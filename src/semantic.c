@@ -1,0 +1,801 @@
+#include "semantic.h"
+#include "parser.h"
+#include "generator.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Symbol Table
+// ─────────────────────────────────────────────────────────────────────────────
+
+typedef enum {
+    SYM_VAR,
+    SYM_FUNC,
+    SYM_STRUCT,
+    SYM_ENUM,
+    SYM_PARAM,
+    SYM_BUILTIN,
+} SymbolKind;
+
+typedef struct Symbol {
+    char        name[128];
+    SymbolKind  kind;
+    TypeExpr*   type;        // May be NULL for structs/enums
+    int         defined_line;
+    bool        is_public;   // <--- Added: visibility flag
+    struct Symbol* next;     // Linked list within one scope
+} Symbol;
+
+typedef struct Scope {
+    Symbol*       symbols;   // Linked list of symbols in this scope
+    struct Scope* parent;
+} Scope;
+
+typedef struct Module {
+    char        path[256];
+    Scope*      top_level_scope;
+    bool        is_analyzed;
+} Module;
+
+// ── Global state ─────────────────────────────────────────────────────────────
+
+static Scope*  current_scope = NULL;
+static Module* current_module = NULL;
+static bool    had_error     = false;
+static int     loop_depth    = 0;  // Track nesting of while/for loops for break/continue validation
+static Arena*  eval_arena    = NULL;
+
+static Module* module_cache[128];
+static int     module_count = 0;
+
+static bool symbol_define(const char* name, size_t name_len,
+                          SymbolKind kind, TypeExpr* type, int line, bool is_public);
+
+static void register_builtins(void) {
+    // Register basic types as SYM_STRUCT so they can be used in type initialization
+    const char* builtins[] = {"Int", "Float", "Double", "UInt8", "UInt16", "Bool", "String"};
+    for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
+        symbol_define(builtins[i], strlen(builtins[i]), SYM_STRUCT, NULL, 0, false);
+    }
+
+    // Register built-in functions
+    symbol_define("print", 5, SYM_BUILTIN, NULL, 0, false);
+    symbol_define("assert", 6, SYM_BUILTIN, NULL, 0, false);
+}
+
+static void semantic_error(int line, const char* format, ...) {
+    had_error = true;
+    va_list args;
+    va_start(args, format);
+    fprintf(stderr, "[Semantic Error] Line %d: ", line);
+    vfprintf(stderr, format, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+
+// ── Scope helpers ─────────────────────────────────────────────────────────────
+
+static Scope* scope_push(void) {
+    Scope* s = (Scope*)malloc(sizeof(Scope));
+    s->symbols = NULL;
+    s->parent  = current_scope;
+    current_scope = s;
+    return s;
+}
+
+static void scope_pop(void) {
+    if (!current_scope) return;
+    Scope* old = current_scope;
+    current_scope = old->parent;
+
+    // Free symbol nodes (not their TypeExprs – those live in the arena)
+    Symbol* sym = old->symbols;
+    while (sym) {
+        Symbol* next = sym->next;
+        free(sym);
+        sym = next;
+    }
+    free(old);
+}
+
+// ── Symbol helpers ────────────────────────────────────────────────────────────
+
+// Define a symbol in the CURRENT scope.
+// Returns false (and emits an error) if the name is already defined in this scope.
+static bool symbol_define(const char* name, size_t name_len,
+                          SymbolKind kind, TypeExpr* type, int line, bool is_public) {
+    if (!current_scope) return true; // Safety
+
+    if (name_len == 0) {
+        // This shouldn't happen
+        return true; 
+    }
+
+    // Check for duplicate in current scope only
+    for (Symbol* s = current_scope->symbols; s; s = s->next) {
+        if (strncmp(s->name, name, name_len) == 0 && s->name[name_len] == '\0') {
+            if (line > 0) { // Only error for non-builtins
+                semantic_error(line,
+                    "Identifier '%.*s' is already declared in this scope (first declared at line %d).",
+                    (int)name_len, name, s->defined_line);
+            }
+            return false;
+        }
+    }
+
+    Symbol* sym = (Symbol*)malloc(sizeof(Symbol));
+    snprintf(sym->name, sizeof(sym->name), "%.*s", (int)name_len, name);
+    sym->kind         = kind;
+    sym->type         = type;
+    sym->defined_line = line;
+    sym->is_public    = is_public;
+    sym->next         = current_scope->symbols;
+    current_scope->symbols = sym;
+    return true;
+}
+
+// Look up a symbol starting from the current scope, walking up to global.
+static Symbol* symbol_lookup(const char* name, size_t name_len) {
+    for (Scope* sc = current_scope; sc; sc = sc->parent) {
+        for (Symbol* s = sc->symbols; s; s = s->next) {
+            if (strncmp(s->name, name, name_len) == 0 && s->name[name_len] == '\0') {
+                return s;
+            }
+        }
+    }
+    return NULL;
+}
+
+// Convenience wrapper using a Token
+static bool define_token(Token tok, SymbolKind kind, TypeExpr* type, bool is_public) {
+    return symbol_define(tok.start, tok.length, kind, type, tok.line, is_public);
+}
+
+static Symbol* lookup_token(Token tok) {
+    return symbol_lookup(tok.start, tok.length);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Forward declaration
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool check_node(ASTNode* node);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Struct init checker (unchanged logic, just adapted to new file layout)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool check_init_assign(ASTNode* node, Token* req, bool* ass,
+                               size_t count, ASTNode* struct_decl);
+
+static bool check_init_assign(ASTNode* node, Token* req, bool* ass,
+                               size_t count, ASTNode* struct_decl) {
+    if (!node) return true;
+
+    if (node->type == AST_BINARY_EXPR && node->as.binary.op == TOKEN_EQUAL) {
+        if (node->as.binary.left->type == AST_IDENTIFIER) {
+            Token name = node->as.binary.left->as.identifier.name;
+            for (size_t i = 0; i < count; i++) {
+                if (req[i].length == name.length &&
+                    strncmp(req[i].start, name.start, name.length) == 0) {
+                    ass[i] = true;
+                }
+            }
+        }
+        if (!check_init_assign(node->as.binary.right, req, ass, count, struct_decl)) return false;
+        return true;
+    }
+
+    if (node->type == AST_FUNC_CALL) {
+        Token callee_name;
+        bool is_method = false;
+        if (node->as.func_call.callee->type == AST_IDENTIFIER) {
+            callee_name = node->as.func_call.callee->as.identifier.name;
+            for (size_t i = 0; i < struct_decl->as.struct_decl.member_count; i++) {
+                ASTNode* m = struct_decl->as.struct_decl.members[i];
+                if (m->type == AST_FUNC_DECL &&
+                    m->as.func_decl.name.length == callee_name.length &&
+                    strncmp(m->as.func_decl.name.start, callee_name.start, callee_name.length) == 0) {
+                    is_method = true;
+                    break;
+                }
+            }
+        }
+
+        if (is_method) {
+            for (size_t i = 0; i < count; i++) {
+                if (!ass[i]) {
+                    semantic_error(node->line,
+                        "Cannot call struct method '%.*s' inside init before all non-optional "
+                        "properties are initialized (missing '%.*s').",
+                        (int)callee_name.length, callee_name.start,
+                        (int)req[i].length, req[i].start);
+                    return false;
+                }
+            }
+        }
+
+        for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
+            if (!check_init_assign(node->as.func_call.args[i], req, ass, count, struct_decl))
+                return false;
+        }
+        return true;
+    }
+
+    switch (node->type) {
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.block.count; i++) {
+                if (!check_init_assign(node->as.block.statements[i], req, ass, count, struct_decl))
+                    return false;
+            }
+            break;
+        case AST_IF_STMT:
+            if (!check_init_assign(node->as.if_stmt.condition, req, ass, count, struct_decl)) return false;
+            if (!check_init_assign(node->as.if_stmt.then_branch, req, ass, count, struct_decl)) return false;
+            if (node->as.if_stmt.else_branch)
+                if (!check_init_assign(node->as.if_stmt.else_branch, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_WHILE_STMT:
+            if (!check_init_assign(node->as.while_stmt.condition, req, ass, count, struct_decl)) return false;
+            if (!check_init_assign(node->as.while_stmt.body, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_FOR_STMT:
+            if (!check_init_assign(node->as.for_stmt.iterable, req, ass, count, struct_decl)) return false;
+            if (!check_init_assign(node->as.for_stmt.body, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_RETURN_STMT:
+            if (node->as.return_stmt.expression)
+                if (!check_init_assign(node->as.return_stmt.expression, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_MEMBER_ACCESS:
+            if (!check_init_assign(node->as.member_access.object, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_UNARY_EXPR:
+            if (!check_init_assign(node->as.unary.right, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_NEW_EXPR:
+            if (!check_init_assign(node->as.new_expr.value, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_VAR_DECL:
+            if (!check_init_assign(node->as.var_decl.initializer, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_INDEX_EXPR:
+            if (!check_init_assign(node->as.index_expr.object, req, ass, count, struct_decl)) return false;
+            if (!check_init_assign(node->as.index_expr.index, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_ARRAY_LITERAL:
+            for (size_t i = 0; i < node->as.array_literal.element_count; i++) {
+                if (!check_init_assign(node->as.array_literal.elements[i], req, ass, count, struct_decl))
+                    return false;
+            }
+            break;
+        case AST_RANGE_EXPR:
+            if (node->as.range.start)
+                if (!check_init_assign(node->as.range.start, req, ass, count, struct_decl)) return false;
+            if (node->as.range.end)
+                if (!check_init_assign(node->as.range.end, req, ass, count, struct_decl)) return false;
+            break;
+        case AST_ENUM_DECL:
+            for (size_t i = 0; i < node->as.enum_decl.member_count; i++) {
+                if (node->as.enum_decl.member_values[i])
+                    if (!check_init_assign(node->as.enum_decl.member_values[i], req, ass, count, struct_decl))
+                        return false;
+            }
+            break;
+        case AST_ENUM_ACCESS:
+            break;
+        default:
+            break;
+    }
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main AST checker with symbol table
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool check_node(ASTNode* node) {
+    if (!node) return true;
+
+    switch (node->type) {
+
+        // ── Top-level program: register all global declarations first ──────
+        case AST_PROGRAM: {
+            // Pre-pass: register all top-level names so that forward references work
+            // (e.g. a function body referencing another function declared later)
+            for (size_t i = 0; i < node->as.block.count; i++) {
+                ASTNode* decl = node->as.block.statements[i];
+                if (decl->type == AST_FUNC_DECL) {
+                    define_token(decl->as.func_decl.name, SYM_FUNC,
+                                 decl->as.func_decl.return_type, decl->is_public);
+                } else if (decl->type == AST_STRUCT_DECL) {
+                    define_token(decl->as.struct_decl.name, SYM_STRUCT, NULL, decl->is_public);
+                } else if (decl->type == AST_ENUM_DECL) {
+                    define_token(decl->as.enum_decl.name, SYM_ENUM, NULL, decl->is_public);
+                }
+            }
+
+            // Now check each statement
+            for (size_t i = 0; i < node->as.block.count; i++) {
+                check_node(node->as.block.statements[i]);
+            }
+            break;
+        }
+
+        // ── Block: push/pop scope ─────────────────────────────────────────
+        case AST_BLOCK: {
+            scope_push();
+            for (size_t i = 0; i < node->as.block.count; i++) {
+                check_node(node->as.block.statements[i]);
+            }
+            scope_pop();
+            break;
+        }
+
+        // ── Variable declaration ──────────────────────────────────────────
+        case AST_VAR_DECL: {
+            // Pointer safety: cannot initialize a pointer with a numeric literal
+            if (node->as.var_decl.type &&
+                node->as.var_decl.type->kind == TYPE_POINTER) {
+                ASTNode* init = node->as.var_decl.initializer;
+                if (init && init->type == AST_LITERAL_NUMBER) {
+                    semantic_error(node->line,
+                        "Pointer '%.*s' cannot be initialized with a numeric literal. "
+                        "Use 'new' or a pointer move.",
+                        (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
+                }
+            }
+
+            // Check initializer before defining the variable itself
+            check_node(node->as.var_decl.initializer);
+
+            // Define in current scope
+            define_token(node->as.var_decl.name, SYM_VAR, node->as.var_decl.type, node->is_public);
+            node->evaluated_type = node->as.var_decl.type;
+            break;
+        }
+
+        // ── Identifier reference ──────────────────────────────────────────
+        case AST_IDENTIFIER: {
+            Token name = node->as.identifier.name;
+            // Skip built-ins: 'self' (handled specially in generator)
+            if (name.length == 4 && strncmp(name.start, "self", 4)  == 0) {
+                break;
+            }
+            Symbol* sym = lookup_token(name);
+            if (!sym) {
+                semantic_error(node->line,
+                    "Undefined identifier '%.*s'.",
+                    (int)name.length, name.start);
+            } else {
+                if (sym->kind == SYM_STRUCT || sym->kind == SYM_ENUM) {
+                    node->evaluated_type = type_new_base(eval_arena, name);
+                } else if (sym->kind == SYM_BUILTIN) {
+                    node->evaluated_type = NULL;
+                } else {
+                    node->evaluated_type = sym->type;
+                }
+            }
+            break;
+        }
+
+        // ── Function declaration ──────────────────────────────────────────
+        case AST_FUNC_DECL: {
+            // The function name was already registered in the program pre-pass.
+            // Open a new scope for parameters + body.
+            scope_push();
+            for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
+                ASTNode* p = node->as.func_decl.params[i];
+                define_token(p->as.var_decl.name, SYM_PARAM, p->as.var_decl.type, false);
+            }
+            // Check body without the outer scope_push from AST_BLOCK
+            // (we push the scope ourselves so we can include params in scope)
+            if (node->as.func_decl.body) {
+                ASTNode* body = node->as.func_decl.body;
+                // body is AST_BLOCK; emit its statements without double-pushing scope
+                for (size_t i = 0; i < body->as.block.count; i++) {
+                    check_node(body->as.block.statements[i]);
+                }
+            }
+            scope_pop();
+            break;
+        }
+
+        // ── Return statement ──────────────────────────────────────────────
+        case AST_RETURN_STMT:
+            check_node(node->as.return_stmt.expression);
+            break;
+
+        // ── Function call ─────────────────────────────────────────────────
+        case AST_FUNC_CALL: {
+            // Validate callee
+            ASTNode* callee = node->as.func_call.callee;
+            if (callee->type == AST_IDENTIFIER) {
+                Token name = callee->as.identifier.name;
+                Symbol* sym = lookup_token(name);
+                if (!sym) {
+                    semantic_error(node->line,
+                        "Call to undefined function or type '%.*s'.",
+                        (int)name.length, name.start);
+                }
+                if (sym) {
+                    if (sym->kind == SYM_STRUCT) {
+                        // Constructor returns the struct type
+                        node->evaluated_type = type_new_base(eval_arena, name);
+                    } else if (sym->kind == SYM_BUILTIN) {
+                        node->evaluated_type = NULL;
+                    } else {
+                        node->evaluated_type = sym->type;
+                    }
+                }
+            } else {
+                check_node(callee);
+                node->evaluated_type = callee->evaluated_type;
+            }
+            for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
+                check_node(node->as.func_call.args[i]);
+            }
+            break;
+        }
+
+        // ── Struct declaration ────────────────────────────────────────────
+        case AST_STRUCT_DECL: {
+            // Struct name already registered in program pre-pass.
+            // Open a new scope for struct members (not visible outside, but needed
+            // for init checking).
+            scope_push();
+
+            // Register methods and fields into the struct scope
+            for (size_t i = 0; i < node->as.struct_decl.member_count; i++) {
+                ASTNode* member = node->as.struct_decl.members[i];
+                if (member->type == AST_VAR_DECL) {
+                    define_token(member->as.var_decl.name, SYM_VAR,
+                                 member->as.var_decl.type, false);
+                } else if (member->type == AST_FUNC_DECL) {
+                    define_token(member->as.func_decl.name, SYM_FUNC,
+                                 member->as.func_decl.return_type, false);
+                }
+            }
+
+            // Verify init methods assign all non-optional fields
+            for (size_t i = 0; i < node->as.struct_decl.member_count; i++) {
+                ASTNode* member = node->as.struct_decl.members[i];
+                if (member->type == AST_INIT_DECL) {
+                    Token required_fields[64];
+                    bool  assigned_fields[64] = {false};
+                    size_t req_count = 0;
+
+                    for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
+                        ASTNode* field = node->as.struct_decl.members[j];
+                        if (field->type == AST_VAR_DECL &&
+                            field->as.var_decl.type->kind != TYPE_NULLABLE) {
+                            required_fields[req_count++] = field->as.var_decl.name;
+                        }
+                    }
+
+                    if (!check_init_assign(member->as.init_decl.body,
+                                           required_fields, assigned_fields, req_count, node)) {
+                        scope_pop();
+                        return false;
+                    }
+
+                    for (size_t j = 0; j < req_count; j++) {
+                        if (!assigned_fields[j]) {
+                            semantic_error(member->line,
+                                "Struct '%.*s' init must initialize non-optional property '%.*s'.",
+                                (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start,
+                                (int)required_fields[j].length, required_fields[j].start);
+                            scope_pop();
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            scope_pop();
+            break;
+        }
+
+        // ── Enum declaration ──────────────────────────────────────────────
+        case AST_ENUM_DECL: {
+            // Enum name already registered. Check value expressions.
+            for (size_t i = 0; i < node->as.enum_decl.member_count; i++) {
+                if (node->as.enum_decl.member_values[i]) {
+                    check_node(node->as.enum_decl.member_values[i]);
+                }
+            }
+            break;
+        }
+
+        // ── Enum access (.member or Enum.member) ──────────────────────────
+        case AST_ENUM_ACCESS:
+            // If a fully qualified enum name is given, verify the enum type exists.
+            if (node->as.enum_access.enum_name.length > 0) {
+                Token name = node->as.enum_access.enum_name;
+                if (!lookup_token(name)) {
+                    semantic_error(node->line,
+                        "Undefined enum type '%.*s'.",
+                        (int)name.length, name.start);
+                }
+            }
+            break;
+
+        // ── Binary expression ─────────────────────────────────────────────
+        case AST_BINARY_EXPR:
+            check_node(node->as.binary.left);
+            check_node(node->as.binary.right);
+            // Result type of binary expr usually same as left (simplification for MVP)
+            if (node->as.binary.left && node->as.binary.left->evaluated_type)
+                node->evaluated_type = node->as.binary.left->evaluated_type;
+            break;
+
+        // ── Unary expression ──────────────────────────────────────────────
+        case AST_UNARY_EXPR:
+            check_node(node->as.unary.right);
+            if (node->as.unary.right && node->as.unary.right->evaluated_type)
+                node->evaluated_type = node->as.unary.right->evaluated_type;
+            break;
+
+        // ── Member access ─────────────────────────────────────────────────
+        case AST_MEMBER_ACCESS:
+            check_node(node->as.member_access.object);
+            // If the object has a type, we might want to resolve the member type too.
+            // For now, the generator just needs to know if 'object' is a pointer.
+            if (node->as.member_access.object)
+                node->evaluated_type = node->as.member_access.object->evaluated_type;
+            break;
+
+        // ── new expression ────────────────────────────────────────────────
+        case AST_NEW_EXPR:
+            if (node->as.new_expr.value) {
+                check_node(node->as.new_expr.value);
+                if (node->as.new_expr.value->evaluated_type) {
+                    node->evaluated_type = type_new_modifier(eval_arena, TYPE_POINTER, node->as.new_expr.value->evaluated_type);
+                }
+            }
+            break;
+
+        // ── If statement ──────────────────────────────────────────────────
+        case AST_IF_STMT:
+            check_node(node->as.if_stmt.condition);
+            check_node(node->as.if_stmt.then_branch);
+            if (node->as.if_stmt.else_branch)
+                check_node(node->as.if_stmt.else_branch);
+            break;
+
+        // ── While statement ───────────────────────────────────────────────
+        case AST_WHILE_STMT:
+            check_node(node->as.while_stmt.condition);
+            loop_depth++;
+            check_node(node->as.while_stmt.body);
+            loop_depth--;
+            break;
+
+        // ── For statement ─────────────────────────────────────────────────
+        case AST_FOR_STMT: {
+            check_node(node->as.for_stmt.iterable);
+            // The pattern variable is implicitly declared – define it in a new scope
+            scope_push();
+            if (node->as.for_stmt.pattern->type == AST_IDENTIFIER) {
+                Token pat = node->as.for_stmt.pattern->as.identifier.name;
+                symbol_define(pat.start, pat.length, SYM_VAR, NULL, node->line, false);
+            }
+            // body is AST_BLOCK; check its contents in the same scope
+            loop_depth++;
+            ASTNode* body = node->as.for_stmt.body;
+            if (body->type == AST_BLOCK) {
+                for (size_t i = 0; i < body->as.block.count; i++) {
+                    check_node(body->as.block.statements[i]);
+                }
+            } else {
+                check_node(body);
+            }
+            loop_depth--;
+            scope_pop();
+            break;
+        }
+
+        // ── Break / Continue ──────────────────────────────────────────────
+        case AST_BREAK_STMT:
+            if (loop_depth == 0) {
+                semantic_error(node->line, "'break' used outside of a loop.");
+            }
+            break;
+
+        case AST_CONTINUE_STMT:
+            if (loop_depth == 0) {
+                semantic_error(node->line, "'continue' used outside of a loop.");
+            }
+            break;
+
+        case AST_IMPORT: {
+            Token path_tok = node->as.import_decl.path;
+            // The path is a string literal including quotes, e.g., "utils/math.jiang"
+            char path[256];
+            snprintf(path, sizeof(path), "%.*s", (int)path_tok.length - 2, path_tok.start + 1);
+
+            // 1. Load and parse the imported file
+            FILE* file = fopen(path, "rb");
+            if (!file) {
+                semantic_error(node->line, "Could not open imported file '%s'.", path);
+                break;
+            }
+            fseek(file, 0L, SEEK_END);
+            size_t fileSize = ftell(file);
+            rewind(file);
+            char* buffer = (char*)malloc(fileSize + 1);
+            fread(buffer, sizeof(char), fileSize, file);
+            buffer[fileSize] = '\0';
+            fclose(file);
+
+            // We need to keep the buffer alive because the AST tokens point to it.
+            // Ideally, the buffer would be managed by the Arena or a Module.
+            ASTNode* imported_root = parse_source(eval_arena, buffer);
+            // free(buffer); // DO NOT FREE THIS!
+            
+            if (!imported_root) {
+                semantic_error(node->line, "Failed to parse imported file '%s'.", path);
+                break;
+            }
+
+            // 2. Recursively check the imported module
+            if (!semantic_check(eval_arena, imported_root, path)) {
+                had_error = true;
+            }
+
+            // 3. Generate C code for the imported module
+            char c_path[256];
+            strncpy(c_path, path, 256);
+            char* dot_jiang = strstr(c_path, ".jiang");
+            if (dot_jiang) {
+                memcpy(dot_jiang, ".c", 2);
+                dot_jiang[2] = '\0';
+            } else {
+                strncat(c_path, ".c", 256);
+            }
+            generate_c_code(imported_root, c_path);
+
+            // 4. Import the public symbols from the analyzed module
+            Module* imported_mod = NULL;
+            for (int i = 0; i < module_count; i++) {
+                if (strcmp(module_cache[i]->path, path) == 0) {
+                    imported_mod = module_cache[i];
+                    break;
+                }
+            }
+
+            if (imported_mod && imported_mod->top_level_scope) {
+                Token alias = node->as.import_decl.alias;
+                if (alias.length > 0) {
+                    // TODO: Implement namespaces/aliases. 
+                    // For now, let's just dump symbols directly if no alias, 
+                    // and error if there's an alias we can't handle yet.
+                    semantic_error(node->line, "Import aliases are not yet fully implemented.");
+                } else {
+                    // Direct import: Copy public symbols from imported_mod to current_scope
+                    Symbol* sym = imported_mod->top_level_scope->symbols;
+                    while (sym) {
+                        if (sym->is_public) {
+                            // Check for conflict
+                            bool conflict = false;
+                            for (Symbol* s = current_scope->symbols; s; s = s->next) {
+                                if (strcmp(s->name, sym->name) == 0) {
+                                    conflict = true;
+                                    break;
+                                }
+                            }
+                            if (!conflict) {
+                                symbol_define(sym->name, strlen(sym->name), 
+                                              sym->kind, sym->type, node->line, false);
+                            }
+                        }
+                        sym = sym->next;
+                    }
+                }
+            }
+            break;
+        }
+
+        // ── Range expression ──────────────────────────────────────────────
+        case AST_RANGE_EXPR:
+            if (node->as.range.start) check_node(node->as.range.start);
+            if (node->as.range.end)   check_node(node->as.range.end);
+            break;
+
+        // ── Index expression ──────────────────────────────────────────────
+        case AST_INDEX_EXPR:
+            check_node(node->as.index_expr.object);
+            check_node(node->as.index_expr.index);
+            break;
+
+        // ── Array literal ─────────────────────────────────────────────────
+        case AST_ARRAY_LITERAL:
+            for (size_t i = 0; i < node->as.array_literal.element_count; i++) {
+                check_node(node->as.array_literal.elements[i]);
+            }
+            node->evaluated_type = node->as.array_literal.type;
+            break;
+
+        // ── Struct init expression ────────────────────────────────────────
+        case AST_STRUCT_INIT_EXPR:
+            for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
+                check_node(node->as.struct_init.field_values[i]);
+            }
+            node->evaluated_type = node->as.struct_init.type;
+            break;
+
+        // ── Init declaration (handled inside STRUCT_DECL) ─────────────────
+        case AST_INIT_DECL:
+            for (size_t i = 0; i < node->as.init_decl.param_count; i++) {
+                check_node(node->as.init_decl.params[i]);
+            }
+            check_node(node->as.init_decl.body);
+            break;
+
+        // ── Literals ──────────────────────────────────────────────────────
+        case AST_LITERAL_NUMBER: {
+            // Implicitly Int for now
+            Token int_token = (Token){TOKEN_IDENTIFIER, "Int", 3, node->line};
+            node->evaluated_type = type_new_base(eval_arena, int_token);
+            break;
+        }
+
+        case AST_LITERAL_STRING:
+            break;
+
+        default:
+            break;
+    }
+
+    return !had_error;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool semantic_check(Arena* arena, ASTNode* root, const char* path) {
+    printf("Starting semantic analysis for %s...\n", path);
+    
+    // Check if already in cache
+    for (int i = 0; i < module_count; i++) {
+        if (strcmp(module_cache[i]->path, path) == 0) {
+            if (module_cache[i]->is_analyzed) return true;
+            return true;
+        }
+    }
+
+    Module* prev_module = current_module;
+    Scope*  prev_scope  = current_scope;
+
+    eval_arena = arena;
+    had_error  = false;
+    loop_depth = 0;
+
+    Module* mod = (Module*)malloc(sizeof(Module));
+    strncpy(mod->path, path, 256);
+    mod->is_analyzed = false;
+    current_module = mod;
+
+    // Create the global scope for this module
+    mod->top_level_scope = scope_push();
+    
+    register_builtins();
+
+    module_cache[module_count++] = mod;
+
+    check_node(root);
+
+    // Keep the top-level scope but restore previous context
+    current_scope = prev_scope;
+    current_module = prev_module;
+    mod->is_analyzed = true;
+
+    if (!had_error) {
+        printf("Semantic analysis passed for %s.\n", path);
+    }
+    return !had_error;
+}
