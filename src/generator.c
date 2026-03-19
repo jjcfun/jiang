@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <unistd.h> // For getcwd
+#include <limits.h> // For PATH_MAX
 
 // Simple symbol table for generator to know variable types for method dispatch
 typedef struct {
@@ -98,7 +100,8 @@ static size_t current_struct_field_count = 0;
 
 static bool is_current_struct_field(Token name) {
     for (size_t i = 0; i < current_struct_field_count; i++) {
-        if (strncmp(current_struct_fields[i].name, name.start, name.length) == 0 && current_struct_fields[i].name[name.length] == '\0') {
+        if (name.length == strlen(current_struct_fields[i].name) &&
+            strncmp(current_struct_fields[i].name, name.start, name.length) == 0 && current_struct_fields[i].name[name.length] == '\0') {
             return true;
         }
     }
@@ -108,30 +111,25 @@ static bool is_current_struct_field(Token name) {
 static void generate_node(ASTNode* node, FILE* out);
 
 static void generate_type(TypeExpr* type, FILE* out) {
-    if (!type) return;
+    if (!type) {
+        fprintf(out, "void");
+        return;
+    }
+
     switch (type->kind) {
-        case TYPE_BASE: {
-            Token t = type->as.base_type;
-            if (t.length == 3 && strncmp(t.start, "Int", 3) == 0) fprintf(out, "int64_t");
-            else if (t.length == 5 && strncmp(t.start, "Float", 5) == 0) fprintf(out, "float");
-            else if (t.length == 6 && strncmp(t.start, "Double", 6) == 0) fprintf(out, "double");
-            else if (t.length == 5 && strncmp(t.start, "UInt8", 5) == 0) fprintf(out, "uint8_t");
-            else if (t.length == 6 && strncmp(t.start, "UInt16", 6) == 0) fprintf(out, "uint16_t");
-            else if (t.length == 4 && strncmp(t.start, "Bool", 4) == 0) fprintf(out, "bool");
-            else if (t.length == 6 && strncmp(t.start, "String", 6) == 0) fprintf(out, "const char*");
-            else if (t.length == 2 && memcmp(t.start, "()", 2) == 0) fprintf(out, "void");
-            else fprintf(out, "%.*s", (int)t.length, t.start);
+        case TYPE_BASE:
+            if (type->as.base_type.length == 3 && strncmp(type->as.base_type.start, "Int", 3) == 0) fprintf(out, "int64_t");
+            else if (type->as.base_type.length == 5 && strncmp(type->as.base_type.start, "Float", 5) == 0) fprintf(out, "float");
+            else if (type->as.base_type.length == 6 && strncmp(type->as.base_type.start, "Double", 6) == 0) fprintf(out, "double");
+            else if (type->as.base_type.length == 5 && strncmp(type->as.base_type.start, "UInt8", 5) == 0) fprintf(out, "uint8_t");
+            else if (type->as.base_type.length == 6 && strncmp(type->as.base_type.start, "UInt16", 6) == 0) fprintf(out, "uint16_t");
+            else if (type->as.base_type.length == 4 && strncmp(type->as.base_type.start, "Bool", 4) == 0) fprintf(out, "bool");
+            else if (type->as.base_type.length == 6 && strncmp(type->as.base_type.start, "String", 6) == 0) fprintf(out, "char*");
+            else fprintf(out, "%.*s", (int)type->as.base_type.length, type->as.base_type.start);
             break;
-        }
         case TYPE_POINTER:
-            if (type->as.pointer.element->kind == TYPE_ARRAY) {
-                // Pointer to array -> just T* in C for easier indexing
-                generate_type(type->as.pointer.element->as.array.element, out);
-                fprintf(out, "*");
-            } else {
-                generate_type(type->as.pointer.element, out);
-                fprintf(out, "*");
-            }
+            generate_type(type->as.pointer.element, out);
+            fprintf(out, "*");
             break;
         case TYPE_ARRAY:
             generate_type(type->as.array.element, out);
@@ -142,7 +140,7 @@ static void generate_type(TypeExpr* type, FILE* out) {
             break;
         case TYPE_NULLABLE:
             generate_type(type->as.nullable.element, out);
-            break; // C doesn't have intrinsic nullable
+            break; // C doesn't have native nullable, handled by pointer or value
         case TYPE_MUTABLE:
             generate_type(type->as.mutable.element, out);
             break; // C is mutable by default
@@ -154,34 +152,52 @@ static void generate_node(ASTNode* node, FILE* out) {
 
     switch (node->type) {
         case AST_PROGRAM:
+        case AST_BLOCK:
+            fprintf(out, "{\n");
             for (size_t i = 0; i < node->as.block.count; i++) {
                 generate_node(node->as.block.statements[i], out);
-                NodeType t = node->as.block.statements[i]->type;
-                if (t != AST_BLOCK && t != AST_PROGRAM && t != AST_IF_STMT && 
-                    t != AST_WHILE_STMT && t != AST_FOR_STMT) {
-                    fprintf(out, ";\n    ");
+                if (node->as.block.statements[i]->type != AST_BLOCK && 
+                    node->as.block.statements[i]->type != AST_IF_STMT &&
+                    node->as.block.statements[i]->type != AST_WHILE_STMT &&
+                    node->as.block.statements[i]->type != AST_FOR_STMT) {
+                    fprintf(out, ";\n");
                 }
+            }
+            fprintf(out, "}\n");
+            break;
+
+        case AST_VAR_DECL:
+            gen_add_sym(node->as.var_decl.name, node->as.var_decl.type);
+            generate_type(node->as.var_decl.type, out);
+            fprintf(out, " %.*s", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
+            if (node->as.var_decl.type && node->as.var_decl.type->kind == TYPE_ARRAY) {
+                fprintf(out, "[");
+                if (node->as.var_decl.type->as.array.length) {
+                    generate_node(node->as.var_decl.type->as.array.length, out);
+                }
+                fprintf(out, "]");
+            }
+            if (node->as.var_decl.initializer) {
+                fprintf(out, " = ");
+                generate_node(node->as.var_decl.initializer, out);
             }
             break;
 
-        case AST_BLOCK:
-            fprintf(out, "{\n    ");
-            for (size_t i = 0; i < node->as.block.count; i++) {
-                generate_node(node->as.block.statements[i], out);
-                NodeType t = node->as.block.statements[i]->type;
-                if (t != AST_BLOCK && t != AST_PROGRAM && t != AST_IF_STMT && 
-                    t != AST_WHILE_STMT && t != AST_FOR_STMT) {
-                    fprintf(out, ";\n    ");
-                }
+        case AST_IDENTIFIER:
+            if (current_struct_context && is_current_struct_field(node->as.identifier.name)) {
+                fprintf(out, "self->%.*s", (int)node->as.identifier.name.length, node->as.identifier.name.start);
+            } else if (node->as.identifier.name.length == 4 && strncmp(node->as.identifier.name.start, "self", 4) == 0) {
+                fprintf(out, "self");
+            } else {
+                fprintf(out, "%.*s", (int)node->as.identifier.name.length, node->as.identifier.name.start);
             }
-            fprintf(out, "}\n    ");
             break;
 
         case AST_LITERAL_NUMBER:
-            if (node->as.number.value == (double)(long long)node->as.number.value) {
-                fprintf(out, "%lld", (long long)node->as.number.value);
+            if (node->as.number.value == (int64_t)node->as.number.value) {
+                fprintf(out, "%lld", (int64_t)node->as.number.value);
             } else {
-                fprintf(out, "%.2f", node->as.number.value);
+                fprintf(out, "%g", node->as.number.value);
             }
             break;
 
@@ -189,73 +205,34 @@ static void generate_node(ASTNode* node, FILE* out) {
             fprintf(out, "%.*s", (int)node->as.string.value.length, node->as.string.value.start);
             break;
 
-        case AST_IDENTIFIER:
-            if (current_struct_context && is_current_struct_field(node->as.identifier.name)) {
-                fprintf(out, "self->%.*s", (int)node->as.identifier.name.length, node->as.identifier.name.start);
-            } else {
-                fprintf(out, "%.*s", (int)node->as.identifier.name.length, node->as.identifier.name.start);
-            }
-            break;
-
         case AST_BINARY_EXPR:
-            if (node->as.binary.op != TOKEN_EQUAL) fprintf(out, "(");
+            fprintf(out, "(");
             generate_node(node->as.binary.left, out);
-            
             switch (node->as.binary.op) {
                 case TOKEN_PLUS: fprintf(out, " + "); break;
                 case TOKEN_MINUS: fprintf(out, " - "); break;
                 case TOKEN_STAR: fprintf(out, " * "); break;
                 case TOKEN_SLASH: fprintf(out, " / "); break;
+                case TOKEN_EQUAL: fprintf(out, " = "); break;
                 case TOKEN_EQUAL_EQUAL: fprintf(out, " == "); break;
                 case TOKEN_BANG_EQUAL: fprintf(out, " != "); break;
                 case TOKEN_LESS: fprintf(out, " < "); break;
-                case TOKEN_LESS_EQUAL: fprintf(out, " <= "); break;
                 case TOKEN_GREATER: fprintf(out, " > "); break;
+                case TOKEN_LESS_EQUAL: fprintf(out, " <= "); break;
                 case TOKEN_GREATER_EQUAL: fprintf(out, " >= "); break;
-                case TOKEN_EQUAL: fprintf(out, " = "); break;
-                default: fprintf(out, " /* op %d */ ", node->as.binary.op);
+                default: break;
             }
-            
             generate_node(node->as.binary.right, out);
-            if (node->as.binary.op != TOKEN_EQUAL) fprintf(out, ")");
+            fprintf(out, ")");
             break;
 
         case AST_UNARY_EXPR:
-            if (node->as.unary.op == TOKEN_DOLLAR) {
-                // $p in Jiang -> p (the pointer) in C
-                generate_node(node->as.unary.right, out);
-            } else {
-                fprintf(out, "(");
-                switch (node->as.unary.op) {
-                    case TOKEN_STAR: fprintf(out, "*"); break;
-                    case TOKEN_MINUS: fprintf(out, "-"); break;
-                    case TOKEN_BANG: fprintf(out, "!"); break;
-                    default: fprintf(out, "/* unary %d */ ", node->as.unary.op);
-                }
-                generate_node(node->as.unary.right, out);
-                fprintf(out, ")");
+            switch (node->as.unary.op) {
+                case TOKEN_MINUS: fprintf(out, "-"); break;
+                case TOKEN_BANG: fprintf(out, "!"); break;
+                default: break;
             }
-            break;
-
-        case AST_VAR_DECL:
-            gen_add_sym(node->as.var_decl.name, node->as.var_decl.type);
-            generate_type(node->as.var_decl.type, out);
-            fprintf(out, " %.*s", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
-            
-            // If it's an array, add the [size] suffix for C
-            if (node->as.var_decl.type->kind == TYPE_ARRAY) {
-                fprintf(out, "[");
-                if (node->as.var_decl.type->as.array.length) {
-                    generate_node(node->as.var_decl.type->as.array.length, out);
-                }
-                fprintf(out, "]");
-            }
-
-            if (node->as.var_decl.initializer) {
-                fprintf(out, " = ");
-                // Cast for pointers/arrays if needed, but C99 designated/array initializers are usually fine without
-                generate_node(node->as.var_decl.initializer, out);
-            }
+            generate_node(node->as.unary.right, out);
             break;
 
         case AST_FUNC_CALL:
@@ -373,37 +350,46 @@ static void generate_node(ASTNode* node, FILE* out) {
                     return;
                 }
             }
+            
             fprintf(out, "%s%.*s", is_ptr ? "->" : ".", (int)node->as.member_access.member.length, node->as.member_access.member.start);
             break;
         }
 
         case AST_NEW_EXPR: {
-            // new <expr>  →  ({ void* _p = malloc(sizeof(T)); memcpy(_p, &(<expr>), sizeof(T)); (T*)_p; })
             ASTNode* val = node->as.new_expr.value;
-            if (val->evaluated_type) {
+            if (val->type == AST_LITERAL_NUMBER) {
+                // ({ void* _p = malloc(sizeof(T)); *(T*)_p = V; (T*)_p; })
                 fprintf(out, "({ void* _p = malloc(sizeof(");
                 generate_type(val->evaluated_type, out);
-                fprintf(out, ")); ");
-                
-                if (val->evaluated_type->kind == TYPE_ARRAY) {
-                    fprintf(out, "memcpy(_p, &(");
-                    generate_node(val, out);
-                    fprintf(out, "), sizeof(");
+                fprintf(out, ")); *(");
+                generate_type(val->evaluated_type, out);
+                fprintf(out, "*)_p = ");
+                generate_node(val, out);
+                fprintf(out, "; (");
+                generate_type(val->evaluated_type, out);
+                fprintf(out, "*)_p; })");
+            } else if (val->type == AST_ARRAY_LITERAL) {
+                // ({ void* _p = malloc(sizeof(T)*N); memcpy(_p, &((T){...}), sizeof(T)*N); (T*)_p; })
+                fprintf(out, "({ void* _p = malloc(sizeof(");
+                generate_type(val->as.array_literal.type->as.array.element, out);
+                fprintf(out, ") * %zu); ", val->as.array_literal.element_count);
+                fprintf(out, "memcpy(_p, &(");
+                generate_node(val, out);
+                fprintf(out, "), sizeof(");
+                generate_type(val->as.array_literal.type->as.array.element, out);
+                fprintf(out, ") * %zu); (", val->as.array_literal.element_count);
+                generate_type(val->as.array_literal.type->as.array.element, out);
+                fprintf(out, "*)_p; })");
+            } else if (val->type == AST_STRUCT_INIT_EXPR) {
+                // Could be value or new. 
+                if (val->as.struct_init.type && val->as.struct_init.type->kind == TYPE_BASE) {
+                    fprintf(out, "({ void* _p = malloc(sizeof(");
                     generate_type(val->evaluated_type, out);
-                    fprintf(out, ")); ");
-                } else {
-                    fprintf(out, "*(");
+                    fprintf(out, ")); *(");
                     generate_type(val->evaluated_type, out);
                     fprintf(out, "*)_p = ");
                     generate_node(val, out);
-                    fprintf(out, "; ");
-                }
-                if (val->evaluated_type->kind == TYPE_ARRAY) {
-                    fprintf(out, "(");
-                    generate_type(val->evaluated_type->as.array.element, out);
-                    fprintf(out, "*)_p; })");
-                } else {
-                    fprintf(out, "(");
+                    fprintf(out, "; (");
                     generate_type(val->evaluated_type, out);
                     fprintf(out, "*)_p; })");
                 }
@@ -435,39 +421,22 @@ static void generate_node(ASTNode* node, FILE* out) {
             break;
 
         case AST_FOR_STMT:
-            // Check if iterable is a range for optimized C for loop
+            // for i in 0..10 { ... } -> for (int64_t i = 0; i < 10; i++) { ... }
             if (node->as.for_stmt.iterable->type == AST_RANGE_EXPR) {
                 ASTNode* range = node->as.for_stmt.iterable;
-                fprintf(out, "for (int64_t ");
-                generate_node(node->as.for_stmt.pattern, out); // Simplification: assume single identifier
-                fprintf(out, " = ");
+                fprintf(out, "for (int64_t %.*s = ", 
+                        (int)node->as.for_stmt.pattern->as.identifier.name.length, 
+                        node->as.for_stmt.pattern->as.identifier.name.start);
                 generate_node(range->as.range.start, out);
-                fprintf(out, "; ");
-                generate_node(node->as.for_stmt.pattern, out);
-                fprintf(out, " < ");
+                fprintf(out, "; %.*s < ", 
+                        (int)node->as.for_stmt.pattern->as.identifier.name.length, 
+                        node->as.for_stmt.pattern->as.identifier.name.start);
                 generate_node(range->as.range.end, out);
-                fprintf(out, "; ");
-                generate_node(node->as.for_stmt.pattern, out);
-                fprintf(out, "++) ");
-            } else {
-                fprintf(out, "/* TODO: generic for-in iterator */ ");
+                fprintf(out, "; %.*s++) ", 
+                        (int)node->as.for_stmt.pattern->as.identifier.name.length, 
+                        node->as.for_stmt.pattern->as.identifier.name.start);
+                generate_node(node->as.for_stmt.body, out);
             }
-            generate_node(node->as.for_stmt.body, out);
-            break;
-
-        case AST_RANGE_EXPR:
-            fprintf(out, "/* range */ ");
-            break;
-
-        case AST_FUNC_DECL:
-            generate_type(node->as.func_decl.return_type, out);
-            fprintf(out, " %.*s(", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
-            for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
-                generate_node(node->as.func_decl.params[i], out);
-                if (i < node->as.func_decl.param_count - 1) fprintf(out, ", ");
-            }
-            fprintf(out, ") ");
-            generate_node(node->as.func_decl.body, out);
             break;
 
         case AST_RETURN_STMT:
@@ -479,20 +448,11 @@ static void generate_node(ASTNode* node, FILE* out) {
             break;
 
         case AST_STRUCT_DECL:
-            // Handled in global pass
-            break;
-
-        case AST_INIT_DECL:
-            // Handled in global pass
+            // Handled in Pass 1/Declarations
             break;
 
         case AST_STRUCT_INIT_EXPR:
-            if (node->as.struct_init.type) {
-                fprintf(out, "(");
-                generate_type(node->as.struct_init.type, out);
-                fprintf(out, ")");
-            }
-            fprintf(out, "{");
+            fprintf(out, "(%.*s){", (int)node->as.struct_init.type->as.base_type.length, node->as.struct_init.type->as.base_type.start);
             for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
                 fprintf(out, ".%.*s = ", (int)node->as.struct_init.field_names[i].length, node->as.struct_init.field_names[i].start);
                 generate_node(node->as.struct_init.field_values[i], out);
@@ -502,49 +462,43 @@ static void generate_node(ASTNode* node, FILE* out) {
             break;
 
         case AST_INDEX_EXPR:
-            if (node->as.index_expr.index->type == AST_RANGE_EXPR) {
-                // Slicing operation: arr[start..end]
-                fprintf(out, "/* SLICE */ (Slice_int64_t){ .ptr = ");
-                generate_node(node->as.index_expr.object, out);
-                const char* type = NULL;
-                if (node->as.index_expr.object->type == AST_IDENTIFIER) {
-                    type = gen_get_type(node->as.index_expr.object->as.identifier.name);
-                }
-                if (type && strcmp(type, "SLICE") == 0) fprintf(out, ".ptr");
-                fprintf(out, " + ");
-                if (node->as.index_expr.index->as.range.start) generate_node(node->as.index_expr.index->as.range.start, out);
-                else fprintf(out, "0");
-                fprintf(out, ", .length = ");
-                if (node->as.index_expr.index->as.range.end) {
-                     generate_node(node->as.index_expr.index->as.range.end, out);
-                     fprintf(out, " - ");
-                     if (node->as.index_expr.index->as.range.start) generate_node(node->as.index_expr.index->as.range.start, out);
-                     else fprintf(out, "0");
-                } else {
-                    // Full slice or end slice. 
-                    // If it's an array, we can use sizeof. If it's a slice, we use .length.
-                    if (type && strcmp(type, "SLICE") == 0) {
+            if (node->as.index_expr.object->evaluated_type && 
+                node->as.index_expr.object->evaluated_type->kind == TYPE_SLICE) {
+                if (node->as.index_expr.index->type == AST_RANGE_EXPR) {
+                    // Slicing: ({ Slice_T _s; _s.ptr = obj.ptr + start; _s.length = end - start; _s; })
+                    fprintf(out, "({ Slice_");
+                    generate_type(node->as.index_expr.object->evaluated_type->as.slice.element, out);
+                    fprintf(out, " _s; _s.ptr = ");
+                    generate_node(node->as.index_expr.object, out);
+                    fprintf(out, ".ptr + ");
+                    if (node->as.index_expr.index->as.range.start) {
+                        generate_node(node->as.index_expr.index->as.range.start, out);
+                    } else {
+                        fprintf(out, "0");
+                    }
+                    fprintf(out, "; _s.length = ");
+                    if (node->as.index_expr.index->as.range.end) {
+                        generate_node(node->as.index_expr.index->as.range.end, out);
+                    } else {
                         generate_node(node->as.index_expr.object, out);
                         fprintf(out, ".length");
-                    } else {
-                        fprintf(out, "5 /* TODO: get array size from type */");
                     }
+                    fprintf(out, " - ");
                     if (node->as.index_expr.index->as.range.start) {
-                        fprintf(out, " - ");
                         generate_node(node->as.index_expr.index->as.range.start, out);
+                    } else {
+                        fprintf(out, "0");
                     }
+                    fprintf(out, "; _s; })");
+                    return;
                 }
-                fprintf(out, " }");
+                generate_node(node->as.index_expr.object, out);
+                fprintf(out, ".ptr[");
+                generate_node(node->as.index_expr.index, out);
+                fprintf(out, "]");
                 return;
             }
-            
             generate_node(node->as.index_expr.object, out);
-            if (node->as.index_expr.object->type == AST_IDENTIFIER) {
-                const char* type = gen_get_type(node->as.index_expr.object->as.identifier.name);
-                if (type && strcmp(type, "SLICE") == 0) {
-                    fprintf(out, ".ptr");
-                }
-            }
             fprintf(out, "[");
             generate_node(node->as.index_expr.index, out);
             fprintf(out, "]");
@@ -553,8 +507,8 @@ static void generate_node(ASTNode* node, FILE* out) {
         case AST_ARRAY_LITERAL:
             if (node->as.array_literal.type) {
                 fprintf(out, "(");
-                generate_type(node->as.array_literal.type, out);
-                fprintf(out, ")");
+                generate_type(node->as.array_literal.type->as.array.element, out);
+                fprintf(out, "[%zu])", node->as.array_literal.element_count);
             }
             fprintf(out, "{");
             for (size_t i = 0; i < node->as.array_literal.element_count; i++) {
@@ -604,6 +558,9 @@ case AST_IMPORT: {
     }
 }
 
+static void generate_declarations(ASTNode* root, FILE* out, const char* out_path);
+static void generate_implementations(ASTNode* root, FILE* out, bool is_main);
+
 void generate_c_code(ASTNode* root, const char* out_path) {
     // Reset global state for each file generation
     gen_sym_count = 0;
@@ -612,175 +569,143 @@ void generate_c_code(ASTNode* root, const char* out_path) {
     current_struct_context = NULL;
     current_struct_field_count = 0;
 
-    FILE* out = fopen(out_path, "w");
-    if (!out) {
+    // 1. Generate .h file
+    char h_path[PATH_MAX];
+    strncpy(h_path, out_path, PATH_MAX);
+    char* dot_c = strstr(h_path, ".c");
+    if (dot_c) memcpy(dot_c, ".h", 2);
+    else strncat(h_path, ".h", PATH_MAX - strlen(h_path) - 1);
+
+    FILE* h_out = fopen(h_path, "w");
+    if (h_out) {
+        generate_declarations(root, h_out, h_path);
+        fclose(h_out);
+    }
+
+    // 2. Generate .c file
+    FILE* c_out = fopen(out_path, "w");
+    if (!c_out) {
         fprintf(stderr, "Generator could not open output file %s\n", out_path);
         return;
     }
+    
+    // In implementation file, include its own header
+    char* last_slash = strrchr(h_path, '/');
+    char* header_filename = last_slash ? last_slash + 1 : h_path;
+    fprintf(c_out, "#include \"%s\"\n\n", header_filename);
 
-    fprintf(out, "#include <stdint.h>\n");
-    fprintf(out, "#include <stdio.h>\n");
-    fprintf(out, "#include <stdbool.h>\n");
-    fprintf(out, "#include <stdlib.h>\n");
-    fprintf(out, "#include <string.h>\n\n");
-    fprintf(out, "\n");
-    fprintf(out, "#ifndef JIANG_SLICE_DEFINED\n");
-    fprintf(out, "#define JIANG_SLICE_DEFINED\n");
-    fprintf(out, "typedef struct {\n");
-    fprintf(out, "    int64_t* ptr;\n");
-    fprintf(out, "    int64_t length;\n");
-    fprintf(out, "} Slice_int64_t;\n");
-    fprintf(out, "#endif\n");
-    fprintf(out, "\n");
+    bool is_main = (strstr(out_path, "out.c") != NULL);
+    generate_implementations(root, c_out, is_main);
+    fclose(c_out);
 
-    // Pass 1: Global declarations (Structs and Functions)
-    // 1. Gather all names
+    printf("Successfully generated C/H code at: %s\n", out_path);
+}
+
+static void generate_declarations(ASTNode* root, FILE* out, const char* out_path) {
+    // Generate a unique guard name based on the output path
+    char guard[512];
+    snprintf(guard, sizeof(guard), "JIANG_GEN_");
+    for (size_t i = 0; out_path[i] != '\0'; i++) {
+        char c = out_path[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            guard[10 + i] = (c >= 'a' && c <= 'z') ? (c - 'a' + 'A') : c;
+        } else {
+            guard[10 + i] = '_';
+        }
+        guard[11 + i] = '\0';
+    }
+
+    fprintf(out, "#ifndef %s\n", guard);
+    fprintf(out, "#define %s\n\n", guard);
+    
+    // Get absolute path to runtime.h
+    char runtime_path[512];
+    char cwd[512];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        snprintf(runtime_path, sizeof(runtime_path), "%s/include/runtime.h", cwd);
+    } else {
+        strcpy(runtime_path, "runtime.h");
+    }
+    fprintf(out, "#include \"%s\"\n\n", runtime_path);
+
+    // Gather structs/enums first
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
         if (node->type == AST_STRUCT_DECL) {
             gen_add_struct(node->as.struct_decl.name);
         } else if (node->type == AST_ENUM_DECL) {
             gen_add_enum(node);
-        } else if (node->type == AST_IMPORT) {
-            generate_node(node, out);
         }
     }
 
-    // 2. Emit enums
-    for (size_t i = 0; i < root->as.block.count; i++) {
-        ASTNode* node = root->as.block.statements[i];
-        if (node->type == AST_ENUM_DECL) {
-            fprintf(out, "typedef enum {\n");
-            for (size_t j = 0; j < node->as.enum_decl.member_count; j++) {
-                fprintf(out, "    %.*s_%.*s", 
-                    (int)node->as.enum_decl.name.length, node->as.enum_decl.name.start,
-                    (int)node->as.enum_decl.member_names[j].length, node->as.enum_decl.member_names[j].start);
-                if (node->as.enum_decl.member_values[j]) {
-                    fprintf(out, " = ");
-                    generate_node(node->as.enum_decl.member_values[j], out);
-                }
-                if (j < node->as.enum_decl.member_count - 1) fprintf(out, ",");
-                fprintf(out, "\n");
-            }
-            fprintf(out, "} %.*s;\n\n", (int)node->as.enum_decl.name.length, node->as.enum_decl.name.start);
-        }
-    }
-
-    // 3. Emit structs
+    // Emit prototypes
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
         if (node->type == AST_STRUCT_DECL) {
-            fprintf(out, "typedef struct {\n");
-            
-            // Build struct context
-            current_struct_field_count = 0;
-            current_struct_context = "active";
-            
+            fprintf(out, "typedef struct { ");
             for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
-                ASTNode* member = node->as.struct_decl.members[j];
-                if (member->type == AST_VAR_DECL) {
-                    fprintf(out, "    ");
-                    generate_type(member->as.var_decl.type, out);
-                    fprintf(out, " %.*s", (int)member->as.var_decl.name.length, member->as.var_decl.name.start);
-                    if (member->as.var_decl.type->kind == TYPE_ARRAY) {
-                        fprintf(out, "[");
-                        if (member->as.var_decl.type->as.array.length) {
-                            generate_node(member->as.var_decl.type->as.array.length, out);
-                        }
-                        fprintf(out, "]");
-                    }
-                    fprintf(out, ";\n");
-                    snprintf(current_struct_fields[current_struct_field_count++].name, 64, "%.*s", (int)member->as.var_decl.name.length, member->as.var_decl.name.start);
+                if (node->as.struct_decl.members[j]->type == AST_VAR_DECL) {
+                    ASTNode* m = node->as.struct_decl.members[j];
+                    generate_type(m->as.var_decl.type, out);
+                    fprintf(out, " %.*s; ", (int)m->as.var_decl.name.length, m->as.var_decl.name.start);
                 }
             }
-            fprintf(out, "} %.*s;\n\n", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-            
-            // Now handle methods and init
-            for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
-                ASTNode* member = node->as.struct_decl.members[j];
-                if (member->type == AST_FUNC_DECL) {
-                    generate_type(member->as.func_decl.return_type, out);
-                    fprintf(out, " %.*s_%.*s(", 
-                            (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start,
-                            (int)member->as.func_decl.name.length, member->as.func_decl.name.start);
-                    // Add 'self' pointer as first arg if it's a method
-                    fprintf(out, "%.*s* self", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-                    if (member->as.func_decl.param_count > 0) fprintf(out, ", ");
-                    
-                    for (size_t k = 0; k < member->as.func_decl.param_count; k++) {
-                        gen_add_sym(member->as.func_decl.params[k]->as.var_decl.name, member->as.func_decl.params[k]->as.var_decl.type);
-                        generate_node(member->as.func_decl.params[k], out);
-                        if (k < member->as.func_decl.param_count - 1) fprintf(out, ", ");
-                    }
-                    fprintf(out, ") ");
-                    generate_node(member->as.func_decl.body, out);
-                    fprintf(out, "\n\n");
-                } else if (member->type == AST_INIT_DECL) {
-                    fprintf(out, "void %.*s_init(", 
-                            (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-                    
-                    // Add 'self' pointer as first arg for constructor
-                    fprintf(out, "%.*s* self", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-                    if (member->as.init_decl.param_count > 0) fprintf(out, ", ");
-
-                    for (size_t k = 0; k < member->as.init_decl.param_count; k++) {
-                        gen_add_sym(member->as.init_decl.params[k]->as.var_decl.name, member->as.init_decl.params[k]->as.var_decl.type);
-                        generate_node(member->as.init_decl.params[k], out);
-                        if (k < member->as.init_decl.param_count - 1) fprintf(out, ", ");
-                    }
-                    fprintf(out, ") ");
-                    generate_node(member->as.init_decl.body, out);
-                    fprintf(out, "\n\n");
-                    
-                    // Generate constructor wrapper returning by value
-                    fprintf(out, "%.*s %.*s_new(", 
-                            (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start,
-                            (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-                    for (size_t k = 0; k < member->as.init_decl.param_count; k++) {
-                        generate_node(member->as.init_decl.params[k], out);
-                        if (k < member->as.init_decl.param_count - 1) fprintf(out, ", ");
-                    }
-                    fprintf(out, ") {\n");
-                    fprintf(out, "    %.*s self;\n", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-                    fprintf(out, "    %.*s_init(&self", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
-                    for (size_t k = 0; k < member->as.init_decl.param_count; k++) {
-                        fprintf(out, ", %.*s", (int)member->as.init_decl.params[k]->as.var_decl.name.length, member->as.init_decl.params[k]->as.var_decl.name.start);
-                    }
-                    fprintf(out, ");\n    return self;\n}\n\n");
-                }
+            fprintf(out, "} %.*s;\n", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
+        } else if (node->type == AST_FUNC_DECL) {
+            generate_type(node->as.func_decl.return_type, out);
+            fprintf(out, " %.*s(", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
+            for (size_t j = 0; j < node->as.func_decl.param_count; j++) {
+                generate_node(node->as.func_decl.params[j], out);
+                if (j < node->as.func_decl.param_count - 1) fprintf(out, ", ");
             }
-            current_struct_context = NULL;
+            fprintf(out, ");\n");
+        } else if (node->type == AST_VAR_DECL) {
+            fprintf(out, "extern ");
+            generate_type(node->as.var_decl.type, out);
+            fprintf(out, " %.*s;\n", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
+        } else if (node->type == AST_IMPORT) {
+            // In headers, replace .c with .h for includes
+            char path[256];
+            strncpy(path, node->as.import_decl.resolved_path, 256);
+            char* dot_c = strstr(path, ".c");
+            if (dot_c) memcpy(dot_c, ".h", 2);
+            fprintf(out, "#include \"%s\"\n", path);
         }
     }
-    
+
+    fprintf(out, "\n#endif\n");
+}
+
+static void generate_implementations(ASTNode* root, FILE* out, bool is_main) {
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
         if (node->type == AST_FUNC_DECL) {
-            generate_node(node, out);
+            // Function implementation
+            generate_type(node->as.func_decl.return_type, out);
+            fprintf(out, " %.*s(", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
+            for (size_t j = 0; j < node->as.func_decl.param_count; j++) {
+                generate_node(node->as.func_decl.params[j], out);
+                if (j < node->as.func_decl.param_count - 1) fprintf(out, ", ");
+            }
+            fprintf(out, ") ");
+            generate_node(node->as.func_decl.body, out);
             fprintf(out, "\n\n");
+        } else if (node->type == AST_VAR_DECL && !is_main) {
+            generate_node(node, out);
+            fprintf(out, ";\n");
         }
     }
 
-    // Pass 2: Executable code in main
-    bool is_main_out = (strstr(out_path, "out.c") != NULL);
-    if (is_main_out) {
+    if (is_main) {
         fprintf(out, "int main() {\n    ");
-
         for (size_t i = 0; i < root->as.block.count; i++) {
             ASTNode* node = root->as.block.statements[i];
-            if (node->type != AST_FUNC_DECL && node->type != AST_STRUCT_DECL && node->type != AST_ENUM_DECL && node->type != AST_IMPORT) {
+            if (node->type != AST_FUNC_DECL && node->type != AST_STRUCT_DECL && 
+                node->type != AST_ENUM_DECL && node->type != AST_IMPORT) {
                 generate_node(node, out);
-                NodeType t = node->type;
-                if (t != AST_BLOCK && t != AST_IF_STMT && t != AST_WHILE_STMT && t != AST_FOR_STMT) {
-                    fprintf(out, ";\n    ");
-                }
+                if (node->type != AST_BLOCK) fprintf(out, ";\n    ");
             }
         }
-
-        fprintf(out, "return 0;\n");
-        fprintf(out, "}\n");
+        fprintf(out, "return 0;\n}\n");
     }
-
-    fclose(out);
-    printf("Successfully generated C code at: %s\n", out_path);
 }

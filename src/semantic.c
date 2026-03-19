@@ -105,6 +105,9 @@ static Arena*  eval_arena    = NULL;
 static Module* module_cache[128];
 static int     module_count = 0;
 
+static char    generated_c_files[128][PATH_MAX];
+static int     generated_c_count = 0;
+
 static bool symbol_define(const char* name, size_t name_len,
                           SymbolKind kind, TypeExpr* type, int line, bool is_public);
 
@@ -767,6 +770,18 @@ static bool check_node(ASTNode* node) {
 
             ensure_dir_exists(c_path);
             generate_c_code(imported_root, c_path);
+            
+            // Record this generated C file for later linking
+            bool already_added = false;
+            for (int i = 0; i < generated_c_count; i++) {
+                if (strcmp(generated_c_files[i], c_path) == 0) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (!already_added) {
+                strncpy(generated_c_files[generated_c_count++], c_path, PATH_MAX);
+            }
 
             // 4. Import the public symbols from the analyzed module
             Module* imported_mod = NULL;
@@ -868,6 +883,13 @@ static bool check_node(ASTNode* node) {
     return !had_error;
 }
 
+int semantic_get_generated_files(char files[128][4096]) {
+    for (int i = 0; i < generated_c_count; i++) {
+        strncpy(files[i], generated_c_files[i], 4096);
+    }
+    return generated_c_count;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -888,6 +910,11 @@ bool semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
 
     Module* prev_module = current_module;
     Scope*  prev_scope  = current_scope;
+
+    if (prev_module == NULL) {
+        generated_c_count = 0;
+        strncpy(generated_c_files[generated_c_count++], "build/out.c", PATH_MAX);
+    }
 
     eval_arena = arena;
     had_error  = false;

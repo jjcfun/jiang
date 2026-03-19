@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "parser.h"
 #include "generator.h"
 #include "semantic.h"
@@ -42,7 +43,34 @@ static void run(const char* source, const char* path) {
 
     if (root) {
         if (semantic_check(arena, root, path)) {
-            generate_c_code(root, "out.c");
+            // Use build/out.c as the entry point
+            generate_c_code(root, "build/out.c");
+
+            // 3. Auto Linker: Link all generated C files
+            char c_files[128][4096];
+            int file_count = semantic_get_generated_files(c_files);
+
+            char link_command[16384];
+            snprintf(link_command, sizeof(link_command), "gcc ");
+            
+            for (int i = 0; i < file_count; i++) {
+                strncat(link_command, c_files[i], sizeof(link_command) - strlen(link_command) - 1);
+                strncat(link_command, " ", sizeof(link_command) - strlen(link_command) - 1);
+            }
+
+            // Output binary name (use basename of input file or 'a.out')
+            char bin_path[4096];
+            snprintf(bin_path, sizeof(bin_path), "build/out_bin");
+            
+            strncat(link_command, "-o ", sizeof(link_command) - strlen(link_command) - 1);
+            strncat(link_command, bin_path, sizeof(link_command) - strlen(link_command) - 1);
+
+            printf("Linking...\n");
+            if (system(link_command) == 0) {
+                printf("Successfully built binary at: %s\n", bin_path);
+            } else {
+                printf("Linking failed.\n");
+            }
         } else {
             printf("Compilation failed due to semantic errors.\n");
         }
@@ -50,7 +78,7 @@ static void run(const char* source, const char* path) {
         printf("Failed to parse AST.\n");
     }
 
-    // 3. Free the entire AST with one stroke
+    // 4. Free the entire AST with one stroke
     arena_destroy(arena);
 }
 
