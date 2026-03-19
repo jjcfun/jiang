@@ -800,12 +800,21 @@ static ASTNode* expression_statement() {
 static ASTNode* import_statement(bool is_public) {
     Token import_tok = parser.previous;
     Token alias = {0};
-    if (match(TOKEN_IDENTIFIER)) {
+    Token path = {0};
+
+    // Case 1: import Alias "path";
+    if (check(TOKEN_IDENTIFIER)) {
+        advance();
         alias = parser.previous;
+        consume(TOKEN_STRING, "Expect string literal for import path.");
+        path = parser.previous;
+    } else {
+        // Case 2: import "path";
+        consume(TOKEN_STRING, "Expect string literal for import path.");
+        path = parser.previous;
     }
-    consume(TOKEN_STRING, "Expect string literal for import path.");
-    Token path = parser.previous;
-    match(TOKEN_SEMICOLON); // Optional semicolon
+
+    consume(TOKEN_SEMICOLON, "Expect ';' after import statement.");
 
     ASTNode* node = ast_new_node(parser.arena, AST_IMPORT, import_tok.line);
     node->as.import_decl.is_public = is_public;

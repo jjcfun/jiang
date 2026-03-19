@@ -93,6 +93,7 @@ typedef enum {
             bool is_public;
             Token alias; // Optional
             Token path;  // String literal
+            char resolved_path[256]; // <--- Added: store absolute path
         } import_decl;
 
         // AST_LITERAL_NUMBER

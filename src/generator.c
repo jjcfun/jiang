@@ -269,6 +269,20 @@ static void generate_node(ASTNode* node, FILE* out) {
                     struct_type = gen_get_type(obj->as.identifier.name);
                 }
                 
+                // Namespace call support: if obj is an identifier but has no type, treat as namespace
+                if (obj->type == AST_IDENTIFIER && struct_type == NULL) {
+                    Token name = obj->as.identifier.name;
+                    if (!(name.length == 4 && strncmp(name.start, "self", 4) == 0)) {
+                        fprintf(out, "%.*s(", (int)method.length, method.start);
+                        for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
+                            generate_node(node->as.func_call.args[i], out);
+                            if (i < node->as.func_call.arg_count - 1) fprintf(out, ", ");
+                        }
+                        fprintf(out, ")");
+                        return;
+                    }
+                }
+
                 if (struct_type) {
                     fprintf(out, "%s_%.*s(&", struct_type, (int)method.length, method.start);
                     generate_node(obj, out);
@@ -324,6 +338,18 @@ static void generate_node(ASTNode* node, FILE* out) {
             const char* obj_type = NULL;
             if (obj->type == AST_IDENTIFIER) {
                 obj_type = gen_get_type(obj->as.identifier.name);
+            }
+
+            // Check for namespace: if it's an identifier with no associated type
+            // and it's not 'self', we treat it as a namespace alias and just output the member.
+            if (obj->type == AST_IDENTIFIER && obj_type == NULL) {
+                Token name = obj->as.identifier.name;
+                if (!(name.length == 4 && strncmp(name.start, "self", 4) == 0)) {
+                    // It's a namespace alias (like 'm' in 'm.add').
+                    // In our flat C output, we just ignore the prefix.
+                    fprintf(out, "%.*s", (int)node->as.member_access.member.length, node->as.member_access.member.start);
+                    return;
+                }
             }
 
             if (node->as.member_access.member.length == 5 && memcmp(node->as.member_access.member.start, "value", 5) == 0) {
@@ -567,18 +593,8 @@ case AST_CONTINUE_STMT:
     break;
 
 case AST_IMPORT: {
-    Token path_tok = node->as.import_decl.path;
-    // The path is a string literal like "utils/math.jiang"
-    // We strip quotes and change extension to .c or .h
-    // Simple approach: replace .jiang" with .c"
-    char path[256];
-    snprintf(path, sizeof(path), "%.*s", (int)path_tok.length, path_tok.start);
-    char* dot_jiang = strstr(path, ".jiang");
-    if (dot_jiang) {
-        memcpy(dot_jiang, ".c", 2);
-        memmove(dot_jiang + 2, dot_jiang + 6, strlen(dot_jiang + 6) + 1);
-    }
-    fprintf(out, "#include %s\n", path);
+    // Use the pre-resolved absolute path from semantic analysis
+    fprintf(out, "#include \"%s\"\n", node->as.import_decl.resolved_path);
     return; // Exit to avoid the automatic semicolon in the main loop
 }
 
@@ -589,6 +605,13 @@ case AST_IMPORT: {
 }
 
 void generate_c_code(ASTNode* root, const char* out_path) {
+    // Reset global state for each file generation
+    gen_sym_count = 0;
+    gen_enum_count = 0;
+    gen_struct_count = 0;
+    current_struct_context = NULL;
+    current_struct_field_count = 0;
+
     FILE* out = fopen(out_path, "w");
     if (!out) {
         fprintf(stderr, "Generator could not open output file %s\n", out_path);
@@ -739,23 +762,21 @@ void generate_c_code(ASTNode* root, const char* out_path) {
     }
 
     // Pass 2: Executable code in main
-    bool is_main_out = (strcmp(out_path, "out.c") == 0);
+    bool is_main_out = (strstr(out_path, "out.c") != NULL);
     if (is_main_out) {
         fprintf(out, "int main() {\n    ");
-    }
 
-    for (size_t i = 0; i < root->as.block.count; i++) {
-        ASTNode* node = root->as.block.statements[i];
-        if (node->type != AST_FUNC_DECL && node->type != AST_STRUCT_DECL && node->type != AST_ENUM_DECL && node->type != AST_IMPORT) {
-            generate_node(node, out);
-            NodeType t = node->type;
-            if (t != AST_BLOCK && t != AST_IF_STMT && t != AST_WHILE_STMT && t != AST_FOR_STMT) {
-                fprintf(out, ";\n    ");
+        for (size_t i = 0; i < root->as.block.count; i++) {
+            ASTNode* node = root->as.block.statements[i];
+            if (node->type != AST_FUNC_DECL && node->type != AST_STRUCT_DECL && node->type != AST_ENUM_DECL && node->type != AST_IMPORT) {
+                generate_node(node, out);
+                NodeType t = node->type;
+                if (t != AST_BLOCK && t != AST_IF_STMT && t != AST_WHILE_STMT && t != AST_FOR_STMT) {
+                    fprintf(out, ";\n    ");
+                }
             }
         }
-    }
 
-    if (is_main_out) {
         fprintf(out, "return 0;\n");
         fprintf(out, "}\n");
     }

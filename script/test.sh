@@ -24,15 +24,26 @@ SUCCESS_COUNT=0
 FAIL_COUNT=0
 SKIPPED_COUNT=0
 
+cd "$PROJECT_ROOT"
+
+# 预先创建必要的 build 目录结构，以支持嵌套模块的编译
+mkdir -p "$BUILD_DIR/tests/dir"
+
 for TEST_FILE in "$TESTS_DIR"/*.jiang; do
     BASENAME=$(basename "$TEST_FILE")
     echo -n "正在测试 $BASENAME ... "
 
     # 清理上一次的产物
+    rm -f "out.c"
     rm -f "$OUTPUT_C"
     
     # 运行编译器并捕获输出
-    ./jiangc "$TEST_FILE" > compiler_output.log 2>&1
+    "$BUILD_DIR/jiangc" "$TEST_FILE" > compiler_output.log 2>&1
+
+    # 如果生成了 out.c，将其移到 build 目录
+    if [ -f "out.c" ]; then
+        mv out.c "$OUTPUT_C"
+    fi
 
     # 针对预期失败的用例 (文件名以 fail_ 开头)
     if [[ "$BASENAME" == fail_* ]]; then

@@ -5,6 +5,59 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <unistd.h>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void get_absolute_path(const char* relative_path, char* buffer) {
+    if (realpath(relative_path, buffer) == NULL) {
+        // If realpath fails (e.g. file doesn't exist yet), 
+        // fall back to the relative path but this is risky.
+        strncpy(buffer, relative_path, PATH_MAX);
+    }
+}
+
+static void ensure_dir_exists(const char* path) {
+    char dir[PATH_MAX];
+    strncpy(dir, path, PATH_MAX);
+    char* last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        char command[PATH_MAX + 10];
+        snprintf(command, sizeof(command), "mkdir -p %s", dir);
+        system(command);
+    }
+}
+
+static void resolve_import_path(const char* current_file_path, const char* import_path, char* buffer) {
+    // 1. If import_path is absolute, just normalize it
+    if (import_path[0] == '/') {
+        get_absolute_path(import_path, buffer);
+        return;
+    }
+
+    // 2. Make it relative to current_file_path's directory
+    char dir[PATH_MAX];
+    strncpy(dir, current_file_path, PATH_MAX);
+    char* last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0'; // Get directory part
+    } else {
+        strcpy(dir, "."); // Current directory
+    }
+
+    char joined[PATH_MAX];
+    snprintf(joined, PATH_MAX, "%s/%s", dir, import_path);
+    
+    // Use realpath to resolve .. and .
+    if (realpath(joined, buffer) == NULL) {
+        // Fallback
+        strncpy(buffer, joined, PATH_MAX);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Symbol Table
@@ -17,12 +70,14 @@ typedef enum {
     SYM_ENUM,
     SYM_PARAM,
     SYM_BUILTIN,
+    SYM_NAMESPACE, // <--- Added: represents an imported module
 } SymbolKind;
 
 typedef struct Symbol {
     char        name[128];
     SymbolKind  kind;
     TypeExpr*   type;        // May be NULL for structs/enums
+    struct Module* module_ptr; // <--- Added: for SYM_NAMESPACE
     int         defined_line;
     bool        is_public;   // <--- Added: visibility flag
     struct Symbol* next;     // Linked list within one scope
@@ -540,13 +595,48 @@ static bool check_node(ASTNode* node) {
             break;
 
         // ── Member access ─────────────────────────────────────────────────
-        case AST_MEMBER_ACCESS:
+        case AST_MEMBER_ACCESS: {
             check_node(node->as.member_access.object);
+            
+            // Check for namespace access: alias.member
+            if (node->as.member_access.object->type == AST_IDENTIFIER) {
+                Token obj_name = node->as.member_access.object->as.identifier.name;
+                Symbol* sym = lookup_token(obj_name);
+                if (sym && sym->kind == SYM_NAMESPACE) {
+                    // This is a namespace access. Look up the member in the module's top scope.
+                    Module* mod = sym->module_ptr;
+                    Token member_tok = node->as.member_access.member;
+                    
+                    Symbol* member_sym = NULL;
+                    if (mod->top_level_scope) {
+                        for (Symbol* s = mod->top_level_scope->symbols; s; s = s->next) {
+                            if (s->name[member_tok.length] == '\0' &&
+                                strncmp(s->name, member_tok.start, member_tok.length) == 0) {
+                                if (s->is_public) {
+                                    member_sym = s;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (!member_sym) {
+                        semantic_error(node->line, "Module '%s' does not export a member named '%.*s'.",
+                                       mod->path, (int)member_tok.length, member_tok.start);
+                    } else {
+                        // Success! Resolve type
+                        node->evaluated_type = member_sym->type;
+                    }
+                    return true;
+                }
+            }
+
             // If the object has a type, we might want to resolve the member type too.
             // For now, the generator just needs to know if 'object' is a pointer.
             if (node->as.member_access.object)
                 node->evaluated_type = node->as.member_access.object->evaluated_type;
             break;
+        }
 
         // ── new expression ────────────────────────────────────────────────
         case AST_NEW_EXPR:
@@ -614,8 +704,12 @@ static bool check_node(ASTNode* node) {
         case AST_IMPORT: {
             Token path_tok = node->as.import_decl.path;
             // The path is a string literal including quotes, e.g., "utils/math.jiang"
-            char path[256];
-            snprintf(path, sizeof(path), "%.*s", (int)path_tok.length - 2, path_tok.start + 1);
+            char raw_path[PATH_MAX];
+            snprintf(raw_path, sizeof(raw_path), "%.*s", (int)path_tok.length - 2, path_tok.start + 1);
+
+            char path[PATH_MAX];
+            resolve_import_path(current_module->path, raw_path, path);
+            strncpy(node->as.import_decl.resolved_path, path, 256);
 
             // 1. Load and parse the imported file
             FILE* file = fopen(path, "rb");
@@ -646,16 +740,32 @@ static bool check_node(ASTNode* node) {
                 had_error = true;
             }
 
-            // 3. Generate C code for the imported module
-            char c_path[256];
-            strncpy(c_path, path, 256);
-            char* dot_jiang = strstr(c_path, ".jiang");
-            if (dot_jiang) {
-                memcpy(dot_jiang, ".c", 2);
-                dot_jiang[2] = '\0';
-            } else {
-                strncat(c_path, ".c", 256);
+            // 3. Generate C code for the imported module in the 'build' directory
+            char c_path[PATH_MAX];
+            
+            char cwd[PATH_MAX];
+            getcwd(cwd, sizeof(cwd));
+            const char* relative_to_root = path;
+            if (strncmp(path, cwd, strlen(cwd)) == 0) {
+                relative_to_root = path + strlen(cwd);
+                if (relative_to_root[0] == '/') relative_to_root++;
             }
+
+            snprintf(c_path, sizeof(c_path), "build/%s", relative_to_root);
+            
+            // Store the ABSOLUTE path where the C code is generated
+            char abs_buffer[PATH_MAX];
+            getcwd(abs_buffer, sizeof(abs_buffer));
+            snprintf(node->as.import_decl.resolved_path, 256, "%s/%s", abs_buffer, c_path);
+            
+            // Now fix suffixes in both paths
+            char* dot_jiang_c = strstr(c_path, ".jiang");
+            if (dot_jiang_c) { memcpy(dot_jiang_c, ".c", 2); dot_jiang_c[2] = '\0'; }
+            
+            char* dot_jiang_res = strstr(node->as.import_decl.resolved_path, ".jiang");
+            if (dot_jiang_res) { memcpy(dot_jiang_res, ".c", 2); dot_jiang_res[2] = '\0'; }
+
+            ensure_dir_exists(c_path);
             generate_c_code(imported_root, c_path);
 
             // 4. Import the public symbols from the analyzed module
@@ -670,10 +780,15 @@ static bool check_node(ASTNode* node) {
             if (imported_mod && imported_mod->top_level_scope) {
                 Token alias = node->as.import_decl.alias;
                 if (alias.length > 0) {
-                    // TODO: Implement namespaces/aliases. 
-                    // For now, let's just dump symbols directly if no alias, 
-                    // and error if there's an alias we can't handle yet.
-                    semantic_error(node->line, "Import aliases are not yet fully implemented.");
+                    // Create a namespace symbol
+                    Symbol* ns_sym = (Symbol*)malloc(sizeof(Symbol));
+                    snprintf(ns_sym->name, sizeof(ns_sym->name), "%.*s", (int)alias.length, alias.start);
+                    ns_sym->kind = SYM_NAMESPACE;
+                    ns_sym->module_ptr = imported_mod;
+                    ns_sym->defined_line = node->line;
+                    ns_sym->is_public = false;
+                    ns_sym->next = current_scope->symbols;
+                    current_scope->symbols = ns_sym;
                 } else {
                     // Direct import: Copy public symbols from imported_mod to current_scope
                     Symbol* sym = imported_mod->top_level_scope->symbols;
@@ -757,7 +872,10 @@ static bool check_node(ASTNode* node) {
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool semantic_check(Arena* arena, ASTNode* root, const char* path) {
+bool semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
+    char path[PATH_MAX];
+    get_absolute_path(input_path, path);
+
     printf("Starting semantic analysis for %s...\n", path);
     
     // Check if already in cache
