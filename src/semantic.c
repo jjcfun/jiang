@@ -77,9 +77,10 @@ typedef struct Symbol {
     char        name[128];
     SymbolKind  kind;
     TypeExpr*   type;        // May be NULL for structs/enums
-    struct Module* module_ptr; // <--- Added: for SYM_NAMESPACE
+    struct Module* module_ptr; // For SYM_NAMESPACE or owner of the symbol
+    struct Module* module_owner; // <--- Added: the module where this symbol is defined
     int         defined_line;
-    bool        is_public;   // <--- Added: visibility flag
+    bool        is_public;   // visibility flag
     struct Symbol* next;     // Linked list within one scope
 } Symbol;
 
@@ -136,8 +137,7 @@ static void semantic_error(int line, const char* format, ...) {
 // ── Scope helpers ─────────────────────────────────────────────────────────────
 
 static Scope* scope_push(void) {
-    Scope* s = (Scope*)malloc(sizeof(Scope));
-    s->symbols = NULL;
+    Scope* s = (Scope*)calloc(1, sizeof(Scope));
     s->parent  = current_scope;
     current_scope = s;
     return s;
@@ -183,10 +183,12 @@ static bool symbol_define(const char* name, size_t name_len,
         }
     }
 
-    Symbol* sym = (Symbol*)malloc(sizeof(Symbol));
+    Symbol* sym = (Symbol*)calloc(1, sizeof(Symbol));
     snprintf(sym->name, sizeof(sym->name), "%.*s", (int)name_len, name);
     sym->kind         = kind;
     sym->type         = type;
+    sym->module_ptr   = NULL;
+    sym->module_owner = current_module; // <--- Set owner
     sym->defined_line = line;
     sym->is_public    = is_public;
     sym->next         = current_scope->symbols;
@@ -239,6 +241,19 @@ static bool check_init_assign(ASTNode* node, Token* req, bool* ass,
                 if (req[i].length == name.length &&
                     strncmp(req[i].start, name.start, name.length) == 0) {
                     ass[i] = true;
+                }
+            }
+        } else if (node->as.binary.left->type == AST_MEMBER_ACCESS) {
+            ASTNode* obj = node->as.binary.left->as.member_access.object;
+            if (obj->type == AST_IDENTIFIER && 
+                obj->as.identifier.name.length == 4 && 
+                strncmp(obj->as.identifier.name.start, "self", 4) == 0) {
+                Token name = node->as.binary.left->as.member_access.member;
+                for (size_t i = 0; i < count; i++) {
+                    if (req[i].length == name.length &&
+                        strncmp(req[i].start, name.start, name.length) == 0) {
+                        ass[i] = true;
+                    }
                 }
             }
         }
@@ -410,6 +425,11 @@ static bool check_node(ASTNode* node) {
             // Check initializer before defining the variable itself
             check_node(node->as.var_decl.initializer);
 
+            // Simple type inference
+            if (node->as.var_decl.type == NULL && node->as.var_decl.initializer != NULL) {
+                node->as.var_decl.type = node->as.var_decl.initializer->evaluated_type;
+            }
+
             // Define in current scope
             define_token(node->as.var_decl.name, SYM_VAR, node->as.var_decl.type, node->is_public);
             node->evaluated_type = node->as.var_decl.type;
@@ -501,24 +521,27 @@ static bool check_node(ASTNode* node) {
 
         // ── Struct declaration ────────────────────────────────────────────
         case AST_STRUCT_DECL: {
+            // Find the struct symbol we registered in pre-pass
+            Symbol* struct_sym = lookup_token(node->as.struct_decl.name);
+
             // Struct name already registered in program pre-pass.
-            // Open a new scope for struct members (not visible outside, but needed
-            // for init checking).
+            // Open a new scope for struct members.
             scope_push();
+            if (struct_sym) struct_sym->module_ptr = (Module*)current_scope; // Hack: reuse module_ptr to hold Scope* for members
 
             // Register methods and fields into the struct scope
             for (size_t i = 0; i < node->as.struct_decl.member_count; i++) {
                 ASTNode* member = node->as.struct_decl.members[i];
                 if (member->type == AST_VAR_DECL) {
                     define_token(member->as.var_decl.name, SYM_VAR,
-                                 member->as.var_decl.type, false);
+                                 member->as.var_decl.type, member->is_public);
                 } else if (member->type == AST_FUNC_DECL) {
                     define_token(member->as.func_decl.name, SYM_FUNC,
-                                 member->as.func_decl.return_type, false);
+                                 member->as.func_decl.return_type, member->is_public);
                 }
             }
 
-            // Verify init methods assign all non-optional fields
+            // ... rest of init checking ...
             for (size_t i = 0; i < node->as.struct_decl.member_count; i++) {
                 ASTNode* member = node->as.struct_decl.members[i];
                 if (member->type == AST_INIT_DECL) {
@@ -553,7 +576,9 @@ static bool check_node(ASTNode* node) {
                 }
             }
 
-            scope_pop();
+            // Note: We don't pop and free the scope if we want to preserve it!
+            // But currently scope_pop frees symbols. We need to detach it.
+            current_scope = current_scope->parent;
             break;
         }
 
@@ -606,10 +631,9 @@ static bool check_node(ASTNode* node) {
                 Token obj_name = node->as.member_access.object->as.identifier.name;
                 Symbol* sym = lookup_token(obj_name);
                 if (sym && sym->kind == SYM_NAMESPACE) {
-                    // This is a namespace access. Look up the member in the module's top scope.
+                    // ... (existing namespace logic) ...
                     Module* mod = sym->module_ptr;
                     Token member_tok = node->as.member_access.member;
-                    
                     Symbol* member_sym = NULL;
                     if (mod->top_level_scope) {
                         for (Symbol* s = mod->top_level_scope->symbols; s; s = s->next) {
@@ -622,20 +646,49 @@ static bool check_node(ASTNode* node) {
                             }
                         }
                     }
-                    
                     if (!member_sym) {
                         semantic_error(node->line, "Module '%s' does not export a member named '%.*s'.",
                                        mod->path, (int)member_tok.length, member_tok.start);
                     } else {
-                        // Success! Resolve type
                         node->evaluated_type = member_sym->type;
                     }
                     return true;
                 }
             }
 
-            // If the object has a type, we might want to resolve the member type too.
-            // For now, the generator just needs to know if 'object' is a pointer.
+            // --- Struct field visibility check ---
+            if (node->as.member_access.object->evaluated_type) {
+                if (node->as.member_access.object->evaluated_type->kind == TYPE_BASE) {
+                    Token type_name = node->as.member_access.object->evaluated_type->as.base_type;
+                    Symbol* struct_sym = lookup_token(type_name);
+                    if (struct_sym && struct_sym->kind == SYM_STRUCT) {
+                        Scope* member_scope = (Scope*)struct_sym->module_ptr;
+                        if (member_scope) {
+                            Token field_name = node->as.member_access.member;
+                            Symbol* field_sym = NULL;
+                            for (Symbol* s = member_scope->symbols; s; s = s->next) {
+                                if (s->name[field_name.length] == '\0' &&
+                                    strncmp(s->name, field_name.start, field_name.length) == 0) {
+                                    field_sym = s;
+                                    break;
+                                }
+                            }
+
+                            if (field_sym) {
+                                if (!field_sym->is_public) {
+                                    if (struct_sym->module_owner != current_module) {
+                                        semantic_error(node->line, 
+                                            "Cannot access private field '%.*s' of struct '%.*s' from outside its defining module.",
+                                            (int)field_name.length, field_name.start,
+                                            (int)type_name.length, type_name.start);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if (node->as.member_access.object)
                 node->evaluated_type = node->as.member_access.object->evaluated_type;
             break;
@@ -818,8 +871,17 @@ static bool check_node(ASTNode* node) {
                                 }
                             }
                             if (!conflict) {
-                                symbol_define(sym->name, strlen(sym->name), 
-                                              sym->kind, sym->type, node->line, false);
+                                // Create a new symbol in current scope but copy metadata
+                                Symbol* new_sym = (Symbol*)calloc(1, sizeof(Symbol));
+                                snprintf(new_sym->name, sizeof(new_sym->name), "%s", sym->name);
+                                new_sym->kind = sym->kind;
+                                new_sym->type = sym->type;
+                                new_sym->module_ptr = sym->module_ptr;
+                                new_sym->module_owner = sym->module_owner;
+                                new_sym->defined_line = node->line;
+                                new_sym->is_public = false; // The imported symbol itself is private to this module unless re-exported
+                                new_sym->next = current_scope->symbols;
+                                current_scope->symbols = new_sym;
                             }
                         }
                         sym = sym->next;
@@ -850,12 +912,43 @@ static bool check_node(ASTNode* node) {
             break;
 
         // ── Struct init expression ────────────────────────────────────────
-        case AST_STRUCT_INIT_EXPR:
+        case AST_STRUCT_INIT_EXPR: {
             for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
                 check_node(node->as.struct_init.field_values[i]);
             }
             node->evaluated_type = node->as.struct_init.type;
+
+            // Visibility check for struct init fields
+            if (node->as.struct_init.type && node->as.struct_init.type->kind == TYPE_BASE) {
+                Token type_name = node->as.struct_init.type->as.base_type;
+                Symbol* struct_sym = lookup_token(type_name);
+                if (struct_sym && struct_sym->kind == SYM_STRUCT) {
+                    Scope* member_scope = (Scope*)struct_sym->module_ptr;
+                    if (member_scope && struct_sym->module_owner != current_module) {
+                        // We are outside the defining module. 
+                        // Check if any field being initialized is private.
+                        for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
+                            Token field_name = node->as.struct_init.field_names[i];
+                            Symbol* field_sym = NULL;
+                            for (Symbol* s = member_scope->symbols; s; s = s->next) {
+                                if (s->name[field_name.length] == '\0' &&
+                                    strncmp(s->name, field_name.start, field_name.length) == 0) {
+                                    field_sym = s;
+                                    break;
+                                }
+                            }
+                            if (field_sym && !field_sym->is_public) {
+                                semantic_error(node->line, 
+                                    "Cannot initialize private field '%.*s' of struct '%.*s' from outside its defining module. Use a public init method instead.",
+                                    (int)field_name.length, field_name.start,
+                                    (int)type_name.length, type_name.start);
+                            }
+                        }
+                    }
+                }
+            }
             break;
+        }
 
         // ── Init declaration (handled inside STRUCT_DECL) ─────────────────
         case AST_INIT_DECL:

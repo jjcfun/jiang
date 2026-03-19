@@ -626,6 +626,11 @@ static ASTNode* struct_declaration() {
     size_t count = 0;
     
     while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
+        bool is_public = false;
+        if (match(TOKEN_PUBLIC)) {
+            is_public = true;
+        }
+
         if (match(TOKEN_INIT)) {
             // Constructor
             consume(TOKEN_LEFT_PAREN, "Expect '(' after 'init'.");
@@ -647,6 +652,7 @@ static ASTNode* struct_declaration() {
             
             ASTNode* body = statement();
             ASTNode* init_node = ast_new_node(parser.arena, AST_INIT_DECL, parser.previous.line);
+            init_node->is_public = is_public;
             init_node->as.init_decl.param_count = param_count;
             if (param_count > 0) {
                 init_node->as.init_decl.params = arena_alloc(parser.arena, sizeof(ASTNode*) * param_count);
@@ -663,6 +669,7 @@ static ASTNode* struct_declaration() {
             if (check(TOKEN_LEFT_PAREN)) {
                 // Method
                 ASTNode* method = function_declaration(type, mem_name);
+                if (method) method->is_public = is_public;
                 members[count++] = method;
             } else {
                 // Fields (could be multiple separated by comma)
@@ -675,6 +682,7 @@ static ASTNode* struct_declaration() {
                     field->as.var_decl.type = type;
                     field->as.var_decl.name = mem_name;
                     field->as.var_decl.initializer = NULL;
+                    field->is_public = is_public;
                     members[count++] = field;
                 } while (match(TOKEN_COMMA));
                 
