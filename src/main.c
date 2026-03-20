@@ -34,17 +34,37 @@ static char* read_file(const char* path) {
     return buffer;
 }
 
+#include <libgen.h> // For basename
+
 static void run(const char* source, const char* path) {
     // 1. Initialize the AST memory pool
     Arena* arena = arena_create();
+
+    // Reset semantic state before starting
+    semantic_reset();
 
     // 2. Parse the code
     ASTNode* root = parse_source(arena, source);
 
     if (root) {
-        if (semantic_check(arena, root, path)) {
-            // Use build/out.c as the entry point
-            generate_c_code(root, "build/out.c");
+        // Derive binary name from input path, e.g., tests/union_test.jiang -> build/union_test
+        char path_copy[1024];
+        strncpy(path_copy, path, sizeof(path_copy));
+        char* base = basename(path_copy);
+        char bin_name[1024];
+        strncpy(bin_name, base, sizeof(bin_name));
+        char* dot = strrchr(bin_name, '.');
+        if (dot) *dot = '\0'; // Remove extension
+
+        char out_path[4096];
+        snprintf(out_path, sizeof(out_path), "build/%s.c", bin_name);
+
+        if (semantic_check(arena, root, path, out_path)) {
+            // Ensure build directory exists
+            system("mkdir -p build");
+
+            // Use build/[bin_name].c as the entry point
+            generate_c_code(root, out_path, true);
 
             // 3. Auto Linker: Link all generated C files
             char c_files[128][4096];
@@ -58,9 +78,8 @@ static void run(const char* source, const char* path) {
                 strncat(link_command, " ", sizeof(link_command) - strlen(link_command) - 1);
             }
 
-            // Output binary name (use basename of input file or 'a.out')
             char bin_path[4096];
-            snprintf(bin_path, sizeof(bin_path), "build/out_bin");
+            snprintf(bin_path, sizeof(bin_path), "build/%s", bin_name);
             
             strncat(link_command, "-o ", sizeof(link_command) - strlen(link_command) - 1);
             strncat(link_command, bin_path, sizeof(link_command) - strlen(link_command) - 1);
@@ -70,12 +89,15 @@ static void run(const char* source, const char* path) {
                 printf("Successfully built binary at: %s\n", bin_path);
             } else {
                 printf("Linking failed.\n");
+                exit(1);
             }
         } else {
             printf("Compilation failed due to semantic errors.\n");
+            exit(1);
         }
     } else {
         printf("Failed to parse AST.\n");
+        exit(1);
     }
 
     // 4. Free the entire AST with one stroke

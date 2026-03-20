@@ -44,6 +44,29 @@ _ y = 3.14; // 推断为 Double
 _ name = "Jiang"; // 推断为UInt8[5]
 ```
 
+### 类型转换 (Type Casting)
+
+Jiang 语言支持显式的类型转换，采用 `$a.cast(Type)` 的语法。其中 `$` 符号表示对对象本身进行“元操作”，`cast` 是一个特殊的元方法，它接收一个类型表达式作为参数。
+
+```c
+Float f = 10.5;
+
+// 将 Float 转换为 Int
+Int i = $f.cast(Int);
+
+print("i = %d", i); // 输出：i = 10
+
+// 将 Int 转换为 UInt8
+Int val = 255;
+UInt8 small_val = $val.cast(UInt8);
+
+// 注意：某些危险的转换（如指针强转）可能需要包裹在 sudo 块中
+Int addr = 0x12345678;
+sudo {
+    Int* ptr = $addr.cast(Int*);
+}
+```
+
 ### 数组（Array）
 
 数组的长度是类型的一部分，必须在编译期就确定，所以数组类型不支运行时改变长度，这与C、Rust、Zig类似。

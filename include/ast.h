@@ -13,7 +13,8 @@ typedef enum {
     TYPE_ARRAY,
     TYPE_SLICE,
     TYPE_NULLABLE,
-    TYPE_MUTABLE
+    TYPE_MUTABLE,
+    TYPE_TUPLE
 } TypeKind;
 
 typedef struct TypeExpr TypeExpr;
@@ -38,6 +39,11 @@ struct TypeExpr {
         struct {
             TypeExpr* element;
         } mutable; // For TYPE_MUTABLE
+        struct {
+            struct TypeExpr** elements;
+            Token* names; // Optional, can be NULL
+            size_t count;
+        } tuple; // For TYPE_TUPLE
     } as;
 };
 
@@ -68,7 +74,9 @@ typedef enum {
     AST_ENUM_ACCESS,
     AST_BREAK_STMT,
     AST_CONTINUE_STMT,
-    AST_IMPORT
+    AST_IMPORT,
+    AST_UNION_DECL,
+    AST_PATTERN
     } NodeType;
 
     typedef struct ASTNode ASTNode;
@@ -81,6 +89,14 @@ typedef enum {
 
     // Union to hold varying node data depending on type
     union {
+        // AST_PATTERN
+        struct {
+            TypeExpr* type; // NULL for inferred '_'
+            Token name;
+            Token field_name; // Field name being deconstructed (if any)
+            int field_index;  // Field index being deconstructed
+        } pattern;
+
         // AST_PROGRAM or AST_BLOCK
         struct {
             ASTNode** statements;
@@ -238,12 +254,21 @@ typedef enum {
             Token enum_name; // (Token){0} if inferred
             Token member_name;
         } enum_access;
+
+        // AST_UNION_DECL
+        struct {
+            Token name;
+            Token tag_enum; // Optional
+            ASTNode** members;
+            size_t member_count;
+        } union_decl;
     } as;
 };
 
 // Create a new TypeExpr
 TypeExpr* type_new_base(Arena* arena, Token token);
 TypeExpr* type_new_modifier(Arena* arena, TypeKind kind, TypeExpr* element);
+TypeExpr* type_new_tuple(Arena* arena, TypeExpr** elements, Token* names, size_t count);
 
 // Utility to print TypeExpr
 void type_print(TypeExpr* type);

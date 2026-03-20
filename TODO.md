@@ -25,9 +25,31 @@
 - [x] **结构体封装性**: 实现私有字段访问限制及强制构造函数初始化逻辑。
 
 ### 2. 生成器完善 (Generator Updates)
-- [x] **自动化编译链**: 改进生成器，使其能自动生成 `Makefile` 或调用 `gcc` 编译所有相关的 `.c` 文件，而不仅仅是靠 `#include`。
+- [x] **自动化编译链**: 改进生成器，使其能自动生成 `Makefile` 或调用 `gcc` 编译所有相关的 `.c` 文件。
 - [x] **更优雅的 Slice 定义**: 将 `Slice_int64_t` 等公共定义提取到单独的 `include/runtime.h` 中。
-- [x] **全局头文件保护**: 为所有生成的 C 文件增加 `#ifndef` 保护，支持递归引用。
+- [x] **全局头文件保护**: 为所有生成的 C 文件增加 `#ifndef` 保护。
+
+## 🚀 待办事项 (TODO) - 核心架构升级
+
+### 1. 引入 JIR (Jiang Intermediate Representation)
+- [ ] **定义 JIR 结构**: 实现基于指令流的线性 IR（类似于 Zig 的 ZIR 或三地址码）。
+    - 定义 `JirInstruction` (OpCode, dest, src1, src2) 和 `JirLocal`。
+- [ ] **实现 Lowering 流程**: 将 AST 降级为 JIR 序列。
+    - **表达式扁平化**: 将嵌套表达式拆解为中间变量赋值。
+    - **语法糖消解**: 在 IR 层展开 `$` 操作符、Union 模式匹配和 `for-in` 循环。
+    - **显式符号绑定**: 终结 Codegen 阶段的字符串查找，每个引用直接关联 `Symbol`。
+- [ ] **重构 Codegen**: 将 `generator.c` 切换为基于 JIR 生成 C 代码，消除现有的状态管理混乱。
+
+### 2. Union 类型与模式匹配 (Union & Pattern Matching)
+- [x] **Union 基础实现**: 支持 `union(Tag) Name { ... }` 语法及 C 代码生成。
+- [ ] **Switch 模式匹配**: 实现 `switch` 语句对 Union 变体的解构（Pattern Matching）。
+- [ ] **匿名 Union**: 支持不带显式 Tag Enum 的 Union。
+
+## 🐞 待修复的 Bug (Bug Fixes)
+- [ ] **构造函数映射**: 修复 `Vault(...)` 没能正确翻译为 `Vault_new(...)` 的问题。
+- [ ] **多模块符号可见性**: 解决 `Alias.member` 在独立编译模式下产生的链接错误。
+- [ ] **切片语法兼容性**: 完善 `x[]` 在 C 语言层面的零索引占位生成。
+- [ ] **空元组返回处理**: 统一将 `() func()` 在 C 声明中映射为 `void func()`。
 
 ## 📝 架构笔记 (Architectural Notes)
 - **File as a Struct**: 借鉴 Zig 的设计，将每个文件视为一个独立的命名空间，避免全局符号冲突。

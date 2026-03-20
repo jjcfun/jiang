@@ -68,6 +68,7 @@ typedef enum {
     SYM_FUNC,
     SYM_STRUCT,
     SYM_ENUM,
+    SYM_VARIANT, // For Union variants
     SYM_PARAM,
     SYM_BUILTIN,
     SYM_NAMESPACE, // <--- Added: represents an imported module
@@ -109,7 +110,7 @@ static int     module_count = 0;
 static char    generated_c_files[128][PATH_MAX];
 static int     generated_c_count = 0;
 
-static bool symbol_define(const char* name, size_t name_len,
+static Symbol* symbol_define(const char* name, size_t name_len,
                           SymbolKind kind, TypeExpr* type, int line, bool is_public);
 
 static void register_builtins(void) {
@@ -161,14 +162,14 @@ static void scope_pop(void) {
 // ── Symbol helpers ────────────────────────────────────────────────────────────
 
 // Define a symbol in the CURRENT scope.
-// Returns false (and emits an error) if the name is already defined in this scope.
-static bool symbol_define(const char* name, size_t name_len,
+// Returns NULL (and emits an error) if the name is already defined in this scope.
+static Symbol* symbol_define(const char* name, size_t name_len,
                           SymbolKind kind, TypeExpr* type, int line, bool is_public) {
-    if (!current_scope) return true; // Safety
+    if (!current_scope) return NULL; // Safety
 
     if (name_len == 0) {
         // This shouldn't happen
-        return true; 
+        return NULL; 
     }
 
     // Check for duplicate in current scope only
@@ -179,7 +180,7 @@ static bool symbol_define(const char* name, size_t name_len,
                     "Identifier '%.*s' is already declared in this scope (first declared at line %d).",
                     (int)name_len, name, s->defined_line);
             }
-            return false;
+            return NULL;
         }
     }
 
@@ -193,7 +194,7 @@ static bool symbol_define(const char* name, size_t name_len,
     sym->is_public    = is_public;
     sym->next         = current_scope->symbols;
     current_scope->symbols = sym;
-    return true;
+    return sym;
 }
 
 // Look up a symbol starting from the current scope, walking up to global.
@@ -209,7 +210,7 @@ static Symbol* symbol_lookup(const char* name, size_t name_len) {
 }
 
 // Convenience wrapper using a Token
-static bool define_token(Token tok, SymbolKind kind, TypeExpr* type, bool is_public) {
+static Symbol* define_token(Token tok, SymbolKind kind, TypeExpr* type, bool is_public) {
     return symbol_define(tok.start, tok.length, kind, type, tok.line, is_public);
 }
 
@@ -388,6 +389,8 @@ static bool check_node(ASTNode* node) {
                     define_token(decl->as.struct_decl.name, SYM_STRUCT, NULL, decl->is_public);
                 } else if (decl->type == AST_ENUM_DECL) {
                     define_token(decl->as.enum_decl.name, SYM_ENUM, NULL, decl->is_public);
+                } else if (decl->type == AST_UNION_DECL) {
+                    define_token(decl->as.union_decl.name, SYM_STRUCT, NULL, decl->is_public);
                 }
             }
 
@@ -460,6 +463,15 @@ static bool check_node(ASTNode* node) {
             break;
         }
 
+        // ── Pattern ───────────────────────────────────────────────────────
+        case AST_PATTERN: {
+            if (node->as.pattern.type) {
+                node->evaluated_type = node->as.pattern.type;
+            }
+            // Note: type inference happens in the caller (e.g. AST_BINARY_EXPR)
+            break;
+        }
+
         // ── Function declaration ──────────────────────────────────────────
         case AST_FUNC_DECL: {
             // The function name was already registered in the program pre-pass.
@@ -491,6 +503,8 @@ static bool check_node(ASTNode* node) {
         case AST_FUNC_CALL: {
             // Validate callee
             ASTNode* callee = node->as.func_call.callee;
+            Symbol* variant_sym = NULL;
+
             if (callee->type == AST_IDENTIFIER) {
                 Token name = callee->as.identifier.name;
                 Symbol* sym = lookup_token(name);
@@ -498,21 +512,60 @@ static bool check_node(ASTNode* node) {
                     semantic_error(node->line,
                         "Call to undefined function or type '%.*s'.",
                         (int)name.length, name.start);
-                }
-                if (sym) {
+                } else {
                     if (sym->kind == SYM_STRUCT) {
                         // Constructor returns the struct type
                         node->evaluated_type = type_new_base(eval_arena, name);
+                    } else if (sym->kind == SYM_VARIANT) {
+                        // Union variant constructor
+                        variant_sym = sym;
+                        // Find the parent Union type. 
+                        // For simplicity, we can try to find the Union name from the scope.
+                        // However, variants are defined in the Union's scope.
+                        // So the parent scope should have the Union name.
+                        if (current_scope->parent) {
+                             // This is a bit complex if it's a direct call like `circle(10.5)`.
+                             // But usually it's `Shape.circle(10.5)`.
+                        }
                     } else if (sym->kind == SYM_BUILTIN) {
                         node->evaluated_type = NULL;
                     } else {
                         node->evaluated_type = sym->type;
                     }
                 }
+            } else if (callee->type == AST_MEMBER_ACCESS) {
+                check_node(callee);
+                // If it's a member access, we need to check if the member is a variant.
+                // AST_MEMBER_ACCESS logic should have set the type, but for variants,
+                // we want the return type of the call to be the Union type.
+                
+                // Let's re-lookup the variant symbol to be sure.
+                if (callee->as.member_access.object->evaluated_type && 
+                    callee->as.member_access.object->evaluated_type->kind == TYPE_BASE) {
+                    Token union_name = callee->as.member_access.object->evaluated_type->as.base_type;
+                    Symbol* union_sym = lookup_token(union_name);
+                    if (union_sym && union_sym->kind == SYM_STRUCT) {
+                         Scope* union_scope = (Scope*)union_sym->module_ptr;
+                         if (union_scope) {
+                             Token m_name = callee->as.member_access.member;
+                             for (Symbol* s = union_scope->symbols; s; s = s->next) {
+                                 if (s->name[m_name.length] == '\0' && 
+                                     strncmp(s->name, m_name.start, m_name.length) == 0) {
+                                     if (s->kind == SYM_VARIANT) {
+                                         variant_sym = s;
+                                         node->evaluated_type = type_new_base(eval_arena, union_name);
+                                     }
+                                     break;
+                                 }
+                             }
+                         }
+                    }
+                }
             } else {
                 check_node(callee);
                 node->evaluated_type = callee->evaluated_type;
             }
+
             for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
                 check_node(node->as.func_call.args[i]);
             }
@@ -593,6 +646,37 @@ static bool check_node(ASTNode* node) {
             break;
         }
 
+        case AST_UNION_DECL: {
+            Symbol* tag_enum_sym = NULL;
+            if (node->as.union_decl.tag_enum.length > 0) {
+                tag_enum_sym = lookup_token(node->as.union_decl.tag_enum);
+                if (!tag_enum_sym || tag_enum_sym->kind != SYM_ENUM) {
+                    semantic_error(node->line, "Undefined or invalid tag enum '%.*s' for union.",
+                        (int)node->as.union_decl.tag_enum.length, node->as.union_decl.tag_enum.start);
+                }
+            }
+
+            scope_push();
+            Symbol* union_sym = lookup_token(node->as.union_decl.name);
+            if (union_sym) union_sym->module_ptr = (Module*)current_scope;
+
+            for (size_t i = 0; i < node->as.union_decl.member_count; i++) {
+                ASTNode* member = node->as.union_decl.members[i];
+                Token m_name = member->as.var_decl.name;
+
+                // Register as variant, keeping its field type. 
+                // The parent union type is available via the union name.
+                Symbol* variant_sym = define_token(m_name, SYM_VARIANT, member->as.var_decl.type, false);
+                if (variant_sym) {
+                    variant_sym->module_owner = current_module;
+                    // We can store the parent union's name/type in a special field if needed,
+                    // but for now, the scope relationship should be enough.
+                }
+            }
+            current_scope = current_scope->parent;
+            break;
+        }
+
         // ── Enum access (.member or Enum.member) ──────────────────────────
         case AST_ENUM_ACCESS:
             // If a fully qualified enum name is given, verify the enum type exists.
@@ -607,13 +691,124 @@ static bool check_node(ASTNode* node) {
             break;
 
         // ── Binary expression ─────────────────────────────────────────────
-        case AST_BINARY_EXPR:
+        case AST_BINARY_EXPR: {
             check_node(node->as.binary.left);
+
+            // Special handling for Union Pattern Matching: union_val == Variant(patterns...)
+            if (node->as.binary.op == TOKEN_EQUAL_EQUAL && 
+                node->as.binary.left && node->as.binary.left->evaluated_type &&
+                node->as.binary.left->evaluated_type->kind == TYPE_BASE &&
+                node->as.binary.right && node->as.binary.right->type == AST_FUNC_CALL) {
+                
+                Token union_name = node->as.binary.left->evaluated_type->as.base_type;
+                Symbol* union_sym = lookup_token(union_name);
+                
+                if (union_sym && union_sym->kind == SYM_STRUCT) {
+                    ASTNode* call = node->as.binary.right;
+                    Symbol* variant_sym = NULL;
+
+                    // Find variant symbol
+                    if (call->as.func_call.callee->type == AST_MEMBER_ACCESS) {
+                        Token m_name = call->as.func_call.callee->as.member_access.member;
+                        Scope* union_scope = (Scope*)union_sym->module_ptr;
+                        if (union_scope) {
+                            for (Symbol* s = union_scope->symbols; s; s = s->next) {
+                                if (s->name[m_name.length] == '\0' && 
+                                    strncmp(s->name, m_name.start, m_name.length) == 0 &&
+                                    s->kind == SYM_VARIANT) {
+                                    variant_sym = s;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (variant_sym) {
+                        // Pattern matching!
+                        TypeExpr* v_type = variant_sym->type;
+                        
+                        if (v_type && v_type->kind == TYPE_TUPLE) {
+                            if (call->as.func_call.arg_count != v_type->as.tuple.count) {
+                                semantic_error(node->line, "Pattern match for variant '%.*s' expects %zu fields, got %zu.",
+                                    (int)strlen(variant_sym->name), variant_sym->name,
+                                    v_type->as.tuple.count, call->as.func_call.arg_count);
+                            } else {
+                                for (size_t i = 0; i < call->as.func_call.arg_count; i++) {
+                                    ASTNode* arg = call->as.func_call.args[i];
+                                    TypeExpr* field_type = v_type->as.tuple.elements[i];
+                                    if (arg->type == AST_PATTERN) {
+                                        arg->as.pattern.field_index = (int)i;
+                                        if (v_type->as.tuple.names) {
+                                            arg->as.pattern.field_name = v_type->as.tuple.names[i];
+                                        } else {
+                                            arg->as.pattern.field_name = (Token){0};
+                                        }
+                                        
+                                        if (arg->as.pattern.type == NULL || (arg->as.pattern.type->kind == TYPE_BASE && arg->as.pattern.type->as.base_type.length == 1 && arg->as.pattern.type->as.base_type.start[0] == '_')) {
+                                            arg->as.pattern.type = field_type;
+                                        }
+                                        arg->evaluated_type = arg->as.pattern.type;
+                                        define_token(arg->as.pattern.name, SYM_VAR, arg->evaluated_type, false);
+                                    } else {
+                                        check_node(arg);
+                                    }
+                                }
+                            }
+                        } else if (v_type) {
+                            // Single field variant (effectively a 1-element tuple for generation purposes)
+                            if (call->as.func_call.arg_count != 1) {
+                                semantic_error(node->line, "Pattern match for variant '%.*s' expects 1 field, got %zu.",
+                                    (int)strlen(variant_sym->name), variant_sym->name,
+                                    call->as.func_call.arg_count);
+                            } else {
+                                ASTNode* arg = call->as.func_call.args[0];
+                                if (arg->type == AST_PATTERN) {
+                                    arg->as.pattern.field_index = 0;
+                                    // Single field variants in the parser currently don't always use tuples
+                                    // but we can assume index 0 if it's not a tuple but has a type.
+                                    // Wait, if it's NOT a tuple, the generator will generate it as a direct field.
+                                    // Let's mark it index -1 to indicate direct field access.
+                                    arg->as.pattern.field_index = -1; 
+                                    
+                                    if (arg->as.pattern.type == NULL || (arg->as.pattern.type->kind == TYPE_BASE && arg->as.pattern.type->as.base_type.length == 1 && arg->as.pattern.type->as.base_type.start[0] == '_')) {
+                                        arg->as.pattern.type = v_type;
+                                    }
+                                    arg->evaluated_type = arg->as.pattern.type;
+                                    define_token(arg->as.pattern.name, SYM_VAR, arg->evaluated_type, false);
+                                } else {
+                                    check_node(arg);
+                                }
+                            }
+                        } else {
+                            // Variant with no fields (tag only)
+                            if (call->as.func_call.arg_count != 0) {
+                                semantic_error(node->line, "Pattern match for variant '%.*s' expects 0 fields, got %zu.",
+                                    (int)strlen(variant_sym->name), variant_sym->name,
+                                    call->as.func_call.arg_count);
+                            }
+                        }
+                        
+                        Token bool_tok = {TOKEN_IDENTIFIER, "Bool", 4, node->line};
+                        node->evaluated_type = type_new_base(eval_arena, bool_tok);
+                        return true;
+                    }
+                }
+            }
+
             check_node(node->as.binary.right);
             // Result type of binary expr usually same as left (simplification for MVP)
             if (node->as.binary.left && node->as.binary.left->evaluated_type)
                 node->evaluated_type = node->as.binary.left->evaluated_type;
+            
+            // If it's a comparison, return Bool
+            if (node->as.binary.op == TOKEN_EQUAL_EQUAL || node->as.binary.op == TOKEN_BANG_EQUAL ||
+                node->as.binary.op == TOKEN_LESS || node->as.binary.op == TOKEN_LESS_EQUAL ||
+                node->as.binary.op == TOKEN_GREATER || node->as.binary.op == TOKEN_GREATER_EQUAL) {
+                Token bool_tok = {TOKEN_IDENTIFIER, "Bool", 4, node->line};
+                node->evaluated_type = type_new_base(eval_arena, bool_tok);
+            }
             break;
+        }
 
         // ── Unary expression ──────────────────────────────────────────────
         case AST_UNARY_EXPR:
@@ -631,7 +826,6 @@ static bool check_node(ASTNode* node) {
                 Token obj_name = node->as.member_access.object->as.identifier.name;
                 Symbol* sym = lookup_token(obj_name);
                 if (sym && sym->kind == SYM_NAMESPACE) {
-                    // ... (existing namespace logic) ...
                     Module* mod = sym->module_ptr;
                     Token member_tok = node->as.member_access.member;
                     Symbol* member_sym = NULL;
@@ -656,13 +850,14 @@ static bool check_node(ASTNode* node) {
                 }
             }
 
-            // --- Struct field visibility check ---
+            // Type lookup for Struct, Union, and Tuple
             if (node->as.member_access.object->evaluated_type) {
-                if (node->as.member_access.object->evaluated_type->kind == TYPE_BASE) {
-                    Token type_name = node->as.member_access.object->evaluated_type->as.base_type;
-                    Symbol* struct_sym = lookup_token(type_name);
-                    if (struct_sym && struct_sym->kind == SYM_STRUCT) {
-                        Scope* member_scope = (Scope*)struct_sym->module_ptr;
+                TypeExpr* obj_type = node->as.member_access.object->evaluated_type;
+                if (obj_type->kind == TYPE_BASE) {
+                    Token type_name = obj_type->as.base_type;
+                    Symbol* sym = lookup_token(type_name);
+                    if (sym && (sym->kind == SYM_STRUCT || sym->kind == SYM_ENUM)) {
+                        Scope* member_scope = (Scope*)sym->module_ptr;
                         if (member_scope) {
                             Token field_name = node->as.member_access.member;
                             Symbol* field_sym = NULL;
@@ -673,19 +868,30 @@ static bool check_node(ASTNode* node) {
                                     break;
                                 }
                             }
-
                             if (field_sym) {
-                                if (!field_sym->is_public) {
-                                    if (struct_sym->module_owner != current_module) {
-                                        semantic_error(node->line, 
-                                            "Cannot access private field '%.*s' of struct '%.*s' from outside its defining module.",
-                                            (int)field_name.length, field_name.start,
-                                            (int)type_name.length, type_name.start);
-                                    }
+                                node->evaluated_type = field_sym->type;
+                                // Visibility check
+                                if (!field_sym->is_public && sym->module_owner != current_module) {
+                                    semantic_error(node->line, 
+                                        "Cannot access private member '%.*s' of '%.*s' from outside its module.",
+                                        (int)field_name.length, field_name.start,
+                                        (int)type_name.length, type_name.start);
                                 }
+                                return true;
                             }
                         }
                     }
+                } else if (obj_type->kind == TYPE_TUPLE) {
+                    Token field_name = node->as.member_access.member;
+                    for (size_t i = 0; i < obj_type->as.tuple.count; i++) {
+                        if (obj_type->as.tuple.names &&
+                            obj_type->as.tuple.names[i].length == field_name.length &&
+                            strncmp(obj_type->as.tuple.names[i].start, field_name.start, field_name.length) == 0) {
+                            node->evaluated_type = obj_type->as.tuple.elements[i];
+                            return true;
+                        }
+                    }
+                    semantic_error(node->line, "Tuple has no field named '%.*s'.", (int)field_name.length, field_name.start);
                 }
             }
 
@@ -792,7 +998,7 @@ static bool check_node(ASTNode* node) {
             }
 
             // 2. Recursively check the imported module
-            if (!semantic_check(eval_arena, imported_root, path)) {
+            if (!semantic_check(eval_arena, imported_root, path, NULL)) {
                 had_error = true;
             }
 
@@ -822,7 +1028,7 @@ static bool check_node(ASTNode* node) {
             if (dot_jiang_res) { memcpy(dot_jiang_res, ".c", 2); dot_jiang_res[2] = '\0'; }
 
             ensure_dir_exists(c_path);
-            generate_c_code(imported_root, c_path);
+            generate_c_code(imported_root, c_path, false);
             
             // Record this generated C file for later linking
             bool already_added = false;
@@ -987,7 +1193,14 @@ int semantic_get_generated_files(char files[128][4096]) {
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
+void semantic_reset(void) {
+    module_count = 0;
+    generated_c_count = 0;
+    had_error = false;
+    loop_depth = 0;
+}
+
+bool semantic_check(Arena* arena, ASTNode* root, const char* input_path, const char* out_path) {
     char path[PATH_MAX];
     get_absolute_path(input_path, path);
 
@@ -1006,7 +1219,11 @@ bool semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
 
     if (prev_module == NULL) {
         generated_c_count = 0;
-        strncpy(generated_c_files[generated_c_count++], "build/out.c", PATH_MAX);
+        if (out_path) {
+            strncpy(generated_c_files[generated_c_count++], out_path, PATH_MAX);
+        } else {
+            strncpy(generated_c_files[generated_c_count++], "build/out.c", PATH_MAX);
+        }
     }
 
     eval_arena = arena;

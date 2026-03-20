@@ -32,6 +32,15 @@ TypeExpr* type_new_modifier(Arena* arena, TypeKind kind, TypeExpr* element) {
     return type;
 }
 
+TypeExpr* type_new_tuple(Arena* arena, TypeExpr** elements, Token* names, size_t count) {
+    TypeExpr* type = (TypeExpr*)arena_alloc(arena, sizeof(TypeExpr));
+    type->kind = TYPE_TUPLE;
+    type->as.tuple.elements = elements;
+    type->as.tuple.names = names;
+    type->as.tuple.count = count;
+    return type;
+}
+
 void type_print(TypeExpr* type) {
     if (!type) return;
     switch (type->kind) {
@@ -67,6 +76,17 @@ void type_print(TypeExpr* type) {
             type_print(type->as.mutable.element);
             printf("!");
             break;
+        case TYPE_TUPLE:
+            printf("(");
+            for (size_t i = 0; i < type->as.tuple.count; i++) {
+                type_print(type->as.tuple.elements[i]);
+                if (type->as.tuple.names && type->as.tuple.names[i].length > 0) {
+                    printf(" %.*s", (int)type->as.tuple.names[i].length, type->as.tuple.names[i].start);
+                }
+                if (i < type->as.tuple.count - 1) printf(", ");
+            }
+            printf(")");
+            break;
     }
 }
 
@@ -81,6 +101,12 @@ void ast_print(ASTNode* node, int depth) {
 
     print_indent(depth);
     switch (node->type) {
+        case AST_PATTERN:
+            printf("Pattern (Type: ");
+            if (node->as.pattern.type) type_print(node->as.pattern.type);
+            else printf("_");
+            printf(", Name: '%.*s')\n", (int)node->as.pattern.name.length, node->as.pattern.name.start);
+            break;
         case AST_PROGRAM:
             printf("Program [\n");
             for (size_t i = 0; i < node->as.block.count; i++) {

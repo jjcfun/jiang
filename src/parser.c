@@ -126,11 +126,42 @@ static TypeExpr* parse_type() {
             Token void_tok = {TOKEN_EOF, "()", 2, parser.previous.line};
             return type_new_base(parser.arena, void_tok);
         }
-        TypeExpr* type = parse_type();
-        consume(TOKEN_RIGHT_PAREN, "Expect ')' after type in array or tuple type.");
         
-        // Handle array modifier: [Size]
-        if (match(TOKEN_LEFT_BRACKET)) {
+        TypeExpr* elements[64];
+        Token names[64];
+        size_t count = 0;
+        bool has_names = false;
+
+        do {
+            elements[count] = parse_type();
+            names[count] = (Token){0};
+            if (check(TOKEN_IDENTIFIER)) {
+                advance();
+                names[count] = parser.previous;
+                has_names = true;
+            }
+            count++;
+        } while (match(TOKEN_COMMA));
+
+        consume(TOKEN_RIGHT_PAREN, "Expect ')' after tuple type.");
+        
+        TypeExpr* type = NULL;
+        if (count == 1 && !has_names) {
+            // Grouping (Type)
+            type = elements[0];
+        } else {
+            TypeExpr** elements_copy = arena_alloc(parser.arena, sizeof(TypeExpr*) * count);
+            memcpy(elements_copy, elements, sizeof(TypeExpr*) * count);
+            Token* names_copy = NULL;
+            if (has_names) {
+                names_copy = arena_alloc(parser.arena, sizeof(Token) * count);
+                memcpy(names_copy, names, sizeof(Token) * count);
+            }
+            type = type_new_tuple(parser.arena, elements_copy, names_copy, count);
+        }
+
+        // Handle array modifier after (Type) or Tuple
+        while (match(TOKEN_LEFT_BRACKET)) {
             ASTNode* length = NULL;
             if (!check(TOKEN_RIGHT_BRACKET)) {
                 length = expression();
@@ -414,9 +445,25 @@ static ASTNode* parse_precedence(Precedence precedence) {
     } else if (parser.previous.type == TOKEN_LEFT_BRACE) {
         node = struct_init_expr(NULL);
     } else if (parser.previous.type == TOKEN_IDENTIFIER || parser.previous.type == TOKEN_UNDERSCORE) {
-        // Simple identifier or keyword-like identifier (Int, Float, etc.)
-        node = ast_new_node(parser.arena, AST_IDENTIFIER, parser.previous.line);
-        node->as.identifier.name = parser.previous;
+        // Check for pattern: '_ name' or 'Type name'
+        if (parser.previous.type == TOKEN_UNDERSCORE && check(TOKEN_IDENTIFIER)) {
+            advance();
+            Token name = parser.previous;
+            node = ast_new_node(parser.arena, AST_PATTERN, name.line);
+            node->as.pattern.type = NULL;
+            node->as.pattern.name = name;
+        } else if (parser.previous.type == TOKEN_IDENTIFIER && check(TOKEN_IDENTIFIER)) {
+            Token type_tok = parser.previous;
+            advance();
+            Token name = parser.previous;
+            node = ast_new_node(parser.arena, AST_PATTERN, name.line);
+            node->as.pattern.type = type_new_base(parser.arena, type_tok);
+            node->as.pattern.name = name;
+        } else {
+            // Simple identifier or keyword-like identifier (Int, Float, etc.)
+            node = ast_new_node(parser.arena, AST_IDENTIFIER, parser.previous.line);
+            node->as.identifier.name = parser.previous;
+        }
     } else if (parser.previous.type == TOKEN_DOT_DOT) {
         // Handle [..end] or [..]
         ASTNode* end = NULL;
@@ -470,12 +517,22 @@ static ASTNode* parse_precedence(Precedence precedence) {
                 node = dot(node);
                 continue;
             } else if (match(TOKEN_LEFT_BRACKET)) {
-                ASTNode* index = expression();
-                consume(TOKEN_RIGHT_BRACKET, "Expect ']' after array index.");
-                ASTNode* index_node = ast_new_node(parser.arena, AST_INDEX_EXPR, parser.previous.line);
-                index_node->as.index_expr.object = node;
-                index_node->as.index_expr.index = index;
-                node = index_node;
+                if (match(TOKEN_RIGHT_BRACKET)) {
+                    ASTNode* range = ast_new_node(parser.arena, AST_RANGE_EXPR, parser.previous.line);
+                    range->as.range.start = NULL;
+                    range->as.range.end = NULL;
+                    ASTNode* index_node = ast_new_node(parser.arena, AST_INDEX_EXPR, parser.previous.line);
+                    index_node->as.index_expr.object = node;
+                    index_node->as.index_expr.index = range;
+                    node = index_node;
+                } else {
+                    ASTNode* index = expression();
+                    consume(TOKEN_RIGHT_BRACKET, "Expect ']' after array index.");
+                    ASTNode* index_node = ast_new_node(parser.arena, AST_INDEX_EXPR, parser.previous.line);
+                    index_node->as.index_expr.object = node;
+                    index_node->as.index_expr.index = index;
+                    node = index_node;
+                }
                 continue;
             } else if (check(TOKEN_LEFT_BRACE)) {
                 TypeExpr* type = ast_to_type(node);
@@ -611,6 +668,50 @@ static ASTNode* enum_declaration() {
     node->as.enum_decl.member_values = (ASTNode**)arena_alloc(parser.arena, sizeof(ASTNode*) * count);
     memcpy(node->as.enum_decl.member_names, member_names, sizeof(Token) * count);
     memcpy(node->as.enum_decl.member_values, member_values, sizeof(ASTNode*) * count);
+    
+    return node;
+}
+
+static ASTNode* union_declaration() {
+    Token union_token = parser.previous;
+    Token tag_enum = {0};
+    
+    // Optional tag enum: union(TagEnum) UnionName { ... }
+    if (match(TOKEN_LEFT_PAREN)) {
+        consume(TOKEN_IDENTIFIER, "Expect tag enum name.");
+        tag_enum = parser.previous;
+        consume(TOKEN_RIGHT_PAREN, "Expect ')' after tag enum.");
+    }
+    
+    consume(TOKEN_IDENTIFIER, "Expect union name.");
+    Token name = parser.previous;
+    consume(TOKEN_LEFT_BRACE, "Expect '{' before union body.");
+    
+    ASTNode* members[128];
+    size_t count = 0;
+    
+    while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
+        TypeExpr* type = parse_type();
+        consume(TOKEN_IDENTIFIER, "Expect variant name.");
+        Token mem_name = parser.previous;
+        
+        consume(TOKEN_SEMICOLON, "Expect ';' after variant declaration.");
+        
+        ASTNode* field = ast_new_node(parser.arena, AST_VAR_DECL, mem_name.line);
+        field->as.var_decl.type = type;
+        field->as.var_decl.name = mem_name;
+        field->as.var_decl.initializer = NULL;
+        members[count++] = field;
+    }
+    
+    consume(TOKEN_RIGHT_BRACE, "Expect '}' after union body.");
+    
+    ASTNode* node = ast_new_node(parser.arena, AST_UNION_DECL, union_token.line);
+    node->as.union_decl.name = name;
+    node->as.union_decl.tag_enum = tag_enum;
+    node->as.union_decl.member_count = count;
+    node->as.union_decl.members = (ASTNode**)arena_alloc(parser.arena, sizeof(ASTNode*) * count);
+    memcpy(node->as.union_decl.members, members, sizeof(ASTNode*) * count);
     
     return node;
 }
@@ -866,6 +967,11 @@ static ASTNode* statement() {
     }
     if (match(TOKEN_STRUCT)) {
         ASTNode* node = struct_declaration();
+        if (node) node->is_public = is_public;
+        return node;
+    }
+    if (match(TOKEN_UNION)) {
+        ASTNode* node = union_declaration();
         if (node) node->is_public = is_public;
         return node;
     }

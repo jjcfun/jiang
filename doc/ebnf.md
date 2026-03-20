@@ -140,6 +140,7 @@ unary_expr = [ "!" | "-" | "&" ] postfix_expr
 postfix_expr = primary_expr { postfix_op } ;
 postfix_op = "[" expression "]"
            | [ "<" type_expr { "," type_expr } ">" ] "(" [ expression_list ] ")"
+           | "." "cast" "(" type_expr ")"
            | "." identifier [ [ "<" type_expr { "," type_expr } ">" ] "(" [ expression_list ] ")" ] ;
 
 primary_expr = literal
