@@ -63,28 +63,6 @@ static void resolve_import_path(const char* current_file_path, const char* impor
 // Symbol Table
 // ─────────────────────────────────────────────────────────────────────────────
 
-typedef enum {
-    SYM_VAR,
-    SYM_FUNC,
-    SYM_STRUCT,
-    SYM_ENUM,
-    SYM_VARIANT, // For Union variants
-    SYM_PARAM,
-    SYM_BUILTIN,
-    SYM_NAMESPACE, // <--- Added: represents an imported module
-} SymbolKind;
-
-typedef struct Symbol {
-    char        name[128];
-    SymbolKind  kind;
-    TypeExpr*   type;        // May be NULL for structs/enums
-    struct Module* module_ptr; // For SYM_NAMESPACE or owner of the symbol
-    struct Module* module_owner; // <--- Added: the module where this symbol is defined
-    int         defined_line;
-    bool        is_public;   // visibility flag
-    struct Symbol* next;     // Linked list within one scope
-} Symbol;
-
 typedef struct Scope {
     Symbol*       symbols;   // Linked list of symbols in this scope
     struct Scope* parent;
@@ -383,14 +361,14 @@ static bool check_node(ASTNode* node) {
             for (size_t i = 0; i < node->as.block.count; i++) {
                 ASTNode* decl = node->as.block.statements[i];
                 if (decl->type == AST_FUNC_DECL) {
-                    define_token(decl->as.func_decl.name, SYM_FUNC,
+                    decl->symbol = define_token(decl->as.func_decl.name, SYM_FUNC,
                                  decl->as.func_decl.return_type, decl->is_public);
                 } else if (decl->type == AST_STRUCT_DECL) {
-                    define_token(decl->as.struct_decl.name, SYM_STRUCT, NULL, decl->is_public);
+                    decl->symbol = define_token(decl->as.struct_decl.name, SYM_STRUCT, NULL, decl->is_public);
                 } else if (decl->type == AST_ENUM_DECL) {
-                    define_token(decl->as.enum_decl.name, SYM_ENUM, NULL, decl->is_public);
+                    decl->symbol = define_token(decl->as.enum_decl.name, SYM_ENUM, NULL, decl->is_public);
                 } else if (decl->type == AST_UNION_DECL) {
-                    define_token(decl->as.union_decl.name, SYM_STRUCT, NULL, decl->is_public);
+                    decl->symbol = define_token(decl->as.union_decl.name, SYM_STRUCT, NULL, decl->is_public);
                 }
             }
 
@@ -434,7 +412,7 @@ static bool check_node(ASTNode* node) {
             }
 
             // Define in current scope
-            define_token(node->as.var_decl.name, SYM_VAR, node->as.var_decl.type, node->is_public);
+            node->symbol = define_token(node->as.var_decl.name, SYM_VAR, node->as.var_decl.type, node->is_public);
             node->evaluated_type = node->as.var_decl.type;
             break;
         }
@@ -452,6 +430,7 @@ static bool check_node(ASTNode* node) {
                     "Undefined identifier '%.*s'.",
                     (int)name.length, name.start);
             } else {
+                node->symbol = sym;
                 if (sym->kind == SYM_STRUCT || sym->kind == SYM_ENUM) {
                     node->evaluated_type = type_new_base(eval_arena, name);
                 } else if (sym->kind == SYM_BUILTIN) {
@@ -479,7 +458,7 @@ static bool check_node(ASTNode* node) {
             scope_push();
             for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
                 ASTNode* p = node->as.func_decl.params[i];
-                define_token(p->as.var_decl.name, SYM_PARAM, p->as.var_decl.type, false);
+                p->symbol = define_token(p->as.var_decl.name, SYM_PARAM, p->as.var_decl.type, false);
             }
             // Check body without the outer scope_push from AST_BLOCK
             // (we push the scope ourselves so we can include params in scope)
@@ -669,6 +648,7 @@ static bool check_node(ASTNode* node) {
                 Symbol* variant_sym = define_token(m_name, SYM_VARIANT, member->as.var_decl.type, false);
                 if (variant_sym) {
                     variant_sym->module_owner = current_module;
+                    member->symbol = variant_sym;
                     // We can store the parent union's name/type in a special field if needed,
                     // but for now, the scope relationship should be enough.
                 }
@@ -748,7 +728,7 @@ static bool check_node(ASTNode* node) {
                                             arg->as.pattern.type = field_type;
                                         }
                                         arg->evaluated_type = arg->as.pattern.type;
-                                        define_token(arg->as.pattern.name, SYM_VAR, arg->evaluated_type, false);
+                                        arg->symbol = define_token(arg->as.pattern.name, SYM_VAR, arg->evaluated_type, false);
                                     } else {
                                         check_node(arg);
                                     }
@@ -774,7 +754,7 @@ static bool check_node(ASTNode* node) {
                                         arg->as.pattern.type = v_type;
                                     }
                                     arg->evaluated_type = arg->as.pattern.type;
-                                    define_token(arg->as.pattern.name, SYM_VAR, arg->evaluated_type, false);
+                                    arg->symbol = define_token(arg->as.pattern.name, SYM_VAR, arg->evaluated_type, false);
                                 } else {
                                     check_node(arg);
                                 }

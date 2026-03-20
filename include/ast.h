@@ -79,13 +79,35 @@ typedef enum {
     AST_PATTERN
     } NodeType;
 
-    typedef struct ASTNode ASTNode;
+    typedef enum {
+        SYM_VAR,
+        SYM_FUNC,
+        SYM_STRUCT,
+        SYM_ENUM,
+        SYM_VARIANT,
+        SYM_PARAM,
+        SYM_BUILTIN,
+        SYM_NAMESPACE,
+    } SymbolKind;
 
+    typedef struct Symbol {
+        char        name[128];
+        SymbolKind  kind;
+        TypeExpr*   type;
+        void*       module_ptr;
+        void*       module_owner;
+        int         defined_line;
+        bool        is_public;
+        struct Symbol* next;
+    } Symbol;
+
+    typedef struct ASTNode ASTNode;
     struct ASTNode {
     NodeType type;
     int line; // Line number for error reporting
     bool is_public; // Visibility flag
     TypeExpr* evaluated_type; // Type information determined during semantic analysis
+    Symbol* symbol;    // <--- Explicit binding to resolved symbol
 
     // Union to hold varying node data depending on type
     union {

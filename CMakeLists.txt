@@ -18,6 +18,9 @@ set(SOURCES
     src/parser.c
     src/generator.c
     src/semantic.c
+    src/jir.c
+    src/lower.c
+    src/jir_gen.c
 )
 
 # Output executable

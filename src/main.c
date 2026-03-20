@@ -4,6 +4,9 @@
 #include "parser.h"
 #include "generator.h"
 #include "semantic.h"
+#include "jir.h"
+#include "lower.h"
+#include "jir_gen.h"
 
 static char* read_file(const char* path) {
     FILE* file = fopen(path, "rb");
@@ -60,11 +63,15 @@ static void run(const char* source, const char* path) {
         snprintf(out_path, sizeof(out_path), "build/%s.c", bin_name);
 
         if (semantic_check(arena, root, path, out_path)) {
+            // --- JIR Lowering ---
+            JirModule* jir = lower_to_jir(root, arena);
+            jir_print_module(jir);
+
             // Ensure build directory exists
             system("mkdir -p build");
 
-            // Use build/[bin_name].c as the entry point
-            generate_c_code(root, out_path, true);
+            // --- JIR Codegen ---
+            jir_generate_c(jir, root, out_path, true);
 
             // 3. Auto Linker: Link all generated C files
             char c_files[128][4096];
