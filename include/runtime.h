@@ -18,4 +18,53 @@ typedef struct {
     int64_t length;
 } Slice_uint8_t;
 
+static inline char* jiang_runtime_to_cstr(Slice_uint8_t value) {
+    char* text = (char*)malloc((size_t)value.length + 1);
+    if (!text) return NULL;
+    if (value.length > 0 && value.ptr) memcpy(text, value.ptr, (size_t)value.length);
+    text[value.length] = '\0';
+    return text;
+}
+
+static inline bool __intrinsic_file_exists(Slice_uint8_t path) {
+    char* path_text = jiang_runtime_to_cstr(path);
+    if (!path_text) return false;
+    FILE* file = fopen(path_text, "rb");
+    free(path_text);
+    if (!file) return false;
+    fclose(file);
+    return true;
+}
+
+static inline Slice_uint8_t __intrinsic_read_file(Slice_uint8_t path) {
+    Slice_uint8_t result = {0};
+    char* path_text = jiang_runtime_to_cstr(path);
+    if (!path_text) return result;
+
+    FILE* file = fopen(path_text, "rb");
+    free(path_text);
+    if (!file) return result;
+
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    rewind(file);
+    if (size < 0) {
+        fclose(file);
+        return result;
+    }
+
+    uint8_t* buffer = (uint8_t*)malloc((size_t)size + 1);
+    if (!buffer) {
+        fclose(file);
+        return result;
+    }
+
+    size_t read_size = fread(buffer, 1, (size_t)size, file);
+    fclose(file);
+    buffer[read_size] = '\0';
+    result.ptr = buffer;
+    result.length = (int64_t)read_size;
+    return result;
+}
+
 #endif // JIANG_RUNTIME_H

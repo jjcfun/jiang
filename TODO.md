@@ -22,7 +22,7 @@
 ## 🎯 Stage0 完成条件 (Must Finish In Stage0)
 
 ### 0. 收口 Binding / Pattern 语法 (Highest Priority)
-- [ ] **定义 Binding 语法**: 统一绑定原子形式为 `type_expr identifier`。
+- [x] **定义 Binding 语法**: 统一绑定原子形式为 `type_expr identifier`。
     - 例: `Int x`, `Int! y`, `_ x`, `_! y`
 - [x] **统一 For Binding**: `for` 语句只接受 binding 语法，不再接受裸标识符。
     - 例: `for Int i in 0..10 { ... }`
@@ -30,7 +30,7 @@
 - [x] **统一解构绑定**: 将元组解构、Union 变体绑定、`for` pattern 统一为 binding 列表。
     - 例: `(_ x, _! y) = foo()`
     - 例: `Shape.circle(_ x1)`
-- [ ] **补齐 Binding AST / 语义分析 / Codegen**: 让 parser、semantic、lowering、codegen 共享同一套 binding 节点与检查逻辑。
+- [x] **补齐 Binding AST / 语义分析 / Codegen**: 让 parser、semantic、lowering、codegen 共享同一套 binding 节点与检查逻辑。
     - [x] 拆分独立 `AST_BINDING_LIST`，不再复用 `AST_BLOCK`
     - [x] 支持 tuple return 与 binding assignment
     - [x] `switch` / Union variant 绑定复用同一套 binding 检查
@@ -39,13 +39,13 @@
 ### 1. 完成 JIR 主链 (Do Not Defer)
 - [x] **保留 JIR 入口**: `main` 通过 `lower_to_jir -> jir_generate_c` 走主链。
 - [x] **定义 JIR 基础结构**: 已具备 `JirInst`、`JirLocal`、`JirFunction`、`JirModule` 基础骨架。
-- [ ] **补齐 Lowering 覆盖率**: 将主要 AST 节点稳定降级为 JIR。
+- [x] **补齐 Lowering 覆盖率**: 将主要 AST 节点稳定降级为 JIR。
     - [x] 变量声明与基础赋值
     - [x] tuple literal / binding assign
     - [x] struct / union 初始化与字段访问
     - [x] range / for-in / break / continue
     - [x] import 后的顶层初始化与跨模块引用
-- [ ] **在 Lowering 阶段消解语法糖**: 不把高层模式匹配和隐式语义继续留给 C generator。
+- [x] **在 Lowering 阶段消解语法糖**: 不把高层模式匹配和隐式语义继续留给 C generator。
     - [x] `for-in`
     - [x] Union pattern / `switch`
     - [x] tuple binding
@@ -68,7 +68,7 @@
     - [x] `std/file`
     - [x] `std/path`
 - [ ] **梳理 intrinsic 与标准库边界**: 将 `print`、`assert` 等能力从“编译器特殊对待”整理为“标准库导出 + 少量 intrinsic 支撑”。
-- [ ] **为 Stage1 预留编译器自举所需接口**: 文件读取、字符串处理、路径处理至少要能支撑词法器和 import 解析。
+- [x] **为 Stage1 预留编译器自举所需接口**: 文件读取、字符串处理、路径处理至少要能支撑词法器和 import 解析。
 
 ### 4. 标准库 Import 机制
 - [x] **区分普通 import 与标准库 import**: 不再只依赖相对路径字符串查找。

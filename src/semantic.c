@@ -226,6 +226,10 @@ static void register_builtins(void) {
     }
     symbol_define("print", 5, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("assert", 6, SYM_FUNC, make_base_type("void"), 0, false);
+    symbol_define("__intrinsic_read_file", 21, SYM_FUNC,
+                  make_slice_type(make_base_type("UInt8")), 0, false);
+    symbol_define("__intrinsic_file_exists", 23, SYM_FUNC,
+                  make_base_type("Bool"), 0, false);
     symbol_define("self", 4, SYM_VAR, NULL, 0, false);
 }
 

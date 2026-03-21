@@ -1618,10 +1618,6 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
     for (size_t i = 0; i < func->inst_count; i++) {
         JirInst* inst = &func->insts[i];
         switch (inst->op) {
-            case JIR_OP_STORE_PTR:
-            case JIR_OP_MALLOC:
-            case JIR_OP_DEREF:
-                return false;
             case JIR_OP_CALL:
                 if ((inst->payload.name.length == 9 && strncmp(inst->payload.name.start, "anonymous", 9) == 0)) {
                     return false;
