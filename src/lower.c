@@ -12,13 +12,26 @@ static int loop_depth = 0;
 
 static int lower_expr(ASTNode* node);
 
-static JirReg lower_get_or_create_local(Token name, TypeExpr* type) {
+static bool lower_is_void_type(TypeExpr* type) {
+    return type &&
+           type->kind == TYPE_BASE &&
+           type->as.base_type.length == 2 &&
+           strncmp(type->as.base_type.start, "()", 2) == 0;
+}
+
+static JirReg lower_find_local(Token name) {
     for (size_t i = 0; i < current_jir_func->local_count; i++) {
         JirLocal* local = &current_jir_func->locals[i];
         if (strncmp(local->name, name.start, name.length) == 0 && local->name[name.length] == '\0') {
             return (JirReg)i;
         }
     }
+    return -1;
+}
+
+static JirReg lower_get_or_create_local(Token name, TypeExpr* type) {
+    JirReg existing = lower_find_local(name);
+    if (existing >= 0) return existing;
     return jir_alloc_local(current_jir_func, name, type, false, jir_arena);
 }
 
@@ -164,6 +177,8 @@ static int lower_expr(ASTNode* node) {
             return r;
         }
         case AST_IDENTIFIER: {
+            JirReg existing = lower_find_local(node->as.identifier.name);
+            if (existing >= 0) return existing;
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             int idx = jir_emit(current_jir_func, JIR_OP_LOAD_SYM, r, -1, -1, jir_arena);
             current_jir_func->insts[idx].payload.name = node->as.identifier.name;
@@ -210,7 +225,7 @@ static int lower_expr(ASTNode* node) {
         }
         case AST_FUNC_CALL: {
             int args[32]; for (size_t i = 0; i < node->as.func_call.arg_count; i++) args[i] = lower_expr(node->as.func_call.args[i]);
-            int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+            int r = lower_is_void_type(node->evaluated_type) ? -1 : jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             Token callee_name = {TOKEN_IDENTIFIER, "anonymous", 9, 0};
             if (node->as.func_call.callee->type == AST_IDENTIFIER) callee_name = node->as.func_call.callee->as.identifier.name;
             jir_emit_call(current_jir_func, r, callee_name, args, node->as.func_call.arg_count, jir_arena);

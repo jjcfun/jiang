@@ -44,13 +44,13 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
   ```c#
   struct School {
   	Int id;
-    String name;
+    UInt8[] name;
   }
   
   struct User {
   	Int school_id;
     Int age;
-  	String name;
+  	UInt8[] name;
   }
   
   User user = {school_id: 100, age: 18, name: "jiang" }

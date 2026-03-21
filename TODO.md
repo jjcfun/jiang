@@ -33,23 +33,24 @@
 - [ ] **补齐 Binding AST / 语义分析 / Codegen**: 让 parser、semantic、lowering、codegen 共享同一套 binding 节点与检查逻辑。
     - [x] 拆分独立 `AST_BINDING_LIST`，不再复用 `AST_BLOCK`
     - [x] 支持 tuple return 与 binding assignment
+    - [x] `switch` / Union variant 绑定复用同一套 binding 检查
 - [x] **补齐 Binding 测试**: 增加 `for`、赋值解构、Union 解构三类 binding 用例。
 
 ### 1. 完成 JIR 主链 (Do Not Defer)
 - [x] **保留 JIR 入口**: `main` 通过 `lower_to_jir -> jir_generate_c` 走主链。
 - [x] **定义 JIR 基础结构**: 已具备 `JirInst`、`JirLocal`、`JirFunction`、`JirModule` 基础骨架。
 - [ ] **补齐 Lowering 覆盖率**: 将主要 AST 节点稳定降级为 JIR。
-    - [ ] 变量声明与赋值
-    - [ ] tuple literal / binding assign
+    - [x] 变量声明与基础赋值
+    - [x] tuple literal / binding assign
     - [ ] struct / union 初始化与字段访问
-    - [ ] range / for-in / break / continue
+    - [x] range / for-in / break / continue
     - [ ] import 后的顶层初始化与跨模块引用
 - [ ] **在 Lowering 阶段消解语法糖**: 不把高层模式匹配和隐式语义继续留给 C generator。
     - [ ] `for-in`
     - [ ] Union pattern / `switch`
     - [ ] tuple binding
     - [ ] `$` 相关语法糖
-- [ ] **让符号绑定显式进入 JIR**: 减少 Codegen 阶段的字符串查找与 AST 回溯。
+- [x] **让符号绑定显式进入 JIR**: 局部变量与参数优先绑定到 JIR local，减少 Codegen 阶段的字符串查找与 AST 回溯。
 - [ ] **重构 JIR Codegen**: 让 `jir_generate_c` 直接基于 JIR 产出 C，逐步淘汰 AST 直出路径。
 
 ### 2. 完成 Union 模式匹配

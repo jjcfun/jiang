@@ -563,7 +563,7 @@ struct User {
   // age为可变属性
   Int! age;
   // nick_name为可空的可变属性
-  String?! nick_name;
+  UInt8[]?! nick_name;
 }
 
 // 定义一个结构体常量并初始化

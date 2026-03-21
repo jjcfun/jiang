@@ -1596,7 +1596,7 @@ static JirFunction* gen_find_jir_function(JirModule* mod, const char* name) {
 }
 
 static bool gen_can_emit_jir_function(JirFunction* func) {
-    if (!func || gen_is_void_type(func->return_type)) return false;
+    if (!func) return false;
 
     for (size_t i = 0; i < func->local_count; i++) {
         TypeExpr* type = func->locals[i].type;
@@ -1625,9 +1625,7 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
             case JIR_OP_DEREF:
                 return false;
             case JIR_OP_CALL:
-                if ((inst->payload.name.length == 5 && strncmp(inst->payload.name.start, "print", 5) == 0) ||
-                    (inst->payload.name.length == 6 && strncmp(inst->payload.name.start, "assert", 6) == 0) ||
-                    (inst->payload.name.length == 9 && strncmp(inst->payload.name.start, "anonymous", 9) == 0)) {
+                if ((inst->payload.name.length == 9 && strncmp(inst->payload.name.start, "anonymous", 9) == 0)) {
                     return false;
                 }
                 break;
@@ -1823,14 +1821,36 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 fprintf(out, ") goto JIR_LABEL_%u;\n", inst->payload.label_id);
                 break;
             case JIR_OP_CALL:
-                if (inst->dest >= 0) fprintf(out, "    %s = ", func->locals[inst->dest].name);
-                else fprintf(out, "    ");
-                fprintf(out, "%.*s(", (int)inst->payload.name.length, inst->payload.name.start);
-                for (size_t j = 0; j < inst->call_arg_count; j++) {
-                    gen_emit_jir_reg(out, func, inst->call_args[j]);
-                    if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                fprintf(out, "    ");
+                if (inst->dest >= 0) fprintf(out, "%s = ", func->locals[inst->dest].name);
+                if (inst->payload.name.length == 5 && strncmp(inst->payload.name.start, "print", 5) == 0) {
+                    fprintf(out, "printf(");
+                    for (size_t j = 0; j < inst->call_arg_count; j++) {
+                        JirReg arg_reg = inst->call_args[j];
+                        TypeExpr* arg_type = (arg_reg >= 0 && (size_t)arg_reg < func->local_count) ? func->locals[arg_reg].type : NULL;
+                        if (gen_is_u8_slice_type(arg_type)) {
+                            fprintf(out, "(char*)");
+                            gen_emit_jir_reg(out, func, arg_reg);
+                            fprintf(out, ".ptr");
+                        } else {
+                            gen_emit_jir_reg(out, func, arg_reg);
+                        }
+                        if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                    }
+                    fprintf(out, ");\n");
+                } else if (inst->payload.name.length == 6 && strncmp(inst->payload.name.start, "assert", 6) == 0) {
+                    fprintf(out, "((void)(( ");
+                    if (inst->call_arg_count > 0) gen_emit_jir_reg(out, func, inst->call_args[0]);
+                    else fprintf(out, "0");
+                    fprintf(out, " ) ? 0 : (fprintf(stderr, \"Assertion failed in JIR\\n\"), exit(1))));\n");
+                } else {
+                    fprintf(out, "%.*s(", (int)inst->payload.name.length, inst->payload.name.start);
+                    for (size_t j = 0; j < inst->call_arg_count; j++) {
+                        gen_emit_jir_reg(out, func, inst->call_args[j]);
+                        if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                    }
+                    fprintf(out, ");\n");
                 }
-                fprintf(out, ");\n");
                 break;
             case JIR_OP_RETURN:
                 fprintf(out, "    return");
