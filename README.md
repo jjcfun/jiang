@@ -75,7 +75,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 好吧，它的**1.0正式版**将会经历以下几个阶段：
 
-+ **Stage0**: 用c语言实现编译器的基本功能，此阶段将借助AI实现，不追求代码质量和运行速度（50%）
++ **Stage0**: 用 C 语言实现编译器的基本功能。当前已经具备多模块、Union/Pattern、Binding、最小标准库与 `import std;` 支持，主链保持为 `AST -> JIR -> C`，仍在继续收口剩余 lowering/codegen 细节
 
 + **Stage1**: 用Stage0的Jiang语言编译器实现自举，并实现标准库的最小集合，此阶段也将借助AI实现
 
@@ -92,6 +92,23 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 - **[Jiang 语言指南](doc/jiang.md)**
 
 ## 快速开始
+
+### Stage1 自举子集（当前约定）
+
+为了让 Stage1 的第一版自举实现尽量稳定，当前建议把可依赖能力收敛到下面这个子集：
+
+- 模块与导入：`import "..."`、`import std;`
+- 基础类型：`Int`、`UInt8`、`UInt16`、`Float`、`Double`、`Bool`
+- 控制流：`if`、`while`、`for Int i in a..b`
+- 绑定：普通 binding、tuple binding、Union variant binding
+- 复合类型：`struct`、`enum`、`union`
+- 最小标准库：`std.io`、`std.assert`、`std.string`、`std.file`、`std.path`
+
+当前 Stage0 里仍然建议避免把这些能力作为自举前提：
+
+- 依赖复杂 JIR lowering 的高层语法糖组合
+- 跨模块共享 tuple typedef 的复杂场景
+- 超出最小标准库范围的运行时能力
 
 ### 前提条件
 

@@ -27,7 +27,7 @@
 - [x] **统一 For Binding**: `for` 语句只接受 binding 语法，不再接受裸标识符。
     - 例: `for Int i in 0..10 { ... }`
     - 例: `for (_ i, _ item) in list.indexed() { ... }`
-- [ ] **统一解构绑定**: 将元组解构、Union 变体绑定、`for` pattern 统一为 binding 列表。
+- [x] **统一解构绑定**: 将元组解构、Union 变体绑定、`for` pattern 统一为 binding 列表。
     - 例: `(_ x, _! y) = foo()`
     - 例: `Shape.circle(_ x1)`
 - [ ] **补齐 Binding AST / 语义分析 / Codegen**: 让 parser、semantic、lowering、codegen 共享同一套 binding 节点与检查逻辑。
@@ -56,7 +56,7 @@
 - [x] **Union 基础实现**: 支持 `union(Tag) Name { ... }` 语法及 C 代码生成。
 - [x] **Switch 模式匹配**: 实现 `switch` 语句对 Union 变体的解构（Pattern Matching）。
 - [x] **将 Union 绑定并入 Binding 体系**: `Shape.circle(_ x)` 与普通 binding list 使用一致检查逻辑。
-- [ ] **匿名 Union**: 支持不带显式 Tag Enum 的 Union。
+- [x] **匿名 Union**: 支持不带显式 Tag Enum 的 Union。
 
 ### 3. 最低限度标准库 (Minimal Stdlib)
 - [x] **建立标准库目录结构**: 约定 `std/` 或等价 sysroot 布局，避免继续依赖测试目录充当库。
@@ -64,8 +64,8 @@
     - [x] `std/io`
     - [x] `std/assert`
     - [x] `std/string`
-    - [ ] `std/file`
-    - [ ] `std/path`
+    - [x] `std/file`
+    - [x] `std/path`
 - [ ] **梳理 intrinsic 与标准库边界**: 将 `print`、`assert` 等能力从“编译器特殊对待”整理为“标准库导出 + 少量 intrinsic 支撑”。
 - [ ] **为 Stage1 预留编译器自举所需接口**: 文件读取、字符串处理、路径处理至少要能支撑词法器和 import 解析。
 
@@ -84,12 +84,12 @@
 - [x] **多模块符号可见性**: 解决 `Alias.member` 在独立编译模式下产生的链接错误。
 - [x] **切片语法兼容性**: 完善 `x[]` 在 C 语言层面的零索引占位生成。
 - [x] **空元组返回处理**: 统一将 `() func()` 在 C 声明中映射为 `void func()`。
-- [ ] **补充真实项目型测试**: 用多模块 + 标准库 + Union + binding 的组合样例验证 Stage0 可用性。
+- [x] **补充真实项目型测试**: 用多模块 + 标准库 + Union + binding 的组合样例验证 Stage0 可用性。
 
 ## 📦 Stage1 前置条件 (Prepare During Stage0)
-- [ ] **定义自举子集**: 明确 Stage1 第一版 Jiang 编译器允许依赖的语法与标准库范围。
+- [x] **定义自举子集**: 明确 Stage1 第一版 Jiang 编译器允许依赖的语法与标准库范围。
 - [ ] **同步语言文档**: 更新 `README`、`doc/jiang.md`、`doc/ebnf.md`，确保与当前实现一致。
-- [ ] **准备标准库示例程序**: 至少能用 Stage0 编译器编译一个依赖标准库的简单工具程序。
+- [x] **准备标准库示例程序**: 至少能用 Stage0 编译器编译一个依赖标准库的简单工具程序。
 
 ## 📝 架构笔记 (Architectural Notes)
 - **File as a Struct**: 借鉴 Zig 的设计，将每个文件视为一个独立的命名空间，避免全局符号冲突。

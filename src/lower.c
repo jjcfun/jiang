@@ -6,8 +6,21 @@
 static JirModule* current_jir_mod = NULL;
 static JirFunction* current_jir_func = NULL;
 static Arena* jir_arena = NULL;
+static uint32_t loop_break_labels[64];
+static uint32_t loop_continue_labels[64];
+static int loop_depth = 0;
 
 static int lower_expr(ASTNode* node);
+
+static JirReg lower_get_or_create_local(Token name, TypeExpr* type) {
+    for (size_t i = 0; i < current_jir_func->local_count; i++) {
+        JirLocal* local = &current_jir_func->locals[i];
+        if (strncmp(local->name, name.start, name.length) == 0 && local->name[name.length] == '\0') {
+            return (JirReg)i;
+        }
+    }
+    return jir_alloc_local(current_jir_func, name, type, false, jir_arena);
+}
 
 static void lower_stmt(ASTNode* node) {
     if (!node) return;
@@ -15,7 +28,7 @@ static void lower_stmt(ASTNode* node) {
         case AST_VAR_DECL: {
             int r_val = lower_expr(node->as.var_decl.initializer);
             TypeExpr* t = node->as.var_decl.type ? node->as.var_decl.type : (node->as.var_decl.initializer ? node->as.var_decl.initializer->evaluated_type : NULL);
-            int r_var = jir_alloc_local(current_jir_func, node->as.var_decl.name, t, false, jir_arena);
+            int r_var = lower_get_or_create_local(node->as.var_decl.name, t);
             jir_emit(current_jir_func, JIR_OP_STORE, r_var, r_val >= 0 ? r_val : 0, -1, jir_arena);
             break;
         }
@@ -36,6 +49,9 @@ static void lower_stmt(ASTNode* node) {
         case AST_WHILE_STMT: {
             uint32_t l_start = jir_reserve_label(current_jir_func);
             uint32_t l_end = jir_reserve_label(current_jir_func);
+            loop_break_labels[loop_depth] = l_end;
+            loop_continue_labels[loop_depth] = l_start;
+            loop_depth++;
             jir_emit_label(current_jir_func, l_start, jir_arena);
             int r_cond = lower_expr(node->as.while_stmt.condition);
             int idx = jir_emit(current_jir_func, JIR_OP_JUMP_IF_FALSE, -1, r_cond >= 0 ? r_cond : 0, -1, jir_arena);
@@ -44,11 +60,82 @@ static void lower_stmt(ASTNode* node) {
             int idx2 = jir_emit(current_jir_func, JIR_OP_JUMP, -1, -1, -1, jir_arena);
             current_jir_func->insts[idx2].payload.label_id = l_start;
             jir_emit_label(current_jir_func, l_end, jir_arena);
+            loop_depth--;
+            break;
+        }
+        case AST_FOR_STMT: {
+            if (node->as.for_stmt.iterable && node->as.for_stmt.iterable->type == AST_RANGE_EXPR) {
+                ASTNode* pattern = node->as.for_stmt.pattern;
+                if (pattern && pattern->type == AST_BINDING_LIST && pattern->as.binding_list.count > 0) {
+                    pattern = pattern->as.binding_list.items[0];
+                }
+                if (pattern && pattern->type == AST_PATTERN) {
+                    JirReg start_reg = lower_expr(node->as.for_stmt.iterable->as.range.start);
+                    JirReg end_reg = lower_expr(node->as.for_stmt.iterable->as.range.end);
+                    TypeExpr* pattern_type = pattern->evaluated_type ? pattern->evaluated_type : pattern->as.pattern.type;
+                    JirReg iter_reg = lower_get_or_create_local(pattern->as.pattern.name, pattern_type);
+                    jir_emit(current_jir_func, JIR_OP_STORE, iter_reg, start_reg, -1, jir_arena);
+
+                    uint32_t l_start = jir_reserve_label(current_jir_func);
+                    uint32_t l_continue = jir_reserve_label(current_jir_func);
+                    uint32_t l_end = jir_reserve_label(current_jir_func);
+                    loop_break_labels[loop_depth] = l_end;
+                    loop_continue_labels[loop_depth] = l_continue;
+                    loop_depth++;
+
+                    jir_emit_label(current_jir_func, l_start, jir_arena);
+                    JirReg cond_reg = jir_alloc_temp(current_jir_func, pattern_type, jir_arena);
+                    jir_emit(current_jir_func, JIR_OP_CMP_LT, cond_reg, iter_reg, end_reg, jir_arena);
+                    int idx = jir_emit(current_jir_func, JIR_OP_JUMP_IF_FALSE, -1, cond_reg, -1, jir_arena);
+                    current_jir_func->insts[idx].payload.label_id = l_end;
+
+                    lower_stmt(node->as.for_stmt.body);
+
+                    jir_emit_label(current_jir_func, l_continue, jir_arena);
+                    JirReg one_reg = jir_alloc_temp(current_jir_func, pattern_type, jir_arena);
+                    int one_idx = jir_emit(current_jir_func, JIR_OP_CONST_INT, one_reg, -1, -1, jir_arena);
+                    current_jir_func->insts[one_idx].payload.int_val = 1;
+                    JirReg next_reg = jir_alloc_temp(current_jir_func, pattern_type, jir_arena);
+                    jir_emit(current_jir_func, JIR_OP_ADD, next_reg, iter_reg, one_reg, jir_arena);
+                    jir_emit(current_jir_func, JIR_OP_STORE, iter_reg, next_reg, -1, jir_arena);
+                    int back_idx = jir_emit(current_jir_func, JIR_OP_JUMP, -1, -1, -1, jir_arena);
+                    current_jir_func->insts[back_idx].payload.label_id = l_start;
+                    jir_emit_label(current_jir_func, l_end, jir_arena);
+                    loop_depth--;
+                }
+            }
             break;
         }
         case AST_RETURN_STMT: {
             int r = lower_expr(node->as.return_stmt.expression);
             jir_emit(current_jir_func, JIR_OP_RETURN, -1, r >= 0 ? r : -1, -1, jir_arena);
+            break;
+        }
+        case AST_BINDING_ASSIGN: {
+            JirReg value_reg = lower_expr(node->as.binding_assign.value);
+            for (size_t i = 0; i < node->as.binding_assign.bindings->as.binding_list.count; i++) {
+                ASTNode* binding = node->as.binding_assign.bindings->as.binding_list.items[i];
+                TypeExpr* binding_type = binding->evaluated_type ? binding->evaluated_type : binding->as.pattern.type;
+                JirReg target_reg = lower_get_or_create_local(binding->as.pattern.name, binding_type);
+                JirReg field_reg = jir_alloc_temp(current_jir_func, binding_type, jir_arena);
+                int field_idx = jir_emit(current_jir_func, JIR_OP_EXTRACT_FIELD, field_reg, value_reg, -1, jir_arena);
+                current_jir_func->insts[field_idx].payload.int_val = (int64_t)i;
+                jir_emit(current_jir_func, JIR_OP_STORE, target_reg, field_reg, -1, jir_arena);
+            }
+            break;
+        }
+        case AST_BREAK_STMT: {
+            if (loop_depth > 0) {
+                int idx = jir_emit(current_jir_func, JIR_OP_JUMP, -1, -1, -1, jir_arena);
+                current_jir_func->insts[idx].payload.label_id = loop_break_labels[loop_depth - 1];
+            }
+            break;
+        }
+        case AST_CONTINUE_STMT: {
+            if (loop_depth > 0) {
+                int idx = jir_emit(current_jir_func, JIR_OP_JUMP, -1, -1, -1, jir_arena);
+                current_jir_func->insts[idx].payload.label_id = loop_continue_labels[loop_depth - 1];
+            }
             break;
         }
         case AST_BLOCK:
@@ -83,6 +170,25 @@ static int lower_expr(ASTNode* node) {
             return r;
         }
         case AST_BINARY_EXPR: {
+            if (node->as.binary.op == TOKEN_EQUAL) {
+                ASTNode* left = node->as.binary.left;
+                int r_right = lower_expr(node->as.binary.right);
+                if (left->type == AST_IDENTIFIER) {
+                    JirReg dest = lower_get_or_create_local(left->as.identifier.name, left->evaluated_type);
+                    jir_emit(current_jir_func, JIR_OP_STORE, dest, r_right >= 0 ? r_right : 0, -1, jir_arena);
+                    return dest;
+                } else if (left->type == AST_MEMBER_ACCESS) {
+                    int r_obj = lower_expr(left->as.member_access.object);
+                    int idx = jir_emit(current_jir_func, JIR_OP_STORE_MEMBER, r_obj, r_right, -1, jir_arena);
+                    current_jir_func->insts[idx].payload.name = left->as.member_access.member;
+                    return r_right;
+                } else if (left->type == AST_INDEX_EXPR) {
+                    int r_obj = lower_expr(left->as.index_expr.object);
+                    int r_idx = lower_expr(left->as.index_expr.index);
+                    jir_emit(current_jir_func, JIR_OP_STORE_MEMBER, r_obj, r_right, r_idx, jir_arena);
+                    return r_right;
+                }
+            }
             int r1 = lower_expr(node->as.binary.left); int r2 = lower_expr(node->as.binary.right);
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             JirOp op;
@@ -92,6 +198,11 @@ static int lower_expr(ASTNode* node) {
                 case TOKEN_STAR: op = JIR_OP_MUL; break;
                 case TOKEN_SLASH: op = JIR_OP_DIV; break;
                 case TOKEN_EQUAL_EQUAL: op = JIR_OP_CMP_EQ; break;
+                case TOKEN_BANG_EQUAL: op = JIR_OP_CMP_NEQ; break;
+                case TOKEN_LESS: op = JIR_OP_CMP_LT; break;
+                case TOKEN_GREATER: op = JIR_OP_CMP_GT; break;
+                case TOKEN_LESS_EQUAL: op = JIR_OP_CMP_LTE; break;
+                case TOKEN_GREATER_EQUAL: op = JIR_OP_CMP_GTE; break;
                 default: op = JIR_OP_ADD; break;
             }
             jir_emit(current_jir_func, op, r, r1 >= 0 ? r1 : 0, r2 >= 0 ? r2 : 0, jir_arena);
@@ -116,6 +227,18 @@ static int lower_expr(ASTNode* node) {
             }
             return r;
         }
+        case AST_TUPLE_LITERAL: {
+            int args[64];
+            for (size_t i = 0; i < node->as.tuple_literal.count; i++) args[i] = lower_expr(node->as.tuple_literal.elements[i]);
+            int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+            int idx = jir_emit(current_jir_func, JIR_OP_ARRAY_INIT, r, -1, -1, jir_arena);
+            if (node->as.tuple_literal.count > 0) {
+                current_jir_func->insts[idx].call_args = malloc(sizeof(int) * node->as.tuple_literal.count);
+                for (size_t i = 0; i < node->as.tuple_literal.count; i++) current_jir_func->insts[idx].call_args[i] = args[i];
+                current_jir_func->insts[idx].call_arg_count = node->as.tuple_literal.count;
+            }
+            return r;
+        }
         case AST_INDEX_EXPR: {
             int r_obj = lower_expr(node->as.index_expr.object); int r_idx = lower_expr(node->as.index_expr.index);
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
@@ -134,6 +257,24 @@ static int lower_expr(ASTNode* node) {
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             int idx = jir_emit(current_jir_func, JIR_OP_MEMBER_ACCESS, r, r_obj >= 0 ? r_obj : 0, -1, jir_arena);
             current_jir_func->insts[idx].payload.name = node->as.member_access.member;
+            return r;
+        }
+        case AST_UNARY_EXPR: {
+            if (node->as.unary.op == TOKEN_STAR) {
+                int r_right = lower_expr(node->as.unary.right);
+                int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+                jir_emit(current_jir_func, JIR_OP_DEREF, r, r_right, -1, jir_arena);
+                return r;
+            }
+            if (node->as.unary.op == TOKEN_DOLLAR) {
+                return lower_expr(node->as.unary.right);
+            }
+            return lower_expr(node->as.unary.right);
+        }
+        case AST_ENUM_ACCESS: {
+            int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+            int idx = jir_emit(current_jir_func, JIR_OP_LOAD_SYM, r, -1, -1, jir_arena);
+            current_jir_func->insts[idx].payload.name = node->as.enum_access.member_name;
             return r;
         }
         default: return -1;

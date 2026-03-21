@@ -31,14 +31,14 @@ statement = import_decl
 
 block = "{" { statement } "}" ;
 
-import_decl = [ "public" ] "import" [ identifier ] string_literal [ ";" ] ;
+import_decl = [ "public" ] "import" ( "std" | [ identifier ] string_literal ) [ ";" ] ;
 
 variable_decl = type_expr identifier "=" expression [ ";" ]
-              | tuple_destruct "=" expression [ ";" ]
+              | binding_list "=" expression [ ";" ]
               ;
 
-tuple_destruct = "(" tuple_destruct_param { "," tuple_destruct_param } ")" ;
-tuple_destruct_param = type_expr identifier ;
+binding = type_expr identifier ;
+binding_list = "(" binding { "," binding } ")" ;
 
 expression_statement = expression [ ";" ] ;
 return_statement = "return" [ expression ] [ ";" ] ;
@@ -50,24 +50,24 @@ if_statement = "if" "(" expression ")" block [ "else" ( block | if_statement ) ]
 while_statement = "while" "(" expression ")" block ;
 for_statement = "for" for_pattern "in" expression block ;
 
-for_pattern = identifier
-            | "(" for_pattern { "," for_pattern } ")" ;
+for_pattern = binding
+            | binding_list ;
 
 switch_statement = "switch" "(" expression ")" "{" { switch_case } "}" ;
 
 condition_expr = expression [ "==" union_match_pattern ] ;
-union_match_pattern = [ identifier ] "." identifier [ "(" union_pattern_params ")" ] ;
+union_match_pattern = identifier "." identifier [ "(" union_pattern_params ")" ] ;
 
-switch_case = "." identifier [ "(" union_pattern_params ")" ] ":" ( statement | block )
+switch_case = identifier "." identifier [ "(" union_pattern_params ")" ] ":" ( statement | block )
             | "else" ":" ( statement | block ) ;
-union_pattern_params = tuple_destruct_param { "," tuple_destruct_param } ;
+union_pattern_params = binding { "," binding } ;
 
 (* --- 2. Types (类型系统) --- *)
 
 (* Jiang语言的类型遵循从左往右、从里到外的原则 *)
 type_expr = base_type { type_modifier } ;
 
-base_type = "Int" | "UInt8" | "UInt16" | "Float" | "Double" | "Bool" | "String" 
+base_type = "Int" | "UInt8" | "UInt16" | "Float" | "Double" | "Bool"
           | "_" | identifier 
           | tuple_type | function_type 
           ;

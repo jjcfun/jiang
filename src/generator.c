@@ -19,6 +19,7 @@ static size_t gen_sym_count = 0;
 static bool gen_printed_syms = false;
 static bool gen_is_local = false;
 static int gen_binding_temp_id = 0;
+static JirModule* gen_active_jir_module = NULL;
 static TypeExpr gen_pattern_fallback_type = {
     .kind = TYPE_BASE,
     .as.base_type = { TOKEN_IDENTIFIER, "Double", 6, 0 }
@@ -146,7 +147,11 @@ static size_t gen_union_count = 0;
 
 static void gen_add_union(Token name, Token tag_enum) {
     snprintf(gen_unions[gen_union_count].name, 64, "%.*s", (int)name.length, name.start);
-    snprintf(gen_unions[gen_union_count].tag_enum, 64, "%.*s", (int)tag_enum.length, tag_enum.start);
+    if (tag_enum.length > 0) {
+        snprintf(gen_unions[gen_union_count].tag_enum, 64, "%.*s", (int)tag_enum.length, tag_enum.start);
+    } else {
+        snprintf(gen_unions[gen_union_count].tag_enum, 64, "%.*sTag", (int)name.length, name.start);
+    }
     gen_union_count++;
 }
 
@@ -271,9 +276,19 @@ static bool gen_is_static_struct_method(ASTNode* method) {
            strncmp(method->as.func_decl.name.start, "open", 4) == 0;
 }
 
+static bool gen_is_void_type(TypeExpr* type) {
+    return type &&
+           type->kind == TYPE_BASE &&
+           type->as.base_type.length == 2 &&
+           strncmp(type->as.base_type.start, "()", 2) == 0;
+}
+
 static void generate_node(ASTNode* node, FILE* out);
 static void generate_type(TypeExpr* type, FILE* out);
 static void generate_match_condition(ASTNode* value, ASTNode* pattern, FILE* out);
+static void generate_declarations(ASTNode* root, FILE* out, const char* out_path);
+static void generate_implementations(ASTNode* root, FILE* out, bool is_main, bool emit_free_functions, bool emit_main_body);
+static bool gen_should_emit_jir_for_ast_function(ASTNode* node);
 
 static void generate_decl_with_name(TypeExpr* type, const char* name, FILE* out) {
     if (!type || (type->kind == TYPE_BASE && type->as.base_type.length == 1 && type->as.base_type.start[0] == '_')) {
@@ -1110,9 +1125,6 @@ static void generate_node(ASTNode* node, FILE* out) {
     }
 }
 
-static void generate_declarations(ASTNode* root, FILE* out, const char* out_path);
-static void generate_implementations(ASTNode* root, FILE* out, bool is_main);
-
 void generate_c_code(ASTNode* root, const char* out_path, bool is_main) {
     gen_sym_count = 0;
     gen_enum_count = 0;
@@ -1143,7 +1155,7 @@ void generate_c_code(ASTNode* root, const char* out_path, bool is_main) {
     char* header_filename = last_slash ? last_slash + 1 : h_path;
     fprintf(c_out, "#include \"%s\"\n\n", header_filename);
 
-    generate_implementations(root, c_out, is_main);
+    generate_implementations(root, c_out, is_main, true, true);
     fclose(c_out);
     printf("Successfully generated C/H code at: %s\n", out_path);
 }
@@ -1242,6 +1254,16 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
                 }
             }
         } else if (node->type == AST_UNION_DECL) {
+            if (node->as.union_decl.tag_enum.length == 0) {
+                fprintf(out, "typedef enum {\n");
+                for (size_t j = 0; j < node->as.union_decl.member_count; j++) {
+                    ASTNode* m = node->as.union_decl.members[j];
+                    fprintf(out, "    %.*sTag_%.*s", (int)node->as.union_decl.name.length, node->as.union_decl.name.start,
+                            (int)m->as.var_decl.name.length, m->as.var_decl.name.start);
+                    if (j < node->as.union_decl.member_count - 1) fprintf(out, ",\n");
+                }
+                fprintf(out, "\n} %.*sTag;\n", (int)node->as.union_decl.name.length, node->as.union_decl.name.start);
+            }
             // Forward declare types for tuple variants
             for (size_t j = 0; j < node->as.union_decl.member_count; j++) {
                 ASTNode* m = node->as.union_decl.members[j];
@@ -1307,6 +1329,7 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
                 }
                 fprintf(out, ") { %.*s _u; ", (int)node->as.union_decl.name.length, node->as.union_decl.name.start);
                 if (tagName.length > 0) fprintf(out, "_u.kind = %.*s_%.*s; ", (int)node->as.union_decl.tag_enum.length, node->as.union_decl.tag_enum.start, (int)tagName.length, tagName.start);
+                else if (node->as.union_decl.tag_enum.length == 0) fprintf(out, "_u.kind = %.*sTag_%.*s; ", (int)node->as.union_decl.name.length, node->as.union_decl.name.start, (int)m->as.var_decl.name.length, m->as.var_decl.name.start);
                 else fprintf(out, "_u.kind = %zu; ", j);
                 if (!is_void) {
                     fprintf(out, "_u.%.*s = val; ", (int)m->as.var_decl.name.length, m->as.var_decl.name.start);
@@ -1346,7 +1369,10 @@ static void gen_collect_patterns(ASTNode* node) {
     
     switch (node->type) {
         case AST_PATTERN:
-            gen_add_sym(node->as.pattern.name, node->evaluated_type ? node->evaluated_type : &gen_pattern_fallback_type, false);
+            gen_add_sym(node->as.pattern.name,
+                        node->evaluated_type ? node->evaluated_type :
+                        (node->symbol && node->symbol->type ? node->symbol->type : &gen_pattern_fallback_type),
+                        false);
             break;
         case AST_PROGRAM:
         case AST_BLOCK:
@@ -1422,10 +1448,10 @@ static void gen_collect_patterns(ASTNode* node) {
     }
 }
 
-static void generate_implementations(ASTNode* root, FILE* out, bool is_main) {
+static void generate_implementations(ASTNode* root, FILE* out, bool is_main, bool emit_free_functions, bool emit_main_body) {
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
-        if (node->type == AST_FUNC_DECL) {
+        if (node->type == AST_FUNC_DECL && emit_free_functions && !gen_should_emit_jir_for_ast_function(node)) {
             gen_sym_count = 0; // Local scope for function
             gen_is_local = true;
             gen_collect_patterns(node->as.func_decl.body);
@@ -1531,7 +1557,7 @@ static void generate_implementations(ASTNode* root, FILE* out, bool is_main) {
         }
     }
 
-    if (is_main) {
+    if (is_main && emit_main_body) {
         gen_sym_count = 0; // Reset for main scope
         gen_is_local = true;
         gen_collect_patterns(root);
@@ -1555,4 +1581,354 @@ static void generate_implementations(ASTNode* root, FILE* out, bool is_main) {
         gen_is_local = false;
         fprintf(out, "return 0;\n}\n");
     }
+}
+
+static JirFunction* gen_find_jir_function(JirModule* mod, const char* name) {
+    if (!mod) return NULL;
+    for (size_t i = 0; i < mod->function_count; i++) {
+        JirFunction* func = mod->functions[i];
+        if ((size_t)func->name.length == strlen(name) &&
+            strncmp(func->name.start, name, func->name.length) == 0) {
+            return func;
+        }
+    }
+    return NULL;
+}
+
+static bool gen_can_emit_jir_function(JirFunction* func) {
+    if (!func || gen_is_void_type(func->return_type)) return false;
+
+    for (size_t i = 0; i < func->local_count; i++) {
+        TypeExpr* type = func->locals[i].type;
+        if (gen_is_void_type(type)) return false;
+        if (type && type->kind == TYPE_ARRAY) return false;
+        if (type && type->kind == TYPE_BASE) {
+            Token base = type->as.base_type;
+            bool builtin =
+                (base.length == 3 && strncmp(base.start, "Int", 3) == 0) ||
+                (base.length == 5 && strncmp(base.start, "Float", 5) == 0) ||
+                (base.length == 6 && strncmp(base.start, "Double", 6) == 0) ||
+                (base.length == 4 && strncmp(base.start, "Bool", 4) == 0) ||
+                (base.length == 5 && strncmp(base.start, "UInt8", 5) == 0) ||
+                (base.length == 6 && strncmp(base.start, "UInt16", 6) == 0);
+            if (!builtin) return false;
+        }
+    }
+
+    for (size_t i = 0; i < func->inst_count; i++) {
+        JirInst* inst = &func->insts[i];
+        switch (inst->op) {
+            case JIR_OP_STORE_PTR:
+            case JIR_OP_STORE_MEMBER:
+            case JIR_OP_MALLOC:
+            case JIR_OP_MEMBER_ACCESS:
+            case JIR_OP_DEREF:
+                return false;
+            case JIR_OP_CALL:
+                if ((inst->payload.name.length == 5 && strncmp(inst->payload.name.start, "print", 5) == 0) ||
+                    (inst->payload.name.length == 6 && strncmp(inst->payload.name.start, "assert", 6) == 0) ||
+                    (inst->payload.name.length == 9 && strncmp(inst->payload.name.start, "anonymous", 9) == 0)) {
+                    return false;
+                }
+                break;
+            case JIR_OP_LOAD_SYM:
+                if (inst->payload.name.length > 0) {
+                    char c = inst->payload.name.start[0];
+                    if (c >= 'a' && c <= 'z') return false;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return true;
+}
+
+static bool gen_should_emit_jir_for_ast_function(ASTNode* node) {
+    if (!gen_active_jir_module || !node || node->type != AST_FUNC_DECL) return false;
+    char func_name[128];
+    snprintf(func_name, sizeof(func_name), "%.*s", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
+    return gen_can_emit_jir_function(gen_find_jir_function(gen_active_jir_module, func_name));
+}
+
+static void gen_emit_jir_reg(FILE* out, JirFunction* func, int reg) {
+    if (reg < 0 || (size_t)reg >= func->local_count) {
+        fprintf(out, "0");
+        return;
+    }
+    fprintf(out, "%s", func->locals[reg].name);
+}
+
+static void gen_emit_jir_string(FILE* out, const char* s) {
+    fprintf(out, "\"");
+    for (const char* p = s; *p; p++) {
+        if (*p == '\\' || *p == '"') fputc('\\', out);
+        if (*p == '\n') {
+            fputs("\\n", out);
+        } else {
+            fputc(*p, out);
+        }
+    }
+    fprintf(out, "\"");
+}
+
+static void gen_emit_jir_aggregate(FILE* out, JirFunction* func, JirInst* inst) {
+    TypeExpr* type = (inst->dest >= 0 && (size_t)inst->dest < func->local_count) ? func->locals[inst->dest].type : NULL;
+    if (type && type->kind == TYPE_ARRAY) {
+        fprintf(out, "(");
+        generate_type(type->as.array.element, out);
+        fprintf(out, "[%zu]){", inst->call_arg_count);
+    } else {
+        fprintf(out, "(");
+        generate_type(type, out);
+        fprintf(out, "){");
+    }
+    for (size_t i = 0; i < inst->call_arg_count; i++) {
+        gen_emit_jir_reg(out, func, inst->call_args[i]);
+        if (i + 1 < inst->call_arg_count) fprintf(out, ", ");
+    }
+    fprintf(out, "}");
+}
+
+static void gen_emit_jir_member_access(FILE* out, JirFunction* func, JirInst* inst) {
+    TypeExpr* object_type = (inst->src1 >= 0 && (size_t)inst->src1 < func->local_count) ? func->locals[inst->src1].type : NULL;
+    object_type = object_type ? object_type : NULL;
+    if (inst->payload.name.length > 0) {
+        gen_emit_jir_reg(out, func, inst->src1);
+        bool is_ptr = object_type && object_type->kind == TYPE_POINTER;
+        fprintf(out, "%s%.*s", is_ptr ? "->" : ".", (int)inst->payload.name.length, inst->payload.name.start);
+        return;
+    }
+    if (object_type && object_type->kind == TYPE_SLICE) {
+        gen_emit_jir_reg(out, func, inst->src1);
+        fprintf(out, ".ptr[");
+        gen_emit_jir_reg(out, func, inst->src2);
+        fprintf(out, "]");
+        return;
+    }
+    gen_emit_jir_reg(out, func, inst->src1);
+    fprintf(out, "[");
+    gen_emit_jir_reg(out, func, inst->src2);
+    fprintf(out, "]");
+}
+
+static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
+    if (!func) return;
+
+    if (is_main) {
+        fprintf(out, "int main() {\n");
+    } else {
+        generate_type(func->return_type, out);
+        fprintf(out, " %.*s(", (int)func->name.length, func->name.start);
+        bool first = true;
+        for (size_t i = 0; i < func->local_count; i++) {
+            if (!func->locals[i].is_param) continue;
+            if (!first) fprintf(out, ", ");
+            generate_type(func->locals[i].type, out);
+            fprintf(out, " %s", func->locals[i].name);
+            first = false;
+        }
+        fprintf(out, ") {\n");
+    }
+
+    for (size_t i = 0; i < func->local_count; i++) {
+        if (func->locals[i].is_param) continue;
+        fprintf(out, "    ");
+        generate_decl_with_name(func->locals[i].type, func->locals[i].name, out);
+        fprintf(out, ";\n");
+    }
+
+    for (size_t i = 0; i < func->inst_count; i++) {
+        JirInst* inst = &func->insts[i];
+        switch (inst->op) {
+            case JIR_OP_LABEL:
+                fprintf(out, "JIR_LABEL_%u:;\n", inst->payload.label_id);
+                break;
+            case JIR_OP_CONST_INT:
+                fprintf(out, "    %s = %lld;\n", func->locals[inst->dest].name, (long long)inst->payload.int_val);
+                break;
+            case JIR_OP_CONST_STR:
+                fprintf(out, "    %s = (Slice_uint8_t){(uint8_t*)", func->locals[inst->dest].name);
+                gen_emit_jir_string(out, inst->payload.str_val ? inst->payload.str_val : "");
+                fprintf(out, ", %zu};\n", inst->payload.str_val ? strlen(inst->payload.str_val) : 0);
+                break;
+            case JIR_OP_LOAD_SYM:
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                if (inst->payload.name.length > 0) fprintf(out, "%.*s", (int)inst->payload.name.length, inst->payload.name.start);
+                else fprintf(out, "0");
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_STORE:
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_STORE_PTR:
+                fprintf(out, "    *");
+                gen_emit_jir_reg(out, func, inst->dest);
+                fprintf(out, " = ");
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_STORE_MEMBER:
+                fprintf(out, "    ");
+                gen_emit_jir_reg(out, func, inst->dest);
+                if (inst->payload.name.length > 0) {
+                    fprintf(out, ".%.*s", (int)inst->payload.name.length, inst->payload.name.start);
+                } else {
+                    fprintf(out, "[");
+                    gen_emit_jir_reg(out, func, inst->src2);
+                    fprintf(out, "]");
+                }
+                fprintf(out, " = ");
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_ADD:
+            case JIR_OP_SUB:
+            case JIR_OP_MUL:
+            case JIR_OP_DIV:
+            case JIR_OP_CMP_EQ:
+            case JIR_OP_CMP_NEQ:
+            case JIR_OP_CMP_LT:
+            case JIR_OP_CMP_GT:
+            case JIR_OP_CMP_LTE:
+            case JIR_OP_CMP_GTE: {
+                const char* op = "+";
+                switch (inst->op) {
+                    case JIR_OP_SUB: op = "-"; break;
+                    case JIR_OP_MUL: op = "*"; break;
+                    case JIR_OP_DIV: op = "/"; break;
+                    case JIR_OP_CMP_EQ: op = "=="; break;
+                    case JIR_OP_CMP_NEQ: op = "!="; break;
+                    case JIR_OP_CMP_LT: op = "<"; break;
+                    case JIR_OP_CMP_GT: op = ">"; break;
+                    case JIR_OP_CMP_LTE: op = "<="; break;
+                    case JIR_OP_CMP_GTE: op = ">="; break;
+                    default: break;
+                }
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, " %s ", op);
+                gen_emit_jir_reg(out, func, inst->src2);
+                fprintf(out, ";\n");
+                break;
+            }
+            case JIR_OP_JUMP:
+                fprintf(out, "    goto JIR_LABEL_%u;\n", inst->payload.label_id);
+                break;
+            case JIR_OP_JUMP_IF_FALSE:
+                fprintf(out, "    if (!");
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ") goto JIR_LABEL_%u;\n", inst->payload.label_id);
+                break;
+            case JIR_OP_CALL:
+                if (inst->dest >= 0) fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                else fprintf(out, "    ");
+                fprintf(out, "%.*s(", (int)inst->payload.name.length, inst->payload.name.start);
+                for (size_t j = 0; j < inst->call_arg_count; j++) {
+                    gen_emit_jir_reg(out, func, inst->call_args[j]);
+                    if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                }
+                fprintf(out, ");\n");
+                break;
+            case JIR_OP_RETURN:
+                fprintf(out, "    return");
+                if (!is_main && inst->src1 >= 0) {
+                    fprintf(out, " ");
+                    gen_emit_jir_reg(out, func, inst->src1);
+                } else if (is_main) {
+                    fprintf(out, " 0");
+                }
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_MALLOC:
+                fprintf(out, "    %s = malloc(sizeof(", func->locals[inst->dest].name);
+                if (func->locals[inst->dest].type && func->locals[inst->dest].type->kind == TYPE_POINTER) {
+                    generate_type(func->locals[inst->dest].type->as.pointer.element, out);
+                } else {
+                    fprintf(out, "char");
+                }
+                fprintf(out, "));\n");
+                break;
+            case JIR_OP_ARRAY_INIT:
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                gen_emit_jir_aggregate(out, func, inst);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_MEMBER_ACCESS:
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                gen_emit_jir_member_access(out, func, inst);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_DEREF:
+                fprintf(out, "    %s = *", func->locals[inst->dest].name);
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_EXTRACT_FIELD:
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                generate_tuple_field_ref(out, func->locals[inst->src1].name, func->locals[inst->src1].type, (size_t)inst->payload.int_val);
+                fprintf(out, ";\n");
+                break;
+            default:
+                fprintf(out, "    /* unsupported JIR op %d */\n", (int)inst->op);
+                break;
+        }
+    }
+
+    if (is_main) {
+        fprintf(out, "    return 0;\n");
+    }
+    fprintf(out, "}\n\n");
+}
+
+void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_path, bool is_main) {
+    gen_sym_count = 0;
+    gen_enum_count = 0;
+    gen_struct_count = 0;
+    gen_union_count = 0;
+    gen_tuple_variant_count = 0;
+    gen_tuple_type_count = 0;
+    gen_printed_syms = false;
+    gen_is_local = false;
+    gen_binding_temp_id = 0;
+    current_struct_context = NULL;
+    current_struct_field_count = 0;
+    gen_active_jir_module = mod;
+    gen_collect_tuple_types_from_node(root);
+
+    char h_path[PATH_MAX];
+    strncpy(h_path, out_path, PATH_MAX);
+    char* dot_c = strstr(h_path, ".c");
+    if (dot_c) memcpy(dot_c, ".h", 2);
+    else strncat(h_path, ".h", PATH_MAX - strlen(h_path) - 1);
+
+    FILE* h_out = fopen(h_path, "w");
+    if (h_out) {
+        generate_declarations(root, h_out, h_path);
+        fclose(h_out);
+    }
+
+    FILE* c_out = fopen(out_path, "w");
+    if (!c_out) return;
+
+    char* last_slash = strrchr(h_path, '/');
+    char* header_filename = last_slash ? last_slash + 1 : h_path;
+    fprintf(c_out, "#include \"%s\"\n\n", header_filename);
+
+    generate_implementations(root, c_out, is_main, true, true);
+
+    for (size_t i = 0; i < root->as.block.count; i++) {
+        ASTNode* node = root->as.block.statements[i];
+        if (node->type != AST_FUNC_DECL) continue;
+        char func_name[128];
+        snprintf(func_name, sizeof(func_name), "%.*s", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
+        JirFunction* func = gen_find_jir_function(mod, func_name);
+        if (gen_can_emit_jir_function(func)) gen_emit_jir_function(c_out, func, false);
+    }
+
+    fclose(c_out);
+    gen_active_jir_module = NULL;
+    printf("Successfully generated C/H code from JIR at: %s\n", out_path);
 }

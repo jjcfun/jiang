@@ -544,8 +544,8 @@ static void check_node(ASTNode* node) {
                                 switch_value->evaluated_type->kind == TYPE_BASE) {
                                 TypeExpr* union_type = unwrap_type(switch_value->evaluated_type);
                                 Symbol* union_sym = symbol_lookup(union_type->as.base_type);
-                                if (union_sym && union_sym->module_owner) {
-                                    Module* owner_mod = (Module*)union_sym->module_owner;
+                                if (union_sym) {
+                                    Module* owner_mod = union_sym->module_owner ? (Module*)union_sym->module_owner : current_module;
                                     if (owner_mod && owner_mod->root) {
                                         for (size_t k = 0; k < owner_mod->root->as.block.count; k++) {
                                             ASTNode* stmt = owner_mod->root->as.block.statements[k];
