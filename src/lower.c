@@ -197,9 +197,14 @@ static int lower_expr(ASTNode* node) {
                 ASTNode* left = node->as.binary.left;
                 int r_right = lower_expr(node->as.binary.right);
                 if (left->type == AST_IDENTIFIER) {
-                    JirReg dest = lower_get_or_create_local(left->as.identifier.name, left->evaluated_type);
-                    jir_emit(current_jir_func, JIR_OP_STORE, dest, r_right >= 0 ? r_right : 0, -1, jir_arena);
-                    return dest;
+                    JirReg dest = lower_find_local(left->as.identifier.name);
+                    if (dest >= 0) {
+                        jir_emit(current_jir_func, JIR_OP_STORE, dest, r_right >= 0 ? r_right : 0, -1, jir_arena);
+                        return dest;
+                    }
+                    int idx = jir_emit(current_jir_func, JIR_OP_STORE_SYM, -1, r_right >= 0 ? r_right : 0, -1, jir_arena);
+                    current_jir_func->insts[idx].payload.name = left->as.identifier.name;
+                    return r_right;
                 } else if (left->type == AST_MEMBER_ACCESS) {
                     int r_obj = lower_expr(left->as.member_access.object);
                     int idx = jir_emit(current_jir_func, JIR_OP_STORE_MEMBER, r_obj, r_right, -1, jir_arena);

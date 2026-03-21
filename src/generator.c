@@ -1627,12 +1627,6 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
                     return false;
                 }
                 break;
-            case JIR_OP_LOAD_SYM:
-                if (inst->payload.name.length > 0) {
-                    char c = inst->payload.name.start[0];
-                    if (c >= 'a' && c <= 'z') return false;
-                }
-                break;
             default:
                 break;
         }
@@ -1756,6 +1750,11 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 break;
             case JIR_OP_STORE:
                 fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ";\n");
+                break;
+            case JIR_OP_STORE_SYM:
+                fprintf(out, "    %.*s = ", (int)inst->payload.name.length, inst->payload.name.start);
                 gen_emit_jir_reg(out, func, inst->src1);
                 fprintf(out, ";\n");
                 break;
@@ -1959,7 +1958,10 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
     char* header_filename = last_slash ? last_slash + 1 : h_path;
     fprintf(c_out, "#include \"%s\"\n\n", header_filename);
 
-    generate_implementations(root, c_out, is_main, true, true);
+    JirFunction* main_func = is_main ? gen_find_jir_function(mod, "module_main") : NULL;
+    bool emit_main_from_jir = is_main && gen_can_emit_jir_function(main_func);
+
+    generate_implementations(root, c_out, is_main, true, !emit_main_from_jir);
 
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
@@ -1968,6 +1970,10 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
         snprintf(func_name, sizeof(func_name), "%.*s", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
         JirFunction* func = gen_find_jir_function(mod, func_name);
         if (gen_can_emit_jir_function(func)) gen_emit_jir_function(c_out, func, false);
+    }
+
+    if (emit_main_from_jir) {
+        gen_emit_jir_function(c_out, main_func, true);
     }
 
     fclose(c_out);
