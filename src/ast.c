@@ -137,6 +137,14 @@ void ast_print(ASTNode* node, int depth) {
         case AST_LITERAL_STRING:
             printf("String(\"%.*s\")\n", (int)node->as.string.value.length, node->as.string.value.start);
             break;
+        case AST_TUPLE_LITERAL:
+            printf("TupleLiteral (\n");
+            for (size_t i = 0; i < node->as.tuple_literal.count; i++) {
+                ast_print(node->as.tuple_literal.elements[i], depth + 1);
+            }
+            print_indent(depth);
+            printf(")\n");
+            break;
         case AST_IDENTIFIER:
             printf("Identifier(%.*s)\n", (int)node->as.identifier.name.length, node->as.identifier.name.start);
             break;
@@ -154,6 +162,17 @@ void ast_print(ASTNode* node, int depth) {
             type_print(node->as.var_decl.type);
             printf(", Name: '%.*s') = \n", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
             ast_print(node->as.var_decl.initializer, depth + 1);
+            break;
+        case AST_BINDING_ASSIGN:
+            printf("BindingAssign (\n");
+            print_indent(depth + 1);
+            printf("Bindings:\n");
+            ast_print(node->as.binding_assign.bindings, depth + 2);
+            print_indent(depth + 1);
+            printf("Value:\n");
+            ast_print(node->as.binding_assign.value, depth + 2);
+            print_indent(depth);
+            printf(")\n");
             break;
         case AST_FUNC_CALL:
             printf("FuncCall (\n");

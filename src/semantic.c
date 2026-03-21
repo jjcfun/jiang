@@ -226,6 +226,17 @@ static void check_binding_list(ASTNode* node) {
     }
 }
 
+static TypeExpr* tuple_element_type(TypeExpr* type, size_t index) {
+    type = unwrap_type(type);
+    if (!type) return NULL;
+    if (type->kind == TYPE_TUPLE) {
+        if (index < type->as.tuple.count) return type->as.tuple.elements[index];
+        return NULL;
+    }
+    if (index == 0) return type;
+    return NULL;
+}
+
 static void import_public_symbols(Module* imported_mod, int line) {
     if (!imported_mod || !imported_mod->top_level_scope) return;
     for (Symbol* sym = imported_mod->top_level_scope->symbols; sym; sym = sym->next) {
@@ -384,11 +395,42 @@ static void check_node(ASTNode* node) {
             node->evaluated_type = make_base_type("String");
             break;
 
+        case AST_TUPLE_LITERAL: {
+            size_t count = node->as.tuple_literal.count;
+            TypeExpr** elements = arena_alloc(eval_arena, sizeof(TypeExpr*) * count);
+            for (size_t i = 0; i < count; i++) {
+                check_node(node->as.tuple_literal.elements[i]);
+                elements[i] = node->as.tuple_literal.elements[i]->evaluated_type;
+            }
+            node->evaluated_type = type_new_tuple(eval_arena, elements, NULL, count);
+            break;
+        }
+
         case AST_PATTERN:
             node->evaluated_type = node->as.pattern.type ? node->as.pattern.type : make_base_type("Double");
             node->symbol = symbol_define(node->as.pattern.name.start, node->as.pattern.name.length,
                                          SYM_VAR, node->evaluated_type, node->line, false);
             break;
+
+        case AST_BINDING_ASSIGN: {
+            check_node(node->as.binding_assign.value);
+            check_binding_list(node->as.binding_assign.bindings);
+            for (size_t i = 0; i < node->as.binding_assign.bindings->as.binding_list.count; i++) {
+                ASTNode* binding = node->as.binding_assign.bindings->as.binding_list.items[i];
+                TypeExpr* value_type = tuple_element_type(node->as.binding_assign.value->evaluated_type, i);
+                if (binding->as.pattern.type && value_type &&
+                    !same_base_name(binding->as.pattern.type, "_") &&
+                    !type_compatible(binding->as.pattern.type, value_type)) {
+                    semantic_error(binding->line, "Type mismatch in binding '%.*s'",
+                                   (int)binding->as.pattern.name.length, binding->as.pattern.name.start);
+                }
+                if ((!binding->as.pattern.type || same_base_name(binding->as.pattern.type, "_")) && value_type) {
+                    binding->evaluated_type = value_type;
+                    if (binding->symbol) binding->symbol->type = value_type;
+                }
+            }
+            break;
+        }
 
         case AST_IF_STMT:
             check_node(node->as.if_stmt.condition);

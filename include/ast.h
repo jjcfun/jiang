@@ -52,6 +52,7 @@ typedef enum {
     AST_BLOCK,
     AST_LITERAL_NUMBER,
     AST_LITERAL_STRING,
+    AST_TUPLE_LITERAL,
     AST_IDENTIFIER,
     AST_BINARY_EXPR,
     AST_UNARY_EXPR,
@@ -77,6 +78,7 @@ typedef enum {
     AST_IMPORT,
     AST_UNION_DECL,
     AST_BINDING_LIST,
+    AST_BINDING_ASSIGN,
     AST_PATTERN
     } NodeType;
 
@@ -150,6 +152,12 @@ typedef enum {
         struct {
             Token value;
         } string;
+
+        // AST_TUPLE_LITERAL
+        struct {
+            ASTNode** elements;
+            size_t count;
+        } tuple_literal;
 
         // AST_IDENTIFIER
         struct {
@@ -291,6 +299,12 @@ typedef enum {
             ASTNode** members;
             size_t member_count;
         } union_decl;
+
+        // AST_BINDING_ASSIGN
+        struct {
+            ASTNode* bindings;
+            ASTNode* value;
+        } binding_assign;
     } as;
 };
 

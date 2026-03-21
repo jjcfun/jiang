@@ -98,6 +98,8 @@ static ASTNode* enum_declaration();
 static ASTNode* block_statement();
 static ASTNode* function_declaration(TypeExpr* return_type, Token name);
 static ASTNode* parse_binding();
+static ASTNode* parse_binding_list();
+static ASTNode* parse_binding_assign_statement();
 
 static void synchronize() {
     parser.panic_mode = false;
@@ -222,9 +224,32 @@ static ASTNode* number() {
 }
 
 static ASTNode* grouping() {
-    ASTNode* expr = expression();
+    if (match(TOKEN_RIGHT_PAREN)) {
+        ASTNode* node = ast_new_node(parser.arena, AST_TUPLE_LITERAL, parser.previous.line);
+        node->as.tuple_literal.elements = NULL;
+        node->as.tuple_literal.count = 0;
+        return node;
+    }
+
+    ASTNode* first = expression();
+    if (match(TOKEN_COMMA)) {
+        ASTNode* elements[64];
+        size_t count = 0;
+        elements[count++] = first;
+        do {
+            elements[count++] = expression();
+        } while (match(TOKEN_COMMA));
+        consume(TOKEN_RIGHT_PAREN, "Expect ')' after tuple literal.");
+
+        ASTNode* node = ast_new_node(parser.arena, AST_TUPLE_LITERAL, first ? first->line : parser.previous.line);
+        node->as.tuple_literal.elements = arena_alloc(parser.arena, sizeof(ASTNode*) * count);
+        memcpy(node->as.tuple_literal.elements, elements, sizeof(ASTNode*) * count);
+        node->as.tuple_literal.count = count;
+        return node;
+    }
+
     consume(TOKEN_RIGHT_PAREN, "Expect ')' after expression.");
-    return expr;
+    return first;
 }
 
 static ASTNode* binary(ASTNode* left) {
@@ -893,6 +918,19 @@ static ASTNode* parse_binding_list() {
     return node;
 }
 
+static ASTNode* parse_binding_assign_statement() {
+    consume(TOKEN_LEFT_PAREN, "Expect '(' before binding list.");
+    ASTNode* bindings = parse_binding_list();
+    consume(TOKEN_EQUAL, "Expect '=' after binding list.");
+    ASTNode* value = expression();
+    consume(TOKEN_SEMICOLON, "Expect ';' after binding assignment.");
+
+    ASTNode* node = ast_new_node(parser.arena, AST_BINDING_ASSIGN, bindings->line);
+    node->as.binding_assign.bindings = bindings;
+    node->as.binding_assign.value = value;
+    return node;
+}
+
 static ASTNode* for_pattern() {
     if (match(TOKEN_LEFT_PAREN)) {
         return parse_binding_list();
@@ -999,6 +1037,20 @@ static ASTNode* statement() {
     if (match(TOKEN_LEFT_BRACE)) {
         return block_statement();
     }
+
+    if (check(TOKEN_LEFT_PAREN)) {
+        Token next = peek_token();
+        Token next2 = peek_next_token();
+        bool maybe_binding_stmt =
+            (next.type == TOKEN_UNDERSCORE) ||
+            (next.type == TOKEN_IDENTIFIER &&
+             (next2.type == TOKEN_IDENTIFIER || next2.type == TOKEN_STAR ||
+              next2.type == TOKEN_BANG || next2.type == TOKEN_QUESTION ||
+              next2.type == TOKEN_LEFT_BRACKET));
+        if (maybe_binding_stmt) {
+            return parse_binding_assign_statement();
+        }
+    }
     
     // Lookahead for struct initialization statement (e.g. `Point { x: 1, y: 2 };`)
     // Actually, primary expression handles `Type {` nicely if it's part of an expression.
@@ -1017,7 +1069,7 @@ static ASTNode* statement() {
             // Check for '(Type) ID' or '(Type)[Size] ID'
             // We'll peek further to see if there's a ')'
             Token next2 = peek_next_token();
-            if (next2.type == TOKEN_RIGHT_PAREN) {
+            if (next2.type == TOKEN_RIGHT_PAREN || next2.type == TOKEN_COMMA) {
                 is_decl = true;
             }
         }

@@ -42,7 +42,7 @@
     - 例: `Shape.circle(_ x1)`
 - [ ] **补齐 Binding AST / 语义分析**: 让 parser、semantic、codegen 共享同一套 binding 节点与检查逻辑。
     - [x] 拆分独立 `AST_BINDING_LIST`，不再复用 `AST_BLOCK`
-- [ ] **补齐 Binding 测试**: 增加 `for`、赋值解构、Union 解构三类 binding 用例。
+- [x] **补齐 Binding 测试**: 增加 `for`、赋值解构、Union 解构三类 binding 用例。
 
 ### 1. 引入 JIR (Jiang Intermediate Representation)
 - [ ] **定义 JIR 结构**: 实现基于指令流的线性 IR（类似于 Zig 的 ZIR 或三地址码）。

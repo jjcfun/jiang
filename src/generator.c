@@ -18,6 +18,7 @@ static GenSymbol gen_sym_table[256];
 static size_t gen_sym_count = 0;
 static bool gen_printed_syms = false;
 static bool gen_is_local = false;
+static int gen_binding_temp_id = 0;
 static TypeExpr gen_pattern_fallback_type = {
     .kind = TYPE_BASE,
     .as.base_type = { TOKEN_IDENTIFIER, "Double", 6, 0 }
@@ -32,6 +33,14 @@ typedef struct {
 static GenTupleVariant gen_tuple_variants[256];
 static size_t gen_tuple_variant_count = 0;
 
+typedef struct {
+    TypeExpr* type;
+    char name[64];
+} GenTupleType;
+
+static GenTupleType gen_tuple_types[256];
+static size_t gen_tuple_type_count = 0;
+
 static void gen_add_tuple_variant(const char* union_name, const char* variant_name) {
     snprintf(gen_tuple_variants[gen_tuple_variant_count].name, 128, "%s_%s_t", union_name, variant_name);
     gen_tuple_variants[gen_tuple_variant_count].field_count = 0;
@@ -45,6 +54,44 @@ static bool gen_is_tuple_variant(const char* union_name, const char* variant_nam
         if (strcmp(gen_tuple_variants[i].name, target) == 0) return true;
     }
     return false;
+}
+
+static bool gen_type_equals(TypeExpr* a, TypeExpr* b) {
+    if (a == b) return true;
+    if (!a || !b || a->kind != b->kind) return false;
+    switch (a->kind) {
+        case TYPE_BASE:
+            return a->as.base_type.length == b->as.base_type.length &&
+                   strncmp(a->as.base_type.start, b->as.base_type.start, a->as.base_type.length) == 0;
+        case TYPE_POINTER:
+            return gen_type_equals(a->as.pointer.element, b->as.pointer.element);
+        case TYPE_ARRAY:
+            return gen_type_equals(a->as.array.element, b->as.array.element);
+        case TYPE_SLICE:
+            return gen_type_equals(a->as.slice.element, b->as.slice.element);
+        case TYPE_NULLABLE:
+            return gen_type_equals(a->as.nullable.element, b->as.nullable.element);
+        case TYPE_MUTABLE:
+            return gen_type_equals(a->as.mutable.element, b->as.mutable.element);
+        case TYPE_TUPLE:
+            if (a->as.tuple.count != b->as.tuple.count) return false;
+            for (size_t i = 0; i < a->as.tuple.count; i++) {
+                if (!gen_type_equals(a->as.tuple.elements[i], b->as.tuple.elements[i])) return false;
+            }
+            return true;
+    }
+    return false;
+}
+
+static const char* gen_register_tuple_type(TypeExpr* type) {
+    if (!type || type->kind != TYPE_TUPLE) return NULL;
+    for (size_t i = 0; i < gen_tuple_type_count; i++) {
+        if (gen_type_equals(gen_tuple_types[i].type, type)) return gen_tuple_types[i].name;
+    }
+    snprintf(gen_tuple_types[gen_tuple_type_count].name, sizeof(gen_tuple_types[gen_tuple_type_count].name),
+             "JiangTuple_%zu", gen_tuple_type_count);
+    gen_tuple_types[gen_tuple_type_count].type = type;
+    return gen_tuple_types[gen_tuple_type_count++].name;
 }
 
 static void gen_set_tuple_variant_fields(const char* union_name, const char* variant_name, TypeExpr* tuple_type) {
@@ -226,6 +273,123 @@ static void generate_decl_with_name(TypeExpr* type, const char* name, FILE* out)
     }
 }
 
+static void generate_tuple_field_ref(FILE* out, const char* tuple_name, TypeExpr* tuple_type, size_t index) {
+    if (tuple_type && tuple_type->kind == TYPE_TUPLE &&
+        tuple_type->as.tuple.names && index < tuple_type->as.tuple.count &&
+        tuple_type->as.tuple.names[index].length > 0) {
+        fprintf(out, "%s.%.*s", tuple_name,
+                (int)tuple_type->as.tuple.names[index].length,
+                tuple_type->as.tuple.names[index].start);
+    } else {
+        fprintf(out, "%s._%zu", tuple_name, index);
+    }
+}
+
+static void gen_collect_tuple_types_from_type(TypeExpr* type) {
+    if (!type) return;
+    switch (type->kind) {
+        case TYPE_POINTER: gen_collect_tuple_types_from_type(type->as.pointer.element); break;
+        case TYPE_ARRAY: gen_collect_tuple_types_from_type(type->as.array.element); break;
+        case TYPE_SLICE: gen_collect_tuple_types_from_type(type->as.slice.element); break;
+        case TYPE_NULLABLE: gen_collect_tuple_types_from_type(type->as.nullable.element); break;
+        case TYPE_MUTABLE: gen_collect_tuple_types_from_type(type->as.mutable.element); break;
+        case TYPE_TUPLE:
+            gen_register_tuple_type(type);
+            for (size_t i = 0; i < type->as.tuple.count; i++) {
+                gen_collect_tuple_types_from_type(type->as.tuple.elements[i]);
+            }
+            break;
+        default: break;
+    }
+}
+
+static void gen_collect_tuple_types_from_node(ASTNode* node) {
+    if (!node) return;
+    gen_collect_tuple_types_from_type(node->evaluated_type);
+    switch (node->type) {
+        case AST_PROGRAM:
+        case AST_BLOCK:
+            for (size_t i = 0; i < node->as.block.count; i++) gen_collect_tuple_types_from_node(node->as.block.statements[i]);
+            break;
+        case AST_BINDING_LIST:
+            for (size_t i = 0; i < node->as.binding_list.count; i++) gen_collect_tuple_types_from_node(node->as.binding_list.items[i]);
+            break;
+        case AST_BINDING_ASSIGN:
+            gen_collect_tuple_types_from_node(node->as.binding_assign.bindings);
+            gen_collect_tuple_types_from_node(node->as.binding_assign.value);
+            break;
+        case AST_VAR_DECL:
+            gen_collect_tuple_types_from_type(node->as.var_decl.type);
+            gen_collect_tuple_types_from_node(node->as.var_decl.initializer);
+            break;
+        case AST_FUNC_DECL:
+            gen_collect_tuple_types_from_type(node->as.func_decl.return_type);
+            for (size_t i = 0; i < node->as.func_decl.param_count; i++) gen_collect_tuple_types_from_node(node->as.func_decl.params[i]);
+            gen_collect_tuple_types_from_node(node->as.func_decl.body);
+            break;
+        case AST_RETURN_STMT:
+            gen_collect_tuple_types_from_node(node->as.return_stmt.expression);
+            break;
+        case AST_BINARY_EXPR:
+            gen_collect_tuple_types_from_node(node->as.binary.left);
+            gen_collect_tuple_types_from_node(node->as.binary.right);
+            break;
+        case AST_UNARY_EXPR:
+            gen_collect_tuple_types_from_node(node->as.unary.right);
+            break;
+        case AST_FUNC_CALL:
+            gen_collect_tuple_types_from_node(node->as.func_call.callee);
+            for (size_t i = 0; i < node->as.func_call.arg_count; i++) gen_collect_tuple_types_from_node(node->as.func_call.args[i]);
+            break;
+        case AST_MEMBER_ACCESS:
+            gen_collect_tuple_types_from_node(node->as.member_access.object);
+            break;
+        case AST_IF_STMT:
+            gen_collect_tuple_types_from_node(node->as.if_stmt.condition);
+            gen_collect_tuple_types_from_node(node->as.if_stmt.then_branch);
+            gen_collect_tuple_types_from_node(node->as.if_stmt.else_branch);
+            break;
+        case AST_WHILE_STMT:
+            gen_collect_tuple_types_from_node(node->as.while_stmt.condition);
+            gen_collect_tuple_types_from_node(node->as.while_stmt.body);
+            break;
+        case AST_FOR_STMT:
+            gen_collect_tuple_types_from_node(node->as.for_stmt.pattern);
+            gen_collect_tuple_types_from_node(node->as.for_stmt.iterable);
+            gen_collect_tuple_types_from_node(node->as.for_stmt.body);
+            break;
+        case AST_STRUCT_DECL:
+            for (size_t i = 0; i < node->as.struct_decl.member_count; i++) gen_collect_tuple_types_from_node(node->as.struct_decl.members[i]);
+            break;
+        case AST_INIT_DECL:
+            for (size_t i = 0; i < node->as.init_decl.param_count; i++) gen_collect_tuple_types_from_node(node->as.init_decl.params[i]);
+            gen_collect_tuple_types_from_node(node->as.init_decl.body);
+            break;
+        case AST_STRUCT_INIT_EXPR:
+            gen_collect_tuple_types_from_type(node->as.struct_init.type);
+            for (size_t i = 0; i < node->as.struct_init.field_count; i++) gen_collect_tuple_types_from_node(node->as.struct_init.field_values[i]);
+            break;
+        case AST_NEW_EXPR:
+            gen_collect_tuple_types_from_node(node->as.new_expr.value);
+            break;
+        case AST_INDEX_EXPR:
+            gen_collect_tuple_types_from_node(node->as.index_expr.object);
+            gen_collect_tuple_types_from_node(node->as.index_expr.index);
+            break;
+        case AST_ARRAY_LITERAL:
+            gen_collect_tuple_types_from_type(node->as.array_literal.type);
+            for (size_t i = 0; i < node->as.array_literal.element_count; i++) gen_collect_tuple_types_from_node(node->as.array_literal.elements[i]);
+            break;
+        case AST_TUPLE_LITERAL:
+            for (size_t i = 0; i < node->as.tuple_literal.count; i++) gen_collect_tuple_types_from_node(node->as.tuple_literal.elements[i]);
+            break;
+        case AST_UNION_DECL:
+            for (size_t i = 0; i < node->as.union_decl.member_count; i++) gen_collect_tuple_types_from_node(node->as.union_decl.members[i]);
+            break;
+        default: break;
+    }
+}
+
 static void generate_type(TypeExpr* type, FILE* out) {
     if (!type) {
         fprintf(out, "void");
@@ -263,16 +427,7 @@ static void generate_type(TypeExpr* type, FILE* out) {
             generate_type(type->as.mutable.element, out);
             break; 
         case TYPE_TUPLE:
-            fprintf(out, "struct { ");
-            for (size_t i = 0; i < type->as.tuple.count; i++) {
-                generate_type(type->as.tuple.elements[i], out);
-                if (type->as.tuple.names && type->as.tuple.names[i].length > 0) {
-                    fprintf(out, " %.*s; ", (int)type->as.tuple.names[i].length, type->as.tuple.names[i].start);
-                } else {
-                    fprintf(out, " _%zu; ", i);
-                }
-            }
-            fprintf(out, " }");
+            fprintf(out, "%s", gen_register_tuple_type(type));
             break;
     }
 }
@@ -351,6 +506,17 @@ static void generate_node(ASTNode* node, FILE* out) {
 
         case AST_LITERAL_STRING:
             fprintf(out, "%.*s", (int)node->as.string.value.length, node->as.string.value.start);
+            break;
+
+        case AST_TUPLE_LITERAL:
+            fprintf(out, "(");
+            generate_type(node->evaluated_type, out);
+            fprintf(out, "){");
+            for (size_t i = 0; i < node->as.tuple_literal.count; i++) {
+                generate_node(node->as.tuple_literal.elements[i], out);
+                if (i < node->as.tuple_literal.count - 1) fprintf(out, ", ");
+            }
+            fprintf(out, "}");
             break;
 
         case AST_BINARY_EXPR:
@@ -659,6 +825,24 @@ static void generate_node(ASTNode* node, FILE* out) {
             }
             break;
 
+        case AST_BINDING_ASSIGN: {
+            char temp_name[64];
+            snprintf(temp_name, sizeof(temp_name), "_binding_tmp_%d", gen_binding_temp_id++);
+            fprintf(out, "{ ");
+            generate_decl_with_name(node->as.binding_assign.value->evaluated_type, temp_name, out);
+            fprintf(out, " = ");
+            generate_node(node->as.binding_assign.value, out);
+            fprintf(out, "; ");
+            for (size_t i = 0; i < node->as.binding_assign.bindings->as.binding_list.count; i++) {
+                ASTNode* binding = node->as.binding_assign.bindings->as.binding_list.items[i];
+                fprintf(out, "%.*s = ", (int)binding->as.pattern.name.length, binding->as.pattern.name.start);
+                generate_tuple_field_ref(out, temp_name, node->as.binding_assign.value->evaluated_type, i);
+                fprintf(out, "; ");
+            }
+            fprintf(out, "}");
+            break;
+        }
+
         case AST_RETURN_STMT:
             fprintf(out, "return");
             if (node->as.return_stmt.expression) {
@@ -839,10 +1023,13 @@ void generate_c_code(ASTNode* root, const char* out_path, bool is_main) {
     gen_struct_count = 0;
     gen_union_count = 0;
     gen_tuple_variant_count = 0;
+    gen_tuple_type_count = 0;
     gen_printed_syms = false;
     gen_is_local = false;
+    gen_binding_temp_id = 0;
     current_struct_context = NULL;
     current_struct_field_count = 0;
+    gen_collect_tuple_types_from_node(root);
 
     char h_path[PATH_MAX];
     strncpy(h_path, out_path, PATH_MAX);
@@ -881,6 +1068,21 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
     if (getcwd(cwd, sizeof(cwd)) != NULL) snprintf(runtime_path, sizeof(runtime_path), "%s/include/runtime.h", cwd);
     else strcpy(runtime_path, "runtime.h");
     fprintf(out, "#include \"%s\"\n\n", runtime_path);
+
+    for (size_t i = 0; i < gen_tuple_type_count; i++) {
+        TypeExpr* type = gen_tuple_types[i].type;
+        fprintf(out, "typedef struct { ");
+        for (size_t j = 0; j < type->as.tuple.count; j++) {
+            generate_type(type->as.tuple.elements[j], out);
+            if (type->as.tuple.names && type->as.tuple.names[j].length > 0) {
+                fprintf(out, " %.*s; ", (int)type->as.tuple.names[j].length, type->as.tuple.names[j].start);
+            } else {
+                fprintf(out, " _%zu; ", j);
+            }
+        }
+        fprintf(out, "} %s;\n", gen_tuple_types[i].name);
+    }
+    if (gen_tuple_type_count > 0) fprintf(out, "\n");
 
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
@@ -1050,6 +1252,13 @@ static void gen_collect_patterns(ASTNode* node) {
             break;
         case AST_BINDING_LIST:
             for (size_t i = 0; i < node->as.binding_list.count; i++) gen_collect_patterns(node->as.binding_list.items[i]);
+            break;
+        case AST_BINDING_ASSIGN:
+            gen_collect_patterns(node->as.binding_assign.bindings);
+            gen_collect_patterns(node->as.binding_assign.value);
+            break;
+        case AST_TUPLE_LITERAL:
+            for (size_t i = 0; i < node->as.tuple_literal.count; i++) gen_collect_patterns(node->as.tuple_literal.elements[i]);
             break;
         case AST_BINARY_EXPR:
             gen_collect_patterns(node->as.binary.left);
