@@ -60,6 +60,8 @@ typedef struct {
     } payload;
     int* call_args;
     size_t call_arg_count;
+    Token* field_names;
+    size_t field_name_count;
 } JirInst;
 
 typedef struct {

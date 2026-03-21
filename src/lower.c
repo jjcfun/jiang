@@ -29,6 +29,14 @@ static JirReg lower_find_local(Token name) {
     return -1;
 }
 
+static Token lower_make_token_from_cstr(const char* text) {
+    size_t len = strlen(text);
+    char* buf = arena_alloc(jir_arena, len + 1);
+    memcpy(buf, text, len + 1);
+    Token token = { TOKEN_IDENTIFIER, buf, (int)len, 0 };
+    return token;
+}
+
 static JirReg lower_get_or_create_local(Token name, TypeExpr* type) {
     JirReg existing = lower_find_local(name);
     if (existing >= 0) return existing;
@@ -227,7 +235,30 @@ static int lower_expr(ASTNode* node) {
             int args[32]; for (size_t i = 0; i < node->as.func_call.arg_count; i++) args[i] = lower_expr(node->as.func_call.args[i]);
             int r = lower_is_void_type(node->evaluated_type) ? -1 : jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             Token callee_name = {TOKEN_IDENTIFIER, "anonymous", 9, 0};
-            if (node->as.func_call.callee->type == AST_IDENTIFIER) callee_name = node->as.func_call.callee->as.identifier.name;
+            if (node->as.func_call.callee->type == AST_IDENTIFIER) {
+                callee_name = node->as.func_call.callee->as.identifier.name;
+            } else if (node->as.func_call.callee->type == AST_MEMBER_ACCESS) {
+                ASTNode* obj = node->as.func_call.callee->as.member_access.object;
+                Token member = node->as.func_call.callee->as.member_access.member;
+                if (obj->symbol && obj->symbol->kind == SYM_NAMESPACE) {
+                    callee_name = member;
+                } else if ((obj->symbol && obj->symbol->kind == SYM_STRUCT && obj->symbol->type && obj->symbol->type->kind == TYPE_BASE) ||
+                           (obj->type == AST_IDENTIFIER && obj->evaluated_type && obj->evaluated_type->kind == TYPE_BASE)) {
+                    Token type_name = {0};
+                    if (obj->symbol && obj->symbol->type && obj->symbol->type->kind == TYPE_BASE) {
+                        type_name = obj->symbol->type->as.base_type;
+                    } else if (obj->type == AST_IDENTIFIER && obj->evaluated_type && obj->evaluated_type->kind == TYPE_BASE) {
+                        type_name = obj->evaluated_type->as.base_type;
+                    }
+                    if (type_name.length > 0) {
+                        char name_buf[160];
+                        snprintf(name_buf, sizeof(name_buf), "%.*s_%.*s",
+                                 (int)type_name.length, type_name.start,
+                                 (int)member.length, member.start);
+                        callee_name = lower_make_token_from_cstr(name_buf);
+                    }
+                }
+            }
             jir_emit_call(current_jir_func, r, callee_name, args, node->as.func_call.arg_count, jir_arena);
             return r;
         }
@@ -254,6 +285,26 @@ static int lower_expr(ASTNode* node) {
             }
             return r;
         }
+        case AST_STRUCT_INIT_EXPR: {
+            int args[64];
+            for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
+                args[i] = lower_expr(node->as.struct_init.field_values[i]);
+            }
+            int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+            int idx = jir_emit(current_jir_func, JIR_OP_STRUCT_INIT, r, -1, -1, jir_arena);
+            current_jir_func->insts[idx].payload.name = node->as.struct_init.type->as.base_type;
+            if (node->as.struct_init.field_count > 0) {
+                current_jir_func->insts[idx].call_args = malloc(sizeof(int) * node->as.struct_init.field_count);
+                current_jir_func->insts[idx].field_names = malloc(sizeof(Token) * node->as.struct_init.field_count);
+                for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
+                    current_jir_func->insts[idx].call_args[i] = args[i];
+                    current_jir_func->insts[idx].field_names[i] = node->as.struct_init.field_names[i];
+                }
+                current_jir_func->insts[idx].call_arg_count = node->as.struct_init.field_count;
+                current_jir_func->insts[idx].field_name_count = node->as.struct_init.field_count;
+            }
+            return r;
+        }
         case AST_INDEX_EXPR: {
             int r_obj = lower_expr(node->as.index_expr.object); int r_idx = lower_expr(node->as.index_expr.index);
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
@@ -268,6 +319,16 @@ static int lower_expr(ASTNode* node) {
             return r;
         }
         case AST_MEMBER_ACCESS: {
+            if (node->as.member_access.object &&
+                node->as.member_access.object->type == AST_UNARY_EXPR &&
+                node->as.member_access.object->as.unary.op == TOKEN_DOLLAR &&
+                node->as.member_access.member.length == 3 &&
+                strncmp(node->as.member_access.member.start, "tag", 3) == 0) {
+                int r_obj = lower_expr(node->as.member_access.object->as.unary.right);
+                int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+                jir_emit(current_jir_func, JIR_OP_GET_TAG, r, r_obj, -1, jir_arena);
+                return r;
+            }
             int r_obj = lower_expr(node->as.member_access.object);
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             int idx = jir_emit(current_jir_func, JIR_OP_MEMBER_ACCESS, r, r_obj >= 0 ? r_obj : 0, -1, jir_arena);

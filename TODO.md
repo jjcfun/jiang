@@ -42,7 +42,7 @@
 - [ ] **补齐 Lowering 覆盖率**: 将主要 AST 节点稳定降级为 JIR。
     - [x] 变量声明与基础赋值
     - [x] tuple literal / binding assign
-    - [ ] struct / union 初始化与字段访问
+    - [x] struct / union 初始化与字段访问
     - [x] range / for-in / break / continue
     - [ ] import 后的顶层初始化与跨模块引用
 - [ ] **在 Lowering 阶段消解语法糖**: 不把高层模式匹配和隐式语义继续留给 C generator。
@@ -61,7 +61,7 @@
 
 ### 3. 最低限度标准库 (Minimal Stdlib)
 - [x] **建立标准库目录结构**: 约定 `std/` 或等价 sysroot 布局，避免继续依赖测试目录充当库。
-- [ ] **实现最小标准库模块**:
+- [x] **实现最小标准库模块**:
     - [x] `std/io`
     - [x] `std/assert`
     - [x] `std/string`
@@ -89,7 +89,7 @@
 
 ## 📦 Stage1 前置条件 (Prepare During Stage0)
 - [x] **定义自举子集**: 明确 Stage1 第一版 Jiang 编译器允许依赖的语法与标准库范围。
-- [ ] **同步语言文档**: 更新 `README`、`doc/jiang.md`、`doc/ebnf.md`，确保与当前实现一致。
+- [x] **同步语言文档**: 更新 `README`、`doc/jiang.md`、`doc/ebnf.md`，确保与当前实现一致。
 - [x] **准备标准库示例程序**: 至少能用 Stage0 编译器编译一个依赖标准库的简单工具程序。
 
 ## 📝 架构笔记 (Architectural Notes)

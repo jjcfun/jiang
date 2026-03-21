@@ -1619,9 +1619,7 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
         JirInst* inst = &func->insts[i];
         switch (inst->op) {
             case JIR_OP_STORE_PTR:
-            case JIR_OP_STORE_MEMBER:
             case JIR_OP_MALLOC:
-            case JIR_OP_MEMBER_ACCESS:
             case JIR_OP_DEREF:
                 return false;
             case JIR_OP_CALL:
@@ -1772,7 +1770,9 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 fprintf(out, "    ");
                 gen_emit_jir_reg(out, func, inst->dest);
                 if (inst->payload.name.length > 0) {
-                    fprintf(out, ".%.*s", (int)inst->payload.name.length, inst->payload.name.start);
+                    TypeExpr* dest_type = (inst->dest >= 0 && (size_t)inst->dest < func->local_count) ? func->locals[inst->dest].type : NULL;
+                    bool is_ptr = dest_type && dest_type->kind == TYPE_POINTER;
+                    fprintf(out, "%s%.*s", is_ptr ? "->" : ".", (int)inst->payload.name.length, inst->payload.name.start);
                 } else {
                     fprintf(out, "[");
                     gen_emit_jir_reg(out, func, inst->src2);
@@ -1876,10 +1876,32 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 gen_emit_jir_aggregate(out, func, inst);
                 fprintf(out, ";\n");
                 break;
+            case JIR_OP_STRUCT_INIT:
+                fprintf(out, "    %s = (", func->locals[inst->dest].name);
+                if (inst->payload.name.length > 0) {
+                    fprintf(out, "%.*s", (int)inst->payload.name.length, inst->payload.name.start);
+                } else {
+                    generate_type(func->locals[inst->dest].type, out);
+                }
+                fprintf(out, "){");
+                for (size_t j = 0; j < inst->call_arg_count; j++) {
+                    if (j < inst->field_name_count) {
+                        fprintf(out, ".%.*s = ", (int)inst->field_names[j].length, inst->field_names[j].start);
+                    }
+                    gen_emit_jir_reg(out, func, inst->call_args[j]);
+                    if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                }
+                fprintf(out, "};\n");
+                break;
             case JIR_OP_MEMBER_ACCESS:
                 fprintf(out, "    %s = ", func->locals[inst->dest].name);
                 gen_emit_jir_member_access(out, func, inst);
                 fprintf(out, ";\n");
+                break;
+            case JIR_OP_GET_TAG:
+                fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ".kind;\n");
                 break;
             case JIR_OP_DEREF:
                 fprintf(out, "    %s = *", func->locals[inst->dest].name);

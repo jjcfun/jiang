@@ -67,6 +67,8 @@ int jir_emit(JirFunction* func, JirOp op, JirReg dest, JirReg src1, JirReg src2,
     func->insts[idx].src2 = src2;
     func->insts[idx].call_args = NULL;
     func->insts[idx].call_arg_count = 0;
+    func->insts[idx].field_names = NULL;
+    func->insts[idx].field_name_count = 0;
     return idx;
 }
 
