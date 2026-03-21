@@ -18,16 +18,24 @@ static GenSymbol gen_sym_table[256];
 static size_t gen_sym_count = 0;
 static bool gen_printed_syms = false;
 static bool gen_is_local = false;
+static TypeExpr gen_pattern_fallback_type = {
+    .kind = TYPE_BASE,
+    .as.base_type = { TOKEN_IDENTIFIER, "Double", 6, 0 }
+};
 
 typedef struct {
     char name[128];
+    char fields[8][64];
+    size_t field_count;
 } GenTupleVariant;
 
 static GenTupleVariant gen_tuple_variants[256];
 static size_t gen_tuple_variant_count = 0;
 
 static void gen_add_tuple_variant(const char* union_name, const char* variant_name) {
-    snprintf(gen_tuple_variants[gen_tuple_variant_count++].name, 128, "%s_%s_t", union_name, variant_name);
+    snprintf(gen_tuple_variants[gen_tuple_variant_count].name, 128, "%s_%s_t", union_name, variant_name);
+    gen_tuple_variants[gen_tuple_variant_count].field_count = 0;
+    gen_tuple_variant_count++;
 }
 
 static bool gen_is_tuple_variant(const char* union_name, const char* variant_name) {
@@ -37,6 +45,36 @@ static bool gen_is_tuple_variant(const char* union_name, const char* variant_nam
         if (strcmp(gen_tuple_variants[i].name, target) == 0) return true;
     }
     return false;
+}
+
+static void gen_set_tuple_variant_fields(const char* union_name, const char* variant_name, TypeExpr* tuple_type) {
+    char target[128];
+    snprintf(target, sizeof(target), "%s_%s_t", union_name, variant_name);
+    for (size_t i = 0; i < gen_tuple_variant_count; i++) {
+        if (strcmp(gen_tuple_variants[i].name, target) != 0) continue;
+        gen_tuple_variants[i].field_count = tuple_type && tuple_type->kind == TYPE_TUPLE ? tuple_type->as.tuple.count : 0;
+        for (size_t j = 0; j < gen_tuple_variants[i].field_count && j < 8; j++) {
+            if (tuple_type->as.tuple.names && tuple_type->as.tuple.names[j].length > 0) {
+                snprintf(gen_tuple_variants[i].fields[j], 64, "%.*s",
+                         (int)tuple_type->as.tuple.names[j].length, tuple_type->as.tuple.names[j].start);
+            } else {
+                snprintf(gen_tuple_variants[i].fields[j], 64, "_%zu", j);
+            }
+        }
+        return;
+    }
+}
+
+static const char* gen_get_tuple_variant_field(const char* union_name, const char* variant_name, int field_index) {
+    char target[128];
+    snprintf(target, sizeof(target), "%s_%s_t", union_name, variant_name);
+    for (size_t i = 0; i < gen_tuple_variant_count; i++) {
+        if (strcmp(gen_tuple_variants[i].name, target) == 0 &&
+            field_index >= 0 && (size_t)field_index < gen_tuple_variants[i].field_count) {
+            return gen_tuple_variants[i].fields[field_index];
+        }
+    }
+    return NULL;
 }
 
 typedef struct {
@@ -172,6 +210,21 @@ static bool is_current_struct_field(Token name) {
 }
 
 static void generate_node(ASTNode* node, FILE* out);
+static void generate_type(TypeExpr* type, FILE* out);
+
+static void generate_decl_with_name(TypeExpr* type, const char* name, FILE* out) {
+    if (!type || (type->kind == TYPE_BASE && type->as.base_type.length == 1 && type->as.base_type.start[0] == '_')) {
+        fprintf(out, "double %s", name);
+        return;
+    }
+    generate_type(type, out);
+    fprintf(out, " %s", name);
+    if (type && type->kind == TYPE_ARRAY) {
+        fprintf(out, "[");
+        if (type->as.array.length) generate_node(type->as.array.length, out);
+        fprintf(out, "]");
+    }
+}
 
 static void generate_type(TypeExpr* type, FILE* out) {
     if (!type) {
@@ -256,6 +309,17 @@ static void generate_node(ASTNode* node, FILE* out) {
                 }
             } else {
                 if (node->as.var_decl.initializer) {
+                    if (type && type->kind == TYPE_ARRAY && node->as.var_decl.initializer->type == AST_ARRAY_LITERAL) {
+                        fprintf(out, "memcpy(%.*s, &", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
+                        generate_node(node->as.var_decl.initializer, out);
+                        fprintf(out, ", sizeof(");
+                        generate_type(type->as.array.element, out);
+                        fprintf(out, ") * ");
+                        if (type->as.array.length) generate_node(type->as.array.length, out);
+                        else fprintf(out, "%zu", node->as.var_decl.initializer->as.array_literal.element_count);
+                        fprintf(out, ")");
+                        return;
+                    }
                     fprintf(out, "%.*s", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
                 }
             }
@@ -314,6 +378,8 @@ static void generate_node(ASTNode* node, FILE* out) {
                             
                             char u_name[64];
                             snprintf(u_name, 64, "%.*s", (int)obj->as.identifier.name.length, obj->as.identifier.name.start);
+                            char v_name[64];
+                            snprintf(v_name, 64, "%.*s", (int)ma->as.member_access.member.length, ma->as.member_access.member.start);
                             const char* tag_enum_name = gen_get_union_tag_enum(u_name);
                             if (tag_enum_name && tag_enum_name[0] != '\0') {
                                 fprintf(out, "%s_%.*s", tag_enum_name, (int)ma->as.member_access.member.length, ma->as.member_access.member.start);
@@ -322,20 +388,26 @@ static void generate_node(ASTNode* node, FILE* out) {
                             }
 
                             fprintf(out, ") ? (");
+                            int pattern_pos = 0;
                             for (size_t i = 0; i < right->as.func_call.arg_count; i++) {
                                 ASTNode* arg = right->as.func_call.args[i];
                                 if (arg->type == AST_PATTERN) {
                                     fprintf(out, "%.*s = ", (int)arg->as.pattern.name.length, arg->as.pattern.name.start);
                                     generate_node(node->as.binary.left, out);
                                     fprintf(out, ".%.*s", (int)ma->as.member_access.member.length, ma->as.member_access.member.start);
-                                    if (arg->as.pattern.field_index >= 0) {
+                                    if (arg->as.pattern.field_index >= 0 || pattern_pos > 0) {
+                                        int field_index = pattern_pos;
                                         if (arg->as.pattern.field_name.length > 0) {
                                             fprintf(out, ".%.*s", (int)arg->as.pattern.field_name.length, arg->as.pattern.field_name.start);
+                                        } else if (gen_is_tuple_variant(u_name, v_name)) {
+                                            const char* field_name = gen_get_tuple_variant_field(u_name, v_name, field_index);
+                                            if (field_name) fprintf(out, ".%s", field_name);
                                         } else {
-                                            fprintf(out, "._%d", arg->as.pattern.field_index);
+                                            // Non-tuple union variant stores the value directly.
                                         }
                                     }
                                     fprintf(out, ", ");
+                                    pattern_pos++;
                                 }
                             }
                             fprintf(out, "1) : 0; })");
@@ -386,6 +458,16 @@ static void generate_node(ASTNode* node, FILE* out) {
             if (callee->type == AST_MEMBER_ACCESS) {
                 ASTNode* obj = callee->as.member_access.object;
                 Token method = callee->as.member_access.member;
+
+                if (obj->type == AST_IDENTIFIER && obj->symbol && obj->symbol->kind == SYM_NAMESPACE) {
+                    fprintf(out, "%.*s(", (int)method.length, method.start);
+                    for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
+                        generate_node(node->as.func_call.args[i], out);
+                        if (i < node->as.func_call.arg_count - 1) fprintf(out, ", ");
+                    }
+                    fprintf(out, ")");
+                    return;
+                }
                 
                 if (obj->type == AST_IDENTIFIER && gen_is_struct(obj->as.identifier.name)) {
                     // Static Union/Struct Constructor
@@ -438,7 +520,7 @@ static void generate_node(ASTNode* node, FILE* out) {
                         if (i < node->as.func_call.arg_count - 1) fprintf(out, ", ");
                     }
                     fprintf(out, ")");
-                } else if (gen_is_struct(name)) {
+                } else if (gen_is_struct(name) || (callee->symbol && callee->symbol->kind == SYM_STRUCT)) {
                     fprintf(out, "%.*s_new(", (int)name.length, name.start);
                     for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
                         generate_node(node->as.func_call.args[i], out);
@@ -474,9 +556,18 @@ static void generate_node(ASTNode* node, FILE* out) {
                 fprintf(out, "%.*s_%.*s", (int)obj->as.identifier.name.length, obj->as.identifier.name.start, (int)member.length, member.start);
                 return;
             }
+
+            if (obj->type == AST_IDENTIFIER && obj->symbol && obj->symbol->kind == SYM_NAMESPACE) {
+                fprintf(out, "%.*s", (int)member.length, member.start);
+                return;
+            }
             
             const char* obj_type = (obj->type == AST_IDENTIFIER) ? gen_get_type(obj->as.identifier.name) : NULL;
             if (obj_type && gen_is_enum_str(obj_type)) {
+                if (member.length == 5 && strncmp(member.start, "value", 5) == 0) {
+                    generate_node(obj, out);
+                    return;
+                }
                 generate_node(obj, out);
                 fprintf(out, "_%.*s", (int)member.length, member.start);
                 return;
@@ -513,9 +604,14 @@ static void generate_node(ASTNode* node, FILE* out) {
                 generate_type(val->as.array_literal.type->as.array.element, out);
                 fprintf(out, "*)_p; })");
             } else {
-                fprintf(out, "malloc(sizeof(");
+                TypeExpr* pointee = node->evaluated_type ? node->evaluated_type->as.pointer.element : val->evaluated_type;
+                fprintf(out, "({ ");
+                generate_type(pointee, out);
+                fprintf(out, "* _p = malloc(sizeof(");
+                generate_type(pointee, out);
+                fprintf(out, ")); *_p = ");
                 generate_node(val, out);
-                fprintf(out, "))");
+                fprintf(out, "; _p; })");
             }
             break;
         }
@@ -578,7 +674,45 @@ static void generate_node(ASTNode* node, FILE* out) {
             fprintf(out, "}");
             break;
 
+        case AST_UNARY_EXPR:
+            if (node->as.unary.op == TOKEN_STAR) {
+                fprintf(out, "(*");
+                generate_node(node->as.unary.right, out);
+                fprintf(out, ")");
+            } else if (node->as.unary.op == TOKEN_MINUS) {
+                fprintf(out, "(-");
+                generate_node(node->as.unary.right, out);
+                fprintf(out, ")");
+            } else if (node->as.unary.op == TOKEN_BANG) {
+                fprintf(out, "(!");
+                generate_node(node->as.unary.right, out);
+                fprintf(out, ")");
+            } else if (node->as.unary.op == TOKEN_DOLLAR) {
+                generate_node(node->as.unary.right, out);
+            }
+            break;
+
         case AST_INDEX_EXPR:
+            if (node->as.index_expr.index->type == AST_RANGE_EXPR &&
+                node->as.index_expr.object->evaluated_type &&
+                node->as.index_expr.object->evaluated_type->kind == TYPE_ARRAY) {
+                fprintf(out, "({ Slice_");
+                generate_type(node->as.index_expr.object->evaluated_type->as.array.element, out);
+                fprintf(out, " _s; _s.ptr = ");
+                generate_node(node->as.index_expr.object, out);
+                fprintf(out, " + ");
+                if (node->as.index_expr.index->as.range.start) generate_node(node->as.index_expr.index->as.range.start, out);
+                else fprintf(out, "0");
+                fprintf(out, "; _s.length = ");
+                if (node->as.index_expr.index->as.range.end) generate_node(node->as.index_expr.index->as.range.end, out);
+                else if (node->as.index_expr.object->evaluated_type->as.array.length) generate_node(node->as.index_expr.object->evaluated_type->as.array.length, out);
+                else fprintf(out, "0");
+                fprintf(out, " - ");
+                if (node->as.index_expr.index->as.range.start) generate_node(node->as.index_expr.index->as.range.start, out);
+                else fprintf(out, "0");
+                fprintf(out, "; _s; })");
+                return;
+            }
             if (node->as.index_expr.object->evaluated_type && 
                 node->as.index_expr.object->evaluated_type->kind == TYPE_SLICE) {
                 if (node->as.index_expr.index->type == AST_RANGE_EXPR) {
@@ -657,8 +791,8 @@ static void generate_node(ASTNode* node, FILE* out) {
                 for (size_t i = 0; i < gen_sym_count; i++) {
                     if (!gen_sym_table[i].is_param) {
                         fprintf(out, "    ");
-                        generate_type(gen_sym_table[i].type_expr, out);
-                        fprintf(out, " %s;\n", gen_sym_table[i].name);
+                        generate_decl_with_name(gen_sym_table[i].type_expr, gen_sym_table[i].name, out);
+                        fprintf(out, ";\n");
                     }
                 }
             }
@@ -678,7 +812,9 @@ static void generate_node(ASTNode* node, FILE* out) {
         case AST_BREAK_STMT: fprintf(out, "break"); break;
         case AST_CONTINUE_STMT: fprintf(out, "continue"); break;
         case AST_IMPORT: {
-            fprintf(out, "#include \"%s\"\n", node->as.import_decl.resolved_path);
+            const char* include_path = node->as.import_decl.resolved_path;
+            const char* base = strrchr(include_path, '/');
+            fprintf(out, "#include \"%s\"\n", base ? base + 1 : include_path);
             return;
         }
         default: break;
@@ -779,6 +915,22 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
                 }
             }
             fprintf(out, ");\n");
+            for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
+                ASTNode* member = node->as.struct_decl.members[j];
+                if (member->type == AST_FUNC_DECL && member->is_public) {
+                    generate_type(member->as.func_decl.return_type, out);
+                    fprintf(out, " %.*s_%.*s(%.*s* self", (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start,
+                            (int)member->as.func_decl.name.length, member->as.func_decl.name.start,
+                            (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start);
+                    for (size_t k = 0; k < member->as.func_decl.param_count; k++) {
+                        fprintf(out, ", ");
+                        generate_type(member->as.func_decl.params[k]->as.var_decl.type, out);
+                        fprintf(out, " %.*s", (int)member->as.func_decl.params[k]->as.var_decl.name.length,
+                                member->as.func_decl.params[k]->as.var_decl.name.start);
+                    }
+                    fprintf(out, ");\n");
+                }
+            }
         } else if (node->type == AST_UNION_DECL) {
             // Forward declare types for tuple variants
             for (size_t j = 0; j < node->as.union_decl.member_count; j++) {
@@ -788,6 +940,7 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
                     snprintf(u_name, 64, "%.*s", (int)node->as.union_decl.name.length, node->as.union_decl.name.start);
                     snprintf(v_name, 64, "%.*s", (int)m->as.var_decl.name.length, m->as.var_decl.name.start);
                     gen_add_tuple_variant(u_name, v_name);
+                    gen_set_tuple_variant_fields(u_name, v_name, m->as.var_decl.type);
 
                     fprintf(out, "typedef ");
                     generate_type(m->as.var_decl.type, out);
@@ -868,7 +1021,8 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
             strncpy(path, node->as.import_decl.resolved_path, 256);
             char* dot_c = strstr(path, ".c");
             if (dot_c) memcpy(dot_c, ".h", 2);
-            fprintf(out, "#include \"%s\"\n", path);
+            char* base = strrchr(path, '/');
+            fprintf(out, "#include \"%s\"\n", base ? base + 1 : path);
         }
     }
     fprintf(out, "\n#endif\n");
@@ -879,7 +1033,7 @@ static void gen_collect_patterns(ASTNode* node) {
     
     switch (node->type) {
         case AST_PATTERN:
-            gen_add_sym(node->as.pattern.name, node->evaluated_type, false);
+            gen_add_sym(node->as.pattern.name, node->evaluated_type ? node->evaluated_type : &gen_pattern_fallback_type, false);
             break;
         case AST_PROGRAM:
         case AST_BLOCK:
@@ -1050,8 +1204,8 @@ static void generate_implementations(ASTNode* root, FILE* out, bool is_main) {
         for (size_t i = 0; i < gen_sym_count; i++) {
             if (!gen_sym_table[i].is_param) {
                 fprintf(out, "    ");
-                generate_type(gen_sym_table[i].type_expr, out);
-                fprintf(out, " %s;\n", gen_sym_table[i].name);
+                generate_decl_with_name(gen_sym_table[i].type_expr, gen_sym_table[i].name, out);
+                fprintf(out, ";\n");
             }
         }
         gen_printed_syms = true;

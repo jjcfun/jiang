@@ -62,11 +62,16 @@ for TEST_FILE in "$TESTS_DIR"/*.jiang; do
                     echo -e "\033[32m通过\033[0m"
                     SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                 else
-                    echo -e "\033[31m失败 (二进制文件运行崩溃)\033[0m"
-                    FAIL_COUNT=$((FAIL_COUNT + 1))
-                    echo "--- 运行输出 ---"
-                    cat "$BUILD_DIR/bin_output.log"
-                    echo "----------------"
+                    if [[ "$TEST_NAME" == "assert_fail" ]]; then
+                        echo -e "\033[32m通过 (成功触发预期内的断言失败)\033[0m"
+                        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                    else
+                        echo -e "\033[31m失败 (二进制文件运行崩溃)\033[0m"
+                        FAIL_COUNT=$((FAIL_COUNT + 1))
+                        echo "--- 运行输出 ---"
+                        cat "$BUILD_DIR/bin_output.log"
+                        echo "----------------"
+                    fi
                 fi
             else
                 echo -e "\033[31m失败 (未找到预期的二进制文件 $OUTPUT_BIN)\033[0m"
