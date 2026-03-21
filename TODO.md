@@ -46,10 +46,10 @@
     - [x] range / for-in / break / continue
     - [x] import 后的顶层初始化与跨模块引用
 - [ ] **在 Lowering 阶段消解语法糖**: 不把高层模式匹配和隐式语义继续留给 C generator。
-    - [ ] `for-in`
-    - [ ] Union pattern / `switch`
-    - [ ] tuple binding
-    - [ ] `$` 相关语法糖
+    - [x] `for-in`
+    - [x] Union pattern / `switch`
+    - [x] tuple binding
+    - [x] `$` 相关语法糖
 - [x] **让符号绑定显式进入 JIR**: 局部变量与参数优先绑定到 JIR local，减少 Codegen 阶段的字符串查找与 AST 回溯。
 - [ ] **重构 JIR Codegen**: 让 `jir_generate_c` 直接基于 JIR 产出 C，逐步淘汰 AST 直出路径。
 

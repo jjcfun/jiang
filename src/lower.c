@@ -6,11 +6,17 @@
 static JirModule* current_jir_mod = NULL;
 static JirFunction* current_jir_func = NULL;
 static Arena* jir_arena = NULL;
+static ASTNode* current_ast_root = NULL;
 static uint32_t loop_break_labels[64];
 static uint32_t loop_continue_labels[64];
 static int loop_depth = 0;
+static TypeExpr lower_int_type = {
+    .kind = TYPE_BASE,
+    .as.base_type = { TOKEN_IDENTIFIER, "Int", 3, 0 }
+};
 
 static int lower_expr(ASTNode* node);
+static JirReg lower_get_or_create_local(Token name, TypeExpr* type);
 
 static bool lower_is_void_type(TypeExpr* type) {
     return type &&
@@ -35,6 +41,94 @@ static Token lower_make_token_from_cstr(const char* text) {
     memcpy(buf, text, len + 1);
     Token token = { TOKEN_IDENTIFIER, buf, (int)len, 0 };
     return token;
+}
+
+typedef struct {
+    ASTNode* union_decl;
+    ASTNode* variant_decl;
+    TypeExpr* variant_type;
+    Token variant_name;
+    Token tag_name;
+} LowerVariantInfo;
+
+static ASTNode* lower_find_union_decl(TypeExpr* type) {
+    if (!current_ast_root || !type || type->kind != TYPE_BASE) return NULL;
+    for (size_t i = 0; i < current_ast_root->as.block.count; i++) {
+        ASTNode* stmt = current_ast_root->as.block.statements[i];
+        if (stmt->type != AST_UNION_DECL) continue;
+        if (stmt->as.union_decl.name.length == type->as.base_type.length &&
+            strncmp(stmt->as.union_decl.name.start, type->as.base_type.start, type->as.base_type.length) == 0) {
+            return stmt;
+        }
+    }
+    return NULL;
+}
+
+static bool lower_resolve_variant_info(ASTNode* switch_expr, ASTNode* pattern, LowerVariantInfo* info) {
+    if (!switch_expr || !pattern || pattern->type != AST_FUNC_CALL || !pattern->as.func_call.callee ||
+        pattern->as.func_call.callee->type != AST_MEMBER_ACCESS) {
+        return false;
+    }
+
+    TypeExpr* switch_type = switch_expr->evaluated_type;
+    if (!switch_type || switch_type->kind != TYPE_BASE) return false;
+
+    ASTNode* union_decl = lower_find_union_decl(switch_type);
+    if (!union_decl) return false;
+
+    Token variant_name = pattern->as.func_call.callee->as.member_access.member;
+    ASTNode* variant_decl = NULL;
+    for (size_t i = 0; i < union_decl->as.union_decl.member_count; i++) {
+        ASTNode* member = union_decl->as.union_decl.members[i];
+        if (member->as.var_decl.name.length == variant_name.length &&
+            strncmp(member->as.var_decl.name.start, variant_name.start, variant_name.length) == 0) {
+            variant_decl = member;
+            break;
+        }
+    }
+    if (!variant_decl) return false;
+
+    char tag_buf[160];
+    if (union_decl->as.union_decl.tag_enum.length > 0) {
+        snprintf(tag_buf, sizeof(tag_buf), "%.*s_%.*s",
+                 (int)union_decl->as.union_decl.tag_enum.length, union_decl->as.union_decl.tag_enum.start,
+                 (int)variant_name.length, variant_name.start);
+    } else {
+        snprintf(tag_buf, sizeof(tag_buf), "%.*sTag_%.*s",
+                 (int)union_decl->as.union_decl.name.length, union_decl->as.union_decl.name.start,
+                 (int)variant_name.length, variant_name.start);
+    }
+
+    info->union_decl = union_decl;
+    info->variant_decl = variant_decl;
+    info->variant_type = variant_decl->as.var_decl.type;
+    info->variant_name = variant_name;
+    info->tag_name = lower_make_token_from_cstr(tag_buf);
+    return true;
+}
+
+static void lower_emit_variant_bindings(JirReg switch_reg, ASTNode* pattern, const LowerVariantInfo* info) {
+    if (!pattern || pattern->type != AST_FUNC_CALL || !info || !info->variant_decl) return;
+
+    JirReg variant_reg = jir_alloc_temp(current_jir_func, info->variant_type, jir_arena);
+    int variant_idx = jir_emit(current_jir_func, JIR_OP_MEMBER_ACCESS, variant_reg, switch_reg, -1, jir_arena);
+    current_jir_func->insts[variant_idx].payload.name = info->variant_name;
+
+    for (size_t i = 0; i < pattern->as.func_call.arg_count; i++) {
+        ASTNode* binding = pattern->as.func_call.args[i];
+        if (binding->type != AST_PATTERN) continue;
+
+        TypeExpr* binding_type = binding->evaluated_type ? binding->evaluated_type : binding->as.pattern.type;
+        JirReg source_reg = variant_reg;
+        if (info->variant_type && info->variant_type->kind == TYPE_TUPLE) {
+            source_reg = jir_alloc_temp(current_jir_func, binding_type, jir_arena);
+            int field_idx = jir_emit(current_jir_func, JIR_OP_EXTRACT_FIELD, source_reg, variant_reg, -1, jir_arena);
+            current_jir_func->insts[field_idx].payload.int_val = (int64_t)i;
+        }
+
+        JirReg target_reg = lower_get_or_create_local(binding->as.pattern.name, binding_type);
+        jir_emit(current_jir_func, JIR_OP_STORE, target_reg, source_reg, -1, jir_arena);
+    }
 }
 
 static JirReg lower_get_or_create_local(Token name, TypeExpr* type) {
@@ -125,6 +219,49 @@ static void lower_stmt(ASTNode* node) {
                     loop_depth--;
                 }
             }
+            break;
+        }
+        case AST_SWITCH_STMT: {
+            JirReg switch_reg = lower_expr(node->as.switch_stmt.expression);
+            uint32_t end_label = jir_reserve_label(current_jir_func);
+            uint32_t next_label = 0;
+
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                ASTNode* case_node = node->as.switch_stmt.cases[i];
+                LowerVariantInfo info = {0};
+                bool has_variant = lower_resolve_variant_info(node->as.switch_stmt.expression,
+                                                              case_node->as.switch_case.pattern, &info);
+
+                JirReg cond_reg = -1;
+                if (has_variant) {
+                    JirReg tag_reg = jir_alloc_temp(current_jir_func, &lower_int_type, jir_arena);
+                    jir_emit(current_jir_func, JIR_OP_GET_TAG, tag_reg, switch_reg, -1, jir_arena);
+                    JirReg expected_reg = jir_alloc_temp(current_jir_func, &lower_int_type, jir_arena);
+                    int load_idx = jir_emit(current_jir_func, JIR_OP_LOAD_SYM, expected_reg, -1, -1, jir_arena);
+                    current_jir_func->insts[load_idx].payload.name = info.tag_name;
+                    cond_reg = jir_alloc_temp(current_jir_func, &lower_int_type, jir_arena);
+                    jir_emit(current_jir_func, JIR_OP_CMP_EQ, cond_reg, tag_reg, expected_reg, jir_arena);
+                } else {
+                    cond_reg = lower_expr(case_node->as.switch_case.pattern);
+                }
+
+                next_label = jir_reserve_label(current_jir_func);
+                int jmp_idx = jir_emit(current_jir_func, JIR_OP_JUMP_IF_FALSE, -1, cond_reg, -1, jir_arena);
+                current_jir_func->insts[jmp_idx].payload.label_id = next_label;
+
+                if (has_variant) {
+                    lower_emit_variant_bindings(switch_reg, case_node->as.switch_case.pattern, &info);
+                }
+                lower_stmt(case_node->as.switch_case.body);
+                int end_idx = jir_emit(current_jir_func, JIR_OP_JUMP, -1, -1, -1, jir_arena);
+                current_jir_func->insts[end_idx].payload.label_id = end_label;
+                jir_emit_label(current_jir_func, next_label, jir_arena);
+            }
+
+            if (node->as.switch_stmt.else_branch) {
+                lower_stmt(node->as.switch_stmt.else_branch);
+            }
+            jir_emit_label(current_jir_func, end_label, jir_arena);
             break;
         }
         case AST_RETURN_STMT: {
@@ -372,6 +509,7 @@ static int lower_expr(ASTNode* node) {
 
 JirModule* lower_to_jir(ASTNode* root, Arena* arena) {
     jir_arena = arena;
+    current_ast_root = root;
     JirModule* mod = jir_module_new(arena);
     current_jir_mod = mod;
     for (size_t i = 0; i < root->as.block.count; i++) {
