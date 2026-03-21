@@ -100,6 +100,33 @@ static ASTNode* function_declaration(TypeExpr* return_type, Token name);
 static ASTNode* parse_binding();
 static ASTNode* parse_binding_list();
 static ASTNode* parse_binding_assign_statement();
+static ASTNode* switch_statement();
+static ASTNode* finish_binding(TypeExpr* binding_type, Token name);
+static ASTNode* parse_simple_binding_after_leading(Token leading);
+
+static bool token_eq_text(Token token, const char* text) {
+    size_t len = strlen(text);
+    return token.length == len && strncmp(token.start, text, len) == 0;
+}
+
+static Token make_string_token(const char* text, int line) {
+    size_t len = strlen(text);
+    char* buf = arena_alloc(parser.arena, len + 3);
+    buf[0] = '"';
+    memcpy(buf + 1, text, len);
+    buf[len + 1] = '"';
+    buf[len + 2] = '\0';
+    Token tok = {TOKEN_STRING, buf, len + 2, line};
+    return tok;
+}
+
+static ASTNode* make_import_node(Token import_tok, bool is_public, Token path) {
+    ASTNode* node = ast_new_node(parser.arena, AST_IMPORT, import_tok.line);
+    node->as.import_decl.is_public = is_public;
+    node->as.import_decl.alias = (Token){0};
+    node->as.import_decl.path = path;
+    return node;
+}
 
 static void synchronize() {
     parser.panic_mode = false;
@@ -221,6 +248,48 @@ static ASTNode* number() {
     ASTNode* node = ast_new_node(parser.arena, AST_LITERAL_NUMBER, parser.previous.line);
     node->as.number.value = value;
     return node;
+}
+
+static ASTNode* finish_binding(TypeExpr* binding_type, Token name) {
+    ASTNode* node = ast_new_node(parser.arena, AST_PATTERN, name.line);
+    node->as.pattern.type = binding_type;
+    node->as.pattern.name = name;
+    node->as.pattern.field_name = (Token){0};
+    node->as.pattern.field_index = -1;
+    return node;
+}
+
+static ASTNode* parse_simple_binding_after_leading(Token leading) {
+    TypeExpr* binding_type = type_new_base(parser.arena, leading);
+    for (;;) {
+        if (match(TOKEN_STAR)) {
+            binding_type = type_new_modifier(parser.arena, TYPE_POINTER, binding_type);
+        } else if (match(TOKEN_QUESTION)) {
+            binding_type = type_new_modifier(parser.arena, TYPE_NULLABLE, binding_type);
+        } else if (match(TOKEN_BANG)) {
+            binding_type = type_new_modifier(parser.arena, TYPE_MUTABLE, binding_type);
+        } else if (match(TOKEN_LEFT_BRACKET)) {
+            ASTNode* length = NULL;
+            bool inferred = false;
+            if (match(TOKEN_UNDERSCORE)) {
+                inferred = true;
+            } else if (!check(TOKEN_RIGHT_BRACKET)) {
+                length = expression();
+            }
+            consume(TOKEN_RIGHT_BRACKET, "Expect ']' after array length.");
+            if (length == NULL && !inferred) {
+                binding_type = type_new_modifier(parser.arena, TYPE_SLICE, binding_type);
+            } else {
+                binding_type = type_new_modifier(parser.arena, TYPE_ARRAY, binding_type);
+                binding_type->as.array.length = length;
+            }
+        } else {
+            break;
+        }
+    }
+
+    consume(TOKEN_IDENTIFIER, "Expect binding name.");
+    return finish_binding(binding_type, parser.previous);
 }
 
 static ASTNode* grouping() {
@@ -471,20 +540,12 @@ static ASTNode* parse_precedence(Precedence precedence) {
     } else if (parser.previous.type == TOKEN_LEFT_BRACE) {
         node = struct_init_expr(NULL);
     } else if (parser.previous.type == TOKEN_IDENTIFIER || parser.previous.type == TOKEN_UNDERSCORE) {
-        // Check for pattern: '_ name' or 'Type name'
-        if (parser.previous.type == TOKEN_UNDERSCORE && check(TOKEN_IDENTIFIER)) {
-            advance();
-            Token name = parser.previous;
-            node = ast_new_node(parser.arena, AST_PATTERN, name.line);
-            node->as.pattern.type = NULL;
-            node->as.pattern.name = name;
-        } else if (parser.previous.type == TOKEN_IDENTIFIER && check(TOKEN_IDENTIFIER)) {
-            Token type_tok = parser.previous;
-            advance();
-            Token name = parser.previous;
-            node = ast_new_node(parser.arena, AST_PATTERN, name.line);
-            node->as.pattern.type = type_new_base(parser.arena, type_tok);
-            node->as.pattern.name = name;
+        // Binding atoms inside union/switch patterns follow the same
+        // `type_expr identifier` shape as declarations.
+        if ((parser.previous.type == TOKEN_UNDERSCORE && check(TOKEN_IDENTIFIER)) ||
+            (parser.previous.type == TOKEN_IDENTIFIER &&
+             check(TOKEN_IDENTIFIER))) {
+            node = parse_simple_binding_after_leading(parser.previous);
         } else {
             // Simple identifier or keyword-like identifier (Int, Float, etc.)
             node = ast_new_node(parser.arena, AST_IDENTIFIER, parser.previous.line);
@@ -887,17 +948,49 @@ static ASTNode* while_statement() {
     return node;
 }
 
+static ASTNode* switch_statement() {
+    Token switch_token = parser.previous;
+    consume(TOKEN_LEFT_PAREN, "Expect '(' after 'switch'.");
+    ASTNode* switch_expr = expression();
+    consume(TOKEN_RIGHT_PAREN, "Expect ')' after switch expression.");
+    consume(TOKEN_LEFT_BRACE, "Expect '{' before switch body.");
+
+    ASTNode* cases[128];
+    size_t case_count = 0;
+    ASTNode* else_branch = NULL;
+
+    while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
+        if (match(TOKEN_ELSE)) {
+            consume(TOKEN_COLON, "Expect ':' after 'else' in switch.");
+            else_branch = statement();
+            continue;
+        }
+
+        ASTNode* pattern = expression();
+        consume(TOKEN_COLON, "Expect ':' after switch pattern.");
+        ASTNode* body = statement();
+
+        ASTNode* case_node = ast_new_node(parser.arena, AST_SWITCH_CASE, pattern ? pattern->line : switch_token.line);
+        case_node->as.switch_case.pattern = pattern;
+        case_node->as.switch_case.body = body;
+        cases[case_count++] = case_node;
+    }
+
+    consume(TOKEN_RIGHT_BRACE, "Expect '}' after switch body.");
+
+    ASTNode* node = ast_new_node(parser.arena, AST_SWITCH_STMT, switch_token.line);
+    node->as.switch_stmt.expression = switch_expr;
+    node->as.switch_stmt.case_count = case_count;
+    node->as.switch_stmt.cases = arena_alloc(parser.arena, sizeof(ASTNode*) * case_count);
+    memcpy(node->as.switch_stmt.cases, cases, sizeof(ASTNode*) * case_count);
+    node->as.switch_stmt.else_branch = else_branch;
+    return node;
+}
+
 static ASTNode* parse_binding() {
     TypeExpr* binding_type = parse_type();
     consume(TOKEN_IDENTIFIER, "Expect binding name.");
-    Token name = parser.previous;
-
-    ASTNode* node = ast_new_node(parser.arena, AST_PATTERN, name.line);
-    node->as.pattern.type = binding_type;
-    node->as.pattern.name = name;
-    node->as.pattern.field_name = (Token){0};
-    node->as.pattern.field_index = -1;
-    return node;
+    return finish_binding(binding_type, parser.previous);
 }
 
 static ASTNode* parse_binding_list() {
@@ -965,10 +1058,25 @@ static ASTNode* import_statement(bool is_public) {
     Token alias = {0};
     Token path = {0};
 
-    // Case 1: import Alias "path";
+    // Case 0: import std;
     if (check(TOKEN_IDENTIFIER)) {
         advance();
-        alias = parser.previous;
+        Token first = parser.previous;
+        if (check(TOKEN_SEMICOLON)) {
+            advance();
+            if (!token_eq_text(first, "std")) {
+                error_at(&first, "Only 'import std;' is supported for bare identifier imports.");
+                return NULL;
+            }
+            ASTNode* node = make_import_node(import_tok, is_public, make_string_token("std/std.jiang", import_tok.line));
+            node->as.import_decl.alias = first;
+            return node;
+        }
+        alias = first;
+    }
+
+    // Case 1: import Alias "path";
+    if (alias.length > 0) {
         consume(TOKEN_STRING, "Expect string literal for import path.");
         path = parser.previous;
     } else {
@@ -1000,6 +1108,9 @@ static ASTNode* statement() {
     }
     if (match(TOKEN_WHILE)) {
         return while_statement();
+    }
+    if (match(TOKEN_SWITCH)) {
+        return switch_statement();
     }
     if (match(TOKEN_FOR)) {
         return for_statement();
@@ -1126,7 +1237,13 @@ ASTNode* parse_source(Arena* arena, const char* source) {
     while (!match(TOKEN_EOF)) {
         ASTNode* stmt = statement();
         if (stmt) {
-            statements[count++] = stmt;
+            if (stmt->type == AST_PROGRAM) {
+                for (size_t i = 0; i < stmt->as.block.count; i++) {
+                    statements[count++] = stmt->as.block.statements[i];
+                }
+            } else {
+                statements[count++] = stmt;
+            }
         } else {
             synchronize();
         }

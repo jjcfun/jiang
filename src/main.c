@@ -29,11 +29,29 @@ static char* read_file_text(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: %s <input_file>\n", argv[0]);
+        printf("Usage: %s [--stdlib-dir <path>] <input_file>\n", argv[0]);
         return 1;
     }
 
-    const char* input_path = argv[1];
+    const char* stdlib_path = "std";
+    const char* input_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--stdlib-dir") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing path after --stdlib-dir\n");
+                return 1;
+            }
+            stdlib_path = argv[++i];
+        } else {
+            input_path = argv[i];
+        }
+    }
+
+    if (!input_path) {
+        fprintf(stderr, "Missing input file\n");
+        return 1;
+    }
+
     Arena* arena = arena_create();
     char* source = read_file_text(input_path);
     if (!source) {
@@ -47,6 +65,7 @@ int main(int argc, char** argv) {
     ASTNode* root = parse_source(arena, source);
     if (root) {
         semantic_reset();
+        semantic_set_stdlib_dir(stdlib_path);
         Module* main_mod = semantic_check(arena, root, input_path);
         if (main_mod) {
             Module* all_mods[128];

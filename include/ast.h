@@ -60,6 +60,8 @@ typedef enum {
     AST_FUNC_CALL,
     AST_MEMBER_ACCESS,
     AST_IF_STMT,
+    AST_SWITCH_STMT,
+    AST_SWITCH_CASE,
     AST_WHILE_STMT,
     AST_FOR_STMT,
     AST_RANGE_EXPR,
@@ -208,6 +210,20 @@ typedef enum {
             ASTNode* then_branch;
             ASTNode* else_branch;
         } if_stmt;
+
+        // AST_SWITCH_STMT
+        struct {
+            ASTNode* expression;
+            ASTNode** cases;
+            size_t case_count;
+            ASTNode* else_branch;
+        } switch_stmt;
+
+        // AST_SWITCH_CASE
+        struct {
+            ASTNode* pattern;
+            ASTNode* body;
+        } switch_case;
 
         // AST_WHILE_STMT
         struct {

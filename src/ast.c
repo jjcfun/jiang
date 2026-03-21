@@ -211,6 +211,35 @@ void ast_print(ASTNode* node, int depth) {
             print_indent(depth);
             printf(")\n");
             break;
+        case AST_SWITCH_STMT:
+            printf("SwitchStmt (\n");
+            print_indent(depth + 1);
+            printf("Expression:\n");
+            ast_print(node->as.switch_stmt.expression, depth + 2);
+            print_indent(depth + 1);
+            printf("Cases:\n");
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                ast_print(node->as.switch_stmt.cases[i], depth + 2);
+            }
+            if (node->as.switch_stmt.else_branch) {
+                print_indent(depth + 1);
+                printf("Else:\n");
+                ast_print(node->as.switch_stmt.else_branch, depth + 2);
+            }
+            print_indent(depth);
+            printf(")\n");
+            break;
+        case AST_SWITCH_CASE:
+            printf("SwitchCase (\n");
+            print_indent(depth + 1);
+            printf("Pattern:\n");
+            ast_print(node->as.switch_case.pattern, depth + 2);
+            print_indent(depth + 1);
+            printf("Body:\n");
+            ast_print(node->as.switch_case.body, depth + 2);
+            print_indent(depth);
+            printf(")\n");
+            break;
         case AST_WHILE_STMT:
             printf("WhileStmt (\n");
             print_indent(depth + 1);

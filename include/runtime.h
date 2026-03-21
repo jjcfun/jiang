@@ -13,4 +13,9 @@ typedef struct {
     int64_t length;
 } Slice_int64_t;
 
+typedef struct {
+    uint8_t* ptr;
+    int64_t length;
+} Slice_uint8_t;
+
 #endif // JIANG_RUNTIME_H

@@ -28,6 +28,7 @@ static int     loop_depth    = 0;
 static Arena*  eval_arena    = NULL;
 static Module* module_cache[128];
 static int     module_cache_count = 0;
+static char    stdlib_dir[PATH_MAX] = "std";
 
 const char* module_get_name(Module* mod) { return mod->name; }
 const char* module_get_id(Module* mod) { return mod->id; }
@@ -171,6 +172,14 @@ static Symbol* symbol_lookup(Token name) {
     return NULL;
 }
 
+static Symbol* current_scope_lookup(Token name) {
+    if (!current_scope) return NULL;
+    for (Symbol* sym = current_scope->symbols; sym; sym = sym->next) {
+        if (strlen(sym->name) == name.length && strncmp(sym->name, name.start, name.length) == 0) return sym;
+    }
+    return NULL;
+}
+
 static Symbol* module_lookup_export(Module* mod, Token name) {
     if (!mod || !mod->top_level_scope) return NULL;
     for (Symbol* sym = mod->top_level_scope->symbols; sym; sym = sym->next) {
@@ -201,9 +210,18 @@ static ASTNode* find_struct_field(ASTNode* struct_decl, Token member) {
     return NULL;
 }
 
+static ASTNode* find_struct_method(ASTNode* struct_decl, Token member) {
+    if (!struct_decl || struct_decl->type != AST_STRUCT_DECL) return NULL;
+    for (size_t i = 0; i < struct_decl->as.struct_decl.member_count; i++) {
+        ASTNode* method = struct_decl->as.struct_decl.members[i];
+        if (method->type == AST_FUNC_DECL && token_eq(method->as.func_decl.name, member)) return method;
+    }
+    return NULL;
+}
+
 static void register_builtins(void) {
-    const char* builtins[] = {"Int", "Float", "Double", "UInt8", "UInt16", "Bool", "String"};
-    for (size_t i = 0; i < 7; i++) {
+    const char* builtins[] = {"Int", "Float", "Double", "UInt8", "UInt16", "Bool"};
+    for (size_t i = 0; i < 6; i++) {
         symbol_define(builtins[i], strlen(builtins[i]), SYM_STRUCT, make_base_type(builtins[i]), 0, false);
     }
     symbol_define("print", 5, SYM_FUNC, make_base_type("void"), 0, false);
@@ -236,6 +254,61 @@ static TypeExpr* tuple_element_type(TypeExpr* type, size_t index) {
     if (index == 0) return type;
     return NULL;
 }
+
+static bool file_exists(const char* path) {
+    return access(path, F_OK) == 0;
+}
+
+
+static bool resolve_import_path(const char* importer_path, Token path_token, char* out, size_t out_size) {
+    char import_path[PATH_MAX];
+    size_t import_len = path_token.length >= 2 ? (size_t)path_token.length - 2 : 0;
+    if (import_len >= sizeof(import_path)) import_len = sizeof(import_path) - 1;
+    memcpy(import_path, path_token.start + 1, import_len);
+    import_path[import_len] = '\0';
+
+    if (import_path[0] == '/') {
+        if (realpath(import_path, out) != NULL) return true;
+        if (file_exists(import_path)) {
+            strncpy(out, import_path, out_size);
+            return true;
+        }
+    }
+
+    if (strncmp(import_path, "std/", 4) == 0) {
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s/%s", stdlib_dir, import_path + 4);
+        if (realpath(candidate, out) != NULL) return true;
+        if (file_exists(candidate)) {
+            strncpy(out, candidate, out_size);
+            return true;
+        }
+    }
+
+    char importer_dir[PATH_MAX];
+    strncpy(importer_dir, importer_path, sizeof(importer_dir));
+    char* last_slash = strrchr(importer_dir, '/');
+    if (last_slash) *last_slash = '\0';
+    else strcpy(importer_dir, ".");
+
+    char candidate[PATH_MAX];
+    snprintf(candidate, sizeof(candidate), "%s/%s", importer_dir, import_path);
+    if (realpath(candidate, out) != NULL) return true;
+    if (file_exists(candidate)) {
+        strncpy(out, candidate, out_size);
+        return true;
+    }
+
+    snprintf(candidate, sizeof(candidate), "%s", import_path);
+    if (realpath(candidate, out) != NULL) return true;
+    if (file_exists(candidate)) {
+        strncpy(out, candidate, out_size);
+        return true;
+    }
+
+    return false;
+}
+
 
 static void import_public_symbols(Module* imported_mod, int line) {
     if (!imported_mod || !imported_mod->top_level_scope) return;
@@ -322,18 +395,17 @@ static void check_node(ASTNode* node) {
             break;
 
         case AST_IMPORT: {
-            char path[PATH_MAX];
-            char dir[PATH_MAX];
-            strncpy(dir, current_module->path, sizeof(dir));
-            char* last_slash = strrchr(dir, '/');
-            if (last_slash) *last_slash = '\0';
-            else strcpy(dir, ".");
-
-            snprintf(path, sizeof(path), "%s/%.*s", dir,
-                     (int)node->as.import_decl.path.length - 2, node->as.import_decl.path.start + 1);
+            char import_text[PATH_MAX];
+            size_t import_len = node->as.import_decl.path.length >= 2 ? (size_t)node->as.import_decl.path.length - 2 : 0;
+            if (import_len >= sizeof(import_text)) import_len = sizeof(import_text) - 1;
+            memcpy(import_text, node->as.import_decl.path.start + 1, import_len);
+            import_text[import_len] = '\0';
 
             char abs_path[PATH_MAX];
-            if (realpath(path, abs_path) == NULL) strncpy(abs_path, path, sizeof(abs_path));
+            if (!resolve_import_path(current_module->path, node->as.import_decl.path, abs_path, sizeof(abs_path))) {
+                semantic_error(node->line, "Could not resolve import '%s'", import_text);
+                break;
+            }
 
             FILE* file = fopen(abs_path, "r");
             if (!file) {
@@ -362,8 +434,17 @@ static void check_node(ASTNode* node) {
                      "build/%s_%s.c", imported_mod->name, imported_mod->id);
 
             if (node->as.import_decl.alias.length > 0) {
-                Symbol* ns = symbol_define(node->as.import_decl.alias.start, node->as.import_decl.alias.length,
-                                           SYM_NAMESPACE, NULL, node->line, false);
+                Symbol* ns = current_scope_lookup(node->as.import_decl.alias);
+                if (ns &&
+                    (token_eq_cstr(node->as.import_decl.alias, "assert") ||
+                     token_eq_cstr(node->as.import_decl.alias, "print"))) {
+                    ns->kind = SYM_NAMESPACE;
+                    ns->type = NULL;
+                    ns->is_public = node->as.import_decl.is_public;
+                } else {
+                    ns = symbol_define(node->as.import_decl.alias.start, node->as.import_decl.alias.length,
+                                       SYM_NAMESPACE, NULL, node->line, node->as.import_decl.is_public);
+                }
                 ns->module_ptr = imported_mod;
                 node->symbol = ns;
             } else {
@@ -392,11 +473,15 @@ static void check_node(ASTNode* node) {
             break;
 
         case AST_LITERAL_STRING:
-            node->evaluated_type = make_base_type("String");
+            node->evaluated_type = make_slice_type(make_base_type("UInt8"));
             break;
 
         case AST_TUPLE_LITERAL: {
             size_t count = node->as.tuple_literal.count;
+            if (count == 0) {
+                node->evaluated_type = make_base_type("()");
+                break;
+            }
             TypeExpr** elements = arena_alloc(eval_arena, sizeof(TypeExpr*) * count);
             for (size_t i = 0; i < count; i++) {
                 check_node(node->as.tuple_literal.elements[i]);
@@ -436,6 +521,71 @@ static void check_node(ASTNode* node) {
             check_node(node->as.if_stmt.condition);
             check_node(node->as.if_stmt.then_branch);
             check_node(node->as.if_stmt.else_branch);
+            break;
+
+        case AST_SWITCH_STMT:
+            check_node(node->as.switch_stmt.expression);
+            for (size_t i = 0; i < node->as.switch_stmt.case_count; i++) {
+                ASTNode* case_node = node->as.switch_stmt.cases[i];
+                scope_push();
+                check_node(case_node->as.switch_case.pattern);
+                if (case_node->as.switch_case.pattern) {
+                    ASTNode* switch_value = node->as.switch_stmt.expression;
+                    ASTNode* pattern = case_node->as.switch_case.pattern;
+                    ASTNode* left = pattern;
+                    if (pattern->type == AST_FUNC_CALL) {
+                        for (size_t j = 0; j < pattern->as.func_call.arg_count; j++) {
+                            ASTNode* binding = pattern->as.func_call.args[j];
+                            if (binding->type != AST_PATTERN) continue;
+                            TypeExpr* value_type = NULL;
+                            if (pattern->as.func_call.callee &&
+                                pattern->as.func_call.callee->type == AST_MEMBER_ACCESS &&
+                                switch_value->evaluated_type &&
+                                switch_value->evaluated_type->kind == TYPE_BASE) {
+                                TypeExpr* union_type = unwrap_type(switch_value->evaluated_type);
+                                Symbol* union_sym = symbol_lookup(union_type->as.base_type);
+                                if (union_sym && union_sym->module_owner) {
+                                    Module* owner_mod = (Module*)union_sym->module_owner;
+                                    if (owner_mod && owner_mod->root) {
+                                        for (size_t k = 0; k < owner_mod->root->as.block.count; k++) {
+                                            ASTNode* stmt = owner_mod->root->as.block.statements[k];
+                                            if (stmt->type != AST_UNION_DECL) continue;
+                                            if (!token_eq(stmt->as.union_decl.name, union_type->as.base_type)) continue;
+                                            Token variant_name = pattern->as.func_call.callee->as.member_access.member;
+                                            for (size_t m = 0; m < stmt->as.union_decl.member_count; m++) {
+                                                ASTNode* member = stmt->as.union_decl.members[m];
+                                                if (token_eq(member->as.var_decl.name, variant_name)) {
+                                                    value_type = member->as.var_decl.type;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if ((!binding->as.pattern.type || same_base_name(binding->as.pattern.type, "_")) && value_type) {
+                                binding->evaluated_type = value_type;
+                                if (binding->symbol) binding->symbol->type = value_type;
+                            } else if (binding->as.pattern.type && value_type &&
+                                       !same_base_name(binding->as.pattern.type, "_") &&
+                                       !type_compatible(binding->as.pattern.type, value_type)) {
+                                semantic_error(binding->line, "Type mismatch in switch binding '%.*s'",
+                                               (int)binding->as.pattern.name.length, binding->as.pattern.name.start);
+                            }
+                        }
+                    } else {
+                        left = switch_value;
+                    }
+                    (void)left;
+                }
+                check_node(case_node->as.switch_case.body);
+                scope_pop();
+            }
+            if (node->as.switch_stmt.else_branch) {
+                scope_push();
+                check_node(node->as.switch_stmt.else_branch);
+                scope_pop();
+            }
             break;
 
         case AST_WHILE_STMT:
@@ -480,12 +630,7 @@ static void check_node(ASTNode* node) {
             check_node(node->as.member_access.object);
             ASTNode* object = node->as.member_access.object;
 
-            if (object->type == AST_IDENTIFIER && object->symbol && object->symbol->kind == SYM_STRUCT) {
-                node->evaluated_type = object->symbol->type;
-                break;
-            }
-
-            if (object->type == AST_IDENTIFIER && object->symbol && object->symbol->kind == SYM_NAMESPACE) {
+            if (object->symbol && object->symbol->kind == SYM_NAMESPACE) {
                 Module* mod = (Module*)object->symbol->module_ptr;
                 Symbol* exported = module_lookup_export(mod, node->as.member_access.member);
                 if (!exported) {
@@ -508,6 +653,13 @@ static void check_node(ASTNode* node) {
             if (owner_type && owner_type->kind == TYPE_POINTER) owner_type = unwrap_type(owner_type->as.pointer.element);
 
             Module* owner_mod = current_module;
+            if (object->symbol && object->symbol->kind == SYM_STRUCT &&
+                object->type == AST_MEMBER_ACCESS &&
+                object->as.member_access.object &&
+                object->as.member_access.object->symbol &&
+                object->as.member_access.object->symbol->kind == SYM_NAMESPACE) {
+                owner_mod = (Module*)object->as.member_access.object->symbol->module_ptr;
+            }
             if (object->symbol && object->symbol->module_owner) owner_mod = (Module*)object->symbol->module_owner;
             else if (owner_type && owner_type->kind == TYPE_BASE) {
                 Symbol* type_sym = symbol_lookup(owner_type->as.base_type);
@@ -515,6 +667,16 @@ static void check_node(ASTNode* node) {
             }
 
             ASTNode* struct_decl = module_find_struct_decl(owner_mod, owner_type);
+            if (!struct_decl && object->symbol && object->symbol->kind == SYM_STRUCT) {
+                node->evaluated_type = object->symbol->type;
+                break;
+            }
+            ASTNode* method = find_struct_method(struct_decl, node->as.member_access.member);
+            if (method && object->symbol && object->symbol->kind == SYM_STRUCT) {
+                node->evaluated_type = method->as.func_decl.return_type;
+                node->symbol = method->symbol;
+                break;
+            }
             ASTNode* field = find_struct_field(struct_decl, node->as.member_access.member);
             if (field) {
                 if (owner_mod != current_module && !field->is_public) {
@@ -596,6 +758,15 @@ void semantic_reset(void) {
     module_cache_count = 0;
     had_error = false;
     loop_depth = 0;
+}
+
+void semantic_set_stdlib_dir(const char* path) {
+    if (!path || !path[0]) {
+        strncpy(stdlib_dir, "std", sizeof(stdlib_dir));
+        return;
+    }
+    strncpy(stdlib_dir, path, sizeof(stdlib_dir));
+    stdlib_dir[sizeof(stdlib_dir) - 1] = '\0';
 }
 
 Module* semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
