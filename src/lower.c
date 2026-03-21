@@ -325,6 +325,14 @@ static int lower_expr(ASTNode* node) {
         }
         case AST_MEMBER_ACCESS: {
             if (node->as.member_access.object &&
+                node->as.member_access.object->symbol &&
+                node->as.member_access.object->symbol->kind == SYM_NAMESPACE) {
+                int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
+                int idx = jir_emit(current_jir_func, JIR_OP_LOAD_SYM, r, -1, -1, jir_arena);
+                current_jir_func->insts[idx].payload.name = node->as.member_access.member;
+                return r;
+            }
+            if (node->as.member_access.object &&
                 node->as.member_access.object->type == AST_UNARY_EXPR &&
                 node->as.member_access.object->as.unary.op == TOKEN_DOLLAR &&
                 node->as.member_access.member.length == 3 &&

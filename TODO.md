@@ -44,7 +44,7 @@
     - [x] tuple literal / binding assign
     - [x] struct / union 初始化与字段访问
     - [x] range / for-in / break / continue
-    - [ ] import 后的顶层初始化与跨模块引用
+    - [x] import 后的顶层初始化与跨模块引用
 - [ ] **在 Lowering 阶段消解语法糖**: 不把高层模式匹配和隐式语义继续留给 C generator。
     - [ ] `for-in`
     - [ ] Union pattern / `switch`
