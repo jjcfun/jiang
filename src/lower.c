@@ -17,12 +17,44 @@ static TypeExpr lower_int_type = {
 
 static int lower_expr(ASTNode* node);
 static JirReg lower_get_or_create_local(Token name, TypeExpr* type);
+static TypeExpr* lower_unwrap_type(TypeExpr* type);
+static int lower_call_expr(ASTNode* node, bool discard_result);
+
+static TypeExpr* lower_make_pointer_type(TypeExpr* element) {
+    TypeExpr* t = arena_alloc(jir_arena, sizeof(TypeExpr));
+    t->kind = TYPE_POINTER;
+    t->as.pointer.element = element;
+    return t;
+}
+
+static TypeExpr* lower_resolved_type(TypeExpr* declared, TypeExpr* inferred) {
+    TypeExpr* type = declared;
+    if (!type) return inferred;
+    type = lower_unwrap_type(type);
+    if (type &&
+        type->kind == TYPE_BASE &&
+        type->as.base_type.length == 1 &&
+        type->as.base_type.start[0] == '_') {
+        return inferred;
+    }
+    return declared;
+}
+
+static TypeExpr* lower_unwrap_type(TypeExpr* type) {
+    while (type && (type->kind == TYPE_NULLABLE || type->kind == TYPE_MUTABLE)) {
+        type = (type->kind == TYPE_NULLABLE) ? type->as.nullable.element : type->as.mutable.element;
+    }
+    return type;
+}
 
 static bool lower_is_void_type(TypeExpr* type) {
     return type &&
-           type->kind == TYPE_BASE &&
-           type->as.base_type.length == 2 &&
-           strncmp(type->as.base_type.start, "()", 2) == 0;
+           ((type->kind == TYPE_TUPLE && type->as.tuple.count == 0) ||
+            (type->kind == TYPE_BASE &&
+             ((type->as.base_type.length == 2 &&
+               strncmp(type->as.base_type.start, "()", 2) == 0) ||
+              (type->as.base_type.length == 4 &&
+               strncmp(type->as.base_type.start, "void", 4) == 0))));
 }
 
 static JirReg lower_find_local(Token name) {
@@ -142,7 +174,8 @@ static void lower_stmt(ASTNode* node) {
     switch (node->type) {
         case AST_VAR_DECL: {
             int r_val = lower_expr(node->as.var_decl.initializer);
-            TypeExpr* t = node->as.var_decl.type ? node->as.var_decl.type : (node->as.var_decl.initializer ? node->as.var_decl.initializer->evaluated_type : NULL);
+            TypeExpr* t = lower_resolved_type(node->as.var_decl.type,
+                                              node->as.var_decl.initializer ? node->as.var_decl.initializer->evaluated_type : NULL);
             int r_var = lower_get_or_create_local(node->as.var_decl.name, t);
             jir_emit(current_jir_func, JIR_OP_STORE, r_var, r_val >= 0 ? r_val : 0, -1, jir_arena);
             break;
@@ -299,8 +332,76 @@ static void lower_stmt(ASTNode* node) {
         case AST_BLOCK:
             for (size_t i = 0; i < node->as.block.count; i++) lower_stmt(node->as.block.statements[i]);
             break;
+        case AST_FUNC_CALL:
+            lower_call_expr(node, true);
+            break;
         default: lower_expr(node); break;
     }
+}
+
+static int lower_call_expr(ASTNode* node, bool discard_result) {
+    int args[32];
+    size_t arg_count = 0;
+    for (size_t i = 0; i < node->as.func_call.arg_count; i++) args[arg_count++] = lower_expr(node->as.func_call.args[i]);
+    TypeExpr* call_type = node->evaluated_type;
+    if (!call_type && node->as.func_call.callee) call_type = node->as.func_call.callee->evaluated_type;
+    if (!call_type &&
+        node->as.func_call.callee &&
+        node->as.func_call.callee->symbol &&
+        node->as.func_call.callee->symbol->kind == SYM_FUNC) {
+        call_type = node->as.func_call.callee->symbol->type;
+    }
+    int r = (discard_result || lower_is_void_type(call_type)) ? -1 : jir_alloc_temp(current_jir_func, call_type, jir_arena);
+    Token callee_name = {TOKEN_IDENTIFIER, "anonymous", 9, 0};
+    if (node->as.func_call.callee->type == AST_IDENTIFIER) {
+        callee_name = node->as.func_call.callee->as.identifier.name;
+        if (node->as.func_call.callee->symbol &&
+            node->as.func_call.callee->symbol->kind == SYM_STRUCT) {
+            char name_buf[160];
+            snprintf(name_buf, sizeof(name_buf), "%.*s_new",
+                     (int)callee_name.length, callee_name.start);
+            callee_name = lower_make_token_from_cstr(name_buf);
+        }
+    } else if (node->as.func_call.callee->type == AST_MEMBER_ACCESS) {
+        ASTNode* obj = node->as.func_call.callee->as.member_access.object;
+        Token member = node->as.func_call.callee->as.member_access.member;
+        if (obj->symbol && obj->symbol->kind == SYM_NAMESPACE) {
+            callee_name = member;
+        } else if (obj->symbol && obj->symbol->kind == SYM_STRUCT &&
+                   obj->symbol->type && obj->symbol->type->kind == TYPE_BASE) {
+            Token type_name = obj->symbol->type->as.base_type;
+            if (type_name.length > 0) {
+                char name_buf[160];
+                snprintf(name_buf, sizeof(name_buf), "%.*s_%.*s",
+                         (int)type_name.length, type_name.start,
+                         (int)member.length, member.start);
+                callee_name = lower_make_token_from_cstr(name_buf);
+            }
+        } else {
+            TypeExpr* obj_type = lower_unwrap_type(obj->evaluated_type);
+            bool is_ptr = obj_type && obj_type->kind == TYPE_POINTER;
+            TypeExpr* owner_type = is_ptr ? lower_unwrap_type(obj_type->as.pointer.element) : obj_type;
+            if (owner_type && owner_type->kind == TYPE_BASE) {
+                char name_buf[160];
+                snprintf(name_buf, sizeof(name_buf), "%.*s_%.*s",
+                         (int)owner_type->as.base_type.length, owner_type->as.base_type.start,
+                         (int)member.length, member.start);
+                callee_name = lower_make_token_from_cstr(name_buf);
+
+                int self_reg = lower_expr(obj);
+                if (!is_ptr) {
+                    int addr_reg = jir_alloc_temp(current_jir_func, lower_make_pointer_type(owner_type), jir_arena);
+                    jir_emit(current_jir_func, JIR_OP_ADDR_OF, addr_reg, self_reg, -1, jir_arena);
+                    self_reg = addr_reg;
+                }
+                for (size_t i = arg_count; i > 0; i--) args[i] = args[i - 1];
+                args[0] = self_reg;
+                arg_count++;
+            }
+        }
+    }
+    jir_emit_call(current_jir_func, r, callee_name, args, arg_count, jir_arena);
+    return r;
 }
 
 static int lower_expr(ASTNode* node) {
@@ -308,8 +409,16 @@ static int lower_expr(ASTNode* node) {
     switch (node->type) {
         case AST_LITERAL_NUMBER: {
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
-            int idx = jir_emit(current_jir_func, JIR_OP_CONST_INT, r, -1, -1, jir_arena);
-            current_jir_func->insts[idx].payload.int_val = (int64_t)node->as.number.value;
+            if (node->evaluated_type &&
+                node->evaluated_type->kind == TYPE_BASE &&
+                node->evaluated_type->as.base_type.length == 3 &&
+                strncmp(node->evaluated_type->as.base_type.start, "Int", 3) == 0) {
+                int idx = jir_emit(current_jir_func, JIR_OP_CONST_INT, r, -1, -1, jir_arena);
+                current_jir_func->insts[idx].payload.int_val = (int64_t)node->as.number.value;
+            } else {
+                int idx = jir_emit(current_jir_func, JIR_OP_CONST_FLOAT, r, -1, -1, jir_arena);
+                current_jir_func->insts[idx].payload.float_val = node->as.number.value;
+            }
             return r;
         }
         case AST_LITERAL_STRING: {
@@ -374,35 +483,7 @@ static int lower_expr(ASTNode* node) {
             return r;
         }
         case AST_FUNC_CALL: {
-            int args[32]; for (size_t i = 0; i < node->as.func_call.arg_count; i++) args[i] = lower_expr(node->as.func_call.args[i]);
-            int r = lower_is_void_type(node->evaluated_type) ? -1 : jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
-            Token callee_name = {TOKEN_IDENTIFIER, "anonymous", 9, 0};
-            if (node->as.func_call.callee->type == AST_IDENTIFIER) {
-                callee_name = node->as.func_call.callee->as.identifier.name;
-            } else if (node->as.func_call.callee->type == AST_MEMBER_ACCESS) {
-                ASTNode* obj = node->as.func_call.callee->as.member_access.object;
-                Token member = node->as.func_call.callee->as.member_access.member;
-                if (obj->symbol && obj->symbol->kind == SYM_NAMESPACE) {
-                    callee_name = member;
-                } else if ((obj->symbol && obj->symbol->kind == SYM_STRUCT && obj->symbol->type && obj->symbol->type->kind == TYPE_BASE) ||
-                           (obj->type == AST_IDENTIFIER && obj->evaluated_type && obj->evaluated_type->kind == TYPE_BASE)) {
-                    Token type_name = {0};
-                    if (obj->symbol && obj->symbol->type && obj->symbol->type->kind == TYPE_BASE) {
-                        type_name = obj->symbol->type->as.base_type;
-                    } else if (obj->type == AST_IDENTIFIER && obj->evaluated_type && obj->evaluated_type->kind == TYPE_BASE) {
-                        type_name = obj->evaluated_type->as.base_type;
-                    }
-                    if (type_name.length > 0) {
-                        char name_buf[160];
-                        snprintf(name_buf, sizeof(name_buf), "%.*s_%.*s",
-                                 (int)type_name.length, type_name.start,
-                                 (int)member.length, member.start);
-                        callee_name = lower_make_token_from_cstr(name_buf);
-                    }
-                }
-            }
-            jir_emit_call(current_jir_func, r, callee_name, args, node->as.func_call.arg_count, jir_arena);
-            return r;
+            return lower_call_expr(node, false);
         }
         case AST_ARRAY_LITERAL: {
             int args[64]; for (size_t i = 0; i < node->as.array_literal.element_count; i++) args[i] = lower_expr(node->as.array_literal.elements[i]);
@@ -519,8 +600,10 @@ JirModule* lower_to_jir(ASTNode* root, Arena* arena) {
             f->return_type = stmt->as.func_decl.return_type;
             current_jir_func = f;
             for (size_t j = 0; j < stmt->as.func_decl.param_count; j++) {
-                ASTNode* p = stmt->as.func_decl.params[j];
-                jir_alloc_local(f, p->as.var_decl.name, p->as.var_decl.type, true, arena);
+            ASTNode* p = stmt->as.func_decl.params[j];
+                jir_alloc_local(f, p->as.var_decl.name,
+                                lower_resolved_type(p->as.var_decl.type, p->evaluated_type),
+                                true, arena);
             }
             lower_stmt(stmt->as.func_decl.body);
         }

@@ -1,4 +1,5 @@
 #include "generator.h"
+#include "semantic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@ static bool gen_printed_syms = false;
 static bool gen_is_local = false;
 static int gen_binding_temp_id = 0;
 static JirModule* gen_active_jir_module = NULL;
+static ASTNode* gen_active_ast_root = NULL;
 static TypeExpr gen_pattern_fallback_type = {
     .kind = TYPE_BASE,
     .as.base_type = { TOKEN_IDENTIFIER, "Double", 6, 0 }
@@ -46,6 +48,10 @@ static void gen_add_tuple_variant(const char* union_name, const char* variant_na
     snprintf(gen_tuple_variants[gen_tuple_variant_count].name, 128, "%s_%s_t", union_name, variant_name);
     gen_tuple_variants[gen_tuple_variant_count].field_count = 0;
     gen_tuple_variant_count++;
+}
+
+static bool gen_token_eq(Token a, Token b) {
+    return a.length == b.length && strncmp(a.start, b.start, a.length) == 0;
 }
 
 static bool gen_is_tuple_variant(const char* union_name, const char* variant_name) {
@@ -278,9 +284,65 @@ static bool gen_is_static_struct_method(ASTNode* method) {
 
 static bool gen_is_void_type(TypeExpr* type) {
     return type &&
-           type->kind == TYPE_BASE &&
-           type->as.base_type.length == 2 &&
-           strncmp(type->as.base_type.start, "()", 2) == 0;
+           ((type->kind == TYPE_TUPLE && type->as.tuple.count == 0) ||
+            (type->kind == TYPE_BASE &&
+             ((type->as.base_type.length == 2 &&
+               strncmp(type->as.base_type.start, "()", 2) == 0) ||
+              (type->as.base_type.length == 4 &&
+               strncmp(type->as.base_type.start, "void", 4) == 0))));
+}
+
+static TypeExpr* gen_lookup_callable_return_type(ASTNode* root, Token name) {
+    if (!root || root->type != AST_BLOCK) return NULL;
+    for (size_t i = 0; i < root->as.block.count; i++) {
+        ASTNode* node = root->as.block.statements[i];
+        if (node->type == AST_FUNC_DECL &&
+            gen_token_eq(node->as.func_decl.name, name)) {
+            return node->as.func_decl.return_type;
+        }
+        if (node->type != AST_STRUCT_DECL) continue;
+        for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
+            ASTNode* member = node->as.struct_decl.members[j];
+            if (member->type != AST_FUNC_DECL) continue;
+            char generated_name[160];
+            snprintf(generated_name, sizeof(generated_name), "%.*s_%.*s",
+                     (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start,
+                     (int)member->as.func_decl.name.length, member->as.func_decl.name.start);
+            if (strlen(generated_name) == (size_t)name.length &&
+                strncmp(generated_name, name.start, name.length) == 0) {
+                return member->as.func_decl.return_type;
+            }
+        }
+    }
+    return NULL;
+}
+
+static TypeExpr* gen_lookup_callable_return_type_any(Token name) {
+    TypeExpr* found = gen_lookup_callable_return_type(gen_active_ast_root, name);
+    if (found) return found;
+
+    Module* modules[128];
+    int count = semantic_get_modules(modules);
+    for (int i = 0; i < count; i++) {
+        ASTNode* root = module_get_root(modules[i]);
+        found = gen_lookup_callable_return_type(root, name);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static bool gen_is_scalar_like_type(TypeExpr* type) {
+    type = type ? type : NULL;
+    if (!type) return false;
+    if (type->kind == TYPE_POINTER) return true;
+    if (type->kind != TYPE_BASE) return false;
+    Token base = type->as.base_type;
+    return (base.length == 3 && strncmp(base.start, "Int", 3) == 0) ||
+           (base.length == 5 && strncmp(base.start, "Float", 5) == 0) ||
+           (base.length == 6 && strncmp(base.start, "Double", 6) == 0) ||
+           (base.length == 4 && strncmp(base.start, "Bool", 4) == 0) ||
+           (base.length == 5 && strncmp(base.start, "UInt8", 5) == 0) ||
+           (base.length == 6 && strncmp(base.start, "UInt16", 6) == 0);
 }
 
 static void generate_node(ASTNode* node, FILE* out);
@@ -749,11 +811,13 @@ static void generate_node(ASTNode* node, FILE* out) {
                 fprintf(out, ")");
             } else if (callee->type == AST_IDENTIFIER) {
                 Token name = callee->as.identifier.name;
-                if (name.length == 6 && strncmp(name.start, "assert", 6) == 0) {
+                if ((name.length == 6 && strncmp(name.start, "assert", 6) == 0) ||
+                    (name.length == 18 && strncmp(name.start, "__intrinsic_assert", 18) == 0)) {
                     fprintf(out, "((void)(( ");
                     generate_node(node->as.func_call.args[0], out);
                     fprintf(out, " ) ? 0 : (fprintf(stderr, \"Assertion failed at line %%d\\n\", %d), exit(1))))", node->line);
-                } else if (name.length == 5 && strncmp(name.start, "print", 5) == 0) {
+                } else if ((name.length == 5 && strncmp(name.start, "print", 5) == 0) ||
+                           (name.length == 17 && strncmp(name.start, "__intrinsic_print", 17) == 0)) {
                     fprintf(out, "printf(");
                     for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
                         ASTNode* arg = node->as.func_call.args[i];
@@ -1602,22 +1666,24 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
         TypeExpr* type = func->locals[i].type;
         if (gen_is_void_type(type)) return false;
         if (type && type->kind == TYPE_ARRAY) return false;
-        if (type && type->kind == TYPE_BASE) {
-            Token base = type->as.base_type;
-            bool builtin =
-                (base.length == 3 && strncmp(base.start, "Int", 3) == 0) ||
-                (base.length == 5 && strncmp(base.start, "Float", 5) == 0) ||
-                (base.length == 6 && strncmp(base.start, "Double", 6) == 0) ||
-                (base.length == 4 && strncmp(base.start, "Bool", 4) == 0) ||
-                (base.length == 5 && strncmp(base.start, "UInt8", 5) == 0) ||
-                (base.length == 6 && strncmp(base.start, "UInt16", 6) == 0);
-            if (!builtin) return false;
-        }
     }
 
     for (size_t i = 0; i < func->inst_count; i++) {
         JirInst* inst = &func->insts[i];
         switch (inst->op) {
+            case JIR_OP_CMP_EQ:
+            case JIR_OP_CMP_NEQ:
+            case JIR_OP_CMP_LT:
+            case JIR_OP_CMP_GT:
+            case JIR_OP_CMP_LTE:
+            case JIR_OP_CMP_GTE:
+                if ((inst->src1 >= 0 && (size_t)inst->src1 < func->local_count &&
+                     !gen_is_scalar_like_type(func->locals[inst->src1].type)) ||
+                    (inst->src2 >= 0 && (size_t)inst->src2 < func->local_count &&
+                     !gen_is_scalar_like_type(func->locals[inst->src2].type))) {
+                    return false;
+                }
+                break;
             case JIR_OP_CALL:
                 if ((inst->payload.name.length == 9 && strncmp(inst->payload.name.start, "anonymous", 9) == 0)) {
                     return false;
@@ -1733,6 +1799,9 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
             case JIR_OP_CONST_INT:
                 fprintf(out, "    %s = %lld;\n", func->locals[inst->dest].name, (long long)inst->payload.int_val);
                 break;
+            case JIR_OP_CONST_FLOAT:
+                fprintf(out, "    %s = %g;\n", func->locals[inst->dest].name, inst->payload.float_val);
+                break;
             case JIR_OP_CONST_STR:
                 fprintf(out, "    %s = (Slice_uint8_t){(uint8_t*)", func->locals[inst->dest].name);
                 gen_emit_jir_string(out, inst->payload.str_val ? inst->payload.str_val : "");
@@ -1817,8 +1886,14 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 break;
             case JIR_OP_CALL:
                 fprintf(out, "    ");
-                if (inst->dest >= 0) fprintf(out, "%s = ", func->locals[inst->dest].name);
-                if (inst->payload.name.length == 5 && strncmp(inst->payload.name.start, "print", 5) == 0) {
+                TypeExpr* call_return_type = gen_lookup_callable_return_type_any(inst->payload.name);
+                bool call_returns_void = gen_is_void_type(call_return_type) ||
+                                         (inst->dest >= 0 &&
+                                          (size_t)inst->dest < func->local_count &&
+                                          gen_is_void_type(func->locals[inst->dest].type));
+                if (inst->dest >= 0 && !call_returns_void) fprintf(out, "%s = ", func->locals[inst->dest].name);
+                if ((inst->payload.name.length == 5 && strncmp(inst->payload.name.start, "print", 5) == 0) ||
+                    (inst->payload.name.length == 17 && strncmp(inst->payload.name.start, "__intrinsic_print", 17) == 0)) {
                     fprintf(out, "printf(");
                     for (size_t j = 0; j < inst->call_arg_count; j++) {
                         JirReg arg_reg = inst->call_args[j];
@@ -1833,7 +1908,8 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                         if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
                     }
                     fprintf(out, ");\n");
-                } else if (inst->payload.name.length == 6 && strncmp(inst->payload.name.start, "assert", 6) == 0) {
+                } else if ((inst->payload.name.length == 6 && strncmp(inst->payload.name.start, "assert", 6) == 0) ||
+                           (inst->payload.name.length == 18 && strncmp(inst->payload.name.start, "__intrinsic_assert", 18) == 0)) {
                     fprintf(out, "((void)(( ");
                     if (inst->call_arg_count > 0) gen_emit_jir_reg(out, func, inst->call_args[0]);
                     else fprintf(out, "0");
@@ -1865,6 +1941,11 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                     fprintf(out, "char");
                 }
                 fprintf(out, "));\n");
+                break;
+            case JIR_OP_ADDR_OF:
+                fprintf(out, "    %s = &", func->locals[inst->dest].name);
+                gen_emit_jir_reg(out, func, inst->src1);
+                fprintf(out, ";\n");
                 break;
             case JIR_OP_ARRAY_INIT:
                 fprintf(out, "    %s = ", func->locals[inst->dest].name);
@@ -1933,6 +2014,7 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
     current_struct_context = NULL;
     current_struct_field_count = 0;
     gen_active_jir_module = mod;
+    gen_active_ast_root = root;
     gen_collect_tuple_types_from_node(root);
 
     char h_path[PATH_MAX];
@@ -1974,5 +2056,6 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
 
     fclose(c_out);
     gen_active_jir_module = NULL;
+    gen_active_ast_root = NULL;
     printf("Successfully generated C/H code from JIR at: %s\n", out_path);
 }

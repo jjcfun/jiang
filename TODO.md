@@ -51,7 +51,7 @@
     - [x] tuple binding
     - [x] `$` 相关语法糖
 - [x] **让符号绑定显式进入 JIR**: 局部变量与参数优先绑定到 JIR local，减少 Codegen 阶段的字符串查找与 AST 回溯。
-- [ ] **重构 JIR Codegen**: 让 `jir_generate_c` 直接基于 JIR 产出 C，逐步淘汰 AST 直出路径。
+- [x] **重构 JIR Codegen**: `jir_generate_c` 已以 JIR 为函数体主路径产出 C，AST 直出仅保留声明生成与兼容兜底。
 
 ### 2. 完成 Union 模式匹配
 - [x] **Union 基础实现**: 支持 `union(Tag) Name { ... }` 语法及 C 代码生成。
@@ -67,7 +67,7 @@
     - [x] `std/string`
     - [x] `std/file`
     - [x] `std/path`
-- [ ] **梳理 intrinsic 与标准库边界**: 将 `print`、`assert` 等能力从“编译器特殊对待”整理为“标准库导出 + 少量 intrinsic 支撑”。
+- [x] **梳理 intrinsic 与标准库边界**: `std.io` / `std.assert` 已通过 `__intrinsic_*` 暴露底层能力，标准库调用不再直接依赖裸 `print` / `assert`。
 - [x] **为 Stage1 预留编译器自举所需接口**: 文件读取、字符串处理、路径处理至少要能支撑词法器和 import 解析。
 
 ### 4. 标准库 Import 机制

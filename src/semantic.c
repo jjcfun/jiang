@@ -126,6 +126,15 @@ static bool type_compatible(TypeExpr* expected, TypeExpr* actual) {
     if (expected->kind != actual->kind) return false;
     switch (expected->kind) {
         case TYPE_BASE:
+            if (same_base_name(expected, "Double")) {
+                return same_base_name(actual, "Double") ||
+                       same_base_name(actual, "Float") ||
+                       same_base_name(actual, "Int");
+            }
+            if (same_base_name(expected, "Float")) {
+                return same_base_name(actual, "Float") ||
+                       same_base_name(actual, "Int");
+            }
             return expected->as.base_type.length == actual->as.base_type.length &&
                    strncmp(expected->as.base_type.start, actual->as.base_type.start, expected->as.base_type.length) == 0;
         case TYPE_POINTER:
@@ -226,6 +235,8 @@ static void register_builtins(void) {
     }
     symbol_define("print", 5, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("assert", 6, SYM_FUNC, make_base_type("void"), 0, false);
+    symbol_define("__intrinsic_print", 17, SYM_FUNC, make_base_type("void"), 0, false);
+    symbol_define("__intrinsic_assert", 18, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("__intrinsic_read_file", 21, SYM_FUNC,
                   make_slice_type(make_base_type("UInt8")), 0, false);
     symbol_define("__intrinsic_file_exists", 23, SYM_FUNC,
@@ -463,7 +474,9 @@ static void check_node(ASTNode* node) {
                 node->symbol = sym;
                 node->evaluated_type = sym->type;
             } else if (token_eq_cstr(node->as.identifier.name, "print") ||
-                       token_eq_cstr(node->as.identifier.name, "assert")) {
+                       token_eq_cstr(node->as.identifier.name, "assert") ||
+                       token_eq_cstr(node->as.identifier.name, "__intrinsic_print") ||
+                       token_eq_cstr(node->as.identifier.name, "__intrinsic_assert")) {
                 node->evaluated_type = make_base_type("void");
             } else {
                 semantic_error(node->line, "Undefined identifier '%.*s'",
@@ -473,7 +486,11 @@ static void check_node(ASTNode* node) {
         }
 
         case AST_LITERAL_NUMBER:
-            node->evaluated_type = make_base_type("Int");
+            if (node->as.number.value == (int64_t)node->as.number.value) {
+                node->evaluated_type = make_base_type("Int");
+            } else {
+                node->evaluated_type = make_base_type("Double");
+            }
             break;
 
         case AST_LITERAL_STRING:
@@ -676,7 +693,7 @@ static void check_node(ASTNode* node) {
                 break;
             }
             ASTNode* method = find_struct_method(struct_decl, node->as.member_access.member);
-            if (method && object->symbol && object->symbol->kind == SYM_STRUCT) {
+            if (method) {
                 node->evaluated_type = method->as.func_decl.return_type;
                 node->symbol = method->symbol;
                 break;
