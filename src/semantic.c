@@ -219,6 +219,13 @@ static void check_block(ASTNode* node) {
     scope_pop();
 }
 
+static void check_binding_list(ASTNode* node) {
+    if (!node || node->type != AST_BINDING_LIST) return;
+    for (size_t i = 0; i < node->as.binding_list.count; i++) {
+        check_node(node->as.binding_list.items[i]);
+    }
+}
+
 static void import_public_symbols(Module* imported_mod, int line) {
     if (!imported_mod || !imported_mod->top_level_scope) return;
     for (Symbol* sym = imported_mod->top_level_scope->symbols; sym; sym = sym->next) {
@@ -238,6 +245,10 @@ static void check_node(ASTNode* node) {
 
         case AST_BLOCK:
             check_block(node);
+            break;
+
+        case AST_BINDING_LIST:
+            check_binding_list(node);
             break;
 
         case AST_VAR_DECL: {
@@ -390,6 +401,20 @@ static void check_node(ASTNode* node) {
             check_node(node->as.while_stmt.condition);
             check_node(node->as.while_stmt.body);
             loop_depth--;
+            break;
+
+        case AST_FOR_STMT:
+            check_node(node->as.for_stmt.iterable);
+            scope_push();
+            if (node->as.for_stmt.pattern->type == AST_BINDING_LIST) {
+                check_binding_list(node->as.for_stmt.pattern);
+            } else {
+                check_node(node->as.for_stmt.pattern);
+            }
+            loop_depth++;
+            check_node(node->as.for_stmt.body);
+            loop_depth--;
+            scope_pop();
             break;
 
         case AST_RETURN_STMT:

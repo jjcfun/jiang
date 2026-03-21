@@ -31,6 +31,19 @@
 
 ## 🚀 待办事项 (TODO) - 核心架构升级
 
+### 0. Binding 语法统一 (Highest Priority)
+- [ ] **定义 Binding 语法**: 统一绑定原子形式为 `type_expr identifier`。
+    - 例: `Int x`, `Int! y`, `_ x`, `_! y`
+- [x] **统一 For Binding**: `for` 语句只接受 binding 语法，不再接受裸标识符。
+    - 例: `for Int i in 0..10 { ... }`
+    - 例: `for (_ i, _ item) in list.indexed() { ... }`
+- [ ] **统一解构绑定**: 将元组解构与 Union 变体绑定统一为 binding 列表。
+    - 例: `(_ x, _! y) = foo()`
+    - 例: `Shape.circle(_ x1)`
+- [ ] **补齐 Binding AST / 语义分析**: 让 parser、semantic、codegen 共享同一套 binding 节点与检查逻辑。
+    - [x] 拆分独立 `AST_BINDING_LIST`，不再复用 `AST_BLOCK`
+- [ ] **补齐 Binding 测试**: 增加 `for`、赋值解构、Union 解构三类 binding 用例。
+
 ### 1. 引入 JIR (Jiang Intermediate Representation)
 - [ ] **定义 JIR 结构**: 实现基于指令流的线性 IR（类似于 Zig 的 ZIR 或三地址码）。
     - 定义 `JirInstruction` (OpCode, dest, src1, src2) 和 `JirLocal`。
@@ -46,9 +59,9 @@
 - [ ] **匿名 Union**: 支持不带显式 Tag Enum 的 Union。
 
 ## 🐞 待修复的 Bug (Bug Fixes)
-- [ ] **构造函数映射**: 修复 `Vault(...)` 没能正确翻译为 `Vault_new(...)` 的问题。
-- [ ] **多模块符号可见性**: 解决 `Alias.member` 在独立编译模式下产生的链接错误。
-- [ ] **切片语法兼容性**: 完善 `x[]` 在 C 语言层面的零索引占位生成。
+- [x] **构造函数映射**: 修复 `Vault(...)` 没能正确翻译为 `Vault_new(...)` 的问题。
+- [x] **多模块符号可见性**: 解决 `Alias.member` 在独立编译模式下产生的链接错误。
+- [x] **切片语法兼容性**: 完善 `x[]` 在 C 语言层面的零索引占位生成。
 - [ ] **空元组返回处理**: 统一将 `() func()` 在 C 声明中映射为 `void func()`。
 
 ## 📝 架构笔记 (Architectural Notes)

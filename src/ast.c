@@ -107,6 +107,14 @@ void ast_print(ASTNode* node, int depth) {
             else printf("_");
             printf(", Name: '%.*s')\n", (int)node->as.pattern.name.length, node->as.pattern.name.start);
             break;
+        case AST_BINDING_LIST:
+            printf("BindingList (\n");
+            for (size_t i = 0; i < node->as.binding_list.count; i++) {
+                ast_print(node->as.binding_list.items[i], depth + 1);
+            }
+            print_indent(depth);
+            printf(")\n");
+            break;
         case AST_PROGRAM:
             printf("Program [\n");
             for (size_t i = 0; i < node->as.block.count; i++) {

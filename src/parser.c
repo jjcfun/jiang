@@ -97,6 +97,7 @@ static ASTNode* struct_declaration();
 static ASTNode* enum_declaration();
 static ASTNode* block_statement();
 static ASTNode* function_declaration(TypeExpr* return_type, Token name);
+static ASTNode* parse_binding();
 
 static void synchronize() {
     parser.panic_mode = false;
@@ -861,28 +862,43 @@ static ASTNode* while_statement() {
     return node;
 }
 
+static ASTNode* parse_binding() {
+    TypeExpr* binding_type = parse_type();
+    consume(TOKEN_IDENTIFIER, "Expect binding name.");
+    Token name = parser.previous;
+
+    ASTNode* node = ast_new_node(parser.arena, AST_PATTERN, name.line);
+    node->as.pattern.type = binding_type;
+    node->as.pattern.name = name;
+    node->as.pattern.field_name = (Token){0};
+    node->as.pattern.field_index = -1;
+    return node;
+}
+
+static ASTNode* parse_binding_list() {
+    ASTNode* node = ast_new_node(parser.arena, AST_BINDING_LIST, parser.previous.line);
+    ASTNode* items[64];
+    size_t count = 0;
+
+    if (!check(TOKEN_RIGHT_PAREN)) {
+        do {
+            items[count++] = parse_binding();
+        } while (match(TOKEN_COMMA));
+    }
+
+    consume(TOKEN_RIGHT_PAREN, "Expect ')' after binding list.");
+    node->as.binding_list.items = arena_alloc(parser.arena, sizeof(ASTNode*) * count);
+    memcpy(node->as.binding_list.items, items, sizeof(ASTNode*) * count);
+    node->as.binding_list.count = count;
+    return node;
+}
+
 static ASTNode* for_pattern() {
     if (match(TOKEN_LEFT_PAREN)) {
-        ASTNode* node = ast_new_node(parser.arena, AST_BLOCK, parser.previous.line); // Re-using block structure for patterns
-        ASTNode* patterns[64];
-        size_t count = 0;
-        
-        do {
-            patterns[count++] = for_pattern();
-        } while (match(TOKEN_COMMA));
-        
-        consume(TOKEN_RIGHT_PAREN, "Expect ')' after pattern list.");
-        
-        node->as.block.statements = (ASTNode**)arena_alloc(parser.arena, sizeof(ASTNode*) * count);
-        memcpy(node->as.block.statements, patterns, sizeof(ASTNode*) * count);
-        node->as.block.count = count;
-        return node;
+        return parse_binding_list();
     }
-    
-    consume(TOKEN_IDENTIFIER, "Expect identifier in for pattern.");
-    ASTNode* node = ast_new_node(parser.arena, AST_IDENTIFIER, parser.previous.line);
-    node->as.identifier.name = parser.previous;
-    return node;
+
+    return parse_binding();
 }
 
 static ASTNode* for_statement() {
@@ -1009,7 +1025,7 @@ static ASTNode* statement() {
                (check(TOKEN_IDENTIFIER) && (
                 peek_token().type == TOKEN_IDENTIFIER || 
                 peek_token().type == TOKEN_STAR || 
-                peek_token().type == TOKEN_LEFT_BRACKET || 
+                (peek_token().type == TOKEN_LEFT_BRACKET && parser.current.start[0] >= 'A' && parser.current.start[0] <= 'Z') || 
                 peek_token().type == TOKEN_BANG || 
                 peek_token().type == TOKEN_QUESTION))) {
         is_decl = true;

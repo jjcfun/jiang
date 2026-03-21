@@ -76,6 +76,7 @@ typedef enum {
     AST_CONTINUE_STMT,
     AST_IMPORT,
     AST_UNION_DECL,
+    AST_BINDING_LIST,
     AST_PATTERN
     } NodeType;
 
@@ -125,6 +126,12 @@ typedef enum {
             size_t count;
             size_t capacity;
         } block;
+
+        // AST_BINDING_LIST
+        struct {
+            ASTNode** items;
+            size_t count;
+        } binding_list;
 
         // AST_IMPORT
         struct {

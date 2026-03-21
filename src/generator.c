@@ -637,17 +637,24 @@ static void generate_node(ASTNode* node, FILE* out) {
         case AST_FOR_STMT:
             if (node->as.for_stmt.iterable->type == AST_RANGE_EXPR) {
                 ASTNode* range = node->as.for_stmt.iterable;
+                ASTNode* binding = node->as.for_stmt.pattern;
+                if (binding->type == AST_BINDING_LIST) {
+                    // Tuple bindings for iterators are planned, but range-based for currently
+                    // only supports a single binding variable in codegen.
+                    binding = (binding->as.binding_list.count > 0) ? binding->as.binding_list.items[0] : NULL;
+                }
+                if (!binding || binding->type != AST_PATTERN) break;
                 fprintf(out, "for (int64_t %.*s = ", 
-                        (int)node->as.for_stmt.pattern->as.identifier.name.length, 
-                        node->as.for_stmt.pattern->as.identifier.name.start);
+                        (int)binding->as.pattern.name.length, 
+                        binding->as.pattern.name.start);
                 generate_node(range->as.range.start, out);
                 fprintf(out, "; %.*s < ", 
-                        (int)node->as.for_stmt.pattern->as.identifier.name.length, 
-                        node->as.for_stmt.pattern->as.identifier.name.start);
+                        (int)binding->as.pattern.name.length, 
+                        binding->as.pattern.name.start);
                 generate_node(range->as.range.end, out);
                 fprintf(out, "; %.*s++) ", 
-                        (int)node->as.for_stmt.pattern->as.identifier.name.length, 
-                        node->as.for_stmt.pattern->as.identifier.name.start);
+                        (int)binding->as.pattern.name.length, 
+                        binding->as.pattern.name.start);
                 generate_node(node->as.for_stmt.body, out);
             }
             break;
@@ -811,6 +818,8 @@ static void generate_node(ASTNode* node, FILE* out) {
 
         case AST_BREAK_STMT: fprintf(out, "break"); break;
         case AST_CONTINUE_STMT: fprintf(out, "continue"); break;
+        case AST_BINDING_LIST:
+            break;
         case AST_IMPORT: {
             const char* include_path = node->as.import_decl.resolved_path;
             const char* base = strrchr(include_path, '/');
@@ -1038,6 +1047,9 @@ static void gen_collect_patterns(ASTNode* node) {
         case AST_PROGRAM:
         case AST_BLOCK:
             for (size_t i = 0; i < node->as.block.count; i++) gen_collect_patterns(node->as.block.statements[i]);
+            break;
+        case AST_BINDING_LIST:
+            for (size_t i = 0; i < node->as.binding_list.count; i++) gen_collect_patterns(node->as.binding_list.items[i]);
             break;
         case AST_BINARY_EXPR:
             gen_collect_patterns(node->as.binary.left);
