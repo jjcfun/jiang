@@ -1235,11 +1235,7 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
     }
     fprintf(out, "#ifndef %s\n#define %s\n\n", guard, guard);
     
-    char runtime_path[512];
-    char cwd[512];
-    if (getcwd(cwd, sizeof(cwd)) != NULL) snprintf(runtime_path, sizeof(runtime_path), "%s/include/runtime.h", cwd);
-    else strcpy(runtime_path, "runtime.h");
-    fprintf(out, "#include \"%s\"\n\n", runtime_path);
+    fprintf(out, "#include \"runtime.h\"\n\n");
 
     for (size_t i = 0; i < gen_tuple_type_count; i++) {
         TypeExpr* type = gen_tuple_types[i].type;
@@ -1411,8 +1407,18 @@ static void generate_declarations(ASTNode* root, FILE* out, const char* out_path
             fprintf(out, ");\n");
         } else if (node->type == AST_VAR_DECL) {
             fprintf(out, "extern ");
-            generate_type(node->as.var_decl.type, out);
-            fprintf(out, " %.*s;\n", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
+            TypeExpr* type = node->as.var_decl.type;
+            if (!type || (type->kind == TYPE_BASE && type->as.base_type.length == 1 && type->as.base_type.start[0] == '_')) {
+                type = node->evaluated_type;
+            }
+            generate_type(type, out);
+            fprintf(out, " %.*s", (int)node->as.var_decl.name.length, node->as.var_decl.name.start);
+            if (type && type->kind == TYPE_ARRAY) {
+                fprintf(out, "[");
+                if (type->as.array.length) generate_node(type->as.array.length, out);
+                fprintf(out, "]");
+            }
+            fprintf(out, ";\n");
         } else if (node->type == AST_IMPORT) {
             if (node->as.import_decl.resolved_path[0] == '\0') {
                 continue;

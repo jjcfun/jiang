@@ -1,5 +1,11 @@
 # Jiang 编译器开发进度与计划
 
+## 当前状态
+
+- Stage0 已完成，`TODO.md` 中原先定义的完成条件已全部达成。
+- 当前主线任务已切换到 Stage1：使用 Stage0 编译器启动 Jiang 自举。
+- 现阶段的 TODO 应优先服务于“先写出最小可工作的 Jiang 版前端”，而不是继续扩张 Stage0 的语法面。
+
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
 - [x] **断言功能实现**: 在 `generator.c` 中实现了 `assert` 的 C 代码生成，支持失败时打印行号并退出（`exit(1)`）。
@@ -19,7 +25,7 @@
 - [x] **更优雅的 Slice 定义**: 将 `Slice_int64_t` 等公共定义提取到单独的 `include/runtime.h` 中。
 - [x] **全局头文件保护**: 为所有生成的 C 文件增加 `#ifndef` 保护。
 
-## 🎯 Stage0 完成条件 (Must Finish In Stage0)
+## ✅ Stage0 完成条件（已达成）
 
 ### 0. 收口 Binding / Pattern 语法 (Highest Priority)
 - [x] **定义 Binding 语法**: 统一绑定原子形式为 `type_expr identifier`。
@@ -87,10 +93,38 @@
 - [x] **空元组返回处理**: 统一将 `() func()` 在 C 声明中映射为 `void func()`。
 - [x] **补充真实项目型测试**: 用多模块 + 标准库 + Union + binding 的组合样例验证 Stage0 可用性。
 
-## 📦 Stage1 前置条件 (Prepare During Stage0)
+## 📦 Stage1 前置条件（已完成）
 - [x] **定义自举子集**: 明确 Stage1 第一版 Jiang 编译器允许依赖的语法与标准库范围。
 - [x] **同步语言文档**: 更新 `README`、`doc/jiang.md`、`doc/ebnf.md`，确保与当前实现一致。
 - [x] **准备标准库示例程序**: 至少能用 Stage0 编译器编译一个依赖标准库的简单工具程序。
+
+## 🚧 Stage1 当前任务（Current Focus）
+
+### 0. 建立 Stage1 工程骨架
+- [x] **创建 Stage1 源码目录**: 当前使用顶层 `bootstrap/` 目录承载 Jiang 版编译器源码。
+- [x] **约定入口程序**: 第一阶段入口已经定为最小 `lexer` 可执行程序。
+- [x] **补最小构建说明**: 已在 `bootstrap/README.md` 中写清如何用 Stage0 编译器编译和运行第一个程序。
+
+### 1. 先做文件与模块基础设施
+- [ ] **实现文件读取封装**: 用 `std.file` 封装 Stage1 所需的源码加载接口。
+- [ ] **实现路径工具封装**: 用 `std.path` 统一处理模块路径拼接、标准化与相对路径解析。
+- [ ] **定义模块加载边界**: 先明确 Stage1 第一版只支持哪些 import 形式，避免过早复制 Stage0 的全部复杂逻辑。
+- [ ] **补跨模块枚举命名空间访问**: 当前 `store.TokenKind.kw` 这类 `namespace.Enum.member` 在 Stage0 里还不能稳定通过语义分析。
+
+### 2. 实现最小 Lexer
+- [ ] **定义 Token 数据结构**: 先覆盖标识符、关键字、字面量、分隔符、运算符这几类核心 token。
+- [x] **跑通源码扫描主循环**: 当前已支持空白符、注释、标识符、数字、字符串与单字符标点。
+- [x] **输出可验证结果**: 当前 `lexer.jiang` 已能输出稳定的 token span 文本。
+
+### 3. 为 Stage1 补测试与样例
+- [x] **增加 Stage1 样例源码**: 已加入 `bootstrap/sample.jiang` 与 `bootstrap/lexer.jiang`。
+- [x] **增加 Stage1 冒烟测试脚本**: 已加入 `script/stage1_smoke.sh`，验证 Stage0 编译器可以编译并运行第一个 Stage1 程序。
+- [ ] **定义 golden 测试格式**: 为 lexer 输出建立稳定、可 diff 的文本格式。
+
+### 4. 控制 Stage1 范围，避免失控
+- [ ] **冻结第一版自举子集**: 没有 Stage1 直接需要的语法，不在这一阶段扩展。
+- [ ] **避免提前引入复杂后端规划**: 在 Jiang 版前端未稳定前，不并行推进 LLVM / MIR 重构。
+- [ ] **优先补标准库缺口**: 只有在 Stage1 代码真正需要时，才扩展 `std` 能力。
 
 ## 📝 架构笔记 (Architectural Notes)
 - **File as a Struct**: 借鉴 Zig 的设计，将每个文件视为一个独立的命名空间，避免全局符号冲突。

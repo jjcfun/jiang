@@ -75,9 +75,9 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 好吧，它的**1.0正式版**将会经历以下几个阶段：
 
-+ **Stage0**: 用 C 语言实现编译器的基本功能。当前已经具备多模块、Union/Pattern、Binding、最小标准库与 `import std;` 支持，主链保持为 `AST -> JIR -> C`，仍在继续收口剩余 lowering/codegen 细节
++ **Stage0**: 用 C 语言实现编译器的基本功能。该阶段已经完成：当前编译器已具备多模块、Union/Pattern、Binding、最小标准库与 `import std;` 支持，主链稳定为 `AST -> JIR -> C`，并已通过当前测试集验证
 
-+ **Stage1**: 用Stage0的Jiang语言编译器实现自举，并实现标准库的最小集合，此阶段也将借助AI实现
++ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。当前重点是基于已确认的自举子集，用 Jiang 实现最小前端能力，并继续补齐标准库对编译器实现的支撑
 
 + **Stage2**: 用Jiang语言重构Jiang语言编译器，并实现自定义语法等高级功能，此阶段追求代码质量和性能，并使用人工实现
 
@@ -102,7 +102,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 - 控制流：`if`、`while`、`for Int i in a..b`
 - 绑定：普通 binding、tuple binding、Union variant binding
 - 复合类型：`struct`、`enum`、`union`
-- 最小标准库：`std.io`、`std.assert`、`std.string`、`std.file`、`std.path`
+- 最小标准库：`std.io`、`std.assert`、`std.string`、`std.fs`
 
 当前 Stage0 里仍然建议避免把这些能力作为自举前提：
 
@@ -129,6 +129,8 @@ make
 ```bash
 ./script/test.sh
 ```
+
+当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行全部测试用例；以仓库当前版本为准，测试集已全部通过。
 
 ## 许可证
 
