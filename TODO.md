@@ -70,9 +70,7 @@
 - [x] **实现最小标准库模块**:
     - [x] `std/io`
     - [x] `std/assert`
-    - [x] `std/string`
-    - [x] `std/file`
-    - [x] `std/path`
+    - [x] `std/fs`
 - [x] **梳理 intrinsic 与标准库边界**: `std.io` / `std.assert` 已通过 `__intrinsic_*` 暴露底层能力，标准库调用不再直接依赖裸 `print` / `assert`。
 - [x] **为 Stage1 预留编译器自举所需接口**: 文件读取、字符串处理、路径处理至少要能支撑词法器和 import 解析。
 

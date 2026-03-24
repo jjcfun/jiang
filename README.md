@@ -102,7 +102,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 - 控制流：`if`、`while`、`for Int i in a..b`
 - 绑定：普通 binding、tuple binding、Union variant binding
 - 复合类型：`struct`、`enum`、`union`
-- 最小标准库：`std.io`、`std.assert`、`std.string`、`std.fs`
+- 最小标准库：`std.io`、`std.assert`、`std.fs`
 
 当前 Stage0 里仍然建议避免把这些能力作为自举前提：
 
