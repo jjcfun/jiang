@@ -31,7 +31,7 @@ statement = import_decl
 
 block = "{" { statement } "}" ;
 
-import_decl = [ "public" ] "import" ( "std" | [ identifier ] string_literal ) [ ";" ] ;
+import_decl = [ "public" ] "import" ( "std" | [ identifier "=" ] string_literal ) [ ";" ] ;
 
 variable_decl = type_expr identifier "=" expression [ ";" ]
               | binding_list "=" expression [ ";" ]

@@ -97,7 +97,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 为了让 Stage1 的第一版自举实现尽量稳定，当前建议把可依赖能力收敛到下面这个子集：
 
-- 模块与导入：`import "..."`、`import std;`
+- 模块与导入：`import "..."`、`import alias = "..."`、`import std;`
 - 基础类型：`Int`、`UInt8`、`UInt16`、`Float`、`Double`、`Bool`
 - 控制流：`if`、`while`、`for Int i in a..b`
 - 绑定：普通 binding、tuple binding、Union variant binding

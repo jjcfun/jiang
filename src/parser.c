@@ -1075,8 +1075,9 @@ static ASTNode* import_statement(bool is_public) {
         alias = first;
     }
 
-    // Case 1: import Alias "path";
+    // Case 1: import Alias = "path";
     if (alias.length > 0) {
+        consume(TOKEN_EQUAL, "Expect '=' after import alias.");
         consume(TOKEN_STRING, "Expect string literal for import path.");
         path = parser.previous;
     } else {

@@ -104,9 +104,9 @@
 - [x] **补最小构建说明**: 已在 `bootstrap/README.md` 中写清如何用 Stage0 编译器编译和运行第一个程序。
 
 ### 1. 先做文件与模块基础设施
-- [ ] **实现文件读取封装**: 用 `std.file` 封装 Stage1 所需的源码加载接口。
-- [ ] **实现路径工具封装**: 用 `std.path` 统一处理模块路径拼接、标准化与相对路径解析。
-- [ ] **定义模块加载边界**: 先明确 Stage1 第一版只支持哪些 import 形式，避免过早复制 Stage0 的全部复杂逻辑。
+- [x] **实现文件读取封装**: 已在 `bootstrap/source_loader.jiang` 中用 `std.fs` 封装 Stage1 当前所需的源码加载接口。
+- [x] **实现路径工具封装**: 已在 `bootstrap/path_utils.jiang` 中收口相对路径、源码后缀与标准库模块名判断。
+- [x] **定义模块加载边界**: Stage1 第一版当前只接受 `import std;` 与相对 `.jiang` 路径导入，不复制 Stage0 的完整 import 复杂度。
 - [ ] **补跨模块枚举命名空间访问**: 当前 `store.TokenKind.kw` 这类 `namespace.Enum.member` 在 Stage0 里还不能稳定通过语义分析。
 
 ### 2. 实现最小 Lexer

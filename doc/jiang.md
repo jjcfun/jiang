@@ -778,7 +778,7 @@ public import "utils/math.jiang";
 math.max(100, 200);
 
 // 3.导入模块，并使用Math作为模块名
-public import Math "utils/math.jiang";
+public import Math = "utils/math.jiang";
 Math.max(100, 200);
 
 ```
