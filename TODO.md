@@ -107,19 +107,25 @@
 - [x] **实现文件读取封装**: 已在 `bootstrap/source_loader.jiang` 中用 `std.fs` 封装 Stage1 当前所需的源码加载接口。
 - [x] **实现路径工具封装**: 已在 `bootstrap/path_utils.jiang` 中收口相对路径、源码后缀与标准库模块名判断。
 - [x] **定义模块加载边界**: Stage1 第一版当前只接受 `import std;` 与相对 `.jiang` 路径导入，不复制 Stage0 的完整 import 复杂度。
-- [ ] **补跨模块枚举命名空间访问**: 当前 `store.TokenKind.kw` 这类 `namespace.Enum.member` 在 Stage0 里还不能稳定通过语义分析。
+- [x] **补跨模块枚举命名空间访问**: 已支持 `store.TokenKind.kw` 这类 `namespace.Enum.member` 形式稳定通过语义分析。
 
 ### 2. 实现最小 Lexer
-- [ ] **定义 Token 数据结构**: 先覆盖标识符、关键字、字面量、分隔符、运算符这几类核心 token。
-- [x] **跑通源码扫描主循环**: 当前已支持空白符、注释、标识符、数字、字符串与单字符标点。
-- [x] **输出可验证结果**: 当前 `lexer.jiang` 已能输出稳定的 token span 文本。
+- [x] **定义 Token 数据结构**: 已在 `bootstrap/token_store.jiang` 中定义 `Token` 与较完整的 `TokenKind`，覆盖关键字、标识符、字面量、分隔符、常用运算符与 `eof`。
+- [x] **跑通源码扫描主循环**: 当前已支持空白符、注释、标识符、数字、字符串、单字符与关键双字符 token。
+- [x] **输出可验证结果**: 当前 `lexer.jiang` 已能输出稳定的 token 文本，包含 kind、span 与转义后的 lexeme。
 
-### 3. 为 Stage1 补测试与样例
+### 3. 实现最小 Parser
+- [x] **抽出可复用 Lexer 模块**: 已将词法逻辑收口到 `bootstrap/lexer_core.jiang`，供后续前端阶段复用。
+- [x] **建立 Parser 骨架**: 已加入 `bootstrap/parser_core.jiang`、`bootstrap/parser_store.jiang` 与 `bootstrap/parser.jiang`，使用整数 node id 保存并输出稳定 parse tree。
+- [x] **补 Parser 冒烟测试**: 已加入 `bootstrap/parser_sample.jiang`、`bootstrap/parser.golden` 与 `script/stage1_parser_smoke.sh`，固定 parser 当前 parse dump。
+- [x] **冻结 Parser v1 边界**: 当前已覆盖 `bootstrap-first` 子集，支持 import、struct、enum、函数、变量、block、if/else、while、for-in、switch-else、return、break/continue、调用、成员访问、索引、数组字面量、struct init 与基础类型修饰符。
+
+### 4. 为 Stage1 补测试与样例
 - [x] **增加 Stage1 样例源码**: 已加入 `bootstrap/sample.jiang` 与 `bootstrap/lexer.jiang`。
 - [x] **增加 Stage1 冒烟测试脚本**: 已加入 `script/stage1_smoke.sh`，验证 Stage0 编译器可以编译并运行第一个 Stage1 程序。
-- [ ] **定义 golden 测试格式**: 为 lexer 输出建立稳定、可 diff 的文本格式。
+- [x] **定义 golden 测试格式**: 已使用 `bootstrap/lexer.golden` 固定 lexer 输出，并在 `script/stage1_smoke.sh` 中做完整 diff。
 
-### 4. 控制 Stage1 范围，避免失控
+### 5. 控制 Stage1 范围，避免失控
 - [ ] **冻结第一版自举子集**: 没有 Stage1 直接需要的语法，不在这一阶段扩展。
 - [ ] **避免提前引入复杂后端规划**: 在 Jiang 版前端未稳定前，不并行推进 LLVM / MIR 重构。
 - [ ] **优先补标准库缺口**: 只有在 Stage1 代码真正需要时，才扩展 `std` 能力。

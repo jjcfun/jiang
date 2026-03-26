@@ -4,6 +4,46 @@
 
 # 语法
 
+### 命名规范
+
+当前仓库建议采用下面这套命名风格：
+
+- 类型名使用 `PascalCase`
+- 函数名使用 `snake_case`
+- 变量名使用 `snake_case`
+- 结构体字段名使用 `snake_case`
+- 枚举成员使用 `snake_case`
+- 模块别名优先使用 `PascalCase`
+
+示例：
+
+```c
+enum TokenKind {
+    kw,
+    string_lit,
+    left_paren,
+}
+
+struct SourceFile {
+    UInt8[] file_path;
+    Int start_offset;
+}
+
+UInt8[] read_source(UInt8[] file_path) {
+    return file_path;
+}
+
+import Store = "token_store.jiang";
+```
+
+这样可以稳定区分类型和值：
+
+- `TokenKind`、`SourceFile` 看起来就是类型
+- `kw`、`string_lit` 看起来就是枚举值
+- `read_source`、`start_offset` 看起来就是函数和字段
+
+当前不建议把枚举成员写成 `SomeField` 这种 `PascalCase` 形式，因为它会和类型名混淆。
+
 ### 类型概要
 
 关于Jiang语言的类型，遵循 **从左往右，从里到外** 的原则。比如`Int[2][3]`，表示一个数组，这个数组的元素有3个，每个元素都是`Int[2]`类型。从左往右看，`Int -> Int[2] -> Int[2][3]`，类型的范围是从里到外逐渐扩大的。简单来说：**越是右边，范围越大**

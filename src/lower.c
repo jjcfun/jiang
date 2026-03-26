@@ -7,6 +7,18 @@ static JirModule* current_jir_mod = NULL;
 static JirFunction* current_jir_func = NULL;
 static Arena* jir_arena = NULL;
 static ASTNode* current_ast_root = NULL;
+
+static Token jir_enum_constant_name(Token enum_name, Token member_name) {
+    if (enum_name.length == 0) return member_name;
+    size_t len = enum_name.length + 1 + member_name.length;
+    char* buf = arena_alloc(jir_arena, len + 1);
+    memcpy(buf, enum_name.start, enum_name.length);
+    buf[enum_name.length] = '_';
+    memcpy(buf + enum_name.length + 1, member_name.start, member_name.length);
+    buf[len] = '\0';
+    Token tok = {TOKEN_IDENTIFIER, buf, len, enum_name.line};
+    return tok;
+}
 static uint32_t loop_break_labels[64];
 static uint32_t loop_continue_labels[64];
 static int loop_depth = 0;
@@ -581,7 +593,8 @@ static int lower_expr(ASTNode* node) {
         case AST_ENUM_ACCESS: {
             int r = jir_alloc_temp(current_jir_func, node->evaluated_type, jir_arena);
             int idx = jir_emit(current_jir_func, JIR_OP_LOAD_SYM, r, -1, -1, jir_arena);
-            current_jir_func->insts[idx].payload.name = node->as.enum_access.member_name;
+            current_jir_func->insts[idx].payload.name =
+                jir_enum_constant_name(node->as.enum_access.enum_name, node->as.enum_access.member_name);
             return r;
         }
         default: return -1;

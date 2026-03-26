@@ -56,9 +56,10 @@ Jiang 目前采用循序渐进的路线：
 
 ### 当前进行中：Stage1 自举准备
 
-*   [ ] 建立 `bootstrap/` 或等价目录，承载 Jiang 版编译器源码
-*   [ ] 先实现文件加载、路径处理、模块解析等基础设施
-*   [ ] 使用 Jiang 实现最小 Lexer
+*   [x] 建立 `bootstrap/` 目录，承载 Jiang 版编译器源码
+*   [x] 实现文件加载、路径处理与最小模块边界约束
+*   [x] 使用 Jiang 实现最小 Lexer，并用 golden 固定 token dump
+*   [x] 使用 Jiang 实现 `bootstrap-first` Parser，并用 golden 固定 parse dump
 *   [ ] 让 Stage0 编译器稳定编译第一个真实的 Jiang 工具程序
 
 ### 后续阶段：原生后端演进

@@ -228,6 +228,23 @@ static ASTNode* find_struct_method(ASTNode* struct_decl, Token member) {
     return NULL;
 }
 
+static ASTNode* module_find_enum_decl(Module* mod, Token name) {
+    if (!mod || !mod->root) return NULL;
+    for (size_t i = 0; i < mod->root->as.block.count; i++) {
+        ASTNode* stmt = mod->root->as.block.statements[i];
+        if (stmt->type == AST_ENUM_DECL && token_eq(stmt->as.enum_decl.name, name)) return stmt;
+    }
+    return NULL;
+}
+
+static bool enum_has_member(ASTNode* enum_decl, Token member) {
+    if (!enum_decl || enum_decl->type != AST_ENUM_DECL) return false;
+    for (size_t i = 0; i < enum_decl->as.enum_decl.member_count; i++) {
+        if (token_eq(enum_decl->as.enum_decl.member_names[i], member)) return true;
+    }
+    return false;
+}
+
 static void register_builtins(void) {
     const char* builtins[] = {"Int", "Float", "Double", "UInt8", "UInt16", "Bool"};
     for (size_t i = 0; i < 6; i++) {
@@ -401,6 +418,13 @@ static void check_node(ASTNode* node) {
             scope_push();
             for (size_t i = 0; i < node->as.struct_decl.member_count; i++) check_node(node->as.struct_decl.members[i]);
             scope_pop();
+            break;
+
+        case AST_ENUM_DECL:
+            node->symbol = symbol_define(node->as.enum_decl.name.start, node->as.enum_decl.name.length,
+                                         SYM_ENUM, make_named_type(node->as.enum_decl.name),
+                                         node->line, node->is_public);
+            node->evaluated_type = node->symbol ? node->symbol->type : make_named_type(node->as.enum_decl.name);
             break;
 
         case AST_UNION_DECL:
@@ -661,6 +685,34 @@ static void check_node(ASTNode* node) {
                     node->symbol = exported;
                     node->evaluated_type = exported->type;
                 }
+                break;
+            }
+
+            if (object->symbol && object->symbol->kind == SYM_ENUM) {
+                Token enum_name = object->symbol->type ? object->symbol->type->as.base_type : (Token){0};
+                Token member_name = node->as.member_access.member;
+                Module* owner_mod = current_module;
+                if (object->type == AST_MEMBER_ACCESS &&
+                    object->as.member_access.object &&
+                    object->as.member_access.object->symbol &&
+                    object->as.member_access.object->symbol->kind == SYM_NAMESPACE) {
+                    owner_mod = (Module*)object->as.member_access.object->symbol->module_ptr;
+                } else if (object->symbol->module_owner) {
+                    owner_mod = (Module*)object->symbol->module_owner;
+                }
+
+                ASTNode* enum_decl = module_find_enum_decl(owner_mod, enum_name);
+                if (!enum_has_member(enum_decl, member_name)) {
+                    semantic_error(node->line, "Enum '%.*s' has no member '%.*s'",
+                                   (int)enum_name.length, enum_name.start,
+                                   (int)member_name.length, member_name.start);
+                    break;
+                }
+
+                node->type = AST_ENUM_ACCESS;
+                node->as.enum_access.enum_name = enum_name;
+                node->as.enum_access.member_name = member_name;
+                node->evaluated_type = object->symbol->type;
                 break;
             }
 

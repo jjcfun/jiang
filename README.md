@@ -110,6 +110,23 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 - 跨模块共享 tuple typedef 的复杂场景
 - 超出最小标准库范围的运行时能力
 
+### 命名规范（当前约定）
+
+为了让 Stage1 自举代码和后续标准库实现保持一致，当前建议采用下面这套命名规则：
+
+- 类型名使用 `PascalCase`
+  例如 `TokenKind`、`SourceLoader`
+- 函数名使用 `snake_case`
+  例如 `read_source`、`push_token`
+- 变量名与结构体字段名使用 `snake_case`
+  例如 `token_count`、`start_offset`
+- 枚举成员使用 `snake_case`
+  例如 `kw`、`string_lit`、`left_paren`
+- 模块别名优先使用 `PascalCase`
+  例如 `import Store = "token_store.jiang";`
+
+这套约定的目标是明确区分“类型”和“值”：`TokenKind` 是类型，`kw` / `string_lit` 是枚举值，避免把枚举成员写成看起来像类型名的 `SomeField`。
+
 ### 前提条件
 
 - CMake
