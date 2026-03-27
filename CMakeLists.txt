@@ -19,6 +19,7 @@ set(SOURCES
     src/generator.c
     src/semantic.c
     src/jir.c
+    src/hir.c
     src/lower.c
     src/jir_gen.c
 )

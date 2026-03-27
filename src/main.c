@@ -8,6 +8,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "semantic.h"
+#include "hir.h"
 #include "jir.h"
 #include "lower.h"
 #include "jir_gen.h"
@@ -29,12 +30,13 @@ static char* read_file_text(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        printf("Usage: %s [--stdlib-dir <path>] <input_file>\n", argv[0]);
+        printf("Usage: %s [--stdlib-dir <path>] [--dump-hir] <input_file>\n", argv[0]);
         return 1;
     }
 
     const char* stdlib_path = "std";
     const char* input_path = NULL;
+    bool dump_hir_only = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdlib-dir") == 0) {
             if (i + 1 >= argc) {
@@ -42,6 +44,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             stdlib_path = argv[++i];
+        } else if (strcmp(argv[i], "--dump-hir") == 0) {
+            dump_hir_only = true;
         } else {
             input_path = argv[i];
         }
@@ -68,6 +72,14 @@ int main(int argc, char** argv) {
         semantic_set_stdlib_dir(stdlib_path);
         Module* main_mod = semantic_check(arena, root, input_path);
         if (main_mod) {
+            if (dump_hir_only) {
+                HIRModule* hir = hir_build_module(module_get_root(main_mod), arena);
+                hir_dump(stdout, hir);
+                arena_destroy(arena);
+                free(source);
+                return 0;
+            }
+
             Module* all_mods[128];
             int mod_count = semantic_get_modules(all_mods);
             
@@ -76,7 +88,8 @@ int main(int argc, char** argv) {
 
             for (int i = 0; i < mod_count; i++) {
                 Module* mod = all_mods[i];
-                JirModule* jir = lower_to_jir(module_get_root(mod), arena);
+                HIRModule* hir = hir_build_module(module_get_root(mod), arena);
+                JirModule* jir = lower_hir_to_jir(hir, arena);
                 if (jir) {
                     char out_path[PATH_MAX];
                     snprintf(out_path, sizeof(out_path), "build/%s_%s.c", module_get_name(mod), module_get_id(mod));

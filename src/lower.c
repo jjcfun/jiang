@@ -601,13 +601,15 @@ static int lower_expr(ASTNode* node) {
     }
 }
 
-JirModule* lower_to_jir(ASTNode* root, Arena* arena) {
+JirModule* lower_hir_to_jir(HIRModule* module, Arena* arena) {
+    if (!module || !hir_root(module)) return NULL;
     jir_arena = arena;
-    current_ast_root = root;
+    current_ast_root = module->ast_root;
     JirModule* mod = jir_module_new(arena);
     current_jir_mod = mod;
-    for (size_t i = 0; i < root->as.block.count; i++) {
-        ASTNode* stmt = root->as.block.statements[i];
+    for (HIRNode* child = hir_first_child(hir_root(module)); child; child = hir_next_sibling(child)) {
+        ASTNode* stmt = hir_source_ast(child);
+        if (!stmt) continue;
         if (stmt->type == AST_FUNC_DECL) {
             JirFunction* f = jir_function_new(mod, stmt->as.func_decl.name);
             f->return_type = stmt->as.func_decl.return_type;
@@ -624,8 +626,9 @@ JirModule* lower_to_jir(ASTNode* root, Arena* arena) {
     Token main_name = {TOKEN_IDENTIFIER, "module_main", 11, 0};
     JirFunction* main_f = jir_function_new(mod, main_name);
     current_jir_func = main_f;
-    for (size_t i = 0; i < root->as.block.count; i++) {
-        ASTNode* stmt = root->as.block.statements[i];
+    for (HIRNode* child = hir_first_child(hir_root(module)); child; child = hir_next_sibling(child)) {
+        ASTNode* stmt = hir_source_ast(child);
+        if (!stmt) continue;
         if (stmt->type != AST_FUNC_DECL && stmt->type != AST_STRUCT_DECL && stmt->type != AST_UNION_DECL && stmt->type != AST_IMPORT) {
             lower_stmt(stmt);
         }
