@@ -92,11 +92,11 @@
 - `bootstrap/module_paths.jiang`、`bootstrap/token_store.jiang`、`bootstrap/hir_store.jiang`、`bootstrap/jir_store.jiang` 的 `mode_emit_c`
 - `bootstrap/symbol_store.jiang`、`bootstrap/type_store.jiang` 的 `mode_emit_c`
 
-当前 growable store 仍在推进中：
+当前 growable store 主链已收口：
 
-- `buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang` 已加入底层抽象
-- `token_store.jiang`、`parser_store.jiang`、`hir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`、`jir_store.jiang` 当前都已接到 growable buffer；现阶段重点转为稳定性收口与真实模块图覆盖扩展
-- 后续迁移会继续遵守当前已经冻结的数组 / slice ABI 规则，避免重新打断宿主 codegen
+- `buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang` 已成为当前唯一底层抽象
+- `token_store.jiang`、`parser_store.jiang`、`hir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`、`jir_store.jiang` 当前都已接到 growable buffer，并通过正式 smoke 回归
+- 当前重点已转为保持真实模块图覆盖稳定，不再回退到固定容量实现
 
 手动运行方式：
 

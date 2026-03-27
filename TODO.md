@@ -139,7 +139,7 @@
 - [x] **冻结数组 / slice ABI 规则**: 宿主 Stage0 与 Stage1 当前已统一固定数组、slice 和数组别名的 C 生成约定，真实入口 codegen 可稳定通过。
 - [x] **完成核心 bootstrap 模块图覆盖**: 当前所有核心前端、store、driver 与模块图基础设施都已纳入正式 real-entry 回归；剩余 sample / demo / probe 文件不视为正式模块图契约。
 - [x] **完成 growable store 主链迁移**: `buffer_int` / `buffer_bytes` / `intern_pool` 已接入，`token/parser/hir/symbol/type/jir` 当前都已切到 growable buffer；后续重点是继续压实真实模块图与宿主兼容性。
-- [ ] **收尾残余 Stage1 告警**: 当前主链结构性 codegen 错误已清掉，仍允许存在少量非阻塞 warning 直到对应 store 完成迁移。
+- [x] **收尾残余 Stage1 告警**: 当前正式回归路径中的 `stage1_codegen_smoke`、`stage1_real_entry_smoke` 与 `test.sh` 日志已无稳定复现 warning 命中，主链告警已收口。
 
 ### 7. 为 Stage1 补测试与样例
 - [x] **增加 Stage1 样例源码**: 已加入 `bootstrap/sample.jiang` 与 `bootstrap/lexer.jiang`。
@@ -148,8 +148,8 @@
 
 ### 8. 控制 Stage1 范围，避免失控
 - [x] **冻结第一版自举子集**: 目前继续维持 bootstrap-first 语法边界，没有 Stage1 真实需要的语法不再扩展。
-- [ ] **避免提前引入复杂后端规划**: 在 Jiang 版前端未稳定前，不并行推进 LLVM / MIR 重构。
-- [ ] **优先补标准库缺口**: 只有在 Stage1 代码真正需要时，才扩展 `std` 能力。
+- [x] **避免提前引入复杂后端规划**: 当前继续维持 `AST -> HIR -> JIR -> C` 主线，不并行推进 LLVM / MIR / 原生后端。
+- [x] **优先补标准库缺口**: 当前 Stage1 所需的最小 `std.io` / `std.assert` / `std.fs` 已足够支撑真实入口编译链，没有新的标准库阻塞缺口。
 
 ## 📝 架构笔记 (Architectural Notes)
 - **File as a Struct**: 借鉴 Zig 的设计，将每个文件视为一个独立的命名空间，避免全局符号冲突。
