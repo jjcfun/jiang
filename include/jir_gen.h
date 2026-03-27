@@ -2,9 +2,9 @@
 #define JIANG_JIR_GEN_H
 
 #include "jir.h"
-#include "ast.h"
+#include "codegen_info.h"
 
-// Generate C code without relying on an unstable Module struct pointer
-void jir_generate_c(JirModule* mod, ASTNode* root, const char* out_path, bool is_main, const char* mod_name, const char* mod_id);
+void jir_generate_c(JirModule* mod, CodegenModuleInfo* info, const char* out_path, bool is_main,
+                    const char* mod_name, const char* mod_id);
 
 #endif

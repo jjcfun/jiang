@@ -11,6 +11,7 @@ static HIRNode* hir_new_node(Arena* arena, HIRKind kind, int line) {
 
 static void hir_add_child(HIRNode* parent, HIRNode* child) {
     if (!parent || !child) return;
+    parent->child_count++;
     if (!parent->first_child) {
         parent->first_child = child;
         parent->last_child = child;
@@ -78,6 +79,7 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena);
 
 static void hir_attach_declared_type(HIRNode* parent, TypeExpr* type, Arena* arena) {
     if (!type) return;
+    parent->declared_type = type;
     hir_add_child(parent, hir_build_type(type, arena));
 }
 
@@ -118,7 +120,6 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
     if (!node) return NULL;
 
     HIRNode* hir = hir_new_node(arena, hir_kind_from_ast(node->type), node->line);
-    hir->ast = node;
     hir->is_public = node->is_public;
     hir->evaluated_type = node->evaluated_type;
     hir->symbol = node->symbol;
@@ -136,10 +137,12 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             }
             break;
         case AST_VAR_DECL:
+            hir->token = node->as.var_decl.name;
             hir_attach_declared_type(hir, node->as.var_decl.type, arena);
             hir_add_child(hir, hir_build_node(node->as.var_decl.initializer, arena));
             break;
         case AST_FUNC_DECL:
+            hir->token = node->as.func_decl.name;
             hir_attach_declared_type(hir, node->as.func_decl.return_type, arena);
             for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
                 hir_add_child(hir, hir_build_node(node->as.func_decl.params[i], arena));
@@ -153,6 +156,8 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             hir_add_child(hir, hir_build_node(node->as.init_decl.body, arena));
             break;
         case AST_PATTERN:
+            hir->token = node->as.pattern.name;
+            hir->token2 = node->as.pattern.field_name;
             hir_attach_declared_type(hir, node->as.pattern.type, arena);
             break;
         case AST_IF_STMT:
@@ -188,12 +193,15 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             hir_add_child(hir, hir_build_node(node->as.return_stmt.expression, arena));
             break;
         case AST_STRUCT_DECL:
+            hir->token = node->as.struct_decl.name;
             for (size_t i = 0; i < node->as.struct_decl.member_count; i++) {
                 hir_add_child(hir, hir_build_node(node->as.struct_decl.members[i], arena));
             }
             break;
         case AST_STRUCT_INIT_EXPR:
             hir_attach_declared_type(hir, node->as.struct_init.type, arena);
+            hir->tokens = node->as.struct_init.field_names;
+            hir->token_count = node->as.struct_init.field_count;
             for (size_t i = 0; i < node->as.struct_init.field_count; i++) {
                 hir_add_child(hir, hir_build_node(node->as.struct_init.field_values[i], arena));
             }
@@ -212,12 +220,17 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             }
             break;
         case AST_ENUM_DECL:
+            hir->token = node->as.enum_decl.name;
+            hir->tokens = node->as.enum_decl.member_names;
+            hir->token_count = node->as.enum_decl.member_count;
             hir_attach_declared_type(hir, node->as.enum_decl.base_type, arena);
             for (size_t i = 0; i < node->as.enum_decl.member_count; i++) {
                 hir_add_child(hir, hir_build_node(node->as.enum_decl.member_values[i], arena));
             }
             break;
         case AST_UNION_DECL:
+            hir->token = node->as.union_decl.name;
+            hir->token2 = node->as.union_decl.tag_enum;
             for (size_t i = 0; i < node->as.union_decl.member_count; i++) {
                 hir_add_child(hir, hir_build_node(node->as.union_decl.members[i], arena));
             }
@@ -227,10 +240,12 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             hir_add_child(hir, hir_build_node(node->as.binding_assign.value, arena));
             break;
         case AST_BINARY_EXPR:
+            hir->op = node->as.binary.op;
             hir_add_child(hir, hir_build_node(node->as.binary.left, arena));
             hir_add_child(hir, hir_build_node(node->as.binary.right, arena));
             break;
         case AST_UNARY_EXPR:
+            hir->op = node->as.unary.op;
             hir_add_child(hir, hir_build_node(node->as.unary.right, arena));
             break;
         case AST_FUNC_CALL:
@@ -240,10 +255,15 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             }
             break;
         case AST_MEMBER_ACCESS:
+            hir->token = node->as.member_access.member;
             hir_add_child(hir, hir_build_node(node->as.member_access.object, arena));
             break;
         case AST_LITERAL_NUMBER:
+            hir->number_value = node->as.number.value;
+            break;
         case AST_LITERAL_STRING:
+            hir->token = node->as.string.value;
+            break;
         case AST_TUPLE_LITERAL:
             if (node->type == AST_TUPLE_LITERAL) {
                 for (size_t i = 0; i < node->as.tuple_literal.count; i++) {
@@ -252,10 +272,18 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
             }
             break;
         case AST_IDENTIFIER:
+            hir->token = node->as.identifier.name;
+            break;
         case AST_ENUM_ACCESS:
+            hir->token = node->as.enum_access.enum_name;
+            hir->token2 = node->as.enum_access.member_name;
+            break;
         case AST_BREAK_STMT:
         case AST_CONTINUE_STMT:
+            break;
         case AST_IMPORT:
+            hir->token = node->as.import_decl.alias;
+            hir->token2 = node->as.import_decl.path;
             break;
     }
 
@@ -379,75 +407,60 @@ static void hir_dump_indent(FILE* out, int depth) {
 }
 
 static void hir_dump_payload(FILE* out, HIRNode* node) {
-    if (node->type_expr && !node->ast) {
+    if (node->type_expr && hir_is_type_node(node)) {
         fputs(" value=", out);
         hir_dump_type(out, node->type_expr);
         return;
     }
 
-    if (!node->ast) return;
-
-    switch (node->ast->type) {
-        case AST_IMPORT:
-            if (node->ast->as.import_decl.alias.length > 0) {
-                fprintf(out, " alias=%.*s", (int)node->ast->as.import_decl.alias.length,
-                        node->ast->as.import_decl.alias.start);
+    switch (node->kind) {
+        case HIR_IMPORT:
+            if (node->token.length > 0) {
+                fprintf(out, " alias=%.*s", (int)node->token.length, node->token.start);
             }
-            fprintf(out, " path=%.*s", (int)node->ast->as.import_decl.path.length,
-                    node->ast->as.import_decl.path.start);
+            fprintf(out, " path=%.*s", (int)node->token2.length, node->token2.start);
             break;
-        case AST_IDENTIFIER:
-            fprintf(out, " name=%.*s", (int)node->ast->as.identifier.name.length,
-                    node->ast->as.identifier.name.start);
+        case HIR_IDENTIFIER:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_VAR_DECL:
-            fprintf(out, " name=%.*s", (int)node->ast->as.var_decl.name.length,
-                    node->ast->as.var_decl.name.start);
+        case HIR_VAR_DECL:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_FUNC_DECL:
-            fprintf(out, " name=%.*s", (int)node->ast->as.func_decl.name.length,
-                    node->ast->as.func_decl.name.start);
+        case HIR_FUNC_DECL:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_STRUCT_DECL:
-            fprintf(out, " name=%.*s", (int)node->ast->as.struct_decl.name.length,
-                    node->ast->as.struct_decl.name.start);
+        case HIR_STRUCT_DECL:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_ENUM_DECL:
-            fprintf(out, " name=%.*s", (int)node->ast->as.enum_decl.name.length,
-                    node->ast->as.enum_decl.name.start);
+        case HIR_ENUM_DECL:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_UNION_DECL:
-            fprintf(out, " name=%.*s", (int)node->ast->as.union_decl.name.length,
-                    node->ast->as.union_decl.name.start);
+        case HIR_UNION_DECL:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_MEMBER_ACCESS:
-            fprintf(out, " member=%.*s", (int)node->ast->as.member_access.member.length,
-                    node->ast->as.member_access.member.start);
+        case HIR_MEMBER_ACCESS:
+            fprintf(out, " member=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_ENUM_ACCESS:
-            if (node->ast->as.enum_access.enum_name.length > 0) {
-                fprintf(out, " enum=%.*s", (int)node->ast->as.enum_access.enum_name.length,
-                        node->ast->as.enum_access.enum_name.start);
+        case HIR_ENUM_ACCESS:
+            if (node->token.length > 0) {
+                fprintf(out, " enum=%.*s", (int)node->token.length, node->token.start);
             }
-            fprintf(out, " member=%.*s", (int)node->ast->as.enum_access.member_name.length,
-                    node->ast->as.enum_access.member_name.start);
+            fprintf(out, " member=%.*s", (int)node->token2.length, node->token2.start);
             break;
-        case AST_PATTERN:
-            fprintf(out, " name=%.*s", (int)node->ast->as.pattern.name.length,
-                    node->ast->as.pattern.name.start);
+        case HIR_PATTERN:
+            fprintf(out, " name=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_LITERAL_NUMBER:
-            fprintf(out, " value=%.0f", node->ast->as.number.value);
+        case HIR_LITERAL_NUMBER:
+            fprintf(out, " value=%.0f", node->number_value);
             break;
-        case AST_LITERAL_STRING:
-            fprintf(out, " value=%.*s", (int)node->ast->as.string.value.length,
-                    node->ast->as.string.value.start);
+        case HIR_LITERAL_STRING:
+            fprintf(out, " value=%.*s", (int)node->token.length, node->token.start);
             break;
-        case AST_BINARY_EXPR:
-            fprintf(out, " op=%d", node->ast->as.binary.op);
+        case HIR_BINARY_EXPR:
+            fprintf(out, " op=%d", node->op);
             break;
-        case AST_UNARY_EXPR:
-            fprintf(out, " op=%d", node->ast->as.unary.op);
+        case HIR_UNARY_EXPR:
+            fprintf(out, " op=%d", node->op);
             break;
         default:
             break;
@@ -490,6 +503,18 @@ HIRNode* hir_next_sibling(HIRNode* node) {
     return node ? node->next_sibling : NULL;
 }
 
-ASTNode* hir_source_ast(HIRNode* node) {
-    return node ? node->ast : NULL;
+HIRNode* hir_child_at(HIRNode* node, size_t index) {
+    if (!node) return NULL;
+    HIRNode* child = node->first_child;
+    size_t i = 0;
+    while (child && i < index) {
+        child = child->next_sibling;
+        i++;
+    }
+    return child;
+}
+
+bool hir_is_type_node(HIRNode* node) {
+    if (!node) return false;
+    return node->kind >= HIR_TYPE_BASE && node->kind <= HIR_TYPE_TUPLE;
 }

@@ -19,6 +19,8 @@ typedef struct Module {
     Scope*      top_level_scope;
     bool        is_analyzed;
     ASTNode*    root;
+    HIRModule*  hir;
+    CodegenModuleInfo* codegen;
 } Module;
 
 static Scope*  current_scope = NULL;
@@ -33,6 +35,8 @@ static char    stdlib_dir[PATH_MAX] = "std";
 const char* module_get_name(Module* mod) { return mod->name; }
 const char* module_get_id(Module* mod) { return mod->id; }
 ASTNode* module_get_root(Module* mod) { return mod->root; }
+HIRModule* module_get_hir(Module* mod) { return mod->hir; }
+CodegenModuleInfo* module_get_codegen_info(Module* mod) { return mod->codegen; }
 
 int semantic_get_modules(Module** mods) {
     for (int i = 0; i < module_cache_count; i++) mods[i] = module_cache[i];
@@ -245,6 +249,239 @@ static bool enum_has_member(ASTNode* enum_decl, Token member) {
     return false;
 }
 
+static Token semantic_make_generated_name(const char* prefix, Token suffix) {
+    size_t prefix_len = strlen(prefix);
+    size_t len = prefix_len + suffix.length;
+    char* text = arena_alloc(eval_arena, len + 1);
+    memcpy(text, prefix, prefix_len);
+    memcpy(text + prefix_len, suffix.start, suffix.length);
+    text[len] = '\0';
+    Token token = { TOKEN_IDENTIFIER, text, (int)len, suffix.line };
+    return token;
+}
+
+static Token semantic_make_joined_name(Token left, const char* sep, Token right) {
+    size_t sep_len = strlen(sep);
+    size_t len = left.length + sep_len + right.length;
+    char* text = arena_alloc(eval_arena, len + 1);
+    memcpy(text, left.start, left.length);
+    memcpy(text + left.length, sep, sep_len);
+    memcpy(text + left.length + sep_len, right.start, right.length);
+    text[len] = '\0';
+    Token token = { TOKEN_IDENTIFIER, text, (int)len, left.line };
+    return token;
+}
+
+static bool semantic_is_static_struct_method(ASTNode* method) {
+    return method && method->type == AST_FUNC_DECL &&
+           method->as.func_decl.name.length == 4 &&
+           strncmp(method->as.func_decl.name.start, "open", 4) == 0;
+}
+
+static TypeExpr* codegen_effective_type(TypeExpr* declared_type, TypeExpr* evaluated_type) {
+    if (!declared_type) return evaluated_type;
+    if (declared_type->kind == TYPE_BASE &&
+        declared_type->as.base_type.length == 1 &&
+        declared_type->as.base_type.start[0] == '_') {
+        return evaluated_type;
+    }
+    return declared_type;
+}
+
+static void build_codegen_info(Module* mod) {
+    ASTNode* root = mod->root;
+    CodegenModuleInfo* info = arena_alloc(eval_arena, sizeof(CodegenModuleInfo));
+    memset(info, 0, sizeof(CodegenModuleInfo));
+
+    size_t import_count = 0;
+    size_t enum_count = 0;
+    size_t struct_count = 0;
+    size_t union_count = 0;
+    size_t function_count = 0;
+    size_t global_count = 0;
+    for (size_t i = 0; i < root->as.block.count; i++) {
+        ASTNode* node = root->as.block.statements[i];
+        switch (node->type) {
+            case AST_IMPORT: import_count++; break;
+            case AST_ENUM_DECL: enum_count++; break;
+            case AST_STRUCT_DECL: struct_count++; break;
+            case AST_UNION_DECL: union_count++; break;
+            case AST_FUNC_DECL: function_count++; break;
+            case AST_VAR_DECL: global_count++; break;
+            default: break;
+        }
+    }
+
+    info->imports = import_count ? arena_alloc(eval_arena, sizeof(CodegenImportInfo) * import_count) : NULL;
+    info->enums = enum_count ? arena_alloc(eval_arena, sizeof(CodegenEnumInfo) * enum_count) : NULL;
+    info->structs = struct_count ? arena_alloc(eval_arena, sizeof(CodegenStructInfo) * struct_count) : NULL;
+    info->unions = union_count ? arena_alloc(eval_arena, sizeof(CodegenUnionInfo) * union_count) : NULL;
+    info->functions = function_count ? arena_alloc(eval_arena, sizeof(CodegenFunctionInfo) * function_count) : NULL;
+    info->globals = global_count ? arena_alloc(eval_arena, sizeof(CodegenGlobalInfo) * global_count) : NULL;
+
+    size_t import_index = 0;
+    size_t enum_index = 0;
+    size_t struct_index = 0;
+    size_t union_index = 0;
+    size_t function_index = 0;
+    size_t global_index = 0;
+
+    for (size_t i = 0; i < root->as.block.count; i++) {
+        ASTNode* node = root->as.block.statements[i];
+        if (node->type == AST_IMPORT) {
+            if (node->as.import_decl.resolved_path[0] == '\0') continue;
+            char path[256];
+            strncpy(path, node->as.import_decl.resolved_path, sizeof(path));
+            char* dot_c = strstr(path, ".c");
+            if (dot_c) memcpy(dot_c, ".h", 2);
+            char* base = strrchr(path, '/');
+            snprintf(info->imports[import_index++].header_path, 256, "%s", base ? base + 1 : path);
+            continue;
+        }
+
+        if (node->type == AST_ENUM_DECL) {
+            CodegenEnumInfo* e = &info->enums[enum_index++];
+            e->name = node->as.enum_decl.name;
+            e->base_type = node->as.enum_decl.base_type;
+            e->member_count = node->as.enum_decl.member_count;
+            e->members = arena_alloc(eval_arena, sizeof(CodegenEnumMemberInfo) * e->member_count);
+            int64_t next_value = 0;
+            for (size_t j = 0; j < e->member_count; j++) {
+                e->members[j].name = node->as.enum_decl.member_names[j];
+                ASTNode* value = node->as.enum_decl.member_values[j];
+                if (value && value->type == AST_LITERAL_NUMBER) {
+                    next_value = (int64_t)value->as.number.value;
+                }
+                e->members[j].value = next_value++;
+            }
+            continue;
+        }
+
+        if (node->type == AST_STRUCT_DECL) {
+            CodegenStructInfo* s = &info->structs[struct_index++];
+            memset(s, 0, sizeof(*s));
+            s->name = node->as.struct_decl.name;
+            size_t field_count = 0;
+            size_t method_count = 0;
+            for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
+                ASTNode* member = node->as.struct_decl.members[j];
+                if (member->type == AST_VAR_DECL) field_count++;
+                else if (member->type == AST_FUNC_DECL) method_count++;
+                else if (member->type == AST_INIT_DECL) s->has_init = true;
+            }
+            s->field_count = field_count;
+            s->fields = field_count ? arena_alloc(eval_arena, sizeof(CodegenFieldInfo) * field_count) : NULL;
+            s->method_count = method_count;
+            s->methods = method_count ? arena_alloc(eval_arena, sizeof(CodegenFunctionInfo) * method_count) : NULL;
+
+            size_t field_index = 0;
+            size_t method_index = 0;
+            for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
+                ASTNode* member = node->as.struct_decl.members[j];
+                if (member->type == AST_VAR_DECL) {
+                    s->fields[field_index].name = member->as.var_decl.name;
+                    s->fields[field_index].type = codegen_effective_type(member->as.var_decl.type, member->evaluated_type);
+                    s->fields[field_index].is_public = member->is_public;
+                    field_index++;
+                } else if (member->type == AST_FUNC_DECL) {
+                    CodegenFunctionInfo* f = &s->methods[method_index++];
+                    memset(f, 0, sizeof(*f));
+                    f->name = member->as.func_decl.name;
+                    f->generated_name = semantic_make_joined_name(s->name, "_", member->as.func_decl.name);
+                    f->return_type = member->as.func_decl.return_type;
+                    f->is_public = member->is_public;
+                    f->is_static_method = semantic_is_static_struct_method(member);
+                    f->is_method = true;
+                    f->param_count = member->as.func_decl.param_count;
+                    f->params = f->param_count ? arena_alloc(eval_arena, sizeof(CodegenParamInfo) * f->param_count) : NULL;
+                    for (size_t k = 0; k < f->param_count; k++) {
+                        f->params[k].name = member->as.func_decl.params[k]->as.var_decl.name;
+                        f->params[k].type = codegen_effective_type(member->as.func_decl.params[k]->as.var_decl.type,
+                                                                   member->as.func_decl.params[k]->evaluated_type);
+                    }
+                } else if (member->type == AST_INIT_DECL) {
+                    s->init_param_count = member->as.init_decl.param_count;
+                    s->init_params = s->init_param_count ? arena_alloc(eval_arena, sizeof(CodegenParamInfo) * s->init_param_count) : NULL;
+                    for (size_t k = 0; k < s->init_param_count; k++) {
+                        s->init_params[k].name = member->as.init_decl.params[k]->as.var_decl.name;
+                        s->init_params[k].type = codegen_effective_type(member->as.init_decl.params[k]->as.var_decl.type,
+                                                                        member->as.init_decl.params[k]->evaluated_type);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (node->type == AST_UNION_DECL) {
+            CodegenUnionInfo* u = &info->unions[union_index++];
+            memset(u, 0, sizeof(*u));
+            u->name = node->as.union_decl.name;
+            u->tag_enum = node->as.union_decl.tag_enum;
+            u->variant_count = node->as.union_decl.member_count;
+            u->variants = arena_alloc(eval_arena, sizeof(CodegenUnionVariantInfo) * u->variant_count);
+            for (size_t j = 0; j < u->variant_count; j++) {
+                ASTNode* member = node->as.union_decl.members[j];
+                u->variants[j].name = member->as.var_decl.name;
+                u->variants[j].type = codegen_effective_type(member->as.var_decl.type, member->evaluated_type);
+            }
+            continue;
+        }
+
+        if (node->type == AST_FUNC_DECL) {
+            CodegenFunctionInfo* f = &info->functions[function_index++];
+            memset(f, 0, sizeof(*f));
+            f->name = node->as.func_decl.name;
+            f->generated_name = node->as.func_decl.name;
+            f->return_type = node->as.func_decl.return_type;
+            f->is_public = node->is_public;
+            f->param_count = node->as.func_decl.param_count;
+            f->params = f->param_count ? arena_alloc(eval_arena, sizeof(CodegenParamInfo) * f->param_count) : NULL;
+            for (size_t j = 0; j < f->param_count; j++) {
+                f->params[j].name = node->as.func_decl.params[j]->as.var_decl.name;
+                f->params[j].type = codegen_effective_type(node->as.func_decl.params[j]->as.var_decl.type,
+                                                           node->as.func_decl.params[j]->evaluated_type);
+            }
+            continue;
+        }
+
+        if (node->type == AST_VAR_DECL) {
+            CodegenGlobalInfo* g = &info->globals[global_index++];
+            memset(g, 0, sizeof(*g));
+            g->name = node->as.var_decl.name;
+            g->type = codegen_effective_type(node->as.var_decl.type, node->evaluated_type);
+            g->is_public = node->is_public;
+            ASTNode* init = node->as.var_decl.initializer;
+            if (init && init->type == AST_LITERAL_NUMBER) {
+                if (init->evaluated_type && init->evaluated_type->kind == TYPE_BASE &&
+                    init->evaluated_type->as.base_type.length == 3 &&
+                    strncmp(init->evaluated_type->as.base_type.start, "Int", 3) == 0) {
+                    g->init_kind = CG_GLOBAL_INIT_INT;
+                    g->int_value = (int64_t)init->as.number.value;
+                } else {
+                    g->init_kind = CG_GLOBAL_INIT_FLOAT;
+                    g->float_value = init->as.number.value;
+                }
+            } else if (init && init->type == AST_LITERAL_STRING) {
+                g->init_kind = CG_GLOBAL_INIT_STRING;
+                g->string_value = init->as.string.value;
+            } else if (init && init->type == AST_ENUM_ACCESS) {
+                g->init_kind = CG_GLOBAL_INIT_ENUM;
+                g->enum_name = init->as.enum_access.enum_name;
+                g->enum_member = init->as.enum_access.member_name;
+            }
+            continue;
+        }
+    }
+
+    info->import_count = import_index;
+    info->enum_count = enum_index;
+    info->struct_count = struct_index;
+    info->union_count = union_index;
+    info->function_count = function_index;
+    info->global_count = global_index;
+    mod->codegen = info;
+}
+
 static void register_builtins(void) {
     const char* builtins[] = {"Int", "Float", "Double", "UInt8", "UInt16", "Bool"};
     for (size_t i = 0; i < 6; i++) {
@@ -258,6 +495,10 @@ static void register_builtins(void) {
                   make_slice_type(make_base_type("UInt8")), 0, false);
     symbol_define("__intrinsic_file_exists", 23, SYM_FUNC,
                   make_base_type("Bool"), 0, false);
+    symbol_define("__intrinsic_alloc_ints", 22, SYM_FUNC,
+                  make_slice_type(make_base_type("Int")), 0, false);
+    symbol_define("__intrinsic_alloc_bytes", 23, SYM_FUNC,
+                  make_slice_type(make_base_type("UInt8")), 0, false);
     symbol_define("self", 4, SYM_VAR, NULL, 0, false);
 }
 
@@ -857,6 +1098,8 @@ Module* semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
     Module* mod = malloc(sizeof(Module));
     strncpy(mod->path, path, sizeof(mod->path));
     mod->root = root;
+    mod->hir = NULL;
+    mod->codegen = NULL;
     mod->is_analyzed = false;
     mod->top_level_scope = NULL;
 
@@ -875,6 +1118,10 @@ Module* semantic_check(Arena* arena, ASTNode* root, const char* input_path) {
     scope_push();
     register_builtins();
     check_node(root);
+    if (!had_error) {
+        mod->hir = hir_build_module(root, arena);
+        build_codegen_info(mod);
+    }
     mod->top_level_scope = current_scope;
     current_scope = prev_scope;
     current_module = prev_mod;

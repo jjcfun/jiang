@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
         Module* main_mod = semantic_check(arena, root, input_path);
         if (main_mod) {
             if (dump_hir_only) {
-                HIRModule* hir = hir_build_module(module_get_root(main_mod), arena);
+                HIRModule* hir = module_get_hir(main_mod);
                 hir_dump(stdout, hir);
                 arena_destroy(arena);
                 free(source);
@@ -88,12 +88,13 @@ int main(int argc, char** argv) {
 
             for (int i = 0; i < mod_count; i++) {
                 Module* mod = all_mods[i];
-                HIRModule* hir = hir_build_module(module_get_root(mod), arena);
+                HIRModule* hir = module_get_hir(mod);
                 JirModule* jir = lower_hir_to_jir(hir, arena);
                 if (jir) {
                     char out_path[PATH_MAX];
                     snprintf(out_path, sizeof(out_path), "build/%s_%s.c", module_get_name(mod), module_get_id(mod));
-                    jir_generate_c(jir, module_get_root(mod), out_path, (mod == main_mod), module_get_name(mod), module_get_id(mod));
+                    jir_generate_c(jir, module_get_codegen_info(mod), out_path, (mod == main_mod),
+                                   module_get_name(mod), module_get_id(mod));
                     strncpy(c_files[c_count++], out_path, PATH_MAX);
                 }
             }

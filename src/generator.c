@@ -21,7 +21,7 @@ static bool gen_printed_syms = false;
 static bool gen_is_local = false;
 static int gen_binding_temp_id = 0;
 static JirModule* gen_active_jir_module = NULL;
-static ASTNode* gen_active_ast_root = NULL;
+static CodegenModuleInfo* gen_active_codegen_info = NULL;
 static TypeExpr gen_pattern_fallback_type = {
     .kind = TYPE_BASE,
     .as.base_type = { TOKEN_IDENTIFIER, "Double", 6, 0 }
@@ -189,6 +189,17 @@ static void gen_add_enum(ASTNode* decl) {
     gen_enum_count++;
 }
 
+static void gen_add_enum_info(CodegenEnumInfo* info) {
+    if (!info) return;
+    snprintf(gen_enums[gen_enum_count].name, 64, "%.*s", (int)info->name.length, info->name.start);
+    gen_enums[gen_enum_count].member_count = info->member_count;
+    for (size_t i = 0; i < info->member_count; i++) {
+        snprintf(gen_enums[gen_enum_count].members[i], 64, "%.*s",
+                 (int)info->members[i].name.length, info->members[i].name.start);
+    }
+    gen_enum_count++;
+}
+
 static bool gen_is_enum(Token name) {
     for (size_t i = 0; i < gen_enum_count; i++) {
         if (strncmp(gen_enums[i].name, name.start, name.length) == 0 && gen_enums[i].name[name.length] == '\0') {
@@ -292,25 +303,32 @@ static bool gen_is_void_type(TypeExpr* type) {
                strncmp(type->as.base_type.start, "void", 4) == 0))));
 }
 
-static TypeExpr* gen_lookup_callable_return_type(ASTNode* root, Token name) {
-    if (!root || root->type != AST_BLOCK) return NULL;
-    for (size_t i = 0; i < root->as.block.count; i++) {
-        ASTNode* node = root->as.block.statements[i];
-        if (node->type == AST_FUNC_DECL &&
-            gen_token_eq(node->as.func_decl.name, name)) {
-            return node->as.func_decl.return_type;
+static TypeExpr* gen_lookup_callable_return_type_in_info(CodegenModuleInfo* info, Token name) {
+    if (!info) return NULL;
+    for (size_t i = 0; i < info->function_count; i++) {
+        if (gen_token_eq(info->functions[i].generated_name, name)) return info->functions[i].return_type;
+    }
+    for (size_t i = 0; i < info->struct_count; i++) {
+        CodegenStructInfo* s = &info->structs[i];
+        for (size_t j = 0; j < s->method_count; j++) {
+            if (gen_token_eq(s->methods[j].generated_name, name)) return s->methods[j].return_type;
         }
-        if (node->type != AST_STRUCT_DECL) continue;
-        for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
-            ASTNode* member = node->as.struct_decl.members[j];
-            if (member->type != AST_FUNC_DECL) continue;
-            char generated_name[160];
-            snprintf(generated_name, sizeof(generated_name), "%.*s_%.*s",
-                     (int)node->as.struct_decl.name.length, node->as.struct_decl.name.start,
-                     (int)member->as.func_decl.name.length, member->as.func_decl.name.start);
-            if (strlen(generated_name) == (size_t)name.length &&
-                strncmp(generated_name, name.start, name.length) == 0) {
-                return member->as.func_decl.return_type;
+    }
+    return NULL;
+}
+
+static TypeExpr* gen_lookup_union_ctor_tuple_type_in_info(CodegenModuleInfo* info, Token name) {
+    if (!info) return NULL;
+    for (size_t i = 0; i < info->union_count; i++) {
+        CodegenUnionInfo* u = &info->unions[i];
+        for (size_t j = 0; j < u->variant_count; j++) {
+            char ctor_name[160];
+            snprintf(ctor_name, sizeof(ctor_name), "%.*s_%.*s",
+                     (int)u->name.length, u->name.start,
+                     (int)u->variants[j].name.length, u->variants[j].name.start);
+            if ((size_t)name.length == strlen(ctor_name) &&
+                strncmp(name.start, ctor_name, name.length) == 0) {
+                return u->variants[j].type;
             }
         }
     }
@@ -318,14 +336,26 @@ static TypeExpr* gen_lookup_callable_return_type(ASTNode* root, Token name) {
 }
 
 static TypeExpr* gen_lookup_callable_return_type_any(Token name) {
-    TypeExpr* found = gen_lookup_callable_return_type(gen_active_ast_root, name);
+    TypeExpr* found = gen_lookup_callable_return_type_in_info(gen_active_codegen_info, name);
     if (found) return found;
 
     Module* modules[128];
     int count = semantic_get_modules(modules);
     for (int i = 0; i < count; i++) {
-        ASTNode* root = module_get_root(modules[i]);
-        found = gen_lookup_callable_return_type(root, name);
+        found = gen_lookup_callable_return_type_in_info(module_get_codegen_info(modules[i]), name);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static TypeExpr* gen_lookup_union_ctor_tuple_type_any(Token name) {
+    TypeExpr* found = gen_lookup_union_ctor_tuple_type_in_info(gen_active_codegen_info, name);
+    if (found) return found;
+
+    Module* modules[128];
+    int count = semantic_get_modules(modules);
+    for (int i = 0; i < count; i++) {
+        found = gen_lookup_union_ctor_tuple_type_in_info(module_get_codegen_info(modules[i]), name);
         if (found) return found;
     }
     return NULL;
@@ -351,6 +381,10 @@ static void generate_match_condition(ASTNode* value, ASTNode* pattern, FILE* out
 static void generate_declarations(ASTNode* root, FILE* out, const char* out_path);
 static void generate_implementations(ASTNode* root, FILE* out, bool is_main, bool emit_free_functions, bool emit_main_body);
 static bool gen_should_emit_jir_for_ast_function(ASTNode* node);
+static void gen_collect_tuple_types_from_info(CodegenModuleInfo* info);
+static void generate_declarations_from_info(CodegenModuleInfo* info, FILE* out, const char* out_path);
+static void generate_struct_new_wrappers_from_info(CodegenModuleInfo* info, FILE* out);
+static void generate_global_definitions_from_info(CodegenModuleInfo* info, FILE* out);
 
 static void generate_decl_with_name(TypeExpr* type, const char* name, FILE* out) {
     if (!type || (type->kind == TYPE_BASE && type->as.base_type.length == 1 && type->as.base_type.start[0] == '_')) {
@@ -1671,7 +1705,6 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
     for (size_t i = 0; i < func->local_count; i++) {
         TypeExpr* type = func->locals[i].type;
         if (gen_is_void_type(type)) return false;
-        if (type && type->kind == TYPE_ARRAY) return false;
     }
 
     for (size_t i = 0; i < func->inst_count; i++) {
@@ -1679,6 +1712,7 @@ static bool gen_can_emit_jir_function(JirFunction* func) {
         switch (inst->op) {
             case JIR_OP_CMP_EQ:
             case JIR_OP_CMP_NEQ:
+                break;
             case JIR_OP_CMP_LT:
             case JIR_OP_CMP_GT:
             case JIR_OP_CMP_LTE:
@@ -1707,6 +1741,307 @@ static bool gen_should_emit_jir_for_ast_function(ASTNode* node) {
     char func_name[128];
     snprintf(func_name, sizeof(func_name), "%.*s", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
     return gen_can_emit_jir_function(gen_find_jir_function(gen_active_jir_module, func_name));
+}
+
+static void gen_collect_tuple_types_from_info(CodegenModuleInfo* info) {
+    if (!info) return;
+    for (size_t i = 0; i < info->struct_count; i++) {
+        CodegenStructInfo* s = &info->structs[i];
+        for (size_t j = 0; j < s->field_count; j++) gen_collect_tuple_types_from_type(s->fields[j].type);
+        for (size_t j = 0; j < s->method_count; j++) {
+            gen_collect_tuple_types_from_type(s->methods[j].return_type);
+            for (size_t k = 0; k < s->methods[j].param_count; k++) gen_collect_tuple_types_from_type(s->methods[j].params[k].type);
+        }
+        for (size_t j = 0; j < s->init_param_count; j++) gen_collect_tuple_types_from_type(s->init_params[j].type);
+    }
+    for (size_t i = 0; i < info->union_count; i++) {
+        CodegenUnionInfo* u = &info->unions[i];
+        for (size_t j = 0; j < u->variant_count; j++) {
+            gen_collect_tuple_types_from_type(u->variants[j].type);
+            if (u->variants[j].type && u->variants[j].type->kind == TYPE_TUPLE) {
+                char u_name[64], v_name[64];
+                snprintf(u_name, sizeof(u_name), "%.*s", (int)u->name.length, u->name.start);
+                snprintf(v_name, sizeof(v_name), "%.*s", (int)u->variants[j].name.length, u->variants[j].name.start);
+                gen_add_tuple_variant(u_name, v_name);
+                gen_set_tuple_variant_fields(u_name, v_name, u->variants[j].type);
+            }
+        }
+    }
+    for (size_t i = 0; i < info->function_count; i++) {
+        gen_collect_tuple_types_from_type(info->functions[i].return_type);
+        for (size_t j = 0; j < info->functions[i].param_count; j++) gen_collect_tuple_types_from_type(info->functions[i].params[j].type);
+    }
+    for (size_t i = 0; i < info->global_count; i++) gen_collect_tuple_types_from_type(info->globals[i].type);
+}
+
+static void generate_declarations_from_info(CodegenModuleInfo* info, FILE* out, const char* out_path) {
+    char guard[512];
+    snprintf(guard, sizeof(guard), "JIANG_GEN_");
+    for (size_t i = 0; out_path[i] != '\0'; i++) {
+        char c = out_path[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) guard[10 + i] = (c >= 'a' && c <= 'z') ? (c - 'a' + 'A') : c;
+        else guard[10 + i] = '_';
+        guard[11 + i] = '\0';
+    }
+    fprintf(out, "#ifndef %s\n#define %s\n\n", guard, guard);
+    fprintf(out, "#include \"runtime.h\"\n\n");
+
+    for (size_t i = 0; i < info->import_count; i++) {
+        fprintf(out, "#include \"%s\"\n", info->imports[i].header_path);
+    }
+    if (info->import_count > 0) fprintf(out, "\n");
+
+    for (size_t i = 0; i < gen_tuple_type_count; i++) {
+        TypeExpr* type = gen_tuple_types[i].type;
+        fprintf(out, "typedef struct { ");
+        for (size_t j = 0; j < type->as.tuple.count; j++) {
+            generate_type(type->as.tuple.elements[j], out);
+            if (type->as.tuple.names && type->as.tuple.names[j].length > 0) {
+                fprintf(out, " %.*s; ", (int)type->as.tuple.names[j].length, type->as.tuple.names[j].start);
+            } else {
+                fprintf(out, " _%zu; ", j);
+            }
+        }
+        fprintf(out, "} %s;\n", gen_tuple_types[i].name);
+    }
+    if (gen_tuple_type_count > 0) fprintf(out, "\n");
+
+    for (size_t i = 0; i < info->enum_count; i++) {
+        CodegenEnumInfo* e = &info->enums[i];
+        gen_add_enum_info(e);
+        fprintf(out, "typedef enum {\n");
+        for (size_t j = 0; j < e->member_count; j++) {
+            fprintf(out, "    %.*s_%.*s = %lld",
+                    (int)e->name.length, e->name.start,
+                    (int)e->members[j].name.length, e->members[j].name.start,
+                    (long long)e->members[j].value);
+            if (j + 1 < e->member_count) fprintf(out, ",\n");
+        }
+        fprintf(out, "\n} %.*s;\n\n", (int)e->name.length, e->name.start);
+    }
+
+    for (size_t i = 0; i < info->struct_count; i++) {
+        CodegenStructInfo* s = &info->structs[i];
+        gen_add_struct(s->name);
+        fprintf(out, "typedef struct { ");
+        for (size_t j = 0; j < s->field_count; j++) {
+            generate_type(s->fields[j].type, out);
+            fprintf(out, " %.*s; ", (int)s->fields[j].name.length, s->fields[j].name.start);
+        }
+        fprintf(out, "} %.*s;\n", (int)s->name.length, s->name.start);
+
+        if (s->has_init) {
+            fprintf(out, "%.*s %.*s_new(", (int)s->name.length, s->name.start, (int)s->name.length, s->name.start);
+            for (size_t j = 0; j < s->init_param_count; j++) {
+                generate_type(s->init_params[j].type, out);
+                fprintf(out, " %.*s", (int)s->init_params[j].name.length, s->init_params[j].name.start);
+                if (j + 1 < s->init_param_count) fprintf(out, ", ");
+            }
+            fprintf(out, ");\n");
+        }
+
+        for (size_t j = 0; j < s->method_count; j++) {
+            CodegenFunctionInfo* m = &s->methods[j];
+            if (!m->is_public) continue;
+            generate_type(m->return_type, out);
+            fprintf(out, " %.*s(", (int)m->generated_name.length, m->generated_name.start);
+            if (!m->is_static_method) {
+                fprintf(out, "%.*s* self", (int)s->name.length, s->name.start);
+                if (m->param_count > 0) fprintf(out, ", ");
+            }
+            for (size_t k = 0; k < m->param_count; k++) {
+                generate_type(m->params[k].type, out);
+                fprintf(out, " %.*s", (int)m->params[k].name.length, m->params[k].name.start);
+                if (k + 1 < m->param_count) fprintf(out, ", ");
+            }
+            fprintf(out, ");\n");
+        }
+        fprintf(out, "\n");
+    }
+
+    for (size_t i = 0; i < info->union_count; i++) {
+        CodegenUnionInfo* u = &info->unions[i];
+        gen_add_struct(u->name);
+        gen_add_union(u->name, u->tag_enum);
+
+        if (u->tag_enum.length == 0) {
+            fprintf(out, "typedef enum {\n");
+            for (size_t j = 0; j < u->variant_count; j++) {
+                fprintf(out, "    %.*sTag_%.*s", (int)u->name.length, u->name.start,
+                        (int)u->variants[j].name.length, u->variants[j].name.start);
+                if (j + 1 < u->variant_count) fprintf(out, ",\n");
+            }
+            fprintf(out, "\n} %.*sTag;\n", (int)u->name.length, u->name.start);
+        }
+
+        for (size_t j = 0; j < u->variant_count; j++) {
+            if (u->variants[j].type && u->variants[j].type->kind == TYPE_TUPLE) {
+                fprintf(out, "typedef ");
+                generate_type(u->variants[j].type, out);
+                fprintf(out, " %.*s_%.*s_t;\n",
+                        (int)u->name.length, u->name.start,
+                        (int)u->variants[j].name.length, u->variants[j].name.start);
+            }
+        }
+
+        fprintf(out, "typedef struct { ");
+        if (u->tag_enum.length > 0) fprintf(out, "%.*s", (int)u->tag_enum.length, u->tag_enum.start);
+        else fprintf(out, "int");
+        fprintf(out, " kind; union { ");
+        for (size_t j = 0; j < u->variant_count; j++) {
+            TypeExpr* t = u->variants[j].type;
+            bool is_void = t && t->kind == TYPE_BASE && t->as.base_type.length == 2 &&
+                           strncmp(t->as.base_type.start, "()", 2) == 0;
+            if (t && t->kind == TYPE_TUPLE) {
+                fprintf(out, "%.*s_%.*s_t %.*s; ",
+                        (int)u->name.length, u->name.start,
+                        (int)u->variants[j].name.length, u->variants[j].name.start,
+                        (int)u->variants[j].name.length, u->variants[j].name.start);
+            } else if (!is_void) {
+                generate_type(t, out);
+                fprintf(out, " %.*s; ", (int)u->variants[j].name.length, u->variants[j].name.start);
+            }
+        }
+        fprintf(out, "}; } %.*s;\n", (int)u->name.length, u->name.start);
+
+        for (size_t j = 0; j < u->variant_count; j++) {
+            TypeExpr* t = u->variants[j].type;
+            bool is_void = t && t->kind == TYPE_BASE && t->as.base_type.length == 2 &&
+                           strncmp(t->as.base_type.start, "()", 2) == 0;
+            fprintf(out, "static inline %.*s %.*s_%.*s(",
+                    (int)u->name.length, u->name.start,
+                    (int)u->name.length, u->name.start,
+                    (int)u->variants[j].name.length, u->variants[j].name.start);
+            if (t && t->kind == TYPE_TUPLE) {
+                for (size_t k = 0; k < t->as.tuple.count; k++) {
+                    generate_type(t->as.tuple.elements[k], out);
+                    if (t->as.tuple.names && t->as.tuple.names[k].length > 0) {
+                        fprintf(out, " %.*s",
+                                (int)t->as.tuple.names[k].length, t->as.tuple.names[k].start);
+                    } else {
+                        fprintf(out, " arg%zu", k);
+                    }
+                    if (k + 1 < t->as.tuple.count) fprintf(out, ", ");
+                }
+            } else if (!is_void) {
+                generate_type(t, out);
+                fprintf(out, " val");
+            }
+            fprintf(out, ") { %.*s _u; ", (int)u->name.length, u->name.start);
+            if (u->tag_enum.length > 0) {
+                fprintf(out, "_u.kind = %.*s_%.*s; ",
+                        (int)u->tag_enum.length, u->tag_enum.start,
+                        (int)u->variants[j].name.length, u->variants[j].name.start);
+            } else {
+                fprintf(out, "_u.kind = %.*sTag_%.*s; ",
+                        (int)u->name.length, u->name.start,
+                        (int)u->variants[j].name.length, u->variants[j].name.start);
+            }
+            if (!is_void) {
+                fprintf(out, "_u.%.*s = ", (int)u->variants[j].name.length, u->variants[j].name.start);
+                if (t && t->kind == TYPE_TUPLE) {
+                    fprintf(out, "(%.*s_%.*s_t){",
+                            (int)u->name.length, u->name.start,
+                            (int)u->variants[j].name.length, u->variants[j].name.start);
+                    for (size_t k = 0; k < t->as.tuple.count; k++) {
+                        if (t->as.tuple.names && t->as.tuple.names[k].length > 0) {
+                            fprintf(out, "%.*s",
+                                    (int)t->as.tuple.names[k].length, t->as.tuple.names[k].start);
+                        } else {
+                            fprintf(out, "arg%zu", k);
+                        }
+                        if (k + 1 < t->as.tuple.count) fprintf(out, ", ");
+                    }
+                    fprintf(out, "}; ");
+                } else {
+                    fprintf(out, "val; ");
+                }
+            }
+            fprintf(out, "return _u; }\n");
+        }
+        fprintf(out, "\n");
+    }
+
+    for (size_t i = 0; i < info->function_count; i++) {
+        generate_type(info->functions[i].return_type, out);
+        fprintf(out, " %.*s(", (int)info->functions[i].generated_name.length, info->functions[i].generated_name.start);
+        for (size_t j = 0; j < info->functions[i].param_count; j++) {
+            generate_type(info->functions[i].params[j].type, out);
+            fprintf(out, " %.*s", (int)info->functions[i].params[j].name.length, info->functions[i].params[j].name.start);
+            if (j + 1 < info->functions[i].param_count) fprintf(out, ", ");
+        }
+        fprintf(out, ");\n");
+    }
+    if (info->function_count > 0) fprintf(out, "\n");
+
+    for (size_t i = 0; i < info->global_count; i++) {
+        fprintf(out, "extern ");
+        generate_type(info->globals[i].type, out);
+        fprintf(out, " %.*s", (int)info->globals[i].name.length, info->globals[i].name.start);
+        fprintf(out, ";\n");
+    }
+
+    fprintf(out, "\n#endif\n");
+}
+
+static void generate_struct_new_wrappers_from_info(CodegenModuleInfo* info, FILE* out) {
+    if (!info) return;
+    for (size_t i = 0; i < info->struct_count; i++) {
+        CodegenStructInfo* s = &info->structs[i];
+        if (!s->has_init) continue;
+        fprintf(out, "%.*s %.*s_new(", (int)s->name.length, s->name.start, (int)s->name.length, s->name.start);
+        for (size_t j = 0; j < s->init_param_count; j++) {
+            generate_type(s->init_params[j].type, out);
+            fprintf(out, " %.*s", (int)s->init_params[j].name.length, s->init_params[j].name.start);
+            if (j + 1 < s->init_param_count) fprintf(out, ", ");
+        }
+        fprintf(out, ") {\n    %.*s self;\n    %.*s_init(&self",
+                (int)s->name.length, s->name.start, (int)s->name.length, s->name.start);
+        for (size_t j = 0; j < s->init_param_count; j++) {
+            fprintf(out, ", %.*s", (int)s->init_params[j].name.length, s->init_params[j].name.start);
+        }
+        fprintf(out, ");\n    return self;\n}\n\n");
+    }
+}
+
+static void generate_global_definitions_from_info(CodegenModuleInfo* info, FILE* out) {
+    if (!info) return;
+    for (size_t i = 0; i < info->global_count; i++) {
+        CodegenGlobalInfo* g = &info->globals[i];
+        generate_type(g->type, out);
+        fprintf(out, " %.*s", (int)g->name.length, g->name.start);
+        if (g->type && g->type->kind == TYPE_ARRAY) {
+            fprintf(out, "[");
+            if (g->type->as.array.length) generate_node(g->type->as.array.length, out);
+            fprintf(out, "]");
+        }
+        switch (g->init_kind) {
+            case CG_GLOBAL_INIT_INT:
+                fprintf(out, " = %lld", (long long)g->int_value);
+                break;
+            case CG_GLOBAL_INIT_FLOAT:
+                fprintf(out, " = %g", g->float_value);
+                break;
+            case CG_GLOBAL_INIT_STRING:
+                fprintf(out, " = (Slice_uint8_t){(uint8_t*)\"%.*s\", %d}",
+                        (int)g->string_value.length, g->string_value.start, g->string_value.length);
+                break;
+            case CG_GLOBAL_INIT_ENUM:
+                fprintf(out, " = ");
+                if (g->enum_name.length > 0) {
+                    fprintf(out, "%.*s_", (int)g->enum_name.length, g->enum_name.start);
+                } else if (g->type && g->type->kind == TYPE_BASE) {
+                    fprintf(out, "%.*s_", (int)g->type->as.base_type.length, g->type->as.base_type.start);
+                }
+                fprintf(out, "%.*s", (int)g->enum_member.length, g->enum_member.start);
+                break;
+            case CG_GLOBAL_INIT_NONE:
+            default:
+                break;
+        }
+        fprintf(out, ";\n");
+    }
+    if (info->global_count > 0) fprintf(out, "\n");
 }
 
 static void gen_emit_jir_reg(FILE* out, JirFunction* func, int reg) {
@@ -1770,6 +2105,10 @@ static void gen_emit_jir_member_access(FILE* out, JirFunction* func, JirInst* in
     fprintf(out, "]");
 }
 
+static bool gen_is_array_type(TypeExpr* type) {
+    return type && type->kind == TYPE_ARRAY;
+}
+
 static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
     if (!func) return;
 
@@ -1820,9 +2159,18 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 fprintf(out, ";\n");
                 break;
             case JIR_OP_STORE:
-                fprintf(out, "    %s = ", func->locals[inst->dest].name);
-                gen_emit_jir_reg(out, func, inst->src1);
-                fprintf(out, ";\n");
+                if (inst->dest >= 0 && (size_t)inst->dest < func->local_count &&
+                    gen_is_array_type(func->locals[inst->dest].type) &&
+                    inst->src1 >= 0 && (size_t)inst->src1 < func->local_count &&
+                    gen_is_array_type(func->locals[inst->src1].type)) {
+                    fprintf(out, "    memcpy(%s, ", func->locals[inst->dest].name);
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ", sizeof(%s));\n", func->locals[inst->dest].name);
+                } else {
+                    fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ";\n");
+                }
                 break;
             case JIR_OP_STORE_SYM:
                 fprintf(out, "    %.*s = ", (int)inst->payload.name.length, inst->payload.name.start);
@@ -1830,11 +2178,20 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 fprintf(out, ";\n");
                 break;
             case JIR_OP_STORE_PTR:
-                fprintf(out, "    *");
-                gen_emit_jir_reg(out, func, inst->dest);
-                fprintf(out, " = ");
-                gen_emit_jir_reg(out, func, inst->src1);
-                fprintf(out, ";\n");
+                if (inst->src1 >= 0 && (size_t)inst->src1 < func->local_count &&
+                    gen_is_array_type(func->locals[inst->src1].type)) {
+                    fprintf(out, "    memcpy(");
+                    gen_emit_jir_reg(out, func, inst->dest);
+                    fprintf(out, ", ");
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ", sizeof(%s));\n", func->locals[inst->src1].name);
+                } else {
+                    fprintf(out, "    *");
+                    gen_emit_jir_reg(out, func, inst->dest);
+                    fprintf(out, " = ");
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ";\n");
+                }
                 break;
             case JIR_OP_STORE_MEMBER:
                 fprintf(out, "    ");
@@ -1844,6 +2201,8 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                     bool is_ptr = dest_type && dest_type->kind == TYPE_POINTER;
                     fprintf(out, "%s%.*s", is_ptr ? "->" : ".", (int)inst->payload.name.length, inst->payload.name.start);
                 } else {
+                    TypeExpr* dest_type = (inst->dest >= 0 && (size_t)inst->dest < func->local_count) ? func->locals[inst->dest].type : NULL;
+                    if (dest_type && dest_type->kind == TYPE_SLICE) fprintf(out, ".ptr");
                     fprintf(out, "[");
                     gen_emit_jir_reg(out, func, inst->src2);
                     fprintf(out, "]");
@@ -1862,6 +2221,7 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
             case JIR_OP_CMP_GT:
             case JIR_OP_CMP_LTE:
             case JIR_OP_CMP_GTE: {
+                TypeExpr* lhs_type = (inst->src1 >= 0 && (size_t)inst->src1 < func->local_count) ? func->locals[inst->src1].type : NULL;
                 const char* op = "+";
                 switch (inst->op) {
                     case JIR_OP_SUB: op = "-"; break;
@@ -1876,9 +2236,20 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                     default: break;
                 }
                 fprintf(out, "    %s = ", func->locals[inst->dest].name);
-                gen_emit_jir_reg(out, func, inst->src1);
-                fprintf(out, " %s ", op);
-                gen_emit_jir_reg(out, func, inst->src2);
+                if ((inst->op == JIR_OP_CMP_EQ || inst->op == JIR_OP_CMP_NEQ) &&
+                    lhs_type && !gen_is_scalar_like_type(lhs_type)) {
+                    fprintf(out, "(memcmp(&");
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ", &");
+                    gen_emit_jir_reg(out, func, inst->src2);
+                    fprintf(out, ", sizeof(");
+                    generate_type(lhs_type, out);
+                    fprintf(out, ")) %s 0)", inst->op == JIR_OP_CMP_EQ ? "==" : "!=");
+                } else {
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, " %s ", op);
+                    gen_emit_jir_reg(out, func, inst->src2);
+                }
                 fprintf(out, ";\n");
                 break;
             }
@@ -1922,9 +2293,28 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                     fprintf(out, " ) ? 0 : (fprintf(stderr, \"Assertion failed in JIR\\n\"), exit(1))));\n");
                 } else {
                     fprintf(out, "%.*s(", (int)inst->payload.name.length, inst->payload.name.start);
-                    for (size_t j = 0; j < inst->call_arg_count; j++) {
-                        gen_emit_jir_reg(out, func, inst->call_args[j]);
-                        if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                    TypeExpr* ctor_tuple_type = gen_lookup_union_ctor_tuple_type_any(inst->payload.name);
+                    bool expanded_tuple_args = false;
+                    if (ctor_tuple_type && ctor_tuple_type->kind == TYPE_TUPLE &&
+                        inst->call_arg_count == 1 &&
+                        inst->call_args[0] >= 0 &&
+                        (size_t)inst->call_args[0] < func->local_count &&
+                        func->locals[inst->call_args[0]].type &&
+                        func->locals[inst->call_args[0]].type->kind == TYPE_TUPLE) {
+                        expanded_tuple_args = true;
+                        for (size_t j = 0; j < ctor_tuple_type->as.tuple.count; j++) {
+                            generate_tuple_field_ref(out,
+                                                     func->locals[inst->call_args[0]].name,
+                                                     func->locals[inst->call_args[0]].type,
+                                                     j);
+                            if (j + 1 < ctor_tuple_type->as.tuple.count) fprintf(out, ", ");
+                        }
+                    }
+                    if (!expanded_tuple_args) {
+                        for (size_t j = 0; j < inst->call_arg_count; j++) {
+                            gen_emit_jir_reg(out, func, inst->call_args[j]);
+                            if (j + 1 < inst->call_arg_count) fprintf(out, ", ");
+                        }
                     }
                     fprintf(out, ");\n");
                 }
@@ -1941,8 +2331,31 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 break;
             case JIR_OP_MALLOC:
                 fprintf(out, "    %s = malloc(sizeof(", func->locals[inst->dest].name);
+                if (i + 1 < func->inst_count &&
+                    func->insts[i + 1].op == JIR_OP_STORE_PTR &&
+                    func->insts[i + 1].dest == inst->dest &&
+                    func->insts[i + 1].src1 >= 0 &&
+                    (size_t)func->insts[i + 1].src1 < func->local_count &&
+                    gen_is_array_type(func->locals[func->insts[i + 1].src1].type)) {
+                    TypeExpr* array_type = func->locals[func->insts[i + 1].src1].type;
+                    generate_type(array_type->as.array.element, out);
+                    fprintf(out, ") * ");
+                    if (array_type->as.array.length) generate_node(array_type->as.array.length, out);
+                    else fprintf(out, "1");
+                    fprintf(out, ");\n");
+                    break;
+                }
                 if (func->locals[inst->dest].type && func->locals[inst->dest].type->kind == TYPE_POINTER) {
-                    generate_type(func->locals[inst->dest].type->as.pointer.element, out);
+                    TypeExpr* pointee = func->locals[inst->dest].type->as.pointer.element;
+                    if (pointee && pointee->kind == TYPE_ARRAY) {
+                        generate_type(pointee->as.array.element, out);
+                        fprintf(out, ") * ");
+                        if (pointee->as.array.length) generate_node(pointee->as.array.length, out);
+                        else fprintf(out, "1");
+                        fprintf(out, ");\n");
+                        break;
+                    }
+                    generate_type(pointee, out);
                 } else {
                     fprintf(out, "char");
                 }
@@ -1954,9 +2367,16 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 fprintf(out, ";\n");
                 break;
             case JIR_OP_ARRAY_INIT:
-                fprintf(out, "    %s = ", func->locals[inst->dest].name);
-                gen_emit_jir_aggregate(out, func, inst);
-                fprintf(out, ";\n");
+                if (inst->dest >= 0 && (size_t)inst->dest < func->local_count &&
+                    gen_is_array_type(func->locals[inst->dest].type)) {
+                    fprintf(out, "    memcpy(%s, ", func->locals[inst->dest].name);
+                    gen_emit_jir_aggregate(out, func, inst);
+                    fprintf(out, ", sizeof(%s));\n", func->locals[inst->dest].name);
+                } else {
+                    fprintf(out, "    %s = ", func->locals[inst->dest].name);
+                    gen_emit_jir_aggregate(out, func, inst);
+                    fprintf(out, ";\n");
+                }
                 break;
             case JIR_OP_STRUCT_INIT:
                 fprintf(out, "    %s = (", func->locals[inst->dest].name);
@@ -1980,6 +2400,37 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 gen_emit_jir_member_access(out, func, inst);
                 fprintf(out, ";\n");
                 break;
+            case JIR_OP_MAKE_SLICE: {
+                TypeExpr* obj_type = (inst->src1 >= 0 && (size_t)inst->src1 < func->local_count) ? func->locals[inst->src1].type : NULL;
+                fprintf(out, "    %s = (", func->locals[inst->dest].name);
+                generate_type(func->locals[inst->dest].type, out);
+                fprintf(out, "){");
+                if (obj_type && obj_type->kind == TYPE_ARRAY) {
+                    gen_emit_jir_reg(out, func, inst->src1);
+                } else {
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ".ptr");
+                }
+                if (inst->src2 >= 0) {
+                    fprintf(out, " + ");
+                    gen_emit_jir_reg(out, func, inst->src2);
+                }
+                fprintf(out, ", ");
+                if (inst->call_arg_count > 0) {
+                    gen_emit_jir_reg(out, func, inst->call_args[0]);
+                } else if (obj_type && obj_type->kind == TYPE_ARRAY && obj_type->as.array.length) {
+                    generate_node(obj_type->as.array.length, out);
+                } else {
+                    gen_emit_jir_reg(out, func, inst->src1);
+                    fprintf(out, ".length");
+                }
+                if (inst->src2 >= 0) {
+                    fprintf(out, " - ");
+                    gen_emit_jir_reg(out, func, inst->src2);
+                }
+                fprintf(out, "};\n");
+                break;
+            }
             case JIR_OP_GET_TAG:
                 fprintf(out, "    %s = ", func->locals[inst->dest].name);
                 gen_emit_jir_reg(out, func, inst->src1);
@@ -2007,7 +2458,7 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
     fprintf(out, "}\n\n");
 }
 
-void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_path, bool is_main) {
+void generate_c_code_from_jir(JirModule* mod, CodegenModuleInfo* info, const char* out_path, bool is_main) {
     gen_sym_count = 0;
     gen_enum_count = 0;
     gen_struct_count = 0;
@@ -2020,8 +2471,8 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
     current_struct_context = NULL;
     current_struct_field_count = 0;
     gen_active_jir_module = mod;
-    gen_active_ast_root = root;
-    gen_collect_tuple_types_from_node(root);
+    gen_active_codegen_info = info;
+    gen_collect_tuple_types_from_info(info);
 
     char h_path[PATH_MAX];
     strncpy(h_path, out_path, PATH_MAX);
@@ -2031,7 +2482,7 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
 
     FILE* h_out = fopen(h_path, "w");
     if (h_out) {
-        generate_declarations(root, h_out, h_path);
+        generate_declarations_from_info(info, h_out, h_path);
         fclose(h_out);
     }
 
@@ -2043,17 +2494,21 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
     fprintf(c_out, "#include \"%s\"\n\n", header_filename);
 
     JirFunction* main_func = is_main ? gen_find_jir_function(mod, "module_main") : NULL;
-    bool emit_main_from_jir = is_main && gen_can_emit_jir_function(main_func);
+    bool emit_main_from_jir = is_main && main_func != NULL;
 
-    generate_implementations(root, c_out, is_main, true, !emit_main_from_jir);
+    if (!is_main) {
+        generate_global_definitions_from_info(info, c_out);
+    }
 
-    for (size_t i = 0; i < root->as.block.count; i++) {
-        ASTNode* node = root->as.block.statements[i];
-        if (node->type != AST_FUNC_DECL) continue;
-        char func_name[128];
-        snprintf(func_name, sizeof(func_name), "%.*s", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
-        JirFunction* func = gen_find_jir_function(mod, func_name);
-        if (gen_can_emit_jir_function(func)) gen_emit_jir_function(c_out, func, false);
+    for (size_t i = 0; i < mod->function_count; i++) {
+        JirFunction* func = mod->functions[i];
+        if (!func || func == main_func) continue;
+        if (func->name.length == 11 && strncmp(func->name.start, "module_main", 11) == 0) continue;
+        gen_emit_jir_function(c_out, func, false);
+    }
+
+    if (info) {
+        generate_struct_new_wrappers_from_info(info, c_out);
     }
 
     if (emit_main_from_jir) {
@@ -2062,6 +2517,6 @@ void generate_c_code_from_jir(JirModule* mod, ASTNode* root, const char* out_pat
 
     fclose(c_out);
     gen_active_jir_module = NULL;
-    gen_active_ast_root = NULL;
+    gen_active_codegen_info = NULL;
     printf("Successfully generated C/H code from JIR at: %s\n", out_path);
 }

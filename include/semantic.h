@@ -3,6 +3,8 @@
 
 #include <stdbool.h>
 #include "ast.h"
+#include "hir.h"
+#include "codegen_info.h"
 
 // Forward declaration of Module structure (defined internally in semantic.c)
 typedef struct Module Module;
@@ -18,6 +20,8 @@ void semantic_set_stdlib_dir(const char* path);
 const char* module_get_name(Module* mod);
 const char* module_get_id(Module* mod);
 ASTNode* module_get_root(Module* mod);
+HIRModule* module_get_hir(Module* mod);
+CodegenModuleInfo* module_get_codegen_info(Module* mod);
 
 // Get all modules discovered during analysis (for mass code generation)
 int semantic_get_modules(Module** mods);

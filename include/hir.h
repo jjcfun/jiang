@@ -59,8 +59,15 @@ struct HIRNode {
     bool is_public;
     TypeExpr* evaluated_type;
     Symbol* symbol;
-    ASTNode* ast;
     TypeExpr* type_expr;
+    TypeExpr* declared_type;
+    Token token;
+    Token token2;
+    TokenType op;
+    double number_value;
+    Token* tokens;
+    size_t token_count;
+    size_t child_count;
     HIRNode* first_child;
     HIRNode* last_child;
     HIRNode* next_sibling;
@@ -78,6 +85,7 @@ const char* hir_kind_name(HIRKind kind);
 HIRNode* hir_root(HIRModule* module);
 HIRNode* hir_first_child(HIRNode* node);
 HIRNode* hir_next_sibling(HIRNode* node);
-ASTNode* hir_source_ast(HIRNode* node);
+HIRNode* hir_child_at(HIRNode* node, size_t index);
+bool hir_is_type_node(HIRNode* node);
 
 #endif
