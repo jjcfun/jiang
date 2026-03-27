@@ -149,6 +149,39 @@ make
 
 当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行全部测试用例；以仓库当前版本为准，测试集已全部通过。
 
+### Stage1 Runtime 边界（当前冻结）
+
+build system 收口之后，Stage1 当前主线不再直接切 LLVM，也不直接进入 Stage2，而是先固定 runtime 与标准库边界。
+
+当前对普通 Jiang 项目公开的最小标准库表面只有：
+
+- `std.io`
+- `std.debug`
+- `std.fs`
+
+其中：
+
+- `std.io` 负责最小输出能力
+- `std.debug` 负责断言与调试辅助
+- `std.fs` 负责文件存在性、读文件与少量路径辅助
+
+当前 Stage1 宿主 runtime ABI 只冻结为下面这 6 个 intrinsic：
+
+- `__intrinsic_print`
+- `__intrinsic_assert`
+- `__intrinsic_read_file`
+- `__intrinsic_file_exists`
+- `__intrinsic_alloc_ints`
+- `__intrinsic_alloc_bytes`
+
+这些 intrinsic 主要供标准库实现、bootstrap 编译器内部基础设施和编译器生成的过渡 glue 使用，不作为普通 Jiang 项目的推荐 public surface。面向用户的代码应优先使用 `std.*`。
+
+当前并不追求完全移除 libc；现阶段只要求把 libc 依赖集中在宿主 C 层，主要集中在 `include/runtime.h` 与编译器宿主实现内部。当前已经固定的 libc 接触点包括：
+
+- 文件读取：`fopen` / `fread` / `fclose`
+- 内存分配：`malloc` / `calloc` / `free`
+- 文本与打印：宿主 `printf` 路径及等价能力
+
 ### 最小 Build System（实验中）
 
 当前已经加入第一版实验性 project manifest 与子命令入口：

@@ -120,6 +120,10 @@ static bool token_eq_cstr(Token tok, const char* text) {
     return tok.length == len && strncmp(tok.start, text, len) == 0;
 }
 
+static bool is_compat_builtin_name(const char* name) {
+    return strcmp(name, "print") == 0 || strcmp(name, "assert") == 0;
+}
+
 static bool same_base_name(TypeExpr* type, const char* name) {
     type = unwrap_type(type);
     return type && type->kind == TYPE_BASE && strlen(name) == type->as.base_type.length &&
@@ -159,6 +163,9 @@ static Symbol* symbol_define(const char* name, size_t name_len,
                              SymbolKind kind, TypeExpr* type, int line, bool is_public) {
     for (Symbol* it = current_scope->symbols; it; it = it->next) {
         if (strlen(it->name) == name_len && strncmp(it->name, name, name_len) == 0) {
+            if (it->defined_line == 0 && is_compat_builtin_name(it->name)) {
+                break;
+            }
             semantic_error(line, "Redefinition of '%.*s'", (int)name_len, name);
             return it;
         }
@@ -490,6 +497,11 @@ static void register_builtins(void) {
     for (size_t i = 0; i < 6; i++) {
         symbol_define(builtins[i], strlen(builtins[i]), SYM_STRUCT, make_base_type(builtins[i]), 0, false);
     }
+
+    // Stage1 runtime ABI is intentionally frozen to a very small host surface.
+    // Only these __intrinsic_* symbols are treated as host runtime entrypoints.
+    // Bare print/assert remain as Stage0 syntax compatibility shims for tests
+    // and older samples; they are not the public std API surface.
     symbol_define("print", 5, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("__intrinsic_print", 17, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("__intrinsic_assert", 18, SYM_FUNC, make_base_type("void"), 0, false);
@@ -607,6 +619,10 @@ static void import_public_symbols(Module* imported_mod, int line) {
     if (!imported_mod || !imported_mod->top_level_scope) return;
     for (Symbol* sym = imported_mod->top_level_scope->symbols; sym; sym = sym->next) {
         if (!sym->is_public) continue;
+        if (is_compat_builtin_name(sym->name)) {
+            Token existing_name = {.start = sym->name, .length = (int)strlen(sym->name)};
+            if (current_scope_lookup(existing_name)) continue;
+        }
         Symbol* imported = symbol_define(sym->name, strlen(sym->name), sym->kind, sym->type, line, true);
         imported->module_owner = imported_mod;
     }

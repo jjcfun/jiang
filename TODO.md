@@ -21,6 +21,7 @@
 - [ ] 不在 build system 缺席的前提下大幅扩张标准库与包管理能力。
 
 相关执行计划见 `doc/plan_build_system.md`。
+当前阶段的下一份执行计划见 `doc/plan_runtime_boundary.md`。
 
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
@@ -120,6 +121,13 @@
 - [x] **实现统一构建入口**: 当前已提供 `jiang build` / `jiang run` / `jiang test` 与 `--manifest` / `--target`。
 - [x] **接入现有 Stage1 编译链**: 当前 build system 已能驱动 `bootstrap/jiang.build` 下的稳定 `lexer` 入口。
 - [x] **补 build system 回归测试**: 当前已覆盖默认 target、额外 target、命名模块、错误路径与 bootstrap smoke。
+
+### 0.1 Stage1 后续主线：标准库与 Runtime 分层
+- [x] **冻结 Stage1 runtime ABI**: 当前宿主 ABI 固定为 `__intrinsic_print`、`__intrinsic_assert`、`__intrinsic_read_file`、`__intrinsic_file_exists`、`__intrinsic_alloc_ints`、`__intrinsic_alloc_bytes`。
+- [x] **固定最小标准库表面**: 当前对外继续收口为 `std.io`、`std.debug`、`std.fs`，`std/std.jiang` 仅负责 re-export。
+- [x] **保留裸 `print` / `assert` 兼容入口**: 当前继续作为 Stage0 与测试兼容能力保留，但不再视为标准库 public API。
+- [x] **限制 raw intrinsic 使用范围**: 当前面向用户的示例与标准库测试优先走 `std.*`，bootstrap 内部基础设施允许继续直连 intrinsic。
+- [x] **增加 runtime 边界回归**: 当前已通过单独 smoke 固定 runtime ABI 集合、`std` 对外模块集合与 README 说明一致性。
 
 ### 0. 建立 Stage1 工程骨架
 - [x] **创建 Stage1 源码目录**: 当前使用顶层 `bootstrap/` 目录承载 Jiang 版编译器源码。

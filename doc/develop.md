@@ -74,3 +74,28 @@ Jiang 目前采用循序渐进的路线：
 *   [ ] 在 Jiang 版前端稳定后评估 HIR / MIR 分层
 *   [ ] 评估 LLVM IR 或其他原生后端接入时机
 *   [ ] 逐步摆脱 C 作为过渡后端
+
+### 当前优先主线：标准库与 Runtime 分层
+
+在 build system 收口之后，当前 Stage1 的下一阶段主线不是直接切 LLVM，而是先固定 runtime ABI 与标准库表面。
+
+当前明确冻结的 Stage1 public surface：
+
+*   `std.io`
+*   `std.debug`
+*   `std.fs`
+
+当前明确冻结的宿主 runtime ABI：
+
+*   `__intrinsic_print`
+*   `__intrinsic_assert`
+*   `__intrinsic_read_file`
+*   `__intrinsic_file_exists`
+*   `__intrinsic_alloc_ints`
+*   `__intrinsic_alloc_bytes`
+
+边界规则：
+
+*   普通 Jiang 项目优先使用 `std.*`，而不是直接调用 `__intrinsic_*`
+*   raw intrinsic 继续允许标准库实现、bootstrap 编译器内部基础设施与编译器生成的过渡 glue 直接使用
+*   libc 依赖当前继续存在，但应集中在 `include/runtime.h` 与宿主编译器实现中，不继续向 Jiang 标准库表面扩散

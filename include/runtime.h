@@ -18,6 +18,24 @@ typedef struct {
     int64_t length;
 } Slice_uint8_t;
 
+// Stage1 runtime ABI is intentionally small and frozen for now.
+// The only host intrinsics exposed to Jiang code are:
+// - __intrinsic_print
+// - __intrinsic_assert
+// - __intrinsic_read_file
+// - __intrinsic_file_exists
+// - __intrinsic_alloc_ints
+// - __intrinsic_alloc_bytes
+//
+// libc usage remains concentrated in this header and the host compiler
+// implementation. Stage1 does not try to remove libc yet; it only fixes the
+// boundary so later LLVM/native backend work has a stable runtime surface.
+//
+// Current libc touchpoints used here:
+// - file IO: fopen / fread / fclose
+// - allocation: malloc / calloc / free
+// - byte copying: memcpy
+
 static inline char* jiang_runtime_to_cstr(Slice_uint8_t value) {
     char* text = (char*)malloc((size_t)value.length + 1);
     if (!text) return NULL;

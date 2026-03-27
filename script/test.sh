@@ -23,6 +23,9 @@ bash "$PROJECT_ROOT/script/build_system_smoke.sh"
 echo -e "\n--- 1.65. 运行 Build System 错误路径冒烟测试 ---"
 bash "$PROJECT_ROOT/script/build_system_error_smoke.sh"
 
+echo -e "\n--- 1.66. 运行 Runtime 边界冒烟测试 ---"
+bash "$PROJECT_ROOT/script/runtime_boundary_smoke.sh"
+
 echo -e "\n--- 1.7. 运行 Stage1 Build System 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_build_system_smoke.sh"
 
