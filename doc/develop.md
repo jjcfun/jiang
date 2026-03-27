@@ -42,8 +42,8 @@ Jiang 目前采用循序渐进的路线：
 当前状态已经进一步推进到“真实入口编译器”阶段：
 
 *   `compiler_core.compile_entry(path, mode)` 已支持当前受支持入口模块的 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`
-*   `stage1_real_entry_smoke` 已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`
-*   growable store 底层抽象已加入，但主链 store 仍以稳定优先的分阶段迁移为主
+*   `stage1_real_entry_smoke` 已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`，并扩到 `lexer_core.jiang`、`hir_core.jiang`、`module_loader.jiang`、`jir_lower.jiang`、`parser_store.jiang`、`buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang`、`module_paths.jiang`、`token_store.jiang`、`hir_store.jiang`、`jir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`
+*   growable store 底层抽象与主链 store 已接通，当前重点转为真实模块图覆盖扩展与残余告警收尾
 
 ### Stage2：Jiang 重构编译器并升级后端
 当 Stage1 的 Jiang 版前端稳定后，再考虑重构内部 IR、接入 LLVM 或其他原生后端。

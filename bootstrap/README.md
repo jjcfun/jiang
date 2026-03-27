@@ -83,11 +83,19 @@
 - `bootstrap/source_loader.jiang` 的 `mode_emit_c`
 - `bootstrap/parser_core.jiang` 的 `mode_dump_hir` 与 `mode_dump_jir`
 - `bootstrap/compiler_core.jiang` 的 `mode_dump_hir` 与 `mode_emit_c`
+- `bootstrap/lexer_core.jiang` 的 `mode_dump_hir`
+- `bootstrap/hir_core.jiang` 的 `mode_dump_hir`
+- `bootstrap/module_loader.jiang` 的 `mode_dump_hir`
+- `bootstrap/jir_lower.jiang` 的 `mode_emit_c`
+- `bootstrap/parser_store.jiang` 的 `mode_emit_c`
+- `bootstrap/buffer_int.jiang`、`bootstrap/buffer_bytes.jiang`、`bootstrap/intern_pool.jiang` 的 `mode_emit_c`
+- `bootstrap/module_paths.jiang`、`bootstrap/token_store.jiang`、`bootstrap/hir_store.jiang`、`bootstrap/jir_store.jiang` 的 `mode_emit_c`
+- `bootstrap/symbol_store.jiang`、`bootstrap/type_store.jiang` 的 `mode_emit_c`
 
 当前 growable store 仍在推进中：
 
 - `buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang` 已加入底层抽象
-- 真实主链上的大部分 store 仍以“固定容量数组 + 整数 id”为稳定实现
+- `token_store.jiang`、`parser_store.jiang`、`hir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`、`jir_store.jiang` 当前都已接到 growable buffer；现阶段重点转为稳定性收口与真实模块图覆盖扩展
 - 后续迁移会继续遵守当前已经冻结的数组 / slice ABI 规则，避免重新打断宿主 codegen
 
 手动运行方式：

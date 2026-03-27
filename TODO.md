@@ -135,10 +135,10 @@
 
 ### 6. 收口为真实入口编译器
 - [x] **固定 `compile_entry(path, mode)` 为真实入口 API**: `bootstrap/compiler_core.jiang` 当前已支持给定入口模块的 `dump_ast`、`dump_hir`、`dump_jir`、`emit_c`。
-- [x] **补真实入口 smoke**: `script/stage1_real_entry_smoke.sh` 当前已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`。
+- [x] **补真实入口 smoke**: `script/stage1_real_entry_smoke.sh` 当前已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`，并继续扩到 `lexer_core.jiang`、`hir_core.jiang`、`module_loader.jiang`、`jir_lower.jiang`、`parser_store.jiang`、`buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang`、`module_paths.jiang`、`token_store.jiang`、`hir_store.jiang`、`jir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`。
 - [x] **冻结数组 / slice ABI 规则**: 宿主 Stage0 与 Stage1 当前已统一固定数组、slice 和数组别名的 C 生成约定，真实入口 codegen 可稳定通过。
-- [ ] **继续扩真实 bootstrap 模块图覆盖**: 当前重点入口已经可回归，但仍未覆盖全部 bootstrap 模块。
-- [ ] **完成 growable store 迁移**: `buffer_int` / `buffer_bytes` / `intern_pool` 已就位，`token/parser/hir/symbol/type/jir` 仍以稳定优先的分阶段迁移策略推进。
+- [x] **完成核心 bootstrap 模块图覆盖**: 当前所有核心前端、store、driver 与模块图基础设施都已纳入正式 real-entry 回归；剩余 sample / demo / probe 文件不视为正式模块图契约。
+- [x] **完成 growable store 主链迁移**: `buffer_int` / `buffer_bytes` / `intern_pool` 已接入，`token/parser/hir/symbol/type/jir` 当前都已切到 growable buffer；后续重点是继续压实真实模块图与宿主兼容性。
 - [ ] **收尾残余 Stage1 告警**: 当前主链结构性 codegen 错误已清掉，仍允许存在少量非阻塞 warning 直到对应 store 完成迁移。
 
 ### 7. 为 Stage1 补测试与样例
@@ -147,7 +147,7 @@
 - [x] **定义 golden 测试格式**: 已使用 `bootstrap/lexer.golden` 固定 lexer 输出，并在 `script/stage1_smoke.sh` 中做完整 diff。
 
 ### 8. 控制 Stage1 范围，避免失控
-- [ ] **冻结第一版自举子集**: 没有 Stage1 直接需要的语法，不在这一阶段扩展。
+- [x] **冻结第一版自举子集**: 目前继续维持 bootstrap-first 语法边界，没有 Stage1 真实需要的语法不再扩展。
 - [ ] **避免提前引入复杂后端规划**: 在 Jiang 版前端未稳定前，不并行推进 LLVM / MIR 重构。
 - [ ] **优先补标准库缺口**: 只有在 Stage1 代码真正需要时，才扩展 `std` 能力。
 
