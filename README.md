@@ -102,7 +102,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 - 控制流：`if`、`while`、`for Int i in a..b`
 - 绑定：普通 binding、tuple binding、Union variant binding
 - 复合类型：`struct`、`enum`、`union`
-- 最小标准库：`std.io`、`std.assert`、`std.fs`
+- 最小标准库：`std.io`、`std.debug`、`std.fs`
 
 当前 Stage0 里仍然建议避免把这些能力作为自举前提：
 
@@ -148,6 +148,36 @@ make
 ```
 
 当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行全部测试用例；以仓库当前版本为准，测试集已全部通过。
+
+### 最小 Build System（实验中）
+
+当前已经加入第一版实验性 project manifest 与子命令入口：
+
+```bash
+./build/jiangc build --manifest ./examples/build_demo/jiang.build
+./build/jiangc run --manifest ./examples/build_demo/jiang.build
+./build/jiangc build --manifest ./examples/build_demo/jiang.build --target alt
+./build/jiangc test --manifest ./examples/build_demo/jiang.build --target alt
+./build/jiangc test --manifest ./examples/build_demo/jiang.build
+```
+
+当前 manifest 采用最小 `jiang.build` 形式，示例见 `examples/build_demo/jiang.build`。第一版只覆盖：
+
+- `name`
+- `root`
+- `stdlib_dir`
+- `test_dir`
+- `module.<name> = <path>`
+- `target.<name>.root = <path>`
+- `target.<name>.test_dir = <path>`
+
+其中 `module.<name>` 会把模块名映射到入口文件，允许项目内直接使用：
+
+```jiang
+import greet;
+```
+
+当前目标是先统一项目入口、标准库路径与 `jiang -> C -> cc` 构建链，不在这一版中直接引入完整包管理与可编程构建 DSL。
 
 ## 许可证
 

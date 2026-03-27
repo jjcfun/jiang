@@ -15,6 +15,8 @@ Module* semantic_check(Arena* arena, ASTNode* root, const char* path);
 // Reset semantic state between runs
 void semantic_reset(void);
 void semantic_set_stdlib_dir(const char* path);
+void semantic_clear_module_map(void);
+void semantic_add_named_module(const char* name, const char* path);
 
 // Helper to get module info for code generation
 const char* module_get_name(Module* mod);

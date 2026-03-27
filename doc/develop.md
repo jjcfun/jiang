@@ -24,7 +24,7 @@ Jiang 目前采用循序渐进的路线：
 *   多模块与命名空间导入
 *   Binding 体系、tuple binding、Union variant binding
 *   `switch` 模式匹配与匿名 Union
-*   最小标准库：`std.io`、`std.assert`、`std.fs`
+*   最小标准库：`std.io`、`std.debug`、`std.fs`
 *   标准库导入与 `--stdlib-dir`
 *   主编译链稳定为 `AST -> JIR -> C`
 

@@ -31,6 +31,9 @@ static Arena*  eval_arena    = NULL;
 static Module* module_cache[128];
 static int     module_cache_count = 0;
 static char    stdlib_dir[PATH_MAX] = "std";
+static char    named_module_names[64][128];
+static char    named_module_paths[64][PATH_MAX];
+static int     named_module_count = 0;
 
 const char* module_get_name(Module* mod) { return mod->name; }
 const char* module_get_id(Module* mod) { return mod->id; }
@@ -488,7 +491,6 @@ static void register_builtins(void) {
         symbol_define(builtins[i], strlen(builtins[i]), SYM_STRUCT, make_base_type(builtins[i]), 0, false);
     }
     symbol_define("print", 5, SYM_FUNC, make_base_type("void"), 0, false);
-    symbol_define("assert", 6, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("__intrinsic_print", 17, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("__intrinsic_assert", 18, SYM_FUNC, make_base_type("void"), 0, false);
     symbol_define("__intrinsic_read_file", 21, SYM_FUNC,
@@ -532,6 +534,20 @@ static bool file_exists(const char* path) {
     return access(path, F_OK) == 0;
 }
 
+static bool resolve_named_module_path(const char* module_name, char* out, size_t out_size) {
+    for (int i = 0; i < named_module_count; i++) {
+        if (strcmp(named_module_names[i], module_name) == 0) {
+            if (realpath(named_module_paths[i], out) != NULL) return true;
+            if (file_exists(named_module_paths[i])) {
+                strncpy(out, named_module_paths[i], out_size - 1);
+                out[out_size - 1] = '\0';
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
 
 static bool resolve_import_path(const char* importer_path, Token path_token, char* out, size_t out_size) {
     char import_path[PATH_MAX];
@@ -539,6 +555,10 @@ static bool resolve_import_path(const char* importer_path, Token path_token, cha
     if (import_len >= sizeof(import_path)) import_len = sizeof(import_path) - 1;
     memcpy(import_path, path_token.start + 1, import_len);
     import_path[import_len] = '\0';
+
+    if (strncmp(import_path, "module:", 7) == 0) {
+        return resolve_named_module_path(import_path + 7, out, out_size);
+    }
 
     if (import_path[0] == '/') {
         if (realpath(import_path, out) != NULL) return true;
@@ -1081,6 +1101,19 @@ void semantic_set_stdlib_dir(const char* path) {
     }
     strncpy(stdlib_dir, path, sizeof(stdlib_dir));
     stdlib_dir[sizeof(stdlib_dir) - 1] = '\0';
+}
+
+void semantic_clear_module_map(void) {
+    named_module_count = 0;
+}
+
+void semantic_add_named_module(const char* name, const char* path) {
+    if (!name || !path || named_module_count >= 64) return;
+    strncpy(named_module_names[named_module_count], name, sizeof(named_module_names[0]) - 1);
+    named_module_names[named_module_count][sizeof(named_module_names[0]) - 1] = '\0';
+    strncpy(named_module_paths[named_module_count], path, sizeof(named_module_paths[0]) - 1);
+    named_module_paths[named_module_count][sizeof(named_module_paths[0]) - 1] = '\0';
+    named_module_count++;
 }
 
 Module* semantic_check(Arena* arena, ASTNode* root, const char* input_path) {

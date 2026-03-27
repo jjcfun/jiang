@@ -1058,17 +1058,20 @@ static ASTNode* import_statement(bool is_public) {
     Token alias = {0};
     Token path = {0};
 
-    // Case 0: import std;
+    // Case 0: import std; / import foo;
     if (check(TOKEN_IDENTIFIER)) {
         advance();
         Token first = parser.previous;
         if (check(TOKEN_SEMICOLON)) {
             advance();
-            if (!token_eq_text(first, "std")) {
-                error_at(&first, "Only 'import std;' is supported for bare identifier imports.");
-                return NULL;
+            if (token_eq_text(first, "std")) {
+                ASTNode* node = make_import_node(import_tok, is_public, make_string_token("std/std.jiang", import_tok.line));
+                node->as.import_decl.alias = first;
+                return node;
             }
-            ASTNode* node = make_import_node(import_tok, is_public, make_string_token("std/std.jiang", import_tok.line));
+            char module_path[256];
+            snprintf(module_path, sizeof(module_path), "module:%.*s", (int)first.length, first.start);
+            ASTNode* node = make_import_node(import_tok, is_public, make_string_token(module_path, import_tok.line));
             node->as.import_decl.alias = first;
             return node;
         }

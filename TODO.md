@@ -5,6 +5,22 @@
 - Stage0 已完成，`TODO.md` 中原先定义的完成条件已全部达成。
 - 当前主线任务已切换到 Stage1：使用 Stage0 编译器启动 Jiang 自举。
 - 现阶段的 TODO 应优先服务于“把 Stage1 收成真实入口可工作的 Jiang 版编译器”，而不是继续扩张 Stage0 的语法面。
+- Stage1 的“真实入口可工作”主链已经基本收口；接下来的第一优先级应切换到构建系统，而不是直接进入 Stage2。
+
+## 🎯 当前优先级调整（Priority Reset）
+
+- 第一优先级：实现 Jiang 自身的最小 build system，统一项目入口、模块图、标准库注入、测试与 `jiang -> C -> cc` 构建链。
+- 第二优先级：在 build system 稳定后，继续完善标准库与 runtime 分层，逐步收口对 libc 的直接依赖。
+- 第三优先级：在模块模型、构建模型与标准库边界稳定后，再评估是否移除 C 过渡后端并接入 LLVM 或其他原生后端。
+- 第四优先级：在以上基础设施稳定后，再正式启动 Stage2 的编译器重构与高级特性实现。
+
+当前阶段暂不作为主线推进的事项：
+
+- [ ] 不直接开始 Stage2 重构。
+- [ ] 不把“移除 C、接 LLVM”作为 Stage1 后续第一目标。
+- [ ] 不在 build system 缺席的前提下大幅扩张标准库与包管理能力。
+
+相关执行计划见 `doc/plan_build_system.md`。
 
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
@@ -69,9 +85,9 @@
 - [x] **建立标准库目录结构**: 约定 `std/` 或等价 sysroot 布局，避免继续依赖测试目录充当库。
 - [x] **实现最小标准库模块**:
     - [x] `std/io`
-    - [x] `std/assert`
+    - [x] `std/debug`
     - [x] `std/fs`
-- [x] **梳理 intrinsic 与标准库边界**: `std.io` / `std.assert` 已通过 `__intrinsic_*` 暴露底层能力，标准库调用不再直接依赖裸 `print` / `assert`。
+- [x] **梳理 intrinsic 与标准库边界**: `std.io` / `std.debug` 已通过 `__intrinsic_*` 暴露底层能力，标准库调用不再直接依赖裸 `print` / `assert`。
 - [x] **为 Stage1 预留编译器自举所需接口**: 文件读取、字符串处理、路径处理至少要能支撑词法器和 import 解析。
 
 ### 4. 标准库 Import 机制
@@ -97,6 +113,13 @@
 - [x] **准备标准库示例程序**: 至少能用 Stage0 编译器编译一个依赖标准库的简单工具程序。
 
 ## 🚧 Stage1 当前任务（Current Focus）
+
+### 0. Stage1 后续主线：最小 Build System
+- [x] **定义项目清单格式**: 第一版当前已固定为临时 `jiang.build`，作为 Stage2 前的过渡 manifest。
+- [x] **定义模块图模型**: 当前已支持默认 root、命名模块映射、`import std;` 与 `import foo;` 的最小模块注入模型。
+- [x] **实现统一构建入口**: 当前已提供 `jiang build` / `jiang run` / `jiang test` 与 `--manifest` / `--target`。
+- [x] **接入现有 Stage1 编译链**: 当前 build system 已能驱动 `bootstrap/jiang.build` 下的稳定 `lexer` 入口。
+- [x] **补 build system 回归测试**: 当前已覆盖默认 target、额外 target、命名模块、错误路径与 bootstrap smoke。
 
 ### 0. 建立 Stage1 工程骨架
 - [x] **创建 Stage1 源码目录**: 当前使用顶层 `bootstrap/` 目录承载 Jiang 版编译器源码。
@@ -149,7 +172,7 @@
 ### 8. 控制 Stage1 范围，避免失控
 - [x] **冻结第一版自举子集**: 目前继续维持 bootstrap-first 语法边界，没有 Stage1 真实需要的语法不再扩展。
 - [x] **避免提前引入复杂后端规划**: 当前继续维持 `AST -> HIR -> JIR -> C` 主线，不并行推进 LLVM / MIR / 原生后端。
-- [x] **优先补标准库缺口**: 当前 Stage1 所需的最小 `std.io` / `std.assert` / `std.fs` 已足够支撑真实入口编译链，没有新的标准库阻塞缺口。
+- [x] **优先补标准库缺口**: 当前 Stage1 所需的最小 `std.io` / `std.debug` / `std.fs` 已足够支撑真实入口编译链，没有新的标准库阻塞缺口。
 
 ## 📝 架构笔记 (Architectural Notes)
 - **File as a Struct**: 借鉴 Zig 的设计，将每个文件视为一个独立的命名空间，避免全局符号冲突。

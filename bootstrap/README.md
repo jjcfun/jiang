@@ -40,7 +40,7 @@
 
 当前约定的模块加载边界：
 
-- 标准库导入只考虑 `import std;` 以及 `std.io` / `std.assert` / `std.fs`
+- 标准库导入只考虑 `import std;` 以及 `std.io` / `std.debug` / `std.fs`
 - 普通模块导入当前只接受相对路径且必须以 `.jiang` 结尾
 - 暂不在 Stage1 第一版里处理绝对路径 import 或更复杂的路径标准化
 
@@ -119,4 +119,11 @@ cd ..
 ./script/stage1_jir_smoke.sh
 ./script/stage1_codegen_smoke.sh
 ./script/stage1_real_entry_smoke.sh
+```
+
+当前也可以通过实验性的 build system 入口驱动一条最小 real-entry 路径：
+
+```bash
+./build/jiangc build --manifest ./bootstrap/jiang.build
+./bootstrap/build/lexer
 ```
