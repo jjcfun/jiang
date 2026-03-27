@@ -120,12 +120,18 @@
 - [x] **补 Parser 冒烟测试**: 已加入 `bootstrap/parser_sample.jiang`、`bootstrap/parser.golden` 与 `script/stage1_parser_smoke.sh`，固定 parser 当前 parse dump。
 - [x] **冻结 Parser v1 边界**: 当前已覆盖 `bootstrap-first` 子集，支持 import、struct、enum、函数、变量、block、if/else、while、for-in、switch-else、return、break/continue、调用、成员访问、索引、数组字面量、struct init 与基础类型修饰符。
 
-### 4. 为 Stage1 补测试与样例
+### 4. 建立最小 HIR / Semantic 前端
+- [x] **建立 HIR 骨架**: 已加入 `bootstrap/hir_store.jiang`、`bootstrap/type_store.jiang`、`bootstrap/symbol_store.jiang`，使用整数 id 保存 HIR、类型与符号。
+- [x] **打通 AST -> HIR lowering**: 已加入 `bootstrap/hir_core.jiang`，覆盖当前真实 bootstrap 模块需要的顶层声明、语句、表达式与基础类型构造。
+- [x] **实现最小模块图加载**: 已加入 `bootstrap/module_loader.jiang` 与 `bootstrap/module_paths.jiang`，递归加载当前真实 bootstrap 模块集合并缓存 HIR root。
+- [x] **补 HIR 冒烟测试**: 已加入 `bootstrap/hir.jiang`、`bootstrap/hir.golden` 与 `script/stage1_hir_smoke.sh`，固定真实模块图的 HIR dump。
+
+### 5. 为 Stage1 补测试与样例
 - [x] **增加 Stage1 样例源码**: 已加入 `bootstrap/sample.jiang` 与 `bootstrap/lexer.jiang`。
 - [x] **增加 Stage1 冒烟测试脚本**: 已加入 `script/stage1_smoke.sh`，验证 Stage0 编译器可以编译并运行第一个 Stage1 程序。
 - [x] **定义 golden 测试格式**: 已使用 `bootstrap/lexer.golden` 固定 lexer 输出，并在 `script/stage1_smoke.sh` 中做完整 diff。
 
-### 5. 控制 Stage1 范围，避免失控
+### 6. 控制 Stage1 范围，避免失控
 - [ ] **冻结第一版自举子集**: 没有 Stage1 直接需要的语法，不在这一阶段扩展。
 - [ ] **避免提前引入复杂后端规划**: 在 Jiang 版前端未稳定前，不并行推进 LLVM / MIR 重构。
 - [ ] **优先补标准库缺口**: 只有在 Stage1 代码真正需要时，才扩展 `std` 能力。

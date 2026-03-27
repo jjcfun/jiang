@@ -60,6 +60,7 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 实现文件加载、路径处理与最小模块边界约束
 *   [x] 使用 Jiang 实现最小 Lexer，并用 golden 固定 token dump
 *   [x] 使用 Jiang 实现 `bootstrap-first` Parser，并用 golden 固定 parse dump
+*   [x] 使用 Jiang 实现最小 HIR / semantic 前端，并用真实 bootstrap 模块图 golden 固定 HIR dump
 *   [ ] 让 Stage0 编译器稳定编译第一个真实的 Jiang 工具程序
 
 ### 后续阶段：原生后端演进
