@@ -67,4 +67,22 @@ static inline Slice_uint8_t __intrinsic_read_file(Slice_uint8_t path) {
     return result;
 }
 
+static inline Slice_int64_t __intrinsic_alloc_ints(int64_t length) {
+    Slice_int64_t result = {0};
+    if (length <= 0) length = 1;
+    result.ptr = (int64_t*)calloc((size_t)length, sizeof(int64_t));
+    if (!result.ptr) return result;
+    result.length = length;
+    return result;
+}
+
+static inline Slice_uint8_t __intrinsic_alloc_bytes(int64_t length) {
+    Slice_uint8_t result = {0};
+    if (length <= 0) length = 1;
+    result.ptr = (uint8_t*)calloc((size_t)length, sizeof(uint8_t));
+    if (!result.ptr) return result;
+    result.length = length;
+    return result;
+}
+
 #endif // JIANG_RUNTIME_H

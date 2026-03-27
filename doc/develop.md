@@ -39,6 +39,12 @@ Jiang 目前采用循序渐进的路线：
 *   优先实现文件加载、路径处理、import 解析、词法分析
 *   继续约束 Stage1 对标准库的依赖范围，避免过早依赖复杂高层语法糖
 
+当前状态已经进一步推进到“真实入口编译器”阶段：
+
+*   `compiler_core.compile_entry(path, mode)` 已支持当前受支持入口模块的 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`
+*   `stage1_real_entry_smoke` 已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`
+*   growable store 底层抽象已加入，但主链 store 仍以稳定优先的分阶段迁移为主
+
 ### Stage2：Jiang 重构编译器并升级后端
 当 Stage1 的 Jiang 版前端稳定后，再考虑重构内部 IR、接入 LLVM 或其他原生后端。
 
@@ -61,7 +67,7 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 使用 Jiang 实现最小 Lexer，并用 golden 固定 token dump
 *   [x] 使用 Jiang 实现 `bootstrap-first` Parser，并用 golden 固定 parse dump
 *   [x] 使用 Jiang 实现最小 HIR / semantic 前端，并用真实 bootstrap 模块图 golden 固定 HIR dump
-*   [ ] 让 Stage0 编译器稳定编译第一个真实的 Jiang 工具程序
+*   [x] 在 `bootstrap/` 内补最小 `HIR -> JIR -> C` 闭环，并让 Stage0 编译器稳定编译第一个 Jiang 工具程序
 
 ### 后续阶段：原生后端演进
 

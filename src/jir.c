@@ -61,14 +61,11 @@ int jir_emit(JirFunction* func, JirOp op, JirReg dest, JirReg src1, JirReg src2,
         func->insts = realloc(func->insts, sizeof(JirInst) * func->inst_capacity);
     }
     int idx = (int)func->inst_count++;
+    memset(&func->insts[idx], 0, sizeof(JirInst));
     func->insts[idx].op = op;
     func->insts[idx].dest = dest;
     func->insts[idx].src1 = src1;
     func->insts[idx].src2 = src2;
-    func->insts[idx].call_args = NULL;
-    func->insts[idx].call_arg_count = 0;
-    func->insts[idx].field_names = NULL;
-    func->insts[idx].field_name_count = 0;
     return idx;
 }
 

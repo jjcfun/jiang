@@ -192,18 +192,6 @@ static HIRNode* lower_find_struct_field_decl(HIRNode* owner, Token name) {
     return NULL;
 }
 
-static HIRNode* lower_find_union_variant_decl(HIRNode* union_decl, Token name) {
-    if (!union_decl || union_decl->kind != HIR_UNION_DECL) return NULL;
-    for (HIRNode* member = hir_first_child(union_decl); member; member = hir_next_sibling(member)) {
-        if (member->kind != HIR_VAR_DECL) continue;
-        if (member->token.length == name.length &&
-            strncmp(member->token.start, name.start, name.length) == 0) {
-            return member;
-        }
-    }
-    return NULL;
-}
-
 static bool lower_resolve_variant_info(HIRNode* switch_expr, HIRNode* pattern, LowerVariantInfo* info) {
     if (!switch_expr || !pattern || pattern->kind != HIR_FUNC_CALL) {
         return false;

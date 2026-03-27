@@ -807,7 +807,7 @@ public Int min(Int a, Int b) {
 ```c
 // src/main.jiang
 
-/// 以下几种方式分别展示了import的用法
+/// 以下几种方式分别展示了import和alias的用法
 
 // 1.导入模块，默认将使用文件名'math'作为模块名
 import "utils/math.jiang";
@@ -821,4 +821,50 @@ math.max(100, 200);
 public import Math = "utils/math.jiang";
 Math.max(100, 200);
 
+// 4.导入模块后，可以通过alias为模块中的公开符号创建本地别名
+import Math = "utils/math.jiang";
+alias maximum = Math.max;
+maximum(100, 200);
+
+// 5.public alias会在当前模块中重新导出该符号
+import Math = "utils/math.jiang";
+public alias max = Math.max;
+public alias min = Math.min;
+
 ```
+
+其中：
+
+- `import "utils/math.jiang";` 会导入整个模块，并默认使用文件名 `math` 作为模块名
+- `public import "utils/math.jiang";` 会在导入模块的同时，将模块名 `math` 对外导出
+- `public import Math = "utils/math.jiang";` 会导入模块并使用 `Math` 作为公开模块名
+- `alias maximum = Math.max;` 会为符号创建一个当前模块内可见的别名
+- `public alias max = Math.max;` 会为符号创建一个公开别名，使其他模块可以通过当前模块访问该符号
+
+`alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
+
+```c
+import Math = "utils/math.jiang";
+
+alias maximum = Math.max;
+public alias minimum = Math.min;
+```
+
+上面的 `maximum` 和 `minimum` 都直接指向原始符号，不会创建新的函数、副本或存储空间。
+
+当前建议 `alias` 的右侧只能是可命名的符号路径，例如：
+
+```c
+alias Foo = A.B;
+alias max = Math.max;
+public alias read = IO.read;
+```
+
+而不应该是任意表达式：
+
+```c
+// bad
+alias x = a + b;
+```
+
+使用 `public alias` 重新导出符号时，目标符号本身必须是源模块中的公开符号。如果当前模块已经存在同名定义，则应当报错，除非显式更换别名。

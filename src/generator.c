@@ -200,15 +200,6 @@ static void gen_add_enum_info(CodegenEnumInfo* info) {
     gen_enum_count++;
 }
 
-static bool gen_is_enum(Token name) {
-    for (size_t i = 0; i < gen_enum_count; i++) {
-        if (strncmp(gen_enums[i].name, name.start, name.length) == 0 && gen_enums[i].name[name.length] == '\0') {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool gen_is_enum_str(const char* name) {
     for (size_t i = 0; i < gen_enum_count; i++) {
         if (strcmp(gen_enums[i].name, name) == 0) return true;
@@ -398,6 +389,91 @@ static void generate_decl_with_name(TypeExpr* type, const char* name, FILE* out)
         if (type->as.array.length) generate_node(type->as.array.length, out);
         fprintf(out, "]");
     }
+}
+
+static int gen_find_jir_def_inst_index(JirFunction* func, int reg) {
+    if (!func || reg < 0) return -1;
+    for (size_t i = 0; i < func->inst_count; i++) {
+        if (func->insts[i].dest == reg) return (int)i;
+    }
+    return -1;
+}
+
+static bool gen_jir_local_is_array_alias(JirFunction* func, int reg) {
+    if (!func || reg < 0 || (size_t)reg >= func->local_count) return false;
+    JirLocal* local = &func->locals[reg];
+    if (!local->is_temp || !local->type || local->type->kind != TYPE_ARRAY) return false;
+
+    int def_idx = gen_find_jir_def_inst_index(func, reg);
+    if (def_idx < 0) return false;
+    return func->insts[def_idx].op == JIR_OP_LOAD_SYM;
+}
+
+static bool gen_jir_reg_is_array_storage(JirFunction* func, int reg) {
+    if (!func || reg < 0 || (size_t)reg >= func->local_count) return false;
+    TypeExpr* type = func->locals[reg].type;
+    return type && type->kind == TYPE_ARRAY && !gen_jir_local_is_array_alias(func, reg);
+}
+
+static const char* gen_jir_const_string_payload(JirFunction* func, int reg) {
+    int def_idx = gen_find_jir_def_inst_index(func, reg);
+    if (def_idx < 0 || func->insts[def_idx].op != JIR_OP_CONST_STR) return NULL;
+    return func->insts[def_idx].payload.str_val;
+}
+
+static size_t gen_count_printf_char_specs(const char* fmt) {
+    if (!fmt) return 0;
+    size_t count = 0;
+    for (size_t i = 0; fmt[i] != '\0'; i++) {
+        if (fmt[i] != '%') continue;
+        i++;
+        if (fmt[i] == '\0') break;
+        if (fmt[i] == '%') continue;
+        while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' || fmt[i] == '0') i++;
+        while (fmt[i] >= '0' && fmt[i] <= '9') i++;
+        if (fmt[i] == '.') {
+            i++;
+            while (fmt[i] >= '0' && fmt[i] <= '9') i++;
+        }
+        while (fmt[i] == 'h' || fmt[i] == 'l' || fmt[i] == 'j' || fmt[i] == 'z' || fmt[i] == 't' || fmt[i] == 'L') i++;
+        if (fmt[i] == '\0') break;
+        if (fmt[i] == 'c') count++;
+    }
+    return count;
+}
+
+static bool gen_printf_arg_is_char_spec(const char* fmt, size_t arg_index) {
+    if (!fmt) return false;
+    size_t spec_index = 0;
+    for (size_t i = 0; fmt[i] != '\0'; i++) {
+        if (fmt[i] != '%') continue;
+        i++;
+        if (fmt[i] == '\0') break;
+        if (fmt[i] == '%') continue;
+        while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' || fmt[i] == '0') i++;
+        while (fmt[i] >= '0' && fmt[i] <= '9') i++;
+        if (fmt[i] == '.') {
+            i++;
+            while (fmt[i] >= '0' && fmt[i] <= '9') i++;
+        }
+        while (fmt[i] == 'h' || fmt[i] == 'l' || fmt[i] == 'j' || fmt[i] == 'z' || fmt[i] == 't' || fmt[i] == 'L') i++;
+        if (fmt[i] == '\0') break;
+        if (spec_index == arg_index) return fmt[i] == 'c';
+        spec_index++;
+    }
+    return false;
+}
+
+static size_t gen_jir_string_decoded_length(const char* s) {
+    size_t len = 0;
+    if (!s) return 0;
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        if (s[i] == '\\' && s[i + 1] != '\0') {
+            i++;
+        }
+        len++;
+    }
+    return len;
 }
 
 static void generate_tuple_field_ref(FILE* out, const char* tuple_name, TypeExpr* tuple_type, size_t index) {
@@ -733,9 +809,10 @@ static void generate_node(ASTNode* node, FILE* out) {
         case AST_LITERAL_STRING:
             {
                 int raw_len = (int)node->as.string.value.length;
+                size_t cooked_len = raw_len >= 2 ? (size_t)(raw_len - 2) : 0;
                 fprintf(out, "(Slice_uint8_t){(uint8_t*)");
                 fprintf(out, "%.*s", raw_len, node->as.string.value.start);
-                fprintf(out, ", %d}", raw_len >= 2 ? raw_len - 2 : 0);
+                fprintf(out, ", %zu}", cooked_len);
             }
             break;
 
@@ -853,7 +930,17 @@ static void generate_node(ASTNode* node, FILE* out) {
                 } else if ((name.length == 5 && strncmp(name.start, "print", 5) == 0) ||
                            (name.length == 17 && strncmp(name.start, "__intrinsic_print", 17) == 0)) {
                     fprintf(out, "printf(");
-                    for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
+                    bool single_u8_slice = node->as.func_call.arg_count == 1;
+                    if (single_u8_slice) {
+                        ASTNode* only_arg = node->as.func_call.args[0];
+                        TypeExpr* only_type = only_arg->evaluated_type ? only_arg->evaluated_type : (only_arg->symbol ? only_arg->symbol->type : NULL);
+                        single_u8_slice = gen_is_u8_slice_type(only_type) && only_arg->type != AST_LITERAL_STRING;
+                    }
+                    if (single_u8_slice) {
+                        fprintf(out, "\"%%s\", (char*)(");
+                        generate_node(node->as.func_call.args[0], out);
+                        fprintf(out, ").ptr");
+                    } else for (size_t i = 0; i < node->as.func_call.arg_count; i++) {
                         ASTNode* arg = node->as.func_call.args[i];
                         TypeExpr* arg_type = arg->evaluated_type ? arg->evaluated_type : (arg->symbol ? arg->symbol->type : NULL);
                         bool is_u8_slice = gen_is_u8_slice_type(arg_type);
@@ -1976,8 +2063,10 @@ static void generate_declarations_from_info(CodegenModuleInfo* info, FILE* out, 
 
     for (size_t i = 0; i < info->global_count; i++) {
         fprintf(out, "extern ");
-        generate_type(info->globals[i].type, out);
-        fprintf(out, " %.*s", (int)info->globals[i].name.length, info->globals[i].name.start);
+        char global_name[128];
+        snprintf(global_name, sizeof(global_name), "%.*s",
+                 (int)info->globals[i].name.length, info->globals[i].name.start);
+        generate_decl_with_name(info->globals[i].type, global_name, out);
         fprintf(out, ";\n");
     }
 
@@ -2023,8 +2112,8 @@ static void generate_global_definitions_from_info(CodegenModuleInfo* info, FILE*
                 fprintf(out, " = %g", g->float_value);
                 break;
             case CG_GLOBAL_INIT_STRING:
-                fprintf(out, " = (Slice_uint8_t){(uint8_t*)\"%.*s\", %d}",
-                        (int)g->string_value.length, g->string_value.start, g->string_value.length);
+                fprintf(out, " = (Slice_uint8_t){(uint8_t*)\"%.*s\", %zu}",
+                        (int)g->string_value.length, g->string_value.start, (size_t)g->string_value.length);
                 break;
             case CG_GLOBAL_INIT_ENUM:
                 fprintf(out, " = ");
@@ -2054,13 +2143,26 @@ static void gen_emit_jir_reg(FILE* out, JirFunction* func, int reg) {
 
 static void gen_emit_jir_string(FILE* out, const char* s) {
     fprintf(out, "\"");
-    for (const char* p = s; *p; p++) {
-        if (*p == '\\' || *p == '"') fputc('\\', out);
-        if (*p == '\n') {
-            fputs("\\n", out);
-        } else {
-            fputc(*p, out);
+    for (size_t i = 0; s && s[i] != '\0'; i++) {
+        char ch = s[i];
+        if (ch == '\\' && s[i + 1] != '\0') {
+            char next = s[++i];
+            if (next == 'n') fputs("\\n", out);
+            else if (next == 't') fputs("\\t", out);
+            else if (next == 'r') fputs("\\r", out);
+            else if (next == '"') fputs("\\\"", out);
+            else if (next == '\\') fputs("\\\\", out);
+            else {
+                fputc('\\', out);
+                fputc(next, out);
+            }
+            continue;
         }
+        if (ch == '\\' || ch == '"') fputc('\\', out);
+        if (ch == '\n') fputs("\\n", out);
+        else if (ch == '\t') fputs("\\t", out);
+        else if (ch == '\r') fputs("\\r", out);
+        else fputc(ch, out);
     }
     fprintf(out, "\"");
 }
@@ -2131,7 +2233,12 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
     for (size_t i = 0; i < func->local_count; i++) {
         if (func->locals[i].is_param) continue;
         fprintf(out, "    ");
-        generate_decl_with_name(func->locals[i].type, func->locals[i].name, out);
+        if (gen_jir_local_is_array_alias(func, (int)i)) {
+            generate_type(func->locals[i].type->as.array.element, out);
+            fprintf(out, "* %s", func->locals[i].name);
+        } else {
+            generate_decl_with_name(func->locals[i].type, func->locals[i].name, out);
+        }
         fprintf(out, ";\n");
     }
 
@@ -2150,7 +2257,7 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
             case JIR_OP_CONST_STR:
                 fprintf(out, "    %s = (Slice_uint8_t){(uint8_t*)", func->locals[inst->dest].name);
                 gen_emit_jir_string(out, inst->payload.str_val ? inst->payload.str_val : "");
-                fprintf(out, ", %zu};\n", inst->payload.str_val ? strlen(inst->payload.str_val) : 0);
+                fprintf(out, ", %zu};\n", gen_jir_string_decoded_length(inst->payload.str_val));
                 break;
             case JIR_OP_LOAD_SYM:
                 fprintf(out, "    %s = ", func->locals[inst->dest].name);
@@ -2160,7 +2267,7 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 break;
             case JIR_OP_STORE:
                 if (inst->dest >= 0 && (size_t)inst->dest < func->local_count &&
-                    gen_is_array_type(func->locals[inst->dest].type) &&
+                    gen_jir_reg_is_array_storage(func, inst->dest) &&
                     inst->src1 >= 0 && (size_t)inst->src1 < func->local_count &&
                     gen_is_array_type(func->locals[inst->src1].type)) {
                     fprintf(out, "    memcpy(%s, ", func->locals[inst->dest].name);
@@ -2179,7 +2286,7 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 break;
             case JIR_OP_STORE_PTR:
                 if (inst->src1 >= 0 && (size_t)inst->src1 < func->local_count &&
-                    gen_is_array_type(func->locals[inst->src1].type)) {
+                    gen_jir_reg_is_array_storage(func, inst->src1)) {
                     fprintf(out, "    memcpy(");
                     gen_emit_jir_reg(out, func, inst->dest);
                     fprintf(out, ", ");
@@ -2272,7 +2379,43 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 if ((inst->payload.name.length == 5 && strncmp(inst->payload.name.start, "print", 5) == 0) ||
                     (inst->payload.name.length == 17 && strncmp(inst->payload.name.start, "__intrinsic_print", 17) == 0)) {
                     fprintf(out, "printf(");
-                    for (size_t j = 0; j < inst->call_arg_count; j++) {
+                    bool first_is_const_string = false;
+                    const char* first_const_string = NULL;
+                    size_t printf_char_specs = 0;
+                    if (inst->call_arg_count > 0) {
+                        first_const_string = gen_jir_const_string_payload(func, inst->call_args[0]);
+                        first_is_const_string = first_const_string != NULL;
+                        if (first_is_const_string) printf_char_specs = gen_count_printf_char_specs(first_const_string);
+                    }
+                    bool single_u8_slice = inst->call_arg_count == 1 && !first_is_const_string;
+                    if (single_u8_slice) {
+                        JirReg arg_reg = inst->call_args[0];
+                        TypeExpr* arg_type = (arg_reg >= 0 && (size_t)arg_reg < func->local_count) ? func->locals[arg_reg].type : NULL;
+                        single_u8_slice = gen_is_u8_slice_type(arg_type);
+                    }
+                    if (first_is_const_string) {
+                        gen_emit_jir_string(out, first_const_string);
+                        for (size_t j = 1; j < inst->call_arg_count; j++) {
+                            JirReg arg_reg = inst->call_args[j];
+                            TypeExpr* arg_type = (arg_reg >= 0 && (size_t)arg_reg < func->local_count) ? func->locals[arg_reg].type : NULL;
+                            fprintf(out, ", ");
+                            if (gen_is_u8_slice_type(arg_type)) {
+                                fprintf(out, "(char*)");
+                                gen_emit_jir_reg(out, func, arg_reg);
+                                fprintf(out, ".ptr");
+                            } else if (printf_char_specs > 0 && gen_printf_arg_is_char_spec(first_const_string, j - 1)) {
+                                fprintf(out, "(int)(");
+                                gen_emit_jir_reg(out, func, arg_reg);
+                                fprintf(out, ")");
+                            } else {
+                                gen_emit_jir_reg(out, func, arg_reg);
+                            }
+                        }
+                    } else if (single_u8_slice) {
+                        fprintf(out, "\"%%s\", (char*)");
+                        gen_emit_jir_reg(out, func, inst->call_args[0]);
+                        fprintf(out, ".ptr");
+                    } else for (size_t j = 0; j < inst->call_arg_count; j++) {
                         JirReg arg_reg = inst->call_args[j];
                         TypeExpr* arg_type = (arg_reg >= 0 && (size_t)arg_reg < func->local_count) ? func->locals[arg_reg].type : NULL;
                         if (gen_is_u8_slice_type(arg_type)) {
@@ -2368,7 +2511,7 @@ static void gen_emit_jir_function(FILE* out, JirFunction* func, bool is_main) {
                 break;
             case JIR_OP_ARRAY_INIT:
                 if (inst->dest >= 0 && (size_t)inst->dest < func->local_count &&
-                    gen_is_array_type(func->locals[inst->dest].type)) {
+                    gen_jir_reg_is_array_storage(func, inst->dest)) {
                     fprintf(out, "    memcpy(%s, ", func->locals[inst->dest].name);
                     gen_emit_jir_aggregate(out, func, inst);
                     fprintf(out, ", sizeof(%s));\n", func->locals[inst->dest].name);

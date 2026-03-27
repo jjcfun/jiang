@@ -4,7 +4,7 @@
 
 - Stage0 已完成，`TODO.md` 中原先定义的完成条件已全部达成。
 - 当前主线任务已切换到 Stage1：使用 Stage0 编译器启动 Jiang 自举。
-- 现阶段的 TODO 应优先服务于“先写出最小可工作的 Jiang 版前端”，而不是继续扩张 Stage0 的语法面。
+- 现阶段的 TODO 应优先服务于“把 Stage1 收成真实入口可工作的 Jiang 版编译器”，而不是继续扩张 Stage0 的语法面。
 
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
@@ -126,12 +126,27 @@
 - [x] **实现最小模块图加载**: 已加入 `bootstrap/module_loader.jiang` 与 `bootstrap/module_paths.jiang`，递归加载当前真实 bootstrap 模块集合并缓存 HIR root。
 - [x] **补 HIR 冒烟测试**: 已加入 `bootstrap/hir.jiang`、`bootstrap/hir.golden` 与 `script/stage1_hir_smoke.sh`，固定真实模块图的 HIR dump。
 
-### 5. 为 Stage1 补测试与样例
+### 5. 打通最小 Stage1 后端
+- [x] **建立最小 JIR 骨架**: 已加入 `bootstrap/jir_store.jiang`，使用整数 id 保存 Stage1 当前的 JIR 节点树。
+- [x] **打通 HIR -> JIR lowering**: 已加入 `bootstrap/jir_lower.jiang`，覆盖当前 codegen fixture 需要的声明、语句与表达式 lowering。
+- [x] **实现最小 C emitter**: 当前 `bootstrap/jir_lower.jiang` 已能把固定 fixture 输出成可由系统 C 编译器编译的 C 文本。
+- [x] **增加 JIR 冒烟测试**: 已加入 `bootstrap/jir.jiang`、`bootstrap/jir.golden` 与 `script/stage1_jir_smoke.sh`，固定当前 JIR dump。
+- [x] **增加 Stage1 codegen 冒烟测试**: 已加入 `bootstrap/compiler_core.jiang`、`bootstrap/compiler.jiang`、`bootstrap/codegen_sample.jiang` 与 `script/stage1_codegen_smoke.sh`，固定 `compiler -> C -> cc -> 可执行` 闭环。
+
+### 6. 收口为真实入口编译器
+- [x] **固定 `compile_entry(path, mode)` 为真实入口 API**: `bootstrap/compiler_core.jiang` 当前已支持给定入口模块的 `dump_ast`、`dump_hir`、`dump_jir`、`emit_c`。
+- [x] **补真实入口 smoke**: `script/stage1_real_entry_smoke.sh` 当前已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`。
+- [x] **冻结数组 / slice ABI 规则**: 宿主 Stage0 与 Stage1 当前已统一固定数组、slice 和数组别名的 C 生成约定，真实入口 codegen 可稳定通过。
+- [ ] **继续扩真实 bootstrap 模块图覆盖**: 当前重点入口已经可回归，但仍未覆盖全部 bootstrap 模块。
+- [ ] **完成 growable store 迁移**: `buffer_int` / `buffer_bytes` / `intern_pool` 已就位，`token/parser/hir/symbol/type/jir` 仍以稳定优先的分阶段迁移策略推进。
+- [ ] **收尾残余 Stage1 告警**: 当前主链结构性 codegen 错误已清掉，仍允许存在少量非阻塞 warning 直到对应 store 完成迁移。
+
+### 7. 为 Stage1 补测试与样例
 - [x] **增加 Stage1 样例源码**: 已加入 `bootstrap/sample.jiang` 与 `bootstrap/lexer.jiang`。
 - [x] **增加 Stage1 冒烟测试脚本**: 已加入 `script/stage1_smoke.sh`，验证 Stage0 编译器可以编译并运行第一个 Stage1 程序。
 - [x] **定义 golden 测试格式**: 已使用 `bootstrap/lexer.golden` 固定 lexer 输出，并在 `script/stage1_smoke.sh` 中做完整 diff。
 
-### 6. 控制 Stage1 范围，避免失控
+### 8. 控制 Stage1 范围，避免失控
 - [ ] **冻结第一版自举子集**: 没有 Stage1 直接需要的语法，不在这一阶段扩展。
 - [ ] **避免提前引入复杂后端规划**: 在 Jiang 版前端未稳定前，不并行推进 LLVM / MIR 重构。
 - [ ] **优先补标准库缺口**: 只有在 Stage1 代码真正需要时，才扩展 `std` 能力。
