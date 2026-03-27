@@ -99,3 +99,19 @@ Jiang 目前采用循序渐进的路线：
 *   普通 Jiang 项目优先使用 `std.*`，而不是直接调用 `__intrinsic_*`
 *   raw intrinsic 继续允许标准库实现、bootstrap 编译器内部基础设施与编译器生成的过渡 glue 直接使用
 *   libc 依赖当前继续存在，但应集中在 `include/runtime.h` 与宿主编译器实现中，不继续向 Jiang 标准库表面扩散
+
+### 当前字符串语义：UTF-8 字节串
+
+当前 Stage1 的 UTF-8 支持只覆盖“字节层正确性”：
+
+*   源码按 UTF-8 字节流读取
+*   非 ASCII UTF-8 字节允许出现在字符串字面量和注释中
+*   `UInt8[]` 仍然表示字节切片
+*   `.length` 按字节数计算
+*   `s[i]` 按字节访问
+
+当前明确不做：
+
+*   Unicode 标识符
+*   code point / rune / grapheme 语义
+*   单独的文本字符串类型

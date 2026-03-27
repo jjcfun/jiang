@@ -74,6 +74,9 @@ static void skip_whitespace() {
                 break;
             case '/':
                 if (peek_next() == '/') {
+                    // Stage1 treats source as a UTF-8 byte stream. Comments are
+                    // skipped byte-by-byte until '\n', so non-ASCII UTF-8 bytes
+                    // are accepted here without introducing Unicode identifier rules.
                     while (peek() != '\n' && !is_at_end()) advance();
                 } else {
                     return;
@@ -188,6 +191,8 @@ static Token number() {
 }
 
 static Token string() {
+    // Stage1 keeps string literals as raw UTF-8 bytes. The lexer does not try
+    // to decode Unicode here; it only preserves the byte range inside quotes.
     while (peek() != '"' && !is_at_end()) {
         if (peek() == '\n') lexer.line++;
         advance();
@@ -241,6 +246,9 @@ Token lexer_next_token() {
         case '"': return string();
     }
 
+    // Outside strings/comments, Stage1 still keeps identifier rules ASCII-only.
+    // Non-ASCII UTF-8 bytes therefore remain invalid here and intentionally
+    // surface as a lexer error instead of becoming Unicode identifiers.
     return error_token("Unexpected character.");
 }
 

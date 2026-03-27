@@ -468,8 +468,27 @@ static size_t gen_jir_string_decoded_length(const char* s) {
     size_t len = 0;
     if (!s) return 0;
     for (size_t i = 0; s[i] != '\0'; i++) {
-        if (s[i] == '\\' && s[i + 1] != '\0') {
+        if (s[i] == '\\' && s[i + 1] != '\0' &&
+            (s[i + 1] == 'n' || s[i + 1] == 't' || s[i + 1] == 'r' ||
+             s[i + 1] == '"' || s[i + 1] == '\\')) {
             i++;
+        }
+        len++;
+    }
+    return len;
+}
+
+static size_t gen_token_string_decoded_length(Token tok) {
+    if (tok.length < 2) return 0;
+
+    size_t len = 0;
+    const unsigned char* bytes = (const unsigned char*)tok.start;
+    for (size_t i = 1; i + 1 < tok.length; i++) {
+        if (bytes[i] == '\\' && i + 2 < tok.length) {
+            unsigned char next = bytes[i + 1];
+            if (next == 'n' || next == 't' || next == 'r' || next == '"' || next == '\\') {
+                i++;
+            }
         }
         len++;
     }
@@ -809,7 +828,7 @@ static void generate_node(ASTNode* node, FILE* out) {
         case AST_LITERAL_STRING:
             {
                 int raw_len = (int)node->as.string.value.length;
-                size_t cooked_len = raw_len >= 2 ? (size_t)(raw_len - 2) : 0;
+                size_t cooked_len = gen_token_string_decoded_length(node->as.string.value);
                 fprintf(out, "(Slice_uint8_t){(uint8_t*)");
                 fprintf(out, "%.*s", raw_len, node->as.string.value.start);
                 fprintf(out, ", %zu}", cooked_len);
@@ -2144,9 +2163,9 @@ static void gen_emit_jir_reg(FILE* out, JirFunction* func, int reg) {
 static void gen_emit_jir_string(FILE* out, const char* s) {
     fprintf(out, "\"");
     for (size_t i = 0; s && s[i] != '\0'; i++) {
-        char ch = s[i];
+        unsigned char ch = (unsigned char)s[i];
         if (ch == '\\' && s[i + 1] != '\0') {
-            char next = s[++i];
+            unsigned char next = (unsigned char)s[++i];
             if (next == 'n') fputs("\\n", out);
             else if (next == 't') fputs("\\t", out);
             else if (next == 'r') fputs("\\r", out);

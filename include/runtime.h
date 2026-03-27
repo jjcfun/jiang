@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Common types for Jiang runtime
+// Common types for Jiang runtime.
+// Stage1 string values remain UTF-8 encoded byte slices: length counts bytes
+// and indexing observes raw bytes instead of Unicode code points.
 typedef struct {
     int64_t* ptr;
     int64_t length;

@@ -35,6 +35,9 @@ typedef struct BuildManifest {
 static char compiler_include_dir[PATH_MAX] = "include";
 
 static char* read_file_text(const char* path) {
+    // Source and manifest files are read as raw bytes. Stage1 UTF-8 support is
+    // defined at the byte level: the compiler preserves UTF-8 bytes in strings
+    // and comments, but does not yet implement Unicode identifier semantics.
     FILE* file = fopen(path, "rb");
     if (!file) return NULL;
     fseek(file, 0, SEEK_END);
