@@ -75,9 +75,9 @@ Jiang 目前采用循序渐进的路线：
 *   [ ] 评估 LLVM IR 或其他原生后端接入时机
 *   [ ] 逐步摆脱 C 作为过渡后端
 
-### 当前优先主线：标准库与 Runtime 分层
+### 当前优先主线：LLVM Spike
 
-在 build system 收口之后，当前 Stage1 的下一阶段主线不是直接切 LLVM，而是先固定 runtime ABI 与标准库表面。
+在 build system、runtime 边界与 UTF-8 字节串支持收口之后，当前 Stage1 的下一阶段主线不是直接切正式后端，而是先做一个受控的 LLVM spike。
 
 当前明确冻结的 Stage1 public surface：
 
@@ -115,3 +115,22 @@ Jiang 目前采用循序渐进的路线：
 *   Unicode 标识符
 *   code point / rune / grapheme 语义
 *   单独的文本字符串类型
+
+### 当前 LLVM Spike 范围
+
+当前计划只验证最小 `JIR -> LLVM IR` 可行性，不替换正式 `JIR -> C` 主线。
+
+当前建议的最小覆盖范围：
+
+*   `Int`、`Bool`
+*   局部变量、基础算术、基础比较
+*   `if`、`while`
+*   普通函数、参数、调用、`return`
+*   继续复用当前冻结的 6 个 runtime intrinsic
+
+当前明确不做：
+
+*   完整标准库 lowering
+*   Union / Pattern / Binding 全覆盖
+*   大规模 JIR 重构
+*   直接切换默认后端

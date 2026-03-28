@@ -26,6 +26,12 @@ bash "$PROJECT_ROOT/script/build_system_error_smoke.sh"
 echo -e "\n--- 1.66. 运行 Runtime 边界冒烟测试 ---"
 bash "$PROJECT_ROOT/script/runtime_boundary_smoke.sh"
 
+echo -e "\n--- 1.67. 运行 LLVM Spike 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/llvm_spike_smoke.sh"
+
+echo -e "\n--- 1.68. 运行 LLVM Backend 回归测试 ---"
+bash "$PROJECT_ROOT/script/test_llvm_backend.sh"
+
 echo -e "\n--- 1.7. 运行 Stage1 Build System 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_build_system_smoke.sh"
 

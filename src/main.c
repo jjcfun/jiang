@@ -14,6 +14,7 @@
 #include "jir.h"
 #include "lower.h"
 #include "jir_gen.h"
+#include "llvm_gen.h"
 #include "arena.h"
 
 typedef struct BuildManifest {
@@ -31,6 +32,11 @@ typedef struct BuildManifest {
     char target_test_dirs[32][PATH_MAX];
     int target_count;
 } BuildManifest;
+
+typedef enum {
+    BACKEND_C,
+    BACKEND_LLVM,
+} BackendKind;
 
 static char compiler_include_dir[PATH_MAX] = "include";
 
@@ -53,10 +59,22 @@ static char* read_file_text(const char* path) {
 
 static void print_usage(const char* argv0) {
     printf("Usage:\n");
-    printf("  %s [--stdlib-dir <path>] [--dump-hir] <input_file>\n", argv0);
-    printf("  %s build [--manifest <path>] [--target <name>]\n", argv0);
-    printf("  %s run [--manifest <path>] [--target <name>]\n", argv0);
-    printf("  %s test [--manifest <path>] [--target <name>]\n", argv0);
+    printf("  %s [--stdlib-dir <path>] [--dump-hir] [--emit-llvm] [--backend <c|llvm>] <input_file>\n", argv0);
+    printf("  %s build [--manifest <path>] [--target <name>] [--backend <c|llvm>]\n", argv0);
+    printf("  %s run [--manifest <path>] [--target <name>] [--backend <c|llvm>]\n", argv0);
+    printf("  %s test [--manifest <path>] [--target <name>] [--backend <c|llvm>]\n", argv0);
+}
+
+static bool parse_backend_name(const char* text, BackendKind* out_backend) {
+    if (strcmp(text, "c") == 0) {
+        *out_backend = BACKEND_C;
+        return true;
+    }
+    if (strcmp(text, "llvm") == 0) {
+        *out_backend = BACKEND_LLVM;
+        return true;
+    }
+    return false;
 }
 
 static bool ensure_dir(const char* path) {
@@ -309,10 +327,27 @@ static bool load_manifest(const char* manifest_path, BuildManifest* manifest) {
     return true;
 }
 
+static bool link_llvm_ir(const char* ir_path, const char* output_path) {
+    char cmd[32768];
+    int status = 0;
+    snprintf(cmd, sizeof(cmd), "xcrun clang -Wno-override-module -x ir \"%s\" -o \"%s\"", ir_path, output_path);
+    status = system(cmd);
+    if (status != 0) {
+        snprintf(cmd, sizeof(cmd), "clang -Wno-override-module -x ir \"%s\" -o \"%s\"", ir_path, output_path);
+        status = system(cmd);
+    }
+    if (status != 0) {
+        fprintf(stderr, "LLVM linkage failed.\n");
+        return false;
+    }
+    return true;
+}
+
 static int compile_input_file(const char* input_path, const char* stdlib_path,
                               const BuildManifest* manifest,
                               const char* build_dir, const char* output_path,
-                              bool dump_hir_only) {
+                              bool dump_hir_only, bool emit_llvm_only,
+                              BackendKind backend) {
     Arena* arena = arena_create();
     char* source = read_file_text(input_path);
     if (!source) {
@@ -360,13 +395,52 @@ static int compile_input_file(const char* input_path, const char* stdlib_path,
 
     Module* all_mods[128];
     int mod_count = semantic_get_modules(all_mods);
+    JirModule* jir_mods[128];
+    CodegenModuleInfo* codegen_infos[128];
+    int main_mod_index = -1;
+    for (int i = 0; i < mod_count; i++) {
+        Module* mod = all_mods[i];
+        HIRModule* hir = module_get_hir(mod);
+        jir_mods[i] = lower_hir_to_jir(hir, arena);
+        codegen_infos[i] = module_get_codegen_info(mod);
+        if (mod == main_mod) main_mod_index = i;
+    }
+
+    if (emit_llvm_only || backend == BACKEND_LLVM) {
+        char llvm_output_path[PATH_MAX];
+        if (emit_llvm_only) {
+            strncpy(llvm_output_path, output_path, sizeof(llvm_output_path) - 1);
+            llvm_output_path[sizeof(llvm_output_path) - 1] = '\0';
+        } else {
+            snprintf(llvm_output_path, sizeof(llvm_output_path), "%s.ll", output_path);
+        }
+        char llvm_error[512];
+        if (main_mod_index < 0 ||
+            !llvm_generate_ir_program(jir_mods, codegen_infos, (size_t)mod_count, (size_t)main_mod_index,
+                                      llvm_output_path, llvm_error, sizeof(llvm_error))) {
+            fprintf(stderr, "%s\n", llvm_error[0] ? llvm_error : "LLVM emission failed.");
+            arena_destroy(arena);
+            free(source);
+            return 1;
+        }
+        if (!emit_llvm_only && !link_llvm_ir(llvm_output_path, output_path)) {
+            arena_destroy(arena);
+            free(source);
+            return 1;
+        }
+        // LLVM codegen currently keeps a few semantic/lowering-owned references
+        // alive until process exit. Avoid tearing down the arena on the success
+        // path here so aggregate-heavy cases like anonymous unions don't crash
+        // after the final binary has already been produced.
+        return 0;
+    }
+
     char c_files[128][PATH_MAX];
     int c_count = 0;
 
     for (int i = 0; i < mod_count; i++) {
         Module* mod = all_mods[i];
-        HIRModule* hir = module_get_hir(mod);
-        JirModule* jir = lower_hir_to_jir(hir, arena);
+        JirModule* jir = jir_mods[i];
         if (!jir) continue;
 
         char out_path[PATH_MAX];
@@ -398,7 +472,7 @@ static int compile_input_file(const char* input_path, const char* stdlib_path,
 }
 
 static int build_project(const BuildManifest* manifest, const char* target_name,
-                         char* out_bin, size_t out_bin_size) {
+                         char* out_bin, size_t out_bin_size, BackendKind backend) {
     char build_dir[PATH_MAX];
     char root_path[PATH_MAX];
     char output_name[256];
@@ -414,12 +488,12 @@ static int build_project(const BuildManifest* manifest, const char* target_name,
         snprintf(output_name, sizeof(output_name), "%s", manifest->name);
     }
     path_join(build_dir, output_name, out_bin, out_bin_size);
-    return compile_input_file(root_path, manifest->stdlib_dir, manifest, build_dir, out_bin, false);
+    return compile_input_file(root_path, manifest->stdlib_dir, manifest, build_dir, out_bin, false, false, backend);
 }
 
-static int run_project(const BuildManifest* manifest, const char* target_name) {
+static int run_project(const BuildManifest* manifest, const char* target_name, BackendKind backend) {
     char out_bin[PATH_MAX];
-    int status = build_project(manifest, target_name, out_bin, sizeof(out_bin));
+    int status = build_project(manifest, target_name, out_bin, sizeof(out_bin), backend);
     if (status != 0) return status;
 
     char cmd[PATH_MAX + 4];
@@ -427,7 +501,7 @@ static int run_project(const BuildManifest* manifest, const char* target_name) {
     return system(cmd);
 }
 
-static int test_project(const BuildManifest* manifest, const char* target_name) {
+static int test_project(const BuildManifest* manifest, const char* target_name, BackendKind backend) {
     char test_dir[PATH_MAX];
     if (!manifest_target_test_dir(manifest, target_name, test_dir, sizeof(test_dir))) {
         fprintf(stderr, "Unknown test target '%s'\n", target_name ? target_name : "");
@@ -466,7 +540,7 @@ static int test_project(const BuildManifest* manifest, const char* target_name) 
         printf("正在测试 %s ... ", name);
         fflush(stdout);
 
-        int compile_status = compile_input_file(test_path, manifest->stdlib_dir, manifest, build_dir, output_bin, false);
+        int compile_status = compile_input_file(test_path, manifest->stdlib_dir, manifest, build_dir, output_bin, false, false, backend);
         bool expect_fail = strncmp(name, "fail_", 5) == 0;
 
         if (expect_fail) {
@@ -520,6 +594,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "build") == 0 || strcmp(argv[1], "run") == 0 || strcmp(argv[1], "test") == 0) {
         const char* manifest_path = "jiang.build";
         const char* target_name = NULL;
+        BackendKind backend = BACKEND_C;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--manifest") == 0) {
                 if (i + 1 >= argc) {
@@ -533,6 +608,15 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 target_name = argv[++i];
+            } else if (strcmp(argv[i], "--backend") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "Missing name after --backend\n");
+                    return 1;
+                }
+                if (!parse_backend_name(argv[++i], &backend)) {
+                    fprintf(stderr, "Unknown backend '%s'\n", argv[i]);
+                    return 1;
+                }
             } else {
                 fprintf(stderr, "Unknown argument: %s\n", argv[i]);
                 return 1;
@@ -544,17 +628,19 @@ int main(int argc, char** argv) {
 
         if (strcmp(argv[1], "build") == 0) {
             char out_bin[PATH_MAX];
-            int status = build_project(&manifest, target_name, out_bin, sizeof(out_bin));
+            int status = build_project(&manifest, target_name, out_bin, sizeof(out_bin), backend);
             if (status == 0) printf("Built %s\n", out_bin);
             return status;
         }
-        if (strcmp(argv[1], "run") == 0) return run_project(&manifest, target_name);
-        return test_project(&manifest, target_name);
+        if (strcmp(argv[1], "run") == 0) return run_project(&manifest, target_name, backend);
+        return test_project(&manifest, target_name, backend);
     }
 
     const char* stdlib_path = "std";
     const char* input_path = NULL;
     bool dump_hir_only = false;
+    bool emit_llvm_only = false;
+    BackendKind backend = BACKEND_C;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdlib-dir") == 0) {
             if (i + 1 >= argc) {
@@ -564,6 +650,17 @@ int main(int argc, char** argv) {
             stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-hir") == 0) {
             dump_hir_only = true;
+        } else if (strcmp(argv[i], "--emit-llvm") == 0) {
+            emit_llvm_only = true;
+        } else if (strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Missing name after --backend\n");
+                return 1;
+            }
+            if (!parse_backend_name(argv[++i], &backend)) {
+                fprintf(stderr, "Unknown backend '%s'\n", argv[i]);
+                return 1;
+            }
         } else {
             input_path = argv[i];
         }
@@ -580,6 +677,12 @@ int main(int argc, char** argv) {
     snprintf(build_dir, sizeof(build_dir), "build");
 
     char final_output_path[PATH_MAX];
-    snprintf(final_output_path, sizeof(final_output_path), "%s/%s", build_dir, output_path);
-    return compile_input_file(input_path, stdlib_path, NULL, build_dir, final_output_path, dump_hir_only);
+    snprintf(final_output_path, sizeof(final_output_path), "%s/%s%s", build_dir, output_path,
+             emit_llvm_only ? ".ll" : "");
+    int status = compile_input_file(input_path, stdlib_path, NULL, build_dir, final_output_path,
+                                    dump_hir_only, emit_llvm_only, backend);
+    if (status == 0 && (emit_llvm_only || backend == BACKEND_LLVM)) {
+        _Exit(0);
+    }
+    return status;
 }

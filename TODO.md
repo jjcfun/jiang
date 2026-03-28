@@ -5,23 +5,24 @@
 - Stage0 已完成，`TODO.md` 中原先定义的完成条件已全部达成。
 - 当前主线任务已切换到 Stage1：使用 Stage0 编译器启动 Jiang 自举。
 - 现阶段的 TODO 应优先服务于“把 Stage1 收成真实入口可工作的 Jiang 版编译器”，而不是继续扩张 Stage0 的语法面。
-- Stage1 的“真实入口可工作”主链已经基本收口；接下来的第一优先级应切换到构建系统，而不是直接进入 Stage2。
+- Stage1 的“真实入口可工作”主链、build system、runtime 边界与 UTF-8 字节串支持已经基本收口；LLVM 后端当前已通过 LLVM C API 路径跑通完整正向测试集，并作为可选完整后端进入回归。
 
 ## 🎯 当前优先级调整（Priority Reset）
 
-- 第一优先级：实现 Jiang 自身的最小 build system，统一项目入口、模块图、标准库注入、测试与 `jiang -> C -> cc` 构建链。
-- 第二优先级：在 build system 稳定后，继续完善标准库与 runtime 分层，逐步收口对 libc 的直接依赖。
-- 第三优先级：在模块模型、构建模型与标准库边界稳定后，再评估是否移除 C 过渡后端并接入 LLVM 或其他原生后端。
-- 第四优先级：在以上基础设施稳定后，再正式启动 Stage2 的编译器重构与高级特性实现。
+- 第一优先级：继续收口 LLVM 后端，把当前“可选完整后端”阶段稳固下来，再决定是否扩大覆盖面或切默认后端。
+- 第二优先级：在 LLVM 路线稳定后，再决定是否继续维持 `JIR -> C` 为正式主线或开始默认后端切换评估。
+- 第三优先级：在后端路线更清楚后，再正式启动 Stage2 的编译器重构与高级特性实现。
 
 当前阶段暂不作为主线推进的事项：
 
 - [ ] 不直接开始 Stage2 重构。
-- [ ] 不把“移除 C、接 LLVM”作为 Stage1 后续第一目标。
+- [x] 不把“移除 C、接 LLVM”作为 Stage1 后续第一目标。
 - [ ] 不在 build system 缺席的前提下大幅扩张标准库与包管理能力。
 
 相关执行计划见 `doc/plan_build_system.md`。
 当前阶段的下一份执行计划见 `doc/plan_runtime_boundary.md`。
+当前最新执行计划见 `doc/plan_llvm_spike.md`。
+当前下一阶段执行计划见 `doc/plan_llvm_c_api.md`。
 
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
@@ -128,6 +129,21 @@
 - [x] **保留裸 `print` / `assert` 兼容入口**: 当前继续作为 Stage0 与测试兼容能力保留，但不再视为标准库 public API。
 - [x] **限制 raw intrinsic 使用范围**: 当前面向用户的示例与标准库测试优先走 `std.*`，bootstrap 内部基础设施允许继续直连 intrinsic。
 - [x] **增加 runtime 边界回归**: 当前已通过单独 smoke 固定 runtime ABI 集合、`std` 对外模块集合与 README 说明一致性。
+
+### 0.2 Stage1 后续主线：LLVM Spike
+- [x] **固定 spike 范围**: 只验证最小 `JIR -> LLVM IR` 可行性，不替换正式 `JIR -> C` 主线。
+- [x] **建立实验性后端入口**: 已新增明确标记为实验性的 LLVM 输出路径，不影响现有默认构建链。
+- [x] **覆盖最小语义子集**: 当前已支持 `Int` / `Bool`、局部变量、算术与比较、`if` / `while`、函数调用、`return`，以及最小 `UInt8[]` / `print` / `assert` 路径。
+- [x] **复用现有 runtime ABI**: 当前未新增新的 `__intrinsic_*`，继续围绕冻结后的宿主入口验证后端可行性。
+- [x] **补 LLVM spike 回归**: 当前已加入独立 smoke，证明最小样例与 `import std;` 样例可稳定落到 LLVM IR 与 LLVM 工具链。
+
+### 0.3 Stage1 后续主线：接入 LLVM C API
+- [x] **固定迁移目标**: 当前已将实验性 LLVM 路径收口到 LLVM C API，不改变默认 `JIR -> C` 主线。
+- [x] **引入最小 LLVM C API 构建链**: 当前已在 CMake 中接入 `llvm-config` / LLVM C 头文件与最小链接库集合。
+- [x] **建立实验性 API 后端入口**: 当前已保留 `--emit-llvm`，并新增 `--backend llvm` 作为可选完整后端入口。
+- [x] **迁移最小已覆盖语义**: 当前已超出最小 spike 子集，支持完整模块图、聚合类型、`std.io` / `std.debug` / `std.fs` 与完整正向测试集。
+- [x] **移除 textual fallback**: 当前仓库中已不再保留旧的 textual LLVM emitter / fallback 逻辑。
+- [x] **补 API 级 smoke 与回归**: 当前 `script/llvm_spike_smoke.sh`、`script/test_llvm_backend.sh` 与 `script/test.sh` 都已覆盖 LLVM 后端路径。
 
 ### 0. 建立 Stage1 工程骨架
 - [x] **创建 Stage1 源码目录**: 当前使用顶层 `bootstrap/` 目录承载 Jiang 版编译器源码。
