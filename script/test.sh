@@ -32,6 +32,9 @@ bash "$PROJECT_ROOT/script/llvm_spike_smoke.sh"
 echo -e "\n--- 1.68. 运行 LLVM Backend 回归测试 ---"
 bash "$PROJECT_ROOT/script/test_llvm_backend.sh"
 
+echo -e "\n--- 1.69. 运行 Bootstrap LLVM 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/bootstrap_llvm_smoke.sh"
+
 echo -e "\n--- 1.7. 运行 Stage1 Build System 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_build_system_smoke.sh"
 

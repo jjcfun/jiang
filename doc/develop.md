@@ -75,7 +75,22 @@ Jiang 目前采用循序渐进的路线：
 *   [ ] 评估 LLVM IR 或其他原生后端接入时机
 *   [ ] 逐步摆脱 C 作为过渡后端
 
-### 当前优先主线：LLVM Spike
+### 当前优先主线：Bootstrap LLVM 收口
+
+当前 `--backend llvm` 已经可以覆盖完整正向测试集，并通过 `script/test_llvm_backend.sh` 与 `script/test.sh`。
+`bootstrap/lexer.jiang` 当前也已经可以通过 LLVM 后端完成：
+
+*   单文件 `--backend llvm` 编译并运行
+*   `bootstrap/jiang.build` manifest 路径下的 `build --backend llvm` 编译并运行
+
+当前最值得继续推进的不是再扩大普通样例覆盖，而是收口 bootstrap 的 LLVM 路径，优先回答：
+
+*   如何继续扩大 bootstrap LLVM 覆盖面，而不只是停在 `lexer.jiang`
+*   何时开始评估是否把更多 bootstrap 入口迁到 LLVM 路径
+
+当前最新计划见 `doc/plan_bootstrap_llvm.md`。
+
+### 已完成阶段：LLVM Spike / LLVM C API 路径
 
 在 build system、runtime 边界与 UTF-8 字节串支持收口之后，当前 Stage1 的下一阶段主线不是直接切正式后端，而是先做一个受控的 LLVM spike。
 

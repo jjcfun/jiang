@@ -59,6 +59,8 @@ typedef struct {
     LLVMBasicBlockRef then_blocks[512];
     bool has_label_block[512];
     LLVMValueRef locals[512];
+    LLVMValueRef global_array_aliases[512];
+    bool has_global_array_alias[512];
     size_t local_count;
 } LlvmApiFunctionState;
 
@@ -342,6 +344,12 @@ static JirFunction* llvm_api_find_jir_function(JirModule* mod, Token name) {
     return NULL;
 }
 
+static LLVMValueRef llvm_api_find_named_global(LlvmApiState* state, Token name) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%.*s", (int)name.length, name.start);
+    return LLVMGetNamedGlobal(state->module, buf);
+}
+
 static LLVMValueRef llvm_api_find_llvm_function(LlvmApiState* state, Token name) {
     char buf[128];
     snprintf(buf, sizeof(buf), "%.*s", (int)name.length, name.start);
@@ -403,6 +411,11 @@ static bool llvm_api_emit_load(LlvmApiState* state, LlvmApiFunctionState* fn_sta
                        "LLVM C API: unsupported local type for %s", fn_state->func->locals[reg].name);
         return false;
     }
+    if (fn_state->has_global_array_alias[reg]) {
+        *out_value = LLVMBuildLoad2(state->builder, llvm_type, fn_state->global_array_aliases[reg], "loadtmp");
+        if (out_type) *out_type = type;
+        return true;
+    }
     *out_value = LLVMBuildLoad2(state->builder, llvm_type, fn_state->locals[reg], "loadtmp");
     if (out_type) *out_type = type;
     return true;
@@ -413,6 +426,11 @@ static bool llvm_api_emit_address(LlvmApiState* state, LlvmApiFunctionState* fn_
     if (reg < 0 || (size_t)reg >= fn_state->local_count) {
         llvm_api_error(state->error_buf, state->error_buf_size, "LLVM C API: invalid register %d", reg);
         return false;
+    }
+    if (fn_state->has_global_array_alias[reg]) {
+        if (out_addr) *out_addr = fn_state->global_array_aliases[reg];
+        if (out_type) *out_type = fn_state->func->locals[reg].type;
+        return true;
     }
     if (out_addr) *out_addr = fn_state->locals[reg];
     if (out_type) *out_type = fn_state->func->locals[reg].type;
@@ -1131,6 +1149,20 @@ static bool llvm_api_emit_function(LlvmApiState* state, JirFunction* func, bool 
     }
 
     for (size_t i = 0; i < func->local_count; i++) {
+        TypeExpr* local_type = llvm_api_unwrap_type(func->locals[i].type);
+        if (!local_type || local_type->kind != TYPE_ARRAY) continue;
+        int def_idx = llvm_api_find_def_inst_index(func, (int)i);
+        if (def_idx < 0) continue;
+        JirInst* def = &func->insts[def_idx];
+        if (def->op != JIR_OP_LOAD_SYM || !def->payload.name.start || def->payload.name.length <= 0) continue;
+        LLVMValueRef global = llvm_api_find_named_global(state, def->payload.name);
+        if (!global) continue;
+        fn_state.global_array_aliases[i] = global;
+        fn_state.has_global_array_alias[i] = true;
+    }
+
+    for (size_t i = 0; i < func->local_count; i++) {
+        if (fn_state.has_global_array_alias[i]) continue;
         LLVMTypeRef local_type = llvm_api_type_ref(state, func->locals[i].type);
         if (!local_type || local_type == state->void_type) {
             llvm_api_error(state->error_buf, state->error_buf_size,
@@ -1213,6 +1245,10 @@ static bool llvm_api_emit_function(LlvmApiState* state, JirFunction* func, bool 
                                    LLVMConstInt(dest_type ? dest_type : state->i64_type,
                                                 (unsigned long long)enum_value, true),
                                    fn_state.locals[inst->dest]);
+                    break;
+                }
+                if (inst->dest >= 0 && (size_t)inst->dest < fn_state.local_count &&
+                    fn_state.has_global_array_alias[inst->dest]) {
                     break;
                 }
                 char sym_name[128];
@@ -1455,13 +1491,17 @@ static bool llvm_api_emit_function(LlvmApiState* state, JirFunction* func, bool 
                     LLVMValueRef index_value = NULL;
                     if (!llvm_api_emit_load(state, &fn_state, inst->src2, &index_value, &index_type)) return false;
                     if (object_type && object_type->kind == TYPE_ARRAY) {
+                        LLVMValueRef array_base =
+                            fn_state.has_global_array_alias[inst->src1]
+                                ? fn_state.global_array_aliases[inst->src1]
+                                : fn_state.locals[inst->src1];
                         LLVMValueRef indices[2] = {
                             LLVMConstInt(state->i64_type, 0, false),
                             index_value,
                         };
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(state->builder,
                                                               llvm_api_type_ref(state, object_type),
-                                                              fn_state.locals[inst->src1],
+                                                              array_base,
                                                               indices, 2, "array.elem.ptr");
                         LLVMTypeRef elem_type = llvm_api_type_ref(state, object_type->as.array.element);
                         LLVMValueRef elem = LLVMBuildLoad2(state->builder, elem_type, elem_ptr, "array.elem");
@@ -1720,12 +1760,16 @@ static bool llvm_api_emit_function(LlvmApiState* state, JirFunction* func, bool 
                     if (!llvm_api_emit_load(state, &fn_state, inst->src2, &start_index, &start_type)) return false;
                 }
                 if (obj_type && obj_type->kind == TYPE_ARRAY) {
+                    LLVMValueRef array_base =
+                        fn_state.has_global_array_alias[inst->src1]
+                            ? fn_state.global_array_aliases[inst->src1]
+                            : fn_state.locals[inst->src1];
                     LLVMValueRef indices[2] = {
                         LLVMConstInt(state->i64_type, 0, false),
                         start_index,
                     };
                     base_ptr = LLVMBuildGEP2(state->builder, llvm_api_type_ref(state, obj_type),
-                                             fn_state.locals[inst->src1], indices, 2, "slice.from.array");
+                                             array_base, indices, 2, "slice.from.array");
                     long long arr_len = llvm_api_static_array_length(obj_type);
                     len_value = LLVMConstInt(state->i64_type, (unsigned long long)arr_len, false);
                 } else if (obj_type && obj_type->kind == TYPE_SLICE) {
@@ -1768,13 +1812,17 @@ static bool llvm_api_emit_function(LlvmApiState* state, JirFunction* func, bool 
                     LLVMValueRef index_value = NULL;
                     if (!llvm_api_emit_load(state, &fn_state, inst->src2, &index_value, &index_type)) return false;
                     if (object_type && object_type->kind == TYPE_ARRAY) {
+                        LLVMValueRef array_base =
+                            fn_state.has_global_array_alias[inst->dest]
+                                ? fn_state.global_array_aliases[inst->dest]
+                                : fn_state.locals[inst->dest];
                         LLVMValueRef indices[2] = {
                             LLVMConstInt(state->i64_type, 0, false),
                             index_value,
                         };
                         LLVMValueRef elem_ptr = LLVMBuildGEP2(state->builder,
                                                               llvm_api_type_ref(state, object_type),
-                                                              fn_state.locals[inst->dest],
+                                                              array_base,
                                                               indices, 2, "array.elem.ptr");
                         LLVMBuildStore(state->builder, value, elem_ptr);
                         break;
