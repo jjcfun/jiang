@@ -75,20 +75,16 @@ Jiang 目前采用循序渐进的路线：
 *   [ ] 评估 LLVM IR 或其他原生后端接入时机
 *   [ ] 逐步摆脱 C 作为过渡后端
 
-### 当前优先主线：Bootstrap LLVM 收口
+### 当前优先主线：评估默认 LLVM 后端候选
 
-当前 `--backend llvm` 已经可以覆盖完整正向测试集，并通过 `script/test_llvm_backend.sh` 与 `script/test.sh`。
-`bootstrap/lexer.jiang` 当前也已经可以通过 LLVM 后端完成：
+当前 `--backend llvm` 已经可以覆盖完整正向测试集，并通过 `script/test_llvm_backend.sh`、`script/bootstrap_llvm_smoke.sh` 与 `script/test.sh`。
+bootstrap LLVM 收口阶段已经完成；当前更值得做的不是继续无限扩大 wrapper smoke，而是回答：
 
-*   单文件 `--backend llvm` 编译并运行
-*   `bootstrap/jiang.build` manifest 路径下的 `build --backend llvm` 编译并运行
+*   C 与 LLVM 在代表入口上的行为是否已经稳定一致
+*   LLVM 是否已经达到 Stage1 默认后端候选的成熟度
+*   如果现在不切默认后端，剩余理由是否已经收缩到少数明确风险
 
-当前最值得继续推进的不是再扩大普通样例覆盖，而是收口 bootstrap 的 LLVM 路径，优先回答：
-
-*   如何继续扩大 bootstrap LLVM 覆盖面，而不只是停在 `lexer.jiang`
-*   何时开始评估是否把更多 bootstrap 入口迁到 LLVM 路径
-
-当前最新计划见 `doc/plan_bootstrap_llvm.md`。
+当前最新计划见 `doc/plan_stage1_default_llvm.md`。
 
 ### 已完成阶段：LLVM Spike / LLVM C API 路径
 

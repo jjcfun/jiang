@@ -63,10 +63,6 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
   School?* school = #SQL(my_db) { select * where id == user.school_id from School limit 1 }
   ```
 
-#####  5. 面向AI的编程语言（2.0版本实现）
-
-如果你了解了第4点子语言的概念，那么不难推断：子语言可以面向人类设计，当然可以面向AI设计。我只要将词法解析生成的Token扩展到大语言模型的Token...💡
-
 
 
 ## 开发进展
@@ -77,7 +73,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 + **Stage0**: 用 C 语言实现编译器的基本功能。该阶段已经完成：当前编译器已具备多模块、Union/Pattern、Binding、最小标准库与 `import std;` 支持，主链稳定为 `AST -> JIR -> C`，并已通过当前测试集验证
 
-+ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。当前已经具备可工作的 `AST -> HIR -> JIR -> C` 真实入口链路：`compiler_core.compile_entry(path, mode)` 可对当前受支持的 `bootstrap/*.jiang` 入口模块执行 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`，核心 bootstrap 模块已进入正式 real-entry 回归，并继续以系统 C 编译器作为过渡后端
++ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。当前已经具备可工作的 `AST -> HIR -> JIR -> C` 真实入口链路：`compiler_core.compile_entry(path, mode)` 可对当前受支持的 `bootstrap/*.jiang` 入口模块执行 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`；同时 `--backend llvm` 已经作为可选完整后端进入回归，核心 bootstrap 模块也已进入 LLVM smoke 覆盖，但默认后端当前仍保持 C
 
 + **Stage2**: 用Jiang语言重构Jiang语言编译器，并实现自定义语法等高级功能，此阶段追求代码质量和性能，并使用人工实现
 
@@ -228,6 +224,23 @@ import greet;
 ```
 
 当前目标是先统一项目入口、标准库路径与 `jiang -> C -> cc` 构建链，不在这一版中直接引入完整包管理与可编程构建 DSL。
+
+### LLVM 后端（当前状态）
+
+当前仓库已经提供实验完成态的可选 LLVM 后端：
+
+```bash
+./build/jiangc --backend llvm tests/std_import_test.jiang
+./build/jiangc --emit-llvm tests/std_import_test.jiang
+./build/jiangc build --backend llvm --manifest ./examples/build_demo/jiang.build
+```
+
+当前状态：
+
+- `JIR -> C` 仍是默认后端
+- `--backend llvm` 已通过当前正向测试集
+- bootstrap 关键入口已经进入 LLVM smoke
+- 当前下一步是评估 LLVM 是否已达到 Stage1 默认后端候选，而不是立刻切换默认后端
 
 ## 许可证
 

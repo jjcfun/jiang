@@ -35,6 +35,9 @@ bash "$PROJECT_ROOT/script/test_llvm_backend.sh"
 echo -e "\n--- 1.69. 运行 Bootstrap LLVM 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/bootstrap_llvm_smoke.sh"
 
+echo -e "\n--- 1.695. 运行默认 LLVM 后端候选评估 ---"
+bash "$PROJECT_ROOT/script/evaluate_default_llvm.sh"
+
 echo -e "\n--- 1.7. 运行 Stage1 Build System 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_build_system_smoke.sh"
 

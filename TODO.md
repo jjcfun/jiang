@@ -9,8 +9,8 @@
 
 ## 🎯 当前优先级调整（Priority Reset）
 
-- 第一优先级：继续扩大 bootstrap LLVM 覆盖面，当前 `bootstrap/lexer.jiang` 的单文件与 manifest LLVM 路径都已跑通。
-- 第二优先级：在 bootstrap LLVM 路径进一步稳定后，再决定是否扩大到更多 bootstrap 入口或评估默认后端切换。
+- 第一优先级：评估是否把 LLVM 提升为 Stage1 默认后端候选，重点从“覆盖更多 smoke”切换到“C / LLVM 行为对比与切换证据”。
+- 第二优先级：在默认后端评估完成后，再决定是否真的切默认后端，或继续保持 C 默认、LLVM 作为成熟可选后端。
 - 第三优先级：在后端路线更清楚后，再正式启动 Stage2 的编译器重构与高级特性实现。
 
 当前阶段暂不作为主线推进的事项：
@@ -23,7 +23,7 @@
 当前阶段的下一份执行计划见 `doc/plan_runtime_boundary.md`。
 当前最新执行计划见 `doc/plan_llvm_spike.md`。
 当前下一阶段执行计划见 `doc/plan_llvm_c_api.md`。
-当前当前优先执行计划见 `doc/plan_bootstrap_llvm.md`。
+当前当前优先执行计划见 `doc/plan_stage1_default_llvm.md`。
 
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
