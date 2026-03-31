@@ -73,7 +73,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 + **Stage0**: 用 C 语言实现编译器的基本功能。该阶段已经完成：当前编译器已具备多模块、Union/Pattern、Binding、最小标准库与 `import std;` 支持，主链稳定为 `AST -> JIR -> C`，并已通过当前测试集验证
 
-+ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。当前已经具备可工作的 `AST -> HIR -> JIR -> C` 真实入口链路：`compiler_core.compile_entry(path, mode)` 可对当前受支持的 `bootstrap/*.jiang` 入口模块执行 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`；同时 `--backend llvm` 已经作为可选完整后端进入回归，核心 bootstrap 模块也已进入 LLVM smoke 覆盖，但默认后端当前仍保持 C
++ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。当前已经具备可工作的 `AST -> HIR -> JIR -> C` 真实入口链路：`compiler_core.compile_entry(path, mode)` 可对当前受支持的 `bootstrap/*.jiang` 入口模块执行 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`；同时 `--backend llvm` 已经作为可选完整后端进入回归，核心 bootstrap 模块也已进入 LLVM smoke 覆盖，但默认后端当前仍保持 C。当前仓库里的 `compiler/` 目录也属于 Stage1 后期主线，用于孵化下一代 Jiang 编译器骨架，还不应视为 README 定义里的正式 Stage2
 
 + **Stage2**: 用Jiang语言重构Jiang语言编译器，并实现自定义语法等高级功能，此阶段追求代码质量和性能，并使用人工实现
 

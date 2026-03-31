@@ -11,7 +11,7 @@
 
 - 第一优先级：评估是否把 LLVM 提升为 Stage1 默认后端候选，重点从“覆盖更多 smoke”切换到“C / LLVM 行为对比与切换证据”。
 - 第二优先级：在默认后端评估完成后，再决定是否真的切默认后端，或继续保持 C 默认、LLVM 作为成熟可选后端。
-- 第三优先级：在后端路线更清楚后，再正式启动 Stage2 的编译器重构与高级特性实现。
+- 第三优先级：继续推进 Stage1 后期主线，并在 `compiler/` 目录中孵化下一代 Jiang 编译器骨架；当前先使用根层 `compiler/*.jiang` 模块，不提前拆子目录。
 
 当前阶段暂不作为主线推进的事项：
 
@@ -24,6 +24,7 @@
 当前最新执行计划见 `doc/plan_llvm_spike.md`。
 当前下一阶段执行计划见 `doc/plan_llvm_c_api.md`。
 当前当前优先执行计划见 `doc/plan_stage1_default_llvm.md`。
+Stage1 后期 `compiler/` 主线计划见 `doc/plan_stage2_start.md`。
 
 ## ✅ 已完成 (Completed)
 - [x] **内置符号重构**: 将 `print` 和 `assert` 从硬编码关键字改为预制标识符（Predefined Identifiers）。
