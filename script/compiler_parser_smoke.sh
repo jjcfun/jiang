@@ -50,4 +50,19 @@ if [[ "$OUT" != *"field Int count"* ]]; then
     exit 1
 fi
 
+if [[ "$OUT" != *"struct_decl Point"* ]]; then
+    echo "compiler parser smoke missing second struct decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"field UInt8 x"* ]]; then
+    echo "compiler parser smoke missing Point.x field" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"field Bool y"* ]]; then
+    echo "compiler parser smoke missing Point.y field" >&2
+    exit 1
+fi
+
 echo "compiler parser smoke passed"

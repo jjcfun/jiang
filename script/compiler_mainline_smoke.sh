@@ -50,6 +50,21 @@ if [[ "$OUT" != *"field_decl name=count type=Int"* ]]; then
     exit 1
 fi
 
+if [[ "$OUT" != *"struct_decl name=Point"* ]]; then
+    echo "compiler mainline smoke missing semantic second struct decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"field_decl name=x type=UInt8"* ]]; then
+    echo "compiler mainline smoke missing semantic Point.x field decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"field_decl name=y type=Bool"* ]]; then
+    echo "compiler mainline smoke missing semantic Point.y field decl" >&2
+    exit 1
+fi
+
 if [[ "$OUT" != *"stage2 hir dump:"* ]]; then
     echo "compiler mainline smoke missing hir dump header" >&2
     exit 1
@@ -60,6 +75,11 @@ if [[ "$OUT" != *"struct_decl public sym=Box"* ]]; then
     exit 1
 fi
 
+if [[ "$OUT" != *"struct_decl sym=Point"* ]]; then
+    echo "compiler mainline smoke missing hir second struct decl" >&2
+    exit 1
+fi
+
 if [[ "$OUT" != *"stage2 jir dump:"* ]]; then
     echo "compiler mainline smoke missing jir dump header" >&2
     exit 1
@@ -67,6 +87,16 @@ fi
 
 if [[ "$OUT" != *"field_decl name=count type=Int"* ]]; then
     echo "compiler mainline smoke missing jir second field decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"field_decl name=x type=UInt8"* ]]; then
+    echo "compiler mainline smoke missing jir Point.x field decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"field_decl name=y type=Bool"* ]]; then
+    echo "compiler mainline smoke missing jir Point.y field decl" >&2
     exit 1
 fi
 
@@ -82,6 +112,11 @@ fi
 
 if [[ "$OUT" != *"typedef struct Box {"* ]]; then
     echo "compiler mainline smoke missing c struct decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"typedef struct Point {"* ]]; then
+    echo "compiler mainline smoke missing Point c struct decl" >&2
     exit 1
 fi
 
@@ -102,6 +137,26 @@ fi
 
 if [[ "$OUT" != *"result.count = count;"* ]]; then
     echo "compiler mainline smoke missing c field assignment" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"uint8_t x;"* ]]; then
+    echo "compiler mainline smoke missing Point.x c field" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"int64_t y;"* ]]; then
+    echo "compiler mainline smoke missing Point.y c field" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"Point Point_new(uint8_t x, int64_t y)"* ]]; then
+    echo "compiler mainline smoke missing Point c ctor" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"result.y = y;"* ]]; then
+    echo "compiler mainline smoke missing Point c field assignment" >&2
     exit 1
 fi
 
