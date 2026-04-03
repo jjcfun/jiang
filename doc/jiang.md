@@ -868,3 +868,13 @@ alias x = a + b;
 ```
 
 使用 `public alias` 重新导出符号时，目标符号本身必须是源模块中的公开符号。如果当前模块已经存在同名定义，则应当报错，除非显式更换别名。
+
+### FFI
+
+```c
+extern {
+  public Int open(CString path, Int options)
+  public Int write(Int fd, UInt8[] buf, Int count)
+}
+
+```
