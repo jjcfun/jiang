@@ -124,6 +124,10 @@ static bool is_compat_builtin_name(const char* name) {
     return strcmp(name, "print") == 0 || strcmp(name, "assert") == 0;
 }
 
+static bool is_intrinsic_builtin_name(const char* name) {
+    return strncmp(name, "__intrinsic_", 12) == 0;
+}
+
 static bool same_base_name(TypeExpr* type, const char* name) {
     type = unwrap_type(type);
     return type && type->kind == TYPE_BASE && strlen(name) == type->as.base_type.length &&
@@ -163,7 +167,8 @@ static Symbol* symbol_define(const char* name, size_t name_len,
                              SymbolKind kind, TypeExpr* type, int line, bool is_public) {
     for (Symbol* it = current_scope->symbols; it; it = it->next) {
         if (strlen(it->name) == name_len && strncmp(it->name, name, name_len) == 0) {
-            if (it->defined_line == 0 && is_compat_builtin_name(it->name)) {
+            if (it->defined_line == 0 &&
+                (is_compat_builtin_name(it->name) || is_intrinsic_builtin_name(it->name))) {
                 break;
             }
             semantic_error(line, "Redefinition of '%.*s'", (int)name_len, name);
@@ -678,6 +683,7 @@ static void check_node(ASTNode* node) {
         case AST_FUNC_DECL:
             node->symbol = symbol_define(node->as.func_decl.name.start, node->as.func_decl.name.length,
                                          SYM_FUNC, node->as.func_decl.return_type, node->line, node->is_public);
+            if (node->is_extern) break;
             scope_push();
             for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
                 ASTNode* p = node->as.func_decl.params[i];

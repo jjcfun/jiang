@@ -57,6 +57,7 @@ typedef enum {
     TOKEN_UNION,
     TOKEN_IMPORT,
     TOKEN_PUBLIC,
+    TOKEN_EXTERN,
     TOKEN_NEW,
     TOKEN_TRUE,
     TOKEN_FALSE,

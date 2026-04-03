@@ -898,12 +898,14 @@ JirModule* lower_hir_to_jir(HIRModule* module, Arena* arena) {
     current_jir_mod = mod;
     for (HIRNode* child = hir_first_child(hir_root(module)); child; child = hir_next_sibling(child)) {
         if (child->kind == HIR_FUNC_DECL) {
+            if (child->is_extern) continue;
             lower_emit_function_body(child, child->token, child->declared_type, NULL, false, NULL);
         } else if (child->kind == HIR_STRUCT_DECL) {
             TypeExpr* owner_type = lower_make_base_type_from_token(child->token);
             TypeExpr* self_type = lower_make_pointer_type(owner_type);
             for (HIRNode* member = hir_first_child(child); member; member = hir_next_sibling(member)) {
                 if (member->kind == HIR_FUNC_DECL) {
+                    if (member->is_extern) continue;
                     Token name = lower_join_tokens(child->token, "_", member->token);
                     bool is_static = lower_is_static_struct_method(member);
                     lower_emit_function_body(member, name, member->declared_type, is_static ? NULL : self_type, !is_static, is_static ? NULL : child);

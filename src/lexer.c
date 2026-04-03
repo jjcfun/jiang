@@ -117,6 +117,7 @@ static TokenType identifier_type() {
                 switch (lexer.start[1]) {
                     case 'l': return check_keyword(2, 2, "se", TOKEN_ELSE);
                     case 'n': return check_keyword(2, 2, "um", TOKEN_ENUM);
+                    case 'x': return check_keyword(2, 4, "tern", TOKEN_EXTERN);
                 }
             }
             break;

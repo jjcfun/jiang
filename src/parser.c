@@ -97,6 +97,7 @@ static ASTNode* struct_declaration();
 static ASTNode* enum_declaration();
 static ASTNode* block_statement();
 static ASTNode* function_declaration(TypeExpr* return_type, Token name);
+static ASTNode* extern_block_statement(void);
 static ASTNode* parse_binding();
 static ASTNode* parse_binding_list();
 static ASTNode* parse_binding_assign_statement();
@@ -142,6 +143,7 @@ static void synchronize() {
             case TOKEN_RETURN:
             case TOKEN_SUDO:
             case TOKEN_UNDERSCORE:
+            case TOKEN_EXTERN:
                 return;
             default: ; // Do nothing
         }
@@ -716,6 +718,64 @@ static ASTNode* function_declaration(TypeExpr* return_type, Token name) {
     return node;
 }
 
+static ASTNode* extern_function_declaration(bool is_public) {
+    TypeExpr* return_type = parse_type();
+    consume(TOKEN_IDENTIFIER, "Expect function name in extern declaration.");
+    Token name = parser.previous;
+    consume(TOKEN_LEFT_PAREN, "Expect '(' after function name.");
+
+    ASTNode* params[64];
+    size_t count = 0;
+
+    if (!check(TOKEN_RIGHT_PAREN)) {
+        do {
+            TypeExpr* p_type = parse_type();
+            consume(TOKEN_IDENTIFIER, "Expect parameter name.");
+            Token p_name = parser.previous;
+
+            ASTNode* param = ast_new_node(parser.arena, AST_VAR_DECL, p_name.line);
+            param->as.var_decl.type = p_type;
+            param->as.var_decl.name = p_name;
+            param->as.var_decl.initializer = NULL;
+            params[count++] = param;
+        } while (match(TOKEN_COMMA));
+    }
+
+    consume(TOKEN_RIGHT_PAREN, "Expect ')' after parameters.");
+    match(TOKEN_SEMICOLON);
+
+    ASTNode* node = ast_new_node(parser.arena, AST_FUNC_DECL, name.line);
+    node->is_public = is_public;
+    node->is_extern = true;
+    node->as.func_decl.return_type = return_type;
+    node->as.func_decl.name = name;
+    node->as.func_decl.param_count = count;
+    node->as.func_decl.params = arena_alloc(parser.arena, sizeof(ASTNode*) * count);
+    memcpy(node->as.func_decl.params, params, sizeof(ASTNode*) * count);
+    node->as.func_decl.body = NULL;
+    return node;
+}
+
+static ASTNode* extern_block_statement(void) {
+    Token extern_tok = parser.previous;
+    consume(TOKEN_LEFT_BRACE, "Expect '{' after 'extern'.");
+
+    ASTNode* program = ast_new_node(parser.arena, AST_PROGRAM, extern_tok.line);
+    ASTNode* statements[256];
+    size_t count = 0;
+
+    while (!check(TOKEN_RIGHT_BRACE) && !check(TOKEN_EOF)) {
+        bool is_public = match(TOKEN_PUBLIC);
+        statements[count++] = extern_function_declaration(is_public);
+    }
+
+    consume(TOKEN_RIGHT_BRACE, "Expect '}' after extern block.");
+    program->as.block.statements = arena_alloc(parser.arena, sizeof(ASTNode*) * count);
+    memcpy(program->as.block.statements, statements, sizeof(ASTNode*) * count);
+    program->as.block.count = count;
+    return program;
+}
+
 static ASTNode* enum_declaration() {
     TypeExpr* base_type = NULL;
     if (match(TOKEN_LEFT_PAREN)) {
@@ -1106,6 +1166,9 @@ static ASTNode* statement() {
     
     if (match(TOKEN_IMPORT)) {
         return import_statement(is_public);
+    }
+    if (match(TOKEN_EXTERN)) {
+        return extern_block_statement();
     }
     if (match(TOKEN_IF)) {
         return if_statement();

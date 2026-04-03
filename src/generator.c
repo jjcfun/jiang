@@ -635,7 +635,7 @@ static void gen_collect_tuple_types_from_node(ASTNode* node) {
         case AST_FUNC_DECL:
             gen_collect_tuple_types_from_type(node->as.func_decl.return_type);
             for (size_t i = 0; i < node->as.func_decl.param_count; i++) gen_collect_tuple_types_from_node(node->as.func_decl.params[i]);
-            gen_collect_tuple_types_from_node(node->as.func_decl.body);
+            if (!node->is_extern) gen_collect_tuple_types_from_node(node->as.func_decl.body);
             break;
         case AST_RETURN_STMT:
             gen_collect_tuple_types_from_node(node->as.return_stmt.expression);
@@ -1661,7 +1661,8 @@ static void gen_collect_patterns(ASTNode* node) {
 static void generate_implementations(ASTNode* root, FILE* out, bool is_main, bool emit_free_functions, bool emit_main_body) {
     for (size_t i = 0; i < root->as.block.count; i++) {
         ASTNode* node = root->as.block.statements[i];
-        if (node->type == AST_FUNC_DECL && emit_free_functions && !gen_should_emit_jir_for_ast_function(node)) {
+        if (node->type == AST_FUNC_DECL && emit_free_functions && !node->is_extern &&
+            !gen_should_emit_jir_for_ast_function(node)) {
             gen_sym_count = 0; // Local scope for function
             gen_is_local = true;
             gen_collect_patterns(node->as.func_decl.body);
@@ -1693,7 +1694,7 @@ static void generate_implementations(ASTNode* root, FILE* out, bool is_main, boo
             }
             for (size_t j = 0; j < node->as.struct_decl.member_count; j++) {
                 ASTNode* m = node->as.struct_decl.members[j];
-                if (m->type == AST_FUNC_DECL) {
+                if (m->type == AST_FUNC_DECL && !m->is_extern) {
                     gen_sym_count = 0;
                     gen_is_local = true;
                     gen_collect_patterns(m->as.func_decl.body);

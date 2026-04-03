@@ -277,7 +277,8 @@ void ast_print(ASTNode* node, int depth) {
         case AST_FUNC_DECL:
             printf("FuncDecl (ReturnType: ");
             type_print(node->as.func_decl.return_type);
-            printf(", Name: '%.*s')\n", (int)node->as.func_decl.name.length, node->as.func_decl.name.start);
+            printf(", Name: '%.*s'%s)\n", (int)node->as.func_decl.name.length, node->as.func_decl.name.start,
+                   node->is_extern ? ", Extern: true" : "");
             print_indent(depth + 1);
             printf("Params [\n");
             for (size_t i = 0; i < node->as.func_decl.param_count; i++) {
@@ -285,9 +286,11 @@ void ast_print(ASTNode* node, int depth) {
             }
             print_indent(depth + 1);
             printf("]\n");
-            print_indent(depth + 1);
-            printf("Body:\n");
-            ast_print(node->as.func_decl.body, depth + 2);
+            if (node->as.func_decl.body) {
+                print_indent(depth + 1);
+                printf("Body:\n");
+                ast_print(node->as.func_decl.body, depth + 2);
+            }
             break;
         case AST_RETURN_STMT:
             printf("ReturnStmt (\n");

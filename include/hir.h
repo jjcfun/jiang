@@ -57,6 +57,7 @@ struct HIRNode {
     HIRKind kind;
     int line;
     bool is_public;
+    bool is_extern;
     TypeExpr* evaluated_type;
     Symbol* symbol;
     TypeExpr* type_expr;

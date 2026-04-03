@@ -107,10 +107,11 @@ typedef enum {
     } Symbol;
 
     typedef struct ASTNode ASTNode;
-    struct ASTNode {
+struct ASTNode {
     NodeType type;
     int line; // Line number for error reporting
     bool is_public; // Visibility flag
+    bool is_extern; // External declaration flag
     TypeExpr* evaluated_type; // Type information determined during semantic analysis
     Symbol* symbol;    // <--- Explicit binding to resolved symbol
 

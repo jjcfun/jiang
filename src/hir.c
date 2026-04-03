@@ -121,6 +121,7 @@ static HIRNode* hir_build_node(ASTNode* node, Arena* arena) {
 
     HIRNode* hir = hir_new_node(arena, hir_kind_from_ast(node->type), node->line);
     hir->is_public = node->is_public;
+    hir->is_extern = node->is_extern;
     hir->evaluated_type = node->evaluated_type;
     hir->symbol = node->symbol;
 
