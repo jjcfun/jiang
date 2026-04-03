@@ -65,6 +65,26 @@ if [[ "$OUT" != *"field_decl name=y type=Bool"* ]]; then
     exit 1
 fi
 
+if [[ "$OUT" != *"func_decl return=Int name=add"* ]]; then
+    echo "compiler mainline smoke missing semantic function decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"param_decl name=left type=Int"* ]]; then
+    echo "compiler mainline smoke missing semantic first param" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"param_decl name=right type=Int"* ]]; then
+    echo "compiler mainline smoke missing semantic second param" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"return_stmt value=left + right"* ]]; then
+    echo "compiler mainline smoke missing semantic return stmt" >&2
+    exit 1
+fi
+
 if [[ "$OUT" != *"stage2 hir dump:"* ]]; then
     echo "compiler mainline smoke missing hir dump header" >&2
     exit 1
@@ -77,6 +97,11 @@ fi
 
 if [[ "$OUT" != *"struct_decl sym=Point"* ]]; then
     echo "compiler mainline smoke missing hir second struct decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"func_decl return=Int sym=add"* ]]; then
+    echo "compiler mainline smoke missing hir function decl" >&2
     exit 1
 fi
 
@@ -97,6 +122,11 @@ fi
 
 if [[ "$OUT" != *"field_decl name=y type=Bool"* ]]; then
     echo "compiler mainline smoke missing jir Point.y field decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"func_decl return=Int sym=add"* ]]; then
+    echo "compiler mainline smoke missing jir function decl" >&2
     exit 1
 fi
 
@@ -157,6 +187,16 @@ fi
 
 if [[ "$OUT" != *"result.y = y;"* ]]; then
     echo "compiler mainline smoke missing Point c field assignment" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"int64_t add(int64_t left, int64_t right)"* ]]; then
+    echo "compiler mainline smoke missing function c signature" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"return left + right;"* ]]; then
+    echo "compiler mainline smoke missing function c return" >&2
     exit 1
 fi
 

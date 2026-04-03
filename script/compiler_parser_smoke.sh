@@ -65,4 +65,24 @@ if [[ "$OUT" != *"field Bool y"* ]]; then
     exit 1
 fi
 
+if [[ "$OUT" != *"func_decl Int add"* ]]; then
+    echo "compiler parser smoke missing function decl" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"param Int left"* ]]; then
+    echo "compiler parser smoke missing first param" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"param Int right"* ]]; then
+    echo "compiler parser smoke missing second param" >&2
+    exit 1
+fi
+
+if [[ "$OUT" != *"return left + right"* ]]; then
+    echo "compiler parser smoke missing return expr" >&2
+    exit 1
+fi
+
 echo "compiler parser smoke passed"
