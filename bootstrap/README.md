@@ -2,6 +2,11 @@
 
 这里放 Jiang 版编译器的自举起步代码。
 
+当前约定已经重新固定：
+
+- `bootstrap/` 对应仓库里的 Stage1 编译器主线
+- `compiler/` 只保留为未来 Stage2 预留目录
+
 当前阶段目标不是重写整个编译器，而是把 Stage1 收成一个真实入口可工作的 `bootstrap-first` 编译器：由 Jiang 实现 `AST -> HIR -> JIR -> C` 前中后端骨架，继续依赖系统 C 编译器完成最后一跳。
 
 当前内容：
