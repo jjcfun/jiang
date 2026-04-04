@@ -41,6 +41,12 @@ bash "$PROJECT_ROOT/script/evaluate_default_llvm.sh"
 echo -e "\n--- 1.7. 运行 Stage1 Build System 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_build_system_smoke.sh"
 
+echo -e "\n--- 1.71. 运行 Stage1 Link 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage1_link_smoke.sh"
+
+echo -e "\n--- 1.72. 运行 Stage1 Selfhost 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage1_selfhost_smoke.sh"
+
 echo -e "\n--- 2. 运行所有单元测试 ---"
 
 # 关闭 set -e，以便我们自己处理测试用例的失败
