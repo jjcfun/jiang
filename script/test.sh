@@ -47,6 +47,9 @@ bash "$PROJECT_ROOT/script/stage1_link_smoke.sh"
 echo -e "\n--- 1.72. 运行 Stage1 Selfhost 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_selfhost_smoke.sh"
 
+echo -e "\n--- 1.73. 运行 Stage1 Run 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage1_run_smoke.sh"
+
 echo -e "\n--- 2. 运行所有单元测试 ---"
 
 # 关闭 set -e，以便我们自己处理测试用例的失败
