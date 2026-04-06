@@ -6,7 +6,7 @@
 
 当前已确认的状态：
 
-- `bootstrap/lexer.jiang` 可以稳定 `--emit-llvm`
+- `bootstrap/entries/lexer.jiang` 可以稳定 `--emit-llvm`
 - 生成的 `build/lexer.ll` 可以通过 `opt -passes=verify`
 - 但 `clang -x ir build/lexer.ll` 与 `lli build/lexer.ll` 当前都会卡住
 
@@ -17,7 +17,7 @@
 
 本阶段完成标准：
 
-- `bootstrap/lexer.jiang` 的 LLVM IR 生成稳定
+- `bootstrap/entries/lexer.jiang` 的 LLVM IR 生成稳定
 - bootstrap LLVM IR 有独立 smoke
 - `TODO.md` / `develop.md` 明确 bootstrap LLVM 是当前后续优先级
 - 不破坏当前 `script/test.sh` 与主测试集
@@ -29,7 +29,7 @@
 当前 bootstrap LLVM 先只承诺这条链：
 
 ```text
-bootstrap/lexer.jiang
+bootstrap/entries/lexer.jiang
 -> jiangc --emit-llvm
 -> build/lexer.ll
 -> opt -passes=verify
@@ -65,7 +65,7 @@ bootstrap/lexer.jiang
 
 它只负责：
 
-- 生成 `bootstrap/lexer.jiang` 的 LLVM IR
+- 生成 `bootstrap/entries/lexer.jiang` 的 LLVM IR
 - 验证 `.ll` 文件存在
 - 调用 `opt -passes=verify`
 - 检查产物中存在 `define i32 @main`

@@ -6,33 +6,34 @@
 
 - `bootstrap/` 对应仓库里的 Stage1 编译器主线
 - `compiler/` 只保留为未来 Stage2 预留目录
+- `bootstrap/entries/` 放 Stage1 的 smoke driver、wrapper 和工具入口；`bootstrap/` 根目录保留可复用编译器模块
 
 当前阶段目标不是重写整个编译器，而是把 Stage1 收成一个真实入口可工作的 `bootstrap-first` 编译器：由 Jiang 实现 `AST -> HIR -> JIR -> C` 前中后端骨架，继续依赖系统 C 编译器完成最后一跳。
 
 当前内容：
 
-- `lexer.jiang`: 第一个 Stage1 程序，读取 `bootstrap/sample.jiang` 并输出 token 流
+- `entries/lexer.jiang`: 第一个 Stage1 程序，读取 `bootstrap/sample.jiang` 并输出 token 流
 - `lexer.golden`: `lexer.jiang` 当前 token dump 的 golden 文本
 - `lexer_core.jiang`: 可复用的 Stage1 lexer 模块
-- `parser.jiang`: Stage1 parser 的 smoke driver，读取固定 fixture 并输出 parse dump
+- `entries/parser.jiang`: Stage1 parser 的 smoke driver，读取固定 fixture 并输出 parse dump
 - `parser.golden`: `parser.jiang` 当前 parse dump 的 golden 文本
 - `parser_core.jiang`: 可复用的 Stage1 parser 模块，负责把 token 流转换成节点树
 - `parser_store.jiang`: 轻量节点池，使用整数 node id 和 child 链接保存 parse tree
-- `hir.jiang`: Stage1 HIR 的 smoke driver，递归加载真实 bootstrap 模块并输出 HIR dump
+- `entries/hir.jiang`: Stage1 HIR 的 smoke driver，递归加载真实 bootstrap 模块并输出 HIR dump
 - `hir.golden`: `hir.jiang` 当前 HIR dump 的 golden 文本
 - `hir_core.jiang`: 负责把 parse tree lower 成树状 HIR，并完成最小名字解析与类型挂载
 - `hir_store.jiang`: HIR 节点池，使用整数 node id 和 child 链接保存 HIR
-- `jir.jiang`: Stage1 JIR 的 smoke driver，当前固定加载 `bootstrap/codegen_sample.jiang` 并输出 JIR dump
+- `entries/jir.jiang`: Stage1 JIR 的 smoke driver，当前固定加载 `bootstrap/codegen_sample.jiang` 并输出 JIR dump
 - `jir.golden`: `jir.jiang` 当前 JIR dump 的 golden 文本
 - `jir_store.jiang`: Stage1 的最小 JIR 节点池
 - `jir_lower.jiang`: 负责把 HIR lower 成 Stage1 当前的 JIR，并内置最小 C emitter
 - `compiler_core.jiang`: Stage1 compiler driver API，提供 `compile_entry(path, mode)`
-- `compiler.jiang`: Stage1 codegen smoke driver，固定把 `bootstrap/codegen_sample.jiang` 编译成 C 并输出到 stdout
-- `compiler_source_loader.jiang`: 真实入口 smoke wrapper，验证 `source_loader.jiang` 的 `mode_emit_c`
-- `hir_parser_core.jiang`: 真实入口 smoke wrapper，验证 `parser_core.jiang` 的 `mode_dump_hir`
-- `jir_parser_core.jiang`: 真实入口 smoke wrapper，验证 `parser_core.jiang` 的 `mode_dump_jir`
-- `hir_compiler_core.jiang`: 真实入口 smoke wrapper，验证 `compiler_core.jiang` 的 `mode_dump_hir`
-- `compiler_compiler_core.jiang`: 真实入口 smoke wrapper，验证 `compiler_core.jiang` 的 `mode_emit_c`
+- `entries/compiler.jiang`: Stage1 codegen smoke driver，固定把 `bootstrap/codegen_sample.jiang` 编译成 C 并输出到 stdout
+- `entries/compiler_source_loader.jiang`: 真实入口 smoke wrapper，验证 `source_loader.jiang` 的 `mode_emit_c`
+- `entries/hir_parser_core.jiang`: 真实入口 smoke wrapper，验证 `parser_core.jiang` 的 `mode_dump_hir`
+- `entries/jir_parser_core.jiang`: 真实入口 smoke wrapper，验证 `parser_core.jiang` 的 `mode_dump_jir`
+- `entries/hir_compiler_core.jiang`: 真实入口 smoke wrapper，验证 `compiler_core.jiang` 的 `mode_dump_hir`
+- `entries/compiler_compiler_core.jiang`: 真实入口 smoke wrapper，验证 `compiler_core.jiang` 的 `mode_emit_c`
 - `symbol_store.jiang`: Stage1 的最小符号表
 - `type_store.jiang`: Stage1 的最小类型表
 - `module_loader.jiang`: 递归加载真实 bootstrap 模块图并驱动 parse/HIR lowering
@@ -111,7 +112,7 @@ cd build
 cmake ..
 make
 cd ..
-./build/jiangc --stdlib-dir ./std ./bootstrap/lexer.jiang
+./build/jiangc --stdlib-dir ./std ./bootstrap/entries/lexer.jiang
 ./build/lexer
 ```
 

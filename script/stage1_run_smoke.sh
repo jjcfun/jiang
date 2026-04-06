@@ -28,9 +28,9 @@ run_stage1_entry() {
     fi
 }
 
-run_stage1_entry "bootstrap/lexer.jiang" "lexer_entry" "bootstrap lexer smoke passed"
-run_stage1_entry "bootstrap/parser.jiang" "parser_entry" "bootstrap parser smoke passed"
-run_stage1_entry "bootstrap/hir.jiang" "hir_entry" "bootstrap hir smoke passed"
-run_stage1_entry "bootstrap/jir.jiang" "jir_entry" "bootstrap jir smoke passed"
+run_stage1_entry "bootstrap/entries/lexer.jiang" "lexer_entry" "bootstrap lexer smoke passed"
+run_stage1_entry "bootstrap/entries/parser.jiang" "parser_entry" "bootstrap parser smoke passed"
+run_stage1_entry "bootstrap/entries/hir.jiang" "hir_entry" "bootstrap hir smoke passed"
+run_stage1_entry "bootstrap/entries/jir.jiang" "jir_entry" "bootstrap jir smoke passed"
 
 echo "stage1 run smoke passed"

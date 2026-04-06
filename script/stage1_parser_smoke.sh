@@ -11,7 +11,7 @@ cmake ..
 make
 
 cd "$PROJECT_ROOT"
-"$BUILD_DIR/jiangc" --stdlib-dir "$PROJECT_ROOT/std" "$PROJECT_ROOT/bootstrap/parser.jiang"
+"$BUILD_DIR/jiangc" --stdlib-dir "$PROJECT_ROOT/std" "$PROJECT_ROOT/bootstrap/entries/parser.jiang"
 
 OUTPUT="$("$BUILD_DIR/parser")"
 printf '%s\n' "$OUTPUT"

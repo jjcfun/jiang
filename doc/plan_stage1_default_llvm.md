@@ -41,9 +41,9 @@
 
 这里的“代表入口”固定为：
 
-- `bootstrap/lexer.jiang`
-- `bootstrap/parser.jiang`
-- `bootstrap/hir.jiang`
+- `bootstrap/entries/lexer.jiang`
+- `bootstrap/entries/parser.jiang`
+- `bootstrap/entries/hir.jiang`
 - `examples/build_demo/jiang.build`
 - `bootstrap/jiang.build`
 
@@ -57,9 +57,9 @@
 
 - 重新构建 `jiangc`
 - 运行现有 `script/test_llvm_backend.sh`
-- 对比 `bootstrap/lexer.jiang` 在 C 与 LLVM 下的运行输出
-- 对比 `bootstrap/parser.jiang` 在 C 与 LLVM 下的运行输出
-- 对比 `bootstrap/hir.jiang` 在 C 与 LLVM 下的运行输出
+- 对比 `bootstrap/entries/lexer.jiang` 在 C 与 LLVM 下的运行输出
+- 对比 `bootstrap/entries/parser.jiang` 在 C 与 LLVM 下的运行输出
+- 对比 `bootstrap/entries/hir.jiang` 在 C 与 LLVM 下的运行输出
 - 对比 `examples/build_demo/jiang.build` 在 C 与 LLVM 下 `build/run/test`
 - 对比 `bootstrap/jiang.build` 在 C 与 LLVM 下的 build 产物运行输出
 

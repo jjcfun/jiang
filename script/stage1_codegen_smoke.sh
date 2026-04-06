@@ -12,7 +12,7 @@ cmake ..
 make
 
 cd "$PROJECT_ROOT"
-"$BUILD_DIR/jiangc" --stdlib-dir "$PROJECT_ROOT/std" "$PROJECT_ROOT/bootstrap/compiler.jiang"
+"$BUILD_DIR/jiangc" --stdlib-dir "$PROJECT_ROOT/std" "$PROJECT_ROOT/bootstrap/entries/compiler.jiang"
 
 mkdir -p "$OUT_DIR"
 "$BUILD_DIR/compiler" > "$OUT_DIR/codegen_sample.c"

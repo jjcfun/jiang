@@ -6,9 +6,9 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 COMPILER="$BUILD_DIR/jiangc"
 
-LEXER_INPUT="$PROJECT_ROOT/bootstrap/lexer.jiang"
-PARSER_INPUT="$PROJECT_ROOT/bootstrap/parser.jiang"
-HIR_INPUT="$PROJECT_ROOT/bootstrap/hir.jiang"
+LEXER_INPUT="$PROJECT_ROOT/bootstrap/entries/lexer.jiang"
+PARSER_INPUT="$PROJECT_ROOT/bootstrap/entries/parser.jiang"
+HIR_INPUT="$PROJECT_ROOT/bootstrap/entries/hir.jiang"
 
 DEMO_MANIFEST="$PROJECT_ROOT/examples/build_demo/jiang.build"
 DEMO_BIN="$PROJECT_ROOT/examples/build_demo/build/build_demo"

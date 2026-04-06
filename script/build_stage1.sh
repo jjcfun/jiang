@@ -14,7 +14,7 @@ make
 mkdir -p "$OUT_DIR"
 cd "$PROJECT_ROOT"
 
-"$BUILD_DIR/jiangc" --stdlib-dir "$PROJECT_ROOT/std" "$PROJECT_ROOT/bootstrap/compiler_compiler_core.jiang"
+"$BUILD_DIR/jiangc" --stdlib-dir "$PROJECT_ROOT/std" "$PROJECT_ROOT/bootstrap/entries/compiler_compiler_core.jiang"
 "$BUILD_DIR/compiler_compiler_core" > "$OUT_DIR/compiler_compiler_core.c"
 
 cc -std=c99 -Wall -Wextra -Werror \

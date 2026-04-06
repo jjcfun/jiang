@@ -169,10 +169,10 @@ target.alt.test_dir = alt_tests
 
 建议接入范围：
 
-- `bootstrap/compiler.jiang`
+- `bootstrap/entries/compiler.jiang`
 - `bootstrap/compiler_core.jiang`
-- `bootstrap/lexer.jiang`
-- `bootstrap/parser.jiang`
+- `bootstrap/entries/lexer.jiang`
+- `bootstrap/entries/parser.jiang`
 
 验收标准：
 

@@ -235,7 +235,7 @@ if [[ "$(<"$OUT_DIR/host_runtime_from_stage1.c")" != *"host_alloc_bytes"* ]]; th
     exit 1
 fi
 
-"$BUILD_DIR/stage1c" "bootstrap/compiler_source_loader.jiang" > "$OUT_DIR/compiler_source_loader_from_stage1.c"
+"$BUILD_DIR/stage1c" "bootstrap/entries/compiler_source_loader.jiang" > "$OUT_DIR/compiler_source_loader_from_stage1.c"
 cc -x c -std=c99 -I "$PROJECT_ROOT/include" -Wall -Wextra -Werror -c "$OUT_DIR/compiler_source_loader_from_stage1.c" -o "$OUT_DIR/compiler_source_loader_from_stage1.o"
 if [[ "$(<"$OUT_DIR/compiler_source_loader_from_stage1.c")" != *"int main(void)"* ]]; then
     echo "stage1 selfhost output missing entry main for compiler_source_loader" >&2
@@ -246,22 +246,22 @@ if [[ "$(<"$OUT_DIR/compiler_source_loader_from_stage1.c")" != *"compile_entry"*
     exit 1
 fi
 
-check_stage1_wrapper "bootstrap/compiler_compiler_core.jiang" "compiler_compiler_core" "bootstrap/compiler_core.jiang"
-check_stage1_wrapper "bootstrap/compiler_token_store.jiang" "compiler_token_store" "bootstrap/token_store.jiang"
-check_stage1_wrapper "bootstrap/compiler_symbol_store.jiang" "compiler_symbol_store" "bootstrap/symbol_store.jiang"
-check_stage1_wrapper "bootstrap/compiler_type_store.jiang" "compiler_type_store" "bootstrap/type_store.jiang"
-check_stage1_wrapper "bootstrap/compiler_parser_store.jiang" "compiler_parser_store" "bootstrap/parser_store.jiang"
-check_stage1_wrapper "bootstrap/compiler_hir_store.jiang" "compiler_hir_store" "bootstrap/hir_store.jiang"
-check_stage1_wrapper "bootstrap/compiler_jir_store.jiang" "compiler_jir_store" "bootstrap/jir_store.jiang"
-check_stage1_wrapper "bootstrap/compiler_jir_lower.jiang" "compiler_jir_lower" "bootstrap/jir_lower.jiang"
-check_stage1_wrapper "bootstrap/compiler_module_paths.jiang" "compiler_module_paths" "bootstrap/module_paths.jiang"
-check_stage1_wrapper "bootstrap/compiler_buffer_int.jiang" "compiler_buffer_int" "bootstrap/buffer_int.jiang"
-check_stage1_wrapper "bootstrap/compiler_buffer_bytes.jiang" "compiler_buffer_bytes" "bootstrap/buffer_bytes.jiang"
-check_stage1_wrapper "bootstrap/compiler_intern_pool.jiang" "compiler_intern_pool" "bootstrap/intern_pool.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_compiler_core.jiang" "compiler_compiler_core" "bootstrap/compiler_core.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_token_store.jiang" "compiler_token_store" "bootstrap/token_store.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_symbol_store.jiang" "compiler_symbol_store" "bootstrap/symbol_store.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_type_store.jiang" "compiler_type_store" "bootstrap/type_store.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_parser_store.jiang" "compiler_parser_store" "bootstrap/parser_store.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_hir_store.jiang" "compiler_hir_store" "bootstrap/hir_store.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_jir_store.jiang" "compiler_jir_store" "bootstrap/jir_store.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_jir_lower.jiang" "compiler_jir_lower" "bootstrap/jir_lower.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_module_paths.jiang" "compiler_module_paths" "bootstrap/module_paths.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_buffer_int.jiang" "compiler_buffer_int" "bootstrap/buffer_int.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_buffer_bytes.jiang" "compiler_buffer_bytes" "bootstrap/buffer_bytes.jiang"
+check_stage1_wrapper "bootstrap/entries/compiler_intern_pool.jiang" "compiler_intern_pool" "bootstrap/intern_pool.jiang"
 
-check_stage1_wrapper "bootstrap/lexer.jiang" "lexer_entry" "bootstrap lexer smoke passed"
-check_stage1_wrapper "bootstrap/parser.jiang" "parser_entry" "bootstrap parser smoke passed"
-check_stage1_wrapper "bootstrap/hir.jiang" "hir_entry" "bootstrap hir smoke passed"
-check_stage1_wrapper "bootstrap/jir.jiang" "jir_entry" "bootstrap jir smoke passed"
+check_stage1_wrapper "bootstrap/entries/lexer.jiang" "lexer_entry" "bootstrap lexer smoke passed"
+check_stage1_wrapper "bootstrap/entries/parser.jiang" "parser_entry" "bootstrap parser smoke passed"
+check_stage1_wrapper "bootstrap/entries/hir.jiang" "hir_entry" "bootstrap hir smoke passed"
+check_stage1_wrapper "bootstrap/entries/jir.jiang" "jir_entry" "bootstrap jir smoke passed"
 
 echo "stage1 selfhost smoke passed"
