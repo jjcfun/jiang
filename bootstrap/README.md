@@ -162,3 +162,23 @@ cd ..
 ./build/jiangc build --manifest ./bootstrap/jiang.build
 ./bootstrap/build/lexer
 ```
+
+当前 `bootstrap/jiang.build` 也已经声明了多入口 target：
+
+```bash
+./build/jiangc build --manifest ./bootstrap/jiang.build --target parser
+./build/jiangc build --manifest ./bootstrap/jiang.build --target hir
+./build/jiangc build --manifest ./bootstrap/jiang.build --target jir
+./build/jiangc build --manifest ./bootstrap/jiang.build --target compiler
+./build/jiangc run --manifest ./bootstrap/jiang.build --target parser
+./build/jiangc run --manifest ./bootstrap/jiang.build --target hir
+./build/jiangc run --manifest ./bootstrap/jiang.build --target jir
+./build/jiangc run --manifest ./bootstrap/jiang.build --target compiler
+```
+
+对应产物分别是：
+
+- `bootstrap/build/lexer_parser`
+- `bootstrap/build/lexer_hir`
+- `bootstrap/build/lexer_jir`
+- `bootstrap/build/lexer_compiler`
