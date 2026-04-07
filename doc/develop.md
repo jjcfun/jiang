@@ -30,19 +30,17 @@ Jiang 目前采用循序渐进的路线：
 
 当前状态：`TODO.md` 中定义的 Stage0 完成条件已经全部完成，仓库当前版本的测试集已经全部通过。
 
-### Stage1：Jiang 自举起步
-目标是使用 Stage0 编译器，开始实现 Jiang 版编译器前端与配套标准库能力。
+### Stage1：Jiang 自举完成
+目标是使用 Stage0 编译器，完成 Jiang 版编译器前端与正式 Stage1 工作流收口。
 
-当前建议的 Stage1 起步范围：
+当前 Stage1 已完成并固定为：
 
-*   先实现最小自举子集，不直接重写整个编译器
-*   优先实现文件加载、路径处理、import 解析、词法分析
-*   继续约束 Stage1 对标准库的依赖范围，避免过早依赖复杂高层语法糖
-
-当前状态已经进一步推进到“真实入口编译器”阶段：
-
-*   `compiler_core.compile_entry(path, mode)` 已支持当前受支持入口模块的 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`
+*   `bootstrap/` 是唯一正式 Stage1 主线，`bootstrap/entries/` 提供工具入口与 smoke driver
+*   `compiler_core.compile_entry(path, mode)` 已稳定支持 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`
+*   正式 `stage1c` CLI 已收口，支持 `--help` 与 `--mode emit-c|dump-ast|dump-hir|dump-jir`
 *   `stage1_real_entry_smoke` 已覆盖 `source_loader.jiang`、`parser_core.jiang`、`compiler_core.jiang`，并扩到 `lexer_core.jiang`、`hir_core.jiang`、`module_loader.jiang`、`jir_lower.jiang`、`parser_store.jiang`、`buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang`、`module_paths.jiang`、`token_store.jiang`、`hir_store.jiang`、`jir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`
+*   `bootstrap/jiang.build` 已收口为正式 Stage1 manifest，支持 `lexer` 默认入口以及 `parser` / `hir` / `jir` / `compiler` target
+*   `stage1_complete_smoke.sh` 已作为统一验收脚本，覆盖 Stage1 smoke、real-entry、build-system、`stage1c` build/link/run/selfhost
 *   growable store 底层抽象与主链 store 已收口，当前 Stage1 正式回归路径已无稳定复现 warning 命中
 
 ### Stage2：Jiang 重构编译器并升级后端
@@ -67,7 +65,7 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 最小标准库与标准库导入机制
 *   [x] 自动化测试脚本与项目型集成测试
 
-### 当前进行中：Stage1 自举准备
+### 已完成：Stage1 自举收口
 
 *   [x] 建立 `bootstrap/` 目录，承载 Jiang 版编译器源码
 *   [x] 实现文件加载、路径处理与最小模块边界约束
@@ -75,6 +73,8 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 使用 Jiang 实现 `bootstrap-first` Parser，并用 golden 固定 parse dump
 *   [x] 使用 Jiang 实现最小 HIR / semantic 前端，并用真实 bootstrap 模块图 golden 固定 HIR dump
 *   [x] 在 `bootstrap/` 内补最小 `HIR -> JIR -> C` 闭环，并让 Stage0 编译器稳定编译第一个 Jiang 工具程序
+*   [x] 收口正式 `stage1c` CLI 与 Stage1 manifest/build workflow
+*   [x] 用统一 Stage1 完成验收脚本固定 build/link/run/selfhost 回归
 
 ### 后续阶段：原生后端演进
 
@@ -82,14 +82,14 @@ Jiang 目前采用循序渐进的路线：
 *   [ ] 评估 LLVM IR 或其他原生后端接入时机
 *   [ ] 逐步摆脱 C 作为过渡后端
 
-### 当前优先主线：Stage1 默认 LLVM 后端评估 + `bootstrap/` 收口
+### 当前优先主线：Stage2 启动准备 + 默认 LLVM 后端持续评估
 
 当前 `--backend llvm` 已经可以覆盖完整正向测试集，并通过 `script/test_llvm_backend.sh`、`script/bootstrap_llvm_smoke.sh` 与 `script/test.sh`。
-bootstrap LLVM 收口阶段已经完成；当前更值得做的不是继续无限扩大 wrapper smoke，而是回答：
+Stage1 当前主线已经完成；当前更值得做的是：
 
+*   是否开始正式启动 Stage2 主线
 *   C 与 LLVM 在代表入口上的行为是否已经稳定一致
-*   LLVM 是否已经达到 Stage1 默认后端候选的成熟度
-*   如果现在不切默认后端，剩余理由是否已经收缩到少数明确风险
+*   LLVM 是否已经达到未来默认后端候选的成熟度
 
 当前最新计划见 `doc/plan_stage1_default_llvm.md`。
 `compiler/` 当前仅是 Stage2 预留目录；现阶段不再推进其内部主线实现。

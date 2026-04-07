@@ -8,7 +8,7 @@
 - `compiler/` 只保留为未来 Stage2 预留目录
 - `bootstrap/entries/` 放 Stage1 的 smoke driver、wrapper 和工具入口；`bootstrap/` 根目录保留可复用编译器模块
 
-当前阶段目标不是重写整个编译器，而是把 Stage1 收成一个真实入口可工作的 `bootstrap-first` 编译器：由 Jiang 实现 `AST -> HIR -> JIR -> C` 前中后端骨架，继续依赖系统 C 编译器完成最后一跳。
+当前阶段目标已经达成：Stage1 已经收成一个真实入口可工作的 `bootstrap-first` 编译器。当前 `bootstrap/` 主线已经稳定提供 Jiang 实现的 `AST -> HIR -> JIR -> C` 前中后端骨架，并继续依赖系统 C 编译器完成最后一跳。
 
 当前内容：
 
@@ -132,6 +132,22 @@ bash ./script/build_stage1.sh
 - `buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang` 已成为当前唯一底层抽象
 - `token_store.jiang`、`parser_store.jiang`、`hir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`、`jir_store.jiang` 当前都已接到 growable buffer，并通过正式 smoke 回归
 - 当前重点已转为保持真实模块图覆盖稳定，不再回退到固定容量实现
+
+当前 Stage1 的正式完成验收脚本：
+
+```bash
+bash ./script/stage1_complete_smoke.sh
+```
+
+这条验收会统一覆盖：
+
+- `stage1_smoke` / `stage1_parser_smoke` / `stage1_hir_smoke` / `stage1_jir_smoke` / `stage1_codegen_smoke`
+- `stage1_real_entry_smoke`
+- `stage1_build_system_smoke`
+- `build_stage1.sh`
+- `stage1_link_smoke`
+- `stage1_run_smoke`
+- `stage1_selfhost_smoke`
 
 手动运行方式：
 
