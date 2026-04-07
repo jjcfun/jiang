@@ -145,6 +145,37 @@ make
 
 当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行全部测试用例；以仓库当前版本为准，测试集已全部通过。
 
+### Stage1c CLI
+
+当前可以通过下面的脚本构建正式的 Stage1 编译器二进制：
+
+```bash
+bash ./script/build_stage1.sh
+```
+
+生成产物：
+
+```bash
+./build/stage1c
+```
+
+当前 `stage1c` 支持最小正式 CLI：
+
+```bash
+./build/stage1c --help
+./build/stage1c bootstrap/entries/lexer.jiang > out.c
+./build/stage1c --mode emit-c bootstrap/entries/lexer.jiang > out.c
+./build/stage1c --mode dump-ast bootstrap/entries/lexer.jiang
+./build/stage1c --mode dump-hir bootstrap/entries/hir.jiang
+./build/stage1c --mode dump-jir bootstrap/entries/jir.jiang
+```
+
+约定：
+
+- `bootstrap/entries/` 是 Stage1 的入口层
+- `bootstrap/` 根目录保留可复用的编译器模块
+- `stage1c <entry>` 默认等价于 `stage1c --mode emit-c <entry>`
+
 ### Stage1 Runtime 边界（当前冻结）
 
 build system 收口之后，Stage1 当前主线不再直接切 LLVM，也不直接进入 Stage2，而是先固定 runtime 与标准库边界。

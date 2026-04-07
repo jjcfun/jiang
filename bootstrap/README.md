@@ -98,6 +98,35 @@
 - `bootstrap/module_paths.jiang`、`bootstrap/token_store.jiang`、`bootstrap/hir_store.jiang`、`bootstrap/jir_store.jiang` 的 `mode_emit_c`
 - `bootstrap/symbol_store.jiang`、`bootstrap/type_store.jiang` 的 `mode_emit_c`
 
+当前正式的 Stage1 CLI 构建方式：
+
+```bash
+bash ./script/build_stage1.sh
+```
+
+会生成：
+
+```bash
+./build/stage1c
+```
+
+当前 `stage1c` 支持：
+
+```bash
+./build/stage1c --help
+./build/stage1c bootstrap/entries/lexer.jiang > out.c
+./build/stage1c --mode emit-c bootstrap/entries/lexer.jiang > out.c
+./build/stage1c --mode dump-ast bootstrap/entries/lexer.jiang
+./build/stage1c --mode dump-hir bootstrap/entries/hir.jiang
+./build/stage1c --mode dump-jir bootstrap/entries/jir.jiang
+```
+
+约定：
+
+- `stage1c <entry>` 默认等价于 `stage1c --mode emit-c <entry>`
+- `emit-c` 继续输出到 stdout，由 shell 或脚本负责重定向
+- `dump-ast` / `dump-hir` / `dump-jir` 直接输出对应 dump 文本
+
 当前 growable store 主链已收口：
 
 - `buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang` 已成为当前唯一底层抽象
