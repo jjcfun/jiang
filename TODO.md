@@ -5,13 +5,14 @@
 - Stage0 已完成，并继续承担当前稳定宿主编译器职责。
 - Stage1 已完成，`bootstrap/` 是当前唯一正式自举主线。
 - `stage1c`、`bootstrap/jiang.build` 与 `script/stage1_complete_smoke.sh` 已固定为 Stage1 正式工作流。
-- `compiler/` 当前不承载正式实现，保留为 Stage2 主线目录。
+- Stage2 已启动，`compiler/` 当前已具备最小 `frontend -> JIR -> C` 骨架与 `stage2_emit_c_smoke.sh`。
 
 更详细的阶段说明见 [doc/develop.md](doc/develop.md)。
 
 ## 当前重点
 
-- [ ] 启动 Stage2 主线定义，并把 `compiler/` 收成新的正式实现目录
+- [x] 启动 Stage2 主线定义，并把 `compiler/` 收成新的正式实现目录
+- [ ] 继续把 Stage2 从最小 `emit-c` 闭环扩到更完整的前端与后端能力
 - [ ] 继续评估 LLVM 是否已经具备成为默认后端的条件
 - [ ] 保持 Stage0 / Stage1 / LLVM 三条回归链持续稳定
 

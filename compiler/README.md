@@ -1,13 +1,46 @@
-# Jiang Compiler Stage2 Placeholder
+# Jiang Compiler Stage2
 
-`compiler/` 当前不再承载 Stage1 主线实现。
+`compiler/` 现在是 Stage2 的正式骨架目录。
 
 当前仓库中的目录分工固定为：
 
 - `src/`: 宿主 C 编译器
-- `bootstrap/`: 当前 Stage1 Jiang 自举编译器主线
-- `compiler/`: 未来 Stage2 的预留目录
+- `bootstrap/`: 已完成的 Stage1 Jiang 自举编译器主线
+- `compiler/`: Stage2 主线目录
 
-这次收口的目标是先把 Stage1 明确固定在 `bootstrap/`，避免同时维护两条 Jiang 编译器主线。
+当前 Stage2 的目标不是直接重写完整编译器，而是先固定分层：
 
-当前 `compiler/` 故意保持为空壳目录，只保留占位说明；等 `bootstrap/` 真正完成接管后，再从这里重新启动 Stage2。
+- `entries/`: 顶层入口与工具程序
+- `frontend/`: 词法、语法、HIR、模块加载
+- `ir/`: 中间表示与 lowering，当前只保留 `jir/`
+- `backend/`: 各后端实现，当前预留 `c` 与 `llvm`
+- `ffi/`: 宿主 runtime 与外部库绑定
+- `support/`: 通用基础设施
+- `tests/`: Stage2 自己的样例、golden 和 smoke
+
+当前约束：
+
+- Stage2 不与 `bootstrap/` 混写
+- Stage1 仍然是稳定基线
+- `compiler/` 中的新实现优先按层落位，不再堆平铺文件
+
+当前目录结构：
+
+- `entries/`
+- `frontend/`
+- `ir/jir/`
+- `backend/c/`
+- `backend/llvm/`
+- `ffi/runtime/`
+- `ffi/llvm/`
+- `support/`
+- `tests/samples/`
+- `tests/golden/`
+- `tests/smoke/`
+
+当前第一阶段已经落地的里程碑：
+
+- `compiler/entries/compiler.jiang` 已能读取单文件输入并输出 C 到 stdout
+- `compiler/tests/samples/minimal.jiang` 作为固定 Stage2 样例
+- `script/build_stage2.sh` 可构建 `build/stage2c`
+- `script/stage2_emit_c_smoke.sh` 已验证 Stage2 emitted C 可被 `cc -c` 编译

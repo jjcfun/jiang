@@ -44,14 +44,14 @@ Jiang 目前采用循序渐进的路线：
 *   growable store 底层抽象与主链 store 已收口，当前 Stage1 正式回归路径已无稳定复现 warning 命中
 
 ### Stage2：Jiang 重构编译器并升级后端
-当 `bootstrap/` 中的 Stage1 编译器真正收口并可接管主职责后，再考虑进入 Stage2，重构内部 IR、接入 LLVM 或其他原生后端。
+当前 Stage2 已启动，目标是在 `compiler/` 中逐步建立新的正式主线，实现重构后的前端、JIR 与多后端分层。
 
 当前约定：
 
 *   `bootstrap/` 对应当前真实 Stage1 主线
-*   `compiler/` 只保留为未来 Stage2 预留目录
+*   `compiler/` 对应当前 Stage2 主线目录
 
-也就是说，当前仓库里不再把 `compiler/` 视为 Stage1 后期实现主线。正式 Stage2 何时启动，取决于 `bootstrap/` 何时先完成接管。
+也就是说，当前仓库里不再把 `compiler/` 视为 Stage1 后期实现主线。Stage1 已经完成，Stage2 当前的第一阶段是先固定一条新的 `frontend -> JIR -> C` 最小闭环。
 
 ---
 
@@ -76,11 +76,13 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 收口正式 `stage1c` CLI 与 Stage1 manifest/build workflow
 *   [x] 用统一 Stage1 完成验收脚本固定 build/link/run/selfhost 回归
 
-### 后续阶段：原生后端演进
+### 当前进行中：Stage2 启动
 
-*   [ ] 在 Jiang 版前端稳定后评估 HIR / MIR 分层
-*   [ ] 评估 LLVM IR 或其他原生后端接入时机
-*   [ ] 逐步摆脱 C 作为过渡后端
+*   [x] 建立 `compiler/` Stage2 分层骨架
+*   [x] 跑通 `compiler/` 内最小 `frontend -> JIR -> C` 闭环
+*   [x] 新增 `script/stage2_emit_c_smoke.sh`
+*   [ ] 继续扩大 Stage2 前端与 JIR 覆盖范围
+*   [ ] 在 Stage2 主线中实现独立的 `JIR -> LLVM` 后端层
 
 ### 当前优先主线：Stage2 启动准备 + 默认 LLVM 后端持续评估
 
