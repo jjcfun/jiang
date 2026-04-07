@@ -73,7 +73,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 + **Stage0**: 用 C 语言实现编译器的基本功能。该阶段已经完成：当前编译器已具备多模块、Union/Pattern、Binding、最小标准库与 `import std;` 支持，主链稳定为 `AST -> JIR -> C`，并已通过当前测试集验证
 
-+ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。该阶段现已完成：Stage1 主线固定在 `bootstrap/`，根目录保留可复用编译器模块，`bootstrap/entries/` 放 smoke driver 和工具入口；`compiler_core.compile_entry(path, mode)` 已稳定支持 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`，正式 `stage1c` CLI 与 build-system manifest/workflow 已收口，并通过 Stage1 完成验收与 selfhost 回归；同时 `--backend llvm` 已作为可选完整后端进入回归，但默认后端当前仍保持 C
++ **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。该阶段已经完成：Stage1 主线固定在 `bootstrap/`，根目录保留可复用编译器模块，`bootstrap/entries/` 放 smoke driver 和工具入口；`compiler_core.compile_entry(path, mode)` 已稳定支持 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`，正式 `stage1c` CLI、manifest 与 build workflow 已收口，并通过统一 Stage1 完成验收与 selfhost 回归；`--backend llvm` 当前作为可选完整后端保留在回归中，但默认后端仍保持 C
 
 + **Stage2**: 在 Stage1 自举编译器真正收口并可接管主职责之后，再用 Jiang 语言重构 Jiang 编译器，并实现自定义语法等高级功能。当前 `compiler/` 目录仅作为 Stage2 预留目录，不承载正式主线实现
 
@@ -86,42 +86,9 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 有关详细的语法和特性说明，请参阅：
 - **[Jiang 语言指南](doc/jiang.md)**
+- **[编译器开发说明](doc/develop.md)**
 
 ## 快速开始
-
-### Stage1 自举子集（当前约定）
-
-为了让 Stage1 的第一版自举实现尽量稳定，当前建议把可依赖能力收敛到下面这个子集：
-
-- 模块与导入：`import "..."`、`import alias = "..."`、`import std;`
-- 基础类型：`Int`、`UInt8`、`UInt16`、`Float`、`Double`、`Bool`
-- 控制流：`if`、`while`、`for Int i in a..b`
-- 绑定：普通 binding、tuple binding、Union variant binding
-- 复合类型：`struct`、`enum`、`union`
-- 最小标准库：`std.io`、`std.debug`、`std.fs`
-
-当前 Stage0 里仍然建议避免把这些能力作为自举前提：
-
-- 依赖复杂 JIR lowering 的高层语法糖组合
-- 跨模块共享 tuple typedef 的复杂场景
-- 超出最小标准库范围的运行时能力
-
-### 命名规范（当前约定）
-
-为了让 Stage1 自举代码和后续标准库实现保持一致，当前建议采用下面这套命名规则：
-
-- 类型名使用 `PascalCase`
-  例如 `TokenKind`、`SourceLoader`
-- 函数名使用 `snake_case`
-  例如 `read_source`、`push_token`
-- 变量名与结构体字段名使用 `snake_case`
-  例如 `token_count`、`start_offset`
-- 枚举成员使用 `snake_case`
-  例如 `kw`、`string_lit`、`left_paren`
-- 模块别名优先使用 `PascalCase`
-  例如 `import Store = "token_store.jiang";`
-
-这套约定的目标是明确区分“类型”和“值”：`TokenKind` 是类型，`kw` / `string_lit` 是枚举值，避免把枚举成员写成看起来像类型名的 `SomeField`。
 
 ### 前提条件
 
@@ -143,9 +110,9 @@ make
 ./script/test.sh
 ```
 
-当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行全部测试用例；以仓库当前版本为准，测试集已全部通过。
+当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行主测试链；Stage1 的正式完成验收由单独脚本固定。
 
-当前 Stage1 的正式完成验收脚本是：
+Stage1 的正式完成验收脚本是：
 
 ```bash
 bash ./script/stage1_complete_smoke.sh
@@ -188,86 +155,6 @@ bash ./script/build_stage1.sh
 - `bootstrap/entries/` 是 Stage1 的入口层
 - `bootstrap/` 根目录保留可复用的编译器模块
 - `stage1c <entry>` 默认等价于 `stage1c --mode emit-c <entry>`
-
-### Stage1 Runtime 边界（当前冻结）
-
-build system 收口之后，Stage1 当前主线不再直接切 LLVM，也不直接进入 Stage2，而是先固定 runtime 与标准库边界。
-
-当前对普通 Jiang 项目公开的最小标准库表面只有：
-
-- `std.io`
-- `std.debug`
-- `std.fs`
-
-其中：
-
-- `std.io` 负责最小输出能力
-- `std.debug` 负责断言与调试辅助
-- `std.fs` 负责文件存在性、读文件与少量路径辅助
-
-当前 Stage1 宿主 runtime ABI 只冻结为下面这 6 个 intrinsic：
-
-- `__intrinsic_print`
-- `__intrinsic_assert`
-- `__intrinsic_read_file`
-- `__intrinsic_file_exists`
-- `__intrinsic_alloc_ints`
-- `__intrinsic_alloc_bytes`
-
-这些 intrinsic 主要供标准库实现、bootstrap 编译器内部基础设施和编译器生成的过渡 glue 使用，不作为普通 Jiang 项目的推荐 public surface。面向用户的代码应优先使用 `std.*`。
-
-当前并不追求完全移除 libc；现阶段只要求把 libc 依赖集中在宿主 C 层，主要集中在 `include/runtime.h` 与编译器宿主实现内部。当前已经固定的 libc 接触点包括：
-
-- 文件读取：`fopen` / `fread` / `fclose`
-- 内存分配：`malloc` / `calloc` / `free`
-- 文本与打印：宿主 `printf` 路径及等价能力
-
-### Stage1 UTF-8 语义（当前约定）
-
-当前 Stage1 只支持 UTF-8 的字节层正确性，不引入完整 Unicode 文本语义。
-
-- 源码按 UTF-8 字节流读取
-- 字符串字面量按 UTF-8 字节序列保留
-- `UInt8[]` 继续表示字节切片
-- `length` 按字节数计算
-- `s[i]` 返回第 `i` 个字节
-
-当前仍然不支持：
-
-- Unicode 标识符
-- code point / rune 类型
-- 按字符计数或按字符索引
-- grapheme cluster 语义
-
-### 最小 Build System（实验中）
-
-当前已经加入第一版实验性 project manifest 与子命令入口：
-
-```bash
-./build/jiangc build --manifest ./examples/build_demo/jiang.build
-./build/jiangc run --manifest ./examples/build_demo/jiang.build
-./build/jiangc build --manifest ./examples/build_demo/jiang.build --target alt
-./build/jiangc test --manifest ./examples/build_demo/jiang.build --target alt
-./build/jiangc test --manifest ./examples/build_demo/jiang.build
-```
-
-当前 manifest 采用最小 `jiang.build` 形式，示例见 `examples/build_demo/jiang.build`。第一版只覆盖：
-
-- `name`
-- `root`
-- `stdlib_dir`
-- `test_dir`
-- `module.<name> = <path>`
-- `target.<name>.root = <path>`
-- `target.<name>.test_dir = <path>`
-
-其中 `module.<name>` 会把模块名映射到入口文件，允许项目内直接使用：
-
-```jiang
-import greet;
-```
-
-当前目标是先统一项目入口、标准库路径与 `jiang -> C -> cc` 构建链，不在这一版中直接引入完整包管理与可编程构建 DSL。
 
 ### LLVM 后端（当前状态）
 
