@@ -44,3 +44,6 @@
 - `compiler/tests/samples/minimal.jiang` 作为固定 Stage2 样例
 - `script/build_stage2.sh` 可构建 `build/stage2c`
 - `script/stage2_emit_c_smoke.sh` 已验证 Stage2 emitted C 可被 `cc -c` 编译
+- `compiler/support/` 已开始沉淀通用结构，目前包含 `Span` 和 `SourceFile`
+- `compiler/support/` 现在还承载了 Stage2 动态数组、驻留池和诊断基础设施
+- `compiler/support/text_buffer.jiang` 已提供最小文本构建器，供后续后端输出层复用

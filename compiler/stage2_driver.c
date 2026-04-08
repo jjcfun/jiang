@@ -7,7 +7,7 @@ typedef struct {
     int64_t length;
 } Slice_uint8_t;
 
-extern void compile_entry(Slice_uint8_t entry_path);
+extern int64_t compile_entry(Slice_uint8_t entry_path);
 
 static void print_usage(const char* argv0, FILE* stream) {
     fprintf(stream, "usage: %s <entry>\n", argv0);
@@ -19,6 +19,5 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    compile_entry((Slice_uint8_t){(uint8_t*)argv[1], (int64_t)strlen(argv[1])});
-    return 0;
+    return (int)compile_entry((Slice_uint8_t){(uint8_t*)argv[1], (int64_t)strlen(argv[1])});
 }

@@ -44,6 +44,12 @@ bash "$PROJECT_ROOT/script/stage1_complete_smoke.sh"
 echo -e "\n--- 1.75. 运行 Stage2 emit-c 冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage2_emit_c_smoke.sh"
 
+echo -e "\n--- 1.76. 运行 Stage2 support 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage2_support_smoke.sh"
+
+echo -e "\n--- 1.77. 运行 Stage2 error 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage2_error_smoke.sh"
+
 echo -e "\n--- 2. 运行所有单元测试 ---"
 
 # 关闭 set -e，以便我们自己处理测试用例的失败
