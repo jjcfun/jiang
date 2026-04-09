@@ -14,6 +14,11 @@ OUT_ASSIGN_TARGET_LOG="$BUILD_DIR/stage2_invalid_assign_target.log"
 OUT_ASSIGN_FIELD_TYPE_LOG="$BUILD_DIR/stage2_invalid_assign_field_type.log"
 OUT_DUP_FUNC_LOG="$BUILD_DIR/stage2_invalid_duplicate_function.log"
 OUT_DUP_FIELD_DECL_LOG="$BUILD_DIR/stage2_invalid_duplicate_field_decl.log"
+OUT_DUP_PARAM_LOG="$BUILD_DIR/stage2_invalid_duplicate_param.log"
+OUT_DUP_LOCAL_LOG="$BUILD_DIR/stage2_invalid_duplicate_local.log"
+OUT_IMPORT_DUP_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_duplicate_function.log"
+OUT_DUP_TYPE_LOG="$BUILD_DIR/stage2_invalid_duplicate_type.log"
+OUT_DUP_ENUM_LOG="$BUILD_DIR/stage2_invalid_duplicate_enum.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -164,6 +169,81 @@ fi
 
 if [[ "$(<"$OUT_DUP_FIELD_DECL_LOG")" != *"duplicate field"* ]]; then
     echo "stage2 error smoke missing duplicate field declaration diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_param.jiang" > "$OUT_DUP_PARAM_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_duplicate_param to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_PARAM_LOG")" != *"duplicate parameter"* ]]; then
+    echo "stage2 error smoke missing duplicate parameter diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_local.jiang" > "$OUT_DUP_LOCAL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_duplicate_local to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_LOCAL_LOG")" != *"duplicate local"* ]]; then
+    echo "stage2 error smoke missing duplicate local diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_import_duplicate_function.jiang" > "$OUT_IMPORT_DUP_FUNC_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_import_duplicate_function to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_IMPORT_DUP_FUNC_LOG")" != *"duplicate function"* ]]; then
+    echo "stage2 error smoke missing imported duplicate function diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_type.jiang" > "$OUT_DUP_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_duplicate_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_TYPE_LOG")" != *"duplicate type"* ]]; then
+    echo "stage2 error smoke missing duplicate type diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_enum.jiang" > "$OUT_DUP_ENUM_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_duplicate_enum to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_ENUM_LOG")" != *"duplicate enum"* ]]; then
+    echo "stage2 error smoke missing duplicate enum diagnostic" >&2
     exit 1
 fi
 
