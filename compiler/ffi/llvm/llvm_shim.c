@@ -75,12 +75,20 @@ int64_t JIANG_LLVM_API(type_i1)(int64_t context) {
     return jiang_llvm_wrap_ptr(LLVMInt1TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)));
 }
 
+int64_t JIANG_LLVM_API(type_i8)(int64_t context) {
+    return jiang_llvm_wrap_ptr(LLVMInt8TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)));
+}
+
 int64_t JIANG_LLVM_API(type_i32)(int64_t context) {
     return jiang_llvm_wrap_ptr(LLVMInt32TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)));
 }
 
 int64_t JIANG_LLVM_API(type_i64)(int64_t context) {
     return jiang_llvm_wrap_ptr(LLVMInt64TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)));
+}
+
+int64_t JIANG_LLVM_API(type_ptr)(int64_t llvm_type) {
+    return jiang_llvm_wrap_ptr(LLVMPointerType((LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type), 0));
 }
 
 int64_t JIANG_LLVM_API(type_struct_named)(int64_t context, Slice_uint8_t name) {

@@ -3,66 +3,142 @@
 ## 当前状态
 
 - Stage0 已完成，并继续承担当前稳定宿主编译器职责。
-- Stage1 已完成，`bootstrap/` 是当前唯一正式自举主线。
-- `stage1c`、`bootstrap/jiang.build` 与 `script/stage1_complete_smoke.sh` 已固定为 Stage1 正式工作流。
-- Stage2 已启动，`compiler/` 当前已具备最小 `frontend -> JIR -> C` 骨架与 `stage2_emit_c_smoke.sh`。
+- Stage1 已完成，`bootstrap/` 是当前正式自举基线，`stage1c` 已固定。
+- Stage2 已启动，并且已经具备：
+  - `stage1c -> stage2c` 构建链
+  - `frontend -> HIR -> JIR -> C`
+  - `frontend -> HIR -> JIR -> LLVM`
+  - 多模块、`public`、alias import、导出表
+  - `struct` / `enum` 基础语义
+  - `UInt8` 与 `UInt8[]` 的最小类型闭环
+  - `emit-c` / `run` / `error` / `llvm` / `llvm-error` smoke
 
 更详细的阶段说明见 [doc/develop.md](doc/develop.md)。
 
 ## 当前重点
 
-- [x] 启动 Stage2 主线定义，并把 `compiler/` 收成新的正式实现目录
-- [ ] 继续把 Stage2 从最小 `emit-c` 闭环扩到更完整的前端与后端能力
-- [ ] 继续评估 LLVM 是否已经具备成为默认后端的条件
-- [ ] 保持 Stage0 / Stage1 / LLVM 三条回归链持续稳定
+- [ ] 完成 Stage2 的 slice / 字符串表达式主线
+- [ ] 完成 Stage2 的数组与聚合类型第一版
+- [ ] 完成 Stage2 的类型系统第一版
+- [ ] 让 LLVM 后端达到与 C 后端基本对齐
+- [ ] 把 Stage2 收成唯一继续演进的主线
 
-## Stage2 功能安排
+## Stage2 主计划
 
-### 1. Stage2 编译器骨架
+### 1. Slice 与字符串主线
 
-- [ ] 在 `compiler/` 中建立新的 Stage2 目录结构
-- [ ] 明确 Stage2 的入口层、核心模块层、后端层边界
-- [ ] 定义 Stage2 的正式 build / smoke / selfhost 验收路径
-- [ ] 保持 `bootstrap/` 继续作为已完成的 Stage1 基线，不与 Stage2 实现混写
+- [ ] 支持 `UInt8[]` 的 `.length`
+- [ ] 支持 `value[index]`
+- [ ] 支持 `value[index] = rhs`
+- [ ] 支持字符串字面量到 `UInt8[]`
+- [ ] 固定 slice 在 C / LLVM / runtime 中的统一 ABI
+- [ ] 为 slice 补正向 / 反向 / 运行级 smoke
 
-### 2. IR 与编译链重构
+涉及文件：
+- `compiler/frontend/token_store.jiang`
+- `compiler/frontend/lexer.jiang`
+- `compiler/frontend/parser_store.jiang`
+- `compiler/frontend/parser.jiang`
+- `compiler/frontend/hir_store.jiang`
+- `compiler/frontend/hir.jiang`
+- `compiler/ir/jir/jir_store.jiang`
+- `compiler/ir/jir/jir_lower.jiang`
+- `compiler/backend/c/emit_c.jiang`
+- `compiler/backend/llvm/emit_llvm.jiang`
+- `compiler/tests/samples/*`
+- `script/stage2_*_smoke.sh`
 
-- [ ] 重新梳理 Stage2 的前端到后端分层
-- [ ] 评估并确定是否引入 `AST -> HIR -> MIR -> backend` 的中间层结构
-- [ ] 减少当前 Stage1 中为 C emitter 服务的过早耦合
-- [ ] 为后续多后端共享 lowering 规则准备更稳定的 IR 边界
+### 2. 数组与聚合类型第一版
 
-### 3. 默认后端决策
+- [ ] 支持数组类型
+- [ ] 支持数组字面量
+- [ ] 明确数组与 slice 的转换规则
+- [ ] 完成数组在 C / LLVM 中的表示
+- [ ] 继续加强 `struct` / `enum` 在多模块、赋值、参数、返回值场景下的一致性
+- [ ] 让 HIR/JIR 不再依赖 emitter 兜底判断聚合语义
 
-- [ ] 对比 C 后端与 LLVM 后端在代表性入口上的行为一致性
-- [ ] 补充 LLVM 路径在 build system、bootstrap 入口和标准库上的稳定性证据
-- [ ] 明确“LLVM 成为默认后端”的验收标准
-- [ ] 如果 LLVM 条件不足，继续维持 C 为默认后端并缩小差异面
+涉及文件：
+- `compiler/frontend/type_store.jiang`
+- `compiler/frontend/hir.jiang`
+- `compiler/ir/jir/jir_store.jiang`
+- `compiler/ir/jir/jir_lower.jiang`
+- `compiler/backend/c/emit_c.jiang`
+- `compiler/backend/llvm/emit_llvm.jiang`
 
-### 4. Stage2 自举路线
+### 3. 类型系统第一版
 
-- [ ] 定义 Stage2 第一阶段允许依赖的语言子集
-- [ ] 规划 Stage2 如何复用或替换当前 Stage1 的模块加载、符号、类型、IR 基础设施
-- [ ] 设计 Stage2 从 `compiler/` 到自编译闭环的阶段性里程碑
-- [ ] 明确 Stage2 与 Stage1 的切换条件，而不是并行长期双主线发展
+- [ ] 完成 builtin type：`Int` / `Bool` / `Void` / `UInt8`
+- [ ] 完成命名类型：`struct` / `enum`
+- [ ] 完成复合类型：array / slice / pointer
+- [ ] 完成赋值类型检查
+- [ ] 完成 `return` 类型检查
+- [ ] 完成 call args / 返回值传播
+- [ ] 完成 field access / struct init / enum member 的完整类型传播
+- [ ] 收紧 `unknown`，减少当前“容忍后继续走”的路径
 
-### 5. 语言与编译器能力升级
+涉及文件：
+- `compiler/frontend/symbol_store.jiang`
+- `compiler/frontend/type_store.jiang`
+- `compiler/frontend/hir.jiang`
 
-- [ ] 规划自定义语法 / 子语言能力在 Stage2 的落点
-- [ ] 规划更稳定的模块系统、包管理接口与工程能力边界
-- [ ] 评估泛型、异步、所有权等高级特性的实现优先级
-- [ ] 规划标准库从 Stage1 最小集合向 Stage2 完整集合的扩展路线
+### 4. 模块系统收尾
+
+- [ ] 继续稳定 direct import / transitive import 规则
+- [ ] 继续稳定 alias import 的命名空间解析
+- [ ] 收紧 duplicate / visibility / export 诊断
+- [ ] 固定 imported type / function 在 HIR / JIR / LLVM 中的 identity
+- [ ] 为后续 build graph 留出稳定模块边界
+
+涉及文件：
+- `compiler/frontend/module_loader.jiang`
+- `compiler/frontend/path_utils.jiang`
+- `compiler/frontend/hir.jiang`
+- `compiler/frontend/symbol_store.jiang`
+- `compiler/frontend/type_store.jiang`
+
+### 5. LLVM 后端对齐
+
+- [ ] 补全 slice lowering
+- [ ] 补全数组 lowering
+- [ ] 继续补 pointer lowering
+- [ ] 与 C 后端在代表性样例上建立行为对齐回归
+- [ ] 完成 LLVM 错误路径与运行级验证
+
+涉及文件：
+- `compiler/backend/llvm/emit_llvm.jiang`
+- `compiler/ffi/llvm/core.jiang`
+- `compiler/ffi/llvm/llvm_shim.c`
+- `script/stage2_llvm_smoke.sh`
+- `script/stage2_llvm_error_smoke.sh`
+
+### 6. Stage2 正式化
+
+- [ ] 收口 `stage2c` CLI
+- [ ] 固定 Stage2 正式验收入口
+- [ ] 保持 `stage1 -> stage2` 构建链持续绿色
+- [ ] 明确 Stage2 替代 Stage1 的验收标准
+- [ ] 在 Stage2 足够稳定后冻结 Stage1，只保留 bootstrap 基线职责
+
+涉及文件：
+- `compiler/entries/compiler.jiang`
+- `compiler/stage2_driver.c`
+- `script/build_stage2.sh`
+- `script/test.sh`
 
 ## 持续性任务
 
 ### 回归与质量
 
-- [ ] 保持 `script/test.sh`、`script/stage1_complete_smoke.sh`、`script/test_llvm_backend.sh` 持续可用
-- [ ] 对新增 Stage2 主线建立独立 smoke，避免破坏已完成的 Stage1 基线
-- [ ] 继续压缩 warning、路径分叉和行为不一致问题
+- [ ] 保持 `script/test.sh` 持续可用
+- [ ] 保持 `script/stage1_complete_smoke.sh` 持续可用
+- [ ] 保持 `script/stage2_emit_c_smoke.sh` 持续可用
+- [ ] 保持 `script/stage2_run_smoke.sh` 持续可用
+- [ ] 保持 `script/stage2_error_smoke.sh` 持续可用
+- [ ] 保持 `script/stage2_llvm_smoke.sh` 持续可用
+- [ ] 保持 `script/stage2_llvm_error_smoke.sh` 持续可用
 
 ### 文档
 
-- [ ] 让 `README.md` 继续只保留高层说明和正式入口
-- [ ] 让 `doc/develop.md` 继续承担阶段设计、边界和内部路线说明
-- [ ] 在 Stage2 启动后补一份独立的 Stage2 设计文档
+- [ ] 根 `README.md` 继续只保留高层说明
+- [ ] `doc/develop.md` 继续承担阶段边界与实现状态说明
+- [ ] `compiler/README.md` 继续承担 Stage2 主线结构与范围说明

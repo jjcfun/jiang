@@ -76,25 +76,31 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 收口正式 `stage1c` CLI 与 Stage1 manifest/build workflow
 *   [x] 用统一 Stage1 完成验收脚本固定 build/link/run/selfhost 回归
 
-### 当前进行中：Stage2 启动
+### 当前进行中：Stage2 主线实现
 
 *   [x] 建立 `compiler/` Stage2 分层骨架
-*   [x] 跑通 `compiler/` 内最小 `frontend -> JIR -> C` 闭环
-*   [x] 新增 `script/stage2_emit_c_smoke.sh`
-*   [ ] 继续扩大 Stage2 前端与 JIR 覆盖范围
-*   [ ] 在 Stage2 主线中实现独立的 `JIR -> LLVM` 后端层
+*   [x] 跑通 `compiler/` 内 `frontend -> HIR -> JIR -> C`
+*   [x] 跑通 `compiler/` 内 `frontend -> HIR -> JIR -> LLVM`
+*   [x] 建立 `stage1 -> stage2` 构建链
+*   [x] 建立 Stage2 的 `emit-c` / `run` / `error` / `llvm` / `llvm-error` smoke
+*   [x] 完成多模块、`public`、alias import、导出表第一版
+*   [x] 完成 `struct` / `enum` 基础语义与 C/LLVM lowering
+*   [x] 完成 `UInt8` 与 `UInt8[]` 的最小类型闭环
+*   [ ] 继续完成 slice / 字符串表达式主线
+*   [ ] 继续完成数组与聚合类型第一版
+*   [ ] 继续完成类型系统第一版
+*   [ ] 继续让 LLVM 后端与 C 后端对齐
 
-### 当前优先主线：Stage2 启动准备 + 默认 LLVM 后端持续评估
+### 当前优先主线：Stage2 实现推进 + 默认 LLVM 后端持续评估
 
-当前 `--backend llvm` 已经可以覆盖完整正向测试集，并通过 `script/test_llvm_backend.sh`、`script/bootstrap_llvm_smoke.sh` 与 `script/test.sh`。
+当前 `--backend llvm` 的 Stage0/Stage1 回归仍然保留；同时 Stage2 自己已经具备独立 LLVM 后端和独立 smoke。
 Stage1 当前主线已经完成；当前更值得做的是：
 
-*   是否开始正式启动 Stage2 主线
-*   C 与 LLVM 在代表入口上的行为是否已经稳定一致
-*   LLVM 是否已经达到未来默认后端候选的成熟度
+*   让 Stage2 的类型系统和聚合类型继续做实
+*   让 C 与 LLVM 在代表性 Stage2 样例上持续收敛
+*   评估 LLVM 是否已经达到未来 Stage2 默认后端候选的成熟度
 
-当前最新计划见 `doc/plan_stage1_default_llvm.md`。
-`compiler/` 当前仅是 Stage2 预留目录；现阶段不再推进其内部主线实现。
+当前最新执行清单见 `TODO.md`。
 
 ### 已完成阶段：LLVM Spike / LLVM C API 路径
 

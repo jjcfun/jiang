@@ -19,6 +19,10 @@ MINIMAL_LL="$OUT_DIR/minimal.ll"
 MINIMAL_O="$OUT_DIR/minimal.o"
 WHILE_LL="$OUT_DIR/while_minimal.ll"
 WHILE_O="$OUT_DIR/while_minimal.o"
+UINT8_LL="$OUT_DIR/uint8_minimal.ll"
+UINT8_O="$OUT_DIR/uint8_minimal.o"
+UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
+UINT8_SLICE_O="$OUT_DIR/uint8_slice_minimal.o"
 ENUM_LL="$OUT_DIR/enum_minimal.ll"
 ENUM_O="$OUT_DIR/enum_minimal.o"
 STRUCT_LL="$OUT_DIR/struct_minimal.ll"
@@ -68,6 +72,17 @@ if [[ $STATUS -ne 10 ]]; then
     echo "stage2 llvm smoke expected while_minimal exit code 10, got $STATUS" >&2
     exit 1
 fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/uint8_minimal.jiang" > "$UINT8_LL"
+rg -q '^define i8 @id\(i8 %0\)' "$UINT8_LL"
+rg -q '^define i32 @main\(\)' "$UINT8_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UINT8_LL" -o "$UINT8_O"
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/uint8_slice_minimal.jiang" > "$UINT8_SLICE_LL"
+rg -q '^%Slice_uint8_t = type \{ ptr, i64 \}' "$UINT8_SLICE_LL"
+rg -q '^define %Slice_uint8_t @id\(%Slice_uint8_t %0\)' "$UINT8_SLICE_LL"
+rg -q '^define i32 @main\(\)' "$UINT8_SLICE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UINT8_SLICE_LL" -o "$UINT8_SLICE_O"
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_minimal.jiang" > "$ENUM_LL"
 rg -q '^define i64 @code\(i64 %0\)' "$ENUM_LL"
