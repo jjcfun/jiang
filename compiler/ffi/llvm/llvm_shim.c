@@ -209,6 +209,26 @@ void JIANG_LLVM_API(build_store)(int64_t builder, int64_t value, int64_t ptr_val
     );
 }
 
+int64_t JIANG_LLVM_API(build_gep)(int64_t builder, int64_t llvm_type, int64_t ptr_value, Slice_int64_t indices, Slice_uint8_t name) {
+    LLVMValueRef llvm_indices[8];
+    unsigned count = 0;
+    while (count < (unsigned)indices.length && count < 8) {
+        llvm_indices[count] = (LLVMValueRef)jiang_llvm_unwrap_ptr(indices.ptr[count]);
+        count++;
+    }
+    char* text = jiang_llvm_to_cstr(name);
+    LLVMValueRef value = LLVMBuildGEP2(
+        (LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
+        (LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type),
+        (LLVMValueRef)jiang_llvm_unwrap_ptr(ptr_value),
+        count == 0 ? NULL : llvm_indices,
+        count,
+        text ? text : "geptmp"
+    );
+    free(text);
+    return jiang_llvm_wrap_ptr(value);
+}
+
 int64_t JIANG_LLVM_API(build_extract_value)(int64_t builder, int64_t aggregate, int64_t index, Slice_uint8_t name) {
     char* text = jiang_llvm_to_cstr(name);
     LLVMValueRef value = LLVMBuildExtractValue(
@@ -231,6 +251,19 @@ int64_t JIANG_LLVM_API(build_insert_value)(int64_t builder, int64_t aggregate, i
         text ? text : "inserttmp"
     );
     free(text);
+    return jiang_llvm_wrap_ptr(out);
+}
+
+int64_t JIANG_LLVM_API(build_global_string_ptr)(int64_t builder, Slice_uint8_t value, Slice_uint8_t name) {
+    char* text = jiang_llvm_to_cstr(value);
+    char* label = jiang_llvm_to_cstr(name);
+    LLVMValueRef out = LLVMBuildGlobalStringPtr(
+        (LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
+        text ? text : "",
+        label ? label : "str"
+    );
+    free(text);
+    free(label);
     return jiang_llvm_wrap_ptr(out);
 }
 
