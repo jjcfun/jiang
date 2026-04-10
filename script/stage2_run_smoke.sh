@@ -61,6 +61,16 @@ if [[ $STATUS -ne 3 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/slice_return_length_minimal.jiang" "slice_return_length_minimal"
+set +e
+"$OUT_DIR/slice_return_length_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 run smoke expected slice_return_length_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/call_result_field_minimal.jiang" "call_result_field_minimal"
 set +e
 "$OUT_DIR/call_result_field_minimal"

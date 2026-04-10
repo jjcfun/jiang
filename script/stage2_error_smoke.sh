@@ -12,6 +12,7 @@ OUT_MISSING_FIELD_LOG="$BUILD_DIR/stage2_invalid_missing_field.log"
 OUT_DUP_FIELD_LOG="$BUILD_DIR/stage2_invalid_duplicate_field.log"
 OUT_ASSIGN_TARGET_LOG="$BUILD_DIR/stage2_invalid_assign_target.log"
 OUT_ASSIGN_FIELD_TYPE_LOG="$BUILD_DIR/stage2_invalid_assign_field_type.log"
+OUT_SLICE_ASSIGN_TYPE_LOG="$BUILD_DIR/stage2_invalid_slice_assign_type.log"
 OUT_DUP_FUNC_LOG="$BUILD_DIR/stage2_invalid_duplicate_function.log"
 OUT_DUP_FIELD_DECL_LOG="$BUILD_DIR/stage2_invalid_duplicate_field_decl.log"
 OUT_DUP_PARAM_LOG="$BUILD_DIR/stage2_invalid_duplicate_param.log"
@@ -143,6 +144,21 @@ fi
 
 if [[ "$(<"$OUT_ASSIGN_FIELD_TYPE_LOG")" != *"assignment type mismatch"* ]]; then
     echo "stage2 error smoke missing assignment type mismatch diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_slice_assign_type.jiang" > "$OUT_SLICE_ASSIGN_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_slice_assign_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_SLICE_ASSIGN_TYPE_LOG")" != *"assignment type mismatch"* ]]; then
+    echo "stage2 error smoke missing slice assignment type mismatch diagnostic" >&2
     exit 1
 fi
 

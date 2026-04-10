@@ -27,6 +27,10 @@ SLICE_LENGTH_LL="$OUT_DIR/slice_length_minimal.ll"
 SLICE_LENGTH_O="$OUT_DIR/slice_length_minimal.o"
 SLICE_INDEX_LL="$OUT_DIR/slice_index_minimal.ll"
 SLICE_INDEX_O="$OUT_DIR/slice_index_minimal.o"
+SLICE_ASSIGN_LL="$OUT_DIR/slice_assign_minimal.ll"
+SLICE_ASSIGN_O="$OUT_DIR/slice_assign_minimal.o"
+SLICE_RETURN_LENGTH_LL="$OUT_DIR/slice_return_length_minimal.ll"
+SLICE_RETURN_LENGTH_O="$OUT_DIR/slice_return_length_minimal.o"
 ENUM_LL="$OUT_DIR/enum_minimal.ll"
 ENUM_O="$OUT_DIR/enum_minimal.o"
 STRUCT_LL="$OUT_DIR/struct_minimal.ll"
@@ -105,6 +109,24 @@ fi
 rg -q '^define i8 @pick\(%Slice_uint8_t %0\)' "$SLICE_INDEX_LL"
 rg -q 'getelementptr i8, ptr' "$SLICE_INDEX_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$SLICE_INDEX_LL" -o "$SLICE_INDEX_O"
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/slice_assign_minimal.jiang" > "$SLICE_ASSIGN_LL"
+rg -q '^define void @poke\(%Slice_uint8_t %0, i8 %1\)' "$SLICE_ASSIGN_LL"
+rg -q 'store i8 %' "$SLICE_ASSIGN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$SLICE_ASSIGN_LL" -o "$SLICE_ASSIGN_O"
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/slice_return_length_minimal.jiang" > "$SLICE_RETURN_LENGTH_LL"
+rg -q '^define %Slice_uint8_t @id\(%Slice_uint8_t %0\)' "$SLICE_RETURN_LENGTH_LL"
+rg -q 'extractvalue %Slice_uint8_t .*?, 1' "$SLICE_RETURN_LENGTH_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$SLICE_RETURN_LENGTH_LL" -o "$SLICE_RETURN_LENGTH_O"
+set +e
+"$LLVM_LLI" "$SLICE_RETURN_LENGTH_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 llvm smoke expected slice_return_length_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_minimal.jiang" > "$ENUM_LL"
 rg -q '^define i64 @code\(i64 %0\)' "$ENUM_LL"

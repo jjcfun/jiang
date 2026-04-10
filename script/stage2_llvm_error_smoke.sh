@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 OUT_PARSE_LOG="$BUILD_DIR/stage2_llvm_invalid_parse.log"
 OUT_CALL_LOG="$BUILD_DIR/stage2_llvm_invalid_call.log"
+OUT_SLICE_ASSIGN_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_slice_assign_type.log"
 OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_private_type.log"
 OUT_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_llvm_invalid_private_function.log"
 OUT_TRANSITIVE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_transitive_type.log"
@@ -50,6 +51,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_CALL_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_call_arg" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_slice_assign_type.jiang" > "$OUT_SLICE_ASSIGN_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_slice_assign_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_SLICE_ASSIGN_TYPE_LOG")" != *"assignment type mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing slice assignment type mismatch diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_SLICE_ASSIGN_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_slice_assign_type" >&2
     exit 1
 fi
 

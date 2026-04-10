@@ -17,9 +17,8 @@
 
 ## 当前重点
 
-- [ ] 完成 Stage2 的 slice / 字符串表达式主线
 - [ ] 完成 Stage2 的数组与聚合类型第一版
-- [ ] 完成 Stage2 的类型系统第一版
+- [ ] 收紧 Stage2 的类型系统与 `unknown` 容忍路径
 - [ ] 让 LLVM 后端达到与 C 后端基本对齐
 - [ ] 把 Stage2 收成唯一继续演进的主线
 
@@ -27,12 +26,12 @@
 
 ### 1. Slice 与字符串主线
 
-- [ ] 支持 `UInt8[]` 的 `.length`
-- [ ] 支持 `value[index]`
-- [ ] 支持 `value[index] = rhs`
-- [ ] 支持字符串字面量到 `UInt8[]`
-- [ ] 固定 slice 在 C / LLVM / runtime 中的统一 ABI
-- [ ] 为 slice 补正向 / 反向 / 运行级 smoke
+- [x] 支持 `UInt8[]` 的 `.length`
+- [x] 支持 `value[index]`
+- [x] 支持 `value[index] = rhs`
+- [x] 支持字符串字面量到 `UInt8[]`
+- [x] 固定 slice 在 C / LLVM / runtime 中的统一 ABI
+- [x] 为 slice 补更完整的反向 / 运行级 smoke
 
 涉及文件：
 - `compiler/frontend/token_store.jiang`
@@ -67,11 +66,11 @@
 
 ### 3. 类型系统第一版
 
-- [ ] 完成 builtin type：`Int` / `Bool` / `Void` / `UInt8`
-- [ ] 完成命名类型：`struct` / `enum`
+- [x] 完成 builtin type：`Int` / `Bool` / `Void` / `UInt8`
+- [x] 完成命名类型：`struct` / `enum`
 - [ ] 完成复合类型：array / slice / pointer
-- [ ] 完成赋值类型检查
-- [ ] 完成 `return` 类型检查
+- [x] 完成赋值类型检查
+- [x] 完成 `return` 类型检查
 - [ ] 完成 call args / 返回值传播
 - [ ] 完成 field access / struct init / enum member 的完整类型传播
 - [ ] 收紧 `unknown`，减少当前“容忍后继续走”的路径
@@ -83,10 +82,10 @@
 
 ### 4. 模块系统收尾
 
-- [ ] 继续稳定 direct import / transitive import 规则
-- [ ] 继续稳定 alias import 的命名空间解析
+- [x] 继续稳定 direct import / transitive import 规则
+- [x] 继续稳定 alias import 的命名空间解析
 - [ ] 收紧 duplicate / visibility / export 诊断
-- [ ] 固定 imported type / function 在 HIR / JIR / LLVM 中的 identity
+- [x] 固定 imported type / function 在 HIR / JIR / LLVM 中的 identity
 - [ ] 为后续 build graph 留出稳定模块边界
 
 涉及文件：
@@ -98,11 +97,11 @@
 
 ### 5. LLVM 后端对齐
 
-- [ ] 补全 slice lowering
+- [x] 补全 slice lowering
 - [ ] 补全数组 lowering
 - [ ] 继续补 pointer lowering
-- [ ] 与 C 后端在代表性样例上建立行为对齐回归
-- [ ] 完成 LLVM 错误路径与运行级验证
+- [x] 与 C 后端在代表性样例上建立行为对齐回归
+- [x] 完成 LLVM 错误路径与运行级验证
 
 涉及文件：
 - `compiler/backend/llvm/emit_llvm.jiang`
@@ -129,13 +128,13 @@
 
 ### 回归与质量
 
-- [ ] 保持 `script/test.sh` 持续可用
-- [ ] 保持 `script/stage1_complete_smoke.sh` 持续可用
-- [ ] 保持 `script/stage2_emit_c_smoke.sh` 持续可用
-- [ ] 保持 `script/stage2_run_smoke.sh` 持续可用
-- [ ] 保持 `script/stage2_error_smoke.sh` 持续可用
-- [ ] 保持 `script/stage2_llvm_smoke.sh` 持续可用
-- [ ] 保持 `script/stage2_llvm_error_smoke.sh` 持续可用
+- [x] 保持 `script/test.sh` 持续可用
+- [x] 保持 `script/stage1_complete_smoke.sh` 持续可用
+- [x] 保持 `script/stage2_emit_c_smoke.sh` 持续可用
+- [x] 保持 `script/stage2_run_smoke.sh` 持续可用
+- [x] 保持 `script/stage2_error_smoke.sh` 持续可用
+- [x] 保持 `script/stage2_llvm_smoke.sh` 持续可用
+- [x] 保持 `script/stage2_llvm_error_smoke.sh` 持续可用
 
 ### 文档
 
