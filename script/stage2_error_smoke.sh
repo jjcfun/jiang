@@ -19,6 +19,10 @@ OUT_DUP_LOCAL_LOG="$BUILD_DIR/stage2_invalid_duplicate_local.log"
 OUT_IMPORT_DUP_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_duplicate_function.log"
 OUT_DUP_TYPE_LOG="$BUILD_DIR/stage2_invalid_duplicate_type.log"
 OUT_DUP_ENUM_LOG="$BUILD_DIR/stage2_invalid_duplicate_enum.log"
+OUT_TRANSITIVE_TYPE_LOG="$BUILD_DIR/stage2_invalid_transitive_import_type.log"
+OUT_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_private_function.log"
+OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_invalid_import_private_type.log"
+OUT_ALIAS_MEMBER_LOG="$BUILD_DIR/stage2_invalid_import_alias_missing_member.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -244,6 +248,66 @@ fi
 
 if [[ "$(<"$OUT_DUP_ENUM_LOG")" != *"duplicate enum"* ]]; then
     echo "stage2 error smoke missing duplicate enum diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_transitive_import_type.jiang" > "$OUT_TRANSITIVE_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_transitive_import_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TRANSITIVE_TYPE_LOG")" != *"unknown type"* ]]; then
+    echo "stage2 error smoke missing unknown type diagnostic for transitive import" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_import_private_function.jiang" > "$OUT_PRIVATE_FUNC_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_import_private_function to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_PRIVATE_FUNC_LOG")" != *"call target must be a function"* ]]; then
+    echo "stage2 error smoke missing private function visibility diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_import_private_type.jiang" > "$OUT_PRIVATE_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_import_private_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_PRIVATE_TYPE_LOG")" != *"unknown type"* ]]; then
+    echo "stage2 error smoke missing private type visibility diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_import_alias_missing_member.jiang" > "$OUT_ALIAS_MEMBER_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_import_alias_missing_member to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ALIAS_MEMBER_LOG")" != *"unknown member"* ]]; then
+    echo "stage2 error smoke missing import alias missing member diagnostic" >&2
     exit 1
 fi
 

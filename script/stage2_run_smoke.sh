@@ -61,4 +61,54 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/public_import_function_minimal.jiang" "public_import_function_minimal"
+set +e
+"$OUT_DIR/public_import_function_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected public_import_function_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/public_import_type_minimal.jiang" "public_import_type_minimal"
+set +e
+"$OUT_DIR/public_import_type_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected public_import_type_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_import_minimal.jiang" "namespaced_import_minimal"
+set +e
+"$OUT_DIR/namespaced_import_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected namespaced_import_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_struct_import_minimal.jiang" "namespaced_struct_import_minimal"
+set +e
+"$OUT_DIR/namespaced_struct_import_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected namespaced_struct_import_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_enum_import_minimal.jiang" "namespaced_enum_import_minimal"
+set +e
+"$OUT_DIR/namespaced_enum_import_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected namespaced_enum_import_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
 echo "stage2 run smoke passed"
