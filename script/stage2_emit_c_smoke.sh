@@ -34,6 +34,10 @@ ENUM_C="$BUILD_DIR/stage2_enum_minimal.c"
 ENUM_O="$BUILD_DIR/stage2_enum_minimal.o"
 FIELDS_C="$BUILD_DIR/stage2_fields_minimal.c"
 FIELDS_O="$BUILD_DIR/stage2_fields_minimal.o"
+NESTED_FIELDS_C="$BUILD_DIR/stage2_nested_fields_minimal.c"
+NESTED_FIELDS_O="$BUILD_DIR/stage2_nested_fields_minimal.o"
+CALL_RESULT_FIELD_C="$BUILD_DIR/stage2_call_result_field_minimal.c"
+CALL_RESULT_FIELD_O="$BUILD_DIR/stage2_call_result_field_minimal.o"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -140,5 +144,17 @@ rg -q 'Pair pair = \(Pair\)\{ \.left = 1, \.right = 2 \};' "$FIELDS_C"
 rg -q '\(pair.left = \(pair.left \+ pair.right\)\);' "$FIELDS_C"
 rg -q '^    return pair.left;$' "$FIELDS_C"
 cc -x c -std=c99 -Wall -Wextra -Werror -c "$FIELDS_C" -o "$FIELDS_O"
+
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/nested_fields_minimal.jiang" > "$NESTED_FIELDS_C"
+rg -q '^typedef struct Point \{$' "$NESTED_FIELDS_C"
+rg -q '^typedef struct Box \{$' "$NESTED_FIELDS_C"
+rg -q 'return box.point.x;' "$NESTED_FIELDS_C"
+rg -q 'Box box = \(Box\)\{ \.point = \(Point\)\{ \.x = 42 \} \};' "$NESTED_FIELDS_C"
+cc -x c -std=c99 -Wall -Wextra -Werror -c "$NESTED_FIELDS_C" -o "$NESTED_FIELDS_O"
+
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/call_result_field_minimal.jiang" > "$CALL_RESULT_FIELD_C"
+rg -q '^Box make_box\(void\);$' "$CALL_RESULT_FIELD_C"
+rg -q 'return make_box\(\)\.point\.x;' "$CALL_RESULT_FIELD_C"
+cc -x c -std=c99 -Wall -Wextra -Werror -c "$CALL_RESULT_FIELD_C" -o "$CALL_RESULT_FIELD_O"
 
 echo "stage2 emit-c smoke passed"
