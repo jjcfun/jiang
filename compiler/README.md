@@ -49,7 +49,9 @@
   - 命令式函数基础语法
   - 多模块、`public`、alias import、导出表
   - `struct` / `enum` 基础语义
-  - `UInt8` 与 `UInt8[]` 的最小类型闭环
+  - `UInt8` / `UInt8[]` / array / pointer 基础类型闭环
+  - 数组到 slice 的最小转换规则（当前固定 `UInt8[N] -> UInt8[]`）
+  - C 与 LLVM 双后端
 - Stage2 当前已有稳定回归：
   - `script/stage2_complete_smoke.sh`
   - `script/stage2_emit_c_smoke.sh`
@@ -66,9 +68,28 @@
   - `Span`
   - `SourceFile`
 
-当前下一阶段的重点不是继续扩平面语法数量，而是：
+当前下一阶段的重点不是再起新骨架，而是收尾：
 
-- 完成 slice / 字符串表达式主线
-- 完成数组与聚合类型第一版
-- 完成类型系统第一版
-- 让 LLVM 后端逐步与 C 后端对齐
+- 收紧 `unknown` 容忍路径
+- 继续加强 `struct` / `enum` 在多模块、赋值、参数、返回值场景下的一致性
+- 继续收紧 LLVM 与 C 后端的剩余差异
+- 把 Stage2 收成唯一继续演进的主线
+
+## Stage2 接管标准
+
+Stage2 替代 Stage1 的验收标准固定为：
+
+- `script/build_stage2.sh` 持续通过，且 `build/stage2c` 由 `stage1c` 构建
+- `script/stage2_complete_smoke.sh` 持续通过
+- `script/stage1_complete_smoke.sh` 持续通过，不因 Stage2 演进被打断
+- `stage2c` 的 `emit-c` 与 `--emit-llvm` 都保持可用
+- Stage2 已覆盖当前日常主语法子集：
+  - 多模块与 `public`
+  - `struct` / `enum`
+  - `UInt8` / `UInt8[]` / array / pointer
+  - 命令式函数、控制流、赋值、调用
+
+达到以上条件后：
+
+- `compiler/` 视为唯一继续演进的编译器主线
+- `bootstrap/` 保持 Stage1 冻结基线职责

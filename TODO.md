@@ -72,7 +72,7 @@
 - [x] 完成赋值类型检查
 - [x] 完成 `return` 类型检查
 - [x] 完成 call args / 返回值传播
-- [ ] 完成 field access / struct init / enum member / array index 的完整类型传播
+- [x] 完成 field access / struct init / enum member / array index 的完整类型传播
 - [ ] 收紧 `unknown`，减少当前“容忍后继续走”的路径
 
 涉及文件：
@@ -114,8 +114,8 @@
 
 - [x] 收口 `stage2c` CLI（默认 `emit-c`，支持 `--emit-llvm` 与 `--help`）
 - [x] 固定 Stage2 正式验收入口
-- [ ] 保持 `stage1 -> stage2` 构建链持续绿色
-- [ ] 明确 Stage2 替代 Stage1 的验收标准
+- [x] 保持 `stage1 -> stage2` 构建链持续绿色
+- [x] 明确 Stage2 替代 Stage1 的验收标准
 - [ ] 在 Stage2 足够稳定后冻结 Stage1，只保留 bootstrap 基线职责
 
 涉及文件：
@@ -138,6 +138,6 @@
 
 ### 文档
 
-- [ ] 根 `README.md` 继续只保留高层说明
-- [ ] `doc/develop.md` 继续承担阶段边界与实现状态说明
-- [ ] `compiler/README.md` 继续承担 Stage2 主线结构与范围说明
+- [x] 根 `README.md` 继续只保留高层说明
+- [x] `doc/develop.md` 继续承担阶段边界与实现状态说明
+- [x] `compiler/README.md` 继续承担 Stage2 主线结构与范围说明

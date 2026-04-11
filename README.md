@@ -75,7 +75,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 + **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。该阶段已经完成：Stage1 主线固定在 `bootstrap/`，根目录保留可复用编译器模块，`bootstrap/entries/` 放 smoke driver 和工具入口；`compiler_core.compile_entry(path, mode)` 已稳定支持 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`，正式 `stage1c` CLI、manifest 与 build workflow 已收口，并通过统一 Stage1 完成验收与 selfhost 回归；`--backend llvm` 当前作为可选完整后端保留在回归中，但默认后端仍保持 C
 
-+ **Stage2**: 在 Stage1 自举编译器真正收口并可接管主职责之后，再用 Jiang 语言重构 Jiang 编译器，并实现自定义语法等高级功能。当前 `compiler/` 目录仅作为 Stage2 预留目录，不承载正式主线实现
++ **Stage2**: 在 Stage1 自举编译器真正收口并可接管主职责之后，再用 Jiang 语言重构 Jiang 编译器，并实现自定义语法等高级功能。该阶段已经启动：当前 `compiler/` 是正式 Stage2 主线目录，已具备 `stage1c -> stage2c` 构建链、`frontend -> HIR -> JIR -> C/LLVM`、多模块与 `public`/alias import、`struct` / `enum` / `UInt8` / `UInt8[]` / array / pointer 基础语义，以及 `emit-c` / `run` / `error` / `llvm` / `llvm-error` / `complete` 回归
 
 + **Stage3**: 包管理工具的实现
 
@@ -110,7 +110,7 @@ make
 ./script/test.sh
 ```
 
-当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行主测试链；Stage1 的正式完成验收由单独脚本固定。
+当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行 Stage0、Stage1、Stage2 的主测试链。
 
 Stage1 的正式完成验收脚本是：
 
@@ -124,6 +124,21 @@ bash ./script/stage1_complete_smoke.sh
 - real-entry smoke
 - Stage1 manifest build/run 矩阵
 - `stage1c` 构建、link、run、selfhost 验证
+
+Stage2 的正式完成验收脚本是：
+
+```bash
+bash ./script/stage2_complete_smoke.sh
+```
+
+它会统一覆盖：
+
+- `stage2c` CLI
+- `emit-c`
+- `run`
+- `error`
+- `emit-llvm`
+- `llvm-error`
 
 ### Stage1c CLI
 

@@ -88,21 +88,43 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 完成 `UInt8` 与 `UInt8[]` 的最小类型闭环
 *   [x] 收口 `stage2c` 最小正式 CLI（默认 `emit-c`，支持 `--emit-llvm` 与 `--help`）
 *   [x] 收口 `stage2_complete_smoke.sh` 作为 Stage2 单点验收入口
-*   [ ] 继续完成 slice / 字符串表达式主线
-*   [ ] 继续完成数组与聚合类型第一版
-*   [ ] 继续完成类型系统第一版
-*   [ ] 继续让 LLVM 后端与 C 后端对齐
+*   [x] 完成 slice / 字符串表达式主线
+*   [x] 完成数组与聚合类型第一版
+*   [x] 完成 builtin / named / 复合类型第一版（`Int` / `Bool` / `Void` / `UInt8`、`struct` / `enum`、array / slice / pointer）
+*   [x] 让 LLVM 后端在代表性 Stage2 样例上与 C 后端建立对齐回归
+*   [ ] 继续收紧 `unknown` 容忍路径
+*   [ ] 继续加强聚合类型在多模块、赋值、参数、返回值场景下的一致性
+*   [ ] 把 Stage2 收成唯一继续演进的主线
 
 ### 当前优先主线：Stage2 实现推进 + 默认 LLVM 后端持续评估
 
 当前 `--backend llvm` 的 Stage0/Stage1 回归仍然保留；同时 Stage2 自己已经具备独立 LLVM 后端和独立 smoke。
 Stage1 当前主线已经完成；当前更值得做的是：
 
-*   让 Stage2 的类型系统和聚合类型继续做实
-*   让 C 与 LLVM 在代表性 Stage2 样例上持续收敛
+*   让 Stage2 的剩余语义缺口继续收紧，尤其是 `unknown` 容忍路径
+*   让聚合类型在多模块和两套后端中的行为继续收敛
 *   评估 LLVM 是否已经达到未来 Stage2 默认后端候选的成熟度
 
 当前最新执行清单见 `TODO.md`。
+
+### Stage2 接管 Stage1 的判定条件
+
+当前固定的接管标准是：
+
+*   `script/build_stage2.sh` 持续通过，且 `stage2c` 由 `stage1c` 构建
+*   `script/stage2_complete_smoke.sh` 持续通过
+*   `script/stage1_complete_smoke.sh` 持续通过
+*   Stage2 的 `emit-c` 与 `--emit-llvm` 都保持正式可用
+*   Stage2 已覆盖当前日常主语法子集：
+    *   多模块与 `public`
+    *   `struct` / `enum`
+    *   `UInt8` / `UInt8[]` / array / pointer
+    *   命令式函数、控制流、赋值、调用
+
+达到这些条件后：
+
+*   `compiler/` 成为唯一继续演进的主线
+*   `bootstrap/` 冻结为 Stage1 基线，只保留 bootstrap 与回归职责
 
 ### 已完成阶段：LLVM Spike / LLVM C API 路径
 

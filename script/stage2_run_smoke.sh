@@ -101,6 +101,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/multi_file_struct_array_minimal.jiang" "multi_file_struct_array_minimal"
+set +e
+"$OUT_DIR/multi_file_struct_array_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 run smoke expected multi_file_struct_array_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_struct_array_minimal.jiang" "namespaced_struct_array_minimal"
+set +e
+"$OUT_DIR/namespaced_struct_array_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 run smoke expected namespaced_struct_array_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/multi_file_slice_return_minimal.jiang" "multi_file_slice_return_minimal"
 set +e
 "$OUT_DIR/multi_file_slice_return_minimal"
@@ -248,6 +268,26 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 run smoke expected pointer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/multi_file_pointer_minimal.jiang" "multi_file_pointer_minimal"
+set +e
+"$OUT_DIR/multi_file_pointer_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected multi_file_pointer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_pointer_minimal.jiang" "namespaced_pointer_minimal"
+set +e
+"$OUT_DIR/namespaced_pointer_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected namespaced_pointer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

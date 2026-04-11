@@ -18,6 +18,15 @@ OUT_UNKNOWN_IDENT_LOG="$BUILD_DIR/stage2_llvm_invalid_unknown_ident.log"
 OUT_CALL_NON_FUNCTION_LOG="$BUILD_DIR/stage2_llvm_invalid_call_non_function.log"
 OUT_DUP_ENUM_MEMBER_LOG="$BUILD_DIR/stage2_llvm_invalid_duplicate_enum_member.log"
 OUT_DUP_IMPORT_ALIAS_LOG="$BUILD_DIR/stage2_llvm_invalid_duplicate_import_alias.log"
+OUT_TYPE_FUNC_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_type_function_name_conflict.log"
+OUT_ENUM_TYPE_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_enum_type_name_conflict.log"
+OUT_ALIAS_FUNC_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_import_alias_function_conflict.log"
+OUT_ALIAS_TYPE_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_import_alias_type_conflict.log"
+OUT_INDEX_TARGET_LOG="$BUILD_DIR/stage2_llvm_invalid_index_target.log"
+OUT_INDEX_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_index_type.log"
+OUT_ARRAY_ARG_LENGTH_LOG="$BUILD_DIR/stage2_llvm_invalid_array_arg_length.log"
+OUT_ARRAY_ASSIGN_LENGTH_LOG="$BUILD_DIR/stage2_llvm_invalid_array_assign_length.log"
+OUT_ARRAY_RETURN_LENGTH_LOG="$BUILD_DIR/stage2_llvm_invalid_array_return_length.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -298,6 +307,186 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_DUP_IMPORT_ALIAS_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_duplicate_import_alias" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_type_function_name_conflict.jiang" > "$OUT_TYPE_FUNC_CONFLICT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_type_function_name_conflict to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TYPE_FUNC_CONFLICT_LOG")" != *"duplicate function"* ]]; then
+    echo "stage2 llvm error smoke missing type/function name conflict diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_TYPE_FUNC_CONFLICT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_type_function_name_conflict" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_enum_type_name_conflict.jiang" > "$OUT_ENUM_TYPE_CONFLICT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_enum_type_name_conflict to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ENUM_TYPE_CONFLICT_LOG")" != *"duplicate enum"* ]]; then
+    echo "stage2 llvm error smoke missing enum/type name conflict diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ENUM_TYPE_CONFLICT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_enum_type_name_conflict" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_import_alias_function_conflict.jiang" > "$OUT_ALIAS_FUNC_CONFLICT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_import_alias_function_conflict to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ALIAS_FUNC_CONFLICT_LOG")" != *"duplicate function"* ]]; then
+    echo "stage2 llvm error smoke missing import alias/function conflict diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ALIAS_FUNC_CONFLICT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_alias_function_conflict" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_import_alias_type_conflict.jiang" > "$OUT_ALIAS_TYPE_CONFLICT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_import_alias_type_conflict to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ALIAS_TYPE_CONFLICT_LOG")" != *"duplicate type"* ]]; then
+    echo "stage2 llvm error smoke missing import alias/type conflict diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ALIAS_TYPE_CONFLICT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_alias_type_conflict" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_index_target.jiang" > "$OUT_INDEX_TARGET_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_index_target to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_INDEX_TARGET_LOG")" != *"index target must be array or slice"* ]]; then
+    echo "stage2 llvm error smoke missing index target diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_INDEX_TARGET_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_index_target" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_index_type.jiang" > "$OUT_INDEX_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_index_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_INDEX_TYPE_LOG")" != *"index requires Int"* ]]; then
+    echo "stage2 llvm error smoke missing index type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_INDEX_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_index_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_array_arg_length.jiang" > "$OUT_ARRAY_ARG_LENGTH_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_array_arg_length to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ARRAY_ARG_LENGTH_LOG")" != *"array literal length mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing array arg length diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ARRAY_ARG_LENGTH_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_array_arg_length" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_array_assign_length.jiang" > "$OUT_ARRAY_ASSIGN_LENGTH_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_array_assign_length to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ARRAY_ASSIGN_LENGTH_LOG")" != *"array literal length mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing array assign length diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ARRAY_ASSIGN_LENGTH_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_array_assign_length" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_array_return_length.jiang" > "$OUT_ARRAY_RETURN_LENGTH_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_array_return_length to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ARRAY_RETURN_LENGTH_LOG")" != *"array literal length mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing array return length diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ARRAY_RETURN_LENGTH_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_array_return_length" >&2
     exit 1
 fi
 

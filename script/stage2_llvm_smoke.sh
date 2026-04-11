@@ -59,10 +59,14 @@ MULTI_STRUCT_LL="$OUT_DIR/multi_file_struct_minimal.ll"
 MULTI_STRUCT_O="$OUT_DIR/multi_file_struct_minimal.o"
 MULTI_STRUCT_RETURN_LL="$OUT_DIR/multi_file_struct_return_minimal.ll"
 MULTI_STRUCT_RETURN_O="$OUT_DIR/multi_file_struct_return_minimal.o"
+MULTI_STRUCT_ARRAY_LL="$OUT_DIR/multi_file_struct_array_minimal.ll"
+MULTI_STRUCT_ARRAY_O="$OUT_DIR/multi_file_struct_array_minimal.o"
 NS_STRUCT_LL="$OUT_DIR/namespaced_struct_import_minimal.ll"
 NS_STRUCT_O="$OUT_DIR/namespaced_struct_import_minimal.o"
 NS_STRUCT_RETURN_LL="$OUT_DIR/namespaced_struct_return_minimal.ll"
 NS_STRUCT_RETURN_O="$OUT_DIR/namespaced_struct_return_minimal.o"
+NS_STRUCT_ARRAY_LL="$OUT_DIR/namespaced_struct_array_minimal.ll"
+NS_STRUCT_ARRAY_O="$OUT_DIR/namespaced_struct_array_minimal.o"
 MULTI_ENUM_LL="$OUT_DIR/multi_file_enum_minimal.ll"
 MULTI_ENUM_O="$OUT_DIR/multi_file_enum_minimal.o"
 NS_ENUM_LL="$OUT_DIR/namespaced_enum_import_minimal.ll"
@@ -77,6 +81,10 @@ NS_SLICE_INDEX_LL="$OUT_DIR/namespaced_slice_index_minimal.ll"
 NS_SLICE_INDEX_O="$OUT_DIR/namespaced_slice_index_minimal.o"
 POINTER_LL="$OUT_DIR/pointer_minimal.ll"
 POINTER_O="$OUT_DIR/pointer_minimal.o"
+MULTI_POINTER_LL="$OUT_DIR/multi_file_pointer_minimal.ll"
+MULTI_POINTER_O="$OUT_DIR/multi_file_pointer_minimal.o"
+NS_POINTER_LL="$OUT_DIR/namespaced_pointer_minimal.ll"
+NS_POINTER_O="$OUT_DIR/namespaced_pointer_minimal.o"
 ARRAY_TO_SLICE_ARG_LL="$OUT_DIR/array_to_slice_arg_minimal.ll"
 ARRAY_TO_SLICE_ARG_O="$OUT_DIR/array_to_slice_arg_minimal.o"
 ARRAY_TO_SLICE_LOCAL_LL="$OUT_DIR/array_to_slice_local_minimal.ll"
@@ -343,6 +351,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_struct_array_minimal.jiang" > "$MULTI_STRUCT_ARRAY_LL"
+rg -q '^%Buffer = type \{ \[3 x i8\] \}' "$MULTI_STRUCT_ARRAY_LL"
+rg -q '^define i8 @middle\(%Buffer %0\)' "$MULTI_STRUCT_ARRAY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_STRUCT_ARRAY_LL" -o "$MULTI_STRUCT_ARRAY_O"
+set +e
+"$LLVM_LLI" "$MULTI_STRUCT_ARRAY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 llvm smoke expected multi_file_struct_array_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_struct_import_minimal.jiang" > "$NS_STRUCT_LL"
 rg -q '^%Pair = type \{ i64, i64 \}' "$NS_STRUCT_LL"
 rg -q 'extractvalue %Pair' "$NS_STRUCT_LL"
@@ -366,6 +387,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected namespaced_struct_return_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_struct_array_minimal.jiang" > "$NS_STRUCT_ARRAY_LL"
+rg -q '^%Buffer = type \{ \[3 x i8\] \}' "$NS_STRUCT_ARRAY_LL"
+rg -q '^define i8 @middle\(%Buffer %0\)' "$NS_STRUCT_ARRAY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_STRUCT_ARRAY_LL" -o "$NS_STRUCT_ARRAY_O"
+set +e
+"$LLVM_LLI" "$NS_STRUCT_ARRAY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 llvm smoke expected namespaced_struct_array_minimal exit code 98, got $STATUS" >&2
     exit 1
 fi
 
@@ -456,6 +490,32 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected pointer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_pointer_minimal.jiang" > "$MULTI_POINTER_LL"
+rg -q '^define i64 @read\(ptr %0\)' "$MULTI_POINTER_LL"
+rg -q '^define void @bump\(ptr %0\)' "$MULTI_POINTER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_POINTER_LL" -o "$MULTI_POINTER_O"
+set +e
+"$LLVM_LLI" "$MULTI_POINTER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected multi_file_pointer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_pointer_minimal.jiang" > "$NS_POINTER_LL"
+rg -q '^define i64 @read\(ptr %0\)' "$NS_POINTER_LL"
+rg -q '^define void @bump\(ptr %0\)' "$NS_POINTER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_POINTER_LL" -o "$NS_POINTER_O"
+set +e
+"$LLVM_LLI" "$NS_POINTER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected namespaced_pointer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
