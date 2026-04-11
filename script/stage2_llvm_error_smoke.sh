@@ -22,6 +22,7 @@ OUT_TYPE_FUNC_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_type_function_name_co
 OUT_ENUM_TYPE_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_enum_type_name_conflict.log"
 OUT_ALIAS_FUNC_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_import_alias_function_conflict.log"
 OUT_ALIAS_TYPE_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_import_alias_type_conflict.log"
+OUT_IMPORT_CYCLE_LOG="$BUILD_DIR/stage2_llvm_invalid_import_cycle.log"
 OUT_INDEX_TARGET_LOG="$BUILD_DIR/stage2_llvm_invalid_index_target.log"
 OUT_INDEX_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_index_type.log"
 OUT_ARRAY_ARG_LENGTH_LOG="$BUILD_DIR/stage2_llvm_invalid_array_arg_length.log"
@@ -387,6 +388,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_ALIAS_TYPE_CONFLICT_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_alias_type_conflict" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_import_cycle_a.jiang" > "$OUT_IMPORT_CYCLE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_import_cycle_a to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_IMPORT_CYCLE_LOG")" != *"import cycle"* ]]; then
+    echo "stage2 llvm error smoke missing import cycle diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_IMPORT_CYCLE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_cycle_a" >&2
     exit 1
 fi
 
