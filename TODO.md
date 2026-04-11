@@ -4,7 +4,7 @@
 
 - Stage0 已完成，并继续承担当前稳定宿主编译器职责。
 - Stage1 已完成，`bootstrap/` 是当前正式自举基线，`stage1c` 已固定。
-- Stage2 已启动，并且已经具备：
+- Stage2 已完成首个正式主线目标，并且已经具备：
   - `stage1c -> stage2c` 构建链
   - `frontend -> HIR -> JIR -> C`
   - `frontend -> HIR -> JIR -> LLVM`
@@ -17,8 +17,9 @@
 
 ## 当前重点
 
-- [ ] 继续收紧 LLVM 与 C 后端的剩余差异（重点转到边角 lowering 和错误路径一致性）
-- [ ] 在 Stage2 继续演进后，择机冻结 Stage1 的残余维护面
+- [x] 继续收紧 LLVM 与 C 后端的剩余差异（当前已收敛到维护级问题，由回归持续约束）
+- [x] 冻结 Stage1 的残余维护面，只保留 bootstrap 基线职责
+- [ ] Stage3：开始规划包管理与后续 1.0 能力
 
 ## Stage2 主计划
 
@@ -115,7 +116,7 @@
 - [x] 保持 `stage1 -> stage2` 构建链持续绿色
 - [x] 明确 Stage2 替代 Stage1 的验收标准
 - [x] 把 Stage2 收成唯一继续演进的主线
-- [ ] 继续冻结 Stage1，只保留 bootstrap 基线职责
+- [x] 继续冻结 Stage1，只保留 bootstrap 基线职责
 
 涉及文件：
 - `compiler/entries/compiler.jiang`
@@ -140,3 +141,4 @@
 - [x] 根 `README.md` 继续只保留高层说明
 - [x] `doc/develop.md` 继续承担阶段边界与实现状态说明
 - [x] `compiler/README.md` 继续承担 Stage2 主线结构与范围说明
+- [x] `bootstrap/README.md` 明确为 Stage1 冻结基线说明

@@ -68,10 +68,11 @@
   - `Span`
   - `SourceFile`
 
-当前下一阶段的重点不是再起新骨架，而是收尾：
+当前第一阶段目标已经完成。后续工作不再是“让 Stage2 可用”，而是：
 
-- 继续收紧 LLVM 与 C 后端的剩余差异
-- 维持 Stage2 作为唯一继续演进主线时的 build graph、回归和文档边界
+- 在现有回归约束下继续演进语言与后端能力
+- 把剩余 LLVM/C 边角差异作为维护项持续压缩
+- 维持 `stage1 -> stage2` 构建链和 Stage2 单点验收入口长期绿色
 
 ## Stage2 接管标准
 
@@ -91,3 +92,4 @@ Stage2 替代 Stage1 的验收标准固定为：
 
 - `compiler/` 已按上述标准进入唯一继续演进主线
 - `bootstrap/` 保持 Stage1 冻结基线职责
+- `stage2_complete_smoke.sh` 是当前 Stage2 的正式单点验收入口

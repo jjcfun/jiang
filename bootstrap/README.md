@@ -1,14 +1,19 @@
 # Bootstrap
 
-这里放 Jiang 版编译器的自举起步代码。
+这里放 Jiang 版编译器的 Stage1 自举基线代码。
 
 当前约定已经重新固定：
 
-- `bootstrap/` 对应仓库里的 Stage1 编译器主线
-- `compiler/` 只保留为未来 Stage2 预留目录
+- `bootstrap/` 对应仓库里的 Stage1 冻结基线
+- `compiler/` 是当前唯一继续演进的 Stage2 编译器主线
 - `bootstrap/entries/` 放 Stage1 的 smoke driver、wrapper 和工具入口；`bootstrap/` 根目录保留可复用编译器模块
 
-当前阶段目标已经达成：Stage1 已经收成一个真实入口可工作的 `bootstrap-first` 编译器。当前 `bootstrap/` 主线已经稳定提供 Jiang 实现的 `AST -> HIR -> JIR -> C` 前中后端骨架，并继续依赖系统 C 编译器完成最后一跳。
+当前阶段目标已经达成：Stage1 已经收成一个真实入口可工作的 `bootstrap-first` 编译器。当前 `bootstrap/` 只承担两类职责：
+
+- 作为 `stage1c` 的冻结 bootstrap 基线
+- 作为 Stage1 回归与 selfhost 验收的固定对象
+
+新的语言能力、主线重构和后端演进统一进入 `compiler/`，不再继续落到 `bootstrap/`。
 
 当前内容：
 
@@ -132,6 +137,12 @@ bash ./script/build_stage1.sh
 - `buffer_int.jiang`、`buffer_bytes.jiang`、`intern_pool.jiang` 已成为当前唯一底层抽象
 - `token_store.jiang`、`parser_store.jiang`、`hir_store.jiang`、`symbol_store.jiang`、`type_store.jiang`、`jir_store.jiang` 当前都已接到 growable buffer，并通过正式 smoke 回归
 - 当前重点已转为保持真实模块图覆盖稳定，不再回退到固定容量实现
+
+当前冻结边界：
+
+- 继续保留 `stage1c` 的构建、link、run、selfhost 与 manifest 回归
+- 只接受为了保持 Stage1 基线可构建、可回归所需的修复
+- 不再在 `bootstrap/` 中继续扩张新的语言特性、默认后端或主线架构
 
 当前 Stage1 的正式完成验收脚本：
 

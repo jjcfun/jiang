@@ -76,7 +76,7 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 收口正式 `stage1c` CLI 与 Stage1 manifest/build workflow
 *   [x] 用统一 Stage1 完成验收脚本固定 build/link/run/selfhost 回归
 
-### 当前进行中：Stage2 主线实现
+### 已完成：Stage2 主线实现
 
 *   [x] 建立 `compiler/` Stage2 分层骨架
 *   [x] 跑通 `compiler/` 内 `frontend -> HIR -> JIR -> C`
@@ -96,12 +96,12 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 继续加强聚合类型在多模块、赋值、参数、返回值场景下的一致性
 *   [x] 把 Stage2 收成唯一继续演进的主线
 
-### 当前优先主线：Stage2 实现推进 + 默认 LLVM 后端持续评估
+### 当前优先主线：Stage2 持续演进 + 默认 LLVM 后端持续评估
 
 当前 `--backend llvm` 的 Stage0/Stage1 回归仍然保留；同时 Stage2 自己已经具备独立 LLVM 后端和独立 smoke。
-Stage1 当前主线已经完成；当前更值得做的是：
+Stage1 当前主线已经完成并冻结；当前更值得做的是：
 
-*   让 Stage2 的剩余语义缺口继续收紧，尤其是 `unknown` 容忍路径
+*   继续在现有回归约束下演进 Stage2 语言与后端能力
 *   让聚合类型在多模块和两套后端中的行为继续收敛
 *   评估 LLVM 是否已经达到未来 Stage2 默认后端候选的成熟度
 
@@ -125,6 +125,7 @@ Stage1 当前主线已经完成；当前更值得做的是：
 
 *   `compiler/` 已成为唯一继续演进的主线
 *   `bootstrap/` 已冻结为 Stage1 基线，只保留 bootstrap 与回归职责
+*   `stage2_complete_smoke.sh` 已成为 Stage2 单点验收入口
 
 ### 已完成阶段：LLVM Spike / LLVM C API 路径
 
