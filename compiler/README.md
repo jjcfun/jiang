@@ -1,6 +1,6 @@
 # Jiang Compiler Stage2
 
-`compiler/` 现在是 Stage2 的正式主线目录。
+`compiler/` 现在是 Stage2 的正式主线目录，也是当前仓库里唯一继续演进的编译器主线。
 
 当前仓库中的目录分工固定为：
 
@@ -23,7 +23,7 @@
 当前约束：
 
 - Stage2 不与 `bootstrap/` 混写
-- Stage1 仍然是稳定基线
+- Stage1 仍然是冻结的 bootstrap 基线
 - `compiler/` 中的新实现优先按层落位，不再堆平铺文件
 
 当前目录结构：
@@ -70,10 +70,8 @@
 
 当前下一阶段的重点不是再起新骨架，而是收尾：
 
-- 收紧 `unknown` 容忍路径
-- 继续加强 `struct` / `enum` 在多模块、赋值、参数、返回值场景下的一致性
 - 继续收紧 LLVM 与 C 后端的剩余差异
-- 把 Stage2 收成唯一继续演进的主线
+- 维持 Stage2 作为唯一继续演进主线时的 build graph、回归和文档边界
 
 ## Stage2 接管标准
 
@@ -89,7 +87,7 @@ Stage2 替代 Stage1 的验收标准固定为：
   - `UInt8` / `UInt8[]` / array / pointer
   - 命令式函数、控制流、赋值、调用
 
-达到以上条件后：
+当前状态：
 
-- `compiler/` 视为唯一继续演进的编译器主线
+- `compiler/` 已按上述标准进入唯一继续演进主线
 - `bootstrap/` 保持 Stage1 冻结基线职责

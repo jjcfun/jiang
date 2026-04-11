@@ -18,7 +18,7 @@
 ## 当前重点
 
 - [ ] 继续收紧 LLVM 与 C 后端的剩余差异（重点转到边角 lowering 和错误路径一致性）
-- [ ] 把 Stage2 收成唯一继续演进的主线
+- [ ] 在 Stage2 继续演进后，择机冻结 Stage1 的残余维护面
 
 ## Stage2 主计划
 
@@ -114,7 +114,8 @@
 - [x] 固定 Stage2 正式验收入口
 - [x] 保持 `stage1 -> stage2` 构建链持续绿色
 - [x] 明确 Stage2 替代 Stage1 的验收标准
-- [ ] 在 Stage2 足够稳定后冻结 Stage1，只保留 bootstrap 基线职责
+- [x] 把 Stage2 收成唯一继续演进的主线
+- [ ] 继续冻结 Stage1，只保留 bootstrap 基线职责
 
 涉及文件：
 - `compiler/entries/compiler.jiang`

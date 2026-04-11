@@ -92,9 +92,9 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 完成数组与聚合类型第一版
 *   [x] 完成 builtin / named / 复合类型第一版（`Int` / `Bool` / `Void` / `UInt8`、`struct` / `enum`、array / slice / pointer）
 *   [x] 让 LLVM 后端在代表性 Stage2 样例上与 C 后端建立对齐回归
-*   [ ] 继续收紧 `unknown` 容忍路径
-*   [ ] 继续加强聚合类型在多模块、赋值、参数、返回值场景下的一致性
-*   [ ] 把 Stage2 收成唯一继续演进的主线
+*   [x] 继续收紧 `unknown` 容忍路径
+*   [x] 继续加强聚合类型在多模块、赋值、参数、返回值场景下的一致性
+*   [x] 把 Stage2 收成唯一继续演进的主线
 
 ### 当前优先主线：Stage2 实现推进 + 默认 LLVM 后端持续评估
 
@@ -121,10 +121,10 @@ Stage1 当前主线已经完成；当前更值得做的是：
     *   `UInt8` / `UInt8[]` / array / pointer
     *   命令式函数、控制流、赋值、调用
 
-达到这些条件后：
+当前状态：
 
-*   `compiler/` 成为唯一继续演进的主线
-*   `bootstrap/` 冻结为 Stage1 基线，只保留 bootstrap 与回归职责
+*   `compiler/` 已成为唯一继续演进的主线
+*   `bootstrap/` 已冻结为 Stage1 基线，只保留 bootstrap 与回归职责
 
 ### 已完成阶段：LLVM Spike / LLVM C API 路径
 

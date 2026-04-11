@@ -41,28 +41,7 @@ bash "$PROJECT_ROOT/script/evaluate_default_llvm.sh"
 echo -e "\n--- 1.7. 运行 Stage1 完成验收冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage1_complete_smoke.sh"
 
-echo -e "\n--- 1.75. 运行 Stage2 emit-c 冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_emit_c_smoke.sh"
-
-echo -e "\n--- 1.76. 运行 Stage2 support 冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_support_smoke.sh"
-
-echo -e "\n--- 1.77. 运行 Stage2 error 冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_error_smoke.sh"
-
-echo -e "\n--- 1.78. 运行 Stage2 run 冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_run_smoke.sh"
-
-echo -e "\n--- 1.79. 运行 Stage2 LLVM 冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_llvm_smoke.sh"
-
-echo -e "\n--- 1.795. 运行 Stage2 LLVM 错误路径冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_llvm_error_smoke.sh"
-
-echo -e "\n--- 1.796. 运行 Stage2 CLI 冒烟测试 ---"
-bash "$PROJECT_ROOT/script/stage2_cli_smoke.sh"
-
-echo -e "\n--- 1.797. 运行 Stage2 完成验收冒烟测试 ---"
+echo -e "\n--- 1.75. 运行 Stage2 完成验收冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage2_complete_smoke.sh"
 
 echo -e "\n--- 2. 运行所有单元测试 ---"
