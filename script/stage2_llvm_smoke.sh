@@ -57,12 +57,20 @@ NAMESPACED_LL="$OUT_DIR/namespaced_import_minimal.ll"
 NAMESPACED_O="$OUT_DIR/namespaced_import_minimal.o"
 MULTI_STRUCT_LL="$OUT_DIR/multi_file_struct_minimal.ll"
 MULTI_STRUCT_O="$OUT_DIR/multi_file_struct_minimal.o"
+MULTI_STRUCT_RETURN_LL="$OUT_DIR/multi_file_struct_return_minimal.ll"
+MULTI_STRUCT_RETURN_O="$OUT_DIR/multi_file_struct_return_minimal.o"
 NS_STRUCT_LL="$OUT_DIR/namespaced_struct_import_minimal.ll"
 NS_STRUCT_O="$OUT_DIR/namespaced_struct_import_minimal.o"
+NS_STRUCT_RETURN_LL="$OUT_DIR/namespaced_struct_return_minimal.ll"
+NS_STRUCT_RETURN_O="$OUT_DIR/namespaced_struct_return_minimal.o"
 MULTI_ENUM_LL="$OUT_DIR/multi_file_enum_minimal.ll"
 MULTI_ENUM_O="$OUT_DIR/multi_file_enum_minimal.o"
 NS_ENUM_LL="$OUT_DIR/namespaced_enum_import_minimal.ll"
 NS_ENUM_O="$OUT_DIR/namespaced_enum_import_minimal.o"
+MULTI_SLICE_RETURN_LL="$OUT_DIR/multi_file_slice_return_minimal.ll"
+MULTI_SLICE_RETURN_O="$OUT_DIR/multi_file_slice_return_minimal.o"
+NS_SLICE_RETURN_LL="$OUT_DIR/namespaced_slice_return_minimal.ll"
+NS_SLICE_RETURN_O="$OUT_DIR/namespaced_slice_return_minimal.o"
 POINTER_LL="$OUT_DIR/pointer_minimal.ll"
 POINTER_O="$OUT_DIR/pointer_minimal.o"
 ARRAY_TO_SLICE_ARG_LL="$OUT_DIR/array_to_slice_arg_minimal.ll"
@@ -318,6 +326,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_struct_return_minimal.jiang" > "$MULTI_STRUCT_RETURN_LL"
+rg -q '^define %Pair @make_pair\(\)' "$MULTI_STRUCT_RETURN_LL"
+rg -q 'extractvalue %Pair' "$MULTI_STRUCT_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_STRUCT_RETURN_LL" -o "$MULTI_STRUCT_RETURN_O"
+set +e
+"$LLVM_LLI" "$MULTI_STRUCT_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected multi_file_struct_return_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_struct_import_minimal.jiang" > "$NS_STRUCT_LL"
 rg -q '^%Pair = type \{ i64, i64 \}' "$NS_STRUCT_LL"
 rg -q 'extractvalue %Pair' "$NS_STRUCT_LL"
@@ -328,6 +349,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected namespaced_struct_import_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_struct_return_minimal.jiang" > "$NS_STRUCT_RETURN_LL"
+rg -q '^define %Pair @make_pair\(\)' "$NS_STRUCT_RETURN_LL"
+rg -q 'extractvalue %Pair' "$NS_STRUCT_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_STRUCT_RETURN_LL" -o "$NS_STRUCT_RETURN_O"
+set +e
+"$LLVM_LLI" "$NS_STRUCT_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected namespaced_struct_return_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -355,6 +389,32 @@ if [[ $STATUS -ne 1 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_slice_return_minimal.jiang" > "$MULTI_SLICE_RETURN_LL"
+rg -q '^define %Slice_uint8_t @expose\(\)' "$MULTI_SLICE_RETURN_LL"
+rg -q 'extractvalue %Slice_uint8_t .*?, 1' "$MULTI_SLICE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_SLICE_RETURN_LL" -o "$MULTI_SLICE_RETURN_O"
+set +e
+"$LLVM_LLI" "$MULTI_SLICE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 llvm smoke expected multi_file_slice_return_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_slice_return_minimal.jiang" > "$NS_SLICE_RETURN_LL"
+rg -q '^define %Slice_uint8_t @expose\(\)' "$NS_SLICE_RETURN_LL"
+rg -q 'extractvalue %Slice_uint8_t .*?, 1' "$NS_SLICE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_SLICE_RETURN_LL" -o "$NS_SLICE_RETURN_O"
+set +e
+"$LLVM_LLI" "$NS_SLICE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 llvm smoke expected namespaced_slice_return_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/pointer_minimal.jiang" > "$POINTER_LL"
 rg -q '^define i64 @read\(ptr %0\)' "$POINTER_LL"
 rg -q 'store ptr %' "$POINTER_LL"
@@ -370,39 +430,42 @@ if [[ $STATUS -ne 42 ]]; then
 fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_arg_minimal.jiang" > "$ARRAY_TO_SLICE_ARG_LL"
-rg -q '^define i8 @pick\(%Slice_uint8_t %0\)' "$ARRAY_TO_SLICE_ARG_LL"
+rg -q '^define i1 @is_b\(%Slice_uint8_t %0\)' "$ARRAY_TO_SLICE_ARG_LL"
+rg -q 'store i8 %indextmp, ptr %probe' "$ARRAY_TO_SLICE_ARG_LL"
 rg -q 'insertvalue %Slice_uint8_t' "$ARRAY_TO_SLICE_ARG_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_ARG_LL" -o "$ARRAY_TO_SLICE_ARG_O"
 set +e
 "$LLVM_LLI" "$ARRAY_TO_SLICE_ARG_LL"
 STATUS=$?
 set -e
-if [[ $STATUS -ne 98 ]]; then
-    echo "stage2 llvm smoke expected array_to_slice_arg_minimal exit code 98, got $STATUS" >&2
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected array_to_slice_arg_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_local_minimal.jiang" > "$ARRAY_TO_SLICE_LOCAL_LL"
 rg -q 'insertvalue %Slice_uint8_t' "$ARRAY_TO_SLICE_LOCAL_LL"
+rg -q 'store i8 %indextmp, ptr %probe' "$ARRAY_TO_SLICE_LOCAL_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_LOCAL_LL" -o "$ARRAY_TO_SLICE_LOCAL_O"
 set +e
 "$LLVM_LLI" "$ARRAY_TO_SLICE_LOCAL_LL"
 STATUS=$?
 set -e
-if [[ $STATUS -ne 99 ]]; then
-    echo "stage2 llvm smoke expected array_to_slice_local_minimal exit code 99, got $STATUS" >&2
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected array_to_slice_local_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_assign_minimal.jiang" > "$ARRAY_TO_SLICE_ASSIGN_LL"
 rg -q 'store %Slice_uint8_t' "$ARRAY_TO_SLICE_ASSIGN_LL"
+rg -q 'store i8 %indextmp, ptr %probe' "$ARRAY_TO_SLICE_ASSIGN_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_ASSIGN_LL" -o "$ARRAY_TO_SLICE_ASSIGN_O"
 set +e
 "$LLVM_LLI" "$ARRAY_TO_SLICE_ASSIGN_LL"
 STATUS=$?
 set -e
-if [[ $STATUS -ne 97 ]]; then
-    echo "stage2 llvm smoke expected array_to_slice_assign_minimal exit code 97, got $STATUS" >&2
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected array_to_slice_assign_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

@@ -81,6 +81,46 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/multi_file_struct_return_minimal.jiang" "multi_file_struct_return_minimal"
+set +e
+"$OUT_DIR/multi_file_struct_return_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected multi_file_struct_return_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_struct_return_minimal.jiang" "namespaced_struct_return_minimal"
+set +e
+"$OUT_DIR/namespaced_struct_return_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected namespaced_struct_return_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/multi_file_slice_return_minimal.jiang" "multi_file_slice_return_minimal"
+set +e
+"$OUT_DIR/multi_file_slice_return_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 run smoke expected multi_file_slice_return_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_slice_return_minimal.jiang" "namespaced_slice_return_minimal"
+set +e
+"$OUT_DIR/namespaced_slice_return_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 run smoke expected namespaced_slice_return_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/array_minimal.jiang" "array_minimal"
 set +e
 "$OUT_DIR/array_minimal"
@@ -196,8 +236,8 @@ set +e
 "$OUT_DIR/array_to_slice_arg_minimal"
 STATUS=$?
 set -e
-if [[ $STATUS -ne 98 ]]; then
-    echo "stage2 run smoke expected array_to_slice_arg_minimal exit code 98, got $STATUS" >&2
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected array_to_slice_arg_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -206,8 +246,8 @@ set +e
 "$OUT_DIR/array_to_slice_local_minimal"
 STATUS=$?
 set -e
-if [[ $STATUS -ne 99 ]]; then
-    echo "stage2 run smoke expected array_to_slice_local_minimal exit code 99, got $STATUS" >&2
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected array_to_slice_local_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -216,8 +256,8 @@ set +e
 "$OUT_DIR/array_to_slice_assign_minimal"
 STATUS=$?
 set -e
-if [[ $STATUS -ne 97 ]]; then
-    echo "stage2 run smoke expected array_to_slice_assign_minimal exit code 97, got $STATUS" >&2
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected array_to_slice_assign_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

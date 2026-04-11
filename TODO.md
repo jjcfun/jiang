@@ -71,7 +71,7 @@
 - [x] 完成复合类型：array / slice / pointer
 - [x] 完成赋值类型检查
 - [x] 完成 `return` 类型检查
-- [ ] 完成 call args / 返回值传播
+- [x] 完成 call args / 返回值传播
 - [ ] 完成 field access / struct init / enum member / array index 的完整类型传播
 - [ ] 收紧 `unknown`，减少当前“容忍后继续走”的路径
 

@@ -14,6 +14,8 @@ OUT_ALIAS_MEMBER_LOG="$BUILD_DIR/stage2_llvm_invalid_alias_member.log"
 OUT_DEREF_NON_POINTER_LOG="$BUILD_DIR/stage2_llvm_invalid_deref_non_pointer.log"
 OUT_ADDRESS_OF_EXPR_LOG="$BUILD_DIR/stage2_llvm_invalid_address_of_expr.log"
 OUT_ARRAY_TO_SLICE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_array_to_slice_type.log"
+OUT_UNKNOWN_IDENT_LOG="$BUILD_DIR/stage2_llvm_invalid_unknown_ident.log"
+OUT_CALL_NON_FUNCTION_LOG="$BUILD_DIR/stage2_llvm_invalid_call_non_function.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -87,7 +89,7 @@ if [[ $STATUS -eq 0 ]]; then
     exit 1
 fi
 
-if [[ "$(<"$OUT_PRIVATE_FUNC_LOG")" != *"call target must be a function"* ]]; then
+if [[ "$(<"$OUT_PRIVATE_FUNC_LOG")" != *"unknown symbol"* ]]; then
     echo "stage2 llvm error smoke missing private function diagnostic" >&2
     exit 1
 fi
@@ -214,6 +216,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_ARRAY_TO_SLICE_TYPE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_array_to_slice_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_unknown_ident.jiang" > "$OUT_UNKNOWN_IDENT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_unknown_ident to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNKNOWN_IDENT_LOG")" != *"unknown symbol"* ]]; then
+    echo "stage2 llvm error smoke missing unknown symbol diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_UNKNOWN_IDENT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_unknown_ident" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_call_non_function.jiang" > "$OUT_CALL_NON_FUNCTION_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_call_non_function to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_CALL_NON_FUNCTION_LOG")" != *"call target must be a function"* ]]; then
+    echo "stage2 llvm error smoke missing non-function call diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_CALL_NON_FUNCTION_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_call_non_function" >&2
     exit 1
 fi
 
