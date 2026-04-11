@@ -55,6 +55,14 @@ MULTI_FILE_LL="$OUT_DIR/multi_file_minimal.ll"
 MULTI_FILE_O="$OUT_DIR/multi_file_minimal.o"
 NAMESPACED_LL="$OUT_DIR/namespaced_import_minimal.ll"
 NAMESPACED_O="$OUT_DIR/namespaced_import_minimal.o"
+ALIAS_IMPORT_FUNCTION_LL="$OUT_DIR/alias_import_function_minimal.ll"
+ALIAS_IMPORT_FUNCTION_O="$OUT_DIR/alias_import_function_minimal.o"
+PUBLIC_ALIAS_FUNCTION_LL="$OUT_DIR/public_alias_function_minimal.ll"
+PUBLIC_ALIAS_FUNCTION_O="$OUT_DIR/public_alias_function_minimal.o"
+ALIAS_IMPORT_TYPE_LL="$OUT_DIR/alias_import_type_minimal.ll"
+ALIAS_IMPORT_TYPE_O="$OUT_DIR/alias_import_type_minimal.o"
+PUBLIC_ALIAS_TYPE_LL="$OUT_DIR/public_alias_type_minimal.ll"
+PUBLIC_ALIAS_TYPE_O="$OUT_DIR/public_alias_type_minimal.o"
 MULTI_STRUCT_LL="$OUT_DIR/multi_file_struct_minimal.ll"
 MULTI_STRUCT_O="$OUT_DIR/multi_file_struct_minimal.o"
 MULTI_STRUCT_RETURN_LL="$OUT_DIR/multi_file_struct_return_minimal.ll"
@@ -322,6 +330,58 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected namespaced_import_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/alias_import_function_minimal.jiang" > "$ALIAS_IMPORT_FUNCTION_LL"
+rg -q '^define i64 @public_add\(i64 %0, i64 %1\)' "$ALIAS_IMPORT_FUNCTION_LL"
+rg -q 'call i64 @public_add' "$ALIAS_IMPORT_FUNCTION_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ALIAS_IMPORT_FUNCTION_LL" -o "$ALIAS_IMPORT_FUNCTION_O"
+set +e
+"$LLVM_LLI" "$ALIAS_IMPORT_FUNCTION_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected alias_import_function_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/public_alias_function_minimal.jiang" > "$PUBLIC_ALIAS_FUNCTION_LL"
+rg -q '^define i64 @public_add\(i64 %0, i64 %1\)' "$PUBLIC_ALIAS_FUNCTION_LL"
+rg -q 'call i64 @public_add' "$PUBLIC_ALIAS_FUNCTION_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$PUBLIC_ALIAS_FUNCTION_LL" -o "$PUBLIC_ALIAS_FUNCTION_O"
+set +e
+"$LLVM_LLI" "$PUBLIC_ALIAS_FUNCTION_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected public_alias_function_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/alias_import_type_minimal.jiang" > "$ALIAS_IMPORT_TYPE_LL"
+rg -q '^%PublicPair = type \{ i64, i64 \}' "$ALIAS_IMPORT_TYPE_LL"
+rg -q 'store %PublicPair \{ i64 20, i64 22 \}' "$ALIAS_IMPORT_TYPE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ALIAS_IMPORT_TYPE_LL" -o "$ALIAS_IMPORT_TYPE_O"
+set +e
+"$LLVM_LLI" "$ALIAS_IMPORT_TYPE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected alias_import_type_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/public_alias_type_minimal.jiang" > "$PUBLIC_ALIAS_TYPE_LL"
+rg -q '^%PublicPair = type \{ i64, i64 \}' "$PUBLIC_ALIAS_TYPE_LL"
+rg -q 'store %PublicPair \{ i64 20, i64 22 \}' "$PUBLIC_ALIAS_TYPE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$PUBLIC_ALIAS_TYPE_LL" -o "$PUBLIC_ALIAS_TYPE_O"
+set +e
+"$LLVM_LLI" "$PUBLIC_ALIAS_TYPE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected public_alias_type_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

@@ -9,6 +9,8 @@ OUT_CALL_LOG="$BUILD_DIR/stage2_llvm_invalid_call.log"
 OUT_SLICE_ASSIGN_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_slice_assign_type.log"
 OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_private_type.log"
 OUT_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_llvm_invalid_private_function.log"
+OUT_PUBLIC_ALIAS_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_llvm_invalid_public_alias_private_function.log"
+OUT_PUBLIC_ALIAS_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_public_alias_private_type.log"
 OUT_TRANSITIVE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_transitive_type.log"
 OUT_ALIAS_MEMBER_LOG="$BUILD_DIR/stage2_llvm_invalid_alias_member.log"
 OUT_DEREF_NON_POINTER_LOG="$BUILD_DIR/stage2_llvm_invalid_deref_non_pointer.log"
@@ -128,6 +130,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_PRIVATE_TYPE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_private_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_public_alias_private_function.jiang" > "$OUT_PUBLIC_ALIAS_PRIVATE_FUNC_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_public_alias_private_function to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_PUBLIC_ALIAS_PRIVATE_FUNC_LOG")" != *"public alias target must be public"* ]]; then
+    echo "stage2 llvm error smoke missing public alias private function diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_PUBLIC_ALIAS_PRIVATE_FUNC_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_public_alias_private_function" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_public_alias_private_type.jiang" > "$OUT_PUBLIC_ALIAS_PRIVATE_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_public_alias_private_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_PUBLIC_ALIAS_PRIVATE_TYPE_LOG")" != *"public alias target must be public"* ]]; then
+    echo "stage2 llvm error smoke missing public alias private type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_PUBLIC_ALIAS_PRIVATE_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_public_alias_private_type" >&2
     exit 1
 fi
 

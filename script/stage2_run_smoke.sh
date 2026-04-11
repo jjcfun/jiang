@@ -231,6 +231,46 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/alias_import_function_minimal.jiang" "alias_import_function_minimal"
+set +e
+"$OUT_DIR/alias_import_function_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected alias_import_function_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/public_alias_function_minimal.jiang" "public_alias_function_minimal"
+set +e
+"$OUT_DIR/public_alias_function_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected public_alias_function_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/alias_import_type_minimal.jiang" "alias_import_type_minimal"
+set +e
+"$OUT_DIR/alias_import_type_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected alias_import_type_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/public_alias_type_minimal.jiang" "public_alias_type_minimal"
+set +e
+"$OUT_DIR/public_alias_type_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected public_alias_type_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/namespaced_import_minimal.jiang" "namespaced_import_minimal"
 set +e
 "$OUT_DIR/namespaced_import_minimal"
