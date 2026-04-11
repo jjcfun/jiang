@@ -104,8 +104,44 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 *   继续在现有回归约束下演进 Stage2 语言与后端能力
 *   让聚合类型在多模块和两套后端中的行为继续收敛
 *   评估 LLVM 是否已经达到未来 Stage2 默认后端候选的成熟度
+*   按 `doc/jiang.md` 的正式语法说明，逐项推进 Stage2 语法对齐
 
 当前最新执行清单见 `TODO.md`。
+
+### Stage2 与 `jiang.md` 的当前关系
+
+当前不再把 Stage2 的目标定义为“继续补零散能力”，而是：
+
+*   先把 `TODO.md` 中列出的 Stage2 对齐表稳定下来
+*   再按 `doc/jiang.md` 的正式语法说明推进剩余语法
+
+当前可以粗分为三层：
+
+*   已基本对齐：
+    *   基本命令式函数
+    *   `if / else`、`while`
+    *   `Int` / `Bool` / `Void` / `UInt8`
+    *   `struct` / `enum`
+    *   array / slice / pointer 第一版
+    *   多模块、`public`、alias import、导出表
+*   部分对齐：
+    *   字符串
+    *   数组可变性与更完整语义
+    *   指针自动解引用 / 所有权相关语义
+    *   `T[]` 的完整泛化
+    *   `struct init`、可变字段、`init`
+    *   枚举显式值、底层类型、`.value`
+    *   `alias` / `public alias`
+*   仍未开始：
+    *   类型转换
+    *   元组
+    *   `for`
+    *   `switch`
+    *   `union`
+    *   模式匹配 / binding
+    *   泛型
+    *   `async`
+    *   FFI 作为正式用户语法
 
 ### Stage2 接管 Stage1 的判定条件
 

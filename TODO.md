@@ -19,7 +19,42 @@
 
 - [x] 继续收紧 LLVM 与 C 后端的剩余差异（当前已收敛到维护级问题，由回归持续约束）
 - [x] 冻结 Stage1 的残余维护面，只保留 bootstrap 基线职责
+- [ ] 按 `doc/jiang.md` 收口 Stage2 语法对齐表，并按表推进剩余语法
 - [ ] Stage3：开始规划包管理与后续 1.0 能力
+
+## Stage2 与 `jiang.md` 对齐表
+
+### 已基本对齐
+
+- [x] 基本命令式函数：函数定义、参数、`return`、调用
+- [x] 基本控制流：`if / else`、`while`
+- [x] 基本类型：`Int`、`Bool`、`Void`、`UInt8`
+- [x] 基本聚合：`struct`、`enum`
+- [x] 数组、slice、pointer 第一版
+- [x] 多模块、`public`、alias import、导出表
+- [x] `emit-c` / `emit-llvm` 双后端
+
+### 部分对齐
+
+- [ ] 字符串：当前 `"abc"` 直接服务于 `UInt8[]`，尚未扩成 `jiang.md` 的完整文本语义
+- [ ] 数组：第一版已可用，但仍需继续对齐 `jiang.md` 中的可变性、推断和更完整用法
+- [ ] 指针：已支持 `T*`、`&x`、`*p`、`*p = rhs`，但尚未对齐自动解引用 / 所有权相关语义
+- [ ] 切片：当前主要覆盖 `UInt8[]`，尚未泛化到 `jiang.md` 的完整 `T[]` 语义
+- [ ] 结构体：已支持字段与构造式初始化，但未对齐 `init`、可变字段、值/引用统一语义
+- [ ] 枚举：已支持声明与成员引用，但未对齐显式值、底层类型、`.value`、`.ok` 这类简写
+- [ ] 模块：已支持 import / public / alias import，但未对齐 `alias` / `public alias`
+
+### 未开始或明确未对齐
+
+- [ ] 类型转换
+- [ ] 元组
+- [ ] `for` 循环与解构迭代
+- [ ] `switch`
+- [ ] `union`
+- [ ] 模式匹配 / binding
+- [ ] 泛型
+- [ ] `async`
+- [ ] FFI 用户语法（`extern { ... }` 作为正式 Stage2 语言能力）
 
 ## Stage2 主计划
 
