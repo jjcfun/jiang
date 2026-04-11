@@ -19,7 +19,7 @@
 
 - [ ] 收尾 Stage2 的数组 / 聚合类型规则（重点是数组到 slice 的转换与剩余聚合一致性）
 - [ ] 收紧 Stage2 的类型系统与 `unknown` 容忍路径
-- [ ] 继续收紧 LLVM 与 C 后端的剩余差异（下一步是 pointer 与更完整聚合语义）
+- [ ] 继续收紧 LLVM 与 C 后端的剩余差异（下一步是数组到 slice 的转换与更完整聚合语义）
 - [ ] 把 Stage2 收成唯一继续演进的主线
 
 ## Stage2 主计划
@@ -68,7 +68,7 @@
 
 - [x] 完成 builtin type：`Int` / `Bool` / `Void` / `UInt8`
 - [x] 完成命名类型：`struct` / `enum`
-- [ ] 完成复合类型：array / slice / pointer
+- [x] 完成复合类型：array / slice / pointer
 - [x] 完成赋值类型检查
 - [x] 完成 `return` 类型检查
 - [ ] 完成 call args / 返回值传播
@@ -99,7 +99,7 @@
 
 - [x] 补全 slice lowering
 - [x] 补全数组 lowering
-- [ ] 继续补 pointer lowering
+- [x] 继续补 pointer lowering
 - [x] 与 C 后端在代表性样例上建立行为对齐回归
 - [x] 完成 LLVM 错误路径与运行级验证
 

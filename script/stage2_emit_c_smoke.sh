@@ -70,6 +70,8 @@ NAMESPACED_STRUCT_IMPORT_C="$BUILD_DIR/stage2_namespaced_struct_import_minimal.c
 NAMESPACED_STRUCT_IMPORT_O="$BUILD_DIR/stage2_namespaced_struct_import_minimal.o"
 NAMESPACED_ENUM_IMPORT_C="$BUILD_DIR/stage2_namespaced_enum_import_minimal.c"
 NAMESPACED_ENUM_IMPORT_O="$BUILD_DIR/stage2_namespaced_enum_import_minimal.o"
+POINTER_C="$BUILD_DIR/stage2_pointer_minimal.c"
+POINTER_O="$BUILD_DIR/stage2_pointer_minimal.o"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -274,5 +276,11 @@ rg -q '^typedef enum Mode \{$' "$NAMESPACED_ENUM_IMPORT_C"
 rg -q '^    Mode mode = Mode_read;$' "$NAMESPACED_ENUM_IMPORT_C"
 rg -q '^    if \(mode == Mode_read\) \{$' "$NAMESPACED_ENUM_IMPORT_C"
 cc -x c -std=c99 -Wall -Wextra -Werror -c "$NAMESPACED_ENUM_IMPORT_C" -o "$NAMESPACED_ENUM_IMPORT_O"
+
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/pointer_minimal.jiang" > "$POINTER_C"
+rg -q '^long long read\(long long\* p\);$' "$POINTER_C"
+rg -q '^    long long\* p = \(&value\);$' "$POINTER_C"
+rg -q '^\s*\(\(\*p\) = \(\(\*p\) \+ 1\)\);$' "$POINTER_C"
+cc -x c -std=c99 -Wall -Wextra -Werror -c "$POINTER_C" -o "$POINTER_O"
 
 echo "stage2 emit-c smoke passed"

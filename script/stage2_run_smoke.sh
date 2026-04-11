@@ -181,4 +181,14 @@ if [[ $STATUS -ne 1 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/pointer_minimal.jiang" "pointer_minimal"
+set +e
+"$OUT_DIR/pointer_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected pointer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 echo "stage2 run smoke passed"

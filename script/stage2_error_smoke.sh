@@ -25,6 +25,8 @@ OUT_TRANSITIVE_TYPE_LOG="$BUILD_DIR/stage2_invalid_transitive_import_type.log"
 OUT_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_private_function.log"
 OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_invalid_import_private_type.log"
 OUT_ALIAS_MEMBER_LOG="$BUILD_DIR/stage2_invalid_import_alias_missing_member.log"
+OUT_DEREF_NON_POINTER_LOG="$BUILD_DIR/stage2_invalid_deref_non_pointer.log"
+OUT_ADDRESS_OF_EXPR_LOG="$BUILD_DIR/stage2_invalid_address_of_expr.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -340,6 +342,36 @@ fi
 
 if [[ "$(<"$OUT_ALIAS_MEMBER_LOG")" != *"unknown member"* ]]; then
     echo "stage2 error smoke missing import alias missing member diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_deref_non_pointer.jiang" > "$OUT_DEREF_NON_POINTER_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_deref_non_pointer to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DEREF_NON_POINTER_LOG")" != *"dereference requires pointer"* ]]; then
+    echo "stage2 error smoke missing dereference diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_address_of_expr.jiang" > "$OUT_ADDRESS_OF_EXPR_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_address_of_expr to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ADDRESS_OF_EXPR_LOG")" != *"address-of requires assignable target"* ]]; then
+    echo "stage2 error smoke missing address-of diagnostic" >&2
     exit 1
 fi
 

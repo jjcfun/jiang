@@ -63,6 +63,8 @@ MULTI_ENUM_LL="$OUT_DIR/multi_file_enum_minimal.ll"
 MULTI_ENUM_O="$OUT_DIR/multi_file_enum_minimal.o"
 NS_ENUM_LL="$OUT_DIR/namespaced_enum_import_minimal.ll"
 NS_ENUM_O="$OUT_DIR/namespaced_enum_import_minimal.o"
+POINTER_LL="$OUT_DIR/pointer_minimal.ll"
+POINTER_O="$OUT_DIR/pointer_minimal.o"
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/minimal.jiang" > "$MINIMAL_LL"
 rg -q '^define i64 @add\(i64 %0, i64 %1\)' "$MINIMAL_LL"
@@ -231,8 +233,8 @@ if [[ $STATUS -ne 42 ]]; then
 fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/fields_minimal.jiang" > "$FIELDS_LL"
-rg -q 'insertvalue %Pair' "$FIELDS_LL"
 rg -q 'extractvalue %Pair' "$FIELDS_LL"
+rg -q 'getelementptr %Pair, ptr' "$FIELDS_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$FIELDS_LL" -o "$FIELDS_O"
 set +e
 "$LLVM_LLI" "$FIELDS_LL"
@@ -342,6 +344,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 1 ]]; then
     echo "stage2 llvm smoke expected namespaced_enum_import_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/pointer_minimal.jiang" > "$POINTER_LL"
+rg -q '^define i64 @read\(ptr %0\)' "$POINTER_LL"
+rg -q 'store ptr %' "$POINTER_LL"
+rg -q 'load i64, ptr %' "$POINTER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$POINTER_LL" -o "$POINTER_O"
+set +e
+"$LLVM_LLI" "$POINTER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected pointer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
