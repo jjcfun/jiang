@@ -65,6 +65,14 @@ NS_ENUM_LL="$OUT_DIR/namespaced_enum_import_minimal.ll"
 NS_ENUM_O="$OUT_DIR/namespaced_enum_import_minimal.o"
 POINTER_LL="$OUT_DIR/pointer_minimal.ll"
 POINTER_O="$OUT_DIR/pointer_minimal.o"
+ARRAY_TO_SLICE_ARG_LL="$OUT_DIR/array_to_slice_arg_minimal.ll"
+ARRAY_TO_SLICE_ARG_O="$OUT_DIR/array_to_slice_arg_minimal.o"
+ARRAY_TO_SLICE_LOCAL_LL="$OUT_DIR/array_to_slice_local_minimal.ll"
+ARRAY_TO_SLICE_LOCAL_O="$OUT_DIR/array_to_slice_local_minimal.o"
+ARRAY_TO_SLICE_ASSIGN_LL="$OUT_DIR/array_to_slice_assign_minimal.ll"
+ARRAY_TO_SLICE_ASSIGN_O="$OUT_DIR/array_to_slice_assign_minimal.o"
+ARRAY_TO_SLICE_RETURN_LL="$OUT_DIR/array_to_slice_return_minimal.ll"
+ARRAY_TO_SLICE_RETURN_O="$OUT_DIR/array_to_slice_return_minimal.o"
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/minimal.jiang" > "$MINIMAL_LL"
 rg -q '^define i64 @add\(i64 %0, i64 %1\)' "$MINIMAL_LL"
@@ -360,5 +368,46 @@ if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected pointer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_arg_minimal.jiang" > "$ARRAY_TO_SLICE_ARG_LL"
+rg -q '^define i8 @pick\(%Slice_uint8_t %0\)' "$ARRAY_TO_SLICE_ARG_LL"
+rg -q 'insertvalue %Slice_uint8_t' "$ARRAY_TO_SLICE_ARG_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_ARG_LL" -o "$ARRAY_TO_SLICE_ARG_O"
+set +e
+"$LLVM_LLI" "$ARRAY_TO_SLICE_ARG_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 llvm smoke expected array_to_slice_arg_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_local_minimal.jiang" > "$ARRAY_TO_SLICE_LOCAL_LL"
+rg -q 'insertvalue %Slice_uint8_t' "$ARRAY_TO_SLICE_LOCAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_LOCAL_LL" -o "$ARRAY_TO_SLICE_LOCAL_O"
+set +e
+"$LLVM_LLI" "$ARRAY_TO_SLICE_LOCAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 99 ]]; then
+    echo "stage2 llvm smoke expected array_to_slice_local_minimal exit code 99, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_assign_minimal.jiang" > "$ARRAY_TO_SLICE_ASSIGN_LL"
+rg -q 'store %Slice_uint8_t' "$ARRAY_TO_SLICE_ASSIGN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_ASSIGN_LL" -o "$ARRAY_TO_SLICE_ASSIGN_O"
+set +e
+"$LLVM_LLI" "$ARRAY_TO_SLICE_ASSIGN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 97 ]]; then
+    echo "stage2 llvm smoke expected array_to_slice_assign_minimal exit code 97, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_return_minimal.jiang" > "$ARRAY_TO_SLICE_RETURN_LL"
+rg -q '^define %Slice_uint8_t @expose\(\)' "$ARRAY_TO_SLICE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_RETURN_LL" -o "$ARRAY_TO_SLICE_RETURN_O"
 
 echo "stage2 llvm smoke passed"

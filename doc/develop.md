@@ -86,6 +86,8 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 完成多模块、`public`、alias import、导出表第一版
 *   [x] 完成 `struct` / `enum` 基础语义与 C/LLVM lowering
 *   [x] 完成 `UInt8` 与 `UInt8[]` 的最小类型闭环
+*   [x] 收口 `stage2c` 最小正式 CLI（默认 `emit-c`，支持 `--emit-llvm` 与 `--help`）
+*   [x] 收口 `stage2_complete_smoke.sh` 作为 Stage2 单点验收入口
 *   [ ] 继续完成 slice / 字符串表达式主线
 *   [ ] 继续完成数组与聚合类型第一版
 *   [ ] 继续完成类型系统第一版

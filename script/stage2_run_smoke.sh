@@ -191,4 +191,34 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/array_to_slice_arg_minimal.jiang" "array_to_slice_arg_minimal"
+set +e
+"$OUT_DIR/array_to_slice_arg_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 run smoke expected array_to_slice_arg_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/array_to_slice_local_minimal.jiang" "array_to_slice_local_minimal"
+set +e
+"$OUT_DIR/array_to_slice_local_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 99 ]]; then
+    echo "stage2 run smoke expected array_to_slice_local_minimal exit code 99, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/array_to_slice_assign_minimal.jiang" "array_to_slice_assign_minimal"
+set +e
+"$OUT_DIR/array_to_slice_assign_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 97 ]]; then
+    echo "stage2 run smoke expected array_to_slice_assign_minimal exit code 97, got $STATUS" >&2
+    exit 1
+fi
+
 echo "stage2 run smoke passed"

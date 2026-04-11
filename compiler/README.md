@@ -44,12 +44,14 @@
 
 - `script/build_stage2.sh` 可通过 `stage1c` 构建 `build/stage2c`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
+- `build/stage2c` 已支持最小正式 CLI：默认 `emit-c`、显式 `--emit-c|--emit-llvm`、`--help`
 - Stage2 已具备：
   - 命令式函数基础语法
   - 多模块、`public`、alias import、导出表
   - `struct` / `enum` 基础语义
   - `UInt8` 与 `UInt8[]` 的最小类型闭环
 - Stage2 当前已有稳定回归：
+  - `script/stage2_complete_smoke.sh`
   - `script/stage2_emit_c_smoke.sh`
   - `script/stage2_run_smoke.sh`
   - `script/stage2_error_smoke.sh`

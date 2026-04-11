@@ -59,6 +59,12 @@ bash "$PROJECT_ROOT/script/stage2_llvm_smoke.sh"
 echo -e "\n--- 1.795. 运行 Stage2 LLVM 错误路径冒烟测试 ---"
 bash "$PROJECT_ROOT/script/stage2_llvm_error_smoke.sh"
 
+echo -e "\n--- 1.796. 运行 Stage2 CLI 冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage2_cli_smoke.sh"
+
+echo -e "\n--- 1.797. 运行 Stage2 完成验收冒烟测试 ---"
+bash "$PROJECT_ROOT/script/stage2_complete_smoke.sh"
+
 echo -e "\n--- 2. 运行所有单元测试 ---"
 
 # 关闭 set -e，以便我们自己处理测试用例的失败

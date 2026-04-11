@@ -27,6 +27,7 @@ OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_invalid_import_private_type.log"
 OUT_ALIAS_MEMBER_LOG="$BUILD_DIR/stage2_invalid_import_alias_missing_member.log"
 OUT_DEREF_NON_POINTER_LOG="$BUILD_DIR/stage2_invalid_deref_non_pointer.log"
 OUT_ADDRESS_OF_EXPR_LOG="$BUILD_DIR/stage2_invalid_address_of_expr.log"
+OUT_ARRAY_TO_SLICE_TYPE_LOG="$BUILD_DIR/stage2_invalid_array_to_slice_type.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -372,6 +373,21 @@ fi
 
 if [[ "$(<"$OUT_ADDRESS_OF_EXPR_LOG")" != *"address-of requires assignable target"* ]]; then
     echo "stage2 error smoke missing address-of diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_array_to_slice_type.jiang" > "$OUT_ARRAY_TO_SLICE_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_array_to_slice_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ARRAY_TO_SLICE_TYPE_LOG")" != *"local initializer type mismatch"* ]]; then
+    echo "stage2 error smoke missing array-to-slice type mismatch diagnostic" >&2
     exit 1
 fi
 
