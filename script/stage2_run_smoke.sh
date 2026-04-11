@@ -81,6 +81,56 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/array_minimal.jiang" "array_minimal"
+set +e
+"$OUT_DIR/array_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/array_assign_minimal.jiang" "array_assign_minimal"
+set +e
+"$OUT_DIR/array_assign_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 10 ]]; then
+    echo "stage2 run smoke expected array_assign_minimal exit code 10, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/uint8_array_string_minimal.jiang" "uint8_array_string_minimal"
+set +e
+"$OUT_DIR/uint8_array_string_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 run smoke expected uint8_array_string_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/nested_array_minimal.jiang" "nested_array_minimal"
+set +e
+"$OUT_DIR/nested_array_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected nested_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_array_field_minimal.jiang" "struct_array_field_minimal"
+set +e
+"$OUT_DIR/struct_array_field_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 run smoke expected struct_array_field_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/public_import_function_minimal.jiang" "public_import_function_minimal"
 set +e
 "$OUT_DIR/public_import_function_minimal"

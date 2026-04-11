@@ -91,6 +91,10 @@ int64_t JIANG_LLVM_API(type_ptr)(int64_t llvm_type) {
     return jiang_llvm_wrap_ptr(LLVMPointerType((LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type), 0));
 }
 
+int64_t JIANG_LLVM_API(array_type)(int64_t elem_type, int64_t count) {
+    return jiang_llvm_wrap_ptr(LLVMArrayType((LLVMTypeRef)jiang_llvm_unwrap_ptr(elem_type), (unsigned)count));
+}
+
 int64_t JIANG_LLVM_API(type_struct_named)(int64_t context, Slice_uint8_t name) {
     char* text = jiang_llvm_to_cstr(name);
     LLVMTypeRef type = LLVMStructCreateNamed((LLVMContextRef)jiang_llvm_unwrap_ptr(context), text ? text : "struct");
@@ -164,6 +168,10 @@ int JIANG_LLVM_API(block_has_terminator)(int64_t block_ref) {
 
 int64_t JIANG_LLVM_API(const_i1)(int64_t context, int value) {
     return jiang_llvm_wrap_ptr(LLVMConstInt(LLVMInt1TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)), value ? 1 : 0, false));
+}
+
+int64_t JIANG_LLVM_API(const_i8)(int64_t context, int64_t value) {
+    return jiang_llvm_wrap_ptr(LLVMConstInt(LLVMInt8TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)), (unsigned long long)value, false));
 }
 
 int64_t JIANG_LLVM_API(const_i32)(int64_t context, int64_t value) {
@@ -352,6 +360,18 @@ int64_t JIANG_LLVM_API(build_trunc)(int64_t builder, int64_t value, int64_t llvm
         (LLVMValueRef)jiang_llvm_unwrap_ptr(value),
         (LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type),
         text ? text : "trunctmp"
+    );
+    free(text);
+    return jiang_llvm_wrap_ptr(out);
+}
+
+int64_t JIANG_LLVM_API(build_zext)(int64_t builder, int64_t value, int64_t llvm_type, Slice_uint8_t name) {
+    char* text = jiang_llvm_to_cstr(name);
+    LLVMValueRef out = LLVMBuildZExt(
+        (LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
+        (LLVMValueRef)jiang_llvm_unwrap_ptr(value),
+        (LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type),
+        text ? text : "zexttmp"
     );
     free(text);
     return jiang_llvm_wrap_ptr(out);

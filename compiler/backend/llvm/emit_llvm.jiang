@@ -114,6 +114,12 @@ Int llvm_type_ref_from_type_id(Int type_id, Bool is_main) {
         return llvm_slice_uint8_type;
     }
     if (type_id < types.type_store_count) {
+        if (types.type_store_kinds[type_id] == types.TypeKind.array) {
+            return llvm.array_type(
+                llvm_type_ref_from_type_id(types.type_store_elem_type_ids[type_id], 0),
+                types.type_store_array_lengths[type_id]
+            );
+        }
         if (types.type_store_kinds[type_id] == types.TypeKind.enum_type) {
             return llvm_i64_type;
         }
@@ -291,15 +297,56 @@ Int llvm_lvalue_ptr(Int node_id) {
     if (jir.jir_store_node_kinds[node_id] == jir.JirNode.ident) {
         return llvm_find_value(jir.jir_store_node_symbol_ids[node_id]);
     }
+    if (jir.jir_store_node_kinds[node_id] == jir.JirNode.member_expr) {
+        Int field_symbol = jir.jir_store_node_symbol_ids[node_id];
+        if (field_symbol != 0) {
+            if (symbols.symbol_store_kinds[field_symbol] == symbols.SymbolKind.field) {
+                Int base = jir.jir_store_node_first_child[node_id];
+                Int base_ptr = llvm_lvalue_ptr(base);
+                if (base_ptr != 0) {
+                    Int field_index = llvm_field_index(field_symbol);
+                    if (field_index < 0) {
+                        return 0;
+                    }
+                    Int gep_indices = ints.buffer_int_new(2);
+                    ints.buffer_int_push(gep_indices, llvm.const_i32(llvm_context, 0));
+                    ints.buffer_int_push(gep_indices, llvm.const_i32(llvm_context, field_index));
+                    return llvm.build_gep(
+                        llvm_builder,
+                        llvm_type_ref_from_type_id(jir.jir_store_node_type_ids[base], 0),
+                        base_ptr,
+                        ints.buffer_int_slice(gep_indices),
+                        "field.ptr"
+                    );
+                }
+            }
+        }
+    }
     if (jir.jir_store_node_kinds[node_id] == jir.JirNode.index_expr) {
         Int base = jir.jir_store_node_first_child[node_id];
         Int index_node = jir.jir_store_node_next_sibling[base];
-        if (jir.jir_store_node_type_ids[base] == types.type_store_builtin_uint8_slice) {
+        Int base_type = jir.jir_store_node_type_ids[base];
+        if (base_type == types.type_store_builtin_uint8_slice) {
             Int base_value = llvm_emit_expr(base);
             Int ptr_value = llvm.build_extract_value(llvm_builder, base_value, 0, "slice.ptr");
             Int gep_indices = ints.buffer_int_new(1);
             ints.buffer_int_push(gep_indices, llvm_emit_expr(index_node));
             return llvm.build_gep(llvm_builder, llvm_i8_type, ptr_value, ints.buffer_int_slice(gep_indices), "slice.index.ptr");
+        }
+        if (types.type_store_kinds[base_type] == types.TypeKind.array) {
+            Int base_ptr = llvm_lvalue_ptr(base);
+            if (base_ptr != 0) {
+                Int gep_indices = ints.buffer_int_new(2);
+                ints.buffer_int_push(gep_indices, llvm.const_i32(llvm_context, 0));
+                ints.buffer_int_push(gep_indices, llvm_emit_expr(index_node));
+                return llvm.build_gep(
+                    llvm_builder,
+                    llvm_type_ref_from_type_id(base_type, 0),
+                    base_ptr,
+                    ints.buffer_int_slice(gep_indices),
+                    "array.index.ptr"
+                );
+            }
         }
     }
     return 0;
@@ -346,6 +393,23 @@ Int llvm_enum_member_value(Int symbol_id) {
         child = jir.jir_store_node_next_sibling[child];
     }
     return 0;
+}
+
+Int llvm_uint8_array_from_string(Int array_type, Int string_node) {
+    UInt8[] string_value = llvm_string_lit_value(string_node);
+    Int aggregate = llvm.const_undef(llvm_type_ref_from_type_id(array_type, 0));
+    Int i = 0;
+    while (i < string_value.length) {
+        aggregate = llvm.build_insert_value(
+            llvm_builder,
+            aggregate,
+            llvm.const_i8(llvm_context, string_value[i]),
+            i,
+            "arraystr"
+        );
+        i = i + 1;
+    }
+    return aggregate;
 }
 
 Int llvm_update_lvalue(Int node_id, Int value) {
@@ -441,6 +505,23 @@ Int llvm_emit_expr(Int node_id) {
         );
         return aggregate;
     }
+    if (kind == jir.JirNode.array_lit) {
+        Int aggregate = llvm.const_undef(llvm_type_ref_from_type_id(jir.jir_store_node_type_ids[node_id], 0));
+        Int child = jir.jir_store_node_first_child[node_id];
+        Int ordinal = 0;
+        while (child != 0) {
+            aggregate = llvm.build_insert_value(
+                llvm_builder,
+                aggregate,
+                llvm_emit_expr(child),
+                ordinal,
+                "arrayinit"
+            );
+            ordinal = ordinal + 1;
+            child = jir.jir_store_node_next_sibling[child];
+        }
+        return aggregate;
+    }
     if (kind == jir.JirNode.ident) {
         Int symbol_id = jir.jir_store_node_symbol_ids[node_id];
         if (symbol_id != 0) {
@@ -534,6 +615,7 @@ Int llvm_emit_expr(Int node_id) {
         while (child != 0) {
             Int field_value = jir.jir_store_node_next_sibling[jir.jir_store_node_first_child[child]];
             Int field_index = llvm_field_index(jir.jir_store_node_symbol_ids[child]);
+            Int inserted_value = 0;
             if (field_index < 0) {
                 diagnostic.diagnostic_error(
                     llvm_source,
@@ -543,10 +625,20 @@ Int llvm_emit_expr(Int node_id) {
                 );
                 return 0;
             }
+            if (jir.jir_store_node_kinds[field_value] == jir.JirNode.string_lit) {
+                if (types.type_store_kinds[jir.jir_store_node_type_ids[child]] == types.TypeKind.array) {
+                    if (types.type_store_elem_type_ids[jir.jir_store_node_type_ids[child]] == types.type_store_builtin_uint8) {
+                        inserted_value = llvm_uint8_array_from_string(jir.jir_store_node_type_ids[child], field_value);
+                    }
+                }
+            }
+            if (inserted_value == 0) {
+                inserted_value = llvm_emit_expr(field_value);
+            }
             aggregate = llvm.build_insert_value(
                 llvm_builder,
                 aggregate,
-                llvm_emit_expr(field_value),
+                inserted_value,
                 field_index,
                 "structinit"
             );
@@ -616,7 +708,14 @@ Int llvm_emit_expr(Int node_id) {
         }
         Int value = llvm_emit_expr(expr);
         if (return_type == llvm_i32_type) {
-            value = llvm.build_trunc(llvm_builder, value, llvm_i32_type, "main.ret");
+            Int expr_type = jir.jir_store_node_type_ids[expr];
+            if (expr_type == types.type_store_builtin_bool) {
+                value = llvm.build_zext(llvm_builder, value, llvm_i32_type, "main.ret");
+            } else if (expr_type == types.type_store_builtin_uint8) {
+                value = llvm.build_zext(llvm_builder, value, llvm_i32_type, "main.ret");
+            } else {
+                value = llvm.build_trunc(llvm_builder, value, llvm_i32_type, "main.ret");
+            }
         }
         llvm.build_ret(llvm_builder, value);
         return;
@@ -629,12 +728,22 @@ Int llvm_emit_expr(Int node_id) {
         Int type_node = jir.jir_store_node_first_child[stmt_node];
         Int name_node = jir.jir_store_node_next_sibling[type_node];
         Int init_expr = jir.jir_store_node_next_sibling[name_node];
+        Int declared_type = jir.jir_store_node_type_ids[type_node];
         Int ptr_value = llvm.build_alloca(
             llvm_builder,
             llvm_type_ref_from_type_id(jir.jir_store_node_type_ids[stmt_node], 0),
             llvm_node_text(name_node)
         );
         llvm_set_value(jir.jir_store_node_symbol_ids[stmt_node], ptr_value);
+        if (types.type_store_kinds[declared_type] == types.TypeKind.array) {
+            if (types.type_store_elem_type_ids[declared_type] == types.type_store_builtin_uint8) {
+                if (jir.jir_store_node_kinds[init_expr] == jir.JirNode.string_lit) {
+                    Int aggregate = llvm_uint8_array_from_string(declared_type, init_expr);
+                    llvm.build_store(llvm_builder, aggregate, ptr_value);
+                    return;
+                }
+            }
+        }
         llvm.build_store(llvm_builder, llvm_emit_expr(init_expr), ptr_value);
         return;
     }

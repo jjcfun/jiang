@@ -31,6 +31,16 @@ SLICE_ASSIGN_LL="$OUT_DIR/slice_assign_minimal.ll"
 SLICE_ASSIGN_O="$OUT_DIR/slice_assign_minimal.o"
 SLICE_RETURN_LENGTH_LL="$OUT_DIR/slice_return_length_minimal.ll"
 SLICE_RETURN_LENGTH_O="$OUT_DIR/slice_return_length_minimal.o"
+ARRAY_LL="$OUT_DIR/array_minimal.ll"
+ARRAY_O="$OUT_DIR/array_minimal.o"
+ARRAY_ASSIGN_LL="$OUT_DIR/array_assign_minimal.ll"
+ARRAY_ASSIGN_O="$OUT_DIR/array_assign_minimal.o"
+UINT8_ARRAY_STRING_LL="$OUT_DIR/uint8_array_string_minimal.ll"
+UINT8_ARRAY_STRING_O="$OUT_DIR/uint8_array_string_minimal.o"
+NESTED_ARRAY_LL="$OUT_DIR/nested_array_minimal.ll"
+NESTED_ARRAY_O="$OUT_DIR/nested_array_minimal.o"
+STRUCT_ARRAY_FIELD_LL="$OUT_DIR/struct_array_field_minimal.ll"
+STRUCT_ARRAY_FIELD_O="$OUT_DIR/struct_array_field_minimal.o"
 ENUM_LL="$OUT_DIR/enum_minimal.ll"
 ENUM_O="$OUT_DIR/enum_minimal.o"
 STRUCT_LL="$OUT_DIR/struct_minimal.ll"
@@ -125,6 +135,72 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 3 ]]; then
     echo "stage2 llvm smoke expected slice_return_length_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_minimal.jiang" > "$ARRAY_LL"
+rg -q '^define i32 @main\(\)' "$ARRAY_LL"
+rg -q '\[5 x i64\]' "$ARRAY_LL"
+rg -q 'store \[5 x i64\] \[i64 1, i64 2, i64 3, i64 4, i64 42\]' "$ARRAY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_LL" -o "$ARRAY_O"
+set +e
+"$LLVM_LLI" "$ARRAY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_assign_minimal.jiang" > "$ARRAY_ASSIGN_LL"
+rg -q 'getelementptr \[3 x i64\], ptr' "$ARRAY_ASSIGN_LL"
+rg -q 'store i64 10' "$ARRAY_ASSIGN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_ASSIGN_LL" -o "$ARRAY_ASSIGN_O"
+set +e
+"$LLVM_LLI" "$ARRAY_ASSIGN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 10 ]]; then
+    echo "stage2 llvm smoke expected array_assign_minimal exit code 10, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/uint8_array_string_minimal.jiang" > "$UINT8_ARRAY_STRING_LL"
+rg -q '\[3 x i8\]' "$UINT8_ARRAY_STRING_LL"
+rg -q 'store \[3 x i8\] c"abc"' "$UINT8_ARRAY_STRING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UINT8_ARRAY_STRING_LL" -o "$UINT8_ARRAY_STRING_O"
+set +e
+"$LLVM_LLI" "$UINT8_ARRAY_STRING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 llvm smoke expected uint8_array_string_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/nested_array_minimal.jiang" > "$NESTED_ARRAY_LL"
+rg -q '\[2 x \[3 x i64\]\]' "$NESTED_ARRAY_LL"
+rg -q 'getelementptr \[2 x \[3 x i64\]\], ptr' "$NESTED_ARRAY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NESTED_ARRAY_LL" -o "$NESTED_ARRAY_O"
+set +e
+"$LLVM_LLI" "$NESTED_ARRAY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected nested_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_array_field_minimal.jiang" > "$STRUCT_ARRAY_FIELD_LL"
+rg -q '^%Buffer = type \{ \[3 x i8\] \}' "$STRUCT_ARRAY_FIELD_LL"
+rg -q 'getelementptr %Buffer, ptr' "$STRUCT_ARRAY_FIELD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_ARRAY_FIELD_LL" -o "$STRUCT_ARRAY_FIELD_O"
+set +e
+"$LLVM_LLI" "$STRUCT_ARRAY_FIELD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 llvm smoke expected struct_array_field_minimal exit code 98, got $STATUS" >&2
     exit 1
 fi
 

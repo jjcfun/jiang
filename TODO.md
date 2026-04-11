@@ -17,9 +17,9 @@
 
 ## 当前重点
 
-- [ ] 完成 Stage2 的数组与聚合类型第一版
+- [ ] 收尾 Stage2 的数组 / 聚合类型规则（重点是数组到 slice 的转换与剩余聚合一致性）
 - [ ] 收紧 Stage2 的类型系统与 `unknown` 容忍路径
-- [ ] 让 LLVM 后端达到与 C 后端基本对齐
+- [ ] 继续收紧 LLVM 与 C 后端的剩余差异（下一步是 pointer 与更完整聚合语义）
 - [ ] 把 Stage2 收成唯一继续演进的主线
 
 ## Stage2 主计划
@@ -49,10 +49,10 @@
 
 ### 2. 数组与聚合类型第一版
 
-- [ ] 支持数组类型
-- [ ] 支持数组字面量
+- [x] 支持数组类型
+- [x] 支持数组字面量
 - [ ] 明确数组与 slice 的转换规则
-- [ ] 完成数组在 C / LLVM 中的表示
+- [x] 完成数组在 C / LLVM 中的表示
 - [ ] 继续加强 `struct` / `enum` 在多模块、赋值、参数、返回值场景下的一致性
 - [ ] 让 HIR/JIR 不再依赖 emitter 兜底判断聚合语义
 
@@ -72,7 +72,7 @@
 - [x] 完成赋值类型检查
 - [x] 完成 `return` 类型检查
 - [ ] 完成 call args / 返回值传播
-- [ ] 完成 field access / struct init / enum member 的完整类型传播
+- [ ] 完成 field access / struct init / enum member / array index 的完整类型传播
 - [ ] 收紧 `unknown`，减少当前“容忍后继续走”的路径
 
 涉及文件：
@@ -98,7 +98,7 @@
 ### 5. LLVM 后端对齐
 
 - [x] 补全 slice lowering
-- [ ] 补全数组 lowering
+- [x] 补全数组 lowering
 - [ ] 继续补 pointer lowering
 - [x] 与 C 后端在代表性样例上建立行为对齐回归
 - [x] 完成 LLVM 错误路径与运行级验证
