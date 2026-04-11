@@ -21,6 +21,8 @@ OUT_DUP_LOCAL_LOG="$BUILD_DIR/stage2_invalid_duplicate_local.log"
 OUT_IMPORT_DUP_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_duplicate_function.log"
 OUT_DUP_TYPE_LOG="$BUILD_DIR/stage2_invalid_duplicate_type.log"
 OUT_DUP_ENUM_LOG="$BUILD_DIR/stage2_invalid_duplicate_enum.log"
+OUT_DUP_ENUM_MEMBER_LOG="$BUILD_DIR/stage2_invalid_duplicate_enum_member.log"
+OUT_DUP_IMPORT_ALIAS_LOG="$BUILD_DIR/stage2_invalid_duplicate_import_alias.log"
 OUT_TRANSITIVE_TYPE_LOG="$BUILD_DIR/stage2_invalid_transitive_import_type.log"
 OUT_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_private_function.log"
 OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_invalid_import_private_type.log"
@@ -285,6 +287,36 @@ fi
 
 if [[ "$(<"$OUT_DUP_ENUM_LOG")" != *"duplicate enum"* ]]; then
     echo "stage2 error smoke missing duplicate enum diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_enum_member.jiang" > "$OUT_DUP_ENUM_MEMBER_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_duplicate_enum_member to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_ENUM_MEMBER_LOG")" != *"duplicate enum member"* ]]; then
+    echo "stage2 error smoke missing duplicate enum member diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_import_alias.jiang" > "$OUT_DUP_IMPORT_ALIAS_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_duplicate_import_alias to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_IMPORT_ALIAS_LOG")" != *"duplicate import alias"* ]]; then
+    echo "stage2 error smoke missing duplicate import alias diagnostic" >&2
     exit 1
 fi
 

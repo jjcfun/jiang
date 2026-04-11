@@ -16,6 +16,8 @@ OUT_ADDRESS_OF_EXPR_LOG="$BUILD_DIR/stage2_llvm_invalid_address_of_expr.log"
 OUT_ARRAY_TO_SLICE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_array_to_slice_type.log"
 OUT_UNKNOWN_IDENT_LOG="$BUILD_DIR/stage2_llvm_invalid_unknown_ident.log"
 OUT_CALL_NON_FUNCTION_LOG="$BUILD_DIR/stage2_llvm_invalid_call_non_function.log"
+OUT_DUP_ENUM_MEMBER_LOG="$BUILD_DIR/stage2_llvm_invalid_duplicate_enum_member.log"
+OUT_DUP_IMPORT_ALIAS_LOG="$BUILD_DIR/stage2_llvm_invalid_duplicate_import_alias.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -256,6 +258,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_CALL_NON_FUNCTION_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_call_non_function" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_enum_member.jiang" > "$OUT_DUP_ENUM_MEMBER_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_duplicate_enum_member to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_ENUM_MEMBER_LOG")" != *"duplicate enum member"* ]]; then
+    echo "stage2 llvm error smoke missing duplicate enum member diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_DUP_ENUM_MEMBER_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_duplicate_enum_member" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_duplicate_import_alias.jiang" > "$OUT_DUP_IMPORT_ALIAS_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_duplicate_import_alias to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_DUP_IMPORT_ALIAS_LOG")" != *"duplicate import alias"* ]]; then
+    echo "stage2 llvm error smoke missing duplicate import alias diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_DUP_IMPORT_ALIAS_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_duplicate_import_alias" >&2
     exit 1
 fi
 

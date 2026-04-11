@@ -121,6 +121,26 @@ if [[ $STATUS -ne 3 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/multi_file_slice_index_minimal.jiang" "multi_file_slice_index_minimal"
+set +e
+"$OUT_DIR/multi_file_slice_index_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected multi_file_slice_index_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_slice_index_minimal.jiang" "namespaced_slice_index_minimal"
+set +e
+"$OUT_DIR/namespaced_slice_index_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected namespaced_slice_index_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/array_minimal.jiang" "array_minimal"
 set +e
 "$OUT_DIR/array_minimal"

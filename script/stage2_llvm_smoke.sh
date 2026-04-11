@@ -71,6 +71,10 @@ MULTI_SLICE_RETURN_LL="$OUT_DIR/multi_file_slice_return_minimal.ll"
 MULTI_SLICE_RETURN_O="$OUT_DIR/multi_file_slice_return_minimal.o"
 NS_SLICE_RETURN_LL="$OUT_DIR/namespaced_slice_return_minimal.ll"
 NS_SLICE_RETURN_O="$OUT_DIR/namespaced_slice_return_minimal.o"
+MULTI_SLICE_INDEX_LL="$OUT_DIR/multi_file_slice_index_minimal.ll"
+MULTI_SLICE_INDEX_O="$OUT_DIR/multi_file_slice_index_minimal.o"
+NS_SLICE_INDEX_LL="$OUT_DIR/namespaced_slice_index_minimal.ll"
+NS_SLICE_INDEX_O="$OUT_DIR/namespaced_slice_index_minimal.o"
 POINTER_LL="$OUT_DIR/pointer_minimal.ll"
 POINTER_O="$OUT_DIR/pointer_minimal.o"
 ARRAY_TO_SLICE_ARG_LL="$OUT_DIR/array_to_slice_arg_minimal.ll"
@@ -412,6 +416,32 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 3 ]]; then
     echo "stage2 llvm smoke expected namespaced_slice_return_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_slice_index_minimal.jiang" > "$MULTI_SLICE_INDEX_LL"
+rg -q 'getelementptr i8, ptr' "$MULTI_SLICE_INDEX_LL"
+rg -q 'icmp eq i8' "$MULTI_SLICE_INDEX_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_SLICE_INDEX_LL" -o "$MULTI_SLICE_INDEX_O"
+set +e
+"$LLVM_LLI" "$MULTI_SLICE_INDEX_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected multi_file_slice_index_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_slice_index_minimal.jiang" > "$NS_SLICE_INDEX_LL"
+rg -q 'getelementptr i8, ptr' "$NS_SLICE_INDEX_LL"
+rg -q 'icmp eq i8' "$NS_SLICE_INDEX_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_SLICE_INDEX_LL" -o "$NS_SLICE_INDEX_O"
+set +e
+"$LLVM_LLI" "$NS_SLICE_INDEX_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected namespaced_slice_index_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
