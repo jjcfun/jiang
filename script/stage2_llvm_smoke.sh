@@ -21,6 +21,8 @@ WHILE_LL="$OUT_DIR/while_minimal.ll"
 WHILE_O="$OUT_DIR/while_minimal.o"
 BREAK_CONTINUE_LL="$OUT_DIR/break_continue_minimal.ll"
 BREAK_CONTINUE_O="$OUT_DIR/break_continue_minimal.o"
+FOR_RANGE_LL="$OUT_DIR/for_range_minimal.ll"
+FOR_RANGE_O="$OUT_DIR/for_range_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -149,6 +151,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 8 ]]; then
     echo "stage2 llvm smoke expected break_continue_minimal exit code 8, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_range_minimal.jiang" > "$FOR_RANGE_LL"
+rg -q '^define i32 @main\(\)' "$FOR_RANGE_LL"
+rg -q 'for\.cond' "$FOR_RANGE_LL"
+rg -q 'for\.step' "$FOR_RANGE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_RANGE_LL" -o "$FOR_RANGE_O"
+set +e
+"$LLVM_LLI" "$FOR_RANGE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 8 ]]; then
+    echo "stage2 llvm smoke expected for_range_minimal exit code 8, got $STATUS" >&2
     exit 1
 fi
 

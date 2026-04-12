@@ -61,6 +61,16 @@ if [[ $STATUS -ne 8 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/for_range_minimal.jiang" "for_range_minimal"
+set +e
+"$OUT_DIR/for_range_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 8 ]]; then
+    echo "stage2 run smoke expected for_range_minimal exit code 8, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/slice_length_minimal.jiang" "slice_length_minimal"
 set +e
 "$OUT_DIR/slice_length_minimal"
