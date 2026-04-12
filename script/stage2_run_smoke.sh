@@ -51,6 +51,16 @@ if [[ $STATUS -ne 10 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/break_continue_minimal.jiang" "break_continue_minimal"
+set +e
+"$OUT_DIR/break_continue_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 8 ]]; then
+    echo "stage2 run smoke expected break_continue_minimal exit code 8, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/slice_length_minimal.jiang" "slice_length_minimal"
 set +e
 "$OUT_DIR/slice_length_minimal"
@@ -178,6 +188,16 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 10 ]]; then
     echo "stage2 run smoke expected array_assign_minimal exit code 10, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/global_minimal.jiang" "global_minimal"
+set +e
+"$OUT_DIR/global_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected global_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

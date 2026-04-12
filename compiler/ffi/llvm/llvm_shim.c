@@ -38,6 +38,57 @@ static void* jiang_llvm_unwrap_ptr(int64_t value) {
 }
 
 #define JIANG_LLVM_API(name) _m64_##name
+#define JIANG_LLVM_STAGE2_API(name) _m_compiler_ffi_llvm_core_jiang__##name
+
+#define JIANG_LLVM_WRAP_RET0(ret, name) \
+ret JIANG_LLVM_STAGE2_API(name)(void) { \
+    return JIANG_LLVM_API(name)(); \
+}
+
+#define JIANG_LLVM_WRAP_RET1(ret, name, t1, a1) \
+ret JIANG_LLVM_STAGE2_API(name)(t1 a1) { \
+    return JIANG_LLVM_API(name)(a1); \
+}
+
+#define JIANG_LLVM_WRAP_RET2(ret, name, t1, a1, t2, a2) \
+ret JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2) { \
+    return JIANG_LLVM_API(name)(a1, a2); \
+}
+
+#define JIANG_LLVM_WRAP_RET3(ret, name, t1, a1, t2, a2, t3, a3) \
+ret JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2, t3 a3) { \
+    return JIANG_LLVM_API(name)(a1, a2, a3); \
+}
+
+#define JIANG_LLVM_WRAP_RET4(ret, name, t1, a1, t2, a2, t3, a3, t4, a4) \
+ret JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2, t3 a3, t4 a4) { \
+    return JIANG_LLVM_API(name)(a1, a2, a3, a4); \
+}
+
+#define JIANG_LLVM_WRAP_RET5(ret, name, t1, a1, t2, a2, t3, a3, t4, a4, t5, a5) \
+ret JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2, t3 a3, t4 a4, t5 a5) { \
+    return JIANG_LLVM_API(name)(a1, a2, a3, a4, a5); \
+}
+
+#define JIANG_LLVM_WRAP_VOID1(name, t1, a1) \
+void JIANG_LLVM_STAGE2_API(name)(t1 a1) { \
+    JIANG_LLVM_API(name)(a1); \
+}
+
+#define JIANG_LLVM_WRAP_VOID2(name, t1, a1, t2, a2) \
+void JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2) { \
+    JIANG_LLVM_API(name)(a1, a2); \
+}
+
+#define JIANG_LLVM_WRAP_VOID3(name, t1, a1, t2, a2, t3, a3) \
+void JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2, t3 a3) { \
+    JIANG_LLVM_API(name)(a1, a2, a3); \
+}
+
+#define JIANG_LLVM_WRAP_VOID4(name, t1, a1, t2, a2, t3, a3, t4, a4) \
+void JIANG_LLVM_STAGE2_API(name)(t1 a1, t2 a2, t3 a3, t4 a4) { \
+    JIANG_LLVM_API(name)(a1, a2, a3, a4); \
+}
 
 int64_t JIANG_LLVM_API(context_create)(void) {
     return jiang_llvm_wrap_ptr(LLVMContextCreate());
@@ -171,6 +222,10 @@ void JIANG_LLVM_API(position_builder)(int64_t builder, int64_t block_ref) {
         (LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
         (LLVMBasicBlockRef)jiang_llvm_unwrap_ptr(block_ref)
     );
+}
+
+int64_t JIANG_LLVM_API(current_block)(int64_t builder) {
+    return jiang_llvm_wrap_ptr(LLVMGetInsertBlock((LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder)));
 }
 
 int JIANG_LLVM_API(block_has_terminator)(int64_t block_ref) {
@@ -454,3 +509,61 @@ void JIANG_LLVM_API(print_module)(int64_t module_ref) {
     fputs(text, stdout);
     LLVMDisposeMessage(text);
 }
+
+JIANG_LLVM_WRAP_RET0(int64_t, context_create)
+JIANG_LLVM_WRAP_VOID1(context_dispose, int64_t, context)
+JIANG_LLVM_WRAP_RET2(int64_t, module_create, int64_t, context, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_VOID1(module_dispose, int64_t, module_ref)
+JIANG_LLVM_WRAP_RET1(int64_t, builder_create, int64_t, context)
+JIANG_LLVM_WRAP_VOID1(builder_dispose, int64_t, builder)
+JIANG_LLVM_WRAP_RET1(int64_t, type_void, int64_t, context)
+JIANG_LLVM_WRAP_RET1(int64_t, type_i1, int64_t, context)
+JIANG_LLVM_WRAP_RET1(int64_t, type_i8, int64_t, context)
+JIANG_LLVM_WRAP_RET1(int64_t, type_i32, int64_t, context)
+JIANG_LLVM_WRAP_RET1(int64_t, type_i64, int64_t, context)
+JIANG_LLVM_WRAP_RET1(int64_t, type_ptr, int64_t, llvm_type)
+JIANG_LLVM_WRAP_RET2(int64_t, array_type, int64_t, elem_type, int64_t, count)
+JIANG_LLVM_WRAP_RET2(int64_t, type_struct_named, int64_t, context, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_VOID2(type_struct_set_body, int64_t, struct_type, Slice_int64_t, field_types)
+JIANG_LLVM_WRAP_RET3(int64_t, function_type, int64_t, return_type, Slice_int64_t, param_types, int, is_vararg)
+JIANG_LLVM_WRAP_RET3(int64_t, add_function, int64_t, module_ref, Slice_uint8_t, name, int64_t, fn_type)
+JIANG_LLVM_WRAP_RET3(int64_t, add_global, int64_t, module_ref, int64_t, llvm_type, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET2(int64_t, get_param, int64_t, function_ref, int64_t, index)
+JIANG_LLVM_WRAP_RET3(int64_t, append_block, int64_t, context, int64_t, function_ref, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_VOID2(position_builder, int64_t, builder, int64_t, block_ref)
+JIANG_LLVM_WRAP_RET1(int64_t, current_block, int64_t, builder)
+JIANG_LLVM_WRAP_RET1(int, block_has_terminator, int64_t, block_ref)
+JIANG_LLVM_WRAP_RET2(int64_t, const_i1, int64_t, context, int, value)
+JIANG_LLVM_WRAP_RET2(int64_t, const_i8, int64_t, context, int64_t, value)
+JIANG_LLVM_WRAP_RET2(int64_t, const_i32, int64_t, context, int64_t, value)
+JIANG_LLVM_WRAP_RET2(int64_t, const_i64, int64_t, context, int64_t, value)
+JIANG_LLVM_WRAP_RET1(int64_t, const_null, int64_t, llvm_type)
+JIANG_LLVM_WRAP_RET1(int64_t, const_undef, int64_t, llvm_type)
+JIANG_LLVM_WRAP_RET2(int64_t, const_named_struct, int64_t, llvm_type, Slice_int64_t, values)
+JIANG_LLVM_WRAP_VOID2(set_initializer, int64_t, global_ref, int64_t, value)
+JIANG_LLVM_WRAP_RET3(int64_t, build_alloca, int64_t, builder, int64_t, llvm_type, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_load, int64_t, builder, int64_t, llvm_type, int64_t, ptr_value, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_VOID3(build_store, int64_t, builder, int64_t, value, int64_t, ptr_value)
+JIANG_LLVM_WRAP_RET5(int64_t, build_gep, int64_t, builder, int64_t, llvm_type, int64_t, ptr_value, Slice_int64_t, indices, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_extract_value, int64_t, builder, int64_t, aggregate, int64_t, index, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET5(int64_t, build_insert_value, int64_t, builder, int64_t, aggregate, int64_t, value, int64_t, index, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET3(int64_t, build_global_string_ptr, int64_t, builder, Slice_uint8_t, value, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_add, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_sub, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_mul, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_sdiv, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_eq, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_ne, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_slt, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_sle, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_sgt, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_sge, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET5(int64_t, build_call, int64_t, builder, int64_t, fn_type, int64_t, function_ref, Slice_int64_t, args, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_trunc, int64_t, builder, int64_t, value, int64_t, llvm_type, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_zext, int64_t, builder, int64_t, value, int64_t, llvm_type, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_VOID2(build_ret, int64_t, builder, int64_t, value)
+JIANG_LLVM_WRAP_VOID1(build_ret_void, int64_t, builder)
+JIANG_LLVM_WRAP_VOID2(build_br, int64_t, builder, int64_t, target_block)
+JIANG_LLVM_WRAP_VOID4(build_cond_br, int64_t, builder, int64_t, cond_value, int64_t, then_block, int64_t, else_block)
+JIANG_LLVM_WRAP_RET1(int, verify_module, int64_t, module_ref)
+JIANG_LLVM_WRAP_VOID1(print_module, int64_t, module_ref)

@@ -19,6 +19,8 @@ MINIMAL_LL="$OUT_DIR/minimal.ll"
 MINIMAL_O="$OUT_DIR/minimal.o"
 WHILE_LL="$OUT_DIR/while_minimal.ll"
 WHILE_O="$OUT_DIR/while_minimal.o"
+BREAK_CONTINUE_LL="$OUT_DIR/break_continue_minimal.ll"
+BREAK_CONTINUE_O="$OUT_DIR/break_continue_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -107,6 +109,8 @@ ARRAY_TO_SLICE_ASSIGN_LL="$OUT_DIR/array_to_slice_assign_minimal.ll"
 ARRAY_TO_SLICE_ASSIGN_O="$OUT_DIR/array_to_slice_assign_minimal.o"
 ARRAY_TO_SLICE_RETURN_LL="$OUT_DIR/array_to_slice_return_minimal.ll"
 ARRAY_TO_SLICE_RETURN_O="$OUT_DIR/array_to_slice_return_minimal.o"
+GLOBAL_LL="$OUT_DIR/global_minimal.ll"
+GLOBAL_O="$OUT_DIR/global_minimal.o"
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/minimal.jiang" > "$MINIMAL_LL"
 rg -q '^define i64 @add\(i64 %0, i64 %1\)' "$MINIMAL_LL"
@@ -132,6 +136,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 10 ]]; then
     echo "stage2 llvm smoke expected while_minimal exit code 10, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/break_continue_minimal.jiang" > "$BREAK_CONTINUE_LL"
+rg -q '^define i32 @main\(\)' "$BREAK_CONTINUE_LL"
+rg -q 'br label %while\.cond' "$BREAK_CONTINUE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$BREAK_CONTINUE_LL" -o "$BREAK_CONTINUE_O"
+set +e
+"$LLVM_LLI" "$BREAK_CONTINUE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 8 ]]; then
+    echo "stage2 llvm smoke expected break_continue_minimal exit code 8, got $STATUS" >&2
     exit 1
 fi
 
@@ -666,5 +683,18 @@ fi
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_to_slice_return_minimal.jiang" > "$ARRAY_TO_SLICE_RETURN_LL"
 rg -q '^define %Slice_uint8_t @expose\(\)' "$ARRAY_TO_SLICE_RETURN_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$ARRAY_TO_SLICE_RETURN_LL" -o "$ARRAY_TO_SLICE_RETURN_O"
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/global_minimal.jiang" > "$GLOBAL_LL"
+rg -q '^@answer = global i64 42$' "$GLOBAL_LL"
+rg -q '^define i32 @main\(\)' "$GLOBAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$GLOBAL_LL" -o "$GLOBAL_O"
+set +e
+"$LLVM_LLI" "$GLOBAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
 
 echo "stage2 llvm smoke passed"

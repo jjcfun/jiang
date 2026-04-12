@@ -45,6 +45,9 @@ OUT_INDEX_TYPE_LOG="$BUILD_DIR/stage2_invalid_index_type.log"
 OUT_ARRAY_ARG_LENGTH_LOG="$BUILD_DIR/stage2_invalid_array_arg_length.log"
 OUT_ARRAY_ASSIGN_LENGTH_LOG="$BUILD_DIR/stage2_invalid_array_assign_length.log"
 OUT_ARRAY_RETURN_LENGTH_LOG="$BUILD_DIR/stage2_invalid_array_return_length.log"
+OUT_BREAK_OUTSIDE_LOOP_LOG="$BUILD_DIR/stage2_invalid_break_outside_loop.log"
+OUT_CONTINUE_OUTSIDE_LOOP_LOG="$BUILD_DIR/stage2_invalid_continue_outside_loop.log"
+OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -660,6 +663,51 @@ fi
 
 if [[ "$(<"$OUT_ARRAY_RETURN_LENGTH_LOG")" != *"array literal length mismatch"* ]]; then
     echo "stage2 error smoke missing array return length diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_break_outside_loop.jiang" > "$OUT_BREAK_OUTSIDE_LOOP_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_break_outside_loop to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_BREAK_OUTSIDE_LOOP_LOG")" != *"break outside loop"* ]]; then
+    echo "stage2 error smoke missing break outside loop diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_continue_outside_loop.jiang" > "$OUT_CONTINUE_OUTSIDE_LOOP_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_continue_outside_loop to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_CONTINUE_OUTSIDE_LOOP_LOG")" != *"continue outside loop"* ]]; then
+    echo "stage2 error smoke missing continue outside loop diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_global_initializer_type.jiang" > "$OUT_GLOBAL_INIT_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_global_initializer_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_GLOBAL_INIT_TYPE_LOG")" != *"global initializer type mismatch"* ]]; then
+    echo "stage2 error smoke missing global initializer type mismatch diagnostic" >&2
     exit 1
 fi
 
