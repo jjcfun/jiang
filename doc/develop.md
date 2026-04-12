@@ -136,7 +136,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 *   仍未开始：
     *   类型转换
     *   元组
-    *   `switch`
+    *   `switch`：当前已支持最小 enum / Int case 与 `else:`，尚未覆盖 union / pattern
     *   `union`
     *   模式匹配 / binding
     *   泛型

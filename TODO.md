@@ -50,7 +50,7 @@
 
 - [ ] 类型转换
 - [ ] 元组
-- [ ] `switch`
+- [ ] `switch`：已支持最小 enum / Int case 与 `else:`，尚未对齐 union / pattern / 穷尽性检查
 - [ ] `union`
 - [ ] 模式匹配 / binding
 - [ ] 泛型
