@@ -6,6 +6,8 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 
+STAGE2_SEED_C_PATH="${STAGE2_SEED_C:-$BUILD_DIR/stage2_seed.c}"
+STAGE2_SEED_BIN="$BUILD_DIR/stage2c.seed"
 STAGE2_BOOTSTRAP_C_PATH="$BUILD_DIR/stage2_compiler.bootstrap.c"
 STAGE2_BOOTSTRAP_BIN="$BUILD_DIR/stage2c.bootstrap"
 STAGE2_C_PATH="$BUILD_DIR/stage2_compiler.c"
@@ -31,10 +33,15 @@ link_stage2() {
         -o "$output_bin"
 }
 
-"$BUILD_DIR/stage1c" --mode emit-c "compiler/entries/compiler.jiang" > "$STAGE2_BOOTSTRAP_C_PATH"
-link_stage2 "$STAGE2_BOOTSTRAP_C_PATH" "$STAGE2_BOOTSTRAP_BIN"
+if [ -f "$STAGE2_SEED_C_PATH" ]; then
+    link_stage2 "$STAGE2_SEED_C_PATH" "$STAGE2_SEED_BIN"
+    "$STAGE2_SEED_BIN" "compiler/entries/compiler.jiang" > "$STAGE2_C_PATH"
+else
+    "$BUILD_DIR/stage1c" --mode emit-c "compiler/entries/compiler.jiang" > "$STAGE2_BOOTSTRAP_C_PATH"
+    link_stage2 "$STAGE2_BOOTSTRAP_C_PATH" "$STAGE2_BOOTSTRAP_BIN"
+    "$STAGE2_BOOTSTRAP_BIN" "compiler/entries/compiler.jiang" > "$STAGE2_C_PATH"
+fi
 
-"$STAGE2_BOOTSTRAP_BIN" "compiler/entries/compiler.jiang" > "$STAGE2_C_PATH"
 link_stage2 "$STAGE2_C_PATH" "$BUILD_DIR/stage2c"
 
 echo "built $BUILD_DIR/stage2c"

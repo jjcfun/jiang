@@ -147,7 +147,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 
 当前固定的接管标准是：
 
-*   `script/build_stage2.sh` 持续通过，且默认构建链已采用“Stage1 引导 -> Stage2 自重编”的两段式自举
+*   `script/build_stage2.sh` 持续通过，且默认构建链已采用“本地或外部提供的 Stage2 seed -> Stage2 自重编”的冷启动路径；当 seed 缺失时仍可回退到 Stage1 引导
 *   `script/stage2_complete_smoke.sh` 持续通过
 *   `script/stage1_complete_smoke.sh` 持续通过
 *   Stage2 的 `emit-c` 与 `--emit-llvm` 都保持正式可用

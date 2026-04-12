@@ -75,7 +75,7 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 + **Stage1**: 用 Stage0 的 Jiang 编译器启动自举。该阶段已经完成：Stage1 主线固定在 `bootstrap/`，根目录保留可复用编译器模块，`bootstrap/entries/` 放 smoke driver 和工具入口；`compiler_core.compile_entry(path, mode)` 已稳定支持 `dump_ast` / `dump_hir` / `dump_jir` / `emit_c`，正式 `stage1c` CLI、manifest 与 build workflow 已收口，并通过统一 Stage1 完成验收与 selfhost 回归；`--backend llvm` 当前作为可选完整后端保留在回归中，但默认后端仍保持 C
 
-+ **Stage2**: 在 Stage1 自举编译器真正收口并可接管主职责之后，再用 Jiang 语言重构 Jiang 编译器，并实现自定义语法等高级功能。该阶段当前已经完成首个正式主线目标：`compiler/` 是唯一继续演进的编译器主线目录，默认 `script/build_stage2.sh` 已采用“Stage1 引导 -> Stage2 自重编”的两段式自举构建链，且已具备 `frontend -> HIR -> JIR -> C/LLVM`、多模块与 `public`/alias import、`struct` / `enum` / `UInt8` / `UInt8[]` / array / pointer 基础语义，以及 `emit-c` / `run` / `selfhost` / `error` / `llvm` / `llvm-error` / `complete` 回归；`bootstrap/` 继续保留为已完成的 Stage1 冻结基线
++ **Stage2**: 在 Stage1 自举编译器真正收口并可接管主职责之后，再用 Jiang 语言重构 Jiang 编译器，并实现自定义语法等高级功能。该阶段当前已经完成首个正式主线目标：`compiler/` 是唯一继续演进的编译器主线目录，默认 `script/build_stage2.sh` 会优先使用本地或外部提供的 Stage2 seed C 产物冷启动，再由 seed 产出的 `stage2c.seed` 重编自身产出最终 `build/stage2c`；在缺少 seed 时仍可回退到 `Stage1 -> Stage2 bootstrap -> Stage2 self-rebuild`。当前已具备 `frontend -> HIR -> JIR -> C/LLVM`、多模块与 `public`/alias import、`struct` / `enum` / `UInt8` / `UInt8[]` / array / pointer 基础语义，以及 `emit-c` / `run` / `selfhost` / `error` / `llvm` / `llvm-error` / `complete` 回归；`bootstrap/` 继续保留为已完成的 Stage1 冻结基线
 
 + **Stage3**: 包管理工具的实现
 

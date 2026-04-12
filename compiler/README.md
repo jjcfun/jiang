@@ -42,7 +42,11 @@
 
 当前已经落地的能力：
 
-- `script/build_stage2.sh` 现在默认采用两段式自举：先由 `stage1c` 引导出 `stage2c.bootstrap`，再由它重编自身产出最终 `build/stage2c`
+- `script/build_stage2.sh` 现在默认优先使用 seed C 冷启动，再由 seed 产出的 `stage2c.seed` 重编自身产出最终 `build/stage2c`
+- seed 来源优先级是：
+  - 环境变量 `STAGE2_SEED_C`
+  - 本地 `build/stage2_seed.c`
+  - 缺失时回退到 `stage1c -> stage2c.bootstrap -> stage2c`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
 - `build/stage2c` 已支持最小正式 CLI：默认 `emit-c`、显式 `--emit-c|--emit-llvm`、`--help`
 - Stage2 已具备：
@@ -79,6 +83,7 @@
 Stage2 替代 Stage1 的验收标准固定为：
 
 - `script/build_stage2.sh` 持续通过，且最终 `build/stage2c` 由 Stage2 自重编产出
+- `script/refresh_stage2_seed.sh` 可用当前 `build/stage2c` 刷新本地 seed；默认输出到 `build/stage2_seed.c`，也支持传入目标路径
 - `script/stage2_complete_smoke.sh` 持续通过
 - `script/stage1_complete_smoke.sh` 持续通过，不因 Stage2 演进被打断
 - `stage2c` 的 `emit-c` 与 `--emit-llvm` 都保持可用
