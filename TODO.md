@@ -149,6 +149,7 @@
 - [x] 收口 `stage2c` CLI（默认 `emit-c`，支持 `--emit-llvm` 与 `--help`）
 - [x] 固定 Stage2 正式验收入口
 - [x] 保持 `stage1 -> stage2` 构建链持续绿色
+- [x] 让默认 `build_stage2.sh` 切到 Stage2 两段式自举
 - [x] 明确 Stage2 替代 Stage1 的验收标准
 - [x] 把 Stage2 收成唯一继续演进的主线
 - [x] 继续冻结 Stage1，只保留 bootstrap 基线职责

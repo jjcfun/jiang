@@ -42,7 +42,7 @@
 
 当前已经落地的能力：
 
-- `script/build_stage2.sh` 可通过 `stage1c` 构建 `build/stage2c`
+- `script/build_stage2.sh` 现在默认采用两段式自举：先由 `stage1c` 引导出 `stage2c.bootstrap`，再由它重编自身产出最终 `build/stage2c`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
 - `build/stage2c` 已支持最小正式 CLI：默认 `emit-c`、显式 `--emit-c|--emit-llvm`、`--help`
 - Stage2 已具备：
@@ -78,7 +78,7 @@
 
 Stage2 替代 Stage1 的验收标准固定为：
 
-- `script/build_stage2.sh` 持续通过，且 `build/stage2c` 由 `stage1c` 构建
+- `script/build_stage2.sh` 持续通过，且最终 `build/stage2c` 由 Stage2 自重编产出
 - `script/stage2_complete_smoke.sh` 持续通过
 - `script/stage1_complete_smoke.sh` 持续通过，不因 Stage2 演进被打断
 - `stage2c` 的 `emit-c` 与 `--emit-llvm` 都保持可用

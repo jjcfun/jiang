@@ -34,6 +34,13 @@ void __intrinsic_print(const char* fmt, ...) {
     va_end(args);
 }
 
+void __intrinsic_write_stdout(Slice_uint8_t value) {
+    if (value.length <= 0 || !value.ptr) {
+        return;
+    }
+    fwrite(value.ptr, 1, (size_t)value.length, stdout);
+}
+
 void __intrinsic_assert(int cond) {
     if (cond) {
         return;
