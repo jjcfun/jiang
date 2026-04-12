@@ -301,6 +301,36 @@ if [[ $STATUS -ne 1 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/enum_value_minimal.jiang" "enum_value_minimal"
+set +e
+"$OUT_DIR/enum_value_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected enum_value_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/multi_file_enum_value_minimal.jiang" "multi_file_enum_value_minimal"
+set +e
+"$OUT_DIR/multi_file_enum_value_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 7 ]]; then
+    echo "stage2 run smoke expected multi_file_enum_value_minimal exit code 7, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_enum_value_minimal.jiang" "namespaced_enum_value_minimal"
+set +e
+"$OUT_DIR/namespaced_enum_value_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 run smoke expected namespaced_enum_value_minimal exit code 3, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/pointer_minimal.jiang" "pointer_minimal"
 set +e
 "$OUT_DIR/pointer_minimal"

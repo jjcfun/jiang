@@ -19,6 +19,7 @@ OUT_ARRAY_TO_SLICE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_array_to_slice_type.
 OUT_UNKNOWN_IDENT_LOG="$BUILD_DIR/stage2_llvm_invalid_unknown_ident.log"
 OUT_CALL_NON_FUNCTION_LOG="$BUILD_DIR/stage2_llvm_invalid_call_non_function.log"
 OUT_DUP_ENUM_MEMBER_LOG="$BUILD_DIR/stage2_llvm_invalid_duplicate_enum_member.log"
+OUT_ENUM_VALUE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_enum_value_type.log"
 OUT_DUP_IMPORT_ALIAS_LOG="$BUILD_DIR/stage2_llvm_invalid_duplicate_import_alias.log"
 OUT_TYPE_FUNC_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_type_function_name_conflict.log"
 OUT_ENUM_TYPE_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_enum_type_name_conflict.log"
@@ -330,6 +331,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_DUP_ENUM_MEMBER_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_duplicate_enum_member" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_enum_value_type.jiang" > "$OUT_ENUM_VALUE_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_enum_value_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ENUM_VALUE_TYPE_LOG")" != *"enum value must be Int"* ]]; then
+    echo "stage2 llvm error smoke missing enum value type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ENUM_VALUE_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_enum_value_type" >&2
     exit 1
 fi
 

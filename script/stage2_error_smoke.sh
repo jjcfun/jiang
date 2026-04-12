@@ -22,6 +22,7 @@ OUT_IMPORT_DUP_FUNC_LOG="$BUILD_DIR/stage2_invalid_import_duplicate_function.log
 OUT_DUP_TYPE_LOG="$BUILD_DIR/stage2_invalid_duplicate_type.log"
 OUT_DUP_ENUM_LOG="$BUILD_DIR/stage2_invalid_duplicate_enum.log"
 OUT_DUP_ENUM_MEMBER_LOG="$BUILD_DIR/stage2_invalid_duplicate_enum_member.log"
+OUT_ENUM_VALUE_TYPE_LOG="$BUILD_DIR/stage2_invalid_enum_value_type.log"
 OUT_DUP_IMPORT_ALIAS_LOG="$BUILD_DIR/stage2_invalid_duplicate_import_alias.log"
 OUT_TYPE_FUNC_CONFLICT_LOG="$BUILD_DIR/stage2_invalid_type_function_name_conflict.log"
 OUT_ENUM_TYPE_CONFLICT_LOG="$BUILD_DIR/stage2_invalid_enum_type_name_conflict.log"
@@ -314,6 +315,21 @@ fi
 
 if [[ "$(<"$OUT_DUP_ENUM_MEMBER_LOG")" != *"duplicate enum member"* ]]; then
     echo "stage2 error smoke missing duplicate enum member diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_enum_value_type.jiang" > "$OUT_ENUM_VALUE_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_enum_value_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ENUM_VALUE_TYPE_LOG")" != *"enum value must be Int"* ]]; then
+    echo "stage2 error smoke missing enum value type diagnostic" >&2
     exit 1
 fi
 

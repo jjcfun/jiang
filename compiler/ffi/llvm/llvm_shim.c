@@ -140,6 +140,17 @@ int64_t JIANG_LLVM_API(add_function)(int64_t module_ref, Slice_uint8_t name, int
     return jiang_llvm_wrap_ptr(fn);
 }
 
+int64_t JIANG_LLVM_API(add_global)(int64_t module_ref, int64_t llvm_type, Slice_uint8_t name) {
+    char* text = jiang_llvm_to_cstr(name);
+    LLVMValueRef global = LLVMAddGlobal(
+        (LLVMModuleRef)jiang_llvm_unwrap_ptr(module_ref),
+        (LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type),
+        text ? text : "global"
+    );
+    free(text);
+    return jiang_llvm_wrap_ptr(global);
+}
+
 int64_t JIANG_LLVM_API(get_param)(int64_t function_ref, int64_t index) {
     return jiang_llvm_wrap_ptr(LLVMGetParam((LLVMValueRef)jiang_llvm_unwrap_ptr(function_ref), (unsigned)index));
 }
@@ -182,8 +193,35 @@ int64_t JIANG_LLVM_API(const_i64)(int64_t context, int64_t value) {
     return jiang_llvm_wrap_ptr(LLVMConstInt(LLVMInt64TypeInContext((LLVMContextRef)jiang_llvm_unwrap_ptr(context)), (unsigned long long)value, true));
 }
 
+int64_t JIANG_LLVM_API(const_null)(int64_t llvm_type) {
+    return jiang_llvm_wrap_ptr(LLVMConstNull((LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type)));
+}
+
 int64_t JIANG_LLVM_API(const_undef)(int64_t llvm_type) {
     return jiang_llvm_wrap_ptr(LLVMGetUndef((LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type)));
+}
+
+int64_t JIANG_LLVM_API(const_named_struct)(int64_t llvm_type, Slice_int64_t values) {
+    LLVMValueRef fields[16];
+    unsigned count = 0;
+    while (count < (unsigned)values.length && count < 16) {
+        fields[count] = (LLVMValueRef)jiang_llvm_unwrap_ptr(values.ptr[count]);
+        count++;
+    }
+    return jiang_llvm_wrap_ptr(
+        LLVMConstNamedStruct(
+            (LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type),
+            count == 0 ? NULL : fields,
+            count
+        )
+    );
+}
+
+void JIANG_LLVM_API(set_initializer)(int64_t global_ref, int64_t value) {
+    LLVMSetInitializer(
+        (LLVMValueRef)jiang_llvm_unwrap_ptr(global_ref),
+        (LLVMValueRef)jiang_llvm_unwrap_ptr(value)
+    );
 }
 
 int64_t JIANG_LLVM_API(build_alloca)(int64_t builder, int64_t llvm_type, Slice_uint8_t name) {

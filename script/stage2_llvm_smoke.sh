@@ -43,6 +43,8 @@ STRUCT_ARRAY_FIELD_LL="$OUT_DIR/struct_array_field_minimal.ll"
 STRUCT_ARRAY_FIELD_O="$OUT_DIR/struct_array_field_minimal.o"
 ENUM_LL="$OUT_DIR/enum_minimal.ll"
 ENUM_O="$OUT_DIR/enum_minimal.o"
+ENUM_VALUE_LL="$OUT_DIR/enum_value_minimal.ll"
+ENUM_VALUE_O="$OUT_DIR/enum_value_minimal.o"
 STRUCT_LL="$OUT_DIR/struct_minimal.ll"
 STRUCT_O="$OUT_DIR/struct_minimal.o"
 FIELDS_LL="$OUT_DIR/fields_minimal.ll"
@@ -77,8 +79,12 @@ NS_STRUCT_ARRAY_LL="$OUT_DIR/namespaced_struct_array_minimal.ll"
 NS_STRUCT_ARRAY_O="$OUT_DIR/namespaced_struct_array_minimal.o"
 MULTI_ENUM_LL="$OUT_DIR/multi_file_enum_minimal.ll"
 MULTI_ENUM_O="$OUT_DIR/multi_file_enum_minimal.o"
+MULTI_ENUM_VALUE_LL="$OUT_DIR/multi_file_enum_value_minimal.ll"
+MULTI_ENUM_VALUE_O="$OUT_DIR/multi_file_enum_value_minimal.o"
 NS_ENUM_LL="$OUT_DIR/namespaced_enum_import_minimal.ll"
 NS_ENUM_O="$OUT_DIR/namespaced_enum_import_minimal.o"
+NS_ENUM_VALUE_LL="$OUT_DIR/namespaced_enum_value_minimal.ll"
+NS_ENUM_VALUE_O="$OUT_DIR/namespaced_enum_value_minimal.o"
 MULTI_SLICE_RETURN_LL="$OUT_DIR/multi_file_slice_return_minimal.ll"
 MULTI_SLICE_RETURN_O="$OUT_DIR/multi_file_slice_return_minimal.o"
 NS_SLICE_RETURN_LL="$OUT_DIR/namespaced_slice_return_minimal.ll"
@@ -252,6 +258,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 2 ]]; then
     echo "stage2 llvm smoke expected enum_minimal exit code 2, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_value_minimal.jiang" > "$ENUM_VALUE_LL"
+rg -q '^define i32 @main\(\)' "$ENUM_VALUE_LL"
+rg -q 'ret i32 42' "$ENUM_VALUE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ENUM_VALUE_LL" -o "$ENUM_VALUE_O"
+set +e
+"$LLVM_LLI" "$ENUM_VALUE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected enum_value_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -475,6 +494,19 @@ if [[ $STATUS -ne 1 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_enum_value_minimal.jiang" > "$MULTI_ENUM_VALUE_LL"
+rg -q 'store i64 7, ptr %mode' "$MULTI_ENUM_VALUE_LL"
+rg -q 'ret i32 %main.ret' "$MULTI_ENUM_VALUE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_ENUM_VALUE_LL" -o "$MULTI_ENUM_VALUE_O"
+set +e
+"$LLVM_LLI" "$MULTI_ENUM_VALUE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 7 ]]; then
+    echo "stage2 llvm smoke expected multi_file_enum_value_minimal exit code 7, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_enum_import_minimal.jiang" > "$NS_ENUM_LL"
 rg -q 'icmp eq i64' "$NS_ENUM_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_ENUM_LL" -o "$NS_ENUM_O"
@@ -484,6 +516,18 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 1 ]]; then
     echo "stage2 llvm smoke expected namespaced_enum_import_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_enum_value_minimal.jiang" > "$NS_ENUM_VALUE_LL"
+rg -q 'ret i32 3' "$NS_ENUM_VALUE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_ENUM_VALUE_LL" -o "$NS_ENUM_VALUE_O"
+set +e
+"$LLVM_LLI" "$NS_ENUM_VALUE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 3 ]]; then
+    echo "stage2 llvm smoke expected namespaced_enum_value_minimal exit code 3, got $STATUS" >&2
     exit 1
 fi
 
