@@ -2,6 +2,8 @@
 
 `compiler/` 现在是 Stage2 的正式主线目录，也是当前仓库里唯一继续演进的编译器主线。
 
+从仓库定位上看，当前仓库已经应按 **Stage2 主线仓库** 理解：`src/`、`bootstrap/` 和 seed 相关资产仍然存在，但它们已经退到 bootstrap、冷启动和历史回归职责。后续如果要把冷启动体系单独分仓，最自然的拆法是把 seed、bootstrap orchestration 和历史阶段整理到独立的 `jiang-bootstrap` 仓库，而当前仓库继续只承载 Stage2+ 主线。
+
 当前仓库中的目录分工固定为：
 
 - `src/`: 宿主 C 编译器
@@ -87,6 +89,7 @@ Stage2 替代 Stage1 的验收标准固定为：
 - `script/stage2_complete_smoke.sh` 持续通过
 - `script/stage1_complete_smoke.sh` 持续通过，不因 Stage2 演进被打断
 - `stage2c` 的 `emit-c` 与 `--emit-llvm` 都保持可用
+- `script/stage2_selfhost_smoke.sh` 能完成 `stage2c -> compiler/entries/compiler.jiang -> stage2c.selfhost -> stage2c.roundtrip` 的 roundtrip 验证
 - Stage2 已覆盖当前日常主语法子集：
   - 多模块与 `public`
   - `struct` / `enum`

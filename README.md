@@ -146,6 +146,7 @@ bash ./script/stage2_complete_smoke.sh
 - `compiler/`: 唯一继续演进的 Stage2 编译器主线
 
 当前仓库状态下，可以把 Stage2 视为“已完成首个正式可用版本”；后续演进继续围绕 `compiler/` 展开，而不是继续扩张 `bootstrap/`。
+当前仓库也应视为 **Stage2 主线仓库**：历史 C / Stage0、Stage1 和 seed 资产仍然保留在仓库中，但它们的职责已经收敛到 bootstrap、冷启动和回归验证。后续如果需要进一步解耦冷启动体系，可以把 seed、bootstrap orchestration 和历史阶段整理到单独的 `jiang-bootstrap` 仓库，而当前仓库继续只承担 Stage2+ 主线演进。
 
 ### Stage1c CLI
 

@@ -20,6 +20,7 @@
 - [x] 继续收紧 LLVM 与 C 后端的剩余差异（当前已收敛到维护级问题，由回归持续约束）
 - [x] 冻结 Stage1 的残余维护面，只保留 bootstrap 基线职责
 - [ ] 按 `doc/jiang.md` 收口 Stage2 语法对齐表，并按表推进剩余语法
+- [ ] 评估是否把 seed / bootstrap orchestration / 历史阶段拆到独立的 `jiang-bootstrap` 仓库
 - [ ] Stage3：开始规划包管理与后续 1.0 能力
 
 ## Stage2 与 `jiang.md` 对齐表
