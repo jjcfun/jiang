@@ -2,7 +2,7 @@
 
 `compiler/` 现在是 Stage2 的正式主线目录，也是当前仓库里唯一继续演进的编译器主线。
 
-从仓库定位上看，当前仓库已经应按 **Stage2 主线仓库** 理解：`src/`、`bootstrap/` 和 seed 相关资产仍然存在，但它们已经退到 bootstrap、冷启动和历史回归职责。后续如果要把冷启动体系单独分仓，最自然的拆法是把 seed、bootstrap orchestration 和历史阶段整理到独立的 `jiang-bootstrap` 仓库，而当前仓库继续只承载 Stage2+ 主线。
+从仓库定位上看，当前仓库已经应按 **Stage2 主线仓库** 理解：`src/`、`bootstrap/` 和历史 bootstrap 资产仍然存在，但它们已经退到 bootstrap、冷启动和历史回归职责。后续如果要把冷启动体系单独分仓，最自然的拆法是把 bootstrap orchestration 和历史阶段整理到独立的 `jiang-bootstrap` 仓库，而当前仓库继续只承载 Stage2+ 主线。
 
 当前仓库中的目录分工固定为：
 
@@ -44,11 +44,10 @@
 
 当前已经落地的能力：
 
-- `script/build_stage2.sh` 现在默认优先使用 seed C 冷启动，再由 seed 产出的 `stage2c.seed` 重编自身产出最终 `build/stage2c`
-- seed 来源优先级是：
-  - 环境变量 `STAGE2_SEED_C`
-  - 本地 `build/stage2_seed.c`
-  - 缺失时回退到 `stage1c -> stage2c.bootstrap -> stage2c`
+- `script/build_stage2.sh` 现在默认优先使用已有旧版 `stage2c` 作为 bootstrap compiler，并由它重编产出当前 `build/stage2c`
+- 当前开发阶段，这个“旧版 `stage2c`”默认就是本地上一次成功构建留下的 `build/stage2c`
+- 进入正式发布节奏后，这个“旧版 `stage2c`”应切换为“上一版 release 的 `stage2c`”
+- 当本地没有可用的旧版 `stage2c` 时，构建链会回退到 `stage1c -> stage2c.bootstrap -> stage2c`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
 - `build/stage2c` 已支持最小正式 CLI：默认 `emit-c`、显式 `--emit-c|--emit-llvm`、`--help`
 - Stage2 已具备：
@@ -85,7 +84,7 @@
 Stage2 替代 Stage1 的验收标准固定为：
 
 - `script/build_stage2.sh` 持续通过，且最终 `build/stage2c` 由 Stage2 自重编产出
-- `script/refresh_stage2_seed.sh` 可用当前 `build/stage2c` 刷新本地 seed；默认输出到 `build/stage2_seed.c`，也支持传入目标路径
+- 当前开发期默认依赖本地已有 `build/stage2c` 做 bootstrap；发布后再切到“上一版 release 的 `stage2c`”做 bootstrap compiler
 - `script/stage2_complete_smoke.sh` 持续通过
 - `script/stage1_complete_smoke.sh` 持续通过，不因 Stage2 演进被打断
 - `stage2c` 的 `emit-c` 与 `--emit-llvm` 都保持可用

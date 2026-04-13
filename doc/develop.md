@@ -147,7 +147,8 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 
 当前固定的接管标准是：
 
-*   `script/build_stage2.sh` 持续通过，且默认构建链已采用“本地或外部提供的 Stage2 seed -> Stage2 自重编”的冷启动路径；当 seed 缺失时仍可回退到 Stage1 引导
+*   `script/build_stage2.sh` 持续通过，且默认构建链已采用“已有旧版 Stage2 编译器 -> 当前 Stage2 自重编”的 bootstrap 路径；当本地没有可用旧版 `stage2c` 时仍可回退到 Stage1 引导
+*   当前开发阶段，“已有旧版 Stage2 编译器”默认指本地上一次成功构建保留下来的 `build/stage2c`；进入正式 release 节奏后，应切换为“上一版 release 的 `stage2c`”
 *   `script/stage2_complete_smoke.sh` 持续通过
 *   `script/stage1_complete_smoke.sh` 持续通过
 *   `script/stage2_selfhost_smoke.sh` 已固定 roundtrip：`stage2c -> compiler -> stage2c.selfhost -> stage2c.roundtrip`
@@ -163,8 +164,9 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 *   `compiler/` 已成为唯一继续演进的主线
 *   `bootstrap/` 已冻结为 Stage1 基线，只保留 bootstrap 与回归职责
 *   `stage2_complete_smoke.sh` 已成为 Stage2 单点验收入口
+*   Stage2 bootstrap 当前采用 Rust/Go 风格迭代策略：旧版 Stage2 编译器编译新版 Stage2，Stage1 仅保留历史兜底职责
 
-仓库定位也已经相应变化：当前仓库应视为 Stage2 主线仓库；`src/`、`bootstrap/` 与 seed 资产继续保留，但职责已经缩到 bootstrap、冷启动与历史回归。后续如果需要进一步清理主仓库历史负担，推荐把 seed、bootstrap orchestration 和历史阶段整理进单独的 `jiang-bootstrap` 仓库，而当前仓库继续只承载 Stage2+ 主线演进。
+仓库定位也已经相应变化：当前仓库应视为 Stage2 主线仓库；`src/`、`bootstrap/` 与历史 bootstrap 资产继续保留，但职责已经缩到 bootstrap、冷启动与历史回归。后续如果需要进一步清理主仓库历史负担，推荐把 bootstrap orchestration 和历史阶段整理进单独的 `jiang-bootstrap` 仓库，而当前仓库继续只承载 Stage2+ 主线演进。
 
 ### 已完成阶段：LLVM Spike / LLVM C API 路径
 

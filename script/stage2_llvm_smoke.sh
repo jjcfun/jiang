@@ -33,6 +33,8 @@ UNION_LL="$OUT_DIR/union_minimal.ll"
 UNION_O="$OUT_DIR/union_minimal.o"
 UNION_BIND_LL="$OUT_DIR/union_bind_minimal.ll"
 UNION_BIND_O="$OUT_DIR/union_bind_minimal.o"
+UNION_IF_PATTERN_LL="$OUT_DIR/union_if_pattern_minimal.ll"
+UNION_IF_PATTERN_O="$OUT_DIR/union_if_pattern_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -243,6 +245,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_bind_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_if_pattern_minimal.jiang" > "$UNION_IF_PATTERN_LL"
+rg -q 'if\.pattern\.tag' "$UNION_IF_PATTERN_LL"
+rg -q 'pattern\.bind' "$UNION_IF_PATTERN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_IF_PATTERN_LL" -o "$UNION_IF_PATTERN_O"
+set +e
+"$LLVM_LLI" "$UNION_IF_PATTERN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_if_pattern_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

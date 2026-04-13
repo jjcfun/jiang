@@ -42,6 +42,7 @@ OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_global_initializer_type
 OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_llvm_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_llvm_invalid_union_bind_void.log"
 OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_switch_non_exhaustive.log"
+OUT_UNION_PATTERN_NE_BIND_LOG="$BUILD_DIR/stage2_llvm_invalid_union_pattern_ne_bind.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -802,6 +803,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_union_switch_non_exhaustive" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_union_pattern_ne_bind.jiang" > "$OUT_UNION_PATTERN_NE_BIND_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_union_pattern_ne_bind to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_PATTERN_NE_BIND_LOG")" != *"union pattern binding requires == condition"* ]]; then
+    echo "stage2 llvm error smoke missing union pattern binding diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_UNION_PATTERN_NE_BIND_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_union_pattern_ne_bind" >&2
     exit 1
 fi
 
