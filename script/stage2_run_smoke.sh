@@ -101,6 +101,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/union_minimal.jiang" "union_minimal"
+set +e
+"$OUT_DIR/union_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/slice_length_minimal.jiang" "slice_length_minimal"
 set +e
 "$OUT_DIR/slice_length_minimal"

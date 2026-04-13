@@ -132,12 +132,12 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   `for`：当前已支持 range 与单变量容器迭代，尚未覆盖 `indexed()` 和解构
     *   `struct init`、可变字段、`init`
     *   枚举底层类型、`.ok` 一类简写
+    *   `union`：当前已支持最小声明、构造和基于 tag 的 `switch`，尚未覆盖 payload binding、简写构造与更完整布局语义
     *   更完整模块语义
 *   仍未开始：
     *   类型转换
     *   元组
-    *   `switch`：当前已支持最小 enum / Int case 与 `else:`，尚未覆盖 union / pattern
-    *   `union`
+    *   `switch`：当前已支持最小 Int / enum / union case 与 `else:`，尚未覆盖 pattern / 穷尽性检查
     *   模式匹配 / binding
     *   泛型
     *   `async`

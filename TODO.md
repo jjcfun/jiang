@@ -44,14 +44,14 @@
 - [ ] 结构体：已支持字段与构造式初始化，但未对齐 `init`、可变字段、值/引用统一语义
 - [ ] 枚举：已支持声明、成员引用、显式值和 `.value`，但未对齐底层类型、`.ok` 这类简写
 - [ ] `for`：已支持 range 与单变量容器迭代，尚未对齐索引迭代、解构迭代与 `indexed()`
+- [ ] `union`：已支持最小声明、构造和基于 tag 的 `switch`，尚未对齐 payload binding、简写构造与更完整布局语义
 - [ ] 模块：已支持 import / public / alias import / `alias` / `public alias`，但仍需继续对齐更完整模块语义
 
 ### 未开始或明确未对齐
 
 - [ ] 类型转换
 - [ ] 元组
-- [ ] `switch`：已支持最小 enum / Int case 与 `else:`，尚未对齐 union / pattern / 穷尽性检查
-- [ ] `union`
+- [ ] `switch`：已支持最小 Int / enum / union case 与 `else:`，尚未对齐 pattern / 穷尽性检查
 - [ ] 模式匹配 / binding
 - [ ] 泛型
 - [ ] `async`

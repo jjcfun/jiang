@@ -51,6 +51,7 @@ OUT_FOR_LOOP_VAR_TYPE_LOG="$BUILD_DIR/stage2_invalid_for_loop_var_type.log"
 OUT_FOR_ITERABLE_TARGET_LOG="$BUILD_DIR/stage2_invalid_for_iterable_target.log"
 OUT_SWITCH_CASE_TYPE_LOG="$BUILD_DIR/stage2_invalid_switch_case_type.log"
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
+OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_invalid_union_ctor_arg.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -756,6 +757,21 @@ fi
 
 if [[ "$(<"$OUT_GLOBAL_INIT_TYPE_LOG")" != *"global initializer type mismatch"* ]]; then
     echo "stage2 error smoke missing global initializer type mismatch diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_union_ctor_arg.jiang" > "$OUT_UNION_CTOR_ARG_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_union_ctor_arg to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_CTOR_ARG_LOG")" != *"argument type mismatch"* ]]; then
+    echo "stage2 error smoke missing union constructor argument type mismatch diagnostic" >&2
     exit 1
 fi
 

@@ -29,6 +29,8 @@ FOR_ITEM_ARRAY_LL="$OUT_DIR/for_item_array_minimal.ll"
 FOR_ITEM_ARRAY_O="$OUT_DIR/for_item_array_minimal.o"
 SWITCH_ENUM_LL="$OUT_DIR/switch_enum_minimal.ll"
 SWITCH_ENUM_O="$OUT_DIR/switch_enum_minimal.o"
+UNION_LL="$OUT_DIR/union_minimal.ll"
+UNION_O="$OUT_DIR/union_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -213,6 +215,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected switch_enum_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_minimal.jiang" > "$UNION_LL"
+rg -q '^%MyUnion = type \{ i64 \}' "$UNION_LL"
+rg -q 'switch\.union\.tag' "$UNION_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_LL" -o "$UNION_O"
+set +e
+"$LLVM_LLI" "$UNION_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
