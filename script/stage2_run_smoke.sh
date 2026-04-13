@@ -71,6 +71,26 @@ if [[ $STATUS -ne 8 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/for_infer_range_minimal.jiang" "for_infer_range_minimal"
+set +e
+"$OUT_DIR/for_infer_range_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 5 ]]; then
+    echo "stage2 run smoke expected for_infer_range_minimal exit code 5, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/for_item_array_minimal.jiang" "for_item_array_minimal"
+set +e
+"$OUT_DIR/for_item_array_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected for_item_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/switch_enum_minimal.jiang" "switch_enum_minimal"
 set +e
 "$OUT_DIR/switch_enum_minimal"

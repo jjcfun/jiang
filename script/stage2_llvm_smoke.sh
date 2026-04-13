@@ -23,6 +23,10 @@ BREAK_CONTINUE_LL="$OUT_DIR/break_continue_minimal.ll"
 BREAK_CONTINUE_O="$OUT_DIR/break_continue_minimal.o"
 FOR_RANGE_LL="$OUT_DIR/for_range_minimal.ll"
 FOR_RANGE_O="$OUT_DIR/for_range_minimal.o"
+FOR_INFER_RANGE_LL="$OUT_DIR/for_infer_range_minimal.ll"
+FOR_INFER_RANGE_O="$OUT_DIR/for_infer_range_minimal.o"
+FOR_ITEM_ARRAY_LL="$OUT_DIR/for_item_array_minimal.ll"
+FOR_ITEM_ARRAY_O="$OUT_DIR/for_item_array_minimal.o"
 SWITCH_ENUM_LL="$OUT_DIR/switch_enum_minimal.ll"
 SWITCH_ENUM_O="$OUT_DIR/switch_enum_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
@@ -167,6 +171,34 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 8 ]]; then
     echo "stage2 llvm smoke expected for_range_minimal exit code 8, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_infer_range_minimal.jiang" > "$FOR_INFER_RANGE_LL"
+rg -q '^define i32 @main\(\)' "$FOR_INFER_RANGE_LL"
+rg -q 'for\.cond' "$FOR_INFER_RANGE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_INFER_RANGE_LL" -o "$FOR_INFER_RANGE_O"
+set +e
+"$LLVM_LLI" "$FOR_INFER_RANGE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 5 ]]; then
+    echo "stage2 llvm smoke expected for_infer_range_minimal exit code 5, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_item_array_minimal.jiang" > "$FOR_ITEM_ARRAY_LL"
+rg -q '^define i32 @main\(\)' "$FOR_ITEM_ARRAY_LL"
+rg -q 'define i64 @.*sum_items\(\)' "$FOR_ITEM_ARRAY_LL"
+rg -q '%Slice_int64_t = type \{ ptr, i64 \}' "$FOR_ITEM_ARRAY_LL"
+rg -q 'extractvalue %Slice_int64_t .*?, 1' "$FOR_ITEM_ARRAY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_ITEM_ARRAY_LL" -o "$FOR_ITEM_ARRAY_O"
+set +e
+"$LLVM_LLI" "$FOR_ITEM_ARRAY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected for_item_array_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

@@ -34,6 +34,7 @@ OUT_ARRAY_RETURN_LENGTH_LOG="$BUILD_DIR/stage2_llvm_invalid_array_return_length.
 OUT_BREAK_OUTSIDE_LOOP_LOG="$BUILD_DIR/stage2_llvm_invalid_break_outside_loop.log"
 OUT_CONTINUE_OUTSIDE_LOOP_LOG="$BUILD_DIR/stage2_llvm_invalid_continue_outside_loop.log"
 OUT_FOR_LOOP_VAR_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_for_loop_var_type.log"
+OUT_FOR_ITERABLE_TARGET_LOG="$BUILD_DIR/stage2_llvm_invalid_for_iterable_target.log"
 OUT_SWITCH_CASE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_switch_case_type.log"
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_global_initializer_type.log"
 
@@ -636,6 +637,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_FOR_LOOP_VAR_TYPE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_loop_var_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_for_iterable_target.jiang" > "$OUT_FOR_ITERABLE_TARGET_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_for_iterable_target to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_FOR_ITERABLE_TARGET_LOG")" != *"for iterable must be array or slice"* ]]; then
+    echo "stage2 llvm error smoke missing for iterable target diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_FOR_ITERABLE_TARGET_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_iterable_target" >&2
     exit 1
 fi
 
