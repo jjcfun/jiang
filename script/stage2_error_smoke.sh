@@ -53,6 +53,7 @@ OUT_SWITCH_CASE_TYPE_LOG="$BUILD_DIR/stage2_invalid_switch_case_type.log"
 OUT_SWITCH_DUPLICATE_CASE_LOG="$BUILD_DIR/stage2_invalid_switch_duplicate_case.log"
 OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG="$BUILD_DIR/stage2_invalid_switch_non_exhaustive_enum.log"
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
+OUT_INFER_GLOBAL_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_global_missing_init.log"
 OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_invalid_union_bind_void.log"
 OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_invalid_union_switch_non_exhaustive.log"
@@ -792,6 +793,21 @@ fi
 
 if [[ "$(<"$OUT_GLOBAL_INIT_TYPE_LOG")" != *"global initializer type mismatch"* ]]; then
     echo "stage2 error smoke missing global initializer type mismatch diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_infer_global_missing_init.jiang" > "$OUT_INFER_GLOBAL_MISSING_INIT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_infer_global_missing_init to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_INFER_GLOBAL_MISSING_INIT_LOG")" != *"inferred global requires initializer"* ]]; then
+    echo "stage2 error smoke missing inferred global initializer diagnostic" >&2
     exit 1
 fi
 

@@ -132,6 +132,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   `for`：当前已支持 range 与单变量容器迭代，尚未覆盖 `indexed()` 和解构
     *   `struct init`、可变字段、`init`
     *   枚举底层类型、`.ok` 一类简写
+    *   类型推断：当前已支持 `_ x = expr` 的局部/全局声明推断，尚未覆盖 expected-type 简写与 tuple/binding 推断
     *   `union`：当前已支持最小声明、构造、payload binding 和带穷尽性检查的 `switch`，尚未覆盖简写构造、多值解构与更完整布局语义
     *   更完整模块语义
 *   仍未开始：

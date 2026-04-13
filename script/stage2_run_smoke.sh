@@ -271,6 +271,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/infer_local_minimal.jiang" "infer_local_minimal"
+set +e
+"$OUT_DIR/infer_local_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected infer_local_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/infer_global_minimal.jiang" "infer_global_minimal"
+set +e
+"$OUT_DIR/infer_global_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected infer_global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/uint8_array_string_minimal.jiang" "uint8_array_string_minimal"
 set +e
 "$OUT_DIR/uint8_array_string_minimal"
