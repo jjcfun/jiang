@@ -31,6 +31,8 @@ SWITCH_ENUM_LL="$OUT_DIR/switch_enum_minimal.ll"
 SWITCH_ENUM_O="$OUT_DIR/switch_enum_minimal.o"
 UNION_LL="$OUT_DIR/union_minimal.ll"
 UNION_O="$OUT_DIR/union_minimal.o"
+UNION_BIND_LL="$OUT_DIR/union_bind_minimal.ll"
+UNION_BIND_O="$OUT_DIR/union_bind_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -219,7 +221,7 @@ if [[ $STATUS -ne 42 ]]; then
 fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_minimal.jiang" > "$UNION_LL"
-rg -q '^%MyUnion = type \{ i64 \}' "$UNION_LL"
+rg -q '^%MyUnion = type \{ i64, i64, i64 \}' "$UNION_LL"
 rg -q 'switch\.union\.tag' "$UNION_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_LL" -o "$UNION_O"
 set +e
@@ -228,6 +230,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_bind_minimal.jiang" > "$UNION_BIND_LL"
+rg -q '^%MyUnion = type \{ i64, i64, i64, i8 \}' "$UNION_BIND_LL"
+rg -q 'union\.payload' "$UNION_BIND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_BIND_LL" -o "$UNION_BIND_O"
+set +e
+"$LLVM_LLI" "$UNION_BIND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_bind_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
