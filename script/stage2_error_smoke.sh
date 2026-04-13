@@ -50,9 +50,12 @@ OUT_CONTINUE_OUTSIDE_LOOP_LOG="$BUILD_DIR/stage2_invalid_continue_outside_loop.l
 OUT_FOR_LOOP_VAR_TYPE_LOG="$BUILD_DIR/stage2_invalid_for_loop_var_type.log"
 OUT_FOR_ITERABLE_TARGET_LOG="$BUILD_DIR/stage2_invalid_for_iterable_target.log"
 OUT_SWITCH_CASE_TYPE_LOG="$BUILD_DIR/stage2_invalid_switch_case_type.log"
+OUT_SWITCH_DUPLICATE_CASE_LOG="$BUILD_DIR/stage2_invalid_switch_duplicate_case.log"
+OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG="$BUILD_DIR/stage2_invalid_switch_non_exhaustive_enum.log"
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
 OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_invalid_union_bind_void.log"
+OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_invalid_union_switch_non_exhaustive.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -747,6 +750,36 @@ if [[ "$(<"$OUT_SWITCH_CASE_TYPE_LOG")" != *"switch case type mismatch"* ]]; the
 fi
 
 set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_switch_duplicate_case.jiang" > "$OUT_SWITCH_DUPLICATE_CASE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_switch_duplicate_case to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_SWITCH_DUPLICATE_CASE_LOG")" != *"duplicate switch case"* ]]; then
+    echo "stage2 error smoke missing duplicate switch case diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_switch_non_exhaustive_enum.jiang" > "$OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_switch_non_exhaustive_enum to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG")" != *"non-exhaustive switch"* ]]; then
+    echo "stage2 error smoke missing non-exhaustive enum switch diagnostic" >&2
+    exit 1
+fi
+
+set +e
 "$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_global_initializer_type.jiang" > "$OUT_GLOBAL_INIT_TYPE_LOG"
 STATUS=$?
 set -e
@@ -788,6 +821,21 @@ fi
 
 if [[ "$(<"$OUT_UNION_BIND_VOID_LOG")" != *"union case has no payload"* ]]; then
     echo "stage2 error smoke missing union bind void diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_union_switch_non_exhaustive.jiang" > "$OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_union_switch_non_exhaustive to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG")" != *"non-exhaustive switch"* ]]; then
+    echo "stage2 error smoke missing non-exhaustive union switch diagnostic" >&2
     exit 1
 fi
 
