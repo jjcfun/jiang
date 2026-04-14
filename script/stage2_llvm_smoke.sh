@@ -31,8 +31,12 @@ SWITCH_ENUM_LL="$OUT_DIR/switch_enum_minimal.ll"
 SWITCH_ENUM_O="$OUT_DIR/switch_enum_minimal.o"
 ENUM_SWITCH_SHORTHAND_LL="$OUT_DIR/enum_switch_shorthand_minimal.ll"
 ENUM_SWITCH_SHORTHAND_O="$OUT_DIR/enum_switch_shorthand_minimal.o"
+STRUCT_ENUM_FIELD_SHORTHAND_LL="$OUT_DIR/struct_enum_field_shorthand_minimal.ll"
+STRUCT_ENUM_FIELD_SHORTHAND_O="$OUT_DIR/struct_enum_field_shorthand_minimal.o"
 ENUM_SHORTHAND_LL="$OUT_DIR/enum_shorthand_minimal.ll"
 ENUM_SHORTHAND_O="$OUT_DIR/enum_shorthand_minimal.o"
+ENUM_SHORTHAND_ARG_LL="$OUT_DIR/enum_shorthand_arg_minimal.ll"
+ENUM_SHORTHAND_ARG_O="$OUT_DIR/enum_shorthand_arg_minimal.o"
 UNION_LL="$OUT_DIR/union_minimal.ll"
 UNION_O="$OUT_DIR/union_minimal.o"
 UNION_SHORTHAND_LL="$OUT_DIR/union_shorthand_minimal.ll"
@@ -45,6 +49,8 @@ UNION_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_if_shorthand_pattern_minimal.ll"
 UNION_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_if_shorthand_pattern_minimal.o"
 UNION_SWITCH_SHORTHAND_PATTERN_LL="$OUT_DIR/union_switch_shorthand_pattern_minimal.ll"
 UNION_SWITCH_SHORTHAND_PATTERN_O="$OUT_DIR/union_switch_shorthand_pattern_minimal.o"
+STRUCT_UNION_FIELD_SHORTHAND_LL="$OUT_DIR/struct_union_field_shorthand_minimal.ll"
+STRUCT_UNION_FIELD_SHORTHAND_O="$OUT_DIR/struct_union_field_shorthand_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -105,10 +111,20 @@ NS_STRUCT_ARRAY_LL="$OUT_DIR/namespaced_struct_array_minimal.ll"
 NS_STRUCT_ARRAY_O="$OUT_DIR/namespaced_struct_array_minimal.o"
 MULTI_ENUM_LL="$OUT_DIR/multi_file_enum_minimal.ll"
 MULTI_ENUM_O="$OUT_DIR/multi_file_enum_minimal.o"
+MULTI_ENUM_SHORTHAND_LL="$OUT_DIR/multi_file_enum_shorthand_minimal.ll"
+MULTI_ENUM_SHORTHAND_O="$OUT_DIR/multi_file_enum_shorthand_minimal.o"
+MULTI_ENUM_SHORTHAND_ARG_LL="$OUT_DIR/multi_file_enum_shorthand_arg_minimal.ll"
+MULTI_ENUM_SHORTHAND_ARG_O="$OUT_DIR/multi_file_enum_shorthand_arg_minimal.o"
+MULTI_ENUM_FIELD_SHORTHAND_LL="$OUT_DIR/multi_file_enum_field_shorthand_minimal.ll"
+MULTI_ENUM_FIELD_SHORTHAND_O="$OUT_DIR/multi_file_enum_field_shorthand_minimal.o"
 MULTI_ENUM_VALUE_LL="$OUT_DIR/multi_file_enum_value_minimal.ll"
 MULTI_ENUM_VALUE_O="$OUT_DIR/multi_file_enum_value_minimal.o"
 NS_ENUM_LL="$OUT_DIR/namespaced_enum_import_minimal.ll"
 NS_ENUM_O="$OUT_DIR/namespaced_enum_import_minimal.o"
+NS_ENUM_SHORTHAND_LL="$OUT_DIR/namespaced_enum_shorthand_minimal.ll"
+NS_ENUM_SHORTHAND_O="$OUT_DIR/namespaced_enum_shorthand_minimal.o"
+NS_ENUM_FIELD_SHORTHAND_LL="$OUT_DIR/namespaced_enum_field_shorthand_minimal.ll"
+NS_ENUM_FIELD_SHORTHAND_O="$OUT_DIR/namespaced_enum_field_shorthand_minimal.o"
 NS_ENUM_VALUE_LL="$OUT_DIR/namespaced_enum_value_minimal.ll"
 NS_ENUM_VALUE_O="$OUT_DIR/namespaced_enum_value_minimal.o"
 MULTI_SLICE_RETURN_LL="$OUT_DIR/multi_file_slice_return_minimal.ll"
@@ -249,6 +265,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_shorthand_arg_minimal.jiang" > "$ENUM_SHORTHAND_ARG_LL"
+rg -q '^define i32 @main\(\)' "$ENUM_SHORTHAND_ARG_LL"
+rg -q 'HttpStatus_ok' "$ENUM_SHORTHAND_ARG_LL" || rg -q 'i64 42' "$ENUM_SHORTHAND_ARG_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ENUM_SHORTHAND_ARG_LL" -o "$ENUM_SHORTHAND_ARG_O"
+set +e
+"$LLVM_LLI" "$ENUM_SHORTHAND_ARG_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected enum_shorthand_arg_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_switch_shorthand_minimal.jiang" > "$ENUM_SWITCH_SHORTHAND_LL"
 rg -q '^define i32 @main\(\)' "$ENUM_SWITCH_SHORTHAND_LL"
 rg -q 'Priority_medium' "$ENUM_SWITCH_SHORTHAND_LL" || rg -q 'i64 42' "$ENUM_SWITCH_SHORTHAND_LL"
@@ -259,6 +288,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected enum_switch_shorthand_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_enum_field_shorthand_minimal.jiang" > "$STRUCT_ENUM_FIELD_SHORTHAND_LL"
+rg -q '^%Config = type \{ i64 \}' "$STRUCT_ENUM_FIELD_SHORTHAND_LL"
+rg -q 'Priority_medium' "$STRUCT_ENUM_FIELD_SHORTHAND_LL" || rg -q 'i64 42' "$STRUCT_ENUM_FIELD_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_ENUM_FIELD_SHORTHAND_LL" -o "$STRUCT_ENUM_FIELD_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$STRUCT_ENUM_FIELD_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_enum_field_shorthand_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -337,6 +379,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_switch_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_union_field_shorthand_minimal.jiang" > "$STRUCT_UNION_FIELD_SHORTHAND_LL"
+rg -q '^%Box = type \{ %MyUnion \}' "$STRUCT_UNION_FIELD_SHORTHAND_LL"
+rg -q 'union\.payload' "$STRUCT_UNION_FIELD_SHORTHAND_LL"
+rg -q 'i64 42' "$STRUCT_UNION_FIELD_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_UNION_FIELD_SHORTHAND_LL" -o "$STRUCT_UNION_FIELD_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$STRUCT_UNION_FIELD_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_union_field_shorthand_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -699,6 +755,46 @@ if [[ $STATUS -ne 1 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_enum_shorthand_minimal.jiang" > "$MULTI_ENUM_SHORTHAND_LL"
+rg -q 'icmp eq i64' "$MULTI_ENUM_SHORTHAND_LL"
+rg -q 'Mode_read' "$MULTI_ENUM_SHORTHAND_LL" || rg -q 'i64 0' "$MULTI_ENUM_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_ENUM_SHORTHAND_LL" -o "$MULTI_ENUM_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$MULTI_ENUM_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 llvm smoke expected multi_file_enum_shorthand_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_enum_shorthand_arg_minimal.jiang" > "$MULTI_ENUM_SHORTHAND_ARG_LL"
+rg -q '^define i64 @code\(i64 %0\)' "$MULTI_ENUM_SHORTHAND_ARG_LL"
+rg -q 'call i64 @code\(i64 0\)' "$MULTI_ENUM_SHORTHAND_ARG_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_ENUM_SHORTHAND_ARG_LL" -o "$MULTI_ENUM_SHORTHAND_ARG_O"
+set +e
+"$LLVM_LLI" "$MULTI_ENUM_SHORTHAND_ARG_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 llvm smoke expected multi_file_enum_shorthand_arg_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_enum_field_shorthand_minimal.jiang" > "$MULTI_ENUM_FIELD_SHORTHAND_LL"
+rg -q '^%Config = type \{ i64 \}' "$MULTI_ENUM_FIELD_SHORTHAND_LL"
+rg -q 'store %Config zeroinitializer' "$MULTI_ENUM_FIELD_SHORTHAND_LL"
+rg -q 'icmp eq i64 %fieldtmp, 0' "$MULTI_ENUM_FIELD_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MULTI_ENUM_FIELD_SHORTHAND_LL" -o "$MULTI_ENUM_FIELD_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$MULTI_ENUM_FIELD_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 llvm smoke expected multi_file_enum_field_shorthand_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/multi_file_enum_value_minimal.jiang" > "$MULTI_ENUM_VALUE_LL"
 rg -q 'store i64 7, ptr %mode' "$MULTI_ENUM_VALUE_LL"
 rg -q 'ret i32 %main.ret' "$MULTI_ENUM_VALUE_LL"
@@ -721,6 +817,33 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 1 ]]; then
     echo "stage2 llvm smoke expected namespaced_enum_import_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_enum_shorthand_minimal.jiang" > "$NS_ENUM_SHORTHAND_LL"
+rg -q 'icmp eq i64' "$NS_ENUM_SHORTHAND_LL"
+rg -q 'Mode_read' "$NS_ENUM_SHORTHAND_LL" || rg -q 'i64 0' "$NS_ENUM_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_ENUM_SHORTHAND_LL" -o "$NS_ENUM_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$NS_ENUM_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 llvm smoke expected namespaced_enum_shorthand_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/namespaced_enum_field_shorthand_minimal.jiang" > "$NS_ENUM_FIELD_SHORTHAND_LL"
+rg -q '^%Config = type \{ i64 \}' "$NS_ENUM_FIELD_SHORTHAND_LL"
+rg -q 'store %Config zeroinitializer' "$NS_ENUM_FIELD_SHORTHAND_LL"
+rg -q 'icmp eq i64 %fieldtmp, 0' "$NS_ENUM_FIELD_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$NS_ENUM_FIELD_SHORTHAND_LL" -o "$NS_ENUM_FIELD_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$NS_ENUM_FIELD_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 llvm smoke expected namespaced_enum_field_shorthand_minimal exit code 1, got $STATUS" >&2
     exit 1
 fi
 

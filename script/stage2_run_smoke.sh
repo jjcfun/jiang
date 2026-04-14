@@ -111,6 +111,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/enum_shorthand_arg_minimal.jiang" "enum_shorthand_arg_minimal"
+set +e
+"$OUT_DIR/enum_shorthand_arg_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected enum_shorthand_arg_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/enum_switch_shorthand_minimal.jiang" "enum_switch_shorthand_minimal"
 set +e
 "$OUT_DIR/enum_switch_shorthand_minimal"
@@ -118,6 +128,66 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 run smoke expected enum_switch_shorthand_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_enum_field_shorthand_minimal.jiang" "struct_enum_field_shorthand_minimal"
+set +e
+"$OUT_DIR/struct_enum_field_shorthand_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_enum_field_shorthand_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/multi_file_enum_shorthand_minimal.jiang" "multi_file_enum_shorthand_minimal"
+set +e
+"$OUT_DIR/multi_file_enum_shorthand_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected multi_file_enum_shorthand_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/multi_file_enum_shorthand_arg_minimal.jiang" "multi_file_enum_shorthand_arg_minimal"
+set +e
+"$OUT_DIR/multi_file_enum_shorthand_arg_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected multi_file_enum_shorthand_arg_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/multi_file_enum_field_shorthand_minimal.jiang" "multi_file_enum_field_shorthand_minimal"
+set +e
+"$OUT_DIR/multi_file_enum_field_shorthand_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected multi_file_enum_field_shorthand_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_enum_shorthand_minimal.jiang" "namespaced_enum_shorthand_minimal"
+set +e
+"$OUT_DIR/namespaced_enum_shorthand_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected namespaced_enum_shorthand_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/namespaced_enum_field_shorthand_minimal.jiang" "namespaced_enum_field_shorthand_minimal"
+set +e
+"$OUT_DIR/namespaced_enum_field_shorthand_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected namespaced_enum_field_shorthand_minimal exit code 1, got $STATUS" >&2
     exit 1
 fi
 
@@ -178,6 +248,16 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 run smoke expected union_switch_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_union_field_shorthand_minimal.jiang" "struct_union_field_shorthand_minimal"
+set +e
+"$OUT_DIR/struct_union_field_shorthand_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_union_field_shorthand_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
