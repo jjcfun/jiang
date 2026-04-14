@@ -57,6 +57,8 @@ OUT_INFER_GLOBAL_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_global_missin
 OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_invalid_infer_shorthand_without_expected.log"
 OUT_VOID_KEYWORD_TYPE_LOG="$BUILD_DIR/stage2_invalid_void_keyword_type.log"
 OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_invalid_empty_tuple_return_non_void.log"
+OUT_TUPLE_DESTRUCTURE_ARITY_LOG="$BUILD_DIR/stage2_invalid_tuple_destructure_arity.log"
+OUT_TUPLE_DESTRUCTURE_RHS_LOG="$BUILD_DIR/stage2_invalid_tuple_destructure_rhs.log"
 OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_invalid_union_bind_void.log"
 OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_invalid_union_switch_non_exhaustive.log"
@@ -856,6 +858,36 @@ fi
 
 if [[ "$(<"$OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG")" != *"return type mismatch"* ]]; then
     echo "stage2 error smoke missing empty tuple return mismatch diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_tuple_destructure_arity.jiang" > "$OUT_TUPLE_DESTRUCTURE_ARITY_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_tuple_destructure_arity to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TUPLE_DESTRUCTURE_ARITY_LOG")" != *"tuple destructuring arity mismatch"* ]]; then
+    echo "stage2 error smoke missing tuple destructuring arity diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_tuple_destructure_rhs.jiang" > "$OUT_TUPLE_DESTRUCTURE_RHS_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_tuple_destructure_rhs to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TUPLE_DESTRUCTURE_RHS_LOG")" != *"tuple destructuring currently requires tuple literal"* ]]; then
+    echo "stage2 error smoke missing tuple destructuring rhs diagnostic" >&2
     exit 1
 fi
 

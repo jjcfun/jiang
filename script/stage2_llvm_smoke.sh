@@ -159,6 +159,10 @@ UNARY_TUPLE_LOCAL_LL="$OUT_DIR/unary_tuple_local_decl_minimal.ll"
 UNARY_TUPLE_LOCAL_O="$OUT_DIR/unary_tuple_local_decl_minimal.o"
 UNARY_TUPLE_INFER_LOCAL_LL="$OUT_DIR/unary_tuple_infer_local_decl_minimal.ll"
 UNARY_TUPLE_INFER_LOCAL_O="$OUT_DIR/unary_tuple_infer_local_decl_minimal.o"
+TUPLE_DESTRUCTURE_LL="$OUT_DIR/tuple_destructure_minimal.ll"
+TUPLE_DESTRUCTURE_O="$OUT_DIR/tuple_destructure_minimal.o"
+TUPLE_DESTRUCTURE_INFER_LL="$OUT_DIR/tuple_destructure_infer_minimal.ll"
+TUPLE_DESTRUCTURE_INFER_O="$OUT_DIR/tuple_destructure_infer_minimal.o"
 INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
@@ -1071,6 +1075,34 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected unary_tuple_infer_local_decl_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_destructure_minimal.jiang" > "$TUPLE_DESTRUCTURE_LL"
+rg -q '^define i32 @main\(\)' "$TUPLE_DESTRUCTURE_LL"
+rg -q 'store i64 40' "$TUPLE_DESTRUCTURE_LL"
+rg -q 'store i64 2' "$TUPLE_DESTRUCTURE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_DESTRUCTURE_LL" -o "$TUPLE_DESTRUCTURE_O"
+set +e
+"$LLVM_LLI" "$TUPLE_DESTRUCTURE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_destructure_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_destructure_infer_minimal.jiang" > "$TUPLE_DESTRUCTURE_INFER_LL"
+rg -q '^define i32 @main\(\)' "$TUPLE_DESTRUCTURE_INFER_LL"
+rg -q 'store i64 40' "$TUPLE_DESTRUCTURE_INFER_LL"
+rg -q 'store i64 2' "$TUPLE_DESTRUCTURE_INFER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_DESTRUCTURE_INFER_LL" -o "$TUPLE_DESTRUCTURE_INFER_O"
+set +e
+"$LLVM_LLI" "$TUPLE_DESTRUCTURE_INFER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_destructure_infer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
