@@ -61,16 +61,6 @@ if [[ $STATUS -ne 0 ]]; then
     exit 1
 fi
 
-compile_stage2_entry "compiler/tests/samples/void_empty_tuple_return_minimal.jiang" "void_empty_tuple_return_minimal"
-set +e
-"$OUT_DIR/void_empty_tuple_return_minimal"
-STATUS=$?
-set -e
-if [[ $STATUS -ne 0 ]]; then
-    echo "stage2 run smoke expected void_empty_tuple_return_minimal exit code 0, got $STATUS" >&2
-    exit 1
-fi
-
 compile_stage2_entry "compiler/tests/samples/empty_tuple_bare_return_minimal.jiang" "empty_tuple_bare_return_minimal"
 set +e
 "$OUT_DIR/empty_tuple_bare_return_minimal"

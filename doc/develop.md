@@ -90,7 +90,7 @@ Jiang 目前采用循序渐进的路线：
 *   [x] 收口 `stage2_complete_smoke.sh` 作为 Stage2 单点验收入口
 *   [x] 完成 slice / 字符串表达式主线
 *   [x] 完成数组与聚合类型第一版
-*   [x] 完成 builtin / named / 复合类型第一版（`Int` / `Bool` / `Void` / `UInt8`、`struct` / `enum`、array / slice / pointer）
+*   [x] 完成 builtin / named / 复合类型第一版（`Int` / `Bool` / `()` / `UInt8`、`struct` / `enum`、array / slice / pointer）
 *   [x] 让 LLVM 后端在代表性 Stage2 样例上与 C 后端建立对齐回归
 *   [x] 继续收紧 `unknown` 容忍路径
 *   [x] 继续加强聚合类型在多模块、赋值、参数、返回值场景下的一致性
@@ -120,7 +120,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 *   已基本对齐：
     *   基本命令式函数
     *   `if / else`、`while`
-    *   `Int` / `Bool` / `Void` / `UInt8`
+    *   `Int` / `Bool` / `()` / `UInt8`
     *   `struct` / `enum`
     *   array / slice / pointer 第一版
     *   多模块、`public`、alias import、导出表

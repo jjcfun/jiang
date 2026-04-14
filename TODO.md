@@ -30,7 +30,7 @@
 
 - [x] 基本命令式函数：函数定义、参数、`return`、调用
 - [x] 基本控制流：`if / else`、`while`
-- [x] 基本类型：`Int`、`Bool`、`Void`、`UInt8`
+- [x] 基本类型：`Int`、`Bool`、`()`, `UInt8`
 - [x] 基本聚合：`struct`、`enum`
 - [x] 数组、slice、pointer 第一版
 - [x] 多模块、`public`、alias import、导出表
@@ -103,7 +103,7 @@
 
 ### 3. 类型系统第一版
 
-- [x] 完成 builtin type：`Int` / `Bool` / `Void` / `UInt8`
+- [x] 完成 builtin type：`Int` / `Bool` / `()` / `UInt8`
 - [x] 完成命名类型：`struct` / `enum`
 - [x] 完成复合类型：array / slice / pointer
 - [x] 完成赋值类型检查
