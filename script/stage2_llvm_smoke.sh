@@ -29,12 +29,22 @@ FOR_ITEM_ARRAY_LL="$OUT_DIR/for_item_array_minimal.ll"
 FOR_ITEM_ARRAY_O="$OUT_DIR/for_item_array_minimal.o"
 SWITCH_ENUM_LL="$OUT_DIR/switch_enum_minimal.ll"
 SWITCH_ENUM_O="$OUT_DIR/switch_enum_minimal.o"
+ENUM_SWITCH_SHORTHAND_LL="$OUT_DIR/enum_switch_shorthand_minimal.ll"
+ENUM_SWITCH_SHORTHAND_O="$OUT_DIR/enum_switch_shorthand_minimal.o"
+ENUM_SHORTHAND_LL="$OUT_DIR/enum_shorthand_minimal.ll"
+ENUM_SHORTHAND_O="$OUT_DIR/enum_shorthand_minimal.o"
 UNION_LL="$OUT_DIR/union_minimal.ll"
 UNION_O="$OUT_DIR/union_minimal.o"
+UNION_SHORTHAND_LL="$OUT_DIR/union_shorthand_minimal.ll"
+UNION_SHORTHAND_O="$OUT_DIR/union_shorthand_minimal.o"
 UNION_BIND_LL="$OUT_DIR/union_bind_minimal.ll"
 UNION_BIND_O="$OUT_DIR/union_bind_minimal.o"
 UNION_IF_PATTERN_LL="$OUT_DIR/union_if_pattern_minimal.ll"
 UNION_IF_PATTERN_O="$OUT_DIR/union_if_pattern_minimal.o"
+UNION_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_if_shorthand_pattern_minimal.ll"
+UNION_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_if_shorthand_pattern_minimal.o"
+UNION_SWITCH_SHORTHAND_PATTERN_LL="$OUT_DIR/union_switch_shorthand_pattern_minimal.ll"
+UNION_SWITCH_SHORTHAND_PATTERN_O="$OUT_DIR/union_switch_shorthand_pattern_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
 UINT8_O="$OUT_DIR/uint8_minimal.o"
 UINT8_SLICE_LL="$OUT_DIR/uint8_slice_minimal.ll"
@@ -226,6 +236,32 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_shorthand_minimal.jiang" > "$ENUM_SHORTHAND_LL"
+rg -q '^define i32 @main\(\)' "$ENUM_SHORTHAND_LL"
+rg -q 'ret i64 42' "$ENUM_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ENUM_SHORTHAND_LL" -o "$ENUM_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$ENUM_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected enum_shorthand_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_switch_shorthand_minimal.jiang" > "$ENUM_SWITCH_SHORTHAND_LL"
+rg -q '^define i32 @main\(\)' "$ENUM_SWITCH_SHORTHAND_LL"
+rg -q 'Priority_medium' "$ENUM_SWITCH_SHORTHAND_LL" || rg -q 'i64 42' "$ENUM_SWITCH_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ENUM_SWITCH_SHORTHAND_LL" -o "$ENUM_SWITCH_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$ENUM_SWITCH_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected enum_switch_shorthand_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_minimal.jiang" > "$UNION_LL"
 rg -q '^%MyUnion = type \{ i64, i64, i64 \}' "$UNION_LL"
 rg -q 'switch\.union\.tag' "$UNION_LL"
@@ -236,6 +272,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_shorthand_minimal.jiang" > "$UNION_SHORTHAND_LL"
+rg -q '^%MyUnion = type ' "$UNION_SHORTHAND_LL"
+rg -q 'i64 42' "$UNION_SHORTHAND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_SHORTHAND_LL" -o "$UNION_SHORTHAND_O"
+set +e
+"$LLVM_LLI" "$UNION_SHORTHAND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_shorthand_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -262,6 +311,32 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_if_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_if_shorthand_pattern_minimal.jiang" > "$UNION_IF_SHORTHAND_PATTERN_LL"
+rg -q 'if\.pattern\.tag' "$UNION_IF_SHORTHAND_PATTERN_LL"
+rg -q 'pattern\.bind' "$UNION_IF_SHORTHAND_PATTERN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_IF_SHORTHAND_PATTERN_LL" -o "$UNION_IF_SHORTHAND_PATTERN_O"
+set +e
+"$LLVM_LLI" "$UNION_IF_SHORTHAND_PATTERN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_if_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_switch_shorthand_pattern_minimal.jiang" > "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
+rg -q 'switch\.union\.tag' "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
+rg -q 'union\.payload' "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_SWITCH_SHORTHAND_PATTERN_LL" -o "$UNION_SWITCH_SHORTHAND_PATTERN_O"
+set +e
+"$LLVM_LLI" "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_switch_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
