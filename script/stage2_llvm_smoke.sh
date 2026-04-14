@@ -163,6 +163,8 @@ TUPLE_DESTRUCTURE_LL="$OUT_DIR/tuple_destructure_minimal.ll"
 TUPLE_DESTRUCTURE_O="$OUT_DIR/tuple_destructure_minimal.o"
 TUPLE_DESTRUCTURE_INFER_LL="$OUT_DIR/tuple_destructure_infer_minimal.ll"
 TUPLE_DESTRUCTURE_INFER_O="$OUT_DIR/tuple_destructure_infer_minimal.o"
+TUPLE_DESTRUCTURE_GLOBAL_LL="$OUT_DIR/tuple_destructure_global_minimal.ll"
+TUPLE_DESTRUCTURE_GLOBAL_O="$OUT_DIR/tuple_destructure_global_minimal.o"
 INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
@@ -1103,6 +1105,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected tuple_destructure_infer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_destructure_global_minimal.jiang" > "$TUPLE_DESTRUCTURE_GLOBAL_LL"
+rg -q '^@left = global i64 40$' "$TUPLE_DESTRUCTURE_GLOBAL_LL"
+rg -q '^@right = global i64 2$' "$TUPLE_DESTRUCTURE_GLOBAL_LL"
+rg -q '^define i32 @main\(\)' "$TUPLE_DESTRUCTURE_GLOBAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_DESTRUCTURE_GLOBAL_LL" -o "$TUPLE_DESTRUCTURE_GLOBAL_O"
+set +e
+"$LLVM_LLI" "$TUPLE_DESTRUCTURE_GLOBAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_destructure_global_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

@@ -481,6 +481,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/tuple_destructure_global_minimal.jiang" "tuple_destructure_global_minimal"
+set +e
+"$OUT_DIR/tuple_destructure_global_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected tuple_destructure_global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/infer_global_minimal.jiang" "infer_global_minimal"
 set +e
 "$OUT_DIR/infer_global_minimal"
