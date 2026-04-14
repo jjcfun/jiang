@@ -161,6 +161,12 @@ UNARY_TUPLE_INFER_LOCAL_LL="$OUT_DIR/unary_tuple_infer_local_decl_minimal.ll"
 UNARY_TUPLE_INFER_LOCAL_O="$OUT_DIR/unary_tuple_infer_local_decl_minimal.o"
 INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
+VOID_EMPTY_TUPLE_RETURN_LL="$OUT_DIR/void_empty_tuple_return_minimal.ll"
+VOID_EMPTY_TUPLE_RETURN_O="$OUT_DIR/void_empty_tuple_return_minimal.o"
+EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
+EMPTY_TUPLE_RETURN_O="$OUT_DIR/empty_tuple_return_minimal.o"
+EMPTY_TUPLE_BARE_RETURN_LL="$OUT_DIR/empty_tuple_bare_return_minimal.ll"
+EMPTY_TUPLE_BARE_RETURN_O="$OUT_DIR/empty_tuple_bare_return_minimal.o"
 UNARY_TUPLE_RETURN_LL="$OUT_DIR/unary_tuple_return_minimal.ll"
 UNARY_TUPLE_RETURN_O="$OUT_DIR/unary_tuple_return_minimal.o"
 
@@ -1080,6 +1086,48 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected infer_global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/void_empty_tuple_return_minimal.jiang" > "$VOID_EMPTY_TUPLE_RETURN_LL"
+rg -q '^define void @noop\(\)' "$VOID_EMPTY_TUPLE_RETURN_LL"
+rg -q 'ret void' "$VOID_EMPTY_TUPLE_RETURN_LL"
+rg -q 'call void @noop\(\)' "$VOID_EMPTY_TUPLE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$VOID_EMPTY_TUPLE_RETURN_LL" -o "$VOID_EMPTY_TUPLE_RETURN_O"
+set +e
+"$LLVM_LLI" "$VOID_EMPTY_TUPLE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 0 ]]; then
+    echo "stage2 llvm smoke expected void_empty_tuple_return_minimal exit code 0, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/empty_tuple_return_minimal.jiang" > "$EMPTY_TUPLE_RETURN_LL"
+rg -q '^define void @noop\(\)' "$EMPTY_TUPLE_RETURN_LL"
+rg -q 'ret void' "$EMPTY_TUPLE_RETURN_LL"
+rg -q 'call void @noop\(\)' "$EMPTY_TUPLE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$EMPTY_TUPLE_RETURN_LL" -o "$EMPTY_TUPLE_RETURN_O"
+set +e
+"$LLVM_LLI" "$EMPTY_TUPLE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 0 ]]; then
+    echo "stage2 llvm smoke expected empty_tuple_return_minimal exit code 0, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/empty_tuple_bare_return_minimal.jiang" > "$EMPTY_TUPLE_BARE_RETURN_LL"
+rg -q '^define void @noop\(\)' "$EMPTY_TUPLE_BARE_RETURN_LL"
+rg -q 'ret void' "$EMPTY_TUPLE_BARE_RETURN_LL"
+rg -q 'call void @noop\(\)' "$EMPTY_TUPLE_BARE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$EMPTY_TUPLE_BARE_RETURN_LL" -o "$EMPTY_TUPLE_BARE_RETURN_O"
+set +e
+"$LLVM_LLI" "$EMPTY_TUPLE_BARE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 0 ]]; then
+    echo "stage2 llvm smoke expected empty_tuple_bare_return_minimal exit code 0, got $STATUS" >&2
     exit 1
 fi
 

@@ -55,6 +55,7 @@ OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG="$BUILD_DIR/stage2_invalid_switch_non_exhaust
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
 OUT_INFER_GLOBAL_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_global_missing_init.log"
 OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_invalid_infer_shorthand_without_expected.log"
+OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_invalid_empty_tuple_return_non_void.log"
 OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_invalid_union_bind_void.log"
 OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_invalid_union_switch_non_exhaustive.log"
@@ -824,6 +825,21 @@ fi
 
 if [[ "$(<"$OUT_INFER_SHORTHAND_LOG")" != *"cannot infer local type"* ]]; then
     echo "stage2 error smoke missing infer shorthand diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_empty_tuple_return_non_void.jiang" > "$OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_empty_tuple_return_non_void to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG")" != *"return type mismatch"* ]]; then
+    echo "stage2 error smoke missing empty tuple return mismatch diagnostic" >&2
     exit 1
 fi
 
