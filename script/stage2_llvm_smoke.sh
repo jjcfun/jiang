@@ -151,10 +151,18 @@ ARRAY_TO_SLICE_RETURN_LL="$OUT_DIR/array_to_slice_return_minimal.ll"
 ARRAY_TO_SLICE_RETURN_O="$OUT_DIR/array_to_slice_return_minimal.o"
 GLOBAL_LL="$OUT_DIR/global_minimal.ll"
 GLOBAL_O="$OUT_DIR/global_minimal.o"
+UNARY_TUPLE_GLOBAL_LL="$OUT_DIR/unary_tuple_global_decl_minimal.ll"
+UNARY_TUPLE_GLOBAL_O="$OUT_DIR/unary_tuple_global_decl_minimal.o"
 INFER_LOCAL_LL="$OUT_DIR/infer_local_minimal.ll"
 INFER_LOCAL_O="$OUT_DIR/infer_local_minimal.o"
+UNARY_TUPLE_LOCAL_LL="$OUT_DIR/unary_tuple_local_decl_minimal.ll"
+UNARY_TUPLE_LOCAL_O="$OUT_DIR/unary_tuple_local_decl_minimal.o"
+UNARY_TUPLE_INFER_LOCAL_LL="$OUT_DIR/unary_tuple_infer_local_decl_minimal.ll"
+UNARY_TUPLE_INFER_LOCAL_O="$OUT_DIR/unary_tuple_infer_local_decl_minimal.o"
 INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
+UNARY_TUPLE_RETURN_LL="$OUT_DIR/unary_tuple_return_minimal.ll"
+UNARY_TUPLE_RETURN_O="$OUT_DIR/unary_tuple_return_minimal.o"
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/minimal.jiang" > "$MINIMAL_LL"
 rg -q '^define i64 @add\(i64 %0, i64 %1\)' "$MINIMAL_LL"
@@ -1008,6 +1016,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/unary_tuple_global_decl_minimal.jiang" > "$UNARY_TUPLE_GLOBAL_LL"
+rg -q '^@answer = global i64 42$' "$UNARY_TUPLE_GLOBAL_LL"
+rg -q '^define i32 @main\(\)' "$UNARY_TUPLE_GLOBAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNARY_TUPLE_GLOBAL_LL" -o "$UNARY_TUPLE_GLOBAL_O"
+set +e
+"$LLVM_LLI" "$UNARY_TUPLE_GLOBAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected unary_tuple_global_decl_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/infer_local_minimal.jiang" > "$INFER_LOCAL_LL"
 rg -q '^define i32 @main\(\)' "$INFER_LOCAL_LL"
 rg -q 'alloca i64' "$INFER_LOCAL_LL"
@@ -1022,6 +1043,33 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/unary_tuple_local_decl_minimal.jiang" > "$UNARY_TUPLE_LOCAL_LL"
+rg -q '^define i64 @forty_two\(\)' "$UNARY_TUPLE_LOCAL_LL"
+rg -q 'call i64 @forty_two\(\)' "$UNARY_TUPLE_LOCAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNARY_TUPLE_LOCAL_LL" -o "$UNARY_TUPLE_LOCAL_O"
+set +e
+"$LLVM_LLI" "$UNARY_TUPLE_LOCAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected unary_tuple_local_decl_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/unary_tuple_infer_local_decl_minimal.jiang" > "$UNARY_TUPLE_INFER_LOCAL_LL"
+rg -q '^define i32 @main\(\)' "$UNARY_TUPLE_INFER_LOCAL_LL"
+rg -q 'alloca i64' "$UNARY_TUPLE_INFER_LOCAL_LL"
+rg -q 'store i64 42' "$UNARY_TUPLE_INFER_LOCAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNARY_TUPLE_INFER_LOCAL_LL" -o "$UNARY_TUPLE_INFER_LOCAL_O"
+set +e
+"$LLVM_LLI" "$UNARY_TUPLE_INFER_LOCAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected unary_tuple_infer_local_decl_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/infer_global_minimal.jiang" > "$INFER_GLOBAL_LL"
 rg -q '^@answer = global i64 42$' "$INFER_GLOBAL_LL"
 rg -q '^define i32 @main\(\)' "$INFER_GLOBAL_LL"
@@ -1032,6 +1080,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected infer_global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/unary_tuple_return_minimal.jiang" > "$UNARY_TUPLE_RETURN_LL"
+rg -q '^define i64 @forty_two\(\)' "$UNARY_TUPLE_RETURN_LL"
+rg -q 'call i64 @forty_two\(\)' "$UNARY_TUPLE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNARY_TUPLE_RETURN_LL" -o "$UNARY_TUPLE_RETURN_O"
+set +e
+"$LLVM_LLI" "$UNARY_TUPLE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected unary_tuple_return_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
