@@ -197,6 +197,12 @@ TUPLE_INFER_LL="$OUT_DIR/tuple_infer_minimal.ll"
 TUPLE_INFER_O="$OUT_DIR/tuple_infer_minimal.o"
 INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
+OPTIONAL_LL="$OUT_DIR/optional_minimal.ll"
+OPTIONAL_O="$OUT_DIR/optional_minimal.o"
+MUTABLE_QUALIFIER_LL="$OUT_DIR/mutable_qualifier_minimal.ll"
+MUTABLE_QUALIFIER_O="$OUT_DIR/mutable_qualifier_minimal.o"
+STRUCT_OPTIONAL_FIELD_LL="$OUT_DIR/struct_optional_field_minimal.ll"
+STRUCT_OPTIONAL_FIELD_O="$OUT_DIR/struct_optional_field_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
 EMPTY_TUPLE_RETURN_O="$OUT_DIR/empty_tuple_return_minimal.o"
 EMPTY_TUPLE_BARE_RETURN_LL="$OUT_DIR/empty_tuple_bare_return_minimal.ll"
@@ -1360,6 +1366,45 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected infer_global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_minimal.jiang" > "$OPTIONAL_LL"
+rg -q '^%Optional_[0-9][0-9]*_t = type \{ i1, i64 \}$' "$OPTIONAL_LL"
+rg -q 'call %Optional_[0-9][0-9]*_t @pass\(%Optional_[0-9][0-9]*_t' "$OPTIONAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_LL" -o "$OPTIONAL_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected optional_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/mutable_qualifier_minimal.jiang" > "$MUTABLE_QUALIFIER_LL"
+rg -q '^define i64 @bump\(i64 %0\)' "$MUTABLE_QUALIFIER_LL"
+rg -q 'store i64 %0, ptr %value' "$MUTABLE_QUALIFIER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MUTABLE_QUALIFIER_LL" -o "$MUTABLE_QUALIFIER_O"
+set +e
+"$LLVM_LLI" "$MUTABLE_QUALIFIER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected mutable_qualifier_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_optional_field_minimal.jiang" > "$STRUCT_OPTIONAL_FIELD_LL"
+rg -q '^%Optional_[0-9][0-9]*_t = type \{ i1, i64 \}$' "$STRUCT_OPTIONAL_FIELD_LL"
+rg -q '^%User = type \{ i64, %Optional_[0-9][0-9]*_t \}$' "$STRUCT_OPTIONAL_FIELD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_OPTIONAL_FIELD_LL" -o "$STRUCT_OPTIONAL_FIELD_O"
+set +e
+"$LLVM_LLI" "$STRUCT_OPTIONAL_FIELD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_optional_field_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

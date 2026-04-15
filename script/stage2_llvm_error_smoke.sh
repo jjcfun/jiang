@@ -44,6 +44,8 @@ OUT_INFER_ARRAY_LENGTH_MISSING_INIT_LOG="$BUILD_DIR/stage2_llvm_invalid_infer_ar
 OUT_TYPED_ARRAY_CONSTRUCTOR_NON_ARRAY_LOG="$BUILD_DIR/stage2_llvm_invalid_typed_array_constructor_non_array.log"
 OUT_TYPED_ARRAY_CONSTRUCTOR_LENGTH_LOG="$BUILD_DIR/stage2_llvm_invalid_typed_array_constructor_length.log"
 OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_llvm_invalid_infer_shorthand_without_expected.log"
+OUT_INFER_OPTIONAL_NULL_LOG="$BUILD_DIR/stage2_llvm_invalid_infer_optional_null.log"
+OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_null_non_optional.log"
 OUT_VOID_KEYWORD_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_void_keyword_type.log"
 OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_llvm_invalid_empty_tuple_return_non_void.log"
 OUT_TUPLE_DESTRUCTURE_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_tuple_destructure_arity.log"
@@ -940,6 +942,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_INFER_SHORTHAND_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_infer_shorthand_without_expected" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_infer_optional_null.jiang" > "$OUT_INFER_OPTIONAL_NULL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_infer_optional_null to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_INFER_OPTIONAL_NULL_LOG")" != *"cannot infer local type"* ]]; then
+    echo "stage2 llvm error smoke missing infer optional null diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_INFER_OPTIONAL_NULL_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_infer_optional_null" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_optional_null_non_optional.jiang" > "$OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_optional_null_non_optional to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG")" != *"local initializer type mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing optional null mismatch diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_null_non_optional" >&2
     exit 1
 fi
 

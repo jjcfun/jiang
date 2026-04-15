@@ -641,6 +641,36 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/optional_minimal.jiang" "optional_minimal"
+set +e
+"$OUT_DIR/optional_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected optional_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/mutable_qualifier_minimal.jiang" "mutable_qualifier_minimal"
+set +e
+"$OUT_DIR/mutable_qualifier_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected mutable_qualifier_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_optional_field_minimal.jiang" "struct_optional_field_minimal"
+set +e
+"$OUT_DIR/struct_optional_field_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_optional_field_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/unary_tuple_return_minimal.jiang" "unary_tuple_return_minimal"
 set +e
 "$OUT_DIR/unary_tuple_return_minimal"
