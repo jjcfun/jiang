@@ -188,6 +188,13 @@ Bool type_parse_is_infer(UInt8[] source, Int parse_node) {
     return parse_node_is(source, parse_node, "_");
 }
 
+Bool parse_array_type_has_infer_length(Int parse_node) {
+    if (parser.parser_store_node_kinds[parse_node] != parser.ParserNode.array_type) {
+        return 0;
+    }
+    return parser.parser_store_node_aux[parse_node] == parser.infer_array_length_aux;
+}
+
 Bool is_builtin_type_name(UInt8[] source, Int parse_node) {
     if (type_parse_is_infer(source, parse_node)) {
         return 0;
@@ -1344,6 +1351,13 @@ Bool type_is_array(Int type_id) {
     return type_store.type_store_kinds[type_id] == type_store.TypeKind.array;
 }
 
+Bool type_is_inferred_array(Int type_id) {
+    if (!type_is_array(type_id)) {
+        return 0;
+    }
+    return type_store.type_store_array_lengths[type_id] < 0;
+}
+
 Bool type_is_slice(Int type_id) {
     if (type_id <= 0) {
         return 0;
@@ -1629,6 +1643,9 @@ Bool is_string_compatible_array(Int declared_type, Int right_node) {
     if (!type_is_array(declared_type)) {
         return 0;
     }
+    if (type_is_inferred_array(declared_type)) {
+        return 0;
+    }
     if (hir.hir_store_node_kinds[right_node] != hir.HirNode.string_lit) {
         return 0;
     }
@@ -1658,6 +1675,78 @@ Bool is_array_to_same_slice(Int expected_type, Int actual_type) {
         return 0;
     }
     return type_store.type_store_elem_type_ids[expected_type] == type_store.type_store_elem_type_ids[actual_type];
+}
+
+Int array_literal_item_count(Int node) {
+    Int count = 0;
+    Int child = hir.hir_store_node_first_child[node];
+    while (child != 0) {
+        count = count + 1;
+        child = hir.hir_store_node_next_sibling[child];
+    }
+    return count;
+}
+
+Bool array_element_type_compatible(Int expected_elem_type, Int actual_elem_type) {
+    if (expected_elem_type == actual_elem_type) {
+        return 1;
+    }
+    if (type_is_inferred_array(expected_elem_type)) {
+        if (!type_is_array(actual_elem_type)) {
+            return 0;
+        }
+        return array_element_type_compatible(
+            type_store.type_store_elem_type_ids[expected_elem_type],
+            type_store.type_store_elem_type_ids[actual_elem_type]
+        );
+    }
+    return 0;
+}
+
+Int infer_concrete_array_type_from_value(Int declared_type, Int value_node) {
+    if (!type_is_inferred_array(declared_type)) {
+        return declared_type;
+    }
+    Int elem_type = type_store.type_store_elem_type_ids[declared_type];
+    Int actual_type = hir.hir_store_node_type_ids[value_node];
+    if (type_is_array(actual_type)) {
+        if (array_element_type_compatible(elem_type, type_store.type_store_elem_type_ids[actual_type])) {
+            return actual_type;
+        }
+        return type_store.type_store_builtin_unknown;
+    }
+    if (hir.hir_store_node_kinds[value_node] == hir.HirNode.string_lit) {
+        if (elem_type != type_store.type_store_builtin_uint8) {
+            return type_store.type_store_builtin_unknown;
+        }
+        Int length = hir.hir_store_node_ends[value_node] - hir.hir_store_node_starts[value_node] - 2;
+        return type_store.type_store_new_array_type(elem_type, length);
+    }
+    if (hir.hir_store_node_kinds[value_node] != hir.HirNode.array_lit) {
+        return type_store.type_store_builtin_unknown;
+    }
+    Int count = array_literal_item_count(value_node);
+    if (type_is_inferred_array(elem_type)) {
+        Int child = hir.hir_store_node_first_child[value_node];
+        Int concrete_elem_type = 0;
+        while (child != 0) {
+            Int child_type = infer_concrete_array_type_from_value(elem_type, child);
+            if (!is_known_type(child_type)) {
+                return type_store.type_store_builtin_unknown;
+            }
+            if (concrete_elem_type == 0) {
+                concrete_elem_type = child_type;
+            } else if (concrete_elem_type != child_type) {
+                return type_store.type_store_builtin_unknown;
+            }
+            child = hir.hir_store_node_next_sibling[child];
+        }
+        if (concrete_elem_type == 0) {
+            concrete_elem_type = elem_type;
+        }
+        return type_store.type_store_new_array_type(concrete_elem_type, count);
+    }
+    return type_store.type_store_new_array_type(elem_type, count);
 }
 
 () hir_text_buffer_push_int(Int buffer, Int value) {
@@ -2151,6 +2240,19 @@ Int for_loop_symbol_type_from_iterable(Int iterable_node) {
             expect_type(child, elem_type, "array element type mismatch");
         }
         child = hir.hir_store_node_next_sibling[child];
+    }
+    if (type_is_inferred_array(declared_type)) {
+        declared_type = infer_concrete_array_type_from_value(declared_type, node);
+        if (!is_known_type(declared_type)) {
+            diagnostic.diagnostic_error(
+                current_path,
+                hir.hir_store_node_starts[node],
+                hir.hir_store_node_ends[node],
+                "cannot infer array length"
+            );
+            return;
+        }
+        expected_count = count;
     }
     if (count != expected_count) {
         diagnostic.diagnostic_error(
@@ -3250,6 +3352,20 @@ Int lower_node(Int parse_node) {
         hir.hir_store_set_type_id(node, resolved_type);
         if (!is_known_type(resolved_type)) {
             diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[node], hir.hir_store_node_ends[node], "unknown type");
+        } else if (type_is_inferred_array(resolved_type)) {
+            Int parent = parser.parser_store_node_parent[parse_node];
+            if (parent != 0) {
+                Int parent_kind = parser.parser_store_node_kinds[parent];
+                if (parent_kind != parser.ParserNode.local_decl) {
+                    if (parent_kind != parser.ParserNode.global_decl) {
+                        if (parent_kind != parser.ParserNode.tuple_local_decl) {
+                            if (parent_kind != parser.ParserNode.tuple_global_decl) {
+                                diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[node], hir.hir_store_node_ends[node], "cannot infer array length here");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     if (kind == parser.ParserNode.pointer_type) {
@@ -3643,6 +3759,17 @@ Int lower_node(Int parse_node) {
                             hir.hir_store_set_type_id(child_decl, declared_type);
                         }
                     }
+                    if (type_is_inferred_array(declared_type)) {
+                        declared_type = infer_concrete_array_type_from_value(declared_type, lowered_init);
+                        if (!is_known_type(declared_type)) {
+                            diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer array length");
+                        } else {
+                            symbol_store.symbol_store_set_type_id(symbol_id, declared_type);
+                            hir.hir_store_set_type_id(lowered_type, declared_type);
+                            hir.hir_store_set_type_id(lowered_name, declared_type);
+                            hir.hir_store_set_type_id(child_decl, declared_type);
+                        }
+                    }
                     if (is_known_type(declared_type)) {
                         Int coerced_init = coerce_expr_to_type(lowered_init, declared_type);
                         if (coerced_init != lowered_init) {
@@ -3695,6 +3822,17 @@ Int lower_node(Int parse_node) {
                         declared_type = hir.hir_store_node_type_ids[lowered_init];
                         if (!is_known_type(declared_type)) {
                             diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer global type");
+                        } else {
+                            symbol_store.symbol_store_set_type_id(symbol_id, declared_type);
+                            hir.hir_store_set_type_id(lowered_type, declared_type);
+                            hir.hir_store_set_type_id(lowered_name, declared_type);
+                            hir.hir_store_set_type_id(child_decl, declared_type);
+                        }
+                    }
+                    if (type_is_inferred_array(declared_type)) {
+                        declared_type = infer_concrete_array_type_from_value(declared_type, lowered_init);
+                        if (!is_known_type(declared_type)) {
+                            diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer array length");
                         } else {
                             symbol_store.symbol_store_set_type_id(symbol_id, declared_type);
                             hir.hir_store_set_type_id(lowered_type, declared_type);
@@ -4000,14 +4138,28 @@ Int lower_node(Int parse_node) {
             Int lowered_type = hir.hir_store_node_first_child[node];
             Int lowered_name = hir.hir_store_node_next_sibling[lowered_type];
             Int lowered_init = hir.hir_store_node_next_sibling[lowered_name];
+            Int declared_type = hir.hir_store_node_type_ids[lowered_type];
             if (lowered_init == 0) {
+                if (type_is_inferred_array(declared_type)) {
+                    diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_type], hir.hir_store_node_ends[lowered_type], "inferred array length requires initializer");
+                }
                 return node;
             }
-            Int declared_type = hir.hir_store_node_type_ids[lowered_type];
             if (type_parse_is_infer(current_source, type_node)) {
                 declared_type = hir.hir_store_node_type_ids[lowered_init];
                 if (!is_known_type(declared_type)) {
                     diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer local type");
+                    return node;
+                }
+                symbol_store.symbol_store_set_type_id(symbol_id, declared_type);
+                hir.hir_store_set_type_id(lowered_type, declared_type);
+                hir.hir_store_set_type_id(lowered_name, declared_type);
+                hir.hir_store_set_type_id(node, declared_type);
+            }
+            if (type_is_inferred_array(declared_type)) {
+                declared_type = infer_concrete_array_type_from_value(declared_type, lowered_init);
+                if (!is_known_type(declared_type)) {
+                    diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer array length");
                     return node;
                 }
                 symbol_store.symbol_store_set_type_id(symbol_id, declared_type);
@@ -4134,6 +4286,8 @@ Int lower_node(Int parse_node) {
             if (lowered_init == 0) {
                 if (type_parse_is_infer(current_source, type_node)) {
                     diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_type], hir.hir_store_node_ends[lowered_type], "inferred global requires initializer");
+                } else if (type_is_inferred_array(hir.hir_store_node_type_ids[lowered_type])) {
+                    diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_type], hir.hir_store_node_ends[lowered_type], "inferred array length requires initializer");
                 }
                 return node;
             }
@@ -4142,6 +4296,17 @@ Int lower_node(Int parse_node) {
                 declared_type = hir.hir_store_node_type_ids[lowered_init];
                 if (!is_known_type(declared_type)) {
                     diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer global type");
+                    return node;
+                }
+                symbol_store.symbol_store_set_type_id(symbol_id, declared_type);
+                hir.hir_store_set_type_id(lowered_type, declared_type);
+                hir.hir_store_set_type_id(lowered_name, declared_type);
+                hir.hir_store_set_type_id(node, declared_type);
+            }
+            if (type_is_inferred_array(declared_type)) {
+                declared_type = infer_concrete_array_type_from_value(declared_type, lowered_init);
+                if (!is_known_type(declared_type)) {
+                    diagnostic.diagnostic_error(current_path, hir.hir_store_node_starts[lowered_init], hir.hir_store_node_ends[lowered_init], "cannot infer array length");
                     return node;
                 }
                 symbol_store.symbol_store_set_type_id(symbol_id, declared_type);

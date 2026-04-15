@@ -54,6 +54,7 @@ OUT_SWITCH_DUPLICATE_CASE_LOG="$BUILD_DIR/stage2_invalid_switch_duplicate_case.l
 OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG="$BUILD_DIR/stage2_invalid_switch_non_exhaustive_enum.log"
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
 OUT_INFER_GLOBAL_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_global_missing_init.log"
+OUT_INFER_ARRAY_LENGTH_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_array_length_missing_init.log"
 OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_invalid_infer_shorthand_without_expected.log"
 OUT_VOID_KEYWORD_TYPE_LOG="$BUILD_DIR/stage2_invalid_void_keyword_type.log"
 OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_invalid_empty_tuple_return_non_void.log"
@@ -881,6 +882,21 @@ fi
 
 if [[ "$(<"$OUT_INFER_GLOBAL_MISSING_INIT_LOG")" != *"inferred global requires initializer"* ]]; then
     echo "stage2 error smoke missing inferred global initializer diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_infer_array_length_missing_init.jiang" > "$OUT_INFER_ARRAY_LENGTH_MISSING_INIT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_infer_array_length_missing_init to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_INFER_ARRAY_LENGTH_MISSING_INIT_LOG")" != *"inferred array length requires initializer"* ]]; then
+    echo "stage2 error smoke missing inferred array length initializer diagnostic" >&2
     exit 1
 fi
 

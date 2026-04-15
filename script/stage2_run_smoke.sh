@@ -471,6 +471,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/infer_array_length_minimal.jiang" "infer_array_length_minimal"
+set +e
+"$OUT_DIR/infer_array_length_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected infer_array_length_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/array_assign_minimal.jiang" "array_assign_minimal"
 set +e
 "$OUT_DIR/array_assign_minimal"
@@ -628,6 +638,16 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 98 ]]; then
     echo "stage2 run smoke expected uint8_array_string_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/infer_uint8_array_string_minimal.jiang" "infer_uint8_array_string_minimal"
+set +e
+"$OUT_DIR/infer_uint8_array_string_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 run smoke expected infer_uint8_array_string_minimal exit code 98, got $STATUS" >&2
     exit 1
 fi
 

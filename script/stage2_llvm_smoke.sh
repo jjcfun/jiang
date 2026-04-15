@@ -79,10 +79,14 @@ SLICE_RETURN_LENGTH_LL="$OUT_DIR/slice_return_length_minimal.ll"
 SLICE_RETURN_LENGTH_O="$OUT_DIR/slice_return_length_minimal.o"
 ARRAY_LL="$OUT_DIR/array_minimal.ll"
 ARRAY_O="$OUT_DIR/array_minimal.o"
+INFER_ARRAY_LENGTH_LL="$OUT_DIR/infer_array_length_minimal.ll"
+INFER_ARRAY_LENGTH_O="$OUT_DIR/infer_array_length_minimal.o"
 ARRAY_ASSIGN_LL="$OUT_DIR/array_assign_minimal.ll"
 ARRAY_ASSIGN_O="$OUT_DIR/array_assign_minimal.o"
 UINT8_ARRAY_STRING_LL="$OUT_DIR/uint8_array_string_minimal.ll"
 UINT8_ARRAY_STRING_O="$OUT_DIR/uint8_array_string_minimal.o"
+INFER_UINT8_ARRAY_STRING_LL="$OUT_DIR/infer_uint8_array_string_minimal.ll"
+INFER_UINT8_ARRAY_STRING_O="$OUT_DIR/infer_uint8_array_string_minimal.o"
 NESTED_ARRAY_LL="$OUT_DIR/nested_array_minimal.ll"
 NESTED_ARRAY_O="$OUT_DIR/nested_array_minimal.o"
 STRUCT_ARRAY_FIELD_LL="$OUT_DIR/struct_array_field_minimal.ll"
@@ -587,6 +591,18 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/infer_array_length_minimal.jiang" > "$INFER_ARRAY_LENGTH_LL"
+rg -q '\[2 x i64\]' "$INFER_ARRAY_LENGTH_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$INFER_ARRAY_LENGTH_LL" -o "$INFER_ARRAY_LENGTH_O"
+set +e
+"$LLVM_LLI" "$INFER_ARRAY_LENGTH_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected infer_array_length_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/array_assign_minimal.jiang" > "$ARRAY_ASSIGN_LL"
 rg -q 'getelementptr \[3 x i64\], ptr' "$ARRAY_ASSIGN_LL"
 rg -q 'store i64 10' "$ARRAY_ASSIGN_LL"
@@ -610,6 +626,18 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 98 ]]; then
     echo "stage2 llvm smoke expected uint8_array_string_minimal exit code 98, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/infer_uint8_array_string_minimal.jiang" > "$INFER_UINT8_ARRAY_STRING_LL"
+rg -q '\[3 x i8\]' "$INFER_UINT8_ARRAY_STRING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$INFER_UINT8_ARRAY_STRING_LL" -o "$INFER_UINT8_ARRAY_STRING_O"
+set +e
+"$LLVM_LLI" "$INFER_UINT8_ARRAY_STRING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 98 ]]; then
+    echo "stage2 llvm smoke expected infer_uint8_array_string_minimal exit code 98, got $STATUS" >&2
     exit 1
 fi
 
