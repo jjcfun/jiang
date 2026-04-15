@@ -241,6 +241,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/union_tuple_bind_minimal.jiang" "union_tuple_bind_minimal"
+set +e
+"$OUT_DIR/union_tuple_bind_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_tuple_bind_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/union_if_pattern_minimal.jiang" "union_if_pattern_minimal"
 set +e
 "$OUT_DIR/union_if_pattern_minimal"
@@ -258,6 +268,16 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 run smoke expected union_if_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/union_tuple_if_shorthand_pattern_minimal.jiang" "union_tuple_if_shorthand_pattern_minimal"
+set +e
+"$OUT_DIR/union_tuple_if_shorthand_pattern_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_tuple_if_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

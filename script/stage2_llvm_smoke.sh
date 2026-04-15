@@ -43,10 +43,14 @@ UNION_SHORTHAND_LL="$OUT_DIR/union_shorthand_minimal.ll"
 UNION_SHORTHAND_O="$OUT_DIR/union_shorthand_minimal.o"
 UNION_BIND_LL="$OUT_DIR/union_bind_minimal.ll"
 UNION_BIND_O="$OUT_DIR/union_bind_minimal.o"
+UNION_TUPLE_BIND_LL="$OUT_DIR/union_tuple_bind_minimal.ll"
+UNION_TUPLE_BIND_O="$OUT_DIR/union_tuple_bind_minimal.o"
 UNION_IF_PATTERN_LL="$OUT_DIR/union_if_pattern_minimal.ll"
 UNION_IF_PATTERN_O="$OUT_DIR/union_if_pattern_minimal.o"
 UNION_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_if_shorthand_pattern_minimal.ll"
 UNION_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_if_shorthand_pattern_minimal.o"
+UNION_TUPLE_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_tuple_if_shorthand_pattern_minimal.ll"
+UNION_TUPLE_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_tuple_if_shorthand_pattern_minimal.o"
 UNION_SWITCH_SHORTHAND_PATTERN_LL="$OUT_DIR/union_switch_shorthand_pattern_minimal.ll"
 UNION_SWITCH_SHORTHAND_PATTERN_O="$OUT_DIR/union_switch_shorthand_pattern_minimal.o"
 STRUCT_UNION_FIELD_SHORTHAND_LL="$OUT_DIR/struct_union_field_shorthand_minimal.ll"
@@ -369,6 +373,18 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_tuple_bind_minimal.jiang" > "$UNION_TUPLE_BIND_LL"
+rg -q 'tuple\.item' "$UNION_TUPLE_BIND_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_TUPLE_BIND_LL" -o "$UNION_TUPLE_BIND_O"
+set +e
+"$LLVM_LLI" "$UNION_TUPLE_BIND_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_tuple_bind_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_if_pattern_minimal.jiang" > "$UNION_IF_PATTERN_LL"
 rg -q 'if\.pattern\.tag' "$UNION_IF_PATTERN_LL"
 rg -q 'pattern\.bind' "$UNION_IF_PATTERN_LL"
@@ -392,6 +408,18 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_if_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_tuple_if_shorthand_pattern_minimal.jiang" > "$UNION_TUPLE_IF_SHORTHAND_PATTERN_LL"
+rg -q 'tuple\.item' "$UNION_TUPLE_IF_SHORTHAND_PATTERN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_TUPLE_IF_SHORTHAND_PATTERN_LL" -o "$UNION_TUPLE_IF_SHORTHAND_PATTERN_O"
+set +e
+"$LLVM_LLI" "$UNION_TUPLE_IF_SHORTHAND_PATTERN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_tuple_if_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

@@ -65,6 +65,8 @@ OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_invalid_union_bind_void.log"
 OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_invalid_union_switch_non_exhaustive.log"
 OUT_UNION_PATTERN_NE_BIND_LOG="$BUILD_DIR/stage2_invalid_union_pattern_ne_bind.log"
+OUT_UNION_TUPLE_BIND_ARITY_LOG="$BUILD_DIR/stage2_invalid_union_tuple_bind_arity.log"
+OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_invalid_union_tuple_bind_non_tuple.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -980,6 +982,36 @@ fi
 
 if [[ "$(<"$OUT_UNION_PATTERN_NE_BIND_LOG")" != *"union pattern binding requires == condition"* ]]; then
     echo "stage2 error smoke missing union pattern binding diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_union_tuple_bind_arity.jiang" > "$OUT_UNION_TUPLE_BIND_ARITY_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_union_tuple_bind_arity to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_TUPLE_BIND_ARITY_LOG")" != *"union tuple binding arity mismatch"* ]]; then
+    echo "stage2 error smoke missing union tuple binding arity diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_union_tuple_bind_non_tuple.jiang" > "$OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_union_tuple_bind_non_tuple to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG")" != *"union tuple binding requires tuple payload"* ]]; then
+    echo "stage2 error smoke missing union tuple binding payload diagnostic" >&2
     exit 1
 fi
 
