@@ -129,7 +129,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   数组可变性与更完整语义
     *   指针自动解引用 / 所有权相关语义
     *   `T[]` 的完整泛化
-    *   `for`：当前已支持 range 与单变量容器迭代，尚未覆盖 `indexed()` 和解构
+    *   `for`：当前已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`；尚未覆盖嵌套解构如 `for (i, (a, b)) in pairs.indexed()`
     *   `struct init`、可变字段、`init`
     *   枚举底层类型、`.ok` 一类简写
     *   类型推断：当前已支持 `_ x = expr` 的局部/全局声明推断，尚未覆盖 expected-type 简写与 tuple/binding 推断
