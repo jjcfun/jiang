@@ -27,6 +27,10 @@ FOR_INFER_RANGE_LL="$OUT_DIR/for_infer_range_minimal.ll"
 FOR_INFER_RANGE_O="$OUT_DIR/for_infer_range_minimal.o"
 FOR_ITEM_ARRAY_LL="$OUT_DIR/for_item_array_minimal.ll"
 FOR_ITEM_ARRAY_O="$OUT_DIR/for_item_array_minimal.o"
+FOR_TUPLE_BINDING_LL="$OUT_DIR/for_tuple_binding_minimal.ll"
+FOR_TUPLE_BINDING_O="$OUT_DIR/for_tuple_binding_minimal.o"
+FOR_TUPLE_BINDING_TYPED_LL="$OUT_DIR/for_tuple_binding_typed_minimal.ll"
+FOR_TUPLE_BINDING_TYPED_O="$OUT_DIR/for_tuple_binding_typed_minimal.o"
 SWITCH_ENUM_LL="$OUT_DIR/switch_enum_minimal.ll"
 SWITCH_ENUM_O="$OUT_DIR/switch_enum_minimal.o"
 ENUM_SWITCH_SHORTHAND_LL="$OUT_DIR/enum_switch_shorthand_minimal.ll"
@@ -265,6 +269,32 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected for_item_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_tuple_binding_minimal.jiang" > "$FOR_TUPLE_BINDING_LL"
+rg -q '^define i32 @main\(\)' "$FOR_TUPLE_BINDING_LL"
+rg -q 'extractvalue %Tuple_' "$FOR_TUPLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_TUPLE_BINDING_LL" -o "$FOR_TUPLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$FOR_TUPLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected for_tuple_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_tuple_binding_typed_minimal.jiang" > "$FOR_TUPLE_BINDING_TYPED_LL"
+rg -q '^define i32 @main\(\)' "$FOR_TUPLE_BINDING_TYPED_LL"
+rg -q 'extractvalue %Tuple_' "$FOR_TUPLE_BINDING_TYPED_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_TUPLE_BINDING_TYPED_LL" -o "$FOR_TUPLE_BINDING_TYPED_O"
+set +e
+"$LLVM_LLI" "$FOR_TUPLE_BINDING_TYPED_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected for_tuple_binding_typed_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

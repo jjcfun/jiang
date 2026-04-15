@@ -53,6 +53,8 @@ OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_switch
 OUT_UNION_PATTERN_NE_BIND_LOG="$BUILD_DIR/stage2_llvm_invalid_union_pattern_ne_bind.log"
 OUT_UNION_TUPLE_BIND_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_union_tuple_bind_arity.log"
 OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_tuple_bind_non_tuple.log"
+OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_llvm_invalid_for_tuple_binding_non_tuple.log"
+OUT_FOR_TUPLE_BIND_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_for_tuple_binding_arity.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -673,6 +675,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_FOR_ITERABLE_TARGET_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_iterable_target" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_for_tuple_binding_non_tuple.jiang" > "$OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_for_tuple_binding_non_tuple to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG")" != *"for tuple binding requires tuple element"* ]]; then
+    echo "stage2 llvm error smoke missing for tuple binding non-tuple diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_tuple_binding_non_tuple" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_for_tuple_binding_arity.jiang" > "$OUT_FOR_TUPLE_BIND_ARITY_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_for_tuple_binding_arity to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_FOR_TUPLE_BIND_ARITY_LOG")" != *"for tuple binding arity mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing for tuple binding arity diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_FOR_TUPLE_BIND_ARITY_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_tuple_binding_arity" >&2
     exit 1
 fi
 
