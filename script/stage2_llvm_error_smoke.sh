@@ -56,6 +56,7 @@ OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_tuple_b
 OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_llvm_invalid_for_tuple_binding_non_tuple.log"
 OUT_FOR_TUPLE_BIND_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_for_tuple_binding_arity.log"
 OUT_FOR_INDEXED_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_for_indexed_arity.log"
+OUT_FOR_INDEXED_NESTED_INDEX_LOG="$BUILD_DIR/stage2_llvm_invalid_for_indexed_nested_index_binding.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -736,6 +737,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_FOR_INDEXED_ARITY_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_indexed_arity" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_for_indexed_nested_index_binding.jiang" > "$OUT_FOR_INDEXED_NESTED_INDEX_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_for_indexed_nested_index_binding to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_FOR_INDEXED_NESTED_INDEX_LOG")" != *"for indexed binding index must be single name"* ]]; then
+    echo "stage2 llvm error smoke missing indexed nested index diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_FOR_INDEXED_NESTED_INDEX_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_for_indexed_nested_index_binding" >&2
     exit 1
 fi
 

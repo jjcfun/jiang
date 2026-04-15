@@ -131,6 +131,16 @@ if [[ $STATUS -ne 40 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/for_indexed_tuple_binding_minimal.jiang" "for_indexed_tuple_binding_minimal"
+set +e
+"$OUT_DIR/for_indexed_tuple_binding_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected for_indexed_tuple_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/for_tuple_binding_minimal.jiang" "for_tuple_binding_minimal"
 set +e
 "$OUT_DIR/for_tuple_binding_minimal"

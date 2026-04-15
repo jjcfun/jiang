@@ -31,6 +31,8 @@ FOR_INDEXED_LL="$OUT_DIR/for_indexed_minimal.ll"
 FOR_INDEXED_O="$OUT_DIR/for_indexed_minimal.o"
 FOR_INDEXED_TYPED_LL="$OUT_DIR/for_indexed_typed_minimal.ll"
 FOR_INDEXED_TYPED_O="$OUT_DIR/for_indexed_typed_minimal.o"
+FOR_INDEXED_TUPLE_BINDING_LL="$OUT_DIR/for_indexed_tuple_binding_minimal.ll"
+FOR_INDEXED_TUPLE_BINDING_O="$OUT_DIR/for_indexed_tuple_binding_minimal.o"
 FOR_TUPLE_BINDING_LL="$OUT_DIR/for_tuple_binding_minimal.ll"
 FOR_TUPLE_BINDING_O="$OUT_DIR/for_tuple_binding_minimal.o"
 FOR_TUPLE_BINDING_TYPED_LL="$OUT_DIR/for_tuple_binding_typed_minimal.ll"
@@ -299,6 +301,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 40 ]]; then
     echo "stage2 llvm smoke expected for_indexed_typed_minimal exit code 40, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_indexed_tuple_binding_minimal.jiang" > "$FOR_INDEXED_TUPLE_BINDING_LL"
+rg -q '^define i32 @main\(\)' "$FOR_INDEXED_TUPLE_BINDING_LL"
+rg -q 'store i64 %for.index.cur, ptr %i' "$FOR_INDEXED_TUPLE_BINDING_LL"
+rg -q 'extractvalue %Tuple_' "$FOR_INDEXED_TUPLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_INDEXED_TUPLE_BINDING_LL" -o "$FOR_INDEXED_TUPLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$FOR_INDEXED_TUPLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected for_indexed_tuple_binding_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
