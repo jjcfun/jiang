@@ -45,6 +45,8 @@ OUT_VOID_KEYWORD_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_void_keyword_type.log"
 OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_llvm_invalid_empty_tuple_return_non_void.log"
 OUT_TUPLE_DESTRUCTURE_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_tuple_destructure_arity.log"
 OUT_TUPLE_DESTRUCTURE_RHS_LOG="$BUILD_DIR/stage2_llvm_invalid_tuple_destructure_rhs.log"
+OUT_TUPLE_INDEX_NON_LITERAL_LOG="$BUILD_DIR/stage2_llvm_invalid_tuple_index_non_literal.log"
+OUT_TUPLE_INDEX_OUT_OF_RANGE_LOG="$BUILD_DIR/stage2_llvm_invalid_tuple_index_out_of_range.log"
 OUT_UNION_CTOR_ARG_LOG="$BUILD_DIR/stage2_llvm_invalid_union_ctor_arg.log"
 OUT_UNION_BIND_VOID_LOG="$BUILD_DIR/stage2_llvm_invalid_union_bind_void.log"
 OUT_UNION_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_switch_non_exhaustive.log"
@@ -502,7 +504,7 @@ if [[ $STATUS -eq 0 ]]; then
     exit 1
 fi
 
-if [[ "$(<"$OUT_INDEX_TARGET_LOG")" != *"index target must be array or slice"* ]]; then
+if [[ "$(<"$OUT_INDEX_TARGET_LOG")" != *"index target must be array, slice, or tuple"* ]]; then
     echo "stage2 llvm error smoke missing index target diagnostic" >&2
     exit 1
 fi
@@ -862,13 +864,53 @@ if [[ $STATUS -eq 0 ]]; then
     exit 1
 fi
 
-if [[ "$(<"$OUT_TUPLE_DESTRUCTURE_RHS_LOG")" != *"tuple destructuring currently requires tuple literal"* ]]; then
+if [[ "$(<"$OUT_TUPLE_DESTRUCTURE_RHS_LOG")" != *"tuple destructuring requires tuple value"* ]]; then
     echo "stage2 llvm error smoke missing tuple destructuring rhs diagnostic" >&2
     exit 1
 fi
 
 if rg -q '^; ModuleID = ' "$OUT_TUPLE_DESTRUCTURE_RHS_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_tuple_destructure_rhs" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_tuple_index_non_literal.jiang" > "$OUT_TUPLE_INDEX_NON_LITERAL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_tuple_index_non_literal to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TUPLE_INDEX_NON_LITERAL_LOG")" != *"tuple index must be integer literal"* ]]; then
+    echo "stage2 llvm error smoke missing tuple index non-literal diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_TUPLE_INDEX_NON_LITERAL_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_tuple_index_non_literal" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_tuple_index_out_of_range.jiang" > "$OUT_TUPLE_INDEX_OUT_OF_RANGE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_tuple_index_out_of_range to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TUPLE_INDEX_OUT_OF_RANGE_LOG")" != *"tuple index out of range"* ]]; then
+    echo "stage2 llvm error smoke missing tuple index out-of-range diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_TUPLE_INDEX_OUT_OF_RANGE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_tuple_index_out_of_range" >&2
     exit 1
 fi
 

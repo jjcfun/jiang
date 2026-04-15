@@ -165,6 +165,14 @@ TUPLE_DESTRUCTURE_INFER_LL="$OUT_DIR/tuple_destructure_infer_minimal.ll"
 TUPLE_DESTRUCTURE_INFER_O="$OUT_DIR/tuple_destructure_infer_minimal.o"
 TUPLE_DESTRUCTURE_GLOBAL_LL="$OUT_DIR/tuple_destructure_global_minimal.ll"
 TUPLE_DESTRUCTURE_GLOBAL_O="$OUT_DIR/tuple_destructure_global_minimal.o"
+TUPLE_DESTRUCTURE_RETURN_LL="$OUT_DIR/tuple_destructure_return_minimal.ll"
+TUPLE_DESTRUCTURE_RETURN_O="$OUT_DIR/tuple_destructure_return_minimal.o"
+TUPLE_VALUE_LL="$OUT_DIR/tuple_value_minimal.ll"
+TUPLE_VALUE_O="$OUT_DIR/tuple_value_minimal.o"
+TUPLE_RETURN_LL="$OUT_DIR/tuple_return_minimal.ll"
+TUPLE_RETURN_O="$OUT_DIR/tuple_return_minimal.o"
+TUPLE_INFER_LL="$OUT_DIR/tuple_infer_minimal.ll"
+TUPLE_INFER_O="$OUT_DIR/tuple_infer_minimal.o"
 INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
@@ -1119,6 +1127,66 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected tuple_destructure_global_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_destructure_return_minimal.jiang" > "$TUPLE_DESTRUCTURE_RETURN_LL"
+rg -q '^define .*@pair\(\)' "$TUPLE_DESTRUCTURE_RETURN_LL"
+rg -q 'extractvalue .* 0' "$TUPLE_DESTRUCTURE_RETURN_LL"
+rg -q 'extractvalue .* 1' "$TUPLE_DESTRUCTURE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_DESTRUCTURE_RETURN_LL" -o "$TUPLE_DESTRUCTURE_RETURN_O"
+set +e
+"$LLVM_LLI" "$TUPLE_DESTRUCTURE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_destructure_return_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_value_minimal.jiang" > "$TUPLE_VALUE_LL"
+rg -q '^%Tuple_[0-9][0-9]* = type \{ i64, i64 \}$' "$TUPLE_VALUE_LL"
+rg -q '^@pair = global %Tuple_[0-9][0-9]* \{ i64 40, i64 2 \}$' "$TUPLE_VALUE_LL"
+rg -q 'extractvalue %Tuple_[0-9][0-9]* .* 0' "$TUPLE_VALUE_LL"
+rg -q 'extractvalue %Tuple_[0-9][0-9]* .* 1' "$TUPLE_VALUE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_VALUE_LL" -o "$TUPLE_VALUE_O"
+set +e
+"$LLVM_LLI" "$TUPLE_VALUE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_value_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_return_minimal.jiang" > "$TUPLE_RETURN_LL"
+rg -q '^%Tuple_[0-9][0-9]* = type \{ i64, i64 \}$' "$TUPLE_RETURN_LL"
+rg -q '^define %Tuple_[0-9][0-9]* @pair\(\)' "$TUPLE_RETURN_LL"
+rg -q 'call %Tuple_[0-9][0-9]* @pair\(\)' "$TUPLE_RETURN_LL"
+rg -q 'extractvalue %Tuple_[0-9][0-9]* .* 0' "$TUPLE_RETURN_LL"
+rg -q 'extractvalue %Tuple_[0-9][0-9]* .* 1' "$TUPLE_RETURN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_RETURN_LL" -o "$TUPLE_RETURN_O"
+set +e
+"$LLVM_LLI" "$TUPLE_RETURN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_return_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_infer_minimal.jiang" > "$TUPLE_INFER_LL"
+rg -q '^%Tuple_[0-9][0-9]* = type \{ i64, i64 \}$' "$TUPLE_INFER_LL"
+rg -q 'alloca %Tuple_[0-9][0-9]*' "$TUPLE_INFER_LL"
+rg -q 'extractvalue %Tuple_[0-9][0-9]* .* 0' "$TUPLE_INFER_LL"
+rg -q 'extractvalue %Tuple_[0-9][0-9]* .* 1' "$TUPLE_INFER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_INFER_LL" -o "$TUPLE_INFER_O"
+set +e
+"$LLVM_LLI" "$TUPLE_INFER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_infer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
