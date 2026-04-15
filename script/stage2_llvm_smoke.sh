@@ -81,6 +81,10 @@ ARRAY_LL="$OUT_DIR/array_minimal.ll"
 ARRAY_O="$OUT_DIR/array_minimal.o"
 INFER_ARRAY_LENGTH_LL="$OUT_DIR/infer_array_length_minimal.ll"
 INFER_ARRAY_LENGTH_O="$OUT_DIR/infer_array_length_minimal.o"
+TYPED_ARRAY_CONSTRUCTOR_LL="$OUT_DIR/typed_array_constructor_minimal.ll"
+TYPED_ARRAY_CONSTRUCTOR_O="$OUT_DIR/typed_array_constructor_minimal.o"
+TYPED_ARRAY_CONSTRUCTOR_INFER_LL="$OUT_DIR/typed_array_constructor_infer_minimal.ll"
+TYPED_ARRAY_CONSTRUCTOR_INFER_O="$OUT_DIR/typed_array_constructor_infer_minimal.o"
 ARRAY_ASSIGN_LL="$OUT_DIR/array_assign_minimal.ll"
 ARRAY_ASSIGN_O="$OUT_DIR/array_assign_minimal.o"
 UINT8_ARRAY_STRING_LL="$OUT_DIR/uint8_array_string_minimal.ll"
@@ -600,6 +604,30 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected infer_array_length_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/typed_array_constructor_minimal.jiang" > "$TYPED_ARRAY_CONSTRUCTOR_LL"
+rg -q '\[2 x i64\]' "$TYPED_ARRAY_CONSTRUCTOR_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TYPED_ARRAY_CONSTRUCTOR_LL" -o "$TYPED_ARRAY_CONSTRUCTOR_O"
+set +e
+"$LLVM_LLI" "$TYPED_ARRAY_CONSTRUCTOR_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected typed_array_constructor_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/typed_array_constructor_infer_minimal.jiang" > "$TYPED_ARRAY_CONSTRUCTOR_INFER_LL"
+rg -q '\[2 x i64\]' "$TYPED_ARRAY_CONSTRUCTOR_INFER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TYPED_ARRAY_CONSTRUCTOR_INFER_LL" -o "$TYPED_ARRAY_CONSTRUCTOR_INFER_O"
+set +e
+"$LLVM_LLI" "$TYPED_ARRAY_CONSTRUCTOR_INFER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected typed_array_constructor_infer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

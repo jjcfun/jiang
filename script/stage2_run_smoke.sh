@@ -481,6 +481,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/typed_array_constructor_minimal.jiang" "typed_array_constructor_minimal"
+set +e
+"$OUT_DIR/typed_array_constructor_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected typed_array_constructor_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/typed_array_constructor_infer_minimal.jiang" "typed_array_constructor_infer_minimal"
+set +e
+"$OUT_DIR/typed_array_constructor_infer_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected typed_array_constructor_infer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/array_assign_minimal.jiang" "array_assign_minimal"
 set +e
 "$OUT_DIR/array_assign_minimal"

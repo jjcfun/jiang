@@ -126,18 +126,18 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   多模块、`public`、alias import、导出表
 *   部分对齐：
     *   字符串
-    *   数组可变性与更完整语义
+    *   数组：当前已支持 `Int[_] x = ...`、`Int[_] { ... }` typed constructor 与基础 tuple/struct 场景，仍未覆盖可变性与更完整语义
     *   指针自动解引用 / 所有权相关语义
     *   `T[]` 的完整泛化
     *   `for`：当前已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`；仍未覆盖更完整 pattern / binding 与迭代协议
     *   `struct init`、可变字段、`init`
-    *   枚举底层类型、`.ok` 一类简写
-    *   类型推断：当前已支持 `_ x = expr` 与 `Int[_] x = ...` 的局部/全局声明推断，尚未覆盖 expected-type 简写、typed array constructor 与 tuple/binding 推断
+    *   枚举：当前已支持 `.ok` 一类 expected-type shorthand、显式值与 `.value`，仍未覆盖底层类型与更完整推断规则
+    *   类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未覆盖更完整的统一推断规则
     *   `union`：当前已支持最小声明、构造、payload binding 和带穷尽性检查的 `switch`，尚未覆盖简写构造、多值解构与更完整布局语义
+    *   元组：当前已支持 `()`、一元组归一化、first-class tuple value/type、索引、return 与 destructuring/binding，尚未覆盖更完整 tuple ABI、pattern 与多返回值语义
     *   更完整模块语义
 *   仍未开始：
     *   类型转换
-    *   元组
     *   `switch`：当前已支持最小 Int / enum / union case、union payload binding、重复 case 诊断、enum/union 穷尽性检查与 `else:`，尚未覆盖更完整 pattern
     *   模式匹配 / binding
     *   泛型

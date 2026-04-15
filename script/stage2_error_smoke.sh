@@ -55,6 +55,8 @@ OUT_SWITCH_NON_EXHAUSTIVE_ENUM_LOG="$BUILD_DIR/stage2_invalid_switch_non_exhaust
 OUT_GLOBAL_INIT_TYPE_LOG="$BUILD_DIR/stage2_invalid_global_initializer_type.log"
 OUT_INFER_GLOBAL_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_global_missing_init.log"
 OUT_INFER_ARRAY_LENGTH_MISSING_INIT_LOG="$BUILD_DIR/stage2_invalid_infer_array_length_missing_init.log"
+OUT_TYPED_ARRAY_CONSTRUCTOR_NON_ARRAY_LOG="$BUILD_DIR/stage2_invalid_typed_array_constructor_non_array.log"
+OUT_TYPED_ARRAY_CONSTRUCTOR_LENGTH_LOG="$BUILD_DIR/stage2_invalid_typed_array_constructor_length.log"
 OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_invalid_infer_shorthand_without_expected.log"
 OUT_VOID_KEYWORD_TYPE_LOG="$BUILD_DIR/stage2_invalid_void_keyword_type.log"
 OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_invalid_empty_tuple_return_non_void.log"
@@ -897,6 +899,36 @@ fi
 
 if [[ "$(<"$OUT_INFER_ARRAY_LENGTH_MISSING_INIT_LOG")" != *"inferred array length requires initializer"* ]]; then
     echo "stage2 error smoke missing inferred array length initializer diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_typed_array_constructor_non_array.jiang" > "$OUT_TYPED_ARRAY_CONSTRUCTOR_NON_ARRAY_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_typed_array_constructor_non_array to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TYPED_ARRAY_CONSTRUCTOR_NON_ARRAY_LOG")" != *"typed array constructor requires array type"* ]]; then
+    echo "stage2 error smoke missing typed array constructor non-array diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_typed_array_constructor_length.jiang" > "$OUT_TYPED_ARRAY_CONSTRUCTOR_LENGTH_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_typed_array_constructor_length to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_TYPED_ARRAY_CONSTRUCTOR_LENGTH_LOG")" != *"array literal length mismatch"* ]]; then
+    echo "stage2 error smoke missing typed array constructor length diagnostic" >&2
     exit 1
 fi
 

@@ -39,12 +39,12 @@
 ### 部分对齐
 
 - [ ] 字符串：当前 `"abc"` 直接服务于 `UInt8[]`，尚未扩成 `jiang.md` 的完整文本语义
-- [ ] 数组：第一版已可用，但仍需继续对齐 `jiang.md` 中的可变性、推断和更完整用法
+- [ ] 数组：已支持 `Int[_] x = ...`、`Int[_] { ... }` typed constructor 与基础 tuple/struct 场景，但仍需继续对齐 `jiang.md` 中的可变性和更完整用法
 - [ ] 指针：已支持 `T*`、`&x`、`*p`、`*p = rhs`，但尚未对齐自动解引用 / 所有权相关语义
 - [ ] 切片：当前主要覆盖 `UInt8[]`，尚未泛化到 `jiang.md` 的完整 `T[]` 语义
 - [ ] 结构体：已支持字段与构造式初始化，但未对齐 `init`、可变字段、值/引用统一语义
-- [ ] 枚举：已支持声明、成员引用、显式值和 `.value`，但未对齐底层类型、`.ok` 这类简写
-- [ ] 类型推断：当前已支持 `_ x = expr` 与 `Int[_] x = ...` 的局部/全局声明推断，尚未对齐 expected-type 简写、tuple/binding 推断、typed array constructor 与更完整规则
+- [ ] 枚举：已支持声明、成员引用、expected-type shorthand、显式值和 `.value`，但未对齐底层类型与更完整推断规则
+- [ ] 类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未对齐更完整的统一推断规则
 - [ ] `for`：已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`，但仍未对齐更完整 pattern / binding 与迭代协议
 - [ ] `union`：已支持最小声明、构造、payload binding 与带穷尽性检查的 `switch`，尚未对齐简写构造、多值解构与更完整布局语义
 - [ ] 模块：已支持 import / public / alias import / `alias` / `public alias`，但仍需继续对齐更完整模块语义
@@ -52,7 +52,7 @@
 ### 未开始或明确未对齐
 
 - [ ] 类型转换
-- [ ] 元组
+- [ ] 元组：已支持 `()`、一元组归一化、first-class tuple value/type、索引、return 与 destructuring/binding，但仍未对齐更完整 tuple ABI、pattern 与多返回值语义
 - [ ] `switch`：已支持最小 Int / enum / union case、union payload binding、重复 case 诊断、enum/union 穷尽性检查与 `else:`，尚未对齐更完整 pattern
 - [ ] 模式匹配 / binding
 - [ ] 泛型
