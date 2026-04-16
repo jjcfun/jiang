@@ -35,6 +35,8 @@ FOR_INDEXED_TUPLE_BINDING_LL="$OUT_DIR/for_indexed_tuple_binding_minimal.ll"
 FOR_INDEXED_TUPLE_BINDING_O="$OUT_DIR/for_indexed_tuple_binding_minimal.o"
 FOR_MUTABLE_BINDING_LL="$OUT_DIR/for_mutable_binding_minimal.ll"
 FOR_MUTABLE_BINDING_O="$OUT_DIR/for_mutable_binding_minimal.o"
+FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL="$OUT_DIR/for_indexed_mutable_tuple_binding_minimal.ll"
+FOR_INDEXED_MUTABLE_TUPLE_BINDING_O="$OUT_DIR/for_indexed_mutable_tuple_binding_minimal.o"
 FOR_TUPLE_BINDING_LL="$OUT_DIR/for_tuple_binding_minimal.ll"
 FOR_TUPLE_BINDING_O="$OUT_DIR/for_tuple_binding_minimal.o"
 FOR_TUPLE_BINDING_TYPED_LL="$OUT_DIR/for_tuple_binding_typed_minimal.ll"
@@ -65,10 +67,14 @@ UNION_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_if_shorthand_pattern_minimal.ll"
 UNION_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_if_shorthand_pattern_minimal.o"
 UNION_TUPLE_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_tuple_if_shorthand_pattern_minimal.ll"
 UNION_TUPLE_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_tuple_if_shorthand_pattern_minimal.o"
+UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_LL="$OUT_DIR/union_tuple_if_mutable_shorthand_pattern_minimal.ll"
+UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_O="$OUT_DIR/union_tuple_if_mutable_shorthand_pattern_minimal.o"
 UNION_SWITCH_SHORTHAND_PATTERN_LL="$OUT_DIR/union_switch_shorthand_pattern_minimal.ll"
 UNION_SWITCH_SHORTHAND_PATTERN_O="$OUT_DIR/union_switch_shorthand_pattern_minimal.o"
 UNION_SWITCH_MUTABLE_BINDING_LL="$OUT_DIR/union_switch_mutable_binding_minimal.ll"
 UNION_SWITCH_MUTABLE_BINDING_O="$OUT_DIR/union_switch_mutable_binding_minimal.o"
+UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL="$OUT_DIR/union_tuple_switch_mutable_binding_minimal.ll"
+UNION_TUPLE_SWITCH_MUTABLE_BINDING_O="$OUT_DIR/union_tuple_switch_mutable_binding_minimal.o"
 STRUCT_UNION_FIELD_SHORTHAND_LL="$OUT_DIR/struct_union_field_shorthand_minimal.ll"
 STRUCT_UNION_FIELD_SHORTHAND_O="$OUT_DIR/struct_union_field_shorthand_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
@@ -360,6 +366,21 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_indexed_mutable_tuple_binding_minimal.jiang" > "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL"
+rg -q '^define i32 @main\(\)' "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL"
+rg -q 'store i64 %for.index.cur, ptr %i' "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL"
+rg -q 'extractvalue %Tuple_' "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL"
+rg -q 'store i64 %addtmp, ptr %left' "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL" -o "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$FOR_INDEXED_MUTABLE_TUPLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected for_indexed_mutable_tuple_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_tuple_binding_minimal.jiang" > "$FOR_TUPLE_BINDING_LL"
 rg -q '^define i32 @main\(\)' "$FOR_TUPLE_BINDING_LL"
 rg -q 'extractvalue %Tuple_' "$FOR_TUPLE_BINDING_LL"
@@ -554,6 +575,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_tuple_if_mutable_shorthand_pattern_minimal.jiang" > "$UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_LL"
+rg -q 'tuple\.item' "$UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_LL"
+rg -q 'store i64 %addtmp, ptr %pattern.bind' "$UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_LL" -o "$UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_O"
+set +e
+"$LLVM_LLI" "$UNION_TUPLE_IF_MUTABLE_SHORTHAND_PATTERN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_tuple_if_mutable_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_switch_shorthand_pattern_minimal.jiang" > "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
 rg -q 'switch\.union\.tag' "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
 rg -q 'union\.payload' "$UNION_SWITCH_SHORTHAND_PATTERN_LL"
@@ -577,6 +611,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_switch_mutable_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_tuple_switch_mutable_binding_minimal.jiang" > "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL"
+rg -q 'switch\.union\.tag' "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL"
+rg -q 'tuple\.item' "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL"
+rg -q 'store i64 %addtmp, ptr %left' "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL" -o "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$UNION_TUPLE_SWITCH_MUTABLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_tuple_switch_mutable_binding_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

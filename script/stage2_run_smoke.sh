@@ -171,6 +171,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/for_indexed_mutable_tuple_binding_minimal.jiang" "for_indexed_mutable_tuple_binding_minimal"
+set +e
+"$OUT_DIR/for_indexed_mutable_tuple_binding_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected for_indexed_mutable_tuple_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/for_tuple_binding_minimal.jiang" "for_tuple_binding_minimal"
 set +e
 "$OUT_DIR/for_tuple_binding_minimal"
@@ -371,6 +381,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/union_tuple_if_mutable_shorthand_pattern_minimal.jiang" "union_tuple_if_mutable_shorthand_pattern_minimal"
+set +e
+"$OUT_DIR/union_tuple_if_mutable_shorthand_pattern_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_tuple_if_mutable_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/union_switch_shorthand_pattern_minimal.jiang" "union_switch_shorthand_pattern_minimal"
 set +e
 "$OUT_DIR/union_switch_shorthand_pattern_minimal"
@@ -388,6 +408,16 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 run smoke expected union_switch_mutable_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/union_tuple_switch_mutable_binding_minimal.jiang" "union_tuple_switch_mutable_binding_minimal"
+set +e
+"$OUT_DIR/union_tuple_switch_mutable_binding_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_tuple_switch_mutable_binding_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
