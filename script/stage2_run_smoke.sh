@@ -771,6 +771,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/struct_optional_field_omitted_minimal.jiang" "struct_optional_field_omitted_minimal"
+set +e
+"$OUT_DIR/struct_optional_field_omitted_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 18 ]]; then
+    echo "stage2 run smoke expected struct_optional_field_omitted_minimal exit code 18, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/unary_tuple_return_minimal.jiang" "unary_tuple_return_minimal"
 set +e
 "$OUT_DIR/unary_tuple_return_minimal"

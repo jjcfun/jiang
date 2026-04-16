@@ -223,6 +223,8 @@ MUTABLE_ARRAY_QUALIFIER_LL="$OUT_DIR/mutable_array_qualifier_minimal.ll"
 MUTABLE_ARRAY_QUALIFIER_O="$OUT_DIR/mutable_array_qualifier_minimal.o"
 STRUCT_OPTIONAL_FIELD_LL="$OUT_DIR/struct_optional_field_minimal.ll"
 STRUCT_OPTIONAL_FIELD_O="$OUT_DIR/struct_optional_field_minimal.o"
+STRUCT_OPTIONAL_FIELD_OMITTED_LL="$OUT_DIR/struct_optional_field_omitted_minimal.ll"
+STRUCT_OPTIONAL_FIELD_OMITTED_O="$OUT_DIR/struct_optional_field_omitted_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
 EMPTY_TUPLE_RETURN_O="$OUT_DIR/empty_tuple_return_minimal.o"
 EMPTY_TUPLE_BARE_RETURN_LL="$OUT_DIR/empty_tuple_bare_return_minimal.ll"
@@ -1561,6 +1563,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected struct_optional_field_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_optional_field_omitted_minimal.jiang" > "$STRUCT_OPTIONAL_FIELD_OMITTED_LL"
+rg -q '^%Optional_[0-9][0-9]*_t = type \{ i1, i64 \}$' "$STRUCT_OPTIONAL_FIELD_OMITTED_LL"
+rg -q '^%User = type \{ i64, %Optional_[0-9][0-9]*_t \}$' "$STRUCT_OPTIONAL_FIELD_OMITTED_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_OPTIONAL_FIELD_OMITTED_LL" -o "$STRUCT_OPTIONAL_FIELD_OMITTED_O"
+set +e
+"$LLVM_LLI" "$STRUCT_OPTIONAL_FIELD_OMITTED_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 18 ]]; then
+    echo "stage2 llvm smoke expected struct_optional_field_omitted_minimal exit code 18, got $STATUS" >&2
     exit 1
 fi
 
