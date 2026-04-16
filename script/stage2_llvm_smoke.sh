@@ -215,6 +215,8 @@ INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
 OPTIONAL_LL="$OUT_DIR/optional_minimal.ll"
 OPTIONAL_O="$OUT_DIR/optional_minimal.o"
+OPTIONAL_NULL_COMPARE_LL="$OUT_DIR/optional_null_compare_minimal.ll"
+OPTIONAL_NULL_COMPARE_O="$OUT_DIR/optional_null_compare_minimal.o"
 OPTIONAL_NESTED_ARRAY_LL="$OUT_DIR/optional_nested_array_minimal.ll"
 OPTIONAL_NESTED_ARRAY_O="$OUT_DIR/optional_nested_array_minimal.o"
 MUTABLE_QUALIFIER_LL="$OUT_DIR/mutable_qualifier_minimal.ll"
@@ -1511,6 +1513,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected optional_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_null_compare_minimal.jiang" > "$OPTIONAL_NULL_COMPARE_LL"
+rg -q '^%Optional_[0-9][0-9]*_t = type \{ i1, i64 \}$' "$OPTIONAL_NULL_COMPARE_LL"
+rg -q 'extractvalue %Optional_[0-9][0-9]*_t' "$OPTIONAL_NULL_COMPARE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_NULL_COMPARE_LL" -o "$OPTIONAL_NULL_COMPARE_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_NULL_COMPARE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected optional_null_compare_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

@@ -60,6 +60,7 @@ OUT_TYPED_ARRAY_CONSTRUCTOR_LENGTH_LOG="$BUILD_DIR/stage2_invalid_typed_array_co
 OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_invalid_infer_shorthand_without_expected.log"
 OUT_INFER_OPTIONAL_NULL_LOG="$BUILD_DIR/stage2_invalid_infer_optional_null.log"
 OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG="$BUILD_DIR/stage2_invalid_optional_null_non_optional.log"
+OUT_OPTIONAL_COMPARE_NON_NULL_LOG="$BUILD_DIR/stage2_invalid_optional_compare_non_null.log"
 OUT_VOID_KEYWORD_TYPE_LOG="$BUILD_DIR/stage2_invalid_void_keyword_type.log"
 OUT_EMPTY_TUPLE_RETURN_NON_VOID_LOG="$BUILD_DIR/stage2_invalid_empty_tuple_return_non_void.log"
 OUT_TUPLE_DESTRUCTURE_ARITY_LOG="$BUILD_DIR/stage2_invalid_tuple_destructure_arity.log"
@@ -976,6 +977,21 @@ fi
 
 if [[ "$(<"$OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG")" != *"local initializer type mismatch"* ]]; then
     echo "stage2 error smoke missing optional null mismatch diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_optional_compare_non_null.jiang" > "$OUT_OPTIONAL_COMPARE_NON_NULL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_optional_compare_non_null to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_OPTIONAL_COMPARE_NON_NULL_LOG")" != *"optional comparison currently requires null"* ]]; then
+    echo "stage2 error smoke missing optional comparison diagnostic" >&2
     exit 1
 fi
 
