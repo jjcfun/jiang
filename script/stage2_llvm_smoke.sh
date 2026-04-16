@@ -33,6 +33,8 @@ FOR_INDEXED_TYPED_LL="$OUT_DIR/for_indexed_typed_minimal.ll"
 FOR_INDEXED_TYPED_O="$OUT_DIR/for_indexed_typed_minimal.o"
 FOR_INDEXED_TUPLE_BINDING_LL="$OUT_DIR/for_indexed_tuple_binding_minimal.ll"
 FOR_INDEXED_TUPLE_BINDING_O="$OUT_DIR/for_indexed_tuple_binding_minimal.o"
+FOR_MUTABLE_BINDING_LL="$OUT_DIR/for_mutable_binding_minimal.ll"
+FOR_MUTABLE_BINDING_O="$OUT_DIR/for_mutable_binding_minimal.o"
 FOR_TUPLE_BINDING_LL="$OUT_DIR/for_tuple_binding_minimal.ll"
 FOR_TUPLE_BINDING_O="$OUT_DIR/for_tuple_binding_minimal.o"
 FOR_TUPLE_BINDING_TYPED_LL="$OUT_DIR/for_tuple_binding_typed_minimal.ll"
@@ -181,6 +183,8 @@ UNARY_TUPLE_GLOBAL_LL="$OUT_DIR/unary_tuple_global_decl_minimal.ll"
 UNARY_TUPLE_GLOBAL_O="$OUT_DIR/unary_tuple_global_decl_minimal.o"
 INFER_LOCAL_LL="$OUT_DIR/infer_local_minimal.ll"
 INFER_LOCAL_O="$OUT_DIR/infer_local_minimal.o"
+INFER_MUTABLE_LOCAL_LL="$OUT_DIR/infer_mutable_local_minimal.ll"
+INFER_MUTABLE_LOCAL_O="$OUT_DIR/infer_mutable_local_minimal.o"
 UNARY_TUPLE_LOCAL_LL="$OUT_DIR/unary_tuple_local_decl_minimal.ll"
 UNARY_TUPLE_LOCAL_O="$OUT_DIR/unary_tuple_local_decl_minimal.o"
 UNARY_TUPLE_INFER_LOCAL_LL="$OUT_DIR/unary_tuple_infer_local_decl_minimal.ll"
@@ -189,6 +193,8 @@ TUPLE_DESTRUCTURE_LL="$OUT_DIR/tuple_destructure_minimal.ll"
 TUPLE_DESTRUCTURE_O="$OUT_DIR/tuple_destructure_minimal.o"
 TUPLE_DESTRUCTURE_INFER_LL="$OUT_DIR/tuple_destructure_infer_minimal.ll"
 TUPLE_DESTRUCTURE_INFER_O="$OUT_DIR/tuple_destructure_infer_minimal.o"
+TUPLE_DESTRUCTURE_MUTABLE_INFER_LL="$OUT_DIR/tuple_destructure_mutable_infer_minimal.ll"
+TUPLE_DESTRUCTURE_MUTABLE_INFER_O="$OUT_DIR/tuple_destructure_mutable_infer_minimal.o"
 TUPLE_DESTRUCTURE_GLOBAL_LL="$OUT_DIR/tuple_destructure_global_minimal.ll"
 TUPLE_DESTRUCTURE_GLOBAL_O="$OUT_DIR/tuple_destructure_global_minimal.o"
 TUPLE_DESTRUCTURE_RETURN_LL="$OUT_DIR/tuple_destructure_return_minimal.ll"
@@ -337,6 +343,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected for_indexed_tuple_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/for_mutable_binding_minimal.jiang" > "$FOR_MUTABLE_BINDING_LL"
+rg -q '^define i32 @main\(\)' "$FOR_MUTABLE_BINDING_LL"
+rg -q 'store i64 %for.item, ptr %value' "$FOR_MUTABLE_BINDING_LL"
+rg -q 'store i64 %addtmp, ptr %value' "$FOR_MUTABLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FOR_MUTABLE_BINDING_LL" -o "$FOR_MUTABLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$FOR_MUTABLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected for_mutable_binding_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
@@ -1261,6 +1281,20 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/infer_mutable_local_minimal.jiang" > "$INFER_MUTABLE_LOCAL_LL"
+rg -q '^define i32 @main\(\)' "$INFER_MUTABLE_LOCAL_LL"
+rg -q 'store i64 41' "$INFER_MUTABLE_LOCAL_LL"
+rg -q 'store i64 .*%value' "$INFER_MUTABLE_LOCAL_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$INFER_MUTABLE_LOCAL_LL" -o "$INFER_MUTABLE_LOCAL_O"
+set +e
+"$LLVM_LLI" "$INFER_MUTABLE_LOCAL_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected infer_mutable_local_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/unary_tuple_local_decl_minimal.jiang" > "$UNARY_TUPLE_LOCAL_LL"
 rg -q '^define i64 @forty_two\(\)' "$UNARY_TUPLE_LOCAL_LL"
 rg -q 'call i64 @forty_two\(\)' "$UNARY_TUPLE_LOCAL_LL"
@@ -1313,6 +1347,20 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected tuple_destructure_infer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/tuple_destructure_mutable_infer_minimal.jiang" > "$TUPLE_DESTRUCTURE_MUTABLE_INFER_LL"
+rg -q '^define i32 @main\(\)' "$TUPLE_DESTRUCTURE_MUTABLE_INFER_LL"
+rg -q 'store i64 1' "$TUPLE_DESTRUCTURE_MUTABLE_INFER_LL"
+rg -q 'store i64 41' "$TUPLE_DESTRUCTURE_MUTABLE_INFER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TUPLE_DESTRUCTURE_MUTABLE_INFER_LL" -o "$TUPLE_DESTRUCTURE_MUTABLE_INFER_O"
+set +e
+"$LLVM_LLI" "$TUPLE_DESTRUCTURE_MUTABLE_INFER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected tuple_destructure_mutable_infer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
