@@ -50,6 +50,8 @@ OUT_OPTIONAL_COMPARE_NON_NULL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_compa
 OUT_OPTIONAL_NO_NARROW_NULL_BRANCH_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_no_narrow_then_null_branch.log"
 OUT_OPTIONAL_CHAIN_IMPURE_BASE_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_chain_impure_base.log"
 OUT_OPTIONAL_CHAIN_IMPURE_MEMBER_BASE_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_chain_impure_member_base.log"
+OUT_OPTIONAL_PATTERN_NON_OPTIONAL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_pattern_non_optional.log"
+OUT_OPTIONAL_PATTERN_LABEL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_pattern_label.log"
 OUT_TERNARY_CONDITION_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_condition_type.log"
 OUT_TERNARY_BRANCH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_branch_type.log"
 OUT_TERNARY_AGGREGATE_RESULT_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_aggregate_result.log"
@@ -1069,6 +1071,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_CHAIN_IMPURE_MEMBER_BASE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_chain_impure_member_base" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_optional_pattern_non_optional.jiang" > "$OUT_OPTIONAL_PATTERN_NON_OPTIONAL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_optional_pattern_non_optional to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_OPTIONAL_PATTERN_NON_OPTIONAL_LOG")" != *"union pattern requires union operand"* ]]; then
+    echo "stage2 llvm error smoke missing optional pattern non-optional diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_PATTERN_NON_OPTIONAL_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_pattern_non_optional" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_optional_pattern_label.jiang" > "$OUT_OPTIONAL_PATTERN_LABEL_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_optional_pattern_label to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_OPTIONAL_PATTERN_LABEL_LOG")" != *"optional pattern requires Option.some or Option.none"* ]]; then
+    echo "stage2 llvm error smoke missing optional pattern label diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_PATTERN_LABEL_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_pattern_label" >&2
     exit 1
 fi
 

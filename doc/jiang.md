@@ -84,6 +84,32 @@ _ y = 3.14; // 推断为 Double
 _ name = "Jiang"; // 推断为UInt8[5]
 ```
 
+
+
+### 可选类型 (Option)
+
+```c
+Int? a1 = 123;
+// a2为Int?类型
+_ a2 = a1;
+
+Bar? b1 = {x: 1, y: 2};
+// b2为Int?类型
+_ b2 = b1?.x;
+
+// 可选类型还支持链式调用
+_ foo = x?.y?.z
+
+// 判空解包
+if a1 == Option.some(_ x) {
+  // 这里x不为null，类型为Int
+} else {
+	// 这里x为null
+}
+```
+
+
+
 ### 类型转换 (Type Casting)
 
 Jiang 语言支持显式的类型转换，采用 `$a.cast(Type)` 的语法。其中 `$` 符号表示对对象本身进行“元操作”，`cast` 是一个特殊的元方法，它接收一个类型表达式作为参数。

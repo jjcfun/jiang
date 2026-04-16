@@ -130,7 +130,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   数组：当前已支持 `Int[_] x = ...`、`Int[_] { ... }` typed constructor 与基础 tuple/struct 场景，仍未覆盖可变性与更完整语义
     *   指针自动解引用 / 所有权相关语义
     *   `T[]` 的完整泛化
-    *   `T?` / `T!`：当前已支持最小 optional / mutable qualifier 语法、`null`、`== null` / `!= null` 判空、`?.field` / `?[index]` optional chain、基础 expected-type / 推断传播、`Int?[2][3]` / `Int[2]!` 这类后缀组合、union pattern 的 `_!` mutable binding，以及 struct init 中省略 optional 字段默认 `null` 与 C/LLVM codegen；但 `!` 仍未收紧赋值约束
+    *   `T?` / `T!`：当前已支持最小 optional / mutable qualifier 语法、`null`、`== null` / `!= null` 判空、`Option.some(_ x)` 判空解包、`?.field` / `?[index]` optional chain、基础 expected-type / 推断传播、`Int?[2][3]` / `Int[2]!` 这类后缀组合、union pattern 的 `_!` mutable binding，以及 struct init 中省略 optional 字段默认 `null` 与 C/LLVM codegen；但 `!` 仍未收紧赋值约束
     *   `for`：当前已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`；仍未覆盖更完整 pattern / binding 与迭代协议
     *   `struct init`、可变字段、`init`
     *   枚举：当前已支持 `.ok` 一类 expected-type shorthand、显式值与 `.value`，仍未覆盖底层类型与更完整推断规则
