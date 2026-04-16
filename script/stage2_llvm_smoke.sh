@@ -227,6 +227,10 @@ OPTIONAL_ELSE_NARROW_LL="$OUT_DIR/optional_else_narrow_minimal.ll"
 OPTIONAL_ELSE_NARROW_O="$OUT_DIR/optional_else_narrow_minimal.o"
 OPTIONAL_NESTED_ARRAY_LL="$OUT_DIR/optional_nested_array_minimal.ll"
 OPTIONAL_NESTED_ARRAY_O="$OUT_DIR/optional_nested_array_minimal.o"
+OPTIONAL_CHAIN_MEMBER_LL="$OUT_DIR/optional_chain_member_minimal.ll"
+OPTIONAL_CHAIN_MEMBER_O="$OUT_DIR/optional_chain_member_minimal.o"
+OPTIONAL_CHAIN_INDEX_LL="$OUT_DIR/optional_chain_index_minimal.ll"
+OPTIONAL_CHAIN_INDEX_O="$OUT_DIR/optional_chain_index_minimal.o"
 MUTABLE_QUALIFIER_LL="$OUT_DIR/mutable_qualifier_minimal.ll"
 MUTABLE_QUALIFIER_O="$OUT_DIR/mutable_qualifier_minimal.o"
 MUTABLE_ARRAY_QUALIFIER_LL="$OUT_DIR/mutable_array_qualifier_minimal.ll"
@@ -1598,6 +1602,31 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected optional_nested_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_chain_member_minimal.jiang" > "$OPTIONAL_CHAIN_MEMBER_LL"
+rg -q 'extractvalue' "$OPTIONAL_CHAIN_MEMBER_LL"
+rg -q 'and i1' "$OPTIONAL_CHAIN_MEMBER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_CHAIN_MEMBER_LL" -o "$OPTIONAL_CHAIN_MEMBER_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_CHAIN_MEMBER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected optional_chain_member_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_chain_index_minimal.jiang" > "$OPTIONAL_CHAIN_INDEX_LL"
+rg -q 'extractvalue' "$OPTIONAL_CHAIN_INDEX_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_CHAIN_INDEX_LL" -o "$OPTIONAL_CHAIN_INDEX_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_CHAIN_INDEX_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 40 ]]; then
+    echo "stage2 llvm smoke expected optional_chain_index_minimal exit code 40, got $STATUS" >&2
     exit 1
 fi
 

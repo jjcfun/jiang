@@ -378,6 +378,16 @@ int64_t JIANG_LLVM_API(build_add)(int64_t builder, int64_t left, int64_t right, 
     return jiang_llvm_wrap_ptr(value);
 }
 
+int64_t JIANG_LLVM_API(build_and)(int64_t builder, int64_t left, int64_t right, Slice_uint8_t name) {
+    char* text = jiang_llvm_to_cstr(name);
+    LLVMValueRef value = LLVMBuildAnd((LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
+                                      (LLVMValueRef)jiang_llvm_unwrap_ptr(left),
+                                      (LLVMValueRef)jiang_llvm_unwrap_ptr(right),
+                                      text ? text : "andtmp");
+    free(text);
+    return jiang_llvm_wrap_ptr(value);
+}
+
 int64_t JIANG_LLVM_API(build_sub)(int64_t builder, int64_t left, int64_t right, Slice_uint8_t name) {
     char* text = jiang_llvm_to_cstr(name);
     LLVMValueRef value = LLVMBuildSub((LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
@@ -549,6 +559,7 @@ JIANG_LLVM_WRAP_RET4(int64_t, build_extract_value, int64_t, builder, int64_t, ag
 JIANG_LLVM_WRAP_RET5(int64_t, build_insert_value, int64_t, builder, int64_t, aggregate, int64_t, value, int64_t, index, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET3(int64_t, build_global_string_ptr, int64_t, builder, Slice_uint8_t, value, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_add, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_and, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_sub, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_mul, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_sdiv, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
