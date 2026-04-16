@@ -781,6 +781,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/optional_if_narrow_minimal.jiang" "optional_if_narrow_minimal"
+set +e
+"$OUT_DIR/optional_if_narrow_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected optional_if_narrow_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/optional_else_narrow_minimal.jiang" "optional_else_narrow_minimal"
+set +e
+"$OUT_DIR/optional_else_narrow_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected optional_else_narrow_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/mutable_qualifier_minimal.jiang" "mutable_qualifier_minimal"
 set +e
 "$OUT_DIR/mutable_qualifier_minimal"

@@ -61,6 +61,7 @@ OUT_INFER_SHORTHAND_LOG="$BUILD_DIR/stage2_invalid_infer_shorthand_without_expec
 OUT_INFER_OPTIONAL_NULL_LOG="$BUILD_DIR/stage2_invalid_infer_optional_null.log"
 OUT_OPTIONAL_NULL_NON_OPTIONAL_LOG="$BUILD_DIR/stage2_invalid_optional_null_non_optional.log"
 OUT_OPTIONAL_COMPARE_NON_NULL_LOG="$BUILD_DIR/stage2_invalid_optional_compare_non_null.log"
+OUT_OPTIONAL_NO_NARROW_NULL_BRANCH_LOG="$BUILD_DIR/stage2_invalid_optional_no_narrow_then_null_branch.log"
 OUT_TERNARY_CONDITION_TYPE_LOG="$BUILD_DIR/stage2_invalid_ternary_condition_type.log"
 OUT_TERNARY_BRANCH_TYPE_LOG="$BUILD_DIR/stage2_invalid_ternary_branch_type.log"
 OUT_TERNARY_AGGREGATE_RESULT_LOG="$BUILD_DIR/stage2_invalid_ternary_aggregate_result.log"
@@ -995,6 +996,21 @@ fi
 
 if [[ "$(<"$OUT_OPTIONAL_COMPARE_NON_NULL_LOG")" != *"optional comparison currently requires null"* ]]; then
     echo "stage2 error smoke missing optional comparison diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_optional_no_narrow_then_null_branch.jiang" > "$OUT_OPTIONAL_NO_NARROW_NULL_BRANCH_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_optional_no_narrow_then_null_branch to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_OPTIONAL_NO_NARROW_NULL_BRANCH_LOG")" != *"return type mismatch"* ]]; then
+    echo "stage2 error smoke missing optional no-narrow diagnostic" >&2
     exit 1
 fi
 
