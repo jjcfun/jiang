@@ -20,6 +20,7 @@
 - [x] 继续收紧 LLVM 与 C 后端的剩余差异（当前已收敛到维护级问题，由回归持续约束）
 - [x] 冻结 Stage1 的残余维护面，只保留 bootstrap 基线职责
 - [ ] 按 `doc/jiang.md` 收口 Stage2 语法对齐表，并按表推进剩余语法
+- [ ] 继续保持 `compiler/` 源码落在 Stage1 语法子集内，直到 Stage2 构建链和自举边界正式稳定后再统一重构源码语法
 - [ ] 评估是否把 bootstrap orchestration / 历史阶段拆到独立的 `jiang-bootstrap` 仓库
 - [ ] Stage3：开始规划包管理与后续 1.0 能力
 - [x] Stage2 bootstrap 主路径切到“旧版 stage2c -> 新版 stage2c”，Stage1 仅保留历史兜底
@@ -46,6 +47,7 @@
 - [ ] 结构体：已支持字段与构造式初始化，但未对齐 `init`、可变字段、值/引用统一语义
 - [ ] 枚举：已支持声明、成员引用、expected-type shorthand、显式值和 `.value`，但未对齐底层类型与更完整推断规则
 - [ ] 类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未对齐更完整的统一推断规则
+- [ ] 条件表达式：当前已支持最小 `cond ? a : b` 标量结果版本，聚合结果仍未对齐
 - [ ] `for`：已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`，但仍未对齐更完整 pattern / binding 与迭代协议
 - [ ] `union`：已支持最小声明、构造、payload binding 与带穷尽性检查的 `switch`，尚未对齐简写构造、多值解构与更完整布局语义
 - [ ] 模块：已支持 import / public / alias import / `alias` / `public alias`，但仍需继续对齐更完整模块语义

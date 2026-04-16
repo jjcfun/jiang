@@ -711,6 +711,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/ternary_minimal.jiang" "ternary_minimal"
+set +e
+"$OUT_DIR/ternary_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected ternary_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/ternary_enum_minimal.jiang" "ternary_enum_minimal"
+set +e
+"$OUT_DIR/ternary_enum_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected ternary_enum_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/tuple_return_minimal.jiang" "tuple_return_minimal"
 set +e
 "$OUT_DIR/tuple_return_minimal"

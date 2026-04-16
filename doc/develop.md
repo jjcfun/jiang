@@ -50,6 +50,7 @@ Jiang 目前采用循序渐进的路线：
 
 *   `bootstrap/` 对应当前真实 Stage1 主线
 *   `compiler/` 对应当前 Stage2 主线目录
+*   在 Stage2 正式稳定并进入统一语法迁移之前，`compiler/` 目录内源码继续遵守 Stage1 语法子集约束，避免主线编译器源码过早依赖 Stage1 尚不稳定或尚不支持的写法
 
 也就是说，当前仓库里不再把 `compiler/` 视为 Stage1 后期实现主线。Stage1 已经完成，Stage2 当前的第一阶段是先固定一条新的 `frontend -> JIR -> C` 最小闭环。
 
@@ -134,6 +135,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   `struct init`、可变字段、`init`
     *   枚举：当前已支持 `.ok` 一类 expected-type shorthand、显式值与 `.value`，仍未覆盖底层类型与更完整推断规则
     *   类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未覆盖更完整的统一推断规则
+    *   条件表达式：当前已支持最小 `cond ? a : b` 标量结果版本，聚合结果仍未覆盖
     *   `union`：当前已支持最小声明、构造、payload binding 和带穷尽性检查的 `switch`，尚未覆盖简写构造、多值解构与更完整布局语义
     *   元组：当前已支持 `()`、一元组归一化、first-class tuple value/type、索引、return 与 destructuring/binding，尚未覆盖更完整 tuple ABI、pattern 与多返回值语义
     *   更完整模块语义
@@ -144,6 +146,16 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   泛型
     *   `async`
     *   FFI 作为正式用户语法
+
+### 当前源码风格约束
+
+当前 Stage2 语言能力可以继续向 `doc/jiang.md` 推进，但 `compiler/` 自身源码有一条额外约束：
+
+*   在 Stage2 正式稳定之前，`compiler/` 源码继续限制在 Stage1 语法子集内
+*   新语法优先通过样例、smoke、lowering 与后端支持落地
+*   等 Stage2 构建链和自举边界稳定后，再统一重构 `compiler/` 源码到新的正式语法风格
+
+这条约束的目的不是限制语言演进，而是避免主编译器源码先于 bootstrap 边界失稳。
 
 ### Stage2 接管 Stage1 的判定条件
 

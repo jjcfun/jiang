@@ -207,6 +207,10 @@ TUPLE_DESTRUCTURE_RETURN_LL="$OUT_DIR/tuple_destructure_return_minimal.ll"
 TUPLE_DESTRUCTURE_RETURN_O="$OUT_DIR/tuple_destructure_return_minimal.o"
 TUPLE_VALUE_LL="$OUT_DIR/tuple_value_minimal.ll"
 TUPLE_VALUE_O="$OUT_DIR/tuple_value_minimal.o"
+TERNARY_LL="$OUT_DIR/ternary_minimal.ll"
+TERNARY_O="$OUT_DIR/ternary_minimal.o"
+TERNARY_ENUM_LL="$OUT_DIR/ternary_enum_minimal.ll"
+TERNARY_ENUM_O="$OUT_DIR/ternary_enum_minimal.o"
 TUPLE_RETURN_LL="$OUT_DIR/tuple_return_minimal.ll"
 TUPLE_RETURN_O="$OUT_DIR/tuple_return_minimal.o"
 TUPLE_INFER_LL="$OUT_DIR/tuple_infer_minimal.ll"
@@ -1456,6 +1460,33 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected tuple_value_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/ternary_minimal.jiang" > "$TERNARY_LL"
+rg -q 'br i1 ' "$TERNARY_LL"
+rg -q 'ternary.then' "$TERNARY_LL"
+rg -q 'ternary.else' "$TERNARY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TERNARY_LL" -o "$TERNARY_O"
+set +e
+"$LLVM_LLI" "$TERNARY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected ternary_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/ternary_enum_minimal.jiang" > "$TERNARY_ENUM_LL"
+rg -q 'ternary.then' "$TERNARY_ENUM_LL"
+rg -q 'ternary.else' "$TERNARY_ENUM_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$TERNARY_ENUM_LL" -o "$TERNARY_ENUM_O"
+set +e
+"$LLVM_LLI" "$TERNARY_ENUM_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected ternary_enum_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
