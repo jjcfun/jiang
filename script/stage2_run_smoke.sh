@@ -111,6 +111,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/optional_nested_array_minimal.jiang" "optional_nested_array_minimal"
+set +e
+"$OUT_DIR/optional_nested_array_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected optional_nested_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/mutable_array_qualifier_minimal.jiang" "mutable_array_qualifier_minimal"
+set +e
+"$OUT_DIR/mutable_array_qualifier_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected mutable_array_qualifier_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/for_indexed_minimal.jiang" "for_indexed_minimal"
 set +e
 "$OUT_DIR/for_indexed_minimal"

@@ -199,8 +199,12 @@ INFER_GLOBAL_LL="$OUT_DIR/infer_global_minimal.ll"
 INFER_GLOBAL_O="$OUT_DIR/infer_global_minimal.o"
 OPTIONAL_LL="$OUT_DIR/optional_minimal.ll"
 OPTIONAL_O="$OUT_DIR/optional_minimal.o"
+OPTIONAL_NESTED_ARRAY_LL="$OUT_DIR/optional_nested_array_minimal.ll"
+OPTIONAL_NESTED_ARRAY_O="$OUT_DIR/optional_nested_array_minimal.o"
 MUTABLE_QUALIFIER_LL="$OUT_DIR/mutable_qualifier_minimal.ll"
 MUTABLE_QUALIFIER_O="$OUT_DIR/mutable_qualifier_minimal.o"
+MUTABLE_ARRAY_QUALIFIER_LL="$OUT_DIR/mutable_array_qualifier_minimal.ll"
+MUTABLE_ARRAY_QUALIFIER_O="$OUT_DIR/mutable_array_qualifier_minimal.o"
 STRUCT_OPTIONAL_FIELD_LL="$OUT_DIR/struct_optional_field_minimal.ll"
 STRUCT_OPTIONAL_FIELD_O="$OUT_DIR/struct_optional_field_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
@@ -676,8 +680,8 @@ if [[ $STATUS -ne 98 ]]; then
 fi
 
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/nested_array_minimal.jiang" > "$NESTED_ARRAY_LL"
-rg -q '\[2 x \[3 x i64\]\]' "$NESTED_ARRAY_LL"
-rg -q 'getelementptr \[2 x \[3 x i64\]\], ptr' "$NESTED_ARRAY_LL"
+rg -q '\[3 x \[2 x i64\]\]' "$NESTED_ARRAY_LL"
+rg -q 'getelementptr \[3 x \[2 x i64\]\], ptr' "$NESTED_ARRAY_LL"
 "$LLVM_CLANG" -Wno-override-module -x ir -c "$NESTED_ARRAY_LL" -o "$NESTED_ARRAY_O"
 set +e
 "$LLVM_LLI" "$NESTED_ARRAY_LL"
@@ -1382,6 +1386,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_nested_array_minimal.jiang" > "$OPTIONAL_NESTED_ARRAY_LL"
+rg -q '^%Optional_[0-9][0-9]*_t = type \{ i1, i64 \}$' "$OPTIONAL_NESTED_ARRAY_LL"
+rg -q '\[3 x \[2 x %Optional_[0-9][0-9]*_t\]\]' "$OPTIONAL_NESTED_ARRAY_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_NESTED_ARRAY_LL" -o "$OPTIONAL_NESTED_ARRAY_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_NESTED_ARRAY_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected optional_nested_array_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/mutable_qualifier_minimal.jiang" > "$MUTABLE_QUALIFIER_LL"
 rg -q '^define i64 @bump\(i64 %0\)' "$MUTABLE_QUALIFIER_LL"
 rg -q 'store i64 %0, ptr %value' "$MUTABLE_QUALIFIER_LL"
@@ -1392,6 +1409,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected mutable_qualifier_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/mutable_array_qualifier_minimal.jiang" > "$MUTABLE_ARRAY_QUALIFIER_LL"
+rg -q '^define i32 @main\(\)' "$MUTABLE_ARRAY_QUALIFIER_LL"
+rg -q '\[2 x i64\]' "$MUTABLE_ARRAY_QUALIFIER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$MUTABLE_ARRAY_QUALIFIER_LL" -o "$MUTABLE_ARRAY_QUALIFIER_O"
+set +e
+"$LLVM_LLI" "$MUTABLE_ARRAY_QUALIFIER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected mutable_array_qualifier_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
