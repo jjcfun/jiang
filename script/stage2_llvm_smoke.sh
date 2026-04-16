@@ -57,12 +57,16 @@ UNION_TUPLE_BIND_LL="$OUT_DIR/union_tuple_bind_minimal.ll"
 UNION_TUPLE_BIND_O="$OUT_DIR/union_tuple_bind_minimal.o"
 UNION_IF_PATTERN_LL="$OUT_DIR/union_if_pattern_minimal.ll"
 UNION_IF_PATTERN_O="$OUT_DIR/union_if_pattern_minimal.o"
+UNION_IF_MUTABLE_BINDING_LL="$OUT_DIR/union_if_mutable_binding_minimal.ll"
+UNION_IF_MUTABLE_BINDING_O="$OUT_DIR/union_if_mutable_binding_minimal.o"
 UNION_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_if_shorthand_pattern_minimal.ll"
 UNION_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_if_shorthand_pattern_minimal.o"
 UNION_TUPLE_IF_SHORTHAND_PATTERN_LL="$OUT_DIR/union_tuple_if_shorthand_pattern_minimal.ll"
 UNION_TUPLE_IF_SHORTHAND_PATTERN_O="$OUT_DIR/union_tuple_if_shorthand_pattern_minimal.o"
 UNION_SWITCH_SHORTHAND_PATTERN_LL="$OUT_DIR/union_switch_shorthand_pattern_minimal.ll"
 UNION_SWITCH_SHORTHAND_PATTERN_O="$OUT_DIR/union_switch_shorthand_pattern_minimal.o"
+UNION_SWITCH_MUTABLE_BINDING_LL="$OUT_DIR/union_switch_mutable_binding_minimal.ll"
+UNION_SWITCH_MUTABLE_BINDING_O="$OUT_DIR/union_switch_mutable_binding_minimal.o"
 STRUCT_UNION_FIELD_SHORTHAND_LL="$OUT_DIR/struct_union_field_shorthand_minimal.ll"
 STRUCT_UNION_FIELD_SHORTHAND_O="$OUT_DIR/struct_union_field_shorthand_minimal.o"
 UINT8_LL="$OUT_DIR/uint8_minimal.ll"
@@ -492,6 +496,19 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_if_mutable_binding_minimal.jiang" > "$UNION_IF_MUTABLE_BINDING_LL"
+rg -q 'if\.pattern\.tag' "$UNION_IF_MUTABLE_BINDING_LL"
+rg -q 'pattern\.bind' "$UNION_IF_MUTABLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_IF_MUTABLE_BINDING_LL" -o "$UNION_IF_MUTABLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$UNION_IF_MUTABLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_if_mutable_binding_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 "$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_if_shorthand_pattern_minimal.jiang" > "$UNION_IF_SHORTHAND_PATTERN_LL"
 rg -q 'if\.pattern\.tag' "$UNION_IF_SHORTHAND_PATTERN_LL"
 rg -q 'pattern\.bind' "$UNION_IF_SHORTHAND_PATTERN_LL"
@@ -527,6 +544,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_switch_shorthand_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_switch_mutable_binding_minimal.jiang" > "$UNION_SWITCH_MUTABLE_BINDING_LL"
+rg -q 'switch\.union\.tag' "$UNION_SWITCH_MUTABLE_BINDING_LL"
+rg -q 'union\.payload' "$UNION_SWITCH_MUTABLE_BINDING_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_SWITCH_MUTABLE_BINDING_LL" -o "$UNION_SWITCH_MUTABLE_BINDING_O"
+set +e
+"$LLVM_LLI" "$UNION_SWITCH_MUTABLE_BINDING_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_switch_mutable_binding_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

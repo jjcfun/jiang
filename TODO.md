@@ -42,7 +42,7 @@
 - [ ] 数组：已支持 `Int[_] x = ...`、`Int[_] { ... }` typed constructor 与基础 tuple/struct 场景，但仍需继续对齐 `jiang.md` 中的可变性和更完整用法
 - [ ] 指针：已支持 `T*`、`&x`、`*p`、`*p = rhs`，但尚未对齐自动解引用 / 所有权相关语义
 - [ ] 切片：当前主要覆盖 `UInt8[]`，尚未泛化到 `jiang.md` 的完整 `T[]` 语义
-- [ ] 类型修饰：已支持最小 `T?` / `null` / `T!` 语法、可选值 codegen、基础推断传播与 `Int?[2][3]` / `Int[2]!` 这类后缀组合；但 `!` 仍未收紧赋值规则
+- [ ] 类型修饰：已支持最小 `T?` / `null` / `T!` 语法、可选值 codegen、基础推断传播、`Int?[2][3]` / `Int[2]!` 这类后缀组合与 union pattern `_!` mutable binding；但 `!` 仍未收紧赋值规则
 - [ ] 结构体：已支持字段与构造式初始化，但未对齐 `init`、可变字段、值/引用统一语义
 - [ ] 枚举：已支持声明、成员引用、expected-type shorthand、显式值和 `.value`，但未对齐底层类型与更完整推断规则
 - [ ] 类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未对齐更完整的统一推断规则
