@@ -891,6 +891,76 @@ if [[ $STATUS -ne 18 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/struct_init_minimal.jiang" "struct_init_minimal"
+set +e
+"$OUT_DIR/struct_init_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_init_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_constructor_sugar_minimal.jiang" "struct_constructor_sugar_minimal"
+set +e
+"$OUT_DIR/struct_constructor_sugar_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_constructor_sugar_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_new_constructor_minimal.jiang" "struct_new_constructor_minimal"
+set +e
+"$OUT_DIR/struct_new_constructor_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_new_constructor_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_init_with_defaults_minimal.jiang" "struct_init_with_defaults_minimal"
+set +e
+"$OUT_DIR/struct_init_with_defaults_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 18 ]]; then
+    echo "stage2 run smoke expected struct_init_with_defaults_minimal exit code 18, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_init_mutable_default_override_minimal.jiang" "struct_init_mutable_default_override_minimal"
+set +e
+"$OUT_DIR/struct_init_mutable_default_override_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 19 ]]; then
+    echo "stage2 run smoke expected struct_init_mutable_default_override_minimal exit code 19, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_init_optional_omitted_minimal.jiang" "struct_init_optional_omitted_minimal"
+set +e
+"$OUT_DIR/struct_init_optional_omitted_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 run smoke expected struct_init_optional_omitted_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_init_branch_complete_minimal.jiang" "struct_init_branch_complete_minimal"
+set +e
+"$OUT_DIR/struct_init_branch_complete_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_init_branch_complete_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/unary_tuple_return_minimal.jiang" "unary_tuple_return_minimal"
 set +e
 "$OUT_DIR/unary_tuple_return_minimal"

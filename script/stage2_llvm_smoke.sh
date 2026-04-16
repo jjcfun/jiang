@@ -247,6 +247,20 @@ STRUCT_OPTIONAL_FIELD_LL="$OUT_DIR/struct_optional_field_minimal.ll"
 STRUCT_OPTIONAL_FIELD_O="$OUT_DIR/struct_optional_field_minimal.o"
 STRUCT_OPTIONAL_FIELD_OMITTED_LL="$OUT_DIR/struct_optional_field_omitted_minimal.ll"
 STRUCT_OPTIONAL_FIELD_OMITTED_O="$OUT_DIR/struct_optional_field_omitted_minimal.o"
+STRUCT_INIT_LL="$OUT_DIR/struct_init_minimal.ll"
+STRUCT_INIT_O="$OUT_DIR/struct_init_minimal.o"
+STRUCT_CONSTRUCTOR_SUGAR_LL="$OUT_DIR/struct_constructor_sugar_minimal.ll"
+STRUCT_CONSTRUCTOR_SUGAR_O="$OUT_DIR/struct_constructor_sugar_minimal.o"
+STRUCT_NEW_CONSTRUCTOR_LL="$OUT_DIR/struct_new_constructor_minimal.ll"
+STRUCT_NEW_CONSTRUCTOR_O="$OUT_DIR/struct_new_constructor_minimal.o"
+STRUCT_INIT_DEFAULTS_LL="$OUT_DIR/struct_init_with_defaults_minimal.ll"
+STRUCT_INIT_DEFAULTS_O="$OUT_DIR/struct_init_with_defaults_minimal.o"
+STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_LL="$OUT_DIR/struct_init_mutable_default_override_minimal.ll"
+STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_O="$OUT_DIR/struct_init_mutable_default_override_minimal.o"
+STRUCT_INIT_OPTIONAL_OMITTED_LL="$OUT_DIR/struct_init_optional_omitted_minimal.ll"
+STRUCT_INIT_OPTIONAL_OMITTED_O="$OUT_DIR/struct_init_optional_omitted_minimal.o"
+STRUCT_INIT_BRANCH_COMPLETE_LL="$OUT_DIR/struct_init_branch_complete_minimal.ll"
+STRUCT_INIT_BRANCH_COMPLETE_O="$OUT_DIR/struct_init_branch_complete_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
 EMPTY_TUPLE_RETURN_O="$OUT_DIR/empty_tuple_return_minimal.o"
 EMPTY_TUPLE_BARE_RETURN_LL="$OUT_DIR/empty_tuple_bare_return_minimal.ll"
@@ -1736,6 +1750,91 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 18 ]]; then
     echo "stage2 llvm smoke expected struct_optional_field_omitted_minimal exit code 18, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_init_minimal.jiang" > "$STRUCT_INIT_LL"
+rg -q '_User_init_into' "$STRUCT_INIT_LL"
+rg -q '_User_init' "$STRUCT_INIT_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INIT_LL" -o "$STRUCT_INIT_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INIT_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_init_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_constructor_sugar_minimal.jiang" > "$STRUCT_CONSTRUCTOR_SUGAR_LL"
+rg -q '_User_init' "$STRUCT_CONSTRUCTOR_SUGAR_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_CONSTRUCTOR_SUGAR_LL" -o "$STRUCT_CONSTRUCTOR_SUGAR_O"
+set +e
+"$LLVM_LLI" "$STRUCT_CONSTRUCTOR_SUGAR_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_constructor_sugar_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_new_constructor_minimal.jiang" > "$STRUCT_NEW_CONSTRUCTOR_LL"
+rg -q '_User_new' "$STRUCT_NEW_CONSTRUCTOR_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_NEW_CONSTRUCTOR_LL" -o "$STRUCT_NEW_CONSTRUCTOR_O"
+set +e
+"$LLVM_LLI" "$STRUCT_NEW_CONSTRUCTOR_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_new_constructor_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_init_with_defaults_minimal.jiang" > "$STRUCT_INIT_DEFAULTS_LL"
+rg -q '^%User = type \{ i64, i64 \}$' "$STRUCT_INIT_DEFAULTS_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INIT_DEFAULTS_LL" -o "$STRUCT_INIT_DEFAULTS_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INIT_DEFAULTS_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 18 ]]; then
+    echo "stage2 llvm smoke expected struct_init_with_defaults_minimal exit code 18, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_init_mutable_default_override_minimal.jiang" > "$STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_LL"
+rg -q '^%User = type \{ i64, i64 \}$' "$STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_LL" -o "$STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INIT_MUTABLE_DEFAULT_OVERRIDE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 19 ]]; then
+    echo "stage2 llvm smoke expected struct_init_mutable_default_override_minimal exit code 19, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_init_optional_omitted_minimal.jiang" > "$STRUCT_INIT_OPTIONAL_OMITTED_LL"
+rg -q '^%Optional_[0-9][0-9]*_t = type \{ i1, i64 \}$' "$STRUCT_INIT_OPTIONAL_OMITTED_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INIT_OPTIONAL_OMITTED_LL" -o "$STRUCT_INIT_OPTIONAL_OMITTED_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INIT_OPTIONAL_OMITTED_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 1 ]]; then
+    echo "stage2 llvm smoke expected struct_init_optional_omitted_minimal exit code 1, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_init_branch_complete_minimal.jiang" > "$STRUCT_INIT_BRANCH_COMPLETE_LL"
+rg -q '^%Pair = type \{ i64, i64 \}$' "$STRUCT_INIT_BRANCH_COMPLETE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INIT_BRANCH_COMPLETE_LL" -o "$STRUCT_INIT_BRANCH_COMPLETE_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INIT_BRANCH_COMPLETE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_init_branch_complete_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

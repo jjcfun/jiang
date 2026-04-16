@@ -456,6 +456,18 @@ int64_t JIANG_LLVM_API(build_call)(int64_t builder, int64_t fn_type, int64_t fun
     return jiang_llvm_wrap_ptr(value);
 }
 
+int64_t JIANG_LLVM_API(build_bitcast)(int64_t builder, int64_t value, int64_t llvm_type, Slice_uint8_t name) {
+    char* text = jiang_llvm_to_cstr(name);
+    LLVMValueRef out = LLVMBuildBitCast(
+        (LLVMBuilderRef)jiang_llvm_unwrap_ptr(builder),
+        (LLVMValueRef)jiang_llvm_unwrap_ptr(value),
+        (LLVMTypeRef)jiang_llvm_unwrap_ptr(llvm_type),
+        text ? text : "bitcasttmp"
+    );
+    free(text);
+    return jiang_llvm_wrap_ptr(out);
+}
+
 int64_t JIANG_LLVM_API(build_trunc)(int64_t builder, int64_t value, int64_t llvm_type, Slice_uint8_t name) {
     char* text = jiang_llvm_to_cstr(name);
     LLVMValueRef out = LLVMBuildTrunc(
@@ -570,6 +582,7 @@ JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_sle, int64_t, builder, int64_t, left, i
 JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_sgt, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_icmp_sge, int64_t, builder, int64_t, left, int64_t, right, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET5(int64_t, build_call, int64_t, builder, int64_t, fn_type, int64_t, function_ref, Slice_int64_t, args, Slice_uint8_t, name)
+JIANG_LLVM_WRAP_RET4(int64_t, build_bitcast, int64_t, builder, int64_t, value, int64_t, llvm_type, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_trunc, int64_t, builder, int64_t, value, int64_t, llvm_type, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_RET4(int64_t, build_zext, int64_t, builder, int64_t, value, int64_t, llvm_type, Slice_uint8_t, name)
 JIANG_LLVM_WRAP_VOID2(build_ret, int64_t, builder, int64_t, value)

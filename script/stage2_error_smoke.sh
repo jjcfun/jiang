@@ -10,6 +10,12 @@ OUT_CALL_LOG="$BUILD_DIR/stage2_invalid_call.log"
 OUT_FIELD_LOG="$BUILD_DIR/stage2_invalid_field.log"
 OUT_MISSING_FIELD_LOG="$BUILD_DIR/stage2_invalid_missing_field.log"
 OUT_DUP_FIELD_LOG="$BUILD_DIR/stage2_invalid_duplicate_field.log"
+OUT_STRUCT_INIT_MISSING_FIELD_LOG="$BUILD_DIR/stage2_invalid_struct_init_missing_field.log"
+OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG="$BUILD_DIR/stage2_invalid_struct_init_read_before_init.log"
+OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG="$BUILD_DIR/stage2_invalid_struct_init_immutable_reassign.log"
+OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG="$BUILD_DIR/stage2_invalid_struct_init_immutable_default_override.log"
+OUT_STRUCT_INIT_RETURN_VALUE_LOG="$BUILD_DIR/stage2_invalid_struct_init_return_value.log"
+OUT_STRUCT_INIT_SELF_ESCAPE_LOG="$BUILD_DIR/stage2_invalid_struct_init_self_escape.log"
 OUT_ASSIGN_TARGET_LOG="$BUILD_DIR/stage2_invalid_assign_target.log"
 OUT_ASSIGN_FIELD_TYPE_LOG="$BUILD_DIR/stage2_invalid_assign_field_type.log"
 OUT_SLICE_ASSIGN_TYPE_LOG="$BUILD_DIR/stage2_invalid_slice_assign_type.log"
@@ -179,6 +185,96 @@ fi
 
 if [[ "$(<"$OUT_DUP_FIELD_LOG")" != *"duplicate field"* ]]; then
     echo "stage2 error smoke missing duplicate field diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_missing_field.jiang" > "$OUT_STRUCT_INIT_MISSING_FIELD_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_struct_init_missing_field to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_MISSING_FIELD_LOG")" != *"missing field initialization in init"* ]]; then
+    echo "stage2 error smoke missing struct init missing field diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_read_before_init.jiang" > "$OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_struct_init_read_before_init to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG")" != *"field read before init"* ]]; then
+    echo "stage2 error smoke missing struct init read-before-init diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_immutable_reassign.jiang" > "$OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_struct_init_immutable_reassign to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG")" != *"immutable field cannot be reassigned in init"* ]]; then
+    echo "stage2 error smoke missing immutable struct init reassignment diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_immutable_default_override.jiang" > "$OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_struct_init_immutable_default_override to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG")" != *"immutable field with default cannot be reassigned in init"* ]]; then
+    echo "stage2 error smoke missing immutable default override diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_return_value.jiang" > "$OUT_STRUCT_INIT_RETURN_VALUE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_struct_init_return_value to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_RETURN_VALUE_LOG")" != *"return type mismatch"* ]]; then
+    echo "stage2 error smoke missing struct init return type diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_self_escape.jiang" > "$OUT_STRUCT_INIT_SELF_ESCAPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_struct_init_self_escape to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_SELF_ESCAPE_LOG")" != *"self cannot escape init"* ]]; then
+    echo "stage2 error smoke missing struct init self escape diagnostic" >&2
     exit 1
 fi
 

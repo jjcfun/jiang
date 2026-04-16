@@ -56,6 +56,12 @@ OUT_OPTIONAL_CHAIN_IMPURE_MEMBER_BASE_LOG="$BUILD_DIR/stage2_llvm_invalid_option
 OUT_OPTIONAL_PATTERN_NON_OPTIONAL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_pattern_non_optional.log"
 OUT_OPTIONAL_PATTERN_LABEL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_pattern_label.log"
 OUT_OPTIONAL_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_switch_non_exhaustive.log"
+OUT_STRUCT_INIT_MISSING_FIELD_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_missing_field.log"
+OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_read_before_init.log"
+OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_immutable_reassign.log"
+OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_immutable_default_override.log"
+OUT_STRUCT_INIT_RETURN_VALUE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_return_value.log"
+OUT_STRUCT_INIT_SELF_ESCAPE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_self_escape.log"
 OUT_TERNARY_CONDITION_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_condition_type.log"
 OUT_TERNARY_BRANCH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_branch_type.log"
 OUT_TERNARY_AGGREGATE_RESULT_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_aggregate_result.log"
@@ -1195,6 +1201,126 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_SWITCH_NON_EXHAUSTIVE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_switch_non_exhaustive" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_missing_field.jiang" > "$OUT_STRUCT_INIT_MISSING_FIELD_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_init_missing_field to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_MISSING_FIELD_LOG")" != *"missing field initialization in init"* ]]; then
+    echo "stage2 llvm error smoke missing struct init missing field diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_MISSING_FIELD_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_missing_field" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_read_before_init.jiang" > "$OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_init_read_before_init to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG")" != *"field read before init"* ]]; then
+    echo "stage2 llvm error smoke missing struct init read-before-init diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_READ_BEFORE_INIT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_read_before_init" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_immutable_reassign.jiang" > "$OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_init_immutable_reassign to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG")" != *"immutable field cannot be reassigned in init"* ]]; then
+    echo "stage2 llvm error smoke missing immutable struct init reassignment diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_immutable_reassign" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_immutable_default_override.jiang" > "$OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_init_immutable_default_override to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG")" != *"immutable field with default cannot be reassigned in init"* ]]; then
+    echo "stage2 llvm error smoke missing immutable default override diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_immutable_default_override" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_return_value.jiang" > "$OUT_STRUCT_INIT_RETURN_VALUE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_init_return_value to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_RETURN_VALUE_LOG")" != *"return type mismatch"* ]]; then
+    echo "stage2 llvm error smoke missing struct init return type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_RETURN_VALUE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_return_value" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_init_self_escape.jiang" > "$OUT_STRUCT_INIT_SELF_ESCAPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_init_self_escape to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INIT_SELF_ESCAPE_LOG")" != *"self cannot escape init"* ]]; then
+    echo "stage2 llvm error smoke missing struct init self escape diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_SELF_ESCAPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_self_escape" >&2
     exit 1
 fi
 
