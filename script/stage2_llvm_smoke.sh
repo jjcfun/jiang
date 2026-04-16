@@ -231,6 +231,8 @@ OPTIONAL_NESTED_ARRAY_LL="$OUT_DIR/optional_nested_array_minimal.ll"
 OPTIONAL_NESTED_ARRAY_O="$OUT_DIR/optional_nested_array_minimal.o"
 OPTIONAL_SOME_PATTERN_LL="$OUT_DIR/optional_some_pattern_minimal.ll"
 OPTIONAL_SOME_PATTERN_O="$OUT_DIR/optional_some_pattern_minimal.o"
+OPTIONAL_SWITCH_PATTERN_LL="$OUT_DIR/optional_switch_pattern_minimal.ll"
+OPTIONAL_SWITCH_PATTERN_O="$OUT_DIR/optional_switch_pattern_minimal.o"
 OPTIONAL_CHAIN_MEMBER_LL="$OUT_DIR/optional_chain_member_minimal.ll"
 OPTIONAL_CHAIN_MEMBER_O="$OUT_DIR/optional_chain_member_minimal.o"
 OPTIONAL_CHAIN_INDEX_LL="$OUT_DIR/optional_chain_index_minimal.ll"
@@ -1633,6 +1635,18 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected optional_some_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_switch_pattern_minimal.jiang" > "$OPTIONAL_SWITCH_PATTERN_LL"
+rg -q 'extractvalue' "$OPTIONAL_SWITCH_PATTERN_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_SWITCH_PATTERN_LL" -o "$OPTIONAL_SWITCH_PATTERN_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_SWITCH_PATTERN_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected optional_switch_pattern_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

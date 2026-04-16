@@ -131,6 +131,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/optional_switch_pattern_minimal.jiang" "optional_switch_pattern_minimal"
+set +e
+"$OUT_DIR/optional_switch_pattern_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected optional_switch_pattern_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/optional_chain_member_minimal.jiang" "optional_chain_member_minimal"
 set +e
 "$OUT_DIR/optional_chain_member_minimal"

@@ -55,6 +55,7 @@ OUT_OPTIONAL_CHAIN_IMPURE_BASE_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_chai
 OUT_OPTIONAL_CHAIN_IMPURE_MEMBER_BASE_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_chain_impure_member_base.log"
 OUT_OPTIONAL_PATTERN_NON_OPTIONAL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_pattern_non_optional.log"
 OUT_OPTIONAL_PATTERN_LABEL_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_pattern_label.log"
+OUT_OPTIONAL_SWITCH_NON_EXHAUSTIVE_LOG="$BUILD_DIR/stage2_llvm_invalid_optional_switch_non_exhaustive.log"
 OUT_TERNARY_CONDITION_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_condition_type.log"
 OUT_TERNARY_BRANCH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_branch_type.log"
 OUT_TERNARY_AGGREGATE_RESULT_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_aggregate_result.log"
@@ -1174,6 +1175,26 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_PATTERN_LABEL_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_pattern_label" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_optional_switch_non_exhaustive.jiang" > "$OUT_OPTIONAL_SWITCH_NON_EXHAUSTIVE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_optional_switch_non_exhaustive to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_OPTIONAL_SWITCH_NON_EXHAUSTIVE_LOG")" != *"non-exhaustive switch"* ]]; then
+    echo "stage2 llvm error smoke missing optional switch non-exhaustive diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_OPTIONAL_SWITCH_NON_EXHAUSTIVE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_optional_switch_non_exhaustive" >&2
     exit 1
 fi
 
