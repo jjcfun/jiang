@@ -221,6 +221,8 @@ OPTIONAL_LL="$OUT_DIR/optional_minimal.ll"
 OPTIONAL_O="$OUT_DIR/optional_minimal.o"
 OPTIONAL_NULL_COMPARE_LL="$OUT_DIR/optional_null_compare_minimal.ll"
 OPTIONAL_NULL_COMPARE_O="$OUT_DIR/optional_null_compare_minimal.o"
+OPTIONAL_COALESCE_LL="$OUT_DIR/optional_coalesce_minimal.ll"
+OPTIONAL_COALESCE_O="$OUT_DIR/optional_coalesce_minimal.o"
 OPTIONAL_IF_NARROW_LL="$OUT_DIR/optional_if_narrow_minimal.ll"
 OPTIONAL_IF_NARROW_O="$OUT_DIR/optional_if_narrow_minimal.o"
 OPTIONAL_ELSE_NARROW_LL="$OUT_DIR/optional_else_narrow_minimal.ll"
@@ -1569,6 +1571,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected optional_null_compare_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/optional_coalesce_minimal.jiang" > "$OPTIONAL_COALESCE_LL"
+rg -q 'coalesce.some' "$OPTIONAL_COALESCE_LL"
+rg -q 'coalesce.none' "$OPTIONAL_COALESCE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$OPTIONAL_COALESCE_LL" -o "$OPTIONAL_COALESCE_O"
+set +e
+"$LLVM_LLI" "$OPTIONAL_COALESCE_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected optional_coalesce_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
