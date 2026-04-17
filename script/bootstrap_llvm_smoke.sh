@@ -5,6 +5,8 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 COMPILER="$BUILD_DIR/jiangc"
+source "$PROJECT_ROOT/script/llvm_env.sh"
+export_llvm_env
 INPUT="$PROJECT_ROOT/bootstrap/entries/lexer.jiang"
 OUTPUT_LL="$BUILD_DIR/lexer.ll"
 OUTPUT_BIN="$BUILD_DIR/lexer"
@@ -91,7 +93,7 @@ if [[ ! -f "$OUTPUT_LL" ]]; then
     exit 1
 fi
 
-opt -passes=verify -disable-output "$OUTPUT_LL"
+"$LLVM_OPT" -passes=verify -disable-output "$OUTPUT_LL"
 
 if ! rg -q "define i32 @main" "$OUTPUT_LL"; then
     echo "bootstrap llvm smoke missing main definition" >&2

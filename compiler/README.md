@@ -28,6 +28,7 @@
 - Stage1 仍然是冻结的 bootstrap 基线
 - `compiler/` 中的新实现优先按层落位，不再堆平铺文件
 - 在 Stage2 正式稳定并允许统一语法迁移之前，`compiler/` 源码继续约束在 Stage1 可解析的语法子集内；新的 Stage2 用户语法优先先落到语言能力和测试，不直接重写 `compiler/` 自身源码风格
+- `dev` 分支固定 LLVM 工具链版本线为 `21.1.x`；Stage2 构建脚本与 smoke 都按这个 minor 版本线解析 `llvm-config`
 
 当前目录结构：
 

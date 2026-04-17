@@ -94,13 +94,29 @@ Jiang（江）是一门旨在成为编程领域“银弹”的现代静态类型
 
 - CMake
 - C 编译器 (gcc, clang 等)
+- LLVM `21.1.x`
+
+当前 `dev` 分支固定 LLVM minor 版本线为 `21.1.x`。脚本解析顺序是：
+
+- 显式设置的 `LLVM_CONFIG`
+- `JIANG_LLVM_ROOT/bin/llvm-config`
+- `PATH` 中的 `llvm-config`
+
+但无论从哪里解析到 `llvm-config`，版本都必须匹配 `21.1.x`，否则脚本和 CMake 都会直接失败。推荐方式有两种：
+
+- Homebrew: `llvm@21`
+- 自己安装到 `~/.jiang/toolchains/llvm-21.1`
+
+```bash
+/opt/homebrew/opt/llvm@21
+```
 
 ### 构建编译器
 
 ```bash
 mkdir build
 cd build
-cmake ..
+cmake .. -DJIANG_LLVM_ROOT=/opt/homebrew/opt/llvm@21
 make
 ```
 

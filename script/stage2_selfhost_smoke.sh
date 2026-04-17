@@ -4,7 +4,9 @@ set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
-LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
+
+source "$PROJECT_ROOT/script/llvm_env.sh"
+export_llvm_env
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -15,10 +17,6 @@ ROUNDTRIP_BIN="$BUILD_DIR/stage2c.roundtrip"
 MINIMAL_C="$BUILD_DIR/stage2_selfhost_minimal.c"
 
 "$BUILD_DIR/stage2c" "compiler/entries/compiler.jiang" > "$SELFHOST_C"
-
-LLVM_CFLAGS="$($LLVM_CONFIG --cflags)"
-LLVM_LDFLAGS="$($LLVM_CONFIG --ldflags)"
-LLVM_LIBS="$($LLVM_CONFIG --libs core analysis --system-libs)"
 
 cc -std=c99 -I "$PROJECT_ROOT/include" \
     $LLVM_CFLAGS \

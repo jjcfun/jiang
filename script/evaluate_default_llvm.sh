@@ -6,6 +6,9 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 COMPILER="$BUILD_DIR/jiangc"
 
+source "$PROJECT_ROOT/script/llvm_env.sh"
+export_llvm_env
+
 LEXER_INPUT="$PROJECT_ROOT/bootstrap/entries/lexer.jiang"
 PARSER_INPUT="$PROJECT_ROOT/bootstrap/entries/parser.jiang"
 HIR_INPUT="$PROJECT_ROOT/bootstrap/entries/hir.jiang"
@@ -129,7 +132,9 @@ run_manifest_matrix() {
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
-cmake ..
+cmake .. \
+    -DJIANG_LLVM_ROOT="$JIANG_LLVM_ROOT" \
+    -DJIANG_LLVM_REQUIRED_SERIES="$JIANG_LLVM_REQUIRED_SERIES"
 make
 
 cd "$PROJECT_ROOT"

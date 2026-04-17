@@ -107,6 +107,8 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 *   评估 LLVM 是否已经达到未来 Stage2 默认后端候选的成熟度
 *   按 `doc/jiang.md` 的正式语法说明，逐项推进 Stage2 语法对齐
 
+当前 `dev` 分支固定 LLVM 工具链版本线为 `21.1.x`。仓库脚本会优先按 `LLVM_CONFIG -> JIANG_LLVM_ROOT/bin/llvm-config -> PATH` 解析 `llvm-config`，但最终解析到的版本必须匹配 `21.1.x`，否则构建和 LLVM smoke 会直接失败。推荐的固定安装位置是 `~/.jiang/toolchains/llvm-21.1`，或者直接使用 Homebrew 的 `/opt/homebrew/opt/llvm@21`。
+
 当前最新执行清单见 `TODO.md`。
 
 ### Stage2 与 `jiang.md` 的当前关系

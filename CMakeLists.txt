@@ -7,6 +7,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter")
 
 option(JIANG_ENABLE_LLVM_C_API "Enable experimental LLVM C API backend path" ON)
+set(JIANG_LLVM_REQUIRED_SERIES "21.1" CACHE STRING "Pinned LLVM minor series for Jiang")
+set(JIANG_LLVM_ROOT "$ENV{JIANG_LLVM_ROOT}" CACHE PATH "Pinned LLVM root for Jiang")
 
 # Include directories
 include_directories(include)
@@ -31,8 +33,24 @@ set(SOURCES
 add_executable(jiangc ${SOURCES})
 
 if (JIANG_ENABLE_LLVM_C_API)
-    find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config)
+    if (JIANG_LLVM_ROOT)
+        set(LLVM_CONFIG_EXECUTABLE "${JIANG_LLVM_ROOT}/bin/llvm-config")
+        if (NOT EXISTS "${LLVM_CONFIG_EXECUTABLE}")
+            message(FATAL_ERROR "Pinned llvm-config not found: ${LLVM_CONFIG_EXECUTABLE}")
+        endif()
+    else()
+        find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config)
+    endif()
+
     if (LLVM_CONFIG_EXECUTABLE)
+        execute_process(
+            COMMAND ${LLVM_CONFIG_EXECUTABLE} --version
+            OUTPUT_VARIABLE LLVM_VERSION_RAW
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (NOT LLVM_VERSION_RAW MATCHES "^${JIANG_LLVM_REQUIRED_SERIES}\\.[0-9]+$")
+            message(FATAL_ERROR "LLVM version mismatch: expected ${JIANG_LLVM_REQUIRED_SERIES}.x, got ${LLVM_VERSION_RAW} from ${LLVM_CONFIG_EXECUTABLE}")
+        endif()
         execute_process(
             COMMAND ${LLVM_CONFIG_EXECUTABLE} --includedir
             OUTPUT_VARIABLE LLVM_INCLUDE_DIR
@@ -56,11 +74,11 @@ if (JIANG_ENABLE_LLVM_C_API)
             foreach(libname IN LISTS LLVM_LIBNAME_LIST)
                 target_link_libraries(jiangc PRIVATE "${LLVM_LIB_DIR}/${libname}")
             endforeach()
-            message(STATUS "Enabled experimental LLVM C API backend")
+            message(STATUS "Enabled experimental LLVM C API backend with LLVM ${LLVM_VERSION_RAW}")
         else()
-            message(STATUS "llvm-config found, but llvm-c headers are unavailable; building without LLVM C API backend")
+            message(FATAL_ERROR "llvm-config found, but llvm-c headers are unavailable under ${LLVM_INCLUDE_DIR}")
         endif()
     else()
-        message(STATUS "llvm-config not found; building without LLVM C API backend")
+        message(FATAL_ERROR "llvm-config not found; configure a pinned LLVM ${JIANG_LLVM_REQUIRED_SERIES}.x toolchain or set JIANG_ENABLE_LLVM_C_API=OFF")
     endif()
 endif()

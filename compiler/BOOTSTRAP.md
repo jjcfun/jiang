@@ -15,6 +15,8 @@
 - emergency fallback: `STAGE2_ALLOW_STAGE1_FALLBACK=1`
 - automatic resolution order:
   `STAGE2_BOOTSTRAP_STAGE2 -> local dist archive -> ~/.jiang/bin/jiang -> build/stage2c`
+- pinned LLVM toolchain series: `21.1.x`
+- recommended LLVM root: `~/.jiang/toolchains/llvm-21.1` or `/opt/homebrew/opt/llvm@21`
 
 ## Recommended Flow
 

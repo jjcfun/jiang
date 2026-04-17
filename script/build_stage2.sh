@@ -5,7 +5,6 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 DIST_ROOT="$PROJECT_ROOT/dist"
-LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -29,9 +28,8 @@ STAGE2_DIST_EXTRACT_ROOT="$BUILD_DIR/stage2_dist_bootstrap"
 
 cd "$PROJECT_ROOT"
 
-LLVM_CFLAGS="$($LLVM_CONFIG --cflags)"
-LLVM_LDFLAGS="$($LLVM_CONFIG --ldflags)"
-LLVM_LIBS="$($LLVM_CONFIG --libs core analysis --system-libs)"
+source "$PROJECT_ROOT/script/llvm_env.sh"
+export_llvm_env
 
 link_stage2() {
     local input_c="$1"

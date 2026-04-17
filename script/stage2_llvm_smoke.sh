@@ -5,10 +5,9 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build"
 OUT_DIR="$BUILD_DIR/stage2_llvm_smoke"
-LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
-LLVM_BINDIR="$($LLVM_CONFIG --bindir)"
-LLVM_CLANG="$LLVM_BINDIR/clang"
-LLVM_LLI="$LLVM_BINDIR/lli"
+
+source "$PROJECT_ROOT/script/llvm_env.sh"
+export_llvm_env
 
 mkdir -p "$OUT_DIR"
 cd "$PROJECT_ROOT"
