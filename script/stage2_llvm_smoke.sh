@@ -261,6 +261,10 @@ STRUCT_INIT_OPTIONAL_OMITTED_LL="$OUT_DIR/struct_init_optional_omitted_minimal.l
 STRUCT_INIT_OPTIONAL_OMITTED_O="$OUT_DIR/struct_init_optional_omitted_minimal.o"
 STRUCT_INIT_BRANCH_COMPLETE_LL="$OUT_DIR/struct_init_branch_complete_minimal.ll"
 STRUCT_INIT_BRANCH_COMPLETE_O="$OUT_DIR/struct_init_branch_complete_minimal.o"
+STRUCT_LITERAL_WITH_INIT_LL="$OUT_DIR/struct_literal_with_init_minimal.ll"
+STRUCT_LITERAL_WITH_INIT_O="$OUT_DIR/struct_literal_with_init_minimal.o"
+STRUCT_NEW_LITERAL_WITH_INIT_LL="$OUT_DIR/struct_new_literal_with_init_minimal.ll"
+STRUCT_NEW_LITERAL_WITH_INIT_O="$OUT_DIR/struct_new_literal_with_init_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
 EMPTY_TUPLE_RETURN_O="$OUT_DIR/empty_tuple_return_minimal.o"
 EMPTY_TUPLE_BARE_RETURN_LL="$OUT_DIR/empty_tuple_bare_return_minimal.ll"
@@ -1835,6 +1839,30 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected struct_init_branch_complete_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_literal_with_init_minimal.jiang" > "$STRUCT_LITERAL_WITH_INIT_LL"
+rg -q '^%User = type \{ i64 \}$' "$STRUCT_LITERAL_WITH_INIT_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_LITERAL_WITH_INIT_LL" -o "$STRUCT_LITERAL_WITH_INIT_O"
+set +e
+"$LLVM_LLI" "$STRUCT_LITERAL_WITH_INIT_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_literal_with_init_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_new_literal_with_init_minimal.jiang" > "$STRUCT_NEW_LITERAL_WITH_INIT_LL"
+rg -q '^%User = type \{ i64 \}$' "$STRUCT_NEW_LITERAL_WITH_INIT_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_NEW_LITERAL_WITH_INIT_LL" -o "$STRUCT_NEW_LITERAL_WITH_INIT_O"
+set +e
+"$LLVM_LLI" "$STRUCT_NEW_LITERAL_WITH_INIT_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_new_literal_with_init_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

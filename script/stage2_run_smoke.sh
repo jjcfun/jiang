@@ -961,6 +961,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/struct_literal_with_init_minimal.jiang" "struct_literal_with_init_minimal"
+set +e
+"$OUT_DIR/struct_literal_with_init_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_literal_with_init_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_new_literal_with_init_minimal.jiang" "struct_new_literal_with_init_minimal"
+set +e
+"$OUT_DIR/struct_new_literal_with_init_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_new_literal_with_init_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/unary_tuple_return_minimal.jiang" "unary_tuple_return_minimal"
 set +e
 "$OUT_DIR/unary_tuple_return_minimal"

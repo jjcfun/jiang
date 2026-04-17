@@ -586,7 +586,18 @@ Point point move_point(Point point, Offset offset) {
 
 #### init函数
 
-struct除了默认的构造语法，还可以自定义init函数
+struct除了默认的构造语法，还可以自定义 `init` 函数。
+
+`init` 具有以下语义：
+
+- `init` 是结构体内唯一的特殊构造器入口
+- `init` 隐式拥有 `self`
+- `init` 不声明返回类型，语义等价于 `()`
+- `init` 只允许 `return;` / `return ();`
+- `Point(...)` 是 `Point.init(...)` 的语法糖
+- `new Point(...)` 会先分配内存，再调用 `Point.init(...)`
+
+默认构造字面量与 `init` 并存，`Point { ... }` / `new Point { ... }` 仍然可用
 
 ```c
 struct Point {
@@ -596,9 +607,24 @@ struct Point {
   init(Int x, Int y) {
     self.x = x;
     self.y = y;
+    return;
   }
 }
 ```
+
+```c
+Point p1 = Point.init(1, 2);
+Point p2 = Point(1, 2);      // 等价于 Point.init(1, 2)
+Point* p3 = new Point(1, 2); // 默认走 new + malloc + init
+Point p4 = Point { x: 1, y: 2 };
+```
+
+字段初始化规则：
+
+- 非 optional 且无默认值字段，必须在所有返回路径上完成初始化
+- optional 字段默认初始化为 `null`
+- 带默认值字段进入 `init` 时视为已初始化
+- 不可变字段最多初始化一次；带默认值的不可变字段不能在 `init` 中再次赋值
 
 Jiang语言中，结构体即可以是值类型，也可以是引用类型。这取决于是初始化时是否带有`new`关键字。以上方的Point结构体为例：
 
