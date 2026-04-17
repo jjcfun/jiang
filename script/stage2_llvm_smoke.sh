@@ -59,6 +59,8 @@ UNION_BIND_LL="$OUT_DIR/union_bind_minimal.ll"
 UNION_BIND_O="$OUT_DIR/union_bind_minimal.o"
 UNION_TUPLE_BIND_LL="$OUT_DIR/union_tuple_bind_minimal.ll"
 UNION_TUPLE_BIND_O="$OUT_DIR/union_tuple_bind_minimal.o"
+UNION_IMPLICIT_TAG_LL="$OUT_DIR/union_implicit_tag_minimal.ll"
+UNION_IMPLICIT_TAG_O="$OUT_DIR/union_implicit_tag_minimal.o"
 UNION_IF_PATTERN_LL="$OUT_DIR/union_if_pattern_minimal.ll"
 UNION_IF_PATTERN_O="$OUT_DIR/union_if_pattern_minimal.o"
 UNION_IF_MUTABLE_BINDING_LL="$OUT_DIR/union_if_mutable_binding_minimal.ll"
@@ -583,6 +585,19 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected union_tuple_bind_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_implicit_tag_minimal.jiang" > "$UNION_IMPLICIT_TAG_LL"
+rg -q '^%MyUnion = type ' "$UNION_IMPLICIT_TAG_LL"
+rg -F -q 'store %MyUnion { i64 0, i64 42' "$UNION_IMPLICIT_TAG_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_IMPLICIT_TAG_LL" -o "$UNION_IMPLICIT_TAG_O"
+set +e
+"$LLVM_LLI" "$UNION_IMPLICIT_TAG_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_implicit_tag_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

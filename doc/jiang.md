@@ -677,12 +677,7 @@ Int b = mode.value();
 ```
 
 ```c
-enum Kind {
-  a,
-  b,
-}
-
-union(Kind) Result {
+union Result {
   Int a;
   Int b;
 
@@ -698,6 +693,25 @@ union(Kind) Result {
 Int a = Result.answer();
 Result result = .a(1);
 Int b = result.value();
+```
+
+`union` 可以显式绑定 tag enum，也可以省略并让编译器按成员名自动生成隐式 tag：
+
+```c
+enum Kind {
+  a,
+  b,
+}
+
+union(Kind) ExplicitResult {
+  Int a;
+  Int b;
+}
+
+union ImplicitResult {
+  Int a;
+  Int b;
+}
 ```
 
 字段初始化规则：
@@ -813,7 +827,7 @@ enum(UInt8) Kind {
   e
 }
 
-union(Kind) MyUnion {
+union MyUnion {
 	Int a;
   Double b;
   (Int, Int) c;

@@ -49,7 +49,7 @@
 - [ ] 类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未对齐更完整的统一推断规则
 - [ ] 条件表达式：当前已支持最小 `cond ? a : b` 标量结果版本，聚合结果仍未对齐
 - [ ] `for`：已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`，但仍未对齐更完整 pattern / binding 与迭代协议
-- [ ] `union`：已支持最小声明、构造、payload binding、带穷尽性检查的 `switch` 与内部函数第一版，尚未对齐简写构造、多值解构与更完整布局语义
+- [ ] `union`：已支持显式/隐式 tag 的最小声明、构造、payload binding、带穷尽性检查的 `switch` 与内部函数第一版，尚未对齐多值解构与更完整布局语义
 - [ ] 模块：已支持 import / public / alias import / `alias` / `public alias`，但仍需继续对齐更完整模块语义
 
 ### 未开始或明确未对齐
