@@ -30,7 +30,7 @@ bash "$PROJECT_ROOT/script/build_stage2.sh"
 bash "$PROJECT_ROOT/script/stage2_selfhost_smoke.sh"
 bash "$PROJECT_ROOT/script/stage2_complete_smoke.sh"
 
-git archive --format=tar.xz --prefix="jiang-$VERSION_NO_V/" "$TAG" -o "$SOURCE_TARBALL"
+git archive --format=tar --prefix="jiang-$VERSION_NO_V/" "$TAG" | xz > "$SOURCE_TARBALL"
 
 mkdir -p "$BINARY_STAGING/bin"
 cp "$STAGE2_BIN" "$BINARY_STAGING/bin/stage2c"
