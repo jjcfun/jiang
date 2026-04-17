@@ -15,8 +15,8 @@ STAGE2_C_PATH="$BUILD_DIR/stage2_compiler.c"
 
 # Bootstrap policy:
 # 1. During active development, prefer a previously built local stage2c.
-# 2. After releases exist, callers can point STAGE2_BOOTSTRAP_STAGE2 at a
-#    stage2c from the previous release.
+# 2. After releases exist, callers can point STAGE2_BOOTSTRAP_STAGE2 at the
+#    jiang binary from the previous release.
 # 3. Stage1 is now a legacy fallback, not the default main path.
 
 cd "$PROJECT_ROOT"
@@ -70,7 +70,7 @@ if bootstrap_stage2_is_usable "$STAGE2_BOOTSTRAP_STAGE2"; then
 else
     if [ "$STAGE2_ALLOW_STAGE1_FALLBACK" != "1" ]; then
         echo "no usable bootstrap stage2 compiler found: $STAGE2_BOOTSTRAP_STAGE2" >&2
-        echo "during development this is usually your last successful build/stage2c; after releases exist it should be the previous release's stage2c" >&2
+        echo "during development this is usually your last successful build/stage2c; after releases exist it should be the previous release's jiang binary" >&2
         echo "provide that compiler via STAGE2_BOOTSTRAP_STAGE2, or set STAGE2_ALLOW_STAGE1_FALLBACK=1 to force the legacy stage1 fallback" >&2
         exit 1
     fi

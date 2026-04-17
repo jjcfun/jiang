@@ -47,7 +47,7 @@
 
 - `script/build_stage2.sh` 现在默认优先使用已有旧版 `stage2c` 作为 bootstrap compiler，并由它重编产出当前 `build/stage2c`
 - 当前开发阶段，这个“旧版 `stage2c`”默认就是本地上一次成功构建留下的 `build/stage2c`
-- 进入正式发布节奏后，这个“旧版 `stage2c`”应切换为“上一版 release 的 `stage2c`”
+- 进入正式发布节奏后，这个 bootstrap compiler 应切换为“上一版 release 包中的 `jiang` 可执行文件”
 - 当本地没有可用的旧版 `stage2c` 时，构建链会回退到 `stage1c -> stage2c.bootstrap -> stage2c`
 - Stage2 的正式 bootstrap contract 固定在 `compiler/BOOTSTRAP.md`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
@@ -86,7 +86,7 @@
 Stage2 替代 Stage1 的验收标准固定为：
 
 - `script/build_stage2.sh` 持续通过，且最终 `build/stage2c` 由 Stage2 自重编产出
-- 当前开发期默认依赖本地已有 `build/stage2c` 做 bootstrap；发布后再切到“上一版 release 的 `stage2c`”做 bootstrap compiler
+- 当前开发期默认依赖本地已有 `build/stage2c` 做 bootstrap；发布后再切到“上一版 release 包中的 `jiang`”做 bootstrap compiler
 - `script/stage2_complete_smoke.sh` 持续通过
 - `script/stage1_complete_smoke.sh` 持续通过，不因 Stage2 演进被打断
 - `stage2c` 的 `emit-c` 与 `--emit-llvm` 都保持可用

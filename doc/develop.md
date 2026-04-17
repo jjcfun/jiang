@@ -162,7 +162,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 当前固定的接管标准是：
 
 *   `script/build_stage2.sh` 持续通过，且默认构建链已采用“已有旧版 Stage2 编译器 -> 当前 Stage2 自重编”的 bootstrap 路径；当本地没有可用旧版 `stage2c` 时仍可回退到 Stage1 引导
-*   当前开发阶段，“已有旧版 Stage2 编译器”默认指本地上一次成功构建保留下来的 `build/stage2c`；进入正式 release 节奏后，应切换为“上一版 release 的 `stage2c`”
+*   当前开发阶段，“已有旧版 Stage2 编译器”默认指本地上一次成功构建保留下来的 `build/stage2c`；进入正式 release 节奏后，应切换为“上一版 release 包中的 `jiang`”
 *   `script/stage2_complete_smoke.sh` 持续通过
 *   `script/stage1_complete_smoke.sh` 持续通过
 *   `script/stage2_selfhost_smoke.sh` 已固定 roundtrip：`stage2c -> compiler -> stage2c.selfhost -> stage2c.roundtrip`

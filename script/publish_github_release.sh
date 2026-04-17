@@ -23,6 +23,11 @@ fi
 gh release view "$VERSION" >/dev/null 2>&1 && EXISTS=1 || EXISTS=0
 
 if [ "$EXISTS" = "1" ]; then
+    while IFS= read -r asset_name; do
+        [ -n "$asset_name" ] || continue
+        gh release delete-asset "$VERSION" "$asset_name" --yes
+    done < <(gh release view "$VERSION" --json assets --jq '.assets[].name')
+
     gh release upload "$VERSION" "$RELEASE_DIR"/* --clobber
     gh release edit "$VERSION" --notes-file "$NOTES_FILE" --title "$VERSION"
 else
