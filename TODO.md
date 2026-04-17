@@ -44,12 +44,12 @@
 - [ ] 指针：已支持 `T*`、`&x`、`*p`、`*p = rhs`，但尚未对齐自动解引用 / 所有权相关语义
 - [ ] 切片：当前主要覆盖 `UInt8[]`，尚未泛化到 `jiang.md` 的完整 `T[]` 语义
 - [ ] 类型修饰：已支持最小 `T?` / `null` / `T!` 语法、可选值 codegen、`== null` / `!= null` 判空、`Option.some(_ x)` 的 `if` / `switch` 判空解包、`?.field` / `?[index]` optional chain、`??` 默认值、基础推断传播、`Int?[2][3]` / `Int[2]!` 这类后缀组合、union pattern `_!` mutable binding，以及 struct init 中省略 optional 字段默认 `null`；但 `!` 仍未收紧赋值规则
-- [ ] 结构体：已支持字段、构造式初始化、最小 `init`/`Type.init(...)`/`Type(...)`/`new Type(...)`、字段默认值与初始化检查、普通 struct 内部函数第一版（`static foo(...)` 与隐式 `self` 的实例函数），但 allocator 版 `new(...)`、值/引用接收者区分与更完整方法系统仍未对齐
-- [ ] 枚举：已支持声明、成员引用、expected-type shorthand、显式值和 `.value`，但未对齐底层类型与更完整推断规则
+- [ ] 结构体：已支持字段、构造式初始化、最小 `init`/`Type.init(...)`/`Type(...)`/`new Type(...)`、字段默认值与初始化检查；`struct` / `union` / `enum` 现已统一支持第一版内部函数（`static foo(...)` 与隐式 `self` 的实例函数），但 `init` 仍仅限 `struct`，且 allocator 版 `new(...)`、值/引用接收者区分与更完整方法系统仍未对齐
+- [ ] 枚举：已支持声明、成员引用、expected-type shorthand、显式值、`.value` 和内部函数第一版，但未对齐底层类型与更完整推断规则
 - [ ] 类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未对齐更完整的统一推断规则
 - [ ] 条件表达式：当前已支持最小 `cond ? a : b` 标量结果版本，聚合结果仍未对齐
 - [ ] `for`：已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`，但仍未对齐更完整 pattern / binding 与迭代协议
-- [ ] `union`：已支持最小声明、构造、payload binding 与带穷尽性检查的 `switch`，尚未对齐简写构造、多值解构与更完整布局语义
+- [ ] `union`：已支持最小声明、构造、payload binding、带穷尽性检查的 `switch` 与内部函数第一版，尚未对齐简写构造、多值解构与更完整布局语义
 - [ ] 模块：已支持 import / public / alias import / `alias` / `public alias`，但仍需继续对齐更完整模块语义
 
 ### 未开始或明确未对齐

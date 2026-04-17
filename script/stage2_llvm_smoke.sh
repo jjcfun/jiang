@@ -269,6 +269,14 @@ STRUCT_STATIC_METHOD_LL="$OUT_DIR/struct_static_method_minimal.ll"
 STRUCT_STATIC_METHOD_O="$OUT_DIR/struct_static_method_minimal.o"
 STRUCT_INSTANCE_METHOD_LL="$OUT_DIR/struct_instance_method_minimal.ll"
 STRUCT_INSTANCE_METHOD_O="$OUT_DIR/struct_instance_method_minimal.o"
+UNION_STATIC_METHOD_LL="$OUT_DIR/union_static_method_minimal.ll"
+UNION_STATIC_METHOD_O="$OUT_DIR/union_static_method_minimal.o"
+UNION_INSTANCE_METHOD_LL="$OUT_DIR/union_instance_method_minimal.ll"
+UNION_INSTANCE_METHOD_O="$OUT_DIR/union_instance_method_minimal.o"
+ENUM_STATIC_METHOD_LL="$OUT_DIR/enum_static_method_minimal.ll"
+ENUM_STATIC_METHOD_O="$OUT_DIR/enum_static_method_minimal.o"
+ENUM_INSTANCE_METHOD_LL="$OUT_DIR/enum_instance_method_minimal.ll"
+ENUM_INSTANCE_METHOD_O="$OUT_DIR/enum_instance_method_minimal.o"
 STRUCT_INSTANCE_METHOD_ARGS_LL="$OUT_DIR/struct_instance_method_with_args_minimal.ll"
 STRUCT_INSTANCE_METHOD_ARGS_O="$OUT_DIR/struct_instance_method_with_args_minimal.o"
 STRUCT_INSTANCE_METHOD_POINTER_LL="$OUT_DIR/struct_instance_method_pointer_base_minimal.ll"
@@ -1899,6 +1907,54 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected struct_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_static_method_minimal.jiang" > "$UNION_STATIC_METHOD_LL"
+rg -q '_MyUnion_answer' "$UNION_STATIC_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_STATIC_METHOD_LL" -o "$UNION_STATIC_METHOD_O"
+set +e
+"$LLVM_LLI" "$UNION_STATIC_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/union_instance_method_minimal.jiang" > "$UNION_INSTANCE_METHOD_LL"
+rg -q '_MyUnion_answer' "$UNION_INSTANCE_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$UNION_INSTANCE_METHOD_LL" -o "$UNION_INSTANCE_METHOD_O"
+set +e
+"$LLVM_LLI" "$UNION_INSTANCE_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected union_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_static_method_minimal.jiang" > "$ENUM_STATIC_METHOD_LL"
+rg -q '_Mode_answer' "$ENUM_STATIC_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ENUM_STATIC_METHOD_LL" -o "$ENUM_STATIC_METHOD_O"
+set +e
+"$LLVM_LLI" "$ENUM_STATIC_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected enum_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/enum_instance_method_minimal.jiang" > "$ENUM_INSTANCE_METHOD_LL"
+rg -q '_Mode_answer' "$ENUM_INSTANCE_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$ENUM_INSTANCE_METHOD_LL" -o "$ENUM_INSTANCE_METHOD_O"
+set +e
+"$LLVM_LLI" "$ENUM_INSTANCE_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected enum_instance_method_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

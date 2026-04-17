@@ -65,6 +65,10 @@ OUT_STRUCT_INIT_SELF_ESCAPE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_self
 OUT_STRUCT_STATIC_USES_SELF_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_static_uses_self.log"
 OUT_STRUCT_INSTANCE_CALL_THROUGH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_instance_call_through_type.log"
 OUT_STRUCT_STATIC_CALL_THROUGH_INSTANCE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_static_call_through_instance.log"
+OUT_UNION_INSTANCE_CALL_THROUGH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_instance_call_through_type.log"
+OUT_UNION_STATIC_CALL_THROUGH_INSTANCE_LOG="$BUILD_DIR/stage2_llvm_invalid_union_static_call_through_instance.log"
+OUT_ENUM_INSTANCE_CALL_THROUGH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_enum_instance_call_through_type.log"
+OUT_ENUM_STATIC_CALL_THROUGH_INSTANCE_LOG="$BUILD_DIR/stage2_llvm_invalid_enum_static_call_through_instance.log"
 OUT_STRUCT_DUPLICATE_METHOD_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_duplicate_method.log"
 OUT_STRUCT_FIELD_METHOD_NAME_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_field_method_name_conflict.log"
 OUT_STRUCT_STATIC_INIT_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_static_init.log"
@@ -1388,6 +1392,86 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_STRUCT_STATIC_CALL_THROUGH_INSTANCE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_static_call_through_instance" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_union_instance_call_through_type.jiang" > "$OUT_UNION_INSTANCE_CALL_THROUGH_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_union_instance_call_through_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_INSTANCE_CALL_THROUGH_TYPE_LOG")" != *"instance method called through type"* ]]; then
+    echo "stage2 llvm error smoke missing union instance-through-type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_UNION_INSTANCE_CALL_THROUGH_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_union_instance_call_through_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_union_static_call_through_instance.jiang" > "$OUT_UNION_STATIC_CALL_THROUGH_INSTANCE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_union_static_call_through_instance to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_UNION_STATIC_CALL_THROUGH_INSTANCE_LOG")" != *"static function called through instance"* ]]; then
+    echo "stage2 llvm error smoke missing union static-through-instance diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_UNION_STATIC_CALL_THROUGH_INSTANCE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_union_static_call_through_instance" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_enum_instance_call_through_type.jiang" > "$OUT_ENUM_INSTANCE_CALL_THROUGH_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_enum_instance_call_through_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ENUM_INSTANCE_CALL_THROUGH_TYPE_LOG")" != *"instance method called through type"* ]]; then
+    echo "stage2 llvm error smoke missing enum instance-through-type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ENUM_INSTANCE_CALL_THROUGH_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_enum_instance_call_through_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_enum_static_call_through_instance.jiang" > "$OUT_ENUM_STATIC_CALL_THROUGH_INSTANCE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_enum_static_call_through_instance to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_ENUM_STATIC_CALL_THROUGH_INSTANCE_LOG")" != *"static function called through instance"* ]]; then
+    echo "stage2 llvm error smoke missing enum static-through-instance diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_ENUM_STATIC_CALL_THROUGH_INSTANCE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_enum_static_call_through_instance" >&2
     exit 1
 fi
 

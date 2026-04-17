@@ -1001,6 +1001,46 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/union_static_method_minimal.jiang" "union_static_method_minimal"
+set +e
+"$OUT_DIR/union_static_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/union_instance_method_minimal.jiang" "union_instance_method_minimal"
+set +e
+"$OUT_DIR/union_instance_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected union_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/enum_static_method_minimal.jiang" "enum_static_method_minimal"
+set +e
+"$OUT_DIR/enum_static_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected enum_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/enum_instance_method_minimal.jiang" "enum_instance_method_minimal"
+set +e
+"$OUT_DIR/enum_instance_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected enum_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/struct_instance_method_with_args_minimal.jiang" "struct_instance_method_with_args_minimal"
 set +e
 "$OUT_DIR/struct_instance_method_with_args_minimal"

@@ -619,14 +619,20 @@ Point* p3 = new Point(1, 2); // 默认走 new + malloc + init
 Point p4 = Point { x: 1, y: 2 };
 ```
 
-#### 结构体内部函数
+#### 名义类型内部函数
 
-除 `init` 外，struct 还可以定义普通内部函数。第一版使用 `static` 区分类型函数与实例函数：
+除 `init` 外，名义类型当前都可以定义普通内部函数。第一版使用 `static` 区分类型函数与实例函数：
 
 - `static Ret foo(...)`：类型函数，只允许 `Type.foo(...)`
 - `Ret foo(...)`：实例函数，函数体内有隐式 `self`，只允许 `value.foo(...)`
 
-`init` 仍然是唯一特殊构造器入口，不能写成 `static init`。
+当前适用范围：
+
+- `struct`：支持 `init`、static 方法、实例方法
+- `union`：支持 static 方法、实例方法
+- `enum`：支持 static 方法、实例方法
+
+`init` 仍然是 `struct` 独有的特殊构造器入口，不能写成 `static init`，也不能定义在 `union` / `enum` 中。
 
 ```c
 struct User {
@@ -649,6 +655,49 @@ struct User {
 Int a = User.zero();
 User user = User(42);
 Int b = user.value();
+```
+
+```c
+enum Mode {
+  read,
+  write,
+
+  static Int answer() {
+    return 42;
+  }
+
+  Int value() {
+    return self.value;
+  }
+}
+
+Int a = Mode.answer();
+Mode mode = Mode.write;
+Int b = mode.value();
+```
+
+```c
+enum Kind {
+  a,
+  b,
+}
+
+union(Kind) Result {
+  Int a;
+  Int b;
+
+  static Int answer() {
+    return 42;
+  }
+
+  Int value() {
+    return self.a;
+  }
+}
+
+Int a = Result.answer();
+Result result = .a(1);
+Int b = result.value();
 ```
 
 字段初始化规则：
