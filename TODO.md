@@ -44,7 +44,7 @@
 - [ ] 指针：已支持 `T*`、`&x`、`*p`、`*p = rhs`，但尚未对齐自动解引用 / 所有权相关语义
 - [ ] 切片：当前主要覆盖 `UInt8[]`，尚未泛化到 `jiang.md` 的完整 `T[]` 语义
 - [ ] 类型修饰：已支持最小 `T?` / `null` / `T!` 语法、可选值 codegen、`== null` / `!= null` 判空、`Option.some(_ x)` 的 `if` / `switch` 判空解包、`?.field` / `?[index]` optional chain、`??` 默认值、基础推断传播、`Int?[2][3]` / `Int[2]!` 这类后缀组合、union pattern `_!` mutable binding，以及 struct init 中省略 optional 字段默认 `null`；但 `!` 仍未收紧赋值规则
-- [ ] 结构体：已支持字段、构造式初始化、最小 `init`/`Type.init(...)`/`Type(...)`/`new Type(...)`、字段默认值与初始化检查，但尚未对齐普通 struct 内部函数、allocator 版 `new(...)` 与更完整值/引用语义
+- [ ] 结构体：已支持字段、构造式初始化、最小 `init`/`Type.init(...)`/`Type(...)`/`new Type(...)`、字段默认值与初始化检查、普通 struct 内部函数第一版（`static foo(...)` 与隐式 `self` 的实例函数），但 allocator 版 `new(...)`、值/引用接收者区分与更完整方法系统仍未对齐
 - [ ] 枚举：已支持声明、成员引用、expected-type shorthand、显式值和 `.value`，但未对齐底层类型与更完整推断规则
 - [ ] 类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未对齐更完整的统一推断规则
 - [ ] 条件表达式：当前已支持最小 `cond ? a : b` 标量结果版本，聚合结果仍未对齐

@@ -62,6 +62,13 @@ OUT_STRUCT_INIT_IMMUTABLE_REASSIGN_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_in
 OUT_STRUCT_INIT_IMMUTABLE_DEFAULT_OVERRIDE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_immutable_default_override.log"
 OUT_STRUCT_INIT_RETURN_VALUE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_return_value.log"
 OUT_STRUCT_INIT_SELF_ESCAPE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_init_self_escape.log"
+OUT_STRUCT_STATIC_USES_SELF_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_static_uses_self.log"
+OUT_STRUCT_INSTANCE_CALL_THROUGH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_instance_call_through_type.log"
+OUT_STRUCT_STATIC_CALL_THROUGH_INSTANCE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_static_call_through_instance.log"
+OUT_STRUCT_DUPLICATE_METHOD_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_duplicate_method.log"
+OUT_STRUCT_FIELD_METHOD_NAME_CONFLICT_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_field_method_name_conflict.log"
+OUT_STRUCT_STATIC_INIT_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_static_init.log"
+OUT_STRUCT_METHOD_MISPARSE_LOG="$BUILD_DIR/stage2_llvm_invalid_struct_method_before_feature_misparse.log"
 OUT_TERNARY_CONDITION_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_condition_type.log"
 OUT_TERNARY_BRANCH_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_branch_type.log"
 OUT_TERNARY_AGGREGATE_RESULT_LOG="$BUILD_DIR/stage2_llvm_invalid_ternary_aggregate_result.log"
@@ -1321,6 +1328,146 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_STRUCT_INIT_SELF_ESCAPE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_init_self_escape" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_static_uses_self.jiang" > "$OUT_STRUCT_STATIC_USES_SELF_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_static_uses_self to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_STATIC_USES_SELF_LOG")" != *"self used in static function"* ]]; then
+    echo "stage2 llvm error smoke missing static self diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_STATIC_USES_SELF_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_static_uses_self" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_instance_call_through_type.jiang" > "$OUT_STRUCT_INSTANCE_CALL_THROUGH_TYPE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_instance_call_through_type to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_INSTANCE_CALL_THROUGH_TYPE_LOG")" != *"instance method called through type"* ]]; then
+    echo "stage2 llvm error smoke missing instance-through-type diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_INSTANCE_CALL_THROUGH_TYPE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_instance_call_through_type" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_static_call_through_instance.jiang" > "$OUT_STRUCT_STATIC_CALL_THROUGH_INSTANCE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_static_call_through_instance to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_STATIC_CALL_THROUGH_INSTANCE_LOG")" != *"static function called through instance"* ]]; then
+    echo "stage2 llvm error smoke missing static-through-instance diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_STATIC_CALL_THROUGH_INSTANCE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_static_call_through_instance" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_duplicate_method.jiang" > "$OUT_STRUCT_DUPLICATE_METHOD_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_duplicate_method to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_DUPLICATE_METHOD_LOG")" != *"duplicate method"* ]]; then
+    echo "stage2 llvm error smoke missing duplicate method diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_DUPLICATE_METHOD_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_duplicate_method" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_field_method_name_conflict.jiang" > "$OUT_STRUCT_FIELD_METHOD_NAME_CONFLICT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_field_method_name_conflict to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_FIELD_METHOD_NAME_CONFLICT_LOG")" != *"field and method names must not conflict"* ]]; then
+    echo "stage2 llvm error smoke missing field/method conflict diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_FIELD_METHOD_NAME_CONFLICT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_field_method_name_conflict" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_static_init.jiang" > "$OUT_STRUCT_STATIC_INIT_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_static_init to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_STATIC_INIT_LOG")" != *"static init is invalid"* ]]; then
+    echo "stage2 llvm error smoke missing static init diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_STATIC_INIT_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_static_init" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_struct_method_before_feature_misparse.jiang" > "$OUT_STRUCT_METHOD_MISPARSE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_struct_method_before_feature_misparse to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_STRUCT_METHOD_MISPARSE_LOG")" != *"unexpected token"* ]]; then
+    echo "stage2 llvm error smoke missing struct method parse diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_STRUCT_METHOD_MISPARSE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_struct_method_before_feature_misparse" >&2
     exit 1
 fi
 

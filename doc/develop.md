@@ -132,7 +132,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
     *   `T[]` 的完整泛化
     *   `T?` / `T!`：当前已支持最小 optional / mutable qualifier 语法、`null`、`== null` / `!= null` 判空、`Option.some(_ x)` 的 `if` / `switch` 判空解包、`?.field` / `?[index]` optional chain、`??` 默认值、基础 expected-type / 推断传播、`Int?[2][3]` / `Int[2]!` 这类后缀组合、union pattern 的 `_!` mutable binding，以及 struct init 中省略 optional 字段默认 `null` 与 C/LLVM codegen；但 `!` 仍未收紧赋值约束
     *   `for`：当前已支持 range、单变量容器迭代、tuple 解构迭代与 `indexed()`；仍未覆盖更完整 pattern / binding 与迭代协议
-    *   `struct init`：当前已支持最小 `init`、隐式 `self`、`Type.init(...)`、`Type(...)` 语法糖、`new Type(...)` 默认 `malloc` 路径、字段默认值 / optional 默认初始化 / 不可变字段重复初始化检查；但普通 struct 内部函数、`new(allocator)` 与更完整构造语义仍未覆盖
+    *   `struct init` / 结构体成员函数：当前已支持最小 `init`、隐式 `self`、`Type.init(...)`、`Type(...)` 语法糖、`new Type(...)` 默认 `malloc` 路径、字段默认值 / optional 默认初始化 / 不可变字段重复初始化检查，以及普通 struct 内部函数第一版：`static Ret foo(...)` 作为类型函数、`Ret foo(...)` 作为隐式 `self` 的实例函数，支持 `Type.method(...)` / `value.method(...)`；但 `new(allocator)`、值/引用接收者区分与更完整方法系统仍未覆盖
     *   枚举：当前已支持 `.ok` 一类 expected-type shorthand、显式值与 `.value`，仍未覆盖底层类型与更完整推断规则
     *   类型推断：当前已支持 `_ x = expr`、`Int[_] x = ...`、expected-type shorthand、基础 tuple/binding 与 typed array constructor，尚未覆盖更完整的统一推断规则
     *   条件表达式：当前已支持最小 `cond ? a : b` 标量结果版本，聚合结果仍未覆盖

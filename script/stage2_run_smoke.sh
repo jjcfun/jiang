@@ -981,6 +981,66 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/struct_static_method_minimal.jiang" "struct_static_method_minimal"
+set +e
+"$OUT_DIR/struct_static_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_instance_method_minimal.jiang" "struct_instance_method_minimal"
+set +e
+"$OUT_DIR/struct_instance_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_instance_method_with_args_minimal.jiang" "struct_instance_method_with_args_minimal"
+set +e
+"$OUT_DIR/struct_instance_method_with_args_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_instance_method_with_args_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_instance_method_pointer_base_minimal.jiang" "struct_instance_method_pointer_base_minimal"
+set +e
+"$OUT_DIR/struct_instance_method_pointer_base_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_instance_method_pointer_base_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_method_calls_method_minimal.jiang" "struct_method_calls_method_minimal"
+set +e
+"$OUT_DIR/struct_method_calls_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_method_calls_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/struct_static_calls_static_minimal.jiang" "struct_static_calls_static_minimal"
+set +e
+"$OUT_DIR/struct_static_calls_static_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected struct_static_calls_static_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/unary_tuple_return_minimal.jiang" "unary_tuple_return_minimal"
 set +e
 "$OUT_DIR/unary_tuple_return_minimal"

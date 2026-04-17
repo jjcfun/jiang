@@ -265,6 +265,18 @@ STRUCT_LITERAL_WITH_INIT_LL="$OUT_DIR/struct_literal_with_init_minimal.ll"
 STRUCT_LITERAL_WITH_INIT_O="$OUT_DIR/struct_literal_with_init_minimal.o"
 STRUCT_NEW_LITERAL_WITH_INIT_LL="$OUT_DIR/struct_new_literal_with_init_minimal.ll"
 STRUCT_NEW_LITERAL_WITH_INIT_O="$OUT_DIR/struct_new_literal_with_init_minimal.o"
+STRUCT_STATIC_METHOD_LL="$OUT_DIR/struct_static_method_minimal.ll"
+STRUCT_STATIC_METHOD_O="$OUT_DIR/struct_static_method_minimal.o"
+STRUCT_INSTANCE_METHOD_LL="$OUT_DIR/struct_instance_method_minimal.ll"
+STRUCT_INSTANCE_METHOD_O="$OUT_DIR/struct_instance_method_minimal.o"
+STRUCT_INSTANCE_METHOD_ARGS_LL="$OUT_DIR/struct_instance_method_with_args_minimal.ll"
+STRUCT_INSTANCE_METHOD_ARGS_O="$OUT_DIR/struct_instance_method_with_args_minimal.o"
+STRUCT_INSTANCE_METHOD_POINTER_LL="$OUT_DIR/struct_instance_method_pointer_base_minimal.ll"
+STRUCT_INSTANCE_METHOD_POINTER_O="$OUT_DIR/struct_instance_method_pointer_base_minimal.o"
+STRUCT_METHOD_CALLS_METHOD_LL="$OUT_DIR/struct_method_calls_method_minimal.ll"
+STRUCT_METHOD_CALLS_METHOD_O="$OUT_DIR/struct_method_calls_method_minimal.o"
+STRUCT_STATIC_CALLS_STATIC_LL="$OUT_DIR/struct_static_calls_static_minimal.ll"
+STRUCT_STATIC_CALLS_STATIC_O="$OUT_DIR/struct_static_calls_static_minimal.o"
 EMPTY_TUPLE_RETURN_LL="$OUT_DIR/empty_tuple_return_minimal.ll"
 EMPTY_TUPLE_RETURN_O="$OUT_DIR/empty_tuple_return_minimal.o"
 EMPTY_TUPLE_BARE_RETURN_LL="$OUT_DIR/empty_tuple_bare_return_minimal.ll"
@@ -1863,6 +1875,78 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected struct_new_literal_with_init_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_static_method_minimal.jiang" > "$STRUCT_STATIC_METHOD_LL"
+rg -q '_User_zero' "$STRUCT_STATIC_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_STATIC_METHOD_LL" -o "$STRUCT_STATIC_METHOD_O"
+set +e
+"$LLVM_LLI" "$STRUCT_STATIC_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_instance_method_minimal.jiang" > "$STRUCT_INSTANCE_METHOD_LL"
+rg -q '_User_value' "$STRUCT_INSTANCE_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INSTANCE_METHOD_LL" -o "$STRUCT_INSTANCE_METHOD_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INSTANCE_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_instance_method_with_args_minimal.jiang" > "$STRUCT_INSTANCE_METHOD_ARGS_LL"
+rg -q '_User_add' "$STRUCT_INSTANCE_METHOD_ARGS_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INSTANCE_METHOD_ARGS_LL" -o "$STRUCT_INSTANCE_METHOD_ARGS_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INSTANCE_METHOD_ARGS_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_instance_method_with_args_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_instance_method_pointer_base_minimal.jiang" > "$STRUCT_INSTANCE_METHOD_POINTER_LL"
+rg -q '_User_value' "$STRUCT_INSTANCE_METHOD_POINTER_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_INSTANCE_METHOD_POINTER_LL" -o "$STRUCT_INSTANCE_METHOD_POINTER_O"
+set +e
+"$LLVM_LLI" "$STRUCT_INSTANCE_METHOD_POINTER_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_instance_method_pointer_base_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_method_calls_method_minimal.jiang" > "$STRUCT_METHOD_CALLS_METHOD_LL"
+rg -q '_User_value_plus_two' "$STRUCT_METHOD_CALLS_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_METHOD_CALLS_METHOD_LL" -o "$STRUCT_METHOD_CALLS_METHOD_O"
+set +e
+"$LLVM_LLI" "$STRUCT_METHOD_CALLS_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_method_calls_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/struct_static_calls_static_minimal.jiang" > "$STRUCT_STATIC_CALLS_STATIC_LL"
+rg -q '_User_two' "$STRUCT_STATIC_CALLS_STATIC_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$STRUCT_STATIC_CALLS_STATIC_LL" -o "$STRUCT_STATIC_CALLS_STATIC_O"
+set +e
+"$LLVM_LLI" "$STRUCT_STATIC_CALLS_STATIC_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected struct_static_calls_static_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
