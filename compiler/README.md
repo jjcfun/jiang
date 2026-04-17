@@ -49,6 +49,7 @@
 - 当前开发阶段，这个“旧版 `stage2c`”默认就是本地上一次成功构建留下的 `build/stage2c`
 - 进入正式发布节奏后，这个“旧版 `stage2c`”应切换为“上一版 release 的 `stage2c`”
 - 当本地没有可用的旧版 `stage2c` 时，构建链会回退到 `stage1c -> stage2c.bootstrap -> stage2c`
+- Stage2 的正式 bootstrap contract 固定在 `compiler/BOOTSTRAP.md`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
 - `build/stage2c` 已支持最小正式 CLI：默认 `emit-c`、显式 `--emit-c|--emit-llvm`、`--help`
 - Stage2 已具备：

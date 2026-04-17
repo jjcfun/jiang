@@ -155,6 +155,28 @@ bash ./script/stage2_complete_smoke.sh
 当前仓库状态下，可以把 Stage2 视为“已完成首个正式可用版本”；后续演进继续围绕 `compiler/` 展开，而不是继续扩张 `bootstrap/`。
 当前仓库也应视为 **Stage2 主线仓库**：历史 C / Stage0、Stage1 和 bootstrap 资产仍然保留在仓库中，但它们的职责已经收敛到 bootstrap、冷启动和回归验证。后续如果需要进一步解耦冷启动体系，可以把 bootstrap orchestration 和历史阶段整理到单独的 `jiang-bootstrap` 仓库，而当前仓库继续只承担 Stage2+ 主线演进。
 
+Stage2 的正式 bootstrap 合约见 [compiler/BOOTSTRAP.md](compiler/BOOTSTRAP.md)。
+
+### Stage2 Release Packaging
+
+当前 Stage2 的发布目录约定为：
+
+- `build/`: 本地临时构建产物
+- `dist/<version>/`: 可发布的 source tarball / binary tarball / checksum / release notes
+- `releases/<version>.md`: 仓库内跟踪的 release notes 源文件
+
+打包当前 release：
+
+```bash
+bash ./script/package_stage2_release.sh v0.2.0
+```
+
+如果本机已安装并登录 `gh`，可直接发布 GitHub release：
+
+```bash
+bash ./script/publish_github_release.sh v0.2.0
+```
+
 ### Stage1c CLI
 
 当前可以通过下面的脚本构建正式的 Stage1 编译器二进制：
