@@ -51,6 +51,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/generic_import_struct_minimal.jiang" "generic_import_struct_minimal"
+set +e
+"$OUT_DIR/generic_import_struct_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected generic_import_struct_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/generic_func_call_minimal.jiang" "generic_func_call_minimal"
 set +e
 "$OUT_DIR/generic_func_call_minimal"
@@ -61,6 +71,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/generic_import_func_call_minimal.jiang" "generic_import_func_call_minimal"
+set +e
+"$OUT_DIR/generic_import_func_call_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected generic_import_func_call_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/generic_func_infer_minimal.jiang" "generic_func_infer_minimal"
 set +e
 "$OUT_DIR/generic_func_infer_minimal"
@@ -68,6 +88,16 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 run smoke expected generic_func_infer_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/generic_import_func_infer_minimal.jiang" "generic_import_func_infer_minimal"
+set +e
+"$OUT_DIR/generic_import_func_infer_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected generic_import_func_infer_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 
