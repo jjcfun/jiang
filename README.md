@@ -145,10 +145,12 @@ bash ./script/stage2_complete_smoke.sh
 - `bootstrap/`: 冻结的 Stage1 bootstrap 基线
 - `compiler/`: 唯一继续演进的 Stage2 编译器主线
 
-当前的 Stage2 bootstrap 策略也固定为两阶段：
+当前的 Stage2 bootstrap 策略固定为：
 
-- 开发阶段：优先使用本地上一次成功构建留下的 `build/stage2c`
-- 发布阶段：切换为使用上一版 release 包中的 `jiang`
+- 显式指定时优先使用 `STAGE2_BOOTSTRAP_STAGE2`
+- 否则优先使用本地 `dist/` 中当前平台可用的最新 `jiang-*.tar.xz`
+- 再退到 `~/.jiang/bin/jiang`
+- 最后才退到本地上一次成功构建留下的 `build/stage2c`
 
 `stage1c` 现在只保留为历史兜底路径，不再是 Stage2 的默认主构建入口。
 

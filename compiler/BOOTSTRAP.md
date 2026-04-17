@@ -13,6 +13,8 @@
 - minimum bootstrap compiler: `v0.2.0`
 - preferred bootstrap compiler: previous stable Stage2 release
 - emergency fallback: `STAGE2_ALLOW_STAGE1_FALLBACK=1`
+- automatic resolution order:
+  `STAGE2_BOOTSTRAP_STAGE2 -> local dist archive -> ~/.jiang/bin/jiang -> build/stage2c`
 
 ## Recommended Flow
 
