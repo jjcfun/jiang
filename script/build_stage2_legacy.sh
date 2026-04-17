@@ -13,15 +13,10 @@ TARGET="${OS}-${ARCH}"
 STAGE2_BOOTSTRAP_STAGE2="${STAGE2_BOOTSTRAP_STAGE2:-}"
 STAGE2_INSTALLED_JIANG="${STAGE2_INSTALLED_JIANG:-$HOME/.jiang/bin/jiang}"
 STAGE2_DIST_ARCHIVE="${STAGE2_DIST_ARCHIVE:-}"
+STAGE2_BOOTSTRAP_C_PATH="$BUILD_DIR/stage2_compiler.bootstrap.c"
+STAGE2_BOOTSTRAP_BIN="$BUILD_DIR/stage2c.bootstrap"
 STAGE2_C_PATH="$BUILD_DIR/stage2_compiler.c"
 STAGE2_DIST_EXTRACT_ROOT="$BUILD_DIR/stage2_dist_bootstrap"
-
-# Bootstrap policy:
-# 1. If STAGE2_BOOTSTRAP_STAGE2 is set, use it directly.
-# 2. Otherwise prefer the newest local dist archive for this target.
-# 3. Then fall back to ~/.jiang/bin/jiang if installed.
-# 4. Then fall back to build/stage2c from local development.
-# 5. Stage1 is not part of the default path; use build_stage2_legacy.sh only for recovery.
 
 cd "$PROJECT_ROOT"
 
@@ -135,10 +130,10 @@ if bootstrap_stage2_is_usable "$RESOLVED_STAGE2_BOOTSTRAP"; then
     echo "bootstrapping stage2 with existing compiler: $RESOLVED_STAGE2_BOOTSTRAP"
     emit_stage2_compiler_c "$RESOLVED_STAGE2_BOOTSTRAP" "$STAGE2_C_PATH"
 else
-    echo "no usable bootstrap stage2 compiler found: $RESOLVED_STAGE2_BOOTSTRAP" >&2
-    echo "auto resolution order is: STAGE2_BOOTSTRAP_STAGE2 -> local dist archive -> ~/.jiang/bin/jiang -> build/stage2c" >&2
-    echo "provide a working Stage2 compiler via STAGE2_BOOTSTRAP_STAGE2, install a release jiang under ~/.jiang/bin/jiang, or use script/build_stage2_legacy.sh for the explicit Stage1 recovery path" >&2
-    exit 1
+    echo "bootstrapping stage2 via legacy stage1 fallback"
+    "$BUILD_DIR/stage1c" --mode emit-c "compiler/entries/compiler.jiang" > "$STAGE2_BOOTSTRAP_C_PATH"
+    link_stage2 "$STAGE2_BOOTSTRAP_C_PATH" "$STAGE2_BOOTSTRAP_BIN"
+    emit_stage2_compiler_c "$STAGE2_BOOTSTRAP_BIN" "$STAGE2_C_PATH"
 fi
 
 echo "linking final stage2 compiler"

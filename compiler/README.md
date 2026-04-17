@@ -49,7 +49,7 @@
 - `script/build_stage2.sh` 现在默认优先使用已有旧版 `stage2c` 作为 bootstrap compiler，并由它重编产出当前 `build/stage2c`
 - 自动解析顺序现在是：`STAGE2_BOOTSTRAP_STAGE2 -> 本地 dist 包中的 jiang -> ~/.jiang/bin/jiang -> build/stage2c`
 - 当前推荐的 bootstrap compiler 仍然是“上一版 release 包中的 `jiang` 可执行文件”
-- 当本地没有可用的旧版 `stage2c` 时，构建链会回退到 `stage1c -> stage2c.bootstrap -> stage2c`
+- 默认 `script/build_stage2.sh` 已不再回退到 Stage1；只有显式执行 `script/build_stage2_legacy.sh` 时才会走 `stage1c -> stage2c.bootstrap -> stage2c`
 - Stage2 的正式 bootstrap contract 固定在 `compiler/BOOTSTRAP.md`
 - `compiler/entries/compiler.jiang` 已支持 `emit-c` 与 `emit-llvm`
 - `build/stage2c` 已支持最小正式 CLI：默认 `emit-c`、显式 `--emit-c|--emit-llvm`、`--help`

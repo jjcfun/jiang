@@ -9,6 +9,8 @@ OUT_CALL_LOG="$BUILD_DIR/stage2_llvm_invalid_call.log"
 OUT_SLICE_ASSIGN_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_slice_assign_type.log"
 OUT_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_private_type.log"
 OUT_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_llvm_invalid_private_function.log"
+OUT_PRIVATE_INSTANCE_METHOD_LOG="$BUILD_DIR/stage2_llvm_invalid_private_instance_method.log"
+OUT_PRIVATE_STATIC_METHOD_LOG="$BUILD_DIR/stage2_llvm_invalid_private_static_method.log"
 OUT_PUBLIC_ALIAS_PRIVATE_FUNC_LOG="$BUILD_DIR/stage2_llvm_invalid_public_alias_private_function.log"
 OUT_PUBLIC_ALIAS_PRIVATE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_public_alias_private_type.log"
 OUT_TRANSITIVE_TYPE_LOG="$BUILD_DIR/stage2_llvm_invalid_transitive_type.log"
@@ -1472,6 +1474,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_ENUM_STATIC_CALL_THROUGH_INSTANCE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_enum_static_call_through_instance" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_import_private_instance_method.jiang" > "$OUT_PRIVATE_INSTANCE_METHOD_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_import_private_instance_method to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_PRIVATE_INSTANCE_METHOD_LOG")" != *"method is private"* ]]; then
+    echo "stage2 llvm error smoke missing private instance method diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_PRIVATE_INSTANCE_METHOD_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_private_instance_method" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_import_private_static_method.jiang" > "$OUT_PRIVATE_STATIC_METHOD_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_import_private_static_method to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_PRIVATE_STATIC_METHOD_LOG")" != *"method is private"* ]]; then
+    echo "stage2 llvm error smoke missing private static method diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_PRIVATE_STATIC_METHOD_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_import_private_static_method" >&2
     exit 1
 fi
 

@@ -128,6 +128,10 @@ ALIAS_IMPORT_FUNCTION_LL="$OUT_DIR/alias_import_function_minimal.ll"
 ALIAS_IMPORT_FUNCTION_O="$OUT_DIR/alias_import_function_minimal.o"
 PUBLIC_ALIAS_FUNCTION_LL="$OUT_DIR/public_alias_function_minimal.ll"
 PUBLIC_ALIAS_FUNCTION_O="$OUT_DIR/public_alias_function_minimal.o"
+PUBLIC_IMPORT_INSTANCE_METHOD_LL="$OUT_DIR/public_import_instance_method_minimal.ll"
+PUBLIC_IMPORT_INSTANCE_METHOD_O="$OUT_DIR/public_import_instance_method_minimal.o"
+PUBLIC_IMPORT_STATIC_METHOD_LL="$OUT_DIR/public_import_static_method_minimal.ll"
+PUBLIC_IMPORT_STATIC_METHOD_O="$OUT_DIR/public_import_static_method_minimal.o"
 ALIAS_IMPORT_TYPE_LL="$OUT_DIR/alias_import_type_minimal.ll"
 ALIAS_IMPORT_TYPE_O="$OUT_DIR/alias_import_type_minimal.o"
 PUBLIC_ALIAS_TYPE_LL="$OUT_DIR/public_alias_type_minimal.ll"
@@ -1006,6 +1010,33 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected public_alias_function_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/public_import_instance_method_minimal.jiang" > "$PUBLIC_IMPORT_INSTANCE_METHOD_LL"
+rg -q 'define i64 @.*MethodBox_public_value\(ptr %0\)' "$PUBLIC_IMPORT_INSTANCE_METHOD_LL"
+rg -q 'define %MethodBox @.*MethodBox_init\(i64 %0\)' "$PUBLIC_IMPORT_INSTANCE_METHOD_LL"
+rg -q 'call i64 @.*MethodBox_public_value\(ptr %box\)' "$PUBLIC_IMPORT_INSTANCE_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$PUBLIC_IMPORT_INSTANCE_METHOD_LL" -o "$PUBLIC_IMPORT_INSTANCE_METHOD_O"
+set +e
+"$LLVM_LLI" "$PUBLIC_IMPORT_INSTANCE_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected public_import_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/public_import_static_method_minimal.jiang" > "$PUBLIC_IMPORT_STATIC_METHOD_LL"
+rg -q 'define i64 @.*MethodBox_public_answer\(\)' "$PUBLIC_IMPORT_STATIC_METHOD_LL"
+rg -q 'call i64 @.*MethodBox_public_answer\(\)' "$PUBLIC_IMPORT_STATIC_METHOD_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$PUBLIC_IMPORT_STATIC_METHOD_LL" -o "$PUBLIC_IMPORT_STATIC_METHOD_O"
+set +e
+"$LLVM_LLI" "$PUBLIC_IMPORT_STATIC_METHOD_LL"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 llvm smoke expected public_import_static_method_minimal exit code 42, got $STATUS" >&2
     exit 1
 fi
 

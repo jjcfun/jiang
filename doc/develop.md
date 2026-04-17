@@ -163,7 +163,7 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 
 当前固定的接管标准是：
 
-*   `script/build_stage2.sh` 持续通过，且默认构建链已采用“已有旧版 Stage2 编译器 -> 当前 Stage2 自重编”的 bootstrap 路径；当本地没有可用旧版 `stage2c` 时仍可回退到 Stage1 引导
+*   `script/build_stage2.sh` 持续通过，且默认构建链已采用“已有旧版 Stage2 编译器 -> 当前 Stage2 自重编”的 bootstrap 路径；Stage1 只保留在 `script/build_stage2_legacy.sh` 这个显式救援入口中
 *   当前默认会按 `STAGE2_BOOTSTRAP_STAGE2 -> 本地 dist 包中的 jiang -> ~/.jiang/bin/jiang -> build/stage2c` 顺序自动解析旧版 Stage2 编译器；推荐基线仍是上一版 release 包中的 `jiang`
 *   `script/stage2_complete_smoke.sh` 持续通过
 *   `script/stage1_complete_smoke.sh` 持续通过

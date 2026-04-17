@@ -1161,6 +1161,26 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/public_import_instance_method_minimal.jiang" "public_import_instance_method_minimal"
+set +e
+"$OUT_DIR/public_import_instance_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected public_import_instance_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/public_import_static_method_minimal.jiang" "public_import_static_method_minimal"
+set +e
+"$OUT_DIR/public_import_static_method_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 42 ]]; then
+    echo "stage2 run smoke expected public_import_static_method_minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/alias_import_function_minimal.jiang" "alias_import_function_minimal"
 set +e
 "$OUT_DIR/alias_import_function_minimal"

@@ -12,9 +12,9 @@
 
 - minimum bootstrap compiler: `v0.2.0`
 - preferred bootstrap compiler: previous stable Stage2 release
-- emergency fallback: `STAGE2_ALLOW_STAGE1_FALLBACK=1`
 - automatic resolution order:
   `STAGE2_BOOTSTRAP_STAGE2 -> local dist archive -> ~/.jiang/bin/jiang -> build/stage2c`
+- legacy Stage1 recovery path: `bash ./script/build_stage2_legacy.sh`
 - pinned LLVM toolchain series: `21.1.x`
 - recommended LLVM root: `~/.jiang/toolchains/llvm-21.1` or `/opt/homebrew/opt/llvm@21`
 
@@ -43,6 +43,7 @@ bash ./script/build_stage2.sh
 - 第一个可作为后续 Stage2 主线 bootstrap anchor 的正式版本
 - 允许 `compiler/` 后续源码逐步切换到 Stage2 语法
 - 明确把“发布版 Stage2 -> 开发版 Stage2”固定为主 bootstrap 路径
+- 默认 `script/build_stage2.sh` 已不再回退到 Stage1；Stage1 只保留在 `script/build_stage2_legacy.sh` 这个显式救援入口中
 
 ## Binary Naming
 
