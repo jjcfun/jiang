@@ -26,8 +26,12 @@ typedef struct LowerContext {
 #define expr_list_push(list, expr) VEC_PUSH((list), (expr))
 #define function_list_push(list, fn) VEC_PUSH((list), (fn))
 #define global_list_push(list, global) VEC_PUSH((list), (global))
+#define enum_member_list_push(list, member) VEC_PUSH((list), (member))
+#define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
+
+static int fail(LowerContext* ctx, const char* error);
 
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
     switch (kind) {
@@ -36,6 +40,14 @@ static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
         case HIR_TYPE_VOID: return &program->void_type;
         default: return 0;
     }
+}
+
+static HirEnumDecl* find_enum(HirProgram* program, const char* name) {
+    return (HirEnumDecl*)hashmap_get(&program->enum_name_map, name);
+}
+
+static HirEnumMember* find_enum_member(HirProgram* program, const char* name) {
+    return (HirEnumMember*)hashmap_get(&program->enum_member_map, name);
 }
 
 static HirUnionDecl* find_union(HirProgram* program, const char* name) {
@@ -63,6 +75,9 @@ static int type_equals(HirType* left, HirType* right) {
     }
     if (left->kind == HIR_TYPE_ARRAY) {
         return left->array_length == right->array_length && type_equals(left->array_item, right->array_item);
+    }
+    if (left->kind == HIR_TYPE_ENUM) {
+        return left->enum_decl == right->enum_decl;
     }
     if (left->kind == HIR_TYPE_UNION) {
         return left->union_decl == right->union_decl;
@@ -97,13 +112,20 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             return array;
         }
         case AST_TYPE_NAMED: {
+            HirEnumDecl* enum_decl = find_enum(ctx->program, type->named_name);
             HirUnionDecl* union_decl = find_union(ctx->program, type->named_name);
+            if (enum_decl) {
+                HirType* enum_type = new_owned_type(ctx->program, HIR_TYPE_ENUM);
+                enum_type->enum_decl = enum_decl;
+                return enum_type;
+            }
             if (union_decl) {
                 HirType* union_type = new_owned_type(ctx->program, HIR_TYPE_UNION);
                 union_type->union_decl = union_decl;
                 return union_type;
             }
-            return primitive_type(ctx->program, HIR_TYPE_INT);
+            fail(ctx, "unknown named type");
+            return 0;
         }
         case AST_TYPE_TUPLE: {
             HirType* tuple = new_owned_type(ctx->program, HIR_TYPE_TUPLE);
@@ -233,6 +255,21 @@ static void rebuild_function_map(HirProgram* program) {
     }
 }
 
+static void rebuild_enum_maps(HirProgram* program) {
+    int i = 0;
+    hashmap_free(&program->enum_name_map);
+    hashmap_init(&program->enum_name_map);
+    hashmap_free(&program->enum_member_map);
+    hashmap_init(&program->enum_member_map);
+    for (i = 0; i < program->enums.count; ++i) {
+        int j = 0;
+        hashmap_set(&program->enum_name_map, program->enums.items[i].name, &program->enums.items[i]);
+        for (j = 0; j < program->enums.items[i].members.count; ++j) {
+            hashmap_set(&program->enum_member_map, program->enums.items[i].members.items[j].name, &program->enums.items[i].members.items[j]);
+        }
+    }
+}
+
 static int payload_slot_count(HirType* type) {
     int i = 0;
     if (!type || type->kind == HIR_TYPE_VOID) {
@@ -252,6 +289,16 @@ static int payload_slot_count(HirType* type) {
     return -1;
 }
 
+static HirEnumMember* find_enum_member_in_decl(HirEnumDecl* enum_decl, const char* name) {
+    int i = 0;
+    for (i = 0; i < enum_decl->members.count; ++i) {
+        if (strcmp(enum_decl->members.items[i].name, name) == 0) {
+            return &enum_decl->members.items[i];
+        }
+    }
+    return 0;
+}
+
 static HirUnionVariant* find_union_variant(HirUnionDecl* union_decl, const char* name) {
     int i = 0;
     for (i = 0; i < union_decl->variants.count; ++i) {
@@ -260,6 +307,35 @@ static HirUnionVariant* find_union_variant(HirUnionDecl* union_decl, const char*
         }
     }
     return 0;
+}
+
+static HirEnumMember* resolve_enum_expr(LowerContext* ctx, const AstExpr* expr, HirEnumDecl** out_enum) {
+    HirEnumMember* member = 0;
+    HirEnumDecl* enum_decl = 0;
+    int i = 0;
+    if (expr->as.variant.union_name) {
+        enum_decl = find_enum(ctx->program, expr->as.variant.union_name);
+        if (!enum_decl) {
+            return 0;
+        }
+        member = find_enum_member_in_decl(enum_decl, expr->as.variant.variant_name);
+    } else {
+        for (i = 0; i < ctx->program->enums.count; ++i) {
+            HirEnumMember* candidate = find_enum_member_in_decl(&ctx->program->enums.items[i], expr->as.variant.variant_name);
+            if (candidate) {
+                enum_decl = &ctx->program->enums.items[i];
+                member = candidate;
+                break;
+            }
+        }
+    }
+    if (!member || !enum_decl) {
+        return 0;
+    }
+    if (out_enum) {
+        *out_enum = enum_decl;
+    }
+    return member;
 }
 
 static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding) {
@@ -284,6 +360,7 @@ static void pop_scope(LowerContext* ctx) {
 }
 
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
+static HirExpr* make_union_tag_expr(LowerContext* ctx, HirExpr* value, int line);
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out);
 static int lower_pattern_bind(LowerContext* ctx, const AstBindingPattern* pattern, HirExpr* init, HirBlock* out_block);
 
@@ -408,12 +485,25 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
             return out;
         }
         case AST_EXPR_VARIANT: {
+            HirEnumDecl* enum_decl = 0;
+            HirEnumMember* enum_member = 0;
             HirUnionDecl* union_decl = 0;
-            HirUnionVariant* variant = resolve_variant_expr(ctx, expr, &union_decl);
             HirType* union_type = 0;
-            if (!variant) {
-                return 0;
+            if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0) {
+                enum_member = resolve_enum_expr(ctx, expr, &enum_decl);
+                if (enum_member) {
+                    HirType* enum_type = new_owned_type(ctx->program, HIR_TYPE_ENUM);
+                    enum_type->enum_decl = enum_decl;
+                    out = new_expr(HIR_EXPR_ENUM_MEMBER, enum_type, expr->line);
+                    out->as.enum_member.member = enum_member;
+                    return out;
+                }
             }
+            {
+                HirUnionVariant* variant = resolve_variant_expr(ctx, expr, &union_decl);
+                if (!variant) {
+                    return 0;
+                }
             if (expr->as.variant.pattern_flag) {
                 fail(ctx, "variant pattern is not a value expression");
                 return 0;
@@ -442,6 +532,24 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                 return 0;
             }
             return out;
+            }
+        }
+        case AST_EXPR_FIELD: {
+            HirExpr* base = lower_expr(ctx, expr->as.field.base);
+            if (!base) {
+                return 0;
+            }
+            if (base->type->kind == HIR_TYPE_ENUM && strcmp(expr->as.field.name, "value") == 0) {
+                out = new_expr(HIR_EXPR_ENUM_VALUE, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out->as.enum_value.value = base;
+                return out;
+            }
+            if (base->type->kind == HIR_TYPE_UNION && strcmp(expr->as.field.name, "tag") == 0) {
+                out = make_union_tag_expr(ctx, base, expr->line);
+                return out;
+            }
+            fail(ctx, "unknown field");
+            return 0;
         }
         case AST_EXPR_BINARY: {
             HirExpr* left = lower_expr(ctx, expr->as.binary.left);
@@ -478,7 +586,7 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                     fail(ctx, "comparison requires matching operand types");
                     return 0;
                 }
-                if (left->type->kind != HIR_TYPE_INT && left->type->kind != HIR_TYPE_BOOL) {
+                if (left->type->kind != HIR_TYPE_INT && left->type->kind != HIR_TYPE_BOOL && left->type->kind != HIR_TYPE_ENUM) {
                     fail(ctx, "comparison operand type unsupported");
                     return 0;
                 }
@@ -879,6 +987,9 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
         }
         return 1;
     }
+    if (pattern->as.variant.bindings.count == 0) {
+        return 1;
+    }
     if (pattern->as.variant.bindings.count != 1) {
         return fail(ctx, "non-tuple variant pattern arity mismatch");
     }
@@ -908,8 +1019,22 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
             Scope then_scope;
             Scope else_scope;
             push_scope(ctx, &then_scope);
-            if (!lower_variant_pattern_bind(ctx, value, ast_case->pattern, &if_stmt->as.if_stmt.then_block, &if_stmt->as.if_stmt.cond)) {
-                return 0;
+            if (value->type->kind == HIR_TYPE_UNION && ast_case->pattern->kind == AST_EXPR_VARIANT) {
+                if (!lower_variant_pattern_bind(ctx, value, ast_case->pattern, &if_stmt->as.if_stmt.then_block, &if_stmt->as.if_stmt.cond)) {
+                    return 0;
+                }
+            } else {
+                HirExpr* case_value = lower_expr(ctx, ast_case->pattern);
+                if (!case_value) {
+                    return 0;
+                }
+                if (!type_equals(value->type, case_value->type)) {
+                    return fail(ctx, "switch case type mismatch");
+                }
+                if_stmt->as.if_stmt.cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), ast_case->pattern->line);
+                if_stmt->as.if_stmt.cond->as.binary.op = HIR_BIN_EQ;
+                if_stmt->as.if_stmt.cond->as.binary.left = value;
+                if_stmt->as.if_stmt.cond->as.binary.right = case_value;
             }
             if (!lower_block(ctx, &ast_case->body, &if_stmt->as.if_stmt.then_block)) {
                 return 0;
@@ -1095,11 +1220,34 @@ static int register_globals(LowerContext* ctx) {
 static int register_enums(LowerContext* ctx) {
     int i = 0;
     for (i = 0; i < ctx->ast->enums.count; ++i) {
+        HirEnumDecl enum_decl;
+        int next_value = 0;
+        int j = 0;
         if (hashmap_contains(&ctx->program->type_name_map, ctx->ast->enums.items[i].name)) {
             return fail(ctx, "duplicate type name");
         }
+        memset(&enum_decl, 0, sizeof(enum_decl));
+        enum_decl.name = ctx->ast->enums.items[i].name;
+        for (j = 0; j < ctx->ast->enums.items[i].members.count; ++j) {
+            HirEnumMember member;
+            memset(&member, 0, sizeof(member));
+            if (hashmap_contains(&ctx->program->enum_member_map, ctx->ast->enums.items[i].members.items[j].name)) {
+                return fail(ctx, "duplicate enum member");
+            }
+            member.name = ctx->ast->enums.items[i].members.items[j].name;
+            if (ctx->ast->enums.items[i].members.items[j].has_value) {
+                member.value = ctx->ast->enums.items[i].members.items[j].value;
+                next_value = (int)member.value + 1;
+            } else {
+                member.value = next_value++;
+            }
+            enum_member_list_push(&enum_decl.members, member);
+            hashmap_set(&ctx->program->enum_member_map, member.name, (void*)1);
+        }
+        enum_list_push(&ctx->program->enums, enum_decl);
         hashmap_set(&ctx->program->type_name_map, ctx->ast->enums.items[i].name, (void*)1);
     }
+    rebuild_enum_maps(ctx->program);
     return 1;
 }
 
@@ -1220,6 +1368,8 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     hashmap_init(&hir->global_map);
     hashmap_init(&hir->function_map);
     hashmap_init(&hir->type_name_map);
+    hashmap_init(&hir->enum_name_map);
+    hashmap_init(&hir->enum_member_map);
     hashmap_init(&hir->union_name_map);
     hashmap_init(&hir->variant_map);
     ctx.program = hir;

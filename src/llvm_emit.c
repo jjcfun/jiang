@@ -120,6 +120,8 @@ static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
             return LLVMInt1TypeInContext(context);
         case HIR_TYPE_VOID:
             return LLVMVoidTypeInContext(context);
+        case HIR_TYPE_ENUM:
+            return LLVMInt64TypeInContext(context);
         case HIR_TYPE_TUPLE:
             return llvm_tuple_type(context, type);
         case HIR_TYPE_ARRAY:
@@ -157,6 +159,9 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
     }
     if (expr->kind == HIR_EXPR_INT) {
         return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.int_value, 1);
+    }
+    if (expr->kind == HIR_EXPR_ENUM_MEMBER) {
+        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.enum_member.member->value, 1);
     }
     if (expr->kind == HIR_EXPR_TUPLE) {
         if (expr->as.tuple.items.count > 0) {
@@ -404,6 +409,10 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case HIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
             }
         }
+        case HIR_EXPR_ENUM_MEMBER:
+            return llvm_const_expr(cg->context, expr);
+        case HIR_EXPR_ENUM_VALUE:
+            return emit_expr(cg, expr->as.enum_value.value);
         case HIR_EXPR_TUPLE: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.tuple.items.count; ++i) {

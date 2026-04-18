@@ -75,6 +75,12 @@ run_sample for_range_minimal.jiang 8
 run_sample infer_global_minimal.jiang 42
 run_sample infer_local_minimal.jiang 42
 run_sample infer_mutable_local_minimal.jiang 42
+run_sample enum_minimal.jiang 2
+run_sample enum_shorthand_minimal.jiang 42
+run_sample enum_shorthand_arg_minimal.jiang 42
+run_sample enum_value_minimal.jiang 42
+run_sample enum_switch_shorthand_minimal.jiang 42
+run_sample switch_enum_minimal.jiang 42
 run_sample assert_minimal.jiang 42
 run_sample print_minimal.jiang 42
 run_sample tuple_value_minimal.jiang 42
@@ -99,6 +105,14 @@ run_sample union_tuple_bind_minimal.jiang 42
 run_sample union_tuple_switch_mutable_binding_minimal.jiang 42
 run_sample union_tuple_if_shorthand_pattern_minimal.jiang 42
 run_sample union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
+run_sample union_minimal.jiang 42
+run_sample union_shorthand_minimal.jiang 42
+run_sample union_bind_minimal.jiang 42
+run_sample union_if_pattern_minimal.jiang 42
+run_sample union_if_mutable_binding_minimal.jiang 42
+run_sample union_if_shorthand_pattern_minimal.jiang 42
+run_sample union_switch_mutable_binding_minimal.jiang 42
+run_sample union_switch_shorthand_pattern_minimal.jiang 42
 run_compile_fail invalid_tuple_index_non_literal.jiang
 run_compile_fail invalid_tuple_index_out_of_range.jiang
 run_compile_fail invalid_tuple_destructure_arity.jiang
@@ -106,6 +120,12 @@ run_compile_fail invalid_tuple_destructure_rhs.jiang
 run_compile_fail invalid_empty_tuple_return_non_void.jiang
 run_compile_fail invalid_for_tuple_binding_non_tuple.jiang
 run_compile_fail invalid_for_tuple_binding_arity.jiang
+run_compile_fail invalid_switch_case_type.jiang
+run_compile_fail invalid_duplicate_enum.jiang
+run_compile_fail invalid_duplicate_enum_member.jiang
+run_compile_fail invalid_union_bind_void.jiang
+run_compile_fail invalid_union_ctor_arg.jiang
+run_compile_fail invalid_union_pattern_ne_bind.jiang
 run_compile_fail invalid_union_tuple_bind_non_tuple.jiang
 run_compile_fail invalid_union_tuple_bind_arity.jiang
 run_sample_nonzero panic_minimal.jiang

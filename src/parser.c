@@ -29,7 +29,7 @@ static int token_equals(const Token* token, const char* text) {
 #define type_list_push(list, type) VEC_PUSH((list), (type))
 #define function_list_push(list, fn) VEC_PUSH((list), (fn))
 #define global_list_push(list, global) VEC_PUSH((list), (global))
-#define name_list_push(list, name) VEC_PUSH((list), (name))
+#define enum_member_list_push(list, member) VEC_PUSH((list), (member))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
@@ -405,6 +405,9 @@ static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag) {
     expr->as.variant.variant_name = token_dup(&parser->current);
     expr->as.variant.pattern_flag = pattern_flag;
     advance(parser);
+    if (parser->current.kind != TOKEN_LEFT_PAREN) {
+        return expr;
+    }
     if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after variant name")) {
         return 0;
     }
@@ -579,6 +582,22 @@ static AstExpr* parse_postfix(Parser* parser) {
                 return 0;
             }
             expr = index;
+            continue;
+        }
+        if (parser->current.kind == TOKEN_DOT) {
+            AstExpr* field = 0;
+            if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "indexed")) {
+                break;
+            }
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return 0;
+            }
+            field = new_expr(AST_EXPR_FIELD, expr->line);
+            field->as.field.base = expr;
+            field->as.field.name = token_dup(&parser->current);
+            advance(parser);
+            expr = field;
             continue;
         }
         break;
@@ -765,7 +784,11 @@ static AstStmt* parse_stmt(Parser* parser) {
                 switch_case.is_else = 1;
                 advance(parser);
             } else {
-                switch_case.pattern = parse_variant_expr(parser, 1);
+                if (looks_like_variant_pattern_expr(parser)) {
+                    switch_case.pattern = parse_variant_expr(parser, 1);
+                } else {
+                    switch_case.pattern = parse_expr(parser);
+                }
                 if (!switch_case.pattern) {
                     return 0;
                 }
@@ -1005,13 +1028,31 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
-        char* member = 0;
+        AstEnumMember member;
+        memset(&member, 0, sizeof(member));
         if (parser->current.kind != TOKEN_IDENT) {
             return fail(parser, "expected enum member");
         }
-        member = token_dup(&parser->current);
+        member.name = token_dup(&parser->current);
+        member.line = parser->current.line;
         advance(parser);
-        name_list_push(&enum_decl.members, member);
+        if (parser->current.kind == TOKEN_ASSIGN) {
+            char* end = 0;
+            long long value = 0;
+            advance(parser);
+            if (parser->current.kind != TOKEN_INT_LIT) {
+                return fail(parser, "expected integer enum value");
+            }
+            errno = 0;
+            value = strtoll(parser->current.start, &end, 10);
+            if (errno != 0 || end != parser->current.start + parser->current.length || value > INT64_MAX || value < INT64_MIN) {
+                return fail(parser, "invalid integer enum value");
+            }
+            member.has_value = 1;
+            member.value = (int64_t)value;
+            advance(parser);
+        }
+        enum_member_list_push(&enum_decl.members, member);
         if (parser->current.kind == TOKEN_COMMA) {
             advance(parser);
         }

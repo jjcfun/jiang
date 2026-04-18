@@ -10,6 +10,8 @@ typedef struct HirExpr HirExpr;
 typedef struct HirStmt HirStmt;
 typedef struct HirFunction HirFunction;
 typedef struct HirBinding HirBinding;
+typedef struct HirEnumDecl HirEnumDecl;
+typedef struct HirEnumMember HirEnumMember;
 typedef struct HirUnionDecl HirUnionDecl;
 typedef struct HirUnionVariant HirUnionVariant;
 
@@ -23,6 +25,7 @@ typedef enum HirTypeKind {
     HIR_TYPE_INT = 0,
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
+    HIR_TYPE_ENUM,
     HIR_TYPE_TUPLE,
     HIR_TYPE_ARRAY,
     HIR_TYPE_UNION,
@@ -33,6 +36,7 @@ struct HirType {
     HirTypeList tuple_items;
     HirType* array_item;
     int array_length;
+    HirEnumDecl* enum_decl;
     HirUnionDecl* union_decl;
 };
 
@@ -61,7 +65,9 @@ typedef enum HirExprKind {
     HIR_EXPR_BINDING,
     HIR_EXPR_BINARY,
     HIR_EXPR_CALL,
+    HIR_EXPR_ENUM_MEMBER,
     HIR_EXPR_VARIANT,
+    HIR_EXPR_ENUM_VALUE,
     HIR_EXPR_UNION_TAG,
     HIR_EXPR_UNION_FIELD,
     HIR_EXPR_TUPLE,
@@ -114,9 +120,15 @@ struct HirExpr {
             HirExprList args;
         } call;
         struct {
+            HirEnumMember* member;
+        } enum_member;
+        struct {
             HirUnionVariant* variant;
             HirExpr* payload;
         } variant;
+        struct {
+            HirExpr* value;
+        } enum_value;
         struct {
             HirExpr* value;
         } union_tag;
@@ -212,6 +224,28 @@ typedef struct HirFunctionList {
     int capacity;
 } HirFunctionList;
 
+struct HirEnumMember {
+    char* name;
+    int64_t value;
+};
+
+typedef struct HirEnumMemberList {
+    HirEnumMember* items;
+    int count;
+    int capacity;
+} HirEnumMemberList;
+
+struct HirEnumDecl {
+    char* name;
+    HirEnumMemberList members;
+};
+
+typedef struct HirEnumList {
+    HirEnumDecl* items;
+    int count;
+    int capacity;
+} HirEnumList;
+
 struct HirUnionVariant {
     char* name;
     HirType* payload_type;
@@ -251,6 +285,7 @@ typedef struct HirGlobalList {
 } HirGlobalList;
 
 typedef struct HirProgram {
+    HirEnumList enums;
     HirUnionList unions;
     HirGlobalList globals;
     HirFunctionList functions;
@@ -261,6 +296,8 @@ typedef struct HirProgram {
     HashMap global_map;
     HashMap function_map;
     HashMap type_name_map;
+    HashMap enum_name_map;
+    HashMap enum_member_map;
     HashMap union_name_map;
     HashMap variant_map;
 } HirProgram;

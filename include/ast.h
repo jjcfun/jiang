@@ -48,6 +48,7 @@ typedef enum AstExprKind {
     AST_EXPR_BINARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
+    AST_EXPR_FIELD,
     AST_EXPR_TUPLE,
     AST_EXPR_ARRAY,
     AST_EXPR_INDEX,
@@ -66,11 +67,18 @@ typedef enum AstBinaryOp {
     AST_BIN_GE,
 } AstBinaryOp;
 
-typedef struct AstNameList {
-    char** items;
+typedef struct AstEnumMember {
+    char* name;
+    int has_value;
+    int64_t value;
+    int line;
+} AstEnumMember;
+
+typedef struct AstEnumMemberList {
+    AstEnumMember* items;
     int count;
     int capacity;
-} AstNameList;
+} AstEnumMemberList;
 
 typedef struct AstBindingPatternList {
     AstBindingPattern** items;
@@ -101,6 +109,10 @@ struct AstExpr {
             AstBindingPatternList bindings;
             int pattern_flag;
         } variant;
+        struct {
+            AstExpr* base;
+            char* name;
+        } field;
         struct {
             AstExprList items;
         } tuple;
@@ -239,7 +251,7 @@ typedef struct AstFunction {
 
 struct AstEnumDecl {
     char* name;
-    AstNameList members;
+    AstEnumMemberList members;
     int line;
 };
 typedef struct AstEnumDecl AstEnumDecl;
