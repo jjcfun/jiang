@@ -489,21 +489,26 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             if (expr->as.index.base->type->kind == HIR_TYPE_TUPLE) {
                 return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.index.base), (unsigned)expr->as.index.index->as.int_value, "tuple.idx");
             }
-            if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY && expr->as.index.base->kind == HIR_EXPR_BINDING) {
-                LLVMValueRef indices[2];
-                LLVMValueRef base_ptr = 0;
-                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
-                indices[1] = emit_expr(cg, expr->as.index.index);
-                if (expr->as.index.base->as.binding->kind == HIR_BINDING_GLOBAL) {
-                    base_ptr = llvm_global_for(cg->module, expr->as.index.base->as.binding);
-                } else {
-                    base_ptr = find_alloca(cg, expr->as.index.base->as.binding);
+            if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY) {
+                if (expr->as.index.base->kind == HIR_EXPR_BINDING) {
+                    LLVMValueRef indices[2];
+                    LLVMValueRef base_ptr = 0;
+                    indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                    indices[1] = emit_expr(cg, expr->as.index.index);
+                    if (expr->as.index.base->as.binding->kind == HIR_BINDING_GLOBAL) {
+                        base_ptr = llvm_global_for(cg->module, expr->as.index.base->as.binding);
+                    } else {
+                        base_ptr = find_alloca(cg, expr->as.index.base->as.binding);
+                    }
+                    return LLVMBuildLoad2(
+                        cg->builder,
+                        llvm_type(cg->context, expr->type),
+                        LLVMBuildInBoundsGEP2(cg->builder, llvm_type(cg->context, expr->as.index.base->type), base_ptr, indices, 2, "array.ptr"),
+                        "array.idx");
                 }
-                return LLVMBuildLoad2(
-                    cg->builder,
-                    llvm_type(cg->context, expr->type),
-                    LLVMBuildInBoundsGEP2(cg->builder, llvm_type(cg->context, expr->as.index.base->type), base_ptr, indices, 2, "array.ptr"),
-                    "array.idx");
+                if (expr->as.index.index->kind == HIR_EXPR_INT) {
+                    return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.index.base), (unsigned)expr->as.index.index->as.int_value, "array.idx");
+                }
             }
             return 0;
     }

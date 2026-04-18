@@ -78,6 +78,7 @@ run_sample for_infer_range_minimal.jiang 5
 run_sample infer_global_minimal.jiang 42
 run_sample infer_local_minimal.jiang 42
 run_sample infer_mutable_local_minimal.jiang 42
+run_sample large_minimal.jiang 15
 run_sample enum_minimal.jiang 2
 run_sample enum_shorthand_minimal.jiang 42
 run_sample enum_shorthand_arg_minimal.jiang 42
@@ -101,7 +102,11 @@ run_sample unary_tuple_global_decl_minimal.jiang 42
 run_sample unary_tuple_return_minimal.jiang 42
 run_sample array_minimal.jiang 42
 run_sample array_assign_minimal.jiang 10
+run_sample array_repeat_init_minimal.jiang 6
+run_sample nested_array_minimal.jiang 42
 run_sample infer_array_length_minimal.jiang 42
+run_sample typed_array_constructor_minimal.jiang 42
+run_sample typed_array_constructor_infer_minimal.jiang 42
 run_sample empty_tuple_return_minimal.jiang 0
 run_sample empty_tuple_bare_return_minimal.jiang 0
 run_sample for_item_array_minimal.jiang 42
@@ -132,9 +137,16 @@ run_compile_fail invalid_array_assign_length.jiang
 run_compile_fail invalid_array_arg_length.jiang
 run_compile_fail invalid_array_return_length.jiang
 run_compile_fail invalid_infer_array_length_missing_init.jiang
+run_compile_fail invalid_infer_global_missing_init.jiang
+run_compile_fail invalid_typed_array_constructor_length.jiang
+run_compile_fail invalid_typed_array_constructor_non_array.jiang
+run_compile_fail invalid_index_target.jiang
+run_compile_fail invalid_index_type.jiang
 run_compile_fail invalid_tuple_destructure_arity.jiang
 run_compile_fail invalid_tuple_destructure_rhs.jiang
 run_compile_fail invalid_empty_tuple_return_non_void.jiang
+run_compile_fail invalid_break_outside_loop.jiang
+run_compile_fail invalid_continue_outside_loop.jiang
 run_compile_fail invalid_for_iterable_target.jiang
 run_compile_fail invalid_for_loop_var_type.jiang
 run_compile_fail invalid_for_indexed_arity.jiang
@@ -144,8 +156,14 @@ run_compile_fail invalid_for_tuple_binding_arity.jiang
 run_compile_fail invalid_switch_case_type.jiang
 run_compile_fail invalid_switch_duplicate_case.jiang
 run_compile_fail invalid_switch_non_exhaustive_enum.jiang
+run_compile_fail invalid_unknown_ident.jiang
+run_compile_fail invalid_call_non_function.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang
+run_compile_fail invalid_duplicate_function.jiang
+run_compile_fail invalid_duplicate_local.jiang
+run_compile_fail invalid_duplicate_param.jiang
+run_compile_fail invalid_missing_semicolon.jiang
 run_compile_fail invalid_enum_value_type.jiang
 run_compile_fail invalid_union_bind_void.jiang
 run_compile_fail invalid_union_ctor_arg.jiang
@@ -153,6 +171,9 @@ run_compile_fail invalid_union_pattern_ne_bind.jiang
 run_compile_fail invalid_union_switch_non_exhaustive.jiang
 run_compile_fail invalid_union_tuple_bind_non_tuple.jiang
 run_compile_fail invalid_union_tuple_bind_arity.jiang
+run_compile_fail invalid_ternary_aggregate_result.jiang
+run_compile_fail invalid_ternary_branch_type.jiang
+run_compile_fail invalid_ternary_condition_type.jiang
 run_sample_nonzero panic_minimal.jiang
 
 echo "stage0 batch A smoke passed"

@@ -345,6 +345,22 @@ static int looks_like_variant_ref(Parser* parser) {
     return 0;
 }
 
+static int looks_like_typed_array_constructor(Parser* parser) {
+    Parser probe = *parser;
+    AstType type;
+    if (!is_type_start(&probe) || (probe.current.kind == TOKEN_LEFT_PAREN && !is_known_type(parser, &parser->current))) {
+        return 0;
+    }
+    type = parse_type(&probe);
+    if (probe.error) {
+        return 0;
+    }
+    if (type.kind != AST_TYPE_ARRAY) {
+        return probe.current.kind == TOKEN_LEFT_BRACE || probe.current.kind == TOKEN_LEFT_PAREN;
+    }
+    return probe.current.kind == TOKEN_LEFT_BRACE || probe.current.kind == TOKEN_LEFT_PAREN;
+}
+
 static int variant_args_are_patterns(Parser* parser) {
     Parser probe = *parser;
     if (!expect(&probe, TOKEN_LEFT_PAREN, "")) {
@@ -454,6 +470,59 @@ static AstExpr* parse_primary(Parser* parser) {
     Token token = parser->current;
     char* end = 0;
     long long value = 0;
+
+    if ((token.kind == TOKEN_KW_INT || token.kind == TOKEN_KW_BOOL ||
+         (token.kind == TOKEN_IDENT && is_known_type(parser, &token))) &&
+        looks_like_typed_array_constructor(parser)) {
+        AstType array_type = parse_type(parser);
+        if (array_type.kind != AST_TYPE_ARRAY) {
+            fail(parser, "typed array constructor requires an array type");
+            return 0;
+        }
+        if (parser->current.kind == TOKEN_LEFT_BRACE) {
+            AstExpr* array = new_expr(AST_EXPR_ARRAY, token.line);
+            advance(parser);
+            if (parser->current.kind != TOKEN_RIGHT_BRACE) {
+                for (;;) {
+                    expr = parse_expr(parser);
+                    if (!expr) {
+                        return 0;
+                    }
+                    expr_list_push(&array->as.array.items, expr);
+                    if (parser->current.kind == TOKEN_COMMA) {
+                        advance(parser);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after array literal")) {
+                return 0;
+            }
+            return array;
+        }
+        if (parser->current.kind == TOKEN_LEFT_PAREN) {
+            AstExpr* array = new_expr(AST_EXPR_ARRAY, token.line);
+            AstExpr* item = 0;
+            int i = 0;
+            advance(parser);
+            item = parse_expr(parser);
+            if (!item) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after repeated array initializer")) {
+                return 0;
+            }
+            if (array_type.array_length < 0) {
+                fail(parser, "repeated array initializer requires a fixed length");
+                return 0;
+            }
+            for (i = 0; i < array_type.array_length; ++i) {
+                expr_list_push(&array->as.array.items, item);
+            }
+            return array;
+        }
+    }
 
     if (token.kind == TOKEN_INT_LIT) {
         errno = 0;

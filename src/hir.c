@@ -502,6 +502,13 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                 fail(ctx, "ternary branch type mismatch");
                 return 0;
             }
+            if (then_expr->type->kind == HIR_TYPE_TUPLE ||
+                then_expr->type->kind == HIR_TYPE_ARRAY ||
+                then_expr->type->kind == HIR_TYPE_UNION ||
+                then_expr->type->kind == HIR_TYPE_VOID) {
+                fail(ctx, "ternary aggregate result unsupported");
+                return 0;
+            }
             out = new_expr(HIR_EXPR_TERNARY, then_expr->type, expr->line);
             out->as.ternary.cond = cond;
             out->as.ternary.then_expr = then_expr;
@@ -1530,7 +1537,9 @@ static int lower_functions(LowerContext* ctx) {
         ctx->current_function = &ctx->program->functions.items[i];
         push_scope(ctx, &root_scope);
         for (param_index = 0; param_index < ctx->current_function->params.count; ++param_index) {
-            bind_in_current_scope(ctx, ctx->current_function->params.items[param_index]);
+            if (!bind_in_current_scope(ctx, ctx->current_function->params.items[param_index])) {
+                return 0;
+            }
         }
         if (!lower_block(ctx, &ctx->ast->functions.items[i].body, &ctx->current_function->body)) {
             return 0;
