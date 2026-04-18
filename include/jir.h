@@ -16,6 +16,7 @@ typedef enum JirBindingKind {
 
 typedef enum JirTypeKind {
     JIR_TYPE_INT = 0,
+    JIR_TYPE_UINT8,
     JIR_TYPE_BOOL,
     JIR_TYPE_VOID,
     JIR_TYPE_ENUM,
@@ -32,8 +33,11 @@ typedef enum JirExprKind {
     JIR_EXPR_BINARY,
     JIR_EXPR_TERNARY,
     JIR_EXPR_CALL,
+    JIR_EXPR_STRUCT_INIT,
     JIR_EXPR_ENUM_MEMBER,
     JIR_EXPR_VARIANT,
+    JIR_EXPR_UNION_PACK,
+    JIR_EXPR_EXTRACT,
     JIR_EXPR_ENUM_VALUE,
     JIR_EXPR_UNION_TAG,
     JIR_EXPR_UNION_FIELD,
@@ -64,6 +68,14 @@ typedef enum JirBuiltinKind {
     JIR_BUILTIN_PANIC,
 } JirBuiltinKind;
 
+typedef enum JirExtractKind {
+    JIR_EXTRACT_STRUCT_FIELD = 0,
+    JIR_EXTRACT_TUPLE_ITEM,
+    JIR_EXTRACT_ARRAY_ITEM,
+    JIR_EXTRACT_UNION_TAG,
+    JIR_EXTRACT_UNION_PAYLOAD,
+} JirExtractKind;
+
 typedef struct JirTypeList {
     JirType** items;
     int count;
@@ -84,6 +96,7 @@ typedef struct JirStructFieldDeclList {
 
 struct JirType {
     JirTypeKind kind;
+    int mutable_flag;
     JirTypeList tuple_items;
     JirType* array_item;
     int array_length;
@@ -145,12 +158,25 @@ struct JirExpr {
             JirExprList args;
         } call;
         struct {
+            JirFunction* init;
+            JirExprList args;
+        } struct_init;
+        struct {
             int64_t value;
         } enum_member;
         struct {
             int tag_value;
             JirExpr* payload;
         } variant;
+        struct {
+            int tag_value;
+            JirExprList payload_items;
+        } union_pack;
+        struct {
+            JirExtractKind kind;
+            JirExpr* base;
+            int field_index;
+        } extract;
         struct {
             JirExpr* value;
         } enum_value;

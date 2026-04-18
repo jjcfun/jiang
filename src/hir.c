@@ -36,6 +36,8 @@ typedef struct LowerContext {
 
 static int fail(LowerContext* ctx, const char* error);
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
+static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type);
+static HirType* new_owned_type(HirProgram* program, HirTypeKind kind);
 
 static char* make_struct_init_name(const char* struct_name) {
     const char* prefix = "__struct_init_";
@@ -70,10 +72,21 @@ static char* make_method_name(const char* owner_name, const char* method_name, i
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
     switch (kind) {
         case HIR_TYPE_INT: return &program->int_type;
+        case HIR_TYPE_UINT8: return &program->uint8_type;
         case HIR_TYPE_BOOL: return &program->bool_type;
         case HIR_TYPE_VOID: return &program->void_type;
         default: return 0;
     }
+}
+
+static HirType* qualified_primitive_type(HirProgram* program, HirTypeKind kind, int mutable_flag) {
+    HirType* type = 0;
+    if (!mutable_flag) {
+        return primitive_type(program, kind);
+    }
+    type = new_owned_type(program, kind);
+    type->mutable_flag = 1;
+    return type;
 }
 
 static HirEnumDecl* find_enum(HirProgram* program, const char* name) {
@@ -124,7 +137,7 @@ static int type_equals(HirType* left, HirType* right) {
         return left->union_decl == right->union_decl;
     }
     if (left->kind != HIR_TYPE_TUPLE) {
-        return 0;
+        return 1;
     }
     if (left->tuple_items.count != right->tuple_items.count) {
         return 0;
@@ -141,13 +154,16 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
     int i = 0;
     switch (type->kind) {
         case AST_TYPE_INT:
-            return primitive_type(ctx->program, HIR_TYPE_INT);
+            return qualified_primitive_type(ctx->program, HIR_TYPE_INT, type->mutable_flag);
+        case AST_TYPE_UINT8:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_UINT8, type->mutable_flag);
         case AST_TYPE_BOOL:
-            return primitive_type(ctx->program, HIR_TYPE_BOOL);
+            return qualified_primitive_type(ctx->program, HIR_TYPE_BOOL, type->mutable_flag);
         case AST_TYPE_VOID:
-            return primitive_type(ctx->program, HIR_TYPE_VOID);
+            return qualified_primitive_type(ctx->program, HIR_TYPE_VOID, type->mutable_flag);
         case AST_TYPE_ARRAY: {
             HirType* array = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
+            array->mutable_flag = type->mutable_flag;
             array->array_item = lower_type(ctx, type->array_item);
             array->array_length = type->array_length;
             return array;
@@ -158,16 +174,19 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             HirUnionDecl* union_decl = find_union(ctx->program, type->named_name);
             if (enum_decl) {
                 HirType* enum_type = new_owned_type(ctx->program, HIR_TYPE_ENUM);
+                enum_type->mutable_flag = type->mutable_flag;
                 enum_type->enum_decl = enum_decl;
                 return enum_type;
             }
             if (struct_decl) {
                 HirType* struct_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+                struct_type->mutable_flag = type->mutable_flag;
                 struct_type->struct_decl = struct_decl;
                 return struct_type;
             }
             if (union_decl) {
                 HirType* union_type = new_owned_type(ctx->program, HIR_TYPE_UNION);
+                union_type->mutable_flag = type->mutable_flag;
                 union_type->union_decl = union_decl;
                 return union_type;
             }
@@ -176,6 +195,7 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
         }
         case AST_TYPE_TUPLE: {
             HirType* tuple = new_owned_type(ctx->program, HIR_TYPE_TUPLE);
+            tuple->mutable_flag = type->mutable_flag;
             for (i = 0; i < type->tuple_items.count; ++i) {
                 type_list_push(&tuple->tuple_items, lower_type(ctx, &type->tuple_items.items[i]));
             }
@@ -363,6 +383,21 @@ static void rebuild_struct_map(HirProgram* program) {
     }
 }
 
+static void rebuild_union_map(HirProgram* program) {
+    int i = 0;
+    hashmap_free(&program->union_name_map);
+    hashmap_init(&program->union_name_map);
+    hashmap_free(&program->variant_map);
+    hashmap_init(&program->variant_map);
+    for (i = 0; i < program->unions.count; ++i) {
+        int j = 0;
+        hashmap_set(&program->union_name_map, program->unions.items[i].name, &program->unions.items[i]);
+        for (j = 0; j < program->unions.items[i].variants.count; ++j) {
+            hashmap_set(&program->variant_map, program->unions.items[i].variants.items[j].name, &program->unions.items[i].variants.items[j]);
+        }
+    }
+}
+
 static int payload_slot_count(HirType* type) {
     int i = 0;
     if (!type || type->kind == HIR_TYPE_VOID) {
@@ -475,7 +510,6 @@ static void pop_scope(LowerContext* ctx) {
     ctx->scope = ctx->scope->parent;
 }
 
-static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
 static HirExpr* make_union_tag_expr(LowerContext* ctx, HirExpr* value, int line);
 static HirExpr* make_union_field_expr(LowerContext* ctx, HirExpr* value, HirUnionVariant* variant, int field_index, HirType* type, int line);
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out);
@@ -516,7 +550,7 @@ static int lower_call_args(LowerContext* ctx, const AstExprList* ast_args, HirEx
         return fail(ctx, "call argument count mismatch");
     }
     for (i = 0; i < ast_args->count; ++i) {
-        HirExpr* arg = lower_expr(ctx, ast_args->items[i]);
+        HirExpr* arg = lower_expr_expected(ctx, ast_args->items[i], callee->params.items[i]->type);
         if (!arg) {
             return 0;
         }
@@ -730,9 +764,10 @@ static int validate_struct_init_block(LowerContext* ctx, HirStructDecl* struct_d
     return 1;
 }
 
-static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
+static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type) {
     HirExpr* out = 0;
     int i = 0;
+    (void)expected_type;
     switch (expr->kind) {
         case AST_EXPR_INT:
             out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
@@ -742,6 +777,27 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
             out = new_expr(HIR_EXPR_BOOL, primitive_type(ctx->program, HIR_TYPE_BOOL), expr->line);
             out->as.bool_value = expr->as.bool_value;
             return out;
+        case AST_EXPR_STRING: {
+            HirType* array_type = 0;
+            int i = 0;
+            if (!expected_type ||
+                expected_type->kind != HIR_TYPE_ARRAY ||
+                !expected_type->array_item ||
+                expected_type->array_item->kind != HIR_TYPE_UINT8) {
+                fail(ctx, "string literal requires UInt8 array type");
+                return 0;
+            }
+            array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
+            array_type->array_item = primitive_type(ctx->program, HIR_TYPE_UINT8);
+            array_type->array_length = expr->as.string_lit.length;
+            out = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
+            for (i = 0; i < expr->as.string_lit.length; ++i) {
+                HirExpr* item = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_UINT8), expr->line);
+                item->as.int_value = (unsigned char)expr->as.string_lit.text[i];
+                expr_list_push(&out->as.array.items, item);
+            }
+            return out;
+        }
         case AST_EXPR_NAME: {
             HirBinding* binding = lookup_binding(ctx, expr->as.name);
             if (!binding) {
@@ -942,7 +998,59 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
             HirEnumMember* enum_member = 0;
             HirUnionDecl* union_decl = 0;
             HirType* union_type = 0;
+            if (!expr->as.variant.union_name && expected_type) {
+                if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0 && expected_type->kind == HIR_TYPE_ENUM) {
+                    enum_member = find_enum_member_in_decl(expected_type->enum_decl, expr->as.variant.variant_name);
+                    if (!enum_member) {
+                        fail(ctx, "unknown enum member");
+                        return 0;
+                    }
+                    out = new_expr(HIR_EXPR_ENUM_MEMBER, expected_type, expr->line);
+                    out->as.enum_member.member = enum_member;
+                    return out;
+                }
+                if (expected_type->kind == HIR_TYPE_UNION) {
+                    HirUnionVariant* expected_variant = find_union_variant(expected_type->union_decl, expr->as.variant.variant_name);
+                    if (!expected_variant) {
+                        fail(ctx, "unknown union variant");
+                        return 0;
+                    }
+                    if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0) {
+                        return make_int_expr(ctx, expected_variant->tag_value, expr->line);
+                    }
+                    if (expr->as.variant.pattern_flag) {
+                        fail(ctx, "variant pattern is not a value expression");
+                        return 0;
+                    }
+                    out = new_expr(HIR_EXPR_VARIANT, expected_type, expr->line);
+                    out->as.variant.variant = expected_variant;
+                    if (expected_variant->payload_type->kind == HIR_TYPE_VOID) {
+                        if (expr->as.variant.payload) {
+                            fail(ctx, "void variant does not accept a payload");
+                            return 0;
+                        }
+                        return out;
+                    }
+                    if (!expr->as.variant.payload) {
+                        fail(ctx, "variant payload required");
+                        return 0;
+                    }
+                    out->as.variant.payload = lower_expr_expected(ctx, expr->as.variant.payload, expected_variant->payload_type);
+                    if (!out->as.variant.payload) {
+                        return 0;
+                    }
+                    if (!type_equals(out->as.variant.payload->type, expected_variant->payload_type)) {
+                        fail(ctx, "variant payload type mismatch");
+                        return 0;
+                    }
+                    return out;
+                }
+            }
             if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0) {
+                if (!expr->as.variant.union_name) {
+                    fail(ctx, "shorthand requires expected type");
+                    return 0;
+                }
                 enum_member = resolve_enum_expr(ctx, expr, &enum_decl);
                 if (enum_member) {
                     HirType* enum_type = new_owned_type(ctx->program, HIR_TYPE_ENUM);
@@ -979,7 +1087,7 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                 fail(ctx, "variant payload required");
                 return 0;
             }
-            out->as.variant.payload = lower_expr(ctx, expr->as.variant.payload);
+            out->as.variant.payload = lower_expr_expected(ctx, expr->as.variant.payload, variant->payload_type);
             if (!out->as.variant.payload) {
                 return 0;
             }
@@ -1062,7 +1170,7 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                     fail(ctx, "duplicate struct field initializer");
                     return 0;
                 }
-                value = lower_expr(ctx, ast_field->value);
+                value = lower_expr_expected(ctx, ast_field->value, field->type);
                 if (!value) {
                     free(seen);
                     return 0;
@@ -1204,6 +1312,10 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
     return 0;
 }
 
+static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
+    return lower_expr_expected(ctx, expr, 0);
+}
+
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block);
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
 
@@ -1311,7 +1423,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 }
                 out->as.ret.expr = 0;
             } else {
-                out->as.ret.expr = lower_expr(ctx, stmt->as.ret.expr);
+                out->as.ret.expr = lower_expr_expected(ctx, stmt->as.ret.expr, ctx->current_function->return_type);
                 if (!out->as.ret.expr) {
                     return 0;
                 }
@@ -1323,15 +1435,20 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             return out;
         case AST_STMT_VAR_DECL: {
             HirBinding* binding = 0;
-            HirExpr* init = lower_expr(ctx, stmt->as.var_decl.init);
+            HirExpr* init = 0;
             HirType* type = primitive_type(ctx->program, HIR_TYPE_INT);
-            if (!init) {
-                return 0;
-            }
             if (stmt->as.var_decl.type.kind == AST_TYPE_INFER) {
+                init = lower_expr(ctx, stmt->as.var_decl.init);
+                if (!init) {
+                    return 0;
+                }
                 type = init->type;
             } else {
                 type = lower_type(ctx, &stmt->as.var_decl.type);
+                init = lower_expr_expected(ctx, stmt->as.var_decl.init, type);
+                if (!init) {
+                    return 0;
+                }
                 if (!type_equals(init->type, type) && !apply_array_length_inference(type, init->type)) {
                     fail(ctx, "variable initializer type mismatch");
                     return 0;
@@ -1362,7 +1479,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 fail(ctx, "assignment target not found");
                 return 0;
             }
-            out->as.assign.value = lower_expr(ctx, stmt->as.assign.value);
+            out->as.assign.value = lower_expr_expected(ctx, stmt->as.assign.value, out->as.assign.target->type);
             if (!out->as.assign.value) {
                 return 0;
             }
@@ -1654,7 +1771,7 @@ static int validate_switch_cases(LowerContext* ctx, HirExpr* value, const AstStm
                 continue;
             }
             {
-                HirExpr* case_value = lower_expr(ctx, ast_case->pattern);
+                HirExpr* case_value = lower_expr_expected(ctx, ast_case->pattern, value->type);
                 int j = 0;
                 if (!case_value) {
                     free(seen);
@@ -1743,7 +1860,7 @@ static int validate_switch_cases(LowerContext* ctx, HirExpr* value, const AstStm
             continue;
         }
         {
-            HirExpr* case_value = lower_expr(ctx, ast_case->pattern);
+            HirExpr* case_value = lower_expr_expected(ctx, ast_case->pattern, value->type);
             if (!case_value) {
                 return 0;
             }
@@ -1786,7 +1903,7 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
                     return 0;
                 }
             } else {
-                HirExpr* case_value = lower_expr(ctx, ast_case->pattern);
+                HirExpr* case_value = lower_expr_expected(ctx, ast_case->pattern, value->type);
                 if (!case_value) {
                     return 0;
                 }
@@ -2031,6 +2148,33 @@ static int register_structs(LowerContext* ctx) {
         hashmap_set(&ctx->program->type_name_map, ast_struct->name, (void*)1);
     }
     rebuild_struct_map(ctx->program);
+    return 1;
+}
+
+static int register_unions(LowerContext* ctx) {
+    int i = 0;
+    for (i = 0; i < ctx->ast->unions.count; ++i) {
+        HirUnionDecl union_decl;
+        const AstUnionDecl* ast_union = &ctx->ast->unions.items[i];
+        memset(&union_decl, 0, sizeof(union_decl));
+        if (ast_union->tag_name && !hashmap_contains(&ctx->program->type_name_map, ast_union->tag_name)) {
+            return fail(ctx, "unknown union tag enum");
+        }
+        if (hashmap_contains(&ctx->program->union_name_map, ast_union->name) || hashmap_contains(&ctx->program->type_name_map, ast_union->name)) {
+            return fail(ctx, "duplicate union name");
+        }
+        union_decl.name = ast_union->name;
+        union_decl.tag_name = ast_union->tag_name;
+        union_list_push(&ctx->program->unions, union_decl);
+        hashmap_set(&ctx->program->union_name_map, union_decl.name, (void*)1);
+        hashmap_set(&ctx->program->type_name_map, union_decl.name, (void*)1);
+    }
+    rebuild_union_map(ctx->program);
+    return 1;
+}
+
+static int resolve_struct_fields(LowerContext* ctx) {
+    int i = 0;
     for (i = 0; i < ctx->ast->structs.count; ++i) {
         const AstStructDecl* ast_struct = &ctx->ast->structs.items[i];
         HirStructDecl* struct_decl = &ctx->program->structs.items[i];
@@ -2044,6 +2188,9 @@ static int register_structs(LowerContext* ctx) {
             }
             field.name = ast_struct->fields.items[j].name;
             field.type = lower_type(ctx, &ast_struct->fields.items[j].type);
+            if (!field.type) {
+                return 0;
+            }
             field.mutable_flag = ast_struct->fields.items[j].type.mutable_flag;
             struct_field_list_push(&struct_decl->fields, field);
         }
@@ -2051,39 +2198,30 @@ static int register_structs(LowerContext* ctx) {
     return 1;
 }
 
-static int register_unions(LowerContext* ctx) {
+static int resolve_union_variants(LowerContext* ctx) {
     int i = 0;
     for (i = 0; i < ctx->ast->unions.count; ++i) {
-        HirUnionDecl union_decl;
         const AstUnionDecl* ast_union = &ctx->ast->unions.items[i];
+        HirUnionDecl* union_decl = &ctx->program->unions.items[i];
         int j = 0;
-        memset(&union_decl, 0, sizeof(union_decl));
-        if (ast_union->tag_name && !hashmap_contains(&ctx->program->type_name_map, ast_union->tag_name)) {
-            return fail(ctx, "unknown union tag enum");
-        }
-        if (hashmap_contains(&ctx->program->union_name_map, ast_union->name) || hashmap_contains(&ctx->program->type_name_map, ast_union->name)) {
-            return fail(ctx, "duplicate union name");
-        }
-        union_decl.name = ast_union->name;
-        union_decl.tag_name = ast_union->tag_name;
         for (j = 0; j < ast_union->variants.count; ++j) {
             HirUnionVariant variant;
             memset(&variant, 0, sizeof(variant));
             variant.name = ast_union->variants.items[j].name;
             variant.tag_value = j;
             variant.payload_type = lower_type(ctx, &ast_union->variants.items[j].type);
+            if (!variant.payload_type) {
+                return 0;
+            }
             variant.payload_slots = payload_slot_count(variant.payload_type);
             if (variant.payload_slots < 0) {
                 return fail(ctx, "unsupported union payload type");
             }
-            if (variant.payload_slots > union_decl.payload_slots) {
-                union_decl.payload_slots = variant.payload_slots;
+            if (variant.payload_slots > union_decl->payload_slots) {
+                union_decl->payload_slots = variant.payload_slots;
             }
-            union_variant_list_push(&union_decl.variants, variant);
+            union_variant_list_push(&union_decl->variants, variant);
         }
-        union_list_push(&ctx->program->unions, union_decl);
-        hashmap_set(&ctx->program->union_name_map, union_decl.name, (void*)1);
-        hashmap_set(&ctx->program->type_name_map, union_decl.name, (void*)1);
     }
     hashmap_free(&ctx->program->union_name_map);
     hashmap_init(&ctx->program->union_name_map);
@@ -2150,15 +2288,20 @@ static int register_functions(LowerContext* ctx) {
         hir_fn.line = ast_fn->line;
         hir_fn.method_flag = ast_fn->method_flag;
         hir_fn.static_method_flag = ast_fn->static_method_flag;
-        if (ast_fn->method_flag) {
-            hir_fn.method_name = ast_fn->name;
-            hir_fn.receiver_type = find_named_owner_type(ctx->program, ast_fn->owner_type_name);
-            if (!hir_fn.receiver_type) {
-                return fail(ctx, "unknown named type");
-            }
-            if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
-                find_struct_field(hir_fn.receiver_type->struct_decl, ast_fn->name, 0)) {
-                return fail(ctx, "struct field and method name conflict");
+            if (ast_fn->method_flag) {
+                hir_fn.method_name = ast_fn->name;
+                hir_fn.receiver_type = find_named_owner_type(ctx->program, ast_fn->owner_type_name);
+                if (!hir_fn.receiver_type) {
+                    return fail(ctx, "unknown named type");
+                }
+                if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
+                    ast_fn->static_method_flag &&
+                    strcmp(ast_fn->name, "init") == 0) {
+                    return fail(ctx, "static init not allowed");
+                }
+                if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
+                    find_struct_field(hir_fn.receiver_type->struct_decl, ast_fn->name, 0)) {
+                    return fail(ctx, "struct field and method name conflict");
             }
             hir_fn.name = make_method_name(ast_fn->owner_type_name, ast_fn->name, ast_fn->static_method_flag);
             if (hashmap_contains(&ctx->program->function_map, hir_fn.name)) {
@@ -2184,7 +2327,7 @@ static int lower_globals(LowerContext* ctx) {
     int i = 0;
     for (i = 0; i < ctx->ast->globals.count; ++i) {
         HirGlobal* hir_global = &ctx->program->globals.items[i];
-        hir_global->init = lower_expr(ctx, ctx->ast->globals.items[i].init);
+        hir_global->init = lower_expr_expected(ctx, ctx->ast->globals.items[i].init, hir_global->binding->type);
         if (!hir_global->init) {
             return 0;
         }
@@ -2298,6 +2441,7 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     memset(hir, 0, sizeof(*hir));
     memset(&ctx, 0, sizeof(ctx));
     hir->int_type.kind = HIR_TYPE_INT;
+    hir->uint8_type.kind = HIR_TYPE_UINT8;
     hir->bool_type.kind = HIR_TYPE_BOOL;
     hir->void_type.kind = HIR_TYPE_VOID;
     hashmap_init(&hir->global_map);
@@ -2310,7 +2454,7 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     hashmap_init(&hir->variant_map);
     ctx.program = hir;
     ctx.ast = ast;
-    if (!register_structs(&ctx) || !register_enums(&ctx) || !register_unions(&ctx) || !register_globals(&ctx) || !register_struct_init_functions(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
+    if (!register_enums(&ctx) || !register_structs(&ctx) || !register_unions(&ctx) || !resolve_struct_fields(&ctx) || !resolve_union_variants(&ctx) || !register_globals(&ctx) || !register_struct_init_functions(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
         *error = ctx.error;
         return 0;
     }

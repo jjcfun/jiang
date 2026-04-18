@@ -17,6 +17,22 @@ static char* token_dup(const Token* token) {
     return text;
 }
 
+static char* string_token_dup(const Token* token) {
+    char* text = 0;
+    size_t length = 0;
+    if (token->length < 2) {
+        return 0;
+    }
+    length = token->length - 2;
+    text = (char*)malloc(length + 1);
+    if (!text) {
+        return 0;
+    }
+    memcpy(text, token->start + 1, length);
+    text[length] = '\0';
+    return text;
+}
+
 static char* dup_join3(const char* left, const char* middle, const char* right) {
     size_t left_len = strlen(left);
     size_t middle_len = strlen(middle);
@@ -118,7 +134,7 @@ static int expect(Parser* parser, TokenKind kind, const char* error) {
 }
 
 static int is_type_start(const Parser* parser) {
-    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_BOOL || parser->current.kind == TOKEN_LEFT_PAREN) {
+    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_UINT8 || parser->current.kind == TOKEN_KW_BOOL || parser->current.kind == TOKEN_LEFT_PAREN) {
         return 1;
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
@@ -128,7 +144,7 @@ static int is_type_start(const Parser* parser) {
 }
 
 static int is_pattern_type_start(const Parser* parser) {
-    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_BOOL) {
+    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_UINT8 || parser->current.kind == TOKEN_KW_BOOL) {
         return 1;
     }
     return parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_");
@@ -152,36 +168,33 @@ static int pattern_has_explicit_type(Parser* parser) {
     return 0;
 }
 
-static AstType apply_type_suffixes(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET) {
-        AstType element = type;
-        advance(parser);
-        if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
+static AstType parse_type_postfix(Parser* parser, AstType type) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG) {
+        if (parser->current.kind == TOKEN_BANG) {
+            type.mutable_flag = 1;
+            advance(parser);
+            continue;
+        }
+        if (parser->current.kind == TOKEN_LEFT_BRACKET) {
+            AstType element = type;
+            advance(parser);
+            memset(&type, 0, sizeof(type));
             type.kind = AST_TYPE_ARRAY;
             type.array_item = heap_type_copy(&element);
-            type.array_length = -1;
-            advance(parser);
-        } else if (parser->current.kind != TOKEN_INT_LIT) {
-            fail(parser, "expected integer array length");
-            return type;
-        } else {
-            type.kind = AST_TYPE_ARRAY;
-            type.array_item = heap_type_copy(&element);
-            type.array_length = (int)strtol(parser->current.start, 0, 10);
-            advance(parser);
+            if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
+                type.array_length = -1;
+                advance(parser);
+            } else if (parser->current.kind != TOKEN_INT_LIT) {
+                fail(parser, "expected integer array length");
+                return type;
+            } else {
+                type.array_length = (int)strtol(parser->current.start, 0, 10);
+                advance(parser);
+            }
+            if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after array length")) {
+                return type;
+            }
         }
-        if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after array length")) {
-            return type;
-        }
-    }
-    return type;
-}
-
-static AstType finalize_type(Parser* parser, AstType type) {
-    type = apply_type_suffixes(parser, type);
-    if (parser->current.kind == TOKEN_BANG) {
-        type.mutable_flag = 1;
-        advance(parser);
     }
     return type;
 }
@@ -209,7 +222,7 @@ static AstType parse_type(Parser* parser) {
             if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after type")) {
                 return type;
             }
-            return apply_type_suffixes(parser, first);
+            return parse_type_postfix(parser, first);
         }
         type.kind = AST_TYPE_TUPLE;
         type_list_push(&type.tuple_items, first);
@@ -225,29 +238,34 @@ static AstType parse_type(Parser* parser) {
         if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after tuple type")) {
             return type;
         }
-        return finalize_type(parser, type);
+        return parse_type_postfix(parser, type);
     }
 
     if (parser->current.kind == TOKEN_KW_BOOL) {
         type.kind = AST_TYPE_BOOL;
         advance(parser);
-        return finalize_type(parser, type);
+        return parse_type_postfix(parser, type);
     }
     if (parser->current.kind == TOKEN_KW_INT) {
         type.kind = AST_TYPE_INT;
         advance(parser);
-        return finalize_type(parser, type);
+        return parse_type_postfix(parser, type);
+    }
+    if (parser->current.kind == TOKEN_KW_UINT8) {
+        type.kind = AST_TYPE_UINT8;
+        advance(parser);
+        return parse_type_postfix(parser, type);
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
         type.kind = AST_TYPE_INFER;
         advance(parser);
-        return finalize_type(parser, type);
+        return parse_type_postfix(parser, type);
     }
     if (parser->current.kind == TOKEN_IDENT) {
         type.kind = AST_TYPE_NAMED;
         type.named_name = token_dup(&parser->current);
         advance(parser);
-        return finalize_type(parser, type);
+        return parse_type_postfix(parser, type);
     }
     parser->error = "expected type";
     parser->error_line = parser->current.line;
@@ -544,7 +562,7 @@ static AstExpr* parse_primary(Parser* parser) {
     char* end = 0;
     long long value = 0;
 
-    if ((token.kind == TOKEN_KW_INT || token.kind == TOKEN_KW_BOOL ||
+    if ((token.kind == TOKEN_KW_INT || token.kind == TOKEN_KW_UINT8 || token.kind == TOKEN_KW_BOOL ||
          (token.kind == TOKEN_IDENT && is_known_type(parser, &token))) &&
         looks_like_typed_array_constructor(parser)) {
         AstType array_type = parse_type(parser);
@@ -650,6 +668,14 @@ static AstExpr* parse_primary(Parser* parser) {
     if (token.kind == TOKEN_KW_TRUE || token.kind == TOKEN_KW_FALSE) {
         expr = new_expr(AST_EXPR_BOOL, token.line);
         expr->as.bool_value = token.kind == TOKEN_KW_TRUE;
+        advance(parser);
+        return expr;
+    }
+
+    if (token.kind == TOKEN_STRING_LIT) {
+        expr = new_expr(AST_EXPR_STRING, token.line);
+        expr->as.string_lit.text = string_token_dup(&token);
+        expr->as.string_lit.length = (int)(token.length >= 2 ? token.length - 2 : 0);
         advance(parser);
         return expr;
     }

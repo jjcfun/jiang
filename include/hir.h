@@ -25,6 +25,7 @@ typedef struct HirTypeList {
 
 typedef enum HirTypeKind {
     HIR_TYPE_INT = 0,
+    HIR_TYPE_UINT8,
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
     HIR_TYPE_ENUM,
@@ -36,6 +37,7 @@ typedef enum HirTypeKind {
 
 struct HirType {
     HirTypeKind kind;
+    int mutable_flag;
     HirTypeList tuple_items;
     HirType* array_item;
     int array_length;
@@ -355,6 +357,7 @@ typedef struct HirProgram {
     HirGlobalList globals;
     HirFunctionList functions;
     HirType int_type;
+    HirType uint8_type;
     HirType bool_type;
     HirType void_type;
     HirTypeList owned_types;

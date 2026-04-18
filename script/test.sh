@@ -72,6 +72,9 @@ run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
 run_sample binary_ops_minimal.jiang 1
 run_sample bool_minimal.jiang 1
+run_sample uint8_minimal.jiang 0
+run_sample mutable_qualifier_minimal.jiang 42
+run_sample mutable_array_qualifier_minimal.jiang 42
 run_sample break_continue_minimal.jiang 8
 run_sample for_range_minimal.jiang 8
 run_sample for_infer_range_minimal.jiang 5
@@ -86,6 +89,7 @@ run_sample enum_value_minimal.jiang 42
 run_sample enum_switch_shorthand_minimal.jiang 42
 run_sample switch_enum_minimal.jiang 42
 run_sample ternary_enum_minimal.jiang 42
+run_sample ternary_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
@@ -94,6 +98,10 @@ run_sample struct_init_minimal.jiang 42
 run_sample struct_init_with_defaults_minimal.jiang 18
 run_sample struct_init_branch_complete_minimal.jiang 42
 run_sample struct_init_mutable_default_override_minimal.jiang 19
+run_sample struct_constructor_sugar_minimal.jiang 42
+run_sample struct_literal_with_init_minimal.jiang 42
+run_sample struct_enum_field_shorthand_minimal.jiang 42
+run_sample struct_union_field_shorthand_minimal.jiang 42
 run_sample struct_instance_method_minimal.jiang 42
 run_sample struct_instance_method_with_args_minimal.jiang 42
 run_sample struct_static_method_minimal.jiang 42
@@ -122,6 +130,9 @@ run_sample array_assign_minimal.jiang 10
 run_sample array_repeat_init_minimal.jiang 6
 run_sample nested_array_minimal.jiang 42
 run_sample infer_array_length_minimal.jiang 42
+run_sample uint8_array_string_minimal.jiang 98
+run_sample infer_uint8_array_string_minimal.jiang 98
+run_sample struct_array_field_minimal.jiang 98
 run_sample typed_array_constructor_minimal.jiang 42
 run_sample typed_array_constructor_infer_minimal.jiang 42
 run_sample empty_tuple_return_minimal.jiang 0
@@ -174,6 +185,8 @@ run_compile_fail invalid_switch_case_type.jiang
 run_compile_fail invalid_switch_duplicate_case.jiang
 run_compile_fail invalid_switch_non_exhaustive_enum.jiang
 run_compile_fail invalid_unknown_ident.jiang
+run_compile_fail invalid_assign_target.jiang
+run_compile_fail invalid_assign_field_type.jiang
 run_compile_fail invalid_call_non_function.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang
@@ -183,7 +196,10 @@ run_compile_fail invalid_duplicate_field_decl.jiang
 run_compile_fail invalid_duplicate_local.jiang
 run_compile_fail invalid_duplicate_param.jiang
 run_compile_fail invalid_struct_duplicate_field.jiang
+run_compile_fail invalid_struct_duplicate_method.jiang
 run_compile_fail invalid_struct_field.jiang
+run_compile_fail invalid_struct_missing_field.jiang
+run_compile_fail invalid_struct_method_before_feature_misparse.jiang
 run_compile_fail invalid_struct_init_immutable_default_override.jiang
 run_compile_fail invalid_struct_init_immutable_reassign.jiang
 run_compile_fail invalid_struct_init_missing_field.jiang
@@ -191,11 +207,15 @@ run_compile_fail invalid_struct_init_read_before_init.jiang
 run_compile_fail invalid_struct_init_return_value.jiang
 run_compile_fail invalid_struct_instance_call_through_type.jiang
 run_compile_fail invalid_struct_static_call_through_instance.jiang
+run_compile_fail invalid_struct_static_init.jiang
 run_compile_fail invalid_struct_static_uses_self.jiang
 run_compile_fail invalid_struct_field_method_name_conflict.jiang
+run_compile_fail invalid_enum_instance_call_through_type.jiang
+run_compile_fail invalid_enum_static_call_through_instance.jiang
 run_compile_fail invalid_union_instance_call_through_type.jiang
 run_compile_fail invalid_union_static_call_through_instance.jiang
 run_compile_fail invalid_missing_semicolon.jiang
+run_compile_fail invalid_void_keyword_type.jiang
 run_compile_fail invalid_type_function_name_conflict.jiang
 run_compile_fail invalid_enum_type_name_conflict.jiang
 run_compile_fail invalid_enum_value_type.jiang
@@ -205,6 +225,7 @@ run_compile_fail invalid_union_pattern_ne_bind.jiang
 run_compile_fail invalid_union_switch_non_exhaustive.jiang
 run_compile_fail invalid_union_tuple_bind_non_tuple.jiang
 run_compile_fail invalid_union_tuple_bind_arity.jiang
+run_compile_fail invalid_infer_shorthand_without_expected.jiang
 run_compile_fail invalid_ternary_aggregate_result.jiang
 run_compile_fail invalid_ternary_branch_type.jiang
 run_compile_fail invalid_ternary_condition_type.jiang

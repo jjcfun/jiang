@@ -83,7 +83,25 @@ static JirBindingKind jir_binding_kind(HirBindingKind kind) {
 }
 
 static JirExprKind jir_expr_kind(HirExprKind kind) {
-    return (JirExprKind)kind;
+    switch (kind) {
+        case HIR_EXPR_INT: return JIR_EXPR_INT;
+        case HIR_EXPR_BOOL: return JIR_EXPR_BOOL;
+        case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
+        case HIR_EXPR_BINARY: return JIR_EXPR_BINARY;
+        case HIR_EXPR_TERNARY: return JIR_EXPR_TERNARY;
+        case HIR_EXPR_CALL: return JIR_EXPR_CALL;
+        case HIR_EXPR_ENUM_MEMBER: return JIR_EXPR_ENUM_MEMBER;
+        case HIR_EXPR_VARIANT: return JIR_EXPR_VARIANT;
+        case HIR_EXPR_ENUM_VALUE: return JIR_EXPR_ENUM_VALUE;
+        case HIR_EXPR_UNION_TAG: return JIR_EXPR_UNION_TAG;
+        case HIR_EXPR_UNION_FIELD: return JIR_EXPR_UNION_FIELD;
+        case HIR_EXPR_STRUCT: return JIR_EXPR_STRUCT;
+        case HIR_EXPR_STRUCT_FIELD: return JIR_EXPR_STRUCT_FIELD;
+        case HIR_EXPR_TUPLE: return JIR_EXPR_TUPLE;
+        case HIR_EXPR_ARRAY: return JIR_EXPR_ARRAY;
+        case HIR_EXPR_INDEX: return JIR_EXPR_INDEX;
+    }
+    return JIR_EXPR_INT;
 }
 
 static JirBinaryOp jir_binary_op(HirBinaryOp op) {
@@ -130,6 +148,7 @@ static JirType* lower_type(const HirType* hir_type, const char** error) {
         return 0;
     }
     jir_type->kind = jir_type_kind(hir_type->kind);
+    jir_type->mutable_flag = hir_type->mutable_flag;
     jir_type->array_length = hir_type->array_length;
     if (hir_type->union_decl) {
         jir_type->union_payload_slots = hir_type->union_decl->payload_slots;
@@ -200,6 +219,11 @@ static JirBinding* lower_binding(const HirBinding* hir_binding, const char** err
 }
 
 static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char** error);
+static JirExpr* desugar_expr(JirExpr* expr);
+static JirExpr* desugar_lvalue_expr(JirExpr* expr);
+static JirExpr* make_int_expr(int64_t value, JirType* type, int line);
+static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, int line);
+static int append_union_payload_item(JirExprList* list, JirExpr* item);
 
 static JirExpr* new_expr(JirExprKind kind, JirType* type, int line) {
     JirExpr* expr = (JirExpr*)calloc(1, sizeof(JirExpr));
@@ -210,6 +234,272 @@ static JirExpr* new_expr(JirExprKind kind, JirType* type, int line) {
     expr->type = type;
     expr->line = line;
     return expr;
+}
+
+static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, int line) {
+    JirExpr* expr = new_expr(JIR_EXPR_EXTRACT, type, line);
+    if (!expr) {
+        return 0;
+    }
+    expr->as.extract.kind = kind;
+    expr->as.extract.base = base;
+    expr->as.extract.field_index = field_index;
+    return expr;
+}
+
+static int append_union_payload_item(JirExprList* list, JirExpr* item) {
+    if (!item) {
+        return 0;
+    }
+    jir_expr_list_push(list, item);
+    return 1;
+}
+
+static void sort_struct_fields(JirStructFieldInitList* fields) {
+    int i = 0;
+    int j = 0;
+    for (i = 0; i < fields->count; ++i) {
+        for (j = i + 1; j < fields->count; ++j) {
+            if (fields->items[j].field_index < fields->items[i].field_index) {
+                JirStructFieldInit tmp = fields->items[i];
+                fields->items[i] = fields->items[j];
+                fields->items[j] = tmp;
+            }
+        }
+    }
+}
+
+static JirExpr* desugar_expr_list(JirExprList* list) {
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        list->items[i] = desugar_expr(list->items[i]);
+        if (!list->items[i]) {
+            return 0;
+        }
+    }
+    return list->count > 0 ? list->items[0] : (JirExpr*)1;
+}
+
+static JirExpr* desugar_lvalue_expr(JirExpr* expr) {
+    if (!expr) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case JIR_EXPR_BINDING:
+            return expr;
+        case JIR_EXPR_STRUCT_FIELD:
+            expr->as.struct_field.base = desugar_lvalue_expr(expr->as.struct_field.base);
+            return expr->as.struct_field.base ? expr : 0;
+        case JIR_EXPR_INDEX:
+            expr->as.index.base = desugar_lvalue_expr(expr->as.index.base);
+            expr->as.index.index = desugar_expr(expr->as.index.index);
+            return expr->as.index.base && expr->as.index.index ? expr : 0;
+        default:
+            return desugar_expr(expr);
+    }
+}
+
+static JirExpr* desugar_expr(JirExpr* expr) {
+    int i = 0;
+    if (!expr) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case JIR_EXPR_BINARY:
+            expr->as.binary.left = desugar_expr(expr->as.binary.left);
+            expr->as.binary.right = desugar_expr(expr->as.binary.right);
+            return expr->as.binary.left && expr->as.binary.right ? expr : 0;
+        case JIR_EXPR_TERNARY:
+            expr->as.ternary.cond = desugar_expr(expr->as.ternary.cond);
+            expr->as.ternary.then_expr = desugar_expr(expr->as.ternary.then_expr);
+            expr->as.ternary.else_expr = desugar_expr(expr->as.ternary.else_expr);
+            return expr->as.ternary.cond && expr->as.ternary.then_expr && expr->as.ternary.else_expr ? expr : 0;
+        case JIR_EXPR_CALL:
+            if (!desugar_expr_list(&expr->as.call.args)) {
+                return 0;
+            }
+            if (expr->as.call.callee && expr->as.call.callee->struct_init_flag) {
+                JirExpr* init_expr = new_expr(JIR_EXPR_STRUCT_INIT, expr->type, expr->line);
+                if (!init_expr) {
+                    return 0;
+                }
+                init_expr->as.struct_init.init = expr->as.call.callee;
+                init_expr->as.struct_init.args = expr->as.call.args;
+                return init_expr;
+            }
+            return expr;
+        case JIR_EXPR_STRUCT_INIT:
+            return desugar_expr_list(&expr->as.struct_init.args) ? expr : 0;
+        case JIR_EXPR_VARIANT:
+            if (expr->as.variant.payload) {
+                expr->as.variant.payload = desugar_expr(expr->as.variant.payload);
+                if (!expr->as.variant.payload) {
+                    return 0;
+                }
+            }
+            {
+                JirExpr* packed = new_expr(JIR_EXPR_UNION_PACK, expr->type, expr->line);
+                int i = 0;
+                if (!packed) {
+                    return 0;
+                }
+                packed->as.union_pack.tag_value = expr->as.variant.tag_value;
+                if (!expr->as.variant.payload) {
+                    return packed;
+                }
+                if (expr->as.variant.payload->kind == JIR_EXPR_TUPLE) {
+                    for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
+                        if (!append_union_payload_item(&packed->as.union_pack.payload_items, expr->as.variant.payload->as.tuple.items.items[i])) {
+                            return 0;
+                        }
+                    }
+                    return packed;
+                }
+                if (!append_union_payload_item(&packed->as.union_pack.payload_items, expr->as.variant.payload)) {
+                    return 0;
+                }
+                return packed;
+            }
+        case JIR_EXPR_UNION_PACK:
+            return desugar_expr_list(&expr->as.union_pack.payload_items) ? expr : 0;
+        case JIR_EXPR_EXTRACT:
+            expr->as.extract.base = desugar_expr(expr->as.extract.base);
+            if (!expr->as.extract.base) {
+                return 0;
+            }
+            return expr;
+        case JIR_EXPR_ENUM_VALUE:
+            expr->as.enum_value.value = desugar_expr(expr->as.enum_value.value);
+            return expr->as.enum_value.value;
+        case JIR_EXPR_UNION_TAG:
+            expr->as.union_tag.value = desugar_expr(expr->as.union_tag.value);
+            if (!expr->as.union_tag.value) {
+                return 0;
+            }
+            if (expr->as.union_tag.value->kind == JIR_EXPR_UNION_PACK) {
+                return make_int_expr(expr->as.union_tag.value->as.union_pack.tag_value, expr->type, expr->line);
+            }
+            return make_extract_expr(JIR_EXTRACT_UNION_TAG, expr->as.union_tag.value, 0, expr->type, expr->line);
+        case JIR_EXPR_UNION_FIELD:
+            expr->as.union_field.value = desugar_expr(expr->as.union_field.value);
+            if (!expr->as.union_field.value) {
+                return 0;
+            }
+            if (expr->as.union_field.value->kind == JIR_EXPR_UNION_PACK) {
+                if (expr->as.union_field.field_index < 0 || expr->as.union_field.field_index >= expr->as.union_field.value->as.union_pack.payload_items.count) {
+                    return 0;
+                }
+                return expr->as.union_field.value->as.union_pack.payload_items.items[expr->as.union_field.field_index];
+            }
+            return make_extract_expr(JIR_EXTRACT_UNION_PAYLOAD, expr->as.union_field.value, expr->as.union_field.field_index, expr->type, expr->line);
+        case JIR_EXPR_STRUCT:
+            for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+                expr->as.struct_lit.fields.items[i].value = desugar_expr(expr->as.struct_lit.fields.items[i].value);
+                if (!expr->as.struct_lit.fields.items[i].value) {
+                    return 0;
+                }
+            }
+            sort_struct_fields(&expr->as.struct_lit.fields);
+            return expr;
+        case JIR_EXPR_STRUCT_FIELD:
+            expr->as.struct_field.base = desugar_expr(expr->as.struct_field.base);
+            if (!expr->as.struct_field.base) {
+                return 0;
+            }
+            if (expr->as.struct_field.base->kind == JIR_EXPR_STRUCT) {
+                for (i = 0; i < expr->as.struct_field.base->as.struct_lit.fields.count; ++i) {
+                    if (expr->as.struct_field.base->as.struct_lit.fields.items[i].field_index == expr->as.struct_field.field_index) {
+                        return expr->as.struct_field.base->as.struct_lit.fields.items[i].value;
+                    }
+                }
+                return 0;
+            }
+            return make_extract_expr(JIR_EXTRACT_STRUCT_FIELD, expr->as.struct_field.base, expr->as.struct_field.field_index, expr->type, expr->line);
+        case JIR_EXPR_TUPLE:
+            return desugar_expr_list(&expr->as.tuple.items) ? expr : 0;
+        case JIR_EXPR_ARRAY:
+            return desugar_expr_list(&expr->as.array.items) ? expr : 0;
+        case JIR_EXPR_INDEX:
+            expr->as.index.base = desugar_expr(expr->as.index.base);
+            expr->as.index.index = desugar_expr(expr->as.index.index);
+            if (!expr->as.index.base || !expr->as.index.index) {
+                return 0;
+            }
+            if (expr->as.index.index->kind == JIR_EXPR_INT) {
+                int index = (int)expr->as.index.index->as.int_value;
+                if (expr->as.index.base->kind == JIR_EXPR_TUPLE) {
+                    if (index < 0 || index >= expr->as.index.base->as.tuple.items.count) {
+                        return 0;
+                    }
+                    return expr->as.index.base->as.tuple.items.items[index];
+                }
+                if (expr->as.index.base->kind == JIR_EXPR_ARRAY) {
+                    if (index < 0 || index >= expr->as.index.base->as.array.items.count) {
+                        return 0;
+                    }
+                    return expr->as.index.base->as.array.items.items[index];
+                }
+                if (expr->as.index.base->type->kind == JIR_TYPE_TUPLE) {
+                    return make_extract_expr(JIR_EXTRACT_TUPLE_ITEM, expr->as.index.base, index, expr->type, expr->line);
+                }
+                if (expr->as.index.base->type->kind == JIR_TYPE_ARRAY) {
+                    return make_extract_expr(JIR_EXTRACT_ARRAY_ITEM, expr->as.index.base, index, expr->type, expr->line);
+                }
+            }
+            return expr;
+        default:
+            return expr;
+    }
+}
+
+static int desugar_program(JirProgram* program) {
+    int i = 0;
+    int j = 0;
+    for (i = 0; i < program->globals.count; ++i) {
+        program->globals.items[i].init = desugar_expr(program->globals.items[i].init);
+        if (!program->globals.items[i].init) {
+            return 0;
+        }
+    }
+    for (i = 0; i < program->lowered_functions.count; ++i) {
+        for (j = 0; j < program->lowered_functions.items[i].blocks.count; ++j) {
+            JirBasicBlock* block = &program->lowered_functions.items[i].blocks.items[j];
+            int k = 0;
+            for (k = 0; k < block->insts.count; ++k) {
+                if (block->insts.items[k].expr) {
+                    block->insts.items[k].expr = desugar_expr(block->insts.items[k].expr);
+                    if (!block->insts.items[k].expr) {
+                        return 0;
+                    }
+                }
+                if (block->insts.items[k].target) {
+                    block->insts.items[k].target = desugar_lvalue_expr(block->insts.items[k].target);
+                    if (!block->insts.items[k].target) {
+                        return 0;
+                    }
+                }
+                if (block->insts.items[k].value) {
+                    block->insts.items[k].value = desugar_expr(block->insts.items[k].value);
+                    if (!block->insts.items[k].value) {
+                        return 0;
+                    }
+                }
+            }
+            if (block->term.cond) {
+                block->term.cond = desugar_expr(block->term.cond);
+                if (!block->term.cond) {
+                    return 0;
+                }
+            }
+            if (block->term.value) {
+                block->term.value = desugar_expr(block->term.value);
+                if (!block->term.value) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;
 }
 
 static JirFunction* find_jir_function(JirProgram* program, const char* name) {
@@ -707,6 +997,10 @@ int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error)
             return 0;
         }
         jir_function_list_push(&jir->lowered_functions, lowered);
+    }
+    if (!desugar_program(jir)) {
+        *error = "failed to desugar JIR";
+        return 0;
     }
     return 1;
 }

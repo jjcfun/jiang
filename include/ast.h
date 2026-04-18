@@ -20,6 +20,7 @@ typedef struct AstTypeList {
 
 typedef enum AstTypeKind {
     AST_TYPE_INT = 0,
+    AST_TYPE_UINT8,
     AST_TYPE_BOOL,
     AST_TYPE_VOID,
     AST_TYPE_INFER,
@@ -58,6 +59,7 @@ typedef struct AstStructFieldInitList {
 typedef enum AstExprKind {
     AST_EXPR_INT = 0,
     AST_EXPR_BOOL,
+    AST_EXPR_STRING,
     AST_EXPR_NAME,
     AST_EXPR_BINARY,
     AST_EXPR_TERNARY,
@@ -121,6 +123,10 @@ struct AstExpr {
     union {
         int64_t int_value;
         int bool_value;
+        struct {
+            char* text;
+            int length;
+        } string_lit;
         char* name;
         struct {
             AstBinaryOp op;

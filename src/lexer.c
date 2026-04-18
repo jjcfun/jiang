@@ -53,6 +53,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 3 && strncmp(lexer->start, "Int", 3) == 0) {
         return make_token(lexer, TOKEN_KW_INT, lexer->start, length);
     }
+    if (length == 5 && strncmp(lexer->start, "UInt8", 5) == 0) {
+        return make_token(lexer, TOKEN_KW_UINT8, lexer->start, length);
+    }
     if (length == 4 && strncmp(lexer->start, "Bool", 4) == 0) {
         return make_token(lexer, TOKEN_KW_BOOL, lexer->start, length);
     }
@@ -124,6 +127,18 @@ Token lexer_next(Lexer* lexer) {
             lexer->current += 1;
         }
         return make_token(lexer, TOKEN_INT_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
+    }
+
+    if (*lexer->current == '"') {
+        lexer->current += 1;
+        while (*lexer->current != '\0' && *lexer->current != '"' && *lexer->current != '\n') {
+            lexer->current += 1;
+        }
+        if (*lexer->current != '"') {
+            return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+        }
+        lexer->current += 1;
+        return make_token(lexer, TOKEN_STRING_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
     }
 
     if (isalpha((unsigned char)*lexer->current) || *lexer->current == '_') {

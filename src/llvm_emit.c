@@ -124,6 +124,8 @@ static LLVMTypeRef llvm_array_type(LLVMContextRef context, const JirType* type) 
 
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
     switch (type->kind) {
+        case JIR_TYPE_UINT8:
+            return LLVMInt8TypeInContext(context);
         case JIR_TYPE_BOOL:
             return LLVMInt1TypeInContext(context);
         case JIR_TYPE_VOID:
@@ -213,7 +215,7 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
         free(items);
         return value;
     }
-    if (expr->kind == JIR_EXPR_VARIANT) {
+    if (expr->kind == JIR_EXPR_UNION_PACK) {
         LLVMTypeRef payload_type = llvm_union_payload_type(context, expr->type);
         LLVMValueRef* payload_items = 0;
         LLVMValueRef payload_array = 0;
@@ -225,26 +227,16 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
                 payload_items[i] = LLVMConstInt(LLVMInt64TypeInContext(context), 0, 0);
             }
         }
-        if (expr->as.variant.payload) {
-            if (expr->as.variant.payload->type->kind == JIR_TYPE_TUPLE) {
-                for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
-                    LLVMValueRef item = llvm_const_expr(context, expr->as.variant.payload->as.tuple.items.items[i]);
-                    if (expr->as.variant.payload->as.tuple.items.items[i]->type->kind == JIR_TYPE_BOOL) {
+        for (i = 0; i < expr->as.union_pack.payload_items.count; ++i) {
+            LLVMValueRef item = llvm_const_expr(context, expr->as.union_pack.payload_items.items[i]);
+            if (expr->as.union_pack.payload_items.items[i]->type->kind == JIR_TYPE_BOOL) {
                         item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
-                    }
-                    payload_items[i] = item;
-                }
-            } else {
-                LLVMValueRef item = llvm_const_expr(context, expr->as.variant.payload);
-                if (expr->as.variant.payload->type->kind == JIR_TYPE_BOOL) {
-                    item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
-                }
-                payload_items[0] = item;
             }
+            payload_items[i] = item;
         }
         payload_array = payload_len == 0 ? LLVMConstNull(payload_type) : LLVMConstArray(LLVMInt64TypeInContext(context), payload_items, payload_len);
         free(payload_items);
-        fields[0] = LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)expr->as.variant.tag_value, 0);
+        fields[0] = LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)expr->as.union_pack.tag_value, 0);
         fields[1] = payload_array;
         return LLVMConstStructInContext(context, fields, 2, 0);
     }
@@ -351,6 +343,23 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
     return LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(printf_fn), printf_fn, args, 2, "printtmp");
 }
 
+static LLVMValueRef emit_plain_call(FunctionCodegen* cg, const JirFunction* callee_fn, const JirExprList* args_list, const JirType* result_type) {
+    LLVMValueRef callee = llvm_function_for(cg->program, cg->module, callee_fn);
+    LLVMTypeRef callee_type = llvm_function_type(cg->context, callee_fn);
+    LLVMValueRef* args = 0;
+    LLVMValueRef result = 0;
+    int i = 0;
+    if (args_list->count > 0) {
+        args = (LLVMValueRef*)malloc((size_t)args_list->count * sizeof(LLVMValueRef));
+        for (i = 0; i < args_list->count; ++i) {
+            args[i] = emit_expr(cg, args_list->items[i]);
+        }
+    }
+    result = LLVMBuildCall2(cg->builder, callee_type, callee, args, (unsigned)args_list->count, result_type->kind == JIR_TYPE_VOID ? "" : "calltmp");
+    free(args);
+    return result;
+}
+
 static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
     switch (expr->kind) {
         case JIR_EXPR_BINDING:
@@ -422,20 +431,10 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             if (expr->as.call.builtin == JIR_BUILTIN_PANIC) {
                 return emit_builtin_panic(cg);
             }
-            LLVMValueRef callee = llvm_function_for(cg->program, cg->module, expr->as.call.callee);
-            LLVMTypeRef callee_type = llvm_function_type(cg->context, (const JirFunction*)expr->as.call.callee);
-            LLVMValueRef* args = 0;
-            LLVMValueRef result = 0;
-            if (expr->as.call.args.count > 0) {
-                args = (LLVMValueRef*)malloc((size_t)expr->as.call.args.count * sizeof(LLVMValueRef));
-                for (i = 0; i < expr->as.call.args.count; ++i) {
-                    args[i] = emit_expr(cg, expr->as.call.args.items[i]);
-                }
-            }
-            result = LLVMBuildCall2(cg->builder, callee_type, callee, args, (unsigned)expr->as.call.args.count, expr->type->kind == JIR_TYPE_VOID ? "" : "calltmp");
-            free(args);
-            return result;
+            return emit_plain_call(cg, expr->as.call.callee, &expr->as.call.args, expr->type);
         }
+        case JIR_EXPR_STRUCT_INIT:
+            return emit_plain_call(cg, expr->as.struct_init.init, &expr->as.struct_init.args, expr->type);
         case JIR_EXPR_BINARY: {
             LLVMValueRef left = emit_expr(cg, expr->as.binary.left);
             LLVMValueRef right = emit_expr(cg, expr->as.binary.right);
@@ -482,7 +481,7 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         case JIR_EXPR_ENUM_MEMBER:
             return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_ENUM_VALUE:
-            return emit_expr(cg, expr->as.enum_value.value);
+            return 0;
         case JIR_EXPR_STRUCT: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
@@ -498,44 +497,44 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             }
             return value;
         }
-        case JIR_EXPR_VARIANT: {
+        case JIR_EXPR_VARIANT:
+            return 0;
+        case JIR_EXPR_UNION_PACK: {
             LLVMValueRef union_value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             LLVMValueRef payload_array = LLVMConstNull(llvm_union_payload_type(cg->context, expr->type));
             union_value = LLVMBuildInsertValue(
                 cg->builder,
                 union_value,
-                LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.variant.tag_value, 0),
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.union_pack.tag_value, 0),
                 0,
                 "union.tag");
-            if (expr->as.variant.payload) {
-                if (expr->as.variant.payload->type->kind == JIR_TYPE_TUPLE) {
-                    for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
-                        LLVMValueRef item = emit_expr(cg, expr->as.variant.payload->as.tuple.items.items[i]);
-                        item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.variant.payload->as.tuple.items.items[i]->type);
-                        payload_array = LLVMBuildInsertValue(cg->builder, payload_array, item, (unsigned)i, "union.payload.ins");
-                    }
-                } else {
-                    LLVMValueRef item = emit_expr(cg, expr->as.variant.payload);
-                    item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.variant.payload->type);
-                    payload_array = LLVMBuildInsertValue(cg->builder, payload_array, item, 0, "union.payload.ins");
-                }
+            for (i = 0; i < expr->as.union_pack.payload_items.count; ++i) {
+                LLVMValueRef item = emit_expr(cg, expr->as.union_pack.payload_items.items[i]);
+                item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.union_pack.payload_items.items[i]->type);
+                payload_array = LLVMBuildInsertValue(cg->builder, payload_array, item, (unsigned)i, "union.payload.ins");
             }
             return LLVMBuildInsertValue(cg->builder, union_value, payload_array, 1, "union.value");
         }
-        case JIR_EXPR_UNION_TAG:
-            return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.union_tag.value), 0, "union.tag");
-        case JIR_EXPR_UNION_FIELD: {
-            LLVMValueRef payload_array = LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.union_field.value), 1, "union.payload");
-            LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.union_field.field_index, "union.field");
-            return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
-        }
-        case JIR_EXPR_STRUCT_FIELD: {
-            LLVMValueRef ptr = emit_lvalue_ptr(cg, expr);
-            if (ptr) {
-                return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), ptr, "struct.field");
+        case JIR_EXPR_EXTRACT:
+            switch (expr->as.extract.kind) {
+                case JIR_EXTRACT_STRUCT_FIELD:
+                case JIR_EXTRACT_TUPLE_ITEM:
+                    return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), (unsigned)expr->as.extract.field_index, "extract");
+                case JIR_EXTRACT_ARRAY_ITEM:
+                    return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), (unsigned)expr->as.extract.field_index, "array.extract");
+                case JIR_EXTRACT_UNION_TAG:
+                    return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), 0, "union.tag");
+                case JIR_EXTRACT_UNION_PAYLOAD: {
+                    LLVMValueRef payload_array = LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), 1, "union.payload");
+                    LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.extract.field_index, "union.field");
+                    return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
+                }
             }
-            return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.struct_field.base), (unsigned)expr->as.struct_field.field_index, "struct.field");
-        }
+            return 0;
+        case JIR_EXPR_UNION_TAG:
+        case JIR_EXPR_UNION_FIELD:
+        case JIR_EXPR_STRUCT_FIELD:
+            return 0;
         case JIR_EXPR_ARRAY: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.array.items.count; ++i) {
