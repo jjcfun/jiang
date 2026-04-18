@@ -11,12 +11,25 @@ typedef struct AstSwitchCase AstSwitchCase;
 typedef struct AstBlock AstBlock;
 typedef struct AstStructField AstStructField;
 typedef struct AstStructDecl AstStructDecl;
+typedef struct AstImportDecl AstImportDecl;
 
 typedef struct AstTypeList {
     AstType* items;
     int count;
     int capacity;
 } AstTypeList;
+
+struct AstImportDecl {
+    char* alias_name;
+    char* path;
+    int line;
+};
+
+typedef struct AstImportList {
+    AstImportDecl* items;
+    int count;
+    int capacity;
+} AstImportList;
 
 typedef enum AstTypeKind {
     AST_TYPE_INT = 0,
@@ -26,6 +39,8 @@ typedef enum AstTypeKind {
     AST_TYPE_INFER,
     AST_TYPE_NAMED,
     AST_TYPE_TUPLE,
+    AST_TYPE_SLICE,
+    AST_TYPE_POINTER,
     AST_TYPE_ARRAY,
 } AstTypeKind;
 
@@ -61,6 +76,10 @@ typedef enum AstExprKind {
     AST_EXPR_BOOL,
     AST_EXPR_STRING,
     AST_EXPR_NAME,
+    AST_EXPR_ADDR,
+    AST_EXPR_DEREF,
+    AST_EXPR_NEW,
+    AST_EXPR_FREE,
     AST_EXPR_BINARY,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
@@ -70,6 +89,7 @@ typedef enum AstExprKind {
     AST_EXPR_TUPLE,
     AST_EXPR_ARRAY,
     AST_EXPR_INDEX,
+    AST_EXPR_SLICE_LENGTH,
 } AstExprKind;
 
 typedef enum AstBinaryOp {
@@ -129,6 +149,9 @@ struct AstExpr {
         } string_lit;
         char* name;
         struct {
+            AstExpr* value;
+        } unary;
+        struct {
             AstBinaryOp op;
             AstExpr* left;
             AstExpr* right;
@@ -167,6 +190,9 @@ struct AstExpr {
             AstExpr* base;
             AstExpr* index;
         } index;
+        struct {
+            AstExpr* base;
+        } slice_length;
     } as;
 };
 
@@ -290,6 +316,7 @@ typedef struct AstFunction {
     char* name;
     AstParamList params;
     AstBlock body;
+    int public_flag;
     int struct_init_flag;
     int method_flag;
     int static_method_flag;
@@ -300,6 +327,7 @@ typedef struct AstFunction {
 struct AstEnumDecl {
     char* name;
     AstEnumMemberList members;
+    int public_flag;
     int line;
 };
 
@@ -308,6 +336,7 @@ struct AstStructDecl {
     AstStructFieldList fields;
     AstParamList init_params;
     AstBlock init_body;
+    int public_flag;
     int has_init;
     int init_line;
     int line;
@@ -342,6 +371,7 @@ struct AstUnionDecl {
     char* tag_name;
     char* name;
     AstUnionVariantList variants;
+    int public_flag;
     int line;
 };
 typedef struct AstUnionDecl AstUnionDecl;
@@ -362,6 +392,7 @@ typedef struct AstGlobal {
     AstType type;
     char* name;
     AstExpr* init;
+    int public_flag;
     int line;
 } AstGlobal;
 
@@ -372,6 +403,7 @@ typedef struct AstGlobalList {
 } AstGlobalList;
 
 typedef struct AstProgram {
+    AstImportList imports;
     AstStructList structs;
     AstEnumList enums;
     AstUnionList unions;

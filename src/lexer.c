@@ -59,6 +59,15 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 4 && strncmp(lexer->start, "Bool", 4) == 0) {
         return make_token(lexer, TOKEN_KW_BOOL, lexer->start, length);
     }
+    if (length == 3 && strncmp(lexer->start, "new", 3) == 0) {
+        return make_token(lexer, TOKEN_KW_NEW, lexer->start, length);
+    }
+    if (length == 6 && strncmp(lexer->start, "import", 6) == 0) {
+        return make_token(lexer, TOKEN_KW_IMPORT, lexer->start, length);
+    }
+    if (length == 6 && strncmp(lexer->start, "public", 6) == 0) {
+        return make_token(lexer, TOKEN_KW_PUBLIC, lexer->start, length);
+    }
     if (length == 6 && strncmp(lexer->start, "return", 6) == 0) {
         return make_token(lexer, TOKEN_KW_RETURN, lexer->start, length);
     }
@@ -173,6 +182,10 @@ Token lexer_next(Lexer* lexer) {
             return make_token(lexer, TOKEN_MINUS, lexer->start, 1);
         case '*':
             return make_token(lexer, TOKEN_STAR, lexer->start, 1);
+        case '&':
+            return make_token(lexer, TOKEN_AMP, lexer->start, 1);
+        case '$':
+            return make_token(lexer, TOKEN_DOLLAR, lexer->start, 1);
         case '/':
             return make_token(lexer, TOKEN_SLASH, lexer->start, 1);
         case '.':

@@ -87,6 +87,10 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_INT: return JIR_EXPR_INT;
         case HIR_EXPR_BOOL: return JIR_EXPR_BOOL;
         case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
+        case HIR_EXPR_ADDR: return JIR_EXPR_ADDR;
+        case HIR_EXPR_DEREF: return JIR_EXPR_DEREF;
+        case HIR_EXPR_NEW: return JIR_EXPR_NEW;
+        case HIR_EXPR_FREE: return JIR_EXPR_FREE;
         case HIR_EXPR_BINARY: return JIR_EXPR_BINARY;
         case HIR_EXPR_TERNARY: return JIR_EXPR_TERNARY;
         case HIR_EXPR_CALL: return JIR_EXPR_CALL;
@@ -100,6 +104,8 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_TUPLE: return JIR_EXPR_TUPLE;
         case HIR_EXPR_ARRAY: return JIR_EXPR_ARRAY;
         case HIR_EXPR_INDEX: return JIR_EXPR_INDEX;
+        case HIR_EXPR_SLICE: return JIR_EXPR_SLICE;
+        case HIR_EXPR_SLICE_LENGTH: return JIR_EXPR_SLICE_LENGTH;
     }
     return JIR_EXPR_INT;
 }
@@ -305,6 +311,12 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         return 0;
     }
     switch (expr->kind) {
+        case JIR_EXPR_ADDR:
+        case JIR_EXPR_DEREF:
+        case JIR_EXPR_NEW:
+        case JIR_EXPR_FREE:
+            expr->as.unary.value = desugar_expr(expr->as.unary.value);
+            return expr->as.unary.value ? expr : 0;
         case JIR_EXPR_BINARY:
             expr->as.binary.left = desugar_expr(expr->as.binary.left);
             expr->as.binary.right = desugar_expr(expr->as.binary.right);
@@ -406,6 +418,9 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             if (!expr->as.struct_field.base) {
                 return 0;
             }
+            if (expr->as.struct_field.base->type->kind == JIR_TYPE_POINTER) {
+                return expr;
+            }
             if (expr->as.struct_field.base->kind == JIR_EXPR_STRUCT) {
                 for (i = 0; i < expr->as.struct_field.base->as.struct_lit.fields.count; ++i) {
                     if (expr->as.struct_field.base->as.struct_lit.fields.items[i].field_index == expr->as.struct_field.field_index) {
@@ -447,6 +462,12 @@ static JirExpr* desugar_expr(JirExpr* expr) {
                 }
             }
             return expr;
+        case JIR_EXPR_SLICE:
+            expr->as.slice.base = desugar_expr(expr->as.slice.base);
+            return expr->as.slice.base ? expr : 0;
+        case JIR_EXPR_SLICE_LENGTH:
+            expr->as.slice_length.base = desugar_expr(expr->as.slice_length.base);
+            return expr->as.slice_length.base ? expr : 0;
         default:
             return expr;
     }
@@ -551,6 +572,12 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_BINDING:
             out->as.binding = lower_binding(expr->as.binding, error);
             return out;
+        case HIR_EXPR_ADDR:
+        case HIR_EXPR_DEREF:
+        case HIR_EXPR_NEW:
+        case HIR_EXPR_FREE:
+            out->as.unary.value = lower_expr(program, expr->as.unary.value, error);
+            return out->as.unary.value ? out : 0;
         case HIR_EXPR_BINARY:
             out->as.binary.op = jir_binary_op(expr->as.binary.op);
             out->as.binary.left = lower_expr(program, expr->as.binary.left, error);
@@ -610,6 +637,12 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             out->as.index.base = lower_expr(program, expr->as.index.base, error);
             out->as.index.index = lower_expr(program, expr->as.index.index, error);
             return out->as.index.base && out->as.index.index ? out : 0;
+        case HIR_EXPR_SLICE:
+            out->as.slice.base = lower_expr(program, expr->as.slice.base, error);
+            return out->as.slice.base ? out : 0;
+        case HIR_EXPR_SLICE_LENGTH:
+            out->as.slice_length.base = lower_expr(program, expr->as.slice_length.base, error);
+            return out->as.slice_length.base ? out : 0;
     }
     *error = "unsupported JIR expr";
     return 0;

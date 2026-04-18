@@ -73,6 +73,12 @@ run_sample while_minimal.jiang 10
 run_sample binary_ops_minimal.jiang 1
 run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0
+run_sample uint8_slice_minimal.jiang 0
+run_sample pointer_minimal.jiang 42
+run_sample free_minimal.jiang 0
+run_sample multi_file_minimal.jiang 42
+run_sample namespaced_import_minimal.jiang 42
+run_sample public_import_function_minimal.jiang 42
 run_sample mutable_qualifier_minimal.jiang 42
 run_sample mutable_array_qualifier_minimal.jiang 42
 run_sample break_continue_minimal.jiang 8
@@ -98,8 +104,13 @@ run_sample struct_init_minimal.jiang 42
 run_sample struct_init_with_defaults_minimal.jiang 18
 run_sample struct_init_branch_complete_minimal.jiang 42
 run_sample struct_init_mutable_default_override_minimal.jiang 19
+run_sample public_import_type_minimal.jiang 42
 run_sample struct_constructor_sugar_minimal.jiang 42
 run_sample struct_literal_with_init_minimal.jiang 42
+run_sample struct_new_constructor_minimal.jiang 42
+run_sample struct_new_literal_with_init_minimal.jiang 42
+run_sample multi_file_struct_minimal.jiang 42
+run_sample namespaced_struct_import_minimal.jiang 42
 run_sample struct_enum_field_shorthand_minimal.jiang 42
 run_sample struct_union_field_shorthand_minimal.jiang 42
 run_sample struct_instance_method_minimal.jiang 42
@@ -133,6 +144,16 @@ run_sample infer_array_length_minimal.jiang 42
 run_sample uint8_array_string_minimal.jiang 98
 run_sample infer_uint8_array_string_minimal.jiang 98
 run_sample struct_array_field_minimal.jiang 98
+run_sample multi_file_pointer_minimal.jiang 42
+run_sample namespaced_pointer_minimal.jiang 42
+run_sample slice_index_minimal.jiang 0
+run_sample slice_assign_minimal.jiang 0
+run_sample slice_length_minimal.jiang 3
+run_sample slice_return_length_minimal.jiang 3
+run_sample array_to_slice_local_minimal.jiang 42
+run_sample array_to_slice_assign_minimal.jiang 42
+run_sample array_to_slice_arg_minimal.jiang 42
+run_sample array_to_slice_return_minimal.jiang 2
 run_sample typed_array_constructor_minimal.jiang 42
 run_sample typed_array_constructor_infer_minimal.jiang 42
 run_sample empty_tuple_return_minimal.jiang 0
@@ -170,6 +191,14 @@ run_compile_fail invalid_typed_array_constructor_length.jiang
 run_compile_fail invalid_typed_array_constructor_non_array.jiang
 run_compile_fail invalid_index_target.jiang
 run_compile_fail invalid_index_type.jiang
+run_compile_fail invalid_address_of_expr.jiang
+run_compile_fail invalid_deref_non_pointer.jiang
+run_compile_fail invalid_free_non_pointer.jiang
+run_compile_fail invalid_use_after_free.jiang
+run_compile_fail invalid_import_private_function.jiang
+run_compile_fail invalid_import_private_type.jiang
+run_compile_fail invalid_slice_assign_type.jiang
+run_compile_fail invalid_array_to_slice_type.jiang
 run_compile_fail invalid_tuple_destructure_arity.jiang
 run_compile_fail invalid_tuple_destructure_rhs.jiang
 run_compile_fail invalid_empty_tuple_return_non_void.jiang

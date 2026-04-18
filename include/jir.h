@@ -19,6 +19,8 @@ typedef enum JirTypeKind {
     JIR_TYPE_UINT8,
     JIR_TYPE_BOOL,
     JIR_TYPE_VOID,
+    JIR_TYPE_SLICE,
+    JIR_TYPE_POINTER,
     JIR_TYPE_ENUM,
     JIR_TYPE_STRUCT,
     JIR_TYPE_TUPLE,
@@ -30,6 +32,10 @@ typedef enum JirExprKind {
     JIR_EXPR_INT = 0,
     JIR_EXPR_BOOL,
     JIR_EXPR_BINDING,
+    JIR_EXPR_ADDR,
+    JIR_EXPR_DEREF,
+    JIR_EXPR_NEW,
+    JIR_EXPR_FREE,
     JIR_EXPR_BINARY,
     JIR_EXPR_TERNARY,
     JIR_EXPR_CALL,
@@ -46,6 +52,8 @@ typedef enum JirExprKind {
     JIR_EXPR_TUPLE,
     JIR_EXPR_ARRAY,
     JIR_EXPR_INDEX,
+    JIR_EXPR_SLICE,
+    JIR_EXPR_SLICE_LENGTH,
 } JirExprKind;
 
 typedef enum JirBinaryOp {
@@ -143,6 +151,9 @@ struct JirExpr {
         int bool_value;
         JirBinding* binding;
         struct {
+            JirExpr* value;
+        } unary;
+        struct {
             JirBinaryOp op;
             JirExpr* left;
             JirExpr* right;
@@ -204,6 +215,12 @@ struct JirExpr {
             JirExpr* base;
             JirExpr* index;
         } index;
+        struct {
+            JirExpr* base;
+        } slice;
+        struct {
+            JirExpr* base;
+        } slice_length;
     } as;
 };
 

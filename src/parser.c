@@ -64,6 +64,7 @@ static int token_equals(const Token* token, const char* text) {
 #define struct_field_list_push(list, field) VEC_PUSH((list), (field))
 #define struct_field_init_list_push(list, field) VEC_PUSH((list), (field))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
+#define import_list_push(list, import_decl) VEC_PUSH((list), (import_decl))
 #define struct_list_push(list, struct_decl) VEC_PUSH((list), (struct_decl))
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
@@ -103,6 +104,62 @@ static void register_known_type(Parser* parser, const char* name) {
     hashmap_set(&parser->known_types, name, (void*)1);
 }
 
+static void advance(Parser* parser);
+
+static int is_type_like_ident(const Token* token) {
+    return token->kind == TOKEN_IDENT &&
+           token->length > 0 &&
+           token->start[0] >= 'A' &&
+           token->start[0] <= 'Z';
+}
+
+static char* parse_qualified_name(Parser* parser) {
+    char* name = 0;
+    if (parser->current.kind != TOKEN_IDENT) {
+        return 0;
+    }
+    name = token_dup(&parser->current);
+    if (!name) {
+        return 0;
+    }
+    advance(parser);
+    while (parser->current.kind == TOKEN_DOT && parser->next.kind == TOKEN_IDENT) {
+        char* right = 0;
+        char* joined = 0;
+        advance(parser);
+        right = token_dup(&parser->current);
+        if (!right) {
+            free(name);
+            return 0;
+        }
+        joined = dup_join3(name, ".", right);
+        free(name);
+        free(right);
+        if (!joined) {
+            return 0;
+        }
+        name = joined;
+        advance(parser);
+    }
+    return name;
+}
+
+static int looks_like_qualified_type_start(Parser* parser) {
+    Parser probe = *parser;
+    if (!is_type_like_ident(&probe.current)) {
+        return 0;
+    }
+    advance(&probe);
+    while (probe.current.kind == TOKEN_DOT && probe.next.kind == TOKEN_IDENT) {
+        advance(&probe);
+        if (!is_type_like_ident(&probe.current)) {
+            return 0;
+        }
+        advance(&probe);
+    }
+    return 1;
+}
+
 static int is_known_type(Parser* parser, const Token* token) {
     char* name = token_dup(token);
     int result = 0;
@@ -140,6 +197,9 @@ static int is_type_start(const Parser* parser) {
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
         return 1;
     }
+    if (parser->current.kind == TOKEN_IDENT && looks_like_qualified_type_start((Parser*)parser)) {
+        return 1;
+    }
     return parser->current.kind == TOKEN_IDENT && is_known_type((Parser*)parser, &parser->current);
 }
 
@@ -151,7 +211,7 @@ static int is_pattern_type_start(const Parser* parser) {
 }
 
 static int pattern_has_explicit_type(Parser* parser) {
-    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_BOOL) {
+    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_UINT8 || parser->current.kind == TOKEN_KW_BOOL) {
         return 1;
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
@@ -169,15 +229,30 @@ static int pattern_has_explicit_type(Parser* parser) {
 }
 
 static AstType parse_type_postfix(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_STAR) {
         if (parser->current.kind == TOKEN_BANG) {
             type.mutable_flag = 1;
             advance(parser);
             continue;
         }
+        if (parser->current.kind == TOKEN_STAR) {
+            AstType pointee = type;
+            advance(parser);
+            memset(&type, 0, sizeof(type));
+            type.kind = AST_TYPE_POINTER;
+            type.array_item = heap_type_copy(&pointee);
+            continue;
+        }
         if (parser->current.kind == TOKEN_LEFT_BRACKET) {
             AstType element = type;
             advance(parser);
+            if (parser->current.kind == TOKEN_RIGHT_BRACKET) {
+                memset(&type, 0, sizeof(type));
+                type.kind = AST_TYPE_SLICE;
+                type.array_item = heap_type_copy(&element);
+                advance(parser);
+                continue;
+            }
             memset(&type, 0, sizeof(type));
             type.kind = AST_TYPE_ARRAY;
             type.array_item = heap_type_copy(&element);
@@ -263,8 +338,7 @@ static AstType parse_type(Parser* parser) {
     }
     if (parser->current.kind == TOKEN_IDENT) {
         type.kind = AST_TYPE_NAMED;
-        type.named_name = token_dup(&parser->current);
-        advance(parser);
+        type.named_name = parse_qualified_name(parser);
         return parse_type_postfix(parser, type);
     }
     parser->error = "expected type";
@@ -388,10 +462,20 @@ static int looks_like_variant_ref(Parser* parser) {
 
 static int looks_like_qualified_init_call(Parser* parser) {
     Parser probe = *parser;
-    if (probe.current.kind != TOKEN_IDENT || !is_known_type(&probe, &probe.current)) {
+    if (probe.current.kind != TOKEN_IDENT) {
         return 0;
     }
     advance(&probe);
+    while (probe.current.kind == TOKEN_DOT && probe.next.kind == TOKEN_IDENT) {
+        if (token_equals(&probe.next, "init")) {
+            Parser tail = probe;
+            advance(&tail);
+            advance(&tail);
+            return tail.current.kind == TOKEN_LEFT_PAREN;
+        }
+        advance(&probe);
+        advance(&probe);
+    }
     if (probe.current.kind != TOKEN_DOT) {
         return 0;
     }
@@ -405,18 +489,14 @@ static int looks_like_qualified_init_call(Parser* parser) {
 
 static int looks_like_qualified_call(Parser* parser) {
     Parser probe = *parser;
-    if (probe.current.kind != TOKEN_IDENT || !is_known_type(&probe, &probe.current)) {
-        return 0;
-    }
-    advance(&probe);
-    if (probe.current.kind != TOKEN_DOT) {
-        return 0;
-    }
-    advance(&probe);
     if (probe.current.kind != TOKEN_IDENT) {
         return 0;
     }
     advance(&probe);
+    while (probe.current.kind == TOKEN_DOT && probe.next.kind == TOKEN_IDENT) {
+        advance(&probe);
+        advance(&probe);
+    }
     return probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
@@ -498,6 +578,9 @@ static int looks_like_variant_pattern_expr(Parser* parser) {
     return variant_args_are_patterns(&probe);
 }
 
+static AstExpr* parse_postfix(Parser* parser);
+static AstExpr* parse_unary(Parser* parser);
+
 static AstExpr* parse_expr(Parser* parser);
 
 static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag) {
@@ -505,6 +588,26 @@ static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag) {
     if (parser->current.kind == TOKEN_IDENT) {
         expr->as.variant.union_name = token_dup(&parser->current);
         advance(parser);
+        while (parser->current.kind == TOKEN_DOT && parser->next.kind == TOKEN_IDENT) {
+            Parser probe = *parser;
+            char* right = 0;
+            char* joined = 0;
+            advance(&probe);
+            if (!is_type_like_ident(&probe.current)) {
+                break;
+            }
+            advance(&probe);
+            if (probe.current.kind != TOKEN_DOT) {
+                break;
+            }
+            advance(parser);
+            right = token_dup(&parser->current);
+            joined = dup_join3(expr->as.variant.union_name, ".", right);
+            free(expr->as.variant.union_name);
+            free(right);
+            expr->as.variant.union_name = joined;
+            advance(parser);
+        }
         if (!expect(parser, TOKEN_DOT, "expected '.' after union name")) {
             return 0;
         }
@@ -615,6 +718,48 @@ static AstExpr* parse_primary(Parser* parser) {
         }
     }
 
+    if (token.kind == TOKEN_IDENT && looks_like_qualified_type_start(parser)) {
+        Parser probe = *parser;
+        char* qualified_name = parse_qualified_name(&probe);
+        if (qualified_name && probe.current.kind == TOKEN_LEFT_BRACE) {
+            AstExpr* struct_lit = new_expr(AST_EXPR_STRUCT, token.line);
+            free(qualified_name);
+            struct_lit->as.struct_lit.type_name = parse_qualified_name(parser);
+            advance(parser);
+            if (parser->current.kind != TOKEN_RIGHT_BRACE) {
+                for (;;) {
+                    AstStructFieldInit field_init;
+                    memset(&field_init, 0, sizeof(field_init));
+                    if (parser->current.kind != TOKEN_IDENT) {
+                        fail(parser, "expected struct field name");
+                        return 0;
+                    }
+                    field_init.name = token_dup(&parser->current);
+                    field_init.line = parser->current.line;
+                    advance(parser);
+                    if (!expect(parser, TOKEN_COLON, "expected ':' after struct field name")) {
+                        return 0;
+                    }
+                    field_init.value = parse_expr(parser);
+                    if (!field_init.value) {
+                        return 0;
+                    }
+                    struct_field_init_list_push(&struct_lit->as.struct_lit.fields, field_init);
+                    if (parser->current.kind == TOKEN_COMMA) {
+                        advance(parser);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after struct literal")) {
+                return 0;
+            }
+            return struct_lit;
+        }
+        free(qualified_name);
+    }
+
     if (token.kind == TOKEN_IDENT && is_known_type(parser, &token) && parser->next.kind == TOKEN_LEFT_BRACE) {
         AstExpr* struct_lit = new_expr(AST_EXPR_STRUCT, token.line);
         struct_lit->as.struct_lit.type_name = token_dup(&token);
@@ -682,7 +827,7 @@ static AstExpr* parse_primary(Parser* parser) {
 
     if (token.kind == TOKEN_IDENT) {
         if (parser->next.kind == TOKEN_DOT &&
-            is_known_type(parser, &token) &&
+            (is_known_type(parser, &token) || is_type_like_ident(&token)) &&
             !looks_like_qualified_init_call(parser) &&
             !looks_like_qualified_call(parser)) {
             return parse_variant_expr(parser, 0);
@@ -819,6 +964,14 @@ static AstExpr* parse_postfix(Parser* parser) {
             field->as.field.base = expr;
             field->as.field.name = token_dup(&parser->current);
             advance(parser);
+            if (strcmp(field->as.field.name, "length") == 0) {
+                AstExpr* slice_length = new_expr(AST_EXPR_SLICE_LENGTH, field->line);
+                slice_length->as.slice_length.base = expr;
+                free(field->as.field.name);
+                free(field);
+                expr = slice_length;
+                continue;
+            }
             expr = field;
             continue;
         }
@@ -828,14 +981,14 @@ static AstExpr* parse_postfix(Parser* parser) {
 }
 
 static AstExpr* parse_multiplicative(Parser* parser) {
-    AstExpr* expr = parse_postfix(parser);
+    AstExpr* expr = parse_unary(parser);
     while (expr && (parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_SLASH)) {
         AstExpr* right = 0;
         AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
         bin->as.binary.left = expr;
         bin->as.binary.op = parser->current.kind == TOKEN_STAR ? AST_BIN_MUL : AST_BIN_DIV;
         advance(parser);
-        right = parse_postfix(parser);
+        right = parse_unary(parser);
         if (!right) {
             return 0;
         }
@@ -843,6 +996,60 @@ static AstExpr* parse_multiplicative(Parser* parser) {
         expr = bin;
     }
     return expr;
+}
+
+static AstExpr* parse_unary(Parser* parser) {
+    if (parser->current.kind == TOKEN_AMP) {
+        AstExpr* expr = new_expr(AST_EXPR_ADDR, parser->current.line);
+        advance(parser);
+        expr->as.unary.value = parse_unary(parser);
+        return expr->as.unary.value ? expr : 0;
+    }
+    if (parser->current.kind == TOKEN_STAR) {
+        AstExpr* expr = new_expr(AST_EXPR_DEREF, parser->current.line);
+        advance(parser);
+        expr->as.unary.value = parse_unary(parser);
+        return expr->as.unary.value ? expr : 0;
+    }
+    if (parser->current.kind == TOKEN_KW_NEW) {
+        AstExpr* expr = new_expr(AST_EXPR_NEW, parser->current.line);
+        advance(parser);
+        expr->as.unary.value = parse_postfix(parser);
+        return expr->as.unary.value ? expr : 0;
+    }
+    if (parser->current.kind == TOKEN_DOLLAR) {
+        AstExpr* base = 0;
+        AstExpr* expr = new_expr(AST_EXPR_FREE, parser->current.line);
+        advance(parser);
+        base = parse_postfix(parser);
+        if (!base) {
+            return 0;
+        }
+        if (base->kind != AST_EXPR_CALL ||
+            !base->as.call.callee ||
+            strstr(base->as.call.callee, ".free") == 0 ||
+            base->as.call.args.count != 0) {
+            fail(parser, "expected '.free()' after '$' target");
+            return 0;
+        }
+        if (!(base->as.call.callee[0] != '\0')) {
+            fail(parser, "expected free target");
+            return 0;
+        }
+        if (base->kind == AST_EXPR_CALL) {
+            char* dot = strrchr(base->as.call.callee, '.');
+            if (!dot || strcmp(dot, ".free") != 0) {
+                fail(parser, "expected '.free()' after '$' target");
+                return 0;
+            }
+            *dot = '\0';
+            expr->as.unary.value = new_expr(AST_EXPR_NAME, expr->line);
+            expr->as.unary.value->as.name = strdup(base->as.call.callee);
+            *dot = '.';
+        }
+        return expr->as.unary.value ? expr : 0;
+    }
+    return parse_postfix(parser);
 }
 
 static AstExpr* parse_additive(Parser* parser) {
@@ -1273,8 +1480,7 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
-    if (parser->current.kind == TOKEN_IDENT &&
-        (parser->next.kind == TOKEN_ASSIGN || parser->next.kind == TOKEN_LEFT_BRACKET || parser->next.kind == TOKEN_DOT)) {
+    if (parser->current.kind == TOKEN_IDENT || parser->current.kind == TOKEN_STAR) {
         AstExpr* target = parse_expr(parser);
         if (!target) {
             return 0;
@@ -1360,6 +1566,10 @@ static int parse_params(Parser* parser, AstParamList* params) {
 static int parse_method_decl(Parser* parser, AstProgram* out_program, const char* owner_type_name) {
     AstFunction fn;
     memset(&fn, 0, sizeof(fn));
+    if (parser->current.kind == TOKEN_KW_PUBLIC) {
+        fn.public_flag = 1;
+        advance(parser);
+    }
     if (parser->current.kind == TOKEN_KW_STATIC) {
         fn.static_method_flag = 1;
         advance(parser);
@@ -1386,6 +1596,28 @@ static int parse_method_decl(Parser* parser, AstProgram* out_program, const char
         return 0;
     }
     function_list_push(&out_program->functions, fn);
+    return 1;
+}
+
+static int parse_import_decl(Parser* parser, AstProgram* out_program) {
+    AstImportDecl import_decl;
+    memset(&import_decl, 0, sizeof(import_decl));
+    import_decl.line = parser->current.line;
+    advance(parser);
+    if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_ASSIGN) {
+        import_decl.alias_name = token_dup(&parser->current);
+        advance(parser);
+        advance(parser);
+    }
+    if (parser->current.kind != TOKEN_STRING_LIT) {
+        return fail(parser, "expected import path string");
+    }
+    import_decl.path = string_token_dup(&parser->current);
+    advance(parser);
+    if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after import")) {
+        return 0;
+    }
+    import_list_push(&out_program->imports, import_decl);
     return 1;
 }
 
@@ -1583,23 +1815,38 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
     while (parser->current.kind != TOKEN_EOF) {
         AstType type;
         char* name = 0;
+        int public_flag = 0;
+
+        if (parser->current.kind == TOKEN_KW_IMPORT) {
+            if (!parse_import_decl(parser, out_program)) {
+                return 0;
+            }
+            continue;
+        }
+        if (parser->current.kind == TOKEN_KW_PUBLIC) {
+            public_flag = 1;
+            advance(parser);
+        }
 
         if (parser->current.kind == TOKEN_KW_ENUM) {
             if (!parse_enum_decl(parser, out_program)) {
                 return 0;
             }
+            out_program->enums.items[out_program->enums.count - 1].public_flag = public_flag;
             continue;
         }
         if (parser->current.kind == TOKEN_KW_STRUCT) {
             if (!parse_struct_decl(parser, out_program)) {
                 return 0;
             }
+            out_program->structs.items[out_program->structs.count - 1].public_flag = public_flag;
             continue;
         }
         if (parser->current.kind == TOKEN_KW_UNION) {
             if (!parse_union_decl(parser, out_program)) {
                 return 0;
             }
+            out_program->unions.items[out_program->unions.count - 1].public_flag = public_flag;
             continue;
         }
 
@@ -1668,6 +1915,7 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             if (type.kind == AST_TYPE_INFER) {
                 return fail(parser, "function return type cannot be inferred");
             }
+            fn.public_flag = public_flag;
             fn.return_type = type;
             fn.name = name;
             fn.line = parser->current.line;
@@ -1686,6 +1934,7 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             memset(&global, 0, sizeof(global));
             global.type = type;
             global.name = name;
+            global.public_flag = public_flag;
             global.line = parser->current.line;
             advance(parser);
             global.init = parse_expr(parser);

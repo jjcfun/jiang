@@ -28,6 +28,8 @@ typedef enum HirTypeKind {
     HIR_TYPE_UINT8,
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
+    HIR_TYPE_SLICE,
+    HIR_TYPE_POINTER,
     HIR_TYPE_ENUM,
     HIR_TYPE_STRUCT,
     HIR_TYPE_TUPLE,
@@ -69,6 +71,10 @@ typedef enum HirExprKind {
     HIR_EXPR_INT = 0,
     HIR_EXPR_BOOL,
     HIR_EXPR_BINDING,
+    HIR_EXPR_ADDR,
+    HIR_EXPR_DEREF,
+    HIR_EXPR_NEW,
+    HIR_EXPR_FREE,
     HIR_EXPR_BINARY,
     HIR_EXPR_TERNARY,
     HIR_EXPR_CALL,
@@ -82,6 +88,8 @@ typedef enum HirExprKind {
     HIR_EXPR_TUPLE,
     HIR_EXPR_ARRAY,
     HIR_EXPR_INDEX,
+    HIR_EXPR_SLICE,
+    HIR_EXPR_SLICE_LENGTH,
 } HirExprKind;
 
 typedef enum HirBinaryOp {
@@ -129,6 +137,9 @@ struct HirExpr {
         int64_t int_value;
         int bool_value;
         HirBinding* binding;
+        struct {
+            HirExpr* value;
+        } unary;
         struct {
             HirBinaryOp op;
             HirExpr* left;
@@ -181,6 +192,12 @@ struct HirExpr {
             HirExpr* base;
             HirExpr* index;
         } index;
+        struct {
+            HirExpr* base;
+        } slice;
+        struct {
+            HirExpr* base;
+        } slice_length;
     } as;
 };
 
