@@ -71,6 +71,7 @@ static int token_equals(const Token* token, const char* text) {
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
+#define name_list_push(list, name) VEC_PUSH((list), (name))
 
 static AstExpr* new_expr(AstExprKind kind, int line) {
     AstExpr* expr = (AstExpr*)calloc(1, sizeof(AstExpr));
@@ -115,6 +116,11 @@ static int is_type_like_ident(const Token* token) {
            token->start[0] <= 'Z';
 }
 
+static AstType parse_type(Parser* parser);
+static int fail(Parser* parser, const char* error);
+static int expect(Parser* parser, TokenKind kind, const char* error);
+static int is_type_start(const Parser* parser);
+
 static char* parse_qualified_name(Parser* parser) {
     char* name = 0;
     if (parser->current.kind != TOKEN_IDENT) {
@@ -144,6 +150,60 @@ static char* parse_qualified_name(Parser* parser) {
         advance(parser);
     }
     return name;
+}
+
+static int parse_type_arg_list(Parser* parser, AstTypeList* out) {
+    if (!expect(parser, TOKEN_LT, "expected '<' to start type arguments")) {
+        return 0;
+    }
+    if (!is_type_start(parser)) {
+        return fail(parser, "expected type argument");
+    }
+    for (;;) {
+        type_list_push(out, parse_type(parser));
+        if (parser->current.kind == TOKEN_COMMA) {
+            advance(parser);
+            continue;
+        }
+        break;
+    }
+    return expect(parser, TOKEN_GT, "expected '>' after type arguments");
+}
+
+static int parse_generic_params(Parser* parser, AstNameList* out) {
+    if (!expect(parser, TOKEN_AT, "expected '@' before generic parameters")) {
+        return 0;
+    }
+    if (!expect(parser, TOKEN_LT, "expected '<' after '@'")) {
+        return 0;
+    }
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected generic parameter name");
+    }
+    for (;;) {
+        name_list_push(out, token_dup(&parser->current));
+        advance(parser);
+        if (parser->current.kind == TOKEN_COMMA) {
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, "expected generic parameter name");
+            }
+            continue;
+        }
+        break;
+    }
+    return expect(parser, TOKEN_GT, "expected '>' after generic parameters");
+}
+
+static int looks_like_call_type_args(Parser* parser) {
+    Parser probe = *parser;
+    if (probe.current.kind != TOKEN_LT) {
+        return 0;
+    }
+    if (!parse_type_arg_list(&probe, &(AstTypeList){0})) {
+        return 0;
+    }
+    return probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
 static int looks_like_qualified_type_start(Parser* parser) {
@@ -349,6 +409,11 @@ static AstType parse_type(Parser* parser) {
     if (parser->current.kind == TOKEN_IDENT) {
         type.kind = AST_TYPE_NAMED;
         type.named_name = parse_qualified_name(parser);
+        if (parser->current.kind == TOKEN_LT) {
+            if (!parse_type_arg_list(parser, &type.type_args)) {
+                return type;
+            }
+        }
         return parse_type_postfix(parser, type);
     }
     parser->error = "expected type";
@@ -737,10 +802,21 @@ static AstExpr* parse_primary(Parser* parser) {
     if (token.kind == TOKEN_IDENT && looks_like_qualified_type_start(parser)) {
         Parser probe = *parser;
         char* qualified_name = parse_qualified_name(&probe);
+        if (probe.current.kind == TOKEN_LT) {
+            if (!parse_type_arg_list(&probe, &(AstTypeList){0})) {
+                free(qualified_name);
+                qualified_name = 0;
+            }
+        }
         if (qualified_name && probe.current.kind == TOKEN_LEFT_BRACE) {
             AstExpr* struct_lit = new_expr(AST_EXPR_STRUCT, token.line);
             free(qualified_name);
             struct_lit->as.struct_lit.type_name = parse_qualified_name(parser);
+            if (parser->current.kind == TOKEN_LT) {
+                if (!parse_type_arg_list(parser, &struct_lit->as.struct_lit.type_args)) {
+                    return 0;
+                }
+            }
             advance(parser);
             if (parser->current.kind != TOKEN_RIGHT_BRACE) {
                 for (;;) {
@@ -945,12 +1021,18 @@ static AstExpr* parse_postfix(Parser* parser) {
              (expr->kind == AST_EXPR_FIELD &&
               expr->as.field.base &&
               expr->as.field.base->kind == AST_EXPR_NAME)) &&
-            parser->current.kind == TOKEN_LEFT_PAREN) {
+            (parser->current.kind == TOKEN_LEFT_PAREN ||
+             (parser->current.kind == TOKEN_LT && looks_like_call_type_args(parser)))) {
             AstExpr* call = new_expr(AST_EXPR_CALL, expr->line);
             if (expr->kind == AST_EXPR_NAME) {
                 call->as.call.callee = expr->as.name;
             } else {
                 call->as.call.callee = dup_join3(expr->as.field.base->as.name, ".", expr->as.field.name);
+            }
+            if (parser->current.kind == TOKEN_LT) {
+                if (!parse_type_arg_list(parser, &call->as.call.type_args)) {
+                    return 0;
+                }
             }
             advance(parser);
             if (parser->current.kind != TOKEN_RIGHT_PAREN) {
@@ -1787,9 +1869,13 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     return 1;
 }
 
-static int parse_struct_decl(Parser* parser, AstProgram* out_program) {
+static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameList* generic_params) {
     AstStructDecl struct_decl;
     memset(&struct_decl, 0, sizeof(struct_decl));
+    if (generic_params) {
+        struct_decl.type_params = *generic_params;
+        memset(generic_params, 0, sizeof(*generic_params));
+    }
     advance(parser);
     if (parser->current.kind != TOKEN_IDENT) {
         return fail(parser, "expected struct name");
@@ -1930,12 +2016,19 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
         AstType type;
         char* name = 0;
         int public_flag = 0;
+        AstNameList generic_params;
+        memset(&generic_params, 0, sizeof(generic_params));
 
         if (parser->current.kind == TOKEN_KW_IMPORT) {
             if (!parse_import_decl(parser, out_program)) {
                 return 0;
             }
             continue;
+        }
+        if (parser->current.kind == TOKEN_AT) {
+            if (!parse_generic_params(parser, &generic_params)) {
+                return 0;
+            }
         }
         if (parser->current.kind == TOKEN_KW_PUBLIC) {
             public_flag = 1;
@@ -1949,6 +2042,9 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
         }
 
         if (parser->current.kind == TOKEN_KW_ENUM) {
+            if (generic_params.count != 0) {
+                return fail(parser, "generic enum is not supported");
+            }
             if (!parse_enum_decl(parser, out_program)) {
                 return 0;
             }
@@ -1956,13 +2052,16 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             continue;
         }
         if (parser->current.kind == TOKEN_KW_STRUCT) {
-            if (!parse_struct_decl(parser, out_program)) {
+            if (!parse_struct_decl(parser, out_program, &generic_params)) {
                 return 0;
             }
             out_program->structs.items[out_program->structs.count - 1].public_flag = public_flag;
             continue;
         }
         if (parser->current.kind == TOKEN_KW_UNION) {
+            if (generic_params.count != 0) {
+                return fail(parser, "generic union is not supported");
+            }
             if (!parse_union_decl(parser, out_program)) {
                 return 0;
             }
@@ -2038,6 +2137,7 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             fn.public_flag = public_flag;
             fn.return_type = type;
             fn.name = name;
+            fn.type_params = generic_params;
             fn.line = parser->current.line;
             if (!parse_params(parser, &fn.params)) {
                 return 0;
@@ -2050,6 +2150,9 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
         }
 
         if (parser->current.kind == TOKEN_ASSIGN) {
+            if (generic_params.count != 0) {
+                return fail(parser, "generic global is not supported");
+            }
             AstGlobal global;
             memset(&global, 0, sizeof(global));
             global.type = type;

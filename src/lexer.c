@@ -174,6 +174,8 @@ Token lexer_next(Lexer* lexer) {
             return make_token(lexer, TOKEN_LEFT_BRACKET, lexer->start, 1);
         case ']':
             return make_token(lexer, TOKEN_RIGHT_BRACKET, lexer->start, 1);
+        case '@':
+            return make_token(lexer, TOKEN_AT, lexer->start, 1);
         case ',':
             return make_token(lexer, TOKEN_COMMA, lexer->start, 1);
         case ':':

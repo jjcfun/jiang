@@ -20,6 +20,12 @@ typedef struct AstTypeList {
     int capacity;
 } AstTypeList;
 
+typedef struct AstNameList {
+    char** items;
+    int count;
+    int capacity;
+} AstNameList;
+
 struct AstImportDecl {
     char* alias_name;
     char* path;
@@ -63,6 +69,7 @@ struct AstType {
     AstTypeKind kind;
     int mutable_flag;
     AstTypeList tuple_items;
+    AstTypeList type_args;
     char* named_name;
     AstType* array_item;
     int array_length;
@@ -188,6 +195,7 @@ struct AstExpr {
         } ternary;
         struct {
             char* callee;
+            AstTypeList type_args;
             AstExprList args;
         } call;
         struct {
@@ -203,6 +211,7 @@ struct AstExpr {
         } field;
         struct {
             char* type_name;
+            AstTypeList type_args;
             AstStructFieldInitList fields;
         } struct_lit;
         struct {
@@ -339,6 +348,7 @@ struct AstStmt {
 typedef struct AstFunction {
     AstType return_type;
     char* name;
+    AstNameList type_params;
     AstParamList params;
     AstBlock body;
     int public_flag;
@@ -358,6 +368,7 @@ struct AstEnumDecl {
 
 struct AstStructDecl {
     char* name;
+    AstNameList type_params;
     AstStructFieldList fields;
     AstParamList init_params;
     AstBlock init_body;

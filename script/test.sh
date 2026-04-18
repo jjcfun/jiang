@@ -118,6 +118,13 @@ run_sample optional_some_pattern_minimal.jiang 42
 run_sample optional_switch_pattern_minimal.jiang 42
 run_sample optional_nested_array_minimal.jiang 42
 run_sample size_of_minimal.jiang 8
+run_sample generic_decl_minimal.jiang 42
+run_sample generic_func_call_minimal.jiang 42
+run_sample generic_func_infer_minimal.jiang 42
+run_sample generic_import_func_call_minimal.jiang 42
+run_sample generic_import_func_infer_minimal.jiang 42
+run_sample generic_struct_instantiation_minimal.jiang 42
+run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
