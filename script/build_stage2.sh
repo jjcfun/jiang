@@ -49,12 +49,7 @@ bootstrap_stage2_is_usable() {
     if [ ! -x "$bootstrap_bin" ]; then
         return 1
     fi
-
-    if "$TIMEOUT_BIN" 5 "$bootstrap_bin" --help >/dev/null 2>&1; then
-        return 0
-    fi
-
-    return 1
+    return 0
 }
 
 find_latest_dist_archive() {

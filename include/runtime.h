@@ -104,14 +104,15 @@ static inline void __intrinsic_free(uint8_t* ptr) {
     free(ptr);
 }
 
-static inline void __intrinsic_memmove(uint8_t* dst, uint8_t* src, int64_t bytes) {
+static inline uint8_t* __intrinsic_memmove(uint8_t* dst, uint8_t* src, int64_t bytes) {
     if (bytes <= 0) {
-        return;
+        return dst;
     }
     if (!dst || !src) {
-        return;
+        return dst;
     }
     memmove(dst, src, (size_t)bytes);
+    return dst;
 }
 
 static inline Slice_int64_t __intrinsic_alloc_ints(int64_t length) {

@@ -111,6 +111,26 @@ if [[ $STATUS -ne 8 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/array_repeat_init_minimal.jiang" "array_repeat_init_minimal"
+set +e
+"$OUT_DIR/array_repeat_init_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 6 ]]; then
+    echo "stage2 run smoke expected array_repeat_init_minimal exit code 6, got $STATUS" >&2
+    exit 1
+fi
+
+compile_stage2_entry "compiler/tests/samples/new_array_repeat_init_minimal.jiang" "new_array_repeat_init_minimal"
+set +e
+"$OUT_DIR/new_array_repeat_init_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 6 ]]; then
+    echo "stage2 run smoke expected new_array_repeat_init_minimal exit code 6, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/multi_file_minimal.jiang" "multi_file_minimal"
 set +e
 "$OUT_DIR/multi_file_minimal"

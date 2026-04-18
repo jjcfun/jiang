@@ -1164,7 +1164,7 @@ cc -x c -std=c99 -Wall -Wextra -Werror -c "$NAMESPACED_SLICE_INDEX_C" -o "$NAMES
 
 "$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/pointer_minimal.jiang" > "$POINTER_C"
 expect_fn_decl 'long long' 'read' 'long long\* p' "$POINTER_C"
-rg -q '^    long long\* p = \(&value\);$' "$POINTER_C"
+rg -q '^    long long \*p = \(&value\);$|^    long long\* p = \(&value\);$' "$POINTER_C"
 rg -q '^\s*\(\(\*p\) = \(\(\*p\) \+ 1\)\);$' "$POINTER_C"
 cc -x c -std=c99 -Wall -Wextra -Werror -c "$POINTER_C" -o "$POINTER_O"
 
