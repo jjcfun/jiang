@@ -16,6 +16,8 @@ bash "$PROJECT_ROOT/script/build_stage2.sh"
 
 MINIMAL_LL="$OUT_DIR/minimal.ll"
 MINIMAL_O="$OUT_DIR/minimal.o"
+FREE_LL="$OUT_DIR/free_minimal.ll"
+FREE_O="$OUT_DIR/free_minimal.o"
 WHILE_LL="$OUT_DIR/while_minimal.ll"
 WHILE_O="$OUT_DIR/while_minimal.o"
 BREAK_CONTINUE_LL="$OUT_DIR/break_continue_minimal.ll"
@@ -308,6 +310,21 @@ STATUS=$?
 set -e
 if [[ $STATUS -ne 42 ]]; then
     echo "stage2 llvm smoke expected minimal exit code 42, got $STATUS" >&2
+    exit 1
+fi
+
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/free_minimal.jiang" > "$FREE_LL"
+rg -q 'call void @free' "$FREE_LL"
+rg -q 'call ptr @malloc' "$FREE_LL"
+"$LLVM_CLANG" -Wno-override-module -x ir -c "$FREE_LL" -o "$FREE_O"
+FREE_BIN="$OUT_DIR/free_minimal"
+"$LLVM_CLANG" "$FREE_O" "$PROJECT_ROOT/runtime/host_runtime.c" -I "$PROJECT_ROOT/include" -o "$FREE_BIN"
+set +e
+"$FREE_BIN"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 0 ]]; then
+    echo "stage2 llvm smoke expected free_minimal exit code 0, got $STATUS" >&2
     exit 1
 fi
 

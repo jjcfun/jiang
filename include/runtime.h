@@ -20,17 +20,20 @@ typedef struct {
     int64_t length;
 } Slice_uint8_t;
 
-// Stage1 runtime ABI is intentionally small and frozen for now.
+// Host runtime ABI is intentionally small and frozen for now.
 // The only host intrinsics exposed to Jiang code are:
 // - __intrinsic_print
 // - __intrinsic_assert
 // - __intrinsic_read_file
 // - __intrinsic_file_exists
+// - __intrinsic_malloc
+// - __intrinsic_free
+// - __intrinsic_memmove
 // - __intrinsic_alloc_ints
 // - __intrinsic_alloc_bytes
 //
 // libc usage remains concentrated in this header and the host compiler
-// implementation. Stage1 does not try to remove libc yet; it only fixes the
+// implementation. Stage2 does not try to remove libc yet; it only fixes the
 // boundary so later LLVM/native backend work has a stable runtime surface.
 //
 // Current libc touchpoints used here:
@@ -85,6 +88,30 @@ static inline Slice_uint8_t __intrinsic_read_file(Slice_uint8_t path) {
     result.ptr = buffer;
     result.length = (int64_t)read_size;
     return result;
+}
+
+static inline uint8_t* __intrinsic_malloc(int64_t size) {
+    if (size <= 0) {
+        size = 1;
+    }
+    return (uint8_t*)malloc((size_t)size);
+}
+
+static inline void __intrinsic_free(uint8_t* ptr) {
+    if (!ptr) {
+        return;
+    }
+    free(ptr);
+}
+
+static inline void __intrinsic_memmove(uint8_t* dst, uint8_t* src, int64_t bytes) {
+    if (bytes <= 0) {
+        return;
+    }
+    if (!dst || !src) {
+        return;
+    }
+    memmove(dst, src, (size_t)bytes);
 }
 
 static inline Slice_int64_t __intrinsic_alloc_ints(int64_t length) {

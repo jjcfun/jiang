@@ -21,7 +21,7 @@ MINIMAL_C="$BUILD_DIR/stage2_selfhost_minimal.c"
 cc -std=c99 -I "$PROJECT_ROOT/include" \
     $LLVM_CFLAGS \
     "$SELFHOST_C" \
-    "$PROJECT_ROOT/runtime/stage1_host.c" \
+    "$PROJECT_ROOT/runtime/host_runtime.c" \
     "$PROJECT_ROOT/compiler/stage2_driver.c" \
     "$PROJECT_ROOT/compiler/ffi/llvm/llvm_shim.c" \
     $LLVM_LDFLAGS \
@@ -33,7 +33,7 @@ cc -std=c99 -I "$PROJECT_ROOT/include" -c "$ROUND2_C" -o "$BUILD_DIR/stage2_self
 cc -std=c99 -I "$PROJECT_ROOT/include" \
     $LLVM_CFLAGS \
     "$ROUND2_C" \
-    "$PROJECT_ROOT/runtime/stage1_host.c" \
+    "$PROJECT_ROOT/runtime/host_runtime.c" \
     "$PROJECT_ROOT/compiler/stage2_driver.c" \
     "$PROJECT_ROOT/compiler/ffi/llvm/llvm_shim.c" \
     $LLVM_LDFLAGS \

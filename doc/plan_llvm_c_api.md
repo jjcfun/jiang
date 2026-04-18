@@ -105,6 +105,9 @@ LLVM C API 路径的第一步不是扩语言覆盖，而是复制当前已验证
 - `__intrinsic_assert`
 - `__intrinsic_read_file`
 - `__intrinsic_file_exists`
+- `__intrinsic_malloc`
+- `__intrinsic_free`
+- `__intrinsic_memmove`
 - `__intrinsic_alloc_ints`
 - `__intrinsic_alloc_bytes`
 

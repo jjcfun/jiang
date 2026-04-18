@@ -5,7 +5,7 @@
 ## 🌟 核心特性 (Key Features)
 
 *   **极简而统一的类型系统**：遵循“从左往右，从里到外”的类型推导与声明逻辑（如 `Int?[2][3]`）。
-*   **内存安全与所有权机制**：内置轻量级的所有权（Ownership）校验，结合手动的内存分配与释放（`new` 与 `sudo $free()`），在无 GC 的前提下保障内存安全。
+*   **内存安全与所有权机制**：内置轻量级的所有权（Ownership）校验，结合手动的内存分配与释放（`new` 与 `$ptr.free()`），在无 GC 的前提下保障内存安全。
 *   **透明的智能指针（自动解引用）**：使用指针如字面量一般自然，而底层的代理与操作则隐藏在 `$` 语法之下（如 `$ptr.move()`）。
 *   **高度灵活的聚合类型**：支持强大且直观的结构体（Struct）、多态枚举（Enum）、以及安全的联合体（Union）与模式匹配。
 *   **泛型及无缝异步设计**：内置函数与结构体级别的泛型修饰，以及为适应现代 IO 设计的 `async` 原生支持。
@@ -200,6 +200,9 @@ Stage1 当前主线已经完成并冻结；当前更值得做的是：
 *   `__intrinsic_assert`
 *   `__intrinsic_read_file`
 *   `__intrinsic_file_exists`
+*   `__intrinsic_malloc`
+*   `__intrinsic_free`
+*   `__intrinsic_memmove`
 *   `__intrinsic_alloc_ints`
 *   `__intrinsic_alloc_bytes`
 

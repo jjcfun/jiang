@@ -19,7 +19,7 @@ cd "$PROJECT_ROOT"
 
 cc -std=c99 -Wall -Wextra -Werror \
     "$OUT_DIR/compiler_compiler_core.c" \
-    "$PROJECT_ROOT/runtime/stage1_host.c" \
+    "$PROJECT_ROOT/runtime/host_runtime.c" \
     "$PROJECT_ROOT/bootstrap/stage1_driver.c" \
     -o "$BUILD_DIR/stage1c"
 

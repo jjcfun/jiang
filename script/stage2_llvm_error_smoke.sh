@@ -94,6 +94,8 @@ OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_llvm_invalid_for_tuple_bindi
 OUT_FOR_TUPLE_BIND_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_for_tuple_binding_arity.log"
 OUT_FOR_INDEXED_ARITY_LOG="$BUILD_DIR/stage2_llvm_invalid_for_indexed_arity.log"
 OUT_FOR_INDEXED_NESTED_INDEX_LOG="$BUILD_DIR/stage2_llvm_invalid_for_indexed_nested_index_binding.log"
+OUT_FREE_NON_POINTER_LOG="$BUILD_DIR/stage2_llvm_invalid_free_non_pointer.log"
+OUT_USE_AFTER_FREE_LOG="$BUILD_DIR/stage2_llvm_invalid_use_after_free.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -1894,6 +1896,46 @@ fi
 
 if rg -q '^; ModuleID = ' "$OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG"; then
     echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_union_tuple_bind_non_tuple" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_free_non_pointer.jiang" > "$OUT_FREE_NON_POINTER_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_free_non_pointer to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_FREE_NON_POINTER_LOG")" != *'$ptr.free() requires a pointer variable'* ]]; then
+    echo "stage2 llvm error smoke missing free non-pointer diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_FREE_NON_POINTER_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_free_non_pointer" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" --emit-llvm "$PROJECT_ROOT/compiler/tests/samples/invalid_use_after_free.jiang" > "$OUT_USE_AFTER_FREE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 llvm error smoke expected invalid_use_after_free to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_USE_AFTER_FREE_LOG")" != *"symbol was freed"* ]]; then
+    echo "stage2 llvm error smoke missing use-after-free diagnostic" >&2
+    exit 1
+fi
+
+if rg -q '^; ModuleID = ' "$OUT_USE_AFTER_FREE_LOG"; then
+    echo "stage2 llvm error smoke unexpectedly produced llvm ir for invalid_use_after_free" >&2
     exit 1
 fi
 

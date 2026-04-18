@@ -514,6 +514,12 @@ static void register_builtins(void) {
                   make_slice_type(make_base_type("UInt8")), 0, false);
     symbol_define("__intrinsic_file_exists", 23, SYM_FUNC,
                   make_base_type("Bool"), 0, false);
+    symbol_define("__intrinsic_malloc", 18, SYM_FUNC,
+                  make_pointer_type(make_base_type("UInt8")), 0, false);
+    symbol_define("__intrinsic_free", 16, SYM_FUNC,
+                  make_base_type("void"), 0, false);
+    symbol_define("__intrinsic_memmove", 19, SYM_FUNC,
+                  make_base_type("void"), 0, false);
     symbol_define("__intrinsic_alloc_ints", 22, SYM_FUNC,
                   make_slice_type(make_base_type("Int")), 0, false);
     symbol_define("__intrinsic_alloc_bytes", 23, SYM_FUNC,

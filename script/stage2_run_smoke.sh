@@ -18,7 +18,7 @@ compile_stage2_entry() {
     local out_bin="$OUT_DIR/${stem}"
 
     "$BUILD_DIR/stage2c" "$source_path" > "$out_c"
-    cc -std=c99 -I "$PROJECT_ROOT/include" "$out_c" "$PROJECT_ROOT/runtime/stage1_host.c" -o "$out_bin"
+    cc -std=c99 -I "$PROJECT_ROOT/include" "$out_c" "$PROJECT_ROOT/runtime/host_runtime.c" -o "$out_bin"
 }
 
 compile_stage2_entry "compiler/tests/samples/minimal.jiang" "minimal"

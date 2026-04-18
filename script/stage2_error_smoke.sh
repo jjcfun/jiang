@@ -108,6 +108,8 @@ OUT_FOR_TUPLE_BIND_NON_TUPLE_LOG="$BUILD_DIR/stage2_invalid_for_tuple_binding_no
 OUT_FOR_TUPLE_BIND_ARITY_LOG="$BUILD_DIR/stage2_invalid_for_tuple_binding_arity.log"
 OUT_FOR_INDEXED_ARITY_LOG="$BUILD_DIR/stage2_invalid_for_indexed_arity.log"
 OUT_FOR_INDEXED_NESTED_INDEX_LOG="$BUILD_DIR/stage2_invalid_for_indexed_nested_index_binding.log"
+OUT_FREE_NON_POINTER_LOG="$BUILD_DIR/stage2_invalid_free_non_pointer.log"
+OUT_USE_AFTER_FREE_LOG="$BUILD_DIR/stage2_invalid_use_after_free.log"
 
 bash "$PROJECT_ROOT/script/build_stage2.sh"
 
@@ -1668,6 +1670,36 @@ fi
 
 if [[ "$(<"$OUT_UNION_TUPLE_BIND_NON_TUPLE_LOG")" != *"union tuple binding requires tuple payload"* ]]; then
     echo "stage2 error smoke missing union tuple binding payload diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_free_non_pointer.jiang" > "$OUT_FREE_NON_POINTER_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_free_non_pointer to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_FREE_NON_POINTER_LOG")" != *'$ptr.free() requires a pointer variable'* ]]; then
+    echo "stage2 error smoke missing free non-pointer diagnostic" >&2
+    exit 1
+fi
+
+set +e
+"$BUILD_DIR/stage2c" "$PROJECT_ROOT/compiler/tests/samples/invalid_use_after_free.jiang" > "$OUT_USE_AFTER_FREE_LOG"
+STATUS=$?
+set -e
+
+if [[ $STATUS -eq 0 ]]; then
+    echo "stage2 error smoke expected invalid_use_after_free to fail" >&2
+    exit 1
+fi
+
+if [[ "$(<"$OUT_USE_AFTER_FREE_LOG")" != *"symbol was freed"* ]]; then
+    echo "stage2 error smoke missing use-after-free diagnostic" >&2
     exit 1
 fi
 

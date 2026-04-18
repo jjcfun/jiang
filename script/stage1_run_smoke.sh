@@ -64,7 +64,7 @@ run_stage1_entry() {
     local out_log="$OUT_DIR/${stem}.log"
 
     "$BUILD_DIR/stage1c" --mode emit-c "$source_path" > "$out_c"
-    cc -std=c99 -I "$PROJECT_ROOT/include" "$out_c" "$PROJECT_ROOT/runtime/stage1_host.c" -o "$out_bin"
+    cc -std=c99 -I "$PROJECT_ROOT/include" "$out_c" "$PROJECT_ROOT/runtime/host_runtime.c" -o "$out_bin"
     "$out_bin" > "$out_log"
     if [[ "$(<"$out_log")" != *"$expected_text"* ]]; then
         echo "stage1 run smoke missing expected text '$expected_text' for $stem" >&2

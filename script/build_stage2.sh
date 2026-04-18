@@ -35,7 +35,7 @@ link_stage2() {
     cc -std=c99 -I "$PROJECT_ROOT/include" \
         $LLVM_CFLAGS \
         "$input_c" \
-        "$PROJECT_ROOT/runtime/stage1_host.c" \
+        "$PROJECT_ROOT/runtime/host_runtime.c" \
         "$PROJECT_ROOT/compiler/stage2_driver.c" \
         "$PROJECT_ROOT/compiler/ffi/llvm/llvm_shim.c" \
         $LLVM_LDFLAGS \

@@ -128,6 +128,25 @@ make
 
 当前仓库状态下，`script/test.sh` 会构建 `jiangc` 并运行 Stage0、Stage1 基线以及 Stage2 主线验收链。
 
+当前冻结的宿主 runtime ABI 包括：
+
+- `__intrinsic_print`
+- `__intrinsic_assert`
+- `__intrinsic_read_file`
+- `__intrinsic_file_exists`
+- `__intrinsic_malloc`
+- `__intrinsic_free`
+- `__intrinsic_memmove`
+- `__intrinsic_alloc_ints`
+- `__intrinsic_alloc_bytes`
+
+当前冻结的标准库入口包括：
+
+- `std.io`
+- `std.debug`
+- `std.fs`
+- `std.mem`
+
 Stage1 的正式完成验收脚本是：
 
 ```bash
