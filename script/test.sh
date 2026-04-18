@@ -106,6 +106,16 @@ run_sample enum_switch_shorthand_minimal.jiang 42
 run_sample switch_enum_minimal.jiang 42
 run_sample ternary_enum_minimal.jiang 42
 run_sample ternary_minimal.jiang 42
+run_sample optional_minimal.jiang 42
+run_sample optional_null_compare_minimal.jiang 42
+run_sample optional_if_narrow_minimal.jiang 42
+run_sample optional_else_narrow_minimal.jiang 42
+run_sample optional_coalesce_minimal.jiang 42
+run_sample optional_chain_member_minimal.jiang 42
+run_sample optional_chain_index_minimal.jiang 40
+run_sample optional_chain_nested_pure_base_minimal.jiang 42
+run_sample optional_some_pattern_minimal.jiang 42
+run_sample optional_switch_pattern_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
@@ -119,6 +129,9 @@ run_sample public_alias_type_minimal.jiang 42
 run_sample public_import_type_minimal.jiang 42
 run_sample struct_constructor_sugar_minimal.jiang 42
 run_sample struct_literal_with_init_minimal.jiang 42
+run_sample struct_optional_field_minimal.jiang 42
+run_sample struct_optional_field_omitted_minimal.jiang 18
+run_sample struct_init_optional_omitted_minimal.jiang 1
 run_sample struct_new_constructor_minimal.jiang 42
 run_sample struct_new_literal_with_init_minimal.jiang 42
 run_sample multi_file_struct_return_minimal.jiang 42
@@ -210,6 +223,16 @@ run_compile_fail invalid_array_length.jiang
 run_compile_fail invalid_array_assign_length.jiang
 run_compile_fail invalid_array_arg_length.jiang
 run_compile_fail invalid_array_return_length.jiang
+run_compile_fail invalid_infer_optional_null.jiang
+run_compile_fail invalid_optional_null_non_optional.jiang
+run_compile_fail invalid_optional_coalesce_non_optional.jiang
+run_compile_fail invalid_optional_coalesce_impure_left.jiang
+run_compile_fail invalid_optional_no_narrow_then_null_branch.jiang
+run_compile_fail invalid_optional_chain_impure_base.jiang
+run_compile_fail invalid_optional_chain_impure_member_base.jiang
+run_compile_fail invalid_optional_pattern_label.jiang
+run_compile_fail invalid_optional_pattern_non_optional.jiang
+run_compile_fail invalid_optional_switch_non_exhaustive.jiang
 run_compile_fail invalid_call_arg.jiang
 run_compile_fail invalid_global_initializer_type.jiang
 run_compile_fail invalid_infer_array_length_missing_init.jiang

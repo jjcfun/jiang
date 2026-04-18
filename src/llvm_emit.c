@@ -149,6 +149,13 @@ static LLVMTypeRef llvm_array_type(LLVMContextRef context, const JirType* type) 
     return LLVMArrayType(llvm_type(context, type->array_item), (unsigned)type->array_length);
 }
 
+static LLVMTypeRef llvm_optional_type(LLVMContextRef context, const JirType* type) {
+    LLVMTypeRef fields[2];
+    fields[0] = LLVMInt1TypeInContext(context);
+    fields[1] = llvm_type(context, type->array_item);
+    return LLVMStructTypeInContext(context, fields, 2, 0);
+}
+
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
     switch (type->kind) {
         case JIR_TYPE_UINT8:
@@ -171,6 +178,8 @@ static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
             return llvm_array_type(context, type);
         case JIR_TYPE_UNION:
             return llvm_union_type(context, type);
+        case JIR_TYPE_OPTIONAL:
+            return llvm_optional_type(context, type);
         default:
             return LLVMInt64TypeInContext(context);
     }
@@ -205,6 +214,15 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
     }
     if (expr->kind == JIR_EXPR_ENUM_MEMBER) {
         return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.enum_member.value, 1);
+    }
+    if (expr->kind == JIR_EXPR_NULL) {
+        return LLVMConstNull(llvm_type(context, expr->type));
+    }
+    if (expr->kind == JIR_EXPR_OPTIONAL_SOME) {
+        LLVMValueRef fields[2];
+        fields[0] = LLVMConstInt(LLVMInt1TypeInContext(context), 1, 0);
+        fields[1] = llvm_const_expr(context, expr->as.unary.value);
+        return LLVMConstStructInContext(context, fields, 2, 0);
     }
     if (expr->kind == JIR_EXPR_TUPLE) {
         if (expr->as.tuple.items.count > 0) {
@@ -473,6 +491,8 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), global, expr->as.binding->name);
             }
             return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), find_alloca(cg, expr->as.binding), expr->as.binding->name);
+        case JIR_EXPR_NULL:
+            return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_ADDR:
             return emit_lvalue_ptr(cg, expr->as.unary.value);
         case JIR_EXPR_DEREF:
@@ -516,9 +536,21 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         }
         case JIR_EXPR_STRUCT_INIT:
             return emit_plain_call(cg, expr->as.struct_init.init, &expr->as.struct_init.args, expr->type);
+        case JIR_EXPR_OPTIONAL_SOME: {
+            LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
+            value = LLVMBuildInsertValue(cg->builder, value, LLVMConstInt(LLVMInt1TypeInContext(cg->context), 1, 0), 0, "opt.some.flag");
+            value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.unary.value), 1, "opt.some.value");
+            return value;
+        }
         case JIR_EXPR_BINARY: {
             LLVMValueRef left = emit_expr(cg, expr->as.binary.left);
             LLVMValueRef right = emit_expr(cg, expr->as.binary.right);
+            if ((expr->as.binary.op == JIR_BIN_EQ || expr->as.binary.op == JIR_BIN_NE) &&
+                expr->as.binary.left->type->kind == JIR_TYPE_OPTIONAL) {
+                LLVMValueRef left_flag = LLVMBuildExtractValue(cg->builder, left, 0, "opt.l.flag");
+                LLVMValueRef right_flag = LLVMBuildExtractValue(cg->builder, right, 0, "opt.r.flag");
+                return LLVMBuildICmp(cg->builder, expr->as.binary.op == JIR_BIN_EQ ? LLVMIntEQ : LLVMIntNE, left_flag, right_flag, expr->as.binary.op == JIR_BIN_EQ ? "eqtmp" : "netmp");
+            }
             switch (expr->as.binary.op) {
                 case JIR_BIN_ADD: return LLVMBuildAdd(cg->builder, left, right, "addtmp");
                 case JIR_BIN_SUB: return LLVMBuildSub(cg->builder, left, right, "subtmp");
@@ -531,6 +563,35 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case JIR_BIN_GT: return LLVMBuildICmp(cg->builder, LLVMIntSGT, left, right, "gttmp");
                 case JIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
             }
+        }
+        case JIR_EXPR_COALESCE: {
+            LLVMValueRef left = emit_expr(cg, expr->as.coalesce.left);
+            LLVMValueRef flag = LLVMBuildExtractValue(cg->builder, left, 0, "opt.flag");
+            LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "coalesce.some");
+            LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "coalesce.fallback");
+            LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "coalesce.end");
+            LLVMValueRef some_value = 0;
+            LLVMValueRef fallback_value = 0;
+            LLVMValueRef phi = 0;
+            LLVMValueRef incoming_values[2];
+            LLVMBasicBlockRef incoming_blocks[2];
+            LLVMBuildCondBr(cg->builder, flag, then_block, else_block);
+            LLVMPositionBuilderAtEnd(cg->builder, then_block);
+            some_value = LLVMBuildExtractValue(cg->builder, left, 1, "opt.some");
+            LLVMBuildBr(cg->builder, merge_block);
+            then_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, else_block);
+            fallback_value = emit_expr(cg, expr->as.coalesce.right);
+            LLVMBuildBr(cg->builder, merge_block);
+            else_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "coalescetmp");
+            incoming_values[0] = some_value;
+            incoming_values[1] = fallback_value;
+            incoming_blocks[0] = then_block;
+            incoming_blocks[1] = else_block;
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            return phi;
         }
         case JIR_EXPR_TERNARY: {
             LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.then");
@@ -610,6 +671,8 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                     LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.extract.field_index, "union.field");
                     return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
                 }
+                case JIR_EXTRACT_OPTIONAL_VALUE:
+                    return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), 1, "optional.value");
             }
             return 0;
         case JIR_EXPR_UNION_TAG:
@@ -621,6 +684,8 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             }
             return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), ptr, "field");
         }
+        case JIR_EXPR_OPTIONAL_VALUE:
+            return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.optional_value.value), 1, "optional.value");
             return 0;
         case JIR_EXPR_ARRAY: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));

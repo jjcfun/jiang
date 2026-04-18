@@ -116,6 +116,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 5 && strncmp(lexer->start, "false", 5) == 0) {
         return make_token(lexer, TOKEN_KW_FALSE, lexer->start, length);
     }
+    if (length == 4 && strncmp(lexer->start, "null", 4) == 0) {
+        return make_token(lexer, TOKEN_KW_NULL, lexer->start, length);
+    }
     return make_token(lexer, TOKEN_IDENT, lexer->start, length);
 }
 
@@ -176,6 +179,12 @@ Token lexer_next(Lexer* lexer) {
         case ':':
             return make_token(lexer, TOKEN_COLON, lexer->start, 1);
         case '?':
+            if (match_char(lexer, '.')) {
+                return make_token(lexer, TOKEN_QUESTION_DOT, lexer->start, 2);
+            }
+            if (match_char(lexer, '?')) {
+                return make_token(lexer, TOKEN_QUESTION_QUESTION, lexer->start, 2);
+            }
             return make_token(lexer, TOKEN_QUESTION, lexer->start, 1);
         case ';':
             return make_token(lexer, TOKEN_SEMICOLON, lexer->start, 1);

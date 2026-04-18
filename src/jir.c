@@ -86,12 +86,15 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
     switch (kind) {
         case HIR_EXPR_INT: return JIR_EXPR_INT;
         case HIR_EXPR_BOOL: return JIR_EXPR_BOOL;
+        case HIR_EXPR_NULL: return JIR_EXPR_NULL;
+        case HIR_EXPR_OPTIONAL_SOME: return JIR_EXPR_OPTIONAL_SOME;
         case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
         case HIR_EXPR_ADDR: return JIR_EXPR_ADDR;
         case HIR_EXPR_DEREF: return JIR_EXPR_DEREF;
         case HIR_EXPR_NEW: return JIR_EXPR_NEW;
         case HIR_EXPR_FREE: return JIR_EXPR_FREE;
         case HIR_EXPR_BINARY: return JIR_EXPR_BINARY;
+        case HIR_EXPR_COALESCE: return JIR_EXPR_COALESCE;
         case HIR_EXPR_TERNARY: return JIR_EXPR_TERNARY;
         case HIR_EXPR_CALL: return JIR_EXPR_CALL;
         case HIR_EXPR_ENUM_MEMBER: return JIR_EXPR_ENUM_MEMBER;
@@ -99,6 +102,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_ENUM_VALUE: return JIR_EXPR_ENUM_VALUE;
         case HIR_EXPR_UNION_TAG: return JIR_EXPR_UNION_TAG;
         case HIR_EXPR_UNION_FIELD: return JIR_EXPR_UNION_FIELD;
+        case HIR_EXPR_OPTIONAL_VALUE: return JIR_EXPR_OPTIONAL_VALUE;
         case HIR_EXPR_STRUCT: return JIR_EXPR_STRUCT;
         case HIR_EXPR_STRUCT_FIELD: return JIR_EXPR_STRUCT_FIELD;
         case HIR_EXPR_TUPLE: return JIR_EXPR_TUPLE;
@@ -315,12 +319,17 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         case JIR_EXPR_DEREF:
         case JIR_EXPR_NEW:
         case JIR_EXPR_FREE:
+        case JIR_EXPR_OPTIONAL_SOME:
             expr->as.unary.value = desugar_expr(expr->as.unary.value);
             return expr->as.unary.value ? expr : 0;
         case JIR_EXPR_BINARY:
             expr->as.binary.left = desugar_expr(expr->as.binary.left);
             expr->as.binary.right = desugar_expr(expr->as.binary.right);
             return expr->as.binary.left && expr->as.binary.right ? expr : 0;
+        case JIR_EXPR_COALESCE:
+            expr->as.coalesce.left = desugar_expr(expr->as.coalesce.left);
+            expr->as.coalesce.right = desugar_expr(expr->as.coalesce.right);
+            return expr->as.coalesce.left && expr->as.coalesce.right ? expr : 0;
         case JIR_EXPR_TERNARY:
             expr->as.ternary.cond = desugar_expr(expr->as.ternary.cond);
             expr->as.ternary.then_expr = desugar_expr(expr->as.ternary.then_expr);
@@ -404,6 +413,15 @@ static JirExpr* desugar_expr(JirExpr* expr) {
                 return expr->as.union_field.value->as.union_pack.payload_items.items[expr->as.union_field.field_index];
             }
             return make_extract_expr(JIR_EXTRACT_UNION_PAYLOAD, expr->as.union_field.value, expr->as.union_field.field_index, expr->type, expr->line);
+        case JIR_EXPR_OPTIONAL_VALUE:
+            expr->as.optional_value.value = desugar_expr(expr->as.optional_value.value);
+            if (!expr->as.optional_value.value) {
+                return 0;
+            }
+            if (expr->as.optional_value.value->kind == JIR_EXPR_OPTIONAL_SOME) {
+                return expr->as.optional_value.value->as.unary.value;
+            }
+            return make_extract_expr(JIR_EXTRACT_OPTIONAL_VALUE, expr->as.optional_value.value, 0, expr->type, expr->line);
         case JIR_EXPR_STRUCT:
             for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
                 expr->as.struct_lit.fields.items[i].value = desugar_expr(expr->as.struct_lit.fields.items[i].value);
@@ -569,6 +587,11 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_BOOL:
             out->as.bool_value = expr->as.bool_value;
             return out;
+        case HIR_EXPR_NULL:
+            return out;
+        case HIR_EXPR_OPTIONAL_SOME:
+            out->as.unary.value = lower_expr(program, expr->as.unary.value, error);
+            return out->as.unary.value ? out : 0;
         case HIR_EXPR_BINDING:
             out->as.binding = lower_binding(expr->as.binding, error);
             return out;
@@ -583,6 +606,10 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             out->as.binary.left = lower_expr(program, expr->as.binary.left, error);
             out->as.binary.right = lower_expr(program, expr->as.binary.right, error);
             return out->as.binary.left && out->as.binary.right ? out : 0;
+        case HIR_EXPR_COALESCE:
+            out->as.coalesce.left = lower_expr(program, expr->as.coalesce.left, error);
+            out->as.coalesce.right = lower_expr(program, expr->as.coalesce.right, error);
+            return out->as.coalesce.left && out->as.coalesce.right ? out : 0;
         case HIR_EXPR_TERNARY:
             out->as.ternary.cond = lower_expr(program, expr->as.ternary.cond, error);
             out->as.ternary.then_expr = lower_expr(program, expr->as.ternary.then_expr, error);
@@ -613,6 +640,9 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             out->as.union_field.value = lower_expr(program, expr->as.union_field.value, error);
             out->as.union_field.field_index = expr->as.union_field.field_index;
             return out->as.union_field.value ? out : 0;
+        case HIR_EXPR_OPTIONAL_VALUE:
+            out->as.optional_value.value = lower_expr(program, expr->as.optional_value.value, error);
+            return out->as.optional_value.value ? out : 0;
         case HIR_EXPR_STRUCT:
             for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
                 JirStructFieldInit init;

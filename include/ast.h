@@ -56,6 +56,7 @@ typedef enum AstTypeKind {
     AST_TYPE_SLICE,
     AST_TYPE_POINTER,
     AST_TYPE_ARRAY,
+    AST_TYPE_OPTIONAL,
 } AstTypeKind;
 
 struct AstType {
@@ -89,20 +90,24 @@ typedef enum AstExprKind {
     AST_EXPR_INT = 0,
     AST_EXPR_BOOL,
     AST_EXPR_STRING,
+    AST_EXPR_NULL,
     AST_EXPR_NAME,
     AST_EXPR_ADDR,
     AST_EXPR_DEREF,
     AST_EXPR_NEW,
     AST_EXPR_FREE,
     AST_EXPR_BINARY,
+    AST_EXPR_COALESCE,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
     AST_EXPR_FIELD,
+    AST_EXPR_OPTIONAL_FIELD,
     AST_EXPR_STRUCT,
     AST_EXPR_TUPLE,
     AST_EXPR_ARRAY,
     AST_EXPR_INDEX,
+    AST_EXPR_OPTIONAL_INDEX,
     AST_EXPR_SLICE_LENGTH,
 } AstExprKind;
 
@@ -170,6 +175,10 @@ struct AstExpr {
             AstExpr* left;
             AstExpr* right;
         } binary;
+        struct {
+            AstExpr* left;
+            AstExpr* right;
+        } coalesce;
         struct {
             AstExpr* cond;
             AstExpr* then_expr;

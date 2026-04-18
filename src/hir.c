@@ -40,11 +40,63 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
 static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type);
 static HirType* new_owned_type(HirProgram* program, HirTypeKind kind);
 static int is_lvalue_expr(const HirExpr* expr);
+static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line);
+static HirExpr* make_optional_value_expr(LowerContext* ctx, HirExpr* value, int line);
+static HirBinding* lookup_binding(LowerContext* ctx, const char* name);
+static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
+static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
 
 static int is_expected_type_shorthand_expr(const AstExpr* expr) {
     return expr &&
            expr->kind == AST_EXPR_VARIANT &&
            !expr->as.variant.union_name;
+}
+
+static int is_expected_type_null_expr(const AstExpr* expr) {
+    return expr && expr->kind == AST_EXPR_NULL;
+}
+
+static int is_pure_optional_base_expr(const AstExpr* expr) {
+    if (!expr) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case AST_EXPR_NAME:
+        case AST_EXPR_INT:
+        case AST_EXPR_BOOL:
+            return 1;
+        case AST_EXPR_FIELD:
+        case AST_EXPR_OPTIONAL_FIELD:
+            return is_pure_optional_base_expr(expr->as.field.base);
+        case AST_EXPR_INDEX:
+        case AST_EXPR_OPTIONAL_INDEX:
+            return is_pure_optional_base_expr(expr->as.index.base) &&
+                   is_pure_optional_base_expr(expr->as.index.index);
+        default:
+            return 0;
+    }
+}
+
+static int optional_null_compare_binding_name(const AstExpr* expr, int* non_null_then, const char** name_out) {
+    const AstExpr* name_expr = 0;
+    const AstExpr* null_expr = 0;
+    if (!expr || expr->kind != AST_EXPR_BINARY || (expr->as.binary.op != AST_BIN_EQ && expr->as.binary.op != AST_BIN_NE)) {
+        return 0;
+    }
+    if (expr->as.binary.left && expr->as.binary.left->kind == AST_EXPR_NULL) {
+        null_expr = expr->as.binary.left;
+        name_expr = expr->as.binary.right;
+    } else if (expr->as.binary.right && expr->as.binary.right->kind == AST_EXPR_NULL) {
+        null_expr = expr->as.binary.right;
+        name_expr = expr->as.binary.left;
+    }
+    (void)null_expr;
+    if (!name_expr || name_expr->kind != AST_EXPR_NAME) {
+        return 0;
+    }
+    *name_out = name_expr->as.name;
+    *non_null_then = expr->as.binary.op == AST_BIN_NE;
+    return 1;
 }
 
 static char* make_struct_init_name(const char* struct_name) {
@@ -141,6 +193,9 @@ static int type_equals(HirType* left, HirType* right) {
     if (left->kind == HIR_TYPE_POINTER) {
         return type_equals(left->array_item, right->array_item);
     }
+    if (left->kind == HIR_TYPE_OPTIONAL) {
+        return type_equals(left->array_item, right->array_item);
+    }
     if (left->kind == HIR_TYPE_ENUM) {
         return left->enum_decl == right->enum_decl;
     }
@@ -193,6 +248,12 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             array->array_item = lower_type(ctx, type->array_item);
             array->array_length = type->array_length;
             return array;
+        }
+        case AST_TYPE_OPTIONAL: {
+            HirType* optional = new_owned_type(ctx->program, HIR_TYPE_OPTIONAL);
+            optional->mutable_flag = type->mutable_flag;
+            optional->array_item = lower_type(ctx, type->array_item);
+            return optional;
         }
         case AST_TYPE_NAMED: {
             HirEnumDecl* enum_decl = find_enum(ctx->program, type->named_name);
@@ -295,6 +356,202 @@ static HirExpr* make_int_expr(LowerContext* ctx, int value, int line) {
     HirExpr* expr = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), line);
     expr->as.int_value = value;
     return expr;
+}
+
+static HirExpr* make_optional_value_expr(LowerContext* ctx, HirExpr* value, int line) {
+    HirExpr* expr = 0;
+    if (!value || value->type->kind != HIR_TYPE_OPTIONAL) {
+        return 0;
+    }
+    expr = new_expr(HIR_EXPR_OPTIONAL_VALUE, value->type->array_item, line);
+    expr->as.optional_value.value = value;
+    return expr;
+}
+
+static HirType* make_optional_type(LowerContext* ctx, HirType* inner) {
+    HirType* type = 0;
+    if (inner->kind == HIR_TYPE_OPTIONAL) {
+        return inner;
+    }
+    type = new_owned_type(ctx->program, HIR_TYPE_OPTIONAL);
+    type->array_item = inner;
+    return type;
+}
+
+static HirExpr* wrap_optional_result(LowerContext* ctx, HirExpr* value, int line) {
+    HirExpr* some = 0;
+    if (!value) {
+        return 0;
+    }
+    if (value->type->kind == HIR_TYPE_OPTIONAL) {
+        return value;
+    }
+    some = new_expr(HIR_EXPR_OPTIONAL_SOME, make_optional_type(ctx, value->type), line);
+    some->as.unary.value = value;
+    return some;
+}
+
+static HirExpr* make_null_expr(HirType* optional_type, int line) {
+    return new_expr(HIR_EXPR_NULL, optional_type, line);
+}
+
+static HirExpr* maybe_wrap_expected_optional_expr(LowerContext* ctx, HirExpr* value, HirType* expected_type, int line) {
+    if (!value) {
+        return 0;
+    }
+    if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, value->type)) {
+        HirExpr* some = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, line);
+        some->as.unary.value = value;
+        return some;
+    }
+    return value;
+}
+
+static HirExpr* lower_optional_chain_field(LowerContext* ctx, const AstExpr* expr) {
+    HirExpr* base = 0;
+    HirExpr* some_base = 0;
+    HirExpr* access = 0;
+    HirExpr* cond = 0;
+    HirExpr* out = 0;
+    HirType* result_type = 0;
+    if (!is_pure_optional_base_expr(expr->as.field.base)) {
+        fail(ctx, "optional chain requires pure base expression");
+        return 0;
+    }
+    base = lower_expr(ctx, expr->as.field.base);
+    if (!base) {
+        return 0;
+    }
+    if (base->type->kind != HIR_TYPE_OPTIONAL) {
+        fail(ctx, "optional chain requires optional base");
+        return 0;
+    }
+    some_base = make_optional_value_expr(ctx, base, expr->line);
+    if (!some_base) {
+        return 0;
+    }
+    if (base->type->array_item->kind == HIR_TYPE_STRUCT) {
+        int field_index = -1;
+        HirStructField* field = find_struct_field(base->type->array_item->struct_decl, expr->as.field.name, &field_index);
+        if (!field) {
+            fail(ctx, "unknown field");
+            return 0;
+        }
+        access = new_expr(HIR_EXPR_STRUCT_FIELD, field->type, expr->line);
+        access->as.struct_field.base = some_base;
+        access->as.struct_field.field = field;
+        access->as.struct_field.field_index = field_index;
+    } else {
+        fail(ctx, "unknown field");
+        return 0;
+    }
+    access = wrap_optional_result(ctx, access, expr->line);
+    if (!access) {
+        return 0;
+    }
+    result_type = access->type;
+    cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), expr->line);
+    cond->as.binary.op = HIR_BIN_NE;
+    cond->as.binary.left = base;
+    cond->as.binary.right = make_null_expr(base->type, expr->line);
+    out = new_expr(HIR_EXPR_TERNARY, result_type, expr->line);
+    out->as.ternary.cond = cond;
+    out->as.ternary.then_expr = access;
+    out->as.ternary.else_expr = make_null_expr(result_type, expr->line);
+    return out;
+}
+
+static HirExpr* lower_optional_chain_index(LowerContext* ctx, const AstExpr* expr) {
+    HirExpr* base = 0;
+    HirExpr* index = 0;
+    HirExpr* some_base = 0;
+    HirExpr* access = 0;
+    HirExpr* cond = 0;
+    HirExpr* out = 0;
+    HirType* result_type = 0;
+    if (!is_pure_optional_base_expr(expr->as.index.base)) {
+        fail(ctx, "optional chain requires pure base expression");
+        return 0;
+    }
+    base = lower_expr(ctx, expr->as.index.base);
+    if (!base) {
+        return 0;
+    }
+    if (base->type->kind != HIR_TYPE_OPTIONAL) {
+        fail(ctx, "optional chain requires optional base");
+        return 0;
+    }
+    index = lower_expr(ctx, expr->as.index.index);
+    if (!index) {
+        return 0;
+    }
+    some_base = make_optional_value_expr(ctx, base, expr->line);
+    if (!some_base) {
+        return 0;
+    }
+    if (some_base->type->kind == HIR_TYPE_TUPLE) {
+        if (expr->as.index.index->kind != AST_EXPR_INT) {
+            fail(ctx, "tuple index must be an integer literal");
+            return 0;
+        }
+        if (expr->as.index.index->as.int_value < 0 || expr->as.index.index->as.int_value >= some_base->type->tuple_items.count) {
+            fail(ctx, "tuple index out of bounds");
+            return 0;
+        }
+        access = new_expr(HIR_EXPR_INDEX, some_base->type->tuple_items.items[expr->as.index.index->as.int_value], expr->line);
+    } else if (some_base->type->kind == HIR_TYPE_ARRAY || some_base->type->kind == HIR_TYPE_SLICE) {
+        if (index->type->kind != HIR_TYPE_INT) {
+            fail(ctx, "array index must be Int");
+            return 0;
+        }
+        access = new_expr(HIR_EXPR_INDEX, some_base->type->array_item, expr->line);
+    } else {
+        fail(ctx, "indexing currently requires a tuple or array base");
+        return 0;
+    }
+    access->as.index.base = some_base;
+    access->as.index.index = index;
+    access = wrap_optional_result(ctx, access, expr->line);
+    if (!access) {
+        return 0;
+    }
+    result_type = access->type;
+    cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), expr->line);
+    cond->as.binary.op = HIR_BIN_NE;
+    cond->as.binary.left = base;
+    cond->as.binary.right = make_null_expr(base->type, expr->line);
+    out = new_expr(HIR_EXPR_TERNARY, result_type, expr->line);
+    out->as.ternary.cond = cond;
+    out->as.ternary.then_expr = access;
+    out->as.ternary.else_expr = make_null_expr(result_type, expr->line);
+    return out;
+}
+
+static int bind_optional_narrow(LowerContext* ctx, const char* name, HirBlock* out_block, int line) {
+    HirBinding* original = lookup_binding(ctx, name);
+    HirBinding* narrowed = 0;
+    HirStmt* decl = 0;
+    HirExpr* original_expr = 0;
+    HirExpr* unwrapped = 0;
+    if (!original || original->type->kind != HIR_TYPE_OPTIONAL) {
+        return 1;
+    }
+    narrowed = new_binding(original->type->array_item, (char*)name, HIR_BINDING_LOCAL, line);
+    if (!bind_in_current_scope(ctx, narrowed)) {
+        return 0;
+    }
+    binding_list_push(&ctx->current_function->locals, narrowed);
+    original_expr = new_expr(HIR_EXPR_BINDING, original->type, line);
+    original_expr->as.binding = original;
+    unwrapped = make_optional_value_expr(ctx, original_expr, line);
+    if (!unwrapped) {
+        return 0;
+    }
+    decl = new_stmt(HIR_STMT_VAR_DECL, line);
+    decl->as.var_decl.binding = narrowed;
+    decl->as.var_decl.init = unwrapped;
+    stmt_list_push(&out_block->stmts, decl);
+    return 1;
 }
 
 static int apply_array_length_inference(HirType* declared, HirType* actual) {
@@ -600,6 +857,7 @@ static HirExpr* make_union_tag_expr(LowerContext* ctx, HirExpr* value, int line)
 static HirExpr* make_union_field_expr(LowerContext* ctx, HirExpr* value, HirUnionVariant* variant, int field_index, HirType* type, int line);
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out);
 static int lower_pattern_bind(LowerContext* ctx, const AstBindingPattern* pattern, HirExpr* init, HirBlock* out_block);
+static int bind_optional_narrow(LowerContext* ctx, const char* name, HirBlock* out_block, int line);
 
 static HirBuiltinKind builtin_kind(const char* name) {
     if (strcmp(name, "assert") == 0) return HIR_BUILTIN_ASSERT;
@@ -857,16 +1115,33 @@ static int validate_struct_init_block(LowerContext* ctx, HirStructDecl* struct_d
 static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type) {
     HirExpr* out = 0;
     int i = 0;
-    (void)expected_type;
     switch (expr->kind) {
         case AST_EXPR_INT:
+            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, primitive_type(ctx->program, HIR_TYPE_INT))) {
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out->as.unary.value->as.int_value = expr->as.int_value;
+                return out;
+            }
             out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
             out->as.int_value = expr->as.int_value;
             return out;
         case AST_EXPR_BOOL:
+            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, primitive_type(ctx->program, HIR_TYPE_BOOL))) {
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_BOOL, primitive_type(ctx->program, HIR_TYPE_BOOL), expr->line);
+                out->as.unary.value->as.bool_value = expr->as.bool_value;
+                return out;
+            }
             out = new_expr(HIR_EXPR_BOOL, primitive_type(ctx->program, HIR_TYPE_BOOL), expr->line);
             out->as.bool_value = expr->as.bool_value;
             return out;
+        case AST_EXPR_NULL:
+            if (!expected_type || expected_type->kind != HIR_TYPE_OPTIONAL) {
+                fail(ctx, "null requires optional type");
+                return 0;
+            }
+            return new_expr(HIR_EXPR_NULL, expected_type, expr->line);
         case AST_EXPR_STRING: {
             HirType* array_type = 0;
             int i = 0;
@@ -894,8 +1169,50 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 fail(ctx, "unknown identifier");
                 return 0;
             }
+            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, binding->type)) {
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
+                out->as.unary.value->as.binding = binding;
+                return out;
+            }
             out = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
             out->as.binding = binding;
+            return out;
+        }
+        case AST_EXPR_OPTIONAL_FIELD:
+            return lower_optional_chain_field(ctx, expr);
+        case AST_EXPR_OPTIONAL_INDEX:
+            return lower_optional_chain_index(ctx, expr);
+        case AST_EXPR_COALESCE: {
+            HirExpr* left = 0;
+            HirExpr* right = 0;
+            if (!is_pure_optional_base_expr(expr->as.coalesce.left)) {
+                fail(ctx, "optional coalesce requires pure left operand");
+                return 0;
+            }
+            left = lower_expr(ctx, expr->as.coalesce.left);
+            if (!left) {
+                return 0;
+            }
+            if (left->type->kind != HIR_TYPE_OPTIONAL) {
+                fail(ctx, "optional coalesce requires optional left operand");
+                return 0;
+            }
+            right = lower_expr_expected(ctx, expr->as.coalesce.right, left->type->array_item);
+            if (!right) {
+                return 0;
+            }
+            right = maybe_decay_array_to_slice(ctx, right, left->type->array_item, expr->line);
+            if (!right) {
+                return 0;
+            }
+            if (!type_equals(right->type, left->type->array_item)) {
+                fail(ctx, "optional coalesce fallback type mismatch");
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_COALESCE, left->type->array_item, expr->line);
+            out->as.coalesce.left = left;
+            out->as.coalesce.right = right;
             return out;
         }
         case AST_EXPR_ADDR: {
@@ -1148,7 +1465,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (!lower_call_args(ctx, &expr->as.call.args, &out->as.call.args, callee)) {
                 return 0;
             }
-            return out;
+            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_VARIANT: {
             HirEnumDecl* enum_decl = 0;
@@ -1200,7 +1517,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         fail(ctx, "variant payload type mismatch");
                         return 0;
                     }
-                    return out;
+                    return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                 }
             }
             if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0) {
@@ -1292,7 +1609,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.struct_field.base = base;
                 out->as.struct_field.field = field;
                 out->as.struct_field.field_index = field_index;
-                return out;
+                return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
             }
             fail(ctx, "unknown field");
             return 0;
@@ -1349,13 +1666,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             for (i = 0; i < struct_decl->fields.count; ++i) {
                 if (!seen[i]) {
-                    free(seen);
-                    fail(ctx, "missing struct field initializer");
-                    return 0;
+                    HirStructFieldInit field_init;
+                    if (struct_decl->fields.items[i].type->kind != HIR_TYPE_OPTIONAL) {
+                        free(seen);
+                        fail(ctx, "missing struct field initializer");
+                        return 0;
+                    }
+                    memset(&field_init, 0, sizeof(field_init));
+                    field_init.field = &struct_decl->fields.items[i];
+                    field_init.value = make_zero_expr(ctx, struct_decl->fields.items[i].type, expr->line);
+                    struct_field_init_list_push(&out->as.struct_lit.fields, field_init);
                 }
             }
             free(seen);
-            return out;
+            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_BINARY: {
             int comparison_op = expr->as.binary.op != AST_BIN_ADD &&
@@ -1365,8 +1689,9 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             HirExpr* left = 0;
             HirExpr* right = 0;
             if (comparison_op &&
-                is_expected_type_shorthand_expr(expr->as.binary.left) &&
-                !is_expected_type_shorthand_expr(expr->as.binary.right)) {
+                (is_expected_type_shorthand_expr(expr->as.binary.left) || is_expected_type_null_expr(expr->as.binary.left)) &&
+                !is_expected_type_shorthand_expr(expr->as.binary.right) &&
+                !is_expected_type_null_expr(expr->as.binary.right)) {
                 right = lower_expr(ctx, expr->as.binary.right);
                 if (!right) {
                     return 0;
@@ -1380,7 +1705,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 if (!left) {
                     return 0;
                 }
-                if (comparison_op && is_expected_type_shorthand_expr(expr->as.binary.right)) {
+                if (comparison_op &&
+                    (is_expected_type_shorthand_expr(expr->as.binary.right) || is_expected_type_null_expr(expr->as.binary.right))) {
                     right = lower_expr_expected(ctx, expr->as.binary.right, left->type);
                 } else {
                     right = lower_expr(ctx, expr->as.binary.right);
@@ -1414,7 +1740,13 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     fail(ctx, "comparison requires matching operand types");
                     return 0;
                 }
-                if (left->type->kind != HIR_TYPE_INT && left->type->kind != HIR_TYPE_UINT8 && left->type->kind != HIR_TYPE_BOOL && left->type->kind != HIR_TYPE_ENUM) {
+                if (left->type->kind == HIR_TYPE_OPTIONAL) {
+                    if ((expr->as.binary.op != AST_BIN_EQ && expr->as.binary.op != AST_BIN_NE) ||
+                        (!is_expected_type_null_expr(expr->as.binary.left) && !is_expected_type_null_expr(expr->as.binary.right))) {
+                        fail(ctx, "comparison operand type unsupported");
+                        return 0;
+                    }
+                } else if (left->type->kind != HIR_TYPE_INT && left->type->kind != HIR_TYPE_UINT8 && left->type->kind != HIR_TYPE_BOOL && left->type->kind != HIR_TYPE_ENUM) {
                     fail(ctx, "comparison operand type unsupported");
                     return 0;
                 }
@@ -1432,7 +1764,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 expr_list_push(&out->as.tuple.items, item);
                 type_list_push(&tuple_type->tuple_items, item->type);
             }
-            return out;
+            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_ARRAY: {
             HirType* array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
@@ -1455,7 +1787,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 fail(ctx, "empty array literal is not supported");
                 return 0;
             }
-            return out;
+            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_INDEX: {
             HirExpr* base = lower_expr(ctx, expr->as.index.base);
@@ -1489,7 +1821,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             out->as.index.base = base;
             out->as.index.index = index;
-            return out;
+            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_SLICE_LENGTH: {
             HirExpr* base = lower_expr(ctx, expr->as.slice_length.base);
@@ -1528,6 +1860,8 @@ static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line) {
             expr = new_expr(HIR_EXPR_BOOL, type, line);
             expr->as.bool_value = 0;
             return expr;
+        case HIR_TYPE_OPTIONAL:
+            return new_expr(HIR_EXPR_NULL, type, line);
         case HIR_TYPE_STRUCT:
             expr = new_expr(HIR_EXPR_STRUCT, type, line);
             for (i = 0; i < type->struct_decl->fields.count; ++i) {
@@ -1702,6 +2036,8 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
         }
         case AST_STMT_IF: {
             Scope inner;
+            const char* optional_name = 0;
+            int non_null_then = 0;
             if (stmt->as.if_stmt.cond &&
                 stmt->as.if_stmt.cond->kind == AST_EXPR_BINARY &&
                 stmt->as.if_stmt.cond->as.binary.op == AST_BIN_EQ &&
@@ -1730,6 +2066,11 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                     return 0;
                 }
                 push_scope(ctx, &inner);
+                if (optional_null_compare_binding_name(stmt->as.if_stmt.cond, &non_null_then, &optional_name) && non_null_then) {
+                    if (!bind_optional_narrow(ctx, optional_name, &out->as.if_stmt.then_block, stmt->line)) {
+                        return 0;
+                    }
+                }
                 if (!lower_block(ctx, &stmt->as.if_stmt.then_block, &out->as.if_stmt.then_block)) {
                     return 0;
                 }
@@ -1739,6 +2080,11 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 Scope else_scope;
                 out->as.if_stmt.has_else = 1;
                 push_scope(ctx, &else_scope);
+                if (optional_null_compare_binding_name(stmt->as.if_stmt.cond, &non_null_then, &optional_name) && !non_null_then) {
+                    if (!bind_optional_narrow(ctx, optional_name, &out->as.if_stmt.else_block, stmt->line)) {
+                        return 0;
+                    }
+                }
                 if (!lower_block(ctx, &stmt->as.if_stmt.else_block, &out->as.if_stmt.else_block)) {
                     return 0;
                 }
@@ -1920,9 +2266,35 @@ static HirExpr* make_union_field_expr(LowerContext* ctx, HirExpr* value, HirUnio
 
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out) {
     HirUnionDecl* union_decl = 0;
-    HirUnionVariant* variant = resolve_variant_expr(ctx, pattern, &union_decl);
+    HirUnionVariant* variant = 0;
     HirExpr* cond = 0;
     int i = 0;
+    if (pattern->as.variant.union_name && strcmp(pattern->as.variant.union_name, "Option") == 0) {
+        HirExpr* some_value = 0;
+        if (value->type->kind != HIR_TYPE_OPTIONAL) {
+            return fail(ctx, "optional pattern type mismatch");
+        }
+        if (strcmp(pattern->as.variant.variant_name, "some") != 0) {
+            return fail(ctx, "unknown optional pattern");
+        }
+        cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), pattern->line);
+        cond->as.binary.op = HIR_BIN_NE;
+        cond->as.binary.left = value;
+        cond->as.binary.right = make_null_expr(value->type, pattern->line);
+        *cond_out = cond;
+        if (pattern->as.variant.bindings.count == 0) {
+            return 1;
+        }
+        if (pattern->as.variant.bindings.count != 1) {
+            return fail(ctx, "non-tuple variant pattern arity mismatch");
+        }
+        some_value = make_optional_value_expr(ctx, value, pattern->line);
+        if (!some_value) {
+            return 0;
+        }
+        return lower_pattern_bind(ctx, pattern->as.variant.bindings.items[0], some_value, out_block);
+    }
+    variant = resolve_variant_expr(ctx, pattern, &union_decl);
     if (!variant) {
         return 0;
     }
@@ -2061,6 +2433,35 @@ static int validate_switch_cases(LowerContext* ctx, HirExpr* value, const AstStm
         free(seen);
         return 1;
     }
+    if (value->type->kind == HIR_TYPE_OPTIONAL) {
+        int seen_some = 0;
+        for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
+            const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            if (ast_case->pattern->kind != AST_EXPR_VARIANT ||
+                !ast_case->pattern->as.variant.union_name ||
+                strcmp(ast_case->pattern->as.variant.union_name, "Option") != 0) {
+                return fail(ctx, "switch case type mismatch");
+            }
+            if (strcmp(ast_case->pattern->as.variant.variant_name, "some") != 0) {
+                return fail(ctx, "unknown optional pattern");
+            }
+            if (seen_some) {
+                return fail(ctx, "duplicate switch case");
+            }
+            seen_some = 1;
+        }
+        if (!have_else) {
+            return fail(ctx, "non-exhaustive optional switch");
+        }
+        return 1;
+    }
     for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
         const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
         if (ast_case->is_else) {
@@ -2109,7 +2510,8 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
             Scope then_scope;
             Scope else_scope;
             push_scope(ctx, &then_scope);
-            if (value->type->kind == HIR_TYPE_UNION && ast_case->pattern->kind == AST_EXPR_VARIANT) {
+            if ((value->type->kind == HIR_TYPE_UNION || value->type->kind == HIR_TYPE_OPTIONAL) &&
+                ast_case->pattern->kind == AST_EXPR_VARIANT) {
                 if (!lower_variant_pattern_bind(ctx, value, ast_case->pattern, &if_stmt->as.if_stmt.then_block, &if_stmt->as.if_stmt.cond)) {
                     return 0;
                 }
@@ -2579,7 +2981,8 @@ static int lower_functions(LowerContext* ctx) {
                 return fail(ctx, "out of memory");
             }
             for (j = 0; j < ctx->current_function->owner_struct->fields.count; ++j) {
-                if (ast_struct->fields.items[j].default_value) {
+                if (ast_struct->fields.items[j].default_value ||
+                    ctx->current_function->owner_struct->fields.items[j].type->kind == HIR_TYPE_OPTIONAL) {
                     field_state[j] = 1;
                 }
             }

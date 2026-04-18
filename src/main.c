@@ -219,6 +219,8 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const A
         case AST_EXPR_BOOL:
             out->as.bool_value = expr->as.bool_value;
             break;
+        case AST_EXPR_NULL:
+            break;
         case AST_EXPR_STRING:
             out->as.string_lit.text = dup_text(expr->as.string_lit.text);
             out->as.string_lit.length = expr->as.string_lit.length;
@@ -236,6 +238,10 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const A
             out->as.binary.op = expr->as.binary.op;
             out->as.binary.left = clone_expr(source, prefix, expr->as.binary.left);
             out->as.binary.right = clone_expr(source, prefix, expr->as.binary.right);
+            break;
+        case AST_EXPR_COALESCE:
+            out->as.coalesce.left = clone_expr(source, prefix, expr->as.coalesce.left);
+            out->as.coalesce.right = clone_expr(source, prefix, expr->as.coalesce.right);
             break;
         case AST_EXPR_TERNARY:
             out->as.ternary.cond = clone_expr(source, prefix, expr->as.ternary.cond);
@@ -260,6 +266,7 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const A
             }
             break;
         case AST_EXPR_FIELD:
+        case AST_EXPR_OPTIONAL_FIELD:
             out->as.field.base = clone_expr(source, prefix, expr->as.field.base);
             out->as.field.name = dup_text(expr->as.field.name);
             break;
@@ -285,6 +292,7 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const A
             }
             break;
         case AST_EXPR_INDEX:
+        case AST_EXPR_OPTIONAL_INDEX:
             out->as.index.base = clone_expr(source, prefix, expr->as.index.base);
             out->as.index.index = clone_expr(source, prefix, expr->as.index.index);
             break;

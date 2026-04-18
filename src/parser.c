@@ -231,7 +231,7 @@ static int pattern_has_explicit_type(Parser* parser) {
 }
 
 static AstType parse_type_postfix(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_STAR) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION) {
         if (parser->current.kind == TOKEN_BANG) {
             type.mutable_flag = 1;
             advance(parser);
@@ -243,6 +243,14 @@ static AstType parse_type_postfix(Parser* parser, AstType type) {
             memset(&type, 0, sizeof(type));
             type.kind = AST_TYPE_POINTER;
             type.array_item = heap_type_copy(&pointee);
+            continue;
+        }
+        if (parser->current.kind == TOKEN_QUESTION) {
+            AstType wrapped = type;
+            advance(parser);
+            memset(&type, 0, sizeof(type));
+            type.kind = AST_TYPE_OPTIONAL;
+            type.array_item = heap_type_copy(&wrapped);
             continue;
         }
         if (parser->current.kind == TOKEN_LEFT_BRACKET) {
@@ -565,7 +573,7 @@ static int looks_like_variant_pattern_expr(Parser* parser) {
         return 0;
     }
     if (probe.current.kind == TOKEN_IDENT) {
-        if (!is_known_type(parser, &parser->current)) {
+        if (!is_known_type(parser, &parser->current) && !token_equals(&parser->current, "Option")) {
             return 0;
         }
         advance(&probe);
@@ -833,6 +841,12 @@ static AstExpr* parse_primary(Parser* parser) {
         return expr;
     }
 
+    if (token.kind == TOKEN_KW_NULL) {
+        expr = new_expr(AST_EXPR_NULL, token.line);
+        advance(parser);
+        return expr;
+    }
+
     if (token.kind == TOKEN_IDENT) {
         if (parser->next.kind == TOKEN_DOT &&
             (is_known_type(parser, &token) || is_type_like_ident(&token)) &&
@@ -959,6 +973,21 @@ static AstExpr* parse_postfix(Parser* parser) {
             expr = index;
             continue;
         }
+        if (parser->current.kind == TOKEN_QUESTION && parser->next.kind == TOKEN_LEFT_BRACKET) {
+            AstExpr* index = new_expr(AST_EXPR_OPTIONAL_INDEX, expr->line);
+            advance(parser);
+            advance(parser);
+            index->as.index.base = expr;
+            index->as.index.index = parse_expr(parser);
+            if (!index->as.index.index) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after optional index expression")) {
+                return 0;
+            }
+            expr = index;
+            continue;
+        }
         if (parser->current.kind == TOKEN_DOT) {
             AstExpr* field = 0;
             if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "indexed")) {
@@ -980,6 +1009,19 @@ static AstExpr* parse_postfix(Parser* parser) {
                 expr = slice_length;
                 continue;
             }
+            expr = field;
+            continue;
+        }
+        if (parser->current.kind == TOKEN_QUESTION_DOT) {
+            AstExpr* field = 0;
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return 0;
+            }
+            field = new_expr(AST_EXPR_OPTIONAL_FIELD, expr->line);
+            field->as.field.base = expr;
+            field->as.field.name = token_dup(&parser->current);
+            advance(parser);
             expr = field;
             continue;
         }
@@ -1123,8 +1165,25 @@ static AstExpr* parse_equality(Parser* parser) {
     return expr;
 }
 
-static AstExpr* parse_expr(Parser* parser) {
+static AstExpr* parse_coalesce(Parser* parser) {
     AstExpr* expr = parse_equality(parser);
+    while (expr && parser->current.kind == TOKEN_QUESTION_QUESTION) {
+        AstExpr* right = 0;
+        AstExpr* out = new_expr(AST_EXPR_COALESCE, parser->current.line);
+        out->as.coalesce.left = expr;
+        advance(parser);
+        right = parse_equality(parser);
+        if (!right) {
+            return 0;
+        }
+        out->as.coalesce.right = right;
+        expr = out;
+    }
+    return expr;
+}
+
+static AstExpr* parse_expr(Parser* parser) {
+    AstExpr* expr = parse_coalesce(parser);
     if (!expr) {
         return 0;
     }

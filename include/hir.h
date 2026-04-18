@@ -35,6 +35,7 @@ typedef enum HirTypeKind {
     HIR_TYPE_TUPLE,
     HIR_TYPE_ARRAY,
     HIR_TYPE_UNION,
+    HIR_TYPE_OPTIONAL,
 } HirTypeKind;
 
 struct HirType {
@@ -70,12 +71,15 @@ typedef struct HirBindingList {
 typedef enum HirExprKind {
     HIR_EXPR_INT = 0,
     HIR_EXPR_BOOL,
+    HIR_EXPR_NULL,
+    HIR_EXPR_OPTIONAL_SOME,
     HIR_EXPR_BINDING,
     HIR_EXPR_ADDR,
     HIR_EXPR_DEREF,
     HIR_EXPR_NEW,
     HIR_EXPR_FREE,
     HIR_EXPR_BINARY,
+    HIR_EXPR_COALESCE,
     HIR_EXPR_TERNARY,
     HIR_EXPR_CALL,
     HIR_EXPR_ENUM_MEMBER,
@@ -83,6 +87,7 @@ typedef enum HirExprKind {
     HIR_EXPR_ENUM_VALUE,
     HIR_EXPR_UNION_TAG,
     HIR_EXPR_UNION_FIELD,
+    HIR_EXPR_OPTIONAL_VALUE,
     HIR_EXPR_STRUCT,
     HIR_EXPR_STRUCT_FIELD,
     HIR_EXPR_TUPLE,
@@ -146,6 +151,10 @@ struct HirExpr {
             HirExpr* right;
         } binary;
         struct {
+            HirExpr* left;
+            HirExpr* right;
+        } coalesce;
+        struct {
             HirExpr* cond;
             HirExpr* then_expr;
             HirExpr* else_expr;
@@ -173,6 +182,9 @@ struct HirExpr {
             HirUnionVariant* variant;
             int field_index;
         } union_field;
+        struct {
+            HirExpr* value;
+        } optional_value;
         struct {
             HirStructDecl* struct_decl;
             HirStructFieldInitList fields;

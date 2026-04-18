@@ -26,17 +26,21 @@ typedef enum JirTypeKind {
     JIR_TYPE_TUPLE,
     JIR_TYPE_ARRAY,
     JIR_TYPE_UNION,
+    JIR_TYPE_OPTIONAL,
 } JirTypeKind;
 
 typedef enum JirExprKind {
     JIR_EXPR_INT = 0,
     JIR_EXPR_BOOL,
+    JIR_EXPR_NULL,
+    JIR_EXPR_OPTIONAL_SOME,
     JIR_EXPR_BINDING,
     JIR_EXPR_ADDR,
     JIR_EXPR_DEREF,
     JIR_EXPR_NEW,
     JIR_EXPR_FREE,
     JIR_EXPR_BINARY,
+    JIR_EXPR_COALESCE,
     JIR_EXPR_TERNARY,
     JIR_EXPR_CALL,
     JIR_EXPR_STRUCT_INIT,
@@ -47,6 +51,7 @@ typedef enum JirExprKind {
     JIR_EXPR_ENUM_VALUE,
     JIR_EXPR_UNION_TAG,
     JIR_EXPR_UNION_FIELD,
+    JIR_EXPR_OPTIONAL_VALUE,
     JIR_EXPR_STRUCT,
     JIR_EXPR_STRUCT_FIELD,
     JIR_EXPR_TUPLE,
@@ -82,6 +87,7 @@ typedef enum JirExtractKind {
     JIR_EXTRACT_ARRAY_ITEM,
     JIR_EXTRACT_UNION_TAG,
     JIR_EXTRACT_UNION_PAYLOAD,
+    JIR_EXTRACT_OPTIONAL_VALUE,
 } JirExtractKind;
 
 typedef struct JirTypeList {
@@ -159,6 +165,10 @@ struct JirExpr {
             JirExpr* right;
         } binary;
         struct {
+            JirExpr* left;
+            JirExpr* right;
+        } coalesce;
+        struct {
             JirExpr* cond;
             JirExpr* then_expr;
             JirExpr* else_expr;
@@ -198,6 +208,9 @@ struct JirExpr {
             JirExpr* value;
             int field_index;
         } union_field;
+        struct {
+            JirExpr* value;
+        } optional_value;
         struct {
             JirStructFieldInitList fields;
         } struct_lit;
