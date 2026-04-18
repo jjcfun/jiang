@@ -95,6 +95,21 @@ static LLVMTypeRef llvm_tuple_type(LLVMContextRef context, const JirType* type) 
     return out;
 }
 
+static LLVMTypeRef llvm_struct_type(LLVMContextRef context, const JirType* type) {
+    LLVMTypeRef* fields = 0;
+    LLVMTypeRef out = 0;
+    int i = 0;
+    if (type->struct_decl->fields.count > 0) {
+        fields = (LLVMTypeRef*)malloc((size_t)type->struct_decl->fields.count * sizeof(LLVMTypeRef));
+        for (i = 0; i < type->struct_decl->fields.count; ++i) {
+            fields[i] = llvm_type(context, type->struct_decl->fields.items[i].type);
+        }
+    }
+    out = LLVMStructTypeInContext(context, fields, (unsigned)type->struct_decl->fields.count, 0);
+    free(fields);
+    return out;
+}
+
 static LLVMTypeRef llvm_union_payload_type(LLVMContextRef context, const JirType* type) {
     unsigned payload_slots = 0;
     if (type->union_decl && type->union_decl->payload_slots > 0) {
@@ -122,6 +137,8 @@ static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
             return LLVMVoidTypeInContext(context);
         case HIR_TYPE_ENUM:
             return LLVMInt64TypeInContext(context);
+        case HIR_TYPE_STRUCT:
+            return llvm_struct_type(context, type);
         case HIR_TYPE_TUPLE:
             return llvm_tuple_type(context, type);
         case HIR_TYPE_ARRAY:
@@ -172,6 +189,24 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
         }
         value = LLVMConstStructInContext(context, items, (unsigned)expr->as.tuple.items.count, 0);
         free(items);
+        return value;
+    }
+    if (expr->kind == HIR_EXPR_STRUCT) {
+        unsigned field_count = (unsigned)expr->type->struct_decl->fields.count;
+        LLVMValueRef* field_values = 0;
+        if (field_count == 0) {
+            return LLVMConstStructInContext(context, 0, 0, 0);
+        }
+        field_values = (LLVMValueRef*)malloc((size_t)field_count * sizeof(LLVMValueRef));
+        for (i = 0; i < (int)field_count; ++i) {
+            field_values[i] = LLVMConstNull(llvm_type(context, expr->type->struct_decl->fields.items[i].type));
+        }
+        for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+            int field_index = (int)(expr->as.struct_lit.fields.items[i].field - expr->type->struct_decl->fields.items);
+            field_values[field_index] = llvm_const_expr(context, expr->as.struct_lit.fields.items[i].value);
+        }
+        value = LLVMConstStructInContext(context, field_values, field_count, 0);
+        free(field_values);
         return value;
     }
     if (expr->kind == HIR_EXPR_ARRAY) {
@@ -303,6 +338,7 @@ static LoopTarget* current_loop(FunctionCodegen* cg) {
 }
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr);
+static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr);
 
 static void create_binding_allocas(FunctionCodegen* cg) {
     int i = 0;
@@ -355,6 +391,52 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
     args[0] = gep_cstr(cg->builder, get_or_add_format_string(cg->module, cg->context, ".str.int", "%lld\n"));
     args[1] = arg;
     return LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(printf_fn), printf_fn, args, 2, "printtmp");
+}
+
+static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
+    switch (expr->kind) {
+        case HIR_EXPR_BINDING:
+            if (expr->as.binding->kind == HIR_BINDING_GLOBAL) {
+                return llvm_global_for(cg->module, expr->as.binding);
+            }
+            return find_alloca(cg, expr->as.binding);
+        case HIR_EXPR_INDEX:
+            if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY) {
+                LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.index.base);
+                LLVMValueRef indices[2];
+                if (!base_ptr) {
+                    return 0;
+                }
+                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                indices[1] = emit_expr(cg, expr->as.index.index);
+                return LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->as.index.base->type),
+                    base_ptr,
+                    indices,
+                    2,
+                    "array.ptr");
+            }
+            return 0;
+        case HIR_EXPR_STRUCT_FIELD: {
+            LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.struct_field.base);
+            LLVMValueRef indices[2];
+            if (!base_ptr) {
+                return 0;
+            }
+            indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+            indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), (unsigned long long)expr->as.struct_field.field_index, 0);
+            return LLVMBuildInBoundsGEP2(
+                cg->builder,
+                llvm_type(cg->context, expr->as.struct_field.base->type),
+                base_ptr,
+                indices,
+                2,
+                "struct.ptr");
+        }
+        default:
+            return 0;
+    }
 }
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
@@ -440,6 +522,14 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             return llvm_const_expr(cg->context, expr);
         case HIR_EXPR_ENUM_VALUE:
             return emit_expr(cg, expr->as.enum_value.value);
+        case HIR_EXPR_STRUCT: {
+            LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
+            for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+                int field_index = (int)(expr->as.struct_lit.fields.items[i].field - expr->type->struct_decl->fields.items);
+                value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.struct_lit.fields.items[i].value), (unsigned)field_index, "struct.ins");
+            }
+            return value;
+        }
         case HIR_EXPR_TUPLE: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.tuple.items.count; ++i) {
@@ -478,6 +568,13 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.union_field.field_index, "union.field");
             return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
         }
+        case HIR_EXPR_STRUCT_FIELD: {
+            LLVMValueRef ptr = emit_lvalue_ptr(cg, expr);
+            if (ptr) {
+                return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), ptr, "struct.field");
+            }
+            return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.struct_field.base), (unsigned)expr->as.struct_field.field_index, "struct.field");
+        }
         case HIR_EXPR_ARRAY: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.array.items.count; ++i) {
@@ -490,20 +587,15 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.index.base), (unsigned)expr->as.index.index->as.int_value, "tuple.idx");
             }
             if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY) {
-                if (expr->as.index.base->kind == HIR_EXPR_BINDING) {
-                    LLVMValueRef indices[2];
-                    LLVMValueRef base_ptr = 0;
-                    indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
-                    indices[1] = emit_expr(cg, expr->as.index.index);
-                    if (expr->as.index.base->as.binding->kind == HIR_BINDING_GLOBAL) {
-                        base_ptr = llvm_global_for(cg->module, expr->as.index.base->as.binding);
-                    } else {
-                        base_ptr = find_alloca(cg, expr->as.index.base->as.binding);
-                    }
+                if (expr->as.index.base->kind == HIR_EXPR_BINDING || expr->as.index.base->kind == HIR_EXPR_STRUCT_FIELD) {
+                    LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.index.base);
                     return LLVMBuildLoad2(
                         cg->builder,
                         llvm_type(cg->context, expr->type),
-                        LLVMBuildInBoundsGEP2(cg->builder, llvm_type(cg->context, expr->as.index.base->type), base_ptr, indices, 2, "array.ptr"),
+                        LLVMBuildInBoundsGEP2(cg->builder, llvm_type(cg->context, expr->as.index.base->type), base_ptr, (LLVMValueRef[]){
+                            LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0),
+                            emit_expr(cg, expr->as.index.index)
+                        }, 2, "array.ptr"),
                         "array.idx");
                 }
                 if (expr->as.index.index->kind == HIR_EXPR_INT) {
@@ -540,28 +632,12 @@ static void emit_stmt(FunctionCodegen* cg, const JirStmt* stmt) {
                 } else {
                     LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), find_alloca(cg, stmt->as.assign.binding));
                 }
-            } else if (stmt->as.assign.target->kind == HIR_EXPR_INDEX && stmt->as.assign.target->as.index.base->kind == HIR_EXPR_BINDING) {
-                LLVMValueRef indices[2];
-                LLVMValueRef base_ptr = 0;
-                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
-                indices[1] = emit_expr(cg, stmt->as.assign.target->as.index.index);
-                if (stmt->as.assign.target->as.index.base->as.binding->kind == HIR_BINDING_GLOBAL) {
-                    base_ptr = llvm_global_for(cg->module, stmt->as.assign.target->as.index.base->as.binding);
-                } else {
-                    base_ptr = find_alloca(cg, stmt->as.assign.target->as.index.base->as.binding);
-                }
-                LLVMBuildStore(
-                    cg->builder,
-                    emit_expr(cg, stmt->as.assign.value),
-                    LLVMBuildInBoundsGEP2(
-                        cg->builder,
-                        llvm_type(cg->context, stmt->as.assign.target->as.index.base->type),
-                        base_ptr,
-                        indices,
-                        2,
-                        "array.assign.ptr"));
             } else {
-                return;
+                LLVMValueRef ptr = emit_lvalue_ptr(cg, stmt->as.assign.target);
+                if (!ptr) {
+                    return;
+                }
+                LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), ptr);
             }
             return;
         case HIR_STMT_IF: {

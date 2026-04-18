@@ -14,6 +14,8 @@ typedef struct HirEnumDecl HirEnumDecl;
 typedef struct HirEnumMember HirEnumMember;
 typedef struct HirUnionDecl HirUnionDecl;
 typedef struct HirUnionVariant HirUnionVariant;
+typedef struct HirStructDecl HirStructDecl;
+typedef struct HirStructField HirStructField;
 
 typedef struct HirTypeList {
     HirType** items;
@@ -26,6 +28,7 @@ typedef enum HirTypeKind {
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
     HIR_TYPE_ENUM,
+    HIR_TYPE_STRUCT,
     HIR_TYPE_TUPLE,
     HIR_TYPE_ARRAY,
     HIR_TYPE_UNION,
@@ -37,6 +40,7 @@ struct HirType {
     HirType* array_item;
     int array_length;
     HirEnumDecl* enum_decl;
+    HirStructDecl* struct_decl;
     HirUnionDecl* union_decl;
 };
 
@@ -71,6 +75,8 @@ typedef enum HirExprKind {
     HIR_EXPR_ENUM_VALUE,
     HIR_EXPR_UNION_TAG,
     HIR_EXPR_UNION_FIELD,
+    HIR_EXPR_STRUCT,
+    HIR_EXPR_STRUCT_FIELD,
     HIR_EXPR_TUPLE,
     HIR_EXPR_ARRAY,
     HIR_EXPR_INDEX,
@@ -101,6 +107,17 @@ typedef struct HirExprList {
     int count;
     int capacity;
 } HirExprList;
+
+typedef struct HirStructFieldInit {
+    HirStructField* field;
+    HirExpr* value;
+} HirStructFieldInit;
+
+typedef struct HirStructFieldInitList {
+    HirStructFieldInit* items;
+    int count;
+    int capacity;
+} HirStructFieldInitList;
 
 struct HirExpr {
     HirExprKind kind;
@@ -143,6 +160,15 @@ struct HirExpr {
             HirUnionVariant* variant;
             int field_index;
         } union_field;
+        struct {
+            HirStructDecl* struct_decl;
+            HirStructFieldInitList fields;
+        } struct_lit;
+        struct {
+            HirExpr* base;
+            HirStructField* field;
+            int field_index;
+        } struct_field;
         struct {
             HirExprList items;
         } tuple;
@@ -222,6 +248,8 @@ struct HirFunction {
     HirBindingList params;
     HirBindingList locals;
     HirBlock body;
+    int struct_init_flag;
+    HirStructDecl* owner_struct;
     int line;
 };
 
@@ -252,6 +280,31 @@ typedef struct HirEnumList {
     int count;
     int capacity;
 } HirEnumList;
+
+struct HirStructField {
+    char* name;
+    HirType* type;
+    int mutable_flag;
+};
+
+typedef struct HirStructFieldList {
+    HirStructField* items;
+    int count;
+    int capacity;
+} HirStructFieldList;
+
+struct HirStructDecl {
+    char* name;
+    HirStructFieldList fields;
+    int has_init;
+    char* init_name;
+};
+
+typedef struct HirStructList {
+    HirStructDecl* items;
+    int count;
+    int capacity;
+} HirStructList;
 
 struct HirUnionVariant {
     char* name;
@@ -292,6 +345,7 @@ typedef struct HirGlobalList {
 } HirGlobalList;
 
 typedef struct HirProgram {
+    HirStructList structs;
     HirEnumList enums;
     HirUnionList unions;
     HirGlobalList globals;
@@ -303,6 +357,7 @@ typedef struct HirProgram {
     HashMap global_map;
     HashMap function_map;
     HashMap type_name_map;
+    HashMap struct_name_map;
     HashMap enum_name_map;
     HashMap enum_member_map;
     HashMap union_name_map;

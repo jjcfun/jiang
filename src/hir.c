@@ -27,11 +27,28 @@ typedef struct LowerContext {
 #define function_list_push(list, fn) VEC_PUSH((list), (fn))
 #define global_list_push(list, global) VEC_PUSH((list), (global))
 #define enum_member_list_push(list, member) VEC_PUSH((list), (member))
+#define struct_field_list_push(list, field) VEC_PUSH((list), (field))
+#define struct_field_init_list_push(list, field) VEC_PUSH((list), (field))
+#define struct_list_push(list, struct_decl) VEC_PUSH((list), (struct_decl))
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
 
 static int fail(LowerContext* ctx, const char* error);
+static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
+
+static char* make_struct_init_name(const char* struct_name) {
+    const char* prefix = "__struct_init_";
+    size_t prefix_len = strlen(prefix);
+    size_t name_len = strlen(struct_name);
+    char* out = (char*)malloc(prefix_len + name_len + 1);
+    if (!out) {
+        return 0;
+    }
+    memcpy(out, prefix, prefix_len);
+    memcpy(out + prefix_len, struct_name, name_len + 1);
+    return out;
+}
 
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
     switch (kind) {
@@ -44,6 +61,10 @@ static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
 
 static HirEnumDecl* find_enum(HirProgram* program, const char* name) {
     return (HirEnumDecl*)hashmap_get(&program->enum_name_map, name);
+}
+
+static HirStructDecl* find_struct(HirProgram* program, const char* name) {
+    return (HirStructDecl*)hashmap_get(&program->struct_name_map, name);
 }
 
 static HirEnumMember* find_enum_member(HirProgram* program, const char* name) {
@@ -79,6 +100,9 @@ static int type_equals(HirType* left, HirType* right) {
     if (left->kind == HIR_TYPE_ENUM) {
         return left->enum_decl == right->enum_decl;
     }
+    if (left->kind == HIR_TYPE_STRUCT) {
+        return left->struct_decl == right->struct_decl;
+    }
     if (left->kind == HIR_TYPE_UNION) {
         return left->union_decl == right->union_decl;
     }
@@ -113,11 +137,17 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
         }
         case AST_TYPE_NAMED: {
             HirEnumDecl* enum_decl = find_enum(ctx->program, type->named_name);
+            HirStructDecl* struct_decl = find_struct(ctx->program, type->named_name);
             HirUnionDecl* union_decl = find_union(ctx->program, type->named_name);
             if (enum_decl) {
                 HirType* enum_type = new_owned_type(ctx->program, HIR_TYPE_ENUM);
                 enum_type->enum_decl = enum_decl;
                 return enum_type;
+            }
+            if (struct_decl) {
+                HirType* struct_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+                struct_type->struct_decl = struct_decl;
+                return struct_type;
             }
             if (union_decl) {
                 HirType* union_type = new_owned_type(ctx->program, HIR_TYPE_UNION);
@@ -284,6 +314,15 @@ static void rebuild_enum_maps(HirProgram* program) {
     }
 }
 
+static void rebuild_struct_map(HirProgram* program) {
+    int i = 0;
+    hashmap_free(&program->struct_name_map);
+    hashmap_init(&program->struct_name_map);
+    for (i = 0; i < program->structs.count; ++i) {
+        hashmap_set(&program->struct_name_map, program->structs.items[i].name, &program->structs.items[i]);
+    }
+}
+
 static int payload_slot_count(HirType* type) {
     int i = 0;
     if (!type || type->kind == HIR_TYPE_VOID) {
@@ -318,6 +357,29 @@ static HirUnionVariant* find_union_variant(HirUnionDecl* union_decl, const char*
     for (i = 0; i < union_decl->variants.count; ++i) {
         if (strcmp(union_decl->variants.items[i].name, name) == 0) {
             return &union_decl->variants.items[i];
+        }
+    }
+    return 0;
+}
+
+static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index) {
+    int i = 0;
+    for (i = 0; i < struct_decl->fields.count; ++i) {
+        if (strcmp(struct_decl->fields.items[i].name, name) == 0) {
+            if (field_index) {
+                *field_index = i;
+            }
+            return &struct_decl->fields.items[i];
+        }
+    }
+    return 0;
+}
+
+static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name) {
+    int i = 0;
+    for (i = 0; i < ast->structs.count; ++i) {
+        if (strcmp(ast->structs.items[i].name, name) == 0) {
+            return &ast->structs.items[i];
         }
     }
     return 0;
@@ -457,6 +519,154 @@ static HirUnionVariant* resolve_variant_expr(LowerContext* ctx, const AstExpr* e
     return variant;
 }
 
+static int validate_struct_init_expr(LowerContext* ctx, HirStructDecl* struct_decl, const AstExpr* expr, int* field_state) {
+    int i = 0;
+    if (!expr) {
+        return 1;
+    }
+    switch (expr->kind) {
+        case AST_EXPR_NAME:
+            if (strcmp(expr->as.name, "self") == 0) {
+                return fail(ctx, "init self escape");
+            }
+            return 1;
+        case AST_EXPR_FIELD:
+            if (expr->as.field.base && expr->as.field.base->kind == AST_EXPR_NAME && strcmp(expr->as.field.base->as.name, "self") == 0) {
+                int field_index = -1;
+                if (!find_struct_field(struct_decl, expr->as.field.name, &field_index)) {
+                    return fail(ctx, "unknown field");
+                }
+                if (!field_state[field_index]) {
+                    return fail(ctx, "init read before field initialization");
+                }
+                return 1;
+            }
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.field.base, field_state);
+        case AST_EXPR_BINARY:
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.binary.left, field_state) &&
+                   validate_struct_init_expr(ctx, struct_decl, expr->as.binary.right, field_state);
+        case AST_EXPR_TERNARY:
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.ternary.cond, field_state) &&
+                   validate_struct_init_expr(ctx, struct_decl, expr->as.ternary.then_expr, field_state) &&
+                   validate_struct_init_expr(ctx, struct_decl, expr->as.ternary.else_expr, field_state);
+        case AST_EXPR_CALL:
+            for (i = 0; i < expr->as.call.args.count; ++i) {
+                if (!validate_struct_init_expr(ctx, struct_decl, expr->as.call.args.items[i], field_state)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_EXPR_VARIANT:
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.variant.payload, field_state);
+        case AST_EXPR_STRUCT:
+            for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+                if (!validate_struct_init_expr(ctx, struct_decl, expr->as.struct_lit.fields.items[i].value, field_state)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_EXPR_TUPLE:
+            for (i = 0; i < expr->as.tuple.items.count; ++i) {
+                if (!validate_struct_init_expr(ctx, struct_decl, expr->as.tuple.items.items[i], field_state)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_EXPR_ARRAY:
+            for (i = 0; i < expr->as.array.items.count; ++i) {
+                if (!validate_struct_init_expr(ctx, struct_decl, expr->as.array.items.items[i], field_state)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_EXPR_INDEX:
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.index.base, field_state) &&
+                   validate_struct_init_expr(ctx, struct_decl, expr->as.index.index, field_state);
+        default:
+            return 1;
+    }
+}
+
+static int validate_struct_init_block(LowerContext* ctx, HirStructDecl* struct_decl, const AstBlock* block, int* field_state);
+
+static int validate_struct_init_stmt(LowerContext* ctx, HirStructDecl* struct_decl, const AstStmt* stmt, int* field_state) {
+    int i = 0;
+    switch (stmt->kind) {
+        case AST_STMT_RETURN:
+            if (stmt->as.ret.expr) {
+                return fail(ctx, "struct init must not return a value");
+            }
+            return 1;
+        case AST_STMT_ASSIGN:
+            if (stmt->as.assign.target->kind == AST_EXPR_FIELD &&
+                stmt->as.assign.target->as.field.base &&
+                stmt->as.assign.target->as.field.base->kind == AST_EXPR_NAME &&
+                strcmp(stmt->as.assign.target->as.field.base->as.name, "self") == 0) {
+                HirStructField* field = 0;
+                int field_index = -1;
+                if (!validate_struct_init_expr(ctx, struct_decl, stmt->as.assign.value, field_state)) {
+                    return 0;
+                }
+                field = find_struct_field(struct_decl, stmt->as.assign.target->as.field.name, &field_index);
+                if (!field) {
+                    return fail(ctx, "unknown field");
+                }
+                if (field_state[field_index] && !field->mutable_flag) {
+                    return fail(ctx, "immutable struct field reassigned in init");
+                }
+                field_state[field_index] = 1;
+                return 1;
+            }
+            return validate_struct_init_expr(ctx, struct_decl, stmt->as.assign.target, field_state) &&
+                   validate_struct_init_expr(ctx, struct_decl, stmt->as.assign.value, field_state);
+        case AST_STMT_IF: {
+            int* then_state = (int*)malloc((size_t)struct_decl->fields.count * sizeof(int));
+            int* else_state = (int*)malloc((size_t)struct_decl->fields.count * sizeof(int));
+            if (!validate_struct_init_expr(ctx, struct_decl, stmt->as.if_stmt.cond, field_state)) {
+                free(then_state);
+                free(else_state);
+                return 0;
+            }
+            memcpy(then_state, field_state, (size_t)struct_decl->fields.count * sizeof(int));
+            memcpy(else_state, field_state, (size_t)struct_decl->fields.count * sizeof(int));
+            if (!validate_struct_init_block(ctx, struct_decl, &stmt->as.if_stmt.then_block, then_state)) {
+                free(then_state);
+                free(else_state);
+                return 0;
+            }
+            if (stmt->as.if_stmt.has_else) {
+                if (!validate_struct_init_block(ctx, struct_decl, &stmt->as.if_stmt.else_block, else_state)) {
+                    free(then_state);
+                    free(else_state);
+                    return 0;
+                }
+                for (i = 0; i < struct_decl->fields.count; ++i) {
+                    field_state[i] = then_state[i] && else_state[i];
+                }
+            }
+            free(then_state);
+            free(else_state);
+            return 1;
+        }
+        case AST_STMT_EXPR:
+            return validate_struct_init_expr(ctx, struct_decl, stmt->as.expr_stmt.expr, field_state);
+        case AST_STMT_VAR_DECL:
+            return validate_struct_init_expr(ctx, struct_decl, stmt->as.var_decl.init, field_state);
+        default:
+            return 1;
+    }
+}
+
+static int validate_struct_init_block(LowerContext* ctx, HirStructDecl* struct_decl, const AstBlock* block, int* field_state) {
+    int i = 0;
+    for (i = 0; i < block->stmts.count; ++i) {
+        if (!validate_struct_init_stmt(ctx, struct_decl, block->stmts.items[i], field_state)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
     HirExpr* out = 0;
     int i = 0;
@@ -523,6 +733,32 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                 return out;
             }
             HirFunction* callee = find_function(ctx->program, expr->as.call.callee);
+            if (!callee) {
+                const char* dot = strchr(expr->as.call.callee, '.');
+                if (dot) {
+                    size_t prefix_len = (size_t)(dot - expr->as.call.callee);
+                    if (strcmp(dot + 1, "init") == 0) {
+                        char* type_name = (char*)malloc(prefix_len + 1);
+                        HirStructDecl* struct_decl = 0;
+                        if (!type_name) {
+                            fail(ctx, "out of memory");
+                            return 0;
+                        }
+                        memcpy(type_name, expr->as.call.callee, prefix_len);
+                        type_name[prefix_len] = '\0';
+                        struct_decl = find_struct(ctx->program, type_name);
+                        free(type_name);
+                        if (struct_decl && struct_decl->has_init) {
+                            callee = find_function(ctx->program, struct_decl->init_name);
+                        }
+                    }
+                } else {
+                    HirStructDecl* struct_decl = find_struct(ctx->program, expr->as.call.callee);
+                    if (struct_decl && struct_decl->has_init) {
+                        callee = find_function(ctx->program, struct_decl->init_name);
+                    }
+                }
+            }
             if (!callee) {
                 fail(ctx, "unknown function");
                 return 0;
@@ -609,8 +845,81 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                     return out;
                 }
             }
+            if (base->type->kind == HIR_TYPE_STRUCT) {
+                int field_index = -1;
+                HirStructField* field = find_struct_field(base->type->struct_decl, expr->as.field.name, &field_index);
+                if (!field) {
+                    fail(ctx, "unknown field");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_STRUCT_FIELD, field->type, expr->line);
+                out->as.struct_field.base = base;
+                out->as.struct_field.field = field;
+                out->as.struct_field.field_index = field_index;
+                return out;
+            }
             fail(ctx, "unknown field");
             return 0;
+        }
+        case AST_EXPR_STRUCT: {
+            HirStructDecl* struct_decl = find_struct(ctx->program, expr->as.struct_lit.type_name);
+            HirType* struct_type = 0;
+            int i = 0;
+            int* seen = 0;
+            if (!struct_decl) {
+                fail(ctx, "unknown named type");
+                return 0;
+            }
+            struct_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+            struct_type->struct_decl = struct_decl;
+            out = new_expr(HIR_EXPR_STRUCT, struct_type, expr->line);
+            seen = (int*)calloc((size_t)struct_decl->fields.count, sizeof(int));
+            if (!seen) {
+                fail(ctx, "out of memory");
+                return 0;
+            }
+            for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+                AstStructFieldInit* ast_field = &expr->as.struct_lit.fields.items[i];
+                HirStructFieldInit field_init;
+                HirStructField* field = 0;
+                HirExpr* value = 0;
+                int field_index = -1;
+                memset(&field_init, 0, sizeof(field_init));
+                field = find_struct_field(struct_decl, ast_field->name, &field_index);
+                if (!field) {
+                    free(seen);
+                    fail(ctx, "unknown field");
+                    return 0;
+                }
+                if (seen[field_index]) {
+                    free(seen);
+                    fail(ctx, "duplicate struct field initializer");
+                    return 0;
+                }
+                value = lower_expr(ctx, ast_field->value);
+                if (!value) {
+                    free(seen);
+                    return 0;
+                }
+                if (!type_equals(value->type, field->type)) {
+                    free(seen);
+                    fail(ctx, "struct field initializer type mismatch");
+                    return 0;
+                }
+                seen[field_index] = 1;
+                field_init.field = field;
+                field_init.value = value;
+                struct_field_init_list_push(&out->as.struct_lit.fields, field_init);
+            }
+            for (i = 0; i < struct_decl->fields.count; ++i) {
+                if (!seen[i]) {
+                    free(seen);
+                    fail(ctx, "missing struct field initializer");
+                    return 0;
+                }
+            }
+            free(seen);
+            return out;
         }
         case AST_EXPR_BINARY: {
             HirExpr* left = lower_expr(ctx, expr->as.binary.left);
@@ -730,6 +1039,100 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
 }
 
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block);
+static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
+
+static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line) {
+    int i = 0;
+    HirExpr* expr = 0;
+    switch (type->kind) {
+        case HIR_TYPE_INT:
+            expr = new_expr(HIR_EXPR_INT, type, line);
+            expr->as.int_value = 0;
+            return expr;
+        case HIR_TYPE_BOOL:
+            expr = new_expr(HIR_EXPR_BOOL, type, line);
+            expr->as.bool_value = 0;
+            return expr;
+        case HIR_TYPE_STRUCT:
+            expr = new_expr(HIR_EXPR_STRUCT, type, line);
+            for (i = 0; i < type->struct_decl->fields.count; ++i) {
+                HirStructFieldInit field_init;
+                memset(&field_init, 0, sizeof(field_init));
+                field_init.field = &type->struct_decl->fields.items[i];
+                field_init.value = make_zero_expr(ctx, type->struct_decl->fields.items[i].type, line);
+                struct_field_init_list_push(&expr->as.struct_lit.fields, field_init);
+            }
+            return expr;
+        case HIR_TYPE_TUPLE:
+            expr = new_expr(HIR_EXPR_TUPLE, type, line);
+            for (i = 0; i < type->tuple_items.count; ++i) {
+                expr_list_push(&expr->as.tuple.items, make_zero_expr(ctx, type->tuple_items.items[i], line));
+            }
+            return expr;
+        case HIR_TYPE_ARRAY:
+            expr = new_expr(HIR_EXPR_ARRAY, type, line);
+            for (i = 0; i < type->array_length; ++i) {
+                expr_list_push(&expr->as.array.items, make_zero_expr(ctx, type->array_item, line));
+            }
+            return expr;
+        case HIR_TYPE_UNION:
+            return new_expr(HIR_EXPR_VARIANT, type, line);
+        case HIR_TYPE_VOID:
+            return 0;
+        default:
+            return new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), line);
+    }
+}
+
+static int lower_init_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, HirBinding* self_binding) {
+    int i = 0;
+    for (i = 0; i < ast_block->stmts.count; ++i) {
+        const AstStmt* ast_stmt = ast_block->stmts.items[i];
+        HirStmt* stmt = 0;
+        if (ast_stmt->kind == AST_STMT_RETURN) {
+            stmt = new_stmt(HIR_STMT_RETURN, ast_stmt->line);
+            if (ast_stmt->as.ret.expr) {
+                return fail(ctx, "struct init must not return a value");
+            }
+            stmt->as.ret.expr = make_binding_expr(self_binding, ast_stmt->line);
+            stmt_list_push(&out_block->stmts, stmt);
+            continue;
+        }
+        if (ast_stmt->kind == AST_STMT_IF) {
+            Scope then_scope;
+            stmt = new_stmt(HIR_STMT_IF, ast_stmt->line);
+            stmt->as.if_stmt.cond = lower_expr(ctx, ast_stmt->as.if_stmt.cond);
+            if (!stmt->as.if_stmt.cond) {
+                return 0;
+            }
+            if (stmt->as.if_stmt.cond->type->kind != HIR_TYPE_BOOL) {
+                return fail(ctx, "if condition must be Bool");
+            }
+            push_scope(ctx, &then_scope);
+            if (!lower_init_block(ctx, &ast_stmt->as.if_stmt.then_block, &stmt->as.if_stmt.then_block, self_binding)) {
+                return 0;
+            }
+            pop_scope(ctx);
+            if (ast_stmt->as.if_stmt.has_else) {
+                Scope else_scope;
+                stmt->as.if_stmt.has_else = 1;
+                push_scope(ctx, &else_scope);
+                if (!lower_init_block(ctx, &ast_stmt->as.if_stmt.else_block, &stmt->as.if_stmt.else_block, self_binding)) {
+                    return 0;
+                }
+                pop_scope(ctx);
+            }
+            stmt_list_push(&out_block->stmts, stmt);
+            continue;
+        }
+        stmt = lower_stmt(ctx, ast_stmt);
+        if (!stmt) {
+            return 0;
+        }
+        stmt_list_push(&out_block->stmts, stmt);
+    }
+    return 1;
+}
 
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
     HirStmt* out = new_stmt(stmt_kind_from_ast(stmt->kind), stmt->line);
@@ -784,7 +1187,12 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             }
             if (out->as.assign.target->kind == HIR_EXPR_BINDING) {
                 out->as.assign.binding = out->as.assign.target->as.binding;
-            } else if (out->as.assign.target->kind != HIR_EXPR_INDEX || out->as.assign.target->as.index.base->type->kind != HIR_TYPE_ARRAY) {
+            } else if (out->as.assign.target->kind == HIR_EXPR_INDEX) {
+                if (out->as.assign.target->as.index.base->type->kind != HIR_TYPE_ARRAY) {
+                    fail(ctx, "assignment target not found");
+                    return 0;
+                }
+            } else if (out->as.assign.target->kind != HIR_EXPR_STRUCT_FIELD) {
                 fail(ctx, "assignment target not found");
                 return 0;
             }
@@ -1439,6 +1847,44 @@ static int register_enums(LowerContext* ctx) {
     return 1;
 }
 
+static int register_structs(LowerContext* ctx) {
+    int i = 0;
+    for (i = 0; i < ctx->ast->structs.count; ++i) {
+        const AstStructDecl* ast_struct = &ctx->ast->structs.items[i];
+        HirStructDecl struct_decl;
+        memset(&struct_decl, 0, sizeof(struct_decl));
+        if (hashmap_contains(&ctx->program->type_name_map, ast_struct->name)) {
+            return fail(ctx, "duplicate type name");
+        }
+        struct_decl.name = ast_struct->name;
+        struct_decl.has_init = ast_struct->has_init;
+        if (ast_struct->has_init) {
+            struct_decl.init_name = make_struct_init_name(ast_struct->name);
+        }
+        struct_list_push(&ctx->program->structs, struct_decl);
+        hashmap_set(&ctx->program->type_name_map, ast_struct->name, (void*)1);
+    }
+    rebuild_struct_map(ctx->program);
+    for (i = 0; i < ctx->ast->structs.count; ++i) {
+        const AstStructDecl* ast_struct = &ctx->ast->structs.items[i];
+        HirStructDecl* struct_decl = &ctx->program->structs.items[i];
+        int j = 0;
+        for (j = 0; j < ast_struct->fields.count; ++j) {
+            HirStructField field;
+            int field_index = -1;
+            memset(&field, 0, sizeof(field));
+            if (find_struct_field(struct_decl, ast_struct->fields.items[j].name, &field_index)) {
+                return fail(ctx, "duplicate field declaration");
+            }
+            field.name = ast_struct->fields.items[j].name;
+            field.type = lower_type(ctx, &ast_struct->fields.items[j].type);
+            field.mutable_flag = ast_struct->fields.items[j].type.mutable_flag;
+            struct_field_list_push(&struct_decl->fields, field);
+        }
+    }
+    return 1;
+}
+
 static int register_unions(LowerContext* ctx) {
     int i = 0;
     for (i = 0; i < ctx->ast->unions.count; ++i) {
@@ -1487,6 +1933,39 @@ static int register_unions(LowerContext* ctx) {
     return 1;
 }
 
+static int register_struct_init_functions(LowerContext* ctx) {
+    int i = 0;
+    for (i = 0; i < ctx->program->structs.count; ++i) {
+        const AstStructDecl* ast_struct = &ctx->ast->structs.items[i];
+        HirStructDecl* struct_decl = &ctx->program->structs.items[i];
+        HirFunction hir_fn;
+        int param_index = 0;
+        HirType* return_type = 0;
+        if (!ast_struct->has_init) {
+            continue;
+        }
+        if (hashmap_contains(&ctx->program->function_map, struct_decl->init_name)) {
+            return fail(ctx, "duplicate function");
+        }
+        memset(&hir_fn, 0, sizeof(hir_fn));
+        return_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+        return_type->struct_decl = struct_decl;
+        hir_fn.return_type = return_type;
+        hir_fn.name = struct_decl->init_name;
+        hir_fn.line = ast_struct->init_line;
+        hir_fn.struct_init_flag = 1;
+        hir_fn.owner_struct = struct_decl;
+        for (param_index = 0; param_index < ast_struct->init_params.count; ++param_index) {
+            HirBinding* param_binding = new_binding(lower_type(ctx, &ast_struct->init_params.items[param_index].type), ast_struct->init_params.items[param_index].name, HIR_BINDING_PARAM, ast_struct->init_params.items[param_index].line);
+            binding_list_push(&hir_fn.params, param_binding);
+        }
+        function_list_push(&ctx->program->functions, hir_fn);
+        hashmap_set(&ctx->program->function_map, hir_fn.name, (void*)1);
+    }
+    rebuild_function_map(ctx->program);
+    return 1;
+}
+
 static int register_functions(LowerContext* ctx) {
     int i = 0;
     for (i = 0; i < ctx->ast->functions.count; ++i) {
@@ -1496,6 +1975,9 @@ static int register_functions(LowerContext* ctx) {
         memset(&hir_fn, 0, sizeof(hir_fn));
         if (hashmap_contains(&ctx->program->function_map, ast_fn->name)) {
             return fail(ctx, "duplicate function");
+        }
+        if (hashmap_contains(&ctx->program->type_name_map, ast_fn->name)) {
+            return fail(ctx, "type and function name conflict");
         }
         hir_fn.return_type = lower_type(ctx, &ast_fn->return_type);
         hir_fn.name = ast_fn->name;
@@ -1531,18 +2013,93 @@ static int lower_globals(LowerContext* ctx) {
 
 static int lower_functions(LowerContext* ctx) {
     int i = 0;
+    int user_index = 0;
     for (i = 0; i < ctx->program->functions.count; ++i) {
         Scope root_scope;
-        int param_index = 0;
         ctx->current_function = &ctx->program->functions.items[i];
         push_scope(ctx, &root_scope);
-        for (param_index = 0; param_index < ctx->current_function->params.count; ++param_index) {
-            if (!bind_in_current_scope(ctx, ctx->current_function->params.items[param_index])) {
+        if (ctx->current_function->struct_init_flag) {
+            const AstStructDecl* ast_struct = find_ast_struct(ctx->ast, ctx->current_function->owner_struct->name);
+            HirBinding* self_binding = 0;
+            HirStmt* self_decl = 0;
+            int* field_state = 0;
+            int j = 0;
+            for (j = 0; j < ctx->current_function->params.count; ++j) {
+                if (!bind_in_current_scope(ctx, ctx->current_function->params.items[j])) {
+                    return 0;
+                }
+            }
+            field_state = (int*)calloc((size_t)ctx->current_function->owner_struct->fields.count, sizeof(int));
+            if (!field_state) {
+                return fail(ctx, "out of memory");
+            }
+            for (j = 0; j < ctx->current_function->owner_struct->fields.count; ++j) {
+                if (ast_struct->fields.items[j].default_value) {
+                    field_state[j] = 1;
+                }
+            }
+            if (!validate_struct_init_block(ctx, ctx->current_function->owner_struct, &ast_struct->init_body, field_state)) {
+                free(field_state);
                 return 0;
             }
-        }
-        if (!lower_block(ctx, &ctx->ast->functions.items[i].body, &ctx->current_function->body)) {
-            return 0;
+            for (j = 0; j < ctx->current_function->owner_struct->fields.count; ++j) {
+                if (!field_state[j]) {
+                    free(field_state);
+                    return fail(ctx, "missing struct init field");
+                }
+            }
+            free(field_state);
+            self_binding = new_binding(ctx->current_function->return_type, "self", HIR_BINDING_LOCAL, ast_struct->init_line);
+            binding_list_push(&ctx->current_function->locals, self_binding);
+            if (!bind_in_current_scope(ctx, self_binding)) {
+                return 0;
+            }
+            self_decl = new_stmt(HIR_STMT_VAR_DECL, ast_struct->init_line);
+            self_decl->as.var_decl.binding = self_binding;
+            self_decl->as.var_decl.init = make_zero_expr(ctx, ctx->current_function->return_type, ast_struct->init_line);
+            stmt_list_push(&ctx->current_function->body.stmts, self_decl);
+            for (j = 0; j < ast_struct->fields.count; ++j) {
+                if (ast_struct->fields.items[j].default_value) {
+                    HirStmt* assign = new_stmt(HIR_STMT_ASSIGN, ast_struct->fields.items[j].line);
+                    AstExpr self_expr;
+                    AstExpr field_expr;
+                    memset(&self_expr, 0, sizeof(self_expr));
+                    memset(&field_expr, 0, sizeof(field_expr));
+                    self_expr.kind = AST_EXPR_NAME;
+                    self_expr.line = ast_struct->fields.items[j].line;
+                    self_expr.as.name = "self";
+                    field_expr.kind = AST_EXPR_FIELD;
+                    field_expr.line = ast_struct->fields.items[j].line;
+                    field_expr.as.field.base = &self_expr;
+                    field_expr.as.field.name = ast_struct->fields.items[j].name;
+                    assign->as.assign.target = lower_expr(ctx, &field_expr);
+                    assign->as.assign.value = lower_expr(ctx, ast_struct->fields.items[j].default_value);
+                    if (!assign->as.assign.target || !assign->as.assign.value) {
+                        return 0;
+                    }
+                    stmt_list_push(&ctx->current_function->body.stmts, assign);
+                }
+            }
+            if (!lower_init_block(ctx, &ast_struct->init_body, &ctx->current_function->body, self_binding)) {
+                return 0;
+            }
+            if (ctx->current_function->body.stmts.count == 0 ||
+                ctx->current_function->body.stmts.items[ctx->current_function->body.stmts.count - 1]->kind != HIR_STMT_RETURN) {
+                HirStmt* ret = new_stmt(HIR_STMT_RETURN, ast_struct->init_line);
+                ret->as.ret.expr = make_binding_expr(self_binding, ast_struct->init_line);
+                stmt_list_push(&ctx->current_function->body.stmts, ret);
+            }
+        } else {
+            int param_index = 0;
+            for (param_index = 0; param_index < ctx->current_function->params.count; ++param_index) {
+                if (!bind_in_current_scope(ctx, ctx->current_function->params.items[param_index])) {
+                    return 0;
+                }
+            }
+            if (!lower_block(ctx, &ctx->ast->functions.items[user_index].body, &ctx->current_function->body)) {
+                return 0;
+            }
+            user_index += 1;
         }
         pop_scope(ctx);
     }
@@ -1559,13 +2116,14 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     hashmap_init(&hir->global_map);
     hashmap_init(&hir->function_map);
     hashmap_init(&hir->type_name_map);
+    hashmap_init(&hir->struct_name_map);
     hashmap_init(&hir->enum_name_map);
     hashmap_init(&hir->enum_member_map);
     hashmap_init(&hir->union_name_map);
     hashmap_init(&hir->variant_map);
     ctx.program = hir;
     ctx.ast = ast;
-    if (!register_enums(&ctx) || !register_unions(&ctx) || !register_globals(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
+    if (!register_structs(&ctx) || !register_enums(&ctx) || !register_unions(&ctx) || !register_globals(&ctx) || !register_struct_init_functions(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
         *error = ctx.error;
         return 0;
     }

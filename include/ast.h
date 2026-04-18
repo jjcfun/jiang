@@ -9,6 +9,8 @@ typedef struct AstStmt AstStmt;
 typedef struct AstBindingPattern AstBindingPattern;
 typedef struct AstSwitchCase AstSwitchCase;
 typedef struct AstBlock AstBlock;
+typedef struct AstStructField AstStructField;
+typedef struct AstStructDecl AstStructDecl;
 
 typedef struct AstTypeList {
     AstType* items;
@@ -41,6 +43,18 @@ typedef struct AstExprList {
     int capacity;
 } AstExprList;
 
+typedef struct AstStructFieldInit {
+    char* name;
+    AstExpr* value;
+    int line;
+} AstStructFieldInit;
+
+typedef struct AstStructFieldInitList {
+    AstStructFieldInit* items;
+    int count;
+    int capacity;
+} AstStructFieldInitList;
+
 typedef enum AstExprKind {
     AST_EXPR_INT = 0,
     AST_EXPR_BOOL,
@@ -50,6 +64,7 @@ typedef enum AstExprKind {
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
     AST_EXPR_FIELD,
+    AST_EXPR_STRUCT,
     AST_EXPR_TUPLE,
     AST_EXPR_ARRAY,
     AST_EXPR_INDEX,
@@ -80,6 +95,19 @@ typedef struct AstEnumMemberList {
     int count;
     int capacity;
 } AstEnumMemberList;
+
+struct AstStructField {
+    AstType type;
+    char* name;
+    AstExpr* default_value;
+    int line;
+};
+
+typedef struct AstStructFieldList {
+    AstStructField* items;
+    int count;
+    int capacity;
+} AstStructFieldList;
 
 typedef struct AstBindingPatternList {
     AstBindingPattern** items;
@@ -119,6 +147,10 @@ struct AstExpr {
             AstExpr* base;
             char* name;
         } field;
+        struct {
+            char* type_name;
+            AstStructFieldInitList fields;
+        } struct_lit;
         struct {
             AstExprList items;
         } tuple;
@@ -252,6 +284,8 @@ typedef struct AstFunction {
     char* name;
     AstParamList params;
     AstBlock body;
+    int struct_init_flag;
+    char* owner_type_name;
     int line;
 } AstFunction;
 
@@ -260,6 +294,22 @@ struct AstEnumDecl {
     AstEnumMemberList members;
     int line;
 };
+
+struct AstStructDecl {
+    char* name;
+    AstStructFieldList fields;
+    AstParamList init_params;
+    AstBlock init_body;
+    int has_init;
+    int init_line;
+    int line;
+};
+
+typedef struct AstStructList {
+    AstStructDecl* items;
+    int count;
+    int capacity;
+} AstStructList;
 typedef struct AstEnumDecl AstEnumDecl;
 
 typedef struct AstEnumList {
@@ -314,6 +364,7 @@ typedef struct AstGlobalList {
 } AstGlobalList;
 
 typedef struct AstProgram {
+    AstStructList structs;
     AstEnumList enums;
     AstUnionList unions;
     AstGlobalList globals;

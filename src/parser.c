@@ -17,6 +17,21 @@ static char* token_dup(const Token* token) {
     return text;
 }
 
+static char* dup_join3(const char* left, const char* middle, const char* right) {
+    size_t left_len = strlen(left);
+    size_t middle_len = strlen(middle);
+    size_t right_len = strlen(right);
+    char* text = (char*)malloc(left_len + middle_len + right_len + 1);
+    if (!text) {
+        return 0;
+    }
+    memcpy(text, left, left_len);
+    memcpy(text + left_len, middle, middle_len);
+    memcpy(text + left_len + middle_len, right, right_len);
+    text[left_len + middle_len + right_len] = '\0';
+    return text;
+}
+
 static int token_equals(const Token* token, const char* text) {
     size_t n = strlen(text);
     return token->length == n && strncmp(token->start, text, n) == 0;
@@ -30,7 +45,10 @@ static int token_equals(const Token* token, const char* text) {
 #define function_list_push(list, fn) VEC_PUSH((list), (fn))
 #define global_list_push(list, global) VEC_PUSH((list), (global))
 #define enum_member_list_push(list, member) VEC_PUSH((list), (member))
+#define struct_field_list_push(list, field) VEC_PUSH((list), (field))
+#define struct_field_init_list_push(list, field) VEC_PUSH((list), (field))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
+#define struct_list_push(list, struct_decl) VEC_PUSH((list), (struct_decl))
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
@@ -159,6 +177,15 @@ static AstType apply_type_suffixes(Parser* parser, AstType type) {
     return type;
 }
 
+static AstType finalize_type(Parser* parser, AstType type) {
+    type = apply_type_suffixes(parser, type);
+    if (parser->current.kind == TOKEN_BANG) {
+        type.mutable_flag = 1;
+        advance(parser);
+    }
+    return type;
+}
+
 static AstType parse_type(Parser* parser) {
     AstType type;
     memset(&type, 0, sizeof(type));
@@ -198,33 +225,29 @@ static AstType parse_type(Parser* parser) {
         if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after tuple type")) {
             return type;
         }
-        return apply_type_suffixes(parser, type);
+        return finalize_type(parser, type);
     }
 
     if (parser->current.kind == TOKEN_KW_BOOL) {
         type.kind = AST_TYPE_BOOL;
         advance(parser);
-        return apply_type_suffixes(parser, type);
+        return finalize_type(parser, type);
     }
     if (parser->current.kind == TOKEN_KW_INT) {
         type.kind = AST_TYPE_INT;
         advance(parser);
-        return apply_type_suffixes(parser, type);
+        return finalize_type(parser, type);
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
         type.kind = AST_TYPE_INFER;
         advance(parser);
-        if (parser->current.kind == TOKEN_BANG) {
-            type.mutable_flag = 1;
-            advance(parser);
-        }
-        return apply_type_suffixes(parser, type);
+        return finalize_type(parser, type);
     }
     if (parser->current.kind == TOKEN_IDENT) {
         type.kind = AST_TYPE_NAMED;
         type.named_name = token_dup(&parser->current);
         advance(parser);
-        return apply_type_suffixes(parser, type);
+        return finalize_type(parser, type);
     }
     parser->error = "expected type";
     parser->error_line = parser->current.line;
@@ -345,6 +368,23 @@ static int looks_like_variant_ref(Parser* parser) {
     return 0;
 }
 
+static int looks_like_qualified_init_call(Parser* parser) {
+    Parser probe = *parser;
+    if (probe.current.kind != TOKEN_IDENT || !is_known_type(&probe, &probe.current)) {
+        return 0;
+    }
+    advance(&probe);
+    if (probe.current.kind != TOKEN_DOT) {
+        return 0;
+    }
+    advance(&probe);
+    if (probe.current.kind != TOKEN_IDENT || !token_equals(&probe.current, "init")) {
+        return 0;
+    }
+    advance(&probe);
+    return probe.current.kind == TOKEN_LEFT_PAREN;
+}
+
 static int looks_like_typed_array_constructor(Parser* parser) {
     Parser probe = *parser;
     AstType type;
@@ -356,7 +396,7 @@ static int looks_like_typed_array_constructor(Parser* parser) {
         return 0;
     }
     if (type.kind != AST_TYPE_ARRAY) {
-        return probe.current.kind == TOKEN_LEFT_BRACE || probe.current.kind == TOKEN_LEFT_PAREN;
+        return 0;
     }
     return probe.current.kind == TOKEN_LEFT_BRACE || probe.current.kind == TOKEN_LEFT_PAREN;
 }
@@ -524,6 +564,43 @@ static AstExpr* parse_primary(Parser* parser) {
         }
     }
 
+    if (token.kind == TOKEN_IDENT && is_known_type(parser, &token) && parser->next.kind == TOKEN_LEFT_BRACE) {
+        AstExpr* struct_lit = new_expr(AST_EXPR_STRUCT, token.line);
+        struct_lit->as.struct_lit.type_name = token_dup(&token);
+        advance(parser);
+        advance(parser);
+        if (parser->current.kind != TOKEN_RIGHT_BRACE) {
+            for (;;) {
+                AstStructFieldInit field_init;
+                memset(&field_init, 0, sizeof(field_init));
+                if (parser->current.kind != TOKEN_IDENT) {
+                    fail(parser, "expected struct field name");
+                    return 0;
+                }
+                field_init.name = token_dup(&parser->current);
+                field_init.line = parser->current.line;
+                advance(parser);
+                if (!expect(parser, TOKEN_COLON, "expected ':' after struct field name")) {
+                    return 0;
+                }
+                field_init.value = parse_expr(parser);
+                if (!field_init.value) {
+                    return 0;
+                }
+                struct_field_init_list_push(&struct_lit->as.struct_lit.fields, field_init);
+                if (parser->current.kind == TOKEN_COMMA) {
+                    advance(parser);
+                    continue;
+                }
+                break;
+            }
+        }
+        if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after struct literal")) {
+            return 0;
+        }
+        return struct_lit;
+    }
+
     if (token.kind == TOKEN_INT_LIT) {
         errno = 0;
         value = strtoll(token.start, &end, 10);
@@ -545,7 +622,7 @@ static AstExpr* parse_primary(Parser* parser) {
     }
 
     if (token.kind == TOKEN_IDENT) {
-        if (parser->next.kind == TOKEN_DOT && is_known_type(parser, &token)) {
+        if (parser->next.kind == TOKEN_DOT && is_known_type(parser, &token) && !looks_like_qualified_init_call(parser)) {
             return parse_variant_expr(parser, 0);
         }
         char* name = token_dup(&token);
@@ -621,9 +698,17 @@ static AstExpr* parse_primary(Parser* parser) {
 static AstExpr* parse_postfix(Parser* parser) {
     AstExpr* expr = parse_primary(parser);
     while (expr) {
-        if (expr->kind == AST_EXPR_NAME && parser->current.kind == TOKEN_LEFT_PAREN) {
+        if ((expr->kind == AST_EXPR_NAME ||
+             (expr->kind == AST_EXPR_FIELD &&
+              expr->as.field.base &&
+              expr->as.field.base->kind == AST_EXPR_NAME)) &&
+            parser->current.kind == TOKEN_LEFT_PAREN) {
             AstExpr* call = new_expr(AST_EXPR_CALL, expr->line);
-            call->as.call.callee = expr->as.name;
+            if (expr->kind == AST_EXPR_NAME) {
+                call->as.call.callee = expr->as.name;
+            } else {
+                call->as.call.callee = dup_join3(expr->as.field.base->as.name, ".", expr->as.field.name);
+            }
             advance(parser);
             if (parser->current.kind != TOKEN_RIGHT_PAREN) {
                 for (;;) {
@@ -1126,22 +1211,8 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
-    if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_ASSIGN) {
-        stmt = new_stmt(AST_STMT_ASSIGN, parser->current.line);
-        stmt->as.assign.target = new_expr(AST_EXPR_NAME, parser->current.line);
-        stmt->as.assign.target->as.name = token_dup(&parser->current);
-        advance(parser);
-        advance(parser);
-        stmt->as.assign.value = parse_expr(parser);
-        if (!stmt->as.assign.value) {
-            return 0;
-        }
-        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after assignment")) {
-            return 0;
-        }
-        return stmt;
-    }
-    if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_LEFT_BRACKET) {
+    if (parser->current.kind == TOKEN_IDENT &&
+        (parser->next.kind == TOKEN_ASSIGN || parser->next.kind == TOKEN_LEFT_BRACKET || parser->next.kind == TOKEN_DOT)) {
         AstExpr* target = parse_expr(parser);
         if (!target) {
             return 0;
@@ -1275,6 +1346,67 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     return 1;
 }
 
+static int parse_struct_decl(Parser* parser, AstProgram* out_program) {
+    AstStructDecl struct_decl;
+    memset(&struct_decl, 0, sizeof(struct_decl));
+    advance(parser);
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected struct name");
+    }
+    struct_decl.name = token_dup(&parser->current);
+    struct_decl.line = parser->current.line;
+    register_known_type(parser, struct_decl.name);
+    advance(parser);
+    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after struct name")) {
+        return 0;
+    }
+    while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "init") && parser->next.kind == TOKEN_LEFT_PAREN) {
+            if (struct_decl.has_init) {
+                return fail(parser, "duplicate struct init");
+            }
+            struct_decl.has_init = 1;
+            struct_decl.init_line = parser->current.line;
+            advance(parser);
+            if (!parse_params(parser, &struct_decl.init_params)) {
+                return 0;
+            }
+            if (!parse_block(parser, &struct_decl.init_body)) {
+                return 0;
+            }
+            continue;
+        }
+        AstStructField field;
+        memset(&field, 0, sizeof(field));
+        if (!is_type_start(parser)) {
+            return fail(parser, "expected struct field type");
+        }
+        field.type = parse_type(parser);
+        if (parser->current.kind != TOKEN_IDENT) {
+            return fail(parser, "expected struct field name");
+        }
+        field.name = token_dup(&parser->current);
+        field.line = parser->current.line;
+        advance(parser);
+        if (parser->current.kind == TOKEN_ASSIGN) {
+            advance(parser);
+            field.default_value = parse_expr(parser);
+            if (!field.default_value) {
+                return 0;
+            }
+        }
+        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after struct field")) {
+            return 0;
+        }
+        struct_field_list_push(&struct_decl.fields, field);
+    }
+    if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after struct declaration")) {
+        return 0;
+    }
+    struct_list_push(&out_program->structs, struct_decl);
+    return 1;
+}
+
 static int parse_union_decl(Parser* parser, AstProgram* out_program) {
     AstUnionDecl union_decl;
     memset(&union_decl, 0, sizeof(union_decl));
@@ -1342,6 +1474,12 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
 
         if (parser->current.kind == TOKEN_KW_ENUM) {
             if (!parse_enum_decl(parser, out_program)) {
+                return 0;
+            }
+            continue;
+        }
+        if (parser->current.kind == TOKEN_KW_STRUCT) {
+            if (!parse_struct_decl(parser, out_program)) {
                 return 0;
             }
             continue;
