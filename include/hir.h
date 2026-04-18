@@ -1,13 +1,40 @@
 #ifndef JIANG_HIR_H
 #define JIANG_HIR_H
 
+#include "hashmap.h"
+
 #include <stdint.h>
+
+typedef struct HirType HirType;
+typedef struct HirExpr HirExpr;
+typedef struct HirStmt HirStmt;
+typedef struct HirFunction HirFunction;
+typedef struct HirBinding HirBinding;
+typedef struct HirUnionDecl HirUnionDecl;
+typedef struct HirUnionVariant HirUnionVariant;
+
+typedef struct HirTypeList {
+    HirType** items;
+    int count;
+    int capacity;
+} HirTypeList;
 
 typedef enum HirTypeKind {
     HIR_TYPE_INT = 0,
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
+    HIR_TYPE_TUPLE,
+    HIR_TYPE_ARRAY,
+    HIR_TYPE_UNION,
 } HirTypeKind;
+
+struct HirType {
+    HirTypeKind kind;
+    HirTypeList tuple_items;
+    HirType* array_item;
+    int array_length;
+    HirUnionDecl* union_decl;
+};
 
 typedef enum HirBindingKind {
     HIR_BINDING_PARAM = 0,
@@ -15,13 +42,8 @@ typedef enum HirBindingKind {
     HIR_BINDING_GLOBAL,
 } HirBindingKind;
 
-typedef struct HirBinding HirBinding;
-typedef struct HirExpr HirExpr;
-typedef struct HirStmt HirStmt;
-typedef struct HirFunction HirFunction;
-
 struct HirBinding {
-    HirTypeKind type;
+    HirType* type;
     char* name;
     HirBindingKind kind;
     int line;
@@ -39,6 +61,12 @@ typedef enum HirExprKind {
     HIR_EXPR_BINDING,
     HIR_EXPR_BINARY,
     HIR_EXPR_CALL,
+    HIR_EXPR_VARIANT,
+    HIR_EXPR_UNION_TAG,
+    HIR_EXPR_UNION_FIELD,
+    HIR_EXPR_TUPLE,
+    HIR_EXPR_ARRAY,
+    HIR_EXPR_INDEX,
 } HirExprKind;
 
 typedef enum HirBinaryOp {
@@ -69,7 +97,7 @@ typedef struct HirExprList {
 
 struct HirExpr {
     HirExprKind kind;
-    HirTypeKind type;
+    HirType* type;
     int line;
     union {
         int64_t int_value;
@@ -85,6 +113,28 @@ struct HirExpr {
             HirBuiltinKind builtin;
             HirExprList args;
         } call;
+        struct {
+            HirUnionVariant* variant;
+            HirExpr* payload;
+        } variant;
+        struct {
+            HirExpr* value;
+        } union_tag;
+        struct {
+            HirExpr* value;
+            HirUnionVariant* variant;
+            int field_index;
+        } union_field;
+        struct {
+            HirExprList items;
+        } tuple;
+        struct {
+            HirExprList items;
+        } array;
+        struct {
+            HirExpr* base;
+            HirExpr* index;
+        } index;
     } as;
 };
 
@@ -148,7 +198,7 @@ struct HirStmt {
 };
 
 struct HirFunction {
-    HirTypeKind return_type;
+    HirType* return_type;
     char* name;
     HirBindingList params;
     HirBindingList locals;
@@ -161,6 +211,32 @@ typedef struct HirFunctionList {
     int count;
     int capacity;
 } HirFunctionList;
+
+struct HirUnionVariant {
+    char* name;
+    HirType* payload_type;
+    int tag_value;
+    int payload_slots;
+};
+
+typedef struct HirUnionVariantList {
+    HirUnionVariant* items;
+    int count;
+    int capacity;
+} HirUnionVariantList;
+
+struct HirUnionDecl {
+    char* name;
+    char* tag_name;
+    HirUnionVariantList variants;
+    int payload_slots;
+};
+
+typedef struct HirUnionList {
+    HirUnionDecl* items;
+    int count;
+    int capacity;
+} HirUnionList;
 
 typedef struct HirGlobal {
     HirBinding* binding;
@@ -175,8 +251,18 @@ typedef struct HirGlobalList {
 } HirGlobalList;
 
 typedef struct HirProgram {
+    HirUnionList unions;
     HirGlobalList globals;
     HirFunctionList functions;
+    HirType int_type;
+    HirType bool_type;
+    HirType void_type;
+    HirTypeList owned_types;
+    HashMap global_map;
+    HashMap function_map;
+    HashMap type_name_map;
+    HashMap union_name_map;
+    HashMap variant_map;
 } HirProgram;
 
 #endif

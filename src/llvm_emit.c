@@ -78,12 +78,54 @@ typedef struct FunctionCodegen {
     int loop_capacity;
 } FunctionCodegen;
 
-static LLVMTypeRef llvm_type(LLVMContextRef context, JirTypeKind type) {
-    switch (type) {
+static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type);
+
+static LLVMTypeRef llvm_tuple_type(LLVMContextRef context, const JirType* type) {
+    LLVMTypeRef* items = 0;
+    LLVMTypeRef out = 0;
+    int i = 0;
+    if (type->tuple_items.count > 0) {
+        items = (LLVMTypeRef*)malloc((size_t)type->tuple_items.count * sizeof(LLVMTypeRef));
+        for (i = 0; i < type->tuple_items.count; ++i) {
+            items[i] = llvm_type(context, type->tuple_items.items[i]);
+        }
+    }
+    out = LLVMStructTypeInContext(context, items, (unsigned)type->tuple_items.count, 0);
+    free(items);
+    return out;
+}
+
+static LLVMTypeRef llvm_union_payload_type(LLVMContextRef context, const JirType* type) {
+    unsigned payload_slots = 0;
+    if (type->union_decl && type->union_decl->payload_slots > 0) {
+        payload_slots = (unsigned)type->union_decl->payload_slots;
+    }
+    return LLVMArrayType(LLVMInt64TypeInContext(context), payload_slots);
+}
+
+static LLVMTypeRef llvm_union_type(LLVMContextRef context, const JirType* type) {
+    LLVMTypeRef fields[2];
+    fields[0] = LLVMInt64TypeInContext(context);
+    fields[1] = llvm_union_payload_type(context, type);
+    return LLVMStructTypeInContext(context, fields, 2, 0);
+}
+
+static LLVMTypeRef llvm_array_type(LLVMContextRef context, const JirType* type) {
+    return LLVMArrayType(llvm_type(context, type->array_item), (unsigned)type->array_length);
+}
+
+static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
+    switch (type->kind) {
         case HIR_TYPE_BOOL:
             return LLVMInt1TypeInContext(context);
         case HIR_TYPE_VOID:
             return LLVMVoidTypeInContext(context);
+        case HIR_TYPE_TUPLE:
+            return llvm_tuple_type(context, type);
+        case HIR_TYPE_ARRAY:
+            return llvm_array_type(context, type);
+        case HIR_TYPE_UNION:
+            return llvm_union_type(context, type);
         default:
             return LLVMInt64TypeInContext(context);
     }
@@ -106,11 +148,88 @@ static LLVMTypeRef llvm_function_type(LLVMContextRef context, const JirFunction*
     return fn_type;
 }
 
-static LLVMValueRef llvm_const(LLVMContextRef context, const JirExpr* expr) {
-    if (expr->type == HIR_TYPE_BOOL) {
-        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)(expr->kind == HIR_EXPR_BOOL ? expr->as.bool_value : 0), 0);
+static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr) {
+    LLVMValueRef* items = 0;
+    LLVMValueRef value = 0;
+    int i = 0;
+    if (expr->kind == HIR_EXPR_BOOL) {
+        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.bool_value, 0);
     }
-    return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.int_value, 1);
+    if (expr->kind == HIR_EXPR_INT) {
+        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.int_value, 1);
+    }
+    if (expr->kind == HIR_EXPR_TUPLE) {
+        if (expr->as.tuple.items.count > 0) {
+            items = (LLVMValueRef*)malloc((size_t)expr->as.tuple.items.count * sizeof(LLVMValueRef));
+            for (i = 0; i < expr->as.tuple.items.count; ++i) {
+                items[i] = llvm_const_expr(context, expr->as.tuple.items.items[i]);
+            }
+        }
+        value = LLVMConstStructInContext(context, items, (unsigned)expr->as.tuple.items.count, 0);
+        free(items);
+        return value;
+    }
+    if (expr->kind == HIR_EXPR_ARRAY) {
+        if (expr->as.array.items.count > 0) {
+            items = (LLVMValueRef*)malloc((size_t)expr->as.array.items.count * sizeof(LLVMValueRef));
+            for (i = 0; i < expr->as.array.items.count; ++i) {
+                items[i] = llvm_const_expr(context, expr->as.array.items.items[i]);
+            }
+        }
+        value = LLVMConstArray(llvm_type(context, expr->type->array_item), items, (unsigned)expr->as.array.items.count);
+        free(items);
+        return value;
+    }
+    if (expr->kind == HIR_EXPR_VARIANT) {
+        LLVMTypeRef payload_type = llvm_union_payload_type(context, expr->type);
+        LLVMValueRef* payload_items = 0;
+        LLVMValueRef payload_array = 0;
+        LLVMValueRef fields[2];
+        unsigned payload_len = (unsigned)expr->type->union_decl->payload_slots;
+        if (payload_len > 0) {
+            payload_items = (LLVMValueRef*)malloc((size_t)payload_len * sizeof(LLVMValueRef));
+            for (i = 0; i < (int)payload_len; ++i) {
+                payload_items[i] = LLVMConstInt(LLVMInt64TypeInContext(context), 0, 0);
+            }
+        }
+        if (expr->as.variant.payload) {
+            if (expr->as.variant.payload->type->kind == HIR_TYPE_TUPLE) {
+                for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
+                    LLVMValueRef item = llvm_const_expr(context, expr->as.variant.payload->as.tuple.items.items[i]);
+                    if (expr->as.variant.payload->as.tuple.items.items[i]->type->kind == HIR_TYPE_BOOL) {
+                        item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
+                    }
+                    payload_items[i] = item;
+                }
+            } else {
+                LLVMValueRef item = llvm_const_expr(context, expr->as.variant.payload);
+                if (expr->as.variant.payload->type->kind == HIR_TYPE_BOOL) {
+                    item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
+                }
+                payload_items[0] = item;
+            }
+        }
+        payload_array = payload_len == 0 ? LLVMConstNull(payload_type) : LLVMConstArray(LLVMInt64TypeInContext(context), payload_items, payload_len);
+        free(payload_items);
+        fields[0] = LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)expr->as.variant.variant->tag_value, 0);
+        fields[1] = payload_array;
+        return LLVMConstStructInContext(context, fields, 2, 0);
+    }
+    return LLVMConstNull(llvm_type(context, expr->type));
+}
+
+static LLVMValueRef extend_union_payload_value(LLVMBuilderRef builder, LLVMContextRef context, LLVMValueRef value, const JirType* type) {
+    if (type->kind == HIR_TYPE_BOOL) {
+        return LLVMBuildZExt(builder, value, LLVMInt64TypeInContext(context), "union.zext");
+    }
+    return value;
+}
+
+static LLVMValueRef narrow_union_payload_value(LLVMBuilderRef builder, LLVMContextRef context, LLVMValueRef value, const JirType* type) {
+    if (type->kind == HIR_TYPE_BOOL) {
+        return LLVMBuildTrunc(builder, value, LLVMInt1TypeInContext(context), "union.trunc");
+    }
+    return value;
 }
 
 static int function_index(const JirProgram* program, const JirFunction* function) {
@@ -201,7 +320,7 @@ static LLVMValueRef emit_builtin_panic(FunctionCodegen* cg) {
     LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(trap_fn), trap_fn, 0, 0, "");
     LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(abort_fn), abort_fn, 0, 0, "");
     LLVMBuildUnreachable(cg->builder);
-    return LLVMConstInt(llvm_type(cg->context, HIR_TYPE_INT), 0, 0);
+    return LLVMConstInt(LLVMInt64TypeInContext(cg->context), 0, 0);
 }
 
 static LLVMValueRef emit_builtin_assert(FunctionCodegen* cg, const JirExpr* expr) {
@@ -215,14 +334,14 @@ static LLVMValueRef emit_builtin_assert(FunctionCodegen* cg, const JirExpr* expr
     LLVMPositionBuilderAtEnd(cg->builder, ok_block);
     LLVMBuildBr(cg->builder, cont_block);
     LLVMPositionBuilderAtEnd(cg->builder, cont_block);
-    return LLVMConstInt(llvm_type(cg->context, HIR_TYPE_INT), 0, 0);
+    return LLVMConstInt(LLVMInt64TypeInContext(cg->context), 0, 0);
 }
 
 static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr) {
     LLVMValueRef printf_fn = get_or_add_printf(cg->module, cg->context);
     LLVMValueRef arg = emit_expr(cg, expr->as.call.args.items[0]);
     LLVMValueRef args[2];
-    if (expr->as.call.args.items[0]->type == HIR_TYPE_BOOL) {
+    if (expr->as.call.args.items[0]->type->kind == HIR_TYPE_BOOL) {
         LLVMValueRef true_str = gep_cstr(cg->builder, get_or_add_format_string(cg->module, cg->context, ".str.true", "true\n"));
         LLVMValueRef false_str = gep_cstr(cg->builder, get_or_add_format_string(cg->module, cg->context, ".str.false", "false\n"));
         args[0] = LLVMBuildSelect(cg->builder, arg, true_str, false_str, "print.bool");
@@ -234,10 +353,11 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
 }
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
+    int i = 0;
     switch (expr->kind) {
         case HIR_EXPR_INT:
         case HIR_EXPR_BOOL:
-            return llvm_const(cg->context, expr);
+            return llvm_const_expr(cg->context, expr);
         case HIR_EXPR_BINDING:
             if (expr->as.binding->kind == HIR_BINDING_GLOBAL) {
                 LLVMValueRef global = llvm_global_for(cg->module, expr->as.binding);
@@ -258,16 +378,13 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMTypeRef callee_type = llvm_function_type(cg->context, expr->as.call.callee);
             LLVMValueRef* args = 0;
             LLVMValueRef result = 0;
-            int i = 0;
-
             if (expr->as.call.args.count > 0) {
                 args = (LLVMValueRef*)malloc((size_t)expr->as.call.args.count * sizeof(LLVMValueRef));
                 for (i = 0; i < expr->as.call.args.count; ++i) {
                     args[i] = emit_expr(cg, expr->as.call.args.items[i]);
                 }
             }
-
-            result = LLVMBuildCall2(cg->builder, callee_type, callee, args, (unsigned)expr->as.call.args.count, expr->type == HIR_TYPE_VOID ? "" : "calltmp");
+            result = LLVMBuildCall2(cg->builder, callee_type, callee, args, (unsigned)expr->as.call.args.count, expr->type->kind == HIR_TYPE_VOID ? "" : "calltmp");
             free(args);
             return result;
         }
@@ -287,6 +404,72 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case HIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
             }
         }
+        case HIR_EXPR_TUPLE: {
+            LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
+            for (i = 0; i < expr->as.tuple.items.count; ++i) {
+                value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.tuple.items.items[i]), (unsigned)i, "tuple.ins");
+            }
+            return value;
+        }
+        case HIR_EXPR_VARIANT: {
+            LLVMValueRef union_value = LLVMGetUndef(llvm_type(cg->context, expr->type));
+            LLVMValueRef payload_array = LLVMConstNull(llvm_union_payload_type(cg->context, expr->type));
+            union_value = LLVMBuildInsertValue(
+                cg->builder,
+                union_value,
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.variant.variant->tag_value, 0),
+                0,
+                "union.tag");
+            if (expr->as.variant.payload) {
+                if (expr->as.variant.payload->type->kind == HIR_TYPE_TUPLE) {
+                    for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
+                        LLVMValueRef item = emit_expr(cg, expr->as.variant.payload->as.tuple.items.items[i]);
+                        item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.variant.payload->as.tuple.items.items[i]->type);
+                        payload_array = LLVMBuildInsertValue(cg->builder, payload_array, item, (unsigned)i, "union.payload.ins");
+                    }
+                } else {
+                    LLVMValueRef item = emit_expr(cg, expr->as.variant.payload);
+                    item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.variant.payload->type);
+                    payload_array = LLVMBuildInsertValue(cg->builder, payload_array, item, 0, "union.payload.ins");
+                }
+            }
+            return LLVMBuildInsertValue(cg->builder, union_value, payload_array, 1, "union.value");
+        }
+        case HIR_EXPR_UNION_TAG:
+            return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.union_tag.value), 0, "union.tag");
+        case HIR_EXPR_UNION_FIELD: {
+            LLVMValueRef payload_array = LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.union_field.value), 1, "union.payload");
+            LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.union_field.field_index, "union.field");
+            return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
+        }
+        case HIR_EXPR_ARRAY: {
+            LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
+            for (i = 0; i < expr->as.array.items.count; ++i) {
+                value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.array.items.items[i]), (unsigned)i, "array.ins");
+            }
+            return value;
+        }
+        case HIR_EXPR_INDEX:
+            if (expr->as.index.base->type->kind == HIR_TYPE_TUPLE) {
+                return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.index.base), (unsigned)expr->as.index.index->as.int_value, "tuple.idx");
+            }
+            if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY && expr->as.index.base->kind == HIR_EXPR_BINDING) {
+                LLVMValueRef indices[2];
+                LLVMValueRef base_ptr = 0;
+                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                indices[1] = emit_expr(cg, expr->as.index.index);
+                if (expr->as.index.base->as.binding->kind == HIR_BINDING_GLOBAL) {
+                    base_ptr = llvm_global_for(cg->module, expr->as.index.base->as.binding);
+                } else {
+                    base_ptr = find_alloca(cg, expr->as.index.base->as.binding);
+                }
+                return LLVMBuildLoad2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->type),
+                    LLVMBuildInBoundsGEP2(cg->builder, llvm_type(cg->context, expr->as.index.base->type), base_ptr, indices, 2, "array.ptr"),
+                    "array.idx");
+            }
+            return 0;
     }
     return 0;
 }
@@ -300,7 +483,11 @@ static void emit_block(FunctionCodegen* cg, const JirBlock* block);
 static void emit_stmt(FunctionCodegen* cg, const JirStmt* stmt) {
     switch (stmt->kind) {
         case HIR_STMT_RETURN:
-            LLVMBuildRet(cg->builder, emit_expr(cg, stmt->as.ret.expr));
+            if (!stmt->as.ret.expr || stmt->as.ret.expr->type->kind == HIR_TYPE_VOID) {
+                LLVMBuildRetVoid(cg->builder);
+            } else {
+                LLVMBuildRet(cg->builder, emit_expr(cg, stmt->as.ret.expr));
+            }
             return;
         case HIR_STMT_VAR_DECL:
             LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.var_decl.init), find_alloca(cg, stmt->as.var_decl.binding));
@@ -363,7 +550,7 @@ static void emit_stmt(FunctionCodegen* cg, const JirStmt* stmt) {
             LLVMPositionBuilderAtEnd(cg->builder, cond_block);
             LLVMBuildCondBr(cg->builder,
                 LLVMBuildICmp(cg->builder, LLVMIntSLT,
-                    LLVMBuildLoad2(cg->builder, llvm_type(cg->context, HIR_TYPE_INT), slot, stmt->as.for_range.binding->name),
+                    LLVMBuildLoad2(cg->builder, llvm_type(cg->context, stmt->as.for_range.binding->type), slot, stmt->as.for_range.binding->name),
                     emit_expr(cg, stmt->as.for_range.end),
                     "forcmp"),
                 body_block,
@@ -378,8 +565,8 @@ static void emit_stmt(FunctionCodegen* cg, const JirStmt* stmt) {
             LLVMPositionBuilderAtEnd(cg->builder, step_block);
             LLVMBuildStore(cg->builder,
                 LLVMBuildAdd(cg->builder,
-                    LLVMBuildLoad2(cg->builder, llvm_type(cg->context, HIR_TYPE_INT), slot, stmt->as.for_range.binding->name),
-                    LLVMConstInt(llvm_type(cg->context, HIR_TYPE_INT), 1, 0),
+                    LLVMBuildLoad2(cg->builder, llvm_type(cg->context, stmt->as.for_range.binding->type), slot, stmt->as.for_range.binding->name),
+                    LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
                     "forinc"),
                 slot);
             LLVMBuildBr(cg->builder, cond_block);
@@ -417,7 +604,7 @@ static int emit_globals(const JirProgram* program, LLVMModuleRef module, LLVMCon
     for (i = 0; i < program->globals.count; ++i) {
         const JirGlobal* global = &program->globals.items[i];
         LLVMValueRef llvm_global = LLVMAddGlobal(module, llvm_type(context, global->binding->type), global->binding->name);
-        LLVMSetInitializer(llvm_global, llvm_const(context, global->init));
+        LLVMSetInitializer(llvm_global, llvm_const_expr(context, global->init));
         LLVMSetLinkage(llvm_global, LLVMExternalLinkage);
     }
     return 1;
@@ -451,10 +638,10 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     emit_block(&cg, &function->body);
 
     if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
-        if (function->return_type == HIR_TYPE_VOID) {
+        if (function->return_type->kind == HIR_TYPE_VOID) {
             LLVMBuildRetVoid(cg.builder);
         } else {
-            LLVMBuildRet(cg.builder, LLVMConstInt(llvm_type(context, function->return_type), 0, 0));
+            LLVMBuildRet(cg.builder, LLVMConstNull(llvm_type(context, function->return_type)));
         }
     }
 

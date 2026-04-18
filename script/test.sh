@@ -21,6 +21,7 @@ fi
 
 cmake -S "$PROJECT_ROOT" -B "$BUILD_DIR"
 cmake --build "$BUILD_DIR"
+"$BUILD_DIR/utils_test"
 
 run_sample() {
   local sample="$1"
@@ -51,6 +52,18 @@ run_sample_nonzero() {
   fi
 }
 
+run_compile_fail() {
+  local sample="$1"
+  set +e
+  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" >/dev/null 2>&1
+  local status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "error: $sample unexpectedly compiled" >&2
+    exit 1
+  fi
+}
+
 run_sample minimal.jiang 42
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
@@ -64,6 +77,37 @@ run_sample infer_local_minimal.jiang 42
 run_sample infer_mutable_local_minimal.jiang 42
 run_sample assert_minimal.jiang 42
 run_sample print_minimal.jiang 42
+run_sample tuple_value_minimal.jiang 42
+run_sample tuple_return_minimal.jiang 42
+run_sample tuple_infer_minimal.jiang 42
+run_sample tuple_destructure_minimal.jiang 42
+run_sample tuple_destructure_infer_minimal.jiang 42
+run_sample tuple_destructure_mutable_infer_minimal.jiang 42
+run_sample tuple_destructure_return_minimal.jiang 42
+run_sample tuple_destructure_global_minimal.jiang 42
+run_sample unary_tuple_local_decl_minimal.jiang 42
+run_sample unary_tuple_infer_local_decl_minimal.jiang 42
+run_sample unary_tuple_global_decl_minimal.jiang 42
+run_sample unary_tuple_return_minimal.jiang 42
+run_sample empty_tuple_return_minimal.jiang 0
+run_sample empty_tuple_bare_return_minimal.jiang 0
+run_sample for_tuple_binding_minimal.jiang 42
+run_sample for_tuple_binding_typed_minimal.jiang 42
+run_sample for_indexed_tuple_binding_minimal.jiang 42
+run_sample for_indexed_mutable_tuple_binding_minimal.jiang 42
+run_sample union_tuple_bind_minimal.jiang 42
+run_sample union_tuple_switch_mutable_binding_minimal.jiang 42
+run_sample union_tuple_if_shorthand_pattern_minimal.jiang 42
+run_sample union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
+run_compile_fail invalid_tuple_index_non_literal.jiang
+run_compile_fail invalid_tuple_index_out_of_range.jiang
+run_compile_fail invalid_tuple_destructure_arity.jiang
+run_compile_fail invalid_tuple_destructure_rhs.jiang
+run_compile_fail invalid_empty_tuple_return_non_void.jiang
+run_compile_fail invalid_for_tuple_binding_non_tuple.jiang
+run_compile_fail invalid_for_tuple_binding_arity.jiang
+run_compile_fail invalid_union_tuple_bind_non_tuple.jiang
+run_compile_fail invalid_union_tuple_bind_arity.jiang
 run_sample_nonzero panic_minimal.jiang
 
 echo "stage0 batch A smoke passed"

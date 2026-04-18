@@ -3,6 +3,6 @@
 
 #include "jir.h"
 
-int emit_llvm_module(const JirModule* module, char** out_ir, const char** error);
+int emit_llvm_module(const JirProgram* program, char** out_ir, const char** error);
 
 #endif

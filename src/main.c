@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
     Parser parser;
     AstProgram ast;
     HirProgram hir;
-    JirModule jir;
+    JirProgram jir;
     char* source = 0;
     char* ir = 0;
     const char* error = 0;
@@ -69,38 +69,31 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: failed to read %s\n", argv[2]);
         return 1;
     }
-    fprintf(stderr, "[debug] read_file ok\n");
 
     parser_init(&parser, source);
-    fprintf(stderr, "[debug] parser_init ok\n");
     if (!parser_parse_program(&parser, &ast)) {
-        fprintf(stderr, "error: %s at line %d\n", parser.error, parser.current.line);
+        fprintf(stderr, "error: %s at line %d\n", parser.error, parser.error_line);
         free(source);
         return 1;
     }
-    fprintf(stderr, "[debug] parse ok\n");
 
     if (!lower_ast_to_hir(&ast, &hir, &error)) {
         fprintf(stderr, "error: %s\n", error ? error : "failed to lower AST to HIR");
         free(source);
         return 1;
     }
-    fprintf(stderr, "[debug] ast->hir ok\n");
     if (!lower_hir_to_jir(&hir, &jir, &error)) {
         fprintf(stderr, "error: %s\n", error ? error : "failed to lower HIR to JIR");
         free(source);
         return 1;
     }
-    fprintf(stderr, "[debug] hir->jir ok\n");
     if (!emit_llvm_module(&jir, &ir, &error)) {
         fprintf(stderr, "error: %s\n", error ? error : "failed to emit LLVM IR");
         free(source);
         return 1;
     }
-    fprintf(stderr, "[debug] emit llvm ok\n");
 
     fputs(ir, stdout);
-    fprintf(stderr, "[debug] wrote ir\n");
     LLVMDisposeMessage(ir);
     free(source);
     return 0;
