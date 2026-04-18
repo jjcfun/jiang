@@ -68,6 +68,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 6 && strncmp(lexer->start, "public", 6) == 0) {
         return make_token(lexer, TOKEN_KW_PUBLIC, lexer->start, length);
     }
+    if (length == 5 && strncmp(lexer->start, "alias", 5) == 0) {
+        return make_token(lexer, TOKEN_KW_ALIAS, lexer->start, length);
+    }
     if (length == 6 && strncmp(lexer->start, "return", 6) == 0) {
         return make_token(lexer, TOKEN_KW_RETURN, lexer->start, length);
     }

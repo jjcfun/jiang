@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -65,6 +66,7 @@ static int token_equals(const Token* token, const char* text) {
 #define struct_field_init_list_push(list, field) VEC_PUSH((list), (field))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define import_list_push(list, import_decl) VEC_PUSH((list), (import_decl))
+#define alias_list_push(list, alias_decl) VEC_PUSH((list), (alias_decl))
 #define struct_list_push(list, struct_decl) VEC_PUSH((list), (struct_decl))
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
@@ -502,6 +504,9 @@ static int looks_like_qualified_call(Parser* parser) {
 
 static int looks_like_method_decl(Parser* parser) {
     Parser probe = *parser;
+    if (probe.current.kind == TOKEN_KW_PUBLIC) {
+        advance(&probe);
+    }
     if (probe.current.kind == TOKEN_KW_STATIC) {
         advance(&probe);
     }
@@ -560,6 +565,9 @@ static int looks_like_variant_pattern_expr(Parser* parser) {
         return 0;
     }
     if (probe.current.kind == TOKEN_IDENT) {
+        if (!is_known_type(parser, &parser->current)) {
+            return 0;
+        }
         advance(&probe);
         if (probe.current.kind != TOKEN_DOT) {
             return 0;
@@ -1621,6 +1629,34 @@ static int parse_import_decl(Parser* parser, AstProgram* out_program) {
     return 1;
 }
 
+static int parse_alias_decl(Parser* parser, AstProgram* out_program, int public_flag) {
+    AstAliasDecl alias_decl;
+    memset(&alias_decl, 0, sizeof(alias_decl));
+    alias_decl.public_flag = public_flag;
+    alias_decl.line = parser->current.line;
+    advance(parser);
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected alias name");
+    }
+    alias_decl.name = token_dup(&parser->current);
+    if (is_type_like_ident(&parser->current)) {
+        register_known_type(parser, alias_decl.name);
+    }
+    advance(parser);
+    if (!expect(parser, TOKEN_ASSIGN, "expected '=' in alias declaration")) {
+        return 0;
+    }
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected alias target");
+    }
+    alias_decl.target_name = parse_qualified_name(parser);
+    if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after alias declaration")) {
+        return 0;
+    }
+    alias_list_push(&out_program->aliases, alias_decl);
+    return 1;
+}
+
 static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     AstEnumDecl enum_decl;
     memset(&enum_decl, 0, sizeof(enum_decl));
@@ -1693,6 +1729,11 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program) {
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        if (parser->current.kind == TOKEN_KW_PUBLIC &&
+            parser->next.kind == TOKEN_IDENT &&
+            token_equals(&parser->next, "init")) {
+            advance(parser);
+        }
         if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "init") && parser->next.kind == TOKEN_LEFT_PAREN) {
             if (struct_decl.has_init) {
                 return fail(parser, "duplicate struct init");
@@ -1826,6 +1867,12 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
         if (parser->current.kind == TOKEN_KW_PUBLIC) {
             public_flag = 1;
             advance(parser);
+        }
+        if (parser->current.kind == TOKEN_KW_ALIAS) {
+            if (!parse_alias_decl(parser, out_program, public_flag)) {
+                return 0;
+            }
+            continue;
         }
 
         if (parser->current.kind == TOKEN_KW_ENUM) {

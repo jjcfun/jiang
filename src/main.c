@@ -127,6 +127,31 @@ static int program_has_public_value(const AstProgram* program, const char* name)
     return 0;
 }
 
+static int program_has_any_type(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->structs.count; ++i) {
+        if (strcmp(program->structs.items[i].name, name) == 0) return 1;
+    }
+    for (i = 0; i < program->enums.count; ++i) {
+        if (strcmp(program->enums.items[i].name, name) == 0) return 1;
+    }
+    for (i = 0; i < program->unions.count; ++i) {
+        if (strcmp(program->unions.items[i].name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int program_has_any_value(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->functions.count; ++i) {
+        if (strcmp(program->functions.items[i].name, name) == 0) return 1;
+    }
+    for (i = 0; i < program->globals.count; ++i) {
+        if (strcmp(program->globals.items[i].name, name) == 0) return 1;
+    }
+    return 0;
+}
+
 static char* remap_exported_name(const AstProgram* program, const char* prefix, const char* name) {
     if (!name) {
         return 0;
@@ -378,6 +403,12 @@ static AstFunction clone_function(const AstProgram* source, const char* prefix, 
     return out;
 }
 
+static AstFunction clone_function_as(const AstProgram* source, const AstFunction* fn, const char* new_name, int public_flag) {
+    AstFunction out = clone_function(source, 0, fn, public_flag);
+    out.name = dup_text(new_name);
+    return out;
+}
+
 static AstGlobal clone_global(const AstProgram* source, const char* prefix, const AstGlobal* global, int public_flag) {
     AstGlobal out;
     memset(&out, 0, sizeof(out));
@@ -386,6 +417,12 @@ static AstGlobal clone_global(const AstProgram* source, const char* prefix, cons
     out.init = clone_expr(source, prefix, global->init);
     out.public_flag = public_flag;
     out.line = global->line;
+    return out;
+}
+
+static AstGlobal clone_global_as(const AstProgram* source, const AstGlobal* global, const char* new_name, int public_flag) {
+    AstGlobal out = clone_global(source, 0, global, public_flag);
+    out.name = dup_text(new_name);
     return out;
 }
 
@@ -419,6 +456,12 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
     return out;
 }
 
+static AstStructDecl clone_struct_decl_as(const AstProgram* source, const AstStructDecl* decl, const char* new_name, int public_flag) {
+    AstStructDecl out = clone_struct_decl(source, 0, decl, public_flag);
+    out.name = dup_text(new_name);
+    return out;
+}
+
 static AstEnumDecl clone_enum_decl(const AstProgram* source, const char* prefix, const AstEnumDecl* decl, int public_flag) {
     AstEnumDecl out;
     int i = 0;
@@ -432,6 +475,12 @@ static AstEnumDecl clone_enum_decl(const AstProgram* source, const char* prefix,
         member.name = dup_text(decl->members.items[i].name);
         enum_member_list_push(&out.members, member);
     }
+    return out;
+}
+
+static AstEnumDecl clone_enum_decl_as(const AstProgram* source, const AstEnumDecl* decl, const char* new_name, int public_flag) {
+    AstEnumDecl out = clone_enum_decl(source, 0, decl, public_flag);
+    out.name = dup_text(new_name);
     return out;
 }
 
@@ -452,6 +501,116 @@ static AstUnionDecl clone_union_decl(const AstProgram* source, const char* prefi
         union_variant_list_push(&out.variants, variant);
     }
     return out;
+}
+
+static AstUnionDecl clone_union_decl_as(const AstProgram* source, const AstUnionDecl* decl, const char* new_name, int public_flag) {
+    AstUnionDecl out = clone_union_decl(source, 0, decl, public_flag);
+    out.name = dup_text(new_name);
+    return out;
+}
+
+static const AstFunction* find_ast_function(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->functions.count; ++i) {
+        if (strcmp(program->functions.items[i].name, name) == 0) return &program->functions.items[i];
+    }
+    return 0;
+}
+
+static const AstGlobal* find_ast_global(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->globals.count; ++i) {
+        if (strcmp(program->globals.items[i].name, name) == 0) return &program->globals.items[i];
+    }
+    return 0;
+}
+
+static const AstStructDecl* find_ast_struct(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->structs.count; ++i) {
+        if (strcmp(program->structs.items[i].name, name) == 0) return &program->structs.items[i];
+    }
+    return 0;
+}
+
+static const AstEnumDecl* find_ast_enum(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->enums.count; ++i) {
+        if (strcmp(program->enums.items[i].name, name) == 0) return &program->enums.items[i];
+    }
+    return 0;
+}
+
+static const AstUnionDecl* find_ast_union(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->unions.count; ++i) {
+        if (strcmp(program->unions.items[i].name, name) == 0) return &program->unions.items[i];
+    }
+    return 0;
+}
+
+static int validate_module_decls(const AstProgram* own_program, const char** error) {
+    int i = 0;
+    int j = 0;
+    for (i = 0; i < own_program->imports.count; ++i) {
+        const char* alias = own_program->imports.items[i].alias_name;
+        if (!alias) {
+            continue;
+        }
+        for (j = i + 1; j < own_program->imports.count; ++j) {
+            if (own_program->imports.items[j].alias_name &&
+                strcmp(alias, own_program->imports.items[j].alias_name) == 0) {
+                *error = "duplicate import alias";
+                return 0;
+            }
+        }
+        if (program_has_any_type(own_program, alias) || program_has_any_value(own_program, alias)) {
+            *error = "import alias conflicts with top-level declaration";
+            return 0;
+        }
+        for (j = 0; j < own_program->aliases.count; ++j) {
+            if (strcmp(alias, own_program->aliases.items[j].name) == 0) {
+                *error = "import alias conflicts with alias";
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int apply_aliases(AstProgram* dest, const AstProgram* own_program, const char** error) {
+    int i = 0;
+    for (i = 0; i < own_program->aliases.count; ++i) {
+        const AstAliasDecl* alias = &own_program->aliases.items[i];
+        const AstFunction* fn = find_ast_function(dest, alias->target_name);
+        const AstGlobal* global = find_ast_global(dest, alias->target_name);
+        const AstStructDecl* struct_decl = find_ast_struct(dest, alias->target_name);
+        const AstEnumDecl* enum_decl = find_ast_enum(dest, alias->target_name);
+        const AstUnionDecl* union_decl = find_ast_union(dest, alias->target_name);
+        if (fn) {
+            function_list_push(&dest->functions, clone_function_as(dest, fn, alias->name, alias->public_flag));
+            continue;
+        }
+        if (global) {
+            global_list_push(&dest->globals, clone_global_as(dest, global, alias->name, alias->public_flag));
+            continue;
+        }
+        if (struct_decl) {
+            struct_list_push(&dest->structs, clone_struct_decl_as(dest, struct_decl, alias->name, alias->public_flag));
+            continue;
+        }
+        if (enum_decl) {
+            enum_list_push(&dest->enums, clone_enum_decl_as(dest, enum_decl, alias->name, alias->public_flag));
+            continue;
+        }
+        if (union_decl) {
+            union_list_push(&dest->unions, clone_union_decl_as(dest, union_decl, alias->name, alias->public_flag));
+            continue;
+        }
+        *error = "unknown alias target";
+        return 0;
+    }
+    return 1;
 }
 
 static void merge_public_import(AstProgram* dest, const AstProgram* imported, const char* prefix) {
@@ -567,6 +726,10 @@ static int load_effective_program(const char* path, const char** stack, int dept
         free(source);
         return 0;
     }
+    if (!validate_module_decls(&own_program, error)) {
+        free(source);
+        return 0;
+    }
     stack[depth] = path;
     for (i = 0; i < own_program.imports.count; ++i) {
         AstProgram imported;
@@ -583,6 +746,10 @@ static int load_effective_program(const char* path, const char** stack, int dept
         }
         merge_public_import(out_program, &imported, own_program.imports.items[i].alias_name);
         free(import_path);
+    }
+    if (!apply_aliases(out_program, &own_program, error)) {
+        free(source);
+        return 0;
     }
     append_own_decls(out_program, &own_program);
     free(source);

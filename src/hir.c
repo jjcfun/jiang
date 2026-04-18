@@ -41,6 +41,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
 static HirType* new_owned_type(HirProgram* program, HirTypeKind kind);
 static int is_lvalue_expr(const HirExpr* expr);
 
+static int is_expected_type_shorthand_expr(const AstExpr* expr) {
+    return expr &&
+           expr->kind == AST_EXPR_VARIANT &&
+           !expr->as.variant.union_name;
+}
+
 static char* make_struct_init_name(const char* struct_name) {
     const char* prefix = "__struct_init_";
     size_t prefix_len = strlen(prefix);
@@ -1008,7 +1014,17 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 owner_binding = lookup_binding(ctx, owner_name);
                 if (owner_binding) {
                     HirFunction* method = 0;
+                    HirExpr* receiver_arg = 0;
                     owner_type = owner_binding->type;
+                    receiver_arg = make_binding_expr(owner_binding, expr->line);
+                    if (owner_type->kind == HIR_TYPE_POINTER && owner_type->array_item &&
+                        (owner_type->array_item->kind == HIR_TYPE_STRUCT ||
+                         owner_type->array_item->kind == HIR_TYPE_ENUM ||
+                         owner_type->array_item->kind == HIR_TYPE_UNION)) {
+                        owner_type = owner_type->array_item;
+                        receiver_arg = new_expr(HIR_EXPR_DEREF, owner_type, expr->line);
+                        receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
+                    }
                     method = find_method(ctx->program, owner_type, member_name, 0);
                     if (method) {
                         int i = 0;
@@ -1019,7 +1035,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         }
                         out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
                         out->as.call.callee = method;
-                        expr_list_push(&out->as.call.args, make_binding_expr(owner_binding, expr->line));
+                        expr_list_push(&out->as.call.args, receiver_arg);
                         for (i = 0; i < expr->as.call.args.count; ++i) {
                             HirExpr* arg = lower_expr(ctx, expr->as.call.args.items[i]);
                             if (!arg) {
@@ -1342,14 +1358,36 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_BINARY: {
-            HirExpr* left = lower_expr(ctx, expr->as.binary.left);
+            int comparison_op = expr->as.binary.op != AST_BIN_ADD &&
+                                expr->as.binary.op != AST_BIN_SUB &&
+                                expr->as.binary.op != AST_BIN_MUL &&
+                                expr->as.binary.op != AST_BIN_DIV;
+            HirExpr* left = 0;
             HirExpr* right = 0;
-            if (!left) {
-                return 0;
-            }
-            right = lower_expr(ctx, expr->as.binary.right);
-            if (!right) {
-                return 0;
+            if (comparison_op &&
+                is_expected_type_shorthand_expr(expr->as.binary.left) &&
+                !is_expected_type_shorthand_expr(expr->as.binary.right)) {
+                right = lower_expr(ctx, expr->as.binary.right);
+                if (!right) {
+                    return 0;
+                }
+                left = lower_expr_expected(ctx, expr->as.binary.left, right->type);
+                if (!left) {
+                    return 0;
+                }
+            } else {
+                left = lower_expr(ctx, expr->as.binary.left);
+                if (!left) {
+                    return 0;
+                }
+                if (comparison_op && is_expected_type_shorthand_expr(expr->as.binary.right)) {
+                    right = lower_expr_expected(ctx, expr->as.binary.right, left->type);
+                } else {
+                    right = lower_expr(ctx, expr->as.binary.right);
+                }
+                if (!right) {
+                    return 0;
+                }
             }
             out = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
             out->as.binary.left = left;

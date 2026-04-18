@@ -12,6 +12,7 @@ typedef struct AstBlock AstBlock;
 typedef struct AstStructField AstStructField;
 typedef struct AstStructDecl AstStructDecl;
 typedef struct AstImportDecl AstImportDecl;
+typedef struct AstAliasDecl AstAliasDecl;
 
 typedef struct AstTypeList {
     AstType* items;
@@ -30,6 +31,19 @@ typedef struct AstImportList {
     int count;
     int capacity;
 } AstImportList;
+
+struct AstAliasDecl {
+    char* name;
+    char* target_name;
+    int public_flag;
+    int line;
+};
+
+typedef struct AstAliasList {
+    AstAliasDecl* items;
+    int count;
+    int capacity;
+} AstAliasList;
 
 typedef enum AstTypeKind {
     AST_TYPE_INT = 0,
@@ -404,6 +418,7 @@ typedef struct AstGlobalList {
 
 typedef struct AstProgram {
     AstImportList imports;
+    AstAliasList aliases;
     AstStructList structs;
     AstEnumList enums;
     AstUnionList unions;
