@@ -285,6 +285,8 @@ typedef struct AstFunction {
     AstParamList params;
     AstBlock body;
     int struct_init_flag;
+    int method_flag;
+    int static_method_flag;
     char* owner_type_name;
     int line;
 } AstFunction;

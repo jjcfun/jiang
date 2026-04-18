@@ -385,6 +385,39 @@ static int looks_like_qualified_init_call(Parser* parser) {
     return probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
+static int looks_like_qualified_call(Parser* parser) {
+    Parser probe = *parser;
+    if (probe.current.kind != TOKEN_IDENT || !is_known_type(&probe, &probe.current)) {
+        return 0;
+    }
+    advance(&probe);
+    if (probe.current.kind != TOKEN_DOT) {
+        return 0;
+    }
+    advance(&probe);
+    if (probe.current.kind != TOKEN_IDENT) {
+        return 0;
+    }
+    advance(&probe);
+    return probe.current.kind == TOKEN_LEFT_PAREN;
+}
+
+static int looks_like_method_decl(Parser* parser) {
+    Parser probe = *parser;
+    if (probe.current.kind == TOKEN_KW_STATIC) {
+        advance(&probe);
+    }
+    if (!is_type_start(&probe)) {
+        return 0;
+    }
+    (void)parse_type(&probe);
+    if (probe.error || probe.current.kind != TOKEN_IDENT) {
+        return 0;
+    }
+    advance(&probe);
+    return probe.current.kind == TOKEN_LEFT_PAREN;
+}
+
 static int looks_like_typed_array_constructor(Parser* parser) {
     Parser probe = *parser;
     AstType type;
@@ -622,7 +655,10 @@ static AstExpr* parse_primary(Parser* parser) {
     }
 
     if (token.kind == TOKEN_IDENT) {
-        if (parser->next.kind == TOKEN_DOT && is_known_type(parser, &token) && !looks_like_qualified_init_call(parser)) {
+        if (parser->next.kind == TOKEN_DOT &&
+            is_known_type(parser, &token) &&
+            !looks_like_qualified_init_call(parser) &&
+            !looks_like_qualified_call(parser)) {
             return parse_variant_expr(parser, 0);
         }
         char* name = token_dup(&token);
@@ -1295,6 +1331,38 @@ static int parse_params(Parser* parser, AstParamList* params) {
     return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after parameters");
 }
 
+static int parse_method_decl(Parser* parser, AstProgram* out_program, const char* owner_type_name) {
+    AstFunction fn;
+    memset(&fn, 0, sizeof(fn));
+    if (parser->current.kind == TOKEN_KW_STATIC) {
+        fn.static_method_flag = 1;
+        advance(parser);
+    }
+    if (!is_type_start(parser)) {
+        return fail(parser, "expected method return type");
+    }
+    fn.return_type = parse_type(parser);
+    if (fn.return_type.kind == AST_TYPE_INFER) {
+        return fail(parser, "method return type cannot be inferred");
+    }
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected method name");
+    }
+    fn.name = token_dup(&parser->current);
+    fn.method_flag = 1;
+    fn.owner_type_name = (char*)owner_type_name;
+    fn.line = parser->current.line;
+    advance(parser);
+    if (!parse_params(parser, &fn.params)) {
+        return 0;
+    }
+    if (!parse_block(parser, &fn.body)) {
+        return 0;
+    }
+    function_list_push(&out_program->functions, fn);
+    return 1;
+}
+
 static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     AstEnumDecl enum_decl;
     memset(&enum_decl, 0, sizeof(enum_decl));
@@ -1310,6 +1378,12 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
+            if (!parse_method_decl(parser, out_program, enum_decl.name)) {
+                return 0;
+            }
+            continue;
+        }
         AstEnumMember member;
         memset(&member, 0, sizeof(member));
         if (parser->current.kind != TOKEN_IDENT) {
@@ -1376,6 +1450,12 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program) {
             }
             continue;
         }
+        if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
+            if (!parse_method_decl(parser, out_program, struct_decl.name)) {
+                return 0;
+            }
+            continue;
+        }
         AstStructField field;
         memset(&field, 0, sizeof(field));
         if (!is_type_start(parser)) {
@@ -1433,6 +1513,12 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
+            if (!parse_method_decl(parser, out_program, union_decl.name)) {
+                return 0;
+            }
+            continue;
+        }
         AstUnionVariant variant;
         memset(&variant, 0, sizeof(variant));
         if (!is_type_start(parser)) {

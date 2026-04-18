@@ -57,11 +57,6 @@ typedef struct BindingAlloca {
     LLVMValueRef alloca_value;
 } BindingAlloca;
 
-typedef struct LoopTarget {
-    LLVMBasicBlockRef continue_block;
-    LLVMBasicBlockRef break_block;
-} LoopTarget;
-
 typedef struct FunctionCodegen {
     const JirProgram* program;
     LLVMModuleRef module;
@@ -73,10 +68,12 @@ typedef struct FunctionCodegen {
     BindingAlloca* allocas;
     int alloca_count;
     int alloca_capacity;
-    LoopTarget* loops;
-    int loop_count;
-    int loop_capacity;
 } FunctionCodegen;
+
+typedef struct JirBlockMapEntry {
+    const char* name;
+    LLVMBasicBlockRef block;
+} JirBlockMapEntry;
 
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type);
 
@@ -99,23 +96,19 @@ static LLVMTypeRef llvm_struct_type(LLVMContextRef context, const JirType* type)
     LLVMTypeRef* fields = 0;
     LLVMTypeRef out = 0;
     int i = 0;
-    if (type->struct_decl->fields.count > 0) {
-        fields = (LLVMTypeRef*)malloc((size_t)type->struct_decl->fields.count * sizeof(LLVMTypeRef));
-        for (i = 0; i < type->struct_decl->fields.count; ++i) {
-            fields[i] = llvm_type(context, type->struct_decl->fields.items[i].type);
+    if (type->struct_fields.count > 0) {
+        fields = (LLVMTypeRef*)malloc((size_t)type->struct_fields.count * sizeof(LLVMTypeRef));
+        for (i = 0; i < type->struct_fields.count; ++i) {
+            fields[i] = llvm_type(context, type->struct_fields.items[i].type);
         }
     }
-    out = LLVMStructTypeInContext(context, fields, (unsigned)type->struct_decl->fields.count, 0);
+    out = LLVMStructTypeInContext(context, fields, (unsigned)type->struct_fields.count, 0);
     free(fields);
     return out;
 }
 
 static LLVMTypeRef llvm_union_payload_type(LLVMContextRef context, const JirType* type) {
-    unsigned payload_slots = 0;
-    if (type->union_decl && type->union_decl->payload_slots > 0) {
-        payload_slots = (unsigned)type->union_decl->payload_slots;
-    }
-    return LLVMArrayType(LLVMInt64TypeInContext(context), payload_slots);
+    return LLVMArrayType(LLVMInt64TypeInContext(context), (unsigned)type->union_payload_slots);
 }
 
 static LLVMTypeRef llvm_union_type(LLVMContextRef context, const JirType* type) {
@@ -131,19 +124,19 @@ static LLVMTypeRef llvm_array_type(LLVMContextRef context, const JirType* type) 
 
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
     switch (type->kind) {
-        case HIR_TYPE_BOOL:
+        case JIR_TYPE_BOOL:
             return LLVMInt1TypeInContext(context);
-        case HIR_TYPE_VOID:
+        case JIR_TYPE_VOID:
             return LLVMVoidTypeInContext(context);
-        case HIR_TYPE_ENUM:
+        case JIR_TYPE_ENUM:
             return LLVMInt64TypeInContext(context);
-        case HIR_TYPE_STRUCT:
+        case JIR_TYPE_STRUCT:
             return llvm_struct_type(context, type);
-        case HIR_TYPE_TUPLE:
+        case JIR_TYPE_TUPLE:
             return llvm_tuple_type(context, type);
-        case HIR_TYPE_ARRAY:
+        case JIR_TYPE_ARRAY:
             return llvm_array_type(context, type);
-        case HIR_TYPE_UNION:
+        case JIR_TYPE_UNION:
             return llvm_union_type(context, type);
         default:
             return LLVMInt64TypeInContext(context);
@@ -171,16 +164,16 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
     LLVMValueRef* items = 0;
     LLVMValueRef value = 0;
     int i = 0;
-    if (expr->kind == HIR_EXPR_BOOL) {
+    if (expr->kind == JIR_EXPR_BOOL) {
         return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.bool_value, 0);
     }
-    if (expr->kind == HIR_EXPR_INT) {
+    if (expr->kind == JIR_EXPR_INT) {
         return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.int_value, 1);
     }
-    if (expr->kind == HIR_EXPR_ENUM_MEMBER) {
-        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.enum_member.member->value, 1);
+    if (expr->kind == JIR_EXPR_ENUM_MEMBER) {
+        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.enum_member.value, 1);
     }
-    if (expr->kind == HIR_EXPR_TUPLE) {
+    if (expr->kind == JIR_EXPR_TUPLE) {
         if (expr->as.tuple.items.count > 0) {
             items = (LLVMValueRef*)malloc((size_t)expr->as.tuple.items.count * sizeof(LLVMValueRef));
             for (i = 0; i < expr->as.tuple.items.count; ++i) {
@@ -191,25 +184,25 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
         free(items);
         return value;
     }
-    if (expr->kind == HIR_EXPR_STRUCT) {
-        unsigned field_count = (unsigned)expr->type->struct_decl->fields.count;
+    if (expr->kind == JIR_EXPR_STRUCT) {
+        unsigned field_count = (unsigned)expr->type->struct_fields.count;
         LLVMValueRef* field_values = 0;
         if (field_count == 0) {
             return LLVMConstStructInContext(context, 0, 0, 0);
         }
         field_values = (LLVMValueRef*)malloc((size_t)field_count * sizeof(LLVMValueRef));
         for (i = 0; i < (int)field_count; ++i) {
-            field_values[i] = LLVMConstNull(llvm_type(context, expr->type->struct_decl->fields.items[i].type));
+            field_values[i] = LLVMConstNull(llvm_type(context, expr->type->struct_fields.items[i].type));
         }
         for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
-            int field_index = (int)(expr->as.struct_lit.fields.items[i].field - expr->type->struct_decl->fields.items);
+            int field_index = expr->as.struct_lit.fields.items[i].field_index;
             field_values[field_index] = llvm_const_expr(context, expr->as.struct_lit.fields.items[i].value);
         }
         value = LLVMConstStructInContext(context, field_values, field_count, 0);
         free(field_values);
         return value;
     }
-    if (expr->kind == HIR_EXPR_ARRAY) {
+    if (expr->kind == JIR_EXPR_ARRAY) {
         if (expr->as.array.items.count > 0) {
             items = (LLVMValueRef*)malloc((size_t)expr->as.array.items.count * sizeof(LLVMValueRef));
             for (i = 0; i < expr->as.array.items.count; ++i) {
@@ -220,12 +213,12 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
         free(items);
         return value;
     }
-    if (expr->kind == HIR_EXPR_VARIANT) {
+    if (expr->kind == JIR_EXPR_VARIANT) {
         LLVMTypeRef payload_type = llvm_union_payload_type(context, expr->type);
         LLVMValueRef* payload_items = 0;
         LLVMValueRef payload_array = 0;
         LLVMValueRef fields[2];
-        unsigned payload_len = (unsigned)expr->type->union_decl->payload_slots;
+        unsigned payload_len = (unsigned)expr->type->union_payload_slots;
         if (payload_len > 0) {
             payload_items = (LLVMValueRef*)malloc((size_t)payload_len * sizeof(LLVMValueRef));
             for (i = 0; i < (int)payload_len; ++i) {
@@ -233,17 +226,17 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
             }
         }
         if (expr->as.variant.payload) {
-            if (expr->as.variant.payload->type->kind == HIR_TYPE_TUPLE) {
+            if (expr->as.variant.payload->type->kind == JIR_TYPE_TUPLE) {
                 for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
                     LLVMValueRef item = llvm_const_expr(context, expr->as.variant.payload->as.tuple.items.items[i]);
-                    if (expr->as.variant.payload->as.tuple.items.items[i]->type->kind == HIR_TYPE_BOOL) {
+                    if (expr->as.variant.payload->as.tuple.items.items[i]->type->kind == JIR_TYPE_BOOL) {
                         item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
                     }
                     payload_items[i] = item;
                 }
             } else {
                 LLVMValueRef item = llvm_const_expr(context, expr->as.variant.payload);
-                if (expr->as.variant.payload->type->kind == HIR_TYPE_BOOL) {
+                if (expr->as.variant.payload->type->kind == JIR_TYPE_BOOL) {
                     item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
                 }
                 payload_items[0] = item;
@@ -251,7 +244,7 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
         }
         payload_array = payload_len == 0 ? LLVMConstNull(payload_type) : LLVMConstArray(LLVMInt64TypeInContext(context), payload_items, payload_len);
         free(payload_items);
-        fields[0] = LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)expr->as.variant.variant->tag_value, 0);
+        fields[0] = LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)expr->as.variant.tag_value, 0);
         fields[1] = payload_array;
         return LLVMConstStructInContext(context, fields, 2, 0);
     }
@@ -259,35 +252,22 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
 }
 
 static LLVMValueRef extend_union_payload_value(LLVMBuilderRef builder, LLVMContextRef context, LLVMValueRef value, const JirType* type) {
-    if (type->kind == HIR_TYPE_BOOL) {
+    if (type->kind == JIR_TYPE_BOOL) {
         return LLVMBuildZExt(builder, value, LLVMInt64TypeInContext(context), "union.zext");
     }
     return value;
 }
 
 static LLVMValueRef narrow_union_payload_value(LLVMBuilderRef builder, LLVMContextRef context, LLVMValueRef value, const JirType* type) {
-    if (type->kind == HIR_TYPE_BOOL) {
+    if (type->kind == JIR_TYPE_BOOL) {
         return LLVMBuildTrunc(builder, value, LLVMInt1TypeInContext(context), "union.trunc");
     }
     return value;
 }
 
-static int function_index(const JirProgram* program, const JirFunction* function) {
-    int i = 0;
-    for (i = 0; i < program->functions.count; ++i) {
-        if (&program->functions.items[i] == function) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 static LLVMValueRef llvm_function_for(const JirProgram* program, LLVMModuleRef module, const JirFunction* function) {
-    int index = function_index(program, function);
-    if (index < 0) {
-        return 0;
-    }
-    return LLVMGetNamedFunction(module, program->functions.items[index].name);
+    (void)program;
+    return LLVMGetNamedFunction(module, function->name);
 }
 
 static LLVMValueRef llvm_global_for(LLVMModuleRef module, const JirBinding* binding) {
@@ -313,28 +293,6 @@ static LLVMValueRef find_alloca(FunctionCodegen* cg, const JirBinding* binding) 
         }
     }
     return 0;
-}
-
-static void push_loop(FunctionCodegen* cg, LLVMBasicBlockRef continue_block, LLVMBasicBlockRef break_block) {
-    if (cg->loop_count == cg->loop_capacity) {
-        int next_capacity = cg->loop_capacity == 0 ? 4 : cg->loop_capacity * 2;
-        cg->loops = (LoopTarget*)realloc(cg->loops, (size_t)next_capacity * sizeof(LoopTarget));
-        cg->loop_capacity = next_capacity;
-    }
-    cg->loops[cg->loop_count].continue_block = continue_block;
-    cg->loops[cg->loop_count].break_block = break_block;
-    cg->loop_count += 1;
-}
-
-static void pop_loop(FunctionCodegen* cg) {
-    cg->loop_count -= 1;
-}
-
-static LoopTarget* current_loop(FunctionCodegen* cg) {
-    if (cg->loop_count <= 0) {
-        return 0;
-    }
-    return &cg->loops[cg->loop_count - 1];
 }
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr);
@@ -382,7 +340,7 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
     LLVMValueRef printf_fn = get_or_add_printf(cg->module, cg->context);
     LLVMValueRef arg = emit_expr(cg, expr->as.call.args.items[0]);
     LLVMValueRef args[2];
-    if (expr->as.call.args.items[0]->type->kind == HIR_TYPE_BOOL) {
+    if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_BOOL) {
         LLVMValueRef true_str = gep_cstr(cg->builder, get_or_add_format_string(cg->module, cg->context, ".str.true", "true\n"));
         LLVMValueRef false_str = gep_cstr(cg->builder, get_or_add_format_string(cg->module, cg->context, ".str.false", "false\n"));
         args[0] = LLVMBuildSelect(cg->builder, arg, true_str, false_str, "print.bool");
@@ -395,13 +353,13 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
 
 static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
     switch (expr->kind) {
-        case HIR_EXPR_BINDING:
-            if (expr->as.binding->kind == HIR_BINDING_GLOBAL) {
+        case JIR_EXPR_BINDING:
+            if (expr->as.binding->kind == JIR_BINDING_GLOBAL) {
                 return llvm_global_for(cg->module, expr->as.binding);
             }
             return find_alloca(cg, expr->as.binding);
-        case HIR_EXPR_INDEX:
-            if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY) {
+        case JIR_EXPR_INDEX:
+            if (expr->as.index.base->type->kind == JIR_TYPE_ARRAY) {
                 LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.index.base);
                 LLVMValueRef indices[2];
                 if (!base_ptr) {
@@ -418,7 +376,7 @@ static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
                     "array.ptr");
             }
             return 0;
-        case HIR_EXPR_STRUCT_FIELD: {
+        case JIR_EXPR_STRUCT_FIELD: {
             LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.struct_field.base);
             LLVMValueRef indices[2];
             if (!base_ptr) {
@@ -441,28 +399,31 @@ static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
     int i = 0;
+    if (!expr) {
+        return 0;
+    }
     switch (expr->kind) {
-        case HIR_EXPR_INT:
-        case HIR_EXPR_BOOL:
+        case JIR_EXPR_INT:
+        case JIR_EXPR_BOOL:
             return llvm_const_expr(cg->context, expr);
-        case HIR_EXPR_BINDING:
-            if (expr->as.binding->kind == HIR_BINDING_GLOBAL) {
+        case JIR_EXPR_BINDING:
+            if (expr->as.binding->kind == JIR_BINDING_GLOBAL) {
                 LLVMValueRef global = llvm_global_for(cg->module, expr->as.binding);
                 return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), global, expr->as.binding->name);
             }
             return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), find_alloca(cg, expr->as.binding), expr->as.binding->name);
-        case HIR_EXPR_CALL: {
-            if (expr->as.call.builtin == HIR_BUILTIN_ASSERT) {
+        case JIR_EXPR_CALL: {
+            if (expr->as.call.builtin == JIR_BUILTIN_ASSERT) {
                 return emit_builtin_assert(cg, expr);
             }
-            if (expr->as.call.builtin == HIR_BUILTIN_PRINT) {
+            if (expr->as.call.builtin == JIR_BUILTIN_PRINT) {
                 return emit_builtin_print(cg, expr);
             }
-            if (expr->as.call.builtin == HIR_BUILTIN_PANIC) {
+            if (expr->as.call.builtin == JIR_BUILTIN_PANIC) {
                 return emit_builtin_panic(cg);
             }
             LLVMValueRef callee = llvm_function_for(cg->program, cg->module, expr->as.call.callee);
-            LLVMTypeRef callee_type = llvm_function_type(cg->context, expr->as.call.callee);
+            LLVMTypeRef callee_type = llvm_function_type(cg->context, (const JirFunction*)expr->as.call.callee);
             LLVMValueRef* args = 0;
             LLVMValueRef result = 0;
             if (expr->as.call.args.count > 0) {
@@ -471,27 +432,27 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                     args[i] = emit_expr(cg, expr->as.call.args.items[i]);
                 }
             }
-            result = LLVMBuildCall2(cg->builder, callee_type, callee, args, (unsigned)expr->as.call.args.count, expr->type->kind == HIR_TYPE_VOID ? "" : "calltmp");
+            result = LLVMBuildCall2(cg->builder, callee_type, callee, args, (unsigned)expr->as.call.args.count, expr->type->kind == JIR_TYPE_VOID ? "" : "calltmp");
             free(args);
             return result;
         }
-        case HIR_EXPR_BINARY: {
+        case JIR_EXPR_BINARY: {
             LLVMValueRef left = emit_expr(cg, expr->as.binary.left);
             LLVMValueRef right = emit_expr(cg, expr->as.binary.right);
             switch (expr->as.binary.op) {
-                case HIR_BIN_ADD: return LLVMBuildAdd(cg->builder, left, right, "addtmp");
-                case HIR_BIN_SUB: return LLVMBuildSub(cg->builder, left, right, "subtmp");
-                case HIR_BIN_MUL: return LLVMBuildMul(cg->builder, left, right, "multmp");
-                case HIR_BIN_DIV: return LLVMBuildSDiv(cg->builder, left, right, "divtmp");
-                case HIR_BIN_EQ: return LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
-                case HIR_BIN_NE: return LLVMBuildICmp(cg->builder, LLVMIntNE, left, right, "netmp");
-                case HIR_BIN_LT: return LLVMBuildICmp(cg->builder, LLVMIntSLT, left, right, "lttmp");
-                case HIR_BIN_LE: return LLVMBuildICmp(cg->builder, LLVMIntSLE, left, right, "letmp");
-                case HIR_BIN_GT: return LLVMBuildICmp(cg->builder, LLVMIntSGT, left, right, "gttmp");
-                case HIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
+                case JIR_BIN_ADD: return LLVMBuildAdd(cg->builder, left, right, "addtmp");
+                case JIR_BIN_SUB: return LLVMBuildSub(cg->builder, left, right, "subtmp");
+                case JIR_BIN_MUL: return LLVMBuildMul(cg->builder, left, right, "multmp");
+                case JIR_BIN_DIV: return LLVMBuildSDiv(cg->builder, left, right, "divtmp");
+                case JIR_BIN_EQ: return LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
+                case JIR_BIN_NE: return LLVMBuildICmp(cg->builder, LLVMIntNE, left, right, "netmp");
+                case JIR_BIN_LT: return LLVMBuildICmp(cg->builder, LLVMIntSLT, left, right, "lttmp");
+                case JIR_BIN_LE: return LLVMBuildICmp(cg->builder, LLVMIntSLE, left, right, "letmp");
+                case JIR_BIN_GT: return LLVMBuildICmp(cg->builder, LLVMIntSGT, left, right, "gttmp");
+                case JIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
             }
         }
-        case HIR_EXPR_TERNARY: {
+        case JIR_EXPR_TERNARY: {
             LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.then");
             LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.else");
             LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.end");
@@ -518,36 +479,36 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
             return phi;
         }
-        case HIR_EXPR_ENUM_MEMBER:
+        case JIR_EXPR_ENUM_MEMBER:
             return llvm_const_expr(cg->context, expr);
-        case HIR_EXPR_ENUM_VALUE:
+        case JIR_EXPR_ENUM_VALUE:
             return emit_expr(cg, expr->as.enum_value.value);
-        case HIR_EXPR_STRUCT: {
+        case JIR_EXPR_STRUCT: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
-                int field_index = (int)(expr->as.struct_lit.fields.items[i].field - expr->type->struct_decl->fields.items);
+                int field_index = expr->as.struct_lit.fields.items[i].field_index;
                 value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.struct_lit.fields.items[i].value), (unsigned)field_index, "struct.ins");
             }
             return value;
         }
-        case HIR_EXPR_TUPLE: {
+        case JIR_EXPR_TUPLE: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.tuple.items.count; ++i) {
                 value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.tuple.items.items[i]), (unsigned)i, "tuple.ins");
             }
             return value;
         }
-        case HIR_EXPR_VARIANT: {
+        case JIR_EXPR_VARIANT: {
             LLVMValueRef union_value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             LLVMValueRef payload_array = LLVMConstNull(llvm_union_payload_type(cg->context, expr->type));
             union_value = LLVMBuildInsertValue(
                 cg->builder,
                 union_value,
-                LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.variant.variant->tag_value, 0),
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.variant.tag_value, 0),
                 0,
                 "union.tag");
             if (expr->as.variant.payload) {
-                if (expr->as.variant.payload->type->kind == HIR_TYPE_TUPLE) {
+                if (expr->as.variant.payload->type->kind == JIR_TYPE_TUPLE) {
                     for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
                         LLVMValueRef item = emit_expr(cg, expr->as.variant.payload->as.tuple.items.items[i]);
                         item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.variant.payload->as.tuple.items.items[i]->type);
@@ -561,33 +522,33 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             }
             return LLVMBuildInsertValue(cg->builder, union_value, payload_array, 1, "union.value");
         }
-        case HIR_EXPR_UNION_TAG:
+        case JIR_EXPR_UNION_TAG:
             return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.union_tag.value), 0, "union.tag");
-        case HIR_EXPR_UNION_FIELD: {
+        case JIR_EXPR_UNION_FIELD: {
             LLVMValueRef payload_array = LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.union_field.value), 1, "union.payload");
             LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.union_field.field_index, "union.field");
             return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
         }
-        case HIR_EXPR_STRUCT_FIELD: {
+        case JIR_EXPR_STRUCT_FIELD: {
             LLVMValueRef ptr = emit_lvalue_ptr(cg, expr);
             if (ptr) {
                 return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), ptr, "struct.field");
             }
             return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.struct_field.base), (unsigned)expr->as.struct_field.field_index, "struct.field");
         }
-        case HIR_EXPR_ARRAY: {
+        case JIR_EXPR_ARRAY: {
             LLVMValueRef value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             for (i = 0; i < expr->as.array.items.count; ++i) {
                 value = LLVMBuildInsertValue(cg->builder, value, emit_expr(cg, expr->as.array.items.items[i]), (unsigned)i, "array.ins");
             }
             return value;
         }
-        case HIR_EXPR_INDEX:
-            if (expr->as.index.base->type->kind == HIR_TYPE_TUPLE) {
+        case JIR_EXPR_INDEX:
+            if (expr->as.index.base->type->kind == JIR_TYPE_TUPLE) {
                 return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.index.base), (unsigned)expr->as.index.index->as.int_value, "tuple.idx");
             }
-            if (expr->as.index.base->type->kind == HIR_TYPE_ARRAY) {
-                if (expr->as.index.base->kind == HIR_EXPR_BINDING || expr->as.index.base->kind == HIR_EXPR_STRUCT_FIELD) {
+            if (expr->as.index.base->type->kind == JIR_TYPE_ARRAY) {
+                if (expr->as.index.base->kind == JIR_EXPR_BINDING || expr->as.index.base->kind == JIR_EXPR_STRUCT_FIELD) {
                     LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.index.base);
                     return LLVMBuildLoad2(
                         cg->builder,
@@ -598,7 +559,7 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                         }, 2, "array.ptr"),
                         "array.idx");
                 }
-                if (expr->as.index.index->kind == HIR_EXPR_INT) {
+                if (expr->as.index.index->kind == JIR_EXPR_INT) {
                     return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.index.base), (unsigned)expr->as.index.index->as.int_value, "array.idx");
                 }
             }
@@ -611,133 +572,57 @@ static int block_terminated(LLVMBasicBlockRef block) {
     return LLVMGetBasicBlockTerminator(block) ? 1 : 0;
 }
 
-static void emit_block(FunctionCodegen* cg, const JirBlock* block);
+static int emit_jir_inst(FunctionCodegen* cg, const JirInst* inst);
 
-static void emit_stmt(FunctionCodegen* cg, const JirStmt* stmt) {
-    switch (stmt->kind) {
-        case HIR_STMT_RETURN:
-            if (!stmt->as.ret.expr || stmt->as.ret.expr->type->kind == HIR_TYPE_VOID) {
-                LLVMBuildRetVoid(cg->builder);
-            } else {
-                LLVMBuildRet(cg->builder, emit_expr(cg, stmt->as.ret.expr));
+static int emit_jir_inst(FunctionCodegen* cg, const JirInst* inst) {
+    switch (inst->kind) {
+        case JIR_INST_PARAM:
+            return 1;
+        case JIR_INST_VAR_DECL:
+            if (!inst->binding || !inst->value) {
+                return 0;
             }
-            return;
-        case HIR_STMT_VAR_DECL:
-            LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.var_decl.init), find_alloca(cg, stmt->as.var_decl.binding));
-            return;
-        case HIR_STMT_ASSIGN:
-            if (stmt->as.assign.binding) {
-                if (stmt->as.assign.binding->kind == HIR_BINDING_GLOBAL) {
-                    LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), llvm_global_for(cg->module, stmt->as.assign.binding));
+            LLVMBuildStore(cg->builder, emit_expr(cg, inst->value), find_alloca(cg, inst->binding));
+            return 1;
+        case JIR_INST_ASSIGN:
+            if (!inst->value) {
+                return 0;
+            }
+            if (inst->binding) {
+                if (inst->binding->kind == JIR_BINDING_GLOBAL) {
+                    LLVMBuildStore(cg->builder, emit_expr(cg, inst->value), llvm_global_for(cg->module, inst->binding));
                 } else {
-                    LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), find_alloca(cg, stmt->as.assign.binding));
+                    LLVMBuildStore(cg->builder, emit_expr(cg, inst->value), find_alloca(cg, inst->binding));
                 }
             } else {
-                LLVMValueRef ptr = emit_lvalue_ptr(cg, stmt->as.assign.target);
+                if (!inst->target) {
+                    return 0;
+                }
+                LLVMValueRef ptr = emit_lvalue_ptr(cg, inst->target);
                 if (!ptr) {
-                    return;
+                    return 0;
                 }
-                LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), ptr);
+                LLVMBuildStore(cg->builder, emit_expr(cg, inst->value), ptr);
             }
-            return;
-        case HIR_STMT_IF: {
-            LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "if.then");
-            LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "if.end");
-            LLVMBasicBlockRef else_block = 0;
-            if (stmt->as.if_stmt.has_else) {
-                else_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "if.else");
+            return 1;
+        case JIR_INST_EXPR:
+            if (!inst->expr) {
+                return 0;
             }
-            LLVMBuildCondBr(cg->builder, emit_expr(cg, stmt->as.if_stmt.cond), then_block, stmt->as.if_stmt.has_else ? else_block : merge_block);
-            LLVMPositionBuilderAtEnd(cg->builder, then_block);
-            emit_block(cg, &stmt->as.if_stmt.then_block);
-            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
-                LLVMBuildBr(cg->builder, merge_block);
-            }
-            if (stmt->as.if_stmt.has_else) {
-                LLVMPositionBuilderAtEnd(cg->builder, else_block);
-                emit_block(cg, &stmt->as.if_stmt.else_block);
-                if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
-                    LLVMBuildBr(cg->builder, merge_block);
-                }
-            }
-            LLVMPositionBuilderAtEnd(cg->builder, merge_block);
-            return;
-        }
-        case HIR_STMT_WHILE: {
-            LLVMBasicBlockRef cond_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "while.cond");
-            LLVMBasicBlockRef body_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "while.body");
-            LLVMBasicBlockRef exit_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "while.end");
-            LLVMBuildBr(cg->builder, cond_block);
-            LLVMPositionBuilderAtEnd(cg->builder, cond_block);
-            LLVMBuildCondBr(cg->builder, emit_expr(cg, stmt->as.while_stmt.cond), body_block, exit_block);
-            LLVMPositionBuilderAtEnd(cg->builder, body_block);
-            push_loop(cg, cond_block, exit_block);
-            emit_block(cg, &stmt->as.while_stmt.body);
-            pop_loop(cg);
-            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
-                LLVMBuildBr(cg->builder, cond_block);
-            }
-            LLVMPositionBuilderAtEnd(cg->builder, exit_block);
-            return;
-        }
-        case HIR_STMT_FOR_RANGE: {
-            LLVMValueRef slot = find_alloca(cg, stmt->as.for_range.binding);
-            LLVMBasicBlockRef cond_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "for.cond");
-            LLVMBasicBlockRef body_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "for.body");
-            LLVMBasicBlockRef step_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "for.step");
-            LLVMBasicBlockRef exit_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "for.end");
-            LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.for_range.start), slot);
-            LLVMBuildBr(cg->builder, cond_block);
-            LLVMPositionBuilderAtEnd(cg->builder, cond_block);
-            LLVMBuildCondBr(cg->builder,
-                LLVMBuildICmp(cg->builder, LLVMIntSLT,
-                    LLVMBuildLoad2(cg->builder, llvm_type(cg->context, stmt->as.for_range.binding->type), slot, stmt->as.for_range.binding->name),
-                    emit_expr(cg, stmt->as.for_range.end),
-                    "forcmp"),
-                body_block,
-                exit_block);
-            LLVMPositionBuilderAtEnd(cg->builder, body_block);
-            push_loop(cg, step_block, exit_block);
-            emit_block(cg, &stmt->as.for_range.body);
-            pop_loop(cg);
-            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
-                LLVMBuildBr(cg->builder, step_block);
-            }
-            LLVMPositionBuilderAtEnd(cg->builder, step_block);
-            LLVMBuildStore(cg->builder,
-                LLVMBuildAdd(cg->builder,
-                    LLVMBuildLoad2(cg->builder, llvm_type(cg->context, stmt->as.for_range.binding->type), slot, stmt->as.for_range.binding->name),
-                    LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
-                    "forinc"),
-                slot);
-            LLVMBuildBr(cg->builder, cond_block);
-            LLVMPositionBuilderAtEnd(cg->builder, exit_block);
-            return;
-        }
-        case HIR_STMT_BREAK: {
-            LoopTarget* loop = current_loop(cg);
-            LLVMBuildBr(cg->builder, loop->break_block);
-            return;
-        }
-        case HIR_STMT_CONTINUE: {
-            LoopTarget* loop = current_loop(cg);
-            LLVMBuildBr(cg->builder, loop->continue_block);
-            return;
-        }
-        case HIR_STMT_EXPR:
-            (void)emit_expr(cg, stmt->as.expr_stmt.expr);
-            return;
+            (void)emit_expr(cg, inst->expr);
+            return 1;
     }
+    return 1;
 }
 
-static void emit_block(FunctionCodegen* cg, const JirBlock* block) {
+static const JirLoweredFunction* find_lowered_function(const JirProgram* program, const JirFunction* function) {
     int i = 0;
-    for (i = 0; i < block->stmts.count; ++i) {
-        emit_stmt(cg, block->stmts.items[i]);
-        if (block_terminated(LLVMGetInsertBlock(cg->builder))) {
-            return;
+    for (i = 0; i < program->lowered_functions.count; ++i) {
+        if (program->lowered_functions.items[i].function == function) {
+            return &program->lowered_functions.items[i];
         }
     }
+    return 0;
 }
 
 static int emit_globals(const JirProgram* program, LLVMModuleRef module, LLVMContextRef context) {
@@ -759,8 +644,10 @@ static int emit_function_decl(const JirFunction* function, LLVMModuleRef module,
 
 static int emit_function_body(const JirProgram* program, LLVMModuleRef module, LLVMContextRef context, const JirFunction* function) {
     FunctionCodegen cg;
-    LLVMBasicBlockRef entry;
+    const JirLoweredFunction* lowered = 0;
+    JirBlockMapEntry* block_map = 0;
     char* verify_error = 0;
+    int i = 0;
 
     memset(&cg, 0, sizeof(cg));
     cg.program = program;
@@ -770,19 +657,70 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     cg.llvm_function = LLVMGetNamedFunction(module, function->name);
     cg.builder = LLVMCreateBuilderInContext(context);
     cg.entry_builder = LLVMCreateBuilderInContext(context);
+    lowered = find_lowered_function(program, function);
+    if (!lowered || lowered->blocks.count <= 0) {
+        return 0;
+    }
 
-    entry = LLVMAppendBasicBlockInContext(context, cg.llvm_function, "entry");
-    LLVMPositionBuilderAtEnd(cg.builder, entry);
-    LLVMPositionBuilderAtEnd(cg.entry_builder, entry);
+    block_map = (JirBlockMapEntry*)calloc((size_t)lowered->blocks.count, sizeof(JirBlockMapEntry));
+    if (!block_map) {
+        *(&verify_error) = 0;
+        return 0;
+    }
+    for (i = 0; i < lowered->blocks.count; ++i) {
+        block_map[i].name = lowered->blocks.items[i].name;
+        block_map[i].block = LLVMAppendBasicBlockInContext(context, cg.llvm_function, lowered->blocks.items[i].name);
+    }
+    LLVMPositionBuilderAtEnd(cg.builder, block_map[0].block);
+    LLVMPositionBuilderAtEnd(cg.entry_builder, block_map[0].block);
 
     create_binding_allocas(&cg);
-    emit_block(&cg, &function->body);
-
-    if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
-        if (function->return_type->kind == HIR_TYPE_VOID) {
-            LLVMBuildRetVoid(cg.builder);
-        } else {
-            LLVMBuildRet(cg.builder, LLVMConstNull(llvm_type(context, function->return_type)));
+    for (i = 0; i < lowered->blocks.count; ++i) {
+        int j = 0;
+        const JirBasicBlock* block = &lowered->blocks.items[i];
+        LLVMPositionBuilderAtEnd(cg.builder, block_map[i].block);
+        for (j = 0; j < block->insts.count; ++j) {
+            if (!emit_jir_inst(&cg, &block->insts.items[j])) {
+                free(block_map);
+                LLVMDisposeBuilder(cg.entry_builder);
+                LLVMDisposeBuilder(cg.builder);
+                free(cg.allocas);
+                return 0;
+            }
+        }
+        switch (block->term.kind) {
+            case JIR_TERM_FALLTHROUGH:
+                if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
+                    if (function->return_type->kind == JIR_TYPE_VOID) {
+                        LLVMBuildRetVoid(cg.builder);
+                    } else {
+                        LLVMBuildRet(cg.builder, LLVMConstNull(llvm_type(context, function->return_type)));
+                    }
+                }
+                break;
+            case JIR_TERM_RETURN:
+                if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
+                    if (!block->term.value || function->return_type->kind == JIR_TYPE_VOID) {
+                        LLVMBuildRetVoid(cg.builder);
+                    } else {
+                        LLVMBuildRet(cg.builder, emit_expr(&cg, block->term.value));
+                    }
+                }
+                break;
+            case JIR_TERM_BRANCH:
+                if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
+                    LLVMBuildBr(cg.builder, block_map[block->term.then_target.index].block);
+                }
+                break;
+            case JIR_TERM_COND_BRANCH:
+                if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
+                    LLVMBuildCondBr(
+                        cg.builder,
+                        emit_expr(&cg, block->term.cond),
+                        block_map[block->term.then_target.index].block,
+                        block_map[block->term.else_target.index].block);
+                }
+                break;
         }
     }
 
@@ -791,15 +729,15 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
         LLVMDisposeMessage(verify_error);
         LLVMDisposeBuilder(cg.entry_builder);
         LLVMDisposeBuilder(cg.builder);
+        free(block_map);
         free(cg.allocas);
-        free(cg.loops);
         return 0;
     }
 
     LLVMDisposeBuilder(cg.entry_builder);
     LLVMDisposeBuilder(cg.builder);
+    free(block_map);
     free(cg.allocas);
-    free(cg.loops);
     return 1;
 }
 

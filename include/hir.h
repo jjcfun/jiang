@@ -245,11 +245,15 @@ struct HirStmt {
 struct HirFunction {
     HirType* return_type;
     char* name;
+    char* method_name;
     HirBindingList params;
     HirBindingList locals;
     HirBlock body;
     int struct_init_flag;
+    int method_flag;
+    int static_method_flag;
     HirStructDecl* owner_struct;
+    HirType* receiver_type;
     int line;
 };
 

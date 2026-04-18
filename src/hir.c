@@ -50,6 +50,23 @@ static char* make_struct_init_name(const char* struct_name) {
     return out;
 }
 
+static char* make_method_name(const char* owner_name, const char* method_name, int static_flag) {
+    const char* prefix = static_flag ? "__static_method_" : "__method_";
+    size_t prefix_len = strlen(prefix);
+    size_t owner_len = strlen(owner_name);
+    size_t method_len = strlen(method_name);
+    char* out = (char*)malloc(prefix_len + owner_len + 1 + method_len + 1);
+    if (!out) {
+        return 0;
+    }
+    memcpy(out, prefix, prefix_len);
+    memcpy(out + prefix_len, owner_name, owner_len);
+    out[prefix_len + owner_len] = '_';
+    memcpy(out + prefix_len + owner_len + 1, method_name, method_len);
+    out[prefix_len + owner_len + 1 + method_len] = '\0';
+    return out;
+}
+
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
     switch (kind) {
         case HIR_TYPE_INT: return &program->int_type;
@@ -259,6 +276,29 @@ static HirFunction* find_function(HirProgram* program, const char* name) {
 
 static HirGlobal* find_global(HirProgram* program, const char* name) {
     return (HirGlobal*)hashmap_get(&program->global_map, name);
+}
+
+static HirFunction* find_method(HirProgram* program, HirType* receiver_type, const char* method_name, int static_flag) {
+    int i = 0;
+    for (i = 0; i < program->functions.count; ++i) {
+        HirFunction* fn = &program->functions.items[i];
+        if (!fn->method_flag || fn->static_method_flag != static_flag || strcmp(fn->method_name, method_name) != 0) {
+            continue;
+        }
+        if (receiver_type->kind != fn->receiver_type->kind) {
+            continue;
+        }
+        if (receiver_type->kind == HIR_TYPE_STRUCT && receiver_type->struct_decl == fn->receiver_type->struct_decl) {
+            return fn;
+        }
+        if (receiver_type->kind == HIR_TYPE_ENUM && receiver_type->enum_decl == fn->receiver_type->enum_decl) {
+            return fn;
+        }
+        if (receiver_type->kind == HIR_TYPE_UNION && receiver_type->union_decl == fn->receiver_type->union_decl) {
+            return fn;
+        }
+    }
+    return 0;
 }
 
 static HirBinding* lookup_binding(LowerContext* ctx, const char* name) {
@@ -519,6 +559,29 @@ static HirUnionVariant* resolve_variant_expr(LowerContext* ctx, const AstExpr* e
     return variant;
 }
 
+static HirType* find_named_owner_type(HirProgram* program, const char* owner_type_name) {
+    HirEnumDecl* enum_decl = find_enum(program, owner_type_name);
+    HirStructDecl* struct_decl = find_struct(program, owner_type_name);
+    HirUnionDecl* union_decl = find_union(program, owner_type_name);
+    HirType* type = 0;
+    if (enum_decl) {
+        type = new_owned_type(program, HIR_TYPE_ENUM);
+        type->enum_decl = enum_decl;
+        return type;
+    }
+    if (struct_decl) {
+        type = new_owned_type(program, HIR_TYPE_STRUCT);
+        type->struct_decl = struct_decl;
+        return type;
+    }
+    if (union_decl) {
+        type = new_owned_type(program, HIR_TYPE_UNION);
+        type->union_decl = union_decl;
+        return type;
+    }
+    return 0;
+}
+
 static int validate_struct_init_expr(LowerContext* ctx, HirStructDecl* struct_decl, const AstExpr* expr, int* field_state) {
     int i = 0;
     if (!expr) {
@@ -726,11 +789,114 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
             return out;
         }
         case AST_EXPR_CALL: {
+            const char* dot = strchr(expr->as.call.callee, '.');
             HirBuiltinKind builtin = builtin_kind(expr->as.call.callee);
             if (builtin != HIR_BUILTIN_NONE) {
                 out = new_expr(HIR_EXPR_CALL, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
                 if (!lower_builtin_call(ctx, expr, out, builtin)) return 0;
                 return out;
+            }
+            if (dot) {
+                size_t owner_len = (size_t)(dot - expr->as.call.callee);
+                char* owner_name = (char*)malloc(owner_len + 1);
+                const char* member_name = dot + 1;
+                HirBinding* owner_binding = 0;
+                HirType* owner_type = 0;
+                if (!owner_name) {
+                    fail(ctx, "out of memory");
+                    return 0;
+                }
+                memcpy(owner_name, expr->as.call.callee, owner_len);
+                owner_name[owner_len] = '\0';
+                owner_binding = lookup_binding(ctx, owner_name);
+                if (owner_binding) {
+                    HirFunction* method = 0;
+                    owner_type = owner_binding->type;
+                    method = find_method(ctx->program, owner_type, member_name, 0);
+                    if (method) {
+                        int i = 0;
+                        if (expr->as.call.args.count + 1 != method->params.count) {
+                            free(owner_name);
+                            fail(ctx, "call argument count mismatch");
+                            return 0;
+                        }
+                        out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
+                        out->as.call.callee = method;
+                        expr_list_push(&out->as.call.args, make_binding_expr(owner_binding, expr->line));
+                        for (i = 0; i < expr->as.call.args.count; ++i) {
+                            HirExpr* arg = lower_expr(ctx, expr->as.call.args.items[i]);
+                            if (!arg) {
+                                free(owner_name);
+                                return 0;
+                            }
+                            if (!type_equals(arg->type, method->params.items[i + 1]->type)) {
+                                free(owner_name);
+                                fail(ctx, "call argument type mismatch");
+                                return 0;
+                            }
+                            expr_list_push(&out->as.call.args, arg);
+                        }
+                        free(owner_name);
+                        return out;
+                    }
+                    if (find_method(ctx->program, owner_type, member_name, 1)) {
+                        free(owner_name);
+                        fail(ctx, "static method called through instance");
+                        return 0;
+                    }
+                } else {
+                    HirType* named_type = find_named_owner_type(ctx->program, owner_name);
+                    if (named_type) {
+                        HirFunction* method = find_method(ctx->program, named_type, member_name, 1);
+                        if (method) {
+                            free(owner_name);
+                            out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
+                            out->as.call.callee = method;
+                            if (!lower_call_args(ctx, &expr->as.call.args, &out->as.call.args, method)) {
+                                return 0;
+                            }
+                            return out;
+                        }
+                        if (find_method(ctx->program, named_type, member_name, 0)) {
+                            free(owner_name);
+                            fail(ctx, "instance method called through type");
+                            return 0;
+                        }
+                        if (named_type->kind == HIR_TYPE_UNION) {
+                            HirUnionVariant* variant = find_union_variant(named_type->union_decl, member_name);
+                            if (variant) {
+                                out = new_expr(HIR_EXPR_VARIANT, named_type, expr->line);
+                                out->as.variant.variant = variant;
+                                if (variant->payload_type->kind == HIR_TYPE_VOID) {
+                                    if (expr->as.call.args.count != 0) {
+                                        free(owner_name);
+                                        fail(ctx, "void variant does not accept a payload");
+                                        return 0;
+                                    }
+                                } else {
+                                    if (expr->as.call.args.count != 1) {
+                                        free(owner_name);
+                                        fail(ctx, "variant payload required");
+                                        return 0;
+                                    }
+                                    out->as.variant.payload = lower_expr(ctx, expr->as.call.args.items[0]);
+                                    if (!out->as.variant.payload) {
+                                        free(owner_name);
+                                        return 0;
+                                    }
+                                    if (!type_equals(out->as.variant.payload->type, variant->payload_type)) {
+                                        free(owner_name);
+                                        fail(ctx, "variant payload type mismatch");
+                                        return 0;
+                                    }
+                                }
+                                free(owner_name);
+                                return out;
+                            }
+                        }
+                    }
+                }
+                free(owner_name);
             }
             HirFunction* callee = find_function(ctx->program, expr->as.call.callee);
             if (!callee) {
@@ -1973,15 +2139,36 @@ static int register_functions(LowerContext* ctx) {
         HirFunction hir_fn;
         int param_index = 0;
         memset(&hir_fn, 0, sizeof(hir_fn));
-        if (hashmap_contains(&ctx->program->function_map, ast_fn->name)) {
+        if (!ast_fn->method_flag && hashmap_contains(&ctx->program->function_map, ast_fn->name)) {
             return fail(ctx, "duplicate function");
         }
-        if (hashmap_contains(&ctx->program->type_name_map, ast_fn->name)) {
+        if (!ast_fn->method_flag && hashmap_contains(&ctx->program->type_name_map, ast_fn->name)) {
             return fail(ctx, "type and function name conflict");
         }
         hir_fn.return_type = lower_type(ctx, &ast_fn->return_type);
         hir_fn.name = ast_fn->name;
         hir_fn.line = ast_fn->line;
+        hir_fn.method_flag = ast_fn->method_flag;
+        hir_fn.static_method_flag = ast_fn->static_method_flag;
+        if (ast_fn->method_flag) {
+            hir_fn.method_name = ast_fn->name;
+            hir_fn.receiver_type = find_named_owner_type(ctx->program, ast_fn->owner_type_name);
+            if (!hir_fn.receiver_type) {
+                return fail(ctx, "unknown named type");
+            }
+            if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
+                find_struct_field(hir_fn.receiver_type->struct_decl, ast_fn->name, 0)) {
+                return fail(ctx, "struct field and method name conflict");
+            }
+            hir_fn.name = make_method_name(ast_fn->owner_type_name, ast_fn->name, ast_fn->static_method_flag);
+            if (hashmap_contains(&ctx->program->function_map, hir_fn.name)) {
+                return fail(ctx, "duplicate function");
+            }
+            if (!ast_fn->static_method_flag) {
+                HirBinding* self_binding = new_binding(hir_fn.receiver_type, "self", HIR_BINDING_PARAM, ast_fn->line);
+                binding_list_push(&hir_fn.params, self_binding);
+            }
+        }
         for (param_index = 0; param_index < ast_fn->params.count; ++param_index) {
             HirBinding* param_binding = new_binding(lower_type(ctx, &ast_fn->params.items[param_index].type), ast_fn->params.items[param_index].name, HIR_BINDING_PARAM, ast_fn->params.items[param_index].line);
             binding_list_push(&hir_fn.params, param_binding);

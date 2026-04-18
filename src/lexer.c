@@ -83,6 +83,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 6 && strncmp(lexer->start, "struct", 6) == 0) {
         return make_token(lexer, TOKEN_KW_STRUCT, lexer->start, length);
     }
+    if (length == 6 && strncmp(lexer->start, "static", 6) == 0) {
+        return make_token(lexer, TOKEN_KW_STATIC, lexer->start, length);
+    }
     if (length == 6 && strncmp(lexer->start, "switch", 6) == 0) {
         return make_token(lexer, TOKEN_KW_SWITCH, lexer->start, length);
     }
