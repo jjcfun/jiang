@@ -221,6 +221,9 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const A
             break;
         case AST_EXPR_NULL:
             break;
+        case AST_EXPR_SIZE_OF:
+            out->as.size_of_type = clone_type(source, prefix, &expr->as.size_of_type);
+            break;
         case AST_EXPR_STRING:
             out->as.string_lit.text = dup_text(expr->as.string_lit.text);
             out->as.string_lit.length = expr->as.string_lit.length;

@@ -219,6 +219,55 @@ static int type_equals(HirType* left, HirType* right) {
     return 1;
 }
 
+static int64_t type_size_bytes(HirType* type) {
+    int i = 0;
+    int64_t size = 0;
+    if (!type) {
+        return 0;
+    }
+    switch (type->kind) {
+        case HIR_TYPE_INT:
+            return 8;
+        case HIR_TYPE_UINT8:
+            return 1;
+        case HIR_TYPE_BOOL:
+            return 1;
+        case HIR_TYPE_VOID:
+            return 0;
+        case HIR_TYPE_POINTER:
+            return 8;
+        case HIR_TYPE_SLICE:
+            return 16;
+        case HIR_TYPE_ARRAY:
+            return (int64_t)type->array_length * type_size_bytes(type->array_item);
+        case HIR_TYPE_OPTIONAL:
+            return 1 + type_size_bytes(type->array_item);
+        case HIR_TYPE_TUPLE:
+            for (i = 0; i < type->tuple_items.count; ++i) {
+                size += type_size_bytes(type->tuple_items.items[i]);
+            }
+            return size;
+        case HIR_TYPE_STRUCT:
+            for (i = 0; i < type->struct_decl->fields.count; ++i) {
+                size += type_size_bytes(type->struct_decl->fields.items[i].type);
+            }
+            return size;
+        case HIR_TYPE_ENUM:
+            return 8;
+        case HIR_TYPE_UNION: {
+            int64_t payload_size = 0;
+            for (i = 0; i < type->union_decl->variants.count; ++i) {
+                int64_t variant_size = type_size_bytes(type->union_decl->variants.items[i].payload_type);
+                if (variant_size > payload_size) {
+                    payload_size = variant_size;
+                }
+            }
+            return 8 + payload_size;
+        }
+    }
+    return 0;
+}
+
 static HirType* lower_type(LowerContext* ctx, const AstType* type) {
     int i = 0;
     switch (type->kind) {
@@ -1142,6 +1191,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 return 0;
             }
             return new_expr(HIR_EXPR_NULL, expected_type, expr->line);
+        case AST_EXPR_SIZE_OF: {
+            HirType* type = lower_type(ctx, &expr->as.size_of_type);
+            if (!type) {
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+            out->as.int_value = type_size_bytes(type);
+            return out;
+        }
         case AST_EXPR_STRING: {
             HirType* array_type = 0;
             int i = 0;
@@ -1768,10 +1826,17 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         }
         case AST_EXPR_ARRAY: {
             HirType* array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
+            HirType* array_item_expected = 0;
             out = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
             array_type->array_length = expr->as.array.items.count;
+            if (expected_type && expected_type->kind == HIR_TYPE_ARRAY) {
+                array_item_expected = expected_type->array_item;
+                array_type->array_item = array_item_expected;
+            }
             for (i = 0; i < expr->as.array.items.count; ++i) {
-                HirExpr* item = lower_expr(ctx, expr->as.array.items.items[i]);
+                HirExpr* item = array_item_expected
+                                    ? lower_expr_expected(ctx, expr->as.array.items.items[i], array_item_expected)
+                                    : lower_expr(ctx, expr->as.array.items.items[i]);
                 if (!item) {
                     return 0;
                 }

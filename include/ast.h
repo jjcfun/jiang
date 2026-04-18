@@ -91,6 +91,7 @@ typedef enum AstExprKind {
     AST_EXPR_BOOL,
     AST_EXPR_STRING,
     AST_EXPR_NULL,
+    AST_EXPR_SIZE_OF,
     AST_EXPR_NAME,
     AST_EXPR_ADDR,
     AST_EXPR_DEREF,
@@ -166,6 +167,7 @@ struct AstExpr {
             char* text;
             int length;
         } string_lit;
+        AstType size_of_type;
         char* name;
         struct {
             AstExpr* value;

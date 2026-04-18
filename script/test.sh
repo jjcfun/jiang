@@ -116,6 +116,8 @@ run_sample optional_chain_index_minimal.jiang 40
 run_sample optional_chain_nested_pure_base_minimal.jiang 42
 run_sample optional_some_pattern_minimal.jiang 42
 run_sample optional_switch_pattern_minimal.jiang 42
+run_sample optional_nested_array_minimal.jiang 42
+run_sample size_of_minimal.jiang 8
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
@@ -233,6 +235,9 @@ run_compile_fail invalid_optional_chain_impure_member_base.jiang
 run_compile_fail invalid_optional_pattern_label.jiang
 run_compile_fail invalid_optional_pattern_non_optional.jiang
 run_compile_fail invalid_optional_switch_non_exhaustive.jiang
+run_compile_fail invalid_optional_coalesce_fallback_type.jiang
+run_compile_fail invalid_optional_compare_non_null.jiang
+run_compile_fail invalid_struct_init_self_escape.jiang
 run_compile_fail invalid_call_arg.jiang
 run_compile_fail invalid_global_initializer_type.jiang
 run_compile_fail invalid_infer_array_length_missing_init.jiang

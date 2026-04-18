@@ -848,6 +848,20 @@ static AstExpr* parse_primary(Parser* parser) {
     }
 
     if (token.kind == TOKEN_IDENT) {
+        if (token_equals(&token, "size_of") && parser->next.kind == TOKEN_LEFT_PAREN) {
+            AstType type;
+            expr = new_expr(AST_EXPR_SIZE_OF, token.line);
+            advance(parser);
+            if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after size_of")) {
+                return 0;
+            }
+            type = parse_type(parser);
+            expr->as.size_of_type = type;
+            if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after size_of type")) {
+                return 0;
+            }
+            return expr;
+        }
         if (parser->next.kind == TOKEN_DOT &&
             (is_known_type(parser, &token) || is_type_like_ident(&token)) &&
             !looks_like_qualified_init_call(parser) &&
