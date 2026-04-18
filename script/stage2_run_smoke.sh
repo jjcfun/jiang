@@ -101,6 +101,16 @@ if [[ $STATUS -ne 42 ]]; then
     exit 1
 fi
 
+compile_stage2_entry "compiler/tests/samples/size_of_minimal.jiang" "size_of_minimal"
+set +e
+"$OUT_DIR/size_of_minimal"
+STATUS=$?
+set -e
+if [[ $STATUS -ne 8 ]]; then
+    echo "stage2 run smoke expected size_of_minimal exit code 8, got $STATUS" >&2
+    exit 1
+fi
+
 compile_stage2_entry "compiler/tests/samples/multi_file_minimal.jiang" "multi_file_minimal"
 set +e
 "$OUT_DIR/multi_file_minimal"
