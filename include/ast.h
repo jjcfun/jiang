@@ -46,6 +46,7 @@ typedef enum AstExprKind {
     AST_EXPR_BOOL,
     AST_EXPR_NAME,
     AST_EXPR_BINARY,
+    AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
     AST_EXPR_FIELD,
@@ -98,6 +99,11 @@ struct AstExpr {
             AstExpr* left;
             AstExpr* right;
         } binary;
+        struct {
+            AstExpr* cond;
+            AstExpr* then_expr;
+            AstExpr* else_expr;
+        } ternary;
         struct {
             char* callee;
             AstExprList args;
@@ -201,7 +207,7 @@ struct AstStmt {
             AstExpr* init;
         } var_decl;
         struct {
-            char* name;
+            AstExpr* target;
             AstExpr* value;
         } assign;
         struct {

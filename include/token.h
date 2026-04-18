@@ -31,6 +31,7 @@ typedef enum TokenKind {
     TOKEN_RIGHT_BRACKET,
     TOKEN_COMMA,
     TOKEN_COLON,
+    TOKEN_QUESTION,
     TOKEN_SEMICOLON,
     TOKEN_ASSIGN,
     TOKEN_PLUS,

@@ -71,7 +71,10 @@ run_sample if_minimal.jiang 2
 run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
 run_sample binary_ops_minimal.jiang 1
+run_sample bool_minimal.jiang 1
+run_sample break_continue_minimal.jiang 8
 run_sample for_range_minimal.jiang 8
+run_sample for_infer_range_minimal.jiang 5
 run_sample infer_global_minimal.jiang 42
 run_sample infer_local_minimal.jiang 42
 run_sample infer_mutable_local_minimal.jiang 42
@@ -81,6 +84,7 @@ run_sample enum_shorthand_arg_minimal.jiang 42
 run_sample enum_value_minimal.jiang 42
 run_sample enum_switch_shorthand_minimal.jiang 42
 run_sample switch_enum_minimal.jiang 42
+run_sample ternary_enum_minimal.jiang 42
 run_sample assert_minimal.jiang 42
 run_sample print_minimal.jiang 42
 run_sample tuple_value_minimal.jiang 42
@@ -95,8 +99,15 @@ run_sample unary_tuple_local_decl_minimal.jiang 42
 run_sample unary_tuple_infer_local_decl_minimal.jiang 42
 run_sample unary_tuple_global_decl_minimal.jiang 42
 run_sample unary_tuple_return_minimal.jiang 42
+run_sample array_minimal.jiang 42
+run_sample array_assign_minimal.jiang 10
+run_sample infer_array_length_minimal.jiang 42
 run_sample empty_tuple_return_minimal.jiang 0
 run_sample empty_tuple_bare_return_minimal.jiang 0
+run_sample for_item_array_minimal.jiang 42
+run_sample for_mutable_binding_minimal.jiang 42
+run_sample for_indexed_minimal.jiang 40
+run_sample for_indexed_typed_minimal.jiang 40
 run_sample for_tuple_binding_minimal.jiang 42
 run_sample for_tuple_binding_typed_minimal.jiang 42
 run_sample for_indexed_tuple_binding_minimal.jiang 42
@@ -107,6 +118,7 @@ run_sample union_tuple_if_shorthand_pattern_minimal.jiang 42
 run_sample union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
 run_sample union_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
+run_sample union_implicit_tag_minimal.jiang 42
 run_sample union_bind_minimal.jiang 42
 run_sample union_if_pattern_minimal.jiang 42
 run_sample union_if_mutable_binding_minimal.jiang 42
@@ -115,17 +127,30 @@ run_sample union_switch_mutable_binding_minimal.jiang 42
 run_sample union_switch_shorthand_pattern_minimal.jiang 42
 run_compile_fail invalid_tuple_index_non_literal.jiang
 run_compile_fail invalid_tuple_index_out_of_range.jiang
+run_compile_fail invalid_array_length.jiang
+run_compile_fail invalid_array_assign_length.jiang
+run_compile_fail invalid_array_arg_length.jiang
+run_compile_fail invalid_array_return_length.jiang
+run_compile_fail invalid_infer_array_length_missing_init.jiang
 run_compile_fail invalid_tuple_destructure_arity.jiang
 run_compile_fail invalid_tuple_destructure_rhs.jiang
 run_compile_fail invalid_empty_tuple_return_non_void.jiang
+run_compile_fail invalid_for_iterable_target.jiang
+run_compile_fail invalid_for_loop_var_type.jiang
+run_compile_fail invalid_for_indexed_arity.jiang
+run_compile_fail invalid_for_indexed_nested_index_binding.jiang
 run_compile_fail invalid_for_tuple_binding_non_tuple.jiang
 run_compile_fail invalid_for_tuple_binding_arity.jiang
 run_compile_fail invalid_switch_case_type.jiang
+run_compile_fail invalid_switch_duplicate_case.jiang
+run_compile_fail invalid_switch_non_exhaustive_enum.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang
+run_compile_fail invalid_enum_value_type.jiang
 run_compile_fail invalid_union_bind_void.jiang
 run_compile_fail invalid_union_ctor_arg.jiang
 run_compile_fail invalid_union_pattern_ne_bind.jiang
+run_compile_fail invalid_union_switch_non_exhaustive.jiang
 run_compile_fail invalid_union_tuple_bind_non_tuple.jiang
 run_compile_fail invalid_union_tuple_bind_arity.jiang
 run_sample_nonzero panic_minimal.jiang

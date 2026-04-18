@@ -138,14 +138,20 @@ static AstType apply_type_suffixes(Parser* parser, AstType type) {
     while (parser->current.kind == TOKEN_LEFT_BRACKET) {
         AstType element = type;
         advance(parser);
-        if (parser->current.kind != TOKEN_INT_LIT) {
+        if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
+            type.kind = AST_TYPE_ARRAY;
+            type.array_item = heap_type_copy(&element);
+            type.array_length = -1;
+            advance(parser);
+        } else if (parser->current.kind != TOKEN_INT_LIT) {
             fail(parser, "expected integer array length");
             return type;
+        } else {
+            type.kind = AST_TYPE_ARRAY;
+            type.array_item = heap_type_copy(&element);
+            type.array_length = (int)strtol(parser->current.start, 0, 10);
+            advance(parser);
         }
-        type.kind = AST_TYPE_ARRAY;
-        type.array_item = heap_type_copy(&element);
-        type.array_length = (int)strtol(parser->current.start, 0, 10);
-        advance(parser);
         if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after array length")) {
             return type;
         }
@@ -687,7 +693,28 @@ static AstExpr* parse_equality(Parser* parser) {
 }
 
 static AstExpr* parse_expr(Parser* parser) {
-    return parse_equality(parser);
+    AstExpr* expr = parse_equality(parser);
+    if (!expr) {
+        return 0;
+    }
+    if (parser->current.kind == TOKEN_QUESTION) {
+        AstExpr* ternary = new_expr(AST_EXPR_TERNARY, expr->line);
+        advance(parser);
+        ternary->as.ternary.cond = expr;
+        ternary->as.ternary.then_expr = parse_expr(parser);
+        if (!ternary->as.ternary.then_expr) {
+            return 0;
+        }
+        if (!expect(parser, TOKEN_COLON, "expected ':' in ternary expression")) {
+            return 0;
+        }
+        ternary->as.ternary.else_expr = parse_expr(parser);
+        if (!ternary->as.ternary.else_expr) {
+            return 0;
+        }
+        return ternary;
+    }
+    return expr;
 }
 
 static int parse_block(Parser* parser, AstBlock* out_block);
@@ -870,6 +897,95 @@ static AstStmt* parse_stmt(Parser* parser) {
             }
             return stmt;
         }
+        if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
+            stmt->kind = AST_STMT_FOR_EACH;
+            stmt->as.for_each.pattern = parse_binding_pattern(parser);
+            if (!stmt->as.for_each.pattern) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_KW_IN, "expected 'in' in for-each")) {
+                return 0;
+            }
+            stmt->as.for_each.iterable = parse_expr(parser);
+            if (!stmt->as.for_each.iterable) {
+                return 0;
+            }
+            if (parser->current.kind == TOKEN_DOT) {
+                advance(parser);
+                if (parser->current.kind != TOKEN_IDENT || !token_equals(&parser->current, "indexed")) {
+                    fail(parser, "expected 'indexed' after '.'");
+                    return 0;
+                }
+                advance(parser);
+                if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after indexed")) {
+                    return 0;
+                }
+                if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after indexed()")) {
+                    return 0;
+                }
+                stmt->as.for_each.indexed_flag = 1;
+            }
+            if (!parse_block(parser, &stmt->as.for_each.body)) {
+                return 0;
+            }
+            return stmt;
+        }
+        if (parser->current.kind == TOKEN_IDENT && !is_known_type(parser, &parser->current) && parser->next.kind == TOKEN_KW_IN) {
+            stmt->as.for_range.type.kind = AST_TYPE_INFER;
+            stmt->as.for_range.name = token_dup(&parser->current);
+            advance(parser);
+            if (!expect(parser, TOKEN_KW_IN, "expected 'in' in for range")) {
+                return 0;
+            }
+            stmt->as.for_range.start = parse_expr(parser);
+            if (!stmt->as.for_range.start) {
+                return 0;
+            }
+            if (parser->current.kind == TOKEN_DOT) {
+                advance(parser);
+                if (parser->current.kind != TOKEN_IDENT || !token_equals(&parser->current, "indexed")) {
+                    fail(parser, "expected 'indexed' after '.'");
+                    return 0;
+                }
+                advance(parser);
+                if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after indexed")) {
+                    return 0;
+                }
+                if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after indexed()")) {
+                    return 0;
+                }
+                stmt->kind = AST_STMT_FOR_EACH;
+                stmt->as.for_each.indexed_flag = 1;
+                stmt->as.for_each.pattern = new_binding_pattern(AST_BINDING_NAME, stmt->line);
+                stmt->as.for_each.pattern->type.kind = AST_TYPE_INFER;
+                stmt->as.for_each.pattern->name = stmt->as.for_range.name;
+                stmt->as.for_each.iterable = stmt->as.for_range.start;
+                if (!parse_block(parser, &stmt->as.for_each.body)) {
+                    return 0;
+                }
+                return stmt;
+            }
+            if (parser->current.kind != TOKEN_DOT_DOT) {
+                stmt->kind = AST_STMT_FOR_EACH;
+                stmt->as.for_each.pattern = new_binding_pattern(AST_BINDING_NAME, stmt->line);
+                stmt->as.for_each.pattern->type.kind = AST_TYPE_INFER;
+                stmt->as.for_each.pattern->name = stmt->as.for_range.name;
+                stmt->as.for_each.iterable = stmt->as.for_range.start;
+                if (!parse_block(parser, &stmt->as.for_each.body)) {
+                    return 0;
+                }
+                return stmt;
+            }
+            advance(parser);
+            stmt->as.for_range.end = parse_expr(parser);
+            if (!stmt->as.for_range.end) {
+                return 0;
+            }
+            if (!parse_block(parser, &stmt->as.for_range.body)) {
+                return 0;
+            }
+            return stmt;
+        }
         if (!is_type_start(parser)) {
             fail(parser, "expected loop variable type after for");
             return 0;
@@ -943,7 +1059,8 @@ static AstStmt* parse_stmt(Parser* parser) {
 
     if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_ASSIGN) {
         stmt = new_stmt(AST_STMT_ASSIGN, parser->current.line);
-        stmt->as.assign.name = token_dup(&parser->current);
+        stmt->as.assign.target = new_expr(AST_EXPR_NAME, parser->current.line);
+        stmt->as.assign.target->as.name = token_dup(&parser->current);
         advance(parser);
         advance(parser);
         stmt->as.assign.value = parse_expr(parser);
@@ -951,6 +1068,31 @@ static AstStmt* parse_stmt(Parser* parser) {
             return 0;
         }
         if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after assignment")) {
+            return 0;
+        }
+        return stmt;
+    }
+    if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_LEFT_BRACKET) {
+        AstExpr* target = parse_expr(parser);
+        if (!target) {
+            return 0;
+        }
+        if (parser->current.kind == TOKEN_ASSIGN) {
+            stmt = new_stmt(AST_STMT_ASSIGN, target->line);
+            stmt->as.assign.target = target;
+            advance(parser);
+            stmt->as.assign.value = parse_expr(parser);
+            if (!stmt->as.assign.value) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after assignment")) {
+                return 0;
+            }
+            return stmt;
+        }
+        stmt = new_stmt(AST_STMT_EXPR, target->line);
+        stmt->as.expr_stmt.expr = target;
+        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after expression")) {
             return 0;
         }
         return stmt;
@@ -1068,16 +1210,16 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
     AstUnionDecl union_decl;
     memset(&union_decl, 0, sizeof(union_decl));
     advance(parser);
-    if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after union")) {
-        return 0;
-    }
-    if (parser->current.kind != TOKEN_IDENT) {
-        return fail(parser, "expected union tag enum name");
-    }
-    union_decl.tag_name = token_dup(&parser->current);
-    advance(parser);
-    if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after union tag enum")) {
-        return 0;
+    if (parser->current.kind == TOKEN_LEFT_PAREN) {
+        advance(parser);
+        if (parser->current.kind != TOKEN_IDENT) {
+            return fail(parser, "expected union tag enum name");
+        }
+        union_decl.tag_name = token_dup(&parser->current);
+        advance(parser);
+        if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after union tag enum")) {
+            return 0;
+        }
     }
     if (parser->current.kind != TOKEN_IDENT) {
         return fail(parser, "expected union name");

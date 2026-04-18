@@ -142,6 +142,8 @@ Token lexer_next(Lexer* lexer) {
             return make_token(lexer, TOKEN_COMMA, lexer->start, 1);
         case ':':
             return make_token(lexer, TOKEN_COLON, lexer->start, 1);
+        case '?':
+            return make_token(lexer, TOKEN_QUESTION, lexer->start, 1);
         case ';':
             return make_token(lexer, TOKEN_SEMICOLON, lexer->start, 1);
         case '+':

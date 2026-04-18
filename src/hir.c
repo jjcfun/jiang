@@ -204,6 +204,20 @@ static HirExpr* make_int_expr(LowerContext* ctx, int value, int line) {
     return expr;
 }
 
+static int apply_array_length_inference(HirType* declared, HirType* actual) {
+    if (!declared || !actual) {
+        return 0;
+    }
+    if (declared->kind == HIR_TYPE_ARRAY && actual->kind == HIR_TYPE_ARRAY && declared->array_length < 0) {
+        if (!type_equals(declared->array_item, actual->array_item)) {
+            return 0;
+        }
+        declared->array_length = actual->array_length;
+        return 1;
+    }
+    return 0;
+}
+
 static int fail(LowerContext* ctx, const char* error) {
     ctx->error = error;
     return 0;
@@ -361,6 +375,7 @@ static void pop_scope(LowerContext* ctx) {
 
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
 static HirExpr* make_union_tag_expr(LowerContext* ctx, HirExpr* value, int line);
+static HirExpr* make_union_field_expr(LowerContext* ctx, HirExpr* value, HirUnionVariant* variant, int field_index, HirType* type, int line);
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out);
 static int lower_pattern_bind(LowerContext* ctx, const AstBindingPattern* pattern, HirExpr* init, HirBlock* out_block);
 
@@ -464,6 +479,35 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
             out->as.binding = binding;
             return out;
         }
+        case AST_EXPR_TERNARY: {
+            HirExpr* cond = lower_expr(ctx, expr->as.ternary.cond);
+            HirExpr* then_expr = 0;
+            HirExpr* else_expr = 0;
+            if (!cond) {
+                return 0;
+            }
+            if (cond->type->kind != HIR_TYPE_BOOL) {
+                fail(ctx, "ternary condition must be Bool");
+                return 0;
+            }
+            then_expr = lower_expr(ctx, expr->as.ternary.then_expr);
+            if (!then_expr) {
+                return 0;
+            }
+            else_expr = lower_expr(ctx, expr->as.ternary.else_expr);
+            if (!else_expr) {
+                return 0;
+            }
+            if (!type_equals(then_expr->type, else_expr->type)) {
+                fail(ctx, "ternary branch type mismatch");
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_TERNARY, then_expr->type, expr->line);
+            out->as.ternary.cond = cond;
+            out->as.ternary.then_expr = then_expr;
+            out->as.ternary.else_expr = else_expr;
+            return out;
+        }
         case AST_EXPR_CALL: {
             HirBuiltinKind builtin = builtin_kind(expr->as.call.callee);
             if (builtin != HIR_BUILTIN_NONE) {
@@ -504,6 +548,9 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
                 if (!variant) {
                     return 0;
                 }
+            if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0) {
+                return make_int_expr(ctx, variant->tag_value, expr->line);
+            }
             if (expr->as.variant.pattern_flag) {
                 fail(ctx, "variant pattern is not a value expression");
                 return 0;
@@ -547,6 +594,13 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
             if (base->type->kind == HIR_TYPE_UNION && strcmp(expr->as.field.name, "tag") == 0) {
                 out = make_union_tag_expr(ctx, base, expr->line);
                 return out;
+            }
+            if (base->type->kind == HIR_TYPE_UNION) {
+                HirUnionVariant* variant = find_union_variant(base->type->union_decl, expr->as.field.name);
+                if (variant && variant->payload_type->kind != HIR_TYPE_VOID && variant->payload_type->kind != HIR_TYPE_TUPLE) {
+                    out = make_union_field_expr(ctx, base, variant, 0, variant->payload_type, expr->line);
+                    return out;
+                }
             }
             fail(ctx, "unknown field");
             return 0;
@@ -702,7 +756,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 type = init->type;
             } else {
                 type = lower_type(ctx, &stmt->as.var_decl.type);
-                if (!type_equals(init->type, type)) {
+                if (!type_equals(init->type, type) && !apply_array_length_inference(type, init->type)) {
                     fail(ctx, "variable initializer type mismatch");
                     return 0;
                 }
@@ -717,17 +771,21 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             return out;
         }
         case AST_STMT_ASSIGN: {
-            HirBinding* binding = lookup_binding(ctx, stmt->as.assign.name);
-            if (!binding) {
+            out->as.assign.target = lower_expr(ctx, stmt->as.assign.target);
+            if (!out->as.assign.target) {
+                return 0;
+            }
+            if (out->as.assign.target->kind == HIR_EXPR_BINDING) {
+                out->as.assign.binding = out->as.assign.target->as.binding;
+            } else if (out->as.assign.target->kind != HIR_EXPR_INDEX || out->as.assign.target->as.index.base->type->kind != HIR_TYPE_ARRAY) {
                 fail(ctx, "assignment target not found");
                 return 0;
             }
-            out->as.assign.binding = binding;
             out->as.assign.value = lower_expr(ctx, stmt->as.assign.value);
             if (!out->as.assign.value) {
                 return 0;
             }
-            if (!type_equals(out->as.assign.value->type, binding->type)) {
+            if (!type_equals(out->as.assign.value->type, out->as.assign.target->type)) {
                 fail(ctx, "assignment type mismatch");
                 return 0;
             }
@@ -803,11 +861,9 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             HirBinding* binding = 0;
             HirExpr* start = lower_expr(ctx, stmt->as.for_range.start);
             HirExpr* end = 0;
-            HirType* type = lower_type(ctx, &stmt->as.for_range.type);
-            if (stmt->as.for_range.type.kind == AST_TYPE_INFER) {
-                fail(ctx, "for-range variable type cannot be inferred");
-                return 0;
-            }
+            HirType* type = stmt->as.for_range.type.kind == AST_TYPE_INFER
+                ? primitive_type(ctx->program, HIR_TYPE_INT)
+                : lower_type(ctx, &stmt->as.for_range.type);
             if (!start) {
                 return 0;
             }
@@ -996,6 +1052,128 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
     return lower_pattern_bind(ctx, pattern->as.variant.bindings.items[0], make_union_field_expr(ctx, value, variant, 0, variant->payload_type, pattern->line), out_block);
 }
 
+static int validate_switch_cases(LowerContext* ctx, HirExpr* value, const AstStmt* stmt) {
+    int i = 0;
+    int have_else = 0;
+    if (value->type->kind == HIR_TYPE_ENUM) {
+        int member_count = value->type->enum_decl->members.count;
+        int* seen = (int*)calloc((size_t)member_count, sizeof(int));
+        int seen_count = 0;
+        if (!seen) {
+            return fail(ctx, "out of memory");
+        }
+        for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
+            const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    free(seen);
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            {
+                HirExpr* case_value = lower_expr(ctx, ast_case->pattern);
+                int j = 0;
+                if (!case_value) {
+                    free(seen);
+                    return 0;
+                }
+                if (!type_equals(value->type, case_value->type)) {
+                    free(seen);
+                    return fail(ctx, "switch case type mismatch");
+                }
+                if (case_value->kind == HIR_EXPR_ENUM_MEMBER) {
+                    for (j = 0; j < member_count; ++j) {
+                        if (&value->type->enum_decl->members.items[j] == case_value->as.enum_member.member) {
+                            if (seen[j]) {
+                                free(seen);
+                                return fail(ctx, "duplicate switch case");
+                            }
+                            seen[j] = 1;
+                            seen_count += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!have_else && seen_count < member_count) {
+            free(seen);
+            return fail(ctx, "non-exhaustive enum switch");
+        }
+        free(seen);
+        return 1;
+    }
+    if (value->type->kind == HIR_TYPE_UNION) {
+        int variant_count = value->type->union_decl->variants.count;
+        int* seen = (int*)calloc((size_t)variant_count, sizeof(int));
+        int seen_count = 0;
+        if (!seen) {
+            return fail(ctx, "out of memory");
+        }
+        for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
+            const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    free(seen);
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            if (ast_case->pattern->kind != AST_EXPR_VARIANT) {
+                free(seen);
+                return fail(ctx, "switch case type mismatch");
+            }
+            {
+                HirUnionDecl* union_decl = 0;
+                HirUnionVariant* variant = resolve_variant_expr(ctx, ast_case->pattern, &union_decl);
+                if (!variant) {
+                    free(seen);
+                    return 0;
+                }
+                if (union_decl != value->type->union_decl) {
+                    free(seen);
+                    return fail(ctx, "switch case type mismatch");
+                }
+                if (seen[variant->tag_value]) {
+                    free(seen);
+                    return fail(ctx, "duplicate switch case");
+                }
+                seen[variant->tag_value] = 1;
+                seen_count += 1;
+            }
+        }
+        if (!have_else && seen_count < variant_count) {
+            free(seen);
+            return fail(ctx, "non-exhaustive union switch");
+        }
+        free(seen);
+        return 1;
+    }
+    for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
+        const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
+        if (ast_case->is_else) {
+            if (have_else) {
+                return fail(ctx, "duplicate else case");
+            }
+            have_else = 1;
+            continue;
+        }
+        {
+            HirExpr* case_value = lower_expr(ctx, ast_case->pattern);
+            if (!case_value) {
+                return 0;
+            }
+            if (!type_equals(value->type, case_value->type)) {
+                return fail(ctx, "switch case type mismatch");
+            }
+        }
+    }
+    return 1;
+}
+
 static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block) {
     HirExpr* value = lower_expr(ctx, stmt->as.switch_stmt.value);
     int i = stmt->as.switch_stmt.cases.count - 1;
@@ -1003,6 +1181,9 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
     int have_else = 0;
     memset(&else_block, 0, sizeof(else_block));
     if (!value) {
+        return 0;
+    }
+    if (!validate_switch_cases(ctx, value, stmt)) {
         return 0;
     }
     for (; i >= 0; --i) {
@@ -1258,7 +1439,7 @@ static int register_unions(LowerContext* ctx) {
         const AstUnionDecl* ast_union = &ctx->ast->unions.items[i];
         int j = 0;
         memset(&union_decl, 0, sizeof(union_decl));
-        if (!hashmap_contains(&ctx->program->type_name_map, ast_union->tag_name)) {
+        if (ast_union->tag_name && !hashmap_contains(&ctx->program->type_name_map, ast_union->tag_name)) {
             return fail(ctx, "unknown union tag enum");
         }
         if (hashmap_contains(&ctx->program->union_name_map, ast_union->name) || hashmap_contains(&ctx->program->type_name_map, ast_union->name)) {
@@ -1333,7 +1514,8 @@ static int lower_globals(LowerContext* ctx) {
         }
         if (ctx->ast->globals.items[i].type.kind == AST_TYPE_INFER) {
             hir_global->binding->type = hir_global->init->type;
-        } else if (!type_equals(hir_global->init->type, hir_global->binding->type)) {
+        } else if (!type_equals(hir_global->init->type, hir_global->binding->type) &&
+                   !apply_array_length_inference(hir_global->binding->type, hir_global->init->type)) {
             return fail(ctx, "global initializer type mismatch");
         }
     }

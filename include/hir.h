@@ -64,6 +64,7 @@ typedef enum HirExprKind {
     HIR_EXPR_BOOL,
     HIR_EXPR_BINDING,
     HIR_EXPR_BINARY,
+    HIR_EXPR_TERNARY,
     HIR_EXPR_CALL,
     HIR_EXPR_ENUM_MEMBER,
     HIR_EXPR_VARIANT,
@@ -114,6 +115,11 @@ struct HirExpr {
             HirExpr* left;
             HirExpr* right;
         } binary;
+        struct {
+            HirExpr* cond;
+            HirExpr* then_expr;
+            HirExpr* else_expr;
+        } ternary;
         struct {
             HirFunction* callee;
             HirBuiltinKind builtin;
@@ -185,6 +191,7 @@ struct HirStmt {
         } var_decl;
         struct {
             HirBinding* binding;
+            HirExpr* target;
             HirExpr* value;
         } assign;
         struct {

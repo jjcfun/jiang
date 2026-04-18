@@ -409,6 +409,33 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case HIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
             }
         }
+        case HIR_EXPR_TERNARY: {
+            LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.then");
+            LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.else");
+            LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.end");
+            LLVMValueRef then_value = 0;
+            LLVMValueRef else_value = 0;
+            LLVMValueRef phi = 0;
+            LLVMValueRef incoming_values[2];
+            LLVMBasicBlockRef incoming_blocks[2];
+            LLVMBuildCondBr(cg->builder, emit_expr(cg, expr->as.ternary.cond), then_block, else_block);
+            LLVMPositionBuilderAtEnd(cg->builder, then_block);
+            then_value = emit_expr(cg, expr->as.ternary.then_expr);
+            LLVMBuildBr(cg->builder, merge_block);
+            then_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, else_block);
+            else_value = emit_expr(cg, expr->as.ternary.else_expr);
+            LLVMBuildBr(cg->builder, merge_block);
+            else_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "ternarytmp");
+            incoming_values[0] = then_value;
+            incoming_values[1] = else_value;
+            incoming_blocks[0] = then_block;
+            incoming_blocks[1] = else_block;
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            return phi;
+        }
         case HIR_EXPR_ENUM_MEMBER:
             return llvm_const_expr(cg->context, expr);
         case HIR_EXPR_ENUM_VALUE:
@@ -502,10 +529,34 @@ static void emit_stmt(FunctionCodegen* cg, const JirStmt* stmt) {
             LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.var_decl.init), find_alloca(cg, stmt->as.var_decl.binding));
             return;
         case HIR_STMT_ASSIGN:
-            if (stmt->as.assign.binding->kind == HIR_BINDING_GLOBAL) {
-                LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), llvm_global_for(cg->module, stmt->as.assign.binding));
+            if (stmt->as.assign.binding) {
+                if (stmt->as.assign.binding->kind == HIR_BINDING_GLOBAL) {
+                    LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), llvm_global_for(cg->module, stmt->as.assign.binding));
+                } else {
+                    LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), find_alloca(cg, stmt->as.assign.binding));
+                }
+            } else if (stmt->as.assign.target->kind == HIR_EXPR_INDEX && stmt->as.assign.target->as.index.base->kind == HIR_EXPR_BINDING) {
+                LLVMValueRef indices[2];
+                LLVMValueRef base_ptr = 0;
+                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                indices[1] = emit_expr(cg, stmt->as.assign.target->as.index.index);
+                if (stmt->as.assign.target->as.index.base->as.binding->kind == HIR_BINDING_GLOBAL) {
+                    base_ptr = llvm_global_for(cg->module, stmt->as.assign.target->as.index.base->as.binding);
+                } else {
+                    base_ptr = find_alloca(cg, stmt->as.assign.target->as.index.base->as.binding);
+                }
+                LLVMBuildStore(
+                    cg->builder,
+                    emit_expr(cg, stmt->as.assign.value),
+                    LLVMBuildInBoundsGEP2(
+                        cg->builder,
+                        llvm_type(cg->context, stmt->as.assign.target->as.index.base->type),
+                        base_ptr,
+                        indices,
+                        2,
+                        "array.assign.ptr"));
             } else {
-                LLVMBuildStore(cg->builder, emit_expr(cg, stmt->as.assign.value), find_alloca(cg, stmt->as.assign.binding));
+                return;
             }
             return;
         case HIR_STMT_IF: {
