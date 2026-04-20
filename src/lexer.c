@@ -199,6 +199,8 @@ Token lexer_next(Lexer* lexer) {
             return make_token(lexer, TOKEN_MINUS, lexer->start, 1);
         case '*':
             return make_token(lexer, TOKEN_STAR, lexer->start, 1);
+        case '%':
+            return make_token(lexer, TOKEN_PERCENT, lexer->start, 1);
         case '&':
             return make_token(lexer, TOKEN_AMP, lexer->start, 1);
         case '$':

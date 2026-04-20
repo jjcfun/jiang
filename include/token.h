@@ -50,6 +50,7 @@ typedef enum TokenKind {
     TOKEN_PLUS,
     TOKEN_MINUS,
     TOKEN_STAR,
+    TOKEN_PERCENT,
     TOKEN_AMP,
     TOKEN_DOLLAR,
     TOKEN_SLASH,

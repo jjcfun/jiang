@@ -140,6 +140,7 @@ typedef enum AstBinaryOp {
     AST_BIN_ADD = 0,
     AST_BIN_SUB,
     AST_BIN_MUL,
+    AST_BIN_MOD,
     AST_BIN_DIV,
     AST_BIN_EQ,
     AST_BIN_NE,

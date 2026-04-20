@@ -103,6 +103,7 @@ typedef enum HirBinaryOp {
     HIR_BIN_ADD = 0,
     HIR_BIN_SUB,
     HIR_BIN_MUL,
+    HIR_BIN_MOD,
     HIR_BIN_DIV,
     HIR_BIN_EQ,
     HIR_BIN_NE,

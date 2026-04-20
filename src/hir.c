@@ -2121,7 +2121,6 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
             }
             if (!callee) {
-                fprintf(stderr, "debug unknown function: %s\n", expr->as.call.callee);
                 fail(ctx, "unknown function");
                 return 0;
             }
@@ -2370,6 +2369,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             int comparison_op = expr->as.binary.op != AST_BIN_ADD &&
                                 expr->as.binary.op != AST_BIN_SUB &&
                                 expr->as.binary.op != AST_BIN_MUL &&
+                                expr->as.binary.op != AST_BIN_MOD &&
                                 expr->as.binary.op != AST_BIN_DIV;
             HirExpr* left = 0;
             HirExpr* right = 0;
@@ -2407,6 +2407,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_ADD: out->as.binary.op = HIR_BIN_ADD; break;
                 case AST_BIN_SUB: out->as.binary.op = HIR_BIN_SUB; break;
                 case AST_BIN_MUL: out->as.binary.op = HIR_BIN_MUL; break;
+                case AST_BIN_MOD: out->as.binary.op = HIR_BIN_MOD; break;
                 case AST_BIN_DIV: out->as.binary.op = HIR_BIN_DIV; break;
                 case AST_BIN_EQ: out->as.binary.op = HIR_BIN_EQ; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_NE: out->as.binary.op = HIR_BIN_NE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
@@ -2415,7 +2416,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_GT: out->as.binary.op = HIR_BIN_GT; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_GE: out->as.binary.op = HIR_BIN_GE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
             }
-            if (expr->as.binary.op == AST_BIN_ADD || expr->as.binary.op == AST_BIN_SUB || expr->as.binary.op == AST_BIN_MUL || expr->as.binary.op == AST_BIN_DIV) {
+            if (expr->as.binary.op == AST_BIN_ADD || expr->as.binary.op == AST_BIN_SUB || expr->as.binary.op == AST_BIN_MUL || expr->as.binary.op == AST_BIN_MOD || expr->as.binary.op == AST_BIN_DIV) {
                 if (left->type->kind != HIR_TYPE_INT || right->type->kind != HIR_TYPE_INT) {
                     fail(ctx, "arithmetic requires Int operands");
                     return 0;

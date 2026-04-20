@@ -1304,11 +1304,17 @@ static AstExpr* parse_postfix(Parser* parser) {
 
 static AstExpr* parse_multiplicative(Parser* parser) {
     AstExpr* expr = parse_unary(parser);
-    while (expr && (parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_SLASH)) {
+    while (expr && (parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_SLASH || parser->current.kind == TOKEN_PERCENT)) {
         AstExpr* right = 0;
         AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
         bin->as.binary.left = expr;
-        bin->as.binary.op = parser->current.kind == TOKEN_STAR ? AST_BIN_MUL : AST_BIN_DIV;
+        if (parser->current.kind == TOKEN_STAR) {
+            bin->as.binary.op = AST_BIN_MUL;
+        } else if (parser->current.kind == TOKEN_PERCENT) {
+            bin->as.binary.op = AST_BIN_MOD;
+        } else {
+            bin->as.binary.op = AST_BIN_DIV;
+        }
         advance(parser);
         right = parse_unary(parser);
         if (!right) {
@@ -1644,8 +1650,16 @@ static AstStmt* parse_stmt(Parser* parser) {
         if (parser->current.kind == TOKEN_KW_ELSE) {
             stmt->as.if_stmt.has_else = 1;
             advance(parser);
-            if (!parse_block(parser, &stmt->as.if_stmt.else_block)) {
-                return 0;
+            if (parser->current.kind == TOKEN_KW_IF) {
+                AstStmt* else_if = parse_stmt(parser);
+                if (!else_if) {
+                    return 0;
+                }
+                stmt_list_push(&stmt->as.if_stmt.else_block.stmts, else_if);
+            } else {
+                if (!parse_block(parser, &stmt->as.if_stmt.else_block)) {
+                    return 0;
+                }
             }
         }
         return stmt;

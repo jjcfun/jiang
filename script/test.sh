@@ -74,6 +74,7 @@ run_sample binary_ops_minimal.jiang 1
 run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0
 run_sample negative_int_minimal.jiang 1
+run_sample mod_minimal.jiang 2
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
 run_sample cast_addr_minimal.jiang 2
@@ -130,6 +131,7 @@ run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
 run_sample hash_map_minimal.jiang 20
+run_sample hash_map_collision_minimal.jiang 30
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
@@ -150,6 +152,7 @@ run_sample struct_init_optional_omitted_minimal.jiang 1
 run_sample struct_new_constructor_minimal.jiang 42
 run_sample struct_new_literal_with_init_minimal.jiang 42
 run_sample deinit_minimal.jiang 42
+run_sample else_if_minimal.jiang 20
 run_sample multi_file_struct_return_minimal.jiang 42
 run_sample multi_file_struct_minimal.jiang 42
 run_sample namespaced_struct_import_minimal.jiang 42

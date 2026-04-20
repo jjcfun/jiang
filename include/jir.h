@@ -66,6 +66,7 @@ typedef enum JirBinaryOp {
     JIR_BIN_ADD = 0,
     JIR_BIN_SUB,
     JIR_BIN_MUL,
+    JIR_BIN_MOD,
     JIR_BIN_DIV,
     JIR_BIN_EQ,
     JIR_BIN_NE,

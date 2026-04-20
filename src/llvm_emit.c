@@ -662,6 +662,7 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case JIR_BIN_ADD: return LLVMBuildAdd(cg->builder, left, right, "addtmp");
                 case JIR_BIN_SUB: return LLVMBuildSub(cg->builder, left, right, "subtmp");
                 case JIR_BIN_MUL: return LLVMBuildMul(cg->builder, left, right, "multmp");
+                case JIR_BIN_MOD: return LLVMBuildSRem(cg->builder, left, right, "modtmp");
                 case JIR_BIN_DIV: return LLVMBuildSDiv(cg->builder, left, right, "divtmp");
                 case JIR_BIN_EQ: return LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
                 case JIR_BIN_NE: return LLVMBuildICmp(cg->builder, LLVMIntNE, left, right, "netmp");
