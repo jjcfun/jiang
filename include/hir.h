@@ -58,6 +58,7 @@ typedef enum HirBindingKind {
 struct HirBinding {
     HirType* type;
     char* name;
+    int mutable_flag;
     HirBindingKind kind;
     int line;
 };
@@ -74,6 +75,7 @@ typedef enum HirExprKind {
     HIR_EXPR_NULL,
     HIR_EXPR_OPTIONAL_SOME,
     HIR_EXPR_BINDING,
+    HIR_EXPR_CAST,
     HIR_EXPR_ADDR,
     HIR_EXPR_DEREF,
     HIR_EXPR_NEW,
@@ -115,6 +117,7 @@ typedef enum HirBuiltinKind {
     HIR_BUILTIN_ASSERT,
     HIR_BUILTIN_PRINT,
     HIR_BUILTIN_PANIC,
+    HIR_BUILTIN_SLICE_WITH_CAPACITY,
 } HirBuiltinKind;
 
 typedef struct HirExprList {
@@ -281,6 +284,7 @@ struct HirFunction {
     HirBindingList locals;
     HirBlock body;
     int struct_init_flag;
+    int struct_deinit_flag;
     int method_flag;
     int static_method_flag;
     HirStructDecl* owner_struct;
@@ -333,6 +337,8 @@ struct HirStructDecl {
     HirStructFieldList fields;
     int has_init;
     char* init_name;
+    int has_deinit;
+    char* deinit_name;
 };
 
 typedef struct HirStructList {

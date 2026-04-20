@@ -35,6 +35,7 @@ typedef enum JirExprKind {
     JIR_EXPR_NULL,
     JIR_EXPR_OPTIONAL_SOME,
     JIR_EXPR_BINDING,
+    JIR_EXPR_CAST,
     JIR_EXPR_ADDR,
     JIR_EXPR_DEREF,
     JIR_EXPR_NEW,
@@ -79,6 +80,7 @@ typedef enum JirBuiltinKind {
     JIR_BUILTIN_ASSERT,
     JIR_BUILTIN_PRINT,
     JIR_BUILTIN_PANIC,
+    JIR_BUILTIN_SLICE_WITH_CAPACITY,
 } JirBuiltinKind;
 
 typedef enum JirExtractKind {
@@ -115,12 +117,15 @@ struct JirType {
     JirType* array_item;
     int array_length;
     JirStructFieldDeclList struct_fields;
+    int struct_has_deinit;
+    char* struct_deinit_name;
     int union_payload_slots;
 };
 
 struct JirBinding {
     JirType* type;
     char* name;
+    int mutable_flag;
     JirBindingKind kind;
     int line;
 };
@@ -256,6 +261,7 @@ struct JirFunction {
     JirBindingList params;
     JirBindingList locals;
     int struct_init_flag;
+    int struct_deinit_flag;
     int method_flag;
     int static_method_flag;
     char* owner_name;

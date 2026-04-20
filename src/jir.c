@@ -89,6 +89,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_NULL: return JIR_EXPR_NULL;
         case HIR_EXPR_OPTIONAL_SOME: return JIR_EXPR_OPTIONAL_SOME;
         case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
+        case HIR_EXPR_CAST: return JIR_EXPR_CAST;
         case HIR_EXPR_ADDR: return JIR_EXPR_ADDR;
         case HIR_EXPR_DEREF: return JIR_EXPR_DEREF;
         case HIR_EXPR_NEW: return JIR_EXPR_NEW;
@@ -194,6 +195,8 @@ static JirType* lower_type(const HirType* hir_type, const char** error) {
             }
             jir_struct_field_decl_list_push(&jir_type->struct_fields, field);
         }
+        jir_type->struct_has_deinit = hir_type->struct_decl->has_deinit;
+        jir_type->struct_deinit_name = hir_type->struct_decl->deinit_name;
     }
     return jir_type;
 }
@@ -217,6 +220,7 @@ static JirBinding* lower_binding(const HirBinding* hir_binding, const char** err
         return 0;
     }
     jir_binding->name = hir_binding->name;
+    jir_binding->mutable_flag = hir_binding->mutable_flag;
     jir_binding->kind = jir_binding_kind(hir_binding->kind);
     jir_binding->line = hir_binding->line;
     {
@@ -595,6 +599,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_BINDING:
             out->as.binding = lower_binding(expr->as.binding, error);
             return out;
+        case HIR_EXPR_CAST:
         case HIR_EXPR_ADDR:
         case HIR_EXPR_DEREF:
         case HIR_EXPR_NEW:
@@ -1020,6 +1025,7 @@ static int lower_function_info(const HirFunction* hir_fn, JirFunction* jir_fn, c
         jir_binding_list_push(&jir_fn->locals, binding);
     }
     jir_fn->struct_init_flag = hir_fn->struct_init_flag;
+    jir_fn->struct_deinit_flag = hir_fn->struct_deinit_flag;
     jir_fn->method_flag = hir_fn->method_flag;
     jir_fn->static_method_flag = hir_fn->static_method_flag;
     jir_fn->owner_name = hir_fn->owner_struct ? hir_fn->owner_struct->name : 0;

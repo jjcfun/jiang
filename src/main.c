@@ -225,6 +225,22 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const A
             break;
         case AST_EXPR_NULL:
             break;
+        case AST_EXPR_IMPLICIT:
+            out->as.implicit.target_is_type = expr->as.implicit.target_is_type;
+            if (expr->as.implicit.target_is_type) {
+                out->as.implicit.type_target = clone_type(source, prefix, &expr->as.implicit.type_target);
+            } else {
+                out->as.implicit.value_target = clone_expr(source, prefix, expr->as.implicit.value_target);
+            }
+            out->as.implicit.member = dup_text(expr->as.implicit.member);
+            out->as.implicit.has_type_arg = expr->as.implicit.has_type_arg;
+            if (expr->as.implicit.has_type_arg) {
+                out->as.implicit.type_arg = clone_type(source, prefix, &expr->as.implicit.type_arg);
+            }
+            for (i = 0; i < expr->as.implicit.args.count; ++i) {
+                expr_list_push(&out->as.implicit.args, clone_expr(source, prefix, expr->as.implicit.args.items[i]));
+            }
+            break;
         case AST_EXPR_SIZE_OF:
             out->as.size_of_type = clone_type(source, prefix, &expr->as.size_of_type);
             break;
@@ -460,7 +476,9 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
     }
     out.public_flag = public_flag;
     out.has_init = decl->has_init;
+    out.has_deinit = decl->has_deinit;
     out.init_line = decl->init_line;
+    out.deinit_line = decl->deinit_line;
     out.line = decl->line;
     for (i = 0; i < decl->fields.count; ++i) {
         AstStructField field;
@@ -480,6 +498,7 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         param_list_push(&out.init_params, param);
     }
     clone_block(source, prefix, &out.init_body, &decl->init_body);
+    clone_block(source, prefix, &out.deinit_body, &decl->deinit_body);
     return out;
 }
 
@@ -963,7 +982,11 @@ static AstType substitute_type(const AstType* type, const TypeSubstList* subst) 
     if (type->kind == AST_TYPE_NAMED && type->type_args.count == 0) {
         replaced = lookup_subst(subst, type->named_name);
         if (replaced) {
-            return ast_type_copy(replaced);
+            AstType copied = ast_type_copy(replaced);
+            if (type->mutable_flag) {
+                copied.mutable_flag = 1;
+            }
+            return copied;
         }
     }
     memset(&out, 0, sizeof(out));
@@ -1165,6 +1188,8 @@ static int transform_type(MonoContext* mono, AstType* type) {
 }
 
 static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst);
+static AstBindingPattern* clone_binding_pattern_subst(const AstBindingPattern* pattern, const TypeSubstList* subst);
+static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst);
 
 static AstType clone_type_subst(const AstType* type, const TypeSubstList* subst) {
     AstType out = substitute_type(type, subst);
@@ -1200,6 +1225,22 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.bool_value = expr->as.bool_value;
             break;
         case AST_EXPR_NULL:
+            break;
+        case AST_EXPR_IMPLICIT:
+            out->as.implicit.target_is_type = expr->as.implicit.target_is_type;
+            if (expr->as.implicit.target_is_type) {
+                out->as.implicit.type_target = clone_type_subst(&expr->as.implicit.type_target, subst);
+            } else {
+                out->as.implicit.value_target = clone_expr_subst(expr->as.implicit.value_target, subst);
+            }
+            out->as.implicit.member = dup_text(expr->as.implicit.member);
+            out->as.implicit.has_type_arg = expr->as.implicit.has_type_arg;
+            if (expr->as.implicit.has_type_arg) {
+                out->as.implicit.type_arg = clone_type_subst(&expr->as.implicit.type_arg, subst);
+            }
+            for (i = 0; i < expr->as.implicit.args.count; ++i) {
+                expr_list_push(&out->as.implicit.args, clone_expr_subst(expr->as.implicit.args.items[i], subst));
+            }
             break;
         case AST_EXPR_SIZE_OF:
             out->as.size_of_type = clone_type_subst(&expr->as.size_of_type, subst);
@@ -1280,6 +1321,105 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             break;
         case AST_EXPR_SLICE_LENGTH:
             out->as.slice_length.base = clone_expr_subst(expr->as.slice_length.base, subst);
+            break;
+    }
+    return out;
+}
+
+static AstBindingPattern* clone_binding_pattern_subst(const AstBindingPattern* pattern, const TypeSubstList* subst) {
+    AstBindingPattern* out = (AstBindingPattern*)calloc(1, sizeof(AstBindingPattern));
+    int i = 0;
+    out->kind = pattern->kind;
+    out->line = pattern->line;
+    out->type = clone_type_subst(&pattern->type, subst);
+    if (pattern->name) {
+        out->name = dup_text(pattern->name);
+    }
+    for (i = 0; i < pattern->items.count; ++i) {
+        binding_pattern_list_push(&out->items, clone_binding_pattern_subst(pattern->items.items[i], subst));
+    }
+    return out;
+}
+
+static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst) {
+    AstStmt* out = (AstStmt*)calloc(1, sizeof(AstStmt));
+    int i = 0;
+    out->kind = stmt->kind;
+    out->line = stmt->line;
+    switch (stmt->kind) {
+        case AST_STMT_RETURN:
+            out->as.ret.expr = clone_expr_subst(stmt->as.ret.expr, subst);
+            break;
+        case AST_STMT_VAR_DECL:
+            out->as.var_decl.type = clone_type_subst(&stmt->as.var_decl.type, subst);
+            out->as.var_decl.name = dup_text(stmt->as.var_decl.name);
+            out->as.var_decl.init = clone_expr_subst(stmt->as.var_decl.init, subst);
+            break;
+        case AST_STMT_ASSIGN:
+            out->as.assign.target = clone_expr_subst(stmt->as.assign.target, subst);
+            out->as.assign.value = clone_expr_subst(stmt->as.assign.value, subst);
+            break;
+        case AST_STMT_IF:
+            out->as.if_stmt.cond = clone_expr_subst(stmt->as.if_stmt.cond, subst);
+            out->as.if_stmt.has_else = stmt->as.if_stmt.has_else;
+            for (i = 0; i < stmt->as.if_stmt.then_block.stmts.count; ++i) {
+                stmt_list_push(&out->as.if_stmt.then_block.stmts, clone_stmt_subst(stmt->as.if_stmt.then_block.stmts.items[i], subst));
+            }
+            for (i = 0; i < stmt->as.if_stmt.else_block.stmts.count; ++i) {
+                stmt_list_push(&out->as.if_stmt.else_block.stmts, clone_stmt_subst(stmt->as.if_stmt.else_block.stmts.items[i], subst));
+            }
+            break;
+        case AST_STMT_SWITCH:
+            out->as.switch_stmt.value = clone_expr_subst(stmt->as.switch_stmt.value, subst);
+            for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
+                AstSwitchCase item;
+                int j = 0;
+                memset(&item, 0, sizeof(item));
+                item.pattern = clone_expr_subst(stmt->as.switch_stmt.cases.items[i].pattern, subst);
+                item.is_else = stmt->as.switch_stmt.cases.items[i].is_else;
+                for (j = 0; j < stmt->as.switch_stmt.cases.items[i].body.stmts.count; ++j) {
+                    stmt_list_push(&item.body.stmts, clone_stmt_subst(stmt->as.switch_stmt.cases.items[i].body.stmts.items[j], subst));
+                }
+                switch_case_list_push(&out->as.switch_stmt.cases, item);
+            }
+            break;
+        case AST_STMT_WHILE:
+            out->as.while_stmt.cond = clone_expr_subst(stmt->as.while_stmt.cond, subst);
+            for (i = 0; i < stmt->as.while_stmt.body.stmts.count; ++i) {
+                stmt_list_push(&out->as.while_stmt.body.stmts, clone_stmt_subst(stmt->as.while_stmt.body.stmts.items[i], subst));
+            }
+            break;
+        case AST_STMT_FOR_RANGE:
+            out->as.for_range.type = clone_type_subst(&stmt->as.for_range.type, subst);
+            out->as.for_range.name = dup_text(stmt->as.for_range.name);
+            out->as.for_range.start = clone_expr_subst(stmt->as.for_range.start, subst);
+            out->as.for_range.end = clone_expr_subst(stmt->as.for_range.end, subst);
+            for (i = 0; i < stmt->as.for_range.body.stmts.count; ++i) {
+                stmt_list_push(&out->as.for_range.body.stmts, clone_stmt_subst(stmt->as.for_range.body.stmts.items[i], subst));
+            }
+            break;
+        case AST_STMT_FOR_EACH:
+            out->as.for_each.pattern = clone_binding_pattern_subst(stmt->as.for_each.pattern, subst);
+            out->as.for_each.iterable = clone_expr_subst(stmt->as.for_each.iterable, subst);
+            out->as.for_each.indexed_flag = stmt->as.for_each.indexed_flag;
+            for (i = 0; i < stmt->as.for_each.body.stmts.count; ++i) {
+                stmt_list_push(&out->as.for_each.body.stmts, clone_stmt_subst(stmt->as.for_each.body.stmts.items[i], subst));
+            }
+            break;
+        case AST_STMT_BREAK:
+        case AST_STMT_CONTINUE:
+            break;
+        case AST_STMT_EXPR:
+            out->as.expr_stmt.expr = clone_expr_subst(stmt->as.expr_stmt.expr, subst);
+            break;
+        case AST_STMT_DESTRUCTURE:
+            for (i = 0; i < stmt->as.destructure.bindings.count; ++i) {
+                AstParam binding = stmt->as.destructure.bindings.items[i];
+                binding.type = clone_type_subst(&binding.type, subst);
+                binding.name = dup_text(binding.name);
+                param_list_push(&out->as.destructure.bindings, binding);
+            }
+            out->as.destructure.init = clone_expr_subst(stmt->as.destructure.init, subst);
             break;
     }
     return out;
@@ -1421,7 +1561,7 @@ static int instantiate_function_template(MonoContext* mono, const AstFunction* t
         local_type_list_push(&locals, entry);
     }
     for (i = 0; i < templ->body.stmts.count; ++i) {
-        stmt_list_push(&fn.body.stmts, clone_stmt(mono->source, 0, templ->body.stmts.items[i]));
+        stmt_list_push(&fn.body.stmts, clone_stmt_subst(templ->body.stmts.items[i], &subst));
     }
     if (!transform_type(mono, &fn.return_type) || !transform_block(mono, &fn.body, &locals)) {
         return 0;
@@ -1447,7 +1587,9 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     decl.name = dup_text(*instantiated_name);
     decl.public_flag = templ->public_flag;
     decl.has_init = templ->has_init;
+    decl.has_deinit = templ->has_deinit;
     decl.init_line = templ->init_line;
+    decl.deinit_line = templ->deinit_line;
     decl.line = templ->line;
     for (i = 0; i < templ->fields.count; ++i) {
         AstStructField field = templ->fields.items[i];
@@ -1463,9 +1605,15 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
         param_list_push(&decl.init_params, param);
     }
     for (i = 0; i < templ->init_body.stmts.count; ++i) {
-        stmt_list_push(&decl.init_body.stmts, clone_stmt(mono->source, 0, templ->init_body.stmts.items[i]));
+        stmt_list_push(&decl.init_body.stmts, clone_stmt_subst(templ->init_body.stmts.items[i], &subst));
     }
     if (!transform_block(mono, &decl.init_body, &(LocalTypeList){0})) {
+        return 0;
+    }
+    for (i = 0; i < templ->deinit_body.stmts.count; ++i) {
+        stmt_list_push(&decl.deinit_body.stmts, clone_stmt_subst(templ->deinit_body.stmts.items[i], &subst));
+    }
+    if (!transform_block(mono, &decl.deinit_body, &(LocalTypeList){0})) {
         return 0;
     }
     struct_list_push(&mono->out->structs, decl);
@@ -1482,6 +1630,13 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
             }
             cloned.return_type = clone_type_subst(&cloned.return_type, &subst);
             memset(&empty_args, 0, sizeof(empty_args));
+            for (int j = 0; j < cloned.body.stmts.count; ++j) {
+                free(cloned.body.stmts.items[j]);
+            }
+            memset(&cloned.body, 0, sizeof(cloned.body));
+            for (int j = 0; j < method->body.stmts.count; ++j) {
+                stmt_list_push(&cloned.body.stmts, clone_stmt_subst(method->body.stmts.items[j], &subst));
+            }
             if (!transform_block(mono, &cloned.body, &(LocalTypeList){0})) {
                 return 0;
             }
@@ -1497,6 +1652,26 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
         return 1;
     }
     switch (expr->kind) {
+        case AST_EXPR_IMPLICIT:
+            if (expr->as.implicit.target_is_type) {
+                if (!transform_type(mono, &expr->as.implicit.type_target)) {
+                    return 0;
+                }
+            } else {
+                if (!transform_expr(mono, expr->as.implicit.value_target, locals)) {
+                    return 0;
+                }
+            }
+            if (expr->as.implicit.has_type_arg &&
+                !transform_type(mono, &expr->as.implicit.type_arg)) {
+                return 0;
+            }
+            for (i = 0; i < expr->as.implicit.args.count; ++i) {
+                if (!transform_expr(mono, expr->as.implicit.args.items[i], locals)) {
+                    return 0;
+                }
+            }
+            return 1;
         case AST_EXPR_SIZE_OF:
             return transform_type(mono, &expr->as.size_of_type);
         case AST_EXPR_CALL: {

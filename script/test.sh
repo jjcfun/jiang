@@ -75,6 +75,7 @@ run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
+run_sample cast_addr_minimal.jiang 2
 run_sample free_minimal.jiang 0
 run_sample new_array_repeat_init_minimal.jiang 6
 run_sample multi_file_minimal.jiang 42
@@ -143,6 +144,7 @@ run_sample struct_optional_field_omitted_minimal.jiang 18
 run_sample struct_init_optional_omitted_minimal.jiang 1
 run_sample struct_new_constructor_minimal.jiang 42
 run_sample struct_new_literal_with_init_minimal.jiang 42
+run_sample deinit_minimal.jiang 42
 run_sample multi_file_struct_return_minimal.jiang 42
 run_sample multi_file_struct_minimal.jiang 42
 run_sample namespaced_struct_import_minimal.jiang 42
@@ -178,6 +180,8 @@ run_sample unary_tuple_infer_local_decl_minimal.jiang 42
 run_sample unary_tuple_global_decl_minimal.jiang 42
 run_sample unary_tuple_return_minimal.jiang 42
 run_sample array_minimal.jiang 42
+run_sample array_list_minimal.jiang 41
+run_sample array_list_pointer_minimal.jiang 48
 run_sample array_assign_minimal.jiang 10
 run_sample array_repeat_init_minimal.jiang 6
 run_sample nested_array_minimal.jiang 42
@@ -289,6 +293,8 @@ run_compile_fail invalid_switch_non_exhaustive_enum.jiang
 run_compile_fail invalid_unknown_ident.jiang
 run_compile_fail invalid_assign_target.jiang
 run_compile_fail invalid_assign_field_type.jiang
+run_compile_fail invalid_pointer_mutable_pointee_arg.jiang
+run_compile_fail invalid_slice_mutable_arg.jiang
 run_compile_fail invalid_call_non_function.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang

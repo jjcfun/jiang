@@ -112,24 +112,48 @@ if a1 == Option.some(_ x) {
 
 ### 类型转换 (Type Casting)
 
-Jiang 语言支持显式的类型转换，采用 `$a.cast(Type)` 的语法。其中 `$` 符号表示对对象本身进行“元操作”，`cast` 是一个特殊的元方法，它接收一个类型表达式作为参数。
+Jiang 语言支持显式的类型转换，采用 `a$.cast(Type)` 的语法。
+
+这里的 `$` 符号表示**进入隐式操作层**。可以把它理解成：对一个值或一个类型，切换到它的“隐式层 / 元层”再进行操作。
+
+- 对值使用：`a$.xxx()`
+- 对类型使用：`Type$.xxx()`
+- 对复合表达式使用：`(expr)$.xxx()`
+
+后缀 `$` 绑定在它左侧的完整对象上。因此：
+
+- `a$.b` 等价于 `(a$).b`
+- `a.b$` 等价于 `(a.b)$`
+- 如果要对整个 `(a + b)` 进入隐式操作层，必须写成 `(a + b)$.xxx()`
+
+例如：
+
+- `a$.cast(Int)`：对值 `a` 做类型转换
+- `a$.ref()`：从值 `a` 获取一个临时指针
+- `a$.addr()`：获取值 `a` 的地址值
+- `self.data$.free()`：对 `self.data` 这个完整表达式做隐式释放操作
+- `Int$.size()`：获取类型 `Int` 的大小
+
+在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
+
+`cast` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数。
 
 ```c
 Float f = 10.5;
 
 // 将 Float 转换为 Int
-Int i = $f.cast(Int);
+Int i = f$.cast(Int);
 
 print("i = %d", i); // 输出：i = 10
 
 // 将 Int 转换为 UInt8
 Int val = 255;
-UInt8 small_val = $val.cast(UInt8);
+UInt8 small_val = val$.cast(UInt8);
 
 // 注意：某些危险的转换（如指针强转）可能需要包裹在 sudo 块中
 Int addr = 0x12345678;
 sudo {
-    Int* ptr = $addr.cast(Int*);
+    Int* ptr = addr$.cast(Int*);
 }
 ```
 
@@ -218,6 +242,14 @@ foo[0][1] // 2
 
 ### 指针（Pointer）
 
+现阶段，Jiang 语言先不引入所有权和借用系统，也不区分多种 allocator。运行时只有默认堆分配器。
+在此基础上，指针语义先约定为：
+
+- `T*`：指向默认堆分配器分配出的 `T`
+- `T&`：临时指针，通常用于引用已有值，不承担释放职责
+
+后续如果语言正式引入所有权、借用或多 allocator，这里的规则再进一步细化。
+
 #### 指针类型
 
 指针类型也遵循 **从左往右，从里到外** 的原则
@@ -232,9 +264,12 @@ Int* b = new 123;
 // 在堆中创建数组，并返回一个数组指针
 Int[3]* c = new {1, 2, 3};
 
+// 临时指针
+Int& d = a$.ref();
+
 ```
 
-指针类型的\*号与元素类型间不能存在空格
+指针类型的 `*` 与 `&` 都紧跟在元素类型后面，不能存在空格
 
 ```c
 // Bad
@@ -245,12 +280,18 @@ Int *a;
 
 // Good
 Int* a;
+
+// Bad
+Int & b;
+
+// Good
+Int& b;
 ```
 
 #### 自动解引用
 
 使用指针时，除非明确使用`$`操作符表示指针本身，否则将自动解引用，使用指针与使用其元素无异。
-特别说明一下，Jiang语言并不追求一切皆显式，并提供了一种类似代理（Proxy）的特性，可以将一些实现细节放在代理内部，并对使用者透明。就比如指针类型，就是一种拥有代理特性的类型。使用指针时，与直接使用指针的元素无异。此时，指针这个概念对使用者来说是透明的。而`$`操作符则是关心这个代理本身，通过类似`$ptr.free()`的语法，就可以调用指针本身的一些方法。
+特别说明一下，Jiang语言并不追求一切皆显式，并提供了一种类似代理（Proxy）的特性，可以将一些实现细节放在代理内部，并对使用者透明。就比如指针类型，就是一种拥有代理特性的类型。使用指针时，与直接使用指针的元素无异。此时，指针这个概念对使用者来说是透明的。而 `$` 操作符则是进入隐式操作层，通过类似 `ptr$.free()` 的语法，就可以调用指针本身的一些方法。
 所以，Jiang语言的理念就是：对于用户，不需要关心冰箱的制冷原理；对于维修者，又提供了螺丝刀，允许拆开冰箱看看内部结构
 
 ```c
@@ -263,27 +304,24 @@ Int c = a + b;
 
 print("c = %d", c); // 输出： c = 300
 
-// '$'符号用于取指针本身，此时可以调用指针本身的一些方法
-$b.free();
+// '$'符号用于进入b的隐式操作层，此时可以调用指针本身的一些方法
+b$.free();
 ```
 
-jiang语言的指针带有所有权，当指针赋值给其他变量的时候，所有权将发生转移
+当前版本里，Jiang 只约定 `*` 指针可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 指针只是临时指针，不参与释放。
 
 ```c
-// 定义一个指针a，指向堆内存，此时a拥有这块内存的有所有权
+// 定义一个指针a，指向堆内存
 Int* a = new 100;
 
 // 可以主动释放指针的内存空间
-$a.free();
-
-// 此时继续使用a，将会报编译错误
-print("a = %d", a); // 编译错误
-
+a$.free();
 ```
 
 ### 切片（Slice）
 
-slice是一个带有length属性的胖指针。它与数组的区别在于：数组类型的长度是在编译器确定的，而Slice的长度在运行时确定
+slice 是一个带有 `length` 属性的胖指针。它与数组的区别在于：数组类型的长度是在编译器确定的，而 slice 的长度在运行时确定。
+现阶段可以把 `T[]` 看作一个轻量的 `{ ptr, len }` 视图值；它本身不表达所有权语义。
 
 ```c
 // x为一个数组
@@ -381,22 +419,26 @@ jiang语言的函数一定有返回值，即使是个空值。 空值用空元�
 Int[] sort(Int[] list, Fn<Bool, Int, Int> compare)
 
 // 支持范型的排序，其中T需要实现Numbric相关特性
-@<T: Numbric>
-T[] sort(T[] list, Fn<Bool, T, T> compare)
+@where(T: Numbric)
+T[] sort<T>(T[] list, Fn<Bool, T, T> compare)
 
 // 支持范型的排序，会抛出异常，其中E可以为任意类型
-@<T: Numbric, E>
-T[]@E sort(T[] list, Fn<Bool@E, T, T> compare)
+@where(T: Numbric)  
+T[]@E sort<T, E>(T[] list, Fn<Bool@E, T, T> compare)
 
-@<T: Numbric, E1, E2: CompareError>
-T[]@E1 sort(T[] list, Fn<Fn<Bool@E2, T, T>@E1, T[]> compare)
+@where(T: Numbric, E2: CompareError)  
+T[]@E1 sort<T, E1, E2>(T[] list, Fn<Fn<Bool@E2, T, T>@E1, T[]> compare)
+```
 
-@<T: Numbric, E1, E2: CompareError>
-async T[]@E1 sort(T[] list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]> compare)
+#### Async
 
-@<T: Numbric, E1, E2: CompareError>
+```c
+@where(T: Numbric, E2: CompareError)  
+async T[]@E1 sort<T, E1, E2>(T[] list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]> compare)
+
+@where(T: Numbric, E2: CompareError)  
 @alias(Cmp = Fn<async Bool@E2, T, T>)
-async T[]@E1 sort(T[] list, Fn<async Cmp@E1, T[]> compare)
+async T[]@E1 sort<T, E1, E2>(T[] list, Fn<async Cmp@E1, T[]> compare)
 ```
 
 #### 函数调用
@@ -571,25 +613,29 @@ Point point move_point(Point point, Offset offset) {
 
 #### init函数
 
-struct除了默认的构造语法，还可以自定义 `init` 函数。
+struct 可以自定义 `init` 函数。
 
 `init` 具有以下语义：
 
 - `init` 是结构体内唯一的特殊构造器入口
+- `init` 允许可见性修饰，例如 `public init(...)`
 - `init` 隐式拥有 `self`
 - `init` 不声明返回类型，语义等价于 `()`
 - `init` 只允许 `return;` / `return ();`
-- `Point(...)` 是 `Point.init(...)` 的语法糖
-- `new Point(...)` 会先分配内存，再调用 `Point.init(...)`
-
-默认构造字面量与 `init` 并存，`Point { ... }` / `new Point { ... }` 仍然可用
+- `init` 不能写成 `static init`
+- `Point(...)` / `Point.init(...)` / `new Point(...)` 不再作为构造语法存在
+- 构造统一使用 `Point { ... }`
+- 如果类型定义了 `init`，那么 `Point { ... }` 会按 `init` 参数名构造
+- 如果类型没有定义 `init`，那么 `Point { ... }` 才表示默认字段初始化
+- 一旦类型定义了 `init`，默认字段初始化语法失效
+- `new Point { ... }` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
 
 ```c
 struct Point {
   Int x;
   Int y;
 
-  init(Int x, Int y) {
+  public init(Int x, Int y) {
     self.x = x;
     self.y = y;
     return;
@@ -598,10 +644,36 @@ struct Point {
 ```
 
 ```c
-Point p1 = Point.init(1, 2);
-Point p2 = Point(1, 2);      // 等价于 Point.init(1, 2)
-Point* p3 = new Point(1, 2); // 默认走 new + malloc + init
-Point p4 = Point { x: 1, y: 2 };
+Point p1 = Point { x: 1, y: 2 };
+Point* p2 = new Point { x: 1, y: 2 };
+```
+
+#### deinit函数
+
+struct 还可以定义 `deinit` 函数。
+
+`deinit` 具有以下语义：
+
+- `deinit` 是结构体内唯一的特殊析构器入口
+- `deinit` 隐式拥有 `self`
+- `deinit` 不声明返回类型，语义等价于 `()`
+- `deinit` 只允许 `return;` / `return ();`
+- `deinit` 不允许 `public` / `static` 等可见性或静态修饰
+- `deinit` 不作为普通方法暴露给外部调用
+- 对结构体指针执行 `ptr$.free()` 时，如果该结构体定义了 `deinit`，则会先触发 `deinit`，再释放对象自身内存
+
+```c
+struct List {
+  Int[]! data;
+
+  deinit() {
+    if self.data != null {
+      self.data$.free();
+      self.data = null;
+    }
+    return;
+  }
+}
 ```
 
 #### 名义类型内部函数
@@ -617,7 +689,7 @@ Point p4 = Point { x: 1, y: 2 };
 - `union`：支持 static 方法、实例方法
 - `enum`：支持 static 方法、实例方法
 
-`init` 仍然是 `struct` 独有的特殊构造器入口，不能写成 `static init`，也不能定义在 `union` / `enum` 中。
+`init` / `deinit` 仍然是 `struct` 独有的特殊生命周期入口，不能定义在 `union` / `enum` 中。
 
 ```c
 struct User {
@@ -638,7 +710,7 @@ struct User {
 }
 
 Int a = User.zero();
-User user = User(42);
+User user = User { id: 42 };
 Int b = user.value();
 ```
 
@@ -719,11 +791,6 @@ Point* p3 = new Point { x: 100, y: 200 }
 
 // 由于Jiang语言的指针自动解引用，此时的p3被当成值
 print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 输出：p3.x = 100, p3.y = 200
-
-// 这里'$'操作符作用是阻止解引用，此时$p指代指针本身
-// 赋值完后，p3的所有权转移到了p4上，继续使用p3将导致编译错误
-Point* p4 = $p3.move()
-print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 这里将编译失败，因为p3已经失去所有权
 ```
 
 #### 结构体的可变属性
@@ -855,40 +922,69 @@ if (x == MyUnion.a(_ value)) {
 }
 ```
 
-### 范型（Generic）
+### 泛型（Generic）
 
-jiang语言通常以`@<T>`形式定义范型
+Jiang 语言通常以 `<T>` 形式声明泛型参数。
+
+`@where(...)` 是一种编译期约束注解，用于约束其后一个泛型声明中的类型参数。  
+`@where(...)` 中引用的参数名，必须出现在后续声明的 `<...>` 泛型参数列表中。
+
+#### Concept
+
+`concept` 用于定义一种**仅存在于编译期**的约束类型。  
+它类似泛型系统里的 trait，但不作为运行时类型使用，也不能直接作为普通变量、字段、参数或返回值类型。
+
+例如，`Numbric` 可以被定义为一个 concept，表示“所有数值类型”：
 
 ```c
-/// 定义范型函数，其中T可以为Int、Float等数值类型
-@<T: Numbric>
-T add(T a, T b) {
+concept Numbric;
+```
+
+此时：
+
+- `Int`、`Float`、`Double` 等数值类型可以被视为满足 `Numbric`
+- `Numbric` 本身不能直接写成 `Numbric x;`
+- `Numbric` 主要用于 `@where(...)` 这类泛型约束位置
+
+例如：
+
+```c
+@where(T: Numbric)
+T add<T>(T a, T b) {
+  return a + b;
+}
+```
+
+```c
+/// 定义泛型函数，其中 T 可以为 Int、Float 等数值类型
+@where(T: Numbric)
+T add<T>(T a, T b) {
   return a + b;
 }
 
-// 此时T为Int类型
-add(100, 200)
-// 此时T为Double类型
-add(3.14, 9.8)
-// 强制指定T为Float类型
-add<Float>(3.14, 9.8)
+// 此时 T 推断为 Int
+add(100, 200);
+// 此时 T 推断为 Double
+add(3.14, 9.8);
+// 强制指定 T 为 Float
+add<Float>(3.14, 9.8);
 
-/// 定义范型结构体
-@<T: Numbric>
-struct Foo {
+/// 定义泛型结构体
+@where(T: Numbric)
+struct Foo<T> {
   T value;
 
   T bar() {
-		retrun self.value * 2;
+    return self.value * 2;
   }
 }
 
-// 此时T为Int类型
-Foo x = {value: 123}
-// 此时T为Float类型
-Foo<Float> y = {value: 3.14}
+// 此时 T 推断为 Int
+Foo x = { value: 123 };
+// 此时 T 明确为 Float
+Foo<Float> y = Foo<Float> { value: 3.14 };
 // 也可以写成
-_ y = Foo<Float> {value: 3.14}
+_ z = Foo<Float> { value: 3.14 };
 ```
 
 ### 模块（Module）

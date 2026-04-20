@@ -45,6 +45,10 @@ static HirExpr* make_optional_value_expr(LowerContext* ctx, HirExpr* value, int 
 static HirBinding* lookup_binding(LowerContext* ctx, const char* name);
 static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
 static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
+static HirFunction* find_function(HirProgram* program, const char* name);
+static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
+static int is_mutable_assignment_target(const HirExpr* expr);
+static int type_assignment_compatible(HirType* actual, HirType* expected);
 
 static int is_expected_type_shorthand_expr(const AstExpr* expr) {
     return expr &&
@@ -101,6 +105,19 @@ static int optional_null_compare_binding_name(const AstExpr* expr, int* non_null
 
 static char* make_struct_init_name(const char* struct_name) {
     const char* prefix = "__struct_init_";
+    size_t prefix_len = strlen(prefix);
+    size_t name_len = strlen(struct_name);
+    char* out = (char*)malloc(prefix_len + name_len + 1);
+    if (!out) {
+        return 0;
+    }
+    memcpy(out, prefix, prefix_len);
+    memcpy(out + prefix_len, struct_name, name_len + 1);
+    return out;
+}
+
+static char* make_struct_deinit_name(const char* struct_name) {
+    const char* prefix = "__struct_deinit_";
     size_t prefix_len = strlen(prefix);
     size_t name_len = strlen(struct_name);
     char* out = (char*)malloc(prefix_len + name_len + 1);
@@ -219,6 +236,51 @@ static int type_equals(HirType* left, HirType* right) {
     return 1;
 }
 
+static int type_assignment_compatible_inner(HirType* actual, HirType* expected, int through_alias) {
+    int i = 0;
+    if (actual == expected) {
+        return 1;
+    }
+    if (!actual || !expected || actual->kind != expected->kind) {
+        return 0;
+    }
+    switch (expected->kind) {
+        case HIR_TYPE_ARRAY:
+            return actual->array_length == expected->array_length &&
+                   type_assignment_compatible_inner(actual->array_item, expected->array_item, through_alias);
+        case HIR_TYPE_SLICE:
+        case HIR_TYPE_POINTER:
+            return type_assignment_compatible_inner(actual->array_item, expected->array_item, 1);
+        case HIR_TYPE_OPTIONAL:
+            return type_assignment_compatible_inner(actual->array_item, expected->array_item, through_alias);
+        case HIR_TYPE_ENUM:
+            return actual->enum_decl == expected->enum_decl;
+        case HIR_TYPE_STRUCT:
+            return actual->struct_decl == expected->struct_decl;
+        case HIR_TYPE_UNION:
+            return actual->union_decl == expected->union_decl;
+        case HIR_TYPE_TUPLE:
+            if (actual->tuple_items.count != expected->tuple_items.count) {
+                return 0;
+            }
+            for (i = 0; i < actual->tuple_items.count; ++i) {
+                if (!type_assignment_compatible_inner(actual->tuple_items.items[i], expected->tuple_items.items[i], through_alias)) {
+                    return 0;
+                }
+            }
+            return 1;
+        default:
+            if (through_alias && expected->mutable_flag && !actual->mutable_flag) {
+                return 0;
+            }
+            return 1;
+    }
+}
+
+static int type_assignment_compatible(HirType* actual, HirType* expected) {
+    return type_assignment_compatible_inner(actual, expected, 0);
+}
+
 static int64_t type_size_bytes(HirType* type) {
     int i = 0;
     int64_t size = 0;
@@ -266,6 +328,38 @@ static int64_t type_size_bytes(HirType* type) {
         }
     }
     return 0;
+}
+
+static int is_integer_like_type(HirType* type) {
+    return type &&
+           (type->kind == HIR_TYPE_INT ||
+            type->kind == HIR_TYPE_UINT8 ||
+            type->kind == HIR_TYPE_BOOL);
+}
+
+static int cast_compatible(HirType* from, HirType* to) {
+    if (!from || !to) {
+        return 0;
+    }
+    if (type_equals(from, to)) {
+        return 1;
+    }
+    if (is_integer_like_type(from) && is_integer_like_type(to)) {
+        return 1;
+    }
+    if (from->kind == HIR_TYPE_POINTER && to->kind == HIR_TYPE_INT) {
+        return 1;
+    }
+    if (from->kind == HIR_TYPE_INT && to->kind == HIR_TYPE_POINTER) {
+        return 1;
+    }
+    return 0;
+}
+
+static HirType* pointer_to_type(LowerContext* ctx, HirType* pointee) {
+    HirType* pointer = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+    pointer->array_item = pointee;
+    return pointer;
 }
 
 static HirType* lower_type(LowerContext* ctx, const AstType* type) {
@@ -342,10 +436,11 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
     }
 }
 
-static HirBinding* new_binding(HirType* type, const char* name, HirBindingKind kind, int line) {
+static HirBinding* new_binding(HirType* type, int mutable_flag, const char* name, HirBindingKind kind, int line) {
     HirBinding* binding = (HirBinding*)calloc(1, sizeof(HirBinding));
     binding->type = type;
     binding->name = (char*)name;
+    binding->mutable_flag = mutable_flag;
     binding->kind = kind;
     binding->line = line;
     return binding;
@@ -538,6 +633,15 @@ static HirExpr* lower_optional_chain_index(LowerContext* ctx, const AstExpr* exp
     if (!some_base) {
         return 0;
     }
+    if (some_base->type->kind == HIR_TYPE_POINTER &&
+        some_base->type->array_item &&
+        (some_base->type->array_item->kind == HIR_TYPE_TUPLE ||
+         some_base->type->array_item->kind == HIR_TYPE_ARRAY ||
+         some_base->type->array_item->kind == HIR_TYPE_SLICE)) {
+        HirExpr* deref = new_expr(HIR_EXPR_DEREF, some_base->type->array_item, expr->line);
+        deref->as.unary.value = some_base;
+        some_base = deref;
+    }
     if (some_base->type->kind == HIR_TYPE_TUPLE) {
         if (expr->as.index.index->kind != AST_EXPR_INT) {
             fail(ctx, "tuple index must be an integer literal");
@@ -585,7 +689,7 @@ static int bind_optional_narrow(LowerContext* ctx, const char* name, HirBlock* o
     if (!original || original->type->kind != HIR_TYPE_OPTIONAL) {
         return 1;
     }
-    narrowed = new_binding(original->type->array_item, (char*)name, HIR_BINDING_LOCAL, line);
+    narrowed = new_binding(original->type->array_item, 0, (char*)name, HIR_BINDING_LOCAL, line);
     if (!bind_in_current_scope(ctx, narrowed)) {
         return 0;
     }
@@ -608,7 +712,7 @@ static int apply_array_length_inference(HirType* declared, HirType* actual) {
         return 0;
     }
     if (declared->kind == HIR_TYPE_ARRAY && actual->kind == HIR_TYPE_ARRAY && declared->array_length < 0) {
-        if (!type_equals(declared->array_item, actual->array_item)) {
+        if (!type_assignment_compatible(actual->array_item, declared->array_item)) {
             return 0;
         }
         declared->array_length = actual->array_length;
@@ -625,7 +729,7 @@ static HirExpr* maybe_decay_array_to_slice(LowerContext* ctx, HirExpr* expr, Hir
     if (expected_type->kind != HIR_TYPE_SLICE || expr->type->kind != HIR_TYPE_ARRAY) {
         return expr;
     }
-    if (!type_equals(expected_type->array_item, expr->type->array_item)) {
+    if (!type_assignment_compatible_inner(expr->type->array_item, expected_type->array_item, 1)) {
         fail(ctx, "array to slice type mismatch");
         return 0;
     }
@@ -667,6 +771,42 @@ static int is_lvalue_expr(const HirExpr* expr) {
         default:
             return 0;
     }
+}
+
+static int is_mutable_assignment_target(const HirExpr* expr) {
+    if (!expr) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case HIR_EXPR_BINDING:
+            return expr->as.binding && expr->as.binding->mutable_flag;
+        case HIR_EXPR_STRUCT_FIELD:
+            return expr->as.struct_field.field && expr->as.struct_field.field->mutable_flag;
+        case HIR_EXPR_INDEX:
+            if (!expr->as.index.base || !expr->as.index.base->type) {
+                return 0;
+            }
+            if ((expr->as.index.base->type->kind == HIR_TYPE_ARRAY || expr->as.index.base->type->kind == HIR_TYPE_SLICE) &&
+                expr->as.index.base->type->array_item) {
+                return expr->as.index.base->type->array_item->mutable_flag;
+            }
+            return 0;
+        case HIR_EXPR_DEREF:
+            return expr->type && expr->type->mutable_flag;
+        default:
+            return 0;
+    }
+}
+
+static int is_struct_init_self_field_assign(LowerContext* ctx, const AstExpr* expr) {
+    return ctx &&
+           ctx->current_function &&
+           ctx->current_function->struct_init_flag &&
+           expr &&
+           expr->kind == AST_EXPR_FIELD &&
+           expr->as.field.base &&
+           expr->as.field.base->kind == AST_EXPR_NAME &&
+           strcmp(expr->as.field.base->as.name, "self") == 0;
 }
 
 static int fail(LowerContext* ctx, const char* error) {
@@ -912,6 +1052,7 @@ static HirBuiltinKind builtin_kind(const char* name) {
     if (strcmp(name, "assert") == 0) return HIR_BUILTIN_ASSERT;
     if (strcmp(name, "print") == 0) return HIR_BUILTIN_PRINT;
     if (strcmp(name, "panic") == 0) return HIR_BUILTIN_PANIC;
+    if (strcmp(name, "__slice_with_capacity") == 0) return HIR_BUILTIN_SLICE_WITH_CAPACITY;
     return HIR_BUILTIN_NONE;
 }
 
@@ -919,6 +1060,32 @@ static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* o
     HirExpr* arg = 0;
     out->as.call.builtin = builtin;
     out->as.call.callee = 0;
+    if (builtin == HIR_BUILTIN_SLICE_WITH_CAPACITY) {
+        HirType* slice_type = 0;
+        if (expr->as.call.type_args.count != 1) {
+            return fail(ctx, "slice with_capacity requires exactly one type argument");
+        }
+        if (expr->as.call.args.count != 1) {
+            return fail(ctx, "slice with_capacity expects exactly one argument");
+        }
+        slice_type = lower_type(ctx, &expr->as.call.type_args.items[0]);
+        if (!slice_type) {
+            return 0;
+        }
+        if (slice_type->kind != HIR_TYPE_SLICE) {
+            return fail(ctx, "slice with_capacity requires slice type");
+        }
+        arg = lower_expr_expected(ctx, expr->as.call.args.items[0], primitive_type(ctx->program, HIR_TYPE_INT));
+        if (!arg) {
+            return 0;
+        }
+        if (arg->type->kind != HIR_TYPE_INT) {
+            return fail(ctx, "slice capacity must be Int");
+        }
+        expr_list_push(&out->as.call.args, arg);
+        out->type = slice_type;
+        return 1;
+    }
     if (builtin == HIR_BUILTIN_PANIC) {
         if (expr->as.call.args.count != 0) return fail(ctx, "panic expects no arguments");
         out->type = primitive_type(ctx->program, HIR_TYPE_INT);
@@ -951,11 +1118,86 @@ static int lower_call_args(LowerContext* ctx, const AstExprList* ast_args, HirEx
         if (!arg) {
             return 0;
         }
-        if (!type_equals(arg->type, callee->params.items[i]->type)) {
+        if (callee->params.items[i]->type->kind == HIR_TYPE_POINTER &&
+            callee->params.items[i]->type->array_item &&
+            callee->params.items[i]->type->array_item->mutable_flag &&
+            arg->kind == HIR_EXPR_ADDR &&
+            (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
+            return fail(ctx, "call argument type mismatch");
+        }
+        if (!type_assignment_compatible(arg->type, callee->params.items[i]->type)) {
             return fail(ctx, "call argument type mismatch");
         }
         expr_list_push(out_args, arg);
     }
+    return 1;
+}
+
+static int lower_struct_init_named_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstExpr* expr, HirExprList* out_args) {
+    const AstStructDecl* ast_struct = 0;
+    HirFunction* init_fn = 0;
+    int param_count = 0;
+    int i = 0;
+    int* seen = 0;
+    if (!struct_decl->has_init) {
+        return fail(ctx, "internal error: struct has no init");
+    }
+    ast_struct = find_ast_struct(ctx->ast, struct_decl->name);
+    if (!ast_struct || !ast_struct->has_init) {
+        return fail(ctx, "internal error: missing struct init metadata");
+    }
+    init_fn = find_function(ctx->program, struct_decl->init_name);
+    if (!init_fn) {
+        return fail(ctx, "internal error: missing struct init function");
+    }
+    param_count = ast_struct->init_params.count;
+    if (param_count > 0) {
+        seen = (int*)calloc((size_t)param_count, sizeof(int));
+    }
+    if (param_count > 0 && !seen) {
+        return fail(ctx, "out of memory");
+    }
+    for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+        AstStructFieldInit* ast_field = &expr->as.struct_lit.fields.items[i];
+        int param_index = -1;
+        HirExpr* value = 0;
+        int j = 0;
+        for (j = 0; j < param_count; ++j) {
+            if (strcmp(ast_struct->init_params.items[j].name, ast_field->name) == 0) {
+                param_index = j;
+                break;
+            }
+        }
+        if (param_index < 0) {
+            free(seen);
+            return fail(ctx, "unknown init parameter");
+        }
+        if (seen[param_index]) {
+            free(seen);
+            return fail(ctx, "duplicate init parameter");
+        }
+        value = lower_expr_expected(ctx, ast_field->value, init_fn->params.items[param_index]->type);
+        if (!value) {
+            free(seen);
+            return 0;
+        }
+        seen[param_index] = 1;
+        while (out_args->count < param_index) {
+            expr_list_push(out_args, 0);
+        }
+        if (out_args->count == param_index) {
+            expr_list_push(out_args, value);
+        } else {
+            out_args->items[param_index] = value;
+        }
+    }
+    for (i = 0; i < param_count; ++i) {
+        if (!seen[i]) {
+            free(seen);
+            return fail(ctx, "missing init parameter");
+        }
+    }
+    free(seen);
     return 1;
 }
 
@@ -1186,11 +1428,128 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.bool_value = expr->as.bool_value;
             return out;
         case AST_EXPR_NULL:
-            if (!expected_type || expected_type->kind != HIR_TYPE_OPTIONAL) {
-                fail(ctx, "null requires optional type");
+            if (!expected_type ||
+                (expected_type->kind != HIR_TYPE_OPTIONAL &&
+                 expected_type->kind != HIR_TYPE_POINTER)) {
+                fail(ctx, "null requires optional or pointer type");
                 return 0;
             }
             return new_expr(HIR_EXPR_NULL, expected_type, expr->line);
+        case AST_EXPR_IMPLICIT: {
+            if (expr->as.implicit.target_is_type) {
+                HirType* type = 0;
+                if (strcmp(expr->as.implicit.member, "size") != 0) {
+                    fail(ctx, "unknown implicit type operation");
+                    return 0;
+                }
+                if (expr->as.implicit.args.count != 0) {
+                    fail(ctx, "type implicit operation '.size()' takes no arguments");
+                    return 0;
+                }
+                type = lower_type(ctx, &expr->as.implicit.type_target);
+                if (!type) {
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out->as.int_value = type_size_bytes(type);
+                return out;
+            }
+            if (strcmp(expr->as.implicit.member, "cast") == 0) {
+                HirExpr* value = 0;
+                HirType* target_type = 0;
+                if (!expr->as.implicit.has_type_arg) {
+                    fail(ctx, "cast requires target type");
+                    return 0;
+                }
+                if (expr->as.implicit.args.count != 0) {
+                    fail(ctx, "cast accepts only a type argument");
+                    return 0;
+                }
+                value = lower_expr(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                target_type = lower_type(ctx, &expr->as.implicit.type_arg);
+                if (!target_type) {
+                    return 0;
+                }
+                if (!cast_compatible(value->type, target_type)) {
+                    fail(ctx, "invalid cast");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_CAST, target_type, expr->line);
+                out->as.unary.value = value;
+                return out;
+            }
+            if (strcmp(expr->as.implicit.member, "ref") == 0) {
+                HirExpr* value = 0;
+                HirType* pointer_type = 0;
+                if (expr->as.implicit.args.count != 0) {
+                    fail(ctx, "implicit operation '.ref()' takes no arguments");
+                    return 0;
+                }
+                value = lower_expr(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if (!is_lvalue_expr(value)) {
+                    fail(ctx, "address-of requires lvalue");
+                    return 0;
+                }
+                pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+                pointer_type->array_item = value->type;
+                out = new_expr(HIR_EXPR_ADDR, pointer_type, expr->line);
+                out->as.unary.value = value;
+                return out;
+            }
+            if (strcmp(expr->as.implicit.member, "addr") == 0) {
+                HirExpr* value = 0;
+                HirType* pointer_type = 0;
+                HirExpr* addr = 0;
+                if (expr->as.implicit.has_type_arg || expr->as.implicit.args.count != 0) {
+                    fail(ctx, "implicit operation '.addr()' takes no arguments");
+                    return 0;
+                }
+                value = lower_expr(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if (!is_lvalue_expr(value)) {
+                    fail(ctx, "address-of requires lvalue");
+                    return 0;
+                }
+                pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+                pointer_type->array_item = value->type;
+                addr = new_expr(HIR_EXPR_ADDR, pointer_type, expr->line);
+                addr->as.unary.value = value;
+                out = new_expr(HIR_EXPR_CAST, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out->as.unary.value = addr;
+                return out;
+            }
+            if (strcmp(expr->as.implicit.member, "free") == 0) {
+                HirExpr* value = 0;
+                if (expr->as.implicit.args.count != 0) {
+                    fail(ctx, "implicit operation '.free()' takes no arguments");
+                    return 0;
+                }
+                value = lower_expr(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if (value->type->kind != HIR_TYPE_POINTER) {
+                    fail(ctx, "free requires pointer");
+                    return 0;
+                }
+                if (value->kind == HIR_EXPR_BINDING) {
+                    mark_binding_freed(ctx, value->as.binding);
+                }
+                out = new_expr(HIR_EXPR_FREE, primitive_type(ctx->program, HIR_TYPE_VOID), expr->line);
+                out->as.unary.value = value;
+                return out;
+            }
+            fail(ctx, "unknown implicit value operation");
+            return 0;
+        }
         case AST_EXPR_SIZE_OF: {
             HirType* type = lower_type(ctx, &expr->as.size_of_type);
             if (!type) {
@@ -1397,8 +1756,6 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                          owner_type->array_item->kind == HIR_TYPE_ENUM ||
                          owner_type->array_item->kind == HIR_TYPE_UNION)) {
                         owner_type = owner_type->array_item;
-                        receiver_arg = new_expr(HIR_EXPR_DEREF, owner_type, expr->line);
-                        receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
                     }
                     method = find_method(ctx->program, owner_type, member_name, 0);
                     if (method) {
@@ -1407,6 +1764,17 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             free(owner_name);
                             fail(ctx, "call argument count mismatch");
                             return 0;
+                        }
+                        if (owner_type->kind == HIR_TYPE_STRUCT) {
+                            if (owner_binding->type->kind == HIR_TYPE_POINTER) {
+                                receiver_arg = make_binding_expr(owner_binding, expr->line);
+                            } else {
+                                receiver_arg = new_expr(HIR_EXPR_ADDR, pointer_to_type(ctx, owner_type), expr->line);
+                                receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
+                            }
+                        } else if (owner_binding->type->kind == HIR_TYPE_POINTER) {
+                            receiver_arg = new_expr(HIR_EXPR_DEREF, owner_type, expr->line);
+                            receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
                         }
                         out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
                         out->as.call.callee = method;
@@ -1417,7 +1785,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 free(owner_name);
                                 return 0;
                             }
-                            if (!type_equals(arg->type, method->params.items[i + 1]->type)) {
+                            if (!type_assignment_compatible(arg->type, method->params.items[i + 1]->type)) {
                                 free(owner_name);
                                 fail(ctx, "call argument type mismatch");
                                 return 0;
@@ -1492,25 +1860,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 if (dot) {
                     size_t prefix_len = (size_t)(dot - expr->as.call.callee);
                     if (strcmp(dot + 1, "init") == 0) {
-                        char* type_name = (char*)malloc(prefix_len + 1);
-                        HirStructDecl* struct_decl = 0;
-                        if (!type_name) {
-                            fail(ctx, "out of memory");
-                            return 0;
-                        }
-                        memcpy(type_name, expr->as.call.callee, prefix_len);
-                        type_name[prefix_len] = '\0';
-                        struct_decl = find_struct(ctx->program, type_name);
-                        free(type_name);
-                        if (struct_decl && struct_decl->has_init) {
-                            callee = find_function(ctx->program, struct_decl->init_name);
-                        }
+                        fail(ctx, "use 'Type { ... }' for initialization");
+                        return 0;
                     }
-                } else {
-                    HirStructDecl* struct_decl = find_struct(ctx->program, expr->as.call.callee);
-                    if (struct_decl && struct_decl->has_init) {
-                        callee = find_function(ctx->program, struct_decl->init_name);
-                    }
+                } else if (find_struct(ctx->program, expr->as.call.callee)) {
+                    fail(ctx, "use 'Type { ... }' for initialization");
+                    return 0;
                 }
             }
             if (!callee) {
@@ -1571,7 +1926,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     if (!out->as.variant.payload) {
                         return 0;
                     }
-                    if (!type_equals(out->as.variant.payload->type, expected_variant->payload_type)) {
+                    if (!type_assignment_compatible(out->as.variant.payload->type, expected_variant->payload_type)) {
                         fail(ctx, "variant payload type mismatch");
                         return 0;
                     }
@@ -1623,7 +1978,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (!out->as.variant.payload) {
                 return 0;
             }
-            if (!type_equals(out->as.variant.payload->type, variant->payload_type)) {
+            if (!type_assignment_compatible(out->as.variant.payload->type, variant->payload_type)) {
                 fail(ctx, "variant payload type mismatch");
                 return 0;
             }
@@ -1656,6 +2011,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     return out;
                 }
             }
+            if (base_type->kind == HIR_TYPE_SLICE && strcmp(expr->as.field.name, "length") == 0) {
+                out = new_expr(HIR_EXPR_SLICE_LENGTH, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out->as.slice_length.base = base;
+                return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+            }
             if (base_type->kind == HIR_TYPE_STRUCT) {
                 int field_index = -1;
                 HirStructField* field = find_struct_field(base_type->struct_decl, expr->as.field.name, &field_index);
@@ -1683,6 +2043,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             struct_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
             struct_type->struct_decl = struct_decl;
+            if (struct_decl->has_init) {
+                HirFunction* init_fn = find_function(ctx->program, struct_decl->init_name);
+                if (!init_fn) {
+                    fail(ctx, "internal error: missing struct init function");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_CALL, init_fn->return_type, expr->line);
+                out->as.call.callee = init_fn;
+                out->as.call.builtin = HIR_BUILTIN_NONE;
+                if (!lower_struct_init_named_args(ctx, struct_decl, expr, &out->as.call.args)) {
+                    return 0;
+                }
+                return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+            }
             out = new_expr(HIR_EXPR_STRUCT, struct_type, expr->line);
             seen = (int*)calloc((size_t)struct_decl->fields.count, sizeof(int));
             if (!seen) {
@@ -1712,7 +2086,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     free(seen);
                     return 0;
                 }
-                if (!type_equals(value->type, field->type)) {
+                if (!type_assignment_compatible(value->type, field->type)) {
                     free(seen);
                     fail(ctx, "struct field initializer type mismatch");
                     return 0;
@@ -1804,6 +2178,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         fail(ctx, "comparison operand type unsupported");
                         return 0;
                     }
+                } else if (left->type->kind == HIR_TYPE_POINTER) {
+                    if (expr->as.binary.op != AST_BIN_EQ && expr->as.binary.op != AST_BIN_NE) {
+                        fail(ctx, "comparison operand type unsupported");
+                        return 0;
+                    }
                 } else if (left->type->kind != HIR_TYPE_INT && left->type->kind != HIR_TYPE_UINT8 && left->type->kind != HIR_TYPE_BOOL && left->type->kind != HIR_TYPE_ENUM) {
                     fail(ctx, "comparison operand type unsupported");
                     return 0;
@@ -1842,7 +2221,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
                 if (i == 0) {
                     array_type->array_item = item->type;
-                } else if (!type_equals(array_type->array_item, item->type)) {
+                } else if (!type_assignment_compatible(item->type, array_type->array_item)) {
                     fail(ctx, "array literal items must have matching types");
                     return 0;
                 }
@@ -1859,6 +2238,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             HirExpr* index = 0;
             if (!base) {
                 return 0;
+            }
+            if (base->type->kind == HIR_TYPE_POINTER &&
+                base->type->array_item &&
+                (base->type->array_item->kind == HIR_TYPE_TUPLE ||
+                 base->type->array_item->kind == HIR_TYPE_ARRAY ||
+                 base->type->array_item->kind == HIR_TYPE_SLICE)) {
+                HirExpr* deref = new_expr(HIR_EXPR_DEREF, base->type->array_item, expr->line);
+                deref->as.unary.value = base;
+                base = deref;
             }
             index = lower_expr(ctx, expr->as.index.index);
             if (!index) {
@@ -2027,7 +2415,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 if (!out->as.ret.expr) {
                     return 0;
                 }
-                if (!type_equals(out->as.ret.expr->type, ctx->current_function->return_type)) {
+                if (!type_assignment_compatible(out->as.ret.expr->type, ctx->current_function->return_type)) {
                     fail(ctx, "return type mismatch");
                     return 0;
                 }
@@ -2053,12 +2441,12 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 if (!init) {
                     return 0;
                 }
-                if (!type_equals(init->type, type) && !apply_array_length_inference(type, init->type)) {
+                if (!type_assignment_compatible(init->type, type) && !apply_array_length_inference(type, init->type)) {
                     fail(ctx, "variable initializer type mismatch");
                     return 0;
                 }
             }
-            binding = new_binding(type, stmt->as.var_decl.name, HIR_BINDING_LOCAL, stmt->line);
+            binding = new_binding(type, stmt->as.var_decl.type.mutable_flag, stmt->as.var_decl.name, HIR_BINDING_LOCAL, stmt->line);
             if (!bind_in_current_scope(ctx, binding)) {
                 return 0;
             }
@@ -2085,6 +2473,11 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 fail(ctx, "assignment target not found");
                 return 0;
             }
+            if (!is_struct_init_self_field_assign(ctx, stmt->as.assign.target) &&
+                !is_mutable_assignment_target(out->as.assign.target)) {
+                fail(ctx, "assignment target is immutable");
+                return 0;
+            }
             out->as.assign.value = lower_expr_expected(ctx, stmt->as.assign.value, out->as.assign.target->type);
             if (!out->as.assign.value) {
                 return 0;
@@ -2093,7 +2486,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             if (!out->as.assign.value) {
                 return 0;
             }
-            if (!type_equals(out->as.assign.value->type, out->as.assign.target->type)) {
+            if (!type_assignment_compatible(out->as.assign.value->type, out->as.assign.target->type)) {
                 fail(ctx, "assignment type mismatch");
                 return 0;
             }
@@ -2195,7 +2588,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 fail(ctx, "for-range currently requires Int bounds");
                 return 0;
             }
-            binding = new_binding(primitive_type(ctx->program, HIR_TYPE_INT), stmt->as.for_range.name, HIR_BINDING_LOCAL, stmt->line);
+            binding = new_binding(primitive_type(ctx->program, HIR_TYPE_INT), stmt->as.for_range.type.mutable_flag, stmt->as.for_range.name, HIR_BINDING_LOCAL, stmt->line);
             binding_list_push(&ctx->current_function->locals, binding);
             out->as.for_range.binding = binding;
             out->as.for_range.start = start;
@@ -2254,11 +2647,11 @@ static int lower_destructure_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlo
             type = init->type;
         } else {
             type = lower_type(ctx, &stmt->as.destructure.bindings.items[0].type);
-            if (!type_equals(type, init->type)) {
+            if (!type_assignment_compatible(init->type, type)) {
                 return fail(ctx, "destructure binding type mismatch");
             }
         }
-        binding = new_binding(type, stmt->as.destructure.bindings.items[0].name, HIR_BINDING_LOCAL, stmt->as.destructure.bindings.items[0].line);
+        binding = new_binding(type, stmt->as.destructure.bindings.items[0].type.mutable_flag, stmt->as.destructure.bindings.items[0].name, HIR_BINDING_LOCAL, stmt->as.destructure.bindings.items[0].line);
         if (!bind_in_current_scope(ctx, binding)) {
             return 0;
         }
@@ -2277,7 +2670,7 @@ static int lower_destructure_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlo
     }
     {
         char* temp_name = make_temp_name(ctx);
-        HirBinding* temp_binding = new_binding(init->type, temp_name, HIR_BINDING_LOCAL, stmt->line);
+        HirBinding* temp_binding = new_binding(init->type, 0, temp_name, HIR_BINDING_LOCAL, stmt->line);
         HirStmt* temp_decl = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
         binding_list_push(&ctx->current_function->locals, temp_binding);
         temp_decl->as.var_decl.binding = temp_binding;
@@ -2293,11 +2686,11 @@ static int lower_destructure_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlo
                 binding_type = item_type;
             } else {
                 binding_type = lower_type(ctx, &stmt->as.destructure.bindings.items[i].type);
-                if (!type_equals(binding_type, item_type)) {
+                if (!type_assignment_compatible(item_type, binding_type)) {
                     return fail(ctx, "destructure binding type mismatch");
                 }
             }
-            binding = new_binding(binding_type, stmt->as.destructure.bindings.items[i].name, HIR_BINDING_LOCAL, stmt->as.destructure.bindings.items[i].line);
+            binding = new_binding(binding_type, stmt->as.destructure.bindings.items[i].type.mutable_flag, stmt->as.destructure.bindings.items[i].name, HIR_BINDING_LOCAL, stmt->as.destructure.bindings.items[i].line);
             if (!bind_in_current_scope(ctx, binding)) {
                 return 0;
             }
@@ -2627,11 +3020,11 @@ static int lower_pattern_bind(LowerContext* ctx, const AstBindingPattern* patter
             type = init->type;
         } else {
             type = lower_type(ctx, &pattern->type);
-            if (!type_equals(type, init->type)) {
+            if (!type_assignment_compatible(init->type, type)) {
                 return fail(ctx, "binding type mismatch");
             }
         }
-        binding = new_binding(type, pattern->name, HIR_BINDING_LOCAL, pattern->line);
+        binding = new_binding(type, pattern->type.mutable_flag, pattern->name, HIR_BINDING_LOCAL, pattern->line);
         if (!bind_in_current_scope(ctx, binding)) {
             return 0;
         }
@@ -2676,7 +3069,7 @@ static int lower_for_each_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock*
         return fail(ctx, "for-each currently requires an array iterable");
     }
     iterable_name = make_temp_name(ctx);
-    iterable_binding = new_binding(iterable->type, iterable_name, HIR_BINDING_LOCAL, stmt->line);
+    iterable_binding = new_binding(iterable->type, 0, iterable_name, HIR_BINDING_LOCAL, stmt->line);
     binding_list_push(&ctx->current_function->locals, iterable_binding);
     iterable_decl = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
     iterable_decl->as.var_decl.binding = iterable_binding;
@@ -2684,7 +3077,7 @@ static int lower_for_each_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock*
     stmt_list_push(&out_block->stmts, iterable_decl);
 
     index_name = make_temp_name(ctx);
-    index_binding = new_binding(primitive_type(ctx->program, HIR_TYPE_INT), index_name, HIR_BINDING_LOCAL, stmt->line);
+    index_binding = new_binding(primitive_type(ctx->program, HIR_TYPE_INT), 0, index_name, HIR_BINDING_LOCAL, stmt->line);
     binding_list_push(&ctx->current_function->locals, index_binding);
     loop_stmt = new_stmt(HIR_STMT_FOR_RANGE, stmt->line);
     loop_stmt->as.for_range.binding = index_binding;
@@ -2765,7 +3158,7 @@ static int register_globals(LowerContext* ctx) {
         if (ast_global->type.kind != AST_TYPE_INFER) {
             type = lower_type(ctx, &ast_global->type);
         }
-        hir_global.binding = new_binding(type, ast_global->name, HIR_BINDING_GLOBAL, ast_global->line);
+        hir_global.binding = new_binding(type, ast_global->type.mutable_flag, ast_global->name, HIR_BINDING_GLOBAL, ast_global->line);
         hir_global.line = ast_global->line;
         global_list_push(&ctx->program->globals, hir_global);
         hashmap_set(&ctx->program->global_map, hir_global.binding->name, (void*)1);
@@ -2821,6 +3214,10 @@ static int register_structs(LowerContext* ctx) {
         struct_decl.has_init = ast_struct->has_init;
         if (ast_struct->has_init) {
             struct_decl.init_name = make_struct_init_name(ast_struct->name);
+        }
+        struct_decl.has_deinit = ast_struct->has_deinit;
+        if (ast_struct->has_deinit) {
+            struct_decl.deinit_name = make_struct_deinit_name(ast_struct->name);
         }
         struct_list_push(&ctx->program->structs, struct_decl);
         hashmap_set(&ctx->program->type_name_map, ast_struct->name, (void*)1);
@@ -2938,9 +3335,40 @@ static int register_struct_init_functions(LowerContext* ctx) {
         hir_fn.struct_init_flag = 1;
         hir_fn.owner_struct = struct_decl;
         for (param_index = 0; param_index < ast_struct->init_params.count; ++param_index) {
-            HirBinding* param_binding = new_binding(lower_type(ctx, &ast_struct->init_params.items[param_index].type), ast_struct->init_params.items[param_index].name, HIR_BINDING_PARAM, ast_struct->init_params.items[param_index].line);
+            HirBinding* param_binding = new_binding(lower_type(ctx, &ast_struct->init_params.items[param_index].type), ast_struct->init_params.items[param_index].type.mutable_flag, ast_struct->init_params.items[param_index].name, HIR_BINDING_PARAM, ast_struct->init_params.items[param_index].line);
             binding_list_push(&hir_fn.params, param_binding);
         }
+        function_list_push(&ctx->program->functions, hir_fn);
+        hashmap_set(&ctx->program->function_map, hir_fn.name, (void*)1);
+    }
+    rebuild_function_map(ctx->program);
+    return 1;
+}
+
+static int register_struct_deinit_functions(LowerContext* ctx) {
+    int i = 0;
+    for (i = 0; i < ctx->program->structs.count; ++i) {
+        const AstStructDecl* ast_struct = &ctx->ast->structs.items[i];
+        HirStructDecl* struct_decl = &ctx->program->structs.items[i];
+        HirFunction hir_fn;
+        HirType* self_type = 0;
+        HirBinding* self_binding = 0;
+        if (!ast_struct->has_deinit) {
+            continue;
+        }
+        if (hashmap_contains(&ctx->program->function_map, struct_decl->deinit_name)) {
+            return fail(ctx, "duplicate function");
+        }
+        memset(&hir_fn, 0, sizeof(hir_fn));
+        hir_fn.return_type = primitive_type(ctx->program, HIR_TYPE_VOID);
+        hir_fn.name = struct_decl->deinit_name;
+        hir_fn.line = ast_struct->deinit_line;
+        hir_fn.struct_deinit_flag = 1;
+        hir_fn.owner_struct = struct_decl;
+        self_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+        self_type->struct_decl = struct_decl;
+        self_binding = new_binding(self_type, 1, "self", HIR_BINDING_PARAM, ast_struct->deinit_line);
+        binding_list_push(&hir_fn.params, self_binding);
         function_list_push(&ctx->program->functions, hir_fn);
         hashmap_set(&ctx->program->function_map, hir_fn.name, (void*)1);
     }
@@ -2986,12 +3414,16 @@ static int register_functions(LowerContext* ctx) {
                 return fail(ctx, "duplicate function");
             }
             if (!ast_fn->static_method_flag) {
-                HirBinding* self_binding = new_binding(hir_fn.receiver_type, "self", HIR_BINDING_PARAM, ast_fn->line);
+                HirType* self_type = hir_fn.receiver_type;
+                if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT) {
+                    self_type = pointer_to_type(ctx, hir_fn.receiver_type);
+                }
+                HirBinding* self_binding = new_binding(self_type, 1, "self", HIR_BINDING_PARAM, ast_fn->line);
                 binding_list_push(&hir_fn.params, self_binding);
             }
         }
         for (param_index = 0; param_index < ast_fn->params.count; ++param_index) {
-            HirBinding* param_binding = new_binding(lower_type(ctx, &ast_fn->params.items[param_index].type), ast_fn->params.items[param_index].name, HIR_BINDING_PARAM, ast_fn->params.items[param_index].line);
+            HirBinding* param_binding = new_binding(lower_type(ctx, &ast_fn->params.items[param_index].type), ast_fn->params.items[param_index].type.mutable_flag, ast_fn->params.items[param_index].name, HIR_BINDING_PARAM, ast_fn->params.items[param_index].line);
             binding_list_push(&hir_fn.params, param_binding);
         }
         function_list_push(&ctx->program->functions, hir_fn);
@@ -3015,7 +3447,7 @@ static int lower_globals(LowerContext* ctx) {
         }
         if (ctx->ast->globals.items[i].type.kind == AST_TYPE_INFER) {
             hir_global->binding->type = hir_global->init->type;
-        } else if (!type_equals(hir_global->init->type, hir_global->binding->type) &&
+        } else if (!type_assignment_compatible(hir_global->init->type, hir_global->binding->type) &&
                    !apply_array_length_inference(hir_global->binding->type, hir_global->init->type)) {
             return fail(ctx, "global initializer type mismatch");
         }
@@ -3062,7 +3494,7 @@ static int lower_functions(LowerContext* ctx) {
                 }
             }
             free(field_state);
-            self_binding = new_binding(ctx->current_function->return_type, "self", HIR_BINDING_LOCAL, ast_struct->init_line);
+            self_binding = new_binding(ctx->current_function->return_type, 1, "self", HIR_BINDING_LOCAL, ast_struct->init_line);
             binding_list_push(&ctx->current_function->locals, self_binding);
             if (!bind_in_current_scope(ctx, self_binding)) {
                 return 0;
@@ -3102,6 +3534,26 @@ static int lower_functions(LowerContext* ctx) {
                 ret->as.ret.expr = make_binding_expr(self_binding, ast_struct->init_line);
                 stmt_list_push(&ctx->current_function->body.stmts, ret);
             }
+        } else if (ctx->current_function->struct_deinit_flag) {
+            const AstStructDecl* ast_struct = find_ast_struct(ctx->ast, ctx->current_function->owner_struct->name);
+            int param_index = 0;
+            if (!ast_struct) {
+                return fail(ctx, "internal error: missing struct deinit metadata");
+            }
+            for (param_index = 0; param_index < ctx->current_function->params.count; ++param_index) {
+                if (!bind_in_current_scope(ctx, ctx->current_function->params.items[param_index])) {
+                    return 0;
+                }
+            }
+            if (!lower_block(ctx, &ast_struct->deinit_body, &ctx->current_function->body)) {
+                return 0;
+            }
+            if (ctx->current_function->body.stmts.count == 0 ||
+                ctx->current_function->body.stmts.items[ctx->current_function->body.stmts.count - 1]->kind != HIR_STMT_RETURN) {
+                HirStmt* ret = new_stmt(HIR_STMT_RETURN, ast_struct->deinit_line);
+                ret->as.ret.expr = 0;
+                stmt_list_push(&ctx->current_function->body.stmts, ret);
+            }
         } else {
             int param_index = 0;
             for (param_index = 0; param_index < ctx->current_function->params.count; ++param_index) {
@@ -3137,7 +3589,7 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     hashmap_init(&hir->variant_map);
     ctx.program = hir;
     ctx.ast = ast;
-    if (!register_enums(&ctx) || !register_structs(&ctx) || !register_unions(&ctx) || !resolve_struct_fields(&ctx) || !resolve_union_variants(&ctx) || !register_globals(&ctx) || !register_struct_init_functions(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
+    if (!register_enums(&ctx) || !register_structs(&ctx) || !register_unions(&ctx) || !resolve_struct_fields(&ctx) || !resolve_union_variants(&ctx) || !register_globals(&ctx) || !register_struct_init_functions(&ctx) || !register_struct_deinit_functions(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
         *error = ctx.error;
         return 0;
     }

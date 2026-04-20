@@ -311,6 +311,16 @@ static LLVMValueRef llvm_function_for(const JirProgram* program, LLVMModuleRef m
     return LLVMGetNamedFunction(module, function->name);
 }
 
+static const JirFunction* find_jir_function(const JirProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->functions.count; ++i) {
+        if (strcmp(program->functions.items[i].name, name) == 0) {
+            return &program->functions.items[i];
+        }
+    }
+    return 0;
+}
+
 static LLVMValueRef llvm_global_for(LLVMModuleRef module, const JirBinding* binding) {
     return LLVMGetNamedGlobal(module, binding->name);
 }
@@ -390,6 +400,26 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
     args[0] = gep_cstr(cg->builder, get_or_add_format_string(cg->module, cg->context, ".str.int", "%lld\n"));
     args[1] = arg;
     return LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(printf_fn), printf_fn, args, 2, "printtmp");
+}
+
+static LLVMValueRef emit_builtin_slice_with_capacity(FunctionCodegen* cg, const JirExpr* expr) {
+    LLVMTypeRef elem_type = llvm_type(cg->context, expr->type->array_item);
+    LLVMTypeRef slice_type = llvm_type(cg->context, expr->type);
+    LLVMValueRef capacity = emit_expr(cg, expr->as.call.args.items[0]);
+    LLVMValueRef elem_bytes = LLVMSizeOf(elem_type);
+    LLVMValueRef total_bytes = LLVMBuildMul(cg->builder, capacity, elem_bytes, "slice.bytes");
+    LLVMValueRef raw_ptr = LLVMBuildCall2(
+        cg->builder,
+        LLVMGlobalGetValueType(get_or_add_malloc(cg->module, cg->context)),
+        get_or_add_malloc(cg->module, cg->context),
+        &total_bytes,
+        1,
+        "slice.malloc");
+    LLVMValueRef typed_ptr = LLVMBuildBitCast(cg->builder, raw_ptr, LLVMPointerType(elem_type, 0), "slice.data");
+    LLVMValueRef slice_value = LLVMGetUndef(slice_type);
+    slice_value = LLVMBuildInsertValue(cg->builder, slice_value, typed_ptr, 0, "slice.ins.ptr");
+    slice_value = LLVMBuildInsertValue(cg->builder, slice_value, capacity, 1, "slice.ins.len");
+    return slice_value;
 }
 
 static LLVMValueRef emit_plain_call(FunctionCodegen* cg, const JirFunction* callee_fn, const JirExprList* args_list, const JirType* result_type) {
@@ -495,6 +525,30 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_ADDR:
             return emit_lvalue_ptr(cg, expr->as.unary.value);
+        case JIR_EXPR_CAST: {
+            LLVMValueRef value = emit_expr(cg, expr->as.unary.value);
+            JirTypeKind from_kind = expr->as.unary.value->type->kind;
+            JirTypeKind to_kind = expr->type->kind;
+            if (from_kind == to_kind) {
+                return value;
+            }
+            if ((from_kind == JIR_TYPE_INT || from_kind == JIR_TYPE_UINT8 || from_kind == JIR_TYPE_BOOL) &&
+                (to_kind == JIR_TYPE_INT || to_kind == JIR_TYPE_UINT8 || to_kind == JIR_TYPE_BOOL)) {
+                return LLVMBuildIntCast2(
+                    cg->builder,
+                    value,
+                    llvm_type(cg->context, expr->type),
+                    from_kind == JIR_TYPE_INT,
+                    "casttmp");
+            }
+            if (from_kind == JIR_TYPE_POINTER && to_kind == JIR_TYPE_INT) {
+                return LLVMBuildPtrToInt(cg->builder, value, llvm_type(cg->context, expr->type), "ptrtoint");
+            }
+            if (from_kind == JIR_TYPE_INT && to_kind == JIR_TYPE_POINTER) {
+                return LLVMBuildIntToPtr(cg->builder, value, llvm_type(cg->context, expr->type), "inttoptr");
+            }
+            return 0;
+        }
         case JIR_EXPR_DEREF:
             return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), emit_expr(cg, expr->as.unary.value), "deref");
         case JIR_EXPR_NEW: {
@@ -512,6 +566,41 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         }
         case JIR_EXPR_FREE: {
             LLVMValueRef ptr = emit_expr(cg, expr->as.unary.value);
+            if (expr->as.unary.value->type &&
+                expr->as.unary.value->type->kind == JIR_TYPE_POINTER &&
+                expr->as.unary.value->type->array_item &&
+                expr->as.unary.value->type->array_item->kind == JIR_TYPE_SLICE) {
+                LLVMValueRef slice_value = LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->as.unary.value->type->array_item), ptr, "slice.free.value");
+                LLVMValueRef data_ptr = LLVMBuildExtractValue(cg->builder, slice_value, 0, "slice.free.data");
+                LLVMValueRef data_raw_ptr = LLVMBuildBitCast(cg->builder, data_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "slice.free.raw");
+                LLVMBuildCall2(
+                    cg->builder,
+                    LLVMGlobalGetValueType(get_or_add_free(cg->module, cg->context)),
+                    get_or_add_free(cg->module, cg->context),
+                    &data_raw_ptr,
+                    1,
+                    "");
+            }
+            if (expr->as.unary.value->type &&
+                expr->as.unary.value->type->kind == JIR_TYPE_POINTER &&
+                expr->as.unary.value->type->array_item &&
+                expr->as.unary.value->type->array_item->kind == JIR_TYPE_STRUCT &&
+                expr->as.unary.value->type->array_item->struct_has_deinit &&
+                expr->as.unary.value->type->array_item->struct_deinit_name) {
+                const JirFunction* deinit_fn = find_jir_function(cg->program, expr->as.unary.value->type->array_item->struct_deinit_name);
+                if (deinit_fn) {
+                    LLVMValueRef self_value = LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->as.unary.value->type->array_item), ptr, "deinit.self");
+                    LLVMValueRef args[1];
+                    args[0] = self_value;
+                    LLVMBuildCall2(
+                        cg->builder,
+                        LLVMGlobalGetValueType(llvm_function_for(cg->program, cg->module, deinit_fn)),
+                        llvm_function_for(cg->program, cg->module, deinit_fn),
+                        args,
+                        1,
+                        "");
+                }
+            }
             LLVMValueRef raw_ptr = LLVMBuildBitCast(cg->builder, ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "free.ptr");
             LLVMBuildCall2(
                 cg->builder,
@@ -531,6 +620,9 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             }
             if (expr->as.call.builtin == JIR_BUILTIN_PANIC) {
                 return emit_builtin_panic(cg);
+            }
+            if (expr->as.call.builtin == JIR_BUILTIN_SLICE_WITH_CAPACITY) {
+                return emit_builtin_slice_with_capacity(cg, expr);
             }
             return emit_plain_call(cg, expr->as.call.callee, &expr->as.call.args, expr->type);
         }
