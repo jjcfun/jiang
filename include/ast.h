@@ -45,6 +45,7 @@ typedef struct AstNameList {
 struct AstImportDecl {
     char* alias_name;
     char* path;
+    int public_flag;
     int line;
 };
 
@@ -69,6 +70,21 @@ typedef struct AstAliasList {
 
 typedef enum AstTypeKind {
     AST_TYPE_INT = 0,
+    AST_TYPE_I8,
+    AST_TYPE_I16,
+    AST_TYPE_I32,
+    AST_TYPE_I64,
+    AST_TYPE_U8,
+    AST_TYPE_U16,
+    AST_TYPE_U32,
+    AST_TYPE_U64,
+    AST_TYPE_F16,
+    AST_TYPE_F32,
+    AST_TYPE_F64,
+    AST_TYPE_FLOAT,
+    AST_TYPE_DOUBLE,
+    AST_TYPE_CHARACTER,
+    AST_TYPE_STRING,
     AST_TYPE_UINT8,
     AST_TYPE_BOOL,
     AST_TYPE_VOID,
@@ -111,6 +127,8 @@ typedef struct AstStructFieldInitList {
 
 typedef enum AstExprKind {
     AST_EXPR_INT = 0,
+    AST_EXPR_FLOAT,
+    AST_EXPR_CHAR,
     AST_EXPR_BOOL,
     AST_EXPR_STRING,
     AST_EXPR_NULL,
@@ -187,6 +205,8 @@ struct AstExpr {
     int line;
     union {
         int64_t int_value;
+        double float_value;
+        int64_t char_value;
         int bool_value;
         struct {
             char* text;
@@ -415,6 +435,7 @@ typedef struct AstFunction {
 
 struct AstEnumDecl {
     char* name;
+    AstNameList concept_names;
     AstEnumMemberList members;
     int public_flag;
     int line;
@@ -424,6 +445,7 @@ struct AstStructDecl {
     char* name;
     AstNameList type_params;
     AstWhereConstraintList where_constraints;
+    AstNameList concept_names;
     AstStructFieldList fields;
     AstParamList init_params;
     AstBlock init_body;
@@ -464,6 +486,7 @@ typedef struct AstUnionVariantList {
 struct AstUnionDecl {
     char* tag_name;
     char* name;
+    AstNameList concept_names;
     AstUnionVariantList variants;
     int public_flag;
     int line;

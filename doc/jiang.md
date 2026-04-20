@@ -68,9 +68,15 @@ Int?[3]* c = new {1, null, 3}
 ```c
 Int a1 = -123;
 UInt8 a2 = 23;
+Character ch = 'a';
 UInt8[3] a3 = "abc";
+Int16 a4 = -45;
+UInt16 a5 = 512;
 Float num3 = 12.3;
 Double num4 = 132.54;
+Float16 num5 = 1.5;
+Float32 num6 = 2.5;
+Float64 num7 = 3.5;
 
 // 类型后紧跟'!'号，表示可变
 Bool! foo = true;
@@ -81,8 +87,24 @@ _ x = 100; // 推断为 Int
 
 _ y = 3.14; // 推断为 Double
 
-_ name = "Jiang"; // 推断为UInt8[5]
+_ name = "Jiang"; // 推断为 UInt8[_]
 ```
+
+其中：
+
+- `Character` 表示单个 Unicode 标量
+- 字符串字面量按 UTF-8 字节序列处理，当前仍使用 `UInt8[_]` / `UInt8[]`
+- `()` 表示空元组，同时承担无返回值语义；语言表面不再提供单独的 `Void` 类型名
+
+当前数值自动提升仅覆盖 `Int / Float / Double`：
+
+```c
+Float f = 0.5$.as(Float);
+Float a = 2 + f;   // Int + Float -> Float
+Double b = 2 + 0.5; // Int + Double -> Double
+```
+
+`%` 仍然只允许整数参与；`Double -> Float`、`Float/Double -> Int` 仍需要显式 `as`。
 
 
 
@@ -112,7 +134,7 @@ if a1 == Option.some(_ x) {
 
 ### 类型转换 (Type Casting)
 
-Jiang 语言支持显式的类型转换，采用 `a$.cast(Type)` 的语法。
+Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 
 这里的 `$` 符号表示**进入隐式操作层**。可以把它理解成：对一个值或一个类型，切换到它的“隐式层 / 元层”再进行操作。
 
@@ -128,7 +150,7 @@ Jiang 语言支持显式的类型转换，采用 `a$.cast(Type)` 的语法。
 
 例如：
 
-- `a$.cast(Int)`：对值 `a` 做类型转换
+- `a$.as(Int)`：对值 `a` 做类型转换
 - `a$.ref()`：从值 `a` 获取一个临时指针
 - `a$.addr()`：获取值 `a` 的地址值
 - `self.data$.free()`：对 `self.data` 这个完整表达式做隐式释放操作
@@ -136,24 +158,24 @@ Jiang 语言支持显式的类型转换，采用 `a$.cast(Type)` 的语法。
 
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
 
-`cast` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数。
+`as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数。
 
 ```c
 Float f = 10.5;
 
 // 将 Float 转换为 Int
-Int i = f$.cast(Int);
+Int i = f$.as(Int);
 
 print("i = %d", i); // 输出：i = 10
 
 // 将 Int 转换为 UInt8
 Int val = 255;
-UInt8 small_val = val$.cast(UInt8);
+UInt8 small_val = val$.as(UInt8);
 
 // 注意：某些危险的转换（如指针强转）可能需要包裹在 sudo 块中
 Int addr = 0x12345678;
 sudo {
-    Int* ptr = addr$.cast(Int*);
+    Int* ptr = addr$.as(Int*);
 }
 ```
 
@@ -395,6 +417,7 @@ Int! x = add(1, 2); 		// 定义变量
 
 ```c
 UInt8[_] str1 = "hello";
+UInt8[] str2 = "hello";
 ```
 
 ### 函数
@@ -946,18 +969,18 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 `@where(...)` 是一种编译期约束注解，用于约束其后一个泛型声明中的类型参数。  
 `@where(...)` 中引用的参数名，必须出现在后续声明的 `<...>` 泛型参数列表中。
 
-#### Concept
+#### Trait
 
-`concept` 用于定义一种**仅存在于编译期**的约束类型。  
-它类似泛型系统里的 trait，但不作为运行时类型使用，也不能直接作为普通变量、字段、参数或返回值类型。
+`trait` 用于定义一种**仅存在于编译期**的约束类型。  
+它不作为运行时类型使用，也不能直接作为普通变量、字段、参数或返回值类型。
 
-例如，`Numbric` 可以被定义为一个 concept，表示“所有数值类型”：
+例如，`Numbric` 可以被定义为一个 trait，表示“所有数值类型”：
 
 ```c
-concept Numbric;
+trait Numbric;
 ```
 
-`std/prelude.jiang` 中默认提供了一些常用 concept，例如：
+`std/prelude.jiang` 中默认提供了一些常用 trait，例如：
 
 - `Numbric`
 - `Hashable`
@@ -965,10 +988,10 @@ concept Numbric;
 
 其中 `Numbric`、`Hashable` 和 `Equatable` 因为来自隐式预导入的 `std/prelude.jiang`，所以可以直接用于 `@where(...)`。
 
-用户也可以自定义 concept，并声明内部函数签名，用于约束满足该 concept 的类型必须提供对应实例方法：
+用户也可以自定义 trait，并声明内部函数签名，用于约束满足该 trait 的类型必须提供对应实例方法：
 
 ```c
-concept Hashable {
+trait Hashable {
   Int hash();
 }
 ```
@@ -978,7 +1001,9 @@ concept Hashable {
 - `Int`、`Float`、`Double` 等数值类型可以被视为满足 `Numbric`
 - `Numbric` 本身不能直接写成 `Numbric x;`
 - `Numbric` 主要用于 `@where(...)` 这类泛型约束位置
-- concept 内部函数当前用于声明**约束签名**，不是运行时成员，也不是默认实现
+- trait 内部函数当前用于声明**约束签名**，不是运行时成员，也不是默认实现
+- 用户自定义类型若要满足某个 trait，当前需要在类型定义处显式声明
+- 仅仅“方法签名刚好匹配”并不会自动满足 trait
 
 例如：
 
@@ -986,6 +1011,20 @@ concept Hashable {
 @where(T: Numbric)
 T add<T>(T a, T b) {
   return a + b;
+}
+```
+
+```c
+trait HasValue {
+  Int value();
+}
+
+struct Box: HasValue {
+  Int inner;
+
+  Int value() {
+    return self.inner;
+  }
 }
 ```
 

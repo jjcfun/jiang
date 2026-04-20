@@ -34,6 +34,91 @@ static char* string_token_dup(const Token* token) {
     return text;
 }
 
+static char* token_slice_dup(const Token* token) {
+    char* text = (char*)malloc(token->length + 1);
+    if (!text) {
+        return 0;
+    }
+    memcpy(text, token->start, token->length);
+    text[token->length] = '\0';
+    return text;
+}
+
+static int hex_digit_value(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+    return -1;
+}
+
+static int parse_char_literal_value(const Token* token, int64_t* out_value) {
+    const char* cursor = 0;
+    const char* end = 0;
+    int64_t value = 0;
+    if (!token || !out_value || token->length < 3 || token->start[0] != '\'' || token->start[token->length - 1] != '\'') {
+        return 0;
+    }
+    cursor = token->start + 1;
+    end = token->start + token->length - 1;
+    if (cursor >= end) {
+        return 0;
+    }
+    if (*cursor != '\\') {
+        if (cursor + 1 != end) {
+            return 0;
+        }
+        *out_value = (unsigned char)*cursor;
+        return 1;
+    }
+    cursor += 1;
+    if (cursor >= end) {
+        return 0;
+    }
+    switch (*cursor) {
+        case 'n': value = '\n'; cursor += 1; break;
+        case 'r': value = '\r'; cursor += 1; break;
+        case 't': value = '\t'; cursor += 1; break;
+        case '0': value = '\0'; cursor += 1; break;
+        case '\\': value = '\\'; cursor += 1; break;
+        case '\'': value = '\''; cursor += 1; break;
+        case '"': value = '"'; cursor += 1; break;
+        case 'u': {
+            cursor += 1;
+            if (cursor >= end || *cursor != '{') {
+                return 0;
+            }
+            cursor += 1;
+            if (cursor >= end) {
+                return 0;
+            }
+            value = 0;
+            while (cursor < end && *cursor != '}') {
+                int digit = hex_digit_value(*cursor);
+                if (digit < 0) {
+                    return 0;
+                }
+                value = (value << 4) | digit;
+                if (value > 0x10FFFF) {
+                    return 0;
+                }
+                cursor += 1;
+            }
+            if (cursor >= end || *cursor != '}') {
+                return 0;
+            }
+            cursor += 1;
+            break;
+        }
+        default:
+            return 0;
+    }
+    if (cursor != end) {
+        return 0;
+    }
+    *out_value = value;
+    return 1;
+}
+
 static char* dup_join3(const char* left, const char* middle, const char* right) {
     size_t left_len = strlen(left);
     size_t middle_len = strlen(middle);
@@ -224,7 +309,7 @@ static int parse_where_annotation(Parser* parser, AstWhereConstraintList* out) {
             return 0;
         }
         if (parser->current.kind != TOKEN_IDENT) {
-            return fail(parser, "expected concept name in @where");
+            return fail(parser, "expected trait name in @where");
         }
         item.concept_name = token_dup(&parser->current);
         advance(parser);
@@ -247,7 +332,7 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
     concept_decl.public_flag = public_flag;
     advance(parser);
     if (parser->current.kind != TOKEN_IDENT) {
-        return fail(parser, "expected concept name");
+        return fail(parser, "expected trait name");
     }
     concept_decl.name = token_dup(&parser->current);
     concept_decl.line = parser->current.line;
@@ -257,21 +342,21 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
         concept_list_push(&out_program->concepts, concept_decl);
         return 1;
     }
-    if (!expect(parser, TOKEN_LEFT_BRACE, "expected ';' or '{' after concept declaration")) {
+    if (!expect(parser, TOKEN_LEFT_BRACE, "expected ';' or '{' after trait declaration")) {
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
         AstConceptMethod method;
         memset(&method, 0, sizeof(method));
         if (!is_type_start(parser)) {
-            return fail(parser, "expected concept method return type");
+            return fail(parser, "expected trait method return type");
         }
         method.return_type = parse_type(parser);
         if (method.return_type.kind == AST_TYPE_INFER) {
-            return fail(parser, "concept method return type cannot be inferred");
+            return fail(parser, "trait method return type cannot be inferred");
         }
         if (parser->current.kind != TOKEN_IDENT) {
-            return fail(parser, "expected concept method name");
+            return fail(parser, "expected trait method name");
         }
         method.name = token_dup(&parser->current);
         method.line = parser->current.line;
@@ -279,12 +364,12 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
         if (!parse_params(parser, &method.params)) {
             return 0;
         }
-        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after concept method")) {
+        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after trait method")) {
             return 0;
         }
         concept_method_list_push(&concept_decl.methods, method);
     }
-    if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after concept declaration")) {
+    if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after trait declaration")) {
         return 0;
     }
     concept_list_push(&out_program->concepts, concept_decl);
@@ -315,19 +400,19 @@ static int looks_like_type_implicit_suffix(Parser* parser) {
 static int looks_like_qualified_type_start(Parser* parser) {
     Parser probe = *parser;
     int seen_dot = 0;
+    int final_is_type = 0;
     if (probe.current.kind != TOKEN_IDENT) {
         return 0;
     }
+    final_is_type = is_type_like_ident(&probe.current);
     advance(&probe);
     while (probe.current.kind == TOKEN_DOT && probe.next.kind == TOKEN_IDENT) {
         seen_dot = 1;
         advance(&probe);
-        if (!is_type_like_ident(&probe.current)) {
-            return 0;
-        }
+        final_is_type = is_type_like_ident(&probe.current);
         advance(&probe);
     }
-    return seen_dot || is_type_like_ident(&parser->current);
+    return seen_dot ? final_is_type : is_type_like_ident(&parser->current);
 }
 
 static int is_known_type(Parser* parser, const Token* token) {
@@ -361,7 +446,7 @@ static int expect(Parser* parser, TokenKind kind, const char* error) {
 }
 
 static int is_type_start(const Parser* parser) {
-    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_UINT8 || parser->current.kind == TOKEN_KW_BOOL || parser->current.kind == TOKEN_LEFT_PAREN) {
+    if (parser->current.kind == TOKEN_LEFT_PAREN) {
         return 1;
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
@@ -374,15 +459,16 @@ static int is_type_start(const Parser* parser) {
 }
 
 static int is_pattern_type_start(const Parser* parser) {
-    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_UINT8 || parser->current.kind == TOKEN_KW_BOOL) {
-        return 1;
-    }
     return parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_");
 }
 
 static int pattern_has_explicit_type(Parser* parser) {
-    if (parser->current.kind == TOKEN_KW_INT || parser->current.kind == TOKEN_KW_UINT8 || parser->current.kind == TOKEN_KW_BOOL) {
-        return 1;
+    Parser probe = *parser;
+    if (is_type_start(&probe)) {
+        (void)parse_type(&probe);
+        if (!probe.error && probe.current.kind == TOKEN_IDENT) {
+            return 1;
+        }
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
         if (parser->next.kind == TOKEN_IDENT) {
@@ -506,27 +592,92 @@ static AstType parse_type(Parser* parser) {
         return parse_type_postfix(parser, type);
     }
 
-    if (parser->current.kind == TOKEN_KW_BOOL) {
-        type.kind = AST_TYPE_BOOL;
-        advance(parser);
-        return parse_type_postfix(parser, type);
-    }
-    if (parser->current.kind == TOKEN_KW_INT) {
-        type.kind = AST_TYPE_INT;
-        advance(parser);
-        return parse_type_postfix(parser, type);
-    }
-    if (parser->current.kind == TOKEN_KW_UINT8) {
-        type.kind = AST_TYPE_UINT8;
-        advance(parser);
-        return parse_type_postfix(parser, type);
-    }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
         type.kind = AST_TYPE_INFER;
         advance(parser);
         return parse_type_postfix(parser, type);
     }
     if (parser->current.kind == TOKEN_IDENT) {
+        if (token_equals(&parser->current, "Int")) {
+            type.kind = AST_TYPE_INT;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Int8")) {
+            type.kind = AST_TYPE_I8;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Int16")) {
+            type.kind = AST_TYPE_I16;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Int32")) {
+            type.kind = AST_TYPE_I32;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Int64")) {
+            type.kind = AST_TYPE_I64;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "UInt16")) {
+            type.kind = AST_TYPE_U16;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "UInt32")) {
+            type.kind = AST_TYPE_U32;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "UInt64")) {
+            type.kind = AST_TYPE_U64;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Float16")) {
+            type.kind = AST_TYPE_F16;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Float32")) {
+            type.kind = AST_TYPE_F32;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Float64")) {
+            type.kind = AST_TYPE_F64;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Float")) {
+            type.kind = AST_TYPE_FLOAT;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Double")) {
+            type.kind = AST_TYPE_DOUBLE;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Character")) {
+            type.kind = AST_TYPE_CHARACTER;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "UInt8")) {
+            type.kind = AST_TYPE_UINT8;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
+        if (token_equals(&parser->current, "Bool")) {
+            type.kind = AST_TYPE_BOOL;
+            advance(parser);
+            return parse_type_postfix(parser, type);
+        }
         type.kind = AST_TYPE_NAMED;
         type.named_name = parse_qualified_name(parser);
         if (parser->current.kind == TOKEN_LT) {
@@ -941,8 +1092,7 @@ static AstExpr* parse_primary(Parser* parser) {
         return parse_type_implicit_expr(parser, token.line);
     }
 
-    if ((token.kind == TOKEN_KW_INT || token.kind == TOKEN_KW_UINT8 || token.kind == TOKEN_KW_BOOL ||
-         (token.kind == TOKEN_IDENT && is_known_type(parser, &token))) &&
+    if ((token.kind == TOKEN_IDENT && is_known_type(parser, &token)) &&
         looks_like_typed_array_constructor(parser)) {
         AstType array_type = parse_type(parser);
         if (array_type.kind != AST_TYPE_ARRAY) {
@@ -1093,6 +1243,36 @@ static AstExpr* parse_primary(Parser* parser) {
         }
         expr = new_expr(AST_EXPR_INT, token.line);
         expr->as.int_value = (int64_t)value;
+        advance(parser);
+        return expr;
+    }
+
+    if (token.kind == TOKEN_FLOAT_LIT) {
+        char* text = token_slice_dup(&token);
+        if (!text) {
+            fail(parser, "out of memory");
+            return 0;
+        }
+        errno = 0;
+        expr = new_expr(AST_EXPR_FLOAT, token.line);
+        expr->as.float_value = strtod(text, &end);
+        free(text);
+        if (errno != 0 || !end || *end != '\0') {
+            fail(parser, "invalid float literal");
+            return 0;
+        }
+        advance(parser);
+        return expr;
+    }
+
+    if (token.kind == TOKEN_CHAR_LIT) {
+        int64_t value = 0;
+        if (!parse_char_literal_value(&token, &value)) {
+            fail(parser, "invalid character literal");
+            return 0;
+        }
+        expr = new_expr(AST_EXPR_CHAR, token.line);
+        expr->as.char_value = value;
         advance(parser);
         return expr;
     }
@@ -1382,26 +1562,26 @@ static int parse_implicit_args(Parser* parser, AstExprList* out_args) {
     return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after implicit operation arguments");
 }
 
-static int parse_implicit_cast_args(Parser* parser, AstExpr* expr) {
+static int parse_implicit_as_args(Parser* parser, AstExpr* expr) {
     if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after implicit operation")) {
         return 0;
     }
     if (!is_type_start(parser)) {
-        fail(parser, "expected cast target type");
+        fail(parser, "expected as target type");
         return 0;
     }
     expr->as.implicit.has_type_arg = 1;
     expr->as.implicit.type_arg = parse_type(parser);
     if (parser->current.kind == TOKEN_COMMA) {
-        fail(parser, "cast accepts exactly one type argument");
+        fail(parser, "as accepts exactly one type argument");
         return 0;
     }
-    return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after cast target type");
+    return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after as target type");
 }
 
 static int is_implicit_member_name(Token* token) {
     return token->kind == TOKEN_IDENT &&
-           (token_equals(token, "cast") ||
+           (token_equals(token, "as") ||
             token_equals(token, "ref") ||
             token_equals(token, "addr") ||
             token_equals(token, "free"));
@@ -1422,8 +1602,8 @@ static AstExpr* parse_implicit_member(Parser* parser, int line, AstExpr* value_t
     }
     expr->as.implicit.member = token_dup(&parser->current);
     advance(parser);
-    if (strcmp(expr->as.implicit.member, "cast") == 0) {
-        return parse_implicit_cast_args(parser, expr) ? expr : 0;
+    if (strcmp(expr->as.implicit.member, "as") == 0) {
+        return parse_implicit_as_args(parser, expr) ? expr : 0;
     }
     return parse_implicit_args(parser, &expr->as.implicit.args) ? expr : 0;
 }
@@ -1444,8 +1624,8 @@ static AstExpr* parse_type_implicit_expr(Parser* parser, int line) {
     }
     expr->as.implicit.member = token_dup(&parser->current);
     advance(parser);
-    if (strcmp(expr->as.implicit.member, "cast") == 0) {
-        fail(parser, "type implicit operation '.cast(...)' is unsupported");
+    if (strcmp(expr->as.implicit.member, "as") == 0) {
+        fail(parser, "type implicit operation '.as(...)' is unsupported");
         return 0;
     }
     return parse_implicit_args(parser, &expr->as.implicit.args) ? expr : 0;
@@ -2054,9 +2234,34 @@ static int parse_method_decl(Parser* parser, AstProgram* out_program, const char
     return 1;
 }
 
-static int parse_import_decl(Parser* parser, AstProgram* out_program) {
+static int parse_decl_concept_names(Parser* parser, AstNameList* out) {
+    if (parser->current.kind != TOKEN_COLON) {
+        return 1;
+    }
+    advance(parser);
+    for (;;) {
+        char* name = 0;
+        if (parser->current.kind != TOKEN_IDENT) {
+            return fail(parser, "expected trait name after ':'");
+        }
+        name = parse_qualified_name(parser);
+        if (!name) {
+            return 0;
+        }
+        name_list_push(out, name);
+        if (parser->current.kind == TOKEN_COMMA) {
+            advance(parser);
+            continue;
+        }
+        break;
+    }
+    return 1;
+}
+
+static int parse_import_decl(Parser* parser, AstProgram* out_program, int public_flag) {
     AstImportDecl import_decl;
     memset(&import_decl, 0, sizeof(import_decl));
+    import_decl.public_flag = public_flag;
     import_decl.line = parser->current.line;
     advance(parser);
     if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_ASSIGN) {
@@ -2115,6 +2320,9 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     enum_decl.line = parser->current.line;
     register_known_type(parser, enum_decl.name);
     advance(parser);
+    if (!parse_decl_concept_names(parser, &enum_decl.concept_names)) {
+        return 0;
+    }
     if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after enum name")) {
         return 0;
     }
@@ -2183,6 +2391,9 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
         if (!parse_named_generic_params(parser, &struct_decl.type_params)) {
             return 0;
         }
+    }
+    if (!parse_decl_concept_names(parser, &struct_decl.concept_names)) {
+        return 0;
     }
     if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after struct name")) {
         return 0;
@@ -2295,6 +2506,9 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
     union_decl.line = parser->current.line;
     register_known_type(parser, union_decl.name);
     advance(parser);
+    if (!parse_decl_concept_names(parser, &union_decl.concept_names)) {
+        return 0;
+    }
     if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after union name")) {
         return 0;
     }
@@ -2334,6 +2548,22 @@ void parser_init(Parser* parser, const char* source) {
     parser->error = 0;
     parser->error_line = 1;
     hashmap_init(&parser->known_types);
+    register_known_type(parser, "Int");
+    register_known_type(parser, "Int8");
+    register_known_type(parser, "Int16");
+    register_known_type(parser, "Int32");
+    register_known_type(parser, "Int64");
+    register_known_type(parser, "UInt16");
+    register_known_type(parser, "UInt32");
+    register_known_type(parser, "UInt64");
+    register_known_type(parser, "Float16");
+    register_known_type(parser, "Float32");
+    register_known_type(parser, "Float64");
+    register_known_type(parser, "Float");
+    register_known_type(parser, "Double");
+    register_known_type(parser, "Character");
+    register_known_type(parser, "UInt8");
+    register_known_type(parser, "Bool");
     parser->current = lexer_next(&parser->lexer);
     parser->next = lexer_next(&parser->lexer);
 }
@@ -2349,12 +2579,6 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
         memset(&generic_params, 0, sizeof(generic_params));
         memset(&where_constraints, 0, sizeof(where_constraints));
 
-        if (parser->current.kind == TOKEN_KW_IMPORT) {
-            if (!parse_import_decl(parser, out_program)) {
-                return 0;
-            }
-            continue;
-        }
         while (parser->current.kind == TOKEN_AT) {
             if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "where")) {
                 if (!parse_where_annotation(parser, &where_constraints)) {
@@ -2367,6 +2591,15 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
         if (parser->current.kind == TOKEN_KW_PUBLIC) {
             public_flag = 1;
             advance(parser);
+        }
+        if (parser->current.kind == TOKEN_KW_IMPORT) {
+            if (where_constraints.count != 0) {
+                return fail(parser, "@where(...) requires a generic function or struct");
+            }
+            if (!parse_import_decl(parser, out_program, public_flag)) {
+                return 0;
+            }
+            continue;
         }
         if (parser->current.kind == TOKEN_KW_ALIAS) {
             if (where_constraints.count != 0) {

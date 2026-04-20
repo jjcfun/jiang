@@ -20,6 +20,12 @@ static int match_char(Lexer* lexer, char expected) {
     return 1;
 }
 
+static int is_hex_digit_char(char ch) {
+    return (ch >= '0' && ch <= '9') ||
+           (ch >= 'a' && ch <= 'f') ||
+           (ch >= 'A' && ch <= 'F');
+}
+
 static void skip_ws(Lexer* lexer) {
     for (;;) {
         char ch = *lexer->current;
@@ -50,15 +56,6 @@ static Token ident_or_keyword(Lexer* lexer) {
         lexer->current += 1;
     }
     length = (size_t)(lexer->current - lexer->start);
-    if (length == 3 && strncmp(lexer->start, "Int", 3) == 0) {
-        return make_token(lexer, TOKEN_KW_INT, lexer->start, length);
-    }
-    if (length == 5 && strncmp(lexer->start, "UInt8", 5) == 0) {
-        return make_token(lexer, TOKEN_KW_UINT8, lexer->start, length);
-    }
-    if (length == 4 && strncmp(lexer->start, "Bool", 4) == 0) {
-        return make_token(lexer, TOKEN_KW_BOOL, lexer->start, length);
-    }
     if (length == 3 && strncmp(lexer->start, "new", 3) == 0) {
         return make_token(lexer, TOKEN_KW_NEW, lexer->start, length);
     }
@@ -98,7 +95,7 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 6 && strncmp(lexer->start, "struct", 6) == 0) {
         return make_token(lexer, TOKEN_KW_STRUCT, lexer->start, length);
     }
-    if (length == 7 && strncmp(lexer->start, "concept", 7) == 0) {
+    if (length == 5 && strncmp(lexer->start, "trait", 5) == 0) {
         return make_token(lexer, TOKEN_KW_CONCEPT, lexer->start, length);
     }
     if (length == 6 && strncmp(lexer->start, "static", 6) == 0) {
@@ -140,11 +137,19 @@ Token lexer_next(Lexer* lexer) {
     }
 
     if (isdigit((unsigned char)*lexer->current)) {
+        int is_float = 0;
         lexer->current += 1;
         while (isdigit((unsigned char)*lexer->current)) {
             lexer->current += 1;
         }
-        return make_token(lexer, TOKEN_INT_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
+        if (*lexer->current == '.' && isdigit((unsigned char)lexer->current[1])) {
+            is_float = 1;
+            lexer->current += 1;
+            while (isdigit((unsigned char)*lexer->current)) {
+                lexer->current += 1;
+            }
+        }
+        return make_token(lexer, is_float ? TOKEN_FLOAT_LIT : TOKEN_INT_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
     }
 
     if (*lexer->current == '"') {
@@ -157,6 +162,45 @@ Token lexer_next(Lexer* lexer) {
         }
         lexer->current += 1;
         return make_token(lexer, TOKEN_STRING_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
+    }
+
+    if (*lexer->current == '\'') {
+        lexer->current += 1;
+        if (*lexer->current == '\0' || *lexer->current == '\n' || *lexer->current == '\'') {
+            return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+        }
+        if (*lexer->current == '\\') {
+            lexer->current += 1;
+            if (*lexer->current == 'u') {
+                lexer->current += 1;
+                if (*lexer->current != '{') {
+                    return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+                }
+                lexer->current += 1;
+                if (!is_hex_digit_char(*lexer->current)) {
+                    return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+                }
+                while (is_hex_digit_char(*lexer->current)) {
+                    lexer->current += 1;
+                }
+                if (*lexer->current != '}') {
+                    return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+                }
+                lexer->current += 1;
+            } else if (*lexer->current == 'n' || *lexer->current == 'r' || *lexer->current == 't' ||
+                       *lexer->current == '0' || *lexer->current == '\\' || *lexer->current == '\'' || *lexer->current == '"') {
+                lexer->current += 1;
+            } else {
+                return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+            }
+        } else {
+            lexer->current += 1;
+        }
+        if (*lexer->current != '\'') {
+            return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
+        }
+        lexer->current += 1;
+        return make_token(lexer, TOKEN_CHAR_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
     }
 
     if (isalpha((unsigned char)*lexer->current) || *lexer->current == '_') {

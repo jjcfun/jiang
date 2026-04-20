@@ -85,11 +85,13 @@ static JirBindingKind jir_binding_kind(HirBindingKind kind) {
 static JirExprKind jir_expr_kind(HirExprKind kind) {
     switch (kind) {
         case HIR_EXPR_INT: return JIR_EXPR_INT;
+        case HIR_EXPR_FLOAT: return JIR_EXPR_FLOAT;
+        case HIR_EXPR_CHAR: return JIR_EXPR_CHAR;
         case HIR_EXPR_BOOL: return JIR_EXPR_BOOL;
         case HIR_EXPR_NULL: return JIR_EXPR_NULL;
         case HIR_EXPR_OPTIONAL_SOME: return JIR_EXPR_OPTIONAL_SOME;
         case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
-        case HIR_EXPR_CAST: return JIR_EXPR_CAST;
+        case HIR_EXPR_AS: return JIR_EXPR_AS;
         case HIR_EXPR_ADDR: return JIR_EXPR_ADDR;
         case HIR_EXPR_DEREF: return JIR_EXPR_DEREF;
         case HIR_EXPR_NEW: return JIR_EXPR_NEW;
@@ -588,6 +590,12 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_INT:
             out->as.int_value = expr->as.int_value;
             return out;
+        case HIR_EXPR_FLOAT:
+            out->as.float_value = expr->as.float_value;
+            return out;
+        case HIR_EXPR_CHAR:
+            out->as.char_value = expr->as.char_value;
+            return out;
         case HIR_EXPR_BOOL:
             out->as.bool_value = expr->as.bool_value;
             return out;
@@ -599,7 +607,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_BINDING:
             out->as.binding = lower_binding(expr->as.binding, error);
             return out;
-        case HIR_EXPR_CAST:
+        case HIR_EXPR_AS:
         case HIR_EXPR_ADDR:
         case HIR_EXPR_DEREF:
         case HIR_EXPR_NEW:

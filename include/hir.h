@@ -25,7 +25,22 @@ typedef struct HirTypeList {
 
 typedef enum HirTypeKind {
     HIR_TYPE_INT = 0,
+    HIR_TYPE_I8,
+    HIR_TYPE_I16,
+    HIR_TYPE_I32,
+    HIR_TYPE_I64,
+    HIR_TYPE_U8,
+    HIR_TYPE_U16,
+    HIR_TYPE_U32,
+    HIR_TYPE_U64,
+    HIR_TYPE_F16,
+    HIR_TYPE_F32,
+    HIR_TYPE_F64,
+    HIR_TYPE_FLOAT,
+    HIR_TYPE_DOUBLE,
+    HIR_TYPE_CHARACTER,
     HIR_TYPE_UINT8,
+    HIR_TYPE_STRING,
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
     HIR_TYPE_SLICE,
@@ -71,11 +86,13 @@ typedef struct HirBindingList {
 
 typedef enum HirExprKind {
     HIR_EXPR_INT = 0,
+    HIR_EXPR_FLOAT,
+    HIR_EXPR_CHAR,
     HIR_EXPR_BOOL,
     HIR_EXPR_NULL,
     HIR_EXPR_OPTIONAL_SOME,
     HIR_EXPR_BINDING,
-    HIR_EXPR_CAST,
+    HIR_EXPR_AS,
     HIR_EXPR_ADDR,
     HIR_EXPR_DEREF,
     HIR_EXPR_NEW,
@@ -146,6 +163,8 @@ struct HirExpr {
     int line;
     union {
         int64_t int_value;
+        double float_value;
+        int64_t char_value;
         int bool_value;
         HirBinding* binding;
         struct {
@@ -288,6 +307,7 @@ struct HirFunction {
     HirBlock body;
     int struct_init_flag;
     int struct_deinit_flag;
+    int public_flag;
     int method_flag;
     int static_method_flag;
     HirStructDecl* owner_struct;
@@ -395,7 +415,22 @@ typedef struct HirProgram {
     HirGlobalList globals;
     HirFunctionList functions;
     HirType int_type;
+    HirType i8_type;
+    HirType i16_type;
+    HirType i32_type;
+    HirType i64_type;
+    HirType u8_type;
+    HirType u16_type;
+    HirType u32_type;
+    HirType u64_type;
+    HirType f16_type;
+    HirType f32_type;
+    HirType f64_type;
+    HirType float_type;
+    HirType double_type;
+    HirType character_type;
     HirType uint8_type;
+    HirType string_type;
     HirType bool_type;
     HirType void_type;
     HirTypeList owned_types;

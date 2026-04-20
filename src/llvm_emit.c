@@ -97,6 +97,52 @@ typedef struct JirBlockMapEntry {
 
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type);
 
+static int jir_type_is_float_like(JirTypeKind kind) {
+    return kind == JIR_TYPE_F16 ||
+           kind == JIR_TYPE_F32 ||
+           kind == JIR_TYPE_F64 ||
+           kind == JIR_TYPE_FLOAT ||
+           kind == JIR_TYPE_DOUBLE;
+}
+
+static int jir_type_is_integer_like(JirTypeKind kind) {
+    return kind == JIR_TYPE_INT ||
+           kind == JIR_TYPE_I8 ||
+           kind == JIR_TYPE_I16 ||
+           kind == JIR_TYPE_I32 ||
+           kind == JIR_TYPE_I64 ||
+           kind == JIR_TYPE_U8 ||
+           kind == JIR_TYPE_U16 ||
+           kind == JIR_TYPE_U32 ||
+           kind == JIR_TYPE_U64 ||
+           kind == JIR_TYPE_UINT8 ||
+           kind == JIR_TYPE_BOOL ||
+           kind == JIR_TYPE_CHARACTER;
+}
+
+static int jir_type_is_signed_integer(JirTypeKind kind) {
+    return kind == JIR_TYPE_INT ||
+           kind == JIR_TYPE_I8 ||
+           kind == JIR_TYPE_I16 ||
+           kind == JIR_TYPE_I32 ||
+           kind == JIR_TYPE_I64;
+}
+
+static int jir_type_float_width_bits(JirTypeKind kind) {
+    switch (kind) {
+        case JIR_TYPE_F16:
+            return 16;
+        case JIR_TYPE_F32:
+        case JIR_TYPE_FLOAT:
+            return 32;
+        case JIR_TYPE_F64:
+        case JIR_TYPE_DOUBLE:
+            return 64;
+        default:
+            return 0;
+    }
+}
+
 static LLVMTypeRef llvm_tuple_type(LLVMContextRef context, const JirType* type) {
     LLVMTypeRef* items = 0;
     LLVMTypeRef out = 0;
@@ -158,8 +204,29 @@ static LLVMTypeRef llvm_optional_type(LLVMContextRef context, const JirType* typ
 
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
     switch (type->kind) {
+        case JIR_TYPE_I8:
+        case JIR_TYPE_U8:
         case JIR_TYPE_UINT8:
             return LLVMInt8TypeInContext(context);
+        case JIR_TYPE_I16:
+        case JIR_TYPE_U16:
+            return LLVMInt16TypeInContext(context);
+        case JIR_TYPE_I32:
+        case JIR_TYPE_U32:
+        case JIR_TYPE_CHARACTER:
+            return LLVMInt32TypeInContext(context);
+        case JIR_TYPE_INT:
+        case JIR_TYPE_I64:
+        case JIR_TYPE_U64:
+            return LLVMInt64TypeInContext(context);
+        case JIR_TYPE_F16:
+            return LLVMHalfTypeInContext(context);
+        case JIR_TYPE_F32:
+        case JIR_TYPE_FLOAT:
+            return LLVMFloatTypeInContext(context);
+        case JIR_TYPE_F64:
+        case JIR_TYPE_DOUBLE:
+            return LLVMDoubleTypeInContext(context);
         case JIR_TYPE_BOOL:
             return LLVMInt1TypeInContext(context);
         case JIR_TYPE_VOID:
@@ -211,6 +278,12 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
     }
     if (expr->kind == JIR_EXPR_INT) {
         return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.int_value, 1);
+    }
+    if (expr->kind == JIR_EXPR_CHAR) {
+        return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.char_value, 0);
+    }
+    if (expr->kind == JIR_EXPR_FLOAT) {
+        return LLVMConstReal(llvm_type(context, expr->type), expr->as.float_value);
     }
     if (expr->kind == JIR_EXPR_ENUM_MEMBER) {
         return LLVMConstInt(llvm_type(context, expr->type), (unsigned long long)expr->as.enum_member.value, 1);
@@ -513,6 +586,8 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
     }
     switch (expr->kind) {
         case JIR_EXPR_INT:
+        case JIR_EXPR_CHAR:
+        case JIR_EXPR_FLOAT:
         case JIR_EXPR_BOOL:
             return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_BINDING:
@@ -525,21 +600,38 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_ADDR:
             return emit_lvalue_ptr(cg, expr->as.unary.value);
-        case JIR_EXPR_CAST: {
+        case JIR_EXPR_AS: {
             LLVMValueRef value = emit_expr(cg, expr->as.unary.value);
             JirTypeKind from_kind = expr->as.unary.value->type->kind;
             JirTypeKind to_kind = expr->type->kind;
             if (from_kind == to_kind) {
                 return value;
             }
-            if ((from_kind == JIR_TYPE_INT || from_kind == JIR_TYPE_UINT8 || from_kind == JIR_TYPE_BOOL) &&
-                (to_kind == JIR_TYPE_INT || to_kind == JIR_TYPE_UINT8 || to_kind == JIR_TYPE_BOOL)) {
+            if (jir_type_is_integer_like(from_kind) && jir_type_is_integer_like(to_kind)) {
                 return LLVMBuildIntCast2(
                     cg->builder,
                     value,
                     llvm_type(cg->context, expr->type),
-                    from_kind == JIR_TYPE_INT,
+                    jir_type_is_signed_integer(from_kind),
                     "casttmp");
+            }
+            if (jir_type_is_integer_like(from_kind) && jir_type_is_float_like(to_kind)) {
+                if (jir_type_is_signed_integer(from_kind)) {
+                    return LLVMBuildSIToFP(cg->builder, value, llvm_type(cg->context, expr->type), "sitofptmp");
+                }
+                return LLVMBuildUIToFP(cg->builder, value, llvm_type(cg->context, expr->type), "uitofptmp");
+            }
+            if (jir_type_is_float_like(from_kind) && jir_type_is_float_like(to_kind)) {
+                if (jir_type_float_width_bits(to_kind) > jir_type_float_width_bits(from_kind)) {
+                    return LLVMBuildFPExt(cg->builder, value, llvm_type(cg->context, expr->type), "fpexttmp");
+                }
+                return LLVMBuildFPTrunc(cg->builder, value, llvm_type(cg->context, expr->type), "fptrunctmp");
+            }
+            if (jir_type_is_float_like(from_kind) && jir_type_is_integer_like(to_kind)) {
+                if (jir_type_is_signed_integer(to_kind)) {
+                    return LLVMBuildFPToSI(cg->builder, value, llvm_type(cg->context, expr->type), "fptositmp");
+                }
+                return LLVMBuildFPToUI(cg->builder, value, llvm_type(cg->context, expr->type), "fptouitmp");
             }
             if (from_kind == JIR_TYPE_POINTER && to_kind == JIR_TYPE_INT) {
                 return LLVMBuildPtrToInt(cg->builder, value, llvm_type(cg->context, expr->type), "ptrtoint");
@@ -627,15 +719,27 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             if (expr->as.call.builtin == JIR_BUILTIN_EQUAL) {
                 LLVMValueRef left = emit_expr(cg, expr->as.call.args.items[0]);
                 LLVMValueRef right = emit_expr(cg, expr->as.call.args.items[1]);
+                if (jir_type_is_float_like(expr->as.call.args.items[0]->type->kind)) {
+                    return LLVMBuildFCmp(cg->builder, LLVMRealOEQ, left, right, "eqtmp");
+                }
                 return LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
             }
             if (expr->as.call.builtin == JIR_BUILTIN_HASH) {
                 LLVMValueRef value = emit_expr(cg, expr->as.call.args.items[0]);
-                if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_UINT8) {
+                if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_UINT8 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_U8 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_U16 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_U32 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_BOOL ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_CHARACTER) {
                     return LLVMBuildZExt(cg->builder, value, LLVMInt64TypeInContext(cg->context), "hashtmp");
                 }
-                if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_BOOL) {
-                    return LLVMBuildZExt(cg->builder, value, LLVMInt64TypeInContext(cg->context), "hashtmp");
+                if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_I8 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_I16 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_I32 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_I64 ||
+                    expr->as.call.args.items[0]->type->kind == JIR_TYPE_INT) {
+                    return LLVMBuildIntCast2(cg->builder, value, LLVMInt64TypeInContext(cg->context), 1, "hashtmp");
                 }
                 return value;
             }
@@ -652,6 +756,8 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         case JIR_EXPR_BINARY: {
             LLVMValueRef left = emit_expr(cg, expr->as.binary.left);
             LLVMValueRef right = emit_expr(cg, expr->as.binary.right);
+            int float_like = jir_type_is_float_like(expr->as.binary.left->type->kind);
+            int signed_int = jir_type_is_signed_integer(expr->as.binary.left->type->kind);
             if ((expr->as.binary.op == JIR_BIN_EQ || expr->as.binary.op == JIR_BIN_NE) &&
                 expr->as.binary.left->type->kind == JIR_TYPE_OPTIONAL) {
                 LLVMValueRef left_flag = LLVMBuildExtractValue(cg->builder, left, 0, "opt.l.flag");
@@ -659,17 +765,29 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 return LLVMBuildICmp(cg->builder, expr->as.binary.op == JIR_BIN_EQ ? LLVMIntEQ : LLVMIntNE, left_flag, right_flag, expr->as.binary.op == JIR_BIN_EQ ? "eqtmp" : "netmp");
             }
             switch (expr->as.binary.op) {
-                case JIR_BIN_ADD: return LLVMBuildAdd(cg->builder, left, right, "addtmp");
-                case JIR_BIN_SUB: return LLVMBuildSub(cg->builder, left, right, "subtmp");
-                case JIR_BIN_MUL: return LLVMBuildMul(cg->builder, left, right, "multmp");
-                case JIR_BIN_MOD: return LLVMBuildSRem(cg->builder, left, right, "modtmp");
-                case JIR_BIN_DIV: return LLVMBuildSDiv(cg->builder, left, right, "divtmp");
-                case JIR_BIN_EQ: return LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
-                case JIR_BIN_NE: return LLVMBuildICmp(cg->builder, LLVMIntNE, left, right, "netmp");
-                case JIR_BIN_LT: return LLVMBuildICmp(cg->builder, LLVMIntSLT, left, right, "lttmp");
-                case JIR_BIN_LE: return LLVMBuildICmp(cg->builder, LLVMIntSLE, left, right, "letmp");
-                case JIR_BIN_GT: return LLVMBuildICmp(cg->builder, LLVMIntSGT, left, right, "gttmp");
-                case JIR_BIN_GE: return LLVMBuildICmp(cg->builder, LLVMIntSGE, left, right, "getmp");
+                case JIR_BIN_ADD: return float_like ? LLVMBuildFAdd(cg->builder, left, right, "addtmp")
+                                                    : LLVMBuildAdd(cg->builder, left, right, "addtmp");
+                case JIR_BIN_SUB: return float_like ? LLVMBuildFSub(cg->builder, left, right, "subtmp")
+                                                    : LLVMBuildSub(cg->builder, left, right, "subtmp");
+                case JIR_BIN_MUL: return float_like ? LLVMBuildFMul(cg->builder, left, right, "multmp")
+                                                    : LLVMBuildMul(cg->builder, left, right, "multmp");
+                case JIR_BIN_MOD: return signed_int ? LLVMBuildSRem(cg->builder, left, right, "modtmp")
+                                                    : LLVMBuildURem(cg->builder, left, right, "modtmp");
+                case JIR_BIN_DIV: return float_like ? LLVMBuildFDiv(cg->builder, left, right, "divtmp")
+                                                    : (signed_int ? LLVMBuildSDiv(cg->builder, left, right, "divtmp")
+                                                                  : LLVMBuildUDiv(cg->builder, left, right, "divtmp"));
+                case JIR_BIN_EQ: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealOEQ, left, right, "eqtmp")
+                                                   : LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
+                case JIR_BIN_NE: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealONE, left, right, "netmp")
+                                                   : LLVMBuildICmp(cg->builder, LLVMIntNE, left, right, "netmp");
+                case JIR_BIN_LT: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealOLT, left, right, "lttmp")
+                                                   : LLVMBuildICmp(cg->builder, signed_int ? LLVMIntSLT : LLVMIntULT, left, right, "lttmp");
+                case JIR_BIN_LE: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealOLE, left, right, "letmp")
+                                                   : LLVMBuildICmp(cg->builder, signed_int ? LLVMIntSLE : LLVMIntULE, left, right, "letmp");
+                case JIR_BIN_GT: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealOGT, left, right, "gttmp")
+                                                   : LLVMBuildICmp(cg->builder, signed_int ? LLVMIntSGT : LLVMIntUGT, left, right, "gttmp");
+                case JIR_BIN_GE: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealOGE, left, right, "getmp")
+                                                   : LLVMBuildICmp(cg->builder, signed_int ? LLVMIntSGE : LLVMIntUGE, left, right, "getmp");
             }
         }
         case JIR_EXPR_COALESCE: {

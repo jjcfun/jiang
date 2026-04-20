@@ -16,7 +16,22 @@ typedef enum JirBindingKind {
 
 typedef enum JirTypeKind {
     JIR_TYPE_INT = 0,
+    JIR_TYPE_I8,
+    JIR_TYPE_I16,
+    JIR_TYPE_I32,
+    JIR_TYPE_I64,
+    JIR_TYPE_U8,
+    JIR_TYPE_U16,
+    JIR_TYPE_U32,
+    JIR_TYPE_U64,
+    JIR_TYPE_F16,
+    JIR_TYPE_F32,
+    JIR_TYPE_F64,
+    JIR_TYPE_FLOAT,
+    JIR_TYPE_DOUBLE,
+    JIR_TYPE_CHARACTER,
     JIR_TYPE_UINT8,
+    JIR_TYPE_STRING,
     JIR_TYPE_BOOL,
     JIR_TYPE_VOID,
     JIR_TYPE_SLICE,
@@ -31,11 +46,13 @@ typedef enum JirTypeKind {
 
 typedef enum JirExprKind {
     JIR_EXPR_INT = 0,
+    JIR_EXPR_FLOAT,
+    JIR_EXPR_CHAR,
     JIR_EXPR_BOOL,
     JIR_EXPR_NULL,
     JIR_EXPR_OPTIONAL_SOME,
     JIR_EXPR_BINDING,
-    JIR_EXPR_CAST,
+    JIR_EXPR_AS,
     JIR_EXPR_ADDR,
     JIR_EXPR_DEREF,
     JIR_EXPR_NEW,
@@ -162,6 +179,8 @@ struct JirExpr {
     int line;
     union {
         int64_t int_value;
+        double float_value;
+        int64_t char_value;
         int bool_value;
         JirBinding* binding;
         struct {

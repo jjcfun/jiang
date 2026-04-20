@@ -32,6 +32,20 @@ typedef enum HirNominalKind {
 typedef enum HirBuiltinNominalKind {
     HIR_BUILTIN_NOMINAL_NONE = 0,
     HIR_BUILTIN_NOMINAL_INT,
+    HIR_BUILTIN_NOMINAL_I8,
+    HIR_BUILTIN_NOMINAL_I16,
+    HIR_BUILTIN_NOMINAL_I32,
+    HIR_BUILTIN_NOMINAL_I64,
+    HIR_BUILTIN_NOMINAL_U8,
+    HIR_BUILTIN_NOMINAL_U16,
+    HIR_BUILTIN_NOMINAL_U32,
+    HIR_BUILTIN_NOMINAL_U64,
+    HIR_BUILTIN_NOMINAL_F16,
+    HIR_BUILTIN_NOMINAL_F32,
+    HIR_BUILTIN_NOMINAL_F64,
+    HIR_BUILTIN_NOMINAL_FLOAT,
+    HIR_BUILTIN_NOMINAL_DOUBLE,
+    HIR_BUILTIN_NOMINAL_CHARACTER,
     HIR_BUILTIN_NOMINAL_UINT8,
     HIR_BUILTIN_NOMINAL_BOOL,
     HIR_BUILTIN_NOMINAL_VOID,
@@ -67,6 +81,20 @@ typedef struct HirTypeQueryRef {
 } HirTypeQueryRef;
 
 static const HirBuiltinNominalDecl HIR_BUILTIN_INT_DECL = { HIR_BUILTIN_NOMINAL_INT, "Int" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_I8_DECL = { HIR_BUILTIN_NOMINAL_I8, "Int8" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_I16_DECL = { HIR_BUILTIN_NOMINAL_I16, "Int16" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_I32_DECL = { HIR_BUILTIN_NOMINAL_I32, "Int32" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_I64_DECL = { HIR_BUILTIN_NOMINAL_I64, "Int64" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_U8_DECL = { HIR_BUILTIN_NOMINAL_U8, "UInt8" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_U16_DECL = { HIR_BUILTIN_NOMINAL_U16, "UInt16" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_U32_DECL = { HIR_BUILTIN_NOMINAL_U32, "UInt32" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_U64_DECL = { HIR_BUILTIN_NOMINAL_U64, "UInt64" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_F16_DECL = { HIR_BUILTIN_NOMINAL_F16, "Float16" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_F32_DECL = { HIR_BUILTIN_NOMINAL_F32, "Float32" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_F64_DECL = { HIR_BUILTIN_NOMINAL_F64, "Float64" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_FLOAT_DECL = { HIR_BUILTIN_NOMINAL_FLOAT, "Float" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_DOUBLE_DECL = { HIR_BUILTIN_NOMINAL_DOUBLE, "Double" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_CHARACTER_DECL = { HIR_BUILTIN_NOMINAL_CHARACTER, "Character" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_UINT8_DECL = { HIR_BUILTIN_NOMINAL_UINT8, "UInt8" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_BOOL_DECL = { HIR_BUILTIN_NOMINAL_BOOL, "Bool" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL_VOID, "Void" };
@@ -100,6 +128,44 @@ static HirFunction* find_function(HirProgram* program, const char* name);
 static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
 static int is_mutable_assignment_target(const HirExpr* expr);
 static int type_assignment_compatible(HirType* actual, HirType* expected);
+static int type_equals(HirType* left, HirType* right);
+
+static int type_is_imported_nominal(HirType* type) {
+    if (!type) {
+        return 0;
+    }
+    switch (type->kind) {
+        case HIR_TYPE_STRUCT:
+            return type->struct_decl && type->struct_decl->name && strchr(type->struct_decl->name, '.') != 0;
+        case HIR_TYPE_ENUM:
+            return type->enum_decl && type->enum_decl->name && strchr(type->enum_decl->name, '.') != 0;
+        case HIR_TYPE_UNION:
+            return type->union_decl && type->union_decl->name && strchr(type->union_decl->name, '.') != 0;
+        default:
+            return 0;
+    }
+}
+
+static int same_method_owner_type(HirType* left, HirType* right) {
+    return left && right && type_equals(left, right);
+}
+
+static int method_visible_from_context(LowerContext* ctx, HirFunction* method, HirType* owner_type) {
+    if (!method || !owner_type) {
+        return 0;
+    }
+    if (method->public_flag) {
+        return 1;
+    }
+    if (!type_is_imported_nominal(owner_type)) {
+        return 1;
+    }
+    if (ctx->current_function && ctx->current_function->receiver_type &&
+        same_method_owner_type(ctx->current_function->receiver_type, owner_type)) {
+        return 1;
+    }
+    return 0;
+}
 
 static int is_expected_type_shorthand_expr(const AstExpr* expr) {
     return expr &&
@@ -118,6 +184,8 @@ static int is_pure_optional_base_expr(const AstExpr* expr) {
     switch (expr->kind) {
         case AST_EXPR_NAME:
         case AST_EXPR_INT:
+        case AST_EXPR_FLOAT:
+        case AST_EXPR_CHAR:
         case AST_EXPR_BOOL:
             return 1;
         case AST_EXPR_FIELD:
@@ -200,6 +268,20 @@ static char* make_method_name(const char* owner_name, const char* method_name, i
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
     switch (kind) {
         case HIR_TYPE_INT: return &program->int_type;
+        case HIR_TYPE_I8: return &program->i8_type;
+        case HIR_TYPE_I16: return &program->i16_type;
+        case HIR_TYPE_I32: return &program->i32_type;
+        case HIR_TYPE_I64: return &program->i64_type;
+        case HIR_TYPE_U8: return &program->u8_type;
+        case HIR_TYPE_U16: return &program->u16_type;
+        case HIR_TYPE_U32: return &program->u32_type;
+        case HIR_TYPE_U64: return &program->u64_type;
+        case HIR_TYPE_F16: return &program->f16_type;
+        case HIR_TYPE_F32: return &program->f32_type;
+        case HIR_TYPE_F64: return &program->f64_type;
+        case HIR_TYPE_FLOAT: return &program->float_type;
+        case HIR_TYPE_DOUBLE: return &program->double_type;
+        case HIR_TYPE_CHARACTER: return &program->character_type;
         case HIR_TYPE_UINT8: return &program->uint8_type;
         case HIR_TYPE_BOOL: return &program->bool_type;
         case HIR_TYPE_VOID: return &program->void_type;
@@ -341,10 +423,28 @@ static int64_t type_size_bytes(HirType* type) {
     switch (type->kind) {
         case HIR_TYPE_INT:
             return 8;
+        case HIR_TYPE_I8:
+        case HIR_TYPE_U8:
         case HIR_TYPE_UINT8:
-            return 1;
         case HIR_TYPE_BOOL:
             return 1;
+        case HIR_TYPE_I16:
+        case HIR_TYPE_U16:
+        case HIR_TYPE_F16:
+            return 2;
+        case HIR_TYPE_I32:
+        case HIR_TYPE_U32:
+        case HIR_TYPE_CHARACTER:
+        case HIR_TYPE_F32:
+        case HIR_TYPE_FLOAT:
+            return 4;
+        case HIR_TYPE_I64:
+        case HIR_TYPE_U64:
+        case HIR_TYPE_F64:
+        case HIR_TYPE_DOUBLE:
+            return 8;
+        case HIR_TYPE_STRING:
+            return 16;
         case HIR_TYPE_VOID:
             return 0;
         case HIR_TYPE_POINTER:
@@ -384,11 +484,51 @@ static int64_t type_size_bytes(HirType* type) {
 static int is_integer_like_type(HirType* type) {
     return type &&
            (type->kind == HIR_TYPE_INT ||
+            type->kind == HIR_TYPE_I8 ||
+            type->kind == HIR_TYPE_I16 ||
+            type->kind == HIR_TYPE_I32 ||
+            type->kind == HIR_TYPE_I64 ||
+            type->kind == HIR_TYPE_U8 ||
+            type->kind == HIR_TYPE_U16 ||
+            type->kind == HIR_TYPE_U32 ||
+            type->kind == HIR_TYPE_U64 ||
             type->kind == HIR_TYPE_UINT8 ||
             type->kind == HIR_TYPE_BOOL);
 }
 
-static int cast_compatible(HirType* from, HirType* to) {
+static int is_float_like_type(HirType* type) {
+    return type &&
+           (type->kind == HIR_TYPE_F16 ||
+            type->kind == HIR_TYPE_F32 ||
+            type->kind == HIR_TYPE_F64 ||
+           (type->kind == HIR_TYPE_FLOAT ||
+            type->kind == HIR_TYPE_DOUBLE));
+}
+
+static int is_numeric_promotion_type(HirType* type) {
+    return type &&
+           (type->kind == HIR_TYPE_INT ||
+            type->kind == HIR_TYPE_FLOAT ||
+            type->kind == HIR_TYPE_DOUBLE);
+}
+
+static HirType* common_numeric_type(HirProgram* program, HirType* left, HirType* right) {
+    if (!left || !right) {
+        return 0;
+    }
+    if (!is_numeric_promotion_type(left) || !is_numeric_promotion_type(right)) {
+        return 0;
+    }
+    if (left->kind == HIR_TYPE_DOUBLE || right->kind == HIR_TYPE_DOUBLE) {
+        return primitive_type(program, HIR_TYPE_DOUBLE);
+    }
+    if (left->kind == HIR_TYPE_FLOAT || right->kind == HIR_TYPE_FLOAT) {
+        return primitive_type(program, HIR_TYPE_FLOAT);
+    }
+    return primitive_type(program, HIR_TYPE_INT);
+}
+
+static int as_compatible(HirType* from, HirType* to) {
     if (!from || !to) {
         return 0;
     }
@@ -396,6 +536,14 @@ static int cast_compatible(HirType* from, HirType* to) {
         return 1;
     }
     if (is_integer_like_type(from) && is_integer_like_type(to)) {
+        return 1;
+    }
+    if ((is_integer_like_type(from) || from->kind == HIR_TYPE_CHARACTER) &&
+        is_float_like_type(to)) {
+        return 1;
+    }
+    if (is_float_like_type(from) &&
+        (is_float_like_type(to) || is_integer_like_type(to) || to->kind == HIR_TYPE_CHARACTER)) {
         return 1;
     }
     if (from->kind == HIR_TYPE_POINTER && to->kind == HIR_TYPE_INT) {
@@ -418,6 +566,34 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
     switch (type->kind) {
         case AST_TYPE_INT:
             return qualified_primitive_type(ctx->program, HIR_TYPE_INT, type->mutable_flag);
+        case AST_TYPE_I8:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_I8, type->mutable_flag);
+        case AST_TYPE_I16:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_I16, type->mutable_flag);
+        case AST_TYPE_I32:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_I32, type->mutable_flag);
+        case AST_TYPE_I64:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_I64, type->mutable_flag);
+        case AST_TYPE_U8:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_U8, type->mutable_flag);
+        case AST_TYPE_U16:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_U16, type->mutable_flag);
+        case AST_TYPE_U32:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_U32, type->mutable_flag);
+        case AST_TYPE_U64:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_U64, type->mutable_flag);
+        case AST_TYPE_F16:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_F16, type->mutable_flag);
+        case AST_TYPE_F32:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_F32, type->mutable_flag);
+        case AST_TYPE_F64:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_F64, type->mutable_flag);
+        case AST_TYPE_FLOAT:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_FLOAT, type->mutable_flag);
+        case AST_TYPE_DOUBLE:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_DOUBLE, type->mutable_flag);
+        case AST_TYPE_CHARACTER:
+            return qualified_primitive_type(ctx->program, HIR_TYPE_CHARACTER, type->mutable_flag);
         case AST_TYPE_UINT8:
             return qualified_primitive_type(ctx->program, HIR_TYPE_UINT8, type->mutable_flag);
         case AST_TYPE_BOOL:
@@ -875,6 +1051,19 @@ static HirGlobal* find_global(HirProgram* program, const char* name) {
 
 static const HirBuiltinNominalDecl* find_builtin_nominal(const char* name) {
     if (strcmp(name, "Int") == 0) return &HIR_BUILTIN_INT_DECL;
+    if (strcmp(name, "Int8") == 0) return &HIR_BUILTIN_I8_DECL;
+    if (strcmp(name, "Int16") == 0) return &HIR_BUILTIN_I16_DECL;
+    if (strcmp(name, "Int32") == 0) return &HIR_BUILTIN_I32_DECL;
+    if (strcmp(name, "Int64") == 0) return &HIR_BUILTIN_I64_DECL;
+    if (strcmp(name, "UInt16") == 0) return &HIR_BUILTIN_U16_DECL;
+    if (strcmp(name, "UInt32") == 0) return &HIR_BUILTIN_U32_DECL;
+    if (strcmp(name, "UInt64") == 0) return &HIR_BUILTIN_U64_DECL;
+    if (strcmp(name, "Float16") == 0) return &HIR_BUILTIN_F16_DECL;
+    if (strcmp(name, "Float32") == 0) return &HIR_BUILTIN_F32_DECL;
+    if (strcmp(name, "Float64") == 0) return &HIR_BUILTIN_F64_DECL;
+    if (strcmp(name, "Float") == 0) return &HIR_BUILTIN_FLOAT_DECL;
+    if (strcmp(name, "Double") == 0) return &HIR_BUILTIN_DOUBLE_DECL;
+    if (strcmp(name, "Character") == 0) return &HIR_BUILTIN_CHARACTER_DECL;
     if (strcmp(name, "UInt8") == 0) return &HIR_BUILTIN_UINT8_DECL;
     if (strcmp(name, "Bool") == 0) return &HIR_BUILTIN_BOOL_DECL;
     if (strcmp(name, "Void") == 0) return &HIR_BUILTIN_VOID_DECL;
@@ -931,6 +1120,90 @@ static HirTypeQueryRef describe_hir_type(HirType* type) {
             out.nominal.kind = HIR_NOMINAL_BUILTIN;
             out.nominal.name = "Int";
             out.nominal.decl = (void*)&HIR_BUILTIN_INT_DECL;
+            return out;
+        case HIR_TYPE_I8:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Int8";
+            out.nominal.decl = (void*)&HIR_BUILTIN_I8_DECL;
+            return out;
+        case HIR_TYPE_I16:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Int16";
+            out.nominal.decl = (void*)&HIR_BUILTIN_I16_DECL;
+            return out;
+        case HIR_TYPE_I32:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Int32";
+            out.nominal.decl = (void*)&HIR_BUILTIN_I32_DECL;
+            return out;
+        case HIR_TYPE_I64:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Int64";
+            out.nominal.decl = (void*)&HIR_BUILTIN_I64_DECL;
+            return out;
+        case HIR_TYPE_U8:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "UInt8";
+            out.nominal.decl = (void*)&HIR_BUILTIN_U8_DECL;
+            return out;
+        case HIR_TYPE_U16:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "UInt16";
+            out.nominal.decl = (void*)&HIR_BUILTIN_U16_DECL;
+            return out;
+        case HIR_TYPE_U32:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "UInt32";
+            out.nominal.decl = (void*)&HIR_BUILTIN_U32_DECL;
+            return out;
+        case HIR_TYPE_U64:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "UInt64";
+            out.nominal.decl = (void*)&HIR_BUILTIN_U64_DECL;
+            return out;
+        case HIR_TYPE_F16:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Float16";
+            out.nominal.decl = (void*)&HIR_BUILTIN_F16_DECL;
+            return out;
+        case HIR_TYPE_F32:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Float32";
+            out.nominal.decl = (void*)&HIR_BUILTIN_F32_DECL;
+            return out;
+        case HIR_TYPE_F64:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Float64";
+            out.nominal.decl = (void*)&HIR_BUILTIN_F64_DECL;
+            return out;
+        case HIR_TYPE_FLOAT:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Float";
+            out.nominal.decl = (void*)&HIR_BUILTIN_FLOAT_DECL;
+            return out;
+        case HIR_TYPE_DOUBLE:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Double";
+            out.nominal.decl = (void*)&HIR_BUILTIN_DOUBLE_DECL;
+            return out;
+        case HIR_TYPE_CHARACTER:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Character";
+            out.nominal.decl = (void*)&HIR_BUILTIN_CHARACTER_DECL;
             return out;
         case HIR_TYPE_UINT8:
             out.kind = HIR_TYPE_QUERY_NOMINAL;
@@ -1238,14 +1511,53 @@ static HirBuiltinKind builtin_kind(const char* name) {
 
 static HirBuiltinKind builtin_method_kind(HirType* receiver_type, const char* method_name, int static_flag) {
     HirTypeQueryRef query = describe_hir_type(receiver_type);
+    const HirBuiltinNominalDecl* builtin = 0;
     if (static_flag || query.kind != HIR_TYPE_QUERY_NOMINAL || query.nominal.kind != HIR_NOMINAL_BUILTIN) {
         return HIR_BUILTIN_NONE;
     }
+    builtin = (const HirBuiltinNominalDecl*)query.nominal.decl;
     if (strcmp(method_name, "equal") == 0) {
-        return HIR_BUILTIN_EQUAL;
+            switch (builtin->kind) {
+            case HIR_BUILTIN_NOMINAL_INT:
+            case HIR_BUILTIN_NOMINAL_I8:
+            case HIR_BUILTIN_NOMINAL_I16:
+            case HIR_BUILTIN_NOMINAL_I32:
+            case HIR_BUILTIN_NOMINAL_I64:
+            case HIR_BUILTIN_NOMINAL_U8:
+            case HIR_BUILTIN_NOMINAL_U16:
+            case HIR_BUILTIN_NOMINAL_U32:
+            case HIR_BUILTIN_NOMINAL_U64:
+            case HIR_BUILTIN_NOMINAL_F16:
+            case HIR_BUILTIN_NOMINAL_F32:
+            case HIR_BUILTIN_NOMINAL_F64:
+            case HIR_BUILTIN_NOMINAL_FLOAT:
+            case HIR_BUILTIN_NOMINAL_DOUBLE:
+            case HIR_BUILTIN_NOMINAL_CHARACTER:
+            case HIR_BUILTIN_NOMINAL_UINT8:
+            case HIR_BUILTIN_NOMINAL_BOOL:
+                return HIR_BUILTIN_EQUAL;
+            default:
+                return HIR_BUILTIN_NONE;
+        }
     }
     if (strcmp(method_name, "hash") == 0) {
-        return HIR_BUILTIN_HASH;
+            switch (builtin->kind) {
+            case HIR_BUILTIN_NOMINAL_INT:
+            case HIR_BUILTIN_NOMINAL_I8:
+            case HIR_BUILTIN_NOMINAL_I16:
+            case HIR_BUILTIN_NOMINAL_I32:
+            case HIR_BUILTIN_NOMINAL_I64:
+            case HIR_BUILTIN_NOMINAL_U8:
+            case HIR_BUILTIN_NOMINAL_U16:
+            case HIR_BUILTIN_NOMINAL_U32:
+            case HIR_BUILTIN_NOMINAL_U64:
+            case HIR_BUILTIN_NOMINAL_CHARACTER:
+            case HIR_BUILTIN_NOMINAL_UINT8:
+            case HIR_BUILTIN_NOMINAL_BOOL:
+                return HIR_BUILTIN_HASH;
+            default:
+                return HIR_BUILTIN_NONE;
+        }
     }
     return HIR_BUILTIN_NONE;
 }
@@ -1469,6 +1781,19 @@ static HirType* find_named_owner_type(HirProgram* program, const char* owner_typ
     switch (nominal.kind) {
         case HIR_NOMINAL_BUILTIN:
             if (strcmp(nominal.name, "Int") == 0) return primitive_type(program, HIR_TYPE_INT);
+            if (strcmp(nominal.name, "Int8") == 0) return primitive_type(program, HIR_TYPE_I8);
+            if (strcmp(nominal.name, "Int16") == 0) return primitive_type(program, HIR_TYPE_I16);
+            if (strcmp(nominal.name, "Int32") == 0) return primitive_type(program, HIR_TYPE_I32);
+            if (strcmp(nominal.name, "Int64") == 0) return primitive_type(program, HIR_TYPE_I64);
+            if (strcmp(nominal.name, "UInt16") == 0) return primitive_type(program, HIR_TYPE_U16);
+            if (strcmp(nominal.name, "UInt32") == 0) return primitive_type(program, HIR_TYPE_U32);
+            if (strcmp(nominal.name, "UInt64") == 0) return primitive_type(program, HIR_TYPE_U64);
+            if (strcmp(nominal.name, "Float16") == 0) return primitive_type(program, HIR_TYPE_F16);
+            if (strcmp(nominal.name, "Float32") == 0) return primitive_type(program, HIR_TYPE_F32);
+            if (strcmp(nominal.name, "Float64") == 0) return primitive_type(program, HIR_TYPE_F64);
+            if (strcmp(nominal.name, "Float") == 0) return primitive_type(program, HIR_TYPE_FLOAT);
+            if (strcmp(nominal.name, "Double") == 0) return primitive_type(program, HIR_TYPE_DOUBLE);
+            if (strcmp(nominal.name, "Character") == 0) return primitive_type(program, HIR_TYPE_CHARACTER);
             if (strcmp(nominal.name, "UInt8") == 0) return primitive_type(program, HIR_TYPE_UINT8);
             if (strcmp(nominal.name, "Bool") == 0) return primitive_type(program, HIR_TYPE_BOOL);
             if (strcmp(nominal.name, "Void") == 0) return primitive_type(program, HIR_TYPE_VOID);
@@ -1654,6 +1979,33 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
             out->as.int_value = expr->as.int_value;
             return out;
+        case AST_EXPR_FLOAT:
+            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL &&
+                is_float_like_type(expected_type->array_item)) {
+                HirType* item_type = expected_type->array_item;
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_FLOAT, item_type, expr->line);
+                out->as.unary.value->as.float_value = expr->as.float_value;
+                return out;
+            }
+            out = new_expr(HIR_EXPR_FLOAT,
+                           expected_type && is_float_like_type(expected_type)
+                               ? expected_type
+                               : primitive_type(ctx->program, HIR_TYPE_DOUBLE),
+                           expr->line);
+            out->as.float_value = expr->as.float_value;
+            return out;
+        case AST_EXPR_CHAR:
+            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL &&
+                type_equals(expected_type->array_item, primitive_type(ctx->program, HIR_TYPE_CHARACTER))) {
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_CHAR, primitive_type(ctx->program, HIR_TYPE_CHARACTER), expr->line);
+                out->as.unary.value->as.char_value = expr->as.char_value;
+                return out;
+            }
+            out = new_expr(HIR_EXPR_CHAR, primitive_type(ctx->program, HIR_TYPE_CHARACTER), expr->line);
+            out->as.char_value = expr->as.char_value;
+            return out;
         case AST_EXPR_BOOL:
             if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, primitive_type(ctx->program, HIR_TYPE_BOOL))) {
                 out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
@@ -1691,15 +2043,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.int_value = type_size_bytes(type);
                 return out;
             }
-            if (strcmp(expr->as.implicit.member, "cast") == 0) {
+            if (strcmp(expr->as.implicit.member, "as") == 0) {
                 HirExpr* value = 0;
                 HirType* target_type = 0;
                 if (!expr->as.implicit.has_type_arg) {
-                    fail(ctx, "cast requires target type");
+                    fail(ctx, "as requires target type");
                     return 0;
                 }
                 if (expr->as.implicit.args.count != 0) {
-                    fail(ctx, "cast accepts only a type argument");
+                    fail(ctx, "as accepts only a type argument");
                     return 0;
                 }
                 value = lower_expr(ctx, expr->as.implicit.value_target);
@@ -1710,11 +2062,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 if (!target_type) {
                     return 0;
                 }
-                if (!cast_compatible(value->type, target_type)) {
-                    fail(ctx, "invalid cast");
+                if (!as_compatible(value->type, target_type)) {
+                    fail(ctx, "invalid as conversion");
                     return 0;
                 }
-                out = new_expr(HIR_EXPR_CAST, target_type, expr->line);
+                out = new_expr(HIR_EXPR_AS, target_type, expr->line);
                 out->as.unary.value = value;
                 return out;
             }
@@ -1759,7 +2111,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 pointer_type->array_item = value->type;
                 addr = new_expr(HIR_EXPR_ADDR, pointer_type, expr->line);
                 addr->as.unary.value = value;
-                out = new_expr(HIR_EXPR_CAST, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out = new_expr(HIR_EXPR_AS, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
                 out->as.unary.value = addr;
                 return out;
             }
@@ -1798,24 +2150,25 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         }
         case AST_EXPR_STRING: {
             HirType* array_type = 0;
+            HirExpr* array_value = 0;
             int i = 0;
             if (!expected_type ||
-                ((expected_type->kind != HIR_TYPE_ARRAY && expected_type->kind != HIR_TYPE_SLICE) ||
-                 !expected_type->array_item ||
-                 expected_type->array_item->kind != HIR_TYPE_UINT8)) {
-                fail(ctx, "string literal requires UInt8 array type");
+                ((expected_type->kind != HIR_TYPE_ARRAY &&
+                  expected_type->kind != HIR_TYPE_SLICE) ||
+                 (!expected_type->array_item || expected_type->array_item->kind != HIR_TYPE_UINT8))) {
+                fail(ctx, "string literal requires UInt8 array or slice type");
                 return 0;
             }
             array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
             array_type->array_item = primitive_type(ctx->program, HIR_TYPE_UINT8);
             array_type->array_length = expr->as.string_lit.length;
-            out = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
+            array_value = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
             for (i = 0; i < expr->as.string_lit.length; ++i) {
                 HirExpr* item = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_UINT8), expr->line);
                 item->as.int_value = (unsigned char)expr->as.string_lit.text[i];
-                expr_list_push(&out->as.array.items, item);
+                expr_list_push(&array_value->as.array.items, item);
             }
-            return out;
+            return array_value;
         }
         case AST_EXPR_NAME: {
             HirBinding* binding = lookup_binding(ctx, expr->as.name);
@@ -1997,6 +2350,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     method = find_type_method(ctx->program, owner_type, member_name, 0);
                     if (method) {
                         int i = 0;
+                        if (!method_visible_from_context(ctx, method, owner_type)) {
+                            free(owner_name);
+                            fail(ctx, "unknown function");
+                            return 0;
+                        }
                         if (expr->as.call.args.count + 1 != method->params.count) {
                             free(owner_name);
                             fail(ctx, "call argument count mismatch");
@@ -2057,6 +2415,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     if (named_type) {
                         HirFunction* method = find_type_method(ctx->program, named_type, member_name, 1);
                         if (method) {
+                            if (!method_visible_from_context(ctx, method, named_type)) {
+                                free(owner_name);
+                                fail(ctx, "unknown function");
+                                return 0;
+                            }
                             free(owner_name);
                             out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
                             out->as.call.callee = method;
@@ -2373,6 +2736,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 expr->as.binary.op != AST_BIN_DIV;
             HirExpr* left = 0;
             HirExpr* right = 0;
+            HirType* numeric_type = 0;
             if (comparison_op &&
                 (is_expected_type_shorthand_expr(expr->as.binary.left) || is_expected_type_null_expr(expr->as.binary.left)) &&
                 !is_expected_type_shorthand_expr(expr->as.binary.right) &&
@@ -2417,12 +2781,54 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_GE: out->as.binary.op = HIR_BIN_GE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
             }
             if (expr->as.binary.op == AST_BIN_ADD || expr->as.binary.op == AST_BIN_SUB || expr->as.binary.op == AST_BIN_MUL || expr->as.binary.op == AST_BIN_MOD || expr->as.binary.op == AST_BIN_DIV) {
-                if (left->type->kind != HIR_TYPE_INT || right->type->kind != HIR_TYPE_INT) {
-                    fail(ctx, "arithmetic requires Int operands");
-                    return 0;
+                numeric_type = common_numeric_type(ctx->program, left->type, right->type);
+                if (numeric_type) {
+                    if (expr->as.binary.op == AST_BIN_MOD && numeric_type->kind != HIR_TYPE_INT) {
+                        fail(ctx, "modulo requires Int operands");
+                        return 0;
+                    }
+                    if (!type_equals(left->type, numeric_type)) {
+                        HirExpr* as_left = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
+                        as_left->as.unary.value = left;
+                        left = as_left;
+                    }
+                    if (!type_equals(right->type, numeric_type)) {
+                        HirExpr* as_right = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
+                        as_right->as.unary.value = right;
+                        right = as_right;
+                    }
+                    out->as.binary.left = left;
+                    out->as.binary.right = right;
+                    out->type = numeric_type;
+                } else if (left->type->kind != HIR_TYPE_INT || right->type->kind != HIR_TYPE_INT) {
+                    if (!type_equals(left->type, right->type) ||
+                        (!is_integer_like_type(left->type) &&
+                         !is_float_like_type(left->type))) {
+                        fail(ctx, "arithmetic requires numeric operands");
+                        return 0;
+                    }
+                    if (expr->as.binary.op == AST_BIN_MOD && !is_integer_like_type(left->type)) {
+                        fail(ctx, "modulo requires integer operands");
+                        return 0;
+                    }
+                    out->type = left->type;
                 }
             } else {
-                if (!type_equals(left->type, right->type)) {
+                numeric_type = common_numeric_type(ctx->program, left->type, right->type);
+                if (numeric_type) {
+                    if (!type_equals(left->type, numeric_type)) {
+                        HirExpr* as_left = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
+                        as_left->as.unary.value = left;
+                        left = as_left;
+                    }
+                    if (!type_equals(right->type, numeric_type)) {
+                        HirExpr* as_right = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
+                        as_right->as.unary.value = right;
+                        right = as_right;
+                    }
+                    out->as.binary.left = left;
+                    out->as.binary.right = right;
+                } else if (!type_equals(left->type, right->type)) {
                     fail(ctx, "comparison requires matching operand types");
                     return 0;
                 }
@@ -2437,7 +2843,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         fail(ctx, "comparison operand type unsupported");
                         return 0;
                     }
-                } else if (left->type->kind != HIR_TYPE_INT && left->type->kind != HIR_TYPE_UINT8 && left->type->kind != HIR_TYPE_BOOL && left->type->kind != HIR_TYPE_ENUM) {
+                } else if (is_float_like_type(left->type)) {
+                    /* supported */
+                } else if (!is_integer_like_type(left->type) &&
+                           left->type->kind != HIR_TYPE_CHARACTER &&
+                           left->type->kind != HIR_TYPE_ENUM) {
                     fail(ctx, "comparison operand type unsupported");
                     return 0;
                 }
@@ -2562,6 +2972,15 @@ static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line) {
         case HIR_TYPE_INT:
             expr = new_expr(HIR_EXPR_INT, type, line);
             expr->as.int_value = 0;
+            return expr;
+        case HIR_TYPE_FLOAT:
+        case HIR_TYPE_DOUBLE:
+            expr = new_expr(HIR_EXPR_FLOAT, type, line);
+            expr->as.float_value = 0.0;
+            return expr;
+        case HIR_TYPE_CHARACTER:
+            expr = new_expr(HIR_EXPR_CHAR, type, line);
+            expr->as.char_value = 0;
             return expr;
         case HIR_TYPE_BOOL:
             expr = new_expr(HIR_EXPR_BOOL, type, line);
@@ -3646,6 +4065,7 @@ static int register_functions(LowerContext* ctx) {
         hir_fn.return_type = lower_type(ctx, &ast_fn->return_type);
         hir_fn.name = ast_fn->name;
         hir_fn.line = ast_fn->line;
+        hir_fn.public_flag = ast_fn->public_flag;
         hir_fn.method_flag = ast_fn->method_flag;
         hir_fn.static_method_flag = ast_fn->static_method_flag;
             if (ast_fn->method_flag) {
@@ -3830,6 +4250,20 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     memset(hir, 0, sizeof(*hir));
     memset(&ctx, 0, sizeof(ctx));
     hir->int_type.kind = HIR_TYPE_INT;
+    hir->i8_type.kind = HIR_TYPE_I8;
+    hir->i16_type.kind = HIR_TYPE_I16;
+    hir->i32_type.kind = HIR_TYPE_I32;
+    hir->i64_type.kind = HIR_TYPE_I64;
+    hir->u8_type.kind = HIR_TYPE_U8;
+    hir->u16_type.kind = HIR_TYPE_U16;
+    hir->u32_type.kind = HIR_TYPE_U32;
+    hir->u64_type.kind = HIR_TYPE_U64;
+    hir->f16_type.kind = HIR_TYPE_F16;
+    hir->f32_type.kind = HIR_TYPE_F32;
+    hir->f64_type.kind = HIR_TYPE_F64;
+    hir->float_type.kind = HIR_TYPE_FLOAT;
+    hir->double_type.kind = HIR_TYPE_DOUBLE;
+    hir->character_type.kind = HIR_TYPE_CHARACTER;
     hir->uint8_type.kind = HIR_TYPE_UINT8;
     hir->bool_type.kind = HIR_TYPE_BOOL;
     hir->void_type.kind = HIR_TYPE_VOID;
