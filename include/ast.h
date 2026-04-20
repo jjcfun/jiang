@@ -13,6 +13,22 @@ typedef struct AstStructField AstStructField;
 typedef struct AstStructDecl AstStructDecl;
 typedef struct AstImportDecl AstImportDecl;
 typedef struct AstAliasDecl AstAliasDecl;
+typedef struct AstConceptDecl AstConceptDecl;
+typedef struct AstParam AstParam;
+typedef struct AstConceptMethod AstConceptMethod;
+typedef struct AstConceptMethodList AstConceptMethodList;
+
+typedef struct AstWhereConstraint {
+    char* param_name;
+    char* concept_name;
+    int line;
+} AstWhereConstraint;
+
+typedef struct AstWhereConstraintList {
+    AstWhereConstraint* items;
+    int count;
+    int capacity;
+} AstWhereConstraintList;
 
 typedef struct AstTypeList {
     AstType* items;
@@ -275,17 +291,43 @@ typedef struct AstSwitchCaseList {
     int capacity;
 } AstSwitchCaseList;
 
-typedef struct AstParam {
+struct AstParam {
     AstType type;
     char* name;
     int line;
-} AstParam;
+};
 
 typedef struct AstParamList {
     AstParam* items;
     int count;
     int capacity;
 } AstParamList;
+
+struct AstConceptMethod {
+    AstType return_type;
+    char* name;
+    AstParamList params;
+    int line;
+};
+
+struct AstConceptMethodList {
+    AstConceptMethod* items;
+    int count;
+    int capacity;
+};
+
+struct AstConceptDecl {
+    char* name;
+    AstConceptMethodList methods;
+    int public_flag;
+    int line;
+};
+
+typedef struct AstConceptList {
+    AstConceptDecl* items;
+    int count;
+    int capacity;
+} AstConceptList;
 
 typedef enum AstStmtKind {
     AST_STMT_RETURN = 0,
@@ -359,6 +401,7 @@ typedef struct AstFunction {
     AstType return_type;
     char* name;
     AstNameList type_params;
+    AstWhereConstraintList where_constraints;
     AstParamList params;
     AstBlock body;
     int public_flag;
@@ -379,6 +422,7 @@ struct AstEnumDecl {
 struct AstStructDecl {
     char* name;
     AstNameList type_params;
+    AstWhereConstraintList where_constraints;
     AstStructFieldList fields;
     AstParamList init_params;
     AstBlock init_body;
@@ -454,6 +498,7 @@ typedef struct AstGlobalList {
 typedef struct AstProgram {
     AstImportList imports;
     AstAliasList aliases;
+    AstConceptList concepts;
     AstStructList structs;
     AstEnumList enums;
     AstUnionList unions;

@@ -24,6 +24,9 @@
 #define binding_pattern_list_push(list, pattern) VEC_PUSH((list), (pattern))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define name_list_push(list, name) VEC_PUSH((list), (name))
+#define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
+#define where_constraint_list_push(list, constraint) VEC_PUSH((list), (constraint))
+#define concept_method_list_push(list, method) VEC_PUSH((list), (method))
 
 static char* dup_text(const char* text) {
     size_t n = strlen(text);
@@ -95,6 +98,11 @@ static void usage(const char* argv0) {
 
 static int program_has_public_type(const AstProgram* program, const char* name) {
     int i = 0;
+    for (i = 0; i < program->concepts.count; ++i) {
+        if (program->concepts.items[i].public_flag && strcmp(program->concepts.items[i].name, name) == 0) {
+            return 1;
+        }
+    }
     for (i = 0; i < program->structs.count; ++i) {
         if (program->structs.items[i].public_flag && strcmp(program->structs.items[i].name, name) == 0) {
             return 1;
@@ -130,6 +138,9 @@ static int program_has_public_value(const AstProgram* program, const char* name)
 
 static int program_has_any_type(const AstProgram* program, const char* name) {
     int i = 0;
+    for (i = 0; i < program->concepts.count; ++i) {
+        if (strcmp(program->concepts.items[i].name, name) == 0) return 1;
+    }
     for (i = 0; i < program->structs.count; ++i) {
         if (strcmp(program->structs.items[i].name, name) == 0) return 1;
     }
@@ -167,6 +178,8 @@ static AstType clone_type(const AstProgram* source, const char* prefix, const As
 static AstExpr* clone_expr(const AstProgram* source, const char* prefix, const AstExpr* expr);
 static AstBindingPattern* clone_binding_pattern(const AstProgram* source, const char* prefix, const AstBindingPattern* pattern);
 static int clone_block(const AstProgram* source, const char* prefix, AstBlock* out, const AstBlock* block);
+static AstType ast_type_copy(const AstType* type);
+static int ast_type_is_equal(const AstType* left, const AstType* right);
 
 static AstType clone_type(const AstProgram* source, const char* prefix, const AstType* type) {
     AstType out;
@@ -419,9 +432,17 @@ static AstFunction clone_function(const AstProgram* source, const char* prefix, 
     int i = 0;
     memset(&out, 0, sizeof(out));
     out.return_type = clone_type(source, prefix, &fn->return_type);
-    out.name = remap_exported_name(source, prefix, fn->name);
+    out.name = fn->method_flag ? dup_text(fn->name) : remap_exported_name(source, prefix, fn->name);
     for (i = 0; i < fn->type_params.count; ++i) {
         name_list_push(&out.type_params, dup_text(fn->type_params.items[i]));
+    }
+    for (i = 0; i < fn->where_constraints.count; ++i) {
+        AstWhereConstraint item;
+        memset(&item, 0, sizeof(item));
+        item.param_name = dup_text(fn->where_constraints.items[i].param_name);
+        item.concept_name = dup_text(fn->where_constraints.items[i].concept_name);
+        item.line = fn->where_constraints.items[i].line;
+        where_constraint_list_push(&out.where_constraints, item);
     }
     out.public_flag = public_flag;
     out.struct_init_flag = fn->struct_init_flag;
@@ -473,6 +494,14 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
     out.name = remap_exported_name(source, prefix, decl->name);
     for (i = 0; i < decl->type_params.count; ++i) {
         name_list_push(&out.type_params, dup_text(decl->type_params.items[i]));
+    }
+    for (i = 0; i < decl->where_constraints.count; ++i) {
+        AstWhereConstraint item;
+        memset(&item, 0, sizeof(item));
+        item.param_name = dup_text(decl->where_constraints.items[i].param_name);
+        item.concept_name = dup_text(decl->where_constraints.items[i].concept_name);
+        item.line = decl->where_constraints.items[i].line;
+        where_constraint_list_push(&out.where_constraints, item);
     }
     out.public_flag = public_flag;
     out.has_init = decl->has_init;
@@ -555,6 +584,33 @@ static AstUnionDecl clone_union_decl_as(const AstProgram* source, const AstUnion
     return out;
 }
 
+static AstConceptDecl clone_concept_decl(const AstConceptDecl* decl) {
+    AstConceptDecl out;
+    int i = 0;
+    memset(&out, 0, sizeof(out));
+    out.name = dup_text(decl->name);
+    for (i = 0; i < decl->methods.count; ++i) {
+        AstConceptMethod method;
+        int j = 0;
+        memset(&method, 0, sizeof(method));
+        method.return_type = ast_type_copy(&decl->methods.items[i].return_type);
+        method.name = dup_text(decl->methods.items[i].name);
+        method.line = decl->methods.items[i].line;
+        for (j = 0; j < decl->methods.items[i].params.count; ++j) {
+            AstParam param;
+            memset(&param, 0, sizeof(param));
+            param.type = ast_type_copy(&decl->methods.items[i].params.items[j].type);
+            param.name = dup_text(decl->methods.items[i].params.items[j].name);
+            param.line = decl->methods.items[i].params.items[j].line;
+            param_list_push(&method.params, param);
+        }
+        concept_method_list_push(&out.methods, method);
+    }
+    out.public_flag = decl->public_flag;
+    out.line = decl->line;
+    return out;
+}
+
 static const AstFunction* find_ast_function(const AstProgram* program, const char* name) {
     int i = 0;
     for (i = 0; i < program->functions.count; ++i) {
@@ -595,31 +651,249 @@ static const AstUnionDecl* find_ast_union(const AstProgram* program, const char*
     return 0;
 }
 
+typedef enum AstNominalKind {
+    AST_NOMINAL_NONE = 0,
+    AST_NOMINAL_BUILTIN,
+    AST_NOMINAL_STRUCT,
+    AST_NOMINAL_ENUM,
+    AST_NOMINAL_UNION,
+} AstNominalKind;
+
+typedef enum AstBuiltinNominalKind {
+    AST_BUILTIN_NOMINAL_NONE = 0,
+    AST_BUILTIN_NOMINAL_INT,
+    AST_BUILTIN_NOMINAL_UINT8,
+    AST_BUILTIN_NOMINAL_BOOL,
+    AST_BUILTIN_NOMINAL_VOID,
+} AstBuiltinNominalKind;
+
+typedef struct AstBuiltinNominalDecl {
+    AstBuiltinNominalKind kind;
+    const char* name;
+} AstBuiltinNominalDecl;
+
+typedef struct AstNominalDeclRef {
+    AstNominalKind kind;
+    const char* name;
+    const void* decl;
+} AstNominalDeclRef;
+
+typedef enum AstTypeQueryKind {
+    AST_TYPE_QUERY_NONE = 0,
+    AST_TYPE_QUERY_NOMINAL,
+    AST_TYPE_QUERY_TUPLE,
+    AST_TYPE_QUERY_SLICE,
+    AST_TYPE_QUERY_POINTER,
+    AST_TYPE_QUERY_ARRAY,
+    AST_TYPE_QUERY_OPTIONAL,
+    AST_TYPE_QUERY_INFER,
+} AstTypeQueryKind;
+
+typedef struct AstTypeQueryRef {
+    AstTypeQueryKind kind;
+    const AstType* source;
+    AstNominalDeclRef nominal;
+    const AstType* item_type;
+    int array_length;
+} AstTypeQueryRef;
+
+static const AstBuiltinNominalDecl AST_BUILTIN_INT_DECL = { AST_BUILTIN_NOMINAL_INT, "Int" };
+static const AstBuiltinNominalDecl AST_BUILTIN_UINT8_DECL = { AST_BUILTIN_NOMINAL_UINT8, "UInt8" };
+static const AstBuiltinNominalDecl AST_BUILTIN_BOOL_DECL = { AST_BUILTIN_NOMINAL_BOOL, "Bool" };
+static const AstBuiltinNominalDecl AST_BUILTIN_VOID_DECL = { AST_BUILTIN_NOMINAL_VOID, "Void" };
+
+static const AstConceptDecl* find_ast_concept(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->concepts.count; ++i) {
+        if (strcmp(program->concepts.items[i].name, name) == 0) return &program->concepts.items[i];
+    }
+    return 0;
+}
+
+static const AstBuiltinNominalDecl* find_ast_builtin_nominal(const char* name) {
+    if (strcmp(name, "Int") == 0) return &AST_BUILTIN_INT_DECL;
+    if (strcmp(name, "UInt8") == 0) return &AST_BUILTIN_UINT8_DECL;
+    if (strcmp(name, "Bool") == 0) return &AST_BUILTIN_BOOL_DECL;
+    if (strcmp(name, "Void") == 0) return &AST_BUILTIN_VOID_DECL;
+    return 0;
+}
+
+static AstNominalKind find_ast_nominal_kind(const AstProgram* program, const char* name) {
+    if (find_ast_builtin_nominal(name)) return AST_NOMINAL_BUILTIN;
+    if (find_ast_struct(program, name)) return AST_NOMINAL_STRUCT;
+    if (find_ast_enum(program, name)) return AST_NOMINAL_ENUM;
+    if (find_ast_union(program, name)) return AST_NOMINAL_UNION;
+    return AST_NOMINAL_NONE;
+}
+
+static AstNominalDeclRef find_ast_nominal_decl(const AstProgram* program, const char* name) {
+    const AstBuiltinNominalDecl* builtin_decl = find_ast_builtin_nominal(name);
+    const AstStructDecl* struct_decl = find_ast_struct(program, name);
+    const AstEnumDecl* enum_decl = 0;
+    const AstUnionDecl* union_decl = 0;
+    AstNominalDeclRef out;
+    memset(&out, 0, sizeof(out));
+    if (builtin_decl) {
+        out.kind = AST_NOMINAL_BUILTIN;
+        out.name = builtin_decl->name;
+        out.decl = builtin_decl;
+        return out;
+    }
+    if (struct_decl) {
+        out.kind = AST_NOMINAL_STRUCT;
+        out.name = struct_decl->name;
+        out.decl = struct_decl;
+        return out;
+    }
+    enum_decl = find_ast_enum(program, name);
+    if (enum_decl) {
+        out.kind = AST_NOMINAL_ENUM;
+        out.name = enum_decl->name;
+        out.decl = enum_decl;
+        return out;
+    }
+    union_decl = find_ast_union(program, name);
+    if (union_decl) {
+        out.kind = AST_NOMINAL_UNION;
+        out.name = union_decl->name;
+        out.decl = union_decl;
+        return out;
+    }
+    return out;
+}
+
+static int ast_nominal_has_type_params(AstNominalDeclRef nominal) {
+    switch (nominal.kind) {
+        case AST_NOMINAL_BUILTIN:
+            return 0;
+        case AST_NOMINAL_STRUCT:
+            return ((const AstStructDecl*)nominal.decl)->type_params.count > 0;
+        case AST_NOMINAL_ENUM:
+        case AST_NOMINAL_UNION:
+        case AST_NOMINAL_NONE:
+        default:
+            return 0;
+    }
+}
+
+static AstTypeQueryRef describe_ast_type(const AstProgram* program, const AstType* type) {
+    AstTypeQueryRef out;
+    memset(&out, 0, sizeof(out));
+    if (!type) {
+        return out;
+    }
+    out.source = type;
+    out.array_length = type->array_length;
+    switch (type->kind) {
+        case AST_TYPE_INT:
+            out.kind = AST_TYPE_QUERY_NOMINAL;
+            out.nominal = find_ast_nominal_decl(program, "Int");
+            return out;
+        case AST_TYPE_UINT8:
+            out.kind = AST_TYPE_QUERY_NOMINAL;
+            out.nominal = find_ast_nominal_decl(program, "UInt8");
+            return out;
+        case AST_TYPE_BOOL:
+            out.kind = AST_TYPE_QUERY_NOMINAL;
+            out.nominal = find_ast_nominal_decl(program, "Bool");
+            return out;
+        case AST_TYPE_VOID:
+            out.kind = AST_TYPE_QUERY_NOMINAL;
+            out.nominal = find_ast_nominal_decl(program, "Void");
+            return out;
+        case AST_TYPE_NAMED:
+            out.kind = AST_TYPE_QUERY_NOMINAL;
+            out.nominal = find_ast_nominal_decl(program, type->named_name);
+            return out;
+        case AST_TYPE_TUPLE:
+            out.kind = AST_TYPE_QUERY_TUPLE;
+            return out;
+        case AST_TYPE_SLICE:
+            out.kind = AST_TYPE_QUERY_SLICE;
+            out.item_type = type->array_item;
+            return out;
+        case AST_TYPE_POINTER:
+            out.kind = AST_TYPE_QUERY_POINTER;
+            out.item_type = type->array_item;
+            return out;
+        case AST_TYPE_ARRAY:
+            out.kind = AST_TYPE_QUERY_ARRAY;
+            out.item_type = type->array_item;
+            return out;
+        case AST_TYPE_OPTIONAL:
+            out.kind = AST_TYPE_QUERY_OPTIONAL;
+            out.item_type = type->array_item;
+            return out;
+        case AST_TYPE_INFER:
+            out.kind = AST_TYPE_QUERY_INFER;
+            return out;
+        default:
+            return out;
+    }
+}
+
 static int validate_module_decls(const AstProgram* own_program, const char** error) {
     int i = 0;
     int j = 0;
     for (i = 0; i < own_program->imports.count; ++i) {
-        const char* alias = own_program->imports.items[i].alias_name;
+        char* alias = own_program->imports.items[i].alias_name
+                          ? dup_text(own_program->imports.items[i].alias_name)
+                          : 0;
         if (!alias) {
-            continue;
+            const char* path = own_program->imports.items[i].path;
+            const char* slash = strrchr(path, '/');
+            const char* base = slash ? slash + 1 : path;
+            const char* dot = strrchr(base, '.');
+            size_t len = dot && dot > base ? (size_t)(dot - base) : strlen(base);
+            alias = (char*)malloc(len + 1);
+            if (!alias) {
+                *error = "out of memory";
+                return 0;
+            }
+            memcpy(alias, base, len);
+            alias[len] = '\0';
         }
         for (j = i + 1; j < own_program->imports.count; ++j) {
-            if (own_program->imports.items[j].alias_name &&
-                strcmp(alias, own_program->imports.items[j].alias_name) == 0) {
+            char* other_alias = own_program->imports.items[j].alias_name
+                                    ? dup_text(own_program->imports.items[j].alias_name)
+                                    : 0;
+            int same = 0;
+            if (!other_alias) {
+                const char* path = own_program->imports.items[j].path;
+                const char* slash = strrchr(path, '/');
+                const char* base = slash ? slash + 1 : path;
+                const char* dot = strrchr(base, '.');
+                size_t len = dot && dot > base ? (size_t)(dot - base) : strlen(base);
+                other_alias = (char*)malloc(len + 1);
+                if (!other_alias) {
+                    free(alias);
+                    *error = "out of memory";
+                    return 0;
+                }
+                memcpy(other_alias, base, len);
+                other_alias[len] = '\0';
+            }
+            same = strcmp(alias, other_alias) == 0;
+            free(other_alias);
+            if (same) {
+                free(alias);
                 *error = "duplicate import alias";
                 return 0;
             }
         }
         if (program_has_any_type(own_program, alias) || program_has_any_value(own_program, alias)) {
+            free(alias);
             *error = "import alias conflicts with top-level declaration";
             return 0;
         }
         for (j = 0; j < own_program->aliases.count; ++j) {
             if (strcmp(alias, own_program->aliases.items[j].name) == 0) {
+                free(alias);
                 *error = "import alias conflicts with alias";
                 return 0;
             }
         }
+        free(alias);
     }
     return 1;
 }
@@ -630,9 +904,7 @@ static int apply_aliases(AstProgram* dest, const AstProgram* own_program, const 
         const AstAliasDecl* alias = &own_program->aliases.items[i];
         const AstFunction* fn = find_ast_function(dest, alias->target_name);
         const AstGlobal* global = find_ast_global(dest, alias->target_name);
-        const AstStructDecl* struct_decl = find_ast_struct(dest, alias->target_name);
-        const AstEnumDecl* enum_decl = find_ast_enum(dest, alias->target_name);
-        const AstUnionDecl* union_decl = find_ast_union(dest, alias->target_name);
+        AstNominalDeclRef nominal = find_ast_nominal_decl(dest, alias->target_name);
         if (fn) {
             function_list_push(&dest->functions, clone_function_as(dest, fn, alias->name, alias->public_flag));
             continue;
@@ -641,17 +913,19 @@ static int apply_aliases(AstProgram* dest, const AstProgram* own_program, const 
             global_list_push(&dest->globals, clone_global_as(dest, global, alias->name, alias->public_flag));
             continue;
         }
-        if (struct_decl) {
-            struct_list_push(&dest->structs, clone_struct_decl_as(dest, struct_decl, alias->name, alias->public_flag));
-            continue;
-        }
-        if (enum_decl) {
-            enum_list_push(&dest->enums, clone_enum_decl_as(dest, enum_decl, alias->name, alias->public_flag));
-            continue;
-        }
-        if (union_decl) {
-            union_list_push(&dest->unions, clone_union_decl_as(dest, union_decl, alias->name, alias->public_flag));
-            continue;
+        switch (nominal.kind) {
+            case AST_NOMINAL_STRUCT:
+                struct_list_push(&dest->structs, clone_struct_decl_as(dest, (const AstStructDecl*)nominal.decl, alias->name, alias->public_flag));
+                continue;
+            case AST_NOMINAL_ENUM:
+                enum_list_push(&dest->enums, clone_enum_decl_as(dest, (const AstEnumDecl*)nominal.decl, alias->name, alias->public_flag));
+                continue;
+            case AST_NOMINAL_UNION:
+                union_list_push(&dest->unions, clone_union_decl_as(dest, (const AstUnionDecl*)nominal.decl, alias->name, alias->public_flag));
+                continue;
+            case AST_NOMINAL_NONE:
+            default:
+                break;
         }
         *error = "unknown alias target";
         return 0;
@@ -661,6 +935,12 @@ static int apply_aliases(AstProgram* dest, const AstProgram* own_program, const 
 
 static void merge_public_import(AstProgram* dest, const AstProgram* imported, const char* prefix) {
     int i = 0;
+    (void)prefix;
+    for (i = 0; i < imported->concepts.count; ++i) {
+        if (!find_ast_concept(dest, imported->concepts.items[i].name)) {
+            concept_list_push(&dest->concepts, clone_concept_decl(&imported->concepts.items[i]));
+        }
+    }
     for (i = 0; i < imported->structs.count; ++i) {
         if (imported->structs.items[i].public_flag) {
             struct_list_push(&dest->structs, clone_struct_decl(imported, prefix, &imported->structs.items[i], 0));
@@ -690,6 +970,11 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
 
 static void append_own_decls(AstProgram* dest, const AstProgram* own) {
     int i = 0;
+    for (i = 0; i < own->concepts.count; ++i) {
+        if (!find_ast_concept(dest, own->concepts.items[i].name)) {
+            concept_list_push(&dest->concepts, clone_concept_decl(&own->concepts.items[i]));
+        }
+    }
     for (i = 0; i < own->structs.count; ++i) {
         struct_list_push(&dest->structs, clone_struct_decl(own, 0, &own->structs.items[i], own->structs.items[i].public_flag));
     }
@@ -739,6 +1024,36 @@ static char* resolve_import_path(const char* from_path, const char* import_path)
     return full;
 }
 
+static char* import_module_name(const char* import_path, const char** error) {
+    const char* slash = strrchr(import_path, '/');
+    const char* base = slash ? slash + 1 : import_path;
+    const char* dot = strrchr(base, '.');
+    size_t len = dot && dot > base ? (size_t)(dot - base) : strlen(base);
+    char* out = 0;
+    if (len == 0) {
+        *error = "invalid import path";
+        return 0;
+    }
+    out = (char*)malloc(len + 1);
+    if (!out) {
+        *error = "out of memory";
+        return 0;
+    }
+    memcpy(out, base, len);
+    out[len] = '\0';
+    return out;
+}
+
+static int is_prelude_module_path(const char* path) {
+    const char* suffix = "/std/prelude.jiang";
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    if (strcmp(path, "std/prelude.jiang") == 0) {
+        return 1;
+    }
+    return path_len >= suffix_len && strcmp(path + path_len - suffix_len, suffix) == 0;
+}
+
 static int path_in_stack(const char* path, const char** stack, int depth) {
     int i = 0;
     for (i = 0; i < depth; ++i) {
@@ -777,20 +1092,38 @@ static int load_effective_program(const char* path, const char** stack, int dept
         return 0;
     }
     stack[depth] = path;
+    if (depth == 0 && !is_prelude_module_path(path)) {
+        AstProgram prelude_program;
+        if (!load_effective_program("std/prelude.jiang", stack, depth + 1, &prelude_program, error)) {
+            free(source);
+            return 0;
+        }
+        merge_public_import(out_program, &prelude_program, 0);
+    }
     for (i = 0; i < own_program.imports.count; ++i) {
         AstProgram imported;
         char* import_path = resolve_import_path(path, own_program.imports.items[i].path);
+        char* import_name = own_program.imports.items[i].alias_name
+                                ? dup_text(own_program.imports.items[i].alias_name)
+                                : import_module_name(own_program.imports.items[i].path, error);
         if (!import_path) {
             *error = "failed to resolve import";
             free(source);
             return 0;
         }
-        if (!load_effective_program(import_path, stack, depth + 1, &imported, error)) {
+        if (!import_name) {
             free(import_path);
             free(source);
             return 0;
         }
-        merge_public_import(out_program, &imported, own_program.imports.items[i].alias_name);
+        if (!load_effective_program(import_path, stack, depth + 1, &imported, error)) {
+            free(import_name);
+            free(import_path);
+            free(source);
+            return 0;
+        }
+        merge_public_import(out_program, &imported, import_name);
+        free(import_name);
         free(import_path);
     }
     if (!apply_aliases(out_program, &own_program, error)) {
@@ -844,9 +1177,10 @@ static const AstFunction* find_generic_function_template(const AstProgram* progr
 }
 
 static int is_generic_owner_method(const AstProgram* program, const AstFunction* fn) {
+    AstNominalDeclRef nominal;
     return fn->method_flag &&
            fn->owner_type_name &&
-           find_generic_struct_template(program, fn->owner_type_name) != 0;
+           ((nominal = find_ast_nominal_decl(program, fn->owner_type_name)), ast_nominal_has_type_params(nominal));
 }
 
 static const AstFunction* find_method_template(const AstProgram* program, const char* owner_name, const char* method_name) {
@@ -862,6 +1196,14 @@ static const AstFunction* find_method_template(const AstProgram* program, const 
     return 0;
 }
 
+static const AstFunction* find_type_method_template(const AstProgram* program, const AstType* type, const char* method_name) {
+    AstTypeQueryRef query = describe_ast_type(program, type);
+    if (query.kind != AST_TYPE_QUERY_NOMINAL || !query.nominal.name) {
+        return 0;
+    }
+    return find_method_template(program, query.nominal.name, method_name);
+}
+
 static const AstType* lookup_subst(const TypeSubstList* subst, const char* name) {
     int i = 0;
     for (i = 0; i < subst->count; ++i) {
@@ -870,6 +1212,274 @@ static const AstType* lookup_subst(const TypeSubstList* subst, const char* name)
         }
     }
     return 0;
+}
+
+typedef enum BuiltinConceptCapability {
+    BUILTIN_CONCEPT_NONE = 0,
+    BUILTIN_CONCEPT_NUMBRIC = 1 << 0,
+    BUILTIN_CONCEPT_EQUATABLE = 1 << 1,
+    BUILTIN_CONCEPT_HASHABLE = 1 << 2,
+} BuiltinConceptCapability;
+
+static uint32_t ast_type_builtin_capabilities(const AstProgram* program, const AstType* type) {
+    AstTypeQueryRef query = describe_ast_type(program, type);
+    switch (query.kind) {
+        case AST_TYPE_QUERY_NOMINAL:
+            if (query.nominal.kind == AST_NOMINAL_BUILTIN) {
+                const AstBuiltinNominalDecl* builtin = (const AstBuiltinNominalDecl*)query.nominal.decl;
+                switch (builtin->kind) {
+                    case AST_BUILTIN_NOMINAL_INT:
+                    case AST_BUILTIN_NOMINAL_UINT8:
+                        return BUILTIN_CONCEPT_NUMBRIC | BUILTIN_CONCEPT_EQUATABLE | BUILTIN_CONCEPT_HASHABLE;
+                    case AST_BUILTIN_NOMINAL_BOOL:
+                        return BUILTIN_CONCEPT_EQUATABLE | BUILTIN_CONCEPT_HASHABLE;
+                    case AST_BUILTIN_NOMINAL_VOID:
+                    case AST_BUILTIN_NOMINAL_NONE:
+                    default:
+                        return BUILTIN_CONCEPT_NONE;
+                }
+            }
+            if (query.nominal.kind == AST_NOMINAL_ENUM) {
+                return BUILTIN_CONCEPT_EQUATABLE;
+            }
+            return BUILTIN_CONCEPT_NONE;
+        case AST_TYPE_QUERY_POINTER:
+            return BUILTIN_CONCEPT_EQUATABLE;
+        case AST_TYPE_QUERY_OPTIONAL:
+            return query.item_type ? ast_type_builtin_capabilities(program, query.item_type) : BUILTIN_CONCEPT_NONE;
+        case AST_TYPE_QUERY_TUPLE:
+        case AST_TYPE_QUERY_SLICE:
+        case AST_TYPE_QUERY_ARRAY:
+        case AST_TYPE_QUERY_INFER:
+        case AST_TYPE_QUERY_NONE:
+        default:
+            return BUILTIN_CONCEPT_NONE;
+    }
+}
+
+static uint32_t builtin_concept_flag_for_name(const char* concept_name) {
+    if (strcmp(concept_name, "Numbric") == 0) return BUILTIN_CONCEPT_NUMBRIC;
+    if (strcmp(concept_name, "Equatable") == 0) return BUILTIN_CONCEPT_EQUATABLE;
+    if (strcmp(concept_name, "Hashable") == 0) return BUILTIN_CONCEPT_HASHABLE;
+    return BUILTIN_CONCEPT_NONE;
+}
+
+static int concept_exists(const AstProgram* program, const char* concept_name) {
+    return find_ast_concept(program, concept_name) != 0;
+}
+
+static int ast_type_has_builtin_concept(const AstProgram* program, const AstType* type, const char* concept_name) {
+    uint32_t required = builtin_concept_flag_for_name(concept_name);
+    if (required == BUILTIN_CONCEPT_NONE) return 0;
+    return (ast_type_builtin_capabilities(program, type) & required) != 0;
+}
+
+static AstType substitute_self_type(const AstType* type, const AstType* self_type) {
+    AstType out;
+    int i = 0;
+    if (type->kind == AST_TYPE_NAMED && type->named_name && strcmp(type->named_name, "Self") == 0 && type->type_args.count == 0) {
+        AstType copied = ast_type_copy(self_type);
+        if (type->mutable_flag) {
+            copied.mutable_flag = 1;
+        }
+        return copied;
+    }
+    memset(&out, 0, sizeof(out));
+    out.kind = type->kind;
+    out.mutable_flag = type->mutable_flag;
+    out.array_length = type->array_length;
+    if (type->named_name) {
+        out.named_name = dup_text(type->named_name);
+    }
+    for (i = 0; i < type->type_args.count; ++i) {
+        type_list_push(&out.type_args, substitute_self_type(&type->type_args.items[i], self_type));
+    }
+    if (type->array_item) {
+        out.array_item = (AstType*)malloc(sizeof(AstType));
+        *out.array_item = substitute_self_type(type->array_item, self_type);
+    }
+    for (i = 0; i < type->tuple_items.count; ++i) {
+        type_list_push(&out.tuple_items, substitute_self_type(&type->tuple_items.items[i], self_type));
+    }
+    return out;
+}
+
+static int type_has_concept_methods(const AstProgram* program, const AstType* type, const AstConceptDecl* concept) {
+    int i = 0;
+    AstTypeQueryRef query = describe_ast_type(program, type);
+    if (query.kind != AST_TYPE_QUERY_NOMINAL) {
+        return concept->methods.count == 0;
+    }
+    if (query.nominal.kind == AST_NOMINAL_BUILTIN) {
+        const AstBuiltinNominalDecl* builtin = (const AstBuiltinNominalDecl*)query.nominal.decl;
+        for (i = 0; i < concept->methods.count; ++i) {
+            const AstConceptMethod* method = &concept->methods.items[i];
+            if (strcmp(method->name, "hash") == 0) {
+                if (method->params.count != 0 || method->return_type.kind != AST_TYPE_INT) {
+                    return 0;
+                }
+                if (!(builtin->kind == AST_BUILTIN_NOMINAL_INT ||
+                      builtin->kind == AST_BUILTIN_NOMINAL_UINT8 ||
+                      builtin->kind == AST_BUILTIN_NOMINAL_BOOL)) {
+                    return 0;
+                }
+                continue;
+            }
+            if (strcmp(method->name, "equal") == 0) {
+                AstType expected_param;
+                if (method->params.count != 1 || method->return_type.kind != AST_TYPE_BOOL) {
+                    return 0;
+                }
+                expected_param = substitute_self_type(&method->params.items[0].type, type);
+                if (!ast_type_is_equal(&expected_param, type)) {
+                    return 0;
+                }
+                if (!(builtin->kind == AST_BUILTIN_NOMINAL_INT ||
+                      builtin->kind == AST_BUILTIN_NOMINAL_UINT8 ||
+                      builtin->kind == AST_BUILTIN_NOMINAL_BOOL)) {
+                    return 0;
+                }
+                continue;
+            }
+            return 0;
+        }
+        return 1;
+    }
+    for (i = 0; i < concept->methods.count; ++i) {
+        const AstFunction* method = find_type_method_template(program, type, concept->methods.items[i].name);
+        int j = 0;
+        if (!method || method->static_method_flag) {
+            return 0;
+        }
+        {
+            AstType expected_return = substitute_self_type(&concept->methods.items[i].return_type, type);
+            if (!ast_type_is_equal(&method->return_type, &expected_return)) {
+                return 0;
+            }
+        }
+        if (method->params.count != concept->methods.items[i].params.count) {
+            return 0;
+        }
+        for (j = 0; j < method->params.count; ++j) {
+            AstType expected_param = substitute_self_type(&concept->methods.items[i].params.items[j].type, type);
+            if (!ast_type_is_equal(&method->params.items[j].type, &expected_param)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int type_has_builtin_concept_methods(const AstProgram* program, const AstType* type, const char* concept_name) {
+    AstConceptDecl synthetic;
+    AstConceptMethod method;
+    AstParam param;
+    AstType self_type;
+    memset(&synthetic, 0, sizeof(synthetic));
+    memset(&method, 0, sizeof(method));
+    memset(&param, 0, sizeof(param));
+    memset(&self_type, 0, sizeof(self_type));
+
+    if (strcmp(concept_name, "Hashable") == 0) {
+        synthetic.name = "Hashable";
+        method.name = "hash";
+        method.return_type.kind = AST_TYPE_INT;
+        concept_method_list_push(&synthetic.methods, method);
+        return type_has_concept_methods(program, type, &synthetic);
+    }
+
+    if (strcmp(concept_name, "Equatable") == 0) {
+        synthetic.name = "Equatable";
+        self_type.kind = AST_TYPE_NAMED;
+        self_type.named_name = "Self";
+        param.name = "other";
+        param.type = self_type;
+        method.name = "equal";
+        method.return_type.kind = AST_TYPE_BOOL;
+        param_list_push(&method.params, param);
+        concept_method_list_push(&synthetic.methods, method);
+        return type_has_concept_methods(program, type, &synthetic);
+    }
+
+    return 1;
+}
+
+static int ast_type_satisfies_concept(const AstProgram* program, const AstType* type, const char* concept_name) {
+    const AstConceptDecl* concept = find_ast_concept(program, concept_name);
+    if (builtin_concept_flag_for_name(concept_name) != BUILTIN_CONCEPT_NONE) {
+        if (!ast_type_has_builtin_concept(program, type, concept_name)) {
+            return 0;
+        }
+        if (!type_has_builtin_concept_methods(program, type, concept_name)) {
+            return 0;
+        }
+        return !concept || type_has_concept_methods(program, type, concept);
+    }
+    return concept && type_has_concept_methods(program, type, concept);
+}
+
+static int type_param_exists(const AstNameList* params, const char* name) {
+    int i = 0;
+    for (i = 0; i < params->count; ++i) {
+        if (strcmp(params->items[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int validate_where_constraints_program(const AstProgram* program, const char** error) {
+    int i = 0;
+    int j = 0;
+    static char where_error[256];
+    for (i = 0; i < program->structs.count; ++i) {
+        for (j = 0; j < program->structs.items[i].where_constraints.count; ++j) {
+            AstWhereConstraint* item = &program->structs.items[i].where_constraints.items[j];
+            if (!type_param_exists(&program->structs.items[i].type_params, item->param_name)) {
+                *error = "@where parameter is not a generic parameter";
+                return 0;
+            }
+            if (!concept_exists(program, item->concept_name)) {
+                snprintf(where_error, sizeof(where_error), "unknown concept in @where: %s", item->concept_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+    }
+    for (i = 0; i < program->functions.count; ++i) {
+        for (j = 0; j < program->functions.items[i].where_constraints.count; ++j) {
+            AstWhereConstraint* item = &program->functions.items[i].where_constraints.items[j];
+            if (!type_param_exists(&program->functions.items[i].type_params, item->param_name)) {
+                *error = "@where parameter is not a generic parameter";
+                return 0;
+            }
+            if (!concept_exists(program, item->concept_name)) {
+                snprintf(where_error, sizeof(where_error), "unknown concept in @where: %s", item->concept_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int check_where_constraints(const AstProgram* program,
+                                   const AstWhereConstraintList* where_constraints,
+                                   const TypeSubstList* subst,
+                                   const char** error) {
+    int i = 0;
+    for (i = 0; i < where_constraints->count; ++i) {
+        const AstType* actual = lookup_subst(subst, where_constraints->items[i].param_name);
+        if (!actual) {
+            *error = "missing generic substitution for @where";
+            return 0;
+        }
+        if (!ast_type_satisfies_concept(program, actual, where_constraints->items[i].concept_name)) {
+            *error = "generic type does not satisfy concept";
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static char* mangle_type_name(const AstType* type);
@@ -1541,6 +2151,9 @@ static int instantiate_function_template(MonoContext* mono, const AstFunction* t
         mono->error = "generic function type argument mismatch";
         return 0;
     }
+    if (!check_where_constraints(mono->source, &templ->where_constraints, &subst, &mono->error)) {
+        return 0;
+    }
     memset(&fn, 0, sizeof(fn));
     fn.return_type = clone_type_subst(&templ->return_type, &subst);
     fn.name = dup_text(*instantiated_name);
@@ -1581,6 +2194,9 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     }
     if (!copy_subst_from_template(&subst, &templ->type_params, type_args)) {
         mono->error = "generic struct type argument mismatch";
+        return 0;
+    }
+    if (!check_where_constraints(mono->source, &templ->where_constraints, &subst, &mono->error)) {
         return 0;
     }
     memset(&decl, 0, sizeof(decl));
@@ -1795,9 +2411,15 @@ static int monomorphize_program(const AstProgram* source, AstProgram* out, const
     MonoContext mono;
     int i = 0;
     memset(out, 0, sizeof(*out));
+    for (i = 0; i < source->concepts.count; ++i) {
+        concept_list_push(&out->concepts, clone_concept_decl(&source->concepts.items[i]));
+    }
     mono.source = source;
     mono.out = out;
     mono.error = 0;
+    if (!validate_where_constraints_program(source, error)) {
+        return 0;
+    }
     for (i = 0; i < source->enums.count; ++i) {
         enum_list_push(&out->enums, clone_enum_decl(source, 0, &source->enums.items[i], source->enums.items[i].public_flag));
     }

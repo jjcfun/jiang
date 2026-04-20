@@ -624,6 +624,21 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             if (expr->as.call.builtin == JIR_BUILTIN_SLICE_WITH_CAPACITY) {
                 return emit_builtin_slice_with_capacity(cg, expr);
             }
+            if (expr->as.call.builtin == JIR_BUILTIN_EQUAL) {
+                LLVMValueRef left = emit_expr(cg, expr->as.call.args.items[0]);
+                LLVMValueRef right = emit_expr(cg, expr->as.call.args.items[1]);
+                return LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
+            }
+            if (expr->as.call.builtin == JIR_BUILTIN_HASH) {
+                LLVMValueRef value = emit_expr(cg, expr->as.call.args.items[0]);
+                if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_UINT8) {
+                    return LLVMBuildZExt(cg->builder, value, LLVMInt64TypeInContext(cg->context), "hashtmp");
+                }
+                if (expr->as.call.args.items[0]->type->kind == JIR_TYPE_BOOL) {
+                    return LLVMBuildZExt(cg->builder, value, LLVMInt64TypeInContext(cg->context), "hashtmp");
+                }
+                return value;
+            }
             return emit_plain_call(cg, expr->as.call.callee, &expr->as.call.args, expr->type);
         }
         case JIR_EXPR_STRUCT_INIT:

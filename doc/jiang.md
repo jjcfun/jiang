@@ -33,7 +33,7 @@ UInt8[] read_source(UInt8[] file_path) {
     return file_path;
 }
 
-import Store = "token_store.jiang";
+import store = "token_store.jiang";
 ```
 
 这样可以稳定区分类型和值：
@@ -940,11 +940,28 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 concept Numbric;
 ```
 
+`std/prelude.jiang` 中默认提供了一些常用 concept，例如：
+
+- `Numbric`
+- `Hashable`
+- `Equatable`
+
+其中 `Numbric`、`Hashable` 和 `Equatable` 因为来自隐式预导入的 `std/prelude.jiang`，所以可以直接用于 `@where(...)`。
+
+用户也可以自定义 concept，并声明内部函数签名，用于约束满足该 concept 的类型必须提供对应实例方法：
+
+```c
+concept Hashable {
+  Int hash();
+}
+```
+
 此时：
 
 - `Int`、`Float`、`Double` 等数值类型可以被视为满足 `Numbric`
 - `Numbric` 本身不能直接写成 `Numbric x;`
 - `Numbric` 主要用于 `@where(...)` 这类泛型约束位置
+- concept 内部函数当前用于声明**约束签名**，不是运行时成员，也不是默认实现
 
 例如：
 
@@ -1045,37 +1062,40 @@ math.max(100, 200);
 public import "utils/math.jiang";
 math.max(100, 200);
 
-// 3.导入模块，并使用Math作为模块名
-public import Math = "utils/math.jiang";
-Math.max(100, 200);
+// 3.导入模块，并使用snake_case别名作为模块名
+public import math_utils = "utils/math.jiang";
+math_utils.max(100, 200);
 
 // 4.导入模块后，可以通过alias为模块中的公开符号创建本地别名
-import Math = "utils/math.jiang";
-alias maximum = Math.max;
+import math_utils = "utils/math.jiang";
+alias maximum = math_utils.max;
 maximum(100, 200);
 
 // 5.public alias会在当前模块中重新导出该符号
-import Math = "utils/math.jiang";
-public alias max = Math.max;
-public alias min = Math.min;
+import math_utils = "utils/math.jiang";
+public alias max = math_utils.max;
+public alias min = math_utils.min;
 
 ```
 
 其中：
 
 - `import "utils/math.jiang";` 会导入整个模块，并默认使用文件名 `math` 作为模块名
+- 编译时会隐式预导入 `std/prelude.jiang`，该文件中的 `public` 定义无需显式 `import`
 - `public import "utils/math.jiang";` 会在导入模块的同时，将模块名 `math` 对外导出
-- `public import Math = "utils/math.jiang";` 会导入模块并使用 `Math` 作为公开模块名
-- `alias maximum = Math.max;` 会为符号创建一个当前模块内可见的别名
-- `public alias max = Math.max;` 会为符号创建一个公开别名，使其他模块可以通过当前模块访问该符号
+- 显式 `import alias = "..."` 中的 `alias` 约定使用 snake_case
+- `import math_utils = "utils/math.jiang";` 会导入模块并使用 snake_case 别名 `math_utils` 作为模块名
+- `public import math_utils = "utils/math.jiang";` 会导入模块并使用 `math_utils` 作为公开模块名
+- `alias maximum = math_utils.max;` 会为符号创建一个当前模块内可见的别名
+- `public alias max = math_utils.max;` 会为符号创建一个公开别名，使其他模块可以通过当前模块访问该符号
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
 ```c
-import Math = "utils/math.jiang";
+import math_utils = "utils/math.jiang";
 
-alias maximum = Math.max;
-public alias minimum = Math.min;
+alias maximum = math_utils.max;
+public alias minimum = math_utils.min;
 ```
 
 上面的 `maximum` 和 `minimum` 都直接指向原始符号，不会创建新的函数、副本或存储空间。
@@ -1084,8 +1104,8 @@ public alias minimum = Math.min;
 
 ```c
 alias Foo = A.B;
-alias max = Math.max;
-public alias read = IO.read;
+alias max = math_utils.max;
+public alias read = io.read;
 ```
 
 而不应该是任意表达式：

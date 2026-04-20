@@ -118,6 +118,8 @@ typedef enum HirBuiltinKind {
     HIR_BUILTIN_PRINT,
     HIR_BUILTIN_PANIC,
     HIR_BUILTIN_SLICE_WITH_CAPACITY,
+    HIR_BUILTIN_EQUAL,
+    HIR_BUILTIN_HASH,
 } HirBuiltinKind;
 
 typedef struct HirExprList {

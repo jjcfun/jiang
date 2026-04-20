@@ -21,6 +21,56 @@ typedef struct LowerContext {
     int temp_index;
 } LowerContext;
 
+typedef enum HirNominalKind {
+    HIR_NOMINAL_NONE = 0,
+    HIR_NOMINAL_BUILTIN,
+    HIR_NOMINAL_ENUM,
+    HIR_NOMINAL_STRUCT,
+    HIR_NOMINAL_UNION,
+} HirNominalKind;
+
+typedef enum HirBuiltinNominalKind {
+    HIR_BUILTIN_NOMINAL_NONE = 0,
+    HIR_BUILTIN_NOMINAL_INT,
+    HIR_BUILTIN_NOMINAL_UINT8,
+    HIR_BUILTIN_NOMINAL_BOOL,
+    HIR_BUILTIN_NOMINAL_VOID,
+} HirBuiltinNominalKind;
+
+typedef struct HirBuiltinNominalDecl {
+    HirBuiltinNominalKind kind;
+    const char* name;
+} HirBuiltinNominalDecl;
+
+typedef struct HirNominalDeclRef {
+    HirNominalKind kind;
+    const char* name;
+    void* decl;
+} HirNominalDeclRef;
+
+typedef enum HirTypeQueryKind {
+    HIR_TYPE_QUERY_NONE = 0,
+    HIR_TYPE_QUERY_NOMINAL,
+    HIR_TYPE_QUERY_TUPLE,
+    HIR_TYPE_QUERY_SLICE,
+    HIR_TYPE_QUERY_POINTER,
+    HIR_TYPE_QUERY_ARRAY,
+    HIR_TYPE_QUERY_OPTIONAL,
+} HirTypeQueryKind;
+
+typedef struct HirTypeQueryRef {
+    HirTypeQueryKind kind;
+    HirType* source;
+    HirNominalDeclRef nominal;
+    HirType* item_type;
+    int array_length;
+} HirTypeQueryRef;
+
+static const HirBuiltinNominalDecl HIR_BUILTIN_INT_DECL = { HIR_BUILTIN_NOMINAL_INT, "Int" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_UINT8_DECL = { HIR_BUILTIN_NOMINAL_UINT8, "UInt8" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_BOOL_DECL = { HIR_BUILTIN_NOMINAL_BOOL, "Bool" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL_VOID, "Void" };
+
 #define type_list_push(list, type) VEC_PUSH((list), (type))
 #define binding_list_push(list, binding) VEC_PUSH((list), (binding))
 #define stmt_list_push(list, stmt) VEC_PUSH((list), (stmt))
@@ -39,6 +89,7 @@ static int fail(LowerContext* ctx, const char* error);
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
 static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type);
 static HirType* new_owned_type(HirProgram* program, HirTypeKind kind);
+static HirType* primitive_type(HirProgram* program, HirTypeKind kind);
 static int is_lvalue_expr(const HirExpr* expr);
 static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line);
 static HirExpr* make_optional_value_expr(LowerContext* ctx, HirExpr* value, int line);
@@ -822,23 +873,152 @@ static HirGlobal* find_global(HirProgram* program, const char* name) {
     return (HirGlobal*)hashmap_get(&program->global_map, name);
 }
 
-static HirFunction* find_method(HirProgram* program, HirType* receiver_type, const char* method_name, int static_flag) {
+static const HirBuiltinNominalDecl* find_builtin_nominal(const char* name) {
+    if (strcmp(name, "Int") == 0) return &HIR_BUILTIN_INT_DECL;
+    if (strcmp(name, "UInt8") == 0) return &HIR_BUILTIN_UINT8_DECL;
+    if (strcmp(name, "Bool") == 0) return &HIR_BUILTIN_BOOL_DECL;
+    if (strcmp(name, "Void") == 0) return &HIR_BUILTIN_VOID_DECL;
+    return 0;
+}
+
+static HirNominalDeclRef find_nominal_decl(HirProgram* program, const char* name) {
+    const HirBuiltinNominalDecl* builtin_decl = find_builtin_nominal(name);
+    HirEnumDecl* enum_decl = find_enum(program, name);
+    HirStructDecl* struct_decl = 0;
+    HirUnionDecl* union_decl = 0;
+    HirNominalDeclRef out;
+    memset(&out, 0, sizeof(out));
+    if (builtin_decl) {
+        out.kind = HIR_NOMINAL_BUILTIN;
+        out.name = builtin_decl->name;
+        out.decl = (void*)builtin_decl;
+        return out;
+    }
+    if (enum_decl) {
+        out.kind = HIR_NOMINAL_ENUM;
+        out.name = enum_decl->name;
+        out.decl = enum_decl;
+        return out;
+    }
+    struct_decl = find_struct(program, name);
+    if (struct_decl) {
+        out.kind = HIR_NOMINAL_STRUCT;
+        out.name = struct_decl->name;
+        out.decl = struct_decl;
+        return out;
+    }
+    union_decl = find_union(program, name);
+    if (union_decl) {
+        out.kind = HIR_NOMINAL_UNION;
+        out.name = union_decl->name;
+        out.decl = union_decl;
+        return out;
+    }
+    return out;
+}
+
+static HirTypeQueryRef describe_hir_type(HirType* type) {
+    HirTypeQueryRef out;
+    memset(&out, 0, sizeof(out));
+    if (!type) {
+        return out;
+    }
+    out.source = type;
+    out.array_length = type->array_length;
+    switch (type->kind) {
+        case HIR_TYPE_INT:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Int";
+            out.nominal.decl = (void*)&HIR_BUILTIN_INT_DECL;
+            return out;
+        case HIR_TYPE_UINT8:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "UInt8";
+            out.nominal.decl = (void*)&HIR_BUILTIN_UINT8_DECL;
+            return out;
+        case HIR_TYPE_BOOL:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Bool";
+            out.nominal.decl = (void*)&HIR_BUILTIN_BOOL_DECL;
+            return out;
+        case HIR_TYPE_VOID:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_BUILTIN;
+            out.nominal.name = "Void";
+            out.nominal.decl = (void*)&HIR_BUILTIN_VOID_DECL;
+            return out;
+        case HIR_TYPE_ENUM:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_ENUM;
+            out.nominal.name = type->enum_decl ? type->enum_decl->name : 0;
+            out.nominal.decl = type->enum_decl;
+            return out;
+        case HIR_TYPE_STRUCT:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_STRUCT;
+            out.nominal.name = type->struct_decl ? type->struct_decl->name : 0;
+            out.nominal.decl = type->struct_decl;
+            return out;
+        case HIR_TYPE_UNION:
+            out.kind = HIR_TYPE_QUERY_NOMINAL;
+            out.nominal.kind = HIR_NOMINAL_UNION;
+            out.nominal.name = type->union_decl ? type->union_decl->name : 0;
+            out.nominal.decl = type->union_decl;
+            return out;
+        case HIR_TYPE_TUPLE:
+            out.kind = HIR_TYPE_QUERY_TUPLE;
+            return out;
+        case HIR_TYPE_SLICE:
+            out.kind = HIR_TYPE_QUERY_SLICE;
+            out.item_type = type->array_item;
+            return out;
+        case HIR_TYPE_POINTER:
+            out.kind = HIR_TYPE_QUERY_POINTER;
+            out.item_type = type->array_item;
+            return out;
+        case HIR_TYPE_ARRAY:
+            out.kind = HIR_TYPE_QUERY_ARRAY;
+            out.item_type = type->array_item;
+            return out;
+        case HIR_TYPE_OPTIONAL:
+            out.kind = HIR_TYPE_QUERY_OPTIONAL;
+            out.item_type = type->array_item;
+            return out;
+        default:
+            return out;
+    }
+}
+
+static int same_nominal_type(HirType* left, HirType* right) {
+    HirTypeQueryRef left_query = describe_hir_type(left);
+    HirTypeQueryRef right_query = describe_hir_type(right);
+    if (left_query.kind != HIR_TYPE_QUERY_NOMINAL || right_query.kind != HIR_TYPE_QUERY_NOMINAL) {
+        return 0;
+    }
+    if (left_query.nominal.kind != right_query.nominal.kind) {
+        return 0;
+    }
+    if (left_query.nominal.kind == HIR_NOMINAL_BUILTIN) {
+        return left_query.nominal.decl == right_query.nominal.decl;
+    }
+    return left_query.nominal.decl == right_query.nominal.decl;
+}
+
+static HirFunction* find_type_method(HirProgram* program, HirType* receiver_type, const char* method_name, int static_flag) {
+    HirTypeQueryRef query = describe_hir_type(receiver_type);
     int i = 0;
+    if (query.kind != HIR_TYPE_QUERY_NOMINAL) {
+        return 0;
+    }
     for (i = 0; i < program->functions.count; ++i) {
         HirFunction* fn = &program->functions.items[i];
         if (!fn->method_flag || fn->static_method_flag != static_flag || strcmp(fn->method_name, method_name) != 0) {
             continue;
         }
-        if (receiver_type->kind != fn->receiver_type->kind) {
-            continue;
-        }
-        if (receiver_type->kind == HIR_TYPE_STRUCT && receiver_type->struct_decl == fn->receiver_type->struct_decl) {
-            return fn;
-        }
-        if (receiver_type->kind == HIR_TYPE_ENUM && receiver_type->enum_decl == fn->receiver_type->enum_decl) {
-            return fn;
-        }
-        if (receiver_type->kind == HIR_TYPE_UNION && receiver_type->union_decl == fn->receiver_type->union_decl) {
+        if (same_nominal_type(receiver_type, fn->receiver_type)) {
             return fn;
         }
     }
@@ -1056,6 +1236,20 @@ static HirBuiltinKind builtin_kind(const char* name) {
     return HIR_BUILTIN_NONE;
 }
 
+static HirBuiltinKind builtin_method_kind(HirType* receiver_type, const char* method_name, int static_flag) {
+    HirTypeQueryRef query = describe_hir_type(receiver_type);
+    if (static_flag || query.kind != HIR_TYPE_QUERY_NOMINAL || query.nominal.kind != HIR_NOMINAL_BUILTIN) {
+        return HIR_BUILTIN_NONE;
+    }
+    if (strcmp(method_name, "equal") == 0) {
+        return HIR_BUILTIN_EQUAL;
+    }
+    if (strcmp(method_name, "hash") == 0) {
+        return HIR_BUILTIN_HASH;
+    }
+    return HIR_BUILTIN_NONE;
+}
+
 static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* out, HirBuiltinKind builtin) {
     HirExpr* arg = 0;
     out->as.call.builtin = builtin;
@@ -1102,6 +1296,43 @@ static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* o
     expr_list_push(&out->as.call.args, arg);
     out->type = primitive_type(ctx->program, HIR_TYPE_INT);
     return 1;
+}
+
+static int lower_builtin_method_call(LowerContext* ctx,
+                                     int line,
+                                     HirBuiltinKind builtin,
+                                     HirType* receiver_type,
+                                     HirExpr* receiver_arg,
+                                     const AstExprList* ast_args,
+                                     HirExpr* out) {
+    out->as.call.builtin = builtin;
+    out->as.call.callee = 0;
+    expr_list_push(&out->as.call.args, receiver_arg);
+    if (builtin == HIR_BUILTIN_EQUAL) {
+        HirExpr* arg = 0;
+        if (ast_args->count != 1) {
+            return fail(ctx, "equal expects exactly one argument");
+        }
+        arg = lower_expr_expected(ctx, ast_args->items[0], receiver_type);
+        if (!arg) {
+            return 0;
+        }
+        if (!type_assignment_compatible(arg->type, receiver_type)) {
+            return fail(ctx, "equal argument type mismatch");
+        }
+        expr_list_push(&out->as.call.args, arg);
+        out->type = primitive_type(ctx->program, HIR_TYPE_BOOL);
+        return 1;
+    }
+    if (builtin == HIR_BUILTIN_HASH) {
+        if (ast_args->count != 0) {
+            return fail(ctx, "hash expects no arguments");
+        }
+        out->type = primitive_type(ctx->program, HIR_TYPE_INT);
+        return 1;
+    }
+    (void)line;
+    return fail(ctx, "unsupported builtin method");
 }
 
 static int lower_call_args(LowerContext* ctx, const AstExprList* ast_args, HirExprList* out_args, HirFunction* callee) {
@@ -1233,24 +1464,30 @@ static HirUnionVariant* resolve_variant_expr(LowerContext* ctx, const AstExpr* e
 }
 
 static HirType* find_named_owner_type(HirProgram* program, const char* owner_type_name) {
-    HirEnumDecl* enum_decl = find_enum(program, owner_type_name);
-    HirStructDecl* struct_decl = find_struct(program, owner_type_name);
-    HirUnionDecl* union_decl = find_union(program, owner_type_name);
+    HirNominalDeclRef nominal = find_nominal_decl(program, owner_type_name);
     HirType* type = 0;
-    if (enum_decl) {
-        type = new_owned_type(program, HIR_TYPE_ENUM);
-        type->enum_decl = enum_decl;
-        return type;
-    }
-    if (struct_decl) {
-        type = new_owned_type(program, HIR_TYPE_STRUCT);
-        type->struct_decl = struct_decl;
-        return type;
-    }
-    if (union_decl) {
-        type = new_owned_type(program, HIR_TYPE_UNION);
-        type->union_decl = union_decl;
-        return type;
+    switch (nominal.kind) {
+        case HIR_NOMINAL_BUILTIN:
+            if (strcmp(nominal.name, "Int") == 0) return primitive_type(program, HIR_TYPE_INT);
+            if (strcmp(nominal.name, "UInt8") == 0) return primitive_type(program, HIR_TYPE_UINT8);
+            if (strcmp(nominal.name, "Bool") == 0) return primitive_type(program, HIR_TYPE_BOOL);
+            if (strcmp(nominal.name, "Void") == 0) return primitive_type(program, HIR_TYPE_VOID);
+            return 0;
+        case HIR_NOMINAL_ENUM:
+            type = new_owned_type(program, HIR_TYPE_ENUM);
+            type->enum_decl = (HirEnumDecl*)nominal.decl;
+            return type;
+        case HIR_NOMINAL_STRUCT:
+            type = new_owned_type(program, HIR_TYPE_STRUCT);
+            type->struct_decl = (HirStructDecl*)nominal.decl;
+            return type;
+        case HIR_NOMINAL_UNION:
+            type = new_owned_type(program, HIR_TYPE_UNION);
+            type->union_decl = (HirUnionDecl*)nominal.decl;
+            return type;
+        case HIR_NOMINAL_NONE:
+        default:
+            break;
     }
     return 0;
 }
@@ -1726,7 +1963,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_CALL: {
-            const char* dot = strchr(expr->as.call.callee, '.');
+            const char* dot = strrchr(expr->as.call.callee, '.');
             HirBuiltinKind builtin = builtin_kind(expr->as.call.callee);
             if (builtin != HIR_BUILTIN_NONE) {
                 out = new_expr(HIR_EXPR_CALL, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
@@ -1757,7 +1994,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                          owner_type->array_item->kind == HIR_TYPE_UNION)) {
                         owner_type = owner_type->array_item;
                     }
-                    method = find_method(ctx->program, owner_type, member_name, 0);
+                    method = find_type_method(ctx->program, owner_type, member_name, 0);
                     if (method) {
                         int i = 0;
                         if (expr->as.call.args.count + 1 != method->params.count) {
@@ -1795,7 +2032,22 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         free(owner_name);
                         return out;
                     }
-                    if (find_method(ctx->program, owner_type, member_name, 1)) {
+                    {
+                        HirBuiltinKind builtin_method = builtin_method_kind(owner_type, member_name, 0);
+                        if (builtin_method != HIR_BUILTIN_NONE) {
+                            out = new_expr(HIR_EXPR_CALL,
+                                           builtin_method == HIR_BUILTIN_EQUAL ? primitive_type(ctx->program, HIR_TYPE_BOOL)
+                                                                               : primitive_type(ctx->program, HIR_TYPE_INT),
+                                           expr->line);
+                            if (!lower_builtin_method_call(ctx, expr->line, builtin_method, owner_type, receiver_arg, &expr->as.call.args, out)) {
+                                free(owner_name);
+                                return 0;
+                            }
+                            free(owner_name);
+                            return out;
+                        }
+                    }
+                    if (find_type_method(ctx->program, owner_type, member_name, 1)) {
                         free(owner_name);
                         fail(ctx, "static method called through instance");
                         return 0;
@@ -1803,7 +2055,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 } else {
                     HirType* named_type = find_named_owner_type(ctx->program, owner_name);
                     if (named_type) {
-                        HirFunction* method = find_method(ctx->program, named_type, member_name, 1);
+                        HirFunction* method = find_type_method(ctx->program, named_type, member_name, 1);
                         if (method) {
                             free(owner_name);
                             out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
@@ -1813,7 +2065,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             }
                             return out;
                         }
-                        if (find_method(ctx->program, named_type, member_name, 0)) {
+                        if (find_type_method(ctx->program, named_type, member_name, 0)) {
                             free(owner_name);
                             fail(ctx, "instance method called through type");
                             return 0;
@@ -1869,6 +2121,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
             }
             if (!callee) {
+                fprintf(stderr, "debug unknown function: %s\n", expr->as.call.callee);
                 fail(ctx, "unknown function");
                 return 0;
             }

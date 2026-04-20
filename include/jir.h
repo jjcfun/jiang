@@ -81,6 +81,8 @@ typedef enum JirBuiltinKind {
     JIR_BUILTIN_PRINT,
     JIR_BUILTIN_PANIC,
     JIR_BUILTIN_SLICE_WITH_CAPACITY,
+    JIR_BUILTIN_EQUAL,
+    JIR_BUILTIN_HASH,
 } JirBuiltinKind;
 
 typedef enum JirExtractKind {

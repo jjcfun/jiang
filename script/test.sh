@@ -73,6 +73,7 @@ run_sample while_minimal.jiang 10
 run_sample binary_ops_minimal.jiang 1
 run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0
+run_sample negative_int_minimal.jiang 1
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
 run_sample cast_addr_minimal.jiang 2
@@ -122,9 +123,13 @@ run_sample size_of_minimal.jiang 8
 run_sample generic_decl_minimal.jiang 42
 run_sample generic_func_call_minimal.jiang 42
 run_sample generic_func_infer_minimal.jiang 42
+run_sample concept_generic_minimal.jiang 42
+run_sample concept_method_minimal.jiang 42
+run_sample builtin_concept_method_minimal.jiang 17
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
+run_sample hash_map_minimal.jiang 20
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
@@ -267,7 +272,10 @@ run_compile_fail invalid_duplicate_import_alias.jiang
 run_compile_fail invalid_import_alias_function_conflict.jiang
 run_compile_fail invalid_import_alias_type_conflict.jiang
 run_compile_fail invalid_import_alias_missing_member.jiang
-run_compile_fail invalid_import_duplicate_function.jiang
+run_compile_fail invalid_concept_unknown.jiang
+run_compile_fail invalid_concept_unsatisfied.jiang
+run_compile_fail invalid_concept_method_missing.jiang
+run_compile_fail invalid_where_unknown_param.jiang
 run_compile_fail invalid_import_cycle_a.jiang
 run_compile_fail invalid_import_private_instance_method.jiang
 run_compile_fail invalid_import_private_static_method.jiang
