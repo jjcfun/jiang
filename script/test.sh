@@ -122,6 +122,8 @@ run_sample public_import_function_minimal.jiang 42
 run_sample public_trait_method_minimal.jiang 42
 run_sample private_trait_public_type_minimal.jiang 7
 run_sample public_import_trait_method_minimal.jiang 42
+run_compile_fail invalid_public_trait_method_private_impl.jiang
+run_compile_fail invalid_extend_public_trait_method_private_impl.jiang
 run_sample mutable_qualifier_minimal.jiang 42
 run_sample mutable_array_qualifier_minimal.jiang 42
 run_sample break_continue_minimal.jiang 8

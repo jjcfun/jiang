@@ -1778,6 +1778,16 @@ static char* resolve_import_path(const char* from_path, const char* import_path)
         return dup_text(import_path);
     }
     if (import_path[0] != '.') {
+        if (strcmp(import_path, "std") == 0) {
+            char* std_root = 0;
+            const char* package_error = 0;
+            int ok = load_package_root_path("std", &std_root, &package_error);
+            free(dir);
+            if (!ok) {
+                return 0;
+            }
+            return std_root;
+        }
         char* package_dir = find_enclosing_package_dir(from_path);
         if (package_dir) {
             char* dep_dir = package_dependency_dir_path(package_dir, import_path);
@@ -2260,6 +2270,9 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
         const AstFunction* method = find_type_method_template(program, type, concept->methods.items[i].name);
         int j = 0;
         if (!method || method->static_method_flag) {
+            return 0;
+        }
+        if (concept->public_flag && !method->public_flag) {
             return 0;
         }
         {

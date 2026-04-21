@@ -2,7 +2,6 @@
 
 > Jiang语言的目标是成为编程语言的“银弹”。`All in one`是Jiang语言的核心思想。
 
-# 语法
 
 ### 命名规范
 
@@ -129,6 +128,29 @@ if a1 == Option.some(_ x) {
 	// 这里x为null
 }
 ```
+
+#### Optional Coalesce
+
+`??` 用于 optional 取值失败时提供默认值：
+
+```c
+Int value = maybe ?? 42;
+Int other = maybe ?? fallback();
+```
+
+`??` 也支持在局部变量初始化位置提前退出：
+
+```c
+Int value = maybe ?? return;
+Int value = maybe ?? break;
+Int value = maybe ?? continue;
+```
+
+其中：
+
+- 左侧必须是 optional
+- `return` / `break` / `continue` 只支持出现在局部变量初始化右侧
+- `return value` 这一轮暂不支持
 
 
 
@@ -753,26 +775,6 @@ struct List {
 
 `init` / `deinit` 仍然是 `struct` 独有的特殊生命周期入口，不能定义在 `union` / `enum` 中。
 
-也可以在类型定义之后用 `extend` 补方法，或补显式 trait 实现：
-
-```c
-trait HasValue {
-  Int value();
-}
-
-struct User {
-  Int id;
-}
-
-extend User: HasValue {
-  Int value() {
-    return self.id;
-  }
-}
-```
-
-当前 `extend` 只支持扩展当前文件里**已经声明过**的本地 `struct` / `enum` / `union`，并且 `extend` 块里只允许普通方法；不支持 `init` / `deinit`。
-
 ```c
 struct User {
   Int id;
@@ -1004,6 +1006,14 @@ if (x == MyUnion.a(_ value)) {
 }
 ```
 
+
+
+### 元编程（Meta）
+
+
+
+
+
 ### 泛型（Generic）
 
 Jiang 语言通常以 `<T>` 形式声明泛型参数。
@@ -1034,28 +1044,11 @@ trait Numbric;
 若一个 `public trait` 被 `public` 类型显式实现，那么模块外可以通过该 trait requirement 调用对应方法。  
 若 trait 本身不是 `public`，则类型本身仍然可以对外可见，但外部不能通过该 private trait requirement 调用这些方法。
 
-### Optional Coalesce
+当前还要求：
 
-`??` 用于 optional 取值失败时提供默认值：
-
-```c
-Int value = maybe ?? 42;
-Int other = maybe ?? fallback();
-```
-
-`??` 也支持在局部变量初始化位置提前退出：
-
-```c
-Int value = maybe ?? return;
-Int value = maybe ?? break;
-Int value = maybe ?? continue;
-```
-
-其中：
-
-- 左侧必须是 optional
-- `return` / `break` / `continue` 只支持出现在局部变量初始化右侧
-- `return value` 这一轮暂不支持
+- 只要 trait 本身是 `public`
+- 那么用于实现该 trait requirement 的方法就必须显式写 `public`
+- 这条规则同时适用于类型定义体内实现，以及 `extend Type: Trait { ... }` 中的实现
 
 用户也可以自定义 trait，并声明内部函数签名，用于约束满足该 trait 的类型必须提供对应实例方法：
 
@@ -1129,6 +1122,39 @@ Foo<Float> y = Foo<Float> { value: 3.14 };
 // 也可以写成
 _ z = Foo<Float> { value: 3.14 };
 ```
+
+### Extend
+
+可以在类型定义之后使用 `extend` 补普通方法，或补显式 trait 实现：
+
+```c
+trait HasValue {
+  Int value();
+}
+
+struct User {
+  Int id;
+}
+
+extend User {
+  Int id_value() {
+    return self.id;
+  }
+}
+
+extend User: HasValue {
+  Int value() {
+    return self.id;
+  }
+}
+```
+
+当前 `extend` 的限制：
+
+- 只支持扩展当前文件里**已经声明过**的本地 `struct` / `enum` / `union`
+- `extend` 块里只允许普通方法
+- 不支持 `init`
+- 不支持 `deinit`
 
 ### 模块（Module）
 
@@ -1285,6 +1311,8 @@ import util;
 
 - package import 不能加引号，必须写成 `import util;`
 - 带引号的 `import "..."` 继续保留给文件路径导入
+- 标准库 package `std` 由编译器内置提供，可直接写 `import std;`
+- `std` 的 package 入口统一是 `std/std.jiang`
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
@@ -1316,14 +1344,14 @@ alias x = a + b;
 
 ### FFI
 
-传给 C 风格 API 的字符串指针当前使用 `UInt8*` 表示。字符串字面量在 `UInt8*` 上下文中会自动生成以 `\0` 结尾的只读全局数据。若需要 owning 包装类型，可使用 `std/ffi.jiang` 中的 `ffi.CString`。
+传给 C 风格 API 的字符串指针当前使用 `UInt8*` 表示。字符串字面量在 `UInt8*` 上下文中会自动生成以 `\0` 结尾的只读全局数据。若需要 owning 包装类型，可通过 `import std;` 使用 `std.ffi.CString`。标准库 package 的统一入口是 `std/std.jiang`。
 
 `ffi.CString` 显式声明了 `FromStringLiteral`，因此可以直接写：
 
 ```c
-import ffi = "../../std/ffi.jiang";
+import std;
 
-ffi.CString text = "hello";
+std.ffi.CString text = "hello";
 puts(text.bytes[0]$.ref());
 ```
 
