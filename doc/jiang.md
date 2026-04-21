@@ -1215,6 +1215,77 @@ public alias min = math_utils.min;
 - `alias maximum = math_utils.max;` 会为符号创建一个当前模块内可见的别名
 - `public alias max = math_utils.max;` 会为符号创建一个公开别名，使其他模块可以通过当前模块访问该符号
 
+#### Package
+
+除了直接编译单个 `.jiang` 文件，编译器也支持把一个目录当作 package 入口：
+
+```bash
+jiangc --emit-llvm path/to/pkg
+```
+
+当输入路径是目录时，编译器会读取该目录下固定文件名的 `package.ini`。当前只识别 `[package]` 段里的：
+
+- `name`
+- `root`
+
+这两个字段都可选：
+
+- `name` 未写时，默认取当前目录名
+- `root` 未写时，默认取 `<name>.jiang`
+- 若显式写了，则覆盖默认值
+- `name` 无论显式还是默认值，都必须满足 Jiang 标识符规则：`[A-Za-z_][A-Za-z0-9_]*`
+
+例如：
+
+```text
+lexer/
+  package.ini
+  lexer.jiang
+```
+
+最小 `package.ini`：
+
+```ini
+[package]
+version = 0.1.0
+type = lib
+```
+
+此时默认：
+
+- `name = lexer`
+- `root = lexer.jiang`
+
+也可以显式覆盖：
+
+```ini
+[package]
+name = frontend
+root = src/main.jiang
+version = 0.1.0
+type = lib
+```
+
+当前第一版 package 机制还支持本地依赖：
+
+```ini
+[dependencies]
+util = ../util_pkg
+```
+
+在 package 内部，可以直接：
+
+```c
+import util;
+```
+
+这会导入依赖 package 的入口模块。当前本地依赖只支持这种“按依赖名导入 package root”的形式；还不支持 `dep/submodule` 这类更细路径。
+
+注意：
+
+- package import 不能加引号，必须写成 `import util;`
+- 带引号的 `import "..."` 继续保留给文件路径导入
+
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
 ```c

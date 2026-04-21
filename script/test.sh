@@ -104,6 +104,10 @@ run_sample as_addr_minimal.jiang 2
 run_sample free_minimal.jiang 0
 run_sample new_array_repeat_init_minimal.jiang 6
 run_sample multi_file_minimal.jiang 42
+run_sample package_default 42
+run_sample package_override 44
+run_compile_fail package_invalid_name
+run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
 run_sample multi_file_enum_minimal.jiang 1
 run_sample multi_file_enum_shorthand_minimal.jiang 1

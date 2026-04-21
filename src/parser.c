@@ -2,6 +2,7 @@
 #include "hashmap.h"
 #include "vec.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -204,6 +205,24 @@ static int is_type_like_ident(const Token* token) {
            token->length > 0 &&
            token->start[0] >= 'A' &&
            token->start[0] <= 'Z';
+}
+
+static int text_is_ident_name(const char* text) {
+    const unsigned char* p = (const unsigned char*)text;
+    if (!text || !*text) {
+        return 0;
+    }
+    if (!(isalpha(*p) || *p == '_')) {
+        return 0;
+    }
+    p += 1;
+    while (*p) {
+        if (!(isalnum(*p) || *p == '_')) {
+            return 0;
+        }
+        p += 1;
+    }
+    return 1;
 }
 
 static AstType parse_type(Parser* parser);
@@ -2439,6 +2458,7 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
 
 static int parse_import_decl(Parser* parser, AstProgram* out_program, int public_flag) {
     AstImportDecl import_decl;
+    char* import_text = 0;
     memset(&import_decl, 0, sizeof(import_decl));
     import_decl.public_flag = public_flag;
     import_decl.line = parser->current.line;
@@ -2448,11 +2468,23 @@ static int parse_import_decl(Parser* parser, AstProgram* out_program, int public
         advance(parser);
         advance(parser);
     }
-    if (parser->current.kind != TOKEN_STRING_LIT) {
-        return fail(parser, "expected import path string");
+    if (parser->current.kind == TOKEN_IDENT) {
+        import_decl.path = token_dup(&parser->current);
+        advance(parser);
+    } else if (parser->current.kind == TOKEN_STRING_LIT) {
+        import_text = string_token_dup(&parser->current);
+        if (!import_text) {
+            return fail(parser, "out of memory");
+        }
+        if (text_is_ident_name(import_text)) {
+            free(import_text);
+            return fail(parser, "package imports must not use quotes");
+        }
+        import_decl.path = import_text;
+        advance(parser);
+    } else {
+        return fail(parser, "expected import path string or package name");
     }
-    import_decl.path = string_token_dup(&parser->current);
-    advance(parser);
     if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after import")) {
         return 0;
     }

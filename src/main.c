@@ -4,6 +4,8 @@
 #include "vec.h"
 
 #include <llvm-c/Core.h>
+#include <ctype.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,8 +94,285 @@ static char* read_file(const char* path) {
     return buffer;
 }
 
+static int path_is_directory(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return 0;
+    }
+    return S_ISDIR(st.st_mode);
+}
+
+static int path_exists(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static char* basename_dup(const char* path) {
+    const char* end = path + strlen(path);
+    const char* base = path;
+    size_t len = 0;
+    char* out = 0;
+    while (end > path && end[-1] == '/') {
+        end -= 1;
+    }
+    while (base < end && base[0] != '\0') {
+        const char* probe = end;
+        while (probe > base) {
+            if (probe[-1] == '/') {
+                base = probe;
+                break;
+            }
+            probe -= 1;
+        }
+        break;
+    }
+    len = (size_t)(end - base);
+    out = (char*)malloc(len + 1);
+    if (!out) {
+        return 0;
+    }
+    memcpy(out, base, len);
+    out[len] = '\0';
+    return out;
+}
+
+static char* trim_ascii(char* text) {
+    char* end = 0;
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
+        text += 1;
+    }
+    end = text + strlen(text);
+    while (end > text && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
+        end -= 1;
+    }
+    *end = '\0';
+    return text;
+}
+
+static int is_ident_name_text(const char* text) {
+    const unsigned char* p = (const unsigned char*)text;
+    if (!text || !*text) {
+        return 0;
+    }
+    if (!(isalpha(*p) || *p == '_')) {
+        return 0;
+    }
+    p += 1;
+    while (*p) {
+        if (!(isalnum(*p) || *p == '_')) {
+            return 0;
+        }
+        p += 1;
+    }
+    return 1;
+}
+
+static char* dirname_dup(const char* path);
+
+static char* parent_dir_dup(const char* path) {
+    return dirname_dup(path);
+}
+
+static char* find_enclosing_package_dir(const char* from_path) {
+    char* dir = dirname_dup(from_path);
+    if (!dir) {
+        return 0;
+    }
+    for (;;) {
+        char* manifest = dup_join3(dir, "/", "package.ini");
+        if (!manifest) {
+            free(dir);
+            return 0;
+        }
+        if (path_exists(manifest)) {
+            free(manifest);
+            return dir;
+        }
+        free(manifest);
+        {
+            char* parent = parent_dir_dup(dir);
+            if (!parent || strcmp(parent, dir) == 0) {
+                free(parent);
+                free(dir);
+                return 0;
+            }
+            free(dir);
+            dir = parent;
+        }
+    }
+}
+
+static char* package_dependency_dir_path(const char* package_dir, const char* dep_name) {
+    char* manifest_path = 0;
+    char* manifest_text = 0;
+    int in_dependencies_section = 0;
+    char* result = 0;
+    manifest_path = dup_join3(package_dir, "/", "package.ini");
+    if (!manifest_path) {
+        return 0;
+    }
+    manifest_text = read_file(manifest_path);
+    free(manifest_path);
+    if (!manifest_text) {
+        return 0;
+    }
+    {
+        char* cursor = manifest_text;
+        while (*cursor != '\0') {
+            char* line = cursor;
+            char* eq = 0;
+            while (*cursor != '\0' && *cursor != '\n') {
+                cursor += 1;
+            }
+            if (*cursor == '\n') {
+                *cursor = '\0';
+                cursor += 1;
+            }
+            line = trim_ascii(line);
+            if (*line == '\0' || *line == ';' || *line == '#') {
+                continue;
+            }
+            if (*line == '[') {
+                size_t len = strlen(line);
+                in_dependencies_section = (len >= 2 && line[len - 1] == ']' && strcmp(line, "[dependencies]") == 0);
+                continue;
+            }
+            if (!in_dependencies_section) {
+                continue;
+            }
+            eq = strchr(line, '=');
+            if (!eq) {
+                continue;
+            }
+            *eq = '\0';
+            {
+                char* key = trim_ascii(line);
+                char* value = trim_ascii(eq + 1);
+                if (strcmp(key, dep_name) == 0 && *value != '\0') {
+                    result = dup_join3(package_dir, "/", value);
+                    break;
+                }
+            }
+        }
+    }
+    free(manifest_text);
+    return result;
+}
+
+static int load_package_root_path(const char* input_path, char** out_path, const char** error) {
+    char* package_dir = 0;
+    char* package_name = 0;
+    char* root_name = 0;
+    char* manifest_path = 0;
+    char* manifest_text = 0;
+    int in_package_section = 0;
+    if (!path_is_directory(input_path)) {
+        *out_path = dup_text(input_path);
+        return *out_path != 0;
+    }
+    package_dir = dup_text(input_path);
+    package_name = basename_dup(input_path);
+    if (!package_dir || !package_name) {
+        *error = "out of memory";
+        goto fail;
+    }
+    if (!is_ident_name_text(package_name)) {
+        *error = "package name must follow identifier rules";
+        goto fail;
+    }
+    root_name = dup_join3(package_name, "", ".jiang");
+    if (!root_name) {
+        *error = "out of memory";
+        goto fail;
+    }
+    manifest_path = dup_join3(input_path, "/", "package.ini");
+    if (!manifest_path) {
+        *error = "out of memory";
+        goto fail;
+    }
+    manifest_text = read_file(manifest_path);
+    if (manifest_text) {
+        char* cursor = manifest_text;
+        while (*cursor != '\0') {
+            char* line = cursor;
+            char* eq = 0;
+            while (*cursor != '\0' && *cursor != '\n') {
+                cursor += 1;
+            }
+            if (*cursor == '\n') {
+                *cursor = '\0';
+                cursor += 1;
+            }
+            line = trim_ascii(line);
+            if (*line == '\0' || *line == ';' || *line == '#') {
+                continue;
+            }
+            if (*line == '[') {
+                size_t len = strlen(line);
+                in_package_section = (len >= 2 && line[len - 1] == ']' && strncmp(line, "[package]", len) == 0);
+                continue;
+            }
+            if (!in_package_section) {
+                continue;
+            }
+            eq = strchr(line, '=');
+            if (!eq) {
+                continue;
+            }
+            *eq = '\0';
+            {
+                char* key = trim_ascii(line);
+                char* value = trim_ascii(eq + 1);
+                if (strcmp(key, "name") == 0 && *value != '\0') {
+                    if (!is_ident_name_text(value)) {
+                        *error = "package name must follow identifier rules";
+                        goto fail;
+                    }
+                    free(package_name);
+                    package_name = dup_text(value);
+                    if (!package_name) {
+                        *error = "out of memory";
+                        goto fail;
+                    }
+                    free(root_name);
+                    root_name = dup_join3(package_name, "", ".jiang");
+                    if (!root_name) {
+                        *error = "out of memory";
+                        goto fail;
+                    }
+                } else if (strcmp(key, "root") == 0 && *value != '\0') {
+                    free(root_name);
+                    root_name = dup_text(value);
+                    if (!root_name) {
+                        *error = "out of memory";
+                        goto fail;
+                    }
+                }
+            }
+        }
+    }
+    *out_path = dup_join3(package_dir, "/", root_name);
+    if (!*out_path) {
+        *error = "out of memory";
+        goto fail;
+    }
+    free(package_dir);
+    free(package_name);
+    free(root_name);
+    free(manifest_path);
+    free(manifest_text);
+    return 1;
+fail:
+    free(package_dir);
+    free(package_name);
+    free(root_name);
+    free(manifest_path);
+    free(manifest_text);
+    return 0;
+}
+
 static void usage(const char* argv0) {
-    fprintf(stderr, "usage: %s --emit-llvm <file>\n", argv0);
+    fprintf(stderr, "usage: %s --emit-llvm <file-or-package-dir>\n", argv0);
 }
 
 static const AstFunction* find_ast_public_function(const AstProgram* program, const char* name);
@@ -1498,6 +1777,25 @@ static char* resolve_import_path(const char* from_path, const char* import_path)
         free(dir);
         return dup_text(import_path);
     }
+    if (import_path[0] != '.') {
+        char* package_dir = find_enclosing_package_dir(from_path);
+        if (package_dir) {
+            char* dep_dir = package_dependency_dir_path(package_dir, import_path);
+            if (dep_dir) {
+                char* dep_root = 0;
+                const char* package_error = 0;
+                int ok = load_package_root_path(dep_dir, &dep_root, &package_error);
+                free(dep_dir);
+                free(package_dir);
+                free(dir);
+                if (!ok) {
+                    return 0;
+                }
+                return dep_root;
+            }
+            free(package_dir);
+        }
+    }
     full = dup_join3(dir, "/", import_path);
     free(dir);
     return full;
@@ -1615,7 +1913,9 @@ static int load_module_graph(const char* path,
     loaded_module_list_push(cache, module);
     source = read_file(path);
     if (!source) {
-        *error = "failed to read import";
+        static char read_error[512];
+        snprintf(read_error, sizeof(read_error), "failed to read import: %s", path);
+        *error = read_error;
         return 0;
     }
     parser_init(&parser, source);
@@ -3326,6 +3626,7 @@ int main(int argc, char** argv) {
     JirProgram jir;
     char* source = 0;
     char* ir = 0;
+    char* input_path = 0;
     const char* error = 0;
 
     if (argc != 3 || strcmp(argv[1], "--emit-llvm") != 0) {
@@ -3337,7 +3638,11 @@ int main(int argc, char** argv) {
         const char* stack[64] = {0};
         (void)parser;
         source = 0;
-        if (!load_effective_program(argv[2], stack, 0, &ast, &error)) {
+        if (!load_package_root_path(argv[2], &input_path, &error)) {
+            fprintf(stderr, "error: %s\n", error ? error : "failed to resolve package root");
+            return 1;
+        }
+        if (!load_effective_program(input_path, stack, 0, &ast, &error)) {
             fprintf(stderr, "error: %s\n", error ? error : "failed to load program");
             return 1;
         }
