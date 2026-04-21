@@ -205,6 +205,8 @@ run_sample multi_file_enum_field_shorthand_minimal.jiang 1
 run_sample namespaced_enum_field_shorthand_minimal.jiang 1
 run_sample struct_union_field_shorthand_minimal.jiang 42
 run_sample struct_instance_method_minimal.jiang 42
+run_sample extend_struct_minimal.jiang 42
+run_sample extend_trait_minimal.jiang 42
 run_sample struct_instance_method_with_args_minimal.jiang 42
 run_sample struct_instance_method_pointer_base_minimal.jiang 42
 run_sample struct_static_method_minimal.jiang 42
@@ -340,6 +342,8 @@ run_compile_fail invalid_import_alias_missing_member.jiang
 run_compile_fail invalid_concept_unknown.jiang
 run_compile_fail invalid_concept_unsatisfied.jiang
 run_compile_fail invalid_concept_method_missing.jiang
+run_compile_fail invalid_extend_unknown_type.jiang
+run_compile_fail invalid_extend_init.jiang
 run_compile_fail invalid_concept_not_declared.jiang
 run_compile_fail invalid_enum_concept_method_missing.jiang
 run_compile_fail invalid_union_concept_not_declared.jiang

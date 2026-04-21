@@ -2330,6 +2330,113 @@ static int parse_decl_concept_names(Parser* parser, AstNameList* out) {
     return 1;
 }
 
+static AstNameList* find_local_ast_nominal_concept_names(AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->structs.count; ++i) {
+        if (strcmp(program->structs.items[i].name, name) == 0) {
+            return &program->structs.items[i].concept_names;
+        }
+    }
+    for (i = 0; i < program->enums.count; ++i) {
+        if (strcmp(program->enums.items[i].name, name) == 0) {
+            return &program->enums.items[i].concept_names;
+        }
+    }
+    for (i = 0; i < program->unions.count; ++i) {
+        if (strcmp(program->unions.items[i].name, name) == 0) {
+            return &program->unions.items[i].concept_names;
+        }
+    }
+    return 0;
+}
+
+static int nominal_decl_concept_names_add_unique(AstNameList* names, const char* concept_name) {
+    int i = 0;
+    if (!names) {
+        return 0;
+    }
+    for (i = 0; i < names->count; ++i) {
+        if (strcmp(names->items[i], concept_name) == 0) {
+            return 1;
+        }
+    }
+    name_list_push(names, concept_name);
+    return 1;
+}
+
+static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public_flag) {
+    char* owner_name = 0;
+    AstNameList concept_names;
+    AstNameList* owner_concept_names = 0;
+    memset(&concept_names, 0, sizeof(concept_names));
+    if (public_flag) {
+        return fail(parser, "extend must not be public");
+    }
+    advance(parser);
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected type name after extend");
+    }
+    owner_name = parse_qualified_name(parser);
+    if (!owner_name) {
+        return 0;
+    }
+    owner_concept_names = find_local_ast_nominal_concept_names(out_program, owner_name);
+    if (!owner_concept_names) {
+        return fail(parser, "extend target must be a local type declared earlier");
+    }
+    if (!parse_decl_concept_names(parser, &concept_names)) {
+        return 0;
+    }
+    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after extend target")) {
+        return 0;
+    }
+    while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        AstWhereConstraintList where_constraints;
+        memset(&where_constraints, 0, sizeof(where_constraints));
+        while (parser->current.kind == TOKEN_AT) {
+            if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "where")) {
+                if (!parse_where_annotation(parser, &where_constraints)) {
+                    return 0;
+                }
+                continue;
+            }
+            return fail(parser, "only @where(...) annotations are supported here");
+        }
+        if (parser->current.kind == TOKEN_KW_PUBLIC &&
+            parser->next.kind == TOKEN_IDENT &&
+            (token_equals(&parser->next, "init") || token_equals(&parser->next, "deinit"))) {
+            return fail(parser, "extend does not support init or deinit");
+        }
+        if (parser->current.kind == TOKEN_KW_STATIC &&
+            parser->next.kind == TOKEN_IDENT &&
+            (token_equals(&parser->next, "init") || token_equals(&parser->next, "deinit"))) {
+            return fail(parser, "extend does not support init or deinit");
+        }
+        if (parser->current.kind == TOKEN_IDENT &&
+            (token_equals(&parser->current, "init") || token_equals(&parser->current, "deinit")) &&
+            parser->next.kind == TOKEN_LEFT_PAREN) {
+            return fail(parser, "extend does not support init or deinit");
+        }
+        if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
+            if (!parse_method_decl(parser, out_program, owner_name, &where_constraints)) {
+                return 0;
+            }
+            continue;
+        }
+        return fail(parser, "extend block only supports methods");
+    }
+    if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after extend block")) {
+        return 0;
+    }
+    {
+        int i = 0;
+        for (i = 0; i < concept_names.count; ++i) {
+            nominal_decl_concept_names_add_unique(owner_concept_names, concept_names.items[i]);
+        }
+    }
+    return 1;
+}
+
 static int parse_import_decl(Parser* parser, AstProgram* out_program, int public_flag) {
     AstImportDecl import_decl;
     memset(&import_decl, 0, sizeof(import_decl));
@@ -2783,6 +2890,18 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
                 return fail(parser, "@where(...) requires a generic function or struct");
             }
             if (!parse_concept_decl(parser, out_program, public_flag)) {
+                return 0;
+            }
+            continue;
+        }
+        if (parser->current.kind == TOKEN_KW_EXTEND) {
+            if (where_constraints.count != 0) {
+                return fail(parser, "@where(...) requires a generic function or struct");
+            }
+            if (generic_params.count != 0) {
+                return fail(parser, "generic extend is not supported");
+            }
+            if (!parse_extend_decl(parser, out_program, public_flag)) {
                 return 0;
             }
             continue;

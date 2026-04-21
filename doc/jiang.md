@@ -753,6 +753,26 @@ struct List {
 
 `init` / `deinit` 仍然是 `struct` 独有的特殊生命周期入口，不能定义在 `union` / `enum` 中。
 
+也可以在类型定义之后用 `extend` 补方法，或补显式 trait 实现：
+
+```c
+trait HasValue {
+  Int value();
+}
+
+struct User {
+  Int id;
+}
+
+extend User: HasValue {
+  Int value() {
+    return self.id;
+  }
+}
+```
+
+当前 `extend` 只支持扩展当前文件里**已经声明过**的本地 `struct` / `enum` / `union`，并且 `extend` 块里只允许普通方法；不支持 `init` / `deinit`。
+
 ```c
 struct User {
   Int id;
