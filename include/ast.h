@@ -522,6 +522,7 @@ typedef struct AstGlobal {
     char* name;
     AstExpr* init;
     int public_flag;
+    int extern_flag;
     int line;
 } AstGlobal;
 

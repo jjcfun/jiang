@@ -89,6 +89,7 @@ typedef enum HirExprKind {
     HIR_EXPR_FLOAT,
     HIR_EXPR_CHAR,
     HIR_EXPR_BOOL,
+    HIR_EXPR_CSTRING,
     HIR_EXPR_NULL,
     HIR_EXPR_OPTIONAL_SOME,
     HIR_EXPR_BINDING,
@@ -136,6 +137,7 @@ typedef enum HirBuiltinKind {
     HIR_BUILTIN_PRINT,
     HIR_BUILTIN_PANIC,
     HIR_BUILTIN_SLICE_WITH_CAPACITY,
+    HIR_BUILTIN_POINTER_OFFSET,
     HIR_BUILTIN_EQUAL,
     HIR_BUILTIN_HASH,
 } HirBuiltinKind;
@@ -166,6 +168,10 @@ struct HirExpr {
         double float_value;
         int64_t char_value;
         int bool_value;
+        struct {
+            char* text;
+            int length;
+        } cstring_lit;
         HirBinding* binding;
         struct {
             HirExpr* value;
@@ -400,6 +406,7 @@ typedef struct HirUnionList {
 typedef struct HirGlobal {
     HirBinding* binding;
     HirExpr* init;
+    int extern_flag;
     int line;
 } HirGlobal;
 

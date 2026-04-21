@@ -969,6 +969,35 @@ static HirExpr* maybe_decay_array_to_slice(LowerContext* ctx, HirExpr* expr, Hir
     return slice;
 }
 
+static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_type, int line) {
+    HirExpr* deref = 0;
+    if (!expr || !expr->type || expr->type->kind != HIR_TYPE_POINTER) {
+        return expr;
+    }
+    if (expected_type && expected_type->kind == HIR_TYPE_POINTER) {
+        return expr;
+    }
+    deref = new_expr(HIR_EXPR_DEREF, expr->type->array_item, line);
+    deref->as.unary.value = expr;
+    return deref;
+}
+
+static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* expr) {
+    HirBinding* binding = 0;
+    HirExpr* out = 0;
+    if (expr && expr->kind == AST_EXPR_NAME) {
+        binding = lookup_binding(ctx, expr->as.name);
+        if (!binding) {
+            fail(ctx, "unknown identifier");
+            return 0;
+        }
+        out = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
+        out->as.binding = binding;
+        return out;
+    }
+    return lower_expr(ctx, expr);
+}
+
 static int is_binding_freed(LowerContext* ctx, HirBinding* binding) {
     int i = 0;
     for (i = 0; i < ctx->freed_bindings.count; ++i) {
@@ -2055,7 +2084,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     fail(ctx, "as accepts only a type argument");
                     return 0;
                 }
-                value = lower_expr(ctx, expr->as.implicit.value_target);
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
                 if (!value) {
                     return 0;
                 }
@@ -2078,7 +2107,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     fail(ctx, "implicit operation '.ref()' takes no arguments");
                     return 0;
                 }
-                value = lower_expr(ctx, expr->as.implicit.value_target);
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
                 if (!value) {
                     return 0;
                 }
@@ -2100,7 +2129,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     fail(ctx, "implicit operation '.addr()' takes no arguments");
                     return 0;
                 }
-                value = lower_expr(ctx, expr->as.implicit.value_target);
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
                 if (!value) {
                     return 0;
                 }
@@ -2122,7 +2151,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     fail(ctx, "implicit operation '.free()' takes no arguments");
                     return 0;
                 }
-                value = lower_expr(ctx, expr->as.implicit.value_target);
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
                 if (!value) {
                     return 0;
                 }
@@ -2135,6 +2164,40 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
                 out = new_expr(HIR_EXPR_FREE, primitive_type(ctx->program, HIR_TYPE_VOID), expr->line);
                 out->as.unary.value = value;
+                return out;
+            }
+            if (strcmp(expr->as.implicit.member, "offset") == 0) {
+                HirExpr* value = 0;
+                HirExpr* offset = 0;
+                if (expr->as.implicit.has_type_arg) {
+                    fail(ctx, "implicit operation '.offset()' does not take a type argument");
+                    return 0;
+                }
+                if (expr->as.implicit.args.count != 1) {
+                    fail(ctx, "implicit operation '.offset()' expects exactly one argument");
+                    return 0;
+                }
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if (value->type->kind != HIR_TYPE_POINTER) {
+                    fail(ctx, "offset requires pointer");
+                    return 0;
+                }
+                offset = lower_expr_expected(ctx, expr->as.implicit.args.items[0], primitive_type(ctx->program, HIR_TYPE_INT));
+                if (!offset) {
+                    return 0;
+                }
+                if (offset->type->kind != HIR_TYPE_INT) {
+                    fail(ctx, "offset requires Int argument");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_CALL, value->type, expr->line);
+                out->as.call.callee = 0;
+                out->as.call.builtin = HIR_BUILTIN_POINTER_OFFSET;
+                expr_list_push(&out->as.call.args, value);
+                expr_list_push(&out->as.call.args, offset);
                 return out;
             }
             fail(ctx, "unknown implicit value operation");
@@ -2153,6 +2216,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             HirType* array_type = 0;
             HirExpr* array_value = 0;
             int i = 0;
+            if (expected_type &&
+                expected_type->kind == HIR_TYPE_POINTER &&
+                expected_type->array_item &&
+                expected_type->array_item->kind == HIR_TYPE_UINT8) {
+                out = new_expr(HIR_EXPR_CSTRING, expected_type, expr->line);
+                out->as.cstring_lit.text = strdup(expr->as.string_lit.text);
+                out->as.cstring_lit.length = expr->as.string_lit.length;
+                return out;
+            }
             if (!expected_type ||
                 ((expected_type->kind != HIR_TYPE_ARRAY &&
                   expected_type->kind != HIR_TYPE_SLICE) ||
@@ -2185,7 +2257,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             out = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
             out->as.binding = binding;
-            return out;
+            return maybe_auto_deref_pointer_expr(out, expected_type, expr->line);
         }
         case AST_EXPR_OPTIONAL_FIELD:
             return lower_optional_chain_field(ctx, expr);
@@ -2379,7 +2451,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         out->as.call.callee = method;
                         expr_list_push(&out->as.call.args, receiver_arg);
                         for (i = 0; i < expr->as.call.args.count; ++i) {
-                            HirExpr* arg = lower_expr(ctx, expr->as.call.args.items[i]);
+                            HirExpr* arg = lower_expr_expected(ctx, expr->as.call.args.items[i], method->params.items[i + 1]->type);
+                            if (!arg) {
+                                free(owner_name);
+                                return 0;
+                            }
+                            arg = maybe_decay_array_to_slice(ctx, arg, method->params.items[i + 1]->type, expr->as.call.args.items[i]->line);
                             if (!arg) {
                                 free(owner_name);
                                 return 0;
@@ -3928,6 +4005,7 @@ static int register_globals(LowerContext* ctx) {
             type = lower_type(ctx, &ast_global->type);
         }
         hir_global.binding = new_binding(type, ast_global->type.mutable_flag, ast_global->name, HIR_BINDING_GLOBAL, ast_global->line);
+        hir_global.extern_flag = ast_global->extern_flag;
         hir_global.line = ast_global->line;
         global_list_push(&ctx->program->globals, hir_global);
         hashmap_set(&ctx->program->global_map, hir_global.binding->name, (void*)1);
@@ -4208,6 +4286,10 @@ static int lower_globals(LowerContext* ctx) {
     int i = 0;
     for (i = 0; i < ctx->ast->globals.count; ++i) {
         HirGlobal* hir_global = &ctx->program->globals.items[i];
+        if (ctx->ast->globals.items[i].extern_flag) {
+            hir_global->init = 0;
+            continue;
+        }
         hir_global->init = lower_expr_expected(ctx, ctx->ast->globals.items[i].init, hir_global->binding->type);
         if (!hir_global->init) {
             return 0;

@@ -88,6 +88,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_FLOAT: return JIR_EXPR_FLOAT;
         case HIR_EXPR_CHAR: return JIR_EXPR_CHAR;
         case HIR_EXPR_BOOL: return JIR_EXPR_BOOL;
+        case HIR_EXPR_CSTRING: return JIR_EXPR_CSTRING;
         case HIR_EXPR_NULL: return JIR_EXPR_NULL;
         case HIR_EXPR_OPTIONAL_SOME: return JIR_EXPR_OPTIONAL_SOME;
         case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
@@ -321,6 +322,15 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         return 0;
     }
     switch (expr->kind) {
+        case JIR_EXPR_INT:
+        case JIR_EXPR_FLOAT:
+        case JIR_EXPR_CHAR:
+        case JIR_EXPR_BOOL:
+        case JIR_EXPR_CSTRING:
+        case JIR_EXPR_NULL:
+        case JIR_EXPR_BINDING:
+        case JIR_EXPR_ENUM_MEMBER:
+            return expr;
         case JIR_EXPR_ADDR:
         case JIR_EXPR_DEREF:
         case JIR_EXPR_NEW:
@@ -501,6 +511,9 @@ static int desugar_program(JirProgram* program) {
     int i = 0;
     int j = 0;
     for (i = 0; i < program->globals.count; ++i) {
+        if (program->globals.items[i].extern_flag) {
+            continue;
+        }
         program->globals.items[i].init = desugar_expr(program->globals.items[i].init);
         if (!program->globals.items[i].init) {
             return 0;
@@ -598,6 +611,10 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             return out;
         case HIR_EXPR_BOOL:
             out->as.bool_value = expr->as.bool_value;
+            return out;
+        case HIR_EXPR_CSTRING:
+            out->as.cstring_lit.text = strdup(expr->as.cstring_lit.text);
+            out->as.cstring_lit.length = expr->as.cstring_lit.length;
             return out;
         case HIR_EXPR_NULL:
             return out;
@@ -1055,9 +1072,10 @@ int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error)
         JirGlobal global;
         memset(&global, 0, sizeof(global));
         global.binding = lower_binding(hir->globals.items[i].binding, error);
-        global.init = lower_expr(jir, hir->globals.items[i].init, error);
+        global.extern_flag = hir->globals.items[i].extern_flag;
+        global.init = hir->globals.items[i].init ? lower_expr(jir, hir->globals.items[i].init, error) : 0;
         global.line = hir->globals.items[i].line;
-        if (!global.binding || !global.init) {
+        if (!global.binding || (!global.extern_flag && !global.init)) {
             return 0;
         }
         jir_global_list_push(&jir->globals, global);

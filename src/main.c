@@ -564,6 +564,7 @@ static AstGlobal clone_global(const AstProgram* source, const char* prefix, int 
     out.name = remap_exported_name(source, prefix, hide_private, global->name);
     out.init = clone_expr(source, prefix, hide_private, global->init);
     out.public_flag = public_flag;
+    out.extern_flag = global->extern_flag;
     out.line = global->line;
     return out;
 }

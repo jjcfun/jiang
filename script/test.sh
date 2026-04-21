@@ -97,6 +97,8 @@ run_sample negative_int_minimal.jiang 1
 run_sample mod_minimal.jiang 2
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
+run_sample pointer_offset_uint8_minimal.jiang 101
+run_sample pointer_offset_int_minimal.jiang 42
 run_sample as_addr_minimal.jiang 2
 run_sample free_minimal.jiang 0
 run_sample new_array_repeat_init_minimal.jiang 6
@@ -158,6 +160,11 @@ run_sample builtin_concept_method_minimal.jiang 17
 run_sample enum_concept_decl_minimal.jiang 42
 run_compile_only extern_minimal.jiang
 run_compile_only extern_call_minimal.jiang
+run_compile_only extern_global_minimal.jiang
+run_compile_only extern_single_function_minimal.jiang
+run_compile_only extern_single_global_minimal.jiang
+run_compile_only extern_cstring_minimal.jiang
+run_compile_only cstring_local_minimal.jiang
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
@@ -336,6 +343,8 @@ run_compile_fail invalid_import_private_trait_method.jiang
 run_compile_fail invalid_extern_nested.jiang
 run_compile_fail invalid_extern_with_body.jiang
 run_compile_fail invalid_extern_non_function.jiang
+run_compile_fail invalid_extern_global_init.jiang
+run_compile_fail invalid_extern_single_with_body.jiang
 run_compile_fail invalid_public_alias_private_function.jiang
 run_compile_fail invalid_public_alias_private_type.jiang
 run_compile_fail invalid_transitive_import_type.jiang

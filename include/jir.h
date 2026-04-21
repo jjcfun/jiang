@@ -49,6 +49,7 @@ typedef enum JirExprKind {
     JIR_EXPR_FLOAT,
     JIR_EXPR_CHAR,
     JIR_EXPR_BOOL,
+    JIR_EXPR_CSTRING,
     JIR_EXPR_NULL,
     JIR_EXPR_OPTIONAL_SOME,
     JIR_EXPR_BINDING,
@@ -99,6 +100,7 @@ typedef enum JirBuiltinKind {
     JIR_BUILTIN_PRINT,
     JIR_BUILTIN_PANIC,
     JIR_BUILTIN_SLICE_WITH_CAPACITY,
+    JIR_BUILTIN_POINTER_OFFSET,
     JIR_BUILTIN_EQUAL,
     JIR_BUILTIN_HASH,
 } JirBuiltinKind;
@@ -182,6 +184,10 @@ struct JirExpr {
         double float_value;
         int64_t char_value;
         int bool_value;
+        struct {
+            char* text;
+            int length;
+        } cstring_lit;
         JirBinding* binding;
         struct {
             JirExpr* value;
@@ -267,6 +273,7 @@ struct JirExpr {
 typedef struct JirGlobal {
     JirBinding* binding;
     JirExpr* init;
+    int extern_flag;
     int line;
 } JirGlobal;
 

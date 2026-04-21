@@ -1584,7 +1584,8 @@ static int is_implicit_member_name(Token* token) {
            (token_equals(token, "as") ||
             token_equals(token, "ref") ||
             token_equals(token, "addr") ||
-            token_equals(token, "free"));
+            token_equals(token, "free") ||
+            token_equals(token, "offset"));
 }
 
 static AstExpr* parse_implicit_member(Parser* parser, int line, AstExpr* value_target) {
@@ -1648,10 +1649,8 @@ static AstExpr* parse_unary(Parser* parser) {
         return bin;
     }
     if (parser->current.kind == TOKEN_STAR) {
-        AstExpr* expr = new_expr(AST_EXPR_DEREF, parser->current.line);
-        advance(parser);
-        expr->as.unary.value = parse_unary(parser);
-        return expr->as.unary.value ? expr : 0;
+        fail(parser, "explicit dereference syntax is not supported");
+        return 0;
     }
     if (parser->current.kind == TOKEN_KW_NEW) {
         AstExpr* expr = new_expr(AST_EXPR_NEW, parser->current.line);
@@ -2337,31 +2336,37 @@ static int parse_import_decl(Parser* parser, AstProgram* out_program, int public
     return 1;
 }
 
-static int parse_extern_decl(Parser* parser, AstProgram* out_program) {
-    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after extern")) {
-        return 0;
+static int parse_extern_item(Parser* parser, AstProgram* out_program, int inherited_public_flag, int in_block) {
+    AstType type;
+    int public_flag = inherited_public_flag;
+    int line = parser->current.line;
+    char* name = 0;
+    if (parser->current.kind == TOKEN_KW_PUBLIC) {
+        public_flag = 1;
+        advance(parser);
     }
-    while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+    if (!is_type_start(parser)) {
+        return fail(parser, in_block
+            ? "extern block only supports function or global declarations"
+            : "extern only supports function or global declarations");
+    }
+    type = parse_type(parser);
+    if (type.kind == AST_TYPE_INFER) {
+        return fail(parser, "extern declaration type cannot be inferred");
+    }
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected extern declaration name");
+    }
+    name = token_dup(&parser->current);
+    advance(parser);
+    if (parser->current.kind == TOKEN_LEFT_PAREN) {
         AstFunction fn;
         memset(&fn, 0, sizeof(fn));
         fn.extern_flag = 1;
-        if (parser->current.kind == TOKEN_KW_PUBLIC) {
-            fn.public_flag = 1;
-            advance(parser);
-        }
-        if (!is_type_start(parser)) {
-            return fail(parser, "extern block only supports function declarations");
-        }
-        fn.return_type = parse_type(parser);
-        if (fn.return_type.kind == AST_TYPE_INFER) {
-            return fail(parser, "extern function return type cannot be inferred");
-        }
-        if (parser->current.kind != TOKEN_IDENT) {
-            return fail(parser, "expected extern function name");
-        }
-        fn.name = token_dup(&parser->current);
-        fn.line = parser->current.line;
-        advance(parser);
+        fn.public_flag = public_flag;
+        fn.return_type = type;
+        fn.name = name;
+        fn.line = line;
         if (!parse_params(parser, &fn.params)) {
             return 0;
         }
@@ -2369,8 +2374,38 @@ static int parse_extern_decl(Parser* parser, AstProgram* out_program) {
             return 0;
         }
         function_list_push(&out_program->functions, fn);
+        return 1;
     }
-    return expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after extern block");
+    if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after extern global declaration")) {
+        return 0;
+    }
+    {
+        AstGlobal global;
+        memset(&global, 0, sizeof(global));
+        global.type = type;
+        global.name = name;
+        global.public_flag = public_flag;
+        global.extern_flag = 1;
+        global.line = line;
+        global_list_push(&out_program->globals, global);
+    }
+    return 1;
+}
+
+static int parse_extern_decl(Parser* parser, AstProgram* out_program, int inherited_public_flag) {
+    if (parser->current.kind == TOKEN_LEFT_BRACE) {
+        if (inherited_public_flag) {
+            return fail(parser, "extern block must not be public");
+        }
+        advance(parser);
+        while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+            if (!parse_extern_item(parser, out_program, 0, 1)) {
+                return 0;
+            }
+        }
+        return expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after extern block");
+    }
+    return parse_extern_item(parser, out_program, inherited_public_flag, 0);
 }
 
 static int parse_alias_decl(Parser* parser, AstProgram* out_program, int public_flag) {
@@ -2703,14 +2738,11 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             continue;
         }
         if (parser->current.kind == TOKEN_KW_EXTERN) {
-            if (public_flag) {
-                return fail(parser, "extern block must not be public");
-            }
             if (where_constraints.count != 0) {
                 return fail(parser, "@where(...) requires a generic function or struct");
             }
             advance(parser);
-            if (!parse_extern_decl(parser, out_program)) {
+            if (!parse_extern_decl(parser, out_program, public_flag)) {
                 return 0;
             }
             continue;

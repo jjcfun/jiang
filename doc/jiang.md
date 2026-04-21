@@ -13,7 +13,7 @@
 - 变量名使用 `snake_case`
 - 结构体字段名使用 `snake_case`
 - 枚举成员使用 `snake_case`
-- 模块别名优先使用 `PascalCase`
+- 模块别名优先使用 `snake_case`
 
 示例：
 
@@ -153,6 +153,7 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 - `a$.as(Int)`：对值 `a` 做类型转换
 - `a$.ref()`：从值 `a` 获取一个临时指针
 - `a$.addr()`：获取值 `a` 的地址值
+- `ptr$.offset(1)`：对 `T*` 指针按元素偏移
 - `self.data$.free()`：对 `self.data` 这个完整表达式做隐式释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
 
@@ -329,6 +330,24 @@ print("c = %d", c); // 输出： c = 300
 // '$'符号用于进入b的隐式操作层，此时可以调用指针本身的一些方法
 b$.free();
 ```
+
+这里没有单独的显式解引用语法，`*ptr` 这种写法不成立。要使用指针元素，直接写 `ptr` 即可；要操作指针本身，则使用隐式层语法，例如 `ptr$.free()` 或 `ptr$.offset(1)`。
+
+```c
+Int! value = 41;
+Int!* p = value$.ref();
+
+// 读取指针元素
+Int x = p;
+
+// 修改指针元素
+p = p + 1;
+
+// 按元素偏移指针本身
+Int!* q = p$.offset(0);
+```
+
+`offset(n)` 是对 `T*` 指针本身做移动，按元素大小偏移，而不是按字节偏移。
 
 当前版本里，Jiang 只约定 `*` 指针可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 指针只是临时指针，不参与释放。
 
@@ -1201,10 +1220,20 @@ alias x = a + b;
 
 ### FFI
 
+传给 C 风格 API 的字符串指针当前使用 `UInt8*` 表示。字符串字面量在 `UInt8*` 上下文中会自动生成以 `\0` 结尾的只读全局数据。若需要 owning 包装类型，可使用 `std/ffi.jiang` 中的 `ffi.CString`。
+
 ```c
 extern {
-  public Int open(UInt8[] path, Int options);
+  public Int open(UInt8* path, Int options);
   public Int write(Int fd, UInt8[] buf, Int count);
+  public Int errno;
 }
 
+```
+
+也支持单条声明：
+
+```c
+extern public Int puts(UInt8* text);
+public extern Int errno;
 ```

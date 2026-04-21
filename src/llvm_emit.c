@@ -2,6 +2,7 @@
 
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -62,6 +63,21 @@ static LLVMValueRef get_or_add_format_string(LLVMModuleRef module, LLVMContextRe
         LLVMSetLinkage(global, LLVMPrivateLinkage);
         LLVMSetUnnamedAddress(global, LLVMGlobalUnnamedAddr);
     }
+    return global;
+}
+
+static LLVMValueRef add_cstring_literal(LLVMModuleRef module, LLVMContextRef context, const char* value, int length) {
+    static int next_id = 0;
+    char name[64];
+    LLVMValueRef global = 0;
+    LLVMValueRef init = 0;
+    snprintf(name, sizeof(name), "__cstr_%d", next_id++);
+    init = LLVMConstStringInContext(context, value, (unsigned)length, 0);
+    global = LLVMAddGlobal(module, LLVMTypeOf(init), name);
+    LLVMSetInitializer(global, init);
+    LLVMSetGlobalConstant(global, 1);
+    LLVMSetLinkage(global, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddress(global, LLVMGlobalUnnamedAddr);
     return global;
 }
 
@@ -590,6 +606,14 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         case JIR_EXPR_FLOAT:
         case JIR_EXPR_BOOL:
             return llvm_const_expr(cg->context, expr);
+        case JIR_EXPR_CSTRING: {
+            LLVMValueRef global = add_cstring_literal(
+                cg->module,
+                cg->context,
+                expr->as.cstring_lit.text,
+                expr->as.cstring_lit.length);
+            return gep_cstr(cg->builder, global);
+        }
         case JIR_EXPR_BINDING:
             if (expr->as.binding->kind == JIR_BINDING_GLOBAL) {
                 LLVMValueRef global = llvm_global_for(cg->module, expr->as.binding);
@@ -715,6 +739,12 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             }
             if (expr->as.call.builtin == JIR_BUILTIN_SLICE_WITH_CAPACITY) {
                 return emit_builtin_slice_with_capacity(cg, expr);
+            }
+            if (expr->as.call.builtin == JIR_BUILTIN_POINTER_OFFSET) {
+                LLVMValueRef base = emit_expr(cg, expr->as.call.args.items[0]);
+                LLVMValueRef index = emit_expr(cg, expr->as.call.args.items[1]);
+                LLVMTypeRef pointee = llvm_type(cg->context, expr->type->array_item);
+                return LLVMBuildInBoundsGEP2(cg->builder, pointee, base, &index, 1, "offsetptr");
             }
             if (expr->as.call.builtin == JIR_BUILTIN_EQUAL) {
                 LLVMValueRef left = emit_expr(cg, expr->as.call.args.items[0]);
@@ -1039,7 +1069,9 @@ static int emit_globals(const JirProgram* program, LLVMModuleRef module, LLVMCon
     for (i = 0; i < program->globals.count; ++i) {
         const JirGlobal* global = &program->globals.items[i];
         LLVMValueRef llvm_global = LLVMAddGlobal(module, llvm_type(context, global->binding->type), global->binding->name);
-        LLVMSetInitializer(llvm_global, llvm_const_expr(context, global->init));
+        if (!global->extern_flag) {
+            LLVMSetInitializer(llvm_global, llvm_const_expr(context, global->init));
+        }
         LLVMSetLinkage(llvm_global, LLVMExternalLinkage);
     }
     return 1;
