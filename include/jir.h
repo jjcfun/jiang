@@ -36,6 +36,7 @@ typedef enum JirTypeKind {
     JIR_TYPE_VOID,
     JIR_TYPE_SLICE,
     JIR_TYPE_POINTER,
+    JIR_TYPE_MANY_POINTER,
     JIR_TYPE_ENUM,
     JIR_TYPE_STRUCT,
     JIR_TYPE_TUPLE,

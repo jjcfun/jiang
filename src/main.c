@@ -851,6 +851,7 @@ typedef enum AstTypeQueryKind {
     AST_TYPE_QUERY_TUPLE,
     AST_TYPE_QUERY_SLICE,
     AST_TYPE_QUERY_POINTER,
+    AST_TYPE_QUERY_MANY_POINTER,
     AST_TYPE_QUERY_ARRAY,
     AST_TYPE_QUERY_OPTIONAL,
     AST_TYPE_QUERY_INFER,
@@ -1109,6 +1110,10 @@ static AstTypeQueryRef describe_ast_type(const AstProgram* program, const AstTyp
             out.kind = AST_TYPE_QUERY_POINTER;
             out.item_type = type->array_item;
             return out;
+        case AST_TYPE_MANY_POINTER:
+            out.kind = AST_TYPE_QUERY_MANY_POINTER;
+            out.item_type = type->array_item;
+            return out;
         case AST_TYPE_ARRAY:
             out.kind = AST_TYPE_QUERY_ARRAY;
             out.item_type = type->array_item;
@@ -1287,7 +1292,7 @@ static int exported_concept_name_allowed(const AstProgram* source, int hide_priv
     if (!hide_private) {
         return 1;
     }
-    return concept && concept->public_flag;
+    return !concept || concept->public_flag;
 }
 
 static int method_is_exported_via_public_trait(const AstProgram* program, const AstFunction* fn) {
@@ -1656,7 +1661,7 @@ static int load_module_graph(const char* path,
         module_import_list_push(&module->imports, item);
         free(import_path);
     }
-    if (root_flag && !is_prelude_module_path(path)) {
+    if (!is_prelude_module_path(path)) {
         LoadedModule* prelude_module = 0;
         if (!load_module_graph("std/prelude.jiang", stack, depth + 1, cache, 0, &prelude_module, error)) {
             free(source);
@@ -1778,6 +1783,8 @@ typedef enum BuiltinConceptCapability {
     BUILTIN_CONCEPT_NUMBRIC = 1 << 0,
     BUILTIN_CONCEPT_EQUATABLE = 1 << 1,
     BUILTIN_CONCEPT_HASHABLE = 1 << 2,
+    BUILTIN_CONCEPT_MUTABLE = 1 << 3,
+    BUILTIN_CONCEPT_MAYBE_MUTABLE = 1 << 4,
 } BuiltinConceptCapability;
 
 static uint32_t ast_type_builtin_capabilities(const AstProgram* program, const AstType* type) {
@@ -1819,6 +1826,7 @@ static uint32_t ast_type_builtin_capabilities(const AstProgram* program, const A
             }
             return BUILTIN_CONCEPT_NONE;
         case AST_TYPE_QUERY_POINTER:
+        case AST_TYPE_QUERY_MANY_POINTER:
             return BUILTIN_CONCEPT_EQUATABLE;
         case AST_TYPE_QUERY_OPTIONAL:
             return query.item_type ? ast_type_builtin_capabilities(program, query.item_type) : BUILTIN_CONCEPT_NONE;
@@ -1836,15 +1844,20 @@ static uint32_t builtin_concept_flag_for_name(const char* concept_name) {
     if (strcmp(concept_name, "Numbric") == 0) return BUILTIN_CONCEPT_NUMBRIC;
     if (strcmp(concept_name, "Equatable") == 0) return BUILTIN_CONCEPT_EQUATABLE;
     if (strcmp(concept_name, "Hashable") == 0) return BUILTIN_CONCEPT_HASHABLE;
+    if (strcmp(concept_name, "Mutable") == 0) return BUILTIN_CONCEPT_MUTABLE;
+    if (strcmp(concept_name, "MaybeMutable") == 0) return BUILTIN_CONCEPT_MAYBE_MUTABLE;
     return BUILTIN_CONCEPT_NONE;
 }
 
 static int concept_exists(const AstProgram* program, const char* concept_name) {
-    return find_ast_concept(program, concept_name) != 0;
+    return builtin_concept_flag_for_name(concept_name) != BUILTIN_CONCEPT_NONE ||
+           find_ast_concept(program, concept_name) != 0;
 }
 
 static int ast_type_has_builtin_concept(const AstProgram* program, const AstType* type, const char* concept_name) {
     uint32_t required = builtin_concept_flag_for_name(concept_name);
+    if (required == BUILTIN_CONCEPT_MUTABLE) return type && type->mutable_flag;
+    if (required == BUILTIN_CONCEPT_MAYBE_MUTABLE) return 1;
     if (required == BUILTIN_CONCEPT_NONE) return 0;
     return (ast_type_builtin_capabilities(program, type) & required) != 0;
 }
@@ -1999,6 +2012,10 @@ static int type_has_builtin_concept_methods(const AstProgram* program, const Ast
         return type_has_concept_methods(program, type, &synthetic);
     }
 
+    if (strcmp(concept_name, "Mutable") == 0 || strcmp(concept_name, "MaybeMutable") == 0) {
+        return 1;
+    }
+
     return 1;
 }
 
@@ -2070,6 +2087,65 @@ static int type_param_exists(const AstNameList* params, const char* name) {
         }
     }
     return 0;
+}
+
+static int function_type_param_exists(const AstProgram* program, const AstFunction* fn, const char* name) {
+    if (type_param_exists(&fn->type_params, name)) {
+        return 1;
+    }
+    if (fn->method_flag && fn->owner_type_name) {
+        const AstStructDecl* owner = find_ast_struct(program, fn->owner_type_name);
+        if (owner && type_param_exists(&owner->type_params, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef enum GenericMutabilityPolicy {
+    GENERIC_MUTABILITY_IMMUTABLE = 0,
+    GENERIC_MUTABILITY_MUTABLE,
+    GENERIC_MUTABILITY_MAYBE_MUTABLE,
+} GenericMutabilityPolicy;
+
+static GenericMutabilityPolicy generic_mutability_policy(const AstWhereConstraintList* where_constraints, const char* param_name) {
+    int i = 0;
+    for (i = 0; i < where_constraints->count; ++i) {
+        if (strcmp(where_constraints->items[i].param_name, param_name) != 0) {
+            continue;
+        }
+        if (strcmp(where_constraints->items[i].concept_name, "Mutable") == 0) {
+            return GENERIC_MUTABILITY_MUTABLE;
+        }
+        if (strcmp(where_constraints->items[i].concept_name, "MaybeMutable") == 0) {
+            return GENERIC_MUTABILITY_MAYBE_MUTABLE;
+        }
+    }
+    return GENERIC_MUTABILITY_IMMUTABLE;
+}
+
+static int check_generic_mutability_constraints(const AstNameList* type_params,
+                                                const AstWhereConstraintList* where_constraints,
+                                                const TypeSubstList* subst,
+                                                const char** error) {
+    int i = 0;
+    for (i = 0; i < type_params->count; ++i) {
+        const AstType* actual = lookup_subst(subst, type_params->items[i]);
+        GenericMutabilityPolicy policy = generic_mutability_policy(where_constraints, type_params->items[i]);
+        if (!actual) {
+            *error = "missing generic substitution for @where";
+            return 0;
+        }
+        if (policy == GENERIC_MUTABILITY_MUTABLE && !actual->mutable_flag) {
+            *error = "generic type does not satisfy trait";
+            return 0;
+        }
+        if (policy == GENERIC_MUTABILITY_IMMUTABLE && actual->mutable_flag) {
+            *error = "generic type does not satisfy trait";
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int validate_where_constraints_program(const AstProgram* program, const char** error) {
@@ -2150,7 +2226,7 @@ static int validate_where_constraints_program(const AstProgram* program, const c
     for (i = 0; i < program->functions.count; ++i) {
         for (j = 0; j < program->functions.items[i].where_constraints.count; ++j) {
             AstWhereConstraint* item = &program->functions.items[i].where_constraints.items[j];
-            if (!type_param_exists(&program->functions.items[i].type_params, item->param_name)) {
+            if (!function_type_param_exists(program, &program->functions.items[i], item->param_name)) {
                 *error = "@where parameter is not a generic parameter";
                 return 0;
             }
@@ -2256,6 +2332,12 @@ static char* mangle_type_name(const AstType* type) {
         case AST_TYPE_POINTER: {
             char* item = mangle_type_name(type->array_item);
             out = dup_join3(item, "_ptr", "");
+            free(item);
+            return out;
+        }
+        case AST_TYPE_MANY_POINTER: {
+            char* item = mangle_type_name(type->array_item);
+            out = dup_join3(item, "_manyptr", "");
             free(item);
             return out;
         }
@@ -2387,10 +2469,6 @@ static const AstFunction* find_ast_function_exact(const AstProgram* program, con
     return find_ast_function(program, name);
 }
 
-static const AstStructDecl* find_ast_struct_exact(const AstProgram* program, const char* name) {
-    return find_ast_struct(program, name);
-}
-
 typedef struct LocalTypeEntry {
     const char* name;
     AstType type;
@@ -2468,7 +2546,7 @@ static AstType infer_expr_type(const AstProgram* program, const LocalTypeList* l
             const AstStructDecl* st = 0;
             int i = 0;
             if (base.kind == AST_TYPE_NAMED) {
-                st = find_ast_struct_exact(program, base.named_name);
+                st = find_ast_struct(program, base.named_name);
                 if (st) {
                     for (i = 0; i < st->fields.count; ++i) {
                         if (strcmp(st->fields.items[i].name, expr->as.field.name) == 0) {
@@ -2899,6 +2977,9 @@ static int instantiate_function_template(MonoContext* mono, const AstFunction* t
         mono->error = "generic function type argument mismatch";
         return 0;
     }
+    if (!check_generic_mutability_constraints(&templ->type_params, &templ->where_constraints, &subst, &mono->error)) {
+        return 0;
+    }
     if (!check_where_constraints(mono->source, &templ->where_constraints, &subst, &mono->error)) {
         return 0;
     }
@@ -2944,6 +3025,9 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
         mono->error = "generic struct type argument mismatch";
         return 0;
     }
+    if (!check_generic_mutability_constraints(&templ->type_params, &templ->where_constraints, &subst, &mono->error)) {
+        return 0;
+    }
     if (!check_where_constraints(mono->source, &templ->where_constraints, &subst, &mono->error)) {
         return 0;
     }
@@ -2986,6 +3070,10 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
         if (method->method_flag && method->owner_type_name && strcmp(method->owner_type_name, templ->name) == 0) {
             AstTypeList empty_args;
             AstFunction cloned = clone_function(mono->source, 0, 0, method, method->public_flag);
+            const char* method_error = 0;
+            if (!check_where_constraints(mono->source, &method->where_constraints, &subst, &method_error)) {
+                continue;
+            }
             free(cloned.owner_type_name);
             cloned.owner_type_name = dup_text(*instantiated_name);
             cloned.type_params.count = 0;

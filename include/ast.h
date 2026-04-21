@@ -99,6 +99,7 @@ typedef enum AstTypeKind {
     AST_TYPE_TUPLE,
     AST_TYPE_SLICE,
     AST_TYPE_POINTER,
+    AST_TYPE_MANY_POINTER,
     AST_TYPE_ARRAY,
     AST_TYPE_OPTIONAL,
 } AstTypeKind;

@@ -153,7 +153,6 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 - `a$.as(Int)`：对值 `a` 做类型转换
 - `a$.ref()`：从值 `a` 获取一个临时指针
 - `a$.addr()`：获取值 `a` 的地址值
-- `ptr$.offset(1)`：对 `T*` 指针按元素偏移
 - `self.data$.free()`：对 `self.data` 这个完整表达式做隐式释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
 
@@ -268,7 +267,8 @@ foo[0][1] // 2
 现阶段，Jiang 语言先不引入所有权和借用系统，也不区分多种 allocator。运行时只有默认堆分配器。
 在此基础上，指针语义先约定为：
 
-- `T*`：指向默认堆分配器分配出的 `T`
+- `T*`：自动解引用的单对象指针，适合 `new T` 这类场景
+- `T[*]`：可按下标访问和按元素偏移的 many-pointer
 - `T&`：临时指针，通常用于引用已有值，不承担释放职责
 
 后续如果语言正式引入所有权、借用或多 allocator，这里的规则再进一步细化。
@@ -331,7 +331,7 @@ print("c = %d", c); // 输出： c = 300
 b$.free();
 ```
 
-这里没有单独的显式解引用语法，`*ptr` 这种写法不成立。要使用指针元素，直接写 `ptr` 即可；要操作指针本身，则使用隐式层语法，例如 `ptr$.free()` 或 `ptr$.offset(1)`。
+这里没有单独的显式解引用语法，`*ptr` 这种写法不成立。`T*` 表示自动解引用的单对象指针：要使用指针元素，直接写 `ptr` 即可；要操作指针本身，则使用隐式层语法，例如 `ptr$.free()`。如果需要按下标访问，则使用 `T[*]` many-pointer。
 
 ```c
 Int! value = 41;
@@ -343,11 +343,14 @@ Int x = p;
 // 修改指针元素
 p = p + 1;
 
-// 按元素偏移指针本身
-Int!* q = p$.offset(0);
+Int[1] items = {41};
+Int[*] raw = items[0]$.ref()$.as(Int[*]);
+
+// many-pointer 通过下标访问
+Int y = raw[0];
 ```
 
-`offset(n)` 是对 `T*` 指针本身做移动，按元素大小偏移，而不是按字节偏移。
+`T[*]` many-pointer 支持下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
 
 当前版本里，Jiang 只约定 `*` 指针可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 指针只是临时指针，不参与释放。
 
@@ -1002,10 +1005,11 @@ trait Numbric;
 `std/prelude.jiang` 中默认提供了一些常用 trait，例如：
 
 - `Numbric`
+- `FromStringLiteral`
 - `Hashable`
 - `Equatable`
 
-其中 `Numbric`、`Hashable` 和 `Equatable` 因为来自隐式预导入的 `std/prelude.jiang`，所以可以直接用于 `@where(...)`。
+其中 `Numbric`、`FromStringLiteral`、`Hashable` 和 `Equatable` 因为来自隐式预导入的 `std/prelude.jiang`，所以可以直接用于 `@where(...)`。
 
 若一个 `public trait` 被 `public` 类型显式实现，那么模块外可以通过该 trait requirement 调用对应方法。  
 若 trait 本身不是 `public`，则类型本身仍然可以对外可见，但外部不能通过该 private trait requirement 调用这些方法。
@@ -1049,6 +1053,7 @@ trait Hashable {
 - trait 内部函数当前用于声明**约束签名**，不是运行时成员，也不是默认实现
 - 用户自定义类型若要满足某个 trait，当前需要在类型定义处显式声明
 - 仅仅“方法签名刚好匹配”并不会自动满足 trait
+- `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[] bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
 
 例如：
 
@@ -1221,6 +1226,15 @@ alias x = a + b;
 ### FFI
 
 传给 C 风格 API 的字符串指针当前使用 `UInt8*` 表示。字符串字面量在 `UInt8*` 上下文中会自动生成以 `\0` 结尾的只读全局数据。若需要 owning 包装类型，可使用 `std/ffi.jiang` 中的 `ffi.CString`。
+
+`ffi.CString` 显式声明了 `FromStringLiteral`，因此可以直接写：
+
+```c
+import ffi = "../../std/ffi.jiang";
+
+ffi.CString text = "hello";
+puts(text.bytes[0]$.ref());
+```
 
 ```c
 extern {

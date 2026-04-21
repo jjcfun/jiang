@@ -250,6 +250,7 @@ static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
         case JIR_TYPE_SLICE:
             return llvm_slice_type(context, type);
         case JIR_TYPE_POINTER:
+        case JIR_TYPE_MANY_POINTER:
             return LLVMPointerType(llvm_type(context, type->array_item), 0);
         case JIR_TYPE_ENUM:
             return LLVMInt64TypeInContext(context);
@@ -563,6 +564,16 @@ static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
                     1,
                     "slice.ptr");
             }
+            if (expr->as.index.base->type->kind == JIR_TYPE_MANY_POINTER) {
+                LLVMValueRef data_ptr = emit_expr(cg, expr->as.index.base);
+                return LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->as.index.base->type->array_item),
+                    data_ptr,
+                    (LLVMValueRef[]){ emit_expr(cg, expr->as.index.index) },
+                    1,
+                    "manyptr.ptr");
+            }
             return 0;
         case JIR_EXPR_DEREF:
             return emit_expr(cg, expr->as.unary.value);
@@ -631,6 +642,26 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             if (from_kind == to_kind) {
                 return value;
             }
+            if (from_kind == JIR_TYPE_ARRAY && to_kind == JIR_TYPE_MANY_POINTER) {
+                LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.unary.value);
+                if (!base_ptr) {
+                    return 0;
+                }
+                return LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->as.unary.value->type),
+                    base_ptr,
+                    (LLVMValueRef[]){
+                        LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0),
+                        LLVMConstInt(LLVMInt64TypeInContext(cg->context), 0, 0)
+                    },
+                    2,
+                    "array.manyptr");
+            }
+            if ((from_kind == JIR_TYPE_POINTER && to_kind == JIR_TYPE_MANY_POINTER) ||
+                (from_kind == JIR_TYPE_MANY_POINTER && to_kind == JIR_TYPE_POINTER)) {
+                return value;
+            }
             if (jir_type_is_integer_like(from_kind) && jir_type_is_integer_like(to_kind)) {
                 return LLVMBuildIntCast2(
                     cg->builder,
@@ -657,10 +688,10 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 }
                 return LLVMBuildFPToUI(cg->builder, value, llvm_type(cg->context, expr->type), "fptouitmp");
             }
-            if (from_kind == JIR_TYPE_POINTER && to_kind == JIR_TYPE_INT) {
+            if ((from_kind == JIR_TYPE_POINTER || from_kind == JIR_TYPE_MANY_POINTER) && to_kind == JIR_TYPE_INT) {
                 return LLVMBuildPtrToInt(cg->builder, value, llvm_type(cg->context, expr->type), "ptrtoint");
             }
-            if (from_kind == JIR_TYPE_INT && to_kind == JIR_TYPE_POINTER) {
+            if (from_kind == JIR_TYPE_INT && (to_kind == JIR_TYPE_POINTER || to_kind == JIR_TYPE_MANY_POINTER)) {
                 return LLVMBuildIntToPtr(cg->builder, value, llvm_type(cg->context, expr->type), "inttoptr");
             }
             return 0;
@@ -1001,6 +1032,9 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             }
             if (expr->as.index.base->type->kind == JIR_TYPE_SLICE) {
                 return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), emit_lvalue_ptr(cg, expr), "slice.idx");
+            }
+            if (expr->as.index.base->type->kind == JIR_TYPE_MANY_POINTER) {
+                return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), emit_lvalue_ptr(cg, expr), "manyptr.idx");
             }
             return 0;
     }

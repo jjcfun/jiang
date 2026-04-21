@@ -68,6 +68,7 @@ typedef enum HirTypeQueryKind {
     HIR_TYPE_QUERY_TUPLE,
     HIR_TYPE_QUERY_SLICE,
     HIR_TYPE_QUERY_POINTER,
+    HIR_TYPE_QUERY_MANY_POINTER,
     HIR_TYPE_QUERY_ARRAY,
     HIR_TYPE_QUERY_OPTIONAL,
 } HirTypeQueryKind;
@@ -341,7 +342,7 @@ static int type_equals(HirType* left, HirType* right) {
     if (left->kind == HIR_TYPE_SLICE) {
         return type_equals(left->array_item, right->array_item);
     }
-    if (left->kind == HIR_TYPE_POINTER) {
+    if (left->kind == HIR_TYPE_POINTER || left->kind == HIR_TYPE_MANY_POINTER) {
         return type_equals(left->array_item, right->array_item);
     }
     if (left->kind == HIR_TYPE_OPTIONAL) {
@@ -384,6 +385,7 @@ static int type_assignment_compatible_inner(HirType* actual, HirType* expected, 
                    type_assignment_compatible_inner(actual->array_item, expected->array_item, through_alias);
         case HIR_TYPE_SLICE:
         case HIR_TYPE_POINTER:
+        case HIR_TYPE_MANY_POINTER:
             return type_assignment_compatible_inner(actual->array_item, expected->array_item, 1);
         case HIR_TYPE_OPTIONAL:
             return type_assignment_compatible_inner(actual->array_item, expected->array_item, through_alias);
@@ -449,6 +451,7 @@ static int64_t type_size_bytes(HirType* type) {
         case HIR_TYPE_VOID:
             return 0;
         case HIR_TYPE_POINTER:
+        case HIR_TYPE_MANY_POINTER:
             return 8;
         case HIR_TYPE_SLICE:
             return 16;
@@ -506,6 +509,12 @@ static int is_float_like_type(HirType* type) {
             type->kind == HIR_TYPE_DOUBLE));
 }
 
+static int is_integer_literal_target_type(HirType* type) {
+    return type &&
+           ((is_integer_like_type(type) && type->kind != HIR_TYPE_BOOL) ||
+            type->kind == HIR_TYPE_CHARACTER);
+}
+
 static int is_numeric_promotion_type(HirType* type) {
     return type &&
            (type->kind == HIR_TYPE_INT ||
@@ -547,10 +556,20 @@ static int as_compatible(HirType* from, HirType* to) {
         (is_float_like_type(to) || is_integer_like_type(to) || to->kind == HIR_TYPE_CHARACTER)) {
         return 1;
     }
-    if (from->kind == HIR_TYPE_POINTER && to->kind == HIR_TYPE_INT) {
+    if ((from->kind == HIR_TYPE_POINTER || from->kind == HIR_TYPE_MANY_POINTER) && to->kind == HIR_TYPE_INT) {
         return 1;
     }
-    if (from->kind == HIR_TYPE_INT && to->kind == HIR_TYPE_POINTER) {
+    if (from->kind == HIR_TYPE_INT && (to->kind == HIR_TYPE_POINTER || to->kind == HIR_TYPE_MANY_POINTER)) {
+        return 1;
+    }
+    if (from->kind == HIR_TYPE_ARRAY &&
+        to->kind == HIR_TYPE_MANY_POINTER &&
+        type_equals(from->array_item, to->array_item)) {
+        return 1;
+    }
+    if (((from->kind == HIR_TYPE_POINTER && to->kind == HIR_TYPE_MANY_POINTER) ||
+         (from->kind == HIR_TYPE_MANY_POINTER && to->kind == HIR_TYPE_POINTER)) &&
+        type_equals(from->array_item, to->array_item)) {
         return 1;
     }
     return 0;
@@ -603,6 +622,12 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             return qualified_primitive_type(ctx->program, HIR_TYPE_VOID, type->mutable_flag);
         case AST_TYPE_POINTER: {
             HirType* pointer = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+            pointer->mutable_flag = type->mutable_flag;
+            pointer->array_item = lower_type(ctx, type->array_item);
+            return pointer;
+        }
+        case AST_TYPE_MANY_POINTER: {
+            HirType* pointer = new_owned_type(ctx->program, HIR_TYPE_MANY_POINTER);
             pointer->mutable_flag = type->mutable_flag;
             pointer->array_item = lower_type(ctx, type->array_item);
             return pointer;
@@ -880,14 +905,14 @@ static HirExpr* lower_optional_chain_index(LowerContext* ctx, const AstExpr* exp
             return 0;
         }
         access = new_expr(HIR_EXPR_INDEX, some_base->type->tuple_items.items[expr->as.index.index->as.int_value], expr->line);
-    } else if (some_base->type->kind == HIR_TYPE_ARRAY || some_base->type->kind == HIR_TYPE_SLICE) {
+    } else if (some_base->type->kind == HIR_TYPE_ARRAY || some_base->type->kind == HIR_TYPE_SLICE || some_base->type->kind == HIR_TYPE_MANY_POINTER) {
         if (index->type->kind != HIR_TYPE_INT) {
             fail(ctx, "array index must be Int");
             return 0;
         }
         access = new_expr(HIR_EXPR_INDEX, some_base->type->array_item, expr->line);
     } else {
-        fail(ctx, "indexing currently requires a tuple or array base");
+        fail(ctx, "indexing currently requires a tuple, array, slice, or many-pointer base");
         return 0;
     }
     access->as.index.base = some_base;
@@ -974,7 +999,8 @@ static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_t
     if (!expr || !expr->type || expr->type->kind != HIR_TYPE_POINTER) {
         return expr;
     }
-    if (expected_type && expected_type->kind == HIR_TYPE_POINTER) {
+    if (expected_type &&
+        (expected_type->kind == HIR_TYPE_POINTER || expected_type->kind == HIR_TYPE_MANY_POINTER)) {
         return expr;
     }
     deref = new_expr(HIR_EXPR_DEREF, expr->type->array_item, line);
@@ -983,6 +1009,10 @@ static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_t
 }
 
 static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* expr) {
+    HirExpr* base = 0;
+    HirType* base_type = 0;
+    HirStructField* field = 0;
+    int field_index = -1;
     HirBinding* binding = 0;
     HirExpr* out = 0;
     if (expr && expr->kind == AST_EXPR_NAME) {
@@ -993,6 +1023,29 @@ static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* ex
         }
         out = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
         out->as.binding = binding;
+        return out;
+    }
+    if (expr && expr->kind == AST_EXPR_FIELD) {
+        base = lower_expr_preserve_pointer(ctx, expr->as.field.base);
+        if (!base) {
+            return 0;
+        }
+        base_type = base->type;
+        if (base_type->kind == HIR_TYPE_POINTER && base_type->array_item && base_type->array_item->kind == HIR_TYPE_STRUCT) {
+            base_type = base_type->array_item;
+        }
+        if (base_type->kind != HIR_TYPE_STRUCT) {
+            return lower_expr(ctx, expr);
+        }
+        field = find_struct_field(base_type->struct_decl, expr->as.field.name, &field_index);
+        if (!field) {
+            fail(ctx, "unknown field");
+            return 0;
+        }
+        out = new_expr(HIR_EXPR_STRUCT_FIELD, field->type, expr->line);
+        out->as.struct_field.base = base;
+        out->as.struct_field.field = field;
+        out->as.struct_field.field_index = field_index;
         return out;
     }
     return lower_expr(ctx, expr);
@@ -1043,9 +1096,12 @@ static int is_mutable_assignment_target(const HirExpr* expr) {
             if (!expr->as.index.base || !expr->as.index.base->type) {
                 return 0;
             }
-            if ((expr->as.index.base->type->kind == HIR_TYPE_ARRAY || expr->as.index.base->type->kind == HIR_TYPE_SLICE) &&
+            if ((expr->as.index.base->type->kind == HIR_TYPE_ARRAY ||
+                 expr->as.index.base->type->kind == HIR_TYPE_SLICE ||
+                 expr->as.index.base->type->kind == HIR_TYPE_MANY_POINTER) &&
                 expr->as.index.base->type->array_item) {
-                return expr->as.index.base->type->array_item->mutable_flag;
+                return expr->as.index.base->type->mutable_flag ||
+                       expr->as.index.base->type->array_item->mutable_flag;
             }
             return 0;
         case HIR_EXPR_DEREF:
@@ -1280,6 +1336,10 @@ static HirTypeQueryRef describe_hir_type(HirType* type) {
             return out;
         case HIR_TYPE_POINTER:
             out.kind = HIR_TYPE_QUERY_POINTER;
+            out.item_type = type->array_item;
+            return out;
+        case HIR_TYPE_MANY_POINTER:
+            out.kind = HIR_TYPE_QUERY_MANY_POINTER;
             out.item_type = type->array_item;
             return out;
         case HIR_TYPE_ARRAY:
@@ -1691,7 +1751,8 @@ static int lower_call_args(LowerContext* ctx, const AstExprList* ast_args, HirEx
         if (!arg) {
             return 0;
         }
-        if (callee->params.items[i]->type->kind == HIR_TYPE_POINTER &&
+        if ((callee->params.items[i]->type->kind == HIR_TYPE_POINTER ||
+             callee->params.items[i]->type->kind == HIR_TYPE_MANY_POINTER) &&
             callee->params.items[i]->type->array_item &&
             callee->params.items[i]->type->array_item->mutable_flag &&
             arg->kind == HIR_EXPR_ADDR &&
@@ -1754,6 +1815,11 @@ static int lower_struct_init_named_args(LowerContext* ctx, HirStructDecl* struct
             free(seen);
             return 0;
         }
+        value = maybe_decay_array_to_slice(ctx, value, init_fn->params.items[param_index]->type, ast_field->line);
+        if (!value) {
+            free(seen);
+            return 0;
+        }
         seen[param_index] = 1;
         while (out_args->count < param_index) {
             expr_list_push(out_args, 0);
@@ -1772,6 +1838,40 @@ static int lower_struct_init_named_args(LowerContext* ctx, HirStructDecl* struct
     }
     free(seen);
     return 1;
+}
+
+static int ast_struct_declares_trait(const AstStructDecl* decl, const char* trait_name) {
+    int i = 0;
+    if (!decl) {
+        return 0;
+    }
+    for (i = 0; i < decl->concept_names.count; ++i) {
+        if (strcmp(decl->concept_names.items[i], trait_name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int hir_type_is_uint8_array_or_slice(const HirType* type) {
+    return type &&
+           (type->kind == HIR_TYPE_ARRAY || type->kind == HIR_TYPE_SLICE) &&
+           type->array_item &&
+           type->array_item->kind == HIR_TYPE_UINT8;
+}
+
+static HirExpr* lower_string_uint8_array_literal(LowerContext* ctx, const AstExpr* expr) {
+    HirType* array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
+    HirExpr* array_value = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
+    int i = 0;
+    array_type->array_item = primitive_type(ctx->program, HIR_TYPE_UINT8);
+    array_type->array_length = expr->as.string_lit.length;
+    for (i = 0; i < expr->as.string_lit.length; ++i) {
+        HirExpr* item = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_UINT8), expr->line);
+        item->as.int_value = (unsigned char)expr->as.string_lit.text[i];
+        expr_list_push(&array_value->as.array.items, item);
+    }
+    return array_value;
 }
 
 static HirUnionVariant* resolve_variant_expr(LowerContext* ctx, const AstExpr* expr, HirUnionDecl** out_union) {
@@ -2000,13 +2100,19 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
     int i = 0;
     switch (expr->kind) {
         case AST_EXPR_INT:
-            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, primitive_type(ctx->program, HIR_TYPE_INT))) {
+            if (expected_type &&
+                expected_type->kind == HIR_TYPE_OPTIONAL &&
+                is_integer_literal_target_type(expected_type->array_item)) {
                 out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
-                out->as.unary.value = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_INT, expected_type->array_item, expr->line);
                 out->as.unary.value->as.int_value = expr->as.int_value;
                 return out;
             }
-            out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+            out = new_expr(HIR_EXPR_INT,
+                           expected_type && is_integer_literal_target_type(expected_type)
+                               ? expected_type
+                               : primitive_type(ctx->program, HIR_TYPE_INT),
+                           expr->line);
             out->as.int_value = expr->as.int_value;
             return out;
         case AST_EXPR_FLOAT:
@@ -2049,7 +2155,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         case AST_EXPR_NULL:
             if (!expected_type ||
                 (expected_type->kind != HIR_TYPE_OPTIONAL &&
-                 expected_type->kind != HIR_TYPE_POINTER)) {
+                 expected_type->kind != HIR_TYPE_POINTER &&
+                 expected_type->kind != HIR_TYPE_MANY_POINTER)) {
                 fail(ctx, "null requires optional or pointer type");
                 return 0;
             }
@@ -2076,10 +2183,6 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (strcmp(expr->as.implicit.member, "as") == 0) {
                 HirExpr* value = 0;
                 HirType* target_type = 0;
-                if (!expr->as.implicit.has_type_arg) {
-                    fail(ctx, "as requires target type");
-                    return 0;
-                }
                 if (expr->as.implicit.args.count != 0) {
                     fail(ctx, "as accepts only a type argument");
                     return 0;
@@ -2088,9 +2191,21 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 if (!value) {
                     return 0;
                 }
-                target_type = lower_type(ctx, &expr->as.implicit.type_arg);
-                if (!target_type) {
-                    return 0;
+                if (expr->as.implicit.has_type_arg) {
+                    target_type = lower_type(ctx, &expr->as.implicit.type_arg);
+                    if (!target_type) {
+                        return 0;
+                    }
+                    if (target_type->mutable_flag) {
+                        fail(ctx, "as target type cannot include top-level '!'");
+                        return 0;
+                    }
+                } else {
+                    target_type = expected_type;
+                    if (!target_type) {
+                        fail(ctx, "as requires target type");
+                        return 0;
+                    }
                 }
                 if (!as_compatible(value->type, target_type)) {
                     fail(ctx, "invalid as conversion");
@@ -2166,40 +2281,6 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.unary.value = value;
                 return out;
             }
-            if (strcmp(expr->as.implicit.member, "offset") == 0) {
-                HirExpr* value = 0;
-                HirExpr* offset = 0;
-                if (expr->as.implicit.has_type_arg) {
-                    fail(ctx, "implicit operation '.offset()' does not take a type argument");
-                    return 0;
-                }
-                if (expr->as.implicit.args.count != 1) {
-                    fail(ctx, "implicit operation '.offset()' expects exactly one argument");
-                    return 0;
-                }
-                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
-                if (!value) {
-                    return 0;
-                }
-                if (value->type->kind != HIR_TYPE_POINTER) {
-                    fail(ctx, "offset requires pointer");
-                    return 0;
-                }
-                offset = lower_expr_expected(ctx, expr->as.implicit.args.items[0], primitive_type(ctx->program, HIR_TYPE_INT));
-                if (!offset) {
-                    return 0;
-                }
-                if (offset->type->kind != HIR_TYPE_INT) {
-                    fail(ctx, "offset requires Int argument");
-                    return 0;
-                }
-                out = new_expr(HIR_EXPR_CALL, value->type, expr->line);
-                out->as.call.callee = 0;
-                out->as.call.builtin = HIR_BUILTIN_POINTER_OFFSET;
-                expr_list_push(&out->as.call.args, value);
-                expr_list_push(&out->as.call.args, offset);
-                return out;
-            }
             fail(ctx, "unknown implicit value operation");
             return 0;
         }
@@ -2213,9 +2294,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_STRING: {
-            HirType* array_type = 0;
             HirExpr* array_value = 0;
-            int i = 0;
             if (expected_type &&
                 expected_type->kind == HIR_TYPE_POINTER &&
                 expected_type->array_item &&
@@ -2225,6 +2304,44 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.cstring_lit.length = expr->as.string_lit.length;
                 return out;
             }
+            if (expected_type &&
+                expected_type->kind == HIR_TYPE_STRUCT &&
+                expected_type->struct_decl) {
+                HirFunction* init_fn = 0;
+                HirType* param_type = 0;
+                HirExpr* arg = 0;
+                if (expected_type->struct_decl->from_string_literal &&
+                    expected_type->struct_decl->has_init) {
+                    init_fn = find_function(ctx->program, expected_type->struct_decl->init_name);
+                    if (!init_fn) {
+                        fail(ctx, "internal error: missing string literal init function");
+                        return 0;
+                    }
+                    if (init_fn->params.count != 1) {
+                        fail(ctx, "FromStringLiteral requires init(UInt8[] bytes)");
+                        return 0;
+                    }
+                    param_type = init_fn->params.items[0]->type;
+                    if (!hir_type_is_uint8_array_or_slice(param_type)) {
+                        fail(ctx, "FromStringLiteral requires init(UInt8[] bytes)");
+                        return 0;
+                    }
+                    arg = lower_string_uint8_array_literal(ctx, expr);
+                    arg = maybe_decay_array_to_slice(ctx, arg, param_type, expr->line);
+                    if (!arg) {
+                        return 0;
+                    }
+                    if (!type_equals(arg->type, param_type)) {
+                        fail(ctx, "string literal initializer type mismatch");
+                        return 0;
+                    }
+                    out = new_expr(HIR_EXPR_CALL, init_fn->return_type, expr->line);
+                    out->as.call.callee = init_fn;
+                    out->as.call.builtin = HIR_BUILTIN_NONE;
+                    expr_list_push(&out->as.call.args, arg);
+                    return out;
+                }
+            }
             if (!expected_type ||
                 ((expected_type->kind != HIR_TYPE_ARRAY &&
                   expected_type->kind != HIR_TYPE_SLICE) ||
@@ -2232,15 +2349,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 fail(ctx, "string literal requires UInt8 array or slice type");
                 return 0;
             }
-            array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
-            array_type->array_item = primitive_type(ctx->program, HIR_TYPE_UINT8);
-            array_type->array_length = expr->as.string_lit.length;
-            array_value = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
-            for (i = 0; i < expr->as.string_lit.length; ++i) {
-                HirExpr* item = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_UINT8), expr->line);
-                item->as.int_value = (unsigned char)expr->as.string_lit.text[i];
-                expr_list_push(&array_value->as.array.items, item);
-            }
+            array_value = lower_string_uint8_array_literal(ctx, expr);
             return array_value;
         }
         case AST_EXPR_NAME: {
@@ -2723,6 +2832,10 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.struct_field.base = base;
                 out->as.struct_field.field = field;
                 out->as.struct_field.field_index = field_index;
+                out = maybe_auto_deref_pointer_expr(out, expected_type, expr->line);
+                if (!out) {
+                    return 0;
+                }
                 return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
             }
             fail(ctx, "unknown field");
@@ -2919,7 +3032,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         fail(ctx, "comparison operand type unsupported");
                         return 0;
                     }
-                } else if (left->type->kind == HIR_TYPE_POINTER) {
+                } else if (left->type->kind == HIR_TYPE_POINTER || left->type->kind == HIR_TYPE_MANY_POINTER) {
                     if (expr->as.binary.op != AST_BIN_EQ && expr->as.binary.op != AST_BIN_NE) {
                         fail(ctx, "comparison operand type unsupported");
                         return 0;
@@ -3007,14 +3120,14 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     return 0;
                 }
                 out = new_expr(HIR_EXPR_INDEX, base->type->tuple_items.items[expr->as.index.index->as.int_value], expr->line);
-            } else if (base->type->kind == HIR_TYPE_ARRAY || base->type->kind == HIR_TYPE_SLICE) {
+            } else if (base->type->kind == HIR_TYPE_ARRAY || base->type->kind == HIR_TYPE_SLICE || base->type->kind == HIR_TYPE_MANY_POINTER) {
                 if (index->type->kind != HIR_TYPE_INT) {
                     fail(ctx, "array index must be Int");
                     return 0;
                 }
                 out = new_expr(HIR_EXPR_INDEX, base->type->array_item, expr->line);
             } else {
-                fail(ctx, "indexing currently requires a tuple or array base");
+                fail(ctx, "indexing currently requires a tuple, array, slice, or many-pointer base");
                 return 0;
             }
             out->as.index.base = base;
@@ -3210,7 +3323,11 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             return out;
         }
         case AST_STMT_ASSIGN: {
-            out->as.assign.target = lower_expr(ctx, stmt->as.assign.target);
+            if (stmt->as.assign.target->kind == AST_EXPR_FIELD) {
+                out->as.assign.target = lower_expr_preserve_pointer(ctx, stmt->as.assign.target);
+            } else {
+                out->as.assign.target = lower_expr(ctx, stmt->as.assign.target);
+            }
             if (!out->as.assign.target) {
                 return 0;
             }
@@ -3218,7 +3335,8 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 out->as.assign.binding = out->as.assign.target->as.binding;
             } else if (out->as.assign.target->kind == HIR_EXPR_INDEX) {
                 if (out->as.assign.target->as.index.base->type->kind != HIR_TYPE_ARRAY &&
-                    out->as.assign.target->as.index.base->type->kind != HIR_TYPE_SLICE) {
+                    out->as.assign.target->as.index.base->type->kind != HIR_TYPE_SLICE &&
+                    out->as.assign.target->as.index.base->type->kind != HIR_TYPE_MANY_POINTER) {
                     fail(ctx, "assignment target not found");
                     return 0;
                 }
@@ -4059,6 +4177,7 @@ static int register_structs(LowerContext* ctx) {
         }
         struct_decl.name = ast_struct->name;
         struct_decl.has_init = ast_struct->has_init;
+        struct_decl.from_string_literal = ast_struct_declares_trait(ast_struct, "FromStringLiteral");
         if (ast_struct->has_init) {
             struct_decl.init_name = make_struct_init_name(ast_struct->name);
         }

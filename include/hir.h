@@ -45,6 +45,7 @@ typedef enum HirTypeKind {
     HIR_TYPE_VOID,
     HIR_TYPE_SLICE,
     HIR_TYPE_POINTER,
+    HIR_TYPE_MANY_POINTER,
     HIR_TYPE_ENUM,
     HIR_TYPE_STRUCT,
     HIR_TYPE_TUPLE,
@@ -367,6 +368,7 @@ struct HirStructDecl {
     HirStructFieldList fields;
     int has_init;
     char* init_name;
+    int from_string_literal;
     int has_deinit;
     char* deinit_name;
 };

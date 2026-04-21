@@ -522,6 +522,16 @@ static AstType parse_type_postfix(Parser* parser, AstType type) {
         if (parser->current.kind == TOKEN_LEFT_BRACKET) {
             AstType element = type;
             advance(parser);
+            if (parser->current.kind == TOKEN_STAR) {
+                advance(parser);
+                if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after pointer marker")) {
+                    return type;
+                }
+                memset(&type, 0, sizeof(type));
+                type.kind = AST_TYPE_MANY_POINTER;
+                type.array_item = heap_type_copy(&element);
+                continue;
+            }
             if (parser->current.kind == TOKEN_RIGHT_BRACKET) {
                 memset(&type, 0, sizeof(type));
                 type.kind = AST_TYPE_SLICE;
@@ -1566,6 +1576,9 @@ static int parse_implicit_as_args(Parser* parser, AstExpr* expr) {
     if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after implicit operation")) {
         return 0;
     }
+    if (parser->current.kind == TOKEN_RIGHT_PAREN) {
+        return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after as target type");
+    }
     if (!is_type_start(parser)) {
         fail(parser, "expected as target type");
         return 0;
@@ -2253,7 +2266,7 @@ static int parse_params(Parser* parser, AstParamList* params) {
     return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after parameters");
 }
 
-static int parse_method_decl(Parser* parser, AstProgram* out_program, const char* owner_type_name) {
+static int parse_method_decl(Parser* parser, AstProgram* out_program, const char* owner_type_name, AstWhereConstraintList* where_constraints) {
     AstFunction fn;
     memset(&fn, 0, sizeof(fn));
     if (parser->current.kind == TOKEN_KW_PUBLIC) {
@@ -2277,6 +2290,10 @@ static int parse_method_decl(Parser* parser, AstProgram* out_program, const char
     fn.name = token_dup(&parser->current);
     fn.method_flag = 1;
     fn.owner_type_name = (char*)owner_type_name;
+    if (where_constraints) {
+        fn.where_constraints = *where_constraints;
+        memset(where_constraints, 0, sizeof(*where_constraints));
+    }
     fn.line = parser->current.line;
     advance(parser);
     if (!parse_params(parser, &fn.params)) {
@@ -2455,7 +2472,7 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
         if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
-            if (!parse_method_decl(parser, out_program, enum_decl.name)) {
+            if (!parse_method_decl(parser, out_program, enum_decl.name, 0)) {
                 return 0;
             }
             continue;
@@ -2526,6 +2543,17 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        AstWhereConstraintList where_constraints;
+        memset(&where_constraints, 0, sizeof(where_constraints));
+        while (parser->current.kind == TOKEN_AT) {
+            if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "where")) {
+                if (!parse_where_annotation(parser, &where_constraints)) {
+                    return 0;
+                }
+                continue;
+            }
+            return fail(parser, "only @where(...) annotations are supported here");
+        }
         if (parser->current.kind == TOKEN_KW_PUBLIC &&
             parser->next.kind == TOKEN_IDENT &&
             token_equals(&parser->next, "deinit")) {
@@ -2575,10 +2603,13 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             continue;
         }
         if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
-            if (!parse_method_decl(parser, out_program, struct_decl.name)) {
+            if (!parse_method_decl(parser, out_program, struct_decl.name, &where_constraints)) {
                 return 0;
             }
             continue;
+        }
+        if (where_constraints.count != 0) {
+            return fail(parser, "@where(...) requires a generic function or struct");
         }
         AstStructField field;
         memset(&field, 0, sizeof(field));
@@ -2641,7 +2672,7 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
         if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
-            if (!parse_method_decl(parser, out_program, union_decl.name)) {
+            if (!parse_method_decl(parser, out_program, union_decl.name, 0)) {
                 return 0;
             }
             continue;
