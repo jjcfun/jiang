@@ -1742,6 +1742,62 @@ static AstExpr* parse_coalesce(Parser* parser) {
     return expr;
 }
 
+static AstExpr* parse_var_decl_init_expr(Parser* parser) {
+    AstExpr* expr = parse_equality(parser);
+    if (!expr) {
+        return 0;
+    }
+    while (parser->current.kind == TOKEN_QUESTION_QUESTION) {
+        AstExpr* out = 0;
+        advance(parser);
+        if (parser->current.kind == TOKEN_KW_RETURN ||
+            parser->current.kind == TOKEN_KW_BREAK ||
+            parser->current.kind == TOKEN_KW_CONTINUE) {
+            out = new_expr(AST_EXPR_COALESCE_CONTROL, parser->current.line);
+            out->as.coalesce_control.left = expr;
+            switch (parser->current.kind) {
+                case TOKEN_KW_RETURN:
+                    out->as.coalesce_control.control = AST_COALESCE_RETURN;
+                    break;
+                case TOKEN_KW_BREAK:
+                    out->as.coalesce_control.control = AST_COALESCE_BREAK;
+                    break;
+                default:
+                    out->as.coalesce_control.control = AST_COALESCE_CONTINUE;
+                    break;
+            }
+            advance(parser);
+            expr = out;
+            continue;
+        }
+        out = new_expr(AST_EXPR_COALESCE, parser->current.line);
+        out->as.coalesce.left = expr;
+        out->as.coalesce.right = parse_equality(parser);
+        if (!out->as.coalesce.right) {
+            return 0;
+        }
+        expr = out;
+    }
+    if (parser->current.kind == TOKEN_QUESTION) {
+        AstExpr* ternary = new_expr(AST_EXPR_TERNARY, expr->line);
+        advance(parser);
+        ternary->as.ternary.cond = expr;
+        ternary->as.ternary.then_expr = parse_expr(parser);
+        if (!ternary->as.ternary.then_expr) {
+            return 0;
+        }
+        if (!expect(parser, TOKEN_COLON, "expected ':' in ternary expression")) {
+            return 0;
+        }
+        ternary->as.ternary.else_expr = parse_expr(parser);
+        if (!ternary->as.ternary.else_expr) {
+            return 0;
+        }
+        return ternary;
+    }
+    return expr;
+}
+
 static AstExpr* parse_expr(Parser* parser) {
     AstExpr* expr = parse_coalesce(parser);
     if (!expr) {
@@ -2105,7 +2161,7 @@ static AstStmt* parse_stmt(Parser* parser) {
         if (!expect(parser, TOKEN_ASSIGN, "expected '=' in variable declaration")) {
             return 0;
         }
-        stmt->as.var_decl.init = parse_expr(parser);
+        stmt->as.var_decl.init = parse_var_decl_init_expr(parser);
         if (!stmt->as.var_decl.init) {
             return 0;
         }
@@ -2279,6 +2335,42 @@ static int parse_import_decl(Parser* parser, AstProgram* out_program, int public
     }
     import_list_push(&out_program->imports, import_decl);
     return 1;
+}
+
+static int parse_extern_decl(Parser* parser, AstProgram* out_program) {
+    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after extern")) {
+        return 0;
+    }
+    while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        AstFunction fn;
+        memset(&fn, 0, sizeof(fn));
+        fn.extern_flag = 1;
+        if (parser->current.kind == TOKEN_KW_PUBLIC) {
+            fn.public_flag = 1;
+            advance(parser);
+        }
+        if (!is_type_start(parser)) {
+            return fail(parser, "extern block only supports function declarations");
+        }
+        fn.return_type = parse_type(parser);
+        if (fn.return_type.kind == AST_TYPE_INFER) {
+            return fail(parser, "extern function return type cannot be inferred");
+        }
+        if (parser->current.kind != TOKEN_IDENT) {
+            return fail(parser, "expected extern function name");
+        }
+        fn.name = token_dup(&parser->current);
+        fn.line = parser->current.line;
+        advance(parser);
+        if (!parse_params(parser, &fn.params)) {
+            return 0;
+        }
+        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after extern function declaration")) {
+            return 0;
+        }
+        function_list_push(&out_program->functions, fn);
+    }
+    return expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after extern block");
 }
 
 static int parse_alias_decl(Parser* parser, AstProgram* out_program, int public_flag) {
@@ -2606,6 +2698,19 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
                 return fail(parser, "@where(...) requires a generic function or struct");
             }
             if (!parse_alias_decl(parser, out_program, public_flag)) {
+                return 0;
+            }
+            continue;
+        }
+        if (parser->current.kind == TOKEN_KW_EXTERN) {
+            if (public_flag) {
+                return fail(parser, "extern block must not be public");
+            }
+            if (where_constraints.count != 0) {
+                return fail(parser, "@where(...) requires a generic function or struct");
+            }
+            advance(parser);
+            if (!parse_extern_decl(parser, out_program)) {
                 return 0;
             }
             continue;

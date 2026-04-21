@@ -307,6 +307,7 @@ struct HirFunction {
     HirBlock body;
     int struct_init_flag;
     int struct_deinit_flag;
+    int extern_flag;
     int public_flag;
     int method_flag;
     int static_method_flag;

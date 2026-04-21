@@ -20,6 +20,7 @@ typedef enum TokenKind {
     TOKEN_KW_IMPORT,
     TOKEN_KW_PUBLIC,
     TOKEN_KW_ALIAS,
+    TOKEN_KW_EXTERN,
     TOKEN_KW_RETURN,
     TOKEN_KW_IF,
     TOKEN_KW_ELSE,

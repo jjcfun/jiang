@@ -129,6 +129,7 @@ static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* n
 static int is_mutable_assignment_target(const HirExpr* expr);
 static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
+static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block);
 
 static int type_is_imported_nominal(HirType* type) {
     if (!type) {
@@ -2222,6 +2223,9 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.coalesce.right = right;
             return out;
         }
+        case AST_EXPR_COALESCE_CONTROL:
+            fail(ctx, "control-flow coalesce is only supported in local variable initialization");
+            return 0;
         case AST_EXPR_ADDR: {
             HirExpr* value = lower_expr(ctx, expr->as.unary.value);
             HirType* pointer_type = 0;
@@ -3302,6 +3306,90 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
     }
 }
 
+static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block) {
+    HirExpr* optional_value = 0;
+    HirType* binding_type = 0;
+    HirBinding* temp_binding = 0;
+    HirBinding* binding = 0;
+    HirStmt* temp_decl = 0;
+    HirStmt* if_stmt = 0;
+    HirStmt* exit_stmt = 0;
+    HirStmt* value_decl = 0;
+    HirExpr* temp_ref = 0;
+    HirExpr* cond = 0;
+    HirExpr* init = 0;
+    AstCoalesceControlKind control = stmt->as.var_decl.init->as.coalesce_control.control;
+
+    optional_value = lower_expr(ctx, stmt->as.var_decl.init->as.coalesce_control.left);
+    if (!optional_value) {
+        return 0;
+    }
+    if (optional_value->type->kind != HIR_TYPE_OPTIONAL) {
+        return fail(ctx, "optional coalesce requires optional left operand");
+    }
+    if (stmt->as.var_decl.type.kind == AST_TYPE_INFER) {
+        binding_type = optional_value->type->array_item;
+    } else {
+        binding_type = lower_type(ctx, &stmt->as.var_decl.type);
+        if (!type_assignment_compatible(optional_value->type->array_item, binding_type)) {
+            return fail(ctx, "variable initializer type mismatch");
+        }
+    }
+
+    if (control == AST_COALESCE_RETURN && ctx->current_function->return_type->kind != HIR_TYPE_VOID) {
+        return fail(ctx, "coalesce return requires () function");
+    }
+    if ((control == AST_COALESCE_BREAK || control == AST_COALESCE_CONTINUE) && ctx->loop_depth <= 0) {
+        return fail(ctx, control == AST_COALESCE_BREAK ? "break used outside loop" : "continue used outside loop");
+    }
+
+    temp_binding = new_binding(optional_value->type, 0, make_temp_name(ctx), HIR_BINDING_LOCAL, stmt->line);
+    binding_list_push(&ctx->current_function->locals, temp_binding);
+    temp_decl = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
+    temp_decl->as.var_decl.binding = temp_binding;
+    temp_decl->as.var_decl.init = optional_value;
+    stmt_list_push(&out_block->stmts, temp_decl);
+
+    temp_ref = new_expr(HIR_EXPR_BINDING, temp_binding->type, stmt->line);
+    temp_ref->as.binding = temp_binding;
+    cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), stmt->line);
+    cond->as.binary.op = HIR_BIN_EQ;
+    cond->as.binary.left = temp_ref;
+    cond->as.binary.right = make_null_expr(temp_binding->type, stmt->line);
+    if_stmt = new_stmt(HIR_STMT_IF, stmt->line);
+    if_stmt->as.if_stmt.cond = cond;
+    exit_stmt = new_stmt(control == AST_COALESCE_RETURN ? HIR_STMT_RETURN :
+                         (control == AST_COALESCE_BREAK ? HIR_STMT_BREAK : HIR_STMT_CONTINUE),
+                         stmt->line);
+    stmt_list_push(&if_stmt->as.if_stmt.then_block.stmts, exit_stmt);
+    stmt_list_push(&out_block->stmts, if_stmt);
+
+    binding = new_binding(binding_type, stmt->as.var_decl.type.mutable_flag, stmt->as.var_decl.name, HIR_BINDING_LOCAL, stmt->line);
+    if (!bind_in_current_scope(ctx, binding)) {
+        return 0;
+    }
+    binding_list_push(&ctx->current_function->locals, binding);
+    temp_ref = new_expr(HIR_EXPR_BINDING, temp_binding->type, stmt->line);
+    temp_ref->as.binding = temp_binding;
+    init = make_optional_value_expr(ctx, temp_ref, stmt->line);
+    if (!init) {
+        return 0;
+    }
+    init = maybe_decay_array_to_slice(ctx, init, binding_type, stmt->line);
+    if (!init) {
+        return 0;
+    }
+    if (!type_assignment_compatible(init->type, binding_type) &&
+        !apply_array_length_inference(binding_type, init->type)) {
+        return fail(ctx, "variable initializer type mismatch");
+    }
+    value_decl = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
+    value_decl->as.var_decl.binding = binding;
+    value_decl->as.var_decl.init = init;
+    stmt_list_push(&out_block->stmts, value_decl);
+    return 1;
+}
+
 static int lower_destructure_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block) {
     HirExpr* init = 0;
     int i = 0;
@@ -3791,6 +3879,14 @@ static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* o
     int i = 0;
     for (i = 0; i < ast_block->stmts.count; ++i) {
         HirStmt* stmt = 0;
+        if (ast_block->stmts.items[i]->kind == AST_STMT_VAR_DECL &&
+            ast_block->stmts.items[i]->as.var_decl.init &&
+            ast_block->stmts.items[i]->as.var_decl.init->kind == AST_EXPR_COALESCE_CONTROL) {
+            if (!lower_var_decl_coalesce_control(ctx, ast_block->stmts.items[i], out_block)) {
+                return 0;
+            }
+            continue;
+        }
         if (ast_block->stmts.items[i]->kind == AST_STMT_DESTRUCTURE) {
             if (!lower_destructure_stmt(ctx, ast_block->stmts.items[i], out_block)) {
                 return 0;
@@ -4065,6 +4161,7 @@ static int register_functions(LowerContext* ctx) {
         hir_fn.return_type = lower_type(ctx, &ast_fn->return_type);
         hir_fn.name = ast_fn->name;
         hir_fn.line = ast_fn->line;
+        hir_fn.extern_flag = ast_fn->extern_flag;
         hir_fn.public_flag = ast_fn->public_flag;
         hir_fn.method_flag = ast_fn->method_flag;
         hir_fn.static_method_flag = ast_fn->static_method_flag;
@@ -4229,6 +4326,11 @@ static int lower_functions(LowerContext* ctx) {
                 stmt_list_push(&ctx->current_function->body.stmts, ret);
             }
         } else {
+            if (ctx->ast->functions.items[user_index].extern_flag) {
+                user_index += 1;
+                pop_scope(ctx);
+                continue;
+            }
             int param_index = 0;
             for (param_index = 0; param_index < ctx->current_function->params.count; ++param_index) {
                 if (!bind_in_current_scope(ctx, ctx->current_function->params.items[param_index])) {

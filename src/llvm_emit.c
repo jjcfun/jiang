@@ -1059,6 +1059,9 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     int i = 0;
 
     memset(&cg, 0, sizeof(cg));
+    if (function->extern_flag) {
+        return 1;
+    }
     cg.program = program;
     cg.module = module;
     cg.context = context;

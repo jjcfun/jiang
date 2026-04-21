@@ -1034,6 +1034,7 @@ static int lower_function_info(const HirFunction* hir_fn, JirFunction* jir_fn, c
     }
     jir_fn->struct_init_flag = hir_fn->struct_init_flag;
     jir_fn->struct_deinit_flag = hir_fn->struct_deinit_flag;
+    jir_fn->extern_flag = hir_fn->extern_flag;
     jir_fn->method_flag = hir_fn->method_flag;
     jir_fn->static_method_flag = hir_fn->static_method_flag;
     jir_fn->owner_name = hir_fn->owner_struct ? hir_fn->owner_struct->name : 0;
@@ -1070,6 +1071,9 @@ int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error)
     }
     for (i = 0; i < hir->functions.count; ++i) {
         JirLoweredFunction lowered;
+        if (hir->functions.items[i].extern_flag) {
+            continue;
+        }
         if (!lower_function_skeleton(hir, jir, &hir->functions.items[i], &jir->functions.items[i], &lowered, error)) {
             return 0;
         }

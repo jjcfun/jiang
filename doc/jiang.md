@@ -988,6 +988,32 @@ trait Numbric;
 
 其中 `Numbric`、`Hashable` 和 `Equatable` 因为来自隐式预导入的 `std/prelude.jiang`，所以可以直接用于 `@where(...)`。
 
+若一个 `public trait` 被 `public` 类型显式实现，那么模块外可以通过该 trait requirement 调用对应方法。  
+若 trait 本身不是 `public`，则类型本身仍然可以对外可见，但外部不能通过该 private trait requirement 调用这些方法。
+
+### Optional Coalesce
+
+`??` 用于 optional 取值失败时提供默认值：
+
+```c
+Int value = maybe ?? 42;
+Int other = maybe ?? fallback();
+```
+
+`??` 也支持在局部变量初始化位置提前退出：
+
+```c
+Int value = maybe ?? return;
+Int value = maybe ?? break;
+Int value = maybe ?? continue;
+```
+
+其中：
+
+- 左侧必须是 optional
+- `return` / `break` / `continue` 只支持出现在局部变量初始化右侧
+- `return value` 这一轮暂不支持
+
 用户也可以自定义 trait，并声明内部函数签名，用于约束满足该 trait 的类型必须提供对应实例方法：
 
 ```c
@@ -1177,8 +1203,8 @@ alias x = a + b;
 
 ```c
 extern {
-  public Int open(CString path, Int options)
-  public Int write(Int fd, UInt8[] buf, Int count)
+  public Int open(UInt8[] path, Int options);
+  public Int write(Int fd, UInt8[] buf, Int count);
 }
 
 ```

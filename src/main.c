@@ -361,6 +361,10 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             out->as.coalesce.left = clone_expr(source, prefix, hide_private, expr->as.coalesce.left);
             out->as.coalesce.right = clone_expr(source, prefix, hide_private, expr->as.coalesce.right);
             break;
+        case AST_EXPR_COALESCE_CONTROL:
+            out->as.coalesce_control.left = clone_expr(source, prefix, hide_private, expr->as.coalesce_control.left);
+            out->as.coalesce_control.control = expr->as.coalesce_control.control;
+            break;
         case AST_EXPR_TERNARY:
             out->as.ternary.cond = clone_expr(source, prefix, hide_private, expr->as.ternary.cond);
             out->as.ternary.then_expr = clone_expr(source, prefix, hide_private, expr->as.ternary.then_expr);
@@ -528,6 +532,7 @@ static AstFunction clone_function(const AstProgram* source, const char* prefix, 
     }
     out.public_flag = public_flag;
     out.struct_init_flag = fn->struct_init_flag;
+    out.extern_flag = fn->extern_flag;
     out.method_flag = fn->method_flag;
     out.static_method_flag = fn->static_method_flag;
     out.line = fn->line;
@@ -2615,6 +2620,10 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.coalesce.left = clone_expr_subst(expr->as.coalesce.left, subst);
             out->as.coalesce.right = clone_expr_subst(expr->as.coalesce.right, subst);
             break;
+        case AST_EXPR_COALESCE_CONTROL:
+            out->as.coalesce_control.left = clone_expr_subst(expr->as.coalesce_control.left, subst);
+            out->as.coalesce_control.control = expr->as.coalesce_control.control;
+            break;
         case AST_EXPR_TERNARY:
             out->as.ternary.cond = clone_expr_subst(expr->as.ternary.cond, subst);
             out->as.ternary.then_expr = clone_expr_subst(expr->as.ternary.then_expr, subst);
@@ -3109,6 +3118,8 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
         case AST_EXPR_COALESCE:
             return transform_expr(mono, expr->as.coalesce.left, locals) &&
                    transform_expr(mono, expr->as.coalesce.right, locals);
+        case AST_EXPR_COALESCE_CONTROL:
+            return transform_expr(mono, expr->as.coalesce_control.left, locals);
         case AST_EXPR_TERNARY:
             return transform_expr(mono, expr->as.ternary.cond, locals) &&
                    transform_expr(mono, expr->as.ternary.then_expr, locals) &&

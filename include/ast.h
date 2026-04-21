@@ -18,6 +18,12 @@ typedef struct AstParam AstParam;
 typedef struct AstConceptMethod AstConceptMethod;
 typedef struct AstConceptMethodList AstConceptMethodList;
 
+typedef enum AstCoalesceControlKind {
+    AST_COALESCE_RETURN = 0,
+    AST_COALESCE_BREAK,
+    AST_COALESCE_CONTINUE,
+} AstCoalesceControlKind;
+
 typedef struct AstWhereConstraint {
     char* param_name;
     char* concept_name;
@@ -141,6 +147,7 @@ typedef enum AstExprKind {
     AST_EXPR_FREE,
     AST_EXPR_BINARY,
     AST_EXPR_COALESCE,
+    AST_EXPR_COALESCE_CONTROL,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
@@ -235,6 +242,10 @@ struct AstExpr {
             AstExpr* left;
             AstExpr* right;
         } coalesce;
+        struct {
+            AstExpr* left;
+            AstCoalesceControlKind control;
+        } coalesce_control;
         struct {
             AstExpr* cond;
             AstExpr* then_expr;
@@ -427,6 +438,7 @@ typedef struct AstFunction {
     AstBlock body;
     int public_flag;
     int struct_init_flag;
+    int extern_flag;
     int method_flag;
     int static_method_flag;
     char* owner_type_name;

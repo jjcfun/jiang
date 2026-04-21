@@ -64,6 +64,12 @@ run_compile_fail() {
   fi
 }
 
+run_compile_only() {
+  local sample="$1"
+  local ir="$BUILD_DIR/${sample%.jiang}.ll"
+  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
+}
+
 run_sample minimal.jiang 42
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
@@ -107,6 +113,8 @@ run_sample alias_import_function_minimal.jiang 42
 run_sample public_alias_function_minimal.jiang 42
 run_sample public_import_function_minimal.jiang 42
 run_sample public_trait_method_minimal.jiang 42
+run_sample private_trait_public_type_minimal.jiang 7
+run_sample public_import_trait_method_minimal.jiang 42
 run_sample mutable_qualifier_minimal.jiang 42
 run_sample mutable_array_qualifier_minimal.jiang 42
 run_sample break_continue_minimal.jiang 8
@@ -129,6 +137,11 @@ run_sample optional_null_compare_minimal.jiang 42
 run_sample optional_if_narrow_minimal.jiang 42
 run_sample optional_else_narrow_minimal.jiang 42
 run_sample optional_coalesce_minimal.jiang 42
+run_sample coalesce_value_minimal.jiang 42
+run_sample coalesce_fallback_call_minimal.jiang 42
+run_sample coalesce_return_minimal.jiang 42
+run_sample coalesce_break_minimal.jiang 3
+run_sample coalesce_continue_minimal.jiang 13
 run_sample optional_chain_member_minimal.jiang 42
 run_sample optional_chain_index_minimal.jiang 40
 run_sample optional_chain_nested_pure_base_minimal.jiang 42
@@ -143,6 +156,8 @@ run_sample concept_generic_minimal.jiang 42
 run_sample concept_method_minimal.jiang 42
 run_sample builtin_concept_method_minimal.jiang 17
 run_sample enum_concept_decl_minimal.jiang 42
+run_compile_only extern_minimal.jiang
+run_compile_only extern_call_minimal.jiang
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
@@ -267,6 +282,11 @@ run_compile_fail invalid_infer_optional_null.jiang
 run_compile_fail invalid_optional_null_non_optional.jiang
 run_compile_fail invalid_optional_coalesce_non_optional.jiang
 run_compile_fail invalid_optional_coalesce_impure_left.jiang
+run_compile_fail invalid_coalesce_break_outside_loop.jiang
+run_compile_fail invalid_coalesce_continue_outside_loop.jiang
+run_compile_fail invalid_coalesce_return_value.jiang
+run_compile_fail invalid_coalesce_non_optional_exit.jiang
+run_compile_fail invalid_coalesce_exit_in_call_arg.jiang
 run_compile_fail invalid_optional_no_narrow_then_null_branch.jiang
 run_compile_fail invalid_optional_chain_impure_base.jiang
 run_compile_fail invalid_optional_chain_impure_member_base.jiang
@@ -313,6 +333,9 @@ run_compile_fail invalid_import_cycle_a.jiang
 run_compile_fail invalid_import_private_instance_method.jiang
 run_compile_fail invalid_import_private_static_method.jiang
 run_compile_fail invalid_import_private_trait_method.jiang
+run_compile_fail invalid_extern_nested.jiang
+run_compile_fail invalid_extern_with_body.jiang
+run_compile_fail invalid_extern_non_function.jiang
 run_compile_fail invalid_public_alias_private_function.jiang
 run_compile_fail invalid_public_alias_private_type.jiang
 run_compile_fail invalid_transitive_import_type.jiang

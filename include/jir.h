@@ -284,6 +284,7 @@ struct JirFunction {
     JirBindingList locals;
     int struct_init_flag;
     int struct_deinit_flag;
+    int extern_flag;
     int method_flag;
     int static_method_flag;
     char* owner_name;
