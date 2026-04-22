@@ -380,6 +380,7 @@ static const AstGlobal* find_ast_public_global(const AstProgram* program, const 
 static const AstStructDecl* find_ast_public_struct(const AstProgram* program, const char* name);
 static const AstEnumDecl* find_ast_public_enum(const AstProgram* program, const char* name);
 static const AstUnionDecl* find_ast_public_union(const AstProgram* program, const char* name);
+static const AstConceptDecl* find_ast_concept(const AstProgram* program, const char* name);
 static const AstConceptDecl* find_ast_public_concept(const AstProgram* program, const char* name);
 static int exported_concept_name_allowed(const AstProgram* source, int hide_private, const char* concept_name);
 
@@ -971,6 +972,9 @@ static AstConceptDecl clone_concept_decl(const AstProgram* source, const char* p
     int i = 0;
     memset(&out, 0, sizeof(out));
     out.name = remap_imported_type_decl_name(source, prefix, hide_private, decl->name);
+    for (i = 0; i < decl->concept_names.count; ++i) {
+        name_list_push(&out.concept_names, remap_type_name(source, prefix, hide_private, decl->concept_names.items[i]));
+    }
     for (i = 0; i < decl->methods.count; ++i) {
         AstConceptMethod method;
         int j = 0;
@@ -1566,6 +1570,161 @@ static int concept_decl_has_method(const AstConceptDecl* concept, const char* me
     return 0;
 }
 
+static int ast_name_list_contains(const AstNameList* list, const char* name);
+
+static int concept_or_parent_has_method(const AstProgram* program,
+                                        const AstConceptDecl* concept,
+                                        const char* method_name,
+                                        AstNameList* seen_concepts) {
+    int i = 0;
+    if (!concept) {
+        return 0;
+    }
+    if (ast_name_list_contains(seen_concepts, concept->name)) {
+        return 0;
+    }
+    name_list_push(seen_concepts, concept->name);
+    if (concept_decl_has_method(concept, method_name)) {
+        return 1;
+    }
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        const AstConceptDecl* parent = find_ast_concept(program, concept->concept_names.items[i]);
+        if (concept_or_parent_has_method(program, parent, method_name, seen_concepts)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ast_name_list_contains(const AstNameList* list, const char* name) {
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct ConceptMethodRef {
+    const AstConceptMethod* method;
+    const AstConceptDecl* owner;
+} ConceptMethodRef;
+
+typedef struct ConceptMethodRefList {
+    ConceptMethodRef* items;
+    int count;
+    int capacity;
+} ConceptMethodRefList;
+
+#define concept_method_ref_list_push(list, item) VEC_PUSH((list), (item))
+
+static int concept_method_signature_equal(const AstConceptMethod* a, const AstConceptMethod* b) {
+    int i = 0;
+    if (!ast_type_is_equal(&a->return_type, &b->return_type)) {
+        return 0;
+    }
+    if (a->params.count != b->params.count) {
+        return 0;
+    }
+    for (i = 0; i < a->params.count; ++i) {
+        if (!ast_type_is_equal(&a->params.items[i].type, &b->params.items[i].type)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static ConceptMethodRef* find_concept_method_ref(ConceptMethodRefList* list, const char* name) {
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i].method->name, name) == 0) {
+            return &list->items[i];
+        }
+    }
+    return 0;
+}
+
+static int collect_concept_method_names(const AstProgram* program,
+                                        const AstConceptDecl* concept,
+                                        AstNameList* seen_concepts,
+                                        AstNameList* active_concepts,
+                                        ConceptMethodRefList* methods,
+                                        const char** error,
+                                        char** name_detail) {
+    int i = 0;
+    if (!concept) {
+        return 1;
+    }
+    if (ast_name_list_contains(active_concepts, concept->name)) {
+        *error = "cyclic trait inheritance";
+        *name_detail = concept->name;
+        return 0;
+    }
+    if (ast_name_list_contains(seen_concepts, concept->name)) {
+        return 1;
+    }
+    name_list_push(active_concepts, concept->name);
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        const AstConceptDecl* parent = find_ast_concept(program, concept->concept_names.items[i]);
+        if (!parent) {
+            *error = "unknown parent trait";
+            *name_detail = concept->concept_names.items[i];
+            return 0;
+        }
+        if (!collect_concept_method_names(program, parent, seen_concepts, active_concepts, methods, error, name_detail)) {
+            return 0;
+        }
+    }
+    name_list_push(seen_concepts, concept->name);
+    for (i = 0; i < concept->methods.count; ++i) {
+        ConceptMethodRef* existing = find_concept_method_ref(methods, concept->methods.items[i].name);
+        if (existing) {
+            if (!concept_method_signature_equal(existing->method, &concept->methods.items[i])) {
+                *error = "trait requirement conflict";
+                *name_detail = concept->methods.items[i].name;
+                return 0;
+            }
+            continue;
+        }
+        {
+            ConceptMethodRef item;
+            item.method = &concept->methods.items[i];
+            item.owner = concept;
+            concept_method_ref_list_push(methods, item);
+        }
+    }
+    active_concepts->count -= 1;
+    return 1;
+}
+
+static int nominal_concepts_have_unique_method_names(const AstProgram* program,
+                                                     const AstNameList* concept_names,
+                                                     const char** error,
+                                                     char** detail_name) {
+    AstNameList seen_concepts;
+    AstNameList active_concepts;
+    ConceptMethodRefList methods;
+    int i = 0;
+    memset(&seen_concepts, 0, sizeof(seen_concepts));
+    memset(&active_concepts, 0, sizeof(active_concepts));
+    memset(&methods, 0, sizeof(methods));
+    *error = 0;
+    *detail_name = 0;
+    for (i = 0; i < concept_names->count; ++i) {
+        const AstConceptDecl* concept = find_ast_concept(program, concept_names->items[i]);
+        if (!concept) {
+            *error = "unknown trait on type";
+            *detail_name = concept_names->items[i];
+            return 0;
+        }
+        if (!collect_concept_method_names(program, concept, &seen_concepts, &active_concepts, &methods, error, detail_name)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int exported_concept_name_allowed(const AstProgram* source, int hide_private, const char* concept_name) {
     const AstConceptDecl* concept = find_ast_concept(source, concept_name);
     if (!hide_private) {
@@ -1586,7 +1745,9 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
             const AstStructDecl* decl = (const AstStructDecl*)owner.decl;
             for (i = 0; i < decl->concept_names.count; ++i) {
                 const AstConceptDecl* concept = find_ast_concept(program, decl->concept_names.items[i]);
-                if (concept && concept->public_flag && concept_decl_has_method(concept, fn->name)) {
+                AstNameList seen_concepts;
+                memset(&seen_concepts, 0, sizeof(seen_concepts));
+                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, &seen_concepts)) {
                     return 1;
                 }
             }
@@ -1596,7 +1757,9 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
             const AstEnumDecl* decl = (const AstEnumDecl*)owner.decl;
             for (i = 0; i < decl->concept_names.count; ++i) {
                 const AstConceptDecl* concept = find_ast_concept(program, decl->concept_names.items[i]);
-                if (concept && concept->public_flag && concept_decl_has_method(concept, fn->name)) {
+                AstNameList seen_concepts;
+                memset(&seen_concepts, 0, sizeof(seen_concepts));
+                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, &seen_concepts)) {
                     return 1;
                 }
             }
@@ -1606,7 +1769,9 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
             const AstUnionDecl* decl = (const AstUnionDecl*)owner.decl;
             for (i = 0; i < decl->concept_names.count; ++i) {
                 const AstConceptDecl* concept = find_ast_concept(program, decl->concept_names.items[i]);
-                if (concept && concept->public_flag && concept_decl_has_method(concept, fn->name)) {
+                AstNameList seen_concepts;
+                memset(&seen_concepts, 0, sizeof(seen_concepts));
+                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, &seen_concepts)) {
                     return 1;
                 }
             }
@@ -2205,13 +2370,24 @@ static AstType substitute_self_type(const AstType* type, const AstType* self_typ
 static int type_has_concept_methods(const AstProgram* program, const AstType* type, const AstConceptDecl* concept) {
     int i = 0;
     AstTypeQueryRef query = describe_ast_type(program, type);
+    AstNameList seen_concepts;
+    AstNameList active_concepts;
+    ConceptMethodRefList methods;
+    const char* collect_error = 0;
+    char* detail_name = 0;
+    memset(&seen_concepts, 0, sizeof(seen_concepts));
+    memset(&active_concepts, 0, sizeof(active_concepts));
+    memset(&methods, 0, sizeof(methods));
+    if (!collect_concept_method_names(program, concept, &seen_concepts, &active_concepts, &methods, &collect_error, &detail_name)) {
+        return 0;
+    }
     if (query.kind != AST_TYPE_QUERY_NOMINAL) {
-        return concept->methods.count == 0;
+        return methods.count == 0;
     }
     if (query.nominal.kind == AST_NOMINAL_BUILTIN) {
         const AstBuiltinNominalDecl* builtin = (const AstBuiltinNominalDecl*)query.nominal.decl;
-        for (i = 0; i < concept->methods.count; ++i) {
-            const AstConceptMethod* method = &concept->methods.items[i];
+        for (i = 0; i < methods.count; ++i) {
+            const AstConceptMethod* method = methods.items[i].method;
             if (strcmp(method->name, "hash") == 0) {
                 if (method->params.count != 0 || method->return_type.kind != AST_TYPE_INT) {
                     return 0;
@@ -2266,26 +2442,28 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
         }
         return 1;
     }
-    for (i = 0; i < concept->methods.count; ++i) {
-        const AstFunction* method = find_type_method_template(program, type, concept->methods.items[i].name);
+    for (i = 0; i < methods.count; ++i) {
+        const AstConceptMethod* requirement = methods.items[i].method;
+        const AstConceptDecl* owner_concept = methods.items[i].owner;
+        const AstFunction* method = find_type_method_template(program, type, requirement->name);
         int j = 0;
         if (!method || method->static_method_flag) {
             return 0;
         }
-        if (concept->public_flag && !method->public_flag) {
+        if (owner_concept && owner_concept->public_flag && !method->public_flag) {
             return 0;
         }
         {
-            AstType expected_return = substitute_self_type(&concept->methods.items[i].return_type, type);
+            AstType expected_return = substitute_self_type(&requirement->return_type, type);
             if (!ast_type_is_equal(&method->return_type, &expected_return)) {
                 return 0;
             }
         }
-        if (method->params.count != concept->methods.items[i].params.count) {
+        if (method->params.count != requirement->params.count) {
             return 0;
         }
         for (j = 0; j < method->params.count; ++j) {
-            AstType expected_param = substitute_self_type(&concept->methods.items[i].params.items[j].type, type);
+            AstType expected_param = substitute_self_type(&requirement->params.items[j].type, type);
             if (!ast_type_is_equal(&method->params.items[j].type, &expected_param)) {
                 return 0;
             }
@@ -2367,6 +2545,70 @@ static int nominal_declares_concept_name(AstNominalDeclRef nominal, const char* 
     }
 }
 
+static int concept_name_is_or_inherits(const AstProgram* program,
+                                       const char* actual_name,
+                                       const char* target_name,
+                                       AstNameList* seen_concepts) {
+    const AstConceptDecl* concept = 0;
+    int i = 0;
+    if (strcmp(actual_name, target_name) == 0) {
+        return 1;
+    }
+    if (ast_name_list_contains(seen_concepts, actual_name)) {
+        return 0;
+    }
+    name_list_push(seen_concepts, actual_name);
+    concept = find_ast_concept(program, actual_name);
+    if (!concept) {
+        return 0;
+    }
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        if (concept_name_is_or_inherits(program, concept->concept_names.items[i], target_name, seen_concepts)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int nominal_declares_concept_or_child(const AstProgram* program,
+                                             AstNominalDeclRef nominal,
+                                             const char* concept_name) {
+    AstNameList seen_concepts;
+    int i = 0;
+    memset(&seen_concepts, 0, sizeof(seen_concepts));
+    switch (nominal.kind) {
+        case AST_NOMINAL_STRUCT: {
+            const AstStructDecl* decl = (const AstStructDecl*)nominal.decl;
+            for (i = 0; i < decl->concept_names.count; ++i) {
+                if (concept_name_is_or_inherits(program, decl->concept_names.items[i], concept_name, &seen_concepts)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        case AST_NOMINAL_ENUM: {
+            const AstEnumDecl* decl = (const AstEnumDecl*)nominal.decl;
+            for (i = 0; i < decl->concept_names.count; ++i) {
+                if (concept_name_is_or_inherits(program, decl->concept_names.items[i], concept_name, &seen_concepts)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        case AST_NOMINAL_UNION: {
+            const AstUnionDecl* decl = (const AstUnionDecl*)nominal.decl;
+            for (i = 0; i < decl->concept_names.count; ++i) {
+                if (concept_name_is_or_inherits(program, decl->concept_names.items[i], concept_name, &seen_concepts)) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        default:
+            return 0;
+    }
+}
+
 static int ast_type_satisfies_concept(const AstProgram* program, const AstType* type, const char* concept_name) {
     const AstConceptDecl* concept = find_ast_concept(program, concept_name);
     AstTypeQueryRef query = describe_ast_type(program, type);
@@ -2378,7 +2620,7 @@ static int ast_type_satisfies_concept(const AstProgram* program, const AstType* 
             return 0;
         }
         if (query.kind == AST_TYPE_QUERY_NOMINAL && query.nominal.kind != AST_NOMINAL_BUILTIN &&
-            !nominal_declares_concept_name(query.nominal, concept_name)) {
+            !nominal_declares_concept_or_child(program, query.nominal, concept_name)) {
             return 0;
         }
         return !concept || type_has_concept_methods(program, type, concept);
@@ -2386,7 +2628,7 @@ static int ast_type_satisfies_concept(const AstProgram* program, const AstType* 
     if (!concept) {
         return 0;
     }
-    if (query.kind != AST_TYPE_QUERY_NOMINAL || !nominal_declares_concept_name(query.nominal, concept_name)) {
+    if (query.kind != AST_TYPE_QUERY_NOMINAL || !nominal_declares_concept_or_child(program, query.nominal, concept_name)) {
         return 0;
     }
     return type_has_concept_methods(program, type, concept);
@@ -2466,6 +2708,24 @@ static int validate_where_constraints_program(const AstProgram* program, const c
     int j = 0;
     static char where_error[256];
     AstType self_type;
+    for (i = 0; i < program->concepts.count; ++i) {
+        AstNameList concept_names;
+        const char* collect_error = 0;
+        char* detail_name = 0;
+        memset(&concept_names, 0, sizeof(concept_names));
+        name_list_push(&concept_names, program->concepts.items[i].name);
+        if (!nominal_concepts_have_unique_method_names(program, &concept_names, &collect_error, &detail_name)) {
+            if (strcmp(collect_error, "unknown parent trait") == 0) {
+                snprintf(where_error, sizeof(where_error), "unknown parent trait: %s", detail_name);
+            } else if (strcmp(collect_error, "cyclic trait inheritance") == 0) {
+                snprintf(where_error, sizeof(where_error), "cyclic trait inheritance: %s", detail_name);
+            } else {
+                snprintf(where_error, sizeof(where_error), "trait requirement conflict: %s", detail_name);
+            }
+            *error = where_error;
+            return 0;
+        }
+    }
     for (i = 0; i < program->structs.count; ++i) {
         memset(&self_type, 0, sizeof(self_type));
         self_type.kind = AST_TYPE_NAMED;
@@ -2484,6 +2744,18 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 *error = where_error;
                 return 0;
             }
+        }
+        {
+            const char* collect_error = 0;
+            char* detail_name = 0;
+            if (!nominal_concepts_have_unique_method_names(program, &program->structs.items[i].concept_names, &collect_error, &detail_name)) {
+                snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+        for (j = 0; j < program->structs.items[i].concept_names.count; ++j) {
+            const char* concept_name = program->structs.items[i].concept_names.items[j];
             if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
                 *error = "type does not satisfy declared trait";
                 return 0;
@@ -2513,6 +2785,18 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 *error = where_error;
                 return 0;
             }
+        }
+        {
+            const char* collect_error = 0;
+            char* detail_name = 0;
+            if (!nominal_concepts_have_unique_method_names(program, &program->enums.items[i].concept_names, &collect_error, &detail_name)) {
+                snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+        for (j = 0; j < program->enums.items[i].concept_names.count; ++j) {
+            const char* concept_name = program->enums.items[i].concept_names.items[j];
             if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
                 *error = "type does not satisfy declared trait";
                 return 0;
@@ -2530,6 +2814,18 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 *error = where_error;
                 return 0;
             }
+        }
+        {
+            const char* collect_error = 0;
+            char* detail_name = 0;
+            if (!nominal_concepts_have_unique_method_names(program, &program->unions.items[i].concept_names, &collect_error, &detail_name)) {
+                snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+        for (j = 0; j < program->unions.items[i].concept_names.count; ++j) {
+            const char* concept_name = program->unions.items[i].concept_names.items[j];
             if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
                 *error = "type does not satisfy declared trait";
                 return 0;

@@ -1008,12 +1008,6 @@ if (x == MyUnion.a(_ value)) {
 
 
 
-### 元编程（Meta）
-
-
-
-
-
 ### 泛型（Generic）
 
 Jiang 语言通常以 `<T>` 形式声明泛型参数。
@@ -1049,12 +1043,22 @@ trait Numbric;
 - 只要 trait 本身是 `public`
 - 那么用于实现该 trait requirement 的方法就必须显式写 `public`
 - 这条规则同时适用于类型定义体内实现，以及 `extend Type: Trait { ... }` 中的实现
+- 若一个类型同时声明多个 trait，而这些 trait 中存在同名 requirement，则当前直接报错
+- 也就是说，当前不支持通过一个类型同时实现“名字相同”的多个 trait 方法
 
 用户也可以自定义 trait，并声明内部函数签名，用于约束满足该 trait 的类型必须提供对应实例方法：
 
 ```c
 trait Hashable {
   Int hash();
+}
+```
+
+trait 也可以继承一个或多个父 trait：
+
+```c
+trait HashEq: Hashable {
+  Bool equal(Self other);
 }
 ```
 
@@ -1066,7 +1070,12 @@ trait Hashable {
 - trait 内部函数当前用于声明**约束签名**，不是运行时成员，也不是默认实现
 - 用户自定义类型若要满足某个 trait，当前需要在类型定义处显式声明
 - 仅仅“方法签名刚好匹配”并不会自动满足 trait
+- 实现子 trait 的类型，会自动被视为也实现其父 trait
 - `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[] bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
+- 若继承链中出现同名 requirement：
+  - 同名且签名完全一致：允许合并
+  - 同名但签名不同：编译报错
+- 若 trait 继承未知父 trait，或出现继承环，编译报错
 
 例如：
 
@@ -1080,6 +1089,10 @@ T add<T>(T a, T b) {
 ```c
 trait HasValue {
   Int value();
+}
+
+trait HasDouble: HasValue {
+  Int double_value();
 }
 
 struct Box: HasValue {
@@ -1155,6 +1168,9 @@ extend User: HasValue {
 - `extend` 块里只允许普通方法
 - 不支持 `init`
 - 不支持 `deinit`
+- 若 `extend Type: Trait1, Trait2` 中的多个 trait 带有同名 requirement：
+  - 同名且签名完全一致：允许合并
+  - 同名但签名不同：编译报错
 
 ### 模块（Module）
 

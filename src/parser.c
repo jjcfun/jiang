@@ -345,6 +345,8 @@ static int parse_where_annotation(Parser* parser, AstWhereConstraintList* out) {
     return expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after @where");
 }
 
+static int parse_decl_concept_names(Parser* parser, AstNameList* out);
+
 static int parse_concept_decl(Parser* parser, AstProgram* out_program, int public_flag) {
     AstConceptDecl concept_decl;
     memset(&concept_decl, 0, sizeof(concept_decl));
@@ -356,6 +358,9 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
     concept_decl.name = token_dup(&parser->current);
     concept_decl.line = parser->current.line;
     advance(parser);
+    if (!parse_decl_concept_names(parser, &concept_decl.concept_names)) {
+        return 0;
+    }
     if (parser->current.kind == TOKEN_SEMICOLON) {
         advance(parser);
         concept_list_push(&out_program->concepts, concept_decl);

@@ -351,6 +351,7 @@ struct AstConceptMethodList {
 
 struct AstConceptDecl {
     char* name;
+    AstNameList concept_names;
     AstConceptMethodList methods;
     int public_flag;
     int line;
