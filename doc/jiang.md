@@ -153,6 +153,29 @@ Int value = maybe ?? continue;
 - `return` / `break` / `continue` 只支持出现在局部变量初始化右侧
 - `return expr` 会按当前函数返回类型检查
 
+### Defer
+
+`defer` 会在当前块退出时按 LIFO 顺序执行。
+
+```c
+defer handle$.free();
+
+defer {
+    log("closing");
+    handle$.free();
+}
+```
+
+支持两种形式：
+
+- `defer expr;`
+- `defer { ... }`
+
+当前限制：
+
+- `defer` 体内不支持 `return`、`break`、`continue`
+- `defer` 体内也不支持 `?? return`、`?? break`、`?? continue`
+
 
 
 ### 类型转换 (Type Casting)

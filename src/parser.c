@@ -2078,6 +2078,29 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
+    if (parser->current.kind == TOKEN_KW_DEFER) {
+        stmt = new_stmt(AST_STMT_DEFER, parser->current.line);
+        advance(parser);
+        if (parser->current.kind == TOKEN_LEFT_BRACE) {
+            if (!parse_block(parser, &stmt->as.defer_stmt.body)) {
+                return 0;
+            }
+            return stmt;
+        }
+        {
+            AstStmt* expr_stmt = new_stmt(AST_STMT_EXPR, parser->current.line);
+            expr_stmt->as.expr_stmt.expr = parse_expr(parser);
+            if (!expr_stmt->as.expr_stmt.expr) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after defer expression")) {
+                return 0;
+            }
+            stmt_list_push(&stmt->as.defer_stmt.body.stmts, expr_stmt);
+            return stmt;
+        }
+    }
+
     if (parser->current.kind == TOKEN_KW_IF) {
         stmt = new_stmt(AST_STMT_IF, parser->current.line);
         advance(parser);

@@ -76,6 +76,10 @@ run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2
 run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
+run_sample defer_minimal.jiang 57
+run_sample defer_block_minimal.jiang 54
+run_sample defer_return_minimal.jiang 21
+run_compile_fail invalid_defer_return_minimal.jiang
 run_sample binary_ops_minimal.jiang 1
 run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0

@@ -37,6 +37,7 @@ typedef enum TokenKind {
     TOKEN_KW_SWITCH,
     TOKEN_KW_BREAK,
     TOKEN_KW_CONTINUE,
+    TOKEN_KW_DEFER,
     TOKEN_KW_TRUE,
     TOKEN_KW_FALSE,
     TOKEN_KW_NULL,

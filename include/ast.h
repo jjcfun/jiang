@@ -414,6 +414,7 @@ typedef enum AstStmtKind {
     AST_STMT_FOR_EACH,
     AST_STMT_BREAK,
     AST_STMT_CONTINUE,
+    AST_STMT_DEFER,
     AST_STMT_EXPR,
     AST_STMT_DESTRUCTURE,
 } AstStmtKind;
@@ -464,6 +465,9 @@ struct AstStmt {
         struct {
             AstExpr* expr;
         } expr_stmt;
+        struct {
+            AstBlock body;
+        } defer_stmt;
         struct {
             AstParamList bindings;
             AstExpr* init;

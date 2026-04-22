@@ -119,6 +119,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 8 && strncmp(lexer->start, "continue", 8) == 0) {
         return make_token(lexer, TOKEN_KW_CONTINUE, lexer->start, length);
     }
+    if (length == 5 && strncmp(lexer->start, "defer", 5) == 0) {
+        return make_token(lexer, TOKEN_KW_DEFER, lexer->start, length);
+    }
     if (length == 4 && strncmp(lexer->start, "true", 4) == 0) {
         return make_token(lexer, TOKEN_KW_TRUE, lexer->start, length);
     }

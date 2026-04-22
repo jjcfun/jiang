@@ -769,6 +769,9 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
         case AST_STMT_BREAK:
         case AST_STMT_CONTINUE:
             break;
+        case AST_STMT_DEFER:
+            clone_block(source, prefix, hide_private, &out->as.defer_stmt.body, &stmt->as.defer_stmt.body);
+            break;
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = clone_expr(source, prefix, hide_private, stmt->as.expr_stmt.expr);
             break;
@@ -4061,6 +4064,11 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
         case AST_STMT_BREAK:
         case AST_STMT_CONTINUE:
             break;
+        case AST_STMT_DEFER:
+            for (i = 0; i < stmt->as.defer_stmt.body.stmts.count; ++i) {
+                stmt_list_push(&out->as.defer_stmt.body.stmts, clone_stmt_subst(stmt->as.defer_stmt.body.stmts.items[i], subst));
+            }
+            break;
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = clone_expr_subst(stmt->as.expr_stmt.expr, subst);
             break;
@@ -4127,6 +4135,8 @@ static int transform_stmt(MonoContext* mono, AstStmt* stmt, LocalTypeList* local
         case AST_STMT_FOR_EACH:
             return transform_expr(mono, stmt->as.for_each.iterable, locals) &&
                    transform_block(mono, &stmt->as.for_each.body, locals);
+        case AST_STMT_DEFER:
+            return transform_block(mono, &stmt->as.defer_stmt.body, locals);
         case AST_STMT_EXPR:
             return transform_expr(mono, stmt->as.expr_stmt.expr, locals);
         case AST_STMT_DESTRUCTURE:

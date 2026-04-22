@@ -10,6 +10,23 @@ typedef struct Scope {
     HirBindingList bindings;
 } Scope;
 
+typedef struct HirBlockList {
+    HirBlock* items;
+    int count;
+    int capacity;
+} HirBlockList;
+
+typedef struct DeferFrame {
+    int defer_start;
+    int loop_boundary;
+} DeferFrame;
+
+typedef struct DeferFrameList {
+    DeferFrame* items;
+    int count;
+    int capacity;
+} DeferFrameList;
+
 typedef struct LowerContext {
     HirProgram* program;
     const AstProgram* ast;
@@ -17,6 +34,8 @@ typedef struct LowerContext {
     HirFunction* current_function;
     Scope* scope;
     HirBindingList freed_bindings;
+    HirBlockList active_defers;
+    DeferFrameList defer_frames;
     int loop_depth;
     int temp_index;
 } LowerContext;
@@ -113,6 +132,8 @@ static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
+#define defer_block_list_push(list, block) VEC_PUSH((list), (block))
+#define defer_frame_list_push(list, frame) VEC_PUSH((list), (frame))
 
 static int fail(LowerContext* ctx, const char* error);
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
@@ -131,6 +152,90 @@ static int is_mutable_assignment_target(const HirExpr* expr);
 static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
 static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block);
+static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary);
+
+static void append_block_stmts(HirBlock* out_block, const HirBlock* block) {
+    int i = 0;
+    for (i = 0; i < block->stmts.count; ++i) {
+        stmt_list_push(&out_block->stmts, block->stmts.items[i]);
+    }
+}
+
+static void emit_deferred_blocks(LowerContext* ctx, HirBlock* out_block, int start) {
+    int i = 0;
+    if (start < 0) {
+        start = 0;
+    }
+    for (i = ctx->active_defers.count - 1; i >= start; --i) {
+        append_block_stmts(out_block, &ctx->active_defers.items[i]);
+    }
+}
+
+static int nearest_loop_defer_start(LowerContext* ctx) {
+    int i = 0;
+    for (i = ctx->defer_frames.count - 1; i >= 0; --i) {
+        if (ctx->defer_frames.items[i].loop_boundary) {
+            return ctx->defer_frames.items[i].defer_start;
+        }
+    }
+    return -1;
+}
+
+static int defer_body_has_control_flow(const AstBlock* block) {
+    int i = 0;
+    for (i = 0; i < block->stmts.count; ++i) {
+        const AstStmt* stmt = block->stmts.items[i];
+        switch (stmt->kind) {
+            case AST_STMT_RETURN:
+            case AST_STMT_BREAK:
+            case AST_STMT_CONTINUE:
+                return 1;
+            case AST_STMT_VAR_DECL:
+                if (stmt->as.var_decl.init && stmt->as.var_decl.init->kind == AST_EXPR_COALESCE_CONTROL) {
+                    return 1;
+                }
+                break;
+            case AST_STMT_IF:
+                if (defer_body_has_control_flow(&stmt->as.if_stmt.then_block) ||
+                    (stmt->as.if_stmt.has_else && defer_body_has_control_flow(&stmt->as.if_stmt.else_block))) {
+                    return 1;
+                }
+                break;
+            case AST_STMT_SWITCH: {
+                int j = 0;
+                for (j = 0; j < stmt->as.switch_stmt.cases.count; ++j) {
+                    if (defer_body_has_control_flow(&stmt->as.switch_stmt.cases.items[j].body)) {
+                        return 1;
+                    }
+                }
+                break;
+            }
+            case AST_STMT_WHILE:
+                if (defer_body_has_control_flow(&stmt->as.while_stmt.body)) {
+                    return 1;
+                }
+                break;
+            case AST_STMT_FOR_RANGE:
+                if (defer_body_has_control_flow(&stmt->as.for_range.body)) {
+                    return 1;
+                }
+                break;
+            case AST_STMT_FOR_EACH:
+                if (defer_body_has_control_flow(&stmt->as.for_each.body)) {
+                    return 1;
+                }
+                break;
+            case AST_STMT_DEFER:
+                if (defer_body_has_control_flow(&stmt->as.defer_stmt.body)) {
+                    return 1;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return 0;
+}
 
 static int type_is_imported_nominal(HirType* type) {
     if (!type) {
@@ -3159,7 +3264,6 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
     return lower_expr_expected(ctx, expr, 0);
 }
 
-static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block);
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
 
 static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line) {
@@ -3385,7 +3489,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 if (!lower_variant_pattern_bind(ctx, value, stmt->as.if_stmt.cond->as.binary.right, &out->as.if_stmt.then_block, &out->as.if_stmt.cond)) {
                     return 0;
                 }
-                if (!lower_block(ctx, &stmt->as.if_stmt.then_block, &out->as.if_stmt.then_block)) {
+                if (!lower_block(ctx, &stmt->as.if_stmt.then_block, &out->as.if_stmt.then_block, 0)) {
                     return 0;
                 }
                 pop_scope(ctx);
@@ -3404,7 +3508,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                         return 0;
                     }
                 }
-                if (!lower_block(ctx, &stmt->as.if_stmt.then_block, &out->as.if_stmt.then_block)) {
+                if (!lower_block(ctx, &stmt->as.if_stmt.then_block, &out->as.if_stmt.then_block, 0)) {
                     return 0;
                 }
                 pop_scope(ctx);
@@ -3418,7 +3522,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                         return 0;
                     }
                 }
-                if (!lower_block(ctx, &stmt->as.if_stmt.else_block, &out->as.if_stmt.else_block)) {
+                if (!lower_block(ctx, &stmt->as.if_stmt.else_block, &out->as.if_stmt.else_block, 0)) {
                     return 0;
                 }
                 pop_scope(ctx);
@@ -3437,7 +3541,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             }
             ctx->loop_depth += 1;
             push_scope(ctx, &inner);
-            if (!lower_block(ctx, &stmt->as.while_stmt.body, &out->as.while_stmt.body)) {
+            if (!lower_block(ctx, &stmt->as.while_stmt.body, &out->as.while_stmt.body, 1)) {
                 return 0;
             }
             pop_scope(ctx);
@@ -3473,7 +3577,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             if (!bind_in_current_scope(ctx, binding)) {
                 return 0;
             }
-            if (!lower_block(ctx, &stmt->as.for_range.body, &out->as.for_range.body)) {
+            if (!lower_block(ctx, &stmt->as.for_range.body, &out->as.for_range.body, 1)) {
                 return 0;
             }
             pop_scope(ctx);
@@ -3573,6 +3677,11 @@ static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stm
     cond->as.binary.right = make_null_expr(temp_binding->type, stmt->line);
     if_stmt = new_stmt(HIR_STMT_IF, stmt->line);
     if_stmt->as.if_stmt.cond = cond;
+    if (control == AST_COALESCE_RETURN) {
+        emit_deferred_blocks(ctx, &if_stmt->as.if_stmt.then_block, 0);
+    } else {
+        emit_deferred_blocks(ctx, &if_stmt->as.if_stmt.then_block, nearest_loop_defer_start(ctx));
+    }
     exit_stmt = new_stmt(control == AST_COALESCE_RETURN ? HIR_STMT_RETURN :
                          (control == AST_COALESCE_BREAK ? HIR_STMT_BREAK : HIR_STMT_CONTINUE),
                          stmt->line);
@@ -3936,7 +4045,7 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
     for (; i >= 0; --i) {
         const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
         if (ast_case->is_else) {
-            if (!lower_block(ctx, &ast_case->body, &else_block)) {
+            if (!lower_block(ctx, &ast_case->body, &else_block, 0)) {
                 return 0;
             }
             have_else = 1;
@@ -3965,7 +4074,7 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
                 if_stmt->as.if_stmt.cond->as.binary.left = value;
                 if_stmt->as.if_stmt.cond->as.binary.right = case_value;
             }
-            if (!lower_block(ctx, &ast_case->body, &if_stmt->as.if_stmt.then_block)) {
+            if (!lower_block(ctx, &ast_case->body, &if_stmt->as.if_stmt.then_block, 0)) {
                 return 0;
             }
             pop_scope(ctx);
@@ -4084,7 +4193,7 @@ static int lower_for_each_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock*
             return 0;
         }
     }
-    if (!lower_block(ctx, &stmt->as.for_each.body, &loop_stmt->as.for_range.body)) {
+    if (!lower_block(ctx, &stmt->as.for_each.body, &loop_stmt->as.for_range.body, 1)) {
         pop_scope(ctx);
         return 0;
     }
@@ -4093,10 +4202,26 @@ static int lower_for_each_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock*
     return 1;
 }
 
-static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block) {
+static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary) {
     int i = 0;
+    DeferFrame frame;
+    frame.defer_start = ctx->active_defers.count;
+    frame.loop_boundary = loop_boundary;
+    defer_frame_list_push(&ctx->defer_frames, frame);
     for (i = 0; i < ast_block->stmts.count; ++i) {
         HirStmt* stmt = 0;
+        if (ast_block->stmts.items[i]->kind == AST_STMT_DEFER) {
+            HirBlock deferred_body;
+            memset(&deferred_body, 0, sizeof(deferred_body));
+            if (defer_body_has_control_flow(&ast_block->stmts.items[i]->as.defer_stmt.body)) {
+                return fail(ctx, "defer body cannot contain control flow");
+            }
+            if (!lower_block(ctx, &ast_block->stmts.items[i]->as.defer_stmt.body, &deferred_body, 0)) {
+                return 0;
+            }
+            defer_block_list_push(&ctx->active_defers, deferred_body);
+            continue;
+        }
         if (ast_block->stmts.items[i]->kind == AST_STMT_VAR_DECL &&
             ast_block->stmts.items[i]->as.var_decl.init &&
             ast_block->stmts.items[i]->as.var_decl.init->kind == AST_EXPR_COALESCE_CONTROL) {
@@ -4127,8 +4252,16 @@ static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* o
         if (!stmt) {
             return 0;
         }
+        if (stmt->kind == HIR_STMT_RETURN) {
+            emit_deferred_blocks(ctx, out_block, 0);
+        } else if (stmt->kind == HIR_STMT_BREAK || stmt->kind == HIR_STMT_CONTINUE) {
+            emit_deferred_blocks(ctx, out_block, nearest_loop_defer_start(ctx));
+        }
         stmt_list_push(&out_block->stmts, stmt);
     }
+    emit_deferred_blocks(ctx, out_block, frame.defer_start);
+    ctx->active_defers.count = frame.defer_start;
+    ctx->defer_frames.count -= 1;
     return 1;
 }
 
@@ -4540,7 +4673,7 @@ static int lower_functions(LowerContext* ctx) {
                     return 0;
                 }
             }
-            if (!lower_block(ctx, &ast_struct->deinit_body, &ctx->current_function->body)) {
+            if (!lower_block(ctx, &ast_struct->deinit_body, &ctx->current_function->body, 0)) {
                 return 0;
             }
             if (ctx->current_function->body.stmts.count == 0 ||
@@ -4561,7 +4694,7 @@ static int lower_functions(LowerContext* ctx) {
                     return 0;
                 }
             }
-            if (!lower_block(ctx, &ctx->ast->functions.items[user_index].body, &ctx->current_function->body)) {
+            if (!lower_block(ctx, &ctx->ast->functions.items[user_index].body, &ctx->current_function->body, 0)) {
                 return 0;
             }
             user_index += 1;
