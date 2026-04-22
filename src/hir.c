@@ -3516,6 +3516,7 @@ static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stm
     HirExpr* temp_ref = 0;
     HirExpr* cond = 0;
     HirExpr* init = 0;
+    HirExpr* return_value = 0;
     AstCoalesceControlKind control = stmt->as.var_decl.init->as.coalesce_control.control;
 
     optional_value = lower_expr(ctx, stmt->as.var_decl.init->as.coalesce_control.left);
@@ -3534,8 +3535,24 @@ static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stm
         }
     }
 
-    if (control == AST_COALESCE_RETURN && ctx->current_function->return_type->kind != HIR_TYPE_VOID) {
-        return fail(ctx, "coalesce return requires () function");
+    if (control == AST_COALESCE_RETURN) {
+        if (stmt->as.var_decl.init->as.coalesce_control.return_expr) {
+            return_value = lower_expr_expected(ctx,
+                                               stmt->as.var_decl.init->as.coalesce_control.return_expr,
+                                               ctx->current_function->return_type);
+            if (!return_value) {
+                return 0;
+            }
+            return_value = maybe_decay_array_to_slice(ctx, return_value, ctx->current_function->return_type, stmt->line);
+            if (!return_value) {
+                return 0;
+            }
+            if (!type_assignment_compatible(return_value->type, ctx->current_function->return_type)) {
+                return fail(ctx, "return type mismatch");
+            }
+        } else if (ctx->current_function->return_type->kind != HIR_TYPE_VOID) {
+            return fail(ctx, "coalesce return requires value");
+        }
     }
     if ((control == AST_COALESCE_BREAK || control == AST_COALESCE_CONTINUE) && ctx->loop_depth <= 0) {
         return fail(ctx, control == AST_COALESCE_BREAK ? "break used outside loop" : "continue used outside loop");
@@ -3559,6 +3576,9 @@ static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stm
     exit_stmt = new_stmt(control == AST_COALESCE_RETURN ? HIR_STMT_RETURN :
                          (control == AST_COALESCE_BREAK ? HIR_STMT_BREAK : HIR_STMT_CONTINUE),
                          stmt->line);
+    if (control == AST_COALESCE_RETURN) {
+        exit_stmt->as.ret.expr = return_value;
+    }
     stmt_list_push(&if_stmt->as.if_stmt.then_block.stmts, exit_stmt);
     stmt_list_push(&out_block->stmts, if_stmt);
 

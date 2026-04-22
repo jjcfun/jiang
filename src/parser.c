@@ -1958,6 +1958,7 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
             parser->current.kind == TOKEN_KW_CONTINUE) {
             out = new_expr(AST_EXPR_COALESCE_CONTROL, parser->current.line);
             out->as.coalesce_control.left = expr;
+            out->as.coalesce_control.return_expr = 0;
             switch (parser->current.kind) {
                 case TOKEN_KW_RETURN:
                     out->as.coalesce_control.control = AST_COALESCE_RETURN;
@@ -1970,6 +1971,13 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
                     break;
             }
             advance(parser);
+            if (out->as.coalesce_control.control == AST_COALESCE_RETURN &&
+                parser->current.kind != TOKEN_SEMICOLON) {
+                out->as.coalesce_control.return_expr = parse_equality(parser);
+                if (!out->as.coalesce_control.return_expr) {
+                    return 0;
+                }
+            }
             expr = out;
             continue;
         }

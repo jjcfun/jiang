@@ -142,6 +142,7 @@ Int other = maybe ?? fallback();
 
 ```c
 Int value = maybe ?? return;
+Int value = maybe ?? return 42;
 Int value = maybe ?? break;
 Int value = maybe ?? continue;
 ```
@@ -150,7 +151,7 @@ Int value = maybe ?? continue;
 
 - 左侧必须是 optional
 - `return` / `break` / `continue` 只支持出现在局部变量初始化右侧
-- `return value` 这一轮暂不支持
+- `return expr` 会按当前函数返回类型检查
 
 
 

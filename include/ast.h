@@ -257,6 +257,7 @@ struct AstExpr {
         struct {
             AstExpr* left;
             AstCoalesceControlKind control;
+            AstExpr* return_expr;
         } coalesce_control;
         struct {
             AstExpr* cond;
