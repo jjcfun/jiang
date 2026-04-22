@@ -930,6 +930,9 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         AstAssocTypeBinding binding;
         memset(&binding, 0, sizeof(binding));
         clone_name_list(&binding.context_concept_names, &decl->assoc_type_bindings.items[i].context_concept_names);
+        binding.concept_name = decl->assoc_type_bindings.items[i].concept_name
+            ? dup_text(decl->assoc_type_bindings.items[i].concept_name)
+            : 0;
         binding.name = dup_text(decl->assoc_type_bindings.items[i].name);
         binding.value = clone_type(source, prefix, hide_private, &decl->assoc_type_bindings.items[i].value);
         binding.line = decl->assoc_type_bindings.items[i].line;
@@ -971,6 +974,9 @@ static AstEnumDecl clone_enum_decl(const AstProgram* source, const char* prefix,
         AstAssocTypeBinding binding;
         memset(&binding, 0, sizeof(binding));
         clone_name_list(&binding.context_concept_names, &decl->assoc_type_bindings.items[i].context_concept_names);
+        binding.concept_name = decl->assoc_type_bindings.items[i].concept_name
+            ? dup_text(decl->assoc_type_bindings.items[i].concept_name)
+            : 0;
         binding.name = dup_text(decl->assoc_type_bindings.items[i].name);
         binding.value = clone_type(source, prefix, hide_private, &decl->assoc_type_bindings.items[i].value);
         binding.line = decl->assoc_type_bindings.items[i].line;
@@ -1007,6 +1013,9 @@ static AstUnionDecl clone_union_decl(const AstProgram* source, const char* prefi
         AstAssocTypeBinding binding;
         memset(&binding, 0, sizeof(binding));
         clone_name_list(&binding.context_concept_names, &decl->assoc_type_bindings.items[i].context_concept_names);
+        binding.concept_name = decl->assoc_type_bindings.items[i].concept_name
+            ? dup_text(decl->assoc_type_bindings.items[i].concept_name)
+            : 0;
         binding.name = dup_text(decl->assoc_type_bindings.items[i].name);
         binding.value = clone_type(source, prefix, hide_private, &decl->assoc_type_bindings.items[i].value);
         binding.line = decl->assoc_type_bindings.items[i].line;
@@ -1988,16 +1997,30 @@ static int collect_concept_assoc_types(const AstProgram* program,
                 return 0;
             }
         }
-        if (concept->methods.items[i].where_constraints.count != 0) {
-            int k = 0;
-            for (k = 0; k < assoc_types->count; ++k) {
-                if (!merge_assoc_where_constraints(&assoc_types->items[k], &concept->methods.items[i].where_constraints, error, name_detail)) {
-                    return 0;
-                }
-            }
-        }
     }
     active_concepts->count -= 1;
+    return 1;
+}
+
+static int ast_type_satisfies_concept(const AstProgram* program, const AstType* type, const char* concept_name);
+
+static int assoc_where_constraints_satisfied(const AstProgram* program,
+                                             const AstWhereConstraintList* where_constraints,
+                                             const ResolvedAssocTypeBindingList* assoc_bindings) {
+    int i = 0;
+    for (i = 0; i < where_constraints->count; ++i) {
+        const AstType* actual = lookup_resolved_assoc_type_binding(assoc_bindings, where_constraints->items[i].param_name);
+        if (!actual) {
+            return 0;
+        }
+        if (where_constraints->items[i].kind == AST_WHERE_CONCEPT) {
+            if (!ast_type_satisfies_concept(program, actual, where_constraints->items[i].concept_name)) {
+                return 0;
+            }
+        } else if (!ast_type_is_equal(actual, &where_constraints->items[i].equal_type)) {
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -2735,6 +2758,44 @@ static int resolve_nominal_assoc_type_bindings(const AstProgram* program,
             continue;
         }
         memset(&seen_concepts, 0, sizeof(seen_concepts));
+        if (binding->concept_name) {
+            const AstConceptDecl* context_concept = find_ast_concept(program, binding->concept_name);
+            ConceptAssocTypeRefList context_assoc_types;
+            AstNameList seen_assoc;
+            AstNameList active_assoc;
+            int visible = 0;
+            memset(&context_assoc_types, 0, sizeof(context_assoc_types));
+            memset(&seen_assoc, 0, sizeof(seen_assoc));
+            memset(&active_assoc, 0, sizeof(active_assoc));
+            if (!context_concept) {
+                *error = "unknown associated type binding";
+                *detail_name = binding->concept_name;
+                return 0;
+            }
+            for (j = 0; j < binding->context_concept_names.count; ++j) {
+                AstNameList seen_visible;
+                memset(&seen_visible, 0, sizeof(seen_visible));
+                if (concept_name_is_or_inherits(program, binding->context_concept_names.items[j], binding->concept_name, &seen_visible)) {
+                    visible = 1;
+                    break;
+                }
+            }
+            if (!visible) {
+                *error = "unknown associated type binding";
+                *detail_name = binding->concept_name;
+                return 0;
+            }
+            if (!collect_concept_assoc_types(program, context_concept, &seen_assoc, &active_assoc, &context_assoc_types, error, detail_name)) {
+                return 0;
+            }
+            if (!find_concept_assoc_type_ref(&context_assoc_types, binding->name)) {
+                *error = "unknown associated type binding";
+                *detail_name = binding->name;
+                return 0;
+            }
+            match_count = 1;
+            matched_concept_name = context_concept->name;
+        } else {
         for (j = 0; j < binding->context_concept_names.count; ++j) {
             const AstConceptDecl* context_concept = find_ast_concept(program, binding->context_concept_names.items[j]);
             ConceptAssocTypeRefList context_assoc_types;
@@ -2754,9 +2815,10 @@ static int resolve_nominal_assoc_type_bindings(const AstProgram* program,
                 matched_concept_name = context_concept->name;
             }
         }
+        }
         if (match_count == 0) {
             *error = "unknown associated type binding";
-            *detail_name = binding->name;
+            *detail_name = binding->concept_name ? binding->concept_name : binding->name;
             return 0;
         }
         if (match_count > 1) {
@@ -2795,27 +2857,60 @@ static int validate_nominal_assoc_type_bindings(const AstProgram* program,
         const AstAssocTypeBinding* binding = find_nominal_assoc_type_binding(nominal, i);
         int j = 0;
         int match_count = 0;
-        for (j = 0; j < binding->context_concept_names.count; ++j) {
-            const AstConceptDecl* context_concept = find_ast_concept(program, binding->context_concept_names.items[j]);
+        if (binding->concept_name) {
+            const AstConceptDecl* context_concept = find_ast_concept(program, binding->concept_name);
             ConceptAssocTypeRefList context_assoc_types;
             AstNameList seen_assoc;
             AstNameList active_assoc;
+            int visible = 0;
             memset(&context_assoc_types, 0, sizeof(context_assoc_types));
             memset(&seen_assoc, 0, sizeof(seen_assoc));
             memset(&active_assoc, 0, sizeof(active_assoc));
             if (!context_concept) {
-                continue;
+                *error = "unknown associated type binding";
+                *detail_name = binding->concept_name;
+                return 0;
+            }
+            for (j = 0; j < binding->context_concept_names.count; ++j) {
+                AstNameList seen_visible;
+                memset(&seen_visible, 0, sizeof(seen_visible));
+                if (concept_name_is_or_inherits(program, binding->context_concept_names.items[j], binding->concept_name, &seen_visible)) {
+                    visible = 1;
+                    break;
+                }
+            }
+            if (!visible) {
+                *error = "unknown associated type binding";
+                *detail_name = binding->concept_name;
+                return 0;
             }
             if (!collect_concept_assoc_types(program, context_concept, &seen_assoc, &active_assoc, &context_assoc_types, error, detail_name)) {
                 return 0;
             }
-            if (find_concept_assoc_type_ref(&context_assoc_types, binding->name)) {
-                match_count += 1;
+            match_count = find_concept_assoc_type_ref(&context_assoc_types, binding->name) ? 1 : 0;
+        } else {
+            for (j = 0; j < binding->context_concept_names.count; ++j) {
+                const AstConceptDecl* context_concept = find_ast_concept(program, binding->context_concept_names.items[j]);
+                ConceptAssocTypeRefList context_assoc_types;
+                AstNameList seen_assoc;
+                AstNameList active_assoc;
+                memset(&context_assoc_types, 0, sizeof(context_assoc_types));
+                memset(&seen_assoc, 0, sizeof(seen_assoc));
+                memset(&active_assoc, 0, sizeof(active_assoc));
+                if (!context_concept) {
+                    continue;
+                }
+                if (!collect_concept_assoc_types(program, context_concept, &seen_assoc, &active_assoc, &context_assoc_types, error, detail_name)) {
+                    return 0;
+                }
+                if (find_concept_assoc_type_ref(&context_assoc_types, binding->name)) {
+                    match_count += 1;
+                }
             }
         }
         if (match_count == 0) {
             *error = "unknown associated type binding";
-            *detail_name = binding->name;
+            *detail_name = binding->concept_name ? binding->concept_name : binding->name;
             return 0;
         }
         if (match_count > 1) {
@@ -2939,6 +3034,9 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
         const AstConceptDecl* owner_concept = methods.items[i].owner;
         const AstFunction* method = find_type_method_template(program, type, requirement->name);
         int j = 0;
+        if (!assoc_where_constraints_satisfied(program, &requirement->where_constraints, &assoc_bindings)) {
+            continue;
+        }
         if (!method || method->static_method_flag) {
             return 0;
         }

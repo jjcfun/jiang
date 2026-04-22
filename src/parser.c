@@ -2704,6 +2704,39 @@ static void name_list_clone(AstNameList* out, const AstNameList* in) {
     }
 }
 
+static int parse_assoc_type_binding_name(Parser* parser,
+                                         char** out_concept_name,
+                                         char** out_assoc_name,
+                                         const char* missing_name_error) {
+    char* qualified = 0;
+    char* last_dot = 0;
+    *out_concept_name = 0;
+    *out_assoc_name = 0;
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, missing_name_error);
+    }
+    qualified = parse_qualified_name(parser);
+    if (!qualified) {
+        return 0;
+    }
+    last_dot = strrchr(qualified, '.');
+    if (!last_dot) {
+        *out_assoc_name = qualified;
+        return 1;
+    }
+    *last_dot = '\0';
+    *out_concept_name = dup_text(qualified);
+    *out_assoc_name = dup_text(last_dot + 1);
+    free(qualified);
+    if (!*out_concept_name || !*out_assoc_name) {
+        return fail(parser, "out of memory");
+    }
+    if (!text_is_ident_name(*out_assoc_name)) {
+        return fail(parser, missing_name_error);
+    }
+    return 1;
+}
+
 static int nominal_decl_concept_names_add_unique(AstNameList* names, const char* concept_name) {
     int i = 0;
     if (!names) {
@@ -2765,12 +2798,10 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
                 return fail(parser, "type binding in extend requires explicit trait list");
             }
             advance(parser);
-            if (parser->current.kind != TOKEN_IDENT) {
-                return fail(parser, "expected associated type name");
-            }
-            binding.name = token_dup(&parser->current);
             binding.line = parser->current.line;
-            advance(parser);
+            if (!parse_assoc_type_binding_name(parser, &binding.concept_name, &binding.name, "expected associated type name")) {
+                return 0;
+            }
             if (!expect(parser, TOKEN_ASSIGN, "expected '=' in associated type binding")) {
                 return 0;
             }
@@ -3064,12 +3095,10 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
                 return fail(parser, "associated type binding requires declared trait implementation");
             }
             advance(parser);
-            if (parser->current.kind != TOKEN_IDENT) {
-                return fail(parser, "expected associated type name");
-            }
-            binding.name = token_dup(&parser->current);
             binding.line = parser->current.line;
-            advance(parser);
+            if (!parse_assoc_type_binding_name(parser, &binding.concept_name, &binding.name, "expected associated type name")) {
+                return 0;
+            }
             if (!expect(parser, TOKEN_ASSIGN, "expected '=' in associated type binding")) {
                 return 0;
             }

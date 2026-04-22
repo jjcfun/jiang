@@ -4,7 +4,10 @@
 #include <stdint.h>
 
 typedef struct AstType AstType;
+#ifndef JIANG_AST_EXPR_FWD_DECL
+#define JIANG_AST_EXPR_FWD_DECL
 typedef struct AstExpr AstExpr;
+#endif
 typedef struct AstStmt AstStmt;
 typedef struct AstBindingPattern AstBindingPattern;
 typedef struct AstSwitchCase AstSwitchCase;
@@ -267,7 +270,7 @@ struct AstExpr {
         struct {
             char* callee;
             AstTypeList type_args;
-            AstExprList args;
+            AstStructFieldInitList args;
         } call;
         struct {
             char* union_name;
@@ -338,7 +341,9 @@ typedef struct AstSwitchCaseList {
 
 struct AstParam {
     AstType type;
+    char* label;
     char* name;
+    AstExpr* default_value;
     int line;
 };
 
@@ -376,6 +381,7 @@ struct AstAssocTypeDeclList {
 
 struct AstAssocTypeBinding {
     AstNameList context_concept_names;
+    char* concept_name;
     char* name;
     AstType value;
     int line;

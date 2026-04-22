@@ -397,6 +397,8 @@ Int y = raw[0];
 
 `T[*]` many-pointer 支持下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
 
+除数组、slice、many-pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]` 语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
+
 当前版本里，Jiang 只约定 `*` 指针可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 指针只是临时指针，不参与释放。
 
 ```c
@@ -1171,6 +1173,27 @@ trait ByteIterator: Iterator {
 }
 ```
 
+内建的 `SubscriptGet` / `SubscriptSet` trait 可用于让用户类型支持 `value[index]` 与可选的 `value[index] = new_value`：
+
+```c
+public trait SubscriptGet {
+  type Index: Equatable;
+  type Value;
+
+  Value subscript_get(Index index);
+}
+
+public trait SubscriptSet: SubscriptGet {
+  () subscript_set(Index index, Value value);
+}
+```
+
+其中：
+
+- 读取 `value[index]` 会映射到 `subscript_get(...)`
+- 写入 `value[index] = new_value` 只有在类型显式实现 `SubscriptSet` 且实际提供 `subscript_set(...)` 时才成立
+- `Value` 是否带 `!` 不再自动推出“可写下标”；读写由 trait 显式区分
+
 此时：
 
 ### Range
@@ -1264,6 +1287,35 @@ struct Counter: Iterator {
   }
 }
 ```
+
+如果一个实现块同时涉及多个带同名关联类型的 trait，可以用限定形式消歧：
+
+```c
+trait Left {
+  type Item;
+  Item left();
+}
+
+trait Right {
+  type Item;
+  Item right();
+}
+
+struct Pair: Left, Right {
+  type Left.Item = UInt8;
+  type Right.Item = UInt8;
+
+  UInt8 left() {
+    return 20;
+  }
+
+  UInt8 right() {
+    return 22;
+  }
+}
+```
+
+如果不限定 trait 名，而同一个实现块里多个 trait 都带来同名关联类型，则会按歧义处理并报错。
 
 同样地，`extend` 中也可以绑定关联类型：
 
