@@ -1595,6 +1595,9 @@ static HirBuiltinKind builtin_kind(const char* name) {
     if (strcmp(name, "assert") == 0) return HIR_BUILTIN_ASSERT;
     if (strcmp(name, "print") == 0) return HIR_BUILTIN_PRINT;
     if (strcmp(name, "panic") == 0) return HIR_BUILTIN_PANIC;
+    if (strcmp(name, "__builtin.assert") == 0) return HIR_BUILTIN_ASSERT;
+    if (strcmp(name, "__builtin.print") == 0) return HIR_BUILTIN_PRINT;
+    if (strcmp(name, "__builtin.panic") == 0) return HIR_BUILTIN_PANIC;
     if (strcmp(name, "__slice_with_capacity") == 0) return HIR_BUILTIN_SLICE_WITH_CAPACITY;
     return HIR_BUILTIN_NONE;
 }

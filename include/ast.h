@@ -17,24 +17,16 @@ typedef struct AstConceptDecl AstConceptDecl;
 typedef struct AstParam AstParam;
 typedef struct AstConceptMethod AstConceptMethod;
 typedef struct AstConceptMethodList AstConceptMethodList;
+typedef struct AstAssocTypeDecl AstAssocTypeDecl;
+typedef struct AstAssocTypeDeclList AstAssocTypeDeclList;
+typedef struct AstAssocTypeBinding AstAssocTypeBinding;
+typedef struct AstAssocTypeBindingList AstAssocTypeBindingList;
 
 typedef enum AstCoalesceControlKind {
     AST_COALESCE_RETURN = 0,
     AST_COALESCE_BREAK,
     AST_COALESCE_CONTINUE,
 } AstCoalesceControlKind;
-
-typedef struct AstWhereConstraint {
-    char* param_name;
-    char* concept_name;
-    int line;
-} AstWhereConstraint;
-
-typedef struct AstWhereConstraintList {
-    AstWhereConstraint* items;
-    int count;
-    int capacity;
-} AstWhereConstraintList;
 
 typedef struct AstTypeList {
     AstType* items;
@@ -113,6 +105,25 @@ struct AstType {
     AstType* array_item;
     int array_length;
 };
+
+typedef enum AstWhereConstraintKind {
+    AST_WHERE_CONCEPT = 0,
+    AST_WHERE_EQUAL,
+} AstWhereConstraintKind;
+
+typedef struct AstWhereConstraint {
+    char* param_name;
+    char* concept_name;
+    AstType equal_type;
+    AstWhereConstraintKind kind;
+    int line;
+} AstWhereConstraint;
+
+typedef struct AstWhereConstraintList {
+    AstWhereConstraint* items;
+    int count;
+    int capacity;
+} AstWhereConstraintList;
 
 typedef struct AstExprList {
     AstExpr** items;
@@ -339,6 +350,7 @@ typedef struct AstParamList {
 struct AstConceptMethod {
     AstType return_type;
     char* name;
+    AstWhereConstraintList where_constraints;
     AstParamList params;
     int line;
 };
@@ -349,9 +361,36 @@ struct AstConceptMethodList {
     int capacity;
 };
 
+struct AstAssocTypeDecl {
+    char* name;
+    AstWhereConstraintList where_constraints;
+    int line;
+};
+
+struct AstAssocTypeDeclList {
+    AstAssocTypeDecl* items;
+    int count;
+    int capacity;
+};
+
+struct AstAssocTypeBinding {
+    AstNameList context_concept_names;
+    char* name;
+    AstType value;
+    int line;
+};
+
+struct AstAssocTypeBindingList {
+    AstAssocTypeBinding* items;
+    int count;
+    int capacity;
+};
+
 struct AstConceptDecl {
     char* name;
+    AstWhereConstraintList where_constraints;
     AstNameList concept_names;
+    AstAssocTypeDeclList assoc_types;
     AstConceptMethodList methods;
     int public_flag;
     int line;
@@ -450,6 +489,7 @@ typedef struct AstFunction {
 struct AstEnumDecl {
     char* name;
     AstNameList concept_names;
+    AstAssocTypeBindingList assoc_type_bindings;
     AstEnumMemberList members;
     int public_flag;
     int line;
@@ -460,6 +500,7 @@ struct AstStructDecl {
     AstNameList type_params;
     AstWhereConstraintList where_constraints;
     AstNameList concept_names;
+    AstAssocTypeBindingList assoc_type_bindings;
     AstStructFieldList fields;
     AstParamList init_params;
     AstBlock init_body;
@@ -501,6 +542,7 @@ struct AstUnionDecl {
     char* tag_name;
     char* name;
     AstNameList concept_names;
+    AstAssocTypeBindingList assoc_type_bindings;
     AstUnionVariantList variants;
     int public_flag;
     int line;

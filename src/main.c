@@ -29,6 +29,8 @@
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
 #define where_constraint_list_push(list, constraint) VEC_PUSH((list), (constraint))
 #define concept_method_list_push(list, method) VEC_PUSH((list), (method))
+#define assoc_type_decl_list_push(list, assoc_type_decl) VEC_PUSH((list), (assoc_type_decl))
+#define assoc_type_binding_list_push(list, assoc_type_binding) VEC_PUSH((list), (assoc_type_binding))
 
 static char* dup_text(const char* text) {
     size_t n = strlen(text);
@@ -793,6 +795,40 @@ static int clone_block(const AstProgram* source, const char* prefix, int hide_pr
     return 1;
 }
 
+static AstWhereConstraint clone_where_constraint(const AstProgram* source,
+                                                 const char* prefix,
+                                                 int hide_private,
+                                                 const AstWhereConstraint* constraint) {
+    AstWhereConstraint out;
+    memset(&out, 0, sizeof(out));
+    out.param_name = dup_text(constraint->param_name);
+    out.concept_name = constraint->concept_name ? dup_text(constraint->concept_name) : 0;
+    out.equal_type = clone_type(source, prefix, hide_private, &constraint->equal_type);
+    out.kind = constraint->kind;
+    out.line = constraint->line;
+    return out;
+}
+
+static void clone_where_constraint_list(const AstProgram* source,
+                                        const char* prefix,
+                                        int hide_private,
+                                        AstWhereConstraintList* out,
+                                        const AstWhereConstraintList* in) {
+    int i = 0;
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < in->count; ++i) {
+        where_constraint_list_push(out, clone_where_constraint(source, prefix, hide_private, &in->items[i]));
+    }
+}
+
+static void clone_name_list(AstNameList* out, const AstNameList* in) {
+    int i = 0;
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < in->count; ++i) {
+        name_list_push(out, dup_text(in->items[i]));
+    }
+}
+
 static AstFunction clone_function(const AstProgram* source, const char* prefix, int hide_private, const AstFunction* fn, int public_flag) {
     AstFunction out;
     int i = 0;
@@ -802,14 +838,7 @@ static AstFunction clone_function(const AstProgram* source, const char* prefix, 
     for (i = 0; i < fn->type_params.count; ++i) {
         name_list_push(&out.type_params, dup_text(fn->type_params.items[i]));
     }
-    for (i = 0; i < fn->where_constraints.count; ++i) {
-        AstWhereConstraint item;
-        memset(&item, 0, sizeof(item));
-        item.param_name = dup_text(fn->where_constraints.items[i].param_name);
-        item.concept_name = dup_text(fn->where_constraints.items[i].concept_name);
-        item.line = fn->where_constraints.items[i].line;
-        where_constraint_list_push(&out.where_constraints, item);
-    }
+    clone_where_constraint_list(source, prefix, hide_private, &out.where_constraints, &fn->where_constraints);
     out.public_flag = public_flag;
     out.struct_init_flag = fn->struct_init_flag;
     out.extern_flag = fn->extern_flag;
@@ -868,14 +897,7 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
             name_list_push(&out.concept_names, remap_type_name(source, prefix, hide_private, decl->concept_names.items[i]));
         }
     }
-    for (i = 0; i < decl->where_constraints.count; ++i) {
-        AstWhereConstraint item;
-        memset(&item, 0, sizeof(item));
-        item.param_name = dup_text(decl->where_constraints.items[i].param_name);
-        item.concept_name = dup_text(decl->where_constraints.items[i].concept_name);
-        item.line = decl->where_constraints.items[i].line;
-        where_constraint_list_push(&out.where_constraints, item);
-    }
+    clone_where_constraint_list(source, prefix, hide_private, &out.where_constraints, &decl->where_constraints);
     out.public_flag = public_flag;
     out.has_init = decl->has_init;
     out.has_deinit = decl->has_deinit;
@@ -890,6 +912,15 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         field.default_value = clone_expr(source, prefix, hide_private, decl->fields.items[i].default_value);
         field.line = decl->fields.items[i].line;
         struct_field_list_push(&out.fields, field);
+    }
+    for (i = 0; i < decl->assoc_type_bindings.count; ++i) {
+        AstAssocTypeBinding binding;
+        memset(&binding, 0, sizeof(binding));
+        clone_name_list(&binding.context_concept_names, &decl->assoc_type_bindings.items[i].context_concept_names);
+        binding.name = dup_text(decl->assoc_type_bindings.items[i].name);
+        binding.value = clone_type(source, prefix, hide_private, &decl->assoc_type_bindings.items[i].value);
+        binding.line = decl->assoc_type_bindings.items[i].line;
+        assoc_type_binding_list_push(&out.assoc_type_bindings, binding);
     }
     for (i = 0; i < decl->init_params.count; ++i) {
         AstParam param;
@@ -921,6 +952,15 @@ static AstEnumDecl clone_enum_decl(const AstProgram* source, const char* prefix,
             name_list_push(&out.concept_names, remap_type_name(source, prefix, hide_private, decl->concept_names.items[i]));
         }
     }
+    for (i = 0; i < decl->assoc_type_bindings.count; ++i) {
+        AstAssocTypeBinding binding;
+        memset(&binding, 0, sizeof(binding));
+        clone_name_list(&binding.context_concept_names, &decl->assoc_type_bindings.items[i].context_concept_names);
+        binding.name = dup_text(decl->assoc_type_bindings.items[i].name);
+        binding.value = clone_type(source, prefix, hide_private, &decl->assoc_type_bindings.items[i].value);
+        binding.line = decl->assoc_type_bindings.items[i].line;
+        assoc_type_binding_list_push(&out.assoc_type_bindings, binding);
+    }
     out.public_flag = public_flag;
     out.line = decl->line;
     for (i = 0; i < decl->members.count; ++i) {
@@ -948,6 +988,15 @@ static AstUnionDecl clone_union_decl(const AstProgram* source, const char* prefi
             name_list_push(&out.concept_names, remap_type_name(source, prefix, hide_private, decl->concept_names.items[i]));
         }
     }
+    for (i = 0; i < decl->assoc_type_bindings.count; ++i) {
+        AstAssocTypeBinding binding;
+        memset(&binding, 0, sizeof(binding));
+        clone_name_list(&binding.context_concept_names, &decl->assoc_type_bindings.items[i].context_concept_names);
+        binding.name = dup_text(decl->assoc_type_bindings.items[i].name);
+        binding.value = clone_type(source, prefix, hide_private, &decl->assoc_type_bindings.items[i].value);
+        binding.line = decl->assoc_type_bindings.items[i].line;
+        assoc_type_binding_list_push(&out.assoc_type_bindings, binding);
+    }
     out.public_flag = public_flag;
     out.line = decl->line;
     for (i = 0; i < decl->variants.count; ++i) {
@@ -972,8 +1021,17 @@ static AstConceptDecl clone_concept_decl(const AstProgram* source, const char* p
     int i = 0;
     memset(&out, 0, sizeof(out));
     out.name = remap_imported_type_decl_name(source, prefix, hide_private, decl->name);
+    clone_where_constraint_list(source, prefix, hide_private, &out.where_constraints, &decl->where_constraints);
     for (i = 0; i < decl->concept_names.count; ++i) {
         name_list_push(&out.concept_names, remap_type_name(source, prefix, hide_private, decl->concept_names.items[i]));
+    }
+    for (i = 0; i < decl->assoc_types.count; ++i) {
+        AstAssocTypeDecl assoc_type;
+        memset(&assoc_type, 0, sizeof(assoc_type));
+        assoc_type.name = dup_text(decl->assoc_types.items[i].name);
+        assoc_type.line = decl->assoc_types.items[i].line;
+        clone_where_constraint_list(source, prefix, hide_private, &assoc_type.where_constraints, &decl->assoc_types.items[i].where_constraints);
+        assoc_type_decl_list_push(&out.assoc_types, assoc_type);
     }
     for (i = 0; i < decl->methods.count; ++i) {
         AstConceptMethod method;
@@ -982,6 +1040,7 @@ static AstConceptDecl clone_concept_decl(const AstProgram* source, const char* p
         method.return_type = clone_type(source, prefix, hide_private, &decl->methods.items[i].return_type);
         method.name = dup_text(decl->methods.items[i].name);
         method.line = decl->methods.items[i].line;
+        clone_where_constraint_list(source, prefix, hide_private, &method.where_constraints, &decl->methods.items[i].where_constraints);
         for (j = 0; j < decl->methods.items[i].params.count; ++j) {
             AstParam param;
             memset(&param, 0, sizeof(param));
@@ -1619,6 +1678,34 @@ typedef struct ConceptMethodRefList {
 
 #define concept_method_ref_list_push(list, item) VEC_PUSH((list), (item))
 
+typedef struct ConceptAssocTypeRef {
+    const char* name;
+    const AstConceptDecl* declared_by;
+    AstWhereConstraintList where_constraints;
+} ConceptAssocTypeRef;
+
+typedef struct ConceptAssocTypeRefList {
+    ConceptAssocTypeRef* items;
+    int count;
+    int capacity;
+} ConceptAssocTypeRefList;
+
+#define concept_assoc_type_ref_list_push(list, item) VEC_PUSH((list), (item))
+
+typedef struct ResolvedAssocTypeBinding {
+    const char* name;
+    const AstType* value;
+    int line;
+} ResolvedAssocTypeBinding;
+
+typedef struct ResolvedAssocTypeBindingList {
+    ResolvedAssocTypeBinding* items;
+    int count;
+    int capacity;
+} ResolvedAssocTypeBindingList;
+
+#define resolved_assoc_type_binding_list_push(list, item) VEC_PUSH((list), (item))
+
 static int concept_method_signature_equal(const AstConceptMethod* a, const AstConceptMethod* b) {
     int i = 0;
     if (!ast_type_is_equal(&a->return_type, &b->return_type)) {
@@ -1635,11 +1722,88 @@ static int concept_method_signature_equal(const AstConceptMethod* a, const AstCo
     return 1;
 }
 
+static int where_constraint_equal(const AstWhereConstraint* a, const AstWhereConstraint* b) {
+    if (a->kind != b->kind) {
+        return 0;
+    }
+    if (strcmp(a->param_name, b->param_name) != 0) {
+        return 0;
+    }
+    if (a->kind == AST_WHERE_CONCEPT) {
+        return strcmp(a->concept_name, b->concept_name) == 0;
+    }
+    return ast_type_is_equal(&a->equal_type, &b->equal_type);
+}
+
+static void add_unique_where_constraint(AstWhereConstraintList* list, const AstWhereConstraint* item) {
+    AstWhereConstraint copy;
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        if (where_constraint_equal(&list->items[i], item)) {
+            return;
+        }
+    }
+    memset(&copy, 0, sizeof(copy));
+    copy.param_name = dup_text(item->param_name);
+    copy.concept_name = item->concept_name ? dup_text(item->concept_name) : 0;
+    copy.equal_type = ast_type_copy(&item->equal_type);
+    copy.kind = item->kind;
+    copy.line = item->line;
+    where_constraint_list_push(list, copy);
+}
+
 static ConceptMethodRef* find_concept_method_ref(ConceptMethodRefList* list, const char* name) {
     int i = 0;
     for (i = 0; i < list->count; ++i) {
         if (strcmp(list->items[i].method->name, name) == 0) {
             return &list->items[i];
+        }
+    }
+    return 0;
+}
+
+static ConceptAssocTypeRef* find_concept_assoc_type_ref(ConceptAssocTypeRefList* list, const char* name) {
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i].name, name) == 0) {
+            return &list->items[i];
+        }
+    }
+    return 0;
+}
+
+static const AstAssocTypeBinding* find_nominal_assoc_type_binding(AstNominalDeclRef nominal, int index) {
+    switch (nominal.kind) {
+        case AST_NOMINAL_STRUCT:
+            return &((const AstStructDecl*)nominal.decl)->assoc_type_bindings.items[index];
+        case AST_NOMINAL_ENUM:
+            return &((const AstEnumDecl*)nominal.decl)->assoc_type_bindings.items[index];
+        case AST_NOMINAL_UNION:
+            return &((const AstUnionDecl*)nominal.decl)->assoc_type_bindings.items[index];
+        default:
+            return 0;
+    }
+}
+
+static int nominal_assoc_type_binding_count(AstNominalDeclRef nominal) {
+    switch (nominal.kind) {
+        case AST_NOMINAL_STRUCT:
+            return ((const AstStructDecl*)nominal.decl)->assoc_type_bindings.count;
+        case AST_NOMINAL_ENUM:
+            return ((const AstEnumDecl*)nominal.decl)->assoc_type_bindings.count;
+        case AST_NOMINAL_UNION:
+            return ((const AstUnionDecl*)nominal.decl)->assoc_type_bindings.count;
+        default:
+            return 0;
+    }
+}
+
+static const AstType* lookup_resolved_assoc_type_binding(const ResolvedAssocTypeBindingList* bindings,
+                                                         const char* assoc_name) {
+    int i = 0;
+    for (i = 0; i < bindings->count; ++i) {
+        if (strcmp(bindings->items[i].name, assoc_name) == 0) {
+            return bindings->items[i].value;
         }
     }
     return 0;
@@ -1692,6 +1856,122 @@ static int collect_concept_method_names(const AstProgram* program,
             item.method = &concept->methods.items[i];
             item.owner = concept;
             concept_method_ref_list_push(methods, item);
+        }
+    }
+    active_concepts->count -= 1;
+    return 1;
+}
+
+static int merge_assoc_where_constraints(ConceptAssocTypeRef* assoc_type,
+                                         const AstWhereConstraintList* constraints,
+                                         const char** error,
+                                         char** name_detail) {
+    int i = 0;
+    for (i = 0; i < constraints->count; ++i) {
+        const AstWhereConstraint* item = &constraints->items[i];
+        int j = 0;
+        if (strcmp(item->param_name, assoc_type->name) != 0) {
+            continue;
+        }
+        if (item->kind == AST_WHERE_EQUAL) {
+            for (j = 0; j < assoc_type->where_constraints.count; ++j) {
+                if (assoc_type->where_constraints.items[j].kind == AST_WHERE_EQUAL &&
+                    !ast_type_is_equal(&assoc_type->where_constraints.items[j].equal_type, &item->equal_type)) {
+                    *error = "associated type conflict";
+                    *name_detail = (char*)assoc_type->name;
+                    return 0;
+                }
+            }
+        }
+        add_unique_where_constraint(&assoc_type->where_constraints, item);
+    }
+    return 1;
+}
+
+static int collect_concept_assoc_types(const AstProgram* program,
+                                       const AstConceptDecl* concept,
+                                       AstNameList* seen_concepts,
+                                       AstNameList* active_concepts,
+                                       ConceptAssocTypeRefList* assoc_types,
+                                       const char** error,
+                                       char** name_detail) {
+    int i = 0;
+    if (!concept) {
+        return 1;
+    }
+    if (ast_name_list_contains(active_concepts, concept->name)) {
+        *error = "cyclic trait inheritance";
+        *name_detail = concept->name;
+        return 0;
+    }
+    if (ast_name_list_contains(seen_concepts, concept->name)) {
+        return 1;
+    }
+    name_list_push(active_concepts, concept->name);
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        const AstConceptDecl* parent = find_ast_concept(program, concept->concept_names.items[i]);
+        if (!parent) {
+            *error = "unknown parent trait";
+            *name_detail = concept->concept_names.items[i];
+            return 0;
+        }
+        if (!collect_concept_assoc_types(program, parent, seen_concepts, active_concepts, assoc_types, error, name_detail)) {
+            return 0;
+        }
+    }
+    name_list_push(seen_concepts, concept->name);
+    for (i = 0; i < concept->assoc_types.count; ++i) {
+        ConceptAssocTypeRef* existing = find_concept_assoc_type_ref(assoc_types, concept->assoc_types.items[i].name);
+        if (existing) {
+            if (existing->declared_by == concept) {
+                *error = "duplicate associated type";
+                *name_detail = concept->assoc_types.items[i].name;
+                return 0;
+            }
+            if (!merge_assoc_where_constraints(existing, &concept->assoc_types.items[i].where_constraints, error, name_detail)) {
+                return 0;
+            }
+            continue;
+        }
+        {
+            ConceptAssocTypeRef item;
+            memset(&item, 0, sizeof(item));
+            item.name = concept->assoc_types.items[i].name;
+            item.declared_by = concept;
+            if (!merge_assoc_where_constraints(&item, &concept->assoc_types.items[i].where_constraints, error, name_detail)) {
+                return 0;
+            }
+            concept_assoc_type_ref_list_push(assoc_types, item);
+        }
+    }
+    for (i = 0; i < concept->where_constraints.count; ++i) {
+        ConceptAssocTypeRef* existing = find_concept_assoc_type_ref(assoc_types, concept->where_constraints.items[i].param_name);
+        if (!existing) {
+            *error = "unknown associated type in @where";
+            *name_detail = concept->where_constraints.items[i].param_name;
+            return 0;
+        }
+        if (!merge_assoc_where_constraints(existing, &concept->where_constraints, error, name_detail)) {
+            return 0;
+        }
+    }
+    for (i = 0; i < concept->methods.count; ++i) {
+        int j = 0;
+        for (j = 0; j < concept->methods.items[i].where_constraints.count; ++j) {
+            ConceptAssocTypeRef* existing = find_concept_assoc_type_ref(assoc_types, concept->methods.items[i].where_constraints.items[j].param_name);
+            if (!existing) {
+                *error = "unknown associated type in @where";
+                *name_detail = concept->methods.items[i].where_constraints.items[j].param_name;
+                return 0;
+            }
+        }
+        if (concept->methods.items[i].where_constraints.count != 0) {
+            int k = 0;
+            for (k = 0; k < assoc_types->count; ++k) {
+                if (!merge_assoc_where_constraints(&assoc_types->items[k], &concept->methods.items[i].where_constraints, error, name_detail)) {
+                    return 0;
+                }
+            }
         }
     }
     active_concepts->count -= 1;
@@ -2337,6 +2617,12 @@ static int ast_type_has_builtin_concept(const AstProgram* program, const AstType
     return (ast_type_builtin_capabilities(program, type) & required) != 0;
 }
 
+static int concept_name_is_or_inherits(const AstProgram* program,
+                                       const char* actual_name,
+                                       const char* target_name,
+                                       AstNameList* seen_concepts);
+static int ast_type_satisfies_concept(const AstProgram* program, const AstType* type, const char* concept_name);
+
 static AstType substitute_self_type(const AstType* type, const AstType* self_type) {
     AstType out;
     int i = 0;
@@ -2367,24 +2653,187 @@ static AstType substitute_self_type(const AstType* type, const AstType* self_typ
     return out;
 }
 
+static AstType substitute_contract_type(const AstType* type,
+                                        const AstType* self_type,
+                                        const ResolvedAssocTypeBindingList* assoc_bindings) {
+    const AstType* assoc_binding = 0;
+    AstType out;
+    int i = 0;
+    if (type->kind == AST_TYPE_NAMED && type->named_name && strcmp(type->named_name, "Self") == 0 && type->type_args.count == 0) {
+        AstType copied = ast_type_copy(self_type);
+        if (type->mutable_flag) {
+            copied.mutable_flag = 1;
+        }
+        return copied;
+    }
+    assoc_binding = lookup_resolved_assoc_type_binding(assoc_bindings, type->named_name ? type->named_name : "");
+    if (type->kind == AST_TYPE_NAMED && assoc_binding && type->type_args.count == 0) {
+        AstType copied = ast_type_copy(assoc_binding);
+        if (type->mutable_flag) {
+            copied.mutable_flag = 1;
+        }
+        return copied;
+    }
+    memset(&out, 0, sizeof(out));
+    out.kind = type->kind;
+    out.mutable_flag = type->mutable_flag;
+    out.array_length = type->array_length;
+    if (type->named_name) {
+        out.named_name = dup_text(type->named_name);
+    }
+    for (i = 0; i < type->type_args.count; ++i) {
+        type_list_push(&out.type_args, substitute_contract_type(&type->type_args.items[i], self_type, assoc_bindings));
+    }
+    if (type->array_item) {
+        out.array_item = (AstType*)malloc(sizeof(AstType));
+        *out.array_item = substitute_contract_type(type->array_item, self_type, assoc_bindings);
+    }
+    for (i = 0; i < type->tuple_items.count; ++i) {
+        type_list_push(&out.tuple_items, substitute_contract_type(&type->tuple_items.items[i], self_type, assoc_bindings));
+    }
+    return out;
+}
+
+static int resolve_nominal_assoc_type_bindings(const AstProgram* program,
+                                               AstNominalDeclRef nominal,
+                                               const AstConceptDecl* target_concept,
+                                               const ConceptAssocTypeRefList* assoc_types,
+                                               ResolvedAssocTypeBindingList* out,
+                                               const char** error,
+                                               char** detail_name) {
+    int i = 0;
+    for (i = 0; i < nominal_assoc_type_binding_count(nominal); ++i) {
+        const AstAssocTypeBinding* binding = find_nominal_assoc_type_binding(nominal, i);
+        AstNameList seen_concepts;
+        int j = 0;
+        int match_count = 0;
+        const char* matched_concept_name = 0;
+        if (!find_concept_assoc_type_ref((ConceptAssocTypeRefList*)assoc_types, binding->name)) {
+            continue;
+        }
+        memset(&seen_concepts, 0, sizeof(seen_concepts));
+        for (j = 0; j < binding->context_concept_names.count; ++j) {
+            const AstConceptDecl* context_concept = find_ast_concept(program, binding->context_concept_names.items[j]);
+            ConceptAssocTypeRefList context_assoc_types;
+            AstNameList seen_assoc;
+            AstNameList active_assoc;
+            memset(&context_assoc_types, 0, sizeof(context_assoc_types));
+            memset(&seen_assoc, 0, sizeof(seen_assoc));
+            memset(&active_assoc, 0, sizeof(active_assoc));
+            if (!context_concept) {
+                continue;
+            }
+            if (!collect_concept_assoc_types(program, context_concept, &seen_assoc, &active_assoc, &context_assoc_types, error, detail_name)) {
+                return 0;
+            }
+            if (find_concept_assoc_type_ref(&context_assoc_types, binding->name)) {
+                match_count += 1;
+                matched_concept_name = context_concept->name;
+            }
+        }
+        if (match_count == 0) {
+            *error = "unknown associated type binding";
+            *detail_name = binding->name;
+            return 0;
+        }
+        if (match_count > 1) {
+            *error = "associated type binding is ambiguous";
+            *detail_name = binding->name;
+            return 0;
+        }
+        if (!concept_name_is_or_inherits(program, matched_concept_name, target_concept->name, &seen_concepts)) {
+            continue;
+        }
+        for (j = 0; j < out->count; ++j) {
+            if (strcmp(out->items[j].name, binding->name) == 0) {
+                *error = "duplicate associated type binding";
+                *detail_name = binding->name;
+                return 0;
+            }
+        }
+        {
+            ResolvedAssocTypeBinding item;
+            memset(&item, 0, sizeof(item));
+            item.name = binding->name;
+            item.value = &binding->value;
+            item.line = binding->line;
+            resolved_assoc_type_binding_list_push(out, item);
+        }
+    }
+    return 1;
+}
+
+static int validate_nominal_assoc_type_bindings(const AstProgram* program,
+                                                AstNominalDeclRef nominal,
+                                                const char** error,
+                                                char** detail_name) {
+    int i = 0;
+    for (i = 0; i < nominal_assoc_type_binding_count(nominal); ++i) {
+        const AstAssocTypeBinding* binding = find_nominal_assoc_type_binding(nominal, i);
+        int j = 0;
+        int match_count = 0;
+        for (j = 0; j < binding->context_concept_names.count; ++j) {
+            const AstConceptDecl* context_concept = find_ast_concept(program, binding->context_concept_names.items[j]);
+            ConceptAssocTypeRefList context_assoc_types;
+            AstNameList seen_assoc;
+            AstNameList active_assoc;
+            memset(&context_assoc_types, 0, sizeof(context_assoc_types));
+            memset(&seen_assoc, 0, sizeof(seen_assoc));
+            memset(&active_assoc, 0, sizeof(active_assoc));
+            if (!context_concept) {
+                continue;
+            }
+            if (!collect_concept_assoc_types(program, context_concept, &seen_assoc, &active_assoc, &context_assoc_types, error, detail_name)) {
+                return 0;
+            }
+            if (find_concept_assoc_type_ref(&context_assoc_types, binding->name)) {
+                match_count += 1;
+            }
+        }
+        if (match_count == 0) {
+            *error = "unknown associated type binding";
+            *detail_name = binding->name;
+            return 0;
+        }
+        if (match_count > 1) {
+            *error = "associated type binding is ambiguous";
+            *detail_name = binding->name;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int type_has_concept_methods(const AstProgram* program, const AstType* type, const AstConceptDecl* concept) {
     int i = 0;
     AstTypeQueryRef query = describe_ast_type(program, type);
     AstNameList seen_concepts;
     AstNameList active_concepts;
     ConceptMethodRefList methods;
+    ConceptAssocTypeRefList assoc_types;
+    ResolvedAssocTypeBindingList assoc_bindings;
     const char* collect_error = 0;
     char* detail_name = 0;
     memset(&seen_concepts, 0, sizeof(seen_concepts));
     memset(&active_concepts, 0, sizeof(active_concepts));
     memset(&methods, 0, sizeof(methods));
+    memset(&assoc_types, 0, sizeof(assoc_types));
+    memset(&assoc_bindings, 0, sizeof(assoc_bindings));
+    if (!collect_concept_assoc_types(program, concept, &seen_concepts, &active_concepts, &assoc_types, &collect_error, &detail_name)) {
+        return 0;
+    }
+    memset(&seen_concepts, 0, sizeof(seen_concepts));
+    memset(&active_concepts, 0, sizeof(active_concepts));
     if (!collect_concept_method_names(program, concept, &seen_concepts, &active_concepts, &methods, &collect_error, &detail_name)) {
         return 0;
     }
     if (query.kind != AST_TYPE_QUERY_NOMINAL) {
-        return methods.count == 0;
+        return methods.count == 0 && assoc_types.count == 0;
     }
     if (query.nominal.kind == AST_NOMINAL_BUILTIN) {
+        if (assoc_types.count != 0) {
+            return 0;
+        }
         const AstBuiltinNominalDecl* builtin = (const AstBuiltinNominalDecl*)query.nominal.decl;
         for (i = 0; i < methods.count; ++i) {
             const AstConceptMethod* method = methods.items[i].method;
@@ -2442,6 +2891,26 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
         }
         return 1;
     }
+    if (!resolve_nominal_assoc_type_bindings(program, query.nominal, concept, &assoc_types, &assoc_bindings, &collect_error, &detail_name)) {
+        return 0;
+    }
+    for (i = 0; i < assoc_types.count; ++i) {
+        const AstType* assoc_value = lookup_resolved_assoc_type_binding(&assoc_bindings, assoc_types.items[i].name);
+        int j = 0;
+        if (!assoc_value) {
+            return 0;
+        }
+        for (j = 0; j < assoc_types.items[i].where_constraints.count; ++j) {
+            const AstWhereConstraint* constraint = &assoc_types.items[i].where_constraints.items[j];
+            if (constraint->kind == AST_WHERE_CONCEPT) {
+                if (!ast_type_satisfies_concept(program, assoc_value, constraint->concept_name)) {
+                    return 0;
+                }
+            } else if (!ast_type_is_equal(assoc_value, &constraint->equal_type)) {
+                return 0;
+            }
+        }
+    }
     for (i = 0; i < methods.count; ++i) {
         const AstConceptMethod* requirement = methods.items[i].method;
         const AstConceptDecl* owner_concept = methods.items[i].owner;
@@ -2454,7 +2923,7 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
             return 0;
         }
         {
-            AstType expected_return = substitute_self_type(&requirement->return_type, type);
+            AstType expected_return = substitute_contract_type(&requirement->return_type, type, &assoc_bindings);
             if (!ast_type_is_equal(&method->return_type, &expected_return)) {
                 return 0;
             }
@@ -2463,7 +2932,7 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
             return 0;
         }
         for (j = 0; j < method->params.count; ++j) {
-            AstType expected_param = substitute_self_type(&requirement->params.items[j].type, type);
+            AstType expected_param = substitute_contract_type(&requirement->params.items[j].type, type, &assoc_bindings);
             if (!ast_type_is_equal(&method->params.items[j].type, &expected_param)) {
                 return 0;
             }
@@ -2644,6 +3113,10 @@ static int type_param_exists(const AstNameList* params, const char* name) {
     return 0;
 }
 
+static int concept_assoc_type_exists(const ConceptAssocTypeRefList* assoc_types, const char* name) {
+    return find_concept_assoc_type_ref((ConceptAssocTypeRefList*)assoc_types, name) != 0;
+}
+
 static int function_type_param_exists(const AstProgram* program, const AstFunction* fn, const char* name) {
     if (type_param_exists(&fn->type_params, name)) {
         return 1;
@@ -2666,6 +3139,9 @@ typedef enum GenericMutabilityPolicy {
 static GenericMutabilityPolicy generic_mutability_policy(const AstWhereConstraintList* where_constraints, const char* param_name) {
     int i = 0;
     for (i = 0; i < where_constraints->count; ++i) {
+        if (where_constraints->items[i].kind != AST_WHERE_CONCEPT) {
+            continue;
+        }
         if (strcmp(where_constraints->items[i].param_name, param_name) != 0) {
             continue;
         }
@@ -2710,9 +3186,15 @@ static int validate_where_constraints_program(const AstProgram* program, const c
     AstType self_type;
     for (i = 0; i < program->concepts.count; ++i) {
         AstNameList concept_names;
+        AstNameList seen_assoc_concepts;
+        AstNameList active_assoc_concepts;
+        ConceptAssocTypeRefList assoc_types;
         const char* collect_error = 0;
         char* detail_name = 0;
         memset(&concept_names, 0, sizeof(concept_names));
+        memset(&seen_assoc_concepts, 0, sizeof(seen_assoc_concepts));
+        memset(&active_assoc_concepts, 0, sizeof(active_assoc_concepts));
+        memset(&assoc_types, 0, sizeof(assoc_types));
         name_list_push(&concept_names, program->concepts.items[i].name);
         if (!nominal_concepts_have_unique_method_names(program, &concept_names, &collect_error, &detail_name)) {
             if (strcmp(collect_error, "unknown parent trait") == 0) {
@@ -2724,6 +3206,94 @@ static int validate_where_constraints_program(const AstProgram* program, const c
             }
             *error = where_error;
             return 0;
+        }
+        if (!collect_concept_assoc_types(program, &program->concepts.items[i], &seen_assoc_concepts, &active_assoc_concepts, &assoc_types, &collect_error, &detail_name)) {
+            if (strcmp(collect_error, "unknown parent trait") == 0) {
+                snprintf(where_error, sizeof(where_error), "unknown parent trait: %s", detail_name);
+            } else if (strcmp(collect_error, "cyclic trait inheritance") == 0) {
+                snprintf(where_error, sizeof(where_error), "cyclic trait inheritance: %s", detail_name);
+            } else if (strcmp(collect_error, "duplicate associated type") == 0) {
+                snprintf(where_error, sizeof(where_error), "duplicate associated type: %s", detail_name);
+            } else if (strcmp(collect_error, "unknown associated type in @where") == 0) {
+                snprintf(where_error, sizeof(where_error), "unknown associated type in @where: %s", detail_name);
+            } else {
+                snprintf(where_error, sizeof(where_error), "associated type conflict: %s", detail_name);
+            }
+            *error = where_error;
+            return 0;
+        }
+        {
+            int local_assoc_index = 0;
+            for (local_assoc_index = 0; local_assoc_index < program->concepts.items[i].assoc_types.count; ++local_assoc_index) {
+                int parent_index = 0;
+                for (parent_index = 0; parent_index < program->concepts.items[i].concept_names.count; ++parent_index) {
+                    const AstConceptDecl* parent = find_ast_concept(program, program->concepts.items[i].concept_names.items[parent_index]);
+                    AstNameList parent_seen;
+                    AstNameList parent_active;
+                    ConceptAssocTypeRefList parent_assoc_types;
+                    memset(&parent_seen, 0, sizeof(parent_seen));
+                    memset(&parent_active, 0, sizeof(parent_active));
+                    memset(&parent_assoc_types, 0, sizeof(parent_assoc_types));
+                    if (!parent) {
+                        continue;
+                    }
+                    if (!collect_concept_assoc_types(program, parent, &parent_seen, &parent_active, &parent_assoc_types, &collect_error, &detail_name)) {
+                        snprintf(where_error, sizeof(where_error), "duplicate associated type: %s", program->concepts.items[i].assoc_types.items[local_assoc_index].name);
+                        *error = where_error;
+                        return 0;
+                    }
+                    if (find_concept_assoc_type_ref(&parent_assoc_types, program->concepts.items[i].assoc_types.items[local_assoc_index].name)) {
+                        snprintf(where_error, sizeof(where_error), "duplicate associated type: %s", program->concepts.items[i].assoc_types.items[local_assoc_index].name);
+                        *error = where_error;
+                        return 0;
+                    }
+                }
+            }
+        }
+        for (j = 0; j < program->concepts.items[i].where_constraints.count; ++j) {
+            AstWhereConstraint* item = &program->concepts.items[i].where_constraints.items[j];
+            if (!concept_assoc_type_exists(&assoc_types, item->param_name)) {
+                snprintf(where_error, sizeof(where_error), "unknown associated type in @where: %s", item->param_name);
+                *error = where_error;
+                return 0;
+            }
+            if (item->kind == AST_WHERE_CONCEPT && !concept_exists(program, item->concept_name)) {
+                snprintf(where_error, sizeof(where_error), "unknown trait in @where: %s", item->concept_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+        for (j = 0; j < program->concepts.items[i].assoc_types.count; ++j) {
+            int k = 0;
+            for (k = 0; k < program->concepts.items[i].assoc_types.items[j].where_constraints.count; ++k) {
+                AstWhereConstraint* item = &program->concepts.items[i].assoc_types.items[j].where_constraints.items[k];
+                if (!concept_assoc_type_exists(&assoc_types, item->param_name)) {
+                    snprintf(where_error, sizeof(where_error), "unknown associated type in @where: %s", item->param_name);
+                    *error = where_error;
+                    return 0;
+                }
+                if (item->kind == AST_WHERE_CONCEPT && !concept_exists(program, item->concept_name)) {
+                    snprintf(where_error, sizeof(where_error), "unknown trait in @where: %s", item->concept_name);
+                    *error = where_error;
+                    return 0;
+                }
+            }
+        }
+        for (j = 0; j < program->concepts.items[i].methods.count; ++j) {
+            int k = 0;
+            for (k = 0; k < program->concepts.items[i].methods.items[j].where_constraints.count; ++k) {
+                AstWhereConstraint* item = &program->concepts.items[i].methods.items[j].where_constraints.items[k];
+                if (!concept_assoc_type_exists(&assoc_types, item->param_name)) {
+                    snprintf(where_error, sizeof(where_error), "unknown associated type in @where: %s", item->param_name);
+                    *error = where_error;
+                    return 0;
+                }
+                if (item->kind == AST_WHERE_CONCEPT && !concept_exists(program, item->concept_name)) {
+                    snprintf(where_error, sizeof(where_error), "unknown trait in @where: %s", item->concept_name);
+                    *error = where_error;
+                    return 0;
+                }
+            }
         }
     }
     for (i = 0; i < program->structs.count; ++i) {
@@ -2754,6 +3324,16 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 return 0;
             }
         }
+        {
+            AstNominalDeclRef nominal = find_ast_nominal_decl(program, program->structs.items[i].name);
+            const char* binding_error = 0;
+            char* detail_name = 0;
+            if (!validate_nominal_assoc_type_bindings(program, nominal, &binding_error, &detail_name)) {
+                snprintf(where_error, sizeof(where_error), "%s: %s", binding_error, detail_name);
+                *error = where_error;
+                return 0;
+            }
+        }
         for (j = 0; j < program->structs.items[i].concept_names.count; ++j) {
             const char* concept_name = program->structs.items[i].concept_names.items[j];
             if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
@@ -2767,7 +3347,7 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 *error = "@where parameter is not a generic parameter";
                 return 0;
             }
-            if (!concept_exists(program, item->concept_name)) {
+            if (item->kind == AST_WHERE_CONCEPT && !concept_exists(program, item->concept_name)) {
                 snprintf(where_error, sizeof(where_error), "unknown trait in @where: %s", item->concept_name);
                 *error = where_error;
                 return 0;
@@ -2791,6 +3371,16 @@ static int validate_where_constraints_program(const AstProgram* program, const c
             char* detail_name = 0;
             if (!nominal_concepts_have_unique_method_names(program, &program->enums.items[i].concept_names, &collect_error, &detail_name)) {
                 snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
+                *error = where_error;
+                return 0;
+            }
+        }
+        {
+            AstNominalDeclRef nominal = find_ast_nominal_decl(program, program->enums.items[i].name);
+            const char* binding_error = 0;
+            char* detail_name = 0;
+            if (!validate_nominal_assoc_type_bindings(program, nominal, &binding_error, &detail_name)) {
+                snprintf(where_error, sizeof(where_error), "%s: %s", binding_error, detail_name);
                 *error = where_error;
                 return 0;
             }
@@ -2824,6 +3414,16 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 return 0;
             }
         }
+        {
+            AstNominalDeclRef nominal = find_ast_nominal_decl(program, program->unions.items[i].name);
+            const char* binding_error = 0;
+            char* detail_name = 0;
+            if (!validate_nominal_assoc_type_bindings(program, nominal, &binding_error, &detail_name)) {
+                snprintf(where_error, sizeof(where_error), "%s: %s", binding_error, detail_name);
+                *error = where_error;
+                return 0;
+            }
+        }
         for (j = 0; j < program->unions.items[i].concept_names.count; ++j) {
             const char* concept_name = program->unions.items[i].concept_names.items[j];
             if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
@@ -2839,7 +3439,7 @@ static int validate_where_constraints_program(const AstProgram* program, const c
                 *error = "@where parameter is not a generic parameter";
                 return 0;
             }
-            if (!concept_exists(program, item->concept_name)) {
+            if (item->kind == AST_WHERE_CONCEPT && !concept_exists(program, item->concept_name)) {
                 snprintf(where_error, sizeof(where_error), "unknown trait in @where: %s", item->concept_name);
                 *error = where_error;
                 return 0;
@@ -2860,8 +3460,13 @@ static int check_where_constraints(const AstProgram* program,
             *error = "missing generic substitution for @where";
             return 0;
         }
-        if (!ast_type_satisfies_concept(program, actual, where_constraints->items[i].concept_name)) {
-            *error = "generic type does not satisfy trait";
+        if (where_constraints->items[i].kind == AST_WHERE_CONCEPT) {
+            if (!ast_type_satisfies_concept(program, actual, where_constraints->items[i].concept_name)) {
+                *error = "generic type does not satisfy trait";
+                return 0;
+            }
+        } else if (!ast_type_is_equal(actual, &where_constraints->items[i].equal_type)) {
+            *error = "generic type does not satisfy type equality";
             return 0;
         }
     }

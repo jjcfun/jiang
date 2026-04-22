@@ -43,7 +43,7 @@ run_sample_nonzero() {
   local ir="$BUILD_DIR/${sample%.jiang}.ll"
   "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
   set +e
-  "$LLI" "$ir" >/dev/null 2>&1
+  /bin/sh -c '"$1" "$2" >/dev/null 2>&1' sh "$LLI" "$ir" >/dev/null 2>&1
   local status=$?
   set -e
   if [[ "$status" -eq 0 ]]; then
@@ -55,7 +55,7 @@ run_sample_nonzero() {
 run_compile_fail() {
   local sample="$1"
   set +e
-  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" >/dev/null 2>&1
+  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/jiangc" "$SAMPLES_DIR/$sample" >/dev/null 2>&1
   local status=$?
   set -e
   if [[ "$status" -eq 0 ]]; then
@@ -129,6 +129,14 @@ run_compile_fail invalid_trait_unknown_parent.jiang
 run_compile_fail invalid_trait_inherit_cycle.jiang
 run_compile_fail invalid_trait_inherit_conflict.jiang
 run_compile_fail invalid_trait_missing_inherited_method.jiang
+run_compile_fail invalid_trait_assoc_duplicate_decl.jiang
+run_compile_fail invalid_trait_assoc_redeclare_parent.jiang
+run_compile_fail invalid_trait_assoc_missing_binding.jiang
+run_compile_fail invalid_trait_assoc_duplicate_binding.jiang
+run_compile_fail invalid_trait_assoc_bound_violation.jiang
+run_compile_fail invalid_trait_assoc_unknown_where.jiang
+run_compile_fail invalid_trait_assoc_conflict.jiang
+run_compile_fail invalid_trait_assoc_ambiguous_binding.jiang
 run_compile_fail invalid_trait_same_method_name_struct_impl.jiang
 run_compile_fail invalid_trait_same_method_name_extend_impl.jiang
 run_sample mutable_qualifier_minimal.jiang 42
@@ -170,11 +178,17 @@ run_sample generic_func_call_minimal.jiang 42
 run_sample generic_func_infer_minimal.jiang 42
 run_sample concept_generic_minimal.jiang 42
 run_sample concept_method_minimal.jiang 42
+run_sample where_amp_minimal.jiang 42
 run_sample trait_inherit_minimal.jiang 42
 run_sample trait_inherit_where_minimal.jiang 42
 run_sample trait_multi_inherit_minimal.jiang 41
 run_sample trait_diamond_inherit_minimal.jiang 42
+run_sample trait_assoc_type_minimal.jiang 42
+run_sample trait_assoc_type_bound_minimal.jiang 42
+run_sample trait_assoc_type_inherit_minimal.jiang 42
+run_sample trait_assoc_type_where_minimal.jiang 42
 run_sample extend_trait_inherit_minimal.jiang 63
+run_sample extend_trait_assoc_type_minimal.jiang 42
 run_sample builtin_concept_method_minimal.jiang 17
 run_sample enum_concept_decl_minimal.jiang 42
 run_compile_only extern_minimal.jiang
@@ -189,6 +203,8 @@ run_compile_only std_ffi_cstring_extern_minimal.jiang
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
+run_sample mutable_generic_minimal.jiang 42
+run_sample maybe_mutable_generic_minimal.jiang 42
 run_sample hash_map_minimal.jiang 20
 run_sample hash_map_collision_minimal.jiang 30
 run_sample hash_map_remove_minimal.jiang 24
@@ -341,6 +357,8 @@ run_compile_fail invalid_double_to_float_assign_minimal.jiang
 run_compile_fail invalid_float_to_int_assign_minimal.jiang
 run_compile_fail invalid_as_target_mutable_type.jiang
 run_compile_fail invalid_as_target_mutable_type_from_mutable_source.jiang
+run_compile_fail invalid_generic_mutable_type_arg.jiang
+run_compile_fail invalid_mutable_generic_requires_mutable.jiang
 run_compile_fail invalid_uint8_double_add_minimal.jiang
 run_compile_fail invalid_index_target.jiang
 run_compile_fail invalid_index_type.jiang

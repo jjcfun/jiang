@@ -135,6 +135,16 @@ static char* dup_join3(const char* left, const char* middle, const char* right) 
     return text;
 }
 
+static char* dup_text(const char* text) {
+    size_t n = strlen(text);
+    char* out = (char*)malloc(n + 1);
+    if (!out) {
+        return 0;
+    }
+    memcpy(out, text, n + 1);
+    return out;
+}
+
 static int token_equals(const Token* token, const char* text) {
     size_t n = strlen(text);
     return token->length == n && strncmp(token->start, text, n) == 0;
@@ -155,6 +165,8 @@ static int token_equals(const Token* token, const char* text) {
 #define alias_list_push(list, alias_decl) VEC_PUSH((list), (alias_decl))
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
 #define concept_method_list_push(list, method) VEC_PUSH((list), (method))
+#define assoc_type_decl_list_push(list, assoc_type_decl) VEC_PUSH((list), (assoc_type_decl))
+#define assoc_type_binding_list_push(list, assoc_type_binding) VEC_PUSH((list), (assoc_type_binding))
 #define where_constraint_list_push(list, constraint) VEC_PUSH((list), (constraint))
 #define struct_list_push(list, struct_decl) VEC_PUSH((list), (struct_decl))
 
@@ -196,6 +208,22 @@ static AstType* heap_type_copy(const AstType* type) {
 
 static void register_known_type(Parser* parser, const char* name) {
     hashmap_set(&parser->known_types, name, (void*)1);
+}
+
+static int ast_name_list_contains_text(const AstNameList* list, const char* name) {
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void push_scoped_type_name(Parser* parser, char* name) {
+    if (!ast_name_list_contains_text(&parser->scoped_type_names, name)) {
+        name_list_push(&parser->scoped_type_names, name);
+    }
 }
 
 static void advance(Parser* parser);
@@ -304,6 +332,42 @@ static int parse_named_generic_params(Parser* parser, AstNameList* out) {
     return expect(parser, TOKEN_GT, "expected '>' after generic parameters");
 }
 
+static const AstConceptDecl* find_parsed_concept(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->concepts.count; ++i) {
+        if (strcmp(program->concepts.items[i].name, name) == 0) {
+            return &program->concepts.items[i];
+        }
+    }
+    return 0;
+}
+
+static int push_concept_visible_assoc_names(Parser* parser,
+                                            const AstProgram* program,
+                                            const AstConceptDecl* concept,
+                                            AstNameList* seen_concepts) {
+    int i = 0;
+    if (!concept) {
+        return 1;
+    }
+    if (ast_name_list_contains_text(seen_concepts, concept->name)) {
+        return 1;
+    }
+    name_list_push(seen_concepts, concept->name);
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        const AstConceptDecl* parent = find_parsed_concept(program, concept->concept_names.items[i]);
+        if (parent) {
+            if (!push_concept_visible_assoc_names(parser, program, parent, seen_concepts)) {
+                return 0;
+            }
+        }
+    }
+    for (i = 0; i < concept->assoc_types.count; ++i) {
+        push_scoped_type_name(parser, concept->assoc_types.items[i].name);
+    }
+    return 1;
+}
+
 static int parse_where_annotation(Parser* parser, AstWhereConstraintList* out) {
     if (!expect(parser, TOKEN_AT, "expected '@' before where")) {
         return 0;
@@ -324,19 +388,40 @@ static int parse_where_annotation(Parser* parser, AstWhereConstraintList* out) {
         item.line = parser->current.line;
         item.param_name = token_dup(&parser->current);
         advance(parser);
-        if (!expect(parser, TOKEN_COLON, "expected ':' in @where constraint")) {
-            return 0;
+        if (parser->current.kind == TOKEN_COLON) {
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, "expected trait name in @where");
+            }
+            for (;;) {
+                memset(&item.equal_type, 0, sizeof(item.equal_type));
+                item.kind = AST_WHERE_CONCEPT;
+                item.concept_name = token_dup(&parser->current);
+                where_constraint_list_push(out, item);
+                advance(parser);
+                if (parser->current.kind != TOKEN_AMP) {
+                    break;
+                }
+                advance(parser);
+                if (parser->current.kind != TOKEN_IDENT) {
+                    return fail(parser, "expected trait name after '&' in @where");
+                }
+            }
+        } else if (parser->current.kind == TOKEN_ASSIGN) {
+            item.kind = AST_WHERE_EQUAL;
+            advance(parser);
+            if (!is_type_start(parser)) {
+                return fail(parser, "expected type in @where equality");
+            }
+            item.equal_type = parse_type(parser);
+            where_constraint_list_push(out, item);
+        } else {
+            return fail(parser, "expected ':' or '=' in @where constraint");
         }
-        if (parser->current.kind != TOKEN_IDENT) {
-            return fail(parser, "expected trait name in @where");
-        }
-        item.concept_name = token_dup(&parser->current);
-        advance(parser);
-        where_constraint_list_push(out, item);
         if (parser->current.kind == TOKEN_COMMA) {
             advance(parser);
             if (parser->current.kind != TOKEN_IDENT) {
-                return fail(parser, "expected generic parameter name in @where");
+                return fail(parser, "expected constraint target name in @where");
             }
             continue;
         }
@@ -347,10 +432,60 @@ static int parse_where_annotation(Parser* parser, AstWhereConstraintList* out) {
 
 static int parse_decl_concept_names(Parser* parser, AstNameList* out);
 
-static int parse_concept_decl(Parser* parser, AstProgram* out_program, int public_flag) {
+static int parse_concept_assoc_decl(Parser* parser,
+                                    AstProgram* out_program,
+                                    AstConceptDecl* concept_decl,
+                                    AstWhereConstraintList* where_constraints) {
+    AstAssocTypeDecl assoc_type;
+    memset(&assoc_type, 0, sizeof(assoc_type));
+    advance(parser);
+    if (parser->current.kind != TOKEN_IDENT) {
+        return fail(parser, "expected associated type name");
+    }
+    assoc_type.name = token_dup(&parser->current);
+    assoc_type.line = parser->current.line;
+    push_scoped_type_name(parser, assoc_type.name);
+    advance(parser);
+    assoc_type.where_constraints = *where_constraints;
+    memset(where_constraints, 0, sizeof(*where_constraints));
+    if (parser->current.kind == TOKEN_COLON) {
+        AstWhereConstraint item;
+        advance(parser);
+        if (parser->current.kind != TOKEN_IDENT) {
+            return fail(parser, "expected trait name after ':'");
+        }
+        for (;;) {
+            memset(&item, 0, sizeof(item));
+            item.kind = AST_WHERE_CONCEPT;
+            item.param_name = dup_text(assoc_type.name);
+            item.line = parser->current.line;
+            item.concept_name = token_dup(&parser->current);
+            where_constraint_list_push(&assoc_type.where_constraints, item);
+            advance(parser);
+            if (parser->current.kind != TOKEN_AMP) {
+                break;
+            }
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, "expected trait name after '&' in associated type bound");
+            }
+        }
+    }
+    if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after associated type")) {
+        return 0;
+    }
+    assoc_type_decl_list_push(&concept_decl->assoc_types, assoc_type);
+    (void)out_program;
+    return 1;
+}
+
+static int parse_concept_decl(Parser* parser, AstProgram* out_program, int public_flag, AstWhereConstraintList* leading_where_constraints) {
     AstConceptDecl concept_decl;
+    int scoped_type_base = parser->scoped_type_names.count;
     memset(&concept_decl, 0, sizeof(concept_decl));
     concept_decl.public_flag = public_flag;
+    concept_decl.where_constraints = *leading_where_constraints;
+    memset(leading_where_constraints, 0, sizeof(*leading_where_constraints));
     advance(parser);
     if (parser->current.kind != TOKEN_IDENT) {
         return fail(parser, "expected trait name");
@@ -369,9 +504,39 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
     if (!expect(parser, TOKEN_LEFT_BRACE, "expected ';' or '{' after trait declaration")) {
         return 0;
     }
+    {
+        AstNameList seen_concepts;
+        int i = 0;
+        memset(&seen_concepts, 0, sizeof(seen_concepts));
+        for (i = 0; i < concept_decl.concept_names.count; ++i) {
+            const AstConceptDecl* parent = find_parsed_concept(out_program, concept_decl.concept_names.items[i]);
+            if (parent) {
+                if (!push_concept_visible_assoc_names(parser, out_program, parent, &seen_concepts)) {
+                    return 0;
+                }
+            }
+        }
+    }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        AstWhereConstraintList where_constraints;
         AstConceptMethod method;
+        memset(&where_constraints, 0, sizeof(where_constraints));
         memset(&method, 0, sizeof(method));
+        while (parser->current.kind == TOKEN_AT) {
+            if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "where")) {
+                if (!parse_where_annotation(parser, &where_constraints)) {
+                    return 0;
+                }
+                continue;
+            }
+            return fail(parser, "only @where(...) annotations are supported here");
+        }
+        if (parser->current.kind == TOKEN_KW_TYPE) {
+            if (!parse_concept_assoc_decl(parser, out_program, &concept_decl, &where_constraints)) {
+                return 0;
+            }
+            continue;
+        }
         if (!is_type_start(parser)) {
             return fail(parser, "expected trait method return type");
         }
@@ -384,6 +549,7 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
         }
         method.name = token_dup(&parser->current);
         method.line = parser->current.line;
+        method.where_constraints = where_constraints;
         advance(parser);
         if (!parse_params(parser, &method.params)) {
             return 0;
@@ -396,6 +562,7 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
     if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after trait declaration")) {
         return 0;
     }
+    parser->scoped_type_names.count = scoped_type_base;
     concept_list_push(&out_program->concepts, concept_decl);
     return 1;
 }
@@ -445,7 +612,7 @@ static int is_known_type(Parser* parser, const Token* token) {
     if (!name) {
         return 0;
     }
-    result = hashmap_contains(&parser->known_types, name);
+    result = hashmap_contains(&parser->known_types, name) || ast_name_list_contains_text(&parser->scoped_type_names, name);
     free(name);
     return result;
 }
@@ -2374,6 +2541,34 @@ static AstNameList* find_local_ast_nominal_concept_names(AstProgram* program, co
     return 0;
 }
 
+static AstAssocTypeBindingList* find_local_ast_nominal_assoc_type_bindings(AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->structs.count; ++i) {
+        if (strcmp(program->structs.items[i].name, name) == 0) {
+            return &program->structs.items[i].assoc_type_bindings;
+        }
+    }
+    for (i = 0; i < program->enums.count; ++i) {
+        if (strcmp(program->enums.items[i].name, name) == 0) {
+            return &program->enums.items[i].assoc_type_bindings;
+        }
+    }
+    for (i = 0; i < program->unions.count; ++i) {
+        if (strcmp(program->unions.items[i].name, name) == 0) {
+            return &program->unions.items[i].assoc_type_bindings;
+        }
+    }
+    return 0;
+}
+
+static void name_list_clone(AstNameList* out, const AstNameList* in) {
+    int i = 0;
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < in->count; ++i) {
+        name_list_push(out, dup_text(in->items[i]));
+    }
+}
+
 static int nominal_decl_concept_names_add_unique(AstNameList* names, const char* concept_name) {
     int i = 0;
     if (!names) {
@@ -2392,6 +2587,7 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
     char* owner_name = 0;
     AstNameList concept_names;
     AstNameList* owner_concept_names = 0;
+    AstAssocTypeBindingList* owner_assoc_type_bindings = 0;
     memset(&concept_names, 0, sizeof(concept_names));
     if (public_flag) {
         return fail(parser, "extend must not be public");
@@ -2405,6 +2601,7 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
         return 0;
     }
     owner_concept_names = find_local_ast_nominal_concept_names(out_program, owner_name);
+    owner_assoc_type_bindings = find_local_ast_nominal_assoc_type_bindings(out_program, owner_name);
     if (!owner_concept_names) {
         return fail(parser, "extend target must be a local type declared earlier");
     }
@@ -2425,6 +2622,33 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
                 continue;
             }
             return fail(parser, "only @where(...) annotations are supported here");
+        }
+        if (parser->current.kind == TOKEN_KW_TYPE) {
+            AstAssocTypeBinding binding;
+            memset(&binding, 0, sizeof(binding));
+            if (concept_names.count == 0) {
+                return fail(parser, "type binding in extend requires explicit trait list");
+            }
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, "expected associated type name");
+            }
+            binding.name = token_dup(&parser->current);
+            binding.line = parser->current.line;
+            advance(parser);
+            if (!expect(parser, TOKEN_ASSIGN, "expected '=' in associated type binding")) {
+                return 0;
+            }
+            if (!is_type_start(parser)) {
+                return fail(parser, "expected type in associated type binding");
+            }
+            binding.value = parse_type(parser);
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after associated type binding")) {
+                return 0;
+            }
+            name_list_clone(&binding.context_concept_names, &concept_names);
+            assoc_type_binding_list_push(owner_assoc_type_bindings, binding);
+            continue;
         }
         if (parser->current.kind == TOKEN_KW_PUBLIC &&
             parser->next.kind == TOKEN_IDENT &&
@@ -2698,6 +2922,33 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             }
             return fail(parser, "only @where(...) annotations are supported here");
         }
+        if (parser->current.kind == TOKEN_KW_TYPE) {
+            AstAssocTypeBinding binding;
+            memset(&binding, 0, sizeof(binding));
+            if (struct_decl.concept_names.count == 0) {
+                return fail(parser, "associated type binding requires declared trait implementation");
+            }
+            advance(parser);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, "expected associated type name");
+            }
+            binding.name = token_dup(&parser->current);
+            binding.line = parser->current.line;
+            advance(parser);
+            if (!expect(parser, TOKEN_ASSIGN, "expected '=' in associated type binding")) {
+                return 0;
+            }
+            if (!is_type_start(parser)) {
+                return fail(parser, "expected type in associated type binding");
+            }
+            binding.value = parse_type(parser);
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after associated type binding")) {
+                return 0;
+            }
+            name_list_clone(&binding.context_concept_names, &struct_decl.concept_names);
+            assoc_type_binding_list_push(&struct_decl.assoc_type_bindings, binding);
+            continue;
+        }
         if (parser->current.kind == TOKEN_KW_PUBLIC &&
             parser->next.kind == TOKEN_IDENT &&
             token_equals(&parser->next, "deinit")) {
@@ -2850,6 +3101,7 @@ void parser_init(Parser* parser, const char* source) {
     parser->error = 0;
     parser->error_line = 1;
     hashmap_init(&parser->known_types);
+    memset(&parser->scoped_type_names, 0, sizeof(parser->scoped_type_names));
     register_known_type(parser, "Int");
     register_known_type(parser, "Int8");
     register_known_type(parser, "Int16");
@@ -2923,10 +3175,7 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             continue;
         }
         if (parser->current.kind == TOKEN_KW_CONCEPT) {
-            if (where_constraints.count != 0) {
-                return fail(parser, "@where(...) requires a generic function or struct");
-            }
-            if (!parse_concept_decl(parser, out_program, public_flag)) {
+            if (!parse_concept_decl(parser, out_program, public_flag, &where_constraints)) {
                 return 0;
             }
             continue;

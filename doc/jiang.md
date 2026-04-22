@@ -1013,7 +1013,14 @@ if (x == MyUnion.a(_ value)) {
 Jiang 语言通常以 `<T>` 形式声明泛型参数。
 
 `@where(...)` 是一种编译期约束注解，用于约束其后一个泛型声明中的类型参数。  
-`@where(...)` 中引用的参数名，必须出现在后续声明的 `<...>` 泛型参数列表中。
+当前 `@where(...)` 支持两类约束项：
+
+- `Name: Trait`
+- `Name: TraitA & TraitB & TraitC`
+- `Name = Type`
+
+在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
+在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
 
 #### Trait
 
@@ -1062,6 +1069,38 @@ trait HashEq: Hashable {
 }
 ```
 
+trait 还可以在 trait 体内部使用 `type` 声明关联类型：
+
+```c
+trait Iterator {
+  type Item;
+  Item next();
+}
+```
+
+关联类型可以直接写 bound：
+
+```c
+trait HasItem {
+  type Item: Hashable & Equatable;
+  Item item();
+}
+```
+
+子 trait 会自动继承父 trait 的关联类型，并可以继续对它加约束：
+
+```c
+trait Iterator {
+  type Item;
+  Item next();
+}
+
+@where(Item = UInt8)
+trait ByteIterator: Iterator {
+  Int next_int();
+}
+```
+
 此时：
 
 - `Int`、`Float`、`Double` 等数值类型可以被视为满足 `Numbric`
@@ -1071,11 +1110,21 @@ trait HashEq: Hashable {
 - 用户自定义类型若要满足某个 trait，当前需要在类型定义处显式声明
 - 仅仅“方法签名刚好匹配”并不会自动满足 trait
 - 实现子 trait 的类型，会自动被视为也实现其父 trait
+- trait 的关联类型使用 `type Name;` 声明
+- 关联类型 bound 可写作 `type Item: Hashable;`
+- 多个关联类型 bound 可写作 `type Item: Hashable & Equatable;`
+- 子 trait 会继承父 trait 的关联类型，且当前不允许重新声明父 trait 的同名关联类型
+- 子 trait 可以通过 `@where(Item: Hashable)` 或 `@where(Item = UInt8)` 继续约束继承来的关联类型
+- `@where(...)` 中多个 trait 约束也支持 `&`，例如 `@where(T: Hashable & Equatable)`
 - `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[] bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
 - 若继承链中出现同名 requirement：
   - 同名且签名完全一致：允许合并
   - 同名但签名不同：编译报错
 - 若 trait 继承未知父 trait，或出现继承环，编译报错
+- 若继承链中出现同名关联类型：
+  - 名字相同且约束兼容：视为同一个关联类型
+  - 名字相同但约束冲突：编译报错
+- 当前不支持关联类型默认类型
 
 例如：
 
@@ -1100,6 +1149,42 @@ struct Box: HasValue {
 
   Int value() {
     return self.inner;
+  }
+}
+```
+
+类型实现带关联类型的 trait 时，需要在实现体中显式绑定关联类型：
+
+```c
+trait Iterator {
+  type Item;
+  Item next();
+}
+
+struct Counter: Iterator {
+  type Item = UInt8;
+
+  UInt8 next() {
+    return 42;
+  }
+}
+```
+
+同样地，`extend` 中也可以绑定关联类型：
+
+```c
+trait Iterator {
+  type Item;
+  Item next();
+}
+
+struct Counter {}
+
+extend Counter: Iterator {
+  type Item = UInt8;
+
+  UInt8 next() {
+    return 42;
   }
 }
 ```
@@ -1135,6 +1220,40 @@ Foo<Float> y = Foo<Float> { value: 3.14 };
 // 也可以写成
 _ z = Foo<Float> { value: 3.14 };
 ```
+
+泛型参数的顶层 `!` 可变性约束有三种模式：
+
+- 默认不写约束时，泛型参数只接受**不带**顶层 `!` 的实参
+- `@where(T: Mutable)` 表示该泛型参数**必须**带顶层 `!`
+- `@where(T: MaybeMutable)` 表示该泛型参数可以带或不带顶层 `!`，并保留实例化后的实际可变性
+
+```c
+@where(T: Mutable)
+struct MutableBox<T> {
+  T value;
+}
+
+@where(T: MaybeMutable)
+struct MaybeMutableBox<T> {
+  T value;
+}
+
+MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
+MaybeMutableBox<Int> b = MaybeMutableBox<Int> { value: 2 };
+MaybeMutableBox<Int!> c = MaybeMutableBox<Int!> { value: 3 };
+```
+
+其中：
+
+- `Mutable` 和 `MaybeMutable` 是语言内建约束名
+- 它们由编译器识别，不是普通用户可实现的 trait
+- 但表面语法仍然通过 `@where(T: ...)` 使用
+
+当前规则只看**顶层** `!`：
+
+- `Int` 不满足 `Mutable`
+- `Int!` 满足 `Mutable`
+- `MaybeMutable` 同时接受 `Int` 与 `Int!`
 
 ### Extend
 

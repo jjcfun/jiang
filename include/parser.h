@@ -12,6 +12,7 @@ typedef struct Parser {
     const char* error;
     int error_line;
     HashMap known_types;
+    AstNameList scoped_type_names;
 } Parser;
 
 void parser_init(Parser* parser, const char* source);
