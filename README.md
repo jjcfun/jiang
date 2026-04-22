@@ -42,3 +42,7 @@ cmake --build build
 ```bash
 LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](./LICENSE).
