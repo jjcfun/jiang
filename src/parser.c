@@ -363,6 +363,16 @@ static const AstConceptDecl* find_parsed_concept(const AstProgram* program, cons
     return 0;
 }
 
+static const AstStructDecl* find_parsed_struct(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->structs.count; ++i) {
+        if (strcmp(program->structs.items[i].name, name) == 0) {
+            return &program->structs.items[i];
+        }
+    }
+    return 0;
+}
+
 static int push_concept_visible_assoc_names(Parser* parser,
                                             const AstProgram* program,
                                             const AstConceptDecl* concept,
@@ -2704,6 +2714,35 @@ static void name_list_clone(AstNameList* out, const AstNameList* in) {
     }
 }
 
+static void where_constraint_list_clone(AstWhereConstraintList* out, const AstWhereConstraintList* in) {
+    int i = 0;
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < in->count; ++i) {
+        AstWhereConstraint item;
+        memset(&item, 0, sizeof(item));
+        item.param_name = dup_text(in->items[i].param_name);
+        item.concept_name = in->items[i].concept_name ? dup_text(in->items[i].concept_name) : 0;
+        item.equal_type = in->items[i].equal_type;
+        item.line = in->items[i].line;
+        item.kind = in->items[i].kind;
+        where_constraint_list_push(out, item);
+    }
+}
+
+static void where_constraint_list_append_clone(AstWhereConstraintList* out, const AstWhereConstraintList* in) {
+    int i = 0;
+    for (i = 0; i < in->count; ++i) {
+        AstWhereConstraint item;
+        memset(&item, 0, sizeof(item));
+        item.param_name = dup_text(in->items[i].param_name);
+        item.concept_name = in->items[i].concept_name ? dup_text(in->items[i].concept_name) : 0;
+        item.equal_type = in->items[i].equal_type;
+        item.line = in->items[i].line;
+        item.kind = in->items[i].kind;
+        where_constraint_list_push(out, item);
+    }
+}
+
 static int parse_assoc_type_binding_name(Parser* parser,
                                          char** out_concept_name,
                                          char** out_assoc_name,
@@ -2751,7 +2790,7 @@ static int nominal_decl_concept_names_add_unique(AstNameList* names, const char*
     return 1;
 }
 
-static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public_flag) {
+static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public_flag, AstWhereConstraintList* leading_where_constraints) {
     char* owner_name = 0;
     AstNameList concept_names;
     AstNameList* owner_concept_names = 0;
@@ -2773,6 +2812,12 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
     if (!owner_concept_names) {
         return fail(parser, "extend target must be a local type declared earlier");
     }
+    if (leading_where_constraints && leading_where_constraints->count != 0) {
+        const AstStructDecl* owner_struct = find_parsed_struct(out_program, owner_name);
+        if (!owner_struct || owner_struct->type_params.count == 0) {
+            return fail(parser, "@where(...) requires generic parameters");
+        }
+    }
     if (!parse_decl_concept_names(parser, &concept_names)) {
         return 0;
     }
@@ -2782,6 +2827,9 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
         AstWhereConstraintList where_constraints;
         memset(&where_constraints, 0, sizeof(where_constraints));
+        if (leading_where_constraints) {
+            where_constraint_list_append_clone(&where_constraints, leading_where_constraints);
+        }
         while (parser->current.kind == TOKEN_AT) {
             if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "where")) {
                 if (!parse_where_annotation(parser, &where_constraints)) {
@@ -3345,13 +3393,10 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             continue;
         }
         if (parser->current.kind == TOKEN_KW_EXTEND) {
-            if (where_constraints.count != 0) {
-                return fail(parser, "@where(...) requires a generic function or struct");
-            }
             if (generic_params.count != 0) {
                 return fail(parser, "generic extend is not supported");
             }
-            if (!parse_extend_decl(parser, out_program, public_flag)) {
+            if (!parse_extend_decl(parser, out_program, public_flag, &where_constraints)) {
                 return 0;
             }
             continue;

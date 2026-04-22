@@ -2826,7 +2826,8 @@ static int resolve_nominal_assoc_type_bindings(const AstProgram* program,
             *detail_name = binding->name;
             return 0;
         }
-        if (!concept_name_is_or_inherits(program, matched_concept_name, target_concept->name, &seen_concepts)) {
+        memset(&seen_concepts, 0, sizeof(seen_concepts));
+        if (!concept_name_is_or_inherits(program, target_concept->name, matched_concept_name, &seen_concepts)) {
             continue;
         }
         for (j = 0; j < out->count; ++j) {
@@ -4391,6 +4392,21 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     decl.init_line = templ->init_line;
     decl.deinit_line = templ->deinit_line;
     decl.line = templ->line;
+    for (i = 0; i < templ->concept_names.count; ++i) {
+        name_list_push(&decl.concept_names, dup_text(templ->concept_names.items[i]));
+    }
+    for (i = 0; i < templ->assoc_type_bindings.count; ++i) {
+        AstAssocTypeBinding binding;
+        memset(&binding, 0, sizeof(binding));
+        clone_name_list(&binding.context_concept_names, &templ->assoc_type_bindings.items[i].context_concept_names);
+        binding.concept_name = templ->assoc_type_bindings.items[i].concept_name
+            ? dup_text(templ->assoc_type_bindings.items[i].concept_name)
+            : 0;
+        binding.name = dup_text(templ->assoc_type_bindings.items[i].name);
+        binding.value = clone_type_subst(&templ->assoc_type_bindings.items[i].value, &subst);
+        binding.line = templ->assoc_type_bindings.items[i].line;
+        assoc_type_binding_list_push(&decl.assoc_type_bindings, binding);
+    }
     for (i = 0; i < templ->fields.count; ++i) {
         AstStructField field = templ->fields.items[i];
         field.type = clone_type_subst(&field.type, &subst);

@@ -134,6 +134,7 @@ static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
 #define defer_block_list_push(list, block) VEC_PUSH((list), (block))
 #define defer_frame_list_push(list, frame) VEC_PUSH((list), (frame))
+#define name_list_push(list, name) VEC_PUSH((list), (name))
 
 static int fail(LowerContext* ctx, const char* error);
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
@@ -148,6 +149,8 @@ static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
 static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
 static HirFunction* find_function(HirProgram* program, const char* name);
 static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
+static const AstEnumDecl* find_ast_enum(const AstProgram* ast, const char* name);
+static const AstUnionDecl* find_ast_union(const AstProgram* ast, const char* name);
 static int is_mutable_assignment_target(const HirExpr* expr);
 static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
@@ -1638,6 +1641,285 @@ static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* n
         }
     }
     return 0;
+}
+
+static const AstEnumDecl* find_ast_enum(const AstProgram* ast, const char* name) {
+    int i = 0;
+    for (i = 0; i < ast->enums.count; ++i) {
+        if (strcmp(ast->enums.items[i].name, name) == 0) {
+            return &ast->enums.items[i];
+        }
+    }
+    return 0;
+}
+
+static const AstUnionDecl* find_ast_union(const AstProgram* ast, const char* name) {
+    int i = 0;
+    for (i = 0; i < ast->unions.count; ++i) {
+        if (strcmp(ast->unions.items[i].name, name) == 0) {
+            return &ast->unions.items[i];
+        }
+    }
+    return 0;
+}
+
+static int ast_name_list_contains_local(const AstNameList* list, const char* name) {
+    int i = 0;
+    for (i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char* unqualified_type_name_local(const char* name) {
+    const char* last_dot = strrchr(name, '.');
+    return last_dot ? last_dot + 1 : name;
+}
+
+static int type_name_matches_local(const char* actual_name, const char* target_name) {
+    return strcmp(actual_name, target_name) == 0 ||
+           strcmp(unqualified_type_name_local(actual_name), target_name) == 0 ||
+           strcmp(actual_name, unqualified_type_name_local(target_name)) == 0 ||
+           strcmp(unqualified_type_name_local(actual_name), unqualified_type_name_local(target_name)) == 0;
+}
+
+static const AstConceptDecl* find_ast_concept_local(const AstProgram* ast, const char* name) {
+    int i = 0;
+    for (i = 0; i < ast->concepts.count; ++i) {
+        if (type_name_matches_local(ast->concepts.items[i].name, name)) {
+            return &ast->concepts.items[i];
+        }
+    }
+    return 0;
+}
+
+static int concept_name_is_or_inherits_local(const AstProgram* ast,
+                                             const char* actual_name,
+                                             const char* target_name,
+                                             AstNameList* seen_concepts) {
+    const AstConceptDecl* concept = 0;
+    int i = 0;
+    if (type_name_matches_local(actual_name, target_name)) {
+        return 1;
+    }
+    if (ast_name_list_contains_local(seen_concepts, actual_name)) {
+        return 0;
+    }
+    name_list_push(seen_concepts, actual_name);
+    concept = find_ast_concept_local(ast, actual_name);
+    if (!concept) {
+        return 0;
+    }
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        if (concept_name_is_or_inherits_local(ast, concept->concept_names.items[i], target_name, seen_concepts)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int nominal_declares_concept_local(const AstProgram* ast,
+                                          const AstNameList* concept_names,
+                                          const char* concept_name) {
+    AstNameList seen_concepts;
+    int i = 0;
+    memset(&seen_concepts, 0, sizeof(seen_concepts));
+    for (i = 0; i < concept_names->count; ++i) {
+        if (concept_name_is_or_inherits_local(ast, concept_names->items[i], concept_name, &seen_concepts)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int hir_type_declares_concept_or_child(const AstProgram* ast,
+                                              HirType* type,
+                                              const char* concept_name) {
+    if (!type) {
+        return 0;
+    }
+    switch (type->kind) {
+        case HIR_TYPE_STRUCT: {
+            const AstStructDecl* decl = find_ast_struct(ast, type->struct_decl->name);
+            return decl && nominal_declares_concept_local(ast, &decl->concept_names, concept_name);
+        }
+        case HIR_TYPE_ENUM: {
+            const AstEnumDecl* decl = find_ast_enum(ast, type->enum_decl->name);
+            return decl && nominal_declares_concept_local(ast, &decl->concept_names, concept_name);
+        }
+        case HIR_TYPE_UNION: {
+            const AstUnionDecl* decl = find_ast_union(ast, type->union_decl->name);
+            return decl && nominal_declares_concept_local(ast, &decl->concept_names, concept_name);
+        }
+        default:
+            return 0;
+    }
+}
+
+static HirType* instance_method_owner_type(HirType* type) {
+    if (!type) {
+        return 0;
+    }
+    if (type->kind == HIR_TYPE_POINTER && type->array_item &&
+        (type->array_item->kind == HIR_TYPE_STRUCT ||
+         type->array_item->kind == HIR_TYPE_ENUM ||
+         type->array_item->kind == HIR_TYPE_UNION)) {
+        return type->array_item;
+    }
+    if (type->kind == HIR_TYPE_STRUCT ||
+        type->kind == HIR_TYPE_ENUM ||
+        type->kind == HIR_TYPE_UNION) {
+        return type;
+    }
+    return 0;
+}
+
+static HirExpr* make_instance_method_receiver(LowerContext* ctx, HirExpr* base, HirType* owner_type, int line) {
+    if (!base || !owner_type) {
+        return 0;
+    }
+    if (owner_type->kind == HIR_TYPE_STRUCT) {
+        if (base->type->kind == HIR_TYPE_POINTER) {
+            return base;
+        }
+        if (!is_lvalue_expr(base)) {
+            fail(ctx, "indexing requires lvalue base");
+            return 0;
+        }
+        {
+            HirExpr* addr = new_expr(HIR_EXPR_ADDR, pointer_to_type(ctx, owner_type), line);
+            addr->as.unary.value = base;
+            return addr;
+        }
+    }
+    if (base->type->kind == HIR_TYPE_POINTER) {
+        HirExpr* deref = new_expr(HIR_EXPR_DEREF, owner_type, line);
+        deref->as.unary.value = base;
+        return deref;
+    }
+    return base;
+}
+
+static HirExpr* lower_subscriptable_get_expr(LowerContext* ctx,
+                                             HirExpr* base,
+                                             const AstExpr* index_expr,
+                                             HirType* expected_type,
+                                             int line) {
+    HirType* owner_type = instance_method_owner_type(base->type);
+    HirFunction* method = 0;
+    HirExpr* index = 0;
+    HirExpr* receiver = 0;
+    HirExpr* call = 0;
+    if (!owner_type || !hir_type_declares_concept_or_child(ctx->ast, owner_type, "SubscriptGet")) {
+        return 0;
+    }
+    method = find_type_method(ctx->program, owner_type, "subscript_get", 0);
+    if (!method) {
+        fail(ctx, "unknown function");
+        return 0;
+    }
+    if (!method_visible_from_context(ctx, method, owner_type)) {
+        fail(ctx, "unknown function");
+        return 0;
+    }
+    if (method->params.count != 2) {
+        fail(ctx, "internal error: invalid subscript_get signature");
+        return 0;
+    }
+    receiver = make_instance_method_receiver(ctx, base, owner_type, line);
+    if (!receiver) {
+        return 0;
+    }
+    index = lower_expr_expected(ctx, index_expr, method->params.items[1]->type);
+    if (!index) {
+        return 0;
+    }
+    if (!type_assignment_compatible(index->type, method->params.items[1]->type)) {
+        fail(ctx, "subscript index type mismatch");
+        return 0;
+    }
+    call = new_expr(HIR_EXPR_CALL, method->return_type, line);
+    call->as.call.callee = method;
+    call->as.call.builtin = HIR_BUILTIN_NONE;
+    expr_list_push(&call->as.call.args, receiver);
+    expr_list_push(&call->as.call.args, index);
+    return maybe_wrap_expected_optional_expr(ctx, call, expected_type, line);
+}
+
+static HirStmt* lower_subscriptable_set_stmt(LowerContext* ctx,
+                                             const AstExpr* target,
+                                             const AstExpr* value_expr,
+                                             int line) {
+    HirExpr* base = lower_expr(ctx, target->as.index.base);
+    HirType* owner_type = 0;
+    HirFunction* method = 0;
+    HirExpr* receiver = 0;
+    HirExpr* index = 0;
+    HirExpr* value = 0;
+    HirExpr* call = 0;
+    HirStmt* stmt = 0;
+    if (!base) {
+        return 0;
+    }
+    owner_type = instance_method_owner_type(base->type);
+    if (!owner_type) {
+        return 0;
+    }
+    if (!hir_type_declares_concept_or_child(ctx->ast, owner_type, "SubscriptGet")) {
+        return 0;
+    }
+    if (!hir_type_declares_concept_or_child(ctx->ast, owner_type, "SubscriptSet")) {
+        fail(ctx, "assignment target is immutable");
+        return 0;
+    }
+    method = find_type_method(ctx->program, owner_type, "subscript_set", 0);
+    if (!method) {
+        fail(ctx, "assignment target is immutable");
+        return 0;
+    }
+    if (!method_visible_from_context(ctx, method, owner_type)) {
+        fail(ctx, "unknown function");
+        return 0;
+    }
+    if (method->params.count != 3 || method->return_type->kind != HIR_TYPE_VOID) {
+        fail(ctx, "internal error: invalid subscript_set signature");
+        return 0;
+    }
+    receiver = make_instance_method_receiver(ctx, base, owner_type, line);
+    if (!receiver) {
+        return 0;
+    }
+    index = lower_expr_expected(ctx, target->as.index.index, method->params.items[1]->type);
+    if (!index) {
+        return 0;
+    }
+    if (!type_assignment_compatible(index->type, method->params.items[1]->type)) {
+        fail(ctx, "subscript index type mismatch");
+        return 0;
+    }
+    value = lower_expr_expected(ctx, value_expr, method->params.items[2]->type);
+    if (!value) {
+        return 0;
+    }
+    value = maybe_decay_array_to_slice(ctx, value, method->params.items[2]->type, line);
+    if (!value) {
+        return 0;
+    }
+    if (!type_assignment_compatible(value->type, method->params.items[2]->type)) {
+        fail(ctx, "assignment type mismatch");
+        return 0;
+    }
+    call = new_expr(HIR_EXPR_CALL, method->return_type, line);
+    call->as.call.callee = method;
+    call->as.call.builtin = HIR_BUILTIN_NONE;
+    expr_list_push(&call->as.call.args, receiver);
+    expr_list_push(&call->as.call.args, index);
+    expr_list_push(&call->as.call.args, value);
+    stmt = new_stmt(HIR_STMT_EXPR, line);
+    stmt->as.expr_stmt.expr = call;
+    return stmt;
 }
 
 static HirEnumMember* resolve_enum_expr(LowerContext* ctx, const AstExpr* expr, HirEnumDecl** out_enum) {
@@ -3370,6 +3652,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         case AST_EXPR_INDEX: {
             HirExpr* base = lower_expr(ctx, expr->as.index.base);
             HirExpr* index = 0;
+            HirExpr* subscript_call = 0;
             if (!base) {
                 return 0;
             }
@@ -3382,11 +3665,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 deref->as.unary.value = base;
                 base = deref;
             }
-            index = lower_expr(ctx, expr->as.index.index);
-            if (!index) {
-                return 0;
-            }
             if (base->type->kind == HIR_TYPE_TUPLE) {
+                index = lower_expr(ctx, expr->as.index.index);
+                if (!index) {
+                    return 0;
+                }
                 if (expr->as.index.index->kind != AST_EXPR_INT) {
                     fail(ctx, "tuple index must be an integer literal");
                     return 0;
@@ -3397,14 +3680,24 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
                 out = new_expr(HIR_EXPR_INDEX, base->type->tuple_items.items[expr->as.index.index->as.int_value], expr->line);
             } else if (base->type->kind == HIR_TYPE_ARRAY || base->type->kind == HIR_TYPE_SLICE || base->type->kind == HIR_TYPE_MANY_POINTER) {
+                index = lower_expr(ctx, expr->as.index.index);
+                if (!index) {
+                    return 0;
+                }
                 if (index->type->kind != HIR_TYPE_INT) {
                     fail(ctx, "array index must be Int");
                     return 0;
                 }
                 out = new_expr(HIR_EXPR_INDEX, base->type->array_item, expr->line);
             } else {
-                fail(ctx, "indexing currently requires a tuple, array, slice, or many-pointer base");
-                return 0;
+                subscript_call = lower_subscriptable_get_expr(ctx, base, expr->as.index.index, expected_type, expr->line);
+                if (!subscript_call) {
+                    if (!ctx->error) {
+                        fail(ctx, "indexing currently requires a tuple, array, slice, many-pointer, or SubscriptGet base");
+                    }
+                    return 0;
+                }
+                return subscript_call;
             }
             out->as.index.base = base;
             out->as.index.index = index;
@@ -3598,6 +3891,19 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             return out;
         }
         case AST_STMT_ASSIGN: {
+            if (stmt->as.assign.target &&
+                stmt->as.assign.target->kind == AST_EXPR_INDEX) {
+                HirStmt* subscript_stmt = lower_subscriptable_set_stmt(ctx,
+                                                                       stmt->as.assign.target,
+                                                                       stmt->as.assign.value,
+                                                                       stmt->line);
+                if (subscript_stmt) {
+                    return subscript_stmt;
+                }
+                if (ctx->error) {
+                    return 0;
+                }
+            }
             if (stmt->as.assign.target->kind == AST_EXPR_FIELD) {
                 out->as.assign.target = lower_expr_preserve_pointer(ctx, stmt->as.assign.target);
             } else {
@@ -3615,6 +3921,10 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                     fail(ctx, "assignment target not found");
                     return 0;
                 }
+            } else if (stmt->as.assign.target->kind == AST_EXPR_INDEX &&
+                       out->as.assign.target->kind == HIR_EXPR_CALL) {
+                fail(ctx, "assignment target is immutable");
+                return 0;
             } else if (out->as.assign.target->kind == HIR_EXPR_DEREF) {
             } else if (out->as.assign.target->kind != HIR_EXPR_STRUCT_FIELD) {
                 fail(ctx, "assignment target not found");
