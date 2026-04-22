@@ -1120,7 +1120,7 @@ static int looks_like_typed_array_constructor(Parser* parser) {
     if (type.kind != AST_TYPE_ARRAY) {
         return 0;
     }
-    return probe.current.kind == TOKEN_LEFT_BRACE || probe.current.kind == TOKEN_LEFT_PAREN;
+    return probe.current.kind == TOKEN_LEFT_BRACKET || probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
 static int variant_args_are_patterns(Parser* parser) {
@@ -1315,17 +1315,16 @@ static AstExpr* parse_primary(Parser* parser) {
         return parse_type_implicit_expr(parser, token.line);
     }
 
-    if ((token.kind == TOKEN_IDENT && is_known_type(parser, &token)) &&
-        looks_like_typed_array_constructor(parser)) {
+    if (looks_like_typed_array_constructor(parser)) {
         AstType array_type = parse_type(parser);
         if (array_type.kind != AST_TYPE_ARRAY) {
             fail(parser, "typed array constructor requires an array type");
             return 0;
         }
-        if (parser->current.kind == TOKEN_LEFT_BRACE) {
+        if (parser->current.kind == TOKEN_LEFT_BRACKET) {
             AstExpr* array = new_expr(AST_EXPR_ARRAY, token.line);
             advance(parser);
-            if (parser->current.kind != TOKEN_RIGHT_BRACE) {
+            if (parser->current.kind != TOKEN_RIGHT_BRACKET) {
                 for (;;) {
                     expr = parse_expr(parser);
                     if (!expr) {
@@ -1339,7 +1338,7 @@ static AstExpr* parse_primary(Parser* parser) {
                     break;
                 }
             }
-            if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after array literal")) {
+            if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after array literal")) {
                 return 0;
             }
             return array;
@@ -1563,10 +1562,10 @@ static AstExpr* parse_primary(Parser* parser) {
         return expr;
     }
 
-    if (token.kind == TOKEN_LEFT_BRACE) {
+    if (token.kind == TOKEN_LEFT_BRACKET) {
         AstExpr* array = new_expr(AST_EXPR_ARRAY, token.line);
         advance(parser);
-        if (parser->current.kind != TOKEN_RIGHT_BRACE) {
+        if (parser->current.kind != TOKEN_RIGHT_BRACKET) {
             for (;;) {
                 expr = parse_expr(parser);
                 if (!expr) {
@@ -1580,7 +1579,7 @@ static AstExpr* parse_primary(Parser* parser) {
                 break;
             }
         }
-        if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after array literal")) {
+        if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after array literal")) {
             return 0;
         }
         return array;
