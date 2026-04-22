@@ -659,7 +659,12 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
                 type_list_push(&out->as.call.type_args, clone_type(source, prefix, hide_private, &expr->as.call.type_args.items[i]));
             }
             for (i = 0; i < expr->as.call.args.count; ++i) {
-                expr_list_push(&out->as.call.args, clone_expr(source, prefix, hide_private, expr->as.call.args.items[i]));
+                AstStructFieldInit arg;
+                memset(&arg, 0, sizeof(arg));
+                arg.name = expr->as.call.args.items[i].name ? dup_text(expr->as.call.args.items[i].name) : 0;
+                arg.value = clone_expr(source, prefix, hide_private, expr->as.call.args.items[i].value);
+                arg.line = expr->as.call.args.items[i].line;
+                struct_field_init_list_push(&out->as.call.args, arg);
             }
             break;
         case AST_EXPR_VARIANT:
@@ -780,7 +785,9 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
                 AstParam binding;
                 memset(&binding, 0, sizeof(binding));
                 binding.type = clone_type(source, prefix, hide_private, &stmt->as.destructure.bindings.items[i].type);
+                binding.label = stmt->as.destructure.bindings.items[i].label ? dup_text(stmt->as.destructure.bindings.items[i].label) : 0;
                 binding.name = dup_text(stmt->as.destructure.bindings.items[i].name);
+                binding.default_value = clone_expr(source, prefix, hide_private, stmt->as.destructure.bindings.items[i].default_value);
                 binding.line = stmt->as.destructure.bindings.items[i].line;
                 param_list_push(&out->as.destructure.bindings, binding);
             }
@@ -856,7 +863,9 @@ static AstFunction clone_function(const AstProgram* source, const char* prefix, 
         AstParam param;
         memset(&param, 0, sizeof(param));
         param.type = clone_type(source, prefix, hide_private, &fn->params.items[i].type);
+        param.label = fn->params.items[i].label ? dup_text(fn->params.items[i].label) : 0;
         param.name = dup_text(fn->params.items[i].name);
+        param.default_value = clone_expr(source, prefix, hide_private, fn->params.items[i].default_value);
         param.line = fn->params.items[i].line;
         param_list_push(&out.params, param);
     }
@@ -930,7 +939,9 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         AstParam param;
         memset(&param, 0, sizeof(param));
         param.type = clone_type(source, prefix, hide_private, &decl->init_params.items[i].type);
+        param.label = decl->init_params.items[i].label ? dup_text(decl->init_params.items[i].label) : 0;
         param.name = dup_text(decl->init_params.items[i].name);
+        param.default_value = clone_expr(source, prefix, hide_private, decl->init_params.items[i].default_value);
         param.line = decl->init_params.items[i].line;
         param_list_push(&out.init_params, param);
     }
@@ -1049,7 +1060,9 @@ static AstConceptDecl clone_concept_decl(const AstProgram* source, const char* p
             AstParam param;
             memset(&param, 0, sizeof(param));
             param.type = clone_type(source, prefix, hide_private, &decl->methods.items[i].params.items[j].type);
+            param.label = decl->methods.items[i].params.items[j].label ? dup_text(decl->methods.items[i].params.items[j].label) : 0;
             param.name = dup_text(decl->methods.items[i].params.items[j].name);
+            param.default_value = clone_expr(source, prefix, hide_private, decl->methods.items[i].params.items[j].default_value);
             param.line = decl->methods.items[i].params.items[j].line;
             param_list_push(&method.params, param);
         }
@@ -1720,6 +1733,12 @@ static int concept_method_signature_equal(const AstConceptMethod* a, const AstCo
     }
     for (i = 0; i < a->params.count; ++i) {
         if (!ast_type_is_equal(&a->params.items[i].type, &b->params.items[i].type)) {
+            return 0;
+        }
+        if (!!a->params.items[i].label != !!b->params.items[i].label) {
+            return 0;
+        }
+        if (a->params.items[i].label && strcmp(a->params.items[i].label, b->params.items[i].label) != 0) {
             return 0;
         }
     }
@@ -3933,7 +3952,12 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
                 type_list_push(&out->as.call.type_args, clone_type_subst(&expr->as.call.type_args.items[i], subst));
             }
             for (i = 0; i < expr->as.call.args.count; ++i) {
-                expr_list_push(&out->as.call.args, clone_expr_subst(expr->as.call.args.items[i], subst));
+                AstStructFieldInit arg;
+                memset(&arg, 0, sizeof(arg));
+                arg.name = expr->as.call.args.items[i].name ? dup_text(expr->as.call.args.items[i].name) : 0;
+                arg.value = clone_expr_subst(expr->as.call.args.items[i].value, subst);
+                arg.line = expr->as.call.args.items[i].line;
+                struct_field_init_list_push(&out->as.call.args, arg);
             }
             break;
         case AST_EXPR_VARIANT:
@@ -4076,7 +4100,9 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
             for (i = 0; i < stmt->as.destructure.bindings.count; ++i) {
                 AstParam binding = stmt->as.destructure.bindings.items[i];
                 binding.type = clone_type_subst(&binding.type, subst);
+                binding.label = binding.label ? dup_text(binding.label) : 0;
                 binding.name = dup_text(binding.name);
+                binding.default_value = clone_expr_subst(binding.default_value, subst);
                 param_list_push(&out->as.destructure.bindings, binding);
             }
             out->as.destructure.init = clone_expr_subst(stmt->as.destructure.init, subst);
@@ -4172,7 +4198,7 @@ static int infer_type_args_from_call(const AstProgram* program, const AstFunctio
             if (templ->params.items[j].type.kind == AST_TYPE_NAMED &&
                 templ->params.items[j].type.type_args.count == 0 &&
                 strcmp(templ->params.items[j].type.named_name, templ->type_params.items[i]) == 0) {
-                AstType actual = infer_expr_type(program, locals, call->as.call.args.items[j]);
+                AstType actual = infer_expr_type(program, locals, call->as.call.args.items[j].value);
                 if (actual.kind == AST_TYPE_VOID) {
                     return 0;
                 }
@@ -4222,7 +4248,9 @@ static int instantiate_function_template(MonoContext* mono, const AstFunction* t
         AstParam param = templ->params.items[i];
         LocalTypeEntry entry;
         param.type = clone_type_subst(&param.type, &subst);
+        param.label = param.label ? dup_text(param.label) : 0;
         param.name = dup_text(param.name);
+        param.default_value = clone_expr_subst(param.default_value, &subst);
         param_list_push(&fn.params, param);
         entry.name = param.name;
         entry.type = ast_type_copy(&param.type);
@@ -4275,7 +4303,9 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     for (i = 0; i < templ->init_params.count; ++i) {
         AstParam param = templ->init_params.items[i];
         param.type = clone_type_subst(&param.type, &subst);
+        param.label = param.label ? dup_text(param.label) : 0;
         param.name = dup_text(param.name);
+        param.default_value = clone_expr_subst(param.default_value, &subst);
         param_list_push(&decl.init_params, param);
     }
     for (i = 0; i < templ->init_body.stmts.count; ++i) {
@@ -4357,15 +4387,28 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
             AstTypeList type_args;
             memset(&type_args, 0, sizeof(type_args));
             for (i = 0; i < expr->as.call.args.count; ++i) {
-                if (!transform_expr(mono, expr->as.call.args.items[i], locals)) {
+                if (!transform_expr(mono, expr->as.call.args.items[i].value, locals)) {
                     return 0;
                 }
             }
             templ = find_generic_function_template(mono->source, expr->as.call.callee);
             if (!templ) {
+                const AstStructDecl* struct_templ = 0;
                 for (i = 0; i < expr->as.call.type_args.count; ++i) {
                     if (!transform_type(mono, &expr->as.call.type_args.items[i])) {
                         return 0;
+                    }
+                }
+                if (expr->as.call.type_args.count > 0) {
+                    struct_templ = find_generic_struct_template(mono->source, expr->as.call.callee);
+                    if (struct_templ) {
+                        char* instantiated_name = 0;
+                        if (!instantiate_struct_template(mono, struct_templ, &expr->as.call.type_args, &instantiated_name)) {
+                            return 0;
+                        }
+                        free(expr->as.call.callee);
+                        expr->as.call.callee = instantiated_name;
+                        memset(&expr->as.call.type_args, 0, sizeof(expr->as.call.type_args));
                     }
                 }
                 return 1;

@@ -390,7 +390,7 @@ Int x = p;
 p = p + 1;
 
 Int[1] items = {41};
-Int[*] raw = items[0]$.ref()$.as(Int[*]);
+Int[*] raw = items[0]$.as(Int[*]);
 
 // many-pointer 通过下标访问
 Int y = raw[0];
@@ -521,6 +521,8 @@ T[]@E sort<T, E>(T[] list, Fn<Bool@E, T, T> compare)
 T[]@E1 sort<T, E1, E2>(T[] list, Fn<Fn<Bool@E2, T, T>@E1, T[]> compare)
 ```
 
+
+
 #### Async
 
 ```c
@@ -542,6 +544,53 @@ sort(list, { $0 < $1 });
 sort(list, { (a, b) -> a < b });
 
 sort(list, { (_ a, _ b) -> a < b });
+```
+
+#### 带标签参数
+
+Jiang 支持带参数标签的函数参数。声明形式如下：
+
+```c
+Int foo(Int value, label1: Int arg1, label2: Int, label3: Int = 100)
+```
+
+规则如下：
+
+- 不带标签的参数与普通参数一样，必须放在前面
+- 不带标签的参数调用时仍按位置传参，顺序不能变化
+- 不带标签的参数不能有默认值
+- `label: Type name` 表示标签名与局部参数名分开
+- `label: Type` 表示省略参数名，此时参数名默认与标签相同
+- 带标签参数必须放在所有不带标签参数之后
+- 带标签参数在调用时必须写标签
+- 带标签参数在调用时顺序可以变化
+- 带标签参数可以有默认值；调用时可以省略不传
+- 最终函数签名中的参数顺序仍然保持定义时顺序
+
+```c
+Int add(Int base, extra: Int other = 2, bonus: Int = 0) {
+    return base + other + bonus;
+}
+
+Int main() {
+    return add(40, bonus: 2);
+}
+```
+
+以下写法合法：
+
+```c
+foo(1, label1: 2, label2: 3)
+foo(1, label2: 3, label1: 2)
+```
+
+以下写法不合法：
+
+```c
+foo(label1: 1, 2)                // 位置参数不能出现在标签参数之后
+Int foo(Int a = 1, label: Int)   // 不带标签的参数不能有默认值
+Int foo(label: Int, Int a)       // 不带标签的参数必须放在带标签参数前面
+foo(1, other: 2, label2: 3)      // 标签名必须匹配
 ```
 
 ### 控制流（Control Flow）
@@ -706,16 +755,16 @@ struct Offset {
 }
 
 // 定义一个结构体常量
-Point point1 = Point { x: 0, y: 0 }
+Point point1 = Point(x: 0, y: 0)
 // 与以下两种方式等价
-_ point1 = Point { x: 0, y: 0 }
-Point point1 = { x: 0, Y: 0 }
+_ point1 = Point(x: 0, y: 0)
+Point point1 = Point(x: 0, y: 0)
 
 Point point move_point(Point point, Offset offset) {
   // 返回一个新的point
-  return { x: point.x + offset.x, y: point.y + offset.y }
+  return Point(x: point.x + offset.x, y: point.y + offset.y)
   // 与以下方式等价
-  // return Point { x: point.x + offset.x, y: point.y + offset.y }
+  // return Point(x: point.x + offset.x, y: point.y + offset.y)
 }
 ```
 
@@ -731,20 +780,25 @@ struct 可以自定义 `init` 函数。
 - `init` 不声明返回类型，语义等价于 `()`
 - `init` 只允许 `return;` / `return ();`
 - `init` 不能写成 `static init`
-- `Point(...)` / `Point.init(...)` / `new Point(...)` 不再作为构造语法存在
-- 构造统一使用 `Point { ... }`
-- 如果类型定义了 `init`，那么 `Point { ... }` 会按 `init` 参数名构造
-- 如果类型没有定义 `init`，那么 `Point { ... }` 才表示默认字段初始化
-- 一旦类型定义了 `init`，默认字段初始化语法失效
-- `new Point { ... }` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
+- `Point(...)` / `Point.init(...)` / `new Point(...)` 是结构体构造语法
+- 结构体不支持 `Point { ... }`
+- 如果类型定义了 `init`，那么 `Point(...)` / `Point.init(...)` 会按 `init` 参数规则构造
+- `init` 参数规则与普通函数一致：
+  - 位置参数在前
+  - 带标签参数在后
+  - 带标签参数可乱序
+  - 带默认值的参数仅允许出现在带标签参数段
+- 在 `Point(...)` 中，未显式写参数名的带标签参数也可以按参数名作为标签传入
+- 如果类型没有定义 `init`，那么 `Point(...)` 表示默认字段初始化，当前只支持 `field: value` 标签形式
+- `new Point(...)` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
 
 ```c
 struct Point {
   Int x;
   Int y;
 
-  public init(Int x, Int y) {
-    self.x = x;
+  public init(Int base, px: Int x, py: Int y = 0) {
+    self.x = base + x;
     self.y = y;
     return;
   }
@@ -752,8 +806,8 @@ struct Point {
 ```
 
 ```c
-Point p1 = Point { x: 1, y: 2 };
-Point* p2 = new Point { x: 1, y: 2 };
+Point p1 = Point(1, py: 2, px: 3);
+Point* p2 = new Point(1, px: 3);
 ```
 
 #### deinit函数
@@ -818,7 +872,7 @@ struct User {
 }
 
 Int a = User.zero();
-User user = User { id: 42 };
+User user = User(id: 42);
 Int b = user.value();
 ```
 
@@ -890,12 +944,12 @@ Jiang语言中，结构体即可以是值类型，也可以是引用类型。这
 
 ```c
 // p1为值
-Point p1 = Point { x: 0, y: 0 }
+Point p1 = Point(x: 0, y: 0)
 // p1赋值给p2是值拷贝
 Point p2 = p1
 
 // p3为指针，此时为引用类型
-Point* p3 = new Point { x: 100, y: 200 }
+Point* p3 = new Point(x: 100, y: 200)
 
 // 由于Jiang语言的指针自动解引用，此时的p3被当成值
 print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 输出：p3.x = 100, p3.y = 200
@@ -915,16 +969,9 @@ struct User {
 
 // 定义一个结构体常量并初始化
 // 注意：可空属性可以不传，此时该属性初始化为null
-User user1 = {
-  id: 123,
-  age: 18
-}
+User user1 = User(id: 123, age: 18)
 // 与以下定义等价：
-// User user1 = User {
-//   id: 123,
-//   age: 18,
-//	 nick_name: null
-// }
+// User user1 = User(id: 123, age: 18, nick_name: null)
 
 print("user age = %d", user1.age); // 输出：user age = 18
 
@@ -1126,6 +1173,31 @@ trait ByteIterator: Iterator {
 ```
 
 此时：
+
+### Range
+
+Jiang 支持用 `start .. end` 语法直接创建 `Range` 值：
+
+```c
+Range r = 0..10;
+```
+
+它等价于：
+
+```c
+Range r = Range(start: 0, end: 10);
+```
+
+其中 `end` 为开区间端点。
+
+`Range` 来自隐式预导入的 `std/prelude.jiang`，当前定义为：
+
+```c
+struct Range {
+  Int start;
+  Int end;
+}
+```
 
 - `Int`、`Float`、`Double` 等数值类型可以被视为满足 `Numbric`
 - `Numbric` 本身不能直接写成 `Numbric x;`

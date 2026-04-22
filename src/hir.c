@@ -1769,7 +1769,7 @@ static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* o
         if (expr->as.call.type_args.count != 1) {
             return fail(ctx, "slice with_capacity requires exactly one type argument");
         }
-        if (expr->as.call.args.count != 1) {
+        if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) {
             return fail(ctx, "slice with_capacity expects exactly one argument");
         }
         slice_type = lower_type(ctx, &expr->as.call.type_args.items[0]);
@@ -1779,7 +1779,7 @@ static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* o
         if (slice_type->kind != HIR_TYPE_SLICE) {
             return fail(ctx, "slice with_capacity requires slice type");
         }
-        arg = lower_expr_expected(ctx, expr->as.call.args.items[0], primitive_type(ctx->program, HIR_TYPE_INT));
+        arg = lower_expr_expected(ctx, expr->as.call.args.items[0].value, primitive_type(ctx->program, HIR_TYPE_INT));
         if (!arg) {
             return 0;
         }
@@ -1795,8 +1795,8 @@ static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* o
         out->type = primitive_type(ctx->program, HIR_TYPE_INT);
         return 1;
     }
-    if (expr->as.call.args.count != 1) return fail(ctx, builtin == HIR_BUILTIN_ASSERT ? "assert expects exactly one argument" : "print expects exactly one argument");
-    arg = lower_expr(ctx, expr->as.call.args.items[0]);
+    if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) return fail(ctx, builtin == HIR_BUILTIN_ASSERT ? "assert expects exactly one argument" : "print expects exactly one argument");
+    arg = lower_expr(ctx, expr->as.call.args.items[0].value);
     if (!arg) return 0;
     if (builtin == HIR_BUILTIN_ASSERT) {
         if (arg->type->kind != HIR_TYPE_BOOL) return fail(ctx, "assert requires a Bool argument");
@@ -1813,17 +1813,17 @@ static int lower_builtin_method_call(LowerContext* ctx,
                                      HirBuiltinKind builtin,
                                      HirType* receiver_type,
                                      HirExpr* receiver_arg,
-                                     const AstExprList* ast_args,
+                                     const AstStructFieldInitList* ast_args,
                                      HirExpr* out) {
     out->as.call.builtin = builtin;
     out->as.call.callee = 0;
     expr_list_push(&out->as.call.args, receiver_arg);
     if (builtin == HIR_BUILTIN_EQUAL) {
         HirExpr* arg = 0;
-        if (ast_args->count != 1) {
+        if (ast_args->count != 1 || ast_args->items[0].name) {
             return fail(ctx, "equal expects exactly one argument");
         }
-        arg = lower_expr_expected(ctx, ast_args->items[0], receiver_type);
+        arg = lower_expr_expected(ctx, ast_args->items[0].value, receiver_type);
         if (!arg) {
             return 0;
         }
@@ -1845,42 +1845,149 @@ static int lower_builtin_method_call(LowerContext* ctx,
     return fail(ctx, "unsupported builtin method");
 }
 
-static int lower_call_args(LowerContext* ctx, const AstExprList* ast_args, HirExprList* out_args, HirFunction* callee) {
+static int lower_call_args_from(LowerContext* ctx, const AstStructFieldInitList* ast_args, HirExprList* out_args, HirFunction* callee, int param_offset) {
     int i = 0;
-    if (ast_args->count != callee->params.count) {
+    int positional_limit = 0;
+    int positional_count = 0;
+    int saw_labeled_arg = 0;
+    int param_count = callee->params.count - param_offset;
+    HirExpr** lowered_args = 0;
+    int* provided = 0;
+    if (ast_args->count > param_count) {
         return fail(ctx, "call argument count mismatch");
     }
+    for (i = 0; i < param_count; ++i) {
+        HirBinding* param = callee->params.items[param_offset + i];
+        if (param->label) {
+            break;
+        }
+        positional_limit += 1;
+    }
+    lowered_args = (HirExpr**)calloc((size_t)param_count, sizeof(HirExpr*));
+    provided = (int*)calloc((size_t)param_count, sizeof(int));
+    if (!lowered_args || !provided) {
+        free(lowered_args);
+        free(provided);
+        return fail(ctx, "out of memory");
+    }
     for (i = 0; i < ast_args->count; ++i) {
-        HirExpr* arg = lower_expr_expected(ctx, ast_args->items[i], callee->params.items[i]->type);
+        AstStructFieldInit* ast_arg = &ast_args->items[i];
+        HirExpr* arg = 0;
+        int param_index = -1;
+        HirBinding* param = 0;
+        if (ast_arg->name) {
+            saw_labeled_arg = 1;
+            for (param_index = positional_limit; param_index < param_count; ++param_index) {
+                param = callee->params.items[param_offset + param_index];
+                if (param->label && strcmp(ast_arg->name, param->label) == 0) {
+                    break;
+                }
+            }
+            if (param_index >= param_count) {
+                free(lowered_args);
+                free(provided);
+                return fail(ctx, "call argument label mismatch");
+            }
+        } else {
+            if (saw_labeled_arg) {
+                free(lowered_args);
+                free(provided);
+                return fail(ctx, "positional arguments must appear before labeled arguments");
+            }
+            if (positional_count >= positional_limit) {
+                free(lowered_args);
+                free(provided);
+                return fail(ctx, "call argument count mismatch");
+            }
+            param_index = positional_count;
+            param = callee->params.items[param_offset + param_index];
+            positional_count += 1;
+        }
+        if (provided[param_index]) {
+            free(lowered_args);
+            free(provided);
+            return fail(ctx, ast_arg->name ? "duplicate labeled argument" : "call argument count mismatch");
+        }
+        arg = lower_expr_expected(ctx, ast_arg->value, param->type);
         if (!arg) {
+            free(lowered_args);
+            free(provided);
             return 0;
         }
-        arg = maybe_decay_array_to_slice(ctx, arg, callee->params.items[i]->type, ast_args->items[i]->line);
+        arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
         if (!arg) {
+            free(lowered_args);
+            free(provided);
             return 0;
         }
-        if ((callee->params.items[i]->type->kind == HIR_TYPE_POINTER ||
-             callee->params.items[i]->type->kind == HIR_TYPE_MANY_POINTER) &&
-            callee->params.items[i]->type->array_item &&
-            callee->params.items[i]->type->array_item->mutable_flag &&
+        if ((param->type->kind == HIR_TYPE_POINTER ||
+             param->type->kind == HIR_TYPE_MANY_POINTER) &&
+            param->type->array_item &&
+            param->type->array_item->mutable_flag &&
             arg->kind == HIR_EXPR_ADDR &&
             (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
+            free(lowered_args);
+            free(provided);
             return fail(ctx, "call argument type mismatch");
         }
-        if (!type_assignment_compatible(arg->type, callee->params.items[i]->type)) {
+        if (!type_assignment_compatible(arg->type, param->type)) {
+            free(lowered_args);
+            free(provided);
+            return fail(ctx, "call argument type mismatch");
+        }
+        lowered_args[param_index] = arg;
+        provided[param_index] = 1;
+    }
+    for (i = 0; i < param_count; ++i) {
+        HirBinding* param = callee->params.items[param_offset + i];
+        HirExpr* arg = 0;
+        if (provided[i]) {
+            expr_list_push(out_args, lowered_args[i]);
+            continue;
+        }
+        if (!param->default_value) {
+            free(lowered_args);
+            free(provided);
+            return fail(ctx, "missing call argument");
+        }
+        arg = lower_expr_expected(ctx, param->default_value, param->type);
+        if (!arg) {
+            free(lowered_args);
+            free(provided);
+            return 0;
+        }
+        arg = maybe_decay_array_to_slice(ctx, arg, param->type, param->default_value->line);
+        if (!arg) {
+            free(lowered_args);
+            free(provided);
+            return 0;
+        }
+        if (!type_assignment_compatible(arg->type, param->type)) {
+            free(lowered_args);
+            free(provided);
             return fail(ctx, "call argument type mismatch");
         }
         expr_list_push(out_args, arg);
     }
+    free(lowered_args);
+    free(provided);
     return 1;
 }
 
-static int lower_struct_init_named_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstExpr* expr, HirExprList* out_args) {
+static int lower_call_args(LowerContext* ctx, const AstStructFieldInitList* ast_args, HirExprList* out_args, HirFunction* callee) {
+    return lower_call_args_from(ctx, ast_args, out_args, callee, 0);
+}
+
+static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstStructFieldInitList* ast_args, HirExprList* out_args, int line) {
     const AstStructDecl* ast_struct = 0;
     HirFunction* init_fn = 0;
     int param_count = 0;
+    int positional_limit = 0;
+    int positional_count = 0;
+    int saw_labeled_arg = 0;
     int i = 0;
-    int* seen = 0;
+    HirExpr** lowered_args = 0;
+    int* provided = 0;
     if (!struct_decl->has_init) {
         return fail(ctx, "internal error: struct has no init");
     }
@@ -1893,55 +2000,172 @@ static int lower_struct_init_named_args(LowerContext* ctx, HirStructDecl* struct
         return fail(ctx, "internal error: missing struct init function");
     }
     param_count = ast_struct->init_params.count;
-    if (param_count > 0) {
-        seen = (int*)calloc((size_t)param_count, sizeof(int));
+    for (i = 0; i < param_count; ++i) {
+        if (ast_struct->init_params.items[i].label) {
+            break;
+        }
+        positional_limit += 1;
     }
-    if (param_count > 0 && !seen) {
+    lowered_args = (HirExpr**)calloc((size_t)param_count, sizeof(HirExpr*));
+    provided = (int*)calloc((size_t)param_count, sizeof(int));
+    if ((param_count > 0) && (!lowered_args || !provided)) {
+        free(lowered_args);
+        free(provided);
         return fail(ctx, "out of memory");
     }
-    for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
-        AstStructFieldInit* ast_field = &expr->as.struct_lit.fields.items[i];
+    for (i = 0; i < ast_args->count; ++i) {
+        AstStructFieldInit* ast_arg = &ast_args->items[i];
+        HirExpr* arg = 0;
         int param_index = -1;
-        HirExpr* value = 0;
-        int j = 0;
-        for (j = 0; j < param_count; ++j) {
-            if (strcmp(ast_struct->init_params.items[j].name, ast_field->name) == 0) {
-                param_index = j;
-                break;
+        HirBinding* param = 0;
+        if (ast_arg->name) {
+            int j = 0;
+            saw_labeled_arg = 1;
+            for (j = 0; j < param_count; ++j) {
+                const char* effective_label = ast_struct->init_params.items[j].label
+                    ? ast_struct->init_params.items[j].label
+                    : ast_struct->init_params.items[j].name;
+                if (strcmp(ast_arg->name, effective_label) == 0) {
+                    param_index = j;
+                    break;
+                }
             }
-        }
-        if (param_index < 0) {
-            free(seen);
-            return fail(ctx, "unknown init parameter");
-        }
-        if (seen[param_index]) {
-            free(seen);
-            return fail(ctx, "duplicate init parameter");
-        }
-        value = lower_expr_expected(ctx, ast_field->value, init_fn->params.items[param_index]->type);
-        if (!value) {
-            free(seen);
-            return 0;
-        }
-        value = maybe_decay_array_to_slice(ctx, value, init_fn->params.items[param_index]->type, ast_field->line);
-        if (!value) {
-            free(seen);
-            return 0;
-        }
-        seen[param_index] = 1;
-        while (out_args->count < param_index) {
-            expr_list_push(out_args, 0);
-        }
-        if (out_args->count == param_index) {
-            expr_list_push(out_args, value);
+            if (param_index < 0) {
+                free(lowered_args);
+                free(provided);
+                return fail(ctx, "unknown init parameter");
+            }
         } else {
-            out_args->items[param_index] = value;
+            if (saw_labeled_arg) {
+                free(lowered_args);
+                free(provided);
+                return fail(ctx, "positional init arguments must appear before labeled arguments");
+            }
+            if (positional_count >= positional_limit) {
+                free(lowered_args);
+                free(provided);
+                return fail(ctx, "init argument count mismatch");
+            }
+            param_index = positional_count;
+            positional_count += 1;
         }
+        param = init_fn->params.items[param_index];
+        if (provided[param_index]) {
+            free(lowered_args);
+            free(provided);
+            return fail(ctx, ast_arg->name ? "duplicate init parameter" : "init argument count mismatch");
+        }
+        arg = lower_expr_expected(ctx, ast_arg->value, param->type);
+        if (!arg) {
+            free(lowered_args);
+            free(provided);
+            return 0;
+        }
+        arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
+        if (!arg) {
+            free(lowered_args);
+            free(provided);
+            return 0;
+        }
+        if (!type_assignment_compatible(arg->type, param->type)) {
+            free(lowered_args);
+            free(provided);
+            return fail(ctx, "init argument type mismatch");
+        }
+        lowered_args[param_index] = arg;
+        provided[param_index] = 1;
     }
     for (i = 0; i < param_count; ++i) {
-        if (!seen[i]) {
-            free(seen);
+        if (provided[i]) {
+            expr_list_push(out_args, lowered_args[i]);
+            continue;
+        }
+        if (!ast_struct->init_params.items[i].default_value) {
+            free(lowered_args);
+            free(provided);
             return fail(ctx, "missing init parameter");
+        }
+        lowered_args[i] = lower_expr_expected(ctx, ast_struct->init_params.items[i].default_value, init_fn->params.items[i]->type);
+        if (!lowered_args[i]) {
+            free(lowered_args);
+            free(provided);
+            return 0;
+        }
+        lowered_args[i] = maybe_decay_array_to_slice(ctx, lowered_args[i], init_fn->params.items[i]->type, line);
+        if (!lowered_args[i]) {
+            free(lowered_args);
+            free(provided);
+            return 0;
+        }
+        if (!type_assignment_compatible(lowered_args[i]->type, init_fn->params.items[i]->type)) {
+            free(lowered_args);
+            free(provided);
+            return fail(ctx, "init argument type mismatch");
+        }
+        expr_list_push(out_args, lowered_args[i]);
+    }
+    free(lowered_args);
+    free(provided);
+    return 1;
+}
+
+static int lower_default_struct_call_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstStructFieldInitList* ast_args, HirExpr* out, int line) {
+    int i = 0;
+    int* seen = 0;
+    seen = (int*)calloc((size_t)struct_decl->fields.count, sizeof(int));
+    if (!seen) {
+        return fail(ctx, "out of memory");
+    }
+    for (i = 0; i < ast_args->count; ++i) {
+        AstStructFieldInit* ast_field = &ast_args->items[i];
+        HirStructFieldInit field_init;
+        HirStructField* field = 0;
+        HirExpr* value = 0;
+        int field_index = -1;
+        memset(&field_init, 0, sizeof(field_init));
+        if (!ast_field->name) {
+            free(seen);
+            return fail(ctx, "default struct initialization requires labeled fields");
+        }
+        field = find_struct_field(struct_decl, ast_field->name, &field_index);
+        if (!field) {
+            free(seen);
+            return fail(ctx, "unknown field");
+        }
+        if (seen[field_index]) {
+            free(seen);
+            return fail(ctx, "duplicate struct field initializer");
+        }
+        value = lower_expr_expected(ctx, ast_field->value, field->type);
+        if (!value) {
+            free(seen);
+            return 0;
+        }
+        value = maybe_decay_array_to_slice(ctx, value, field->type, line);
+        if (!value) {
+            free(seen);
+            return 0;
+        }
+        if (!type_assignment_compatible(value->type, field->type)) {
+            free(seen);
+            return fail(ctx, "struct field initializer type mismatch");
+        }
+        seen[field_index] = 1;
+        field_init.field = field;
+        field_init.value = value;
+        struct_field_init_list_push(&out->as.struct_lit.fields, field_init);
+    }
+    for (i = 0; i < struct_decl->fields.count; ++i) {
+        if (!seen[i]) {
+            HirStructFieldInit field_init;
+            if (struct_decl->fields.items[i].type->kind != HIR_TYPE_OPTIONAL) {
+                free(seen);
+                return fail(ctx, "missing struct field initializer");
+            }
+            memset(&field_init, 0, sizeof(field_init));
+            field_init.field = &struct_decl->fields.items[i];
+            field_init.value = make_zero_expr(ctx, struct_decl->fields.items[i].type, line);
+            struct_field_init_list_push(&out->as.struct_lit.fields, field_init);
         }
     }
     free(seen);
@@ -2087,7 +2311,7 @@ static int validate_struct_init_expr(LowerContext* ctx, HirStructDecl* struct_de
                    validate_struct_init_expr(ctx, struct_decl, expr->as.ternary.else_expr, field_state);
         case AST_EXPR_CALL:
             for (i = 0; i < expr->as.call.args.count; ++i) {
-                if (!validate_struct_init_expr(ctx, struct_decl, expr->as.call.args.items[i], field_state)) {
+                if (!validate_struct_init_expr(ctx, struct_decl, expr->as.call.args.items[i].value, field_state)) {
                     return 0;
                 }
             }
@@ -2648,11 +2872,6 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             fail(ctx, "unknown function");
                             return 0;
                         }
-                        if (expr->as.call.args.count + 1 != method->params.count) {
-                            free(owner_name);
-                            fail(ctx, "call argument count mismatch");
-                            return 0;
-                        }
                         if (owner_type->kind == HIR_TYPE_STRUCT) {
                             if (owner_binding->type->kind == HIR_TYPE_POINTER) {
                                 receiver_arg = make_binding_expr(owner_binding, expr->line);
@@ -2667,23 +2886,9 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
                         out->as.call.callee = method;
                         expr_list_push(&out->as.call.args, receiver_arg);
-                        for (i = 0; i < expr->as.call.args.count; ++i) {
-                            HirExpr* arg = lower_expr_expected(ctx, expr->as.call.args.items[i], method->params.items[i + 1]->type);
-                            if (!arg) {
-                                free(owner_name);
-                                return 0;
-                            }
-                            arg = maybe_decay_array_to_slice(ctx, arg, method->params.items[i + 1]->type, expr->as.call.args.items[i]->line);
-                            if (!arg) {
-                                free(owner_name);
-                                return 0;
-                            }
-                            if (!type_assignment_compatible(arg->type, method->params.items[i + 1]->type)) {
-                                free(owner_name);
-                                fail(ctx, "call argument type mismatch");
-                                return 0;
-                            }
-                            expr_list_push(&out->as.call.args, arg);
+                        if (!lower_call_args_from(ctx, &expr->as.call.args, &out->as.call.args, method, 1)) {
+                            free(owner_name);
+                            return 0;
                         }
                         free(owner_name);
                         return out;
@@ -2726,6 +2931,29 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             }
                             return out;
                         }
+                        if (named_type->kind == HIR_TYPE_STRUCT && strcmp(member_name, "init") == 0) {
+                            HirStructDecl* init_struct = named_type->struct_decl;
+                            HirFunction* init_fn = 0;
+                            if (!init_struct->has_init) {
+                                free(owner_name);
+                                fail(ctx, "struct has no init");
+                                return 0;
+                            }
+                            init_fn = find_function(ctx->program, init_struct->init_name);
+                            if (!init_fn) {
+                                free(owner_name);
+                                fail(ctx, "internal error: missing struct init function");
+                                return 0;
+                            }
+                            free(owner_name);
+                            out = new_expr(HIR_EXPR_CALL, init_fn->return_type, expr->line);
+                            out->as.call.callee = init_fn;
+                            out->as.call.builtin = HIR_BUILTIN_NONE;
+                            if (!lower_struct_init_args(ctx, init_struct, &expr->as.call.args, &out->as.call.args, expr->line)) {
+                                return 0;
+                            }
+                            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+                        }
                         if (find_type_method(ctx->program, named_type, member_name, 0)) {
                             free(owner_name);
                             fail(ctx, "instance method called through type");
@@ -2743,12 +2971,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                         return 0;
                                     }
                                 } else {
-                                    if (expr->as.call.args.count != 1) {
+                                    if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) {
                                         free(owner_name);
                                         fail(ctx, "variant payload required");
                                         return 0;
                                     }
-                                    out->as.variant.payload = lower_expr(ctx, expr->as.call.args.items[0]);
+                                    out->as.variant.payload = lower_expr(ctx, expr->as.call.args.items[0].value);
                                     if (!out->as.variant.payload) {
                                         free(owner_name);
                                         return 0;
@@ -2769,16 +2997,28 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             HirFunction* callee = find_function(ctx->program, expr->as.call.callee);
             if (!callee) {
-                const char* dot = strchr(expr->as.call.callee, '.');
-                if (dot) {
-                    size_t prefix_len = (size_t)(dot - expr->as.call.callee);
-                    if (strcmp(dot + 1, "init") == 0) {
-                        fail(ctx, "use 'Type { ... }' for initialization");
+                HirStructDecl* init_struct = find_struct(ctx->program, expr->as.call.callee);
+                if (init_struct) {
+                    if (init_struct->has_init) {
+                        HirFunction* init_fn = find_function(ctx->program, init_struct->init_name);
+                        if (!init_fn) {
+                            fail(ctx, "internal error: missing struct init function");
+                            return 0;
+                        }
+                        out = new_expr(HIR_EXPR_CALL, init_fn->return_type, expr->line);
+                        out->as.call.callee = init_fn;
+                        out->as.call.builtin = HIR_BUILTIN_NONE;
+                        if (!lower_struct_init_args(ctx, init_struct, &expr->as.call.args, &out->as.call.args, expr->line)) {
+                            return 0;
+                        }
+                        return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+                    }
+                    out = new_expr(HIR_EXPR_STRUCT, new_owned_type(ctx->program, HIR_TYPE_STRUCT), expr->line);
+                    out->type->struct_decl = init_struct;
+                    if (!lower_default_struct_call_args(ctx, init_struct, &expr->as.call.args, out, expr->line)) {
                         return 0;
                     }
-                } else if (find_struct(ctx->program, expr->as.call.callee)) {
-                    fail(ctx, "use 'Type { ... }' for initialization");
-                    return 0;
+                    return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                 }
             }
             if (!callee) {
@@ -2951,84 +3191,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         }
         case AST_EXPR_STRUCT: {
             HirStructDecl* struct_decl = find_struct(ctx->program, expr->as.struct_lit.type_name);
-            HirType* struct_type = 0;
-            int i = 0;
-            int* seen = 0;
             if (!struct_decl) {
                 fail(ctx, "unknown named type");
                 return 0;
             }
-            struct_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
-            struct_type->struct_decl = struct_decl;
-            if (struct_decl->has_init) {
-                HirFunction* init_fn = find_function(ctx->program, struct_decl->init_name);
-                if (!init_fn) {
-                    fail(ctx, "internal error: missing struct init function");
-                    return 0;
-                }
-                out = new_expr(HIR_EXPR_CALL, init_fn->return_type, expr->line);
-                out->as.call.callee = init_fn;
-                out->as.call.builtin = HIR_BUILTIN_NONE;
-                if (!lower_struct_init_named_args(ctx, struct_decl, expr, &out->as.call.args)) {
-                    return 0;
-                }
-                return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
-            }
-            out = new_expr(HIR_EXPR_STRUCT, struct_type, expr->line);
-            seen = (int*)calloc((size_t)struct_decl->fields.count, sizeof(int));
-            if (!seen) {
-                fail(ctx, "out of memory");
-                return 0;
-            }
-            for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
-                AstStructFieldInit* ast_field = &expr->as.struct_lit.fields.items[i];
-                HirStructFieldInit field_init;
-                HirStructField* field = 0;
-                HirExpr* value = 0;
-                int field_index = -1;
-                memset(&field_init, 0, sizeof(field_init));
-                field = find_struct_field(struct_decl, ast_field->name, &field_index);
-                if (!field) {
-                    free(seen);
-                    fail(ctx, "unknown field");
-                    return 0;
-                }
-                if (seen[field_index]) {
-                    free(seen);
-                    fail(ctx, "duplicate struct field initializer");
-                    return 0;
-                }
-                value = lower_expr_expected(ctx, ast_field->value, field->type);
-                if (!value) {
-                    free(seen);
-                    return 0;
-                }
-                if (!type_assignment_compatible(value->type, field->type)) {
-                    free(seen);
-                    fail(ctx, "struct field initializer type mismatch");
-                    return 0;
-                }
-                seen[field_index] = 1;
-                field_init.field = field;
-                field_init.value = value;
-                struct_field_init_list_push(&out->as.struct_lit.fields, field_init);
-            }
-            for (i = 0; i < struct_decl->fields.count; ++i) {
-                if (!seen[i]) {
-                    HirStructFieldInit field_init;
-                    if (struct_decl->fields.items[i].type->kind != HIR_TYPE_OPTIONAL) {
-                        free(seen);
-                        fail(ctx, "missing struct field initializer");
-                        return 0;
-                    }
-                    memset(&field_init, 0, sizeof(field_init));
-                    field_init.field = &struct_decl->fields.items[i];
-                    field_init.value = make_zero_expr(ctx, struct_decl->fields.items[i].type, expr->line);
-                    struct_field_init_list_push(&out->as.struct_lit.fields, field_init);
-                }
-            }
-            free(seen);
-            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+            fail(ctx, "struct construction requires call syntax");
+            return 0;
         }
         case AST_EXPR_BINARY: {
             int comparison_op = expr->as.binary.op != AST_BIN_ADD &&
@@ -4458,6 +4626,8 @@ static int register_struct_init_functions(LowerContext* ctx) {
         hir_fn.owner_struct = struct_decl;
         for (param_index = 0; param_index < ast_struct->init_params.count; ++param_index) {
             HirBinding* param_binding = new_binding(lower_type(ctx, &ast_struct->init_params.items[param_index].type), ast_struct->init_params.items[param_index].type.mutable_flag, ast_struct->init_params.items[param_index].name, HIR_BINDING_PARAM, ast_struct->init_params.items[param_index].line);
+            param_binding->label = ast_struct->init_params.items[param_index].label;
+            param_binding->default_value = ast_struct->init_params.items[param_index].default_value;
             binding_list_push(&hir_fn.params, param_binding);
         }
         function_list_push(&ctx->program->functions, hir_fn);
@@ -4548,6 +4718,8 @@ static int register_functions(LowerContext* ctx) {
         }
         for (param_index = 0; param_index < ast_fn->params.count; ++param_index) {
             HirBinding* param_binding = new_binding(lower_type(ctx, &ast_fn->params.items[param_index].type), ast_fn->params.items[param_index].type.mutable_flag, ast_fn->params.items[param_index].name, HIR_BINDING_PARAM, ast_fn->params.items[param_index].line);
+            param_binding->label = ast_fn->params.items[param_index].label;
+            param_binding->default_value = ast_fn->params.items[param_index].default_value;
             binding_list_push(&hir_fn.params, param_binding);
         }
         function_list_push(&ctx->program->functions, hir_fn);
