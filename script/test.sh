@@ -333,6 +333,7 @@ run_sample union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
 run_sample union_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
 run_sample union_implicit_tag_minimal.jiang 42
+run_sample union_grouped_variant_minimal.jiang 42
 run_sample union_bind_minimal.jiang 42
 run_sample union_if_pattern_minimal.jiang 42
 run_sample union_if_mutable_binding_minimal.jiang 42

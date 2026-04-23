@@ -939,6 +939,15 @@ union ImplicitResult {
   Int a;
   Int b;
 }
+
+同类型的多个 variant 也可以合并声明：
+
+```c
+union MyUnion {
+  Int a, b, c;
+  Float r;
+}
+```
 ```
 
 字段初始化规则：

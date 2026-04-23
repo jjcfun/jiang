@@ -3401,22 +3401,35 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
             }
             continue;
         }
-        AstUnionVariant variant;
-        memset(&variant, 0, sizeof(variant));
-        if (!is_type_start(parser)) {
-            return fail(parser, "expected union variant type");
+        {
+            AstType variant_type;
+            int parsed_any = 0;
+            if (!is_type_start(parser)) {
+                return fail(parser, "expected union variant type");
+            }
+            variant_type = parse_type(parser);
+            while (parser->current.kind == TOKEN_IDENT) {
+                AstUnionVariant variant;
+                memset(&variant, 0, sizeof(variant));
+                variant.type = ast_type_copy_local(&variant_type);
+                variant.name = token_dup(&parser->current);
+                variant.line = parser->current.line;
+                advance(parser);
+                union_variant_list_push(&union_decl.variants, variant);
+                parsed_any = 1;
+                if (parser->current.kind != TOKEN_COMMA) {
+                    break;
+                }
+                advance(parser);
+            }
+            if (!parsed_any) {
+                return fail(parser, "expected union variant name");
+            }
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after union variant")) {
+                return 0;
+            }
+            continue;
         }
-        variant.type = parse_type(parser);
-        if (parser->current.kind != TOKEN_IDENT) {
-            return fail(parser, "expected union variant name");
-        }
-        variant.name = token_dup(&parser->current);
-        variant.line = parser->current.line;
-        advance(parser);
-        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after union variant")) {
-            return 0;
-        }
-        union_variant_list_push(&union_decl.variants, variant);
     }
     if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after union declaration")) {
         return 0;
