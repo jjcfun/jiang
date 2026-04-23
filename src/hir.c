@@ -31,6 +31,8 @@ typedef struct LowerContext {
     HirProgram* program;
     const AstProgram* ast;
     const char* error;
+    int error_line;
+    int current_line;
     HirFunction* current_function;
     Scope* scope;
     HirBindingList freed_bindings;
@@ -1246,6 +1248,16 @@ static int is_struct_init_self_field_assign(LowerContext* ctx, const AstExpr* ex
 
 static int fail(LowerContext* ctx, const char* error) {
     ctx->error = error;
+    if (!ctx->error_line) {
+        ctx->error_line = ctx->current_line;
+    }
+    return 0;
+}
+
+static int fail_at(LowerContext* ctx, int line, const char* error) {
+    ctx->current_line = line;
+    ctx->error_line = line;
+    ctx->error = error;
     return 0;
 }
 
@@ -1279,8 +1291,7 @@ static int lower_struct_init_args_for_function(LowerContext* ctx,
         HirExpr* arg = 0;
         HirBinding* param = init_fn->params.items[i];
         if (ast_arg->name) {
-            ctx->error = "labeled init arguments are not supported";
-            return 0;
+            return fail_at(ctx, ast_arg->line, "labeled init arguments are not supported");
         }
         arg = lower_expr_expected(ctx, ast_arg->value, param->type);
         if (!arg) {
@@ -1296,12 +1307,10 @@ static int lower_struct_init_args_for_function(LowerContext* ctx,
             param->type->array_item->mutable_flag &&
             arg->kind == HIR_EXPR_ADDR &&
             (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
-            ctx->error = "init argument type mismatch";
-            return 0;
+            return fail_at(ctx, ast_arg->line, "init argument type mismatch");
         }
         if (!type_assignment_compatible(arg->type, param->type)) {
-            ctx->error = "init argument type mismatch";
-            return 0;
+            return fail_at(ctx, ast_arg->line, "init argument type mismatch");
         }
         expr_list_push(out_args, arg);
     }
@@ -2598,6 +2607,10 @@ static int validate_struct_init_block(LowerContext* ctx, HirStructDecl* struct_d
 static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type) {
     HirExpr* out = 0;
     int i = 0;
+    int saved_line = ctx->current_line;
+    if (expr) {
+        ctx->current_line = expr->line;
+    }
     switch (expr->kind) {
         case AST_EXPR_INT:
             if (expected_type &&
@@ -3723,11 +3736,13 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         }
     }
     fail(ctx, "unsupported expression kind");
+    ctx->current_line = saved_line;
     return 0;
 }
 
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
-    return lower_expr_expected(ctx, expr, 0);
+    HirExpr* out = lower_expr_expected(ctx, expr, 0);
+    return out;
 }
 
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
@@ -3931,6 +3946,8 @@ static int lower_init_block(LowerContext* ctx, const AstBlock* ast_block, HirBlo
 
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
     HirStmt* out = new_stmt(stmt_kind_from_ast(stmt->kind), stmt->line);
+    int saved_line = ctx->current_line;
+    ctx->current_line = stmt->line;
     switch (stmt->kind) {
         case AST_STMT_RETURN:
             if (!stmt->as.ret.expr) {
@@ -3953,6 +3970,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                     return 0;
                 }
             }
+            ctx->current_line = saved_line;
             return out;
         case AST_STMT_VAR_DECL: {
             HirBinding* binding = 0;
@@ -3994,6 +4012,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             binding_list_push(&ctx->current_function->locals, binding);
             out->as.var_decl.binding = binding;
             out->as.var_decl.init = init;
+            ctx->current_line = saved_line;
             return out;
         }
         case AST_STMT_ASSIGN: {
@@ -4053,6 +4072,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 fail(ctx, "assignment type mismatch");
                 return 0;
             }
+            ctx->current_line = saved_line;
             return out;
         }
         case AST_STMT_IF: {
@@ -4111,6 +4131,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 }
                 pop_scope(ctx);
             }
+            ctx->current_line = saved_line;
             return out;
         }
         case AST_STMT_WHILE: {
@@ -4130,6 +4151,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             }
             pop_scope(ctx);
             ctx->loop_depth -= 1;
+            ctx->current_line = saved_line;
             return out;
         }
         case AST_STMT_FOR_RANGE: {
@@ -4166,6 +4188,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             }
             pop_scope(ctx);
             ctx->loop_depth -= 1;
+            ctx->current_line = saved_line;
             return out;
         }
         case AST_STMT_BREAK:
@@ -4173,18 +4196,21 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 fail(ctx, "break used outside loop");
                 return 0;
             }
+            ctx->current_line = saved_line;
             return out;
         case AST_STMT_CONTINUE:
             if (ctx->loop_depth <= 0) {
                 fail(ctx, "continue used outside loop");
                 return 0;
             }
+            ctx->current_line = saved_line;
             return out;
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = lower_expr(ctx, stmt->as.expr_stmt.expr);
             if (!out->as.expr_stmt.expr) {
                 return 0;
             }
+            ctx->current_line = saved_line;
             return out;
         default:
             fail(ctx, "unsupported statement kind");
@@ -4789,11 +4815,13 @@ static int lower_for_each_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock*
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary) {
     int i = 0;
     DeferFrame frame;
+    int saved_line = ctx->current_line;
     frame.defer_start = ctx->active_defers.count;
     frame.loop_boundary = loop_boundary;
     defer_frame_list_push(&ctx->defer_frames, frame);
     for (i = 0; i < ast_block->stmts.count; ++i) {
         HirStmt* stmt = 0;
+        ctx->current_line = ast_block->stmts.items[i]->line;
         if (ast_block->stmts.items[i]->kind == AST_STMT_DEFER) {
             HirBlock deferred_body;
             memset(&deferred_body, 0, sizeof(deferred_body));
@@ -5305,7 +5333,7 @@ static int lower_functions(LowerContext* ctx) {
     return 1;
 }
 
-int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error) {
+int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error, int* error_line) {
     LowerContext ctx;
     memset(hir, 0, sizeof(*hir));
     memset(&ctx, 0, sizeof(ctx));
@@ -5339,7 +5367,13 @@ int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error)
     ctx.ast = ast;
     if (!register_enums(&ctx) || !register_structs(&ctx) || !register_unions(&ctx) || !resolve_struct_fields(&ctx) || !resolve_union_variants(&ctx) || !register_globals(&ctx) || !register_struct_init_functions(&ctx) || !register_struct_deinit_functions(&ctx) || !register_functions(&ctx) || !lower_globals(&ctx) || !lower_functions(&ctx)) {
         *error = ctx.error;
+        if (error_line) {
+            *error_line = ctx.error_line;
+        }
         return 0;
+    }
+    if (error_line) {
+        *error_line = 0;
     }
     return 1;
 }

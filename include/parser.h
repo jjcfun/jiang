@@ -9,13 +9,16 @@ typedef struct Parser {
     Lexer lexer;
     Token current;
     Token next;
+    const char* source;
+    const char* filename;
     const char* error;
     int error_line;
+    int error_column;
     HashMap known_types;
     AstNameList scoped_type_names;
 } Parser;
 
-void parser_init(Parser* parser, const char* source);
+void parser_init(Parser* parser, const char* source, const char* filename);
 int parser_parse_program(Parser* parser, AstProgram* out_program);
 
 #endif

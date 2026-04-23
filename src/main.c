@@ -97,6 +97,143 @@ static char* read_file(const char* path) {
     return buffer;
 }
 
+static void print_source_excerpt(const char* path, int line, int column) {
+    char* source = 0;
+    const char* cursor = 0;
+    const char* line_start = 0;
+    const char* line_end = 0;
+    int current_line = 1;
+    int i = 0;
+    if (!path || !*path || line <= 0) {
+        return;
+    }
+    source = read_file(path);
+    if (!source) {
+        return;
+    }
+    cursor = source;
+    line_start = source;
+    while (*cursor && current_line < line) {
+        if (*cursor == '\n') {
+            current_line += 1;
+            line_start = cursor + 1;
+        }
+        cursor += 1;
+    }
+    if (current_line != line) {
+        free(source);
+        return;
+    }
+    line_end = line_start;
+    while (*line_end && *line_end != '\n' && *line_end != '\r') {
+        line_end += 1;
+    }
+    fprintf(stderr, "  %.*s\n", (int)(line_end - line_start), line_start);
+    if (column > 0) {
+        fprintf(stderr, "  ");
+        for (i = 1; i < column; ++i) {
+            if (line_start[i - 1] == '\t') {
+                fputc('\t', stderr);
+            } else {
+                fputc(' ', stderr);
+            }
+        }
+        fprintf(stderr, "^\n");
+    }
+    free(source);
+}
+
+static int parse_embedded_diagnostic(const char* error,
+                                     const char** out_path,
+                                     size_t* out_path_len,
+                                     int* out_line,
+                                     int* out_column,
+                                     const char** out_message) {
+    const char* p = 0;
+    const char* path_end = 0;
+    const char* msg = 0;
+    int line = 0;
+    int column = 0;
+    if (!error || !out_path || !out_path_len || !out_line || !out_column || !out_message) {
+        return 0;
+    }
+    path_end = strchr(error, ':');
+    if (!path_end || path_end == error) {
+        return 0;
+    }
+    p = path_end + 1;
+    if (!isdigit((unsigned char)*p)) {
+        return 0;
+    }
+    while (isdigit((unsigned char)*p)) {
+        line = line * 10 + (*p - '0');
+        p += 1;
+    }
+    if (*p == ':') {
+        const char* probe = p + 1;
+        if (isdigit((unsigned char)*probe)) {
+            p = probe;
+            while (isdigit((unsigned char)*p)) {
+                column = column * 10 + (*p - '0');
+                p += 1;
+            }
+        }
+    }
+    if (strncmp(p, ": error: ", 9) != 0) {
+        return 0;
+    }
+    msg = p + 9;
+    *out_path = error;
+    *out_path_len = (size_t)(path_end - error);
+    *out_line = line;
+    *out_column = column;
+    *out_message = msg;
+    return 1;
+}
+
+static void print_compiler_error(const char* path, int line, int column, const char* error) {
+    if (error && strstr(error, ": error: ")) {
+        const char* parsed_path = 0;
+        const char* parsed_message = 0;
+        size_t parsed_path_len = 0;
+        int parsed_line = 0;
+        int parsed_column = 0;
+        if (parse_embedded_diagnostic(error, &parsed_path, &parsed_path_len, &parsed_line, &parsed_column, &parsed_message)) {
+            char* path_copy = (char*)malloc(parsed_path_len + 1);
+            if (!path_copy) {
+                fprintf(stderr, "%s\n", error);
+                return;
+            }
+            memcpy(path_copy, parsed_path, parsed_path_len);
+            path_copy[parsed_path_len] = '\0';
+            fprintf(stderr, "%s:%d", path_copy, parsed_line);
+            if (parsed_column > 0) {
+                fprintf(stderr, ":%d", parsed_column);
+            }
+            fprintf(stderr, ": error: %s\n", parsed_message);
+            print_source_excerpt(path_copy, parsed_line, parsed_column);
+            free(path_copy);
+            return;
+        }
+        fprintf(stderr, "%s\n", error);
+        return;
+    }
+    if (!path || !*path) {
+        fprintf(stderr, "error: %s\n", error ? error : "unknown error");
+        return;
+    }
+    if (line > 0) {
+        if (column > 0) {
+            fprintf(stderr, "%s:%d:%d: error: %s\n", path, line, column, error ? error : "unknown error");
+        } else {
+            fprintf(stderr, "%s:%d: error: %s\n", path, line, error ? error : "unknown error");
+        }
+        print_source_excerpt(path, line, column);
+        return;
+    }
+    fprintf(stderr, "%s: error: %s\n", path, error ? error : "unknown error");
+}
+
 static int path_is_directory(const char* path) {
     struct stat st;
     if (stat(path, &st) != 0) {
@@ -2445,10 +2582,29 @@ static int load_module_graph(const char* path,
         *error = read_error;
         return 0;
     }
-    parser_init(&parser, source);
+    parser_init(&parser, source, path);
     if (!parser_parse_program(&parser, &module->own_program)) {
-        static char parse_error[256];
-        snprintf(parse_error, sizeof(parse_error), "%s at line %d", parser.error, parser.error_line);
+        static char parse_error[640];
+        if (parser.error_line > 0) {
+            if (parser.error_column > 0) {
+                snprintf(parse_error,
+                         sizeof(parse_error),
+                         "%s:%d:%d: error: %s",
+                         path,
+                         parser.error_line,
+                         parser.error_column,
+                         parser.error ? parser.error : "parse error");
+            } else {
+                snprintf(parse_error,
+                         sizeof(parse_error),
+                         "%s:%d: error: %s",
+                         path,
+                         parser.error_line,
+                         parser.error ? parser.error : "parse error");
+            }
+        } else {
+            snprintf(parse_error, sizeof(parse_error), "%s: error: %s", path, parser.error ? parser.error : "parse error");
+        }
         *error = parse_error;
         free(source);
         return 0;
@@ -4768,29 +4924,35 @@ int main(int argc, char** argv) {
         (void)parser;
         source = 0;
         if (!load_package_root_path(argv[2], &input_path, &error)) {
-            fprintf(stderr, "error: %s\n", error ? error : "failed to resolve package root");
+            print_compiler_error(argv[2], 0, 0, error ? error : "failed to resolve package root");
             return 1;
         }
         if (!load_effective_program(input_path, stack, 0, &ast, &error)) {
-            fprintf(stderr, "error: %s\n", error ? error : "failed to load program");
+            print_compiler_error(input_path, 0, 0, error ? error : "failed to load program");
             return 1;
         }
     }
 
     if (!monomorphize_program(&ast, &mono_ast, &error)) {
-        fprintf(stderr, "error: %s\n", error ? error : "failed to monomorphize AST");
+        print_compiler_error(input_path, 0, 0, error ? error : "failed to monomorphize AST");
         return 1;
     }
-    if (!lower_ast_to_hir(&mono_ast, &hir, &error)) {
-        fprintf(stderr, "error: %s\n", error ? error : "failed to lower AST to HIR");
-        return 1;
+    {
+        int error_line = 0;
+        if (!lower_ast_to_hir(&mono_ast, &hir, &error, &error_line)) {
+            print_compiler_error(input_path, error_line, 0, error ? error : "failed to lower AST to HIR");
+            return 1;
+        }
     }
-    if (!lower_hir_to_jir(&hir, &jir, &error)) {
-        fprintf(stderr, "error: %s\n", error ? error : "failed to lower HIR to JIR");
-        return 1;
+    {
+        int error_line = 0;
+        if (!lower_hir_to_jir(&hir, &jir, &error, &error_line)) {
+            print_compiler_error(input_path, error_line, 0, error ? error : "failed to lower HIR to JIR");
+            return 1;
+        }
     }
     if (!emit_llvm_module(&jir, &ir, &error)) {
-        fprintf(stderr, "error: %s\n", error ? error : "failed to emit LLVM IR");
+        print_compiler_error(input_path, 0, 0, error ? error : "failed to emit LLVM IR");
         return 1;
     }
 

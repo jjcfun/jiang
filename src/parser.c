@@ -150,6 +150,26 @@ static int token_equals(const Token* token, const char* text) {
     return token->length == n && strncmp(token->start, text, n) == 0;
 }
 
+static int parser_current_column(const Parser* parser) {
+    const char* cursor = 0;
+    int column = 1;
+    if (!parser || !parser->source || !parser->current.start) {
+        return 1;
+    }
+    cursor = parser->current.start;
+    while (cursor > parser->source && cursor[-1] != '\n') {
+        cursor -= 1;
+        column += 1;
+    }
+    return column;
+}
+
+static void parser_set_error(Parser* parser, const char* error) {
+    parser->error = error;
+    parser->error_line = parser->current.line;
+    parser->error_column = parser_current_column(parser);
+}
+
 #define stmt_list_push(list, stmt) VEC_PUSH((list), (stmt))
 #define expr_list_push(list, expr) VEC_PUSH((list), (expr))
 #define param_list_push(list, param) VEC_PUSH((list), (param))
@@ -726,8 +746,7 @@ static void advance(Parser* parser) {
 }
 
 static int fail(Parser* parser, const char* error) {
-    parser->error = error;
-    parser->error_line = parser->current.line;
+    parser_set_error(parser, error);
     return 0;
 }
 
@@ -875,8 +894,7 @@ static AstType parse_type(Parser* parser) {
             return type;
         }
         if (!is_type_start(parser)) {
-            parser->error = "expected tuple item type";
-            parser->error_line = parser->current.line;
+            parser_set_error(parser, "expected tuple item type");
             return type;
         }
         first = parse_type(parser);
@@ -891,8 +909,7 @@ static AstType parse_type(Parser* parser) {
         while (parser->current.kind == TOKEN_COMMA) {
             advance(parser);
             if (!is_type_start(parser)) {
-                parser->error = "expected tuple item type after ','";
-                parser->error_line = parser->current.line;
+                parser_set_error(parser, "expected tuple item type after ','");
                 return type;
             }
             type_list_push(&type.tuple_items, parse_type(parser));
@@ -998,8 +1015,7 @@ static AstType parse_type(Parser* parser) {
         }
         return parse_type_postfix(parser, type);
     }
-    parser->error = "expected type";
-    parser->error_line = parser->current.line;
+    parser_set_error(parser, "expected type");
     return type;
 }
 
@@ -3409,10 +3425,14 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
     return 1;
 }
 
-void parser_init(Parser* parser, const char* source) {
+void parser_init(Parser* parser, const char* source, const char* filename) {
+    memset(parser, 0, sizeof(*parser));
+    parser->source = source;
+    parser->filename = filename;
     lexer_init(&parser->lexer, source);
     parser->error = 0;
     parser->error_line = 1;
+    parser->error_column = 1;
     hashmap_init(&parser->known_types);
     memset(&parser->scoped_type_names, 0, sizeof(parser->scoped_type_names));
     register_known_type(parser, "Int");

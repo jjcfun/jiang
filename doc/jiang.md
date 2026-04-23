@@ -199,7 +199,7 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 - `a$.as(Int)`：对值 `a` 做类型转换
 - `a$.ref()`：从值 `a` 获取一个临时指针
 - `a$.addr()`：获取值 `a` 的地址值
-- `self.data$.free()`：对 `self.data` 这个完整表达式做隐式释放操作
+- `a$.free()`：对 `a` 做释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.alloc()`：分配一个未初始化的 `Int*`
 - `Int$.alloc_array(10)`：分配一个长度为 `10` 的 `Int[]*`
