@@ -2054,7 +2054,6 @@ static HirBuiltinKind builtin_kind(const char* name) {
     if (strcmp(name, "__builtin.assert") == 0) return HIR_BUILTIN_ASSERT;
     if (strcmp(name, "__builtin.print") == 0) return HIR_BUILTIN_PRINT;
     if (strcmp(name, "__builtin.panic") == 0) return HIR_BUILTIN_PANIC;
-    if (strcmp(name, "__slice_with_capacity") == 0) return HIR_BUILTIN_SLICE_WITH_CAPACITY;
     return HIR_BUILTIN_NONE;
 }
 
@@ -2115,32 +2114,6 @@ static int lower_builtin_call(LowerContext* ctx, const AstExpr* expr, HirExpr* o
     HirExpr* arg = 0;
     out->as.call.builtin = builtin;
     out->as.call.callee = 0;
-    if (builtin == HIR_BUILTIN_SLICE_WITH_CAPACITY) {
-        HirType* slice_type = 0;
-        if (expr->as.call.type_args.count != 1) {
-            return fail(ctx, "slice with_capacity requires exactly one type argument");
-        }
-        if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) {
-            return fail(ctx, "slice with_capacity expects exactly one argument");
-        }
-        slice_type = lower_type(ctx, &expr->as.call.type_args.items[0]);
-        if (!slice_type) {
-            return 0;
-        }
-        if (slice_type->kind != HIR_TYPE_SLICE) {
-            return fail(ctx, "slice with_capacity requires slice type");
-        }
-        arg = lower_expr_expected(ctx, expr->as.call.args.items[0].value, primitive_type(ctx->program, HIR_TYPE_INT));
-        if (!arg) {
-            return 0;
-        }
-        if (arg->type->kind != HIR_TYPE_INT) {
-            return fail(ctx, "slice capacity must be Int");
-        }
-        expr_list_push(&out->as.call.args, arg);
-        out->type = slice_type;
-        return 1;
-    }
     if (builtin == HIR_BUILTIN_PANIC) {
         if (expr->as.call.args.count != 0) return fail(ctx, "panic expects no arguments");
         out->type = primitive_type(ctx->program, HIR_TYPE_INT);
@@ -2691,21 +2664,71 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         case AST_EXPR_IMPLICIT: {
             if (expr->as.implicit.target_is_type) {
                 HirType* type = 0;
-                if (strcmp(expr->as.implicit.member, "size") != 0) {
-                    fail(ctx, "unknown implicit type operation");
-                    return 0;
-                }
-                if (expr->as.implicit.args.count != 0) {
-                    fail(ctx, "type implicit operation '.size()' takes no arguments");
-                    return 0;
-                }
                 type = lower_type(ctx, &expr->as.implicit.type_target);
                 if (!type) {
                     return 0;
                 }
-                out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
-                out->as.int_value = type_size_bytes(type);
-                return out;
+                if (strcmp(expr->as.implicit.member, "size") == 0) {
+                    if (expr->as.implicit.args.count != 0) {
+                        fail(ctx, "type implicit operation '.size()' takes no arguments");
+                        return 0;
+                    }
+                    out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                    out->as.int_value = type_size_bytes(type);
+                    return out;
+                }
+                if (strcmp(expr->as.implicit.member, "alloc") == 0) {
+                    HirType* pointer_type = 0;
+                    if (expr->as.implicit.args.count != 0) {
+                        fail(ctx, "type implicit operation '.alloc()' takes no arguments");
+                        return 0;
+                    }
+                    if (type->kind == HIR_TYPE_VOID) {
+                        fail(ctx, "alloc requires non-void type");
+                        return 0;
+                    }
+                    pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+                    pointer_type->mutable_flag = 1;
+                    pointer_type->array_item = type;
+                    out = new_expr(HIR_EXPR_CALL, pointer_type, expr->line);
+                    out->as.call.callee = 0;
+                    out->as.call.builtin = HIR_BUILTIN_ALLOC;
+                    return out;
+                }
+                if (strcmp(expr->as.implicit.member, "alloc_array") == 0) {
+                    HirType* slice_type = 0;
+                    HirType* pointer_type = 0;
+                    HirExpr* count = 0;
+                    if (expr->as.implicit.args.count != 1) {
+                        fail(ctx, "type implicit operation '.alloc_array()' expects exactly one argument");
+                        return 0;
+                    }
+                    if (type->kind == HIR_TYPE_VOID) {
+                        fail(ctx, "alloc_array requires non-void element type");
+                        return 0;
+                    }
+                    count = lower_expr_expected(ctx, expr->as.implicit.args.items[0], primitive_type(ctx->program, HIR_TYPE_INT));
+                    if (!count) {
+                        return 0;
+                    }
+                    if (count->type->kind != HIR_TYPE_INT) {
+                        fail(ctx, "alloc_array length must be Int");
+                        return 0;
+                    }
+                    slice_type = new_owned_type(ctx->program, HIR_TYPE_SLICE);
+                    slice_type->mutable_flag = 1;
+                    slice_type->array_item = type;
+                    pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+                    pointer_type->mutable_flag = 1;
+                    pointer_type->array_item = slice_type;
+                    out = new_expr(HIR_EXPR_CALL, pointer_type, expr->line);
+                    out->as.call.callee = 0;
+                    out->as.call.builtin = HIR_BUILTIN_ALLOC_ARRAY;
+                    expr_list_push(&out->as.call.args, count);
+                    return out;
+                }
+                fail(ctx, "unknown implicit type operation");
+                return 0;
             }
             if (strcmp(expr->as.implicit.member, "as") == 0) {
                 HirExpr* value = 0;
@@ -3749,7 +3772,7 @@ static int hir_expr_is_new_constructible(const HirExpr* expr) {
         case HIR_EXPR_ENUM_MEMBER:
             return 1;
         case HIR_EXPR_CALL:
-            if (expr->as.call.builtin == HIR_BUILTIN_SLICE_WITH_CAPACITY) {
+            if (expr->as.call.builtin == HIR_BUILTIN_ALLOC_ARRAY) {
                 return 1;
             }
             return expr->as.call.callee && expr->as.call.callee->struct_init_flag;

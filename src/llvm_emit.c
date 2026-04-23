@@ -492,9 +492,21 @@ static LLVMValueRef emit_builtin_print(FunctionCodegen* cg, const JirExpr* expr)
     return LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(printf_fn), printf_fn, args, 2, "printtmp");
 }
 
-static LLVMValueRef emit_builtin_slice_with_capacity(FunctionCodegen* cg, const JirExpr* expr) {
-    LLVMTypeRef elem_type = llvm_type(cg->context, expr->type->array_item);
-    LLVMTypeRef slice_type = llvm_type(cg->context, expr->type);
+static LLVMValueRef emit_builtin_alloc(FunctionCodegen* cg, const JirExpr* expr) {
+    LLVMValueRef bytes = LLVMSizeOf(llvm_type(cg->context, expr->type->array_item));
+    LLVMValueRef raw_ptr = LLVMBuildCall2(
+        cg->builder,
+        LLVMGlobalGetValueType(get_or_add_malloc(cg->module, cg->context)),
+        get_or_add_malloc(cg->module, cg->context),
+        &bytes,
+        1,
+        "alloc.malloc");
+    return LLVMBuildBitCast(cg->builder, raw_ptr, llvm_type(cg->context, expr->type), "alloc.ptr");
+}
+
+static LLVMValueRef emit_builtin_alloc_array(FunctionCodegen* cg, const JirExpr* expr) {
+    LLVMTypeRef elem_type = llvm_type(cg->context, expr->type->array_item->array_item);
+    LLVMTypeRef slice_type = llvm_type(cg->context, expr->type->array_item);
     LLVMValueRef capacity = emit_expr(cg, expr->as.call.args.items[0]);
     LLVMValueRef elem_bytes = LLVMSizeOf(elem_type);
     LLVMValueRef total_bytes = LLVMBuildMul(cg->builder, capacity, elem_bytes, "slice.bytes");
@@ -507,9 +519,21 @@ static LLVMValueRef emit_builtin_slice_with_capacity(FunctionCodegen* cg, const 
         "slice.malloc");
     LLVMValueRef typed_ptr = LLVMBuildBitCast(cg->builder, raw_ptr, LLVMPointerType(elem_type, 0), "slice.data");
     LLVMValueRef slice_value = LLVMGetUndef(slice_type);
+    LLVMValueRef slice_bytes = LLVMSizeOf(slice_type);
+    LLVMValueRef slice_raw_ptr = 0;
+    LLVMValueRef slice_typed_ptr = 0;
     slice_value = LLVMBuildInsertValue(cg->builder, slice_value, typed_ptr, 0, "slice.ins.ptr");
     slice_value = LLVMBuildInsertValue(cg->builder, slice_value, capacity, 1, "slice.ins.len");
-    return slice_value;
+    slice_raw_ptr = LLVMBuildCall2(
+        cg->builder,
+        LLVMGlobalGetValueType(get_or_add_malloc(cg->module, cg->context)),
+        get_or_add_malloc(cg->module, cg->context),
+        &slice_bytes,
+        1,
+        "slice.struct.malloc");
+    slice_typed_ptr = LLVMBuildBitCast(cg->builder, slice_raw_ptr, llvm_type(cg->context, expr->type), "slice.struct.ptr");
+    LLVMBuildStore(cg->builder, slice_value, slice_typed_ptr);
+    return slice_typed_ptr;
 }
 
 static LLVMValueRef emit_plain_call(FunctionCodegen* cg, const JirFunction* callee_fn, const JirExprList* args_list, const JirType* result_type) {
@@ -899,8 +923,11 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             if (expr->as.call.builtin == JIR_BUILTIN_PANIC) {
                 return emit_builtin_panic(cg);
             }
-            if (expr->as.call.builtin == JIR_BUILTIN_SLICE_WITH_CAPACITY) {
-                return emit_builtin_slice_with_capacity(cg, expr);
+            if (expr->as.call.builtin == JIR_BUILTIN_ALLOC) {
+                return emit_builtin_alloc(cg, expr);
+            }
+            if (expr->as.call.builtin == JIR_BUILTIN_ALLOC_ARRAY) {
+                return emit_builtin_alloc_array(cg, expr);
             }
             if (expr->as.call.builtin == JIR_BUILTIN_POINTER_OFFSET) {
                 LLVMValueRef base = emit_expr(cg, expr->as.call.args.items[0]);

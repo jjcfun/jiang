@@ -1206,13 +1206,10 @@ static int looks_like_typed_array_constructor(Parser* parser) {
     if (probe.error) {
         return 0;
     }
-    if (type.kind == AST_TYPE_ARRAY) {
-        return probe.current.kind == TOKEN_LEFT_BRACKET || probe.current.kind == TOKEN_LEFT_PAREN;
+    if (type.kind != AST_TYPE_ARRAY) {
+        return 0;
     }
-    if (type.kind == AST_TYPE_SLICE) {
-        return probe.current.kind == TOKEN_LEFT_PAREN;
-    }
-    return 0;
+    return probe.current.kind == TOKEN_LEFT_BRACKET || probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
 static int variant_args_are_patterns(Parser* parser) {
@@ -1377,25 +1374,6 @@ static AstExpr* parse_primary(Parser* parser) {
 
     if (looks_like_typed_array_constructor(parser)) {
         AstType array_type = parse_type(parser);
-        if (array_type.kind == AST_TYPE_SLICE) {
-            AstExpr* call = new_expr(AST_EXPR_CALL, token.line);
-            AstStructFieldInit field_init;
-            memset(&field_init, 0, sizeof(field_init));
-            call->as.call.callee = strdup("__slice_with_capacity");
-            type_list_push(&call->as.call.type_args, array_type);
-            if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after slice type")) {
-                return 0;
-            }
-            field_init.value = parse_expr(parser);
-            if (!field_init.value) {
-                return 0;
-            }
-            struct_field_init_list_push(&call->as.call.args, field_init);
-            if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after slice capacity initializer")) {
-                return 0;
-            }
-            return call;
-        }
         if (array_type.kind != AST_TYPE_ARRAY) {
             fail(parser, "typed array constructor requires an array type");
             return 0;
