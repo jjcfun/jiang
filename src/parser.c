@@ -1019,6 +1019,10 @@ static AstType parse_type(Parser* parser) {
     return type;
 }
 
+static int type_uses_empty_tuple_void(const AstType* type) {
+    return type && type->kind == AST_TYPE_VOID;
+}
+
 static int looks_like_destructure(Parser* parser) {
     Parser probe = *parser;
     if (probe.current.kind != TOKEN_LEFT_PAREN) {
@@ -1060,6 +1064,9 @@ static int parse_binding_list(Parser* parser, AstParamList* bindings) {
             return fail(parser, "expected binding type");
         }
         binding.type = parse_type(parser);
+        if (type_uses_empty_tuple_void(&binding.type)) {
+            return fail(parser, "only union variants may use '()' type");
+        }
         if (parser->current.kind != TOKEN_IDENT) {
             return fail(parser, "expected binding name");
         }
@@ -1108,6 +1115,10 @@ static AstBindingPattern* parse_binding_pattern(Parser* parser) {
     }
     if (pattern_has_explicit_type(parser)) {
         pattern->type = parse_type(parser);
+        if (type_uses_empty_tuple_void(&pattern->type)) {
+            fail(parser, "only union variants may use '()' type");
+            return 0;
+        }
     } else {
         memset(&pattern->type, 0, sizeof(pattern->type));
         pattern->type.kind = AST_TYPE_INFER;
@@ -2504,6 +2515,10 @@ static AstStmt* parse_stmt(Parser* parser) {
             return 0;
         }
         stmt->as.for_range.type = parse_type(parser);
+        if (type_uses_empty_tuple_void(&stmt->as.for_range.type)) {
+            fail(parser, "only union variants may use '()' type");
+            return 0;
+        }
         if (parser->current.kind != TOKEN_IDENT) {
             fail(parser, "expected loop variable name");
             return 0;
@@ -2554,6 +2569,10 @@ static AstStmt* parse_stmt(Parser* parser) {
         AstStmt* group_stmt = 0;
         int decl_count = 0;
         decl_type = parse_type(parser);
+        if (type_uses_empty_tuple_void(&decl_type)) {
+            fail(parser, "only union variants may use '()' type");
+            return 0;
+        }
         for (;;) {
             AstStmt* decl = 0;
             if (parser->current.kind != TOKEN_IDENT) {
@@ -2659,6 +2678,9 @@ static int parse_params(Parser* parser, AstParamList* params) {
             param.type = parse_type(parser);
             if (param.type.kind == AST_TYPE_INFER) {
                 return fail(parser, "parameter type cannot be inferred");
+            }
+            if (type_uses_empty_tuple_void(&param.type)) {
+                return fail(parser, "only union variants may use '()' type");
             }
             if (parser->current.kind != TOKEN_IDENT) {
                 return fail(parser, "expected parameter name");
@@ -3050,6 +3072,9 @@ static int parse_extern_item(Parser* parser, AstProgram* out_program, int inheri
         function_list_push(&out_program->functions, fn);
         return 1;
     }
+    if (type_uses_empty_tuple_void(&type)) {
+        return fail(parser, "only union variants may use '()' type");
+    }
     if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after extern global declaration")) {
         return 0;
     }
@@ -3332,6 +3357,9 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             return fail(parser, record_flag ? "expected record field type" : "expected struct field type");
         }
         field_type = parse_type(parser);
+        if (type_uses_empty_tuple_void(&field_type)) {
+            return fail(parser, "only union variants may use '()' type");
+        }
         for (;;) {
             AstStructField field;
             memset(&field, 0, sizeof(field));
@@ -3674,6 +3702,9 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             }
             if (generic_params.count != 0) {
                 return fail(parser, "generic global is not supported");
+            }
+            if (type_uses_empty_tuple_void(&type)) {
+                return fail(parser, "only union variants may use '()' type");
             }
             AstGlobal global;
             memset(&global, 0, sizeof(global));
