@@ -550,6 +550,53 @@ Fn<Bool, Int, Int> compare;
 - 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
 - 通过 `Fn<...>` 变量进行调用
 
+示例 1：顶层函数
+
+```c
+Bool less(Int left, Int right) {
+    return left < right;
+}
+
+Fn<Bool, Int, Int> compare = less;
+Bool ok = compare(1, 2);
+```
+
+示例 2：`static` 方法
+
+```c
+struct Math {
+    static Bool less(Int left, Int right) {
+        return left < right;
+    }
+}
+
+Fn<Bool, Int, Int> compare = Math.less;
+Bool ok = compare(1, 2);
+```
+
+示例 3：实例方法（未绑定方法值）
+
+```c
+struct User {
+    Int id;
+
+    Int add(Int extra) {
+        return self.id + extra;
+    }
+}
+
+Fn<Int, User&, Int> add = User.add;
+
+User user = User { id: 40 };
+Int value = add(user$.ref(), 2);
+```
+
+这里 `User.add` 是未绑定实例方法：
+
+- 第一个参数是接收者引用 `User&`
+- 后续参数与方法声明中的普通参数保持一致
+- 当前需要显式传入 `user$.ref()`
+
 当前不支持：
 
 - 通过实例值获取绑定方法函数值（例如 `value.method`）
@@ -912,7 +959,7 @@ struct User {
 }
 
 Int a = User.zero();
-User user = User(id: 42);
+User user = User { id: 42 };
 Int b = user.value();
 ```
 

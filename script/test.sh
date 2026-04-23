@@ -115,6 +115,8 @@ run_compile_fail package_invalid_name
 run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
 run_sample fn_pointer_minimal.jiang 7
+run_sample fn_pointer_comprehensive_minimal.jiang 83
+run_sample fn_pointer_infer_minimal.jiang 3
 run_sample fn_pointer_static_method_minimal.jiang 3
 run_sample fn_pointer_instance_method_minimal.jiang 42
 run_sample self_keyword_minimal.jiang 42
