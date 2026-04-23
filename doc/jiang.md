@@ -327,7 +327,7 @@ foo[0][1] // 2
 Int a = 123;
 
 // new关键字可以在堆中开辟内存空间，并返回一个指针
-Int* b = new 123;
+Int* b = new Int(123);
 
 // 在堆中创建数组，并返回一个数组指针
 Int[3]* c = new [1, 2, 3];
@@ -365,7 +365,7 @@ Int& b;
 ```c
 Int a = 100;
 
-Int* b = new 200;
+Int* b = new Int(200);
 
 // 指针默认自动解引用，b直接表示了其元素的值
 Int c = a + b;
@@ -403,7 +403,7 @@ Int y = raw[0];
 
 ```c
 // 定义一个指针a，指向堆内存
-Int* a = new 100;
+Int* a = new Int(100);
 
 // 可以主动释放指针的内存空间
 a$.free();
@@ -755,10 +755,17 @@ struct 可以自定义 `init` 函数。
 - `init` 只支持普通位置参数，不支持标签参数
 - 如果类型没有定义 `init`，那么默认字段初始化使用 `Point { field: value }`
 - 只要类型定义了 `init`，就不允许再用 `Point { ... }`
+- `new` 只接受构造形式，不支持任意表达式
+- 例如：
+  - `new Int`
+  - `new Int(123)`
+  - `new Point(...)`
+  - `new Point { ... }`
+  - `new [1, 2, 3]`
 - `new Point(...)` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
 - `struct` / `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
 
-#### record
+### record
 
 `record` 是轻量数据类型，使用字段字面量初始化：
 

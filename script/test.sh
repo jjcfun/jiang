@@ -106,6 +106,7 @@ run_sample pointer_offset_int_minimal.jiang 42
 run_sample many_pointer_assign_minimal.jiang 10
 run_sample as_addr_minimal.jiang 2
 run_sample free_minimal.jiang 0
+run_sample new_primitive_constructor_minimal.jiang 123
 run_sample new_array_repeat_init_minimal.jiang 6
 run_sample multi_file_minimal.jiang 42
 run_sample package_default 42
@@ -387,6 +388,7 @@ run_compile_fail invalid_index_type.jiang
 run_compile_fail invalid_address_of_expr.jiang
 run_compile_fail invalid_deref_non_pointer.jiang
 run_compile_fail invalid_free_non_pointer.jiang
+run_compile_fail invalid_new_non_construct_expr.jiang
 run_compile_fail invalid_pointer_offset_requires_many_pointer.jiang
 run_compile_fail invalid_many_pointer_assign_immutable.jiang
 run_compile_fail invalid_array_list_set_immutable_type_arg.jiang

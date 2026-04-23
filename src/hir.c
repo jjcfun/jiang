@@ -146,6 +146,8 @@ static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line);
 static HirExpr* make_optional_value_expr(LowerContext* ctx, HirExpr* value, int line);
 static HirBinding* lookup_binding(LowerContext* ctx, const char* name);
 static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
+static int hir_expr_is_new_constructible(const HirExpr* expr);
+static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr* expr);
 static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
 static HirFunction* find_function(HirProgram* program, const char* name);
 static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
@@ -2966,10 +2968,17 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_NEW: {
-            HirExpr* value = lower_expr(ctx, expr->as.unary.value);
+            HirExpr* value = lower_new_primitive_constructor(ctx, expr->as.unary.value);
             HirType* pointer_type = 0;
             if (!value) {
-                return 0;
+                value = lower_expr(ctx, expr->as.unary.value);
+                if (!value) {
+                    return 0;
+                }
+                if (!hir_expr_is_new_constructible(value)) {
+                    fail(ctx, "new requires a construction expression");
+                    return 0;
+                }
             }
             pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
             pointer_type->array_item = value->type;
@@ -3699,6 +3708,93 @@ static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr) {
 }
 
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
+
+static int hir_type_supports_new_default_init(HirType* type) {
+    if (!type) {
+        return 0;
+    }
+    switch (type->kind) {
+        case HIR_TYPE_INT:
+        case HIR_TYPE_I8:
+        case HIR_TYPE_I16:
+        case HIR_TYPE_I32:
+        case HIR_TYPE_I64:
+        case HIR_TYPE_U8:
+        case HIR_TYPE_U16:
+        case HIR_TYPE_U32:
+        case HIR_TYPE_U64:
+        case HIR_TYPE_F16:
+        case HIR_TYPE_F32:
+        case HIR_TYPE_F64:
+        case HIR_TYPE_FLOAT:
+        case HIR_TYPE_DOUBLE:
+        case HIR_TYPE_CHARACTER:
+        case HIR_TYPE_UINT8:
+        case HIR_TYPE_BOOL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int hir_expr_is_new_constructible(const HirExpr* expr) {
+    if (!expr) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case HIR_EXPR_STRUCT:
+        case HIR_EXPR_TUPLE:
+        case HIR_EXPR_ARRAY:
+        case HIR_EXPR_VARIANT:
+        case HIR_EXPR_ENUM_MEMBER:
+            return 1;
+        case HIR_EXPR_CALL:
+            if (expr->as.call.builtin == HIR_BUILTIN_SLICE_WITH_CAPACITY) {
+                return 1;
+            }
+            return expr->as.call.callee && expr->as.call.callee->struct_init_flag;
+        default:
+            return 0;
+    }
+}
+
+static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr* expr) {
+    HirType* target_type = 0;
+    HirExpr* arg = 0;
+    if (!expr) {
+        return 0;
+    }
+    if (expr->kind == AST_EXPR_NAME) {
+        target_type = find_named_owner_type(ctx->program, expr->as.name);
+        if (!target_type || !hir_type_supports_new_default_init(target_type)) {
+            return 0;
+        }
+        return make_zero_expr(ctx, target_type, expr->line);
+    }
+    if (expr->kind != AST_EXPR_CALL || expr->as.call.type_args.count != 0) {
+        return 0;
+    }
+    target_type = find_named_owner_type(ctx->program, expr->as.call.callee);
+    if (!target_type || !hir_type_supports_new_default_init(target_type)) {
+        return 0;
+    }
+    if (expr->as.call.args.count == 0) {
+        return make_zero_expr(ctx, target_type, expr->line);
+    }
+    if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) {
+        fail(ctx, "primitive constructor requires zero or one positional argument");
+        return 0;
+    }
+    arg = lower_expr_expected(ctx, expr->as.call.args.items[0].value, target_type);
+    if (!arg) {
+        return 0;
+    }
+    if (!type_equals(arg->type, target_type)) {
+        fail(ctx, "primitive constructor type mismatch");
+        return 0;
+    }
+    return arg;
+}
 
 static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line) {
     int i = 0;

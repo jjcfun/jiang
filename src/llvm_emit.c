@@ -529,6 +529,135 @@ static LLVMValueRef emit_plain_call(FunctionCodegen* cg, const JirFunction* call
     return result;
 }
 
+static int emit_expr_into_ptr(FunctionCodegen* cg, const JirExpr* expr, LLVMValueRef dst_ptr) {
+    int i = 0;
+    if (!expr || !dst_ptr) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case JIR_EXPR_STRUCT:
+            for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+                LLVMValueRef field_ptr = 0;
+                LLVMValueRef indices[2];
+                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context),
+                                          (unsigned long long)expr->as.struct_lit.fields.items[i].field_index,
+                                          0);
+                field_ptr = LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->type),
+                    dst_ptr,
+                    indices,
+                    2,
+                    "new.struct.field");
+                if (!emit_expr_into_ptr(cg, expr->as.struct_lit.fields.items[i].value, field_ptr)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case JIR_EXPR_TUPLE:
+            for (i = 0; i < expr->as.tuple.items.count; ++i) {
+                LLVMValueRef item_ptr = 0;
+                LLVMValueRef indices[2];
+                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context),
+                                          (unsigned long long)i,
+                                          0);
+                item_ptr = LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->type),
+                    dst_ptr,
+                    indices,
+                    2,
+                    "new.tuple.item");
+                if (!emit_expr_into_ptr(cg, expr->as.tuple.items.items[i], item_ptr)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case JIR_EXPR_ARRAY:
+            for (i = 0; i < expr->as.array.items.count; ++i) {
+                LLVMValueRef item_ptr = 0;
+                LLVMValueRef indices[2];
+                indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                indices[1] = LLVMConstInt(LLVMInt64TypeInContext(cg->context),
+                                          (unsigned long long)i,
+                                          0);
+                item_ptr = LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->type),
+                    dst_ptr,
+                    indices,
+                    2,
+                    "new.array.item");
+                if (!emit_expr_into_ptr(cg, expr->as.array.items.items[i], item_ptr)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case JIR_EXPR_UNION_PACK: {
+            LLVMValueRef tag_ptr = 0;
+            LLVMValueRef payload_ptr = 0;
+            LLVMValueRef tag_indices[2];
+            LLVMValueRef payload_indices[2];
+            tag_indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+            tag_indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+            tag_ptr = LLVMBuildInBoundsGEP2(
+                cg->builder,
+                llvm_type(cg->context, expr->type),
+                dst_ptr,
+                tag_indices,
+                2,
+                "new.union.tag.ptr");
+            LLVMBuildStore(
+                cg->builder,
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context),
+                             (unsigned long long)expr->as.union_pack.tag_value,
+                             0),
+                tag_ptr);
+
+            payload_indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+            payload_indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 1, 0);
+            payload_ptr = LLVMBuildInBoundsGEP2(
+                cg->builder,
+                llvm_type(cg->context, expr->type),
+                dst_ptr,
+                payload_indices,
+                2,
+                "new.union.payload.ptr");
+            LLVMBuildStore(cg->builder,
+                           LLVMConstNull(llvm_union_payload_type(cg->context, expr->type)),
+                           payload_ptr);
+
+            for (i = 0; i < expr->as.union_pack.payload_items.count; ++i) {
+                LLVMValueRef slot_ptr = 0;
+                LLVMValueRef slot_indices[2];
+                LLVMValueRef item = emit_expr(cg, expr->as.union_pack.payload_items.items[i]);
+                item = extend_union_payload_value(cg->builder,
+                                                  cg->context,
+                                                  item,
+                                                  expr->as.union_pack.payload_items.items[i]->type);
+                slot_indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+                slot_indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context),
+                                               (unsigned long long)i,
+                                               0);
+                slot_ptr = LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_union_payload_type(cg->context, expr->type),
+                    payload_ptr,
+                    slot_indices,
+                    2,
+                    "new.union.payload.slot");
+                LLVMBuildStore(cg->builder, item, slot_ptr);
+            }
+            return 1;
+        }
+        default:
+            LLVMBuildStore(cg->builder, emit_expr(cg, expr), dst_ptr);
+            return 1;
+    }
+}
+
 static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr) {
     switch (expr->kind) {
         case JIR_EXPR_BINDING:
@@ -708,7 +837,9 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 1,
                 "malloc");
             LLVMValueRef typed_ptr = LLVMBuildBitCast(cg->builder, raw_ptr, llvm_type(cg->context, expr->type), "new.ptr");
-            LLVMBuildStore(cg->builder, emit_expr(cg, expr->as.unary.value), typed_ptr);
+            if (!emit_expr_into_ptr(cg, expr->as.unary.value, typed_ptr)) {
+                return 0;
+            }
             return typed_ptr;
         }
         case JIR_EXPR_FREE: {
