@@ -143,13 +143,15 @@ run_compile_fail invalid_trait_assoc_conflict.jiang
 run_compile_fail invalid_trait_assoc_unqualified_ambiguous_binding.jiang
 run_compile_fail invalid_trait_same_method_name_struct_impl.jiang
 run_compile_fail invalid_trait_same_method_name_extend_impl.jiang
-run_compile_fail invalid_labeled_call_wrong_label.jiang
-run_compile_fail invalid_labeled_call_reordered.jiang
-run_compile_fail invalid_positional_after_labeled_decl.jiang
-run_compile_fail invalid_positional_default_arg.jiang
-run_compile_fail invalid_positional_after_labeled_call.jiang
 run_sample mutable_qualifier_minimal.jiang 42
 run_sample mutable_array_qualifier_minimal.jiang 42
+run_sample record_minimal.jiang 42
+run_sample record_shorthand_minimal.jiang 42
+run_sample grouped_decl_minimal.jiang 51
+run_compile_fail invalid_record_shorthand_no_expected_type.jiang
+run_compile_fail invalid_record_call_syntax_minimal.jiang
+run_compile_fail invalid_struct_brace_literal_minimal.jiang
+run_compile_fail invalid_grouped_var_decl_missing_initializer.jiang
 run_sample break_continue_minimal.jiang 8
 run_sample for_range_minimal.jiang 8
 run_sample for_infer_range_minimal.jiang 5
@@ -204,12 +206,6 @@ run_sample subscriptable_mutable_minimal.jiang 42
 run_compile_fail invalid_subscriptable_write_readonly.jiang
 run_sample extend_trait_inherit_minimal.jiang 63
 run_sample extend_trait_assoc_type_minimal.jiang 42
-run_sample labeled_call_minimal.jiang 42
-run_sample labeled_call_implicit_name_minimal.jiang 42
-run_sample labeled_default_arg_minimal.jiang 42
-run_sample labeled_params_comprehensive_minimal.jiang 73
-run_sample labeled_call_reordered_minimal.jiang 43
-run_sample mixed_labeled_default_arg_minimal.jiang 44
 run_sample builtin_concept_method_minimal.jiang 17
 run_sample enum_concept_decl_minimal.jiang 42
 run_compile_only extern_minimal.jiang
@@ -226,6 +222,7 @@ run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
 run_sample mutable_generic_minimal.jiang 42
 run_sample maybe_mutable_generic_minimal.jiang 42
+run_sample type_modifier_canonical_minimal.jiang 7
 run_sample hash_map_minimal.jiang 20
 run_sample hash_map_collision_minimal.jiang 30
 run_sample hash_map_remove_minimal.jiang 24
@@ -236,6 +233,7 @@ run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
 run_sample call_result_field_minimal.jiang 42
 run_sample struct_init_minimal.jiang 42
+run_sample struct_init_overload_minimal.jiang 43
 run_sample struct_init_with_defaults_minimal.jiang 18
 run_sample struct_init_mixed_params_minimal.jiang 65
 run_sample struct_init_branch_complete_minimal.jiang 42
@@ -455,6 +453,7 @@ run_compile_fail invalid_struct_field.jiang
 run_compile_fail invalid_struct_missing_field.jiang
 run_compile_fail invalid_struct_method_before_feature_misparse.jiang
 run_compile_fail invalid_struct_init_immutable_default_override.jiang
+run_compile_fail invalid_struct_init_duplicate_overload.jiang
 run_compile_fail invalid_struct_init_immutable_reassign.jiang
 run_compile_fail invalid_struct_init_missing_field.jiang
 run_compile_fail invalid_struct_init_read_before_init.jiang

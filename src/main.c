@@ -31,6 +31,7 @@
 #define concept_method_list_push(list, method) VEC_PUSH((list), (method))
 #define assoc_type_decl_list_push(list, assoc_type_decl) VEC_PUSH((list), (assoc_type_decl))
 #define assoc_type_binding_list_push(list, assoc_type_binding) VEC_PUSH((list), (assoc_type_binding))
+#define struct_init_decl_list_push(list, init_decl) VEC_PUSH((list), (init_decl))
 
 static char* dup_text(const char* text) {
     size_t n = strlen(text);
@@ -538,6 +539,20 @@ static AstBindingPattern* clone_binding_pattern(const AstProgram* source, const 
 static int clone_block(const AstProgram* source, const char* prefix, int hide_private, AstBlock* out, const AstBlock* block);
 static AstType ast_type_copy(const AstType* type);
 static int ast_type_is_equal(const AstType* left, const AstType* right);
+static AstType canonicalize_ast_type(AstType type);
+
+static AstType canonicalize_ast_type(AstType type) {
+    while (type.kind == AST_TYPE_OPTIONAL &&
+           type.array_item &&
+           type.array_item->kind == AST_TYPE_OPTIONAL) {
+        AstType inner = ast_type_copy(type.array_item);
+        if (type.mutable_flag) {
+            inner.mutable_flag = 1;
+        }
+        type = inner;
+    }
+    return type;
+}
 
 static AstType clone_type(const AstProgram* source, const char* prefix, int hide_private, const AstType* type) {
     AstType out;
@@ -560,7 +575,7 @@ static AstType clone_type(const AstProgram* source, const char* prefix, int hide
         AstType item = clone_type(source, prefix, hide_private, &type->tuple_items.items[i]);
         type_list_push(&out.tuple_items, item);
     }
-    return out;
+    return canonicalize_ast_type(out);
 }
 
 static AstBindingPattern* clone_binding_pattern(const AstProgram* source, const char* prefix, int hide_private, const AstBindingPattern* pattern) {
@@ -684,7 +699,9 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             out->as.field.name = dup_text(expr->as.field.name);
             break;
         case AST_EXPR_STRUCT:
-            out->as.struct_lit.type_name = remap_exported_name(source, prefix, hide_private, expr->as.struct_lit.type_name);
+            out->as.struct_lit.type_name = expr->as.struct_lit.type_name
+                ? remap_exported_name(source, prefix, hide_private, expr->as.struct_lit.type_name)
+                : 0;
             for (i = 0; i < expr->as.struct_lit.type_args.count; ++i) {
                 type_list_push(&out->as.struct_lit.type_args, clone_type(source, prefix, hide_private, &expr->as.struct_lit.type_args.items[i]));
             }
@@ -732,6 +749,9 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
             out->as.var_decl.type = clone_type(source, prefix, hide_private, &stmt->as.var_decl.type);
             out->as.var_decl.name = dup_text(stmt->as.var_decl.name);
             out->as.var_decl.init = clone_expr(source, prefix, hide_private, stmt->as.var_decl.init);
+            break;
+        case AST_STMT_GROUP:
+            clone_block(source, prefix, hide_private, &out->as.group_stmt, &stmt->as.group_stmt);
             break;
         case AST_STMT_ASSIGN:
             out->as.assign.target = clone_expr(source, prefix, hide_private, stmt->as.assign.target);
@@ -912,9 +932,8 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
     }
     clone_where_constraint_list(source, prefix, hide_private, &out.where_constraints, &decl->where_constraints);
     out.public_flag = public_flag;
-    out.has_init = decl->has_init;
+    out.record_flag = decl->record_flag;
     out.has_deinit = decl->has_deinit;
-    out.init_line = decl->init_line;
     out.deinit_line = decl->deinit_line;
     out.line = decl->line;
     for (i = 0; i < decl->fields.count; ++i) {
@@ -938,17 +957,24 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         binding.line = decl->assoc_type_bindings.items[i].line;
         assoc_type_binding_list_push(&out.assoc_type_bindings, binding);
     }
-    for (i = 0; i < decl->init_params.count; ++i) {
-        AstParam param;
-        memset(&param, 0, sizeof(param));
-        param.type = clone_type(source, prefix, hide_private, &decl->init_params.items[i].type);
-        param.label = decl->init_params.items[i].label ? dup_text(decl->init_params.items[i].label) : 0;
-        param.name = dup_text(decl->init_params.items[i].name);
-        param.default_value = clone_expr(source, prefix, hide_private, decl->init_params.items[i].default_value);
-        param.line = decl->init_params.items[i].line;
-        param_list_push(&out.init_params, param);
+    for (i = 0; i < decl->init_overloads.count; ++i) {
+        AstStructInitDecl init_decl;
+        int j = 0;
+        memset(&init_decl, 0, sizeof(init_decl));
+        init_decl.line = decl->init_overloads.items[i].line;
+        for (j = 0; j < decl->init_overloads.items[i].params.count; ++j) {
+            AstParam param;
+            memset(&param, 0, sizeof(param));
+            param.type = clone_type(source, prefix, hide_private, &decl->init_overloads.items[i].params.items[j].type);
+            param.label = decl->init_overloads.items[i].params.items[j].label ? dup_text(decl->init_overloads.items[i].params.items[j].label) : 0;
+            param.name = dup_text(decl->init_overloads.items[i].params.items[j].name);
+            param.default_value = clone_expr(source, prefix, hide_private, decl->init_overloads.items[i].params.items[j].default_value);
+            param.line = decl->init_overloads.items[i].params.items[j].line;
+            param_list_push(&init_decl.params, param);
+        }
+        clone_block(source, prefix, hide_private, &init_decl.body, &decl->init_overloads.items[i].body);
+        struct_init_decl_list_push(&out.init_overloads, init_decl);
     }
-    clone_block(source, prefix, hide_private, &out.init_body, &decl->init_body);
     clone_block(source, prefix, hide_private, &out.deinit_body, &decl->deinit_body);
     return out;
 }
@@ -3617,7 +3643,7 @@ static AstType ast_type_copy(const AstType* type) {
         type_list_push(&out.tuple_items, ast_type_copy(&type->tuple_items.items[i]));
     }
     out.array_length = type->array_length;
-    return out;
+    return canonicalize_ast_type(out);
 }
 
 static char* mangle_type_name(const AstType* type) {
@@ -3765,7 +3791,7 @@ static AstType substitute_type(const AstType* type, const TypeSubstList* subst) 
         type_list_push(&out.tuple_items, substitute_type(&type->tuple_items.items[i], subst));
     }
     out.array_length = type->array_length;
-    return out;
+    return canonicalize_ast_type(out);
 }
 
 static int ast_type_is_equal(const AstType* left, const AstType* right) {
@@ -3867,8 +3893,10 @@ static AstType infer_expr_type(const AstProgram* program, const LocalTypeList* l
             return out;
         }
         case AST_EXPR_STRUCT:
-            out.kind = AST_TYPE_NAMED;
-            out.named_name = dup_text(expr->as.struct_lit.type_name);
+            if (expr->as.struct_lit.type_name) {
+                out.kind = AST_TYPE_NAMED;
+                out.named_name = dup_text(expr->as.struct_lit.type_name);
+            }
             return out;
         case AST_EXPR_CALL: {
             const AstFunction* fn = find_ast_function_exact(program, expr->as.call.callee);
@@ -4071,7 +4099,7 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.field.name = dup_text(expr->as.field.name);
             break;
         case AST_EXPR_STRUCT:
-            out->as.struct_lit.type_name = dup_text(expr->as.struct_lit.type_name);
+            out->as.struct_lit.type_name = expr->as.struct_lit.type_name ? dup_text(expr->as.struct_lit.type_name) : 0;
             for (i = 0; i < expr->as.struct_lit.type_args.count; ++i) {
                 type_list_push(&out->as.struct_lit.type_args, clone_type_subst(&expr->as.struct_lit.type_args.items[i], subst));
             }
@@ -4132,6 +4160,11 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
             out->as.var_decl.type = clone_type_subst(&stmt->as.var_decl.type, subst);
             out->as.var_decl.name = dup_text(stmt->as.var_decl.name);
             out->as.var_decl.init = clone_expr_subst(stmt->as.var_decl.init, subst);
+            break;
+        case AST_STMT_GROUP:
+            for (i = 0; i < stmt->as.group_stmt.stmts.count; ++i) {
+                stmt_list_push(&out->as.group_stmt.stmts, clone_stmt_subst(stmt->as.group_stmt.stmts.items[i], subst));
+            }
             break;
         case AST_STMT_ASSIGN:
             out->as.assign.target = clone_expr_subst(stmt->as.assign.target, subst);
@@ -4228,6 +4261,8 @@ static int transform_stmt(MonoContext* mono, AstStmt* stmt, LocalTypeList* local
             local_type_list_push(locals, entry);
             return 1;
         }
+        case AST_STMT_GROUP:
+            return transform_block(mono, &stmt->as.group_stmt, locals);
         case AST_STMT_ASSIGN:
             return transform_expr(mono, stmt->as.assign.target, locals) &&
                    transform_expr(mono, stmt->as.assign.value, locals);
@@ -4387,9 +4422,8 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     memset(&decl, 0, sizeof(decl));
     decl.name = dup_text(*instantiated_name);
     decl.public_flag = templ->public_flag;
-    decl.has_init = templ->has_init;
+    decl.record_flag = templ->record_flag;
     decl.has_deinit = templ->has_deinit;
-    decl.init_line = templ->init_line;
     decl.deinit_line = templ->deinit_line;
     decl.line = templ->line;
     for (i = 0; i < templ->concept_names.count; ++i) {
@@ -4414,19 +4448,26 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
         field.default_value = clone_expr_subst(field.default_value, &subst);
         struct_field_list_push(&decl.fields, field);
     }
-    for (i = 0; i < templ->init_params.count; ++i) {
-        AstParam param = templ->init_params.items[i];
-        param.type = clone_type_subst(&param.type, &subst);
-        param.label = param.label ? dup_text(param.label) : 0;
-        param.name = dup_text(param.name);
-        param.default_value = clone_expr_subst(param.default_value, &subst);
-        param_list_push(&decl.init_params, param);
-    }
-    for (i = 0; i < templ->init_body.stmts.count; ++i) {
-        stmt_list_push(&decl.init_body.stmts, clone_stmt_subst(templ->init_body.stmts.items[i], &subst));
-    }
-    if (!transform_block(mono, &decl.init_body, &(LocalTypeList){0})) {
-        return 0;
+    for (i = 0; i < templ->init_overloads.count; ++i) {
+        AstStructInitDecl init_decl;
+        int j = 0;
+        memset(&init_decl, 0, sizeof(init_decl));
+        init_decl.line = templ->init_overloads.items[i].line;
+        for (j = 0; j < templ->init_overloads.items[i].params.count; ++j) {
+            AstParam param = templ->init_overloads.items[i].params.items[j];
+            param.type = clone_type_subst(&param.type, &subst);
+            param.label = param.label ? dup_text(param.label) : 0;
+            param.name = dup_text(param.name);
+            param.default_value = clone_expr_subst(param.default_value, &subst);
+            param_list_push(&init_decl.params, param);
+        }
+        for (j = 0; j < templ->init_overloads.items[i].body.stmts.count; ++j) {
+            stmt_list_push(&init_decl.body.stmts, clone_stmt_subst(templ->init_overloads.items[i].body.stmts.items[j], &subst));
+        }
+        if (!transform_block(mono, &init_decl.body, &(LocalTypeList){0})) {
+            return 0;
+        }
+        struct_init_decl_list_push(&decl.init_overloads, init_decl);
     }
     for (i = 0; i < templ->deinit_body.stmts.count; ++i) {
         stmt_list_push(&decl.deinit_body.stmts, clone_stmt_subst(templ->deinit_body.stmts.items[i], &subst));
@@ -4556,7 +4597,7 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
                     return 0;
                 }
             }
-            if (expr->as.struct_lit.type_args.count > 0) {
+            if (expr->as.struct_lit.type_name && expr->as.struct_lit.type_args.count > 0) {
                 const AstStructDecl* templ = find_generic_struct_template(mono->source, expr->as.struct_lit.type_name);
                 char* instantiated_name = 0;
                 if (!templ) {
@@ -4653,13 +4694,16 @@ static int monomorphize_program(const AstProgram* source, AstProgram* out, const
     }
     for (i = 0; i < source->structs.count; ++i) {
         AstStructDecl decl;
+        int init_index = 0;
         if (source->structs.items[i].type_params.count > 0) {
             continue;
         }
         decl = clone_struct_decl(source, 0, 0, &source->structs.items[i], source->structs.items[i].public_flag);
-        if (!transform_block(&mono, &decl.init_body, &(LocalTypeList){0})) {
-            *error = mono.error;
-            return 0;
+        for (init_index = 0; init_index < decl.init_overloads.count; ++init_index) {
+            if (!transform_block(&mono, &decl.init_overloads.items[init_index].body, &(LocalTypeList){0})) {
+                *error = mono.error;
+                return 0;
+            }
         }
         struct_list_push(&out->structs, decl);
     }

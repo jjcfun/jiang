@@ -167,6 +167,7 @@ static int token_equals(const Token* token, const char* text) {
 #define concept_method_list_push(list, method) VEC_PUSH((list), (method))
 #define assoc_type_decl_list_push(list, assoc_type_decl) VEC_PUSH((list), (assoc_type_decl))
 #define assoc_type_binding_list_push(list, assoc_type_binding) VEC_PUSH((list), (assoc_type_binding))
+#define struct_init_decl_list_push(list, init_decl) VEC_PUSH((list), (init_decl))
 #define where_constraint_list_push(list, constraint) VEC_PUSH((list), (constraint))
 #define struct_list_push(list, struct_decl) VEC_PUSH((list), (struct_decl))
 
@@ -197,12 +198,38 @@ static AstBindingPattern* new_binding_pattern(AstBindingPatternKind kind, int li
     return pattern;
 }
 
+static AstType* heap_type_copy(const AstType* type);
+
+static AstType ast_type_copy_local(const AstType* type) {
+    AstType out;
+    int i = 0;
+    memset(&out, 0, sizeof(out));
+    if (!type) {
+        return out;
+    }
+    out = *type;
+    out.named_name = type->named_name ? dup_text(type->named_name) : 0;
+    memset(&out.type_args, 0, sizeof(out.type_args));
+    memset(&out.tuple_items, 0, sizeof(out.tuple_items));
+    out.array_item = 0;
+    for (i = 0; i < type->type_args.count; ++i) {
+        type_list_push(&out.type_args, ast_type_copy_local(&type->type_args.items[i]));
+    }
+    for (i = 0; i < type->tuple_items.count; ++i) {
+        type_list_push(&out.tuple_items, ast_type_copy_local(&type->tuple_items.items[i]));
+    }
+    if (type->array_item) {
+        out.array_item = heap_type_copy(type->array_item);
+    }
+    return out;
+}
+
 static AstType* heap_type_copy(const AstType* type) {
     AstType* copy = (AstType*)malloc(sizeof(AstType));
     if (!copy) {
         return 0;
     }
-    *copy = *type;
+    *copy = ast_type_copy_local(type);
     return copy;
 }
 
@@ -261,23 +288,68 @@ static int parse_params(Parser* parser, AstParamList* params);
 static AstExpr* parse_implicit_member(Parser* parser, int line, AstExpr* value_target);
 static AstExpr* parse_type_implicit_expr(Parser* parser, int line);
 
+static int ast_type_equals(const AstType* left, const AstType* right) {
+    int i = 0;
+    if (left->kind != right->kind || left->mutable_flag != right->mutable_flag) {
+        return 0;
+    }
+    if (left->kind == AST_TYPE_NAMED) {
+        if ((!left->named_name) != (!right->named_name)) {
+            return 0;
+        }
+        if (left->named_name && strcmp(left->named_name, right->named_name) != 0) {
+            return 0;
+        }
+    }
+    if (left->kind == AST_TYPE_ARRAY && left->array_length != right->array_length) {
+        return 0;
+    }
+    if (left->kind == AST_TYPE_POINTER ||
+        left->kind == AST_TYPE_MANY_POINTER ||
+        left->kind == AST_TYPE_ARRAY ||
+        left->kind == AST_TYPE_SLICE ||
+        left->kind == AST_TYPE_OPTIONAL) {
+        if ((!left->array_item) != (!right->array_item)) {
+            return 0;
+        }
+        if (left->array_item && !ast_type_equals(left->array_item, right->array_item)) {
+            return 0;
+        }
+    }
+    if (left->type_args.count != right->type_args.count ||
+        left->tuple_items.count != right->tuple_items.count) {
+        return 0;
+    }
+    for (i = 0; i < left->type_args.count; ++i) {
+        if (!ast_type_equals(&left->type_args.items[i], &right->type_args.items[i])) {
+            return 0;
+        }
+    }
+    for (i = 0; i < left->tuple_items.count; ++i) {
+        if (!ast_type_equals(&left->tuple_items.items[i], &right->tuple_items.items[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static AstExpr* make_range_expr(AstExpr* start, AstExpr* end, int line) {
-    AstExpr* range = new_expr(AST_EXPR_CALL, line);
+    AstExpr* range = new_expr(AST_EXPR_STRUCT, line);
     AstStructFieldInit field_init;
 
-    range->as.call.callee = dup_text("Range");
+    range->as.struct_lit.type_name = dup_text("Range");
 
     memset(&field_init, 0, sizeof(field_init));
     field_init.name = dup_text("start");
     field_init.value = start;
     field_init.line = line;
-    struct_field_init_list_push(&range->as.call.args, field_init);
+    struct_field_init_list_push(&range->as.struct_lit.fields, field_init);
 
     memset(&field_init, 0, sizeof(field_init));
     field_init.name = dup_text("end");
     field_init.value = end;
     field_init.line = line;
-    struct_field_init_list_push(&range->as.call.args, field_init);
+    struct_field_init_list_push(&range->as.struct_lit.fields, field_init);
 
     return range;
 }
@@ -715,11 +787,14 @@ static int looks_like_var_decl(Parser* parser) {
     if (probe.error) {
         return 0;
     }
-    return probe.current.kind == TOKEN_IDENT && probe.next.kind == TOKEN_ASSIGN;
+    return probe.current.kind == TOKEN_IDENT &&
+           (probe.next.kind == TOKEN_ASSIGN ||
+            probe.next.kind == TOKEN_COMMA ||
+            probe.next.kind == TOKEN_SEMICOLON);
 }
 
 static AstType parse_type_postfix(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION) {
         if (parser->current.kind == TOKEN_BANG) {
             type.mutable_flag = 1;
             advance(parser);
@@ -733,12 +808,16 @@ static AstType parse_type_postfix(Parser* parser, AstType type) {
             type.array_item = heap_type_copy(&pointee);
             continue;
         }
-        if (parser->current.kind == TOKEN_QUESTION) {
+        if (parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION) {
             AstType wrapped = type;
             advance(parser);
-            memset(&type, 0, sizeof(type));
-            type.kind = AST_TYPE_OPTIONAL;
-            type.array_item = heap_type_copy(&wrapped);
+            if (wrapped.kind == AST_TYPE_OPTIONAL) {
+                type = wrapped;
+            } else {
+                memset(&type, 0, sizeof(type));
+                type.kind = AST_TYPE_OPTIONAL;
+                type.array_item = heap_type_copy(&wrapped);
+            }
             continue;
         }
         if (parser->current.kind == TOKEN_LEFT_BRACKET) {
@@ -1458,6 +1537,39 @@ static AstExpr* parse_primary(Parser* parser) {
         return struct_lit;
     }
 
+    if (token.kind == TOKEN_LEFT_BRACE) {
+        AstExpr* struct_lit = new_expr(AST_EXPR_STRUCT, token.line);
+        advance(parser);
+        if (parser->current.kind != TOKEN_RIGHT_BRACE) {
+            for (;;) {
+                AstStructFieldInit field_init;
+                memset(&field_init, 0, sizeof(field_init));
+                field_init.line = parser->current.line;
+                if (parser->current.kind != TOKEN_IDENT || parser->next.kind != TOKEN_COLON) {
+                    fail(parser, "expected record field name");
+                    return 0;
+                }
+                field_init.name = token_dup(&parser->current);
+                advance(parser);
+                advance(parser);
+                field_init.value = parse_expr(parser);
+                if (!field_init.value) {
+                    return 0;
+                }
+                struct_field_init_list_push(&struct_lit->as.struct_lit.fields, field_init);
+                if (parser->current.kind == TOKEN_COMMA) {
+                    advance(parser);
+                    continue;
+                }
+                break;
+            }
+        }
+        if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after record literal")) {
+            return 0;
+        }
+        return struct_lit;
+    }
+
     if (token.kind == TOKEN_INT_LIT) {
         errno = 0;
         value = strtoll(token.start, &end, 10);
@@ -1627,16 +1739,8 @@ static AstExpr* parse_postfix(Parser* parser) {
                 for (;;) {
                     AstStructFieldInit arg;
                     memset(&arg, 0, sizeof(arg));
-                    if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_COLON) {
-                        arg.name = token_dup(&parser->current);
-                        arg.line = parser->current.line;
-                        advance(parser);
-                        advance(parser);
-                        arg.value = parse_expr(parser);
-                    } else {
-                        arg.line = parser->current.line;
-                        arg.value = parse_expr(parser);
-                    }
+                    arg.line = parser->current.line;
+                    arg.value = parse_expr(parser);
                     if (!arg.value) {
                         return 0;
                     }
@@ -2461,25 +2565,49 @@ static AstStmt* parse_stmt(Parser* parser) {
     }
 
     if (looks_like_var_decl(parser)) {
-        stmt = new_stmt(AST_STMT_VAR_DECL, parser->current.line);
-        stmt->as.var_decl.type = parse_type(parser);
-        if (parser->current.kind != TOKEN_IDENT) {
-            fail(parser, "expected identifier after type");
-            return 0;
-        }
-        stmt->as.var_decl.name = token_dup(&parser->current);
-        advance(parser);
-        if (!expect(parser, TOKEN_ASSIGN, "expected '=' in variable declaration")) {
-            return 0;
-        }
-        stmt->as.var_decl.init = parse_var_decl_init_expr(parser);
-        if (!stmt->as.var_decl.init) {
-            return 0;
+        AstType decl_type;
+        AstStmt* first_decl = 0;
+        AstStmt* group_stmt = 0;
+        int decl_count = 0;
+        decl_type = parse_type(parser);
+        for (;;) {
+            AstStmt* decl = 0;
+            if (parser->current.kind != TOKEN_IDENT) {
+                fail(parser, "expected identifier after type");
+                return 0;
+            }
+            decl = new_stmt(AST_STMT_VAR_DECL, parser->current.line);
+            decl->as.var_decl.type = ast_type_copy_local(&decl_type);
+            decl->as.var_decl.name = token_dup(&parser->current);
+            advance(parser);
+            if (parser->current.kind != TOKEN_ASSIGN) {
+                fail(parser, "expected '=' in variable declaration");
+                return 0;
+            }
+            advance(parser);
+            decl->as.var_decl.init = parse_var_decl_init_expr(parser);
+            if (!decl->as.var_decl.init) {
+                return 0;
+            }
+            if (decl_count == 0) {
+                first_decl = decl;
+            } else {
+                if (!group_stmt) {
+                    group_stmt = new_stmt(AST_STMT_GROUP, first_decl->line);
+                    stmt_list_push(&group_stmt->as.group_stmt.stmts, first_decl);
+                }
+                stmt_list_push(&group_stmt->as.group_stmt.stmts, decl);
+            }
+            decl_count += 1;
+            if (parser->current.kind != TOKEN_COMMA) {
+                break;
+            }
+            advance(parser);
         }
         if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after variable declaration")) {
             return 0;
         }
-        return stmt;
+        return group_stmt ? group_stmt : first_decl;
     }
 
     if (parser->current.kind == TOKEN_IDENT || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_LEFT_PAREN) {
@@ -2538,59 +2666,22 @@ static int parse_params(Parser* parser, AstParamList* params) {
         return 0;
     }
     if (parser->current.kind != TOKEN_RIGHT_PAREN) {
-        int seen_labeled = 0;
         for (;;) {
             AstParam param;
-            int is_labeled = 0;
             memset(&param, 0, sizeof(param));
-            if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_COLON) {
-                is_labeled = 1;
-                seen_labeled = 1;
-                param.label = token_dup(&parser->current);
-                advance(parser);
-                advance(parser);
-                if (!is_type_start(parser)) {
-                    return fail(parser, "expected parameter type");
-                }
-                param.type = parse_type(parser);
-                if (param.type.kind == AST_TYPE_INFER) {
-                    return fail(parser, "parameter type cannot be inferred");
-                }
-                if (parser->current.kind == TOKEN_IDENT) {
-                    param.name = token_dup(&parser->current);
-                    param.line = parser->current.line;
-                    advance(parser);
-                } else {
-                    param.name = dup_text(param.label);
-                }
-            } else {
-                if (!is_type_start(parser)) {
-                    return fail(parser, "expected parameter type");
-                }
-                param.type = parse_type(parser);
-                if (param.type.kind == AST_TYPE_INFER) {
-                    return fail(parser, "parameter type cannot be inferred");
-                }
-                if (parser->current.kind != TOKEN_IDENT) {
-                    return fail(parser, "expected parameter name");
-                }
-                if (seen_labeled) {
-                    return fail(parser, "positional parameters must appear before labeled parameters");
-                }
-                param.name = token_dup(&parser->current);
-                param.line = parser->current.line;
-                advance(parser);
+            if (!is_type_start(parser)) {
+                return fail(parser, "expected parameter type");
             }
-            if (parser->current.kind == TOKEN_ASSIGN) {
-                if (!is_labeled) {
-                    return fail(parser, "positional parameters cannot have default values");
-                }
-                advance(parser);
-                param.default_value = parse_expr(parser);
-                if (!param.default_value) {
-                    return 0;
-                }
+            param.type = parse_type(parser);
+            if (param.type.kind == AST_TYPE_INFER) {
+                return fail(parser, "parameter type cannot be inferred");
             }
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, "expected parameter name");
+            }
+            param.name = token_dup(&parser->current);
+            param.line = parser->current.line;
+            advance(parser);
             param_list_push(params, param);
             if (parser->current.kind == TOKEN_COMMA) {
                 advance(parser);
@@ -3095,16 +3186,17 @@ static int parse_enum_decl(Parser* parser, AstProgram* out_program) {
     return 1;
 }
 
-static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameList* generic_params) {
+static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameList* generic_params, int record_flag) {
     AstStructDecl struct_decl;
     memset(&struct_decl, 0, sizeof(struct_decl));
+    struct_decl.record_flag = record_flag;
     if (generic_params) {
         struct_decl.type_params = *generic_params;
         memset(generic_params, 0, sizeof(*generic_params));
     }
     advance(parser);
     if (parser->current.kind != TOKEN_IDENT) {
-        return fail(parser, "expected struct name");
+        return fail(parser, record_flag ? "expected record name" : "expected struct name");
     }
     struct_decl.name = token_dup(&parser->current);
     struct_decl.line = parser->current.line;
@@ -3121,7 +3213,10 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
     if (!parse_decl_concept_names(parser, &struct_decl.concept_names)) {
         return 0;
     }
-    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after struct name")) {
+    if (record_flag && struct_decl.concept_names.count != 0) {
+        return fail(parser, "record trait implementation is not supported");
+    }
+    if (!expect(parser, TOKEN_LEFT_BRACE, record_flag ? "expected '{' after record name" : "expected '{' after struct name")) {
         return 0;
     }
     while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
@@ -3139,6 +3234,9 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
         if (parser->current.kind == TOKEN_KW_TYPE) {
             AstAssocTypeBinding binding;
             memset(&binding, 0, sizeof(binding));
+            if (record_flag) {
+                return fail(parser, "record associated type binding is not supported");
+            }
             if (struct_decl.concept_names.count == 0) {
                 return fail(parser, "associated type binding requires declared trait implementation");
             }
@@ -3166,6 +3264,9 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             token_equals(&parser->next, "deinit")) {
             return fail(parser, "deinit must not be public");
         }
+        if (record_flag && parser->current.kind == TOKEN_KW_PUBLIC) {
+            return fail(parser, "record fields must not be public");
+        }
         if (parser->current.kind == TOKEN_KW_PUBLIC &&
             parser->next.kind == TOKEN_IDENT &&
             token_equals(&parser->next, "init")) {
@@ -3177,21 +3278,42 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             return fail(parser, "static deinit not allowed");
         }
         if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "init") && parser->next.kind == TOKEN_LEFT_PAREN) {
-            if (struct_decl.has_init) {
-                return fail(parser, "duplicate struct init");
+            AstStructInitDecl init_decl;
+            int init_index = 0;
+            memset(&init_decl, 0, sizeof(init_decl));
+            if (record_flag) {
+                return fail(parser, "record init is not supported");
             }
-            struct_decl.has_init = 1;
-            struct_decl.init_line = parser->current.line;
+            init_decl.line = parser->current.line;
             advance(parser);
-            if (!parse_params(parser, &struct_decl.init_params)) {
+            if (!parse_params(parser, &init_decl.params)) {
                 return 0;
             }
-            if (!parse_block(parser, &struct_decl.init_body)) {
+            for (init_index = 0; init_index < struct_decl.init_overloads.count; ++init_index) {
+                AstStructInitDecl* existing = &struct_decl.init_overloads.items[init_index];
+                int param_index = 0;
+                if (existing->params.count != init_decl.params.count) {
+                    continue;
+                }
+                for (param_index = 0; param_index < existing->params.count; ++param_index) {
+                    if (!ast_type_equals(&existing->params.items[param_index].type, &init_decl.params.items[param_index].type)) {
+                        break;
+                    }
+                }
+                if (param_index == existing->params.count) {
+                    return fail(parser, "duplicate struct init");
+                }
+            }
+            if (!parse_block(parser, &init_decl.body)) {
                 return 0;
             }
+            struct_init_decl_list_push(&struct_decl.init_overloads, init_decl);
             continue;
         }
         if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "deinit") && parser->next.kind == TOKEN_LEFT_PAREN) {
+            if (record_flag) {
+                return fail(parser, "record deinit is not supported");
+            }
             if (struct_decl.has_deinit) {
                 return fail(parser, "duplicate struct deinit");
             }
@@ -3210,39 +3332,50 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             continue;
         }
         if (parser->current.kind == TOKEN_KW_STATIC || looks_like_method_decl(parser)) {
+            if (record_flag) {
+                return fail(parser, "record methods are not supported");
+            }
             if (!parse_method_decl(parser, out_program, struct_decl.name, &where_constraints)) {
                 return 0;
             }
             continue;
         }
         if (where_constraints.count != 0) {
-            return fail(parser, "@where(...) requires a generic function or struct");
+            return fail(parser, record_flag ? "@where(...) requires a generic function, struct, or record" : "@where(...) requires a generic function or struct");
         }
-        AstStructField field;
-        memset(&field, 0, sizeof(field));
+        AstType field_type;
         if (!is_type_start(parser)) {
-            return fail(parser, "expected struct field type");
+            return fail(parser, record_flag ? "expected record field type" : "expected struct field type");
         }
-        field.type = parse_type(parser);
-        if (parser->current.kind != TOKEN_IDENT) {
-            return fail(parser, "expected struct field name");
-        }
-        field.name = token_dup(&parser->current);
-        field.line = parser->current.line;
-        advance(parser);
-        if (parser->current.kind == TOKEN_ASSIGN) {
-            advance(parser);
-            field.default_value = parse_expr(parser);
-            if (!field.default_value) {
-                return 0;
+        field_type = parse_type(parser);
+        for (;;) {
+            AstStructField field;
+            memset(&field, 0, sizeof(field));
+            field.type = ast_type_copy_local(&field_type);
+            if (parser->current.kind != TOKEN_IDENT) {
+                return fail(parser, record_flag ? "expected record field name" : "expected struct field name");
             }
+            field.name = token_dup(&parser->current);
+            field.line = parser->current.line;
+            advance(parser);
+            if (parser->current.kind == TOKEN_ASSIGN) {
+                advance(parser);
+                field.default_value = parse_expr(parser);
+                if (!field.default_value) {
+                    return 0;
+                }
+            }
+            struct_field_list_push(&struct_decl.fields, field);
+            if (parser->current.kind != TOKEN_COMMA) {
+                break;
+            }
+            advance(parser);
         }
-        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after struct field")) {
+        if (!expect(parser, TOKEN_SEMICOLON, record_flag ? "expected ';' after record field" : "expected ';' after struct field")) {
             return 0;
         }
-        struct_field_list_push(&struct_decl.fields, field);
     }
-    if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after struct declaration")) {
+    if (!expect(parser, TOKEN_RIGHT_BRACE, record_flag ? "expected '}' after record declaration" : "expected '}' after struct declaration")) {
         return 0;
     }
     struct_list_push(&out_program->structs, struct_decl);
@@ -3415,8 +3548,9 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             out_program->enums.items[out_program->enums.count - 1].public_flag = public_flag;
             continue;
         }
-        if (parser->current.kind == TOKEN_KW_STRUCT) {
-            if (!parse_struct_decl(parser, out_program, &generic_params)) {
+        if (parser->current.kind == TOKEN_KW_STRUCT || parser->current.kind == TOKEN_KW_RECORD) {
+            int record_flag = parser->current.kind == TOKEN_KW_RECORD;
+            if (!parse_struct_decl(parser, out_program, &generic_params, record_flag)) {
                 return 0;
             }
             out_program->structs.items[out_program->structs.count - 1].where_constraints = where_constraints;

@@ -353,6 +353,18 @@ typedef struct AstParamList {
     int capacity;
 } AstParamList;
 
+typedef struct AstStructInitDecl {
+    AstParamList params;
+    AstBlock body;
+    int line;
+} AstStructInitDecl;
+
+typedef struct AstStructInitDeclList {
+    AstStructInitDecl* items;
+    int count;
+    int capacity;
+} AstStructInitDeclList;
+
 struct AstConceptMethod {
     AstType return_type;
     char* name;
@@ -412,6 +424,7 @@ typedef struct AstConceptList {
 typedef enum AstStmtKind {
     AST_STMT_RETURN = 0,
     AST_STMT_VAR_DECL,
+    AST_STMT_GROUP,
     AST_STMT_ASSIGN,
     AST_STMT_IF,
     AST_STMT_SWITCH,
@@ -437,6 +450,7 @@ struct AstStmt {
             char* name;
             AstExpr* init;
         } var_decl;
+        AstBlock group_stmt;
         struct {
             AstExpr* target;
             AstExpr* value;
@@ -513,13 +527,11 @@ struct AstStructDecl {
     AstNameList concept_names;
     AstAssocTypeBindingList assoc_type_bindings;
     AstStructFieldList fields;
-    AstParamList init_params;
-    AstBlock init_body;
+    AstStructInitDeclList init_overloads;
     AstBlock deinit_body;
     int public_flag;
-    int has_init;
+    int record_flag;
     int has_deinit;
-    int init_line;
     int deinit_line;
     int line;
 };

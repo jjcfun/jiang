@@ -547,52 +547,21 @@ sort(list, { (a, b) -> a < b });
 sort(list, { (_ a, _ b) -> a < b });
 ```
 
-#### 带标签参数
+#### 函数参数
 
-Jiang 支持带参数标签的函数参数。声明形式如下：
+Jiang 目前只支持普通位置参数：
 
 ```c
-Int foo(Int value, label1: Int arg1, label2: Int, label3: Int = 100)
+Int add(Int base, Int extra) {
+    return base + extra;
+}
 ```
 
 规则如下：
 
-- 不带标签的参数与普通参数一样，必须放在前面
-- 不带标签的参数调用时仍按位置传参，顺序不能变化
-- 不带标签的参数不能有默认值
-- `label: Type name` 表示标签名与局部参数名分开
-- `label: Type` 表示省略参数名，此时参数名默认与标签相同
-- 带标签参数必须放在所有不带标签参数之后
-- 带标签参数在调用时必须写标签
-- 带标签参数在调用时顺序可以变化
-- 带标签参数可以有默认值；调用时可以省略不传
-- 最终函数签名中的参数顺序仍然保持定义时顺序
-
-```c
-Int add(Int base, extra: Int other = 2, bonus: Int = 0) {
-    return base + other + bonus;
-}
-
-Int main() {
-    return add(40, bonus: 2);
-}
-```
-
-以下写法合法：
-
-```c
-foo(1, label1: 2, label2: 3)
-foo(1, label2: 3, label1: 2)
-```
-
-以下写法不合法：
-
-```c
-foo(label1: 1, 2)                // 位置参数不能出现在标签参数之后
-Int foo(Int a = 1, label: Int)   // 不带标签的参数不能有默认值
-Int foo(label: Int, Int a)       // 不带标签的参数必须放在带标签参数前面
-foo(1, other: 2, label2: 3)      // 标签名必须匹配
-```
+- 参数按定义顺序匹配
+- 当前不支持标签参数
+- 当前不支持默认参数
 
 ### 控制流（Control Flow）
 
@@ -756,16 +725,16 @@ struct Offset {
 }
 
 // 定义一个结构体常量
-Point point1 = Point(x: 0, y: 0)
+Point point1 = Point { x: 0, y: 0 }
 // 与以下两种方式等价
-_ point1 = Point(x: 0, y: 0)
-Point point1 = Point(x: 0, y: 0)
+_ point1 = Point { x: 0, y: 0 }
+Point point1 = Point { x: 0, y: 0 }
 
 Point point move_point(Point point, Offset offset) {
   // 返回一个新的point
-  return Point(x: point.x + offset.x, y: point.y + offset.y)
+  return Point { x: point.x + offset.x, y: point.y + offset.y }
   // 与以下方式等价
-  // return Point(x: point.x + offset.x, y: point.y + offset.y)
+  // return Point { x: point.x + offset.x, y: point.y + offset.y }
 }
 ```
 
@@ -775,40 +744,69 @@ struct 可以自定义 `init` 函数。
 
 `init` 具有以下语义：
 
-- `init` 是结构体内唯一的特殊构造器入口
+- `init` 是结构体内的特殊构造器入口
 - `init` 允许可见性修饰，例如 `public init(...)`
 - `init` 隐式拥有 `self`
 - `init` 不声明返回类型，语义等价于 `()`
 - `init` 只允许 `return;` / `return ();`
 - `init` 不能写成 `static init`
 - `Point(...)` / `Point.init(...)` / `new Point(...)` 是结构体构造语法
-- 结构体不支持 `Point { ... }`
-- 如果类型定义了 `init`，那么 `Point(...)` / `Point.init(...)` 会按 `init` 参数规则构造
-- `init` 参数规则与普通函数一致：
-  - 位置参数在前
-  - 带标签参数在后
-  - 带标签参数可乱序
-  - 带默认值的参数仅允许出现在带标签参数段
-- 在 `Point(...)` 中，未显式写参数名的带标签参数也可以按参数名作为标签传入
-- 如果类型没有定义 `init`，那么 `Point(...)` 表示默认字段初始化，当前只支持 `field: value` 标签形式
+- 如果类型定义了一个或多个 `init`，那么 `Point(...)` / `Point.init(...)` 会在这些 `init` 中按参数个数和参数类型做重载决议
+- `init` 只支持普通位置参数，不支持标签参数
+- 如果类型没有定义 `init`，那么默认字段初始化使用 `Point { field: value }`
+- 只要类型定义了 `init`，就不允许再用 `Point { ... }`
 - `new Point(...)` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
+- `struct` / `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
+
+#### record
+
+`record` 是轻量数据类型，使用字段字面量初始化：
+
+```c
+record Point {
+  Int x;
+  Int y = 2;
+}
+
+Point p1 = Point { x: 40 };
+Point p2 = { x: 1, y: 2 };
+```
+
+规则：
+
+- `record` 支持 `Type { field: value }`
+- 当 expected type 已知且为 `record` 时，允许直接写 `{ field: value }`
+- `record` 字段支持默认值
+- `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
+- `struct` 只有在没有定义 `init` 时才支持 `Type { ... }`
+
+局部变量声明也支持同类型多名字写法，但它只是语法糖，每个变量仍然必须显式初始化：
+
+```c
+Int a = 1, b = 2, c = 3;
+```
 
 ```c
 struct Point {
   Int x;
   Int y;
 
-  public init(Int base, px: Int x, py: Int y = 0) {
-    self.x = base + x;
+  public init(Int x, Int y) {
+    self.x = x;
     self.y = y;
-    return;
+  }
+
+  public init(Int value) {
+    self.x = value;
+    self.y = value;
   }
 }
 ```
 
 ```c
-Point p1 = Point(1, py: 2, px: 3);
-Point* p2 = new Point(1, px: 3);
+Point p1 = Point(1, 2);
+Point p2 = Point(3);
+Point* p3 = new Point(4, 5);
 ```
 
 #### deinit函数
@@ -945,12 +943,12 @@ Jiang语言中，结构体即可以是值类型，也可以是引用类型。这
 
 ```c
 // p1为值
-Point p1 = Point(x: 0, y: 0)
+Point p1 = Point { x: 0, y: 0 }
 // p1赋值给p2是值拷贝
 Point p2 = p1
 
 // p3为指针，此时为引用类型
-Point* p3 = new Point(x: 100, y: 200)
+Point* p3 = new Point { x: 100, y: 200 }
 
 // 由于Jiang语言的指针自动解引用，此时的p3被当成值
 print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 输出：p3.x = 100, p3.y = 200
