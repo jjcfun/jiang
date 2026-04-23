@@ -30,6 +30,7 @@ typedef enum TokenKind {
     TOKEN_KW_ENUM,
     TOKEN_KW_UNION,
     TOKEN_KW_STRUCT,
+    TOKEN_KW_RECORD,
     TOKEN_KW_CONCEPT,
     TOKEN_KW_EXTEND,
     TOKEN_KW_TYPE,

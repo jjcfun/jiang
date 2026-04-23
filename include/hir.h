@@ -10,6 +10,10 @@ typedef struct HirExpr HirExpr;
 typedef struct HirStmt HirStmt;
 typedef struct HirFunction HirFunction;
 typedef struct HirBinding HirBinding;
+#ifndef JIANG_AST_EXPR_FWD_DECL
+#define JIANG_AST_EXPR_FWD_DECL
+typedef struct AstExpr AstExpr;
+#endif
 typedef struct HirEnumDecl HirEnumDecl;
 typedef struct HirEnumMember HirEnumMember;
 typedef struct HirUnionDecl HirUnionDecl;
@@ -73,7 +77,9 @@ typedef enum HirBindingKind {
 
 struct HirBinding {
     HirType* type;
+    char* label;
     char* name;
+    AstExpr* default_value;
     int mutable_flag;
     HirBindingKind kind;
     int line;
@@ -318,6 +324,7 @@ struct HirFunction {
     int public_flag;
     int method_flag;
     int static_method_flag;
+    int struct_init_index;
     HirStructDecl* owner_struct;
     HirType* receiver_type;
     int line;
@@ -366,8 +373,9 @@ typedef struct HirStructFieldList {
 struct HirStructDecl {
     char* name;
     HirStructFieldList fields;
+    int record_flag;
     int has_init;
-    char* init_name;
+    int init_count;
     int from_string_literal;
     int has_deinit;
     char* deinit_name;
