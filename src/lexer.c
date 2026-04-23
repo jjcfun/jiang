@@ -134,6 +134,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 4 && strncmp(lexer->start, "null", 4) == 0) {
         return make_token(lexer, TOKEN_KW_NULL, lexer->start, length);
     }
+    if (length == 4 && strncmp(lexer->start, "Self", 4) == 0) {
+        return make_token(lexer, TOKEN_KW_SELF, lexer->start, length);
+    }
     return make_token(lexer, TOKEN_IDENT, lexer->start, length);
 }
 

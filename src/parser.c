@@ -275,11 +275,16 @@ static void push_scoped_type_name(Parser* parser, char* name) {
 
 static void advance(Parser* parser);
 
+static int is_name_token(const Token* token) {
+    return token->kind == TOKEN_IDENT || token->kind == TOKEN_KW_SELF;
+}
+
 static int is_type_like_ident(const Token* token) {
-    return token->kind == TOKEN_IDENT &&
-           token->length > 0 &&
-           token->start[0] >= 'A' &&
-           token->start[0] <= 'Z';
+    return token->kind == TOKEN_KW_SELF ||
+           (token->kind == TOKEN_IDENT &&
+            token->length > 0 &&
+            token->start[0] >= 'A' &&
+            token->start[0] <= 'Z');
 }
 
 static int text_is_ident_name(const char* text) {
@@ -376,7 +381,7 @@ static AstExpr* make_range_expr(AstExpr* start, AstExpr* end, int line) {
 
 static char* parse_qualified_name(Parser* parser) {
     char* name = 0;
-    if (parser->current.kind != TOKEN_IDENT) {
+    if (!is_name_token(&parser->current)) {
         return 0;
     }
     name = token_dup(&parser->current);
@@ -715,7 +720,7 @@ static int looks_like_qualified_type_start(Parser* parser) {
     Parser probe = *parser;
     int seen_dot = 0;
     int final_is_type = 0;
-    if (probe.current.kind != TOKEN_IDENT) {
+    if (!is_name_token(&probe.current)) {
         return 0;
     }
     final_is_type = is_type_like_ident(&probe.current);
@@ -760,6 +765,9 @@ static int expect(Parser* parser, TokenKind kind, const char* error) {
 
 static int is_type_start(const Parser* parser) {
     if (parser->current.kind == TOKEN_LEFT_PAREN) {
+        return 1;
+    }
+    if (parser->current.kind == TOKEN_KW_SELF) {
         return 1;
     }
     if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "_")) {
@@ -813,10 +821,18 @@ static int looks_like_var_decl(Parser* parser) {
 }
 
 static AstType parse_type_postfix(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_AMP || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION) {
         if (parser->current.kind == TOKEN_BANG) {
             type.mutable_flag = 1;
             advance(parser);
+            continue;
+        }
+        if (parser->current.kind == TOKEN_AMP) {
+            AstType referent = type;
+            advance(parser);
+            memset(&type, 0, sizeof(type));
+            type.kind = AST_TYPE_REFERENCE;
+            type.array_item = heap_type_copy(&referent);
             continue;
         }
         if (parser->current.kind == TOKEN_STAR) {
@@ -925,7 +941,7 @@ static AstType parse_type(Parser* parser) {
         advance(parser);
         return parse_type_postfix(parser, type);
     }
-    if (parser->current.kind == TOKEN_IDENT) {
+    if (parser->current.kind == TOKEN_IDENT || parser->current.kind == TOKEN_KW_SELF) {
         if (token_equals(&parser->current, "Int")) {
             type.kind = AST_TYPE_INT;
             advance(parser);
@@ -1147,7 +1163,7 @@ static int looks_like_variant_ref(Parser* parser) {
 static int looks_like_qualified_variant_ref(Parser* parser) {
     Parser probe = *parser;
     int consumed_type_segment = 0;
-    if (probe.current.kind != TOKEN_IDENT) {
+    if (!is_name_token(&probe.current)) {
         return 0;
     }
     advance(&probe);
@@ -1166,7 +1182,7 @@ static int looks_like_qualified_variant_ref(Parser* parser) {
 
 static int looks_like_qualified_init_call(Parser* parser) {
     Parser probe = *parser;
-    if (probe.current.kind != TOKEN_IDENT) {
+    if (!is_name_token(&probe.current)) {
         return 0;
     }
     advance(&probe);
@@ -1193,7 +1209,7 @@ static int looks_like_qualified_init_call(Parser* parser) {
 
 static int looks_like_qualified_call(Parser* parser) {
     Parser probe = *parser;
-    if (probe.current.kind != TOKEN_IDENT) {
+    if (!is_name_token(&probe.current)) {
         return 0;
     }
     advance(&probe);
@@ -1316,7 +1332,7 @@ static char* expr_to_qualified_callee(const AstExpr* expr) {
 
 static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag) {
     AstExpr* expr = new_expr(AST_EXPR_VARIANT, parser->current.line);
-    if (parser->current.kind == TOKEN_IDENT) {
+    if (is_name_token(&parser->current)) {
         expr->as.variant.union_name = token_dup(&parser->current);
         advance(parser);
         while (parser->current.kind == TOKEN_DOT && parser->next.kind == TOKEN_IDENT) {
@@ -1450,7 +1466,7 @@ static AstExpr* parse_primary(Parser* parser) {
         }
     }
 
-    if (token.kind == TOKEN_IDENT && looks_like_qualified_type_start(parser)) {
+    if (is_name_token(&token) && looks_like_qualified_type_start(parser)) {
         Parser probe = *parser;
         char* qualified_name = parse_qualified_name(&probe);
         if (probe.current.kind == TOKEN_LT) {
@@ -1636,6 +1652,8 @@ static AstExpr* parse_primary(Parser* parser) {
             !looks_like_qualified_call(parser)) {
             return parse_variant_expr(parser, 0);
         }
+    }
+    if (token.kind == TOKEN_IDENT || token.kind == TOKEN_KW_SELF) {
         char* name = token_dup(&token);
         advance(parser);
         expr = new_expr(AST_EXPR_NAME, token.line);
@@ -1920,6 +1938,7 @@ static int is_implicit_member_name(Token* token) {
     return token->kind == TOKEN_IDENT &&
            (token_equals(token, "as") ||
             token_equals(token, "ref") ||
+            token_equals(token, "ptr") ||
             token_equals(token, "addr") ||
             token_equals(token, "free") ||
             token_equals(token, "offset"));
@@ -2613,7 +2632,7 @@ static AstStmt* parse_stmt(Parser* parser) {
         return group_stmt ? group_stmt : first_decl;
     }
 
-    if (parser->current.kind == TOKEN_IDENT || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_LEFT_PAREN) {
+    if (parser->current.kind == TOKEN_IDENT || parser->current.kind == TOKEN_KW_SELF || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_LEFT_PAREN) {
         AstExpr* target = parse_expr(parser);
         if (!target) {
             return 0;

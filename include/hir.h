@@ -48,6 +48,7 @@ typedef enum HirTypeKind {
     HIR_TYPE_BOOL,
     HIR_TYPE_VOID,
     HIR_TYPE_SLICE,
+    HIR_TYPE_REFERENCE,
     HIR_TYPE_POINTER,
     HIR_TYPE_MANY_POINTER,
     HIR_TYPE_ENUM,
@@ -56,6 +57,7 @@ typedef enum HirTypeKind {
     HIR_TYPE_ARRAY,
     HIR_TYPE_UNION,
     HIR_TYPE_OPTIONAL,
+    HIR_TYPE_FUNCTION,
 } HirTypeKind;
 
 struct HirType {
@@ -64,6 +66,7 @@ struct HirType {
     HirTypeList tuple_items;
     HirType* array_item;
     int array_length;
+    HirType* return_type;
     HirEnumDecl* enum_decl;
     HirStructDecl* struct_decl;
     HirUnionDecl* union_decl;
@@ -100,6 +103,7 @@ typedef enum HirExprKind {
     HIR_EXPR_NULL,
     HIR_EXPR_OPTIONAL_SOME,
     HIR_EXPR_BINDING,
+    HIR_EXPR_FUNCTION,
     HIR_EXPR_AS,
     HIR_EXPR_ADDR,
     HIR_EXPR_DEREF,
@@ -181,6 +185,7 @@ struct HirExpr {
             int length;
         } cstring_lit;
         HirBinding* binding;
+        HirFunction* function;
         struct {
             HirExpr* value;
         } unary;
@@ -200,6 +205,7 @@ struct HirExpr {
         } ternary;
         struct {
             HirFunction* callee;
+            HirExpr* callee_value;
             HirBuiltinKind builtin;
             HirExprList args;
         } call;

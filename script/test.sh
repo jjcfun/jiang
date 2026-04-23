@@ -114,6 +114,10 @@ run_sample package_override 44
 run_compile_fail package_invalid_name
 run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
+run_sample fn_pointer_minimal.jiang 7
+run_sample fn_pointer_static_method_minimal.jiang 3
+run_sample fn_pointer_instance_method_minimal.jiang 42
+run_sample self_keyword_minimal.jiang 42
 run_sample multi_file_enum_minimal.jiang 1
 run_sample multi_file_enum_shorthand_minimal.jiang 1
 run_sample multi_file_enum_shorthand_arg_minimal.jiang 1
@@ -443,6 +447,7 @@ run_compile_fail invalid_assign_field_type.jiang
 run_compile_fail invalid_pointer_mutable_pointee_arg.jiang
 run_compile_fail invalid_slice_mutable_arg.jiang
 run_compile_fail invalid_call_non_function.jiang
+run_compile_fail invalid_fn_pointer_signature_mismatch.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang
 run_compile_fail invalid_duplicate_type.jiang

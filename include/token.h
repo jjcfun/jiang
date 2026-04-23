@@ -42,6 +42,7 @@ typedef enum TokenKind {
     TOKEN_KW_TRUE,
     TOKEN_KW_FALSE,
     TOKEN_KW_NULL,
+    TOKEN_KW_SELF,
     TOKEN_LEFT_PAREN,
     TOKEN_RIGHT_PAREN,
     TOKEN_LEFT_BRACE,

@@ -160,6 +160,10 @@ static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
 static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block);
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary);
+static HirType* function_type_from_function(LowerContext* ctx, HirFunction* fn);
+static HirType* current_self_owner_type(LowerContext* ctx);
+static HirType* requalify_nominal_owner_type(LowerContext* ctx, HirType* base_type, int mutable_flag);
+static HirType* resolve_owner_type_name(LowerContext* ctx, const char* owner_type_name);
 
 static void append_block_stmts(HirBlock* out_block, const HirBlock* block) {
     int i = 0;
@@ -465,11 +469,25 @@ static int type_equals(HirType* left, HirType* right) {
     if (left->kind == HIR_TYPE_SLICE) {
         return type_equals(left->array_item, right->array_item);
     }
-    if (left->kind == HIR_TYPE_POINTER || left->kind == HIR_TYPE_MANY_POINTER) {
+    if (left->kind == HIR_TYPE_REFERENCE || left->kind == HIR_TYPE_POINTER || left->kind == HIR_TYPE_MANY_POINTER) {
         return type_equals(left->array_item, right->array_item);
     }
     if (left->kind == HIR_TYPE_OPTIONAL) {
         return type_equals(left->array_item, right->array_item);
+    }
+    if (left->kind == HIR_TYPE_FUNCTION) {
+        if (!type_equals(left->return_type, right->return_type)) {
+            return 0;
+        }
+        if (left->tuple_items.count != right->tuple_items.count) {
+            return 0;
+        }
+        for (i = 0; i < left->tuple_items.count; ++i) {
+            if (!type_equals(left->tuple_items.items[i], right->tuple_items.items[i])) {
+                return 0;
+            }
+        }
+        return 1;
     }
     if (left->kind == HIR_TYPE_ENUM) {
         return left->enum_decl == right->enum_decl;
@@ -507,11 +525,25 @@ static int type_assignment_compatible_inner(HirType* actual, HirType* expected, 
             return actual->array_length == expected->array_length &&
                    type_assignment_compatible_inner(actual->array_item, expected->array_item, through_alias);
         case HIR_TYPE_SLICE:
+        case HIR_TYPE_REFERENCE:
         case HIR_TYPE_POINTER:
         case HIR_TYPE_MANY_POINTER:
             return type_assignment_compatible_inner(actual->array_item, expected->array_item, 1);
         case HIR_TYPE_OPTIONAL:
             return type_assignment_compatible_inner(actual->array_item, expected->array_item, through_alias);
+        case HIR_TYPE_FUNCTION:
+            if (!type_assignment_compatible_inner(actual->return_type, expected->return_type, through_alias)) {
+                return 0;
+            }
+            if (actual->tuple_items.count != expected->tuple_items.count) {
+                return 0;
+            }
+            for (i = 0; i < actual->tuple_items.count; ++i) {
+                if (!type_assignment_compatible_inner(actual->tuple_items.items[i], expected->tuple_items.items[i], through_alias)) {
+                    return 0;
+                }
+            }
+            return 1;
         case HIR_TYPE_ENUM:
             return actual->enum_decl == expected->enum_decl;
         case HIR_TYPE_STRUCT:
@@ -573,8 +605,10 @@ static int64_t type_size_bytes(HirType* type) {
             return 16;
         case HIR_TYPE_VOID:
             return 0;
+        case HIR_TYPE_REFERENCE:
         case HIR_TYPE_POINTER:
         case HIR_TYPE_MANY_POINTER:
+        case HIR_TYPE_FUNCTION:
             return 8;
         case HIR_TYPE_SLICE:
             return 16;
@@ -679,10 +713,10 @@ static int as_compatible(HirType* from, HirType* to) {
         (is_float_like_type(to) || is_integer_like_type(to) || to->kind == HIR_TYPE_CHARACTER)) {
         return 1;
     }
-    if ((from->kind == HIR_TYPE_POINTER || from->kind == HIR_TYPE_MANY_POINTER) && to->kind == HIR_TYPE_INT) {
+    if ((from->kind == HIR_TYPE_REFERENCE || from->kind == HIR_TYPE_POINTER || from->kind == HIR_TYPE_MANY_POINTER) && to->kind == HIR_TYPE_INT) {
         return 1;
     }
-    if (from->kind == HIR_TYPE_INT && (to->kind == HIR_TYPE_POINTER || to->kind == HIR_TYPE_MANY_POINTER)) {
+    if (from->kind == HIR_TYPE_INT && (to->kind == HIR_TYPE_REFERENCE || to->kind == HIR_TYPE_POINTER || to->kind == HIR_TYPE_MANY_POINTER)) {
         return 1;
     }
     if (from->kind == HIR_TYPE_ARRAY &&
@@ -690,12 +724,19 @@ static int as_compatible(HirType* from, HirType* to) {
         type_equals(from->array_item, to->array_item)) {
         return 1;
     }
-    if (((from->kind == HIR_TYPE_POINTER && to->kind == HIR_TYPE_MANY_POINTER) ||
-         (from->kind == HIR_TYPE_MANY_POINTER && to->kind == HIR_TYPE_POINTER)) &&
+    if ((((from->kind == HIR_TYPE_REFERENCE || from->kind == HIR_TYPE_POINTER) && to->kind == HIR_TYPE_MANY_POINTER) ||
+         (from->kind == HIR_TYPE_MANY_POINTER && (to->kind == HIR_TYPE_REFERENCE || to->kind == HIR_TYPE_POINTER)) ||
+         ((from->kind == HIR_TYPE_REFERENCE || from->kind == HIR_TYPE_POINTER) && (to->kind == HIR_TYPE_REFERENCE || to->kind == HIR_TYPE_POINTER))) &&
         type_equals(from->array_item, to->array_item)) {
         return 1;
     }
     return 0;
+}
+
+static HirType* reference_to_type(LowerContext* ctx, HirType* referent) {
+    HirType* reference = new_owned_type(ctx->program, HIR_TYPE_REFERENCE);
+    reference->array_item = referent;
+    return reference;
 }
 
 static HirType* pointer_to_type(LowerContext* ctx, HirType* pointee) {
@@ -743,6 +784,12 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             return qualified_primitive_type(ctx->program, HIR_TYPE_BOOL, type->mutable_flag);
         case AST_TYPE_VOID:
             return qualified_primitive_type(ctx->program, HIR_TYPE_VOID, type->mutable_flag);
+        case AST_TYPE_REFERENCE: {
+            HirType* reference = new_owned_type(ctx->program, HIR_TYPE_REFERENCE);
+            reference->mutable_flag = type->mutable_flag;
+            reference->array_item = lower_type(ctx, type->array_item);
+            return reference;
+        }
         case AST_TYPE_POINTER: {
             HirType* pointer = new_owned_type(ctx->program, HIR_TYPE_POINTER);
             pointer->mutable_flag = type->mutable_flag;
@@ -775,26 +822,38 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             return optional;
         }
         case AST_TYPE_NAMED: {
-            HirEnumDecl* enum_decl = find_enum(ctx->program, type->named_name);
-            HirStructDecl* struct_decl = find_struct(ctx->program, type->named_name);
-            HirUnionDecl* union_decl = find_union(ctx->program, type->named_name);
-            if (enum_decl) {
-                HirType* enum_type = new_owned_type(ctx->program, HIR_TYPE_ENUM);
-                enum_type->mutable_flag = type->mutable_flag;
-                enum_type->enum_decl = enum_decl;
-                return enum_type;
+            if (type->named_name && strcmp(type->named_name, "Fn") == 0) {
+                HirType* fn_type = 0;
+                if (type->type_args.count == 0) {
+                    fail(ctx, "Fn requires at least a return type");
+                    return 0;
+                }
+                fn_type = new_owned_type(ctx->program, HIR_TYPE_FUNCTION);
+                fn_type->mutable_flag = type->mutable_flag;
+                fn_type->return_type = lower_type(ctx, &type->type_args.items[0]);
+                if (!fn_type->return_type) {
+                    return 0;
+                }
+                for (i = 1; i < type->type_args.count; ++i) {
+                    HirType* param_type = lower_type(ctx, &type->type_args.items[i]);
+                    if (!param_type) {
+                        return 0;
+                    }
+                    type_list_push(&fn_type->tuple_items, param_type);
+                }
+                return fn_type;
             }
-            if (struct_decl) {
-                HirType* struct_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
-                struct_type->mutable_flag = type->mutable_flag;
-                struct_type->struct_decl = struct_decl;
-                return struct_type;
-            }
-            if (union_decl) {
-                HirType* union_type = new_owned_type(ctx->program, HIR_TYPE_UNION);
-                union_type->mutable_flag = type->mutable_flag;
-                union_type->union_decl = union_decl;
-                return union_type;
+            {
+                HirType* nominal_type = resolve_owner_type_name(ctx, type->named_name);
+                if (!nominal_type) {
+                    fail(ctx, "unknown named type");
+                    return 0;
+                }
+                if (nominal_type->kind == HIR_TYPE_ENUM ||
+                    nominal_type->kind == HIR_TYPE_STRUCT ||
+                    nominal_type->kind == HIR_TYPE_UNION) {
+                    return requalify_nominal_owner_type(ctx, nominal_type, type->mutable_flag);
+                }
             }
             fail(ctx, "unknown named type");
             return 0;
@@ -820,6 +879,20 @@ static HirBinding* new_binding(HirType* type, int mutable_flag, const char* name
     binding->kind = kind;
     binding->line = line;
     return binding;
+}
+
+static HirType* function_type_from_function(LowerContext* ctx, HirFunction* fn) {
+    int i = 0;
+    HirType* type = 0;
+    if (!fn) {
+        return 0;
+    }
+    type = new_owned_type(ctx->program, HIR_TYPE_FUNCTION);
+    type->return_type = fn->return_type;
+    for (i = 0; i < fn->params.count; ++i) {
+        type_list_push(&type->tuple_items, fn->params.items[i]->type);
+    }
+    return type;
 }
 
 static HirExpr* new_expr(HirExprKind kind, HirType* type, int line) {
@@ -1010,7 +1083,7 @@ static HirExpr* lower_optional_chain_index(LowerContext* ctx, const AstExpr* exp
     if (!some_base) {
         return 0;
     }
-    if (some_base->type->kind == HIR_TYPE_POINTER &&
+    if ((some_base->type->kind == HIR_TYPE_REFERENCE || some_base->type->kind == HIR_TYPE_POINTER) &&
         some_base->type->array_item &&
         (some_base->type->array_item->kind == HIR_TYPE_TUPLE ||
          some_base->type->array_item->kind == HIR_TYPE_ARRAY ||
@@ -1120,11 +1193,11 @@ static HirExpr* maybe_decay_array_to_slice(LowerContext* ctx, HirExpr* expr, Hir
 
 static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_type, int line) {
     HirExpr* deref = 0;
-    if (!expr || !expr->type || expr->type->kind != HIR_TYPE_POINTER) {
+    if (!expr || !expr->type || (expr->type->kind != HIR_TYPE_REFERENCE && expr->type->kind != HIR_TYPE_POINTER)) {
         return expr;
     }
     if (expected_type &&
-        (expected_type->kind == HIR_TYPE_POINTER || expected_type->kind == HIR_TYPE_MANY_POINTER)) {
+        (expected_type->kind == HIR_TYPE_REFERENCE || expected_type->kind == HIR_TYPE_POINTER || expected_type->kind == HIR_TYPE_MANY_POINTER)) {
         return expr;
     }
     deref = new_expr(HIR_EXPR_DEREF, expr->type->array_item, line);
@@ -1155,7 +1228,7 @@ static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* ex
             return 0;
         }
         base_type = base->type;
-        if (base_type->kind == HIR_TYPE_POINTER && base_type->array_item && base_type->array_item->kind == HIR_TYPE_STRUCT) {
+        if ((base_type->kind == HIR_TYPE_REFERENCE || base_type->kind == HIR_TYPE_POINTER) && base_type->array_item && base_type->array_item->kind == HIR_TYPE_STRUCT) {
             base_type = base_type->array_item;
         }
         if (base_type->kind != HIR_TYPE_STRUCT) {
@@ -1301,7 +1374,8 @@ static int lower_struct_init_args_for_function(LowerContext* ctx,
         if (!arg) {
             return 0;
         }
-        if ((param->type->kind == HIR_TYPE_POINTER ||
+        if ((param->type->kind == HIR_TYPE_REFERENCE ||
+             param->type->kind == HIR_TYPE_POINTER ||
              param->type->kind == HIR_TYPE_MANY_POINTER) &&
             param->type->array_item &&
             param->type->array_item->mutable_flag &&
@@ -1518,6 +1592,10 @@ static HirTypeQueryRef describe_hir_type(HirType* type) {
             return out;
         case HIR_TYPE_SLICE:
             out.kind = HIR_TYPE_QUERY_SLICE;
+            out.item_type = type->array_item;
+            return out;
+        case HIR_TYPE_REFERENCE:
+            out.kind = HIR_TYPE_QUERY_POINTER;
             out.item_type = type->array_item;
             return out;
         case HIR_TYPE_POINTER:
@@ -1840,7 +1918,7 @@ static HirType* instance_method_owner_type(HirType* type) {
     if (!type) {
         return 0;
     }
-    if (type->kind == HIR_TYPE_POINTER && type->array_item &&
+    if ((type->kind == HIR_TYPE_REFERENCE || type->kind == HIR_TYPE_POINTER) && type->array_item &&
         (type->array_item->kind == HIR_TYPE_STRUCT ||
          type->array_item->kind == HIR_TYPE_ENUM ||
          type->array_item->kind == HIR_TYPE_UNION)) {
@@ -1859,20 +1937,28 @@ static HirExpr* make_instance_method_receiver(LowerContext* ctx, HirExpr* base, 
         return 0;
     }
     if (owner_type->kind == HIR_TYPE_STRUCT) {
-        if (base->type->kind == HIR_TYPE_POINTER) {
+        if (base->type->kind == HIR_TYPE_REFERENCE) {
             return base;
+        }
+        if (base->type->kind == HIR_TYPE_POINTER) {
+            HirExpr* deref = new_expr(HIR_EXPR_DEREF, owner_type, line);
+            HirExpr* addr = 0;
+            deref->as.unary.value = base;
+            addr = new_expr(HIR_EXPR_ADDR, reference_to_type(ctx, owner_type), line);
+            addr->as.unary.value = deref;
+            return addr;
         }
         if (!is_lvalue_expr(base)) {
             fail(ctx, "indexing requires lvalue base");
             return 0;
         }
         {
-            HirExpr* addr = new_expr(HIR_EXPR_ADDR, pointer_to_type(ctx, owner_type), line);
+            HirExpr* addr = new_expr(HIR_EXPR_ADDR, reference_to_type(ctx, owner_type), line);
             addr->as.unary.value = base;
             return addr;
         }
     }
-    if (base->type->kind == HIR_TYPE_POINTER) {
+    if (base->type->kind == HIR_TYPE_REFERENCE || base->type->kind == HIR_TYPE_POINTER) {
         HirExpr* deref = new_expr(HIR_EXPR_DEREF, owner_type, line);
         deref->as.unary.value = base;
         return deref;
@@ -2199,7 +2285,8 @@ static int lower_call_args_from(LowerContext* ctx, const AstStructFieldInitList*
         if (!arg) {
             return 0;
         }
-        if ((param->type->kind == HIR_TYPE_POINTER ||
+        if ((param->type->kind == HIR_TYPE_REFERENCE ||
+             param->type->kind == HIR_TYPE_POINTER ||
              param->type->kind == HIR_TYPE_MANY_POINTER) &&
             param->type->array_item &&
             param->type->array_item->mutable_flag &&
@@ -2452,6 +2539,50 @@ static HirType* find_named_owner_type(HirProgram* program, const char* owner_typ
             break;
     }
     return 0;
+}
+
+static HirType* current_self_owner_type(LowerContext* ctx) {
+    if (!ctx || !ctx->current_function) {
+        return 0;
+    }
+    if (ctx->current_function->receiver_type) {
+        return ctx->current_function->receiver_type;
+    }
+    if (ctx->current_function->owner_struct) {
+        HirType* type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+        type->struct_decl = ctx->current_function->owner_struct;
+        return type;
+    }
+    return 0;
+}
+
+static HirType* requalify_nominal_owner_type(LowerContext* ctx, HirType* base_type, int mutable_flag) {
+    HirType* out = 0;
+    if (!ctx || !base_type) {
+        return 0;
+    }
+    out = new_owned_type(ctx->program, base_type->kind);
+    out->mutable_flag = mutable_flag;
+    switch (base_type->kind) {
+        case HIR_TYPE_STRUCT:
+            out->struct_decl = base_type->struct_decl;
+            return out;
+        case HIR_TYPE_ENUM:
+            out->enum_decl = base_type->enum_decl;
+            return out;
+        case HIR_TYPE_UNION:
+            out->union_decl = base_type->union_decl;
+            return out;
+        default:
+            return 0;
+    }
+}
+
+static HirType* resolve_owner_type_name(LowerContext* ctx, const char* owner_type_name) {
+    if (owner_type_name && strcmp(owner_type_name, "Self") == 0) {
+        return current_self_owner_type(ctx);
+    }
+    return find_named_owner_type(ctx->program, owner_type_name);
 }
 
 static int validate_struct_init_expr(LowerContext* ctx, HirStructDecl* struct_decl, const AstExpr* expr, int* field_state) {
@@ -2709,8 +2840,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     return out;
                 }
                 if (strcmp(expr->as.implicit.member, "alloc_array") == 0) {
-                    HirType* slice_type = 0;
-                    HirType* pointer_type = 0;
+                    HirType* many_pointer_type = 0;
                     HirExpr* count = 0;
                     if (expr->as.implicit.args.count != 1) {
                         fail(ctx, "type implicit operation '.alloc_array()' expects exactly one argument");
@@ -2728,13 +2858,10 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         fail(ctx, "alloc_array length must be Int");
                         return 0;
                     }
-                    slice_type = new_owned_type(ctx->program, HIR_TYPE_SLICE);
-                    slice_type->mutable_flag = 1;
-                    slice_type->array_item = type;
-                    pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
-                    pointer_type->mutable_flag = 1;
-                    pointer_type->array_item = slice_type;
-                    out = new_expr(HIR_EXPR_CALL, pointer_type, expr->line);
+                    many_pointer_type = new_owned_type(ctx->program, HIR_TYPE_MANY_POINTER);
+                    many_pointer_type->mutable_flag = 1;
+                    many_pointer_type->array_item = type;
+                    out = new_expr(HIR_EXPR_CALL, many_pointer_type, expr->line);
                     out->as.call.callee = 0;
                     out->as.call.builtin = HIR_BUILTIN_ALLOC_ARRAY;
                     expr_list_push(&out->as.call.args, count);
@@ -2793,6 +2920,27 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     fail(ctx, "address-of requires lvalue");
                     return 0;
                 }
+                pointer_type = new_owned_type(ctx->program, HIR_TYPE_REFERENCE);
+                pointer_type->array_item = value->type;
+                out = new_expr(HIR_EXPR_ADDR, pointer_type, expr->line);
+                out->as.unary.value = value;
+                return out;
+            }
+            if (strcmp(expr->as.implicit.member, "ptr") == 0) {
+                HirExpr* value = 0;
+                HirType* pointer_type = 0;
+                if (expr->as.implicit.has_type_arg || expr->as.implicit.args.count != 0) {
+                    fail(ctx, "implicit operation '.ptr()' takes no arguments");
+                    return 0;
+                }
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if (!is_lvalue_expr(value)) {
+                    fail(ctx, "address-of requires lvalue");
+                    return 0;
+                }
                 pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
                 pointer_type->array_item = value->type;
                 out = new_expr(HIR_EXPR_ADDR, pointer_type, expr->line);
@@ -2833,7 +2981,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 if (!value) {
                     return 0;
                 }
-                if (value->type->kind != HIR_TYPE_POINTER) {
+                if (value->type->kind != HIR_TYPE_POINTER && value->type->kind != HIR_TYPE_MANY_POINTER) {
                     fail(ctx, "free requires pointer");
                     return 0;
                 }
@@ -2922,8 +3070,14 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         case AST_EXPR_NAME: {
             HirBinding* binding = lookup_binding(ctx, expr->as.name);
             if (!binding) {
-                fail(ctx, "unknown identifier");
-                return 0;
+                HirFunction* fn = find_function(ctx->program, expr->as.name);
+                if (!fn || fn->method_flag || fn->struct_init_flag || fn->struct_deinit_flag) {
+                    fail(ctx, "unknown identifier");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_FUNCTION, function_type_from_function(ctx, fn), expr->line);
+                out->as.function = fn;
+                return out;
             }
             if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, binding->type)) {
                 out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
@@ -2995,7 +3149,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (!value) {
                 return 0;
             }
-            if (value->type->kind != HIR_TYPE_POINTER) {
+            if (value->type->kind != HIR_TYPE_REFERENCE && value->type->kind != HIR_TYPE_POINTER) {
                 fail(ctx, "deref requires pointer");
                 return 0;
             }
@@ -3027,7 +3181,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (!value) {
                 return 0;
             }
-            if (value->type->kind != HIR_TYPE_POINTER) {
+            if (value->type->kind != HIR_TYPE_POINTER && value->type->kind != HIR_TYPE_MANY_POINTER) {
                 fail(ctx, "free requires pointer");
                 return 0;
             }
@@ -3100,7 +3254,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     HirExpr* receiver_arg = 0;
                     owner_type = owner_binding->type;
                     receiver_arg = make_binding_expr(owner_binding, expr->line);
-                    if (owner_type->kind == HIR_TYPE_POINTER && owner_type->array_item &&
+                    if ((owner_type->kind == HIR_TYPE_REFERENCE || owner_type->kind == HIR_TYPE_POINTER) && owner_type->array_item &&
                         (owner_type->array_item->kind == HIR_TYPE_STRUCT ||
                          owner_type->array_item->kind == HIR_TYPE_ENUM ||
                          owner_type->array_item->kind == HIR_TYPE_UNION)) {
@@ -3115,13 +3269,13 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             return 0;
                         }
                         if (owner_type->kind == HIR_TYPE_STRUCT) {
-                            if (owner_binding->type->kind == HIR_TYPE_POINTER) {
+                            if (owner_binding->type->kind == HIR_TYPE_REFERENCE || owner_binding->type->kind == HIR_TYPE_POINTER) {
                                 receiver_arg = make_binding_expr(owner_binding, expr->line);
                             } else {
-                                receiver_arg = new_expr(HIR_EXPR_ADDR, pointer_to_type(ctx, owner_type), expr->line);
+                                receiver_arg = new_expr(HIR_EXPR_ADDR, reference_to_type(ctx, owner_type), expr->line);
                                 receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
                             }
-                        } else if (owner_binding->type->kind == HIR_TYPE_POINTER) {
+                        } else if (owner_binding->type->kind == HIR_TYPE_REFERENCE || owner_binding->type->kind == HIR_TYPE_POINTER) {
                             receiver_arg = new_expr(HIR_EXPR_DEREF, owner_type, expr->line);
                             receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
                         }
@@ -3156,7 +3310,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         return 0;
                     }
                 } else {
-                    HirType* named_type = find_named_owner_type(ctx->program, owner_name);
+                    HirType* named_type = resolve_owner_type_name(ctx, owner_name);
                     if (named_type) {
                         HirFunction* method = find_type_method(ctx->program, named_type, member_name, 1);
                         if (method) {
@@ -3298,11 +3452,47 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
             }
             if (!callee) {
+                HirBinding* callee_binding = lookup_binding(ctx, expr->as.call.callee);
+                if (callee_binding && callee_binding->type && callee_binding->type->kind == HIR_TYPE_FUNCTION) {
+                    int i = 0;
+                    out = new_expr(HIR_EXPR_CALL, callee_binding->type->return_type, expr->line);
+                    out->as.call.callee = 0;
+                    out->as.call.callee_value = make_binding_expr(callee_binding, expr->line);
+                    out->as.call.builtin = HIR_BUILTIN_NONE;
+                    if (expr->as.call.args.count != callee_binding->type->tuple_items.count) {
+                        fail(ctx, "call argument count mismatch");
+                        return 0;
+                    }
+                    for (i = 0; i < expr->as.call.args.count; ++i) {
+                        AstStructFieldInit* ast_arg = &expr->as.call.args.items[i];
+                        HirExpr* arg = 0;
+                        HirType* param_type = callee_binding->type->tuple_items.items[i];
+                        if (ast_arg->name) {
+                            fail(ctx, "labeled call arguments are not supported");
+                            return 0;
+                        }
+                        arg = lower_expr_expected(ctx, ast_arg->value, param_type);
+                        if (!arg) {
+                            return 0;
+                        }
+                        arg = maybe_decay_array_to_slice(ctx, arg, param_type, ast_arg->line);
+                        if (!arg) {
+                            return 0;
+                        }
+                        if (!type_assignment_compatible(arg->type, param_type)) {
+                            fail(ctx, "call argument type mismatch");
+                            return 0;
+                        }
+                        expr_list_push(&out->as.call.args, arg);
+                    }
+                    return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+                }
                 fail(ctx, "unknown function");
                 return 0;
             }
             out = new_expr(HIR_EXPR_CALL, callee->return_type, expr->line);
             out->as.call.callee = callee;
+            out->as.call.callee_value = 0;
             out->as.call.builtin = HIR_BUILTIN_NONE;
             if (!lower_call_args(ctx, &expr->as.call.args, &out->as.call.args, callee)) {
                 return 0;
@@ -3314,6 +3504,27 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             HirEnumMember* enum_member = 0;
             HirUnionDecl* union_decl = 0;
             HirType* union_type = 0;
+            if (expr->as.variant.union_name &&
+                !expr->as.variant.payload &&
+                expr->as.variant.bindings.count == 0 &&
+                !expr->as.variant.pattern_flag) {
+                HirType* owner_type = resolve_owner_type_name(ctx, expr->as.variant.union_name);
+                if (owner_type) {
+                    HirFunction* method = find_type_method(ctx->program, owner_type, expr->as.variant.variant_name, 1);
+                    if (!method) {
+                        method = find_type_method(ctx->program, owner_type, expr->as.variant.variant_name, 0);
+                    }
+                    if (method) {
+                        if (!method_visible_from_context(ctx, method, owner_type)) {
+                            fail(ctx, "unknown function");
+                            return 0;
+                        }
+                        out = new_expr(HIR_EXPR_FUNCTION, function_type_from_function(ctx, method), expr->line);
+                        out->as.function = method;
+                        return out;
+                    }
+                }
+            }
             if (!expr->as.variant.union_name && expected_type) {
                 if (!expr->as.variant.payload && expr->as.variant.bindings.count == 0 && expected_type->kind == HIR_TYPE_ENUM) {
                     enum_member = find_enum_member_in_decl(expected_type->enum_decl, expr->as.variant.variant_name);
@@ -3415,13 +3626,32 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
         }
         case AST_EXPR_FIELD: {
+            if (expr->as.field.base &&
+                expr->as.field.base->kind == AST_EXPR_NAME) {
+                HirType* owner_type = resolve_owner_type_name(ctx, expr->as.field.base->as.name);
+                if (owner_type) {
+                    HirFunction* method = find_type_method(ctx->program, owner_type, expr->as.field.name, 1);
+                    if (!method) {
+                        method = find_type_method(ctx->program, owner_type, expr->as.field.name, 0);
+                    }
+                    if (method) {
+                        if (!method_visible_from_context(ctx, method, owner_type)) {
+                            fail(ctx, "unknown field");
+                            return 0;
+                        }
+                        out = new_expr(HIR_EXPR_FUNCTION, function_type_from_function(ctx, method), expr->line);
+                        out->as.function = method;
+                        return out;
+                    }
+                }
+            }
             HirExpr* base = lower_expr(ctx, expr->as.field.base);
             HirType* base_type = 0;
             if (!base) {
                 return 0;
             }
             base_type = base->type;
-            if (base_type->kind == HIR_TYPE_POINTER && base_type->array_item && base_type->array_item->kind == HIR_TYPE_STRUCT) {
+            if ((base_type->kind == HIR_TYPE_REFERENCE || base_type->kind == HIR_TYPE_POINTER) && base_type->array_item && base_type->array_item->kind == HIR_TYPE_STRUCT) {
                 base_type = base_type->array_item;
             }
             if (base_type->kind == HIR_TYPE_ENUM && strcmp(expr->as.field.name, "value") == 0) {
@@ -3469,11 +3699,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             HirStructDecl* struct_decl = 0;
             const AstStructDecl* ast_struct = 0;
             if (expr->as.struct_lit.type_name) {
-                struct_decl = find_struct(ctx->program, expr->as.struct_lit.type_name);
-                if (!struct_decl) {
+                HirType* named_struct_type = resolve_owner_type_name(ctx, expr->as.struct_lit.type_name);
+                if (!named_struct_type || named_struct_type->kind != HIR_TYPE_STRUCT) {
                     fail(ctx, "unknown named type");
                     return 0;
                 }
+                struct_decl = named_struct_type->struct_decl;
                 if (!struct_decl->record_flag && struct_decl->has_init) {
                     fail(ctx, "struct with init requires call syntax");
                     return 0;
@@ -3608,7 +3839,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         fail(ctx, "comparison operand type unsupported");
                         return 0;
                     }
-                } else if (left->type->kind == HIR_TYPE_POINTER || left->type->kind == HIR_TYPE_MANY_POINTER) {
+                } else if (left->type->kind == HIR_TYPE_REFERENCE || left->type->kind == HIR_TYPE_POINTER || left->type->kind == HIR_TYPE_MANY_POINTER) {
                     if (expr->as.binary.op != AST_BIN_EQ && expr->as.binary.op != AST_BIN_NE) {
                         fail(ctx, "comparison operand type unsupported");
                         return 0;
@@ -3674,7 +3905,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (!base) {
                 return 0;
             }
-            if (base->type->kind == HIR_TYPE_POINTER &&
+            if ((base->type->kind == HIR_TYPE_REFERENCE || base->type->kind == HIR_TYPE_POINTER) &&
                 base->type->array_item &&
                 (base->type->array_item->kind == HIR_TYPE_TUPLE ||
                  base->type->array_item->kind == HIR_TYPE_ARRAY ||
@@ -3803,7 +4034,7 @@ static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr
         return 0;
     }
     if (expr->kind == AST_EXPR_NAME) {
-        target_type = find_named_owner_type(ctx->program, expr->as.name);
+        target_type = resolve_owner_type_name(ctx, expr->as.name);
         if (!target_type || !hir_type_supports_new_default_init(target_type)) {
             return 0;
         }
@@ -3812,7 +4043,7 @@ static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr
     if (expr->kind != AST_EXPR_CALL || expr->as.call.type_args.count != 0) {
         return 0;
     }
-    target_type = find_named_owner_type(ctx->program, expr->as.call.callee);
+    target_type = resolve_owner_type_name(ctx, expr->as.call.callee);
     if (!target_type || !hir_type_supports_new_default_init(target_type)) {
         return 0;
     }
@@ -5123,6 +5354,7 @@ static int register_functions(LowerContext* ctx) {
     for (i = 0; i < ctx->ast->functions.count; ++i) {
         const AstFunction* ast_fn = &ctx->ast->functions.items[i];
         HirFunction hir_fn;
+        HirFunction* saved_current_function = 0;
         int param_index = 0;
         memset(&hir_fn, 0, sizeof(hir_fn));
         if (!ast_fn->method_flag && hashmap_contains(&ctx->program->function_map, ast_fn->name)) {
@@ -5131,43 +5363,51 @@ static int register_functions(LowerContext* ctx) {
         if (!ast_fn->method_flag && hashmap_contains(&ctx->program->type_name_map, ast_fn->name)) {
             return fail(ctx, "type and function name conflict");
         }
-        hir_fn.return_type = lower_type(ctx, &ast_fn->return_type);
         hir_fn.name = ast_fn->name;
         hir_fn.line = ast_fn->line;
         hir_fn.extern_flag = ast_fn->extern_flag;
         hir_fn.public_flag = ast_fn->public_flag;
         hir_fn.method_flag = ast_fn->method_flag;
         hir_fn.static_method_flag = ast_fn->static_method_flag;
-            if (ast_fn->method_flag) {
-                hir_fn.method_name = ast_fn->name;
-                hir_fn.receiver_type = find_named_owner_type(ctx->program, ast_fn->owner_type_name);
-                if (!hir_fn.receiver_type) {
-                    return fail(ctx, "unknown named type");
-                }
-                if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
-                    ast_fn->static_method_flag &&
-                    strcmp(ast_fn->name, "init") == 0) {
-                    return fail(ctx, "static init not allowed");
-                }
-                if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
-                    find_struct_field(hir_fn.receiver_type->struct_decl, ast_fn->name, 0)) {
-                    return fail(ctx, "struct field and method name conflict");
+        if (ast_fn->method_flag) {
+            hir_fn.method_name = ast_fn->name;
+            hir_fn.receiver_type = find_named_owner_type(ctx->program, ast_fn->owner_type_name);
+            if (!hir_fn.receiver_type) {
+                return fail(ctx, "unknown named type");
+            }
+            if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
+                ast_fn->static_method_flag &&
+                strcmp(ast_fn->name, "init") == 0) {
+                return fail(ctx, "static init not allowed");
+            }
+            if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT &&
+                find_struct_field(hir_fn.receiver_type->struct_decl, ast_fn->name, 0)) {
+                return fail(ctx, "struct field and method name conflict");
             }
             hir_fn.name = make_method_name(ast_fn->owner_type_name, ast_fn->name, ast_fn->static_method_flag);
             if (hashmap_contains(&ctx->program->function_map, hir_fn.name)) {
                 return fail(ctx, "duplicate function");
             }
-            if (!ast_fn->static_method_flag) {
-                HirType* self_type = hir_fn.receiver_type;
-                if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT) {
-                    self_type = pointer_to_type(ctx, hir_fn.receiver_type);
-                }
-                HirBinding* self_binding = new_binding(self_type, 1, "self", HIR_BINDING_PARAM, ast_fn->line);
-                binding_list_push(&hir_fn.params, self_binding);
+        }
+        saved_current_function = ctx->current_function;
+        ctx->current_function = &hir_fn;
+        hir_fn.return_type = lower_type(ctx, &ast_fn->return_type);
+        ctx->current_function = saved_current_function;
+        if (ast_fn->method_flag && !ast_fn->static_method_flag) {
+            HirType* self_type = hir_fn.receiver_type;
+            if (hir_fn.receiver_type->kind == HIR_TYPE_STRUCT) {
+                self_type = reference_to_type(ctx, hir_fn.receiver_type);
             }
+            HirBinding* self_binding = new_binding(self_type, 1, "self", HIR_BINDING_PARAM, ast_fn->line);
+            binding_list_push(&hir_fn.params, self_binding);
         }
         for (param_index = 0; param_index < ast_fn->params.count; ++param_index) {
-            HirBinding* param_binding = new_binding(lower_type(ctx, &ast_fn->params.items[param_index].type), ast_fn->params.items[param_index].type.mutable_flag, ast_fn->params.items[param_index].name, HIR_BINDING_PARAM, ast_fn->params.items[param_index].line);
+            HirType* param_type = 0;
+            saved_current_function = ctx->current_function;
+            ctx->current_function = &hir_fn;
+            param_type = lower_type(ctx, &ast_fn->params.items[param_index].type);
+            ctx->current_function = saved_current_function;
+            HirBinding* param_binding = new_binding(param_type, ast_fn->params.items[param_index].type.mutable_flag, ast_fn->params.items[param_index].name, HIR_BINDING_PARAM, ast_fn->params.items[param_index].line);
             param_binding->label = ast_fn->params.items[param_index].label;
             param_binding->default_value = ast_fn->params.items[param_index].default_value;
             binding_list_push(&hir_fn.params, param_binding);

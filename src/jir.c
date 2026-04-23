@@ -93,6 +93,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_NULL: return JIR_EXPR_NULL;
         case HIR_EXPR_OPTIONAL_SOME: return JIR_EXPR_OPTIONAL_SOME;
         case HIR_EXPR_BINDING: return JIR_EXPR_BINDING;
+        case HIR_EXPR_FUNCTION: return JIR_EXPR_FUNCTION;
         case HIR_EXPR_AS: return JIR_EXPR_AS;
         case HIR_EXPR_ADDR: return JIR_EXPR_ADDR;
         case HIR_EXPR_DEREF: return JIR_EXPR_DEREF;
@@ -165,6 +166,12 @@ static JirType* lower_type(const HirType* hir_type, const char** error) {
     jir_type->kind = jir_type_kind(hir_type->kind);
     jir_type->mutable_flag = hir_type->mutable_flag;
     jir_type->array_length = hir_type->array_length;
+    if (hir_type->return_type) {
+        jir_type->return_type = lower_type(hir_type->return_type, error);
+        if (!jir_type->return_type) {
+            return 0;
+        }
+    }
     if (hir_type->union_decl) {
         jir_type->union_payload_slots = hir_type->union_decl->payload_slots;
     }
@@ -330,6 +337,7 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         case JIR_EXPR_CSTRING:
         case JIR_EXPR_NULL:
         case JIR_EXPR_BINDING:
+        case JIR_EXPR_FUNCTION:
         case JIR_EXPR_ENUM_MEMBER:
             return expr;
         case JIR_EXPR_ADDR:
@@ -353,6 +361,12 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             expr->as.ternary.else_expr = desugar_expr(expr->as.ternary.else_expr);
             return expr->as.ternary.cond && expr->as.ternary.then_expr && expr->as.ternary.else_expr ? expr : 0;
         case JIR_EXPR_CALL:
+            if (expr->as.call.callee_value) {
+                expr->as.call.callee_value = desugar_expr(expr->as.call.callee_value);
+                if (!expr->as.call.callee_value) {
+                    return 0;
+                }
+            }
             if (!desugar_expr_list(&expr->as.call.args)) {
                 return 0;
             }
@@ -453,7 +467,7 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             if (!expr->as.struct_field.base) {
                 return 0;
             }
-            if (expr->as.struct_field.base->type->kind == JIR_TYPE_POINTER) {
+            if (expr->as.struct_field.base->type->kind == JIR_TYPE_REFERENCE || expr->as.struct_field.base->type->kind == JIR_TYPE_POINTER) {
                 return expr;
             }
             if (expr->as.struct_field.base->kind == JIR_EXPR_STRUCT) {
@@ -628,6 +642,13 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_BINDING:
             out->as.binding = lower_binding(expr->as.binding, error);
             return out;
+        case HIR_EXPR_FUNCTION:
+            out->as.function = find_jir_function(program, expr->as.function->name);
+            if (!out->as.function) {
+                *error = "missing JIR function";
+                return 0;
+            }
+            return out;
         case HIR_EXPR_AS:
         case HIR_EXPR_ADDR:
         case HIR_EXPR_DEREF:
@@ -651,9 +672,13 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             return out->as.ternary.cond && out->as.ternary.then_expr && out->as.ternary.else_expr ? out : 0;
         case HIR_EXPR_CALL:
             out->as.call.callee = expr->as.call.callee ? find_jir_function(program, expr->as.call.callee->name) : 0;
+            out->as.call.callee_value = expr->as.call.callee_value ? lower_expr(program, expr->as.call.callee_value, error, error_line) : 0;
             out->as.call.builtin = jir_builtin_kind(expr->as.call.builtin);
             if (expr->as.call.callee && !out->as.call.callee) {
                 *error = "missing JIR callee";
+                return 0;
+            }
+            if (expr->as.call.callee_value && !out->as.call.callee_value) {
                 return 0;
             }
             return lower_expr_list(program, &expr->as.call.args, &out->as.call.args, error, error_line) ? out : 0;

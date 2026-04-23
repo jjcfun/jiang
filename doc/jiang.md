@@ -197,12 +197,13 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 例如：
 
 - `a$.as(Int)`：对值 `a` 做类型转换
-- `a$.ref()`：从值 `a` 获取一个临时指针
+- `a$.ref()`：从值 `a` 获取一个临时引用
+- `a$.ptr()`：从值 `a` 获取一个裸指针
 - `a$.addr()`：获取值 `a` 的地址值
 - `a$.free()`：对 `a` 做释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.alloc()`：分配一个未初始化的 `Int*`
-- `Int$.alloc_array(10)`：分配一个长度为 `10` 的 `Int[]*`
+- `Int$.alloc_array(10)`：分配一个长度为 `10` 的 `Int[*]`
 
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
 
@@ -334,7 +335,7 @@ Int* b = new Int(123);
 // 在堆中创建数组，并返回一个数组指针
 Int[3]* c = new [1, 2, 3];
 
-// 临时指针
+// 临时引用
 Int& d = a$.ref();
 
 ```
@@ -382,7 +383,7 @@ b$.free();
 
 ```c
 Int! value = 41;
-Int!* p = value$.ref();
+Int!* p = value$.ptr();
 
 // 读取指针元素
 Int x = p;
@@ -523,6 +524,37 @@ T[]@E sort<T, E>(T[] list, Fn<Bool@E, T, T> compare)
 @where(T: Numbric, E2: CompareError)  
 T[]@E1 sort<T, E1, E2>(T[] list, Fn<Fn<Bool@E2, T, T>@E1, T[]> compare)
 ```
+
+#### 函数指针
+
+`Fn<R, A, B, ...>` 表示函数指针类型：
+
+- 第一个类型参数是返回类型
+- 后续类型参数按顺序表示参数类型
+
+例如：
+
+```c
+Fn<Bool, Int, Int> compare;
+```
+
+表示：
+
+- 返回 `Bool`
+- 接收两个 `Int` 参数
+
+当前第一版支持：
+
+- 普通顶层函数衰减为 `Fn<...>`
+- `static` 方法衰减为 `Fn<...>`
+- 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
+- 通过 `Fn<...>` 变量进行调用
+
+当前不支持：
+
+- 通过实例值获取绑定方法函数值（例如 `value.method`）
+- `init` 转函数指针
+- 闭包
 
 
 
@@ -1650,7 +1682,7 @@ alias x = a + b;
 import std;
 
 std.ffi.CString text = "hello";
-puts(text.bytes[0]$.ref());
+puts(text.bytes[0]$.ptr());
 ```
 
 ```c

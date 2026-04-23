@@ -1637,6 +1637,10 @@ static AstTypeQueryRef describe_ast_type(const AstProgram* program, const AstTyp
             out.kind = AST_TYPE_QUERY_SLICE;
             out.item_type = type->array_item;
             return out;
+        case AST_TYPE_REFERENCE:
+            out.kind = AST_TYPE_QUERY_POINTER;
+            out.item_type = type->array_item;
+            return out;
         case AST_TYPE_POINTER:
             out.kind = AST_TYPE_QUERY_POINTER;
             out.item_type = type->array_item;
@@ -3847,6 +3851,12 @@ static char* mangle_type_name(const AstType* type) {
             return dup_text("Void");
         case AST_TYPE_INFER:
             return dup_text("_");
+        case AST_TYPE_REFERENCE: {
+            char* item = mangle_type_name(type->array_item);
+            out = dup_join3(item, "_ref", "");
+            free(item);
+            return out;
+        }
         case AST_TYPE_POINTER: {
             char* item = mangle_type_name(type->array_item);
             out = dup_join3(item, "_ptr", "");
@@ -4117,6 +4127,9 @@ static int transform_type(MonoContext* mono, AstType* type) {
         }
     }
     if (type->kind == AST_TYPE_NAMED && type->type_args.count > 0) {
+        if (type->named_name && strcmp(type->named_name, "Fn") == 0) {
+            return 1;
+        }
         const AstStructDecl* templ = find_generic_struct_template(mono->source, type->named_name);
         char* instantiated_name = 0;
         if (!templ) {

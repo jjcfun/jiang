@@ -35,6 +35,7 @@ typedef enum JirTypeKind {
     JIR_TYPE_BOOL,
     JIR_TYPE_VOID,
     JIR_TYPE_SLICE,
+    JIR_TYPE_REFERENCE,
     JIR_TYPE_POINTER,
     JIR_TYPE_MANY_POINTER,
     JIR_TYPE_ENUM,
@@ -43,6 +44,7 @@ typedef enum JirTypeKind {
     JIR_TYPE_ARRAY,
     JIR_TYPE_UNION,
     JIR_TYPE_OPTIONAL,
+    JIR_TYPE_FUNCTION,
 } JirTypeKind;
 
 typedef enum JirExprKind {
@@ -54,6 +56,7 @@ typedef enum JirExprKind {
     JIR_EXPR_NULL,
     JIR_EXPR_OPTIONAL_SOME,
     JIR_EXPR_BINDING,
+    JIR_EXPR_FUNCTION,
     JIR_EXPR_AS,
     JIR_EXPR_ADDR,
     JIR_EXPR_DEREF,
@@ -140,6 +143,7 @@ struct JirType {
     JirTypeList tuple_items;
     JirType* array_item;
     int array_length;
+    JirType* return_type;
     JirStructFieldDeclList struct_fields;
     int struct_has_deinit;
     char* struct_deinit_name;
@@ -191,6 +195,7 @@ struct JirExpr {
             int length;
         } cstring_lit;
         JirBinding* binding;
+        JirFunction* function;
         struct {
             JirExpr* value;
         } unary;
@@ -210,6 +215,7 @@ struct JirExpr {
         } ternary;
         struct {
             JirFunction* callee;
+            JirExpr* callee_value;
             JirBuiltinKind builtin;
             JirExprList args;
         } call;
