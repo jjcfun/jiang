@@ -618,6 +618,20 @@ Bool@Err less(Int left, Int right) {
 Fn<Bool@Err, Int, Int> compare = less;
 ```
 
+#### if表达式
+
+`if` 也可以作为表达式使用：
+
+```c
+Int x = if (flag) { 1 } else { 2 };
+```
+
+当前规则：
+
+- `else` 分支必填
+- 两个分支的结果类型必须一致
+- 分支块当前只支持单个表达式，不支持完整语句块产值
+
 ### 异常
 
 Jiang 第一版异常不是 runtime exception，也不做栈展开。  

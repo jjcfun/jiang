@@ -1377,6 +1377,51 @@ static AstExpr* parse_postfix(Parser* parser);
 static AstExpr* parse_unary(Parser* parser);
 
 static AstExpr* parse_expr(Parser* parser);
+static AstExpr* parse_if_expr(Parser* parser);
+
+static AstExpr* parse_expr_block_value(Parser* parser, const char* context) {
+    AstExpr* expr = 0;
+    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' to start expression block")) {
+        return 0;
+    }
+    expr = parse_expr(parser);
+    if (!expr) {
+        return 0;
+    }
+    if (!expect(parser, TOKEN_RIGHT_BRACE, context)) {
+        return 0;
+    }
+    return expr;
+}
+
+static AstExpr* parse_if_expr(Parser* parser) {
+    AstExpr* expr = new_expr(AST_EXPR_IF, parser->current.line);
+    advance(parser);
+    if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after if")) {
+        return 0;
+    }
+    expr->as.if_expr.cond = parse_expr(parser);
+    if (!expr->as.if_expr.cond) {
+        return 0;
+    }
+    if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after if condition")) {
+        return 0;
+    }
+    expr->as.if_expr.then_expr = parse_expr_block_value(parser, "expected '}' after if expression then branch");
+    if (!expr->as.if_expr.then_expr) {
+        return 0;
+    }
+    if (parser->current.kind != TOKEN_KW_ELSE) {
+        fail(parser, "if expression requires else branch");
+        return 0;
+    }
+    advance(parser);
+    expr->as.if_expr.else_expr = parse_expr_block_value(parser, "expected '}' after if expression else branch");
+    if (!expr->as.if_expr.else_expr) {
+        return 0;
+    }
+    return expr;
+}
 static AstExpr* parse_expr_no_range(Parser* parser);
 
 static char* expr_to_qualified_callee(const AstExpr* expr) {
@@ -1788,6 +1833,10 @@ static AstExpr* parse_primary(Parser* parser) {
             return 0;
         }
         return array;
+    }
+
+    if (token.kind == TOKEN_KW_IF) {
+        return parse_if_expr(parser);
     }
 
     fail(parser, "expected expression");

@@ -74,6 +74,8 @@ run_sample minimal.jiang 42
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2
+run_sample if_expr_minimal.jiang 42
+run_sample if_expr_nested_minimal.jiang 42
 run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
 run_sample defer_minimal.jiang 57
@@ -171,6 +173,8 @@ run_sample grouped_decl_minimal.jiang 51
 run_compile_fail invalid_record_shorthand_no_expected_type.jiang
 run_compile_fail invalid_record_call_syntax_minimal.jiang
 run_compile_fail invalid_struct_brace_literal_minimal.jiang
+run_compile_fail invalid_if_expr_missing_else.jiang
+run_compile_fail invalid_if_expr_branch_type_mismatch.jiang
 run_compile_fail invalid_grouped_var_decl_missing_initializer.jiang
 run_sample break_continue_minimal.jiang 8
 run_sample for_range_minimal.jiang 8

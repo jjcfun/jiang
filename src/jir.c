@@ -167,6 +167,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_BINARY: return JIR_EXPR_BINARY;
         case HIR_EXPR_COALESCE: return JIR_EXPR_COALESCE;
         case HIR_EXPR_CATCH_FALLBACK: return JIR_EXPR_CATCH_FALLBACK;
+        case HIR_EXPR_IF: return JIR_EXPR_IF;
         case HIR_EXPR_TERNARY: return JIR_EXPR_TERNARY;
         case HIR_EXPR_CALL: return JIR_EXPR_CALL;
         case HIR_EXPR_PROPAGATE: return JIR_EXPR_PROPAGATE;
@@ -422,6 +423,11 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             expr->as.catch_fallback.left = desugar_expr(expr->as.catch_fallback.left);
             expr->as.catch_fallback.fallback = desugar_expr(expr->as.catch_fallback.fallback);
             return expr->as.catch_fallback.left && expr->as.catch_fallback.fallback ? expr : 0;
+        case JIR_EXPR_IF:
+            expr->as.if_expr.cond = desugar_expr(expr->as.if_expr.cond);
+            expr->as.if_expr.then_expr = desugar_expr(expr->as.if_expr.then_expr);
+            expr->as.if_expr.else_expr = desugar_expr(expr->as.if_expr.else_expr);
+            return expr->as.if_expr.cond && expr->as.if_expr.then_expr && expr->as.if_expr.else_expr ? expr : 0;
         case JIR_EXPR_TERNARY:
             expr->as.ternary.cond = desugar_expr(expr->as.ternary.cond);
             expr->as.ternary.then_expr = desugar_expr(expr->as.ternary.then_expr);
@@ -746,6 +752,11 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             out->as.catch_fallback.left = lower_expr(program, expr->as.catch_fallback.left, error, error_line);
             out->as.catch_fallback.fallback = lower_expr(program, expr->as.catch_fallback.fallback, error, error_line);
             return out->as.catch_fallback.left && out->as.catch_fallback.fallback ? out : 0;
+        case HIR_EXPR_IF:
+            out->as.if_expr.cond = lower_expr(program, expr->as.if_expr.cond, error, error_line);
+            out->as.if_expr.then_expr = lower_expr(program, expr->as.if_expr.then_expr, error, error_line);
+            out->as.if_expr.else_expr = lower_expr(program, expr->as.if_expr.else_expr, error, error_line);
+            return out->as.if_expr.cond && out->as.if_expr.then_expr && out->as.if_expr.else_expr ? out : 0;
         case HIR_EXPR_TERNARY:
             out->as.ternary.cond = lower_expr(program, expr->as.ternary.cond, error, error_line);
             out->as.ternary.then_expr = lower_expr(program, expr->as.ternary.then_expr, error, error_line);

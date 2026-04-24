@@ -3430,6 +3430,42 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.unary.value = value;
             return out;
         }
+        case AST_EXPR_IF: {
+            HirExpr* cond = lower_expr_expected(ctx, expr->as.if_expr.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
+            HirExpr* then_expr = 0;
+            HirExpr* else_expr = 0;
+            if (!cond) {
+                return 0;
+            }
+            if (cond->type->kind != HIR_TYPE_BOOL) {
+                fail(ctx, "if expression condition must be Bool");
+                return 0;
+            }
+            then_expr = lower_expr(ctx, expr->as.if_expr.then_expr);
+            if (!then_expr) {
+                return 0;
+            }
+            else_expr = lower_expr(ctx, expr->as.if_expr.else_expr);
+            if (!else_expr) {
+                return 0;
+            }
+            if (!type_equals(then_expr->type, else_expr->type)) {
+                fail(ctx, "if expression branch type mismatch");
+                return 0;
+            }
+            if (then_expr->type->kind == HIR_TYPE_TUPLE ||
+                then_expr->type->kind == HIR_TYPE_ARRAY ||
+                then_expr->type->kind == HIR_TYPE_UNION ||
+                then_expr->type->kind == HIR_TYPE_VOID) {
+                fail(ctx, "if expression aggregate result unsupported");
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_IF, then_expr->type, expr->line);
+            out->as.if_expr.cond = cond;
+            out->as.if_expr.then_expr = then_expr;
+            out->as.if_expr.else_expr = else_expr;
+            return out;
+        }
         case AST_EXPR_TERNARY: {
             HirExpr* cond = lower_expr_expected(ctx, expr->as.ternary.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
             HirExpr* then_expr = 0;

@@ -168,6 +168,7 @@ typedef enum AstExprKind {
     AST_EXPR_COALESCE,
     AST_EXPR_COALESCE_CONTROL,
     AST_EXPR_CATCH_FALLBACK,
+    AST_EXPR_IF,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
@@ -266,6 +267,11 @@ struct AstExpr {
             AstExpr* left;
             AstExpr* fallback;
         } catch_fallback;
+        struct {
+            AstExpr* cond;
+            AstExpr* then_expr;
+            AstExpr* else_expr;
+        } if_expr;
         struct {
             AstExpr* left;
             AstCoalesceControlKind control;

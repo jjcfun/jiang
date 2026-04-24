@@ -65,6 +65,7 @@ typedef enum JirExprKind {
     JIR_EXPR_BINARY,
     JIR_EXPR_COALESCE,
     JIR_EXPR_CATCH_FALLBACK,
+    JIR_EXPR_IF,
     JIR_EXPR_TERNARY,
     JIR_EXPR_CALL,
     JIR_EXPR_PROPAGATE,
@@ -215,6 +216,11 @@ struct JirExpr {
             JirExpr* left;
             JirExpr* fallback;
         } catch_fallback;
+        struct {
+            JirExpr* cond;
+            JirExpr* then_expr;
+            JirExpr* else_expr;
+        } if_expr;
         struct {
             JirExpr* cond;
             JirExpr* then_expr;

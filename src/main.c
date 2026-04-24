@@ -804,6 +804,11 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             out->as.catch_fallback.left = clone_expr(source, prefix, hide_private, expr->as.catch_fallback.left);
             out->as.catch_fallback.fallback = clone_expr(source, prefix, hide_private, expr->as.catch_fallback.fallback);
             break;
+        case AST_EXPR_IF:
+            out->as.if_expr.cond = clone_expr(source, prefix, hide_private, expr->as.if_expr.cond);
+            out->as.if_expr.then_expr = clone_expr(source, prefix, hide_private, expr->as.if_expr.then_expr);
+            out->as.if_expr.else_expr = clone_expr(source, prefix, hide_private, expr->as.if_expr.else_expr);
+            break;
         case AST_EXPR_COALESCE_CONTROL:
             out->as.coalesce_control.left = clone_expr(source, prefix, hide_private, expr->as.coalesce_control.left);
             out->as.coalesce_control.control = expr->as.coalesce_control.control;
@@ -4317,6 +4322,11 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.catch_fallback.left = clone_expr_subst(expr->as.catch_fallback.left, subst);
             out->as.catch_fallback.fallback = clone_expr_subst(expr->as.catch_fallback.fallback, subst);
             break;
+        case AST_EXPR_IF:
+            out->as.if_expr.cond = clone_expr_subst(expr->as.if_expr.cond, subst);
+            out->as.if_expr.then_expr = clone_expr_subst(expr->as.if_expr.then_expr, subst);
+            out->as.if_expr.else_expr = clone_expr_subst(expr->as.if_expr.else_expr, subst);
+            break;
         case AST_EXPR_COALESCE_CONTROL:
             out->as.coalesce_control.left = clone_expr_subst(expr->as.coalesce_control.left, subst);
             out->as.coalesce_control.control = expr->as.coalesce_control.control;
@@ -5014,6 +5024,10 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
         case AST_EXPR_CATCH_FALLBACK:
             return transform_expr(mono, expr->as.catch_fallback.left, locals) &&
                    transform_expr(mono, expr->as.catch_fallback.fallback, locals);
+        case AST_EXPR_IF:
+            return transform_expr(mono, expr->as.if_expr.cond, locals) &&
+                   transform_expr(mono, expr->as.if_expr.then_expr, locals) &&
+                   transform_expr(mono, expr->as.if_expr.else_expr, locals);
         case AST_EXPR_COALESCE_CONTROL:
             return transform_expr(mono, expr->as.coalesce_control.left, locals) &&
                    (!expr->as.coalesce_control.return_expr ||

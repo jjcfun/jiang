@@ -1228,6 +1228,33 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
             return phi;
         }
+        case JIR_EXPR_IF: {
+            LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ifexpr.then");
+            LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ifexpr.else");
+            LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ifexpr.end");
+            LLVMValueRef then_value = 0;
+            LLVMValueRef else_value = 0;
+            LLVMValueRef phi = 0;
+            LLVMValueRef incoming_values[2];
+            LLVMBasicBlockRef incoming_blocks[2];
+            LLVMBuildCondBr(cg->builder, emit_expr(cg, expr->as.if_expr.cond), then_block, else_block);
+            LLVMPositionBuilderAtEnd(cg->builder, then_block);
+            then_value = emit_expr(cg, expr->as.if_expr.then_expr);
+            LLVMBuildBr(cg->builder, merge_block);
+            then_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, else_block);
+            else_value = emit_expr(cg, expr->as.if_expr.else_expr);
+            LLVMBuildBr(cg->builder, merge_block);
+            else_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "ifexprtmp");
+            incoming_values[0] = then_value;
+            incoming_values[1] = else_value;
+            incoming_blocks[0] = then_block;
+            incoming_blocks[1] = else_block;
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            return phi;
+        }
         case JIR_EXPR_ENUM_MEMBER:
             return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_ENUM_VALUE:
