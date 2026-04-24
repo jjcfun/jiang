@@ -75,6 +75,7 @@ run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2
 run_sample if_expr_minimal.jiang 42
+run_sample if_expr_bare_minimal.jiang 42
 run_sample if_expr_nested_minimal.jiang 42
 run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
