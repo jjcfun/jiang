@@ -159,6 +159,7 @@ struct JirType {
     JirStructFieldDeclList struct_fields;
     int struct_has_deinit;
     char* struct_deinit_name;
+    int errorable_flag;
     int64_t union_payload_size;
     int64_t union_payload_align;
 };

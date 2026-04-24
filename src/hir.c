@@ -50,6 +50,8 @@ typedef struct LowerContext {
     HirBlockList active_defers;
     DeferFrameList defer_frames;
     TryScopeList try_scopes;
+    int infer_try_error_flag;
+    HirType* inferred_try_error_type;
     int loop_depth;
     int temp_index;
 } LowerContext;
@@ -184,6 +186,7 @@ static HirType* errorable_value_type(HirType* type);
 static HirType* errorable_error_type(HirType* type);
 static int is_errorable_type(HirType* type);
 static HirExpr* maybe_wrap_expected_errorable_expr(LowerContext* ctx, HirExpr* value, HirType* expected_type, int line);
+static HirExpr* lower_expr_value(LowerContext* ctx, const AstExpr* expr);
 static int current_try_catches_error(LowerContext* ctx, HirType* error_type);
 static int current_try_defer_start(LowerContext* ctx);
 
@@ -1274,6 +1277,51 @@ static HirExpr* maybe_wrap_expected_errorable_expr(LowerContext* ctx, HirExpr* v
         }
     }
     return value;
+}
+
+static HirExpr* lower_expr_value(LowerContext* ctx, const AstExpr* expr) {
+    HirExpr* value = lower_expr(ctx, expr);
+    HirType* current_return_type = 0;
+    if (!value) {
+        return 0;
+    }
+    if (!is_errorable_type(value->type)) {
+        return value;
+    }
+    current_return_type = ctx->current_function ? ctx->current_function->return_type : 0;
+    if (current_try_catches_error(ctx, errorable_error_type(value->type))) {
+        HirExpr* propagate = new_expr(HIR_EXPR_PROPAGATE, errorable_value_type(value->type), expr->line);
+        propagate->as.propagate.value = value;
+        propagate->as.propagate.result_type = 0;
+        return propagate;
+    }
+    if (ctx->infer_try_error_flag && ctx->try_scopes.count > 0) {
+        if (!ctx->inferred_try_error_type) {
+            ctx->inferred_try_error_type = errorable_error_type(value->type);
+        } else if (!type_equals(ctx->inferred_try_error_type, errorable_error_type(value->type))) {
+            fail(ctx, "try expression body must use a single error type");
+            return 0;
+        }
+        {
+            HirExpr* propagate = new_expr(HIR_EXPR_PROPAGATE, errorable_value_type(value->type), expr->line);
+            propagate->as.propagate.value = value;
+            propagate->as.propagate.result_type = 0;
+            return propagate;
+        }
+    }
+    if (is_errorable_type(current_return_type) &&
+        type_equals(errorable_error_type(current_return_type), errorable_error_type(value->type))) {
+        HirExpr* propagate = new_expr(HIR_EXPR_PROPAGATE, errorable_value_type(value->type), expr->line);
+        propagate->as.propagate.value = value;
+        propagate->as.propagate.result_type = current_return_type;
+        return propagate;
+    }
+    if (ctx->try_scopes.count > 0) {
+        fail(ctx, "uncaught error type in try block");
+        return 0;
+    }
+    fail(ctx, "errorable expression must be handled");
+    return 0;
 }
 
 static HirExpr* lower_optional_chain_field(LowerContext* ctx, const AstExpr* expr) {
@@ -3488,7 +3536,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 pop_scope(ctx);
                 return 0;
             }
-            value = lower_expr(ctx, expr->as.block_expr.value);
+            value = lower_expr_value(ctx, expr->as.block_expr.value);
             if (!value) {
                 pop_scope(ctx);
                 return 0;
@@ -3500,22 +3548,71 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_TRY: {
-            HirExpr* value = lower_expr(ctx, expr->as.try_expr.value);
+            HirExpr* value = 0;
             HirType* value_type = 0;
             HirType* produced_error_type = 0;
+            TryScope try_scope;
+            int saved_infer_try_error_flag = ctx->infer_try_error_flag;
+            HirType* saved_inferred_try_error_type = ctx->inferred_try_error_type;
             int i = 0;
             HirExpr* result = 0;
+            memset(&try_scope, 0, sizeof(try_scope));
+            for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                if (expr->as.try_expr.catches.items[i].error_type.kind != AST_TYPE_INFER) {
+                    HirTryCatch catch_item;
+                    int j = 0;
+                    memset(&catch_item, 0, sizeof(catch_item));
+                    catch_item.error_type = lower_type(ctx, &expr->as.try_expr.catches.items[i].error_type);
+                    if (!catch_item.error_type) {
+                        return 0;
+                    }
+                    for (j = 0; j < try_scope.catches.count; ++j) {
+                        if (type_equals(try_scope.catches.items[j].error_type, catch_item.error_type)) {
+                            fail(ctx, "duplicate catch type");
+                            return 0;
+                        }
+                    }
+                    try_catch_list_push(&try_scope.catches, catch_item);
+                }
+            }
+            try_scope.defer_start = ctx->active_defers.count;
+            try_scope_list_push(&ctx->try_scopes, try_scope);
+            ctx->infer_try_error_flag = 0;
+            ctx->inferred_try_error_type = 0;
+            for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                if (expr->as.try_expr.catches.items[i].error_type.kind == AST_TYPE_INFER) {
+                    ctx->infer_try_error_flag = 1;
+                    break;
+                }
+            }
+            value = lower_expr_value(ctx, expr->as.try_expr.value);
+            produced_error_type = ctx->inferred_try_error_type;
+            ctx->try_scopes.count -= 1;
+            ctx->infer_try_error_flag = saved_infer_try_error_flag;
+            ctx->inferred_try_error_type = saved_inferred_try_error_type;
             if (!value) {
                 return 0;
             }
-            if (!is_errorable_type(value->type)) {
+            value_type = value->type;
+            if (!produced_error_type) {
+                for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                    if (expr->as.try_expr.catches.items[i].error_type.kind != AST_TYPE_INFER) {
+                        produced_error_type = lower_type(ctx, &expr->as.try_expr.catches.items[i].error_type);
+                        if (!produced_error_type) {
+                            return 0;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!produced_error_type) {
                 fail(ctx, "try expression requires errorable body");
                 return 0;
             }
-            value_type = errorable_value_type(value->type);
-            produced_error_type = errorable_error_type(value->type);
             for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
-                HirType* catch_error_type = lower_type(ctx, &expr->as.try_expr.catches.items[i].error_type);
+                HirType* catch_error_type = expr->as.try_expr.catches.items[i].error_type.kind == AST_TYPE_INFER
+                    ? produced_error_type
+                    : lower_type(ctx, &expr->as.try_expr.catches.items[i].error_type);
                 HirBinding* binding = 0;
                 HirExpr* handler = 0;
                 Scope catch_scope;
@@ -3567,7 +3664,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             fail(ctx, "control-flow coalesce is only supported in local variable initialization");
             return 0;
         case AST_EXPR_ADDR: {
-            HirExpr* value = lower_expr(ctx, expr->as.unary.value);
+            HirExpr* value = lower_expr_value(ctx, expr->as.unary.value);
             HirType* pointer_type = 0;
             if (!value) {
                 return 0;
@@ -3583,7 +3680,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_DEREF: {
-            HirExpr* value = lower_expr(ctx, expr->as.unary.value);
+            HirExpr* value = lower_expr_value(ctx, expr->as.unary.value);
             if (!value) {
                 return 0;
             }
@@ -3615,7 +3712,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_FREE: {
-            HirExpr* value = lower_expr(ctx, expr->as.unary.value);
+            HirExpr* value = lower_expr_value(ctx, expr->as.unary.value);
             if (!value) {
                 return 0;
             }
@@ -3631,7 +3728,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_BIT_NOT: {
-            HirExpr* value = lower_expr(ctx, expr->as.unary.value);
+            HirExpr* value = lower_expr_value(ctx, expr->as.unary.value);
             if (!value) {
                 return 0;
             }
@@ -3654,11 +3751,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 fail(ctx, "if expression condition must be Bool");
                 return 0;
             }
-            then_expr = lower_expr(ctx, expr->as.if_expr.then_expr);
+            then_expr = lower_expr_value(ctx, expr->as.if_expr.then_expr);
             if (!then_expr) {
                 return 0;
             }
-            else_expr = lower_expr(ctx, expr->as.if_expr.else_expr);
+            else_expr = lower_expr_value(ctx, expr->as.if_expr.else_expr);
             if (!else_expr) {
                 return 0;
             }
@@ -4239,7 +4336,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 (is_expected_type_shorthand_expr(expr->as.binary.left) || is_expected_type_null_expr(expr->as.binary.left)) &&
                 !is_expected_type_shorthand_expr(expr->as.binary.right) &&
                 !is_expected_type_null_expr(expr->as.binary.right)) {
-                right = lower_expr(ctx, expr->as.binary.right);
+                right = lower_expr_value(ctx, expr->as.binary.right);
                 if (!right) {
                     return 0;
                 }
@@ -4248,7 +4345,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     return 0;
                 }
             } else {
-                left = lower_expr(ctx, expr->as.binary.left);
+                left = lower_expr_value(ctx, expr->as.binary.left);
                 if (!left) {
                     return 0;
                 }
@@ -4256,7 +4353,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     (is_expected_type_shorthand_expr(expr->as.binary.right) || is_expected_type_null_expr(expr->as.binary.right))) {
                     right = lower_expr_expected(ctx, expr->as.binary.right, left->type);
                 } else {
-                    right = lower_expr(ctx, expr->as.binary.right);
+                    right = lower_expr_value(ctx, expr->as.binary.right);
                 }
                 if (!right) {
                     return 0;
@@ -4377,7 +4474,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 : new_owned_type(ctx->program, HIR_TYPE_TUPLE);
             out = new_expr(HIR_EXPR_TUPLE, tuple_type, expr->line);
             for (i = 0; i < expr->as.tuple.items.count; ++i) {
-                HirExpr* item = lower_expr(ctx, expr->as.tuple.items.items[i]);
+                HirExpr* item = lower_expr_value(ctx, expr->as.tuple.items.items[i]);
                 if (!item) {
                     return 0;
                 }
@@ -4398,7 +4495,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             for (i = 0; i < expr->as.array.items.count; ++i) {
                 HirExpr* item = array_item_expected
                                     ? lower_expr_expected(ctx, expr->as.array.items.items[i], array_item_expected)
-                                    : lower_expr(ctx, expr->as.array.items.items[i]);
+                                    : lower_expr_value(ctx, expr->as.array.items.items[i]);
                 if (!item) {
                     return 0;
                 }
@@ -4417,7 +4514,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_INDEX: {
-            HirExpr* base = lower_expr(ctx, expr->as.index.base);
+            HirExpr* base = lower_expr_value(ctx, expr->as.index.base);
             HirExpr* index = 0;
             HirExpr* subscript_call = 0;
             if (!base) {
@@ -4433,7 +4530,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 base = deref;
             }
             if (base->type->kind == HIR_TYPE_TUPLE) {
-                index = lower_expr(ctx, expr->as.index.index);
+                index = lower_expr_value(ctx, expr->as.index.index);
                 if (!index) {
                     return 0;
                 }
@@ -4447,7 +4544,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
                 out = new_expr(HIR_EXPR_INDEX, base->type->tuple_items.items[expr->as.index.index->as.int_value], expr->line);
             } else if (base->type->kind == HIR_TYPE_ARRAY || base->type->kind == HIR_TYPE_SLICE || base->type->kind == HIR_TYPE_MANY_POINTER) {
-                index = lower_expr(ctx, expr->as.index.index);
+                index = lower_expr_value(ctx, expr->as.index.index);
                 if (!index) {
                     return 0;
                 }
@@ -5091,7 +5188,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             ctx->current_line = saved_line;
             return out;
         case AST_STMT_EXPR:
-            out->as.expr_stmt.expr = lower_expr(ctx, stmt->as.expr_stmt.expr);
+            out->as.expr_stmt.expr = lower_expr_value(ctx, stmt->as.expr_stmt.expr);
             if (!out->as.expr_stmt.expr) {
                 return 0;
             }

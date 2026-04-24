@@ -740,14 +740,13 @@ Int@Err outer(Bool fail) {
 异常的使用方式是：
 
 - 在 `@E` 函数里依靠普通调用做同 `E` 的隐式传播
-- 用 `expr catch fallback` 处理单个失败结果
-- 用 `expr catch (e) fallback` 或 `expr catch (e) { expr }` 处理单个失败结果并读取错误值
-- 在表达式位置用 `try { expr } catch (...) ...` 拦截单个可错表达式
+- 用 `try expr catch fallback` 处理单个失败结果
+- 用 `try expr catch (e) fallback` 或 `try expr catch (e) { expr }` 处理单个失败结果并读取错误值
 - 在需要拦截错误时使用语句级 `try-catch`
 
 异常结果不通过 `switch` 匹配。
 
-单个表达式可以直接写 `catch`：
+单个可错表达式可以用前置 `try` 加 `catch` 处理：
 
 ```c
 enum Err {
@@ -762,18 +761,15 @@ Int@Err parse(Bool fail) {
 }
 
 Int main() {
-    Int a = parse(false) catch 0;
-    Int b = parse(true) catch (e) if (e == Err.bad) 42 else 0;
+    Int a = try parse(false) catch 0;
+    Int b = try parse(true) catch (e) if (e == Err.bad) 42 else 0;
     Int! handled = 0;
-    parse(true) catch (e) {
+    try parse(true) catch (e) {
         if (e == Err.bad) {
             handled = handled + 1;
         }
     };
-    Int c = try {
-        Int fail = 1;
-        parse(fail == 1)
-    } catch (Err e) {
+    Int c = try parse(true) catch (e) {
         Int base = 0;
         if (e == Err.bad) base + 7 else base
     };
@@ -783,21 +779,21 @@ Int main() {
 
 单条 `catch` 规则：
 
-- `expr catch fallback`
+- `try expr catch fallback`
   - `expr` 必须是 `T@E`
   - 结果类型是 `T`
   - `fallback` 的类型必须能赋给 `T`
-- `expr catch (name) fallback`
+- `try expr catch (name) fallback`
   - `expr` 必须是 `T@E`
   - `name` 的类型自动推断为错误类型 `E`
   - 结果类型是 `T`
   - `fallback` 的类型必须能赋给 `T`
-- `expr catch (name) { expr }`
+- `try expr catch (name) { expr }`
   - 只在表达式位置可用
   - `expr` 必须是 `T@E`
   - `name` 的类型自动推断为错误类型 `E`
   - 花括号内可以写多条语句，最后一个不带 `;` 的表达式作为结果
-- `expr catch (name) { ... };`
+- `try expr catch (name) { ... };`
   - 这是语句级形式
   - 成功时继续执行，错误时进入块
 - `catch` 不会做 runtime unwind，仍然只是结果值分支
@@ -839,9 +835,6 @@ Int main() {
 
 - 只支持语句级：
   - `try { ... } catch (Type name) { ... }`
-- 也支持表达式级：
-  - `try { expr } catch (Type name) expr`
-  - `try { expr } catch (Type name) { expr }`
 - `catch` 至少一个，可多个
 - `catch` 类型必须显式写出，且必须带绑定名
 - `try` 块中所有可能出现的错误类型都必须被 `catch` 完整覆盖，否则编译错误

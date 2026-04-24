@@ -237,6 +237,7 @@ static JirType* lower_type(const HirType* hir_type, const char** error) {
     jir_type->kind = jir_type_kind(hir_type->kind);
     jir_type->mutable_flag = hir_type->mutable_flag;
     jir_type->array_length = hir_type->array_length;
+    jir_type->errorable_flag = hir_is_errorable_type(hir_type);
     if (hir_type->return_type) {
         jir_type->return_type = lower_type(hir_type->return_type, error);
         if (!jir_type->return_type) {

@@ -109,6 +109,9 @@ typedef struct FunctionCodegen {
     int alloca_capacity;
     int current_block_index;
     JirBlockMapEntry* block_map;
+    struct TempTryHandler* temp_try_handlers;
+    int temp_try_handler_count;
+    int temp_try_handler_capacity;
 } FunctionCodegen;
 
 struct JirBlockMapEntry {
@@ -116,8 +119,62 @@ struct JirBlockMapEntry {
     LLVMBasicBlockRef block;
 };
 
+typedef struct TempTryHandler {
+    const JirType* error_type;
+    LLVMValueRef slot;
+    LLVMBasicBlockRef catch_target;
+} TempTryHandler;
+
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type);
 static LLVMValueRef find_alloca(FunctionCodegen* cg, const JirBinding* binding);
+static int block_terminated(LLVMBasicBlockRef block);
+
+static int jir_type_is_errorable(const JirType* type) {
+    return type && type->kind == JIR_TYPE_UNION && type->errorable_flag;
+}
+
+static const TempTryHandler* active_temp_try_handler(FunctionCodegen* cg, const JirType* error_type) {
+    int i = 0;
+    if (!cg || !error_type) {
+        return 0;
+    }
+    for (i = cg->temp_try_handler_count - 1; i >= 0; --i) {
+        if (cg->temp_try_handlers[i].error_type == error_type) {
+            return &cg->temp_try_handlers[i];
+        }
+    }
+    return 0;
+}
+
+static int push_temp_try_handler(FunctionCodegen* cg, const JirType* error_type, LLVMValueRef slot, LLVMBasicBlockRef catch_target) {
+    TempTryHandler handler;
+    if (!cg || !error_type || !slot || !catch_target) {
+        return 0;
+    }
+    if (cg->temp_try_handler_count >= cg->temp_try_handler_capacity) {
+        int new_capacity = cg->temp_try_handler_capacity > 0 ? cg->temp_try_handler_capacity * 2 : 4;
+        TempTryHandler* new_items = (TempTryHandler*)realloc(
+            cg->temp_try_handlers,
+            (size_t)new_capacity * sizeof(TempTryHandler));
+        if (!new_items) {
+            return 0;
+        }
+        cg->temp_try_handlers = new_items;
+        cg->temp_try_handler_capacity = new_capacity;
+    }
+    memset(&handler, 0, sizeof(handler));
+    handler.error_type = error_type;
+    handler.slot = slot;
+    handler.catch_target = catch_target;
+    cg->temp_try_handlers[cg->temp_try_handler_count++] = handler;
+    return 1;
+}
+
+static void pop_temp_try_handler(FunctionCodegen* cg) {
+    if (cg && cg->temp_try_handler_count > 0) {
+        cg->temp_try_handler_count -= 1;
+    }
+}
 
 static const JirTryHandler* active_try_handler(FunctionCodegen* cg, const JirType* error_type) {
     int i = 0;
@@ -138,8 +195,14 @@ static const JirTryHandler* active_try_handler(FunctionCodegen* cg, const JirTyp
 }
 
 static int branch_to_try_handler(FunctionCodegen* cg, const JirType* error_type, LLVMValueRef error_value) {
+    const TempTryHandler* temp_handler = active_temp_try_handler(cg, error_type);
     const JirTryHandler* handler = active_try_handler(cg, error_type);
     LLVMValueRef slot = 0;
+    if (temp_handler) {
+        LLVMBuildStore(cg->builder, error_value, temp_handler->slot);
+        LLVMBuildBr(cg->builder, temp_handler->catch_target);
+        return 1;
+    }
     if (!handler) {
         return 0;
     }
@@ -943,7 +1006,8 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                     base,
                     expr->as.propagate.value->type,
                     expr->as.propagate.error_type);
-                if (active_try_handler(cg, expr->as.propagate.error_type)) {
+                if (active_temp_try_handler(cg, expr->as.propagate.error_type) ||
+                    active_try_handler(cg, expr->as.propagate.error_type)) {
                     if (!branch_to_try_handler(cg, expr->as.propagate.error_type, error_payload)) {
                         return 0;
                     }
@@ -1213,46 +1277,64 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             return phi;
         }
         case JIR_EXPR_CATCH_HANDLER: {
-            LLVMValueRef base = emit_expr(cg, expr->as.catch_handler.left);
-            LLVMValueRef tag = LLVMBuildExtractValue(cg->builder, base, 0, "catchh.tag");
-            LLVMBasicBlockRef ok_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.ok");
+            LLVMValueRef base = 0;
             LLVMBasicBlockRef err_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.handler");
             LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.end");
+            LLVMBasicBlockRef ok_block = 0;
             LLVMValueRef ok_value = 0;
             LLVMValueRef handler_value = 0;
-            LLVMValueRef error_value = 0;
             LLVMValueRef phi = 0;
             LLVMValueRef slot = 0;
             LLVMValueRef incoming_values[2];
             LLVMBasicBlockRef incoming_blocks[2];
-            LLVMValueRef is_error = LLVMBuildICmp(
-                cg->builder,
-                LLVMIntEQ,
-                tag,
-                LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
-                "catchh.is_error");
-            LLVMBuildCondBr(cg->builder, is_error, err_block, ok_block);
-            LLVMPositionBuilderAtEnd(cg->builder, ok_block);
-            ok_value = load_union_payload_value(
-                cg,
-                base,
-                expr->as.catch_handler.left->type,
-                expr->type);
-            LLVMBuildBr(cg->builder, merge_block);
-            ok_block = LLVMGetInsertBlock(cg->builder);
-            LLVMPositionBuilderAtEnd(cg->builder, err_block);
-            error_value = load_union_payload_value(
-                cg,
-                base,
-                expr->as.catch_handler.left->type,
-                expr->as.catch_handler.binding->type);
             slot = find_alloca(cg, expr->as.catch_handler.binding);
             if (!slot) {
                 return 0;
             }
-            LLVMBuildStore(cg->builder, error_value, slot);
+            if (!push_temp_try_handler(cg, expr->as.catch_handler.binding->type, slot, err_block)) {
+                return 0;
+            }
+            base = emit_expr(cg, expr->as.catch_handler.left);
+            pop_temp_try_handler(cg);
+            if (jir_type_is_errorable(expr->as.catch_handler.left->type)) {
+                LLVMValueRef tag = LLVMBuildExtractValue(cg->builder, base, 0, "catchh.tag");
+                LLVMBasicBlockRef union_ok_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.ok");
+                LLVMValueRef is_error = LLVMBuildICmp(
+                    cg->builder,
+                    LLVMIntEQ,
+                    tag,
+                    LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
+                    "catchh.is_error");
+                LLVMBuildCondBr(cg->builder, is_error, err_block, union_ok_block);
+                LLVMPositionBuilderAtEnd(cg->builder, union_ok_block);
+                ok_value = load_union_payload_value(
+                    cg,
+                    base,
+                    expr->as.catch_handler.left->type,
+                    expr->type);
+                LLVMBuildBr(cg->builder, merge_block);
+                ok_block = LLVMGetInsertBlock(cg->builder);
+                LLVMPositionBuilderAtEnd(cg->builder, err_block);
+                LLVMBuildStore(
+                    cg->builder,
+                    load_union_payload_value(
+                        cg,
+                        base,
+                        expr->as.catch_handler.left->type,
+                        expr->as.catch_handler.binding->type),
+                    slot);
+            } else {
+                ok_value = base;
+                ok_block = LLVMGetInsertBlock(cg->builder);
+                if (!block_terminated(ok_block)) {
+                    LLVMBuildBr(cg->builder, merge_block);
+                }
+                LLVMPositionBuilderAtEnd(cg->builder, err_block);
+            }
             handler_value = emit_expr(cg, expr->as.catch_handler.handler);
-            LLVMBuildBr(cg->builder, merge_block);
+            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
+                LLVMBuildBr(cg->builder, merge_block);
+            }
             err_block = LLVMGetInsertBlock(cg->builder);
             LLVMPositionBuilderAtEnd(cg->builder, merge_block);
             phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "catchhtmp");
@@ -1581,6 +1663,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
         for (j = 0; j < block->insts.count; ++j) {
             if (!emit_jir_inst(&cg, &block->insts.items[j])) {
                 free(block_map);
+                free(cg.temp_try_handlers);
                 LLVMDisposeBuilder(cg.entry_builder);
                 LLVMDisposeBuilder(cg.builder);
                 free(cg.allocas);
@@ -1609,6 +1692,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
                     if (handler) {
                         if (!branch_to_try_handler(&cg, block->term.value->type, throw_value)) {
                             free(block_map);
+                            free(cg.temp_try_handlers);
                             LLVMDisposeBuilder(cg.entry_builder);
                             LLVMDisposeBuilder(cg.builder);
                             free(cg.allocas);
@@ -1658,6 +1742,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
         LLVMDisposeBuilder(cg.entry_builder);
         LLVMDisposeBuilder(cg.builder);
         free(block_map);
+        free(cg.temp_try_handlers);
         free(cg.allocas);
         return 0;
     }
@@ -1665,6 +1750,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     LLVMDisposeBuilder(cg.entry_builder);
     LLVMDisposeBuilder(cg.builder);
     free(block_map);
+    free(cg.temp_try_handlers);
     free(cg.allocas);
     return 1;
 }

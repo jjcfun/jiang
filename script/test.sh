@@ -140,9 +140,12 @@ run_sample fn_pointer_errorable_minimal.jiang 1
 run_sample try_catch_single_minimal.jiang 12
 run_sample try_catch_multi_minimal.jiang 30
 run_sample try_catch_errorable_fn_minimal.jiang 42
+run_sample try_catch_nested_value_expr_minimal.jiang 42
 run_sample try_catch_nested_minimal.jiang 13
 run_sample try_catch_expr_minimal.jiang 42
 run_sample try_catch_expr_block_multi_stmt_minimal.jiang 42
+run_sample try_catch_expr_nested_minimal.jiang 43
+run_sample try_catch_expr_block_nested_minimal.jiang 43
 run_sample self_keyword_minimal.jiang 42
 run_sample multi_file_enum_minimal.jiang 1
 run_sample multi_file_enum_shorthand_minimal.jiang 1
