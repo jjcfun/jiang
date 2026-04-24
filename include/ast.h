@@ -157,6 +157,19 @@ typedef struct AstSwitchExprCaseList {
     int capacity;
 } AstSwitchExprCaseList;
 
+typedef struct AstExprTryCatch {
+    AstType error_type;
+    char* binding_name;
+    AstExpr* value;
+    int line;
+} AstExprTryCatch;
+
+typedef struct AstExprTryCatchList {
+    AstExprTryCatch* items;
+    int count;
+    int capacity;
+} AstExprTryCatchList;
+
 typedef enum AstExprKind {
     AST_EXPR_INT = 0,
     AST_EXPR_FLOAT,
@@ -175,8 +188,11 @@ typedef enum AstExprKind {
     AST_EXPR_COALESCE,
     AST_EXPR_COALESCE_CONTROL,
     AST_EXPR_CATCH_FALLBACK,
+    AST_EXPR_CATCH_HANDLER,
+    AST_EXPR_BLOCK,
     AST_EXPR_IF,
     AST_EXPR_SWITCH,
+    AST_EXPR_TRY,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
@@ -276,6 +292,15 @@ struct AstExpr {
             AstExpr* fallback;
         } catch_fallback;
         struct {
+            AstExpr* left;
+            char* binding_name;
+            AstExpr* handler;
+        } catch_handler;
+        struct {
+            AstBlock* body;
+            AstExpr* value;
+        } block_expr;
+        struct {
             AstExpr* cond;
             AstExpr* then_expr;
             AstExpr* else_expr;
@@ -284,6 +309,10 @@ struct AstExpr {
             AstExpr* value;
             AstSwitchExprCaseList cases;
         } switch_expr;
+        struct {
+            AstExpr* value;
+            AstExprTryCatchList catches;
+        } try_expr;
         struct {
             AstExpr* left;
             AstCoalesceControlKind control;

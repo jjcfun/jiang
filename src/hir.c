@@ -174,6 +174,7 @@ static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
 static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block);
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary);
+static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
 static HirType* function_type_from_function(LowerContext* ctx, HirFunction* fn);
 static HirType* current_self_owner_type(LowerContext* ctx);
 static HirType* requalify_nominal_owner_type(LowerContext* ctx, HirType* base_type, int mutable_flag);
@@ -1077,6 +1078,49 @@ static HirStmt* new_stmt(HirStmtKind kind, int line) {
     stmt->kind = kind;
     stmt->line = line;
     return stmt;
+}
+
+static int lower_block_expr_stmts(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block) {
+    int i = 0;
+    for (i = 0; i < ast_block->stmts.count; ++i) {
+        const AstStmt* stmt = ast_block->stmts.items[i];
+        HirStmt* lowered = 0;
+        if (stmt->kind == AST_STMT_GROUP) {
+            if (!lower_block_expr_stmts(ctx, &stmt->as.group_stmt, out_block)) {
+                return 0;
+            }
+            continue;
+        }
+        if (stmt->kind == AST_STMT_VAR_DECL &&
+            stmt->as.var_decl.init &&
+            stmt->as.var_decl.init->kind == AST_EXPR_COALESCE_CONTROL) {
+            return fail(ctx, "coalesce control is not supported in expression block");
+        }
+        switch (stmt->kind) {
+            case AST_STMT_VAR_DECL:
+            case AST_STMT_ASSIGN:
+            case AST_STMT_EXPR:
+                break;
+            default:
+                return fail(ctx, "unsupported statement in expression block");
+        }
+        lowered = lower_stmt(ctx, stmt);
+        if (!lowered) {
+            return 0;
+        }
+        if (lowered->kind != HIR_STMT_VAR_DECL &&
+            lowered->kind != HIR_STMT_ASSIGN &&
+            lowered->kind != HIR_STMT_EXPR) {
+            return fail(ctx, "unsupported statement in expression block");
+        }
+        if (lowered->kind == HIR_STMT_EXPR &&
+            lowered->as.expr_stmt.expr &&
+            lowered->as.expr_stmt.expr->kind == HIR_EXPR_PROPAGATE) {
+            return fail(ctx, "implicit error propagation is not supported in expression block statement");
+        }
+        stmt_list_push(&out_block->stmts, lowered);
+    }
+    return 1;
 }
 
 static HirStmtKind stmt_kind_from_ast(AstStmtKind kind) {
@@ -3363,6 +3407,138 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.catch_fallback.left = left;
             out->as.catch_fallback.fallback = fallback;
             return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+        }
+        case AST_EXPR_CATCH_HANDLER: {
+            HirExpr* left = lower_expr(ctx, expr->as.catch_handler.left);
+            HirExpr* handler = 0;
+            HirType* value_type = 0;
+            HirType* error_type = 0;
+            HirBinding* binding = 0;
+            Scope catch_scope;
+            if (!left) {
+                return 0;
+            }
+            if (!is_errorable_type(left->type)) {
+                fail(ctx, "catch handler requires errorable expression");
+                return 0;
+            }
+            value_type = errorable_value_type(left->type);
+            error_type = errorable_error_type(left->type);
+            binding = new_binding(error_type, 0, expr->as.catch_handler.binding_name, HIR_BINDING_LOCAL, expr->line);
+            binding_list_push(&ctx->current_function->locals, binding);
+            push_scope(ctx, &catch_scope);
+            if (!bind_in_current_scope(ctx, binding)) {
+                pop_scope(ctx);
+                return 0;
+            }
+            handler = lower_expr_expected(ctx, expr->as.catch_handler.handler, value_type);
+            if (!handler) {
+                pop_scope(ctx);
+                return 0;
+            }
+            handler = maybe_decay_array_to_slice(ctx, handler, value_type, expr->line);
+            if (!handler) {
+                pop_scope(ctx);
+                return 0;
+            }
+            pop_scope(ctx);
+            if (!type_assignment_compatible(handler->type, value_type)) {
+                fail(ctx, "catch handler type mismatch");
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_CATCH_HANDLER, value_type, expr->line);
+            out->as.catch_handler.left = left;
+            out->as.catch_handler.binding = binding;
+            out->as.catch_handler.handler = handler;
+            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+        }
+        case AST_EXPR_BLOCK: {
+            Scope block_scope;
+            HirBlock* body = (HirBlock*)calloc(1, sizeof(HirBlock));
+            HirExpr* value = 0;
+            if (!body) {
+                fail(ctx, "out of memory");
+                return 0;
+            }
+            push_scope(ctx, &block_scope);
+            if (!lower_block_expr_stmts(ctx, expr->as.block_expr.body, body)) {
+                pop_scope(ctx);
+                return 0;
+            }
+            value = lower_expr(ctx, expr->as.block_expr.value);
+            if (!value) {
+                pop_scope(ctx);
+                return 0;
+            }
+            pop_scope(ctx);
+            out = new_expr(HIR_EXPR_BLOCK, value->type, expr->line);
+            out->as.block_expr.body = body;
+            out->as.block_expr.value = value;
+            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+        }
+        case AST_EXPR_TRY: {
+            HirExpr* value = lower_expr(ctx, expr->as.try_expr.value);
+            HirType* value_type = 0;
+            HirType* produced_error_type = 0;
+            int i = 0;
+            HirExpr* result = 0;
+            if (!value) {
+                return 0;
+            }
+            if (!is_errorable_type(value->type)) {
+                fail(ctx, "try expression requires errorable body");
+                return 0;
+            }
+            value_type = errorable_value_type(value->type);
+            produced_error_type = errorable_error_type(value->type);
+            for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                HirType* catch_error_type = lower_type(ctx, &expr->as.try_expr.catches.items[i].error_type);
+                HirBinding* binding = 0;
+                HirExpr* handler = 0;
+                Scope catch_scope;
+                if (!catch_error_type) {
+                    return 0;
+                }
+                if (!type_equals(catch_error_type, produced_error_type)) {
+                    fail(ctx, "try expression catch type does not match body error type");
+                    return 0;
+                }
+                if (result) {
+                    fail(ctx, "duplicate catch type");
+                    return 0;
+                }
+                binding = new_binding(catch_error_type, 0, expr->as.try_expr.catches.items[i].binding_name, HIR_BINDING_LOCAL, expr->as.try_expr.catches.items[i].line);
+                binding_list_push(&ctx->current_function->locals, binding);
+                push_scope(ctx, &catch_scope);
+                if (!bind_in_current_scope(ctx, binding)) {
+                    pop_scope(ctx);
+                    return 0;
+                }
+                handler = lower_expr_expected(ctx, expr->as.try_expr.catches.items[i].value, value_type);
+                if (!handler) {
+                    pop_scope(ctx);
+                    return 0;
+                }
+                handler = maybe_decay_array_to_slice(ctx, handler, value_type, expr->line);
+                if (!handler) {
+                    pop_scope(ctx);
+                    return 0;
+                }
+                pop_scope(ctx);
+                if (!type_assignment_compatible(handler->type, value_type)) {
+                    fail(ctx, "try expression catch branch type mismatch");
+                    return 0;
+                }
+                result = new_expr(HIR_EXPR_CATCH_HANDLER, value_type, expr->line);
+                result->as.catch_handler.left = value;
+                result->as.catch_handler.binding = binding;
+                result->as.catch_handler.handler = handler;
+            }
+            if (!result) {
+                fail(ctx, "try expression requires at least one matching catch");
+                return 0;
+            }
+            return maybe_wrap_expected_errorable_expr(ctx, result, expected_type, expr->line);
         }
         case AST_EXPR_COALESCE_CONTROL:
             fail(ctx, "control-flow coalesce is only supported in local variable initialization");

@@ -7,6 +7,7 @@ typedef struct JirExpr JirExpr;
 typedef struct JirFunction JirFunction;
 typedef struct JirType JirType;
 typedef struct JirBinding JirBinding;
+typedef struct JirInstList JirInstList;
 
 typedef enum JirBindingKind {
     JIR_BINDING_PARAM = 0,
@@ -65,6 +66,8 @@ typedef enum JirExprKind {
     JIR_EXPR_BINARY,
     JIR_EXPR_COALESCE,
     JIR_EXPR_CATCH_FALLBACK,
+    JIR_EXPR_CATCH_HANDLER,
+    JIR_EXPR_BLOCK,
     JIR_EXPR_IF,
     JIR_EXPR_TERNARY,
     JIR_EXPR_CALL,
@@ -217,6 +220,15 @@ struct JirExpr {
             JirExpr* fallback;
         } catch_fallback;
         struct {
+            JirExpr* left;
+            JirBinding* binding;
+            JirExpr* handler;
+        } catch_handler;
+        struct {
+            JirInstList* insts;
+            JirExpr* value;
+        } block_expr;
+        struct {
             JirExpr* cond;
             JirExpr* then_expr;
             JirExpr* else_expr;
@@ -357,11 +369,11 @@ typedef struct JirInst {
     JirExpr* value;
 } JirInst;
 
-typedef struct JirInstList {
+struct JirInstList {
     JirInst* items;
     int count;
     int capacity;
-} JirInstList;
+};
 
 typedef struct JirBasicBlockRef {
     int index;

@@ -625,14 +625,22 @@ Fn<Bool@Err, Int, Int> compare = less;
 ```c
 Int x = if (flag) { 1 } else { 2 };
 Int y = if (flag) 1 else 2;
+Int z = if (flag) {
+    Int base = 40;
+    base + 2
+} else {
+    0
+};
 ```
 
 当前规则：
 
 - `else` 分支必填
 - 两个分支的结果类型必须一致
-- 分支可以写成单个裸表达式，或写成 `{ expr }`
-- `{ ... }` 当前仍只支持单个表达式，不支持完整语句块产值
+- 分支可以写成单个裸表达式，或写成 `{ ... }`
+- 裸表达式分支不需要 `;`
+- `{ ... }` 内可以写多条语句，最后一个**不带 `;`** 的表达式作为分支结果
+- 前置语句当前主要支持局部变量声明、赋值和普通表达式语句
 
 #### switch表达式
 
@@ -644,13 +652,23 @@ Int x = switch (value) {
     2 => 42;
     else => 0;
 };
+
+Int y = switch (value) {
+    1 => {
+        Int base = 40;
+        base + 1
+    }
+    else => 0;
+};
 ```
 
 当前规则：
 
 - 分支使用 `=>`
-- 分支右侧可以写成单个裸表达式，或 `{ expr }`
+- 分支右侧可以写成单个裸表达式，或 `{ ... }`
 - 裸表达式分支必须以 `;` 结束
+- `{ ... }` 分支后面不需要再写 `;`
+- `{ ... }` 内可以写多条语句，最后一个**不带 `;`** 的表达式作为分支结果
 - 所有分支结果类型必须一致
 - `enum` / `union` / `optional` 仍然做穷尽性检查
 - 当前不支持模式绑定形式的 `switch` 表达式
@@ -723,7 +741,8 @@ Int@Err outer(Bool fail) {
 
 - 在 `@E` 函数里依靠普通调用做同 `E` 的隐式传播
 - 用 `expr catch fallback` 处理单个失败结果
-- 用 `expr catch (e) { ... };` 处理单个失败结果并读取错误值
+- 用 `expr catch (e) fallback` 或 `expr catch (e) { expr }` 处理单个失败结果并读取错误值
+- 在表达式位置用 `try { expr } catch (...) ...` 拦截单个可错表达式
 - 在需要拦截错误时使用语句级 `try-catch`
 
 当前不再支持通过 `switch` 直接匹配异常结果。
@@ -744,13 +763,21 @@ Int@Err parse(Bool fail) {
 
 Int main() {
     Int a = parse(false) catch 0;
-    Int! b = 0;
+    Int b = parse(true) catch (e) if (e == Err.bad) 42 else 0;
+    Int! handled = 0;
     parse(true) catch (e) {
         if (e == Err.bad) {
-            b = 1;
+            handled = handled + 1;
         }
     };
-    return a + b;
+    Int c = try {
+        Int fail = 1;
+        parse(fail == 1)
+    } catch (Err e) {
+        Int base = 0;
+        if (e == Err.bad) base + 7 else base
+    };
+    return a + b + handled + c;
 }
 ```
 
@@ -760,10 +787,18 @@ Int main() {
   - `expr` 必须是 `T@E`
   - 结果类型是 `T`
   - `fallback` 的类型必须能赋给 `T`
-- `expr catch (name) { ... };`
-  - 只支持语句级
+- `expr catch (name) fallback`
   - `expr` 必须是 `T@E`
   - `name` 的类型自动推断为错误类型 `E`
+  - 结果类型是 `T`
+  - `fallback` 的类型必须能赋给 `T`
+- `expr catch (name) { expr }`
+  - 只在表达式位置可用
+  - `expr` 必须是 `T@E`
+  - `name` 的类型自动推断为错误类型 `E`
+  - 花括号内可以写多条语句，最后一个不带 `;` 的表达式作为结果
+- `expr catch (name) { ... };`
+  - 仍然支持语句级形式
   - 成功时继续执行，错误时进入块
 - `catch` 不会做 runtime unwind，仍然只是结果值分支
 
@@ -804,19 +839,23 @@ Int main() {
 
 - 只支持语句级：
   - `try { ... } catch (Type name) { ... }`
+- 也支持表达式级：
+  - `try { expr } catch (Type name) expr`
+  - `try { expr } catch (Type name) { expr }`
 - `catch` 至少一个，可多个
 - `catch` 类型必须显式写出，且必须带绑定名
 - `try` 块中所有可能出现的错误类型都必须被 `catch` 完整覆盖，否则编译错误
 - 匹配按**精确错误类型**进行
 - 在 `try` 中，原本会隐式传播到当前函数外部的错误，优先跳转到匹配的 `catch`
-- `try` 不产值，不支持：
-  - `Int x = try { ... }`
-  - `return try { ... }`
+- 语句级 `try` 不产值
+- 表达式级 `try` 当前只支持：
+  - `try` body 的最后一个不带 `;` 的表达式必须是可错表达式
+  - `catch` 分支可以是单个表达式，或多语句 `{ ... }`
+  - body 只能产生一种错误类型；`catch` 类型必须与它精确一致
 
 当前不支持：
 
 - `try expr`
-- `try` 表达式
 - `finally`
 - 不同错误类型自动组合
 

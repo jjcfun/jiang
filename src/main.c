@@ -27,6 +27,7 @@
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define switch_expr_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
+#define expr_try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
 #define name_list_push(list, name) VEC_PUSH((list), (name))
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
 #define where_constraint_list_push(list, constraint) VEC_PUSH((list), (constraint))
@@ -805,6 +806,18 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             out->as.catch_fallback.left = clone_expr(source, prefix, hide_private, expr->as.catch_fallback.left);
             out->as.catch_fallback.fallback = clone_expr(source, prefix, hide_private, expr->as.catch_fallback.fallback);
             break;
+        case AST_EXPR_CATCH_HANDLER:
+            out->as.catch_handler.left = clone_expr(source, prefix, hide_private, expr->as.catch_handler.left);
+            out->as.catch_handler.binding_name = dup_text(expr->as.catch_handler.binding_name);
+            out->as.catch_handler.handler = clone_expr(source, prefix, hide_private, expr->as.catch_handler.handler);
+            break;
+        case AST_EXPR_BLOCK:
+            out->as.block_expr.body = (AstBlock*)calloc(1, sizeof(AstBlock));
+            if (out->as.block_expr.body) {
+                clone_block(source, prefix, hide_private, out->as.block_expr.body, expr->as.block_expr.body);
+            }
+            out->as.block_expr.value = clone_expr(source, prefix, hide_private, expr->as.block_expr.value);
+            break;
         case AST_EXPR_IF:
             out->as.if_expr.cond = clone_expr(source, prefix, hide_private, expr->as.if_expr.cond);
             out->as.if_expr.then_expr = clone_expr(source, prefix, hide_private, expr->as.if_expr.then_expr);
@@ -819,6 +832,18 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
                 item.value = clone_expr(source, prefix, hide_private, expr->as.switch_expr.cases.items[i].value);
                 item.is_else = expr->as.switch_expr.cases.items[i].is_else;
                 switch_expr_case_list_push(&out->as.switch_expr.cases, item);
+            }
+            break;
+        case AST_EXPR_TRY:
+            out->as.try_expr.value = clone_expr(source, prefix, hide_private, expr->as.try_expr.value);
+            for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                AstExprTryCatch item;
+                memset(&item, 0, sizeof(item));
+                item.error_type = clone_type(source, prefix, hide_private, &expr->as.try_expr.catches.items[i].error_type);
+                item.binding_name = dup_text(expr->as.try_expr.catches.items[i].binding_name);
+                item.value = clone_expr(source, prefix, hide_private, expr->as.try_expr.catches.items[i].value);
+                item.line = expr->as.try_expr.catches.items[i].line;
+                expr_try_catch_list_push(&out->as.try_expr.catches, item);
             }
             break;
         case AST_EXPR_COALESCE_CONTROL:
@@ -4334,6 +4359,20 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.catch_fallback.left = clone_expr_subst(expr->as.catch_fallback.left, subst);
             out->as.catch_fallback.fallback = clone_expr_subst(expr->as.catch_fallback.fallback, subst);
             break;
+        case AST_EXPR_CATCH_HANDLER:
+            out->as.catch_handler.left = clone_expr_subst(expr->as.catch_handler.left, subst);
+            out->as.catch_handler.binding_name = dup_text(expr->as.catch_handler.binding_name);
+            out->as.catch_handler.handler = clone_expr_subst(expr->as.catch_handler.handler, subst);
+            break;
+        case AST_EXPR_BLOCK:
+            out->as.block_expr.body = (AstBlock*)calloc(1, sizeof(AstBlock));
+            if (out->as.block_expr.body) {
+                for (i = 0; i < expr->as.block_expr.body->stmts.count; ++i) {
+                    stmt_list_push(&out->as.block_expr.body->stmts, clone_stmt_subst(expr->as.block_expr.body->stmts.items[i], subst));
+                }
+            }
+            out->as.block_expr.value = clone_expr_subst(expr->as.block_expr.value, subst);
+            break;
         case AST_EXPR_IF:
             out->as.if_expr.cond = clone_expr_subst(expr->as.if_expr.cond, subst);
             out->as.if_expr.then_expr = clone_expr_subst(expr->as.if_expr.then_expr, subst);
@@ -4348,6 +4387,18 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
                 item.value = clone_expr_subst(expr->as.switch_expr.cases.items[i].value, subst);
                 item.is_else = expr->as.switch_expr.cases.items[i].is_else;
                 switch_expr_case_list_push(&out->as.switch_expr.cases, item);
+            }
+            break;
+        case AST_EXPR_TRY:
+            out->as.try_expr.value = clone_expr_subst(expr->as.try_expr.value, subst);
+            for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                AstExprTryCatch item;
+                memset(&item, 0, sizeof(item));
+                item.error_type = clone_type_subst(&expr->as.try_expr.catches.items[i].error_type, subst);
+                item.binding_name = dup_text(expr->as.try_expr.catches.items[i].binding_name);
+                item.value = clone_expr_subst(expr->as.try_expr.catches.items[i].value, subst);
+                item.line = expr->as.try_expr.catches.items[i].line;
+                expr_try_catch_list_push(&out->as.try_expr.catches, item);
             }
             break;
         case AST_EXPR_COALESCE_CONTROL:
@@ -5047,6 +5098,12 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
         case AST_EXPR_CATCH_FALLBACK:
             return transform_expr(mono, expr->as.catch_fallback.left, locals) &&
                    transform_expr(mono, expr->as.catch_fallback.fallback, locals);
+        case AST_EXPR_CATCH_HANDLER:
+            return transform_expr(mono, expr->as.catch_handler.left, locals) &&
+                   transform_expr(mono, expr->as.catch_handler.handler, locals);
+        case AST_EXPR_BLOCK:
+            return transform_block(mono, expr->as.block_expr.body, locals) &&
+                   transform_expr(mono, expr->as.block_expr.value, locals);
         case AST_EXPR_IF:
             return transform_expr(mono, expr->as.if_expr.cond, locals) &&
                    transform_expr(mono, expr->as.if_expr.then_expr, locals) &&
@@ -5059,6 +5116,17 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
                 if ((expr->as.switch_expr.cases.items[i].pattern &&
                      !transform_expr(mono, expr->as.switch_expr.cases.items[i].pattern, locals)) ||
                     !transform_expr(mono, expr->as.switch_expr.cases.items[i].value, locals)) {
+                    return 0;
+                }
+            }
+            return 1;
+        case AST_EXPR_TRY:
+            if (!transform_expr(mono, expr->as.try_expr.value, locals)) {
+                return 0;
+            }
+            for (i = 0; i < expr->as.try_expr.catches.count; ++i) {
+                if (!transform_type(mono, &expr->as.try_expr.catches.items[i].error_type) ||
+                    !transform_expr(mono, expr->as.try_expr.catches.items[i].value, locals)) {
                     return 0;
                 }
             }

@@ -167,6 +167,8 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_BINARY: return JIR_EXPR_BINARY;
         case HIR_EXPR_COALESCE: return JIR_EXPR_COALESCE;
         case HIR_EXPR_CATCH_FALLBACK: return JIR_EXPR_CATCH_FALLBACK;
+        case HIR_EXPR_CATCH_HANDLER: return JIR_EXPR_CATCH_HANDLER;
+        case HIR_EXPR_BLOCK: return JIR_EXPR_BLOCK;
         case HIR_EXPR_IF: return JIR_EXPR_IF;
         case HIR_EXPR_TERNARY: return JIR_EXPR_TERNARY;
         case HIR_EXPR_CALL: return JIR_EXPR_CALL;
@@ -317,6 +319,7 @@ static JirExpr* desugar_expr(JirExpr* expr);
 static JirExpr* desugar_lvalue_expr(JirExpr* expr);
 static JirExpr* make_int_expr(int64_t value, JirType* type, int line);
 static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, JirType* payload_type, int line);
+static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const HirStmt* stmt, const char** error, int* error_line);
 
 static JirExpr* new_expr(JirExprKind kind, JirType* type, int line) {
     JirExpr* expr = (JirExpr*)calloc(1, sizeof(JirExpr));
@@ -423,6 +426,35 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             expr->as.catch_fallback.left = desugar_expr(expr->as.catch_fallback.left);
             expr->as.catch_fallback.fallback = desugar_expr(expr->as.catch_fallback.fallback);
             return expr->as.catch_fallback.left && expr->as.catch_fallback.fallback ? expr : 0;
+        case JIR_EXPR_CATCH_HANDLER:
+            expr->as.catch_handler.left = desugar_expr(expr->as.catch_handler.left);
+            expr->as.catch_handler.handler = desugar_expr(expr->as.catch_handler.handler);
+            return expr->as.catch_handler.left && expr->as.catch_handler.handler ? expr : 0;
+        case JIR_EXPR_BLOCK:
+            if (expr->as.block_expr.insts) {
+                for (i = 0; i < expr->as.block_expr.insts->count; ++i) {
+                    if (expr->as.block_expr.insts->items[i].expr) {
+                        expr->as.block_expr.insts->items[i].expr = desugar_expr(expr->as.block_expr.insts->items[i].expr);
+                        if (!expr->as.block_expr.insts->items[i].expr) {
+                            return 0;
+                        }
+                    }
+                    if (expr->as.block_expr.insts->items[i].target) {
+                        expr->as.block_expr.insts->items[i].target = desugar_lvalue_expr(expr->as.block_expr.insts->items[i].target);
+                        if (!expr->as.block_expr.insts->items[i].target) {
+                            return 0;
+                        }
+                    }
+                    if (expr->as.block_expr.insts->items[i].value) {
+                        expr->as.block_expr.insts->items[i].value = desugar_expr(expr->as.block_expr.insts->items[i].value);
+                        if (!expr->as.block_expr.insts->items[i].value) {
+                            return 0;
+                        }
+                    }
+                }
+            }
+            expr->as.block_expr.value = desugar_expr(expr->as.block_expr.value);
+            return expr->as.block_expr.value ? expr : 0;
         case JIR_EXPR_IF:
             expr->as.if_expr.cond = desugar_expr(expr->as.if_expr.cond);
             expr->as.if_expr.then_expr = desugar_expr(expr->as.if_expr.then_expr);
@@ -752,6 +784,28 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             out->as.catch_fallback.left = lower_expr(program, expr->as.catch_fallback.left, error, error_line);
             out->as.catch_fallback.fallback = lower_expr(program, expr->as.catch_fallback.fallback, error, error_line);
             return out->as.catch_fallback.left && out->as.catch_fallback.fallback ? out : 0;
+        case HIR_EXPR_CATCH_HANDLER:
+            out->as.catch_handler.left = lower_expr(program, expr->as.catch_handler.left, error, error_line);
+            out->as.catch_handler.binding = lower_binding(expr->as.catch_handler.binding, error);
+            out->as.catch_handler.handler = lower_expr(program, expr->as.catch_handler.handler, error, error_line);
+            return out->as.catch_handler.left && out->as.catch_handler.binding && out->as.catch_handler.handler ? out : 0;
+        case HIR_EXPR_BLOCK: {
+            JirBasicBlock temp_block;
+            memset(&temp_block, 0, sizeof(temp_block));
+            out->as.block_expr.insts = (JirInstList*)calloc(1, sizeof(JirInstList));
+            if (!out->as.block_expr.insts) {
+                *error = "out of memory";
+                return 0;
+            }
+            for (i = 0; i < expr->as.block_expr.body->stmts.count; ++i) {
+                if (!append_simple_inst(program, &temp_block, expr->as.block_expr.body->stmts.items[i], error, error_line)) {
+                    return 0;
+                }
+            }
+            *out->as.block_expr.insts = temp_block.insts;
+            out->as.block_expr.value = lower_expr(program, expr->as.block_expr.value, error, error_line);
+            return out->as.block_expr.value ? out : 0;
+        }
         case HIR_EXPR_IF:
             out->as.if_expr.cond = lower_expr(program, expr->as.if_expr.cond, error, error_line);
             out->as.if_expr.then_expr = lower_expr(program, expr->as.if_expr.then_expr, error, error_line);

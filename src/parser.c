@@ -183,6 +183,7 @@ static void parser_set_error(Parser* parser, const char* error) {
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define switch_expr_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
+#define expr_try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
 #define import_list_push(list, import_decl) VEC_PUSH((list), (import_decl))
 #define alias_list_push(list, alias_decl) VEC_PUSH((list), (alias_decl))
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
@@ -1379,23 +1380,76 @@ static AstExpr* parse_unary(Parser* parser);
 static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag);
 
 static AstExpr* parse_expr(Parser* parser);
+static AstExpr* parse_expr_stmt_target(Parser* parser);
 static AstExpr* parse_if_expr(Parser* parser);
 static AstExpr* parse_switch_expr(Parser* parser);
+static AstExpr* parse_try_expr(Parser* parser);
+static AstExpr* parse_block_expr(Parser* parser, const char* context);
+static AstExpr* parse_expr_internal(Parser* parser, int allow_catch_handler);
+static AstExpr* parse_expr_no_range_internal(Parser* parser, int allow_catch_handler);
+static AstExpr* parse_value_branch_expr(Parser* parser, const char* context);
+static AstStmt* parse_stmt(Parser* parser);
+
+static AstExpr* parse_catch_handler_expr(Parser* parser, AstExpr* left) {
+    AstExpr* out = new_expr(AST_EXPR_CATCH_HANDLER, parser->current.line);
+    advance(parser);
+    out->as.catch_handler.left = left;
+    if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after catch")) {
+        return 0;
+    }
+    if (parser->current.kind != TOKEN_IDENT) {
+        fail(parser, "expected catch binding name");
+        return 0;
+    }
+    out->as.catch_handler.binding_name = token_dup(&parser->current);
+    advance(parser);
+    if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after catch binding")) {
+        return 0;
+    }
+    out->as.catch_handler.handler = parse_value_branch_expr(parser, "expected '}' after catch expression handler");
+    if (!out->as.catch_handler.handler) {
+        return 0;
+    }
+    return out;
+}
 
 static AstExpr* parse_value_branch_expr(Parser* parser, const char* context) {
-    AstExpr* expr = 0;
     if (parser->current.kind == TOKEN_LEFT_BRACE) {
-        advance(parser);
-        expr = parse_expr(parser);
-        if (!expr) {
-            return 0;
-        }
-        if (!expect(parser, TOKEN_RIGHT_BRACE, context)) {
-            return 0;
-        }
-        return expr;
+        return parse_block_expr(parser, context);
     }
     return parse_expr(parser);
+}
+
+static AstExpr* parse_block_expr(Parser* parser, const char* context) {
+    AstExpr* expr = new_expr(AST_EXPR_BLOCK, parser->current.line);
+    AstBlock* body = (AstBlock*)calloc(1, sizeof(AstBlock));
+    expr->as.block_expr.body = body;
+    advance(parser);
+    while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        Parser snapshot = *parser;
+        AstExpr* tail = parse_expr(&snapshot);
+        if (tail && snapshot.current.kind == TOKEN_RIGHT_BRACE) {
+            *parser = snapshot;
+            expr->as.block_expr.value = tail;
+            break;
+        }
+        if (!body) {
+            fail(parser, "out of memory");
+            return 0;
+        }
+        stmt_list_push(&body->stmts, parse_stmt(parser));
+        if (body->stmts.count <= 0 || !body->stmts.items[body->stmts.count - 1]) {
+            return 0;
+        }
+    }
+    if (!expr->as.block_expr.value) {
+        fail(parser, "block expression requires final value");
+        return 0;
+    }
+    if (!expect(parser, TOKEN_RIGHT_BRACE, context)) {
+        return 0;
+    }
+    return expr;
 }
 
 static AstExpr* parse_if_expr(Parser* parser) {
@@ -1480,6 +1534,55 @@ static AstExpr* parse_switch_expr(Parser* parser) {
     }
     if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after switch")) {
         return 0;
+    }
+    return expr;
+}
+
+static AstExpr* parse_try_expr(Parser* parser) {
+    AstExpr* expr = new_expr(AST_EXPR_TRY, parser->current.line);
+    advance(parser);
+    if (parser->current.kind != TOKEN_LEFT_BRACE) {
+        fail(parser, "expected '{' after try");
+        return 0;
+    }
+    expr->as.try_expr.value = parse_block_expr(parser, "expected '}' after try expression body");
+    if (!expr->as.try_expr.value) {
+        return 0;
+    }
+    if (parser->current.kind != TOKEN_KW_CATCH) {
+        fail(parser, "try expression requires at least one catch");
+        return 0;
+    }
+    while (parser->current.kind == TOKEN_KW_CATCH) {
+        AstExprTryCatch catch_clause;
+        memset(&catch_clause, 0, sizeof(catch_clause));
+        catch_clause.line = parser->current.line;
+        advance(parser);
+        if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after catch")) {
+            return 0;
+        }
+        catch_clause.error_type = parse_type(parser);
+        if (parser->error) {
+            return 0;
+        }
+        if (catch_clause.error_type.kind == AST_TYPE_ERRORABLE) {
+            fail(parser, "catch type must not use '@'");
+            return 0;
+        }
+        if (parser->current.kind != TOKEN_IDENT) {
+            fail(parser, "expected catch binding name");
+            return 0;
+        }
+        catch_clause.binding_name = token_dup(&parser->current);
+        advance(parser);
+        if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after catch binding")) {
+            return 0;
+        }
+        catch_clause.value = parse_value_branch_expr(parser, "expected '}' after try expression catch branch");
+        if (!catch_clause.value) {
+            return 0;
+        }
+        expr_try_catch_list_push(&expr->as.try_expr.catches, catch_clause);
     }
     return expr;
 }
@@ -1898,6 +2001,10 @@ static AstExpr* parse_primary(Parser* parser) {
 
     if (token.kind == TOKEN_KW_IF) {
         return parse_if_expr(parser);
+    }
+
+    if (token.kind == TOKEN_KW_TRY) {
+        return parse_try_expr(parser);
     }
 
     if (token.kind == TOKEN_KW_SWITCH) {
@@ -2367,11 +2474,17 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
         }
         expr = out;
     }
+    if (parser->current.kind == TOKEN_KW_CATCH && parser->next.kind == TOKEN_LEFT_PAREN) {
+        expr = parse_catch_handler_expr(parser, expr);
+        if (!expr) {
+            return 0;
+        }
+    }
     if (parser->current.kind == TOKEN_DOT_DOT) {
         AstExpr* end = 0;
         int line = parser->current.line;
         advance(parser);
-        end = parse_expr_no_range(parser);
+        end = parse_expr_no_range_internal(parser, 1);
         if (!end) {
             return 0;
         }
@@ -2380,7 +2493,7 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
     return expr;
 }
 
-static AstExpr* parse_expr_no_range(Parser* parser) {
+static AstExpr* parse_expr_no_range_internal(Parser* parser, int allow_catch_handler) {
     AstExpr* expr = parse_coalesce(parser);
     if (!expr) {
         return 0;
@@ -2412,11 +2525,18 @@ static AstExpr* parse_expr_no_range(Parser* parser) {
         }
         return out;
     }
+    if (allow_catch_handler && parser->current.kind == TOKEN_KW_CATCH && parser->next.kind == TOKEN_LEFT_PAREN) {
+        return parse_catch_handler_expr(parser, expr);
+    }
     return expr;
 }
 
-static AstExpr* parse_expr(Parser* parser) {
-    AstExpr* expr = parse_expr_no_range(parser);
+static AstExpr* parse_expr_no_range(Parser* parser) {
+    return parse_expr_no_range_internal(parser, 1);
+}
+
+static AstExpr* parse_expr_internal(Parser* parser, int allow_catch_handler) {
+    AstExpr* expr = parse_expr_no_range_internal(parser, allow_catch_handler);
     if (!expr) {
         return 0;
     }
@@ -2424,13 +2544,21 @@ static AstExpr* parse_expr(Parser* parser) {
         AstExpr* end = 0;
         int line = parser->current.line;
         advance(parser);
-        end = parse_expr_no_range(parser);
+        end = parse_expr_no_range_internal(parser, allow_catch_handler);
         if (!end) {
             return 0;
         }
         return make_range_expr(expr, end, line);
     }
     return expr;
+}
+
+static AstExpr* parse_expr_stmt_target(Parser* parser) {
+    return parse_expr_internal(parser, 0);
+}
+
+static AstExpr* parse_expr(Parser* parser) {
+    return parse_expr_internal(parser, 1);
 }
 
 static int parse_block(Parser* parser, AstBlock* out_block);
@@ -2894,7 +3022,7 @@ static AstStmt* parse_stmt(Parser* parser) {
     }
 
     if (parser->current.kind == TOKEN_IDENT || parser->current.kind == TOKEN_KW_SELF || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_LEFT_PAREN) {
-        AstExpr* target = parse_expr(parser);
+        AstExpr* target = parse_expr_stmt_target(parser);
         if (!target) {
             return 0;
         }
@@ -2945,7 +3073,7 @@ static AstStmt* parse_stmt(Parser* parser) {
 
     {
         int line = parser->current.line;
-        AstExpr* expr = parse_expr(parser);
+        AstExpr* expr = parse_expr_stmt_target(parser);
         if (expr) {
             if (parser->current.kind == TOKEN_KW_CATCH && parser->next.kind == TOKEN_LEFT_PAREN) {
                 stmt = new_stmt(AST_STMT_EXPR_CATCH, line);

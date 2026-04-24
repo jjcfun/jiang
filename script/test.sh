@@ -76,6 +76,7 @@ run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2
 run_sample if_expr_minimal.jiang 42
 run_sample if_expr_bare_minimal.jiang 42
+run_sample if_expr_block_multi_stmt_minimal.jiang 42
 run_sample if_expr_nested_minimal.jiang 42
 run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
@@ -129,12 +130,16 @@ run_sample errorable_propagate_minimal.jiang 42
 run_sample errorable_switch_minimal.jiang 9
 run_sample errorable_catch_fallback_minimal.jiang 42
 run_sample errorable_catch_handler_minimal.jiang 42
+run_sample errorable_catch_expr_minimal.jiang 42
+run_sample errorable_catch_expr_block_multi_stmt_minimal.jiang 42
 run_sample errorable_void_minimal.jiang 9
 run_sample fn_pointer_errorable_minimal.jiang 1
 run_sample try_catch_single_minimal.jiang 12
 run_sample try_catch_multi_minimal.jiang 30
 run_sample try_catch_errorable_fn_minimal.jiang 42
 run_sample try_catch_nested_minimal.jiang 13
+run_sample try_catch_expr_minimal.jiang 42
+run_sample try_catch_expr_block_multi_stmt_minimal.jiang 42
 run_sample self_keyword_minimal.jiang 42
 run_sample multi_file_enum_minimal.jiang 1
 run_sample multi_file_enum_shorthand_minimal.jiang 1
@@ -180,12 +185,14 @@ run_compile_fail invalid_switch_expr_branch_type_mismatch.jiang
 run_compile_fail invalid_switch_expr_binding_pattern.jiang
 run_compile_fail invalid_switch_expr_errorable_value.jiang
 run_compile_fail invalid_switch_expr_missing_semicolon.jiang
+run_compile_fail invalid_try_expr_catch_type_mismatch.jiang
 run_compile_fail invalid_grouped_var_decl_missing_initializer.jiang
 run_sample break_continue_minimal.jiang 8
 run_sample for_range_minimal.jiang 8
 run_sample for_infer_range_minimal.jiang 5
 run_sample range_minimal.jiang 5
 run_sample switch_expr_scalar_minimal.jiang 42
+run_sample switch_expr_block_multi_stmt_minimal.jiang 42
 run_sample switch_expr_enum_minimal.jiang 42
 run_sample switch_expr_optional_minimal.jiang 42
 run_sample infer_global_minimal.jiang 42

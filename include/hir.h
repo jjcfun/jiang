@@ -114,6 +114,8 @@ typedef enum HirExprKind {
     HIR_EXPR_BINARY,
     HIR_EXPR_COALESCE,
     HIR_EXPR_CATCH_FALLBACK,
+    HIR_EXPR_CATCH_HANDLER,
+    HIR_EXPR_BLOCK,
     HIR_EXPR_IF,
     HIR_EXPR_TERNARY,
     HIR_EXPR_CALL,
@@ -207,6 +209,15 @@ struct HirExpr {
             HirExpr* left;
             HirExpr* fallback;
         } catch_fallback;
+        struct {
+            HirExpr* left;
+            HirBinding* binding;
+            HirExpr* handler;
+        } catch_handler;
+        struct {
+            struct HirBlock* body;
+            HirExpr* value;
+        } block_expr;
         struct {
             HirExpr* cond;
             HirExpr* then_expr;

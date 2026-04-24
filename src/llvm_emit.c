@@ -465,6 +465,7 @@ static LLVMValueRef find_alloca(FunctionCodegen* cg, const JirBinding* binding) 
 }
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr);
+static int emit_jir_inst(FunctionCodegen* cg, const JirInst* inst);
 static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr);
 static int emit_expr_into_ptr(FunctionCodegen* cg, const JirExpr* expr, LLVMValueRef dst_ptr);
 
@@ -1200,6 +1201,67 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             incoming_blocks[1] = err_block;
             LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
             return phi;
+        }
+        case JIR_EXPR_CATCH_HANDLER: {
+            LLVMValueRef base = emit_expr(cg, expr->as.catch_handler.left);
+            LLVMValueRef tag = LLVMBuildExtractValue(cg->builder, base, 0, "catchh.tag");
+            LLVMBasicBlockRef ok_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.ok");
+            LLVMBasicBlockRef err_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.handler");
+            LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catchh.end");
+            LLVMValueRef ok_value = 0;
+            LLVMValueRef handler_value = 0;
+            LLVMValueRef error_value = 0;
+            LLVMValueRef phi = 0;
+            LLVMValueRef slot = 0;
+            LLVMValueRef incoming_values[2];
+            LLVMBasicBlockRef incoming_blocks[2];
+            LLVMValueRef is_error = LLVMBuildICmp(
+                cg->builder,
+                LLVMIntEQ,
+                tag,
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
+                "catchh.is_error");
+            LLVMBuildCondBr(cg->builder, is_error, err_block, ok_block);
+            LLVMPositionBuilderAtEnd(cg->builder, ok_block);
+            ok_value = load_union_payload_value(
+                cg,
+                base,
+                expr->as.catch_handler.left->type,
+                expr->type);
+            LLVMBuildBr(cg->builder, merge_block);
+            ok_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, err_block);
+            error_value = load_union_payload_value(
+                cg,
+                base,
+                expr->as.catch_handler.left->type,
+                expr->as.catch_handler.binding->type);
+            slot = find_alloca(cg, expr->as.catch_handler.binding);
+            if (!slot) {
+                return 0;
+            }
+            LLVMBuildStore(cg->builder, error_value, slot);
+            handler_value = emit_expr(cg, expr->as.catch_handler.handler);
+            LLVMBuildBr(cg->builder, merge_block);
+            err_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "catchhtmp");
+            incoming_values[0] = ok_value;
+            incoming_values[1] = handler_value;
+            incoming_blocks[0] = ok_block;
+            incoming_blocks[1] = err_block;
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            return phi;
+        }
+        case JIR_EXPR_BLOCK: {
+            if (expr->as.block_expr.insts) {
+                for (i = 0; i < expr->as.block_expr.insts->count; ++i) {
+                    if (!emit_jir_inst(cg, &expr->as.block_expr.insts->items[i])) {
+                        return 0;
+                    }
+                }
+            }
+            return emit_expr(cg, expr->as.block_expr.value);
         }
         case JIR_EXPR_TERNARY: {
             LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.then");
