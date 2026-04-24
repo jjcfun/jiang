@@ -492,19 +492,68 @@ UInt8[_] str1 = "hello";
 UInt8[] str2 = "hello";
 ```
 
+### Range
+
+Jiang 支持用 `start .. end` 语法直接创建 `Range` 值：
+
+```c
+Range r = 0..10;
+```
+
+它等价于：
+
+```c
+Range r = Range(start: 0, end: 10);
+```
+
+其中 `end` 为开区间端点。
+
+`Range` 来自隐式预导入的 `std/prelude.jiang`，当前定义为：
+
+```c
+struct Range {
+  Int start;
+  Int end;
+}
+```
+
 ### 函数
 
 #### 返回值
 
-jiang语言的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 表示，在运行时不会占用内存空间
+Jiang 的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 表示，在运行时不会占用内存空间。
 
 ```c
 () hello() {
   print("Hello World!");
-
-  // 下方的return语句可以省略
   return ();
 }
+```
+
+#### 函数参数
+
+Jiang 目前只支持普通位置参数：
+
+```c
+Int add(Int base, Int extra) {
+    return base + extra;
+}
+```
+
+规则如下：
+
+- 参数按定义顺序匹配
+- 当前不支持标签参数
+- 当前不支持默认参数
+
+#### 函数调用
+
+```c
+Int[_] list = [5, 3, 4, 1, 2];
+
+sort(list, { $0 < $1 });
+sort(list, { (a, b) -> a < b });
+sort(list, { (_ a, _ b) -> a < b });
 ```
 
 #### 函数签名
@@ -513,12 +562,12 @@ jiang语言的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 
 // 排序
 Int[] sort(Int[] list, Fn<Bool, Int, Int> compare)
 
-// 支持范型的排序，其中T需要实现Numbric相关特性
+// 支持泛型的排序，其中 T 需要实现 Numbric
 @where(T: Numbric)
 T[] sort<T>(T[] list, Fn<Bool, T, T> compare)
 
-// 支持范型的排序，会抛出异常，其中E可以为任意类型
-@where(T: Numbric)  
+// 支持泛型的排序，会抛出异常，其中 E 可以为任意类型
+@where(T: Numbric)
 T[]@E sort<T, E>(T[] list, Fn<Bool@E, T, T> compare)
 ```
 
@@ -540,7 +589,7 @@ Fn<Bool, Int, Int> compare;
 - 返回 `Bool`
 - 接收两个 `Int` 参数
 
-当前第一版支持：
+当前支持：
 
 - 普通顶层函数衰减为 `Fn<...>`
 - `static` 方法衰减为 `Fn<...>`
@@ -600,11 +649,22 @@ Int value = add(user$.ref(), 2);
 - 后续参数与方法声明中的普通参数保持一致
 - 当前需要显式传入 `user$.ref()`
 
-当前不支持：
+示例 4：可错返回的函数指针
 
-- 通过实例值获取绑定方法函数值（例如 `value.method`）
-- `init` 转函数指针
-- 闭包
+```c
+enum Err {
+    bad = 1,
+}
+
+Bool@Err less(Int left, Int right) {
+    if (left < 0) {
+        throw Err.bad;
+    }
+    return left < right;
+}
+
+Fn<Bool@Err, Int, Int> compare = less;
+```
 
 示例 5：重载函数值按 `Fn<...>` 目标类型消歧
 
@@ -621,21 +681,51 @@ Fn<Int, Int> inc = add;
 Fn<Int, Int, Int> sum = add;
 ```
 
-示例 4：可错返回的函数指针
+当前不支持：
+
+- 通过实例值获取绑定方法函数值（例如 `value.method`）
+- `init` 转函数指针
+- 闭包
+
+#### 异步函数（Async）
 
 ```c
-enum Err {
-    bad = 1,
-}
+@where(T: Numbric, E2: CompareError)
+async T[]@E1 sort<T, E1, E2>(T[] list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]> compare)
 
-Bool@Err less(Int left, Int right) {
-    if (left < 0) {
-        throw Err.bad;
-    }
-    return left < right;
-}
+@where(T: Numbric, E2: CompareError)
+@alias(Cmp = Fn<async Bool@E2, T, T>)
+async T[]@E1 sort<T, E1, E2>(T[] list, Fn<async Cmp@E1, T[]> compare)
+```
 
-Fn<Bool@Err, Int, Int> compare = less;
+### 控制流（Control Flow）
+
+#### 块语句（Block）
+
+使用 `{}` 可以将多条语句组合成一个代码块。代码块通常用于函数体、`if` 分支或作为独立的作用域。
+
+```c
+{
+    Int a = 1;
+    Int b = 2;
+    print("sum = %d", a + b);
+}
+```
+
+#### 条件分支（If/Else）
+
+Jiang 语言支持标准的 `if` 条件分支。条件表达式必须放在括号 `()` 内。
+
+```c
+Int a = 10;
+
+if (a == 10) {
+    print("a is ten");
+} else if (a > 10) {
+    print("a is greater than ten");
+} else {
+    print("a is less than ten");
+}
 ```
 
 #### if表达式
@@ -694,17 +784,15 @@ Int y = switch (value) {
 - 当前不支持模式绑定形式的 `switch` 表达式
 - 当前不支持对 `T@E` 结果直接使用 `switch` 表达式
 
-### 异常
+#### 异常
 
-Jiang 的异常不是 runtime exception，也不做栈展开。  
-
-它只是返回值编码，语法写作 `T@E`：
+Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，语法写作 `T@E`：
 
 ```c
 Int@Err parse(UInt8[] text)
-
+  
 ()@Err flush()
-
+  
 Fn<Bool@Err, Int, Int> compare
 ```
 
@@ -872,76 +960,28 @@ Int main() {
 - `finally`
 - 不同错误类型自动组合
 
+#### Defer
 
-
-#### Async
-
-```c
-@where(T: Numbric, E2: CompareError)  
-async T[]@E1 sort<T, E1, E2>(T[] list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]> compare)
-
-@where(T: Numbric, E2: CompareError)  
-@alias(Cmp = Fn<async Bool@E2, T, T>)
-async T[]@E1 sort<T, E1, E2>(T[] list, Fn<async Cmp@E1, T[]> compare)
-```
-
-#### 函数调用
+`defer` 会在当前块退出时按 LIFO 顺序执行。
 
 ```c
-Int[_] list = [5, 3, 4, 1, 2];
+defer handle$.free();
 
-sort(list, { $0 < $1 });
-
-sort(list, { (a, b) -> a < b });
-
-sort(list, { (_ a, _ b) -> a < b });
-```
-
-#### 函数参数
-
-Jiang 目前只支持普通位置参数：
-
-```c
-Int add(Int base, Int extra) {
-    return base + extra;
+defer {
+    log("closing");
+    handle$.free();
 }
 ```
 
-规则如下：
+支持两种形式：
 
-- 参数按定义顺序匹配
-- 当前不支持标签参数
-- 当前不支持默认参数
+- `defer expr;`
+- `defer { ... }`
 
-### 控制流（Control Flow）
+当前限制：
 
-#### 块语句（Block）
-
-使用 `{}` 可以将多条语句组合成一个代码块。代码块通常用于函数体、`if` 分支或作为独立的作用域。
-
-```c
-{
-    Int a = 1;
-    Int b = 2;
-    print("sum = %d", a + b);
-}
-```
-
-#### 条件分支（If/Else）
-
-Jiang 语言支持标准的 `if` 条件分支。条件表达式必须放在括号 `()` 内。
-
-```c
-Int a = 10;
-
-if (a == 10) {
-    print("a is ten");
-} else if (a > 10) {
-    print("a is greater than ten");
-} else {
-    print("a is less than ten");
-}
-```
+- `defer` 体内不支持 `return`、`break`、`continue`
+- `defer` 体内也不支持 `?? return`、`?? break`、`?? continue`
 
 #### 算术运算符
 
@@ -1024,7 +1064,6 @@ Jiang 语言支持 `for-in` 语法，用于遍历区间、数组或任何可迭�
 目前仅支持左闭右开区间 `start..end`。
 
 ```c
-// 遍历 0 到 9
 for i in 0..10 {
     print("%d", i);
 }
@@ -1046,7 +1085,6 @@ Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.i
 ```c
 Int[_] list = [10, 20];
 
-// 通过显式解构获取索引和元素
 for (i, item) in list.indexed() {
     print("index: %d, value: %d", i, item);
 }
@@ -1059,18 +1097,12 @@ for (i, item) in list.indexed() {
 - 单个元素的迭代可以不用括号。
 
 ```c
-// 遍历元组列表 (Int, Int)[_]
 (Int, Int)[_] pairs = [(1, 2), (3, 4)];
 
-// 正确：明确的元组解构
 for (a, b) in pairs {
     print("a=%d, b=%d", a, b);
 }
 
-// 错误：解构超过 1 个元素必须加括号，以下代码编译失败
-for a, b in pairs { ... }
-
-// 正确：带索引且解构元组元素
 for (i, (a, b)) in pairs.indexed() {
     print("index=%d, a=%d, b=%d", i, a, b);
 }
@@ -1137,34 +1169,6 @@ struct 可以自定义 `init` 函数。
   - `new [1, 2, 3]`
 - `new Point(...)` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
 - `struct` / `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
-
-### record
-
-`record` 是轻量数据类型，使用字段字面量初始化：
-
-```c
-record Point {
-  Int x;
-  Int y = 2;
-}
-
-Point p1 = Point { x: 40 };
-Point p2 = { x: 1, y: 2 };
-```
-
-规则：
-
-- `record` 支持 `Type { field: value }`
-- 当 expected type 已知且为 `record` 时，允许直接写 `{ field: value }`
-- `record` 字段支持默认值
-- `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
-- `struct` 只有在没有定义 `init` 时才支持 `Type { ... }`
-
-局部变量声明也支持同类型多名字写法，但它只是语法糖，每个变量仍然必须显式初始化：
-
-```c
-Int a = 1, b = 2, c = 3;
-```
 
 ```c
 struct Point {
@@ -1293,57 +1297,6 @@ Result result = .a(1);
 Int b = result.value();
 ```
 
-`union` 可以显式绑定 tag enum，也可以省略并让编译器按成员名自动生成隐式 tag：
-
-```c
-enum Kind {
-  a,
-  b,
-}
-
-union(Kind) ExplicitResult {
-  Int a;
-  Int b;
-}
-
-union ImplicitResult {
-  Int a;
-  Int b;
-}
-
-同类型的多个 variant 也可以合并声明：
-
-```c
-union MyUnion {
-  Int a, b, c;
-  Float r;
-}
-```
-
-`union` 的 payload 当前支持任意普通类型，包括：
-
-- `struct`
-- `record`
-- tuple
-- array
-- slice
-- `Fn<...>`
-- `T&`
-- `T*`
-- `T[*]`
-- optional
-- 其他 `union` / `enum`
-
-`union` 也支持泛型：
-
-```c
-union Result<T, E> {
-  T value;
-  E error;
-}
-```
-```
-
 字段初始化规则：
 
 - 非 optional 且无默认值字段，必须在所有返回路径上完成初始化
@@ -1391,6 +1344,34 @@ print("user age = %d", user1.age); // 输出：user age = 19
 
 user1.id = 200; // 编译错误，不可变属性无法修改
 
+```
+
+### record
+
+`record` 是轻量数据类型，使用字段字面量初始化：
+
+```c
+record Point {
+  Int x;
+  Int y = 2;
+}
+
+Point p1 = Point { x: 40 };
+Point p2 = { x: 1, y: 2 };
+```
+
+规则：
+
+- `record` 支持 `Type { field: value }`
+- 当 expected type 已知且为 `record` 时，允许直接写 `{ field: value }`
+- `record` 字段支持默认值
+- `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
+- `struct` 只有在没有定义 `init` 时才支持 `Type { ... }`
+
+局部变量声明也支持同类型多名字写法，但它只是语法糖，每个变量仍然必须显式初始化：
+
+```c
+Int a = 1, b = 2, c = 3;
 ```
 
 ### 枚举类型（Enum）
@@ -1488,6 +1469,57 @@ if (x == MyUnion.a(_ value)) {
 }
 ```
 
+`union` 可以显式绑定 tag enum，也可以省略并让编译器按成员名自动生成隐式 tag：
+
+```c
+enum Kind {
+  a,
+  b,
+}
+
+union(Kind) ExplicitResult {
+  Int a;
+  Int b;
+}
+
+union ImplicitResult {
+  Int a;
+  Int b;
+}
+```
+
+同类型的多个 variant 也可以合并声明：
+
+```c
+union MyUnion {
+  Int a, b, c;
+  Float r;
+}
+```
+
+`union` 的 payload 当前支持任意普通类型，包括：
+
+- `struct`
+- `record`
+- tuple
+- array
+- slice
+- `Fn<...>`
+- `T&`
+- `T*`
+- `T[*]`
+- optional
+- 其他 `union` / `enum`
+
+`union` 也支持泛型：
+
+```c
+union Result<T, E> {
+  T value;
+  E error;
+}
+```
+
 
 
 ### 泛型（Generic）
@@ -1503,6 +1535,81 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
+
+例如：
+
+```c
+@where(T: Numbric)
+T add<T>(T a, T b) {
+  return a + b;
+}
+```
+
+```c
+/// 定义泛型函数，其中 T 可以为 Int、Float 等数值类型
+@where(T: Numbric)
+T add<T>(T a, T b) {
+  return a + b;
+}
+
+// 此时 T 推断为 Int
+add(100, 200);
+// 此时 T 推断为 Double
+add(3.14, 9.8);
+// 强制指定 T 为 Float
+add<Float>(3.14, 9.8);
+
+/// 定义泛型结构体
+@where(T: Numbric)
+struct Foo<T> {
+  T value;
+
+  T bar() {
+    return self.value * 2;
+  }
+}
+
+// 此时 T 推断为 Int
+Foo x = { value: 123 };
+// 此时 T 明确为 Float
+Foo<Float> y = Foo<Float> { value: 3.14 };
+// 也可以写成
+_ z = Foo<Float> { value: 3.14 };
+```
+
+泛型参数的顶层 `!` 可变性约束有三种模式：
+
+- 默认不写约束时，泛型参数只接受**不带**顶层 `!` 的实参
+- `@where(T: Mutable)` 表示该泛型参数**必须**带顶层 `!`
+- `@where(T: MaybeMutable)` 表示该泛型参数可以带或不带顶层 `!`，并保留实例化后的实际可变性
+
+```c
+@where(T: Mutable)
+struct MutableBox<T> {
+  T value;
+}
+
+@where(T: MaybeMutable)
+struct MaybeMutableBox<T> {
+  T value;
+}
+
+MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
+MaybeMutableBox<Int> b = MaybeMutableBox<Int> { value: 2 };
+MaybeMutableBox<Int!> c = MaybeMutableBox<Int!> { value: 3 };
+```
+
+其中：
+
+- `Mutable` 和 `MaybeMutable` 是语言内建约束名
+- 它们由编译器识别，不是普通用户可实现的 trait
+- 但表面语法仍然通过 `@where(T: ...)` 使用
+
+当前规则只看**顶层** `!`：
+
+- `Int` 不满足 `Mutable`
+- `Int!` 满足 `Mutable`
+- `MaybeMutable` 同时接受 `Int` 与 `Int!`
 
 ### Trait
 
@@ -1642,33 +1749,6 @@ public trait SubscriptSet: SubscriptGet {
 - 写入 `value[index] = new_value` 只有在类型显式实现 `SubscriptSet` 且实际提供 `subscript_set(...)` 时才成立
 - `Value` 是否带 `!` 不再自动推出“可写下标”；读写由 trait 显式区分
 
-此时：
-
-### Range
-
-Jiang 支持用 `start .. end` 语法直接创建 `Range` 值：
-
-```c
-Range r = 0..10;
-```
-
-它等价于：
-
-```c
-Range r = Range(start: 0, end: 10);
-```
-
-其中 `end` 为开区间端点。
-
-`Range` 来自隐式预导入的 `std/prelude.jiang`，当前定义为：
-
-```c
-struct Range {
-  Int start;
-  Int end;
-}
-```
-
 - `Int`、`Float`、`Double` 等数值类型可以被视为满足 `Numbric`
 - `Numbric` 本身不能直接写成 `Numbric x;`
 - `Numbric` 主要用于 `@where(...)` 这类泛型约束位置
@@ -1691,15 +1771,6 @@ struct Range {
   - 名字相同且约束兼容：视为同一个关联类型
   - 名字相同但约束冲突：编译报错
 - 当前不支持关联类型默认类型
-
-例如：
-
-```c
-@where(T: Numbric)
-T add<T>(T a, T b) {
-  return a + b;
-}
-```
 
 ```c
 trait HasValue {
@@ -1783,72 +1854,6 @@ extend Counter: Iterator {
   }
 }
 ```
-
-```c
-/// 定义泛型函数，其中 T 可以为 Int、Float 等数值类型
-@where(T: Numbric)
-T add<T>(T a, T b) {
-  return a + b;
-}
-
-// 此时 T 推断为 Int
-add(100, 200);
-// 此时 T 推断为 Double
-add(3.14, 9.8);
-// 强制指定 T 为 Float
-add<Float>(3.14, 9.8);
-
-/// 定义泛型结构体
-@where(T: Numbric)
-struct Foo<T> {
-  T value;
-
-  T bar() {
-    return self.value * 2;
-  }
-}
-
-// 此时 T 推断为 Int
-Foo x = { value: 123 };
-// 此时 T 明确为 Float
-Foo<Float> y = Foo<Float> { value: 3.14 };
-// 也可以写成
-_ z = Foo<Float> { value: 3.14 };
-```
-
-泛型参数的顶层 `!` 可变性约束有三种模式：
-
-- 默认不写约束时，泛型参数只接受**不带**顶层 `!` 的实参
-- `@where(T: Mutable)` 表示该泛型参数**必须**带顶层 `!`
-- `@where(T: MaybeMutable)` 表示该泛型参数可以带或不带顶层 `!`，并保留实例化后的实际可变性
-
-```c
-@where(T: Mutable)
-struct MutableBox<T> {
-  T value;
-}
-
-@where(T: MaybeMutable)
-struct MaybeMutableBox<T> {
-  T value;
-}
-
-MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
-MaybeMutableBox<Int> b = MaybeMutableBox<Int> { value: 2 };
-MaybeMutableBox<Int!> c = MaybeMutableBox<Int!> { value: 3 };
-```
-
-其中：
-
-- `Mutable` 和 `MaybeMutable` 是语言内建约束名
-- 它们由编译器识别，不是普通用户可实现的 trait
-- 但表面语法仍然通过 `@where(T: ...)` 使用
-
-当前规则只看**顶层** `!`：
-
-- `Int` 不满足 `Mutable`
-- `Int!` 满足 `Mutable`
-- `MaybeMutable` 同时接受 `Int` 与 `Int!`
 
 ### Extend
 
