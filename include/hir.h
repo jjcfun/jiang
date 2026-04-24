@@ -113,6 +113,7 @@ typedef enum HirExprKind {
     HIR_EXPR_FREE,
     HIR_EXPR_BINARY,
     HIR_EXPR_COALESCE,
+    HIR_EXPR_CATCH_FALLBACK,
     HIR_EXPR_TERNARY,
     HIR_EXPR_CALL,
     HIR_EXPR_PROPAGATE,
@@ -201,6 +202,10 @@ struct HirExpr {
             HirExpr* left;
             HirExpr* right;
         } coalesce;
+        struct {
+            HirExpr* left;
+            HirExpr* fallback;
+        } catch_fallback;
         struct {
             HirExpr* cond;
             HirExpr* then_expr;

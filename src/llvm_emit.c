@@ -1162,6 +1162,45 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
             return phi;
         }
+        case JIR_EXPR_CATCH_FALLBACK: {
+            LLVMValueRef base = emit_expr(cg, expr->as.catch_fallback.left);
+            LLVMValueRef tag = LLVMBuildExtractValue(cg->builder, base, 0, "catch.tag");
+            LLVMBasicBlockRef ok_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catch.ok");
+            LLVMBasicBlockRef err_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catch.fallback");
+            LLVMBasicBlockRef merge_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "catch.end");
+            LLVMValueRef ok_value = 0;
+            LLVMValueRef fallback_value = 0;
+            LLVMValueRef phi = 0;
+            LLVMValueRef incoming_values[2];
+            LLVMBasicBlockRef incoming_blocks[2];
+            LLVMValueRef is_error = LLVMBuildICmp(
+                cg->builder,
+                LLVMIntEQ,
+                tag,
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
+                "catch.is_error");
+            LLVMBuildCondBr(cg->builder, is_error, err_block, ok_block);
+            LLVMPositionBuilderAtEnd(cg->builder, ok_block);
+            ok_value = load_union_payload_value(
+                cg,
+                base,
+                expr->as.catch_fallback.left->type,
+                expr->type);
+            LLVMBuildBr(cg->builder, merge_block);
+            ok_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, err_block);
+            fallback_value = emit_expr(cg, expr->as.catch_fallback.fallback);
+            LLVMBuildBr(cg->builder, merge_block);
+            err_block = LLVMGetInsertBlock(cg->builder);
+            LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "catchtmp");
+            incoming_values[0] = ok_value;
+            incoming_values[1] = fallback_value;
+            incoming_blocks[0] = ok_block;
+            incoming_blocks[1] = err_block;
+            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            return phi;
+        }
         case JIR_EXPR_TERNARY: {
             LLVMBasicBlockRef then_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.then");
             LLVMBasicBlockRef else_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "ternary.else");

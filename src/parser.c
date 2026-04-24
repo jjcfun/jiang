@@ -2243,6 +2243,16 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
         }
         return ternary;
     }
+    if (parser->current.kind == TOKEN_KW_CATCH && parser->next.kind != TOKEN_LEFT_PAREN) {
+        AstExpr* out = new_expr(AST_EXPR_CATCH_FALLBACK, parser->current.line);
+        advance(parser);
+        out->as.catch_fallback.left = expr;
+        out->as.catch_fallback.fallback = parse_expr(parser);
+        if (!out->as.catch_fallback.fallback) {
+            return 0;
+        }
+        expr = out;
+    }
     if (parser->current.kind == TOKEN_DOT_DOT) {
         AstExpr* end = 0;
         int line = parser->current.line;
@@ -2277,6 +2287,16 @@ static AstExpr* parse_expr_no_range(Parser* parser) {
             return 0;
         }
         return ternary;
+    }
+    if (parser->current.kind == TOKEN_KW_CATCH && parser->next.kind != TOKEN_LEFT_PAREN) {
+        AstExpr* out = new_expr(AST_EXPR_CATCH_FALLBACK, parser->current.line);
+        advance(parser);
+        out->as.catch_fallback.left = expr;
+        out->as.catch_fallback.fallback = parse_expr(parser);
+        if (!out->as.catch_fallback.fallback) {
+            return 0;
+        }
+        return out;
     }
     return expr;
 }
@@ -2795,6 +2815,30 @@ static AstStmt* parse_stmt(Parser* parser) {
             }
             return stmt;
         }
+        if (parser->current.kind == TOKEN_KW_CATCH && parser->next.kind == TOKEN_LEFT_PAREN) {
+            stmt = new_stmt(AST_STMT_EXPR_CATCH, target->line);
+            stmt->as.expr_catch_stmt.expr = target;
+            advance(parser);
+            if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after catch")) {
+                return 0;
+            }
+            if (parser->current.kind != TOKEN_IDENT) {
+                fail(parser, "expected catch binding name");
+                return 0;
+            }
+            stmt->as.expr_catch_stmt.binding_name = token_dup(&parser->current);
+            advance(parser);
+            if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after catch binding")) {
+                return 0;
+            }
+            if (!parse_block(parser, &stmt->as.expr_catch_stmt.body)) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after catch handler")) {
+                return 0;
+            }
+            return stmt;
+        }
         stmt = new_stmt(AST_STMT_EXPR, target->line);
         stmt->as.expr_stmt.expr = target;
         if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after expression")) {
@@ -2803,15 +2847,43 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
-    stmt = new_stmt(AST_STMT_EXPR, parser->current.line);
-    stmt->as.expr_stmt.expr = parse_expr(parser);
-    if (!stmt->as.expr_stmt.expr) {
-        return 0;
+    {
+        int line = parser->current.line;
+        AstExpr* expr = parse_expr(parser);
+        if (expr) {
+            if (parser->current.kind == TOKEN_KW_CATCH && parser->next.kind == TOKEN_LEFT_PAREN) {
+                stmt = new_stmt(AST_STMT_EXPR_CATCH, line);
+                stmt->as.expr_catch_stmt.expr = expr;
+                advance(parser);
+                if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after catch")) {
+                    return 0;
+                }
+                if (parser->current.kind != TOKEN_IDENT) {
+                    fail(parser, "expected catch binding name");
+                    return 0;
+                }
+                stmt->as.expr_catch_stmt.binding_name = token_dup(&parser->current);
+                advance(parser);
+                if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after catch binding")) {
+                    return 0;
+                }
+                if (!parse_block(parser, &stmt->as.expr_catch_stmt.body)) {
+                    return 0;
+                }
+                if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after catch handler")) {
+                    return 0;
+                }
+                return stmt;
+            }
+            stmt = new_stmt(AST_STMT_EXPR, line);
+            stmt->as.expr_stmt.expr = expr;
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after expression")) {
+                return 0;
+            }
+            return stmt;
+        }
     }
-    if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after expression")) {
-        return 0;
-    }
-    return stmt;
+    return 0;
 }
 
 static int parse_block(Parser* parser, AstBlock* out_block) {

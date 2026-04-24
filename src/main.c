@@ -800,6 +800,10 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             out->as.coalesce.left = clone_expr(source, prefix, hide_private, expr->as.coalesce.left);
             out->as.coalesce.right = clone_expr(source, prefix, hide_private, expr->as.coalesce.right);
             break;
+        case AST_EXPR_CATCH_FALLBACK:
+            out->as.catch_fallback.left = clone_expr(source, prefix, hide_private, expr->as.catch_fallback.left);
+            out->as.catch_fallback.fallback = clone_expr(source, prefix, hide_private, expr->as.catch_fallback.fallback);
+            break;
         case AST_EXPR_COALESCE_CONTROL:
             out->as.coalesce_control.left = clone_expr(source, prefix, hide_private, expr->as.coalesce_control.left);
             out->as.coalesce_control.control = expr->as.coalesce_control.control;
@@ -957,6 +961,11 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
             break;
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = clone_expr(source, prefix, hide_private, stmt->as.expr_stmt.expr);
+            break;
+        case AST_STMT_EXPR_CATCH:
+            out->as.expr_catch_stmt.expr = clone_expr(source, prefix, hide_private, stmt->as.expr_catch_stmt.expr);
+            out->as.expr_catch_stmt.binding_name = dup_text(stmt->as.expr_catch_stmt.binding_name);
+            clone_block(source, prefix, hide_private, &out->as.expr_catch_stmt.body, &stmt->as.expr_catch_stmt.body);
             break;
         case AST_STMT_THROW:
             out->as.throw_stmt.expr = clone_expr(source, prefix, hide_private, stmt->as.throw_stmt.expr);
@@ -4304,6 +4313,10 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.coalesce.left = clone_expr_subst(expr->as.coalesce.left, subst);
             out->as.coalesce.right = clone_expr_subst(expr->as.coalesce.right, subst);
             break;
+        case AST_EXPR_CATCH_FALLBACK:
+            out->as.catch_fallback.left = clone_expr_subst(expr->as.catch_fallback.left, subst);
+            out->as.catch_fallback.fallback = clone_expr_subst(expr->as.catch_fallback.fallback, subst);
+            break;
         case AST_EXPR_COALESCE_CONTROL:
             out->as.coalesce_control.left = clone_expr_subst(expr->as.coalesce_control.left, subst);
             out->as.coalesce_control.control = expr->as.coalesce_control.control;
@@ -4490,6 +4503,13 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = clone_expr_subst(stmt->as.expr_stmt.expr, subst);
             break;
+        case AST_STMT_EXPR_CATCH:
+            out->as.expr_catch_stmt.expr = clone_expr_subst(stmt->as.expr_catch_stmt.expr, subst);
+            out->as.expr_catch_stmt.binding_name = dup_text(stmt->as.expr_catch_stmt.binding_name);
+            for (i = 0; i < stmt->as.expr_catch_stmt.body.stmts.count; ++i) {
+                stmt_list_push(&out->as.expr_catch_stmt.body.stmts, clone_stmt_subst(stmt->as.expr_catch_stmt.body.stmts.items[i], subst));
+            }
+            break;
         case AST_STMT_THROW:
             out->as.throw_stmt.expr = clone_expr_subst(stmt->as.throw_stmt.expr, subst);
             break;
@@ -4575,6 +4595,9 @@ static int transform_stmt(MonoContext* mono, AstStmt* stmt, LocalTypeList* local
             return transform_block(mono, &stmt->as.defer_stmt.body, locals);
         case AST_STMT_EXPR:
             return transform_expr(mono, stmt->as.expr_stmt.expr, locals);
+        case AST_STMT_EXPR_CATCH:
+            return transform_expr(mono, stmt->as.expr_catch_stmt.expr, locals) &&
+                   transform_block(mono, &stmt->as.expr_catch_stmt.body, locals);
         case AST_STMT_THROW:
             return transform_expr(mono, stmt->as.throw_stmt.expr, locals);
         case AST_STMT_DESTRUCTURE:
@@ -4988,6 +5011,9 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
         case AST_EXPR_COALESCE:
             return transform_expr(mono, expr->as.coalesce.left, locals) &&
                    transform_expr(mono, expr->as.coalesce.right, locals);
+        case AST_EXPR_CATCH_FALLBACK:
+            return transform_expr(mono, expr->as.catch_fallback.left, locals) &&
+                   transform_expr(mono, expr->as.catch_fallback.fallback, locals);
         case AST_EXPR_COALESCE_CONTROL:
             return transform_expr(mono, expr->as.coalesce_control.left, locals) &&
                    (!expr->as.coalesce_control.return_expr ||

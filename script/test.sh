@@ -124,6 +124,8 @@ run_sample errorable_throw_minimal.jiang 1
 run_sample errorable_return_minimal.jiang 42
 run_sample errorable_propagate_minimal.jiang 42
 run_sample errorable_switch_minimal.jiang 9
+run_sample errorable_catch_fallback_minimal.jiang 42
+run_sample errorable_catch_handler_minimal.jiang 42
 run_sample errorable_void_minimal.jiang 9
 run_sample fn_pointer_errorable_minimal.jiang 1
 run_sample try_catch_single_minimal.jiang 12
@@ -468,6 +470,9 @@ run_compile_fail invalid_throw_outside_errorable.jiang
 run_compile_fail invalid_throw_type_mismatch.jiang
 run_compile_fail invalid_errorable_return_mismatch.jiang
 run_compile_fail invalid_errorable_plain_use.jiang
+run_compile_fail invalid_errorable_catch_fallback_non_errorable.jiang
+run_compile_fail invalid_errorable_catch_fallback_type_mismatch.jiang
+run_compile_fail invalid_errorable_catch_handler_non_errorable.jiang
 run_compile_fail invalid_throw_expr.jiang
 run_compile_fail invalid_errorable_switch_case_kind.jiang
 run_compile_fail invalid_try_without_catch.jiang

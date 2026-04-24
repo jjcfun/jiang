@@ -681,56 +681,53 @@ Int@Err outer(Bool fail) {
 - 第一版只支持**相同错误类型 `E`** 的隐式传播
 - 在非 `@E` 函数里，不能把 `@E` 调用结果当普通值直接使用
 
-错误消费统一通过 `switch` 完成：
+第一版异常的稳定用法是：
 
-```c
-switch (parse(false)) {
-value x:
-    return x;
-error e: {
-    if (e == Err.bad) {
-        return 7;
-    }
-    return 0;
-}
-}
-```
+- 在 `@E` 函数里依靠普通调用做同 `E` 的隐式传播
+- 用 `expr catch fallback` 处理单个失败结果
+- 用 `expr catch (e) { ... };` 处理单个失败结果并读取错误值
+- 在需要拦截错误时使用语句级 `try-catch`
 
-对 `@E` 的 `switch` 当前固定支持：
-
-- `value name:`
-- `error name:`
-- `else:`
-
-示例：成功值与错误值分支
+单个表达式可以直接写 `catch`：
 
 ```c
 enum Err {
-    bad = 9,
+    bad = 7,
 }
 
 Int@Err parse(Bool fail) {
     if (fail) {
         throw Err.bad;
     }
-    return 9;
+    return 41;
 }
 
 Int main() {
-    switch (parse(false)) {
-    value x:
-        return x;
-    error e: {
+    Int a = parse(false) catch 0;
+    Int! b = 0;
+    parse(true) catch (e) {
         if (e == Err.bad) {
-            return 9;
+            b = 1;
         }
-        return 0;
-    }
-    }
+    };
+    return a + b;
 }
 ```
 
-除了 `switch` 之外，也支持语句级 `try-catch`：
+单条 `catch` 规则：
+
+- `expr catch fallback`
+  - `expr` 必须是 `T@E`
+  - 结果类型是 `T`
+  - `fallback` 的类型必须能赋给 `T`
+- `expr catch (name) { ... };`
+  - 只支持语句级
+  - `expr` 必须是 `T@E`
+  - `name` 的类型自动推断为错误类型 `E`
+  - 成功时继续执行，错误时进入块
+- `catch` 不会做 runtime unwind，仍然只是结果值分支
+
+示例：
 
 ```c
 enum ErrA {

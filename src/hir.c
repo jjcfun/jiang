@@ -1088,6 +1088,7 @@ static HirStmtKind stmt_kind_from_ast(AstStmtKind kind) {
         case AST_STMT_ASSIGN: return HIR_STMT_ASSIGN;
         case AST_STMT_IF: return HIR_STMT_IF;
         case AST_STMT_TRY: return HIR_STMT_TRY;
+        case AST_STMT_EXPR_CATCH: return HIR_STMT_TRY;
         case AST_STMT_WHILE: return HIR_STMT_WHILE;
         case AST_STMT_FOR_RANGE: return HIR_STMT_FOR_RANGE;
         case AST_STMT_BREAK: return HIR_STMT_BREAK;
@@ -3333,6 +3334,35 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.coalesce.right = right;
             return out;
         }
+        case AST_EXPR_CATCH_FALLBACK: {
+            HirExpr* left = lower_expr(ctx, expr->as.catch_fallback.left);
+            HirExpr* fallback = 0;
+            HirType* value_type = 0;
+            if (!left) {
+                return 0;
+            }
+            if (!is_errorable_type(left->type)) {
+                fail(ctx, "catch fallback requires errorable expression");
+                return 0;
+            }
+            value_type = errorable_value_type(left->type);
+            fallback = lower_expr_expected(ctx, expr->as.catch_fallback.fallback, value_type);
+            if (!fallback) {
+                return 0;
+            }
+            fallback = maybe_decay_array_to_slice(ctx, fallback, value_type, expr->line);
+            if (!fallback) {
+                return 0;
+            }
+            if (!type_assignment_compatible(fallback->type, value_type)) {
+                fail(ctx, "catch fallback type mismatch");
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_CATCH_FALLBACK, value_type, expr->line);
+            out->as.catch_fallback.left = left;
+            out->as.catch_fallback.fallback = fallback;
+            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+        }
         case AST_EXPR_COALESCE_CONTROL:
             fail(ctx, "control-flow coalesce is only supported in local variable initialization");
             return 0;
@@ -4665,6 +4695,49 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 }
                 pop_scope(ctx);
             }
+            ctx->current_line = saved_line;
+            return out;
+        }
+        case AST_STMT_EXPR_CATCH: {
+            TryScope try_scope;
+            HirTryCatch catch_item;
+            AstStmt expr_stmt_ast;
+            HirStmt* lowered_expr_stmt = 0;
+            Scope catch_scope;
+            HirExpr* raw_expr = lower_expr(ctx, stmt->as.expr_catch_stmt.expr);
+            if (!raw_expr) {
+                return 0;
+            }
+            if (!is_errorable_type(raw_expr->type)) {
+                fail(ctx, "catch handler requires errorable expression");
+                return 0;
+            }
+            memset(&try_scope, 0, sizeof(try_scope));
+            memset(&catch_item, 0, sizeof(catch_item));
+            catch_item.error_type = errorable_error_type(raw_expr->type);
+            catch_item.binding = new_binding(catch_item.error_type, 0, stmt->as.expr_catch_stmt.binding_name, HIR_BINDING_LOCAL, stmt->line);
+            binding_list_push(&ctx->current_function->locals, catch_item.binding);
+            try_catch_list_push(&try_scope.catches, catch_item);
+            try_catch_list_push(&out->as.try_stmt.catches, catch_item);
+            try_scope_list_push(&ctx->try_scopes, try_scope);
+            memset(&expr_stmt_ast, 0, sizeof(expr_stmt_ast));
+            expr_stmt_ast.kind = AST_STMT_EXPR;
+            expr_stmt_ast.line = stmt->line;
+            expr_stmt_ast.as.expr_stmt.expr = stmt->as.expr_catch_stmt.expr;
+            lowered_expr_stmt = lower_stmt(ctx, &expr_stmt_ast);
+            ctx->try_scopes.count -= 1;
+            if (!lowered_expr_stmt) {
+                return 0;
+            }
+            stmt_list_push(&out->as.try_stmt.try_body.stmts, lowered_expr_stmt);
+            push_scope(ctx, &catch_scope);
+            if (!bind_in_current_scope(ctx, out->as.try_stmt.catches.items[0].binding)) {
+                return 0;
+            }
+            if (!lower_block(ctx, &stmt->as.expr_catch_stmt.body, &out->as.try_stmt.catches.items[0].body, 0)) {
+                return 0;
+            }
+            pop_scope(ctx);
             ctx->current_line = saved_line;
             return out;
         }

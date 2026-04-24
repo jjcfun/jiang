@@ -167,6 +167,7 @@ typedef enum AstExprKind {
     AST_EXPR_BINARY,
     AST_EXPR_COALESCE,
     AST_EXPR_COALESCE_CONTROL,
+    AST_EXPR_CATCH_FALLBACK,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
@@ -261,6 +262,10 @@ struct AstExpr {
             AstExpr* left;
             AstExpr* right;
         } coalesce;
+        struct {
+            AstExpr* left;
+            AstExpr* fallback;
+        } catch_fallback;
         struct {
             AstExpr* left;
             AstCoalesceControlKind control;
@@ -456,6 +461,7 @@ typedef enum AstStmtKind {
     AST_STMT_DEFER,
     AST_STMT_THROW,
     AST_STMT_EXPR,
+    AST_STMT_EXPR_CATCH,
     AST_STMT_DESTRUCTURE,
 } AstStmtKind;
 
@@ -513,6 +519,11 @@ struct AstStmt {
         struct {
             AstExpr* expr;
         } expr_stmt;
+        struct {
+            AstExpr* expr;
+            char* binding_name;
+            AstBlock body;
+        } expr_catch_stmt;
         struct {
             AstBlock body;
         } defer_stmt;
