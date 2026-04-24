@@ -791,6 +791,7 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
         case AST_EXPR_DEREF:
         case AST_EXPR_NEW:
         case AST_EXPR_FREE:
+        case AST_EXPR_BIT_NOT:
             out->as.unary.value = clone_expr(source, prefix, hide_private, expr->as.unary.value);
             break;
         case AST_EXPR_BINARY:
@@ -4344,6 +4345,7 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
         case AST_EXPR_DEREF:
         case AST_EXPR_NEW:
         case AST_EXPR_FREE:
+        case AST_EXPR_BIT_NOT:
             out->as.unary.value = clone_expr_subst(expr->as.unary.value, subst);
             break;
         case AST_EXPR_BINARY:
@@ -5088,6 +5090,7 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
         case AST_EXPR_DEREF:
         case AST_EXPR_NEW:
         case AST_EXPR_FREE:
+        case AST_EXPR_BIT_NOT:
             return transform_expr(mono, expr->as.unary.value, locals);
         case AST_EXPR_BINARY:
             return transform_expr(mono, expr->as.binary.left, locals) &&

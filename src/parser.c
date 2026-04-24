@@ -1385,6 +1385,12 @@ static AstExpr* parse_if_expr(Parser* parser);
 static AstExpr* parse_switch_expr(Parser* parser);
 static AstExpr* parse_try_expr(Parser* parser);
 static AstExpr* parse_block_expr(Parser* parser, const char* context);
+static AstExpr* parse_multiplicative(Parser* parser);
+static AstExpr* parse_additive(Parser* parser);
+static AstExpr* parse_shift(Parser* parser);
+static AstExpr* parse_bitwise_and(Parser* parser);
+static AstExpr* parse_bitwise_xor(Parser* parser);
+static AstExpr* parse_bitwise_or(Parser* parser);
 static AstExpr* parse_expr_internal(Parser* parser, int allow_catch_handler);
 static AstExpr* parse_expr_no_range_internal(Parser* parser, int allow_catch_handler);
 static AstExpr* parse_value_branch_expr(Parser* parser, const char* context);
@@ -2280,6 +2286,12 @@ static AstExpr* parse_type_implicit_expr(Parser* parser, int line) {
 }
 
 static AstExpr* parse_unary(Parser* parser) {
+    if (parser->current.kind == TOKEN_TILDE) {
+        AstExpr* expr = new_expr(AST_EXPR_BIT_NOT, parser->current.line);
+        advance(parser);
+        expr->as.unary.value = parse_unary(parser);
+        return expr->as.unary.value ? expr : 0;
+    }
     if (parser->current.kind == TOKEN_BANG) {
         AstExpr* right = 0;
         AstExpr* false_expr = new_expr(AST_EXPR_BOOL, parser->current.line);
@@ -2323,6 +2335,81 @@ static AstExpr* parse_unary(Parser* parser) {
     return parse_postfix(parser);
 }
 
+static AstExpr* parse_shift(Parser* parser) {
+    AstExpr* expr = parse_additive(parser);
+    while (expr &&
+           ((parser->current.kind == TOKEN_LT && parser->next.kind == TOKEN_LT) ||
+            (parser->current.kind == TOKEN_GT && parser->next.kind == TOKEN_GT))) {
+        AstExpr* right = 0;
+        AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
+        bin->as.binary.left = expr;
+        bin->as.binary.op = parser->current.kind == TOKEN_LT ? AST_BIN_SHL : AST_BIN_SHR;
+        advance(parser);
+        advance(parser);
+        right = parse_additive(parser);
+        if (!right) {
+            return 0;
+        }
+        bin->as.binary.right = right;
+        expr = bin;
+    }
+    return expr;
+}
+
+static AstExpr* parse_bitwise_and(Parser* parser) {
+    AstExpr* expr = parse_shift(parser);
+    while (expr && parser->current.kind == TOKEN_AMP) {
+        AstExpr* right = 0;
+        AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
+        bin->as.binary.left = expr;
+        bin->as.binary.op = AST_BIN_BIT_AND;
+        advance(parser);
+        right = parse_shift(parser);
+        if (!right) {
+            return 0;
+        }
+        bin->as.binary.right = right;
+        expr = bin;
+    }
+    return expr;
+}
+
+static AstExpr* parse_bitwise_xor(Parser* parser) {
+    AstExpr* expr = parse_bitwise_and(parser);
+    while (expr && parser->current.kind == TOKEN_CARET) {
+        AstExpr* right = 0;
+        AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
+        bin->as.binary.left = expr;
+        bin->as.binary.op = AST_BIN_BIT_XOR;
+        advance(parser);
+        right = parse_bitwise_and(parser);
+        if (!right) {
+            return 0;
+        }
+        bin->as.binary.right = right;
+        expr = bin;
+    }
+    return expr;
+}
+
+static AstExpr* parse_bitwise_or(Parser* parser) {
+    AstExpr* expr = parse_bitwise_xor(parser);
+    while (expr && parser->current.kind == TOKEN_PIPE) {
+        AstExpr* right = 0;
+        AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
+        bin->as.binary.left = expr;
+        bin->as.binary.op = AST_BIN_BIT_OR;
+        advance(parser);
+        right = parse_bitwise_xor(parser);
+        if (!right) {
+            return 0;
+        }
+        bin->as.binary.right = right;
+        expr = bin;
+    }
+    return expr;
+}
+
 static AstExpr* parse_additive(Parser* parser) {
     AstExpr* expr = parse_multiplicative(parser);
     while (expr && (parser->current.kind == TOKEN_PLUS || parser->current.kind == TOKEN_MINUS)) {
@@ -2342,7 +2429,7 @@ static AstExpr* parse_additive(Parser* parser) {
 }
 
 static AstExpr* parse_comparison(Parser* parser) {
-    AstExpr* expr = parse_additive(parser);
+    AstExpr* expr = parse_bitwise_or(parser);
     while (expr && (parser->current.kind == TOKEN_LT || parser->current.kind == TOKEN_LT_EQ || parser->current.kind == TOKEN_GT || parser->current.kind == TOKEN_GT_EQ)) {
         AstExpr* right = 0;
         AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
@@ -2354,7 +2441,7 @@ static AstExpr* parse_comparison(Parser* parser) {
             default: bin->as.binary.op = AST_BIN_GE; break;
         }
         advance(parser);
-        right = parse_additive(parser);
+        right = parse_bitwise_or(parser);
         if (!right) {
             return 0;
         }

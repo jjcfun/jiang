@@ -83,8 +83,11 @@ run_sample while_minimal.jiang 10
 run_sample defer_minimal.jiang 57
 run_sample defer_block_minimal.jiang 54
 run_sample defer_return_minimal.jiang 21
+run_sample defer_throw_try_minimal.jiang 123
+run_sample defer_propagate_minimal.jiang 12
 run_compile_fail invalid_defer_return_minimal.jiang
 run_sample binary_ops_minimal.jiang 1
+run_sample bitwise_minimal.jiang 42
 run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0
 run_sample float_minimal.jiang 7
@@ -186,6 +189,8 @@ run_compile_fail invalid_switch_expr_binding_pattern.jiang
 run_compile_fail invalid_switch_expr_errorable_value.jiang
 run_compile_fail invalid_switch_expr_missing_semicolon.jiang
 run_compile_fail invalid_try_expr_catch_type_mismatch.jiang
+run_compile_fail invalid_bitwise_float_operand.jiang
+run_compile_fail invalid_bitwise_mismatched_integer_types.jiang
 run_compile_fail invalid_grouped_var_decl_missing_initializer.jiang
 run_sample break_continue_minimal.jiang 8
 run_sample for_range_minimal.jiang 8

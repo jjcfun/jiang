@@ -856,6 +856,10 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             return llvm_const_expr(cg->context, expr);
         case JIR_EXPR_ADDR:
             return emit_lvalue_ptr(cg, expr->as.unary.value);
+        case JIR_EXPR_BIT_NOT: {
+            LLVMValueRef value = emit_expr(cg, expr->as.unary.value);
+            return LLVMBuildNot(cg->builder, value, "bnottmp");
+        }
         case JIR_EXPR_AS: {
             LLVMValueRef value = emit_expr(cg, expr->as.unary.value);
             JirTypeKind from_kind = expr->as.unary.value->type->kind;
@@ -1120,6 +1124,12 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case JIR_BIN_DIV: return float_like ? LLVMBuildFDiv(cg->builder, left, right, "divtmp")
                                                     : (signed_int ? LLVMBuildSDiv(cg->builder, left, right, "divtmp")
                                                                   : LLVMBuildUDiv(cg->builder, left, right, "divtmp"));
+                case JIR_BIN_BIT_AND: return LLVMBuildAnd(cg->builder, left, right, "andtmp");
+                case JIR_BIN_BIT_OR: return LLVMBuildOr(cg->builder, left, right, "ortmp");
+                case JIR_BIN_BIT_XOR: return LLVMBuildXor(cg->builder, left, right, "xortmp");
+                case JIR_BIN_SHL: return LLVMBuildShl(cg->builder, left, right, "shltmp");
+                case JIR_BIN_SHR: return signed_int ? LLVMBuildAShr(cg->builder, left, right, "shrtmp")
+                                                    : LLVMBuildLShr(cg->builder, left, right, "shrtmp");
                 case JIR_BIN_EQ: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealOEQ, left, right, "eqtmp")
                                                    : LLVMBuildICmp(cg->builder, LLVMIntEQ, left, right, "eqtmp");
                 case JIR_BIN_NE: return float_like ? LLVMBuildFCmp(cg->builder, LLVMRealONE, left, right, "netmp")

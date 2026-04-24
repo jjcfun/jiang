@@ -164,6 +164,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_DEREF: return JIR_EXPR_DEREF;
         case HIR_EXPR_NEW: return JIR_EXPR_NEW;
         case HIR_EXPR_FREE: return JIR_EXPR_FREE;
+        case HIR_EXPR_BIT_NOT: return JIR_EXPR_BIT_NOT;
         case HIR_EXPR_BINARY: return JIR_EXPR_BINARY;
         case HIR_EXPR_COALESCE: return JIR_EXPR_COALESCE;
         case HIR_EXPR_CATCH_FALLBACK: return JIR_EXPR_CATCH_FALLBACK;
@@ -408,6 +409,7 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         case JIR_EXPR_DEREF:
         case JIR_EXPR_NEW:
         case JIR_EXPR_FREE:
+        case JIR_EXPR_BIT_NOT:
         case JIR_EXPR_OPTIONAL_SOME:
             expr->as.unary.value = desugar_expr(expr->as.unary.value);
             return expr->as.unary.value ? expr : 0;
@@ -759,6 +761,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_DEREF:
         case HIR_EXPR_NEW:
         case HIR_EXPR_FREE:
+        case HIR_EXPR_BIT_NOT:
             out->as.unary.value = lower_expr(program, expr->as.unary.value, error, error_line);
             return out->as.unary.value ? out : 0;
         case HIR_EXPR_PROPAGATE:

@@ -274,6 +274,12 @@ Token lexer_next(Lexer* lexer) {
             return make_token(lexer, TOKEN_PERCENT, lexer->start, 1);
         case '&':
             return make_token(lexer, TOKEN_AMP, lexer->start, 1);
+        case '|':
+            return make_token(lexer, TOKEN_PIPE, lexer->start, 1);
+        case '^':
+            return make_token(lexer, TOKEN_CARET, lexer->start, 1);
+        case '~':
+            return make_token(lexer, TOKEN_TILDE, lexer->start, 1);
         case '$':
             return make_token(lexer, TOKEN_DOLLAR, lexer->start, 1);
         case '/':

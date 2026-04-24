@@ -29,6 +29,7 @@ typedef struct DeferFrameList {
 
 typedef struct TryScope {
     HirTryCatchList catches;
+    int defer_start;
 } TryScope;
 
 typedef struct TryScopeList {
@@ -184,6 +185,7 @@ static HirType* errorable_error_type(HirType* type);
 static int is_errorable_type(HirType* type);
 static HirExpr* maybe_wrap_expected_errorable_expr(LowerContext* ctx, HirExpr* value, HirType* expected_type, int line);
 static int current_try_catches_error(LowerContext* ctx, HirType* error_type);
+static int current_try_defer_start(LowerContext* ctx);
 
 static void append_block_stmts(HirBlock* out_block, const HirBlock* block) {
     int i = 0;
@@ -203,6 +205,13 @@ static int current_try_catches_error(LowerContext* ctx, HirType* error_type) {
         }
     }
     return 0;
+}
+
+static int current_try_defer_start(LowerContext* ctx) {
+    if (!ctx || ctx->try_scopes.count <= 0) {
+        return 0;
+    }
+    return ctx->try_scopes.items[ctx->try_scopes.count - 1].defer_start;
 }
 
 static void emit_deferred_blocks(LowerContext* ctx, HirBlock* out_block, int start) {
@@ -773,6 +782,20 @@ static int is_integer_like_type(HirType* type) {
             type->kind == HIR_TYPE_U64 ||
             type->kind == HIR_TYPE_UINT8 ||
             type->kind == HIR_TYPE_BOOL);
+}
+
+static int is_bitwise_integer_type(HirType* type) {
+    return type &&
+           (type->kind == HIR_TYPE_INT ||
+            type->kind == HIR_TYPE_I8 ||
+            type->kind == HIR_TYPE_I16 ||
+            type->kind == HIR_TYPE_I32 ||
+            type->kind == HIR_TYPE_I64 ||
+            type->kind == HIR_TYPE_U8 ||
+            type->kind == HIR_TYPE_U16 ||
+            type->kind == HIR_TYPE_U32 ||
+            type->kind == HIR_TYPE_U64 ||
+            type->kind == HIR_TYPE_UINT8);
 }
 
 static int is_float_like_type(HirType* type) {
@@ -3607,6 +3630,19 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.unary.value = value;
             return out;
         }
+        case AST_EXPR_BIT_NOT: {
+            HirExpr* value = lower_expr(ctx, expr->as.unary.value);
+            if (!value) {
+                return 0;
+            }
+            if (!is_bitwise_integer_type(value->type)) {
+                fail(ctx, "bitwise not requires integer operand");
+                return 0;
+            }
+            out = new_expr(HIR_EXPR_BIT_NOT, value->type, expr->line);
+            out->as.unary.value = value;
+            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+        }
         case AST_EXPR_IF: {
             HirExpr* cond = lower_expr_expected(ctx, expr->as.if_expr.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
             HirExpr* then_expr = 0;
@@ -4185,11 +4221,17 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_BINARY: {
-            int comparison_op = expr->as.binary.op != AST_BIN_ADD &&
-                                expr->as.binary.op != AST_BIN_SUB &&
-                                expr->as.binary.op != AST_BIN_MUL &&
-                                expr->as.binary.op != AST_BIN_MOD &&
-                                expr->as.binary.op != AST_BIN_DIV;
+            int arithmetic_op = expr->as.binary.op == AST_BIN_ADD ||
+                                expr->as.binary.op == AST_BIN_SUB ||
+                                expr->as.binary.op == AST_BIN_MUL ||
+                                expr->as.binary.op == AST_BIN_MOD ||
+                                expr->as.binary.op == AST_BIN_DIV;
+            int bitwise_op = expr->as.binary.op == AST_BIN_BIT_AND ||
+                             expr->as.binary.op == AST_BIN_BIT_OR ||
+                             expr->as.binary.op == AST_BIN_BIT_XOR;
+            int shift_op = expr->as.binary.op == AST_BIN_SHL ||
+                           expr->as.binary.op == AST_BIN_SHR;
+            int comparison_op = !arithmetic_op && !bitwise_op && !shift_op;
             HirExpr* left = 0;
             HirExpr* right = 0;
             HirType* numeric_type = 0;
@@ -4229,6 +4271,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_MUL: out->as.binary.op = HIR_BIN_MUL; break;
                 case AST_BIN_MOD: out->as.binary.op = HIR_BIN_MOD; break;
                 case AST_BIN_DIV: out->as.binary.op = HIR_BIN_DIV; break;
+                case AST_BIN_BIT_AND: out->as.binary.op = HIR_BIN_BIT_AND; break;
+                case AST_BIN_BIT_OR: out->as.binary.op = HIR_BIN_BIT_OR; break;
+                case AST_BIN_BIT_XOR: out->as.binary.op = HIR_BIN_BIT_XOR; break;
+                case AST_BIN_SHL: out->as.binary.op = HIR_BIN_SHL; break;
+                case AST_BIN_SHR: out->as.binary.op = HIR_BIN_SHR; break;
                 case AST_BIN_EQ: out->as.binary.op = HIR_BIN_EQ; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_NE: out->as.binary.op = HIR_BIN_NE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_LT: out->as.binary.op = HIR_BIN_LT; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
@@ -4236,7 +4283,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_GT: out->as.binary.op = HIR_BIN_GT; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_GE: out->as.binary.op = HIR_BIN_GE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
             }
-            if (expr->as.binary.op == AST_BIN_ADD || expr->as.binary.op == AST_BIN_SUB || expr->as.binary.op == AST_BIN_MUL || expr->as.binary.op == AST_BIN_MOD || expr->as.binary.op == AST_BIN_DIV) {
+            if (arithmetic_op) {
                 numeric_type = common_numeric_type(ctx->program, left->type, right->type);
                 if (numeric_type) {
                     if (expr->as.binary.op == AST_BIN_MOD && numeric_type->kind != HIR_TYPE_INT) {
@@ -4269,6 +4316,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     }
                     out->type = left->type;
                 }
+            } else if (bitwise_op) {
+                if (!type_equals(left->type, right->type) ||
+                    !is_bitwise_integer_type(left->type)) {
+                    fail(ctx, "bitwise operation requires matching integer operands");
+                    return 0;
+                }
+                out->type = left->type;
+            } else if (shift_op) {
+                if (!is_bitwise_integer_type(left->type) ||
+                    !is_bitwise_integer_type(right->type)) {
+                    fail(ctx, "shift requires integer operands");
+                    return 0;
+                }
+                out->type = left->type;
             } else {
                 numeric_type = common_numeric_type(ctx->program, left->type, right->type);
                 if (numeric_type) {
@@ -4868,6 +4929,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             TryScope try_scope;
             int i = 0;
             memset(&try_scope, 0, sizeof(try_scope));
+            try_scope.defer_start = ctx->active_defers.count;
             if (stmt->as.try_stmt.catches.count == 0) {
                 fail(ctx, "try requires at least one catch");
                 return 0;
@@ -4928,6 +4990,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 return 0;
             }
             memset(&try_scope, 0, sizeof(try_scope));
+            try_scope.defer_start = ctx->active_defers.count;
             memset(&catch_item, 0, sizeof(catch_item));
             catch_item.error_type = errorable_error_type(raw_expr->type);
             catch_item.binding = new_binding(catch_item.error_type, 0, stmt->as.expr_catch_stmt.binding_name, HIR_BINDING_LOCAL, stmt->line);
@@ -5970,6 +6033,7 @@ static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* o
     defer_frame_list_push(&ctx->defer_frames, frame);
     for (i = 0; i < ast_block->stmts.count; ++i) {
         HirStmt* stmt = 0;
+        HirStmt* spill_stmt = 0;
         ctx->current_line = ast_block->stmts.items[i]->line;
         if (ast_block->stmts.items[i]->kind == AST_STMT_DEFER) {
             HirBlock deferred_body;
@@ -6019,10 +6083,42 @@ static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* o
         if (!stmt) {
             return 0;
         }
+        if (stmt->kind == HIR_STMT_THROW && stmt->as.throw_stmt.expr) {
+            HirBinding* temp_binding = new_binding(stmt->as.throw_stmt.expr->type, 0, make_temp_name(ctx), HIR_BINDING_LOCAL, stmt->line);
+            spill_stmt = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
+            binding_list_push(&ctx->current_function->locals, temp_binding);
+            spill_stmt->as.var_decl.binding = temp_binding;
+            spill_stmt->as.var_decl.init = stmt->as.throw_stmt.expr;
+            stmt->as.throw_stmt.expr = make_binding_expr(temp_binding, stmt->line);
+        } else if (stmt->kind == HIR_STMT_EXPR &&
+                   stmt->as.expr_stmt.expr &&
+                   stmt->as.expr_stmt.expr->kind == HIR_EXPR_PROPAGATE &&
+                   stmt->as.expr_stmt.expr->as.propagate.value) {
+            HirBinding* temp_binding = new_binding(stmt->as.expr_stmt.expr->as.propagate.value->type, 0, make_temp_name(ctx), HIR_BINDING_LOCAL, stmt->line);
+            spill_stmt = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
+            binding_list_push(&ctx->current_function->locals, temp_binding);
+            spill_stmt->as.var_decl.binding = temp_binding;
+            spill_stmt->as.var_decl.init = stmt->as.expr_stmt.expr->as.propagate.value;
+            stmt->as.expr_stmt.expr->as.propagate.value = make_binding_expr(temp_binding, stmt->line);
+        }
+        if (spill_stmt) {
+            stmt_list_push(&out_block->stmts, spill_stmt);
+        }
         if (stmt->kind == HIR_STMT_RETURN) {
             emit_deferred_blocks(ctx, out_block, 0);
+        } else if (stmt->kind == HIR_STMT_THROW) {
+            int defer_start = (ctx->try_scopes.count > 0 &&
+                               current_try_catches_error(ctx, stmt->as.throw_stmt.expr->type))
+                ? current_try_defer_start(ctx)
+                : 0;
+            emit_deferred_blocks(ctx, out_block, defer_start);
         } else if (stmt->kind == HIR_STMT_BREAK || stmt->kind == HIR_STMT_CONTINUE) {
             emit_deferred_blocks(ctx, out_block, nearest_loop_defer_start(ctx));
+        } else if (stmt->kind == HIR_STMT_EXPR &&
+                   stmt->as.expr_stmt.expr &&
+                   stmt->as.expr_stmt.expr->kind == HIR_EXPR_PROPAGATE) {
+            int defer_start = stmt->as.expr_stmt.expr->as.propagate.result_type ? 0 : current_try_defer_start(ctx);
+            emit_deferred_blocks(ctx, out_block, defer_start);
         }
         stmt_list_push(&out_block->stmts, stmt);
     }

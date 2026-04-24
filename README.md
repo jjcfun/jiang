@@ -37,6 +37,10 @@ cmake --build build
 ./build/jiangc --emit-llvm tests/samples/minimal.jiang
 ```
 
+## 语言指南
+
+[Jiang 语言指南](./doc/jiang.md)
+
 ## 测试
 
 ```bash
