@@ -284,6 +284,9 @@ Token lexer_next(Lexer* lexer) {
             }
             return make_token(lexer, TOKEN_DOT, lexer->start, 1);
         case '=':
+            if (match_char(lexer, '>')) {
+                return make_token(lexer, TOKEN_FAT_ARROW, lexer->start, 2);
+            }
             if (match_char(lexer, '=')) {
                 return make_token(lexer, TOKEN_EQ_EQ, lexer->start, 2);
             }

@@ -1313,9 +1313,9 @@ Priority priority = Priority.medium
 HttpStatus status = .ok
 
 switch (priority) {
-	.low: print("priority value: %d", priority.value)
-  .medium: print("priority value: %d", priority.value)
-  .high: print("priority value: %d", priority.value)
+	.low => print("priority value: %d", priority.value)
+  .medium => print("priority value: %d", priority.value)
+  .high => print("priority value: %d", priority.value)
 }
 ```
 
@@ -1352,19 +1352,19 @@ MyUnion y = .b(3.15);
 // 使用 switch 处理所有情况（编译器确保完整性）
 switch (x) {
 	// 单个语句可以不用 {}
-  .a(_ value): print("value = %d", value);
+  .a(_ value) => print("value = %d", value);
 
   // 多个语句必须用 {}
-  .b(_! value): {
+  .b(_! value) => {
     value += 0.1;
     print("value = %f", value);
   }
 
-  .c(_ v1, _ b2): print("value = (%d, %d)", v1, v2);
+  .c(_ v1, _ b2) => print("value = (%d, %d)", v1, v2);
 
-  .d(_ v): print("value = Foo {x: %d, y: %d}", v.x, v.y);
+  .d(_ v) => print("value = Foo {x: %d, y: %d}", v.x, v.y);
 
-	else: break;
+	else => break;
 }
 
 // 使用 if 判断

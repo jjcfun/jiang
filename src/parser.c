@@ -2484,7 +2484,7 @@ static AstStmt* parse_stmt(Parser* parser) {
                     return 0;
                 }
             }
-            if (!expect(parser, TOKEN_COLON, "expected ':' after switch branch")) {
+            if (!expect(parser, TOKEN_FAT_ARROW, "expected '=>' after switch branch")) {
                 return 0;
             }
             if (parser->current.kind == TOKEN_LEFT_BRACE) {
