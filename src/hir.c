@@ -2349,6 +2349,7 @@ static HirExpr* make_union_field_expr(LowerContext* ctx, HirExpr* value, HirUnio
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out);
 static int lower_pattern_bind(LowerContext* ctx, const AstBindingPattern* pattern, HirExpr* init, HirBlock* out_block);
 static int bind_optional_narrow(LowerContext* ctx, const char* name, HirBlock* out_block, int line);
+static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr);
 
 static HirBuiltinKind builtin_kind(const char* name) {
     if (strcmp(name, "assert") == 0) return HIR_BUILTIN_ASSERT;
@@ -3466,6 +3467,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             out->as.if_expr.else_expr = else_expr;
             return out;
         }
+        case AST_EXPR_SWITCH:
+            return lower_switch_expr(ctx, expr);
         case AST_EXPR_TERNARY: {
             HirExpr* cond = lower_expr_expected(ctx, expr->as.ternary.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
             HirExpr* then_expr = 0;
@@ -5148,6 +5151,257 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
         return fail(ctx, "non-tuple variant pattern arity mismatch");
     }
     return lower_pattern_bind(ctx, pattern->as.variant.bindings.items[0], make_union_field_expr(ctx, value, variant, -1, variant->payload_type, pattern->line), out_block);
+}
+
+static int switch_expr_case_has_bindings(const AstSwitchExprCase* ast_case) {
+    if (!ast_case || ast_case->is_else || !ast_case->pattern) {
+        return 0;
+    }
+    return ast_case->pattern->kind == AST_EXPR_VARIANT &&
+           ast_case->pattern->as.variant.bindings.count > 0;
+}
+
+static int validate_switch_expr_cases(LowerContext* ctx, HirExpr* value, const AstExpr* expr) {
+    int i = 0;
+    int have_else = 0;
+    if (is_errorable_type(value->type)) {
+        return fail(ctx, "switch expression does not support errorable values");
+    }
+    if (value->type->kind == HIR_TYPE_ENUM) {
+        int member_count = value->type->enum_decl->members.count;
+        int* seen = (int*)calloc((size_t)member_count, sizeof(int));
+        int seen_count = 0;
+        if (!seen) {
+            return fail(ctx, "out of memory");
+        }
+        for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+            const AstSwitchExprCase* ast_case = &expr->as.switch_expr.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    free(seen);
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            {
+                HirExpr* case_value = lower_expr_expected(ctx, ast_case->pattern, value->type);
+                int j = 0;
+                if (!case_value) {
+                    free(seen);
+                    return 0;
+                }
+                if (!type_equals(value->type, case_value->type)) {
+                    free(seen);
+                    return fail(ctx, "switch case type mismatch");
+                }
+                if (case_value->kind == HIR_EXPR_ENUM_MEMBER) {
+                    for (j = 0; j < member_count; ++j) {
+                        if (&value->type->enum_decl->members.items[j] == case_value->as.enum_member.member) {
+                            if (seen[j]) {
+                                free(seen);
+                                return fail(ctx, "duplicate switch case");
+                            }
+                            seen[j] = 1;
+                            seen_count += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!have_else && seen_count < member_count) {
+            free(seen);
+            return fail(ctx, "non-exhaustive enum switch");
+        }
+        free(seen);
+        return 1;
+    }
+    if (value->type->kind == HIR_TYPE_UNION) {
+        int variant_count = value->type->union_decl->variants.count;
+        int* seen = (int*)calloc((size_t)variant_count, sizeof(int));
+        int seen_count = 0;
+        if (!seen) {
+            return fail(ctx, "out of memory");
+        }
+        for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+            const AstSwitchExprCase* ast_case = &expr->as.switch_expr.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    free(seen);
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            if (switch_expr_case_has_bindings(ast_case)) {
+                free(seen);
+                return fail(ctx, "switch expression pattern bindings unsupported");
+            }
+            if (ast_case->pattern->kind != AST_EXPR_VARIANT) {
+                free(seen);
+                return fail(ctx, "switch case type mismatch");
+            }
+            {
+                HirUnionDecl* union_decl = 0;
+                HirUnionVariant* variant = resolve_variant_expr(ctx, ast_case->pattern, &union_decl);
+                if (!variant) {
+                    free(seen);
+                    return 0;
+                }
+                if (union_decl != value->type->union_decl) {
+                    free(seen);
+                    return fail(ctx, "switch case type mismatch");
+                }
+                if (seen[variant->tag_value]) {
+                    free(seen);
+                    return fail(ctx, "duplicate switch case");
+                }
+                seen[variant->tag_value] = 1;
+                seen_count += 1;
+            }
+        }
+        if (!have_else && seen_count < variant_count) {
+            free(seen);
+            return fail(ctx, "non-exhaustive union switch");
+        }
+        free(seen);
+        return 1;
+    }
+    if (value->type->kind == HIR_TYPE_OPTIONAL) {
+        int seen_some = 0;
+        for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+            const AstSwitchExprCase* ast_case = &expr->as.switch_expr.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            if (switch_expr_case_has_bindings(ast_case)) {
+                return fail(ctx, "switch expression pattern bindings unsupported");
+            }
+            if (ast_case->pattern->kind != AST_EXPR_VARIANT ||
+                !ast_case->pattern->as.variant.union_name ||
+                strcmp(ast_case->pattern->as.variant.union_name, "Option") != 0) {
+                return fail(ctx, "switch case type mismatch");
+            }
+            if (strcmp(ast_case->pattern->as.variant.variant_name, "some") != 0) {
+                return fail(ctx, "unknown optional pattern");
+            }
+            if (seen_some) {
+                return fail(ctx, "duplicate switch case");
+            }
+            seen_some = 1;
+        }
+        if (!have_else) {
+            return fail(ctx, "non-exhaustive optional switch");
+        }
+        return 1;
+    }
+    for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+        const AstSwitchExprCase* ast_case = &expr->as.switch_expr.cases.items[i];
+        if (ast_case->is_else) {
+            if (have_else) {
+                return fail(ctx, "duplicate else case");
+            }
+            have_else = 1;
+            continue;
+        }
+        {
+            HirExpr* case_value = lower_expr_expected(ctx, ast_case->pattern, value->type);
+            if (!case_value) {
+                return 0;
+            }
+            if (!type_equals(value->type, case_value->type)) {
+                return fail(ctx, "switch case type mismatch");
+            }
+        }
+    }
+    if (!have_else) {
+        return fail(ctx, "non-exhaustive switch expression");
+    }
+    return 1;
+}
+
+static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
+    HirExpr* value = lower_expr(ctx, expr->as.switch_expr.value);
+    HirExpr* fallback = 0;
+    HirType* result_type = 0;
+    int i = expr->as.switch_expr.cases.count - 1;
+    if (!value) {
+        return 0;
+    }
+    if (!validate_switch_expr_cases(ctx, value, expr)) {
+        return 0;
+    }
+    for (; i >= 0; --i) {
+        const AstSwitchExprCase* ast_case = &expr->as.switch_expr.cases.items[i];
+        HirExpr* branch_value = 0;
+        HirExpr* cond = 0;
+        if (ast_case->is_else) {
+            fallback = lower_expr(ctx, ast_case->value);
+            if (!fallback) {
+                return 0;
+            }
+            if (!result_type) {
+                result_type = fallback->type;
+            } else if (!type_equals(result_type, fallback->type)) {
+                return fail(ctx, "switch expression branch type mismatch"), (HirExpr*)0;
+            }
+            continue;
+        }
+        branch_value = lower_expr(ctx, ast_case->value);
+        if (!branch_value) {
+            return 0;
+        }
+        if (!result_type) {
+            result_type = branch_value->type;
+        } else if (!type_equals(result_type, branch_value->type)) {
+            return fail(ctx, "switch expression branch type mismatch"), (HirExpr*)0;
+        }
+        if (result_type->kind == HIR_TYPE_TUPLE ||
+            result_type->kind == HIR_TYPE_ARRAY ||
+            result_type->kind == HIR_TYPE_UNION ||
+            result_type->kind == HIR_TYPE_VOID) {
+            return fail(ctx, "switch expression aggregate result unsupported"), (HirExpr*)0;
+        }
+        if ((value->type->kind == HIR_TYPE_UNION || value->type->kind == HIR_TYPE_OPTIONAL) &&
+            ast_case->pattern->kind == AST_EXPR_VARIANT) {
+            HirBlock dummy;
+            memset(&dummy, 0, sizeof(dummy));
+            if (!lower_variant_pattern_bind(ctx, value, ast_case->pattern, &dummy, &cond)) {
+                return 0;
+            }
+            if (dummy.stmts.count != 0) {
+                return fail(ctx, "switch expression pattern bindings unsupported"), (HirExpr*)0;
+            }
+        } else {
+            HirExpr* case_value = lower_expr_expected(ctx, ast_case->pattern, value->type);
+            if (!case_value) {
+                return 0;
+            }
+            if (!type_equals(value->type, case_value->type)) {
+                return fail(ctx, "switch case type mismatch"), (HirExpr*)0;
+            }
+            cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), ast_case->pattern->line);
+            cond->as.binary.op = HIR_BIN_EQ;
+            cond->as.binary.left = value;
+            cond->as.binary.right = case_value;
+        }
+        if (!fallback) {
+            return fail(ctx, "non-exhaustive switch expression"), (HirExpr*)0;
+        }
+        {
+            HirExpr* if_expr = new_expr(HIR_EXPR_IF, result_type, ast_case->value->line);
+            if_expr->as.if_expr.cond = cond;
+            if_expr->as.if_expr.then_expr = branch_value;
+            if_expr->as.if_expr.else_expr = fallback;
+            fallback = if_expr;
+        }
+    }
+    return fallback;
 }
 
 static int validate_switch_cases(LowerContext* ctx, HirExpr* value, const AstStmt* stmt) {

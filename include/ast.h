@@ -11,6 +11,7 @@ typedef struct AstExpr AstExpr;
 typedef struct AstStmt AstStmt;
 typedef struct AstBindingPattern AstBindingPattern;
 typedef struct AstSwitchCase AstSwitchCase;
+typedef struct AstSwitchExprCase AstSwitchExprCase;
 typedef struct AstTryCatch AstTryCatch;
 typedef struct AstBlock AstBlock;
 typedef struct AstStructField AstStructField;
@@ -150,6 +151,12 @@ typedef struct AstStructFieldInitList {
     int capacity;
 } AstStructFieldInitList;
 
+typedef struct AstSwitchExprCaseList {
+    AstSwitchExprCase* items;
+    int count;
+    int capacity;
+} AstSwitchExprCaseList;
+
 typedef enum AstExprKind {
     AST_EXPR_INT = 0,
     AST_EXPR_FLOAT,
@@ -169,6 +176,7 @@ typedef enum AstExprKind {
     AST_EXPR_COALESCE_CONTROL,
     AST_EXPR_CATCH_FALLBACK,
     AST_EXPR_IF,
+    AST_EXPR_SWITCH,
     AST_EXPR_TERNARY,
     AST_EXPR_CALL,
     AST_EXPR_VARIANT,
@@ -273,6 +281,10 @@ struct AstExpr {
             AstExpr* else_expr;
         } if_expr;
         struct {
+            AstExpr* value;
+            AstSwitchExprCaseList cases;
+        } switch_expr;
+        struct {
             AstExpr* left;
             AstCoalesceControlKind control;
             AstExpr* return_expr;
@@ -348,6 +360,12 @@ struct AstSwitchCase {
     AstBlock body;
     int is_else;
     int result_case_kind;
+};
+
+struct AstSwitchExprCase {
+    AstExpr* pattern;
+    AstExpr* value;
+    int is_else;
 };
 
 typedef struct AstSwitchCaseList {

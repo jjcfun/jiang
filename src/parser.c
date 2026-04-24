@@ -181,6 +181,7 @@ static void parser_set_error(Parser* parser, const char* error) {
 #define struct_field_list_push(list, field) VEC_PUSH((list), (field))
 #define struct_field_init_list_push(list, field) VEC_PUSH((list), (field))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
+#define switch_expr_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
 #define import_list_push(list, import_decl) VEC_PUSH((list), (import_decl))
 #define alias_list_push(list, alias_decl) VEC_PUSH((list), (alias_decl))
@@ -1375,11 +1376,13 @@ static int looks_like_variant_pattern_expr(Parser* parser) {
 
 static AstExpr* parse_postfix(Parser* parser);
 static AstExpr* parse_unary(Parser* parser);
+static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag);
 
 static AstExpr* parse_expr(Parser* parser);
 static AstExpr* parse_if_expr(Parser* parser);
+static AstExpr* parse_switch_expr(Parser* parser);
 
-static AstExpr* parse_if_branch_expr(Parser* parser, const char* context) {
+static AstExpr* parse_value_branch_expr(Parser* parser, const char* context) {
     AstExpr* expr = 0;
     if (parser->current.kind == TOKEN_LEFT_BRACE) {
         advance(parser);
@@ -1408,7 +1411,7 @@ static AstExpr* parse_if_expr(Parser* parser) {
     if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after if condition")) {
         return 0;
     }
-    expr->as.if_expr.then_expr = parse_if_branch_expr(parser, "expected '}' after if expression then branch");
+    expr->as.if_expr.then_expr = parse_value_branch_expr(parser, "expected '}' after if expression then branch");
     if (!expr->as.if_expr.then_expr) {
         return 0;
     }
@@ -1417,8 +1420,65 @@ static AstExpr* parse_if_expr(Parser* parser) {
         return 0;
     }
     advance(parser);
-    expr->as.if_expr.else_expr = parse_if_branch_expr(parser, "expected '}' after if expression else branch");
+    expr->as.if_expr.else_expr = parse_value_branch_expr(parser, "expected '}' after if expression else branch");
     if (!expr->as.if_expr.else_expr) {
+        return 0;
+    }
+    return expr;
+}
+
+static AstExpr* parse_switch_expr(Parser* parser) {
+    AstExpr* expr = new_expr(AST_EXPR_SWITCH, parser->current.line);
+    advance(parser);
+    if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after switch")) {
+        return 0;
+    }
+    expr->as.switch_expr.value = parse_expr(parser);
+    if (!expr->as.switch_expr.value) {
+        return 0;
+    }
+    if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after switch value")) {
+        return 0;
+    }
+    if (!expect(parser, TOKEN_LEFT_BRACE, "expected '{' after switch")) {
+        return 0;
+    }
+    while (parser->current.kind != TOKEN_RIGHT_BRACE && parser->current.kind != TOKEN_EOF) {
+        AstSwitchExprCase switch_case;
+        memset(&switch_case, 0, sizeof(switch_case));
+        if (parser->current.kind == TOKEN_KW_ELSE) {
+            switch_case.is_else = 1;
+            advance(parser);
+        } else {
+            if (looks_like_variant_pattern_expr(parser)) {
+                switch_case.pattern = parse_variant_expr(parser, 1);
+            } else {
+                switch_case.pattern = parse_expr(parser);
+            }
+            if (!switch_case.pattern) {
+                return 0;
+            }
+        }
+        if (!expect(parser, TOKEN_FAT_ARROW, "expected '=>' after switch branch")) {
+            return 0;
+        }
+        if (parser->current.kind == TOKEN_LEFT_BRACE) {
+            switch_case.value = parse_value_branch_expr(parser, "expected '}' after switch expression branch");
+            if (!switch_case.value) {
+                return 0;
+            }
+        } else {
+            switch_case.value = parse_expr(parser);
+            if (!switch_case.value) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after bare switch expression branch")) {
+                return 0;
+            }
+        }
+        switch_expr_case_list_push(&expr->as.switch_expr.cases, switch_case);
+    }
+    if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after switch")) {
         return 0;
     }
     return expr;
@@ -1838,6 +1898,10 @@ static AstExpr* parse_primary(Parser* parser) {
 
     if (token.kind == TOKEN_KW_IF) {
         return parse_if_expr(parser);
+    }
+
+    if (token.kind == TOKEN_KW_SWITCH) {
+        return parse_switch_expr(parser);
     }
 
     fail(parser, "expected expression");
@@ -2503,25 +2567,7 @@ static AstStmt* parse_stmt(Parser* parser) {
             AstSwitchCase switch_case;
             AstStmt* case_stmt = 0;
             memset(&switch_case, 0, sizeof(switch_case));
-            if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "value")) {
-                switch_case.result_case_kind = 1;
-                advance(parser);
-                if (parser->current.kind != TOKEN_IDENT) {
-                    fail(parser, "expected binding name after 'value'");
-                    return 0;
-                }
-                switch_case.binding_name = token_dup(&parser->current);
-                advance(parser);
-            } else if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "error")) {
-                switch_case.result_case_kind = 2;
-                advance(parser);
-                if (parser->current.kind != TOKEN_IDENT) {
-                    fail(parser, "expected binding name after 'error'");
-                    return 0;
-                }
-                switch_case.binding_name = token_dup(&parser->current);
-                advance(parser);
-            } else if (parser->current.kind == TOKEN_KW_ELSE) {
+            if (parser->current.kind == TOKEN_KW_ELSE) {
                 switch_case.is_else = 1;
                 advance(parser);
             } else {

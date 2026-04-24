@@ -634,6 +634,28 @@ Int y = if (flag) 1 else 2;
 - 分支可以写成单个裸表达式，或写成 `{ expr }`
 - `{ ... }` 当前仍只支持单个表达式，不支持完整语句块产值
 
+#### switch表达式
+
+`switch` 也可以作为表达式使用：
+
+```c
+Int x = switch (value) {
+    1 => 40;
+    2 => 42;
+    else => 0;
+};
+```
+
+当前规则：
+
+- 分支使用 `=>`
+- 分支右侧可以写成单个裸表达式，或 `{ expr }`
+- 裸表达式分支必须以 `;` 结束
+- 所有分支结果类型必须一致
+- `enum` / `union` / `optional` 仍然做穷尽性检查
+- 当前不支持模式绑定形式的 `switch` 表达式
+- 当前不支持对 `T@E` 结果直接使用 `switch` 表达式
+
 ### 异常
 
 Jiang 第一版异常不是 runtime exception，也不做栈展开。  
@@ -703,6 +725,8 @@ Int@Err outer(Bool fail) {
 - 用 `expr catch fallback` 处理单个失败结果
 - 用 `expr catch (e) { ... };` 处理单个失败结果并读取错误值
 - 在需要拦截错误时使用语句级 `try-catch`
+
+当前不再支持通过 `switch` 直接匹配异常结果。
 
 单个表达式可以直接写 `catch`：
 

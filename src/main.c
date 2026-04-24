@@ -25,6 +25,7 @@
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define binding_pattern_list_push(list, pattern) VEC_PUSH((list), (pattern))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
+#define switch_expr_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
 #define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
 #define name_list_push(list, name) VEC_PUSH((list), (name))
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
@@ -808,6 +809,17 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             out->as.if_expr.cond = clone_expr(source, prefix, hide_private, expr->as.if_expr.cond);
             out->as.if_expr.then_expr = clone_expr(source, prefix, hide_private, expr->as.if_expr.then_expr);
             out->as.if_expr.else_expr = clone_expr(source, prefix, hide_private, expr->as.if_expr.else_expr);
+            break;
+        case AST_EXPR_SWITCH:
+            out->as.switch_expr.value = clone_expr(source, prefix, hide_private, expr->as.switch_expr.value);
+            for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+                AstSwitchExprCase item;
+                memset(&item, 0, sizeof(item));
+                item.pattern = clone_expr(source, prefix, hide_private, expr->as.switch_expr.cases.items[i].pattern);
+                item.value = clone_expr(source, prefix, hide_private, expr->as.switch_expr.cases.items[i].value);
+                item.is_else = expr->as.switch_expr.cases.items[i].is_else;
+                switch_expr_case_list_push(&out->as.switch_expr.cases, item);
+            }
             break;
         case AST_EXPR_COALESCE_CONTROL:
             out->as.coalesce_control.left = clone_expr(source, prefix, hide_private, expr->as.coalesce_control.left);
@@ -4327,6 +4339,17 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             out->as.if_expr.then_expr = clone_expr_subst(expr->as.if_expr.then_expr, subst);
             out->as.if_expr.else_expr = clone_expr_subst(expr->as.if_expr.else_expr, subst);
             break;
+        case AST_EXPR_SWITCH:
+            out->as.switch_expr.value = clone_expr_subst(expr->as.switch_expr.value, subst);
+            for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+                AstSwitchExprCase item;
+                memset(&item, 0, sizeof(item));
+                item.pattern = clone_expr_subst(expr->as.switch_expr.cases.items[i].pattern, subst);
+                item.value = clone_expr_subst(expr->as.switch_expr.cases.items[i].value, subst);
+                item.is_else = expr->as.switch_expr.cases.items[i].is_else;
+                switch_expr_case_list_push(&out->as.switch_expr.cases, item);
+            }
+            break;
         case AST_EXPR_COALESCE_CONTROL:
             out->as.coalesce_control.left = clone_expr_subst(expr->as.coalesce_control.left, subst);
             out->as.coalesce_control.control = expr->as.coalesce_control.control;
@@ -5028,6 +5051,18 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
             return transform_expr(mono, expr->as.if_expr.cond, locals) &&
                    transform_expr(mono, expr->as.if_expr.then_expr, locals) &&
                    transform_expr(mono, expr->as.if_expr.else_expr, locals);
+        case AST_EXPR_SWITCH:
+            if (!transform_expr(mono, expr->as.switch_expr.value, locals)) {
+                return 0;
+            }
+            for (i = 0; i < expr->as.switch_expr.cases.count; ++i) {
+                if ((expr->as.switch_expr.cases.items[i].pattern &&
+                     !transform_expr(mono, expr->as.switch_expr.cases.items[i].pattern, locals)) ||
+                    !transform_expr(mono, expr->as.switch_expr.cases.items[i].value, locals)) {
+                    return 0;
+                }
+            }
+            return 1;
         case AST_EXPR_COALESCE_CONTROL:
             return transform_expr(mono, expr->as.coalesce_control.left, locals) &&
                    (!expr->as.coalesce_control.return_expr ||
