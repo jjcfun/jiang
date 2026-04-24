@@ -116,6 +116,12 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 6 && strncmp(lexer->start, "switch", 6) == 0) {
         return make_token(lexer, TOKEN_KW_SWITCH, lexer->start, length);
     }
+    if (length == 3 && strncmp(lexer->start, "try", 3) == 0) {
+        return make_token(lexer, TOKEN_KW_TRY, lexer->start, length);
+    }
+    if (length == 5 && strncmp(lexer->start, "catch", 5) == 0) {
+        return make_token(lexer, TOKEN_KW_CATCH, lexer->start, length);
+    }
     if (length == 5 && strncmp(lexer->start, "break", 5) == 0) {
         return make_token(lexer, TOKEN_KW_BREAK, lexer->start, length);
     }
@@ -124,6 +130,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     }
     if (length == 5 && strncmp(lexer->start, "defer", 5) == 0) {
         return make_token(lexer, TOKEN_KW_DEFER, lexer->start, length);
+    }
+    if (length == 5 && strncmp(lexer->start, "throw", 5) == 0) {
+        return make_token(lexer, TOKEN_KW_THROW, lexer->start, length);
     }
     if (length == 4 && strncmp(lexer->start, "true", 4) == 0) {
         return make_token(lexer, TOKEN_KW_TRUE, lexer->start, length);

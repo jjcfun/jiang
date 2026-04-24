@@ -119,6 +119,17 @@ run_sample fn_pointer_comprehensive_minimal.jiang 83
 run_sample fn_pointer_infer_minimal.jiang 3
 run_sample fn_pointer_static_method_minimal.jiang 3
 run_sample fn_pointer_instance_method_minimal.jiang 42
+run_sample unit_field_minimal.jiang 0
+run_sample errorable_throw_minimal.jiang 1
+run_sample errorable_return_minimal.jiang 42
+run_sample errorable_propagate_minimal.jiang 42
+run_sample errorable_switch_minimal.jiang 9
+run_sample errorable_void_minimal.jiang 9
+run_sample fn_pointer_errorable_minimal.jiang 1
+run_sample try_catch_single_minimal.jiang 12
+run_sample try_catch_multi_minimal.jiang 30
+run_sample try_catch_errorable_fn_minimal.jiang 42
+run_sample try_catch_nested_minimal.jiang 13
 run_sample self_keyword_minimal.jiang 42
 run_sample multi_file_enum_minimal.jiang 1
 run_sample multi_file_enum_shorthand_minimal.jiang 1
@@ -340,6 +351,9 @@ run_sample union_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
 run_sample union_implicit_tag_minimal.jiang 42
 run_sample union_grouped_variant_minimal.jiang 42
+run_sample union_payload_comprehensive_minimal.jiang 42
+run_sample generic_union_minimal.jiang 42
+run_sample generic_union_fn_payload_minimal.jiang 42
 run_sample union_bind_minimal.jiang 42
 run_sample union_if_pattern_minimal.jiang 42
 run_sample union_if_mutable_binding_minimal.jiang 42
@@ -450,6 +464,16 @@ run_compile_fail invalid_pointer_mutable_pointee_arg.jiang
 run_compile_fail invalid_slice_mutable_arg.jiang
 run_compile_fail invalid_call_non_function.jiang
 run_compile_fail invalid_fn_pointer_signature_mismatch.jiang
+run_compile_fail invalid_throw_outside_errorable.jiang
+run_compile_fail invalid_throw_type_mismatch.jiang
+run_compile_fail invalid_errorable_return_mismatch.jiang
+run_compile_fail invalid_errorable_plain_use.jiang
+run_compile_fail invalid_throw_expr.jiang
+run_compile_fail invalid_errorable_switch_case_kind.jiang
+run_compile_fail invalid_try_without_catch.jiang
+run_compile_fail invalid_try_duplicate_catch.jiang
+run_compile_fail invalid_try_uncaught_error_type.jiang
+run_compile_fail invalid_try_expr_context.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang
 run_compile_fail invalid_duplicate_type.jiang
@@ -460,7 +484,6 @@ run_compile_fail invalid_duplicate_param.jiang
 run_compile_fail invalid_struct_duplicate_field.jiang
 run_compile_fail invalid_struct_duplicate_method.jiang
 run_compile_fail invalid_struct_field.jiang
-run_compile_fail invalid_struct_void_field.jiang
 run_compile_fail invalid_struct_missing_field.jiang
 run_compile_fail invalid_struct_method_before_feature_misparse.jiang
 run_compile_fail invalid_struct_init_immutable_default_override.jiang
@@ -480,8 +503,6 @@ run_compile_fail invalid_union_instance_call_through_type.jiang
 run_compile_fail invalid_union_static_call_through_instance.jiang
 run_compile_fail invalid_missing_semicolon.jiang
 run_compile_fail invalid_void_keyword_type.jiang
-run_compile_fail invalid_void_local_decl.jiang
-run_compile_fail invalid_void_param_decl.jiang
 run_compile_fail invalid_type_function_name_conflict.jiang
 run_compile_fail invalid_enum_type_name_conflict.jiang
 run_compile_fail invalid_enum_value_type.jiang

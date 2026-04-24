@@ -27,6 +27,16 @@ typedef struct DeferFrameList {
     int capacity;
 } DeferFrameList;
 
+typedef struct TryScope {
+    HirTryCatchList catches;
+} TryScope;
+
+typedef struct TryScopeList {
+    TryScope* items;
+    int count;
+    int capacity;
+} TryScopeList;
+
 typedef struct LowerContext {
     HirProgram* program;
     const AstProgram* ast;
@@ -38,6 +48,7 @@ typedef struct LowerContext {
     HirBindingList freed_bindings;
     HirBlockList active_defers;
     DeferFrameList defer_frames;
+    TryScopeList try_scopes;
     int loop_depth;
     int temp_index;
 } LowerContext;
@@ -134,6 +145,9 @@ static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL
 #define enum_list_push(list, enum_decl) VEC_PUSH((list), (enum_decl))
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
+#define errorable_entry_list_push(list, entry) VEC_PUSH((list), (entry))
+#define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
+#define try_scope_list_push(list, scope) VEC_PUSH((list), (scope))
 #define defer_block_list_push(list, block) VEC_PUSH((list), (block))
 #define defer_frame_list_push(list, frame) VEC_PUSH((list), (frame))
 #define name_list_push(list, name) VEC_PUSH((list), (name))
@@ -164,12 +178,30 @@ static HirType* function_type_from_function(LowerContext* ctx, HirFunction* fn);
 static HirType* current_self_owner_type(LowerContext* ctx);
 static HirType* requalify_nominal_owner_type(LowerContext* ctx, HirType* base_type, int mutable_flag);
 static HirType* resolve_owner_type_name(LowerContext* ctx, const char* owner_type_name);
+static HirType* errorable_value_type(HirType* type);
+static HirType* errorable_error_type(HirType* type);
+static int is_errorable_type(HirType* type);
+static HirExpr* maybe_wrap_expected_errorable_expr(LowerContext* ctx, HirExpr* value, HirType* expected_type, int line);
+static int current_try_catches_error(LowerContext* ctx, HirType* error_type);
 
 static void append_block_stmts(HirBlock* out_block, const HirBlock* block) {
     int i = 0;
     for (i = 0; i < block->stmts.count; ++i) {
         stmt_list_push(&out_block->stmts, block->stmts.items[i]);
     }
+}
+
+static int current_try_catches_error(LowerContext* ctx, HirType* error_type) {
+    int i = 0;
+    if (!ctx || ctx->try_scopes.count <= 0 || !error_type) {
+        return 0;
+    }
+    for (i = 0; i < ctx->try_scopes.items[ctx->try_scopes.count - 1].catches.count; ++i) {
+        if (type_equals(ctx->try_scopes.items[ctx->try_scopes.count - 1].catches.items[i].error_type, error_type)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void emit_deferred_blocks(LowerContext* ctx, HirBlock* out_block, int start) {
@@ -572,6 +604,92 @@ static int type_assignment_compatible(HirType* actual, HirType* expected) {
     return type_assignment_compatible_inner(actual, expected, 0);
 }
 
+static int is_errorable_type(HirType* type) {
+    return type && type->kind == HIR_TYPE_UNION && type->union_decl && type->union_decl->errorable_flag;
+}
+
+static HirType* errorable_value_type(HirType* type) {
+    if (!is_errorable_type(type)) {
+        return 0;
+    }
+    return type->union_decl->variants.items[0].payload_type;
+}
+
+static HirType* errorable_error_type(HirType* type) {
+    if (!is_errorable_type(type)) {
+        return 0;
+    }
+    return type->union_decl->variants.items[1].payload_type;
+}
+
+static int64_t align_up_bytes(int64_t value, int64_t align) {
+    if (align <= 1) {
+        return value;
+    }
+    return ((value + align - 1) / align) * align;
+}
+
+static int64_t type_alignment_bytes(HirType* type) {
+    int i = 0;
+    int64_t align = 1;
+    if (!type) {
+        return 1;
+    }
+    switch (type->kind) {
+        case HIR_TYPE_I8:
+        case HIR_TYPE_U8:
+        case HIR_TYPE_UINT8:
+        case HIR_TYPE_BOOL:
+        case HIR_TYPE_VOID:
+            return 1;
+        case HIR_TYPE_I16:
+        case HIR_TYPE_U16:
+        case HIR_TYPE_F16:
+            return 2;
+        case HIR_TYPE_I32:
+        case HIR_TYPE_U32:
+        case HIR_TYPE_CHARACTER:
+        case HIR_TYPE_F32:
+        case HIR_TYPE_FLOAT:
+            return 4;
+        case HIR_TYPE_INT:
+        case HIR_TYPE_I64:
+        case HIR_TYPE_U64:
+        case HIR_TYPE_F64:
+        case HIR_TYPE_DOUBLE:
+        case HIR_TYPE_STRING:
+        case HIR_TYPE_REFERENCE:
+        case HIR_TYPE_POINTER:
+        case HIR_TYPE_MANY_POINTER:
+        case HIR_TYPE_SLICE:
+        case HIR_TYPE_ENUM:
+        case HIR_TYPE_FUNCTION:
+            return 8;
+        case HIR_TYPE_ARRAY:
+        case HIR_TYPE_OPTIONAL:
+            return type_alignment_bytes(type->array_item);
+        case HIR_TYPE_TUPLE:
+            for (i = 0; i < type->tuple_items.count; ++i) {
+                int64_t item_align = type_alignment_bytes(type->tuple_items.items[i]);
+                if (item_align > align) {
+                    align = item_align;
+                }
+            }
+            return align;
+        case HIR_TYPE_STRUCT:
+            for (i = 0; i < type->struct_decl->fields.count; ++i) {
+                int64_t field_align = type_alignment_bytes(type->struct_decl->fields.items[i].type);
+                if (field_align > align) {
+                    align = field_align;
+                }
+            }
+            return align;
+        case HIR_TYPE_UNION:
+            return type->union_decl->payload_align > 8 ? type->union_decl->payload_align : 8;
+    }
+    return 1;
+}
+
 static int64_t type_size_bytes(HirType* type) {
     int i = 0;
     int64_t size = 0;
@@ -615,28 +733,27 @@ static int64_t type_size_bytes(HirType* type) {
         case HIR_TYPE_ARRAY:
             return (int64_t)type->array_length * type_size_bytes(type->array_item);
         case HIR_TYPE_OPTIONAL:
-            return 1 + type_size_bytes(type->array_item);
+            size = 1;
+            size = align_up_bytes(size, type_alignment_bytes(type->array_item));
+            size += type_size_bytes(type->array_item);
+            return align_up_bytes(size, type_alignment_bytes(type));
         case HIR_TYPE_TUPLE:
             for (i = 0; i < type->tuple_items.count; ++i) {
+                size = align_up_bytes(size, type_alignment_bytes(type->tuple_items.items[i]));
                 size += type_size_bytes(type->tuple_items.items[i]);
             }
-            return size;
+            return align_up_bytes(size, type_alignment_bytes(type));
         case HIR_TYPE_STRUCT:
             for (i = 0; i < type->struct_decl->fields.count; ++i) {
+                size = align_up_bytes(size, type_alignment_bytes(type->struct_decl->fields.items[i].type));
                 size += type_size_bytes(type->struct_decl->fields.items[i].type);
             }
-            return size;
+            return align_up_bytes(size, type_alignment_bytes(type));
         case HIR_TYPE_ENUM:
             return 8;
         case HIR_TYPE_UNION: {
-            int64_t payload_size = 0;
-            for (i = 0; i < type->union_decl->variants.count; ++i) {
-                int64_t variant_size = type_size_bytes(type->union_decl->variants.items[i].payload_type);
-                if (variant_size > payload_size) {
-                    payload_size = variant_size;
-                }
-            }
-            return 8 + payload_size;
+            size = 8 + type->union_decl->payload_size;
+            return align_up_bytes(size, type_alignment_bytes(type));
         }
     }
     return 0;
@@ -745,6 +862,56 @@ static HirType* pointer_to_type(LowerContext* ctx, HirType* pointee) {
     return pointer;
 }
 
+static HirType* get_errorable_type(LowerContext* ctx, HirType* value_type, HirType* error_type) {
+    int i = 0;
+    for (i = 0; i < ctx->program->errorable_types.count; ++i) {
+        HirErrorableEntry* entry = &ctx->program->errorable_types.items[i];
+        if (type_equals(entry->value_type, value_type) && type_equals(entry->error_type, error_type)) {
+            return entry->result_type;
+        }
+    }
+    {
+        HirUnionDecl* union_decl = (HirUnionDecl*)calloc(1, sizeof(HirUnionDecl));
+        HirType* result_type = 0;
+        HirUnionVariant value_variant;
+        HirUnionVariant error_variant;
+        HirErrorableEntry entry;
+        if (!union_decl) {
+            fail(ctx, "out of memory");
+            return 0;
+        }
+        union_decl->name = "__result";
+        union_decl->errorable_flag = 1;
+        memset(&value_variant, 0, sizeof(value_variant));
+        memset(&error_variant, 0, sizeof(error_variant));
+        value_variant.name = "value";
+        value_variant.payload_type = value_type;
+        value_variant.tag_value = 0;
+        error_variant.name = "error";
+        error_variant.payload_type = error_type;
+        error_variant.tag_value = 1;
+        union_variant_list_push(&union_decl->variants, value_variant);
+        union_variant_list_push(&union_decl->variants, error_variant);
+        union_decl->payload_size = type_size_bytes(value_type);
+        if (type_size_bytes(error_type) > union_decl->payload_size) {
+            union_decl->payload_size = type_size_bytes(error_type);
+        }
+        union_decl->payload_align = type_alignment_bytes(value_type);
+        if (type_alignment_bytes(error_type) > union_decl->payload_align) {
+            union_decl->payload_align = type_alignment_bytes(error_type);
+        }
+        result_type = new_owned_type(ctx->program, HIR_TYPE_UNION);
+        result_type->union_decl = union_decl;
+        memset(&entry, 0, sizeof(entry));
+        entry.value_type = value_type;
+        entry.error_type = error_type;
+        entry.result_type = result_type;
+        entry.union_decl = union_decl;
+        errorable_entry_list_push(&ctx->program->errorable_types, entry);
+        return result_type;
+    }
+}
+
 static HirType* lower_type(LowerContext* ctx, const AstType* type) {
     int i = 0;
     switch (type->kind) {
@@ -821,6 +988,8 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             optional->array_item = lower_type(ctx, type->array_item);
             return optional;
         }
+        case AST_TYPE_ERRORABLE:
+            return get_errorable_type(ctx, lower_type(ctx, type->array_item), lower_type(ctx, type->error_type));
         case AST_TYPE_NAMED: {
             if (type->named_name && strcmp(type->named_name, "Fn") == 0) {
                 HirType* fn_type = 0;
@@ -913,10 +1082,12 @@ static HirStmt* new_stmt(HirStmtKind kind, int line) {
 static HirStmtKind stmt_kind_from_ast(AstStmtKind kind) {
     switch (kind) {
         case AST_STMT_RETURN: return HIR_STMT_RETURN;
+        case AST_STMT_THROW: return HIR_STMT_THROW;
         case AST_STMT_VAR_DECL: return HIR_STMT_VAR_DECL;
         case AST_STMT_GROUP: return HIR_STMT_EXPR;
         case AST_STMT_ASSIGN: return HIR_STMT_ASSIGN;
         case AST_STMT_IF: return HIR_STMT_IF;
+        case AST_STMT_TRY: return HIR_STMT_TRY;
         case AST_STMT_WHILE: return HIR_STMT_WHILE;
         case AST_STMT_FOR_RANGE: return HIR_STMT_FOR_RANGE;
         case AST_STMT_BREAK: return HIR_STMT_BREAK;
@@ -997,6 +1168,42 @@ static HirExpr* maybe_wrap_expected_optional_expr(LowerContext* ctx, HirExpr* va
         HirExpr* some = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, line);
         some->as.unary.value = value;
         return some;
+    }
+    return value;
+}
+
+static HirExpr* maybe_wrap_expected_errorable_expr(LowerContext* ctx, HirExpr* value, HirType* expected_type, int line) {
+    HirType* current_return_type = 0;
+    if (!value) {
+        return 0;
+    }
+    current_return_type = ctx->current_function ? ctx->current_function->return_type : 0;
+    if (expected_type && is_errorable_type(expected_type)) {
+        if (is_errorable_type(value->type)) {
+            return value;
+        }
+        if (type_equals(value->type, errorable_value_type(expected_type))) {
+            HirExpr* wrapped = new_expr(HIR_EXPR_VARIANT, expected_type, line);
+            wrapped->as.variant.variant = &expected_type->union_decl->variants.items[0];
+            wrapped->as.variant.payload = value;
+            return wrapped;
+        }
+        return value;
+    }
+    if (expected_type && !is_errorable_type(expected_type) && is_errorable_type(value->type) &&
+        type_equals(expected_type, errorable_value_type(value->type))) {
+        HirExpr* propagate = new_expr(HIR_EXPR_PROPAGATE, expected_type, line);
+        if (current_try_catches_error(ctx, errorable_error_type(value->type))) {
+            propagate->as.propagate.value = value;
+            propagate->as.propagate.result_type = 0;
+            return propagate;
+        }
+        if (is_errorable_type(current_return_type) &&
+            type_equals(errorable_error_type(current_return_type), errorable_error_type(value->type))) {
+            propagate->as.propagate.value = value;
+            propagate->as.propagate.result_type = current_return_type;
+            return propagate;
+        }
     }
     return value;
 }
@@ -3087,7 +3294,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             out = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
             out->as.binding = binding;
-            return maybe_auto_deref_pointer_expr(out, expected_type, expr->line);
+            out = maybe_auto_deref_pointer_expr(out, expected_type, expr->line);
+            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_OPTIONAL_FIELD:
             return lower_optional_chain_field(ctx, expr);
@@ -3193,7 +3401,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_TERNARY: {
-            HirExpr* cond = lower_expr(ctx, expr->as.ternary.cond);
+            HirExpr* cond = lower_expr_expected(ctx, expr->as.ternary.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
             HirExpr* then_expr = 0;
             HirExpr* else_expr = 0;
             if (!cond) {
@@ -3287,7 +3495,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             return 0;
                         }
                         free(owner_name);
-                        return out;
+                        return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
                     }
                     {
                         HirBuiltinKind builtin_method = builtin_method_kind(owner_type, member_name, 0);
@@ -3301,7 +3509,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 return 0;
                             }
                             free(owner_name);
-                            return out;
+                            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
                         }
                     }
                     if (find_type_method(ctx->program, owner_type, member_name, 1)) {
@@ -3485,6 +3693,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         }
                         expr_list_push(&out->as.call.args, arg);
                     }
+                    out = maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
                     return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                 }
                 fail(ctx, "unknown function");
@@ -3497,6 +3706,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (!lower_call_args(ctx, &expr->as.call.args, &out->as.call.args, callee)) {
                 return 0;
             }
+            out = maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
             return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_VARIANT: {
@@ -3666,7 +3876,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             if (base_type->kind == HIR_TYPE_UNION) {
                 HirUnionVariant* variant = find_union_variant(base_type->union_decl, expr->as.field.name);
                 if (variant && variant->payload_type->kind != HIR_TYPE_VOID && variant->payload_type->kind != HIR_TYPE_TUPLE) {
-                    out = make_union_field_expr(ctx, base, variant, 0, variant->payload_type, expr->line);
+                    out = make_union_field_expr(ctx, base, variant, -1, variant->payload_type, expr->line);
                     return out;
                 }
             }
@@ -3856,7 +4066,9 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_TUPLE: {
-            HirType* tuple_type = new_owned_type(ctx->program, HIR_TYPE_TUPLE);
+            HirType* tuple_type = expr->as.tuple.items.count == 0
+                ? primitive_type(ctx->program, HIR_TYPE_VOID)
+                : new_owned_type(ctx->program, HIR_TYPE_TUPLE);
             out = new_expr(HIR_EXPR_TUPLE, tuple_type, expr->line);
             for (i = 0; i < expr->as.tuple.items.count; ++i) {
                 HirExpr* item = lower_expr(ctx, expr->as.tuple.items.items[i]);
@@ -4182,11 +4394,24 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
     switch (stmt->kind) {
         case AST_STMT_RETURN:
             if (!stmt->as.ret.expr) {
-                if (ctx->current_function->return_type->kind != HIR_TYPE_VOID) {
+                if (ctx->current_function->return_type->kind != HIR_TYPE_VOID &&
+                    !is_errorable_type(ctx->current_function->return_type)) {
                     fail(ctx, "return type mismatch");
                     return 0;
                 }
-                out->as.ret.expr = 0;
+                if (is_errorable_type(ctx->current_function->return_type) &&
+                    errorable_value_type(ctx->current_function->return_type)->kind != HIR_TYPE_VOID) {
+                    fail(ctx, "return type mismatch");
+                    return 0;
+                }
+                if (is_errorable_type(ctx->current_function->return_type)) {
+                    HirExpr* wrapped = new_expr(HIR_EXPR_VARIANT, ctx->current_function->return_type, stmt->line);
+                    wrapped->as.variant.variant = &ctx->current_function->return_type->union_decl->variants.items[0];
+                    wrapped->as.variant.payload = 0;
+                    out->as.ret.expr = wrapped;
+                } else {
+                    out->as.ret.expr = 0;
+                }
             } else {
                 out->as.ret.expr = lower_expr_expected(ctx, stmt->as.ret.expr, ctx->current_function->return_type);
                 if (!out->as.ret.expr) {
@@ -4196,10 +4421,39 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 if (!out->as.ret.expr) {
                     return 0;
                 }
+                if (is_errorable_type(ctx->current_function->return_type)) {
+                    if (!is_errorable_type(out->as.ret.expr->type) &&
+                        type_assignment_compatible(out->as.ret.expr->type, errorable_value_type(ctx->current_function->return_type))) {
+                        HirExpr* wrapped = new_expr(HIR_EXPR_VARIANT, ctx->current_function->return_type, stmt->line);
+                        wrapped->as.variant.variant = &ctx->current_function->return_type->union_decl->variants.items[0];
+                        wrapped->as.variant.payload = out->as.ret.expr;
+                        out->as.ret.expr = wrapped;
+                    }
+                }
                 if (!type_assignment_compatible(out->as.ret.expr->type, ctx->current_function->return_type)) {
                     fail(ctx, "return type mismatch");
                     return 0;
                 }
+            }
+            ctx->current_line = saved_line;
+            return out;
+        case AST_STMT_THROW:
+            if (!is_errorable_type(ctx->current_function->return_type)) {
+                fail(ctx, "throw requires an errorable return type");
+                return 0;
+            }
+            out->as.throw_stmt.expr = lower_expr_expected(ctx, stmt->as.throw_stmt.expr, errorable_error_type(ctx->current_function->return_type));
+            if (!out->as.throw_stmt.expr) {
+                return 0;
+            }
+            if (!type_assignment_compatible(out->as.throw_stmt.expr->type, errorable_error_type(ctx->current_function->return_type))) {
+                fail(ctx, "throw type mismatch");
+                return 0;
+            }
+            if (ctx->try_scopes.count > 0 &&
+                !current_try_catches_error(ctx, out->as.throw_stmt.expr->type)) {
+                fail(ctx, "uncaught error type in try block");
+                return 0;
             }
             ctx->current_line = saved_line;
             return out;
@@ -4329,7 +4583,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 }
                 pop_scope(ctx);
             } else {
-                out->as.if_stmt.cond = lower_expr(ctx, stmt->as.if_stmt.cond);
+                out->as.if_stmt.cond = lower_expr_expected(ctx, stmt->as.if_stmt.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
                 if (!out->as.if_stmt.cond) {
                     return 0;
                 }
@@ -4365,9 +4619,58 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             ctx->current_line = saved_line;
             return out;
         }
+        case AST_STMT_TRY: {
+            TryScope try_scope;
+            int i = 0;
+            memset(&try_scope, 0, sizeof(try_scope));
+            if (stmt->as.try_stmt.catches.count == 0) {
+                fail(ctx, "try requires at least one catch");
+                return 0;
+            }
+            for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+                const AstTryCatch* ast_catch = &stmt->as.try_stmt.catches.items[i];
+                HirTryCatch catch_item;
+                int j = 0;
+                memset(&catch_item, 0, sizeof(catch_item));
+                catch_item.error_type = lower_type(ctx, &ast_catch->error_type);
+                if (!catch_item.error_type) {
+                    return 0;
+                }
+                for (j = 0; j < try_scope.catches.count; ++j) {
+                    if (type_equals(try_scope.catches.items[j].error_type, catch_item.error_type)) {
+                        fail(ctx, "duplicate catch type");
+                        return 0;
+                    }
+                }
+                catch_item.binding = new_binding(catch_item.error_type, 0, ast_catch->binding_name, HIR_BINDING_LOCAL, ast_catch->line);
+                binding_list_push(&ctx->current_function->locals, catch_item.binding);
+                try_catch_list_push(&try_scope.catches, catch_item);
+                try_catch_list_push(&out->as.try_stmt.catches, catch_item);
+            }
+            try_scope_list_push(&ctx->try_scopes, try_scope);
+            if (!lower_block(ctx, &stmt->as.try_stmt.try_body, &out->as.try_stmt.try_body, 0)) {
+                ctx->try_scopes.count -= 1;
+                return 0;
+            }
+            ctx->try_scopes.count -= 1;
+            for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+                Scope catch_scope;
+                HirTryCatch* catch_item = &out->as.try_stmt.catches.items[i];
+                push_scope(ctx, &catch_scope);
+                if (!bind_in_current_scope(ctx, catch_item->binding)) {
+                    return 0;
+                }
+                if (!lower_block(ctx, &stmt->as.try_stmt.catches.items[i].body, &catch_item->body, 0)) {
+                    return 0;
+                }
+                pop_scope(ctx);
+            }
+            ctx->current_line = saved_line;
+            return out;
+        }
         case AST_STMT_WHILE: {
             Scope inner;
-            out->as.while_stmt.cond = lower_expr(ctx, stmt->as.while_stmt.cond);
+            out->as.while_stmt.cond = lower_expr_expected(ctx, stmt->as.while_stmt.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
             if (!out->as.while_stmt.cond) {
                 return 0;
             }
@@ -4440,6 +4743,24 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             out->as.expr_stmt.expr = lower_expr(ctx, stmt->as.expr_stmt.expr);
             if (!out->as.expr_stmt.expr) {
                 return 0;
+            }
+            if (is_errorable_type(out->as.expr_stmt.expr->type)) {
+                HirType* error_type = errorable_error_type(out->as.expr_stmt.expr->type);
+                int try_handles = ctx->try_scopes.count > 0 && current_try_catches_error(ctx, error_type);
+                int function_handles = is_errorable_type(ctx->current_function->return_type) &&
+                    type_equals(error_type, errorable_error_type(ctx->current_function->return_type));
+                if (try_handles || function_handles) {
+                    HirExpr* propagated = new_expr(HIR_EXPR_PROPAGATE, errorable_value_type(out->as.expr_stmt.expr->type), stmt->line);
+                    propagated->as.propagate.value = out->as.expr_stmt.expr;
+                    propagated->as.propagate.result_type = try_handles ? 0 : ctx->current_function->return_type;
+                    out->as.expr_stmt.expr = propagated;
+                } else if (ctx->try_scopes.count > 0) {
+                    fail(ctx, "uncaught error type in try block");
+                    return 0;
+                } else {
+                    fail(ctx, "errorable expression must be handled");
+                    return 0;
+                }
             }
             ctx->current_line = saved_line;
             return out;
@@ -4717,12 +5038,45 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
     if (pattern->as.variant.bindings.count != 1) {
         return fail(ctx, "non-tuple variant pattern arity mismatch");
     }
-    return lower_pattern_bind(ctx, pattern->as.variant.bindings.items[0], make_union_field_expr(ctx, value, variant, 0, variant->payload_type, pattern->line), out_block);
+    return lower_pattern_bind(ctx, pattern->as.variant.bindings.items[0], make_union_field_expr(ctx, value, variant, -1, variant->payload_type, pattern->line), out_block);
 }
 
 static int validate_switch_cases(LowerContext* ctx, HirExpr* value, const AstStmt* stmt) {
     int i = 0;
     int have_else = 0;
+    if (is_errorable_type(value->type)) {
+        int seen_value = 0;
+        int seen_error = 0;
+        for (i = 0; i < stmt->as.switch_stmt.cases.count; ++i) {
+            const AstSwitchCase* ast_case = &stmt->as.switch_stmt.cases.items[i];
+            if (ast_case->is_else) {
+                if (have_else) {
+                    return fail(ctx, "duplicate else case");
+                }
+                have_else = 1;
+                continue;
+            }
+            if (ast_case->result_case_kind == 1) {
+                if (seen_value) {
+                    return fail(ctx, "duplicate switch case");
+                }
+                seen_value = 1;
+                continue;
+            }
+            if (ast_case->result_case_kind == 2) {
+                if (seen_error) {
+                    return fail(ctx, "duplicate switch case");
+                }
+                seen_error = 1;
+                continue;
+            }
+            return fail(ctx, "errorable switch requires 'value' or 'error' branches");
+        }
+        if (!have_else && (!seen_value || !seen_error)) {
+            return fail(ctx, "non-exhaustive errorable switch");
+        }
+        return 1;
+    }
     if (value->type->kind == HIR_TYPE_ENUM) {
         int member_count = value->type->enum_decl->members.count;
         int* seen = (int*)calloc((size_t)member_count, sizeof(int));
@@ -4897,7 +5251,32 @@ static int lower_switch_stmt(LowerContext* ctx, const AstStmt* stmt, HirBlock* o
             Scope then_scope;
             Scope else_scope;
             push_scope(ctx, &then_scope);
-            if ((value->type->kind == HIR_TYPE_UNION || value->type->kind == HIR_TYPE_OPTIONAL) &&
+            if (is_errorable_type(value->type) && ast_case->result_case_kind != 0) {
+                int tag_value = ast_case->result_case_kind == 1 ? 0 : 1;
+                HirType* payload_type = ast_case->result_case_kind == 1
+                    ? errorable_value_type(value->type)
+                    : errorable_error_type(value->type);
+                HirUnionVariant* variant = &value->type->union_decl->variants.items[tag_value];
+                if_stmt->as.if_stmt.cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), stmt->line);
+                if_stmt->as.if_stmt.cond->as.binary.op = HIR_BIN_EQ;
+                if_stmt->as.if_stmt.cond->as.binary.left = make_union_tag_expr(ctx, value, stmt->line);
+                if_stmt->as.if_stmt.cond->as.binary.right = make_int_expr(ctx, tag_value, stmt->line);
+                if (ast_case->binding_name) {
+                    if (payload_type->kind == HIR_TYPE_VOID) {
+                        return fail(ctx, "void result case must not bind a value");
+                    }
+                    HirBinding* binding = new_binding(payload_type, 0, ast_case->binding_name, HIR_BINDING_LOCAL, ast_case->pattern ? ast_case->pattern->line : stmt->line);
+                    HirStmt* decl = 0;
+                    if (!bind_in_current_scope(ctx, binding)) {
+                        return 0;
+                    }
+                    binding_list_push(&ctx->current_function->locals, binding);
+                    decl = new_stmt(HIR_STMT_VAR_DECL, stmt->line);
+                    decl->as.var_decl.binding = binding;
+                    decl->as.var_decl.init = make_union_field_expr(ctx, value, variant, -1, payload_type, stmt->line);
+                    stmt_list_push(&if_stmt->as.if_stmt.then_block.stmts, decl);
+                }
+            } else if ((value->type->kind == HIR_TYPE_UNION || value->type->kind == HIR_TYPE_OPTIONAL) &&
                 ast_case->pattern->kind == AST_EXPR_VARIANT) {
                 if (!lower_variant_pattern_bind(ctx, value, ast_case->pattern, &if_stmt->as.if_stmt.then_block, &if_stmt->as.if_stmt.cond)) {
                     return 0;
@@ -5258,12 +5637,11 @@ static int resolve_union_variants(LowerContext* ctx) {
             if (!variant.payload_type) {
                 return 0;
             }
-            variant.payload_slots = payload_slot_count(variant.payload_type);
-            if (variant.payload_slots < 0) {
-                return fail(ctx, "unsupported union payload type");
+            if (type_size_bytes(variant.payload_type) > union_decl->payload_size) {
+                union_decl->payload_size = type_size_bytes(variant.payload_type);
             }
-            if (variant.payload_slots > union_decl->payload_slots) {
-                union_decl->payload_slots = variant.payload_slots;
+            if (type_alignment_bytes(variant.payload_type) > union_decl->payload_align) {
+                union_decl->payload_align = type_alignment_bytes(variant.payload_type);
             }
             union_variant_list_push(&union_decl->variants, variant);
         }

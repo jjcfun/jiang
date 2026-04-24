@@ -181,6 +181,7 @@ static void parser_set_error(Parser* parser, const char* error) {
 #define struct_field_list_push(list, field) VEC_PUSH((list), (field))
 #define struct_field_init_list_push(list, field) VEC_PUSH((list), (field))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
+#define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
 #define import_list_push(list, import_decl) VEC_PUSH((list), (import_decl))
 #define alias_list_push(list, alias_decl) VEC_PUSH((list), (alias_decl))
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
@@ -232,6 +233,7 @@ static AstType ast_type_copy_local(const AstType* type) {
     memset(&out.type_args, 0, sizeof(out.type_args));
     memset(&out.tuple_items, 0, sizeof(out.tuple_items));
     out.array_item = 0;
+    out.error_type = 0;
     for (i = 0; i < type->type_args.count; ++i) {
         type_list_push(&out.type_args, ast_type_copy_local(&type->type_args.items[i]));
     }
@@ -240,6 +242,9 @@ static AstType ast_type_copy_local(const AstType* type) {
     }
     if (type->array_item) {
         out.array_item = heap_type_copy(type->array_item);
+    }
+    if (type->error_type) {
+        out.error_type = heap_type_copy(type->error_type);
     }
     return out;
 }
@@ -465,6 +470,16 @@ static const AstStructDecl* find_parsed_struct(const AstProgram* program, const 
     for (i = 0; i < program->structs.count; ++i) {
         if (strcmp(program->structs.items[i].name, name) == 0) {
             return &program->structs.items[i];
+        }
+    }
+    return 0;
+}
+
+static const AstUnionDecl* find_parsed_union(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->unions.count; ++i) {
+        if (strcmp(program->unions.items[i].name, name) == 0) {
+            return &program->unions.items[i];
         }
     }
     return 0;
@@ -821,7 +836,7 @@ static int looks_like_var_decl(Parser* parser) {
 }
 
 static AstType parse_type_postfix(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_AMP || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_AMP || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION || parser->current.kind == TOKEN_AT) {
         if (parser->current.kind == TOKEN_BANG) {
             type.mutable_flag = 1;
             advance(parser);
@@ -853,6 +868,21 @@ static AstType parse_type_postfix(Parser* parser, AstType type) {
                 type.kind = AST_TYPE_OPTIONAL;
                 type.array_item = heap_type_copy(&wrapped);
             }
+            continue;
+        }
+        if (parser->current.kind == TOKEN_AT) {
+            AstType wrapped = type;
+            AstType error_type;
+            advance(parser);
+            if (!is_type_start(parser)) {
+                fail(parser, "expected error type after '@'");
+                return type;
+            }
+            error_type = parse_type(parser);
+            memset(&type, 0, sizeof(type));
+            type.kind = AST_TYPE_ERRORABLE;
+            type.array_item = heap_type_copy(&wrapped);
+            type.error_type = heap_type_copy(&error_type);
             continue;
         }
         if (parser->current.kind == TOKEN_LEFT_BRACKET) {
@@ -907,7 +937,7 @@ static AstType parse_type(Parser* parser) {
         if (parser->current.kind == TOKEN_RIGHT_PAREN) {
             type.kind = AST_TYPE_VOID;
             advance(parser);
-            return type;
+            return parse_type_postfix(parser, type);
         }
         if (!is_type_start(parser)) {
             parser_set_error(parser, "expected tuple item type");
@@ -1039,6 +1069,52 @@ static int type_uses_empty_tuple_void(const AstType* type) {
     return type && type->kind == AST_TYPE_VOID;
 }
 
+static int type_contains_invalid_errorable(const AstType* type, int allow_here) {
+    int i = 0;
+    if (!type) {
+        return 0;
+    }
+    if (type->kind == AST_TYPE_ERRORABLE) {
+        if (!allow_here) {
+            return 1;
+        }
+        return type_contains_invalid_errorable(type->array_item, 0) ||
+               type_contains_invalid_errorable(type->error_type, 0);
+    }
+    if (type->kind == AST_TYPE_NAMED && type->named_name && strcmp(type->named_name, "Fn") == 0) {
+        if (type->type_args.count > 0 && type_contains_invalid_errorable(&type->type_args.items[0], 1)) {
+            return 1;
+        }
+        for (i = 1; i < type->type_args.count; ++i) {
+            if (type_contains_invalid_errorable(&type->type_args.items[i], 0)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (type->array_item && type_contains_invalid_errorable(type->array_item, 0)) {
+        return 1;
+    }
+    if (type->error_type && type_contains_invalid_errorable(type->error_type, 0)) {
+        return 1;
+    }
+    for (i = 0; i < type->tuple_items.count; ++i) {
+        if (type_contains_invalid_errorable(&type->tuple_items.items[i], 0)) {
+            return 1;
+        }
+    }
+    for (i = 0; i < type->type_args.count; ++i) {
+        if (type_contains_invalid_errorable(&type->type_args.items[i], 0)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int type_contains_errorable(const AstType* type) {
+    return type_contains_invalid_errorable(type, 0);
+}
+
 static int looks_like_destructure(Parser* parser) {
     Parser probe = *parser;
     if (probe.current.kind != TOKEN_LEFT_PAREN) {
@@ -1080,9 +1156,6 @@ static int parse_binding_list(Parser* parser, AstParamList* bindings) {
             return fail(parser, "expected binding type");
         }
         binding.type = parse_type(parser);
-        if (type_uses_empty_tuple_void(&binding.type)) {
-            return fail(parser, "only union variants may use '()' type");
-        }
         if (parser->current.kind != TOKEN_IDENT) {
             return fail(parser, "expected binding name");
         }
@@ -1131,10 +1204,6 @@ static AstBindingPattern* parse_binding_pattern(Parser* parser) {
     }
     if (pattern_has_explicit_type(parser)) {
         pattern->type = parse_type(parser);
-        if (type_uses_empty_tuple_void(&pattern->type)) {
-            fail(parser, "only union variants may use '()' type");
-            return 0;
-        }
     } else {
         memset(&pattern->type, 0, sizeof(pattern->type));
         pattern->type.kind = AST_TYPE_INFER;
@@ -1668,8 +1737,9 @@ static AstExpr* parse_primary(Parser* parser) {
     if (token.kind == TOKEN_LEFT_PAREN) {
         advance(parser);
         if (parser->current.kind == TOKEN_RIGHT_PAREN) {
-            fail(parser, "empty tuple literal is only supported in return statements");
-            return 0;
+            AstExpr* tuple = new_expr(AST_EXPR_TUPLE, token.line);
+            advance(parser);
+            return tuple;
         }
         expr = parse_expr(parser);
         if (!expr) {
@@ -2255,6 +2325,19 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
+    if (parser->current.kind == TOKEN_KW_THROW) {
+        stmt = new_stmt(AST_STMT_THROW, parser->current.line);
+        advance(parser);
+        stmt->as.throw_stmt.expr = parse_expr(parser);
+        if (!stmt->as.throw_stmt.expr) {
+            return 0;
+        }
+        if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after throw")) {
+            return 0;
+        }
+        return stmt;
+    }
+
     if (parser->current.kind == TOKEN_KW_BREAK) {
         stmt = new_stmt(AST_STMT_BREAK, parser->current.line);
         advance(parser);
@@ -2350,7 +2433,25 @@ static AstStmt* parse_stmt(Parser* parser) {
             AstSwitchCase switch_case;
             AstStmt* case_stmt = 0;
             memset(&switch_case, 0, sizeof(switch_case));
-            if (parser->current.kind == TOKEN_KW_ELSE) {
+            if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "value")) {
+                switch_case.result_case_kind = 1;
+                advance(parser);
+                if (parser->current.kind != TOKEN_IDENT) {
+                    fail(parser, "expected binding name after 'value'");
+                    return 0;
+                }
+                switch_case.binding_name = token_dup(&parser->current);
+                advance(parser);
+            } else if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "error")) {
+                switch_case.result_case_kind = 2;
+                advance(parser);
+                if (parser->current.kind != TOKEN_IDENT) {
+                    fail(parser, "expected binding name after 'error'");
+                    return 0;
+                }
+                switch_case.binding_name = token_dup(&parser->current);
+                advance(parser);
+            } else if (parser->current.kind == TOKEN_KW_ELSE) {
                 switch_case.is_else = 1;
                 advance(parser);
             } else {
@@ -2363,7 +2464,7 @@ static AstStmt* parse_stmt(Parser* parser) {
                     return 0;
                 }
             }
-            if (!expect(parser, TOKEN_COLON, "expected ':' after switch case")) {
+            if (!expect(parser, TOKEN_COLON, "expected ':' after switch branch")) {
                 return 0;
             }
             if (parser->current.kind == TOKEN_LEFT_BRACE) {
@@ -2381,6 +2482,50 @@ static AstStmt* parse_stmt(Parser* parser) {
         }
         if (!expect(parser, TOKEN_RIGHT_BRACE, "expected '}' after switch")) {
             return 0;
+        }
+        return stmt;
+    }
+
+    if (parser->current.kind == TOKEN_KW_TRY) {
+        stmt = new_stmt(AST_STMT_TRY, parser->current.line);
+        advance(parser);
+        if (!parse_block(parser, &stmt->as.try_stmt.try_body)) {
+            return 0;
+        }
+        if (parser->current.kind != TOKEN_KW_CATCH) {
+            fail(parser, "expected at least one catch after try block");
+            return 0;
+        }
+        while (parser->current.kind == TOKEN_KW_CATCH) {
+            AstTryCatch catch_clause;
+            memset(&catch_clause, 0, sizeof(catch_clause));
+            catch_clause.line = parser->current.line;
+            advance(parser);
+            if (!expect(parser, TOKEN_LEFT_PAREN, "expected '(' after catch")) {
+                return 0;
+            }
+            if (!is_type_start(parser)) {
+                fail(parser, "expected catch error type");
+                return 0;
+            }
+            catch_clause.error_type = parse_type(parser);
+            if (type_contains_errorable(&catch_clause.error_type)) {
+                fail(parser, "catch error type cannot be errorable");
+                return 0;
+            }
+            if (parser->current.kind != TOKEN_IDENT) {
+                fail(parser, "expected catch binding name");
+                return 0;
+            }
+            catch_clause.binding_name = token_dup(&parser->current);
+            advance(parser);
+            if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after catch binding")) {
+                return 0;
+            }
+            if (!parse_block(parser, &catch_clause.body)) {
+                return 0;
+            }
+            try_catch_list_push(&stmt->as.try_stmt.catches, catch_clause);
         }
         return stmt;
     }
@@ -2534,8 +2679,8 @@ static AstStmt* parse_stmt(Parser* parser) {
             return 0;
         }
         stmt->as.for_range.type = parse_type(parser);
-        if (type_uses_empty_tuple_void(&stmt->as.for_range.type)) {
-            fail(parser, "only union variants may use '()' type");
+        if (type_contains_errorable(&stmt->as.for_range.type)) {
+            fail(parser, "errorable type is only allowed in function return types");
             return 0;
         }
         if (parser->current.kind != TOKEN_IDENT) {
@@ -2588,8 +2733,8 @@ static AstStmt* parse_stmt(Parser* parser) {
         AstStmt* group_stmt = 0;
         int decl_count = 0;
         decl_type = parse_type(parser);
-        if (type_uses_empty_tuple_void(&decl_type)) {
-            fail(parser, "only union variants may use '()' type");
+        if (type_contains_errorable(&decl_type)) {
+            fail(parser, "errorable type is only allowed in function return types");
             return 0;
         }
         for (;;) {
@@ -2698,8 +2843,8 @@ static int parse_params(Parser* parser, AstParamList* params) {
             if (param.type.kind == AST_TYPE_INFER) {
                 return fail(parser, "parameter type cannot be inferred");
             }
-            if (type_uses_empty_tuple_void(&param.type)) {
-                return fail(parser, "only union variants may use '()' type");
+            if (type_contains_errorable(&param.type)) {
+                return fail(parser, "errorable type is only allowed in function return types");
             }
             if (parser->current.kind != TOKEN_IDENT) {
                 return fail(parser, "expected parameter name");
@@ -2930,7 +3075,9 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
     }
     if (leading_where_constraints && leading_where_constraints->count != 0) {
         const AstStructDecl* owner_struct = find_parsed_struct(out_program, owner_name);
-        if (!owner_struct || owner_struct->type_params.count == 0) {
+        const AstUnionDecl* owner_union = find_parsed_union(out_program, owner_name);
+        if ((!owner_struct || owner_struct->type_params.count == 0) &&
+            (!owner_union || owner_union->type_params.count == 0)) {
             return fail(parser, "@where(...) requires generic parameters");
         }
     }
@@ -3090,9 +3237,6 @@ static int parse_extern_item(Parser* parser, AstProgram* out_program, int inheri
         }
         function_list_push(&out_program->functions, fn);
         return 1;
-    }
-    if (type_uses_empty_tuple_void(&type)) {
-        return fail(parser, "only union variants may use '()' type");
     }
     if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after extern global declaration")) {
         return 0;
@@ -3376,8 +3520,8 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             return fail(parser, record_flag ? "expected record field type" : "expected struct field type");
         }
         field_type = parse_type(parser);
-        if (type_uses_empty_tuple_void(&field_type)) {
-            return fail(parser, "only union variants may use '()' type");
+        if (type_contains_errorable(&field_type)) {
+            return fail(parser, "errorable type is only allowed in function return types");
         }
         for (;;) {
             AstStructField field;
@@ -3413,9 +3557,13 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
     return 1;
 }
 
-static int parse_union_decl(Parser* parser, AstProgram* out_program) {
+static int parse_union_decl(Parser* parser, AstProgram* out_program, AstNameList* generic_params) {
     AstUnionDecl union_decl;
     memset(&union_decl, 0, sizeof(union_decl));
+    if (generic_params) {
+        union_decl.type_params = *generic_params;
+        memset(generic_params, 0, sizeof(*generic_params));
+    }
     advance(parser);
     if (parser->current.kind == TOKEN_LEFT_PAREN) {
         advance(parser);
@@ -3435,6 +3583,14 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program) {
     union_decl.line = parser->current.line;
     register_known_type(parser, union_decl.name);
     advance(parser);
+    if (parser->current.kind == TOKEN_LT) {
+        if (union_decl.type_params.count != 0) {
+            return fail(parser, "duplicate generic parameter list");
+        }
+        if (!parse_named_generic_params(parser, &union_decl.type_params)) {
+            return 0;
+        }
+    }
     if (!parse_decl_concept_names(parser, &union_decl.concept_names)) {
         return 0;
     }
@@ -3610,14 +3766,13 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             continue;
         }
         if (parser->current.kind == TOKEN_KW_UNION) {
-            if (where_constraints.count != 0) {
-                return fail(parser, "@where(...) requires a generic function or struct");
-            }
-            if (generic_params.count != 0) {
-                return fail(parser, "generic union is not supported");
-            }
-            if (!parse_union_decl(parser, out_program)) {
+            if (!parse_union_decl(parser, out_program, &generic_params)) {
                 return 0;
+            }
+            out_program->unions.items[out_program->unions.count - 1].where_constraints = where_constraints;
+            if (where_constraints.count != 0 &&
+                out_program->unions.items[out_program->unions.count - 1].type_params.count == 0) {
+                return fail(parser, "@where(...) requires generic parameters");
             }
             out_program->unions.items[out_program->unions.count - 1].public_flag = public_flag;
             continue;
@@ -3722,8 +3877,8 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
             if (generic_params.count != 0) {
                 return fail(parser, "generic global is not supported");
             }
-            if (type_uses_empty_tuple_void(&type)) {
-                return fail(parser, "only union variants may use '()' type");
+            if (type_contains_errorable(&type)) {
+                return fail(parser, "errorable type is only allowed in function return types");
             }
             AstGlobal global;
             memset(&global, 0, sizeof(global));

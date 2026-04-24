@@ -14,6 +14,8 @@
 #define jir_type_list_push(list, type) VEC_PUSH((list), (type))
 #define jir_binding_list_push(list, binding) VEC_PUSH((list), (binding))
 #define jir_struct_field_decl_list_push(list, field) VEC_PUSH((list), (field))
+#define jir_try_handler_list_push(list, handler) VEC_PUSH((list), (handler))
+#define jir_try_scope_list_push(list, scope) VEC_PUSH((list), (scope))
 
 typedef struct JirTypeMapEntry {
     const HirType* hir;
@@ -53,6 +55,7 @@ typedef struct LowerJirContext {
     JirProgram* jir_program;
     JirLoweredFunction* function;
     int next_block_id;
+    int active_try_scope;
     JirLoopTargetList loops;
     const char** error;
     int* error_line;
@@ -74,6 +77,68 @@ static char* dup_text(const char* text) {
 
 static JirTypeMapEntryList g_type_map;
 static JirBindingMapEntryList g_binding_map;
+
+static int hir_is_errorable_type(const HirType* type) {
+    return type && type->kind == HIR_TYPE_UNION && type->union_decl && type->union_decl->errorable_flag;
+}
+
+static int hir_type_equivalent(const HirType* left, const HirType* right) {
+    int i = 0;
+    if (left == right) {
+        return 1;
+    }
+    if (!left || !right) {
+        return 0;
+    }
+    if (left->kind != right->kind || left->mutable_flag != right->mutable_flag || left->array_length != right->array_length) {
+        return 0;
+    }
+    switch (left->kind) {
+        case HIR_TYPE_ENUM:
+            return left->enum_decl == right->enum_decl;
+        case HIR_TYPE_STRUCT:
+            return left->struct_decl == right->struct_decl;
+        case HIR_TYPE_UNION:
+            return left->union_decl == right->union_decl;
+        case HIR_TYPE_SLICE:
+        case HIR_TYPE_REFERENCE:
+        case HIR_TYPE_POINTER:
+        case HIR_TYPE_MANY_POINTER:
+        case HIR_TYPE_OPTIONAL:
+        case HIR_TYPE_ARRAY:
+            return hir_type_equivalent(left->array_item, right->array_item);
+        case HIR_TYPE_FUNCTION:
+            if (!hir_type_equivalent(left->return_type, right->return_type) ||
+                left->tuple_items.count != right->tuple_items.count) {
+                return 0;
+            }
+            for (i = 0; i < left->tuple_items.count; ++i) {
+                if (!hir_type_equivalent(left->tuple_items.items[i], right->tuple_items.items[i])) {
+                    return 0;
+                }
+            }
+            return 1;
+        case HIR_TYPE_TUPLE:
+            if (left->tuple_items.count != right->tuple_items.count) {
+                return 0;
+            }
+            for (i = 0; i < left->tuple_items.count; ++i) {
+                if (!hir_type_equivalent(left->tuple_items.items[i], right->tuple_items.items[i])) {
+                    return 0;
+                }
+            }
+            return 1;
+        default:
+            return 1;
+    }
+}
+
+static const HirType* hir_errorable_error_type(const HirType* type) {
+    if (!hir_is_errorable_type(type) || type->union_decl->variants.count < 2) {
+        return 0;
+    }
+    return type->union_decl->variants.items[1].payload_type;
+}
 
 static JirTypeKind jir_type_kind(HirTypeKind kind) {
     return (JirTypeKind)kind;
@@ -103,6 +168,7 @@ static JirExprKind jir_expr_kind(HirExprKind kind) {
         case HIR_EXPR_COALESCE: return JIR_EXPR_COALESCE;
         case HIR_EXPR_TERNARY: return JIR_EXPR_TERNARY;
         case HIR_EXPR_CALL: return JIR_EXPR_CALL;
+        case HIR_EXPR_PROPAGATE: return JIR_EXPR_PROPAGATE;
         case HIR_EXPR_ENUM_MEMBER: return JIR_EXPR_ENUM_MEMBER;
         case HIR_EXPR_VARIANT: return JIR_EXPR_VARIANT;
         case HIR_EXPR_ENUM_VALUE: return JIR_EXPR_ENUM_VALUE;
@@ -131,7 +197,7 @@ static JirBuiltinKind jir_builtin_kind(HirBuiltinKind kind) {
 static JirType* find_lowered_type(const HirType* hir_type) {
     int i = 0;
     for (i = 0; i < g_type_map.count; ++i) {
-        if (g_type_map.items[i].hir == hir_type) {
+        if (hir_type_equivalent(g_type_map.items[i].hir, hir_type)) {
             return g_type_map.items[i].jir;
         }
     }
@@ -173,7 +239,8 @@ static JirType* lower_type(const HirType* hir_type, const char** error) {
         }
     }
     if (hir_type->union_decl) {
-        jir_type->union_payload_slots = hir_type->union_decl->payload_slots;
+        jir_type->union_payload_size = hir_type->union_decl->payload_size;
+        jir_type->union_payload_align = hir_type->union_decl->payload_align;
     }
     {
         JirTypeMapEntry entry;
@@ -247,8 +314,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
 static JirExpr* desugar_expr(JirExpr* expr);
 static JirExpr* desugar_lvalue_expr(JirExpr* expr);
 static JirExpr* make_int_expr(int64_t value, JirType* type, int line);
-static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, int line);
-static int append_union_payload_item(JirExprList* list, JirExpr* item);
+static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, JirType* payload_type, int line);
 
 static JirExpr* new_expr(JirExprKind kind, JirType* type, int line) {
     JirExpr* expr = (JirExpr*)calloc(1, sizeof(JirExpr));
@@ -261,7 +327,7 @@ static JirExpr* new_expr(JirExprKind kind, JirType* type, int line) {
     return expr;
 }
 
-static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, int line) {
+static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, JirType* payload_type, int line) {
     JirExpr* expr = new_expr(JIR_EXPR_EXTRACT, type, line);
     if (!expr) {
         return 0;
@@ -269,15 +335,8 @@ static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_
     expr->as.extract.kind = kind;
     expr->as.extract.base = base;
     expr->as.extract.field_index = field_index;
+    expr->as.extract.payload_type = payload_type;
     return expr;
-}
-
-static int append_union_payload_item(JirExprList* list, JirExpr* item) {
-    if (!item) {
-        return 0;
-    }
-    jir_expr_list_push(list, item);
-    return 1;
 }
 
 static void sort_struct_fields(JirStructFieldInitList* fields) {
@@ -347,6 +406,9 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         case JIR_EXPR_OPTIONAL_SOME:
             expr->as.unary.value = desugar_expr(expr->as.unary.value);
             return expr->as.unary.value ? expr : 0;
+        case JIR_EXPR_PROPAGATE:
+            expr->as.propagate.value = desugar_expr(expr->as.propagate.value);
+            return expr->as.propagate.value ? expr : 0;
         case JIR_EXPR_BINARY:
             expr->as.binary.left = desugar_expr(expr->as.binary.left);
             expr->as.binary.right = desugar_expr(expr->as.binary.right);
@@ -396,24 +458,17 @@ static JirExpr* desugar_expr(JirExpr* expr) {
                     return 0;
                 }
                 packed->as.union_pack.tag_value = expr->as.variant.tag_value;
-                if (!expr->as.variant.payload) {
-                    return packed;
-                }
-                if (expr->as.variant.payload->kind == JIR_EXPR_TUPLE) {
-                    for (i = 0; i < expr->as.variant.payload->as.tuple.items.count; ++i) {
-                        if (!append_union_payload_item(&packed->as.union_pack.payload_items, expr->as.variant.payload->as.tuple.items.items[i])) {
-                            return 0;
-                        }
-                    }
-                    return packed;
-                }
-                if (!append_union_payload_item(&packed->as.union_pack.payload_items, expr->as.variant.payload)) {
-                    return 0;
-                }
+                packed->as.union_pack.payload = expr->as.variant.payload;
                 return packed;
             }
         case JIR_EXPR_UNION_PACK:
-            return desugar_expr_list(&expr->as.union_pack.payload_items) ? expr : 0;
+            if (expr->as.union_pack.payload) {
+                expr->as.union_pack.payload = desugar_expr(expr->as.union_pack.payload);
+                if (!expr->as.union_pack.payload) {
+                    return 0;
+                }
+            }
+            return expr;
         case JIR_EXPR_EXTRACT:
             expr->as.extract.base = desugar_expr(expr->as.extract.base);
             if (!expr->as.extract.base) {
@@ -431,19 +486,26 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             if (expr->as.union_tag.value->kind == JIR_EXPR_UNION_PACK) {
                 return make_int_expr(expr->as.union_tag.value->as.union_pack.tag_value, expr->type, expr->line);
             }
-            return make_extract_expr(JIR_EXTRACT_UNION_TAG, expr->as.union_tag.value, 0, expr->type, expr->line);
+            return make_extract_expr(JIR_EXTRACT_UNION_TAG, expr->as.union_tag.value, 0, expr->type, 0, expr->line);
         case JIR_EXPR_UNION_FIELD:
             expr->as.union_field.value = desugar_expr(expr->as.union_field.value);
             if (!expr->as.union_field.value) {
                 return 0;
             }
             if (expr->as.union_field.value->kind == JIR_EXPR_UNION_PACK) {
-                if (expr->as.union_field.field_index < 0 || expr->as.union_field.field_index >= expr->as.union_field.value->as.union_pack.payload_items.count) {
+                JirExpr* payload = expr->as.union_field.value->as.union_pack.payload;
+                if (expr->as.union_field.field_index < 0) {
+                    return payload;
+                }
+                if (!payload || payload->kind != JIR_EXPR_TUPLE) {
                     return 0;
                 }
-                return expr->as.union_field.value->as.union_pack.payload_items.items[expr->as.union_field.field_index];
+                if (expr->as.union_field.field_index >= payload->as.tuple.items.count) {
+                    return 0;
+                }
+                return payload->as.tuple.items.items[expr->as.union_field.field_index];
             }
-            return make_extract_expr(JIR_EXTRACT_UNION_PAYLOAD, expr->as.union_field.value, expr->as.union_field.field_index, expr->type, expr->line);
+            return make_extract_expr(JIR_EXTRACT_UNION_PAYLOAD, expr->as.union_field.value, expr->as.union_field.field_index, expr->type, expr->as.union_field.payload_type, expr->line);
         case JIR_EXPR_OPTIONAL_VALUE:
             expr->as.optional_value.value = desugar_expr(expr->as.optional_value.value);
             if (!expr->as.optional_value.value) {
@@ -452,7 +514,7 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             if (expr->as.optional_value.value->kind == JIR_EXPR_OPTIONAL_SOME) {
                 return expr->as.optional_value.value->as.unary.value;
             }
-            return make_extract_expr(JIR_EXTRACT_OPTIONAL_VALUE, expr->as.optional_value.value, 0, expr->type, expr->line);
+            return make_extract_expr(JIR_EXTRACT_OPTIONAL_VALUE, expr->as.optional_value.value, 0, expr->type, 0, expr->line);
         case JIR_EXPR_STRUCT:
             for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
                 expr->as.struct_lit.fields.items[i].value = desugar_expr(expr->as.struct_lit.fields.items[i].value);
@@ -478,7 +540,7 @@ static JirExpr* desugar_expr(JirExpr* expr) {
                 }
                 return 0;
             }
-            return make_extract_expr(JIR_EXTRACT_STRUCT_FIELD, expr->as.struct_field.base, expr->as.struct_field.field_index, expr->type, expr->line);
+            return make_extract_expr(JIR_EXTRACT_STRUCT_FIELD, expr->as.struct_field.base, expr->as.struct_field.field_index, expr->type, 0, expr->line);
         case JIR_EXPR_TUPLE:
             return desugar_expr_list(&expr->as.tuple.items) ? expr : 0;
         case JIR_EXPR_ARRAY:
@@ -504,10 +566,10 @@ static JirExpr* desugar_expr(JirExpr* expr) {
                     return expr->as.index.base->as.array.items.items[index];
                 }
                 if (expr->as.index.base->type->kind == JIR_TYPE_TUPLE) {
-                    return make_extract_expr(JIR_EXTRACT_TUPLE_ITEM, expr->as.index.base, index, expr->type, expr->line);
+                    return make_extract_expr(JIR_EXTRACT_TUPLE_ITEM, expr->as.index.base, index, expr->type, 0, expr->line);
                 }
                 if (expr->as.index.base->type->kind == JIR_TYPE_ARRAY) {
-                    return make_extract_expr(JIR_EXTRACT_ARRAY_ITEM, expr->as.index.base, index, expr->type, expr->line);
+                    return make_extract_expr(JIR_EXTRACT_ARRAY_ITEM, expr->as.index.base, index, expr->type, 0, expr->line);
                 }
             }
             return expr;
@@ -656,6 +718,16 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_FREE:
             out->as.unary.value = lower_expr(program, expr->as.unary.value, error, error_line);
             return out->as.unary.value ? out : 0;
+        case HIR_EXPR_PROPAGATE:
+            out->as.propagate.value = lower_expr(program, expr->as.propagate.value, error, error_line);
+            out->as.propagate.error_type = lower_type(hir_errorable_error_type(expr->as.propagate.value->type), error);
+            out->as.propagate.result_type = expr->as.propagate.result_type
+                ? lower_type(expr->as.propagate.result_type, error)
+                : 0;
+            return out->as.propagate.value && out->as.propagate.error_type &&
+                       (!expr->as.propagate.result_type || out->as.propagate.result_type)
+                ? out
+                : 0;
         case HIR_EXPR_BINARY:
             out->as.binary.op = jir_binary_op(expr->as.binary.op);
             out->as.binary.left = lower_expr(program, expr->as.binary.left, error, error_line);
@@ -698,6 +770,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_UNION_FIELD:
             out->as.union_field.value = lower_expr(program, expr->as.union_field.value, error, error_line);
             out->as.union_field.field_index = expr->as.union_field.field_index;
+            out->as.union_field.payload_type = lower_type(expr->as.union_field.variant->payload_type, error);
             return out->as.union_field.value ? out : 0;
         case HIR_EXPR_OPTIONAL_VALUE:
             out->as.optional_value.value = lower_expr(program, expr->as.optional_value.value, error, error_line);
@@ -786,8 +859,16 @@ static int append_block(LowerJirContext* ctx, const char* prefix) {
         return -1;
     }
     block.term.kind = JIR_TERM_FALLTHROUGH;
+    block.active_try_scope = ctx->active_try_scope;
     jir_block_list_push(&ctx->function->blocks, block);
     return ctx->function->blocks.count - 1;
+}
+
+static int append_try_scope(LowerJirContext* ctx) {
+    JirTryScope scope;
+    memset(&scope, 0, sizeof(scope));
+    jir_try_scope_list_push(&ctx->function->try_scopes, scope);
+    return ctx->function->try_scopes.count - 1;
 }
 
 static void set_block_ref(JirBasicBlockRef* ref, JirLoweredFunction* function, int index) {
@@ -869,6 +950,70 @@ static int lower_if_stmt(LowerJirContext* ctx, const HirStmt* stmt, int block_in
         if (!block_is_terminated(&ctx->function->blocks.items[else_index])) {
             ctx->function->blocks.items[else_index].term.kind = JIR_TERM_BRANCH;
             set_block_ref(&ctx->function->blocks.items[else_index].term.then_target, ctx->function, merge_index);
+        }
+    }
+    *next_index = merge_index;
+    return 1;
+}
+
+static int lower_try_stmt(LowerJirContext* ctx, const HirStmt* stmt, int block_index, int* next_index) {
+    int previous_scope = ctx->active_try_scope;
+    int try_scope_index = 0;
+    int try_body_index = -1;
+    int merge_index = -1;
+    int i = 0;
+    int try_end_index = -1;
+
+    ctx->active_try_scope = previous_scope;
+    merge_index = append_block(ctx, "try.end.");
+    if (merge_index < 0) {
+        return 0;
+    }
+    try_scope_index = append_try_scope(ctx);
+    if (try_scope_index < 0) {
+        return 0;
+    }
+    for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+        int catch_index = append_block(ctx, "try.catch.");
+        JirTryHandler handler;
+        if (catch_index < 0) {
+            return 0;
+        }
+        memset(&handler, 0, sizeof(handler));
+        handler.error_type = lower_type(stmt->as.try_stmt.catches.items[i].error_type, ctx->error);
+        handler.binding = lower_binding(stmt->as.try_stmt.catches.items[i].binding, ctx->error);
+        if (!handler.error_type || !handler.binding) {
+            return 0;
+        }
+        set_block_ref(&handler.catch_target, ctx->function, catch_index);
+        jir_try_handler_list_push(&ctx->function->try_scopes.items[try_scope_index].handlers, handler);
+    }
+
+    ctx->active_try_scope = try_scope_index;
+    try_body_index = append_block(ctx, "try.body.");
+    if (try_body_index < 0) {
+        return 0;
+    }
+    ctx->function->blocks.items[block_index].term.kind = JIR_TERM_BRANCH;
+    set_block_ref(&ctx->function->blocks.items[block_index].term.then_target, ctx->function, try_body_index);
+    if (!lower_hir_block(ctx, &stmt->as.try_stmt.try_body, try_body_index, &try_end_index)) {
+        return 0;
+    }
+    if (!block_is_terminated(&ctx->function->blocks.items[try_end_index])) {
+        ctx->function->blocks.items[try_end_index].term.kind = JIR_TERM_BRANCH;
+        set_block_ref(&ctx->function->blocks.items[try_end_index].term.then_target, ctx->function, merge_index);
+    }
+
+    ctx->active_try_scope = previous_scope;
+    for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+        int catch_index = ctx->function->try_scopes.items[try_scope_index].handlers.items[i].catch_target.index;
+        int catch_end_index = catch_index;
+        if (!lower_hir_block(ctx, &stmt->as.try_stmt.catches.items[i].body, catch_index, &catch_end_index)) {
+            return 0;
+        }
+        if (!block_is_terminated(&ctx->function->blocks.items[catch_end_index])) {
+            ctx->function->blocks.items[catch_end_index].term.kind = JIR_TERM_BRANCH;
+            set_block_ref(&ctx->function->blocks.items[catch_end_index].term.then_target, ctx->function, merge_index);
         }
     }
     *next_index = merge_index;
@@ -1004,6 +1149,11 @@ static int lower_hir_block(LowerJirContext* ctx, const HirBlock* hir_block, int 
                     return 0;
                 }
                 break;
+            case HIR_STMT_TRY:
+                if (!lower_try_stmt(ctx, stmt, current_index, &current_index)) {
+                    return 0;
+                }
+                break;
             case HIR_STMT_WHILE:
                 if (!lower_while_stmt(ctx, stmt, current_index, &current_index)) {
                     return 0;
@@ -1043,6 +1193,13 @@ static int lower_hir_block(LowerJirContext* ctx, const HirBlock* hir_block, int 
                     return 0;
                 }
                 break;
+            case HIR_STMT_THROW:
+                block->term.kind = JIR_TERM_THROW;
+                block->term.value = stmt->as.throw_stmt.expr ? lower_expr(ctx->jir_program, stmt->as.throw_stmt.expr, ctx->error, ctx->error_line) : 0;
+                if (!block->term.value) {
+                    return 0;
+                }
+                break;
             default:
                 if (!append_simple_inst(ctx->jir_program, block, stmt, ctx->error, ctx->error_line)) {
                     return 0;
@@ -1070,6 +1227,7 @@ static int lower_function_skeleton(const HirProgram* hir_program, JirProgram* ji
     ctx.error_line = error_line;
     ctx.program = hir_program;
     ctx.jir_program = jir_program;
+    ctx.active_try_scope = -1;
     entry_index = append_block(&ctx, "entry.");
     if (entry_index < 0) {
         return 0;

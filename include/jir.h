@@ -66,6 +66,7 @@ typedef enum JirExprKind {
     JIR_EXPR_COALESCE,
     JIR_EXPR_TERNARY,
     JIR_EXPR_CALL,
+    JIR_EXPR_PROPAGATE,
     JIR_EXPR_STRUCT_INIT,
     JIR_EXPR_ENUM_MEMBER,
     JIR_EXPR_VARIANT,
@@ -147,7 +148,8 @@ struct JirType {
     JirStructFieldDeclList struct_fields;
     int struct_has_deinit;
     char* struct_deinit_name;
-    int union_payload_slots;
+    int64_t union_payload_size;
+    int64_t union_payload_align;
 };
 
 struct JirBinding {
@@ -220,6 +222,11 @@ struct JirExpr {
             JirExprList args;
         } call;
         struct {
+            JirExpr* value;
+            JirType* error_type;
+            JirType* result_type;
+        } propagate;
+        struct {
             JirFunction* init;
             JirExprList args;
         } struct_init;
@@ -232,12 +239,13 @@ struct JirExpr {
         } variant;
         struct {
             int tag_value;
-            JirExprList payload_items;
+            JirExpr* payload;
         } union_pack;
         struct {
             JirExtractKind kind;
             JirExpr* base;
             int field_index;
+            JirType* payload_type;
         } extract;
         struct {
             JirExpr* value;
@@ -248,6 +256,7 @@ struct JirExpr {
         struct {
             JirExpr* value;
             int field_index;
+            JirType* payload_type;
         } union_field;
         struct {
             JirExpr* value;
@@ -323,6 +332,7 @@ typedef enum JirInstKind {
 typedef enum JirTermKind {
     JIR_TERM_FALLTHROUGH = 0,
     JIR_TERM_RETURN,
+    JIR_TERM_THROW,
     JIR_TERM_BRANCH,
     JIR_TERM_COND_BRANCH,
 } JirTermKind;
@@ -347,6 +357,28 @@ typedef struct JirBasicBlockRef {
     char* name;
 } JirBasicBlockRef;
 
+typedef struct JirTryHandler {
+    JirType* error_type;
+    JirBinding* binding;
+    JirBasicBlockRef catch_target;
+} JirTryHandler;
+
+typedef struct JirTryHandlerList {
+    JirTryHandler* items;
+    int count;
+    int capacity;
+} JirTryHandlerList;
+
+typedef struct JirTryScope {
+    JirTryHandlerList handlers;
+} JirTryScope;
+
+typedef struct JirTryScopeList {
+    JirTryScope* items;
+    int count;
+    int capacity;
+} JirTryScopeList;
+
 typedef struct JirTerminator {
     JirTermKind kind;
     JirExpr* value;
@@ -359,6 +391,7 @@ typedef struct JirBasicBlock {
     char* name;
     JirInstList insts;
     JirTerminator term;
+    int active_try_scope;
 } JirBasicBlock;
 
 typedef struct JirBasicBlockList {
@@ -371,6 +404,7 @@ typedef struct JirLoweredFunction {
     char* name;
     JirFunction* function;
     JirBasicBlockList blocks;
+    JirTryScopeList try_scopes;
 } JirLoweredFunction;
 
 typedef struct JirLoweredFunctionList {

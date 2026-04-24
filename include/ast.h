@@ -11,6 +11,7 @@ typedef struct AstExpr AstExpr;
 typedef struct AstStmt AstStmt;
 typedef struct AstBindingPattern AstBindingPattern;
 typedef struct AstSwitchCase AstSwitchCase;
+typedef struct AstTryCatch AstTryCatch;
 typedef struct AstBlock AstBlock;
 typedef struct AstStructField AstStructField;
 typedef struct AstStructDecl AstStructDecl;
@@ -98,6 +99,7 @@ typedef enum AstTypeKind {
     AST_TYPE_MANY_POINTER,
     AST_TYPE_ARRAY,
     AST_TYPE_OPTIONAL,
+    AST_TYPE_ERRORABLE,
 } AstTypeKind;
 
 struct AstType {
@@ -107,6 +109,7 @@ struct AstType {
     AstTypeList type_args;
     char* named_name;
     AstType* array_item;
+    AstType* error_type;
     int array_length;
 };
 
@@ -330,8 +333,10 @@ struct AstBlock {
 
 struct AstSwitchCase {
     AstExpr* pattern;
+    char* binding_name;
     AstBlock body;
     int is_else;
+    int result_case_kind;
 };
 
 typedef struct AstSwitchCaseList {
@@ -339,6 +344,19 @@ typedef struct AstSwitchCaseList {
     int count;
     int capacity;
 } AstSwitchCaseList;
+
+struct AstTryCatch {
+    AstType error_type;
+    char* binding_name;
+    AstBlock body;
+    int line;
+};
+
+typedef struct AstTryCatchList {
+    AstTryCatch* items;
+    int count;
+    int capacity;
+} AstTryCatchList;
 
 struct AstParam {
     AstType type;
@@ -429,12 +447,14 @@ typedef enum AstStmtKind {
     AST_STMT_ASSIGN,
     AST_STMT_IF,
     AST_STMT_SWITCH,
+    AST_STMT_TRY,
     AST_STMT_WHILE,
     AST_STMT_FOR_RANGE,
     AST_STMT_FOR_EACH,
     AST_STMT_BREAK,
     AST_STMT_CONTINUE,
     AST_STMT_DEFER,
+    AST_STMT_THROW,
     AST_STMT_EXPR,
     AST_STMT_DESTRUCTURE,
 } AstStmtKind;
@@ -446,6 +466,9 @@ struct AstStmt {
         struct {
             AstExpr* expr;
         } ret;
+        struct {
+            AstExpr* expr;
+        } throw_stmt;
         struct {
             AstType type;
             char* name;
@@ -466,6 +489,10 @@ struct AstStmt {
             AstExpr* value;
             AstSwitchCaseList cases;
         } switch_stmt;
+        struct {
+            AstBlock try_body;
+            AstTryCatchList catches;
+        } try_stmt;
         struct {
             AstExpr* cond;
             AstBlock body;
@@ -565,6 +592,8 @@ typedef struct AstUnionVariantList {
 struct AstUnionDecl {
     char* tag_name;
     char* name;
+    AstNameList type_params;
+    AstWhereConstraintList where_constraints;
     AstNameList concept_names;
     AstAssocTypeBindingList assoc_type_bindings;
     AstUnionVariantList variants;

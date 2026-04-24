@@ -93,8 +93,11 @@ typedef struct BindingAlloca {
     LLVMValueRef alloca_value;
 } BindingAlloca;
 
+typedef struct JirBlockMapEntry JirBlockMapEntry;
+
 typedef struct FunctionCodegen {
     const JirProgram* program;
+    const JirLoweredFunction* lowered;
     LLVMModuleRef module;
     LLVMContextRef context;
     LLVMBuilderRef builder;
@@ -104,14 +107,50 @@ typedef struct FunctionCodegen {
     BindingAlloca* allocas;
     int alloca_count;
     int alloca_capacity;
+    int current_block_index;
+    JirBlockMapEntry* block_map;
 } FunctionCodegen;
 
-typedef struct JirBlockMapEntry {
+struct JirBlockMapEntry {
     const char* name;
     LLVMBasicBlockRef block;
-} JirBlockMapEntry;
+};
 
 static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type);
+static LLVMValueRef find_alloca(FunctionCodegen* cg, const JirBinding* binding);
+
+static const JirTryHandler* active_try_handler(FunctionCodegen* cg, const JirType* error_type) {
+    int i = 0;
+    int scope_index = -1;
+    if (!cg->lowered || cg->current_block_index < 0) {
+        return 0;
+    }
+    scope_index = cg->lowered->blocks.items[cg->current_block_index].active_try_scope;
+    if (scope_index < 0 || scope_index >= cg->lowered->try_scopes.count) {
+        return 0;
+    }
+    for (i = 0; i < cg->lowered->try_scopes.items[scope_index].handlers.count; ++i) {
+        if (cg->lowered->try_scopes.items[scope_index].handlers.items[i].error_type == error_type) {
+            return &cg->lowered->try_scopes.items[scope_index].handlers.items[i];
+        }
+    }
+    return 0;
+}
+
+static int branch_to_try_handler(FunctionCodegen* cg, const JirType* error_type, LLVMValueRef error_value) {
+    const JirTryHandler* handler = active_try_handler(cg, error_type);
+    LLVMValueRef slot = 0;
+    if (!handler) {
+        return 0;
+    }
+    slot = find_alloca(cg, handler->binding);
+    if (!slot) {
+        return 0;
+    }
+    LLVMBuildStore(cg->builder, error_value, slot);
+    LLVMBuildBr(cg->builder, cg->block_map[handler->catch_target.index].block);
+    return 1;
+}
 
 static int jir_type_is_float_like(JirTypeKind kind) {
     return kind == JIR_TYPE_F16 ||
@@ -190,7 +229,7 @@ static LLVMTypeRef llvm_struct_type(LLVMContextRef context, const JirType* type)
 }
 
 static LLVMTypeRef llvm_union_payload_type(LLVMContextRef context, const JirType* type) {
-    return LLVMArrayType(LLVMInt64TypeInContext(context), (unsigned)type->union_payload_slots);
+    return LLVMArrayType(LLVMInt8TypeInContext(context), (unsigned)type->union_payload_size);
 }
 
 static LLVMTypeRef llvm_union_type(LLVMContextRef context, const JirType* type) {
@@ -198,6 +237,10 @@ static LLVMTypeRef llvm_union_type(LLVMContextRef context, const JirType* type) 
     fields[0] = LLVMInt64TypeInContext(context);
     fields[1] = llvm_union_payload_type(context, type);
     return LLVMStructTypeInContext(context, fields, 2, 0);
+}
+
+static LLVMValueRef llvm_union_payload_size_value(LLVMContextRef context, const JirType* type) {
+    return LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)type->union_payload_size, 0);
 }
 
 static LLVMTypeRef llvm_slice_type(LLVMContextRef context, const JirType* type) {
@@ -261,7 +304,7 @@ static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
         case JIR_TYPE_BOOL:
             return LLVMInt1TypeInContext(context);
         case JIR_TYPE_VOID:
-            return LLVMVoidTypeInContext(context);
+            return LLVMStructTypeInContext(context, 0, 0, 0);
         case JIR_TYPE_SLICE:
             return llvm_slice_type(context, type);
         case JIR_TYPE_REFERENCE:
@@ -373,45 +416,12 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
         return value;
     }
     if (expr->kind == JIR_EXPR_UNION_PACK) {
-        LLVMTypeRef payload_type = llvm_union_payload_type(context, expr->type);
-        LLVMValueRef* payload_items = 0;
-        LLVMValueRef payload_array = 0;
         LLVMValueRef fields[2];
-        unsigned payload_len = (unsigned)expr->type->union_payload_slots;
-        if (payload_len > 0) {
-            payload_items = (LLVMValueRef*)malloc((size_t)payload_len * sizeof(LLVMValueRef));
-            for (i = 0; i < (int)payload_len; ++i) {
-                payload_items[i] = LLVMConstInt(LLVMInt64TypeInContext(context), 0, 0);
-            }
-        }
-        for (i = 0; i < expr->as.union_pack.payload_items.count; ++i) {
-            LLVMValueRef item = llvm_const_expr(context, expr->as.union_pack.payload_items.items[i]);
-            if (expr->as.union_pack.payload_items.items[i]->type->kind == JIR_TYPE_BOOL) {
-                        item = LLVMConstInt(LLVMInt64TypeInContext(context), LLVMConstIntGetZExtValue(item), 0);
-            }
-            payload_items[i] = item;
-        }
-        payload_array = payload_len == 0 ? LLVMConstNull(payload_type) : LLVMConstArray(LLVMInt64TypeInContext(context), payload_items, payload_len);
-        free(payload_items);
         fields[0] = LLVMConstInt(LLVMInt64TypeInContext(context), (unsigned long long)expr->as.union_pack.tag_value, 0);
-        fields[1] = payload_array;
+        fields[1] = LLVMConstNull(llvm_union_payload_type(context, expr->type));
         return LLVMConstStructInContext(context, fields, 2, 0);
     }
     return LLVMConstNull(llvm_type(context, expr->type));
-}
-
-static LLVMValueRef extend_union_payload_value(LLVMBuilderRef builder, LLVMContextRef context, LLVMValueRef value, const JirType* type) {
-    if (type->kind == JIR_TYPE_BOOL) {
-        return LLVMBuildZExt(builder, value, LLVMInt64TypeInContext(context), "union.zext");
-    }
-    return value;
-}
-
-static LLVMValueRef narrow_union_payload_value(LLVMBuilderRef builder, LLVMContextRef context, LLVMValueRef value, const JirType* type) {
-    if (type->kind == JIR_TYPE_BOOL) {
-        return LLVMBuildTrunc(builder, value, LLVMInt1TypeInContext(context), "union.trunc");
-    }
-    return value;
 }
 
 static LLVMValueRef llvm_function_for(const JirProgram* program, LLVMModuleRef module, const JirFunction* function) {
@@ -456,6 +466,68 @@ static LLVMValueRef find_alloca(FunctionCodegen* cg, const JirBinding* binding) 
 
 static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr);
 static LLVMValueRef emit_lvalue_ptr(FunctionCodegen* cg, const JirExpr* expr);
+static int emit_expr_into_ptr(FunctionCodegen* cg, const JirExpr* expr, LLVMValueRef dst_ptr);
+
+static LLVMValueRef build_entry_alloca(FunctionCodegen* cg, LLVMTypeRef type, const char* name) {
+    return LLVMBuildAlloca(cg->entry_builder, type, name);
+}
+
+static LLVMValueRef build_local_alloca(FunctionCodegen* cg, LLVMTypeRef type, const char* name) {
+    return LLVMBuildAlloca(cg->builder, type, name);
+}
+
+static LLVMValueRef union_payload_field_ptr(FunctionCodegen* cg, LLVMValueRef union_ptr, const JirType* union_type, const char* name) {
+    LLVMValueRef indices[2];
+    indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
+    indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 1, 0);
+    return LLVMBuildInBoundsGEP2(
+        cg->builder,
+        llvm_type(cg->context, union_type),
+        union_ptr,
+        indices,
+        2,
+        name);
+}
+
+static int emit_union_payload_copy_from_expr(FunctionCodegen* cg, LLVMValueRef payload_ptr, const JirExpr* payload_expr) {
+    LLVMTypeRef payload_type = 0;
+    LLVMValueRef temp_ptr = 0;
+    LLVMValueRef dst_i8 = 0;
+    LLVMValueRef src_i8 = 0;
+    if (!payload_expr || payload_expr->type->kind == JIR_TYPE_VOID) {
+        return 1;
+    }
+    payload_type = llvm_type(cg->context, payload_expr->type);
+    temp_ptr = build_local_alloca(cg, payload_type, "union.payload.src");
+    if (!emit_expr_into_ptr(cg, payload_expr, temp_ptr)) {
+        return 0;
+    }
+    dst_i8 = LLVMBuildBitCast(cg->builder, payload_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "union.payload.dst.i8");
+    src_i8 = LLVMBuildBitCast(cg->builder, temp_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "union.payload.src.i8");
+    LLVMBuildMemCpy(cg->builder, dst_i8, 1, src_i8, 1, LLVMSizeOf(payload_type));
+    return 1;
+}
+
+static LLVMValueRef load_union_payload_value(FunctionCodegen* cg, LLVMValueRef union_value, const JirType* union_type, const JirType* payload_type) {
+    LLVMTypeRef llvm_union_ty = llvm_type(cg->context, union_type);
+    LLVMTypeRef llvm_payload_ty = 0;
+    LLVMValueRef union_ptr = build_local_alloca(cg, llvm_union_ty, "union.extract.tmp");
+    LLVMValueRef payload_ptr = 0;
+    LLVMValueRef dst_ptr = 0;
+    LLVMValueRef src_i8 = 0;
+    LLVMValueRef dst_i8 = 0;
+    if (!payload_type || payload_type->kind == JIR_TYPE_VOID) {
+        return 0;
+    }
+    llvm_payload_ty = llvm_type(cg->context, payload_type);
+    LLVMBuildStore(cg->builder, union_value, union_ptr);
+    payload_ptr = union_payload_field_ptr(cg, union_ptr, union_type, "union.extract.payload.ptr");
+    dst_ptr = build_local_alloca(cg, llvm_payload_ty, "union.extract.payload.tmp");
+    src_i8 = LLVMBuildBitCast(cg->builder, payload_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "union.extract.src.i8");
+    dst_i8 = LLVMBuildBitCast(cg->builder, dst_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "union.extract.dst.i8");
+    LLVMBuildMemCpy(cg->builder, dst_i8, 1, src_i8, 1, LLVMSizeOf(llvm_payload_ty));
+    return LLVMBuildLoad2(cg->builder, llvm_payload_ty, dst_ptr, "union.extract.payload");
+}
 
 static void create_binding_allocas(FunctionCodegen* cg) {
     int i = 0;
@@ -645,7 +717,6 @@ static int emit_expr_into_ptr(FunctionCodegen* cg, const JirExpr* expr, LLVMValu
             LLVMValueRef tag_ptr = 0;
             LLVMValueRef payload_ptr = 0;
             LLVMValueRef tag_indices[2];
-            LLVMValueRef payload_indices[2];
             tag_indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
             tag_indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
             tag_ptr = LLVMBuildInBoundsGEP2(
@@ -661,40 +732,12 @@ static int emit_expr_into_ptr(FunctionCodegen* cg, const JirExpr* expr, LLVMValu
                              (unsigned long long)expr->as.union_pack.tag_value,
                              0),
                 tag_ptr);
-
-            payload_indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
-            payload_indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 1, 0);
-            payload_ptr = LLVMBuildInBoundsGEP2(
-                cg->builder,
-                llvm_type(cg->context, expr->type),
-                dst_ptr,
-                payload_indices,
-                2,
-                "new.union.payload.ptr");
+            payload_ptr = union_payload_field_ptr(cg, dst_ptr, expr->type, "new.union.payload.ptr");
             LLVMBuildStore(cg->builder,
                            LLVMConstNull(llvm_union_payload_type(cg->context, expr->type)),
                            payload_ptr);
-
-            for (i = 0; i < expr->as.union_pack.payload_items.count; ++i) {
-                LLVMValueRef slot_ptr = 0;
-                LLVMValueRef slot_indices[2];
-                LLVMValueRef item = emit_expr(cg, expr->as.union_pack.payload_items.items[i]);
-                item = extend_union_payload_value(cg->builder,
-                                                  cg->context,
-                                                  item,
-                                                  expr->as.union_pack.payload_items.items[i]->type);
-                slot_indices[0] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0);
-                slot_indices[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context),
-                                               (unsigned long long)i,
-                                               0);
-                slot_ptr = LLVMBuildInBoundsGEP2(
-                    cg->builder,
-                    llvm_union_payload_type(cg->context, expr->type),
-                    payload_ptr,
-                    slot_indices,
-                    2,
-                    "new.union.payload.slot");
-                LLVMBuildStore(cg->builder, item, slot_ptr);
+            if (expr->as.union_pack.payload && !emit_union_payload_copy_from_expr(cg, payload_ptr, expr->as.union_pack.payload)) {
+                return 0;
             }
             return 1;
         }
@@ -876,6 +919,58 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         }
         case JIR_EXPR_DEREF:
             return LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->type), emit_expr(cg, expr->as.unary.value), "deref");
+        case JIR_EXPR_PROPAGATE: {
+            LLVMValueRef base = emit_expr(cg, expr->as.propagate.value);
+            LLVMValueRef tag = LLVMBuildExtractValue(cg->builder, base, 0, "propagate.tag");
+            LLVMBasicBlockRef ok_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "propagate.ok");
+            LLVMBasicBlockRef err_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "propagate.err");
+            LLVMValueRef is_error = LLVMBuildICmp(
+                cg->builder,
+                LLVMIntEQ,
+                tag,
+                LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0),
+                "propagate.is_error");
+            LLVMBuildCondBr(cg->builder, is_error, err_block, ok_block);
+            LLVMPositionBuilderAtEnd(cg->builder, err_block);
+            {
+                LLVMValueRef error_payload = load_union_payload_value(
+                    cg,
+                    base,
+                    expr->as.propagate.value->type,
+                    expr->as.propagate.error_type);
+                if (active_try_handler(cg, expr->as.propagate.error_type)) {
+                    if (!branch_to_try_handler(cg, expr->as.propagate.error_type, error_payload)) {
+                        return 0;
+                    }
+                } else {
+                    LLVMTypeRef result_union_ty = llvm_type(cg->context, expr->as.propagate.result_type);
+                    LLVMValueRef result_tmp = build_local_alloca(cg, result_union_ty, "propagate.result.tmp");
+                    LLVMValueRef tag_ptr = LLVMBuildStructGEP2(cg->builder, result_union_ty, result_tmp, 0, "propagate.result.tag.ptr");
+                    LLVMValueRef payload_ptr = union_payload_field_ptr(cg, result_tmp, expr->as.propagate.result_type, "propagate.result.payload.ptr");
+                    LLVMBuildStore(cg->builder, LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0), tag_ptr);
+                    LLVMBuildStore(
+                        cg->builder,
+                        LLVMConstNull(llvm_union_payload_type(cg->context, expr->as.propagate.result_type)),
+                        payload_ptr);
+                    if (expr->as.propagate.error_type->kind != JIR_TYPE_VOID) {
+                        LLVMTypeRef error_ty = llvm_type(cg->context, expr->as.propagate.error_type);
+                        LLVMValueRef error_tmp = build_local_alloca(cg, error_ty, "propagate.error.tmp");
+                        LLVMValueRef dst_i8 = 0;
+                        LLVMValueRef src_i8 = 0;
+                        LLVMBuildStore(cg->builder, error_payload, error_tmp);
+                        dst_i8 = LLVMBuildBitCast(cg->builder, payload_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "propagate.result.dst.i8");
+                        src_i8 = LLVMBuildBitCast(cg->builder, error_tmp, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "propagate.result.src.i8");
+                        LLVMBuildMemCpy(cg->builder, dst_i8, 1, src_i8, 1, LLVMSizeOf(error_ty));
+                    }
+                    LLVMBuildRet(cg->builder, LLVMBuildLoad2(cg->builder, result_union_ty, result_tmp, "propagate.result"));
+                }
+            }
+            LLVMPositionBuilderAtEnd(cg->builder, ok_block);
+            if (expr->type->kind == JIR_TYPE_VOID) {
+                return 0;
+            }
+            return load_union_payload_value(cg, base, expr->as.propagate.value->type, expr->type);
+        }
         case JIR_EXPR_NEW: {
             LLVMValueRef bytes = LLVMSizeOf(llvm_type(cg->context, expr->type->array_item));
             LLVMValueRef raw_ptr = LLVMBuildCall2(
@@ -1116,20 +1211,12 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         case JIR_EXPR_VARIANT:
             return 0;
         case JIR_EXPR_UNION_PACK: {
-            LLVMValueRef union_value = LLVMGetUndef(llvm_type(cg->context, expr->type));
-            LLVMValueRef payload_array = LLVMConstNull(llvm_union_payload_type(cg->context, expr->type));
-            union_value = LLVMBuildInsertValue(
-                cg->builder,
-                union_value,
-                LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.union_pack.tag_value, 0),
-                0,
-                "union.tag");
-            for (i = 0; i < expr->as.union_pack.payload_items.count; ++i) {
-                LLVMValueRef item = emit_expr(cg, expr->as.union_pack.payload_items.items[i]);
-                item = extend_union_payload_value(cg->builder, cg->context, item, expr->as.union_pack.payload_items.items[i]->type);
-                payload_array = LLVMBuildInsertValue(cg->builder, payload_array, item, (unsigned)i, "union.payload.ins");
+            LLVMTypeRef union_type = llvm_type(cg->context, expr->type);
+            LLVMValueRef temp_ptr = build_local_alloca(cg, union_type, "union.value.tmp");
+            if (!emit_expr_into_ptr(cg, expr, temp_ptr)) {
+                return 0;
             }
-            return LLVMBuildInsertValue(cg->builder, union_value, payload_array, 1, "union.value");
+            return LLVMBuildLoad2(cg->builder, union_type, temp_ptr, "union.value");
         }
         case JIR_EXPR_EXTRACT:
             switch (expr->as.extract.kind) {
@@ -1141,9 +1228,15 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                 case JIR_EXTRACT_UNION_TAG:
                     return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), 0, "union.tag");
                 case JIR_EXTRACT_UNION_PAYLOAD: {
-                    LLVMValueRef payload_array = LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), 1, "union.payload");
-                    LLVMValueRef item = LLVMBuildExtractValue(cg->builder, payload_array, (unsigned)expr->as.extract.field_index, "union.field");
-                    return narrow_union_payload_value(cg->builder, cg->context, item, expr->type);
+                    LLVMValueRef payload_value = load_union_payload_value(
+                        cg,
+                        emit_expr(cg, expr->as.extract.base),
+                        expr->as.extract.base->type,
+                        expr->as.extract.payload_type ? expr->as.extract.payload_type : expr->type);
+                    if (expr->as.extract.field_index >= 0) {
+                        return LLVMBuildExtractValue(cg->builder, payload_value, (unsigned)expr->as.extract.field_index, "union.field");
+                    }
+                    return payload_value;
                 }
                 case JIR_EXTRACT_OPTIONAL_VALUE:
                     return LLVMBuildExtractValue(cg->builder, emit_expr(cg, expr->as.extract.base), 1, "optional.value");
@@ -1326,6 +1419,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     if (!lowered || lowered->blocks.count <= 0) {
         return 0;
     }
+    cg.lowered = lowered;
 
     block_map = (JirBlockMapEntry*)calloc((size_t)lowered->blocks.count, sizeof(JirBlockMapEntry));
     if (!block_map) {
@@ -1336,6 +1430,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
         block_map[i].name = lowered->blocks.items[i].name;
         block_map[i].block = LLVMAppendBasicBlockInContext(context, cg.llvm_function, lowered->blocks.items[i].name);
     }
+    cg.block_map = block_map;
     LLVMPositionBuilderAtEnd(cg.builder, block_map[0].block);
     LLVMPositionBuilderAtEnd(cg.entry_builder, block_map[0].block);
 
@@ -1343,6 +1438,7 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     for (i = 0; i < lowered->blocks.count; ++i) {
         int j = 0;
         const JirBasicBlock* block = &lowered->blocks.items[i];
+        cg.current_block_index = i;
         LLVMPositionBuilderAtEnd(cg.builder, block_map[i].block);
         for (j = 0; j < block->insts.count; ++j) {
             if (!emit_jir_inst(&cg, &block->insts.items[j])) {
@@ -1356,19 +1452,48 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
         switch (block->term.kind) {
             case JIR_TERM_FALLTHROUGH:
                 if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
-                    if (function->return_type->kind == JIR_TYPE_VOID) {
-                        LLVMBuildRetVoid(cg.builder);
-                    } else {
-                        LLVMBuildRet(cg.builder, LLVMConstNull(llvm_type(context, function->return_type)));
-                    }
+                    LLVMBuildRet(cg.builder, LLVMConstNull(llvm_type(context, function->return_type)));
                 }
                 break;
             case JIR_TERM_RETURN:
                 if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
-                    if (!block->term.value || function->return_type->kind == JIR_TYPE_VOID) {
-                        LLVMBuildRetVoid(cg.builder);
+                    if (!block->term.value) {
+                        LLVMBuildRet(cg.builder, LLVMConstNull(llvm_type(context, function->return_type)));
                     } else {
                         LLVMBuildRet(cg.builder, emit_expr(&cg, block->term.value));
+                    }
+                }
+                break;
+            case JIR_TERM_THROW:
+                if (!block_terminated(LLVMGetInsertBlock(cg.builder))) {
+                    LLVMValueRef throw_value = emit_expr(&cg, block->term.value);
+                    const JirTryHandler* handler = active_try_handler(&cg, block->term.value->type);
+                    if (handler) {
+                        if (!branch_to_try_handler(&cg, block->term.value->type, throw_value)) {
+                            free(block_map);
+                            LLVMDisposeBuilder(cg.entry_builder);
+                            LLVMDisposeBuilder(cg.builder);
+                            free(cg.allocas);
+                            return 0;
+                        }
+                    } else {
+                        LLVMTypeRef result_union_ty = llvm_type(context, function->return_type);
+                        LLVMValueRef result_tmp = build_local_alloca(&cg, result_union_ty, "throw.result.tmp");
+                        LLVMValueRef tag_ptr = LLVMBuildStructGEP2(cg.builder, result_union_ty, result_tmp, 0, "throw.result.tag.ptr");
+                        LLVMValueRef payload_ptr = union_payload_field_ptr(&cg, result_tmp, function->return_type, "throw.result.payload.ptr");
+                        LLVMBuildStore(cg.builder, LLVMConstInt(LLVMInt64TypeInContext(context), 1, 0), tag_ptr);
+                        LLVMBuildStore(cg.builder, LLVMConstNull(llvm_union_payload_type(context, function->return_type)), payload_ptr);
+                        if (block->term.value->type->kind != JIR_TYPE_VOID) {
+                            LLVMTypeRef error_ty = llvm_type(context, block->term.value->type);
+                            LLVMValueRef error_tmp = build_local_alloca(&cg, error_ty, "throw.error.tmp");
+                            LLVMValueRef dst_i8 = 0;
+                            LLVMValueRef src_i8 = 0;
+                            LLVMBuildStore(cg.builder, throw_value, error_tmp);
+                            dst_i8 = LLVMBuildBitCast(cg.builder, payload_ptr, LLVMPointerType(LLVMInt8TypeInContext(context), 0), "throw.result.dst.i8");
+                            src_i8 = LLVMBuildBitCast(cg.builder, error_tmp, LLVMPointerType(LLVMInt8TypeInContext(context), 0), "throw.result.src.i8");
+                            LLVMBuildMemCpy(cg.builder, dst_i8, 1, src_i8, 1, LLVMSizeOf(error_ty));
+                        }
+                        LLVMBuildRet(cg.builder, LLVMBuildLoad2(cg.builder, result_union_ty, result_tmp, "throw.result"));
                     }
                 }
                 break;
@@ -1389,8 +1514,8 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
         }
     }
 
-    if (LLVMVerifyFunction(cg.llvm_function, LLVMReturnStatusAction) != 0) {
-        LLVMVerifyModule(module, LLVMReturnStatusAction, &verify_error);
+    if (LLVMVerifyFunction(cg.llvm_function, LLVMPrintMessageAction) != 0) {
+        LLVMVerifyModule(module, LLVMPrintMessageAction, &verify_error);
         LLVMDisposeMessage(verify_error);
         LLVMDisposeBuilder(cg.entry_builder);
         LLVMDisposeBuilder(cg.builder);

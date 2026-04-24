@@ -25,6 +25,7 @@
 #define union_variant_list_push(list, variant) VEC_PUSH((list), (variant))
 #define binding_pattern_list_push(list, pattern) VEC_PUSH((list), (pattern))
 #define switch_case_list_push(list, switch_case) VEC_PUSH((list), (switch_case))
+#define try_catch_list_push(list, try_catch) VEC_PUSH((list), (try_catch))
 #define name_list_push(list, name) VEC_PUSH((list), (name))
 #define concept_list_push(list, concept_decl) VEC_PUSH((list), (concept_decl))
 #define where_constraint_list_push(list, constraint) VEC_PUSH((list), (constraint))
@@ -708,6 +709,10 @@ static AstType clone_type(const AstProgram* source, const char* prefix, int hide
         out.array_item = (AstType*)malloc(sizeof(AstType));
         *out.array_item = clone_type(source, prefix, hide_private, type->array_item);
     }
+    if (type->error_type) {
+        out.error_type = (AstType*)malloc(sizeof(AstType));
+        *out.error_type = clone_type(source, prefix, hide_private, type->error_type);
+    }
     for (i = 0; i < type->tuple_items.count; ++i) {
         AstType item = clone_type(source, prefix, hide_private, &type->tuple_items.items[i]);
         type_list_push(&out.tuple_items, item);
@@ -907,8 +912,24 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
                 memset(&item, 0, sizeof(item));
                 item.pattern = clone_expr(source, prefix, hide_private, stmt->as.switch_stmt.cases.items[i].pattern);
                 item.is_else = stmt->as.switch_stmt.cases.items[i].is_else;
+                item.binding_name = stmt->as.switch_stmt.cases.items[i].binding_name
+                    ? dup_text(stmt->as.switch_stmt.cases.items[i].binding_name)
+                    : 0;
+                item.result_case_kind = stmt->as.switch_stmt.cases.items[i].result_case_kind;
                 clone_block(source, prefix, hide_private, &item.body, &stmt->as.switch_stmt.cases.items[i].body);
                 switch_case_list_push(&out->as.switch_stmt.cases, item);
+            }
+            break;
+        case AST_STMT_TRY:
+            clone_block(source, prefix, hide_private, &out->as.try_stmt.try_body, &stmt->as.try_stmt.try_body);
+            for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+                AstTryCatch item;
+                memset(&item, 0, sizeof(item));
+                item.error_type = clone_type(source, prefix, hide_private, &stmt->as.try_stmt.catches.items[i].error_type);
+                item.binding_name = dup_text(stmt->as.try_stmt.catches.items[i].binding_name);
+                item.line = stmt->as.try_stmt.catches.items[i].line;
+                clone_block(source, prefix, hide_private, &item.body, &stmt->as.try_stmt.catches.items[i].body);
+                try_catch_list_push(&out->as.try_stmt.catches, item);
             }
             break;
         case AST_STMT_WHILE:
@@ -936,6 +957,9 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
             break;
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = clone_expr(source, prefix, hide_private, stmt->as.expr_stmt.expr);
+            break;
+        case AST_STMT_THROW:
+            out->as.throw_stmt.expr = clone_expr(source, prefix, hide_private, stmt->as.throw_stmt.expr);
             break;
         case AST_STMT_DESTRUCTURE:
             for (i = 0; i < stmt->as.destructure.bindings.count; ++i) {
@@ -1167,6 +1191,10 @@ static AstUnionDecl clone_union_decl(const AstProgram* source, const char* prefi
     memset(&out, 0, sizeof(out));
     out.tag_name = decl->tag_name ? remap_exported_name(source, prefix, hide_private, decl->tag_name) : 0;
     out.name = remap_imported_type_decl_name(source, prefix, hide_private, decl->name);
+    for (i = 0; i < decl->type_params.count; ++i) {
+        name_list_push(&out.type_params, dup_text(decl->type_params.items[i]));
+    }
+    clone_where_constraint_list(source, prefix, hide_private, &out.where_constraints, &decl->where_constraints);
     for (i = 0; i < decl->concept_names.count; ++i) {
         if (exported_concept_name_allowed(source, hide_private, decl->concept_names.items[i])) {
             name_list_push(&out.concept_names, remap_type_name(source, prefix, hide_private, decl->concept_names.items[i]));
@@ -1537,8 +1565,9 @@ static int ast_nominal_has_type_params(AstNominalDeclRef nominal) {
             return 0;
         case AST_NOMINAL_STRUCT:
             return ((const AstStructDecl*)nominal.decl)->type_params.count > 0;
-        case AST_NOMINAL_ENUM:
         case AST_NOMINAL_UNION:
+            return ((const AstUnionDecl*)nominal.decl)->type_params.count > 0;
+        case AST_NOMINAL_ENUM:
         case AST_NOMINAL_NONE:
         default:
             return 0;
@@ -1656,6 +1685,8 @@ static AstTypeQueryRef describe_ast_type(const AstProgram* program, const AstTyp
         case AST_TYPE_OPTIONAL:
             out.kind = AST_TYPE_QUERY_OPTIONAL;
             out.item_type = type->array_item;
+            return out;
+        case AST_TYPE_ERRORABLE:
             return out;
         case AST_TYPE_INFER:
             out.kind = AST_TYPE_QUERY_INFER;
@@ -2711,6 +2742,17 @@ static const AstStructDecl* find_generic_struct_template(const AstProgram* progr
         if (program->structs.items[i].type_params.count > 0 &&
             strcmp(program->structs.items[i].name, name) == 0) {
             return &program->structs.items[i];
+        }
+    }
+    return 0;
+}
+
+static const AstUnionDecl* find_generic_union_template(const AstProgram* program, const char* name) {
+    int i = 0;
+    for (i = 0; i < program->unions.count; ++i) {
+        if (program->unions.items[i].type_params.count > 0 &&
+            strcmp(program->unions.items[i].name, name) == 0) {
+            return &program->unions.items[i];
         }
     }
     return 0;
@@ -3799,6 +3841,10 @@ static AstType ast_type_copy(const AstType* type) {
         out.array_item = (AstType*)malloc(sizeof(AstType));
         *out.array_item = ast_type_copy(type->array_item);
     }
+    if (type->error_type) {
+        out.error_type = (AstType*)malloc(sizeof(AstType));
+        *out.error_type = ast_type_copy(type->error_type);
+    }
     for (i = 0; i < type->tuple_items.count; ++i) {
         type_list_push(&out.tuple_items, ast_type_copy(&type->tuple_items.items[i]));
     }
@@ -3879,6 +3925,14 @@ static char* mangle_type_name(const AstType* type) {
             char* item = mangle_type_name(type->array_item);
             out = dup_join3(item, "_opt", "");
             free(item);
+            return out;
+        }
+        case AST_TYPE_ERRORABLE: {
+            char* value = mangle_type_name(type->array_item);
+            char* error = mangle_type_name(type->error_type);
+            out = dup_join3(value, "_err_", error);
+            free(value);
+            free(error);
             return out;
         }
         case AST_TYPE_ARRAY: {
@@ -4095,6 +4149,7 @@ static AstType infer_expr_type(const AstProgram* program, const LocalTypeList* l
 static int transform_type(MonoContext* mono, AstType* type);
 static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* locals);
 static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* templ, const AstTypeList* type_args, char** instantiated_name);
+static int instantiate_union_template(MonoContext* mono, const AstUnionDecl* templ, const AstTypeList* type_args, char** instantiated_name);
 static int instantiate_function_template(MonoContext* mono, const AstFunction* templ, const AstTypeList* type_args, char** instantiated_name);
 
 static int copy_subst_from_template(TypeSubstList* subst, const AstNameList* type_params, const AstTypeList* type_args) {
@@ -4116,6 +4171,9 @@ static int transform_type(MonoContext* mono, AstType* type) {
     if (type->array_item && !transform_type(mono, type->array_item)) {
         return 0;
     }
+    if (type->error_type && !transform_type(mono, type->error_type)) {
+        return 0;
+    }
     for (i = 0; i < type->tuple_items.count; ++i) {
         if (!transform_type(mono, &type->tuple_items.items[i])) {
             return 0;
@@ -4127,17 +4185,25 @@ static int transform_type(MonoContext* mono, AstType* type) {
         }
     }
     if (type->kind == AST_TYPE_NAMED && type->type_args.count > 0) {
+        const AstUnionDecl* union_templ = 0;
         if (type->named_name && strcmp(type->named_name, "Fn") == 0) {
             return 1;
         }
-        const AstStructDecl* templ = find_generic_struct_template(mono->source, type->named_name);
         char* instantiated_name = 0;
-        if (!templ) {
+        const AstStructDecl* templ = find_generic_struct_template(mono->source, type->named_name);
+        union_templ = find_generic_union_template(mono->source, type->named_name);
+        if (!templ && !union_templ) {
             mono->error = "unknown generic type";
             return 0;
         }
-        if (!instantiate_struct_template(mono, templ, &type->type_args, &instantiated_name)) {
-            return 0;
+        if (templ) {
+            if (!instantiate_struct_template(mono, templ, &type->type_args, &instantiated_name)) {
+                return 0;
+            }
+        } else {
+            if (!instantiate_union_template(mono, union_templ, &type->type_args, &instantiated_name)) {
+                return 0;
+            }
         }
         free(type->named_name);
         type->named_name = instantiated_name;
@@ -4158,6 +4224,12 @@ static AstType clone_type_subst(const AstType* type, const TypeSubstList* subst)
         free(out.array_item);
         out.array_item = (AstType*)malloc(sizeof(AstType));
         *out.array_item = tmp;
+    }
+    if (out.error_type) {
+        AstType tmp = clone_type_subst(out.error_type, subst);
+        free(out.error_type);
+        out.error_type = (AstType*)malloc(sizeof(AstType));
+        *out.error_type = tmp;
     }
     for (i = 0; i < out.type_args.count; ++i) {
         out.type_args.items[i] = clone_type_subst(&out.type_args.items[i], subst);
@@ -4357,10 +4429,31 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
                 memset(&item, 0, sizeof(item));
                 item.pattern = clone_expr_subst(stmt->as.switch_stmt.cases.items[i].pattern, subst);
                 item.is_else = stmt->as.switch_stmt.cases.items[i].is_else;
+                item.binding_name = stmt->as.switch_stmt.cases.items[i].binding_name
+                    ? dup_text(stmt->as.switch_stmt.cases.items[i].binding_name)
+                    : 0;
+                item.result_case_kind = stmt->as.switch_stmt.cases.items[i].result_case_kind;
                 for (j = 0; j < stmt->as.switch_stmt.cases.items[i].body.stmts.count; ++j) {
                     stmt_list_push(&item.body.stmts, clone_stmt_subst(stmt->as.switch_stmt.cases.items[i].body.stmts.items[j], subst));
                 }
                 switch_case_list_push(&out->as.switch_stmt.cases, item);
+            }
+            break;
+        case AST_STMT_TRY:
+            for (i = 0; i < stmt->as.try_stmt.try_body.stmts.count; ++i) {
+                stmt_list_push(&out->as.try_stmt.try_body.stmts, clone_stmt_subst(stmt->as.try_stmt.try_body.stmts.items[i], subst));
+            }
+            for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+                AstTryCatch item;
+                int j = 0;
+                memset(&item, 0, sizeof(item));
+                item.error_type = clone_type_subst(&stmt->as.try_stmt.catches.items[i].error_type, subst);
+                item.binding_name = dup_text(stmt->as.try_stmt.catches.items[i].binding_name);
+                item.line = stmt->as.try_stmt.catches.items[i].line;
+                for (j = 0; j < stmt->as.try_stmt.catches.items[i].body.stmts.count; ++j) {
+                    stmt_list_push(&item.body.stmts, clone_stmt_subst(stmt->as.try_stmt.catches.items[i].body.stmts.items[j], subst));
+                }
+                try_catch_list_push(&out->as.try_stmt.catches, item);
             }
             break;
         case AST_STMT_WHILE:
@@ -4396,6 +4489,9 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
             break;
         case AST_STMT_EXPR:
             out->as.expr_stmt.expr = clone_expr_subst(stmt->as.expr_stmt.expr, subst);
+            break;
+        case AST_STMT_THROW:
+            out->as.throw_stmt.expr = clone_expr_subst(stmt->as.throw_stmt.expr, subst);
             break;
         case AST_STMT_DESTRUCTURE:
             for (i = 0; i < stmt->as.destructure.bindings.count; ++i) {
@@ -4453,6 +4549,17 @@ static int transform_stmt(MonoContext* mono, AstStmt* stmt, LocalTypeList* local
                 }
             }
             return 1;
+        case AST_STMT_TRY:
+            if (!transform_block(mono, &stmt->as.try_stmt.try_body, locals)) {
+                return 0;
+            }
+            for (i = 0; i < stmt->as.try_stmt.catches.count; ++i) {
+                if (!transform_type(mono, &stmt->as.try_stmt.catches.items[i].error_type) ||
+                    !transform_block(mono, &stmt->as.try_stmt.catches.items[i].body, locals)) {
+                    return 0;
+                }
+            }
+            return 1;
         case AST_STMT_WHILE:
             return transform_expr(mono, stmt->as.while_stmt.cond, locals) &&
                    transform_block(mono, &stmt->as.while_stmt.body, locals);
@@ -4468,6 +4575,8 @@ static int transform_stmt(MonoContext* mono, AstStmt* stmt, LocalTypeList* local
             return transform_block(mono, &stmt->as.defer_stmt.body, locals);
         case AST_STMT_EXPR:
             return transform_expr(mono, stmt->as.expr_stmt.expr, locals);
+        case AST_STMT_THROW:
+            return transform_expr(mono, stmt->as.throw_stmt.expr, locals);
         case AST_STMT_DESTRUCTURE:
             for (i = 0; i < stmt->as.destructure.bindings.count; ++i) {
                 if (!transform_type(mono, &stmt->as.destructure.bindings.items[i].type)) {
@@ -4678,6 +4787,85 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     return 1;
 }
 
+static int instantiate_union_template(MonoContext* mono, const AstUnionDecl* templ, const AstTypeList* type_args, char** instantiated_name) {
+    AstUnionDecl decl;
+    TypeSubstList subst;
+    int i = 0;
+    memset(&subst, 0, sizeof(subst));
+    *instantiated_name = make_instantiated_name(templ->name, type_args);
+    if (find_ast_union(mono->out, *instantiated_name)) {
+        return 1;
+    }
+    if (!copy_subst_from_template(&subst, &templ->type_params, type_args)) {
+        mono->error = "generic union type argument mismatch";
+        return 0;
+    }
+    if (!check_generic_mutability_constraints(&templ->type_params, &templ->where_constraints, &subst, &mono->error)) {
+        return 0;
+    }
+    if (!check_where_constraints(mono->source, &templ->where_constraints, &subst, &mono->error)) {
+        return 0;
+    }
+    memset(&decl, 0, sizeof(decl));
+    decl.tag_name = templ->tag_name ? dup_text(templ->tag_name) : 0;
+    decl.name = dup_text(*instantiated_name);
+    decl.public_flag = templ->public_flag;
+    decl.line = templ->line;
+    for (i = 0; i < templ->concept_names.count; ++i) {
+        name_list_push(&decl.concept_names, dup_text(templ->concept_names.items[i]));
+    }
+    for (i = 0; i < templ->assoc_type_bindings.count; ++i) {
+        AstAssocTypeBinding binding;
+        memset(&binding, 0, sizeof(binding));
+        clone_name_list(&binding.context_concept_names, &templ->assoc_type_bindings.items[i].context_concept_names);
+        binding.concept_name = templ->assoc_type_bindings.items[i].concept_name
+            ? dup_text(templ->assoc_type_bindings.items[i].concept_name)
+            : 0;
+        binding.name = dup_text(templ->assoc_type_bindings.items[i].name);
+        binding.value = clone_type_subst(&templ->assoc_type_bindings.items[i].value, &subst);
+        binding.line = templ->assoc_type_bindings.items[i].line;
+        assoc_type_binding_list_push(&decl.assoc_type_bindings, binding);
+    }
+    for (i = 0; i < templ->variants.count; ++i) {
+        AstUnionVariant variant;
+        memset(&variant, 0, sizeof(variant));
+        variant.type = clone_type_subst(&templ->variants.items[i].type, &subst);
+        variant.name = dup_text(templ->variants.items[i].name);
+        variant.line = templ->variants.items[i].line;
+        union_variant_list_push(&decl.variants, variant);
+    }
+    union_list_push(&mono->out->unions, decl);
+    for (i = 0; i < mono->source->functions.count; ++i) {
+        const AstFunction* method = &mono->source->functions.items[i];
+        if (method->method_flag && method->owner_type_name && strcmp(method->owner_type_name, templ->name) == 0) {
+            AstFunction cloned = clone_function(mono->source, 0, 0, method, method->public_flag);
+            const char* method_error = 0;
+            if (!check_where_constraints(mono->source, &method->where_constraints, &subst, &method_error)) {
+                continue;
+            }
+            free(cloned.owner_type_name);
+            cloned.owner_type_name = dup_text(*instantiated_name);
+            cloned.type_params.count = 0;
+            for (int j = 0; j < cloned.params.count; ++j) {
+                cloned.params.items[j].type = clone_type_subst(&cloned.params.items[j].type, &subst);
+            }
+            cloned.return_type = clone_type_subst(&cloned.return_type, &subst);
+            for (int j = 0; j < cloned.body.stmts.count; ++j) {
+                free(cloned.body.stmts.items[j]);
+            }
+            memset(&cloned.body, 0, sizeof(cloned.body));
+            for (int j = 0; j < method->body.stmts.count; ++j) {
+                stmt_list_push(&cloned.body.stmts, clone_stmt_subst(method->body.stmts.items[j], &subst));
+            }
+            if (!transform_block(mono, &cloned.body, &(LocalTypeList){0})) {
+                return 0;
+            }
+            function_list_push(&mono->out->functions, cloned);
+        }
+    }
+    return 1;
+}
+
 static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* locals) {
     int i = 0;
     if (!expr) {
@@ -4859,6 +5047,9 @@ static int monomorphize_program(const AstProgram* source, AstProgram* out, const
         enum_list_push(&out->enums, clone_enum_decl(source, 0, 0, &source->enums.items[i], source->enums.items[i].public_flag));
     }
     for (i = 0; i < source->unions.count; ++i) {
+        if (source->unions.items[i].type_params.count > 0) {
+            continue;
+        }
         union_list_push(&out->unions, clone_union_decl(source, 0, 0, &source->unions.items[i], source->unions.items[i].public_flag));
     }
     for (i = 0; i < source->structs.count; ++i) {

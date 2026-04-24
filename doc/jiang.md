@@ -93,7 +93,7 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 
 - `Character` 表示单个 Unicode 标量
 - 字符串字面量按 UTF-8 字节序列处理，当前仍使用 `UInt8[_]` / `UInt8[]`
-- `()` 表示空元组，同时承担无返回值语义；语言表面不再提供单独的 `Void` 类型名
+- `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
 
 当前数值自动提升仅覆盖 `Int / Float / Double`：
 
@@ -473,14 +473,14 @@ Int add(Int a, Int b);
 Int! x = add(1, 2); 		// 定义变量
 ```
 
-#### 空元组
+#### Unit
 
-没有任何元素的元组被称之为空元组，用 `()` 表示。空元组不会占用内存空间
+`()` 表示 `Unit` 类型。`Unit` 不占用内存空间，可以像普通类型一样作为值、参数、局部变量和字段使用。
 
 ```c
 () hello() {
 	print("Hello World!");
-  // return语句必须有返回值，即使返回值是个空元组
+  // return语句必须有返回值，即使返回值是 Unit
   return ();
 }
 ```
@@ -496,7 +496,7 @@ UInt8[] str2 = "hello";
 
 #### 返回值
 
-jiang语言的函数一定有返回值，即使是个空值。 空值用空元组 `()` 表示，在运行时不会占用内存空间
+jiang语言的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 表示，在运行时不会占用内存空间
 
 ```c
 () hello() {
@@ -520,9 +520,6 @@ T[] sort<T>(T[] list, Fn<Bool, T, T> compare)
 // 支持范型的排序，会抛出异常，其中E可以为任意类型
 @where(T: Numbric)  
 T[]@E sort<T, E>(T[] list, Fn<Bool@E, T, T> compare)
-
-@where(T: Numbric, E2: CompareError)  
-T[]@E1 sort<T, E1, E2>(T[] list, Fn<Fn<Bool@E2, T, T>@E1, T[]> compare)
 ```
 
 #### 函数指针
@@ -548,6 +545,7 @@ Fn<Bool, Int, Int> compare;
 - 普通顶层函数衰减为 `Fn<...>`
 - `static` 方法衰减为 `Fn<...>`
 - 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
+- `Fn<...>` 的返回类型可以写成 `T@E`
 - 通过 `Fn<...>` 变量进行调用
 
 示例 1：顶层函数
@@ -602,6 +600,188 @@ Int value = add(user$.ref(), 2);
 - 通过实例值获取绑定方法函数值（例如 `value.method`）
 - `init` 转函数指针
 - 闭包
+
+示例 4：可错返回的函数指针
+
+```c
+enum Err {
+    bad = 1,
+}
+
+Bool@Err less(Int left, Int right) {
+    if (left < 0) {
+        throw Err.bad;
+    }
+    return left < right;
+}
+
+Fn<Bool@Err, Int, Int> compare = less;
+```
+
+### 异常
+
+Jiang 第一版异常不是 runtime exception，也不做栈展开。  
+
+它只是返回值编码，语法写作 `T@E`：
+
+```c
+Int@Err parse(UInt8[] text)
+
+()@Err flush()
+
+Fn<Bool@Err, Int, Int> compare
+```
+
+其中：
+
+- `T` 是成功值类型
+- `E` 是错误值类型
+- 当前只允许函数返回类型和 `Fn<...>` 的返回位使用 `@E`
+- 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
+
+抛出错误使用 `throw expr;`：
+
+```c
+enum Err {
+    bad = 7,
+}
+
+Int@Err parse(Bool fail) {
+    if (fail) {
+        throw Err.bad;
+    }
+    return 42;
+}
+```
+
+`throw` 规则：
+
+- 只允许出现在返回类型为 `@E` 的函数里
+- `throw` 的值必须与当前函数的错误类型 `E` 一致
+- `throw` 只是语句，不是表达式
+
+在 `T@E` 函数里调用另一个 `U@E` 函数时，错误会自动传播：
+
+```c
+Int@Err ok() {
+    return 1;
+}
+
+Int@Err outer(Bool fail) {
+    parse(fail);
+    Int x = ok();
+    return x + 41;
+}
+```
+
+这里：
+
+- `parse(fail)` 成功时继续执行
+- 失败时自动从 `outer` 返回同一个错误
+- 第一版只支持**相同错误类型 `E`** 的隐式传播
+- 在非 `@E` 函数里，不能把 `@E` 调用结果当普通值直接使用
+
+错误消费统一通过 `switch` 完成：
+
+```c
+switch (parse(false)) {
+value x:
+    return x;
+error e: {
+    if (e == Err.bad) {
+        return 7;
+    }
+    return 0;
+}
+}
+```
+
+对 `@E` 的 `switch` 当前固定支持：
+
+- `value name:`
+- `error name:`
+- `else:`
+
+示例：成功值与错误值分支
+
+```c
+enum Err {
+    bad = 9,
+}
+
+Int@Err parse(Bool fail) {
+    if (fail) {
+        throw Err.bad;
+    }
+    return 9;
+}
+
+Int main() {
+    switch (parse(false)) {
+    value x:
+        return x;
+    error e: {
+        if (e == Err.bad) {
+            return 9;
+        }
+        return 0;
+    }
+    }
+}
+```
+
+除了 `switch` 之外，也支持语句级 `try-catch`：
+
+```c
+enum ErrA {
+    a,
+}
+
+enum ErrB {
+    b,
+}
+
+Int@ErrA fail_a() {
+    throw ErrA.a;
+}
+
+Int@ErrB fail_b() {
+    throw ErrB.b;
+}
+
+Int main() {
+    Int! result = 0;
+    try {
+        fail_a();
+        fail_b();
+    } catch (ErrA e) {
+        result = 1;
+    } catch (ErrB e) {
+        result = 2;
+    }
+    return result;
+}
+```
+
+`try-catch` 规则：
+
+- 只支持语句级：
+  - `try { ... } catch (Type name) { ... }`
+- `catch` 至少一个，可多个
+- `catch` 类型必须显式写出，且必须带绑定名
+- `try` 块中所有可能出现的错误类型都必须被 `catch` 完整覆盖，否则编译错误
+- 匹配按**精确错误类型**进行
+- 在 `try` 中，原本会隐式传播到当前函数外部的错误，优先跳转到匹配的 `catch`
+- `try` 不产值，不支持：
+  - `Int x = try { ... }`
+  - `return try { ... }`
+
+当前不支持：
+
+- `try expr`
+- `try` 表达式
+- `finally`
+- 不同错误类型自动组合
 
 
 
@@ -1025,6 +1205,29 @@ union ImplicitResult {
 union MyUnion {
   Int a, b, c;
   Float r;
+}
+```
+
+`union` 的 payload 当前支持任意普通类型，包括：
+
+- `struct`
+- `record`
+- tuple
+- array
+- slice
+- `Fn<...>`
+- `T&`
+- `T*`
+- `T[*]`
+- optional
+- 其他 `union` / `enum`
+
+`union` 也支持泛型：
+
+```c
+union Result<T, E> {
+  T value;
+  E error;
 }
 ```
 ```

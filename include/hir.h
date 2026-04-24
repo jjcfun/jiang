@@ -10,6 +10,7 @@ typedef struct HirExpr HirExpr;
 typedef struct HirStmt HirStmt;
 typedef struct HirFunction HirFunction;
 typedef struct HirBinding HirBinding;
+typedef struct HirTryCatch HirTryCatch;
 #ifndef JIANG_AST_EXPR_FWD_DECL
 #define JIANG_AST_EXPR_FWD_DECL
 typedef struct AstExpr AstExpr;
@@ -20,6 +21,7 @@ typedef struct HirUnionDecl HirUnionDecl;
 typedef struct HirUnionVariant HirUnionVariant;
 typedef struct HirStructDecl HirStructDecl;
 typedef struct HirStructField HirStructField;
+typedef struct HirErrorableEntry HirErrorableEntry;
 
 typedef struct HirTypeList {
     HirType** items;
@@ -113,6 +115,7 @@ typedef enum HirExprKind {
     HIR_EXPR_COALESCE,
     HIR_EXPR_TERNARY,
     HIR_EXPR_CALL,
+    HIR_EXPR_PROPAGATE,
     HIR_EXPR_ENUM_MEMBER,
     HIR_EXPR_VARIANT,
     HIR_EXPR_ENUM_VALUE,
@@ -210,6 +213,10 @@ struct HirExpr {
             HirExprList args;
         } call;
         struct {
+            HirExpr* value;
+            HirType* result_type;
+        } propagate;
+        struct {
             HirEnumMember* member;
         } enum_member;
         struct {
@@ -260,9 +267,11 @@ struct HirExpr {
 
 typedef enum HirStmtKind {
     HIR_STMT_RETURN = 0,
+    HIR_STMT_THROW,
     HIR_STMT_VAR_DECL,
     HIR_STMT_ASSIGN,
     HIR_STMT_IF,
+    HIR_STMT_TRY,
     HIR_STMT_WHILE,
     HIR_STMT_FOR_RANGE,
     HIR_STMT_BREAK,
@@ -280,6 +289,18 @@ typedef struct HirBlock {
     HirStmtList stmts;
 } HirBlock;
 
+struct HirTryCatch {
+    HirType* error_type;
+    HirBinding* binding;
+    HirBlock body;
+};
+
+typedef struct HirTryCatchList {
+    HirTryCatch* items;
+    int count;
+    int capacity;
+} HirTryCatchList;
+
 struct HirStmt {
     HirStmtKind kind;
     int line;
@@ -287,6 +308,9 @@ struct HirStmt {
         struct {
             HirExpr* expr;
         } ret;
+        struct {
+            HirExpr* expr;
+        } throw_stmt;
         struct {
             HirBinding* binding;
             HirExpr* init;
@@ -302,6 +326,10 @@ struct HirStmt {
             HirBlock else_block;
             int has_else;
         } if_stmt;
+        struct {
+            HirBlock try_body;
+            HirTryCatchList catches;
+        } try_stmt;
         struct {
             HirExpr* cond;
             HirBlock body;
@@ -398,7 +426,6 @@ struct HirUnionVariant {
     char* name;
     HirType* payload_type;
     int tag_value;
-    int payload_slots;
 };
 
 typedef struct HirUnionVariantList {
@@ -411,7 +438,9 @@ struct HirUnionDecl {
     char* name;
     char* tag_name;
     HirUnionVariantList variants;
-    int payload_slots;
+    int64_t payload_size;
+    int64_t payload_align;
+    int errorable_flag;
 };
 
 typedef struct HirUnionList {
@@ -419,6 +448,19 @@ typedef struct HirUnionList {
     int count;
     int capacity;
 } HirUnionList;
+
+struct HirErrorableEntry {
+    HirType* value_type;
+    HirType* error_type;
+    HirType* result_type;
+    HirUnionDecl* union_decl;
+};
+
+typedef struct HirErrorableEntryList {
+    HirErrorableEntry* items;
+    int count;
+    int capacity;
+} HirErrorableEntryList;
 
 typedef struct HirGlobal {
     HirBinding* binding;
@@ -459,6 +501,7 @@ typedef struct HirProgram {
     HirType bool_type;
     HirType void_type;
     HirTypeList owned_types;
+    HirErrorableEntryList errorable_types;
     HashMap global_map;
     HashMap function_map;
     HashMap type_name_map;
