@@ -1980,6 +1980,8 @@ public alias min = math_utils.min;
 
 ```bash
 jiangc --emit-llvm path/to/pkg
+jiangc --emit-obj path/to/pkg -o pkg.o
+jiangc path/to/pkg -o pkg
 ```
 
 当输入路径是目录时，编译器会读取该目录下固定文件名的 `package.ini`。当前只识别 `[package]` 段里的：

@@ -5,10 +5,13 @@
 
 #include <llvm-c/Core.h>
 #include <ctype.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define function_list_push(list, fn) VEC_PUSH((list), (fn))
 #define global_list_push(list, global) VEC_PUSH((list), (global))
@@ -279,6 +282,67 @@ static char* basename_dup(const char* path) {
     return out;
 }
 
+static char* stem_dup(const char* path) {
+    char* base = basename_dup(path);
+    char* dot = 0;
+    if (!base) {
+        return 0;
+    }
+    dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        *dot = '\0';
+    }
+    return base;
+}
+
+static char* default_output_path(const char* input_path, const char* suffix) {
+    char* stem = stem_dup(input_path);
+    char* out = 0;
+    if (!stem) {
+        return 0;
+    }
+    out = dup_join3(stem, "", suffix ? suffix : "");
+    free(stem);
+    return out;
+}
+
+static int run_host_command(const char* const* argv, const char** error) {
+    pid_t pid = 0;
+    int status = 0;
+    pid = fork();
+    if (pid < 0) {
+        *error = "failed to fork host tool";
+        return 0;
+    }
+    if (pid == 0) {
+        execvp(argv[0], (char* const*)argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    if (waitpid(pid, &status, 0) < 0) {
+        *error = "failed to wait for host tool";
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        *error = "host tool command failed";
+        return 0;
+    }
+    return 1;
+}
+
+static int link_executable_file(const char* object_path, const char* output_path, const char** error) {
+    const char* cc = getenv("CC");
+    const char* argv[5];
+    if (!cc || !*cc) {
+        cc = "cc";
+    }
+    argv[0] = cc;
+    argv[1] = object_path;
+    argv[2] = "-o";
+    argv[3] = output_path;
+    argv[4] = 0;
+    return run_host_command(argv, error);
+}
+
 static char* trim_ascii(char* text) {
     char* end = 0;
     while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') {
@@ -515,7 +579,9 @@ fail:
 }
 
 static void usage(const char* argv0) {
-    fprintf(stderr, "usage: %s --emit-llvm <file-or-package-dir>\n", argv0);
+    fprintf(stderr,
+            "usage: %s [--emit-llvm|--emit-obj] [-o output] <file-or-package-dir>\n",
+            argv0);
 }
 
 static const AstFunction* find_ast_public_function(const AstProgram* program, const char* name);
@@ -5275,12 +5341,41 @@ int main(int argc, char** argv) {
     AstProgram mono_ast;
     HirProgram hir;
     JirProgram jir;
-    char* source = 0;
     char* ir = 0;
     char* input_path = 0;
+    char* output_path = 0;
     const char* error = 0;
+    const char* input_arg = 0;
+    enum {
+        OUTPUT_EXE = 0,
+        OUTPUT_LLVM_IR = 1,
+        OUTPUT_OBJ = 2
+    } output_mode = OUTPUT_EXE;
+    int i = 0;
 
-    if (argc != 3 || strcmp(argv[1], "--emit-llvm") != 0) {
+    for (i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--emit-llvm") == 0) {
+            output_mode = OUTPUT_LLVM_IR;
+        } else if (strcmp(argv[i], "--emit-obj") == 0) {
+            output_mode = OUTPUT_OBJ;
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 1;
+            }
+            output_path = dup_text(argv[++i]);
+        } else if (argv[i][0] == '-') {
+            usage(argv[0]);
+            return 1;
+        } else if (!input_arg) {
+            input_arg = argv[i];
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (!input_arg) {
         usage(argv[0]);
         return 1;
     }
@@ -5288,9 +5383,8 @@ int main(int argc, char** argv) {
     {
         const char* stack[64] = {0};
         (void)parser;
-        source = 0;
-        if (!load_package_root_path(argv[2], &input_path, &error)) {
-            print_compiler_error(argv[2], 0, 0, error ? error : "failed to resolve package root");
+        if (!load_package_root_path(input_arg, &input_path, &error)) {
+            print_compiler_error(input_arg, 0, 0, error ? error : "failed to resolve package root");
             return 1;
         }
         if (!load_effective_program(input_path, stack, 0, &ast, &error)) {
@@ -5317,12 +5411,72 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (!emit_llvm_module(&jir, &ir, &error)) {
-        print_compiler_error(input_path, 0, 0, error ? error : "failed to emit LLVM IR");
-        return 1;
-    }
 
-    fputs(ir, stdout);
-    LLVMDisposeMessage(ir);
-    return 0;
+    switch (output_mode) {
+        case OUTPUT_LLVM_IR:
+            if (!emit_llvm_ir(&jir, &ir, &error)) {
+                print_compiler_error(input_path, 0, 0, error ? error : "failed to emit LLVM IR");
+                return 1;
+            }
+            if (output_path) {
+                FILE* out = fopen(output_path, "wb");
+                if (!out) {
+                    print_compiler_error(output_path, 0, 0, "failed to open LLVM IR output");
+                    LLVMDisposeMessage(ir);
+                    free(output_path);
+                    return 1;
+                }
+                fputs(ir, out);
+                fclose(out);
+            } else {
+                fputs(ir, stdout);
+            }
+            LLVMDisposeMessage(ir);
+            free(output_path);
+            return 0;
+        case OUTPUT_OBJ:
+            if (!output_path) {
+                output_path = default_output_path(input_path, ".o");
+            }
+            if (!output_path || !emit_object_file(&jir, output_path, &error)) {
+                print_compiler_error(output_path ? output_path : input_path, 0, 0, error ? error : "failed to emit object file");
+                free(output_path);
+                return 1;
+            }
+            free(output_path);
+            return 0;
+        case OUTPUT_EXE:
+        default: {
+            char temp_template[] = "/tmp/jiangc-obj-XXXXXX.o";
+            int temp_fd = mkstemps(temp_template, 2);
+            if (temp_fd < 0) {
+                print_compiler_error(input_path, 0, 0, "failed to create temporary object file");
+                return 1;
+            }
+            close(temp_fd);
+            if (!output_path) {
+                output_path = default_output_path(input_path, "");
+            }
+            if (!output_path) {
+                unlink(temp_template);
+                print_compiler_error(input_path, 0, 0, "failed to derive executable output path");
+                return 1;
+            }
+            if (!emit_object_file(&jir, temp_template, &error)) {
+                unlink(temp_template);
+                print_compiler_error(input_path, 0, 0, error ? error : "failed to emit temporary object file");
+                free(output_path);
+                return 1;
+            }
+            if (!link_executable_file(temp_template, output_path, &error)) {
+                unlink(temp_template);
+                print_compiler_error(output_path, 0, 0, error ? error : "failed to link executable");
+                free(output_path);
+                return 1;
+            }
+            unlink(temp_template);
+            free(output_path);
+            return 0;
+        }
+    }
 }

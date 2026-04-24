@@ -35,6 +35,8 @@ cmake --build build
 
 ```bash
 ./build/jiangc --emit-llvm tests/samples/minimal.jiang
+./build/jiangc --emit-obj tests/samples/minimal.jiang -o minimal.o
+./build/jiangc tests/samples/minimal.jiang -o minimal
 ```
 
 ## 语言指南

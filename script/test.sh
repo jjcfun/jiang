@@ -19,6 +19,13 @@ if [[ -z "$LLI" || ! -x "$LLI" ]]; then
   exit 1
 fi
 
+CC_BIN="${CC:-$(command -v cc)}"
+
+if [[ -z "$CC_BIN" || ! -x "$CC_BIN" ]]; then
+  echo "error: cc not found" >&2
+  exit 1
+fi
+
 cmake -S "$PROJECT_ROOT" -B "$BUILD_DIR"
 cmake --build "$BUILD_DIR"
 "$BUILD_DIR/utils_test"
@@ -70,7 +77,41 @@ run_compile_only() {
   "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
 }
 
+run_object_sample() {
+  local sample="$1"
+  local expected="$2"
+  local obj="$BUILD_DIR/${sample%.jiang}.o"
+  local exe="$BUILD_DIR/${sample%.jiang}.obj.out"
+  "$BUILD_DIR/jiangc" --emit-obj -o "$obj" "$SAMPLES_DIR/$sample"
+  "$CC_BIN" "$obj" -o "$exe"
+  set +e
+  "$exe"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "error: object sample $sample exited $status, expected $expected" >&2
+    exit 1
+  fi
+}
+
+run_executable_sample() {
+  local sample="$1"
+  local expected="$2"
+  local exe="$BUILD_DIR/${sample%.jiang}.exe.out"
+  "$BUILD_DIR/jiangc" -o "$exe" "$SAMPLES_DIR/$sample"
+  set +e
+  "$exe"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "error: executable sample $sample exited $status, expected $expected" >&2
+    exit 1
+  fi
+}
+
 run_sample minimal.jiang 42
+run_object_sample minimal.jiang 42
+run_executable_sample minimal.jiang 42
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2

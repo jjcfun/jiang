@@ -2,6 +2,8 @@
 
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/Target.h>
+#include <llvm-c/TargetMachine.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1755,7 +1757,10 @@ static int emit_function_body(const JirProgram* program, LLVMModuleRef module, L
     return 1;
 }
 
-int emit_llvm_module(const JirProgram* program, char** out_ir, const char** error) {
+static int build_verified_module(const JirProgram* program,
+                                 LLVMContextRef* out_context,
+                                 LLVMModuleRef* out_module,
+                                 const char** error) {
     LLVMContextRef context = LLVMContextCreate();
     LLVMModuleRef llvm_module = LLVMModuleCreateWithNameInContext("jiang", context);
     char* verify_error = 0;
@@ -1781,7 +1786,101 @@ int emit_llvm_module(const JirProgram* program, char** out_ir, const char** erro
         return 0;
     }
 
+    *out_context = context;
+    *out_module = llvm_module;
+    return 1;
+}
+
+int emit_llvm_ir(const JirProgram* program, char** out_ir, const char** error) {
+    LLVMContextRef context = 0;
+    LLVMModuleRef llvm_module = 0;
+    if (!build_verified_module(program, &context, &llvm_module, error)) {
+        return 0;
+    }
+
     *out_ir = LLVMPrintModuleToString(llvm_module);
+    LLVMDisposeModule(llvm_module);
+    LLVMContextDispose(context);
+    return 1;
+}
+
+int emit_object_file(const JirProgram* program, const char* output_path, const char** error) {
+    LLVMContextRef context = 0;
+    LLVMModuleRef llvm_module = 0;
+    LLVMTargetRef target = 0;
+    LLVMTargetMachineRef machine = 0;
+    LLVMTargetDataRef data_layout = 0;
+    char* triple = 0;
+    char* target_error = 0;
+    char* emit_error = 0;
+    char* cpu = 0;
+    char* features = 0;
+
+    if (!build_verified_module(program, &context, &llvm_module, error)) {
+        return 0;
+    }
+
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    LLVMInitializeNativeAsmParser();
+
+    triple = LLVMGetDefaultTargetTriple();
+    if (!triple) {
+        *error = "failed to get default target triple";
+        LLVMDisposeModule(llvm_module);
+        LLVMContextDispose(context);
+        return 0;
+    }
+    LLVMSetTarget(llvm_module, triple);
+
+    if (LLVMGetTargetFromTriple(triple, &target, &target_error) != 0) {
+        *error = target_error ? target_error : "failed to resolve LLVM target";
+        LLVMDisposeMessage(triple);
+        LLVMDisposeModule(llvm_module);
+        LLVMContextDispose(context);
+        return 0;
+    }
+
+    cpu = LLVMGetHostCPUName();
+    features = LLVMGetHostCPUFeatures();
+    machine = LLVMCreateTargetMachine(
+        target,
+        triple,
+        cpu ? cpu : "",
+        features ? features : "",
+        LLVMCodeGenLevelDefault,
+        LLVMRelocDefault,
+        LLVMCodeModelDefault);
+    if (!machine) {
+        *error = "failed to create LLVM target machine";
+        if (features) LLVMDisposeMessage(features);
+        if (cpu) LLVMDisposeMessage(cpu);
+        LLVMDisposeMessage(triple);
+        LLVMDisposeModule(llvm_module);
+        LLVMContextDispose(context);
+        return 0;
+    }
+
+    data_layout = LLVMCreateTargetDataLayout(machine);
+    LLVMSetModuleDataLayout(llvm_module, data_layout);
+
+    if (LLVMTargetMachineEmitToFile(machine, llvm_module, (char*)output_path, LLVMObjectFile, &emit_error) != 0) {
+        *error = emit_error ? emit_error : "failed to emit object file";
+        if (data_layout) LLVMDisposeTargetData(data_layout);
+        if (features) LLVMDisposeMessage(features);
+        if (cpu) LLVMDisposeMessage(cpu);
+        LLVMDisposeTargetMachine(machine);
+        LLVMDisposeMessage(triple);
+        LLVMDisposeModule(llvm_module);
+        LLVMContextDispose(context);
+        return 0;
+    }
+
+    if (data_layout) LLVMDisposeTargetData(data_layout);
+    if (features) LLVMDisposeMessage(features);
+    if (cpu) LLVMDisposeMessage(cpu);
+    LLVMDisposeTargetMachine(machine);
+    LLVMDisposeMessage(triple);
     LLVMDisposeModule(llvm_module);
     LLVMContextDispose(context);
     return 1;

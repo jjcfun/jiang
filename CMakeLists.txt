@@ -43,7 +43,7 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 execute_process(
-    COMMAND ${LLVM_CONFIG_EXECUTABLE} --libs core analysis
+    COMMAND ${LLVM_CONFIG_EXECUTABLE} --libs core analysis native nativecodegen target
     OUTPUT_VARIABLE LLVM_LIBS_RAW
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
