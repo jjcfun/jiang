@@ -207,6 +207,23 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
 
+当前 stage0 里，与隐式操作层和运行时相关的边界可以简单理解为：
+
+- `std/prelude.jiang` 提供默认预导入的 trait 和基础类型声明，例如 `Range`
+- 一部分 primitive 能力由编译器 builtin 直接支持，例如：
+  - `Char.equal(...)`
+  - `Char.hash()`
+  - `assert(...)`
+  - `print(...)`
+  - `panic()`
+  - `T$.alloc()`
+  - `T$.alloc_array(...)`
+- 最小运行时仍依赖宿主 C 运行时，当前主要使用：
+  - `malloc`
+  - `free`
+  - `printf`
+  - `abort`
+
 `as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数。
 
 ```c
@@ -1660,7 +1677,7 @@ trait HashEq: Hashable {
 }
 ```
 
-当多个 trait 含有同名 requirement 时，可以用 trait 限定调用显式消歧：
+当多个 trait 含有同名 requirement 时：
 
 ```c
 trait AddInt {

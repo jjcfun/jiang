@@ -157,7 +157,11 @@ run_sample free_minimal.jiang 0
 run_sample new_primitive_constructor_minimal.jiang 123
 run_sample new_array_repeat_init_minimal.jiang 6
 run_sample multi_file_minimal.jiang 42
+run_object_sample multi_file_minimal.jiang 42
+run_executable_sample multi_file_minimal.jiang 42
 run_sample package_default 42
+run_object_sample package_default 42
+run_executable_sample package_default 42
 run_sample package_override 44
 run_compile_fail package_invalid_name
 run_compile_fail invalid_package_import_with_quotes
@@ -307,6 +311,7 @@ run_compile_only extern_single_global_minimal.jiang
 run_compile_only extern_cstring_minimal.jiang
 run_compile_only cstring_local_minimal.jiang
 run_sample std_ffi_cstring_minimal.jiang 42
+run_executable_sample std_ffi_cstring_minimal.jiang 42
 run_compile_only std_ffi_cstring_extern_minimal.jiang
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
