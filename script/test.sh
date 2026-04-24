@@ -128,7 +128,6 @@ run_sample fn_pointer_static_method_minimal.jiang 3
 run_sample fn_pointer_instance_method_minimal.jiang 42
 run_sample function_overload_minimal.jiang 66
 run_sample function_overload_fn_pointer_minimal.jiang 62
-run_sample trait_qualified_method_minimal.jiang 72
 run_sample unit_field_minimal.jiang 0
 run_sample errorable_throw_minimal.jiang 1
 run_sample errorable_return_minimal.jiang 42
@@ -181,8 +180,6 @@ run_compile_fail invalid_trait_assoc_unqualified_ambiguous_binding.jiang
 run_compile_fail invalid_function_overload_return_only.jiang
 run_compile_fail invalid_function_value_ambiguous_overload.jiang
 run_compile_fail invalid_method_value_ambiguous_overload.jiang
-run_compile_fail invalid_trait_qualified_missing_impl.jiang
-run_compile_fail invalid_trait_qualified_unknown_method.jiang
 run_sample mutable_qualifier_minimal.jiang 42
 run_sample mutable_array_qualifier_minimal.jiang 42
 run_sample record_minimal.jiang 42

@@ -1504,7 +1504,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
 
-#### Trait
+### Trait
 
 `trait` 用于定义一种**仅存在于编译期**的约束类型。  
 它不作为运行时类型使用，也不能直接作为普通变量、字段、参数或返回值类型。
@@ -1535,7 +1535,7 @@ trait Numbric;
 - 若一个类型同时声明多个带同名 requirement 的 trait：
   - 同名且签名完全一致：允许共存
   - 同名但签名不同：允许共存
-  - 未限定调用时，固有方法优先；若需要显式指定 trait，可写 `value.[Trait].method(...)` 或 `Type.[Trait].method(...)`
+  - 未限定调用时，按普通重载规则解析
 
 用户也可以自定义 trait，并声明内部函数签名，用于约束满足该 trait 的类型必须提供对应实例方法：
 
@@ -1580,15 +1580,14 @@ struct Counter: AddInt, FlagValue {
 }
 
 Counter counter = Counter { base: 30 };
-Int a = counter.[AddInt].apply(2);
-Int b = Counter.[FlagValue].apply(counter$.ref(), true);
+Int a = counter.apply(2);
+Int b = counter.apply(true);
 ```
 
 这里：
 
-- `value.[Trait].method(...)` 表示通过指定 trait requirement 调用实例方法
-- `Type.[Trait].method(...)` 表示通过指定 trait requirement 调用类型侧的方法值或未绑定实例方法
-- `.[Trait]` 只用于 trait method requirement 消歧，不用于字段、关联类型或其他成员
+- 同名不同签名的方法按普通重载规则区分
+- 同名同签名的多个 trait requirement 可以共用同一份实现
 
 trait 还可以在 trait 体内部使用 `type` 声明关联类型：
 
@@ -1883,7 +1882,7 @@ extend User: HasValue {
 - `extend` 块里只允许普通方法
 - 不支持 `init`
 - 不支持 `deinit`
-- `extend Type: Trait1, Trait2` 可以同时涉及多个带同名 requirement 的 trait；调用时若需要显式指定 trait，可使用 `.[Trait]`
+- `extend Type: Trait1, Trait2` 可以同时涉及多个带同名 requirement 的 trait
 
 ### 模块（Module）
 
