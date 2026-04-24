@@ -168,13 +168,13 @@ static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
 static int hir_expr_is_new_constructible(const HirExpr* expr);
 static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr* expr);
 static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
-static HirFunction* find_function(HirProgram* program, const char* name);
 static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
 static const AstEnumDecl* find_ast_enum(const AstProgram* ast, const char* name);
 static const AstUnionDecl* find_ast_union(const AstProgram* ast, const char* name);
 static int is_mutable_assignment_target(const HirExpr* expr);
 static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
+static int same_nominal_type(HirType* left, HirType* right);
 static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block);
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary);
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
@@ -437,6 +437,28 @@ static char* make_method_name(const char* owner_name, const char* method_name, i
     memcpy(out + prefix_len + owner_len + 1, method_name, method_len);
     out[prefix_len + owner_len + 1 + method_len] = '\0';
     return out;
+}
+
+static char* make_unique_function_name(HirProgram* program, const char* base_name) {
+    char suffix[32];
+    char* candidate = 0;
+    int index = 1;
+    if (!hashmap_contains(&program->function_map, base_name)) {
+        return strdup(base_name);
+    }
+    for (;;) {
+        snprintf(suffix, sizeof(suffix), "__ov%d", index++);
+        candidate = (char*)malloc(strlen(base_name) + strlen(suffix) + 1);
+        if (!candidate) {
+            return 0;
+        }
+        strcpy(candidate, base_name);
+        strcat(candidate, suffix);
+        if (!hashmap_contains(&program->function_map, candidate)) {
+            return candidate;
+        }
+        free(candidate);
+    }
 }
 
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind) {
@@ -1657,8 +1679,71 @@ static int fail_at(LowerContext* ctx, int line, const char* error) {
     return 0;
 }
 
-static HirFunction* find_function(HirProgram* program, const char* name) {
-    return (HirFunction*)hashmap_get(&program->function_map, name);
+static int function_param_types_equal(const HirBindingList* left, const HirBindingList* right) {
+    int i = 0;
+    if (left->count != right->count) {
+        return 0;
+    }
+    for (i = 0; i < left->count; ++i) {
+        if (!type_equals(left->items[i]->type, right->items[i]->type)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int function_signature_conflicts(HirFunction* left, HirFunction* right) {
+    if (left->struct_init_flag || right->struct_init_flag) {
+        return left->struct_init_flag &&
+               right->struct_init_flag &&
+               left->owner_struct == right->owner_struct &&
+               function_param_types_equal(&left->params, &right->params);
+    }
+    if (left->struct_deinit_flag || right->struct_deinit_flag) {
+        return left->struct_deinit_flag &&
+               right->struct_deinit_flag &&
+               left->owner_struct == right->owner_struct;
+    }
+    if (left->method_flag != right->method_flag) {
+        return 0;
+    }
+    if (!left->method_flag) {
+        return strcmp(left->name, right->name) == 0 &&
+               function_param_types_equal(&left->params, &right->params);
+    }
+    return left->static_method_flag == right->static_method_flag &&
+           left->receiver_type &&
+           right->receiver_type &&
+           same_nominal_type(left->receiver_type, right->receiver_type) &&
+           strcmp(left->method_name, right->method_name) == 0 &&
+           function_param_types_equal(&left->params, &right->params);
+}
+
+static int function_matches_fn_type(HirFunction* fn, HirType* fn_type) {
+    int i = 0;
+    if (!fn || !fn_type || fn_type->kind != HIR_TYPE_FUNCTION) {
+        return 0;
+    }
+    if (!type_equals(fn->return_type, fn_type->return_type)) {
+        return 0;
+    }
+    if (fn->params.count != fn_type->tuple_items.count) {
+        return 0;
+    }
+    for (i = 0; i < fn->params.count; ++i) {
+        if (!type_equals(fn->params.items[i]->type, fn_type->tuple_items.items[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int function_matches_exact_name(HirFunction* fn, const char* name) {
+    return fn &&
+           !fn->method_flag &&
+           !fn->struct_init_flag &&
+           !fn->struct_deinit_flag &&
+           strcmp(fn->source_name ? fn->source_name : fn->name, name) == 0;
 }
 
 static HirFunction* find_struct_init_function(HirProgram* program, HirStructDecl* struct_decl, int init_index) {
@@ -2630,6 +2715,95 @@ static int lower_call_args(LowerContext* ctx, const AstStructFieldInitList* ast_
     return lower_call_args_from(ctx, ast_args, out_args, callee, 0);
 }
 
+static int lower_call_args_exact_from(LowerContext* ctx,
+                                      const AstStructFieldInitList* ast_args,
+                                      HirExprList* out_args,
+                                      HirFunction* callee,
+                                      int param_offset) {
+    int i = 0;
+    int param_count = callee->params.count - param_offset;
+    if (ast_args->count != param_count) {
+        return 0;
+    }
+    for (i = 0; i < ast_args->count; ++i) {
+        AstStructFieldInit* ast_arg = &ast_args->items[i];
+        HirExpr* arg = 0;
+        HirBinding* param = callee->params.items[param_offset + i];
+        if (ast_arg->name) {
+            return fail(ctx, "labeled call arguments are not supported");
+        }
+        arg = lower_expr_expected(ctx, ast_arg->value, param->type);
+        if (!arg) {
+            return 0;
+        }
+        arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
+        if (!arg) {
+            return 0;
+        }
+        if ((param->type->kind == HIR_TYPE_REFERENCE ||
+             param->type->kind == HIR_TYPE_POINTER ||
+             param->type->kind == HIR_TYPE_MANY_POINTER) &&
+            param->type->array_item &&
+            param->type->array_item->mutable_flag &&
+            arg->kind == HIR_EXPR_ADDR &&
+            (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
+            return fail(ctx, "call argument type mismatch");
+        }
+        if (!type_equals(arg->type, param->type)) {
+            return 0;
+        }
+        expr_list_push(out_args, arg);
+    }
+    return 1;
+}
+
+static int lower_call_args_exact(LowerContext* ctx,
+                                 const AstStructFieldInitList* ast_args,
+                                 HirExprList* out_args,
+                                 HirFunction* callee) {
+    return lower_call_args_exact_from(ctx, ast_args, out_args, callee, 0);
+}
+
+static HirFunction* resolve_top_level_function_call(LowerContext* ctx,
+                                                    const char* name,
+                                                    const AstStructFieldInitList* ast_args,
+                                                    HirExprList* out_args) {
+    HirFunction* matched = 0;
+    HirExprList matched_args;
+    int match_count = 0;
+    int i = 0;
+    memset(&matched_args, 0, sizeof(matched_args));
+    for (i = 0; i < ctx->program->functions.count; ++i) {
+        HirFunction* candidate = &ctx->program->functions.items[i];
+        HirExprList candidate_args;
+        const char* saved_error = ctx->error;
+        memset(&candidate_args, 0, sizeof(candidate_args));
+        if (!function_matches_exact_name(candidate, name)) {
+            continue;
+        }
+        ctx->error = 0;
+        if (!lower_call_args_exact(ctx, ast_args, &candidate_args, candidate)) {
+            ctx->error = saved_error;
+            continue;
+        }
+        ctx->error = saved_error;
+        matched = candidate;
+        matched_args = candidate_args;
+        match_count += 1;
+    }
+    if (match_count == 0) {
+        return 0;
+    }
+    if (match_count > 1) {
+        fail(ctx, "ambiguous overload");
+        return 0;
+    }
+    out_args->items = matched_args.items;
+    out_args->count = matched_args.count;
+    out_args->capacity = matched_args.capacity;
+    return matched;
+}
+
 static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstStructFieldInitList* ast_args, HirExprList* out_args, int line) {
     int param_count = 0;
     int i = 0;
@@ -2767,6 +2941,205 @@ static int ast_struct_declares_trait(const AstStructDecl* decl, const char* trai
         if (strcmp(decl->concept_names.items[i], trait_name) == 0) {
             return 1;
         }
+    }
+    return 0;
+}
+
+static int ast_concept_declares_method_name_local(const AstProgram* ast,
+                                                  const AstConceptDecl* concept,
+                                                  const char* method_name,
+                                                  AstNameList* seen_concepts) {
+    int i = 0;
+    if (!concept) {
+        return 0;
+    }
+    if (ast_name_list_contains_local(seen_concepts, concept->name)) {
+        return 0;
+    }
+    name_list_push(seen_concepts, concept->name);
+    for (i = 0; i < concept->methods.count; ++i) {
+        if (strcmp(concept->methods.items[i].name, method_name) == 0) {
+            return 1;
+        }
+    }
+    for (i = 0; i < concept->concept_names.count; ++i) {
+        const AstConceptDecl* parent = find_ast_concept_local(ast, concept->concept_names.items[i]);
+        if (ast_concept_declares_method_name_local(ast, parent, method_name, seen_concepts)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int hir_type_declares_trait_method_name(const AstProgram* ast,
+                                               HirType* type,
+                                               const char* trait_name,
+                                               const char* method_name) {
+    const AstConceptDecl* trait = find_ast_concept_local(ast, trait_name);
+    AstNameList seen_concepts;
+    if (!trait || !hir_type_declares_concept_or_child(ast, type, trait_name)) {
+        return 0;
+    }
+    memset(&seen_concepts, 0, sizeof(seen_concepts));
+    return ast_concept_declares_method_name_local(ast, trait, method_name, &seen_concepts);
+}
+
+static int parse_trait_qualified_callee(const char* callee,
+                                        char** owner_name,
+                                        char** trait_name,
+                                        char** member_name) {
+    const char* marker = strstr(callee, ".[");
+    const char* close = 0;
+    const char* dot = 0;
+    size_t owner_len = 0;
+    size_t trait_len = 0;
+    if (!marker) {
+        return 0;
+    }
+    close = strchr(marker + 2, ']');
+    if (!close || close[1] != '.') {
+        return 0;
+    }
+    dot = close + 1;
+    owner_len = (size_t)(marker - callee);
+    trait_len = (size_t)(close - (marker + 2));
+    *owner_name = (char*)malloc(owner_len + 1);
+    *trait_name = (char*)malloc(trait_len + 1);
+    *member_name = strdup(dot + 1);
+    if (!*owner_name || !*trait_name || !*member_name) {
+        free(*owner_name);
+        free(*trait_name);
+        free(*member_name);
+        *owner_name = 0;
+        *trait_name = 0;
+        *member_name = 0;
+        return 0;
+    }
+    memcpy(*owner_name, callee, owner_len);
+    (*owner_name)[owner_len] = '\0';
+    memcpy(*trait_name, marker + 2, trait_len);
+    (*trait_name)[trait_len] = '\0';
+    return 1;
+}
+
+static HirFunction* resolve_method_call_overload(LowerContext* ctx,
+                                                 HirType* owner_type,
+                                                 const char* method_name,
+                                                 int static_flag,
+                                                 const AstStructFieldInitList* ast_args,
+                                                 int param_offset,
+                                                 const char* trait_name,
+                                                 HirExprList* out_args) {
+    HirFunction* matched = 0;
+    HirExprList matched_args;
+    int match_count = 0;
+    int i = 0;
+    memset(&matched_args, 0, sizeof(matched_args));
+    if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name)) {
+        fail(ctx, "trait method not found");
+        return 0;
+    }
+    for (i = 0; i < ctx->program->functions.count; ++i) {
+        HirFunction* candidate = &ctx->program->functions.items[i];
+        HirExprList candidate_args;
+        const char* saved_error = ctx->error;
+        memset(&candidate_args, 0, sizeof(candidate_args));
+        if (!candidate->method_flag ||
+            candidate->static_method_flag != static_flag ||
+            strcmp(candidate->method_name, method_name) != 0 ||
+            !same_nominal_type(owner_type, candidate->receiver_type)) {
+            continue;
+        }
+        if (!method_visible_from_context(ctx, candidate, owner_type)) {
+            continue;
+        }
+        ctx->error = 0;
+        if (!lower_call_args_exact_from(ctx, ast_args, &candidate_args, candidate, param_offset)) {
+            ctx->error = saved_error;
+            continue;
+        }
+        ctx->error = saved_error;
+        matched = candidate;
+        matched_args = candidate_args;
+        match_count += 1;
+    }
+    if (match_count == 0) {
+        return 0;
+    }
+    if (match_count > 1) {
+        fail(ctx, "ambiguous overload");
+        return 0;
+    }
+    out_args->items = matched_args.items;
+    out_args->count = matched_args.count;
+    out_args->capacity = matched_args.capacity;
+    return matched;
+}
+
+static HirFunction* resolve_function_value_overload(LowerContext* ctx,
+                                                    const char* name,
+                                                    HirType* expected_type) {
+    HirFunction* matched = 0;
+    int match_count = 0;
+    int i = 0;
+    for (i = 0; i < ctx->program->functions.count; ++i) {
+        HirFunction* candidate = &ctx->program->functions.items[i];
+        if (!function_matches_exact_name(candidate, name)) {
+            continue;
+        }
+        if (expected_type && expected_type->kind == HIR_TYPE_FUNCTION) {
+            if (!function_matches_fn_type(candidate, expected_type)) {
+                continue;
+            }
+        }
+        matched = candidate;
+        match_count += 1;
+    }
+    if (match_count == 1) {
+        return matched;
+    }
+    if (match_count > 1) {
+        fail(ctx, "ambiguous overload");
+    }
+    return 0;
+}
+
+static HirFunction* resolve_method_value_overload(LowerContext* ctx,
+                                                  HirType* owner_type,
+                                                  const char* method_name,
+                                                  int static_flag,
+                                                  const char* trait_name,
+                                                  HirType* expected_type) {
+    HirFunction* matched = 0;
+    int match_count = 0;
+    int i = 0;
+    if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name)) {
+        fail(ctx, "trait method not found");
+        return 0;
+    }
+    for (i = 0; i < ctx->program->functions.count; ++i) {
+        HirFunction* candidate = &ctx->program->functions.items[i];
+        if (!candidate->method_flag ||
+            candidate->static_method_flag != static_flag ||
+            strcmp(candidate->method_name, method_name) != 0 ||
+            !same_nominal_type(owner_type, candidate->receiver_type)) {
+            continue;
+        }
+        if (!method_visible_from_context(ctx, candidate, owner_type)) {
+            continue;
+        }
+        if (expected_type && expected_type->kind == HIR_TYPE_FUNCTION &&
+            !function_matches_fn_type(candidate, expected_type)) {
+            continue;
+        }
+        matched = candidate;
+        match_count += 1;
+    }
+    if (match_count == 1) {
+        return matched;
+    }
+    if (match_count > 1) {
+        fail(ctx, "ambiguous overload");
     }
     return 0;
 }
@@ -3478,8 +3851,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         case AST_EXPR_NAME: {
             HirBinding* binding = lookup_binding(ctx, expr->as.name);
             if (!binding) {
-                HirFunction* fn = find_function(ctx->program, expr->as.name);
-                if (!fn || fn->method_flag || fn->struct_init_flag || fn->struct_deinit_flag) {
+                HirFunction* fn = resolve_function_value_overload(ctx, expr->as.name, expected_type);
+                if (!fn) {
+                    if (ctx->error) {
+                        return 0;
+                    }
                     fail(ctx, "unknown identifier");
                     return 0;
                 }
@@ -3907,57 +4283,61 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 return out;
             }
             if (dot) {
-                size_t owner_len = (size_t)(dot - expr->as.call.callee);
-                char* owner_name = (char*)malloc(owner_len + 1);
-                const char* member_name = dot + 1;
+                char* owner_name = 0;
+                char* trait_name = 0;
+                char* parsed_member_name = 0;
+                const char* member_name = 0;
                 HirBinding* owner_binding = 0;
                 HirType* owner_type = 0;
-                if (!owner_name) {
-                    fail(ctx, "out of memory");
-                    return 0;
+                HirExprList matched_args;
+                memset(&matched_args, 0, sizeof(matched_args));
+                if (parse_trait_qualified_callee(expr->as.call.callee, &owner_name, &trait_name, &parsed_member_name)) {
+                    member_name = parsed_member_name;
+                } else {
+                    size_t owner_len = (size_t)(dot - expr->as.call.callee);
+                    owner_name = (char*)malloc(owner_len + 1);
+                    if (!owner_name) {
+                        fail(ctx, "out of memory");
+                        return 0;
+                    }
+                    memcpy(owner_name, expr->as.call.callee, owner_len);
+                    owner_name[owner_len] = '\0';
+                    member_name = dot + 1;
                 }
-                memcpy(owner_name, expr->as.call.callee, owner_len);
-                owner_name[owner_len] = '\0';
                 owner_binding = lookup_binding(ctx, owner_name);
                 if (owner_binding) {
                     HirFunction* method = 0;
                     HirExpr* receiver_arg = 0;
+                    HirType* method_owner_type = 0;
                     owner_type = owner_binding->type;
                     receiver_arg = make_binding_expr(owner_binding, expr->line);
-                    if ((owner_type->kind == HIR_TYPE_REFERENCE || owner_type->kind == HIR_TYPE_POINTER) && owner_type->array_item &&
-                        (owner_type->array_item->kind == HIR_TYPE_STRUCT ||
-                         owner_type->array_item->kind == HIR_TYPE_ENUM ||
-                         owner_type->array_item->kind == HIR_TYPE_UNION)) {
-                        owner_type = owner_type->array_item;
-                    }
-                    method = find_type_method(ctx->program, owner_type, member_name, 0);
+                    method_owner_type = instance_method_owner_type(owner_type);
+                    method = resolve_method_call_overload(ctx, method_owner_type, member_name, 0, &expr->as.call.args, 1, trait_name, &matched_args);
                     if (method) {
-                        int i = 0;
-                        if (!method_visible_from_context(ctx, method, owner_type)) {
+                        receiver_arg = make_instance_method_receiver(ctx, make_binding_expr(owner_binding, expr->line), method_owner_type, expr->line);
+                        if (!receiver_arg) {
                             free(owner_name);
-                            fail(ctx, "unknown function");
+                            free(trait_name);
+                            free(parsed_member_name);
                             return 0;
-                        }
-                        if (owner_type->kind == HIR_TYPE_STRUCT) {
-                            if (owner_binding->type->kind == HIR_TYPE_REFERENCE || owner_binding->type->kind == HIR_TYPE_POINTER) {
-                                receiver_arg = make_binding_expr(owner_binding, expr->line);
-                            } else {
-                                receiver_arg = new_expr(HIR_EXPR_ADDR, reference_to_type(ctx, owner_type), expr->line);
-                                receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
-                            }
-                        } else if (owner_binding->type->kind == HIR_TYPE_REFERENCE || owner_binding->type->kind == HIR_TYPE_POINTER) {
-                            receiver_arg = new_expr(HIR_EXPR_DEREF, owner_type, expr->line);
-                            receiver_arg->as.unary.value = make_binding_expr(owner_binding, expr->line);
                         }
                         out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
                         out->as.call.callee = method;
                         expr_list_push(&out->as.call.args, receiver_arg);
-                        if (!lower_call_args_from(ctx, &expr->as.call.args, &out->as.call.args, method, 1)) {
-                            free(owner_name);
-                            return 0;
-                        }
+                        out->as.call.args.items = (HirExpr**)realloc(out->as.call.args.items, sizeof(HirExpr*) * (matched_args.count + 1));
+                        memcpy(out->as.call.args.items + 1, matched_args.items, sizeof(HirExpr*) * matched_args.count);
+                        out->as.call.args.count = matched_args.count + 1;
+                        out->as.call.args.capacity = matched_args.count + 1;
                         free(owner_name);
+                        free(trait_name);
+                        free(parsed_member_name);
                         return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+                    }
+                    if (ctx->error) {
+                        free(owner_name);
+                        free(trait_name);
+                        free(parsed_member_name);
+                        return 0;
                     }
                     {
                         HirBuiltinKind builtin_method = builtin_method_kind(owner_type, member_name, 0);
@@ -3968,43 +4348,54 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                            expr->line);
                             if (!lower_builtin_method_call(ctx, expr->line, builtin_method, owner_type, receiver_arg, &expr->as.call.args, out)) {
                                 free(owner_name);
+                                free(trait_name);
+                                free(parsed_member_name);
                                 return 0;
                             }
                             free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
                             return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
                         }
                     }
-                    if (find_type_method(ctx->program, owner_type, member_name, 1)) {
+                    if (resolve_method_value_overload(ctx, method_owner_type, member_name, 1, trait_name, 0)) {
                         free(owner_name);
+                        free(trait_name);
+                        free(parsed_member_name);
                         fail(ctx, "static method called through instance");
                         return 0;
                     }
                 } else {
                     HirType* named_type = resolve_owner_type_name(ctx, owner_name);
                     if (named_type) {
-                        HirFunction* method = find_type_method(ctx->program, named_type, member_name, 1);
+                        HirFunction* method = resolve_method_call_overload(ctx, named_type, member_name, 1, &expr->as.call.args, 0, trait_name, &matched_args);
                         if (method) {
-                            if (!method_visible_from_context(ctx, method, named_type)) {
-                                free(owner_name);
-                                fail(ctx, "unknown function");
-                                return 0;
-                            }
                             free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
                             out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
                             out->as.call.callee = method;
-                            if (!lower_call_args(ctx, &expr->as.call.args, &out->as.call.args, method)) {
-                                return 0;
-                            }
+                            out->as.call.args = matched_args;
                             return out;
+                        }
+                        if (ctx->error) {
+                            free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
+                            return 0;
                         }
                         if (named_type->kind == HIR_TYPE_STRUCT && strcmp(member_name, "init") == 0) {
                             HirStructDecl* init_struct = named_type->struct_decl;
                             if (!init_struct->has_init) {
                                 free(owner_name);
+                                free(trait_name);
+                                free(parsed_member_name);
                                 fail(ctx, "struct has no init");
                                 return 0;
                             }
                             free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
                             out = new_expr(HIR_EXPR_CALL, named_type, expr->line);
                             out->as.call.callee = 0;
                             out->as.call.builtin = HIR_BUILTIN_NONE;
@@ -4037,9 +4428,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             }
                             return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                         }
-                        if (find_type_method(ctx->program, named_type, member_name, 0)) {
+                        method = resolve_method_call_overload(ctx, named_type, member_name, 0, &expr->as.call.args, 0, trait_name, &matched_args);
+                        if (method) {
                             free(owner_name);
-                            fail(ctx, "instance method called through type");
+                            free(trait_name);
+                            free(parsed_member_name);
+                            out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
+                            out->as.call.callee = method;
+                            out->as.call.args = matched_args;
+                            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+                        }
+                        if (ctx->error) {
+                            free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
                             return 0;
                         }
                         if (named_type->kind == HIR_TYPE_UNION) {
@@ -4050,35 +4452,65 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 if (variant->payload_type->kind == HIR_TYPE_VOID) {
                                     if (expr->as.call.args.count != 0) {
                                         free(owner_name);
+                                        free(trait_name);
+                                        free(parsed_member_name);
                                         fail(ctx, "void variant does not accept a payload");
                                         return 0;
                                     }
                                 } else {
                                     if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) {
                                         free(owner_name);
+                                        free(trait_name);
+                                        free(parsed_member_name);
                                         fail(ctx, "variant payload required");
                                         return 0;
                                     }
                                     out->as.variant.payload = lower_expr(ctx, expr->as.call.args.items[0].value);
                                     if (!out->as.variant.payload) {
                                         free(owner_name);
+                                        free(trait_name);
+                                        free(parsed_member_name);
                                         return 0;
                                     }
                                     if (!type_equals(out->as.variant.payload->type, variant->payload_type)) {
                                         free(owner_name);
+                                        free(trait_name);
+                                        free(parsed_member_name);
                                         fail(ctx, "variant payload type mismatch");
                                         return 0;
                                     }
                                 }
                                 free(owner_name);
+                                free(trait_name);
+                                free(parsed_member_name);
                                 return out;
                             }
                         }
                     }
                 }
                 free(owner_name);
+                free(trait_name);
+                free(parsed_member_name);
             }
-            HirFunction* callee = find_function(ctx->program, expr->as.call.callee);
+            {
+                HirExprList matched_args;
+                HirFunction* callee = 0;
+                memset(&matched_args, 0, sizeof(matched_args));
+                callee = resolve_top_level_function_call(ctx, expr->as.call.callee, &expr->as.call.args, &matched_args);
+                if (callee) {
+                    out = new_expr(HIR_EXPR_CALL, callee->return_type, expr->line);
+                    out->as.call.callee = callee;
+                    out->as.call.callee_value = 0;
+                    out->as.call.builtin = HIR_BUILTIN_NONE;
+                    out->as.call.args = matched_args;
+                    out = maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+                    return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+                }
+                if (ctx->error) {
+                    return 0;
+                }
+            }
+            HirFunction* callee = 0;
             if (!callee) {
                 HirStructDecl* init_struct = find_struct(ctx->program, expr->as.call.callee);
                 if (init_struct) {
@@ -4161,15 +4593,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 fail(ctx, "unknown function");
                 return 0;
             }
-            out = new_expr(HIR_EXPR_CALL, callee->return_type, expr->line);
-            out->as.call.callee = callee;
-            out->as.call.callee_value = 0;
-            out->as.call.builtin = HIR_BUILTIN_NONE;
-            if (!lower_call_args(ctx, &expr->as.call.args, &out->as.call.args, callee)) {
-                return 0;
-            }
-            out = maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
-            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+            fail(ctx, "unknown function");
+            return 0;
         }
         case AST_EXPR_VARIANT: {
             HirEnumDecl* enum_decl = 0;
@@ -4182,18 +4607,27 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 !expr->as.variant.pattern_flag) {
                 HirType* owner_type = resolve_owner_type_name(ctx, expr->as.variant.union_name);
                 if (owner_type) {
-                    HirFunction* method = find_type_method(ctx->program, owner_type, expr->as.variant.variant_name, 1);
-                    if (!method) {
-                        method = find_type_method(ctx->program, owner_type, expr->as.variant.variant_name, 0);
+                    HirFunction* method = resolve_method_value_overload(ctx,
+                                                                        owner_type,
+                                                                        expr->as.variant.variant_name,
+                                                                        1,
+                                                                        0,
+                                                                        expected_type);
+                    if (!method && !ctx->error) {
+                        method = resolve_method_value_overload(ctx,
+                                                               owner_type,
+                                                               expr->as.variant.variant_name,
+                                                               0,
+                                                               0,
+                                                               expected_type);
                     }
                     if (method) {
-                        if (!method_visible_from_context(ctx, method, owner_type)) {
-                            fail(ctx, "unknown function");
-                            return 0;
-                        }
                         out = new_expr(HIR_EXPR_FUNCTION, function_type_from_function(ctx, method), expr->line);
                         out->as.function = method;
                         return out;
+                    }
+                    if (ctx->error) {
+                        return 0;
                     }
                 }
             }
@@ -4302,20 +4736,23 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 expr->as.field.base->kind == AST_EXPR_NAME) {
                 HirType* owner_type = resolve_owner_type_name(ctx, expr->as.field.base->as.name);
                 if (owner_type) {
-                    HirFunction* method = find_type_method(ctx->program, owner_type, expr->as.field.name, 1);
-                    if (!method) {
-                        method = find_type_method(ctx->program, owner_type, expr->as.field.name, 0);
+                    HirFunction* method = resolve_method_value_overload(ctx, owner_type, expr->as.field.name, 1, expr->as.field.trait_name, expected_type);
+                    if (!method && !ctx->error) {
+                        method = resolve_method_value_overload(ctx, owner_type, expr->as.field.name, 0, expr->as.field.trait_name, expected_type);
                     }
                     if (method) {
-                        if (!method_visible_from_context(ctx, method, owner_type)) {
-                            fail(ctx, "unknown field");
-                            return 0;
-                        }
                         out = new_expr(HIR_EXPR_FUNCTION, function_type_from_function(ctx, method), expr->line);
                         out->as.function = method;
                         return out;
                     }
+                    if (ctx->error) {
+                        return 0;
+                    }
                 }
+            }
+            if (expr->as.field.trait_name) {
+                fail(ctx, "trait-qualified field access requires a method");
+                return 0;
             }
             HirExpr* base = lower_expr(ctx, expr->as.field.base);
             HirType* base_type = 0;
@@ -6491,18 +6928,24 @@ static int register_struct_init_functions(LowerContext* ctx) {
             return_type->struct_decl = struct_decl;
             hir_fn.return_type = return_type;
             hir_fn.name = make_struct_init_name(struct_decl->name, init_index);
+            hir_fn.source_name = "init";
             hir_fn.line = ast_struct->init_overloads.items[init_index].line;
             hir_fn.struct_init_flag = 1;
             hir_fn.struct_init_index = init_index;
             hir_fn.owner_struct = struct_decl;
-            if (hashmap_contains(&ctx->program->function_map, hir_fn.name)) {
-                return fail(ctx, "duplicate function");
-            }
             for (param_index = 0; param_index < ast_struct->init_overloads.items[init_index].params.count; ++param_index) {
                 HirBinding* param_binding = new_binding(lower_type(ctx, &ast_struct->init_overloads.items[init_index].params.items[param_index].type), ast_struct->init_overloads.items[init_index].params.items[param_index].type.mutable_flag, ast_struct->init_overloads.items[init_index].params.items[param_index].name, HIR_BINDING_PARAM, ast_struct->init_overloads.items[init_index].params.items[param_index].line);
                 param_binding->label = ast_struct->init_overloads.items[init_index].params.items[param_index].label;
                 param_binding->default_value = ast_struct->init_overloads.items[init_index].params.items[param_index].default_value;
                 binding_list_push(&hir_fn.params, param_binding);
+            }
+            {
+                int fn_index = 0;
+                for (fn_index = 0; fn_index < ctx->program->functions.count; ++fn_index) {
+                    if (function_signature_conflicts(&ctx->program->functions.items[fn_index], &hir_fn)) {
+                        return fail(ctx, "duplicate function");
+                    }
+                }
             }
             function_list_push(&ctx->program->functions, hir_fn);
             hashmap_set(&ctx->program->function_map, hir_fn.name, (void*)1);
@@ -6523,12 +6966,10 @@ static int register_struct_deinit_functions(LowerContext* ctx) {
         if (!ast_struct->has_deinit) {
             continue;
         }
-        if (hashmap_contains(&ctx->program->function_map, struct_decl->deinit_name)) {
-            return fail(ctx, "duplicate function");
-        }
         memset(&hir_fn, 0, sizeof(hir_fn));
         hir_fn.return_type = primitive_type(ctx->program, HIR_TYPE_VOID);
         hir_fn.name = struct_decl->deinit_name;
+        hir_fn.source_name = "deinit";
         hir_fn.line = ast_struct->deinit_line;
         hir_fn.struct_deinit_flag = 1;
         hir_fn.owner_struct = struct_decl;
@@ -6536,6 +6977,14 @@ static int register_struct_deinit_functions(LowerContext* ctx) {
         self_type->struct_decl = struct_decl;
         self_binding = new_binding(self_type, 1, "self", HIR_BINDING_PARAM, ast_struct->deinit_line);
         binding_list_push(&hir_fn.params, self_binding);
+        {
+            int fn_index = 0;
+            for (fn_index = 0; fn_index < ctx->program->functions.count; ++fn_index) {
+                if (function_signature_conflicts(&ctx->program->functions.items[fn_index], &hir_fn)) {
+                    return fail(ctx, "duplicate function");
+                }
+            }
+        }
         function_list_push(&ctx->program->functions, hir_fn);
         hashmap_set(&ctx->program->function_map, hir_fn.name, (void*)1);
     }
@@ -6551,13 +7000,11 @@ static int register_functions(LowerContext* ctx) {
         HirFunction* saved_current_function = 0;
         int param_index = 0;
         memset(&hir_fn, 0, sizeof(hir_fn));
-        if (!ast_fn->method_flag && hashmap_contains(&ctx->program->function_map, ast_fn->name)) {
-            return fail(ctx, "duplicate function");
-        }
         if (!ast_fn->method_flag && hashmap_contains(&ctx->program->type_name_map, ast_fn->name)) {
             return fail(ctx, "type and function name conflict");
         }
         hir_fn.name = ast_fn->name;
+        hir_fn.source_name = ast_fn->name;
         hir_fn.line = ast_fn->line;
         hir_fn.extern_flag = ast_fn->extern_flag;
         hir_fn.public_flag = ast_fn->public_flag;
@@ -6579,9 +7026,6 @@ static int register_functions(LowerContext* ctx) {
                 return fail(ctx, "struct field and method name conflict");
             }
             hir_fn.name = make_method_name(ast_fn->owner_type_name, ast_fn->name, ast_fn->static_method_flag);
-            if (hashmap_contains(&ctx->program->function_map, hir_fn.name)) {
-                return fail(ctx, "duplicate function");
-            }
         }
         saved_current_function = ctx->current_function;
         ctx->current_function = &hir_fn;
@@ -6605,6 +7049,18 @@ static int register_functions(LowerContext* ctx) {
             param_binding->label = ast_fn->params.items[param_index].label;
             param_binding->default_value = ast_fn->params.items[param_index].default_value;
             binding_list_push(&hir_fn.params, param_binding);
+        }
+        for (param_index = 0; param_index < ctx->program->functions.count; ++param_index) {
+            if (function_signature_conflicts(&ctx->program->functions.items[param_index], &hir_fn)) {
+                return fail(ctx, "duplicate function");
+            }
+        }
+        if (hashmap_contains(&ctx->program->function_map, hir_fn.name)) {
+            char* unique_name = make_unique_function_name(ctx->program, hir_fn.name);
+            if (!unique_name) {
+                return fail(ctx, "out of memory");
+            }
+            hir_fn.name = unique_name;
         }
         function_list_push(&ctx->program->functions, hir_fn);
         hashmap_set(&ctx->program->function_map, hir_fn.name, (void*)1);

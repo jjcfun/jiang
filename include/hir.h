@@ -377,6 +377,7 @@ struct HirStmt {
 struct HirFunction {
     HirType* return_type;
     char* name;
+    char* source_name;
     char* method_name;
     HirBindingList params;
     HirBindingList locals;

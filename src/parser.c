@@ -1216,6 +1216,16 @@ static int looks_like_qualified_call(Parser* parser) {
     return probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
+static int looks_like_trait_qualified_member(Parser* parser) {
+    Parser probe = *parser;
+    if (!is_name_token(&probe.current) || probe.next.kind != TOKEN_DOT) {
+        return 0;
+    }
+    advance(&probe);
+    advance(&probe);
+    return probe.current.kind == TOKEN_LEFT_BRACKET;
+}
+
 static int looks_like_method_decl(Parser* parser) {
     Parser probe = *parser;
     if (probe.current.kind == TOKEN_KW_PUBLIC) {
@@ -1566,10 +1576,17 @@ static char* expr_to_qualified_callee(const AstExpr* expr) {
     if (expr->kind == AST_EXPR_FIELD) {
         char* base = expr_to_qualified_callee(expr->as.field.base);
         char* out = 0;
+        char* qualified = 0;
         if (!base) {
             return 0;
         }
-        out = dup_join3(base, ".", expr->as.field.name);
+        if (expr->as.field.trait_name) {
+            qualified = dup_join3(".[", expr->as.field.trait_name, "].");
+            out = dup_join3(base, qualified, expr->as.field.name);
+            free(qualified);
+        } else {
+            out = dup_join3(base, ".", expr->as.field.name);
+        }
         free(base);
         return out;
     }
@@ -1883,6 +1900,7 @@ static AstExpr* parse_primary(Parser* parser) {
         if (parser->next.kind == TOKEN_DOT &&
             (is_known_type(parser, &token) || is_type_like_ident(&token) || looks_like_qualified_variant_ref(parser)) &&
             !looks_like_qualified_init_call(parser) &&
+            !looks_like_trait_qualified_member(parser) &&
             !looks_like_qualified_call(parser)) {
             return parse_variant_expr(parser, 0);
         }
@@ -2052,12 +2070,40 @@ static AstExpr* parse_postfix(Parser* parser) {
             if (parser->next.kind == TOKEN_IDENT && token_equals(&parser->next, "indexed")) {
                 break;
             }
+            if (parser->next.kind == TOKEN_LEFT_BRACKET) {
+                advance(parser);
+                advance(parser);
+                if (!is_name_token(&parser->current)) {
+                    return 0;
+                }
+                field = new_expr(AST_EXPR_FIELD, expr->line);
+                field->as.field.base = expr;
+                field->as.field.trait_name = parse_qualified_name(parser);
+                if (!field->as.field.trait_name) {
+                    return 0;
+                }
+                if (!expect(parser, TOKEN_RIGHT_BRACKET, "expected ']' after trait name")) {
+                    return 0;
+                }
+                if (!expect(parser, TOKEN_DOT, "expected '.' after trait qualifier")) {
+                    return 0;
+                }
+                if (parser->current.kind != TOKEN_IDENT) {
+                    fail(parser, "expected member name after trait qualifier");
+                    return 0;
+                }
+                field->as.field.name = token_dup(&parser->current);
+                advance(parser);
+                expr = field;
+                continue;
+            }
             advance(parser);
             if (parser->current.kind != TOKEN_IDENT) {
                 return 0;
             }
             field = new_expr(AST_EXPR_FIELD, expr->line);
             field->as.field.base = expr;
+            field->as.field.trait_name = 0;
             field->as.field.name = token_dup(&parser->current);
             advance(parser);
             expr = field;

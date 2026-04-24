@@ -547,6 +547,11 @@ Fn<Bool, Int, Int> compare;
 - 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
 - `Fn<...>` 的返回类型可以写成 `T@E`
 - 通过 `Fn<...>` 变量进行调用
+- 若同名函数/方法存在多个重载：
+  - 调用时按参数个数和参数类型**精确匹配**
+  - 返回类型不参与重载决议
+  - 将函数值赋给 `Fn<...>` 时，目标 `Fn<...>` 类型会参与消歧
+  - 若没有目标类型上下文（例如 `_ f = foo;`）且存在多个重载，则编译报歧义
 
 示例 1：顶层函数
 
@@ -600,6 +605,21 @@ Int value = add(user$.ref(), 2);
 - 通过实例值获取绑定方法函数值（例如 `value.method`）
 - `init` 转函数指针
 - 闭包
+
+示例 5：重载函数值按 `Fn<...>` 目标类型消歧
+
+```c
+Int add(Int value) {
+    return value + 1;
+}
+
+Int add(Int left, Int right) {
+    return left + right;
+}
+
+Fn<Int, Int> inc = add;
+Fn<Int, Int, Int> sum = add;
+```
 
 示例 4：可错返回的函数指针
 
@@ -1512,8 +1532,10 @@ trait Numbric;
 - 只要 trait 本身是 `public`
 - 那么用于实现该 trait requirement 的方法就必须显式写 `public`
 - 这条规则同时适用于类型定义体内实现，以及 `extend Type: Trait { ... }` 中的实现
-- 若一个类型同时声明多个 trait，而这些 trait 中存在同名 requirement，则当前直接报错
-- 也就是说，当前不支持通过一个类型同时实现“名字相同”的多个 trait 方法
+- 若一个类型同时声明多个带同名 requirement 的 trait：
+  - 同名且签名完全一致：允许共存
+  - 同名但签名不同：允许共存
+  - 未限定调用时，固有方法优先；若需要显式指定 trait，可写 `value.[Trait].method(...)` 或 `Type.[Trait].method(...)`
 
 用户也可以自定义 trait，并声明内部函数签名，用于约束满足该 trait 的类型必须提供对应实例方法：
 
@@ -1530,6 +1552,43 @@ trait HashEq: Hashable {
   Bool equal(Self other);
 }
 ```
+
+当多个 trait 含有同名 requirement 时，可以用 trait 限定调用显式消歧：
+
+```c
+trait AddInt {
+  Int apply(Int delta);
+}
+
+trait FlagValue {
+  Int apply(Bool flag);
+}
+
+struct Counter: AddInt, FlagValue {
+  Int base;
+
+  Int apply(Int delta) {
+    return self.base + delta;
+  }
+
+  Int apply(Bool flag) {
+    if (flag) {
+      return self.base + 10;
+    }
+    return self.base;
+  }
+}
+
+Counter counter = Counter { base: 30 };
+Int a = counter.[AddInt].apply(2);
+Int b = Counter.[FlagValue].apply(counter$.ref(), true);
+```
+
+这里：
+
+- `value.[Trait].method(...)` 表示通过指定 trait requirement 调用实例方法
+- `Type.[Trait].method(...)` 表示通过指定 trait requirement 调用类型侧的方法值或未绑定实例方法
+- `.[Trait]` 只用于 trait method requirement 消歧，不用于字段、关联类型或其他成员
 
 trait 还可以在 trait 体内部使用 `type` 声明关联类型：
 
@@ -1824,9 +1883,7 @@ extend User: HasValue {
 - `extend` 块里只允许普通方法
 - 不支持 `init`
 - 不支持 `deinit`
-- 若 `extend Type: Trait1, Trait2` 中的多个 trait 带有同名 requirement：
-  - 同名且签名完全一致：允许合并
-  - 同名但签名不同：编译报错
+- `extend Type: Trait1, Trait2` 可以同时涉及多个带同名 requirement 的 trait；调用时若需要显式指定 trait，可使用 `.[Trait]`
 
 ### 模块（Module）
 

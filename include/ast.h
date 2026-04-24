@@ -343,6 +343,7 @@ struct AstExpr {
         } variant;
         struct {
             AstExpr* base;
+            char* trait_name;
             char* name;
         } field;
         struct {

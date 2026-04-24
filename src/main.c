@@ -885,6 +885,9 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
         case AST_EXPR_FIELD:
         case AST_EXPR_OPTIONAL_FIELD:
             out->as.field.base = clone_expr(source, prefix, hide_private, expr->as.field.base);
+            out->as.field.trait_name = expr->as.field.trait_name
+                ? remap_type_name(source, prefix, hide_private, expr->as.field.trait_name)
+                : 0;
             out->as.field.name = dup_text(expr->as.field.name);
             break;
         case AST_EXPR_STRUCT:
@@ -2849,6 +2852,44 @@ static const AstFunction* find_type_method_template(const AstProgram* program, c
     return find_method_template(program, query.nominal.name, method_name);
 }
 
+static const AstFunction* find_type_method_template_matching_signature(const AstProgram* program,
+                                                                       const AstType* type,
+                                                                       const AstType* expected_return,
+                                                                       const AstParamList* expected_params,
+                                                                       const char* method_name,
+                                                                       int static_method_flag) {
+    AstTypeQueryRef query = describe_ast_type(program, type);
+    int i = 0;
+    if (query.kind != AST_TYPE_QUERY_NOMINAL || !query.nominal.name) {
+        return 0;
+    }
+    for (i = 0; i < program->functions.count; ++i) {
+        const AstFunction* fn = &program->functions.items[i];
+        int j = 0;
+        if (!fn->method_flag || fn->static_method_flag != static_method_flag || !fn->owner_type_name) {
+            continue;
+        }
+        if (strcmp(fn->owner_type_name, query.nominal.name) != 0 || strcmp(fn->name, method_name) != 0) {
+            continue;
+        }
+        if (!ast_type_is_equal(&fn->return_type, expected_return)) {
+            continue;
+        }
+        if (fn->params.count != expected_params->count) {
+            continue;
+        }
+        for (j = 0; j < fn->params.count; ++j) {
+            if (!ast_type_is_equal(&fn->params.items[j].type, &expected_params->items[j].type)) {
+                break;
+            }
+        }
+        if (j == fn->params.count) {
+            return fn;
+        }
+    }
+    return 0;
+}
+
 static const AstType* lookup_subst(const TypeSubstList* subst, const char* name) {
     int i = 0;
     for (i = 0; i < subst->count; ++i) {
@@ -3313,31 +3354,32 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
     for (i = 0; i < methods.count; ++i) {
         const AstConceptMethod* requirement = methods.items[i].method;
         const AstConceptDecl* owner_concept = methods.items[i].owner;
-        const AstFunction* method = find_type_method_template(program, type, requirement->name);
+        const AstFunction* method = 0;
+        AstType expected_return = substitute_contract_type(&requirement->return_type, type, &assoc_bindings);
+        AstParamList expected_params;
         int j = 0;
+        memset(&expected_params, 0, sizeof(expected_params));
         if (!assoc_where_constraints_satisfied(program, &requirement->where_constraints, &assoc_bindings)) {
             continue;
         }
-        if (!method || method->static_method_flag) {
+        for (j = 0; j < requirement->params.count; ++j) {
+            AstParam param;
+            memset(&param, 0, sizeof(param));
+            param.name = requirement->params.items[j].name;
+            param.type = substitute_contract_type(&requirement->params.items[j].type, type, &assoc_bindings);
+            param_list_push(&expected_params, param);
+        }
+        method = find_type_method_template_matching_signature(program,
+                                                              type,
+                                                              &expected_return,
+                                                              &expected_params,
+                                                              requirement->name,
+                                                              0);
+        if (!method) {
             return 0;
         }
         if (owner_concept && owner_concept->public_flag && !method->public_flag) {
             return 0;
-        }
-        {
-            AstType expected_return = substitute_contract_type(&requirement->return_type, type, &assoc_bindings);
-            if (!ast_type_is_equal(&method->return_type, &expected_return)) {
-                return 0;
-            }
-        }
-        if (method->params.count != requirement->params.count) {
-            return 0;
-        }
-        for (j = 0; j < method->params.count; ++j) {
-            AstType expected_param = substitute_contract_type(&requirement->params.items[j].type, type, &assoc_bindings);
-            if (!ast_type_is_equal(&method->params.items[j].type, &expected_param)) {
-                return 0;
-            }
         }
     }
     return 1;
@@ -3718,15 +3760,6 @@ static int validate_where_constraints_program(const AstProgram* program, const c
             }
         }
         {
-            const char* collect_error = 0;
-            char* detail_name = 0;
-            if (!nominal_concepts_have_unique_method_names(program, &program->structs.items[i].concept_names, &collect_error, &detail_name)) {
-                snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
-                *error = where_error;
-                return 0;
-            }
-        }
-        {
             AstNominalDeclRef nominal = find_ast_nominal_decl(program, program->structs.items[i].name);
             const char* binding_error = 0;
             char* detail_name = 0;
@@ -3769,15 +3802,6 @@ static int validate_where_constraints_program(const AstProgram* program, const c
             }
         }
         {
-            const char* collect_error = 0;
-            char* detail_name = 0;
-            if (!nominal_concepts_have_unique_method_names(program, &program->enums.items[i].concept_names, &collect_error, &detail_name)) {
-                snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
-                *error = where_error;
-                return 0;
-            }
-        }
-        {
             AstNominalDeclRef nominal = find_ast_nominal_decl(program, program->enums.items[i].name);
             const char* binding_error = 0;
             char* detail_name = 0;
@@ -3803,15 +3827,6 @@ static int validate_where_constraints_program(const AstProgram* program, const c
             const char* concept_name = program->unions.items[i].concept_names.items[j];
             if (!concept_exists(program, concept_name)) {
                 snprintf(where_error, sizeof(where_error), "unknown trait on type: %s", concept_name);
-                *error = where_error;
-                return 0;
-            }
-        }
-        {
-            const char* collect_error = 0;
-            char* detail_name = 0;
-            if (!nominal_concepts_have_unique_method_names(program, &program->unions.items[i].concept_names, &collect_error, &detail_name)) {
-                snprintf(where_error, sizeof(where_error), "trait method conflict on type: %s", detail_name);
                 *error = where_error;
                 return 0;
             }
@@ -4436,6 +4451,7 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
         case AST_EXPR_FIELD:
         case AST_EXPR_OPTIONAL_FIELD:
             out->as.field.base = clone_expr_subst(expr->as.field.base, subst);
+            out->as.field.trait_name = expr->as.field.trait_name ? dup_text(expr->as.field.trait_name) : 0;
             out->as.field.name = dup_text(expr->as.field.name);
             break;
         case AST_EXPR_STRUCT:
