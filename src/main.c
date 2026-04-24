@@ -1490,7 +1490,7 @@ static const AstBuiltinNominalDecl AST_BUILTIN_F32_DECL = { AST_BUILTIN_NOMINAL_
 static const AstBuiltinNominalDecl AST_BUILTIN_F64_DECL = { AST_BUILTIN_NOMINAL_F64, "Float64" };
 static const AstBuiltinNominalDecl AST_BUILTIN_FLOAT_DECL = { AST_BUILTIN_NOMINAL_FLOAT, "Float" };
 static const AstBuiltinNominalDecl AST_BUILTIN_DOUBLE_DECL = { AST_BUILTIN_NOMINAL_DOUBLE, "Double" };
-static const AstBuiltinNominalDecl AST_BUILTIN_CHARACTER_DECL = { AST_BUILTIN_NOMINAL_CHARACTER, "Character" };
+static const AstBuiltinNominalDecl AST_BUILTIN_CHARACTER_DECL = { AST_BUILTIN_NOMINAL_CHARACTER, "Char" };
 static const AstBuiltinNominalDecl AST_BUILTIN_UINT8_DECL = { AST_BUILTIN_NOMINAL_UINT8, "UInt8" };
 static const AstBuiltinNominalDecl AST_BUILTIN_BOOL_DECL = { AST_BUILTIN_NOMINAL_BOOL, "Bool" };
 static const AstBuiltinNominalDecl AST_BUILTIN_VOID_DECL = { AST_BUILTIN_NOMINAL_VOID, "Void" };
@@ -1527,7 +1527,7 @@ static const AstBuiltinNominalDecl* find_ast_builtin_nominal(const char* name) {
     if (strcmp(name, "Float64") == 0) return &AST_BUILTIN_F64_DECL;
     if (strcmp(name, "Float") == 0) return &AST_BUILTIN_FLOAT_DECL;
     if (strcmp(name, "Double") == 0) return &AST_BUILTIN_DOUBLE_DECL;
-    if (strcmp(name, "Character") == 0) return &AST_BUILTIN_CHARACTER_DECL;
+    if (strcmp(name, "Char") == 0) return &AST_BUILTIN_CHARACTER_DECL;
     if (strcmp(name, "UInt8") == 0) return &AST_BUILTIN_UINT8_DECL;
     if (strcmp(name, "Bool") == 0) return &AST_BUILTIN_BOOL_DECL;
     if (strcmp(name, "Void") == 0) return &AST_BUILTIN_VOID_DECL;
@@ -1693,7 +1693,7 @@ static AstTypeQueryRef describe_ast_type(const AstProgram* program, const AstTyp
             return out;
         case AST_TYPE_CHARACTER:
             out.kind = AST_TYPE_QUERY_NOMINAL;
-            out.nominal = find_ast_nominal_decl(program, "Character");
+            out.nominal = find_ast_nominal_decl(program, "Char");
             return out;
         case AST_TYPE_UINT8:
             out.kind = AST_TYPE_QUERY_NOMINAL;
@@ -3938,7 +3938,7 @@ static char* mangle_type_name(const AstType* type) {
         case AST_TYPE_DOUBLE:
             return dup_text("Double");
         case AST_TYPE_CHARACTER:
-            return dup_text("Character");
+            return dup_text("Char");
         case AST_TYPE_STRING:
             return dup_text("String");
         case AST_TYPE_UINT8:

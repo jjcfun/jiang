@@ -9,7 +9,6 @@ typedef enum TokenKind {
     TOKEN_IDENT,
     TOKEN_INT_LIT,
     TOKEN_FLOAT_LIT,
-    TOKEN_CHAR_LIT,
     TOKEN_STRING_LIT,
     TOKEN_KW_INT,
     TOKEN_KW_FLOAT,

@@ -130,7 +130,7 @@ static const HirBuiltinNominalDecl HIR_BUILTIN_F32_DECL = { HIR_BUILTIN_NOMINAL_
 static const HirBuiltinNominalDecl HIR_BUILTIN_F64_DECL = { HIR_BUILTIN_NOMINAL_F64, "Float64" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_FLOAT_DECL = { HIR_BUILTIN_NOMINAL_FLOAT, "Float" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_DOUBLE_DECL = { HIR_BUILTIN_NOMINAL_DOUBLE, "Double" };
-static const HirBuiltinNominalDecl HIR_BUILTIN_CHARACTER_DECL = { HIR_BUILTIN_NOMINAL_CHARACTER, "Character" };
+static const HirBuiltinNominalDecl HIR_BUILTIN_CHARACTER_DECL = { HIR_BUILTIN_NOMINAL_CHARACTER, "Char" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_UINT8_DECL = { HIR_BUILTIN_NOMINAL_UINT8, "UInt8" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_BOOL_DECL = { HIR_BUILTIN_NOMINAL_BOOL, "Bool" };
 static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL_VOID, "Void" };
@@ -1732,7 +1732,7 @@ static const HirBuiltinNominalDecl* find_builtin_nominal(const char* name) {
     if (strcmp(name, "Float64") == 0) return &HIR_BUILTIN_F64_DECL;
     if (strcmp(name, "Float") == 0) return &HIR_BUILTIN_FLOAT_DECL;
     if (strcmp(name, "Double") == 0) return &HIR_BUILTIN_DOUBLE_DECL;
-    if (strcmp(name, "Character") == 0) return &HIR_BUILTIN_CHARACTER_DECL;
+    if (strcmp(name, "Char") == 0) return &HIR_BUILTIN_CHARACTER_DECL;
     if (strcmp(name, "UInt8") == 0) return &HIR_BUILTIN_UINT8_DECL;
     if (strcmp(name, "Bool") == 0) return &HIR_BUILTIN_BOOL_DECL;
     if (strcmp(name, "Void") == 0) return &HIR_BUILTIN_VOID_DECL;
@@ -1871,7 +1871,7 @@ static HirTypeQueryRef describe_hir_type(HirType* type) {
         case HIR_TYPE_CHARACTER:
             out.kind = HIR_TYPE_QUERY_NOMINAL;
             out.nominal.kind = HIR_NOMINAL_BUILTIN;
-            out.nominal.name = "Character";
+            out.nominal.name = "Char";
             out.nominal.decl = (void*)&HIR_BUILTIN_CHARACTER_DECL;
             return out;
         case HIR_TYPE_UINT8:
@@ -2778,6 +2778,67 @@ static int hir_type_is_uint8_array_or_slice(const HirType* type) {
            type->array_item->kind == HIR_TYPE_UINT8;
 }
 
+static int lower_string_char_literal_value(const AstExpr* expr, int64_t* out_value) {
+    const unsigned char* text = 0;
+    int length = 0;
+    int64_t value = 0;
+    if (!expr || expr->kind != AST_EXPR_STRING || !out_value) {
+        return 0;
+    }
+    text = (const unsigned char*)expr->as.string_lit.text;
+    length = expr->as.string_lit.length;
+    if (length <= 0) {
+        return 0;
+    }
+    if ((text[0] & 0x80) == 0) {
+        if (length != 1) {
+            return 0;
+        }
+        *out_value = text[0];
+        return 1;
+    }
+    if ((text[0] & 0xE0) == 0xC0) {
+        if (length != 2 || (text[1] & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = ((int64_t)(text[0] & 0x1F) << 6) |
+                (int64_t)(text[1] & 0x3F);
+        if (value < 0x80) {
+            return 0;
+        }
+        *out_value = value;
+        return 1;
+    }
+    if ((text[0] & 0xF0) == 0xE0) {
+        if (length != 3 || (text[1] & 0xC0) != 0x80 || (text[2] & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = ((int64_t)(text[0] & 0x0F) << 12) |
+                ((int64_t)(text[1] & 0x3F) << 6) |
+                (int64_t)(text[2] & 0x3F);
+        if (value < 0x800 || (value >= 0xD800 && value <= 0xDFFF)) {
+            return 0;
+        }
+        *out_value = value;
+        return 1;
+    }
+    if ((text[0] & 0xF8) == 0xF0) {
+        if (length != 4 || (text[1] & 0xC0) != 0x80 || (text[2] & 0xC0) != 0x80 || (text[3] & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = ((int64_t)(text[0] & 0x07) << 18) |
+                ((int64_t)(text[1] & 0x3F) << 12) |
+                ((int64_t)(text[2] & 0x3F) << 6) |
+                (int64_t)(text[3] & 0x3F);
+        if (value < 0x10000 || value > 0x10FFFF) {
+            return 0;
+        }
+        *out_value = value;
+        return 1;
+    }
+    return 0;
+}
+
 static HirExpr* lower_string_uint8_array_literal(LowerContext* ctx, const AstExpr* expr) {
     HirType* array_type = new_owned_type(ctx->program, HIR_TYPE_ARRAY);
     HirExpr* array_value = new_expr(HIR_EXPR_ARRAY, array_type, expr->line);
@@ -2841,7 +2902,7 @@ static HirType* find_named_owner_type(HirProgram* program, const char* owner_typ
             if (strcmp(nominal.name, "Float64") == 0) return primitive_type(program, HIR_TYPE_F64);
             if (strcmp(nominal.name, "Float") == 0) return primitive_type(program, HIR_TYPE_FLOAT);
             if (strcmp(nominal.name, "Double") == 0) return primitive_type(program, HIR_TYPE_DOUBLE);
-            if (strcmp(nominal.name, "Character") == 0) return primitive_type(program, HIR_TYPE_CHARACTER);
+            if (strcmp(nominal.name, "Char") == 0) return primitive_type(program, HIR_TYPE_CHARACTER);
             if (strcmp(nominal.name, "UInt8") == 0) return primitive_type(program, HIR_TYPE_UINT8);
             if (strcmp(nominal.name, "Bool") == 0) return primitive_type(program, HIR_TYPE_BOOL);
             if (strcmp(nominal.name, "Void") == 0) return primitive_type(program, HIR_TYPE_VOID);
@@ -3330,6 +3391,29 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         }
         case AST_EXPR_STRING: {
             HirExpr* array_value = 0;
+            int64_t char_value = 0;
+            if (expected_type &&
+                expected_type->kind == HIR_TYPE_OPTIONAL &&
+                type_equals(expected_type->array_item, primitive_type(ctx->program, HIR_TYPE_CHARACTER))) {
+                if (!lower_string_char_literal_value(expr, &char_value)) {
+                    fail(ctx, "Char literal requires exactly one Unicode scalar");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_CHAR, primitive_type(ctx->program, HIR_TYPE_CHARACTER), expr->line);
+                out->as.unary.value->as.char_value = char_value;
+                return out;
+            }
+            if (expected_type &&
+                type_equals(expected_type, primitive_type(ctx->program, HIR_TYPE_CHARACTER))) {
+                if (!lower_string_char_literal_value(expr, &char_value)) {
+                    fail(ctx, "Char literal requires exactly one Unicode scalar");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_CHAR, primitive_type(ctx->program, HIR_TYPE_CHARACTER), expr->line);
+                out->as.char_value = char_value;
+                return out;
+            }
             if (expected_type &&
                 expected_type->kind == HIR_TYPE_POINTER &&
                 expected_type->array_item &&

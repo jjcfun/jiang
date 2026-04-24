@@ -45,81 +45,6 @@ static char* token_slice_dup(const Token* token) {
     return text;
 }
 
-static int hex_digit_value(char ch) {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
-    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
-    return -1;
-}
-
-static int parse_char_literal_value(const Token* token, int64_t* out_value) {
-    const char* cursor = 0;
-    const char* end = 0;
-    int64_t value = 0;
-    if (!token || !out_value || token->length < 3 || token->start[0] != '\'' || token->start[token->length - 1] != '\'') {
-        return 0;
-    }
-    cursor = token->start + 1;
-    end = token->start + token->length - 1;
-    if (cursor >= end) {
-        return 0;
-    }
-    if (*cursor != '\\') {
-        if (cursor + 1 != end) {
-            return 0;
-        }
-        *out_value = (unsigned char)*cursor;
-        return 1;
-    }
-    cursor += 1;
-    if (cursor >= end) {
-        return 0;
-    }
-    switch (*cursor) {
-        case 'n': value = '\n'; cursor += 1; break;
-        case 'r': value = '\r'; cursor += 1; break;
-        case 't': value = '\t'; cursor += 1; break;
-        case '0': value = '\0'; cursor += 1; break;
-        case '\\': value = '\\'; cursor += 1; break;
-        case '\'': value = '\''; cursor += 1; break;
-        case '"': value = '"'; cursor += 1; break;
-        case 'u': {
-            cursor += 1;
-            if (cursor >= end || *cursor != '{') {
-                return 0;
-            }
-            cursor += 1;
-            if (cursor >= end) {
-                return 0;
-            }
-            value = 0;
-            while (cursor < end && *cursor != '}') {
-                int digit = hex_digit_value(*cursor);
-                if (digit < 0) {
-                    return 0;
-                }
-                value = (value << 4) | digit;
-                if (value > 0x10FFFF) {
-                    return 0;
-                }
-                cursor += 1;
-            }
-            if (cursor >= end || *cursor != '}') {
-                return 0;
-            }
-            cursor += 1;
-            break;
-        }
-        default:
-            return 0;
-    }
-    if (cursor != end) {
-        return 0;
-    }
-    *out_value = value;
-    return 1;
-}
-
 static char* dup_join3(const char* left, const char* middle, const char* right) {
     size_t left_len = strlen(left);
     size_t middle_len = strlen(middle);
@@ -1039,7 +964,7 @@ static AstType parse_type(Parser* parser) {
             advance(parser);
             return parse_type_postfix(parser, type);
         }
-        if (token_equals(&parser->current, "Character")) {
+        if (token_equals(&parser->current, "Char")) {
             type.kind = AST_TYPE_CHARACTER;
             advance(parser);
             return parse_type_postfix(parser, type);
@@ -1929,18 +1854,6 @@ static AstExpr* parse_primary(Parser* parser) {
             fail(parser, "invalid float literal");
             return 0;
         }
-        advance(parser);
-        return expr;
-    }
-
-    if (token.kind == TOKEN_CHAR_LIT) {
-        int64_t value = 0;
-        if (!parse_char_literal_value(&token, &value)) {
-            fail(parser, "invalid character literal");
-            return 0;
-        }
-        expr = new_expr(AST_EXPR_CHAR, token.line);
-        expr->as.char_value = value;
         advance(parser);
         return expr;
     }
@@ -4102,7 +4015,7 @@ void parser_init(Parser* parser, const char* source, const char* filename) {
     register_known_type(parser, "Float64");
     register_known_type(parser, "Float");
     register_known_type(parser, "Double");
-    register_known_type(parser, "Character");
+    register_known_type(parser, "Char");
     register_known_type(parser, "UInt8");
     register_known_type(parser, "Bool");
     parser->current = lexer_next(&parser->lexer);

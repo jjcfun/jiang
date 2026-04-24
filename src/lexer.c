@@ -191,45 +191,6 @@ Token lexer_next(Lexer* lexer) {
         return make_token(lexer, TOKEN_STRING_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
     }
 
-    if (*lexer->current == '\'') {
-        lexer->current += 1;
-        if (*lexer->current == '\0' || *lexer->current == '\n' || *lexer->current == '\'') {
-            return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
-        }
-        if (*lexer->current == '\\') {
-            lexer->current += 1;
-            if (*lexer->current == 'u') {
-                lexer->current += 1;
-                if (*lexer->current != '{') {
-                    return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
-                }
-                lexer->current += 1;
-                if (!is_hex_digit_char(*lexer->current)) {
-                    return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
-                }
-                while (is_hex_digit_char(*lexer->current)) {
-                    lexer->current += 1;
-                }
-                if (*lexer->current != '}') {
-                    return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
-                }
-                lexer->current += 1;
-            } else if (*lexer->current == 'n' || *lexer->current == 'r' || *lexer->current == 't' ||
-                       *lexer->current == '0' || *lexer->current == '\\' || *lexer->current == '\'' || *lexer->current == '"') {
-                lexer->current += 1;
-            } else {
-                return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
-            }
-        } else {
-            lexer->current += 1;
-        }
-        if (*lexer->current != '\'') {
-            return make_token(lexer, TOKEN_ERROR, lexer->start, (size_t)(lexer->current - lexer->start));
-        }
-        lexer->current += 1;
-        return make_token(lexer, TOKEN_CHAR_LIT, lexer->start, (size_t)(lexer->current - lexer->start));
-    }
-
     if (isalpha((unsigned char)*lexer->current) || *lexer->current == '_') {
         return ident_or_keyword(lexer);
     }

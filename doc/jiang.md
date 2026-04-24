@@ -67,7 +67,7 @@ Int?[3]* c = new [1, null, 3]
 ```c
 Int a1 = -123;
 UInt8 a2 = 23;
-Character ch = 'a';
+Char ch = "a";
 UInt8[3] a3 = "abc";
 Int16 a4 = -45;
 UInt16 a5 = 512;
@@ -91,7 +91,7 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 
 其中：
 
-- `Character` 表示单个 Unicode 标量
+- `Char` 表示单个 Unicode 标量，字面量语法与字符串一致，例如 `"a"`、`"中"`
 - 字符串字面量按 UTF-8 字节序列处理，当前仍使用 `UInt8[_]` / `UInt8[]`
 - `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
 
