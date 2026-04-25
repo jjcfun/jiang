@@ -5,7 +5,7 @@
 #include "hir.h"
 #include "jir.h"
 
-int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error, int* error_line);
-int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error, int* error_line);
+int lower_ast_to_hir(const AstProgram* ast, HirProgram* hir, const char** error, int* error_line, int* error_column);
+int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error, int* error_line, int* error_column);
 
 #endif

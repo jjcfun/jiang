@@ -125,10 +125,13 @@ static int is_known_type(Parser* parser, const Token* token);
 #define union_list_push(list, union_decl) VEC_PUSH((list), (union_decl))
 #define name_list_push(list, name) VEC_PUSH((list), (name))
 
+static Parser* g_active_parser = 0;
+
 static AstExpr* new_expr(AstExprKind kind, int line) {
     AstExpr* expr = (AstExpr*)calloc(1, sizeof(AstExpr));
     expr->kind = kind;
     expr->line = line;
+    expr->column = g_active_parser ? parser_current_column(g_active_parser) : 0;
     return expr;
 }
 
@@ -136,6 +139,7 @@ static AstStmt* new_stmt(AstStmtKind kind, int line) {
     AstStmt* stmt = (AstStmt*)calloc(1, sizeof(AstStmt));
     stmt->kind = kind;
     stmt->line = line;
+    stmt->column = g_active_parser ? parser_current_column(g_active_parser) : 0;
     return stmt;
 }
 
@@ -143,6 +147,7 @@ static AstBindingPattern* new_binding_pattern(AstBindingPatternKind kind, int li
     AstBindingPattern* pattern = (AstBindingPattern*)calloc(1, sizeof(AstBindingPattern));
     pattern->kind = kind;
     pattern->line = line;
+    pattern->column = g_active_parser ? parser_current_column(g_active_parser) : 0;
     return pattern;
 }
 
@@ -4023,6 +4028,7 @@ void parser_init(Parser* parser, const char* source, const char* filename) {
 }
 
 int parser_parse_program(Parser* parser, AstProgram* out_program) {
+    g_active_parser = parser;
     memset(out_program, 0, sizeof(*out_program));
     while (parser->current.kind != TOKEN_EOF) {
         AstType type;
@@ -4251,5 +4257,6 @@ int parser_parse_program(Parser* parser, AstProgram* out_program) {
 
         return fail(parser, "expected function or global declaration");
     }
+    g_active_parser = 0;
     return 1;
 }

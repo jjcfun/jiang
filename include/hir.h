@@ -188,6 +188,7 @@ struct HirExpr {
     HirExprKind kind;
     HirType* type;
     int line;
+    int column;
     union {
         int64_t int_value;
         double float_value;
@@ -332,6 +333,7 @@ typedef struct HirTryCatchList {
 struct HirStmt {
     HirStmtKind kind;
     int line;
+    int column;
     union {
         struct {
             HirExpr* expr;

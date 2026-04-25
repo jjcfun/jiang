@@ -59,6 +59,7 @@ typedef struct LowerJirContext {
     JirLoopTargetList loops;
     const char** error;
     int* error_line;
+    int* error_column;
 } LowerJirContext;
 
 #define jir_loop_list_push(list, item) VEC_PUSH((list), (item))
@@ -316,12 +317,12 @@ static JirBinding* lower_binding(const HirBinding* hir_binding, const char** err
     return jir_binding;
 }
 
-static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char** error, int* error_line);
+static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char** error, int* error_line, int* error_column);
 static JirExpr* desugar_expr(JirExpr* expr);
 static JirExpr* desugar_lvalue_expr(JirExpr* expr);
 static JirExpr* make_int_expr(int64_t value, JirType* type, int line);
 static JirExpr* make_extract_expr(JirExtractKind kind, JirExpr* base, int field_index, JirType* type, JirType* payload_type, int line);
-static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const HirStmt* stmt, const char** error, int* error_line);
+static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const HirStmt* stmt, const char** error, int* error_line, int* error_column);
 
 static JirExpr* new_expr(JirExprKind kind, JirType* type, int line) {
     JirExpr* expr = (JirExpr*)calloc(1, sizeof(JirExpr));
@@ -693,11 +694,11 @@ static JirFunction* find_jir_function(JirProgram* program, const char* name) {
     return 0;
 }
 
-static int lower_expr_list(JirProgram* program, const HirExprList* hir_list, JirExprList* jir_list, const char** error, int* error_line) {
+static int lower_expr_list(JirProgram* program, const HirExprList* hir_list, JirExprList* jir_list, const char** error, int* error_line, int* error_column) {
     int i = 0;
     memset(jir_list, 0, sizeof(*jir_list));
     for (i = 0; i < hir_list->count; ++i) {
-        JirExpr* item = lower_expr(program, hir_list->items[i], error, error_line);
+        JirExpr* item = lower_expr(program, hir_list->items[i], error, error_line, error_column);
         if (!item) {
             return 0;
         }
@@ -706,7 +707,7 @@ static int lower_expr_list(JirProgram* program, const HirExprList* hir_list, Jir
     return 1;
 }
 
-static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char** error, int* error_line) {
+static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char** error, int* error_line, int* error_column) {
     JirExpr* out = 0;
     JirType* type = 0;
     int i = 0;
@@ -715,6 +716,9 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
     }
     if (error_line) {
         *error_line = expr->line;
+    }
+    if (error_column) {
+        *error_column = expr->column;
     }
     type = lower_type(expr->type, error);
     if (!type) {
@@ -745,7 +749,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_NULL:
             return out;
         case HIR_EXPR_OPTIONAL_SOME:
-            out->as.unary.value = lower_expr(program, expr->as.unary.value, error, error_line);
+            out->as.unary.value = lower_expr(program, expr->as.unary.value, error, error_line, error_column);
             return out->as.unary.value ? out : 0;
         case HIR_EXPR_BINDING:
             out->as.binding = lower_binding(expr->as.binding, error);
@@ -763,10 +767,10 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         case HIR_EXPR_NEW:
         case HIR_EXPR_FREE:
         case HIR_EXPR_BIT_NOT:
-            out->as.unary.value = lower_expr(program, expr->as.unary.value, error, error_line);
+            out->as.unary.value = lower_expr(program, expr->as.unary.value, error, error_line, error_column);
             return out->as.unary.value ? out : 0;
         case HIR_EXPR_PROPAGATE:
-            out->as.propagate.value = lower_expr(program, expr->as.propagate.value, error, error_line);
+            out->as.propagate.value = lower_expr(program, expr->as.propagate.value, error, error_line, error_column);
             out->as.propagate.error_type = lower_type(hir_errorable_error_type(expr->as.propagate.value->type), error);
             out->as.propagate.result_type = expr->as.propagate.result_type
                 ? lower_type(expr->as.propagate.result_type, error)
@@ -777,21 +781,21 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
                 : 0;
         case HIR_EXPR_BINARY:
             out->as.binary.op = jir_binary_op(expr->as.binary.op);
-            out->as.binary.left = lower_expr(program, expr->as.binary.left, error, error_line);
-            out->as.binary.right = lower_expr(program, expr->as.binary.right, error, error_line);
+            out->as.binary.left = lower_expr(program, expr->as.binary.left, error, error_line, error_column);
+            out->as.binary.right = lower_expr(program, expr->as.binary.right, error, error_line, error_column);
             return out->as.binary.left && out->as.binary.right ? out : 0;
         case HIR_EXPR_COALESCE:
-            out->as.coalesce.left = lower_expr(program, expr->as.coalesce.left, error, error_line);
-            out->as.coalesce.right = lower_expr(program, expr->as.coalesce.right, error, error_line);
+            out->as.coalesce.left = lower_expr(program, expr->as.coalesce.left, error, error_line, error_column);
+            out->as.coalesce.right = lower_expr(program, expr->as.coalesce.right, error, error_line, error_column);
             return out->as.coalesce.left && out->as.coalesce.right ? out : 0;
         case HIR_EXPR_CATCH_FALLBACK:
-            out->as.catch_fallback.left = lower_expr(program, expr->as.catch_fallback.left, error, error_line);
-            out->as.catch_fallback.fallback = lower_expr(program, expr->as.catch_fallback.fallback, error, error_line);
+            out->as.catch_fallback.left = lower_expr(program, expr->as.catch_fallback.left, error, error_line, error_column);
+            out->as.catch_fallback.fallback = lower_expr(program, expr->as.catch_fallback.fallback, error, error_line, error_column);
             return out->as.catch_fallback.left && out->as.catch_fallback.fallback ? out : 0;
         case HIR_EXPR_CATCH_HANDLER:
-            out->as.catch_handler.left = lower_expr(program, expr->as.catch_handler.left, error, error_line);
+            out->as.catch_handler.left = lower_expr(program, expr->as.catch_handler.left, error, error_line, error_column);
             out->as.catch_handler.binding = lower_binding(expr->as.catch_handler.binding, error);
-            out->as.catch_handler.handler = lower_expr(program, expr->as.catch_handler.handler, error, error_line);
+            out->as.catch_handler.handler = lower_expr(program, expr->as.catch_handler.handler, error, error_line, error_column);
             return out->as.catch_handler.left && out->as.catch_handler.binding && out->as.catch_handler.handler ? out : 0;
         case HIR_EXPR_BLOCK: {
             JirBasicBlock temp_block;
@@ -802,27 +806,27 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
                 return 0;
             }
             for (i = 0; i < expr->as.block_expr.body->stmts.count; ++i) {
-                if (!append_simple_inst(program, &temp_block, expr->as.block_expr.body->stmts.items[i], error, error_line)) {
+                if (!append_simple_inst(program, &temp_block, expr->as.block_expr.body->stmts.items[i], error, error_line, error_column)) {
                     return 0;
                 }
             }
             *out->as.block_expr.insts = temp_block.insts;
-            out->as.block_expr.value = lower_expr(program, expr->as.block_expr.value, error, error_line);
+            out->as.block_expr.value = lower_expr(program, expr->as.block_expr.value, error, error_line, error_column);
             return out->as.block_expr.value ? out : 0;
         }
         case HIR_EXPR_IF:
-            out->as.if_expr.cond = lower_expr(program, expr->as.if_expr.cond, error, error_line);
-            out->as.if_expr.then_expr = lower_expr(program, expr->as.if_expr.then_expr, error, error_line);
-            out->as.if_expr.else_expr = lower_expr(program, expr->as.if_expr.else_expr, error, error_line);
+            out->as.if_expr.cond = lower_expr(program, expr->as.if_expr.cond, error, error_line, error_column);
+            out->as.if_expr.then_expr = lower_expr(program, expr->as.if_expr.then_expr, error, error_line, error_column);
+            out->as.if_expr.else_expr = lower_expr(program, expr->as.if_expr.else_expr, error, error_line, error_column);
             return out->as.if_expr.cond && out->as.if_expr.then_expr && out->as.if_expr.else_expr ? out : 0;
         case HIR_EXPR_TERNARY:
-            out->as.ternary.cond = lower_expr(program, expr->as.ternary.cond, error, error_line);
-            out->as.ternary.then_expr = lower_expr(program, expr->as.ternary.then_expr, error, error_line);
-            out->as.ternary.else_expr = lower_expr(program, expr->as.ternary.else_expr, error, error_line);
+            out->as.ternary.cond = lower_expr(program, expr->as.ternary.cond, error, error_line, error_column);
+            out->as.ternary.then_expr = lower_expr(program, expr->as.ternary.then_expr, error, error_line, error_column);
+            out->as.ternary.else_expr = lower_expr(program, expr->as.ternary.else_expr, error, error_line, error_column);
             return out->as.ternary.cond && out->as.ternary.then_expr && out->as.ternary.else_expr ? out : 0;
         case HIR_EXPR_CALL:
             out->as.call.callee = expr->as.call.callee ? find_jir_function(program, expr->as.call.callee->name) : 0;
-            out->as.call.callee_value = expr->as.call.callee_value ? lower_expr(program, expr->as.call.callee_value, error, error_line) : 0;
+            out->as.call.callee_value = expr->as.call.callee_value ? lower_expr(program, expr->as.call.callee_value, error, error_line, error_column) : 0;
             out->as.call.builtin = jir_builtin_kind(expr->as.call.builtin);
             if (expr->as.call.callee && !out->as.call.callee) {
                 *error = "missing JIR callee";
@@ -831,34 +835,34 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             if (expr->as.call.callee_value && !out->as.call.callee_value) {
                 return 0;
             }
-            return lower_expr_list(program, &expr->as.call.args, &out->as.call.args, error, error_line) ? out : 0;
+            return lower_expr_list(program, &expr->as.call.args, &out->as.call.args, error, error_line, error_column) ? out : 0;
         case HIR_EXPR_ENUM_MEMBER:
             out->as.enum_member.value = expr->as.enum_member.member->value;
             return out;
         case HIR_EXPR_VARIANT:
             out->as.variant.tag_value = expr->as.variant.variant->tag_value;
-            out->as.variant.payload = expr->as.variant.payload ? lower_expr(program, expr->as.variant.payload, error, error_line) : 0;
+            out->as.variant.payload = expr->as.variant.payload ? lower_expr(program, expr->as.variant.payload, error, error_line, error_column) : 0;
             return expr->as.variant.payload && !out->as.variant.payload ? 0 : out;
         case HIR_EXPR_ENUM_VALUE:
-            out->as.enum_value.value = lower_expr(program, expr->as.enum_value.value, error, error_line);
+            out->as.enum_value.value = lower_expr(program, expr->as.enum_value.value, error, error_line, error_column);
             return out->as.enum_value.value ? out : 0;
         case HIR_EXPR_UNION_TAG:
-            out->as.union_tag.value = lower_expr(program, expr->as.union_tag.value, error, error_line);
+            out->as.union_tag.value = lower_expr(program, expr->as.union_tag.value, error, error_line, error_column);
             return out->as.union_tag.value ? out : 0;
         case HIR_EXPR_UNION_FIELD:
-            out->as.union_field.value = lower_expr(program, expr->as.union_field.value, error, error_line);
+            out->as.union_field.value = lower_expr(program, expr->as.union_field.value, error, error_line, error_column);
             out->as.union_field.field_index = expr->as.union_field.field_index;
             out->as.union_field.payload_type = lower_type(expr->as.union_field.variant->payload_type, error);
             return out->as.union_field.value ? out : 0;
         case HIR_EXPR_OPTIONAL_VALUE:
-            out->as.optional_value.value = lower_expr(program, expr->as.optional_value.value, error, error_line);
+            out->as.optional_value.value = lower_expr(program, expr->as.optional_value.value, error, error_line, error_column);
             return out->as.optional_value.value ? out : 0;
         case HIR_EXPR_STRUCT:
             for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
                 JirStructFieldInit init;
                 memset(&init, 0, sizeof(init));
                 init.field_index = (int)(expr->as.struct_lit.fields.items[i].field - expr->type->struct_decl->fields.items);
-                init.value = lower_expr(program, expr->as.struct_lit.fields.items[i].value, error, error_line);
+                init.value = lower_expr(program, expr->as.struct_lit.fields.items[i].value, error, error_line, error_column);
                 if (!init.value) {
                     return 0;
                 }
@@ -866,22 +870,22 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             }
             return out;
         case HIR_EXPR_STRUCT_FIELD:
-            out->as.struct_field.base = lower_expr(program, expr->as.struct_field.base, error, error_line);
+            out->as.struct_field.base = lower_expr(program, expr->as.struct_field.base, error, error_line, error_column);
             out->as.struct_field.field_index = expr->as.struct_field.field_index;
             return out->as.struct_field.base ? out : 0;
         case HIR_EXPR_TUPLE:
-            return lower_expr_list(program, &expr->as.tuple.items, &out->as.tuple.items, error, error_line) ? out : 0;
+            return lower_expr_list(program, &expr->as.tuple.items, &out->as.tuple.items, error, error_line, error_column) ? out : 0;
         case HIR_EXPR_ARRAY:
-            return lower_expr_list(program, &expr->as.array.items, &out->as.array.items, error, error_line) ? out : 0;
+            return lower_expr_list(program, &expr->as.array.items, &out->as.array.items, error, error_line, error_column) ? out : 0;
         case HIR_EXPR_INDEX:
-            out->as.index.base = lower_expr(program, expr->as.index.base, error, error_line);
-            out->as.index.index = lower_expr(program, expr->as.index.index, error, error_line);
+            out->as.index.base = lower_expr(program, expr->as.index.base, error, error_line, error_column);
+            out->as.index.index = lower_expr(program, expr->as.index.index, error, error_line, error_column);
             return out->as.index.base && out->as.index.index ? out : 0;
         case HIR_EXPR_SLICE:
-            out->as.slice.base = lower_expr(program, expr->as.slice.base, error, error_line);
+            out->as.slice.base = lower_expr(program, expr->as.slice.base, error, error_line, error_column);
             return out->as.slice.base ? out : 0;
         case HIR_EXPR_SLICE_LENGTH:
-            out->as.slice_length.base = lower_expr(program, expr->as.slice_length.base, error, error_line);
+            out->as.slice_length.base = lower_expr(program, expr->as.slice_length.base, error, error_line, error_column);
             return out->as.slice_length.base ? out : 0;
     }
     *error = "unsupported JIR expr";
@@ -954,7 +958,7 @@ static void set_block_ref(JirBasicBlockRef* ref, JirLoweredFunction* function, i
     ref->name = function->blocks.items[index].name;
 }
 
-static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const HirStmt* stmt, const char** error, int* error_line) {
+static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const HirStmt* stmt, const char** error, int* error_line, int* error_column) {
     JirInst inst;
     memset(&inst, 0, sizeof(inst));
     inst.line = stmt->line;
@@ -962,7 +966,7 @@ static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const H
         case HIR_STMT_VAR_DECL:
             inst.kind = JIR_INST_VAR_DECL;
             inst.binding = lower_binding(stmt->as.var_decl.binding, error);
-            inst.value = lower_expr(program, stmt->as.var_decl.init, error, error_line);
+            inst.value = lower_expr(program, stmt->as.var_decl.init, error, error_line, error_column);
             if (!inst.binding || !inst.value) {
                 return 0;
             }
@@ -970,15 +974,15 @@ static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const H
         case HIR_STMT_ASSIGN:
             inst.kind = JIR_INST_ASSIGN;
             inst.binding = stmt->as.assign.binding ? lower_binding(stmt->as.assign.binding, error) : 0;
-            inst.target = stmt->as.assign.target ? lower_expr(program, stmt->as.assign.target, error, error_line) : 0;
-            inst.value = lower_expr(program, stmt->as.assign.value, error, error_line);
+            inst.target = stmt->as.assign.target ? lower_expr(program, stmt->as.assign.target, error, error_line, error_column) : 0;
+            inst.value = lower_expr(program, stmt->as.assign.value, error, error_line, error_column);
             if ((stmt->as.assign.target && !inst.target) || !inst.value) {
                 return 0;
             }
             break;
         case HIR_STMT_EXPR:
             inst.kind = JIR_INST_EXPR;
-            inst.expr = lower_expr(program, stmt->as.expr_stmt.expr, error, error_line);
+            inst.expr = lower_expr(program, stmt->as.expr_stmt.expr, error, error_line, error_column);
             if (!inst.expr) {
                 return 0;
             }
@@ -1007,8 +1011,11 @@ static int lower_if_stmt(LowerJirContext* ctx, const HirStmt* stmt, int block_in
     if (ctx->error_line) {
         *ctx->error_line = stmt->line;
     }
+    if (ctx->error_column) {
+        *ctx->error_column = stmt->column;
+    }
     ctx->function->blocks.items[block_index].term.kind = JIR_TERM_COND_BRANCH;
-    ctx->function->blocks.items[block_index].term.cond = lower_expr(ctx->jir_program, stmt->as.if_stmt.cond, ctx->error, ctx->error_line);
+    ctx->function->blocks.items[block_index].term.cond = lower_expr(ctx->jir_program, stmt->as.if_stmt.cond, ctx->error, ctx->error_line, ctx->error_column);
     if (!ctx->function->blocks.items[block_index].term.cond) {
         return 0;
     }
@@ -1109,10 +1116,13 @@ static int lower_while_stmt(LowerJirContext* ctx, const HirStmt* stmt, int block
     if (ctx->error_line) {
         *ctx->error_line = stmt->line;
     }
+    if (ctx->error_column) {
+        *ctx->error_column = stmt->column;
+    }
     ctx->function->blocks.items[block_index].term.kind = JIR_TERM_BRANCH;
     set_block_ref(&ctx->function->blocks.items[block_index].term.then_target, ctx->function, cond_index);
     ctx->function->blocks.items[cond_index].term.kind = JIR_TERM_COND_BRANCH;
-    ctx->function->blocks.items[cond_index].term.cond = lower_expr(ctx->jir_program, stmt->as.while_stmt.cond, ctx->error, ctx->error_line);
+    ctx->function->blocks.items[cond_index].term.cond = lower_expr(ctx->jir_program, stmt->as.while_stmt.cond, ctx->error, ctx->error_line, ctx->error_column);
     if (!ctx->function->blocks.items[cond_index].term.cond) {
         return 0;
     }
@@ -1148,11 +1158,14 @@ static int lower_for_stmt(LowerJirContext* ctx, const HirStmt* stmt, int block_i
     if (ctx->error_line) {
         *ctx->error_line = stmt->line;
     }
+    if (ctx->error_column) {
+        *ctx->error_column = stmt->column;
+    }
     memset(&decl, 0, sizeof(decl));
     decl.kind = JIR_INST_VAR_DECL;
     decl.line = stmt->line;
     decl.binding = lower_binding(stmt->as.for_range.binding, ctx->error);
-    decl.value = lower_expr(ctx->jir_program, stmt->as.for_range.start, ctx->error, ctx->error_line);
+    decl.value = lower_expr(ctx->jir_program, stmt->as.for_range.start, ctx->error, ctx->error_line, ctx->error_column);
     if (!decl.binding || !decl.value) {
         return 0;
     }
@@ -1162,7 +1175,7 @@ static int lower_for_stmt(LowerJirContext* ctx, const HirStmt* stmt, int block_i
     cond = make_binary_expr(
         JIR_BIN_LT,
         make_binding_expr(decl.binding, stmt->line),
-        lower_expr(ctx->jir_program, stmt->as.for_range.end, ctx->error, ctx->error_line),
+        lower_expr(ctx->jir_program, stmt->as.for_range.end, ctx->error, ctx->error_line, ctx->error_column),
         lower_type(&ctx->program->bool_type, ctx->error),
         stmt->line);
     if (!cond || !cond->as.binary.right) {
@@ -1266,20 +1279,20 @@ static int lower_hir_block(LowerJirContext* ctx, const HirBlock* hir_block, int 
                 break;
             case HIR_STMT_RETURN:
                 block->term.kind = JIR_TERM_RETURN;
-                block->term.value = stmt->as.ret.expr ? lower_expr(ctx->jir_program, stmt->as.ret.expr, ctx->error, ctx->error_line) : 0;
+                block->term.value = stmt->as.ret.expr ? lower_expr(ctx->jir_program, stmt->as.ret.expr, ctx->error, ctx->error_line, ctx->error_column) : 0;
                 if (stmt->as.ret.expr && !block->term.value) {
                     return 0;
                 }
                 break;
             case HIR_STMT_THROW:
                 block->term.kind = JIR_TERM_THROW;
-                block->term.value = stmt->as.throw_stmt.expr ? lower_expr(ctx->jir_program, stmt->as.throw_stmt.expr, ctx->error, ctx->error_line) : 0;
+                block->term.value = stmt->as.throw_stmt.expr ? lower_expr(ctx->jir_program, stmt->as.throw_stmt.expr, ctx->error, ctx->error_line, ctx->error_column) : 0;
                 if (!block->term.value) {
                     return 0;
                 }
                 break;
             default:
-                if (!append_simple_inst(ctx->jir_program, block, stmt, ctx->error, ctx->error_line)) {
+                if (!append_simple_inst(ctx->jir_program, block, stmt, ctx->error, ctx->error_line, ctx->error_column)) {
                     return 0;
                 }
                 break;
@@ -1289,7 +1302,7 @@ static int lower_hir_block(LowerJirContext* ctx, const HirBlock* hir_block, int 
     return 1;
 }
 
-static int lower_function_skeleton(const HirProgram* hir_program, JirProgram* jir_program, const HirFunction* hir_fn, JirFunction* function_info, JirLoweredFunction* jir_fn, const char** error, int* error_line) {
+static int lower_function_skeleton(const HirProgram* hir_program, JirProgram* jir_program, const HirFunction* hir_fn, JirFunction* function_info, JirLoweredFunction* jir_fn, const char** error, int* error_line, int* error_column) {
     LowerJirContext ctx;
     int entry_index = 0;
     memset(jir_fn, 0, sizeof(*jir_fn));
@@ -1303,6 +1316,7 @@ static int lower_function_skeleton(const HirProgram* hir_program, JirProgram* ji
     ctx.function = jir_fn;
     ctx.error = error;
     ctx.error_line = error_line;
+    ctx.error_column = error_column;
     ctx.program = hir_program;
     ctx.jir_program = jir_program;
     ctx.active_try_scope = -1;
@@ -1350,7 +1364,7 @@ static int lower_function_info(const HirFunction* hir_fn, JirFunction* jir_fn, c
     return 1;
 }
 
-int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error, int* error_line) {
+int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error, int* error_line, int* error_column) {
     int i = 0;
     memset(jir, 0, sizeof(*jir));
     memset(&g_type_map, 0, sizeof(g_type_map));
@@ -1363,7 +1377,10 @@ int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error,
         if (error_line) {
             *error_line = hir->globals.items[i].line;
         }
-        global.init = hir->globals.items[i].init ? lower_expr(jir, hir->globals.items[i].init, error, error_line) : 0;
+        if (error_column) {
+            *error_column = hir->globals.items[i].init ? hir->globals.items[i].init->column : 0;
+        }
+        global.init = hir->globals.items[i].init ? lower_expr(jir, hir->globals.items[i].init, error, error_line, error_column) : 0;
         global.line = hir->globals.items[i].line;
         if (!global.binding || (!global.extern_flag && !global.init)) {
             return 0;
@@ -1382,7 +1399,7 @@ int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error,
         if (hir->functions.items[i].extern_flag) {
             continue;
         }
-        if (!lower_function_skeleton(hir, jir, &hir->functions.items[i], &jir->functions.items[i], &lowered, error, error_line)) {
+        if (!lower_function_skeleton(hir, jir, &hir->functions.items[i], &jir->functions.items[i], &lowered, error, error_line, error_column)) {
             return 0;
         }
         jir_function_list_push(&jir->lowered_functions, lowered);
@@ -1392,10 +1409,16 @@ int lower_hir_to_jir(const HirProgram* hir, JirProgram* jir, const char** error,
         if (error_line) {
             *error_line = 0;
         }
+        if (error_column) {
+            *error_column = 0;
+        }
         return 0;
     }
     if (error_line) {
         *error_line = 0;
+    }
+    if (error_column) {
+        *error_column = 0;
     }
     return 1;
 }

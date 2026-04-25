@@ -39,6 +39,13 @@
 #define assoc_type_binding_list_push(list, assoc_type_binding) VEC_PUSH((list), (assoc_type_binding))
 #define struct_init_decl_list_push(list, init_decl) VEC_PUSH((list), (init_decl))
 
+typedef struct CompilerDiagnostic {
+    const char* path;
+    int line;
+    int column;
+    const char* message;
+} CompilerDiagnostic;
+
 static char* dup_text(const char* text) {
     size_t n = strlen(text);
     char* out = (char*)malloc(n + 1);
@@ -149,81 +156,35 @@ static void print_source_excerpt(const char* path, int line, int column) {
     free(source);
 }
 
-static int parse_embedded_diagnostic(const char* error,
-                                     const char** out_path,
-                                     size_t* out_path_len,
-                                     int* out_line,
-                                     int* out_column,
-                                     const char** out_message) {
-    const char* p = 0;
-    const char* path_end = 0;
-    const char* msg = 0;
-    int line = 0;
-    int column = 0;
-    if (!error || !out_path || !out_path_len || !out_line || !out_column || !out_message) {
-        return 0;
-    }
-    path_end = strchr(error, ':');
-    if (!path_end || path_end == error) {
-        return 0;
-    }
-    p = path_end + 1;
-    if (!isdigit((unsigned char)*p)) {
-        return 0;
-    }
-    while (isdigit((unsigned char)*p)) {
-        line = line * 10 + (*p - '0');
-        p += 1;
-    }
-    if (*p == ':') {
-        const char* probe = p + 1;
-        if (isdigit((unsigned char)*probe)) {
-            p = probe;
-            while (isdigit((unsigned char)*p)) {
-                column = column * 10 + (*p - '0');
-                p += 1;
-            }
-        }
-    }
-    if (strncmp(p, ": error: ", 9) != 0) {
-        return 0;
-    }
-    msg = p + 9;
-    *out_path = error;
-    *out_path_len = (size_t)(path_end - error);
-    *out_line = line;
-    *out_column = column;
-    *out_message = msg;
-    return 1;
-}
-
-static void print_compiler_error(const char* path, int line, int column, const char* error) {
-    if (error && strstr(error, ": error: ")) {
-        const char* parsed_path = 0;
-        const char* parsed_message = 0;
-        size_t parsed_path_len = 0;
-        int parsed_line = 0;
-        int parsed_column = 0;
-        if (parse_embedded_diagnostic(error, &parsed_path, &parsed_path_len, &parsed_line, &parsed_column, &parsed_message)) {
-            char* path_copy = (char*)malloc(parsed_path_len + 1);
-            if (!path_copy) {
-                fprintf(stderr, "%s\n", error);
-                return;
-            }
-            memcpy(path_copy, parsed_path, parsed_path_len);
-            path_copy[parsed_path_len] = '\0';
-            fprintf(stderr, "%s:%d", path_copy, parsed_line);
-            if (parsed_column > 0) {
-                fprintf(stderr, ":%d", parsed_column);
-            }
-            fprintf(stderr, ": error: %s\n", parsed_message);
-            print_source_excerpt(path_copy, parsed_line, parsed_column);
-            free(path_copy);
-            return;
-        }
-        fprintf(stderr, "%s\n", error);
+static void clear_diagnostic(CompilerDiagnostic* diagnostic) {
+    if (!diagnostic) {
         return;
     }
+    diagnostic->path = 0;
+    diagnostic->line = 0;
+    diagnostic->column = 0;
+    diagnostic->message = 0;
+}
+
+static void set_diagnostic(CompilerDiagnostic* diagnostic,
+                           const char* path,
+                           int line,
+                           int column,
+                           const char* message) {
+    if (!diagnostic) {
+        return;
+    }
+    diagnostic->path = path;
+    diagnostic->line = line;
+    diagnostic->column = column;
+    diagnostic->message = message;
+}
+
+static void print_compiler_error(const CompilerDiagnostic* diagnostic) {
+    const char* path = diagnostic ? diagnostic->path : 0;
+    int line = diagnostic ? diagnostic->line : 0;
+    int column = diagnostic ? diagnostic->column : 0;
+    const char* error = diagnostic ? diagnostic->message : 0;
     if (!path || !*path) {
         fprintf(stderr, "error: %s\n", error ? error : "unknown error");
         return;
@@ -812,6 +773,7 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
     out = (AstExpr*)calloc(1, sizeof(AstExpr));
     out->kind = expr->kind;
     out->line = expr->line;
+    out->column = expr->column;
     switch (expr->kind) {
         case AST_EXPR_INT:
             out->as.int_value = expr->as.int_value;
@@ -999,6 +961,7 @@ static AstStmt* clone_stmt(const AstProgram* source, const char* prefix, int hid
     int i = 0;
     out->kind = stmt->kind;
     out->line = stmt->line;
+    out->column = stmt->column;
     switch (stmt->kind) {
         case AST_STMT_RETURN:
             out->as.ret.expr = clone_expr(source, prefix, hide_private, stmt->as.ret.expr);
@@ -1817,7 +1780,7 @@ static AstTypeQueryRef describe_ast_type(const AstProgram* program, const AstTyp
     }
 }
 
-static int validate_module_decls(const AstProgram* own_program, const char** error) {
+static int validate_module_decls(const char* path, const AstProgram* own_program, CompilerDiagnostic* diagnostic, const char** error) {
     int i = 0;
     int j = 0;
     for (i = 0; i < own_program->imports.count; ++i) {
@@ -1832,6 +1795,7 @@ static int validate_module_decls(const AstProgram* own_program, const char** err
             size_t len = dot && dot > base ? (size_t)(dot - base) : strlen(base);
             alias = (char*)malloc(len + 1);
             if (!alias) {
+                set_diagnostic(diagnostic, path, own_program->imports.items[i].line, 0, "out of memory");
                 *error = "out of memory";
                 return 0;
             }
@@ -1852,6 +1816,7 @@ static int validate_module_decls(const AstProgram* own_program, const char** err
                 other_alias = (char*)malloc(len + 1);
                 if (!other_alias) {
                     free(alias);
+                    set_diagnostic(diagnostic, path, own_program->imports.items[j].line, 0, "out of memory");
                     *error = "out of memory";
                     return 0;
                 }
@@ -1862,18 +1827,21 @@ static int validate_module_decls(const AstProgram* own_program, const char** err
             free(other_alias);
             if (same) {
                 free(alias);
+                set_diagnostic(diagnostic, path, own_program->imports.items[j].line, 0, "duplicate import alias");
                 *error = "duplicate import alias";
                 return 0;
             }
         }
         if (program_has_any_type(own_program, alias) || program_has_any_value(own_program, alias)) {
             free(alias);
+            set_diagnostic(diagnostic, path, own_program->imports.items[i].line, 0, "import alias conflicts with top-level declaration");
             *error = "import alias conflicts with top-level declaration";
             return 0;
         }
         for (j = 0; j < own_program->aliases.count; ++j) {
             if (strcmp(alias, own_program->aliases.items[j].name) == 0) {
                 free(alias);
+                set_diagnostic(diagnostic, path, own_program->imports.items[i].line, 0, "import alias conflicts with alias");
                 *error = "import alias conflicts with alias";
                 return 0;
             }
@@ -2705,18 +2673,21 @@ static int load_module_graph(const char* path,
                              LoadedModuleList* cache,
                              int root_flag,
                              LoadedModule** out_module,
+                             CompilerDiagnostic* diagnostic,
                              const char** error) {
     LoadedModule* module = 0;
     Parser parser;
     char* source = 0;
     int i = 0;
     if (path_in_stack(path, stack, depth)) {
+        set_diagnostic(diagnostic, path, 0, 0, "import cycle");
         *error = "import cycle";
         return 0;
     }
     module = find_loaded_module(cache, path);
     if (module) {
         if (module->loading_flag) {
+            set_diagnostic(diagnostic, path, 0, 0, "import cycle");
             *error = "import cycle";
             return 0;
         }
@@ -2725,6 +2696,7 @@ static int load_module_graph(const char* path,
     }
     module = (LoadedModule*)calloc(1, sizeof(LoadedModule));
     if (!module) {
+        set_diagnostic(diagnostic, path, 0, 0, "out of memory");
         *error = "out of memory";
         return 0;
     }
@@ -2735,37 +2707,22 @@ static int load_module_graph(const char* path,
     if (!source) {
         static char read_error[512];
         snprintf(read_error, sizeof(read_error), "failed to read import: %s", path);
+        set_diagnostic(diagnostic, path, 0, 0, read_error);
         *error = read_error;
         return 0;
     }
     parser_init(&parser, source, path);
     if (!parser_parse_program(&parser, &module->own_program)) {
-        static char parse_error[640];
-        if (parser.error_line > 0) {
-            if (parser.error_column > 0) {
-                snprintf(parse_error,
-                         sizeof(parse_error),
-                         "%s:%d:%d: error: %s",
-                         path,
-                         parser.error_line,
-                         parser.error_column,
-                         parser.error ? parser.error : "parse error");
-            } else {
-                snprintf(parse_error,
-                         sizeof(parse_error),
-                         "%s:%d: error: %s",
-                         path,
-                         parser.error_line,
-                         parser.error ? parser.error : "parse error");
-            }
-        } else {
-            snprintf(parse_error, sizeof(parse_error), "%s: error: %s", path, parser.error ? parser.error : "parse error");
-        }
-        *error = parse_error;
+        set_diagnostic(diagnostic,
+                       path,
+                       parser.error_line,
+                       parser.error_column,
+                       parser.error ? parser.error : "parse error");
+        *error = parser.error ? parser.error : "parse error";
         free(source);
         return 0;
     }
-    if (!validate_module_decls(&module->own_program, error)) {
+    if (!validate_module_decls(path, &module->own_program, diagnostic, error)) {
         free(source);
         return 0;
     }
@@ -2778,16 +2735,22 @@ static int load_module_graph(const char* path,
                                 ? dup_text(module->own_program.imports.items[i].alias_name)
                                 : import_module_name(module->own_program.imports.items[i].path, error);
         if (!import_path) {
+            set_diagnostic(diagnostic, path, module->own_program.imports.items[i].line, 0, "failed to resolve import");
             *error = "failed to resolve import";
             free(source);
             return 0;
         }
         if (!import_name) {
+            set_diagnostic(diagnostic,
+                           path,
+                           module->own_program.imports.items[i].line,
+                           0,
+                           *error ? *error : "failed to resolve import name");
             free(import_path);
             free(source);
             return 0;
         }
-        if (!load_module_graph(import_path, stack, depth + 1, cache, 0, &imported, error)) {
+        if (!load_module_graph(import_path, stack, depth + 1, cache, 0, &imported, diagnostic, error)) {
             free(import_name);
             free(import_path);
             free(source);
@@ -2802,7 +2765,7 @@ static int load_module_graph(const char* path,
     }
     if (!is_prelude_module_path(path)) {
         LoadedModule* prelude_module = 0;
-        if (!load_module_graph("std/prelude.jiang", stack, depth + 1, cache, 0, &prelude_module, error)) {
+        if (!load_module_graph("std/prelude.jiang", stack, depth + 1, cache, 0, &prelude_module, diagnostic, error)) {
             free(source);
             return 0;
         }
@@ -2826,12 +2789,17 @@ static int load_module_graph(const char* path,
     return 1;
 }
 
-static int load_effective_program(const char* path, const char** stack, int depth, AstProgram* out_program, const char** error) {
+static int load_effective_program(const char* path,
+                                  const char** stack,
+                                  int depth,
+                                  AstProgram* out_program,
+                                  CompilerDiagnostic* diagnostic,
+                                  const char** error) {
     LoadedModuleList cache;
     LoadedModule* root = 0;
     memset(&cache, 0, sizeof(cache));
     memset(out_program, 0, sizeof(*out_program));
-    if (!load_module_graph(path, stack, depth, &cache, 1, &root, error)) {
+    if (!load_module_graph(path, stack, depth, &cache, 1, &root, diagnostic, error)) {
         return 0;
     }
     *out_program = root->full_program;
@@ -4381,6 +4349,7 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
     int i = 0;
     out->kind = expr->kind;
     out->line = expr->line;
+    out->column = expr->column;
     switch (expr->kind) {
         case AST_EXPR_INT:
             out->as.int_value = expr->as.int_value;
@@ -4559,6 +4528,7 @@ static AstBindingPattern* clone_binding_pattern_subst(const AstBindingPattern* p
     int i = 0;
     out->kind = pattern->kind;
     out->line = pattern->line;
+    out->column = pattern->column;
     out->type = clone_type_subst(&pattern->type, subst);
     if (pattern->name) {
         out->name = dup_text(pattern->name);
@@ -4574,6 +4544,7 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
     int i = 0;
     out->kind = stmt->kind;
     out->line = stmt->line;
+    out->column = stmt->column;
     switch (stmt->kind) {
         case AST_STMT_RETURN:
             out->as.ret.expr = clone_expr_subst(stmt->as.ret.expr, subst);
@@ -5341,6 +5312,7 @@ int main(int argc, char** argv) {
     AstProgram mono_ast;
     HirProgram hir;
     JirProgram jir;
+    CompilerDiagnostic diagnostic;
     char* ir = 0;
     char* input_path = 0;
     char* output_path = 0;
@@ -5352,6 +5324,8 @@ int main(int argc, char** argv) {
         OUTPUT_OBJ = 2
     } output_mode = OUTPUT_EXE;
     int i = 0;
+
+    clear_diagnostic(&diagnostic);
 
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--emit-llvm") == 0) {
@@ -5384,30 +5358,40 @@ int main(int argc, char** argv) {
         const char* stack[64] = {0};
         (void)parser;
         if (!load_package_root_path(input_arg, &input_path, &error)) {
-            print_compiler_error(input_arg, 0, 0, error ? error : "failed to resolve package root");
+            set_diagnostic(&diagnostic, input_arg, 0, 0, error ? error : "failed to resolve package root");
+            print_compiler_error(&diagnostic);
             return 1;
         }
-        if (!load_effective_program(input_path, stack, 0, &ast, &error)) {
-            print_compiler_error(input_path, 0, 0, error ? error : "failed to load program");
+        clear_diagnostic(&diagnostic);
+        if (!load_effective_program(input_path, stack, 0, &ast, &diagnostic, &error)) {
+            if (!diagnostic.message) {
+                set_diagnostic(&diagnostic, input_path, 0, 0, error ? error : "failed to load program");
+            }
+            print_compiler_error(&diagnostic);
             return 1;
         }
     }
 
     if (!monomorphize_program(&ast, &mono_ast, &error)) {
-        print_compiler_error(input_path, 0, 0, error ? error : "failed to monomorphize AST");
+        set_diagnostic(&diagnostic, input_path, 0, 0, error ? error : "failed to monomorphize AST");
+        print_compiler_error(&diagnostic);
         return 1;
     }
     {
         int error_line = 0;
-        if (!lower_ast_to_hir(&mono_ast, &hir, &error, &error_line)) {
-            print_compiler_error(input_path, error_line, 0, error ? error : "failed to lower AST to HIR");
+        int error_column = 0;
+        if (!lower_ast_to_hir(&mono_ast, &hir, &error, &error_line, &error_column)) {
+            set_diagnostic(&diagnostic, input_path, error_line, error_column, error ? error : "failed to lower AST to HIR");
+            print_compiler_error(&diagnostic);
             return 1;
         }
     }
     {
         int error_line = 0;
-        if (!lower_hir_to_jir(&hir, &jir, &error, &error_line)) {
-            print_compiler_error(input_path, error_line, 0, error ? error : "failed to lower HIR to JIR");
+        int error_column = 0;
+        if (!lower_hir_to_jir(&hir, &jir, &error, &error_line, &error_column)) {
+            set_diagnostic(&diagnostic, input_path, error_line, error_column, error ? error : "failed to lower HIR to JIR");
+            print_compiler_error(&diagnostic);
             return 1;
         }
     }
@@ -5415,13 +5399,15 @@ int main(int argc, char** argv) {
     switch (output_mode) {
         case OUTPUT_LLVM_IR:
             if (!emit_llvm_ir(&jir, &ir, &error)) {
-                print_compiler_error(input_path, 0, 0, error ? error : "failed to emit LLVM IR");
+                set_diagnostic(&diagnostic, input_path, 0, 0, error ? error : "failed to emit LLVM IR");
+                print_compiler_error(&diagnostic);
                 return 1;
             }
             if (output_path) {
                 FILE* out = fopen(output_path, "wb");
                 if (!out) {
-                    print_compiler_error(output_path, 0, 0, "failed to open LLVM IR output");
+                    set_diagnostic(&diagnostic, output_path, 0, 0, "failed to open LLVM IR output");
+                    print_compiler_error(&diagnostic);
                     LLVMDisposeMessage(ir);
                     free(output_path);
                     return 1;
@@ -5439,7 +5425,12 @@ int main(int argc, char** argv) {
                 output_path = default_output_path(input_path, ".o");
             }
             if (!output_path || !emit_object_file(&jir, output_path, &error)) {
-                print_compiler_error(output_path ? output_path : input_path, 0, 0, error ? error : "failed to emit object file");
+                set_diagnostic(&diagnostic,
+                               output_path ? output_path : input_path,
+                               0,
+                               0,
+                               error ? error : "failed to emit object file");
+                print_compiler_error(&diagnostic);
                 free(output_path);
                 return 1;
             }
@@ -5450,7 +5441,8 @@ int main(int argc, char** argv) {
             char temp_template[] = "/tmp/jiangc-obj-XXXXXX.o";
             int temp_fd = mkstemps(temp_template, 2);
             if (temp_fd < 0) {
-                print_compiler_error(input_path, 0, 0, "failed to create temporary object file");
+                set_diagnostic(&diagnostic, input_path, 0, 0, "failed to create temporary object file");
+                print_compiler_error(&diagnostic);
                 return 1;
             }
             close(temp_fd);
@@ -5459,18 +5451,21 @@ int main(int argc, char** argv) {
             }
             if (!output_path) {
                 unlink(temp_template);
-                print_compiler_error(input_path, 0, 0, "failed to derive executable output path");
+                set_diagnostic(&diagnostic, input_path, 0, 0, "failed to derive executable output path");
+                print_compiler_error(&diagnostic);
                 return 1;
             }
             if (!emit_object_file(&jir, temp_template, &error)) {
                 unlink(temp_template);
-                print_compiler_error(input_path, 0, 0, error ? error : "failed to emit temporary object file");
+                set_diagnostic(&diagnostic, input_path, 0, 0, error ? error : "failed to emit temporary object file");
+                print_compiler_error(&diagnostic);
                 free(output_path);
                 return 1;
             }
             if (!link_executable_file(temp_template, output_path, &error)) {
                 unlink(temp_template);
-                print_compiler_error(output_path, 0, 0, error ? error : "failed to link executable");
+                set_diagnostic(&diagnostic, output_path, 0, 0, error ? error : "failed to link executable");
+                print_compiler_error(&diagnostic);
                 free(output_path);
                 return 1;
             }

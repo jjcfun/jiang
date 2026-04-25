@@ -261,6 +261,7 @@ typedef struct AstBindingPatternList {
 struct AstExpr {
     AstExprKind kind;
     int line;
+    int column;
     union {
         int64_t int_value;
         double float_value;
@@ -375,6 +376,7 @@ typedef enum AstBindingPatternKind {
 struct AstBindingPattern {
     AstBindingPatternKind kind;
     int line;
+    int column;
     AstType type;
     char* name;
     AstBindingPatternList items;
@@ -528,6 +530,7 @@ typedef enum AstStmtKind {
 struct AstStmt {
     AstStmtKind kind;
     int line;
+    int column;
     union {
         struct {
             AstExpr* expr;
