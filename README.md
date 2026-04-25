@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./doc/logo.svg" alt="Jiang logo" width="180">
+</p>
+
 # Jiang Stage0
 
 新的 `stage0` 从零开始，当前固定实现路线是：
