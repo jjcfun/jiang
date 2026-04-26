@@ -36,6 +36,14 @@ static LLVMValueRef get_or_add_malloc(LLVMModuleRef module, LLVMContextRef conte
     return fn;
 }
 
+static void set_builtin_alloc_alignment(LLVMContextRef context, LLVMValueRef call) {
+    unsigned kind = LLVMGetEnumAttributeKindForName("align", 5);
+    if (kind != 0) {
+        LLVMAttributeRef attr = LLVMCreateEnumAttribute(context, kind, JIANG_MAX_TYPE_ALIGNMENT_BYTES);
+        LLVMAddCallSiteAttribute(call, LLVMAttributeReturnIndex, attr);
+    }
+}
+
 static LLVMValueRef get_or_add_free(LLVMModuleRef module, LLVMContextRef context) {
     LLVMValueRef fn = LLVMGetNamedFunction(module, "free");
     if (!fn) {
@@ -657,6 +665,7 @@ static LLVMValueRef emit_builtin_alloc(FunctionCodegen* cg, const JirExpr* expr)
         &bytes,
         1,
         "alloc.malloc");
+    set_builtin_alloc_alignment(cg->context, raw_ptr);
     return LLVMBuildBitCast(cg->builder, raw_ptr, llvm_type(cg->context, expr->type), "alloc.ptr");
 }
 
@@ -672,6 +681,7 @@ static LLVMValueRef emit_builtin_alloc_array(FunctionCodegen* cg, const JirExpr*
         &total_bytes,
         1,
         "slice.malloc");
+    set_builtin_alloc_alignment(cg->context, raw_ptr);
     return LLVMBuildBitCast(cg->builder, raw_ptr, llvm_type(cg->context, expr->type), "manyptr.data");
 }
 

@@ -729,6 +729,10 @@ static int64_t type_alignment_bytes(HirType* type) {
     return 1;
 }
 
+static int64_t max_type_alignment_bytes(void) {
+    return JIANG_MAX_TYPE_ALIGNMENT_BYTES;
+}
+
 static int64_t type_size_bytes(HirType* type) {
     int i = 0;
     int64_t size = 0;
@@ -3587,6 +3591,24 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     }
                     out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
                     out->as.int_value = type_size_bytes(type);
+                    return out;
+                }
+                if (strcmp(expr->as.implicit.member, "align") == 0) {
+                    if (expr->as.implicit.args.count != 0) {
+                        fail(ctx, "type implicit operation '.align()' takes no arguments");
+                        return 0;
+                    }
+                    out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                    out->as.int_value = type_alignment_bytes(type);
+                    return out;
+                }
+                if (strcmp(expr->as.implicit.member, "max_align") == 0) {
+                    if (expr->as.implicit.args.count != 0) {
+                        fail(ctx, "type implicit operation '.max_align()' takes no arguments");
+                        return 0;
+                    }
+                    out = new_expr(HIR_EXPR_INT, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
+                    out->as.int_value = max_type_alignment_bytes();
                     return out;
                 }
                 if (strcmp(expr->as.implicit.member, "alloc") == 0) {

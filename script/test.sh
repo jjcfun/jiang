@@ -281,6 +281,8 @@ run_sample optional_some_pattern_minimal.jiang 42
 run_sample optional_switch_pattern_minimal.jiang 42
 run_sample optional_nested_array_minimal.jiang 42
 run_sample size_of_minimal.jiang 8
+run_sample align_of_minimal.jiang 17
+run_sample max_align_alloc_minimal.jiang 0
 run_sample generic_decl_minimal.jiang 42
 run_sample generic_func_call_minimal.jiang 42
 run_sample generic_func_infer_minimal.jiang 42

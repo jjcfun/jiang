@@ -5,6 +5,8 @@
 
 #include <stdint.h>
 
+#define JIANG_MAX_TYPE_ALIGNMENT_BYTES 8
+
 typedef struct HirType HirType;
 typedef struct HirExpr HirExpr;
 typedef struct HirStmt HirStmt;

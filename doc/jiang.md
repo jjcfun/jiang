@@ -202,6 +202,8 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 - `a$.addr()`：获取值 `a` 的地址值
 - `a$.free()`：对 `a` 做释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
+- `Int$.align()`：获取类型 `Int` 的 ABI 对齐
+- `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
 - `Int$.alloc()`：分配一个未初始化的 `Int*`
 - `Int$.alloc_array(10)`：分配一个长度为 `10` 的 `Int[*]`
 
@@ -218,6 +220,8 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
   - `panic()`
   - `T$.alloc()`
   - `T$.alloc_array(...)`
+  - `T$.align()`
+  - `T$.max_align()`
 - 最小运行时仍依赖宿主 C 运行时，当前主要使用：
   - `malloc`
   - `free`
