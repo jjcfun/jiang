@@ -424,8 +424,13 @@ run_sample unary_tuple_infer_local_decl_minimal.jiang 42
 run_sample unary_tuple_global_decl_minimal.jiang 42
 run_sample unary_tuple_return_minimal.jiang 42
 run_sample array_minimal.jiang 42
-run_compiler_sample array_list_minimal.jiang 41
+run_compiler_sample array_list_minimal.jiang 60
 run_compiler_sample array_list_pointer_minimal.jiang 48
+run_compiler_sample array_list_capacity_minimal.jiang 42
+run_compiler_sample arena_list_minimal.jiang 60
+run_compiler_sample arena_list_capacity_minimal.jiang 45
+run_compiler_sample subscriptable_inferred_get_minimal.jiang 42
+run_compiler_sample subscriptable_inferred_set_minimal.jiang 42
 run_sample array_assign_minimal.jiang 10
 run_sample array_repeat_init_minimal.jiang 6
 run_sample nested_array_minimal.jiang 42

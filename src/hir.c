@@ -173,6 +173,54 @@ static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
 static int hir_expr_is_new_constructible(const HirExpr* expr);
 static void mark_binding_freed(LowerContext* ctx, HirBinding* binding);
 static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr* expr);
+
+static AstExpr* new_synthetic_name_expr(const char* name, int line) {
+    AstExpr* expr = (AstExpr*)calloc(1, sizeof(AstExpr));
+    if (!expr) {
+        return 0;
+    }
+    expr->kind = AST_EXPR_NAME;
+    expr->line = line;
+    expr->as.name = strdup(name);
+    return expr;
+}
+
+static AstExpr* new_synthetic_field_expr(AstExpr* base, const char* name, int line) {
+    AstExpr* expr = (AstExpr*)calloc(1, sizeof(AstExpr));
+    if (!expr) {
+        return 0;
+    }
+    expr->kind = AST_EXPR_FIELD;
+    expr->line = line;
+    expr->as.field.base = base;
+    expr->as.field.name = strdup(name);
+    return expr;
+}
+
+static AstExpr* qualified_path_to_expr(const char* path, int line) {
+    char* copy = strdup(path);
+    char* part = copy;
+    char* dot = 0;
+    AstExpr* expr = 0;
+    if (!copy) {
+        return 0;
+    }
+    dot = strchr(part, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    expr = new_synthetic_name_expr(part, line);
+    while (expr && dot) {
+        part = dot + 1;
+        dot = strchr(part, '.');
+        if (dot) {
+            *dot = '\0';
+        }
+        expr = new_synthetic_field_expr(expr, part, line);
+    }
+    free(copy);
+    return expr;
+}
 static HirExpr* lower_primitive_init_constructor(LowerContext* ctx, const AstExpr* expr);
 static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
 static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
@@ -4508,6 +4556,49 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                         return 0;
                     }
                 } else {
+                    char* owner_first = strdup(owner_name);
+                    char* owner_first_dot = owner_first ? strchr(owner_first, '.') : 0;
+                    HirBinding* receiver_root = 0;
+                    if (owner_first_dot) {
+                        *owner_first_dot = '\0';
+                    }
+                    receiver_root = owner_first ? lookup_binding(ctx, owner_first) : 0;
+                    if (receiver_root) {
+                        AstExpr* receiver_ast = qualified_path_to_expr(owner_name, expr->line);
+                        HirExpr* receiver_value = receiver_ast ? lower_expr(ctx, receiver_ast) : 0;
+                        HirExpr* receiver_arg = 0;
+                        HirType* method_owner_type = receiver_value ? instance_method_owner_type(receiver_value->type) : 0;
+                        HirFunction* method = method_owner_type ? resolve_method_call_overload(ctx, method_owner_type, member_name, 0, &expr->as.call.args, 1, trait_name, &matched_args) : 0;
+                        if (method) {
+                            receiver_arg = make_instance_method_receiver(ctx, receiver_value, method_owner_type, expr->line);
+                            if (!receiver_arg) {
+                                free(owner_name);
+                                free(trait_name);
+                                free(parsed_member_name);
+                                return 0;
+                            }
+                            out = new_expr(HIR_EXPR_CALL, method->return_type, expr->line);
+                            out->as.call.callee = method;
+                            expr_list_push(&out->as.call.args, receiver_arg);
+                            out->as.call.args.items = (HirExpr**)realloc(out->as.call.args.items, sizeof(HirExpr*) * (matched_args.count + 1));
+                            memcpy(out->as.call.args.items + 1, matched_args.items, sizeof(HirExpr*) * matched_args.count);
+                            out->as.call.args.count = matched_args.count + 1;
+                            out->as.call.args.capacity = matched_args.count + 1;
+                            free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
+                            return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+                        }
+                        if (ctx->error) {
+                            free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
+                            return 0;
+                        }
+                    }
+                    free(owner_first);
+                }
+                {
                     HirType* named_type = resolve_owner_type_name(ctx, owner_name);
                     if (named_type) {
                         HirFunction* method = resolve_method_call_overload(ctx, named_type, member_name, 1, &expr->as.call.args, 0, trait_name, &matched_args);

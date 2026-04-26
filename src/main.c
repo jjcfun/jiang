@@ -2129,6 +2129,85 @@ static const AstType* lookup_resolved_assoc_type_binding(const ResolvedAssocType
     return 0;
 }
 
+static const AstFunction* find_type_method_template(const AstProgram* program,
+                                                    const AstType* type,
+                                                    const char* method_name);
+
+static int assoc_type_ref_exists(const ConceptAssocTypeRefList* assoc_types, const char* assoc_name) {
+    return find_concept_assoc_type_ref((ConceptAssocTypeRefList*)assoc_types, assoc_name) != 0;
+}
+
+static int add_inferred_assoc_type_binding(ResolvedAssocTypeBindingList* bindings,
+                                           const char* assoc_name,
+                                           const AstType* value,
+                                           int line) {
+    const AstType* existing = lookup_resolved_assoc_type_binding(bindings, assoc_name);
+    if (existing) {
+        return ast_type_is_equal(existing, value);
+    }
+    {
+        AstType* owned_value = (AstType*)malloc(sizeof(AstType));
+        ResolvedAssocTypeBinding item;
+        if (!owned_value) {
+            return 0;
+        }
+        *owned_value = ast_type_copy(value);
+        memset(&item, 0, sizeof(item));
+        item.name = assoc_name;
+        item.value = owned_value;
+        item.line = line;
+        resolved_assoc_type_binding_list_push(bindings, item);
+    }
+    return 1;
+}
+
+static int infer_assoc_type_binding_from_type(const ConceptAssocTypeRefList* assoc_types,
+                                              ResolvedAssocTypeBindingList* bindings,
+                                              const AstType* required,
+                                              const AstType* actual,
+                                              int line) {
+    if (required->kind == AST_TYPE_NAMED &&
+        required->named_name &&
+        required->type_args.count == 0 &&
+        assoc_type_ref_exists(assoc_types, required->named_name)) {
+        return add_inferred_assoc_type_binding(bindings, required->named_name, actual, line);
+    }
+    return 1;
+}
+
+static int infer_missing_assoc_type_bindings_from_methods(const AstProgram* program,
+                                                          const AstType* type,
+                                                          const ConceptMethodRefList* methods,
+                                                          const ConceptAssocTypeRefList* assoc_types,
+                                                          ResolvedAssocTypeBindingList* bindings) {
+    int i = 0;
+    for (i = 0; i < methods->count; ++i) {
+        const AstConceptMethod* requirement = methods->items[i].method;
+        const AstFunction* method = find_type_method_template(program, type, requirement->name);
+        int j = 0;
+        if (!method || method->params.count != requirement->params.count) {
+            continue;
+        }
+        if (!infer_assoc_type_binding_from_type(assoc_types,
+                                                bindings,
+                                                &requirement->return_type,
+                                                &method->return_type,
+                                                method->line)) {
+            return 0;
+        }
+        for (j = 0; j < requirement->params.count; ++j) {
+            if (!infer_assoc_type_binding_from_type(assoc_types,
+                                                    bindings,
+                                                    &requirement->params.items[j].type,
+                                                    &method->params.items[j].type,
+                                                    method->params.items[j].line)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static int collect_concept_method_names(const AstProgram* program,
                                         const AstConceptDecl* concept,
                                         AstNameList* seen_concepts,
@@ -3369,6 +3448,9 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
     if (!resolve_nominal_assoc_type_bindings(program, query.nominal, concept, &assoc_types, &assoc_bindings, &collect_error, &detail_name)) {
         return 0;
     }
+    if (!infer_missing_assoc_type_bindings_from_methods(program, type, &methods, &assoc_types, &assoc_bindings)) {
+        return 0;
+    }
     for (i = 0; i < assoc_types.count; ++i) {
         const AstType* assoc_value = lookup_resolved_assoc_type_binding(&assoc_bindings, assoc_types.items[i].name);
         int j = 0;
@@ -4176,6 +4258,79 @@ static const AstType* lookup_local_type(const LocalTypeList* locals, const char*
     return 0;
 }
 
+static void push_self_local_type(LocalTypeList* locals, const char* owner_type_name) {
+    LocalTypeEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.name = "self";
+    entry.type.kind = AST_TYPE_NAMED;
+    entry.type.named_name = (char*)owner_type_name;
+    local_type_list_push(locals, entry);
+}
+
+static AstType ast_instance_method_owner_type(const AstType* type) {
+    if ((type->kind == AST_TYPE_POINTER || type->kind == AST_TYPE_REFERENCE) && type->array_item) {
+        return ast_type_copy(type->array_item);
+    }
+    return ast_type_copy(type);
+}
+
+static AstType infer_qualified_receiver_type(const AstProgram* program, const LocalTypeList* locals, const char* path) {
+    AstType out;
+    char* copy = dup_text(path);
+    char* part = copy;
+    char* dot = 0;
+    const AstType* local = 0;
+    memset(&out, 0, sizeof(out));
+    out.kind = AST_TYPE_VOID;
+    if (!copy) {
+        return out;
+    }
+    dot = strchr(part, '.');
+    if (dot) {
+        *dot = '\0';
+    }
+    local = lookup_local_type(locals, part);
+    if (!local) {
+        free(copy);
+        return out;
+    }
+    out = ast_type_copy(local);
+    while (dot) {
+        char* member = dot + 1;
+        AstType base = ast_instance_method_owner_type(&out);
+        const AstStructDecl* st = 0;
+        int i = 0;
+        dot = strchr(member, '.');
+        if (dot) {
+            *dot = '\0';
+        }
+        if (base.kind != AST_TYPE_NAMED) {
+            out.kind = AST_TYPE_VOID;
+            free(copy);
+            return out;
+        }
+        st = find_ast_struct(program, base.named_name);
+        if (!st) {
+            out.kind = AST_TYPE_VOID;
+            free(copy);
+            return out;
+        }
+        out.kind = AST_TYPE_VOID;
+        for (i = 0; i < st->fields.count; ++i) {
+            if (strcmp(st->fields.items[i].name, member) == 0) {
+                out = ast_type_copy(&st->fields.items[i].type);
+                break;
+            }
+        }
+        if (out.kind == AST_TYPE_VOID) {
+            free(copy);
+            return out;
+        }
+    }
+    free(copy);
+    return out;
+}
+
 static AstType infer_expr_type(const AstProgram* program, const LocalTypeList* locals, const AstExpr* expr) {
     AstType out;
     memset(&out, 0, sizeof(out));
@@ -4892,21 +5047,28 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     }
     for (i = 0; i < templ->init_overloads.count; ++i) {
         AstStructInitDecl init_decl;
+        LocalTypeList init_locals;
         int j = 0;
         memset(&init_decl, 0, sizeof(init_decl));
+        memset(&init_locals, 0, sizeof(init_locals));
+        push_self_local_type(&init_locals, templ->name);
         init_decl.line = templ->init_overloads.items[i].line;
         for (j = 0; j < templ->init_overloads.items[i].params.count; ++j) {
             AstParam param = templ->init_overloads.items[i].params.items[j];
+            LocalTypeEntry entry;
             param.type = clone_type_subst(&param.type, &subst);
             param.label = param.label ? dup_text(param.label) : 0;
             param.name = dup_text(param.name);
             param.default_value = clone_expr_subst(param.default_value, &subst);
             param_list_push(&init_decl.params, param);
+            entry.name = param.name;
+            entry.type = ast_type_copy(&param.type);
+            local_type_list_push(&init_locals, entry);
         }
         for (j = 0; j < templ->init_overloads.items[i].body.stmts.count; ++j) {
             stmt_list_push(&init_decl.body.stmts, clone_stmt_subst(templ->init_overloads.items[i].body.stmts.items[j], &subst));
         }
-        if (!transform_block(mono, &init_decl.body, &(LocalTypeList){0})) {
+        if (!transform_block(mono, &init_decl.body, &init_locals)) {
             return 0;
         }
         struct_init_decl_list_push(&decl.init_overloads, init_decl);
@@ -4914,8 +5076,13 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
     for (i = 0; i < templ->deinit_body.stmts.count; ++i) {
         stmt_list_push(&decl.deinit_body.stmts, clone_stmt_subst(templ->deinit_body.stmts.items[i], &subst));
     }
-    if (!transform_block(mono, &decl.deinit_body, &(LocalTypeList){0})) {
-        return 0;
+    {
+        LocalTypeList deinit_locals;
+        memset(&deinit_locals, 0, sizeof(deinit_locals));
+        push_self_local_type(&deinit_locals, decl.name);
+        if (!transform_block(mono, &decl.deinit_body, &deinit_locals)) {
+            return 0;
+        }
     }
     struct_list_push(&mono->out->structs, decl);
     for (i = 0; i < mono->source->functions.count; ++i) {
@@ -4942,8 +5109,19 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
             for (int j = 0; j < method->body.stmts.count; ++j) {
                 stmt_list_push(&cloned.body.stmts, clone_stmt_subst(method->body.stmts.items[j], &subst));
             }
-            if (!transform_block(mono, &cloned.body, &(LocalTypeList){0})) {
-                return 0;
+            {
+                LocalTypeList method_locals;
+                memset(&method_locals, 0, sizeof(method_locals));
+                push_self_local_type(&method_locals, *instantiated_name);
+                for (int j = 0; j < cloned.params.count; ++j) {
+                    LocalTypeEntry entry;
+                    entry.name = cloned.params.items[j].name;
+                    entry.type = ast_type_copy(&cloned.params.items[j].type);
+                    local_type_list_push(&method_locals, entry);
+                }
+                if (!transform_block(mono, &cloned.body, &method_locals)) {
+                    return 0;
+                }
             }
             function_list_push(&mono->out->functions, cloned);
         }
@@ -5082,8 +5260,18 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
                     memcpy(owner_name, expr->as.call.callee, owner_len);
                     owner_name[owner_len] = '\0';
                     owner_type = lookup_local_type(locals, owner_name);
-                    if (owner_type) {
-                        method_templ = find_type_method_template(mono->source, owner_type, member_name);
+                    if (!owner_type) {
+                        AstType inferred_owner_type = infer_qualified_receiver_type(mono->out, locals, owner_name);
+                        if (inferred_owner_type.kind == AST_TYPE_VOID) {
+                            inferred_owner_type = infer_qualified_receiver_type(mono->source, locals, owner_name);
+                        }
+                        if (inferred_owner_type.kind != AST_TYPE_VOID) {
+                            AstType method_owner_type = ast_instance_method_owner_type(&inferred_owner_type);
+                            method_templ = find_type_method_template(mono->source, &method_owner_type, member_name);
+                        }
+                    } else {
+                        AstType method_owner_type = ast_instance_method_owner_type(owner_type);
+                        method_templ = find_type_method_template(mono->source, &method_owner_type, member_name);
                     }
                     if (method_templ && method_templ->type_params.count > 0) {
                         char* instantiated_name = 0;
