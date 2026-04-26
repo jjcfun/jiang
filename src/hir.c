@@ -3636,6 +3636,21 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         ctx->current_line = expr->line;
         ctx->current_column = expr->column;
     }
+    if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && expr->kind != AST_EXPR_NULL) {
+        out = lower_expr_expected(ctx, expr, expected_type->array_item);
+        if (!out) {
+            return 0;
+        }
+        if (type_assignment_compatible(out->type, expected_type)) {
+            return out;
+        }
+        if (type_assignment_compatible(out->type, expected_type->array_item)) {
+            HirExpr* some = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+            some->as.unary.value = out;
+            return some;
+        }
+        return out;
+    }
     switch (expr->kind) {
         case AST_EXPR_INT:
             if (expected_type &&

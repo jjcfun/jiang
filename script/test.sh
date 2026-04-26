@@ -363,6 +363,10 @@ run_compiler_sample hash_map_minimal.jiang 20
 run_compiler_sample hash_map_collision_minimal.jiang 30
 run_compiler_sample hash_map_remove_minimal.jiang 24
 run_compiler_sample hash_map_deleted_reuse_minimal.jiang 52
+run_compiler_sample hash_map_get_ptr_minimal.jiang 45
+run_compiler_sample hash_map_get_or_put_minimal.jiang 18
+run_compiler_sample hash_map_reserve_clear_minimal.jiang 42
+run_compiler_sample hash_map_optional_value_has_minimal.jiang 42
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
