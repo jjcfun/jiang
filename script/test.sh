@@ -157,6 +157,7 @@ run_sample defer_propagate_minimal.jiang 12
 run_compile_fail invalid_defer_return_minimal.jiang
 run_sample binary_ops_minimal.jiang 1
 run_sample bitwise_minimal.jiang 42
+run_sample logical_ops_minimal.jiang 140
 run_sample bool_minimal.jiang 1
 run_sample uint8_minimal.jiang 0
 run_sample float_minimal.jiang 7

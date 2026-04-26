@@ -237,8 +237,14 @@ Token lexer_next(Lexer* lexer) {
         case '%':
             return make_token(lexer, TOKEN_PERCENT, lexer->start, 1);
         case '&':
+            if (match_char(lexer, '&')) {
+                return make_token(lexer, TOKEN_AMP_AMP, lexer->start, 2);
+            }
             return make_token(lexer, TOKEN_AMP, lexer->start, 1);
         case '|':
+            if (match_char(lexer, '|')) {
+                return make_token(lexer, TOKEN_PIPE_PIPE, lexer->start, 2);
+            }
             return make_token(lexer, TOKEN_PIPE, lexer->start, 1);
         case '^':
             return make_token(lexer, TOKEN_CARET, lexer->start, 1);

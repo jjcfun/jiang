@@ -1326,6 +1326,8 @@ static AstExpr* parse_shift(Parser* parser);
 static AstExpr* parse_bitwise_and(Parser* parser);
 static AstExpr* parse_bitwise_xor(Parser* parser);
 static AstExpr* parse_bitwise_or(Parser* parser);
+static AstExpr* parse_logical_and(Parser* parser);
+static AstExpr* parse_logical_or(Parser* parser);
 static AstExpr* parse_expr_internal(Parser* parser, int allow_catch_handler);
 static AstExpr* parse_expr_no_range_internal(Parser* parser, int allow_catch_handler);
 static AstExpr* parse_value_branch_expr(Parser* parser, const char* context);
@@ -2448,14 +2450,50 @@ static AstExpr* parse_equality(Parser* parser) {
     return expr;
 }
 
-static AstExpr* parse_coalesce(Parser* parser) {
+static AstExpr* parse_logical_and(Parser* parser) {
     AstExpr* expr = parse_equality(parser);
+    while (expr && parser->current.kind == TOKEN_AMP_AMP) {
+        AstExpr* right = 0;
+        AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
+        bin->as.binary.left = expr;
+        bin->as.binary.op = AST_BIN_LOGIC_AND;
+        advance(parser);
+        right = parse_equality(parser);
+        if (!right) {
+            return 0;
+        }
+        bin->as.binary.right = right;
+        expr = bin;
+    }
+    return expr;
+}
+
+static AstExpr* parse_logical_or(Parser* parser) {
+    AstExpr* expr = parse_logical_and(parser);
+    while (expr && parser->current.kind == TOKEN_PIPE_PIPE) {
+        AstExpr* right = 0;
+        AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
+        bin->as.binary.left = expr;
+        bin->as.binary.op = AST_BIN_LOGIC_OR;
+        advance(parser);
+        right = parse_logical_and(parser);
+        if (!right) {
+            return 0;
+        }
+        bin->as.binary.right = right;
+        expr = bin;
+    }
+    return expr;
+}
+
+static AstExpr* parse_coalesce(Parser* parser) {
+    AstExpr* expr = parse_logical_or(parser);
     while (expr && parser->current.kind == TOKEN_QUESTION_QUESTION) {
         AstExpr* right = 0;
         AstExpr* out = new_expr(AST_EXPR_COALESCE, parser->current.line);
         out->as.coalesce.left = expr;
         advance(parser);
-        right = parse_equality(parser);
+        right = parse_logical_or(parser);
         if (!right) {
             return 0;
         }
@@ -2466,7 +2504,7 @@ static AstExpr* parse_coalesce(Parser* parser) {
 }
 
 static AstExpr* parse_var_decl_init_expr(Parser* parser) {
-    AstExpr* expr = parse_equality(parser);
+    AstExpr* expr = parse_logical_or(parser);
     if (!expr) {
         return 0;
     }
@@ -2493,7 +2531,7 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
             advance(parser);
             if (out->as.coalesce_control.control == AST_COALESCE_RETURN &&
                 parser->current.kind != TOKEN_SEMICOLON) {
-                out->as.coalesce_control.return_expr = parse_equality(parser);
+                out->as.coalesce_control.return_expr = parse_logical_or(parser);
                 if (!out->as.coalesce_control.return_expr) {
                     return 0;
                 }
@@ -2503,7 +2541,7 @@ static AstExpr* parse_var_decl_init_expr(Parser* parser) {
         }
         out = new_expr(AST_EXPR_COALESCE, parser->current.line);
         out->as.coalesce.left = expr;
-        out->as.coalesce.right = parse_equality(parser);
+        out->as.coalesce.right = parse_logical_or(parser);
         if (!out->as.coalesce.right) {
             return 0;
         }

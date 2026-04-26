@@ -216,6 +216,8 @@ typedef enum AstBinaryOp {
     AST_BIN_BIT_AND,
     AST_BIN_BIT_OR,
     AST_BIN_BIT_XOR,
+    AST_BIN_LOGIC_AND,
+    AST_BIN_LOGIC_OR,
     AST_BIN_SHL,
     AST_BIN_SHR,
     AST_BIN_EQ,

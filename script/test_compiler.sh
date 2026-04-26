@@ -64,7 +64,6 @@ run_compiler_sample arena_list_minimal.jiang 60
 run_compiler_sample arena_list_capacity_minimal.jiang 45
 run_compiler_sample subscriptable_inferred_get_minimal.jiang 42
 run_compiler_sample subscriptable_inferred_set_minimal.jiang 42
-
 run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 
 echo "compiler samples passed"

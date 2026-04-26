@@ -5092,9 +5092,45 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 expr->as.binary.op == AST_BIN_MUL ||
                                 expr->as.binary.op == AST_BIN_MOD ||
                                 expr->as.binary.op == AST_BIN_DIV;
+            int logic_op = expr->as.binary.op == AST_BIN_LOGIC_AND ||
+                           expr->as.binary.op == AST_BIN_LOGIC_OR;
             if (expr->as.binary.op == AST_BIN_IS) {
                 fail(ctx, "is pattern is only supported in if and while conditions");
                 return 0;
+            }
+            if (logic_op) {
+                HirType* bool_type = primitive_type(ctx->program, HIR_TYPE_BOOL);
+                HirExpr* left = lower_expr_expected(ctx, expr->as.binary.left, bool_type);
+                HirExpr* right = 0;
+                HirExpr* literal = 0;
+                if (!left) {
+                    return 0;
+                }
+                if (left->type->kind != HIR_TYPE_BOOL) {
+                    fail(ctx, "logical operation requires Bool operands");
+                    return 0;
+                }
+                right = lower_expr_expected(ctx, expr->as.binary.right, bool_type);
+                if (!right) {
+                    return 0;
+                }
+                if (right->type->kind != HIR_TYPE_BOOL) {
+                    fail(ctx, "logical operation requires Bool operands");
+                    return 0;
+                }
+                literal = new_expr(HIR_EXPR_BOOL, bool_type, expr->line);
+                out = new_expr(HIR_EXPR_IF, bool_type, expr->line);
+                out->as.if_expr.cond = left;
+                if (expr->as.binary.op == AST_BIN_LOGIC_AND) {
+                    literal->as.bool_value = 0;
+                    out->as.if_expr.then_expr = right;
+                    out->as.if_expr.else_expr = literal;
+                } else {
+                    literal->as.bool_value = 1;
+                    out->as.if_expr.then_expr = literal;
+                    out->as.if_expr.else_expr = right;
+                }
+                return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
             }
             int bitwise_op = expr->as.binary.op == AST_BIN_BIT_AND ||
                              expr->as.binary.op == AST_BIN_BIT_OR ||
@@ -5165,6 +5201,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_BIT_AND: out->as.binary.op = HIR_BIN_BIT_AND; break;
                 case AST_BIN_BIT_OR: out->as.binary.op = HIR_BIN_BIT_OR; break;
                 case AST_BIN_BIT_XOR: out->as.binary.op = HIR_BIN_BIT_XOR; break;
+                case AST_BIN_LOGIC_AND: break;
+                case AST_BIN_LOGIC_OR: break;
                 case AST_BIN_SHL: out->as.binary.op = HIR_BIN_SHL; break;
                 case AST_BIN_SHR: out->as.binary.op = HIR_BIN_SHR; break;
                 case AST_BIN_EQ: out->as.binary.op = HIR_BIN_EQ; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
