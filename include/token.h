@@ -26,6 +26,7 @@ typedef enum TokenKind {
     TOKEN_KW_WHILE,
     TOKEN_KW_FOR,
     TOKEN_KW_IN,
+    TOKEN_KW_IS,
     TOKEN_KW_ENUM,
     TOKEN_KW_UNION,
     TOKEN_KW_STRUCT,

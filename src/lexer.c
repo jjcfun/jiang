@@ -89,6 +89,9 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 2 && strncmp(lexer->start, "in", 2) == 0) {
         return make_token(lexer, TOKEN_KW_IN, lexer->start, length);
     }
+    if (length == 2 && strncmp(lexer->start, "is", 2) == 0) {
+        return make_token(lexer, TOKEN_KW_IS, lexer->start, length);
+    }
     if (length == 4 && strncmp(lexer->start, "enum", 4) == 0) {
         return make_token(lexer, TOKEN_KW_ENUM, lexer->start, length);
     }

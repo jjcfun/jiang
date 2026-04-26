@@ -791,6 +791,7 @@ static AstExpr* clone_expr(const AstProgram* source, const char* prefix, int hid
             break;
         case AST_EXPR_IMPLICIT:
             out->as.implicit.target_is_type = expr->as.implicit.target_is_type;
+            out->as.implicit.optional_chain = expr->as.implicit.optional_chain;
             if (expr->as.implicit.target_is_type) {
                 out->as.implicit.type_target = clone_type(source, prefix, hide_private, &expr->as.implicit.type_target);
             } else {
@@ -4367,6 +4368,7 @@ static AstExpr* clone_expr_subst(const AstExpr* expr, const TypeSubstList* subst
             break;
         case AST_EXPR_IMPLICIT:
             out->as.implicit.target_is_type = expr->as.implicit.target_is_type;
+            out->as.implicit.optional_chain = expr->as.implicit.optional_chain;
             if (expr->as.implicit.target_is_type) {
                 out->as.implicit.type_target = clone_type_subst(&expr->as.implicit.type_target, subst);
             } else {
@@ -5063,6 +5065,60 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
             for (i = 0; i < expr->as.call.args.count; ++i) {
                 if (!transform_expr(mono, expr->as.call.args.items[i].value, locals)) {
                     return 0;
+                }
+            }
+            if (expr->as.call.type_args.count > 0) {
+                const char* dot = strrchr(expr->as.call.callee, '.');
+                if (dot) {
+                    size_t owner_len = (size_t)(dot - expr->as.call.callee);
+                    char* owner_name = (char*)malloc(owner_len + 1);
+                    const char* member_name = dot + 1;
+                    const AstType* owner_type = 0;
+                    const AstFunction* method_templ = 0;
+                    if (!owner_name) {
+                        mono->error = "out of memory";
+                        return 0;
+                    }
+                    memcpy(owner_name, expr->as.call.callee, owner_len);
+                    owner_name[owner_len] = '\0';
+                    owner_type = lookup_local_type(locals, owner_name);
+                    if (owner_type) {
+                        method_templ = find_type_method_template(mono->source, owner_type, member_name);
+                    }
+                    if (method_templ && method_templ->type_params.count > 0) {
+                        char* instantiated_name = 0;
+                        for (i = 0; i < expr->as.call.type_args.count; ++i) {
+                            AstType arg = expr->as.call.type_args.items[i];
+                            if (!transform_type(mono, &arg)) {
+                                return 0;
+                            }
+                            type_list_push(&type_args, arg);
+                        }
+                        if (!instantiate_function_template(mono, method_templ, &type_args, &instantiated_name)) {
+                            free(owner_name);
+                            return 0;
+                        }
+                        {
+                            size_t new_len = owner_len + 1 + strlen(instantiated_name);
+                            char* new_callee = (char*)malloc(new_len + 1);
+                            if (!new_callee) {
+                                mono->error = "out of memory";
+                                free(owner_name);
+                                free(instantiated_name);
+                                return 0;
+                            }
+                            memcpy(new_callee, owner_name, owner_len);
+                            new_callee[owner_len] = '.';
+                            memcpy(new_callee + owner_len + 1, instantiated_name, strlen(instantiated_name) + 1);
+                            free(expr->as.call.callee);
+                            expr->as.call.callee = new_callee;
+                        }
+                        free(owner_name);
+                        free(instantiated_name);
+                        memset(&expr->as.call.type_args, 0, sizeof(expr->as.call.type_args));
+                        return 1;
+                    }
+                    free(owner_name);
                 }
             }
             templ = find_generic_function_template(mono->source, expr->as.call.callee);

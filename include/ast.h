@@ -220,6 +220,7 @@ typedef enum AstBinaryOp {
     AST_BIN_SHR,
     AST_BIN_EQ,
     AST_BIN_NE,
+    AST_BIN_IS,
     AST_BIN_LT,
     AST_BIN_LE,
     AST_BIN_GT,
@@ -273,6 +274,7 @@ struct AstExpr {
         } string_lit;
         struct {
             int target_is_type;
+            int optional_chain;
             AstType type_target;
             AstExpr* value_target;
             char* member;

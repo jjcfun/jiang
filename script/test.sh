@@ -3,8 +3,9 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="$PROJECT_ROOT/build"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
 SAMPLES_DIR="$PROJECT_ROOT/tests/samples"
+COMPILER_SAMPLES_DIR="$PROJECT_ROOT/tests/compiler"
 
 if [[ -n "${LLVM_CONFIG:-}" ]]; then
   LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"
@@ -67,6 +68,33 @@ run_compile_fail() {
   set -e
   if [[ "$status" -eq 0 ]]; then
     echo "error: $sample unexpectedly compiled" >&2
+    exit 1
+  fi
+}
+
+run_compiler_sample() {
+  local sample="$1"
+  local expected="$2"
+  local ir="$BUILD_DIR/compiler_${sample%.jiang}.ll"
+  "$BUILD_DIR/jiangc" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
+  set +e
+  "$LLI" "$ir"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "error: compiler/$sample exited $status, expected $expected" >&2
+    exit 1
+  fi
+}
+
+run_compiler_compile_fail() {
+  local sample="$1"
+  set +e
+  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/jiangc" "$COMPILER_SAMPLES_DIR/$sample" >/dev/null 2>&1
+  local status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "error: compiler/$sample unexpectedly compiled" >&2
     exit 1
   fi
 }
@@ -145,6 +173,7 @@ run_sample character_unicode_minimal.jiang 23
 run_sample int_float_add_minimal.jiang 24
 run_sample int_double_add_minimal.jiang 25
 run_sample float_double_compare_minimal.jiang 26
+run_sample primitive_init_minimal.jiang 42
 run_sample negative_int_minimal.jiang 1
 run_sample mod_minimal.jiang 2
 run_sample uint8_slice_minimal.jiang 0
@@ -153,7 +182,9 @@ run_sample pointer_offset_uint8_minimal.jiang 101
 run_sample pointer_offset_int_minimal.jiang 42
 run_sample many_pointer_assign_minimal.jiang 10
 run_sample as_addr_minimal.jiang 2
+run_sample as_pointer_reinterpret_minimal.jiang 42
 run_sample free_minimal.jiang 0
+run_sample optional_implicit_free_minimal.jiang 42
 run_sample new_primitive_constructor_minimal.jiang 123
 run_sample new_array_repeat_init_minimal.jiang 6
 run_sample multi_file_minimal.jiang 42
@@ -277,7 +308,10 @@ run_sample invalid_coalesce_return_value.jiang 1
 run_sample optional_chain_member_minimal.jiang 42
 run_sample optional_chain_index_minimal.jiang 40
 run_sample optional_chain_nested_pure_base_minimal.jiang 42
+run_sample optional_some_minimal.jiang 42
 run_sample optional_some_pattern_minimal.jiang 42
+run_sample optional_if_mutable_pattern_minimal.jiang 42
+run_sample optional_while_is_pattern_minimal.jiang 6
 run_sample optional_switch_pattern_minimal.jiang 42
 run_sample optional_nested_array_minimal.jiang 42
 run_sample size_of_minimal.jiang 8
@@ -321,10 +355,14 @@ run_sample generic_struct_instantiation_minimal.jiang 42
 run_sample mutable_generic_minimal.jiang 42
 run_sample maybe_mutable_generic_minimal.jiang 42
 run_sample type_modifier_canonical_minimal.jiang 7
-run_sample hash_map_minimal.jiang 20
-run_sample hash_map_collision_minimal.jiang 30
-run_sample hash_map_remove_minimal.jiang 24
-run_sample hash_map_deleted_reuse_minimal.jiang 52
+run_compiler_sample arena_basic_minimal.jiang 42
+run_compiler_sample arena_reset_reuse_minimal.jiang 42
+run_compiler_sample arena_typed_alloc_minimal.jiang 42
+run_compiler_sample arena_zero_size_minimal.jiang 42
+run_compiler_sample hash_map_minimal.jiang 20
+run_compiler_sample hash_map_collision_minimal.jiang 30
+run_compiler_sample hash_map_remove_minimal.jiang 24
+run_compiler_sample hash_map_deleted_reuse_minimal.jiang 52
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
@@ -386,8 +424,8 @@ run_sample unary_tuple_infer_local_decl_minimal.jiang 42
 run_sample unary_tuple_global_decl_minimal.jiang 42
 run_sample unary_tuple_return_minimal.jiang 42
 run_sample array_minimal.jiang 42
-run_sample array_list_minimal.jiang 41
-run_sample array_list_pointer_minimal.jiang 48
+run_compiler_sample array_list_minimal.jiang 41
+run_compiler_sample array_list_pointer_minimal.jiang 48
 run_sample array_assign_minimal.jiang 10
 run_sample array_repeat_init_minimal.jiang 6
 run_sample nested_array_minimal.jiang 42
@@ -471,7 +509,8 @@ run_compile_fail invalid_global_initializer_type.jiang
 run_compile_fail invalid_infer_array_length_missing_init.jiang
 run_compile_fail invalid_infer_global_missing_init.jiang
 run_compile_fail invalid_typed_array_constructor_length.jiang
-run_compile_fail invalid_typed_array_constructor_non_array.jiang
+run_compile_fail invalid_implicit_numeric_arithmetic.jiang
+run_compile_fail invalid_implicit_numeric_compare.jiang
 run_compile_fail invalid_character_literal_empty.jiang
 run_compile_fail invalid_character_literal_multi.jiang
 run_compile_fail invalid_character_literal_escape.jiang
@@ -492,7 +531,7 @@ run_compile_fail invalid_free_non_pointer.jiang
 run_compile_fail invalid_new_non_construct_expr.jiang
 run_compile_fail invalid_pointer_offset_requires_many_pointer.jiang
 run_compile_fail invalid_many_pointer_assign_immutable.jiang
-run_compile_fail invalid_array_list_set_immutable_type_arg.jiang
+run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 run_compile_fail invalid_use_after_free.jiang
 run_compile_fail invalid_import_private_function.jiang
 run_compile_fail invalid_import_private_type.jiang
@@ -591,6 +630,7 @@ run_compile_fail invalid_enum_value_type.jiang
 run_compile_fail invalid_union_bind_void.jiang
 run_compile_fail invalid_union_ctor_arg.jiang
 run_compile_fail invalid_union_pattern_ne_bind.jiang
+run_compile_fail invalid_union_pattern_eq_bind.jiang
 run_compile_fail invalid_union_switch_non_exhaustive.jiang
 run_compile_fail invalid_union_tuple_bind_non_tuple.jiang
 run_compile_fail invalid_union_tuple_bind_arity.jiang

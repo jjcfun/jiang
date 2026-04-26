@@ -318,7 +318,8 @@ static LLVMValueRef llvm_union_payload_size_value(LLVMContextRef context, const 
 
 static LLVMTypeRef llvm_slice_type(LLVMContextRef context, const JirType* type) {
     LLVMTypeRef fields[2];
-    fields[0] = LLVMPointerType(llvm_type(context, type->array_item), 0);
+    (void)type;
+    fields[0] = LLVMPointerType(LLVMInt8TypeInContext(context), 0);
     fields[1] = LLVMInt64TypeInContext(context);
     return LLVMStructTypeInContext(context, fields, 2, 0);
 }
@@ -383,7 +384,7 @@ static LLVMTypeRef llvm_type(LLVMContextRef context, const JirType* type) {
         case JIR_TYPE_REFERENCE:
         case JIR_TYPE_POINTER:
         case JIR_TYPE_MANY_POINTER:
-            return LLVMPointerType(llvm_type(context, type->array_item), 0);
+            return LLVMPointerType(LLVMInt8TypeInContext(context), 0);
         case JIR_TYPE_ENUM:
             return LLVMInt64TypeInContext(context);
         case JIR_TYPE_STRUCT:
@@ -1413,6 +1414,9 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMBuildBr(cg->builder, merge_block);
             else_block = LLVMGetInsertBlock(cg->builder);
             LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            if (expr->type->kind == JIR_TYPE_VOID) {
+                return LLVMConstNull(llvm_type(cg->context, expr->type));
+            }
             phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "ifexprtmp");
             incoming_values[0] = then_value;
             incoming_values[1] = else_value;

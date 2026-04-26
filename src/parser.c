@@ -1237,6 +1237,11 @@ static int looks_like_method_decl(Parser* parser) {
         return 0;
     }
     advance(&probe);
+    if (probe.current.kind == TOKEN_LT) {
+        if (!parse_named_generic_params(&probe, &(AstNameList){0})) {
+            return 0;
+        }
+    }
     return probe.current.kind == TOKEN_LEFT_PAREN;
 }
 
@@ -1986,6 +1991,14 @@ static AstExpr* parse_postfix(Parser* parser) {
             expr = parse_implicit_member(parser, expr->line, expr);
             continue;
         }
+        if (parser->current.kind == TOKEN_QUESTION && parser->next.kind == TOKEN_DOLLAR) {
+            advance(parser);
+            expr = parse_implicit_member(parser, expr->line, expr);
+            if (expr) {
+                expr->as.implicit.optional_chain = 1;
+            }
+            continue;
+        }
         if ((parser->current.kind == TOKEN_LEFT_PAREN ||
              (parser->current.kind == TOKEN_LT && looks_like_call_type_args(parser)))) {
             AstExpr* call = new_expr(AST_EXPR_CALL, expr->line);
@@ -2193,6 +2206,7 @@ static int is_implicit_member_name(Token* token) {
             token_equals(token, "ptr") ||
             token_equals(token, "addr") ||
             token_equals(token, "free") ||
+            token_equals(token, "some") ||
             token_equals(token, "offset"));
 }
 
@@ -2408,15 +2422,21 @@ static AstExpr* parse_comparison(Parser* parser) {
 
 static AstExpr* parse_equality(Parser* parser) {
     AstExpr* expr = parse_comparison(parser);
-    while (expr && (parser->current.kind == TOKEN_EQ_EQ || parser->current.kind == TOKEN_BANG_EQ)) {
+    while (expr && (parser->current.kind == TOKEN_EQ_EQ || parser->current.kind == TOKEN_BANG_EQ || parser->current.kind == TOKEN_KW_IS)) {
         AstExpr* right = 0;
         AstExpr* bin = new_expr(AST_EXPR_BINARY, parser->current.line);
         bin->as.binary.left = expr;
-        bin->as.binary.op = parser->current.kind == TOKEN_EQ_EQ ? AST_BIN_EQ : AST_BIN_NE;
-        advance(parser);
-        if (looks_like_variant_pattern_expr(parser)) {
+        if (parser->current.kind == TOKEN_KW_IS) {
+            bin->as.binary.op = AST_BIN_IS;
+            advance(parser);
+            if (!looks_like_variant_pattern_expr(parser)) {
+                fail(parser, "expected variant pattern after 'is'");
+                return 0;
+            }
             right = parse_variant_expr(parser, 1);
         } else {
+            bin->as.binary.op = parser->current.kind == TOKEN_EQ_EQ ? AST_BIN_EQ : AST_BIN_NE;
+            advance(parser);
             right = parse_comparison(parser);
         }
         if (!right) {
@@ -3249,6 +3269,11 @@ static int parse_method_decl(Parser* parser, AstProgram* out_program, const char
     }
     fn.line = parser->current.line;
     advance(parser);
+    if (parser->current.kind == TOKEN_LT) {
+        if (!parse_named_generic_params(parser, &fn.type_params)) {
+            return 0;
+        }
+    }
     if (!parse_params(parser, &fn.params)) {
         return 0;
     }

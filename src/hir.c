@@ -162,6 +162,7 @@ static const HirBuiltinNominalDecl HIR_BUILTIN_VOID_DECL = { HIR_BUILTIN_NOMINAL
 static int fail(LowerContext* ctx, const char* error);
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
 static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type);
+static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* expr);
 static HirType* new_owned_type(HirProgram* program, HirTypeKind kind);
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind);
 static int is_lvalue_expr(const HirExpr* expr);
@@ -170,7 +171,9 @@ static HirExpr* make_optional_value_expr(LowerContext* ctx, HirExpr* value, int 
 static HirBinding* lookup_binding(LowerContext* ctx, const char* name);
 static int bind_in_current_scope(LowerContext* ctx, HirBinding* binding);
 static int hir_expr_is_new_constructible(const HirExpr* expr);
+static void mark_binding_freed(LowerContext* ctx, HirBinding* binding);
 static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr* expr);
+static HirExpr* lower_primitive_init_constructor(LowerContext* ctx, const AstExpr* expr);
 static HirStructField* find_struct_field(HirStructDecl* struct_decl, const char* name, int* field_index);
 static const AstStructDecl* find_ast_struct(const AstProgram* ast, const char* name);
 static const AstEnumDecl* find_ast_enum(const AstProgram* ast, const char* name);
@@ -347,6 +350,13 @@ static int is_expected_type_shorthand_expr(const AstExpr* expr) {
 
 static int is_expected_type_null_expr(const AstExpr* expr) {
     return expr && expr->kind == AST_EXPR_NULL;
+}
+
+static int is_numeric_literal_expr(const AstExpr* expr) {
+    return expr &&
+           (expr->kind == AST_EXPR_INT ||
+            expr->kind == AST_EXPR_FLOAT ||
+            expr->kind == AST_EXPR_CHAR);
 }
 
 static int is_pure_optional_base_expr(const AstExpr* expr) {
@@ -869,6 +879,13 @@ static HirType* common_numeric_type(HirProgram* program, HirType* left, HirType*
     return primitive_type(program, HIR_TYPE_INT);
 }
 
+static int is_primitive_init_cast_type(HirType* type) {
+    return type &&
+           ((is_integer_like_type(type) && type->kind != HIR_TYPE_BOOL) ||
+            is_float_like_type(type) ||
+            type->kind == HIR_TYPE_CHARACTER);
+}
+
 static int as_compatible(HirType* from, HirType* to) {
     if (!from || !to) {
         return 0;
@@ -898,10 +915,8 @@ static int as_compatible(HirType* from, HirType* to) {
         type_equals(from->array_item, to->array_item)) {
         return 1;
     }
-    if ((((from->kind == HIR_TYPE_REFERENCE || from->kind == HIR_TYPE_POINTER) && to->kind == HIR_TYPE_MANY_POINTER) ||
-         (from->kind == HIR_TYPE_MANY_POINTER && (to->kind == HIR_TYPE_REFERENCE || to->kind == HIR_TYPE_POINTER)) ||
-         ((from->kind == HIR_TYPE_REFERENCE || from->kind == HIR_TYPE_POINTER) && (to->kind == HIR_TYPE_REFERENCE || to->kind == HIR_TYPE_POINTER))) &&
-        type_equals(from->array_item, to->array_item)) {
+    if ((from->kind == HIR_TYPE_REFERENCE || from->kind == HIR_TYPE_POINTER || from->kind == HIR_TYPE_MANY_POINTER) &&
+        (to->kind == HIR_TYPE_REFERENCE || to->kind == HIR_TYPE_POINTER || to->kind == HIR_TYPE_MANY_POINTER)) {
         return 1;
     }
     return 0;
@@ -1482,6 +1497,65 @@ static HirExpr* lower_optional_chain_index(LowerContext* ctx, const AstExpr* exp
     out->as.ternary.cond = cond;
     out->as.ternary.then_expr = access;
     out->as.ternary.else_expr = make_null_expr(result_type, expr->line);
+    return out;
+}
+
+static HirExpr* lower_optional_chain_implicit(LowerContext* ctx, const AstExpr* expr) {
+    HirExpr* base = 0;
+    HirExpr* free_value = 0;
+    HirExpr* cond = 0;
+    HirExpr* then_expr = 0;
+    HirExpr* else_expr = 0;
+    HirExpr* out = 0;
+    HirType* void_type = primitive_type(ctx->program, HIR_TYPE_VOID);
+    if (expr->as.implicit.target_is_type) {
+        fail(ctx, "optional chain requires value target");
+        return 0;
+    }
+    if (strcmp(expr->as.implicit.member, "free") != 0) {
+        fail(ctx, "optional implicit chain currently supports '.free()'");
+        return 0;
+    }
+    if (expr->as.implicit.has_type_arg || expr->as.implicit.args.count != 0) {
+        fail(ctx, "implicit operation '.free()' takes no arguments");
+        return 0;
+    }
+    if (!is_pure_optional_base_expr(expr->as.implicit.value_target)) {
+        fail(ctx, "optional chain requires pure base expression");
+        return 0;
+    }
+    base = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
+    if (!base) {
+        return 0;
+    }
+    if (base->type->kind == HIR_TYPE_OPTIONAL) {
+        free_value = make_optional_value_expr(ctx, base, expr->line);
+        if (!free_value) {
+            return 0;
+        }
+    } else {
+        free_value = base;
+    }
+    if (free_value->type->kind != HIR_TYPE_POINTER && free_value->type->kind != HIR_TYPE_MANY_POINTER) {
+        fail(ctx, "free requires pointer");
+        return 0;
+    }
+    if (free_value->kind == HIR_EXPR_BINDING) {
+        mark_binding_freed(ctx, free_value->as.binding);
+    } else if (base->kind == HIR_EXPR_BINDING) {
+        mark_binding_freed(ctx, base->as.binding);
+    }
+    cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), expr->line);
+    cond->as.binary.op = HIR_BIN_NE;
+    cond->as.binary.left = base;
+    cond->as.binary.right = make_null_expr(base->type, expr->line);
+    then_expr = new_expr(HIR_EXPR_FREE, void_type, expr->line);
+    then_expr->as.unary.value = free_value;
+    else_expr = new_expr(HIR_EXPR_NULL, void_type, expr->line);
+    out = new_expr(HIR_EXPR_IF, void_type, expr->line);
+    out->as.if_expr.cond = cond;
+    out->as.if_expr.then_expr = then_expr;
+    out->as.if_expr.else_expr = else_expr;
     return out;
 }
 
@@ -3524,6 +3598,19 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.unary.value->as.int_value = expr->as.int_value;
                 return out;
             }
+            if (expected_type &&
+                expected_type->kind == HIR_TYPE_OPTIONAL &&
+                is_float_like_type(expected_type->array_item)) {
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_FLOAT, expected_type->array_item, expr->line);
+                out->as.unary.value->as.float_value = (double)expr->as.int_value;
+                return out;
+            }
+            if (expected_type && is_float_like_type(expected_type)) {
+                out = new_expr(HIR_EXPR_FLOAT, expected_type, expr->line);
+                out->as.float_value = (double)expr->as.int_value;
+                return out;
+            }
             out = new_expr(HIR_EXPR_INT,
                            expected_type && is_integer_literal_target_type(expected_type)
                                ? expected_type
@@ -3578,6 +3665,9 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             return new_expr(HIR_EXPR_NULL, expected_type, expr->line);
         case AST_EXPR_IMPLICIT: {
+            if (expr->as.implicit.optional_chain) {
+                return lower_optional_chain_implicit(ctx, expr);
+            }
             if (expr->as.implicit.target_is_type) {
                 HirType* type = 0;
                 type = lower_type(ctx, &expr->as.implicit.type_target);
@@ -3781,6 +3871,22 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out = new_expr(HIR_EXPR_FREE, primitive_type(ctx->program, HIR_TYPE_VOID), expr->line);
                 out->as.unary.value = value;
                 return out;
+            }
+            if (strcmp(expr->as.implicit.member, "some") == 0) {
+                HirExpr* value = 0;
+                if (expr->as.implicit.has_type_arg || expr->as.implicit.args.count != 0) {
+                    fail(ctx, "implicit operation '.some()' takes no arguments");
+                    return 0;
+                }
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if (value->type->kind != HIR_TYPE_OPTIONAL) {
+                    fail(ctx, "some requires optional value");
+                    return 0;
+                }
+                return make_optional_value_expr(ctx, value, expr->line);
             }
             fail(ctx, "unknown implicit value operation");
             return 0;
@@ -4257,8 +4363,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             }
             if (then_expr->type->kind == HIR_TYPE_TUPLE ||
                 then_expr->type->kind == HIR_TYPE_ARRAY ||
-                then_expr->type->kind == HIR_TYPE_UNION ||
-                then_expr->type->kind == HIR_TYPE_VOID) {
+                then_expr->type->kind == HIR_TYPE_UNION) {
                 fail(ctx, "if expression aggregate result unsupported");
                 return 0;
             }
@@ -4309,10 +4414,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
         case AST_EXPR_CALL: {
             const char* dot = strrchr(expr->as.call.callee, '.');
             HirBuiltinKind builtin = builtin_kind(expr->as.call.callee);
+            HirExpr* primitive_init = 0;
             if (builtin != HIR_BUILTIN_NONE) {
                 out = new_expr(HIR_EXPR_CALL, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
                 if (!lower_builtin_call(ctx, expr, out, builtin)) return 0;
                 return out;
+            }
+            primitive_init = lower_primitive_init_constructor(ctx, expr);
+            if (primitive_init || ctx->error) {
+                return primitive_init;
             }
             if (dot) {
                 char* owner_name = 0;
@@ -4876,6 +4986,10 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 expr->as.binary.op == AST_BIN_MUL ||
                                 expr->as.binary.op == AST_BIN_MOD ||
                                 expr->as.binary.op == AST_BIN_DIV;
+            if (expr->as.binary.op == AST_BIN_IS) {
+                fail(ctx, "is pattern is only supported in if and while conditions");
+                return 0;
+            }
             int bitwise_op = expr->as.binary.op == AST_BIN_BIT_AND ||
                              expr->as.binary.op == AST_BIN_BIT_OR ||
                              expr->as.binary.op == AST_BIN_BIT_XOR;
@@ -4884,8 +4998,29 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             int comparison_op = !arithmetic_op && !bitwise_op && !shift_op;
             HirExpr* left = 0;
             HirExpr* right = 0;
-            HirType* numeric_type = 0;
-            if (comparison_op &&
+            if ((arithmetic_op || comparison_op || bitwise_op || shift_op) &&
+                is_numeric_literal_expr(expr->as.binary.left) &&
+                !is_numeric_literal_expr(expr->as.binary.right)) {
+                right = lower_expr_value(ctx, expr->as.binary.right);
+                if (!right) {
+                    return 0;
+                }
+                left = lower_expr_expected(ctx, expr->as.binary.left, right->type);
+                if (!left) {
+                    return 0;
+                }
+            } else if ((arithmetic_op || comparison_op || bitwise_op || shift_op) &&
+                       is_numeric_literal_expr(expr->as.binary.right) &&
+                       !is_numeric_literal_expr(expr->as.binary.left)) {
+                left = lower_expr_value(ctx, expr->as.binary.left);
+                if (!left) {
+                    return 0;
+                }
+                right = lower_expr_expected(ctx, expr->as.binary.right, left->type);
+                if (!right) {
+                    return 0;
+                }
+            } else if (comparison_op &&
                 (is_expected_type_shorthand_expr(expr->as.binary.left) || is_expected_type_null_expr(expr->as.binary.left)) &&
                 !is_expected_type_shorthand_expr(expr->as.binary.right) &&
                 !is_expected_type_null_expr(expr->as.binary.right)) {
@@ -4932,40 +5067,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 case AST_BIN_LE: out->as.binary.op = HIR_BIN_LE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_GT: out->as.binary.op = HIR_BIN_GT; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
                 case AST_BIN_GE: out->as.binary.op = HIR_BIN_GE; out->type = primitive_type(ctx->program, HIR_TYPE_BOOL); break;
+                case AST_BIN_IS: break;
             }
             if (arithmetic_op) {
-                numeric_type = common_numeric_type(ctx->program, left->type, right->type);
-                if (numeric_type) {
-                    if (expr->as.binary.op == AST_BIN_MOD && numeric_type->kind != HIR_TYPE_INT) {
-                        fail(ctx, "modulo requires Int operands");
-                        return 0;
-                    }
-                    if (!type_equals(left->type, numeric_type)) {
-                        HirExpr* as_left = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
-                        as_left->as.unary.value = left;
-                        left = as_left;
-                    }
-                    if (!type_equals(right->type, numeric_type)) {
-                        HirExpr* as_right = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
-                        as_right->as.unary.value = right;
-                        right = as_right;
-                    }
-                    out->as.binary.left = left;
-                    out->as.binary.right = right;
-                    out->type = numeric_type;
-                } else if (left->type->kind != HIR_TYPE_INT || right->type->kind != HIR_TYPE_INT) {
-                    if (!type_equals(left->type, right->type) ||
-                        (!is_integer_like_type(left->type) &&
-                         !is_float_like_type(left->type))) {
-                        fail(ctx, "arithmetic requires numeric operands");
-                        return 0;
-                    }
-                    if (expr->as.binary.op == AST_BIN_MOD && !is_integer_like_type(left->type)) {
-                        fail(ctx, "modulo requires integer operands");
-                        return 0;
-                    }
-                    out->type = left->type;
+                if (!type_equals(left->type, right->type) ||
+                    (!is_integer_like_type(left->type) &&
+                     !is_float_like_type(left->type))) {
+                    fail(ctx, "arithmetic requires matching numeric operands");
+                    return 0;
                 }
+                if (expr->as.binary.op == AST_BIN_MOD && !is_integer_like_type(left->type)) {
+                    fail(ctx, "modulo requires integer operands");
+                    return 0;
+                }
+                out->type = left->type;
             } else if (bitwise_op) {
                 if (!type_equals(left->type, right->type) ||
                     !is_bitwise_integer_type(left->type)) {
@@ -4981,21 +5096,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
                 out->type = left->type;
             } else {
-                numeric_type = common_numeric_type(ctx->program, left->type, right->type);
-                if (numeric_type) {
-                    if (!type_equals(left->type, numeric_type)) {
-                        HirExpr* as_left = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
-                        as_left->as.unary.value = left;
-                        left = as_left;
-                    }
-                    if (!type_equals(right->type, numeric_type)) {
-                        HirExpr* as_right = new_expr(HIR_EXPR_AS, numeric_type, expr->line);
-                        as_right->as.unary.value = right;
-                        right = as_right;
-                    }
-                    out->as.binary.left = left;
-                    out->as.binary.right = right;
-                } else if (!type_equals(left->type, right->type)) {
+                if (!type_equals(left->type, right->type)) {
                     fail(ctx, "comparison requires matching operand types");
                     return 0;
                 }
@@ -5231,6 +5332,40 @@ static HirExpr* lower_new_primitive_constructor(LowerContext* ctx, const AstExpr
         return 0;
     }
     return arg;
+}
+
+static HirExpr* lower_primitive_init_constructor(LowerContext* ctx, const AstExpr* expr) {
+    HirType* target_type = 0;
+    HirExpr* arg = 0;
+    HirExpr* out = 0;
+    if (!expr || expr->kind != AST_EXPR_CALL || expr->as.call.type_args.count != 0) {
+        return 0;
+    }
+    target_type = resolve_owner_type_name(ctx, expr->as.call.callee);
+    if (!target_type || !hir_type_supports_new_default_init(target_type)) {
+        return 0;
+    }
+    if (expr->as.call.args.count == 0) {
+        return make_zero_expr(ctx, target_type, expr->line);
+    }
+    if (expr->as.call.args.count != 1 || expr->as.call.args.items[0].name) {
+        fail(ctx, "primitive init requires zero or one positional argument");
+        return 0;
+    }
+    arg = lower_expr(ctx, expr->as.call.args.items[0].value);
+    if (!arg) {
+        return 0;
+    }
+    if (type_equals(arg->type, target_type)) {
+        return arg;
+    }
+    if (!is_primitive_init_cast_type(arg->type) || !is_primitive_init_cast_type(target_type)) {
+        fail(ctx, "primitive init type mismatch");
+        return 0;
+    }
+    out = new_expr(HIR_EXPR_AS, target_type, expr->line);
+    out->as.unary.value = arg;
+    return out;
 }
 
 static HirExpr* make_zero_expr(LowerContext* ctx, HirType* type, int line) {
@@ -5523,7 +5658,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             int non_null_then = 0;
             if (stmt->as.if_stmt.cond &&
                 stmt->as.if_stmt.cond->kind == AST_EXPR_BINARY &&
-                stmt->as.if_stmt.cond->as.binary.op == AST_BIN_EQ &&
+                stmt->as.if_stmt.cond->as.binary.op == AST_BIN_IS &&
                 stmt->as.if_stmt.cond->as.binary.right &&
                 stmt->as.if_stmt.cond->as.binary.right->kind == AST_EXPR_VARIANT &&
                 stmt->as.if_stmt.cond->as.binary.right->as.variant.pattern_flag) {
@@ -5673,20 +5808,40 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
         }
         case AST_STMT_WHILE: {
             Scope inner;
-            out->as.while_stmt.cond = lower_expr_expected(ctx, stmt->as.while_stmt.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
-            if (!out->as.while_stmt.cond) {
-                return 0;
-            }
-            if (out->as.while_stmt.cond->type->kind != HIR_TYPE_BOOL) {
-                fail(ctx, "while condition must be Bool");
-                return 0;
-            }
             ctx->loop_depth += 1;
-            push_scope(ctx, &inner);
-            if (!lower_block(ctx, &stmt->as.while_stmt.body, &out->as.while_stmt.body, 1)) {
-                return 0;
+            if (stmt->as.while_stmt.cond &&
+                stmt->as.while_stmt.cond->kind == AST_EXPR_BINARY &&
+                stmt->as.while_stmt.cond->as.binary.op == AST_BIN_IS &&
+                stmt->as.while_stmt.cond->as.binary.right &&
+                stmt->as.while_stmt.cond->as.binary.right->kind == AST_EXPR_VARIANT &&
+                stmt->as.while_stmt.cond->as.binary.right->as.variant.pattern_flag) {
+                HirExpr* value = lower_expr(ctx, stmt->as.while_stmt.cond->as.binary.left);
+                if (!value) {
+                    return 0;
+                }
+                push_scope(ctx, &inner);
+                if (!lower_variant_pattern_bind(ctx, value, stmt->as.while_stmt.cond->as.binary.right, &out->as.while_stmt.body, &out->as.while_stmt.cond)) {
+                    return 0;
+                }
+                if (!lower_block(ctx, &stmt->as.while_stmt.body, &out->as.while_stmt.body, 1)) {
+                    return 0;
+                }
+                pop_scope(ctx);
+            } else {
+                out->as.while_stmt.cond = lower_expr_expected(ctx, stmt->as.while_stmt.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
+                if (!out->as.while_stmt.cond) {
+                    return 0;
+                }
+                if (out->as.while_stmt.cond->type->kind != HIR_TYPE_BOOL) {
+                    fail(ctx, "while condition must be Bool");
+                    return 0;
+                }
+                push_scope(ctx, &inner);
+                if (!lower_block(ctx, &stmt->as.while_stmt.body, &out->as.while_stmt.body, 1)) {
+                    return 0;
+                }
+                pop_scope(ctx);
             }
-            pop_scope(ctx);
             ctx->loop_depth -= 1;
             ctx->current_line = saved_line;
             return out;
@@ -5980,11 +6135,9 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
     HirUnionVariant* variant = 0;
     HirExpr* cond = 0;
     int i = 0;
-    if (pattern->as.variant.union_name && strcmp(pattern->as.variant.union_name, "Option") == 0) {
+    if (value->type->kind == HIR_TYPE_OPTIONAL &&
+        (!pattern->as.variant.union_name || strcmp(pattern->as.variant.union_name, "Option") == 0)) {
         HirExpr* some_value = 0;
-        if (value->type->kind != HIR_TYPE_OPTIONAL) {
-            return fail(ctx, "optional pattern type mismatch");
-        }
         if (strcmp(pattern->as.variant.variant_name, "some") != 0) {
             return fail(ctx, "unknown optional pattern");
         }
