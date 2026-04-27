@@ -444,9 +444,11 @@ typedef struct AstParamList {
 } AstParamList;
 
 typedef struct AstStructInitDecl {
+    char* name;
     AstParamList params;
     AstBlock body;
     int line;
+    int failable_flag;
 } AstStructInitDecl;
 
 typedef struct AstStructInitDeclList {

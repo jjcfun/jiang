@@ -1207,7 +1207,9 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         AstStructInitDecl init_decl;
         int j = 0;
         memset(&init_decl, 0, sizeof(init_decl));
+        init_decl.name = decl->init_overloads.items[i].name ? dup_text(decl->init_overloads.items[i].name) : 0;
         init_decl.line = decl->init_overloads.items[i].line;
+        init_decl.failable_flag = decl->init_overloads.items[i].failable_flag;
         for (j = 0; j < decl->init_overloads.items[i].params.count; ++j) {
             AstParam param;
             memset(&param, 0, sizeof(param));
@@ -5052,7 +5054,9 @@ static int instantiate_struct_template(MonoContext* mono, const AstStructDecl* t
         memset(&init_decl, 0, sizeof(init_decl));
         memset(&init_locals, 0, sizeof(init_locals));
         push_self_local_type(&init_locals, templ->name);
+        init_decl.name = templ->init_overloads.items[i].name ? dup_text(templ->init_overloads.items[i].name) : 0;
         init_decl.line = templ->init_overloads.items[i].line;
+        init_decl.failable_flag = templ->init_overloads.items[i].failable_flag;
         for (j = 0; j < templ->init_overloads.items[i].params.count; ++j) {
             AstParam param = templ->init_overloads.items[i].params.items[j];
             LocalTypeEntry entry;

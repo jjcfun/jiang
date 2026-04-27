@@ -387,6 +387,7 @@ struct HirFunction {
     HirBindingList locals;
     HirBlock body;
     int struct_init_flag;
+    int struct_init_failable_flag;
     int struct_deinit_flag;
     int extern_flag;
     int public_flag;

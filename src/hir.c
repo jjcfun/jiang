@@ -904,6 +904,33 @@ static int is_integer_literal_target_type(HirType* type) {
             type->kind == HIR_TYPE_CHARACTER);
 }
 
+static int char_literal_fits_integer_type(int64_t value, HirType* type) {
+    if (!type) {
+        return 0;
+    }
+    switch (type->kind) {
+        case HIR_TYPE_INT:
+        case HIR_TYPE_I64:
+            return value >= INT64_MIN && value <= INT64_MAX;
+        case HIR_TYPE_I8:
+            return value >= -128 && value <= 127;
+        case HIR_TYPE_I16:
+            return value >= -32768 && value <= 32767;
+        case HIR_TYPE_I32:
+            return value >= -2147483648LL && value <= 2147483647LL;
+        case HIR_TYPE_UINT8:
+        case HIR_TYPE_U8:
+            return value >= 0 && value <= 255;
+        case HIR_TYPE_U16:
+            return value >= 0 && value <= 65535;
+        case HIR_TYPE_U32:
+        case HIR_TYPE_U64:
+            return value >= 0;
+        default:
+            return 0;
+    }
+}
+
 static int is_numeric_promotion_type(HirType* type) {
     return type &&
            (type->kind == HIR_TYPE_INT ||
@@ -1832,6 +1859,8 @@ static int function_signature_conflicts(HirFunction* left, HirFunction* right) {
         return left->struct_init_flag &&
                right->struct_init_flag &&
                left->owner_struct == right->owner_struct &&
+               ((left->source_name == 0 && right->source_name == 0) ||
+                (left->source_name && right->source_name && strcmp(left->source_name, right->source_name) == 0)) &&
                function_param_types_equal(&left->params, &right->params);
     }
     if (left->struct_deinit_flag || right->struct_deinit_flag) {
@@ -1889,6 +1918,27 @@ static HirFunction* find_struct_init_function(HirProgram* program, HirStructDecl
             fn->owner_struct == struct_decl &&
             fn->struct_init_index == init_index) {
             return fn;
+        }
+    }
+    return 0;
+}
+
+static int struct_init_name_matches(HirFunction* fn, const char* init_name) {
+    if (!fn || !fn->struct_init_flag) {
+        return 0;
+    }
+    if (!init_name) {
+        return fn->source_name == 0;
+    }
+    return fn->source_name && strcmp(fn->source_name, init_name) == 0;
+}
+
+static int struct_has_init_name(HirProgram* program, HirStructDecl* struct_decl, const char* init_name) {
+    int i = 0;
+    for (i = 0; i < program->functions.count; ++i) {
+        HirFunction* fn = &program->functions.items[i];
+        if (fn->owner_struct == struct_decl && struct_init_name_matches(fn, init_name)) {
+            return 1;
         }
     }
     return 0;
@@ -2939,10 +2989,17 @@ static HirFunction* resolve_top_level_function_call(LowerContext* ctx,
     return matched;
 }
 
-static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstStructFieldInitList* ast_args, HirExprList* out_args, int line) {
+static int lower_struct_init_args_named(LowerContext* ctx,
+                                        HirStructDecl* struct_decl,
+                                        const char* init_name,
+                                        const AstStructFieldInitList* ast_args,
+                                        HirExprList* out_args,
+                                        HirFunction** out_fn,
+                                        int line) {
     int param_count = 0;
     int i = 0;
     int match_count = 0;
+    HirFunction* matched_fn = 0;
     HirExprList matched_args;
     memset(&matched_args, 0, sizeof(matched_args));
     (void)line;
@@ -2954,7 +3011,9 @@ static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl,
         HirExprList candidate_args;
         const char* saved_error = ctx->error;
         memset(&candidate_args, 0, sizeof(candidate_args));
-        if (!candidate->struct_init_flag || candidate->owner_struct != struct_decl) {
+        if (!candidate->struct_init_flag ||
+            candidate->owner_struct != struct_decl ||
+            !struct_init_name_matches(candidate, init_name)) {
             continue;
         }
         param_count = candidate->params.count;
@@ -2967,6 +3026,7 @@ static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl,
             continue;
         }
         matched_args = candidate_args;
+        matched_fn = candidate;
         match_count += 1;
         if (match_count > 1) {
             return fail(ctx, "ambiguous init overload");
@@ -2978,7 +3038,14 @@ static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl,
     out_args->items = matched_args.items;
     out_args->count = matched_args.count;
     out_args->capacity = matched_args.capacity;
+    if (out_fn) {
+        *out_fn = matched_fn;
+    }
     return 1;
+}
+
+static int lower_struct_init_args(LowerContext* ctx, HirStructDecl* struct_decl, const AstStructFieldInitList* ast_args, HirExprList* out_args, int line) {
+    return lower_struct_init_args_named(ctx, struct_decl, 0, ast_args, out_args, 0, line);
 }
 
 static int lower_default_struct_call_args(LowerContext* ctx,
@@ -3553,6 +3620,11 @@ static int validate_struct_init_stmt(LowerContext* ctx, HirStructDecl* struct_de
     switch (stmt->kind) {
         case AST_STMT_RETURN:
             if (stmt->as.ret.expr) {
+                if (ctx->current_function &&
+                    ctx->current_function->struct_init_failable_flag &&
+                    stmt->as.ret.expr->kind == AST_EXPR_NULL) {
+                    return 1;
+                }
                 return fail(ctx, "struct init must not return a value");
             }
             return 1;
@@ -3703,6 +3775,30 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
                 out->as.unary.value = new_expr(HIR_EXPR_CHAR, primitive_type(ctx->program, HIR_TYPE_CHARACTER), expr->line);
                 out->as.unary.value->as.char_value = expr->as.char_value;
+                return out;
+            }
+            if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL &&
+                expected_type->array_item &&
+                is_integer_like_type(expected_type->array_item) &&
+                expected_type->array_item->kind != HIR_TYPE_BOOL) {
+                if (!char_literal_fits_integer_type(expr->as.char_value, expected_type->array_item)) {
+                    fail(ctx, "character literal out of range for integer type");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, expr->line);
+                out->as.unary.value = new_expr(HIR_EXPR_INT, expected_type->array_item, expr->line);
+                out->as.unary.value->as.int_value = expr->as.char_value;
+                return out;
+            }
+            if (expected_type &&
+                is_integer_like_type(expected_type) &&
+                expected_type->kind != HIR_TYPE_BOOL) {
+                if (!char_literal_fits_integer_type(expr->as.char_value, expected_type)) {
+                    fail(ctx, "character literal out of range for integer type");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_INT, expected_type, expr->line);
+                out->as.int_value = expr->as.char_value;
                 return out;
             }
             out = new_expr(HIR_EXPR_CHAR, primitive_type(ctx->program, HIR_TYPE_CHARACTER), expr->line);
@@ -4656,6 +4752,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                     HirFunction* candidate = &ctx->program->functions.items[fn_index];
                                     if (candidate->struct_init_flag &&
                                         candidate->owner_struct == init_struct &&
+                                        struct_init_name_matches(candidate, 0) &&
                                         candidate->params.count == out->as.call.args.count) {
                                         HirExprList candidate_args;
                                         const char* saved_error = ctx->error;
@@ -4674,6 +4771,27 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 fail(ctx, "internal error: missing struct init function");
                                 return 0;
                             }
+                            out->type = out->as.call.callee->return_type;
+                            return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
+                        }
+                        if (named_type->kind == HIR_TYPE_STRUCT &&
+                            struct_has_init_name(ctx->program, named_type->struct_decl, member_name)) {
+                            HirFunction* init_fn = 0;
+                            HirExprList named_args;
+                            memset(&named_args, 0, sizeof(named_args));
+                            if (!lower_struct_init_args_named(ctx, named_type->struct_decl, member_name, &expr->as.call.args, &named_args, &init_fn, expr->line)) {
+                                free(owner_name);
+                                free(trait_name);
+                                free(parsed_member_name);
+                                return 0;
+                            }
+                            free(owner_name);
+                            free(trait_name);
+                            free(parsed_member_name);
+                            out = new_expr(HIR_EXPR_CALL, init_fn->return_type, expr->line);
+                            out->as.call.callee = init_fn;
+                            out->as.call.builtin = HIR_BUILTIN_NONE;
+                            out->as.call.args = named_args;
                             return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                         }
                         method = resolve_method_call_overload(ctx, named_type, member_name, 0, &expr->as.call.args, 0, trait_name, &matched_args);
@@ -4779,6 +4897,9 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             if (!candidate->struct_init_flag || candidate->owner_struct != init_struct) {
                                 continue;
                             }
+                            if (!struct_init_name_matches(candidate, 0)) {
+                                continue;
+                            }
                             ctx->error = 0;
                             if (lower_struct_init_args_for_function(ctx, &expr->as.call.args, &candidate_args, candidate)) {
                                 out->as.call.callee = candidate;
@@ -4791,6 +4912,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                             fail(ctx, "internal error: missing struct init function");
                             return 0;
                         }
+                        out->type = out->as.call.callee->return_type;
                         return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                     }
                     if (init_struct->record_flag) {
@@ -5580,9 +5702,21 @@ static int lower_init_block(LowerContext* ctx, const AstBlock* ast_block, HirBlo
         if (ast_stmt->kind == AST_STMT_RETURN) {
             stmt = new_stmt(HIR_STMT_RETURN, ast_stmt->line);
             if (ast_stmt->as.ret.expr) {
-                return fail(ctx, "struct init must not return a value");
+                if (!ctx->current_function->struct_init_failable_flag ||
+                    ast_stmt->as.ret.expr->kind != AST_EXPR_NULL) {
+                    return fail(ctx, "struct init must not return a value");
+                }
+                stmt->as.ret.expr = lower_expr_expected(ctx, ast_stmt->as.ret.expr, ctx->current_function->return_type);
+                if (!stmt->as.ret.expr) {
+                    return 0;
+                }
+                stmt_list_push(&out_block->stmts, stmt);
+                continue;
             }
             stmt->as.ret.expr = make_binding_expr(self_binding, ast_stmt->line);
+            if (ctx->current_function->struct_init_failable_flag) {
+                stmt->as.ret.expr = wrap_optional_result(ctx, stmt->as.ret.expr, ast_stmt->line);
+            }
             stmt_list_push(&out_block->stmts, stmt);
             continue;
         }
@@ -7257,9 +7391,13 @@ static int register_struct_init_functions(LowerContext* ctx) {
             memset(&hir_fn, 0, sizeof(hir_fn));
             return_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
             return_type->struct_decl = struct_decl;
+            if (ast_struct->init_overloads.items[init_index].failable_flag) {
+                return_type = make_optional_type(ctx, return_type);
+                hir_fn.struct_init_failable_flag = 1;
+            }
             hir_fn.return_type = return_type;
             hir_fn.name = make_struct_init_name(struct_decl->name, init_index);
-            hir_fn.source_name = "init";
+            hir_fn.source_name = ast_struct->init_overloads.items[init_index].name;
             hir_fn.line = ast_struct->init_overloads.items[init_index].line;
             hir_fn.struct_init_flag = 1;
             hir_fn.struct_init_index = init_index;
@@ -7437,6 +7575,7 @@ static int lower_functions(LowerContext* ctx) {
             const AstStructDecl* ast_struct = find_ast_struct(ctx->ast, ctx->current_function->owner_struct->name);
             const AstStructInitDecl* ast_init = 0;
             HirBinding* self_binding = 0;
+            HirType* self_type = 0;
             HirStmt* self_decl = 0;
             int* field_state = 0;
             int j = 0;
@@ -7472,14 +7611,16 @@ static int lower_functions(LowerContext* ctx) {
                 }
             }
             free(field_state);
-            self_binding = new_binding(ctx->current_function->return_type, 1, "self", HIR_BINDING_LOCAL, ast_init->line);
+            self_type = new_owned_type(ctx->program, HIR_TYPE_STRUCT);
+            self_type->struct_decl = ctx->current_function->owner_struct;
+            self_binding = new_binding(self_type, 1, "self", HIR_BINDING_LOCAL, ast_init->line);
             binding_list_push(&ctx->current_function->locals, self_binding);
             if (!bind_in_current_scope(ctx, self_binding)) {
                 return 0;
             }
             self_decl = new_stmt(HIR_STMT_VAR_DECL, ast_init->line);
             self_decl->as.var_decl.binding = self_binding;
-            self_decl->as.var_decl.init = make_zero_expr(ctx, ctx->current_function->return_type, ast_init->line);
+            self_decl->as.var_decl.init = make_zero_expr(ctx, self_type, ast_init->line);
             stmt_list_push(&ctx->current_function->body.stmts, self_decl);
             for (j = 0; j < ast_struct->fields.count; ++j) {
                 if (ast_struct->fields.items[j].default_value) {
@@ -7510,6 +7651,9 @@ static int lower_functions(LowerContext* ctx) {
                 ctx->current_function->body.stmts.items[ctx->current_function->body.stmts.count - 1]->kind != HIR_STMT_RETURN) {
                 HirStmt* ret = new_stmt(HIR_STMT_RETURN, ast_init->line);
                 ret->as.ret.expr = make_binding_expr(self_binding, ast_init->line);
+                if (ctx->current_function->struct_init_failable_flag) {
+                    ret->as.ret.expr = wrap_optional_result(ctx, ret->as.ret.expr, ast_init->line);
+                }
                 stmt_list_push(&ctx->current_function->body.stmts, ret);
             }
         } else if (ctx->current_function->struct_deinit_flag) {

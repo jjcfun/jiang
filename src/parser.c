@@ -45,6 +45,61 @@ static char* token_slice_dup(const Token* token) {
     return text;
 }
 
+static int decode_single_unicode_scalar_text(const char* raw_text, int length, int64_t* out_value) {
+    const unsigned char* text = (const unsigned char*)raw_text;
+    int64_t value = 0;
+    if (!text || !out_value || length <= 0) {
+        return 0;
+    }
+    if ((text[0] & 0x80) == 0) {
+        if (length != 1) {
+            return 0;
+        }
+        *out_value = text[0];
+        return 1;
+    }
+    if ((text[0] & 0xE0) == 0xC0) {
+        if (length != 2 || (text[1] & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = ((int64_t)(text[0] & 0x1F) << 6) |
+                (int64_t)(text[1] & 0x3F);
+        if (value < 0x80) {
+            return 0;
+        }
+        *out_value = value;
+        return 1;
+    }
+    if ((text[0] & 0xF0) == 0xE0) {
+        if (length != 3 || (text[1] & 0xC0) != 0x80 || (text[2] & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = ((int64_t)(text[0] & 0x0F) << 12) |
+                ((int64_t)(text[1] & 0x3F) << 6) |
+                (int64_t)(text[2] & 0x3F);
+        if (value < 0x800 || (value >= 0xD800 && value <= 0xDFFF)) {
+            return 0;
+        }
+        *out_value = value;
+        return 1;
+    }
+    if ((text[0] & 0xF8) == 0xF0) {
+        if (length != 4 || (text[1] & 0xC0) != 0x80 || (text[2] & 0xC0) != 0x80 || (text[3] & 0xC0) != 0x80) {
+            return 0;
+        }
+        value = ((int64_t)(text[0] & 0x07) << 18) |
+                ((int64_t)(text[1] & 0x3F) << 12) |
+                ((int64_t)(text[2] & 0x3F) << 6) |
+                (int64_t)(text[3] & 0x3F);
+        if (value < 0x10000 || value > 0x10FFFF) {
+            return 0;
+        }
+        *out_value = value;
+        return 1;
+    }
+    return 0;
+}
+
 static char* dup_join3(const char* left, const char* middle, const char* right) {
     size_t left_len = strlen(left);
     size_t middle_len = strlen(middle);
@@ -1881,6 +1936,24 @@ static AstExpr* parse_primary(Parser* parser) {
         expr = new_expr(AST_EXPR_STRING, token.line);
         expr->as.string_lit.text = string_token_dup(&token);
         expr->as.string_lit.length = (int)(token.length >= 2 ? token.length - 2 : 0);
+        advance(parser);
+        return expr;
+    }
+
+    if (token.kind == TOKEN_CHAR_LIT) {
+        AstExpr string_expr;
+        int64_t value = 0;
+        memset(&string_expr, 0, sizeof(string_expr));
+        string_expr.kind = AST_EXPR_STRING;
+        string_expr.line = token.line;
+        string_expr.as.string_lit.text = string_token_dup(&token);
+        string_expr.as.string_lit.length = (int)(token.length >= 2 ? token.length - 2 : 0);
+        if (!decode_single_unicode_scalar_text(string_expr.as.string_lit.text, string_expr.as.string_lit.length, &value)) {
+            fail(parser, "character literal requires exactly one Unicode scalar");
+            return 0;
+        }
+        expr = new_expr(AST_EXPR_CHAR, token.line);
+        expr->as.char_value = value;
         advance(parser);
         return expr;
     }
@@ -3868,7 +3941,11 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             token_equals(&parser->next, "deinit")) {
             return fail(parser, "static deinit not allowed");
         }
-        if (parser->current.kind == TOKEN_IDENT && token_equals(&parser->current, "init") && parser->next.kind == TOKEN_LEFT_PAREN) {
+        if (parser->current.kind == TOKEN_IDENT &&
+            token_equals(&parser->current, "init") &&
+            (parser->next.kind == TOKEN_LEFT_PAREN ||
+             parser->next.kind == TOKEN_QUESTION ||
+             parser->next.kind == TOKEN_IDENT)) {
             AstStructInitDecl init_decl;
             int init_index = 0;
             memset(&init_decl, 0, sizeof(init_decl));
@@ -3877,12 +3954,24 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             }
             init_decl.line = parser->current.line;
             advance(parser);
+            if (parser->current.kind == TOKEN_QUESTION) {
+                init_decl.failable_flag = 1;
+                advance(parser);
+            }
+            if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_LEFT_PAREN) {
+                init_decl.name = token_dup(&parser->current);
+                advance(parser);
+            }
             if (!parse_params(parser, &init_decl.params)) {
                 return 0;
             }
             for (init_index = 0; init_index < struct_decl.init_overloads.count; ++init_index) {
                 AstStructInitDecl* existing = &struct_decl.init_overloads.items[init_index];
                 int param_index = 0;
+                if ((existing->name || init_decl.name) &&
+                    (!existing->name || !init_decl.name || strcmp(existing->name, init_decl.name) != 0)) {
+                    continue;
+                }
                 if (existing->params.count != init_decl.params.count) {
                     continue;
                 }
