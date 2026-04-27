@@ -185,6 +185,10 @@ Token lexer_next(Lexer* lexer) {
     if (*lexer->current == '"') {
         lexer->current += 1;
         while (*lexer->current != '\0' && *lexer->current != '"' && *lexer->current != '\n') {
+            if (*lexer->current == '\\' && lexer->current[1] != '\0' && lexer->current[1] != '\n') {
+                lexer->current += 2;
+                continue;
+            }
             lexer->current += 1;
         }
         if (*lexer->current != '"') {
@@ -197,6 +201,10 @@ Token lexer_next(Lexer* lexer) {
     if (*lexer->current == '\'') {
         lexer->current += 1;
         while (*lexer->current != '\0' && *lexer->current != '\'' && *lexer->current != '\n') {
+            if (*lexer->current == '\\' && lexer->current[1] != '\0' && lexer->current[1] != '\n') {
+                lexer->current += 2;
+                continue;
+            }
             lexer->current += 1;
         }
         if (*lexer->current != '\'') {

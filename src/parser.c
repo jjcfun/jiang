@@ -51,6 +51,33 @@ static int decode_single_unicode_scalar_text(const char* raw_text, int length, i
     if (!text || !out_value || length <= 0) {
         return 0;
     }
+    if (length == 2 && text[0] == '\\') {
+        switch (text[1]) {
+            case '0':
+                *out_value = 0;
+                return 1;
+            case 'n':
+                *out_value = '\n';
+                return 1;
+            case 'r':
+                *out_value = '\r';
+                return 1;
+            case 't':
+                *out_value = '\t';
+                return 1;
+            case '\\':
+                *out_value = '\\';
+                return 1;
+            case '\'':
+                *out_value = '\'';
+                return 1;
+            case '"':
+                *out_value = '"';
+                return 1;
+            default:
+                return 0;
+        }
+    }
     if ((text[0] & 0x80) == 0) {
         if (length != 1) {
             return 0;

@@ -2508,13 +2508,22 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
         }
     }
     for (i = 0; i < imported->structs.count; ++i) {
-        struct_list_push(&dest->structs, clone_struct_decl(imported, prefix, 1, &imported->structs.items[i], imported->structs.items[i].public_flag));
+        AstStructDecl decl = clone_struct_decl(imported, prefix, 1, &imported->structs.items[i], imported->structs.items[i].public_flag);
+        if (!find_ast_struct(dest, decl.name)) {
+            struct_list_push(&dest->structs, decl);
+        }
     }
     for (i = 0; i < imported->enums.count; ++i) {
-        enum_list_push(&dest->enums, clone_enum_decl(imported, prefix, 1, &imported->enums.items[i], imported->enums.items[i].public_flag));
+        AstEnumDecl decl = clone_enum_decl(imported, prefix, 1, &imported->enums.items[i], imported->enums.items[i].public_flag);
+        if (!find_ast_enum(dest, decl.name)) {
+            enum_list_push(&dest->enums, decl);
+        }
     }
     for (i = 0; i < imported->unions.count; ++i) {
-        union_list_push(&dest->unions, clone_union_decl(imported, prefix, 1, &imported->unions.items[i], imported->unions.items[i].public_flag));
+        AstUnionDecl decl = clone_union_decl(imported, prefix, 1, &imported->unions.items[i], imported->unions.items[i].public_flag);
+        if (!find_ast_union(dest, decl.name)) {
+            union_list_push(&dest->unions, decl);
+        }
     }
     for (i = 0; i < imported->globals.count; ++i) {
         if (imported->globals.items[i].public_flag ||
@@ -3671,11 +3680,14 @@ static int ast_type_satisfies_concept(const AstProgram* program, const AstType* 
     const AstConceptDecl* concept = find_ast_concept(program, concept_name);
     AstTypeQueryRef query = describe_ast_type(program, type);
     if (builtin_concept_flag_for_name(concept_name) != BUILTIN_CONCEPT_NONE) {
+        if (strcmp(concept_name, "MaybeMutable") == 0) {
+            return 1;
+        }
+        if (strcmp(concept_name, "Mutable") == 0) {
+            return type && type->mutable_flag;
+        }
         if (query.kind == AST_TYPE_QUERY_NOMINAL && query.nominal.kind != AST_NOMINAL_BUILTIN) {
             if (!nominal_declares_concept_or_child(program, query.nominal, concept_name)) {
-                return 0;
-            }
-            if (strcmp(concept_name, "Mutable") == 0 && (!type || !type->mutable_flag)) {
                 return 0;
             }
             if (!type_has_builtin_concept_methods(program, type, concept_name)) {

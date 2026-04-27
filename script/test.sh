@@ -175,6 +175,7 @@ run_sample character_hashable_minimal.jiang 65
 run_sample character_unicode_minimal.jiang 23
 run_sample character_single_quote_minimal.jiang 24
 run_sample character_single_quote_unicode_minimal.jiang 25
+run_sample character_escape_minimal.jiang 42
 run_sample int_char_literal_expected_minimal.jiang 42
 run_sample int_float_add_minimal.jiang 24
 run_sample int_double_add_minimal.jiang 25

@@ -7500,9 +7500,13 @@ static int register_enums(LowerContext* ctx) {
         enum_decl.name = ctx->ast->enums.items[i].name;
         for (j = 0; j < ctx->ast->enums.items[i].members.count; ++j) {
             HirEnumMember member;
+            int k = 0;
             memset(&member, 0, sizeof(member));
-            if (hashmap_contains(&ctx->program->enum_member_map, ctx->ast->enums.items[i].members.items[j].name)) {
-                return fail(ctx, "duplicate enum member");
+            for (k = 0; k < j; ++k) {
+                if (strcmp(ctx->ast->enums.items[i].members.items[k].name,
+                           ctx->ast->enums.items[i].members.items[j].name) == 0) {
+                    return fail(ctx, "duplicate enum member");
+                }
             }
             member.name = ctx->ast->enums.items[i].members.items[j].name;
             if (ctx->ast->enums.items[i].members.items[j].has_value) {
