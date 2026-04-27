@@ -5,7 +5,6 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
 SAMPLES_DIR="$PROJECT_ROOT/tests/samples"
-COMPILER_SAMPLES_DIR="$PROJECT_ROOT/tests/compiler"
 
 if [[ -n "${LLVM_CONFIG:-}" ]]; then
   LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"
@@ -68,33 +67,6 @@ run_compile_fail() {
   set -e
   if [[ "$status" -eq 0 ]]; then
     echo "error: $sample unexpectedly compiled" >&2
-    exit 1
-  fi
-}
-
-run_compiler_sample() {
-  local sample="$1"
-  local expected="$2"
-  local ir="$BUILD_DIR/compiler_${sample%.jiang}.ll"
-  "$BUILD_DIR/jiangc" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
-  set +e
-  "$LLI" "$ir"
-  local status=$?
-  set -e
-  if [[ "$status" -ne "$expected" ]]; then
-    echo "error: compiler/$sample exited $status, expected $expected" >&2
-    exit 1
-  fi
-}
-
-run_compiler_compile_fail() {
-  local sample="$1"
-  set +e
-  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/jiangc" "$COMPILER_SAMPLES_DIR/$sample" >/dev/null 2>&1
-  local status=$?
-  set -e
-  if [[ "$status" -eq 0 ]]; then
-    echo "error: compiler/$sample unexpectedly compiled" >&2
     exit 1
   fi
 }
@@ -362,18 +334,7 @@ run_sample generic_struct_instantiation_minimal.jiang 42
 run_sample mutable_generic_minimal.jiang 42
 run_sample maybe_mutable_generic_minimal.jiang 42
 run_sample type_modifier_canonical_minimal.jiang 7
-run_compiler_sample arena_basic_minimal.jiang 0
-run_compiler_sample arena_reset_reuse_minimal.jiang 0
-run_compiler_sample arena_typed_alloc_minimal.jiang 0
-run_compiler_sample arena_zero_size_minimal.jiang 0
-run_compiler_sample hash_map_minimal.jiang 0
-run_compiler_sample hash_map_collision_minimal.jiang 0
-run_compiler_sample hash_map_remove_minimal.jiang 0
-run_compiler_sample hash_map_deleted_reuse_minimal.jiang 0
-run_compiler_sample hash_map_get_ptr_minimal.jiang 0
-run_compiler_sample hash_map_get_or_put_minimal.jiang 0
-run_compiler_sample hash_map_reserve_clear_minimal.jiang 0
-run_compiler_sample hash_map_optional_value_has_minimal.jiang 0
+SKIP_STAGE0_BUILD=1 BUILD_DIR="$BUILD_DIR" sh "$PROJECT_ROOT/script/test_compiler.sh"
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
@@ -438,14 +399,6 @@ run_sample unary_tuple_infer_local_decl_minimal.jiang 42
 run_sample unary_tuple_global_decl_minimal.jiang 42
 run_sample unary_tuple_return_minimal.jiang 42
 run_sample array_minimal.jiang 42
-run_compiler_sample array_list_minimal.jiang 0
-run_compiler_sample array_list_pointer_minimal.jiang 0
-run_compiler_sample array_list_capacity_minimal.jiang 0
-run_compiler_sample arena_list_minimal.jiang 0
-run_compiler_sample arena_list_capacity_minimal.jiang 0
-run_compiler_sample subscriptable_inferred_get_minimal.jiang 0
-run_compiler_sample subscriptable_inferred_set_minimal.jiang 0
-run_compiler_sample token_minimal.jiang 0
 run_sample array_assign_minimal.jiang 10
 run_sample array_repeat_init_minimal.jiang 6
 run_sample nested_array_minimal.jiang 42
@@ -461,6 +414,7 @@ run_sample slice_index_minimal.jiang 0
 run_sample slice_assign_minimal.jiang 0
 run_sample slice_length_minimal.jiang 3
 run_sample slice_return_length_minimal.jiang 3
+run_sample string_slice_condition_after_branch_minimal.jiang 42
 run_sample multi_file_slice_return_minimal.jiang 3
 run_sample multi_file_slice_index_minimal.jiang 42
 run_sample namespaced_slice_return_minimal.jiang 3
@@ -558,7 +512,6 @@ run_compile_fail invalid_free_non_pointer.jiang
 run_compile_fail invalid_new_non_construct_expr.jiang
 run_compile_fail invalid_pointer_offset_requires_many_pointer.jiang
 run_compile_fail invalid_many_pointer_assign_immutable.jiang
-run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 run_compile_fail invalid_use_after_free.jiang
 run_compile_fail invalid_import_private_function.jiang
 run_compile_fail invalid_import_private_type.jiang

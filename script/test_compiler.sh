@@ -19,7 +19,9 @@ if [ -z "$LLI" ] || [ ! -x "$LLI" ]; then
   exit 1
 fi
 
-"$PROJECT_ROOT/script/build_stage0.sh" >/dev/null
+if [ "${SKIP_STAGE0_BUILD:-0}" != "1" ]; then
+  "$PROJECT_ROOT/script/build_stage0.sh" >/dev/null
+fi
 
 run_compiler_sample() {
   sample="$1"
@@ -56,15 +58,20 @@ run_compiler_sample hash_map_get_ptr_minimal.jiang 0
 run_compiler_sample hash_map_get_or_put_minimal.jiang 0
 run_compiler_sample hash_map_reserve_clear_minimal.jiang 0
 run_compiler_sample hash_map_optional_value_has_minimal.jiang 0
+run_compiler_sample hash_minimal.jiang 0
 
 run_compiler_sample array_list_minimal.jiang 0
 run_compiler_sample array_list_pointer_minimal.jiang 0
 run_compiler_sample array_list_capacity_minimal.jiang 0
 run_compiler_sample arena_list_minimal.jiang 0
 run_compiler_sample arena_list_capacity_minimal.jiang 0
+run_compiler_sample imported_type_field_minimal.jiang 0
+run_compiler_sample string_util_minimal.jiang 0
 run_compiler_sample subscriptable_inferred_get_minimal.jiang 0
 run_compiler_sample subscriptable_inferred_set_minimal.jiang 0
 run_compiler_sample token_minimal.jiang 0
+run_compiler_sample interner_minimal.jiang 0
+run_compiler_sample lexer_minimal.jiang 0
 run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 
 echo "compiler samples passed"

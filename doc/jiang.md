@@ -1,6 +1,6 @@
 # Jiang语言指南
 
-> Jiang语言的目标是成为编程语言的“银弹”。`All in one`是Jiang语言的核心思想。
+> Jiang语言的目标是成为系统编程语言的“银弹”。`All in one`是Jiang语言的核心思想。
 
 
 ### 命名规范
