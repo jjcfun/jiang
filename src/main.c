@@ -621,6 +621,10 @@ static int program_value_is_public(const AstProgram* program, const char* name) 
     return 0;
 }
 
+static int is_hidden_implementation_name(const char* name) {
+    return name && (name[0] == '#' || strstr(name, ".#") != 0);
+}
+
 static char* remap_value_name(const AstProgram* program, const char* prefix, int hide_private, const char* name) {
     if (!name) {
         return 0;
@@ -1889,6 +1893,22 @@ static int apply_aliases(AstProgram* dest, const AstProgram* own_program, const 
     return 1;
 }
 
+static void append_hidden_implementation_decls(AstProgram* dest, const AstProgram* source) {
+    int i = 0;
+    for (i = 0; i < source->globals.count; ++i) {
+        const AstGlobal* global = &source->globals.items[i];
+        if (is_hidden_implementation_name(global->name) && !find_ast_global(dest, global->name)) {
+            global_list_push(&dest->globals, clone_global(source, 0, 0, global, 0));
+        }
+    }
+    for (i = 0; i < source->functions.count; ++i) {
+        const AstFunction* fn = &source->functions.items[i];
+        if (is_hidden_implementation_name(fn->name) && !find_ast_function(dest, fn->name)) {
+            function_list_push(&dest->functions, clone_function(source, 0, 0, fn, 0));
+        }
+    }
+}
+
 static int apply_public_aliases(AstProgram* dest, const AstProgram* lookup_program, const AstProgram* own_program, const char** error) {
     int i = 0;
     for (i = 0; i < own_program->aliases.count; ++i) {
@@ -1904,10 +1924,12 @@ static int apply_public_aliases(AstProgram* dest, const AstProgram* lookup_progr
         global = find_ast_public_global(lookup_program, alias->target_name);
         nominal = find_ast_public_nominal_decl(lookup_program, alias->target_name);
         if (fn) {
+            append_hidden_implementation_decls(dest, lookup_program);
             function_list_push(&dest->functions, clone_function_as(dest, fn, alias->name, 1));
             continue;
         }
         if (global) {
+            append_hidden_implementation_decls(dest, lookup_program);
             global_list_push(&dest->globals, clone_global_as(dest, global, alias->name, 1));
             continue;
         }
@@ -2495,7 +2517,8 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
         union_list_push(&dest->unions, clone_union_decl(imported, prefix, 1, &imported->unions.items[i], imported->unions.items[i].public_flag));
     }
     for (i = 0; i < imported->globals.count; ++i) {
-        if (imported->globals.items[i].public_flag) {
+        if (imported->globals.items[i].public_flag ||
+            is_hidden_implementation_name(imported->globals.items[i].name)) {
             global_list_push(&dest->globals, clone_global(imported, prefix, 1, &imported->globals.items[i], imported->globals.items[i].public_flag));
         }
     }
@@ -2522,6 +2545,9 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
             if (owner_public && method_is_exported_via_public_trait(imported, &imported->functions.items[i])) {
                 exported_public_flag = 1;
             }
+        }
+        if (!keep && is_hidden_implementation_name(imported->functions.items[i].name)) {
+            keep = 1;
         }
         if (keep) {
             function_list_push(&dest->functions, clone_function(imported, prefix, 1, &imported->functions.items[i], exported_public_flag));
