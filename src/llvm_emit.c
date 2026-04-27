@@ -26,6 +26,16 @@ static LLVMValueRef get_or_add_printf(LLVMModuleRef module, LLVMContextRef conte
     return fn;
 }
 
+static LLVMValueRef get_or_add_fflush(LLVMModuleRef module, LLVMContextRef context) {
+    LLVMValueRef fn = LLVMGetNamedFunction(module, "fflush");
+    if (!fn) {
+        LLVMTypeRef args[1];
+        args[0] = LLVMPointerType(LLVMInt8TypeInContext(context), 0);
+        fn = LLVMAddFunction(module, "fflush", LLVMFunctionType(LLVMInt32TypeInContext(context), args, 1, 0));
+    }
+    return fn;
+}
+
 static LLVMValueRef get_or_add_malloc(LLVMModuleRef module, LLVMContextRef context) {
     LLVMValueRef fn = LLVMGetNamedFunction(module, "malloc");
     if (!fn) {
@@ -635,6 +645,19 @@ static LLVMValueRef emit_builtin_assert(FunctionCodegen* cg, const JirExpr* expr
     LLVMBasicBlockRef cont_block = LLVMAppendBasicBlockInContext(cg->context, cg->llvm_function, "assert.cont");
     LLVMBuildCondBr(cg->builder, cond, ok_block, fail_block);
     LLVMPositionBuilderAtEnd(cg->builder, fail_block);
+    {
+        LLVMValueRef printf_fn = get_or_add_printf(cg->module, cg->context);
+        LLVMValueRef fflush_fn = get_or_add_fflush(cg->module, cg->context);
+        LLVMValueRef format = get_or_add_format_string(cg->module, cg->context, "__assert_fmt", "assertion failed at %d:%d\n");
+        LLVMValueRef args[3];
+        LLVMValueRef flush_args[1];
+        args[0] = LLVMBuildPointerCast(cg->builder, format, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "assertfmt");
+        args[1] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), (unsigned long long)expr->line, 0);
+        args[2] = LLVMConstInt(LLVMInt32TypeInContext(cg->context), (unsigned long long)expr->column, 0);
+        LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(printf_fn), printf_fn, args, 3, "");
+        flush_args[0] = LLVMConstPointerNull(LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0));
+        LLVMBuildCall2(cg->builder, LLVMGlobalGetValueType(fflush_fn), fflush_fn, flush_args, 1, "");
+    }
     emit_builtin_panic(cg);
     LLVMPositionBuilderAtEnd(cg->builder, ok_block);
     LLVMBuildBr(cg->builder, cont_block);

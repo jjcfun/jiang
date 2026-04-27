@@ -199,6 +199,7 @@ struct JirExpr {
     JirExprKind kind;
     JirType* type;
     int line;
+    int column;
     union {
         int64_t int_value;
         double float_value;

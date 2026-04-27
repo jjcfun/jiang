@@ -729,6 +729,7 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
         *error = "out of memory";
         return 0;
     }
+    out->column = expr->column;
     switch (expr->kind) {
         case HIR_EXPR_INT:
             out->as.int_value = expr->as.int_value;

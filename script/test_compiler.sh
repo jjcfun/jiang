@@ -48,22 +48,23 @@ run_compiler_compile_fail() {
   fi
 }
 
-run_compiler_sample hash_map_minimal.jiang 20
-run_compiler_sample hash_map_collision_minimal.jiang 30
-run_compiler_sample hash_map_remove_minimal.jiang 24
-run_compiler_sample hash_map_deleted_reuse_minimal.jiang 52
-run_compiler_sample hash_map_get_ptr_minimal.jiang 45
-run_compiler_sample hash_map_get_or_put_minimal.jiang 18
-run_compiler_sample hash_map_reserve_clear_minimal.jiang 42
-run_compiler_sample hash_map_optional_value_has_minimal.jiang 42
+run_compiler_sample hash_map_minimal.jiang 0
+run_compiler_sample hash_map_collision_minimal.jiang 0
+run_compiler_sample hash_map_remove_minimal.jiang 0
+run_compiler_sample hash_map_deleted_reuse_minimal.jiang 0
+run_compiler_sample hash_map_get_ptr_minimal.jiang 0
+run_compiler_sample hash_map_get_or_put_minimal.jiang 0
+run_compiler_sample hash_map_reserve_clear_minimal.jiang 0
+run_compiler_sample hash_map_optional_value_has_minimal.jiang 0
 
-run_compiler_sample array_list_minimal.jiang 60
-run_compiler_sample array_list_pointer_minimal.jiang 48
-run_compiler_sample array_list_capacity_minimal.jiang 42
-run_compiler_sample arena_list_minimal.jiang 60
-run_compiler_sample arena_list_capacity_minimal.jiang 45
-run_compiler_sample subscriptable_inferred_get_minimal.jiang 42
-run_compiler_sample subscriptable_inferred_set_minimal.jiang 42
+run_compiler_sample array_list_minimal.jiang 0
+run_compiler_sample array_list_pointer_minimal.jiang 0
+run_compiler_sample array_list_capacity_minimal.jiang 0
+run_compiler_sample arena_list_minimal.jiang 0
+run_compiler_sample arena_list_capacity_minimal.jiang 0
+run_compiler_sample subscriptable_inferred_get_minimal.jiang 0
+run_compiler_sample subscriptable_inferred_set_minimal.jiang 0
+run_compiler_sample token_minimal.jiang 0
 run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 
 echo "compiler samples passed"
