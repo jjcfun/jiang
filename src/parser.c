@@ -115,6 +115,10 @@ static char* dup_join3(const char* left, const char* middle, const char* right) 
     return text;
 }
 
+static char* make_static_field_name(const char* owner, const char* field) {
+    return dup_join3(owner, ".#", field);
+}
+
 static char* dup_text(const char* text) {
     size_t n = strlen(text);
     char* out = (char*)malloc(n + 1);
@@ -747,6 +751,31 @@ static int is_known_type(Parser* parser, const Token* token) {
     return result;
 }
 
+static int is_known_static_field(Parser* parser) {
+    Parser probe = *parser;
+    char* owner = 0;
+    char* field = 0;
+    char* key = 0;
+    int result = 0;
+    if (probe.current.kind != TOKEN_IDENT || probe.next.kind != TOKEN_DOT) {
+        return 0;
+    }
+    owner = token_dup(&probe.current);
+    advance(&probe);
+    advance(&probe);
+    if (probe.current.kind != TOKEN_IDENT) {
+        free(owner);
+        return 0;
+    }
+    field = token_dup(&probe.current);
+    key = dup_join3(owner, ".", field);
+    result = hashmap_contains(&parser->static_fields, key);
+    free(owner);
+    free(field);
+    free(key);
+    return result;
+}
+
 static void advance(Parser* parser) {
     parser->current = parser->next;
     parser->next = lexer_next(&parser->lexer);
@@ -1298,6 +1327,23 @@ static int looks_like_method_decl(Parser* parser) {
         }
     }
     return probe.current.kind == TOKEN_LEFT_PAREN;
+}
+
+static int looks_like_static_field_decl(Parser* parser) {
+    Parser probe = *parser;
+    if (probe.current.kind != TOKEN_KW_STATIC) {
+        return 0;
+    }
+    advance(&probe);
+    if (!is_type_start(&probe)) {
+        return 0;
+    }
+    (void)parse_type(&probe);
+    if (probe.error || probe.current.kind != TOKEN_IDENT) {
+        return 0;
+    }
+    advance(&probe);
+    return probe.current.kind == TOKEN_ASSIGN;
 }
 
 static int looks_like_typed_array_constructor(Parser* parser) {
@@ -1967,6 +2013,7 @@ static AstExpr* parse_primary(Parser* parser) {
     if (token.kind == TOKEN_IDENT) {
         if (parser->next.kind == TOKEN_DOT &&
             (is_known_type(parser, &token) || is_type_like_ident(&token) || looks_like_qualified_variant_ref(parser)) &&
+            !is_known_static_field(parser) &&
             !looks_like_qualified_init_call(parser) &&
             !looks_like_qualified_call(parser)) {
             return parse_variant_expr(parser, 0);
@@ -2093,6 +2140,11 @@ static AstExpr* parse_postfix(Parser* parser) {
                     AstStructFieldInit arg;
                     memset(&arg, 0, sizeof(arg));
                     arg.line = parser->current.line;
+                    if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_COLON) {
+                        arg.name = token_dup(&parser->current);
+                        advance(parser);
+                        advance(parser);
+                    }
                     arg.value = parse_expr(parser);
                     if (!arg.value) {
                         return 0;
@@ -3322,7 +3374,13 @@ static int parse_params(Parser* parser, AstParamList* params) {
     if (parser->current.kind != TOKEN_RIGHT_PAREN) {
         for (;;) {
             AstParam param;
+            int param_line = parser->current.line;
             memset(&param, 0, sizeof(param));
+            if (parser->current.kind == TOKEN_IDENT && parser->next.kind == TOKEN_COLON) {
+                param.label = token_dup(&parser->current);
+                advance(parser);
+                advance(parser);
+            }
             if (!is_type_start(parser)) {
                 return fail(parser, "expected parameter type");
             }
@@ -3333,12 +3391,16 @@ static int parse_params(Parser* parser, AstParamList* params) {
             if (type_contains_errorable(&param.type)) {
                 return fail(parser, "errorable type is only allowed in function return types");
             }
-            if (parser->current.kind != TOKEN_IDENT) {
+            if (parser->current.kind == TOKEN_IDENT) {
+                param.name = token_dup(&parser->current);
+                param.line = parser->current.line;
+                advance(parser);
+            } else if (param.label) {
+                param.name = strdup(param.label);
+                param.line = param_line;
+            } else {
                 return fail(parser, "expected parameter name");
             }
-            param.name = token_dup(&parser->current);
-            param.line = parser->current.line;
-            advance(parser);
             param_list_push(params, param);
             if (parser->current.kind == TOKEN_COMMA) {
                 advance(parser);
@@ -3941,6 +4003,40 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             token_equals(&parser->next, "deinit")) {
             return fail(parser, "static deinit not allowed");
         }
+        if (looks_like_static_field_decl(parser)) {
+            AstGlobal global;
+            char* field_name = 0;
+            memset(&global, 0, sizeof(global));
+            if (record_flag) {
+                return fail(parser, "record static fields are not supported");
+            }
+            if (struct_decl.type_params.count != 0) {
+                return fail(parser, "generic struct static fields are not supported");
+            }
+            advance(parser);
+            global.type = parse_type(parser);
+            if (type_contains_errorable(&global.type)) {
+                return fail(parser, "errorable type is only allowed in function return types");
+            }
+            field_name = token_dup(&parser->current);
+            global.name = make_static_field_name(struct_decl.name, field_name);
+            hashmap_set(&parser->static_fields, dup_join3(struct_decl.name, ".", field_name), (void*)1);
+            free(field_name);
+            global.line = parser->current.line;
+            advance(parser);
+            if (!expect(parser, TOKEN_ASSIGN, "expected '=' in static field declaration")) {
+                return 0;
+            }
+            global.init = parse_expr(parser);
+            if (!global.init) {
+                return 0;
+            }
+            if (!expect(parser, TOKEN_SEMICOLON, "expected ';' after static field declaration")) {
+                return 0;
+            }
+            global_list_push(&out_program->globals, global);
+            continue;
+        }
         if (parser->current.kind == TOKEN_IDENT &&
             token_equals(&parser->current, "init") &&
             (parser->next.kind == TOKEN_LEFT_PAREN ||
@@ -4158,6 +4254,7 @@ void parser_init(Parser* parser, const char* source, const char* filename) {
     parser->error_line = 1;
     parser->error_column = 1;
     hashmap_init(&parser->known_types);
+    hashmap_init(&parser->static_fields);
     memset(&parser->scoped_type_names, 0, sizeof(parser->scoped_type_names));
     register_known_type(parser, "Int");
     register_known_type(parser, "Int8");

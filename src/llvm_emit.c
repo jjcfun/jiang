@@ -1523,11 +1523,17 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
         case JIR_EXPR_SLICE: {
             LLVMValueRef slice_value = LLVMGetUndef(llvm_type(cg->context, expr->type));
             LLVMValueRef data_ptr = 0;
+            LLVMValueRef start = expr->as.slice.start
+                ? emit_expr(cg, expr->as.slice.start)
+                : LLVMConstInt(LLVMInt64TypeInContext(cg->context), 0, 0);
+            LLVMValueRef end = expr->as.slice.end
+                ? emit_expr(cg, expr->as.slice.end)
+                : 0;
             LLVMValueRef len = LLVMConstInt(LLVMInt64TypeInContext(cg->context), 0, 0);
             if (expr->as.slice.base->type->kind == JIR_TYPE_ARRAY) {
                 LLVMValueRef base_ptr = emit_lvalue_ptr(cg, expr->as.slice.base);
                 if (!base_ptr) {
-                    LLVMValueRef temp = LLVMBuildAlloca(cg->entry_builder, llvm_type(cg->context, expr->as.slice.base->type), "slice.tmp");
+                    LLVMValueRef temp = build_local_alloca(cg, llvm_type(cg->context, expr->as.slice.base->type), "slice.tmp");
                     LLVMBuildStore(cg->builder, emit_expr(cg, expr->as.slice.base), temp);
                     base_ptr = temp;
                 }
@@ -1537,11 +1543,38 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                     base_ptr,
                     (LLVMValueRef[]){
                         LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0),
-                        LLVMConstInt(LLVMInt32TypeInContext(cg->context), 0, 0)
+                        start
                     },
                     2,
                     "slice.data");
-                len = LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.slice.base->type->array_length, 0);
+                len = end
+                    ? LLVMBuildSub(cg->builder, end, start, "slice.len")
+                    : LLVMConstInt(LLVMInt64TypeInContext(cg->context), (unsigned long long)expr->as.slice.base->type->array_length, 0);
+            } else if (expr->as.slice.base->type->kind == JIR_TYPE_SLICE) {
+                LLVMValueRef base_slice = emit_expr(cg, expr->as.slice.base);
+                LLVMValueRef base_data = LLVMBuildExtractValue(cg->builder, base_slice, 0, "slice.base.data");
+                data_ptr = LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->as.slice.base->type->array_item),
+                    base_data,
+                    (LLVMValueRef[]){ start },
+                    1,
+                    "slice.sub.data");
+                len = end
+                    ? LLVMBuildSub(cg->builder, end, start, "slice.len")
+                    : LLVMBuildExtractValue(cg->builder, base_slice, 1, "slice.base.len");
+            } else if (expr->as.slice.base->type->kind == JIR_TYPE_MANY_POINTER) {
+                LLVMValueRef base_data = emit_expr(cg, expr->as.slice.base);
+                data_ptr = LLVMBuildInBoundsGEP2(
+                    cg->builder,
+                    llvm_type(cg->context, expr->as.slice.base->type->array_item),
+                    base_data,
+                    (LLVMValueRef[]){ start },
+                    1,
+                    "slice.manyptr.data");
+                len = end
+                    ? LLVMBuildSub(cg->builder, end, start, "slice.len")
+                    : LLVMConstInt(LLVMInt64TypeInContext(cg->context), 0, 0);
             }
             slice_value = LLVMBuildInsertValue(cg->builder, slice_value, data_ptr, 0, "slice.ins.ptr");
             slice_value = LLVMBuildInsertValue(cg->builder, slice_value, len, 1, "slice.ins.len");

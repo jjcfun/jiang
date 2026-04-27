@@ -387,6 +387,12 @@ static int method_visible_from_context(LowerContext* ctx, HirFunction* method, H
         same_method_owner_type(ctx->current_function->receiver_type, owner_type)) {
         return 1;
     }
+    if (ctx->current_function &&
+        ctx->current_function->owner_struct &&
+        owner_type->kind == HIR_TYPE_STRUCT &&
+        owner_type->struct_decl == ctx->current_function->owner_struct) {
+        return 1;
+    }
     return 0;
 }
 
@@ -1162,7 +1168,10 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
             {
                 HirType* nominal_type = resolve_owner_type_name(ctx, type->named_name);
                 if (!nominal_type) {
-                    fail(ctx, "unknown named type");
+                    static char unknown_named_type_error[256];
+                    snprintf(unknown_named_type_error, sizeof(unknown_named_type_error),
+                             "unknown named type: %s", type->named_name ? type->named_name : "<null>");
+                    fail(ctx, unknown_named_type_error);
                     return 0;
                 }
                 if (nominal_type->kind == HIR_TYPE_ENUM ||
@@ -1171,7 +1180,12 @@ static HirType* lower_type(LowerContext* ctx, const AstType* type) {
                     return requalify_nominal_owner_type(ctx, nominal_type, type->mutable_flag);
                 }
             }
-            fail(ctx, "unknown named type");
+            {
+                static char unknown_named_type_error[256];
+                snprintf(unknown_named_type_error, sizeof(unknown_named_type_error),
+                         "unknown named type: %s", type->named_name ? type->named_name : "<null>");
+                fail(ctx, unknown_named_type_error);
+            }
             return 0;
         }
         case AST_TYPE_TUPLE: {
@@ -1692,7 +1706,30 @@ static HirExpr* maybe_decay_array_to_slice(LowerContext* ctx, HirExpr* expr, Hir
         return 0;
     }
     slice->as.slice.base = expr;
+    slice->as.slice.start = 0;
+    slice->as.slice.end = 0;
     return slice;
+}
+
+static int ast_range_bounds(const AstExpr* expr, const AstExpr** start, const AstExpr** end) {
+    int i = 0;
+    if (!expr ||
+        expr->kind != AST_EXPR_STRUCT ||
+        !expr->as.struct_lit.type_name ||
+        strcmp(expr->as.struct_lit.type_name, "Range") != 0) {
+        return 0;
+    }
+    *start = 0;
+    *end = 0;
+    for (i = 0; i < expr->as.struct_lit.fields.count; ++i) {
+        AstStructFieldInit* field = &expr->as.struct_lit.fields.items[i];
+        if (strcmp(field->name, "start") == 0) {
+            *start = field->value;
+        } else if (strcmp(field->name, "end") == 0) {
+            *end = field->value;
+        }
+    }
+    return *start && *end;
 }
 
 static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_type, int line) {
@@ -1719,7 +1756,10 @@ static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* ex
     if (expr && expr->kind == AST_EXPR_NAME) {
         binding = lookup_binding(ctx, expr->as.name);
         if (!binding) {
-            fail(ctx, "unknown identifier");
+            static char unknown_identifier_error[256];
+            snprintf(unknown_identifier_error, sizeof(unknown_identifier_error),
+                     "unknown identifier: %s", expr->as.name ? expr->as.name : "<null>");
+            fail(ctx, unknown_identifier_error);
             return 0;
         }
         out = new_expr(HIR_EXPR_BINDING, binding->type, expr->line);
@@ -1986,6 +2026,78 @@ static int lower_struct_init_args_for_function(LowerContext* ctx,
 
 static HirGlobal* find_global(HirProgram* program, const char* name) {
     return (HirGlobal*)hashmap_get(&program->global_map, name);
+}
+
+static char* make_static_field_global_name(const char* owner, const char* field) {
+    size_t owner_len = strlen(owner);
+    size_t field_len = strlen(field);
+    char* out = (char*)malloc(owner_len + field_len + 3);
+    if (!out) {
+        return 0;
+    }
+    memcpy(out, owner, owner_len);
+    memcpy(out + owner_len, ".#", 2);
+    memcpy(out + owner_len + 2, field, field_len);
+    out[owner_len + 2 + field_len] = '\0';
+    return out;
+}
+
+static HirExpr* make_static_field_expr(LowerContext* ctx, const char* owner, const char* field, int line) {
+    char* global_name = make_static_field_global_name(owner, field);
+    HirGlobal* global = global_name ? find_global(ctx->program, global_name) : 0;
+    HirExpr* out = 0;
+    if (!global && owner) {
+        const char* dot = strrchr(owner, '.');
+        if (dot) {
+            size_t prefix_len = (size_t)(dot - owner);
+            size_t owner_tail_len = strlen(dot + 1);
+            size_t field_len = strlen(field);
+            char* imported_hidden_name = (char*)malloc(prefix_len + owner_tail_len + field_len + 5);
+            if (imported_hidden_name) {
+                memcpy(imported_hidden_name, owner, prefix_len);
+                memcpy(imported_hidden_name + prefix_len, ".#", 2);
+                memcpy(imported_hidden_name + prefix_len + 2, dot + 1, owner_tail_len);
+                memcpy(imported_hidden_name + prefix_len + 2 + owner_tail_len, ".#", 2);
+                memcpy(imported_hidden_name + prefix_len + 4 + owner_tail_len, field, field_len);
+                imported_hidden_name[prefix_len + 4 + owner_tail_len + field_len] = '\0';
+                global = find_global(ctx->program, imported_hidden_name);
+                free(imported_hidden_name);
+            }
+        }
+    }
+    if (!global && owner) {
+        const char* owner_tail = strrchr(owner, '.');
+        size_t owner_tail_len = 0;
+        size_t field_len = strlen(field);
+        int i = 0;
+        owner_tail = owner_tail ? owner_tail + 1 : owner;
+        owner_tail_len = strlen(owner_tail);
+        for (i = 0; i < ctx->program->globals.count; ++i) {
+            const char* name = ctx->program->globals.items[i].binding->name;
+            size_t name_len = strlen(name);
+            if (name_len > field_len + 2 &&
+                strcmp(name + name_len - field_len, field) == 0 &&
+                name[name_len - field_len - 1] == '#' &&
+                name[name_len - field_len - 2] == '.') {
+                size_t owner_end = name_len - field_len - 2;
+                if ((owner_end >= owner_tail_len &&
+                     strncmp(name + owner_end - owner_tail_len, owner_tail, owner_tail_len) == 0) ||
+                    (owner_end >= owner_tail_len + 1 &&
+                     name[owner_end - owner_tail_len - 1] == '#' &&
+                     strncmp(name + owner_end - owner_tail_len, owner_tail, owner_tail_len) == 0)) {
+                    global = &ctx->program->globals.items[i];
+                    break;
+                }
+            }
+        }
+    }
+    free(global_name);
+    if (!global) {
+        return 0;
+    }
+    out = new_expr(HIR_EXPR_BINDING, global->binding->type, line);
+    out->as.binding = global->binding;
+    return out;
 }
 
 static const HirBuiltinNominalDecl* find_builtin_nominal(const char* name) {
@@ -2851,48 +2963,112 @@ static int lower_builtin_method_call(LowerContext* ctx,
         if (ast_args->count != 0) {
             return fail(ctx, "hash expects no arguments");
         }
-        out->type = primitive_type(ctx->program, HIR_TYPE_INT);
+        out->type = primitive_type(ctx->program, HIR_TYPE_U64);
         return 1;
     }
     (void)line;
     return fail(ctx, "unsupported builtin method");
 }
 
+static int lower_call_arg_for_param(LowerContext* ctx,
+                                    AstStructFieldInit* ast_arg,
+                                    HirBinding* param,
+                                    int exact_type,
+                                    const char* type_error,
+                                    HirExpr** out_arg) {
+    HirExpr* arg = lower_expr_expected(ctx, ast_arg->value, param->type);
+    if (!arg) {
+        return 0;
+    }
+    arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
+    if (!arg) {
+        return 0;
+    }
+    if ((param->type->kind == HIR_TYPE_REFERENCE ||
+         param->type->kind == HIR_TYPE_POINTER ||
+         param->type->kind == HIR_TYPE_MANY_POINTER) &&
+        param->type->array_item &&
+        param->type->array_item->mutable_flag &&
+        arg->kind == HIR_EXPR_ADDR &&
+        (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
+        return fail_at(ctx, ast_arg->line, 0, type_error);
+    }
+    if (exact_type) {
+        if (!type_equals(arg->type, param->type)) {
+            return 0;
+        }
+    } else if (!type_assignment_compatible(arg->type, param->type)) {
+        return fail_at(ctx, ast_arg->line, 0, type_error);
+    }
+    *out_arg = arg;
+    return 1;
+}
+
 static int lower_call_args_from(LowerContext* ctx, const AstStructFieldInitList* ast_args, HirExprList* out_args, HirFunction* callee, int param_offset) {
     int i = 0;
     int param_count = callee->params.count - param_offset;
+    int next_positional = 0;
+    int* assigned = 0;
+    HirExpr** ordered_args = 0;
     if (ast_args->count != param_count) {
         return fail(ctx, "call argument count mismatch");
     }
+    if (param_count == 0) {
+        return 1;
+    }
+    assigned = (int*)calloc((size_t)param_count, sizeof(int));
+    ordered_args = (HirExpr**)calloc((size_t)param_count, sizeof(HirExpr*));
+    if (!assigned || !ordered_args) {
+        free(assigned);
+        free(ordered_args);
+        return fail(ctx, "out of memory");
+    }
     for (i = 0; i < ast_args->count; ++i) {
         AstStructFieldInit* ast_arg = &ast_args->items[i];
-        HirExpr* arg = 0;
-        HirBinding* param = callee->params.items[param_offset + i];
+        HirBinding* param = 0;
+        int param_index = -1;
+        int j = 0;
         if (ast_arg->name) {
-            return fail(ctx, "labeled call arguments are not supported");
+            for (j = 0; j < param_count; ++j) {
+                HirBinding* candidate = callee->params.items[param_offset + j];
+                if (!assigned[j] && candidate->label && strcmp(candidate->label, ast_arg->name) == 0) {
+                    param_index = j;
+                    break;
+                }
+            }
+        } else {
+            while (next_positional < param_count &&
+                   (assigned[next_positional] || callee->params.items[param_offset + next_positional]->label)) {
+                next_positional += 1;
+            }
+            if (next_positional < param_count) {
+                param_index = next_positional;
+                next_positional += 1;
+            }
         }
-        arg = lower_expr_expected(ctx, ast_arg->value, param->type);
-        if (!arg) {
+        if (param_index < 0) {
+            free(assigned);
+            free(ordered_args);
+            return fail_at(ctx, ast_arg->line, 0, "call argument label mismatch");
+        }
+        param = callee->params.items[param_offset + param_index];
+        if (!lower_call_arg_for_param(ctx, ast_arg, param, 0, "call argument type mismatch", &ordered_args[param_index])) {
+            free(assigned);
+            free(ordered_args);
             return 0;
         }
-        arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
-        if (!arg) {
-            return 0;
-        }
-        if ((param->type->kind == HIR_TYPE_REFERENCE ||
-             param->type->kind == HIR_TYPE_POINTER ||
-             param->type->kind == HIR_TYPE_MANY_POINTER) &&
-            param->type->array_item &&
-            param->type->array_item->mutable_flag &&
-            arg->kind == HIR_EXPR_ADDR &&
-            (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
-            return fail(ctx, "call argument type mismatch");
-        }
-        if (!type_assignment_compatible(arg->type, param->type)) {
-            return fail(ctx, "call argument type mismatch");
-        }
-        expr_list_push(out_args, arg);
+        assigned[param_index] = 1;
     }
+    for (i = 0; i < param_count; ++i) {
+        if (!assigned[i]) {
+            free(assigned);
+            free(ordered_args);
+            return fail(ctx, "call argument count mismatch");
+        }
+        expr_list_push(out_args, ordered_args[i]);
+    }
+    free(assigned);
+    free(ordered_args);
     return 1;
 }
 
@@ -2907,38 +3083,68 @@ static int lower_call_args_exact_from(LowerContext* ctx,
                                       int param_offset) {
     int i = 0;
     int param_count = callee->params.count - param_offset;
+    int next_positional = 0;
+    int* assigned = 0;
+    HirExpr** ordered_args = 0;
     if (ast_args->count != param_count) {
         return 0;
     }
+    if (param_count == 0) {
+        return 1;
+    }
+    assigned = (int*)calloc((size_t)param_count, sizeof(int));
+    ordered_args = (HirExpr**)calloc((size_t)param_count, sizeof(HirExpr*));
+    if (!assigned || !ordered_args) {
+        free(assigned);
+        free(ordered_args);
+        return fail(ctx, "out of memory");
+    }
     for (i = 0; i < ast_args->count; ++i) {
         AstStructFieldInit* ast_arg = &ast_args->items[i];
-        HirExpr* arg = 0;
-        HirBinding* param = callee->params.items[param_offset + i];
+        HirBinding* param = 0;
+        int param_index = -1;
+        int j = 0;
         if (ast_arg->name) {
-            return fail(ctx, "labeled call arguments are not supported");
+            for (j = 0; j < param_count; ++j) {
+                HirBinding* candidate = callee->params.items[param_offset + j];
+                if (!assigned[j] && candidate->label && strcmp(candidate->label, ast_arg->name) == 0) {
+                    param_index = j;
+                    break;
+                }
+            }
+        } else {
+            while (next_positional < param_count &&
+                   (assigned[next_positional] || callee->params.items[param_offset + next_positional]->label)) {
+                next_positional += 1;
+            }
+            if (next_positional < param_count) {
+                param_index = next_positional;
+                next_positional += 1;
+            }
         }
-        arg = lower_expr_expected(ctx, ast_arg->value, param->type);
-        if (!arg) {
+        if (param_index < 0) {
+            free(assigned);
+            free(ordered_args);
             return 0;
         }
-        arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
-        if (!arg) {
+        param = callee->params.items[param_offset + param_index];
+        if (!lower_call_arg_for_param(ctx, ast_arg, param, 1, "call argument type mismatch", &ordered_args[param_index])) {
+            free(assigned);
+            free(ordered_args);
             return 0;
         }
-        if ((param->type->kind == HIR_TYPE_REFERENCE ||
-             param->type->kind == HIR_TYPE_POINTER ||
-             param->type->kind == HIR_TYPE_MANY_POINTER) &&
-            param->type->array_item &&
-            param->type->array_item->mutable_flag &&
-            arg->kind == HIR_EXPR_ADDR &&
-            (!arg->as.unary.value || !arg->as.unary.value->type || !arg->as.unary.value->type->mutable_flag)) {
-            return fail(ctx, "call argument type mismatch");
-        }
-        if (!type_equals(arg->type, param->type)) {
-            return 0;
-        }
-        expr_list_push(out_args, arg);
+        assigned[param_index] = 1;
     }
+    for (i = 0; i < param_count; ++i) {
+        if (!assigned[i]) {
+            free(assigned);
+            free(ordered_args);
+            return 0;
+        }
+        expr_list_push(out_args, ordered_args[i]);
+    }
+    free(assigned);
+    free(ordered_args);
     return 1;
 }
 
@@ -4153,7 +4359,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     if (ctx->error) {
                         return 0;
                     }
-                    fail(ctx, "unknown identifier");
+                    {
+                        static char unknown_identifier_error[256];
+                        snprintf(unknown_identifier_error, sizeof(unknown_identifier_error),
+                                 "unknown identifier: %s", expr->as.name ? expr->as.name : "<null>");
+                        fail(ctx, unknown_identifier_error);
+                    }
                     return 0;
                 }
                 out = new_expr(HIR_EXPR_FUNCTION, function_type_from_function(ctx, fn), expr->line);
@@ -4960,10 +5171,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     out = maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
                     return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
                 }
-                fail(ctx, "unknown function");
+                {
+                    static char unknown_function_error[256];
+                    snprintf(unknown_function_error, sizeof(unknown_function_error),
+                             "unknown function: %s", expr->as.call.callee ? expr->as.call.callee : "<null>");
+                    fail(ctx, unknown_function_error);
+                }
                 return 0;
             }
-            fail(ctx, "unknown function");
+            {
+                static char unknown_function_error[256];
+                snprintf(unknown_function_error, sizeof(unknown_function_error),
+                         "unknown function: %s", expr->as.call.callee ? expr->as.call.callee : "<null>");
+                fail(ctx, unknown_function_error);
+            }
             return 0;
         }
         case AST_EXPR_VARIANT: {
@@ -5106,6 +5327,10 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 expr->as.field.base->kind == AST_EXPR_NAME) {
                 HirType* owner_type = resolve_owner_type_name(ctx, expr->as.field.base->as.name);
                 if (owner_type) {
+                    out = make_static_field_expr(ctx, expr->as.field.base->as.name, expr->as.field.name, expr->line);
+                    if (out) {
+                        return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+                    }
                     HirFunction* method = resolve_method_value_overload(ctx, owner_type, expr->as.field.name, 1, expr->as.field.trait_name, expected_type);
                     if (!method && !ctx->error) {
                         method = resolve_method_value_overload(ctx, owner_type, expr->as.field.name, 0, expr->as.field.trait_name, expected_type);
@@ -5158,6 +5383,10 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 int field_index = -1;
                 HirStructField* field = find_struct_field(base_type->struct_decl, expr->as.field.name, &field_index);
                 if (!field) {
+                    out = make_static_field_expr(ctx, base_type->struct_decl->name, expr->as.field.name, expr->line);
+                    if (out) {
+                        return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
+                    }
                     fail(ctx, "unknown field");
                     return 0;
                 }
@@ -5437,6 +5666,8 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             HirExpr* base = lower_expr_value(ctx, expr->as.index.base);
             HirExpr* index = 0;
             HirExpr* subscript_call = 0;
+            const AstExpr* range_start = 0;
+            const AstExpr* range_end = 0;
             if (!base) {
                 return 0;
             }
@@ -5448,6 +5679,28 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 HirExpr* deref = new_expr(HIR_EXPR_DEREF, base->type->array_item, expr->line);
                 deref->as.unary.value = base;
                 base = deref;
+            }
+            if (ast_range_bounds(expr->as.index.index, &range_start, &range_end) &&
+                (base->type->kind == HIR_TYPE_ARRAY ||
+                 base->type->kind == HIR_TYPE_SLICE ||
+                 base->type->kind == HIR_TYPE_MANY_POINTER)) {
+                HirExpr* start = lower_expr_expected(ctx, range_start, primitive_type(ctx->program, HIR_TYPE_INT));
+                HirExpr* end = lower_expr_expected(ctx, range_end, primitive_type(ctx->program, HIR_TYPE_INT));
+                HirType* slice_type = new_owned_type(ctx->program, HIR_TYPE_SLICE);
+                if (!start || !end) {
+                    return 0;
+                }
+                if (start->type->kind != HIR_TYPE_INT || end->type->kind != HIR_TYPE_INT) {
+                    fail(ctx, "slice bounds must be Int");
+                    return 0;
+                }
+                slice_type->mutable_flag = base->type->mutable_flag;
+                slice_type->array_item = base->type->array_item;
+                out = new_expr(HIR_EXPR_SLICE, slice_type, expr->line);
+                out->as.slice.base = base;
+                out->as.slice.start = start;
+                out->as.slice.end = end;
+                return maybe_wrap_expected_optional_expr(ctx, out, expected_type, expr->line);
             }
             if (base->type->kind == HIR_TYPE_TUPLE) {
                 index = lower_expr_value(ctx, expr->as.index.index);

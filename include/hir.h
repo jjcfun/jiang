@@ -289,6 +289,8 @@ struct HirExpr {
         } index;
         struct {
             HirExpr* base;
+            HirExpr* start;
+            HirExpr* end;
         } slice;
         struct {
             HirExpr* base;

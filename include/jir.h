@@ -311,6 +311,8 @@ struct JirExpr {
         } index;
         struct {
             JirExpr* base;
+            JirExpr* start;
+            JirExpr* end;
         } slice;
         struct {
             JirExpr* base;

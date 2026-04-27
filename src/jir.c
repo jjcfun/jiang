@@ -622,6 +622,18 @@ static JirExpr* desugar_expr(JirExpr* expr) {
             return expr;
         case JIR_EXPR_SLICE:
             expr->as.slice.base = desugar_expr(expr->as.slice.base);
+            if (expr->as.slice.start) {
+                expr->as.slice.start = desugar_expr(expr->as.slice.start);
+                if (!expr->as.slice.start) {
+                    return 0;
+                }
+            }
+            if (expr->as.slice.end) {
+                expr->as.slice.end = desugar_expr(expr->as.slice.end);
+                if (!expr->as.slice.end) {
+                    return 0;
+                }
+            }
             return expr->as.slice.base ? expr : 0;
         case JIR_EXPR_SLICE_LENGTH:
             expr->as.slice_length.base = desugar_expr(expr->as.slice_length.base);
@@ -884,6 +896,18 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             return out->as.index.base && out->as.index.index ? out : 0;
         case HIR_EXPR_SLICE:
             out->as.slice.base = lower_expr(program, expr->as.slice.base, error, error_line, error_column);
+            if (expr->as.slice.start) {
+                out->as.slice.start = lower_expr(program, expr->as.slice.start, error, error_line, error_column);
+                if (!out->as.slice.start) {
+                    return 0;
+                }
+            }
+            if (expr->as.slice.end) {
+                out->as.slice.end = lower_expr(program, expr->as.slice.end, error, error_line, error_column);
+                if (!out->as.slice.end) {
+                    return 0;
+                }
+            }
             return out->as.slice.base ? out : 0;
         case HIR_EXPR_SLICE_LENGTH:
             out->as.slice_length.base = lower_expr(program, expr->as.slice_length.base, error, error_line, error_column);

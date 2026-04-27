@@ -15,6 +15,7 @@ typedef struct Parser {
     int error_line;
     int error_column;
     HashMap known_types;
+    HashMap static_fields;
     AstNameList scoped_type_names;
 } Parser;
 

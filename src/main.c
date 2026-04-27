@@ -3420,7 +3420,7 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
         for (i = 0; i < methods.count; ++i) {
             const AstConceptMethod* method = methods.items[i].method;
             if (strcmp(method->name, "hash") == 0) {
-                if (method->params.count != 0 || method->return_type.kind != AST_TYPE_INT) {
+                if (method->params.count != 0 || method->return_type.kind != AST_TYPE_U64) {
                     return 0;
                 }
                 if (!(builtin->kind == AST_BUILTIN_NOMINAL_INT ||
@@ -3543,7 +3543,7 @@ static int type_has_builtin_concept_methods(const AstProgram* program, const Ast
     if (strcmp(concept_name, "Hashable") == 0) {
         synthetic.name = "Hashable";
         method.name = "hash";
-        method.return_type.kind = AST_TYPE_INT;
+        method.return_type.kind = AST_TYPE_U64;
         concept_method_list_push(&synthetic.methods, method);
         return type_has_concept_methods(program, type, &synthetic);
     }
@@ -3671,6 +3671,18 @@ static int ast_type_satisfies_concept(const AstProgram* program, const AstType* 
     const AstConceptDecl* concept = find_ast_concept(program, concept_name);
     AstTypeQueryRef query = describe_ast_type(program, type);
     if (builtin_concept_flag_for_name(concept_name) != BUILTIN_CONCEPT_NONE) {
+        if (query.kind == AST_TYPE_QUERY_NOMINAL && query.nominal.kind != AST_NOMINAL_BUILTIN) {
+            if (!nominal_declares_concept_or_child(program, query.nominal, concept_name)) {
+                return 0;
+            }
+            if (strcmp(concept_name, "Mutable") == 0 && (!type || !type->mutable_flag)) {
+                return 0;
+            }
+            if (!type_has_builtin_concept_methods(program, type, concept_name)) {
+                return 0;
+            }
+            return !concept || type_has_concept_methods(program, type, concept);
+        }
         if (!ast_type_has_builtin_concept(program, type, concept_name)) {
             return 0;
         }
@@ -3916,8 +3928,10 @@ static int validate_where_constraints_program(const AstProgram* program, const c
         }
         for (j = 0; j < program->structs.items[i].concept_names.count; ++j) {
             const char* concept_name = program->structs.items[i].concept_names.items[j];
-            if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
-                *error = "type does not satisfy declared trait";
+            if (!ast_type_satisfies_concept(program, &self_type, concept_name)) {
+                snprintf(where_error, sizeof(where_error), "type %s does not satisfy declared trait %s",
+                         program->structs.items[i].name, concept_name);
+                *error = where_error;
                 return 0;
             }
         }
@@ -3958,8 +3972,10 @@ static int validate_where_constraints_program(const AstProgram* program, const c
         }
         for (j = 0; j < program->enums.items[i].concept_names.count; ++j) {
             const char* concept_name = program->enums.items[i].concept_names.items[j];
-            if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
-                *error = "type does not satisfy declared trait";
+            if (!ast_type_satisfies_concept(program, &self_type, concept_name)) {
+                snprintf(where_error, sizeof(where_error), "type %s does not satisfy declared trait %s",
+                         program->enums.items[i].name, concept_name);
+                *error = where_error;
                 return 0;
             }
         }
@@ -3988,8 +4004,10 @@ static int validate_where_constraints_program(const AstProgram* program, const c
         }
         for (j = 0; j < program->unions.items[i].concept_names.count; ++j) {
             const char* concept_name = program->unions.items[i].concept_names.items[j];
-            if (!type_has_concept_methods(program, &self_type, find_ast_concept(program, concept_name))) {
-                *error = "type does not satisfy declared trait";
+            if (!ast_type_satisfies_concept(program, &self_type, concept_name)) {
+                snprintf(where_error, sizeof(where_error), "type %s does not satisfy declared trait %s",
+                         program->unions.items[i].name, concept_name);
+                *error = where_error;
                 return 0;
             }
         }
@@ -5520,18 +5538,35 @@ static int monomorphize_program(const AstProgram* source, AstProgram* out, const
         enum_list_push(&out->enums, clone_enum_decl(source, 0, 0, &source->enums.items[i], source->enums.items[i].public_flag));
     }
     for (i = 0; i < source->unions.count; ++i) {
+        AstUnionDecl decl;
+        int variant_index = 0;
         if (source->unions.items[i].type_params.count > 0) {
             continue;
         }
-        union_list_push(&out->unions, clone_union_decl(source, 0, 0, &source->unions.items[i], source->unions.items[i].public_flag));
+        decl = clone_union_decl(source, 0, 0, &source->unions.items[i], source->unions.items[i].public_flag);
+        for (variant_index = 0; variant_index < decl.variants.count; ++variant_index) {
+            if (!transform_type(&mono, &decl.variants.items[variant_index].type)) {
+                *error = mono.error;
+                return 0;
+            }
+        }
+        union_list_push(&out->unions, decl);
     }
     for (i = 0; i < source->structs.count; ++i) {
         AstStructDecl decl;
+        int field_index = 0;
         int init_index = 0;
         if (source->structs.items[i].type_params.count > 0) {
             continue;
         }
         decl = clone_struct_decl(source, 0, 0, &source->structs.items[i], source->structs.items[i].public_flag);
+        for (field_index = 0; field_index < decl.fields.count; ++field_index) {
+            if (!transform_type(&mono, &decl.fields.items[field_index].type) ||
+                !transform_expr(&mono, decl.fields.items[field_index].default_value, &(LocalTypeList){0})) {
+                *error = mono.error;
+                return 0;
+            }
+        }
         for (init_index = 0; init_index < decl.init_overloads.count; ++init_index) {
             if (!transform_block(&mono, &decl.init_overloads.items[init_index].body, &(LocalTypeList){0})) {
                 *error = mono.error;
