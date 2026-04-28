@@ -157,6 +157,7 @@ run_sample negative_int_minimal.jiang 1
 run_sample mod_minimal.jiang 2
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
+run_sample pointer_default_field_minimal.jiang 0
 run_sample pointer_offset_uint8_minimal.jiang 101
 run_sample pointer_offset_int_minimal.jiang 42
 run_sample many_pointer_assign_minimal.jiang 10
@@ -357,6 +358,7 @@ run_sample struct_literal_with_init_minimal.jiang 42
 run_sample struct_optional_field_minimal.jiang 42
 run_sample struct_optional_field_omitted_minimal.jiang 18
 run_sample struct_init_optional_omitted_minimal.jiang 1
+run_sample struct_init_optional_assign_minimal.jiang 42
 run_sample struct_new_constructor_minimal.jiang 42
 run_sample struct_new_literal_with_init_minimal.jiang 42
 run_sample deinit_minimal.jiang 42
@@ -376,6 +378,7 @@ run_sample struct_instance_method_with_args_minimal.jiang 42
 run_sample struct_instance_method_pointer_base_minimal.jiang 42
 run_sample struct_static_method_minimal.jiang 42
 run_sample struct_method_calls_method_minimal.jiang 42
+run_sample struct_nested_field_method_minimal.jiang 42
 run_sample struct_static_calls_static_minimal.jiang 42
 run_sample public_import_instance_method_minimal.jiang 42
 run_sample public_import_static_method_minimal.jiang 42
@@ -440,6 +443,7 @@ run_sample union_tuple_switch_mutable_binding_minimal.jiang 42
 run_sample union_tuple_if_shorthand_pattern_minimal.jiang 42
 run_sample union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
 run_sample union_minimal.jiang 42
+run_sample union_default_field_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
 run_sample union_implicit_tag_minimal.jiang 42
 run_sample union_grouped_variant_minimal.jiang 42

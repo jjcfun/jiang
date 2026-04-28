@@ -407,13 +407,15 @@ static JirExpr* desugar_expr(JirExpr* expr) {
         case JIR_EXPR_FUNCTION:
         case JIR_EXPR_ENUM_MEMBER:
             return expr;
-        case JIR_EXPR_ADDR:
         case JIR_EXPR_DEREF:
         case JIR_EXPR_NEW:
         case JIR_EXPR_FREE:
         case JIR_EXPR_BIT_NOT:
         case JIR_EXPR_OPTIONAL_SOME:
             expr->as.unary.value = desugar_expr(expr->as.unary.value);
+            return expr->as.unary.value ? expr : 0;
+        case JIR_EXPR_ADDR:
+            expr->as.unary.value = desugar_lvalue_expr(expr->as.unary.value);
             return expr->as.unary.value ? expr : 0;
         case JIR_EXPR_PROPAGATE:
             expr->as.propagate.value = desugar_expr(expr->as.propagate.value);
@@ -853,6 +855,10 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
             out->as.enum_member.value = expr->as.enum_member.member->value;
             return out;
         case HIR_EXPR_VARIANT:
+            if (!expr->as.variant.variant) {
+                *error = "missing union variant";
+                return 0;
+            }
             out->as.variant.tag_value = expr->as.variant.variant->tag_value;
             out->as.variant.payload = expr->as.variant.payload ? lower_expr(program, expr->as.variant.payload, error, error_line, error_column) : 0;
             return expr->as.variant.payload && !out->as.variant.payload ? 0 : out;

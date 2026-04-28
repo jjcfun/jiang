@@ -4094,6 +4094,50 @@ static AstType ast_type_copy(const AstType* type) {
     return canonicalize_ast_type(out);
 }
 
+static char* mangle_name_text(const char* name) {
+    size_t len = name ? strlen(name) : 0;
+    size_t i = 0;
+    size_t out_len = 0;
+    char* out = 0;
+    char* cursor = 0;
+    for (i = 0; i < len; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+        if ((ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_') {
+            out_len += 1;
+        } else {
+            out_len += 3;
+        }
+    }
+    out = (char*)malloc(out_len + 1);
+    if (!out) {
+        return 0;
+    }
+    cursor = out;
+    for (i = 0; i < len; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+        if ((ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_') {
+            *cursor++ = (char)ch;
+        } else if (ch == '.') {
+            memcpy(cursor, "_d_", 3);
+            cursor += 3;
+        } else if (ch == '#') {
+            memcpy(cursor, "_h_", 3);
+            cursor += 3;
+        } else {
+            memcpy(cursor, "_x_", 3);
+            cursor += 3;
+        }
+    }
+    *cursor = '\0';
+    return out;
+}
+
 static char* mangle_type_name(const AstType* type) {
     char buffer[64];
     char* out = 0;
@@ -4196,7 +4240,7 @@ static char* mangle_type_name(const AstType* type) {
             return out;
         }
         case AST_TYPE_NAMED:
-            out = dup_text(type->named_name);
+            out = mangle_name_text(type->named_name);
             for (i = 0; i < type->type_args.count; ++i) {
                 char* item = mangle_type_name(&type->type_args.items[i]);
                 char* next = dup_join3(out, "__", item);
