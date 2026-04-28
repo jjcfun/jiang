@@ -1559,6 +1559,10 @@ static AstExpr* parse_value_branch_expr(Parser* parser, const char* context) {
     return parse_expr(parser);
 }
 
+static int ast_stmt_is_never_exit(const AstStmt* stmt) {
+    return stmt && (stmt->kind == AST_STMT_RETURN || stmt->kind == AST_STMT_THROW);
+}
+
 static AstExpr* parse_block_expr(Parser* parser, const char* context) {
     AstExpr* expr = new_expr(AST_EXPR_BLOCK, parser->current.line);
     AstBlock* body = (AstBlock*)calloc(1, sizeof(AstBlock));
@@ -1581,7 +1585,8 @@ static AstExpr* parse_block_expr(Parser* parser, const char* context) {
             return 0;
         }
     }
-    if (!expr->as.block_expr.value) {
+    if (!expr->as.block_expr.value &&
+        (body->stmts.count <= 0 || !ast_stmt_is_never_exit(body->stmts.items[body->stmts.count - 1]))) {
         fail(parser, "block expression requires final value");
         return 0;
     }

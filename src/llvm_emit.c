@@ -1389,6 +1389,9 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                     }
                 }
             }
+            if (!expr->as.block_expr.value) {
+                return 0;
+            }
             return emit_expr(cg, expr->as.block_expr.value);
         }
         case JIR_EXPR_TERNARY: {
@@ -1430,22 +1433,44 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
             LLVMBuildCondBr(cg->builder, emit_expr(cg, expr->as.if_expr.cond), then_block, else_block);
             LLVMPositionBuilderAtEnd(cg->builder, then_block);
             then_value = emit_expr(cg, expr->as.if_expr.then_expr);
-            LLVMBuildBr(cg->builder, merge_block);
-            then_block = LLVMGetInsertBlock(cg->builder);
+            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
+                LLVMBuildBr(cg->builder, merge_block);
+                then_block = LLVMGetInsertBlock(cg->builder);
+            } else {
+                then_block = 0;
+            }
             LLVMPositionBuilderAtEnd(cg->builder, else_block);
             else_value = emit_expr(cg, expr->as.if_expr.else_expr);
-            LLVMBuildBr(cg->builder, merge_block);
-            else_block = LLVMGetInsertBlock(cg->builder);
+            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
+                LLVMBuildBr(cg->builder, merge_block);
+                else_block = LLVMGetInsertBlock(cg->builder);
+            } else {
+                else_block = 0;
+            }
             LLVMPositionBuilderAtEnd(cg->builder, merge_block);
+            if (!then_block && !else_block) {
+                LLVMBuildUnreachable(cg->builder);
+                return LLVMConstNull(llvm_type(cg->context, expr->type));
+            }
             if (expr->type->kind == JIR_TYPE_VOID) {
                 return LLVMConstNull(llvm_type(cg->context, expr->type));
             }
             phi = LLVMBuildPhi(cg->builder, llvm_type(cg->context, expr->type), "ifexprtmp");
-            incoming_values[0] = then_value;
-            incoming_values[1] = else_value;
-            incoming_blocks[0] = then_block;
-            incoming_blocks[1] = else_block;
-            LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            if (then_block && else_block) {
+                incoming_values[0] = then_value;
+                incoming_values[1] = else_value;
+                incoming_blocks[0] = then_block;
+                incoming_blocks[1] = else_block;
+                LLVMAddIncoming(phi, incoming_values, incoming_blocks, 2);
+            } else if (then_block) {
+                incoming_values[0] = then_value;
+                incoming_blocks[0] = then_block;
+                LLVMAddIncoming(phi, incoming_values, incoming_blocks, 1);
+            } else {
+                incoming_values[0] = else_value;
+                incoming_blocks[0] = else_block;
+                LLVMAddIncoming(phi, incoming_values, incoming_blocks, 1);
+            }
             return phi;
         }
         case JIR_EXPR_ENUM_MEMBER:
@@ -1655,6 +1680,45 @@ static int emit_jir_inst(FunctionCodegen* cg, const JirInst* inst) {
                 return 0;
             }
             (void)emit_expr(cg, inst->expr);
+            return 1;
+        case JIR_INST_RETURN:
+            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
+                if (!inst->value) {
+                    LLVMBuildRet(cg->builder, LLVMConstNull(llvm_type(cg->context, cg->function->return_type)));
+                } else {
+                    LLVMBuildRet(cg->builder, emit_expr(cg, inst->value));
+                }
+            }
+            return 1;
+        case JIR_INST_THROW:
+            if (!inst->value) {
+                return 0;
+            }
+            if (!block_terminated(LLVMGetInsertBlock(cg->builder))) {
+                LLVMValueRef throw_value = emit_expr(cg, inst->value);
+                const JirTryHandler* handler = active_try_handler(cg, inst->value->type);
+                if (handler) {
+                    return branch_to_try_handler(cg, inst->value->type, throw_value);
+                } else {
+                    LLVMTypeRef result_union_ty = llvm_type(cg->context, cg->function->return_type);
+                    LLVMValueRef result_tmp = build_local_alloca(cg, result_union_ty, "throw.result.tmp");
+                    LLVMValueRef tag_ptr = LLVMBuildStructGEP2(cg->builder, result_union_ty, result_tmp, 0, "throw.result.tag.ptr");
+                    LLVMValueRef payload_ptr = union_payload_field_ptr(cg, result_tmp, cg->function->return_type, "throw.result.payload.ptr");
+                    LLVMBuildStore(cg->builder, LLVMConstInt(LLVMInt64TypeInContext(cg->context), 1, 0), tag_ptr);
+                    LLVMBuildStore(cg->builder, LLVMConstNull(llvm_union_payload_type(cg->context, cg->function->return_type)), payload_ptr);
+                    if (inst->value->type->kind != JIR_TYPE_VOID) {
+                        LLVMTypeRef error_ty = llvm_type(cg->context, inst->value->type);
+                        LLVMValueRef error_tmp = build_local_alloca(cg, error_ty, "throw.error.tmp");
+                        LLVMValueRef dst_i8 = 0;
+                        LLVMValueRef src_i8 = 0;
+                        LLVMBuildStore(cg->builder, throw_value, error_tmp);
+                        dst_i8 = LLVMBuildBitCast(cg->builder, payload_ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "throw.result.dst.i8");
+                        src_i8 = LLVMBuildBitCast(cg->builder, error_tmp, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "throw.result.src.i8");
+                        LLVMBuildMemCpy(cg->builder, dst_i8, 1, src_i8, 1, LLVMSizeOf(error_ty));
+                    }
+                    LLVMBuildRet(cg->builder, LLVMBuildLoad2(cg->builder, result_union_ty, result_tmp, "throw.result"));
+                }
+            }
             return 1;
     }
     return 1;

@@ -119,6 +119,7 @@ run_sample if_expr_minimal.jiang 42
 run_sample if_expr_bare_minimal.jiang 42
 run_sample if_expr_block_multi_stmt_minimal.jiang 42
 run_sample if_expr_nested_minimal.jiang 42
+run_sample if_expr_return_branch_minimal.jiang 42
 run_sample global_minimal.jiang 42
 run_sample while_minimal.jiang 10
 run_sample defer_minimal.jiang 57
@@ -250,6 +251,7 @@ run_compile_fail invalid_switch_expr_branch_type_mismatch.jiang
 run_compile_fail invalid_switch_expr_binding_pattern.jiang
 run_compile_fail invalid_switch_expr_errorable_value.jiang
 run_compile_fail invalid_switch_expr_missing_semicolon.jiang
+run_sample switch_expr_return_branch_minimal.jiang 42
 run_compile_fail invalid_try_expr_catch_type_mismatch.jiang
 run_compile_fail invalid_bitwise_float_operand.jiang
 run_compile_fail invalid_bitwise_mismatched_integer_types.jiang

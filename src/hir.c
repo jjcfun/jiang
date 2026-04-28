@@ -1382,6 +1382,7 @@ static int lower_block_expr_stmts(LowerContext* ctx, const AstBlock* ast_block, 
     for (i = 0; i < ast_block->stmts.count; ++i) {
         const AstStmt* stmt = ast_block->stmts.items[i];
         HirStmt* lowered = 0;
+        int is_last = i + 1 == ast_block->stmts.count;
         if (stmt->kind == AST_STMT_GROUP) {
             if (!lower_block_expr_stmts(ctx, &stmt->as.group_stmt, out_block)) {
                 return 0;
@@ -1398,6 +1399,12 @@ static int lower_block_expr_stmts(LowerContext* ctx, const AstBlock* ast_block, 
             case AST_STMT_ASSIGN:
             case AST_STMT_EXPR:
                 break;
+            case AST_STMT_RETURN:
+            case AST_STMT_THROW:
+                if (is_last) {
+                    break;
+                }
+                return fail(ctx, "early-exit statement must end expression block");
             default:
                 return fail(ctx, "unsupported statement in expression block");
         }
@@ -1407,7 +1414,9 @@ static int lower_block_expr_stmts(LowerContext* ctx, const AstBlock* ast_block, 
         }
         if (lowered->kind != HIR_STMT_VAR_DECL &&
             lowered->kind != HIR_STMT_ASSIGN &&
-            lowered->kind != HIR_STMT_EXPR) {
+            lowered->kind != HIR_STMT_EXPR &&
+            lowered->kind != HIR_STMT_RETURN &&
+            lowered->kind != HIR_STMT_THROW) {
             return fail(ctx, "unsupported statement in expression block");
         }
         if (lowered->kind == HIR_STMT_EXPR &&
@@ -1418,6 +1427,10 @@ static int lower_block_expr_stmts(LowerContext* ctx, const AstBlock* ast_block, 
         stmt_list_push(&out_block->stmts, lowered);
     }
     return 1;
+}
+
+static int hir_expr_is_never_exit(const HirExpr* expr) {
+    return expr && expr->kind == HIR_EXPR_BLOCK && expr->as.block_expr.value == 0;
 }
 
 static HirStmtKind stmt_kind_from_ast(AstStmtKind kind) {
@@ -4711,15 +4724,20 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 pop_scope(ctx);
                 return 0;
             }
-            value = lower_expr_value(ctx, expr->as.block_expr.value);
-            if (!value) {
-                pop_scope(ctx);
-                return 0;
+            if (expr->as.block_expr.value) {
+                value = lower_expr_value(ctx, expr->as.block_expr.value);
+                if (!value) {
+                    pop_scope(ctx);
+                    return 0;
+                }
             }
             pop_scope(ctx);
-            out = new_expr(HIR_EXPR_BLOCK, value->type, expr->line);
+            out = new_expr(HIR_EXPR_BLOCK, value ? value->type : (expected_type ? expected_type : primitive_type(ctx->program, HIR_TYPE_VOID)), expr->line);
             out->as.block_expr.body = body;
             out->as.block_expr.value = value;
+            if (!value) {
+                return out;
+            }
             return maybe_wrap_expected_errorable_expr(ctx, out, expected_type, expr->line);
         }
         case AST_EXPR_TRY: {
@@ -4933,6 +4951,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             else_expr = lower_expr_value(ctx, expr->as.if_expr.else_expr);
             if (!else_expr) {
                 return 0;
+            }
+            if (hir_expr_is_never_exit(then_expr) && !hir_expr_is_never_exit(else_expr)) {
+                then_expr->type = else_expr->type;
+            } else if (hir_expr_is_never_exit(else_expr) && !hir_expr_is_never_exit(then_expr)) {
+                else_expr->type = then_expr->type;
             }
             if (!type_equals(then_expr->type, else_expr->type)) {
                 fail(ctx, "if expression branch type mismatch");
@@ -7162,7 +7185,11 @@ static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
             if (!fallback) {
                 return 0;
             }
-            if (!result_type) {
+            if (hir_expr_is_never_exit(fallback)) {
+                if (result_type) {
+                    fallback->type = result_type;
+                }
+            } else if (!result_type) {
                 result_type = fallback->type;
             } else if (!type_equals(result_type, fallback->type)) {
                 return fail(ctx, "switch expression branch type mismatch"), (HirExpr*)0;
@@ -7173,15 +7200,23 @@ static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
         if (!branch_value) {
             return 0;
         }
-        if (!result_type) {
+        if (hir_expr_is_never_exit(branch_value)) {
+            if (result_type) {
+                branch_value->type = result_type;
+            }
+        } else if (!result_type) {
             result_type = branch_value->type;
         } else if (!type_equals(result_type, branch_value->type)) {
             return fail(ctx, "switch expression branch type mismatch"), (HirExpr*)0;
         }
-        if (result_type->kind == HIR_TYPE_TUPLE ||
+        if (result_type && hir_expr_is_never_exit(fallback)) {
+            fallback->type = result_type;
+        }
+        if (result_type &&
+            (result_type->kind == HIR_TYPE_TUPLE ||
             result_type->kind == HIR_TYPE_ARRAY ||
             result_type->kind == HIR_TYPE_UNION ||
-            result_type->kind == HIR_TYPE_VOID) {
+            result_type->kind == HIR_TYPE_VOID)) {
             return fail(ctx, "switch expression aggregate result unsupported"), (HirExpr*)0;
         }
         if ((value->type->kind == HIR_TYPE_UNION || value->type->kind == HIR_TYPE_OPTIONAL) &&
@@ -7211,7 +7246,7 @@ static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
             return fail(ctx, "non-exhaustive switch expression"), (HirExpr*)0;
         }
         {
-            HirExpr* if_expr = new_expr(HIR_EXPR_IF, result_type, ast_case->value->line);
+            HirExpr* if_expr = new_expr(HIR_EXPR_IF, result_type ? result_type : branch_value->type, ast_case->value->line);
             if_expr->as.if_expr.cond = cond;
             if_expr->as.if_expr.then_expr = branch_value;
             if_expr->as.if_expr.else_expr = fallback;

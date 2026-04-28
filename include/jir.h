@@ -360,6 +360,8 @@ typedef enum JirInstKind {
     JIR_INST_VAR_DECL,
     JIR_INST_ASSIGN,
     JIR_INST_EXPR,
+    JIR_INST_RETURN,
+    JIR_INST_THROW,
 } JirInstKind;
 
 typedef enum JirTermKind {

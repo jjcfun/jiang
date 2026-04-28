@@ -459,8 +459,11 @@ static JirExpr* desugar_expr(JirExpr* expr) {
                     }
                 }
             }
-            expr->as.block_expr.value = desugar_expr(expr->as.block_expr.value);
-            return expr->as.block_expr.value ? expr : 0;
+            if (expr->as.block_expr.value) {
+                expr->as.block_expr.value = desugar_expr(expr->as.block_expr.value);
+                return expr->as.block_expr.value ? expr : 0;
+            }
+            return expr;
         case JIR_EXPR_IF:
             expr->as.if_expr.cond = desugar_expr(expr->as.if_expr.cond);
             expr->as.if_expr.then_expr = desugar_expr(expr->as.if_expr.then_expr);
@@ -826,8 +829,12 @@ static JirExpr* lower_expr(JirProgram* program, const HirExpr* expr, const char*
                 }
             }
             *out->as.block_expr.insts = temp_block.insts;
-            out->as.block_expr.value = lower_expr(program, expr->as.block_expr.value, error, error_line, error_column);
-            return out->as.block_expr.value ? out : 0;
+            if (expr->as.block_expr.value) {
+                out->as.block_expr.value = lower_expr(program, expr->as.block_expr.value, error, error_line, error_column);
+                return out->as.block_expr.value ? out : 0;
+            }
+            out->as.block_expr.value = 0;
+            return out;
         }
         case HIR_EXPR_IF:
             out->as.if_expr.cond = lower_expr(program, expr->as.if_expr.cond, error, error_line, error_column);
@@ -1015,6 +1022,20 @@ static int append_simple_inst(JirProgram* program, JirBasicBlock* block, const H
             inst.kind = JIR_INST_EXPR;
             inst.expr = lower_expr(program, stmt->as.expr_stmt.expr, error, error_line, error_column);
             if (!inst.expr) {
+                return 0;
+            }
+            break;
+        case HIR_STMT_RETURN:
+            inst.kind = JIR_INST_RETURN;
+            inst.value = stmt->as.ret.expr ? lower_expr(program, stmt->as.ret.expr, error, error_line, error_column) : 0;
+            if (stmt->as.ret.expr && !inst.value) {
+                return 0;
+            }
+            break;
+        case HIR_STMT_THROW:
+            inst.kind = JIR_INST_THROW;
+            inst.value = stmt->as.throw_stmt.expr ? lower_expr(program, stmt->as.throw_stmt.expr, error, error_line, error_column) : 0;
+            if (!inst.value) {
                 return 0;
             }
             break;
