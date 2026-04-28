@@ -5678,6 +5678,9 @@ static int monomorphize_program(const AstProgram* source, AstProgram* out, const
         }
         memset(&locals, 0, sizeof(locals));
         fn = clone_function(source, 0, 0, &source->functions.items[i], source->functions.items[i].public_flag);
+        if (fn.method_flag && !fn.static_method_flag && fn.owner_type_name) {
+            push_self_local_type(&locals, fn.owner_type_name);
+        }
         if (!transform_type(&mono, &fn.return_type)) {
             *error = mono.error;
             return 0;
