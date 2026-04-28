@@ -1,0 +1,230 @@
+import "./ast.jiang";
+import "./context.jiang";
+import "./diagnostic.jiang";
+import "./interner.jiang";
+import "./lexer.jiang";
+import "./token.jiang";
+import "./support/arena.jiang";
+
+public struct Parser {
+    context.CompilerContext* ctx;
+    token.TokenBuffer* tokens;
+    Int! index;
+    token.Token! current;
+    diagnostic.DiagnosticBag* diagnostics;
+    arena.Arena* store;
+    token.Span! last_type_span;
+
+    public init(context.CompilerContext* ctx, token.TokenBuffer* tokens) {
+        self.ctx = ctx;
+        self.tokens = tokens;
+        self.index = 0;
+        self.diagnostics = ctx.diagnostics_ptr();
+        self.store = ctx.ast_store_ptr();
+        self.last_type_span = token.Span();
+        self.current = self.tokens.at(0);
+    }
+
+    public ast.AstFile parse() {
+        ast.AstFile! file = ast.AstFile(self.store);
+        while (!self.is_kind(.eof)) {
+            ast.AstDecl? decl = self.parse_decl();
+            if (decl is .some(parsed_decl)) {
+                file.items.add(parsed_decl);
+            } else if (!self.is_kind(.eof)) {
+                self.advance();
+            }
+        }
+        return file;
+    }
+
+    () advance() {
+        if (self.index + 1 < self.tokens.len()) {
+            self.index = self.index + 1;
+        }
+        self.current = self.tokens.at(self.index);
+    }
+
+    Bool is_kind(token.Kind kind) {
+        return self.current.kind == kind;
+    }
+
+    Bool consume(token.Kind kind, UInt8[] message) {
+        if (self.is_kind(kind)) {
+            self.advance();
+            return true;
+        }
+        self.diagnostics.add_error(self.current.span, message);
+        return false;
+    }
+
+    ast.AstDecl? parse_decl() {
+        Bool! public_flag = false;
+        token.Span start = self.current.span;
+
+        if (self.is_kind(.kw_public)) {
+            public_flag = true;
+            self.advance();
+        }
+
+        if (self.is_kind(.kw_import)) {
+            if (public_flag) {
+                self.diagnostics.add_error(start, "import declaration must not be public");
+            }
+            return self.parse_import(self.current.span);
+        }
+        if (self.is_kind(.kw_alias)) {
+            return self.parse_alias(public_flag, start);
+        }
+        return self.parse_global(public_flag, start);
+    }
+
+    ast.AstDecl? parse_import(token.Span start) {
+        self.advance();
+
+        if (!self.is_kind(.string_lit)) {
+            self.diagnostics.add_error(self.current.span, "expected import path string literal");
+            return null;
+        }
+
+        token.Span path = self.current.span;
+        self.advance();
+        token.Span! end_span = path;
+        if (self.consume(.semicolon, "expected ';' after import declaration")) {
+            end_span = token.Span(end_span.end(), 0);
+        }
+
+        ast.AstDecl decl = .import_decl(ast.ImportDecl(self.span_from(start, end_span), path, null, false));
+        return decl;
+    }
+
+    ast.AstDecl? parse_alias(Bool public_flag, token.Span start) {
+        token.Span alias_span = self.current.span;
+        self.advance();
+
+        ast.Name? name = self.parse_name("expected alias name");
+        if (name == null) {
+            return null;
+        }
+        if (!self.consume(.assign, "expected '=' after alias name")) {
+            return null;
+        }
+
+        ast.AstType? target = self.parse_type();
+        if (target == null) {
+            return null;
+        }
+
+        token.Span! end_span = self.last_type_span;
+        if (self.consume(.semicolon, "expected ';' after alias declaration")) {
+            end_span = token.Span(end_span.end(), 0);
+        }
+
+        token.Span! span = self.span_from(start, end_span);
+        if (!public_flag) {
+            span = self.span_from(alias_span, end_span);
+        }
+        ast.AstDecl decl = .alias_decl(ast.AliasDecl(span, name$.some(), target$.some(), public_flag));
+        return decl;
+    }
+
+    ast.AstDecl? parse_global(Bool public_flag, token.Span start) {
+        ast.AstType? type_ref = self.parse_type();
+        if (type_ref == null) {
+            return null;
+        }
+
+        ast.Name? name = self.parse_name("expected global declaration name");
+        if (name == null) {
+            return null;
+        }
+
+        ast.AstExpr*?! initializer = null;
+        token.Span! end_span = name$.some().span;
+        if (self.is_kind(.assign)) {
+            self.advance();
+            token.Span initializer_span = self.current.span;
+            initializer = self.parse_literal_expr();
+            if (initializer == null) {
+                return null;
+            }
+            end_span = initializer_span;
+        }
+
+        if (self.consume(.semicolon, "expected ';' after global declaration")) {
+            end_span = token.Span(end_span.end(), 0);
+        }
+
+        ast.GlobalDecl global = ast.GlobalDecl(self.span_from(start, end_span), name$.some(), type_ref$.some(), initializer, public_flag);
+        ast.AstDecl decl = .global_decl(global);
+        return decl;
+    }
+
+    ast.Name? parse_name(UInt8[] message) {
+        if (!self.is_kind(.ident)) {
+            self.diagnostics.add_error(self.current.span, message);
+            return null;
+        }
+
+        ast.Name name = ast.Name(self.current.span, interner.Symbol(self.current.symbol_id));
+        self.advance();
+        return name;
+    }
+
+    ast.AstType? parse_type() {
+        if (!self.is_kind(.ident)) {
+            self.diagnostics.add_error(self.current.span, "expected type name");
+            return null;
+        }
+
+        token.Span start = self.current.span;
+        ast.Path! path = ast.Path(self.store, start);
+        token.Span! end_span = start;
+        path.add_segment(ast.Name(self.current.span, interner.Symbol(self.current.symbol_id)));
+        self.advance();
+
+        while (self.is_kind(.dot)) {
+            self.advance();
+            if (!self.is_kind(.ident)) {
+                self.diagnostics.add_error(self.current.span, "expected path segment after '.'");
+                return null;
+            }
+            end_span = self.current.span;
+            path.add_segment(ast.Name(self.current.span, interner.Symbol(self.current.symbol_id)));
+            self.advance();
+        }
+
+        path.span = self.span_from(start, end_span);
+        self.last_type_span = path.span;
+        ast.AstType type_ref = .named(ast.NamedType(self.store, path.span, path));
+        return type_ref;
+    }
+
+    ast.AstExpr*? parse_literal_expr() {
+        token.Span span = self.current.span;
+        ast.Literal! literal = .null_lit(span);
+        switch (self.current.kind) {
+            .int_lit => literal = .int_lit(span);
+            .float_lit => literal = .float_lit(span);
+            .string_lit => literal = .string_lit(span);
+            .kw_true => literal = .bool_lit(ast.BoolLiteral(span, true));
+            .kw_false => literal = .bool_lit(ast.BoolLiteral(span, false));
+            .kw_null => literal = .null_lit(span);
+            else => {
+                self.diagnostics.add_error(span, "expected literal expression");
+                return null;
+            }
+        }
+        self.advance();
+
+        UInt8![*] bytes = self.store.alloc_bytes(ast.AstExpr$.size(), ast.AstExpr$.align());
+        ast.AstExpr![*] slot = bytes$.as(ast.AstExpr![*]);
+        slot[0] = .literal(literal);
+        return slot$.as(ast.AstExpr*);
+    }
+
+    token.Span span_from(token.Span start, token.Span end) {
+        return token.Span(start.start, end.end() - start.start);
+    }
+
+}
