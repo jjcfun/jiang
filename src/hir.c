@@ -231,6 +231,8 @@ static int is_mutable_assignment_target(const HirExpr* expr);
 static int type_assignment_compatible(HirType* actual, HirType* expected);
 static int type_equals(HirType* left, HirType* right);
 static int same_nominal_type(HirType* left, HirType* right);
+static int same_nominal_type_strict(HirType* left, HirType* right);
+static int nominal_names_equivalent(const char* left, const char* right);
 static int lower_var_decl_coalesce_control(LowerContext* ctx, const AstStmt* stmt, HirBlock* out_block);
 static int lower_block(LowerContext* ctx, const AstBlock* ast_block, HirBlock* out_block, int loop_boundary);
 static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt);
@@ -372,6 +374,19 @@ static int type_is_imported_nominal(HirType* type) {
 
 static int same_method_owner_type(HirType* left, HirType* right) {
     return left && right && type_equals(left, right);
+}
+
+static int method_source_name_matches(const char* candidate, const char* requested) {
+    if (!candidate || !requested) {
+        return 0;
+    }
+    if (strcmp(candidate, requested) == 0) {
+        return 1;
+    }
+    if (candidate[0] == '#' && strcmp(candidate + 1, requested) == 0) {
+        return 1;
+    }
+    return 0;
 }
 
 static int method_visible_from_context(LowerContext* ctx, HirFunction* method, HirType* owner_type) {
@@ -626,13 +641,25 @@ static int type_equals(HirType* left, HirType* right) {
         return 1;
     }
     if (left->kind == HIR_TYPE_ENUM) {
-        return left->enum_decl == right->enum_decl;
+        return left->enum_decl == right->enum_decl ||
+               (left->enum_decl && right->enum_decl &&
+                nominal_names_equivalent(left->enum_decl->name, right->enum_decl->name));
     }
     if (left->kind == HIR_TYPE_STRUCT) {
-        return left->struct_decl == right->struct_decl;
+        return left->struct_decl == right->struct_decl ||
+               (left->struct_decl && right->struct_decl &&
+                nominal_names_equivalent(left->struct_decl->name, right->struct_decl->name));
     }
     if (left->kind == HIR_TYPE_UNION) {
-        return left->union_decl == right->union_decl;
+        if (is_errorable_type(left) || is_errorable_type(right)) {
+            return is_errorable_type(left) &&
+                   is_errorable_type(right) &&
+                   type_equals(errorable_value_type(left), errorable_value_type(right)) &&
+                   type_equals(errorable_error_type(left), errorable_error_type(right));
+        }
+        return left->union_decl == right->union_decl ||
+               (left->union_decl && right->union_decl &&
+                nominal_names_equivalent(left->union_decl->name, right->union_decl->name));
     }
     if (left->kind != HIR_TYPE_TUPLE) {
         return 1;
@@ -646,6 +673,101 @@ static int type_equals(HirType* left, HirType* right) {
         }
     }
     return 1;
+}
+
+static const char* nominal_public_suffix(const char* name) {
+    const char* last_dot = name ? strrchr(name, '.') : 0;
+    const char* scan = 0;
+    if (!last_dot) {
+        return name;
+    }
+    scan = last_dot;
+    while (scan > name) {
+        scan -= 1;
+        if (*scan == '.') {
+            return scan + 1;
+        }
+    }
+    return name;
+}
+
+static int suffix_range_equal(const char* left, size_t left_len, const char* right, size_t right_len) {
+    const char* left_suffix = left;
+    const char* right_suffix = right;
+    size_t left_suffix_len = left_len;
+    size_t right_suffix_len = right_len;
+    size_t i = 0;
+    for (i = 0; i + 2 < left_len; ++i) {
+        if (left[i] == '_' && left[i + 1] == 'd' && left[i + 2] == '_') {
+            left_suffix = left + i + 3;
+            left_suffix_len = left_len - i - 3;
+        }
+    }
+    for (i = 0; i + 2 < right_len; ++i) {
+        if (right[i] == '_' && right[i + 1] == 'd' && right[i + 2] == '_') {
+            right_suffix = right + i + 3;
+            right_suffix_len = right_len - i - 3;
+        }
+    }
+    if (left_suffix_len != right_suffix_len) {
+        return 0;
+    }
+    return strncmp(left_suffix, right_suffix, left_suffix_len) == 0;
+}
+
+static int generic_nominal_names_equivalent(const char* left, const char* right) {
+    const char* left_args = strstr(left, "__");
+    const char* right_args = strstr(right, "__");
+    if (!left_args || !right_args) {
+        return 0;
+    }
+    if ((left_args == 0) != (right_args == 0)) {
+        return 0;
+    }
+    {
+        size_t left_base_len = (size_t)(left_args - left);
+        size_t right_base_len = (size_t)(right_args - right);
+        const char* left_base = nominal_public_suffix(left);
+        const char* right_base = nominal_public_suffix(right);
+        size_t left_suffix_len = left_base_len - (size_t)(left_base - left);
+        size_t right_suffix_len = right_base_len - (size_t)(right_base - right);
+        if (left_suffix_len != right_suffix_len || strncmp(left_base, right_base, left_suffix_len) != 0) {
+            return 0;
+        }
+    }
+    left_args += 2;
+    right_args += 2;
+    while (*left_args || *right_args) {
+        const char* left_next = strstr(left_args, "__");
+        const char* right_next = strstr(right_args, "__");
+        size_t left_len = left_next ? (size_t)(left_next - left_args) : strlen(left_args);
+        size_t right_len = right_next ? (size_t)(right_next - right_args) : strlen(right_args);
+        if (!suffix_range_equal(left_args, left_len, right_args, right_len)) {
+            return 0;
+        }
+        if ((left_next == 0) != (right_next == 0)) {
+            return 0;
+        }
+        if (!left_next) {
+            break;
+        }
+        left_args = left_next + 2;
+        right_args = right_next + 2;
+    }
+    return 1;
+}
+
+static int nominal_names_equivalent(const char* left, const char* right) {
+    if (!left || !right) {
+        return 0;
+    }
+    if (strcmp(left, right) == 0) {
+        return 1;
+    }
+    if (generic_nominal_names_equivalent(left, right)) {
+        return 1;
+    }
+    return strcmp(nominal_public_suffix(left), nominal_public_suffix(right)) == 0;
 }
 
 static int type_assignment_compatible_inner(HirType* actual, HirType* expected, int through_alias) {
@@ -681,11 +803,23 @@ static int type_assignment_compatible_inner(HirType* actual, HirType* expected, 
             }
             return 1;
         case HIR_TYPE_ENUM:
-            return actual->enum_decl == expected->enum_decl;
+            return actual->enum_decl == expected->enum_decl ||
+                   (actual->enum_decl && expected->enum_decl &&
+                    nominal_names_equivalent(actual->enum_decl->name, expected->enum_decl->name));
         case HIR_TYPE_STRUCT:
-            return actual->struct_decl == expected->struct_decl;
+            return actual->struct_decl == expected->struct_decl ||
+                   (actual->struct_decl && expected->struct_decl &&
+                    nominal_names_equivalent(actual->struct_decl->name, expected->struct_decl->name));
         case HIR_TYPE_UNION:
-            return actual->union_decl == expected->union_decl;
+            if (is_errorable_type(actual) || is_errorable_type(expected)) {
+                return is_errorable_type(actual) &&
+                       is_errorable_type(expected) &&
+                       type_assignment_compatible_inner(errorable_value_type(actual), errorable_value_type(expected), through_alias) &&
+                       type_equals(errorable_error_type(actual), errorable_error_type(expected));
+            }
+            return actual->union_decl == expected->union_decl ||
+                   (actual->union_decl && expected->union_decl &&
+                    nominal_names_equivalent(actual->union_decl->name, expected->union_decl->name));
         case HIR_TYPE_TUPLE:
             if (actual->tuple_items.count != expected->tuple_items.count) {
                 return 0;
@@ -1936,7 +2070,7 @@ static int function_signature_conflicts(HirFunction* left, HirFunction* right) {
     return left->static_method_flag == right->static_method_flag &&
            left->receiver_type &&
            right->receiver_type &&
-           same_nominal_type(left->receiver_type, right->receiver_type) &&
+           same_nominal_type_strict(left->receiver_type, right->receiver_type) &&
            strcmp(left->method_name, right->method_name) == 0 &&
            function_param_types_equal(&left->params, &right->params);
 }
@@ -2354,22 +2488,45 @@ static int same_nominal_type(HirType* left, HirType* right) {
     if (left_query.nominal.kind == HIR_NOMINAL_BUILTIN) {
         return left_query.nominal.decl == right_query.nominal.decl;
     }
+    if (left_query.nominal.decl == right_query.nominal.decl) {
+        return 1;
+    }
+    return nominal_names_equivalent(left_query.nominal.name, right_query.nominal.name);
+}
+
+static int same_nominal_type_strict(HirType* left, HirType* right) {
+    HirTypeQueryRef left_query = describe_hir_type(left);
+    HirTypeQueryRef right_query = describe_hir_type(right);
+    if (left_query.kind != HIR_TYPE_QUERY_NOMINAL || right_query.kind != HIR_TYPE_QUERY_NOMINAL) {
+        return 0;
+    }
+    if (left_query.nominal.kind != right_query.nominal.kind) {
+        return 0;
+    }
     return left_query.nominal.decl == right_query.nominal.decl;
 }
 
 static HirFunction* find_type_method(HirProgram* program, HirType* receiver_type, const char* method_name, int static_flag) {
     HirTypeQueryRef query = describe_hir_type(receiver_type);
     int i = 0;
+    int pass = 0;
     if (query.kind != HIR_TYPE_QUERY_NOMINAL) {
         return 0;
     }
-    for (i = 0; i < program->functions.count; ++i) {
-        HirFunction* fn = &program->functions.items[i];
-        if (!fn->method_flag || fn->static_method_flag != static_flag || strcmp(fn->method_name, method_name) != 0) {
-            continue;
-        }
-        if (same_nominal_type(receiver_type, fn->receiver_type)) {
-            return fn;
+    for (pass = 0; pass < 2; ++pass) {
+        for (i = 0; i < program->functions.count; ++i) {
+            HirFunction* fn = &program->functions.items[i];
+            if (!fn->method_flag || fn->static_method_flag != static_flag || !method_source_name_matches(fn->method_name, method_name)) {
+                continue;
+            }
+            if (pass == 0) {
+                if (same_nominal_type_strict(receiver_type, fn->receiver_type)) {
+                    return fn;
+                }
+            } else if (!same_nominal_type_strict(receiver_type, fn->receiver_type) &&
+                       same_nominal_type(receiver_type, fn->receiver_type)) {
+                return fn;
+            }
         }
     }
     return 0;
@@ -3257,7 +3414,13 @@ static int lower_struct_init_args_named(LowerContext* ctx,
         }
     }
     if (match_count == 0) {
-        return fail(ctx, "no matching init overload");
+        static char error_buffer[512];
+        snprintf(error_buffer,
+                 sizeof(error_buffer),
+                 "no matching init overload: %s with %d args",
+                 struct_decl->name ? struct_decl->name : "<null>",
+                 ast_args->count);
+        return fail(ctx, error_buffer);
     }
     out_args->items = matched_args.items;
     out_args->count = matched_args.count;
@@ -3460,34 +3623,44 @@ static HirFunction* resolve_method_call_overload(LowerContext* ctx,
     HirExprList matched_args;
     int match_count = 0;
     int i = 0;
+    int pass = 0;
     memset(&matched_args, 0, sizeof(matched_args));
     if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name)) {
         fail(ctx, "trait method not found");
         return 0;
     }
-    for (i = 0; i < ctx->program->functions.count; ++i) {
-        HirFunction* candidate = &ctx->program->functions.items[i];
-        HirExprList candidate_args;
-        const char* saved_error = ctx->error;
-        memset(&candidate_args, 0, sizeof(candidate_args));
-        if (!candidate->method_flag ||
-            candidate->static_method_flag != static_flag ||
-            strcmp(candidate->method_name, method_name) != 0 ||
-            !same_nominal_type(owner_type, candidate->receiver_type)) {
-            continue;
-        }
-        if (!method_visible_from_context(ctx, candidate, owner_type)) {
-            continue;
-        }
-        ctx->error = 0;
-        if (!lower_call_args_exact_from(ctx, ast_args, &candidate_args, candidate, param_offset)) {
+    for (pass = 0; pass < 2 && match_count == 0; ++pass) {
+        for (i = 0; i < ctx->program->functions.count; ++i) {
+            HirFunction* candidate = &ctx->program->functions.items[i];
+            HirExprList candidate_args;
+            const char* saved_error = ctx->error;
+            memset(&candidate_args, 0, sizeof(candidate_args));
+            if (!candidate->method_flag ||
+                candidate->static_method_flag != static_flag ||
+                !method_source_name_matches(candidate->method_name, method_name)) {
+                continue;
+            }
+            if (pass == 0) {
+                if (!same_nominal_type_strict(owner_type, candidate->receiver_type)) {
+                    continue;
+                }
+            } else if (same_nominal_type_strict(owner_type, candidate->receiver_type) ||
+                       !same_nominal_type(owner_type, candidate->receiver_type)) {
+                continue;
+            }
+            if (!method_visible_from_context(ctx, candidate, owner_type)) {
+                continue;
+            }
+            ctx->error = 0;
+            if (!lower_call_args_exact_from(ctx, ast_args, &candidate_args, candidate, param_offset)) {
+                ctx->error = saved_error;
+                continue;
+            }
             ctx->error = saved_error;
-            continue;
+            matched = candidate;
+            matched_args = candidate_args;
+            match_count += 1;
         }
-        ctx->error = saved_error;
-        matched = candidate;
-        matched_args = candidate_args;
-        match_count += 1;
     }
     if (match_count == 0) {
         return 0;
@@ -3539,27 +3712,37 @@ static HirFunction* resolve_method_value_overload(LowerContext* ctx,
     HirFunction* matched = 0;
     int match_count = 0;
     int i = 0;
+    int pass = 0;
     if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name)) {
         fail(ctx, "trait method not found");
         return 0;
     }
-    for (i = 0; i < ctx->program->functions.count; ++i) {
-        HirFunction* candidate = &ctx->program->functions.items[i];
-        if (!candidate->method_flag ||
-            candidate->static_method_flag != static_flag ||
-            strcmp(candidate->method_name, method_name) != 0 ||
-            !same_nominal_type(owner_type, candidate->receiver_type)) {
-            continue;
+    for (pass = 0; pass < 2 && match_count == 0; ++pass) {
+        for (i = 0; i < ctx->program->functions.count; ++i) {
+            HirFunction* candidate = &ctx->program->functions.items[i];
+            if (!candidate->method_flag ||
+                candidate->static_method_flag != static_flag ||
+                !method_source_name_matches(candidate->method_name, method_name)) {
+                continue;
+            }
+            if (pass == 0) {
+                if (!same_nominal_type_strict(owner_type, candidate->receiver_type)) {
+                    continue;
+                }
+            } else if (same_nominal_type_strict(owner_type, candidate->receiver_type) ||
+                       !same_nominal_type(owner_type, candidate->receiver_type)) {
+                continue;
+            }
+            if (!method_visible_from_context(ctx, candidate, owner_type)) {
+                continue;
+            }
+            if (expected_type && expected_type->kind == HIR_TYPE_FUNCTION &&
+                !function_matches_fn_type(candidate, expected_type)) {
+                continue;
+            }
+            matched = candidate;
+            match_count += 1;
         }
-        if (!method_visible_from_context(ctx, candidate, owner_type)) {
-            continue;
-        }
-        if (expected_type && expected_type->kind == HIR_TYPE_FUNCTION &&
-            !function_matches_fn_type(candidate, expected_type)) {
-            continue;
-        }
-        matched = candidate;
-        match_count += 1;
     }
     if (match_count == 1) {
         return matched;

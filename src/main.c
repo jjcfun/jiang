@@ -6,6 +6,7 @@
 #include <llvm-c/Core.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <stdio.h>
@@ -213,6 +214,8 @@ static int path_exists(const char* path) {
     struct stat st;
     return stat(path, &st) == 0;
 }
+
+static char* canonical_path_dup(const char* path);
 
 static char* basename_dup(const char* path) {
     const char* end = path + strlen(path);
@@ -435,7 +438,7 @@ static int load_package_root_path(const char* input_path, char** out_path, const
     char* manifest_text = 0;
     int in_package_section = 0;
     if (!path_is_directory(input_path)) {
-        *out_path = dup_text(input_path);
+        *out_path = canonical_path_dup(input_path);
         return *out_path != 0;
     }
     package_dir = dup_text(input_path);
@@ -519,10 +522,18 @@ static int load_package_root_path(const char* input_path, char** out_path, const
             }
         }
     }
-    *out_path = dup_join3(package_dir, "/", root_name);
-    if (!*out_path) {
-        *error = "out of memory";
-        goto fail;
+    {
+        char* root_path = dup_join3(package_dir, "/", root_name);
+        if (!root_path) {
+            *error = "out of memory";
+            goto fail;
+        }
+        *out_path = canonical_path_dup(root_path);
+        free(root_path);
+        if (!*out_path) {
+            *error = "out of memory";
+            goto fail;
+        }
     }
     free(package_dir);
     free(package_name);
@@ -2662,6 +2673,14 @@ static char* dirname_dup(const char* path) {
     return out;
 }
 
+static char* canonical_path_dup(const char* path) {
+    char* resolved = realpath(path, 0);
+    if (resolved) {
+        return resolved;
+    }
+    return dup_text(path);
+}
+
 static char* resolve_import_path(const char* from_path, const char* import_path) {
     char* dir = dirname_dup(from_path);
     char* full = 0;
@@ -2670,7 +2689,7 @@ static char* resolve_import_path(const char* from_path, const char* import_path)
     }
     if (import_path[0] == '/') {
         free(dir);
-        return dup_text(import_path);
+        return canonical_path_dup(import_path);
     }
     if (import_path[0] != '.') {
         if (strcmp(import_path, "std") == 0) {
@@ -2681,7 +2700,11 @@ static char* resolve_import_path(const char* from_path, const char* import_path)
             if (!ok) {
                 return 0;
             }
-            return std_root;
+            {
+                char* canonical = canonical_path_dup(std_root);
+                free(std_root);
+                return canonical;
+            }
         }
         char* package_dir = find_enclosing_package_dir(from_path);
         if (package_dir) {
@@ -2696,14 +2719,23 @@ static char* resolve_import_path(const char* from_path, const char* import_path)
                 if (!ok) {
                     return 0;
                 }
-                return dep_root;
+                {
+                    char* canonical = canonical_path_dup(dep_root);
+                    free(dep_root);
+                    return canonical;
+                }
             }
             free(package_dir);
         }
     }
     full = dup_join3(dir, "/", import_path);
     free(dir);
-    return full;
+    if (full) {
+        char* canonical = canonical_path_dup(full);
+        free(full);
+        return canonical;
+    }
+    return 0;
 }
 
 static char* import_module_name(const char* import_path, const char** error) {
@@ -2768,9 +2800,7 @@ static int build_loaded_module(LoadedModule* module, int inject_prelude, LoadedM
     }
     for (i = 0; i < module->imports.count; ++i) {
         merge_public_import(&module->full_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
-        if (module->imports.items[i].public_flag) {
-            merge_public_import(&module->export_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
-        }
+        merge_public_import(&module->export_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
     }
     append_own_decls(&module->full_program, &module->own_program);
     if (!apply_aliases(&module->full_program, &module->own_program, error)) {
@@ -4552,7 +4582,7 @@ static int transform_type(MonoContext* mono, AstType* type) {
         const AstStructDecl* templ = find_generic_struct_template(mono->source, type->named_name);
         union_templ = find_generic_union_template(mono->source, type->named_name);
         if (!templ && !union_templ) {
-            mono->error = "unknown generic type";
+            mono->error = dup_join3("unknown generic type: ", "", type->named_name ? type->named_name : "<null>");
             return 0;
         }
         if (templ) {
@@ -5468,7 +5498,7 @@ static int transform_expr(MonoContext* mono, AstExpr* expr, LocalTypeList* local
                 const AstStructDecl* templ = find_generic_struct_template(mono->source, expr->as.struct_lit.type_name);
                 char* instantiated_name = 0;
                 if (!templ) {
-                    mono->error = "unknown generic type";
+                    mono->error = dup_join3("unknown generic type: ", "", expr->as.struct_lit.type_name ? expr->as.struct_lit.type_name : "<null>");
                     return 0;
                 }
                 if (!instantiate_struct_template(mono, templ, &expr->as.struct_lit.type_args, &instantiated_name)) {

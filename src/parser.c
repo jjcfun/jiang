@@ -19,9 +19,24 @@ static char* token_dup(const Token* token) {
     return text;
 }
 
-static char* string_token_dup(const Token* token) {
+static char decode_escape_char(char ch) {
+    switch (ch) {
+        case '0': return '\0';
+        case 'n': return '\n';
+        case 'r': return '\r';
+        case 't': return '\t';
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"': return '"';
+        default: return ch;
+    }
+}
+
+static char* string_token_decode_dup(const Token* token, int* out_length) {
     char* text = 0;
     size_t length = 0;
+    size_t read_index = 0;
+    size_t write_index = 0;
     if (token->length < 2) {
         return 0;
     }
@@ -30,9 +45,25 @@ static char* string_token_dup(const Token* token) {
     if (!text) {
         return 0;
     }
-    memcpy(text, token->start + 1, length);
-    text[length] = '\0';
+    while (read_index < length) {
+        char ch = token->start[1 + read_index];
+        if (ch == '\\' && read_index + 1 < length) {
+            text[write_index++] = decode_escape_char(token->start[1 + read_index + 1]);
+            read_index += 2;
+        } else {
+            text[write_index++] = ch;
+            read_index += 1;
+        }
+    }
+    text[write_index] = '\0';
+    if (out_length) {
+        *out_length = (int)write_index;
+    }
     return text;
+}
+
+static char* string_token_dup(const Token* token) {
+    return string_token_decode_dup(token, 0);
 }
 
 static char* token_slice_dup(const Token* token) {
@@ -2007,8 +2038,7 @@ static AstExpr* parse_primary(Parser* parser) {
 
     if (token.kind == TOKEN_STRING_LIT) {
         expr = new_expr(AST_EXPR_STRING, token.line);
-        expr->as.string_lit.text = string_token_dup(&token);
-        expr->as.string_lit.length = (int)(token.length >= 2 ? token.length - 2 : 0);
+        expr->as.string_lit.text = string_token_decode_dup(&token, &expr->as.string_lit.length);
         advance(parser);
         return expr;
     }
@@ -2019,8 +2049,7 @@ static AstExpr* parse_primary(Parser* parser) {
         memset(&string_expr, 0, sizeof(string_expr));
         string_expr.kind = AST_EXPR_STRING;
         string_expr.line = token.line;
-        string_expr.as.string_lit.text = string_token_dup(&token);
-        string_expr.as.string_lit.length = (int)(token.length >= 2 ? token.length - 2 : 0);
+        string_expr.as.string_lit.text = string_token_decode_dup(&token, &string_expr.as.string_lit.length);
         if (!decode_single_unicode_scalar_text(string_expr.as.string_lit.text, string_expr.as.string_lit.length, &value)) {
             fail(parser, "character literal requires exactly one Unicode scalar");
             return 0;
