@@ -22,6 +22,54 @@ source files
 
 `JIR` 是更低层、面向代码生成的 IR。它应该移除大部分源码级语法糖，把控制流、值、存储和调用降到 LLVM backend 容易消费的形式。
 
+## 名称解析和符号生成
+
+Jiang Stage1 应参考 Rust 的内部表示方式：编译器内部使用结构化 ID 表达语义，最终到 codegen/link 阶段才生成符号名。
+
+内部不要把方法、泛型实例、初始化函数等 lowering 成可再次被 parser 解释的字符串。例如不要长期使用类似下面的形式表示调用目标：
+
+```text
+self.arena.alloc_array__ast.AstType
+```
+
+这种字符串同时包含语义信息和语法分隔符，容易在后续阶段被错误拆分。正确方向是把调用目标表示为结构化引用：
+
+```text
+ResolvedCallee {
+    def: DefId,
+    receiver_type: TypeId?,
+    type_args: TypeId[],
+}
+```
+
+推荐的职责边界：
+
+- `Symbol` 只表示 interned source text，例如 identifier 的文本。
+- `DefId` 表示唯一声明，例如 function、method、struct、enum、union、global。
+- `TypeId` 表示语义类型，不直接等同 AST type syntax。
+- `InstanceKey` 表示泛型实例，至少包含 `def_id` 和 `type_args`。
+- `HIR/JIR` 中的 call 应引用 resolved callee 或 instance id，不依赖合成字符串查找。
+- LLVM/codegen 阶段才把 `InstanceKey` 转成最终 symbol name。
+
+最终 symbol mangling 可以参考 Swift 或 Itanium ABI：使用不会被 Jiang parser 误解的编码。优先考虑长度前缀方案；如果暂时使用分隔符，也必须保证输出只包含安全字符，不包含 `.`、`#`、`[]`、`<>` 等仍有语法意义的字符。
+
+示例：
+
+```text
+InstanceKey {
+    def: ast.arena.Arena.alloc_array,
+    type_args: [ast.AstType],
+}
+
+// 可接受的临时 mangling
+__method_ast_d_arena_d_Arena_alloc_array__ast_d_AstType
+
+// 更推荐的长期方向：长度前缀编码
+M3ast5arena5Arena11alloc_arrayT3ast7AstType
+```
+
+Stage0 中可能仍需要字符串 mangling，但这只能作为过渡实现。Stage1 的 resolver、type checker、HIR、JIR 不应依赖字符串拼接来表达已解析语义。
+
 ## 顶层模块
 
 ### `compiler.jiang`
@@ -98,16 +146,6 @@ AST 应保留源码形状，不应该要求类型信息或已解析声明。
 - 报告语法错误，后续可加入错误恢复
 
 parser 的输出应只是 AST。名称查找、重载解析、类型推导都放到后续阶段。
-
-### `interner.jiang`
-
-Symbol 相关公共类型和辅助方法。
-
-预期职责：
-- 如果从 `interner.jiang` 中拆分，放共享 symbol/name handle 类型
-- 后续可放 keyword/builtin name 的公共 symbol 常量
-
-不要把它做成 scope table。作用域和声明查找属于 `scope.jiang` 与 `resolve.jiang`。
 
 ### `interner.jiang`
 

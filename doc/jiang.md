@@ -1438,6 +1438,10 @@ switch (priority) {
 
 ### 联合类型（Union）
 
+Jiang 的 `union` 是安全的 tagged union：每个值都会携带当前 variant 的 tag，并且每个 variant 可以有自己的 payload。它不是 C 风格的 untagged/raw union。
+
+`union` 可以复用已有 `enum` 作为 tag，也可以省略 tag enum，由编译器根据 variant 名自动生成隐式 tag。`enum` 只表示 tag/value set；`union` 表示 tag 加 payload 的 sum type。
+
 ```c
 enum(UInt8) Kind {
   a = 1,
@@ -1485,7 +1489,7 @@ switch (x) {
 }
 
 // 使用 if 判断
-if (x == MyUnion.a(_ value)) {
+if (x is .a(_ value)) {
   print("value = %d", value)
 }
 ```
@@ -1508,6 +1512,14 @@ union ImplicitResult {
   Int b;
 }
 ```
+
+规则：
+
+- `union(TagEnum)` 的 variant 名必须能对应到 `TagEnum` 的成员。
+- 省略 tag enum 时，编译器按 variant 声明生成隐式 tag。
+- `union` variant 的可见性规则类似 `record` 字段：variant 本身不单独声明 `public` / `private`，只由外层 `union` 是否公开决定。
+- 如果 `union` 是 `public`，它的 variant 属于公开类型表面；如果 `union` 不公开，variant 也只在模块内可见。
+- 如果需要隐藏 union 的部分实现细节，优先用 public `struct` 包装 private union/data。
 
 同类型的多个 variant 也可以合并声明：
 
