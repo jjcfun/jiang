@@ -4961,12 +4961,6 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 fail(ctx, "if expression branch type mismatch");
                 return 0;
             }
-            if (then_expr->type->kind == HIR_TYPE_TUPLE ||
-                then_expr->type->kind == HIR_TYPE_ARRAY ||
-                then_expr->type->kind == HIR_TYPE_UNION) {
-                fail(ctx, "if expression aggregate result unsupported");
-                return 0;
-            }
             out = new_expr(HIR_EXPR_IF, then_expr->type, expr->line);
             out->as.if_expr.cond = cond;
             out->as.if_expr.then_expr = then_expr;
@@ -7212,11 +7206,7 @@ static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
         if (result_type && hir_expr_is_never_exit(fallback)) {
             fallback->type = result_type;
         }
-        if (result_type &&
-            (result_type->kind == HIR_TYPE_TUPLE ||
-            result_type->kind == HIR_TYPE_ARRAY ||
-            result_type->kind == HIR_TYPE_UNION ||
-            result_type->kind == HIR_TYPE_VOID)) {
+        if (result_type && result_type->kind == HIR_TYPE_VOID) {
             return fail(ctx, "switch expression aggregate result unsupported"), (HirExpr*)0;
         }
         if ((value->type->kind == HIR_TYPE_UNION || value->type->kind == HIR_TYPE_OPTIONAL) &&
