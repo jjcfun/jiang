@@ -3988,6 +3988,29 @@ static int validate_struct_init_expr(LowerContext* ctx, HirStructDecl* struct_de
                 return 1;
             }
             return validate_struct_init_expr(ctx, struct_decl, expr->as.field.base, field_state);
+        case AST_EXPR_ADDR:
+            if (expr->as.unary.value &&
+                expr->as.unary.value->kind == AST_EXPR_FIELD &&
+                expr->as.unary.value->as.field.base &&
+                expr->as.unary.value->as.field.base->kind == AST_EXPR_NAME &&
+                strcmp(expr->as.unary.value->as.field.base->as.name, "self") == 0) {
+                return fail(ctx, "init self field address escape");
+            }
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.unary.value, field_state);
+        case AST_EXPR_IMPLICIT:
+            if (!expr->as.implicit.target_is_type &&
+                expr->as.implicit.value_target &&
+                expr->as.implicit.value_target->kind == AST_EXPR_FIELD &&
+                expr->as.implicit.value_target->as.field.base &&
+                expr->as.implicit.value_target->as.field.base->kind == AST_EXPR_NAME &&
+                strcmp(expr->as.implicit.value_target->as.field.base->as.name, "self") == 0 &&
+                expr->as.implicit.member &&
+                (strcmp(expr->as.implicit.member, "ptr") == 0 ||
+                 strcmp(expr->as.implicit.member, "ref") == 0 ||
+                 strcmp(expr->as.implicit.member, "addr") == 0)) {
+                return fail(ctx, "init self field address escape");
+            }
+            return validate_struct_init_expr(ctx, struct_decl, expr->as.implicit.value_target, field_state);
         case AST_EXPR_BINARY:
             return validate_struct_init_expr(ctx, struct_decl, expr->as.binary.left, field_state) &&
                    validate_struct_init_expr(ctx, struct_decl, expr->as.binary.right, field_state);

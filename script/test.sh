@@ -160,6 +160,7 @@ run_sample mod_minimal.jiang 2
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
 run_sample pointer_default_field_minimal.jiang 0
+run_compile_fail invalid_init_self_field_ptr_escape.jiang
 run_sample pointer_offset_uint8_minimal.jiang 101
 run_sample pointer_offset_int_minimal.jiang 42
 run_sample many_pointer_assign_minimal.jiang 10
