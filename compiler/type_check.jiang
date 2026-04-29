@@ -1,0 +1,307 @@
+import "./ast.jiang";
+import "./context.jiang";
+import "./resolve.jiang";
+import types = "./type.jiang";
+import "./token.jiang";
+
+public struct TypeCheckResult {
+    public types.TypeTable! types;
+    public Int! checked_global_count;
+    public Int! checked_initializer_count;
+    public Int! mismatch_count;
+    public Int! unknown_type_count;
+
+    public init(context.CompilerContext* ctx) {
+        self.types = types.TypeTable(ctx.ast_store_ptr());
+        self.checked_global_count = 0;
+        self.checked_initializer_count = 0;
+        self.mismatch_count = 0;
+        self.unknown_type_count = 0;
+    }
+}
+
+public struct TypeChecker {
+    context.CompilerContext* ctx;
+    resolve.ResolveResult* resolved;
+    TypeCheckResult! result;
+    Int! resolved_path_index;
+
+    public init(context.CompilerContext* ctx, resolve.ResolveResult* resolved) {
+        self.ctx = ctx;
+        self.resolved = resolved;
+        self.result = TypeCheckResult(ctx);
+        self.resolved_path_index = 0;
+    }
+
+    public TypeCheckResult check(ast.AstFile* file) {
+        Int! index = 0;
+        while (index < file.len()) {
+            ast.AstDecl decl = file.decl_at(index);
+            self.check_decl(decl);
+            index = index + 1;
+        }
+        return self.result;
+    }
+
+    () check_decl(ast.AstDecl decl) {
+        if (decl is .alias_decl(alias_decl)) {
+            self.type_from_ast(alias_decl.target);
+            return;
+        }
+        if (decl is .global_decl(global_decl)) {
+            self.check_global(global_decl);
+            return;
+        }
+        if (decl is .function_decl(function_decl)) {
+            self.check_function_signature(function_decl);
+            return;
+        }
+        if (decl is .struct_decl(struct_decl)) {
+            self.check_struct(struct_decl);
+            return;
+        }
+        if (decl is .union_decl(union_decl)) {
+            self.check_union(union_decl);
+            return;
+        }
+        if (decl is .trait_decl(trait_decl)) {
+            self.check_trait(trait_decl);
+            return;
+        }
+        if (decl is .extend_decl(extend_decl)) {
+            self.type_from_ast(extend_decl.target);
+            return;
+        }
+    }
+
+    () check_global(ast.GlobalDecl decl) {
+        types.TypeId declared_type = self.type_from_ast(decl.type_ref);
+        self.result.checked_global_count = self.result.checked_global_count + 1;
+        if (decl.initializer is some initializer) {
+            self.result.checked_initializer_count = self.result.checked_initializer_count + 1;
+            self.check_initializer(declared_type, initializer);
+        }
+    }
+
+    () check_function_signature(ast.FunctionDecl decl) {
+        Int! index = 0;
+        while (index < decl.params.len()) {
+            ast.Param param = decl.params[index];
+            self.type_from_ast(param.type_ref);
+            index = index + 1;
+        }
+        self.type_from_ast(decl.result);
+    }
+
+    () check_struct(ast.StructDecl decl) {
+        Int! index = 0;
+        while (index < decl.fields.len()) {
+            ast.FieldDecl field = decl.fields[index];
+            self.type_from_ast(field.type_ref);
+            index = index + 1;
+        }
+    }
+
+    () check_union(ast.UnionDecl decl) {
+        Int! index = 0;
+        while (index < decl.variants.len()) {
+            ast.UnionVariant variant = decl.variants[index];
+            self.type_from_ast(variant.type_ref);
+            index = index + 1;
+        }
+    }
+
+    () check_trait(ast.TraitDecl decl) {
+        Int! index = 0;
+        while (index < decl.methods.len()) {
+            ast.TraitMethod method = decl.methods[index];
+            self.check_function_signature(method.signature);
+            index = index + 1;
+        }
+    }
+
+    types.TypeId type_from_ast(ast.AstType type_ref) {
+        if (type_ref is .infer(span)) {
+            return self.result.types.make_infer(span);
+        }
+        if (type_ref is .unit(span)) {
+            return self.result.types.make_unit(span);
+        }
+        if (type_ref is .named(named)) {
+            return self.type_from_named(named);
+        }
+        if (type_ref is .tuple(tuple)) {
+            return self.type_from_tuple(tuple);
+        }
+        if (type_ref is .function(function)) {
+            return self.type_from_function(function);
+        }
+        if (type_ref is .pointer(pointer)) {
+            types.TypeId element = self.type_from_ast(pointer.element);
+            return self.result.types.make_pointer(pointer.span, element, pointer.mutable_item, pointer.many);
+        }
+        if (type_ref is .slice(slice)) {
+            types.TypeId element = self.type_from_ast(slice.element);
+            return self.result.types.make_slice(slice.span, element);
+        }
+        if (type_ref is .array(array)) {
+            types.TypeId element = self.type_from_ast(array.element);
+            return self.result.types.make_array(array.span, element, self.array_count_inferred(array.count));
+        }
+        if (type_ref is .layer(layer)) {
+            types.TypeId element = self.type_from_ast(layer.element);
+            return self.result.types.make_layer(layer.span, element, layer.flags.optional, layer.flags.mutable);
+        }
+        if (type_ref is .errorable(errorable)) {
+            types.TypeId value = self.type_from_ast(errorable.value);
+            types.TypeId error = self.type_from_ast(errorable.error);
+            return self.result.types.make_errorable(errorable.span, value, error);
+        }
+        return self.result.types.make_invalid(token.Span());
+    }
+
+    types.TypeId type_from_named(ast.NamedType named) {
+        resolve.ResolvedTypePath? resolved_path = self.next_resolved_type_path();
+        if (resolved_path == null) {
+            self.result.unknown_type_count = self.result.unknown_type_count + 1;
+            return self.result.types.make_invalid(named.span);
+        }
+
+        resolve.ResolvedTypePath path = resolved_path$.some();
+        types.TypeId base = self.type_from_resolved_path(named, path);
+        Int! index = 0;
+        while (index < named.args.len()) {
+            self.type_from_ast(named.args[index]);
+            index = index + 1;
+        }
+        return base;
+    }
+
+    types.TypeId type_from_resolved_path(ast.NamedType named, resolve.ResolvedTypePath path) {
+        ast.Name last = named.path.segments[named.path.segment_len() - 1];
+        if (path.kind == .builtin_type) {
+            return self.result.types.make_builtin(named.span, last.symbol);
+        }
+        if (path.binding is some binding) {
+            return self.result.types.make_nominal(named.span, last.symbol, binding.binding_id);
+        }
+        self.result.unknown_type_count = self.result.unknown_type_count + 1;
+        return self.result.types.make_invalid(named.span);
+    }
+
+    types.TypeId type_from_tuple(ast.TupleType tuple) {
+        Int child_start = self.result.types.begin_children();
+        Int! index = 0;
+        while (index < tuple.items.len()) {
+            self.result.types.add_child(self.type_from_ast(tuple.items[index]));
+            index = index + 1;
+        }
+        return self.result.types.make_compound(.tuple, tuple.span, child_start, tuple.items.len());
+    }
+
+    types.TypeId type_from_function(ast.FunctionType function) {
+        Int child_start = self.result.types.begin_children();
+        Int! index = 0;
+        while (index < function.params.len()) {
+            self.result.types.add_child(self.type_from_ast(function.params[index]));
+            index = index + 1;
+        }
+        self.result.types.add_child(self.type_from_ast(function.result));
+        return self.result.types.make_compound(.function, function.span, child_start, function.params.len() + 1);
+    }
+
+    resolve.ResolvedTypePath? next_resolved_type_path() {
+        if (self.resolved_path_index >= self.resolved.resolved_type_path_count()) {
+            return null;
+        }
+        resolve.ResolvedTypePath path = self.resolved.resolved_type_path_at(self.resolved_path_index);
+        self.resolved_path_index = self.resolved_path_index + 1;
+        return path;
+    }
+
+    Bool array_count_inferred(ast.AstExpr count) {
+        if (count is .implicit_value(_)) {
+            return true;
+        }
+        return false;
+    }
+
+    () check_initializer(types.TypeId declared_type, ast.AstExpr initializer) {
+        if (self.result.types.is_invalid(declared_type)) {
+            return;
+        }
+        if (initializer is .literal(_ literal)) {
+            if (!self.literal_compatible(declared_type, literal)) {
+                self.result.mismatch_count = self.result.mismatch_count + 1;
+                self.ctx.diagnostics.add_error(self.literal_span(literal), "initializer literal does not match declared type");
+            }
+        }
+    }
+
+    Bool literal_compatible(types.TypeId expected, ast.Literal literal) {
+        if (literal is .int_lit(_)) {
+            return self.int_literal_compatible(expected);
+        }
+        if (literal is .float_lit(_)) {
+            return self.float_literal_compatible(expected);
+        }
+        if (literal is .char_lit(_)) {
+            return self.char_literal_compatible(expected);
+        }
+        if (literal is .string_lit(_)) {
+            return self.string_literal_compatible(expected);
+        }
+        if (literal is .bool_lit(_)) {
+            return self.result.types.is_builtin_named(expected, self.ctx.symbols, "Bool");
+        }
+        if (literal is .null_lit(_)) {
+            return self.result.types.is_optional(expected);
+        }
+        return true;
+    }
+
+    Bool int_literal_compatible(types.TypeId expected) {
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Int")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Int8")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Int16")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Int32")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Int64")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "UInt8")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "UInt16")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "UInt32")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "UInt64")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Float")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Double")) { return true; }
+        return self.result.types.is_optional(expected);
+    }
+
+    Bool float_literal_compatible(types.TypeId expected) {
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Float")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Double")) { return true; }
+        return self.result.types.is_optional(expected);
+    }
+
+    Bool char_literal_compatible(types.TypeId expected) {
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "Char")) { return true; }
+        if (self.result.types.is_builtin_named(expected, self.ctx.symbols, "UInt8")) { return true; }
+        return self.result.types.is_optional(expected);
+    }
+
+    Bool string_literal_compatible(types.TypeId expected) {
+        types.TypeInfo info = self.result.types.type_at(expected);
+        if (info.kind != .slice) {
+            return false;
+        }
+        return self.result.types.is_builtin_named(info.element, self.ctx.symbols, "UInt8");
+    }
+
+    token.Span literal_span(ast.Literal literal) {
+        token.Span![*] spans = literal$.ptr()$.as(token.Span![*]);
+        return spans[0];
+    }
+}
+
+public TypeCheckResult check_file(context.CompilerContext* ctx, ast.AstFile* file, resolve.ResolveResult* resolved) {
+    TypeChecker! checker = TypeChecker(ctx, resolved);
+    return checker.check(file);
+}
