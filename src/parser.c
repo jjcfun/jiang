@@ -341,6 +341,10 @@ static int is_type_like_ident(const Token* token) {
             token->start[0] <= 'Z');
 }
 
+static int is_optional_some_token(const Token* token) {
+    return token->kind == TOKEN_IDENT && token_equals(token, "some");
+}
+
 static int text_is_ident_name(const char* text) {
     const unsigned char* p = (const unsigned char*)text;
     if (!text || !*text) {
@@ -1472,6 +1476,8 @@ static int looks_like_variant_pattern_expr(Parser* parser) {
 static AstExpr* parse_postfix(Parser* parser);
 static AstExpr* parse_unary(Parser* parser);
 static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag);
+static int looks_like_optional_some_pattern(Parser* parser);
+static AstExpr* parse_optional_some_pattern(Parser* parser);
 
 static AstExpr* parse_expr(Parser* parser);
 static AstExpr* parse_expr_stmt_target(Parser* parser);
@@ -1648,7 +1654,9 @@ static AstExpr* parse_switch_expr(Parser* parser) {
             switch_case.is_else = 1;
             advance(parser);
         } else {
-            if (looks_like_variant_pattern_expr(parser)) {
+            if (looks_like_optional_some_pattern(parser)) {
+                switch_case.pattern = parse_optional_some_pattern(parser);
+            } else if (looks_like_variant_pattern_expr(parser)) {
                 switch_case.pattern = parse_variant_expr(parser, 1);
             } else {
                 switch_case.pattern = parse_expr(parser);
@@ -1824,6 +1832,45 @@ static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag) {
     }
     if (!expect(parser, TOKEN_RIGHT_PAREN, "expected ')' after variant constructor")) {
         return 0;
+    }
+    return expr;
+}
+
+static int looks_like_optional_some_pattern(Parser* parser) {
+    if (!is_optional_some_token(&parser->current)) {
+        return 0;
+    }
+    return parser->next.kind == TOKEN_IDENT ||
+           parser->next.kind == TOKEN_BANG ||
+           parser->next.kind == TOKEN_FAT_ARROW ||
+           parser->next.kind == TOKEN_RIGHT_PAREN;
+}
+
+static AstExpr* parse_optional_some_pattern(Parser* parser) {
+    AstExpr* expr = new_expr(AST_EXPR_VARIANT, parser->current.line);
+    int mutable_binding = 0;
+    expr->as.variant.union_name = strdup("Option");
+    expr->as.variant.variant_name = strdup("some");
+    expr->as.variant.pattern_flag = 1;
+    advance(parser);
+    if (parser->current.kind == TOKEN_BANG) {
+        mutable_binding = 1;
+        advance(parser);
+        if (parser->current.kind != TOKEN_IDENT) {
+            fail(parser, "expected optional payload binding name");
+            return 0;
+        }
+    }
+    if (parser->current.kind == TOKEN_IDENT) {
+        AstBindingPattern* binding = new_binding_pattern(AST_BINDING_NAME, parser->current.line);
+        if (!binding) {
+            return 0;
+        }
+        binding->type.kind = AST_TYPE_INFER;
+        binding->type.mutable_flag = mutable_binding;
+        binding->name = token_dup(&parser->current);
+        binding_pattern_list_push(&expr->as.variant.bindings, binding);
+        advance(parser);
     }
     return expr;
 }
@@ -2617,11 +2664,14 @@ static AstExpr* parse_equality(Parser* parser) {
         if (parser->current.kind == TOKEN_KW_IS) {
             bin->as.binary.op = AST_BIN_IS;
             advance(parser);
-            if (!looks_like_variant_pattern_expr(parser)) {
-                fail(parser, "expected variant pattern after 'is'");
+            if (looks_like_optional_some_pattern(parser)) {
+                right = parse_optional_some_pattern(parser);
+            } else if (looks_like_variant_pattern_expr(parser)) {
+                right = parse_variant_expr(parser, 1);
+            } else {
+                fail(parser, "expected pattern after 'is'");
                 return 0;
             }
-            right = parse_variant_expr(parser, 1);
         } else {
             bin->as.binary.op = parser->current.kind == TOKEN_EQ_EQ ? AST_BIN_EQ : AST_BIN_NE;
             advance(parser);
@@ -2956,7 +3006,9 @@ static AstStmt* parse_stmt(Parser* parser) {
                 switch_case.is_else = 1;
                 advance(parser);
             } else {
-                if (looks_like_variant_pattern_expr(parser)) {
+                if (looks_like_optional_some_pattern(parser)) {
+                    switch_case.pattern = parse_optional_some_pattern(parser);
+                } else if (looks_like_variant_pattern_expr(parser)) {
                     switch_case.pattern = parse_variant_expr(parser, 1);
                 } else {
                     switch_case.pattern = parse_expr(parser);
