@@ -319,9 +319,10 @@ Package/module 依赖图。
 - 只支持内存 source registry，不做 filesystem/package discovery。
 - import path 不做规范化，也不解码 string escape。
 - import cycle 会在触发循环的 import span 上报错，并对已知的循环边补充 note；后续应输出完整格式化 cycle path。
-- import resolve 只使用被导入模块的 export scope；private top-level declaration 不会跨模块可见。
-- `public import` 会把被导入模块的 export scope 合并进当前模块 export scope。
-- import alias 可以用于解析 `alias.Name`，目标只查被导入模块的 export scope。
+- import resolve 会为每条 import 绑定一个模块名；显式 alias 优先，否则从 import path 的文件名推导默认模块名。
+- `module.Name` 只查询被导入模块的 export scope；private top-level declaration 不会跨模块可见。
+- 普通 import 不会把被导入模块的 public name 平铺到当前模块。
+- `public import` 当前会把被导入模块的 export scope 合并进当前模块 export scope；完整模块名 re-export 规则后续继续细化。
 - package dependency 和跨 package visibility 尚未接入。
 - 多个 import 导出同名声明时，当前 resolve 还没有 ambiguity diagnostic。
 - package manifest、module name、source root 和跨 package dependency 尚未接入。
