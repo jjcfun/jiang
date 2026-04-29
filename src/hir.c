@@ -6975,8 +6975,18 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
     if (!variant) {
         return 0;
     }
-    if (value->type->kind != HIR_TYPE_UNION || value->type->union_decl != union_decl) {
+    if (value->type->kind != HIR_TYPE_UNION ||
+        !value->type->union_decl ||
+        !union_decl ||
+        !nominal_names_equivalent(value->type->union_decl->name, union_decl->name)) {
         return fail(ctx, "union pattern type mismatch");
+    }
+    if (value->type->union_decl != union_decl) {
+        variant = find_union_variant(value->type->union_decl, pattern->as.variant.variant_name);
+        if (!variant) {
+            return fail(ctx, "unknown union variant");
+        }
+        union_decl = value->type->union_decl;
     }
     cond = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), pattern->line);
     cond->as.binary.op = HIR_BIN_EQ;
