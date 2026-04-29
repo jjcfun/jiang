@@ -265,6 +265,8 @@ Package/module 依赖图。
 - `add_source(path, text)` 注册一个 source，并返回 `SourceId`。
 - `parse(id)` 确保对应 module 被解析为 AST。
 - `resolve_root(id)` 从 root module 开始递归解析 import，并按依赖优先顺序运行 resolve。
+- `resolve_order_len()` / `resolve_order_at(index)` 暴露已经 resolved 的 dependency-first 顺序。
+- 每条 import 边会记录目标 module 和源码 span；同一个 module 内重复 import 同一 source 时只保留一条边。
 - import path 当前来自 `import "path"` 的 string literal span，去掉首尾引号后按 `path` 精确匹配已注册 source。
 
 当前依赖解析使用 DFS 加 module state，等价于三色标记：
@@ -273,6 +275,7 @@ Package/module 依赖图。
 - `parsed`：module 已经 parse，import 已收集，但还未 resolve。
 - `resolving`：module 正在 DFS 栈中，用于发现 import cycle。
 - `resolved`：module 及其直接/间接依赖已经 resolve。
+- `failed`：module 的依赖解析失败，例如 import cycle。失败 module 不进入 `resolve_order`。
 
 `resolve_root(root)` 的核心流程：
 
@@ -283,13 +286,13 @@ Package/module 依赖图。
 5. resolve 当前 module 的 AST。
 6. 标记为 `resolved`。
 
-这个算法的目标复杂度是 `O(V + E)`，其中 `V` 是 root 可达 module 数量，`E` 是 import 边数量。后续如果需要显式调度列表，可以在 DFS 完成后保存 dependency-first topo order，供 type check、HIR lowering、JIR lowering 和 backend 复用。
+这个算法的目标复杂度是 `O(V + E)`，其中 `V` 是 root 可达 module 数量，`E` 是 import 边数量。每个 module resolve 成功后会追加到 `resolve_order`，因此该列表天然是 dependency-first order，可供后续 type check、HIR lowering、JIR lowering 和 backend 调度复用。
 
 当前限制：
 
 - 只支持内存 source registry，不做 filesystem/package discovery。
 - import path 不做规范化，也不解码 string escape。
-- import cycle 只报告最小错误，后续应输出完整 cycle path。
+- import cycle 会在触发循环的 import span 上报错，并对已知的循环边补充 note；后续应输出完整格式化 cycle path。
 - 直接 import 的 top-level scope 会整体加入当前 resolver；尚未实现 public/private 导出规则、re-export 和 import alias lookup。
 - `public import` 是语言目标语法，但当前 stage1 parser 暂时禁用；ModuleGraph 后续需要区分普通 import、re-export import 和 package dependency。
 - 多个 import 导出同名声明时，当前 resolve 还没有 ambiguity diagnostic。

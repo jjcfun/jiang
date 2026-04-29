@@ -14,6 +14,7 @@ public enum ModuleState {
     parsed,
     resolving,
     resolved,
+    failed,
 }
 
 public struct Module {
@@ -21,18 +22,32 @@ public struct Module {
     public ast.AstFile! ast_file;
     public resolve.ResolveResult! result;
     public list.ArenaList<Module!*> imports;
+    public list.ArenaList<token.Span> import_spans;
     public ModuleState! state;
+    public Module!*?! resolving_parent;
+    public token.Span! resolving_import_span;
 
     public init(arena.Arena* store, source.SourceFile source_file) {
         self.source_file = source_file;
         self.ast_file = ast.AstFile(store);
         self.result = resolve.ResolveResult(store);
         self.imports = list.ArenaList<Module!*>(store);
+        self.import_spans = list.ArenaList<token.Span>(store);
         self.state = .empty;
+        self.resolving_parent = null;
+        self.resolving_import_span = token.Span();
     }
 
     public Int import_count() {
         return self.imports.len();
+    }
+
+    public Module!* import_at(Int index) {
+        return self.imports[index];
+    }
+
+    public token.Span import_span_at(Int index) {
+        return self.import_spans[index];
     }
 }
 
@@ -41,12 +56,14 @@ public struct ModuleGraph {
     arena.Arena* store;
     list.ArenaList<source.SourceFile> sources;
     list.ArenaList<Module!*> modules;
+    list.ArenaList<Module!*> resolve_order;
 
     public init(context.CompilerContext* ctx) {
         self.ctx = ctx;
         self.store = ctx.ast_store_ptr();
         self.sources = list.ArenaList<source.SourceFile>(self.store);
         self.modules = list.ArenaList<Module!*>(self.store);
+        self.resolve_order = list.ArenaList<Module!*>(self.store);
     }
 
     public source.SourceId add_source(UInt8[] path, UInt8[] text) {
@@ -65,6 +82,14 @@ public struct ModuleGraph {
 
     public Module!* module_at(Int index) {
         return self.modules[index];
+    }
+
+    public Int resolve_order_len() {
+        return self.resolve_order.len();
+    }
+
+    public Module!* resolve_order_at(Int index) {
+        return self.resolve_order[index];
     }
 
     public Module!*? module_for_source(source.SourceId id) {
@@ -87,7 +112,7 @@ public struct ModuleGraph {
 
     public Module!* resolve_root(source.SourceId id) {
         Module!* module = self.ensure_module(id);
-        self.resolve_module(module);
+        self.resolve_module(module, null, token.Span());
         return module;
     }
 
@@ -158,8 +183,27 @@ public struct ModuleGraph {
                 return;
             }
             Module!* imported_module = self.ensure_module(imported_source$.some());
-            module.imports.add(imported_module);
+            self.add_import(module, imported_module, import_decl.path);
         }
+    }
+
+    () add_import(Module!* module, Module!* imported_module, token.Span span) {
+        if (self.has_import(module, imported_module)) {
+            return;
+        }
+        module.imports.add(imported_module);
+        module.import_spans.add(span);
+    }
+
+    Bool has_import(Module!* module, Module!* imported_module) {
+        Int! index = 0;
+        while (index < module.imports.len()) {
+            if (self.same_module(module.imports[index], imported_module)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     UInt8[] import_path(Module!* module, token.Span span) {
@@ -169,18 +213,29 @@ public struct ModuleGraph {
         return module.source_file.text[span.start + 1 .. span.end() - 1];
     }
 
-    () resolve_module(Module!* module) {
+    Bool resolve_module(Module!* module, Module!*? parent, token.Span import_span) {
         if (module.state == .resolved) {
-            return;
+            return true;
+        }
+        if (module.state == .failed) {
+            return false;
         }
         if (module.state == .resolving) {
-            self.ctx.diagnostics.add_error(token.Span(), "cyclic import");
-            return;
+            self.report_cycle(module, parent, import_span);
+            return false;
         }
 
         self.parse_module(module);
         module.state = .resolving;
-        self.resolve_imports(module);
+        module.resolving_parent = parent;
+        module.resolving_import_span = import_span;
+
+        if (!self.resolve_imports(module)) {
+            module.state = .failed;
+            module.resolving_parent = null;
+            module.resolving_import_span = token.Span();
+            return false;
+        }
 
         resolve.Resolver! resolver = resolve.Resolver(self.ctx);
         Int! index = 0;
@@ -192,13 +247,45 @@ public struct ModuleGraph {
 
         module.result = resolver.resolve(module.ast_file$.ptr());
         module.state = .resolved;
+        module.resolving_parent = null;
+        module.resolving_import_span = token.Span();
+        self.resolve_order.add(module);
+        return true;
     }
 
-    () resolve_imports(Module!* module) {
+    Bool resolve_imports(Module!* module) {
+        Bool! success = true;
         Int! index = 0;
         while (index < module.imports.len()) {
-            self.resolve_module(module.imports[index]);
+            Module!* imported_module = module.imports[index];
+            token.Span import_span = module.import_spans[index];
+            if (!self.resolve_module(imported_module, module, import_span)) {
+                success = false;
+            }
             index = index + 1;
         }
+        return success;
+    }
+
+    () report_cycle(Module!* target, Module!*? importer, token.Span span) {
+        self.ctx.diagnostics.add_error(span, "cyclic import");
+        if (importer == null) {
+            return;
+        }
+
+        Module!*?! current = importer;
+        while (current is some item) {
+            if (self.same_module(item, target)) {
+                return;
+            }
+            if (!item.resolving_import_span.is_empty()) {
+                self.ctx.diagnostics.add(.note, item.resolving_import_span, "imported here");
+            }
+            current = item.resolving_parent;
+        }
+    }
+
+    Bool same_module(Module!* left, Module!* right) {
+        return left.source_file.id.equal(right.source_file.id);
     }
 }
