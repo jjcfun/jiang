@@ -460,6 +460,7 @@ run_sample union_bind_minimal.jiang 42
 run_sample union_if_pattern_minimal.jiang 42
 run_sample union_if_mutable_binding_minimal.jiang 42
 run_sample union_if_shorthand_pattern_minimal.jiang 42
+run_sample union_pattern_expected_type_minimal.jiang 42
 run_sample union_switch_mutable_binding_minimal.jiang 42
 run_sample union_switch_shorthand_pattern_minimal.jiang 42
 run_compile_fail invalid_tuple_index_non_literal.jiang

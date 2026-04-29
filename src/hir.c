@@ -6948,6 +6948,14 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
     HirUnionVariant* variant = 0;
     HirExpr* cond = 0;
     int i = 0;
+    if (value->type &&
+        (value->type->kind == HIR_TYPE_REFERENCE || value->type->kind == HIR_TYPE_POINTER) &&
+        value->type->array_item &&
+        value->type->array_item->kind == HIR_TYPE_UNION) {
+        HirExpr* deref = new_expr(HIR_EXPR_DEREF, value->type->array_item, pattern->line);
+        deref->as.unary.value = value;
+        value = deref;
+    }
     if (value->type->kind == HIR_TYPE_OPTIONAL &&
         (!pattern->as.variant.union_name || strcmp(pattern->as.variant.union_name, "Option") == 0)) {
         HirExpr* some_value = 0;
@@ -6971,9 +6979,17 @@ static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const A
         }
         return lower_pattern_bind(ctx, pattern->as.variant.bindings.items[0], some_value, out_block);
     }
-    variant = resolve_variant_expr(ctx, pattern, &union_decl);
-    if (!variant) {
-        return 0;
+    if (value->type->kind == HIR_TYPE_UNION && value->type->union_decl && !pattern->as.variant.union_name) {
+        union_decl = value->type->union_decl;
+        variant = find_union_variant(union_decl, pattern->as.variant.variant_name);
+        if (!variant) {
+            return fail(ctx, "unknown union variant");
+        }
+    } else {
+        variant = resolve_variant_expr(ctx, pattern, &union_decl);
+        if (!variant) {
+            return 0;
+        }
     }
     if (value->type->kind != HIR_TYPE_UNION ||
         !value->type->union_decl ||
