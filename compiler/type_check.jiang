@@ -6,21 +6,98 @@ import types = "./type.jiang";
 import "./token.jiang";
 import list = "./support/list.jiang";
 
+public struct ExprType {
+    public ast.AstExpr* expr;
+    public types.TypeId type_id;
+
+    public init(ast.AstExpr* expr, types.TypeId type_id) {
+        self.expr = expr;
+        self.type_id = type_id;
+    }
+}
+
+public struct BindingType {
+    public scope.BindingId binding_id;
+    public types.TypeId type_id;
+
+    public init(scope.BindingId binding_id, types.TypeId type_id) {
+        self.binding_id = binding_id;
+        self.type_id = type_id;
+    }
+}
+
+public struct LocalType {
+    public scope.LocalBindingId local_id;
+    public ast.Name name;
+    public types.TypeId type_id;
+    public Bool mutable_binding;
+
+    public init(scope.LocalBindingId local_id, ast.Name name, types.TypeId type_id, Bool mutable_binding) {
+        self.local_id = local_id;
+        self.name = name;
+        self.type_id = type_id;
+        self.mutable_binding = mutable_binding;
+    }
+}
+
 public struct TypeCheckResult {
     public types.TypeTable! types;
+    public list.ArenaList<ExprType> expr_types;
+    public list.ArenaList<BindingType> binding_types;
+    public list.ArenaList<LocalType> local_types;
     public Int! checked_global_count;
     public Int! checked_initializer_count;
+    public Int! checked_function_count;
+    public Int! checked_stmt_count;
+    public Int! checked_expr_count;
     public Int! mismatch_count;
     public Int! unknown_type_count;
     public Int! alias_cycle_count;
 
     public init(context.CompilerContext* ctx) {
         self.types = types.TypeTable(ctx.ast_store_ptr());
+        self.expr_types = list.ArenaList<ExprType>(ctx.ast_store_ptr());
+        self.binding_types = list.ArenaList<BindingType>(ctx.ast_store_ptr());
+        self.local_types = list.ArenaList<LocalType>(ctx.ast_store_ptr());
         self.checked_global_count = 0;
         self.checked_initializer_count = 0;
+        self.checked_function_count = 0;
+        self.checked_stmt_count = 0;
+        self.checked_expr_count = 0;
         self.mismatch_count = 0;
         self.unknown_type_count = 0;
         self.alias_cycle_count = 0;
+    }
+
+    public () add_expr_type(ast.AstExpr* expr, types.TypeId type_id) {
+        self.expr_types.add(ExprType(expr, type_id));
+    }
+
+    public () add_binding_type(scope.BindingId binding_id, types.TypeId type_id) {
+        Int! index = 0;
+        while (index < self.binding_types.len()) {
+            if (self.binding_types[index].binding_id.id == binding_id.id) {
+                return;
+            }
+            index = index + 1;
+        }
+        self.binding_types.add(BindingType(binding_id, type_id));
+    }
+
+    public () add_local_type(scope.LocalBindingId local_id, ast.Name name, types.TypeId type_id, Bool mutable_binding) {
+        self.local_types.add(LocalType(local_id, name, type_id, mutable_binding));
+    }
+
+    public types.TypeId lookup_binding_type(scope.BindingId binding_id) {
+        Int! index = 0;
+        while (index < self.binding_types.len()) {
+            BindingType typed = self.binding_types[index];
+            if (typed.binding_id.id == binding_id.id) {
+                return typed.type_id;
+            }
+            index = index + 1;
+        }
+        return types.TypeId();
     }
 }
 
@@ -30,6 +107,9 @@ public struct TypeChecker {
     TypeCheckResult! result;
     ast.AstFile*?! file;
     list.ArenaList<Int> resolving_aliases;
+    list.ArenaList<LocalType> active_locals;
+    list.ArenaList<Int> local_scope_starts;
+    types.TypeId! current_return_type;
 
     public init(context.CompilerContext* ctx, resolve.ResolveResult* resolved) {
         self.ctx = ctx;
@@ -37,11 +117,19 @@ public struct TypeChecker {
         self.result = TypeCheckResult(ctx);
         self.file = null;
         self.resolving_aliases = list.ArenaList<Int>(ctx.ast_store_ptr());
+        self.active_locals = list.ArenaList<LocalType>(ctx.ast_store_ptr());
+        self.local_scope_starts = list.ArenaList<Int>(ctx.ast_store_ptr());
+        self.current_return_type = types.TypeId();
     }
 
     public TypeCheckResult check(ast.AstFile* file) {
         self.file = file;
         Int! index = 0;
+        while (index < file.len()) {
+            self.declare_decl_type(file.decl_at(index));
+            index = index + 1;
+        }
+        index = 0;
         while (index < file.len()) {
             ast.AstDecl decl = file.decl_at(index);
             self.check_decl(decl);
@@ -50,9 +138,65 @@ public struct TypeChecker {
         return self.result;
     }
 
+    () declare_decl_type(ast.AstDecl decl) {
+        if (decl is .alias_decl(alias_decl)) {
+            self.declare_named_binding(alias_decl.name, self.type_from_ast(alias_decl.target));
+            return;
+        }
+        if (decl is .global_decl(global_decl)) {
+            self.declare_named_binding(global_decl.name, self.type_from_ast(global_decl.type_ref));
+            return;
+        }
+        if (decl is .function_decl(function_decl)) {
+            self.declare_named_binding(function_decl.name, self.function_type(function_decl));
+            return;
+        }
+        if (decl is .struct_decl(struct_decl)) {
+            self.declare_named_binding(struct_decl.name, self.nominal_type(struct_decl.name, .struct_decl));
+            return;
+        }
+        if (decl is .enum_decl(enum_decl)) {
+            self.declare_named_binding(enum_decl.name, self.nominal_type(enum_decl.name, .enum_decl));
+            return;
+        }
+        if (decl is .union_decl(union_decl)) {
+            self.declare_named_binding(union_decl.name, self.nominal_type(union_decl.name, .union_decl));
+            return;
+        }
+        if (decl is .trait_decl(trait_decl)) {
+            self.declare_named_binding(trait_decl.name, self.nominal_type(trait_decl.name, .trait_decl));
+            return;
+        }
+    }
+
+    () declare_named_binding(ast.Name name, types.TypeId type_id) {
+        scope.Binding? binding = self.resolved.lookup_top_level_id(name.symbol.id);
+        if (binding is some resolved_binding) {
+            self.result.add_binding_type(resolved_binding.binding_id, type_id);
+        }
+    }
+
+    types.TypeId nominal_type(ast.Name name, types.NominalKind nominal_kind) {
+        scope.Binding? binding = self.resolved.lookup_top_level_id(name.symbol.id);
+        if (binding is some resolved_binding) {
+            return self.result.types.make_nominal(name.span, name.symbol, resolved_binding.binding_id, nominal_kind);
+        }
+        return self.result.types.make_invalid(name.span);
+    }
+
+    types.TypeId function_type(ast.FunctionDecl decl) {
+        Int child_start = self.result.types.begin_children();
+        Int! index = 0;
+        while (index < decl.params.len()) {
+            self.result.types.add_child(self.type_from_ast(decl.params[index].type_ref));
+            index = index + 1;
+        }
+        self.result.types.add_child(self.type_from_ast(decl.result));
+        return self.result.types.make_compound(.function, decl.span, child_start, decl.params.len() + 1);
+    }
+
     () check_decl(ast.AstDecl decl) {
         if (decl is .alias_decl(alias_decl)) {
-            self.type_from_ast(alias_decl.target);
             return;
         }
         if (decl is .global_decl(global_decl)) {
@@ -91,21 +235,54 @@ public struct TypeChecker {
     }
 
     () check_function_signature(ast.FunctionDecl decl) {
-        self.type_from_ast(decl.result);
+        self.function_type(decl);
+        if (decl.body is some body) {
+            self.check_function_body(decl, body);
+        }
+    }
+
+    () check_function_body(ast.FunctionDecl decl, ast.Block body) {
+        self.result.checked_function_count = self.result.checked_function_count + 1;
+        types.TypeId previous_return_type = self.current_return_type;
+        self.current_return_type = self.type_from_ast(decl.result);
+        self.enter_local_scope();
         Int! index = 0;
         while (index < decl.params.len()) {
             ast.Param param = decl.params[index];
-            self.type_from_ast(param.type_ref);
+            self.define_local_type(param.name, self.type_from_ast(param.type_ref), param.mutable_binding);
             index = index + 1;
         }
+        self.check_block(body);
+        self.exit_local_scope();
+        self.current_return_type = previous_return_type;
     }
 
     () check_struct(ast.StructDecl decl) {
         Int! index = 0;
         while (index < decl.fields.len()) {
             ast.FieldDecl field = decl.fields[index];
-            self.type_from_ast(field.type_ref);
+            types.TypeId field_type = self.type_from_ast(field.type_ref);
+            if (field.default_value is some default_value) {
+                self.check_initializer(field_type, default_value);
+            }
             index = index + 1;
+        }
+        index = 0;
+        while (index < decl.inits.len()) {
+            ast.InitDecl init_decl = decl.inits[index];
+            self.enter_local_scope();
+            Int! param_index = 0;
+            while (param_index < init_decl.params.len()) {
+                ast.Param param = init_decl.params[param_index];
+                self.define_local_type(param.name, self.type_from_ast(param.type_ref), param.mutable_binding);
+                param_index = param_index + 1;
+            }
+            self.check_block(init_decl.body);
+            self.exit_local_scope();
+            index = index + 1;
+        }
+        if (decl.deinit_body is some deinit_body) {
+            self.check_block(deinit_body);
         }
     }
 
@@ -120,11 +297,885 @@ public struct TypeChecker {
 
     () check_trait(ast.TraitDecl decl) {
         Int! index = 0;
+        while (index < decl.assoc_types.len()) {
+            ast.AssocTypeDecl assoc = decl.assoc_types[index];
+            Int! where_index = 0;
+            while (where_index < assoc.where_constraints.len()) {
+                ast.WhereConstraint constraint = assoc.where_constraints[where_index];
+                if (constraint.equal_type is some equal_type) {
+                    self.type_from_ast(equal_type);
+                }
+                where_index = where_index + 1;
+            }
+            index = index + 1;
+        }
+        index = 0;
         while (index < decl.methods.len()) {
             ast.TraitMethod method = decl.methods[index];
             self.check_function_signature(method.signature);
             index = index + 1;
         }
+    }
+
+    () enter_local_scope() {
+        self.local_scope_starts.add(self.active_locals.len());
+    }
+
+    () exit_local_scope() {
+        Int start = self.local_scope_starts[self.local_scope_starts.len() - 1];
+        while (self.active_locals.len() > start) {
+            self.active_locals.pop();
+        }
+        self.local_scope_starts.pop();
+    }
+
+    () define_local_type(ast.Name name, types.TypeId type_id, Bool mutable_binding) {
+        scope.LocalBindingId! local_id = scope.LocalBindingId();
+        scope.LocalBinding? resolved_local = self.resolved.lookup_local_binding_span(name.span);
+        if (resolved_local is some binding) {
+            local_id = binding.local_id;
+        }
+        LocalType local = LocalType(local_id, name, type_id, mutable_binding);
+        self.active_locals.add(local);
+        self.result.add_local_type(local_id, name, type_id, mutable_binding);
+    }
+
+    LocalType? lookup_local_type(Int symbol_id) {
+        Int! index = self.active_locals.len() - 1;
+        while (index >= 0) {
+            LocalType local = self.active_locals[index];
+            if (local.name.symbol.id == symbol_id) {
+                return local;
+            }
+            index = index - 1;
+        }
+        return null;
+    }
+
+    () check_block(ast.Block block) {
+        self.enter_local_scope();
+        Int! index = 0;
+        while (index < block.stmts.len()) {
+            self.check_stmt(block.stmts[index]);
+            index = index + 1;
+        }
+        self.exit_local_scope();
+    }
+
+    () check_stmt(ast.AstStmt stmt) {
+        self.result.checked_stmt_count = self.result.checked_stmt_count + 1;
+        if (stmt is .var_decl(var_decl)) {
+            self.check_var_decl(var_decl);
+            return;
+        }
+        if (stmt is .assign(assign)) {
+            self.check_assignment(assign);
+            return;
+        }
+        if (stmt is .if_stmt(if_stmt)) {
+            token.Span cond_span = self.expr_span(if_stmt.cond);
+            types.TypeId cond_type = self.expr_type(if_stmt.cond, self.bool_type(cond_span));
+            self.check_bool(cond_type, cond_span);
+            self.check_block(if_stmt.then_block);
+            if (if_stmt.else_block is some else_block) {
+                self.check_block(else_block);
+            }
+            return;
+        }
+        if (stmt is .switch_stmt(switch_stmt)) {
+            self.check_switch_stmt(switch_stmt);
+            return;
+        }
+        if (stmt is .try_stmt(try_stmt)) {
+            self.check_block(try_stmt.body);
+            Int! index = 0;
+            while (index < try_stmt.catches.len()) {
+                ast.CatchStmt catch_stmt = try_stmt.catches[index];
+                self.enter_local_scope();
+                if (catch_stmt.error_type is some error_type) {
+                    self.type_from_ast(error_type);
+                }
+                if (catch_stmt.binding is some binding) {
+                    self.define_local_type(binding, self.infer_type(binding.span), false);
+                }
+                self.check_block(catch_stmt.body);
+                self.exit_local_scope();
+                index = index + 1;
+            }
+            return;
+        }
+        if (stmt is .while_stmt(while_stmt)) {
+            token.Span cond_span = self.expr_span(while_stmt.cond);
+            types.TypeId cond_type = self.expr_type(while_stmt.cond, self.bool_type(cond_span));
+            self.check_bool(cond_type, cond_span);
+            self.check_block(while_stmt.body);
+            return;
+        }
+        if (stmt is .for_range(for_range)) {
+            self.check_for_range(for_range);
+            return;
+        }
+        if (stmt is .for_each(for_each)) {
+            self.check_for_each(for_each);
+            return;
+        }
+        if (stmt is .return_stmt(return_stmt)) {
+            self.check_return(return_stmt);
+            return;
+        }
+        if (stmt is .throw_stmt(throw_stmt)) {
+            self.expr_type(throw_stmt.value, types.TypeId());
+            return;
+        }
+        if (stmt is .expr(expr_stmt)) {
+            self.expr_type(expr_stmt.value, types.TypeId());
+            return;
+        }
+        if (stmt is .defer_stmt(defer_stmt)) {
+            self.check_block(defer_stmt.body);
+            return;
+        }
+        if (stmt is .block(block)) {
+            self.check_block(block);
+            return;
+        }
+    }
+
+    () check_var_decl(ast.VarDecl decl) {
+        types.TypeId declared_type = self.type_from_ast(decl.type_ref);
+        if (decl.initializer is some initializer) {
+            types.TypeId initializer_type = self.expr_type(initializer, declared_type);
+            self.check_compatible(declared_type, initializer_type, decl.span, "initializer type mismatch");
+        }
+        self.define_local_type(decl.name, declared_type, decl.mutable_binding);
+    }
+
+    () check_assignment(ast.AssignStmt stmt) {
+        types.TypeId target_type = self.expr_type(stmt.target, types.TypeId());
+        if (!self.assign_target_mutable(stmt.target)) {
+            self.mismatch(stmt.span, "assignment target is immutable");
+        }
+        types.TypeId value_type = self.expr_type(stmt.value, target_type);
+        self.check_compatible(target_type, value_type, stmt.span, "assignment type mismatch");
+    }
+
+    () check_switch_stmt(ast.SwitchStmt stmt) {
+        types.TypeId value_type = self.expr_type(stmt.value, types.TypeId());
+        Int! index = 0;
+        while (index < stmt.cases.len()) {
+            ast.SwitchCase case_value = stmt.cases[index];
+            self.enter_local_scope();
+            if (case_value.pattern is some pattern) {
+                self.check_pattern(pattern, value_type);
+            }
+            self.check_block(case_value.body);
+            self.exit_local_scope();
+            index = index + 1;
+        }
+    }
+
+    () check_for_range(ast.ForRangeStmt stmt) {
+        types.TypeId! range_type = self.int_type(stmt.span);
+        if (stmt.type_hint is some type_hint) {
+            range_type = self.type_from_ast(type_hint);
+        }
+        self.check_compatible(range_type, self.expr_type(stmt.start, range_type), self.expr_span(stmt.start), "range start type mismatch");
+        self.check_compatible(range_type, self.expr_type(stmt.end_expr, range_type), self.expr_span(stmt.end_expr), "range end type mismatch");
+        self.enter_local_scope();
+        self.define_local_type(stmt.name, range_type, false);
+        self.check_block(stmt.body);
+        self.exit_local_scope();
+    }
+
+    () check_for_each(ast.ForEachStmt stmt) {
+        types.TypeId iterable_type = self.expr_type(stmt.iterable, types.TypeId());
+        types.TypeId item_type = self.iterable_item_type(iterable_type, stmt.span);
+        self.enter_local_scope();
+        self.check_pattern(stmt.pattern, item_type);
+        self.check_block(stmt.body);
+        self.exit_local_scope();
+    }
+
+    () check_return(ast.ReturnStmt stmt) {
+        if (stmt.value is some value) {
+            types.TypeId value_type = self.expr_type(value, self.current_return_type);
+            self.check_compatible(self.current_return_type, value_type, stmt.span, "return type mismatch");
+            return;
+        }
+        self.check_compatible(self.current_return_type, self.unit_type(stmt.span), stmt.span, "return type mismatch");
+    }
+
+    public types.TypeId expr_type(ast.AstExpr* expr, types.TypeId expected) {
+        self.result.checked_expr_count = self.result.checked_expr_count + 1;
+        types.TypeId type_id = self.compute_expr_type(expr, expected);
+        self.result.add_expr_type(expr, type_id);
+        return type_id;
+    }
+
+    public types.TypeId compute_expr_type(ast.AstExpr* expr, types.TypeId expected) {
+        if (expr is .literal(literal)) {
+            return self.literal_type(literal, expected);
+        }
+        if (expr is .name(name)) {
+            return self.type_of_name(name);
+        }
+        if (expr is .self_value(span)) {
+            return self.result.types.make_type_param(span, self.ctx.intern("Self"));
+        }
+        if (expr is .implicit_value(span)) {
+            return self.infer_type(span);
+        }
+        if (expr is .size_of_type(type_ref)) {
+            self.type_from_ast(type_ref);
+            return self.int_type(self.type_span(type_ref));
+        }
+        if (expr is .unary(unary)) {
+            return self.type_of_unary(unary, expected);
+        }
+        if (expr is .binary(binary)) {
+            return self.type_of_binary(binary, expected);
+        }
+        if (expr is .is_expr(is_expr)) {
+            types.TypeId value_type = self.expr_type(is_expr.value, types.TypeId());
+            self.enter_local_scope();
+            self.check_pattern(is_expr.pattern, value_type);
+            self.exit_local_scope();
+            return self.bool_type(is_expr.span);
+        }
+        if (expr is .coalesce(coalesce)) {
+            return self.type_of_coalesce(coalesce, expected);
+        }
+        if (expr is .coalesce_control(control)) {
+            self.expr_type(control.left, types.TypeId());
+            if (control.result is some result_expr) {
+                self.expr_type(result_expr, self.current_return_type);
+            }
+            return self.optional_element_or_invalid(control.left, control.span);
+        }
+        if (expr is .catch_handler(handler)) {
+            self.expr_type(handler.left, expected);
+            self.enter_local_scope();
+            if (handler.binding is some binding) {
+                self.define_local_type(binding, self.infer_type(binding.span), false);
+            }
+            types.TypeId handler_type = self.expr_type(handler.handler, expected);
+            self.exit_local_scope();
+            return handler_type;
+        }
+        if (expr is .block(block)) {
+            return self.type_of_block_expr(block, expected);
+        }
+        if (expr is .if_expr(if_expr)) {
+            return self.type_of_if_expr(if_expr, expected);
+        }
+        if (expr is .switch_expr(switch_expr)) {
+            return self.type_of_switch_expr(switch_expr, expected);
+        }
+        if (expr is .try_expr(try_expr)) {
+            return self.type_of_try_expr(try_expr, expected);
+        }
+        if (expr is .call(call)) {
+            return self.type_of_call(call, expected);
+        }
+        if (expr is .field(field)) {
+            return self.type_of_field(field);
+        }
+        if (expr is .index(index_expr)) {
+            return self.type_of_index(index_expr);
+        }
+        if (expr is .slice(slice_expr)) {
+            return self.type_of_slice(slice_expr);
+        }
+        if (expr is .struct_lit(struct_lit)) {
+            return self.type_of_struct_lit(struct_lit);
+        }
+        if (expr is .variant(variant)) {
+            return self.type_of_variant(variant);
+        }
+        if (expr is .tuple(tuple)) {
+            return self.type_of_tuple(tuple);
+        }
+        if (expr is .array(array)) {
+            return self.type_of_array(array, expected);
+        }
+        return self.invalid_type(token.Span());
+    }
+
+    types.TypeId literal_type(ast.Literal literal, types.TypeId expected) {
+        if (expected.valid() && self.literal_compatible(expected, literal)) {
+            return expected;
+        }
+        if (literal is .int_lit(span)) {
+            return self.int_type(span);
+        }
+        if (literal is .float_lit(span)) {
+            return self.double_type(span);
+        }
+        if (literal is .char_lit(span)) {
+            return self.char_type(span);
+        }
+        if (literal is .string_lit(span)) {
+            return self.result.types.make_slice(span, self.builtin_type(span, "UInt8"));
+        }
+        if (literal is .bool_lit(bool_lit)) {
+            return self.bool_type(bool_lit.span);
+        }
+        if (literal is .null_lit(span)) {
+            if (expected.valid() && self.result.types.is_optional(expected)) {
+                return expected;
+            }
+            self.mismatch(span, "null requires optional type");
+            return self.invalid_type(span);
+        }
+        return self.invalid_type(token.Span());
+    }
+
+    types.TypeId type_of_name(ast.Name name) {
+        LocalType? local = self.lookup_local_type(name.symbol.id);
+        if (local is some local_type) {
+            return local_type.type_id;
+        }
+        resolve.ResolvedValuePath? resolved_path = self.resolved.lookup_resolved_value_span(name.span);
+        if (resolved_path is some path) {
+            if (path.binding is some binding) {
+                types.TypeId binding_type = self.result.lookup_binding_type(binding.binding_id);
+                if (binding_type.valid()) {
+                    return binding_type;
+                }
+            }
+        }
+        self.result.unknown_type_count = self.result.unknown_type_count + 1;
+        return self.invalid_type(name.span);
+    }
+
+    types.TypeId type_of_unary(ast.UnaryExpr expr, types.TypeId expected) {
+        if (expr.op == .not) {
+            types.TypeId value_type = self.expr_type(expr.value, self.bool_type(expr.span));
+            self.check_bool(value_type, expr.span);
+            return self.bool_type(expr.span);
+        }
+        if (expr.op == .address_of) {
+            types.TypeId value_type = self.expr_type(expr.value, types.TypeId());
+            return self.result.types.make_pointer(expr.span, value_type, false, false);
+        }
+        if (expr.op == .deref) {
+            types.TypeId value_type = self.expr_type(expr.value, types.TypeId());
+            types.TypeInfo info = self.result.types.type_at(value_type);
+            if (info.kind == .pointer) {
+                return info.element;
+            }
+            self.mismatch(expr.span, "dereference target must be pointer");
+            return self.invalid_type(expr.span);
+        }
+        return self.expr_type(expr.value, expected);
+    }
+
+    public types.TypeId type_of_binary(ast.BinaryExpr expr, types.TypeId expected) {
+        if (expr.op == .logic_and || expr.op == .logic_or) {
+            return self.bool_type(expr.span);
+        }
+        if (self.binary_returns_bool(expr.op)) {
+            return self.bool_type(expr.span);
+        }
+        if (expr.op == .range) {
+            return self.builtin_type(expr.span, "Range");
+        }
+        if (expected.valid()) {
+            return expected;
+        }
+        return self.infer_type(expr.span);
+    }
+
+    types.TypeId type_of_bool_binary(ast.BinaryExpr expr) {
+        return self.bool_type(expr.span);
+    }
+
+    Bool binary_returns_bool(ast.BinaryOp op) {
+        if (op == .logic_and) { return true; }
+        if (op == .logic_or) { return true; }
+        if (op == .equal) { return true; }
+        if (op == .not_equal) { return true; }
+        if (op == .less) { return true; }
+        if (op == .less_equal) { return true; }
+        if (op == .greater) { return true; }
+        if (op == .greater_equal) { return true; }
+        return false;
+    }
+
+    types.TypeId type_of_coalesce(ast.CoalesceExpr expr, types.TypeId expected) {
+        types.TypeId left_type = self.expr_type(expr.left, types.TypeId());
+        types.TypeInfo left_info = self.result.types.type_at(left_type);
+        if (left_info.kind != .layer || !left_info.optional) {
+            self.mismatch(expr.span, "coalesce left operand must be optional");
+            return self.invalid_type(expr.span);
+        }
+        types.TypeId element = left_info.element;
+        types.TypeId right_type = self.expr_type(expr.right, element);
+        self.check_compatible(element, right_type, expr.span, "coalesce fallback type mismatch");
+        if (expected.valid()) {
+            self.check_compatible(expected, element, expr.span, "coalesce result type mismatch");
+        }
+        return element;
+    }
+
+    types.TypeId optional_element_or_invalid(ast.AstExpr* expr, token.Span span) {
+        types.TypeId value_type = self.expr_type(expr, types.TypeId());
+        types.TypeInfo info = self.result.types.type_at(value_type);
+        if (info.kind == .layer && info.optional) {
+            return info.element;
+        }
+        self.mismatch(span, "expected optional value");
+        return self.invalid_type(span);
+    }
+
+    types.TypeId type_of_block_expr(ast.BlockExpr expr, types.TypeId expected) {
+        self.check_block(expr.block);
+        if (expr.value is some value) {
+            return self.expr_type(value, expected);
+        }
+        return self.unit_type(expr.span);
+    }
+
+    types.TypeId type_of_if_expr(ast.IfExpr expr, types.TypeId expected) {
+        types.TypeId cond_type = self.expr_type(expr.cond, self.bool_type(expr.span));
+        self.check_bool(cond_type, expr.span);
+        types.TypeId then_type = self.expr_type(expr.then_value, expected);
+        types.TypeId else_type = self.expr_type(expr.else_value, then_type);
+        self.check_compatible(then_type, else_type, expr.span, "if branch type mismatch");
+        return then_type;
+    }
+
+    types.TypeId type_of_switch_expr(ast.SwitchExpr expr, types.TypeId expected) {
+        types.TypeId value_type = self.expr_type(expr.value, types.TypeId());
+        types.TypeId! result_type = types.TypeId();
+        Int! index = 0;
+        while (index < expr.cases.len()) {
+            ast.SwitchExprCase case_value = expr.cases[index];
+            self.enter_local_scope();
+            if (case_value.pattern is some pattern) {
+                self.check_pattern(pattern, value_type);
+            }
+            types.TypeId case_type = self.expr_type(case_value.value, expected);
+            if (result_type.valid()) {
+                self.check_compatible(result_type, case_type, case_value.span, "switch branch type mismatch");
+            } else {
+                result_type = case_type;
+            }
+            self.exit_local_scope();
+            index = index + 1;
+        }
+        if (result_type.valid()) {
+            return result_type;
+        }
+        return self.unit_type(expr.span);
+    }
+
+    types.TypeId type_of_try_expr(ast.TryExpr expr, types.TypeId expected) {
+        types.TypeId value_type = self.expr_type(expr.value, expected);
+        Int! index = 0;
+        while (index < expr.catches.len()) {
+            ast.CatchExpr catch_expr = expr.catches[index];
+            self.enter_local_scope();
+            if (catch_expr.error_type is some error_type) {
+                self.type_from_ast(error_type);
+            }
+            if (catch_expr.binding is some binding) {
+                self.define_local_type(binding, self.infer_type(binding.span), false);
+            }
+            types.TypeId catch_type = self.expr_type(catch_expr.value, value_type);
+            self.check_compatible(value_type, catch_type, catch_expr.span, "catch branch type mismatch");
+            self.exit_local_scope();
+            index = index + 1;
+        }
+        return value_type;
+    }
+
+    types.TypeId type_of_call(ast.CallExpr expr, types.TypeId expected) {
+        types.TypeId callee_type = self.expr_type(expr.callee, types.TypeId());
+        types.TypeInfo info = self.result.types.type_at(callee_type);
+        if (info.kind != .function) {
+            self.check_call_args_without_signature(expr);
+            return self.invalid_type(expr.span);
+        }
+        Int param_count = info.child_count - 1;
+        if (param_count != expr.args.len()) {
+            self.mismatch(expr.span, "call argument count mismatch");
+        }
+        Int! index = 0;
+        while (index < expr.args.len()) {
+            types.TypeId! expected_arg = types.TypeId();
+            if (index < param_count) {
+                expected_arg = self.result.types.child_at(info.child_start + index);
+            }
+            self.check_compatible(expected_arg, self.expr_type(expr.args[index].value, expected_arg), expr.args[index].span, "call argument type mismatch");
+            index = index + 1;
+        }
+        types.TypeId result_type = self.result.types.child_at(info.child_start + info.child_count - 1);
+        if (expected.valid()) {
+            self.check_compatible(expected, result_type, expr.span, "call result type mismatch");
+        }
+        return result_type;
+    }
+
+    () check_call_args_without_signature(ast.CallExpr expr) {
+        Int! index = 0;
+        while (index < expr.args.len()) {
+            self.expr_type(expr.args[index].value, types.TypeId());
+            index = index + 1;
+        }
+    }
+
+    types.TypeId type_of_field(ast.FieldExpr expr) {
+        if (expr.base is .name(base_name)) {
+            types.TypeId module_type = self.type_of_module_field(base_name, expr.name);
+            if (module_type.valid()) {
+                return module_type;
+            }
+        }
+        types.TypeId! base_type = self.expr_type(expr.base, types.TypeId());
+        if (self.result.types.is_optional(base_type) && expr.optional_chain) {
+            base_type = self.result.types.type_at(base_type).element;
+        }
+        types.TypeId field_type = self.lookup_field_type(base_type, expr.name);
+        if (!field_type.valid()) {
+            self.mismatch(expr.name.span, "unknown field");
+            return self.invalid_type(expr.span);
+        }
+        if (expr.optional_chain) {
+            return self.result.types.make_layer(expr.span, field_type, true, false);
+        }
+        return field_type;
+    }
+
+    types.TypeId type_of_module_field(ast.Name module_name, ast.Name member_name) {
+        resolve.ResolvedValuePath? path = self.resolved.lookup_resolved_value_span(module_name.span);
+        if (path == null) {
+            return types.TypeId();
+        }
+        resolve.ResolvedValuePath resolved_path = path$.some();
+        if (resolved_path.kind != .module_alias) {
+            return types.TypeId();
+        }
+        resolve.ImportedModule? module = self.resolved.lookup_import_module(module_name.symbol.id);
+        if (module == null) {
+            return types.TypeId();
+        }
+        resolve.ImportedModule imported_module = module$.some();
+        scope.Binding? binding = imported_module.result.lookup_exported_id(member_name.symbol.id);
+        if (binding is some resolved_binding) {
+            return self.result.lookup_binding_type(resolved_binding.binding_id);
+        }
+        return types.TypeId();
+    }
+
+    types.TypeId type_of_index(ast.IndexExpr expr) {
+        types.TypeId base_type = self.expr_type(expr.base, types.TypeId());
+        self.check_compatible(self.int_type(expr.span), self.expr_type(expr.index, self.int_type(expr.span)), self.expr_span(expr.index), "index must be Int");
+        types.TypeId item = self.iterable_item_type(base_type, expr.span);
+        if (!item.valid()) {
+            self.mismatch(expr.span, "index target must be array or slice");
+            return self.invalid_type(expr.span);
+        }
+        return item;
+    }
+
+    types.TypeId type_of_slice(ast.SliceExpr expr) {
+        types.TypeId base_type = self.expr_type(expr.base, types.TypeId());
+        if (expr.start is some start) {
+            self.check_compatible(self.int_type(expr.span), self.expr_type(start, self.int_type(expr.span)), self.expr_span(start), "slice start must be Int");
+        }
+        if (expr.end_expr is some end_expr) {
+            self.check_compatible(self.int_type(expr.span), self.expr_type(end_expr, self.int_type(expr.span)), self.expr_span(end_expr), "slice end must be Int");
+        }
+        types.TypeId item = self.iterable_item_type(base_type, expr.span);
+        if (!item.valid()) {
+            self.mismatch(expr.span, "slice target must be array or slice");
+            return self.invalid_type(expr.span);
+        }
+        return self.result.types.make_slice(expr.span, item);
+    }
+
+    types.TypeId type_of_struct_lit(ast.StructExpr expr) {
+        scope.Binding? binding = self.resolved.lookup_top_level_id(expr.path.segments[0].symbol.id);
+        if (binding == null) {
+            self.result.unknown_type_count = self.result.unknown_type_count + 1;
+            return self.invalid_type(expr.span);
+        }
+        scope.Binding resolved_binding = binding$.some();
+        types.TypeId nominal = self.result.types.make_nominal(expr.span, expr.path.segments[0].symbol, resolved_binding.binding_id, self.binding_nominal_kind(resolved_binding.kind));
+        Int! index = 0;
+        while (index < expr.fields.len()) {
+            ast.FieldInit field = expr.fields[index];
+            if (field.name is some name) {
+                types.TypeId field_type = self.lookup_field_type(nominal, name);
+                self.expr_type(field.value, field_type);
+            } else {
+                self.expr_type(field.value, types.TypeId());
+            }
+            index = index + 1;
+        }
+        return nominal;
+    }
+
+    types.TypeId type_of_variant(ast.VariantExpr expr) {
+        Int! index = 0;
+        while (index < expr.payload.len()) {
+            self.expr_type(expr.payload[index], types.TypeId());
+            index = index + 1;
+        }
+        return self.infer_type(expr.span);
+    }
+
+    types.TypeId type_of_tuple(ast.SequenceExpr expr) {
+        Int child_start = self.result.types.begin_children();
+        Int! index = 0;
+        while (index < expr.items.len()) {
+            self.result.types.add_child(self.expr_type(expr.items[index], types.TypeId()));
+            index = index + 1;
+        }
+        return self.result.types.make_compound(.tuple, expr.span, child_start, expr.items.len());
+    }
+
+    types.TypeId type_of_array(ast.SequenceExpr expr, types.TypeId expected) {
+        types.TypeId! item_type = types.TypeId();
+        if (expected.valid()) {
+            types.TypeInfo expected_info = self.result.types.type_at(expected);
+            if (expected_info.kind == .array || expected_info.kind == .slice) {
+                item_type = expected_info.element;
+            }
+        }
+        Int! index = 0;
+        while (index < expr.items.len()) {
+            types.TypeId element_type = self.expr_type(expr.items[index], item_type);
+            if (item_type.valid()) {
+                self.check_compatible(item_type, element_type, expr.span, "array element type mismatch");
+            } else {
+                item_type = element_type;
+            }
+            index = index + 1;
+        }
+        if (!item_type.valid()) {
+            item_type = self.infer_type(expr.span);
+        }
+        return self.result.types.make_array(expr.span, item_type, false);
+    }
+
+    () check_pattern(ast.Pattern pattern, types.TypeId expected) {
+        if (pattern is .binding(binding)) {
+            self.define_local_type(binding.name, expected, binding.mutable_binding);
+            return;
+        }
+        if (pattern is .tuple(tuple)) {
+            self.check_tuple_pattern(tuple, expected);
+            return;
+        }
+        if (pattern is .variant(variant)) {
+            Int! index = 0;
+            while (index < variant.payload.len()) {
+                self.check_pattern(variant.payload[index], self.infer_type(variant.span));
+                index = index + 1;
+            }
+            return;
+        }
+        if (pattern is .optional(optional)) {
+            types.TypeId payload_type = self.optional_payload_type(expected, optional.span);
+            self.check_pattern(optional.payload, payload_type);
+            return;
+        }
+    }
+
+    () check_tuple_pattern(ast.TuplePattern tuple, types.TypeId expected) {
+        types.TypeInfo info = self.result.types.type_at(expected);
+        Int! index = 0;
+        while (index < tuple.items.len()) {
+            types.TypeId! item_type = self.infer_type(tuple.span);
+            if (info.kind == .tuple && index < info.child_count) {
+                item_type = self.result.types.child_at(info.child_start + index);
+            }
+            self.check_pattern(tuple.items[index], item_type);
+            index = index + 1;
+        }
+    }
+
+    types.TypeId optional_payload_type(types.TypeId expected, token.Span span) {
+        if (!expected.valid()) {
+            return self.infer_type(span);
+        }
+        types.TypeInfo info = self.result.types.type_at(expected);
+        if (info.kind == .layer && info.optional) {
+            return info.element;
+        }
+        self.mismatch(span, "optional pattern requires optional value");
+        return self.invalid_type(span);
+    }
+
+    types.TypeId lookup_field_type(types.TypeId base_type, ast.Name field_name) {
+        if (!base_type.valid()) { return types.TypeId(); }
+        types.TypeInfo info = self.result.types.type_at(base_type);
+        if (info.kind != .nominal || info.nominal_kind != .struct_decl) {
+            return types.TypeId();
+        }
+        ast.AstDecl? decl = self.decl_for_binding(info.binding_id);
+        if (decl == null) { return types.TypeId(); }
+        ast.AstDecl resolved_decl = decl$.some();
+        if (resolved_decl is .struct_decl(struct_decl)) {
+            Int! index = 0;
+            while (index < struct_decl.fields.len()) {
+                ast.FieldDecl field = struct_decl.fields[index];
+                if (field.name.symbol.id == field_name.symbol.id) {
+                    return self.type_from_ast(field.type_ref);
+                }
+                index = index + 1;
+            }
+        }
+        return types.TypeId();
+    }
+
+    ast.AstDecl? decl_for_binding(scope.BindingId binding_id) {
+        if (self.file == null) {
+            return null;
+        }
+        ast.AstFile* file = self.file$.some();
+        Int! index = 0;
+        while (index < self.resolved.top_level_len()) {
+            scope.Binding binding = self.resolved.top_level_binding_at(index);
+            if (binding.binding_id.id == binding_id.id && binding.decl_id.valid()) {
+                return file.decl_at(binding.decl_id.id);
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    types.TypeId iterable_item_type(types.TypeId type_id, token.Span span) {
+        if (!type_id.valid()) { return types.TypeId(); }
+        types.TypeInfo info = self.result.types.type_at(type_id);
+        if (info.kind == .array || info.kind == .slice) {
+            return info.element;
+        }
+        if (info.kind == .pointer && info.many) {
+            return info.element;
+        }
+        return types.TypeId();
+    }
+
+    Bool assign_target_mutable(ast.AstExpr* expr) {
+        if (expr is .name(name)) {
+            LocalType? local = self.lookup_local_type(name.symbol.id);
+            if (local is some local_type) {
+                return local_type.mutable_binding;
+            }
+            scope.Binding? binding = self.resolved.lookup_top_level_id(name.symbol.id);
+            if (binding is some resolved_binding) {
+                return self.binding_mutable(resolved_binding);
+            }
+            return false;
+        }
+        if (expr is .field(_)) { return true; }
+        if (expr is .index(_)) { return true; }
+        if (expr is .unary(unary)) {
+            return unary.op == .deref;
+        }
+        return false;
+    }
+
+    Bool binding_mutable(scope.Binding binding) {
+        ast.AstDecl? decl = self.decl_for_binding(binding.binding_id);
+        if (decl == null) { return false; }
+        ast.AstDecl resolved_decl = decl$.some();
+        if (resolved_decl is .global_decl(global_decl)) {
+            return global_decl.mutable_binding;
+        }
+        return false;
+    }
+
+    () check_bool(types.TypeId type_id, token.Span span) {
+        self.check_compatible(self.bool_type(span), type_id, span, "condition must be Bool");
+    }
+
+    () check_compatible(types.TypeId expected, types.TypeId actual, token.Span span, UInt8[] message) {
+        if (self.result.types.compatible(expected, actual)) {
+            return;
+        }
+        self.mismatch(span, message);
+    }
+
+    () mismatch(token.Span span, UInt8[] message) {
+        self.result.mismatch_count = self.result.mismatch_count + 1;
+        self.ctx.diagnostics.add_error(span, message);
+    }
+
+    types.TypeId invalid_type(token.Span span) {
+        return self.result.types.make_invalid(span);
+    }
+
+    types.TypeId infer_type(token.Span span) {
+        return self.result.types.make_infer(span);
+    }
+
+    types.TypeId unit_type(token.Span span) {
+        return self.result.types.make_unit(span);
+    }
+
+    types.TypeId int_type(token.Span span) {
+        return self.builtin_type(span, "Int");
+    }
+
+    types.TypeId bool_type(token.Span span) {
+        return self.builtin_type(span, "Bool");
+    }
+
+    types.TypeId char_type(token.Span span) {
+        return self.builtin_type(span, "Char");
+    }
+
+    types.TypeId double_type(token.Span span) {
+        return self.builtin_type(span, "Double");
+    }
+
+    types.TypeId builtin_type(token.Span span, UInt8[] name) {
+        return self.result.types.make_builtin(span, self.ctx.intern(name));
+    }
+
+    token.Span expr_span(ast.AstExpr* expr) {
+        if (expr is .literal(literal)) { return self.literal_span(literal); }
+        if (expr is .name(name)) { return name.span; }
+        if (expr is .self_value(span)) { return span; }
+        if (expr is .implicit_value(span)) { return span; }
+        if (expr is .size_of_type(type_ref)) { return self.type_span(type_ref); }
+        if (expr is .unary(unary)) { return unary.span; }
+        if (expr is .binary(binary)) { return binary.span; }
+        if (expr is .is_expr(is_expr)) { return is_expr.span; }
+        if (expr is .coalesce(coalesce)) { return coalesce.span; }
+        if (expr is .coalesce_control(control)) { return control.span; }
+        if (expr is .catch_handler(handler)) { return handler.span; }
+        if (expr is .block(block)) { return block.span; }
+        if (expr is .if_expr(if_expr)) { return if_expr.span; }
+        if (expr is .switch_expr(switch_expr)) { return switch_expr.span; }
+        if (expr is .try_expr(try_expr)) { return try_expr.span; }
+        if (expr is .call(call)) { return call.span; }
+        if (expr is .field(field)) { return field.span; }
+        if (expr is .index(index_expr)) { return index_expr.span; }
+        if (expr is .slice(slice_expr)) { return slice_expr.span; }
+        if (expr is .struct_lit(struct_lit)) { return struct_lit.span; }
+        if (expr is .variant(variant)) { return variant.span; }
+        if (expr is .tuple(tuple)) { return tuple.span; }
+        if (expr is .array(array)) { return array.span; }
+        return token.Span();
+    }
+
+    token.Span type_span(ast.AstType type_ref) {
+        if (type_ref is .infer(span)) { return span; }
+        if (type_ref is .unit(span)) { return span; }
+        if (type_ref is .named(named)) { return named.span; }
+        if (type_ref is .tuple(tuple)) { return tuple.span; }
+        if (type_ref is .function(function)) { return function.span; }
+        if (type_ref is .pointer(pointer)) { return pointer.span; }
+        if (type_ref is .slice(slice)) { return slice.span; }
+        if (type_ref is .array(array)) { return array.span; }
+        if (type_ref is .layer(layer)) { return layer.span; }
+        if (type_ref is .errorable(errorable)) { return errorable.span; }
+        return token.Span();
     }
 
     types.TypeId type_from_ast(ast.AstType type_ref) {
@@ -188,6 +1239,12 @@ public struct TypeChecker {
         ast.Name last = named.path.segments[named.path.segment_len() - 1];
         if (path.kind == .builtin_type) {
             return self.result.types.make_builtin(named.span, last.symbol);
+        }
+        if (path.kind == .generic_param) {
+            return self.result.types.make_type_param(named.span, last.symbol);
+        }
+        if (path.kind == .self_type) {
+            return self.result.types.make_type_param(named.span, last.symbol);
         }
         if (path.binding is some binding) {
             if (path.kind == .local_binding && binding.kind == .top_alias) {
@@ -264,23 +1321,19 @@ public struct TypeChecker {
         return self.result.types.make_compound(.function, function.span, child_start, function.params.len() + 1);
     }
 
-    Bool array_count_inferred(ast.AstExpr count) {
+    Bool array_count_inferred(ast.AstExpr* count) {
         if (count is .implicit_value(_)) {
             return true;
         }
         return false;
     }
 
-    () check_initializer(types.TypeId declared_type, ast.AstExpr initializer) {
+    () check_initializer(types.TypeId declared_type, ast.AstExpr* initializer) {
         if (self.result.types.is_invalid(declared_type)) {
             return;
         }
-        if (initializer is .literal(_ literal)) {
-            if (!self.literal_compatible(declared_type, literal)) {
-                self.result.mismatch_count = self.result.mismatch_count + 1;
-                self.ctx.diagnostics.add_error(self.literal_span(literal), "initializer literal does not match declared type");
-            }
-        }
+        types.TypeId initializer_type = self.expr_type(initializer, declared_type);
+        self.check_compatible(declared_type, initializer_type, self.expr_span(initializer), "initializer type mismatch");
     }
 
     Bool literal_compatible(types.TypeId expected, ast.Literal literal) {

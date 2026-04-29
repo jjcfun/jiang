@@ -13,7 +13,8 @@ source files
   -> lexer/token
   -> parser/AST
   -> resolve/scope
-  -> type_check/HIR
+  -> type_check side tables
+  -> HIR
   -> lower_jir/JIR
   -> llvm/codegen
 ```
@@ -206,7 +207,13 @@ parser 的输出应只是 AST。名称查找、重载解析、类型推导都放
 - 发现 unresolved 或 ambiguous name
 - 为 HIR/type checking 准备已解析数据
 
-当前 `ResolveResult` 已记录 `resolved_type_paths` side table：每个成功解析的 named type ref 会按 `TypeRefId` 记录为 builtin type、本模块 binding 或 imported binding。后续 type checker 应通过 `TypeRefId` 查询这个结果表，避免依赖遍历顺序，也避免重复实现 scope lookup。
+当前 `ResolveResult` 产出语义 side tables：
+
+- `resolved_type_paths`：每个成功解析的 named type ref 会按 `TypeRefId` 记录为 builtin type、generic param、`Self`、本模块 binding 或 imported binding。
+- `resolved_value_paths`：记录 value/name 使用点解析结果，包括 local binding、top-level binding 和 import module alias。
+- `local_bindings`：记录 function params、block local vars、pattern bindings、for bindings。
+
+resolve 采用顶层单命名空间：import alias、alias、function、global、struct、enum、union、trait 在同一模块顶层互相冲突。普通 import 不摊平导入声明，只引入模块命名空间；`public import` 用于 re-export module namespace。
 
 resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推导。
 
@@ -217,6 +224,7 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 预期职责：
 - primitive type
 - nominal type
+- type param
 - pointer/reference/slice/array/tuple/optional/errorable/function type
 - type equality 和 compatibility 辅助方法
 
@@ -230,11 +238,19 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 - expression type checking
 - 根据 expected type 处理 literal typing
 - 本地类型别名在使用点展开为目标类型；struct/enum/union/trait 等声明保留 nominal type 句柄
-- overload selection
-- trait/concept constraint checking
-- 生成 typed HIR
+- alias cycle 检测
+- declaration / binding / expression / local binding 的类型 side tables
+- function signature、global initializer、function body、local var、assignment、return、基础 control-flow 的语义检查
+- generic param 可作为 type param 使用；`@where` 的 trait/equality bound 在 resolve/type_check 层只做名称解析和基本合法性检查
 
-这个阶段负责把 AST/resolved syntax 转为 HIR。
+这个阶段暂不生成 typed HIR。当前边界是：type checker 消费 AST 和 `ResolveResult`，产出稳定 side tables 与 diagnostics；HIR 会在后续独立设计和 lowering。
+
+暂不实现：
+
+- overload resolution
+- trait method lookup
+- trait conformance solving
+- generic monomorphization
 
 ### `hir.jiang`
 
