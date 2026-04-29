@@ -39,6 +39,7 @@
 #define assoc_type_decl_list_push(list, assoc_type_decl) VEC_PUSH((list), (assoc_type_decl))
 #define assoc_type_binding_list_push(list, assoc_type_binding) VEC_PUSH((list), (assoc_type_binding))
 #define struct_init_decl_list_push(list, init_decl) VEC_PUSH((list), (init_decl))
+#define import_list_push(list, import_decl) VEC_PUSH((list), (import_decl))
 
 typedef struct CompilerDiagnostic {
     const char* path;
@@ -636,9 +637,33 @@ static int is_hidden_implementation_name(const char* name) {
     return name && (name[0] == '#' || strstr(name, ".#") != 0);
 }
 
+static int qualified_name_starts_with(const char* name, const char* prefix) {
+    size_t prefix_len = 0;
+    if (!name || !prefix) {
+        return 0;
+    }
+    prefix_len = strlen(prefix);
+    return strncmp(name, prefix, prefix_len) == 0 && name[prefix_len] == '.';
+}
+
+static int program_exports_namespace(const AstProgram* program, const char* qualified_name) {
+    int i = 0;
+    for (i = 0; i < program->imports.count; ++i) {
+        const AstImportDecl* import_decl = &program->imports.items[i];
+        const char* name = import_decl->alias_name ? import_decl->alias_name : import_decl->path;
+        if (qualified_name_starts_with(qualified_name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static char* remap_value_name(const AstProgram* program, const char* prefix, int hide_private, const char* name) {
     if (!name) {
         return 0;
+    }
+    if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
+        return dup_text(name);
     }
     if (prefix && program_has_any_value(program, name)) {
         if (program_value_is_public(program, name)) {
@@ -658,6 +683,9 @@ static char* remap_value_name(const AstProgram* program, const char* prefix, int
 static char* remap_exported_name(const AstProgram* program, const char* prefix, int hide_private, const char* name) {
     if (!name) {
         return 0;
+    }
+    if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
+        return dup_text(name);
     }
     if (program_has_any_value(program, name)) {
         return remap_value_name(program, prefix, hide_private, name);
@@ -681,6 +709,9 @@ static char* remap_imported_type_decl_name(const AstProgram* program, const char
     if (!name) {
         return 0;
     }
+    if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
+        return dup_text(name);
+    }
     if (prefix && program_has_any_type(program, name)) {
         if (program_type_is_public(program, name)) {
             return dup_join3(prefix, ".", name);
@@ -699,6 +730,9 @@ static char* remap_imported_type_decl_name(const AstProgram* program, const char
 static char* remap_type_name(const AstProgram* program, const char* prefix, int hide_private, const char* name) {
     if (!name) {
         return 0;
+    }
+    if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
+        return dup_text(name);
     }
     if (prefix && program_has_any_type(program, name)) {
         if (program_type_is_public(program, name)) {
@@ -2511,9 +2545,53 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
     }
 }
 
+static int ast_param_signature_equal(const AstParam* left, const AstParam* right) {
+    if (!ast_type_is_equal(&left->type, &right->type)) {
+        return 0;
+    }
+    if (!!left->label != !!right->label) {
+        return 0;
+    }
+    if (left->label && strcmp(left->label, right->label) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int ast_function_signature_equal(const AstFunction* left, const AstFunction* right) {
+    int i = 0;
+    if (strcmp(left->name, right->name) != 0) {
+        return 0;
+    }
+    if (left->method_flag != right->method_flag ||
+        left->static_method_flag != right->static_method_flag ||
+        left->params.count != right->params.count ||
+        !!left->owner_type_name != !!right->owner_type_name) {
+        return 0;
+    }
+    if (left->owner_type_name && strcmp(left->owner_type_name, right->owner_type_name) != 0) {
+        return 0;
+    }
+    for (i = 0; i < left->params.count; ++i) {
+        if (!ast_param_signature_equal(&left->params.items[i], &right->params.items[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int ast_program_has_function_signature(const AstProgram* program, const AstFunction* fn) {
+    int i = 0;
+    for (i = 0; i < program->functions.count; ++i) {
+        if (ast_function_signature_equal(&program->functions.items[i], fn)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void merge_public_import(AstProgram* dest, const AstProgram* imported, const char* prefix) {
     int i = 0;
-    (void)prefix;
     for (i = 0; i < imported->concepts.count; ++i) {
         if (!find_ast_concept(dest, imported->concepts.items[i].name)) {
             concept_list_push(&dest->concepts, clone_concept_decl(imported, prefix, 1, &imported->concepts.items[i], imported->concepts.items[i].public_flag));
@@ -2540,7 +2618,10 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
     for (i = 0; i < imported->globals.count; ++i) {
         if (imported->globals.items[i].public_flag ||
             is_hidden_implementation_name(imported->globals.items[i].name)) {
-            global_list_push(&dest->globals, clone_global(imported, prefix, 1, &imported->globals.items[i], imported->globals.items[i].public_flag));
+            AstGlobal global = clone_global(imported, prefix, 1, &imported->globals.items[i], imported->globals.items[i].public_flag);
+            if (!find_ast_global(dest, global.name)) {
+                global_list_push(&dest->globals, global);
+            }
         }
     }
     for (i = 0; i < imported->functions.count; ++i) {
@@ -2571,7 +2652,10 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
             keep = 1;
         }
         if (keep) {
-            function_list_push(&dest->functions, clone_function(imported, prefix, 1, &imported->functions.items[i], exported_public_flag));
+            AstFunction fn = clone_function(imported, prefix, 1, &imported->functions.items[i], exported_public_flag);
+            if (!ast_program_has_function_signature(dest, &fn)) {
+                function_list_push(&dest->functions, fn);
+            }
         }
     }
 }
@@ -2802,6 +2886,14 @@ static int build_loaded_module(LoadedModule* module, int inject_prelude, LoadedM
     for (i = 0; i < module->imports.count; ++i) {
         merge_public_import(&module->full_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
         merge_public_import(&module->export_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
+        if (module->imports.items[i].public_flag) {
+            AstImportDecl exported_import;
+            memset(&exported_import, 0, sizeof(exported_import));
+            exported_import.alias_name = module->imports.items[i].name;
+            exported_import.path = module->imports.items[i].name;
+            exported_import.public_flag = 1;
+            import_list_push(&module->export_program.imports, exported_import);
+        }
     }
     append_own_decls(&module->full_program, &module->own_program);
     if (!apply_aliases(&module->full_program, &module->own_program, error)) {

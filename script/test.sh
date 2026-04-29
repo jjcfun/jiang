@@ -77,6 +77,22 @@ run_compile_only() {
   "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
 }
 
+run_ir_regression_check() {
+  local source="$1"
+  local ir="$BUILD_DIR/$(basename "${source%.jiang}").regression.ll"
+  "$BUILD_DIR/jiangc" --emit-llvm "$PROJECT_ROOT/$source" > "$ir"
+  local function_count
+  function_count="$(grep -c '^define ' "$ir" || true)"
+  if [[ "$function_count" -ge 3000 ]]; then
+    echo "error: $source generated $function_count functions, expected fewer than 3000" >&2
+    exit 1
+  fi
+  if grep -q 'type_check\.resolve\.scope\.ast\.token' "$ir"; then
+    echo "error: $source generated transitive import clone names" >&2
+    exit 1
+  fi
+}
+
 run_object_sample() {
   local sample="$1"
   local expected="$2"
@@ -108,6 +124,8 @@ run_executable_sample() {
     exit 1
   fi
 }
+
+run_ir_regression_check tests/compiler/type_minimal.jiang
 
 run_sample minimal.jiang 42
 run_object_sample minimal.jiang 42
@@ -180,6 +198,8 @@ run_sample package_override 44
 run_compile_fail package_invalid_name
 run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
+run_sample normal_import_reexport_minimal.jiang 42
+run_compile_fail invalid_normal_import_reexport_namespace.jiang
 run_sample fn_pointer_minimal.jiang 7
 run_sample fn_pointer_comprehensive_minimal.jiang 83
 run_sample fn_pointer_infer_minimal.jiang 3
