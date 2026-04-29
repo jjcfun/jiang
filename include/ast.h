@@ -246,6 +246,7 @@ struct AstStructField {
     AstType type;
     char* name;
     AstExpr* default_value;
+    int public_flag;
     int line;
 };
 

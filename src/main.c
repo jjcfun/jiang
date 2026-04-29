@@ -1203,6 +1203,7 @@ static AstStructDecl clone_struct_decl(const AstProgram* source, const char* pre
         field.type = clone_type(source, prefix, hide_private, &decl->fields.items[i].type);
         field.name = dup_text(decl->fields.items[i].name);
         field.default_value = clone_expr(source, prefix, hide_private, decl->fields.items[i].default_value);
+        field.public_flag = decl->fields.items[i].public_flag;
         field.line = decl->fields.items[i].line;
         struct_field_list_push(&out.fields, field);
     }

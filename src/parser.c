@@ -4181,6 +4181,14 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             return fail(parser, record_flag ? "@where(...) requires a generic function, struct, or record" : "@where(...) requires a generic function or struct");
         }
         AstType field_type;
+        int field_public_flag = 0;
+        if (parser->current.kind == TOKEN_KW_PUBLIC) {
+            if (record_flag) {
+                return fail(parser, "record fields must not be public");
+            }
+            field_public_flag = 1;
+            advance(parser);
+        }
         if (!is_type_start(parser)) {
             return fail(parser, record_flag ? "expected record field type" : "expected struct field type");
         }
@@ -4197,6 +4205,7 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             }
             field.name = token_dup(&parser->current);
             field.line = parser->current.line;
+            field.public_flag = field_public_flag;
             advance(parser);
             if (parser->current.kind == TOKEN_ASSIGN) {
                 advance(parser);
