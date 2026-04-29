@@ -386,6 +386,7 @@ run_sample struct_static_method_minimal.jiang 42
 run_sample struct_method_calls_method_minimal.jiang 42
 run_sample struct_nested_field_method_minimal.jiang 42
 run_sample struct_static_calls_static_minimal.jiang 42
+run_sample private_method_called_by_public_method_minimal.jiang 42
 run_sample public_import_instance_method_minimal.jiang 42
 run_sample public_import_static_method_minimal.jiang 42
 run_sample enum_instance_method_minimal.jiang 42

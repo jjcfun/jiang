@@ -229,6 +229,7 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 预期职责：
 - expression type checking
 - 根据 expected type 处理 literal typing
+- 本地类型别名在使用点展开为目标类型；struct/enum/union/trait 等声明保留 nominal type 句柄
 - overload selection
 - trait/concept constraint checking
 - 生成 typed HIR
