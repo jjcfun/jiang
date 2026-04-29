@@ -1473,6 +1473,22 @@ static int looks_like_variant_pattern_expr(Parser* parser) {
     return variant_args_are_patterns(&probe);
 }
 
+static int looks_like_legacy_optional_some_pattern(Parser* parser) {
+    Parser probe = *parser;
+    if (probe.current.kind == TOKEN_DOT) {
+        return is_optional_some_token(&probe.next);
+    }
+    if (probe.current.kind != TOKEN_IDENT || !token_equals(&probe.current, "Option")) {
+        return 0;
+    }
+    advance(&probe);
+    if (probe.current.kind != TOKEN_DOT) {
+        return 0;
+    }
+    advance(&probe);
+    return is_optional_some_token(&probe.current);
+}
+
 static AstExpr* parse_postfix(Parser* parser);
 static AstExpr* parse_unary(Parser* parser);
 static AstExpr* parse_variant_expr(Parser* parser, int pattern_flag);
@@ -1654,6 +1670,10 @@ static AstExpr* parse_switch_expr(Parser* parser) {
             switch_case.is_else = 1;
             advance(parser);
         } else {
+            if (looks_like_legacy_optional_some_pattern(parser)) {
+                fail(parser, "optional pattern uses 'some name', not '.some(...)' or 'Option.some(...)'");
+                return 0;
+            }
             if (looks_like_optional_some_pattern(parser)) {
                 switch_case.pattern = parse_optional_some_pattern(parser);
             } else if (looks_like_variant_pattern_expr(parser)) {
@@ -2664,6 +2684,10 @@ static AstExpr* parse_equality(Parser* parser) {
         if (parser->current.kind == TOKEN_KW_IS) {
             bin->as.binary.op = AST_BIN_IS;
             advance(parser);
+            if (looks_like_legacy_optional_some_pattern(parser)) {
+                fail(parser, "optional pattern uses 'some name', not '.some(...)' or 'Option.some(...)'");
+                return 0;
+            }
             if (looks_like_optional_some_pattern(parser)) {
                 right = parse_optional_some_pattern(parser);
             } else if (looks_like_variant_pattern_expr(parser)) {
@@ -3006,6 +3030,10 @@ static AstStmt* parse_stmt(Parser* parser) {
                 switch_case.is_else = 1;
                 advance(parser);
             } else {
+                if (looks_like_legacy_optional_some_pattern(parser)) {
+                    fail(parser, "optional pattern uses 'some name', not '.some(...)' or 'Option.some(...)'");
+                    return 0;
+                }
                 if (looks_like_optional_some_pattern(parser)) {
                     switch_case.pattern = parse_optional_some_pattern(parser);
                 } else if (looks_like_variant_pattern_expr(parser)) {
