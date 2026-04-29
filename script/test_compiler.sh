@@ -87,6 +87,7 @@ run_all_compiler_samples() {
   run_compiler_sample lexer_minimal.jiang 0
   run_compiler_sample parser_minimal.jiang 0
   run_compiler_sample resolve_minimal.jiang 0
+  run_compiler_sample module_graph_minimal.jiang 0
   run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 }
 

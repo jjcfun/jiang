@@ -1,0 +1,204 @@
+import "./ast.jiang";
+import "./context.jiang";
+import "./lexer.jiang";
+import "./parser.jiang";
+import "./resolve.jiang";
+import "./source.jiang";
+import "./token.jiang";
+import arena = "./support/arena.jiang";
+import list = "./support/list.jiang";
+import string = "./support/string.jiang";
+
+public enum ModuleState {
+    empty,
+    parsed,
+    resolving,
+    resolved,
+}
+
+public struct Module {
+    public source.SourceFile source_file;
+    public ast.AstFile! ast_file;
+    public resolve.ResolveResult! result;
+    public list.ArenaList<Module!*> imports;
+    public ModuleState! state;
+
+    public init(arena.Arena* store, source.SourceFile source_file) {
+        self.source_file = source_file;
+        self.ast_file = ast.AstFile(store);
+        self.result = resolve.ResolveResult(store);
+        self.imports = list.ArenaList<Module!*>(store);
+        self.state = .empty;
+    }
+
+    public Int import_count() {
+        return self.imports.len();
+    }
+}
+
+public struct ModuleGraph {
+    context.CompilerContext* ctx;
+    arena.Arena* store;
+    list.ArenaList<source.SourceFile> sources;
+    list.ArenaList<Module!*> modules;
+
+    public init(context.CompilerContext* ctx) {
+        self.ctx = ctx;
+        self.store = ctx.ast_store_ptr();
+        self.sources = list.ArenaList<source.SourceFile>(self.store);
+        self.modules = list.ArenaList<Module!*>(self.store);
+    }
+
+    public source.SourceId add_source(UInt8[] path, UInt8[] text) {
+        source.SourceId id = source.SourceId(self.sources.len() + 1);
+        self.sources.add(source.SourceFile(id, path, text));
+        return id;
+    }
+
+    public Int source_count() {
+        return self.sources.len();
+    }
+
+    public Int module_count() {
+        return self.modules.len();
+    }
+
+    public Module!* module_at(Int index) {
+        return self.modules[index];
+    }
+
+    public Module!*? module_for_source(source.SourceId id) {
+        Int! index = 0;
+        while (index < self.modules.len()) {
+            Module!* module = self.modules[index];
+            if (module.source_file.id.equal(id)) {
+                return module;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Module!* parse(source.SourceId id) {
+        Module!* module = self.ensure_module(id);
+        self.parse_module(module);
+        return module;
+    }
+
+    public Module!* resolve_root(source.SourceId id) {
+        Module!* module = self.ensure_module(id);
+        self.resolve_module(module);
+        return module;
+    }
+
+    Module!* ensure_module(source.SourceId id) {
+        Module!*? existing = self.module_for_source(id);
+        if (existing is some module) {
+            return module;
+        }
+        source.SourceFile source_file = self.source_for_id(id);
+        Module!* module = self.store.create<Module>(Module(self.store, source_file));
+        self.modules.add(module);
+        return module;
+    }
+
+    source.SourceFile source_for_id(source.SourceId id) {
+        Int! index = 0;
+        while (index < self.sources.len()) {
+            source.SourceFile source_file = self.sources[index];
+            if (source_file.id.equal(id)) {
+                return source_file;
+            }
+            index = index + 1;
+        }
+        assert(false);
+        return self.sources[0];
+    }
+
+    source.SourceId? find_source(UInt8[] path) {
+        Int! index = 0;
+        while (index < self.sources.len()) {
+            source.SourceFile source_file = self.sources[index];
+            if (string.equal(source_file.path, path)) {
+                return source_file.id;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    () parse_module(Module!* module) {
+        if (module.state != .empty) {
+            return;
+        }
+
+        lexer.Lexer! lex = lexer.Lexer(self.ctx, module.source_file.text);
+        token.TokenBuffer! tokens = lex.tokenize();
+        parser.Parser! p = parser.Parser(self.ctx, tokens$.ptr());
+        module.ast_file = p.parse();
+        module.state = .parsed;
+        self.collect_imports(module);
+    }
+
+    () collect_imports(Module!* module) {
+        Int! index = 0;
+        while (index < module.ast_file.len()) {
+            ast.AstDecl decl = module.ast_file.decl_at(index);
+            self.collect_import(module, decl);
+            index = index + 1;
+        }
+    }
+
+    () collect_import(Module!* module, ast.AstDecl decl) {
+        if (decl is .import_decl(import_decl)) {
+            UInt8[] path = self.import_path(module, import_decl.path);
+            source.SourceId?! imported_source = self.find_source(path);
+            if (imported_source == null) {
+                self.ctx.diagnostics.add_error(import_decl.path, "unresolved import");
+                return;
+            }
+            Module!* imported_module = self.ensure_module(imported_source$.some());
+            module.imports.add(imported_module);
+        }
+    }
+
+    UInt8[] import_path(Module!* module, token.Span span) {
+        if (span.length < 2) {
+            return "";
+        }
+        return module.source_file.text[span.start + 1 .. span.end() - 1];
+    }
+
+    () resolve_module(Module!* module) {
+        if (module.state == .resolved) {
+            return;
+        }
+        if (module.state == .resolving) {
+            self.ctx.diagnostics.add_error(token.Span(), "cyclic import");
+            return;
+        }
+
+        self.parse_module(module);
+        module.state = .resolving;
+        self.resolve_imports(module);
+
+        resolve.Resolver! resolver = resolve.Resolver(self.ctx);
+        Int! index = 0;
+        while (index < module.imports.len()) {
+            Module!* imported_module = module.imports[index];
+            resolver.add_import_scope(imported_module.result.top_level);
+            index = index + 1;
+        }
+
+        module.result = resolver.resolve(module.ast_file$.ptr());
+        module.state = .resolved;
+    }
+
+    () resolve_imports(Module!* module) {
+        Int! index = 0;
+        while (index < module.imports.len()) {
+            self.resolve_module(module.imports[index]);
+            index = index + 1;
+        }
+    }
+}

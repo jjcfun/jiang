@@ -251,7 +251,49 @@ Package/module 依赖图。
 - dependency order
 - cycle diagnostics
 
-这个模块应独立于 parser 和 type checker 的细节。
+这个模块是 frontend 各阶段之间的调度边界。parser 仍然只负责单个 source 的语法解析，resolve 仍然只负责单个 AST 加导入 scope 的名称解析；跨文件 import、依赖顺序和循环检测由 ModuleGraph 统一处理。
+
+依赖图语义：
+
+- 图节点是 module/source file。
+- 有向边 `A -> B` 表示 `A` 直接 `import` 了 `B`，也就是 `A` 依赖 `B`。
+- 成功编译时，参与当前 root 的依赖子图应当是 DAG。
+- resolver/type checker/lowering/codegen 的执行顺序应是 dependency-first，也就是先处理 `B`，再处理 `A`。
+
+当前实现先使用内存注册模型：
+
+- `add_source(path, text)` 注册一个 source，并返回 `SourceId`。
+- `parse(id)` 确保对应 module 被解析为 AST。
+- `resolve_root(id)` 从 root module 开始递归解析 import，并按依赖优先顺序运行 resolve。
+- import path 当前来自 `import "path"` 的 string literal span，去掉首尾引号后按 `path` 精确匹配已注册 source。
+
+当前依赖解析使用 DFS 加 module state，等价于三色标记：
+
+- `empty`：module 还未 parse。
+- `parsed`：module 已经 parse，import 已收集，但还未 resolve。
+- `resolving`：module 正在 DFS 栈中，用于发现 import cycle。
+- `resolved`：module 及其直接/间接依赖已经 resolve。
+
+`resolve_root(root)` 的核心流程：
+
+1. 确保 root module 存在。
+2. parse root，并收集直接 import。
+3. 对每个 import 递归执行 resolve。
+4. 将已解析 import 的 top-level scope 加入当前 resolver。
+5. resolve 当前 module 的 AST。
+6. 标记为 `resolved`。
+
+这个算法的目标复杂度是 `O(V + E)`，其中 `V` 是 root 可达 module 数量，`E` 是 import 边数量。后续如果需要显式调度列表，可以在 DFS 完成后保存 dependency-first topo order，供 type check、HIR lowering、JIR lowering 和 backend 复用。
+
+当前限制：
+
+- 只支持内存 source registry，不做 filesystem/package discovery。
+- import path 不做规范化，也不解码 string escape。
+- import cycle 只报告最小错误，后续应输出完整 cycle path。
+- 直接 import 的 top-level scope 会整体加入当前 resolver；尚未实现 public/private 导出规则、re-export 和 import alias lookup。
+- `public import` 是语言目标语法，但当前 stage1 parser 暂时禁用；ModuleGraph 后续需要区分普通 import、re-export import 和 package dependency。
+- 多个 import 导出同名声明时，当前 resolve 还没有 ambiguity diagnostic。
+- package manifest、module name、source root 和跨 package dependency 尚未接入。
 
 ### `package_manifest.jiang`
 
