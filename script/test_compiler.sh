@@ -82,6 +82,7 @@ run_all_compiler_samples() {
   run_compiler_sample subscriptable_inferred_get_minimal.jiang 0
   run_compiler_sample subscriptable_inferred_set_minimal.jiang 0
   run_compiler_sample token_minimal.jiang 0
+  run_compiler_sample source_manager_minimal.jiang 0
   run_compiler_sample interner_minimal.jiang 0
   run_compiler_sample ast_minimal.jiang 0
   run_compiler_sample lexer_minimal.jiang 0

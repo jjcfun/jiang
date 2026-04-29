@@ -78,6 +78,18 @@ Stage0 中可能仍需要字符串 mangling，但这只能作为过渡实现。S
 
 后续应负责高层编译入口：读取 package/module 输入，构建共享上下文，按顺序运行各个编译阶段，并选择输出模式。这里不应该放 lexer、parser、resolver、type checker 或 backend 的细节。
 
+### `context.jiang`
+
+编译器共享上下文。
+
+当前职责：
+- `InternPool` 和 keyword symbols
+- `SourceManager`
+- AST arena
+- diagnostic arena 和 `DiagnosticBag`
+
+它拥有跨 frontend 阶段共享的长期状态。阶段内部的临时数据仍应放在对应阶段或局部 arena 中，不要无条件塞进 `CompilerContext`。
+
 ### `source.jiang`
 
 源文件和源码文本模型。
@@ -90,6 +102,20 @@ Stage0 中可能仍需要字符串 mangling，但这只能作为过渡实现。S
 - 诊断需要时的 line/column 查询
 
 span 数据优先使用字节偏移和字节长度。line/column 应该在诊断时计算，不要存到每个 token 上。
+
+### `source_manager.jiang`
+
+编译期 source registry。
+
+当前职责：
+- 分配 `SourceId`
+- 保存 `SourceFile`
+- 按 `SourceId` 取回 source
+- 按 path 查找已注册 source
+
+它由 `CompilerContext` 持有，现在仍然是内存注册模型，不读取文件系统。后续 package 编译入口应在这里或它的上层接入 path normalization、文件读取、source 去重、source root 和 dependency root 查找。
+
+`ModuleGraph` 不直接管理 source 列表，只通过 `SourceManager` 获取 import 目标。这样 graph 只保留依赖边、状态、cycle 和 resolve order。
 
 ### `diagnostic.jiang`
 
@@ -262,7 +288,7 @@ Package/module 依赖图。
 
 当前实现先使用内存注册模型：
 
-- `add_source(path, text)` 注册一个 source，并返回 `SourceId`。
+- `add_source(path, text)` 转发到 `SourceManager` 注册 source，并返回 `SourceId`。
 - `parse(id)` 确保对应 module 被解析为 AST。
 - `resolve_root(id)` 从 root module 开始递归解析 import，并按依赖优先顺序运行 resolve。
 - `resolve_order_len()` / `resolve_order_at(index)` 暴露已经 resolved 的 dependency-first 顺序。
