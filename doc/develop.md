@@ -194,7 +194,7 @@ parser 的输出应只是 AST。名称查找、重载解析、类型推导都放
 - binding lookup
 - 适当位置的重复声明检查
 
-这个模块描述可见性和查找结构，不做类型检查。
+`BindingId` 是当前模块内 binding 的稳定句柄，`DeclId` 指向对应的 AST 顶层声明位置。这个模块描述可见性和查找结构，不做类型检查。
 
 ### `resolve.jiang`
 
@@ -205,6 +205,8 @@ parser 的输出应只是 AST。名称查找、重载解析、类型推导都放
 - 连接 import/module
 - 发现 unresolved 或 ambiguous name
 - 为 HIR/type checking 准备已解析数据
+
+当前 `ResolveResult` 已记录 `resolved_type_paths` side table：每个成功解析的 type path 会被标记为 builtin type、本模块 binding 或 imported binding。后续 type checker 应优先消费这个结果表，避免重复实现 scope lookup。
 
 resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推导。
 
