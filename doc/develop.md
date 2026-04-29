@@ -308,7 +308,7 @@ Package/module 依赖图。
 1. 确保 root module 存在。
 2. parse root，并收集直接 import。
 3. 对每个 import 递归执行 resolve。
-4. 将已解析 import 的 top-level scope 加入当前 resolver。
+4. 将已解析 import 作为模块命名空间加入当前 resolver；`public import` 同时加入当前模块的 public module namespace。
 5. resolve 当前 module 的 AST。
 6. 标记为 `resolved`。
 
@@ -322,7 +322,7 @@ Package/module 依赖图。
 - import resolve 会为每条 import 绑定一个模块名；显式 alias 优先，否则从 import path 的文件名推导默认模块名。
 - `module.Name` 只查询被导入模块的 export scope；private top-level declaration 不会跨模块可见。
 - 普通 import 不会把被导入模块的 public name 平铺到当前模块。
-- `public import` 当前会把被导入模块的 export scope 合并进当前模块 export scope；完整模块名 re-export 规则后续继续细化。
+- `public import` 会把被导入模块作为 public module namespace 重新导出，不会摊平被导入模块的声明。例如 `middle` 中 `public import "leaf";` 后，外部通过 `middle.leaf.Name` 访问，而不是 `middle.Name`。
 - package dependency 和跨 package visibility 尚未接入。
 - 多个 import 导出同名声明时，当前 resolve 还没有 ambiguity diagnostic。
 - package manifest、module name、source root 和跨 package dependency 尚未接入。

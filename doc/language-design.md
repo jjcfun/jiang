@@ -249,9 +249,10 @@ value$.free();
 兼容性状态：
 
 - stage0 已支持 `public import`，但历史实现存在问题。
-- stage1 已恢复 `public import` 语法，并在 module graph / resolver 中建立最小模块名导入语义：普通 import 会绑定一个模块名，默认模块名来自文件名；访问被导入模块的 public API 需要写 `module.Name`。
+- stage1 已恢复 `public import` 语法，并在 module graph / resolver 中建立模块名导入语义：普通 import 会绑定一个模块名，默认模块名来自文件名；访问被导入模块的 public API 需要写 `module.Name`。
 - stage1 已支持最小 import alias lookup：`import math = "math"; math.Number` 会在被导入模块的 public API 中查找 `Number`。
-- `public import` 的完整模块名 re-export、ambiguous re-export、跨 package import 仍需后续细化。
+- stage1 已支持模块名 re-export：`public import "leaf";` 会导出 `leaf` 模块命名空间，外部通过 `current.leaf.Name` 访问，不会摊平为 `current.Name`。
+- ambiguous re-export、跨 package import 仍需后续细化。
 
 ## 函数和方法
 
@@ -522,11 +523,11 @@ if block is some! dead {
 - 普通 `import "path";` 会绑定一个模块名，默认模块名来自 import path 的文件名部分，例如 `import "utils/math.jiang";` 绑定模块名 `math`。
 - `import alias = "path";` 使用显式 alias 作为模块名。
 - 被导入模块的 public API 通过 `module.Name` 访问，不默认平铺到当前模块。
-- `public import` 导入当前模块使用，并将被导入模块的可见 API 作为当前模块 public API 的一部分重新导出；完整模块名 re-export 规则仍需细化。
+- `public import` 导入当前模块使用，并将被导入模块作为当前模块 public API 中的一个模块命名空间重新导出。它不摊平被导入模块的声明；例如 `middle` 中 `public import "leaf";` 后，外部通过 `middle.leaf.Name` 访问，而不是 `middle.Name`。
 - `public` 标记声明对外可见。
 - 基本类型不是关键字，由名字解析绑定到内建声明。
 
-兼容性状态：stage0 已支持默认模块名 import 和 `public import` re-export，但历史实现有问题；stage1 parser/module graph/resolver 已支持默认模块名、显式 import alias 和最小 re-export 语义。完整 alias re-export、ambiguous re-export 和 package path 解析仍需后续完善。
+兼容性状态：stage0 已支持默认模块名 import 和 `public import` re-export，但历史实现有问题；stage1 parser/module graph/resolver 已支持默认模块名、显式 import alias 和模块名 re-export。ambiguous re-export 和 package path 解析仍需后续完善。
 
 名称解析需要单独定稿：
 
@@ -555,7 +556,7 @@ Jiang 后续要支持自定义语法。当前原则：
 | 基本类型名作为 ident | 已支持 | 已支持 | resolver 绑定内建类型 |
 | char/string literal | 已支持 | 已支持 | expected type 规则待 type checker 固定 |
 | 默认模块名 import | 已支持 | 已解析 | resolver 支持 `module.Name` |
-| `public import` | 已支持但实现有问题 | 已解析 | module graph/resolver 已支持最小 re-export |
+| `public import` | 已支持但实现有问题 | 已解析 | module graph/resolver 已支持模块名 re-export |
 | alias/global/function | 已支持 | 已解析 | resolver/type checker 未完成 |
 | 参数 label/default | 历史支持 | 部分解析 | 目标语言不支持，stage1 待清理 |
 | struct | 已支持 | 已解析 | init/deinit 缺口 |
@@ -612,7 +613,7 @@ resolver/type checker 开始前，需要先明确这些模型：
 - 维护 Feature Matrix，标注 stage0 已支持、stage1 已解析、stage1 缺口和未定设计。
 - 清理 stage1 中参数 label/default 的 AST/parser 预留或标记为无效语法。
 - 决定 `record`、init/deinit 的正式语法和 stage1 对齐策略。
-- 完善 `public import` 的 alias re-export、ambiguous re-export 和跨 package visibility 规则。
+- 完善 `public import` 的 ambiguous re-export 和跨 package visibility 规则。
 - 决定 null-check narrowing、errorable `T@E` 与 `try/catch` 的精确规则。
 - 决定 `T*` / `T&` 在 semantic type 中是否分离，以及 auto-deref 的精确规则。
 
