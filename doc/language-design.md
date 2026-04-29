@@ -250,7 +250,8 @@ value$.free();
 
 - stage0 已支持 `public import`，但历史实现存在问题。
 - stage1 已恢复 `public import` 语法，并在 module graph / resolver 中建立最小 re-export 语义：普通 import 只导入被导入模块的 public API 给当前模块使用；`public import` 会进一步把该 public API 合并进当前模块的 export scope。
-- import alias、ambiguous re-export、跨 package import 仍需后续细化。
+- stage1 已支持最小 import alias lookup：`import math = "math"; math.Number` 会在被导入模块的 public API 中查找 `Number`。
+- ambiguous re-export、跨 package import 仍需后续细化。
 
 ## 函数和方法
 
@@ -522,7 +523,7 @@ if block is some! dead {
 - `public` 标记声明对外可见。
 - 基本类型不是关键字，由名字解析绑定到内建声明。
 
-兼容性状态：stage0 已支持 `public import` re-export，但历史实现有问题；stage1 parser/module graph/resolver 已支持最小 re-export 语义。import alias、ambiguous re-export 和 package path 解析仍需后续完善。
+兼容性状态：stage0 已支持 `public import` re-export，但历史实现有问题；stage1 parser/module graph/resolver 已支持最小 re-export 语义和 import alias lookup。ambiguous re-export 和 package path 解析仍需后续完善。
 
 名称解析需要单独定稿：
 
@@ -607,7 +608,7 @@ resolver/type checker 开始前，需要先明确这些模型：
 - 维护 Feature Matrix，标注 stage0 已支持、stage1 已解析、stage1 缺口和未定设计。
 - 清理 stage1 中参数 label/default 的 AST/parser 预留或标记为无效语法。
 - 决定 `record`、init/deinit 的正式语法和 stage1 对齐策略。
-- 完善 `public import` 的 import alias、ambiguous re-export 和跨 package visibility 规则。
+- 完善 `public import` 的 alias re-export、ambiguous re-export 和跨 package visibility 规则。
 - 决定 null-check narrowing、errorable `T@E` 与 `try/catch` 的精确规则。
 - 决定 `T*` / `T&` 在 semantic type 中是否分离，以及 auto-deref 的精确规则。
 

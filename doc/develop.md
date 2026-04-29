@@ -321,7 +321,8 @@ Package/module 依赖图。
 - import cycle 会在触发循环的 import span 上报错，并对已知的循环边补充 note；后续应输出完整格式化 cycle path。
 - import resolve 只使用被导入模块的 export scope；private top-level declaration 不会跨模块可见。
 - `public import` 会把被导入模块的 export scope 合并进当前模块 export scope。
-- import alias lookup、package dependency 和跨 package visibility 尚未接入。
+- import alias 可以用于解析 `alias.Name`，目标只查被导入模块的 export scope。
+- package dependency 和跨 package visibility 尚未接入。
 - 多个 import 导出同名声明时，当前 resolve 还没有 ambiguity diagnostic。
 - package manifest、module name、source root 和跨 package dependency 尚未接入。
 
