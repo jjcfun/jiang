@@ -90,8 +90,8 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T<A, B>`：泛型类型参数。
 - `(A, B)`：tuple type。
 - `T!`：当前类型层级的可变 flag。
-- `T?`：当前类型层级的 optional flag。
-- `T?!`：当前类型层级同时带 optional 和 mutable flag 的规范写法。
+- `T?`：内建 optional 类型层；optional 不是可直接命名的 `Option<T>` 普通泛型类型。
+- `T?!`：optional 类型层可变的规范写法。
 - `T*`：自动解引用的单对象指针。
 - `T&`：临时引用。
 - `T[]`：slice。
@@ -114,12 +114,12 @@ Result?!@Error maybe_result;
 
 ## 可变性
 
-`!` 表示当前类型层级可变。它不表示 optional，也不表示空值。
+可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变；它不表示 optional，也不表示空值。
 
-`!` 和 `?` 是同一类型层级上的 flag，不表示嵌套 wrapper。同一类型层级中，每种 flag 最多出现一次。为了避免用户在不同排列之间做选择，如果同一层级同时出现 `?` 和 `!`，源码只能写成 `T?!`：
+`!` 和 `?` 都作用在当前类型层级。同一类型层级中，每种标记最多出现一次。为了避免用户在不同排列之间做选择，如果同一层级同时出现 `?` 和 `!`，源码只能写成 `T?!`：
 
 ```jiang
-Int?! value; // optional + mutable
+Int?! value; // optional 层可变
 ```
 
 `T!?` 是语法错误，编译器可以恢复为 `T?!` 继续解析，但必须报告 diagnostic。
@@ -139,9 +139,43 @@ T! value; // 归一化为 Int!
 Bool! flag = true;
 flag = false;
 
-Int![_] items = [1, 2, 3]; // 元素可变
-Int[_]! other = [1, 2, 3]; // 变量可重新赋值
+Int[3] values = [1, 2, 3];
+Int[3]! mutable_values = values; // 外层数组值可重新赋值
+mutable_values = [4, 5, 6];
+
+Int![3]! mutable_items = [1, 2, 3]; // 显式声明：元素层和外层数组值都可变
+mutable_items[0] = 10;
+mutable_items = [4, 5, 6];
 ```
+
+变量、参数、全局变量和字段声明如果写出了完整左侧类型，则以左侧声明类型为准。左侧类型可以表达每个类型层级的可变性，例如 `Int![3]!` 表示元素层是 `Int!`，外层数组值也是可变层。初始化器只负责提供值，不能反过来改变左侧声明出来的分层可变性。
+
+类型推导场景不同：如果左侧没有写出完整类型结构，只能对推导结果的最外层追加可变性。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 record 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
+
+解构语法可以为每个解构出来的绑定重新指定可变性，因为解构本质上是在声明多个局部绑定。但这种可变性也只作用于对应元素类型的最外层，不能深入修改该元素类型的内部层级：
+
+```jiang
+(Int, User) pair = (1, user);
+(_! count, _! current_user) = pair; // count 和 current_user 两个绑定本身可变
+
+(Int[3]) arrays = ([1, 2, 3]);
+(_! inferred_array) = arrays; // 只能让 inferred_array 这个外层绑定可变
+```
+
+内部成员的可变性来自类型定义本身。对于 `struct` / `record` 字段、tuple 元素、union payload、数组元素，只要成员类型在其定义处是可变的，该成员就总是可变；这不受外层变量本身是否带 `!` 影响：
+
+```jiang
+struct User {
+    Int id;
+    Int! age;
+}
+
+User user = User(id: 1, age: 18);
+user.age = 19; // 允许：age 字段自身是可变字段
+user.id = 2;   // 编译错误：id 字段自身不可变
+```
+
+数组、tuple、union、record 也遵循同一条分层规则：外层变量的可变性只控制外层绑定；成员或元素能否被修改，由成员或元素类型自己的可变性决定。
 
 编译器内部泛型约束中，`MaybeMutable` 用于表示类型参数可能带可变性。
 
@@ -182,6 +216,17 @@ value$.free();
 - `Type$.alloc_array(n)`：分配数组。
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
+
+未来规划：隐式操作层会纳入 capability 系统。`$` 不是绕过语言规则的普通后门，而是进入受编译期 capability 约束的低层操作层。每个 `$` 操作都需要对应能力；缺少能力时编译失败。
+
+初步分类：
+
+- 总是安全或低风险的编译期查询：`Type$.size()`、`Type$.align()`、`Type$.max_align()`。
+- 类型系统强制操作：`optional$.some()`，后续需要定义失败时的诊断、trap 或静态证明规则。
+- 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.free()`、`Type$.alloc()`、`Type$.alloc_array(n)`。
+- 需要 unsafe/cast 能力：`value$.as(Type)`。
+
+`compiler/` 目录内的自举编译器源码默认拥有全部 capability，这是编译器实现的特殊配置，不代表普通 Jiang 包默认拥有这些能力。普通包默认应采用最小能力集合，并通过显式配置或受控上下文获得额外能力。
 
 ## 声明
 
@@ -288,7 +333,7 @@ trait Hashable {
 
 extend Int: Hashable {
     UInt64 hash() {
-        return self$.as(UInt64);
+        return UInt64(self);
     }
 }
 ```
@@ -341,7 +386,7 @@ T id<T>(T value);
 
 Optional 使用 `T?` 表示。
 
-`?` 是当前类型层级的 optional flag，不按 nested union wrapper 处理。`Int?` 表示该类型层级允许为空；`Int?!` 表示同一类型层级同时带 optional 和 mutable flag。
+`?` 是语言内建 optional 类型层，不暴露为可直接命名的 `Option<T>` 普通泛型类型。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
 
 重复 optional 标记是语法错误。编译器恢复时可以把 `T??` 当作 `T?` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `!` 也要报错，例如 `T?!?`。
 
@@ -358,12 +403,31 @@ T? value; // 归一化为 Int?
 - coalesce: `value ?? fallback`
 - early-exit coalesce: `value ?? return`
 - 强制解包: `value$.some()`
+- 条件解包 pattern: `value is some payload`
+- 可变条件解包 pattern: `value is some! payload`
 
-stage0 已支持 `x == null` / `x != null` 分支窄化。目标设计仍偏向显式 optional handling，但这里不能简单写成“不做 if 内自动 unwrap”。下一步需要决定：
+`some` 是 optional pattern 位置的 contextual keyword，类似 `init` 在初始化声明中的特殊角色；它不是普通类型名，也不是 `Option.some` 这种公开 union variant。`some! payload` 的 `!` 只改变解包后绑定的最外层可变性，不改变 payload 类型内部层级。
 
-- 是否正式保留 null-check narrowing。
-- narrowing 后变量是在分支内临时视图，还是产生新的 narrowed binding。
-- pattern matching 与 null-check narrowing 的优先级。
+示例：
+
+```jiang
+if value is some payload {
+    // payload: T
+}
+
+if value is some! payload {
+    // payload: T!
+}
+
+switch value {
+    some payload => ...
+    null => ...
+}
+```
+
+同一个 optional match/switch 层级中，`some payload` 与 `some! payload` 只能二选一；它们匹配范围相同，只是绑定可变性不同，同时出现是编译错误。
+
+stage0 已支持 `x == null` / `x != null` 分支窄化。目标设计仍偏向显式 optional handling；后续需要决定 null-check narrowing 是长期保留，还是只作为旧代码兼容能力。
 
 Errorable 使用 `T@E` 表示。`@E` 是 errorable 边界，`?` 和 `!` 只能作用在 `@` 左侧的值类型层，不能作用在 errorable 类型层或错误类型顶层。
 
@@ -440,14 +504,14 @@ pattern 目前包括：
 示例方向：
 
 ```jiang
-if value is .some(_ payload) {
+if value is some payload {
 }
 
-if block is .some(_! dead) {
+if block is some! dead {
 }
 ```
 
-是否支持更多 Swift/Rust 风格的 binding form，需要后续定稿。
+`some` / `some!` 只用于 optional pattern。普通 union variant 仍然使用 variant pattern，不复用 optional 的 `some` 语法。
 
 ## Module 和 Visibility
 

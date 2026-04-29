@@ -62,6 +62,27 @@ Int[3]* b = new [1, 2, 3]
 Int?[3]* c = new [1, null, 3]
 ```
 
+### 可变性
+
+可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变：
+
+```c
+Bool! flag = true;
+flag = false;
+
+Int[3] values = [1, 2, 3];
+Int[3]! mutable_values = values; // 外层数组值可重新赋值
+mutable_values = [4, 5, 6];
+
+Int![3]! mutable_items = [1, 2, 3]; // 元素层和外层数组值都可变
+mutable_items[0] = 10;
+mutable_items = [4, 5, 6];
+```
+
+如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导场景只能修改推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 record 字段等内部层级的可变性。
+
+结构体、record、tuple、union 和数组的内部成员是否可修改，由成员类型自己的可变性决定，不由外层变量是否带 `!` 决定。
+
 ### 基本类型
 
 ```c
@@ -77,7 +98,7 @@ Float16 num5 = 1.5;
 Float32 num6 = 2.5;
 Float64 num7 = 3.5;
 
-// 类型后紧跟'!'号，表示可变
+// 类型后紧跟'!'号，表示当前类型层级可变
 Bool! foo = true;
 foo = false;
 
@@ -95,19 +116,26 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 - 字符串字面量按 UTF-8 字节序列处理，当前仍使用 `UInt8[_]` / `UInt8[]`
 - `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
 
-当前数值自动提升仅覆盖 `Int / Float / Double`：
+数值字面量在类型检查前保持未定型，优先由上下文决定最终类型。普通已经定型的数值之间不做隐式提升：
 
 ```c
-Float f = 0.5$.as(Float);
-Float a = 2 + f;   // Int + Float -> Float
-Double b = 2 + 0.5; // Int + Double -> Double
+Float f = 0.5;          // 0.5 按期望类型定为 Float
+Float a = 2 + f;        // 2 是字面量，可按 Float 参与表达式
+Double b = 2 + 0.5;     // 2 和 0.5 按 Double 参与表达式
+
+Int two = 2;
+Float c = two + f;      // 错误：Int 变量不会隐式提升为 Float
 ```
 
-`%` 仍然只允许整数参与；`Double -> Float`、`Float/Double -> Int` 仍需要显式 `as`。
+安全的数值转换使用类型初始化形式，例如 `Float(two)`、`Double(f)`、`Int(f)`。`$.as(Type)` 是低层强制转换，不保证类型安全，不作为普通数值转换的推荐写法。
+
+`%` 仍然只允许整数参与；`Double -> Float`、`Float/Double -> Int` 等窄化转换需要显式写出目标类型。
 
 
 
-### 可选类型 (Option)
+### 可选类型 (Optional)
+
+Optional 是语言内建类型层，使用 `T?` 表示。当前设计不把它暴露为可直接命名的 `Option<T>` 普通泛型类型。
 
 ```c
 Int? a1 = 123;
@@ -121,11 +149,15 @@ _ b2 = b1?.x;
 // 可选类型还支持链式调用
 _ foo = x?.y?.z
 
-// 判空解包
-if a1 == Option.some(_ x) {
+// 条件解包
+if a1 is some x {
   // 这里x不为null，类型为Int
 } else {
 	// 这里x为null
+}
+
+if a1 is some! x {
+  // 这里x为可变绑定
 }
 ```
 
@@ -178,9 +210,12 @@ defer {
 
 
 
-### 类型转换 (Type Casting)
+### 类型转换与隐式操作层
 
-Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
+Jiang 语言把安全转换和低层强制转换分开：
+
+- `Type(value)`：安全转换或初始化，由目标类型的 `init` 规则决定。
+- `value$.as(Type)`：强制转换，不保证类型安全，主要用于底层实现、指针转换或能力受控的场景。
 
 这里的 `$` 符号表示**进入隐式操作层**。可以把它理解成：对一个值或一个类型，切换到它的“隐式层 / 元层”再进行操作。
 
@@ -196,7 +231,7 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
 
 例如：
 
-- `a$.as(Int)`：对值 `a` 做类型转换
+- `a$.as(Int)`：对值 `a` 做低层强制转换
 - `a$.ref()`：从值 `a` 获取一个临时引用
 - `a$.ptr()`：从值 `a` 获取一个裸指针
 - `a$.addr()`：获取值 `a` 的地址值
@@ -228,21 +263,25 @@ Jiang 语言支持显式的类型转换，采用 `a$.as(Type)` 的语法。
   - `printf`
   - `abort`
 
-`as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数。
+普通数值转换优先使用目标类型初始化：
 
 ```c
 Float f = 10.5;
 
 // 将 Float 转换为 Int
-Int i = f$.as(Int);
+Int i = Int(f);
 
 print("i = %d", i); // 输出：i = 10
 
 // 将 Int 转换为 UInt8
 Int val = 255;
-UInt8 small_val = val$.as(UInt8);
+UInt8 small_val = UInt8(val);
+```
 
-// 注意：某些危险的转换（如指针强转）可能需要包裹在 sudo 块中
+`as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换：
+
+```c
+// 注意：某些危险的转换（如指针强转）需要对应 capability
 Int addr = 0x12345678;
 sudo {
     Int* ptr = addr$.as(Int*);
