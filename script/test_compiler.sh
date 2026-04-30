@@ -112,6 +112,7 @@ run_all_compiler_samples() {
   run_compiler_sample type_minimal.jiang 0
   run_compiler_sample lower_hir_minimal.jiang 0
   run_compiler_sample lower_jir_minimal.jiang 0
+  run_compiler_sample llvm_ffi_minimal.jiang 0
   run_compiler_sample codegen_llvm_minimal.jiang 0
   run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 }

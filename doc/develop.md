@@ -469,6 +469,23 @@ Package 元数据。
 - package name/version/type
 - 后续 source root 和 dependency metadata
 
+### `llvm/ffi.jiang`
+
+LLVM C API 薄绑定。
+
+预期职责：
+- 定义 LLVM opaque handle pointee types，例如 `LLVMContextRef*`、`LLVMModuleRef*`、`LLVMBuilderRef*`、`LLVMTypeRef*`、`LLVMValueRef*`、`LLVMBasicBlockRef*`
+- 声明 LLVM 21.1.x C API 的最小 extern surface
+- 记录资源释放边界：`LLVMContextCreate` / `LLVMContextDispose`、`LLVMModuleCreateWithNameInContext` / `LLVMDisposeModule`、`LLVMCreateBuilderInContext` / `LLVMDisposeBuilder`、message / `LLVMDisposeMessage`
+
+这里不做中层 builder 抽象，不隐藏 LLVM 语义，也不负责 target machine 或 object emission。第一批只覆盖生成 LLVM IR 所需的 context、module、builder、type、function、global、basic block、alloca/load/store/return/branch、verify 和 print module API。由于 stage0 的 `alias` 仍是符号别名而不是完整类型别名，LLVM `*Ref` 暂时建模为 Jiang opaque pointee struct，并在签名中显式写成 `LLVMContextRef*` 这类形式。
+
+### `llvm/api.jiang`
+
+LLVM backend facade model。
+
+当前这个文件不是 LLVM C API 绑定，而是 stage1 backend 测试用的 facade instruction model。它用于固定 JIR 到 backend 的边界，方便在真实 LLVM lowering 完成前验证 `codegen.jiang` 消费了哪些 JIR 结构。
+
 ### `llvm/codegen.jiang`
 
 LLVM backend。
