@@ -54,7 +54,7 @@ Token 只表示词法事实，不承载语义类型。
 已确定：
 
 - identifier 和基本类型名统一为 `ident`。
-- 关键字包括 `import`、`public`、`alias`、`extern`、`return`、`if`、`else`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、`extend`、`type`、`static`、`switch`、`try`、`catch`、`break`、`continue`、`defer`、`throw`、`true`、`false`、`null`、`Self`。
+- 关键字包括 `import`、`public`、`alias`、`extern`、`return`、`if`、`else`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、`extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、`defer`、`throw`、`true`、`false`、`null`、`Self`。
 - 字符字面量使用单引号，例如 `'a'`。
 - 字符串字面量使用双引号，文本按 UTF-8 字节序列处理。
 - `Span` 使用字节偏移和字节长度；line/column 在诊断阶段计算。

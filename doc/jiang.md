@@ -1768,11 +1768,11 @@ Int b = counter.apply(true);
 - 同名不同签名的方法按普通重载规则区分
 - 同名同签名的多个 trait requirement 可以共用同一份实现
 
-trait 还可以在 trait 体内部使用 `type` 声明关联类型：
+trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
 
 ```c
 trait Iterator {
-  type Item;
+  associated Item;
   Item next();
 }
 ```
@@ -1781,7 +1781,7 @@ trait Iterator {
 
 ```c
 trait HasItem {
-  type Item: Hashable & Equatable;
+  associated Item: Hashable & Equatable;
   Item item();
 }
 ```
@@ -1790,7 +1790,7 @@ trait HasItem {
 
 ```c
 trait Iterator {
-  type Item;
+  associated Item;
   Item next();
 }
 
@@ -1804,8 +1804,8 @@ trait ByteIterator: Iterator {
 
 ```c
 public trait SubscriptGet {
-  type Index: Equatable;
-  type Value;
+  associated Index: Equatable;
+  associated Value;
 
   Value subscript_get(Index index);
 }
@@ -1828,9 +1828,9 @@ public trait SubscriptSet: SubscriptGet {
 - 用户自定义类型若要满足某个 trait，当前需要在类型定义处显式声明
 - 仅仅“方法签名刚好匹配”并不会自动满足 trait
 - 实现子 trait 的类型，会自动被视为也实现其父 trait
-- trait 的关联类型使用 `type Name;` 声明
-- 关联类型 bound 可写作 `type Item: Hashable;`
-- 多个关联类型 bound 可写作 `type Item: Hashable & Equatable;`
+- trait 的关联类型使用 `associated Name;` 声明
+- 关联类型 bound 可写作 `associated Item: Hashable;`
+- 多个关联类型 bound 可写作 `associated Item: Hashable & Equatable;`
 - 子 trait 会继承父 trait 的关联类型，且当前不允许重新声明父 trait 的同名关联类型
 - 子 trait 可以通过 `@where(Item: Hashable)` 或 `@where(Item = UInt8)` 继续约束继承来的关联类型
 - `@where(...)` 中多个 trait 约束也支持 `&`，例如 `@where(T: Hashable & Equatable)`
@@ -1866,12 +1866,12 @@ struct Box: HasValue {
 
 ```c
 trait Iterator {
-  type Item;
+  associated Item;
   Item next();
 }
 
 struct Counter: Iterator {
-  type Item = UInt8;
+  associated Item = UInt8;
 
   UInt8 next() {
     return 42;
@@ -1883,18 +1883,18 @@ struct Counter: Iterator {
 
 ```c
 trait Left {
-  type Item;
+  associated Item;
   Item left();
 }
 
 trait Right {
-  type Item;
+  associated Item;
   Item right();
 }
 
 struct Pair: Left, Right {
-  type Left.Item = UInt8;
-  type Right.Item = UInt8;
+  associated Left.Item = UInt8;
+  associated Right.Item = UInt8;
 
   UInt8 left() {
     return 20;
@@ -1912,14 +1912,14 @@ struct Pair: Left, Right {
 
 ```c
 trait Iterator {
-  type Item;
+  associated Item;
   Item next();
 }
 
 struct Counter {}
 
 extend Counter: Iterator {
-  type Item = UInt8;
+  associated Item = UInt8;
 
   UInt8 next() {
     return 42;
