@@ -385,7 +385,7 @@ Jiang backend lowering IR。
 
 JIR 应避免源码级语法形态。它是进入 LLVM-specific lowering 前的边界。
 
-当前第一版 JIR 仍保持 flat arena list，不直接降成 CFG。`JirDeclId` / `JirStmtId` / `JirExprId` / `JirPatternId` / `JirTempId` 是强类型索引，节点继续携带 `BindingId`、`LocalBindingId` 和 `TypeId`。JIR 已经能承接当前 HIR 的主要 declaration、statement、expression 和 pattern，包括 switch、try、for、coalesce、pattern-bearing `is`、field/index/slice、struct literal、variant、tuple、array、optional pattern 和 variant pattern。`defer` 不再作为源码级 statement 保留，`lower_jir` 会在 block 退出点插入显式 `run_defer` statement；局部变量初始化中的 `?? return/break/continue` 会降成 `coalesce_control_local` statement；局部变量初始化、assignment、return/throw value 右侧的 block/if/switch/try expression 会拆成 statement + temporary/assignment；`value is some binding` 会降成 `optional_is_some` expression；普通 `is pattern` 和 switch case 会携带显式 pattern test/bind 列表；`if` expression 会降成 `select` expression。JIR expression 层不再保留 `coalesce_control`、`block`、`if_expr`、`switch_expr`、`try_expr` 这些源码级高层 case。
+当前第一版 JIR 仍保持 flat arena list，不直接降成 CFG。`JirDeclId` / `JirStmtId` / `JirExprId` / `JirPatternId` / `JirTempId` 是强类型索引，节点继续携带 `BindingId`、`LocalBindingId` 和 `TypeId`。JIR 已经能承接当前 HIR 的主要 declaration、statement、expression 和 pattern，包括 switch、try、for、pattern-bearing `is`、field/index/slice、struct literal、variant、tuple、array、optional pattern 和 variant pattern。`defer` 不再作为源码级 statement 保留，`lower_jir` 会在 block 退出点插入显式 `run_defer` statement；局部变量初始化中的 `?? return/break/continue` 会降成 `coalesce_control_local` statement；普通 `??`、`catch` expression、block/if/switch/try expression 会拆成 statement + temporary/assignment；`value is some binding` 会降成 `optional_is_some` expression；普通 `is pattern`、switch case 和 for-each pattern 会携带显式 pattern test/bind 列表。JIR expression 层不再保留 `coalesce_control`、`coalesce`、`catch_handler`、`block`、`if_expr`、`switch_expr`、`try_expr` 这些源码级高层 case。
 
 ### `lower_jir.jiang`
 
@@ -398,7 +398,7 @@ HIR 到 JIR 的 lowering。
 
 这里不要放 LLVM API 细节。
 
-当前实现只消费 `HirModule`，不重新做名称解析或类型推导。第一版先把 HIR 中的 resolved ID、`TypeId` 和高层结构稳定搬入 JIR，保证普通 HIR 节点不会落到 `unsupported`；其中 `defer` 已经降成显式退出前执行的 `run_defer`，`?? return/break/continue` 已经从表达式降成局部初始化 statement，局部初始化、assignment 和 return/throw value 的控制流表达式已经拆成 statement + temporary/assignment。后续如果继续降低控制流，应优先从当前 structured block 过渡到 CFG，而不是重新引入源码级 expression case。
+当前实现只消费 `HirModule`，不重新做名称解析或类型推导。第一版先把 HIR 中的 resolved ID、`TypeId` 和高层结构稳定搬入 JIR，保证普通 HIR 节点不会落到 `unsupported`；其中 `defer` 已经降成显式退出前执行的 `run_defer`，`?? return/break/continue` 已经从表达式降成局部初始化 statement，普通 `??` 和 `catch` expression 也已经拆成 statement + temporary/assignment。后续如果继续降低控制流，应优先从当前 structured block 过渡到 CFG，而不是重新引入源码级 expression case。
 
 ### `module_graph.jiang`
 
@@ -494,8 +494,8 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 
 - `switch_stmt`：按 case 顺序 emit branch chain；每个 case 先 emit pattern tests，成功后 emit binds 和 body。
 - pattern tests/binds：optional `some`、variant tag、tuple item、literal compare、binding payload materialization 都应降成明确的 load/compare/store。
-- `try_stmt` / `catch_handler`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
-- `coalesce`：普通 optional coalesce 需要降成 optional test + value/default branch；`coalesce_control_local` 已经是 statement 级 early-exit 形式，但 backend 仍要生成 left test 和对应 control flow。
+- `try_stmt`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
+- `coalesce_control_local`：statement 级 early-exit 形式，backend 需要生成 left test 和对应 control flow。
 - `optional_is_some` / `is_expr`：需要按 type/pattern 生成测试和绑定，不应在 backend 重新解释源码 pattern。
 
 暂不进入第一版 backend 的内容：
