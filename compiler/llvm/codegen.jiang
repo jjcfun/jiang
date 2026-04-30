@@ -3,7 +3,9 @@ import llvm_ffi = "./ffi.jiang";
 import "../ast.jiang";
 import "../context.jiang";
 import "../jir.jiang";
+import "../scope.jiang";
 import types = "../type.jiang";
+import arena = "../support/arena.jiang";
 import list = "../support/list.jiang";
 
 struct RealCodegen {
@@ -61,6 +63,64 @@ struct RealCodegen {
     }
 }
 
+struct RealLocalSlot {
+    scope.LocalBindingId local_id;
+    jir.JirTempId temp_id;
+    llvm_ffi.LLVMValueRef* slot;
+    llvm_ffi.LLVMTypeRef* type_ref;
+
+    init(scope.LocalBindingId local_id, jir.JirTempId temp_id, llvm_ffi.LLVMValueRef* slot, llvm_ffi.LLVMTypeRef* type_ref) {
+        self.local_id = local_id;
+        self.temp_id = temp_id;
+        self.slot = slot;
+        self.type_ref = type_ref;
+    }
+}
+
+struct RealFunctionEnv {
+    list.ArenaList<RealLocalSlot> slots;
+
+    init(arena.Arena* store) {
+        self.slots = list.ArenaList<RealLocalSlot>(store);
+    }
+
+    public () add_local(scope.LocalBindingId local_id, llvm_ffi.LLVMValueRef* slot, llvm_ffi.LLVMTypeRef* type_ref) {
+        self.slots.add(RealLocalSlot(local_id, jir.JirTempId(), slot, type_ref));
+    }
+
+    public () add_temp(jir.JirTempId temp_id, llvm_ffi.LLVMValueRef* slot, llvm_ffi.LLVMTypeRef* type_ref) {
+        self.slots.add(RealLocalSlot(scope.LocalBindingId(), temp_id, slot, type_ref));
+    }
+
+    public Int find_local(scope.LocalBindingId local_id) {
+        Int! index = 0;
+        while (index < self.slots.len()) {
+            RealLocalSlot slot = self.slots[index];
+            if (slot.local_id.valid()) {
+                if (slot.local_id.id == local_id.id) {
+                    return index;
+                }
+            }
+            index = index + 1;
+        }
+        return -1;
+    }
+
+    public Int find_temp(jir.JirTempId temp_id) {
+        Int! index = 0;
+        while (index < self.slots.len()) {
+            RealLocalSlot slot = self.slots[index];
+            if (slot.temp_id.valid()) {
+                if (slot.temp_id.id == temp_id.id) {
+                    return index;
+                }
+            }
+            index = index + 1;
+        }
+        return -1;
+    }
+}
+
 public UInt8* emit_minimal_main_ir() {
     llvm_ffi.LLVMContextRef* context_ref = llvm_ffi.LLVMContextCreate();
     llvm_ffi.LLVMModuleRef* module_ref = llvm_ffi.LLVMModuleCreateWithNameInContext("jiang", context_ref);
@@ -84,6 +144,9 @@ public () dispose_llvm_message(UInt8* message) {
 }
 
 llvm_ffi.LLVMTypeRef* real_result_type_ref(context.CompilerContext* ctx, types.TypeTable* type_table, types.TypeId type_id, llvm_ffi.LLVMContextRef* context_ref) {
+    if (!type_id.valid()) {
+        return llvm_ffi.LLVMInt64TypeInContext(context_ref);
+    }
     types.TypeInfo info = type_table.type_at(type_id);
     if (info.kind == .unit) {
         return llvm_ffi.LLVMVoidTypeInContext(context_ref);
@@ -97,6 +160,21 @@ llvm_ffi.LLVMTypeRef* real_result_type_ref(context.CompilerContext* ctx, types.T
         }
     }
     return llvm_ffi.LLVMInt64TypeInContext(context_ref);
+}
+
+Bool real_uses_i64_result_type(context.CompilerContext* ctx, types.TypeTable* type_table, types.TypeId type_id) {
+    if (!type_id.valid()) {
+        return true;
+    }
+    types.TypeInfo info = type_table.type_at(type_id);
+    if (info.kind == .unit) {
+        return false;
+    }
+    if (info.kind == .builtin) {
+        if (ctx.symbol_equal(info.symbol, "Bool")) { return false; }
+        if (ctx.symbol_equal(info.symbol, "UInt8")) { return false; }
+    }
+    return true;
 }
 
 llvm_ffi.LLVMTypeRef* real_function_type_ref(context.CompilerContext* ctx, types.TypeTable* type_table, llvm_ffi.LLVMContextRef* context_ref, jir.JirFunctionDecl function_decl, llvm_ffi.LLVMTypeRef* result_type) {
@@ -326,7 +404,10 @@ llvm_ffi.LLVMValueRef* real_call_value(context.CompilerContext* ctx, types.TypeT
     UInt8* callee_name = real_callee_name(ctx, input, call.callee);
     llvm_ffi.LLVMValueRef* callee_value = llvm_ffi.LLVMGetNamedFunction(module_ref, callee_name);
     jir.JirExpr callee_expr = input.expr_at(call.callee);
-    types.TypeInfo callee_type = type_table.type_at(callee_expr.type_id);
+    types.TypeInfo! callee_type = types.TypeInfo(.invalid, callee_expr.span);
+    if (callee_expr.type_id.valid()) {
+        callee_type = type_table.type_at(callee_expr.type_id);
+    }
     if (call.args.len() == 0) {
         llvm_ffi.LLVMTypeRef* function_type = llvm_ffi.LLVMFunctionType(result_type, null, 0, 0);
         return llvm_ffi.LLVMBuildCall2(builder_ref, function_type, callee_value, null, 0, "calltmp");
@@ -393,6 +474,166 @@ llvm_ffi.LLVMValueRef* real_expr_value(context.CompilerContext* ctx, types.TypeT
         return real_call_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, call, result_type);
     }
     return real_default_value(result_type);
+}
+
+llvm_ffi.LLVMValueRef* real_env_name_value(context.CompilerContext* ctx, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, jir.JirNameExpr name, RealFunctionEnv* env, llvm_ffi.LLVMTypeRef* result_type) {
+    Int local_index = env.find_local(name.local_id);
+    if (local_index >= 0) {
+        RealLocalSlot slot = env.slots[local_index];
+        return llvm_ffi.LLVMBuildLoad2(builder_ref, slot.type_ref, slot.slot, "local.load");
+    }
+
+    Int param_index = real_param_index(function_decl, name);
+    if (param_index >= 0) {
+        return llvm_ffi.LLVMGetParam(function_value, UInt32(param_index));
+    }
+
+    if (name.binding_id.valid()) {
+        llvm_ffi.LLVMValueRef* global_value = llvm_ffi.LLVMGetNamedGlobal(module_ref, ctx.symbol_c_string(name.name.symbol));
+        return llvm_ffi.LLVMBuildLoad2(builder_ref, result_type, global_value, "global.load");
+    }
+    return real_default_value(result_type);
+}
+
+llvm_ffi.LLVMValueRef* real_env_expr_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, jir.JirExprId expr_id, RealFunctionEnv* env, llvm_ffi.LLVMTypeRef* result_type) {
+    if (!expr_id.valid()) {
+        return real_default_value(result_type);
+    }
+
+    jir.JirExpr expr = input.expr_at(expr_id);
+    if (expr.body is .literal(literal)) {
+        return real_literal_value(ctx, literal, result_type);
+    }
+    if (expr.body is .name(name)) {
+        return real_env_name_value(ctx, builder_ref, module_ref, function_value, function_decl, name, env, result_type);
+    }
+    if (expr.body is .temp(temp)) {
+        Int temp_index = env.find_temp(temp.temp_id);
+        if (temp_index >= 0) {
+            RealLocalSlot slot = env.slots[temp_index];
+            return llvm_ffi.LLVMBuildLoad2(builder_ref, slot.type_ref, slot.slot, "temp.load");
+        }
+    }
+    if (expr.body is .unary(unary)) {
+        llvm_ffi.LLVMValueRef* value = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, unary.value, env, result_type);
+        if (unary.op == .negate) {
+            return llvm_ffi.LLVMBuildSub(builder_ref, real_default_value(result_type), value, "negtmp");
+        }
+        if (unary.op == .not) {
+            return llvm_ffi.LLVMBuildICmp(builder_ref, .eq, value, real_default_value(result_type), "nottmp");
+        }
+        if (unary.op == .bit_not) {
+            llvm_ffi.LLVMValueRef* one = llvm_ffi.LLVMConstInt(result_type, 1, 0);
+            llvm_ffi.LLVMValueRef* all_bits = llvm_ffi.LLVMBuildSub(builder_ref, real_default_value(result_type), one, "allbits");
+            return llvm_ffi.LLVMBuildXor(builder_ref, value, all_bits, "bitnottmp");
+        }
+    }
+    if (expr.body is .binary(binary)) {
+        llvm_ffi.LLVMValueRef* left = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, binary.left, env, result_type);
+        llvm_ffi.LLVMValueRef* right = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, binary.right, env, result_type);
+        return real_binary_op_value(builder_ref, left, right, binary.op, result_type);
+    }
+    if (expr.body is .call(call)) {
+        return real_call_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, call, result_type);
+    }
+    return real_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, expr_id, result_type);
+}
+
+Bool real_stmt_linear_supported(jir.JirStmt stmt) {
+    if (stmt.body is .local(local_stmt)) { return true; }
+    if (stmt.body is .temp_local(temp_local)) { return true; }
+    if (stmt.body is .assign(assign_stmt)) { return true; }
+    if (stmt.body is .expr(expr_stmt)) { return true; }
+    if (stmt.body is .return_stmt(return_stmt)) { return true; }
+    return false;
+}
+
+Bool real_block_linear_supported(jir.JirModule* input, jir.JirBlock block) {
+    Int! index = 0;
+    while (index < block.stmts.len()) {
+        if (!real_stmt_linear_supported(input.stmt_at(block.stmts[index]))) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Int real_assignment_target_slot(jir.JirModule* input, jir.JirExprId target, RealFunctionEnv* env) {
+    if (!target.valid()) {
+        return -1;
+    }
+    jir.JirExpr expr = input.expr_at(target);
+    if (expr.body is .name(name)) {
+        return env.find_local(name.local_id);
+    }
+    if (expr.body is .temp(temp)) {
+        return env.find_temp(temp.temp_id);
+    }
+    return -1;
+}
+
+Bool real_emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, jir.JirStmt stmt, RealFunctionEnv* env, llvm_ffi.LLVMTypeRef* result_type) {
+    if (stmt.body is .local(local_stmt)) {
+        llvm_ffi.LLVMTypeRef* type_ref = real_result_type_ref(ctx, type_table, local_stmt.type_id, context_ref);
+        llvm_ffi.LLVMValueRef* slot = llvm_ffi.LLVMBuildAlloca(builder_ref, type_ref, "local");
+        env.add_local(local_stmt.local_id, slot, type_ref);
+        if (local_stmt.initializer.valid()) {
+            llvm_ffi.LLVMValueRef* initializer = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, local_stmt.initializer, env, type_ref);
+            llvm_ffi.LLVMBuildStore(builder_ref, initializer, slot);
+        }
+        return false;
+    }
+    if (stmt.body is .temp_local(temp_local)) {
+        llvm_ffi.LLVMTypeRef* type_ref = real_result_type_ref(ctx, type_table, temp_local.type_id, context_ref);
+        llvm_ffi.LLVMValueRef* slot = llvm_ffi.LLVMBuildAlloca(builder_ref, type_ref, "temp");
+        env.add_temp(temp_local.temp_id, slot, type_ref);
+        return false;
+    }
+    if (stmt.body is .assign(assign_stmt)) {
+        Int slot_index = real_assignment_target_slot(input, assign_stmt.target, env);
+        if (slot_index >= 0) {
+            RealLocalSlot slot = env.slots[slot_index];
+            llvm_ffi.LLVMValueRef* value = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, assign_stmt.value, env, slot.type_ref);
+            llvm_ffi.LLVMBuildStore(builder_ref, value, slot.slot);
+        }
+        return false;
+    }
+    if (stmt.body is .expr(expr_stmt)) {
+        if (expr_stmt.value.valid()) {
+            jir.JirExpr expr = input.expr_at(expr_stmt.value);
+            llvm_ffi.LLVMTypeRef* expr_type = real_result_type_ref(ctx, type_table, expr.type_id, context_ref);
+            real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, expr_stmt.value, env, expr_type);
+        }
+        return false;
+    }
+    if (stmt.body is .return_stmt(return_stmt)) {
+        if (type_table.type_at(function_decl.result_type).kind == .unit || !return_stmt.value.valid()) {
+            llvm_ffi.LLVMBuildRetVoid(builder_ref);
+        } else {
+            llvm_ffi.LLVMValueRef* value = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, return_stmt.value, env, result_type);
+            llvm_ffi.LLVMBuildRet(builder_ref, value);
+        }
+        return true;
+    }
+    return false;
+}
+
+Bool real_emit_linear_function(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, llvm_ffi.LLVMTypeRef* result_type) {
+    if (function_decl.body is some body) {
+        if (!real_block_linear_supported(input, body)) {
+            return false;
+        }
+        RealFunctionEnv! env = RealFunctionEnv(ctx.ast_store_ptr());
+        Int! index = 0;
+        while (index < body.stmts.len()) {
+            if (real_emit_linear_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, input.stmt_at(body.stmts[index]), env$.ptr(), result_type)) {
+                return true;
+            }
+            index = index + 1;
+        }
+    }
+    return false;
 }
 
 llvm_ffi.LLVMValueRef* real_local_return_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, jir.JirLocalStmt local_stmt, jir.JirReturnStmt return_stmt, llvm_ffi.LLVMTypeRef* result_type) {
@@ -826,6 +1067,11 @@ llvm_ffi.LLVMValueRef* real_declare_function(context.CompilerContext* ctx, types
         }
         llvm_ffi.LLVMBuildRetVoid(builder_ref);
         return;
+    }
+    if (real_uses_i64_result_type(ctx, type_table, function_decl.result_type)) {
+        if (real_emit_linear_function(ctx, type_table, input, context_ref, module_ref, builder_ref, function_value, function_decl, result_type)) {
+            return;
+        }
     }
     if (real_emit_local_if_return_function(ctx, type_table, input, context_ref, module_ref, builder_ref, function_value, function_decl, result_type)) {
         return;
