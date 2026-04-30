@@ -77,6 +77,20 @@ run_compile_only() {
   "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
 }
 
+run_imported_extern_symbol_sample() {
+  local sample="imported_extern_symbol_minimal.jiang"
+  local ir="$BUILD_DIR/${sample%.jiang}.ll"
+  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
+  if grep -q "imported_extern_helper.puts" "$ir"; then
+    echo "error: imported extern leaked module-qualified C symbol" >&2
+    exit 1
+  fi
+  if ! grep -q "@puts" "$ir"; then
+    echo "error: imported extern did not emit raw C symbol" >&2
+    exit 1
+  fi
+}
+
 run_object_sample() {
   local sample="$1"
   local expected="$2"
@@ -112,6 +126,7 @@ run_executable_sample() {
 run_sample minimal.jiang 42
 run_object_sample minimal.jiang 42
 run_executable_sample minimal.jiang 42
+run_imported_extern_symbol_sample
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2

@@ -509,8 +509,18 @@ static LLVMValueRef llvm_const_expr(LLVMContextRef context, const JirExpr* expr)
 }
 
 static LLVMValueRef llvm_function_for(const JirProgram* program, LLVMModuleRef module, const JirFunction* function) {
+    LLVMValueRef value = 0;
+    const char* dot = 0;
     (void)program;
-    return LLVMGetNamedFunction(module, function->name);
+    value = LLVMGetNamedFunction(module, function->name);
+    if (value || !function->extern_flag) {
+        return value;
+    }
+    dot = strrchr(function->name, '.');
+    if (!dot || !dot[1]) {
+        return value;
+    }
+    return LLVMGetNamedFunction(module, dot + 1);
 }
 
 static const JirFunction* find_jir_function(const JirProgram* program, const char* name) {
@@ -524,7 +534,16 @@ static const JirFunction* find_jir_function(const JirProgram* program, const cha
 }
 
 static LLVMValueRef llvm_global_for(LLVMModuleRef module, const JirBinding* binding) {
-    return LLVMGetNamedGlobal(module, binding->name);
+    LLVMValueRef value = LLVMGetNamedGlobal(module, binding->name);
+    const char* dot = 0;
+    if (value) {
+        return value;
+    }
+    dot = strrchr(binding->name, '.');
+    if (!dot || !dot[1]) {
+        return value;
+    }
+    return LLVMGetNamedGlobal(module, dot + 1);
 }
 
 static void add_alloca(FunctionCodegen* cg, const JirBinding* binding, LLVMValueRef alloca_value) {
@@ -1738,7 +1757,13 @@ static int emit_globals(const JirProgram* program, LLVMModuleRef module, LLVMCon
     int i = 0;
     for (i = 0; i < program->globals.count; ++i) {
         const JirGlobal* global = &program->globals.items[i];
-        LLVMValueRef llvm_global = LLVMAddGlobal(module, llvm_type(context, global->binding->type), global->binding->name);
+        const char* name = global->binding->name;
+        const char* dot = global->extern_flag ? strrchr(name, '.') : 0;
+        LLVMValueRef llvm_global = 0;
+        if (dot && dot[1]) {
+            name = dot + 1;
+        }
+        llvm_global = LLVMAddGlobal(module, llvm_type(context, global->binding->type), name);
         if (!global->extern_flag) {
             LLVMSetInitializer(llvm_global, llvm_const_expr(context, global->init));
         }
@@ -1749,7 +1774,12 @@ static int emit_globals(const JirProgram* program, LLVMModuleRef module, LLVMCon
 
 static int emit_function_decl(const JirFunction* function, LLVMModuleRef module, LLVMContextRef context) {
     LLVMTypeRef fn_type = llvm_function_type(context, function);
-    LLVMAddFunction(module, function->name, fn_type);
+    const char* name = function->name;
+    const char* dot = function->extern_flag ? strrchr(name, '.') : 0;
+    if (dot && dot[1]) {
+        name = dot + 1;
+    }
+    LLVMAddFunction(module, name, fn_type);
     return 1;
 }
 
