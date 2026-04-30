@@ -481,6 +481,38 @@ LLVM backend。
 
 LLVM-specific 代码应放在 `llvm/` 内。
 
+Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重新读取 AST/HIR，也不重新做 resolve/type check。JIR 中的 `BindingId`、`LocalBindingId`、`TypeId`、`JirTempId` 是 backend 查表和生成 storage 的主要入口；最终 LLVM symbol name 只在 backend 边界按这些结构化 ID 做 mangling。
+
+第一版可以直接 emit 的 JIR：
+
+- declaration：function、global、type declaration metadata。
+- storage：local、temp local、assign、name/temp expr。
+- primitive expr：literal、unary、binary、call、field、index、slice、tuple、array、struct literal、variant constructor。
+- structured stmt：block、if、while、for-range、for-each、return、throw、break、continue、run-defer。
+
+第一版仍需要在 backend 内继续 lowering 的 JIR：
+
+- `switch_stmt`：按 case 顺序 emit branch chain；每个 case 先 emit pattern tests，成功后 emit binds 和 body。
+- pattern tests/binds：optional `some`、variant tag、tuple item、literal compare、binding payload materialization 都应降成明确的 load/compare/store。
+- `try_stmt` / `catch_handler`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
+- `coalesce`：普通 optional coalesce 需要降成 optional test + value/default branch；`coalesce_control_local` 已经是 statement 级 early-exit 形式，但 backend 仍要生成 left test 和对应 control flow。
+- `optional_is_some` / `is_expr`：需要按 type/pattern 生成测试和绑定，不应在 backend 重新解释源码 pattern。
+
+暂不进入第一版 backend 的内容：
+
+- overload resolution、trait solving、trait method lookup。
+- generic monomorphization 和跨 module instance cache。
+- 完整 CFG IR。当前可以从 structured JIR 直接 emit LLVM block；如果后续控制流复杂度升高，再新增 CFG 层。
+- LLVM exception model。Jiang `try/catch` 先按普通 tagged/errorable value lowering。
+
+第一批 backend 测试建议从只验证结构和可生成性开始：
+
+- 空 module / 简单 function / global initializer。
+- local/temp/assign/return 的基本 emission。
+- if/while/block/run-defer 的 block 生成顺序。
+- switch + pattern test/bind 的 branch 形状。
+- optional coalesce、try/catch 的最小 success/error branch。
+
 ## Support 模块
 
 Support 模块是编译器内部工具，不应依赖 AST/HIR/JIR。
