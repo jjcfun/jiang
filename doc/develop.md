@@ -385,6 +385,8 @@ Jiang backend lowering IR。
 
 JIR 应避免源码级语法形态。它是进入 LLVM-specific lowering 前的边界。
 
+当前第一版 JIR 仍保持 flat arena list，不直接降成 CFG。`JirDeclId` / `JirStmtId` / `JirExprId` 是强类型索引，节点继续携带 `BindingId`、`LocalBindingId` 和 `TypeId`。已经覆盖 type/global/function declaration、local/assign/if/while/return/block/break/continue statement，以及 literal/name/self/unary/binary/call/field expression。switch、try、for、defer、pattern 和 optional/control-flow sugar 后续在 JIR lowering 阶段继续 desugar。
+
 ### `lower_jir.jiang`
 
 HIR 到 JIR 的 lowering。
@@ -395,6 +397,8 @@ HIR 到 JIR 的 lowering。
 - 为 backend emission 准备 call、temporary、storage
 
 这里不要放 LLVM API 细节。
+
+当前实现只消费 `HirModule`，不重新做名称解析或类型推导。第一版先保留结构化 block/if/while，确保 HIR 中的 resolved ID 和 `TypeId` 能稳定进入 JIR；后续再把复杂控制流和高层语法糖降成更接近 backend 的形式。
 
 ### `module_graph.jiang`
 
