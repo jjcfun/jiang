@@ -500,6 +500,11 @@ LLVM-specific 代码应放在 `llvm/` 内。
 
 Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重新读取 AST/HIR，也不重新做 resolve/type check。JIR 中的 `BindingId`、`LocalBindingId`、`TypeId`、`JirTempId` 是 backend 查表和生成 storage 的主要入口；最终 LLVM symbol name 只在 backend 边界按这些结构化 ID 做 mangling。
 
+当前 `codegen.jiang` 同时保留两条边界：
+
+- facade `emit_module(...)`：返回 `llvm/api.jiang` 的测试模型，用于继续覆盖 JIR 消费面。
+- 内部 `RealCodegen`：直接调用 `llvm/ffi.jiang`，当前只打通 context/module/builder 生命周期、最小 `main -> ret 0`、verify 和 print module。它暂不作为跨模块 public API 暴露，避免 stage0 的 public 函数体 re-export 私有 import 限制影响后续演进。
+
 当前 LLVM backend 仍是 facade 形态：它记录 `LLVMInstruction` 序列，用于固定 JIR 到 backend 的边界和覆盖率，不代表已经生成真实 LLVM basic block / SSA / alloca / branch target。现阶段支持矩阵如下。
 
 当前可以直接 emit facade 指令的 JIR：
