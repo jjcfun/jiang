@@ -483,20 +483,27 @@ LLVM-specific 代码应放在 `llvm/` 内。
 
 Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重新读取 AST/HIR，也不重新做 resolve/type check。JIR 中的 `BindingId`、`LocalBindingId`、`TypeId`、`JirTempId` 是 backend 查表和生成 storage 的主要入口；最终 LLVM symbol name 只在 backend 边界按这些结构化 ID 做 mangling。
 
-第一版可以直接 emit 的 JIR：
+当前 LLVM backend 仍是 facade 形态：它记录 `LLVMInstruction` 序列，用于固定 JIR 到 backend 的边界和覆盖率，不代表已经生成真实 LLVM basic block / SSA / alloca / branch target。现阶段支持矩阵如下。
+
+当前可以直接 emit facade 指令的 JIR：
 
 - declaration：function、global、type declaration metadata。
 - storage：local、temp local、assign、name/temp expr。
 - primitive expr：literal、unary、binary、call、field、index、slice、tuple、array、struct literal、variant constructor。
 - structured stmt：block、if、while、for-range、for-each、return、throw、break、continue、run-defer。
 
-第一版仍需要在 backend 内继续 lowering 的 JIR：
+当前 backend 会消费但仍只是 structured facade 的 JIR：
 
 - `switch_stmt`：按 case 顺序 emit branch chain；每个 case 先 emit pattern tests，成功后 emit binds 和 body。
 - pattern tests/binds：optional `some`、variant tag、tuple item、literal compare、binding payload materialization 都应降成明确的 load/compare/store。
 - `try_stmt`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
 - `coalesce_control_local`：statement 级 early-exit 形式，backend 需要生成 left test 和对应 control flow。
 - `optional_is_some` / `is_expr`：需要按 type/pattern 生成测试和绑定，不应在 backend 重新解释源码 pattern。
+
+当前明确不应进入 LLVM backend 的源码级结构：
+
+- JIR expression 层不应包含 `coalesce`、`catch_handler`、`select`、`block`、`if_expr`、`switch_expr`、`try_expr`。
+- 如果 backend 看到 JIR `.unsupported` 或无法处理的 expression fallback，必须增加 `unsupported_count`，测试应断言该值为 `0`。
 
 暂不进入第一版 backend 的内容：
 
@@ -505,7 +512,7 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 - 完整 CFG IR。当前可以从 structured JIR 直接 emit LLVM block；如果后续控制流复杂度升高，再新增 CFG 层。
 - LLVM exception model。Jiang `try/catch` 先按普通 tagged/errorable value lowering。
 
-第一批 backend 测试建议从只验证结构和可生成性开始：
+第一批 backend 测试从只验证结构和可生成性开始：
 
 - 空 module / 简单 function / global initializer。
 - local/temp/assign/return 的基本 emission。
