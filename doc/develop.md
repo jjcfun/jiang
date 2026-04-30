@@ -385,7 +385,7 @@ Jiang backend lowering IR。
 
 JIR 应避免源码级语法形态。它是进入 LLVM-specific lowering 前的边界。
 
-当前第一版 JIR 仍保持 flat arena list，不直接降成 CFG。`JirDeclId` / `JirStmtId` / `JirExprId` / `JirPatternId` 是强类型索引，节点继续携带 `BindingId`、`LocalBindingId` 和 `TypeId`。JIR 已经能承接当前 HIR 的主要 declaration、statement、expression 和 pattern，包括 switch、try、for、coalesce、pattern-bearing `is`、field/index/slice、struct literal、variant、tuple、array、optional pattern 和 variant pattern。`defer` 不再作为源码级 statement 保留，`lower_jir` 会在 block 退出点插入显式 `run_defer` statement；局部变量初始化中的 `?? return/break/continue` 会降成 `coalesce_control_local` statement；局部变量初始化和 assignment 右侧的 block/if/switch/try expression 会拆成 statement + assignment；`value is some binding` 会降成 `optional_is_some` expression；普通 `is pattern` 和 switch case 会携带显式 pattern test/bind 列表；`if` expression 会降成 `select` expression。复杂控制流和 pattern 目前仍保留结构，但 JIR 不再引用 HIR pattern storage，后续再逐步 desugar 成 backend 更容易消费的 match/test/bind 形式。
+当前第一版 JIR 仍保持 flat arena list，不直接降成 CFG。`JirDeclId` / `JirStmtId` / `JirExprId` / `JirPatternId` / `JirTempId` 是强类型索引，节点继续携带 `BindingId`、`LocalBindingId` 和 `TypeId`。JIR 已经能承接当前 HIR 的主要 declaration、statement、expression 和 pattern，包括 switch、try、for、coalesce、pattern-bearing `is`、field/index/slice、struct literal、variant、tuple、array、optional pattern 和 variant pattern。`defer` 不再作为源码级 statement 保留，`lower_jir` 会在 block 退出点插入显式 `run_defer` statement；局部变量初始化中的 `?? return/break/continue` 会降成 `coalesce_control_local` statement；局部变量初始化、assignment、return/throw value 右侧的 block/if/switch/try expression 会拆成 statement + temporary/assignment；`value is some binding` 会降成 `optional_is_some` expression；普通 `is pattern` 和 switch case 会携带显式 pattern test/bind 列表；`if` expression 会降成 `select` expression。复杂控制流和 pattern 目前仍保留结构，但 JIR 不再引用 HIR pattern storage，后续再逐步 desugar 成 backend 更容易消费的 match/test/bind 形式。
 
 ### `lower_jir.jiang`
 
@@ -398,7 +398,7 @@ HIR 到 JIR 的 lowering。
 
 这里不要放 LLVM API 细节。
 
-当前实现只消费 `HirModule`，不重新做名称解析或类型推导。第一版先把 HIR 中的 resolved ID、`TypeId` 和高层结构稳定搬入 JIR，保证普通 HIR 节点不会落到 `unsupported`；其中 `defer` 已经降成显式退出前执行的 `run_defer`，`?? return/break/continue` 已经从表达式降成局部初始化 statement，局部初始化和 assignment 右侧的控制流表达式已经拆成 statement + assignment。后续再把 `switch`、`try/catch`、pattern match 等语法糖降成更接近 backend 的形式。
+当前实现只消费 `HirModule`，不重新做名称解析或类型推导。第一版先把 HIR 中的 resolved ID、`TypeId` 和高层结构稳定搬入 JIR，保证普通 HIR 节点不会落到 `unsupported`；其中 `defer` 已经降成显式退出前执行的 `run_defer`，`?? return/break/continue` 已经从表达式降成局部初始化 statement，局部初始化、assignment 和 return/throw value 的控制流表达式已经拆成 statement + temporary/assignment。后续再把 `switch`、`try/catch`、pattern match 等语法糖降成更接近 backend 的形式。
 
 ### `module_graph.jiang`
 
