@@ -1,1 +1,241 @@
+import "./api.jiang";
+import "../ast.jiang";
+import "../context.jiang";
+import "../jir.jiang";
+import types = "../type.jiang";
 
+public struct Codegen {
+    context.CompilerContext* ctx;
+    types.TypeTable* types;
+    api.LLVMModule! module;
+    api.LLVMBlock*?! current_block;
+    Int! next_value_id;
+
+    public init(context.CompilerContext* ctx, types.TypeTable* types) {
+        self.ctx = ctx;
+        self.types = types;
+        self.module = api.LLVMModule(ctx.ast_store_ptr());
+        self.current_block = null;
+        self.next_value_id = 0;
+    }
+
+    public api.LLVMModule emit(jir.JirModule* input) {
+        Int! index = 0;
+        while (index < input.decl_count()) {
+            self.emit_decl(input, input.decl_at(jir.JirDeclId(index)));
+            index = index + 1;
+        }
+        return self.module;
+    }
+
+    () emit_decl(jir.JirModule* input, jir.JirDecl decl) {
+        if (decl.body is .function_decl(function_decl)) {
+            self.emit_function(input, function_decl);
+            return;
+        }
+        if (decl.body is .global_decl(global_decl)) {
+            self.emit_global(input, global_decl);
+            return;
+        }
+        if (decl.body is .unsupported(span)) {
+            self.module.unsupported_count = self.module.unsupported_count + 1;
+        }
+    }
+
+    () emit_global(jir.JirModule* input, jir.JirGlobalDecl decl) {
+        api.LLVMType type_value = self.lower_type(decl.type_id);
+        self.module.add_global(api.LLVMGlobal(decl.name.symbol, type_value, decl.extern_flag, decl.mutable_binding));
+        if (decl.initializer.valid()) {
+            self.emit_expr(input, decl.initializer);
+        }
+    }
+
+    () emit_function(jir.JirModule* input, jir.JirFunctionDecl decl) {
+        api.LLVMFunction! function_value = api.LLVMFunction(self.module.store, decl.name.symbol, self.lower_type(decl.result_type), decl.extern_flag);
+        Int! param_index = 0;
+        while (param_index < decl.params.len()) {
+            function_value.params.add(self.lower_type(decl.params[param_index].type_id));
+            param_index = param_index + 1;
+        }
+        if (decl.body is some body) {
+            self.current_block = function_value.add_block(self.module.store);
+            self.emit_block(input, body);
+        }
+        self.module.add_function(function_value);
+        self.current_block = null;
+    }
+
+    () emit_block(jir.JirModule* input, jir.JirBlock block) {
+        Int! index = 0;
+        while (index < block.stmts.len()) {
+            self.emit_stmt(input, input.stmt_at(block.stmts[index]));
+            index = index + 1;
+        }
+        if (block.value.valid()) {
+            self.emit_expr(input, block.value);
+        }
+    }
+
+    () emit_stmt(jir.JirModule* input, jir.JirStmt stmt) {
+        if (stmt.body is .local(local)) {
+            self.add_inst(.local_alloc, self.make_value(.local, local.type_id));
+            if (local.initializer.valid()) {
+                self.emit_expr(input, local.initializer);
+                self.add_inst(.store, api.LLVMValue());
+            }
+            return;
+        }
+        if (stmt.body is .temp_local(temp_local)) {
+            self.add_inst(.temp_alloc, self.make_value(.temp, temp_local.type_id));
+            return;
+        }
+        if (stmt.body is .assign(assign)) {
+            self.emit_expr(input, assign.target);
+            self.emit_expr(input, assign.value);
+            self.add_inst(.store, api.LLVMValue());
+            return;
+        }
+        if (stmt.body is .return_stmt(return_stmt)) {
+            if (return_stmt.value.valid()) {
+                self.emit_expr(input, return_stmt.value);
+            }
+            self.add_inst(.ret, api.LLVMValue());
+            return;
+        }
+        self.emit_control_stmt(input, stmt);
+    }
+
+    () emit_control_stmt(jir.JirModule* input, jir.JirStmt stmt) {
+        if (stmt.body is .expr(expr_stmt)) {
+            self.emit_expr(input, expr_stmt.value);
+            return;
+        }
+        if (stmt.body is .block(block_stmt)) {
+            self.emit_block(input, block_stmt.block);
+            return;
+        }
+        if (stmt.body is .if_stmt(if_stmt)) {
+            self.emit_expr(input, if_stmt.cond);
+            self.add_inst(.branch, api.LLVMValue());
+            self.emit_block(input, if_stmt.then_block);
+            if (if_stmt.else_block is some else_block) {
+                self.emit_block(input, else_block);
+            }
+            return;
+        }
+        if (stmt.body is .while_stmt(while_stmt)) {
+            self.emit_expr(input, while_stmt.cond);
+            self.add_inst(.branch, api.LLVMValue());
+            self.emit_block(input, while_stmt.body);
+            return;
+        }
+        self.module.unsupported_count = self.module.unsupported_count + 1;
+    }
+
+    api.LLVMValue emit_expr(jir.JirModule* input, jir.JirExprId id) {
+        jir.JirExpr expr = input.expr_at(id);
+        if (expr.body is .literal(literal)) {
+            return self.emit_literal(expr, literal);
+        }
+        if (expr.body is .name(name)) {
+            api.LLVMValue result = self.make_value(.local, expr.type_id);
+            self.add_inst(.load, result);
+            return result;
+        }
+        if (expr.body is .temp(temp)) {
+            api.LLVMValue result = self.make_value(.temp, expr.type_id);
+            self.add_inst(.load, result);
+            return result;
+        }
+        if (expr.body is .binary(binary)) {
+            return self.emit_binary(input, expr, binary);
+        }
+        if (expr.body is .call(call)) {
+            return self.emit_call(input, expr, call);
+        }
+        self.module.unsupported_count = self.module.unsupported_count + 1;
+        return api.LLVMValue();
+    }
+
+    api.LLVMValue emit_literal(jir.JirExpr expr, ast.Literal literal) {
+        if (literal is .bool_lit(bool_literal)) {
+            return self.make_value(.const_bool, expr.type_id);
+        }
+        if (literal is .int_lit(span)) {
+            return self.make_value(.const_int, expr.type_id);
+        }
+        self.module.unsupported_count = self.module.unsupported_count + 1;
+        return api.LLVMValue();
+    }
+
+    api.LLVMValue emit_binary(jir.JirModule* input, jir.JirExpr expr, jir.JirBinaryExpr binary) {
+        self.emit_expr(input, binary.left);
+        self.emit_expr(input, binary.right);
+        api.LLVMValue result = self.make_value(.instruction, expr.type_id);
+        if (binary.op == .add) {
+            self.add_inst(.add, result);
+            return result;
+        }
+        if (binary.op == .sub) {
+            self.add_inst(.sub, result);
+            return result;
+        }
+        if (binary.op == .mul) {
+            self.add_inst(.mul, result);
+            return result;
+        }
+        if (binary.op == .div) {
+            self.add_inst(.div, result);
+            return result;
+        }
+        self.add_inst(.compare, result);
+        return result;
+    }
+
+    api.LLVMValue emit_call(jir.JirModule* input, jir.JirExpr expr, jir.JirCallExpr call) {
+        self.emit_expr(input, call.callee);
+        Int! index = 0;
+        while (index < call.args.len()) {
+            self.emit_expr(input, call.args[index]);
+            index = index + 1;
+        }
+        api.LLVMValue result = self.make_value(.instruction, expr.type_id);
+        self.add_inst(.call, result);
+        return result;
+    }
+
+    api.LLVMType lower_type(types.TypeId type_id) {
+        if (!type_id.valid()) { return api.LLVMType(); }
+        types.TypeInfo info = self.types.type_at(type_id);
+        if (info.kind == .unit) { return api.LLVMType(.void_type, type_id); }
+        if (info.kind == .builtin) { return self.lower_builtin_type(info, type_id); }
+        if (info.kind == .pointer || info.kind == .slice) { return api.LLVMType(.ptr, type_id); }
+        if (info.kind == .layer) { return self.lower_type(info.element); }
+        return api.LLVMType(.aggregate, type_id);
+    }
+
+    api.LLVMType lower_builtin_type(types.TypeInfo info, types.TypeId type_id) {
+        if (self.ctx.symbol_equal(info.symbol, "Bool")) { return api.LLVMType(.i1, type_id); }
+        if (self.ctx.symbol_equal(info.symbol, "UInt8")) { return api.LLVMType(.i8, type_id); }
+        if (self.ctx.symbol_equal(info.symbol, "Char")) { return api.LLVMType(.i8, type_id); }
+        if (self.ctx.symbol_equal(info.symbol, "Int")) { return api.LLVMType(.i64, type_id); }
+        return api.LLVMType(.aggregate, type_id);
+    }
+
+    api.LLVMValue make_value(api.LLVMValueKind kind, types.TypeId type_id) {
+        api.LLVMValue result = api.LLVMValue(kind, self.lower_type(type_id), self.next_value_id);
+        self.next_value_id = self.next_value_id + 1;
+        return result;
+    }
+
+    () add_inst(api.LLVMInstKind kind, api.LLVMValue result) {
+        if (self.current_block is some block) {
+            block.add(api.LLVMInstruction(kind, result));
+        }
+    }
+}
+
+public api.LLVMModule emit_module(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input) {
+    Codegen! codegen = Codegen(ctx, type_table);
+    return codegen.emit(input);
+}
