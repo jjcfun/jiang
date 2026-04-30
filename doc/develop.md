@@ -230,6 +230,10 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 
 类型表示要和 AST 语法节点分离。
 
+当前 `TypeTable.type_equals(a, b)` 表示语义类型的结构等价：builtin/type param 以 `Symbol` 比较，nominal type 以 binding identity 比较，tuple/function/pointer/slice/array/layer/errorable 递归比较子类型。
+
+当前 `TypeTable.compatible(expected, actual)` 只在严格等价基础上额外放行 `invalid` / `infer`，用于错误恢复和未定型占位。literal 的 expected-type 适配不属于 `compatible`，由 `type_check.jiang` 在表达式检查时处理。
+
 ### `type_check.jiang`
 
 类型检查和语义验证。
@@ -242,6 +246,9 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 - declaration / binding / expression / local binding 的类型 side tables
 - function signature、global initializer、function body、local var、assignment、return、基础 control-flow 的语义检查
 - generic param 可作为 type param 使用；`@where` 的 trait/equality bound 在 resolve/type_check 层只做名称解析和基本合法性检查
+- 二元表达式会检查左右操作数基础兼容性；逻辑表达式和条件表达式要求 `Bool`
+- call、field、index、slice 会做第一版目标类型检查，错误时写入 diagnostics 并继续产出 `invalid` 类型
+- generic type arg 目前只做 arity 检查，不做实例化或约束求解
 
 这个阶段暂不生成 typed HIR。当前边界是：type checker 消费 AST 和 `ResolveResult`，产出稳定 side tables 与 diagnostics；HIR 会在后续独立设计和 lowering。
 
