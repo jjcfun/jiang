@@ -31,7 +31,7 @@ package input / source registry
 - `lower_hir` 消费 AST、resolve result、type check result，产出携带 resolved ID 和 `TypeId` 的 `HirModule`。
 - `lower_jir`、JIR 和 LLVM backend 是后续 lower/codegen 边界，不能重新依赖源码字符串做语义查找。
 
-`HIR` 当前定位为类似 Rust 的 HIR 加 typed HIR/THIR：它需要保留足够的源码结构，方便诊断和语义检查，同时在 name resolution 和 type checking 之后携带已解析名称和类型信息。当前 HIR 已有最小 lowering，覆盖 alias/global/function、block、local var、return、literal/name/binary/call；未覆盖语法继续以 `unsupported` 占位。
+`HIR` 当前定位为类似 Rust 的 HIR 加 typed HIR/THIR：它保留足够的源码结构，方便诊断和语义 pass，同时在 name resolution 和 type checking 之后携带已解析名称和类型信息。当前 HIR 覆盖 parser/type_check 已产出的主要 declaration、statement、expression 和 pattern；import/module graph 元信息不作为普通 HIR declaration 进入可执行语义节点。
 
 `JIR` 是更低层、面向代码生成的 IR。它应该移除大部分源码级语法糖，把控制流、值、存储和调用降到 LLVM backend 容易消费的形式。
 
@@ -53,7 +53,7 @@ self.arena.alloc_array__ast.AstType
 - `BindingId` 表示当前模块顶层 binding，例如 function、struct、enum、union、trait、global、import alias。
 - `LocalBindingId` 表示局部 binding，例如 function param、local var、pattern binding。
 - `TypeId` 表示语义类型，不直接等同 AST type syntax。
-- `HirDeclId` / `HirStmtId` / `HirExprId` 表示 HIR flat node storage 中的节点位置。
+- `HirDeclId` / `HirStmtId` / `HirExprId` / `HirPatternId` 表示 HIR flat node storage 中的节点位置。
 - `HIR` 中的 name、decl、local var、expr type 应引用 resolved ID，不依赖合成字符串查找。
 - `JIR` 和 codegen 后续也应继续使用结构化 ID，LLVM/codegen 阶段才生成最终 symbol name。
 
@@ -121,6 +121,7 @@ Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是
 | `HirDeclId` | `HirModule.decls` | HIR declaration index | `HirModule.decl_at(id)` |
 | `HirStmtId` | `HirModule.stmts` | HIR statement index | `HirModule.stmt_at(id)` |
 | `HirExprId` | `HirModule.exprs` | HIR expression index | `HirModule.expr_at(id)` |
+| `HirPatternId` | `HirModule.patterns` | HIR pattern index | `HirModule.pattern_at(id)` |
 
 阶段职责：
 
@@ -139,7 +140,7 @@ Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是
 - `TypeCheckResult.function_result_types`：`BindingId -> TypeId`，保存 function result type。
 - `TypeCheckResult.local_types`：`LocalBindingId -> TypeId`，保存局部 binding 类型。
 - `TypeCheckResult.expr_types`：按 expression span 保存 `TypeId`，供 HIR lowering 和后续诊断使用。
-- `HirModule.decls/stmts/exprs`：HIR flat node storage，节点之间用 `HirDeclId` / `HirStmtId` / `HirExprId` 引用。
+- `HirModule.decls/stmts/exprs/patterns`：HIR flat node storage，节点之间用 `HirDeclId` / `HirStmtId` / `HirExprId` / `HirPatternId` 引用。
 
 查询示例：
 
@@ -360,7 +361,7 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 
 Stage1 中，HIR 暂时承担 resolved HIR 和 typed HIR/THIR 的角色。除非有明确需求，不要过早把它降成 CFG 形式。
 
-当前 HIR 采用 flat arena list：`HirDeclId` / `HirStmtId` / `HirExprId` 是强类型索引，节点内部引用 resolved `BindingId`、`LocalBindingId` 和 `TypeId`。第一版只覆盖 alias/global/function、block、local var、return、literal/name/binary/call；未覆盖节点保留为 `unsupported`，供后续按语义需求逐步扩展。
+当前 HIR 采用 flat arena list：`HirDeclId` / `HirStmtId` / `HirExprId` / `HirPatternId` 是强类型索引，节点内部引用 resolved `BindingId`、`LocalBindingId` 和 `TypeId`。HIR 覆盖当前 AST 的主要声明、语句、表达式和 pattern，包括 struct/record、enum、union、trait、extend、assign、if/switch/try/while/for/defer、coalesce、field/index/slice、struct literal、variant、tuple/array 和 optional pattern。import 只作为 module graph 输入，不生成普通 HIR declaration。
 
 ### `lower_hir.jiang`
 
