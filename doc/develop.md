@@ -243,14 +243,14 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 - 根据 expected type 处理 literal typing
 - 本地类型别名在使用点展开为目标类型；struct/enum/union/trait 等声明保留 nominal type 句柄
 - alias cycle 检测
-- declaration / binding / expression / local binding 的类型 side tables
+- declaration / binding / function result / expression / local binding 的类型 side tables
 - function signature、global initializer、function body、local var、assignment、return、基础 control-flow 的语义检查
 - generic param 可作为 type param 使用；`@where` 的 trait/equality bound 在 resolve/type_check 层只做名称解析和基本合法性检查
 - 二元表达式会检查左右操作数基础兼容性；逻辑表达式和条件表达式要求 `Bool`
 - call、field、index、slice 会做第一版目标类型检查，错误时写入 diagnostics 并继续产出 `invalid` 类型
 - generic type arg 目前只做 arity 检查，不做实例化或约束求解
 
-这个阶段暂不生成 typed HIR。当前边界是：type checker 消费 AST 和 `ResolveResult`，产出稳定 side tables 与 diagnostics；HIR 会在后续独立设计和 lowering。
+当前边界是：type checker 消费 AST 和 `ResolveResult`，产出稳定 side tables 与 diagnostics；`lower_hir.jiang` 只消费这些 side tables，不重新做名字解析或类型推导。
 
 暂不实现：
 
@@ -269,6 +269,18 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 - 保留适合诊断和语义 pass 的源码结构
 
 Stage1 中，HIR 暂时承担 resolved HIR 和 typed HIR/THIR 的角色。除非有明确需求，不要过早把它降成 CFG 形式。
+
+当前 HIR 采用 flat arena list：`HirDeclId` / `HirStmtId` / `HirExprId` 是强类型索引，节点内部引用 resolved `BindingId`、`LocalBindingId` 和 `TypeId`。第一版只覆盖 alias/global/function、block、local var、return、literal/name/binary/call；未覆盖节点保留为 `unsupported`，供后续按语义需求逐步扩展。
+
+### `lower_hir.jiang`
+
+AST 到 HIR 的 lowering。
+
+预期职责：
+- 消费 AST、`ResolveResult` 和 `TypeCheckResult`
+- 把已解析的顶层 binding、local binding 和 expression type 写入 HIR 节点
+- 保持源码 span，方便后续 diagnostics
+- 不做新的 name resolution、type checking、desugar 或 backend lowering
 
 ### `jir.jiang`
 
