@@ -56,6 +56,25 @@ run_compiler_compile_fail() {
   echo "ok"
 }
 
+run_compiler_ir_regression_check() {
+  sample="$1"
+  ir="$BUILD_DIR/compiler_${sample%.jiang}.regression.ll"
+  printf 'compiler/%s ir regression ... ' "$sample"
+  "$BUILD_DIR/jiangc" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
+  function_count="$(grep -c '^define ' "$ir" || true)"
+  if [ "$function_count" -ge 3000 ]; then
+    echo "failed"
+    echo "error: compiler/$sample generated $function_count functions, expected fewer than 3000" >&2
+    exit 1
+  fi
+  if grep -q 'type_check\.resolve\.scope\.ast\.token' "$ir"; then
+    echo "failed"
+    echo "error: compiler/$sample generated transitive import clone names" >&2
+    exit 1
+  fi
+  echo "ok"
+}
+
 run_named_sample() {
   sample="$1"
   case "$sample" in
@@ -89,6 +108,7 @@ run_all_compiler_samples() {
   run_compiler_sample parser_minimal.jiang 0
   run_compiler_sample resolve_minimal.jiang 0
   run_compiler_sample module_graph_minimal.jiang 0
+  run_compiler_ir_regression_check type_minimal.jiang
   run_compiler_sample type_minimal.jiang 0
   run_compiler_sample lower_hir_minimal.jiang 0
   run_compiler_sample lower_jir_minimal.jiang 0
