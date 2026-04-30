@@ -4,6 +4,20 @@ import "./hir.jiang";
 import "./jir.jiang";
 import types = "./type.jiang";
 import "./token.jiang";
+import arena = "./support/arena.jiang";
+import list = "./support/list.jiang";
+
+struct DeferContext {
+    list.ArenaList<jir.JirBlock>! return_defers;
+    list.ArenaList<jir.JirBlock>! break_defers;
+    list.ArenaList<jir.JirBlock>! continue_defers;
+
+    init(arena.Arena* store) {
+        self.return_defers = list.ArenaList<jir.JirBlock>(store);
+        self.break_defers = list.ArenaList<jir.JirBlock>(store);
+        self.continue_defers = list.ArenaList<jir.JirBlock>(store);
+    }
+}
 
 public struct JirLowerer {
     context.CompilerContext* ctx;
@@ -86,18 +100,114 @@ public struct JirLowerer {
     }
 
     jir.JirBlock lower_block(hir.HirBlock block) {
+        return self.lower_block_with_defers(block, DeferContext(self.module.store));
+    }
+
+    jir.JirBlock lower_block_with_defers(hir.HirBlock block, DeferContext context) {
         jir.JirBlock! lowered = jir.JirBlock(self.module.store, block.span);
+        list.ArenaList<jir.JirBlock>! local_defers = list.ArenaList<jir.JirBlock>(self.module.store);
+        Bool! falls_through = true;
         Int! index = 0;
         while (index < block.stmts.len()) {
             hir.HirStmt stmt = self.source.stmt_at(block.stmts[index]);
-            lowered.stmts.add(self.module.add_stmt(self.lower_stmt(stmt)));
+            DeferContext active = self.extend_defer_context(context, local_defers);
+            if (stmt.body is .defer_stmt(defer_stmt)) {
+                local_defers.add(self.lower_block_with_defers(defer_stmt.body, active));
+            } else {
+                lowered = self.append_exit_defers(lowered, stmt, context, local_defers);
+                lowered.stmts.add(self.module.add_stmt(self.lower_stmt(stmt, active)));
+                falls_through = !self.stmt_exits_block(stmt);
+            }
             index = index + 1;
+        }
+        if (falls_through) {
+            lowered = self.append_run_defers(lowered, local_defers);
         }
         return lowered;
     }
 
-    jir.JirStmt lower_stmt(hir.HirStmt stmt) {
+    DeferContext extend_defer_context(DeferContext context, list.ArenaList<jir.JirBlock> local_defers) {
+        DeferContext! result = DeferContext(self.module.store);
+        result.return_defers = self.copy_and_append_defers(context.return_defers, local_defers);
+        result.break_defers = self.copy_and_append_defers(context.break_defers, local_defers);
+        result.continue_defers = self.copy_and_append_defers(context.continue_defers, local_defers);
+        return result;
+    }
+
+    DeferContext loop_body_defer_context(DeferContext context) {
+        DeferContext! result = DeferContext(self.module.store);
+        result.return_defers = self.copy_defers(context.return_defers);
+        return result;
+    }
+
+    list.ArenaList<jir.JirBlock> copy_defers(list.ArenaList<jir.JirBlock> source) {
+        list.ArenaList<jir.JirBlock>! result = list.ArenaList<jir.JirBlock>(self.module.store);
+        Int! index = 0;
+        while (index < source.len()) {
+            result.add(source[index]);
+            index = index + 1;
+        }
+        return result;
+    }
+
+    list.ArenaList<jir.JirBlock> copy_and_append_defers(list.ArenaList<jir.JirBlock> first, list.ArenaList<jir.JirBlock> second) {
+        list.ArenaList<jir.JirBlock>! result = self.copy_defers(first);
+        Int! index = 0;
+        while (index < second.len()) {
+            result.add(second[index]);
+            index = index + 1;
+        }
+        return result;
+    }
+
+    jir.JirBlock append_exit_defers(jir.JirBlock block, hir.HirStmt stmt, DeferContext context, list.ArenaList<jir.JirBlock> local_defers) {
+        jir.JirBlock! result = block;
+        if (stmt.body is .return_stmt(return_stmt)) {
+            result = self.append_run_defers(result, local_defers);
+            result = self.append_run_defers(result, context.return_defers);
+        }
+        if (stmt.body is .throw_stmt(throw_stmt)) {
+            result = self.append_run_defers(result, local_defers);
+            result = self.append_run_defers(result, context.return_defers);
+        }
+        if (stmt.body is .break_stmt(span)) {
+            result = self.append_run_defers(result, local_defers);
+            result = self.append_run_defers(result, context.break_defers);
+        }
+        if (stmt.body is .continue_stmt(span)) {
+            result = self.append_run_defers(result, local_defers);
+            result = self.append_run_defers(result, context.continue_defers);
+        }
+        return result;
+    }
+
+    jir.JirBlock append_run_defers(jir.JirBlock block, list.ArenaList<jir.JirBlock> defers) {
+        jir.JirBlock! result = block;
+        Int! index = defers.len() - 1;
+        while (index >= 0) {
+            jir.JirBlock body = defers[index];
+            result.stmts.add(self.module.add_stmt(jir.JirStmt(body.span, .run_defer(jir.JirRunDeferStmt(body.span, body)))));
+            index = index - 1;
+        }
+        return result;
+    }
+
+    Bool stmt_exits_block(hir.HirStmt stmt) {
+        if (stmt.body is .return_stmt(return_stmt)) { return true; }
+        if (stmt.body is .throw_stmt(throw_stmt)) { return true; }
+        if (stmt.body is .break_stmt(span)) { return true; }
+        if (stmt.body is .continue_stmt(span)) { return true; }
+        return false;
+    }
+
+    jir.JirStmt lower_stmt(hir.HirStmt stmt, DeferContext context) {
         if (stmt.body is .var_decl(var_decl)) {
+            if (var_decl.initializer.valid()) {
+                hir.HirExpr initializer_expr = self.source.expr_at(var_decl.initializer);
+                if (initializer_expr.body is .coalesce_control(coalesce_control)) {
+                    return self.lower_coalesce_control_local(var_decl, coalesce_control);
+                }
+            }
             jir.JirExprId! initializer = jir.JirExprId();
             if (var_decl.initializer.valid()) {
                 initializer = self.lower_expr_id(var_decl.initializer);
@@ -110,28 +220,28 @@ public struct JirLowerer {
             return jir.JirStmt(assign.span, .assign(lowered));
         }
         if (stmt.body is .if_stmt(if_stmt)) {
-            jir.JirIfStmt! lowered = jir.JirIfStmt(if_stmt.span, self.lower_expr_id(if_stmt.cond), self.lower_block(if_stmt.then_block));
+            jir.JirIfStmt! lowered = jir.JirIfStmt(if_stmt.span, self.lower_expr_id(if_stmt.cond), self.lower_block_with_defers(if_stmt.then_block, context));
             if (if_stmt.else_block is some else_block) {
-                lowered.else_block = self.lower_block(else_block);
+                lowered.else_block = self.lower_block_with_defers(else_block, context);
             }
             return jir.JirStmt(if_stmt.span, .if_stmt(lowered));
         }
         if (stmt.body is .switch_stmt(switch_stmt)) {
-            return self.lower_switch_stmt(switch_stmt);
+            return self.lower_switch_stmt(switch_stmt, context);
         }
         if (stmt.body is .try_stmt(try_stmt)) {
-            return self.lower_try_stmt(try_stmt);
+            return self.lower_try_stmt(try_stmt, context);
         }
         if (stmt.body is .while_stmt(while_stmt)) {
-            jir.JirWhileStmt lowered = jir.JirWhileStmt(while_stmt.span, self.lower_expr_id(while_stmt.cond), self.lower_block(while_stmt.body));
+            jir.JirWhileStmt lowered = jir.JirWhileStmt(while_stmt.span, self.lower_expr_id(while_stmt.cond), self.lower_block_with_defers(while_stmt.body, self.loop_body_defer_context(context)));
             return jir.JirStmt(while_stmt.span, .while_stmt(lowered));
         }
         if (stmt.body is .for_range(for_range)) {
-            jir.JirForRangeStmt lowered = jir.JirForRangeStmt(for_range.span, for_range.name, for_range.local_id, for_range.type_id, self.lower_expr_id(for_range.start), self.lower_expr_id(for_range.end_expr), self.lower_block(for_range.body));
+            jir.JirForRangeStmt lowered = jir.JirForRangeStmt(for_range.span, for_range.name, for_range.local_id, for_range.type_id, self.lower_expr_id(for_range.start), self.lower_expr_id(for_range.end_expr), self.lower_block_with_defers(for_range.body, self.loop_body_defer_context(context)));
             return jir.JirStmt(for_range.span, .for_range(lowered));
         }
         if (stmt.body is .for_each(for_each)) {
-            jir.JirForEachStmt lowered = jir.JirForEachStmt(for_each.span, for_each.pattern, self.lower_expr_id(for_each.iterable), self.lower_block(for_each.body), for_each.indexed_flag);
+            jir.JirForEachStmt lowered = jir.JirForEachStmt(for_each.span, for_each.pattern, self.lower_expr_id(for_each.iterable), self.lower_block_with_defers(for_each.body, self.loop_body_defer_context(context)), for_each.indexed_flag);
             return jir.JirStmt(for_each.span, .for_each(lowered));
         }
         if (stmt.body is .return_stmt(return_stmt)) {
@@ -150,11 +260,10 @@ public struct JirLowerer {
             return jir.JirStmt(expr_stmt.span, .expr(lowered));
         }
         if (stmt.body is .defer_stmt(defer_stmt)) {
-            jir.JirDeferStmt lowered = jir.JirDeferStmt(defer_stmt.span, self.lower_block(defer_stmt.body));
-            return jir.JirStmt(defer_stmt.span, .defer_stmt(lowered));
+            return jir.JirStmt(defer_stmt.span, .unsupported(defer_stmt.span));
         }
         if (stmt.body is .block(block)) {
-            jir.JirBlock lowered = self.lower_block(block);
+            jir.JirBlock lowered = self.lower_block_with_defers(block, context);
             return jir.JirStmt(block.span, .block(jir.JirBlockStmt(lowered)));
         }
         if (stmt.body is .break_stmt(span)) {
@@ -166,23 +275,32 @@ public struct JirLowerer {
         return jir.JirStmt(stmt.span, .unsupported(stmt.span));
     }
 
-    jir.JirStmt lower_switch_stmt(hir.HirSwitchStmt stmt) {
+    jir.JirStmt lower_coalesce_control_local(hir.HirVarDecl var_decl, hir.HirCoalesceControlExpr coalesce_control) {
+        jir.JirExprId! result = jir.JirExprId();
+        if (coalesce_control.result.valid()) {
+            result = self.lower_expr_id(coalesce_control.result);
+        }
+        jir.JirCoalesceControlLocalStmt lowered = jir.JirCoalesceControlLocalStmt(var_decl.span, var_decl.name, var_decl.local_id, var_decl.type_id, self.lower_expr_id(coalesce_control.left), coalesce_control.control, result, var_decl.mutable_binding);
+        return jir.JirStmt(var_decl.span, .coalesce_control_local(lowered));
+    }
+
+    jir.JirStmt lower_switch_stmt(hir.HirSwitchStmt stmt, DeferContext context) {
         jir.JirSwitchStmt! lowered = jir.JirSwitchStmt(self.module.store, stmt.span, self.lower_expr_id(stmt.value));
         Int! index = 0;
         while (index < stmt.cases.len()) {
             hir.HirSwitchCase case_value = stmt.cases[index];
-            lowered.cases.add(jir.JirSwitchCase(case_value.span, case_value.pattern, self.lower_block(case_value.body)));
+            lowered.cases.add(jir.JirSwitchCase(case_value.span, case_value.pattern, self.lower_block_with_defers(case_value.body, context)));
             index = index + 1;
         }
         return jir.JirStmt(stmt.span, .switch_stmt(lowered));
     }
 
-    jir.JirStmt lower_try_stmt(hir.HirTryStmt stmt) {
-        jir.JirTryStmt! lowered = jir.JirTryStmt(self.module.store, stmt.span, self.lower_block(stmt.body));
+    jir.JirStmt lower_try_stmt(hir.HirTryStmt stmt, DeferContext context) {
+        jir.JirTryStmt! lowered = jir.JirTryStmt(self.module.store, stmt.span, self.lower_block_with_defers(stmt.body, context));
         Int! index = 0;
         while (index < stmt.catches.len()) {
             hir.HirCatchStmt catch_stmt = stmt.catches[index];
-            lowered.catches.add(jir.JirCatchStmt(catch_stmt.span, catch_stmt.error_type, catch_stmt.binding, self.lower_block(catch_stmt.body)));
+            lowered.catches.add(jir.JirCatchStmt(catch_stmt.span, catch_stmt.error_type, catch_stmt.binding, self.lower_block_with_defers(catch_stmt.body, context)));
             index = index + 1;
         }
         return jir.JirStmt(stmt.span, .try_stmt(lowered));
