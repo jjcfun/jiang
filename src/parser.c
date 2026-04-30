@@ -727,7 +727,7 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
             }
             return fail(parser, "only @where(...) annotations are supported here");
         }
-        if (parser->current.kind == TOKEN_KW_TYPE) {
+        if (parser->current.kind == TOKEN_KW_ASSOCIATED) {
             if (!parse_concept_assoc_decl(parser, out_program, &concept_decl, &where_constraints)) {
                 return 0;
             }
@@ -3797,7 +3797,7 @@ static int parse_extend_decl(Parser* parser, AstProgram* out_program, int public
             }
             return fail(parser, "only @where(...) annotations are supported here");
         }
-        if (parser->current.kind == TOKEN_KW_TYPE) {
+        if (parser->current.kind == TOKEN_KW_ASSOCIATED) {
             AstAssocTypeBinding binding;
             memset(&binding, 0, sizeof(binding));
             if (concept_names.count == 0) {
@@ -4098,7 +4098,7 @@ static int parse_struct_decl(Parser* parser, AstProgram* out_program, AstNameLis
             }
             return fail(parser, "only @where(...) annotations are supported here");
         }
-        if (parser->current.kind == TOKEN_KW_TYPE) {
+        if (parser->current.kind == TOKEN_KW_ASSOCIATED) {
             AstAssocTypeBinding binding;
             memset(&binding, 0, sizeof(binding));
             if (record_flag) {

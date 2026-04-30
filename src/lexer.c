@@ -110,8 +110,8 @@ static Token ident_or_keyword(Lexer* lexer) {
     if (length == 6 && strncmp(lexer->start, "extend", 6) == 0) {
         return make_token(lexer, TOKEN_KW_EXTEND, lexer->start, length);
     }
-    if (length == 4 && strncmp(lexer->start, "type", 4) == 0) {
-        return make_token(lexer, TOKEN_KW_TYPE, lexer->start, length);
+    if (length == 10 && strncmp(lexer->start, "associated", 10) == 0) {
+        return make_token(lexer, TOKEN_KW_ASSOCIATED, lexer->start, length);
     }
     if (length == 6 && strncmp(lexer->start, "static", 6) == 0) {
         return make_token(lexer, TOKEN_KW_STATIC, lexer->start, length);
