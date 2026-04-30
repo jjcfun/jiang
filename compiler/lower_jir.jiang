@@ -2,6 +2,7 @@ import "./ast.jiang";
 import "./context.jiang";
 import "./hir.jiang";
 import "./jir.jiang";
+import "./scope.jiang";
 import types = "./type.jiang";
 import "./token.jiang";
 import arena = "./support/arena.jiang";
@@ -113,6 +114,9 @@ public struct JirLowerer {
             DeferContext active = self.extend_defer_context(context, local_defers);
             if (stmt.body is .defer_stmt(defer_stmt)) {
                 local_defers.add(self.lower_block_with_defers(defer_stmt.body, active));
+            } else if (stmt.body is .var_decl(var_decl)) {
+                lowered = self.append_var_decl(lowered, var_decl, active);
+                falls_through = true;
             } else {
                 lowered = self.append_exit_defers(lowered, stmt, context, local_defers);
                 lowered.stmts.add(self.module.add_stmt(self.lower_stmt(stmt, active)));
@@ -202,18 +206,7 @@ public struct JirLowerer {
 
     jir.JirStmt lower_stmt(hir.HirStmt stmt, DeferContext context) {
         if (stmt.body is .var_decl(var_decl)) {
-            if (var_decl.initializer.valid()) {
-                hir.HirExpr initializer_expr = self.source.expr_at(var_decl.initializer);
-                if (initializer_expr.body is .coalesce_control(coalesce_control)) {
-                    return self.lower_coalesce_control_local(var_decl, coalesce_control);
-                }
-            }
-            jir.JirExprId! initializer = jir.JirExprId();
-            if (var_decl.initializer.valid()) {
-                initializer = self.lower_expr_id(var_decl.initializer);
-            }
-            jir.JirLocalStmt lowered = jir.JirLocalStmt(var_decl.span, var_decl.name, var_decl.local_id, var_decl.type_id, initializer, var_decl.mutable_binding);
-            return jir.JirStmt(var_decl.span, .local(lowered));
+            return self.lower_plain_var_decl(var_decl);
         }
         if (stmt.body is .assign(assign)) {
             jir.JirAssignStmt lowered = jir.JirAssignStmt(assign.span, self.lower_expr_id(assign.target), self.lower_expr_id(assign.value));
@@ -273,6 +266,121 @@ public struct JirLowerer {
             return jir.JirStmt(span, .continue_stmt(span));
         }
         return jir.JirStmt(stmt.span, .unsupported(stmt.span));
+    }
+
+    jir.JirBlock append_var_decl(jir.JirBlock block, hir.HirVarDecl var_decl, DeferContext context) {
+        jir.JirBlock! result = block;
+        if (!var_decl.initializer.valid()) {
+            result.stmts.add(self.module.add_stmt(self.lower_plain_var_decl(var_decl)));
+            return result;
+        }
+
+        hir.HirExpr initializer_expr = self.source.expr_at(var_decl.initializer);
+        if (initializer_expr.body is .coalesce_control(coalesce_control)) {
+            result.stmts.add(self.module.add_stmt(self.lower_coalesce_control_local(var_decl, coalesce_control)));
+            return result;
+        }
+
+        if (!self.expr_lowers_to_statements(initializer_expr)) {
+            result.stmts.add(self.module.add_stmt(self.lower_plain_var_decl(var_decl)));
+            return result;
+        }
+
+        jir.JirLocalStmt local = jir.JirLocalStmt(var_decl.span, var_decl.name, var_decl.local_id, var_decl.type_id, jir.JirExprId(), var_decl.mutable_binding);
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(var_decl.span, .local(local))));
+        return self.append_expr_assignment(result, var_decl.span, self.local_target_expr(var_decl), var_decl.initializer, context);
+    }
+
+    Bool expr_lowers_to_statements(hir.HirExpr expr) {
+        if (expr.body is .block(block_expr)) { return true; }
+        if (expr.body is .if_expr(if_expr)) { return true; }
+        if (expr.body is .switch_expr(switch_expr)) { return true; }
+        if (expr.body is .try_expr(try_expr)) { return true; }
+        return false;
+    }
+
+    jir.JirStmt lower_plain_var_decl(hir.HirVarDecl var_decl) {
+        jir.JirExprId! initializer = jir.JirExprId();
+        if (var_decl.initializer.valid()) {
+            initializer = self.lower_expr_id(var_decl.initializer);
+        }
+        jir.JirLocalStmt lowered = jir.JirLocalStmt(var_decl.span, var_decl.name, var_decl.local_id, var_decl.type_id, initializer, var_decl.mutable_binding);
+        return jir.JirStmt(var_decl.span, .local(lowered));
+    }
+
+    jir.JirExprId local_target_expr(hir.HirVarDecl var_decl) {
+        jir.JirNameExpr target = jir.JirNameExpr(var_decl.name, scope.BindingId(), var_decl.local_id);
+        return self.module.add_expr(jir.JirExpr(var_decl.span, var_decl.type_id, .name(target)));
+    }
+
+    jir.JirBlock append_expr_assignment(jir.JirBlock block, token.Span span, jir.JirExprId target, hir.HirExprId value, DeferContext context) {
+        jir.JirBlock! result = block;
+        hir.HirExpr expr = self.source.expr_at(value);
+        if (expr.body is .if_expr(if_expr)) {
+            return self.append_if_value_assignment(result, span, target, if_expr, context);
+        }
+        if (expr.body is .switch_expr(switch_expr)) {
+            return self.append_switch_value_assignment(result, span, target, switch_expr, context);
+        }
+        if (expr.body is .try_expr(try_expr)) {
+            return self.append_try_value_assignment(result, span, target, try_expr, context);
+        }
+        if (expr.body is .block(block_expr)) {
+            jir.JirBlock lowered = self.lower_block_with_defers(block_expr.block, context);
+            result.stmts.add(self.module.add_stmt(jir.JirStmt(block_expr.block.span, .block(jir.JirBlockStmt(lowered)))));
+            if (block_expr.value.valid()) {
+                jir.JirAssignStmt assign = jir.JirAssignStmt(span, target, self.lower_expr_id(block_expr.value));
+                result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .assign(assign))));
+            }
+            return result;
+        }
+        jir.JirAssignStmt assign = jir.JirAssignStmt(span, target, self.lower_expr_id(value));
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .assign(assign))));
+        return result;
+    }
+
+    jir.JirBlock append_if_value_assignment(jir.JirBlock block, token.Span span, jir.JirExprId target, hir.HirIfExpr expr, DeferContext context) {
+        jir.JirBlock! result = block;
+        jir.JirBlock! then_block = jir.JirBlock(self.module.store, span);
+        then_block = self.append_expr_assignment(then_block, span, target, expr.then_value, context);
+        jir.JirBlock! else_block = jir.JirBlock(self.module.store, span);
+        else_block = self.append_expr_assignment(else_block, span, target, expr.else_value, context);
+        jir.JirIfStmt! lowered = jir.JirIfStmt(span, self.lower_expr_id(expr.cond), then_block);
+        lowered.else_block = else_block;
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .if_stmt(lowered))));
+        return result;
+    }
+
+    jir.JirBlock append_switch_value_assignment(jir.JirBlock block, token.Span span, jir.JirExprId target, hir.HirSwitchExpr expr, DeferContext context) {
+        jir.JirBlock! result = block;
+        jir.JirSwitchStmt! lowered = jir.JirSwitchStmt(self.module.store, span, self.lower_expr_id(expr.value));
+        Int! index = 0;
+        while (index < expr.cases.len()) {
+            hir.HirSwitchExprCase case_value = expr.cases[index];
+            jir.JirBlock! case_block = jir.JirBlock(self.module.store, case_value.span);
+            case_block = self.append_expr_assignment(case_block, case_value.span, target, case_value.value, context);
+            lowered.cases.add(jir.JirSwitchCase(case_value.span, self.lower_pattern_id(case_value.pattern), case_block));
+            index = index + 1;
+        }
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .switch_stmt(lowered))));
+        return result;
+    }
+
+    jir.JirBlock append_try_value_assignment(jir.JirBlock block, token.Span span, jir.JirExprId target, hir.HirTryExpr expr, DeferContext context) {
+        jir.JirBlock! result = block;
+        jir.JirBlock! body = jir.JirBlock(self.module.store, span);
+        body = self.append_expr_assignment(body, span, target, expr.value, context);
+        jir.JirTryStmt! lowered = jir.JirTryStmt(self.module.store, span, body);
+        Int! index = 0;
+        while (index < expr.catches.len()) {
+            hir.HirCatchExpr catch_expr = expr.catches[index];
+            jir.JirBlock! catch_block = jir.JirBlock(self.module.store, catch_expr.span);
+            catch_block = self.append_expr_assignment(catch_block, catch_expr.span, target, catch_expr.value, context);
+            lowered.catches.add(jir.JirCatchStmt(catch_expr.span, catch_expr.error_type, catch_expr.binding, catch_block));
+            index = index + 1;
+        }
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(lowered))));
+        return result;
     }
 
     jir.JirStmt lower_coalesce_control_local(hir.HirVarDecl var_decl, hir.HirCoalesceControlExpr coalesce_control) {
@@ -392,8 +500,8 @@ public struct JirLowerer {
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .block(lowered)));
         }
         if (expr.body is .if_expr(if_expr)) {
-            jir.JirIfExpr lowered = jir.JirIfExpr(self.lower_expr_id(if_expr.cond), self.lower_expr_id(if_expr.then_value), self.lower_expr_id(if_expr.else_value));
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .if_expr(lowered)));
+            jir.JirSelectExpr lowered = jir.JirSelectExpr(self.lower_expr_id(if_expr.cond), self.lower_expr_id(if_expr.then_value), self.lower_expr_id(if_expr.else_value));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .select(lowered)));
         }
         if (expr.body is .switch_expr(switch_expr)) {
             return self.lower_switch_expr(expr.span, expr.type_id, switch_expr);
