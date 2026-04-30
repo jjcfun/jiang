@@ -6,20 +6,32 @@
 
 ## 编译流程
 
-计划中的编译流程是：
+当前 Stage1 frontend 的编译流程是：
 
 ```text
-source files
-  -> lexer/token
-  -> parser/AST
-  -> resolve/scope
-  -> type_check side tables
-  -> HIR
-  -> lower_jir/JIR
-  -> llvm/codegen
+package input / source registry
+  -> SourceManager
+  -> ModuleGraph
+  -> lexer / TokenBuffer
+  -> parser / AstFile
+  -> resolve / scope side tables
+  -> type_check / TypeTable + type side tables
+  -> lower_hir / HirModule
+  -> lower_jir / JIR
+  -> llvm codegen
 ```
 
-`HIR` 当前定位为类似 Rust 的 HIR 加 typed HIR/THIR：它需要保留足够的源码结构，方便诊断和语义检查，同时在 name resolution 和 type checking 之后携带已解析名称和类型信息。
+当前边界：
+
+- `SourceManager` 保存 source file registry，负责 `SourceId -> SourceFile` 和 path lookup。
+- `ModuleGraph` 负责模块节点、import 边、cycle 检查、dependency-first resolve order；它不做语义检查。
+- `lexer` 产出 `TokenBuffer`，`parser` 只消费 token buffer 并产出 `AstFile`。
+- `resolve` 产出名称解析 side tables，例如 `BindingId`、`LocalBindingId`、`TypeRefId -> ResolvedTypePath`。
+- `type_check` 产出 `TypeTable` 和类型 side tables，例如 `BindingId -> TypeId`、expression span -> `TypeId`。
+- `lower_hir` 消费 AST、resolve result、type check result，产出携带 resolved ID 和 `TypeId` 的 `HirModule`。
+- `lower_jir`、JIR 和 LLVM backend 是后续 lower/codegen 边界，不能重新依赖源码字符串做语义查找。
+
+`HIR` 当前定位为类似 Rust 的 HIR 加 typed HIR/THIR：它需要保留足够的源码结构，方便诊断和语义检查，同时在 name resolution 和 type checking 之后携带已解析名称和类型信息。当前 HIR 已有最小 lowering，覆盖 alias/global/function、block、local var、return、literal/name/binary/call；未覆盖语法继续以 `unsupported` 占位。
 
 `JIR` 是更低层、面向代码生成的 IR。它应该移除大部分源码级语法糖，把控制流、值、存储和调用降到 LLVM backend 容易消费的形式。
 
@@ -33,7 +45,23 @@ Jiang Stage1 应参考 Rust 的内部表示方式：编译器内部使用结构�
 self.arena.alloc_array__ast.AstType
 ```
 
-这种字符串同时包含语义信息和语法分隔符，容易在后续阶段被错误拆分。正确方向是把调用目标表示为结构化引用：
+这种字符串同时包含语义信息和语法分隔符，容易在后续阶段被错误拆分。
+
+当前职责边界：
+
+- `Symbol` 只表示 interned source text，例如 identifier 的文本。
+- `BindingId` 表示当前模块顶层 binding，例如 function、struct、enum、union、trait、global、import alias。
+- `LocalBindingId` 表示局部 binding，例如 function param、local var、pattern binding。
+- `TypeId` 表示语义类型，不直接等同 AST type syntax。
+- `HirDeclId` / `HirStmtId` / `HirExprId` 表示 HIR flat node storage 中的节点位置。
+- `HIR` 中的 name、decl、local var、expr type 应引用 resolved ID，不依赖合成字符串查找。
+- `JIR` 和 codegen 后续也应继续使用结构化 ID，LLVM/codegen 阶段才生成最终 symbol name。
+
+后续进入 overload、trait method lookup、generic monomorphization 后，需要补充更精确的语义身份类型，例如：
+
+- `DefId`：跨模块唯一声明身份，不局限于当前模块 `BindingId`。
+- `ResolvedCallee`：已解析调用目标，至少包含声明身份、receiver type、type args。
+- `InstanceKey`：泛型实例身份，至少包含 declaration identity 和 type args。
 
 ```text
 ResolvedCallee {
@@ -41,16 +69,12 @@ ResolvedCallee {
     receiver_type: TypeId?,
     type_args: TypeId[],
 }
+
+InstanceKey {
+    def: ast.arena.Arena.alloc_array,
+    type_args: [ast.AstType],
+}
 ```
-
-推荐的职责边界：
-
-- `Symbol` 只表示 interned source text，例如 identifier 的文本。
-- `DefId` 表示唯一声明，例如 function、method、struct、enum、union、global。
-- `TypeId` 表示语义类型，不直接等同 AST type syntax。
-- `InstanceKey` 表示泛型实例，至少包含 `def_id` 和 `type_args`。
-- `HIR/JIR` 中的 call 应引用 resolved callee 或 instance id，不依赖合成字符串查找。
-- LLVM/codegen 阶段才把 `InstanceKey` 转成最终 symbol name。
 
 最终 symbol mangling 可以参考 Swift 或 Itanium ABI：使用不会被 Jiang parser 误解的编码。优先考虑长度前缀方案；如果暂时使用分隔符，也必须保证输出只包含安全字符，不包含 `.`、`#`、`[]`、`<>` 等仍有语法意义的字符。
 
@@ -70,6 +94,72 @@ M3ast5arena5Arena11alloc_arrayT3ast7AstType
 ```
 
 Stage0 中可能仍需要字符串 mangling，但这只能作为过渡实现。Stage1 的 resolver、type checker、HIR、JIR 不应依赖字符串拼接来表达已解析语义。
+
+## ID 与 Side Table 约定
+
+Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是某个 owner table 的索引句柄，不是源码文本，也不是跨阶段通用整数。除非明确说明，同一种 ID 只能在它所属的结果对象或表内查询。
+
+通用规则：
+
+- ID 类型要保持强类型区分，避免把 expression id、statement id、type id、binding id 混用。
+- `Symbol` 只表示 interned text，相等比较快，但不代表声明身份。
+- `BindingId`、`LocalBindingId`、`TypeId`、`Hir*Id` 才是后续阶段应传递的语义句柄。
+- 不要把 fully-qualified string 当作语义身份；字符串只应出现在 source text、diagnostic message 或最终 backend mangling 中。
+- 跨阶段查询必须走对应 result/table 的 helper，例如 `ResolveResult.lookup_resolved_type_path(...)`、`TypeCheckResult.lookup_binding_type(...)`、`HirModule.expr_at(...)`。
+
+当前主要 ID：
+
+| ID | Owner / 保存位置 | 作用 | 常用查询方式 |
+| --- | --- | --- | --- |
+| `Symbol` | `InternPool`，常见于 `ast.Name.symbol`、keyword symbols | interned 源码文本句柄，用于名字和关键字的快速相等比较 | 通过 `CompilerContext` / `InternPool` 比较或取回文本 |
+| `SourceId` | `SourceManager.sources`，保存在 `SourceFile.id` | 源文件身份 | `SourceManager` 按 `SourceId` 取回 `SourceFile` |
+| `TypeRefId` | parser 分配，保存在 `ast.NamedType.type_ref_id` | AST 中 named type reference 的解析 key | `ResolveResult.lookup_resolved_type_path(type_ref_id)` |
+| `DeclId` | AST 顶层 declaration index，保存在 `scope.Binding.decl_id` | 指向 `AstFile.items` 中的顶层声明 | `AstFile.decl_at(binding.decl_id.id)` |
+| `BindingId` | `ResolveResult.top_level` / `export_scope` 内的 binding table | 当前模块顶层声明、import alias、module alias 的稳定句柄 | `ResolveResult.lookup_top_level_id(symbol_id)`；type check 后用 `TypeCheckResult.lookup_binding_type(binding_id)` |
+| `LocalBindingId` | `ResolveResult.local_bindings` | function param、local var、pattern binding、for binding 的稳定句柄 | `ResolveResult.lookup_local_binding_span(span)`；type check 后用 `TypeCheckResult.lookup_local_type(local_id)` |
+| `TypeId` | `TypeTable.items` | 语义类型句柄，和 AST type syntax 分离 | `TypeTable.type_at(type_id)`、`type_equals(...)`、`compatible(...)` |
+| `HirDeclId` | `HirModule.decls` | HIR declaration index | `HirModule.decl_at(id)` |
+| `HirStmtId` | `HirModule.stmts` | HIR statement index | `HirModule.stmt_at(id)` |
+| `HirExprId` | `HirModule.exprs` | HIR expression index | `HirModule.expr_at(id)` |
+
+阶段职责：
+
+- parser 只创建 AST 和 `TypeRefId`。它不解析 `TypeRefId` 指向哪个声明。
+- resolver 创建 `BindingId` / `LocalBindingId`，并填充 `ResolveResult` side tables。
+- type checker 创建 `TypeId`，并填充 `TypeCheckResult` side tables。
+- HIR lowering 消费 `ResolveResult` 和 `TypeCheckResult`，把 AST 节点转换成携带 `BindingId` / `LocalBindingId` / `TypeId` 的 HIR 节点。
+- JIR / codegen 后续应继续使用结构化语义身份，最终 symbol name 只在 backend 边界生成。
+
+当前重要 side tables：
+
+- `ResolveResult.resolved_type_paths`：`TypeRefId -> ResolvedTypePath`，用于查询 named type ref 被解析成 builtin、generic param、`Self`、本模块 binding 或 imported binding。
+- `ResolveResult.resolved_value_paths`：按 name 使用点 span 保存 value resolution 结果，用于查询 expression name 是 local、top-level 还是 imported module path。
+- `ResolveResult.local_bindings`：保存局部 binding 的 `LocalBindingId`、名字、span 和可变性。
+- `TypeCheckResult.binding_types`：`BindingId -> TypeId`，保存顶层 binding 的类型。
+- `TypeCheckResult.function_result_types`：`BindingId -> TypeId`，保存 function result type。
+- `TypeCheckResult.local_types`：`LocalBindingId -> TypeId`，保存局部 binding 类型。
+- `TypeCheckResult.expr_types`：按 expression span 保存 `TypeId`，供 HIR lowering 和后续诊断使用。
+- `HirModule.decls/stmts/exprs`：HIR flat node storage，节点之间用 `HirDeclId` / `HirStmtId` / `HirExprId` 引用。
+
+查询示例：
+
+```text
+Name in type context
+  Ast NamedType.type_ref_id
+  -> ResolveResult.lookup_resolved_type_path(type_ref_id)
+  -> binding / builtin / generic param / Self
+  -> TypeChecker lowers to TypeId
+
+Name in value context
+  Ast Name.span
+  -> ResolveResult.lookup_resolved_value_span(span)
+  -> local binding or top-level binding
+  -> TypeCheckResult.lookup_local_type(...) or lookup_binding_type(...)
+
+HIR expression type
+  HirExpr.type_id
+  -> TypeTable.type_at(type_id)
+```
 
 ## 顶层模块
 
