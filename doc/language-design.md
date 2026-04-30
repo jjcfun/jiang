@@ -376,6 +376,12 @@ T id<T>(T value);
 @where(T: Hashable & Equatable)
 ```
 
+支持 trait bound 内的关联类型绑定：
+
+```jiang
+@where(T: Iterator<Item = Int>)
+```
+
 当前 AST 使用：
 
 - `WhereConstraint`：一条泛型约束。

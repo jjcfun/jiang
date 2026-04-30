@@ -1602,12 +1602,13 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 当前 `@where(...)` 支持两类约束项：
 
 - `Name: Trait`
+- `Name: Trait<Assoc = Type>`
 - `Name: TraitA & TraitB & TraitC`
 - `Name = Type`
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
-
+关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Iterator<Item = Int>)`。
 例如：
 
 ```c
