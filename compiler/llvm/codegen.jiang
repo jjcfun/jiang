@@ -641,6 +641,7 @@ api.Value env_expr_value(context.CompilerContext* ctx, types.TypeTable* type_tab
 Bool stmt_linear_supported(jir.JirModule* input, jir.JirStmt stmt) {
     if (stmt.body is .local(local_stmt)) { return true; }
     if (stmt.body is .temp_local(temp_local)) { return true; }
+    if (stmt.body is .coalesce_control_local(coalesce_control_local)) { return true; }
     if (stmt.body is .assign(assign_stmt)) { return true; }
     if (stmt.body is .expr(expr_stmt)) { return true; }
     if (stmt.body is .return_stmt(return_stmt)) { return true; }
@@ -660,6 +661,19 @@ Bool stmt_linear_supported(jir.JirModule* input, jir.JirStmt stmt) {
         }
         return true;
     }
+    if (stmt.body is .try_stmt(try_stmt)) {
+        if (!block_linear_without_return_supported(input, try_stmt.body)) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < try_stmt.catches.len()) {
+            if (!block_linear_without_return_supported(input, try_stmt.catches[index].body)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
     if (stmt.body is .for_range(for_range)) {
         return block_linear_without_return_supported(input, for_range.body);
     }
@@ -671,6 +685,7 @@ Bool stmt_linear_supported(jir.JirModule* input, jir.JirStmt stmt) {
     }
     if (stmt.body is .break_stmt(span)) { return true; }
     if (stmt.body is .continue_stmt(span)) { return true; }
+    if (stmt.body is .throw_stmt(throw_stmt)) { return true; }
     if (stmt.body is .if_stmt(if_stmt)) {
         if (!block_linear_without_return_supported(input, if_stmt.then_block)) {
             return false;
@@ -888,6 +903,72 @@ api.Block next_switch_block(api.Context* context_ref, api.Module* module_ref, ap
     env.continue_target = previous_continue;
 }
 
+api.Value coalesce_control_result_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirCoalesceControlLocalStmt stmt, FunctionEnv* env, api.Type result_type) {
+    if (!stmt.result.valid()) {
+        return default_value(result_type);
+    }
+    return env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, stmt.result, env, result_type);
+}
+
+() emit_coalesce_control_exit(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirCoalesceControlLocalStmt stmt, FunctionEnv* env, api.Type result_type) {
+    if (stmt.control == .return_value) {
+        if (type_table.type_at(function_decl.result_type).kind == .unit) {
+            builder_ref.build_ret_void();
+        } else {
+            api.Value result = coalesce_control_result_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, stmt, env, result_type);
+            builder_ref.build_ret(result);
+        }
+        return;
+    }
+    if (stmt.control == .break_loop) {
+        if (env.break_target is some target) {
+            builder_ref.build_br(target);
+        } else {
+            builder_ref.build_unreachable();
+        }
+        return;
+    }
+    if (stmt.control == .continue_loop) {
+        if (env.continue_target is some target) {
+            builder_ref.build_br(target);
+        } else {
+            builder_ref.build_unreachable();
+        }
+        return;
+    }
+    builder_ref.build_unreachable();
+}
+
+() emit_linear_coalesce_control_local(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirCoalesceControlLocalStmt stmt, FunctionEnv* env, api.Type result_type) {
+    api.Type local_type = slot_type_ref(ctx, type_table, stmt.type_id, context_ref, result_type);
+    api.Value local_slot = builder_ref.build_alloca(local_type, "coalesce.local");
+    env.add_local(stmt.local_id, local_slot, local_type);
+    emit_linear_block_without_return(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, stmt.left_block, env, result_type);
+    api.Value left = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, stmt.left, env, local_type);
+    api.Value cond = builder_ref.build_icmp(.ne, left, default_value(local_type), "coalesce.some");
+    api.Block some_block = api.append_block(module_ref, context_ref, function_value, "coalesce.some");
+    api.Block exit_block = api.append_block(module_ref, context_ref, function_value, "coalesce.exit");
+    api.Block merge_block = api.append_block(module_ref, context_ref, function_value, "coalesce.end");
+    builder_ref.build_cond_br(cond, some_block, exit_block);
+
+    builder_ref.position_at_end(some_block);
+    builder_ref.build_store(left, local_slot);
+    builder_ref.build_br(merge_block);
+
+    builder_ref.position_at_end(exit_block);
+    emit_linear_block_without_return(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, stmt.result_block, env, result_type);
+    emit_coalesce_control_exit(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, stmt, env, result_type);
+
+    builder_ref.position_at_end(merge_block);
+}
+
+Bool emit_linear_try_stmt(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirTryStmt try_stmt, FunctionEnv* env, api.Type result_type) {
+    if (emit_linear_block_without_return(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, try_stmt.body, env, result_type)) {
+        return true;
+    }
+    return false;
+}
+
 Bool emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirStmt stmt, FunctionEnv* env, api.Type result_type) {
     if (stmt.body is .local(local_stmt)) {
         api.Type type_ref = slot_type_ref(ctx, type_table, local_stmt.type_id, context_ref, result_type);
@@ -903,6 +984,10 @@ Bool emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table,
         api.Type type_ref = slot_type_ref(ctx, type_table, temp_local.type_id, context_ref, result_type);
         api.Value slot = builder_ref.build_alloca(type_ref, "temp");
         env.add_temp(temp_local.temp_id, slot, type_ref);
+        return false;
+    }
+    if (stmt.body is .coalesce_control_local(coalesce_control_local)) {
+        emit_linear_coalesce_control_local(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, coalesce_control_local, env, result_type);
         return false;
     }
     if (stmt.body is .assign(assign_stmt)) {
@@ -931,6 +1016,9 @@ Bool emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table,
     if (stmt.body is .switch_stmt(switch_stmt)) {
         emit_linear_switch_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, switch_stmt, env, result_type);
         return false;
+    }
+    if (stmt.body is .try_stmt(try_stmt)) {
+        return emit_linear_try_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, try_stmt, env, result_type);
     }
     if (stmt.body is .for_range(for_range)) {
         emit_linear_for_range_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, for_range, env, result_type);
@@ -971,6 +1059,13 @@ Bool emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table,
             api.Value value = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, return_stmt.value, env, result_type);
             builder_ref.build_ret(value);
         }
+        return true;
+    }
+    if (stmt.body is .throw_stmt(throw_stmt)) {
+        if (throw_stmt.value.valid()) {
+            env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, throw_stmt.value, env, result_type);
+        }
+        builder_ref.build_unreachable();
         return true;
     }
     if (stmt.body is .break_stmt(span)) {
