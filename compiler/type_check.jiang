@@ -249,6 +249,7 @@ public struct TypeChecker {
     list.ArenaList<LocalType> active_locals;
     list.ArenaList<Int> local_scope_starts;
     types.TypeId! current_return_type;
+    types.TypeId! current_self_type;
 
     public init(context.CompilerContext* ctx, resolve.ResolveResult* resolved) {
         self.ctx = ctx;
@@ -259,6 +260,7 @@ public struct TypeChecker {
         self.active_locals = list.ArenaList<LocalType>(ctx.ast_store_ptr());
         self.local_scope_starts = list.ArenaList<Int>(ctx.ast_store_ptr());
         self.current_return_type = types.TypeId();
+        self.current_self_type = types.TypeId();
     }
 
     public TypeCheckResult check(ast.AstFile* file) {
@@ -369,7 +371,7 @@ public struct TypeChecker {
             return;
         }
         if (decl is .extend_decl(extend_decl)) {
-            self.type_from_ast(extend_decl.target);
+            self.check_extend(extend_decl);
             return;
         }
     }
@@ -477,6 +479,60 @@ public struct TypeChecker {
             self.check_function_signature(method.signature);
             index = index + 1;
         }
+    }
+
+    () check_extend(ast.ExtendDecl decl) {
+        self.check_generics(decl.generics);
+        self.type_from_ast(decl.target);
+        Int! index = 0;
+        while (index < decl.items.len()) {
+            ast.AstDecl item = decl.items[index];
+            if (item is .function_decl(function_decl)) {
+                self.check_method_signature(decl.target, function_decl);
+            } else {
+                self.check_decl(item);
+            }
+            index = index + 1;
+        }
+    }
+
+    () check_method_signature(ast.AstType receiver_ref, ast.FunctionDecl decl) {
+        self.check_generics(decl.generics);
+        self.function_type(decl);
+        types.TypeId receiver_type = self.type_from_ast(receiver_ref);
+        if (decl.body is some body) {
+            self.check_method_body(decl, body, receiver_type);
+        } else {
+            self.enter_local_scope();
+            Int! index = 0;
+            while (index < decl.params.len()) {
+                ast.Param param = decl.params[index];
+                self.define_local_type(param.name, self.type_from_ast(param.type_ref), param.mutable_binding);
+                index = index + 1;
+            }
+            self.exit_local_scope();
+        }
+    }
+
+    () check_method_body(ast.FunctionDecl decl, ast.Block body, types.TypeId receiver_type) {
+        self.result.checked_function_count = self.result.checked_function_count + 1;
+        types.TypeId previous_return_type = self.current_return_type;
+        types.TypeId previous_self_type = self.current_self_type;
+        self.current_return_type = self.type_from_ast(decl.result);
+        self.current_self_type = receiver_type;
+        self.enter_local_scope();
+        ast.Name self_name = ast.Name(decl.span, self.ctx.intern("self"));
+        self.define_local_type(self_name, self.result.types.make_pointer(decl.span, receiver_type, false, false), false);
+        Int! index = 0;
+        while (index < decl.params.len()) {
+            ast.Param param = decl.params[index];
+            self.define_local_type(param.name, self.type_from_ast(param.type_ref), param.mutable_binding);
+            index = index + 1;
+        }
+        self.check_block(body);
+        self.exit_local_scope();
+        self.current_self_type = previous_self_type;
+        self.current_return_type = previous_return_type;
     }
 
     () check_generics(ast.GenericParams generics) {
@@ -799,6 +855,9 @@ public struct TypeChecker {
             return self.type_of_name(name);
         }
         if (expr is .self_value(span)) {
+            if (self.current_self_type.valid()) {
+                return self.result.types.make_pointer(span, self.current_self_type, false, false);
+            }
             return self.result.types.make_type_param(span, self.ctx.intern("Self"));
         }
         if (expr is .implicit_value(span)) {
@@ -1133,6 +1192,12 @@ public struct TypeChecker {
         if (expr.callee is .variant(variant)) {
             return self.type_of_variant_call(variant, expr, expected);
         }
+        if (expr.callee is .field(field)) {
+            types.TypeId method_result = self.try_method_call(field, expr, expected);
+            if (method_result.valid()) {
+                return method_result;
+            }
+        }
         types.TypeId callee_type = self.expr_type(expr.callee, types.TypeId());
         types.TypeInfo info = self.result.types.type_at(callee_type);
         if (info.kind != .function) {
@@ -1156,6 +1221,57 @@ public struct TypeChecker {
         types.TypeId result_type = self.result.types.child_at(info.child_start + info.child_count - 1);
         if (expected.valid()) {
             self.check_compatible(expected, result_type, expr.span, "call result type mismatch");
+        }
+        return result_type;
+    }
+
+    types.TypeId try_method_call(ast.FieldExpr field, ast.CallExpr call, types.TypeId expected) {
+        types.TypeId receiver_type = self.method_receiver_type(self.expr_type(field.base, types.TypeId()));
+        Bool! receiver_name_matched = false;
+        Int! index = 0;
+        while (index < self.resolved.method_count()) {
+            resolve.MethodBinding method = self.resolved.method_at_index(index);
+            if (self.method_matches_receiver(method, receiver_type) && method.function.name.symbol.id == field.name.symbol.id) {
+                receiver_name_matched = true;
+                if (method.function.params.len() == call.args.len()) {
+                    return self.check_method_call(method.function, call, expected);
+                }
+            }
+            index = index + 1;
+        }
+        if (receiver_name_matched) {
+            self.check_call_args_without_signature(call);
+            self.mismatch(call.span, "method argument count mismatch");
+            return self.invalid_type(call.span);
+        }
+        return types.TypeId();
+    }
+
+    types.TypeId method_receiver_type(types.TypeId type_id) {
+        if (!type_id.valid()) { return type_id; }
+        types.TypeInfo info = self.result.types.type_at(type_id);
+        if (info.kind == .pointer) {
+            return info.element;
+        }
+        return type_id;
+    }
+
+    Bool method_matches_receiver(resolve.MethodBinding method, types.TypeId receiver_type) {
+        if (!receiver_type.valid()) { return false; }
+        types.TypeId method_receiver = self.method_receiver_type(self.type_from_ast(method.receiver));
+        return self.result.types.type_equals(method_receiver, receiver_type);
+    }
+
+    types.TypeId check_method_call(ast.FunctionDecl method, ast.CallExpr call, types.TypeId expected) {
+        Int! index = 0;
+        while (index < call.args.len()) {
+            types.TypeId expected_arg = self.type_from_ast(method.params[index].type_ref);
+            self.check_compatible(expected_arg, self.expr_type(call.args[index].value, expected_arg), call.args[index].span, "method argument type mismatch");
+            index = index + 1;
+        }
+        types.TypeId result_type = self.type_from_ast(method.result);
+        if (expected.valid()) {
+            self.check_compatible(expected, result_type, call.span, "method result type mismatch");
         }
         return result_type;
     }
@@ -1607,7 +1723,12 @@ public struct TypeChecker {
 
     types.TypeId lookup_field_type(types.TypeId base_type, ast.Name field_name) {
         if (!base_type.valid()) { return types.TypeId(); }
-        types.TypeInfo info = self.result.types.type_at(base_type);
+        types.TypeId! receiver_type = base_type;
+        types.TypeInfo! info = self.result.types.type_at(receiver_type);
+        if (info.kind == .pointer) {
+            receiver_type = info.element;
+            info = self.result.types.type_at(receiver_type);
+        }
         if (info.kind != .nominal || info.nominal_kind != .struct_decl) {
             return types.TypeId();
         }
@@ -1669,7 +1790,9 @@ public struct TypeChecker {
             }
             return false;
         }
-        if (expr is .field(_)) { return true; }
+        if (expr is .field(_)) {
+            return self.type_mutable(self.expr_type(expr, types.TypeId()));
+        }
         if (expr is .index(_)) { return true; }
         if (expr is .unary(unary)) {
             return unary.op == .deref;
@@ -1685,6 +1808,12 @@ public struct TypeChecker {
             return global_decl.mutable_binding;
         }
         return false;
+    }
+
+    Bool type_mutable(types.TypeId type_id) {
+        if (!type_id.valid()) { return false; }
+        types.TypeInfo info = self.result.types.type_at(type_id);
+        return info.kind == .layer && info.mutable;
     }
 
     () check_bool(types.TypeId type_id, token.Span span) {
