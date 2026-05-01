@@ -800,6 +800,9 @@ Bool stmt_linear_supported(jir.JirModule* input, jir.JirStmt stmt) {
     if (stmt.body is .for_range(for_range)) {
         return block_linear_without_return_supported(input, for_range.body);
     }
+    if (stmt.body is .for_each(for_each)) {
+        return block_linear_without_return_supported(input, for_each.body);
+    }
     if (stmt.body is .while_stmt(while_stmt)) {
         if (!block_linear_without_return_supported(input, while_stmt.cond_block)) {
             return false;
@@ -1026,6 +1029,93 @@ api.Block next_switch_block(api.Context* context_ref, api.Module* module_ref, ap
     env.continue_target = previous_continue;
 }
 
+types.TypeInfo iterable_array_info(types.TypeTable* type_table, jir.JirExpr iterable_expr) {
+    if (iterable_expr.type_id.valid()) {
+        types.TypeInfo info = type_table.type_at(iterable_expr.type_id);
+        if (info.kind == .array) {
+            return info;
+        }
+        if (info.kind == .layer && info.element.valid()) {
+            types.TypeInfo element_info = type_table.type_at(info.element);
+            if (element_info.kind == .array) {
+                return element_info;
+            }
+        }
+    }
+    return types.TypeInfo(.invalid, iterable_expr.span);
+}
+
+() emit_for_each_binds(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, list.ArenaList<jir.JirPatternBind> binds, FunctionEnv* env, api.Value item_value, api.Type item_type) {
+    Int! index = 0;
+    while (index < binds.len()) {
+        jir.JirPatternBind bind = binds[index];
+        if (env.find_local(bind.local_id) < 0) {
+            api.Type bind_type = slot_type_ref(ctx, type_table, bind.type_id, context_ref, item_type);
+            api.Value bind_slot = builder_ref.build_alloca(bind_type, "for.each.bind");
+            env.add_local(bind.local_id, bind_slot, bind_type);
+            builder_ref.build_store(item_value, bind_slot);
+        }
+        index = index + 1;
+    }
+}
+
+() emit_linear_for_each_stmt(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirForEachStmt for_each, FunctionEnv* env, api.Type result_type) {
+    if (!for_each.iterable.valid()) {
+        return;
+    }
+    jir.JirExpr iterable_expr = input.expr_at(for_each.iterable);
+    types.TypeInfo array_info = iterable_array_info(type_table, iterable_expr);
+    if (array_info.kind != .array || array_info.child_count <= 0) {
+        return;
+    }
+
+    api.Type array_ref = expr_type_ref(ctx, type_table, input, context_ref, for_each.iterable, result_type);
+    api.Type item_type = result_type_ref(ctx, type_table, array_info.element, context_ref);
+    api.Value array_value = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, for_each.iterable, env, array_ref);
+    api.Value array_slot = builder_ref.build_alloca(array_ref, "for.each.array");
+    builder_ref.build_store(array_value, array_slot);
+
+    api.Type index_type = context_ref.int64_type();
+    api.Value index_slot = builder_ref.build_alloca(index_type, "for.each.index");
+    builder_ref.build_store(api.const_int(index_type, 0), index_slot);
+
+    api.Block cond_block = api.append_block(module_ref, context_ref, function_value, "for.each.cond");
+    api.Block body_block = api.append_block(module_ref, context_ref, function_value, "for.each.body");
+    api.Block step_block = api.append_block(module_ref, context_ref, function_value, "for.each.step");
+    api.Block exit_block = api.append_block(module_ref, context_ref, function_value, "for.each.exit");
+    api.Block?! previous_break = env.break_target;
+    api.Block?! previous_continue = env.continue_target;
+    env.set_loop_targets(exit_block, step_block);
+    builder_ref.build_br(cond_block);
+
+    builder_ref.position_at_end(cond_block);
+    api.Value current = builder_ref.build_load(index_type, index_slot, "for.each.index.load");
+    api.Value count = api.const_int(index_type, UInt64(array_info.child_count));
+    api.Value cond = builder_ref.build_icmp(.slt, current, count, "for.each.cond");
+    builder_ref.build_cond_br(cond, body_block, exit_block);
+
+    builder_ref.position_at_end(body_block);
+    api.LLVMValueRef![*] indices = api.LLVMValueRef$.alloc_array(2);
+    indices[0] = api.value_ref(api.const_int(index_type, 0));
+    indices[1] = api.value_ref(current);
+    api.Value item_ptr = builder_ref.build_gep_refs(array_ref, array_slot, indices, 2, "for.each.item.ptr");
+    api.Value item_value = builder_ref.build_load(item_type, item_ptr, "for.each.item");
+    emit_for_each_binds(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, for_each.binds, env, item_value, item_type);
+    if (!emit_linear_block_without_return(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, for_each.body, env, result_type)) {
+        builder_ref.build_br(step_block);
+    }
+
+    builder_ref.position_at_end(step_block);
+    api.Value step_current = builder_ref.build_load(index_type, index_slot, "for.each.index.step");
+    api.Value one = api.const_int(index_type, 1);
+    builder_ref.build_store(builder_ref.build_add(step_current, one, "for.each.next"), index_slot);
+    builder_ref.build_br(cond_block);
+
+    builder_ref.position_at_end(exit_block);
+    env.break_target = previous_break;
+    env.continue_target = previous_continue;
+}
+
 api.Value coalesce_control_result_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirCoalesceControlLocalStmt stmt, FunctionEnv* env, api.Type result_type) {
     if (!stmt.result.valid()) {
         return default_value(result_type);
@@ -1145,6 +1235,10 @@ Bool emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table,
     }
     if (stmt.body is .for_range(for_range)) {
         emit_linear_for_range_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, for_range, env, result_type);
+        return false;
+    }
+    if (stmt.body is .for_each(for_each)) {
+        emit_linear_for_each_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, for_each, env, result_type);
         return false;
     }
     if (stmt.body is .while_stmt(while_stmt)) {
