@@ -803,7 +803,7 @@ public struct TypeChecker {
             return self.type_of_struct_lit(struct_lit);
         }
         if (expr is .variant(variant)) {
-            return self.type_of_variant(variant);
+            return self.type_of_variant(variant, expected);
         }
         if (expr is .tuple(tuple)) {
             return self.type_of_tuple(tuple);
@@ -1018,6 +1018,9 @@ public struct TypeChecker {
     }
 
     types.TypeId type_of_call(ast.CallExpr expr, types.TypeId expected) {
+        if (expr.callee is .variant(variant)) {
+            return self.type_of_variant_call(variant, expr, expected);
+        }
         types.TypeId callee_type = self.expr_type(expr.callee, types.TypeId());
         types.TypeInfo info = self.result.types.type_at(callee_type);
         if (info.kind != .function) {
@@ -1043,6 +1046,20 @@ public struct TypeChecker {
             self.check_compatible(expected, result_type, expr.span, "call result type mismatch");
         }
         return result_type;
+    }
+
+    types.TypeId type_of_variant_call(ast.VariantExpr variant, ast.CallExpr call, types.TypeId expected) {
+        types.TypeId union_type = self.variant_union_type(variant.path, expected);
+        if (!union_type.valid()) {
+            self.check_infer_call_args(call.args);
+            if (expected.valid() && !self.result.types.is_invalid(expected)) {
+                self.mismatch(call.span, "variant constructor requires union type");
+            }
+            return self.infer_type(call.span);
+        }
+        types.TypeId payload_type = self.variant_payload_type(union_type, variant.path);
+        self.check_variant_call_args(call.args, call.span, payload_type);
+        return union_type;
     }
 
     () check_call_args_without_signature(ast.CallExpr expr) {
@@ -1150,13 +1167,17 @@ public struct TypeChecker {
         return nominal;
     }
 
-    types.TypeId type_of_variant(ast.VariantExpr expr) {
-        Int! index = 0;
-        while (index < expr.payload.len()) {
-            self.expr_type(expr.payload[index], types.TypeId());
-            index = index + 1;
+    types.TypeId type_of_variant(ast.VariantExpr expr, types.TypeId expected) {
+        types.TypeId union_type = self.variant_union_type(expr.path, expected);
+        if (!union_type.valid()) {
+            self.check_variant_payload_exprs(expr, types.TypeId());
+            if (expected.valid() && !self.result.types.is_invalid(expected)) {
+                self.mismatch(expr.span, "variant constructor requires union type");
+            }
+            return self.infer_type(expr.span);
         }
-        return self.infer_type(expr.span);
+        self.check_variant_payload_exprs(expr, union_type);
+        return union_type;
     }
 
     types.TypeId type_of_tuple(ast.SequenceExpr expr) {
@@ -1205,11 +1226,7 @@ public struct TypeChecker {
             return;
         }
         if (pattern is .variant(variant)) {
-            Int! index = 0;
-            while (index < variant.payload.len()) {
-                self.check_pattern(variant.payload[index], self.infer_type(variant.span));
-                index = index + 1;
-            }
+            self.check_variant_payload_patterns(variant, expected);
             return;
         }
         if (pattern is .optional(optional)) {
@@ -1242,6 +1259,230 @@ public struct TypeChecker {
         }
         self.mismatch(span, "optional pattern requires optional value");
         return self.invalid_type(span);
+    }
+
+    types.TypeId variant_union_type(ast.Path path, types.TypeId expected) {
+        if (expected.valid()) {
+            types.TypeInfo expected_info = self.result.types.type_at(expected);
+            if (expected_info.kind == .nominal && expected_info.nominal_kind == .union_decl) {
+                if (self.path_matches_union(path, expected_info)) {
+                    return expected;
+                }
+                self.mismatch(path.span, "variant constructor type mismatch");
+                return types.TypeId();
+            }
+            if (!self.result.types.is_invalid(expected) && expected_info.kind != .infer) {
+                return types.TypeId();
+            }
+        }
+        return self.union_type_from_path(path);
+    }
+
+    Bool path_matches_union(ast.Path path, types.TypeInfo union_info) {
+        if (path.segment_len() < 2) {
+            return false;
+        }
+        ast.Name type_name = path.segments[path.segment_len() - 2];
+        return type_name.symbol.id == union_info.symbol.id;
+    }
+
+    types.TypeId union_type_from_path(ast.Path path) {
+        if (path.segment_len() < 2) {
+            return types.TypeId();
+        }
+        ast.Name type_name = path.segments[path.segment_len() - 2];
+        scope.Binding? binding = self.resolved.lookup_top_level_id(type_name.symbol.id);
+        if (binding == null) {
+            return types.TypeId();
+        }
+        scope.Binding resolved_binding = binding$.some();
+        if (resolved_binding.kind != .top_union) {
+            return types.TypeId();
+        }
+        return self.result.types.make_nominal(type_name.span, type_name.symbol, resolved_binding.binding_id, .union_decl);
+    }
+
+    () check_variant_payload_exprs(ast.VariantExpr expr, types.TypeId union_type) {
+        types.TypeId payload_type = self.variant_payload_type(union_type, expr.path);
+        self.check_payload_exprs(expr.payload, expr.span, payload_type);
+    }
+
+    () check_variant_payload_patterns(ast.VariantPattern pattern, types.TypeId expected) {
+        types.TypeId union_type = self.variant_union_type(pattern.path, expected);
+        types.TypeId payload_type = self.variant_payload_type(union_type, pattern.path);
+        self.check_payload_patterns(pattern.payload, pattern.span, payload_type);
+    }
+
+    types.TypeId variant_payload_type(types.TypeId union_type, ast.Path path) {
+        if (!union_type.valid()) {
+            return types.TypeId();
+        }
+        types.TypeInfo info = self.result.types.type_at(union_type);
+        if (info.kind != .nominal || info.nominal_kind != .union_decl) {
+            return types.TypeId();
+        }
+        ast.AstDecl? decl = self.decl_for_binding(info.binding_id);
+        if (decl == null) {
+            return types.TypeId();
+        }
+        ast.AstDecl resolved_decl = decl$.some();
+        if (resolved_decl is .union_decl(union_decl)) {
+            ast.Name variant_name = path.segments[path.segment_len() - 1];
+            Int! index = 0;
+            while (index < union_decl.variants.len()) {
+                ast.UnionVariant variant = union_decl.variants[index];
+                if (variant.name.symbol.id == variant_name.symbol.id) {
+                    return self.type_from_ast(variant.type_ref);
+                }
+                index = index + 1;
+            }
+            self.mismatch(variant_name.span, "unknown union variant");
+        }
+        return types.TypeId();
+    }
+
+    () check_payload_exprs(list.ArenaList<ast.AstExpr*> payload, token.Span span, types.TypeId payload_type) {
+        if (!payload_type.valid()) {
+            self.check_infer_payload_exprs(payload);
+            return;
+        }
+        types.TypeInfo info = self.result.types.type_at(payload_type);
+        if (info.kind == .unit) {
+            if (payload.len() != 0) {
+                self.mismatch(span, "variant payload count mismatch");
+            }
+            self.check_infer_payload_exprs(payload);
+            return;
+        }
+        if (info.kind == .tuple) {
+            self.check_tuple_payload_exprs(payload, span, info);
+            return;
+        }
+        if (payload.len() != 1) {
+            self.mismatch(span, "variant payload count mismatch");
+            self.check_infer_payload_exprs(payload);
+            return;
+        }
+        self.check_compatible(payload_type, self.expr_type(payload[0], payload_type), span, "variant payload type mismatch");
+    }
+
+    () check_variant_call_args(list.ArenaList<ast.CallArg> args, token.Span span, types.TypeId payload_type) {
+        if (!payload_type.valid()) {
+            self.check_infer_call_args(args);
+            return;
+        }
+        types.TypeInfo info = self.result.types.type_at(payload_type);
+        if (info.kind == .unit) {
+            if (args.len() != 0) {
+                self.mismatch(span, "variant payload count mismatch");
+            }
+            self.check_infer_call_args(args);
+            return;
+        }
+        if (info.kind == .tuple) {
+            self.check_tuple_variant_call_args(args, span, info);
+            return;
+        }
+        if (args.len() != 1) {
+            self.mismatch(span, "variant payload count mismatch");
+            self.check_infer_call_args(args);
+            return;
+        }
+        self.check_compatible(payload_type, self.expr_type(args[0].value, payload_type), span, "variant payload type mismatch");
+    }
+
+    () check_tuple_variant_call_args(list.ArenaList<ast.CallArg> args, token.Span span, types.TypeInfo info) {
+        if (args.len() != info.child_count) {
+            self.mismatch(span, "variant payload count mismatch");
+        }
+        Int! index = 0;
+        while (index < args.len()) {
+            types.TypeId! item_type = self.infer_type(span);
+            if (index < info.child_count) {
+                item_type = self.result.types.child_at(info.child_start + index);
+            }
+            self.check_compatible(item_type, self.expr_type(args[index].value, item_type), span, "variant payload type mismatch");
+            index = index + 1;
+        }
+    }
+
+    () check_infer_call_args(list.ArenaList<ast.CallArg> args) {
+        Int! index = 0;
+        while (index < args.len()) {
+            self.expr_type(args[index].value, types.TypeId());
+            index = index + 1;
+        }
+    }
+
+    () check_tuple_payload_exprs(list.ArenaList<ast.AstExpr*> payload, token.Span span, types.TypeInfo info) {
+        if (payload.len() != info.child_count) {
+            self.mismatch(span, "variant payload count mismatch");
+        }
+        Int! index = 0;
+        while (index < payload.len()) {
+            types.TypeId! item_type = self.infer_type(span);
+            if (index < info.child_count) {
+                item_type = self.result.types.child_at(info.child_start + index);
+            }
+            self.check_compatible(item_type, self.expr_type(payload[index], item_type), span, "variant payload type mismatch");
+            index = index + 1;
+        }
+    }
+
+    () check_infer_payload_exprs(list.ArenaList<ast.AstExpr*> payload) {
+        Int! index = 0;
+        while (index < payload.len()) {
+            self.expr_type(payload[index], types.TypeId());
+            index = index + 1;
+        }
+    }
+
+    () check_payload_patterns(list.ArenaList<ast.Pattern> payload, token.Span span, types.TypeId payload_type) {
+        if (!payload_type.valid()) {
+            self.check_infer_payload_patterns(payload, span);
+            return;
+        }
+        types.TypeInfo info = self.result.types.type_at(payload_type);
+        if (info.kind == .unit) {
+            if (payload.len() != 0) {
+                self.mismatch(span, "variant payload count mismatch");
+            }
+            self.check_infer_payload_patterns(payload, span);
+            return;
+        }
+        if (info.kind == .tuple) {
+            self.check_tuple_payload_patterns(payload, span, info);
+            return;
+        }
+        if (payload.len() != 1) {
+            self.mismatch(span, "variant payload count mismatch");
+            self.check_infer_payload_patterns(payload, span);
+            return;
+        }
+        self.check_pattern(payload[0], payload_type);
+    }
+
+    () check_tuple_payload_patterns(list.ArenaList<ast.Pattern> payload, token.Span span, types.TypeInfo info) {
+        if (payload.len() != info.child_count) {
+            self.mismatch(span, "variant payload count mismatch");
+        }
+        Int! index = 0;
+        while (index < payload.len()) {
+            types.TypeId! item_type = self.infer_type(span);
+            if (index < info.child_count) {
+                item_type = self.result.types.child_at(info.child_start + index);
+            }
+            self.check_pattern(payload[index], item_type);
+            index = index + 1;
+        }
+    }
+
+    () check_infer_payload_patterns(list.ArenaList<ast.Pattern> payload, token.Span span) {
+        Int! index = 0;
+        while (index < payload.len()) {
+            self.check_pattern(payload[index], self.infer_type(span));
+            index = index + 1;
+        }
     }
 
     types.TypeId lookup_field_type(types.TypeId base_type, ast.Name field_name) {

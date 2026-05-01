@@ -179,10 +179,11 @@ jir.JirTypeDecl? type_decl_for_symbol(jir.JirModule* input, ast.Name name) {
 }
 
 jir.JirTypeDecl? union_decl_for_path(jir.JirModule* input, ast.Path path) {
-    if (path.segment_len() == 0) {
+    if (path.segment_len() < 2) {
         return null;
     }
-    jir.JirTypeDecl? decl = type_decl_for_symbol(input, path.segments[0]);
+    ast.Name type_name = path.segments[path.segment_len() - 2];
+    jir.JirTypeDecl? decl = type_decl_for_symbol(input, type_name);
     if (decl is some type_decl) {
         if (type_decl.kind == .union_decl) {
             return type_decl;
@@ -195,7 +196,7 @@ Int variant_index_for_path(jir.JirTypeDecl decl, ast.Path path) {
     if (path.segment_len() < 2) {
         return -1;
     }
-    ast.Name variant_name = path.segments[1];
+    ast.Name variant_name = path.segments[path.segment_len() - 1];
     Int! index = 0;
     while (index < decl.variants.len()) {
         if (decl.variants[index].name.symbol.id == variant_name.symbol.id) {
@@ -204,6 +205,13 @@ Int variant_index_for_path(jir.JirTypeDecl decl, ast.Path path) {
         index = index + 1;
     }
     return -1;
+}
+
+api.Type union_type_ref(api.Context* context_ref) {
+    api.LLVMTypeRef![*] element_types = api.LLVMTypeRef$.alloc_array(2);
+    element_types[0] = api.type_ref(context_ref.int64_type());
+    element_types[1] = api.type_ref(context_ref.int64_type());
+    return context_ref.struct_type_refs(element_types, 2);
 }
 
 api.Type struct_decl_type_ref(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, jir.JirTypeDecl decl) {
@@ -223,7 +231,10 @@ api.Type nominal_type_ref(context.CompilerContext* ctx, types.TypeTable* type_ta
             return struct_decl_type_ref(ctx, type_table, input, context_ref, type_decl);
         }
     }
-    if (info.nominal_kind == .union_decl || info.nominal_kind == .enum_decl) {
+    if (info.nominal_kind == .union_decl) {
+        return union_type_ref(context_ref);
+    }
+    if (info.nominal_kind == .enum_decl) {
         return context_ref.int64_type();
     }
     return context_ref.int64_type();
@@ -262,7 +273,10 @@ api.Type ast_named_type_ref(context.CompilerContext* ctx, types.TypeTable* type_
         if (type_decl.kind == .struct_decl) {
             return struct_decl_type_ref(ctx, type_table, input, context_ref, type_decl);
         }
-        if (type_decl.kind == .union_decl || type_decl.kind == .enum_decl) {
+        if (type_decl.kind == .union_decl) {
+            return union_type_ref(context_ref);
+        }
+        if (type_decl.kind == .enum_decl) {
             return context_ref.int64_type();
         }
     }
@@ -364,6 +378,22 @@ api.Type function_type_ref(context.CompilerContext* ctx, types.TypeTable* type_t
 
 api.Value default_value(api.Type result_type) {
     return api.const_int(result_type, 0);
+}
+
+Bool type_id_is_union(types.TypeTable* type_table, types.TypeId type_id) {
+    if (!type_id.valid()) {
+        return false;
+    }
+    types.TypeInfo info = type_table.type_at(type_id);
+    return info.kind == .nominal && info.nominal_kind == .union_decl;
+}
+
+api.Value union_tag(api.Builder* builder_ref, api.Value value) {
+    return builder_ref.build_extract_value(value, 0, "union.tag");
+}
+
+api.Value union_payload(api.Builder* builder_ref, api.Value value) {
+    return builder_ref.build_extract_value(value, 1, "union.payload");
 }
 
 UInt64 parse_uint_literal(context.CompilerContext* ctx, token.Span span) {
@@ -861,15 +891,23 @@ api.Value env_enum_field_value(context.CompilerContext* ctx, jir.JirModule* inpu
     return default_value(result_type);
 }
 
-api.Value env_variant_value(context.CompilerContext* ctx, jir.JirModule* input, api.Context* context_ref, jir.JirVariantExpr variant, api.Type result_type) {
+api.Value env_variant_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirVariantExpr variant, FunctionEnv* env, api.Type result_type) {
     jir.JirTypeDecl? decl = union_decl_for_path(input, variant.path);
     if (decl is some union_decl) {
         Int index = variant_index_for_path(union_decl, variant.path);
         if (index >= 0) {
-            return api.const_int(result_type, UInt64(index + 1));
+            api.Value tag = api.const_int(context_ref.int64_type(), UInt64(index + 1));
+            api.Value! payload = api.const_int(context_ref.int64_type(), 0);
+            if (variant.payload.len() > 0) {
+                payload = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, variant.payload[0], env, context_ref.int64_type());
+            }
+            api.Value! aggregate = api.undef(result_type);
+            aggregate = builder_ref.build_insert_value(aggregate, tag, 0, "variant.tag");
+            aggregate = builder_ref.build_insert_value(aggregate, payload, 1, "variant.payload");
+            return aggregate;
         }
     }
-    return api.const_int(result_type, 0);
+    return api.undef(result_type);
 }
 
 types.TypeId pointer_element_type(types.TypeTable* type_table, jir.JirExpr base) {
@@ -1068,8 +1106,15 @@ api.Value pattern_test_condition(context.CompilerContext* ctx, types.TypeTable* 
             if (decl is some union_decl) {
                 Int index = variant_index_for_path(union_decl, path);
                 if (index >= 0) {
-                    api.Value expected = api.const_int(value_type, UInt64(index + 1));
-                    return builder_ref.build_icmp(.eq, value, expected, "pattern.variant");
+                    api.Value! tag = value;
+                    api.Type! tag_type = value_type;
+                    jir.JirExpr source_expr = input.expr_at(test.value);
+                    if (type_id_is_union(type_table, source_expr.type_id)) {
+                        tag = union_tag(builder_ref, value);
+                        tag_type = context_ref.int64_type();
+                    }
+                    api.Value expected = api.const_int(tag_type, UInt64(index + 1));
+                    return builder_ref.build_icmp(.eq, tag, expected, "pattern.variant");
                 }
             }
         }
@@ -1097,11 +1142,23 @@ api.Value pattern_tests_condition(context.CompilerContext* ctx, types.TypeTable*
             api.Type bind_type = slot_type_ref(ctx, type_table, input, bind.type_id, context_ref, context_ref.int64_type());
             api.Value bind_slot = builder_ref.build_alloca(bind_type, "pattern.bind");
             env.add_local(bind.local_id, bind_slot, bind_type);
-            api.Value value = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, bind.value, env, bind_type);
+            api.Value value = pattern_bind_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, bind, env, bind_type);
             builder_ref.build_store(value, bind_slot);
         }
         index = index + 1;
     }
+}
+
+api.Value pattern_bind_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirPatternBind bind, FunctionEnv* env, api.Type bind_type) {
+    if (bind.value.valid()) {
+        jir.JirExpr source_expr = input.expr_at(bind.value);
+        if (type_id_is_union(type_table, source_expr.type_id) && !type_id_is_union(type_table, bind.type_id)) {
+            api.Type union_type = expr_type_ref(ctx, type_table, input, context_ref, bind.value, union_type_ref(context_ref));
+            api.Value source_value = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, bind.value, env, union_type);
+            return union_payload(builder_ref, source_value);
+        }
+    }
+    return env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, bind.value, env, bind_type);
 }
 
 api.Value optional_is_some_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirOptionalIsSomeExpr optional_is_some, FunctionEnv* env) {
@@ -1190,7 +1247,7 @@ api.Value env_expr_value(context.CompilerContext* ctx, types.TypeTable* type_tab
         return env_struct_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, expr.type_id, struct_lit, env, result_type);
     }
     if (expr.body is .variant(variant)) {
-        return env_variant_value(ctx, input, context_ref, variant, result_type);
+        return env_variant_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, variant, env, result_type);
     }
     if (expr.body is .field(field)) {
         return env_field_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, field, env, result_type);
