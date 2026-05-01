@@ -477,6 +477,7 @@ LLVM C API helper layer，内部直接声明 LLVM 21.1.x C API 的最小 extern 
 - 在文件内部定义 LLVM opaque pointee types，例如 `LLVMContext`、`LLVMModule`、`LLVMBuilder`、`LLVMType`、`LLVMValue`、`LLVMBasicBlock`。
 - 对外暴露 Jiang 风格 wrapper，例如 `Context`、`Module`、`Builder`、`Type`、`Value`、`Block`。
 - 提供薄 helper，例如 `function_type(...)`、`const_int(...)`、`Builder.build_ret(...)`。
+- 提供 module target helper：`Module.set_default_target()` 会设置默认 target triple，并写入当前过渡期使用的 64-bit data layout。
 - 记录资源释放边界：`Context.dispose()`、`Module.dispose()`、`Builder.dispose()`、message / `dispose_message(...)`。
 - 不记录 mock instruction，不重新建一套 LLVM facade IR。
 
@@ -493,6 +494,8 @@ stage1 实现自举后需要回收这层技术债：
 - LLVM extern 声明改回 private，只允许 `api.jiang` 内部 wrapper 方法调用。
 - `codegen.jiang` 不直接引用 raw LLVM handle 和 extern，只通过 `api.Context`、`api.Module`、`api.Builder`、`api.Type`、`api.Value`、`api.Block` 工作。
 - 如果 stage0 仍需维护，应先修复“public 方法体依赖 private helper/extern 被导入后不可见”的问题，再同步收回这些 `public`。
+
+当前 target/data layout 还有一个过渡限制：compiler 测试通过 `lli` 执行，`lli` 不保证暴露 `LLVMInitializeNativeTarget`、`LLVMCreateTargetMachine` 等 native target machine 符号。因此 `Module.set_default_target()` 暂时只调用 `LLVMGetDefaultTargetTriple` / `LLVMSetTarget`，data layout 使用固定 64-bit 字符串。后续实现 object/executable emission 时，应改为通过 TargetMachine 查询真实 data layout，并按输出 target 配置驱动 `Int` / `UInt` / pointer-sized layout。
 
 ### `llvm/codegen.jiang`
 
