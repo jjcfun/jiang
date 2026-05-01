@@ -678,17 +678,30 @@ static int type_equals(HirType* left, HirType* right) {
 static const char* nominal_public_suffix(const char* name) {
     const char* last_dot = name ? strrchr(name, '.') : 0;
     const char* scan = 0;
+    const char* suffix = name;
     if (!last_dot) {
-        return name;
+        suffix = name;
+        while (suffix && *suffix == '#') {
+            suffix += 1;
+        }
+        return suffix;
     }
     scan = last_dot;
     while (scan > name) {
         scan -= 1;
         if (*scan == '.') {
-            return scan + 1;
+            suffix = scan + 1;
+            while (*suffix == '#') {
+                suffix += 1;
+            }
+            return suffix;
         }
     }
-    return name;
+    suffix = name;
+    while (suffix && *suffix == '#') {
+        suffix += 1;
+    }
+    return suffix;
 }
 
 static int suffix_range_equal(const char* left, size_t left_len, const char* right, size_t right_len) {
@@ -2115,6 +2128,10 @@ static int function_matches_exact_name(HirFunction* fn, const char* name) {
            strcmp(fn->source_name ? fn->source_name : fn->name, name) == 0;
 }
 
+static int hir_name_is_hidden_implementation_name(const char* name) {
+    return name && (name[0] == '#' || strstr(name, ".#") != 0);
+}
+
 static HirFunction* find_struct_init_function(HirProgram* program, HirStructDecl* struct_decl, int init_index) {
     int i = 0;
     for (i = 0; i < program->functions.count; ++i) {
@@ -3343,6 +3360,34 @@ static int lower_call_args_exact(LowerContext* ctx,
     return lower_call_args_exact_from(ctx, ast_args, out_args, callee, 0);
 }
 
+static int lower_hidden_call_args(LowerContext* ctx,
+                                  const AstStructFieldInitList* ast_args,
+                                  HirExprList* out_args,
+                                  HirFunction* callee) {
+    int i = 0;
+    if (ast_args->count != callee->params.count) {
+        return 0;
+    }
+    for (i = 0; i < ast_args->count; ++i) {
+        AstStructFieldInit* ast_arg = &ast_args->items[i];
+        HirBinding* param = callee->params.items[i];
+        HirExpr* arg = 0;
+        if (ast_arg->name) {
+            return 0;
+        }
+        arg = lower_expr_expected(ctx, ast_arg->value, param->type);
+        if (!arg) {
+            return 0;
+        }
+        arg = maybe_decay_array_to_slice(ctx, arg, param->type, ast_arg->line);
+        if (!arg) {
+            return 0;
+        }
+        expr_list_push(out_args, arg);
+    }
+    return 1;
+}
+
 static HirFunction* resolve_top_level_function_call(LowerContext* ctx,
                                                     const char* name,
                                                     const AstStructFieldInitList* ast_args,
@@ -3362,6 +3407,17 @@ static HirFunction* resolve_top_level_function_call(LowerContext* ctx,
         }
         ctx->error = 0;
         if (!lower_call_args_exact(ctx, ast_args, &candidate_args, candidate)) {
+            if (hir_name_is_hidden_implementation_name(name)) {
+                ctx->error = 0;
+                memset(&candidate_args, 0, sizeof(candidate_args));
+                if (lower_hidden_call_args(ctx, ast_args, &candidate_args, candidate)) {
+                    ctx->error = saved_error;
+                    matched = candidate;
+                    matched_args = candidate_args;
+                    match_count += 1;
+                    continue;
+                }
+            }
             ctx->error = saved_error;
             continue;
         }
@@ -3416,6 +3472,20 @@ static int lower_struct_init_args_named(LowerContext* ctx,
         }
         ctx->error = 0;
         if (!lower_struct_init_args_for_function(ctx, ast_args, &candidate_args, candidate)) {
+            if (hir_name_is_hidden_implementation_name(struct_decl->name)) {
+                ctx->error = 0;
+                memset(&candidate_args, 0, sizeof(candidate_args));
+                if (lower_hidden_call_args(ctx, ast_args, &candidate_args, candidate)) {
+                    ctx->error = saved_error;
+                    matched_args = candidate_args;
+                    matched_fn = candidate;
+                    match_count += 1;
+                    if (match_count > 1) {
+                        return fail(ctx, "ambiguous init overload");
+                    }
+                    continue;
+                }
+            }
             ctx->error = saved_error;
             continue;
         }
@@ -5221,6 +5291,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                             ctx->error = saved_error;
                                             break;
                                         }
+                                        if (hir_name_is_hidden_implementation_name(init_struct->name)) {
+                                            ctx->error = 0;
+                                            memset(&candidate_args, 0, sizeof(candidate_args));
+                                            if (lower_hidden_call_args(ctx, &expr->as.call.args, &candidate_args, candidate)) {
+                                                out->as.call.callee = candidate;
+                                                ctx->error = saved_error;
+                                                break;
+                                            }
+                                        }
                                         ctx->error = saved_error;
                                     }
                                 }
@@ -5363,6 +5442,15 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                                 out->as.call.callee = candidate;
                                 ctx->error = saved_error;
                                 break;
+                            }
+                            if (hir_name_is_hidden_implementation_name(init_struct->name)) {
+                                ctx->error = 0;
+                                memset(&candidate_args, 0, sizeof(candidate_args));
+                                if (lower_hidden_call_args(ctx, &expr->as.call.args, &candidate_args, candidate)) {
+                                    out->as.call.callee = candidate;
+                                    ctx->error = saved_error;
+                                    break;
+                                }
                             }
                             ctx->error = saved_error;
                         }
