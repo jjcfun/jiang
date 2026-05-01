@@ -469,22 +469,30 @@ Package 元数据。
 - package name/version/type
 - 后续 source root 和 dependency metadata
 
-### `llvm/ffi.jiang`
-
-LLVM C API 薄绑定。
-
-预期职责：
-- 定义 LLVM opaque handle pointee types，例如 `LLVMContextRef*`、`LLVMModuleRef*`、`LLVMBuilderRef*`、`LLVMTypeRef*`、`LLVMValueRef*`、`LLVMBasicBlockRef*`
-- 声明 LLVM 21.1.x C API 的最小 extern surface
-- 记录资源释放边界：`LLVMContextCreate` / `LLVMContextDispose`、`LLVMModuleCreateWithNameInContext` / `LLVMDisposeModule`、`LLVMCreateBuilderInContext` / `LLVMDisposeBuilder`、message / `LLVMDisposeMessage`
-
-这里不做中层 builder 抽象，不隐藏 LLVM 语义，也不负责 target machine 或 object emission。第一批只覆盖生成 LLVM IR 所需的 context、module、builder、type、function、global、basic block、alloca/load/store/return/branch、verify 和 print module API。由于 stage0 的 `alias` 仍是符号别名而不是完整类型别名，LLVM `*Ref` 暂时建模为 Jiang opaque pointee struct，并在签名中显式写成 `LLVMContextRef*` 这类形式。
-
 ### `llvm/api.jiang`
 
-LLVM backend facade model。
+LLVM C API helper layer，内部直接声明 LLVM 21.1.x C API 的最小 extern surface。
 
-当前这个文件不是 LLVM C API 绑定，而是 stage1 backend 测试用的 facade instruction model。它用于固定 JIR 到 backend 的边界，方便在真实 LLVM lowering 完成前验证 `codegen.jiang` 消费了哪些 JIR 结构。
+职责：
+- 在文件内部定义 LLVM opaque pointee types，例如 `LLVMContext`、`LLVMModule`、`LLVMBuilder`、`LLVMType`、`LLVMValue`、`LLVMBasicBlock`。
+- 对外暴露 Jiang 风格 wrapper，例如 `Context`、`Module`、`Builder`、`Type`、`Value`、`Block`。
+- 提供薄 helper，例如 `function_type(...)`、`const_int(...)`、`Builder.build_ret(...)`。
+- 记录资源释放边界：`Context.dispose()`、`Module.dispose()`、`Builder.dispose()`、message / `dispose_message(...)`。
+- 不记录 mock instruction，不重新建一套 LLVM facade IR。
+
+命名规则：
+- 内部 opaque pointee type 使用 `LLVMContext` 这类名字，函数签名写 `LLVMContext*`；不使用 `LLVMContextRef*` 这种双重指针语义命名。
+- 普通 wrapper 类型不加 `LLVM` 前缀，因为模块路径已经表达了 LLVM 语境。
+- 如果 wrapper 只是官方 C API 的薄转发，不应隐藏资源所有权；创建出来的 context/module/builder 仍由调用方显式 dispose。
+
+当前由于 stage0 对“public 方法体引用本模块 private extern 依赖”的导出模型仍有限制，`api.jiang` 内部的 LLVM opaque pointee type 和 LLVM extern 声明暂时保持 `public`，但这不是目标 API 边界。测试和后续 codegen 应只使用 wrapper API，不应直接使用 `LLVMContext*`、`LLVMType*` 或 `LLVMContextCreate()` 这类 raw handle / raw extern。
+
+stage1 实现自举后需要回收这层技术债：
+
+- `LLVMContext`、`LLVMModule`、`LLVMBuilder`、`LLVMType`、`LLVMValue`、`LLVMBasicBlock` 等 raw opaque pointee type 改回 `api.jiang` 内部私有。
+- LLVM extern 声明改回 private，只允许 `api.jiang` 内部 wrapper 方法调用。
+- `codegen.jiang` 不直接引用 raw LLVM handle 和 extern，只通过 `api.Context`、`api.Module`、`api.Builder`、`api.Type`、`api.Value`、`api.Block` 工作。
+- 如果 stage0 仍需维护，应先修复“public 方法体依赖 private helper/extern 被导入后不可见”的问题，再同步收回这些 `public`。
 
 ### `llvm/codegen.jiang`
 
@@ -500,32 +508,31 @@ LLVM-specific 代码应放在 `llvm/` 内。
 
 Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重新读取 AST/HIR，也不重新做 resolve/type check。JIR 中的 `BindingId`、`LocalBindingId`、`TypeId`、`JirTempId` 是 backend 查表和生成 storage 的主要入口；最终 LLVM symbol name 只在 backend 边界按这些结构化 ID 做 mangling。
 
-当前 `codegen.jiang` 同时保留两条边界：
+当前 `codegen.jiang` 已删除旧 facade `emit_module(...)`，主要 public 边界是：
 
-- facade `emit_module(...)`：返回 `llvm/api.jiang` 的测试模型，用于继续覆盖 JIR 消费面。
-- 内部 `RealCodegen`：直接调用 `llvm/ffi.jiang`，当前只打通 context/module/builder 生命周期、最小 `main -> ret 0`、verify 和 print module。它暂不作为跨模块 public API 暴露，避免 stage0 的 public 函数体 re-export 私有 import 限制影响后续演进。
+- `emit_minimal_main_ir()`：直接构造最小 LLVM module，作为 FFI/LLVM 链路 smoke test。
+- `emit_jir_module_ir(...)`：消费 JIR 和 `TypeTable`，返回 `LLVMPrintModuleToString` 生成的 IR 字符串。
 
-当前 LLVM backend 仍是 facade 形态：它记录 `LLVMInstruction` 序列，用于固定 JIR 到 backend 的边界和覆盖率，不代表已经生成真实 LLVM basic block / SSA / alloca / branch target。现阶段支持矩阵如下。
-
-当前可以直接 emit facade 指令的 JIR：
+当前真实 LLVM lowering 已覆盖的 JIR：
 
 - declaration：function、global、type declaration metadata。
 - storage：local、temp local、assign、name/temp expr。
-- primitive expr：literal、unary、binary、call、field、index、slice、tuple、array、struct literal、variant constructor。
-- structured stmt：block、if、while、for-range、for-each、return、throw、break、continue、run-defer。
+- primitive expr：literal、unary、binary、call、tuple、pointer index。
+- structured stmt：block、if、while、for-range、return、break、continue、run-defer。
 
-当前 backend 会消费但仍只是 structured facade 的 JIR：
+当前还需要继续真实 lowering 的 JIR：
 
 - `switch_stmt`：按 case 顺序 emit branch chain；每个 case 先 emit pattern tests，成功后 emit binds 和 body。
 - pattern tests/binds：optional `some`、variant tag、tuple item、literal compare、binding payload materialization 都应降成明确的 load/compare/store。
 - `try_stmt`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
 - `coalesce_control_local`：statement 级 early-exit 形式，backend 需要生成 left test 和对应 control flow。
 - `optional_is_some` / `is_expr`：需要按 type/pattern 生成测试和绑定，不应在 backend 重新解释源码 pattern。
+- struct/record layout、field access、array/slice literal、variant layout、optional representation。
 
 当前明确不应进入 LLVM backend 的源码级结构：
 
 - JIR expression 层不应包含 `coalesce`、`catch_handler`、`select`、`block`、`if_expr`、`switch_expr`、`try_expr`。
-- 如果 backend 看到 JIR `.unsupported` 或无法处理的 expression fallback，必须增加 `unsupported_count`，测试应断言该值为 `0`。
+- 如果 backend 看到 JIR `.unsupported` 或无法处理的 expression fallback，应优先在 JIR lowering 阶段消除，或在 LLVM backend 中补齐真实 lowering；不要重新引入 mock instruction model。
 
 暂不进入第一版 backend 的内容：
 
