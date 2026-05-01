@@ -548,6 +548,16 @@ Bool real_stmt_linear_supported(jir.JirModule* input, jir.JirStmt stmt) {
     if (stmt.body is .block(block_stmt)) {
         return real_block_linear_without_return_supported(input, block_stmt.block);
     }
+    if (stmt.body is .switch_stmt(switch_stmt)) {
+        Int! index = 0;
+        while (index < switch_stmt.cases.len()) {
+            if (!real_block_linear_without_return_supported(input, switch_stmt.cases[index].body)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
     if (stmt.body is .if_stmt(if_stmt)) {
         if (!real_block_linear_without_return_supported(input, if_stmt.then_block)) {
             return false;
@@ -600,11 +610,83 @@ Int real_assignment_target_slot(jir.JirModule* input, jir.JirExprId target, Real
     return -1;
 }
 
+llvm_ffi.LLVMTypeRef* real_expr_type_ref(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, jir.JirExprId expr_id, llvm_ffi.LLVMTypeRef* fallback) {
+    if (!expr_id.valid()) {
+        return fallback;
+    }
+    jir.JirExpr expr = input.expr_at(expr_id);
+    if (expr.type_id.valid()) {
+        return real_result_type_ref(ctx, type_table, expr.type_id, context_ref);
+    }
+    return fallback;
+}
+
 llvm_ffi.LLVMTypeRef* real_slot_type_ref(context.CompilerContext* ctx, types.TypeTable* type_table, types.TypeId type_id, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMTypeRef* fallback) {
     if (type_id.valid()) {
         return real_result_type_ref(ctx, type_table, type_id, context_ref);
     }
     return fallback;
+}
+
+Bool real_switch_case_has_condition(jir.JirModule* input, jir.JirSwitchCase switch_case) {
+    if (switch_case.tests.len() == 0) {
+        return false;
+    }
+    jir.JirPatternTest test = switch_case.tests[0];
+    jir.JirPattern pattern = input.pattern_at(test.pattern);
+    if (pattern.body is .literal(literal)) {
+        return true;
+    }
+    return false;
+}
+
+llvm_ffi.LLVMValueRef* real_switch_case_condition(context.CompilerContext* ctx, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMValueRef* switch_value, llvm_ffi.LLVMTypeRef* switch_type, jir.JirSwitchCase switch_case) {
+    jir.JirPatternTest test = switch_case.tests[0];
+    jir.JirPattern pattern = input.pattern_at(test.pattern);
+    if (pattern.body is .literal(literal)) {
+        llvm_ffi.LLVMValueRef* expected = real_literal_value(ctx, literal, switch_type);
+        return llvm_ffi.LLVMBuildICmp(builder_ref, .eq, switch_value, expected, "switch.case");
+    }
+    return llvm_ffi.LLVMConstInt(llvm_ffi.LLVMInt1TypeInContext(context_ref), 1, 0);
+}
+
+llvm_ffi.LLVMBasicBlockRef* real_next_switch_block(llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMValueRef* function_value, llvm_ffi.LLVMBasicBlockRef* merge_block, Int index, Int case_count) {
+    if (index + 1 < case_count) {
+        return llvm_ffi.LLVMAppendBasicBlockInContext(context_ref, function_value, "switch.next");
+    }
+    return merge_block;
+}
+
+() real_emit_linear_switch_stmt(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, jir.JirSwitchStmt switch_stmt, RealFunctionEnv* env, llvm_ffi.LLVMTypeRef* result_type) {
+    llvm_ffi.LLVMTypeRef* switch_type = real_expr_type_ref(ctx, type_table, input, context_ref, switch_stmt.value, result_type);
+    llvm_ffi.LLVMValueRef* switch_value = real_env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, switch_stmt.value, env, switch_type);
+    llvm_ffi.LLVMBasicBlockRef* merge_block = llvm_ffi.LLVMAppendBasicBlockInContext(context_ref, function_value, "switch.end");
+    Int! index = 0;
+    while (index < switch_stmt.cases.len()) {
+        jir.JirSwitchCase switch_case = switch_stmt.cases[index];
+        llvm_ffi.LLVMBasicBlockRef* case_block = llvm_ffi.LLVMAppendBasicBlockInContext(context_ref, function_value, "switch.case");
+        llvm_ffi.LLVMBasicBlockRef* next_block = real_next_switch_block(context_ref, function_value, merge_block, index, switch_stmt.cases.len());
+
+        if (real_switch_case_has_condition(input, switch_case)) {
+            llvm_ffi.LLVMValueRef* condition = real_switch_case_condition(ctx, input, context_ref, builder_ref, switch_value, switch_type, switch_case);
+            llvm_ffi.LLVMBuildCondBr(builder_ref, condition, case_block, next_block);
+        } else {
+            llvm_ffi.LLVMBuildBr(builder_ref, case_block);
+        }
+
+        llvm_ffi.LLVMPositionBuilderAtEnd(builder_ref, case_block);
+        real_emit_linear_block_without_return(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, switch_case.body, env, result_type);
+        llvm_ffi.LLVMBuildBr(builder_ref, merge_block);
+
+        if (index + 1 < switch_stmt.cases.len()) {
+            llvm_ffi.LLVMPositionBuilderAtEnd(builder_ref, next_block);
+        }
+        index = index + 1;
+    }
+    if (switch_stmt.cases.len() == 0) {
+        llvm_ffi.LLVMBuildBr(builder_ref, merge_block);
+    }
+    llvm_ffi.LLVMPositionBuilderAtEnd(builder_ref, merge_block);
 }
 
 Bool real_emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, llvm_ffi.LLVMContextRef* context_ref, llvm_ffi.LLVMBuilderRef* builder_ref, llvm_ffi.LLVMModuleRef* module_ref, llvm_ffi.LLVMValueRef* function_value, jir.JirFunctionDecl function_decl, jir.JirStmt stmt, RealFunctionEnv* env, llvm_ffi.LLVMTypeRef* result_type) {
@@ -643,6 +725,10 @@ Bool real_emit_linear_stmt(context.CompilerContext* ctx, types.TypeTable* type_t
     }
     if (stmt.body is .block(block_stmt)) {
         real_emit_linear_block_without_return(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, block_stmt.block, env, result_type);
+        return false;
+    }
+    if (stmt.body is .switch_stmt(switch_stmt)) {
+        real_emit_linear_switch_stmt(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, switch_stmt, env, result_type);
         return false;
     }
     if (stmt.body is .if_stmt(if_stmt)) {
