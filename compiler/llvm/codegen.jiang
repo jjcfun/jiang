@@ -154,7 +154,7 @@ api.Type result_type_ref(context.CompilerContext* ctx, types.TypeTable* type_tab
     }
     if (info.kind == .errorable) {
         api.LLVMTypeRef![*] element_types = api.LLVMTypeRef$.alloc_array(2);
-        element_types[0] = api.type_ref(context_ref.int1_type());
+        element_types[0] = api.type_ref(context_ref.int64_type());
         element_types[1] = api.type_ref(context_ref.int64_type());
         return context_ref.struct_type_refs(element_types, 2);
     }
@@ -228,6 +228,40 @@ UInt64 max_u64(UInt64 left, UInt64 right) {
     return right;
 }
 
+UInt64 align_to(UInt64 size, UInt64 align) {
+    if (align <= 1) {
+        return size;
+    }
+    UInt64 remainder = size % align;
+    if (remainder == 0) {
+        return size;
+    }
+    return size + align - remainder;
+}
+
+struct LayoutInfo {
+    UInt64 size;
+    UInt64 align;
+
+    init(UInt64 size, UInt64 align) {
+        self.size = size;
+        self.align = align;
+    }
+}
+
+LayoutInfo scalar_layout(UInt64 size) {
+    return LayoutInfo(size, size);
+}
+
+LayoutInfo add_field_layout(LayoutInfo aggregate, LayoutInfo field) {
+    UInt64 offset = align_to(aggregate.size, field.align);
+    return LayoutInfo(offset + field.size, max_u64(aggregate.align, field.align));
+}
+
+LayoutInfo finish_layout(LayoutInfo aggregate) {
+    return LayoutInfo(align_to(aggregate.size, aggregate.align), aggregate.align);
+}
+
 UInt64 payload_byte_count(UInt64 size) {
     if (size == 0) {
         return 1;
@@ -299,7 +333,7 @@ api.Type layout_type_ref(context.CompilerContext* ctx, types.TypeTable* type_tab
     }
     if (info.kind == .errorable) {
         api.LLVMTypeRef![*] element_types = api.LLVMTypeRef$.alloc_array(2);
-        element_types[0] = api.type_ref(context_ref.int1_type());
+        element_types[0] = api.type_ref(context_ref.int64_type());
         element_types[1] = api.type_ref(payload_buffer_type(context_ref, errorable_payload_static_size(ctx, type_table, input, type_id)));
         return context_ref.struct_type_refs(element_types, 2);
     }
@@ -354,117 +388,176 @@ api.Type ast_type_ref(context.CompilerContext* ctx, types.TypeTable* type_table,
     return context_ref.int64_type();
 }
 
-UInt64 named_type_static_size(context.CompilerContext* ctx, jir.JirModule* input, ast.NamedType named) {
+LayoutInfo named_type_layout_info(context.CompilerContext* ctx, jir.JirModule* input, ast.NamedType named) {
     if (named.path.segment_len() == 0) {
-        return 8;
+        return scalar_layout(8);
     }
     ast.Name name = named.path.segments[0];
     if (ctx.symbol_equal(name.symbol, "Bool")) {
-        return 1;
+        return scalar_layout(1);
     }
     if (ctx.symbol_equal(name.symbol, "UInt8")) {
-        return 1;
+        return scalar_layout(1);
     }
     if (ctx.symbol_equal(name.symbol, "Int")) {
-        return 8;
+        return scalar_layout(8);
     }
     jir.JirTypeDecl? decl = type_decl_for_symbol(input, name);
     if (decl is some type_decl) {
         if (type_decl.kind == .struct_decl) {
-            UInt64! size = 0;
-            Int! index = 0;
-            while (index < type_decl.fields.len()) {
-                size = size + ast_type_static_size(ctx, input, type_decl.fields[index].type_ref);
-                index = index + 1;
-            }
-            return size;
+            return struct_decl_layout_info(ctx, input, type_decl);
+        }
+        if (type_decl.kind == .union_decl) {
+            return finish_layout(add_field_layout(scalar_layout(8), union_decl_payload_layout_info(ctx, input, type_decl)));
+        }
+        if (type_decl.kind == .enum_decl) {
+            return scalar_layout(8);
         }
     }
-    return 8;
+    return scalar_layout(8);
+}
+
+UInt64 ast_const_array_count(context.CompilerContext* ctx, ast.AstExpr* expr) {
+    if (expr is .literal(literal)) {
+        if (literal is .int_lit(span)) {
+            return parse_uint_literal(ctx, span);
+        }
+    }
+    return 1;
+}
+
+LayoutInfo ast_type_layout_info(context.CompilerContext* ctx, jir.JirModule* input, ast.AstType type_ref) {
+    if (type_ref is .unit(span)) {
+        return LayoutInfo(0, 1);
+    }
+    if (type_ref is .named(named)) {
+        return named_type_layout_info(ctx, input, named);
+    }
+    if (type_ref is .tuple(tuple)) {
+        LayoutInfo! layout = LayoutInfo(0, 1);
+        Int! index = 0;
+        while (index < tuple.items.len()) {
+            layout = add_field_layout(layout, ast_type_layout_info(ctx, input, tuple.items[index]));
+            index = index + 1;
+        }
+        return finish_layout(layout);
+    }
+    if (type_ref is .layer(layer)) {
+        if (layer.flags.optional) {
+            LayoutInfo! layout = scalar_layout(1);
+            layout = add_field_layout(layout, ast_type_layout_info(ctx, input, layer.element));
+            return finish_layout(layout);
+        }
+        return ast_type_layout_info(ctx, input, layer.element);
+    }
+    if (type_ref is .pointer(pointer)) {
+        return scalar_layout(8);
+    }
+    if (type_ref is .slice(slice)) {
+        return LayoutInfo(16, 8);
+    }
+    if (type_ref is .array(array)) {
+        LayoutInfo element = ast_type_layout_info(ctx, input, array.element);
+        return LayoutInfo(align_to(element.size, element.align) * ast_const_array_count(ctx, array.count), element.align);
+    }
+    if (type_ref is .errorable(errorable)) {
+        LayoutInfo value = ast_type_layout_info(ctx, input, errorable.value);
+        LayoutInfo error = ast_type_layout_info(ctx, input, errorable.error);
+        LayoutInfo payload = LayoutInfo(max_u64(value.size, error.size), max_u64(value.align, error.align));
+        return finish_layout(add_field_layout(scalar_layout(8), payload));
+    }
+    return scalar_layout(8);
+}
+
+LayoutInfo struct_decl_layout_info(context.CompilerContext* ctx, jir.JirModule* input, jir.JirTypeDecl decl) {
+    LayoutInfo! layout = LayoutInfo(0, 1);
+    Int! index = 0;
+    while (index < decl.fields.len()) {
+        layout = add_field_layout(layout, ast_type_layout_info(ctx, input, decl.fields[index].type_ref));
+        index = index + 1;
+    }
+    return finish_layout(layout);
 }
 
 UInt64 ast_type_static_size(context.CompilerContext* ctx, jir.JirModule* input, ast.AstType type_ref) {
-    if (type_ref is .named(named)) {
-        return named_type_static_size(ctx, input, named);
+    return ast_type_layout_info(ctx, input, type_ref).size;
+}
+
+LayoutInfo union_decl_payload_layout_info(context.CompilerContext* ctx, jir.JirModule* input, jir.JirTypeDecl decl) {
+    LayoutInfo! layout = LayoutInfo(1, 1);
+    Int! index = 0;
+    while (index < decl.variants.len()) {
+        LayoutInfo variant = ast_type_layout_info(ctx, input, decl.variants[index].type_ref);
+        layout = LayoutInfo(max_u64(layout.size, variant.size), max_u64(layout.align, variant.align));
+        index = index + 1;
     }
-    if (type_ref is .layer(layer)) {
-        return ast_type_static_size(ctx, input, layer.element);
-    }
-    if (type_ref is .pointer(pointer)) {
-        return 8;
-    }
-    if (type_ref is .slice(slice)) {
-        return 16;
-    }
-    return 8;
+    return layout;
 }
 
 UInt64 union_decl_payload_static_size(context.CompilerContext* ctx, jir.JirModule* input, jir.JirTypeDecl decl) {
-    UInt64! size = 1;
-    Int! index = 0;
-    while (index < decl.variants.len()) {
-        size = max_u64(size, ast_type_static_size(ctx, input, decl.variants[index].type_ref));
-        index = index + 1;
-    }
-    return size;
+    return union_decl_payload_layout_info(ctx, input, decl).size;
 }
 
-UInt64 type_static_size(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, types.TypeId type_id) {
+LayoutInfo type_layout_info(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, types.TypeId type_id) {
     if (!type_id.valid()) {
-        return 8;
+        return scalar_layout(8);
     }
     types.TypeInfo! info = type_table.type_at(type_id);
-    if (info.kind == .unit) { return 0; }
+    if (info.kind == .unit) { return LayoutInfo(0, 1); }
     if (info.kind == .builtin) {
-        if (ctx.symbol_equal(info.symbol, "Bool")) { return 1; }
-        if (ctx.symbol_equal(info.symbol, "UInt8")) { return 1; }
-        return 8;
+        if (ctx.symbol_equal(info.symbol, "Bool")) { return scalar_layout(1); }
+        if (ctx.symbol_equal(info.symbol, "UInt8")) { return scalar_layout(1); }
+        return scalar_layout(8);
     }
-    if (info.kind == .pointer) { return 8; }
-    if (info.kind == .slice) { return 16; }
+    if (info.kind == .pointer) { return scalar_layout(8); }
+    if (info.kind == .slice) { return LayoutInfo(16, 8); }
     if (info.kind == .array) {
-        return type_static_size(ctx, type_table, input, info.element) * UInt64(info.child_count);
+        LayoutInfo element = type_layout_info(ctx, type_table, input, info.element);
+        return LayoutInfo(align_to(element.size, element.align) * UInt64(info.child_count), element.align);
     }
     if (info.kind == .tuple || info.kind == .function) {
-        UInt64! size = 0;
+        LayoutInfo! layout = LayoutInfo(0, 1);
         Int! index = 0;
         while (index < info.child_count) {
-            size = size + type_static_size(ctx, type_table, input, type_table.child_at(info.child_start + index));
+            layout = add_field_layout(layout, type_layout_info(ctx, type_table, input, type_table.child_at(info.child_start + index)));
             index = index + 1;
         }
-        return size;
+        return finish_layout(layout);
     }
     if (info.kind == .layer && info.element.valid()) {
         if (info.optional) {
-            return 8 + type_static_size(ctx, type_table, input, info.element);
+            LayoutInfo! layout = scalar_layout(1);
+            layout = add_field_layout(layout, type_layout_info(ctx, type_table, input, info.element));
+            return finish_layout(layout);
         }
-        return type_static_size(ctx, type_table, input, info.element);
+        return type_layout_info(ctx, type_table, input, info.element);
     }
     if (info.kind == .errorable) {
-        return 8 + max_u64(type_static_size(ctx, type_table, input, info.element), type_static_size(ctx, type_table, input, info.other));
+        LayoutInfo value = type_layout_info(ctx, type_table, input, info.element);
+        LayoutInfo error = type_layout_info(ctx, type_table, input, info.other);
+        LayoutInfo payload = LayoutInfo(max_u64(value.size, error.size), max_u64(value.align, error.align));
+        return finish_layout(add_field_layout(scalar_layout(8), payload));
     }
     if (info.kind == .nominal) {
         if (info.nominal_kind == .union_decl) {
             jir.JirTypeDecl? decl = type_decl_for_binding(input, info.binding_id);
             if (decl is some type_decl) {
-                return 8 + union_decl_payload_static_size(ctx, input, type_decl);
+                return finish_layout(add_field_layout(scalar_layout(8), union_decl_payload_layout_info(ctx, input, type_decl)));
             }
         }
         if (info.nominal_kind == .struct_decl) {
             jir.JirTypeDecl? decl = type_decl_for_binding(input, info.binding_id);
             if (decl is some type_decl) {
-                UInt64! size = 0;
-                Int! index = 0;
-                while (index < type_decl.fields.len()) {
-                    size = size + ast_type_static_size(ctx, input, type_decl.fields[index].type_ref);
-                    index = index + 1;
-                }
-                return size;
+                return struct_decl_layout_info(ctx, input, type_decl);
             }
         }
-        return 8;
+        return scalar_layout(8);
     }
-    return 8;
+    return scalar_layout(8);
+}
+
+UInt64 type_static_size(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, types.TypeId type_id) {
+    return type_layout_info(ctx, type_table, input, type_id).size;
 }
 
 UInt64 errorable_payload_static_size(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, types.TypeId type_id) {
@@ -476,7 +569,9 @@ UInt64 errorable_payload_static_size(context.CompilerContext* ctx, types.TypeTab
         info = type_table.type_at(info.element);
     }
     if (info.kind == .errorable) {
-        return max_u64(type_static_size(ctx, type_table, input, info.element), type_static_size(ctx, type_table, input, info.other));
+        LayoutInfo value = type_layout_info(ctx, type_table, input, info.element);
+        LayoutInfo error = type_layout_info(ctx, type_table, input, info.other);
+        return max_u64(value.size, error.size);
     }
     return 8;
 }
@@ -524,10 +619,6 @@ Bool type_id_is_union(types.TypeTable* type_table, types.TypeId type_id) {
 
 api.Value union_tag(api.Builder* builder_ref, api.Value value) {
     return builder_ref.build_extract_value(value, 0, "union.tag");
-}
-
-api.Value union_payload(api.Builder* builder_ref, api.Value value) {
-    return builder_ref.build_extract_value(value, 1, "union.payload");
 }
 
 api.Value aggregate_field_ptr(api.Context* context_ref, api.Builder* builder_ref, api.Type aggregate_type, api.Value aggregate_ptr, UInt64 field_index, UInt8* name) {
@@ -733,10 +824,6 @@ api.Value optional_payload_value(api.Builder* builder_ref, api.Value optional_va
     return builder_ref.build_extract_value(optional_value, 1, "optional.payload");
 }
 
-api.Value errorable_build_value(api.Context* context_ref, api.Builder* builder_ref, api.Type errorable_type, api.Value ok, api.Value payload) {
-    return aggregate_with_payload(context_ref, builder_ref, errorable_type, ok, context_ref.int64_type(), payload, "errorable.value");
-}
-
 types.TypeId errorable_value_type_id(types.TypeTable* type_table, types.TypeId type_id) {
     if (!type_id.valid()) {
         return types.TypeId();
@@ -767,16 +854,17 @@ types.TypeId errorable_error_type_id(types.TypeTable* type_table, types.TypeId t
 
 api.Value errorable_success_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, types.TypeId errorable_type_id, api.Type errorable_type, api.Value payload) {
     api.Type payload_type = layout_type_ref(ctx, type_table, input, context_ref, errorable_value_type_id(type_table, errorable_type_id));
-    return aggregate_with_payload(context_ref, builder_ref, errorable_type, api.const_int(context_ref.int1_type(), 1), payload_type, payload, "errorable.ok.value");
+    return aggregate_with_payload(context_ref, builder_ref, errorable_type, api.const_int(context_ref.int64_type(), 1), payload_type, payload, "errorable.ok.value");
 }
 
 api.Value errorable_error_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, types.TypeId errorable_type_id, api.Type errorable_type, api.Value error) {
     api.Type payload_type = layout_type_ref(ctx, type_table, input, context_ref, errorable_error_type_id(type_table, errorable_type_id));
-    return aggregate_with_payload(context_ref, builder_ref, errorable_type, api.const_int(context_ref.int1_type(), 0), payload_type, error, "errorable.err.value");
+    return aggregate_with_payload(context_ref, builder_ref, errorable_type, api.const_int(context_ref.int64_type(), 0), payload_type, error, "errorable.err.value");
 }
 
-api.Value errorable_ok_value(api.Builder* builder_ref, api.Value errorable_value) {
-    return builder_ref.build_extract_value(errorable_value, 0, "errorable.ok");
+api.Value errorable_ok_value(api.Context* context_ref, api.Builder* builder_ref, api.Value errorable_value) {
+    api.Value ok = builder_ref.build_extract_value(errorable_value, 0, "errorable.ok");
+    return builder_ref.build_icmp(.ne, ok, api.const_int(context_ref.int64_type(), 0), "errorable.ok.bool");
 }
 
 api.Value errorable_payload_value(api.Context* context_ref, api.Builder* builder_ref, api.Type errorable_type, api.Value errorable_value, api.Type payload_type) {
@@ -2495,7 +2583,7 @@ Bool emit_errorable_try_assignment(context.CompilerContext* ctx, types.TypeTable
     api.Block success_block = api.append_block(module_ref, context_ref, function_value, "try.success");
     api.Block catch_block = api.append_block(module_ref, context_ref, function_value, "try.catch");
     api.Block merge_block = api.append_block(module_ref, context_ref, function_value, "try.end");
-    builder_ref.build_cond_br(errorable_ok_value(builder_ref, errorable_result), success_block, catch_block);
+    builder_ref.build_cond_br(errorable_ok_value(context_ref, builder_ref, errorable_result), success_block, catch_block);
 
     builder_ref.position_at_end(success_block);
     emit_errorable_success_assignment(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, assign_stmt, env, errorable_type, errorable_result);

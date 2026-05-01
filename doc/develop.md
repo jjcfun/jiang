@@ -517,17 +517,17 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 
 - declaration：function、global、type declaration metadata。
 - storage：local、temp local、assign、name/temp expr。
-- primitive expr：literal、unary、binary、call、tuple、fixed array、pointer index、fixed array index、`self`。
-- pattern expr：`optional_is_some`、普通 `is_expr` 的 primitive test/bind 列表，包括 literal test、optional some test、variant placeholder test 和 binding materialization。
-- structured stmt：block、if、switch branch chain、while、for-range、fixed array for-each、return、throw/unreachable、break、continue、run-defer。
+- primitive expr：literal、unary、binary、call、tuple、fixed array、pointer index、fixed array index、field/index/slice、struct literal、variant constructor、`self`。
+- compound ABI：struct/record、tuple、fixed array、optional、errorable、union variant payload 的基础 layout；union/errorable payload 使用 byte buffer，并由 resolved type layout 决定 payload 大小。
+- pattern expr：`optional_is_some`、普通 `is_expr` 的 primitive test/bind 列表，包括 literal test、optional some test、variant tag test、tuple item bind、variant payload bind 和 binding materialization。
+- structured stmt：block、if、switch branch chain、try success/error branch、while、for-range、fixed array/slice for-each、return、throw/unreachable、break、continue、run-defer。
 - early exit：`coalesce_control_local` 已能生成 optional test 和 return/break/continue control flow。
 
 当前还需要继续真实 lowering 的 JIR：
 
-- `try_stmt`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
-- struct/record layout、field access、slice literal、variant layout、optional payload representation。
 - extend/method emission：需要先确定 receiver ABI、method symbol mangling 和 trait method边界，再递归进入 extend item。
-- pattern tests/binds 的深层 payload：tuple item bind、variant tag/payload bind 仍需要依赖 layout 模型，当前只完成 primitive test/bind 的最小 LLVM 表达。
+- 更完整的 ABI：跨 module nominal type layout、泛型实例 layout、trait object/receiver ABI、按目标平台 data layout 校准 size/align。
+- 可执行输出闭环：当前 backend 主要返回 LLVM IR 字符串；object/executable emission、linker 调度和 runtime 链接仍是后续工作。
 
 当前明确不应进入 LLVM backend 的源码级结构：
 
