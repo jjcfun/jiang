@@ -259,6 +259,13 @@ UInt64 max_u64(UInt64 left, UInt64 right) {
     return right;
 }
 
+UInt64 min_u64(UInt64 left, UInt64 right) {
+    if (left < right) {
+        return left;
+    }
+    return right;
+}
+
 UInt64 align_to(UInt64 size, UInt64 align) {
     if (align <= 1) {
         return size;
@@ -826,16 +833,29 @@ api.Value aggregate_with_payload(api.Context* context_ref, api.Builder* builder_
     return builder_ref.build_load(aggregate_type, aggregate_slot, "aggregate.load");
 }
 
+api.LLVMValueRef const_i8_value_ref(api.Context* context_ref, UInt64 value) {
+    return api.value_ref(api.const_int(context_ref.int8_type(), value % UInt64(256)));
+}
+
 api.Value const_payload_buffer(api.Context* context_ref, UInt64 size, UInt64 value) {
     Int count = Int(payload_byte_count(size));
-    if (count <= 1) {
-        return api.const_i8_array1(context_ref, value);
+    api.LLVMValueRef![*] values = api.LLVMValueRef$.alloc_array(count);
+    UInt64! current = value;
+    Int! index = 0;
+    while (index < count) {
+        values[index] = const_i8_value_ref(context_ref, current);
+        current = current / UInt64(256);
+        index = index + 1;
     }
-    return api.const_i8_array8(context_ref, value);
+    return api.const_array(context_ref.int8_type(), values, count);
 }
 
 api.Value const_tagged_payload_value(api.Context* context_ref, api.Type aggregate_type, UInt64 tag, UInt64 payload_size, UInt64 payload_value) {
     return api.const_struct2(context_ref, api.const_int(context_ref.int64_type(), tag), const_payload_buffer(context_ref, payload_size, payload_value));
+}
+
+api.Value const_tagged_payload_buffer_value(api.Context* context_ref, api.Type aggregate_type, UInt64 tag, api.Value payload) {
+    return api.const_struct2(context_ref, api.const_int(context_ref.int64_type(), tag), payload);
 }
 
 UInt64 parse_uint_literal(context.CompilerContext* ctx, token.Span span) {
@@ -3669,6 +3689,127 @@ api.Value const_scalar_expr_value(context.CompilerContext* ctx, jir.JirModule* i
     return default_value(type_ref);
 }
 
+() fill_const_payload_zeros(api.Context* context_ref, api.LLVMValueRef![*] bytes, Int count) {
+    Int! index = 0;
+    while (index < count) {
+        bytes[index] = const_i8_value_ref(context_ref, 0);
+        index = index + 1;
+    }
+}
+
+() write_const_uint_payload_bytes(api.Context* context_ref, api.LLVMValueRef![*] bytes, Int count, Int offset, UInt64 size, UInt64 value) {
+    if (offset >= count) {
+        return;
+    }
+    UInt64! current = value;
+    Int limit = offset + Int(min_u64(size, UInt64(count - offset)));
+    Int! index = offset;
+    while (index < limit) {
+        bytes[index] = const_i8_value_ref(context_ref, current);
+        current = current / UInt64(256);
+        index = index + 1;
+    }
+}
+
+UInt64 struct_field_offset(context.CompilerContext* ctx, jir.JirModule* input, jir.JirTypeDecl decl, Int field_index) {
+    LayoutInfo! layout = LayoutInfo(0, 1);
+    Int! index = 0;
+    while (index < decl.fields.len()) {
+        LayoutInfo field_layout = ast_type_layout_info(ctx, input, decl.fields[index].type_ref);
+        UInt64 offset = align_to(layout.size, field_layout.align);
+        if (index == field_index) {
+            return offset;
+        }
+        layout = LayoutInfo(offset + field_layout.size, max_u64(layout.align, field_layout.align));
+        index = index + 1;
+    }
+    return 0;
+}
+
+() write_const_expr_payload_bytes(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.LLVMValueRef![*] bytes, Int count, Int offset, jir.JirExprId expr_id, types.TypeId type_id) {
+    if (offset >= count || !expr_id.valid()) {
+        return;
+    }
+    jir.JirExpr expr = input.expr_at(expr_id);
+    types.TypeId! value_type_id = type_id;
+    if (!value_type_id.valid()) {
+        value_type_id = expr.type_id;
+    }
+    if (!value_type_id.valid()) {
+        write_const_uint_payload_bytes(context_ref, bytes, count, offset, 8, const_int_expr(ctx, input, expr_id));
+        return;
+    }
+    types.TypeInfo! type_info = type_table.type_at(value_type_id);
+    if (type_info.kind == .layer && !type_info.optional && type_info.element.valid()) {
+        value_type_id = type_info.element;
+        type_info = type_table.type_at(value_type_id);
+    }
+    if (type_info.kind == .array) {
+        if (expr.body is .array(array)) {
+            LayoutInfo element_layout = type_layout_info(ctx, type_table, input, type_info.element);
+            UInt64 stride = align_to(element_layout.size, element_layout.align);
+            Int! index = 0;
+            while (index < array.items.len() && index < type_info.child_count) {
+                write_const_expr_payload_bytes(ctx, type_table, input, context_ref, bytes, count, offset + Int(UInt64(index) * stride), array.items[index], type_info.element);
+                index = index + 1;
+            }
+            return;
+        }
+    }
+    if (type_info.kind == .tuple) {
+        if (expr.body is .tuple(tuple)) {
+            UInt64! cursor = 0;
+            Int! index = 0;
+            while (index < tuple.items.len() && index < type_info.child_count) {
+                types.TypeId item_type_id = type_table.child_at(type_info.child_start + index);
+                LayoutInfo item_layout = type_layout_info(ctx, type_table, input, item_type_id);
+                UInt64 item_offset = align_to(cursor, item_layout.align);
+                write_const_expr_payload_bytes(ctx, type_table, input, context_ref, bytes, count, offset + Int(item_offset), tuple.items[index], item_type_id);
+                cursor = item_offset + item_layout.size;
+                index = index + 1;
+            }
+            return;
+        }
+    }
+    if (type_info.kind == .nominal && type_info.nominal_kind == .struct_decl) {
+        if (expr.body is .struct_lit(struct_lit)) {
+            jir.JirTypeDecl? maybe_decl = type_decl_for_expr_type(type_table, input, value_type_id);
+            if (maybe_decl is some decl) {
+                Int! index = 0;
+                while (index < decl.fields.len()) {
+                    jir.JirFieldDecl field = decl.fields[index];
+                    if (field.default_value.valid()) {
+                        write_const_expr_payload_bytes(ctx, type_table, input, context_ref, bytes, count, offset + Int(struct_field_offset(ctx, input, decl, index)), field.default_value, types.TypeId());
+                    }
+                    index = index + 1;
+                }
+
+                index = 0;
+                while (index < struct_lit.fields.len()) {
+                    jir.JirStructFieldInit field = struct_lit.fields[index];
+                    if (field.name is some name) {
+                        Int field_index = field_index_for_name(decl, name);
+                        if (field_index >= 0) {
+                            write_const_expr_payload_bytes(ctx, type_table, input, context_ref, bytes, count, offset + Int(struct_field_offset(ctx, input, decl, field_index)), field.value, types.TypeId());
+                        }
+                    }
+                    index = index + 1;
+                }
+            }
+            return;
+        }
+    }
+    write_const_uint_payload_bytes(context_ref, bytes, count, offset, type_static_size(ctx, type_table, input, value_type_id), const_int_expr(ctx, input, expr_id));
+}
+
+api.Value const_expr_payload_buffer(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, jir.JirExprId expr_id, types.TypeId payload_type_id, UInt64 payload_size) {
+    Int count = Int(payload_byte_count(payload_size));
+    api.LLVMValueRef![*] bytes = api.LLVMValueRef$.alloc_array(count);
+    fill_const_payload_zeros(context_ref, bytes, count);
+    write_const_expr_payload_bytes(ctx, type_table, input, context_ref, bytes, count, 0, expr_id, payload_type_id);
+    return api.const_array(context_ref.int8_type(), bytes, count);
+}
+
 api.Value const_optional_expr_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, jir.JirExprId expr_id, types.TypeId type_id, api.Type type_ref) {
     types.TypeId payload_type_id = optional_payload_type_id(type_table, type_id);
     api.Type payload_type = result_type_ref(ctx, type_table, payload_type_id, context_ref);
@@ -3692,13 +3833,15 @@ api.Value const_optional_expr_value(context.CompilerContext* ctx, types.TypeTabl
 api.Value const_errorable_expr_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, jir.JirExprId expr_id, types.TypeId type_id, api.Type type_ref) {
     types.TypeInfo info = type_table.type_at(type_id);
     UInt64! payload_size = errorable_payload_static_size(ctx, type_table, input, type_id);
-    UInt64 payload_value = const_int_expr(ctx, input, expr_id);
+    types.TypeId! payload_type_id = type_id;
     if (info.kind == .errorable) {
         if (info.element.valid()) {
+            payload_type_id = info.element;
             payload_size = max_u64(payload_size, type_static_size(ctx, type_table, input, info.element));
         }
     }
-    return const_tagged_payload_value(context_ref, type_ref, 1, payload_size, payload_value);
+    api.Value payload = const_expr_payload_buffer(ctx, type_table, input, context_ref, expr_id, payload_type_id, payload_size);
+    return const_tagged_payload_buffer_value(context_ref, type_ref, 1, payload);
 }
 
 api.Value const_variant_expr_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, jir.JirVariantExpr variant, api.Type type_ref) {
@@ -3707,11 +3850,11 @@ api.Value const_variant_expr_value(context.CompilerContext* ctx, types.TypeTable
         Int index = variant_index_for_path(union_decl, variant.path);
         if (index >= 0) {
             UInt64 payload_size = union_decl_payload_static_size(ctx, input, union_decl);
-            UInt64! payload_value = 0;
+            api.Value! payload = const_payload_buffer(context_ref, payload_size, 0);
             if (variant.payload.len() > 0) {
-                payload_value = const_int_expr(ctx, input, variant.payload[0]);
+                payload = const_expr_payload_buffer(ctx, type_table, input, context_ref, variant.payload[0], types.TypeId(), payload_size);
             }
-            return const_tagged_payload_value(context_ref, type_ref, UInt64(index + 1), payload_size, payload_value);
+            return const_tagged_payload_buffer_value(context_ref, type_ref, UInt64(index + 1), payload);
         }
     }
     return default_value(type_ref);
