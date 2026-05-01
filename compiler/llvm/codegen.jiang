@@ -1614,6 +1614,39 @@ Bool function_arg_types_match(types.TypeTable* type_table, jir.JirModule* input,
     return true;
 }
 
+Bool receiver_arg_type_matches(types.TypeTable* type_table, types.TypeId expected, types.TypeId actual) {
+    if (type_table.compatible(expected, actual)) {
+        return true;
+    }
+    if (!expected.valid() || !actual.valid()) {
+        return true;
+    }
+    types.TypeInfo expected_info = type_table.type_at(expected);
+    if (expected_info.kind == .pointer && type_table.compatible(expected_info.element, actual)) {
+        return true;
+    }
+    return false;
+}
+
+Bool method_arg_types_match(types.TypeTable* type_table, jir.JirModule* input, jir.JirFunctionDecl function_decl, jir.JirFieldExpr field, jir.JirCallExpr call) {
+    if (function_decl.params.len() != call.args.len() + 1) {
+        return false;
+    }
+    jir.JirExpr receiver = input.expr_at(field.base);
+    if (!receiver_arg_type_matches(type_table, function_decl.params[0].type_id, receiver.type_id)) {
+        return false;
+    }
+    Int! index = 0;
+    while (index < call.args.len()) {
+        jir.JirExpr arg = input.expr_at(call.args[index]);
+        if (!type_table.compatible(function_decl.params[index + 1].type_id, arg.type_id)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
 jir.JirFunctionDecl? function_decl_for_call(types.TypeTable* type_table, jir.JirModule* input, jir.JirCallExpr call) {
     if (!call.callee.valid()) {
         return null;
@@ -1627,6 +1660,28 @@ jir.JirFunctionDecl? function_decl_for_call(types.TypeTable* type_table, jir.Jir
             if (decl.body is .function_decl(function_decl)) {
                 if (function_decl.name.symbol.id == name.name.symbol.id) {
                     if (function_arg_types_match(type_table, input, function_decl, call)) {
+                        return function_decl;
+                    }
+                    if (fallback == null) {
+                        fallback = function_decl;
+                    }
+                }
+            }
+            index = index + 1;
+        }
+        return fallback;
+    }
+    if (expr.body is .field(field)) {
+        if (!field.base.valid()) {
+            return null;
+        }
+        jir.JirFunctionDecl?! fallback = null;
+        Int! index = 0;
+        while (index < input.decl_count()) {
+            jir.JirDecl decl = input.decl_at(jir.JirDeclId(index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (function_decl.name.symbol.id == field.name.symbol.id && function_decl.params.len() > 0) {
+                    if (method_arg_types_match(type_table, input, function_decl, field, call)) {
                         return function_decl;
                     }
                     if (fallback == null) {
@@ -1853,33 +1908,69 @@ api.Value env_expr_value_expected(context.CompilerContext* ctx, types.TypeTable*
     return optional_some_value(context_ref, builder_ref, expected_type, payload);
 }
 
+Bool call_is_method(jir.JirModule* input, jir.JirCallExpr call, jir.JirFunctionDecl callee_decl) {
+    if (!call.callee.valid()) {
+        return false;
+    }
+    jir.JirExpr callee = input.expr_at(call.callee);
+    if (callee.body is .field(field)) {
+        return callee_decl.params.len() == call.args.len() + 1 && field.base.valid();
+    }
+    return false;
+}
+
+api.Value env_method_receiver_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirFieldExpr field, FunctionEnv* env, api.Type receiver_type) {
+    jir.JirExpr receiver = input.expr_at(field.base);
+    types.TypeInfo receiver_info = unlayer_type_info(type_table, receiver.type_id);
+    if (receiver_info.kind == .pointer) {
+        return env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, field.base, env, receiver_type);
+    }
+    return env_address_of_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, field.base, env, receiver_type);
+}
+
 api.Value env_call_value(context.CompilerContext* ctx, types.TypeTable* type_table, jir.JirModule* input, api.Context* context_ref, api.Builder* builder_ref, api.Module* module_ref, api.Value function_value, jir.JirFunctionDecl function_decl, jir.JirCallExpr call, FunctionEnv* env, api.Type result_type) {
     UInt8* callee_name = callee_name(ctx, input, call.callee);
     jir.JirFunctionDecl? target_decl = function_decl_for_call(type_table, input, call);
     if (target_decl is some callee_decl) {
         UInt8* target_name = function_symbol_name(ctx, type_table, callee_decl);
         api.Type target_result_type = layout_type_ref(ctx, type_table, input, context_ref, callee_decl.result_type);
-        if (call.args.len() == 0) {
+        Bool method_call = call_is_method(input, call, callee_decl);
+        if (call.args.len() == 0 && !method_call) {
             api.Type function_type = function_type_ref(ctx, type_table, input, context_ref, callee_decl, target_result_type);
             api.Value callee_value = get_or_add_function(module_ref, target_name, function_type);
             return builder_ref.build_call(function_type, callee_value, "");
         }
-        api.LLVMValueRef![*] args = api.LLVMValueRef$.alloc_array(call.args.len());
-        api.LLVMTypeRef![*] arg_types = api.LLVMTypeRef$.alloc_array(call.args.len());
+        Int! arg_count = call.args.len();
+        if (method_call) {
+            arg_count = arg_count + 1;
+        }
+        api.LLVMValueRef![*] args = api.LLVMValueRef$.alloc_array(arg_count);
+        api.LLVMTypeRef![*] arg_types = api.LLVMTypeRef$.alloc_array(arg_count);
+        Int! out_index = 0;
+        if (method_call) {
+            jir.JirExpr callee = input.expr_at(call.callee);
+            if (callee.body is .field(field)) {
+                api.Type receiver_type = decl_call_arg_type(ctx, type_table, input, context_ref, callee_decl, 0, context_ref.pointer_type());
+                args[0] = api.value_ref(env_method_receiver_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, field, env, receiver_type));
+                arg_types[0] = api.type_ref(receiver_type);
+                out_index = 1;
+            }
+        }
         Int! index = 0;
         while (index < call.args.len()) {
+            Int param_index_value = index + out_index;
             types.TypeId! arg_type_id = types.TypeId();
-            if (index < callee_decl.params.len()) {
-                arg_type_id = callee_decl.params[index].type_id;
+            if (param_index_value < callee_decl.params.len()) {
+                arg_type_id = callee_decl.params[param_index_value].type_id;
             }
-            api.Type arg_type = decl_call_arg_type(ctx, type_table, input, context_ref, callee_decl, index, result_type);
-            args[index] = api.value_ref(env_expr_value_expected(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, call.args[index], env, arg_type_id, arg_type));
-            arg_types[index] = api.type_ref(arg_type);
+            api.Type arg_type = decl_call_arg_type(ctx, type_table, input, context_ref, callee_decl, param_index_value, result_type);
+            args[param_index_value] = api.value_ref(env_expr_value_expected(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, call.args[index], env, arg_type_id, arg_type));
+            arg_types[param_index_value] = api.type_ref(arg_type);
             index = index + 1;
         }
-        api.Type function_type = api.function_type_refs(target_result_type, arg_types, call.args.len());
+        api.Type function_type = api.function_type_refs(target_result_type, arg_types, arg_count);
         api.Value callee_value = get_or_add_function(module_ref, target_name, function_type);
-        return builder_ref.build_call_refs(function_type, callee_value, args, call.args.len(), "");
+        return builder_ref.build_call_refs(function_type, callee_value, args, arg_count, "");
     }
     jir.JirExpr callee_expr = input.expr_at(call.callee);
     types.TypeInfo! callee_type = types.TypeInfo(.invalid, callee_expr.span);
@@ -1975,6 +2066,21 @@ jir.JirTypeDecl? type_decl_for_expr_type(types.TypeTable* type_table, jir.JirMod
         return null;
     }
     return type_decl_for_binding(input, info.binding_id);
+}
+
+jir.JirTypeDecl? type_decl_for_value_or_pointer_expr_type(types.TypeTable* type_table, jir.JirModule* input, types.TypeId type_id) {
+    jir.JirTypeDecl? direct = type_decl_for_expr_type(type_table, input, type_id);
+    if (direct != null) {
+        return direct;
+    }
+    if (!type_id.valid()) {
+        return null;
+    }
+    types.TypeInfo info = unlayer_type_info(type_table, type_id);
+    if (info.kind == .pointer && info.element.valid()) {
+        return type_decl_for_expr_type(type_table, input, info.element);
+    }
+    return null;
 }
 
 Int field_index_for_name(jir.JirTypeDecl decl, ast.Name name) {
@@ -2176,7 +2282,7 @@ api.Value env_field_value(context.CompilerContext* ctx, types.TypeTable* type_ta
             }
         }
     }
-    jir.JirTypeDecl? decl = type_decl_for_expr_type(type_table, input, base_expr.type_id);
+    jir.JirTypeDecl? decl = type_decl_for_value_or_pointer_expr_type(type_table, input, base_expr.type_id);
     if (decl == null) {
         return default_value(result_type);
     }
@@ -2184,6 +2290,13 @@ api.Value env_field_value(context.CompilerContext* ctx, types.TypeTable* type_ta
     Int field_index = field_index_for_name(type_decl, field.name);
     if (field_index < 0) {
         return default_value(result_type);
+    }
+    types.TypeInfo base_info = unlayer_type_info(type_table, base_expr.type_id);
+    if (base_info.kind == .pointer) {
+        api.Type element_type = layout_type_ref(ctx, type_table, input, context_ref, base_info.element);
+        api.Value base_ptr = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, field.base, env, context_ref.pointer_type());
+        api.Value field_ptr = aggregate_field_ptr(context_ref, builder_ref, element_type, base_ptr, UInt64(field_index), "field.ptr");
+        return builder_ref.build_load(result_type, field_ptr, "field.load");
     }
     api.Type base_type = layout_type_ref(ctx, type_table, input, context_ref, base_expr.type_id);
     api.Value base_value = env_expr_value(ctx, type_table, input, context_ref, builder_ref, module_ref, function_value, function_decl, field.base, env, base_type);
