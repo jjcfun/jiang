@@ -87,8 +87,9 @@ mutable_items = [4, 5, 6];
 
 ```c
 Int a1 = -123;
+UInt u0 = 123;
 UInt8 a2 = 23;
-Char ch = "a";
+Char ch = 'a';
 UInt8[3] a3 = "abc";
 Int16 a4 = -45;
 UInt16 a5 = 512;
@@ -112,7 +113,9 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 
 其中：
 
-- `Char` 表示单个 Unicode 标量，字面量语法与字符串一致，例如 `"a"`、`"中"`
+- `Int` / `UInt` 是 pointer-sized 整数，语义上分别对应 `isize` / `usize`；在 64-bit target 上通常是 64 位，在 32-bit target 上通常是 32 位。
+- 需要固定 ABI 宽度、文件格式或网络协议布局时，使用 `Int8/Int16/Int32/Int64` 与 `UInt8/UInt16/UInt32/UInt64`。
+- `Char` 表示单个 Unicode 标量，例如 `'a'`、`'中'`
 - 字符串字面量按 UTF-8 字节序列处理，当前仍使用 `UInt8[_]` / `UInt8[]`
 - `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
 
