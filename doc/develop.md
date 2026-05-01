@@ -517,17 +517,17 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 
 - declaration：function、global、type declaration metadata。
 - storage：local、temp local、assign、name/temp expr。
-- primitive expr：literal、unary、binary、call、tuple、pointer index。
-- structured stmt：block、if、while、for-range、return、break、continue、run-defer。
+- primitive expr：literal、unary、binary、call、tuple、fixed array、pointer index、fixed array index、`self`。
+- pattern expr：`optional_is_some`、普通 `is_expr` 的 primitive test/bind 列表，包括 literal test、optional some test、variant placeholder test 和 binding materialization。
+- structured stmt：block、if、switch branch chain、while、for-range、fixed array for-each、return、throw/unreachable、break、continue、run-defer。
+- early exit：`coalesce_control_local` 已能生成 optional test 和 return/break/continue control flow。
 
 当前还需要继续真实 lowering 的 JIR：
 
-- `switch_stmt`：按 case 顺序 emit branch chain；每个 case 先 emit pattern tests，成功后 emit binds 和 body。
-- pattern tests/binds：optional `some`、variant tag、tuple item、literal compare、binding payload materialization 都应降成明确的 load/compare/store。
 - `try_stmt`：先按 errorable value 的 success/error branch 模型实现，不接 LLVM exception。
-- `coalesce_control_local`：statement 级 early-exit 形式，backend 需要生成 left test 和对应 control flow。
-- `optional_is_some` / `is_expr`：需要按 type/pattern 生成测试和绑定，不应在 backend 重新解释源码 pattern。
-- struct/record layout、field access、array/slice literal、variant layout、optional representation。
+- struct/record layout、field access、slice literal、variant layout、optional payload representation。
+- extend/method emission：需要先确定 receiver ABI、method symbol mangling 和 trait method边界，再递归进入 extend item。
+- pattern tests/binds 的深层 payload：tuple item bind、variant tag/payload bind 仍需要依赖 layout 模型，当前只完成 primitive test/bind 的最小 LLVM 表达。
 
 当前明确不应进入 LLVM backend 的源码级结构：
 
