@@ -84,6 +84,10 @@ run_sample while_minimal.jiang 10
 run_sample for_range_minimal.jiang 8
 run_sample array_minimal.jiang 42
 run_sample tuple_value_minimal.jiang 42
+run_sample enum_minimal.jiang 2
+run_sample union_minimal.jiang 42
+run_sample union_if_pattern_minimal.jiang 42
+run_sample optional_some_pattern_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample struct_init_minimal.jiang 42
