@@ -11,6 +11,7 @@ fi
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 
 STAGE1_OBJ="${TMPDIR:-/tmp}/jiangc.o"
+STAGE1_LL="${TMPDIR:-/tmp}/jiangc.ll"
 STAGE1_BIN="${TMPDIR:-/tmp}/jiangc"
 INPUT="${TMPDIR:-/tmp}/jiang-stage1-smoke-input.jiang"
 OUTPUT="${TMPDIR:-/tmp}/jiang-stage1-smoke-out"
@@ -19,7 +20,7 @@ if [ ! -x ./build/stage0c ]; then
   bash script/build_stage0.sh >/dev/null
 fi
 
-./build/stage0c --emit-obj -o "$STAGE1_OBJ" compiler/jiangc.jiang
+./build/stage0c --emit-llvm compiler/jiangc.jiang > "$STAGE1_LL"
 
 declare -a llvm_ldflags=()
 declare -a llvm_libs=()
@@ -31,13 +32,19 @@ if [ -n "$system_libs" ]; then
   read -r -a llvm_system_libs <<< "$system_libs"
 fi
 
+if [ -x "$(dirname "$LLVM_CONFIG")/clang" ]; then
+  CC_BIN="$(dirname "$LLVM_CONFIG")/clang"
+else
+  CC_BIN="${CC:-cc}"
+fi
+
 if [ "${#llvm_system_libs[@]}" -eq 0 ]; then
-  cc "$STAGE1_OBJ" -o "$STAGE1_BIN" \
+  "$CC_BIN" "$STAGE1_LL" -o "$STAGE1_BIN" \
     "${llvm_ldflags[@]}" \
     "${llvm_libs[@]}" \
     -lc++
 else
-  cc "$STAGE1_OBJ" -o "$STAGE1_BIN" \
+  "$CC_BIN" "$STAGE1_LL" -o "$STAGE1_BIN" \
     "${llvm_ldflags[@]}" \
     "${llvm_libs[@]}" \
     "${llvm_system_libs[@]}" \
