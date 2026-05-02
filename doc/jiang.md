@@ -1959,11 +1959,18 @@ extend User: HasValue {
 
 当前 `extend` 的限制：
 
-- 只支持扩展当前文件里**已经声明过**的本地 `struct` / `enum` / `union`
-- `extend` 块里只允许普通方法
+- method 不进入模块顶层命名空间
+- method body 中的 `self` 是 receiver 的不可变引用
+- 字段能否赋值只由字段类型本身是否 mutable 决定
+- `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`
+- receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
+- `Type.method(receiver, args...)` 是显式方法调用形式
+- union variant name 和同一 union 的 method name 不能重名，避免 `Union.member(...)` 歧义
+- 同名 method 可以 overload，但参数数量或参数类型必须不同
+- `extend Type: Trait { ... }` 会做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现
 - 不支持 `init`
 - 不支持 `deinit`
-- `extend Type: Trait1, Trait2` 可以同时涉及多个带同名 requirement 的 trait
+- 完整 trait solving、trait method lookup、associated type projection 后续实现
 
 ### 模块（Module）
 

@@ -518,7 +518,7 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 
 当前真实 LLVM lowering 已覆盖的 JIR：
 
-- declaration：function、global、type declaration metadata。
+- declaration：function、method、global、type declaration metadata。
 - storage：local、temp local、assign、name/temp expr。
 - primitive expr：literal、unary、binary、call、tuple、fixed array、pointer index、fixed array index、field/index/slice、struct literal、variant constructor、`self`。
 - compound ABI：struct/record、tuple、fixed array、optional、errorable、union variant payload 的基础 layout；union/errorable payload 使用 byte buffer，并由 resolved type layout 决定 payload 大小。
@@ -528,7 +528,6 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 
 当前还需要继续真实 lowering 的 JIR：
 
-- extend/method emission：需要先确定 receiver ABI、method symbol mangling 和 trait method边界，再递归进入 extend item。
 - 更完整的 ABI：跨 module nominal type layout、泛型实例 layout、trait object/receiver ABI、按目标平台 data layout 校准 size/align。
 - 可执行输出闭环：当前 backend 主要返回 LLVM IR 字符串；object/executable emission、linker 调度和 runtime 链接仍是后续工作。
 

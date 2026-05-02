@@ -340,14 +340,26 @@ extend Int: Hashable {
 }
 ```
 
-stage0 已支持 trait 继承、associated type 和相关负例检查。stage1 AST 已有 `TraitDecl.parents`、`AssocTypeDecl`、`TraitMethod`，但 parser/type checker 还没有完整对齐 stage0 语义。
+当前规则：
+
+- method 不进入模块顶层命名空间；它们记录在 extend/method side table 中。
+- method body 中的 `self` 是 receiver 的不可变引用。
+- 字段能否被赋值只由字段类型本身是否 mutable 决定，不由 receiver 绑定是否 mutable 决定。
+- `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`。
+- 如果 receiver 已经是 pointer，`ptr.method(args...)` 也等价于 `Type.method(ptr, args...)`。
+- `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver pointer。
+- union variant name 和同一 union 的 static/显式 method name 共享类型成员命名空间，不能重名，避免 `Union.member(...)` 歧义。
+- 同名函数和同名方法允许 overload；参数数量或参数类型必须不同。
+- `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。
+
+stage0 已支持 trait 继承、associated type 和相关负例检查。stage1 目前已支持 method side table、method overload、显式/隐式 method call 和基础 trait conformance；完整 trait solving、trait method lookup、associated type projection 仍不在本阶段范围内。
 
 未定事项：
 
 - trait parent 的解析和循环检查。
 - associated type 的 where constraint。
-- trait method 的 `self`/`Self` 规则。
-- extend 中 trait implementation 和普通 extension 的边界。
+- trait method lookup。
+- trait conformance solving。
 
 ## 泛型和 Type Bound
 
