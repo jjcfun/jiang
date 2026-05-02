@@ -57,4 +57,27 @@ if [ "$status" -ne 42 ]; then
   exit 1
 fi
 
+run_sample() {
+  local sample="$1"
+  local expected="$2"
+  local exe="${TMPDIR:-/tmp}/jiang-stage1-${sample%.jiang}"
+  "$STAGE1_BIN" -o "$exe" "tests/samples/$sample"
+  set +e
+  "$exe"
+  local status=$?
+  set -e
+  if [ "$status" -ne "$expected" ]; then
+    echo "stage1 smoke failed: $sample expected exit $expected, got $status"
+    exit 1
+  fi
+}
+
+run_sample minimal.jiang 42
+run_sample locals_minimal.jiang 42
+run_sample assign_minimal.jiang 5
+run_sample if_expr_minimal.jiang 42
+run_sample struct_minimal.jiang 42
+run_sample fields_minimal.jiang 3
+run_sample struct_init_minimal.jiang 42
+
 echo "stage1 smoke ok"
