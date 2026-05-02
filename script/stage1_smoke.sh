@@ -77,7 +77,12 @@ run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
 run_sample binary_ops_minimal.jiang 1
 run_sample logical_ops_minimal.jiang 140
+run_sample optional_minimal.jiang 42
+run_sample optional_coalesce_minimal.jiang 42
 run_sample if_expr_minimal.jiang 42
+run_sample while_minimal.jiang 10
+run_sample for_range_minimal.jiang 8
+run_sample array_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample struct_init_minimal.jiang 42
