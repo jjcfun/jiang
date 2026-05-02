@@ -477,8 +477,9 @@ LLVM C API helper layer，内部直接声明 LLVM 21.1.x C API 的最小 extern 
 - 在文件内部定义 LLVM opaque pointee types，例如 `LLVMContext`、`LLVMModule`、`LLVMBuilder`、`LLVMType`、`LLVMValue`、`LLVMBasicBlock`。
 - 对外暴露 Jiang 风格 wrapper，例如 `Context`、`Module`、`Builder`、`Type`、`Value`、`Block`。
 - 提供薄 helper，例如 `function_type(...)`、`const_int(...)`、`Builder.build_ret(...)`。
-- 提供 module target helper：`Module.set_default_target()` 会设置默认 target triple，并写入当前过渡期使用的 64-bit data layout。
-- 记录资源释放边界：`Context.dispose()`、`Module.dispose()`、`Builder.dispose()`、message / `dispose_message(...)`。
+- 提供 module target helper：`Module.set_default_target()` 设置默认 target triple；object emission 路径会通过 `TargetMachine` 查询真实 data layout 并写回 module。
+- 提供 object emission helper：`create_target_machine(...)`、`TargetMachine.data_layout_string()`、`emit_object_file(...)`。
+- 记录资源释放边界：`Context.dispose()`、`Module.dispose()`、`Builder.dispose()`、`TargetMachine.dispose()`、message / `dispose_message(...)`。
 - 不记录 mock instruction，不重新建一套 LLVM facade IR。
 
 命名规则：
@@ -495,7 +496,20 @@ stage1 实现自举后需要回收这层技术债：
 - `codegen.jiang` 不直接引用 raw LLVM handle 和 extern，只通过 `api.Context`、`api.Module`、`api.Builder`、`api.Type`、`api.Value`、`api.Block` 工作。
 - 如果 stage0 仍需维护，应先修复“public 方法体依赖 private helper/extern 被导入后不可见”的问题，再同步收回这些 `public`。
 
-当前 target/data layout 还有一个过渡限制：compiler 测试通过 `lli` 执行，`lli` 不保证暴露 `LLVMInitializeNativeTarget`、`LLVMCreateTargetMachine` 等 native target machine 符号。因此 `Module.set_default_target()` 暂时只调用 `LLVMGetDefaultTargetTriple` / `LLVMSetTarget`，data layout 使用固定 64-bit 字符串。后续实现 object/executable emission 时，应改为通过 TargetMachine 查询真实 data layout，并按输出 target 配置驱动 `Int` / `UInt` / pointer-sized layout。
+当前 target/data layout 还有两个过渡限制：`Module.set_default_target()` 仍保留固定 64-bit data layout，方便 `emit-llvm` smoke test 在没有完整 target machine 配置时工作；object emission 路径必须通过 `TargetMachine` 查询真实 data layout。compiler tests 通过 `lli` 执行，而当前 `lli` 不暴露 native target initialization 符号，所以 `api.jiang` 暂不声明 `LLVMInitializeNativeTarget` 这类入口；后续切到原生 stage1c 后应补回显式 target initialization，并把 `Int` / `UInt` / pointer-sized layout 统一接到 target data。
+
+### `llvm/linker.jiang`
+
+最小 external linker driver。
+
+当前职责：
+- 用系统 `cc` 把 object file 链接成 executable。
+- 提供 `run_executable_file(...)` 作为 compiler smoke test 的临时执行 helper。
+
+当前限制：
+- 第一版只拼接简单 `cc <object> -o <output>` 命令，路径不能包含空格或 shell 特殊字符。
+- linker driver 只是打通 object -> executable 闭环，不代表最终 CLI 设计。
+- 未来需要支持 linker 配置、额外 object/runtime、library search path、目标平台参数，以及 `clang -fuse-ld=lld` / `lld` 路径。
 
 ### `llvm/codegen.jiang`
 
@@ -515,6 +529,7 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 
 - `emit_minimal_main_ir()`：直接构造最小 LLVM module，作为 FFI/LLVM 链路 smoke test。
 - `emit_jir_module_ir(...)`：消费 JIR 和 `TypeTable`，返回 `LLVMPrintModuleToString` 生成的 IR 字符串。
+- `emit_jir_module_object(...)`：消费 JIR 和 `TypeTable`，通过 LLVM target machine 写出 object file。它复用 `emit_jir_module_body(...)`，因此 object emission 和 IR emission 不应分叉实现语义。
 
 当前真实 LLVM lowering 已覆盖的 JIR：
 
@@ -529,7 +544,7 @@ Backend 只消费 JIR、`TypeTable` 和必要的 module/codegen 配置，不重�
 当前还需要继续真实 lowering 的 JIR：
 
 - 更完整的 ABI：跨 module nominal type layout、泛型实例 layout、trait object/receiver ABI、按目标平台 data layout 校准 size/align。
-- 可执行输出闭环：当前 backend 主要返回 LLVM IR 字符串；object/executable emission、linker 调度和 runtime 链接仍是后续工作。
+- 可执行输出闭环：object file emission 已有最小路径；executable smoke test 已可通过 `llvm/linker.jiang` 调用系统 `cc` 链接运行；正式 CLI、linker 参数模型和 runtime 链接仍是后续工作。
 
 当前明确不应进入 LLVM backend 的源码级结构：
 
