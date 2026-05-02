@@ -2121,15 +2121,32 @@ static int function_matches_fn_type(HirFunction* fn, HirType* fn_type) {
 }
 
 static int function_matches_exact_name(HirFunction* fn, const char* name) {
-    return fn &&
-           !fn->method_flag &&
-           !fn->struct_init_flag &&
-           !fn->struct_deinit_flag &&
-           strcmp(fn->source_name ? fn->source_name : fn->name, name) == 0;
+    if (!fn ||
+        fn->method_flag ||
+        fn->struct_init_flag ||
+        fn->struct_deinit_flag) {
+        return 0;
+    }
+    if (fn->name && strcmp(fn->name, name) == 0) {
+        return 1;
+    }
+    return fn->source_name && strcmp(fn->source_name, name) == 0;
 }
 
 static int hir_name_is_hidden_implementation_name(const char* name) {
     return name && (name[0] == '#' || strstr(name, ".#") != 0);
+}
+
+static const char* hidden_binding_suffix(const char* name) {
+    const char* marker = 0;
+    if (!name) {
+        return 0;
+    }
+    marker = strrchr(name, '#');
+    if (marker && marker[1] != '\0') {
+        return marker + 1;
+    }
+    return 0;
 }
 
 static HirFunction* find_struct_init_function(HirProgram* program, HirStructDecl* struct_decl, int init_index) {
@@ -2564,10 +2581,18 @@ static HirFunction* find_type_method(HirProgram* program, HirType* receiver_type
 
 static HirBinding* lookup_binding(LowerContext* ctx, const char* name) {
     Scope* scope = ctx->scope;
+    const char* hidden_suffix = hidden_binding_suffix(name);
     while (scope) {
         int i = scope->bindings.count - 1;
         for (; i >= 0; --i) {
             if (strcmp(scope->bindings.items[i]->name, name) == 0) {
+                if (is_binding_freed(ctx, scope->bindings.items[i])) {
+                    fail(ctx, "use after free");
+                    return 0;
+                }
+                return scope->bindings.items[i];
+            }
+            if (hidden_suffix && strcmp(scope->bindings.items[i]->name, hidden_suffix) == 0) {
                 if (is_binding_freed(ctx, scope->bindings.items[i])) {
                     fail(ctx, "use after free");
                     return 0;
