@@ -377,6 +377,8 @@ static int same_method_owner_type(HirType* left, HirType* right) {
 }
 
 static int method_source_name_matches(const char* candidate, const char* requested) {
+    const char* marker = 0;
+    const char* dot = 0;
     if (!candidate || !requested) {
         return 0;
     }
@@ -384,6 +386,14 @@ static int method_source_name_matches(const char* candidate, const char* request
         return 1;
     }
     if (candidate[0] == '#' && strcmp(candidate + 1, requested) == 0) {
+        return 1;
+    }
+    marker = strrchr(candidate, '#');
+    if (marker && marker[1] != '\0' && strcmp(marker + 1, requested) == 0) {
+        return 1;
+    }
+    dot = strrchr(candidate, '.');
+    if (dot && dot[1] != '\0' && strcmp(dot + 1, requested) == 0) {
         return 1;
     }
     return 0;
@@ -728,6 +738,31 @@ static int suffix_range_equal(const char* left, size_t left_len, const char* rig
     return strncmp(left_suffix, right_suffix, left_suffix_len) == 0;
 }
 
+static int nominal_suffix_equal_ignoring_hidden_markers(const char* left, const char* right) {
+    int left_segment_start = 1;
+    int right_segment_start = 1;
+    while (*left || *right) {
+        while (*left == '#' && left_segment_start) {
+            left += 1;
+        }
+        while (*right == '#' && right_segment_start) {
+            right += 1;
+        }
+        if (*left != *right) {
+            return 0;
+        }
+        if (*left) {
+            left_segment_start = *left == '.';
+            left += 1;
+        }
+        if (*right) {
+            right_segment_start = *right == '.';
+            right += 1;
+        }
+    }
+    return 1;
+}
+
 static int generic_nominal_names_equivalent(const char* left, const char* right) {
     const char* left_args = strstr(left, "__");
     const char* right_args = strstr(right, "__");
@@ -780,7 +815,7 @@ static int nominal_names_equivalent(const char* left, const char* right) {
     if (generic_nominal_names_equivalent(left, right)) {
         return 1;
     }
-    return strcmp(nominal_public_suffix(left), nominal_public_suffix(right)) == 0;
+    return nominal_suffix_equal_ignoring_hidden_markers(nominal_public_suffix(left), nominal_public_suffix(right));
 }
 
 static int type_assignment_compatible_inner(HirType* actual, HirType* expected, int through_alias) {
@@ -2149,6 +2184,33 @@ static const char* hidden_binding_suffix(const char* name) {
     return 0;
 }
 
+static int binding_root_exists(LowerContext* ctx, const char* name, size_t root_len) {
+    Scope* scope = ctx->scope;
+    while (scope) {
+        int i = scope->bindings.count - 1;
+        for (; i >= 0; --i) {
+            const char* binding_name = scope->bindings.items[i]->name;
+            if (binding_name && strlen(binding_name) == root_len && strncmp(binding_name, name, root_len) == 0) {
+                return 1;
+            }
+        }
+        scope = scope->parent;
+    }
+    return 0;
+}
+
+static const char* qualified_imported_local_suffix(LowerContext* ctx, const char* name) {
+    const char* first_dot = name ? strchr(name, '.') : 0;
+    const char* last_dot = name ? strrchr(name, '.') : 0;
+    if (!first_dot || !last_dot || last_dot[1] == '\0') {
+        return 0;
+    }
+    if (binding_root_exists(ctx, name, (size_t)(first_dot - name))) {
+        return 0;
+    }
+    return last_dot + 1;
+}
+
 static HirFunction* find_struct_init_function(HirProgram* program, HirStructDecl* struct_decl, int init_index) {
     int i = 0;
     for (i = 0; i < program->functions.count; ++i) {
@@ -2582,6 +2644,7 @@ static HirFunction* find_type_method(HirProgram* program, HirType* receiver_type
 static HirBinding* lookup_binding(LowerContext* ctx, const char* name) {
     Scope* scope = ctx->scope;
     const char* hidden_suffix = hidden_binding_suffix(name);
+    const char* imported_local_suffix = qualified_imported_local_suffix(ctx, name);
     while (scope) {
         int i = scope->bindings.count - 1;
         for (; i >= 0; --i) {
@@ -2593,6 +2656,13 @@ static HirBinding* lookup_binding(LowerContext* ctx, const char* name) {
                 return scope->bindings.items[i];
             }
             if (hidden_suffix && strcmp(scope->bindings.items[i]->name, hidden_suffix) == 0) {
+                if (is_binding_freed(ctx, scope->bindings.items[i])) {
+                    fail(ctx, "use after free");
+                    return 0;
+                }
+                return scope->bindings.items[i];
+            }
+            if (imported_local_suffix && strcmp(scope->bindings.items[i]->name, imported_local_suffix) == 0) {
                 if (is_binding_freed(ctx, scope->bindings.items[i])) {
                     fail(ctx, "use after free");
                     return 0;
@@ -3761,8 +3831,27 @@ static HirFunction* resolve_method_call_overload(LowerContext* ctx,
             }
             ctx->error = 0;
             if (!lower_call_args_exact_from(ctx, ast_args, &candidate_args, candidate, param_offset)) {
-                ctx->error = saved_error;
-                continue;
+                if (hir_name_is_hidden_implementation_name(candidate->name) ||
+                    (candidate->receiver_type &&
+                     ((candidate->receiver_type->kind == HIR_TYPE_STRUCT &&
+                       candidate->receiver_type->struct_decl &&
+                       hir_name_is_hidden_implementation_name(candidate->receiver_type->struct_decl->name)) ||
+                      (candidate->receiver_type->kind == HIR_TYPE_ENUM &&
+                       candidate->receiver_type->enum_decl &&
+                       hir_name_is_hidden_implementation_name(candidate->receiver_type->enum_decl->name)) ||
+                      (candidate->receiver_type->kind == HIR_TYPE_UNION &&
+                       candidate->receiver_type->union_decl &&
+                       hir_name_is_hidden_implementation_name(candidate->receiver_type->union_decl->name))))) {
+                    ctx->error = 0;
+                    memset(&candidate_args, 0, sizeof(candidate_args));
+                    if (!lower_call_args_from(ctx, ast_args, &candidate_args, candidate, param_offset)) {
+                        ctx->error = saved_error;
+                        continue;
+                    }
+                } else {
+                    ctx->error = saved_error;
+                    continue;
+                }
             }
             ctx->error = saved_error;
             matched = candidate;
