@@ -478,7 +478,7 @@ LLVM C API helper layer，内部直接声明 LLVM 21.1.x C API 的最小 extern 
 - 对外暴露 Jiang 风格 wrapper，例如 `Context`、`Module`、`Builder`、`Type`、`Value`、`Block`。
 - 提供薄 helper，例如 `function_type(...)`、`const_int(...)`、`Builder.build_ret(...)`。
 - 提供 module target helper：`Module.set_default_target()` 设置默认 target triple；object emission 路径会通过 `TargetMachine` 查询真实 data layout 并写回 module。
-- 提供 object emission helper：`create_target_machine(...)`、`TargetMachine.data_layout_string()`、`emit_object_file(...)`。
+- 提供 object emission helper：`create_target_machine(...)`、`TargetMachine.data_layout_string()`、`TargetMachine.pointer_byte_size()`、`TargetMachine.abi_size_of(...)`、`TargetMachine.abi_align_of(...)`、`emit_object_file(...)`。
 - 记录资源释放边界：`Context.dispose()`、`Module.dispose()`、`Builder.dispose()`、`TargetMachine.dispose()`、message / `dispose_message(...)`。
 - 不记录 mock instruction，不重新建一套 LLVM facade IR。
 
@@ -496,7 +496,7 @@ stage1 实现自举后需要回收这层技术债：
 - `codegen.jiang` 不直接引用 raw LLVM handle 和 extern，只通过 `api.Context`、`api.Module`、`api.Builder`、`api.Type`、`api.Value`、`api.Block` 工作。
 - 如果 stage0 仍需维护，应先修复“public 方法体依赖 private helper/extern 被导入后不可见”的问题，再同步收回这些 `public`。
 
-当前 target/data layout 还有两个过渡限制：`Module.set_default_target()` 仍保留固定 64-bit data layout，方便 `emit-llvm` smoke test 在没有完整 target machine 配置时工作；object emission 路径必须通过 `TargetMachine` 查询真实 data layout。compiler tests 通过 `lli` 执行，而当前 `lli` 不暴露 native target initialization 符号，所以 `api.jiang` 暂不声明 `LLVMInitializeNativeTarget` 这类入口；后续切到原生 stage1c 后应补回显式 target initialization，并把 `Int` / `UInt` / pointer-sized layout 统一接到 target data。
+当前 target/data layout 还有一个过渡限制：`Module.set_default_target()` 会优先通过 `TargetMachine` 写入真实 data layout，失败时才回退到固定 64-bit data layout。compiler tests 通过 `lli` 执行，而当前 `lli` 不暴露 native target initialization 符号，所以 `api.jiang` 暂不声明 `LLVMInitializeNativeTarget` 这类入口；后续切到原生 stage1c 后应补回显式 target initialization，并把 `Int` / `UInt` / pointer-sized layout 和所有 aggregate layout 统一接到 target data。
 
 ### `llvm/linker.jiang`
 
