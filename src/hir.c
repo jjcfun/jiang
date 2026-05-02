@@ -164,6 +164,7 @@ static int fail_unknown_field(LowerContext* ctx, const char* struct_name, const 
 static HirExpr* lower_expr(LowerContext* ctx, const AstExpr* expr);
 static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirType* expected_type);
 static HirExpr* lower_expr_preserve_pointer(LowerContext* ctx, const AstExpr* expr);
+static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_type, int line);
 static HirType* new_owned_type(HirProgram* program, HirTypeKind kind);
 static HirType* primitive_type(HirProgram* program, HirTypeKind kind);
 static int is_lvalue_expr(const HirExpr* expr);
@@ -1567,6 +1568,7 @@ static HirExpr* maybe_wrap_expected_optional_expr(LowerContext* ctx, HirExpr* va
     if (!value) {
         return 0;
     }
+    value = maybe_auto_deref_pointer_expr(value, expected_type, line);
     if (expected_type && expected_type->kind == HIR_TYPE_OPTIONAL && type_equals(expected_type->array_item, value->type)) {
         HirExpr* some = new_expr(HIR_EXPR_OPTIONAL_SOME, expected_type, line);
         some->as.unary.value = value;
@@ -1580,6 +1582,7 @@ static HirExpr* maybe_wrap_expected_errorable_expr(LowerContext* ctx, HirExpr* v
     if (!value) {
         return 0;
     }
+    value = maybe_auto_deref_pointer_expr(value, expected_type, line);
     current_return_type = ctx->current_function ? ctx->current_function->return_type : 0;
     if (expected_type && is_errorable_type(expected_type)) {
         if (is_errorable_type(value->type)) {
@@ -1931,10 +1934,6 @@ static int ast_range_bounds(const AstExpr* expr, const AstExpr** start, const As
 static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_type, int line) {
     HirExpr* deref = 0;
     if (!expr || !expr->type || (expr->type->kind != HIR_TYPE_REFERENCE && expr->type->kind != HIR_TYPE_POINTER)) {
-        return expr;
-    }
-    if (expected_type &&
-        (expected_type->kind == HIR_TYPE_REFERENCE || expected_type->kind == HIR_TYPE_POINTER || expected_type->kind == HIR_TYPE_MANY_POINTER)) {
         return expr;
     }
     deref = new_expr(HIR_EXPR_DEREF, expr->type->array_item, line);
@@ -2981,7 +2980,7 @@ static HirExpr* lower_subscriptable_get_expr(LowerContext* ctx,
     HirExpr* index = 0;
     HirExpr* receiver = 0;
     HirExpr* call = 0;
-    if (!owner_type || !hir_type_declares_concept_or_child(ctx->ast, owner_type, "SubscriptGet")) {
+    if (!owner_type) {
         return 0;
     }
     method = find_type_method(ctx->program, owner_type, "subscript_get", 0);
@@ -3034,13 +3033,6 @@ static HirStmt* lower_subscriptable_set_stmt(LowerContext* ctx,
     }
     owner_type = instance_method_owner_type(base->type);
     if (!owner_type) {
-        return 0;
-    }
-    if (!hir_type_declares_concept_or_child(ctx->ast, owner_type, "SubscriptGet")) {
-        return 0;
-    }
-    if (!hir_type_declares_concept_or_child(ctx->ast, owner_type, "SubscriptSet")) {
-        fail(ctx, "assignment target is immutable");
         return 0;
     }
     method = find_type_method(ctx->program, owner_type, "subscript_set", 0);
@@ -4188,11 +4180,26 @@ static int validate_struct_init_expr(LowerContext* ctx, HirStructDecl* struct_de
                 expr->as.implicit.value_target->as.field.base &&
                 expr->as.implicit.value_target->as.field.base->kind == AST_EXPR_NAME &&
                 strcmp(expr->as.implicit.value_target->as.field.base->as.name, "self") == 0 &&
-                expr->as.implicit.member &&
-                (strcmp(expr->as.implicit.member, "ptr") == 0 ||
-                 strcmp(expr->as.implicit.member, "ref") == 0 ||
-                 strcmp(expr->as.implicit.member, "addr") == 0)) {
-                return fail(ctx, "init self field address escape");
+                expr->as.implicit.member) {
+                int field_index = -1;
+                HirStructField* field = find_struct_field(struct_decl, expr->as.implicit.value_target->as.field.name, &field_index);
+                if (!field) {
+                    return fail_unknown_field(ctx, struct_decl->name, expr->as.implicit.value_target->as.field.name);
+                }
+                if (!field_state[field_index]) {
+                    return fail(ctx, "init read before field initialization");
+                }
+                if ((strcmp(expr->as.implicit.member, "ptr") == 0 ||
+                     strcmp(expr->as.implicit.member, "ref") == 0) &&
+                    field->type &&
+                    (field->type->kind == HIR_TYPE_POINTER || field->type->kind == HIR_TYPE_REFERENCE)) {
+                    return 1;
+                }
+                if (strcmp(expr->as.implicit.member, "ptr") == 0 ||
+                    strcmp(expr->as.implicit.member, "ref") == 0 ||
+                    strcmp(expr->as.implicit.member, "addr") == 0) {
+                    return fail(ctx, "init self field address escape");
+                }
             }
             return validate_struct_init_expr(ctx, struct_decl, expr->as.implicit.value_target, field_state);
         case AST_EXPR_BINARY:
@@ -4588,6 +4595,13 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 if (!value) {
                     return 0;
                 }
+                if ((value->type->kind == HIR_TYPE_REFERENCE || value->type->kind == HIR_TYPE_POINTER) && value->type->array_item) {
+                    pointer_type = new_owned_type(ctx->program, HIR_TYPE_REFERENCE);
+                    pointer_type->array_item = value->type->array_item;
+                    out = new_expr(HIR_EXPR_AS, pointer_type, expr->line);
+                    out->as.unary.value = value;
+                    return out;
+                }
                 if (!is_lvalue_expr(value)) {
                     fail(ctx, "address-of requires lvalue");
                     return 0;
@@ -4608,6 +4622,13 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
                 if (!value) {
                     return 0;
+                }
+                if ((value->type->kind == HIR_TYPE_REFERENCE || value->type->kind == HIR_TYPE_POINTER) && value->type->array_item) {
+                    pointer_type = new_owned_type(ctx->program, HIR_TYPE_POINTER);
+                    pointer_type->array_item = value->type->array_item;
+                    out = new_expr(HIR_EXPR_AS, pointer_type, expr->line);
+                    out->as.unary.value = value;
+                    return out;
                 }
                 if (!is_lvalue_expr(value)) {
                     fail(ctx, "address-of requires lvalue");
@@ -6179,11 +6200,11 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 subscript_call = lower_subscriptable_get_expr(ctx, base, expr->as.index.index, expected_type, expr->line);
                 if (!subscript_call) {
                     if (!ctx->error) {
-                        fail(ctx, "indexing currently requires a tuple, array, slice, many-pointer, or SubscriptGet base");
+                        fail(ctx, "indexing currently requires a tuple, array, slice, many-pointer, or subscript_get method");
                     }
                     return 0;
                 }
-                return subscript_call;
+                return maybe_wrap_expected_optional_expr(ctx, subscript_call, expected_type, expr->line);
             }
             out->as.index.base = base;
             out->as.index.index = index;
