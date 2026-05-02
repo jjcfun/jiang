@@ -28,7 +28,7 @@ run_compiler_sample() {
   expected="$2"
   ir="$BUILD_DIR/compiler_${sample%.jiang}.ll"
   printf 'compiler/%s ... ' "$sample"
-  "$BUILD_DIR/jiangc" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
+  "$BUILD_DIR/stage0c" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
   set +e
   "$LLI" "$ir"
   status=$?
@@ -45,7 +45,7 @@ run_compiler_compile_fail() {
   sample="$1"
   printf 'compiler/%s ... ' "$sample"
   set +e
-  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/jiangc" "$COMPILER_SAMPLES_DIR/$sample" >/dev/null 2>&1
+  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/stage0c" "$COMPILER_SAMPLES_DIR/$sample" >/dev/null 2>&1
   status=$?
   set -e
   if [ "$status" -eq 0 ]; then
@@ -60,7 +60,7 @@ run_compiler_ir_regression_check() {
   sample="$1"
   ir="$BUILD_DIR/compiler_${sample%.jiang}.regression.ll"
   printf 'compiler/%s ir regression ... ' "$sample"
-  "$BUILD_DIR/jiangc" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
+  "$BUILD_DIR/stage0c" --emit-llvm "$COMPILER_SAMPLES_DIR/$sample" > "$ir"
   function_count="$(grep -c '^define ' "$ir" || true)"
   if [ "$function_count" -ge 3000 ]; then
     echo "failed"

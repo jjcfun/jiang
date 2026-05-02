@@ -16,6 +16,6 @@ if [ -f "$CACHE_FILE" ]; then
 fi
 
 cmake -S "$PROJECT_ROOT" -B "$BUILD_DIR"
-cmake --build "$BUILD_DIR" --target jiangc
+cmake --build "$BUILD_DIR" --target stage0c
 
-echo "$BUILD_DIR/jiangc"
+echo "$BUILD_DIR/stage0c"

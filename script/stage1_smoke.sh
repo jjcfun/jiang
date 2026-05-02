@@ -10,12 +10,16 @@ if [ -z "$LLVM_CONFIG" ] && [ -n "${JIANG_LLVM_ROOT:-}" ]; then
 fi
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 
-STAGE1_OBJ="${TMPDIR:-/tmp}/jiang-stage1c.o"
-STAGE1_BIN="${TMPDIR:-/tmp}/jiang-stage1c"
+STAGE1_OBJ="${TMPDIR:-/tmp}/jiangc.o"
+STAGE1_BIN="${TMPDIR:-/tmp}/jiangc"
 INPUT="${TMPDIR:-/tmp}/jiang-stage1-smoke-input.jiang"
 OUTPUT="${TMPDIR:-/tmp}/jiang-stage1-smoke-out"
 
-./build/jiangc --emit-obj -o "$STAGE1_OBJ" compiler/stage1_main.jiang
+if [ ! -x ./build/stage0c ]; then
+  bash script/build_stage0.sh >/dev/null
+fi
+
+./build/stage0c --emit-obj -o "$STAGE1_OBJ" compiler/jiangc.jiang
 
 declare -a llvm_ldflags=()
 declare -a llvm_libs=()

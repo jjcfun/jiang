@@ -496,7 +496,7 @@ stage1 实现自举后需要回收这层技术债：
 - `codegen.jiang` 不直接引用 raw LLVM handle 和 extern，只通过 `api.Context`、`api.Module`、`api.Builder`、`api.Type`、`api.Value`、`api.Block` 工作。
 - 如果 stage0 仍需维护，应先修复“public 方法体依赖 private helper/extern 被导入后不可见”的问题，再同步收回这些 `public`。
 
-当前 target/data layout 还有一个过渡限制：`Module.set_default_target()` 会优先通过 `TargetMachine` 写入真实 data layout，失败时才回退到固定 64-bit data layout。compiler tests 通过 `lli` 执行，而当前 `lli` 不暴露 native target initialization 符号，所以 `api.jiang` 暂不声明 `LLVMInitializeNativeTarget` 这类入口；后续切到原生 stage1c 后应补回显式 target initialization，并把 `Int` / `UInt` / pointer-sized layout 和所有 aggregate layout 统一接到 target data。
+当前 target/data layout 还有一个过渡限制：`Module.set_default_target()` 会优先通过 `TargetMachine` 写入真实 data layout，失败时才回退到固定 64-bit data layout。`api.jiang` 已在 object emission 路径显式初始化当前 native target；由于 `LLVMInitializeNativeTarget` 是 LLVM C 头文件中的 `static inline` helper，不是动态库导出符号，当前 macOS/arm64 先直接绑定 AArch64 target 初始化入口。后续需要按发布平台抽象这层初始化，并把 `Int` / `UInt` / pointer-sized layout 和所有 aggregate layout 统一接到 target data。
 
 ### `llvm/linker.jiang`
 

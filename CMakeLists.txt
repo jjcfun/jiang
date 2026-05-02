@@ -58,7 +58,7 @@ separate_arguments(LLVM_LDFLAGS_LIST UNIX_COMMAND "${LLVM_LDFLAGS_RAW}")
 separate_arguments(LLVM_LIBS_LIST UNIX_COMMAND "${LLVM_LIBS_RAW}")
 separate_arguments(LLVM_SYSTEM_LIBS_LIST UNIX_COMMAND "${LLVM_SYSTEM_LIBS_RAW}")
 
-add_executable(jiangc
+add_executable(stage0c
     src/main.c
     src/vec.c
     src/hashmap.c
@@ -69,10 +69,10 @@ add_executable(jiangc
     src/llvm_emit.c
 )
 
-target_include_directories(jiangc PRIVATE include)
-target_compile_options(jiangc PRIVATE ${LLVM_CFLAGS_LIST})
-target_link_options(jiangc PRIVATE ${LLVM_LDFLAGS_LIST})
-target_link_libraries(jiangc PRIVATE ${LLVM_LIBS_LIST} ${LLVM_SYSTEM_LIBS_LIST})
+target_include_directories(stage0c PRIVATE include)
+target_compile_options(stage0c PRIVATE ${LLVM_CFLAGS_LIST})
+target_link_options(stage0c PRIVATE ${LLVM_LDFLAGS_LIST})
+target_link_libraries(stage0c PRIVATE ${LLVM_LIBS_LIST} ${LLVM_SYSTEM_LIBS_LIST})
 
 add_executable(utils_test
     tests/utils_test.c

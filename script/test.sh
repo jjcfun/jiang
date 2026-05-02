@@ -34,7 +34,7 @@ run_sample() {
   local sample="$1"
   local expected="$2"
   local ir="$BUILD_DIR/${sample%.jiang}.ll"
-  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
+  "$BUILD_DIR/stage0c" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
   set +e
   "$LLI" "$ir"
   local status=$?
@@ -48,7 +48,7 @@ run_sample() {
 run_sample_nonzero() {
   local sample="$1"
   local ir="$BUILD_DIR/${sample%.jiang}.ll"
-  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
+  "$BUILD_DIR/stage0c" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
   set +e
   /bin/sh -c '"$1" "$2" >/dev/null 2>&1' sh "$LLI" "$ir" >/dev/null 2>&1
   local status=$?
@@ -62,7 +62,7 @@ run_sample_nonzero() {
 run_compile_fail() {
   local sample="$1"
   set +e
-  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/jiangc" "$SAMPLES_DIR/$sample" >/dev/null 2>&1
+  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/stage0c" "$SAMPLES_DIR/$sample" >/dev/null 2>&1
   local status=$?
   set -e
   if [[ "$status" -eq 0 ]]; then
@@ -74,13 +74,13 @@ run_compile_fail() {
 run_compile_only() {
   local sample="$1"
   local ir="$BUILD_DIR/${sample%.jiang}.ll"
-  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
+  "$BUILD_DIR/stage0c" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
 }
 
 run_imported_extern_symbol_sample() {
   local sample="imported_extern_symbol_minimal.jiang"
   local ir="$BUILD_DIR/${sample%.jiang}.ll"
-  "$BUILD_DIR/jiangc" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
+  "$BUILD_DIR/stage0c" --emit-llvm "$SAMPLES_DIR/$sample" > "$ir"
   if grep -q "imported_extern_helper.puts" "$ir"; then
     echo "error: imported extern leaked module-qualified C symbol" >&2
     exit 1
@@ -96,7 +96,7 @@ run_object_sample() {
   local expected="$2"
   local obj="$BUILD_DIR/${sample%.jiang}.o"
   local exe="$BUILD_DIR/${sample%.jiang}.obj.out"
-  "$BUILD_DIR/jiangc" --emit-obj -o "$obj" "$SAMPLES_DIR/$sample"
+  "$BUILD_DIR/stage0c" --emit-obj -o "$obj" "$SAMPLES_DIR/$sample"
   "$CC_BIN" "$obj" -o "$exe"
   set +e
   "$exe"
@@ -112,7 +112,7 @@ run_executable_sample() {
   local sample="$1"
   local expected="$2"
   local exe="$BUILD_DIR/${sample%.jiang}.exe.out"
-  "$BUILD_DIR/jiangc" -o "$exe" "$SAMPLES_DIR/$sample"
+  "$BUILD_DIR/stage0c" -o "$exe" "$SAMPLES_DIR/$sample"
   set +e
   "$exe"
   local status=$?

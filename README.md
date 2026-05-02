@@ -43,16 +43,17 @@ cmake --build build
 ## 使用
 
 ```bash
-./build/jiangc --emit-llvm tests/samples/minimal.jiang
-./build/jiangc --emit-obj tests/samples/minimal.jiang -o minimal.o
-./build/jiangc tests/samples/minimal.jiang -o minimal
+./build/stage0c --emit-llvm tests/samples/minimal.jiang
+./build/stage0c --emit-obj tests/samples/minimal.jiang -o minimal.o
+./build/stage0c tests/samples/minimal.jiang -o minimal
 ```
 
 说明：
 
 - `--emit-llvm` 默认输出到标准输出；配合 `-o` 可写入 `.ll` 文件
 - `--emit-obj` 直接输出目标文件
-- 不带 `--emit-*` 时，`jiangc` 会先生成临时目标文件，再通过宿主 `cc` 链接出可执行文件
+- `stage0c` 是 C 实现的 bootstrap compiler；stage1 自举产物使用 `jiangc` 作为正式编译器名
+- 不带 `--emit-*` 时，编译器会先生成临时目标文件，再通过宿主 `cc` 链接出可执行文件
 - 当前最小运行时边界仍由宿主 C 运行时提供，主要包括 `malloc`、`free`、`printf`、`abort`
 
 ## 测试
