@@ -177,6 +177,7 @@ run_sample pointer_minimal.jiang 42
 run_sample pointer_default_field_minimal.jiang 0
 run_sample pointer_expected_type_deref_minimal.jiang 63
 run_sample pointer_argument_expected_type_minimal.jiang 42
+run_sample pointer_get_minimal.jiang 42
 run_compile_fail invalid_pointer_star_type.jiang
 run_compile_fail invalid_pointer_double_owner.jiang
 run_compile_fail invalid_pointer_owner_reference_combo.jiang

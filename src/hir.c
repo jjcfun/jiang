@@ -4643,6 +4643,25 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.unary.value = value;
                 return out;
             }
+            if (strcmp(expr->as.implicit.member, "get") == 0) {
+                HirExpr* value = 0;
+                if (expr->as.implicit.has_type_arg || expr->as.implicit.args.count != 0) {
+                    fail(ctx, "implicit operation '.get()' takes no arguments");
+                    return 0;
+                }
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if ((value->type->kind != HIR_TYPE_REFERENCE && value->type->kind != HIR_TYPE_POINTER) ||
+                    !value->type->array_item) {
+                    fail(ctx, "get requires pointer or reference");
+                    return 0;
+                }
+                out = new_expr(HIR_EXPR_DEREF, value->type->array_item, expr->line);
+                out->as.unary.value = value;
+                return out;
+            }
             if (strcmp(expr->as.implicit.member, "addr") == 0) {
                 HirExpr* value = 0;
                 HirType* pointer_type = 0;

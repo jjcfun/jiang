@@ -2500,6 +2500,7 @@ static int is_implicit_member_name(Token* token) {
             token_equals(token, "addr") ||
             token_equals(token, "free") ||
             token_equals(token, "some") ||
+            token_equals(token, "get") ||
             token_equals(token, "offset"));
 }
 

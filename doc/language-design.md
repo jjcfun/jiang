@@ -92,10 +92,11 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T!`：当前类型层级的可变 flag。
 - `T?`：内建 optional 类型层；optional 不是可直接命名的 `Option<T>` 普通泛型类型。
 - `T?!`：optional 类型层可变的规范写法。
-- `T*`：自动解引用的单对象指针。
-- `T&`：临时引用。
+- `T^`：自动解引用的 owning heap pointer，通常来自 `new T(...)`；它不是 C 风格 raw pointer。
+- `T&`：自动解引用的临时引用，不表达释放职责。
 - `T[]`：slice。
-- `T[*]`：many pointer。
+- `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
+- `RawPointer<T>`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
 - `T[_]`：数组长度由初始化器推断。
 - `T@E`：errorable。
@@ -114,9 +115,29 @@ Result?!@Error maybe_result;
 
 ## 可变性
 
-可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变；它不表示 optional，也不表示空值。
+可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变；它不表示 optional，也不表示空值。也就是说，`Int` 与 `Int!` 是不同的 Jiang 类型形态，虽然类型检查可以在受控位置做兼容判断。
 
-`!` 和 `?` 都作用在当前类型层级。同一类型层级中，每种标记最多出现一次。为了避免用户在不同排列之间做选择，如果同一层级同时出现 `?` 和 `!`，源码只能写成 `T?!`：
+`?` / `!` 作用在当前类型层级，并且都是 type flag。同一类型层级中，每种 flag 最多出现一次；源码里重复写出时必须报 diagnostic。类型归一化阶段如果因为泛型替换或别名展开得到重复 flag，按幂等规则合并。
+
+`^` / `&` 会基于左侧已经形成的类型创建新的 pointer/reference 外层。创建出的外层也可以继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 pointer/reference 层；因此不支持 `T^^`、`T&&`、`T^&` 或 `T&^` 这类 handle 的 handle。类型归一化阶段如果得到重复 handle 层，按当前同类 handle 合并；如果同时出现 `^` 和 `&`，必须保留错误状态并报告 diagnostic，不能静默选择一种。
+
+为了避免用户在不同排列之间做选择，同一层级的 type suffix 顺序固定：
+
+- 普通层写成 `T?!`
+- owning pointer 外层写成 `T^?!`
+- reference 外层写成 `T&?!`
+
+其中 `?` 和 `!` 可以省略，但剩余 suffix 的相对顺序不能变化：
+
+```jiang
+Int?! value;       // optional + mutable
+Int!^?! owner;     // optional mutable owning pointer to mutable Int
+Int?& ref;         // reference to optional Int
+```
+
+`Int!?`、`Int^!?`、`Int^^`、`Int&&`、`Int^&` 都是语法错误。编译器可以按规范顺序恢复后继续解析，但必须报告 diagnostic。
+
+如果同一层级同时出现 `?` 和 `!`，源码只能写成 `T?!`：
 
 ```jiang
 Int?! value; // optional 层可变
@@ -126,7 +147,9 @@ Int?! value; // optional 层可变
 
 重复可变标记是语法错误。编译器恢复时可以把 `T!!` 当作 `T!` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `?` 也要报错，例如 `T!?!`。
 
-这个规则只针对源码中直接写出的 type flag。类型归一化阶段如果因为泛型替换得到重复可变性，`!` 是幂等的：
+pointer/reference 外层只能是 `^` 或 `&` 之一，不能写成 `T^&` 或 `T&^`。
+
+源码报错规则和类型归一化规则要分开：源码中直接写出的重复 suffix 必须报错；归一化阶段因为泛型替换得到重复 flag 时，重复的 `?` / `!` / 同类 handle 可以合并。
 
 ```jiang
 // 假设 T 实例化为 Int!
@@ -150,7 +173,7 @@ mutable_items = [4, 5, 6];
 
 变量、参数、全局变量和字段声明如果写出了完整左侧类型，则以左侧声明类型为准。左侧类型可以表达每个类型层级的可变性，例如 `Int![3]!` 表示元素层是 `Int!`，外层数组值也是可变层。初始化器只负责提供值，不能反过来改变左侧声明出来的分层可变性。
 
-类型推导场景不同：如果左侧没有写出完整类型结构，只能对推导结果的最外层追加可变性。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 record 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
+类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 record 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
 
 解构语法可以为每个解构出来的绑定重新指定可变性，因为解构本质上是在声明多个局部绑定。但这种可变性也只作用于对应元素类型的最外层，不能深入修改该元素类型的内部层级：
 
@@ -181,18 +204,65 @@ user.id = 2;   // 编译错误：id 字段自身不可变
 
 ## 指针、引用、数组和 Slice
 
-现阶段先不引入完整 ownership/borrow 系统。指针语义先按以下规则固定：
+现阶段先不引入完整 borrow checker，但先固定 pointer/reference 的目标语义：
 
-- `T*`：自动解引用的单对象指针，通常来自 `new T(...)`。
+- `T^`：owning heap pointer，通常来自 `new T(...)`，拥有堆上对象；它不是 C 风格 raw pointer。
 - `T&`：临时引用，不表达释放职责。
-- `T[*]`：many pointer，可下标访问。
+- `RawPointer<T>`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
+- `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
 - `T[]`：slice，是 `{ ptr, len }` 形态的视图值，不表达所有权。
 
-使用 `T*` 时默认访问其元素。要操作指针本身，使用隐式操作层：
+`^` 和 `&` 会创建新的 pointer/reference 外层。一个完整源码类型中最多只能出现一个 pointer/reference 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。归一化阶段如果因为泛型替换得到重复同类 handle，可以合并；如果得到 `^` 与 `&` 混合的 handle 层，必须保留错误状态并报告 diagnostic。
+
+`T^` 和 `T&` 在普通值上下文中默认自动解引用。只有 expected type 本身就是同一个 pointer/reference 类型时，表达式才保留 pointer/reference 层：
 
 ```jiang
-Int* value = new Int(42);
+Int^ foo();
+
+Int^ a = foo();      // expected type 是 Int^，保留 owning pointer
+_ b = foo();         // 推导上下文保留自然类型，b: Int^
+Int c = foo();       // expected type 是 Int，自动解引用
+_ d = foo() + 123;   // 算术上下文，自动解引用为 Int
+
+Int&! ref = value$.ref();
+_ copied = ref;      // 推导上下文保留 reference，copied: Int&
+_! mutable = ref;    // mutable: Int&!
+Int copied_value = ref; // expected type 是 Int，自动解引用
+Int& kept = ref;     // expected type 是 Int&，保留 reference
+_ raw_ref = ref$.ref(); // '$' 阻止自动解引用，raw_ref: Int&
+```
+
+Jiang 没有前缀手动解引用语法，`*foo()` 这类写法不成立。需要显式取出 `T^` / `T&` 指向的值时，使用隐式操作层的 `value$.get()`：
+
+```jiang
+Int& ref = value$.ref();
+Int copied = ref$.get();
+```
+
+`$` 会阻止自动解引用，并进入隐式操作层。`$.ref()` 和 `$.ptr()` 分别投影到语言引用和裸指针：
+
+```jiang
+Int^ value = new Int(42);
+
+_ ref = value$.ref(); // ref: Int&
+_ ptr = value$.ptr(); // ptr: RawPointer<Int>
 value$.free();
+
+Int sum = value + 100;        // 允许：value 自动解引用为 Int
+Int bad = value$.ref() + 100; // 错误：Int& 不会在结果位置继续自动解引用
+```
+
+`T[*]` many pointer 不参与默认自动解引用。它表示一段可按元素索引的连续地址，必须通过下标表达式取元素：
+
+```jiang
+Int[*] ptr;
+
+_ raw = ptr;    // raw: Int[*]
+Int value = ptr[0];
+ptr[1] = 42;
+
+_ item_ref = ptr[1]$.ref(); // item_ref: Int&
+_ item_ptr = ptr[1]$.ptr(); // item_ptr: RawPointer<Int>
 ```
 
 数组长度是类型的一部分；slice 长度是运行时值。
@@ -204,8 +274,9 @@ value$.free();
 已确定操作：
 
 - `value$.as(Type)`：强制类型转换，不保证类型安全。
-- `value$.ref()`：获取临时引用。
-- `value$.ptr()`：获取裸指针。
+- `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
+- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `RawPointer<T>`。
+- `value$.get()`：显式解引用 `T^` / `T&`，返回指向的值；`T[*]` many pointer 必须使用下标访问。
 - `value$.addr()`：获取地址值。
 - `value$.free()`：释放默认堆分配器上的对象。
 - `optional$.some()`：强制解包 optional。
@@ -408,9 +479,9 @@ Optional 使用 `T?` 表示。
 
 `?` 是语言内建 optional 类型层，不暴露为可直接命名的 `Option<T>` 普通泛型类型。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
 
-重复 optional 标记是语法错误。编译器恢复时可以把 `T??` 当作 `T?` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `!` 也要报错，例如 `T?!?`。
+重复 optional 标记是语法错误。编译器恢复时可以把 `T??` 当作 `T?` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `!` 也要报错，例如 `T?!?`。`!` 与 `?` 一样属于当前类型层级的 type flag，`Int?!` 表示 optional 层本身可变。
 
-这个规则只针对源码中直接写出的 type flag。类型归一化阶段如果因为泛型替换得到重复 optional，`?` 是幂等的：
+这个规则只针对源码中直接写出的 type flag。类型归一化阶段如果因为泛型替换得到重复 optional，`?` 按幂等规则合并：
 
 ```jiang
 // 假设 T 实例化为 Int?
@@ -633,7 +704,7 @@ resolver/type checker 开始前，需要先明确这些模型：
 - 决定 `record`、init/deinit 的正式语法和 stage1 对齐策略。
 - 完善 `public import` 的 ambiguous re-export 和跨 package visibility 规则。
 - 决定 null-check narrowing、errorable `T@E` 与 `try/catch` 的精确规则。
-- 决定 `T*` / `T&` 在 semantic type 中是否分离，以及 auto-deref 的精确规则。
+- 实现 `T^` / `T&` 的单 handle 层限制、expected-type auto-deref 和 `$` 隐式层规则。
 
 ### P1：Source / Diagnostic
 

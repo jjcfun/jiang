@@ -56,10 +56,10 @@ Int?[2][3] b = [[1, null], [3, 4], [5, 6]]
 
 Int?[2]?[3] c = [[1, null], null, [5, 6]]
 
-// 指针同理
-Int[3]* b = new [1, 2, 3]
+// owning heap pointer 同理
+Int[3]^ b = new [1, 2, 3]
 
-Int?[3]* c = new [1, null, 3]
+Int?[3]^ c = new [1, null, 3]
 ```
 
 ### 可变性
@@ -79,7 +79,7 @@ mutable_items[0] = 10;
 mutable_items = [4, 5, 6];
 ```
 
-如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导场景只能修改推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 record 字段等内部层级的可变性。
+如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导默认得到不可变绑定；需要可变绑定时显式写 `_!` 或写出带 `!` 的左侧类型。类型推导会保留表达式的自然类型，不自动解引用 `T^` / `T&`；需要值类型时写出 expected type。类型推导只能影响推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 record 字段等内部层级的可变性。
 
 结构体、record、tuple、union 和数组的内部成员是否可修改，由成员类型自己的可变性决定，不由外层变量是否带 `!` 决定。
 
@@ -218,7 +218,7 @@ defer {
 Jiang 语言把安全转换和低层强制转换分开：
 
 - `Type(value)`：安全转换或初始化，由目标类型的 `init` 规则决定。
-- `value$.as(Type)`：强制转换，不保证类型安全，主要用于底层实现、指针转换或能力受控的场景。
+- `value$.as(Type)`：强制转换，不保证类型安全，主要用于底层实现、裸指针转换或能力受控的场景。
 
 这里的 `$` 符号表示**进入隐式操作层**。可以把它理解成：对一个值或一个类型，切换到它的“隐式层 / 元层”再进行操作。
 
@@ -235,14 +235,15 @@ Jiang 语言把安全转换和低层强制转换分开：
 例如：
 
 - `a$.as(Int)`：对值 `a` 做低层强制转换
-- `a$.ref()`：从值 `a` 获取一个临时引用
-- `a$.ptr()`：从值 `a` 获取一个裸指针
+- `a$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`
+- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `RawPointer<T>`
+- `a$.get()`：显式解引用 `T^` / `T&`，返回指向的值
 - `a$.addr()`：获取值 `a` 的地址值
 - `a$.free()`：对 `a` 做释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.align()`：获取类型 `Int` 的 ABI 对齐
 - `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
-- `Int$.alloc()`：分配一个未初始化的 `Int*`
+- `Int$.alloc()`：分配一个未初始化的 `Int^`
 - `Int$.alloc_array(10)`：分配一个长度为 `10` 的 `Int[*]`
 
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
@@ -284,10 +285,10 @@ UInt8 small_val = UInt8(val);
 `as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换：
 
 ```c
-// 注意：某些危险的转换（如指针强转）需要对应 capability
+// 注意：某些危险的转换（如裸指针强转）需要对应 capability
 Int addr = 0x12345678;
 sudo {
-    Int* ptr = addr$.as(Int*);
+    RawPointer<Int> ptr = addr$.as(RawPointer<Int>);
 }
 ```
 
@@ -305,10 +306,10 @@ Int[3] a = [1, 2, 3] // a: [1, 2, 3]
 // 初始化数组时，如果元素个数与数组长度不想等，将会报编译错误
 Int[5] a = [1, 2, 3]
 
-// 在堆上创建数组，并返回数组指针
-Int[3]* x = new [1, 2, 3]
+// 在堆上创建数组，并返回 owning pointer
+Int[3]^ x = new [1, 2, 3]
 
-// 通过length属性，可以获取到数组的长度（注意，Jiang语言中，指针是自动解引用的）
+// 通过length属性，可以获取到数组的长度（注意，Jiang语言中，owning pointer 默认自动解引用）
 print("array %d", x.length)
 ```
 
@@ -354,7 +355,7 @@ d[1] = 4 // d: [1, 4, 3]
 d = [4, 5, 6] // d: [4, 5, 6]
 
 // 数组在堆上创建
-Int[_]*! e = new [1, 2, 3]
+Int[_]^! e = new [1, 2, 3]
 // 这里，变量赋值的时候会在堆上分配内存
 e = new [4, 5, 6]
 ```
@@ -373,47 +374,52 @@ foo[0][1] // 2
 
 ```
 
-### 指针（Pointer）
+### 指针与引用
 
 现阶段，Jiang 语言先不引入所有权和借用系统，也不区分多种 allocator。运行时只有默认堆分配器。
 在此基础上，指针语义先约定为：
 
-- `T*`：自动解引用的单对象指针，适合 `new T` 这类场景
-- `T[*]`：可按下标访问和按元素偏移的 many-pointer
-- `T&`：临时指针，通常用于引用已有值，不承担释放职责
+- `T^`：自动解引用的 owning heap pointer，适合 `new T` 这类场景；它不是 C 风格 raw pointer
+- `T&`：自动解引用的临时引用，通常用于引用已有值，不承担释放职责
+- `RawPointer<T>`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
+- `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
 
 后续如果语言正式引入所有权、借用或多 allocator，这里的规则再进一步细化。
 
-#### 指针类型
+#### Pointer / Reference 类型
 
-指针类型也遵循 **从左往右，从里到外** 的原则
+Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 表示 owning heap pointer 外层，`&` 表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
 
 ```c
 // 在栈中开辟内存空间
 Int a = 123;
 
-// new关键字可以在堆中开辟内存空间，并返回一个指针
-Int* b = new Int(123);
+// new关键字可以在堆中开辟内存空间，并返回一个 owning heap pointer
+Int^ b = new Int(123);
 
-// 在堆中创建数组，并返回一个数组指针
-Int[3]* c = new [1, 2, 3];
+// 在堆中创建数组，并返回一个 owning heap pointer
+Int[3]^ c = new [1, 2, 3];
 
 // 临时引用
 Int& d = a$.ref();
 
+Int!^? maybe_owner; // optional owning pointer to mutable Int
+Int?& maybe_ref;    // reference to optional Int
+Int^! owner_slot;   // owning pointer 绑定本身可变
+
 ```
 
-指针类型的 `*` 与 `&` 都紧跟在元素类型后面，不能存在空格
+`^` 与 `&` 都紧跟在元素类型后面，不能存在空格
 
 ```c
 // Bad
-Int * a;
+Int ^ a;
 
 // Bad
-Int *a;
+Int ^a;
 
 // Good
-Int* a;
+Int^ a;
 
 // Bad
 Int & b;
@@ -424,35 +430,53 @@ Int& b;
 
 #### 自动解引用
 
-使用指针时，除非明确使用`$`操作符表示指针本身，否则将自动解引用，使用指针与使用其元素无异。
-特别说明一下，Jiang语言并不追求一切皆显式，并提供了一种类似代理（Proxy）的特性，可以将一些实现细节放在代理内部，并对使用者透明。就比如指针类型，就是一种拥有代理特性的类型。使用指针时，与直接使用指针的元素无异。此时，指针这个概念对使用者来说是透明的。而 `$` 操作符则是进入隐式操作层，通过类似 `ptr$.free()` 的语法，就可以调用指针本身的一些方法。
-所以，Jiang语言的理念就是：对于用户，不需要关心冰箱的制冷原理；对于维修者，又提供了螺丝刀，允许拆开冰箱看看内部结构
+使用 `T^` 或 `T&` 时默认自动解引用，除非 expected type 本身与 pointer/reference 类型一致。`T^` 是 owning heap pointer，不是 C 风格 raw pointer。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；需要显式解引用时使用 `ptr$.get()`。
+
+类型推导会保留 pointer/reference 层，并默认得到不可变绑定；写出 expected type 才会触发自动解引用：
+
+```c
+Int&! ref = value$.ref();
+
+_ copied = ref;      // copied: Int&
+_! mutable = ref;    // mutable: Int&!
+Int copied_value = ref; // expected type 是 Int，自动解引用
+Int& kept = ref;     // expected type 是 Int&，保留 reference
+_ raw_ref = ref$.ref(); // raw_ref: Int&
+Int explicit_value = ref$.get(); // 显式解引用
+```
+
+`$` 操作符会阻止自动解引用，并进入隐式操作层。通过类似 `ptr$.free()`、`ptr$.ref()`、`ptr$.ptr()` 的语法，可以调用 pointer/reference 自身的一些低层操作。
 
 ```c
 Int a = 100;
 
-Int* b = new Int(200);
+Int^ b = new Int(200);
 
-// 指针默认自动解引用，b直接表示了其元素的值
+// owning pointer 默认自动解引用，b 直接表示其元素的值
 Int c = a + b;
 
 print("c = %d", c); // 输出： c = 300
 
-// '$'符号用于进入b的隐式操作层，此时可以调用指针本身的一些方法
+// '$' 符号阻止自动解引用，并进入 b 的隐式操作层
 b$.free();
 ```
 
-这里没有单独的显式解引用语法，`*ptr` 这种写法不成立。`T*` 表示自动解引用的单对象指针：要使用指针元素，直接写 `ptr` 即可；要操作指针本身，则使用隐式层语法，例如 `ptr$.free()`。如果需要按下标访问，则使用 `T[*]` many-pointer。
+`$.ref()` 和 `$.ptr()` 的返回类型固定为 `T&` 和 `RawPointer<T>`：
 
 ```c
-Int! value = 41;
-Int!* p = value$.ptr();
+Int^ p = new Int(41);
 
-// 读取指针元素
-Int x = p;
+_ ref = p$.ref(); // ref: Int&
+_ raw = p$.ptr(); // raw: RawPointer<Int>
 
-// 修改指针元素
-p = p + 1;
+// 普通值上下文会自动解引用
+Int x = p + 1;
+
+// 进入隐式层后返回的引用不会再次自动解引用
+Int bad = p$.ref() + 1; // 编译错误
+
+// 显式解引用
+Int explicit = p$.get();
 
 Int[1] items = [41];
 Int[*] raw = items[0]$.as(Int[*]);
@@ -461,17 +485,30 @@ Int[*] raw = items[0]$.as(Int[*]);
 Int y = raw[0];
 ```
 
+`T[*]` many-pointer 不参与默认自动解引用。它表示一段可按元素索引的连续地址，必须通过下标表达式取元素：
+
+```c
+Int[*] ptr = items[0]$.as(Int[*]);
+
+_ raw = ptr;    // raw: Int[*]
+Int value = ptr[0];
+ptr[1] = 42;
+
+_ item_ref = ptr[1]$.ref(); // item_ref: Int&
+_ item_ptr = ptr[1]$.ptr(); // item_ptr: RawPointer<Int>
+```
+
 `T[*]` many-pointer 支持下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
 
 除数组、slice、many-pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]` 语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
 
-当前版本里，Jiang 只约定 `*` 指针可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 指针只是临时指针，不参与释放。
+当前版本里，Jiang 只约定 `^` owning pointer 可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 引用只是临时引用，不参与释放。
 
 ```c
-// 定义一个指针a，指向堆内存
-Int* a = new Int(100);
+// 定义一个 owning pointer，指向堆内存
+Int^ a = new Int(100);
 
-// 可以主动释放指针的内存空间
+// 可以主动释放 owning pointer 管理的内存空间
 a$.free();
 ```
 
@@ -1253,7 +1290,7 @@ struct Point {
 ```c
 Point p1 = Point(1, 2);
 Point p2 = Point(3);
-Point* p3 = new Point(4, 5);
+Point^ p3 = new Point(4, 5);
 ```
 
 #### deinit函数
@@ -1268,7 +1305,7 @@ struct 还可以定义 `deinit` 函数。
 - `deinit` 只允许 `return;` / `return ();`
 - `deinit` 不允许 `public` / `static` 等可见性或静态修饰
 - `deinit` 不作为普通方法暴露给外部调用
-- 对结构体指针执行 `ptr$.free()` 时，如果该结构体定义了 `deinit`，则会先触发 `deinit`，再释放对象自身内存
+- 对结构体 owning pointer 执行 `ptr$.free()` 时，如果该结构体定义了 `deinit`，则会先触发 `deinit`，再释放对象自身内存
 
 ```c
 struct List {
@@ -1375,10 +1412,10 @@ Point p1 = Point { x: 0, y: 0 }
 // p1赋值给p2是值拷贝
 Point p2 = p1
 
-// p3为指针，此时为引用类型
-Point* p3 = new Point { x: 100, y: 200 }
+// p3为 owning pointer，此时为引用类型
+Point^ p3 = new Point { x: 100, y: 200 }
 
-// 由于Jiang语言的指针自动解引用，此时的p3被当成值
+// 由于Jiang语言的 owning pointer 默认自动解引用，此时的p3被当成值
 print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 输出：p3.x = 100, p3.y = 200
 ```
 
@@ -1580,9 +1617,10 @@ union MyUnion {
 - array
 - slice
 - `Fn<...>`
+- `T^`
 - `T&`
-- `T*`
 - `T[*]`
+- `RawPointer<T>`
 - optional
 - 其他 `union` / `enum`
 
@@ -2162,20 +2200,11 @@ alias x = a + b;
 
 ### FFI
 
-传给 C 风格 API 的字符串指针当前使用 `UInt8*` 表示。字符串字面量在 `UInt8*` 上下文中会自动生成以 `\0` 结尾的只读全局数据。若需要 owning 包装类型，可通过 `import std;` 使用 `std.ffi.CString`。标准库 package 的统一入口是 `std/std.jiang`。
-
-`ffi.CString` 显式声明了 `FromStringLiteral`，因此可以直接写：
-
-```c
-import std;
-
-std.ffi.CString text = "hello";
-puts(text.bytes[0]$.ptr());
-```
+传给 C 风格 API 的字符串指针当前使用 `UInt8[*]` 表示。字符串字面量在 `UInt8[*]` 上下文中会自动生成以 `\0` 结尾的只读全局数据。
 
 ```c
 extern {
-  public Int open(UInt8* path, Int options);
+  public Int open(UInt8[*] path, Int options);
   public Int write(Int fd, UInt8[] buf, Int count);
   public Int errno;
 }
@@ -2185,6 +2214,6 @@ extern {
 也支持单条声明：
 
 ```c
-extern public Int puts(UInt8* text);
+extern public Int puts(UInt8[*] text);
 public extern Int errno;
 ```
