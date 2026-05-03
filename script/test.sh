@@ -363,7 +363,6 @@ run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
 run_sample mutable_generic_minimal.jiang 42
-run_sample maybe_mutable_generic_minimal.jiang 42
 run_sample type_modifier_canonical_minimal.jiang 7
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
@@ -539,7 +538,6 @@ run_compile_fail invalid_double_to_float_assign_minimal.jiang
 run_compile_fail invalid_float_to_int_assign_minimal.jiang
 run_compile_fail invalid_as_target_mutable_type.jiang
 run_compile_fail invalid_as_target_mutable_type_from_mutable_source.jiang
-run_compile_fail invalid_generic_mutable_type_arg.jiang
 run_compile_fail invalid_mutable_generic_requires_mutable.jiang
 run_compile_fail invalid_uint8_double_add_minimal.jiang
 run_compile_fail invalid_index_target.jiang

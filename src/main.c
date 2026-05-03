@@ -3190,7 +3190,6 @@ typedef enum BuiltinConceptCapability {
     BUILTIN_CONCEPT_EQUATABLE = 1 << 1,
     BUILTIN_CONCEPT_HASHABLE = 1 << 2,
     BUILTIN_CONCEPT_MUTABLE = 1 << 3,
-    BUILTIN_CONCEPT_MAYBE_MUTABLE = 1 << 4,
 } BuiltinConceptCapability;
 
 static uint32_t ast_type_builtin_capabilities(const AstProgram* program, const AstType* type) {
@@ -3251,7 +3250,6 @@ static uint32_t builtin_concept_flag_for_name(const char* concept_name) {
     if (strcmp(concept_name, "Equatable") == 0) return BUILTIN_CONCEPT_EQUATABLE;
     if (strcmp(concept_name, "Hashable") == 0) return BUILTIN_CONCEPT_HASHABLE;
     if (strcmp(concept_name, "Mutable") == 0) return BUILTIN_CONCEPT_MUTABLE;
-    if (strcmp(concept_name, "MaybeMutable") == 0) return BUILTIN_CONCEPT_MAYBE_MUTABLE;
     return BUILTIN_CONCEPT_NONE;
 }
 
@@ -3263,7 +3261,6 @@ static int concept_exists(const AstProgram* program, const char* concept_name) {
 static int ast_type_has_builtin_concept(const AstProgram* program, const AstType* type, const char* concept_name) {
     uint32_t required = builtin_concept_flag_for_name(concept_name);
     if (required == BUILTIN_CONCEPT_MUTABLE) return type && type->mutable_flag;
-    if (required == BUILTIN_CONCEPT_MAYBE_MUTABLE) return 1;
     if (required == BUILTIN_CONCEPT_NONE) return 0;
     return (ast_type_builtin_capabilities(program, type) & required) != 0;
 }
@@ -3703,7 +3700,7 @@ static int type_has_builtin_concept_methods(const AstProgram* program, const Ast
         return type_has_concept_methods(program, type, &synthetic);
     }
 
-    if (strcmp(concept_name, "Mutable") == 0 || strcmp(concept_name, "MaybeMutable") == 0) {
+    if (strcmp(concept_name, "Mutable") == 0) {
         return 1;
     }
 
@@ -3813,9 +3810,6 @@ static int ast_type_satisfies_concept(const AstProgram* program, const AstType* 
     const AstConceptDecl* concept = find_ast_concept(program, concept_name);
     AstTypeQueryRef query = describe_ast_type(program, type);
     if (builtin_concept_flag_for_name(concept_name) != BUILTIN_CONCEPT_NONE) {
-        if (strcmp(concept_name, "MaybeMutable") == 0) {
-            return 1;
-        }
         if (strcmp(concept_name, "Mutable") == 0) {
             return type && type->mutable_flag;
         }
@@ -3879,7 +3873,6 @@ static int function_type_param_exists(const AstProgram* program, const AstFuncti
 typedef enum GenericMutabilityPolicy {
     GENERIC_MUTABILITY_IMMUTABLE = 0,
     GENERIC_MUTABILITY_MUTABLE,
-    GENERIC_MUTABILITY_MAYBE_MUTABLE,
 } GenericMutabilityPolicy;
 
 static GenericMutabilityPolicy generic_mutability_policy(const AstWhereConstraintList* where_constraints, const char* param_name) {
@@ -3893,9 +3886,6 @@ static GenericMutabilityPolicy generic_mutability_policy(const AstWhereConstrain
         }
         if (strcmp(where_constraints->items[i].concept_name, "Mutable") == 0) {
             return GENERIC_MUTABILITY_MUTABLE;
-        }
-        if (strcmp(where_constraints->items[i].concept_name, "MaybeMutable") == 0) {
-            return GENERIC_MUTABILITY_MAYBE_MUTABLE;
         }
     }
     return GENERIC_MUTABILITY_IMMUTABLE;
@@ -3914,10 +3904,6 @@ static int check_generic_mutability_constraints(const AstNameList* type_params,
             return 0;
         }
         if (policy == GENERIC_MUTABILITY_MUTABLE && !actual->mutable_flag) {
-            *error = "generic type does not satisfy trait";
-            return 0;
-        }
-        if (policy == GENERIC_MUTABILITY_IMMUTABLE && actual->mutable_flag) {
             *error = "generic type does not satisfy trait";
             return 0;
         }
