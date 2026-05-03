@@ -202,6 +202,8 @@ run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
 run_sample normal_import_reexport_minimal.jiang 42
 run_compile_fail invalid_normal_import_reexport_namespace.jiang
+run_sample normal_import_public_signature_minimal.jiang 42
+run_compile_fail invalid_normal_import_public_signature_missing_import.jiang
 run_sample fn_pointer_minimal.jiang 7
 run_sample fn_pointer_comprehensive_minimal.jiang 83
 run_sample fn_pointer_infer_minimal.jiang 3

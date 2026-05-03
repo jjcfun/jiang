@@ -677,26 +677,11 @@ static char* remap_value_name(const AstProgram* program, const char* prefix, int
     if (!name) {
         return 0;
     }
-    if (hide_private && strchr(name, '.')) {
-        char* private_import_name = remap_private_import_qualified_name(program, name);
-        if (private_import_name) {
-            return private_import_name;
-        }
-    }
     if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
         return dup_text(name);
     }
     if (prefix && program_has_any_value(program, name)) {
-        if (program_value_is_public(program, name)) {
-            return dup_join3(prefix, ".", name);
-        }
-        if (hide_private) {
-            return dup_join3(prefix, ".#", name);
-        }
-        return dup_text(name);
-    }
-    if (hide_private && program_has_any_value(program, name) && !program_value_is_public(program, name)) {
-        return dup_join3("#", "", name);
+        return dup_join3(prefix, ".", name);
     }
     return dup_text(name);
 }
@@ -705,12 +690,6 @@ static char* remap_exported_name(const AstProgram* program, const char* prefix, 
     if (!name) {
         return 0;
     }
-    if (hide_private && strchr(name, '.')) {
-        char* private_import_name = remap_private_import_qualified_name(program, name);
-        if (private_import_name) {
-            return private_import_name;
-        }
-    }
     if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
         return dup_text(name);
     }
@@ -718,16 +697,7 @@ static char* remap_exported_name(const AstProgram* program, const char* prefix, 
         return remap_value_name(program, prefix, hide_private, name);
     }
     if (prefix && program_has_any_type(program, name)) {
-        if (program_type_is_public(program, name)) {
-            return dup_join3(prefix, ".", name);
-        }
-        if (hide_private) {
-            return dup_join3(prefix, ".#", name);
-        }
-        return dup_text(name);
-    }
-    if (hide_private && program_has_any_type(program, name) && !program_type_is_public(program, name)) {
-        return dup_join3("#", "", name);
+        return dup_join3(prefix, ".", name);
     }
     return dup_text(name);
 }
@@ -736,26 +706,11 @@ static char* remap_imported_type_decl_name(const AstProgram* program, const char
     if (!name) {
         return 0;
     }
-    if (hide_private && strchr(name, '.')) {
-        char* private_import_name = remap_private_import_qualified_name(program, name);
-        if (private_import_name) {
-            return private_import_name;
-        }
-    }
     if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
         return dup_text(name);
     }
     if (prefix && program_has_any_type(program, name)) {
-        if (program_type_is_public(program, name)) {
-            return dup_join3(prefix, ".", name);
-        }
-        if (hide_private) {
-            return dup_join3(prefix, ".#", name);
-        }
-        return dup_text(name);
-    }
-    if (hide_private && program_has_any_type(program, name) && !program_type_is_public(program, name)) {
-        return dup_join3("#", "", name);
+        return dup_join3(prefix, ".", name);
     }
     return dup_text(name);
 }
@@ -764,26 +719,11 @@ static char* remap_type_name(const AstProgram* program, const char* prefix, int 
     if (!name) {
         return 0;
     }
-    if (hide_private && strchr(name, '.')) {
-        char* private_import_name = remap_private_import_qualified_name(program, name);
-        if (private_import_name) {
-            return private_import_name;
-        }
-    }
     if (prefix && strchr(name, '.') && !program_exports_namespace(program, name)) {
         return dup_text(name);
     }
     if (prefix && program_has_any_type(program, name)) {
-        if (program_type_is_public(program, name)) {
-            return dup_join3(prefix, ".", name);
-        }
-        if (hide_private) {
-            return dup_join3(prefix, ".#", name);
-        }
-        return dup_text(name);
-    }
-    if (hide_private && program_has_any_type(program, name) && !program_type_is_public(program, name)) {
-        return dup_join3("#", "", name);
+        return dup_join3(prefix, ".", name);
     }
     return dup_text(name);
 }
@@ -1986,18 +1926,28 @@ static int apply_aliases(AstProgram* dest, const AstProgram* own_program, const 
     return 1;
 }
 
-static void append_hidden_implementation_decls(AstProgram* dest, const AstProgram* source) {
+static void append_private_implementation_decls(AstProgram* dest, const AstProgram* source, const char* prefix) {
     int i = 0;
     for (i = 0; i < source->globals.count; ++i) {
         const AstGlobal* global = &source->globals.items[i];
-        if (is_hidden_implementation_name(global->name) && !find_ast_global(dest, global->name)) {
-            global_list_push(&dest->globals, clone_global(source, 0, 0, global, 0));
+        AstGlobal cloned;
+        if (global->public_flag) {
+            continue;
+        }
+        cloned = clone_global(source, prefix, 1, global, 0);
+        if (!find_ast_global(dest, cloned.name)) {
+            global_list_push(&dest->globals, cloned);
         }
     }
     for (i = 0; i < source->functions.count; ++i) {
         const AstFunction* fn = &source->functions.items[i];
-        if (is_hidden_implementation_name(fn->name) && !find_ast_function(dest, fn->name)) {
-            function_list_push(&dest->functions, clone_function(source, 0, 0, fn, 0));
+        AstFunction cloned;
+        if (fn->public_flag) {
+            continue;
+        }
+        cloned = clone_function(source, prefix, 1, fn, 0);
+        if (!find_ast_function(dest, cloned.name)) {
+            function_list_push(&dest->functions, cloned);
         }
     }
 }
@@ -2017,12 +1967,12 @@ static int apply_public_aliases(AstProgram* dest, const AstProgram* lookup_progr
         global = find_ast_public_global(lookup_program, alias->target_name);
         nominal = find_ast_public_nominal_decl(lookup_program, alias->target_name);
         if (fn) {
-            append_hidden_implementation_decls(dest, lookup_program);
+            append_private_implementation_decls(dest, lookup_program, 0);
             function_list_push(&dest->functions, clone_function_as(dest, fn, alias->name, 1));
             continue;
         }
         if (global) {
-            append_hidden_implementation_decls(dest, lookup_program);
+            append_private_implementation_decls(dest, lookup_program, 0);
             global_list_push(&dest->globals, clone_global_as(dest, global, alias->name, 1));
             continue;
         }
@@ -2637,33 +2587,45 @@ static int ast_program_has_function_signature(const AstProgram* program, const A
     return 0;
 }
 
-static void merge_public_import(AstProgram* dest, const AstProgram* imported, const char* prefix) {
+static void merge_public_import(AstProgram* dest, const AstProgram* imported, const char* prefix, int include_private_impl) {
     int i = 0;
     for (i = 0; i < imported->concepts.count; ++i) {
+        if (!include_private_impl && !imported->concepts.items[i].public_flag) {
+            continue;
+        }
         if (!find_ast_concept(dest, imported->concepts.items[i].name)) {
             concept_list_push(&dest->concepts, clone_concept_decl(imported, prefix, 1, &imported->concepts.items[i], imported->concepts.items[i].public_flag));
         }
     }
     for (i = 0; i < imported->structs.count; ++i) {
+        if (!include_private_impl && !imported->structs.items[i].public_flag) {
+            continue;
+        }
         AstStructDecl decl = clone_struct_decl(imported, prefix, 1, &imported->structs.items[i], imported->structs.items[i].public_flag);
         if (!find_ast_struct(dest, decl.name)) {
             struct_list_push(&dest->structs, decl);
         }
     }
     for (i = 0; i < imported->enums.count; ++i) {
+        if (!include_private_impl && !imported->enums.items[i].public_flag) {
+            continue;
+        }
         AstEnumDecl decl = clone_enum_decl(imported, prefix, 1, &imported->enums.items[i], imported->enums.items[i].public_flag);
         if (!find_ast_enum(dest, decl.name)) {
             enum_list_push(&dest->enums, decl);
         }
     }
     for (i = 0; i < imported->unions.count; ++i) {
+        if (!include_private_impl && !imported->unions.items[i].public_flag) {
+            continue;
+        }
         AstUnionDecl decl = clone_union_decl(imported, prefix, 1, &imported->unions.items[i], imported->unions.items[i].public_flag);
         if (!find_ast_union(dest, decl.name)) {
             union_list_push(&dest->unions, decl);
         }
     }
     for (i = 0; i < imported->globals.count; ++i) {
-        if (imported->globals.items[i].public_flag ||
+        if (include_private_impl || imported->globals.items[i].public_flag ||
             is_hidden_implementation_name(imported->globals.items[i].name)) {
             AstGlobal global = clone_global(imported, prefix, 1, &imported->globals.items[i], imported->globals.items[i].public_flag);
             if (!find_ast_global(dest, global.name)) {
@@ -2672,7 +2634,7 @@ static void merge_public_import(AstProgram* dest, const AstProgram* imported, co
         }
     }
     for (i = 0; i < imported->functions.count; ++i) {
-        int keep = imported->functions.items[i].public_flag;
+        int keep = include_private_impl || imported->functions.items[i].public_flag;
         int exported_public_flag = imported->functions.items[i].public_flag;
         if (!keep && imported->functions.items[i].method_flag && imported->functions.items[i].owner_type_name) {
             AstNominalDeclRef owner = find_ast_nominal_decl(imported, imported->functions.items[i].owner_type_name);
@@ -2928,32 +2890,19 @@ static int build_loaded_module(LoadedModule* module, int inject_prelude, LoadedM
     memset(&module->full_program, 0, sizeof(module->full_program));
     memset(&module->export_program, 0, sizeof(module->export_program));
     if (inject_prelude && prelude_module) {
-        merge_public_import(&module->full_program, &prelude_module->export_program, 0);
+        merge_public_import(&module->full_program, &prelude_module->export_program, 0, 1);
     }
     for (i = 0; i < module->imports.count; ++i) {
-        merge_public_import(&module->full_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
+        merge_public_import(&module->full_program, &module->imports.items[i].module->export_program, module->imports.items[i].name, 1);
         if (module->imports.items[i].public_flag) {
             AstImportDecl exported_import;
             memset(&exported_import, 0, sizeof(exported_import));
-            merge_public_import(&module->export_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
+            merge_public_import(&module->export_program, &module->imports.items[i].module->export_program, module->imports.items[i].name, 0);
+            append_private_implementation_decls(&module->export_program, &module->imports.items[i].module->export_program, module->imports.items[i].name);
             exported_import.alias_name = module->imports.items[i].name;
             exported_import.path = module->imports.items[i].name;
             exported_import.public_flag = 1;
             import_list_push(&module->export_program.imports, exported_import);
-        } else {
-            AstImportDecl private_import;
-            char* hidden_import_name = dup_join3("#", "", module->imports.items[i].name);
-            if (!hidden_import_name) {
-                *error = "out of memory";
-                return 0;
-            }
-            merge_public_import(&module->export_program, &module->imports.items[i].module->export_program, hidden_import_name);
-            memset(&private_import, 0, sizeof(private_import));
-            private_import.alias_name = module->imports.items[i].name;
-            private_import.path = module->imports.items[i].name;
-            private_import.public_flag = 0;
-            import_list_push(&module->export_program.imports, private_import);
-            free(hidden_import_name);
         }
     }
     append_own_decls(&module->full_program, &module->own_program);
