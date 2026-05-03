@@ -200,8 +200,6 @@ user.id = 2;   // 编译错误：id 字段自身不可变
 
 数组、tuple、union、record 也遵循同一条分层规则：外层变量的可变性只控制外层绑定；成员或元素能否被修改，由成员或元素类型自己的可变性决定。
 
-编译器内部泛型约束中，`MaybeMutable` 用于表示类型参数可能带可变性。
-
 ## 指针、引用、数组和 Slice
 
 现阶段先不引入完整 borrow checker，但先固定 pointer/reference 的目标语义：

@@ -1695,11 +1695,10 @@ Foo<Float> y = Foo<Float> { value: 3.14 };
 _ z = Foo<Float> { value: 3.14 };
 ```
 
-泛型参数的顶层 `!` 可变性约束有三种模式：
+泛型参数的顶层 `!` 可变性约束当前只有显式 `Mutable` 模式：
 
 - 默认不写约束时，泛型参数只接受**不带**顶层 `!` 的实参
 - `@where(T: Mutable)` 表示该泛型参数**必须**带顶层 `!`
-- `@where(T: MaybeMutable)` 表示该泛型参数可以带或不带顶层 `!`，并保留实例化后的实际可变性
 
 ```c
 @where(T: Mutable)
@@ -1707,27 +1706,19 @@ struct MutableBox<T> {
   T value;
 }
 
-@where(T: MaybeMutable)
-struct MaybeMutableBox<T> {
-  T value;
-}
-
 MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
-MaybeMutableBox<Int> b = MaybeMutableBox<Int> { value: 2 };
-MaybeMutableBox<Int!> c = MaybeMutableBox<Int!> { value: 3 };
 ```
 
 其中：
 
-- `Mutable` 和 `MaybeMutable` 是语言内建约束名
-- 它们由编译器识别，不是普通用户可实现的 trait
+- `Mutable` 是语言内建约束名
+- 它由编译器识别，不是普通用户可实现的 trait
 - 但表面语法仍然通过 `@where(T: ...)` 使用
 
 当前规则只看**顶层** `!`：
 
 - `Int` 不满足 `Mutable`
 - `Int!` 满足 `Mutable`
-- `MaybeMutable` 同时接受 `Int` 与 `Int!`
 
 ### Trait
 
