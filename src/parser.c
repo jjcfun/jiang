@@ -950,12 +950,8 @@ static AstType parse_type_postfix(Parser* parser, AstType type) {
             continue;
         }
         if (parser->current.kind == TOKEN_STAR) {
-            AstType pointee = type;
-            advance(parser);
-            memset(&type, 0, sizeof(type));
-            type.kind = AST_TYPE_POINTER;
-            type.array_item = heap_type_copy(&pointee);
-            continue;
+            fail(parser, "use '^' for owning pointer types; '*' is only valid in '[*]'");
+            return type;
         }
         if (parser->current.kind == TOKEN_CARET) {
             AstType pointee = type;

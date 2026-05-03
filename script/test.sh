@@ -177,6 +177,7 @@ run_sample pointer_minimal.jiang 42
 run_sample pointer_default_field_minimal.jiang 0
 run_sample pointer_expected_type_deref_minimal.jiang 63
 run_sample pointer_argument_expected_type_minimal.jiang 42
+run_compile_fail invalid_pointer_star_type.jiang
 run_compile_fail invalid_pointer_double_owner.jiang
 run_compile_fail invalid_pointer_owner_reference_combo.jiang
 run_compile_fail invalid_init_self_field_ptr_escape.jiang
@@ -353,9 +354,6 @@ run_compile_only extern_single_function_minimal.jiang
 run_compile_only extern_single_global_minimal.jiang
 run_compile_only extern_cstring_minimal.jiang
 run_compile_only cstring_local_minimal.jiang
-run_sample std_ffi_cstring_minimal.jiang 42
-run_executable_sample std_ffi_cstring_minimal.jiang 42
-run_compile_only std_ffi_cstring_extern_minimal.jiang
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42

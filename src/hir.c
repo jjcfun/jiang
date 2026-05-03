@@ -4742,7 +4742,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 return out;
             }
             if (expected_type &&
-                expected_type->kind == HIR_TYPE_POINTER &&
+                (expected_type->kind == HIR_TYPE_POINTER || expected_type->kind == HIR_TYPE_MANY_POINTER) &&
                 expected_type->array_item &&
                 expected_type->array_item->kind == HIR_TYPE_UINT8) {
                 out = new_expr(HIR_EXPR_CSTRING, expected_type, expr->line);
