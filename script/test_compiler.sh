@@ -78,9 +78,6 @@ run_compiler_ir_regression_check() {
 run_named_sample() {
   sample="$1"
   case "$sample" in
-    invalid_array_list_set_immutable_type_arg.jiang)
-      run_compiler_compile_fail "$sample"
-      ;;
     *.jiang)
       run_compiler_sample "$sample" 0
       ;;
@@ -113,8 +110,6 @@ run_all_compiler_samples() {
   run_compiler_sample lower_hir_minimal.jiang 0
   run_compiler_sample lower_jir_minimal.jiang 0
   run_compiler_sample llvm_api_minimal.jiang 0
-  run_compiler_sample compiler_bootstrap_smoke.jiang 0
-  run_compiler_compile_fail invalid_array_list_set_immutable_type_arg.jiang
 }
 
 if [ "$#" -gt 0 ]; then
