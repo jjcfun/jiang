@@ -1936,6 +1936,9 @@ static HirExpr* maybe_auto_deref_pointer_expr(HirExpr* expr, HirType* expected_t
     if (!expr || !expr->type || (expr->type->kind != HIR_TYPE_REFERENCE && expr->type->kind != HIR_TYPE_POINTER)) {
         return expr;
     }
+    if (expected_type && type_assignment_compatible(expr->type, expected_type)) {
+        return expr;
+    }
     deref = new_expr(HIR_EXPR_DEREF, expr->type->array_item, line);
     deref->as.unary.value = expr;
     return deref;
@@ -6629,6 +6632,7 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
             return out;
         }
         case AST_STMT_ASSIGN: {
+            HirExpr* preserved_target = 0;
             if (stmt->as.assign.target &&
                 stmt->as.assign.target->kind == AST_EXPR_INDEX) {
                 HirStmt* subscript_stmt = lower_subscriptable_set_stmt(ctx,
@@ -6642,10 +6646,39 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                     return 0;
                 }
             }
-            if (stmt->as.assign.target->kind == AST_EXPR_FIELD) {
-                out->as.assign.target = lower_expr_preserve_pointer(ctx, stmt->as.assign.target);
-            } else {
-                out->as.assign.target = lower_expr(ctx, stmt->as.assign.target);
+            preserved_target = lower_expr_preserve_pointer(ctx, stmt->as.assign.target);
+            if (!preserved_target) {
+                return 0;
+            }
+            if (preserved_target->type &&
+                (preserved_target->type->kind == HIR_TYPE_POINTER ||
+                 preserved_target->type->kind == HIR_TYPE_REFERENCE)) {
+                const char* saved_error = ctx->error;
+                int saved_error_line = ctx->error_line;
+                int saved_error_column = ctx->error_column;
+                HirExpr* pointer_value = 0;
+                ctx->error = 0;
+                ctx->error_line = 0;
+                ctx->error_column = 0;
+                pointer_value = lower_expr_expected(ctx, stmt->as.assign.value, preserved_target->type);
+                if (pointer_value) {
+                    pointer_value = maybe_decay_array_to_slice(ctx, pointer_value, preserved_target->type, stmt->line);
+                }
+                if (pointer_value && type_assignment_compatible(pointer_value->type, preserved_target->type)) {
+                    out->as.assign.target = preserved_target;
+                    out->as.assign.value = pointer_value;
+                } else {
+                    ctx->error = saved_error;
+                    ctx->error_line = saved_error_line;
+                    ctx->error_column = saved_error_column;
+                }
+            }
+            if (!out->as.assign.target) {
+                if (stmt->as.assign.target->kind == AST_EXPR_FIELD) {
+                    out->as.assign.target = preserved_target;
+                } else {
+                    out->as.assign.target = lower_expr(ctx, stmt->as.assign.target);
+                }
             }
             if (!out->as.assign.target) {
                 return 0;
@@ -6673,13 +6706,15 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 fail(ctx, "assignment target is immutable");
                 return 0;
             }
-            out->as.assign.value = lower_expr_expected(ctx, stmt->as.assign.value, out->as.assign.target->type);
             if (!out->as.assign.value) {
-                return 0;
-            }
-            out->as.assign.value = maybe_decay_array_to_slice(ctx, out->as.assign.value, out->as.assign.target->type, stmt->line);
-            if (!out->as.assign.value) {
-                return 0;
+                out->as.assign.value = lower_expr_expected(ctx, stmt->as.assign.value, out->as.assign.target->type);
+                if (!out->as.assign.value) {
+                    return 0;
+                }
+                out->as.assign.value = maybe_decay_array_to_slice(ctx, out->as.assign.value, out->as.assign.target->type, stmt->line);
+                if (!out->as.assign.value) {
+                    return 0;
+                }
             }
             if (!type_assignment_compatible(out->as.assign.value->type, out->as.assign.target->type)) {
                 fail(ctx, "assignment type mismatch");

@@ -175,6 +175,10 @@ run_sample mod_minimal.jiang 2
 run_sample uint8_slice_minimal.jiang 0
 run_sample pointer_minimal.jiang 42
 run_sample pointer_default_field_minimal.jiang 0
+run_sample pointer_expected_type_deref_minimal.jiang 63
+run_sample pointer_argument_expected_type_minimal.jiang 42
+run_compile_fail invalid_pointer_double_owner.jiang
+run_compile_fail invalid_pointer_owner_reference_combo.jiang
 run_compile_fail invalid_init_self_field_ptr_escape.jiang
 run_sample pointer_offset_uint8_minimal.jiang 101
 run_sample pointer_offset_int_minimal.jiang 42
@@ -540,7 +544,6 @@ run_compile_fail invalid_address_of_expr.jiang
 run_compile_fail invalid_deref_non_pointer.jiang
 run_compile_fail invalid_free_non_pointer.jiang
 run_compile_fail invalid_new_non_construct_expr.jiang
-run_compile_fail invalid_pointer_argument_requires_implicit_layer.jiang
 run_compile_fail invalid_pointer_offset_requires_many_pointer.jiang
 run_compile_fail invalid_many_pointer_assign_immutable.jiang
 run_compile_fail invalid_use_after_free.jiang

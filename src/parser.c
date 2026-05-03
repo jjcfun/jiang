@@ -371,6 +371,19 @@ static int parse_params(Parser* parser, AstParamList* params);
 static AstExpr* parse_implicit_member(Parser* parser, int line, AstExpr* value_target);
 static AstExpr* parse_type_implicit_expr(Parser* parser, int line);
 
+static int ast_type_has_pointer_or_reference(const AstType* type) {
+    if (!type) {
+        return 0;
+    }
+    if (type->kind == AST_TYPE_POINTER || type->kind == AST_TYPE_REFERENCE) {
+        return 1;
+    }
+    if (type->array_item && ast_type_has_pointer_or_reference(type->array_item)) {
+        return 1;
+    }
+    return 0;
+}
+
 static int ast_type_equals(const AstType* left, const AstType* right) {
     int i = 0;
     if (left->kind != right->kind || left->mutable_flag != right->mutable_flag) {
@@ -914,14 +927,22 @@ static int looks_like_var_decl(Parser* parser) {
 }
 
 static AstType parse_type_postfix(Parser* parser, AstType type) {
-    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_AMP || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION || parser->current.kind == TOKEN_AT) {
+    while (parser->current.kind == TOKEN_LEFT_BRACKET || parser->current.kind == TOKEN_BANG || parser->current.kind == TOKEN_AMP || parser->current.kind == TOKEN_CARET || parser->current.kind == TOKEN_STAR || parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION || parser->current.kind == TOKEN_AT) {
         if (parser->current.kind == TOKEN_BANG) {
+            if (type.mutable_flag) {
+                fail(parser, "duplicate mutable type marker");
+                return type;
+            }
             type.mutable_flag = 1;
             advance(parser);
             continue;
         }
         if (parser->current.kind == TOKEN_AMP) {
             AstType referent = type;
+            if (ast_type_has_pointer_or_reference(&referent)) {
+                fail(parser, "type cannot contain multiple pointer or reference layers");
+                return type;
+            }
             advance(parser);
             memset(&type, 0, sizeof(type));
             type.kind = AST_TYPE_REFERENCE;
@@ -936,11 +957,32 @@ static AstType parse_type_postfix(Parser* parser, AstType type) {
             type.array_item = heap_type_copy(&pointee);
             continue;
         }
-        if (parser->current.kind == TOKEN_QUESTION || parser->current.kind == TOKEN_QUESTION_QUESTION) {
+        if (parser->current.kind == TOKEN_CARET) {
+            AstType pointee = type;
+            if (ast_type_has_pointer_or_reference(&pointee)) {
+                fail(parser, "type cannot contain multiple pointer or reference layers");
+                return type;
+            }
+            advance(parser);
+            memset(&type, 0, sizeof(type));
+            type.kind = AST_TYPE_POINTER;
+            type.array_item = heap_type_copy(&pointee);
+            continue;
+        }
+        if (parser->current.kind == TOKEN_QUESTION_QUESTION) {
+            fail(parser, "duplicate optional type marker");
+            return type;
+        }
+        if (parser->current.kind == TOKEN_QUESTION) {
             AstType wrapped = type;
+            if (wrapped.mutable_flag) {
+                fail(parser, "optional marker must appear before mutable marker");
+                return type;
+            }
             advance(parser);
             if (wrapped.kind == AST_TYPE_OPTIONAL) {
-                type = wrapped;
+                fail(parser, "duplicate optional type marker");
+                return type;
             } else {
                 memset(&type, 0, sizeof(type));
                 type.kind = AST_TYPE_OPTIONAL;
