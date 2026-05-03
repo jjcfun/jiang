@@ -1899,36 +1899,27 @@ static int looks_like_optional_some_pattern(Parser* parser) {
         return 0;
     }
     return parser->next.kind == TOKEN_IDENT ||
-           parser->next.kind == TOKEN_BANG ||
+           parser->next.kind == TOKEN_LEFT_PAREN ||
            parser->next.kind == TOKEN_FAT_ARROW ||
            parser->next.kind == TOKEN_RIGHT_PAREN;
 }
 
 static AstExpr* parse_optional_some_pattern(Parser* parser) {
     AstExpr* expr = new_expr(AST_EXPR_VARIANT, parser->current.line);
-    int mutable_binding = 0;
     expr->as.variant.union_name = strdup("Option");
     expr->as.variant.variant_name = strdup("some");
     expr->as.variant.pattern_flag = 1;
     advance(parser);
     if (parser->current.kind == TOKEN_BANG) {
-        mutable_binding = 1;
-        advance(parser);
-        if (parser->current.kind != TOKEN_IDENT) {
-            fail(parser, "expected optional payload binding name");
-            return 0;
-        }
+        fail(parser, "optional pattern uses 'some _! name', not 'some! name'");
+        return 0;
     }
-    if (parser->current.kind == TOKEN_IDENT) {
-        AstBindingPattern* binding = new_binding_pattern(AST_BINDING_NAME, parser->current.line);
+    if (parser->current.kind != TOKEN_FAT_ARROW && parser->current.kind != TOKEN_RIGHT_PAREN) {
+        AstBindingPattern* binding = parse_binding_pattern(parser);
         if (!binding) {
             return 0;
         }
-        binding->type.kind = AST_TYPE_INFER;
-        binding->type.mutable_flag = mutable_binding;
-        binding->name = token_dup(&parser->current);
         binding_pattern_list_push(&expr->as.variant.bindings, binding);
-        advance(parser);
     }
     return expr;
 }

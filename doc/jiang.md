@@ -159,7 +159,11 @@ if a1 is some x {
 	// 这里x为null
 }
 
-if a1 is some! x {
+if a1 is some _ x {
+  // 等价于 some x，但显式写出推导类型
+}
+
+if a1 is some _! x {
   // 这里x为可变绑定
 }
 ```

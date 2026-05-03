@@ -494,10 +494,10 @@ T? value; // 归一化为 Int?
 - coalesce: `value ?? fallback`
 - early-exit coalesce: `value ?? return`
 - 强制解包: `value$.some()`
-- 条件解包 pattern: `value is some payload`
-- 可变条件解包 pattern: `value is some! payload`
+- 条件解包 pattern: `value is some payload` 或 `value is some _ payload`
+- 可变条件解包 pattern: `value is some _! payload`
 
-`some` 是 optional pattern 位置的 contextual keyword，类似 `init` 在初始化声明中的特殊角色；它不是普通类型名，也不是 `Option.some` 这种公开 union variant。`some! payload` 的 `!` 只改变解包后绑定的最外层可变性，不改变 payload 类型内部层级。
+`some` 是 optional pattern 位置的 contextual keyword，类似 `init` 在初始化声明中的特殊角色；它不是普通类型名，也不是 `Option.some` 这种公开 union variant。`some` 后面接普通 binding pattern：`some payload` 是 `some _ payload` 的简写，`some _! payload` 表示可变绑定。`!` 仍然属于 binding pattern 的类型部分，不挂在 `some` 关键字上。
 
 示例：
 
@@ -506,17 +506,23 @@ if value is some payload {
     // payload: T
 }
 
-if value is some! payload {
+if value is some _ payload {
+    // payload: T
+}
+
+if value is some _! payload {
     // payload: T!
 }
 
 switch value {
     some payload => ...
+    some _ payload => ...
+    some _! payload => ...
     null => ...
 }
 ```
 
-同一个 optional match/switch 层级中，`some payload` 与 `some! payload` 只能二选一；它们匹配范围相同，只是绑定可变性不同，同时出现是编译错误。
+同一个 optional match/switch 层级中，不同 `some` 分支匹配范围相同，只是绑定形式不同，因此只能出现一个 `some` 分支，同时出现是编译错误。
 
 stage0 已支持 `x == null` / `x != null` 分支窄化。目标设计仍偏向显式 optional handling；后续需要决定 null-check narrowing 是长期保留，还是只作为旧代码兼容能力。
 
@@ -598,11 +604,11 @@ pattern 目前包括：
 if value is some payload {
 }
 
-if block is some! dead {
+if block is some _! dead {
 }
 ```
 
-`some` / `some!` 只用于 optional pattern。普通 union variant 仍然使用 variant pattern，不复用 optional 的 `some` 语法。
+`some` 只用于 optional pattern。普通 union variant 仍然使用 variant pattern，不复用 optional 的 `some` 语法。
 
 ## Module 和 Visibility
 
