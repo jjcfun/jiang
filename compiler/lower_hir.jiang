@@ -1,6 +1,7 @@
 import "./ast.jiang";
 import "./context.jiang";
 import hir = "./hir.jiang";
+import "./interner.jiang";
 import "./resolve.jiang";
 import "./scope.jiang";
 import type_check = "./type_check.jiang";
@@ -211,6 +212,11 @@ public struct HirLowerer {
             return self.lower_var_decl(var_decl);
         }
         if (stmt is .assign(assign)) {
+            if (assign.target is .index(index_expr)) {
+                if (self.uses_subscript_set(index_expr)) {
+                    return self.lower_subscript_set_stmt(assign, index_expr);
+                }
+            }
             hir.HirExprId target = self.lower_expr(assign.target);
             hir.HirExprId value = self.lower_expr(assign.value);
             hir.HirAssignStmt lowered = hir.HirAssignStmt(assign.span, target, value);
@@ -454,6 +460,9 @@ public struct HirLowerer {
             return self.module.add_expr(hir.HirExpr(span, type_id, .hir_field(lowered)));
         }
         if (expr is .index(index_expr)) {
+            if (self.uses_subscript_get(index_expr)) {
+                return self.lower_subscript_get_expr(span, type_id, index_expr);
+            }
             hir.HirExprId base = self.lower_expr(index_expr.base);
             hir.HirExprId index = self.lower_expr(index_expr.index);
             hir.HirIndexExpr lowered = hir.HirIndexExpr(base, index, index_expr.optional_chain);
@@ -558,6 +567,18 @@ public struct HirLowerer {
         return info.kind == .nominal && info.nominal_kind == .struct_decl;
     }
 
+    hir.HirStmt lower_subscript_set_stmt(ast.AssignStmt assign, ast.IndexExpr target) {
+        token.Span span = assign.span;
+        hir.HirExprId base = self.lower_expr(target.base);
+        ast.Name method_name = ast.Name(span, self.ctx.intern("subscript_set"));
+        hir.HirExprId callee = self.module.add_expr(hir.HirExpr(span, self.checked.type_table.make_unit(span), .hir_field(hir.HirFieldExpr(base, method_name, false))));
+        hir.HirCallExpr! call = hir.HirCallExpr(self.module.store$.ptr(), callee);
+        call.args.add(self.lower_expr(target.index));
+        call.args.add(self.lower_expr(assign.value));
+        hir.HirExprId value = self.module.add_expr(hir.HirExpr(span, self.checked.type_table.make_unit(span), .hir_call(call)));
+        return hir.HirStmt(span, .expr(hir.HirExprStmt(span, value)));
+    }
+
     hir.HirExprId lower_constructor_expr(token.Span span, types.TypeId type_id, ast.Name name, ast.CallExpr call) {
         ast.Path path = ast.Path(self.module.store$.ptr(), name.span);
         path.add_segment(name);
@@ -586,6 +607,84 @@ public struct HirLowerer {
                 }
             }
             index = index + 1;
+        }
+        return false;
+    }
+
+    hir.HirExprId lower_subscript_get_expr(token.Span span, types.TypeId type_id, ast.IndexExpr expr) {
+        hir.HirExprId base = self.lower_expr(expr.base);
+        ast.Name method_name = ast.Name(span, self.ctx.intern("subscript_get"));
+        hir.HirExprId callee = self.module.add_expr(hir.HirExpr(span, self.checked.type_table.make_unit(span), .hir_field(hir.HirFieldExpr(base, method_name, false))));
+        hir.HirCallExpr! call = hir.HirCallExpr(self.module.store$.ptr(), callee);
+        call.args.add(self.lower_expr(expr.index));
+        return self.module.add_expr(hir.HirExpr(span, type_id, .hir_call(call)));
+    }
+
+    Bool uses_subscript_get(ast.IndexExpr expr) {
+        if (expr.optional_chain) {
+            return false;
+        }
+        types.TypeId receiver_type = self.aggregate_access_type(self.checked.lookup_expr_type(expr.base$.ptr()));
+        return self.subscript_method(receiver_type, self.ctx.intern("subscript_get").id, 1) != null;
+    }
+
+    Bool uses_subscript_set(ast.IndexExpr expr) {
+        if (expr.optional_chain) {
+            return false;
+        }
+        types.TypeId receiver_type = self.aggregate_access_type(self.checked.lookup_expr_type(expr.base$.ptr()));
+        return self.subscript_method(receiver_type, self.ctx.intern("subscript_set").id, 2) != null;
+    }
+
+    ast.FunctionDecl? subscript_method(types.TypeId receiver_type, Int symbol_id, Int param_count) {
+        Int! index = 0;
+        while (index < self.resolved.method_count()) {
+            resolve.MethodBinding method = self.resolved.method_at_index(index);
+            if (self.method_matches_receiver(method, receiver_type)
+                && method.function.name.symbol.id == symbol_id
+                && method.function.params.len() == param_count) {
+                return method.function;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    types.TypeId aggregate_access_type(types.TypeId type_id) {
+        if (!type_id.valid()) {
+            return type_id;
+        }
+        types.TypeInfo info = self.checked.type_table.type_at(type_id);
+        if (info.kind == .layer && info.mutable && !info.optional) {
+            return info.element;
+        }
+        return type_id;
+    }
+
+    interner.Symbol? nominal_receiver_symbol(types.TypeId type_id) {
+        if (!type_id.valid()) {
+            return null;
+        }
+        types.TypeInfo info = self.checked.type_table.type_at(type_id);
+        if (info.kind == .pointer || info.kind == .layer) {
+            return self.nominal_receiver_symbol(info.element);
+        }
+        if (info.kind == .nominal) {
+            return info.symbol;
+        }
+        return null;
+    }
+
+    Bool method_matches_receiver(resolve.MethodBinding method, types.TypeId receiver_type) {
+        if (!receiver_type.valid()) {
+            return false;
+        }
+        if (method.receiver_name is some receiver_name) {
+            interner.Symbol? receiver_symbol = self.nominal_receiver_symbol(receiver_type);
+            if (receiver_symbol is some resolved_symbol) {
+                return resolved_symbol.id == receiver_name.symbol.id;
+            }
+            return false;
         }
         return false;
     }

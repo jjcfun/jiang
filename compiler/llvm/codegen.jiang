@@ -49,14 +49,53 @@ public struct LocalSlot {
     }
 }
 
+public struct TypeSubst {
+    public Int symbol_id;
+    public types.TypeId! type_id;
+
+    public init(Int symbol_id, types.TypeId type_id) {
+        self.symbol_id = symbol_id;
+        self.type_id = type_id;
+    }
+}
+
+public struct EmissionState {
+    public list.ArenaList<interner.Symbol> emitted_function_names;
+
+    public init(arena.Arena^ store) {
+        self.emitted_function_names = list.ArenaList<interner.Symbol>(store$.ref());
+    }
+
+    public Bool emitted(interner.Symbol name) {
+        Int! index = 0;
+        while (index < self.emitted_function_names.len()) {
+            if (self.emitted_function_names[index].id == name.id) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public () mark_emitted(interner.Symbol name) {
+        if (!self.emitted(name)) {
+            self.emitted_function_names.add(name);
+        }
+    }
+}
+
 public struct FunctionEnv {
     public list.ArenaList<LocalSlot> slots;
+    public list.ArenaList<TypeSubst> generic_substs;
+    public EmissionState^ state;
     public api.Block! catch_target;
     public api.Value! catch_error_slot;
     public types.TypeId! function_result_type;
 
-    public init(arena.Arena^ store) {
+    public init(arena.Arena^ store, EmissionState^ state) {
         self.slots = list.ArenaList<LocalSlot>(store$.ref());
+        self.generic_substs = list.ArenaList<TypeSubst>(store$.ref());
+        self.state = state$.ptr();
         self.catch_target = api.Block();
         self.catch_error_slot = api.Value();
         self.function_result_type = types.TypeId();
@@ -110,6 +149,31 @@ public struct FunctionEnv {
         self.function_result_type = type_id;
     }
 
+    public () add_generic_subst(Int symbol_id, types.TypeId type_id) {
+        Int! index = 0;
+        while (index < self.generic_substs.len()) {
+            TypeSubst& entry = self.generic_substs.get(index);
+            if (entry.symbol_id == symbol_id) {
+                entry.type_id = type_id;
+                return;
+            }
+            index = index + 1;
+        }
+        self.generic_substs.add(TypeSubst(symbol_id, type_id));
+    }
+
+    public types.TypeId lookup_generic_subst(Int symbol_id) {
+        Int! index = 0;
+        while (index < self.generic_substs.len()) {
+            TypeSubst entry = self.generic_substs[index];
+            if (entry.symbol_id == symbol_id) {
+                return entry.type_id;
+            }
+            index = index + 1;
+        }
+        return types.TypeId();
+    }
+
     public Bool local_initialized(scope.LocalBindingId local_id) {
         Int! index = 0;
         while (index < self.slots.len()) {
@@ -137,6 +201,199 @@ public struct FunctionEnv {
 
 api.Type pointer_sized_int_type(api.Context llvm_context) {
     return llvm_context.int64_type();
+}
+
+Int decimal_length(Int value) {
+    if (value <= 0) { return 1; }
+    Int! current = value;
+    Int! length = 0;
+    while (current > 0) {
+        current = current / 10;
+        length = length + 1;
+    }
+    return length;
+}
+
+() write_decimal(UInt8![*] out, Int start, Int value) {
+    if (value <= 0) {
+        out[start] = '0';
+        return;
+    }
+    Int! index = start + decimal_length(value) - 1;
+    Int! current = value;
+    while (current > 0) {
+        out[index] = UInt8('0' + current % 10);
+        current = current / 10;
+        index = index - 1;
+    }
+}
+
+Bool type_contains_type_param(types.TypeTable^ type_table, types.TypeId type_id) {
+    if (!type_id.valid()) { return false; }
+    if (type_id.id >= type_table.len()) { return false; }
+    types.TypeInfo info = type_table.type_at(type_id);
+    if (info.kind == .type_param) { return true; }
+    if (info.element.valid() && type_contains_type_param(type_table$.ptr(), info.element)) { return true; }
+    if (info.other.valid() && type_contains_type_param(type_table$.ptr(), info.other)) { return true; }
+    Int! index = 0;
+    while (index < info.child_count) {
+        if (type_contains_type_param(type_table$.ptr(), type_table.child_at(info.child_start + index))) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool function_decl_is_generic(types.TypeTable^ type_table, jir.JirFunctionDecl decl) {
+    if (type_contains_type_param(type_table$.ptr(), decl.result_type)) {
+        return true;
+    }
+    Int! index = 0;
+    while (index < decl.params.len()) {
+        if (type_contains_type_param(type_table$.ptr(), decl.params[index].type_id)) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+types.TypeId substitute_type_id(types.TypeTable^ type_table, FunctionEnv^ env, types.TypeId type_id) {
+    if (!type_id.valid()) { return type_id; }
+    if (type_id.id >= type_table.len()) { return type_id; }
+    types.TypeInfo info = type_table.type_at(type_id);
+    if (info.kind == .type_param) {
+        types.TypeId substituted = env.lookup_generic_subst(info.symbol.id);
+        if (substituted.valid()) {
+            return substituted;
+        }
+        return type_id;
+    }
+    if (info.kind == .pointer) {
+        types.TypeId element = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
+        if (element.id == info.element.id) { return type_id; }
+        return type_table.make_pointer(info.span, element, info.mutable_item, info.many);
+    }
+    if (info.kind == .slice) {
+        types.TypeId element = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
+        if (element.id == info.element.id) { return type_id; }
+        return type_table.make_slice(info.span, element);
+    }
+    if (info.kind == .array) {
+        types.TypeId element = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
+        if (element.id == info.element.id) { return type_id; }
+        return type_table.make_array(info.span, element, info.inferred_count, info.child_count);
+    }
+    if (info.kind == .layer) {
+        types.TypeId element = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
+        if (element.id == info.element.id) { return type_id; }
+        return type_table.make_layer(info.span, element, info.optional, info.mutable);
+    }
+    if (info.kind == .errorable) {
+        types.TypeId value = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
+        types.TypeId error = substitute_type_id(type_table$.ptr(), env$.ptr(), info.other);
+        if (value.id == info.element.id && error.id == info.other.id) { return type_id; }
+        return type_table.make_errorable(info.span, value, error);
+    }
+    if (info.kind == .tuple || info.kind == .function) {
+        Int! start = type_table.begin_children();
+        Bool! changed = false;
+        Int! index = 0;
+        while (index < info.child_count) {
+            types.TypeId child = type_table.child_at(info.child_start + index);
+            types.TypeId substituted = substitute_type_id(type_table$.ptr(), env$.ptr(), child);
+            if (substituted.id != child.id) {
+                changed = true;
+            }
+            type_table.add_child(substituted);
+            index = index + 1;
+        }
+        if (!changed) { return type_id; }
+        return type_table.make_compound(info.kind, info.span, start, info.child_count);
+    }
+    return type_id;
+}
+
+() collect_type_substs(types.TypeTable^ type_table, FunctionEnv^ env, types.TypeId expected_type, types.TypeId actual_type) {
+    if (!expected_type.valid() || !actual_type.valid()) { return; }
+    if (expected_type.id >= type_table.len() || actual_type.id >= type_table.len()) { return; }
+    types.TypeInfo expected_info = type_table.type_at(expected_type);
+    types.TypeInfo actual_info = type_table.type_at(actual_type);
+    if (expected_info.kind == .type_param) {
+        env.add_generic_subst(expected_info.symbol.id, actual_type);
+        return;
+    }
+    if (expected_info.kind == .layer && actual_info.kind == .layer) {
+        collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
+        return;
+    }
+    if (expected_info.kind == .pointer && actual_info.kind == .pointer) {
+        collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
+        return;
+    }
+    if (expected_info.kind == .slice && actual_info.kind == .slice) {
+        collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
+        return;
+    }
+    if (expected_info.kind == .array && actual_info.kind == .array) {
+        collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
+        return;
+    }
+    if (expected_info.kind == .errorable && actual_info.kind == .errorable) {
+        collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
+        collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.other, actual_info.other);
+        return;
+    }
+    if ((expected_info.kind == .tuple || expected_info.kind == .function) && expected_info.kind == actual_info.kind) {
+        Int! index = 0;
+        while (index < expected_info.child_count && index < actual_info.child_count) {
+            collect_type_substs(type_table$.ptr(), env$.ptr(), type_table.child_at(expected_info.child_start + index), type_table.child_at(actual_info.child_start + index));
+            index = index + 1;
+        }
+    }
+}
+
+interner.Symbol specialized_function_name(context.CompilerContext^ ctx, jir.JirFunctionDecl decl, FunctionEnv^ env) {
+    UInt8[*] base = ctx.symbol_c_string(decl.name.symbol);
+    Int! suffix_parts = 0;
+    Int! suffix_length = 0;
+    Int! index = 0;
+    while (index < decl.params.len()) {
+        types.TypeId substituted = substitute_type_id(ctx.types_ref()$.ptr(), env$.ptr(), decl.params[index].type_id);
+        if (substituted.valid() && substituted.id >= 0) {
+            suffix_parts = suffix_parts + 1;
+            suffix_length = suffix_length + 3 + decimal_length(substituted.id);
+        }
+        index = index + 1;
+    }
+    if (suffix_parts == 0) {
+        return decl.name.symbol;
+    }
+    Int! base_length = c_string_length(base);
+    arena.Arena& store = ctx.ast_store_ref();
+    UInt8![*] text = store.alloc_array<UInt8>(base_length + suffix_length + 1);
+    Int! out = 0;
+    index = 0;
+    while (index < base_length) {
+        text[out] = base[index];
+        out = out + 1;
+        index = index + 1;
+    }
+    index = 0;
+    while (index < decl.params.len()) {
+        types.TypeId substituted = substitute_type_id(ctx.types_ref()$.ptr(), env$.ptr(), decl.params[index].type_id);
+        if (substituted.valid() && substituted.id >= 0) {
+            text[out] = '_';
+            text[out + 1] = '_';
+            text[out + 2] = 't';
+            write_decimal(text, out + 3, substituted.id);
+            out = out + 3 + decimal_length(substituted.id);
+        }
+        index = index + 1;
+    }
+    text[out] = 0;
+    return ctx.intern(text[0 .. out]);
 }
 
 api.Type builtin_type(context.CompilerContext^ ctx, api.Context llvm_context, interner.Symbol symbol) {
@@ -433,6 +690,22 @@ api.Type function_type_ref(context.CompilerContext^ ctx, types.TypeTable^ type_t
     return api.function_type_refs(result_type, param_types, decl.params.len());
 }
 
+api.Type specialized_function_type_ref(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, jir.JirFunctionDecl decl, FunctionEnv^ env) {
+    types.TypeId result_type_id = substitute_type_id(type_table$.ptr(), env$.ptr(), decl.result_type);
+    api.Type result_type = llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, result_type_id);
+    if (decl.params.len() == 0) {
+        return api.function_type(result_type);
+    }
+    Int![*] param_types = Int!$.alloc_array(decl.params.len());
+    Int! index = 0;
+    while (index < decl.params.len()) {
+        types.TypeId param_type_id = substitute_type_id(type_table$.ptr(), env$.ptr(), decl.params[index].type_id);
+        param_types[index] = api.type_ref(llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, param_type_id));
+        index = index + 1;
+    }
+    return api.function_type_refs(result_type, param_types, decl.params.len());
+}
+
 UInt8[*] function_name(context.CompilerContext^ ctx, jir.JirFunctionDecl decl) {
     return ctx.symbol_c_string(decl.name.symbol);
 }
@@ -452,12 +725,21 @@ api.Value declare_function(context.CompilerContext^ ctx, types.TypeTable^ type_t
     return llvm_module.add_function(name, function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl));
 }
 
+api.Value declare_specialized_function(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, jir.JirFunctionDecl decl, interner.Symbol name_symbol, FunctionEnv^ env) {
+    UInt8[*] name = ctx.symbol_c_string(name_symbol);
+    api.Value existing = llvm_module.lookup_function(name);
+    if (!existing.is_null()) { return existing; }
+    return llvm_module.add_function(name, specialized_function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl, env$.ptr()));
+}
+
 () declare_functions(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module) {
     Int! index = 0;
     while (index < input.decl_count()) {
         jir.JirDecl decl = input.decl_at(jir.JirDeclId(index));
         if (decl.body is .function_decl(function_decl)) {
-            declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, function_decl);
+            if (!function_decl_is_generic(type_table$.ptr(), function_decl)) {
+                declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, function_decl);
+            }
         }
         index = index + 1;
     }
@@ -493,6 +775,14 @@ jir.JirGlobalDecl? global_decl_for_binding(jir.JirModule^ input, scope.BindingId
 
 jir.JirFunctionDecl? function_decl_for_call(jir.JirModule^ input, jir.JirCallExpr call) {
     jir.JirExpr callee = input.expr_at(call.callee);
+    if (callee.body is .name_expr(name)) {
+        if (name.binding_id.valid()) {
+            jir.JirFunctionDecl? binding_target = function_decl_for_binding(input$.ptr(), name.binding_id);
+            if (binding_target is some resolved_binding_target) {
+                return resolved_binding_target;
+            }
+        }
+    }
     Int! symbol_id = -1;
     if (callee.body is .name_expr(name)) {
         symbol_id = name.name.symbol.id;
@@ -1665,12 +1955,44 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
         }
         jir.JirFunctionDecl? target = function_decl_for_call(input$.ptr(), call);
         if (target is some decl) {
-            api.Value fn = declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl);
-            api.Type fn_type = function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl);
             Bool! method_call = false;
             jir.JirExpr callee = input.expr_at(call.callee);
             if (callee.body is .field_expr(field)) {
                 method_call = decl.params.len() == call.args.len() + 1;
+            }
+            FunctionEnv! call_env = FunctionEnv(ctx.ast_store_ref()$.ptr(), env.state);
+            if (function_decl_is_generic(type_table$.ptr(), decl)) {
+                Int! subst_index = 0;
+                if (method_call) {
+                    if (callee.body is .field_expr(field)) {
+                        collect_type_substs(type_table$.ptr(), call_env$.ptr(), decl.params[0].type_id, input.expr_at(field.base).type_id);
+                    }
+                    subst_index = 1;
+                }
+                Int! infer_index = 0;
+                while (infer_index < call.args.len()) {
+                    Int param_index = infer_index + subst_index;
+                    if (param_index < decl.params.len()) {
+                        collect_type_substs(type_table$.ptr(), call_env$.ptr(), decl.params[param_index].type_id, input.expr_at(call.args[infer_index]).type_id);
+                    }
+                    infer_index = infer_index + 1;
+                }
+            }
+            interner.Symbol! function_symbol = decl.name.symbol;
+            api.Type! fn_type = function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl);
+            api.Value! fn = api.Value();
+            if (function_decl_is_generic(type_table$.ptr(), decl)) {
+                function_symbol = specialized_function_name(ctx$.ptr(), decl, call_env$.ptr());
+                fn_type = specialized_function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl, call_env$.ptr());
+                fn = declare_specialized_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl, function_symbol, call_env$.ptr());
+                if (!env.state.emitted(function_symbol) && decl.body != null && !decl.extern_flag) {
+                    api.Builder! temp_builder = api.Builder(llvm_context$.ptr());
+                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, temp_builder, decl, function_symbol, call_env$.ptr());
+                    temp_builder.dispose();
+                    env.state.mark_emitted(function_symbol);
+                }
+            } else {
+                fn = declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl);
             }
             Int! arg_count = call.args.len();
             if (method_call) { arg_count = arg_count + 1; }
@@ -1680,7 +2002,11 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
                 if (callee.body is .field_expr(field)) {
                     api.Value! self_arg = expr_address(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, field.base, env$.ptr());
                     if (decl.params.len() > 0) {
-                        self_arg = cast_value(ctx$.ptr(), type_table$.ptr(), builder, input.expr_at(field.base).type_id, decl.params[0].type_id, llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl.params[0].type_id), self_arg);
+                        types.TypeId! self_type_id = decl.params[0].type_id;
+                        if (function_decl_is_generic(type_table$.ptr(), decl)) {
+                            self_type_id = substitute_type_id(type_table$.ptr(), call_env$.ptr(), self_type_id);
+                        }
+                        self_arg = cast_value(ctx$.ptr(), type_table$.ptr(), builder, input.expr_at(field.base).type_id, self_type_id, llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, self_type_id), self_arg);
                     }
                     args[0] = api.value_ref(self_arg);
                     out_index = 1;
@@ -1692,7 +2018,11 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
                 api.Value! arg_value = expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, call.args[index], env$.ptr());
                 Int param_index = index + out_index;
                 if (param_index < decl.params.len()) {
-                    arg_value = cast_value(ctx$.ptr(), type_table$.ptr(), builder, arg_expr.type_id, decl.params[param_index].type_id, llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl.params[param_index].type_id), arg_value);
+                    types.TypeId! param_type_id = decl.params[param_index].type_id;
+                    if (function_decl_is_generic(type_table$.ptr(), decl)) {
+                        param_type_id = substitute_type_id(type_table$.ptr(), call_env$.ptr(), param_type_id);
+                    }
+                    arg_value = cast_value(ctx$.ptr(), type_table$.ptr(), builder, arg_expr.type_id, param_type_id, llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, param_type_id), arg_value);
                 }
                 args[index + out_index] = api.value_ref(arg_value);
                 index = index + 1;
@@ -2350,37 +2680,43 @@ api.Value switch_case_condition(context.CompilerContext^ ctx, types.TypeTable^ t
     }
 }
 
-() emit_function(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder, jir.JirFunctionDecl decl) {
+() emit_function_named(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder, jir.JirFunctionDecl decl, interner.Symbol name_symbol, FunctionEnv^ env) {
     debug_log("debug: emit function");
-    debug_log(ctx.symbol_c_string(decl.name.symbol));
-    api.Value function_value = declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl);
+    debug_log(ctx.symbol_c_string(name_symbol));
+    api.Value! function_value = api.Value();
+    if (name_symbol.id == decl.name.symbol.id && !function_decl_is_generic(type_table$.ptr(), decl)) {
+        function_value = declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl);
+    } else {
+        function_value = declare_specialized_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl, name_symbol, env$.ptr());
+    }
     debug_log("debug: function declared");
     api.Block entry = llvm_module.append_block(llvm_context$.ptr(), function_value, "entry");
     debug_log("debug: function entry");
     builder.position_at_end(entry);
-    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref()$.ptr());
     Int! index = 0;
     while (index < decl.params.len()) {
         debug_log("debug: function param");
         jir.JirParam param = decl.params[index];
-        api.Type param_type = llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, param.type_id);
+        types.TypeId param_type_id = substitute_type_id(type_table$.ptr(), env$.ptr(), param.type_id);
+        api.Type param_type = llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, param_type_id);
         api.Value slot = builder.build_alloca(param_type, ctx.symbol_c_string(param.name.symbol));
         builder.build_store(llvm_module.get_param(function_value, UInt32(index)), slot);
-        env.add_local(param.local_id, slot, param_type, param.type_id);
+        env.add_local(param.local_id, slot, param_type, param_type_id);
         index = index + 1;
     }
     if (decl.body is some body) {
         debug_log("debug: function body");
-        env.set_function_result_type(decl.result_type);
+        env.set_function_result_type(substitute_type_id(type_table$.ptr(), env$.ptr(), decl.result_type));
         emit_block(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_value, api.Block(), api.Block(), body, env$.ptr());
         if (!block_ends_block(input$.ptr(), body)) {
-            if (decl.result_type.valid()) {
-                types.TypeInfo result_info = type_table.type_at(decl.result_type);
+            types.TypeId result_type_id = substitute_type_id(type_table$.ptr(), env$.ptr(), decl.result_type);
+            if (result_type_id.valid()) {
+                types.TypeInfo result_info = type_table.type_at(result_type_id);
                 if (result_info.kind == .unit) {
                     builder.build_ret_void();
                 }
                 if (result_info.kind == .errorable) {
-                    builder.build_ret(errorable_success_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, builder, decl.result_type));
+                    builder.build_ret(errorable_success_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, builder, result_type_id));
                 }
             }
         }
@@ -2400,16 +2736,21 @@ Bool emitted_function_contains(list.ArenaList<scope.BindingId> emitted, scope.Bi
 
 () emit_functions(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder) {
     list.ArenaList<scope.BindingId>! emitted = list.ArenaList<scope.BindingId>(ctx.ast_store_ref());
+    EmissionState! state = EmissionState(ctx.ast_store_ref()$.ptr());
     Int! index = 0;
     while (index < input.decl_count()) {
         jir.JirDecl decl = input.decl_at(jir.JirDeclId(index));
         if (decl.body is .function_decl(function_decl)) {
-            if (!function_decl.extern_flag && function_decl.body != null) {
+            if (!function_decl.extern_flag && function_decl.body != null && !function_decl_is_generic(type_table$.ptr(), function_decl)) {
                 if (!function_decl.binding_id.valid()) {
-                    emit_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl);
+                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref()$.ptr(), state$.ptr());
+                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl, function_decl.name.symbol, env$.ptr());
+                    state.mark_emitted(function_decl.name.symbol);
                 } else if (!emitted_function_contains(emitted, function_decl.binding_id)) {
-                    emit_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl);
+                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref()$.ptr(), state$.ptr());
+                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl, function_decl.name.symbol, env$.ptr());
                     emitted.add(function_decl.binding_id);
+                    state.mark_emitted(function_decl.name.symbol);
                 }
             }
         }
