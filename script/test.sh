@@ -178,6 +178,7 @@ run_sample pointer_default_field_minimal.jiang 0
 run_sample pointer_expected_type_deref_minimal.jiang 63
 run_sample pointer_argument_expected_type_minimal.jiang 42
 run_sample pointer_get_minimal.jiang 42
+run_compile_fail invalid_pointer_get_lvalue.jiang
 run_compile_fail invalid_pointer_star_type.jiang
 run_compile_fail invalid_pointer_double_owner.jiang
 run_compile_fail invalid_pointer_owner_reference_combo.jiang
@@ -205,6 +206,7 @@ run_sample normal_import_reexport_minimal.jiang 42
 run_compile_fail invalid_normal_import_reexport_namespace.jiang
 run_sample normal_import_public_signature_minimal.jiang 42
 run_compile_fail invalid_normal_import_public_signature_missing_import.jiang
+run_sample imported_typeid_field_minimal.jiang 42
 run_sample fn_pointer_minimal.jiang 7
 run_sample fn_pointer_comprehensive_minimal.jiang 83
 run_sample fn_pointer_infer_minimal.jiang 3
@@ -306,8 +308,8 @@ run_sample ternary_enum_minimal.jiang 42
 run_sample ternary_minimal.jiang 42
 run_sample optional_minimal.jiang 42
 run_sample optional_null_compare_minimal.jiang 42
-run_sample optional_if_narrow_minimal.jiang 42
-run_sample optional_else_narrow_minimal.jiang 42
+run_compile_fail optional_if_narrow_minimal.jiang
+run_compile_fail optional_else_narrow_minimal.jiang
 run_sample optional_coalesce_minimal.jiang 42
 run_sample coalesce_value_minimal.jiang 42
 run_sample coalesce_fallback_call_minimal.jiang 42

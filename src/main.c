@@ -4697,6 +4697,19 @@ static AstStmt* clone_stmt_subst(const AstStmt* stmt, const TypeSubstList* subst
 static AstType clone_type_subst(const AstType* type, const TypeSubstList* subst) {
     AstType out = substitute_type(type, subst);
     int i = 0;
+    if (!out.array_item && type->array_item &&
+        (out.kind == AST_TYPE_REFERENCE ||
+         out.kind == AST_TYPE_POINTER ||
+         out.kind == AST_TYPE_MANY_POINTER ||
+         out.kind == AST_TYPE_SLICE ||
+         out.kind == AST_TYPE_ARRAY ||
+         out.kind == AST_TYPE_OPTIONAL ||
+         out.kind == AST_TYPE_ERRORABLE)) {
+        out.array_item = (AstType*)malloc(sizeof(AstType));
+        if (out.array_item) {
+            *out.array_item = clone_type_subst(type->array_item, subst);
+        }
+    }
     if (out.array_item) {
         AstType tmp = clone_type_subst(out.array_item, subst);
         free(out.array_item);

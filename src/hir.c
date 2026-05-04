@@ -2403,6 +2403,14 @@ static HirNominalDeclRef find_nominal_decl(HirProgram* program, const char* name
         out.decl = enum_decl;
         return out;
     }
+    for (int i = 0; i < program->enums.count; ++i) {
+        if (nominal_names_equivalent(name, program->enums.items[i].name)) {
+            out.kind = HIR_NOMINAL_ENUM;
+            out.name = program->enums.items[i].name;
+            out.decl = &program->enums.items[i];
+            return out;
+        }
+    }
     struct_decl = find_struct(program, name);
     if (struct_decl) {
         out.kind = HIR_NOMINAL_STRUCT;
@@ -2410,12 +2418,28 @@ static HirNominalDeclRef find_nominal_decl(HirProgram* program, const char* name
         out.decl = struct_decl;
         return out;
     }
+    for (int i = 0; i < program->structs.count; ++i) {
+        if (nominal_names_equivalent(name, program->structs.items[i].name)) {
+            out.kind = HIR_NOMINAL_STRUCT;
+            out.name = program->structs.items[i].name;
+            out.decl = &program->structs.items[i];
+            return out;
+        }
+    }
     union_decl = find_union(program, name);
     if (union_decl) {
         out.kind = HIR_NOMINAL_UNION;
         out.name = union_decl->name;
         out.decl = union_decl;
         return out;
+    }
+    for (int i = 0; i < program->unions.count; ++i) {
+        if (nominal_names_equivalent(name, program->unions.items[i].name)) {
+            out.kind = HIR_NOMINAL_UNION;
+            out.name = program->unions.items[i].name;
+            out.decl = &program->unions.items[i];
+            return out;
+        }
     }
     return out;
 }
@@ -4662,6 +4686,56 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 out->as.unary.value = value;
                 return out;
             }
+            if (strcmp(expr->as.implicit.member, "set") == 0) {
+                HirExpr* value = 0;
+                HirExpr* target = 0;
+                HirExpr* new_value = 0;
+                HirStmt* assign = 0;
+                HirBlock* body = 0;
+                if (expr->as.implicit.has_type_arg || expr->as.implicit.args.count != 1) {
+                    fail(ctx, "implicit operation '.set(...)' expects exactly one argument");
+                    return 0;
+                }
+                value = lower_expr_preserve_pointer(ctx, expr->as.implicit.value_target);
+                if (!value) {
+                    return 0;
+                }
+                if ((value->type->kind != HIR_TYPE_REFERENCE && value->type->kind != HIR_TYPE_POINTER) ||
+                    !value->type->array_item) {
+                    fail(ctx, "set requires pointer or reference");
+                    return 0;
+                }
+                target = new_expr(HIR_EXPR_DEREF, value->type->array_item, expr->line);
+                target->as.unary.value = value;
+                if (!is_mutable_assignment_target(target)) {
+                    fail(ctx, "assignment target is immutable");
+                    return 0;
+                }
+                new_value = lower_expr_expected(ctx, expr->as.implicit.args.items[0], target->type);
+                if (!new_value) {
+                    return 0;
+                }
+                new_value = maybe_decay_array_to_slice(ctx, new_value, target->type, expr->line);
+                if (!new_value) {
+                    return 0;
+                }
+                if (!type_assignment_compatible(new_value->type, target->type)) {
+                    fail(ctx, "assignment type mismatch");
+                    return 0;
+                }
+                body = (HirBlock*)calloc(1, sizeof(HirBlock));
+                if (!body) {
+                    fail(ctx, "out of memory");
+                    return 0;
+                }
+                assign = new_stmt(HIR_STMT_ASSIGN, expr->line);
+                assign->as.assign.target = target;
+                assign->as.assign.value = new_value;
+                stmt_list_push(&body->stmts, assign);
+                out = new_expr(HIR_EXPR_BLOCK, primitive_type(ctx->program, HIR_TYPE_VOID), expr->line);
+                out->as.block_expr.body = body;
+                return out;
+            }
             if (strcmp(expr->as.implicit.member, "addr") == 0) {
                 HirExpr* value = 0;
                 HirType* pointer_type = 0;
@@ -6653,6 +6727,14 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
         case AST_STMT_ASSIGN: {
             HirExpr* preserved_target = 0;
             if (stmt->as.assign.target &&
+                stmt->as.assign.target->kind == AST_EXPR_IMPLICIT &&
+                !stmt->as.assign.target->as.implicit.target_is_type &&
+                stmt->as.assign.target->as.implicit.member &&
+                strcmp(stmt->as.assign.target->as.implicit.member, "get") == 0) {
+                fail(ctx, "implicit operation '.get()' is not assignable; use '.set(...)'");
+                return 0;
+            }
+            if (stmt->as.assign.target &&
                 stmt->as.assign.target->kind == AST_EXPR_INDEX) {
                 HirStmt* subscript_stmt = lower_subscriptable_set_stmt(ctx,
                                                                        stmt->as.assign.target,
@@ -6744,8 +6826,6 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
         }
         case AST_STMT_IF: {
             Scope inner;
-            const char* optional_name = 0;
-            int non_null_then = 0;
             if (stmt->as.if_stmt.cond &&
                 stmt->as.if_stmt.cond->kind == AST_EXPR_BINARY &&
                 stmt->as.if_stmt.cond->as.binary.op == AST_BIN_IS &&
@@ -6774,11 +6854,6 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                     return 0;
                 }
                 push_scope(ctx, &inner);
-                if (optional_null_compare_binding_name(stmt->as.if_stmt.cond, &non_null_then, &optional_name) && non_null_then) {
-                    if (!bind_optional_narrow(ctx, optional_name, &out->as.if_stmt.then_block, stmt->line)) {
-                        return 0;
-                    }
-                }
                 if (!lower_block(ctx, &stmt->as.if_stmt.then_block, &out->as.if_stmt.then_block, 0)) {
                     return 0;
                 }
@@ -6788,11 +6863,6 @@ static HirStmt* lower_stmt(LowerContext* ctx, const AstStmt* stmt) {
                 Scope else_scope;
                 out->as.if_stmt.has_else = 1;
                 push_scope(ctx, &else_scope);
-                if (optional_null_compare_binding_name(stmt->as.if_stmt.cond, &non_null_then, &optional_name) && !non_null_then) {
-                    if (!bind_optional_narrow(ctx, optional_name, &out->as.if_stmt.else_block, stmt->line)) {
-                        return 0;
-                    }
-                }
                 if (!lower_block(ctx, &stmt->as.if_stmt.else_block, &out->as.if_stmt.else_block, 0)) {
                     return 0;
                 }
