@@ -110,6 +110,7 @@ run_all_compiler_samples() {
   run_compiler_sample lower_hir_minimal.jiang 0
   run_compiler_sample lower_jir_minimal.jiang 0
   run_compiler_sample llvm_api_minimal.jiang 0
+  run_compiler_sample compiler_bootstrap_smoke.jiang 0
 }
 
 if [ "$#" -gt 0 ]; then

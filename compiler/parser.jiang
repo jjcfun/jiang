@@ -166,6 +166,30 @@ public struct Parser {
         return self.is_expr_start(kind);
     }
 
+    Bool try_stmt_has_block_catch() {
+        if (self.peek(1).kind == .left_brace) { return true; }
+        Int! offset = 1;
+        while (self.peek(offset).kind != .eof && self.peek(offset).kind != .semicolon) {
+            if (self.peek(offset).kind == .kw_catch) {
+                offset = offset + 1;
+                if (self.peek(offset).kind == .left_paren) {
+                    Int! depth = 1;
+                    offset = offset + 1;
+                    while (depth > 0 && self.peek(offset).kind != .eof) {
+                        if (self.peek(offset).kind == .left_paren) { depth = depth + 1; }
+                        if (self.peek(offset).kind == .right_paren) { depth = depth - 1; }
+                        offset = offset + 1;
+                    }
+                } else if (self.peek(offset).kind == .ident) {
+                    offset = offset + 1;
+                }
+                return self.peek(offset).kind == .left_brace;
+            }
+            offset = offset + 1;
+        }
+        return false;
+    }
+
     Bool is_expr_start(token.Kind kind) {
         if (kind == .ident) { return true; }
         if (kind == .int_lit) { return true; }
@@ -891,7 +915,7 @@ public struct Parser {
     }
 
     ast.AstExpr^?! parse_expr() {
-        return self.parse_range_expr();
+        return self.parse_conditional_expr();
     }
 
     ast.AstExpr^?! parse_expr_before_block() {
@@ -900,6 +924,18 @@ public struct Parser {
         ast.AstExpr^?! result = self.parse_expr();
         self.allow_struct_literal = old_allow_struct_literal;
         return result;
+    }
+
+    ast.AstExpr^?! parse_conditional_expr() {
+        ast.AstExpr^ cond = self.parse_range_expr() ?? return null;
+        if (!self.match(.question)) {
+            return cond;
+        }
+        ast.AstExpr^ then_value = self.parse_expr() ?? return null;
+        if (!self.expect(.colon, "expected ':' in conditional expression")) { return null; }
+        ast.AstExpr^ else_value = self.parse_expr() ?? return null;
+        ast.AstExpr result = .if_expr(ast.IfExpr(self.span_from(self.expr_span(cond), self.expr_span(else_value)), cond, then_value, else_value));
+        return self.alloc_expr(result);
     }
 
     ast.AstExpr^?! parse_range_expr() {
@@ -1115,6 +1151,12 @@ public struct Parser {
                 expr = self.parse_implicit_member_tail(expr$.some());
                 continue;
             }
+            if (self.is_kind(.question) && self.peek(1).kind == .dollar) {
+                self.advance();
+                self.advance();
+                expr = self.parse_implicit_member_tail(expr$.some());
+                continue;
+            }
             return expr;
         }
         return expr;
@@ -1153,14 +1195,23 @@ public struct Parser {
             return null;
         }
         if (self.ctx.symbol_equal(name.symbol, "as")) {
+            ast.AstType target_type = self.parse_type() ?? return null;
+            if (!self.expect(.right_paren, "expected ')' after implicit member arguments")) {
+                return null;
+            }
+            token.Span span = self.span_from(start, self.previous().span);
+            return self.alloc_expr(.cast(ast.CastExpr(span, base, target_type)));
+        }
+        if (self.ctx.symbol_equal(name.symbol, "addr")) {
             if (!self.is_kind(.right_paren)) {
-                ast.AstType? ignored_type = self.parse_type();
-                if (ignored_type == null) { return null; }
+                self.diagnostics.add_error(self.current.span, "implicit addr operation does not take arguments");
+                return null;
             }
             if (!self.expect(.right_paren, "expected ')' after implicit member arguments")) {
                 return null;
             }
-            return base;
+            token.Span span = self.span_from(start, self.previous().span);
+            return self.alloc_expr(.unary(ast.UnaryExpr(span, .address_value, base)));
         }
         ast.AstExpr^ callee = self.alloc_expr(.field(ast.FieldExpr(self.span_from(start, name.span), base, name, false)));
         ast.CallExpr! call = ast.CallExpr(self.store$.ptr(), name.span, callee);
@@ -1188,11 +1239,22 @@ public struct Parser {
             token.Span span = self.span_from(start, self.previous().span);
             return self.alloc_expr(.unary(ast.UnaryExpr(span, .address_of, base)));
         }
+        if (self.ctx.symbol_equal(name.symbol, "get")) {
+            if (call.args.len() != 0) {
+                self.diagnostics.add_error(call.span, "implicit get operation does not take arguments");
+                return null;
+            }
+            token.Span span = self.span_from(start, self.previous().span);
+            return self.alloc_expr(.unary(ast.UnaryExpr(span, .deref, base)));
+        }
         call.span = self.span_from(start, self.previous().span);
         return self.alloc_expr(.call(call));
     }
 
     ast.AstType? implicit_base_type(ast.AstExpr^ base) {
+        if (base is .type_value(type_ref)) {
+            return type_ref;
+        }
         if (base is .name(name)) {
             ast.Path path = ast.Path(self.store$.ptr(), name.span);
             path.add_segment(name);
@@ -1272,6 +1334,15 @@ public struct Parser {
             ast.AstExpr result = .literal(lit);
             return self.alloc_expr(result);
         }
+        if (self.starts_type_implicit_expr()) {
+            ast.AstType type_ref = self.parse_type() ?? return null;
+            if (!self.expect(.dollar, "expected '$' after type in implicit operation")) {
+                return null;
+            }
+            ast.AstExpr type_expr = .type_value(type_ref);
+            ast.AstExpr^ base = self.alloc_expr(type_expr);
+            return self.parse_implicit_member_tail(base);
+        }
         if (self.is_ident_text("self")) {
             self.advance();
             ast.AstExpr result = .self_value(start);
@@ -1325,6 +1396,31 @@ public struct Parser {
         }
         self.diagnostics.add_error(self.current.span, "expected expression");
         return null;
+    }
+
+    Bool starts_type_implicit_expr() {
+        if (self.is_kind(.ident) && !self.token_is_uppercase_ident(self.current)) {
+            return false;
+        }
+        if (!(self.is_kind(.ident) || self.is_kind(.kw_self))) {
+            return false;
+        }
+        if (self.peek(1).kind == .dollar) {
+            return true;
+        }
+        Int! offset = 1;
+        while (offset < 24) {
+            token.Kind kind = self.peek(offset).kind;
+            if (kind == .dollar) {
+                return true;
+            }
+            if (kind == .bang || kind == .question || kind == .question_question || kind == .caret || kind == .amp || kind == .left_bracket || kind == .right_bracket || kind == .star || kind == .at) {
+                offset = offset + 1;
+                continue;
+            }
+            return false;
+        }
+        return false;
     }
 
     ast.AstExpr^?! parse_implicit_variant_expr(token.Span start) {
@@ -1523,7 +1619,7 @@ public struct Parser {
                 self.advance();
             }
             if (!self.expect(.fat_arrow, "expected '=>' in switch expression case")) { return null; }
-            ast.AstExpr^ case_value = self.parse_expr() ?? return null;
+            ast.AstExpr^ case_value = self.parse_switch_expr_case_value() ?? return null;
             expr.cases.add(ast.SwitchExprCase(self.span_from(case_start, self.expr_span(case_value)), pattern, case_value));
             if (!self.match(.comma)) {
                 self.match(.semicolon);
@@ -1533,6 +1629,13 @@ public struct Parser {
         expr.span = self.span_from(start, self.previous().span);
         ast.AstExpr result = .switch_expr(expr);
         return self.alloc_expr(result);
+    }
+
+    ast.AstExpr^?! parse_switch_expr_case_value() {
+        if (self.is_kind(.left_brace)) {
+            return self.parse_block_expr();
+        }
+        return self.parse_expr();
     }
 
     ast.AstExpr^?! parse_try_expr() {
@@ -1691,7 +1794,18 @@ public struct Parser {
             return .continue_stmt(start);
         }
         if (self.match(.kw_defer)) {
-            ast.Block body = self.parse_block() ?? return null;
+            ast.Block! body = ast.Block(self.store$.ptr(), start);
+            if (self.is_kind(.left_brace)) {
+                ast.Block? parsed_block = self.parse_block();
+                if (parsed_block == null) { return null; }
+                body = parsed_block$.some();
+            } else {
+                ast.AstExpr^ value = self.parse_expr() ?? return null;
+                token.Span end = self.expr_span(value);
+                self.expect(.semicolon, "expected ';' after defer expression");
+                body.stmts.add(.expr(ast.ExprStmt(self.span_from(start, end), value)));
+                body.span = self.span_from(start, end);
+            }
             return .defer_stmt(ast.DeferStmt(self.span_from(start, body.span), body));
         }
         if (self.is_kind(.left_brace)) {
@@ -1704,7 +1818,7 @@ public struct Parser {
         if (self.is_kind(.kw_switch)) {
             return self.parse_switch_stmt();
         }
-        if (self.is_kind(.kw_try)) {
+        if (self.is_kind(.kw_try) && self.try_stmt_has_block_catch()) {
             return self.parse_try_stmt();
         }
         if (self.is_kind(.kw_while)) {
@@ -1752,9 +1866,23 @@ public struct Parser {
         if (!self.is_type_start(self.current.kind)) {
             return false;
         }
+        if (self.is_kind(.ident) && !self.token_is_uppercase_ident(self.current)) {
+            if (self.ctx.symbol_equal_text(self.current.symbol_id, "_")) {
+                return true;
+            }
+            if (self.peek(1).kind != .dot || self.peek(2).kind != .ident || !self.token_is_uppercase_ident(self.peek(2))) {
+                return false;
+            }
+        }
         Int! probe = self.index;
         if (self.peek(0).kind == .ident && self.peek(1).kind == .ident) {
             return true;
+        }
+        if (self.peek(0).kind == .ident && self.peek(1).kind == .left_bracket) {
+            Int after_bracket = self.after_matching_bracket(self.index + 1);
+            if (after_bracket >= 0 && self.tokens.at(after_bracket).kind == .assign) {
+                return false;
+            }
         }
         while (probe < self.tokens.len()) {
             token.Kind kind = self.tokens.at(probe).kind;
@@ -1770,6 +1898,26 @@ public struct Parser {
             probe = probe + 1;
         }
         return false;
+    }
+
+    Int after_matching_bracket(Int left_index) {
+        Int! depth = 0;
+        Int! probe = left_index;
+        while (probe < self.tokens.len()) {
+            token.Kind kind = self.tokens.at(probe).kind;
+            if (kind == .left_bracket) {
+                depth = depth + 1;
+            } else if (kind == .right_bracket) {
+                depth = depth - 1;
+                if (depth == 0) {
+                    return probe + 1;
+                }
+            } else if (kind == .semicolon || kind == .eof) {
+                return -1;
+            }
+            probe = probe + 1;
+        }
+        return -1;
     }
 
     ast.AstStmt? parse_var_decl_stmt() {
@@ -1791,15 +1939,45 @@ public struct Parser {
         token.Span! start = self.current.span;
         self.advance();
         ast.AstExpr^ cond = self.parse_expr_before_block() ?? return null;
-        ast.Block then_block = self.parse_block() ?? return null;
+        ast.Block then_block = self.parse_stmt_body_block(start) ?? return null;
         ast.Block?! else_block = null;
         token.Span! end_span = then_block.span;
         if (self.match(.kw_else)) {
-            ast.Block parsed_else_block = self.parse_block() ?? return null;
+            ast.Block parsed_else_block = self.parse_stmt_body_block(self.previous().span) ?? return null;
             else_block = parsed_else_block;
             end_span = else_block$.some().span;
         }
         return .if_stmt(ast.IfStmt(self.span_from(start, end_span), cond, then_block, else_block));
+    }
+
+    ast.Block? parse_stmt_body_block(token.Span start) {
+        if (self.is_kind(.left_brace)) {
+            return self.parse_block();
+        }
+        ast.Block! body = ast.Block(self.store$.ptr(), start);
+        ast.AstStmt stmt = self.parse_stmt() ?? return null;
+        body.stmts.add(stmt);
+        body.span = self.span_from(start, self.stmt_span(stmt));
+        return body;
+    }
+
+    token.Span stmt_span(ast.AstStmt stmt) {
+        if (stmt is .var_decl(var_decl)) { return var_decl.span; }
+        if (stmt is .assign(assign)) { return assign.span; }
+        if (stmt is .if_stmt(if_stmt)) { return if_stmt.span; }
+        if (stmt is .switch_stmt(switch_stmt)) { return switch_stmt.span; }
+        if (stmt is .try_stmt(try_stmt)) { return try_stmt.span; }
+        if (stmt is .while_stmt(while_stmt)) { return while_stmt.span; }
+        if (stmt is .for_range(for_range)) { return for_range.span; }
+        if (stmt is .for_each(for_each)) { return for_each.span; }
+        if (stmt is .return_stmt(return_stmt)) { return return_stmt.span; }
+        if (stmt is .throw_stmt(throw_stmt)) { return throw_stmt.span; }
+        if (stmt is .expr(expr_stmt)) { return expr_stmt.span; }
+        if (stmt is .defer_stmt(defer_stmt)) { return defer_stmt.span; }
+        if (stmt is .block(block)) { return block.span; }
+        if (stmt is .break_stmt(span)) { return span; }
+        if (stmt is .continue_stmt(span)) { return span; }
+        return token.Span();
     }
 
     ast.AstStmt? parse_switch_stmt() {
@@ -1849,17 +2027,31 @@ public struct Parser {
     ast.AstStmt? parse_try_stmt() {
         token.Span! start = self.current.span;
         self.advance();
-        ast.Block body = self.parse_block() ?? return null;
+        ast.Block! body = ast.Block(self.store$.ptr(), start);
+        if (self.is_kind(.left_brace)) {
+            ast.Block? parsed_body = self.parse_block();
+            if (parsed_body == null) { return null; }
+            body = parsed_body$.some();
+        } else {
+            ast.AstExpr^ value = self.parse_expr() ?? return null;
+            token.Span value_span = self.expr_span(value);
+            body.stmts.add(.expr(ast.ExprStmt(value_span, value)));
+            body.span = self.span_from(start, value_span);
+        }
         ast.TryStmt! stmt = ast.TryStmt(self.store$.ptr(), start, body);
         while (self.match(.kw_catch)) {
             token.Span! catch_start = self.previous().span;
             ast.AstType?! error_type = null;
             ast.Name?! binding = null;
             if (self.match(.left_paren)) {
-                ast.AstType parsed_error_type = self.parse_type() ?? return null;
-                error_type = parsed_error_type;
-                if (self.is_kind(.ident)) {
+                if (self.is_kind(.ident) && self.peek(1).kind == .right_paren) {
                     binding = self.parse_name("expected catch binding");
+                } else {
+                    ast.AstType parsed_error_type = self.parse_type() ?? return null;
+                    error_type = parsed_error_type;
+                    if (self.is_kind(.ident)) {
+                        binding = self.parse_name("expected catch binding");
+                    }
                 }
                 if (!self.expect(.right_paren, "expected ')' after catch binding")) { return null; }
             } else if (self.is_kind(.ident)) {
@@ -1868,6 +2060,7 @@ public struct Parser {
             ast.Block catch_body = self.parse_block() ?? return null;
             stmt.catches.add(ast.CatchStmt(self.span_from(catch_start, catch_body.span), error_type, binding, catch_body));
         }
+        self.match(.semicolon);
         return .try_stmt(stmt);
     }
 
@@ -1947,6 +2140,14 @@ public struct Parser {
         token.Span! item_start = self.current.span;
         if (self.match(.kw_public)) {
             item_start = self.previous().span;
+        }
+        if (self.is_ident_text("deinit") && self.peek(1).kind == .left_paren) {
+            self.advance();
+            if (!self.expect(.left_paren, "expected '(' after deinit")) { return false; }
+            if (!self.expect(.right_paren, "expected ')' after deinit parameters")) { return false; }
+            ast.Block body = self.parse_block() ?? return false;
+            decl.deinit_body = body;
+            return true;
         }
         if (self.is_kind(.ident) && self.peek(1).kind == .left_paren) {
             ast.InitDecl parsed_init = self.parse_constructor_decl(item_start) ?? return false;

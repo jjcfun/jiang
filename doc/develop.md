@@ -117,7 +117,7 @@ Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是
 | `DeclId` | AST 顶层 declaration index，保存在 `scope.Binding.decl_id` | 指向 `AstFile.items` 中的顶层声明 | `AstFile.decl_at(binding.decl_id.id)` |
 | `BindingId` | `ResolveResult.top_level` / `export_scope` 内的 binding table | 当前模块顶层声明、import alias、module alias 的稳定句柄 | `ResolveResult.lookup_top_level_id(symbol_id)`；type check 后用 `TypeCheckResult.lookup_binding_type(binding_id)` |
 | `LocalBindingId` | `ResolveResult.local_bindings` | function param、local var、pattern binding、for binding 的稳定句柄 | `ResolveResult.lookup_local_binding_span(span)`；type check 后用 `TypeCheckResult.lookup_local_type(local_id)` |
-| `TypeId` | `TypeTable.items` | 语义类型句柄，和 AST type syntax 分离 | `TypeTable.type_at(type_id)`、`type_equals(...)`、`compatible(...)` |
+| `TypeId` | `CompilerContext.types` / `TypeTable.items` | 编译会话内全局语义类型句柄，和 AST type syntax 分离 | `CompilerContext.types_ref().type_at(type_id)`、`type_equals(...)`、`compatible(...)` |
 | `HirDeclId` | `HirModule.decls` | HIR declaration index | `HirModule.decl_at(id)` |
 | `HirStmtId` | `HirModule.stmts` | HIR statement index | `HirModule.stmt_at(id)` |
 | `HirExprId` | `HirModule.exprs` | HIR expression index | `HirModule.expr_at(id)` |
@@ -127,7 +127,7 @@ Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是
 
 - parser 只创建 AST 和 `TypeRefId`。它不解析 `TypeRefId` 指向哪个声明。
 - resolver 创建 `BindingId` / `LocalBindingId`，并填充 `ResolveResult` side tables。
-- type checker 创建 `TypeId`，并填充 `TypeCheckResult` side tables。
+- type checker 在 `CompilerContext` 持有的全局 `TypeTable` 中创建 `TypeId`，并填充当前模块的 `TypeCheckResult` side tables。
 - HIR lowering 消费 `ResolveResult` 和 `TypeCheckResult`，把 AST 节点转换成携带 `BindingId` / `LocalBindingId` / `TypeId` 的 HIR 节点。
 - JIR / codegen 后续应继续使用结构化语义身份，最终 symbol name 只在 backend 边界生成。
 
@@ -136,6 +136,7 @@ Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是
 - `ResolveResult.resolved_type_paths`：`TypeRefId -> ResolvedTypePath`，用于查询 named type ref 被解析成 builtin、generic param、`Self`、本模块 binding 或 imported binding。
 - `ResolveResult.resolved_value_paths`：按 name 使用点 span 保存 value resolution 结果，用于查询 expression name 是 local、top-level 还是 imported module path。
 - `ResolveResult.local_bindings`：保存局部 binding 的 `LocalBindingId`、名字、span 和可变性。
+- `TypeCheckResult.type_table`：指向 `CompilerContext.types`，不拥有独立 per-module 类型表。
 - `TypeCheckResult.binding_types`：`BindingId -> TypeId`，保存顶层 binding 的类型。
 - `TypeCheckResult.function_result_types`：`BindingId -> TypeId`，保存 function result type。
 - `TypeCheckResult.local_types`：`LocalBindingId -> TypeId`，保存局部 binding 类型。
@@ -179,6 +180,7 @@ HIR expression type
 - `SourceManager`
 - AST arena
 - diagnostic arena 和 `DiagnosticBag`
+- 全局 `TypeTable`，所有模块的 `TypeId` 都从这里分配
 
 它拥有跨 frontend 阶段共享的长期状态。阶段内部的临时数据仍应放在对应阶段或局部 arena 中，不要无条件塞进 `CompilerContext`。
 
@@ -320,6 +322,8 @@ resolve 应使用 `scope.jiang` 和 `interner.jiang`，但不做完整类型推�
 - type equality 和 compatibility 辅助方法
 
 类型表示要和 AST 语法节点分离。
+
+`TypeTable` 由 `CompilerContext` 持有，`TypeId` 是一次编译会话内的全局 id。跨模块 imported type 不能再用局部 `JirModule` 或 AST 反查字段；后续 layout 查询应以全局 `TypeId` / `BindingId` 为入口。
 
 当前 `TypeTable.type_equals(a, b)` 表示语义类型的结构等价：builtin/type param 以 `Symbol` 比较，nominal type 以 binding identity 比较，tuple/function/pointer/slice/array/layer/errorable 递归比较子类型。
 
