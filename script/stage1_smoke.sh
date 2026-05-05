@@ -10,11 +10,13 @@ if [ -z "$LLVM_CONFIG" ] && [ -n "${JIANG_LLVM_ROOT:-}" ]; then
 fi
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 
-STAGE1_OBJ="${TMPDIR:-/tmp}/jiangc.o"
-STAGE1_LL="${TMPDIR:-/tmp}/jiangc.ll"
-STAGE1_BIN="${TMPDIR:-/tmp}/jiangc"
-INPUT="${TMPDIR:-/tmp}/jiang-stage1-smoke-input.jiang"
-OUTPUT="${TMPDIR:-/tmp}/jiang-stage1-smoke-out"
+STAGE1_BUILD_DIR="${STAGE1_BUILD_DIR:-$ROOT_DIR/build/stage1-smoke}"
+STAGE1_LL="$STAGE1_BUILD_DIR/jiangc.ll"
+STAGE1_BIN="$STAGE1_BUILD_DIR/jiangc"
+INPUT="$STAGE1_BUILD_DIR/input.jiang"
+OUTPUT="$STAGE1_BUILD_DIR/output"
+
+mkdir -p "$STAGE1_BUILD_DIR"
 
 if [ ! -x ./build/stage0c ]; then
   bash script/build_stage0.sh >/dev/null
@@ -67,7 +69,7 @@ fi
 run_sample() {
   local sample="$1"
   local expected="$2"
-  local exe="${TMPDIR:-/tmp}/jiang-stage1-${sample%.jiang}"
+  local exe="$STAGE1_BUILD_DIR/${sample%.jiang}"
   "$STAGE1_BIN" -o "$exe" "tests/samples/$sample"
   set +e
   "$exe"
@@ -75,6 +77,21 @@ run_sample() {
   set -e
   if [ "$status" -ne "$expected" ]; then
     echo "stage1 smoke failed: $sample expected exit $expected, got $status"
+    exit 1
+  fi
+}
+
+run_next_sample() {
+  local sample="$1"
+  local expected="$2"
+  local exe="$STAGE1_BUILD_DIR/next-${sample%.jiang}"
+  "$STAGE1_BIN" -o "$exe" "tests/samples_next/$sample"
+  set +e
+  "$exe"
+  local status=$?
+  set -e
+  if [ "$status" -ne "$expected" ]; then
+    echo "stage1 smoke failed: samples_next/$sample expected exit $expected, got $status"
     exit 1
   fi
 }
@@ -90,6 +107,7 @@ run_sample if_expr_minimal.jiang 42
 run_sample while_minimal.jiang 10
 run_sample for_range_minimal.jiang 8
 run_sample array_minimal.jiang 42
+run_next_sample raw_pointer_minimal.jiang 42
 run_sample tuple_value_minimal.jiang 42
 run_sample enum_minimal.jiang 2
 run_sample union_minimal.jiang 42

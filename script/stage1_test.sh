@@ -5,7 +5,8 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build/stage1-tests}"
 SAMPLES_DIR="$PROJECT_ROOT/tests/samples"
-STAGE1_BIN="${STAGE1_BIN:-${TMPDIR:-/tmp}/jiangc}"
+NEXT_SAMPLES_DIR="$PROJECT_ROOT/tests/samples_next"
+STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1-smoke/jiangc}"
 
 if [[ -n "${LLVM_CONFIG:-}" ]]; then
   LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"
@@ -46,6 +47,21 @@ run_sample() {
   set -e
   if [[ "$status" -ne "$expected" ]]; then
     echo "error: $sample exited $status, expected $expected" >&2
+    exit 1
+  fi
+}
+
+run_next_sample() {
+  local sample="$1"
+  local expected="$2"
+  local ir="$BUILD_DIR/next-${sample%.jiang}.ll"
+  "$STAGE1_BIN" --emit-llvm "$NEXT_SAMPLES_DIR/$sample" > "$ir"
+  set +e
+  "$LLI" "$ir"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "error: samples_next/$sample exited $status, expected $expected" >&2
     exit 1
   fi
 }
@@ -186,6 +202,7 @@ run_compile_fail invalid_init_self_field_ptr_escape.jiang
 run_sample pointer_offset_uint8_minimal.jiang 101
 run_sample pointer_offset_int_minimal.jiang 42
 run_sample many_pointer_assign_minimal.jiang 10
+run_next_sample raw_pointer_minimal.jiang 42
 run_sample as_addr_minimal.jiang 2
 run_sample as_pointer_reinterpret_minimal.jiang 42
 run_sample free_minimal.jiang 0
