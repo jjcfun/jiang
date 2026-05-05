@@ -43,16 +43,21 @@
   - [x] call target 通过 `DeclId -> JirDeclRef` 解析。
 - [x] 将 `JirModule` 的 decl、stmt、expr 存储从 `ArenaRefList` 改为
   `ArenaList`；`JirDeclId`、`JirStmtId`、`JirExprId` 只保留本地索引用途。
-- [ ] 增加常用查询 helper。
-  - [ ] `decl_info(DeclId) -> DeclInfo`
-  - [ ] `type_info(TypeId) -> TypeInfo`
-  - [ ] `nominal_decl(TypeId) -> DeclInfo`
-  - [ ] `jir_decl_ref(DeclId) -> JirDeclRef`
-  - [ ] `jir_decl(JirDeclRef) -> JirDecl`
-- [ ] 重构 `lower_hir`、`lower_jir` 和 codegen，让它们使用新的 helper，
+- [x] 增加常用查询 helper。
+  - [x] `decl_info(DeclId) -> DeclInfo`
+  - [x] `type_info(TypeId) -> TypeInfo`
+  - [x] `nominal_decl(TypeId) -> DeclInfo`
+  - [x] `hir_decl_ref(DeclId) -> HirDeclRef`
+  - [x] `jir_decl_ref(DeclId) -> JirDeclRef`
+  - [x] codegen 内部的 `jir_decl(JirDeclRef) -> JirDecl`
+- [x] 重构 `lower_jir` 和 codegen，让它们使用新的 helper，
   不再依赖扫描式查找或指针式查找。
-- [ ] 在新的 `decl_table`、module table 和 lowering maps 覆盖旧用途后，
+- [x] 继续重构 `lower_hir`，让它在需要跨声明语义信息时也优先使用 helper，
+  不再依赖扫描式查找或指针式查找。
+- [x] 在新的 `decl_table`、module table 和 lowering maps 覆盖旧用途后，
   删除过时的 semantic lookup 表。
+  - [x] 删除 `SemanticContext.binding_types`。
+  - [x] 删除 `SemanticContext.function_result_types`。
 
 验证：
 
