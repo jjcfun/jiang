@@ -74,17 +74,17 @@
 
 ## 第五阶段：调试与编译入口清理
 
-- [ ] 删除空实现 `debug_log` 以及无效果调用。
-- [ ] 如果仍需要调试日志，改成显式 debug flag。
-- [ ] 检查 `compiler.jiang` 的 compiler source preload：
-  - [ ] 普通用户编译不应无条件 preload compiler 源。
-  - [ ] self-host 编译器源码时再按 import 图加载。
-- [ ] 检查 `jiangc.jiang` 的临时输出路径：
-  - [ ] 避免固定写 `/tmp/jiang-stage1-temp.o`。
-  - [ ] 支持更明确的临时文件策略。
+- [x] 删除空实现 `debug_log` 以及无效果调用。
+- [x] 如果仍需要调试日志，改成显式 debug flag。
+- [x] 检查 `compiler.jiang` 的 compiler source preload：
+  - [x] 普通用户编译不应无条件 preload compiler 源。
+  - [x] self-host 编译器源码时再按 import 图加载。
+- [x] 检查 `jiangc.jiang` 的临时输出路径：
+  - [x] 避免固定写 `/tmp/jiang-stage1-temp.o`。
+  - [x] 支持更明确的临时文件策略。
 
 ## 每阶段验证
 
-- [ ] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh`
-- [ ] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_smoke.sh`
-- [ ] 必要时用 `./build/stage1-smoke/jiangc` 编译新增样例。
+- [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh`
+- [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_smoke.sh`
+- [x] 必要时用 `./build/stage1-smoke/jiangc` 编译新增样例。
