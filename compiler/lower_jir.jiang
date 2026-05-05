@@ -38,12 +38,28 @@ public struct JirLowerer {
     context.CompilerContext& ctx;
     hir.HirModule& module_input;
     jir.JirModule! module;
+    UInt8[]! source_text;
+    scope.BindingId! active_type_binding_id;
+    Int! active_type_decl_ref;
     Int! temp_count;
 
     init(context.CompilerContext& ctx, hir.HirModule& source_module) {
         self.ctx = ctx;
         self.module_input = source_module;
         self.module = jir.JirModule(ctx.ast_store_ref());
+        self.source_text = "";
+        self.active_type_binding_id = scope.BindingId();
+        self.active_type_decl_ref = 0;
+        self.temp_count = 0;
+    }
+
+    init(context.CompilerContext& ctx, hir.HirModule& source_module, UInt8[] source_text) {
+        self.ctx = ctx;
+        self.module_input = source_module;
+        self.module = jir.JirModule(ctx.ast_store_ref());
+        self.source_text = source_text;
+        self.active_type_binding_id = scope.BindingId();
+        self.active_type_decl_ref = 0;
         self.temp_count = 0;
     }
 
@@ -89,7 +105,7 @@ public struct JirLowerer {
             return self.lower_type_decl(trait_decl.span, trait_decl.name, trait_decl.binding_id, trait_decl.type_id, .trait_decl, trait_decl.public_flag);
         }
         if (decl.body is .extend_decl(extend_decl)) {
-            jir.JirExtendDecl! lowered = jir.JirExtendDecl(self.module.store, extend_decl.span, extend_decl.target);
+            jir.JirExtendDecl! lowered = jir.JirExtendDecl(self.module.store, extend_decl.span, self.type_from_ast_ref(extend_decl.target));
             Int! index = 0;
             while (index < extend_decl.items.len()) {
                 hir.HirDecl item = self.module_input.decl_at(extend_decl.items[index]);
@@ -107,13 +123,151 @@ public struct JirLowerer {
         return jir.JirDecl(span, .type_decl(lowered));
     }
 
+    Int decl_ref_for_binding(scope.BindingId binding_id) {
+        if (!binding_id.valid()) {
+            return 0;
+        }
+        Int! index = 0;
+        while (index < self.module.decl_count()) {
+            jir.JirDecl!& decl = self.module.decl_ref_at(jir.JirDeclId(index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (function_decl.binding_id.id == binding_id.id) {
+                    return decl$.ptr()$.as(Int);
+                }
+            }
+            if (decl.body is .global_decl(global_decl)) {
+                if (global_decl.binding_id.id == binding_id.id) {
+                    return decl$.ptr()$.as(Int);
+                }
+            }
+            index = index + 1;
+        }
+        return 0;
+    }
+
+    jir.JirNameExpr lower_name_expr(hir.HirNameExpr name) {
+        return jir.JirNameExpr(name.name, name.binding_id, name.local_id, self.decl_ref_for_binding(name.binding_id));
+    }
+
     types.TypeId bool_type(token.Span span) {
         types.TypeTable& table = self.ctx.types_ref();
         return table.make_builtin(span, self.ctx.intern("Bool"));
     }
 
+    types.NominalKind type_decl_nominal_kind(jir.JirTypeDeclKind kind) {
+        if (kind == .struct_decl) { return .struct_decl; }
+        if (kind == .enum_decl) { return .enum_decl; }
+        if (kind == .union_decl) { return .union_decl; }
+        if (kind == .trait_decl) { return .trait_decl; }
+        if (kind == .alias_decl) { return .alias_decl; }
+        return .unknown;
+    }
+
+    types.PointerKind pointer_kind_from_ir(ir.PointerKind pointer_kind) {
+        if (pointer_kind == .owner) { return types.PointerKind.owner; }
+        if (pointer_kind == .many) { return types.PointerKind.many; }
+        if (pointer_kind == .raw) { return types.PointerKind.raw; }
+        return types.PointerKind.borrow;
+    }
+
+    Bool active_generic_param(Int symbol_id) {
+        if (self.active_type_decl_ref == 0) { return false; }
+        jir.JirTypeDecl^ active_decl = self.active_type_decl_ref$.as(jir.JirTypeDecl^);
+        Int! index = 0;
+        while (index < active_decl.generic_params.len()) {
+            if (active_decl.generic_params[index].symbol.id == symbol_id) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    types.TypeId type_from_named_decl(ir.NamedType named, ir.Name last, jir.JirTypeDecl& decl) {
+        types.TypeTable& table = self.ctx.types_ref();
+        list.ArenaList<types.TypeId>! generic_args = list.ArenaList<types.TypeId>(self.ctx.ast_store_ref());
+        Int! index = 0;
+        while (index < named.args.len()) {
+            generic_args.add(self.type_from_ast_ref(named.args[index]));
+            index = index + 1;
+        }
+        if (generic_args.len() == 0) {
+            return table.make_nominal(named.span, last.symbol, decl.binding_id, self.type_decl_nominal_kind(decl.kind));
+        }
+        Int child_start = table.begin_children();
+        index = 0;
+        while (index < generic_args.len()) {
+            table.add_child(generic_args[index]);
+            index = index + 1;
+        }
+        return table.make_nominal_with_args(named.span, last.symbol, decl.binding_id, self.type_decl_nominal_kind(decl.kind), child_start, generic_args.len());
+    }
+
+    types.TypeId type_from_ast_ref(ir.AstType type_ref) {
+        types.TypeTable& table = self.ctx.types_ref();
+        if (type_ref is .unit(span)) {
+            return table.make_unit(span);
+        }
+        if (type_ref is .named(named)) {
+            if (named.path.segment_len() > 0) {
+                ir.Name last = named.path.segments[named.path.segment_len() - 1];
+                if (self.active_generic_param(last.symbol.id)) {
+                    return table.make_type_param(named.span, last.symbol);
+                }
+                if (self.ctx.symbol_equal(last.symbol, "Int")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "UInt")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Bool")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Char")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "UInt8")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Int8")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "UInt16")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Int16")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "UInt32")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Int32")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "UInt64")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Int64")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Float16")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Float32")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.ctx.symbol_equal(last.symbol, "Float64")) { return table.make_builtin(named.span, last.symbol); }
+                if (self.active_type_decl_ref != 0) {
+                    jir.JirTypeDecl^ active_decl = self.active_type_decl_ref$.as(jir.JirTypeDecl^);
+                    if (active_decl.name.symbol.id == last.symbol.id) {
+                        return self.type_from_named_decl(named, last, active_decl$.ref());
+                    }
+                }
+                Int type_decl_ref = self.type_decl_ref_for_symbol(last.symbol.id);
+                if (type_decl_ref != 0) {
+                    jir.JirDecl^ decl_ref = type_decl_ref$.as(jir.JirDecl^);
+                    if (decl_ref.body is .type_decl(type_decl)) {
+                        return self.type_from_named_decl(named, last, type_decl$.ref());
+                    }
+                }
+            }
+        }
+        if (type_ref is .pointer(pointer)) {
+            return table.make_pointer_kind(pointer.span, self.type_from_ast_ref(pointer.element), self.pointer_kind_from_ir(pointer.pointer_kind), pointer.mutable_item, pointer.many);
+        }
+        if (type_ref is .slice(slice)) {
+            return table.make_slice(slice.span, self.type_from_ast_ref(slice.element));
+        }
+        if (type_ref is .array(array)) {
+            return table.make_array(array.span, self.type_from_ast_ref(array.element), true, 0);
+        }
+        if (type_ref is .layer(layer)) {
+            return table.make_layer(layer.span, self.type_from_ast_ref(layer.element), layer.flags.optional, layer.flags.mutable);
+        }
+        if (type_ref is .errorable(errorable)) {
+            return table.make_errorable(errorable.span, self.type_from_ast_ref(errorable.value), self.type_from_ast_ref(errorable.error));
+        }
+        return types.TypeId();
+    }
+
     jir.JirDecl lower_struct_decl(hir.HirStructDecl decl) {
         jir.JirTypeDecl! lowered = jir.JirTypeDecl(self.module.store, decl.span, decl.name, decl.binding_id, decl.type_id, .struct_decl, decl.public_flag);
+        scope.BindingId previous_binding_id = self.active_type_binding_id;
+        Int previous_type_decl_ref = self.active_type_decl_ref;
+        self.active_type_binding_id = decl.binding_id;
+        self.active_type_decl_ref = lowered$.ptr()$.as(Int);
         Int! generic_index = 0;
         while (generic_index < decl.generic_params.len()) {
             lowered.generic_params.add(decl.generic_params[generic_index]);
@@ -122,7 +276,7 @@ public struct JirLowerer {
         Int! index = 0;
         while (index < decl.fields.len()) {
             hir.HirFieldDecl field = decl.fields[index];
-            lowered.fields.add(jir.JirFieldDecl(field.span, field.name, field.type_ref, self.lower_plain_expr_id(field.default_value)));
+            lowered.fields.add(jir.JirFieldDecl(field.span, field.name, self.type_from_ast_ref(field.type_ref), self.lower_plain_expr_id(field.default_value)));
             index = index + 1;
         }
         index = 0;
@@ -130,6 +284,8 @@ public struct JirLowerer {
             lowered.inits.add(self.lower_init_decl(decl.inits[index]));
             index = index + 1;
         }
+        self.active_type_binding_id = previous_binding_id;
+        self.active_type_decl_ref = previous_type_decl_ref;
         return jir.JirDecl(decl.span, .type_decl(lowered));
     }
 
@@ -149,14 +305,343 @@ public struct JirLowerer {
         Int! index = 0;
         while (index < decl.members.len()) {
             hir.HirEnumMember member = decl.members[index];
-            lowered.members.add(jir.JirEnumMember(member.span, member.name, self.lower_plain_expr_id(member.value)));
+            jir.JirExprId value = self.lower_plain_expr_id(member.value);
+            if (member.value.valid()) {
+                hir.HirExpr value_expr = self.module_input.expr_at(member.value);
+                if (value_expr.body is .hir_literal(literal)) {
+                    if (literal is .int_lit(span)) {
+                        lowered.members.add(jir.JirEnumMember(member.span, member.name, value, self.parse_uint_literal(span)));
+                    } else {
+                        lowered.members.add(jir.JirEnumMember(member.span, member.name, value));
+                    }
+                } else {
+                    lowered.members.add(jir.JirEnumMember(member.span, member.name, value));
+                }
+            } else {
+                lowered.members.add(jir.JirEnumMember(member.span, member.name, value));
+            }
             index = index + 1;
         }
         return jir.JirDecl(decl.span, .type_decl(lowered));
     }
 
+    UInt64 parse_uint_literal(token.Span span) {
+        UInt64! result = UInt64(0);
+        Int! index = 0;
+        while (index < span.length && span.start + index < self.source_text.length) {
+            UInt8 byte = self.source_text[span.start + index];
+            if (byte >= '0' && byte <= '9') {
+                result = result * UInt64(10) + UInt64(byte - '0');
+            }
+            index = index + 1;
+        }
+        return result;
+    }
+
+    UInt64 parse_char_literal(token.Span span) {
+        if (span.length < 3 || span.start + 1 >= self.source_text.length) { return UInt64(0); }
+        UInt8 first = self.source_text[span.start + 1];
+        if (first != '\\') {
+            return UInt64(first);
+        }
+        if (span.length < 4 || span.start + 2 >= self.source_text.length) { return UInt64(0); }
+        UInt8 escaped = self.source_text[span.start + 2];
+        if (escaped == 'n') { return UInt64(10); }
+        if (escaped == 'r') { return UInt64(13); }
+        if (escaped == 't') { return UInt64(9); }
+        if (escaped == '0') { return UInt64(0); }
+        if (escaped == '\\') { return UInt64('\\'); }
+        if (escaped == '\'') { return UInt64('\''); }
+        return UInt64(escaped);
+    }
+
+    UInt8[*] span_c_string(token.Span span) {
+        UInt8![*] data = self.module.store.alloc_array<UInt8>(span.length + 1);
+        Int! index = 0;
+        while (index < span.length && span.start + index < self.source_text.length) {
+            data[index] = self.source_text[span.start + index];
+            index = index + 1;
+        }
+        data[index] = 0;
+        return data$.as(UInt8[*]);
+    }
+
+    UInt8[*] string_literal_c_string(token.Span span) {
+        UInt8![*] data = self.module.store.alloc_array<UInt8>(span.length);
+        Int! source_index = span.start + 1;
+        Int end = span.start + span.length - 1;
+        Int! out_index = 0;
+        while (source_index < end && source_index < self.source_text.length) {
+            UInt8! ch = self.source_text[source_index];
+            if (ch == '\\' && source_index + 1 < end && source_index + 1 < self.source_text.length) {
+                source_index = source_index + 1;
+                UInt8 escaped = self.source_text[source_index];
+                if (escaped == 'n') {
+                    ch = UInt8(10);
+                } else if (escaped == 'r') {
+                    ch = UInt8(13);
+                } else if (escaped == 't') {
+                    ch = UInt8(9);
+                } else if (escaped == '0') {
+                    ch = UInt8(0);
+                } else {
+                    ch = escaped;
+                }
+            }
+            data[out_index] = ch;
+            out_index = out_index + 1;
+            source_index = source_index + 1;
+        }
+        data[out_index] = 0;
+        return data$.as(UInt8[*]);
+    }
+
+    jir.JirLiteral lower_literal(ir.Literal literal) {
+        if (literal is .int_lit(span)) {
+            return jir.JirLiteral(span, .int_lit, self.parse_uint_literal(span), false, self.span_c_string(span), span.length);
+        }
+        if (literal is .float_lit(span)) {
+            return jir.JirLiteral(span, .float_lit, UInt64(0), false, self.span_c_string(span), span.length);
+        }
+        if (literal is .char_lit(span)) {
+            return jir.JirLiteral(span, .char_lit, self.parse_char_literal(span), false, null, 0);
+        }
+        if (literal is .string_lit(span)) {
+            return jir.JirLiteral(span, .string_lit, UInt64(0), false, self.string_literal_c_string(span), span.length);
+        }
+        if (literal is .bool_lit(bool_lit)) {
+            return jir.JirLiteral(bool_lit.span, .bool_lit, UInt64(0), bool_lit.value, null, 0);
+        }
+        if (literal is .null_lit(span)) {
+            return jir.JirLiteral(span, .null_lit, UInt64(0), false, null, 0);
+        }
+        return jir.JirLiteral();
+    }
+
+    jir.JirIndexExpr lower_index_expr(hir.HirIndexExpr index_expr, jir.JirExprId base, jir.JirExprId index) {
+        hir.HirExpr index_value = self.module_input.expr_at(index_expr.index);
+        if (index_value.body is .hir_literal(literal)) {
+            if (literal is .int_lit(span)) {
+                return jir.JirIndexExpr(base, index, index_expr.optional_chain, self.parse_uint_literal(span));
+            }
+        }
+        return jir.JirIndexExpr(base, index, index_expr.optional_chain);
+    }
+
+    jir.JirTypeDecl? type_decl_for_binding(scope.BindingId binding_id) {
+        Int! index = 0;
+        while (index < self.module.decl_count()) {
+            jir.JirDecl decl = self.module.decl_at(jir.JirDeclId(index));
+            if (decl.body is .type_decl(type_decl)) {
+                if (type_decl.binding_id.id == binding_id.id) {
+                    return type_decl;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Int type_decl_ref_for_binding(scope.BindingId binding_id) {
+        if (!binding_id.valid()) { return 0; }
+        Int! index = 0;
+        while (index < self.module.decl_count()) {
+            jir.JirDecl!& decl = self.module.decl_ref_at(jir.JirDeclId(index));
+            if (decl.body is .type_decl(type_decl)) {
+                if (type_decl.binding_id.id == binding_id.id) {
+                    return decl$.ptr()$.as(Int);
+                }
+            }
+            index = index + 1;
+        }
+        return 0;
+    }
+
+    Int type_decl_ref_for_symbol(Int symbol_id) {
+        Int! index = 0;
+        while (index < self.module.decl_count()) {
+            jir.JirDecl!& decl = self.module.decl_ref_at(jir.JirDeclId(index));
+            if (decl.body is .type_decl(type_decl)) {
+                if (type_decl.name.symbol.id == symbol_id) {
+                    return decl$.ptr()$.as(Int);
+                }
+            }
+            index = index + 1;
+        }
+        return 0;
+    }
+
+    Int type_decl_ref_for_type(types.TypeId type_id) {
+        if (!type_id.valid()) { return 0; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(type_id);
+        if ((info.kind == .layer || info.kind == .pointer) && info.element.valid()) {
+            return self.type_decl_ref_for_type(info.element);
+        }
+        if (info.kind == .nominal) {
+            return self.type_decl_ref_for_binding(info.binding_id);
+        }
+        return 0;
+    }
+
+    Int field_index_name(jir.JirTypeDecl decl, ir.Name field_name) {
+        Int! index = 0;
+        while (index < decl.fields.len()) {
+            if (decl.fields[index].name.symbol.id == field_name.symbol.id) {
+                return index;
+            }
+            index = index + 1;
+        }
+        return -1;
+    }
+
+    Int field_index_for_type(types.TypeId type_id, ir.Name field_name) {
+        if (!type_id.valid()) { return -1; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(type_id);
+        if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
+            if (self.active_type_decl_ref != 0 && self.active_type_binding_id.id == info.binding_id.id) {
+                jir.JirTypeDecl^ active_decl = self.active_type_decl_ref$.as(jir.JirTypeDecl^);
+                return self.field_index_name(active_decl, field_name);
+            }
+            jir.JirTypeDecl? decl = self.type_decl_for_binding(info.binding_id);
+            if (decl is some type_decl) {
+                return self.field_index_name(type_decl, field_name);
+            }
+        }
+        if (info.kind == .pointer || info.kind == .layer) {
+            return self.field_index_for_type(info.element, field_name);
+        }
+        return -1;
+    }
+
+    Bool field_type_optional_for_type(types.TypeId type_id, ir.Name field_name) {
+        if (!type_id.valid()) { return false; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(type_id);
+        if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
+            if (self.active_type_decl_ref != 0 && self.active_type_binding_id.id == info.binding_id.id) {
+                jir.JirTypeDecl^ active_decl = self.active_type_decl_ref$.as(jir.JirTypeDecl^);
+                Int index = self.field_index_name(active_decl, field_name);
+                if (index >= 0) {
+                    return self.field_type_optional(active_decl.fields[index].type_id);
+                }
+                return false;
+            }
+            jir.JirTypeDecl? decl = self.type_decl_for_binding(info.binding_id);
+            if (decl is some type_decl) {
+                Int index = self.field_index_name(type_decl, field_name);
+                if (index >= 0) {
+                    return self.field_type_optional(type_decl.fields[index].type_id);
+                }
+            }
+            return false;
+        }
+        if (info.kind == .pointer || info.kind == .layer) {
+            return self.field_type_optional_for_type(info.element, field_name);
+        }
+        return false;
+    }
+
+    Bool field_type_optional(types.TypeId type_id) {
+        if (!type_id.valid()) { return false; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(type_id);
+        return info.kind == .layer && info.optional;
+    }
+
+    jir.JirFieldExpr lower_field_expr(jir.JirExprId base, ir.Name name, Bool optional_chain) {
+        jir.JirExpr base_expr = self.module.expr_at(base);
+        return jir.JirFieldExpr(
+            base,
+            name,
+            optional_chain,
+            self.field_index_for_type(base_expr.type_id, name),
+            self.field_type_optional_for_type(base_expr.type_id, name),
+            self.type_decl_ref_for_type(base_expr.type_id),
+            self.variant_index_for_type(base_expr.type_id, name)
+        );
+    }
+
+    ir.Name variant_name_from_path(ir.Path path) {
+        if (path.segment_len() >= 2) {
+            return path.segments[1];
+        }
+        if (path.segment_len() == 1) {
+            return path.segments[0];
+        }
+        return ir.Name(token.Span(), self.ctx.intern("<invalid>"));
+    }
+
+    Int variant_index_name(jir.JirTypeDecl decl, ir.Name variant_name) {
+        if (decl.kind == .enum_decl) {
+            Int! index = 0;
+            while (index < decl.members.len()) {
+                if (decl.members[index].name.symbol.id == variant_name.symbol.id) {
+                    return index;
+                }
+                index = index + 1;
+            }
+        }
+        if (decl.kind == .union_decl) {
+            Int! index = 0;
+            while (index < decl.variants.len()) {
+                if (decl.variants[index].name.symbol.id == variant_name.symbol.id) {
+                    return index;
+                }
+                index = index + 1;
+            }
+        }
+        return -1;
+    }
+
+    Int variant_index_for_type(types.TypeId type_id, ir.Name variant_name) {
+        Int type_ref = self.type_decl_ref_for_type(type_id);
+        if (type_ref == 0) { return -1; }
+        jir.JirDecl^ decl_ref = type_ref$.as(jir.JirDecl^);
+        if (decl_ref.body is .type_decl(type_decl)) {
+            return self.variant_index_name(type_decl, variant_name);
+        }
+        return -1;
+    }
+
+    jir.JirVariantExpr lower_variant_metadata(jir.JirVariantExpr expr, types.TypeId type_id) {
+        jir.JirVariantExpr! result = expr;
+        result.type_decl_ref = self.type_decl_ref_for_type(type_id);
+        if (result.type_decl_ref == 0 && expr.path.segment_len() >= 2) {
+            result.type_decl_ref = self.type_decl_ref_for_symbol(expr.path.segments[0].symbol.id);
+        }
+        if (result.type_decl_ref != 0) {
+            jir.JirDecl^ decl_ref = result.type_decl_ref$.as(jir.JirDecl^);
+            if (decl_ref.body is .type_decl(type_decl)) {
+                result.variant_index = self.variant_index_name(type_decl, self.variant_name_from_path(expr.path));
+            }
+        } else {
+            result.variant_index = self.variant_index_for_type(type_id, self.variant_name_from_path(expr.path));
+        }
+        return result;
+    }
+
+    jir.JirPatternTest variant_pattern_test(token.Span span, jir.JirExprId value, hir.HirVariantPattern variant) {
+        jir.JirExpr test_value = self.module.expr_at(value);
+        Int type_decl_ref = self.type_decl_ref_for_type(test_value.type_id);
+        Int variant_index = self.variant_index_for_type(test_value.type_id, self.variant_name_from_path(variant.path));
+        return jir.JirPatternTest(span, value, .variant, null, variant.path, type_decl_ref, variant_index);
+    }
+
+    Int struct_init_field_index(types.TypeId type_id, hir.HirStructFieldInit field, Int position) {
+        if (field.name is some name) {
+            return self.field_index_for_type(type_id, name);
+        }
+        return position;
+    }
+
     jir.JirDecl lower_union_decl(hir.HirUnionDecl decl) {
         jir.JirTypeDecl! lowered = jir.JirTypeDecl(self.module.store, decl.span, decl.name, decl.binding_id, decl.type_id, .union_decl, decl.public_flag);
+        scope.BindingId previous_binding_id = self.active_type_binding_id;
+        Int previous_type_decl_ref = self.active_type_decl_ref;
+        self.active_type_binding_id = decl.binding_id;
+        self.active_type_decl_ref = lowered$.ptr()$.as(Int);
         Int! generic_index = 0;
         while (generic_index < decl.generic_params.len()) {
             lowered.generic_params.add(decl.generic_params[generic_index]);
@@ -165,9 +650,11 @@ public struct JirLowerer {
         Int! index = 0;
         while (index < decl.variants.len()) {
             hir.HirUnionVariant variant = decl.variants[index];
-            lowered.variants.add(jir.JirUnionVariantDecl(variant.span, variant.name, variant.type_ref));
+            lowered.variants.add(jir.JirUnionVariantDecl(variant.span, variant.name, self.type_from_ast_ref(variant.type_ref)));
             index = index + 1;
         }
+        self.active_type_binding_id = previous_binding_id;
+        self.active_type_decl_ref = previous_type_decl_ref;
         return jir.JirDecl(decl.span, .type_decl(lowered));
     }
 
@@ -566,14 +1053,14 @@ public struct JirLowerer {
 
     LoweredValue append_plain_value_expr(jir.JirBlock block, hir.HirExpr expr, DeferContext context) {
         if (expr.body is .hir_literal(literal)) {
-            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .literal_expr(literal))));
+            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .literal_expr(self.lower_literal(literal)))));
         }
         if (expr.body is .hir_name(name)) {
-            jir.JirNameExpr lowered = jir.JirNameExpr(name.name, name.binding_id, name.local_id);
+            jir.JirNameExpr lowered = self.lower_name_expr(name);
             return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .name_expr(lowered))));
         }
         if (expr.body is .hir_type_value(type_ref)) {
-            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .type_value_expr(type_ref))));
+            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .type_value_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref))))));
         }
         if (expr.body is .hir_self(span)) {
             return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .self_expr(span))));
@@ -582,17 +1069,17 @@ public struct JirLowerer {
             return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .implicit_expr(span))));
         }
         if (expr.body is .hir_size_of_type(type_ref)) {
-            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .size_of_type_expr(type_ref))));
+            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .size_of_type_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref))))));
         }
         if (expr.body is .hir_align_of_type(type_ref)) {
-            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .align_of_type_expr(type_ref))));
+            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .align_of_type_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref))))));
         }
         if (expr.body is .hir_max_align_of_type(type_ref)) {
-            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .max_align_of_type_expr(type_ref))));
+            return LoweredValue(block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .max_align_of_type_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref))))));
         }
         if (expr.body is .hir_cast(cast)) {
             LoweredValue value = self.append_value_expr(block, cast.value, context);
-            jir.JirCastExpr lowered = jir.JirCastExpr(value.value, cast.target);
+            jir.JirCastExpr lowered = jir.JirCastExpr(value.value, self.type_from_ast_ref(cast.target));
             return LoweredValue(value.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .cast_expr(lowered))));
         }
         if (expr.body is .hir_unary(unary)) {
@@ -614,13 +1101,13 @@ public struct JirLowerer {
         }
         if (expr.body is .hir_field(field)) {
             LoweredValue base = self.append_value_expr(block, field.base, context);
-            jir.JirFieldExpr lowered = jir.JirFieldExpr(base.value, field.name, field.optional_chain);
+            jir.JirFieldExpr lowered = self.lower_field_expr(base.value, field.name, field.optional_chain);
             return LoweredValue(base.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .field_expr(lowered))));
         }
         if (expr.body is .hir_index(index_expr)) {
             LoweredValue base = self.append_value_expr(block, index_expr.base, context);
             LoweredValue index = self.append_value_expr(base.block, index_expr.index, context);
-            jir.JirIndexExpr lowered = jir.JirIndexExpr(base.value, index.value, index_expr.optional_chain);
+            jir.JirIndexExpr lowered = self.lower_index_expr(index_expr, base.value, index.value);
             return LoweredValue(index.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .index_expr(lowered))));
         }
         if (expr.body is .hir_slice(slice_expr)) {
@@ -719,7 +1206,7 @@ public struct JirLowerer {
         jir.JirBlock! catch_block = jir.JirBlock(self.module.store, span);
         catch_block = self.append_expr_assignment(catch_block, span, target, catch_handler.handler, context);
         jir.JirTryStmt! lowered = jir.JirTryStmt(self.module.store, span, body);
-        lowered.catches.add(jir.JirCatchStmt(span, null, catch_handler.binding, catch_handler.local_id, catch_handler.type_id, catch_handler.mutable_binding, catch_block));
+        lowered.catches.add(jir.JirCatchStmt(span, catch_handler.binding, catch_handler.local_id, catch_handler.type_id, catch_handler.mutable_binding, catch_block));
         jir.JirBlock! result = block;
         result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(lowered))));
         return result;
@@ -727,13 +1214,14 @@ public struct JirLowerer {
 
     LoweredValue append_struct_expr(jir.JirBlock block, token.Span span, types.TypeId type_id, hir.HirStructExpr expr, DeferContext context) {
         jir.JirStructExpr! lowered = jir.JirStructExpr(self.module.store, expr.path);
+        lowered.type_decl_ref = self.type_decl_ref_for_type(type_id);
         jir.JirBlock! result = block;
         Int! index = 0;
         while (index < expr.fields.len()) {
             hir.HirStructFieldInit field = expr.fields[index];
             LoweredValue value = self.append_value_expr(result, field.value, context);
             result = value.block;
-            lowered.fields.add(jir.JirStructFieldInit(field.span, field.name, value.value));
+            lowered.fields.add(jir.JirStructFieldInit(field.span, field.name, value.value, self.struct_init_field_index(type_id, field, index)));
             index = index + 1;
         }
         return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .struct_expr(lowered))));
@@ -741,6 +1229,7 @@ public struct JirLowerer {
 
     LoweredValue append_variant_expr(jir.JirBlock block, token.Span span, types.TypeId type_id, hir.HirVariantExpr expr, DeferContext context) {
         jir.JirVariantExpr! lowered = jir.JirVariantExpr(self.module.store, expr.path);
+        lowered = self.lower_variant_metadata(lowered, type_id);
         jir.JirBlock! result = block;
         Int! index = 0;
         while (index < expr.payload.len()) {
@@ -769,7 +1258,7 @@ public struct JirLowerer {
     }
 
     jir.JirExprId bool_literal_expr(token.Span span, types.TypeId type_id, Bool value) {
-        ir.Literal literal = .bool_lit(ir.BoolLiteral(span, value));
+        jir.JirLiteral literal = jir.JirLiteral(span, .bool_lit, UInt64(0), value, null, 0);
         return self.module.add_expr(jir.JirExpr(span, type_id, .literal_expr(literal)));
     }
 
@@ -857,7 +1346,7 @@ public struct JirLowerer {
             hir.HirCatchExpr catch_expr = expr.catches[index];
             jir.JirBlock! catch_block = jir.JirBlock(self.module.store, catch_expr.span);
             catch_block = self.append_expr_assignment(catch_block, catch_expr.span, target, catch_expr.value, context);
-            lowered.catches.add(jir.JirCatchStmt(catch_expr.span, catch_expr.error_type, catch_expr.binding, catch_expr.local_id, catch_expr.type_id, catch_expr.mutable_binding, catch_block));
+            lowered.catches.add(jir.JirCatchStmt(catch_expr.span, catch_expr.binding, catch_expr.local_id, catch_expr.type_id, catch_expr.mutable_binding, catch_block));
             index = index + 1;
         }
         result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(lowered))));
@@ -869,7 +1358,7 @@ public struct JirLowerer {
         Int! index = 0;
         while (index < expr.catches.len()) {
             hir.HirCatchExpr catch_expr = expr.catches[index];
-            lowered.catches.add(jir.JirCatchStmt(catch_expr.span, catch_expr.error_type, catch_expr.binding, catch_expr.local_id, catch_expr.type_id, catch_expr.mutable_binding, self.lower_expr_as_stmt_block(catch_expr.span, catch_expr.value, context)));
+            lowered.catches.add(jir.JirCatchStmt(catch_expr.span, catch_expr.binding, catch_expr.local_id, catch_expr.type_id, catch_expr.mutable_binding, self.lower_expr_as_stmt_block(catch_expr.span, catch_expr.value, context)));
             index = index + 1;
         }
         return lowered;
@@ -987,7 +1476,7 @@ public struct JirLowerer {
             return;
         }
         if (pattern.body is .literal(literal)) {
-            tests.add(jir.JirPatternTest(pattern.span, value, .literal, literal, null));
+            tests.add(jir.JirPatternTest(pattern.span, value, .literal, self.lower_literal(literal), null));
             return;
         }
         if (pattern.body is .optional(optional)) {
@@ -1005,7 +1494,7 @@ public struct JirLowerer {
             return;
         }
         if (pattern.body is .variant(variant)) {
-            tests.add(jir.JirPatternTest(variant.span, value, .variant, null, variant.path));
+            tests.add(self.variant_pattern_test(variant.span, value, variant));
             Int! index = 0;
             while (index < variant.payload.len()) {
                 self.add_pattern_ops_to_id(tests$.ptr(), binds$.ptr(), value, variant.payload[index], true, false, -1);
@@ -1020,7 +1509,7 @@ public struct JirLowerer {
         Int! index = 0;
         while (index < stmt.catches.len()) {
             hir.HirCatchStmt catch_stmt = stmt.catches[index];
-            lowered.catches.add(jir.JirCatchStmt(catch_stmt.span, catch_stmt.error_type, catch_stmt.binding, catch_stmt.local_id, catch_stmt.type_id, catch_stmt.mutable_binding, self.lower_block_with_defers(catch_stmt.body, context)));
+            lowered.catches.add(jir.JirCatchStmt(catch_stmt.span, catch_stmt.binding, catch_stmt.local_id, catch_stmt.type_id, catch_stmt.mutable_binding, self.lower_block_with_defers(catch_stmt.body, context)));
             index = index + 1;
         }
         return jir.JirStmt(stmt.span, .try_stmt(lowered));
@@ -1036,14 +1525,14 @@ public struct JirLowerer {
 
     jir.JirExprId lower_plain_expr(hir.HirExpr expr) {
         if (expr.body is .hir_literal(literal)) {
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .literal_expr(literal)));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .literal_expr(self.lower_literal(literal))));
         }
         if (expr.body is .hir_name(name)) {
-            jir.JirNameExpr lowered = jir.JirNameExpr(name.name, name.binding_id, name.local_id);
+            jir.JirNameExpr lowered = self.lower_name_expr(name);
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .name_expr(lowered)));
         }
         if (expr.body is .hir_type_value(type_ref)) {
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .type_value_expr(type_ref)));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .type_value_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref)))));
         }
         if (expr.body is .hir_self(span)) {
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .self_expr(span)));
@@ -1052,16 +1541,16 @@ public struct JirLowerer {
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .implicit_expr(span)));
         }
         if (expr.body is .hir_size_of_type(type_ref)) {
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .size_of_type_expr(type_ref)));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .size_of_type_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref)))));
         }
         if (expr.body is .hir_align_of_type(type_ref)) {
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .align_of_type_expr(type_ref)));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .align_of_type_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref)))));
         }
         if (expr.body is .hir_max_align_of_type(type_ref)) {
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .max_align_of_type_expr(type_ref)));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .max_align_of_type_expr(jir.JirTypeExpr(self.type_from_ast_ref(type_ref)))));
         }
         if (expr.body is .hir_cast(cast)) {
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .cast_expr(jir.JirCastExpr(self.lower_plain_expr_id(cast.value), cast.target))));
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .cast_expr(jir.JirCastExpr(self.lower_plain_expr_id(cast.value), self.type_from_ast_ref(cast.target)))));
         }
         if (expr.body is .hir_unary(unary)) {
             jir.JirUnaryExpr lowered = jir.JirUnaryExpr(unary.op, self.lower_plain_expr_id(unary.value));
@@ -1088,11 +1577,13 @@ public struct JirLowerer {
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .call_expr(call_value)));
         }
         if (expr.body is .hir_field(field)) {
-            jir.JirFieldExpr lowered = jir.JirFieldExpr(self.lower_plain_expr_id(field.base), field.name, field.optional_chain);
+            jir.JirFieldExpr lowered = self.lower_field_expr(self.lower_plain_expr_id(field.base), field.name, field.optional_chain);
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .field_expr(lowered)));
         }
         if (expr.body is .hir_index(index_expr)) {
-            jir.JirIndexExpr lowered = jir.JirIndexExpr(self.lower_plain_expr_id(index_expr.base), self.lower_plain_expr_id(index_expr.index), index_expr.optional_chain);
+            jir.JirExprId base = self.lower_plain_expr_id(index_expr.base);
+            jir.JirExprId index = self.lower_plain_expr_id(index_expr.index);
+            jir.JirIndexExpr lowered = self.lower_index_expr(index_expr, base, index);
             return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .index_expr(lowered)));
         }
         if (expr.body is .hir_slice(slice_expr)) {
@@ -1120,10 +1611,11 @@ public struct JirLowerer {
 
     jir.JirExprId lower_struct_expr(token.Span span, types.TypeId type_id, hir.HirStructExpr expr) {
         jir.JirStructExpr! lowered = jir.JirStructExpr(self.module.store, expr.path, expr.init_index);
+        lowered.type_decl_ref = self.type_decl_ref_for_type(type_id);
         Int! index = 0;
         while (index < expr.fields.len()) {
             hir.HirStructFieldInit field = expr.fields[index];
-            lowered.fields.add(jir.JirStructFieldInit(field.span, field.name, self.lower_plain_expr_id(field.value)));
+            lowered.fields.add(jir.JirStructFieldInit(field.span, field.name, self.lower_plain_expr_id(field.value), self.struct_init_field_index(type_id, field, index)));
             index = index + 1;
         }
         return self.module.add_expr(jir.JirExpr(span, type_id, .struct_expr(lowered)));
@@ -1131,6 +1623,7 @@ public struct JirLowerer {
 
     jir.JirExprId lower_variant_expr(token.Span span, types.TypeId type_id, hir.HirVariantExpr expr) {
         jir.JirVariantExpr! lowered = jir.JirVariantExpr(self.module.store, expr.path);
+        lowered = self.lower_variant_metadata(lowered, type_id);
         Int! index = 0;
         while (index < expr.payload.len()) {
             lowered.payload.add(self.lower_plain_expr_id(expr.payload[index]));
@@ -1155,5 +1648,10 @@ public struct JirLowerer {
 
 public jir.JirModule lower_module(context.CompilerContext& ctx, hir.HirModule& module) {
     JirLowerer! lowerer = JirLowerer(ctx, module);
+    return lowerer.lower();
+}
+
+public jir.JirModule lower_module_with_source(context.CompilerContext& ctx, hir.HirModule& module, UInt8[] source_text) {
+    JirLowerer! lowerer = JirLowerer(ctx, module, source_text);
     return lowerer.lower();
 }
