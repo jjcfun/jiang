@@ -63,10 +63,10 @@
 
 - [x] 跑 compiler 测试套件。
 - [x] 跑 bootstrap/smoke 测试。
-- [ ] 增加有针对性的跨模块样例：
-  - [ ] function call
-  - [ ] global
-  - [ ] struct field 和 struct literal
-  - [ ] enum 和 union variant
-  - [ ] method 和 static method
-  - [ ] generic nominal type
+- [x] 增加有针对性的跨模块样例：
+  - [x] function call
+  - [x] global
+  - [x] struct field 和 struct literal
+  - [x] enum 和 union variant
+  - [x] method 和 static method
+  - [x] generic nominal type
