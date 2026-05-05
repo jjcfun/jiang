@@ -50,11 +50,11 @@
 ## 第三阶段：type_check 声明反查收敛
 
 - [ ] 增加 AST 声明查询 helper：
-  - [ ] `module_file(ModuleId) -> AstFile`
-  - [ ] `decl_ast(DeclId) -> AstDecl`
+  - [x] `module_file(ModuleId) -> AstFile`
+  - [x] `decl_ast(DeclId) -> AstDecl`
   - [ ] 必要时增加 `decl_binding(DeclId) -> Binding`
 - [ ] 重构 `type_check.decl_for_binding`：
-  - [ ] 优先通过 `DeclInfo.decl_id/module_id/ast_index` 查询。
+  - [x] 优先通过 `DeclInfo.decl_id/module_id/ast_index` 查询。
   - [ ] 删除对当前文件 top-level binding 的线性扫描依赖。
 - [ ] 将字段、method、union/enum 查询逐步改成 `DeclId` 驱动。
 - [ ] 保留本地变量和表达式 span lookup，暂不混入全局 decl_table。
