@@ -31,15 +31,15 @@
 ## 第二阶段：JIR type/variant 查询清理
 
 - [x] 让 type value、struct literal、variant expr/pattern 在 lowering 时优先携带 `DeclId`。
-- [ ] 删除 `lower_jir.jiang` 中扫描式 type decl 查询：
+- [x] 删除 `lower_jir.jiang` 中扫描式 type decl 查询：
   - [x] `type_decl_for_binding`
   - [x] `type_decl_for_symbol`
   - [x] `type_decl_id_for_symbol`
-- [ ] 将 field/variant metadata 查询改为：
+- [x] 将 field/variant metadata 查询改为：
   - [x] `TypeId -> TypeInfo -> DeclId`
   - [x] codegen 中 `DeclId -> JirDeclRef -> JirTypeDecl`
-  - [ ] lowering 构建当前模块时减少本地 `DeclId` 线性扫描。
-- [ ] 删除 codegen 中 nominal type 的 binding fallback：
+  - [x] lowering 构建当前模块时减少本地 `DeclId` 线性扫描。
+- [x] 删除 codegen 中 nominal type 的 binding fallback：
   - [x] `type_decl_for_binding`
   - [x] 未使用的 `type_decl_for_symbol`
 - [x] 增加或保留覆盖：
