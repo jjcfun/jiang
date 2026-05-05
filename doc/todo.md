@@ -37,7 +37,8 @@
   - [x] `type_decl_id_for_symbol`
 - [ ] 将 field/variant metadata 查询改为：
   - [x] `TypeId -> TypeInfo -> DeclId`
-  - [ ] `DeclId -> JirDeclRef -> JirTypeDecl`
+  - [x] codegen 中 `DeclId -> JirDeclRef -> JirTypeDecl`
+  - [ ] lowering 构建当前模块时减少本地 `DeclId` 线性扫描。
 - [ ] 删除 codegen 中 nominal type 的 binding fallback：
   - [x] `type_decl_for_binding`
   - [x] 未使用的 `type_decl_for_symbol`
