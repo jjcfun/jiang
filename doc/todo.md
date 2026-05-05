@@ -18,15 +18,15 @@
 ## 第一阶段：JIR 调用目标解析
 
 - [x] 给 HIR/JIR call target 保留 resolve/type_check 已确定的 `DeclId`。
-- [ ] 重构 `compiler.jiang` 中的 JIR call target 解析：
-  - [ ] 删除按 `symbol_id + arg_count` 扫描所有 `JirDecl` 的逻辑。
-  - [ ] 删除 `function_target_ref_for_shape`。
-  - [ ] 删除 `function_target_ref_for_binding`，或只保留为过渡断言。
-  - [ ] 跨模块调用统一走 `DeclId -> JirDeclRef`。
-- [ ] 增加或保留覆盖：
+- [x] 重构 `compiler.jiang` 中的 JIR call target 解析：
+  - [x] 删除按 `symbol_id + arg_count` 扫描所有 `JirDecl` 的逻辑。
+  - [x] 删除 `function_target_ref_for_shape`。
+  - [x] 删除 `function_target_ref_for_binding`，或只保留为过渡断言。
+  - [x] 跨模块调用统一走 `DeclId -> JirDeclRef`。
+- [x] 增加或保留覆盖：
   - [x] 跨模块同名函数不误命中。
-  - [ ] 跨模块同名 method/static method 不误命中。
-  - [ ] overload 调用仍能正确解析。
+  - [x] 跨模块同名 method/static method 不误命中。
+  - [x] overload 调用仍能正确解析。
 
 ## 第二阶段：JIR type/variant 查询清理
 
