@@ -61,16 +61,16 @@
 
 ## 第四阶段：重复 type 结果表清理
 
-- [ ] 审计 `TypeCheckResult` 中的顶层 binding type 缓存：
-  - [ ] `binding_ids`
-  - [ ] `binding_type_ids`
-  - [ ] `function_result_binding_ids`
-  - [ ] `result_type_ids`
-- [ ] 顶层声明类型优先从 `DeclInfo.type_id/result_type_id` 读取。
-- [ ] 只保留 lowering 必须使用的本地/表达式类型表：
-  - [ ] local binding type
-  - [ ] expr type
-  - [ ] pattern binding type
+- [x] 审计 `TypeCheckResult` 中的顶层 binding type 缓存：
+  - [x] `binding_ids`
+  - [x] `binding_type_ids`
+  - [x] `function_result_binding_ids`
+  - [x] `result_type_ids`
+- [x] 顶层声明类型优先从 `DeclInfo.type_id/result_type_id` 读取。
+- [x] 只保留 lowering 必须使用的本地/表达式类型表：
+  - [x] local binding type
+  - [x] expr type
+  - [x] pattern binding type
 
 ## 第五阶段：调试与编译入口清理
 
