@@ -22,9 +22,10 @@ NameId    — 驻留字符串索引 (global, 永不过期)         ← 独立的
 ModuleId  — 源文件/模块标识                           ← 独立的模块表
 DeclId    — 顶层声明 (struct/enum/function/global/…)  ← 独立的声明表
 TypeId    — 类型 (nominal 或 structural)              ← 独立的类型表
-ScopeId   — 词法作用域                                 ← 独立的作用域表
-BodyId    — 函数体/初始化器                            ← 独立的体表
-LocalId   — 局部变量 (作用域限于一个 BodyId)           ← 独立的局部变量表
+ScopeId   — 词法作用域, 仅 resolve 阶段使用, 不跨模块引用, 不序列化, 非全局表
+BodyId    — 函数体/初始化器, 仅 lower/codegen 阶段使用, 不跨模块引用, 不序列化, 非全局表
+LocalId   — 局部变量, 作用域限于一个 BodyId, 不跨模块引用, 不序列化, 非全局表
+            (LocalId = BodyInfo.locals 中的下标)
 ```
 
 如果将来需要一个统一的 "任意语义实体引用"，可以用 tagged union：
@@ -48,30 +49,44 @@ DeclId = 全局递增整数。每个 Decl 记录 `owner_module: ModuleId`。
 
 ---
 
-## 2. 全局符号表 (Tables)
+## 2. 表结构 (Tables)
 
-所有表是全局稠密数组，按 ID 下标 O(1) 访问。每个条目记录 `owner_module` 以支持按模块分区和序列化。
+全局表以稠密数组存储，按 ID 下标 O(1) 访问，条目记录 `owner_module` 以支持按模块分区和序列化。
+非全局表仅在各阶段临时使用，不跨阶段存活，不序列化。
 
-### 2.1 名称表 (NameId → String)
+### 全局持久表 (序列化到 .jiang_cache/)
+
+> **为什么声明表和类型表要分开？**
+> 
+> - **声明表**存源级实体，条目大小差异大（struct 有 fields vec，function 有 params vec），数量等于源文件中声明的总数。extend/trait impl 的方法也各自为独立声明，不另建全局方法表
+> - **类型表**存语义类型，条目小而均匀（kind 鉴别 + 少量字段），泛型实例化会产生大量条目（`Vec<i32>`、`Vec<String>`…），数量远大于声明数
+> - 分开后各自紧凑、按需序列化（meta.bin / types.bin）、查询模式各不同
+
+#### 2.1 名称表 (NameId → String)
 
 ```
 names: Vec<UInt8[]>   // 驻留字符串池，永不回收
 // 等价于现有的 Interner
 ```
 
-### 2.2 模块表 (ModuleId → ModuleInfo)
+#### 2.2 模块表 (ModuleId → ModuleInfo)
 
 ```
 ModuleInfo:
-    source_path: NameId            // 源文件路径 (驻留)
+    source_path: NameId            // 相对于项目根目录的源文件路径 (驻留), 例 "src/main.jiang"
     source_hash: UInt64            // 文件内容哈希 (用于变更检测)
     signature_hash: UInt64         // 该模块所有导出声明签名的哈希 (用于快速判断影响范围)
-    deps: Vec<ModuleId>            // 直接依赖的模块 (import 的模块)
+    deps: Vec<DepModule>           // 直接依赖的模块列表
     reverse_deps: Vec<ModuleId>    // 被哪些模块依赖 (反向边)
     decl_range: (DeclId, DeclId)   // 该模块拥有的声明 ID 区间 [start, end)
     type_range: (TypeId, TypeId)   // 该模块拥有的类型 ID 区间
     exports: HashMap<NameId, DeclId>  // public 导出的 name → DeclId
     status: ModuleStatus           // empty / parsed / resolved / type_checked / lowered / codegened
+
+DepModule:
+    module_id: ModuleId            // 依赖的模块
+    snapshot_signature_hash: UInt64  // 上次 type_check 时所见依赖方的签名哈希
+                                     // 冷启动后: 若依赖方新 signature_hash ≠ snapshot, 本模块变脏
 ```
 
 ### 2.3 声明表 (DeclId → DeclInfo)
@@ -143,7 +158,9 @@ TypeInfo:
     hash: UInt64
 ```
 
-### 2.5 作用域表 (ScopeId → ScopeInfo)
+### 阶段内临时表 (不序列化, 不跨阶段存活)
+
+#### 2.5 作用域表 (ScopeId → ScopeInfo)
 
 ```
 ScopeInfo:
@@ -177,22 +194,16 @@ LocalInfo:
     scope: ScopeId       // 局部变量所属的最内层作用域
 ```
 
-### 2.7 方法表 (按接收者类型索引)
+### 2.7 全局表序列化策略
 
-```
-// 全局方法注册表，按 receiver 类型索引
-method_table: HashMap<TypeKey, Vec<MethodEntry>>
+> **核心原则：每模块只重写自己的缓存文件，不改动其他模块的缓存。**
 
-TypeKey:
-    receiver_type: TypeId       // 方法接收者类型
-    trait_path: DeclId?         // 如果来自 trait impl，记录 trait DeclId
-
-MethodEntry:
-    method_decl: DeclId         // 方法声明
-    visibility: Visibility
-    static: Bool
-    // 泛型方法在调用时实例化，实例化表单独维护
-```
+| 表 | 序列化方式 | 变更代价 |
+|---|---|---|
+| 名称表 | `names.bin`，append-only（新 intern 字符串追加写） | 追写新名字 |
+| 模块表 | `manifest.bin`（id→source_path 映射，极轻） | 几十字节 |
+| 声明表 | 每个模块写自己的 `meta.bin`（只含本模块 decls） | 只重写变更模块 |
+| 类型表 | 每个模块写自己的 `types.bin`（只含本模块 types） | 只重写变更模块 |
 
 ---
 
@@ -254,7 +265,7 @@ DepKind:
 │  Phase 1: 加载缓存                                   │
 │  for each unchanged module:                          │
 │    load from .jiang_cache/ → 恢复 DeclId, TypeId,    │
-│    exports, JIR                                     │
+│    exports, deps                                     │
 │  for each changed module:                            │
 │    re-parse source → AST                             │
 └─────────────────────┬───────────────────────────────┘
@@ -304,10 +315,11 @@ DepKind:
     <module_id>/          # 每个模块一个目录
       meta.bin            # ModuleInfo + DeclInfo[] 序列化
       types.bin           # 该模块拥有的 TypeInfo[]
-      jir.bin             # JIR 体 (Stmt/Expr 序列化)
-      object.o            # LLVM 编译产物 (.o 文件)
-  manifest.bin            # 全局: module_id → source_path 映射 + 全局版本号
+      module.o            # LLVM 编译产物 (.o 文件)
+  manifest.bin            # 全局: module_id → source_path, 全局计数器, free-list
 ```
+
+> **为什么没有 hir.bin 和 jir.bin？** HIR/JIR 只是 lower 的中间产物，生成 .o 后就可以丢弃。.o 有效时直接链接，.o 失效时重跑 lower→codegen（lower 是已解析 AST 的线性转换，成本远低于 type_check），缓存它们不划算。
 
 ### meta.bin 内容
 
@@ -318,16 +330,28 @@ ModuleMetadata:
     source_hash: u64
     signature_hash: u64
     exports: [(NameId, DeclId)]
-    deps: [ModuleId]
+    deps: [(module_id: u32, snapshot_signature_hash: u64)]
     decls: [
         for each decl owned by this module:
             DeclInfo (所有字段)
     ]
 ```
 
+### manifest.bin 内容
+
+```
+Manifest:
+    version: u32                   // 缓存格式版本
+    modules: [(u32, string)]       // module_id → source_path
+    next_decl_id: u32              // 全局声明 ID 计数器
+    next_type_id: u32              // 全局类型 ID 计数器
+    free_decl_ids: [u32]           // 被删除声明的 ID，复用优先
+    free_type_ids: [u32]           // 被删除类型的 ID
+```
+
 ### 重要约束
 
-- **JIR 中不存储 AST 引用**：`ast.AstType` → 全部替换为 `TypeId`，`ast.Path` → 替换为 `DeclId`
+- **缓存中不存储 AST 引用**：`ast.AstType` → 全部替换为 `TypeId`，`ast.Path` → 替换为 `DeclId`
 - **不存储裸指针**：所有引用用 ID
 - **缓存独立于 Arena 内存布局**：反序列化后可以放入新的 Arena 或堆分配的内存
 
@@ -353,8 +377,10 @@ ModuleMetadata:
 
 ### Phase B: 稳定 ID 体系 + 全局符号表
 
-1. 定义所有 ID 类型和表结构 (ModuleId / DeclId / TypeId / ScopeId / BodyId / LocalId)
-2. 实现 7 张全局稠密数组表（名称、模块、声明、类型、作用域、体、方法）
+1. 定义所有 ID 类型 (ModuleId / DeclId / TypeId / ScopeId / BodyId / LocalId)
+   和表结构（模块、声明、类型）
+2. 实现全局表：模块表、声明表、类型表 (共 3 张)
+   实现阶段内临时表：作用域表、体表 (不序列化)
 3. 实现序列化/反序列化 (二进制格式)
 4. 实现 `.jiang_cache/` 读写
 5. 编译后写出缓存，下次编译加载缓存 (先全量模式，验证正确性)
@@ -399,6 +425,14 @@ signature_hash = hash(
 
 如果 signature_hash 不变，依赖模块的**名称解析结果**不变 (名字指向同样的 DeclId，签名也相同)。此时只需重新 codegen 本模块，不需要重新 type_check 依赖模块。
 
-### trait / extend 的方法如何索引？
+### trait / extend 的方法如何查找？
 
-方法放在全局 `method_table` 中，按 `(receiver_type, trait_decl?)` 索引。当 extend 方法添加/删除时，method_table 变更。依赖模块如果在类型检查时查询了 method_table 并记录了 DepEdge (依赖于 trait 声明)，则会被重新检查。
+不建全局方法表。extend 声明是独立的 `DeclInfo`（`kind = extend`），序列化在自己的 `owner_module` 缓存中。方法查找在 type_check 时按模块进行：
+
+1. 类型体内定义的方法（`struct Point { fn x() ... }`）
+2. 当前模块 **可见的** extend 块（按 `extend_target` 匹配目标类型）
+3. 当前模块 **可见的** trait impl
+
+`private` extend 只在 `owner_module` 内可见，不会污染其他模块的类型视图。模块 B 的 private extend 对模块 C 不可见——无需将方法注入目标类型的全局数据结构。
+
+增量编译：extend 声明变更时，该声明本身的 DepEdge 会触发依赖方（引用了该 extend 的模块）重新 type_check。
