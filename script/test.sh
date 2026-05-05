@@ -208,6 +208,7 @@ run_sample normal_import_public_signature_minimal.jiang 42
 run_compile_fail invalid_normal_import_public_signature_missing_import.jiang
 run_sample imported_typeid_field_minimal.jiang 42
 run_sample semantic_ids_function_call_minimal.jiang 42
+run_sample semantic_ids_call_collision_minimal.jiang 42
 run_sample semantic_ids_global_minimal.jiang 42
 run_sample semantic_ids_struct_field_literal_minimal.jiang 42
 run_sample semantic_ids_enum_union_variant_minimal.jiang 42

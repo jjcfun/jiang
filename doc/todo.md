@@ -1,72 +1,89 @@
-# 语义 ID 与 JIR 存储重构
+# Compiler 优化与清理计划
 
-目标：让编译器里的语义身份在全局范围内明确且稳定，同时让 HIR/JIR
-自己的存储 ID 只作为模块内部下标使用。JIR 不应该保存指向语义信息或其他
-声明实体的 arena 指针；JIR 只保存稳定 ID，并在需要实体时通过辅助表查询。
+当前状态：
 
-设计原则：
+- 语义 ID 与 JIR 存储重构已经完成。
+- `ModuleId`、`DeclId`、`TypeId` 已作为全局稳定 ID 使用。
+- `DeclInfo` 已成为顶层声明的语义事实表。
+- HIR/JIR lowering map 已使用 `DeclId -> HirDeclRef/JirDeclRef`。
+- stage1 自举 smoke 已通过。
 
-- `ModuleId`、`DeclId`、`TypeId` 是全局稳定 ID。
-- `HirDeclId`、`JirDeclId`、`JirStmtId`、`JirExprId` 是各自 HIR/JIR
-  module 内部的本地存储下标。
-- `DeclInfo` 只保存语义事实：所在模块、名字、声明种类、binding、声明类型、
-  返回类型和声明 flags。
-- `DeclInfo` 不保存 `HirDeclId`、`JirDeclId`、指针或 lowering 产物。
-- HIR/JIR 的 lowering 映射使用独立 side table：
-  - `DeclId -> HirDeclRef`
-  - `DeclId -> JirDeclRef`
-- nominal `TypeInfo` 应该引用声明该 nominal 类型的 `DeclId`。
-- JIR 中的跨声明引用应该使用 `DeclId`、`BindingId` 或 `TypeId`；需要实体时
-  再通过 `SemanticContext` helper 解析。
+目标：
 
-计划：
+- 删除重构后遗留的扫描式查找和兼容 fallback。
+- 让跨模块引用统一通过稳定 ID 和语义 helper 解析。
+- 收敛 type_check/lowering/codegen 之间重复保存的声明信息。
+- 保持每一步都能通过 compiler 测试和 stage1 smoke。
 
-- [x] 先把当前 compiler 文件恢复到干净基线，再应用这次重构。
-- [x] 引入全局稳定的 `ModuleId`，并在 `SemanticContext` 或
-  `CompilerContext` 中建立 module table。
-- [x] 将 `scope.DeclId` 从文件内下标语义改成全局稳定声明身份。
-- [x] 在 resolve/type_check 后构建 `SemanticContext.decl_table`。
-  - [x] 每个全局声明对应一个 `DeclInfo`。
-  - [x] 保存 `ModuleId`、`BindingId`、symbol/name、kind、visibility、
-    extern、static、mutable、声明类型和必要时的返回类型。
-  - [x] 不把 HIR/JIR id 放进 `DeclInfo`。
-- [x] 更新 nominal `TypeInfo`，让它引用 nominal 声明的稳定 `DeclId`，
-  不再只依赖 `BindingId`。
-- [x] 给 HIR declaration 传递并保存 `DeclId`。
-- [x] 增加 HIR lowering side table：`DeclId -> HirDeclRef`。
-- [x] 给 JIR declaration 传递并保存 `DeclId`。
-- [x] 增加 JIR lowering side table：`DeclId -> JirDeclRef`。
-- [x] 替换 JIR 中当前保存语义实体指针或 JIR declaration 指针的字段，
-  改为保存稳定 ID。
-  - [x] name/global/function 引用使用 `DeclId` 或 `BindingId`。
-  - [x] nominal type 引用通过 `TypeId -> TypeInfo -> DeclId` 表达。
-  - [x] call target 通过 `DeclId -> JirDeclRef` 解析。
-- [x] 将 `JirModule` 的 decl、stmt、expr 存储从 `ArenaRefList` 改为
-  `ArenaList`；`JirDeclId`、`JirStmtId`、`JirExprId` 只保留本地索引用途。
-- [x] 增加常用查询 helper。
-  - [x] `decl_info(DeclId) -> DeclInfo`
-  - [x] `type_info(TypeId) -> TypeInfo`
-  - [x] `nominal_decl(TypeId) -> DeclInfo`
-  - [x] `hir_decl_ref(DeclId) -> HirDeclRef`
-  - [x] `jir_decl_ref(DeclId) -> JirDeclRef`
-  - [x] codegen 内部的 `jir_decl(JirDeclRef) -> JirDecl`
-- [x] 重构 `lower_jir` 和 codegen，让它们使用新的 helper，
-  不再依赖扫描式查找或指针式查找。
-- [x] 继续重构 `lower_hir`，让它在需要跨声明语义信息时也优先使用 helper，
-  不再依赖扫描式查找或指针式查找。
-- [x] 在新的 `decl_table`、module table 和 lowering maps 覆盖旧用途后，
-  删除过时的 semantic lookup 表。
-  - [x] 删除 `SemanticContext.binding_types`。
-  - [x] 删除 `SemanticContext.function_result_types`。
+## 第一阶段：JIR 调用目标解析
 
-验证：
+- [x] 给 HIR/JIR call target 保留 resolve/type_check 已确定的 `DeclId`。
+- [ ] 重构 `compiler.jiang` 中的 JIR call target 解析：
+  - [ ] 删除按 `symbol_id + arg_count` 扫描所有 `JirDecl` 的逻辑。
+  - [ ] 删除 `function_target_ref_for_shape`。
+  - [ ] 删除 `function_target_ref_for_binding`，或只保留为过渡断言。
+  - [ ] 跨模块调用统一走 `DeclId -> JirDeclRef`。
+- [ ] 增加或保留覆盖：
+  - [x] 跨模块同名函数不误命中。
+  - [ ] 跨模块同名 method/static method 不误命中。
+  - [ ] overload 调用仍能正确解析。
 
-- [x] 跑 compiler 测试套件。
-- [x] 跑 bootstrap/smoke 测试。
-- [x] 增加有针对性的跨模块样例：
-  - [x] function call
-  - [x] global
-  - [x] struct field 和 struct literal
-  - [x] enum 和 union variant
-  - [x] method 和 static method
-  - [x] generic nominal type
+## 第二阶段：JIR type/variant 查询清理
+
+- [ ] 让 type value、struct literal、variant expr/pattern 在 lowering 时优先携带 `DeclId`。
+- [ ] 删除 `lower_jir.jiang` 中扫描式 type decl 查询：
+  - [ ] `type_decl_for_binding`
+  - [ ] `type_decl_for_symbol`
+  - [ ] `type_decl_id_for_symbol`
+- [ ] 将 field/variant metadata 查询改为：
+  - [ ] `TypeId -> TypeInfo -> DeclId`
+  - [ ] `DeclId -> JirDeclRef -> JirTypeDecl`
+- [ ] 删除 codegen 中 nominal type 的 binding fallback：
+  - [ ] `type_decl_for_binding`
+  - [ ] 未使用的 `type_decl_for_symbol`
+- [ ] 增加或保留覆盖：
+  - [ ] 跨模块 struct literal 字段索引。
+  - [ ] 跨模块 enum/union variant 索引。
+  - [ ] generic nominal type 字段布局。
+
+## 第三阶段：type_check 声明反查收敛
+
+- [ ] 增加 AST 声明查询 helper：
+  - [ ] `module_file(ModuleId) -> AstFile`
+  - [ ] `decl_ast(DeclId) -> AstDecl`
+  - [ ] 必要时增加 `decl_binding(DeclId) -> Binding`
+- [ ] 重构 `type_check.decl_for_binding`：
+  - [ ] 优先通过 `DeclInfo.decl_id/module_id/ast_index` 查询。
+  - [ ] 删除对当前文件 top-level binding 的线性扫描依赖。
+- [ ] 将字段、method、union/enum 查询逐步改成 `DeclId` 驱动。
+- [ ] 保留本地变量和表达式 span lookup，暂不混入全局 decl_table。
+
+## 第四阶段：重复 type 结果表清理
+
+- [ ] 审计 `TypeCheckResult` 中的顶层 binding type 缓存：
+  - [ ] `binding_ids`
+  - [ ] `binding_type_ids`
+  - [ ] `function_result_binding_ids`
+  - [ ] `result_type_ids`
+- [ ] 顶层声明类型优先从 `DeclInfo.type_id/result_type_id` 读取。
+- [ ] 只保留 lowering 必须使用的本地/表达式类型表：
+  - [ ] local binding type
+  - [ ] expr type
+  - [ ] pattern binding type
+
+## 第五阶段：调试与编译入口清理
+
+- [ ] 删除空实现 `debug_log` 以及无效果调用。
+- [ ] 如果仍需要调试日志，改成显式 debug flag。
+- [ ] 检查 `compiler.jiang` 的 compiler source preload：
+  - [ ] 普通用户编译不应无条件 preload compiler 源。
+  - [ ] self-host 编译器源码时再按 import 图加载。
+- [ ] 检查 `jiangc.jiang` 的临时输出路径：
+  - [ ] 避免固定写 `/tmp/jiang-stage1-temp.o`。
+  - [ ] 支持更明确的临时文件策略。
+
+## 每阶段验证
+
+- [ ] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh`
+- [ ] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_smoke.sh`
+- [ ] 必要时用 `./build/stage1-smoke/jiangc` 编译新增样例。
