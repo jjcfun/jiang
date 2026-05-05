@@ -1,57 +1,67 @@
-# JIR reference lowering and codegen lookup cleanup
+# 语义 ID 与 JIR 存储重构
 
-Goal: make JIR a temporary, arena-backed IR whose cross-entity dependencies are
-stable borrow references instead of AST/HIR/source lookups. JIR is not a cache
-format; future incremental compilation should introduce stable ids or side
-tables at the cache boundary.
+目标：让编译器里的语义身份在全局范围内明确且稳定，同时让 HIR/JIR
+自己的存储 ID 只作为模块内部下标使用。JIR 不应该保存指向语义信息或其他
+声明实体的 arena 指针；JIR 只保存稳定 ID，并在需要实体时通过辅助表查询。
 
-Plan:
+设计原则：
 
-- [x] Add `ArenaRefList<T>` for arena-allocated entities with stable addresses.
-- [x] Store `JirModule` decls, stmts, and exprs as stable arena entities while
-  preserving id-based accessors during the transition.
-- [x] Resolve call targets into a JIR side table after all graph modules are
-  lowered, including local, imported, instance method, and static method calls.
-- [x] Make codegen consume resolved call target refs without scan-based
-  function lookup fallback.
-- [x] Introduce `CodegenContext` for the active compiler context, JIR module,
-  LLVM context/module/builder, and context-owned `TypeTable&`.
-- [x] Move field, struct init, variant, and enum-member semantic information
-  into JIR so codegen no longer has to recover it from names, AST spans, or
-  source text.
-  - [x] Enum member explicit integer values.
-  - [x] Field indexes and optional-field result metadata.
-  - [x] Struct init target and field mapping.
-  - [x] Field/variant declaration `type_id` for layout and field init.
-  - [x] Union/enum variant indexes and payload metadata.
-  - [x] Static integer indexes for tuple and optional-array access.
-  - [x] Literal values and literal pattern tests carry lowered JIR payloads
-    instead of requiring codegen to parse source text.
-- [x] Remove codegen fallback lookup helpers for function/global call targets.
-- [x] Keep arena ownership in the compile/codegen session; JIR internals use
-  `&` and reference lists, not owned arena pointers.
-- [x] Continue shrinking codegen signatures so expression/statement emission
-  takes `CodegenContext&` instead of threading `ctx`, `TypeTable&`,
-  `JirModule&`, LLVM context/module, and builder separately.
-  - [x] Function/init/module emission.
-  - [x] Statement/block emission and condition/pattern helpers.
-  - [x] Expression/address emission.
-  - [x] Constant-expression emission.
-- [x] Replace remaining codegen `ir.AstType`/source-text literal paths with
-  lowered JIR/type information where practical.
-  - [x] Type-value/sizeof/alignof/alloc_array use lowered `JirTypeExpr`
-    `TypeId` instead of codegen-local AST type lowering.
-  - [x] Literal codegen consumes `JirLiteral`; codegen-local source text literal
-    parsing helpers were removed.
-  - [x] Cast codegen consumes lowered target `TypeId` instead of inspecting
-    `ir.AstType`.
-  - [x] JIR field/variant/type/extend/catch nodes no longer store `ir.AstType`;
-    `JirModule` no longer stores source text.
+- `ModuleId`、`DeclId`、`TypeId` 是全局稳定 ID。
+- `HirDeclId`、`JirDeclId`、`JirStmtId`、`JirExprId` 是各自 HIR/JIR
+  module 内部的本地存储下标。
+- `DeclInfo` 只保存语义事实：所在模块、名字、声明种类、binding、声明类型、
+  返回类型和声明 flags。
+- `DeclInfo` 不保存 `HirDeclId`、`JirDeclId`、指针或 lowering 产物。
+- HIR/JIR 的 lowering 映射使用独立 side table：
+  - `DeclId -> HirDeclRef`
+  - `DeclId -> JirDeclRef`
+- nominal `TypeInfo` 应该引用声明该 nominal 类型的 `DeclId`。
+- JIR 中的跨声明引用应该使用 `DeclId`、`BindingId` 或 `TypeId`；需要实体时
+  再通过 `SemanticContext` helper 解析。
 
-Tests:
+计划：
 
-- `script/test_compiler.sh type_minimal.jiang`
-- `script/test_compiler.sh lower_jir_minimal.jiang llvm_api_minimal.jiang compiler_bootstrap_smoke.jiang`
-- `script/stage1_smoke.sh`
-- Targeted samples covering mutable generics, raw pointers, methods, imports,
-  structs, enums, and unions.
+- [x] 先把当前 compiler 文件恢复到干净基线，再应用这次重构。
+- [x] 引入全局稳定的 `ModuleId`，并在 `SemanticContext` 或
+  `CompilerContext` 中建立 module table。
+- [x] 将 `scope.DeclId` 从文件内下标语义改成全局稳定声明身份。
+- [x] 在 resolve/type_check 后构建 `SemanticContext.decl_table`。
+  - [x] 每个全局声明对应一个 `DeclInfo`。
+  - [x] 保存 `ModuleId`、`BindingId`、symbol/name、kind、visibility、
+    extern、static、mutable、声明类型和必要时的返回类型。
+  - [x] 不把 HIR/JIR id 放进 `DeclInfo`。
+- [x] 更新 nominal `TypeInfo`，让它引用 nominal 声明的稳定 `DeclId`，
+  不再只依赖 `BindingId`。
+- [x] 给 HIR declaration 传递并保存 `DeclId`。
+- [x] 增加 HIR lowering side table：`DeclId -> HirDeclRef`。
+- [x] 给 JIR declaration 传递并保存 `DeclId`。
+- [x] 增加 JIR lowering side table：`DeclId -> JirDeclRef`。
+- [x] 替换 JIR 中当前保存语义实体指针或 JIR declaration 指针的字段，
+  改为保存稳定 ID。
+  - [x] name/global/function 引用使用 `DeclId` 或 `BindingId`。
+  - [x] nominal type 引用通过 `TypeId -> TypeInfo -> DeclId` 表达。
+  - [x] call target 通过 `DeclId -> JirDeclRef` 解析。
+- [x] 将 `JirModule` 的 decl、stmt、expr 存储从 `ArenaRefList` 改为
+  `ArenaList`；`JirDeclId`、`JirStmtId`、`JirExprId` 只保留本地索引用途。
+- [ ] 增加常用查询 helper。
+  - [ ] `decl_info(DeclId) -> DeclInfo`
+  - [ ] `type_info(TypeId) -> TypeInfo`
+  - [ ] `nominal_decl(TypeId) -> DeclInfo`
+  - [ ] `jir_decl_ref(DeclId) -> JirDeclRef`
+  - [ ] `jir_decl(JirDeclRef) -> JirDecl`
+- [ ] 重构 `lower_hir`、`lower_jir` 和 codegen，让它们使用新的 helper，
+  不再依赖扫描式查找或指针式查找。
+- [ ] 在新的 `decl_table`、module table 和 lowering maps 覆盖旧用途后，
+  删除过时的 semantic lookup 表。
+
+验证：
+
+- [x] 跑 compiler 测试套件。
+- [x] 跑 bootstrap/smoke 测试。
+- [ ] 增加有针对性的跨模块样例：
+  - [ ] function call
+  - [ ] global
+  - [ ] struct field 和 struct literal
+  - [ ] enum 和 union variant
+  - [ ] method 和 static method
+  - [ ] generic nominal type
