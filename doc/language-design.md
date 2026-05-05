@@ -173,6 +173,23 @@ mutable_items = [4, 5, 6];
 
 变量、参数、全局变量和字段声明如果写出了完整左侧类型，则以左侧声明类型为准。左侧类型可以表达每个类型层级的可变性，例如 `Int![3]!` 表示元素层是 `Int!`，外层数组值也是可变层。初始化器只负责提供值，不能反过来改变左侧声明出来的分层可变性。
 
+赋值、初始化、传参和 `return` 都是“把右值写入一个目标位置”的场景。这里不使用普通类型兼容性去判断可变性，而是以目标位置的类型为准：比较目标类型和值类型时，在两侧相同结构位置忽略 mutable flag，但保留 optional flag、pointer kind、数组形状、字段、payload 等结构差异。
+
+```jiang
+Int! a = 3;
+Int b = a;   // 允许：把 mutable 右值写入不可变目标，目标类型是 Int
+Int! c = b;  // 允许：把不可变右值写入 mutable 目标，目标类型是 Int!
+
+Int?! optional_mut = 1;
+Int? optional_value = optional_mut; // 允许：optional 层相同，只忽略同层 mutable
+Int plain = optional_mut;           // 编译错误：不能忽略 optional
+
+Int! value = 3;
+Int& ref = value$.ref(); // 允许：reference 结构相同，pointee 的 mutable 以左侧 Int& 为准
+```
+
+这条规则只属于写入目标的场景，不能把 `Int` 与 `Int!` 视为全局等价类型。二元运算、分支合并、重载判定中不应该因为某一侧带 `!` 就把两种类型普遍合并；这些上下文需要先有明确的 expected type 或目标位置，再按上面的写入规则检查。
+
 类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 record 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
 
 解构语法可以为每个解构出来的绑定重新指定可变性，因为解构本质上是在声明多个局部绑定。但这种可变性也只作用于对应元素类型的最外层，不能深入修改该元素类型的内部层级：
@@ -417,6 +434,7 @@ extend Int: Hashable {
 - `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`。
 - 如果 receiver 已经是 pointer，`ptr.method(args...)` 也等价于 `Type.method(ptr, args...)`。
 - `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver pointer。
+- 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get(self: Box<T>&) -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
 - union variant name 和同一 union 的 static/显式 method name 共享类型成员命名空间，不能重名，避免 `Union.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量或参数类型必须不同。
 - `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。
