@@ -1,9 +1,10 @@
 import api = "./api.jiang";
-import "../ast.jiang";
+import ir = "../ir_common.jiang";
 import "../context.jiang";
 import diagnostic = "../diagnostic.jiang";
 import interner = "../interner.jiang";
 import "../jir.jiang";
+import semantic_ctx = "../semantic.jiang";
 import "../scope.jiang";
 import "../source.jiang";
 import source_manager = "../source_manager.jiang";
@@ -61,9 +62,13 @@ public struct TypeSubst {
 
 public struct EmissionState {
     public list.ArenaList<interner.Symbol> emitted_function_names;
+    public ModuleInput[*]! all_input_data;
+    public Int! all_input_count;
 
-    public init(arena.Arena^ store) {
-        self.emitted_function_names = list.ArenaList<interner.Symbol>(store$.ref());
+    public init(arena.Arena& store) {
+        self.emitted_function_names = list.ArenaList<interner.Symbol>(store);
+        self.all_input_data = null;
+        self.all_input_count = 0;
     }
 
     public Bool emitted(interner.Symbol name) {
@@ -84,6 +89,18 @@ public struct EmissionState {
     }
 }
 
+public struct FunctionTarget {
+    public types.TypeTable^ type_table;
+    public jir.JirModule^ module;
+    public jir.JirFunctionDecl function;
+
+    public init(types.TypeTable^ type_table, jir.JirModule^ module, jir.JirFunctionDecl function) {
+        self.type_table = type_table$.ptr();
+        self.module = module$.ptr();
+        self.function = function;
+    }
+}
+
 public struct FunctionEnv {
     public list.ArenaList<LocalSlot> slots;
     public list.ArenaList<TypeSubst> generic_substs;
@@ -92,9 +109,9 @@ public struct FunctionEnv {
     public api.Value! catch_error_slot;
     public types.TypeId! function_result_type;
 
-    public init(arena.Arena^ store, EmissionState^ state) {
-        self.slots = list.ArenaList<LocalSlot>(store$.ref());
-        self.generic_substs = list.ArenaList<TypeSubst>(store$.ref());
+    public init(arena.Arena& store, EmissionState^ state) {
+        self.slots = list.ArenaList<LocalSlot>(store);
+        self.generic_substs = list.ArenaList<TypeSubst>(store);
         self.state = state$.ptr();
         self.catch_target = api.Block();
         self.catch_error_slot = api.Value();
@@ -273,7 +290,7 @@ types.TypeId substitute_type_id(types.TypeTable^ type_table, FunctionEnv^ env, t
     if (info.kind == .pointer) {
         types.TypeId element = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
         if (element.id == info.element.id) { return type_id; }
-        return type_table.make_pointer(info.span, element, info.mutable_item, info.many);
+        return type_table.make_pointer_kind(info.span, element, info.pointer_kind, info.mutable_item, info.many);
     }
     if (info.kind == .slice) {
         types.TypeId element = substitute_type_id(type_table$.ptr(), env$.ptr(), info.element);
@@ -315,6 +332,22 @@ types.TypeId substitute_type_id(types.TypeTable^ type_table, FunctionEnv^ env, t
     return type_id;
 }
 
+types.NominalKind type_decl_nominal_kind(jir.JirTypeDeclKind kind) {
+    if (kind == .struct_decl) { return .struct_decl; }
+    if (kind == .enum_decl) { return .enum_decl; }
+    if (kind == .union_decl) { return .union_decl; }
+    if (kind == .trait_decl) { return .trait_decl; }
+    if (kind == .alias_decl) { return .alias_decl; }
+    return .unknown;
+}
+
+types.PointerKind pointer_kind_from_ir(ir.PointerKind pointer_kind) {
+    if (pointer_kind == .owner) { return types.PointerKind.owner; }
+    if (pointer_kind == .many) { return types.PointerKind.many; }
+    if (pointer_kind == .raw) { return types.PointerKind.raw; }
+    return types.PointerKind.borrow;
+}
+
 () collect_type_substs(types.TypeTable^ type_table, FunctionEnv^ env, types.TypeId expected_type, types.TypeId actual_type) {
     if (!expected_type.valid() || !actual_type.valid()) { return; }
     if (expected_type.id >= type_table.len() || actual_type.id >= type_table.len()) { return; }
@@ -328,7 +361,7 @@ types.TypeId substitute_type_id(types.TypeTable^ type_table, FunctionEnv^ env, t
         collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
         return;
     }
-    if (expected_info.kind == .pointer && actual_info.kind == .pointer) {
+    if (expected_info.kind == .pointer && actual_info.kind == .pointer && expected_info.pointer_kind == actual_info.pointer_kind) {
         collect_type_substs(type_table$.ptr(), env$.ptr(), expected_info.element, actual_info.element);
         return;
     }
@@ -422,6 +455,86 @@ interner.Symbol init_function_name_symbol(context.CompilerContext^ ctx, jir.JirT
     return ctx.intern(text[0 .. out]);
 }
 
+interner.Symbol scoped_symbol(context.CompilerContext^ ctx, interner.Symbol module_symbol, interner.Symbol name_symbol) {
+    if (!module_symbol.valid()) { return name_symbol; }
+    if (ctx.symbol_equal(name_symbol, "main")) { return name_symbol; }
+    UInt8[*] prefix = ctx.symbol_c_string(module_symbol);
+    UInt8[*] suffix = ctx.symbol_c_string(name_symbol);
+    Int! prefix_length = c_string_length(prefix);
+    Int! suffix_length = c_string_length(suffix);
+    arena.Arena& store = ctx.ast_store_ref();
+    UInt8![*] text = store.alloc_array<UInt8>(prefix_length + 1 + suffix_length + 1);
+    Int! out = 0;
+    Int! index = 0;
+    while (index < prefix_length) {
+        text[out] = prefix[index];
+        out = out + 1;
+        index = index + 1;
+    }
+    text[out] = '.';
+    out = out + 1;
+    index = 0;
+    while (index < suffix_length) {
+        text[out] = suffix[index];
+        out = out + 1;
+        index = index + 1;
+    }
+    text[out] = 0;
+    return ctx.intern(text[0..out]);
+}
+
+interner.Symbol scoped_function_symbol(context.CompilerContext^ ctx, jir.JirModule^ input, jir.JirFunctionDecl decl) {
+    if (decl.extern_flag) { return decl.name.symbol; }
+    return scoped_symbol(ctx$.ptr(), input.module_symbol, decl.name.symbol);
+}
+
+interner.Symbol specialized_function_symbol(context.CompilerContext^ ctx, jir.JirModule^ input, jir.JirFunctionDecl decl, FunctionEnv^ env) {
+    interner.Symbol base_symbol = scoped_function_symbol(ctx$.ptr(), input$.ptr(), decl);
+    UInt8[*] base = ctx.symbol_c_string(base_symbol);
+    Int! suffix_parts = 0;
+    Int! suffix_length = 0;
+    Int! index = 0;
+    while (index < decl.params.len()) {
+        types.TypeId substituted = substitute_type_id(ctx.types_ref()$.ptr(), env$.ptr(), decl.params[index].type_id);
+        if (substituted.valid() && substituted.id >= 0) {
+            suffix_parts = suffix_parts + 1;
+            suffix_length = suffix_length + 3 + decimal_length(substituted.id);
+        }
+        index = index + 1;
+    }
+    if (suffix_parts == 0) {
+        return base_symbol;
+    }
+    Int! base_length = c_string_length(base);
+    arena.Arena& store = ctx.ast_store_ref();
+    UInt8![*] text = store.alloc_array<UInt8>(base_length + suffix_length + 1);
+    Int! out = 0;
+    index = 0;
+    while (index < base_length) {
+        text[out] = base[index];
+        out = out + 1;
+        index = index + 1;
+    }
+    index = 0;
+    while (index < decl.params.len()) {
+        types.TypeId substituted = substitute_type_id(ctx.types_ref()$.ptr(), env$.ptr(), decl.params[index].type_id);
+        if (substituted.valid() && substituted.id >= 0) {
+            text[out] = '_';
+            text[out + 1] = '_';
+            text[out + 2] = 't';
+            write_decimal(text, out + 3, substituted.id);
+            out = out + 3 + decimal_length(substituted.id);
+        }
+        index = index + 1;
+    }
+    text[out] = 0;
+    return ctx.intern(text[0 .. out]);
+}
+
+interner.Symbol scoped_init_function_name_symbol(context.CompilerContext^ ctx, jir.JirModule^ input, jir.JirTypeDecl decl, Int init_index) {
+    return scoped_symbol(ctx$.ptr(), input.module_symbol, init_function_name_symbol(ctx$.ptr(), decl, init_index));
+}
+
 api.Type builtin_type(context.CompilerContext^ ctx, api.Context llvm_context, interner.Symbol symbol) {
     if (ctx.symbol_equal(symbol, "Bool")) { return llvm_context.int1_type(); }
     if (ctx.symbol_equal(symbol, "UInt8")) { return llvm_context.int8_type(); }
@@ -471,20 +584,51 @@ jir.JirTypeDecl? type_decl_for_symbol(jir.JirModule^ input, Int symbol_id) {
     return null;
 }
 
-api.Type ast_type_ref(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, ast.AstType type_ref) {
+api.Type ast_type_ref(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, ir.AstType type_ref) {
+    EmissionState! state = EmissionState(ctx.ast_store_ref());
+    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ptr());
+    return ast_type_ref_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_ref, env$.ptr());
+}
+
+() add_nominal_generic_substs(FunctionEnv^ env, types.TypeTable^ type_table, jir.JirTypeDecl decl, types.TypeInfo info) {
+    Int! index = 0;
+    while (index < decl.generic_params.len() && index < info.child_count) {
+        env.add_generic_subst(decl.generic_params[index].symbol.id, type_table.child_at(info.child_start + index));
+        index = index + 1;
+    }
+}
+
+api.Type ast_type_ref_in_env(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, ir.AstType type_ref, FunctionEnv^ env) {
     if (type_ref is .unit(span)) {
         return llvm_context.void_type();
     }
     if (type_ref is .named(named)) {
         if (named.path.segment_len() > 0) {
-            ast.Name name = named.path.segments[0];
+            ir.Name name = named.path.segments[0];
+            if (named.path.segment_len() == 1) {
+                types.TypeId substituted = env.lookup_generic_subst(name.symbol.id);
+                if (substituted.valid()) {
+                    return llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, substituted);
+                }
+            }
             if (ctx.symbol_equal(name.symbol, "Int")) { return pointer_sized_int_type(llvm_context); }
             if (ctx.symbol_equal(name.symbol, "UInt")) { return pointer_sized_int_type(llvm_context); }
             if (ctx.symbol_equal(name.symbol, "Bool")) { return llvm_context.int1_type(); }
             jir.JirTypeDecl? decl = type_decl_for_symbol(input$.ptr(), name.symbol.id);
             if (decl is some type_decl) {
                 if (type_decl.kind == .struct_decl) {
-                    return struct_decl_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl);
+                    if (named.args.len() == type_decl.generic_params.len()) {
+                        EmissionState! nested_state = EmissionState(ctx.ast_store_ref());
+                        FunctionEnv! nested_env = FunctionEnv(ctx.ast_store_ref(), nested_state$.ptr());
+                        Int! arg_index = 0;
+                        while (arg_index < named.args.len()) {
+                            types.TypeId arg_type = type_from_ast_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), named.args[arg_index], env$.ptr());
+                            nested_env.add_generic_subst(type_decl.generic_params[arg_index].symbol.id, arg_type);
+                            arg_index = arg_index + 1;
+                        }
+                        return struct_decl_type_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl, nested_env$.ptr());
+                    }
+                    return struct_decl_type_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl, env$.ptr());
                 }
             }
         }
@@ -496,22 +640,68 @@ api.Type ast_type_ref(context.CompilerContext^ ctx, types.TypeTable^ type_table,
         if (layer.flags.optional) {
             Int![*] fields = Int!$.alloc_array(2);
             fields[0] = api.type_ref(llvm_context.int1_type());
-            fields[1] = api.type_ref(ast_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, layer.element));
+            fields[1] = api.type_ref(ast_type_ref_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, layer.element, env$.ptr()));
             return llvm_context.struct_type_refs(fields, 2);
         }
-        return ast_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, layer.element);
+        return ast_type_ref_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, layer.element, env$.ptr());
     }
     return pointer_sized_int_type(llvm_context);
 }
 
-Bool ast_type_optional(ast.AstType type_ref) {
+types.TypeId type_from_ast_ref(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, ir.AstType type_ref, FunctionEnv^ env) {
+    if (type_ref is .unit(span)) {
+        return type_table.make_unit(span);
+    }
+    if (type_ref is .named(named)) {
+        if (named.path.segment_len() == 1) {
+            types.TypeId substituted = env.lookup_generic_subst(named.path.segments[0].symbol.id);
+            if (substituted.valid()) {
+                return substituted;
+            }
+        }
+        if (named.path.segment_len() > 0) {
+            ir.Name last = named.path.segments[named.path.segment_len() - 1];
+            if (ctx.symbol_equal(last.symbol, "Int")) { return type_table.make_builtin(named.span, last.symbol); }
+            if (ctx.symbol_equal(last.symbol, "UInt")) { return type_table.make_builtin(named.span, last.symbol); }
+            if (ctx.symbol_equal(last.symbol, "Bool")) { return type_table.make_builtin(named.span, last.symbol); }
+            jir.JirTypeDecl? decl = type_decl_for_symbol(input$.ptr(), last.symbol.id);
+            if (decl is some type_decl) {
+                list.ArenaList<types.TypeId>! generic_args = list.ArenaList<types.TypeId>(ctx.ast_store_ref());
+                Int! index = 0;
+                while (index < named.args.len()) {
+                    generic_args.add(type_from_ast_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), named.args[index], env$.ptr()));
+                    index = index + 1;
+                }
+                if (generic_args.len() == 0) {
+                    return type_table.make_nominal(named.span, last.symbol, type_decl.binding_id, type_decl_nominal_kind(type_decl.kind));
+                }
+                Int child_start = type_table.begin_children();
+                index = 0;
+                while (index < generic_args.len()) {
+                    type_table.add_child(generic_args[index]);
+                    index = index + 1;
+                }
+                return type_table.make_nominal_with_args(named.span, last.symbol, type_decl.binding_id, type_decl_nominal_kind(type_decl.kind), child_start, generic_args.len());
+            }
+        }
+    }
+    if (type_ref is .pointer(pointer)) {
+        return type_table.make_pointer_kind(pointer.span, type_from_ast_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), pointer.element, env$.ptr()), pointer_kind_from_ir(pointer.pointer_kind), pointer.mutable_item, pointer.many);
+    }
+    if (type_ref is .layer(layer)) {
+        return type_table.make_layer(layer.span, type_from_ast_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), layer.element, env$.ptr()), layer.flags.optional, layer.flags.mutable);
+    }
+    return types.TypeId();
+}
+
+Bool ast_type_optional(ir.AstType type_ref) {
     if (type_ref is .layer(layer)) {
         return layer.flags.optional;
     }
     return false;
 }
 
-api.Value wrap_optional_ast_value(types.TypeTable^ type_table, api.Context llvm_context, api.Builder builder, types.TypeId source_type, ast.AstType target_type, api.Type target_ref, api.Value value) {
+api.Value wrap_optional_ast_value(types.TypeTable^ type_table, api.Context llvm_context, api.Builder builder, types.TypeId source_type, ir.AstType target_type, api.Type target_ref, api.Value value) {
     if (!ast_type_optional(target_type)) { return value; }
     if (source_type.valid() && type_table.is_optional(source_type)) { return value; }
     api.Value! current = api.undef(target_ref);
@@ -521,6 +711,12 @@ api.Value wrap_optional_ast_value(types.TypeTable^ type_table, api.Context llvm_
 }
 
 api.Type struct_decl_type(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, jir.JirTypeDecl decl) {
+    EmissionState! state = EmissionState(ctx.ast_store_ref());
+    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ptr());
+    return struct_decl_type_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl, env$.ptr());
+}
+
+api.Type struct_decl_type_in_env(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, jir.JirTypeDecl decl, FunctionEnv^ env) {
     if (decl.fields.len() == 0) {
         Int![*] empty = Int!$.alloc_array(1);
         return llvm_context.struct_type_refs(empty, 0);
@@ -528,17 +724,17 @@ api.Type struct_decl_type(context.CompilerContext^ ctx, types.TypeTable^ type_ta
     Int![*] fields = Int!$.alloc_array(decl.fields.len());
     Int! index = 0;
     while (index < decl.fields.len()) {
-        fields[index] = api.type_ref(ast_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl.fields[index].type_ref));
+        fields[index] = api.type_ref(ast_type_ref_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl.fields[index].type_ref, env$.ptr()));
         index = index + 1;
     }
     return llvm_context.struct_type_refs(fields, decl.fields.len());
 }
 
-UInt64 ast_type_align_bytes(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, ast.AstType type_ref) {
+UInt64 ast_type_align_bytes(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, ir.AstType type_ref) {
     if (type_ref is .unit(_)) { return UInt64(1); }
     if (type_ref is .named(named)) {
         if (named.path.segment_len() > 0) {
-            ast.Name name = named.path.segments[0];
+            ir.Name name = named.path.segments[0];
             if (ctx.symbol_equal(name.symbol, "Bool")) { return UInt64(1); }
             if (ctx.symbol_equal(name.symbol, "UInt8")) { return UInt64(1); }
             if (ctx.symbol_equal(name.symbol, "Int8")) { return UInt64(1); }
@@ -645,7 +841,10 @@ api.Type llvm_type(context.CompilerContext^ ctx, types.TypeTable^ type_table, ji
     if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
         jir.JirTypeDecl? decl = type_decl_for_binding(input$.ptr(), info.binding_id);
         if (decl is some type_decl) {
-            return struct_decl_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl);
+            EmissionState! state = EmissionState(ctx.ast_store_ref());
+            FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ptr());
+            add_nominal_generic_substs(env$.ptr(), type_table$.ptr(), type_decl, info);
+            return struct_decl_type_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl, env$.ptr());
         }
     }
     if (info.kind == .nominal && info.nominal_kind == .union_decl) {
@@ -732,8 +931,8 @@ api.Type specialized_function_type_ref(context.CompilerContext^ ctx, types.TypeT
     return api.function_type_refs(result_type, param_types, decl.params.len());
 }
 
-UInt8[*] function_name(context.CompilerContext^ ctx, jir.JirFunctionDecl decl) {
-    return ctx.symbol_c_string(decl.name.symbol);
+UInt8[*] function_name(context.CompilerContext^ ctx, jir.JirModule^ input, jir.JirFunctionDecl decl) {
+    return ctx.symbol_c_string(scoped_function_symbol(ctx$.ptr(), input$.ptr(), decl));
 }
 
 Int c_string_length(UInt8[*] text) {
@@ -745,7 +944,7 @@ Int c_string_length(UInt8[*] text) {
 }
 
 api.Value declare_function(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, jir.JirFunctionDecl decl) {
-    UInt8[*] name = function_name(ctx$.ptr(), decl);
+    UInt8[*] name = function_name(ctx$.ptr(), input$.ptr(), decl);
     api.Value existing = llvm_module.lookup_function(name);
     if (!existing.is_null()) { return existing; }
     return llvm_module.add_function(name, function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl));
@@ -771,7 +970,7 @@ api.Type init_function_type_ref(context.CompilerContext^ ctx, types.TypeTable^ t
 }
 
 api.Value declare_init_function(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, jir.JirTypeDecl type_decl, jir.JirInitDecl init_decl, Int init_index) {
-    interner.Symbol name_symbol = init_function_name_symbol(ctx$.ptr(), type_decl, init_index);
+    interner.Symbol name_symbol = scoped_init_function_name_symbol(ctx$.ptr(), input$.ptr(), type_decl, init_index);
     UInt8[*] name = ctx.symbol_c_string(name_symbol);
     api.Value existing = llvm_module.lookup_function(name);
     if (!existing.is_null()) { return existing; }
@@ -831,32 +1030,85 @@ jir.JirGlobalDecl? global_decl_for_binding(jir.JirModule^ input, scope.BindingId
     return null;
 }
 
-jir.JirFunctionDecl? function_decl_for_call(jir.JirModule^ input, jir.JirCallExpr call) {
-    jir.JirExpr callee = input.expr_at(call.callee);
-    if (callee.body is .name_expr(name)) {
-        if (name.binding_id.valid()) {
-            jir.JirFunctionDecl? binding_target = function_decl_for_binding(input$.ptr(), name.binding_id);
-            if (binding_target is some resolved_binding_target) {
-                return resolved_binding_target;
-            }
-        }
-    }
-    Int! symbol_id = -1;
-    if (callee.body is .name_expr(name)) {
-        symbol_id = name.name.symbol.id;
-    }
-    if (callee.body is .field_expr(field)) {
-        symbol_id = field.name.symbol.id;
-    }
+jir.JirFunctionDecl? function_decl_for_call_shape_in_module(jir.JirModule^ input, Int symbol_id, Int arg_count, Bool expect_instance_method, Bool expect_static_method) {
     Int! index = 0;
     while (index < input.decl_count()) {
         jir.JirDecl decl = input.decl_at(jir.JirDeclId(index));
         if (decl.body is .function_decl(function_decl)) {
             if (function_decl.name.symbol.id == symbol_id) {
-                if (function_decl.params.len() == call.args.len() || function_decl.params.len() == call.args.len() + 1) {
+                if (expect_instance_method) {
+                    if (function_decl.params.len() == arg_count + 1 && !function_decl.static_flag) {
+                        return function_decl;
+                    }
+                } else if (expect_static_method) {
+                    if (function_decl.params.len() == arg_count && function_decl.static_flag) {
+                        return function_decl;
+                    }
+                } else if (function_decl.params.len() == arg_count || function_decl.params.len() == arg_count + 1) {
                     return function_decl;
                 }
             }
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+FunctionTarget? function_target_for_call(EmissionState^ state, ModuleInput local_input, jir.JirCallExpr call) {
+    jir.JirExpr callee = local_input.module.expr_at(call.callee);
+    if (callee.body is .name_expr(name)) {
+        if (name.binding_id.valid()) {
+            jir.JirFunctionDecl? binding_target = function_decl_for_binding(local_input.module, name.binding_id);
+            if (binding_target is some resolved_binding_target) {
+                return FunctionTarget(local_input.type_table, local_input.module, resolved_binding_target);
+            }
+        }
+    }
+    if (callee.body is .field_expr(field)) {
+        jir.JirExpr base = local_input.module.expr_at(field.base);
+        if (base.body is .name_expr(module_name)) {
+            if (state.all_input_data != null && state.all_input_count > 0) {
+                Int! imported_index = 0;
+                while (imported_index < state.all_input_count) {
+                    ModuleInput imported_input = state.all_input_data[imported_index];
+                    jir.JirFunctionDecl? imported_function = function_decl_for_call_shape_in_module(imported_input.module, field.name.symbol.id, call.args.len(), false, false);
+                    if (imported_function is some resolved_imported_function) {
+                        return FunctionTarget(imported_input.type_table, imported_input.module, resolved_imported_function);
+                    }
+                    imported_index = imported_index + 1;
+                }
+            }
+        }
+    }
+    Int! symbol_id = -1;
+    Bool! expect_instance_method = false;
+    Bool! expect_static_method = false;
+    if (callee.body is .name_expr(name)) {
+        symbol_id = name.name.symbol.id;
+    }
+    if (callee.body is .field_expr(field)) {
+        symbol_id = field.name.symbol.id;
+        expect_instance_method = true;
+    }
+    if (callee.body is .variant_expr(variant)) {
+        if (variant.path.segment_len() == 2) {
+            symbol_id = variant.path.segments[1].symbol.id;
+            expect_static_method = true;
+        }
+    }
+    jir.JirFunctionDecl? local = function_decl_for_call_shape_in_module(local_input.module, symbol_id, call.args.len(), expect_instance_method, expect_static_method);
+    if (local is some local_function) {
+        return FunctionTarget(local_input.type_table, local_input.module, local_function);
+    }
+    if (state.all_input_data == null || state.all_input_count == 0) {
+        return null;
+    }
+    Int! index = 0;
+    while (index < state.all_input_count) {
+        ModuleInput candidate = state.all_input_data[index];
+        jir.JirFunctionDecl? found = function_decl_for_call_shape_in_module(candidate.module, symbol_id, call.args.len(), expect_instance_method, expect_static_method);
+        if (found is some imported_function) {
+            return FunctionTarget(candidate.type_table, candidate.module, imported_function);
         }
         index = index + 1;
     }
@@ -870,6 +1122,11 @@ Int call_symbol_id(jir.JirModule^ input, jir.JirCallExpr call) {
     }
     if (callee.body is .field_expr(field)) {
         return field.name.symbol.id;
+    }
+    if (callee.body is .variant_expr(variant)) {
+        if (variant.path.segment_len() == 2) {
+            return variant.path.segments[1].symbol.id;
+        }
     }
     return -1;
 }
@@ -1011,7 +1268,7 @@ api.Value wrap_optional_value(types.TypeTable^ type_table, api.Context llvm_cont
     return value;
 }
 
-Bool ast_type_is_named_or_layered_named(ast.AstType type_ref) {
+Bool ast_type_is_named_or_layered_named(ir.AstType type_ref) {
     if (type_ref is .layer(layer)) {
         return ast_type_is_named_or_layered_named(layer.element);
     }
@@ -1021,11 +1278,11 @@ Bool ast_type_is_named_or_layered_named(ast.AstType type_ref) {
     return false;
 }
 
-Bool ast_type_is_int_like(ast.AstType type_ref) {
+Bool ast_type_is_int_like(ir.AstType type_ref) {
     return ast_type_is_named_or_layered_named(type_ref);
 }
 
-Bool ast_type_is_pointer_like(ast.AstType type_ref) {
+Bool ast_type_is_pointer_like(ir.AstType type_ref) {
     if (type_ref is .layer(layer)) {
         return ast_type_is_pointer_like(layer.element);
     }
@@ -1035,7 +1292,7 @@ Bool ast_type_is_pointer_like(ast.AstType type_ref) {
     return false;
 }
 
-api.Value cast_value_to_ast_type(context.CompilerContext^ ctx, types.TypeTable^ type_table, api.Builder builder, types.TypeId source_type, ast.AstType target_type, api.Type target_ref, api.Value value) {
+api.Value cast_value_to_ast_type(context.CompilerContext^ ctx, types.TypeTable^ type_table, api.Builder builder, types.TypeId source_type, ir.AstType target_type, api.Type target_ref, api.Value value) {
     if (!source_type.valid()) { return value; }
     types.TypeInfo! source_info = type_table.type_at(source_type);
     if (source_info.kind == .layer && source_info.element.valid()) {
@@ -1139,7 +1396,7 @@ UInt8[*] string_literal_c_string(context.CompilerContext^ ctx, UInt8[] text, tok
     return data$.as(UInt8[*]);
 }
 
-api.Value literal_value(context.CompilerContext^ ctx, UInt8[] text, api.Type result_type, ast.Literal literal) {
+api.Value literal_value(context.CompilerContext^ ctx, UInt8[] text, api.Type result_type, ir.Literal literal) {
     if (literal is .int_lit(span)) {
         return api.const_int(result_type, parse_uint_literal(text, span));
     }
@@ -1156,7 +1413,7 @@ api.Value literal_value(context.CompilerContext^ ctx, UInt8[] text, api.Type res
     return api.const_null(result_type);
 }
 
-api.Value typed_literal_value(context.CompilerContext^ ctx, UInt8[] text, types.TypeTable^ type_table, api.Type result_type, types.TypeId type_id, ast.Literal literal) {
+api.Value typed_literal_value(context.CompilerContext^ ctx, UInt8[] text, types.TypeTable^ type_table, api.Type result_type, types.TypeId type_id, ir.Literal literal) {
     if (is_float_type(ctx$.ptr(), type_table$.ptr(), type_id)) {
         if (literal is .int_lit(span)) {
             return api.const_real_string(result_type, span_c_string(ctx$.ptr(), text, span), span.length);
@@ -1191,7 +1448,7 @@ Int float_type_width(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
 Bool is_uint8_many_pointer(context.CompilerContext^ ctx, types.TypeTable^ type_table, types.TypeId type_id) {
     if (!type_id.valid()) { return false; }
     types.TypeInfo info = type_table.type_at(type_id);
-    if (info.kind != .pointer || !info.many) { return false; }
+    if (info.kind != .pointer || info.pointer_kind != types.PointerKind.many || !info.many) { return false; }
     return type_table.is_builtin_named(info.element, ctx.symbols$.ref(), "UInt8");
 }
 
@@ -1296,13 +1553,13 @@ api.Value declare_global(context.CompilerContext^ ctx, types.TypeTable^ type_tab
     }
 }
 
-Int field_index(jir.JirTypeDecl decl, ast.Name? name) {
+Int field_index(jir.JirTypeDecl decl, ir.Name? name) {
     if (name == null) { return 0; }
-    ast.Name field_name = name$.some();
+    ir.Name field_name = name$.some();
     return field_index_name(decl, field_name);
 }
 
-Int field_index_name(jir.JirTypeDecl decl, ast.Name field_name) {
+Int field_index_name(jir.JirTypeDecl decl, ir.Name field_name) {
     Int! index = 0;
     while (index < decl.fields.len()) {
         if (decl.fields[index].name.symbol.id == field_name.symbol.id) {
@@ -1329,7 +1586,7 @@ jir.JirExprId struct_init_field_value(jir.JirStructExpr struct_expr, jir.JirType
     return decl.fields[field_index].default_value;
 }
 
-Int enum_member_index(jir.JirTypeDecl decl, ast.Name member_name) {
+Int enum_member_index(jir.JirTypeDecl decl, ir.Name member_name) {
     Int! index = 0;
     while (index < decl.members.len()) {
         if (decl.members[index].name.symbol.id == member_name.symbol.id) {
@@ -1340,7 +1597,7 @@ Int enum_member_index(jir.JirTypeDecl decl, ast.Name member_name) {
     return 0;
 }
 
-UInt64 enum_member_value(jir.JirModule^ input, UInt8[] source_text, jir.JirTypeDecl decl, ast.Name member_name) {
+UInt64 enum_member_value(jir.JirModule^ input, UInt8[] source_text, jir.JirTypeDecl decl, ir.Name member_name) {
     Int! index = 0;
     while (index < decl.members.len()) {
         jir.JirEnumMember member = decl.members[index];
@@ -1360,7 +1617,7 @@ UInt64 enum_member_value(jir.JirModule^ input, UInt8[] source_text, jir.JirTypeD
     return UInt64(0);
 }
 
-Int union_variant_index(jir.JirTypeDecl decl, ast.Name variant_name) {
+Int union_variant_index(jir.JirTypeDecl decl, ir.Name variant_name) {
     Int! index = 0;
     while (index < decl.variants.len()) {
         if (decl.variants[index].name.symbol.id == variant_name.symbol.id) {
@@ -1369,6 +1626,18 @@ Int union_variant_index(jir.JirTypeDecl decl, ast.Name variant_name) {
         index = index + 1;
     }
     return 0;
+}
+
+Bool union_has_variant(jir.JirTypeDecl decl, ir.Name variant_name) {
+    Int! index = 0;
+    while (index < decl.variants.len()) {
+        jir.JirUnionVariantDecl variant = decl.variants[index];
+        if (variant.name.symbol.id == variant_name.symbol.id) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
 }
 
 jir.JirTypeDecl? struct_decl_for_expr(types.TypeTable^ type_table, jir.JirModule^ input, types.TypeId type_id, jir.JirStructExpr struct_expr) {
@@ -1384,7 +1653,7 @@ jir.JirTypeDecl? struct_decl_for_expr(types.TypeTable^ type_table, jir.JirModule
     return null;
 }
 
-Int field_index_for_base(types.TypeTable^ type_table, jir.JirModule^ input, types.TypeId type_id, ast.Name name) {
+Int field_index_for_base(types.TypeTable^ type_table, jir.JirModule^ input, types.TypeId type_id, ir.Name name) {
     if (!type_id.valid()) { return -1; }
     types.TypeInfo info = type_table.type_at(type_id);
     if (info.kind == .nominal) {
@@ -1400,7 +1669,7 @@ Int field_index_for_base(types.TypeTable^ type_table, jir.JirModule^ input, type
     return -1;
 }
 
-Bool field_type_ref_optional_for_base(types.TypeTable^ type_table, jir.JirModule^ input, types.TypeId type_id, ast.Name name) {
+Bool field_type_ref_optional_for_base(types.TypeTable^ type_table, jir.JirModule^ input, types.TypeId type_id, ir.Name name) {
     if (!type_id.valid()) { return false; }
     types.TypeInfo info = type_table.type_at(type_id);
     if (info.kind == .nominal) {
@@ -1441,7 +1710,7 @@ api.Value declare_free(api.Context llvm_context, api.Module llvm_module) {
     return llvm_module.add_function("free", fn_type);
 }
 
-api.Value emit_alloc_array(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder, jir.JirExpr expr, ast.AstType type_ref, jir.JirCallExpr call, FunctionEnv^ env) {
+api.Value emit_alloc_array(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder, jir.JirExpr expr, ir.AstType type_ref, jir.JirCallExpr call, FunctionEnv^ env) {
     api.Type result_type = llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, expr.type_id);
     api.Type element_type = ast_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_ref);
     api.Value malloc_fn = declare_malloc(llvm_context, llvm_module);
@@ -1635,7 +1904,7 @@ api.Value! expr_address(context.CompilerContext^ ctx, types.TypeTable^ type_tabl
             if (base_info.kind == .layer && base_info.element.valid()) {
                 base_info = type_table.type_at(base_info.element);
             }
-            if (base_info.kind == .pointer && base_info.many) {
+            if (base_info.kind == .pointer && base_info.pointer_kind == types.PointerKind.many && base_info.many) {
                 api.Type element_type = llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, base_info.element);
                 api.Value pointer_value = expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, index_expr.base, env$.ptr());
                 return builder.build_gep_one(element_type, pointer_value, index_value, "index.ptr");
@@ -1680,7 +1949,7 @@ Bool is_null_literal_expr(jir.JirExpr expr) {
     return false;
 }
 
-api.Value optional_null_compare(types.TypeTable^ type_table, api.Context llvm_context, api.Builder builder, ast.BinaryOp op, jir.JirExpr left_expr, api.Value left, jir.JirExpr right_expr, api.Value right) {
+api.Value optional_null_compare(types.TypeTable^ type_table, api.Context llvm_context, api.Builder builder, ir.BinaryOp op, jir.JirExpr left_expr, api.Value left, jir.JirExpr right_expr, api.Value right) {
     Bool! left_null = is_null_literal_expr(left_expr);
     Bool! right_null = is_null_literal_expr(right_expr);
     Bool! left_optional = left_expr.type_id.valid() && type_table.is_optional(left_expr.type_id);
@@ -1749,7 +2018,7 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
         if (value_expr.type_id.valid() && expr.type_id.valid()) {
             types.TypeInfo source_info = type_table.type_at(value_expr.type_id);
             types.TypeInfo target_info = type_table.type_at(expr.type_id);
-            if (source_info.kind == .array && target_info.kind == .pointer && target_info.many) {
+            if (source_info.kind == .array && target_info.kind == .pointer && target_info.pointer_kind == types.PointerKind.many && target_info.many) {
                 api.Value address = expr_address(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, cast.value, env$.ptr());
                 return builder.build_pointer_cast(address, result_type, "array.ptr");
             }
@@ -1765,7 +2034,7 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
                 if (expr.type_id.valid() && local_slot.type_id.valid()) {
                     types.TypeInfo expr_info = type_table.type_at(expr.type_id);
                     types.TypeInfo slot_info = type_table.type_at(local_slot.type_id);
-                    if (expr_info.kind == .pointer && expr_info.many && slot_info.kind == .array) {
+                    if (expr_info.kind == .pointer && expr_info.pointer_kind == types.PointerKind.many && expr_info.many && slot_info.kind == .array) {
                         return local_slot.slot;
                     }
                     if (expr_info.kind == .pointer && slot_info.kind == .builtin) {
@@ -1947,12 +2216,42 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
         if (!base_expr.type_id.valid()) {
             return api.const_null(result_type);
         }
-        types.TypeInfo base_info = type_table.type_at(base_expr.type_id);
+        types.TypeInfo! base_info = type_table.type_at(base_expr.type_id);
         if (base_info.kind == .invalid) {
             return api.const_null(result_type);
         }
+        if (base_info.kind == .layer && base_info.mutable && !base_info.optional) {
+            base_info = type_table.type_at(base_info.element);
+        }
         if (base_info.kind == .nominal && base_info.nominal_kind == .enum_decl && field.name.symbol.id == ctx.intern("value").id) {
             return expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, field.base, env$.ptr());
+        }
+        if (base_info.kind == .pointer && base_info.element.valid()) {
+            types.TypeInfo pointee_info = type_table.type_at(base_info.element);
+            if (pointee_info.kind == .nominal && pointee_info.nominal_kind == .enum_decl && field.name.symbol.id == ctx.intern("value").id) {
+                api.Value enum_ptr = expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, field.base, env$.ptr());
+                return builder.build_load(result_type, enum_ptr, "enum.value");
+            }
+        }
+        types.TypeId! union_type_id = base_expr.type_id;
+        if (base_info.kind == .pointer && base_info.element.valid()) {
+            union_type_id = base_info.element;
+        }
+        if (union_type_id.valid()) {
+            types.TypeInfo union_info = type_table.type_at(union_type_id);
+            if (union_info.kind == .nominal && union_info.nominal_kind == .union_decl) {
+                jir.JirTypeDecl? union_decl = type_decl_for_binding(input$.ptr(), union_info.binding_id);
+                if (union_decl is some union_type_decl) {
+                    if (union_has_variant(union_type_decl, field.name)) {
+                        api.Value! union_value = expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, field.base, env$.ptr());
+                        if (base_info.kind == .pointer && base_info.element.valid()) {
+                            union_value = builder.build_load(llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, union_type_id), union_value, "union.value");
+                        }
+                        api.Value payload = builder.build_extract_value(union_value, UInt32(1), "union.payload");
+                        return payload;
+                    }
+                }
+            }
         }
         if (base_info.kind == .layer && base_info.optional) {
             types.TypeId payload_type_id = base_info.element;
@@ -2042,19 +2341,20 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
             api.Value arg_value = expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, call.args[0], env$.ptr());
             return cast_integer_value(ctx$.ptr(), type_table$.ptr(), builder, arg_expr.type_id, expr.type_id, result_type, arg_value);
         }
-        jir.JirFunctionDecl? target = function_decl_for_call(input$.ptr(), call);
-        if (target is some decl) {
+        FunctionTarget? target = function_target_for_call(env.state, ModuleInput(type_table, input), call);
+        if (target is some function_target) {
+            jir.JirFunctionDecl decl = function_target.function;
             Bool! method_call = false;
             jir.JirExpr callee = input.expr_at(call.callee);
             if (callee.body is .field_expr(field)) {
                 method_call = decl.params.len() == call.args.len() + 1;
             }
-            FunctionEnv! call_env = FunctionEnv(ctx.ast_store_ref()$.ptr(), env.state);
-            if (function_decl_is_generic(type_table$.ptr(), decl)) {
+            FunctionEnv! call_env = FunctionEnv(ctx.ast_store_ref(), env.state);
+            if (function_decl_is_generic(function_target.type_table, decl)) {
                 Int! subst_index = 0;
                 if (method_call) {
                     if (callee.body is .field_expr(field)) {
-                        collect_type_substs(type_table$.ptr(), call_env$.ptr(), decl.params[0].type_id, input.expr_at(field.base).type_id);
+                        collect_type_substs(function_target.type_table, call_env$.ptr(), decl.params[0].type_id, input.expr_at(field.base).type_id);
                     }
                     subst_index = 1;
                 }
@@ -2062,24 +2362,24 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
                 while (infer_index < call.args.len()) {
                     Int param_index = infer_index + subst_index;
                     if (param_index < decl.params.len()) {
-                        collect_type_substs(type_table$.ptr(), call_env$.ptr(), decl.params[param_index].type_id, input.expr_at(call.args[infer_index]).type_id);
+                        collect_type_substs(function_target.type_table, call_env$.ptr(), decl.params[param_index].type_id, input.expr_at(call.args[infer_index]).type_id);
                     }
                     infer_index = infer_index + 1;
                 }
             }
             interner.Symbol! function_symbol = decl.name.symbol;
-            api.Type! fn_type = function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl);
+            api.Type! fn_type = function_type_ref(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, decl);
             api.Value! fn = api.Value();
-            if (function_decl_is_generic(type_table$.ptr(), decl)) {
-                function_symbol = specialized_function_name(ctx$.ptr(), decl, call_env$.ptr());
-                fn_type = specialized_function_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, decl, call_env$.ptr());
-                fn = declare_specialized_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl, function_symbol, call_env$.ptr());
+            if (function_decl_is_generic(function_target.type_table, decl)) {
+                function_symbol = specialized_function_symbol(ctx$.ptr(), function_target.module, decl, call_env$.ptr());
+                fn_type = specialized_function_type_ref(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, decl, call_env$.ptr());
+                fn = declare_specialized_function(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, llvm_module, decl, function_symbol, call_env$.ptr());
                 if (!env.state.emitted(function_symbol) && decl.body != null && !decl.extern_flag) {
-                    emit_specialized_function_now(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl, function_symbol, call_env$.ptr());
+                    emit_specialized_function_now(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, llvm_module, decl, function_symbol, call_env$.ptr());
                     env.state.mark_emitted(function_symbol);
                 }
             } else {
-                fn = declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl);
+                fn = declare_function(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, llvm_module, decl);
             }
             Int! arg_count = call.args.len();
             if (method_call) { arg_count = arg_count + 1; }
@@ -2090,10 +2390,10 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
                     api.Value! self_arg = expr_address(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, field.base, env$.ptr());
                     if (decl.params.len() > 0) {
                         types.TypeId! self_type_id = decl.params[0].type_id;
-                        if (function_decl_is_generic(type_table$.ptr(), decl)) {
-                            self_type_id = substitute_type_id(type_table$.ptr(), call_env$.ptr(), self_type_id);
+                        if (function_decl_is_generic(function_target.type_table, decl)) {
+                            self_type_id = substitute_type_id(function_target.type_table, call_env$.ptr(), self_type_id);
                         }
-                        self_arg = cast_value(ctx$.ptr(), type_table$.ptr(), builder, input.expr_at(field.base).type_id, self_type_id, llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, self_type_id), self_arg);
+                        self_arg = cast_value(ctx$.ptr(), type_table$.ptr(), builder, input.expr_at(field.base).type_id, self_type_id, llvm_type(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, self_type_id), self_arg);
                     }
                     args[0] = api.value_ref(self_arg);
                     out_index = 1;
@@ -2106,10 +2406,10 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
                 Int param_index = index + out_index;
                 if (param_index < decl.params.len()) {
                     types.TypeId! param_type_id = decl.params[param_index].type_id;
-                    if (function_decl_is_generic(type_table$.ptr(), decl)) {
-                        param_type_id = substitute_type_id(type_table$.ptr(), call_env$.ptr(), param_type_id);
+                    if (function_decl_is_generic(function_target.type_table, decl)) {
+                        param_type_id = substitute_type_id(function_target.type_table, call_env$.ptr(), param_type_id);
                     }
-                    arg_value = cast_value(ctx$.ptr(), type_table$.ptr(), builder, arg_expr.type_id, param_type_id, llvm_type(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, param_type_id), arg_value);
+                    arg_value = cast_value(ctx$.ptr(), type_table$.ptr(), builder, arg_expr.type_id, param_type_id, llvm_type(ctx$.ptr(), function_target.type_table, function_target.module, llvm_context, param_type_id), arg_value);
                 }
                 args[index + out_index] = api.value_ref(arg_value);
                 index = index + 1;
@@ -2150,6 +2450,10 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
         api.Value! current = api.undef(build_result_type);
         jir.JirTypeDecl? decl = struct_decl_for_expr(type_table$.ptr(), input$.ptr(), build_type_id, struct_expr);
         if (decl is some type_decl) {
+            FunctionEnv! struct_env = FunctionEnv(ctx.ast_store_ref(), env.state);
+            if (build_type_id.valid()) {
+                add_nominal_generic_substs(struct_env$.ptr(), type_table$.ptr(), type_decl, type_table.type_at(build_type_id));
+            }
             Int! matched_init_index = -1;
             Int! scan_index = 0;
             while (scan_index < type_decl.inits.len()) {
@@ -2194,7 +2498,7 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
             Int! field_index_value = 0;
             while (field_index_value < type_decl.fields.len()) {
                 jir.JirExprId value_id = struct_init_field_value(struct_expr, type_decl, field_index_value);
-                api.Type field_type_ref = ast_type_ref(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl.fields[field_index_value].type_ref);
+                api.Type field_type_ref = ast_type_ref_in_env(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, type_decl.fields[field_index_value].type_ref, struct_env$.ptr());
                 api.Value! value = api.const_null(field_type_ref);
                 if (value_id.valid()) {
                     value = expr_value(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, value_id, env$.ptr());
@@ -2247,9 +2551,9 @@ api.Value expr_value(context.CompilerContext^ ctx, types.TypeTable^ type_table, 
     }
     if (expr.body is .variant_expr(variant_expr)) {
         jir.JirTypeDecl?! decl = null;
-        ast.Name! member_name = ast.Name(token.Span(), interner.Symbol());
+        ir.Name! member_name = ir.Name(token.Span(), interner.Symbol());
         if (variant_expr.path.segment_len() >= 2) {
-            ast.Name type_name = variant_expr.path.segments[0];
+            ir.Name type_name = variant_expr.path.segments[0];
             member_name = variant_expr.path.segments[1];
             decl = type_decl_for_symbol(input$.ptr(), type_name.symbol.id);
         } else if (variant_expr.path.segment_len() == 1) {
@@ -2311,9 +2615,9 @@ Bool block_ends_block(jir.JirModule^ input, jir.JirBlock block) {
 api.Value variant_pattern_test(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Builder builder, api.Value value, jir.JirPatternTest test) {
     if (test.path is some path) {
         jir.JirTypeDecl?! decl = null;
-        ast.Name! variant_name = ast.Name(token.Span(), interner.Symbol());
+        ir.Name! variant_name = ir.Name(token.Span(), interner.Symbol());
         if (path.segment_len() >= 2) {
-            ast.Name type_name = path.segments[0];
+            ir.Name type_name = path.segments[0];
             variant_name = path.segments[1];
             decl = type_decl_for_symbol(input$.ptr(), type_name.symbol.id);
         } else if (path.segment_len() == 1) {
@@ -2812,7 +3116,7 @@ api.Value switch_case_condition(context.CompilerContext^ ctx, types.TypeTable^ t
     debug_log("debug: emit function");
     debug_log(ctx.symbol_c_string(name_symbol));
     api.Value! function_value = api.Value();
-    if (name_symbol.id == decl.name.symbol.id && !function_decl_is_generic(type_table$.ptr(), decl)) {
+    if (name_symbol.id == scoped_function_symbol(ctx$.ptr(), input$.ptr(), decl).id && !function_decl_is_generic(type_table$.ptr(), decl)) {
         function_value = declare_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl);
     } else {
         function_value = declare_specialized_function(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, decl, name_symbol, env$.ptr());
@@ -2871,8 +3175,8 @@ Bool emitted_function_contains(list.ArenaList<scope.BindingId> emitted, scope.Bi
     api.Value self_slot = builder.build_alloca(self_type, "self");
     builder.build_store(llvm_module.get_param(function_value, UInt32(0)), self_slot);
 
-    EmissionState! state = EmissionState(ctx.ast_store_ref()$.ptr());
-    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref()$.ptr(), state$.ptr());
+    EmissionState! state = EmissionState(ctx.ast_store_ref());
+    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ptr());
     env.add_local(init_decl.self_local_id, self_slot, self_type, init_decl.self_type_id);
     env.set_function_result_type(type_table.make_unit(init_decl.span));
 
@@ -2892,23 +3196,27 @@ Bool emitted_function_contains(list.ArenaList<scope.BindingId> emitted, scope.Bi
     }
 }
 
-() emit_functions(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder) {
+() emit_functions(context.CompilerContext^ ctx, types.TypeTable^ type_table, jir.JirModule^ input, api.Context llvm_context, api.Module llvm_module, api.Builder builder, ModuleInput[*]! all_input_data, Int all_input_count) {
     list.ArenaList<scope.BindingId>! emitted = list.ArenaList<scope.BindingId>(ctx.ast_store_ref());
-    EmissionState! state = EmissionState(ctx.ast_store_ref()$.ptr());
+    EmissionState! state = EmissionState(ctx.ast_store_ref());
+    state.all_input_data = all_input_data;
+    state.all_input_count = all_input_count;
     Int! index = 0;
     while (index < input.decl_count()) {
         jir.JirDecl decl = input.decl_at(jir.JirDeclId(index));
         if (decl.body is .function_decl(function_decl)) {
             if (!function_decl.extern_flag && function_decl.body != null && !function_decl_is_generic(type_table$.ptr(), function_decl)) {
                 if (!function_decl.binding_id.valid()) {
-                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref()$.ptr(), state$.ptr());
-                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl, function_decl.name.symbol, env$.ptr());
-                    state.mark_emitted(function_decl.name.symbol);
+                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ptr());
+                    interner.Symbol emitted_name = scoped_function_symbol(ctx$.ptr(), input$.ptr(), function_decl);
+                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl, emitted_name, env$.ptr());
+                    state.mark_emitted(emitted_name);
                 } else if (!emitted_function_contains(emitted, function_decl.binding_id)) {
-                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref()$.ptr(), state$.ptr());
-                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl, function_decl.name.symbol, env$.ptr());
+                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ptr());
+                    interner.Symbol emitted_name = scoped_function_symbol(ctx$.ptr(), input$.ptr(), function_decl);
+                    emit_function_named(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, function_decl, emitted_name, env$.ptr());
                     emitted.add(function_decl.binding_id);
-                    state.mark_emitted(function_decl.name.symbol);
+                    state.mark_emitted(emitted_name);
                 }
             }
         }
@@ -2944,7 +3252,11 @@ Bool emitted_function_contains(list.ArenaList<scope.BindingId> emitted, scope.Bi
     while (index < inputs.len()) {
         debug_log("debug: emit module");
         ModuleInput input = inputs[index];
-        emit_functions(ctx$.ptr(), input.type_table, input.module, llvm_context, llvm_module, builder);
+        ModuleInput[*]! all_input_data = null;
+        if (inputs.len() > 0) {
+            all_input_data = inputs.get(0)$.ptr()$.as(ModuleInput[*]);
+        }
+        emit_functions(ctx$.ptr(), input.type_table, input.module, llvm_context, llvm_module, builder, all_input_data, inputs.len());
         index = index + 1;
     }
 }
@@ -2989,7 +3301,7 @@ public UInt8[*] emit_jir_module_ir(context.CompilerContext^ ctx, types.TypeTable
     api.Builder! builder = make_builder(llvm_context);
     declare_globals(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module);
     declare_functions(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module);
-    emit_functions(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder);
+    emit_functions(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, null, 0);
     assert(api.verify(llvm_module$.ptr()) == 0);
     UInt8[*] ir = api.print_to_string(llvm_module$.ptr());
     builder.dispose();
@@ -3005,7 +3317,7 @@ public Int32 emit_jir_module_object(context.CompilerContext^ ctx, types.TypeTabl
     api.Builder! builder = make_builder(llvm_context);
     declare_globals(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module);
     declare_functions(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module);
-    emit_functions(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder);
+    emit_functions(ctx$.ptr(), type_table$.ptr(), input$.ptr(), llvm_context, llvm_module, builder, null, 0);
     Int32 result = api.emit_object_file(llvm_module$.ptr(), path);
     builder.dispose();
     llvm_module.dispose();

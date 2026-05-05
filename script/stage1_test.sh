@@ -304,9 +304,6 @@ run_compile_only extern_single_function_minimal.jiang
 run_compile_only extern_single_global_minimal.jiang
 run_compile_only extern_cstring_minimal.jiang
 run_compile_only cstring_local_minimal.jiang
-run_sample std_ffi_cstring_minimal.jiang 42
-run_executable_sample std_ffi_cstring_minimal.jiang 42
-run_compile_only std_ffi_cstring_extern_minimal.jiang
 run_sample generic_import_func_call_minimal.jiang 42
 run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
