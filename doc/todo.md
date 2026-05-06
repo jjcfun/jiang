@@ -79,11 +79,11 @@
 
 ## 第四阶段：Type Check / Resolve 清理
 
-- [ ] 将 overload resolution 从 fallback 逻辑整理成明确算法。
-  - [ ] 函数 overload。
-  - [ ] method overload。
-  - [ ] static method overload。
-  - [ ] ambiguous overload diagnostic。
+- [x] 将 overload resolution 从 fallback 逻辑整理成明确算法。
+  - [x] 函数 overload。
+  - [x] method overload。
+  - [x] static method overload。
+  - [x] ambiguous overload diagnostic。
 - [ ] 继续收敛 trait / generic 基础语义。
   - [ ] trait declaration 基本检查。
   - [ ] extend declaration 基本检查。
