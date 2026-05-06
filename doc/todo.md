@@ -70,7 +70,7 @@
   - [x] 记录 signature/body/layout hash 的占位字段或计算入口。
   - [x] 明确 tombstone / no-reuse ID 策略。
 - [ ] 清理跨阶段重复 side table。
-  - [ ] 顶层声明类型只从 `DeclInfo.type_id/result_type_id` 读取。
+  - [x] 顶层声明类型只从 `DeclInfo.type_id/result_type_id` 读取。
   - [ ] `TypeCheckResult` 只保留 expression/local/pattern 等阶段必要结果。
   - [ ] HIR/JIR lowering 不重新做名称解析或类型推导。
 
