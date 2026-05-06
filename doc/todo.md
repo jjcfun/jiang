@@ -84,16 +84,16 @@
   - [x] method overload。
   - [x] static method overload。
   - [x] ambiguous overload diagnostic。
-- [ ] 继续收敛 trait / generic 基础语义。
-  - [ ] trait declaration 基本检查。
-  - [ ] extend declaration 基本检查。
-  - [ ] associated type binding 检查。
-  - [ ] trait conformance diagnostic。
+- [x] 继续收敛 trait / generic 基础语义。
+  - [x] trait declaration 基本检查。
+  - [x] extend declaration 基本检查。
+  - [x] associated type binding 检查。
+  - [x] trait conformance diagnostic。
   - [ ] 暂缓完整 trait solving 和 trait method lookup，直到调用目标模型稳定。
 - [ ] 清理目标语言不保留的历史语法。
-  - [ ] 参数 label。
-  - [ ] 参数 default value。
-  - [ ] record call syntax。
+  - [x] 参数 label。
+  - [x] 参数 default value。
+  - [x] record call syntax。
   - [ ] grouped declaration 的最终策略。
 - [ ] 明确 optional/errorable 规则。
   - [ ] null-check narrowing 是否长期保留。
