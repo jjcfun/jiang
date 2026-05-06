@@ -328,9 +328,9 @@ run_sample coalesce_return_minimal.jiang 42
 run_known_stage1_gap coalesce_break_minimal.jiang 3
 run_known_stage1_gap coalesce_continue_minimal.jiang 13
 run_sample invalid_coalesce_return_value.jiang 1
-run_known_stage1_gap optional_chain_member_minimal.jiang 42
+run_sample optional_chain_member_minimal.jiang 42
 run_sample optional_chain_index_minimal.jiang 40
-run_known_stage1_gap optional_chain_nested_pure_base_minimal.jiang 42
+run_sample optional_chain_nested_pure_base_minimal.jiang 42
 run_sample optional_some_minimal.jiang 42
 run_sample optional_some_pattern_minimal.jiang 42
 run_sample optional_if_mutable_pattern_minimal.jiang 42
@@ -378,7 +378,7 @@ run_sample type_modifier_canonical_minimal.jiang 7
 run_known_stage1_gap generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
-run_known_stage1_gap nested_fields_minimal.jiang 42
+run_sample nested_fields_minimal.jiang 42
 run_known_stage1_gap call_result_field_minimal.jiang 42
 run_sample struct_init_minimal.jiang 42
 run_known_stage1_gap struct_init_overload_minimal.jiang 43

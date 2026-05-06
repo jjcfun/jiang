@@ -75,6 +75,7 @@
     - [x] 删除 local type 的重复并行索引。
     - [ ] expression/type-ref/call target 的并行索引仍需等待 Stage1 指针字段比较和结构化 list 语义更稳。
   - [ ] HIR/JIR lowering 不重新做名称解析或类型推导。
+    - [x] struct field / union variant 类型由 HIR 携带 `TypeId`，JIR 不再从 AST type-ref 重构。
 
 ## 第四阶段：Type Check / Resolve 清理
 
