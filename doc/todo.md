@@ -60,15 +60,15 @@
 
 ## 第三阶段：Semantic Table 收敛
 
-- [ ] 减少 `SemanticContext` 中对 `decl_table` 的线性扫描。
-  - [ ] 增加 `BindingId -> DeclId` 索引。
-  - [ ] 增加 `(ModuleId, Symbol) -> DeclId` 索引。
-  - [ ] 增加 `ModuleId -> AstFile` 直接索引。
-  - [ ] 增加 `DeclId -> owner/module/file` helper。
-- [ ] 将 `DeclInfo` 作为顶层声明事实表继续加强。
-  - [ ] 记录 declaration stable key 的第一版结构。
-  - [ ] 记录 signature/body/layout hash 的占位字段或计算入口。
-  - [ ] 明确 tombstone / no-reuse ID 策略。
+- [x] 减少 `SemanticContext` 中对 `decl_table` 的线性扫描。
+  - [x] 增加 `BindingId -> DeclId` 索引。
+  - [x] 增加 `(ModuleId, Symbol) -> DeclId` 索引。
+  - [x] 增加 `ModuleId -> AstFile` 直接索引。
+  - [x] 增加 `DeclId -> owner/module/file` helper。
+- [x] 将 `DeclInfo` 作为顶层声明事实表继续加强。
+  - [x] 记录 declaration stable key 的第一版结构。
+  - [x] 记录 signature/body/layout hash 的占位字段或计算入口。
+  - [x] 明确 tombstone / no-reuse ID 策略。
 - [ ] 清理跨阶段重复 side table。
   - [ ] 顶层声明类型只从 `DeclInfo.type_id/result_type_id` 读取。
   - [ ] `TypeCheckResult` 只保留 expression/local/pattern 等阶段必要结果。
