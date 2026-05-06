@@ -3580,11 +3580,16 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
             }
             if (strcmp(method->name, "equal") == 0) {
                 AstType expected_param;
+                AstType expected_ref;
                 if (method->params.count != 1 || method->return_type.kind != AST_TYPE_BOOL) {
                     return 0;
                 }
                 expected_param = substitute_self_type(&method->params.items[0].type, type);
-                if (!ast_type_is_equal(&expected_param, type)) {
+                memset(&expected_ref, 0, sizeof(expected_ref));
+                expected_ref.kind = AST_TYPE_REFERENCE;
+                expected_ref.array_item = (AstType*)malloc(sizeof(AstType));
+                *expected_ref.array_item = ast_type_copy(type);
+                if (!ast_type_is_equal(&expected_param, &expected_ref)) {
                     return 0;
                 }
                 if (!(builtin->kind == AST_BUILTIN_NOMINAL_INT ||
@@ -3688,11 +3693,16 @@ static int type_has_builtin_concept_methods(const AstProgram* program, const Ast
     }
 
     if (strcmp(concept_name, "Equatable") == 0) {
+        AstType ref_type;
         synthetic.name = "Equatable";
         self_type.kind = AST_TYPE_NAMED;
         self_type.named_name = "Self";
+        memset(&ref_type, 0, sizeof(ref_type));
+        ref_type.kind = AST_TYPE_REFERENCE;
+        ref_type.array_item = (AstType*)malloc(sizeof(AstType));
+        *ref_type.array_item = self_type;
         param.name = "other";
-        param.type = self_type;
+        param.type = ref_type;
         method.name = "equal";
         method.return_type.kind = AST_TYPE_BOOL;
         param_list_push(&method.params, param);

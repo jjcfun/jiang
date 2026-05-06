@@ -3165,7 +3165,7 @@ static HirExpr* make_union_field_expr(LowerContext* ctx, HirExpr* value, HirUnio
 static int lower_variant_pattern_bind(LowerContext* ctx, HirExpr* value, const AstExpr* pattern, HirBlock* out_block, HirExpr** cond_out);
 static int lower_pattern_bind(LowerContext* ctx, const AstBindingPattern* pattern, HirExpr* init, HirBlock* out_block);
 static int bind_optional_narrow(LowerContext* ctx, const char* name, HirBlock* out_block, int line);
-static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr);
+static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr, HirType* expected_type);
 
 static HirBuiltinKind builtin_kind(const char* name) {
     if (strcmp(name, "assert") == 0) return HIR_BUILTIN_ASSERT;
@@ -3264,15 +3264,26 @@ static int lower_builtin_method_call(LowerContext* ctx,
     expr_list_push(&out->as.call.args, receiver_arg);
     if (builtin == HIR_BUILTIN_EQUAL) {
         HirExpr* arg = 0;
+        HirType* value_type = primitive_type(ctx->program, receiver_type->kind);
+        HirType* expected_type = 0;
+        if (!value_type) {
+            value_type = receiver_type;
+        }
+        expected_type = reference_to_type(ctx, value_type);
         if (ast_args->count != 1 || ast_args->items[0].name) {
             return fail(ctx, "equal expects exactly one argument");
         }
-        arg = lower_expr_expected(ctx, ast_args->items[0].value, receiver_type);
+        arg = lower_expr_expected(ctx, ast_args->items[0].value, expected_type);
         if (!arg) {
             return 0;
         }
-        if (!type_assignment_compatible(arg->type, receiver_type)) {
+        if (!type_assignment_compatible(arg->type, expected_type)) {
             return fail(ctx, "equal argument type mismatch");
+        }
+        {
+            HirExpr* deref = new_expr(HIR_EXPR_DEREF, value_type, line);
+            deref->as.unary.value = arg;
+            arg = deref;
         }
         expr_list_push(&out->as.call.args, arg);
         out->type = primitive_type(ctx->program, HIR_TYPE_BOOL);
@@ -3287,6 +3298,51 @@ static int lower_builtin_method_call(LowerContext* ctx,
     }
     (void)line;
     return fail(ctx, "unsupported builtin method");
+}
+
+static HirExpr* lower_equatable_binary_method_call(LowerContext* ctx,
+                                                   AstBinaryOp op,
+                                                   HirExpr* left,
+                                                   HirExpr* right,
+                                                   int line) {
+    HirFunction* method = 0;
+    HirExpr* receiver_arg = 0;
+    HirExpr* right_ref = 0;
+    HirExpr* call = 0;
+    if ((op != AST_BIN_EQ && op != AST_BIN_NE) || !left || !right || !type_equals(left->type, right->type)) {
+        return 0;
+    }
+    method = find_type_method(ctx->program, left->type, "equal", 0);
+    if (!method || method->return_type->kind != HIR_TYPE_BOOL || method->params.count != 2) {
+        return 0;
+    }
+    receiver_arg = make_instance_method_receiver(ctx, left, left->type, line);
+    if (!receiver_arg) {
+        return 0;
+    }
+    if (!is_lvalue_expr(right)) {
+        fail(ctx, "equal argument requires lvalue");
+        return 0;
+    }
+    right_ref = new_expr(HIR_EXPR_ADDR, reference_to_type(ctx, right->type), line);
+    right_ref->as.unary.value = right;
+    if (!type_assignment_compatible(right_ref->type, method->params.items[1]->type)) {
+        return 0;
+    }
+    call = new_expr(HIR_EXPR_CALL, primitive_type(ctx->program, HIR_TYPE_BOOL), line);
+    call->as.call.callee = method;
+    expr_list_push(&call->as.call.args, receiver_arg);
+    expr_list_push(&call->as.call.args, right_ref);
+    if (op == AST_BIN_NE) {
+        HirExpr* false_lit = new_expr(HIR_EXPR_BOOL, primitive_type(ctx->program, HIR_TYPE_BOOL), line);
+        HirExpr* not_expr = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_BOOL), line);
+        false_lit->as.bool_value = 0;
+        not_expr->as.binary.op = HIR_BIN_EQ;
+        not_expr->as.binary.left = call;
+        not_expr->as.binary.right = false_lit;
+        return not_expr;
+    }
+    return call;
 }
 
 static int lower_call_arg_for_param(LowerContext* ctx,
@@ -5292,7 +5348,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
             return out;
         }
         case AST_EXPR_SWITCH:
-            return lower_switch_expr(ctx, expr);
+            return lower_switch_expr(ctx, expr, expected_type);
         case AST_EXPR_TERNARY: {
             HirExpr* cond = lower_expr_expected(ctx, expr->as.ternary.cond, primitive_type(ctx->program, HIR_TYPE_BOOL));
             HirExpr* then_expr = 0;
@@ -6104,6 +6160,12 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                 }
                 if (!right) {
                     return 0;
+                }
+            }
+            if (expr->as.binary.op == AST_BIN_EQ || expr->as.binary.op == AST_BIN_NE) {
+                HirExpr* equal_call = lower_equatable_binary_method_call(ctx, expr->as.binary.op, left, right, expr->line);
+                if (equal_call || ctx->error) {
+                    return equal_call;
                 }
             }
             out = new_expr(HIR_EXPR_BINARY, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
@@ -7555,7 +7617,7 @@ static int validate_switch_expr_cases(LowerContext* ctx, HirExpr* value, const A
     return 1;
 }
 
-static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
+static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr, HirType* expected_type) {
     HirExpr* value = lower_expr(ctx, expr->as.switch_expr.value);
     HirExpr* fallback = 0;
     HirType* result_type = 0;
@@ -7570,8 +7632,11 @@ static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
         const AstSwitchExprCase* ast_case = &expr->as.switch_expr.cases.items[i];
         HirExpr* branch_value = 0;
         HirExpr* cond = 0;
+        HirType* branch_expected_type = result_type ? result_type : expected_type;
         if (ast_case->is_else) {
-            fallback = lower_expr(ctx, ast_case->value);
+            fallback = branch_expected_type
+                ? lower_expr_expected(ctx, ast_case->value, branch_expected_type)
+                : lower_expr(ctx, ast_case->value);
             if (!fallback) {
                 return 0;
             }
@@ -7586,7 +7651,9 @@ static HirExpr* lower_switch_expr(LowerContext* ctx, const AstExpr* expr) {
             }
             continue;
         }
-        branch_value = lower_expr(ctx, ast_case->value);
+        branch_value = branch_expected_type
+            ? lower_expr_expected(ctx, ast_case->value, branch_expected_type)
+            : lower_expr(ctx, ast_case->value);
         if (!branch_value) {
             return 0;
         }

@@ -10,7 +10,7 @@ if [ -z "$LLVM_CONFIG" ] && [ -n "${JIANG_LLVM_ROOT:-}" ]; then
 fi
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 
-STAGE1_BUILD_DIR="${STAGE1_BUILD_DIR:-$ROOT_DIR/build/stage1-smoke}"
+STAGE1_BUILD_DIR="${STAGE1_BUILD_DIR:-$ROOT_DIR/build/stage1}"
 STAGE1_LL="$STAGE1_BUILD_DIR/jiangc.ll"
 STAGE1_BIN="$STAGE1_BUILD_DIR/jiangc"
 INPUT="$STAGE1_BUILD_DIR/input.jiang"
@@ -62,7 +62,7 @@ status=$?
 set -e
 
 if [ "$status" -ne 42 ]; then
-  echo "stage1 smoke failed: expected exit 42, got $status"
+  echo "stage1 build check failed: expected exit 42, got $status"
   exit 1
 fi
 
@@ -76,7 +76,7 @@ run_sample() {
   local status=$?
   set -e
   if [ "$status" -ne "$expected" ]; then
-    echo "stage1 smoke failed: $sample expected exit $expected, got $status"
+    echo "stage1 build check failed: $sample expected exit $expected, got $status"
     exit 1
   fi
 }
@@ -91,7 +91,7 @@ run_next_sample() {
   local status=$?
   set -e
   if [ "$status" -ne "$expected" ]; then
-    echo "stage1 smoke failed: samples_next/$sample expected exit $expected, got $status"
+    echo "stage1 build check failed: samples_next/$sample expected exit $expected, got $status"
     exit 1
   fi
 }
@@ -118,4 +118,4 @@ run_sample fields_minimal.jiang 3
 run_sample struct_grouped_fields_minimal.jiang 42
 run_sample struct_init_minimal.jiang 42
 
-echo "stage1 smoke ok"
+echo "stage1 build ok"

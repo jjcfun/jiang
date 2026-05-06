@@ -6,7 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build/stage1-tests}"
 SAMPLES_DIR="$PROJECT_ROOT/tests/samples"
 NEXT_SAMPLES_DIR="$PROJECT_ROOT/tests/samples_next"
-STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1-smoke/jiangc}"
+STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1/jiangc}"
 
 if [[ -n "${LLVM_CONFIG:-}" ]]; then
   LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"
@@ -32,7 +32,7 @@ mkdir -p "$BUILD_DIR"
 
 if [[ ! -x "$STAGE1_BIN" ]]; then
   echo "error: stage1 compiler not found: $STAGE1_BIN" >&2
-  echo "hint: run LLVM_CONFIG=/path/to/llvm-config bash script/stage1_smoke.sh first" >&2
+  echo "hint: run LLVM_CONFIG=/path/to/llvm-config bash script/build_stage1.sh first" >&2
   exit 1
 fi
 

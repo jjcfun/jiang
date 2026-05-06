@@ -33,7 +33,7 @@
 - [ ] 给新增行为建立最小样例，不把大范围语言回归混进单个测试。
 - [ ] 保持每个阶段都能通过：
   - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh`
-  - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_smoke.sh`
+  - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage1.sh`
   - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_test.sh`
 
 ## 第二阶段：Package / Source / Driver
