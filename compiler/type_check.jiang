@@ -43,6 +43,50 @@ public struct LocalType {
     }
 }
 
+public struct InitFieldState {
+    public list.ArenaList<Int> symbols;
+    public list.ArenaList<Bool> assigned;
+
+    public init(arena.Arena& store) {
+        self.symbols = list.ArenaList<Int>(store);
+        self.assigned = list.ArenaList<Bool>(store);
+    }
+
+    public () init_from_struct(ast.StructDecl decl) {
+        Int! index = 0;
+        while (index < decl.fields.len()) {
+            ast.FieldDecl field = decl.fields[index];
+            self.symbols.add(field.name.symbol.id);
+            self.assigned.add(field.default_value != null);
+            index = index + 1;
+        }
+    }
+
+    public Int field_index(Int symbol_id) {
+        Int! index = 0;
+        while (index < self.symbols.len()) {
+            if (self.symbols[index] == symbol_id) {
+                return index;
+            }
+            index = index + 1;
+        }
+        return -1;
+    }
+
+    public Bool is_assigned(Int symbol_id) {
+        Int index = self.field_index(symbol_id);
+        if (index < 0) { return false; }
+        return self.assigned[index];
+    }
+
+    public () mark_assigned(Int symbol_id) {
+        Int index = self.field_index(symbol_id);
+        if (index >= 0) {
+            self.assigned.set(index, true);
+        }
+    }
+}
+
 public struct TypeCheckResult {
     context.CompilerContext& ctx;
     public types.TypeTable& type_table;
@@ -267,10 +311,13 @@ public struct TypeChecker {
     list.ArenaList<Int>! resolving_aliases;
     list.ArenaList<LocalType>! active_locals;
     list.ArenaList<Int>! local_scope_starts;
+    list.ArenaList<Int>! freed_symbols;
     list.ArenaList<ast.WhereConstraint>! active_generic_constraints;
     list.ArenaList<Int>! generic_scope_starts;
     types.TypeId! current_return_type;
     types.TypeId! current_self_type;
+    Int! current_loop_depth;
+    Int! current_decl_index;
     Bool! current_init_body;
 
     public init(context.CompilerContext& ctx, resolve.ResolveResult& resolved) {
@@ -282,10 +329,13 @@ public struct TypeChecker {
         self.resolving_aliases = list.ArenaList<Int>(ctx.ast_store_ref());
         self.active_locals = list.ArenaList<LocalType>(ctx.ast_store_ref());
         self.local_scope_starts = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.freed_symbols = list.ArenaList<Int>(ctx.ast_store_ref());
         self.active_generic_constraints = list.ArenaList<ast.WhereConstraint>(ctx.ast_store_ref());
         self.generic_scope_starts = list.ArenaList<Int>(ctx.ast_store_ref());
         self.current_return_type = types.TypeId();
         self.current_self_type = types.TypeId();
+        self.current_loop_depth = 0;
+        self.current_decl_index = -1;
         self.current_init_body = false;
     }
 
@@ -304,9 +354,11 @@ public struct TypeChecker {
         index = 0;
         while (index < file.len()) {
             ast.AstDecl decl = file.decl_at(index);
+            self.current_decl_index = index;
             self.check_decl(decl);
             index = index + 1;
         }
+        self.current_decl_index = -1;
         return self.result;
     }
 
@@ -484,6 +536,8 @@ public struct TypeChecker {
         if (decl.initializer is some initializer) {
             self.result.checked_initializer_count = self.result.checked_initializer_count + 1;
             self.check_initializer(declared_type, initializer$.ptr());
+        } else if (self.type_requires_initializer(declared_type)) {
+            self.mismatch(decl.span, "inferred type requires initializer");
         }
     }
 
@@ -491,6 +545,9 @@ public struct TypeChecker {
         self.enter_generic_scope(decl.generics);
         self.check_generics(decl.generics);
         self.function_type(decl);
+        if (decl.extern_flag && decl.body != null) {
+            self.mismatch(decl.span, "extern function must not have body");
+        }
         if (decl.body is some body) {
             self.check_function_body(decl, body);
         } else {
@@ -526,6 +583,10 @@ public struct TypeChecker {
         self.enter_generic_scope(decl.generics);
         self.check_generics(decl.generics);
         types.TypeId self_type = self.nominal_type(decl.name, .struct_decl);
+        self.check_struct_field_decls(decl);
+        self.check_struct_method_decls(decl);
+        self.check_struct_init_decls(decl);
+        self.check_nominal_traits(decl.traits, decl.methods);
         Int! index = 0;
         while (index < decl.fields.len()) {
             ast.FieldDecl field = decl.fields[index];
@@ -541,6 +602,8 @@ public struct TypeChecker {
             types.TypeId previous_return_type = self.current_return_type;
             types.TypeId previous_self_type = self.current_self_type;
             Bool previous_init_body = self.current_init_body;
+            InitFieldState field_state = InitFieldState(self.ctx.ast_store_ref());
+            field_state.init_from_struct(decl);
             self.current_return_type = self.unit_type(init_decl.span);
             self.current_self_type = self_type;
             self.current_init_body = true;
@@ -553,7 +616,8 @@ public struct TypeChecker {
                 self.define_local_type(param.name, self.type_from_ast(param.type_ref), param.mutable_binding);
                 param_index = param_index + 1;
             }
-            self.check_block(init_decl.body);
+            self.check_init_block(init_decl.body, decl, field_state$.ptr());
+            self.check_init_fields_complete(init_decl, decl, field_state);
             self.exit_local_scope();
             self.current_init_body = previous_init_body;
             self.current_self_type = previous_self_type;
@@ -571,6 +635,124 @@ public struct TypeChecker {
         self.exit_generic_scope();
     }
 
+    () check_struct_field_decls(ast.StructDecl decl) {
+        Int! index = 0;
+        while (index < decl.fields.len()) {
+            ast.FieldDecl field = decl.fields[index];
+            Int! previous = 0;
+            while (previous < index) {
+                if (decl.fields[previous].name.symbol.id == field.name.symbol.id) {
+                    self.mismatch(field.name.span, "duplicate field declaration");
+                }
+                previous = previous + 1;
+            }
+            Int! method_index = 0;
+            while (method_index < decl.methods.len()) {
+                if (decl.methods[method_index].name.symbol.id == field.name.symbol.id) {
+                    self.mismatch(decl.methods[method_index].name.span, "method name conflicts with field");
+                }
+                method_index = method_index + 1;
+            }
+            index = index + 1;
+        }
+    }
+
+    () check_struct_method_decls(ast.StructDecl decl) {
+        Int! left = 0;
+        while (left < decl.methods.len()) {
+            ast.FunctionDecl left_method = decl.methods[left];
+            if (left_method.name.symbol.id == self.ctx.intern("init").id && left_method.static_flag) {
+                self.mismatch(left_method.name.span, "static init is not allowed");
+            }
+            Int! right = left + 1;
+            while (right < decl.methods.len()) {
+                ast.FunctionDecl right_method = decl.methods[right];
+                if (left_method.name.symbol.id == right_method.name.symbol.id && self.same_function_signature(left_method, right_method)) {
+                    self.mismatch(right_method.name.span, "duplicate method overload");
+                }
+                right = right + 1;
+            }
+            left = left + 1;
+        }
+    }
+
+    () check_struct_init_decls(ast.StructDecl decl) {
+        Int! left = 0;
+        while (left < decl.inits.len()) {
+            ast.InitDecl left_init = decl.inits[left];
+            Int! right = left + 1;
+            while (right < decl.inits.len()) {
+                ast.InitDecl right_init = decl.inits[right];
+                if (self.same_init_signature(left_init, right_init)) {
+                    self.mismatch(right_init.span, "duplicate init overload");
+                }
+                right = right + 1;
+            }
+            left = left + 1;
+        }
+    }
+
+    Bool same_init_signature(ast.InitDecl left, ast.InitDecl right) {
+        if (left.params.len() != right.params.len()) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < left.params.len()) {
+            types.TypeId left_type = self.type_from_ast(left.params[index].type_ref);
+            types.TypeId right_type = self.type_from_ast(right.params[index].type_ref);
+            if (!self.type_table.type_equals(left_type, right_type)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    () check_nominal_traits(list.ArenaList<ast.Path> traits, list.ArenaList<ast.FunctionDecl> methods) {
+        Int! index = 0;
+        while (index < traits.len()) {
+            ast.Path trait_path = traits[index];
+            ast.TraitDecl? trait_decl = self.trait_decl_for_path(trait_path);
+            if (trait_decl is some resolved_trait) {
+                self.check_nominal_trait_methods(methods, resolved_trait);
+            } else {
+                self.mismatch(trait_path.span, "declared trait must resolve to trait");
+            }
+            index = index + 1;
+        }
+    }
+
+    () check_nominal_trait_methods(list.ArenaList<ast.FunctionDecl> methods, ast.TraitDecl trait_decl) {
+        Int! index = 0;
+        while (index < trait_decl.methods.len()) {
+            ast.FunctionDecl signature = trait_decl.methods[index].signature;
+            if (!self.nominal_has_trait_method(methods, signature)) {
+                self.mismatch(signature.name.span, "missing trait method implementation");
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < trait_decl.parents.len()) {
+            ast.TraitDecl? parent_decl = self.trait_decl_for_path(trait_decl.parents[index]);
+            if (parent_decl is some resolved_parent) {
+                self.check_nominal_trait_methods(methods, resolved_parent);
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool nominal_has_trait_method(list.ArenaList<ast.FunctionDecl> methods, ast.FunctionDecl signature) {
+        Int! index = 0;
+        while (index < methods.len()) {
+            ast.FunctionDecl method = methods[index];
+            if (method.name.symbol.id == signature.name.symbol.id && self.same_function_signature(method, signature)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
     ast.AstType receiver_type_for_name(ast.Name name) {
         ast.Path path = ast.Path(self.ctx.ast_store_ref(), name.span);
         path.add_segment(name);
@@ -579,11 +761,22 @@ public struct TypeChecker {
 
     () check_enum(ast.EnumDecl decl) {
         types.TypeId self_type = self.nominal_type(decl.name, .enum_decl);
+        self.check_nominal_traits(decl.traits, decl.methods);
         Int! index = 0;
         while (index < decl.members.len()) {
             ast.EnumMember member = decl.members[index];
+            Int! previous = 0;
+            while (previous < index) {
+                if (decl.members[previous].name.symbol.id == member.name.symbol.id) {
+                    self.mismatch(member.name.span, "duplicate enum member");
+                }
+                previous = previous + 1;
+            }
             if (member.value is some value) {
-                self.expr_type(value, types.TypeId());
+                types.TypeId value_type = self.expr_type(value, self.int_type(member.span));
+                if (!self.type_table.assignment_compatible(self.int_type(member.span), value_type)) {
+                    self.mismatch(member.span, "enum member value must be Int");
+                }
             }
             index = index + 1;
         }
@@ -598,6 +791,7 @@ public struct TypeChecker {
         self.enter_generic_scope(decl.generics);
         self.check_generics(decl.generics);
         types.TypeId self_type = self.nominal_type(decl.name, .union_decl);
+        self.check_nominal_traits(decl.traits, decl.methods);
         Int! index = 0;
         while (index < decl.variants.len()) {
             ast.UnionVariant variant = decl.variants[index];
@@ -648,6 +842,7 @@ public struct TypeChecker {
     public () check_extend(ast.ExtendDecl decl) {
         self.enter_generic_scope(decl.generics);
         self.check_generics(decl.generics);
+        self.check_extend_target_declared_before(decl);
         types.TypeId receiver_type = self.type_from_ast(decl.target);
         self.check_method_variant_name_conflicts(receiver_type, decl);
         self.check_extend_traits(decl);
@@ -663,6 +858,19 @@ public struct TypeChecker {
             index = index + 1;
         }
         self.exit_generic_scope();
+    }
+
+    () check_extend_target_declared_before(ast.ExtendDecl decl) {
+        if (self.current_decl_index < 0) { return; }
+        if (decl.target is .named(named)) {
+            if (named.path.segment_len() != 1) { return; }
+            scope.Binding? binding = self.resolved.lookup_top_level_id(named.path.segments[0].symbol.id);
+            if (binding is some resolved_binding) {
+                if (resolved_binding.ast_index > self.current_decl_index) {
+                    self.mismatch(named.span, "extend target must be declared before extend");
+                }
+            }
+        }
     }
 
     public () check_extend_traits(ast.ExtendDecl decl) {
@@ -911,6 +1119,7 @@ public struct TypeChecker {
         if (decl.body is some body) {
             self.check_method_body(decl, body, receiver_type);
         } else {
+            self.mismatch(decl.span, "method must have body");
             self.enter_local_scope();
             Int! index = 0;
             while (index < decl.params.len()) {
@@ -933,6 +1142,7 @@ public struct TypeChecker {
         if (decl.body is some body) {
             self.check_method_body(decl, body, receiver_type);
         } else {
+            self.mismatch(decl.span, "method must have body");
             self.enter_local_scope();
             Int! index = 0;
             while (index < decl.params.len()) {
@@ -967,10 +1177,16 @@ public struct TypeChecker {
         types.TypeId previous_return_type = self.current_return_type;
         types.TypeId previous_self_type = self.current_self_type;
         self.current_return_type = self.type_from_ast(decl.result);
-        self.current_self_type = receiver_type;
+        if (decl.static_flag) {
+            self.current_self_type = types.TypeId();
+        } else {
+            self.current_self_type = receiver_type;
+        }
         self.enter_local_scope();
-        ast.Name self_name = ast.Name(decl.span, self.ctx.intern("self"));
-        self.define_local_type(self_name, self.type_table.make_pointer_kind(decl.span, receiver_type, types.PointerKind.borrow, false, false), false);
+        if (!decl.static_flag) {
+            ast.Name self_name = ast.Name(decl.span, self.ctx.intern("self"));
+            self.define_local_type(self_name, self.type_table.make_pointer_kind(decl.span, receiver_type, types.PointerKind.borrow, false, false), false);
+        }
         Int! index = 0;
         while (index < decl.params.len()) {
             ast.Param param = decl.params[index];
@@ -1141,6 +1357,85 @@ public struct TypeChecker {
         self.exit_local_scope();
     }
 
+    () check_init_block(ast.Block block, ast.StructDecl decl, InitFieldState^ state) {
+        self.enter_local_scope();
+        Int! index = 0;
+        while (index < block.stmts.len()) {
+            self.check_init_stmt(block.stmts[index], decl, state);
+            index = index + 1;
+        }
+        self.exit_local_scope();
+    }
+
+    () check_init_stmt(ast.AstStmt stmt, ast.StructDecl decl, InitFieldState^ state) {
+        if (stmt is .assign(assign)) {
+            self.check_init_expr_before_assignment(assign.value, state);
+            self.check_assignment(assign);
+            self.record_init_assignment(assign, state);
+            return;
+        }
+        if (stmt is .return_stmt(return_stmt)) {
+            if (return_stmt.value is some value) {
+                self.check_init_expr(value, state);
+            }
+            self.check_return(return_stmt);
+            return;
+        }
+        if (stmt is .expr(expr_stmt)) {
+            self.check_init_expr(expr_stmt.value, state);
+            self.expr_type(expr_stmt.value, types.TypeId());
+            return;
+        }
+        if (stmt is .throw_stmt(throw_stmt)) {
+            self.check_init_expr(throw_stmt.value, state);
+            self.check_throw(throw_stmt);
+            return;
+        }
+        if (stmt is .block(block)) {
+            self.check_init_block(block, decl, state);
+            return;
+        }
+        self.check_stmt(stmt);
+    }
+
+    () check_init_expr_before_assignment(ast.AstExpr^ expr, InitFieldState^ state) {
+        self.check_init_expr(expr, state);
+    }
+
+    () check_init_expr(ast.AstExpr^ expr, InitFieldState^ state) {
+        if (self.expr_contains_direct_self(expr)) {
+            self.mismatch(self.expr_span(expr), "init must not let self reference escape");
+            return;
+        }
+        ast.Name? field_name = self.self_field_read_name(expr);
+        if (field_name is some name) {
+            if (!state.is_assigned(name.symbol.id)) {
+                self.mismatch(name.span, "init must not read field before initialization");
+            }
+        }
+    }
+
+    () record_init_assignment(ast.AssignStmt assign, InitFieldState^ state) {
+        ast.Name? field_name = self.self_field_write_name(assign.target);
+        if (field_name is some name) {
+            if (state.is_assigned(name.symbol.id)) {
+                self.mismatch(name.span, "init must not assign field more than once");
+            }
+            state.mark_assigned(name.symbol.id);
+        }
+    }
+
+    () check_init_fields_complete(ast.InitDecl init_decl, ast.StructDecl decl, InitFieldState state) {
+        Int! index = 0;
+        while (index < decl.fields.len()) {
+            ast.FieldDecl field = decl.fields[index];
+            if (!state.is_assigned(field.name.symbol.id) && !self.struct_field_can_be_omitted(field)) {
+                self.mismatch(init_decl.span, "init must initialize all fields");
+            }
+            index = index + 1;
+        }
+    }
+
     () check_stmt(ast.AstStmt stmt) {
         self.result.checked_stmt_count = self.result.checked_stmt_count + 1;
         if (stmt is .var_decl(var_decl)) {
@@ -1175,23 +1470,7 @@ public struct TypeChecker {
             return;
         }
         if (stmt is .try_stmt(try_stmt)) {
-            self.check_block(try_stmt.body);
-            types.TypeId body_error_type = self.try_stmt_error_type(try_stmt);
-            Int! index = 0;
-            while (index < try_stmt.catches.len()) {
-                ast.CatchStmt catch_stmt = try_stmt.catches[index];
-                self.enter_local_scope();
-                types.TypeId! catch_error_type = body_error_type;
-                if (catch_stmt.error_type is some error_type) {
-                    catch_error_type = self.type_from_ast(error_type);
-                }
-                if (catch_stmt.binding is some binding) {
-                    self.define_local_type(binding, catch_error_type, false);
-                }
-                self.check_block(catch_stmt.body);
-                self.exit_local_scope();
-                index = index + 1;
-            }
+            self.check_try_stmt(try_stmt);
             return;
         }
         if (stmt is .while_stmt(while_stmt)) {
@@ -1201,14 +1480,18 @@ public struct TypeChecker {
                 self.check_bool(cond_type, is_expr.span);
                 self.enter_local_scope();
                 self.check_pattern(is_expr.pattern, value_type);
+                self.current_loop_depth = self.current_loop_depth + 1;
                 self.check_block(while_stmt.body);
+                self.current_loop_depth = self.current_loop_depth - 1;
                 self.exit_local_scope();
                 return;
             }
             token.Span cond_span = self.expr_span(while_stmt.cond$.ptr());
             types.TypeId cond_type = self.expr_type(while_stmt.cond$.ptr(), self.bool_type(cond_span));
             self.check_bool(cond_type, cond_span);
+            self.current_loop_depth = self.current_loop_depth + 1;
             self.check_block(while_stmt.body);
+            self.current_loop_depth = self.current_loop_depth - 1;
             return;
         }
         if (stmt is .for_range(for_range)) {
@@ -1224,11 +1507,24 @@ public struct TypeChecker {
             return;
         }
         if (stmt is .throw_stmt(throw_stmt)) {
-            self.expr_type(throw_stmt.value, types.TypeId());
+            self.check_throw(throw_stmt);
+            return;
+        }
+        if (stmt is .break_stmt(span)) {
+            if (self.current_loop_depth == 0) {
+                self.mismatch(span, "break outside loop");
+            }
+            return;
+        }
+        if (stmt is .continue_stmt(span)) {
+            if (self.current_loop_depth == 0) {
+                self.mismatch(span, "continue outside loop");
+            }
             return;
         }
         if (stmt is .expr(expr_stmt)) {
             self.expr_type(expr_stmt.value, types.TypeId());
+            self.record_free_expr(expr_stmt.value);
             return;
         }
         if (stmt is .defer_stmt(defer_stmt)) {
@@ -1255,8 +1551,18 @@ public struct TypeChecker {
                 types.TypeId initializer_type = self.expr_type(initializer$.ptr(), declared_type);
                 self.check_assignment_compatible(declared_type, initializer_type, decl.span, "initializer type mismatch");
             }
+        } else if (self.type_requires_initializer(declared_type)) {
+            self.mismatch(decl.span, "inferred type requires initializer");
         }
         self.define_local_type(decl.name, declared_type, decl.mutable_binding);
+    }
+
+    Bool type_requires_initializer(types.TypeId type_id) {
+        if (!type_id.valid()) { return false; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .infer) { return true; }
+        if (info.kind == .array && info.inferred_count) { return true; }
+        return false;
     }
 
     () check_assignment(ast.AssignStmt stmt) {
@@ -1297,17 +1603,22 @@ public struct TypeChecker {
 
     () check_switch_stmt(ast.SwitchStmt stmt) {
         types.TypeId value_type = self.expr_type(stmt.value, types.TypeId());
+        Bool! has_else = false;
         Int! index = 0;
         while (index < stmt.cases.len()) {
             ast.SwitchCase case_value = stmt.cases[index];
             self.enter_local_scope();
             if (case_value.pattern is some pattern) {
+                self.check_duplicate_switch_pattern(stmt, pattern, index);
                 self.check_pattern(pattern, value_type);
+            } else {
+                has_else = true;
             }
             self.check_block(case_value.body);
             self.exit_local_scope();
             index = index + 1;
         }
+        self.check_switch_exhaustive(stmt.span, value_type, has_else, stmt.cases);
     }
 
     () check_for_range(ast.ForRangeStmt stmt) {
@@ -1319,7 +1630,9 @@ public struct TypeChecker {
         self.check_compatible(range_type, self.expr_type(stmt.end_expr$.ptr(), range_type), self.expr_span(stmt.end_expr$.ptr()), "range end type mismatch");
         self.enter_local_scope();
         self.define_local_type(stmt.name, range_type, false);
+        self.current_loop_depth = self.current_loop_depth + 1;
         self.check_block(stmt.body);
+        self.current_loop_depth = self.current_loop_depth - 1;
         self.exit_local_scope();
     }
 
@@ -1328,8 +1641,28 @@ public struct TypeChecker {
         types.TypeId item_type = self.iterable_item_type(iterable_type, stmt.span);
         self.enter_local_scope();
         self.check_pattern(stmt.pattern, item_type);
+        self.current_loop_depth = self.current_loop_depth + 1;
         self.check_block(stmt.body);
+        self.current_loop_depth = self.current_loop_depth - 1;
         self.exit_local_scope();
+    }
+
+    () check_throw(ast.ExprStmt stmt) {
+        types.TypeId! expected_error = types.TypeId();
+        Bool! in_errorable = false;
+        if (self.current_return_type.valid()) {
+            types.TypeInfo return_info = self.type_table.type_at(self.current_return_type);
+            if (return_info.kind == .errorable) {
+                expected_error = return_info.other;
+                in_errorable = true;
+            }
+        }
+        types.TypeId thrown_type = self.expr_type(stmt.value, expected_error);
+        if (!in_errorable) {
+            self.mismatch(stmt.span, "throw outside errorable function");
+            return;
+        }
+        self.check_assignment_compatible(expected_error, thrown_type, stmt.span, "throw type mismatch");
     }
 
     () check_return(ast.ReturnStmt stmt) {
@@ -1398,7 +1731,8 @@ public struct TypeChecker {
             if (self.current_self_type.valid()) {
                 return self.type_table.make_pointer_kind(span, self.current_self_type, types.PointerKind.borrow, false, false);
             }
-            return self.type_table.make_type_param(span, self.ctx.intern("Self"));
+            self.mismatch(span, "self is not available in static context");
+            return self.invalid_type(span);
         }
         if (expr is .implicit_value(span)) {
             return self.infer_type(span);
@@ -1420,6 +1754,10 @@ public struct TypeChecker {
         }
         if (expr is .cast(cast)) {
             types.TypeId target_type = self.type_from_ast(cast.target);
+            types.TypeInfo target_info = self.type_table.type_at(target_type);
+            if (target_info.kind == .layer && target_info.mutable) {
+                self.mismatch(cast.span, "cast target must not be mutable");
+            }
             self.expr_type(cast.value, types.TypeId());
             return target_type;
         }
@@ -1440,14 +1778,28 @@ public struct TypeChecker {
             return self.type_of_coalesce(coalesce, expected);
         }
         if (expr is .coalesce_control(control)) {
-            self.expr_type(control.left$.ptr(), types.TypeId());
-            if (control.result is some result_expr) {
-                self.expr_type(result_expr$.ptr(), self.current_return_type);
+            if (!self.coalesce_left_is_pure(control.left$.ptr())) {
+                self.mismatch(control.span, "coalesce left operand must be pure");
             }
-            return self.optional_element_or_invalid(control.left$.ptr(), control.span);
+            types.TypeId left_type = self.expr_type(control.left$.ptr(), types.TypeId());
+            if (control.control == .break_loop && self.current_loop_depth == 0) {
+                self.mismatch(control.span, "break outside loop");
+            }
+            if (control.control == .continue_loop && self.current_loop_depth == 0) {
+                self.mismatch(control.span, "continue outside loop");
+            }
+            if (control.result is some result_expr) {
+                types.TypeId expected_return = self.errorable_value_type_or_self(self.current_return_type);
+                types.TypeId result_type = self.expr_type(result_expr$.ptr(), expected_return);
+                self.check_assignment_compatible(expected_return, result_type, control.span, "coalesce return type mismatch");
+            }
+            return self.optional_element_from_type_or_invalid(left_type, control.span);
         }
         if (expr is .catch_handler(handler)) {
             types.TypeId left_type = self.expr_type(handler.left$.ptr(), types.TypeId());
+            if (!self.type_is_errorable(left_type)) {
+                self.mismatch(handler.span, "catch source must be errorable");
+            }
             types.TypeId result_type = self.errorable_value_type_or_self(left_type);
             types.TypeId error_type = self.errorable_error_type_or_infer(left_type, handler.span);
             self.enter_local_scope();
@@ -1532,6 +1884,9 @@ public struct TypeChecker {
     types.TypeId type_of_name(ast.Name name) {
         LocalType? local = self.lookup_local_type(name.symbol.id);
         if (local is some local_type) {
+            if (self.symbol_is_freed(name.symbol.id)) {
+                self.mismatch(name.span, "use after free");
+            }
             return local_type.type_id;
         }
         resolve.ResolvedValuePath? resolved_path = self.resolved.lookup_resolved_value_span(name.span);
@@ -1545,6 +1900,48 @@ public struct TypeChecker {
         }
         self.result.unknown_type_count = self.result.unknown_type_count + 1;
         return self.invalid_type(name.span);
+    }
+
+    Bool symbol_is_freed(Int symbol_id) {
+        Int! index = 0;
+        while (index < self.freed_symbols.len()) {
+            if (self.freed_symbols[index] == symbol_id) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () mark_symbol_freed(Int symbol_id) {
+        if (!self.symbol_is_freed(symbol_id)) {
+            self.freed_symbols.add(symbol_id);
+        }
+    }
+
+    () record_free_expr(ast.AstExpr^ expr) {
+        if (expr is .call(call)) {
+            if (call.callee is .field(field)) {
+                if (self.ctx.symbol_equal(field.name.symbol, "free")) {
+                    Int symbol_id = self.receiver_symbol_id(field.base);
+                    if (symbol_id >= 0) {
+                        self.mark_symbol_freed(symbol_id);
+                    }
+                }
+            }
+        }
+    }
+
+    Int receiver_symbol_id(ast.AstExpr^ expr) {
+        if (expr is .name(name)) {
+            return name.symbol.id;
+        }
+        if (expr is .unary(unary)) {
+            if (unary.op == .address_value || unary.op == .deref) {
+                return self.receiver_symbol_id(unary.value);
+            }
+        }
+        return -1;
     }
 
     types.TypeId type_of_unary(ast.UnaryExpr expr, types.TypeId expected) {
@@ -1709,6 +2106,9 @@ public struct TypeChecker {
     }
 
     types.TypeId type_of_coalesce(ast.CoalesceExpr expr, types.TypeId expected) {
+        if (!self.coalesce_left_is_pure(expr.left$.ptr())) {
+            self.mismatch(expr.span, "coalesce left operand must be pure");
+        }
         types.TypeId left_type = self.expr_type(expr.left$.ptr(), types.TypeId());
         types.TypeInfo left_info = self.type_table.type_at(left_type);
         if (left_info.kind != .layer || !left_info.optional) {
@@ -1726,12 +2126,65 @@ public struct TypeChecker {
 
     types.TypeId optional_element_or_invalid(ast.AstExpr^ expr, token.Span span) {
         types.TypeId value_type = self.expr_type(expr$.ptr(), types.TypeId());
+        return self.optional_element_from_type_or_invalid(value_type, span);
+    }
+
+    types.TypeId optional_element_from_type_or_invalid(types.TypeId value_type, token.Span span) {
         types.TypeInfo info = self.type_table.type_at(value_type);
         if (info.kind == .layer && info.optional) {
             return info.element;
         }
         self.mismatch(span, "expected optional value");
         return self.invalid_type(span);
+    }
+
+    Bool coalesce_left_is_pure(ast.AstExpr^ expr) {
+        if (expr is .call(_)) { return false; }
+        if (expr is .coalesce(_)) { return false; }
+        if (expr is .coalesce_control(_)) { return false; }
+        if (expr is .catch_handler(_)) { return false; }
+        if (expr is .try_expr(_)) { return false; }
+        if (expr is .block(_)) { return false; }
+        if (expr is .if_expr(_)) { return false; }
+        if (expr is .switch_expr(_)) { return false; }
+        if (expr is .struct_lit(_)) { return false; }
+        if (expr is .variant(_)) { return false; }
+        if (expr is .tuple(_)) { return false; }
+        if (expr is .array(_)) { return false; }
+        if (expr is .unary(unary)) {
+            return self.coalesce_left_is_pure(unary.value);
+        }
+        if (expr is .binary(binary)) {
+            return self.coalesce_left_is_pure(binary.left) && self.coalesce_left_is_pure(binary.right);
+        }
+        if (expr is .is_expr(is_expr)) {
+            return self.coalesce_left_is_pure(is_expr.value);
+        }
+        if (expr is .cast(cast)) {
+            return self.coalesce_left_is_pure(cast.value);
+        }
+        if (expr is .field(field)) {
+            return self.coalesce_left_is_pure(field.base);
+        }
+        if (expr is .index(index)) {
+            return self.coalesce_left_is_pure(index.base) && self.coalesce_left_is_pure(index.index);
+        }
+        if (expr is .slice(slice)) {
+            if (!self.coalesce_left_is_pure(slice.base)) { return false; }
+            if (slice.start is some start) {
+                if (!self.coalesce_left_is_pure(start)) { return false; }
+            }
+            if (slice.end_expr is some end_expr) {
+                if (!self.coalesce_left_is_pure(end_expr)) { return false; }
+            }
+        }
+        return true;
+    }
+
+    Bool type_is_errorable(types.TypeId type_id) {
+        if (!type_id.valid()) { return false; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        return info.kind == .errorable;
     }
 
     types.TypeId errorable_value_type_or_self(types.TypeId type_id) {
@@ -1767,6 +2220,239 @@ public struct TypeChecker {
             }
         }
         return self.infer_type(stmt.span);
+    }
+
+    () check_duplicate_switch_pattern(ast.SwitchStmt stmt, ast.Pattern pattern, Int before_index) {
+        Int! key = self.switch_pattern_key(pattern);
+        if (key < 0) { return; }
+        Int! index = 0;
+        while (index < before_index) {
+            ast.SwitchCase previous = stmt.cases[index];
+            if (previous.pattern is some previous_pattern) {
+                if (self.switch_pattern_key(previous_pattern) == key) {
+                    self.mismatch(self.pattern_span(pattern), "duplicate switch case");
+                    return;
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    Int switch_pattern_key(ast.Pattern pattern) {
+        if (pattern is .literal(literal)) {
+            if (literal is .bool_lit(bool_lit)) {
+                if (bool_lit.value) { return 1; }
+                return 0;
+            }
+        }
+        if (pattern is .variant(variant)) {
+            if (variant.path.segment_len() > 0) {
+                return variant.path.segments[variant.path.segment_len() - 1].symbol.id;
+            }
+        }
+        return -1;
+    }
+
+    token.Span pattern_span(ast.Pattern pattern) {
+        if (pattern is .wildcard(span)) { return span; }
+        if (pattern is .binding(binding)) { return binding.span; }
+        if (pattern is .literal(literal)) { return self.literal_span(literal); }
+        if (pattern is .tuple(tuple)) { return tuple.span; }
+        if (pattern is .variant(variant)) { return variant.span; }
+        if (pattern is .optional(optional)) { return optional.span; }
+        return token.Span();
+    }
+
+    () check_switch_exhaustive(token.Span span, types.TypeId value_type, Bool has_else, list.ArenaList<ast.SwitchCase> cases) {
+        if (has_else) { return; }
+        if (self.type_table.is_optional(value_type)) {
+            self.mismatch(span, "switch must be exhaustive");
+            return;
+        }
+        Int required = self.nominal_case_count(value_type);
+        if (required <= 0) { return; }
+        Int covered = self.switch_case_count(cases);
+        if (covered < required) {
+            self.mismatch(span, "switch must be exhaustive");
+        }
+    }
+
+    () check_switch_expr_exhaustive(token.Span span, types.TypeId value_type, Bool has_else, list.ArenaList<ast.SwitchExprCase> cases) {
+        if (has_else) { return; }
+        if (self.type_table.is_optional(value_type)) {
+            self.mismatch(span, "switch must be exhaustive");
+            return;
+        }
+        Int required = self.nominal_case_count(value_type);
+        if (required <= 0) { return; }
+        Int covered = self.switch_expr_case_count(cases);
+        if (covered < required) {
+            self.mismatch(span, "switch must be exhaustive");
+        }
+    }
+
+    Int switch_case_count(list.ArenaList<ast.SwitchCase> cases) {
+        Int! count = 0;
+        Int! index = 0;
+        while (index < cases.len()) {
+            if (cases[index].pattern != null) {
+                count = count + 1;
+            }
+            index = index + 1;
+        }
+        return count;
+    }
+
+    Int switch_expr_case_count(list.ArenaList<ast.SwitchExprCase> cases) {
+        Int! count = 0;
+        Int! index = 0;
+        while (index < cases.len()) {
+            if (cases[index].pattern != null) {
+                count = count + 1;
+            }
+            index = index + 1;
+        }
+        return count;
+    }
+
+    Int nominal_case_count(types.TypeId type_id) {
+        if (!type_id.valid()) { return 0; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind != .nominal) { return 0; }
+        ast.AstDecl? decl = self.decl_for_type(type_id);
+        if (decl is some resolved_decl) {
+            if (resolved_decl is .enum_decl(enum_decl)) {
+                return enum_decl.members.len();
+            }
+            if (resolved_decl is .union_decl(union_decl)) {
+                return union_decl.variants.len();
+            }
+        }
+        return 0;
+    }
+
+    Bool pattern_contains_binding(ast.Pattern pattern) {
+        if (pattern is .binding(_)) { return true; }
+        if (pattern is .tuple(tuple)) {
+            Int! index = 0;
+            while (index < tuple.items.len()) {
+                if (self.pattern_contains_binding(tuple.items[index])) { return true; }
+                index = index + 1;
+            }
+        }
+        if (pattern is .variant(variant)) {
+            Int! index = 0;
+            while (index < variant.payload.len()) {
+                if (self.pattern_contains_binding(variant.payload[index])) { return true; }
+                index = index + 1;
+            }
+        }
+        if (pattern is .optional(optional)) {
+            return self.pattern_contains_binding(optional.payload);
+        }
+        return false;
+    }
+
+    () check_try_stmt(ast.TryStmt stmt) {
+        self.check_block(stmt.body);
+        list.ArenaList<types.TypeId>! error_types = list.ArenaList<types.TypeId>(self.ctx.ast_store_ref());
+        self.collect_try_stmt_error_types(stmt.body, error_types$.ptr());
+        Bool! has_catch_all = false;
+        Int! index = 0;
+        while (index < stmt.catches.len()) {
+            ast.CatchStmt catch_stmt = stmt.catches[index];
+            self.enter_local_scope();
+            types.TypeId! catch_error_type = self.try_stmt_error_type(stmt);
+            if (catch_stmt.error_type is some error_type) {
+                catch_error_type = self.type_from_ast(error_type);
+                if (self.catch_type_seen(stmt, catch_error_type, index)) {
+                    self.mismatch(catch_stmt.span, "duplicate catch type");
+                }
+            } else {
+                has_catch_all = true;
+            }
+            if (catch_stmt.binding is some binding) {
+                self.define_local_type(binding, catch_error_type, false);
+            }
+            self.check_block(catch_stmt.body);
+            self.exit_local_scope();
+            index = index + 1;
+        }
+        if (!has_catch_all) {
+            index = 0;
+            while (index < error_types.len()) {
+                if (!self.try_error_is_caught(stmt, error_types[index])) {
+                    self.mismatch(stmt.span, "uncaught error type");
+                }
+                index = index + 1;
+            }
+        }
+    }
+
+    () collect_try_stmt_error_types(ast.Block body, list.ArenaList<types.TypeId>^ error_types) {
+        Int! index = 0;
+        while (index < body.stmts.len()) {
+            ast.AstStmt stmt = body.stmts[index];
+            if (stmt is .assign(assign)) {
+                self.add_errorable_type(error_types, self.expr_type(assign.value, types.TypeId()));
+            }
+            if (stmt is .expr(expr_stmt)) {
+                self.add_errorable_type(error_types, self.expr_type(expr_stmt.value, types.TypeId()));
+            }
+            if (stmt is .var_decl(var_decl)) {
+                if (var_decl.initializer is some initializer) {
+                    self.add_errorable_type(error_types, self.expr_type(initializer$.ptr(), types.TypeId()));
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () add_errorable_type(list.ArenaList<types.TypeId>^ error_types, types.TypeId type_id) {
+        if (!type_id.valid()) { return; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind != .errorable) { return; }
+        Int! index = 0;
+        while (index < error_types.len()) {
+            if (self.type_table.type_equals(error_types[index], info.other)) {
+                return;
+            }
+            index = index + 1;
+        }
+        error_types.add(info.other);
+    }
+
+    Bool catch_type_seen(ast.TryStmt stmt, types.TypeId catch_error_type, Int before_index) {
+        Int! index = 0;
+        while (index < before_index) {
+            ast.CatchStmt catch_stmt = stmt.catches[index];
+            if (catch_stmt.error_type is some error_type) {
+                types.TypeId previous_type = self.type_from_ast(error_type);
+                if (self.type_table.type_equals(previous_type, catch_error_type)) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool try_error_is_caught(ast.TryStmt stmt, types.TypeId error_type) {
+        Int! index = 0;
+        while (index < stmt.catches.len()) {
+            ast.CatchStmt catch_stmt = stmt.catches[index];
+            if (catch_stmt.error_type == null) {
+                return true;
+            }
+            if (catch_stmt.error_type is some catch_type_ref) {
+                types.TypeId catch_type = self.type_from_ast(catch_type_ref);
+                if (self.type_table.type_equals(catch_type, error_type)) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     types.TypeId type_of_block_expr(ast.BlockExpr expr, types.TypeId expected) {
@@ -1808,18 +2494,31 @@ public struct TypeChecker {
         types.TypeId then_type = self.expr_type(expr.then_value$.ptr(), expected);
         types.TypeId else_type = self.expr_type(expr.else_value$.ptr(), then_type);
         self.check_compatible(then_type, else_type, expr.span, "if branch type mismatch");
+        types.TypeInfo result_info = self.type_table.type_at(then_type);
+        if (result_info.kind == .tuple || result_info.kind == .array) {
+            self.mismatch(expr.span, "conditional expression result must be scalar");
+        }
         return then_type;
     }
 
     types.TypeId type_of_switch_expr(ast.SwitchExpr expr, types.TypeId expected) {
         types.TypeId value_type = self.expr_type(expr.value, types.TypeId());
+        if (self.type_is_errorable(value_type)) {
+            self.mismatch(expr.span, "switch value must not be errorable");
+        }
         types.TypeId! result_type = types.TypeId();
+        Bool! has_else = false;
         Int! index = 0;
         while (index < expr.cases.len()) {
             ast.SwitchExprCase case_value = expr.cases[index];
             self.enter_local_scope();
             if (case_value.pattern is some pattern) {
+                if (self.pattern_contains_binding(pattern)) {
+                    self.mismatch(case_value.span, "switch expression case must not bind values");
+                }
                 self.check_pattern(pattern, value_type);
+            } else {
+                has_else = true;
             }
             types.TypeId case_type = self.expr_type(case_value.value, expected);
             if (result_type.valid()) {
@@ -1830,6 +2529,7 @@ public struct TypeChecker {
             self.exit_local_scope();
             index = index + 1;
         }
+        self.check_switch_expr_exhaustive(expr.span, value_type, has_else, expr.cases);
         if (result_type.valid()) {
             return result_type;
         }
@@ -1838,6 +2538,9 @@ public struct TypeChecker {
 
     types.TypeId type_of_try_expr(ast.TryExpr expr, types.TypeId expected) {
         types.TypeId source_type = self.expr_type(expr.value, types.TypeId());
+        if (!self.type_is_errorable(source_type)) {
+            self.mismatch(expr.span, "try source must be errorable");
+        }
         types.TypeId value_type = self.errorable_value_type_or_self(source_type);
         types.TypeId source_error_type = self.errorable_error_type_or_infer(source_type, expr.span);
         if (expected.valid()) {
@@ -2212,7 +2915,7 @@ public struct TypeChecker {
             }
             index = index + 1;
         }
-        return true;
+        return self.generic_args_satisfy_constraints(function_decl.generics, generic_args);
     }
 
     types.TypeId check_function_call(ast.FunctionDecl function_decl, ast.CallExpr call, types.TypeId expected, UInt8[] arg_message, UInt8[] result_message) {
@@ -2227,7 +2930,70 @@ public struct TypeChecker {
         if (expected.valid()) {
             self.check_assignment_compatible(expected, result_type, call.span, result_message);
         }
+        if (!self.generic_args_satisfy_constraints(function_decl.generics, generic_args)) {
+            self.mismatch(call.span, "generic constraint not satisfied");
+        }
         return result_type;
+    }
+
+    Bool generic_args_satisfy_constraints(ast.GenericParams generics, list.ArenaList<types.TypeId> generic_args) {
+        Int! index = 0;
+        while (index < generics.where_constraints.len()) {
+            ast.WhereConstraint constraint = generics.where_constraints[index];
+            Int generic_index = self.generic_param_index(generics, constraint.param.symbol);
+            if (generic_index >= 0 && generic_index < generic_args.len()) {
+                types.TypeId actual = generic_args[generic_index];
+                if (actual.valid() && !self.type_satisfies_bound(actual, constraint.bound)) {
+                    return false;
+                }
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool type_satisfies_bound(types.TypeId type_id, ast.TypeBound bound) {
+        if (bound is .trait_bound(trait_bound)) {
+            return self.type_declares_trait(type_id, trait_bound.path);
+        }
+        if (bound is .intersection(intersection)) {
+            return self.type_satisfies_bound(type_id, intersection.left) && self.type_satisfies_bound(type_id, intersection.right);
+        }
+        return true;
+    }
+
+    Bool type_declares_trait(types.TypeId type_id, ast.Path trait_path) {
+        if (!type_id.valid()) { return true; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .builtin) { return true; }
+        if (info.kind == .type_param) { return true; }
+        if (info.kind != .nominal) { return false; }
+        ast.AstDecl? decl = self.decl_for_type(type_id);
+        if (decl is some resolved_decl) {
+            if (resolved_decl is .struct_decl(struct_decl)) {
+                return self.trait_list_contains(struct_decl.traits, trait_path);
+            }
+            if (resolved_decl is .enum_decl(enum_decl)) {
+                return self.trait_list_contains(enum_decl.traits, trait_path);
+            }
+            if (resolved_decl is .union_decl(union_decl)) {
+                return self.trait_list_contains(union_decl.traits, trait_path);
+            }
+        }
+        return false;
+    }
+
+    Bool trait_list_contains(list.ArenaList<ast.Path> traits, ast.Path trait_path) {
+        if (trait_path.segment_len() != 1) { return false; }
+        Int! index = 0;
+        while (index < traits.len()) {
+            ast.Path candidate = traits[index];
+            if (candidate.segment_len() == 1 && candidate.segments[0].symbol.id == trait_path.segments[0].symbol.id) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     types.TypeId check_function_call_in_context(ast.FunctionDecl function_decl, resolve.ResolveResult^ imported_result, ast.AstFile^ imported_file, ast.CallExpr call, types.TypeId expected, UInt8[] arg_message, UInt8[] result_message) {
@@ -2425,7 +3191,7 @@ public struct TypeChecker {
         Int! index = 0;
         while (index < self.resolved.method_count()) {
             resolve.MethodBinding method = self.resolved.method_at_index(index);
-            if (self.method_matches_receiver(method, receiver_type) && method.function.name.symbol.id == field.name.symbol.id) {
+            if (!method.function.static_flag && self.method_matches_receiver(method, receiver_type) && method.function.name.symbol.id == field.name.symbol.id) {
                 receiver_name_matched = true;
                 if (method.function.params.len() == call.args.len()) {
                     if (fallback == null) {
@@ -2467,7 +3233,7 @@ public struct TypeChecker {
         Int! index = 0;
         while (index < self.resolved.method_count()) {
             resolve.MethodBinding method = self.resolved.method_at_index(index);
-            if (self.method_matches_receiver(method, receiver_type) && method.function.name.symbol.id == method_name.symbol.id) {
+            if (method.function.static_flag && self.method_matches_receiver(method, receiver_type) && method.function.name.symbol.id == method_name.symbol.id) {
                 receiver_name_matched = true;
                 if (self.static_method_arg_count(method.function) == call.args.len()) {
                     if (fallback == null) {
@@ -3023,6 +3789,21 @@ public struct TypeChecker {
             return self.invalid_type(expr.span);
         }
         scope.Binding resolved_binding = binding$.some();
+        ast.AstDecl? decl = self.decl_for_binding(resolved_binding.binding_id);
+        if (decl is some ast_decl) {
+            if (ast_decl is .struct_decl(struct_decl)) {
+                if (!struct_decl.record_flag && struct_decl.inits.len() > 0) {
+                    Int! field_index = 0;
+                    while (field_index < expr.fields.len()) {
+                        self.expr_type(expr.fields[field_index].value, types.TypeId());
+                        field_index = field_index + 1;
+                    }
+                    self.mismatch(expr.span, "struct with init requires call syntax");
+                    return self.invalid_type(expr.span);
+                }
+                self.check_struct_lit_shape(expr, struct_decl);
+            }
+        }
         list.ArenaList<types.TypeId>! generic_args = list.ArenaList<types.TypeId>(self.ctx.ast_store_ref());
         Int! generic_index = 0;
         while (generic_index < expr.type_args.len()) {
@@ -3047,6 +3828,55 @@ public struct TypeChecker {
             index = index + 1;
         }
         return nominal;
+    }
+
+    () check_struct_lit_shape(ast.StructExpr expr, ast.StructDecl decl) {
+        Int! index = 0;
+        while (index < expr.fields.len()) {
+            ast.FieldInit field = expr.fields[index];
+            if (field.name is some name) {
+                Int! previous = 0;
+                while (previous < index) {
+                    ast.FieldInit previous_field = expr.fields[previous];
+                    if (previous_field.name is some previous_name) {
+                        if (previous_name.symbol.id == name.symbol.id) {
+                            self.mismatch(name.span, "duplicate field initializer");
+                        }
+                    }
+                    previous = previous + 1;
+                }
+            }
+            index = index + 1;
+        }
+        index = 0;
+        while (index < decl.fields.len()) {
+            ast.FieldDecl declared = decl.fields[index];
+            if (!self.struct_field_can_be_omitted(declared) && !self.struct_lit_has_field(expr, declared.name.symbol.id)) {
+                self.mismatch(expr.span, "missing field initializer");
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool struct_field_can_be_omitted(ast.FieldDecl field) {
+        if (field.default_value != null) { return true; }
+        types.TypeId field_type = self.type_from_ast(field.type_ref);
+        types.TypeInfo info = self.type_table.type_at(field_type);
+        return info.kind == .layer && info.optional;
+    }
+
+    Bool struct_lit_has_field(ast.StructExpr expr, Int symbol_id) {
+        Int! index = 0;
+        while (index < expr.fields.len()) {
+            ast.FieldInit field = expr.fields[index];
+            if (field.name is some name) {
+                if (name.symbol.id == symbol_id) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     types.TypeId type_of_variant(ast.VariantExpr expr, types.TypeId expected) {
@@ -3115,6 +3945,11 @@ public struct TypeChecker {
             self.define_local_type(binding.name, expected, binding.mutable_binding);
             return;
         }
+        if (pattern is .literal(literal)) {
+            types.TypeId literal_type = self.literal_type(literal, expected);
+            self.check_compatible(expected, literal_type, self.literal_span(literal), "pattern type mismatch");
+            return;
+        }
         if (pattern is .tuple(tuple)) {
             self.check_tuple_pattern(tuple, expected);
             return;
@@ -3132,6 +3967,11 @@ public struct TypeChecker {
 
     () check_tuple_pattern(ast.TuplePattern tuple, types.TypeId expected) {
         types.TypeInfo info = self.type_table.type_at(expected);
+        if (info.kind != .tuple) {
+            self.mismatch(tuple.span, "tuple pattern requires tuple value");
+        } else if (tuple.items.len() != info.child_count) {
+            self.mismatch(tuple.span, "tuple pattern arity mismatch");
+        }
         Int! index = 0;
         while (index < tuple.items.len()) {
             types.TypeId! item_type = self.infer_type(tuple.span);
@@ -3664,6 +4504,67 @@ public struct TypeChecker {
             return true;
         }
         return false;
+    }
+
+    Bool expr_contains_direct_self(ast.AstExpr^ expr) {
+        if (expr is .self_value(_)) {
+            return true;
+        }
+        if (expr is .field(field)) {
+            return false;
+        }
+        if (expr is .call(call)) {
+            if (self.expr_contains_direct_self(call.callee)) { return true; }
+            Int! index = 0;
+            while (index < call.args.len()) {
+                if (self.expr_contains_direct_self(call.args[index].value)) { return true; }
+                index = index + 1;
+            }
+        }
+        if (expr is .unary(unary)) {
+            return self.expr_contains_direct_self(unary.value);
+        }
+        if (expr is .binary(binary)) {
+            return self.expr_contains_direct_self(binary.left) || self.expr_contains_direct_self(binary.right);
+        }
+        return false;
+    }
+
+    ast.Name? self_field_read_name(ast.AstExpr^ expr) {
+        if (expr is .field(field)) {
+            if (self.is_self_expr(field.base$.ptr())) {
+                return field.name;
+            }
+            return self.self_field_read_name(field.base$.ptr());
+        }
+        if (expr is .binary(binary)) {
+            ast.Name? left = self.self_field_read_name(binary.left);
+            if (left != null) { return left; }
+            return self.self_field_read_name(binary.right);
+        }
+        if (expr is .unary(unary)) {
+            return self.self_field_read_name(unary.value);
+        }
+        if (expr is .call(call)) {
+            ast.Name? callee = self.self_field_read_name(call.callee);
+            if (callee != null) { return callee; }
+            Int! index = 0;
+            while (index < call.args.len()) {
+                ast.Name? arg = self.self_field_read_name(call.args[index].value);
+                if (arg != null) { return arg; }
+                index = index + 1;
+            }
+        }
+        return null;
+    }
+
+    ast.Name? self_field_write_name(ast.AstExpr^ expr) {
+        if (expr is .field(field)) {
+            if (self.is_self_expr(field.base$.ptr())) {
+                return field.name;
+            }
+        }
+        return null;
     }
 
     Bool is_self_field_address(ast.AstExpr^ expr) {
