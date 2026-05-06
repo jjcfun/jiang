@@ -42,6 +42,55 @@ cmake --build build
 
 如果 `llvm-config --version` 不是 `21.1.*`，配置阶段会直接失败。
 
+### 从源码构建 Stage0
+
+`stage0c` 是 C 实现的 bootstrap compiler。直接用 CMake 构建即可：
+
+```bash
+LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config cmake -S . -B build
+cmake --build build --target stage0c
+```
+
+也可以使用仓库脚本：
+
+```bash
+LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage0.sh
+```
+
+### 从源码构建 Stage1
+
+`Stage1` 编译器源码入口是 `compiler/jiangc.jiang`。构建流程是：
+
+1. 先用 `stage0c` 把 `compiler/jiangc.jiang` 编译成 LLVM IR。
+2. 再用 LLVM 21.1.x 对应的 `clang` 和 LLVM link flags 链接成 `jiangc`。
+
+推荐直接运行 smoke 脚本，它会构建 `build/stage1-smoke/jiangc` 并用它编译样例：
+
+```bash
+LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_smoke.sh
+```
+
+等价的手动构建命令如下：
+
+```bash
+LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config
+STAGE1_BUILD_DIR=build/stage1-smoke
+mkdir -p "$STAGE1_BUILD_DIR"
+
+./build/stage0c --emit-llvm compiler/jiangc.jiang > "$STAGE1_BUILD_DIR/jiangc.ll"
+
+read -r -a llvm_ldflags <<< "$("$LLVM_CONFIG" --ldflags)"
+read -r -a llvm_libs <<< "$("$LLVM_CONFIG" --libs core analysis target native nativecodegen)"
+read -r -a llvm_system_libs <<< "$("$LLVM_CONFIG" --system-libs)"
+
+"$(dirname "$LLVM_CONFIG")/clang" "$STAGE1_BUILD_DIR/jiangc.ll" \
+  -o "$STAGE1_BUILD_DIR/jiangc" \
+  "${llvm_ldflags[@]}" \
+  "${llvm_libs[@]}" \
+  "${llvm_system_libs[@]}" \
+  -lc++
+```
+
 ## 使用
 
 ```bash
@@ -58,10 +107,28 @@ cmake --build build
 - 不带 `--emit-*` 时，编译器会先生成临时目标文件，再通过宿主 `cc` 链接出可执行文件
 - 当前最小运行时边界仍由宿主 C 运行时提供，主要包括 `malloc`、`free`、`printf`、`abort`
 
+### 使用 Stage1 编译器
+
+构建出 `build/stage1-smoke/jiangc` 后，可以用它编译 Jiang 源文件：
+
+```bash
+./build/stage1-smoke/jiangc --emit-llvm tests/samples/minimal.jiang
+./build/stage1-smoke/jiangc --emit-obj -o minimal.o tests/samples/minimal.jiang
+./build/stage1-smoke/jiangc -o minimal tests/samples/minimal.jiang
+```
+
+生成可执行文件后直接运行：
+
+```bash
+./minimal
+echo $?
+```
+
 ## 测试
 
 ```bash
 LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh
+LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_smoke.sh
 ```
 
 ## License
