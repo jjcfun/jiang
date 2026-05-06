@@ -72,6 +72,8 @@
 - [ ] 清理跨阶段重复 side table。
   - [x] 顶层声明类型只从 `DeclInfo.type_id/result_type_id` 读取。
   - [ ] `TypeCheckResult` 只保留 expression/local/pattern 等阶段必要结果。
+    - [x] 删除 local type 的重复并行索引。
+    - [ ] expression/type-ref/call target 的并行索引仍需等待 Stage1 指针字段比较和结构化 list 语义更稳。
   - [ ] HIR/JIR lowering 不重新做名称解析或类型推导。
 
 ## 第四阶段：Type Check / Resolve 清理
