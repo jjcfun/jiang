@@ -24,14 +24,14 @@
   - [x] 已通过样例继续使用 `run_sample` 硬断言。
   - [x] 未达 Stage0 行为的样例使用 `run_known_stage1_gap`。
   - [x] 运行时非零缺口使用 `run_known_stage1_nonzero_gap`。
-- [ ] 让 Stage1 compiler test 覆盖：
-  - [ ] `--emit-llvm`
-  - [ ] `--emit-obj`
-  - [ ] executable link/run
-  - [ ] multi-file import
-  - [ ] compiler bootstrap smoke
-- [ ] 给新增行为建立最小样例，不把大范围语言回归混进单个测试。
-- [ ] 保持每个阶段都能通过：
+- [x] 让 Stage1 compiler test 覆盖：
+  - [x] `--emit-llvm`
+  - [x] `--emit-obj`
+  - [x] executable link/run
+  - [x] multi-file import
+  - [x] compiler bootstrap smoke
+- [x] 给新增行为建立最小样例，不把大范围语言回归混进单个测试。
+- [x] 保持每个阶段都能通过：
   - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh`
   - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage1.sh`
   - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_test.sh`

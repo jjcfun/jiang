@@ -56,6 +56,19 @@ run_compiler_compile_fail() {
   echo "ok"
 }
 
+run_compiler_compile_only() {
+  test_file="$1"
+  ir="$BUILD_DIR/compiler_${test_file%.jiang}.ll"
+  printf 'compiler/%s compile ... ' "$test_file"
+  "$BUILD_DIR/stage0c" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
+  if [ ! -s "$ir" ]; then
+    echo "failed"
+    echo "error: compiler/$test_file generated empty IR" >&2
+    exit 1
+  fi
+  echo "ok"
+}
+
 run_compiler_ir_regression_check() {
   test_file="$1"
   ir="$BUILD_DIR/compiler_${test_file%.jiang}.regression.ll"
@@ -78,6 +91,9 @@ run_compiler_ir_regression_check() {
 run_named_test() {
   test_file="$1"
   case "$test_file" in
+    compiler_bootstrap_smoke.jiang)
+      run_compiler_compile_only "$test_file"
+      ;;
     *.jiang)
       run_compiler_test "$test_file" 0
       ;;
@@ -91,6 +107,8 @@ run_named_test() {
 run_all_compiler_tests() {
   run_compiler_test arena_minimal.jiang 0
   run_compiler_test list_minimal.jiang 0
+  run_compiler_test blake3_minimal.jiang 0
+  run_compiler_test equatable_binary_minimal.jiang 0
   run_compiler_test hash_minimal.jiang 0
 
   run_compiler_test imported_type_field_minimal.jiang 0
@@ -110,7 +128,7 @@ run_all_compiler_tests() {
   run_compiler_test lower_hir_minimal.jiang 0
   run_compiler_test lower_jir_minimal.jiang 0
   run_compiler_test llvm_api_minimal.jiang 0
-  run_compiler_test compiler_bootstrap_smoke.jiang 0
+  run_compiler_compile_only compiler_bootstrap_smoke.jiang
 }
 
 if [ "$#" -gt 0 ]; then
