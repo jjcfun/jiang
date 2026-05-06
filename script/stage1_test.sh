@@ -312,7 +312,7 @@ run_sample large_minimal.jiang 15
 run_sample enum_minimal.jiang 2
 run_sample enum_shorthand_minimal.jiang 42
 run_sample enum_shorthand_arg_minimal.jiang 42
-run_known_stage1_gap enum_value_minimal.jiang 42
+run_sample enum_value_minimal.jiang 42
 run_sample enum_switch_shorthand_minimal.jiang 42
 run_sample switch_enum_minimal.jiang 42
 run_sample ternary_enum_minimal.jiang 42

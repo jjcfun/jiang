@@ -97,6 +97,10 @@
   - [ ] errorable ABI。
   - [ ] `try/catch` expression/statement type rule。
   - [ ] `throw` / `?? return` / `?? break` / `?? continue` 的诊断边界。
+- [ ] 替换 type operation 的 span-based type-ref lookup。
+  - [ ] `TypeCheckResult` 不再用 `(span.start, span.length) -> TypeId` 作为 `T$.size()/align()/max_align()` 的主查询路径。
+  - [ ] 改成 `TypeRefId -> TypeId` 或等价稳定 type identity。
+  - [ ] 修复 `align_of_minimal.jiang` 中 Stage1 自编译路径拿错 type id 的问题。
 
 ## 第五阶段：HIR / JIR / Codegen
 
