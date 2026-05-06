@@ -115,6 +115,7 @@ run_sample union_if_pattern_minimal.jiang 42
 run_sample optional_some_pattern_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
+run_sample struct_grouped_fields_minimal.jiang 42
 run_sample struct_init_minimal.jiang 42
 
 echo "stage1 smoke ok"

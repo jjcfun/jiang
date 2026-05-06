@@ -377,6 +377,7 @@ run_sample type_modifier_canonical_minimal.jiang 7
 run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
+run_sample struct_grouped_fields_minimal.jiang 42
 run_sample nested_fields_minimal.jiang 42
 run_sample call_result_field_minimal.jiang 42
 run_sample struct_init_minimal.jiang 42
