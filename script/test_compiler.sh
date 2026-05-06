@@ -117,6 +117,7 @@ run_all_compiler_tests() {
   run_compiler_test subscriptable_inferred_set_minimal.jiang 0
   run_compiler_test token_minimal.jiang 0
   run_compiler_test source_manager_minimal.jiang 0
+  run_compiler_test package_manifest_minimal.jiang 0
   run_compiler_test interner_minimal.jiang 0
   run_compiler_test ast_minimal.jiang 0
   run_compiler_test lexer_minimal.jiang 0

@@ -257,8 +257,12 @@ run_sample new_array_repeat_init_minimal.jiang 6
 run_sample multi_file_minimal.jiang 42
 run_object_sample multi_file_minimal.jiang 42
 run_executable_sample multi_file_minimal.jiang 42
-# Package directory resolution is still owned by the stage0 driver.
-# Stage1 smoke focuses on file inputs until package_manifest is wired in.
+run_sample package_default 42
+run_object_sample package_default 42
+run_executable_sample package_default 42
+run_sample package_override 44
+run_compile_fail package_invalid_name
+run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
 run_sample normal_import_reexport_minimal.jiang 42
 run_compile_fail invalid_normal_import_reexport_namespace.jiang

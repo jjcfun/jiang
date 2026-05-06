@@ -38,25 +38,25 @@
 
 ## 第二阶段：Package / Source / Driver
 
-- [ ] 实现 `compiler/package_manifest.jiang` 的最小模型。
-  - [ ] 解析 `package.ini` 的 package name / type / root。
-  - [ ] 解析 dependency 条目。
-  - [ ] 对非法 package name 和非法 import path 输出诊断。
-- [ ] 将 `SourceManager` 从内存 registry 扩展到文件系统输入。
-  - [ ] path normalization。
-  - [ ] source root 识别。
-  - [ ] 重复 source 去重。
-  - [ ] import path string escape 处理。
-- [ ] 将 `ModuleGraph` 接入 package/source discovery。
-  - [ ] 支持 package root module。
-  - [ ] 支持 package 内 module import。
-  - [ ] 支持 package dependency import。
-  - [ ] 输出完整 import cycle path。
-- [ ] 整理 `jiangc.jiang` CLI。
-  - [ ] 单文件编译入口。
-  - [ ] package 编译入口。
-  - [ ] 明确 `--emit-llvm` / `--emit-obj` / executable 输出规则。
-  - [ ] 临时文件和 object 输出路径统一管理。
+- [x] 实现 `compiler/package_manifest.jiang` 的最小模型。
+  - [x] 解析 `package.ini` 的 package name / type / root。
+  - [x] 解析 dependency 条目。
+  - [x] 对非法 package name 和非法 import path 输出诊断。
+- [x] 将 `SourceManager` 从内存 registry 扩展到文件系统输入。
+  - [x] path normalization。
+  - [x] source root 识别。
+  - [x] 重复 source 去重。
+  - [x] import path string escape 处理。
+- [x] 将 `ModuleGraph` 接入 package/source discovery。
+  - [x] 支持 package root module。
+  - [x] 支持 package 内 module import。
+  - [x] 支持 package dependency import。
+  - [x] 输出完整 import cycle path。
+- [x] 整理 `jiangc.jiang` CLI。
+  - [x] 单文件编译入口。
+  - [x] package 编译入口。
+  - [x] 明确 `--emit-llvm` / `--emit-obj` / executable 输出规则。
+  - [x] 临时文件和 object 输出路径统一管理。
 
 ## 第三阶段：Semantic Table 收敛
 
