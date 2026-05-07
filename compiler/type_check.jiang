@@ -46,10 +46,12 @@ public struct LocalType {
 public struct InitFieldState {
     public list.ArenaList<Int> symbols;
     public list.ArenaList<Bool> assigned;
+    public list.ArenaList<Bool> default_override_allowed;
 
     public init(arena.Arena& store) {
         self.symbols = list.ArenaList<Int>(store);
         self.assigned = list.ArenaList<Bool>(store);
+        self.default_override_allowed = list.ArenaList<Bool>(store);
     }
 
     public () init_from_struct(ast.StructDecl decl) {
@@ -58,8 +60,16 @@ public struct InitFieldState {
             ast.FieldDecl field = decl.fields[index];
             self.symbols.add(field.name.symbol.id);
             self.assigned.add(field.default_value != null);
+            self.default_override_allowed.add(field.default_value != null && self.type_outer_mutable(field.type_ref));
             index = index + 1;
         }
+    }
+
+    public Bool type_outer_mutable(ast.AstType type_ref) {
+        if (type_ref is .layer(layer)) {
+            return layer.flags.mutable;
+        }
+        return false;
     }
 
     public Int field_index(Int symbol_id) {
@@ -86,11 +96,20 @@ public struct InitFieldState {
         }
     }
 
+    public Bool consume_default_override(Int symbol_id) {
+        Int index = self.field_index(symbol_id);
+        if (index < 0) { return false; }
+        if (!self.default_override_allowed[index]) { return false; }
+        self.default_override_allowed.set(index, false);
+        return true;
+    }
+
     public () copy_from(InitFieldState other) {
         Int! index = 0;
         while (index < other.symbols.len()) {
             self.symbols.add(other.symbols[index]);
             self.assigned.add(other.assigned[index]);
+            self.default_override_allowed.add(other.default_override_allowed[index]);
             index = index + 1;
         }
     }
@@ -100,6 +119,7 @@ public struct InitFieldState {
         while (index < self.assigned.len()) {
             Bool assigned = left.assigned[index] && right.assigned[index];
             self.assigned.set(index, assigned);
+            self.default_override_allowed.set(index, left.default_override_allowed[index] && right.default_override_allowed[index]);
             index = index + 1;
         }
     }
@@ -508,6 +528,7 @@ public struct TypeChecker {
     Int! current_loop_depth;
     Int! current_decl_index;
     Bool! current_init_body;
+    Bool! current_failable_init;
 
     public init(context.CompilerContext& ctx, resolve.ResolveResult& resolved) {
         self.ctx = ctx;
@@ -527,6 +548,7 @@ public struct TypeChecker {
         self.current_loop_depth = 0;
         self.current_decl_index = -1;
         self.current_init_body = false;
+        self.current_failable_init = false;
     }
 
     public () set_source_text(UInt8[] source_text) {
@@ -842,11 +864,17 @@ public struct TypeChecker {
             types.TypeId previous_return_type = self.current_return_type;
             types.TypeId previous_self_type = self.current_self_type;
             Bool previous_init_body = self.current_init_body;
+            Bool previous_failable_init = self.current_failable_init;
             InitFieldState field_state = InitFieldState(self.ctx.ast_store_ref());
             field_state.init_from_struct(decl);
-            self.current_return_type = self.unit_type(init_decl.span);
+            if (init_decl.failable) {
+                self.current_return_type = self.type_table.make_layer(init_decl.span, self_type, true, false);
+            } else {
+                self.current_return_type = self.unit_type(init_decl.span);
+            }
             self.current_self_type = self_type;
             self.current_init_body = true;
+            self.current_failable_init = init_decl.failable;
             self.enter_local_scope();
             ast.Name self_name = ast.Name(init_decl.span, self.ctx.intern("self"));
             self.define_local_type(self_name, self.type_table.make_pointer_kind(init_decl.span, self_type, types.PointerKind.borrow, false, false), false);
@@ -860,6 +888,7 @@ public struct TypeChecker {
             self.check_init_fields_complete(init_decl, decl, field_state);
             self.exit_local_scope();
             self.current_init_body = previous_init_body;
+            self.current_failable_init = previous_failable_init;
             self.current_self_type = previous_self_type;
             self.current_return_type = previous_return_type;
             index = index + 1;
@@ -870,7 +899,17 @@ public struct TypeChecker {
             index = index + 1;
         }
         if (decl.deinit_body is some deinit_body) {
+            types.TypeId previous_return_type = self.current_return_type;
+            types.TypeId previous_self_type = self.current_self_type;
+            self.current_return_type = self.unit_type(deinit_body.span);
+            self.current_self_type = self_type;
+            self.enter_local_scope();
+            ast.Name self_name = ast.Name(deinit_body.span, self.ctx.intern("self"));
+            self.define_local_type(self_name, self.type_table.make_pointer_kind(deinit_body.span, self_type, types.PointerKind.borrow, false, false), false);
             self.check_block(deinit_body);
+            self.exit_local_scope();
+            self.current_self_type = previous_self_type;
+            self.current_return_type = previous_return_type;
         }
         self.exit_generic_scope();
     }
@@ -933,6 +972,18 @@ public struct TypeChecker {
     }
 
     Bool same_init_signature(ast.InitDecl left, ast.InitDecl right) {
+        if (left.name == null && right.name != null) {
+            return false;
+        }
+        if (left.name != null && right.name == null) {
+            return false;
+        }
+        if (left.name is some left_name) {
+            ast.Name right_name = right.name$.some();
+            if (left_name.symbol.id != right_name.symbol.id) {
+                return false;
+            }
+        }
         if (left.params.len() != right.params.len()) {
             return false;
         }
@@ -1654,6 +1705,7 @@ public struct TypeChecker {
             while (copy_index < state.symbols.len()) {
                 then_state.symbols.add(state.symbols[copy_index]);
                 then_state.assigned.add(state.assigned[copy_index]);
+                then_state.default_override_allowed.add(state.default_override_allowed[copy_index]);
                 copy_index = copy_index + 1;
             }
             self.check_init_block(if_stmt.then_block, decl, then_state$.ptr());
@@ -1662,6 +1714,7 @@ public struct TypeChecker {
             while (copy_index < state.symbols.len()) {
                 else_state.symbols.add(state.symbols[copy_index]);
                 else_state.assigned.add(state.assigned[copy_index]);
+                else_state.default_override_allowed.add(state.default_override_allowed[copy_index]);
                 copy_index = copy_index + 1;
             }
             if (if_stmt.else_block is some else_block) {
@@ -1670,6 +1723,7 @@ public struct TypeChecker {
             Int! merge_index = 0;
             while (merge_index < state.assigned.len()) {
                 state.assigned.set(merge_index, then_state.assigned[merge_index] && else_state.assigned[merge_index]);
+                state.default_override_allowed.set(merge_index, then_state.default_override_allowed[merge_index] && else_state.default_override_allowed[merge_index]);
                 merge_index = merge_index + 1;
             }
             return;
@@ -1697,7 +1751,7 @@ public struct TypeChecker {
     () record_init_assignment(ast.AssignStmt assign, InitFieldState^ state) {
         ast.Name? field_name = self.self_field_write_name(assign.target);
         if (field_name is some name) {
-            if (state.is_assigned(name.symbol.id)) {
+            if (state.is_assigned(name.symbol.id) && !state.consume_default_override(name.symbol.id)) {
                 self.mismatch(name.span, "init must not assign field more than once");
             }
             state.mark_assigned(name.symbol.id);
@@ -1983,6 +2037,9 @@ public struct TypeChecker {
         if (stmt.value is some value) {
             types.TypeId value_type = self.expr_type(value$.ptr(), expected_type);
             self.check_assignment_compatible(expected_type, value_type, stmt.span, "return type mismatch");
+            return;
+        }
+        if (self.current_failable_init) {
             return;
         }
         self.check_assignment_compatible(expected_type, self.unit_type(stmt.span), stmt.span, "return type mismatch");
@@ -2914,6 +2971,10 @@ public struct TypeChecker {
             if (builtin_type_call.valid()) {
                 return builtin_type_call;
             }
+            types.TypeId optional_some_result = self.try_optional_some_call(field, expr, expected);
+            if (optional_some_result.valid()) {
+                return optional_some_result;
+            }
             types.TypeId imported_result = self.try_imported_function_call(expr_ref, field, expr, expected);
             if (imported_result.valid()) {
                 return imported_result;
@@ -2923,6 +2984,10 @@ public struct TypeChecker {
             types.TypeId constructor_result = self.try_qualified_constructor_call(expr_ref, variant, expr, expected);
             if (constructor_result.valid()) {
                 return constructor_result;
+            }
+            types.TypeId named_constructor_result = self.try_named_constructor_call(expr_ref, variant, expr, expected);
+            if (named_constructor_result.valid()) {
+                return named_constructor_result;
             }
             types.TypeId static_method_result = self.try_static_method_call(expr_ref, variant, expr, expected);
             if (static_method_result.valid()) {
@@ -2975,6 +3040,25 @@ public struct TypeChecker {
             self.check_assignment_compatible(expected, result_type, expr.span, "call result type mismatch");
         }
         return result_type;
+    }
+
+    types.TypeId try_optional_some_call(ast.FieldExpr field, ast.CallExpr call, types.TypeId expected) {
+        if (!self.ctx.symbol_equal(field.name.symbol, "some")) {
+            return types.TypeId();
+        }
+        if (call.args.len() != 0) {
+            self.mismatch(call.span, "optional some argument count mismatch");
+            return self.invalid_type(call.span);
+        }
+        types.TypeId base_type = self.expr_type(field.base$.ptr(), types.TypeId());
+        types.TypeInfo base_info = self.type_table.type_at(base_type);
+        if (base_info.kind != .layer || !base_info.optional) {
+            return types.TypeId();
+        }
+        if (expected.valid()) {
+            self.check_assignment_compatible(expected, base_info.element, call.span, "optional some result type mismatch");
+        }
+        return base_info.element;
     }
 
     types.TypeId try_imported_function_call(ast.AstExpr^ call_expr, ast.FieldExpr field, ast.CallExpr call, types.TypeId expected) {
@@ -3098,11 +3182,15 @@ public struct TypeChecker {
             if (resolved_decl is .struct_decl(struct_decl)) {
                 Int init_index = self.constructor_compatible_init_index(struct_decl, call);
                 if (init_index >= -1) {
+                    types.TypeId! call_result_type = result_type;
+                    if (init_index >= 0 && struct_decl.inits[init_index].failable) {
+                        call_result_type = self.type_table.make_layer(call.span, result_type, true, false);
+                    }
                     self.result.add_resolved_callee_with_index(call_expr, call.span, resolved_binding.decl_id, .constructor, init_index);
                     if (expected.valid()) {
-                        self.check_assignment_compatible(expected, result_type, call.span, "constructor result type mismatch");
+                        self.check_assignment_compatible(expected, call_result_type, call.span, "constructor result type mismatch");
                     }
-                    return result_type;
+                    return call_result_type;
                 }
                 self.check_infer_call_args(call.args);
                 self.mismatch(call.span, "constructor argument mismatch");
@@ -3136,11 +3224,15 @@ public struct TypeChecker {
             types.TypeId result_type = self.type_table.make_nominal_decl(type_name.span, type_name.symbol, resolved_binding.binding_id, resolved_binding.decl_id, .struct_decl);
             Int init_index = self.constructor_compatible_init_index_in_context(struct_decl, imported_module.result$.ptr(), imported_file, call);
             if (init_index >= -1) {
+                types.TypeId! call_result_type = result_type;
+                if (init_index >= 0 && struct_decl.inits[init_index].failable) {
+                    call_result_type = self.type_table.make_layer(call.span, result_type, true, false);
+                }
                 self.result.add_resolved_callee_with_index(call_expr, call.span, resolved_binding.decl_id, .imported_constructor, init_index);
                 if (expected.valid()) {
-                    self.check_assignment_compatible(expected, result_type, call.span, "constructor result type mismatch");
+                    self.check_assignment_compatible(expected, call_result_type, call.span, "constructor result type mismatch");
                 }
-                return result_type;
+                return call_result_type;
             }
             self.check_infer_call_args(call.args);
             self.mismatch(call.span, "constructor argument mismatch");
@@ -3157,7 +3249,7 @@ public struct TypeChecker {
         Int! index = 0;
         while (index < decl.inits.len()) {
             ast.InitDecl init_decl = decl.inits[index];
-            if (init_decl.params.len() == call.args.len()) {
+            if (init_decl.name == null && init_decl.params.len() == call.args.len()) {
                 if (self.constructor_init_args_compatible(init_decl, call)) {
                     return index;
                 }
@@ -3191,7 +3283,7 @@ public struct TypeChecker {
         Int! index = 0;
         while (index < decl.inits.len()) {
             ast.InitDecl init_decl = decl.inits[index];
-            if (init_decl.params.len() == call.args.len()) {
+            if (init_decl.name == null && init_decl.params.len() == call.args.len()) {
                 if (self.constructor_init_args_compatible_in_context(init_decl, imported_result, imported_file, call)) {
                     return index;
                 }
@@ -3215,6 +3307,77 @@ public struct TypeChecker {
             index = index + 1;
         }
         return true;
+    }
+
+    types.TypeId try_named_constructor_call(ast.AstExpr^ call_expr, ast.VariantExpr variant, ast.CallExpr call, types.TypeId expected) {
+        if (variant.path.segment_len() < 2) {
+            return types.TypeId();
+        }
+        ast.Name init_name = variant.path.segments[variant.path.segment_len() - 1];
+        ast.Path receiver_path = self.path_without_last_segment(variant.path);
+        types.TypeId receiver_type = self.type_of_receiver_path(receiver_path);
+        if (!receiver_type.valid()) {
+            return types.TypeId();
+        }
+        types.TypeInfo receiver_info = self.type_table.type_at(receiver_type);
+        if (receiver_info.kind != .nominal || receiver_info.nominal_kind != .struct_decl || !receiver_info.decl_id.valid()) {
+            return types.TypeId();
+        }
+        ast.AstDecl? decl = self.ctx.semantic_decl_ast(receiver_info.decl_id);
+        if (decl is some resolved_decl) {
+            if (resolved_decl is .struct_decl(struct_decl)) {
+                if (!self.struct_has_named_init(struct_decl, init_name)) {
+                    return types.TypeId();
+                }
+                Int init_index = self.named_constructor_compatible_init_index(struct_decl, init_name, call);
+                if (init_index >= 0) {
+                    ast.InitDecl init_decl = struct_decl.inits[init_index];
+                    types.TypeId! result_type = receiver_type;
+                    if (init_decl.failable) {
+                        result_type = self.type_table.make_layer(call.span, receiver_type, true, false);
+                    }
+                    self.result.add_resolved_callee_with_index(call_expr, call.span, receiver_info.decl_id, .constructor, init_index);
+                    if (expected.valid()) {
+                        self.check_assignment_compatible(expected, result_type, call.span, "constructor result type mismatch");
+                    }
+                    return result_type;
+                }
+                self.check_infer_call_args(call.args);
+                self.mismatch(call.span, "constructor argument mismatch");
+                return self.invalid_type(call.span);
+            }
+        }
+        return types.TypeId();
+    }
+
+    Bool struct_has_named_init(ast.StructDecl decl, ast.Name name) {
+        Int! index = 0;
+        while (index < decl.inits.len()) {
+            ast.InitDecl init_decl = decl.inits[index];
+            if (init_decl.name is some init_name) {
+                if (init_name.symbol.id == name.symbol.id) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Int named_constructor_compatible_init_index(ast.StructDecl decl, ast.Name name, ast.CallExpr call) {
+        Int! index = 0;
+        while (index < decl.inits.len()) {
+            ast.InitDecl init_decl = decl.inits[index];
+            if (init_decl.name is some init_name) {
+                if (init_name.symbol.id == name.symbol.id && init_decl.params.len() == call.args.len()) {
+                    if (self.constructor_init_args_compatible(init_decl, call)) {
+                        return index;
+                    }
+                }
+            }
+            index = index + 1;
+        }
+        return -1;
     }
 
     types.TypeId try_function_overload_call(ast.AstExpr^ call_expr, ast.Name name, ast.CallExpr call, types.TypeId expected) {

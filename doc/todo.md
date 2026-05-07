@@ -77,21 +77,22 @@
 
 ## 第三阶段：Struct / Init / Lifetime Lowering
 
-- [ ] 重新整理 struct init resolution / lowering。
+- [x] 重新整理 struct init resolution / lowering。
   - [x] overload init selection。
-  - [ ] mixed positional/named init args。
-  - [ ] named init sugar。
+  - [x] mutable default field override in init。
+  - [x] mixed positional/named init args。
+  - [x] named init sugar。
   - [x] branch-complete init analysis。
-  - [ ] failable init return/ABI。
-  - [ ] optional/mutable default assignment。
-- [ ] 补齐 `new` + constructor/init lowering。
-  - [ ] `struct_new_constructor_minimal`
-  - [ ] `struct_new_literal_with_init_minimal`
-- [ ] 补齐 deinit / runtime lifetime lowering。
-  - [ ] `deinit_minimal`
-  - [ ] owner pointer runtime smoke 需要走 executable/link 路径，避免 `lli` 外部符号解析造成误判。
-- [ ] 保持 owner/borrow receiver 一致性。
-  - [ ] 将 `struct_instance_method_pointer_base_minimal` 的 runtime harness/外部符号问题与真实 lowering 问题分离。
+  - [x] failable init return/ABI。
+  - [x] optional/mutable default assignment。
+- [x] 补齐 `new` + constructor/init lowering。
+  - [x] `struct_new_constructor_minimal`
+  - [x] `struct_new_literal_with_init_minimal`
+- [x] 补齐 deinit / runtime lifetime lowering。
+  - [x] `deinit_minimal`
+  - [x] owner pointer runtime smoke 需要走 executable/link 路径，避免 `lli` 外部符号解析造成误判。
+- [x] 保持 owner/borrow receiver 一致性。
+  - [x] 将 `struct_instance_method_pointer_base_minimal` 的 runtime harness/外部符号问题与真实 lowering 问题分离。
 
 ## 第四阶段：Control Flow / Pattern / Destructuring Lowering
 

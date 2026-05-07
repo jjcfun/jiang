@@ -121,6 +121,8 @@ public struct FunctionEnv {
     public api.Block! catch_target;
     public api.Value! catch_error_slot;
     public types.TypeId! function_result_type;
+    public api.Value! function_value;
+    public Bool! failable_init;
 
     public init(arena.Arena& store, EmissionState& state) {
         self.slots = list.ArenaList<LocalSlot>(store);
@@ -129,6 +131,8 @@ public struct FunctionEnv {
         self.catch_target = api.Block();
         self.catch_error_slot = api.Value();
         self.function_result_type = types.TypeId();
+        self.function_value = api.Value();
+        self.failable_init = false;
     }
 
     public () add_local(scope.LocalBindingId local_id, api.Value slot, api.Type type_ref, types.TypeId type_id) {
@@ -540,6 +544,32 @@ interner.Symbol init_function_name_symbol(context.CompilerContext& ctx, jir.JirT
     return ctx.intern(text[0 .. out]);
 }
 
+interner.Symbol deinit_function_name_symbol(context.CompilerContext& ctx, jir.JirTypeDecl decl) {
+    UInt8[*] base = ctx.symbol_c_string(decl.name.symbol);
+    Int! suffix_length = 8;
+    Int! base_length = c_string_length(base);
+    arena.Arena& store = ctx.ast_store_ref();
+    UInt8![*] text = store.alloc_array<UInt8>(base_length + suffix_length + 1);
+    Int! out = 0;
+    Int! index = 0;
+    while (index < base_length) {
+        text[out] = base[index];
+        out = out + 1;
+        index = index + 1;
+    }
+    text[out] = '_';
+    text[out + 1] = '_';
+    text[out + 2] = 'd';
+    text[out + 3] = 'e';
+    text[out + 4] = 'i';
+    text[out + 5] = 'n';
+    text[out + 6] = 'i';
+    text[out + 7] = 't';
+    out = out + 8;
+    text[out] = 0;
+    return ctx.intern(text[0 .. out]);
+}
+
 interner.Symbol scoped_symbol(context.CompilerContext& ctx, interner.Symbol module_symbol, interner.Symbol name_symbol) {
     if (!module_symbol.valid()) { return name_symbol; }
     if (ctx.symbol_equal(name_symbol, "main")) { return name_symbol; }
@@ -592,6 +622,10 @@ interner.Symbol specialized_function_symbol(context.CompilerContext& ctx, jir.Ji
 
 interner.Symbol scoped_init_function_name_symbol(context.CompilerContext& ctx, jir.JirModule& input, jir.JirTypeDecl decl, Int init_index) {
     return scoped_symbol(ctx, input.module_symbol, init_function_name_symbol(ctx, decl, init_index));
+}
+
+interner.Symbol scoped_deinit_function_name_symbol(context.CompilerContext& ctx, jir.JirModule& input, jir.JirTypeDecl decl) {
+    return scoped_symbol(ctx, input.module_symbol, deinit_function_name_symbol(ctx, decl));
 }
 
 api.Type builtin_type(context.CompilerContext& ctx, api.Context llvm_context, interner.Symbol symbol) {
@@ -917,7 +951,11 @@ api.Type init_function_type_ref(context.CompilerContext& ctx, types.TypeTable& t
         param_types[index + 1] = api.type_ref(llvm_type(ctx, type_table, input, llvm_context, init_decl.params[index].type_id));
         index = index + 1;
     }
-    return api.function_type_refs(llvm_context.void_type(), param_types, init_decl.params.len() + 1);
+    api.Type! result_type = llvm_context.void_type();
+    if (init_decl.failable) {
+        result_type = llvm_context.int1_type();
+    }
+    return api.function_type_refs(result_type, param_types, init_decl.params.len() + 1);
 }
 
 api.Value declare_init_function(context.CompilerContext& ctx, types.TypeTable& type_table, jir.JirModule& input, api.Context llvm_context, api.Module llvm_module, jir.JirTypeDecl type_decl, jir.JirInitDecl init_decl, Int init_index) {
@@ -926,6 +964,14 @@ api.Value declare_init_function(context.CompilerContext& ctx, types.TypeTable& t
     api.Value existing = llvm_module.lookup_function(name);
     if (!existing.is_null()) { return existing; }
     return llvm_module.add_function(name, init_function_type_ref(ctx, type_table, input, llvm_context, init_decl));
+}
+
+api.Value declare_deinit_function(context.CompilerContext& ctx, types.TypeTable& type_table, jir.JirModule& input, api.Context llvm_context, api.Module llvm_module, jir.JirTypeDecl type_decl, jir.JirInitDecl deinit_decl) {
+    interner.Symbol name_symbol = scoped_deinit_function_name_symbol(ctx, input, type_decl);
+    UInt8[*] name = ctx.symbol_c_string(name_symbol);
+    api.Value existing = llvm_module.lookup_function(name);
+    if (!existing.is_null()) { return existing; }
+    return llvm_module.add_function(name, init_function_type_ref(ctx, type_table, input, llvm_context, deinit_decl));
 }
 
 api.Builder make_builder(api.Context llvm_context) {
@@ -1566,6 +1612,23 @@ api.Value emit_free(CodegenContext& cg, jir.JirExpr expr, jir.JirFieldExpr field
     jir.JirExpr base_expr = input.expr_at(field.base);
     if (!base_expr.type_id.valid()) {
         pointer = builder.build_inttoptr(pointer, llvm_context.pointer_type(), "free.ptr");
+    } else {
+        types.TypeInfo base_info = type_table.type_at(base_expr.type_id);
+        if (base_info.kind == .pointer) {
+            types.TypeInfo element_info = type_table.type_at(base_info.element);
+            if (element_info.kind == .nominal && element_info.decl_id.valid()) {
+                jir.JirTypeDecl? type_decl_ref = type_decl_for_decl_id_ref(ctx, env.state, input, element_info.decl_id);
+                if (type_decl_ref is some type_decl) {
+                    if (type_decl.deinit_decl is some deinit_decl) {
+                        api.Value deinit_fn = declare_deinit_function(ctx, type_table, input, llvm_context, llvm_module, type_decl, deinit_decl);
+                        api.Type deinit_type = init_function_type_ref(ctx, type_table, input, llvm_context, deinit_decl);
+                        Int![*] deinit_args = Int!$.alloc_array(1);
+                        deinit_args[0] = api.value_ref(pointer);
+                        builder.build_call_refs(deinit_type, deinit_fn, deinit_args, 1, "");
+                    }
+                }
+            }
+        }
     }
     Int![*] args = Int!$.alloc_array(1);
     args[0] = api.value_ref(pointer);
@@ -2207,6 +2270,13 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
                 return emit_set(cg, expr, field, call, env);
             }
             jir.JirExpr base_expr = input.expr_at(field.base);
+            if (field.name.symbol.id == ctx.intern("some").id && call.args.len() == 0) {
+                types.TypeInfo base_info = type_table.type_at(base_expr.type_id);
+                if (base_info.kind == .layer && base_info.optional) {
+                    api.Value base_value = expr_value_cg(cg, field.base, env);
+                    return builder.build_extract_value(base_value, UInt32(1), "optional.some.value");
+                }
+            }
             if (is_builtin_hash_method(ctx, field.name.symbol.id) && call.args.len() == 0) {
                 api.Value base_value = expr_value_cg(cg, field.base, env);
                 return emit_builtin_hash_call(ctx, type_table, input, llvm_context, builder, expr, base_expr, base_value);
@@ -2402,10 +2472,30 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
                     arg_types[arg_index + 1] = api.type_ref(param_type);
                     arg_index = arg_index + 1;
                 }
-                api.Type init_type = api.function_type_refs(llvm_context.void_type(), arg_types, struct_expr.fields.len() + 1);
-                builder.build_call_refs(init_type, init_fn, args, struct_expr.fields.len() + 1, "");
+                api.Type! init_result_type = llvm_context.void_type();
+                if (init_decl.failable) {
+                    init_result_type = llvm_context.int1_type();
+                }
+                api.Type init_type = api.function_type_refs(init_result_type, arg_types, struct_expr.fields.len() + 1);
+                api.Value init_result = builder.build_call_refs(init_type, init_fn, args, struct_expr.fields.len() + 1, "");
                 current = builder.build_load(build_result_type, slot, "ctor.value");
                 if (wrap_result_optional) {
+                    if (init_decl.failable) {
+                        api.Value result_slot = builder.build_alloca(result_type, "ctor.optional");
+                        api.Block some_block = llvm_module.append_block(llvm_context$.ptr(), env.function_value, "ctor.some");
+                        api.Block none_block = llvm_module.append_block(llvm_context$.ptr(), env.function_value, "ctor.none");
+                        api.Block end_block = llvm_module.append_block(llvm_context$.ptr(), env.function_value, "ctor.end");
+                        builder.build_cond_br(init_result, some_block, none_block);
+                        builder.position_at_end(some_block);
+                        api.Value some_value = wrap_optional_value(type_table, llvm_context, builder, build_type_id, expr.type_id, result_type, current);
+                        builder.build_store(some_value, result_slot);
+                        builder.build_br(end_block);
+                        builder.position_at_end(none_block);
+                        builder.build_store(api.const_null(result_type), result_slot);
+                        builder.build_br(end_block);
+                        builder.position_at_end(end_block);
+                        return builder.build_load(result_type, result_slot, "ctor.optional.value");
+                    }
                     return wrap_optional_value(type_table, llvm_context, builder, build_type_id, expr.type_id, result_type, current);
                 }
                 return current;
@@ -2729,6 +2819,14 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
         return;
     }
     if (stmt.body is .return_stmt(return_stmt)) {
+        if (env.failable_init) {
+            if (return_stmt.value.valid()) {
+                builder.build_ret(api.const_int(llvm_context.int1_type(), UInt64(0)));
+            } else {
+                builder.build_ret(api.const_int(llvm_context.int1_type(), UInt64(1)));
+            }
+            return;
+        }
         if (return_stmt.value.valid()) {
             api.Value! return_value = expr_value_cg(cg, return_stmt.value, env);
             if (env.function_result_type.valid()) {
@@ -3111,6 +3209,7 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
     }
     api.Block entry = llvm_module.append_block(llvm_context$.ptr(), function_value, "entry");
     builder.position_at_end(entry);
+    env.function_value = function_value;
     Int! index = 0;
     while (index < decl.params.len()) {
         jir.JirParam param = decl.params[index];
@@ -3156,6 +3255,8 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
 
     EmissionState! state = EmissionState(ctx.ast_store_ref());
     FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ref());
+    env.function_value = function_value;
+    env.failable_init = init_decl.failable;
     env.add_local(init_decl.self_local_id, self_slot, self_type, init_decl.self_type_id);
     env.set_function_result_type(type_table.make_unit(init_decl.span));
 
@@ -3171,6 +3272,36 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
 
     emit_block(cg, function_value, api.Block(), api.Block(), init_decl.body, env$.ref());
     if (!block_ends_block(input, init_decl.body)) {
+        if (init_decl.failable) {
+            builder.build_ret(api.const_int(llvm_context.int1_type(), UInt64(1)));
+            return;
+        }
+        builder.build_ret_void();
+    }
+}
+
+() emit_deinit_named(CodegenContext& cg, jir.JirTypeDecl type_decl, jir.JirInitDecl deinit_decl) {
+    context.CompilerContext& ctx = cg.ctx;
+    types.TypeTable& type_table = cg.type_table;
+    jir.JirModule& input = cg.input;
+    api.Context llvm_context = cg.llvm_context;
+    api.Module llvm_module = cg.llvm_module;
+    api.Builder builder = cg.builder;
+    api.Value function_value = declare_deinit_function(ctx, type_table, input, llvm_context, llvm_module, type_decl, deinit_decl);
+    api.Block entry = llvm_module.append_block(llvm_context$.ptr(), function_value, "entry");
+    builder.position_at_end(entry);
+
+    api.Type self_type = llvm_type(ctx, type_table, input, llvm_context, deinit_decl.self_type_id);
+    api.Value self_slot = builder.build_alloca(self_type, "self");
+    builder.build_store(llvm_module.get_param(function_value, UInt32(0)), self_slot);
+
+    EmissionState! state = EmissionState(ctx.ast_store_ref());
+    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ref());
+    env.function_value = function_value;
+    env.add_local(deinit_decl.self_local_id, self_slot, self_type, deinit_decl.self_type_id);
+    env.set_function_result_type(type_table.make_unit(deinit_decl.span));
+    emit_block(cg, function_value, api.Block(), api.Block(), deinit_decl.body, env$.ref());
+    if (!block_ends_block(input, deinit_decl.body)) {
         builder.build_ret_void();
     }
 }
@@ -3217,10 +3348,11 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
                 Int! init_index = 0;
                 while (init_index < type_decl.inits.len()) {
                     jir.JirInitDecl init_decl = type_decl.inits[init_index];
-                    if (!init_decl.failable) {
-                        emit_init_named(cg, type_decl, init_decl, init_index);
-                    }
+                    emit_init_named(cg, type_decl, init_decl, init_index);
                     init_index = init_index + 1;
+                }
+                if (type_decl.deinit_decl is some deinit_decl) {
+                    emit_deinit_named(cg, type_decl, deinit_decl);
                 }
             }
         }
