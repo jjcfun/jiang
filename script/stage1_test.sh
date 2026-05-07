@@ -294,6 +294,7 @@ run_sample coalesce_fallback_call_minimal.jiang 42
 run_sample coalesce_return_minimal.jiang 42
 run_next_sample coalesce_throw_minimal.jiang 42
 run_sample coalesce_break_minimal.jiang 3
+run_sample coalesce_break_defer_minimal.jiang 21
 run_sample coalesce_continue_minimal.jiang 13
 run_sample invalid_coalesce_return_value.jiang 1
 run_sample optional_chain_member_minimal.jiang 42

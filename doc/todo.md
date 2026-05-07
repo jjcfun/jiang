@@ -99,7 +99,7 @@
 - [ ] 补齐 coalesce early-exit lowering。
   - [x] `coalesce_break_minimal`
   - [x] `coalesce_continue_minimal`
-  - [ ] defer 与 early-exit 组合回归。
+  - [x] defer 与 early-exit 组合回归。
 - [x] 补齐 optional while-pattern narrowing/lowering。
   - [x] `optional_while_is_pattern_minimal`
 - [x] 补齐 try/catch JIR lowering。
