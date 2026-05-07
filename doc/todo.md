@@ -148,10 +148,10 @@
 
 ## 第六阶段：Runtime / Builtin / LLVM API Surface
 
-- [ ] 明确 Stage1 runtime/builtin 边界。
-  - [ ] `assert_minimal`
-  - [ ] `print_minimal`
-  - [ ] `panic_minimal`
+- [x] 明确 Stage1 runtime/builtin 边界。
+  - [x] `assert_minimal`
+  - [x] `print_minimal`
+  - [x] `panic_minimal`
 - [x] 补齐 array repeat init lowering/runtime。
   - [x] `array_repeat_init_minimal`
   - [ ] 区分 language lowering failure 与 allocator/runtime harness 问题。

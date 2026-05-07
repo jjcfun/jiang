@@ -442,8 +442,8 @@ run_sample enum_static_method_minimal.jiang 42
 run_sample union_concept_decl_minimal.jiang 42
 run_sample union_instance_method_minimal.jiang 42
 run_sample union_static_method_minimal.jiang 42
-run_known_stage1_gap assert_minimal.jiang 42
-run_known_stage1_gap print_minimal.jiang 42
+run_sample assert_minimal.jiang 42
+run_sample print_minimal.jiang 42
 run_sample tuple_value_minimal.jiang 42
 run_sample tuple_return_minimal.jiang 42
 run_sample tuple_infer_minimal.jiang 42
@@ -686,6 +686,6 @@ run_compile_fail invalid_infer_shorthand_without_expected.jiang
 run_compile_fail invalid_ternary_aggregate_result.jiang
 run_compile_fail invalid_ternary_branch_type.jiang
 run_compile_fail invalid_ternary_condition_type.jiang
-run_known_stage1_nonzero_gap panic_minimal.jiang
+run_sample_nonzero panic_minimal.jiang
 
 echo "stage1 compiler tests passed"
