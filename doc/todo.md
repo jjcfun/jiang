@@ -61,16 +61,16 @@
   - [x] 修复 multi-file/namespaced struct return/layout。
   - [x] 修复 multi-file/namespaced struct array layout。
   - [x] 修复 multi-file/namespaced slice return layout。
-  - [ ] 修复 multi-file/namespaced enum field shorthand。
+  - [x] 修复 multi-file/namespaced enum field shorthand。
 - [ ] 补齐 public/import alias/type visibility。
   - [x] `alias_import_type_minimal`
   - [x] `public_alias_type_minimal`
-  - [ ] `public_import_type_minimal`
+  - [x] `public_import_type_minimal`
 - [ ] 补齐跨 module method target。
-  - [ ] `public_import_instance_method_minimal`
-  - [ ] `public_import_static_method_minimal`
-  - [ ] `private_method_called_by_public_method_minimal`
-  - [ ] 保持 private method/type 负例继续硬断言。
+  - [x] `public_import_instance_method_minimal`
+  - [x] `public_import_static_method_minimal`
+  - [x] `private_method_called_by_public_method_minimal`
+  - [x] 保持 private method/type 负例继续硬断言。
 - [ ] 补齐 generic imported nominal instance layout。
   - [x] `generic_import_struct_minimal`
   - [ ] imported generic instance 的 `InstanceKey` 与 layout 复用。
@@ -78,10 +78,10 @@
 ## 第三阶段：Struct / Init / Lifetime Lowering
 
 - [ ] 重新整理 struct init resolution / lowering。
-  - [ ] overload init selection。
+  - [x] overload init selection。
   - [ ] mixed positional/named init args。
   - [ ] named init sugar。
-  - [ ] branch-complete init analysis。
+  - [x] branch-complete init analysis。
   - [ ] failable init return/ABI。
   - [ ] optional/mutable default assignment。
 - [ ] 补齐 `new` + constructor/init lowering。
