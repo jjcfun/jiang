@@ -363,7 +363,7 @@ run_sample concept_generic_minimal.jiang 42
 run_sample concept_method_minimal.jiang 42
 run_sample where_amp_minimal.jiang 42
 run_sample trait_inherit_minimal.jiang 42
-run_known_stage1_gap trait_inherit_where_minimal.jiang 42
+run_sample trait_inherit_where_minimal.jiang 42
 run_sample trait_multi_inherit_minimal.jiang 41
 run_sample trait_diamond_inherit_minimal.jiang 42
 run_sample trait_assoc_type_minimal.jiang 42
@@ -374,7 +374,7 @@ run_sample invalid_trait_assoc_ambiguous_binding.jiang 42
 run_sample subscriptable_readonly_minimal.jiang 42
 run_sample subscriptable_mutable_minimal.jiang 42
 run_compile_fail invalid_subscriptable_write_readonly.jiang
-run_known_stage1_gap extend_trait_inherit_minimal.jiang 63
+run_sample extend_trait_inherit_minimal.jiang 63
 run_sample extend_trait_assoc_type_minimal.jiang 42
 run_sample builtin_concept_method_minimal.jiang 17
 run_sample enum_concept_decl_minimal.jiang 42

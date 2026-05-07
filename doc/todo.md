@@ -136,8 +136,8 @@
 - [ ] 补齐 trait receiver / trait object ABI。
   - [ ] trait receiver direct call ABI。
   - [ ] trait object representation；如果 Stage1 不实现，需要显式 defer。
-  - [ ] trait inheritance with where constraints。
-  - [ ] extend trait inheritance。
+  - [x] trait inheritance with where constraints。
+  - [x] extend trait inheritance。
 - [ ] 补齐 errorable ABI。
   - [ ] value/error representation。
   - [ ] function return/call convention。
