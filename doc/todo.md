@@ -97,11 +97,11 @@
 ## 第四阶段：Control Flow / Pattern / Destructuring Lowering
 
 - [ ] 补齐 coalesce early-exit lowering。
-  - [ ] `coalesce_break_minimal`
-  - [ ] `coalesce_continue_minimal`
+  - [x] `coalesce_break_minimal`
+  - [x] `coalesce_continue_minimal`
   - [ ] defer 与 early-exit 组合回归。
-- [ ] 补齐 optional while-pattern narrowing/lowering。
-  - [ ] `optional_while_is_pattern_minimal`
+- [x] 补齐 optional while-pattern narrowing/lowering。
+  - [x] `optional_while_is_pattern_minimal`
 - [ ] 补齐 try/catch JIR lowering。
   - [ ] statement lowering。
   - [ ] expression lowering。

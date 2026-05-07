@@ -340,8 +340,8 @@ run_sample coalesce_value_minimal.jiang 42
 run_sample coalesce_fallback_call_minimal.jiang 42
 run_sample coalesce_return_minimal.jiang 42
 run_next_sample coalesce_throw_minimal.jiang 42
-run_known_stage1_gap coalesce_break_minimal.jiang 3
-run_known_stage1_gap coalesce_continue_minimal.jiang 13
+run_sample coalesce_break_minimal.jiang 3
+run_sample coalesce_continue_minimal.jiang 13
 run_sample invalid_coalesce_return_value.jiang 1
 run_sample optional_chain_member_minimal.jiang 42
 run_sample optional_chain_index_minimal.jiang 40
@@ -349,7 +349,7 @@ run_sample optional_chain_nested_pure_base_minimal.jiang 42
 run_sample optional_some_minimal.jiang 42
 run_sample optional_some_pattern_minimal.jiang 42
 run_sample optional_if_mutable_pattern_minimal.jiang 42
-run_known_stage1_gap optional_while_is_pattern_minimal.jiang 6
+run_sample optional_while_is_pattern_minimal.jiang 6
 run_sample optional_switch_pattern_minimal.jiang 42
 run_sample optional_nested_array_minimal.jiang 42
 run_sample size_of_minimal.jiang 8
