@@ -281,7 +281,7 @@ run_compile_fail invalid_package_import_with_quotes
 run_sample namespaced_import_minimal.jiang 42
 run_sample normal_import_reexport_minimal.jiang 42
 run_compile_fail invalid_normal_import_reexport_namespace.jiang
-# Function pointer builtin `Fn<...>` is not wired into stage1 type lowering yet.
+# Most standalone function pointer samples are still outside the stage1 smoke.
 # Overload resolution/mangling is not part of the current bootstrap smoke.
 # Unit field/literal checking is not complete in stage1 yet.
 # Errorable ABI/lowering is intentionally minimal in stage1.
@@ -502,9 +502,9 @@ run_sample union_default_field_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
 run_sample union_implicit_tag_minimal.jiang 42
 run_sample union_grouped_variant_minimal.jiang 42
-run_known_stage1_gap union_payload_comprehensive_minimal.jiang 42
-run_known_stage1_gap generic_union_minimal.jiang 42
-run_known_stage1_gap generic_union_fn_payload_minimal.jiang 42
+run_sample union_payload_comprehensive_minimal.jiang 42
+run_sample generic_union_minimal.jiang 42
+run_sample generic_union_fn_payload_minimal.jiang 42
 run_sample union_bind_minimal.jiang 42
 run_sample union_if_pattern_minimal.jiang 42
 run_sample union_if_mutable_binding_minimal.jiang 42

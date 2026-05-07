@@ -126,13 +126,16 @@
 - [ ] 重新定义 union payload ABI。
   - [x] 非 `Int` payload。
   - [x] tuple payload。
+  - [x] array/function pointer payload。
   - [ ] nested union payload。
   - [x] grouped/implicit tag variants。
   - [ ] generic union payload/layout。
+    - [x] scalar/function payload smoke。
+    - [ ] generic payload size keyed by `InstanceKey`。
   - [x] union bind/switch shorthand lowering。
 - [ ] 补齐 generic instance layout。
   - [ ] generic nominal layout keyed by `InstanceKey`。
-  - [ ] generic union/function payload。
+  - [x] generic union/function payload smoke。
 - [ ] 补齐 trait receiver / trait object ABI。
   - [ ] trait receiver direct call ABI。
   - [ ] trait object representation；如果 Stage1 不实现，需要显式 defer。
