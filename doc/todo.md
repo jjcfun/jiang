@@ -107,14 +107,14 @@
   - [x] expression lowering。
   - [x] error propagation with defer。
   - [x] Stage1 语法收敛为 `try errorable_call() catch (...) { ... }`，不支持多语句 try body 或裸 catch 表达式。
-- [ ] 补齐 switch/pattern 中间表示。
-  - [ ] exhaustiveness 需要的 JIR representation。
+- [x] 补齐 switch/pattern 中间表示。
+  - [x] exhaustiveness 需要的 JIR representation。
   - [x] union switch shorthand pattern。
   - [x] union tuple pattern bind。
-- [ ] 补齐 tuple destructuring。
-  - [ ] local/global/return destructure。
-  - [ ] inferred and mutable destructure。
-  - [ ] unary tuple local/global inference。
+- [x] 补齐 tuple destructuring。
+  - [x] local/global/return destructure。
+  - [x] inferred and mutable destructure。
+  - [x] unary tuple local/global inference。
 - [ ] 补齐 for lowering variants。
   - [ ] mutable binding。
   - [ ] indexed for。
