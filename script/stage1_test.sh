@@ -445,7 +445,7 @@ run_sample array_minimal.jiang 42
 run_sample array_assign_minimal.jiang 10
 run_known_stage1_gap array_repeat_init_minimal.jiang 6
 run_sample nested_array_minimal.jiang 42
-run_known_stage1_gap infer_array_length_minimal.jiang 42
+run_sample infer_array_length_minimal.jiang 42
 run_sample uint8_array_string_minimal.jiang 98
 run_sample infer_uint8_array_string_minimal.jiang 98
 run_sample struct_array_field_minimal.jiang 98

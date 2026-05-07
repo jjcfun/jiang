@@ -127,6 +127,7 @@
   - [ ] errorable ABI。
   - [x] slice 最小 ABI：`{ptr, length}`，字符串字面量可直接生成 `UInt8[]`。
   - [x] `UInt8[N]`/`UInt8[_]` 字符串字面量和最小 `array -> slice` 转换。
+  - [x] 数组字面量可回填 `T[_]` 的最小长度推导。
   - [ ] target data layout 驱动的 `Int` / `UInt` / pointer-sized layout。
 - [ ] 收回 `llvm/api.jiang` 的 raw LLVM public surface。
   - [ ] opaque pointee type 改回 private。
