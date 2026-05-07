@@ -125,6 +125,7 @@
   - [ ] generic instance layout。
   - [ ] trait receiver / trait object ABI。
   - [ ] errorable ABI。
+  - [x] slice 最小 ABI：`{ptr, length}`，字符串字面量可直接生成 `UInt8[]`。
   - [ ] target data layout 驱动的 `Int` / `UInt` / pointer-sized layout。
 - [ ] 收回 `llvm/api.jiang` 的 raw LLVM public surface。
   - [ ] opaque pointee type 改回 private。

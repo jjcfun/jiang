@@ -453,11 +453,11 @@ run_known_stage1_gap multi_file_struct_array_minimal.jiang 98
 run_known_stage1_gap namespaced_struct_array_minimal.jiang 98
 run_sample multi_file_pointer_minimal.jiang 42
 run_sample namespaced_pointer_minimal.jiang 42
-run_known_stage1_gap slice_index_minimal.jiang 0
-run_known_stage1_gap slice_assign_minimal.jiang 0
-run_known_stage1_gap slice_length_minimal.jiang 3
-run_known_stage1_gap slice_return_length_minimal.jiang 3
-run_known_stage1_gap string_slice_condition_after_branch_minimal.jiang 42
+run_sample slice_index_minimal.jiang 0
+run_sample slice_assign_minimal.jiang 0
+run_sample slice_length_minimal.jiang 3
+run_sample slice_return_length_minimal.jiang 3
+run_sample string_slice_condition_after_branch_minimal.jiang 42
 run_known_stage1_gap multi_file_slice_return_minimal.jiang 3
 run_known_stage1_gap multi_file_slice_index_minimal.jiang 42
 run_known_stage1_gap namespaced_slice_return_minimal.jiang 3
