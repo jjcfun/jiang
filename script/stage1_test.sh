@@ -360,7 +360,7 @@ run_known_stage1_gap subscriptable_readonly_minimal.jiang 42
 run_known_stage1_gap subscriptable_mutable_minimal.jiang 42
 run_compile_fail invalid_subscriptable_write_readonly.jiang
 run_known_stage1_gap extend_trait_inherit_minimal.jiang 63
-run_known_stage1_gap extend_trait_assoc_type_minimal.jiang 42
+run_sample extend_trait_assoc_type_minimal.jiang 42
 run_sample builtin_concept_method_minimal.jiang 17
 run_sample enum_concept_decl_minimal.jiang 42
 run_compile_only extern_minimal.jiang
@@ -411,7 +411,7 @@ run_known_stage1_gap multi_file_enum_field_shorthand_minimal.jiang 1
 run_known_stage1_gap namespaced_enum_field_shorthand_minimal.jiang 1
 run_sample struct_union_field_shorthand_minimal.jiang 42
 run_sample struct_instance_method_minimal.jiang 42
-run_known_stage1_gap extend_struct_minimal.jiang 42
+run_sample extend_struct_minimal.jiang 42
 run_known_stage1_gap extend_trait_minimal.jiang 42
 run_sample struct_instance_method_with_args_minimal.jiang 42
 run_known_stage1_gap struct_instance_method_pointer_base_minimal.jiang 42

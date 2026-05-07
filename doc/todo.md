@@ -111,6 +111,8 @@
   - [ ] 新增 fallback 时必须配测试和 TODO。
   - [ ] backend 不重新引入源码级 expression case。
 - [ ] 将调用目标模型升级为结构化语义身份。
+  - [x] extend method 保留 resolver 分配的 `DeclId`，并让 LLVM call target 使用 JIR call 的语义目标。
+  - [x] owner pointer 在 expected borrow 场景下可通过 `.ref()` 借出 pointee。
   - [ ] `ResolvedCallee`
   - [ ] `InstanceKey`
   - [ ] backend-only symbol mangling
