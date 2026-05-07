@@ -127,9 +127,9 @@
   - [x] 非 `Int` payload。
   - [x] tuple payload。
   - [ ] nested union payload。
-  - [ ] grouped/implicit tag variants。
+  - [x] grouped/implicit tag variants。
   - [ ] generic union payload/layout。
-  - [ ] union bind/switch shorthand lowering。
+  - [x] union bind/switch shorthand lowering。
 - [ ] 补齐 generic instance layout。
   - [ ] generic nominal layout keyed by `InstanceKey`。
   - [ ] generic union/function payload。

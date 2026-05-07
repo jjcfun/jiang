@@ -500,12 +500,12 @@ run_sample union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
 run_sample union_minimal.jiang 42
 run_sample union_default_field_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
-run_known_stage1_gap union_implicit_tag_minimal.jiang 42
-run_known_stage1_gap union_grouped_variant_minimal.jiang 42
+run_sample union_implicit_tag_minimal.jiang 42
+run_sample union_grouped_variant_minimal.jiang 42
 run_known_stage1_gap union_payload_comprehensive_minimal.jiang 42
 run_known_stage1_gap generic_union_minimal.jiang 42
 run_known_stage1_gap generic_union_fn_payload_minimal.jiang 42
-run_known_stage1_gap union_bind_minimal.jiang 42
+run_sample union_bind_minimal.jiang 42
 run_sample union_if_pattern_minimal.jiang 42
 run_sample union_if_mutable_binding_minimal.jiang 42
 run_sample union_if_shorthand_pattern_minimal.jiang 42
