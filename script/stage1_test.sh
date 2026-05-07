@@ -343,7 +343,7 @@ run_executable_sample max_align_alloc_minimal.jiang 0
 run_sample generic_decl_minimal.jiang 42
 run_sample generic_func_call_minimal.jiang 42
 run_sample generic_func_infer_minimal.jiang 42
-run_known_stage1_gap generic_method_on_self_field_minimal.jiang 42
+run_sample generic_method_on_self_field_minimal.jiang 42
 run_sample concept_generic_minimal.jiang 42
 run_sample concept_method_minimal.jiang 42
 run_sample where_amp_minimal.jiang 42
