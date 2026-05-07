@@ -109,7 +109,7 @@
   - [x] Stage1 语法收敛为 `try errorable_call() catch (...) { ... }`，不支持多语句 try body 或裸 catch 表达式。
 - [ ] 补齐 switch/pattern 中间表示。
   - [ ] exhaustiveness 需要的 JIR representation。
-  - [ ] union switch shorthand pattern。
+  - [x] union switch shorthand pattern。
   - [ ] union tuple pattern bind。
 - [ ] 补齐 tuple destructuring。
   - [ ] local/global/return destructure。

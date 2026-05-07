@@ -4392,6 +4392,22 @@ static int parse_union_decl(Parser* parser, AstProgram* out_program, AstNameList
         {
             AstType variant_type;
             int parsed_any = 0;
+            if (parser->current.kind == TOKEN_IDENT &&
+                (parser->next.kind == TOKEN_SEMICOLON ||
+                 parser->next.kind == TOKEN_COMMA ||
+                 parser->next.kind == TOKEN_RIGHT_BRACE)) {
+                AstUnionVariant variant;
+                memset(&variant, 0, sizeof(variant));
+                variant.type.kind = AST_TYPE_VOID;
+                variant.name = token_dup(&parser->current);
+                variant.line = parser->current.line;
+                advance(parser);
+                union_variant_list_push(&union_decl.variants, variant);
+                if (parser->current.kind == TOKEN_COMMA || parser->current.kind == TOKEN_SEMICOLON) {
+                    advance(parser);
+                }
+                continue;
+            }
             if (!is_type_start(parser)) {
                 return fail(parser, "expected union variant type");
             }
