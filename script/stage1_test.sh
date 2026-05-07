@@ -470,11 +470,11 @@ run_sample typed_array_constructor_minimal.jiang 42
 run_sample typed_array_constructor_infer_minimal.jiang 42
 run_sample empty_tuple_return_minimal.jiang 0
 run_sample empty_tuple_bare_return_minimal.jiang 0
-run_known_stage1_gap for_item_array_minimal.jiang 42
+run_sample for_item_array_minimal.jiang 42
 run_known_stage1_gap for_mutable_binding_minimal.jiang 42
 run_known_stage1_gap for_indexed_minimal.jiang 40
 run_known_stage1_gap for_indexed_typed_minimal.jiang 40
-run_known_stage1_gap for_tuple_binding_minimal.jiang 42
+run_sample for_tuple_binding_minimal.jiang 42
 run_known_stage1_gap for_tuple_binding_typed_minimal.jiang 42
 run_known_stage1_gap for_indexed_tuple_binding_minimal.jiang 42
 run_known_stage1_gap for_indexed_mutable_tuple_binding_minimal.jiang 42

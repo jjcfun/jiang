@@ -119,6 +119,7 @@
   - [ ] try/catch lowering。
   - [ ] switch/pattern exhaustiveness 需要的中间表示。
   - [ ] defer 与 early-exit 的组合回归。
+  - [x] fixed array/slice for-each 最小 LLVM lowering。
   - [ ] 必要时再引入 CFG，不提前大改。
 - [ ] 补齐 LLVM backend ABI。
   - [ ] 跨 module nominal type layout。
