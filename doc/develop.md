@@ -1,6 +1,6 @@
 # 编译器开发说明
 
-这个目录包含 Jiang Stage1 编译器实现。Stage1 的目标是成为自举编译器，因此模块划分要尽量小、明确、稳定。
+这个目录包含 Jiang Stage1 编译器实现。Stage1 自举基线已经打通；当前文档记录的是 Stage1 hardening 和 Stage2 准备期仍要保持的模块边界。
 
 当前顶层结构刻意保持平铺。只有边界非常清楚的一类实现才放入子目录，例如 `support/` 和 `llvm/`。
 
@@ -27,7 +27,7 @@ package input / source registry
 - `ModuleGraph` 负责模块节点、import 边、cycle 检查、dependency-first resolve order；它不做语义检查。
 - `lexer` 产出 `TokenBuffer`，`parser` 只消费 token buffer 并产出 `AstFile`。
 - `resolve` 产出名称解析 side tables，例如 `BindingId`、`LocalBindingId`、`TypeRefId -> ResolvedTypePath`。
-- `type_check` 产出 `TypeTable` 和类型 side tables，例如 `BindingId -> TypeId`、expression span -> `TypeId`。
+- `type_check` 产出 `TypeTable` 和类型 side tables，例如 `BindingId -> TypeId`、expression pointer/span -> `TypeId`、`TypeRefId -> TypeId`、`ResolvedCalleeEntry`。
 - `lower_hir` 消费 AST、resolve result、type check result，产出携带 resolved ID 和 `TypeId` 的 `HirModule`。
 - `lower_jir`、JIR 和 LLVM backend 是后续 lower/codegen 边界，不能重新依赖源码字符串做语义查找。
 
@@ -140,7 +140,9 @@ Stage1 内部优先使用结构化 ID 和 side table 表达语义关系。ID 是
 - `TypeCheckResult.binding_types`：`BindingId -> TypeId`，保存顶层 binding 的类型。
 - `TypeCheckResult.function_result_types`：`BindingId -> TypeId`，保存 function result type。
 - `TypeCheckResult.local_types`：`LocalBindingId -> TypeId`，保存局部 binding 类型。
-- `TypeCheckResult.expr_types`：按 expression span 保存 `TypeId`，供 HIR lowering 和后续诊断使用。
+- `TypeCheckResult.expr_types`：按 expression pointer 保存 `TypeId`，span 只作为兼容 fallback，供 HIR lowering 和后续诊断使用。
+- `TypeCheckResult.type_ref_types`：按 `TypeRefId` 保存 AST type reference 对应的 `TypeId`，span 只作为兼容 fallback。
+- `TypeCheckResult.resolved_callees`：按 expression pointer 保存 `ResolvedCallee`，记录 call target kind、目标 `DeclId` 和 init/method overload index。
 - `HirModule.decls/stmts/exprs/patterns`：HIR flat node storage，节点之间用 `HirDeclId` / `HirStmtId` / `HirExprId` / `HirPatternId` 引用。
 
 查询示例：
@@ -188,14 +190,14 @@ HIR expression type
 
 源文件和源码文本模型。
 
-预期职责：
+当前职责：
 - 源文件身份
 - 文件路径或模块路径
 - 完整源码文本，通常是 `UInt8[]`
 - span 构造辅助方法
 - 诊断需要时的 line/column 查询
 
-span 数据优先使用字节偏移和字节长度。line/column 应该在诊断时计算，不要存到每个 token 上。
+span 数据优先使用字节偏移和字节长度。line/column 在诊断层通过 `Diagnostic.line_column(...)` / `line_column_for_span(...)` 查询，不存到每个 token 上。
 
 ### `source_manager.jiang`
 

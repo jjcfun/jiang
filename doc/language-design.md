@@ -662,59 +662,24 @@ Jiang 后续要支持自定义语法。当前原则：
 
 ### 前端 Feature Matrix
 
-| Feature | stage0 | stage1 lexer/parser/AST | 语义状态 |
+| Feature | stage0 | stage1 状态 | 备注 |
 | --- | --- | --- | --- |
-| 基本类型名作为 ident | 已支持 | 已支持 | resolver 绑定内建类型 |
-| char/string literal | 已支持 | 已支持 | expected type 规则待 type checker 固定 |
-| 默认模块名 import | 已支持 | 已解析 | resolver 支持 `module.Name` |
-| `public import` | 已支持但实现有问题 | 已解析 | module graph/resolver 已支持模块名 re-export |
-| alias/global/function | 已支持 | 已解析 | resolver/type checker 未完成 |
-| 参数 label/default | 历史支持 | 部分解析 | 目标语言不支持，stage1 待清理 |
-| struct | 已支持 | 已解析 | init/deinit 缺口 |
-| record | 已支持 | 解析为 struct flag | 语义差异待定稿 |
-| enum | 已支持 | 已解析 | resolver/type checker 未完成 |
-| union | stage0 旧语法 | stage1 目标语法 | 兼容策略未定 |
-| trait/extend | 已支持部分语义 | 已解析骨架 | associated type/method lookup 待实现 |
-| `@where` leading annotation | 部分支持旧语义 | 已解析 | trait constraint checking 待实现 |
-| `T: A & B` TypeBound | 未完整确认 | 已解析 | constraint solver 待实现 |
-| optional null narrowing | 已支持 | AST 可表达相关条件 | 正式规则待定 |
-| errorable/try/catch | 已支持较多行为 | AST/parser 预留 | type checker 待实现 |
-| pattern matching / `is` | 部分支持 | AST/parser 初版 | binding/exhaustiveness 待定 |
-| init/deinit | 已支持 | AST 预留，parser 缺口 | stage1 待实现 |
+| source/diagnostic/token/lexer/parser | 已支持 | 已支持 | diagnostic 已具备 label/note/suggestion 数据和 line/column 查询；渲染仍保持最小输出 |
+| module graph / package manifest | Stage0 单文件为主 | 已支持 package.ini 与 package import | manifest 继续使用最小 INI 子集 |
+| resolver/scope/type model | 已支持旧模型 | 已支持 Stage1 模型 | 使用结构化 binding/type/callee side table |
+| alias/global/function | 已支持 | 已支持 | overload 和 generic specialization 走结构化 identity 后端边界 |
+| struct/record/init/deinit/new | 已支持 | 已支持 Stage1 smoke | 更完整 lifetime/allocator 模型留到后续 ABI 阶段 |
+| enum/union/pattern | 已支持 | 已支持 Stage1 smoke | union payload 使用 byte buffer；nested/generic layout cache 后续用 InstanceKey 收敛 |
+| trait/extend/where | 部分支持 | 已支持基础 conformance、继承约束和 trait method direct call | trait object representation 明确不进 Stage1 |
+| optional/coalesce/early exit | 已支持 | 已支持 | `?? return/break/continue/throw` 与 defer 组合已有回归 |
+| errorable/try/catch | 已支持旧语义 | 已支持 Stage1 tagged value ABI | Stage1 语法限定为单个 errorable call；完整 ABI/calling convention 后续收敛 |
+| HIR/JIR/LLVM backend | C backend | 已支持 Stage1 自举 smoke | `.unsupported` fallback 只保留 assert 后不可达兜底 |
 
-已完成或正在实现：
+Stage1 当前边界：
 
-- `source.jiang` 最小源文件模型。
-- `diagnostic.jiang` 最小 diagnostic bag。
-- `token.jiang` / `lexer.jiang` / `TokenBuffer`。
-- AST 基础节点。
-- parser minimal 到完整 AST parser 的第一版骨架。
-- leading `@where(...)` 和 `TypeBound`。
-
-尚未完成：
-
-- 完整 source manager 和 line/column diagnostic。
-- resolver/scope。
-- type model。
-- type checker。
-- HIR typed representation。
-- JIR lowering。
-- LLVM backend 接入 stage1。
-- module graph/package manifest。
-- LSP 支持。
-
-### 语义模型缺口
-
-resolver/type checker 开始前，需要先明确这些模型：
-
-- `DefId`、`ScopeId`、`BindingId` 和 namespace 拆分。
-- AST type 到 semantic `TypeId` 的 lowering 规则。
-- builtin type 的注册和查找方式。
-- alias 展开、nominal type identity、array length const eval。
-- pointer/ref/auto-deref 的 lvalue/rvalue 规则。
-- literal expected type 和 coercion 规则。
-- optional/errorable 的控制流和传播规则。
-- HIR 保留哪些源码结构，JIR 降低哪些语法糖。
+- Stage1 已完成自举、测试基线、package/source/driver、resolver/type checker、HIR/JIR lowering 和 LLVM backend 的第一阶段闭环。
+- Stage1 不把 trait object、跨 module/generic instance layout cache、完整 target data layout、完整 diagnostic renderer、LSP 和声明级增量编译作为完成条件。
+- 上述长期架构项进入 Stage2 / 增量编译准备；它们依赖稳定 `ResolvedCallee`、`InstanceKey`、module identity 和 layout hash。
 
 ## 下一阶段任务计划
 
@@ -732,8 +697,8 @@ resolver/type checker 开始前，需要先明确这些模型：
 
 - 将 `Span` 从 `token.jiang` 迁移或桥接到 `source.jiang`。
 - 增加 source file table。
-- 增加 diagnostic label/note/suggestion。
-- 实现 line/column 查询。
+- diagnostic 已有 label/note/suggestion 数据结构和 line/column 查询。
+- 后续实现多文件 diagnostic renderer，把 label/note/suggestion 渲染到源码上下文。
 
 ### P2：Resolver / Scope
 

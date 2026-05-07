@@ -10,11 +10,11 @@
 
 ## 阶段规划
 
-> 目前jiang语言已处于`Stage1`开发阶段。
+> 目前 jiang 语言已完成 `Stage1` 自举基线，正在进入 Stage1 hardening / Stage2 准备阶段。
 
-`Stage0` 的任务是快速验证 Jiang 语言原型，基于C语言实现，完全采用AI编程，现阶段已接近完成。如果有后续Bug，将在 Stage1 阶段修复并验证。
+`Stage0` 的任务是快速验证 Jiang 语言原型，基于 C 语言实现，完全采用 AI 编程。后续只保留 bootstrap 兼容和必要 bugfix。
 
-`Stage1` 的目标是尽快实现 Jiang 语言自举。此阶段同样会借助 AI 快速推进，同时通过人工编码和人工审核控制方向；重点是让自举链路跑通，而不是一次性完成最终架构。
+`Stage1` 编译器源码使用 Jiang 编写，已经打通自举构建、package/source/driver、resolver/type checker、HIR/JIR lowering、LLVM backend 和基础 runtime/builtin smoke。当前 Stage1 的重点是稳定语义身份、测试基线和文档边界，不把完整 ABI、trait object、LSP 或声明级增量编译作为 Stage1 完成条件。
 
 `Stage2` 将在 Stage1 自举产物之上继续演进，重点进行编译器结构重构、代码质量提升、长期可维护性收敛，以及面向后续增量编译的内部表示整理。
 
@@ -105,7 +105,7 @@ read -r -a llvm_system_libs <<< "$("$LLVM_CONFIG" --system-libs)"
 - `--emit-obj` 直接输出目标文件
 - `stage0c` 是 C 实现的 bootstrap compiler；stage1 自举产物使用 `jiangc` 作为正式编译器名
 - 不带 `--emit-*` 时，编译器会先生成临时目标文件，再通过宿主 `cc` 链接出可执行文件
-- 当前最小运行时边界仍由宿主 C 运行时提供，主要包括 `malloc`、`free`、`printf`、`abort`
+- 当前最小运行时边界仍由宿主 C 运行时提供，主要包括 `malloc`、`free`、`exit`，以及 Stage0/兼容路径仍使用的 `printf` / `abort`
 
 ### 使用 Stage1 编译器
 
@@ -129,6 +129,7 @@ echo $?
 ```bash
 LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh
 LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage1.sh
+LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_test.sh
 ```
 
 ## License
