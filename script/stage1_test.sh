@@ -225,6 +225,7 @@ run_sample defer_block_minimal.jiang 54
 run_sample defer_return_minimal.jiang 21
 run_sample defer_throw_try_minimal.jiang 123
 run_sample defer_propagate_minimal.jiang 12
+run_sample try_catch_single_minimal.jiang 12
 run_compile_fail invalid_defer_return_minimal.jiang
 run_sample binary_ops_minimal.jiang 1
 run_sample bitwise_minimal.jiang 42
@@ -283,9 +284,8 @@ run_compile_fail invalid_normal_import_reexport_namespace.jiang
 # Function pointer builtin `Fn<...>` is not wired into stage1 type lowering yet.
 # Overload resolution/mangling is not part of the current bootstrap smoke.
 # Unit field/literal checking is not complete in stage1 yet.
-# Errorable ABI/lowering is not complete in stage1 codegen yet.
-# try/catch over errorable values is deferred with errorable ABI support.
-# General try/catch lowering is deferred with the JIR control-flow cleanup.
+# Errorable ABI/lowering is intentionally minimal in stage1.
+# try/catch is restricted to `try errorable_call() catch (...) { ... }`.
 # Self static dispatch with Fn values is deferred.
 # Cross-module enum variants still parse/lower as field expressions.
 # Function aliases, public-import re-export functions, and trait conformance
@@ -638,6 +638,7 @@ run_compile_fail invalid_try_without_catch.jiang
 run_compile_fail invalid_try_duplicate_catch.jiang
 run_compile_fail invalid_try_uncaught_error_type.jiang
 run_compile_fail invalid_try_expr_context.jiang
+run_compile_fail invalid_try_source_binary.jiang
 run_compile_fail invalid_duplicate_enum.jiang
 run_compile_fail invalid_duplicate_enum_member.jiang
 run_compile_fail invalid_duplicate_type.jiang

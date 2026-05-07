@@ -2609,6 +2609,83 @@ Bool block_ends_block(jir.JirModule& input, jir.JirBlock block) {
     return stmt_ends_block(input, stmt);
 }
 
+Bool type_is_errorable(types.TypeTable& type_table, types.TypeId type_id) {
+    if (!type_id.valid() || type_id.id >= type_table.len()) { return false; }
+    return type_table.type_at(type_id).kind == .errorable;
+}
+
+Int errorable_error_index(types.TypeTable& type_table, types.TypeId type_id) {
+    types.TypeInfo info = type_table.type_at(type_id);
+    types.TypeInfo value_info = type_table.type_at(info.element);
+    if (value_info.kind == .unit) { return 1; }
+    return 2;
+}
+
+Bool emit_try_errorable_result(CodegenContext& cg, api.Value function_value, api.Block catch_block, api.Block end_block, api.Value error_slot, api.Value result_value, types.TypeId result_type_id, jir.JirExprId target_id, FunctionEnv& env) {
+    context.CompilerContext& ctx = cg.ctx;
+    types.TypeTable& type_table = cg.type_table;
+    jir.JirModule& input = cg.input;
+    api.Context llvm_context = cg.llvm_context;
+    api.Builder builder = cg.builder;
+    if (!type_is_errorable(type_table, result_type_id)) { return false; }
+    types.TypeInfo result_info = type_table.type_at(result_type_id);
+    api.Value error_flag = builder.build_extract_value(result_value, UInt32(0), "try.error");
+    api.Block error_block = cg.llvm_module.append_block(llvm_context$.ptr(), function_value, "try.err");
+    api.Block success_block = cg.llvm_module.append_block(llvm_context$.ptr(), function_value, "try.ok");
+    builder.build_cond_br(error_flag, error_block, success_block);
+
+    builder.position_at_end(error_block);
+    api.Value error_value = builder.build_extract_value(result_value, UInt32(errorable_error_index(type_table, result_type_id)), "try.error.value");
+    if (!error_slot.is_null()) {
+        builder.build_store(error_value, error_slot);
+    }
+    builder.build_br(catch_block);
+
+    builder.position_at_end(success_block);
+    types.TypeInfo value_info = type_table.type_at(result_info.element);
+    if (target_id.valid() && value_info.kind != .unit) {
+        api.Value payload = builder.build_extract_value(result_value, UInt32(1), "try.value");
+        api.Value! ptr = expr_address_cg(cg, target_id, env);
+        if (!ptr.is_null()) {
+            jir.JirExpr target_expr = input.expr_at(target_id);
+            types.TypeId! target_type_id = target_expr.type_id;
+            api.Type! target_type_ref = llvm_type(ctx, type_table, input, llvm_context, target_type_id);
+            if (target_expr.body is .name_expr(name)) {
+                if (name.local_id.valid()) {
+                    LocalSlot? slot = env.find_local(name.local_id);
+                    if (slot is some local_slot) {
+                        target_type_id = local_slot.type_id;
+                        target_type_ref = local_slot.type_ref;
+                    }
+                }
+            }
+            api.Value stored = cast_value(ctx, type_table, builder, result_info.element, target_type_id, target_type_ref, payload);
+            builder.build_store(stored, ptr);
+        }
+    }
+    builder.build_br(end_block);
+    return true;
+}
+
+Bool emit_try_body_errorable(CodegenContext& cg, api.Value function_value, api.Block catch_block, api.Block end_block, api.Value error_slot, jir.JirBlock body, FunctionEnv& env) {
+    jir.JirModule& input = cg.input;
+    if (body.stmts.len() != 1) { return false; }
+    jir.JirStmt stmt = input.stmt_at(body.stmts[0]);
+    if (stmt.body is .expr(expr_stmt)) {
+        jir.JirExpr expr = input.expr_at(expr_stmt.value);
+        if (!type_is_errorable(cg.type_table, expr.type_id)) { return false; }
+        api.Value result_value = expr_value_cg(cg, expr_stmt.value, env);
+        return emit_try_errorable_result(cg, function_value, catch_block, end_block, error_slot, result_value, expr.type_id, jir.JirExprId(), env);
+    }
+    if (stmt.body is .assign(assign)) {
+        jir.JirExpr value_expr = input.expr_at(assign.value);
+        if (!type_is_errorable(cg.type_table, value_expr.type_id)) { return false; }
+        api.Value result_value = expr_value_cg(cg, assign.value, env);
+        return emit_try_errorable_result(cg, function_value, catch_block, end_block, error_slot, result_value, value_expr.type_id, assign.target, env);
+    }
+    return false;
+}
+
 api.Value variant_pattern_test(CodegenContext& cg, api.Value value, jir.JirPatternTest test, FunctionEnv& env) {
     context.CompilerContext& ctx = cg.ctx;
     jir.JirModule& input = cg.input;
@@ -2944,9 +3021,11 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
             }
         }
         env.set_catch_target(catch_block, error_slot);
-        emit_block(cg, function_value, break_target, continue_target, try_stmt.body, env);
-        if (!block_ends_block(input, try_stmt.body)) {
-            builder.build_br(end_block);
+        if (!emit_try_body_errorable(cg, function_value, catch_block, end_block, error_slot, try_stmt.body, env)) {
+            emit_block(cg, function_value, break_target, continue_target, try_stmt.body, env);
+            if (!block_ends_block(input, try_stmt.body)) {
+                builder.build_br(end_block);
+            }
         }
         env.set_catch_target(old_catch_target, old_catch_error_slot);
 

@@ -102,10 +102,11 @@
   - [ ] defer 与 early-exit 组合回归。
 - [x] 补齐 optional while-pattern narrowing/lowering。
   - [x] `optional_while_is_pattern_minimal`
-- [ ] 补齐 try/catch JIR lowering。
-  - [ ] statement lowering。
-  - [ ] expression lowering。
-  - [ ] error propagation with defer。
+- [x] 补齐 try/catch JIR lowering。
+  - [x] statement lowering。
+  - [x] expression lowering。
+  - [x] error propagation with defer。
+  - [x] Stage1 语法收敛为 `try errorable_call() catch (...) { ... }`，不支持多语句 try body 或裸 catch 表达式。
 - [ ] 补齐 switch/pattern 中间表示。
   - [ ] exhaustiveness 需要的 JIR representation。
   - [ ] union switch shorthand pattern。
