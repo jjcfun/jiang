@@ -51,30 +51,6 @@ run_sample() {
   fi
 }
 
-run_known_stage1_gap() {
-  local sample="$1"
-  local expected="$2"
-  local ir="$BUILD_DIR/${sample%.jiang}.known-gap.ll"
-  set +e
-  /bin/sh -c '"$1" --emit-llvm "$2" > "$3" 2>/dev/null' sh "$STAGE1_BIN" "$SAMPLES_DIR/$sample" "$ir" >/dev/null 2>&1
-  local compile_status=$?
-  set -e
-  if [[ "$compile_status" -ne 0 ]]; then
-    echo "known Stage1 runtime/codegen gap still fails to compile: $sample" >&2
-    return 0
-  fi
-
-  set +e
-  "$LLI" "$ir" >/dev/null 2>&1
-  local run_status=$?
-  set -e
-  if [[ "$run_status" -eq "$expected" ]]; then
-    echo "known Stage1 runtime/codegen gap now passes; move to run_sample: $sample" >&2
-  else
-    echo "known Stage1 runtime/codegen gap still mismatches: $sample expected $expected got $run_status" >&2
-  fi
-}
-
 run_next_sample() {
   local sample="$1"
   local expected="$2"
@@ -113,29 +89,6 @@ run_sample_nonzero() {
   if [[ "$status" -eq 0 ]]; then
     echo "error: $sample unexpectedly exited 0" >&2
     exit 1
-  fi
-}
-
-run_known_stage1_nonzero_gap() {
-  local sample="$1"
-  local ir="$BUILD_DIR/${sample%.jiang}.known-gap.ll"
-  set +e
-  /bin/sh -c '"$1" --emit-llvm "$2" > "$3" 2>/dev/null' sh "$STAGE1_BIN" "$SAMPLES_DIR/$sample" "$ir" >/dev/null 2>&1
-  local compile_status=$?
-  set -e
-  if [[ "$compile_status" -ne 0 ]]; then
-    echo "known Stage1 runtime/nonzero gap still fails to compile: $sample" >&2
-    return 0
-  fi
-
-  set +e
-  /bin/sh -c '"$1" "$2" >/dev/null 2>&1' sh "$LLI" "$ir" >/dev/null 2>&1
-  local run_status=$?
-  set -e
-  if [[ "$run_status" -eq 0 ]]; then
-    echo "known Stage1 runtime/nonzero gap still exits 0: $sample" >&2
-  else
-    echo "known Stage1 runtime/nonzero gap now exits nonzero; move to run_sample_nonzero: $sample" >&2
   fi
 }
 

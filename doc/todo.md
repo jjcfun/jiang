@@ -43,7 +43,7 @@
   - [x] backend 对已解析 call target 优先消费 HIR/JIR/semantic identity，不再对明确 `DeclId` 的 call 重新按 receiver/symbol 猜目标。
   - [x] backend 剩余 fallback 仅保留 trait/unresolved method dispatch 路径，并随后续 trait ABI 收敛。
 - [ ] 继续消除 HIR/JIR `.unsupported` fallback。
-  - [ ] 将现有 fallback 逐项对应到 `stage1_test.sh` 的具体 known gap。
+  - [x] 将现有 fallback 逐项对应到 `stage1_test.sh` 的具体 known gap。
   - [x] HIR/JIR lowering 的兜底 fallback 改为先触发断言，避免静默生成 unsupported IR。
   - [x] 新增 fallback 必须配测试和 TODO。
   - [ ] fallback 清零前不扩大新语法。
