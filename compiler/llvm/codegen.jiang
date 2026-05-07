@@ -1130,6 +1130,42 @@ api.Value wrap_optional_value(types.TypeTable& type_table, api.Context llvm_cont
     return value;
 }
 
+api.Value coerce_value_cg(CodegenContext& cg, FunctionEnv& env, jir.JirExprId source_id, types.TypeId target_type, api.Type target_ref) {
+    context.CompilerContext& ctx = cg.ctx;
+    types.TypeTable& type_table = cg.type_table;
+    jir.JirModule& input = cg.input;
+    api.Context llvm_context = cg.llvm_context;
+    api.Builder builder = cg.builder;
+    jir.JirExpr source_expr = input.expr_at(source_id);
+    api.Value! value = expr_value_cg(cg, source_id, env);
+    if (source_expr.type_id.valid() && target_type.valid()
+        && source_expr.type_id.id < type_table.len()
+        && target_type.id < type_table.len()) {
+        types.TypeInfo source_info = type_table.type_at(source_expr.type_id);
+        types.TypeInfo! target_info = type_table.type_at(target_type);
+        if (target_info.kind == .layer && !target_info.optional && target_info.element.valid()) {
+            target_info = type_table.type_at(target_info.element);
+        }
+        if (source_info.kind == .array
+            && target_info.kind == .slice
+            && type_table.assignment_compatible(target_info.element, source_info.element)) {
+            api.Type source_ref = llvm_type(ctx, type_table, input, llvm_context, source_expr.type_id);
+            api.Value array_ptr = expr_address_cg(cg, source_id, env);
+            if (!array_ptr.is_null()) {
+                api.Value zero = api.const_int(llvm_context.int32_type(), UInt64(0));
+                api.Value data_ptr = builder.build_gep_two(source_ref, array_ptr, zero, zero, "array.slice.ptr");
+                api.Value! current = api.undef(target_ref);
+                current = builder.build_insert_value(current, data_ptr, UInt32(0), "slice.ptr");
+                current = builder.build_insert_value(current, api.const_int(pointer_sized_int_type(llvm_context), UInt64(source_info.child_count)), UInt32(1), "slice.length");
+                return current;
+            }
+        }
+    }
+    value = cast_value(ctx, type_table, builder, source_expr.type_id, target_type, target_ref, value);
+    value = wrap_optional_value(type_table, llvm_context, builder, source_expr.type_id, target_type, target_ref, value);
+    return value;
+}
+
 api.Value bool_condition_value(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& env) {
     context.CompilerContext& ctx = cg.ctx;
     types.TypeTable& type_table = cg.type_table;
@@ -1179,6 +1215,23 @@ api.Value typed_literal_value(context.CompilerContext& ctx, types.TypeTable& typ
         }
     }
     return literal_value(result_type, literal);
+}
+
+api.Value string_literal_array_value(api.Context llvm_context, types.TypeInfo info, jir.JirLiteral literal) {
+    Int count = info.child_count;
+    Int![*] values = Int!$.alloc_array(count);
+    api.Type i8_type = llvm_context.int8_type();
+    Int text_len = c_string_length(literal.text);
+    Int! index = 0;
+    while (index < count) {
+        UInt64! byte = UInt64(0);
+        if (index < text_len) {
+            byte = UInt64(literal.text[index]);
+        }
+        values[index] = api.value_ref(api.const_int(i8_type, byte));
+        index = index + 1;
+    }
+    return api.const_array(i8_type, values, count);
 }
 
 Bool is_float_type(context.CompilerContext& ctx, types.TypeTable& type_table, types.TypeId type_id) {
@@ -1679,6 +1732,9 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
             }
             if (expr.type_id.valid()) {
                 types.TypeInfo string_result_info = type_table.type_at(expr.type_id);
+                if (string_result_info.kind == .array && type_table.is_builtin_named(string_result_info.element, ctx.symbols$.ref(), "UInt8")) {
+                    return string_literal_array_value(llvm_context, string_result_info, literal);
+                }
                 if (string_result_info.kind == .slice && type_table.is_builtin_named(string_result_info.element, ctx.symbols$.ref(), "UInt8")) {
                     api.Value! current = api.undef(result_type);
                     current = builder.build_insert_value(current, builder.build_global_string_ptr(literal.text, "str"), UInt32(0), "slice.ptr");
@@ -2123,7 +2179,6 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
             }
             Int! index = 0;
             while (index < call.args.len()) {
-                jir.JirExpr arg_expr = input.expr_at(call.args[index]);
                 api.Value! arg_value = expr_value_cg(cg, call.args[index], env);
                 Int param_index = index + out_index;
                 if (param_index < decl.params.len()) {
@@ -2131,7 +2186,7 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
                     if (function_decl_is_generic(type_table, decl)) {
                         param_type_id = substitute_type_id(type_table, call_env$.ref(), param_type_id);
                     }
-                    arg_value = cast_value(ctx, type_table, builder, arg_expr.type_id, param_type_id, llvm_type(ctx, type_table, function_target.module, llvm_context, param_type_id), arg_value);
+                    arg_value = coerce_value_cg(cg, env, call.args[index], param_type_id, llvm_type(ctx, type_table, function_target.module, llvm_context, param_type_id));
                 }
                 args[index + out_index] = api.value_ref(arg_value);
                 index = index + 1;
@@ -2198,12 +2253,9 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
                 Int! arg_index = 0;
                 while (arg_index < struct_expr.fields.len() && arg_index < init_decl.params.len()) {
                     jir.JirExprId arg_id = struct_expr.fields[arg_index].value;
-                    jir.JirExpr arg_expr = input.expr_at(arg_id);
                     types.TypeId param_type_id = init_decl.params[arg_index].type_id;
                     api.Type param_type = llvm_type(ctx, type_table, type_input, llvm_context, param_type_id);
-                    api.Value! arg_value = expr_value_cg(cg, arg_id, env);
-                    arg_value = cast_value(ctx, type_table, builder, arg_expr.type_id, param_type_id, param_type, arg_value);
-                    arg_value = wrap_optional_value(type_table, llvm_context, builder, arg_expr.type_id, param_type_id, param_type, arg_value);
+                    api.Value! arg_value = coerce_value_cg(cg, env, arg_id, param_type_id, param_type);
                     args[arg_index + 1] = api.value_ref(arg_value);
                     arg_types[arg_index + 1] = api.type_ref(param_type);
                     arg_index = arg_index + 1;
@@ -2397,10 +2449,7 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
         api.Value slot = builder.build_alloca(type_ref, ctx.symbol_c_string(local.name.symbol));
         env.add_local(local.local_id, slot, type_ref, local.type_id);
         if (local.initializer.valid()) {
-            jir.JirExpr initializer_expr = input.expr_at(local.initializer);
-            api.Value! initial_value = expr_value_cg(cg, local.initializer, env);
-            initial_value = cast_value(ctx, type_table, builder, initializer_expr.type_id, local.type_id, type_ref, initial_value);
-            initial_value = wrap_optional_value(type_table, llvm_context, builder, initializer_expr.type_id, local.type_id, type_ref, initial_value);
+            api.Value! initial_value = coerce_value_cg(cg, env, local.initializer, local.type_id, type_ref);
             builder.build_store(initial_value, slot);
             env.mark_local_initialized(local.local_id);
         }
@@ -2486,10 +2535,7 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
             if (name.local_id.valid() && !env.local_initialized(name.local_id)) {
                 LocalSlot? slot = env.find_local(name.local_id);
                 if (slot is some local_slot) {
-                    jir.JirExpr assign_value_expr = input.expr_at(assign.value);
-                    api.Value! initial_value = expr_value_cg(cg, assign.value, env);
-                    initial_value = cast_value(ctx, type_table, builder, assign_value_expr.type_id, local_slot.type_id, local_slot.type_ref, initial_value);
-                    initial_value = wrap_optional_value(type_table, llvm_context, builder, assign_value_expr.type_id, local_slot.type_id, local_slot.type_ref, initial_value);
+                    api.Value! initial_value = coerce_value_cg(cg, env, assign.value, local_slot.type_id, local_slot.type_ref);
                     builder.build_store(initial_value, local_slot.slot);
                     env.mark_local_initialized(name.local_id);
                     return;
@@ -2502,10 +2548,14 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
         }
         jir.JirExpr assign_target_expr = input.expr_at(assign.target);
         jir.JirExpr assign_value_expr = input.expr_at(assign.value);
+        types.TypeId! assign_target_type_id = assign_target_expr.type_id;
+        api.Type! assign_target_type_ref = llvm_type(ctx, type_table, input, llvm_context, assign_target_type_id);
         if (assign_target_expr.body is .name_expr(assign_name)) {
             if (assign_name.local_id.valid()) {
                 LocalSlot? assign_slot = env.find_local(assign_name.local_id);
                 if (assign_slot is some assign_local_slot) {
+                    assign_target_type_id = assign_local_slot.type_id;
+                    assign_target_type_ref = assign_local_slot.type_ref;
                     types.TypeInfo assign_target_info = type_table.type_at(assign_local_slot.type_id);
                     types.TypeInfo assign_value_info = type_table.type_at(assign_value_expr.type_id);
                     if (assign_target_info.kind == .pointer && assign_value_info.kind != .pointer) {
@@ -2514,19 +2564,15 @@ api.Value switch_case_condition(CodegenContext& cg, api.Value value, jir.JirSwit
                 }
             }
         }
-        api.Value! value = expr_value_cg(cg, assign.value, env);
-        value = cast_value(ctx, type_table, builder, assign_value_expr.type_id, assign_target_expr.type_id, llvm_type(ctx, type_table, input, llvm_context, assign_target_expr.type_id), value);
-        value = wrap_optional_value(type_table, llvm_context, builder, assign_value_expr.type_id, assign_target_expr.type_id, llvm_type(ctx, type_table, input, llvm_context, assign_target_expr.type_id), value);
+        api.Value! value = coerce_value_cg(cg, env, assign.value, assign_target_type_id, assign_target_type_ref);
         builder.build_store(value, ptr);
         return;
     }
     if (stmt.body is .return_stmt(return_stmt)) {
         if (return_stmt.value.valid()) {
-            jir.JirExpr return_expr = input.expr_at(return_stmt.value);
             api.Value! return_value = expr_value_cg(cg, return_stmt.value, env);
             if (env.function_result_type.valid()) {
-                return_value = cast_value(ctx, type_table, builder, return_expr.type_id, env.function_result_type, llvm_type(ctx, type_table, input, llvm_context, env.function_result_type), return_value);
-                return_value = wrap_optional_value(type_table, llvm_context, builder, return_expr.type_id, env.function_result_type, llvm_type(ctx, type_table, input, llvm_context, env.function_result_type), return_value);
+                return_value = coerce_value_cg(cg, env, return_stmt.value, env.function_result_type, llvm_type(ctx, type_table, input, llvm_context, env.function_result_type));
                 types.TypeInfo result_info = type_table.type_at(env.function_result_type);
                 if (result_info.kind == .errorable) {
                     builder.build_ret(errorable_success_payload_value(ctx, type_table, input, llvm_context, builder, env.function_result_type, return_value));
