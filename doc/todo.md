@@ -89,15 +89,15 @@
   - [x] extend declaration 基本检查。
   - [x] associated type binding 检查。
   - [x] trait conformance diagnostic。
-  - [ ] 暂缓完整 trait solving 和 trait method lookup，直到调用目标模型稳定。
+  - [x] 暂缓完整 trait solving 和 trait method lookup，直到调用目标模型稳定；后续随第五阶段调用目标模型一起做。
 - [x] 清理目标语言不保留的历史语法。
   - [x] 参数 label。
   - [x] 参数 default value。
   - [x] record call syntax。
   - [x] grouped declaration 的最终策略：只保留 struct 字段 `T a, b;`，不扩展到 top-level/grouped function declaration。
-- [ ] 明确 optional/errorable 规则。
+- [x] 明确 optional/errorable 规则。
   - [x] null-check narrowing 是否长期保留：Stage1 暂时保留 `is some`/null-check narrowing，并由负例约束边界。
-  - [ ] errorable ABI。
+  - [x] errorable ABI 不属于 Type Check / Resolve 规则，作为第五阶段 LLVM backend ABI 项继续跟踪。
   - [x] `try/catch` expression/statement type rule。
   - [x] `throw` / `?? return` / `?? break` / `?? continue` 的诊断边界。
 - [x] 替换 type operation 的 span-based type-ref lookup。
