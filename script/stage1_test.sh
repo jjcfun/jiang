@@ -90,6 +90,18 @@ run_next_sample() {
   fi
 }
 
+run_next_compile_fail() {
+  local sample="$1"
+  set +e
+  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$STAGE1_BIN" "$NEXT_SAMPLES_DIR/$sample" >/dev/null 2>&1
+  local status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    echo "error: samples_next/$sample unexpectedly compiled" >&2
+    exit 1
+  fi
+}
+
 run_sample_nonzero() {
   local sample="$1"
   local ir="$BUILD_DIR/${sample%.jiang}.ll"
@@ -198,8 +210,10 @@ run_imported_extern_symbol_sample
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
 run_sample if_minimal.jiang 2
+run_next_sample if_no_parens_minimal.jiang 42
 run_sample if_expr_minimal.jiang 42
-run_sample if_expr_bare_minimal.jiang 42
+run_next_compile_fail invalid_if_expr_bare_minimal.jiang
+run_next_compile_fail invalid_if_stmt_bare_body.jiang
 run_sample if_expr_block_multi_stmt_minimal.jiang 42
 run_sample if_expr_nested_minimal.jiang 42
 run_sample if_expr_return_branch_minimal.jiang 42
@@ -325,6 +339,7 @@ run_sample optional_coalesce_minimal.jiang 42
 run_sample coalesce_value_minimal.jiang 42
 run_sample coalesce_fallback_call_minimal.jiang 42
 run_sample coalesce_return_minimal.jiang 42
+run_next_sample coalesce_throw_minimal.jiang 42
 run_known_stage1_gap coalesce_break_minimal.jiang 3
 run_known_stage1_gap coalesce_continue_minimal.jiang 13
 run_sample invalid_coalesce_return_value.jiang 1
@@ -510,6 +525,8 @@ run_compile_fail invalid_optional_coalesce_impure_left.jiang
 run_compile_fail invalid_coalesce_break_outside_loop.jiang
 run_compile_fail invalid_coalesce_continue_outside_loop.jiang
 run_compile_fail invalid_coalesce_return_value_type.jiang
+run_next_compile_fail invalid_coalesce_throw_outside_errorable.jiang
+run_next_compile_fail invalid_coalesce_throw_type_mismatch.jiang
 run_compile_fail invalid_coalesce_non_optional_exit.jiang
 run_compile_fail invalid_coalesce_exit_in_call_arg.jiang
 run_compile_fail invalid_optional_no_narrow_then_null_branch.jiang

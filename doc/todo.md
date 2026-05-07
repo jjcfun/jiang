@@ -2,147 +2,158 @@
 
 当前状态：
 
-- Stage1 自举 smoke 已通过。
-- 第一轮 `DeclId` / `TypeId` / HIR / JIR 稳定 ID 清理已经完成。
-- 现在重点不是新增大语法，而是把 Stage1 编译器从“能自举”推进到“可长期维护、可测试、可继续演进”。
+- Stage1 自举 smoke、测试基线、package/source/driver、semantic table 基线、type check/resolve 基线已完成。
+- TODO 只保留未完成任务；已完成阶段和已转为硬断言的缺口不再列入。
+- 剩余工作按依赖排序：语义身份 -> 跨 module layout -> lowering -> ABI/runtime -> 诊断/文档 -> 增量编译准备。
 
-目标：
+依赖关系：
 
-- 建立可信测试基线，尤其恢复负例测试。
-- 收敛 package / module / source / driver 边界。
-- 继续清理 semantic table、type_check、lowering、codegen 的阶段职责。
-- 为后续增量编译和更完整语言特性打基础。
+- `ResolvedCallee` / `InstanceKey` 是 call target、generic specialization、symbol mangling、增量编译 hash 的共同前置。
+- 跨 module struct/enum/union/alias/method/slice/array 缺口依赖统一 nominal layout 和 import visibility。
+- struct init / `new` / deinit 先于更复杂 lifetime 和 runtime 行为。
+- control-flow、pattern、tuple destructuring、for variants 应在 union/trait/errorable ABI 大改前收敛 lowering 形状。
+- 增量编译依赖稳定 semantic identity、module graph、layout hash，不在这些基础稳定前开始声明级增量。
 
-## 第一阶段：测试基线硬化
+## 第一阶段：HIR / JIR 语义身份与职责边界
 
-- [x] 恢复 `script/stage1_test.sh` 中的负例测试。
-  - [x] 删除 `run_compile_fail` 中的临时 skip。
-  - [x] 将负例分成“应立即通过”和“已知缺口”两组。
-  - [x] 已知缺口必须在脚本或文档中显式列名，不能静默跳过。
-  - [x] 清空 `run_known_compile_gap`，所有负例编译缺口均改回 `run_compile_fail` 硬断言。
-- [x] 将 Stage1 当前正向运行时/codegen 缺口显式列名。
-  - [x] 已通过样例继续使用 `run_sample` 硬断言。
-  - [x] 未达 Stage0 行为的样例使用 `run_known_stage1_gap`。
-  - [x] 运行时非零缺口使用 `run_known_stage1_nonzero_gap`。
-- [x] 让 Stage1 compiler test 覆盖：
-  - [x] `--emit-llvm`
-  - [x] `--emit-obj`
-  - [x] executable link/run
-  - [x] multi-file import
-  - [x] compiler bootstrap smoke
-- [x] 给新增行为建立最小样例，不把大范围语言回归混进单个测试。
-- [x] 保持每个阶段都能通过：
-  - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/test.sh`
-  - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage1.sh`
-  - [x] `LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/stage1_test.sh`
-
-## 第二阶段：Package / Source / Driver
-
-- [x] 实现 `compiler/package_manifest.jiang` 的最小模型。
-  - [x] 解析 `package.ini` 的 package name / type / root。
-  - [x] 解析 dependency 条目。
-  - [x] 对非法 package name 和非法 import path 输出诊断。
-- [x] 将 `SourceManager` 从内存 registry 扩展到文件系统输入。
-  - [x] path normalization。
-  - [x] source root 识别。
-  - [x] 重复 source 去重。
-  - [x] import path string escape 处理。
-- [x] 将 `ModuleGraph` 接入 package/source discovery。
-  - [x] 支持 package root module。
-  - [x] 支持 package 内 module import。
-  - [x] 支持 package dependency import。
-  - [x] 输出完整 import cycle path。
-- [x] 整理 `jiangc.jiang` CLI。
-  - [x] 单文件编译入口。
-  - [x] package 编译入口。
-  - [x] 明确 `--emit-llvm` / `--emit-obj` / executable 输出规则。
-  - [x] 临时文件和 object 输出路径统一管理。
-
-## 第三阶段：Semantic Table 收敛
-
-- [x] 减少 `SemanticContext` 中对 `decl_table` 的线性扫描。
-  - [x] 增加 `BindingId -> DeclId` 索引。
-  - [x] 增加 `(ModuleId, Symbol) -> DeclId` 索引。
-  - [x] 增加 `ModuleId -> AstFile` 直接索引。
-  - [x] 增加 `DeclId -> owner/module/file` helper。
-- [x] 将 `DeclInfo` 作为顶层声明事实表继续加强。
-  - [x] 记录 declaration stable key 的第一版结构。
-  - [x] 记录 signature/body/layout hash 的占位字段或计算入口。
-  - [x] 明确 tombstone / no-reuse ID 策略。
-- [x] 清理跨阶段重复 side table。
-  - [x] 顶层声明类型只从 `DeclInfo.type_id/result_type_id` 读取。
-  - [x] `TypeCheckResult` 只保留 expression/local/pattern 等阶段必要结果作为 Stage1 当前边界。
-    - [x] 删除 local type 的重复并行索引。
-    - [x] expression/type-ref/call target 的并行索引不在第三阶段继续强拆，后续随结构化 expression identity / call target model 收敛。
-  - [x] HIR/JIR lowering 不重新做名称解析或类型推导。
-    - [x] struct field / union variant 类型由 HIR 携带 `TypeId`，JIR 不再从 AST type-ref 重构。
-
-## 第四阶段：Type Check / Resolve 清理
-
-- [x] 将 overload resolution 从 fallback 逻辑整理成明确算法。
-  - [x] 函数 overload。
-  - [x] method overload。
-  - [x] static method overload。
-  - [x] ambiguous overload diagnostic。
-- [x] 继续收敛 trait / generic 基础语义。
-  - [x] trait declaration 基本检查。
-  - [x] extend declaration 基本检查。
-  - [x] associated type binding 检查。
-  - [x] trait conformance diagnostic。
-  - [x] 暂缓完整 trait solving 和 trait method lookup，直到调用目标模型稳定；后续随第五阶段调用目标模型一起做。
-- [x] 清理目标语言不保留的历史语法。
-  - [x] 参数 label。
-  - [x] 参数 default value。
-  - [x] record call syntax。
-  - [x] grouped declaration 的最终策略：只保留 struct 字段 `T a, b;`，不扩展到 top-level/grouped function declaration。
-- [x] 明确 optional/errorable 规则。
-  - [x] null-check narrowing 是否长期保留：Stage1 暂时保留 `is some`/null-check narrowing，并由负例约束边界。
-  - [x] errorable ABI 不属于 Type Check / Resolve 规则，作为第五阶段 LLVM backend ABI 项继续跟踪。
-  - [x] `try/catch` expression/statement type rule。
-  - [x] `throw` / `?? return` / `?? break` / `?? continue` 的诊断边界。
-- [x] 替换 type operation 的 span-based type-ref lookup。
-  - [x] `TypeCheckResult` 不再用 `(span.start, span.length) -> TypeId` 作为 `T$.size()/align()/max_align()` 的主查询路径。
-  - [x] 改成 `TypeRefId -> TypeId` 或等价稳定 type identity。
-  - [x] 修复 `align_of_minimal.jiang` 中 Stage1 自编译路径拿错 type id 的问题。
-
-## 第五阶段：HIR / JIR / Codegen
-
+- [x] 固化 Stage1 语法边界。
+  - [x] `if` / `else if` condition 的圆括号可选。
+  - [x] `if` / `else` body 的大括号不能省略，包括 if expression。
+  - [x] 给省略大括号的 statement/expression 形式补负例测试。
+- [x] 补齐 coalesce throw early-exit 语法。
+  - [x] 支持 `optional ?? throw error;`。
+  - [x] 明确 `?? throw` 的 type rule、HIR/JIR lowering 和 defer 交互。
+  - [x] 增加最小正例和错误边界负例。
+- [ ] 收敛结构化 expression / call identity。
+  - [ ] 设计并落地 `ResolvedCallee`，覆盖普通函数、method、static method、trait/concept method、imported method、constructor/init。
+    - [x] 普通函数、method、static method、imported function、Equatable.equal 已记录 callee kind + `DeclId`。
+    - [x] 本地和 imported struct constructor 已记录 callee kind + struct `DeclId`。
+    - [x] HIR/JIR call 节点携带 callee kind、target `DeclId`、unresolved method receiver/symbol。
+    - [ ] trait/concept method、init overload index 统一进入 `ResolvedCallee`。
+  - [ ] 设计并落地 `InstanceKey`，作为 generic/type specialization 的稳定身份。
+    - [x] 定义 `InstanceKey` 的最小结构。
+    - [ ] generic specialization/mangling/layout 改用 `InstanceKey`。
+  - [ ] 用结构化 identity 替换 `TypeCheckResult` 中 expression/type-ref/call target 的并行 span/index 查表。
+    - [x] call target 优先按 AST expression pointer 查询，span 仅作为兼容 fallback。
+    - [x] type-ref lookup 优先使用 `TypeRefId`，span 仅作为兼容 fallback。
+    - [ ] type-ref/call target 的剩余并行数组继续收敛成结构化表。
+  - [ ] backend 只消费 HIR/JIR/semantic identity，不重新按源码 expression case 猜语义。
 - [ ] 继续消除 HIR/JIR `.unsupported` fallback。
-  - [ ] 新增 fallback 时必须配测试和 TODO。
-  - [ ] backend 不重新引入源码级 expression case。
-- [ ] 将调用目标模型升级为结构化语义身份。
-  - [x] extend method 保留 resolver 分配的 `DeclId`，并让 LLVM call target 使用 JIR call 的语义目标。
-  - [x] owner pointer 在 expected borrow 场景下可通过 `.ref()` 借出 pointee。
-  - [x] 当前 module 内 `extend T: Trait` 可参与显式泛型实参的 trait constraint 检查。
-  - [x] JIR 通过 module side table 表达 unresolved method target，支持 generic trait/concept method specialization 和 synthetic subscript getter/setter。
-  - [ ] `ResolvedCallee`
-  - [ ] `InstanceKey`
-  - [ ] backend-only symbol mangling
-  - [ ] 长度前缀或其他不会被 parser 误解的 mangling 编码
-- [ ] 补齐 JIR control-flow lowering。
-  - [ ] try/catch lowering。
-  - [ ] switch/pattern exhaustiveness 需要的中间表示。
-  - [ ] defer 与 early-exit 的组合回归。
-  - [x] fixed array/slice for-each 最小 LLVM lowering。
-  - [ ] 必要时再引入 CFG，不提前大改。
-- [ ] 补齐 LLVM backend ABI。
-  - [ ] 跨 module nominal type layout。
-  - [ ] generic instance layout。
-  - [ ] trait receiver / trait object ABI。
-  - [ ] errorable ABI。
-  - [x] slice 最小 ABI：`{ptr, length}`，字符串字面量可直接生成 `UInt8[]`。
-  - [x] `UInt8[N]`/`UInt8[_]` 字符串字面量和最小 `array -> slice` 转换。
-  - [x] 数组字面量可回填 `T[_]` 的最小长度推导。
-  - [x] `return ();` 可匹配 unit 返回值并生成 `ret void`。
-  - [x] rvalue aggregate field projection：`call().field` 在 HIR/JIR 标记为 value projection，LLVM 使用 `extractvalue`。
-  - [x] constructor init lowering 保留字段默认值，并支持 mutable-layer union payload 读取。
-  - [ ] target data layout 驱动的 `Int` / `UInt` / pointer-sized layout。
+  - [ ] 将现有 fallback 逐项对应到 `stage1_test.sh` 的具体 known gap。
+  - [x] HIR/JIR lowering 的兜底 fallback 改为先触发断言，避免静默生成 unsupported IR。
+  - [x] 新增 fallback 必须配测试和 TODO。
+  - [ ] fallback 清零前不扩大新语法。
+- [ ] 固化 symbol mangling 规则。
+  - [ ] mangling 输入只使用 `ResolvedCallee` / `InstanceKey` / module identity。
+  - [x] mangling 只在 backend 边界生成。
+  - [x] module-scoped symbol 使用长度前缀编码，避免 parser/source grammar 相关字符。
+  - [x] generic specialization 后缀使用长度前缀编码。
+
+## 第二阶段：跨 Module / Import / Nominal Layout
+
+- [ ] 统一跨 module nominal type layout。
+  - [ ] imported struct/enum/union 的字段、方法、init、generic 参数从 semantic/JIR identity 查询。
+  - [ ] 修复 multi-file/namespaced struct return/layout。
+  - [ ] 修复 multi-file/namespaced struct array layout。
+  - [ ] 修复 multi-file/namespaced slice return layout。
+  - [ ] 修复 multi-file/namespaced enum field shorthand。
+- [ ] 补齐 public/import alias/type visibility。
+  - [ ] `alias_import_type_minimal`
+  - [ ] `public_alias_type_minimal`
+  - [ ] `public_import_type_minimal`
+- [ ] 补齐跨 module method target。
+  - [ ] `public_import_instance_method_minimal`
+  - [ ] `public_import_static_method_minimal`
+  - [ ] `private_method_called_by_public_method_minimal`
+  - [ ] 保持 private method/type 负例继续硬断言。
+- [ ] 补齐 generic imported nominal instance layout。
+  - [ ] `generic_import_struct_minimal`
+  - [ ] imported generic instance 的 `InstanceKey` 与 layout 复用。
+
+## 第三阶段：Struct / Init / Lifetime Lowering
+
+- [ ] 重新整理 struct init resolution / lowering。
+  - [ ] overload init selection。
+  - [ ] mixed positional/named init args。
+  - [ ] named init sugar。
+  - [ ] branch-complete init analysis。
+  - [ ] failable init return/ABI。
+  - [ ] optional/mutable default assignment。
+- [ ] 补齐 `new` + constructor/init lowering。
+  - [ ] `struct_new_constructor_minimal`
+  - [ ] `struct_new_literal_with_init_minimal`
+- [ ] 补齐 deinit / runtime lifetime lowering。
+  - [ ] `deinit_minimal`
+  - [ ] owner pointer runtime smoke 需要走 executable/link 路径，避免 `lli` 外部符号解析造成误判。
+- [ ] 保持 owner/borrow receiver 一致性。
+  - [ ] 将 `struct_instance_method_pointer_base_minimal` 的 runtime harness/外部符号问题与真实 lowering 问题分离。
+
+## 第四阶段：Control Flow / Pattern / Destructuring Lowering
+
+- [ ] 补齐 coalesce early-exit lowering。
+  - [ ] `coalesce_break_minimal`
+  - [ ] `coalesce_continue_minimal`
+  - [ ] defer 与 early-exit 组合回归。
+- [ ] 补齐 optional while-pattern narrowing/lowering。
+  - [ ] `optional_while_is_pattern_minimal`
+- [ ] 补齐 try/catch JIR lowering。
+  - [ ] statement lowering。
+  - [ ] expression lowering。
+  - [ ] error propagation with defer。
+- [ ] 补齐 switch/pattern 中间表示。
+  - [ ] exhaustiveness 需要的 JIR representation。
+  - [ ] union switch shorthand pattern。
+  - [ ] union tuple pattern bind。
+- [ ] 补齐 tuple destructuring。
+  - [ ] local/global/return destructure。
+  - [ ] inferred and mutable destructure。
+  - [ ] unary tuple local/global inference。
+- [ ] 补齐 for lowering variants。
+  - [ ] mutable binding。
+  - [ ] indexed for。
+  - [ ] indexed typed for。
+  - [ ] tuple binding typed/indexed/mutable。
+
+## 第五阶段：Union / Generic / Trait / Errorable ABI
+
+- [ ] 重新定义 union payload ABI。
+  - [ ] 非 `Int` payload。
+  - [ ] tuple payload。
+  - [ ] nested union payload。
+  - [ ] grouped/implicit tag variants。
+  - [ ] generic union payload/layout。
+  - [ ] union bind/switch shorthand lowering。
+- [ ] 补齐 generic instance layout。
+  - [ ] generic nominal layout keyed by `InstanceKey`。
+  - [ ] generic union/function payload。
+- [ ] 补齐 trait receiver / trait object ABI。
+  - [ ] trait receiver direct call ABI。
+  - [ ] trait object representation；如果 Stage1 不实现，需要显式 defer。
+  - [ ] trait inheritance with where constraints。
+  - [ ] extend trait inheritance。
+- [ ] 补齐 errorable ABI。
+  - [ ] value/error representation。
+  - [ ] function return/call convention。
+  - [ ] interaction with try/catch/defer。
+- [ ] 使用 target data layout 驱动 scalar layout。
+  - [ ] `Int` / `UInt` / pointer-sized layout。
+  - [ ] target machine data layout source 统一。
+
+## 第六阶段：Runtime / Builtin / LLVM API Surface
+
+- [ ] 明确 Stage1 runtime/builtin 边界。
+  - [ ] `assert_minimal`
+  - [ ] `print_minimal`
+  - [ ] `panic_minimal`
+- [ ] 补齐 array repeat init lowering/runtime。
+  - [ ] `array_repeat_init_minimal`
+  - [ ] 区分 language lowering failure 与 allocator/runtime harness 问题。
 - [ ] 收回 `llvm/api.jiang` 的 raw LLVM public surface。
   - [ ] opaque pointee type 改回 private。
   - [ ] LLVM extern 声明改回 private。
   - [ ] `codegen.jiang` 只通过 wrapper API 工作。
 
-## 第六阶段：诊断与文档
+## 第七阶段：Diagnostics / Docs
 
 - [ ] 增强 diagnostic 数据结构。
   - [ ] label。
@@ -154,15 +165,21 @@
   - [ ] README 阶段说明改成当前 Stage1 状态。
   - [ ] `doc/develop.md` 移除已过期的“尚未完成”列表。
   - [ ] `doc/language-design.md` 的 feature matrix 和测试基线对齐。
-  - [ ] 记录 Stage1 已知缺口，避免散落在脚本注释里。
+  - [ ] 从 `stage1_test.sh` 生成或记录 Stage1 已知缺口，避免散落在脚本注释里。
 
-## 后续准备：增量编译
+## 第八阶段：增量编译准备
 
-- [ ] 先完成 package/module 边界，再进入增量编译实现。
-- [ ] 随结构化 expression identity / call target model 继续收敛 `TypeCheckResult` 中 expression/type-ref/call target 的并行索引。
-- [ ] 第一版只做模块级增量。
-  - [ ] 文件 hash。
+- [ ] 完成增量编译前置依赖。
+  - [ ] `ResolvedCallee`
+  - [ ] `InstanceKey`
+  - [ ] cross-module layout。
+  - [ ] `DeclInfo` signature/body/layout hash。
+- [ ] 实现 module-level incremental v1。
+  - [ ] file hash。
   - [ ] module public API hash。
   - [ ] reverse dependency index。
-  - [ ] 未变 module object 复用。
-- [ ] 暂缓声明级和函数级增量，直到 stable key / DeclInfo / package graph 稳定。
+  - [ ] unchanged module object reuse。
+- [ ] 暂缓 decl/function-level incremental。
+  - [ ] declaration stable key finalization。
+  - [ ] signature/body/layout hash implementation。
+  - [ ] generic instance invalidation model。
