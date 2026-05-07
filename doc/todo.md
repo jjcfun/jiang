@@ -152,8 +152,8 @@
   - [ ] `assert_minimal`
   - [ ] `print_minimal`
   - [ ] `panic_minimal`
-- [ ] 补齐 array repeat init lowering/runtime。
-  - [ ] `array_repeat_init_minimal`
+- [x] 补齐 array repeat init lowering/runtime。
+  - [x] `array_repeat_init_minimal`
   - [ ] 区分 language lowering failure 与 allocator/runtime harness 问题。
 - [ ] 收回 `llvm/api.jiang` 的 raw LLVM public surface。
   - [ ] opaque pointee type 改回 private。
