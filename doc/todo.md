@@ -69,12 +69,12 @@
   - [x] 记录 declaration stable key 的第一版结构。
   - [x] 记录 signature/body/layout hash 的占位字段或计算入口。
   - [x] 明确 tombstone / no-reuse ID 策略。
-- [ ] 清理跨阶段重复 side table。
+- [x] 清理跨阶段重复 side table。
   - [x] 顶层声明类型只从 `DeclInfo.type_id/result_type_id` 读取。
-  - [ ] `TypeCheckResult` 只保留 expression/local/pattern 等阶段必要结果。
+  - [x] `TypeCheckResult` 只保留 expression/local/pattern 等阶段必要结果作为 Stage1 当前边界。
     - [x] 删除 local type 的重复并行索引。
-    - [ ] expression/type-ref/call target 的并行索引仍需等待 Stage1 指针字段比较和结构化 list 语义更稳。
-  - [ ] HIR/JIR lowering 不重新做名称解析或类型推导。
+    - [x] expression/type-ref/call target 的并行索引不在第三阶段继续强拆，后续随结构化 expression identity / call target model 收敛。
+  - [x] HIR/JIR lowering 不重新做名称解析或类型推导。
     - [x] struct field / union variant 类型由 HIR 携带 `TypeId`，JIR 不再从 AST type-ref 重构。
 
 ## 第四阶段：Type Check / Resolve 清理
@@ -152,6 +152,7 @@
 ## 后续准备：增量编译
 
 - [ ] 先完成 package/module 边界，再进入增量编译实现。
+- [ ] 随结构化 expression identity / call target model 继续收敛 `TypeCheckResult` 中 expression/type-ref/call target 的并行索引。
 - [ ] 第一版只做模块级增量。
   - [ ] 文件 hash。
   - [ ] module public API hash。
