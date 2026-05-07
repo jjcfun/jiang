@@ -468,7 +468,7 @@ run_sample array_to_slice_arg_minimal.jiang 42
 run_sample array_to_slice_return_minimal.jiang 2
 run_sample typed_array_constructor_minimal.jiang 42
 run_sample typed_array_constructor_infer_minimal.jiang 42
-run_known_stage1_gap empty_tuple_return_minimal.jiang 0
+run_sample empty_tuple_return_minimal.jiang 0
 run_sample empty_tuple_bare_return_minimal.jiang 0
 run_known_stage1_gap for_item_array_minimal.jiang 42
 run_known_stage1_gap for_mutable_binding_minimal.jiang 42
