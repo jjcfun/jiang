@@ -6,6 +6,7 @@ import interner = "../interner.jiang";
 import "../jir.jiang";
 import semantic_ctx = "../semantic.jiang";
 import "../scope.jiang";
+import type_check = "../type_check.jiang";
 import types = "../type.jiang";
 import "../token.jiang";
 import arena = "../support/arena.jiang";
@@ -103,10 +104,12 @@ public struct EmissionState {
 
 public struct FunctionTarget {
     public jir.JirModule& module;
+    public scope.DeclId decl_id;
     public jir.JirFunctionDecl function;
 
-    public init(jir.JirModule& module, jir.JirFunctionDecl function) {
+    public init(jir.JirModule& module, scope.DeclId decl_id, jir.JirFunctionDecl function) {
         self.module = module;
+        self.decl_id = decl_id;
         self.function = function;
     }
 }
@@ -312,6 +315,23 @@ Int decimal_length(Int value) {
     }
 }
 
+UInt8 hex_digit(UInt64 value) {
+    if (value < 10) {
+        return UInt8(UInt64('0') + value);
+    }
+    return UInt8(UInt64('a') + value - 10);
+}
+
+() write_hex_u64(UInt8![*] out, Int start, UInt64 value) {
+    UInt64! current = value;
+    Int! index = start + 15;
+    while (index >= start) {
+        out[index] = hex_digit(current & 15);
+        current = current >> 4;
+        index = index - 1;
+    }
+}
+
 Bool type_contains_type_param(types.TypeTable& type_table, types.TypeId type_id) {
     if (!type_id.valid()) { return false; }
     if (type_id.id >= type_table.len()) { return false; }
@@ -438,49 +458,58 @@ types.TypeId substitute_type_id(types.TypeTable& type_table, FunctionEnv& env, t
     }
 }
 
-interner.Symbol specialized_function_name(context.CompilerContext& ctx, jir.JirFunctionDecl decl, FunctionEnv& env) {
-    UInt8[*] base = ctx.symbol_c_string(decl.name.symbol);
-    Int! suffix_parts = 0;
-    Int! suffix_length = 0;
+() write_function_instance_signature(hash_util.WyHasher& hasher, types.TypeTable& type_table, jir.JirFunctionDecl decl, FunctionEnv& env) {
+    hasher.write_uint64(UInt64(decl.params.len()));
     Int! index = 0;
     while (index < decl.params.len()) {
-        types.TypeId substituted = substitute_type_id(ctx.types_ref(), env, decl.params[index].type_id);
-        if (substituted.valid() && substituted.id >= 0) {
-            suffix_parts = suffix_parts + 1;
-            suffix_length = suffix_length + 2 + decimal_length(decimal_length(substituted.id)) + 1 + decimal_length(substituted.id);
-        }
+        types.TypeId substituted = substitute_type_id(type_table, env, decl.params[index].type_id);
+        hasher.write_uint64(UInt64(substituted.id));
         index = index + 1;
     }
-    if (suffix_parts == 0) {
-        return decl.name.symbol;
-    }
+    types.TypeId result_type = substitute_type_id(type_table, env, decl.result_type);
+    hasher.write_uint64(UInt64(result_type.id));
+}
+
+semantic_ctx.InstanceKey function_instance_key(context.CompilerContext& ctx, types.TypeTable& type_table, scope.DeclId decl_id, jir.JirFunctionDecl decl, FunctionEnv& env) {
+    hash_util.WyHasher! low = hash_util.WyHasher();
+    hash_util.WyHasher! high = hash_util.WyHasher();
+    low.write_uint64(UInt64(1));
+    high.write_uint64(UInt64(2));
+    write_function_instance_signature(low$.ref(), type_table, decl, env);
+    write_function_instance_signature(high$.ref(), type_table, decl, env);
+    return semantic_ctx.InstanceKey(decl_id, types.TypeId(), low.finish(), high.finish());
+}
+
+interner.Symbol specialized_function_symbol_from_key(context.CompilerContext& ctx, interner.Symbol base_symbol, semantic_ctx.InstanceKey key) {
+    if (!key.valid()) { return base_symbol; }
+    UInt8[*] base = ctx.symbol_c_string(base_symbol);
     Int! base_length = c_string_length(base);
     arena.Arena& store = ctx.ast_store_ref();
+    Int decl_digits = decimal_length(key.decl_id.id);
+    Int suffix_length = 39 + decl_digits;
     UInt8![*] text = store.alloc_array<UInt8>(base_length + suffix_length + 1);
     Int! out = 0;
-    index = 0;
+    Int! index = 0;
     while (index < base_length) {
         text[out] = base[index];
         out = out + 1;
         index = index + 1;
     }
-    index = 0;
-    while (index < decl.params.len()) {
-        types.TypeId substituted = substitute_type_id(ctx.types_ref(), env, decl.params[index].type_id);
-        if (substituted.valid() && substituted.id >= 0) {
-            text[out] = '_';
-            text[out + 1] = 'T';
-            out = out + 2;
-            Int id_digits = decimal_length(substituted.id);
-            write_decimal(text, out, id_digits);
-            out = out + decimal_length(id_digits);
-            text[out] = '_';
-            out = out + 1;
-            write_decimal(text, out, substituted.id);
-            out = out + id_digits;
-        }
-        index = index + 1;
-    }
+    text[out] = '_';
+    text[out + 1] = 'D';
+    out = out + 2;
+    write_decimal(text, out, key.decl_id.id);
+    out = out + decl_digits;
+    text[out] = '_';
+    text[out + 1] = 'I';
+    text[out + 2] = 'H';
+    text[out + 3] = '3';
+    text[out + 4] = '2';
+    out = out + 5;
+    write_hex_u64(text, out, key.signature_hash[0]);
+    out = out + 16;
+    write_hex_u64(text, out, key.signature_hash[1]);
+    out = out + 16;
     text[out] = 0;
     return ctx.intern(text[0 .. out]);
 }
@@ -555,52 +584,10 @@ interner.Symbol scoped_function_symbol(context.CompilerContext& ctx, jir.JirModu
     return scoped_symbol(ctx, input.module_symbol, decl.name.symbol);
 }
 
-interner.Symbol specialized_function_symbol(context.CompilerContext& ctx, jir.JirModule& input, jir.JirFunctionDecl decl, FunctionEnv& env) {
+interner.Symbol specialized_function_symbol(context.CompilerContext& ctx, jir.JirModule& input, scope.DeclId decl_id, jir.JirFunctionDecl decl, FunctionEnv& env) {
     interner.Symbol base_symbol = scoped_function_symbol(ctx, input, decl);
-    UInt8[*] base = ctx.symbol_c_string(base_symbol);
-    Int! suffix_parts = 0;
-    Int! suffix_length = 0;
-    Int! index = 0;
-    while (index < decl.params.len()) {
-        types.TypeId substituted = substitute_type_id(ctx.types_ref(), env, decl.params[index].type_id);
-        if (substituted.valid() && substituted.id >= 0) {
-            suffix_parts = suffix_parts + 1;
-            suffix_length = suffix_length + 2 + decimal_length(decimal_length(substituted.id)) + 1 + decimal_length(substituted.id);
-        }
-        index = index + 1;
-    }
-    if (suffix_parts == 0) {
-        return base_symbol;
-    }
-    Int! base_length = c_string_length(base);
-    arena.Arena& store = ctx.ast_store_ref();
-    UInt8![*] text = store.alloc_array<UInt8>(base_length + suffix_length + 1);
-    Int! out = 0;
-    index = 0;
-    while (index < base_length) {
-        text[out] = base[index];
-        out = out + 1;
-        index = index + 1;
-    }
-    index = 0;
-    while (index < decl.params.len()) {
-        types.TypeId substituted = substitute_type_id(ctx.types_ref(), env, decl.params[index].type_id);
-        if (substituted.valid() && substituted.id >= 0) {
-            text[out] = '_';
-            text[out + 1] = 'T';
-            out = out + 2;
-            Int id_digits = decimal_length(substituted.id);
-            write_decimal(text, out, id_digits);
-            out = out + decimal_length(id_digits);
-            text[out] = '_';
-            out = out + 1;
-            write_decimal(text, out, substituted.id);
-            out = out + id_digits;
-        }
-        index = index + 1;
-    }
-    text[out] = 0;
-    return ctx.intern(text[0 .. out]);
+    semantic_ctx.InstanceKey key = function_instance_key(ctx, ctx.types_ref(), decl_id, decl, env);
+    return specialized_function_symbol_from_key(ctx, base_symbol, key);
 }
 
 interner.Symbol scoped_init_function_name_symbol(context.CompilerContext& ctx, jir.JirModule& input, jir.JirTypeDecl decl, Int init_index) {
@@ -985,12 +972,19 @@ FunctionTarget? function_target_for_call(context.CompilerContext& ctx, types.Typ
         if (target_input_ref is some target_input) {
             if (decl_ref is some resolved_decl) {
                 if (resolved_decl.body is .function_decl(function_decl)) {
-                    return FunctionTarget(target_input.module, function_decl);
+                    return FunctionTarget(target_input.module, target_decl_id, function_decl);
                 }
             }
         }
     }
+    if (target_decl_id.valid() && !call_target_kind_is_trait_method(call.target_kind_id)) {
+        return null;
+    }
     return method_target_for_call(type_table, env, local_input, expr_id, call);
+}
+
+Bool call_target_kind_is_trait_method(Int kind_id) {
+    return kind_id == type_check.resolved_callee_kind_id(type_check.ResolvedCalleeKind.trait_method);
 }
 
 types.TypeId dispatch_receiver_type(types.TypeTable& type_table, FunctionEnv& env, types.TypeId type_id) {
@@ -1020,7 +1014,7 @@ FunctionTarget? method_target_in_module(types.TypeTable& type_table, FunctionEnv
         jir.JirDecl decl = module.decl_at(jir.JirDeclId(index));
         if (decl.body is .function_decl(function_decl)) {
             if (function_matches_method_target(type_table, env, function_decl, method_symbol, arg_count, receiver_type)) {
-                return FunctionTarget(module, function_decl);
+                return FunctionTarget(module, decl.decl_id, function_decl);
             }
         }
         index = index + 1;
@@ -1240,6 +1234,20 @@ api.Value coerce_value_cg(CodegenContext& cg, FunctionEnv& env, jir.JirExprId so
     api.Context llvm_context = cg.llvm_context;
     api.Builder builder = cg.builder;
     jir.JirExpr source_expr = input.expr_at(source_id);
+    if (source_expr.body is .literal_expr(literal)) {
+        if (literal.kind == jir.JirLiteralKind.string_lit && target_type.valid() && target_type.id < type_table.len()) {
+            types.TypeInfo target_info = type_table.type_at(target_type);
+            if (target_info.kind == .array && type_table.is_builtin_named(target_info.element, ctx.symbols$.ref(), "UInt8")) {
+                return string_literal_array_value(llvm_context, target_info, literal);
+            }
+            if (target_info.kind == .slice && type_table.is_builtin_named(target_info.element, ctx.symbols$.ref(), "UInt8")) {
+                api.Value! current = api.undef(target_ref);
+                current = builder.build_insert_value(current, builder.build_global_string_ptr(literal.text, "str"), UInt32(0), "slice.ptr");
+                current = builder.build_insert_value(current, api.const_int(pointer_sized_int_type(llvm_context), UInt64(c_string_length(literal.text))), UInt32(1), "slice.length");
+                return current;
+            }
+        }
+    }
     api.Value! value = expr_value_cg(cg, source_id, env);
     if (source_expr.type_id.valid() && target_type.valid()
         && source_expr.type_id.id < type_table.len()
@@ -2259,7 +2267,7 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
             api.Type! fn_type = function_type_ref(ctx, type_table, function_target.module, llvm_context, decl);
             api.Value! fn = api.Value();
             if (function_decl_is_generic(type_table, decl)) {
-                function_symbol = specialized_function_symbol(ctx, function_target.module, decl, call_env$.ref());
+                function_symbol = specialized_function_symbol(ctx, function_target.module, function_target.decl_id, decl, call_env$.ref());
                 fn_type = specialized_function_type_ref(ctx, type_table, function_target.module, llvm_context, decl, call_env$.ref());
                 fn = declare_specialized_function(ctx, type_table, function_target.module, llvm_context, llvm_module, decl, function_symbol, call_env$.ref());
                 if (!env.state.emitted(function_symbol) && decl.body != null && !decl.extern_flag) {
@@ -2345,7 +2353,7 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
             build_type_id = expr_info.element;
             wrap_result_optional = true;
         }
-        api.Type! build_result_type = llvm_type(ctx, type_table, input, llvm_context, build_type_id);
+        api.Type! build_result_type = llvm_type_in_env(ctx, type_table, input, llvm_context, build_type_id, env);
         api.Value! current = api.undef(build_result_type);
         if (struct_expr.type_decl_id.valid()) {
             jir.JirTypeDecl? type_decl_ref = type_decl_for_decl_id_ref(ctx, env.state, input, struct_expr.type_decl_id);
@@ -2371,11 +2379,8 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
                     jir.JirExprId default_value_id = type_decl.fields[default_index].default_value;
                     if (default_value_id.valid()) {
                         types.TypeId field_type_id = substitute_type_id(type_table, struct_env$.ref(), type_decl.fields[default_index].type_id);
-                        api.Type field_type_ref = llvm_type(ctx, type_table, type_input, llvm_context, field_type_id);
-                        api.Value! default_value = expr_value_cg(cg, default_value_id, env);
-                        jir.JirExpr default_expr = input.expr_at(default_value_id);
-                        default_value = cast_value(ctx, type_table, builder, default_expr.type_id, field_type_id, field_type_ref, default_value);
-                        default_value = wrap_optional_value(type_table, llvm_context, builder, default_expr.type_id, field_type_id, field_type_ref, default_value);
+                        api.Type field_type_ref = llvm_type_in_env(ctx, type_table, type_input, llvm_context, field_type_id, struct_env$.ref());
+                        api.Value default_value = coerce_value_cg(cg, env, default_value_id, field_type_id, field_type_ref);
                         initial = builder.build_insert_value(initial, default_value, UInt32(default_index), "ctor.default");
                     }
                     default_index = default_index + 1;
@@ -2386,12 +2391,12 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
                 Int![*]! args = call_store.alloc_array<Int>(struct_expr.fields.len() + 1);
                 Int![*]! arg_types = call_store.alloc_array<Int>(struct_expr.fields.len() + 1);
                 args[0] = api.value_ref(slot);
-                arg_types[0] = api.type_ref(llvm_type(ctx, type_table, type_input, llvm_context, init_decl.self_type_id));
+                arg_types[0] = api.type_ref(llvm_type_in_env(ctx, type_table, type_input, llvm_context, init_decl.self_type_id, struct_env$.ref()));
                 Int! arg_index = 0;
                 while (arg_index < struct_expr.fields.len() && arg_index < init_decl.params.len()) {
                     jir.JirExprId arg_id = struct_expr.fields[arg_index].value;
                     types.TypeId param_type_id = init_decl.params[arg_index].type_id;
-                    api.Type param_type = llvm_type(ctx, type_table, type_input, llvm_context, param_type_id);
+                    api.Type param_type = llvm_type_in_env(ctx, type_table, type_input, llvm_context, param_type_id, struct_env$.ref());
                     api.Value! arg_value = coerce_value_cg(cg, env, arg_id, param_type_id, param_type);
                     args[arg_index + 1] = api.value_ref(arg_value);
                     arg_types[arg_index + 1] = api.type_ref(param_type);
@@ -2409,13 +2414,10 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
             while (field_index_value < type_decl.fields.len()) {
                 jir.JirExprId value_id = struct_init_field_value(struct_expr, type_decl, field_index_value);
                 types.TypeId field_type_id = substitute_type_id(type_table, struct_env$.ref(), type_decl.fields[field_index_value].type_id);
-                api.Type field_type_ref = llvm_type(ctx, type_table, type_input, llvm_context, field_type_id);
+                api.Type field_type_ref = llvm_type_in_env(ctx, type_table, type_input, llvm_context, field_type_id, struct_env$.ref());
                 api.Value! value = api.const_null(field_type_ref);
                 if (value_id.valid()) {
-                    value = expr_value_cg(cg, value_id, env);
-                    jir.JirExpr value_expr = input.expr_at(value_id);
-                    value = cast_value(ctx, type_table, builder, value_expr.type_id, field_type_id, field_type_ref, value);
-                    value = wrap_optional_value(type_table, llvm_context, builder, value_expr.type_id, field_type_id, field_type_ref, value);
+                    value = coerce_value_cg(cg, env, value_id, field_type_id, field_type_ref);
                 }
                 current = builder.build_insert_value(current, value, UInt32(field_index_value), "struct.insert");
                 field_index_value = field_index_value + 1;

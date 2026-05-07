@@ -390,7 +390,7 @@ run_sample generic_import_func_infer_minimal.jiang 42
 run_sample generic_struct_instantiation_minimal.jiang 42
 run_sample mutable_generic_minimal.jiang 42
 run_sample type_modifier_canonical_minimal.jiang 7
-run_known_stage1_gap generic_import_struct_minimal.jiang 42
+run_sample generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
@@ -404,8 +404,8 @@ run_known_stage1_gap struct_init_failable_minimal.jiang 42
 run_known_stage1_gap struct_init_failable_return_success_minimal.jiang 43
 run_known_stage1_gap struct_named_init_minimal.jiang 64
 run_known_stage1_gap struct_init_mutable_default_override_minimal.jiang 19
-run_known_stage1_gap alias_import_type_minimal.jiang 42
-run_known_stage1_gap public_alias_type_minimal.jiang 42
+run_sample alias_import_type_minimal.jiang 42
+run_sample public_alias_type_minimal.jiang 42
 run_known_stage1_gap public_import_type_minimal.jiang 42
 run_sample struct_constructor_sugar_minimal.jiang 42
 run_sample struct_literal_with_init_minimal.jiang 42
@@ -417,10 +417,10 @@ run_known_stage1_gap struct_new_constructor_minimal.jiang 42
 run_known_stage1_gap struct_new_literal_with_init_minimal.jiang 42
 run_known_stage1_gap deinit_minimal.jiang 42
 run_sample else_if_minimal.jiang 20
-run_known_stage1_gap multi_file_struct_return_minimal.jiang 42
-run_known_stage1_gap multi_file_struct_minimal.jiang 42
-run_known_stage1_gap namespaced_struct_import_minimal.jiang 42
-run_known_stage1_gap namespaced_struct_return_minimal.jiang 42
+run_sample multi_file_struct_return_minimal.jiang 42
+run_sample multi_file_struct_minimal.jiang 42
+run_sample namespaced_struct_import_minimal.jiang 42
+run_sample namespaced_struct_return_minimal.jiang 42
 run_sample struct_enum_field_shorthand_minimal.jiang 42
 run_known_stage1_gap multi_file_enum_field_shorthand_minimal.jiang 1
 run_known_stage1_gap namespaced_enum_field_shorthand_minimal.jiang 1
@@ -464,8 +464,8 @@ run_sample infer_array_length_minimal.jiang 42
 run_sample uint8_array_string_minimal.jiang 98
 run_sample infer_uint8_array_string_minimal.jiang 98
 run_sample struct_array_field_minimal.jiang 98
-run_known_stage1_gap multi_file_struct_array_minimal.jiang 98
-run_known_stage1_gap namespaced_struct_array_minimal.jiang 98
+run_sample multi_file_struct_array_minimal.jiang 98
+run_sample namespaced_struct_array_minimal.jiang 98
 run_sample multi_file_pointer_minimal.jiang 42
 run_sample namespaced_pointer_minimal.jiang 42
 run_sample slice_index_minimal.jiang 0
@@ -473,9 +473,9 @@ run_sample slice_assign_minimal.jiang 0
 run_sample slice_length_minimal.jiang 3
 run_sample slice_return_length_minimal.jiang 3
 run_sample string_slice_condition_after_branch_minimal.jiang 42
-run_known_stage1_gap multi_file_slice_return_minimal.jiang 3
+run_sample multi_file_slice_return_minimal.jiang 3
 run_sample multi_file_slice_index_minimal.jiang 42
-run_known_stage1_gap namespaced_slice_return_minimal.jiang 3
+run_sample namespaced_slice_return_minimal.jiang 3
 run_sample namespaced_slice_index_minimal.jiang 42
 run_sample array_to_slice_local_minimal.jiang 42
 run_sample array_to_slice_assign_minimal.jiang 42

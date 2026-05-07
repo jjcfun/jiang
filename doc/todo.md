@@ -29,37 +29,42 @@
     - [x] 普通函数、method、static method、imported function、Equatable.equal 已记录 callee kind + `DeclId`。
     - [x] 本地和 imported struct constructor 已记录 callee kind + struct `DeclId`。
     - [x] HIR/JIR call 节点携带 callee kind、target `DeclId`、unresolved method receiver/symbol。
-    - [ ] trait/concept method、init overload index 统一进入 `ResolvedCallee`。
+    - [x] init overload index 进入 `ResolvedCallee`，并向 HIR/JIR call identity 透传。
+    - [x] trait/concept method 统一进入 `ResolvedCallee`，用 trait owner `DeclId` + method index 表达签名身份。
   - [ ] 设计并落地 `InstanceKey`，作为 generic/type specialization 的稳定身份。
-    - [x] 定义 `InstanceKey` 的最小结构。
-    - [ ] generic specialization/mangling/layout 改用 `InstanceKey`。
+    - [x] 在 semantic 层定义 `InstanceKey` 的最小结构。
+    - [x] generic function specialization/mangling 改用 `InstanceKey` 的 `DeclId` + signature hash。
+    - [ ] generic nominal layout 改用 `InstanceKey`。
   - [ ] 用结构化 identity 替换 `TypeCheckResult` 中 expression/type-ref/call target 的并行 span/index 查表。
     - [x] call target 优先按 AST expression pointer 查询，span 仅作为兼容 fallback。
     - [x] type-ref lookup 优先使用 `TypeRefId`，span 仅作为兼容 fallback。
-    - [ ] type-ref/call target 的剩余并行数组继续收敛成结构化表。
-  - [ ] backend 只消费 HIR/JIR/semantic identity，不重新按源码 expression case 猜语义。
+    - [x] call target 并行数组收敛为结构化 `ResolvedCalleeEntry` 表。
+    - [x] type-ref 并行数组收敛为结构化 `TypeRefTypeEntry` 表。
+  - [x] backend 对已解析 call target 优先消费 HIR/JIR/semantic identity，不再对明确 `DeclId` 的 call 重新按 receiver/symbol 猜目标。
+  - [x] backend 剩余 fallback 仅保留 trait/unresolved method dispatch 路径，并随后续 trait ABI 收敛。
 - [ ] 继续消除 HIR/JIR `.unsupported` fallback。
   - [ ] 将现有 fallback 逐项对应到 `stage1_test.sh` 的具体 known gap。
   - [x] HIR/JIR lowering 的兜底 fallback 改为先触发断言，避免静默生成 unsupported IR。
   - [x] 新增 fallback 必须配测试和 TODO。
   - [ ] fallback 清零前不扩大新语法。
 - [ ] 固化 symbol mangling 规则。
-  - [ ] mangling 输入只使用 `ResolvedCallee` / `InstanceKey` / module identity。
+  - [x] generic function mangling 输入使用 `InstanceKey` 的 `DeclId` + signature hash / module identity。
+  - [ ] 剩余 mangling 输入只使用 `ResolvedCallee` / `InstanceKey` / module identity。
   - [x] mangling 只在 backend 边界生成。
   - [x] module-scoped symbol 使用长度前缀编码，避免 parser/source grammar 相关字符。
-  - [x] generic specialization 后缀使用长度前缀编码。
+  - [x] generic specialization 后缀使用固定宽度 hash 编码。
 
 ## 第二阶段：跨 Module / Import / Nominal Layout
 
 - [ ] 统一跨 module nominal type layout。
   - [ ] imported struct/enum/union 的字段、方法、init、generic 参数从 semantic/JIR identity 查询。
-  - [ ] 修复 multi-file/namespaced struct return/layout。
-  - [ ] 修复 multi-file/namespaced struct array layout。
-  - [ ] 修复 multi-file/namespaced slice return layout。
+  - [x] 修复 multi-file/namespaced struct return/layout。
+  - [x] 修复 multi-file/namespaced struct array layout。
+  - [x] 修复 multi-file/namespaced slice return layout。
   - [ ] 修复 multi-file/namespaced enum field shorthand。
 - [ ] 补齐 public/import alias/type visibility。
-  - [ ] `alias_import_type_minimal`
-  - [ ] `public_alias_type_minimal`
+  - [x] `alias_import_type_minimal`
+  - [x] `public_alias_type_minimal`
   - [ ] `public_import_type_minimal`
 - [ ] 补齐跨 module method target。
   - [ ] `public_import_instance_method_minimal`
@@ -67,7 +72,7 @@
   - [ ] `private_method_called_by_public_method_minimal`
   - [ ] 保持 private method/type 负例继续硬断言。
 - [ ] 补齐 generic imported nominal instance layout。
-  - [ ] `generic_import_struct_minimal`
+  - [x] `generic_import_struct_minimal`
   - [ ] imported generic instance 的 `InstanceKey` 与 layout 复用。
 
 ## 第三阶段：Struct / Init / Lifetime Lowering
