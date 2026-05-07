@@ -345,7 +345,7 @@ run_sample generic_func_call_minimal.jiang 42
 run_sample generic_func_infer_minimal.jiang 42
 run_known_stage1_gap generic_method_on_self_field_minimal.jiang 42
 run_sample concept_generic_minimal.jiang 42
-run_known_stage1_gap concept_method_minimal.jiang 42
+run_sample concept_method_minimal.jiang 42
 run_sample where_amp_minimal.jiang 42
 run_sample trait_inherit_minimal.jiang 42
 run_known_stage1_gap trait_inherit_where_minimal.jiang 42
@@ -356,8 +356,8 @@ run_sample trait_assoc_type_bound_minimal.jiang 42
 run_sample trait_assoc_type_inherit_minimal.jiang 42
 run_sample trait_assoc_type_where_minimal.jiang 42
 run_sample invalid_trait_assoc_ambiguous_binding.jiang 42
-run_known_stage1_gap subscriptable_readonly_minimal.jiang 42
-run_known_stage1_gap subscriptable_mutable_minimal.jiang 42
+run_sample subscriptable_readonly_minimal.jiang 42
+run_sample subscriptable_mutable_minimal.jiang 42
 run_compile_fail invalid_subscriptable_write_readonly.jiang
 run_known_stage1_gap extend_trait_inherit_minimal.jiang 63
 run_sample extend_trait_assoc_type_minimal.jiang 42
@@ -412,7 +412,7 @@ run_known_stage1_gap namespaced_enum_field_shorthand_minimal.jiang 1
 run_sample struct_union_field_shorthand_minimal.jiang 42
 run_sample struct_instance_method_minimal.jiang 42
 run_sample extend_struct_minimal.jiang 42
-run_known_stage1_gap extend_trait_minimal.jiang 42
+run_sample extend_trait_minimal.jiang 42
 run_sample struct_instance_method_with_args_minimal.jiang 42
 run_known_stage1_gap struct_instance_method_pointer_base_minimal.jiang 42
 run_sample struct_static_method_minimal.jiang 42

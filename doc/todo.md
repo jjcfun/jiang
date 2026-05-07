@@ -114,6 +114,7 @@
   - [x] extend method 保留 resolver 分配的 `DeclId`，并让 LLVM call target 使用 JIR call 的语义目标。
   - [x] owner pointer 在 expected borrow 场景下可通过 `.ref()` 借出 pointee。
   - [x] 当前 module 内 `extend T: Trait` 可参与显式泛型实参的 trait constraint 检查。
+  - [x] JIR 通过 module side table 表达 unresolved method target，支持 generic trait/concept method specialization 和 synthetic subscript getter/setter。
   - [ ] `ResolvedCallee`
   - [ ] `InstanceKey`
   - [ ] backend-only symbol mangling
