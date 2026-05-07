@@ -379,7 +379,7 @@ run_known_stage1_gap generic_import_struct_minimal.jiang 42
 run_sample struct_minimal.jiang 42
 run_sample fields_minimal.jiang 3
 run_sample nested_fields_minimal.jiang 42
-run_known_stage1_gap call_result_field_minimal.jiang 42
+run_sample call_result_field_minimal.jiang 42
 run_sample struct_init_minimal.jiang 42
 run_known_stage1_gap struct_init_overload_minimal.jiang 43
 run_sample struct_init_with_defaults_minimal.jiang 18
@@ -409,7 +409,7 @@ run_known_stage1_gap namespaced_struct_return_minimal.jiang 42
 run_sample struct_enum_field_shorthand_minimal.jiang 42
 run_known_stage1_gap multi_file_enum_field_shorthand_minimal.jiang 1
 run_known_stage1_gap namespaced_enum_field_shorthand_minimal.jiang 1
-run_known_stage1_gap struct_union_field_shorthand_minimal.jiang 42
+run_sample struct_union_field_shorthand_minimal.jiang 42
 run_sample struct_instance_method_minimal.jiang 42
 run_known_stage1_gap extend_struct_minimal.jiang 42
 run_known_stage1_gap extend_trait_minimal.jiang 42
@@ -483,7 +483,7 @@ run_known_stage1_gap union_tuple_switch_mutable_binding_minimal.jiang 42
 run_known_stage1_gap union_tuple_if_shorthand_pattern_minimal.jiang 42
 run_known_stage1_gap union_tuple_if_mutable_shorthand_pattern_minimal.jiang 42
 run_sample union_minimal.jiang 42
-run_known_stage1_gap union_default_field_minimal.jiang 42
+run_sample union_default_field_minimal.jiang 42
 run_sample union_shorthand_minimal.jiang 42
 run_known_stage1_gap union_implicit_tag_minimal.jiang 42
 run_known_stage1_gap union_grouped_variant_minimal.jiang 42
