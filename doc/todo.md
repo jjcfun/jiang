@@ -115,11 +115,11 @@
   - [x] local/global/return destructure。
   - [x] inferred and mutable destructure。
   - [x] unary tuple local/global inference。
-- [ ] 补齐 for lowering variants。
-  - [ ] mutable binding。
-  - [ ] indexed for。
-  - [ ] indexed typed for。
-  - [ ] tuple binding typed/indexed/mutable。
+- [x] 补齐 for lowering variants。
+  - [x] mutable binding。
+  - [x] indexed for。
+  - [x] indexed typed for。
+  - [x] tuple binding typed/indexed/mutable。
 
 ## 第五阶段：Union / Generic / Trait / Errorable ABI
 
