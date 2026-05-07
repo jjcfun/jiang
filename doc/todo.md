@@ -110,7 +110,7 @@
 - [ ] 补齐 switch/pattern 中间表示。
   - [ ] exhaustiveness 需要的 JIR representation。
   - [x] union switch shorthand pattern。
-  - [ ] union tuple pattern bind。
+  - [x] union tuple pattern bind。
 - [ ] 补齐 tuple destructuring。
   - [ ] local/global/return destructure。
   - [ ] inferred and mutable destructure。
@@ -124,8 +124,8 @@
 ## 第五阶段：Union / Generic / Trait / Errorable ABI
 
 - [ ] 重新定义 union payload ABI。
-  - [ ] 非 `Int` payload。
-  - [ ] tuple payload。
+  - [x] 非 `Int` payload。
+  - [x] tuple payload。
   - [ ] nested union payload。
   - [ ] grouped/implicit tag variants。
   - [ ] generic union payload/layout。
