@@ -3,6 +3,7 @@ import "./context.jiang";
 import "./diagnostic.jiang";
 import compiler_file_io = "./file_io.jiang";
 import "./hir.jiang";
+public import incremental = "./incremental.jiang";
 import interner = "./interner.jiang";
 import ir = "./ir_common.jiang";
 import api = "./llvm/api.jiang";
@@ -134,6 +135,49 @@ CompileResult compile_source_to_object_with_context(context.CompilerContext& ctx
     return CompileResult(Int(status));
 }
 
+incremental.Hash128 graph_source_hash(module_graph.ModuleGraph& graph) {
+    incremental.Hash128! result = incremental.hash128_bytes("jiang.graph-source.v1");
+    Int! index = 0;
+    while (index < graph.resolve_order_len()) {
+        module_graph.Module!^ module = graph.resolve_order_at(index);
+        result = incremental.hash128_combine_2(result, module.source_file.path, module.source_file.text);
+        index = index + 1;
+    }
+    return result;
+}
+
+CompileResult compile_source_incremental_to_object_with_context(context.CompilerContext& ctx, UInt8[] path, UInt8[] text, UInt8[*] object_path) {
+    incremental.IncrementalSession session = incremental.IncrementalSession(".jiang/cache", "native", "stage1", "");
+    source.SourceId root_id = ctx.sources.add_source(path, text);
+    module_graph.ModuleGraph! graph = module_graph.ModuleGraph(ctx$.ref());
+    module_graph.Module!^ root = graph.resolve_root(root_id);
+    if (ctx.diagnostics.has_error()) {
+        print_diagnostics(ctx$.ref());
+        return CompileResult(2);
+    }
+    incremental.Hash128 manifest_hash = incremental.hash128_bytes("");
+    incremental.PackageKey package_key = incremental.package_key("root", "0", path, manifest_hash, session.target_triple, session.compiler_version);
+    incremental.Hash128 source_hash = graph_source_hash(graph$.ref());
+    incremental.ObjectKey object_key = incremental.graph_object_key(package_key, source_hash, session.target_triple, session.compiler_version, session.codegen_options);
+    UInt8[*] cached_object_path = incremental.object_cache_path(object_key);
+    incremental.ensure_cache_dirs();
+    if (incremental.file_exists(cached_object_path)) {
+        if (incremental.copy_file(cached_object_path, object_path)) {
+            return CompileResult(0);
+        }
+    }
+    list.ArenaList<codegen.ModuleInput> inputs = lower_graph_inputs(ctx$.ref(), graph$.ref());
+    if (ctx.diagnostics.has_error()) {
+        print_diagnostics(ctx$.ref());
+        return CompileResult(2);
+    }
+    Int32 status = codegen.emit_jir_modules_object(ctx$.ref(), inputs, object_path);
+    if (status == 0) {
+        incremental.copy_file(object_path, cached_object_path);
+    }
+    return CompileResult(Int(status));
+}
+
 CompileResult compile_source_to_llvm_stdout_with_context(context.CompilerContext& ctx, UInt8[] path, UInt8[] text) {
     source.SourceId root_id = ctx.sources.add_source(path, text);
     module_graph.ModuleGraph! graph = module_graph.ModuleGraph(ctx$.ref());
@@ -165,13 +209,30 @@ public CompileResult compile_source_to_object_result(UInt8[] path, UInt8[] text,
     return compile_source_to_object_with_context(ctx$.ref(), path, text, object_path);
 }
 
+public CompileResult compile_source_incremental_to_object_result(UInt8[] path, UInt8[] text, UInt8[*] object_path) {
+    _ ctx = new context.CompilerContext();
+    return compile_source_incremental_to_object_with_context(ctx$.ref(), path, text, object_path);
+}
+
 public Bool compile_source_to_object(UInt8[] path, UInt8[] text, UInt8[*] object_path) {
     CompileResult result = compile_source_to_object_result(path, text, object_path);
     return result.status == 0;
 }
 
+public Bool compile_source_incremental_to_object(UInt8[] path, UInt8[] text, UInt8[*] object_path) {
+    CompileResult result = compile_source_incremental_to_object_result(path, text, object_path);
+    return result.status == 0;
+}
+
 public Bool compile_source_to_executable(UInt8[] path, UInt8[] text, UInt8[*] object_path, UInt8[*] executable_path) {
     if (!compile_source_to_object(path, text, object_path)) {
+        return false;
+    }
+    return linker.link_object_file(object_path, executable_path);
+}
+
+public Bool compile_source_incremental_to_executable(UInt8[] path, UInt8[] text, UInt8[*] object_path, UInt8[*] executable_path) {
+    if (!compile_source_incremental_to_object(path, text, object_path)) {
         return false;
     }
     return linker.link_object_file(object_path, executable_path);
@@ -210,6 +271,23 @@ public CompileResult compile_file_to_object(UInt8[*] path, UInt8[*] object_path)
     return result;
 }
 
+public CompileResult compile_file_incremental_to_object(UInt8[*] path, UInt8[*] object_path) {
+    _ ctx = new context.CompilerContext();
+    package_manifest.ResolvedInput input = resolve_compile_input(ctx$.ref(), path);
+    if (!input.ok) {
+        return CompileResult(1);
+    }
+    UInt8![*] input_path = slice_to_c_string(ctx$.ref(), input.path);
+    _! text = compiler_file_io.read_all(input_path$.as(UInt8[*]));
+    Bool! ok = text.ok;
+    if (ok == false) {
+        return CompileResult(1);
+    }
+    CompileResult result = compile_source_incremental_to_object_with_context(ctx$.ref(), input.path, text.slice(), object_path);
+    text.free();
+    return result;
+}
+
 public CompileResult compile_file_to_llvm_stdout(UInt8[*] path) {
     _ ctx = new context.CompilerContext();
     package_manifest.ResolvedInput input = resolve_compile_input(ctx$.ref(), path);
@@ -229,6 +307,17 @@ public CompileResult compile_file_to_llvm_stdout(UInt8[*] path) {
 
 public CompileResult compile_file_to_executable(UInt8[*] path, UInt8[*] object_path, UInt8[*] executable_path) {
     CompileResult result = compile_file_to_object(path, object_path);
+    if (!(result.status == 0)) {
+        return result;
+    }
+    if (!linker.link_object_file(object_path, executable_path)) {
+        return CompileResult(4);
+    }
+    return result;
+}
+
+public CompileResult compile_file_incremental_to_executable(UInt8[*] path, UInt8[*] object_path, UInt8[*] executable_path) {
+    CompileResult result = compile_file_incremental_to_object(path, object_path);
     if (!(result.status == 0)) {
         return result;
     }

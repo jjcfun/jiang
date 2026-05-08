@@ -156,9 +156,25 @@ run_executable_sample() {
   fi
 }
 
+run_incremental_executable_sample() {
+  local sample="$1"
+  local expected="$2"
+  local exe="$BUILD_DIR/${sample%.jiang}.incremental.out"
+  "$STAGE1_BIN" --incremental -o "$exe" "$SAMPLES_DIR/$sample"
+  set +e
+  "$exe"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "error: incremental executable sample $sample exited $status, expected $expected" >&2
+    exit 1
+  fi
+}
+
 run_sample minimal.jiang 42
 run_object_sample minimal.jiang 42
 run_executable_sample minimal.jiang 42
+run_incremental_executable_sample minimal.jiang 42
 run_imported_extern_symbol_sample
 run_sample locals_minimal.jiang 42
 run_sample assign_minimal.jiang 5
