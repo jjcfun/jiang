@@ -20,7 +20,7 @@
     - [x] `while` 生成 cond/body/end blocks。
     - [ ] `switch` 生成 case/default blocks。
     - [ ] `try` 生成 normal/catch/end blocks。
-  - [ ] call / field / index / cast / binary / aggregate init 生成 typed instruction。
+  - [x] call / field / index / cast / binary / aggregate init 生成 typed instruction。
   - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
 - [ ] 调整 call target 表示。
   - [ ] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
