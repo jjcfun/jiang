@@ -49,7 +49,7 @@
 
 - [ ] stage1 编译 `compiler/interner.jiang` 不崩溃。
 - [ ] stage1 能编译完整 compiler graph。
-- [ ] stage1 生成的 compiler 能通过 `build_stage1` / compiler tests。
+- [x] stage1 生成的 compiler 能通过 `build_stage1` / compiler tests。
 - [ ] self-compile 产物与当前 stage1 行为一致。
 - [ ] 清理临时兼容代码、调试输出和过渡 TODO。
 
