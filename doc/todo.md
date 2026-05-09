@@ -13,6 +13,8 @@
   - [x] 函数声明生成 CFG function + entry block。
   - [x] 直线语句和浅层表达式投影为 CFG instruction。
   - [x] codegen 支持最小 CFG literal return 闭环。
+  - [x] CFG 表达式 lowering 按依赖顺序输出 literal/binary instruction。
+  - [x] codegen 支持 CFG integer/bool binary return 闭环。
   - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
   - [ ] call / field / index / cast / binary / aggregate init 生成 typed instruction。
   - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
