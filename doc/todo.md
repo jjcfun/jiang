@@ -4,12 +4,14 @@
 
 ## 阶段 1：JIR 改为 CFG 形式
 
-- [ ] 定义 CFG JIR 数据结构。
-  - [ ] `JirFunction` 持有 `BasicBlock[]`。
-  - [ ] `BasicBlock` 持有线性 `Instruction[]` 和 `Terminator`。
-  - [ ] `Instruction` 使用 `ValueId` 作为 operand/result。
-  - [ ] `Terminator` 覆盖 `return` / `branch` / `cond_branch` / `switch` / `throw`。
+- [x] 定义 CFG JIR 数据结构。
+  - [x] `JirCfgFunction` 持有 `BasicBlock[]`。
+  - [x] `BasicBlock` 持有线性 `Instruction[]` 和 `Terminator`。
+  - [x] `Instruction` 使用 `ValueId` 作为 operand/result。
+  - [x] `Terminator` 覆盖 `return` / `branch` / `cond_branch` / `switch` / `throw`。
 - [ ] 将 tree JIR 的表达式/语句 lowering 改为 CFG lowering。
+  - [x] 函数声明生成 CFG function + entry block。
+  - [x] 直线语句和浅层表达式投影为 CFG instruction。
   - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
   - [ ] call / field / index / cast / binary / aggregate init 生成 typed instruction。
   - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
