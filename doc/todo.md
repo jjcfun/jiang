@@ -16,6 +16,10 @@
   - [x] CFG 表达式 lowering 按依赖顺序输出 literal/binary instruction。
   - [x] codegen 支持 CFG integer/bool binary return 闭环。
   - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
+    - [x] `if` statement 生成 `cond_branch` + then/else/merge blocks。
+    - [ ] `while` 生成 cond/body/end blocks。
+    - [ ] `switch` 生成 case/default blocks。
+    - [ ] `try` 生成 normal/catch/end blocks。
   - [ ] call / field / index / cast / binary / aggregate init 生成 typed instruction。
   - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
 - [ ] 调整 call target 表示。
