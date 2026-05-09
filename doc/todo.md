@@ -15,6 +15,7 @@
   - [x] codegen 支持最小 CFG literal return 闭环。
   - [x] CFG 表达式 lowering 按依赖顺序输出 literal/binary instruction。
   - [x] codegen 支持 CFG integer/bool binary return 闭环。
+  - [x] codegen 支持已验证 CFG blocks 的 branch / cond_branch / return 翻译。
   - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
     - [x] `if` statement 生成 `cond_branch` + then/else/merge blocks。
     - [x] `while` 生成 cond/body/end blocks。
