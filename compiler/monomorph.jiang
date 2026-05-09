@@ -1,0 +1,1915 @@
+import "./context.jiang";
+import ir = "./ir_common.jiang";
+import "./interner.jiang";
+import "./jir.jiang";
+import semantic_ctx = "./semantic.jiang";
+import "./scope.jiang";
+import types = "./type.jiang";
+import "./token.jiang";
+import arena = "./support/arena.jiang";
+import list = "./support/list.jiang";
+
+struct TypeSubst {
+    Int symbol_id;
+    types.TypeId type_id;
+
+    init(Int symbol_id, types.TypeId type_id) {
+        self.symbol_id = symbol_id;
+        self.type_id = type_id;
+    }
+}
+
+struct InstanceEntry {
+    semantic_ctx.ModuleId template_module_id;
+    semantic_ctx.ModuleId instance_module_id;
+    scope.DeclId decl_id;
+    Int arg_start;
+    Int arg_count;
+    jir.JirDeclId jir_decl_id;
+
+    init(semantic_ctx.ModuleId template_module_id, semantic_ctx.ModuleId instance_module_id, scope.DeclId decl_id, Int arg_start, Int arg_count, jir.JirDeclId jir_decl_id) {
+        self.template_module_id = template_module_id;
+        self.instance_module_id = instance_module_id;
+        self.decl_id = decl_id;
+        self.arg_start = arg_start;
+        self.arg_count = arg_count;
+        self.jir_decl_id = jir_decl_id;
+    }
+}
+
+struct MaterializedTypeEntry {
+    semantic_ctx.ModuleId module_id;
+    types.TypeId type_id;
+
+    init(semantic_ctx.ModuleId module_id, types.TypeId type_id) {
+        self.module_id = module_id;
+        self.type_id = type_id;
+    }
+}
+
+struct MonomorphContext {
+    context.CompilerContext& ctx;
+    Int![*] inputs;
+    Int input_count;
+    list.ArenaList<InstanceEntry> instances;
+    list.ArenaList<Int> instance_arg_type_ids;
+    list.ArenaList<Int> generic_template_expr_ids;
+    list.ArenaList<Int> active_expr_ids;
+    list.ArenaList<MaterializedTypeEntry> materialized_types;
+
+    init(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
+        self.ctx = ctx;
+        self.inputs = inputs;
+        self.input_count = input_count;
+        self.instances = list.ArenaList<InstanceEntry>(ctx.ast_store_ref());
+        self.instance_arg_type_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.generic_template_expr_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.active_expr_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.materialized_types = list.ArenaList<MaterializedTypeEntry>(ctx.ast_store_ref());
+    }
+
+    jir.JirModule^? module_for_id(semantic_ctx.ModuleId module_id) {
+        if (!module_id.valid()) { return null; }
+        Int! index = 0;
+        while (index < self.input_count) {
+            jir.JirModule^ module = self.inputs[index]$.as(jir.JirModule^);
+            if (module.module_id.id == module_id.id) {
+                return module;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool args_equal(InstanceEntry entry, jir.JirCallExpr^ call) {
+        if (entry.arg_count != call.generic_type_args.len()) { return false; }
+        Int! index = 0;
+        while (index < entry.arg_count) {
+            if (self.instance_arg_type_ids[entry.arg_start + index] != call.generic_type_args[index].id) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    jir.JirDeclId lookup_instance(semantic_ctx.ModuleId template_module_id, semantic_ctx.ModuleId instance_module_id, scope.DeclId decl_id, jir.JirCallExpr^ call) {
+        Int! index = 0;
+        while (index < self.instances.len()) {
+            InstanceEntry entry = self.instances[index];
+            if (entry.template_module_id.id == template_module_id.id && entry.instance_module_id.id == instance_module_id.id && entry.decl_id.id == decl_id.id && self.args_equal(entry, call)) {
+                return entry.jir_decl_id;
+            }
+            index = index + 1;
+        }
+        return jir.JirDeclId();
+    }
+
+    () record_instance(semantic_ctx.ModuleId template_module_id, semantic_ctx.ModuleId instance_module_id, scope.DeclId decl_id, jir.JirCallExpr^ call, jir.JirDeclId jir_decl_id) {
+        Int start = self.instance_arg_type_ids.len();
+        Int! index = 0;
+        while (index < call.generic_type_args.len()) {
+            self.instance_arg_type_ids.add(call.generic_type_args[index].id);
+            index = index + 1;
+        }
+        self.instances.add(InstanceEntry(template_module_id, instance_module_id, decl_id, start, call.generic_type_args.len(), jir_decl_id));
+    }
+
+    public Bool has_materialized_type(semantic_ctx.ModuleId module_id, types.TypeId type_id) {
+        if (!module_id.valid() || !type_id.valid()) { return false; }
+        Int! index = 0;
+        while (index < self.materialized_types.len()) {
+            MaterializedTypeEntry entry = self.materialized_types[index];
+            if (entry.module_id.id == module_id.id && entry.type_id.id == type_id.id) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public Bool record_materialized_type(semantic_ctx.ModuleId module_id, types.TypeId type_id) {
+        if (!module_id.valid() || !type_id.valid()) { return false; }
+        if (self.has_materialized_type(module_id, type_id)) { return false; }
+        self.materialized_types.add(MaterializedTypeEntry(module_id, type_id));
+        return true;
+    }
+}
+
+Int monomorph_expr_key(Int input_index, jir.JirExprId expr_id) {
+    return input_index * 1000000 + expr_id.id;
+}
+
+Bool monomorph_expr_marked(list.ArenaList<Int> items, Int key) {
+    Int! index = 0;
+    while (index < items.len()) {
+        if (items[index] == key) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+() monomorph_add_expr_key(list.ArenaList<Int>^ items, Int key) {
+    if (monomorph_expr_marked(items, key)) { return; }
+    items.add(key);
+}
+
+Int monomorph_key_input_index(Int key) {
+    return key / 1000000;
+}
+
+jir.JirExprId monomorph_key_expr_id(Int key) {
+    return jir.JirExprId(key % 1000000);
+}
+
+jir.JirModule^? monomorph_module_for_id(MonomorphContext^ mono, semantic_ctx.ModuleId module_id) {
+    if (!module_id.valid()) { return null; }
+    Int! index = 0;
+    while (index < mono.input_count) {
+        jir.JirModule^ module = mono.inputs[index]$.as(jir.JirModule^);
+        if (module.module_id.id == module_id.id) {
+            return module;
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+Bool monomorph_args_equal(MonomorphContext^ mono, InstanceEntry entry, jir.JirCallExpr^ call) {
+    if (entry.arg_count != call.generic_type_args.len()) { return false; }
+    Int! index = 0;
+    while (index < entry.arg_count) {
+        if (mono.instance_arg_type_ids[entry.arg_start + index] != call.generic_type_args[index].id) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+struct CloneState {
+    context.CompilerContext& ctx;
+    jir.JirModule& source;
+    jir.JirModule& target;
+    list.ArenaList<TypeSubst> substs;
+    list.ArenaList<Int> old_expr_ids;
+    list.ArenaList<Int> new_expr_ids;
+    list.ArenaList<Int> old_stmt_ids;
+    list.ArenaList<Int> new_stmt_ids;
+
+    init(context.CompilerContext& ctx, jir.JirModule& source, jir.JirModule& target) {
+        self.ctx = ctx;
+        self.source = source;
+        self.target = target;
+        self.substs = list.ArenaList<TypeSubst>(ctx.ast_store_ref());
+        self.old_expr_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.new_expr_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.old_stmt_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.new_stmt_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+    }
+
+    public () add_subst(Int symbol_id, types.TypeId type_id) {
+        if (symbol_id <= 0 || !type_id.valid()) { return; }
+        self.substs.add(TypeSubst(symbol_id, type_id));
+    }
+
+    public types.TypeId lookup_subst(Int symbol_id) {
+        Int! index = self.substs.len() - 1;
+        while (index >= 0) {
+            TypeSubst subst = self.substs[index];
+            if (subst.symbol_id == symbol_id) { return subst.type_id; }
+            index = index - 1;
+        }
+        return types.TypeId();
+    }
+
+    public types.TypeId subst_type(types.TypeId type_id) {
+        return self.subst_type_depth(type_id, 0);
+    }
+
+    public types.TypeId subst_type_depth(types.TypeId type_id, Int depth) {
+        if (!type_id.valid()) { return type_id; }
+        if (depth > 8) { return type_id; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(type_id);
+        if (info.kind == .type_param) {
+            types.TypeId substituted = self.lookup_subst(info.symbol.id);
+            if (substituted.valid()) { return substituted; }
+            return type_id;
+        }
+        if (info.kind == .pointer) {
+            types.TypeId element = self.subst_type_depth(info.element, depth + 1);
+            if (element.id != info.element.id) { return table.make_pointer_kind(info.span, element, info.pointer_kind, info.mutable_item, info.many); }
+            return type_id;
+        }
+        if (info.kind == .slice) {
+            types.TypeId element = self.subst_type_depth(info.element, depth + 1);
+            if (element.id != info.element.id) { return table.make_slice(info.span, element); }
+            return type_id;
+        }
+        if (info.kind == .array) {
+            types.TypeId element = self.subst_type_depth(info.element, depth + 1);
+            if (element.id != info.element.id) { return table.make_array(info.span, element, info.inferred_count, info.child_count); }
+            return type_id;
+        }
+        if (info.kind == .layer) {
+            types.TypeId element = self.subst_type_depth(info.element, depth + 1);
+            if (element.id != info.element.id) { return table.make_layer(info.span, element, info.optional, info.mutable); }
+            return type_id;
+        }
+        if (info.kind == .errorable) {
+            types.TypeId value = self.subst_type_depth(info.element, depth + 1);
+            types.TypeId error = self.subst_type_depth(info.other, depth + 1);
+            if (value.id != info.element.id || error.id != info.other.id) { return table.make_errorable(info.span, value, error); }
+            return type_id;
+        }
+        if (info.kind == .nominal && info.child_count > 0) {
+            Bool! changed = false;
+            list.ArenaList<types.TypeId>! lowered_children = list.ArenaList<types.TypeId>(self.ctx.ast_store_ref());
+            Int! index = 0;
+            while (index < info.child_count) {
+                types.TypeId child = table.child_at(info.child_start + index);
+                types.TypeId lowered_child = self.subst_type_depth(child, depth + 1);
+                if (lowered_child.id != child.id) { changed = true; }
+                lowered_children.add(lowered_child);
+                index = index + 1;
+            }
+            Int child_start = table.begin_children();
+            index = 0;
+            while (index < lowered_children.len()) {
+                table.add_child(lowered_children[index]);
+                index = index + 1;
+            }
+            if (changed) { return table.make_nominal_decl_with_args(info.span, info.symbol, info.binding_id, info.decl_id, info.nominal_kind, child_start, info.child_count); }
+            return type_id;
+        }
+        if ((info.kind == .tuple || info.kind == .function) && info.child_count > 0) {
+            Bool! changed = false;
+            list.ArenaList<types.TypeId>! lowered_children = list.ArenaList<types.TypeId>(self.ctx.ast_store_ref());
+            Int! index = 0;
+            while (index < info.child_count) {
+                types.TypeId child = table.child_at(info.child_start + index);
+                types.TypeId lowered_child = self.subst_type_depth(child, depth + 1);
+                if (lowered_child.id != child.id) { changed = true; }
+                lowered_children.add(lowered_child);
+                index = index + 1;
+            }
+            Int child_start = table.begin_children();
+            index = 0;
+            while (index < lowered_children.len()) {
+                table.add_child(lowered_children[index]);
+                index = index + 1;
+            }
+            if (changed) { return table.make_compound(info.kind, info.span, child_start, info.child_count); }
+            return type_id;
+        }
+        return type_id;
+    }
+
+    public jir.JirExprId lookup_expr(jir.JirExprId old_id) {
+        Int! index = 0;
+        while (index < self.old_expr_ids.len()) {
+            if (self.old_expr_ids[index] == old_id.id) {
+                return jir.JirExprId(self.new_expr_ids[index]);
+            }
+            index = index + 1;
+        }
+        return jir.JirExprId();
+    }
+
+    public jir.JirStmtId lookup_stmt(jir.JirStmtId old_id) {
+        Int! index = 0;
+        while (index < self.old_stmt_ids.len()) {
+            if (self.old_stmt_ids[index] == old_id.id) {
+                return jir.JirStmtId(self.new_stmt_ids[index]);
+            }
+            index = index + 1;
+        }
+        return jir.JirStmtId();
+    }
+
+    public jir.JirExprId clone_expr_id(jir.JirExprId old_id) {
+        if (!old_id.valid()) { return jir.JirExprId(); }
+        jir.JirExprId existing = self.lookup_expr(old_id);
+        if (existing.valid()) { return existing; }
+        jir.JirExpr& old_expr = self.source.expr_ref_at(old_id);
+        jir.JirExprId new_id = self.target.add_unsupported_expr(old_expr.span, self.subst_type(old_expr.type_id));
+        self.old_expr_ids.add(old_id.id);
+        self.new_expr_ids.add(new_id.id);
+        return new_id;
+    }
+
+    public () clone_pending_exprs() {
+        Int! index = 0;
+        while (index < self.old_expr_ids.len()) {
+            jir.JirExprId old_id = jir.JirExprId(self.old_expr_ids[index]);
+            jir.JirExprId new_id = jir.JirExprId(self.new_expr_ids[index]);
+            jir.JirExpr& new_expr = self.target.expr_ref_at(new_id);
+            if (new_expr.body is .unsupported_expr(span)) {
+                jir.JirExpr& old_expr = self.source.expr_ref_at(old_id);
+                self.clone_expr_body(new_id, old_expr);
+            }
+            index = index + 1;
+        }
+    }
+
+    public jir.JirStmtId clone_stmt_id(jir.JirStmtId old_id) {
+        if (!old_id.valid()) { return jir.JirStmtId(); }
+        jir.JirStmtId existing = self.lookup_stmt(old_id);
+        if (existing.valid()) { return existing; }
+        jir.JirStmt& old_stmt = self.source.stmt_ref_at(old_id);
+        jir.JirStmtId new_id = self.target.add_unsupported_stmt(old_stmt.span);
+        self.old_stmt_ids.add(old_id.id);
+        self.new_stmt_ids.add(new_id.id);
+        self.clone_stmt_body(new_id, old_stmt);
+        return new_id;
+    }
+
+    public jir.JirBlock clone_block(jir.JirBlock block) {
+        jir.JirBlock! result = jir.JirBlock(self.target.store, block.span);
+        Int! index = 0;
+        while (index < block.stmts.len()) {
+            result.stmts.add(self.clone_stmt_id(block.stmts[index]));
+            index = index + 1;
+        }
+        result.value = self.clone_expr_id(block.value);
+        return result;
+    }
+
+    public jir.JirParam clone_param(jir.JirParam param) {
+        return jir.JirParam(param.span, param.name, param.local_id, self.subst_type(param.type_id), param.mutable_binding);
+    }
+
+    public jir.JirFieldDecl clone_field(jir.JirFieldDecl field) {
+        return jir.JirFieldDecl(field.span, field.name, self.subst_type(field.type_id), self.clone_expr_id(field.default_value));
+    }
+
+    public jir.JirInitDecl clone_init(jir.JirInitDecl decl) {
+        jir.JirInitDecl! result = jir.JirInitDecl(self.target.store, decl.span, decl.name, decl.self_local_id, self.subst_type(decl.self_type_id), self.clone_block(decl.body), decl.failable);
+        Int! index = 0;
+        while (index < decl.params.len()) {
+            result.params.add(self.clone_param(decl.params[index]));
+            index = index + 1;
+        }
+        return result;
+    }
+
+    public jir.JirTypeDecl clone_type_decl(jir.JirTypeDecl decl, types.TypeId concrete_type_id) {
+        jir.JirTypeDecl! result = jir.JirTypeDecl(self.target.store, decl.span, decl.name, decl.binding_id, concrete_type_id, decl.kind, decl.public_flag);
+        Int! index = 0;
+        while (index < decl.fields.len()) {
+            result.fields.add(self.clone_field(decl.fields[index]));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < decl.inits.len()) {
+            result.inits.add(self.clone_init(decl.inits[index]));
+            index = index + 1;
+        }
+        if (decl.deinit_decl is some deinit_decl) {
+            result.deinit_decl = self.clone_init(deinit_decl);
+        }
+        index = 0;
+        while (index < decl.members.len()) {
+            result.members.add(decl.members[index]);
+            index = index + 1;
+        }
+        index = 0;
+        while (index < decl.variants.len()) {
+            jir.JirUnionVariantDecl variant = decl.variants[index];
+            result.variants.add(jir.JirUnionVariantDecl(variant.span, variant.name, self.subst_type(variant.type_id)));
+            index = index + 1;
+        }
+        self.clone_pending_exprs();
+        return result;
+    }
+
+    public jir.JirFunctionDecl clone_function(jir.JirFunctionDecl decl, interner.Symbol instance_symbol) {
+        types.TypeId cloned_type_id = self.subst_type(decl.type_id);
+        types.TypeId cloned_result_type = self.subst_type(decl.result_type);
+        jir.JirFunctionDecl! result = jir.JirFunctionDecl(self.target.store, decl.span, ir.Name(decl.name.span, instance_symbol), scope.BindingId(), cloned_type_id, cloned_result_type, decl.public_flag, decl.extern_flag, decl.static_flag);
+        result.decl_id = decl.decl_id;
+        Int! index = 0;
+        while (index < decl.params.len()) {
+            result.params.add(self.clone_param(decl.params[index]));
+            index = index + 1;
+        }
+        if (decl.body is some body) {
+            result.body = self.clone_block(body);
+            self.clone_pending_exprs();
+        }
+        return result;
+    }
+
+    public jir.JirStmtBody clone_stmt_simple(jir.JirStmt stmt) {
+        if (stmt.body is .local(local)) {
+            return .local(jir.JirLocalStmt(local.span, local.name, local.local_id, self.subst_type(local.type_id), self.clone_expr_id(local.initializer), local.mutable_binding));
+        }
+        if (stmt.body is .temp_local(temp_local)) {
+            return .temp_local(jir.JirTempLocalStmt(temp_local.span, temp_local.temp_id, self.subst_type(temp_local.type_id)));
+        }
+        return self.clone_stmt_simple_value(stmt);
+    }
+
+    public jir.JirStmtBody clone_stmt_simple_value(jir.JirStmt stmt) {
+        if (stmt.body is .assign(assign)) {
+            return .assign(jir.JirAssignStmt(assign.span, self.clone_expr_id(assign.target), self.clone_expr_id(assign.value)));
+        }
+        if (stmt.body is .return_stmt(ret)) {
+            return .return_stmt(jir.JirReturnStmt(ret.span, self.clone_expr_id(ret.value)));
+        }
+        if (stmt.body is .throw_stmt(expr)) {
+            return .throw_stmt(jir.JirExprStmt(expr.span, self.clone_expr_id(expr.value)));
+        }
+        if (stmt.body is .expr(expr)) {
+            return .expr(jir.JirExprStmt(expr.span, self.clone_expr_id(expr.value)));
+        }
+        return self.clone_stmt_simple_leaf(stmt);
+    }
+
+    public jir.JirStmtBody clone_stmt_simple_leaf(jir.JirStmt stmt) {
+        if (stmt.body is .break_stmt(span)) { return .break_stmt(span); }
+        if (stmt.body is .continue_stmt(span)) { return .continue_stmt(span); }
+        return self.clone_stmt_control(stmt);
+    }
+
+    public jir.JirStmtBody clone_stmt_control(jir.JirStmt stmt) {
+        if (stmt.body is .if_stmt(if_stmt)) {
+            jir.JirIfStmt^ cloned = new jir.JirIfStmt(if_stmt.span, self.clone_expr_id(if_stmt.cond), self.clone_block(if_stmt.then_block));
+            if (if_stmt.else_block is some else_block) { cloned.else_block = self.clone_block(else_block); }
+            return .if_stmt(cloned);
+        }
+        if (stmt.body is .while_stmt(while_stmt)) {
+            jir.JirWhileStmt^ cloned = new jir.JirWhileStmt(self.target.store, while_stmt.span, self.clone_expr_id(while_stmt.cond), self.clone_block(while_stmt.body));
+            cloned.cond_block = self.clone_block(while_stmt.cond_block);
+            return .while_stmt(cloned);
+        }
+        if (stmt.body is .block(block_stmt)) {
+            return .block(new jir.JirBlockStmt(self.clone_block(block_stmt.block)));
+        }
+        if (stmt.body is .run_defer(run_defer)) {
+            return .run_defer(new jir.JirRunDeferStmt(run_defer.span, self.clone_block(run_defer.body)));
+        }
+        return self.clone_stmt_try_loop(stmt);
+    }
+
+    public jir.JirStmtBody clone_stmt_try_loop(jir.JirStmt stmt) {
+        if (stmt.body is .try_stmt(try_stmt)) {
+            jir.JirTryStmt^ cloned = new jir.JirTryStmt(self.target.store, try_stmt.span, self.clone_block(try_stmt.body));
+            Int! index = 0;
+            while (index < try_stmt.catches.len()) {
+                jir.JirCatchStmt item = try_stmt.catches[index];
+                cloned.catches.add(jir.JirCatchStmt(item.span, item.binding, item.local_id, self.subst_type(item.type_id), item.mutable_binding, self.clone_block(item.body)));
+                index = index + 1;
+            }
+            return .try_stmt(cloned);
+        }
+        if (stmt.body is .while_stmt(while_stmt)) {
+            jir.JirWhileStmt^ cloned = new jir.JirWhileStmt(self.target.store, while_stmt.span, self.clone_expr_id(while_stmt.cond), self.clone_block(while_stmt.body));
+            cloned.cond_block = self.clone_block(while_stmt.cond_block);
+            return .while_stmt(cloned);
+        }
+        if (stmt.body is .for_range(for_range)) {
+            return .for_range(new jir.JirForRangeStmt(for_range.span, for_range.name, for_range.local_id, self.subst_type(for_range.type_id), self.clone_expr_id(for_range.start), self.clone_expr_id(for_range.end_expr), self.clone_block(for_range.body)));
+        }
+        if (stmt.body is .for_each(for_each)) {
+            jir.JirForEachStmt^ cloned = new jir.JirForEachStmt(self.target.store, for_each.span, self.clone_expr_id(for_each.iterable), self.clone_block(for_each.body), for_each.indexed_flag);
+            self.clone_pattern_tests(for_each.tests, cloned.tests$.ptr());
+            self.clone_pattern_binds(for_each.binds, cloned.binds$.ptr());
+            return .for_each(cloned);
+        }
+        return self.clone_stmt_pattern(stmt);
+    }
+
+    public jir.JirStmtBody clone_stmt_pattern(jir.JirStmt stmt) {
+        if (stmt.body is .switch_stmt(switch_stmt)) {
+            jir.JirSwitchStmt^ cloned = new jir.JirSwitchStmt(self.target.store, switch_stmt.span, self.clone_expr_id(switch_stmt.value));
+            Int! index = 0;
+            while (index < switch_stmt.cases.len()) {
+                jir.JirSwitchCase item = switch_stmt.cases[index];
+                jir.JirSwitchCase! cloned_case = jir.JirSwitchCase(self.target.store, item.span, self.clone_block(item.body));
+                self.clone_pattern_tests(item.tests, cloned_case.tests$.ptr());
+                cloned.cases.add(cloned_case);
+                index = index + 1;
+            }
+            return .switch_stmt(cloned);
+        }
+        if (stmt.body is .pattern_bind(pattern_bind)) {
+            jir.JirPatternBindStmt^ cloned = new jir.JirPatternBindStmt(self.target.store, pattern_bind.span);
+            self.clone_pattern_binds(pattern_bind.binds, cloned.binds$.ptr());
+            return .pattern_bind(cloned);
+        }
+        if (stmt.body is .coalesce_control_local(local)) {
+            jir.JirCoalesceControlLocalStmt^ cloned = new jir.JirCoalesceControlLocalStmt(self.target.store, local.span, local.name, local.local_id, self.subst_type(local.type_id), self.clone_expr_id(local.left), local.control, self.clone_expr_id(local.result), local.mutable_binding);
+            cloned.left_block = self.clone_block(local.left_block);
+            cloned.result_block = self.clone_block(local.result_block);
+            return .coalesce_control_local(cloned);
+        }
+        return .unsupported(stmt.span);
+    }
+
+    public Bool clone_stmt_body_local(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .local(local)) {
+            jir.JirExprId initializer = self.clone_expr_id(local.initializer);
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .local(jir.JirLocalStmt(local.span, local.name, local.local_id, self.subst_type(local.type_id), initializer, local.mutable_binding));
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_temp_local(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .temp_local(temp_local)) {
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .temp_local(jir.JirTempLocalStmt(temp_local.span, temp_local.temp_id, self.subst_type(temp_local.type_id)));
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_assign(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .assign(assign)) {
+            jir.JirExprId target = self.clone_expr_id(assign.target);
+            jir.JirExprId value = self.clone_expr_id(assign.value);
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .assign(jir.JirAssignStmt(assign.span, target, value));
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_return(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .return_stmt(ret)) {
+            jir.JirExprId value = self.clone_expr_id(ret.value);
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .return_stmt(jir.JirReturnStmt(ret.span, value));
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_throw(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .throw_stmt(expr)) {
+            jir.JirExprId value = self.clone_expr_id(expr.value);
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .throw_stmt(jir.JirExprStmt(expr.span, value));
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_expr(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .expr(expr)) {
+            jir.JirExprId value = self.clone_expr_id(expr.value);
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .expr(jir.JirExprStmt(expr.span, value));
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_break_continue(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .break_stmt(span)) {
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .break_stmt(span);
+            return true;
+        }
+        if (stmt.body is .continue_stmt(span)) {
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .continue_stmt(span);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_stmt_body_if(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (stmt.body is .if_stmt(if_stmt)) {
+            jir.JirExprId cond = self.clone_expr_id(if_stmt.cond);
+            jir.JirBlock then_block = self.clone_block(if_stmt.then_block);
+            jir.JirIfStmt^ cloned = new jir.JirIfStmt(if_stmt.span, cond, then_block);
+            if (if_stmt.else_block is some else_block) { cloned.else_block = self.clone_block(else_block); }
+            jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+            slot.body = .if_stmt(cloned);
+            return true;
+        }
+        return false;
+    }
+
+    public () clone_stmt_body(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        if (self.clone_stmt_body_local(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_temp_local(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_assign(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_return(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_throw(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_expr(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_break_continue(new_id, stmt)) { return; }
+        if (self.clone_stmt_body_if(new_id, stmt)) { return; }
+        self.clone_stmt_body_fallback(new_id, stmt);
+    }
+
+    public () clone_stmt_body_fallback(jir.JirStmtId new_id, jir.JirStmt& stmt) {
+        jir.JirStmtBody new_body = self.clone_stmt_simple(stmt);
+        jir.JirStmt& slot = self.target.stmt_ref_at(new_id);
+        slot.body = new_body;
+    }
+
+    public () clone_pattern_tests(list.ArenaList<jir.JirPatternTest> input, list.ArenaList<jir.JirPatternTest>^ output) {
+        Int! index = 0;
+        while (index < input.len()) {
+            jir.JirPatternTest test = input[index];
+            output.add(jir.JirPatternTest(test.span, self.clone_expr_id(test.value), test.kind, test.literal, test.path, test.type_decl_id, test.variant_index));
+            index = index + 1;
+        }
+    }
+
+    public () clone_pattern_binds(list.ArenaList<jir.JirPatternBind> input, list.ArenaList<jir.JirPatternBind>^ output) {
+        Int! index = 0;
+        while (index < input.len()) {
+            jir.JirPatternBind bind = input[index];
+            output.add(jir.JirPatternBind(bind.span, self.clone_expr_id(bind.value), bind.local_id, self.subst_type(bind.type_id), bind.mutable_binding, bind.extract_union_payload, bind.extract_optional_payload, bind.tuple_index));
+            index = index + 1;
+        }
+    }
+
+    public jir.JirExprBody clone_call_body(jir.JirCallExpr^ call) {
+        jir.JirCallExpr^ cloned = new jir.JirCallExpr(self.target.store, self.clone_expr_id(call.callee), call.target_decl_id, call.target_kind_id);
+        cloned.set_target_overload_index(call.target_overload_index);
+        Int! index = 0;
+        while (index < call.args.len()) {
+            cloned.args.add(self.clone_expr_id(call.args[index]));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < call.generic_type_args.len()) {
+            cloned.add_generic_type_arg(self.subst_type(call.generic_type_args[index]));
+            index = index + 1;
+        }
+        cloned.set_method_target(self.subst_type(call.method_receiver_type_id), call.method_symbol);
+        return .call_expr(cloned);
+    }
+
+    public jir.JirExprBody clone_struct_body(jir.JirStructExpr^ struct_expr) {
+        jir.JirStructExpr^ cloned = new jir.JirStructExpr(self.target.store, struct_expr.path, struct_expr.init_index);
+        cloned.type_decl_id = struct_expr.type_decl_id;
+        Int! index = 0;
+        while (index < struct_expr.fields.len()) {
+            jir.JirStructFieldInit field = struct_expr.fields[index];
+            cloned.fields.add(jir.JirStructFieldInit(field.span, field.name, self.clone_expr_id(field.value), field.field_index));
+            index = index + 1;
+        }
+        return .struct_expr(cloned);
+    }
+
+    public jir.JirExprBody clone_variant_body(jir.JirVariantExpr^ variant) {
+        jir.JirVariantExpr^ cloned = new jir.JirVariantExpr(self.target.store, variant.path);
+        cloned.type_decl_id = variant.type_decl_id;
+        cloned.variant_index = variant.variant_index;
+        Int! index = 0;
+        while (index < variant.payload.len()) {
+            cloned.payload.add(self.clone_expr_id(variant.payload[index]));
+            index = index + 1;
+        }
+        return .variant_expr(cloned);
+    }
+
+    public jir.JirExprBody clone_tuple_body(jir.JirSequenceExpr^ tuple) {
+        jir.JirSequenceExpr^ cloned = new jir.JirSequenceExpr(self.target.store);
+        self.clone_expr_list(tuple.items, cloned.items$.ptr());
+        return .tuple_expr(cloned);
+    }
+
+    public jir.JirExprBody clone_array_body(jir.JirSequenceExpr^ array) {
+        jir.JirSequenceExpr^ cloned = new jir.JirSequenceExpr(self.target.store);
+        self.clone_expr_list(array.items, cloned.items$.ptr());
+        return .array_expr(cloned);
+    }
+
+    public jir.JirExprBody clone_is_pattern_body(jir.JirIsExpr^ is_expr) {
+        jir.JirIsExpr^ cloned = new jir.JirIsExpr(self.target.store, self.clone_expr_id(is_expr.value));
+        self.clone_pattern_tests(is_expr.tests, cloned.tests$.ptr());
+        return .is_pattern_expr(cloned);
+    }
+
+    public jir.JirExprBody clone_optional_some_body(jir.JirOptionalIsSomeExpr^ optional_some) {
+        jir.JirOptionalIsSomeExpr^ cloned = new jir.JirOptionalIsSomeExpr(self.target.store, self.clone_expr_id(optional_some.value));
+        self.clone_pattern_tests(optional_some.tests, cloned.tests$.ptr());
+        return .optional_some_expr(cloned);
+    }
+
+    public () set_expr_body(jir.JirExprId new_id, jir.JirExprBody body) {
+        jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+        slot.body = body;
+    }
+
+    public () clone_call_into(jir.JirExprId new_id, jir.JirCallExpr^ call) {
+        jir.JirExprId callee = self.clone_expr_id(call.callee);
+        list.ArenaList<jir.JirExprId>! args = list.ArenaList<jir.JirExprId>(self.target.store);
+        Int! index = 0;
+        while (index < call.args.len()) {
+            args.add(self.clone_expr_id(call.args[index]));
+            index = index + 1;
+        }
+        jir.JirCallExpr^ cloned = new jir.JirCallExpr(self.target.store, callee, call.target_decl_id, call.target_kind_id);
+        cloned.set_target_overload_index(call.target_overload_index);
+        index = 0;
+        while (index < args.len()) {
+            cloned.args.add(args[index]);
+            index = index + 1;
+        }
+        index = 0;
+        while (index < call.generic_type_args.len()) {
+            cloned.add_generic_type_arg(self.subst_type(call.generic_type_args[index]));
+            index = index + 1;
+        }
+        cloned.set_method_target(self.subst_type(call.method_receiver_type_id), call.method_symbol);
+        jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+        slot.body = .call_expr(cloned);
+    }
+
+    public () clone_binary_into(jir.JirExprId new_id, jir.JirBinaryExpr binary) {
+        jir.JirExprId left = self.clone_expr_id(binary.left);
+        jir.JirExprId right = self.clone_expr_id(binary.right);
+        jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+        slot.body = .binary_expr(jir.JirBinaryExpr(binary.op, left, right));
+    }
+
+    public Bool clone_expr_body_call(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .call_expr(call)) {
+            self.clone_call_into(new_id, call);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_expr_body_binary_direct(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .binary_expr(binary)) {
+            self.clone_binary_into(new_id, binary);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_expr_body_field(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .field_expr(field)) {
+            jir.JirExprId base = self.clone_expr_id(field.base);
+            jir.JirFieldExpr^ boxed_field = self.target.store.alloc_one<jir.JirFieldExpr>();
+            boxed_field.base = base;
+            boxed_field.name = field.name;
+            boxed_field.optional_chain = field.optional_chain;
+            boxed_field.implicit_member = field.implicit_member;
+            boxed_field.place_projection = field.place_projection;
+            boxed_field.field_index = field.field_index;
+            boxed_field.field_type_optional = field.field_type_optional;
+            boxed_field.type_decl_id = field.type_decl_id;
+            boxed_field.variant_index = field.variant_index;
+            jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+            slot.body = .field_expr(boxed_field);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_expr_body_name_direct(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .name_expr(name)) {
+            jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+            slot.body = .name_expr(name);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_expr_body_literal_direct(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .literal_expr(literal)) {
+            jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+            slot.body = .literal_expr(literal);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_expr_body_temp_direct(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .temp_expr(temp)) {
+            jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+            slot.body = .temp_expr(temp);
+            return true;
+        }
+        return false;
+    }
+
+    public Bool clone_expr_body_self_direct(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .self_expr(span)) {
+            jir.JirExpr& slot = self.target.expr_ref_at(new_id);
+            slot.body = .self_expr(span);
+            return true;
+        }
+        return false;
+    }
+
+    public () clone_expr_body_access(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .call_expr(call)) {
+            self.set_expr_body(new_id, self.clone_call_body(call));
+            return;
+        }
+        if (expr.body is .field_expr(field)) {
+            self.set_expr_body(new_id, .field_expr(new jir.JirFieldExpr(self.clone_expr_id(field.base), field.name, field.optional_chain, field.implicit_member, field.place_projection, field.field_index, field.field_type_optional, field.type_decl_id, field.variant_index)));
+            return;
+        }
+        if (expr.body is .index_expr(index_expr)) {
+            if (index_expr.has_static_index) {
+                self.set_expr_body(new_id, .index_expr(jir.JirIndexExpr(self.clone_expr_id(index_expr.base), self.clone_expr_id(index_expr.index), index_expr.optional_chain, index_expr.static_index)));
+                return;
+            }
+            self.set_expr_body(new_id, .index_expr(jir.JirIndexExpr(self.clone_expr_id(index_expr.base), self.clone_expr_id(index_expr.index), index_expr.optional_chain)));
+            return;
+        }
+        if (expr.body is .slice_expr(slice_expr)) {
+            self.set_expr_body(new_id, .slice_expr(jir.JirSliceExpr(self.clone_expr_id(slice_expr.base), self.clone_expr_id(slice_expr.start), self.clone_expr_id(slice_expr.end_expr))));
+            return;
+        }
+        self.clone_expr_body_aggregate(new_id, expr); return;
+    }
+
+    public () clone_expr_body_aggregate(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .struct_expr(struct_expr)) {
+            self.set_expr_body(new_id, self.clone_struct_body(struct_expr));
+            return;
+        }
+        if (expr.body is .variant_expr(variant)) {
+            self.set_expr_body(new_id, self.clone_variant_body(variant));
+            return;
+        }
+        if (expr.body is .tuple_expr(tuple)) {
+            self.set_expr_body(new_id, self.clone_tuple_body(tuple));
+            return;
+        }
+        if (expr.body is .array_expr(array)) {
+            self.set_expr_body(new_id, self.clone_array_body(array));
+            return;
+        }
+        if (expr.body is .is_pattern_expr(is_expr)) {
+            self.set_expr_body(new_id, self.clone_is_pattern_body(is_expr));
+            return;
+        }
+        if (expr.body is .optional_some_expr(optional_some)) {
+            self.set_expr_body(new_id, self.clone_optional_some_body(optional_some));
+            return;
+        }
+        self.set_expr_body(new_id, .unsupported_expr(expr.span));
+    }
+
+    public () clone_expr_body_primitive_a(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .literal_expr(literal)) { self.set_expr_body(new_id, .literal_expr(literal)); return; }
+        self.clone_expr_body_name(new_id, expr); return;
+    }
+
+    public () clone_expr_body_name(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .name_expr(name)) { self.set_expr_body(new_id, .name_expr(name)); return; }
+        self.clone_expr_body_temp(new_id, expr); return;
+    }
+
+    public () clone_expr_body_temp(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .temp_expr(temp)) { self.set_expr_body(new_id, .temp_expr(temp)); return; }
+        self.clone_expr_body_self(new_id, expr); return;
+    }
+
+    public () clone_expr_body_self(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .self_expr(span)) { self.set_expr_body(new_id, .self_expr(span)); return; }
+        self.clone_expr_body_implicit(new_id, expr); return;
+    }
+
+    public () clone_expr_body_implicit(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .implicit_expr(span)) { self.set_expr_body(new_id, .implicit_expr(span)); return; }
+        self.clone_expr_body_primitive_b(new_id, expr); return;
+    }
+
+    public () clone_expr_body_primitive_b(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .type_value_expr(type_expr)) { self.set_expr_body(new_id, .type_value_expr(jir.JirTypeExpr(self.subst_type(type_expr.type_id)))); return; }
+        self.clone_expr_body_sizeof(new_id, expr); return;
+    }
+
+    public () clone_expr_body_sizeof(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .size_of_type_expr(type_expr)) { self.set_expr_body(new_id, .size_of_type_expr(jir.JirTypeExpr(self.subst_type(type_expr.type_id)))); return; }
+        self.clone_expr_body_alignof(new_id, expr); return;
+    }
+
+    public () clone_expr_body_alignof(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .align_of_type_expr(type_expr)) { self.set_expr_body(new_id, .align_of_type_expr(jir.JirTypeExpr(self.subst_type(type_expr.type_id)))); return; }
+        self.clone_expr_body_max_alignof(new_id, expr); return;
+    }
+
+    public () clone_expr_body_max_alignof(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .max_align_of_type_expr(type_expr)) { self.set_expr_body(new_id, .max_align_of_type_expr(jir.JirTypeExpr(self.subst_type(type_expr.type_id)))); return; }
+        self.clone_expr_body_cast(new_id, expr); return;
+    }
+
+    public () clone_expr_body_cast(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .cast_expr(cast)) { self.set_expr_body(new_id, .cast_expr(jir.JirCastExpr(self.clone_expr_id(cast.value), self.subst_type(cast.target_type_id)))); return; }
+        self.clone_expr_body_unary(new_id, expr); return;
+    }
+
+    public () clone_expr_body_unary(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .unary_expr(unary)) { self.set_expr_body(new_id, .unary_expr(jir.JirUnaryExpr(unary.op, self.clone_expr_id(unary.value)))); return; }
+        self.clone_expr_body_binary(new_id, expr); return;
+    }
+
+    public () clone_expr_body_binary(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (expr.body is .binary_expr(binary)) { self.set_expr_body(new_id, .binary_expr(jir.JirBinaryExpr(binary.op, self.clone_expr_id(binary.left), self.clone_expr_id(binary.right)))); return; }
+        self.clone_expr_body_access(new_id, expr); return;
+    }
+
+    public () clone_expr_body(jir.JirExprId new_id, jir.JirExpr& expr) {
+        if (self.clone_expr_body_call(new_id, expr)) { return; }
+        if (self.clone_expr_body_binary_direct(new_id, expr)) { return; }
+        if (self.clone_expr_body_field(new_id, expr)) { return; }
+        if (self.clone_expr_body_name_direct(new_id, expr)) { return; }
+        if (self.clone_expr_body_literal_direct(new_id, expr)) { return; }
+        if (self.clone_expr_body_temp_direct(new_id, expr)) { return; }
+        if (self.clone_expr_body_self_direct(new_id, expr)) { return; }
+        self.clone_expr_body_primitive_a(new_id, expr); return;
+    }
+
+    public () clone_expr_list(list.ArenaList<jir.JirExprId> input, list.ArenaList<jir.JirExprId>^ output) {
+        Int! index = 0;
+        while (index < input.len()) {
+            output.add(self.clone_expr_id(input[index]));
+            index = index + 1;
+        }
+    }
+}
+
+Int decimal_length(Int value) {
+    if (value <= 0) { return 1; }
+    Int! current = value;
+    Int! length = 0;
+    while (current > 0) {
+        current = current / 10;
+        length = length + 1;
+    }
+    return length;
+}
+
+() write_decimal(UInt8![*] out, Int start, Int value) {
+    Int! divisor = 1;
+    while (value / divisor >= 10) {
+        divisor = divisor * 10;
+    }
+    Int! index = start;
+    Int! current = value;
+    while (divisor > 0) {
+        out[index] = UInt8('0' + current / divisor);
+        current = current % divisor;
+        divisor = divisor / 10;
+        index = index + 1;
+    }
+}
+
+interner.Symbol instance_function_symbol(context.CompilerContext& ctx, interner.Symbol base_symbol, scope.DeclId decl_id, list.ArenaList<types.TypeId> args) {
+    UInt8[*] base = ctx.symbol_c_string(base_symbol);
+    Int base_len = ctx.symbol_len(base_symbol);
+    Int! suffix_len = 5 + decimal_length(decl_id.id);
+    Int! index = 0;
+    while (index < args.len()) {
+        suffix_len = suffix_len + 2 + decimal_length(args[index].id);
+        index = index + 1;
+    }
+    arena.Arena& store = ctx.ast_store_ref();
+    UInt8![*] text = store.alloc_array<UInt8>(base_len + suffix_len + 1);
+    Int! out = 0;
+    index = 0;
+    while (index < base_len) {
+        text[out] = base[index];
+        out = out + 1;
+        index = index + 1;
+    }
+    text[out] = '_';
+    text[out + 1] = '_';
+    text[out + 2] = 'g';
+    text[out + 3] = 'D';
+    out = out + 4;
+    write_decimal(text, out, decl_id.id);
+    out = out + decimal_length(decl_id.id);
+    index = 0;
+    while (index < args.len()) {
+        text[out] = '_';
+        text[out + 1] = 'T';
+        out = out + 2;
+        write_decimal(text, out, args[index].id);
+        out = out + decimal_length(args[index].id);
+        index = index + 1;
+    }
+    text[out] = 0;
+    return ctx.intern(text[0..out]);
+}
+
+Bool type_contains_type_param_depth(types.TypeTable& table, types.TypeId type_id, Int depth) {
+    if (!type_id.valid()) { return false; }
+    if (depth > 64) { return false; }
+    if (type_id.id >= table.len()) { return false; }
+    types.TypeInfo info = table.type_at(type_id);
+    if (info.kind == .type_param) { return true; }
+    if (info.element.valid() && type_contains_type_param_depth(table, info.element, depth + 1)) { return true; }
+    if (info.other.valid() && type_contains_type_param_depth(table, info.other, depth + 1)) { return true; }
+    Int! index = 0;
+    while (index < info.child_count) {
+        if (type_contains_type_param_depth(table, table.child_at(info.child_start + index), depth + 1)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool type_contains_type_param(types.TypeTable& table, types.TypeId type_id) {
+    return type_contains_type_param_depth(table, type_id, 0);
+}
+
+Bool function_decl_is_generic(types.TypeTable& table, jir.JirFunctionDecl decl) {
+    if (decl.generic_params.len() > 0) { return true; }
+    if (type_contains_type_param(table, decl.result_type)) { return true; }
+    Int! index = 0;
+    while (index < decl.params.len()) {
+        if (type_contains_type_param(table, decl.params[index].type_id)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool module_has_decl_id(jir.JirModule^ module, scope.DeclId decl_id) {
+    if (!decl_id.valid()) { return false; }
+    Int! index = 0;
+    while (index < module.decl_count()) {
+        jir.JirDecl decl = module.decl_at(jir.JirDeclId(index));
+        if (decl.decl_id.id == decl_id.id) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+jir.JirTypeDecl? source_type_decl_for(MonomorphContext^ mono, scope.DeclId decl_id) {
+    if (!decl_id.valid()) { return null; }
+    semantic_ctx.JirDeclRef ref = mono.ctx.semantic_jir_decl_ref(decl_id);
+    if (!ref.valid()) { return null; }
+    jir.JirModule^? module_ref = monomorph_module_for_id(mono, ref.module_id);
+    if (module_ref == null) { return null; }
+    jir.JirModule^ source_module = module_ref$.some();
+    if (ref.jir_decl_id < 0 || ref.jir_decl_id >= source_module.decl_count()) { return null; }
+    jir.JirDecl decl = source_module.decl_at(jir.JirDeclId(ref.jir_decl_id));
+    if (decl.body is .type_decl(type_decl)) {
+        return type_decl;
+    }
+    return null;
+}
+
+jir.JirModule^? source_module_for_decl(MonomorphContext^ mono, scope.DeclId decl_id) {
+    if (!decl_id.valid()) { return null; }
+    semantic_ctx.JirDeclRef ref = mono.ctx.semantic_jir_decl_ref(decl_id);
+    if (!ref.valid()) { return null; }
+    return monomorph_module_for_id(mono, ref.module_id);
+}
+
+() add_type_substs_from_nominal(types.TypeTable& table, CloneState^ clone, jir.JirTypeDecl source_decl, types.TypeInfo concrete_info) {
+    Int! index = 0;
+    while (index < source_decl.generic_params.len() && index < concrete_info.child_count) {
+        clone.add_subst(source_decl.generic_params[index].symbol.id, table.child_at(concrete_info.child_start + index));
+        index = index + 1;
+    }
+}
+
+public () materialize_type_in_module(MonomorphContext^ mono, jir.JirModule^ module, types.TypeId type_id) {
+    if (!type_id.valid()) { return; }
+    types.TypeTable& table = mono.ctx.types_ref();
+    if (type_id.id >= table.len()) { return; }
+    types.TypeInfo info = table.type_at(type_id);
+    Bool! should_materialize_nominal = info.kind == .nominal && info.decl_id.valid();
+    Bool! first_nominal_visit = false;
+    if (should_materialize_nominal) {
+        first_nominal_visit = mono.record_materialized_type(module.module_id, type_id);
+        if (!first_nominal_visit) { return; }
+    }
+    if (info.element.valid()) { materialize_type_in_module(mono, module, info.element); }
+    if (info.other.valid()) { materialize_type_in_module(mono, module, info.other); }
+    if (info.kind == .nominal || info.kind == .tuple || info.kind == .function) {
+        Int! index = 0;
+        while (index < info.child_count) {
+            materialize_type_in_module(mono, module, table.child_at(info.child_start + index));
+            index = index + 1;
+        }
+    }
+    if (!should_materialize_nominal) { return; }
+    jir.JirTypeDecl? source_decl_ref = source_type_decl_for(mono, info.decl_id);
+    jir.JirModule^? source_module_ref = source_module_for_decl(mono, info.decl_id);
+    if (source_decl_ref == null || source_module_ref == null) { return; }
+    jir.JirTypeDecl source_decl = source_decl_ref$.some();
+    jir.JirModule^ source_module = source_module_ref$.some();
+    CloneState! clone = CloneState(mono.ctx, source_module$.ref(), module$.ref());
+    add_type_substs_from_nominal(table, clone$.ptr(), source_decl, info);
+    jir.JirTypeDecl concrete_decl = clone.clone_type_decl(source_decl, type_id);
+    module.add_decl(jir.JirDecl(info.decl_id, source_decl.span, .type_decl(concrete_decl)));
+}
+
+() materialize_pattern_tests(MonomorphContext^ mono, jir.JirModule^ module, list.ArenaList<jir.JirPatternTest> tests) {
+    Int! index = 0;
+    while (index < tests.len()) {
+        index = index + 1;
+    }
+}
+
+() materialize_pattern_binds(MonomorphContext^ mono, jir.JirModule^ module, list.ArenaList<jir.JirPatternBind> binds) {
+    Int! index = 0;
+    while (index < binds.len()) {
+        jir.JirPatternBind bind = binds[index];
+        materialize_type_in_module(mono, module, bind.type_id);
+        index = index + 1;
+    }
+}
+
+public () materialize_block_types(MonomorphContext^ mono, jir.JirModule^ module, jir.JirBlock block) {
+    Int! index = 0;
+    while (index < block.stmts.len()) {
+        jir.JirStmt stmt = module.stmt_at(block.stmts[index]);
+        if (stmt.body is .local(local)) {
+            materialize_type_in_module(mono, module, local.type_id);
+        }
+        if (stmt.body is .temp_local(temp_local)) {
+            materialize_type_in_module(mono, module, temp_local.type_id);
+        }
+        if (stmt.body is .pattern_bind(pattern_bind)) {
+            materialize_pattern_binds(mono, module, pattern_bind.binds);
+        }
+        if (stmt.body is .coalesce_control_local(local)) {
+            materialize_type_in_module(mono, module, local.type_id);
+            materialize_block_types(mono, module, local.left_block);
+            materialize_block_types(mono, module, local.result_block);
+        }
+        if (stmt.body is .if_stmt(if_stmt)) {
+            materialize_block_types(mono, module, if_stmt.then_block);
+            if (if_stmt.else_block is some else_block) {
+                materialize_block_types(mono, module, else_block);
+            }
+        }
+        if (stmt.body is .switch_stmt(switch_stmt)) {
+            Int! case_index = 0;
+            while (case_index < switch_stmt.cases.len()) {
+                jir.JirSwitchCase item = switch_stmt.cases[case_index];
+                materialize_pattern_tests(mono, module, item.tests);
+                materialize_block_types(mono, module, item.body);
+                case_index = case_index + 1;
+            }
+        }
+        if (stmt.body is .try_stmt(try_stmt)) {
+            materialize_block_types(mono, module, try_stmt.body);
+            Int! catch_index = 0;
+            while (catch_index < try_stmt.catches.len()) {
+                jir.JirCatchStmt item = try_stmt.catches[catch_index];
+                materialize_type_in_module(mono, module, item.type_id);
+                materialize_block_types(mono, module, item.body);
+                catch_index = catch_index + 1;
+            }
+        }
+        if (stmt.body is .while_stmt(while_stmt)) {
+            materialize_block_types(mono, module, while_stmt.cond_block);
+            materialize_block_types(mono, module, while_stmt.body);
+        }
+        if (stmt.body is .for_range(for_range)) {
+            materialize_type_in_module(mono, module, for_range.type_id);
+            materialize_block_types(mono, module, for_range.body);
+        }
+        if (stmt.body is .for_each(for_each)) {
+            materialize_pattern_tests(mono, module, for_each.tests);
+            materialize_pattern_binds(mono, module, for_each.binds);
+            materialize_block_types(mono, module, for_each.body);
+        }
+        if (stmt.body is .run_defer(run_defer)) {
+            materialize_block_types(mono, module, run_defer.body);
+        }
+        if (stmt.body is .block(block_stmt)) {
+            materialize_block_types(mono, module, block_stmt.block);
+        }
+        index = index + 1;
+    }
+}
+
+() materialize_expr_types(MonomorphContext^ mono, jir.JirModule^ module) {
+    Int! index = 0;
+    Int expr_count = module.expr_count();
+    while (index < expr_count) {
+        jir.JirExpr expr = module.expr_at(jir.JirExprId(index));
+        materialize_type_in_module(mono, module, expr.type_id);
+        if (expr.body is .call_expr(call)) {
+            Int! arg_index = 0;
+            while (arg_index < call.generic_type_args.len()) {
+                materialize_type_in_module(mono, module, call.generic_type_args[arg_index]);
+                arg_index = arg_index + 1;
+            }
+            materialize_type_in_module(mono, module, call.method_receiver_type_id);
+        }
+        index = index + 1;
+    }
+}
+
+() materialize_decl_types(MonomorphContext^ mono, jir.JirModule^ module) {
+    Int! index = 0;
+    Int decl_count = module.decl_count();
+    while (index < decl_count) {
+        jir.JirDecl decl = module.decl_at(jir.JirDeclId(index));
+        if (decl.body is .function_decl(function_decl)) {
+            materialize_type_in_module(mono, module, function_decl.type_id);
+            materialize_type_in_module(mono, module, function_decl.result_type);
+            Int! param_index = 0;
+            while (param_index < function_decl.params.len()) {
+                materialize_type_in_module(mono, module, function_decl.params[param_index].type_id);
+                param_index = param_index + 1;
+            }
+            if (function_decl.body is some body) {
+                materialize_block_types(mono, module, body);
+            }
+        }
+        if (decl.body is .type_decl(type_decl)) {
+            materialize_type_in_module(mono, module, type_decl.type_id);
+            Int! field_index = 0;
+            while (field_index < type_decl.fields.len()) {
+                materialize_type_in_module(mono, module, type_decl.fields[field_index].type_id);
+                field_index = field_index + 1;
+            }
+        }
+        index = index + 1;
+    }
+}
+
+() materialize_concrete_type_decls(MonomorphContext^ mono) {
+    Int! seed_input_index = 0;
+    while (seed_input_index < mono.input_count) {
+        jir.JirModule^ seed_module = mono.inputs[seed_input_index]$.as(jir.JirModule^);
+        Int! decl_index = 0;
+        Int seed_decl_count = seed_module.decl_count();
+        while (decl_index < seed_decl_count) {
+            jir.JirDecl decl = seed_module.decl_at(jir.JirDeclId(decl_index));
+            if (decl.body is .type_decl(type_decl)) {
+                mono.record_materialized_type(seed_module.module_id, type_decl.type_id);
+            }
+            decl_index = decl_index + 1;
+        }
+        seed_input_index = seed_input_index + 1;
+    }
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ module = mono.inputs[input_index]$.as(jir.JirModule^);
+        materialize_decl_types(mono, module);
+        materialize_expr_types(mono, module);
+        input_index = input_index + 1;
+    }
+}
+
+() add_subst(list.ArenaList<TypeSubst>^ substs, list.ArenaList<types.TypeId>^ args, Int symbol_id, types.TypeId type_id) {
+    if (symbol_id <= 0 || !type_id.valid()) { return; }
+    Int! index = 0;
+    while (index < substs.len()) {
+        if (substs[index].symbol_id == symbol_id) { return; }
+        index = index + 1;
+    }
+    substs.add(TypeSubst(symbol_id, type_id));
+    args.add(type_id);
+}
+
+() collect_type_substs_depth(types.TypeTable& table, list.ArenaList<TypeSubst>^ substs, list.ArenaList<types.TypeId>^ args, types.TypeId expected_type, types.TypeId actual_type, Int depth) {
+    if (!expected_type.valid() || !actual_type.valid()) { return; }
+    if (depth > 64) { return; }
+    if (expected_type.id >= table.len() || actual_type.id >= table.len()) { return; }
+    types.TypeInfo expected_info = table.type_at(expected_type);
+    types.TypeInfo actual_info = table.type_at(actual_type);
+    if (expected_info.kind == .type_param) {
+        add_subst(substs, args, expected_info.symbol.id, actual_type);
+        return;
+    }
+    if (expected_info.kind == .layer && actual_info.kind != .layer) {
+        collect_type_substs_depth(table, substs, args, expected_info.element, actual_type, depth + 1);
+        return;
+    }
+    if (expected_info.kind != .layer && actual_info.kind == .layer) {
+        collect_type_substs_depth(table, substs, args, expected_type, actual_info.element, depth + 1);
+        return;
+    }
+    if (expected_info.kind == .layer && actual_info.kind == .layer) {
+        collect_type_substs_depth(table, substs, args, expected_info.element, actual_info.element, depth + 1);
+        return;
+    }
+    if (expected_info.kind == .pointer && actual_info.kind == .pointer && expected_info.pointer_kind == actual_info.pointer_kind) {
+        collect_type_substs_depth(table, substs, args, expected_info.element, actual_info.element, depth + 1);
+        return;
+    }
+    if (expected_info.kind == .slice && actual_info.kind == .slice) {
+        collect_type_substs_depth(table, substs, args, expected_info.element, actual_info.element, depth + 1);
+        return;
+    }
+    if (expected_info.kind == .array && actual_info.kind == .array) {
+        collect_type_substs_depth(table, substs, args, expected_info.element, actual_info.element, depth + 1);
+        return;
+    }
+    if (expected_info.kind == .errorable && actual_info.kind == .errorable) {
+        collect_type_substs_depth(table, substs, args, expected_info.element, actual_info.element, depth + 1);
+        collect_type_substs_depth(table, substs, args, expected_info.other, actual_info.other, depth + 1);
+        return;
+    }
+    if ((expected_info.kind == .tuple || expected_info.kind == .function) && expected_info.kind == actual_info.kind) {
+        Int! index = 0;
+        while (index < expected_info.child_count && index < actual_info.child_count) {
+            collect_type_substs_depth(table, substs, args, table.child_at(expected_info.child_start + index), table.child_at(actual_info.child_start + index), depth + 1);
+            index = index + 1;
+        }
+        return;
+    }
+    if (expected_info.kind == .nominal && actual_info.kind == .nominal && expected_info.decl_id.id == actual_info.decl_id.id) {
+        Int! index = 0;
+        while (index < expected_info.child_count && index < actual_info.child_count) {
+            collect_type_substs_depth(table, substs, args, table.child_at(expected_info.child_start + index), table.child_at(actual_info.child_start + index), depth + 1);
+            index = index + 1;
+        }
+    }
+}
+
+() collect_type_substs(types.TypeTable& table, list.ArenaList<TypeSubst>^ substs, list.ArenaList<types.TypeId>^ args, types.TypeId expected_type, types.TypeId actual_type) {
+    collect_type_substs_depth(table, substs, args, expected_type, actual_type, 0);
+}
+
+Bool type_shape_matches(types.TypeTable& table, types.TypeId expected_type, types.TypeId actual_type, Int depth) {
+    if (!expected_type.valid() || !actual_type.valid()) { return false; }
+    if (depth > 64) { return false; }
+    if (expected_type.id >= table.len() || actual_type.id >= table.len()) { return false; }
+    types.TypeInfo expected_info = table.type_at(expected_type);
+    types.TypeInfo actual_info = table.type_at(actual_type);
+    if (expected_info.kind == .type_param) { return true; }
+    if (expected_info.kind == .layer && actual_info.kind != .layer) {
+        return type_shape_matches(table, expected_info.element, actual_type, depth + 1);
+    }
+    if (expected_info.kind != .layer && actual_info.kind == .layer) {
+        return type_shape_matches(table, expected_type, actual_info.element, depth + 1);
+    }
+    if (expected_info.kind != actual_info.kind) { return false; }
+    if (expected_info.kind == .layer) {
+        return type_shape_matches(table, expected_info.element, actual_info.element, depth + 1);
+    }
+    if (expected_info.kind == .pointer) {
+        if (expected_info.pointer_kind != actual_info.pointer_kind) { return false; }
+        return type_shape_matches(table, expected_info.element, actual_info.element, depth + 1);
+    }
+    if (expected_info.kind == .nominal) {
+        return expected_info.decl_id.id == actual_info.decl_id.id;
+    }
+    return true;
+}
+
+Bool instance_args_equal(MonomorphContext^ mono, InstanceEntry entry, list.ArenaList<types.TypeId> args) {
+    if (entry.arg_count != args.len()) { return false; }
+    Int! index = 0;
+    while (index < entry.arg_count) {
+        if (mono.instance_arg_type_ids[entry.arg_start + index] != args[index].id) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+jir.JirDeclId lookup_instance(MonomorphContext^ mono, semantic_ctx.ModuleId template_module_id, semantic_ctx.ModuleId instance_module_id, scope.DeclId decl_id, list.ArenaList<types.TypeId> args) {
+    Int! index = 0;
+    while (index < mono.instances.len()) {
+        InstanceEntry entry = mono.instances[index];
+        if (entry.template_module_id.id == template_module_id.id && entry.instance_module_id.id == instance_module_id.id && entry.decl_id.id == decl_id.id && instance_args_equal(mono, entry, args)) {
+            return entry.jir_decl_id;
+        }
+        index = index + 1;
+    }
+    return jir.JirDeclId();
+}
+
+() record_instance(MonomorphContext^ mono, semantic_ctx.ModuleId template_module_id, semantic_ctx.ModuleId instance_module_id, scope.DeclId decl_id, list.ArenaList<types.TypeId> args, jir.JirDeclId jir_decl_id) {
+    Int start = mono.instance_arg_type_ids.len();
+    Int! index = 0;
+    while (index < args.len()) {
+        mono.instance_arg_type_ids.add(args[index].id);
+        index = index + 1;
+    }
+    mono.instances.add(InstanceEntry(template_module_id, instance_module_id, decl_id, start, args.len(), jir_decl_id));
+}
+
+jir.JirDeclId instantiate_function(MonomorphContext^ mono, jir.JirModule^ template_module, jir.JirModule^ instance_module, jir.JirDeclId target_decl_id, jir.JirDecl target_decl, jir.JirFunctionDecl function_decl, list.ArenaList<TypeSubst> substs, list.ArenaList<types.TypeId> args) {
+    Int! existing_index = 0;
+    while (existing_index < mono.instances.len()) {
+        InstanceEntry entry = mono.instances[existing_index];
+        if (entry.template_module_id.id == template_module.module_id.id && entry.instance_module_id.id == instance_module.module_id.id && entry.decl_id.id == target_decl.decl_id.id && instance_args_equal(mono, entry, args)) {
+            return entry.jir_decl_id;
+        }
+        existing_index = existing_index + 1;
+    }
+    CloneState! clone = CloneState(mono.ctx, template_module$.ref(), instance_module$.ref());
+    Int! index = 0;
+    while (index < substs.len()) {
+        clone.add_subst(substs[index].symbol_id, substs[index].type_id);
+        index = index + 1;
+    }
+    interner.Symbol symbol = instance_function_symbol(mono.ctx, function_decl.name.symbol, target_decl.decl_id, args);
+    jir.JirDeclId new_id = instance_module.add_unsupported_decl(target_decl.decl_id, target_decl.span);
+    record_instance(mono, template_module.module_id, instance_module.module_id, target_decl.decl_id, args, new_id);
+    jir.JirFunctionDecl cloned_function = clone.clone_function(function_decl, symbol);
+    instance_module.replace_function_decl(new_id, target_decl.decl_id, target_decl.span, cloned_function$.ref());
+    if (cloned_function.body is some body) {
+        Int! module_index = 0;
+        while (module_index < mono.input_count) {
+            jir.JirModule^ input = mono.inputs[module_index]$.as(jir.JirModule^);
+            if (input.module_id.id == instance_module.module_id.id) {
+                mark_block_exprs(instance_module, body, mono.active_expr_ids$.ptr(), module_index, false);
+                module_index = mono.input_count;
+            } else {
+                module_index = module_index + 1;
+            }
+        }
+    }
+    return new_id;
+}
+
+Bool try_monomorphize_method_candidate(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExprId expr_id, jir.JirCallExpr^ call, jir.JirExpr callee, jir.JirFieldExpr^ field, jir.JirModule^ target_module, jir.JirDeclId target_decl_id, jir.JirDecl target_decl) {
+    if (target_decl.body is .function_decl(function_decl)) {
+        if (function_decl.static_flag) { return false; }
+        if (function_decl.name.symbol.id != field.name.symbol.id) { return false; }
+        if (function_decl.params.len() != call.args.len() + 1) { return false; }
+        types.TypeTable& table = mono.ctx.types_ref();
+        list.ArenaList<TypeSubst>! substs = list.ArenaList<TypeSubst>(mono.ctx.ast_store_ref());
+        list.ArenaList<types.TypeId>! args = list.ArenaList<types.TypeId>(mono.ctx.ast_store_ref());
+        jir.JirExpr base = input.expr_at(field.base);
+        if (!type_shape_matches(table, function_decl.params[0].type_id, base.type_id, 0)) { return false; }
+        collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[0].type_id, base.type_id);
+        Int! index = 0;
+        while (index < call.args.len()) {
+            jir.JirExpr arg = input.expr_at(call.args[index]);
+            collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[index + 1].type_id, arg.type_id);
+            index = index + 1;
+        }
+        jir.JirExpr call_expr = input.expr_at(expr_id);
+        collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.result_type, call_expr.type_id);
+        if (args.len() == 0) { return false; }
+        jir.JirDeclId instance_id = instantiate_function(mono, target_module, input, target_decl_id, target_decl, function_decl, substs, args);
+        if (instance_id.valid()) {
+            input.set_call_target(expr_id, jir.JirCallTargetRef(input.module_id, instance_id));
+            return true;
+        }
+    }
+    return false;
+}
+
+Bool try_monomorphize_method_call(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExprId expr_id, jir.JirCallExpr^ call) {
+    jir.JirExpr callee = input.expr_at(call.callee);
+    if (callee.body is .field_expr(field)) {
+        jir.JirExpr base_expr = input.expr_at(field.base);
+        if (base_expr.body is .implicit_expr(_)) { return false; }
+        if (base_expr.body is .type_value_expr(_)) { return false; }
+        if (type_contains_type_param(mono.ctx.types_ref(), base_expr.type_id)) { return false; }
+        Int! input_index = 0;
+        while (input_index < mono.input_count) {
+            jir.JirModule^ target_module = mono.inputs[input_index]$.as(jir.JirModule^);
+            Int! decl_index = 0;
+            while (decl_index < target_module.decl_count()) {
+                jir.JirDeclId target_decl_id = jir.JirDeclId(decl_index);
+                jir.JirDecl target_decl = target_module.decl_at(target_decl_id);
+                if (try_monomorphize_method_candidate(mono, input, expr_id, call, callee, field, target_module, target_decl_id, target_decl)) {
+                    return true;
+                }
+                decl_index = decl_index + 1;
+            }
+            input_index = input_index + 1;
+        }
+    }
+    return false;
+}
+
+Bool monomorphize_call(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExprId expr_id, jir.JirCallExpr^ call) {
+    Int! generic_arg_index = 0;
+    while (generic_arg_index < call.generic_type_args.len()) {
+        if (type_contains_type_param(mono.ctx.types_ref(), call.generic_type_args[generic_arg_index])) {
+            return false;
+        }
+        generic_arg_index = generic_arg_index + 1;
+    }
+    jir.JirCallTargetRef current_target = input.call_target_at(expr_id);
+    scope.DeclId! decl_id = call.target_decl_id;
+    semantic_ctx.ModuleId! module_id = current_target.module_id;
+    jir.JirDeclId! target_jir_decl_id = current_target.jir_decl_id;
+    if (!module_id.valid() || !target_jir_decl_id.valid()) {
+        if (!decl_id.valid() && current_target.decl_id.valid()) {
+            decl_id = current_target.decl_id;
+        }
+        if (!decl_id.valid()) {
+            return try_monomorphize_method_call(mono, input, expr_id, call);
+        }
+        semantic_ctx.JirDeclRef ref = mono.ctx.semantic_jir_decl_ref(decl_id);
+        if (!ref.valid()) { return false; }
+        module_id = ref.module_id;
+        target_jir_decl_id = jir.JirDeclId(ref.jir_decl_id);
+    }
+    if (!decl_id.valid() && current_target.decl_id.valid()) {
+        decl_id = current_target.decl_id;
+    }
+    jir.JirModule^? target_module_ref = monomorph_module_for_id(mono, module_id);
+    if (target_module_ref == null) { return false; }
+    jir.JirModule^ target_module = target_module_ref$.some();
+    jir.JirDecl target_decl = target_module.decl_at(target_jir_decl_id);
+    if (!decl_id.valid()) { decl_id = target_decl.decl_id; }
+    if (target_decl.body is .function_decl(function_decl)) {
+        types.TypeTable& table = mono.ctx.types_ref();
+        list.ArenaList<TypeSubst>! substs = list.ArenaList<TypeSubst>(mono.ctx.ast_store_ref());
+        list.ArenaList<types.TypeId>! args = list.ArenaList<types.TypeId>(mono.ctx.ast_store_ref());
+        Int! index = 0;
+        while (index < function_decl.generic_params.len() && index < call.generic_type_args.len()) {
+            add_subst(substs$.ptr(), args$.ptr(), function_decl.generic_params[index].symbol.id, call.generic_type_args[index]);
+            index = index + 1;
+        }
+        Bool! method_call = false;
+        jir.JirExpr callee = input.expr_at(call.callee);
+        if (callee.body is .field_expr(field)) {
+            method_call = function_decl.params.len() == call.args.len() + 1;
+            if (method_call && function_decl.params.len() > 0) {
+                jir.JirExpr base = input.expr_at(field.base);
+                types.TypeId! receiver_type = base.type_id;
+                if (call.method_receiver_type_id.valid()) {
+                    receiver_type = call.method_receiver_type_id;
+                }
+                collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[0].type_id, receiver_type);
+            }
+        }
+        index = 0;
+        while (index < call.args.len()) {
+            Int! param_index = index;
+            if (method_call) { param_index = index + 1; }
+            if (param_index < function_decl.params.len()) {
+                jir.JirExpr arg = input.expr_at(call.args[index]);
+                collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[param_index].type_id, arg.type_id);
+            }
+            index = index + 1;
+        }
+        jir.JirExpr call_expr = input.expr_at(expr_id);
+        collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.result_type, call_expr.type_id);
+        if (args.len() == 0) { return false; }
+        jir.JirDeclId instance_id = instantiate_function(mono, target_module, input, target_jir_decl_id, target_decl, function_decl, substs, args);
+        if (instance_id.valid()) {
+            input.set_call_target(expr_id, jir.JirCallTargetRef(input.module_id, instance_id));
+            return true;
+        }
+    }
+    return false;
+}
+
+() reserve_monomorph_capacity(MonomorphContext& mono) {
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ module = mono.inputs[input_index]$.as(jir.JirModule^);
+        module.exprs.reserve(8192);
+        module.call_targets.reserve(8192);
+        module.stmts.reserve(4096);
+        module.decls.reserve(1024);
+        input_index = input_index + 1;
+    }
+}
+
+Bool collect_expr_ids_call(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .call_expr(call)) {
+        collect_expr_ids_from_expr(input, call.callee, output, input_index, generic_mark);
+        Int! index = 0;
+        while (index < call.args.len()) {
+            collect_expr_ids_from_expr(input, call.args[index], output, input_index, generic_mark);
+            index = index + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_field(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .field_expr(field)) {
+        collect_expr_ids_from_expr(input, field.base, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_index(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .index_expr(index_expr)) {
+        collect_expr_ids_from_expr(input, index_expr.base, output, input_index, generic_mark);
+        collect_expr_ids_from_expr(input, index_expr.index, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_slice(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .slice_expr(slice_expr)) {
+        collect_expr_ids_from_expr(input, slice_expr.base, output, input_index, generic_mark);
+        collect_expr_ids_from_expr(input, slice_expr.start, output, input_index, generic_mark);
+        collect_expr_ids_from_expr(input, slice_expr.end_expr, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_unary(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .unary_expr(unary)) {
+        collect_expr_ids_from_expr(input, unary.value, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_binary(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .binary_expr(binary)) {
+        collect_expr_ids_from_expr(input, binary.left, output, input_index, generic_mark);
+        collect_expr_ids_from_expr(input, binary.right, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_struct(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .struct_expr(struct_expr)) {
+        Int! index = 0;
+        while (index < struct_expr.fields.len()) {
+            collect_expr_ids_from_expr(input, struct_expr.fields[index].value, output, input_index, generic_mark);
+            index = index + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_tuple(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .tuple_expr(tuple)) {
+        Int! index = 0;
+        while (index < tuple.items.len()) {
+            collect_expr_ids_from_expr(input, tuple.items[index], output, input_index, generic_mark);
+            index = index + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+Bool collect_expr_ids_array(jir.JirModule^ input, jir.JirExpr& expr, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (expr.body is .array_expr(array)) {
+        Int! index = 0;
+        while (index < array.items.len()) {
+            collect_expr_ids_from_expr(input, array.items[index], output, input_index, generic_mark);
+            index = index + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+() collect_expr_ids_from_expr(jir.JirModule^ input, jir.JirExprId expr_id, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (!expr_id.valid()) { return; }
+    Int key = monomorph_expr_key(input_index, expr_id);
+    if (!input.mark_monomorph_expr(generic_mark, expr_id)) { return; }
+    output.add(key);
+    jir.JirExpr& expr = input.expr_ref_at(expr_id);
+    if (collect_expr_ids_call(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_field(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_index(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_slice(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_unary(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_binary(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_struct(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_tuple(input, expr, output, input_index, generic_mark)) { return; }
+    if (collect_expr_ids_array(input, expr, output, input_index, generic_mark)) { return; }
+}
+
+() mark_block_exprs(jir.JirModule^ input, jir.JirBlock block, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    Int! stmt_index = 0;
+    while (stmt_index < block.stmts.len()) {
+        mark_stmt_exprs(input, block.stmts[stmt_index], output, input_index, generic_mark);
+        stmt_index = stmt_index + 1;
+    }
+    collect_expr_ids_from_expr(input, block.value, output, input_index, generic_mark);
+}
+
+Bool mark_stmt_exprs_local(jir.JirModule^ input, jir.JirStmt& stmt, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (stmt.body is .local(local)) {
+        collect_expr_ids_from_expr(input, local.initializer, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool mark_stmt_exprs_assign(jir.JirModule^ input, jir.JirStmt& stmt, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (stmt.body is .assign(assign)) {
+        collect_expr_ids_from_expr(input, assign.target, output, input_index, generic_mark);
+        collect_expr_ids_from_expr(input, assign.value, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool mark_stmt_exprs_return(jir.JirModule^ input, jir.JirStmt& stmt, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (stmt.body is .return_stmt(ret)) {
+        collect_expr_ids_from_expr(input, ret.value, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool mark_stmt_exprs_expr(jir.JirModule^ input, jir.JirStmt& stmt, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (stmt.body is .expr(expr)) {
+        collect_expr_ids_from_expr(input, expr.value, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+Bool mark_stmt_exprs_if(jir.JirModule^ input, jir.JirStmt& stmt, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (stmt.body is .if_stmt(if_stmt)) {
+        collect_expr_ids_from_expr(input, if_stmt.cond, output, input_index, generic_mark);
+        mark_block_exprs(input, if_stmt.then_block, output, input_index, generic_mark);
+        if (if_stmt.else_block is some else_block) { mark_block_exprs(input, else_block, output, input_index, generic_mark); }
+        return true;
+    }
+    return false;
+}
+
+Bool mark_stmt_exprs_while(jir.JirModule^ input, jir.JirStmt& stmt, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (stmt.body is .while_stmt(while_stmt)) {
+        collect_expr_ids_from_expr(input, while_stmt.cond, output, input_index, generic_mark);
+        mark_block_exprs(input, while_stmt.body, output, input_index, generic_mark);
+        mark_block_exprs(input, while_stmt.cond_block, output, input_index, generic_mark);
+        return true;
+    }
+    return false;
+}
+
+() mark_stmt_exprs(jir.JirModule^ input, jir.JirStmtId stmt_id, list.ArenaList<Int>^ output, Int input_index, Bool generic_mark) {
+    if (!stmt_id.valid()) { return; }
+    jir.JirStmt& stmt = input.stmt_ref_at(stmt_id);
+    if (mark_stmt_exprs_local(input, stmt, output, input_index, generic_mark)) { return; }
+    if (mark_stmt_exprs_assign(input, stmt, output, input_index, generic_mark)) { return; }
+    if (mark_stmt_exprs_return(input, stmt, output, input_index, generic_mark)) { return; }
+    if (mark_stmt_exprs_expr(input, stmt, output, input_index, generic_mark)) { return; }
+    if (mark_stmt_exprs_if(input, stmt, output, input_index, generic_mark)) { return; }
+    if (mark_stmt_exprs_while(input, stmt, output, input_index, generic_mark)) { return; }
+}
+
+() mark_generic_template_exprs(MonomorphContext^ mono) {
+    types.TypeTable& table = mono.ctx.types_ref();
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ input = mono.inputs[input_index]$.as(jir.JirModule^);
+        Int! decl_index = 0;
+        while (decl_index < input.decl_count()) {
+            jir.JirDecl decl = input.decl_at(jir.JirDeclId(decl_index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (function_decl_is_generic(table, function_decl)) {
+                    if (function_decl.body is some body) {
+                        mark_block_exprs(input, body, mono.generic_template_expr_ids$.ptr(), input_index, true);
+                    }
+                }
+            }
+            if (decl.body is .type_decl(type_decl)) {
+                if (type_decl.generic_params.len() > 0) {
+                    Int! init_index = 0;
+                    while (init_index < type_decl.inits.len()) {
+                        mark_block_exprs(input, type_decl.inits[init_index].body, mono.generic_template_expr_ids$.ptr(), input_index, true);
+                        init_index = init_index + 1;
+                    }
+                    if (type_decl.deinit_decl is some deinit_decl) {
+                        mark_block_exprs(input, deinit_decl.body, mono.generic_template_expr_ids$.ptr(), input_index, true);
+                    }
+                }
+            }
+            decl_index = decl_index + 1;
+        }
+        input_index = input_index + 1;
+    }
+}
+
+() mark_active_root_exprs(MonomorphContext^ mono) {
+    types.TypeTable& table = mono.ctx.types_ref();
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ input = mono.inputs[input_index]$.as(jir.JirModule^);
+        Int! decl_index = 0;
+        while (decl_index < input.decl_count()) {
+            jir.JirDecl decl = input.decl_at(jir.JirDeclId(decl_index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (!function_decl_is_generic(table, function_decl)) {
+                    if (function_decl.body is some body) {
+                        mark_block_exprs(input, body, mono.active_expr_ids$.ptr(), input_index, false);
+                    }
+                }
+            }
+            if (decl.body is .type_decl(type_decl)) {
+                if (type_decl.generic_params.len() == 0) {
+                    Int! init_index = 0;
+                    while (init_index < type_decl.inits.len()) {
+                        mark_block_exprs(input, type_decl.inits[init_index].body, mono.active_expr_ids$.ptr(), input_index, false);
+                        init_index = init_index + 1;
+                    }
+                    if (type_decl.deinit_decl is some deinit_decl) {
+                        mark_block_exprs(input, deinit_decl.body, mono.active_expr_ids$.ptr(), input_index, false);
+                    }
+                }
+            }
+            decl_index = decl_index + 1;
+        }
+        input_index = input_index + 1;
+    }
+}
+
+() strip_generic_function_templates(MonomorphContext^ mono) {
+    types.TypeTable& table = mono.ctx.types_ref();
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ input = mono.inputs[input_index]$.as(jir.JirModule^);
+        Int! decl_index = 0;
+        while (decl_index < input.decl_count()) {
+            jir.JirDecl decl = input.decl_at(jir.JirDeclId(decl_index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (function_decl_is_generic(table, function_decl)) {
+                    jir.JirFunctionDecl! stripped = jir.JirFunctionDecl(input.store, function_decl.span, function_decl.name, function_decl.binding_id, function_decl.type_id, function_decl.result_type, function_decl.public_flag, true, function_decl.static_flag);
+                    stripped.decl_id = function_decl.decl_id;
+                    Int! param_index = 0;
+                    while (param_index < function_decl.params.len()) {
+                        stripped.params.add(function_decl.params[param_index]);
+                        param_index = param_index + 1;
+                    }
+                    param_index = 0;
+                    while (param_index < function_decl.generic_params.len()) {
+                        stripped.generic_params.add(function_decl.generic_params[param_index]);
+                        param_index = param_index + 1;
+                    }
+                    input.replace_function_decl(jir.JirDeclId(decl_index), decl.decl_id, decl.span, stripped$.ref());
+                }
+            }
+            decl_index = decl_index + 1;
+        }
+        input_index = input_index + 1;
+    }
+}
+
+public () monomorphize_jir_modules(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
+    MonomorphContext! mono = MonomorphContext(ctx, inputs, input_count);
+    reserve_monomorph_capacity(mono$.ref());
+    mark_generic_template_exprs(mono$.ptr());
+    mark_active_root_exprs(mono$.ptr());
+    Bool! changed = true;
+    while (changed) {
+        changed = false;
+        Int! active_index = 0;
+        while (active_index < mono.active_expr_ids.len()) {
+            Int key = mono.active_expr_ids[active_index];
+            Int input_index = monomorph_key_input_index(key);
+            jir.JirExprId expr_id = monomorph_key_expr_id(key);
+            jir.JirModule^ input = inputs[input_index]$.as(jir.JirModule^);
+            if (!input.monomorph_expr_marked(true, expr_id)) {
+                jir.JirExpr& expr = input.expr_ref_at(expr_id);
+                if (expr.body is .call_expr(call)) {
+                    if (monomorphize_call(mono$.ptr(), input, expr_id, call)) {
+                        changed = true;
+                    }
+                }
+            }
+            active_index = active_index + 1;
+        }
+    }
+    materialize_concrete_type_decls(mono$.ptr());
+    strip_generic_function_templates(mono$.ptr());
+}

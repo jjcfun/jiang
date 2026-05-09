@@ -1,51 +1,52 @@
 # Jiang TODO
 
-当前状态：
+当前目标：先把 stage1 自举链路的 IR 架构收稳，再继续增量编译后续阶段。
 
-- Stage1 前七阶段已完成，不再在 TODO 中逐项展开。
-- 当前 TODO 只保留本版本要实现的增量编译 v1。
-- 增量编译方案见 `doc/incremental-compilation.md`。
+## 阶段 1：JIR 改为 CFG 形式
 
-## 增量编译 v1
+- [ ] 定义 CFG JIR 数据结构。
+  - [ ] `JirFunction` 持有 `BasicBlock[]`。
+  - [ ] `BasicBlock` 持有线性 `Instruction[]` 和 `Terminator`。
+  - [ ] `Instruction` 使用 `ValueId` 作为 operand/result。
+  - [ ] `Terminator` 覆盖 `return` / `branch` / `cond_branch` / `switch` / `throw`。
+- [ ] 将 tree JIR 的表达式/语句 lowering 改为 CFG lowering。
+  - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
+  - [ ] call / field / index / cast / binary / aggregate init 生成 typed instruction。
+  - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
+- [ ] 调整 call target 表示。
+  - [ ] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
+  - [ ] `resolve_jir_call_targets` 改为遍历 CFG instruction。
+- [ ] 调整 type layout 和 codegen 输入。
+  - [ ] `type_layout` 只依赖 concrete `TypeId` 和 concrete type decl。
+  - [ ] codegen 按 block/instruction/terminator 翻译，不做泛型判断。
+- [ ] 删除不再使用的 tree JIR clone 辅助结构。
 
-- [x] 新增 `compiler/incremental.jiang`。
-  - [x] `Hash128 = UInt64[2]` 语义类型。
-  - [x] `Hash256 = UInt64[4]` 语义类型。
-  - [x] 封装已有 `support/blake3.jiang` 为 `hash128_bytes(...)` / `hash256_bytes(...)`。
-  - [x] `PackageKey` / `ModuleKey` / `ObjectKey`。
-  - [x] `IncrementalSession` / `ModuleFingerprint` / `ModuleCacheEntry` / `IncrementalPlan`。
-- [x] 清理 stable key 命名。
-  - [x] session-local key 统一命名为 `*SessionKey`。
-  - [x] `*StableKey` 只能表示跨进程可重建字段。
-  - [x] 禁止 `ModuleId` / `DeclId` / `TypeId` / `BindingId` / `Symbol.id` 写入 stable key。
-- [x] 接入 compiler 框架。
-  - [x] `compile_file_incremental_to_object(...)`。
-  - [x] `compile_file_incremental_to_executable(...)`。
-  - [x] v1 cache miss/full rebuild fallback。
-  - [x] CLI 预留 incremental 入口。
-- [x] 生成 module-level fingerprint。
-  - [x] source hash。
-  - [x] package key。
-  - [x] module key。
-  - [x] object key。
-  - [x] dirty reason。
-- [x] whole-graph object cache。
-  - [x] graph source hash。
-  - [x] `.jiang/cache/objects/<object-key>.o` path 规则。
-  - [x] cache hit 时复制 cached object。
-  - [x] cache miss 时 full rebuild 并写入 cache。
-- [x] 验证。
-  - [x] stage1 build。
-  - [x] stage1 smoke。
-  - [x] 最小 incremental hash/key 单元测试或 smoke。
+## 阶段 2：完善 JIR 单态化
 
-## 暂不进入当前版本
+- [ ] 单态化输入输出统一为 CFG JIR。
+- [ ] 实例 key 使用 `template module + template decl + concrete type args`。
+- [ ] clone function 时按 block/instruction 线性复制。
+  - [ ] 建立 `old ValueId -> new ValueId` 映射。
+  - [ ] 建立 `old BlockId -> new BlockId` 映射。
+  - [ ] 类型替换只发生在 monomorph 阶段，不进入 codegen。
+- [ ] 生成 concrete function/type instance。
+  - [ ] 泛型函数调用改指向 concrete function。
+  - [ ] concrete nominal type decl materialize 后再进入 layout。
+- [ ] 移除 codegen 中所有泛型判断或查找补偿。
+- [ ] 验证泛型 samples、method call、cross-module generic call。
 
-- declaration/function-level incremental。
-- `DeclStableKey` / `TypeStableKey` / `InstanceStableKey` 落盘实现。
-- per-module object reuse。
-- multi-object linker。
-- cross-module public API 精准 dirty propagation。
-- generic nominal layout cache。
-- 远程 cache / 跨机器共享。
-- trait object、完整 errorable ABI、target data layout invalidation。
+## 阶段 3：完成 stage1 自举
+
+- [ ] stage1 编译 `compiler/interner.jiang` 不崩溃。
+- [ ] stage1 能编译完整 compiler graph。
+- [ ] stage1 生成的 compiler 能通过 `build_stage1` / compiler tests。
+- [ ] self-compile 产物与当前 stage1 行为一致。
+- [ ] 清理临时兼容代码、调试输出和过渡 TODO。
+
+## 后续：增量编译 v2/v3
+
+- [ ] declaration/function-level incremental。
+- [ ] `DeclStableKey` / `TypeStableKey` / `InstanceStableKey` 落盘实现。
+- [ ] per-module object reuse。
+- [ ] multi-object linker。
+- [ ] cross-module public API dirty propagation。

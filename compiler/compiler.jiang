@@ -15,10 +15,12 @@ import list = "./support/list.jiang";
 import map = "./support/map.jiang";
 import "./lower_hir.jiang";
 import lower_jir = "./lower_jir.jiang";
+import monomorph = "./monomorph.jiang";
 import "./module_graph.jiang";
 import package_manifest = "./package_manifest.jiang";
 import "./parser.jiang";
 import "./resolve.jiang";
+import semantic_ctx = "./semantic.jiang";
 import scope = "./scope.jiang";
 import "./source.jiang";
 import source_manager = "./source_manager.jiang";
@@ -26,6 +28,7 @@ import arena = "./support/arena.jiang";
 import hash_util = "./support/hash.jiang";
 import string = "./support/string.jiang";
 import type_check = "./type_check.jiang";
+import type_layout = "./type_layout.jiang";
 import types = "./type.jiang";
 import "./token.jiang";
 
@@ -76,24 +79,86 @@ ast.AstFile parse_source(context.CompilerContext& ctx, UInt8[] path, UInt8[] tex
     return file;
 }
 
-jir.JirCallTargetRef resolve_jir_call_target(list.ArenaList<codegen.ModuleInput> inputs, Int input_index, jir.JirCallExpr call) {
-    if (call.target_decl_id.valid()) {
-        return jir.JirCallTargetRef(call.target_decl_id);
+jir.JirCallTargetRef resolve_decl_jir_call_target(context.CompilerContext& ctx, scope.DeclId decl_id) {
+    if (!decl_id.valid()) { return jir.JirCallTargetRef(); }
+    semantic_ctx.JirDeclRef ref = ctx.semantic_jir_decl_ref(decl_id);
+    if (!ref.valid()) { return jir.JirCallTargetRef(); }
+    return jir.JirCallTargetRef(ref.module_id, jir.JirDeclId(ref.jir_decl_id));
+}
+
+types.TypeId dispatch_receiver_type(types.TypeTable& type_table, types.TypeId type_id) {
+    if (!type_id.valid()) { return type_id; }
+    types.TypeInfo info = type_table.type_at(type_id);
+    if (info.kind == .pointer && (info.pointer_kind == types.PointerKind.borrow || info.pointer_kind == types.PointerKind.owner)) {
+        return info.element;
+    }
+    if (info.kind == .layer) {
+        return dispatch_receiver_type(type_table, info.element);
+    }
+    return type_id;
+}
+
+Bool function_matches_method_target(types.TypeTable& type_table, jir.JirFunctionDecl decl, interner.Symbol method_symbol, Int arg_count, types.TypeId receiver_type) {
+    if (!method_symbol.valid()) { return false; }
+    if (decl.static_flag) { return false; }
+    if (decl.name.symbol.id != method_symbol.id) { return false; }
+    if (decl.params.len() != arg_count + 1) { return false; }
+    return type_table.type_equals(dispatch_receiver_type(type_table, decl.params[0].type_id), receiver_type);
+}
+
+jir.JirCallTargetRef resolve_jir_call_target(context.CompilerContext& ctx, list.ArenaList<codegen.ModuleInput> inputs, Int input_index, jir.JirExprId expr_id, jir.JirCallExpr call) {
+    if (call.target_decl_id.valid() && call.target_kind_id != type_check.resolved_callee_kind_id(type_check.ResolvedCalleeKind.trait_method)) {
+        return resolve_decl_jir_call_target(ctx, call.target_decl_id);
+    }
+    codegen.ModuleInput local_input = inputs[input_index];
+    types.TypeId! method_receiver_type_id = call.method_receiver_type_id;
+    interner.Symbol! method_symbol = call.method_symbol;
+    if (!method_receiver_type_id.valid() || !method_symbol.valid()) {
+        method_receiver_type_id = local_input.module.call_method_receiver_type_at(expr_id);
+        method_symbol = local_input.module.call_method_symbol_at(expr_id);
+    }
+    if (method_receiver_type_id.valid() && method_symbol.valid()) {
+        types.TypeId receiver_type = dispatch_receiver_type(ctx.types_ref(), method_receiver_type_id);
+        Int! module_index = 0;
+        while (module_index < inputs.len()) {
+            codegen.ModuleInput input = inputs[module_index];
+            Int! candidate_index = 0;
+            Int! param_count = call.args.len() + 1;
+            while (candidate_index < input.module.method_candidate_count()) {
+                if (!input.module.method_candidate_matches(candidate_index, method_symbol, param_count)) {
+                    candidate_index = candidate_index + 1;
+                    continue;
+                }
+                jir.JirDeclId decl_id = input.module.method_candidate_decl_id(candidate_index);
+                jir.JirDecl decl = input.module.decl_at(decl_id);
+                if (decl.body is .function_decl(function_decl)) {
+                    if (function_matches_method_target(ctx.types_ref(), function_decl, method_symbol, call.args.len(), receiver_type)) {
+                        return jir.JirCallTargetRef(input.module.module_id, decl_id);
+                    }
+                }
+                candidate_index = candidate_index + 1;
+            }
+            module_index = module_index + 1;
+        }
     }
     return jir.JirCallTargetRef();
 }
 
-() resolve_jir_call_targets(list.ArenaList<codegen.ModuleInput> inputs) {
+() resolve_jir_call_targets(context.CompilerContext& ctx, list.ArenaList<codegen.ModuleInput> inputs) {
     Int! input_index = 0;
     while (input_index < inputs.len()) {
         codegen.ModuleInput input = inputs[input_index];
         Int! expr_index = 0;
         while (expr_index < input.module.expr_count()) {
-            jir.JirExpr expr = input.module.expr_at(jir.JirExprId(expr_index));
+            jir.JirExpr& expr = input.module.expr_ref_at(jir.JirExprId(expr_index));
             if (expr.body is .call_expr(call)) {
-                jir.JirCallTargetRef target = resolve_jir_call_target(inputs, input_index, call);
-                if (target.valid()) {
-                    input.module.set_call_target(jir.JirExprId(expr_index), target);
+                jir.JirExprId expr_id = jir.JirExprId(expr_index);
+                jir.JirCallTargetRef current_target = input.module.call_target_at(expr_id);
+                if (!current_target.module_id.valid() || !current_target.jir_decl_id.valid()) {
+                    jir.JirCallTargetRef target = resolve_jir_call_target(ctx, inputs, input_index, expr_id, call);
+                    if (target.valid()) {
+                        input.module.set_call_target(expr_id, target);
+                    }
                 }
             }
             expr_index = expr_index + 1;
@@ -105,6 +170,7 @@ jir.JirCallTargetRef resolve_jir_call_target(list.ArenaList<codegen.ModuleInput>
 list.ArenaList<codegen.ModuleInput> lower_graph_inputs(context.CompilerContext& ctx, module_graph.ModuleGraph& graph) {
     arena.Arena& store = ctx.ast_store_ref();
     list.ArenaList<codegen.ModuleInput>! inputs = list.ArenaList<codegen.ModuleInput>(store);
+    list.ArenaList<Int>! jir_modules = list.ArenaList<Int>(store);
     Int! index = 0;
     while (index < graph.resolve_order_len()) {
         module_graph.Module!^ module = graph.resolve_order_at(index);
@@ -116,9 +182,13 @@ list.ArenaList<codegen.ModuleInput> lower_graph_inputs(context.CompilerContext& 
         jir_value.module_symbol = module_symbol_from_path(ctx, module.source_file.path);
         jir.JirModule!^ lowered_jir = store.create<jir.JirModule>(jir_value);
         inputs.add(codegen.ModuleInput(lowered_jir$.ref()));
+        jir_modules.add(lowered_jir$.as(Int));
         index = index + 1;
     }
-    resolve_jir_call_targets(inputs);
+    resolve_jir_call_targets(ctx, inputs);
+    monomorph.monomorphize_jir_modules(ctx$.ref(), jir_modules.data, jir_modules.len());
+    resolve_jir_call_targets(ctx, inputs);
+    type_layout.compute_jir_modules_layout(ctx$.ref(), jir_modules.data, jir_modules.len());
     return inputs;
 }
 
@@ -199,9 +269,43 @@ public () print_diagnostics(context.CompilerContext& ctx) {
         diagnostic.Diagnostic item = ctx.diagnostics.at(index);
         if (item.severity == .error) {
             puts(ctx.symbol_c_string(item.message));
+            Int! source_index = 0;
+            Bool! printed_source = false;
+            while (!printed_source && source_index < ctx.sources.source_count()) {
+                source.SourceFile source_file = ctx.sources.source_at(source_index);
+                if (item.span.start >= 0 && item.span.start < source_file.text.length) {
+                    puts(slice_to_c_string(ctx$.ref(), source_file.path)$.as(UInt8[*]));
+                    puts(line_for_span_c_string(ctx$.ref(), source_file.text, item.span)$.as(UInt8[*]));
+                    printed_source = true;
+                }
+                source_index = source_index + 1;
+            }
         }
         index = index + 1;
     }
+}
+
+UInt8![*] line_for_span_c_string(context.CompilerContext& ctx, UInt8[] text, token.Span span) {
+    Int! start = span.start;
+    if (start < 0) { start = 0; }
+    if (start > text.length) { start = text.length; }
+    while (start > 0 && text[start - 1] != 10) {
+        start = start - 1;
+    }
+    Int! end = span.start;
+    if (end < start) { end = start; }
+    while (end < text.length && text[end] != 10) {
+        end = end + 1;
+    }
+    arena.Arena& store = ctx.ast_store_ref();
+    UInt8![*] out = store.alloc_array<UInt8>(end - start + 1);
+    Int! index = start;
+    while (index < end) {
+        out[index - start] = text[index];
+        index = index + 1;
+    }
+    out[end - start] = 0;
+    return out;
 }
 
 public CompileResult compile_source_to_object_result(UInt8[] path, UInt8[] text, UInt8[*] object_path) {

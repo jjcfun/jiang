@@ -36,6 +36,16 @@ struct LoweredValue {
     }
 }
 
+struct TypeSubst {
+    Int symbol_id;
+    types.TypeId type_id;
+
+    init(Int symbol_id, types.TypeId type_id) {
+        self.symbol_id = symbol_id;
+        self.type_id = type_id;
+    }
+}
+
 public struct JirLowerer {
     context.CompilerContext& ctx;
     hir.HirModule& module_input;
@@ -45,6 +55,8 @@ public struct JirLowerer {
     Int! active_type_decl_id;
     Int! temp_count;
     list.ArenaList<Int>! local_jir_decl_ids;
+    list.ArenaList<TypeSubst>! active_type_substs;
+    list.ArenaList<Int>! type_subst_scope_starts;
 
     init(context.CompilerContext& ctx, hir.HirModule& source_module) {
         self.ctx = ctx;
@@ -55,6 +67,8 @@ public struct JirLowerer {
         self.active_type_decl_id = 0;
         self.temp_count = 0;
         self.local_jir_decl_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.active_type_substs = list.ArenaList<TypeSubst>(ctx.ast_store_ref());
+        self.type_subst_scope_starts = list.ArenaList<Int>(ctx.ast_store_ref());
     }
 
     init(context.CompilerContext& ctx, hir.HirModule& source_module, UInt8[] source_text) {
@@ -66,6 +80,8 @@ public struct JirLowerer {
         self.active_type_decl_id = 0;
         self.temp_count = 0;
         self.local_jir_decl_ids = list.ArenaList<Int>(ctx.ast_store_ref());
+        self.active_type_substs = list.ArenaList<TypeSubst>(ctx.ast_store_ref());
+        self.type_subst_scope_starts = list.ArenaList<Int>(ctx.ast_store_ref());
     }
 
     public jir.JirModule lower() {
@@ -173,6 +189,115 @@ public struct JirLowerer {
     types.TypeId bool_type(token.Span span) {
         types.TypeTable& table = self.ctx.types_ref();
         return table.make_builtin(span, self.ctx.intern("Bool"));
+    }
+
+    () push_type_subst_scope() {
+        self.type_subst_scope_starts.add(self.active_type_substs.len());
+    }
+
+    () pop_type_subst_scope() {
+        if (self.type_subst_scope_starts.len() == 0) { return; }
+        Int start = self.type_subst_scope_starts[self.type_subst_scope_starts.len() - 1];
+        while (self.active_type_substs.len() > start) {
+            self.active_type_substs.pop();
+        }
+        self.type_subst_scope_starts.pop();
+    }
+
+    () add_type_subst(Int symbol_id, types.TypeId type_id) {
+        if (symbol_id <= 0 || !type_id.valid()) { return; }
+        Int! index = self.active_type_substs.len() - 1;
+        while (index >= 0) {
+            TypeSubst subst = self.active_type_substs[index];
+            if (subst.symbol_id == symbol_id) {
+                self.active_type_substs.set(index, TypeSubst(symbol_id, type_id));
+                return;
+            }
+            index = index - 1;
+        }
+        self.active_type_substs.add(TypeSubst(symbol_id, type_id));
+    }
+
+    types.TypeId lookup_type_subst(Int symbol_id) {
+        Int! index = self.active_type_substs.len() - 1;
+        while (index >= 0) {
+            TypeSubst subst = self.active_type_substs[index];
+            if (subst.symbol_id == symbol_id) {
+                return subst.type_id;
+            }
+            index = index - 1;
+        }
+        return types.TypeId();
+    }
+
+    types.TypeId lower_type_id(types.TypeId type_id) {
+        if (!type_id.valid()) { return type_id; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(type_id);
+        if (info.kind == .type_param) {
+            types.TypeId substituted = self.lookup_type_subst(info.symbol.id);
+            if (substituted.valid()) { return substituted; }
+            return type_id;
+        }
+        if (info.kind == .pointer) {
+            types.TypeId element = self.lower_type_id(info.element);
+            if (element.id != info.element.id) {
+                return table.make_pointer_kind(info.span, element, info.pointer_kind, info.mutable_item, info.many);
+            }
+            return type_id;
+        }
+        if (info.kind == .slice) {
+            types.TypeId element = self.lower_type_id(info.element);
+            if (element.id != info.element.id) { return table.make_slice(info.span, element); }
+            return type_id;
+        }
+        if (info.kind == .array) {
+            types.TypeId element = self.lower_type_id(info.element);
+            if (element.id != info.element.id) { return table.make_array(info.span, element, info.inferred_count, info.child_count); }
+            return type_id;
+        }
+        if (info.kind == .layer) {
+            types.TypeId element = self.lower_type_id(info.element);
+            if (element.id != info.element.id) { return table.make_layer(info.span, element, info.optional, info.mutable); }
+            return type_id;
+        }
+        if (info.kind == .errorable) {
+            types.TypeId value = self.lower_type_id(info.element);
+            types.TypeId error = self.lower_type_id(info.other);
+            if (value.id != info.element.id || error.id != info.other.id) { return table.make_errorable(info.span, value, error); }
+            return type_id;
+        }
+        if (info.kind == .nominal && info.child_count > 0) {
+            Bool! changed = false;
+            Int child_start = table.begin_children();
+            Int! index = 0;
+            while (index < info.child_count) {
+                types.TypeId child = table.child_at(info.child_start + index);
+                types.TypeId lowered_child = self.lower_type_id(child);
+                if (lowered_child.id != child.id) { changed = true; }
+                table.add_child(lowered_child);
+                index = index + 1;
+            }
+            if (changed) {
+                return table.make_nominal_decl_with_args(info.span, info.symbol, info.binding_id, info.decl_id, info.nominal_kind, child_start, info.child_count);
+            }
+            return type_id;
+        }
+        if ((info.kind == .tuple || info.kind == .function) && info.child_count > 0) {
+            Bool! changed = false;
+            Int child_start = table.begin_children();
+            Int! index = 0;
+            while (index < info.child_count) {
+                types.TypeId child = table.child_at(info.child_start + index);
+                types.TypeId lowered_child = self.lower_type_id(child);
+                if (lowered_child.id != child.id) { changed = true; }
+                table.add_child(lowered_child);
+                index = index + 1;
+            }
+            if (changed) { return table.make_compound(info.kind, info.span, child_start, info.child_count); }
+            return type_id;
+        }
+        return type_id;
     }
 
     types.NominalKind type_decl_nominal_kind(jir.JirTypeDeclKind kind) {
@@ -286,12 +411,7 @@ public struct JirLowerer {
     }
 
     jir.JirTypeExpr lower_type_expr(hir.HirTypeExpr type_expr) {
-        types.TypeId! type_id = type_expr.type_id;
-        types.TypeId resolved_type_id = self.type_from_ast_ref(type_expr.type_ref);
-        if (resolved_type_id.valid()) {
-            type_id = resolved_type_id;
-        }
-        return jir.JirTypeExpr(type_id);
+        return jir.JirTypeExpr(self.lower_type_id(type_expr.type_id));
     }
 
     jir.JirDecl lower_struct_decl(scope.DeclId decl_id, hir.HirStructDecl decl) {
@@ -619,7 +739,7 @@ public struct JirLowerer {
         return false;
     }
 
-    jir.JirFieldExpr lower_field_expr(jir.JirExprId base, ir.Name name, Bool optional_chain, Bool place_projection, Int hir_field_index) {
+    jir.JirFieldExpr lower_field_expr(jir.JirExprId base, ir.Name name, Bool optional_chain, Bool implicit_member, Bool place_projection, Int hir_field_index) {
         jir.JirExpr base_expr = self.module.expr_at(base);
         Int! field_index = hir_field_index;
         if (field_index < 0) {
@@ -629,6 +749,7 @@ public struct JirLowerer {
             base,
             name,
             optional_chain,
+            implicit_member,
             place_projection,
             field_index,
             self.field_type_optional_for_type(base_expr.type_id, name),
@@ -767,16 +888,32 @@ public struct JirLowerer {
     }
 
     jir.JirDecl lower_function_decl(scope.DeclId decl_id, hir.HirFunctionDecl decl) {
-        jir.JirFunctionDecl! lowered = jir.JirFunctionDecl(self.module.store, decl.span, decl.name, decl.binding_id, decl.type_id, decl.result_type, decl.public_flag, decl.extern_flag, decl.static_flag);
+        self.push_type_subst_scope();
+        jir.JirFunctionDecl! lowered = jir.JirFunctionDecl(self.module.store, decl.span, decl.name, decl.binding_id, self.lower_type_id(decl.type_id), self.lower_type_id(decl.result_type), decl.public_flag, decl.extern_flag, decl.static_flag);
+        lowered.decl_id = decl_id;
+        Int! generic_index = 0;
+        if (self.active_type_decl_id != 0) {
+            jir.JirTypeDecl^ active_decl = self.active_type_decl_id$.as(jir.JirTypeDecl^);
+            while (generic_index < active_decl.generic_params.len()) {
+                lowered.generic_params.add(active_decl.generic_params[generic_index]);
+                generic_index = generic_index + 1;
+            }
+            generic_index = 0;
+        }
+        while (generic_index < decl.generic_params.len()) {
+            lowered.generic_params.add(decl.generic_params[generic_index]);
+            generic_index = generic_index + 1;
+        }
         Int! index = 0;
         while (index < decl.params.len()) {
             hir.HirParam param = decl.params[index];
-            lowered.params.add(jir.JirParam(param.span, param.name, param.local_id, param.type_id, param.mutable_binding));
+            lowered.params.add(jir.JirParam(param.span, param.name, param.local_id, self.lower_type_id(param.type_id), param.mutable_binding));
             index = index + 1;
         }
         if (decl.body is some body) {
             lowered.body = self.lower_block(body);
         }
+        self.pop_type_subst_scope();
         return jir.JirDecl(decl_id, decl.span, .function_decl(lowered));
     }
 
@@ -893,7 +1030,7 @@ public struct JirLowerer {
         Int! index = defers.len() - 1;
         while (index >= 0) {
             jir.JirBlock body = defers[index];
-            result.stmts.add(self.module.add_stmt(jir.JirStmt(body.span, .run_defer(jir.JirRunDeferStmt(body.span, body)))));
+            result.stmts.add(self.module.add_stmt(jir.JirStmt(body.span, .run_defer(self.module.store.create<jir.JirRunDeferStmt>(jir.JirRunDeferStmt(body.span, body))))));
             index = index - 1;
         }
         return result;
@@ -990,7 +1127,7 @@ public struct JirLowerer {
         if (if_stmt.else_block is some else_block) {
             lowered.else_block = self.lower_block_with_defers(else_block, context);
         }
-        cond.block.stmts.add(self.module.add_stmt(jir.JirStmt(if_stmt.span, .if_stmt(lowered))));
+        cond.block.stmts.add(self.module.add_stmt(jir.JirStmt(if_stmt.span, .if_stmt(self.module.store.create<jir.JirIfStmt>(lowered)))));
         return cond.block;
     }
 
@@ -1004,7 +1141,7 @@ public struct JirLowerer {
         LoweredValue! start = self.append_value_expr(block, for_range.start, context);
         LoweredValue! end_value = self.append_value_expr(start.block, for_range.end_expr, context);
         jir.JirForRangeStmt lowered = jir.JirForRangeStmt(for_range.span, for_range.name, for_range.local_id, for_range.type_id, start.value, end_value.value, self.lower_block_with_defers(for_range.body, self.loop_body_defer_context(context)));
-        end_value.block.stmts.add(self.module.add_stmt(jir.JirStmt(for_range.span, .for_range(lowered))));
+        end_value.block.stmts.add(self.module.add_stmt(jir.JirStmt(for_range.span, .for_range(self.module.store.create<jir.JirForRangeStmt>(lowered)))));
         return end_value.block;
     }
 
@@ -1012,7 +1149,7 @@ public struct JirLowerer {
         LoweredValue! iterable = self.append_value_expr(block, for_each.iterable, context);
         jir.JirForEachStmt! lowered = jir.JirForEachStmt(self.module.store, for_each.span, iterable.value, self.lower_block_with_defers(for_each.body, self.loop_body_defer_context(context)), for_each.indexed_flag);
         self.add_pattern_ops_to_id(lowered.tests$.ptr(), lowered.binds$.ptr(), iterable.value, for_each.pattern, false, false, -1);
-        iterable.block.stmts.add(self.module.add_stmt(jir.JirStmt(for_each.span, .for_each(lowered))));
+        iterable.block.stmts.add(self.module.add_stmt(jir.JirStmt(for_each.span, .for_each(self.module.store.create<jir.JirForEachStmt>(lowered)))));
         return iterable.block;
     }
 
@@ -1024,7 +1161,7 @@ public struct JirLowerer {
         jir.JirWhileStmt! lowered = jir.JirWhileStmt(self.module.store, while_stmt.span, cond.value, body);
         lowered.cond_block = cond.block;
         jir.JirBlock! result = block;
-        result.stmts.add(self.module.add_stmt(jir.JirStmt(while_stmt.span, .while_stmt(lowered))));
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(while_stmt.span, .while_stmt(self.module.store.create<jir.JirWhileStmt>(lowered)))));
         return result;
     }
 
@@ -1032,24 +1169,24 @@ public struct JirLowerer {
         hir.HirExpr expr = self.module_input.expr_at(stmt.value);
         if (expr.body is .hir_block(block_expr)) {
             jir.JirBlock! result = block;
-            result.stmts.add(self.module.add_stmt(jir.JirStmt(block_expr.block.span, .block(jir.JirBlockStmt(self.lower_block_with_tail(block_expr.block, block_expr.value, jir.JirExprId(), stmt.span, false, context))))));
+            result.stmts.add(self.module.add_stmt(jir.JirStmt(block_expr.block.span, .block(self.module.store.create<jir.JirBlockStmt>(jir.JirBlockStmt(self.lower_block_with_tail(block_expr.block, block_expr.value, jir.JirExprId(), stmt.span, false, context)))))));
             return result;
         }
         if (expr.body is .hir_if(if_expr)) {
             LoweredValue cond = self.append_value_expr(block, if_expr.cond, context);
             jir.JirIfStmt! lowered = jir.JirIfStmt(stmt.span, cond.value, self.lower_expr_as_stmt_block(stmt.span, if_expr.then_value, context));
             lowered.else_block = self.lower_expr_as_stmt_block(stmt.span, if_expr.else_value, context);
-            cond.block.stmts.add(self.module.add_stmt(jir.JirStmt(stmt.span, .if_stmt(lowered))));
+            cond.block.stmts.add(self.module.add_stmt(jir.JirStmt(stmt.span, .if_stmt(self.module.store.create<jir.JirIfStmt>(lowered)))));
             return cond.block;
         }
         if (expr.body is .hir_switch(switch_expr)) {
             LoweredValue value = self.append_value_expr(block, switch_expr.value, context);
-            value.block.stmts.add(self.module.add_stmt(jir.JirStmt(stmt.span, .switch_stmt(self.lower_switch_expr_as_stmt_with_value(stmt.span, switch_expr, context, value.value)))));
+            value.block.stmts.add(self.module.add_stmt(jir.JirStmt(stmt.span, .switch_stmt(self.module.store.create<jir.JirSwitchStmt>(self.lower_switch_expr_as_stmt_with_value(stmt.span, switch_expr, context, value.value))))));
             return value.block;
         }
         if (expr.body is .hir_try(try_expr)) {
             jir.JirBlock! result = block;
-            result.stmts.add(self.module.add_stmt(jir.JirStmt(stmt.span, .try_stmt(self.lower_try_expr_as_stmt(stmt.span, try_expr, context)))));
+            result.stmts.add(self.module.add_stmt(jir.JirStmt(stmt.span, .try_stmt(self.module.store.create<jir.JirTryStmt>(self.lower_try_expr_as_stmt(stmt.span, try_expr, context))))));
             return result;
         }
         LoweredValue lowered = self.append_value_expr(block, stmt.value, context);
@@ -1075,7 +1212,7 @@ public struct JirLowerer {
         }
         if (stmt.body is .block(block)) {
             jir.JirBlock lowered = self.lower_block_with_defers(block, context);
-            return jir.JirStmt(block.span, .block(jir.JirBlockStmt(lowered)));
+            return jir.JirStmt(block.span, .block(self.module.store.create<jir.JirBlockStmt>(jir.JirBlockStmt(lowered))));
         }
         if (stmt.body is .break_stmt(span)) {
             return jir.JirStmt(span, .break_stmt(span));
@@ -1084,7 +1221,7 @@ public struct JirLowerer {
             return jir.JirStmt(span, .continue_stmt(span));
         }
         assert(false);
-        return jir.JirStmt(stmt.span, .block(jir.JirBlockStmt(jir.JirBlock(self.module.store, stmt.span))));
+        return jir.JirStmt(stmt.span, .block(self.module.store.create<jir.JirBlockStmt>(jir.JirBlockStmt(jir.JirBlock(self.module.store, stmt.span)))));
     }
 
     jir.JirBlock append_var_decl(jir.JirBlock block, hir.HirVarDecl var_decl, DeferContext context) {
@@ -1119,8 +1256,9 @@ public struct JirLowerer {
             result.stmts.add(self.module.add_stmt(jir.JirStmt(binding.span, .local(local))));
             jir.JirExprId! field_value = temp_value;
             if (stmt.bindings.len() > 1) {
-                jir.JirFieldExpr field = self.lower_field_expr(temp_value, binding.name, false, false, index);
-                field_value = self.module.add_expr(jir.JirExpr(binding.span, binding.type_id, .field_expr(field)));
+                jir.JirFieldExpr field = self.lower_field_expr(temp_value, binding.name, false, false, false, index);
+                jir.JirFieldExpr^ boxed_field = new jir.JirFieldExpr(field.base, field.name, field.optional_chain, field.implicit_member, field.place_projection, field.field_index, field.field_type_optional, field.type_decl_id, field.variant_index);
+                field_value = self.module.add_expr(jir.JirExpr(binding.span, binding.type_id, .field_expr(boxed_field)));
             }
             jir.JirNameExpr target = jir.JirNameExpr(binding.name, scope.BindingId(), binding.local_id);
             jir.JirExprId target_value = self.module.add_expr(jir.JirExpr(binding.span, binding.type_id, .name_expr(target)));
@@ -1254,8 +1392,9 @@ public struct JirLowerer {
         }
         if (expr.body is .hir_field(field)) {
             LoweredValue base = self.append_value_expr(block, field.base, context);
-            jir.JirFieldExpr lowered = self.lower_field_expr(base.value, field.name, field.optional_chain, field.place_projection, field.field_index);
-            return LoweredValue(base.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .field_expr(lowered))));
+            jir.JirFieldExpr lowered = self.lower_field_expr(base.value, field.name, field.optional_chain, field.implicit_member, field.place_projection, field.field_index);
+            jir.JirFieldExpr^ boxed_field = new jir.JirFieldExpr(lowered.base, lowered.name, lowered.optional_chain, lowered.implicit_member, lowered.place_projection, lowered.field_index, lowered.field_type_optional, lowered.type_decl_id, lowered.variant_index);
+            return LoweredValue(base.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .field_expr(boxed_field))));
         }
         if (expr.body is .hir_index(index_expr)) {
             LoweredValue base = self.append_value_expr(block, index_expr.base, context);
@@ -1293,12 +1432,12 @@ public struct JirLowerer {
             if (pattern.body is .optional(optional)) {
                 jir.JirOptionalIsSomeExpr! lowered = jir.JirOptionalIsSomeExpr(self.module.store, value.value);
                 self.add_pattern_tests_to_id(lowered.tests$.ptr(), value.value, optional.payload, false, true, -1);
-                return LoweredValue(value.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .optional_some_expr(lowered))));
+                return LoweredValue(value.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .optional_some_expr(self.module.store.create<jir.JirOptionalIsSomeExpr>(lowered)))));
             }
         }
         jir.JirIsExpr! lowered = jir.JirIsExpr(self.module.store, value.value);
         self.add_pattern_tests_to_id(lowered.tests$.ptr(), value.value, is_expr.pattern, false, false, -1);
-        return LoweredValue(value.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .is_pattern_expr(lowered))));
+        return LoweredValue(value.block, self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .is_pattern_expr(self.module.store.create<jir.JirIsExpr>(lowered)))));
     }
 
     jir.JirExprId lower_plain_is_expr(hir.HirExpr expr, hir.HirIsExpr is_expr) {
@@ -1308,19 +1447,24 @@ public struct JirLowerer {
                 jir.JirExprId lowered_value = self.lower_plain_expr_id(is_expr.value);
                 jir.JirOptionalIsSomeExpr! optional_value = jir.JirOptionalIsSomeExpr(self.module.store, lowered_value);
                 self.add_pattern_tests_to_id(optional_value.tests$.ptr(), lowered_value, optional.payload, false, true, -1);
-                return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .optional_some_expr(optional_value)));
+                return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .optional_some_expr(self.module.store.create<jir.JirOptionalIsSomeExpr>(optional_value))));
             }
         }
         jir.JirExprId lowered_value = self.lower_plain_expr_id(is_expr.value);
         jir.JirIsExpr! is_value = jir.JirIsExpr(self.module.store, lowered_value);
         self.add_pattern_tests_to_id(is_value.tests$.ptr(), lowered_value, is_expr.pattern, false, false, -1);
-        return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .is_pattern_expr(is_value)));
+        return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .is_pattern_expr(self.module.store.create<jir.JirIsExpr>(is_value))));
     }
 
     LoweredValue append_call_expr(jir.JirBlock block, hir.HirExprId hir_expr_id, hir.HirExpr expr, hir.HirCallExpr call, DeferContext context) {
         LoweredValue callee = self.append_value_expr(block, call.callee, context);
-        jir.JirCallExpr! lowered = jir.JirCallExpr(self.module.store, callee.value, call.target_decl_id, call.target_kind_id);
+        jir.JirCallExpr^ lowered = new jir.JirCallExpr(self.module.store, callee.value, call.target_decl_id, call.target_kind_id);
         lowered.set_target_overload_index(call.target_overload_index);
+        Int! generic_index = 0;
+        while (generic_index < call.generic_type_args.len()) {
+            lowered.add_generic_type_arg(self.lower_type_id(call.generic_type_args[generic_index]));
+            generic_index = generic_index + 1;
+        }
         jir.JirBlock! result = callee.block;
         Int! index = 0;
         while (index < call.args.len()) {
@@ -1329,9 +1473,9 @@ public struct JirLowerer {
             lowered.args.add(arg.value);
             index = index + 1;
         }
-        lowered.set_method_target(call.method_receiver_type_id, call.method_symbol);
-        jir.JirExprId call_id = self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .call_expr(lowered)));
-        types.TypeId receiver_type_id = self.module_input.call_method_receiver_type_at(hir_expr_id);
+        lowered.set_method_target(self.lower_type_id(call.method_receiver_type_id), call.method_symbol);
+        jir.JirExprId call_id = self.module.add_expr(jir.JirExpr(expr.span, self.lower_type_id(expr.type_id), .call_expr(lowered)));
+        types.TypeId receiver_type_id = self.lower_type_id(self.module_input.call_method_receiver_type_at(hir_expr_id));
         interner.Symbol method_symbol = self.module_input.call_method_symbol_at(hir_expr_id);
         if (receiver_type_id.valid() && method_symbol.valid()) {
             self.module.set_call_method_target(call_id, receiver_type_id, method_symbol);
@@ -1342,14 +1486,14 @@ public struct JirLowerer {
     jir.JirBlock append_block_value_assignment(jir.JirBlock block, token.Span span, jir.JirExprId target, hir.HirBlockExpr expr, DeferContext context) {
         jir.JirBlock! result = block;
         jir.JirBlock lowered = self.lower_block_with_tail(expr.block, expr.value, target, span, true, context);
-        result.stmts.add(self.module.add_stmt(jir.JirStmt(expr.block.span, .block(jir.JirBlockStmt(lowered)))));
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(expr.block.span, .block(self.module.store.create<jir.JirBlockStmt>(jir.JirBlockStmt(lowered))))));
         return result;
     }
 
     jir.JirBlock append_coalesce_value_assignment(jir.JirBlock block, token.Span span, jir.JirExprId target, hir.HirExpr expr, hir.HirCoalesceExpr coalesce, DeferContext context) {
         LoweredValue left = self.append_value_expr(block, coalesce.left, context);
         jir.JirOptionalIsSomeExpr! test = jir.JirOptionalIsSomeExpr(self.module.store, left.value);
-        jir.JirExprId cond = self.module.add_expr(jir.JirExpr(expr.span, self.bool_type(expr.span), .optional_some_expr(test)));
+        jir.JirExprId cond = self.module.add_expr(jir.JirExpr(expr.span, self.bool_type(expr.span), .optional_some_expr(self.module.store.create<jir.JirOptionalIsSomeExpr>(test))));
         jir.JirBlock! then_block = jir.JirBlock(self.module.store, expr.span);
         jir.JirAssignStmt then_assign = jir.JirAssignStmt(span, target, left.value);
         then_block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .assign(then_assign))));
@@ -1357,7 +1501,7 @@ public struct JirLowerer {
         else_block = self.append_expr_assignment(else_block, span, target, coalesce.right, context);
         jir.JirIfStmt! lowered = jir.JirIfStmt(expr.span, cond, then_block);
         lowered.else_block = else_block;
-        left.block.stmts.add(self.module.add_stmt(jir.JirStmt(expr.span, .if_stmt(lowered))));
+        left.block.stmts.add(self.module.add_stmt(jir.JirStmt(expr.span, .if_stmt(self.module.store.create<jir.JirIfStmt>(lowered)))));
         return left.block;
     }
 
@@ -1369,7 +1513,7 @@ public struct JirLowerer {
         jir.JirTryStmt! lowered = jir.JirTryStmt(self.module.store, span, body);
         lowered.catches.add(jir.JirCatchStmt(span, catch_handler.binding, catch_handler.local_id, catch_handler.type_id, catch_handler.mutable_binding, catch_block));
         jir.JirBlock! result = block;
-        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(lowered))));
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(self.module.store.create<jir.JirTryStmt>(lowered)))));
         return result;
     }
 
@@ -1385,7 +1529,7 @@ public struct JirLowerer {
             lowered.fields.add(jir.JirStructFieldInit(field.span, field.name, value.value, self.struct_init_field_index(type_id, field, index)));
             index = index + 1;
         }
-        return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .struct_expr(lowered))));
+        return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .struct_expr(self.module.store.create<jir.JirStructExpr>(lowered)))));
     }
 
     LoweredValue append_variant_expr(jir.JirBlock block, token.Span span, types.TypeId type_id, hir.HirVariantExpr expr, DeferContext context) {
@@ -1399,7 +1543,7 @@ public struct JirLowerer {
             lowered.payload.add(value.value);
             index = index + 1;
         }
-        return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .variant_expr(lowered))));
+        return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .variant_expr(self.module.store.create<jir.JirVariantExpr>(lowered)))));
     }
 
     LoweredValue append_sequence_expr(jir.JirBlock block, token.Span span, types.TypeId type_id, hir.HirSequenceExpr expr, Bool tuple_flag, DeferContext context) {
@@ -1413,9 +1557,9 @@ public struct JirLowerer {
             index = index + 1;
         }
         if (tuple_flag) {
-            return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .tuple_expr(lowered))));
+            return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .tuple_expr(self.module.store.create<jir.JirSequenceExpr>(lowered)))));
         }
-        return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .array_expr(lowered))));
+        return LoweredValue(result, self.module.add_expr(jir.JirExpr(span, type_id, .array_expr(self.module.store.create<jir.JirSequenceExpr>(lowered)))));
     }
 
     jir.JirExprId bool_literal_expr(token.Span span, types.TypeId type_id, Bool value) {
@@ -1443,7 +1587,7 @@ public struct JirLowerer {
         }
         jir.JirIfStmt! lowered = jir.JirIfStmt(span, left.value, then_block);
         lowered.else_block = else_block;
-        left.block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .if_stmt(lowered))));
+        left.block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .if_stmt(self.module.store.create<jir.JirIfStmt>(lowered)))));
         return left.block;
     }
 
@@ -1460,7 +1604,7 @@ public struct JirLowerer {
         else_block = self.append_expr_assignment(else_block, span, target, expr.else_value, context);
         jir.JirIfStmt! lowered = jir.JirIfStmt(span, cond.value, then_block);
         lowered.else_block = else_block;
-        cond.block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .if_stmt(lowered))));
+        cond.block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .if_stmt(self.module.store.create<jir.JirIfStmt>(lowered)))));
         return cond.block;
     }
 
@@ -1478,7 +1622,7 @@ public struct JirLowerer {
             lowered.cases.add(lowered_case);
             index = index + 1;
         }
-        value.block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .switch_stmt(lowered))));
+        value.block.stmts.add(self.module.add_stmt(jir.JirStmt(span, .switch_stmt(self.module.store.create<jir.JirSwitchStmt>(lowered)))));
         return value.block;
     }
 
@@ -1510,7 +1654,7 @@ public struct JirLowerer {
             lowered.catches.add(jir.JirCatchStmt(catch_expr.span, catch_expr.binding, catch_expr.local_id, catch_expr.type_id, catch_expr.mutable_binding, catch_block));
             index = index + 1;
         }
-        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(lowered))));
+        result.stmts.add(self.module.add_stmt(jir.JirStmt(span, .try_stmt(self.module.store.create<jir.JirTryStmt>(lowered)))));
         return result;
     }
 
@@ -1540,13 +1684,13 @@ public struct JirLowerer {
         jir.JirCoalesceControlLocalStmt! lowered = jir.JirCoalesceControlLocalStmt(self.module.store, span, var_decl.name, var_decl.local_id, var_decl.type_id, left.value, coalesce_control.control, result, var_decl.mutable_binding);
         lowered.left_block = left.block;
         lowered.result_block = result_block;
-        return jir.JirStmt(var_decl.span, .coalesce_control_local(lowered));
+        return jir.JirStmt(var_decl.span, .coalesce_control_local(self.module.store.create<jir.JirCoalesceControlLocalStmt>(lowered)));
     }
 
     jir.JirStmt lower_switch_stmt_with_value(hir.HirSwitchStmt stmt, DeferContext context, jir.JirExprId value) {
         jir.JirSwitchStmt! lowered = jir.JirSwitchStmt(self.module.store, stmt.span, value);
         self.append_switch_stmt_cases(lowered$.ptr(), stmt.cases, context, 0);
-        return jir.JirStmt(stmt.span, .switch_stmt(lowered));
+        return jir.JirStmt(stmt.span, .switch_stmt(self.module.store.create<jir.JirSwitchStmt>(lowered)));
     }
 
     jir.JirSwitchCase lower_switch_stmt_case(jir.JirExprId switch_value, hir.HirSwitchCase case_value, DeferContext context) {
@@ -1624,8 +1768,8 @@ public struct JirLowerer {
             return body;
         }
         jir.JirBlock! wrapped = jir.JirBlock(self.module.store, span);
-        wrapped.stmts.add(self.module.add_stmt(jir.JirStmt(span, .pattern_bind(bind_stmt))));
-        wrapped.stmts.add(self.module.add_stmt(jir.JirStmt(body.span, .block(jir.JirBlockStmt(body)))));
+        wrapped.stmts.add(self.module.add_stmt(jir.JirStmt(span, .pattern_bind(self.module.store.create<jir.JirPatternBindStmt>(bind_stmt)))));
+        wrapped.stmts.add(self.module.add_stmt(jir.JirStmt(body.span, .block(self.module.store.create<jir.JirBlockStmt>(jir.JirBlockStmt(body))))));
         return wrapped;
     }
 
@@ -1678,7 +1822,7 @@ public struct JirLowerer {
             lowered.catches.add(jir.JirCatchStmt(catch_stmt.span, catch_stmt.binding, catch_stmt.local_id, catch_stmt.type_id, catch_stmt.mutable_binding, self.lower_block_with_defers(catch_stmt.body, context)));
             index = index + 1;
         }
-        return jir.JirStmt(stmt.span, .try_stmt(lowered));
+        return jir.JirStmt(stmt.span, .try_stmt(self.module.store.create<jir.JirTryStmt>(lowered)));
     }
 
     jir.JirExprId lower_plain_expr_id(hir.HirExprId id) {
@@ -1738,16 +1882,21 @@ public struct JirLowerer {
             return jir.JirExprId();
         }
         if (expr.body is .hir_call(call)) {
-            jir.JirCallExpr! call_value = jir.JirCallExpr(self.module.store, self.lower_plain_expr_id(call.callee), call.target_decl_id, call.target_kind_id);
+            jir.JirCallExpr^ call_value = new jir.JirCallExpr(self.module.store, self.lower_plain_expr_id(call.callee), call.target_decl_id, call.target_kind_id);
             call_value.set_target_overload_index(call.target_overload_index);
+            Int! generic_index = 0;
+            while (generic_index < call.generic_type_args.len()) {
+                call_value.add_generic_type_arg(self.lower_type_id(call.generic_type_args[generic_index]));
+                generic_index = generic_index + 1;
+            }
             Int! index = 0;
             while (index < call.args.len()) {
                 call_value.args.add(self.lower_plain_expr_id(call.args[index]));
                 index = index + 1;
             }
-            call_value.set_method_target(call.method_receiver_type_id, call.method_symbol);
-            jir.JirExprId call_id = self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .call_expr(call_value)));
-            types.TypeId receiver_type_id = self.module_input.call_method_receiver_type_at(hir_expr_id);
+            call_value.set_method_target(self.lower_type_id(call.method_receiver_type_id), call.method_symbol);
+            jir.JirExprId call_id = self.module.add_expr(jir.JirExpr(expr.span, self.lower_type_id(expr.type_id), .call_expr(call_value)));
+            types.TypeId receiver_type_id = self.lower_type_id(self.module_input.call_method_receiver_type_at(hir_expr_id));
             interner.Symbol method_symbol = self.module_input.call_method_symbol_at(hir_expr_id);
             if (receiver_type_id.valid() && method_symbol.valid()) {
                 self.module.set_call_method_target(call_id, receiver_type_id, method_symbol);
@@ -1755,8 +1904,9 @@ public struct JirLowerer {
             return call_id;
         }
         if (expr.body is .hir_field(field)) {
-            jir.JirFieldExpr lowered = self.lower_field_expr(self.lower_plain_expr_id(field.base), field.name, field.optional_chain, field.place_projection, field.field_index);
-            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .field_expr(lowered)));
+            jir.JirFieldExpr lowered = self.lower_field_expr(self.lower_plain_expr_id(field.base), field.name, field.optional_chain, field.implicit_member, field.place_projection, field.field_index);
+            jir.JirFieldExpr^ boxed_field = new jir.JirFieldExpr(lowered.base, lowered.name, lowered.optional_chain, lowered.implicit_member, lowered.place_projection, lowered.field_index, lowered.field_type_optional, lowered.type_decl_id, lowered.variant_index);
+            return self.module.add_expr(jir.JirExpr(expr.span, expr.type_id, .field_expr(boxed_field)));
         }
         if (expr.body is .hir_index(index_expr)) {
             jir.JirExprId base = self.lower_plain_expr_id(index_expr.base);
@@ -1797,7 +1947,7 @@ public struct JirLowerer {
             lowered.fields.add(jir.JirStructFieldInit(field.span, field.name, self.lower_plain_expr_id(field.value), self.struct_init_field_index(type_id, field, index)));
             index = index + 1;
         }
-        return self.module.add_expr(jir.JirExpr(span, type_id, .struct_expr(lowered)));
+        return self.module.add_expr(jir.JirExpr(span, type_id, .struct_expr(self.module.store.create<jir.JirStructExpr>(lowered))));
     }
 
     jir.JirExprId lower_variant_expr(token.Span span, types.TypeId type_id, hir.HirVariantExpr expr) {
@@ -1808,7 +1958,7 @@ public struct JirLowerer {
             lowered.payload.add(self.lower_plain_expr_id(expr.payload[index]));
             index = index + 1;
         }
-        return self.module.add_expr(jir.JirExpr(span, type_id, .variant_expr(lowered)));
+        return self.module.add_expr(jir.JirExpr(span, type_id, .variant_expr(self.module.store.create<jir.JirVariantExpr>(lowered))));
     }
 
     jir.JirExprId lower_sequence_expr(token.Span span, types.TypeId type_id, hir.HirSequenceExpr expr, Bool tuple_flag) {
@@ -1819,9 +1969,9 @@ public struct JirLowerer {
             index = index + 1;
         }
         if (tuple_flag) {
-            return self.module.add_expr(jir.JirExpr(span, type_id, .tuple_expr(lowered)));
+            return self.module.add_expr(jir.JirExpr(span, type_id, .tuple_expr(self.module.store.create<jir.JirSequenceExpr>(lowered))));
         }
-        return self.module.add_expr(jir.JirExpr(span, type_id, .array_expr(lowered)));
+        return self.module.add_expr(jir.JirExpr(span, type_id, .array_expr(self.module.store.create<jir.JirSequenceExpr>(lowered))));
     }
 }
 

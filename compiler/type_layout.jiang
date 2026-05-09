@@ -1,0 +1,370 @@
+import "./ast.jiang";
+import "./context.jiang";
+import diagnostic = "./diagnostic.jiang";
+import ir = "./ir_common.jiang";
+import "./interner.jiang";
+import "./jir.jiang";
+import semantic_ctx = "./semantic.jiang";
+import "./scope.jiang";
+import source_manager = "./source_manager.jiang";
+import "./source.jiang";
+import "./token.jiang";
+import arena = "./support/arena.jiang";
+import hash_util = "./support/hash.jiang";
+import types = "./type.jiang";
+import list = "./support/list.jiang";
+import map = "./support/map.jiang";
+import string = "./support/string.jiang";
+
+struct TypeSubst {
+    Int symbol_id;
+    types.TypeId type_id;
+
+    init(Int symbol_id, types.TypeId type_id) {
+        self.symbol_id = symbol_id;
+        self.type_id = type_id;
+    }
+}
+
+struct LayoutEnv {
+    list.ArenaList<TypeSubst> generic_substs;
+
+    init(context.CompilerContext& ctx) {
+        self.generic_substs = list.ArenaList<TypeSubst>(ctx.ast_store_ref());
+    }
+
+    public () add_generic_subst(Int symbol_id, types.TypeId type_id) {
+        self.generic_substs.add(TypeSubst(symbol_id, type_id));
+    }
+
+    public types.TypeId lookup_generic_subst(Int symbol_id) {
+        Int! index = self.generic_substs.len() - 1;
+        while (index >= 0) {
+            if (self.generic_substs[index].symbol_id == symbol_id) {
+                return self.generic_substs[index].type_id;
+            }
+            index = index - 1;
+        }
+        return types.TypeId();
+    }
+}
+
+struct TypeLayoutContext {
+    context.CompilerContext& ctx;
+    types.TypeTable& type_table;
+    Int![*] inputs;
+    Int input_count;
+
+    init(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
+        self.ctx = ctx;
+        self.type_table = ctx.types_ref();
+        self.inputs = inputs;
+        self.input_count = input_count;
+    }
+
+    jir.JirTypeDecl? type_decl_for_decl_id(scope.DeclId decl_id) {
+        if (!decl_id.valid()) { return null; }
+        Int! index = 0;
+        while (index < self.input_count) {
+            jir.JirModule^ module = self.inputs[index]$.as(jir.JirModule^);
+            jir.JirTypeDecl? decl = module.type_decl_for_decl_id(decl_id);
+            if (decl is some type_decl) {
+                return type_decl;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    types.TypeId substitute_type_id(LayoutEnv& env, types.TypeId type_id) {
+        if (!type_id.valid()) { return type_id; }
+        if (type_id.id >= self.type_table.len()) { return type_id; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .type_param) {
+            types.TypeId substituted = env.lookup_generic_subst(info.symbol.id);
+            if (substituted.valid()) { return substituted; }
+            return type_id;
+        }
+        if (info.kind == .pointer) {
+            types.TypeId element = self.substitute_type_id(env, info.element);
+            if (element.id == info.element.id) { return type_id; }
+            return self.type_table.make_pointer_kind(info.span, element, info.pointer_kind, info.mutable_item, info.many);
+        }
+        if (info.kind == .slice) {
+            types.TypeId element = self.substitute_type_id(env, info.element);
+            if (element.id == info.element.id) { return type_id; }
+            return self.type_table.make_slice(info.span, element);
+        }
+        if (info.kind == .array) {
+            types.TypeId element = self.substitute_type_id(env, info.element);
+            if (element.id == info.element.id) { return type_id; }
+            return self.type_table.make_array(info.span, element, info.inferred_count, info.child_count);
+        }
+        if (info.kind == .layer) {
+            types.TypeId element = self.substitute_type_id(env, info.element);
+            if (element.id == info.element.id) { return type_id; }
+            return self.type_table.make_layer(info.span, element, info.optional, info.mutable);
+        }
+        if (info.kind == .errorable) {
+            types.TypeId value = self.substitute_type_id(env, info.element);
+            types.TypeId error = self.substitute_type_id(env, info.other);
+            if (value.id == info.element.id && error.id == info.other.id) { return type_id; }
+            return self.type_table.make_errorable(info.span, value, error);
+        }
+        if (info.kind == .tuple || info.kind == .function) {
+            list.ArenaList<types.TypeId>! substituted_children = list.ArenaList<types.TypeId>(self.ctx.ast_store_ref());
+            Bool! changed = false;
+            Int! index = 0;
+            while (index < info.child_count) {
+                types.TypeId child = self.type_table.child_at(info.child_start + index);
+                types.TypeId substituted = self.substitute_type_id(env, child);
+                if (substituted.id != child.id) { changed = true; }
+                substituted_children.add(substituted);
+                index = index + 1;
+            }
+            Int! start = self.type_table.begin_children();
+            index = 0;
+            while (index < substituted_children.len()) {
+                self.type_table.add_child(substituted_children[index]);
+                index = index + 1;
+            }
+            if (!changed) { return type_id; }
+            return self.type_table.make_compound(info.kind, info.span, start, info.child_count);
+        }
+        return type_id;
+    }
+
+    () add_nominal_generic_substs(LayoutEnv& env, jir.JirTypeDecl decl, types.TypeInfo info) {
+        Int! index = 0;
+        while (index < decl.generic_params.len() && index < info.child_count) {
+            env.add_generic_subst(decl.generic_params[index].symbol.id, self.type_table.child_at(info.child_start + index));
+            index = index + 1;
+        }
+    }
+
+    Int builtin_size(types.TypeId type_id) {
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Bool")) { return 1; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "UInt8")) { return 1; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Int8")) { return 1; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "UInt16")) { return 2; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Int16")) { return 2; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Float16")) { return 2; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "UInt32")) { return 4; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Int32")) { return 4; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Float")) { return 4; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Float32")) { return 4; }
+        if (self.type_table.is_builtin_named(type_id, self.ctx.symbols$.ref(), "Char")) { return 4; }
+        return 8;
+    }
+
+    Int builtin_align(types.TypeId type_id) {
+        return self.builtin_size(type_id);
+    }
+
+    Int align_up(Int value, Int align) {
+        if (align <= 1) { return value; }
+        Int! remainder = value % align;
+        if (remainder == 0) { return value; }
+        return value + align - remainder;
+    }
+
+    Int type_align(types.TypeId type_id) {
+        if (!type_id.valid()) { return 1; }
+        Int! cached = self.type_table.cached_layout_align(type_id);
+        if (cached >= 0) { return cached; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .builtin) {
+            Int! align = self.builtin_align(type_id);
+            self.type_table.set_layout_align(type_id, align);
+            return align;
+        }
+        if (info.kind == .unit) { self.type_table.set_layout_align(type_id, 1); return 1; }
+        if (info.kind == .pointer) { self.type_table.set_layout_align(type_id, 8); return 8; }
+        if (info.kind == .function) { self.type_table.set_layout_align(type_id, 8); return 8; }
+        if (info.kind == .slice) { self.type_table.set_layout_align(type_id, 8); return 8; }
+        if (info.kind == .array) {
+            Int! align = self.type_align(info.element);
+            self.type_table.set_layout_align(type_id, align);
+            return align;
+        }
+        if (info.kind == .layer) {
+            if (!info.optional) {
+                Int! align = self.type_align(info.element);
+                self.type_table.set_layout_align(type_id, align);
+                return align;
+            }
+            Int! align = self.type_align(info.element);
+            if (align < 1) { align = 1; }
+            self.type_table.set_layout_align(type_id, align);
+            return align;
+        }
+        if (info.kind == .errorable) {
+            Int! value_align = self.type_align(info.element);
+            Int! error_align = self.type_align(info.other);
+            if (value_align > error_align) {
+                self.type_table.set_layout_align(type_id, value_align);
+                return value_align;
+            }
+            self.type_table.set_layout_align(type_id, error_align);
+            return error_align;
+        }
+        if (info.kind == .tuple) {
+            Int! align = 1;
+            Int! index = 0;
+            while (index < info.child_count) {
+                Int! child_align = self.type_align(self.type_table.child_at(info.child_start + index));
+                if (child_align > align) { align = child_align; }
+                index = index + 1;
+            }
+            self.type_table.set_layout_align(type_id, align);
+            return align;
+        }
+        if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
+            jir.JirTypeDecl? decl_ref = self.type_decl_for_decl_id(info.decl_id);
+            if (decl_ref is some decl) {
+                LayoutEnv! env = LayoutEnv(self.ctx);
+                self.add_nominal_generic_substs(env$.ref(), decl, info);
+                Int! align = 1;
+                Int! index = 0;
+                while (index < decl.fields.len()) {
+                    types.TypeId field_type_id = self.substitute_type_id(env$.ref(), decl.fields[index].type_id);
+                    Int! field_align = self.type_align(field_type_id);
+                    if (field_align > align) { align = field_align; }
+                    index = index + 1;
+                }
+                self.type_table.set_layout_align(type_id, align);
+                return align;
+            }
+        }
+        if (info.kind == .nominal && info.nominal_kind == .enum_decl) { self.type_table.set_layout_align(type_id, 8); return 8; }
+        if (info.kind == .nominal && info.nominal_kind == .union_decl) { self.type_table.set_layout_align(type_id, 8); return 8; }
+        self.type_table.set_layout_align(type_id, 8);
+        return 8;
+    }
+
+    Int type_size(types.TypeId type_id) {
+        if (!type_id.valid()) { return 8; }
+        Int! cached = self.type_table.cached_layout_size(type_id);
+        if (cached >= 0) { return cached; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .unit) { self.type_table.set_layout_size(type_id, 1); return 1; }
+        if (info.kind == .function) { self.type_table.set_layout_size(type_id, 8); return 8; }
+        if (info.kind == .pointer) { self.type_table.set_layout_size(type_id, 8); return 8; }
+        if (info.kind == .builtin) {
+            Int! size = self.builtin_size(type_id);
+            self.type_table.set_layout_size(type_id, size);
+            return size;
+        }
+        if (info.kind == .array) {
+            Int! size = self.type_size(info.element) * info.child_count;
+            self.type_table.set_layout_size(type_id, size);
+            return size;
+        }
+        if (info.kind == .slice) { self.type_table.set_layout_size(type_id, 16); return 16; }
+        if (info.kind == .layer) {
+            if (!info.optional) {
+                Int! layer_size = self.type_size(info.element);
+                self.type_table.set_layout_size(type_id, layer_size);
+                return layer_size;
+            }
+            Int! payload_align = self.type_align(info.element);
+            Int! optional_size = self.align_up(1 + self.type_size(info.element), payload_align);
+            self.type_table.set_layout_size(type_id, optional_size);
+            return optional_size;
+        }
+        if (info.kind == .errorable) {
+            Int! tag_size = 1;
+            Int! value_align = self.type_align(info.element);
+            Int! error_align = self.type_align(info.other);
+            Int! align = value_align;
+            if (error_align > align) { align = error_align; }
+            Int! errorable_size = tag_size;
+            errorable_size = self.align_up(errorable_size, value_align) + self.type_size(info.element);
+            errorable_size = self.align_up(errorable_size, error_align) + self.type_size(info.other);
+            errorable_size = self.align_up(errorable_size, align);
+            self.type_table.set_layout_size(type_id, errorable_size);
+            self.type_table.set_layout_align(type_id, align);
+            return errorable_size;
+        }
+        if (info.kind == .tuple) {
+            Int! tuple_size = 0;
+            Int! align = 1;
+            Int! index = 0;
+            while (index < info.child_count) {
+                types.TypeId child = self.type_table.child_at(info.child_start + index);
+                Int! child_align = self.type_align(child);
+                if (child_align > align) { align = child_align; }
+                tuple_size = self.align_up(tuple_size, child_align) + self.type_size(child);
+                index = index + 1;
+            }
+            tuple_size = self.align_up(tuple_size, align);
+            self.type_table.set_layout_size(type_id, tuple_size);
+            self.type_table.set_layout_align(type_id, align);
+            return tuple_size;
+        }
+        if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
+            jir.JirTypeDecl? decl_ref = self.type_decl_for_decl_id(info.decl_id);
+            if (decl_ref is some decl) {
+                LayoutEnv! env = LayoutEnv(self.ctx);
+                self.add_nominal_generic_substs(env$.ref(), decl, info);
+                Int! struct_size = 0;
+                Int! align = 1;
+                Int! index = 0;
+                while (index < decl.fields.len()) {
+                    types.TypeId field_type_id = self.substitute_type_id(env$.ref(), decl.fields[index].type_id);
+                    Int! field_align = self.type_align(field_type_id);
+                    if (field_align > align) { align = field_align; }
+                    struct_size = self.align_up(struct_size, field_align) + self.type_size(field_type_id);
+                    index = index + 1;
+                }
+                struct_size = self.align_up(struct_size, align);
+                self.type_table.set_layout_size(type_id, struct_size);
+                self.type_table.set_layout_align(type_id, align);
+                return struct_size;
+            }
+        }
+        if (info.kind == .nominal && info.nominal_kind == .enum_decl) { self.type_table.set_layout_size(type_id, 8); return 8; }
+        if (info.kind == .nominal && info.nominal_kind == .union_decl) {
+            Int! payload_size = 1;
+            jir.JirTypeDecl? decl_ref = self.type_decl_for_decl_id(info.decl_id);
+            if (decl_ref is some decl) {
+                Int! index = 0;
+                while (index < decl.variants.len()) {
+                    types.TypeId payload_type_id = decl.variants[index].type_id;
+                    if (payload_type_id.valid()) {
+                        types.TypeInfo payload_info = self.type_table.type_at(payload_type_id);
+                        if (payload_info.kind != .unit) {
+                            Int! item_size = self.type_size(payload_type_id);
+                            if (item_size > payload_size) { payload_size = item_size; }
+                        }
+                    }
+                    index = index + 1;
+                }
+            }
+            Int! union_size = self.align_up(8 + payload_size, 8);
+            self.type_table.set_layout_size(type_id, union_size);
+            self.type_table.set_layout_align(type_id, 8);
+            return union_size;
+        }
+        self.type_table.set_layout_size(type_id, 8);
+        self.type_table.set_layout_align(type_id, 8);
+        return 8;
+    }
+
+    public () compute_all() {
+        Int! initial_len = self.type_table.len();
+        Int! index = 0;
+        while (index < initial_len) {
+            types.TypeId type_id = types.TypeId(index);
+            self.type_align(type_id);
+            self.type_size(type_id);
+            index = index + 1;
+        }
+    }
+}
+
+public () compute_jir_modules_layout(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
+    TypeLayoutContext! layout = TypeLayoutContext(ctx, inputs, input_count);
+    layout.compute_all();
+}
