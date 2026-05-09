@@ -17,7 +17,7 @@
   - [x] codegen 支持 CFG integer/bool binary return 闭环。
   - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
     - [x] `if` statement 生成 `cond_branch` + then/else/merge blocks。
-    - [ ] `while` 生成 cond/body/end blocks。
+    - [x] `while` 生成 cond/body/end blocks。
     - [ ] `switch` 生成 case/default blocks。
     - [ ] `try` 生成 normal/catch/end blocks。
   - [ ] call / field / index / cast / binary / aggregate init 生成 typed instruction。
