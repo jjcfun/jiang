@@ -5,6 +5,8 @@ set -eu
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
 COMPILER_TESTS_DIR="$PROJECT_ROOT/tests/compiler"
+STAGE0_BIN="${STAGE0_BIN:-$BUILD_DIR/stage0c}"
+STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1/jiangc}"
 
 if [ -n "${LLVM_CONFIG:-}" ]; then
   LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"
@@ -23,12 +25,16 @@ if [ "${SKIP_STAGE0_BUILD:-0}" != "1" ]; then
   "$PROJECT_ROOT/script/build_stage0.sh" >/dev/null
 fi
 
+if [ ! -x "$STAGE1_BIN" ]; then
+  "$PROJECT_ROOT/script/build_stage1.sh" >/dev/null
+fi
+
 run_compiler_test() {
   test_file="$1"
   expected="$2"
   ir="$BUILD_DIR/compiler_${test_file%.jiang}.ll"
   printf 'compiler/%s ... ' "$test_file"
-  "$BUILD_DIR/stage0c" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
+  "$STAGE0_BIN" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
   set +e
   "$LLI" "$ir"
   status=$?
@@ -45,7 +51,7 @@ run_compiler_compile_fail() {
   test_file="$1"
   printf 'compiler/%s ... ' "$test_file"
   set +e
-  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$BUILD_DIR/stage0c" "$COMPILER_TESTS_DIR/$test_file" >/dev/null 2>&1
+  /bin/sh -c '"$1" --emit-llvm "$2" >/dev/null 2>&1' sh "$STAGE0_BIN" "$COMPILER_TESTS_DIR/$test_file" >/dev/null 2>&1
   status=$?
   set -e
   if [ "$status" -eq 0 ]; then
@@ -58,9 +64,20 @@ run_compiler_compile_fail() {
 
 run_compiler_compile_only() {
   test_file="$1"
+  run_compiler_compile_only_with "$test_file" "$STAGE0_BIN"
+}
+
+run_compiler_compile_only_stage1() {
+  test_file="$1"
+  run_compiler_compile_only_with "$test_file" "$STAGE1_BIN"
+}
+
+run_compiler_compile_only_with() {
+  test_file="$1"
+  compiler_bin="$2"
   ir="$BUILD_DIR/compiler_${test_file%.jiang}.ll"
   printf 'compiler/%s compile ... ' "$test_file"
-  "$BUILD_DIR/stage0c" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
+  "$compiler_bin" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
   if [ ! -s "$ir" ]; then
     echo "failed"
     echo "error: compiler/$test_file generated empty IR" >&2
@@ -73,7 +90,7 @@ run_compiler_ir_regression_check() {
   test_file="$1"
   ir="$BUILD_DIR/compiler_${test_file%.jiang}.regression.ll"
   printf 'compiler/%s ir regression ... ' "$test_file"
-  "$BUILD_DIR/stage0c" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
+  "$STAGE0_BIN" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
   function_count="$(grep -c '^define ' "$ir" || true)"
   if [ "$function_count" -ge 3000 ]; then
     echo "failed"
@@ -92,7 +109,7 @@ run_named_test() {
   test_file="$1"
   case "$test_file" in
     compiler_bootstrap_smoke.jiang)
-      run_compiler_compile_only "$test_file"
+      run_compiler_compile_only_stage1 "$test_file"
       ;;
     *.jiang)
       run_compiler_test "$test_file" 0
@@ -129,7 +146,7 @@ run_all_compiler_tests() {
   run_compiler_test lower_hir_minimal.jiang 0
   run_compiler_test lower_jir_minimal.jiang 0
   run_compiler_test llvm_api_minimal.jiang 0
-  run_compiler_compile_only compiler_bootstrap_smoke.jiang
+  run_compiler_compile_only_stage1 compiler_bootstrap_smoke.jiang
 }
 
 if [ "$#" -gt 0 ]; then

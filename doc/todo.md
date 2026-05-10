@@ -9,19 +9,33 @@
   - [x] `BasicBlock` 持有线性 `Instruction[]` 和 `Terminator`。
   - [x] `Instruction` 使用 `ValueId` 作为 operand/result。
   - [x] `Terminator` 覆盖 `return` / `branch` / `cond_branch` / `switch` / `throw`。
-- [ ] 将 tree JIR 的表达式/语句 lowering 改为 CFG lowering。
+- [x] 将 tree JIR 的表达式/语句 lowering 改为 CFG lowering。
   - [x] 函数声明生成 CFG function + entry block。
-  - [x] 直线语句和浅层表达式投影为 CFG instruction。
+  - [x] function/init declaration 不再挂旧 tree body，codegen 以 `cfg_function_id` 作为函数体入口。
+  - [x] 直线语句直接生成 CFG marker/terminator，不再经单语句 tree block 过渡。
+  - [x] 浅层表达式投影为 CFG instruction。
   - [x] codegen 支持最小 CFG literal return 闭环。
   - [x] CFG 表达式 lowering 按依赖顺序输出 literal/binary instruction。
   - [x] codegen 支持 CFG integer/bool binary return 闭环。
   - [x] codegen 支持已验证 CFG blocks 的 branch / cond_branch / return 翻译。
-  - [ ] `if` / `while` / `switch` / `try` 生成 block + terminator。
+  - [x] `if` / `while` / `switch` / `try` 生成 block + terminator。
     - [x] `if` statement 生成 `cond_branch` + then/else/merge blocks。
     - [x] `while` 生成 cond/body/end blocks。
-    - [ ] `switch` 生成 case/default blocks。
-    - [ ] `try` 生成 normal/catch/end blocks。
+    - [x] `switch` 生成 case/default blocks。
+    - [x] `try` 生成 normal/catch/end blocks。
+    - [x] `for_range` 生成 local/cond/body/step/end blocks。
+    - [x] `for_each` 生成 init/cond/bind/body/step/end blocks。
+    - [x] `coalesce_control_local` 生成 some/none/end blocks。
+  - [x] `if is-pattern` / `switch` case pattern bind 直接生成 CFG marker。
   - [x] call / field / index / cast / binary / aggregate init 生成 typed instruction。
+  - [x] `lower_jir` 内部不再用 `JirBlock/JirStmt` 作为复杂表达式和 defer 的过渡 buffer。
+    - [x] 函数/init body 不再保存 tree。
+    - [x] 函数正文普通语句不再经 tree adapter。
+    - [x] condition/switch pattern bind 不再经 tree wrapper。
+    - [x] `defer` payload 改为 CFG inline lowering。
+    - [x] `if` / `switch` / `try` / block expression value lowering 改为 CFG 原生。
+    - [x] `??` / logic short-circuit expression lowering 改为 CFG 原生。
+  - [x] 去掉 `lower_jir` 中旧 tree-to-CFG adapter 和旧 `JirBlock` lowering 链路。
   - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
 - [ ] 调整 call target 表示。
   - [ ] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
@@ -29,15 +43,16 @@
 - [ ] 调整 type layout 和 codegen 输入。
   - [ ] `type_layout` 只依赖 concrete `TypeId` 和 concrete type decl。
   - [ ] codegen 按 block/instruction/terminator 翻译，不做泛型判断。
+- [ ] 将 `JirStmt` 中只作为 CFG marker metadata 使用的旧 tree 字段收缩成 metadata-only 结构。
 - [ ] 删除不再使用的 tree JIR clone 辅助结构。
 
 ## 阶段 2：完善 JIR 单态化
 
 - [ ] 单态化输入输出统一为 CFG JIR。
 - [ ] 实例 key 使用 `template module + template decl + concrete type args`。
-- [ ] clone function 时按 block/instruction 线性复制。
-  - [ ] 建立 `old ValueId -> new ValueId` 映射。
-  - [ ] 建立 `old BlockId -> new BlockId` 映射。
+- [x] clone function/init 时复制 CFG function。
+  - [x] 建立 `old ValueId -> new ValueId` 映射。
+  - [x] 保持 CFG block 顺序和 `BlockId` 稳定复制。
   - [ ] 类型替换只发生在 monomorph 阶段，不进入 codegen。
 - [ ] 生成 concrete function/type instance。
   - [ ] 泛型函数调用改指向 concrete function。
@@ -48,8 +63,9 @@
 ## 阶段 3：完成 stage1 自举
 
 - [x] stage1 编译 `compiler/interner.jiang` 不崩溃。
-- [ ] stage1 能编译完整 compiler graph。
+- [x] stage1 能编译完整 compiler graph。
 - [x] stage1 生成的 compiler 能通过 `build_stage1` / compiler tests。
+- [ ] selfhost compiler 运行 `tests/samples/minimal.jiang` 不再以状态 `-1` 退出。
 - [ ] self-compile 产物与当前 stage1 行为一致。
 - [ ] 清理临时兼容代码、调试输出和过渡 TODO。
 
