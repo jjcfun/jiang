@@ -37,14 +37,19 @@
     - [x] `??` / logic short-circuit expression lowering 改为 CFG 原生。
   - [x] 去掉 `lower_jir` 中旧 tree-to-CFG adapter 和旧 `JirBlock` lowering 链路。
   - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
-- [ ] 调整 call target 表示。
-  - [ ] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
-  - [ ] `resolve_jir_call_targets` 改为遍历 CFG instruction。
+    - [x] CFG marker instruction 携带 local/assign/pattern/expr/for_each/coalesce 的 value operand。
+    - [x] local/assign/pattern/for_each/coalesce/return 优先使用 CFG value coercion。
+    - [x] call instruction codegen 使用 CFG operand，且不提前执行短路分支中的副作用。
+    - [x] 删除旧 `expr_value_cg` 的 call / aggregate value fallback。
+    - [ ] address/place projection、runtime builtin、struct init default/init call 仍需从表达式 fallback 收敛到 CFG operand。
+- [x] 调整 call target 表示。
+  - [x] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
+  - [x] `resolve_jir_call_targets` 改为遍历 CFG instruction。
 - [ ] 调整 type layout 和 codegen 输入。
   - [ ] `type_layout` 只依赖 concrete `TypeId` 和 concrete type decl。
   - [ ] codegen 按 block/instruction/terminator 翻译，不做泛型判断。
-- [ ] 将 `JirStmt` 中只作为 CFG marker metadata 使用的旧 tree 字段收缩成 metadata-only 结构。
-- [ ] 删除不再使用的 tree JIR clone 辅助结构。
+- [x] 将 `JirStmt` 中只作为 CFG marker metadata 使用的旧 tree 字段收缩成 metadata-only 结构。
+- [x] 删除不再使用的 tree JIR clone 辅助结构。
 
 ## 阶段 2：完善 JIR 单态化
 
@@ -65,7 +70,9 @@
 - [x] stage1 编译 `compiler/interner.jiang` 不崩溃。
 - [x] stage1 能编译完整 compiler graph。
 - [x] stage1 生成的 compiler 能通过 `build_stage1` / compiler tests。
-- [ ] selfhost compiler 运行 `tests/samples/minimal.jiang` 不再以状态 `-1` 退出。
+- [ ] selfhost compiler 运行 `tests/samples/minimal.jiang` 不再失败。
+  - [x] 不再以 trap / `-1` 退出。
+  - [ ] 当前仍以普通状态 `1` 退出，需要继续定位 file input / compile pipeline。
 - [ ] self-compile 产物与当前 stage1 行为一致。
 - [ ] 清理临时兼容代码、调试输出和过渡 TODO。
 

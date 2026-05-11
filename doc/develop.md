@@ -593,9 +593,8 @@ List 容器。
 
 当前职责：
 - `ArrayList<T>`：heap-backed growable list
-- `ArenaList<T>`：arena-backed growable list
 
-需要独立生命周期和可释放 buffer 时使用 `ArrayList`。列表生命周期绑定到 arena 时使用 `ArenaList`。
+编译器内部统一使用 `ArrayList`，不再保留 arena-backed list 变体。
 
 ### `support/map.jiang`
 
