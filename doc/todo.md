@@ -70,10 +70,10 @@
 - [x] stage1 编译 `compiler/interner.jiang` 不崩溃。
 - [x] stage1 能编译完整 compiler graph。
 - [x] stage1 生成的 compiler 能通过 `build_stage1` / compiler tests。
-- [ ] selfhost compiler 运行 `tests/samples/minimal.jiang` 不再失败。
+- [x] selfhost compiler 运行 `tests/samples/minimal.jiang` 不再失败。
   - [x] 不再以 trap / `-1` 退出。
-  - [ ] 当前仍以普通状态 `1` 退出，需要继续定位 file input / compile pipeline。
-- [ ] self-compile 产物与当前 stage1 行为一致。
+- [x] selfhost compiler 能通过完整 `stage1_test`。
+- [x] self-compile 产物与当前 stage1 行为一致。
 - [ ] 清理临时兼容代码、调试输出和过渡 TODO。
 
 ## 后续：增量编译 v2/v3
