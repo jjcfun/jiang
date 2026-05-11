@@ -78,7 +78,7 @@
   - [x] 不再以 trap / `-1` 退出。
 - [x] selfhost compiler 能通过完整 `stage1_test`。
 - [x] self-compile 产物与当前 stage1 行为一致。
-- [ ] 清理临时兼容代码、调试输出和过渡 TODO。
+- [x] 清理临时兼容代码、调试输出和过渡 TODO。
 
 ## 后续：增量编译 v2/v3
 
