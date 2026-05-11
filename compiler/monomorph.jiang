@@ -40,10 +40,12 @@ struct InstanceEntry {
 struct MaterializedTypeEntry {
     semantic_ctx.ModuleId module_id;
     Int type_key;
+    types.TypeId type_id;
 
-    init(semantic_ctx.ModuleId module_id, Int type_key) {
+    init(semantic_ctx.ModuleId module_id, Int type_key, types.TypeId type_id) {
         self.module_id = module_id;
         self.type_key = type_key;
+        self.type_id = type_id;
     }
 }
 
@@ -134,7 +136,7 @@ struct MonomorphContext {
     public Bool record_materialized_type(semantic_ctx.ModuleId module_id, types.TypeId type_id) {
         if (!module_id.valid() || !type_id.valid()) { return false; }
         if (self.has_materialized_type(module_id, type_id)) { return false; }
-        self.materialized_types.add(MaterializedTypeEntry(module_id, monomorph_type_key_cached(self$.ptr(), type_id, 0)));
+        self.materialized_types.add(MaterializedTypeEntry(module_id, monomorph_type_key_cached(self$.ptr(), type_id, 0), type_id));
         return true;
     }
 }
@@ -1440,7 +1442,10 @@ public () materialize_type_in_module(MonomorphContext^ mono, jir.JirModule^ modu
     Bool! first_nominal_visit = false;
     if (should_materialize_nominal) {
         first_nominal_visit = mono.record_materialized_type(module.module_id, type_id);
-        if (!first_nominal_visit) { return; }
+        if (!first_nominal_visit) {
+            if (info.child_count == 0) { return; }
+            if (module.type_decl_for_type_id(type_id) != null) { return; }
+        }
     }
     if (info.element.valid()) { materialize_type_in_module(mono, module, info.element); }
     if (info.other.valid()) { materialize_type_in_module(mono, module, info.other); }
@@ -1503,6 +1508,60 @@ public () materialize_type_in_module(MonomorphContext^ mono, jir.JirModule^ modu
     }
 }
 
+() materialize_instruction_types(MonomorphContext^ mono, jir.JirModule^ module, jir.JirInstruction& inst) {
+    materialize_type_in_module(mono, module, inst.type_id);
+    materialize_type_in_module(mono, module, inst.method_receiver_type_id);
+    Int! index = 0;
+    while (index < inst.generic_type_args.len()) {
+        materialize_type_in_module(mono, module, inst.generic_type_args[index]);
+        index = index + 1;
+    }
+    if (inst.local_meta is some local) {
+        materialize_type_in_module(mono, module, local.type_id);
+    }
+    if (inst.temp_local_meta is some temp_local) {
+        materialize_type_in_module(mono, module, temp_local.type_id);
+    }
+    if (inst.pattern_bind_meta is some pattern_bind) {
+        index = 0;
+        while (index < pattern_bind.binds.len()) {
+            materialize_type_in_module(mono, module, pattern_bind.binds[index].type_id);
+            index = index + 1;
+        }
+    }
+    if (inst.coalesce_meta is some coalesce_meta) {
+        materialize_type_in_module(mono, module, coalesce_meta.type_id);
+    }
+}
+
+() materialize_cfg_function_types(MonomorphContext^ mono, jir.JirModule^ module, jir.JirCfgFunction& cfg) {
+    Int! block_index = 0;
+    while (block_index < cfg.blocks.len()) {
+        jir.JirBasicBlock& block = cfg.blocks.get(block_index);
+        Int! inst_index = 0;
+        while (inst_index < block.instructions.len()) {
+            materialize_instruction_types(mono, module, block.instructions.get(inst_index));
+            inst_index = inst_index + 1;
+        }
+        if (block.terminator.for_each_meta is some for_each) {
+            Int! bind_index = 0;
+            while (bind_index < for_each.binds.len()) {
+                materialize_type_in_module(mono, module, for_each.binds[bind_index].type_id);
+                bind_index = bind_index + 1;
+            }
+        }
+        block_index = block_index + 1;
+    }
+}
+
+() materialize_cfg_types(MonomorphContext^ mono, jir.JirModule^ module) {
+    Int! index = 0;
+    while (index < module.cfg_function_count()) {
+        materialize_cfg_function_types(mono, module, module.cfg_function_ref_at(jir.JirCfgFunctionId(index)));
+        index = index + 1;
+    }
+}
+
 () materialize_decl_types(MonomorphContext^ mono, jir.JirModule^ module) {
     types.TypeTable& table = mono.ctx.types_ref();
     Int! index = 0;
@@ -1557,7 +1616,32 @@ public () materialize_type_in_module(MonomorphContext^ mono, jir.JirModule^ modu
         jir.JirModule^ module = mono.inputs[input_index]$.as(jir.JirModule^);
         materialize_decl_types(mono, module);
         materialize_expr_types(mono, module);
+        materialize_cfg_types(mono, module);
         input_index = input_index + 1;
+    }
+}
+
+() verify_concrete_type_decls(MonomorphContext^ mono) {
+    types.TypeTable& table = mono.ctx.types_ref();
+    Int! index = 0;
+    while (index < mono.materialized_types.len()) {
+        MaterializedTypeEntry entry = mono.materialized_types[index];
+        if (entry.type_id.valid() && entry.type_id.id < table.len()) {
+            types.TypeInfo info = table.type_at(entry.type_id);
+            if (info.kind == .nominal && info.child_count > 0 && info.decl_id.valid()) {
+                jir.JirModule^? module_ref = monomorph_module_for_id(mono, entry.module_id);
+                assert(module_ref != null);
+                if (module_ref is some module) {
+                    jir.JirTypeDecl^? decl_ref = module.type_decl_for_type_id(entry.type_id);
+                    assert(decl_ref != null);
+                    if (decl_ref is some decl) {
+                        assert(decl.type_id.id == entry.type_id.id);
+                        assert(decl.generic_params.len() == 0);
+                    }
+                }
+            }
+        }
+        index = index + 1;
     }
 }
 
@@ -2623,8 +2707,11 @@ public () monomorphize_jir_modules(context.CompilerContext& ctx, Int![*] inputs,
     mark_active_root_exprs(mono$.ptr());
     monomorphize_active_calls(mono$.ptr());
     materialize_concrete_type_decls(mono$.ptr());
+    verify_concrete_type_decls(mono$.ptr());
     mark_active_root_exprs(mono$.ptr());
     monomorphize_active_calls(mono$.ptr());
+    materialize_concrete_type_decls(mono$.ptr());
+    verify_concrete_type_decls(mono$.ptr());
     strip_generic_function_templates(mono$.ptr());
     strip_generic_type_templates(mono$.ptr());
 }

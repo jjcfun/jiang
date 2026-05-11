@@ -48,7 +48,7 @@
   - [x] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
   - [x] `resolve_jir_call_targets` 改为遍历 CFG instruction。
 - [ ] 调整 type layout 和 codegen 输入。
-  - [ ] `type_layout` 只依赖 concrete `TypeId` 和 concrete type decl。
+  - [x] `type_layout` 对 concrete nominal `TypeId` 必须使用 exact concrete type decl。
   - [x] codegen 按 block/instruction/terminator 翻译，不做泛型替换或 AST fallback。
   - [x] codegen 中带 CFG body 的泛型函数只作为 post-monomorph 边界断言。
 - [x] 将 `JirStmt` 中只作为 CFG marker metadata 使用的旧 tree 字段收缩成 metadata-only 结构。
@@ -65,7 +65,7 @@
   - [ ] type_layout 的泛型替换迁移到 concrete type decl materialize。
 - [ ] 生成 concrete function/type instance。
   - [ ] 泛型函数调用改指向 concrete function。
-  - [ ] concrete nominal type decl materialize 后再进入 layout。
+  - [x] concrete nominal type decl materialize 后再进入 layout。
 - [x] 移除 codegen 中泛型替换和查找补偿。
 - [ ] 验证泛型 samples、method call、cross-module generic call。
 
