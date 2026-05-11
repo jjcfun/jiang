@@ -1379,6 +1379,7 @@ static AstConceptDecl clone_concept_decl(const AstProgram* source, const char* p
         method.return_type = clone_type(source, prefix, hide_private, &decl->methods.items[i].return_type);
         method.name = dup_text(decl->methods.items[i].name);
         method.line = decl->methods.items[i].line;
+        method.static_method_flag = decl->methods.items[i].static_method_flag;
         clone_where_constraint_list(source, prefix, hide_private, &method.where_constraints, &decl->methods.items[i].where_constraints);
         for (j = 0; j < decl->methods.items[i].params.count; ++j) {
             AstParam param;
@@ -1997,13 +1998,14 @@ static int apply_public_aliases(AstProgram* dest, const AstProgram* lookup_progr
     return 1;
 }
 
-static int concept_decl_has_method(const AstConceptDecl* concept, const char* method_name) {
+static int concept_decl_has_method(const AstConceptDecl* concept, const char* method_name, int static_method_flag) {
     int i = 0;
     if (!concept) {
         return 0;
     }
     for (i = 0; i < concept->methods.count; ++i) {
-        if (strcmp(concept->methods.items[i].name, method_name) == 0) {
+        if (concept->methods.items[i].static_method_flag == static_method_flag &&
+            strcmp(concept->methods.items[i].name, method_name) == 0) {
             return 1;
         }
     }
@@ -2015,6 +2017,7 @@ static int ast_name_list_contains(const AstNameList* list, const char* name);
 static int concept_or_parent_has_method(const AstProgram* program,
                                         const AstConceptDecl* concept,
                                         const char* method_name,
+                                        int static_method_flag,
                                         AstNameList* seen_concepts) {
     int i = 0;
     if (!concept) {
@@ -2024,12 +2027,12 @@ static int concept_or_parent_has_method(const AstProgram* program,
         return 0;
     }
     name_list_push(seen_concepts, concept->name);
-    if (concept_decl_has_method(concept, method_name)) {
+    if (concept_decl_has_method(concept, method_name, static_method_flag)) {
         return 1;
     }
     for (i = 0; i < concept->concept_names.count; ++i) {
         const AstConceptDecl* parent = find_ast_concept(program, concept->concept_names.items[i]);
-        if (concept_or_parent_has_method(program, parent, method_name, seen_concepts)) {
+        if (concept_or_parent_has_method(program, parent, method_name, static_method_flag, seen_concepts)) {
             return 1;
         }
     }
@@ -2089,6 +2092,9 @@ typedef struct ResolvedAssocTypeBindingList {
 
 static int concept_method_signature_equal(const AstConceptMethod* a, const AstConceptMethod* b) {
     int i = 0;
+    if (a->static_method_flag != b->static_method_flag) {
+        return 0;
+    }
     if (!ast_type_is_equal(&a->return_type, &b->return_type)) {
         return 0;
     }
@@ -2199,6 +2205,10 @@ static const AstType* lookup_resolved_assoc_type_binding(const ResolvedAssocType
 static const AstFunction* find_type_method_template(const AstProgram* program,
                                                     const AstType* type,
                                                     const char* method_name);
+static const AstFunction* find_type_method_template_with_static(const AstProgram* program,
+                                                                const AstType* type,
+                                                                const char* method_name,
+                                                                int static_method_flag);
 
 static int assoc_type_ref_exists(const ConceptAssocTypeRefList* assoc_types, const char* assoc_name) {
     return find_concept_assoc_type_ref((ConceptAssocTypeRefList*)assoc_types, assoc_name) != 0;
@@ -2250,7 +2260,10 @@ static int infer_missing_assoc_type_bindings_from_methods(const AstProgram* prog
     int i = 0;
     for (i = 0; i < methods->count; ++i) {
         const AstConceptMethod* requirement = methods->items[i].method;
-        const AstFunction* method = find_type_method_template(program, type, requirement->name);
+        const AstFunction* method = find_type_method_template_with_static(program,
+                                                                          type,
+                                                                          requirement->name,
+                                                                          requirement->static_method_flag);
         int j = 0;
         if (!method || method->params.count != requirement->params.count) {
             continue;
@@ -2496,7 +2509,7 @@ static int exported_concept_name_allowed(const AstProgram* source, int hide_priv
 static int method_is_exported_via_public_trait(const AstProgram* program, const AstFunction* fn) {
     AstNominalDeclRef owner;
     int i = 0;
-    if (!fn || !fn->method_flag || fn->static_method_flag || !fn->owner_type_name) {
+    if (!fn || !fn->method_flag || !fn->owner_type_name) {
         return 0;
     }
     owner = find_ast_nominal_decl(program, fn->owner_type_name);
@@ -2507,7 +2520,7 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
                 const AstConceptDecl* concept = find_ast_concept(program, decl->concept_names.items[i]);
                 AstNameList seen_concepts;
                 memset(&seen_concepts, 0, sizeof(seen_concepts));
-                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, &seen_concepts)) {
+                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, fn->static_method_flag, &seen_concepts)) {
                     return 1;
                 }
             }
@@ -2519,7 +2532,7 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
                 const AstConceptDecl* concept = find_ast_concept(program, decl->concept_names.items[i]);
                 AstNameList seen_concepts;
                 memset(&seen_concepts, 0, sizeof(seen_concepts));
-                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, &seen_concepts)) {
+                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, fn->static_method_flag, &seen_concepts)) {
                     return 1;
                 }
             }
@@ -2531,7 +2544,7 @@ static int method_is_exported_via_public_trait(const AstProgram* program, const 
                 const AstConceptDecl* concept = find_ast_concept(program, decl->concept_names.items[i]);
                 AstNameList seen_concepts;
                 memset(&seen_concepts, 0, sizeof(seen_concepts));
-                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, &seen_concepts)) {
+                if (concept && concept->public_flag && concept_or_parent_has_method(program, concept, fn->name, fn->static_method_flag, &seen_concepts)) {
                     return 1;
                 }
             }
@@ -3136,6 +3149,28 @@ static const AstFunction* find_type_method_template(const AstProgram* program, c
     return find_method_template(program, query.nominal.name, method_name);
 }
 
+static const AstFunction* find_type_method_template_with_static(const AstProgram* program,
+                                                                const AstType* type,
+                                                                const char* method_name,
+                                                                int static_method_flag) {
+    AstTypeQueryRef query = describe_ast_type(program, type);
+    int i = 0;
+    if (query.kind != AST_TYPE_QUERY_NOMINAL || !query.nominal.name) {
+        return 0;
+    }
+    for (i = 0; i < program->functions.count; ++i) {
+        const AstFunction* fn = &program->functions.items[i];
+        if (fn->method_flag &&
+            fn->static_method_flag == static_method_flag &&
+            fn->owner_type_name &&
+            strcmp(fn->owner_type_name, query.nominal.name) == 0 &&
+            strcmp(fn->name, method_name) == 0) {
+            return fn;
+        }
+    }
+    return 0;
+}
+
 static const AstFunction* find_type_method_template_matching_signature(const AstProgram* program,
                                                                        const AstType* type,
                                                                        const AstType* expected_return,
@@ -3663,7 +3698,7 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
                                                               &expected_return,
                                                               &expected_params,
                                                               requirement->name,
-                                                              0);
+                                                              requirement->static_method_flag);
         if (!method) {
             return 0;
         }

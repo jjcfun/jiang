@@ -347,6 +347,7 @@ run_sample concept_generic_minimal.jiang 42
 run_sample concept_method_minimal.jiang 42
 run_sample where_amp_minimal.jiang 42
 run_sample trait_inherit_minimal.jiang 42
+run_sample trait_static_method_minimal.jiang 42
 run_sample trait_inherit_where_minimal.jiang 42
 run_sample trait_multi_inherit_minimal.jiang 41
 run_sample trait_diamond_inherit_minimal.jiang 42
@@ -568,6 +569,7 @@ run_compile_fail invalid_import_alias_missing_member.jiang
 run_compile_fail invalid_concept_unknown.jiang
 run_compile_fail invalid_concept_unsatisfied.jiang
 run_compile_fail invalid_concept_method_missing.jiang
+run_compile_fail invalid_trait_static_method_instance_impl.jiang
 run_compile_fail invalid_extend_unknown_type.jiang
 run_compile_fail invalid_extend_init.jiang
 run_compile_fail invalid_concept_not_declared.jiang

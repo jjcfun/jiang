@@ -464,6 +464,7 @@ struct AstConceptMethod {
     AstWhereConstraintList where_constraints;
     AstParamList params;
     int line;
+    int static_method_flag;
 };
 
 struct AstConceptMethodList {

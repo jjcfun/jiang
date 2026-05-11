@@ -3790,6 +3790,7 @@ static int ast_struct_declares_trait(const AstStructDecl* decl, const char* trai
 static int ast_concept_declares_method_name_local(const AstProgram* ast,
                                                   const AstConceptDecl* concept,
                                                   const char* method_name,
+                                                  int static_method_flag,
                                                   AstNameList* seen_concepts) {
     int i = 0;
     if (!concept) {
@@ -3800,13 +3801,14 @@ static int ast_concept_declares_method_name_local(const AstProgram* ast,
     }
     name_list_push(seen_concepts, concept->name);
     for (i = 0; i < concept->methods.count; ++i) {
-        if (strcmp(concept->methods.items[i].name, method_name) == 0) {
+        if (concept->methods.items[i].static_method_flag == static_method_flag &&
+            strcmp(concept->methods.items[i].name, method_name) == 0) {
             return 1;
         }
     }
     for (i = 0; i < concept->concept_names.count; ++i) {
         const AstConceptDecl* parent = find_ast_concept_local(ast, concept->concept_names.items[i]);
-        if (ast_concept_declares_method_name_local(ast, parent, method_name, seen_concepts)) {
+        if (ast_concept_declares_method_name_local(ast, parent, method_name, static_method_flag, seen_concepts)) {
             return 1;
         }
     }
@@ -3816,14 +3818,15 @@ static int ast_concept_declares_method_name_local(const AstProgram* ast,
 static int hir_type_declares_trait_method_name(const AstProgram* ast,
                                                HirType* type,
                                                const char* trait_name,
-                                               const char* method_name) {
+                                               const char* method_name,
+                                               int static_method_flag) {
     const AstConceptDecl* trait = find_ast_concept_local(ast, trait_name);
     AstNameList seen_concepts;
     if (!trait || !hir_type_declares_concept_or_child(ast, type, trait_name)) {
         return 0;
     }
     memset(&seen_concepts, 0, sizeof(seen_concepts));
-    return ast_concept_declares_method_name_local(ast, trait, method_name, &seen_concepts);
+    return ast_concept_declares_method_name_local(ast, trait, method_name, static_method_flag, &seen_concepts);
 }
 
 static int parse_trait_qualified_callee(const char* callee,
@@ -3878,7 +3881,7 @@ static HirFunction* resolve_method_call_overload(LowerContext* ctx,
     int i = 0;
     int pass = 0;
     memset(&matched_args, 0, sizeof(matched_args));
-    if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name)) {
+    if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name, static_flag)) {
         fail(ctx, "trait method not found");
         return 0;
     }
@@ -3985,7 +3988,7 @@ static HirFunction* resolve_method_value_overload(LowerContext* ctx,
     int match_count = 0;
     int i = 0;
     int pass = 0;
-    if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name)) {
+    if (trait_name && !hir_type_declares_trait_method_name(ctx->ast, owner_type, trait_name, method_name, static_flag)) {
         fail(ctx, "trait method not found");
         return 0;
     }

@@ -746,6 +746,13 @@ static int parse_concept_decl(Parser* parser, AstProgram* out_program, int publi
             }
             continue;
         }
+        if (parser->current.kind == TOKEN_KW_STATIC) {
+            method.static_method_flag = 1;
+            advance(parser);
+            if (parser->current.kind == TOKEN_KW_ASSOCIATED) {
+                return fail(parser, "static associated types are not supported");
+            }
+        }
         if (!is_type_start(parser)) {
             return fail(parser, "expected trait method return type");
         }
