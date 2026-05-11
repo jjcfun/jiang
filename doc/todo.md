@@ -47,7 +47,7 @@
 - [x] 调整 call target 表示。
   - [x] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
   - [x] `resolve_jir_call_targets` 改为遍历 CFG instruction。
-- [ ] 调整 type layout 和 codegen 输入。
+- [x] 调整 type layout 和 codegen 输入。
   - [x] `type_layout` 对 concrete nominal `TypeId` 必须使用 exact concrete type decl。
   - [x] codegen 按 block/instruction/terminator 翻译，不做泛型替换或 AST fallback。
   - [x] codegen 中带 CFG body 的泛型函数只作为 post-monomorph 边界断言。
@@ -56,18 +56,18 @@
 
 ## 阶段 2：完善 JIR 单态化
 
-- [ ] 单态化输入输出统一为 CFG JIR。
-- [ ] 实例 key 使用 `template module + template decl + concrete type args`。
+- [x] 单态化输入输出统一为 CFG JIR。
+- [x] 实例 key 使用 `template module + instance module + template decl + concrete type args`。
 - [x] clone function/init 时复制 CFG function。
   - [x] 建立 `old ValueId -> new ValueId` 映射。
   - [x] 保持 CFG block 顺序和 `BlockId` 稳定复制。
   - [x] codegen 不再做泛型类型替换。
-  - [ ] type_layout 的泛型替换迁移到 concrete type decl materialize。
-- [ ] 生成 concrete function/type instance。
-  - [ ] 泛型函数调用改指向 concrete function。
+  - [x] type_layout 的泛型替换迁移到 concrete type decl materialize。
+- [x] 生成 concrete function/type instance。
+  - [x] 泛型函数调用改指向 concrete function。
   - [x] concrete nominal type decl materialize 后再进入 layout。
 - [x] 移除 codegen 中泛型替换和查找补偿。
-- [ ] 验证泛型 samples、method call、cross-module generic call。
+- [x] 验证泛型 samples、method call、cross-module generic call。
 
 ## 阶段 3：完成 stage1 自举
 
