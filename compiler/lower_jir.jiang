@@ -49,7 +49,7 @@ struct TypeSubst {
 public struct JirLowerer {
     context.CompilerContext& ctx;
     hir.HirModule& module_input;
-    jir.JirModule! module;
+    jir.JirModule& module;
     UInt8[]! source_text;
     scope.BindingId! active_type_binding_id;
     jir.JirTypeDecl^?! active_type_decl;
@@ -61,7 +61,8 @@ public struct JirLowerer {
     init(context.CompilerContext& ctx, hir.HirModule& source_module) {
         self.ctx = ctx;
         self.module_input = source_module;
-        self.module = jir.JirModule(ctx.ast_store_ref(), source_module.module_id);
+        jir.JirModule!^ output = new jir.JirModule(ctx.ast_store_ref(), source_module.module_id);
+        self.module = output$.ref();
         self.source_text = "";
         self.active_type_binding_id = scope.BindingId();
         self.active_type_decl = null;
@@ -74,7 +75,21 @@ public struct JirLowerer {
     init(context.CompilerContext& ctx, hir.HirModule& source_module, UInt8[] source_text) {
         self.ctx = ctx;
         self.module_input = source_module;
-        self.module = jir.JirModule(ctx.ast_store_ref(), source_module.module_id);
+        jir.JirModule!^ output = new jir.JirModule(ctx.ast_store_ref(), source_module.module_id);
+        self.module = output$.ref();
+        self.source_text = source_text;
+        self.active_type_binding_id = scope.BindingId();
+        self.active_type_decl = null;
+        self.temp_count = 0;
+        self.local_jir_decl_ids = list.ArrayList<Int>();
+        self.active_type_substs = list.ArrayList<TypeSubst>();
+        self.type_subst_scope_starts = list.ArrayList<Int>();
+    }
+
+    init(context.CompilerContext& ctx, hir.HirModule& source_module, UInt8[] source_text, jir.JirModule& output) {
+        self.ctx = ctx;
+        self.module_input = source_module;
+        self.module = output;
         self.source_text = source_text;
         self.active_type_binding_id = scope.BindingId();
         self.active_type_decl = null;
@@ -85,14 +100,27 @@ public struct JirLowerer {
     }
 
     public jir.JirModule lower() {
+        self.lower_into_module();
+        return self.module$.get();
+    }
+
+    public jir.JirModule!^ lower_ptr() {
+        self.lower_into_module();
+        return self.module$.ptr();
+    }
+
+    public () lower_into_module() {
         Int! index = 0;
         while (index < self.module_input.decl_count()) {
             hir.HirDecl decl = self.module_input.decl_at(hir.HirDeclId(index));
-            jir.JirDecl lowered = self.lower_decl(decl);
-            self.add_decl(lowered);
+            if (decl.body is .function_decl(function_decl)) {
+                self.add_function_decl(decl.decl_id, function_decl);
+            } else {
+                jir.JirDecl lowered = self.lower_decl(decl);
+                self.add_decl(lowered);
+            }
             index = index + 1;
         }
-        return self.module;
     }
 
     () ensure_local_decl_map(scope.DeclId decl_id) {
@@ -125,6 +153,39 @@ public struct JirLowerer {
         self.register_local_jir_decl(decl.decl_id, decl_id);
         self.ctx.semantic_register_jir_decl(decl.decl_id, self.module.module_id, decl_id.id);
         return decl_id;
+    }
+
+    jir.JirDeclId add_function_decl(scope.DeclId decl_id, hir.HirFunctionDecl decl) {
+        self.push_type_subst_scope();
+        jir.JirFunctionDecl! lowered = jir.JirFunctionDecl(self.module.store, decl.span, decl.name, decl.binding_id, self.lower_type_id(decl.type_id), self.lower_type_id(decl.result_type), decl.public_flag, decl.extern_flag, decl.static_flag);
+        lowered.decl_id = decl_id;
+        Int! generic_index = 0;
+        if (self.active_type_decl != null) {
+            jir.JirTypeDecl^ active_decl = self.active_type_decl$.some();
+            while (generic_index < active_decl.generic_params.len()) {
+                lowered.generic_params.add(active_decl.generic_params[generic_index]);
+                generic_index = generic_index + 1;
+            }
+            generic_index = 0;
+        }
+        while (generic_index < decl.generic_params.len()) {
+            lowered.generic_params.add(decl.generic_params[generic_index]);
+            generic_index = generic_index + 1;
+        }
+        Int! index = 0;
+        while (index < decl.params.len()) {
+            hir.HirParam param = decl.params[index];
+            lowered.params.add(jir.JirParam(param.span, param.name, param.local_id, self.lower_type_id(param.type_id), param.mutable_binding));
+            index = index + 1;
+        }
+        if (decl.body is some body) {
+            lowered.cfg_function_id = self.lower_and_add_cfg_function_from_hir(decl_id, decl.span, body);
+        }
+        self.pop_type_subst_scope();
+        jir.JirDeclId lowered_decl_id = self.module.add_function_decl(decl_id, decl.span, lowered$.ref());
+        self.register_local_jir_decl(decl_id, lowered_decl_id);
+        self.ctx.semantic_register_jir_decl(decl_id, self.module.module_id, lowered_decl_id.id);
+        return lowered_decl_id;
     }
 
     jir.JirDecl lower_decl(hir.HirDecl decl) {
@@ -161,12 +222,16 @@ public struct JirLowerer {
                 hir.HirDecl item = self.module_input.decl_at(extend_decl.items[index]);
                 jir.JirDeclId! item_decl_id = self.local_jir_decl_id(item.decl_id);
                 if (!item_decl_id.valid()) {
-                    item_decl_id = self.add_decl(self.lower_decl(item));
+                    if (item.body is .function_decl(function_decl)) {
+                        item_decl_id = self.add_function_decl(item.decl_id, function_decl);
+                    } else {
+                        item_decl_id = self.add_decl(self.lower_decl(item));
+                    }
                 }
                 lowered.items.add(item_decl_id);
                 index = index + 1;
             }
-            return jir.JirDecl(decl.decl_id, extend_decl.span, .extend_decl(lowered));
+            return jir.JirDecl(decl.decl_id, extend_decl.span, .extend_decl(self.module.store.create<jir.JirExtendDecl>(lowered)));
         }
         assert(false);
         return self.lower_type_decl(decl.decl_id, decl.span, ir.Name(decl.span, self.ctx.intern("<invalid>")), scope.BindingId(), types.TypeId(), .alias_decl, false);
@@ -175,7 +240,7 @@ public struct JirLowerer {
     jir.JirDecl lower_type_decl(scope.DeclId decl_id, token.Span span, ir.Name name, scope.BindingId binding_id, types.TypeId type_id, jir.JirTypeDeclKind kind, Bool public_flag) {
         jir.JirTypeDecl! lowered = jir.JirTypeDecl(self.module.store, span, name, binding_id, type_id, kind, public_flag);
         lowered.decl_id = decl_id;
-        return jir.JirDecl(decl_id, span, .type_decl(lowered));
+        return jir.JirDecl(decl_id, span, .type_decl(self.module.store.create<jir.JirTypeDecl>(lowered)));
     }
 
     scope.DeclId decl_id_for_binding(scope.BindingId binding_id) {
@@ -386,7 +451,7 @@ public struct JirLowerer {
                         return self.type_from_named_decl(named, last, active_decl$.ref());
                     }
                 }
-                jir.JirTypeDecl? decl_ref = self.type_decl_for_module_symbol(last.symbol.id);
+                jir.JirTypeDecl^? decl_ref = self.type_decl_for_module_symbol(last.symbol.id);
                 if (decl_ref is some type_decl) {
                     return self.type_from_named_decl(named, last, type_decl$.ref());
                 }
@@ -447,7 +512,7 @@ public struct JirLowerer {
         }
         self.active_type_binding_id = previous_binding_id;
         self.active_type_decl = previous_type_decl;
-        return jir.JirDecl(decl_id, decl.span, .type_decl(lowered));
+        return jir.JirDecl(decl_id, decl.span, .type_decl(self.module.store.create<jir.JirTypeDecl>(lowered)));
     }
 
     jir.JirInitDecl lower_init_decl(hir.HirInitDecl decl) {
@@ -485,7 +550,7 @@ public struct JirLowerer {
             }
             index = index + 1;
         }
-        return jir.JirDecl(decl_id, decl.span, .type_decl(lowered));
+        return jir.JirDecl(decl_id, decl.span, .type_decl(self.module.store.create<jir.JirTypeDecl>(lowered)));
     }
 
     UInt64 parse_uint_literal(token.Span span) {
@@ -591,7 +656,7 @@ public struct JirLowerer {
         return jir.JirIndexExpr(base, index, index_expr.optional_chain);
     }
 
-    jir.JirTypeDecl? type_decl_for_decl_id(scope.DeclId decl_id) {
+    jir.JirTypeDecl^? type_decl_for_decl_id(scope.DeclId decl_id) {
         jir.JirDeclId jir_decl_id = self.local_jir_decl_id(decl_id);
         if (jir_decl_id.valid()) {
             jir.JirDecl decl = self.module.decl_at(jir_decl_id);
@@ -616,7 +681,7 @@ public struct JirLowerer {
         return self.ctx.semantic_nominal_decl_id(type_id);
     }
 
-    jir.JirTypeDecl? type_decl_for_type(types.TypeId type_id) {
+    jir.JirTypeDecl^? type_decl_for_type(types.TypeId type_id) {
         return self.type_decl_for_decl_id(self.type_decl_id_for_type(type_id));
     }
 
@@ -626,7 +691,7 @@ public struct JirLowerer {
         return self.ctx.semantic_decl_ast(decl_id);
     }
 
-    jir.JirTypeDecl? type_decl_for_module_symbol(Int symbol_id) {
+    jir.JirTypeDecl^? type_decl_for_module_symbol(Int symbol_id) {
         return self.type_decl_for_decl_id(self.ctx.semantic_decl_id_for_module_symbol(self.module.module_id, symbol_id));
     }
 
@@ -648,7 +713,7 @@ public struct JirLowerer {
         return info.decl_id;
     }
 
-    Int field_index_name(jir.JirTypeDecl decl, ir.Name field_name) {
+    Int field_index_name(jir.JirTypeDecl^ decl, ir.Name field_name) {
         Int! index = 0;
         while (index < decl.fields.len()) {
             if (decl.fields[index].name.symbol.id == field_name.symbol.id) {
@@ -680,9 +745,9 @@ public struct JirLowerer {
         if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
             if (self.active_type_decl != null && self.active_type_binding_id.id == info.binding_id.id) {
                 jir.JirTypeDecl^ active_decl = self.active_type_decl$.some();
-                return self.field_index_name(active_decl$.get(), field_name);
+                return self.field_index_name(active_decl, field_name);
             }
-            jir.JirTypeDecl? decl = self.type_decl_for_type(type_id);
+            jir.JirTypeDecl^? decl = self.type_decl_for_type(type_id);
             if (decl is some type_decl) {
                 return self.field_index_name(type_decl, field_name);
             }
@@ -706,13 +771,13 @@ public struct JirLowerer {
         if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
             if (self.active_type_decl != null && self.active_type_binding_id.id == info.binding_id.id) {
                 jir.JirTypeDecl^ active_decl = self.active_type_decl$.some();
-                Int index = self.field_index_name(active_decl$.get(), field_name);
+                Int index = self.field_index_name(active_decl, field_name);
                 if (index >= 0) {
                     return self.field_type_optional(active_decl.fields[index].type_id);
                 }
                 return false;
             }
-            jir.JirTypeDecl? decl = self.type_decl_for_type(type_id);
+            jir.JirTypeDecl^? decl = self.type_decl_for_type(type_id);
             if (decl is some type_decl) {
                 Int index = self.field_index_name(type_decl, field_name);
                 if (index >= 0) {
@@ -743,11 +808,11 @@ public struct JirLowerer {
         if (info.kind == .nominal && info.nominal_kind == .struct_decl) {
             if (self.active_type_decl != null && self.active_type_binding_id.id == info.binding_id.id) {
                 jir.JirTypeDecl^ active_decl = self.active_type_decl$.some();
-                Int index = self.field_index_name(active_decl$.get(), field_name);
+                Int index = self.field_index_name(active_decl, field_name);
                 if (index >= 0) { return active_decl.fields[index].type_id; }
                 return types.TypeId();
             }
-            jir.JirTypeDecl? decl = self.type_decl_for_type(type_id);
+            jir.JirTypeDecl^? decl = self.type_decl_for_type(type_id);
             if (decl is some type_decl) {
                 Int index = self.field_index_name(type_decl, field_name);
                 if (index >= 0) { return type_decl.fields[index].type_id; }
@@ -815,7 +880,7 @@ public struct JirLowerer {
         return self.variant_name_from_path(path);
     }
 
-    Int variant_index_name(jir.JirTypeDecl decl, ir.Name variant_name) {
+    Int variant_index_name(jir.JirTypeDecl^ decl, ir.Name variant_name) {
         if (decl.kind == .enum_decl) {
             Int! index = 0;
             while (index < decl.members.len()) {
@@ -867,7 +932,7 @@ public struct JirLowerer {
                 return self.variant_index_for_type(info.element, variant_name);
             }
         }
-        jir.JirTypeDecl? decl_ref = self.type_decl_for_type(type_id);
+        jir.JirTypeDecl^? decl_ref = self.type_decl_for_type(type_id);
         if (decl_ref is some type_decl) {
             return self.variant_index_name(type_decl, variant_name);
         }
@@ -890,7 +955,7 @@ public struct JirLowerer {
             result.type_decl_id = self.union_value_path_type_decl_id(expr.path);
         }
         if (result.variant_index < 0 && result.type_decl_id.valid()) {
-            jir.JirTypeDecl? decl_ref = self.type_decl_for_decl_id(result.type_decl_id);
+            jir.JirTypeDecl^? decl_ref = self.type_decl_for_decl_id(result.type_decl_id);
             if (decl_ref is some type_decl) {
                 result.variant_index = self.variant_index_name(type_decl, self.variant_case_name_from_path(expr.path));
             }
@@ -937,10 +1002,15 @@ public struct JirLowerer {
         }
         self.active_type_binding_id = previous_binding_id;
         self.active_type_decl = previous_type_decl;
-        return jir.JirDecl(decl_id, decl.span, .type_decl(lowered));
+        return jir.JirDecl(decl_id, decl.span, .type_decl(self.module.store.create<jir.JirTypeDecl>(lowered)));
     }
 
     jir.JirDecl lower_function_decl(scope.DeclId decl_id, hir.HirFunctionDecl decl) {
+        jir.JirFunctionDecl lowered = self.lower_function_value(decl_id, decl);
+        return jir.JirDecl(decl_id, decl.span, .function_decl(self.module.store.create<jir.JirFunctionDecl>(lowered)));
+    }
+
+    jir.JirFunctionDecl lower_function_value(scope.DeclId decl_id, hir.HirFunctionDecl decl) {
         self.push_type_subst_scope();
         jir.JirFunctionDecl! lowered = jir.JirFunctionDecl(self.module.store, decl.span, decl.name, decl.binding_id, self.lower_type_id(decl.type_id), self.lower_type_id(decl.result_type), decl.public_flag, decl.extern_flag, decl.static_flag);
         lowered.decl_id = decl_id;
@@ -967,7 +1037,7 @@ public struct JirLowerer {
             lowered.cfg_function_id = self.module.add_cfg_function(self.lower_cfg_function_from_hir(decl_id, decl.span, body));
         }
         self.pop_type_subst_scope();
-        return jir.JirDecl(decl_id, decl.span, .function_decl(lowered));
+        return lowered;
     }
 
     jir.JirCfgFunction lower_cfg_function_from_hir(scope.DeclId decl_id, token.Span span, hir.HirBlock body) {
@@ -979,6 +1049,17 @@ public struct JirLowerer {
             block.set_terminator(jir.JirTerminator(body.span, .return_value));
         }
         return function;
+    }
+
+    jir.JirCfgFunctionId lower_and_add_cfg_function_from_hir(scope.DeclId decl_id, token.Span span, hir.HirBlock body) {
+        jir.JirCfgFunction! function = jir.JirCfgFunction(self.module.store, span, decl_id);
+        jir.JirBlockId entry = function.add_block(self.module.store, body.span);
+        jir.JirBlockId end = self.append_cfg_block_from_hir(function$.ptr(), entry, body, jir.JirBlockId(), jir.JirBlockId());
+        jir.JirBasicBlock& block = function.block_ref_at(end);
+        if (block.terminator.kind == .none) {
+            block.set_terminator(jir.JirTerminator(body.span, .return_value));
+        }
+        return self.module.add_cfg_function_ref(function$.ref());
     }
 
     jir.JirBlockId append_cfg_block_from_hir(jir.JirCfgFunction^ function, jir.JirBlockId block_id, hir.HirBlock body, jir.JirBlockId break_target, jir.JirBlockId continue_target) {
@@ -1662,7 +1743,7 @@ public struct JirLowerer {
                 index = index + 1;
             }
             if (lowered.type_decl_id.valid()) {
-                jir.JirTypeDecl? type_decl_ref = self.type_decl_for_decl_id(lowered.type_decl_id);
+                jir.JirTypeDecl^? type_decl_ref = self.type_decl_for_decl_id(lowered.type_decl_id);
                 if (type_decl_ref is some type_decl) {
                     Int! default_index = 0;
                     while (default_index < type_decl.fields.len()) {
@@ -2596,4 +2677,11 @@ public jir.JirModule lower_module(context.CompilerContext& ctx, hir.HirModule& m
 public jir.JirModule lower_module_with_source(context.CompilerContext& ctx, hir.HirModule& module, UInt8[] source_text) {
     JirLowerer! lowerer = JirLowerer(ctx, module, source_text);
     return lowerer.lower();
+}
+
+public jir.JirModule!^ lower_module_with_source_ptr(context.CompilerContext& ctx, hir.HirModule& module, UInt8[] source_text) {
+    jir.JirModule!^ output = new jir.JirModule(ctx.ast_store_ref(), module.module_id);
+    JirLowerer! lowerer = JirLowerer(ctx, module, source_text, output$.ref());
+    lowerer.lower_into_module();
+    return output;
 }
