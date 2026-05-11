@@ -36,18 +36,21 @@
     - [x] `if` / `switch` / `try` / block expression value lowering 改为 CFG 原生。
     - [x] `??` / logic short-circuit expression lowering 改为 CFG 原生。
   - [x] 去掉 `lower_jir` 中旧 tree-to-CFG adapter 和旧 `JirBlock` lowering 链路。
-  - [ ] 去掉 codegen 前仍需递归遍历表达式树的路径。
+  - [x] 去掉 codegen 前仍需递归遍历表达式树的路径。
     - [x] CFG marker instruction 携带 local/assign/pattern/expr/for_each/coalesce 的 value operand。
     - [x] local/assign/pattern/for_each/coalesce/return 优先使用 CFG value coercion。
     - [x] call instruction codegen 使用 CFG operand，且不提前执行短路分支中的副作用。
     - [x] 删除旧 `expr_value_cg` 的 call / aggregate value fallback。
-    - [ ] address/place projection、runtime builtin、struct init default/init call 仍需从表达式 fallback 收敛到 CFG operand。
+    - [x] runtime builtin call 不再回退到旧 tree call emission。
+    - [x] address/place projection 使用 CFG operand 计算 field/index/slice/assign 地址。
+    - [x] struct init default/init call 使用 CFG operand；跨模块 default 在 codegen 前克隆到当前 CFG block。
 - [x] 调整 call target 表示。
   - [x] call instruction 直接携带 `target_decl_id` 和可选 `JirCallTargetRef`。
   - [x] `resolve_jir_call_targets` 改为遍历 CFG instruction。
 - [ ] 调整 type layout 和 codegen 输入。
   - [ ] `type_layout` 只依赖 concrete `TypeId` 和 concrete type decl。
-  - [ ] codegen 按 block/instruction/terminator 翻译，不做泛型判断。
+  - [x] codegen 按 block/instruction/terminator 翻译，不做泛型替换或 AST fallback。
+  - [x] codegen 中带 CFG body 的泛型函数只作为 post-monomorph 边界断言。
 - [x] 将 `JirStmt` 中只作为 CFG marker metadata 使用的旧 tree 字段收缩成 metadata-only 结构。
 - [x] 删除不再使用的 tree JIR clone 辅助结构。
 
@@ -58,11 +61,12 @@
 - [x] clone function/init 时复制 CFG function。
   - [x] 建立 `old ValueId -> new ValueId` 映射。
   - [x] 保持 CFG block 顺序和 `BlockId` 稳定复制。
-  - [ ] 类型替换只发生在 monomorph 阶段，不进入 codegen。
+  - [x] codegen 不再做泛型类型替换。
+  - [ ] type_layout 的泛型替换迁移到 concrete type decl materialize。
 - [ ] 生成 concrete function/type instance。
   - [ ] 泛型函数调用改指向 concrete function。
   - [ ] concrete nominal type decl materialize 后再进入 layout。
-- [ ] 移除 codegen 中所有泛型判断或查找补偿。
+- [x] 移除 codegen 中泛型替换和查找补偿。
 - [ ] 验证泛型 samples、method call、cross-module generic call。
 
 ## 阶段 3：完成 stage1 自举
