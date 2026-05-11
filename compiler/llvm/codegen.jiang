@@ -1353,6 +1353,9 @@ Bool storage_type_is_pointer_like(types.TypeTable& type_table, types.TypeId type
 Bool is_scalar_type(context.CompilerContext& ctx, types.TypeTable& type_table, types.TypeId type_id) {
     if (!type_id.valid()) { return false; }
     types.TypeInfo info = type_table.type_at(type_id);
+    if (info.kind == .layer && !info.optional && info.element.valid()) {
+        return is_scalar_type(ctx, type_table, info.element);
+    }
     if (info.kind == .builtin) { return true; }
     if (info.kind == .pointer) { return true; }
     return false;
@@ -2489,6 +2492,28 @@ api.Value cfg_value_or_expr(CodegenContext& cg, CfgValueEnv& values, jir.JirValu
     return api.Value();
 }
 
+Bool binary_op_returns_bool(ir.BinaryOp op) {
+    if (op == .equal) { return true; }
+    if (op == .not_equal) { return true; }
+    if (op == .less) { return true; }
+    if (op == .less_equal) { return true; }
+    if (op == .greater) { return true; }
+    if (op == .greater_equal) { return true; }
+    return false;
+}
+
+types.TypeId binary_operand_target_type(context.CompilerContext& ctx, types.TypeTable& type_table, ir.BinaryOp op, types.TypeId result_type, types.TypeId left_type, types.TypeId right_type) {
+    if (!binary_op_returns_bool(op)) { return result_type; }
+    if (!left_type.valid()) { return right_type; }
+    if (!right_type.valid()) { return left_type; }
+    Int left_width = integer_type_width(ctx, type_table, left_type);
+    Int right_width = integer_type_width(ctx, type_table, right_type);
+    if (left_width > 0 && right_width > 0 && right_width > left_width) {
+        return right_type;
+    }
+    return left_type;
+}
+
 api.Value emit_cfg_binary_value(CodegenContext& cg, CfgValueEnv& values, jir.JirInstruction& inst, FunctionEnv& env, api.Type result_type) {
     context.CompilerContext& ctx = cg.ctx;
     types.TypeTable& type_table = cg.type_table;
@@ -2552,6 +2577,17 @@ api.Value emit_cfg_binary_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
         } else if (right_kind == 12 && left_kind != 12) {
             api.Type cast_type = api.value_type(right);
             if (cast_type.raw != 0) { left = builder.build_inttoptr(left, cast_type, "int.ptr"); }
+        }
+    }
+    Bool pointer_operand = (inst.binary_op == .equal || inst.binary_op == .not_equal) && (api.value_type_kind(left) == 12 || api.value_type_kind(right) == 12);
+    types.TypeId operand_target_type = binary_operand_target_type(ctx, type_table, inst.binary_op, inst.type_id, left_expr.type_id, right_expr.type_id);
+    if (operand_target_type.valid() && !pointer_operand) {
+        api.Type operand_target_ref = llvm_type(ctx, type_table, input, llvm_context, operand_target_type);
+        if (operand_target_ref.raw != 0) {
+            api.Value coerced_left = coerce_cfg_value(cg, values, env, left_id, jir.JirExprId(left_id.id), operand_target_type, operand_target_ref);
+            if (!coerced_left.is_null()) { left = coerced_left; }
+            api.Value coerced_right = coerce_cfg_value(cg, values, env, right_id, jir.JirExprId(right_id.id), operand_target_type, operand_target_ref);
+            if (!coerced_right.is_null()) { right = coerced_right; }
         }
     }
     Bool float_operands = is_float_type(ctx, type_table, left_expr.type_id) || is_float_type(ctx, type_table, right_expr.type_id);
@@ -3316,7 +3352,7 @@ api.Value coerce_cfg_value(CodegenContext& cg, CfgValueEnv& values, FunctionEnv&
             target_is_optional_pointer_payload = payload_info.kind == .pointer;
         }
         if (source_info.kind == .pointer
-            && source_info.pointer_kind == types.PointerKind.borrow
+            && (source_info.pointer_kind == types.PointerKind.borrow || source_info.pointer_kind == types.PointerKind.owner)
             && !source_info.many
             && !target_is_optional_pointer_payload
             && target_info.kind != .pointer
@@ -3525,12 +3561,26 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
         if (assign_name.local_id.valid()) {
             LocalSlot? assign_slot = env.find_local(assign_name.local_id);
             if (assign_slot is some assign_local_slot) {
-                assign_target_type_id = assign_local_slot.type_id;
-                assign_target_type_ref = assign_local_slot.type_ref;
-                types.TypeInfo assign_target_info = type_table.type_at(assign_local_slot.type_id);
+                types.TypeId! local_type_id = assign_local_slot.type_id;
+                types.TypeInfo! assign_target_info = type_table.type_at(local_type_id);
+                if (assign_target_info.kind == .layer && assign_target_info.mutable && !assign_target_info.optional) {
+                    local_type_id = assign_target_info.element;
+                    assign_target_info = type_table.type_at(local_type_id);
+                }
                 types.TypeInfo assign_value_info = type_table.type_at(assign_value_expr.type_id);
-                if (assign_target_info.kind == .pointer && assign_value_info.kind != .pointer) {
+                if (assign_target_info.kind == .pointer && assign_target_info.pointer_kind != types.PointerKind.owner && !assign_target_info.many) {
                     ptr = builder.build_load(assign_local_slot.type_ref, assign_local_slot.slot, "ref.assign.ptr");
+                    assign_target_type_id = assign_target_info.element;
+                    types.TypeInfo element_info = type_table.type_at(assign_target_type_id);
+                    if (element_info.kind == .layer && element_info.mutable && !element_info.optional) {
+                        assign_target_type_id = element_info.element;
+                    }
+                    assign_target_type_ref = llvm_type(ctx, type_table, input, llvm_context, assign_target_type_id);
+                } else if (assign_target_info.kind == .pointer && assign_value_info.kind != .pointer) {
+                    ptr = builder.build_load(assign_local_slot.type_ref, assign_local_slot.slot, "ref.assign.ptr");
+                } else {
+                    assign_target_type_id = assign_local_slot.type_id;
+                    assign_target_type_ref = assign_local_slot.type_ref;
                 }
             }
         }
@@ -3612,6 +3662,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
         }
         builder.build_store(value, slot);
         env.add_local(bind.local_id, slot, type_ref, bind.type_id);
+        env.mark_local_initialized(bind.local_id);
         index = index + 1;
     }
 }
@@ -4227,10 +4278,12 @@ Bool should_emit_init_decl(context.CompilerContext& ctx, types.TypeTable& type_t
         if (decl.body is .function_decl(function_decl)) {
             if (!function_decl.extern_flag && function_decl.cfg_function_id.valid()) {
                 assert(function_decl.generic_params.len() == 0);
-                FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ref());
                 interner.Symbol emitted_name = scoped_function_symbol(ctx, input, function_decl);
-                emit_function_named(cg, function_decl, emitted_name, env$.ref());
-                state.mark_emitted(emitted_name);
+                if (!state.emitted(emitted_name)) {
+                    FunctionEnv! env = FunctionEnv(ctx.ast_store_ref(), state$.ref());
+                    emit_function_named(cg, function_decl, emitted_name, env$.ref());
+                    state.mark_emitted(emitted_name);
+                }
             }
         }
         if (decl.body is .type_decl(type_decl)) {
@@ -4239,12 +4292,20 @@ Bool should_emit_init_decl(context.CompilerContext& ctx, types.TypeTable& type_t
                 while (init_index < type_decl.inits.len()) {
                     jir.JirInitDecl init_decl = type_decl.inits[init_index];
                     if (should_emit_init_decl(ctx, type_table, input, type_decl, init_index)) {
-                        emit_init_named(cg, state$.ref(), type_decl, init_decl, init_index);
+                        interner.Symbol emitted_name = scoped_init_function_name_symbol(ctx, type_table, input, type_decl, init_index);
+                        if (!state.emitted(emitted_name)) {
+                            emit_init_named(cg, state$.ref(), type_decl, init_decl, init_index);
+                            state.mark_emitted(emitted_name);
+                        }
                     }
                     init_index = init_index + 1;
                 }
                 if (type_decl.deinit_decl is some deinit_decl) {
-                    emit_deinit_named(cg, state$.ref(), type_decl, deinit_decl);
+                    interner.Symbol emitted_name = scoped_deinit_function_name_symbol(ctx, type_table, input, type_decl);
+                    if (!state.emitted(emitted_name)) {
+                        emit_deinit_named(cg, state$.ref(), type_decl, deinit_decl);
+                        state.mark_emitted(emitted_name);
+                    }
                 }
             }
         }

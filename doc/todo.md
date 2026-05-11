@@ -77,7 +77,12 @@
 - [x] selfhost compiler 运行 `tests/samples/minimal.jiang` 不再失败。
   - [x] 不再以 trap / `-1` 退出。
 - [x] selfhost compiler 能通过完整 `stage1_test`。
+- [x] selfhost compiler 能通过 `tests/compiler`。
+  - [x] 修复 `tests/compiler/arena_minimal.jiang` 生成非法 LLVM IR。
+  - [x] `tests/compiler` 在 selfhost 下使用能解析 libc 符号的执行路径。
+- [x] selfhost compiler 能二次编译完整 `compiler/jiangc.jiang`。
 - [x] self-compile 产物与当前 stage1 行为一致。
+  - [x] 二次产物能通过完整 `tests/compiler`。
 - [x] 清理临时兼容代码、调试输出和过渡 TODO。
 
 ## 后续：增量编译 v2/v3

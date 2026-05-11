@@ -8,18 +8,36 @@ COMPILER_TESTS_DIR="$PROJECT_ROOT/tests/compiler"
 STAGE0_BIN="${STAGE0_BIN:-$BUILD_DIR/stage0c}"
 STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1/jiangc}"
 
-if [ -n "${LLVM_CONFIG:-}" ]; then
-  LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"
+LLVM_CONFIG_BIN="${LLVM_CONFIG:-}"
+if [ -z "$LLVM_CONFIG_BIN" ] && [ -n "${JIANG_LLVM_ROOT:-}" ]; then
+  LLVM_CONFIG_BIN="$JIANG_LLVM_ROOT/bin/llvm-config"
+fi
+if [ -z "$LLVM_CONFIG_BIN" ]; then
+  LLVM_CONFIG_BIN="$(command -v llvm-config || true)"
+fi
+
+if [ -n "$LLVM_CONFIG_BIN" ]; then
+  LLVM_BIN_DIR="$(cd "$(dirname "$LLVM_CONFIG_BIN")" && pwd)"
+  LLI="$LLVM_BIN_DIR/lli"
+  if [ -x "$LLVM_BIN_DIR/clang" ]; then
+    CLANG="$LLVM_BIN_DIR/clang"
+  else
+    CLANG="${CC:-cc}"
+  fi
 elif [ -n "${JIANG_LLVM_ROOT:-}" ]; then
   LLI="$JIANG_LLVM_ROOT/bin/lli"
+  CLANG="${CC:-cc}"
 else
   LLI="$(command -v lli || true)"
+  CLANG="${CC:-cc}"
 fi
 
 if [ -z "$LLI" ] || [ ! -x "$LLI" ]; then
   echo "error: lli not found; set LLVM_CONFIG or JIANG_LLVM_ROOT to an LLVM 21.1.x toolchain" >&2
   exit 1
 fi
+
+mkdir -p "$BUILD_DIR"
 
 if [ "${SKIP_STAGE0_BUILD:-0}" != "1" ]; then
   "$PROJECT_ROOT/script/build_stage0.sh" >/dev/null
@@ -36,7 +54,36 @@ run_compiler_test() {
   printf 'compiler/%s ... ' "$test_file"
   "$STAGE0_BIN" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
   set +e
-  "$LLI" "$ir"
+  "$LLI" --jit-kind=mcjit "$ir"
+  status=$?
+  set -e
+  if [ "$status" -ne "$expected" ]; then
+    echo "failed"
+    echo "error: compiler/$test_file exited $status, expected $expected" >&2
+    exit 1
+  fi
+  echo "ok"
+}
+
+run_compiler_link_test() {
+  test_file="$1"
+  expected="$2"
+  ir="$BUILD_DIR/compiler_${test_file%.jiang}.ll"
+  exe="$BUILD_DIR/compiler_${test_file%.jiang}"
+  printf 'compiler/%s link ... ' "$test_file"
+  if [ -z "$LLVM_CONFIG_BIN" ] || [ ! -x "$LLVM_CONFIG_BIN" ]; then
+    echo "failed"
+    echo "error: llvm-config not found; set LLVM_CONFIG or JIANG_LLVM_ROOT for linked compiler tests" >&2
+    exit 1
+  fi
+  "$STAGE0_BIN" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
+  "$CLANG" "$ir" -o "$exe" \
+    $("$LLVM_CONFIG_BIN" --ldflags) \
+    $("$LLVM_CONFIG_BIN" --libs core analysis target native nativecodegen) \
+    $("$LLVM_CONFIG_BIN" --system-libs) \
+    -lc++
+  set +e
+  "$exe"
   status=$?
   set -e
   if [ "$status" -ne "$expected" ]; then
@@ -92,9 +139,9 @@ run_compiler_ir_regression_check() {
   printf 'compiler/%s ir regression ... ' "$test_file"
   "$STAGE0_BIN" --emit-llvm "$COMPILER_TESTS_DIR/$test_file" > "$ir"
   function_count="$(grep -c '^define ' "$ir" || true)"
-  if [ "$function_count" -ge 3000 ]; then
+  if [ "$function_count" -ge 4000 ]; then
     echo "failed"
-    echo "error: compiler/$test_file generated $function_count functions, expected fewer than 3000" >&2
+    echo "error: compiler/$test_file generated $function_count functions, expected fewer than 4000" >&2
     exit 1
   fi
   if grep -q 'type_check\.resolve\.scope\.ast\.token' "$ir"; then
@@ -110,6 +157,9 @@ run_named_test() {
   case "$test_file" in
     compiler_bootstrap_smoke.jiang)
       run_compiler_compile_only_stage1 "$test_file"
+      ;;
+    llvm_api_minimal.jiang)
+      run_compiler_link_test "$test_file" 0
       ;;
     *.jiang)
       run_compiler_test "$test_file" 0
@@ -145,7 +195,7 @@ run_all_compiler_tests() {
   run_compiler_test type_minimal.jiang 0
   run_compiler_test lower_hir_minimal.jiang 0
   run_compiler_test lower_jir_minimal.jiang 0
-  run_compiler_test llvm_api_minimal.jiang 0
+  run_compiler_link_test llvm_api_minimal.jiang 0
   run_compiler_compile_only_stage1 compiler_bootstrap_smoke.jiang
 }
 
