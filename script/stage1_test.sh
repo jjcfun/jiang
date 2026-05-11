@@ -302,6 +302,7 @@ run_sample ternary_enum_minimal.jiang 42
 run_sample ternary_minimal.jiang 42
 run_sample optional_minimal.jiang 42
 run_sample optional_null_compare_minimal.jiang 42
+run_sample optional_compare_non_null_minimal.jiang 42
 run_compile_fail optional_if_narrow_minimal.jiang
 run_compile_fail optional_else_narrow_minimal.jiang
 run_sample optional_coalesce_minimal.jiang 42
@@ -508,7 +509,6 @@ run_compile_fail invalid_optional_pattern_label.jiang
 run_compile_fail invalid_optional_pattern_non_optional.jiang
 run_compile_fail invalid_optional_switch_non_exhaustive.jiang
 run_compile_fail invalid_optional_coalesce_fallback_type.jiang
-run_compile_fail invalid_optional_compare_non_null.jiang
 run_compile_fail invalid_struct_init_self_escape.jiang
 run_compile_fail invalid_struct_init_positional_after_labeled.jiang
 run_compile_fail invalid_default_struct_init_positional.jiang

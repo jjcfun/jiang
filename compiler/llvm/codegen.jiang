@@ -1835,13 +1835,34 @@ api.Value coerce_value_cg(CodegenContext& cg, FunctionEnv& env, jir.JirExprId so
             types.TypeInfo payload_info = type_table.type_at(target_info.element);
             target_is_optional_pointer_payload = payload_info.kind == .pointer;
         }
+        if (target_info.kind == .layer
+            && target_info.optional
+            && target_info.element.valid()
+            && !target_is_optional_pointer_payload
+            && api.value_type_kind(value) == 12) {
+            api.Type payload_ref = llvm_type(ctx, type_table, input, llvm_context, target_info.element);
+            api.Value loaded = builder.build_load(payload_ref, value, "borrow.optional.load");
+            return wrap_optional_value(ctx, type_table, input, llvm_context, builder, target_info.element, target_type, target_ref, loaded);
+        }
+        if (source_info.kind == .pointer
+            && source_info.pointer_kind == types.PointerKind.borrow
+            && !source_info.many
+            && target_info.kind == .layer
+            && target_info.optional
+            && target_info.element.valid()
+            && type_table.assignment_compatible(target_info.element, source_info.element)) {
+            api.Type source_ref = llvm_type(ctx, type_table, input, llvm_context, source_info.element);
+            api.Value loaded = builder.build_load(source_ref, value, "borrow.optional.load");
+            return wrap_optional_value(ctx, type_table, input, llvm_context, builder, source_info.element, target_type, target_ref, loaded);
+        }
         if (source_info.kind == .pointer
             && source_info.pointer_kind == types.PointerKind.borrow
             && !source_info.many
             && !target_is_optional_pointer_payload
             && target_info.kind != .pointer
             && type_table.assignment_compatible(target_type, source_info.element)) {
-            return builder.build_load(target_ref, value, "borrow.load");
+            api.Type source_ref = llvm_type(ctx, type_table, input, llvm_context, source_info.element);
+            return builder.build_load(source_ref, value, "borrow.load");
         }
     }
     value = cast_value(ctx, type_table, builder, source_expr.type_id, target_type, target_ref, value);
@@ -2524,7 +2545,7 @@ Bool is_null_literal_expr(jir.JirExpr expr) {
     return false;
 }
 
-api.Value optional_null_compare(types.TypeTable& type_table, api.Context llvm_context, api.Builder builder, ir.BinaryOp op, jir.JirExpr left_expr, api.Value left, jir.JirExpr right_expr, api.Value right) {
+api.Value optional_compare(context.CompilerContext& ctx, types.TypeTable& type_table, jir.JirModule& input, api.Context llvm_context, api.Builder builder, ir.BinaryOp op, jir.JirExpr left_expr, api.Value left, jir.JirExpr right_expr, api.Value right) {
     Bool! left_null = is_null_literal_expr(left_expr);
     Bool! right_null = is_null_literal_expr(right_expr);
     Bool! left_optional = left_expr.type_id.valid() && type_table.is_optional(left_expr.type_id);
@@ -2534,16 +2555,40 @@ api.Value optional_null_compare(types.TypeTable& type_table, api.Context llvm_co
         optional_value = right;
     } else if (right_null && left_optional) {
         optional_value = left;
-    } else {
+    }
+    if (!optional_value.is_null() && (left_null || right_null)) {
+        api.Value tag = builder.build_extract_value(optional_value, UInt32(0), "optional.tag");
+        api.Value absent = api.const_int(llvm_context.int1_type(), UInt64(0));
+        if (op == .equal) {
+            return builder.build_icmp(32, tag, absent, "optional.null");
+        }
+        if (op == .not_equal) {
+            return builder.build_icmp(33, tag, absent, "optional.not_null");
+        }
         return api.Value();
     }
-    api.Value tag = builder.build_extract_value(optional_value, UInt32(0), "optional.tag");
-    api.Value absent = api.const_int(llvm_context.int1_type(), UInt64(0));
-    if (op == .equal) {
-        return builder.build_icmp(32, tag, absent, "optional.null");
-    }
-    if (op == .not_equal) {
-        return builder.build_icmp(33, tag, absent, "optional.not_null");
+    if (left_optional && right_optional) {
+        types.TypeInfo left_info = type_table.type_at(left_expr.type_id);
+        api.Value left_tag = builder.build_extract_value(left, UInt32(0), "optional.left.tag");
+        api.Value right_tag = builder.build_extract_value(right, UInt32(0), "optional.right.tag");
+        api.Value tags_equal = builder.build_icmp(32, left_tag, right_tag, "optional.tags.eq");
+        api.Value absent = api.const_int(llvm_context.int1_type(), UInt64(0));
+        api.Value left_absent = builder.build_icmp(32, left_tag, absent, "optional.left.absent");
+        api.Value left_payload = builder.build_extract_value(left, UInt32(1), "optional.left.payload");
+        api.Value right_payload = builder.build_extract_value(right, UInt32(1), "optional.right.payload");
+        api.Value! payload_equal = api.Value();
+        if (left_info.element.valid() && is_float_type(ctx, type_table, left_info.element)) {
+            payload_equal = builder.build_fcmp(1, left_payload, right_payload, "optional.payload.eq");
+        } else {
+            payload_equal = builder.build_icmp(32, left_payload, right_payload, "optional.payload.eq");
+        }
+        api.Value absent_or_payload_equal = builder.build_or(left_absent, payload_equal, "optional.absent.or.payload");
+        api.Value equal = builder.build_and(tags_equal, absent_or_payload_equal, "optional.eq");
+        if (op == .equal) { return equal; }
+        if (op == .not_equal) {
+            return builder.build_xor(equal, api.const_all_ones(llvm_context.int1_type()), "optional.ne");
+        }
+        return api.Value();
     }
     return api.Value();
 }
@@ -2733,8 +2778,8 @@ api.Value expr_value_cg(CodegenContext& cg, jir.JirExprId expr_id, FunctionEnv& 
         api.Value! left = expr_value_cg(cg, binary.left, env);
         api.Value! right = expr_value_cg(cg, binary.right, env);
         if (binary.op == .equal || binary.op == .not_equal) {
-            api.Value optional_compare = optional_null_compare(type_table, llvm_context, builder, binary.op, left_expr, left, right_expr, right);
-            if (!optional_compare.is_null()) { return optional_compare; }
+            api.Value optional_result = optional_compare(ctx, type_table, input, llvm_context, builder, binary.op, left_expr, left, right_expr, right);
+            if (!optional_result.is_null()) { return optional_result; }
         }
         if (left_expr.type_id.valid() && right_expr.type_id.valid()) {
             types.TypeInfo! left_info = type_table.type_at(left_expr.type_id);
@@ -3287,8 +3332,7 @@ api.Value emit_cfg_binary(api.Builder builder, ir.BinaryOp op, api.Value left, a
 api.Value cfg_value_or_expr(CodegenContext& cg, CfgValueEnv& values, jir.JirValueId id, FunctionEnv& env) {
     api.Value value = values.get(id);
     if (!value.is_null()) { return value; }
-    if (!id.valid()) { return api.Value(); }
-    return expr_value_cg(cg, jir.JirExprId(id.id), env);
+    return api.Value();
 }
 
 api.Value emit_cfg_binary_value(CodegenContext& cg, CfgValueEnv& values, jir.JirInstruction inst, FunctionEnv& env, api.Type result_type) {
@@ -3305,8 +3349,8 @@ api.Value emit_cfg_binary_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
     api.Value! left = cfg_value_or_expr(cg, values, left_id, env);
     api.Value! right = cfg_value_or_expr(cg, values, right_id, env);
     if (inst.binary_op == .equal || inst.binary_op == .not_equal) {
-        api.Value optional_compare = optional_null_compare(type_table, llvm_context, builder, inst.binary_op, left_expr, left, right_expr, right);
-        if (!optional_compare.is_null()) { return optional_compare; }
+        api.Value optional_result = optional_compare(ctx, type_table, input, llvm_context, builder, inst.binary_op, left_expr, left, right_expr, right);
+        if (!optional_result.is_null()) { return optional_result; }
     }
     if (left_expr.type_id.valid()) {
         types.TypeInfo! left_info = type_table.type_at(left_expr.type_id);
@@ -4001,7 +4045,7 @@ api.Value emit_cfg_call_value(CodegenContext& cg, CfgValueEnv& values, jir.JirIn
             Int! param_index = index + out_index;
             if (param_index < decl.params.len()) {
                 types.TypeId! param_type_id = decl.params[param_index].type_id;
-                arg_value = coerce_cfg_value_or_expr(cg, values, env, jir.JirValueId(arg_id.id), arg_id, param_type_id, llvm_type(ctx, type_table, function_target.module, llvm_context, param_type_id));
+                arg_value = coerce_cfg_value(cg, values, env, jir.JirValueId(arg_id.id), arg_id, param_type_id, llvm_type(ctx, type_table, function_target.module, llvm_context, param_type_id));
             }
             args[index + out_index] = api.value_ref(arg_value);
             index = index + 1;
@@ -4047,11 +4091,11 @@ api.Value emit_cfg_call_value(CodegenContext& cg, CfgValueEnv& values, jir.JirIn
     return api.const_null(result_type);
 }
 
-api.Value coerce_cfg_or_expr_value(CodegenContext& cg, CfgValueEnv& values, FunctionEnv& env, jir.JirExprId source_id, types.TypeId target_type, api.Type target_ref) {
-    return coerce_cfg_value_or_expr(cg, values, env, jir.JirValueId(source_id.id), source_id, target_type, target_ref);
+api.Value coerce_cfg_expr_value(CodegenContext& cg, CfgValueEnv& values, FunctionEnv& env, jir.JirExprId source_id, types.TypeId target_type, api.Type target_ref) {
+    return coerce_cfg_value(cg, values, env, jir.JirValueId(source_id.id), source_id, target_type, target_ref);
 }
 
-api.Value coerce_cfg_value_or_expr(CodegenContext& cg, CfgValueEnv& values, FunctionEnv& env, jir.JirValueId source_value_id, jir.JirExprId source_expr_id, types.TypeId target_type, api.Type target_ref) {
+api.Value coerce_cfg_value(CodegenContext& cg, CfgValueEnv& values, FunctionEnv& env, jir.JirValueId source_value_id, jir.JirExprId source_expr_id, types.TypeId target_type, api.Type target_ref) {
     context.CompilerContext& ctx = cg.ctx;
     types.TypeTable& type_table = cg.type_table;
     jir.JirModule& input = cg.input;
@@ -4059,8 +4103,17 @@ api.Value coerce_cfg_value_or_expr(CodegenContext& cg, CfgValueEnv& values, Func
     api.Builder builder = cg.builder;
     jir.JirExpr source_expr = input.expr_at(source_expr_id);
     if (source_expr.body is .literal_expr(literal)) {
-        if (literal.kind == jir.JirLiteralKind.string_lit) {
-            return coerce_value_cg(cg, env, source_expr_id, target_type, target_ref);
+        if (literal.kind == jir.JirLiteralKind.string_lit && target_type.valid() && target_type.id < type_table.len()) {
+            types.TypeInfo target_info = type_table.type_at(target_type);
+            if (target_info.kind == .array && codegen_type_is_builtin_named(ctx, type_table, target_info.element, "UInt8")) {
+                return string_literal_array_value(llvm_context, target_info, literal);
+            }
+            if (target_info.kind == .slice && codegen_type_is_builtin_named(ctx, type_table, target_info.element, "UInt8")) {
+                api.Value! current = api.undef(target_ref);
+                current = builder.build_insert_value(current, builder.build_global_string_ptr(literal.text, "str"), UInt32(0), "slice.ptr");
+                current = builder.build_insert_value(current, api.const_int(pointer_sized_int_type(llvm_context), UInt64(c_string_length(literal.text))), UInt32(1), "slice.length");
+                return current;
+            }
         }
     }
     api.Value! value = api.Value();
@@ -4068,7 +4121,7 @@ api.Value coerce_cfg_value_or_expr(CodegenContext& cg, CfgValueEnv& values, Func
         value = values.get(source_value_id);
     }
     if (value.is_null()) {
-        return coerce_value_cg(cg, env, source_expr_id, target_type, target_ref);
+        return api.Value();
     }
     if (source_expr.type_id.valid() && target_type.valid()
         && source_expr.type_id.id < type_table.len()
@@ -4132,7 +4185,20 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
         api.Type! build_result_type = llvm_type_in_env(ctx, type_table, input, llvm_context, build_type_id, env);
         api.Value! current = api.undef(build_result_type);
         if (struct_expr.type_decl_id.valid()) {
+            ModuleInput! type_input = ModuleInput(input);
             jir.JirTypeDecl?! type_decl_ref = type_decl_for_decl_id(input, struct_expr.type_decl_id);
+            if (type_decl_ref == null && env.state.all_input_data != null) {
+                Int! module_index = 0;
+                while (module_index < env.state.all_input_count) {
+                    ModuleInput candidate_input = env.state.all_input_data[module_index];
+                    jir.JirTypeDecl? candidate_decl = type_decl_for_decl_id(candidate_input.module, struct_expr.type_decl_id);
+                    if (candidate_decl != null) {
+                        type_input = candidate_input;
+                        type_decl_ref = candidate_decl;
+                    }
+                    module_index = module_index + 1;
+                }
+            }
             if (type_decl_ref is some type_decl) {
                 FunctionEnv! struct_env = FunctionEnv(ctx.ast_store_ref(), env.state);
                 if (build_type_id.valid()) {
@@ -4148,7 +4214,8 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
                         if (default_value_id.valid()) {
                             types.TypeId field_type_id = substitute_type_id(type_table, struct_env$.ref(), type_decl.fields[default_index].type_id);
                             api.Type field_type_ref = llvm_type_in_env(ctx, type_table, input, llvm_context, field_type_id, struct_env$.ref());
-                            api.Value default_value = coerce_cfg_or_expr_value(cg, values, env, default_value_id, field_type_id, field_type_ref);
+                            CodegenContext default_cg = CodegenContext(ctx, type_input.module, llvm_context, llvm_module, builder);
+                            api.Value default_value = coerce_value_cg(default_cg$.ref(), env, default_value_id, field_type_id, field_type_ref);
                             initial = builder.build_insert_value(initial, default_value, UInt32(default_index), "ctor.default");
                         }
                         default_index = default_index + 1;
@@ -4164,7 +4231,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
                         jir.JirExprId arg_id = struct_expr.fields[arg_index].value;
                         types.TypeId param_type_id = init_decl.params[arg_index].type_id;
                         api.Type param_type = llvm_type_in_env(ctx, type_table, input, llvm_context, param_type_id, struct_env$.ref());
-                        api.Value! arg_value = coerce_cfg_or_expr_value(cg, values, env, arg_id, param_type_id, param_type);
+                        api.Value! arg_value = coerce_cfg_expr_value(cg, values, env, arg_id, param_type_id, param_type);
                         args[arg_index + 1] = api.value_ref(arg_value);
                         arg_types[arg_index + 1] = api.type_ref(param_type);
                         arg_index = arg_index + 1;
@@ -4174,7 +4241,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
                     api.Type init_type = api.function_type_refs(init_result_type, arg_types, struct_expr.fields.len() + 1);
                     interner.Symbol init_base_symbol = init_function_name_symbol(ctx, type_decl, struct_expr.init_index);
                     interner.Symbol init_instance_symbol = type_instance_symbol(ctx, type_table, init_base_symbol, build_type_id);
-                    interner.Symbol init_scoped_symbol = scoped_symbol(ctx, input.module_symbol, init_instance_symbol);
+                    interner.Symbol init_scoped_symbol = scoped_symbol(ctx, type_input.module.module_symbol, init_instance_symbol);
                     UInt8[*] init_name = ctx.symbol_c_string(init_scoped_symbol);
                     api.Value! init_fn = llvm_module.lookup_function(init_name);
                     if (init_fn.is_null()) { init_fn = llvm_module.add_function(init_name, init_type); }
@@ -4208,7 +4275,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
                     api.Type field_type_ref = llvm_type_in_env(ctx, type_table, input, llvm_context, field_type_id, struct_env$.ref());
                     api.Value! value = api.const_null(field_type_ref);
                     if (value_id.valid()) {
-                        value = coerce_cfg_or_expr_value(cg, values, env, value_id, field_type_id, field_type_ref);
+                        value = coerce_cfg_expr_value(cg, values, env, value_id, field_type_id, field_type_ref);
                     }
                     current = builder.build_insert_value(current, value, UInt32(field_index_value), "struct.insert");
                     field_index_value = field_index_value + 1;
@@ -4244,7 +4311,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
     if (local.initializer.valid()) {
         jir.JirValueId! value_id = jir.JirValueId();
         if (inst.operands.len() > 0) { value_id = inst.operands[0]; }
-        api.Value! initial_value = coerce_cfg_value_or_expr(cg, values, env, value_id, local.initializer, local.type_id, type_ref);
+        api.Value! initial_value = coerce_cfg_value(cg, values, env, value_id, local.initializer, local.type_id, type_ref);
         cg.builder.build_store(initial_value, slot);
         env.mark_local_initialized(local.local_id);
     }
@@ -4269,7 +4336,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
         if (name.local_id.valid() && !env.local_initialized(name.local_id)) {
             LocalSlot? slot = env.find_local(name.local_id);
             if (slot is some local_slot) {
-                api.Value! initial_value = coerce_cfg_value_or_expr(cg, values, env, value_id, assign.value, local_slot.type_id, local_slot.type_ref);
+                api.Value! initial_value = coerce_cfg_value(cg, values, env, value_id, assign.value, local_slot.type_id, local_slot.type_ref);
                 builder.build_store(initial_value, local_slot.slot);
                 env.mark_local_initialized(name.local_id);
                 return;
@@ -4298,7 +4365,7 @@ api.Value emit_cfg_struct_value(CodegenContext& cg, CfgValueEnv& values, jir.Jir
             }
         }
     }
-    api.Value! value = coerce_cfg_value_or_expr(cg, values, env, value_id, assign.value, assign_target_type_id, assign_target_type_ref);
+    api.Value! value = coerce_cfg_value(cg, values, env, value_id, assign.value, assign_target_type_id, assign_target_type_ref);
     builder.build_store(value, ptr);
 }
 
@@ -4513,8 +4580,6 @@ api.Value for_each_current_item(CodegenContext& cg, jir.JirForEachStmt^ for_each
         if (inst.expr_meta is some expr_stmt) {
             if (inst.operands.len() > 0) {
                 cfg_value_or_expr(cg, values, inst.operands[0], env);
-            } else {
-                expr_value_cg(cg, expr_stmt.value, env);
             }
         }
         return;
@@ -4686,7 +4751,7 @@ api.Block cfg_llvm_block_at(list.ArrayList<api.Block>& blocks, jir.JirBlockId id
                 builder.build_ret_void();
                 return;
             }
-            value = coerce_cfg_value_or_expr(cg, values, env, terminator.value, jir.JirExprId(terminator.value.id), env.function_result_type, llvm_type(ctx, type_table, input, llvm_context, env.function_result_type));
+            value = coerce_cfg_value(cg, values, env, terminator.value, jir.JirExprId(terminator.value.id), env.function_result_type, llvm_type(ctx, type_table, input, llvm_context, env.function_result_type));
             if (result_info.kind == .errorable) {
                 builder.build_ret(errorable_success_payload_value(ctx, type_table, input, llvm_context, builder, env.function_result_type, value));
                 return;
