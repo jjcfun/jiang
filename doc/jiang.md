@@ -1309,7 +1309,7 @@ struct 还可以定义 `deinit` 函数。
 - `deinit` 只允许 `return;` / `return ();`
 - `deinit` 不允许 `public` / `static` 等可见性或静态修饰
 - `deinit` 不作为普通方法暴露给外部调用
-- 对结构体 owning pointer 执行 `ptr$.free()` 时，如果该结构体定义了 `deinit`，则会先触发 `deinit`，再释放对象自身内存
+- `ptr$.free()` 只释放指针指向的内存，不会隐式触发 `deinit`
 
 ```c
 struct List {

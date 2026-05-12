@@ -386,7 +386,7 @@ run_sample struct_init_optional_omitted_minimal.jiang 1
 run_sample struct_init_optional_assign_minimal.jiang 42
 run_executable_sample struct_new_constructor_minimal.jiang 42
 run_executable_sample struct_new_literal_with_init_minimal.jiang 42
-run_executable_sample deinit_minimal.jiang 42
+run_executable_sample deinit_minimal.jiang 0
 run_sample else_if_minimal.jiang 20
 run_sample multi_file_struct_return_minimal.jiang 42
 run_sample multi_file_struct_minimal.jiang 42

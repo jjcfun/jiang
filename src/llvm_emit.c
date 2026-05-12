@@ -1128,26 +1128,6 @@ static LLVMValueRef emit_expr(FunctionCodegen* cg, const JirExpr* expr) {
                     1,
                     "");
             }
-            if (expr->as.unary.value->type &&
-                expr->as.unary.value->type->kind == JIR_TYPE_POINTER &&
-                expr->as.unary.value->type->array_item &&
-                expr->as.unary.value->type->array_item->kind == JIR_TYPE_STRUCT &&
-                expr->as.unary.value->type->array_item->struct_has_deinit &&
-                expr->as.unary.value->type->array_item->struct_deinit_name) {
-                const JirFunction* deinit_fn = find_jir_function(cg->program, expr->as.unary.value->type->array_item->struct_deinit_name);
-                if (deinit_fn) {
-                    LLVMValueRef self_value = LLVMBuildLoad2(cg->builder, llvm_type(cg->context, expr->as.unary.value->type->array_item), ptr, "deinit.self");
-                    LLVMValueRef args[1];
-                    args[0] = self_value;
-                    LLVMBuildCall2(
-                        cg->builder,
-                        LLVMGlobalGetValueType(llvm_function_for(cg->program, cg->module, deinit_fn)),
-                        llvm_function_for(cg->program, cg->module, deinit_fn),
-                        args,
-                        1,
-                        "");
-                }
-            }
             LLVMValueRef raw_ptr = LLVMBuildBitCast(cg->builder, ptr, LLVMPointerType(LLVMInt8TypeInContext(cg->context), 0), "free.ptr");
             LLVMBuildCall2(
                 cg->builder,
