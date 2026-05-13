@@ -197,6 +197,8 @@ struct CloneState {
     jir.JirModule& source;
     jir.JirModule& target;
     list.ArrayList<TypeSubst> substs;
+    scope.DeclId! self_decl_id;
+    types.TypeId! self_type_id;
     list.ArrayList<Int> old_expr_ids;
     list.ArrayList<Int> new_expr_ids;
     list.ArrayList<Int> old_stmt_ids;
@@ -207,6 +209,8 @@ struct CloneState {
         self.source = source;
         self.target = target;
         self.substs = list.ArrayList<TypeSubst>();
+        self.self_decl_id = scope.DeclId();
+        self.self_type_id = types.TypeId();
         self.old_expr_ids = list.ArrayList<Int>();
         self.new_expr_ids = list.ArrayList<Int>();
         self.old_stmt_ids = list.ArrayList<Int>();
@@ -216,6 +220,25 @@ struct CloneState {
     public () add_subst(Int symbol_id, types.TypeId type_id) {
         if (symbol_id <= 0 || !type_id.valid()) { return; }
         self.substs.add(TypeSubst(symbol_id, type_id));
+    }
+
+    public () set_self_type_subst(scope.DeclId decl_id, types.TypeId type_id) {
+        self.self_decl_id = decl_id;
+        self.self_type_id = type_id;
+    }
+
+    public Bool add_self_type_args(jir.JirCallExpr^ call) {
+        if (!self.self_type_id.valid()) { return false; }
+        types.TypeTable& table = self.ctx.types_ref();
+        if (self.self_type_id.id >= table.len()) { return false; }
+        types.TypeInfo info = table.type_at(self.self_type_id);
+        if (info.kind != .nominal) { return false; }
+        Int! index = 0;
+        while (index < info.child_count) {
+            call.add_generic_type_arg(table.child_at(info.child_start + index));
+            index = index + 1;
+        }
+        return info.child_count > 0;
     }
 
     public types.TypeId lookup_subst(Int symbol_id) {
@@ -241,6 +264,9 @@ struct CloneState {
             types.TypeId substituted = self.lookup_subst(info.symbol.id);
             if (substituted.valid()) { return substituted; }
             return type_id;
+        }
+        if (info.kind == .nominal && self.self_decl_id.valid() && self.self_type_id.valid() && info.decl_id.id == self.self_decl_id.id) {
+            return self.self_type_id;
         }
         if (info.kind == .pointer) {
             types.TypeId element = self.subst_type_depth(info.element, depth + 1);
@@ -545,6 +571,7 @@ struct CloneState {
     public jir.JirTypeDecl clone_type_decl(jir.JirTypeDecl& decl, types.TypeId concrete_type_id) {
         jir.JirTypeDecl! result = jir.JirTypeDecl(self.target.store, decl.span, decl.name, decl.binding_id, concrete_type_id, decl.kind, decl.public_flag);
         result.decl_id = decl.decl_id;
+        self.set_self_type_subst(decl.decl_id, concrete_type_id);
         Int! index = 0;
         while (index < decl.fields.len()) {
             result.fields.add(self.clone_field(decl.fields[index]));
@@ -820,6 +847,16 @@ struct CloneState {
             cloned.add_generic_type_arg(self.subst_type(call.generic_type_args[index]));
             index = index + 1;
         }
+        if (call.generic_type_args.len() == 0 && call.target_decl_id.valid()) {
+            index = 0;
+            while (index < self.substs.len()) {
+                cloned.add_generic_type_arg(self.substs[index].type_id);
+                index = index + 1;
+            }
+            if (self.substs.len() == 0) {
+                self.add_self_type_args(cloned);
+            }
+        }
         cloned.set_method_target(self.subst_type(call.method_receiver_type_id), call.method_symbol);
         return .call_expr(cloned);
     }
@@ -893,6 +930,12 @@ struct CloneState {
             source_method_symbol = self.source.call_method_symbol_at(old_call_id);
         }
         jir.JirExprId callee = self.clone_expr_id(call.callee);
+        if (!source_method_symbol.valid() && call.callee.valid()) {
+            jir.JirExpr source_callee = self.source.expr_at(call.callee);
+            if (source_callee.body is .field_expr(field)) {
+                source_method_symbol = field.name.symbol;
+            }
+        }
         list.ArrayList<jir.JirExprId>! args = list.ArrayList<jir.JirExprId>();
         Int! index = 0;
         while (index < call.args.len()) {
@@ -911,11 +954,14 @@ struct CloneState {
             cloned.add_generic_type_arg(self.subst_type(call.generic_type_args[index]));
             index = index + 1;
         }
-        if (call.generic_type_args.len() == 0 && source_method_symbol.valid()) {
+        if (call.generic_type_args.len() == 0 && (source_method_symbol.valid() || call.target_decl_id.valid())) {
             index = 0;
             while (index < self.substs.len()) {
                 cloned.add_generic_type_arg(self.substs[index].type_id);
                 index = index + 1;
+            }
+            if (self.substs.len() == 0) {
+                self.add_self_type_args(cloned);
             }
         }
         cloned.set_method_target(self.subst_type(call.method_receiver_type_id), source_method_symbol);
@@ -1395,6 +1441,7 @@ jir.JirExprId clone_jir_expr_to_module_for_nominal_impl(context.CompilerContext&
         types.TypeTable& table = ctx.types_ref();
         if (concrete_type_id.id < table.len()) {
             add_type_substs_from_nominal(table, clone$.ptr(), source_decl$.ref(), table.type_at(concrete_type_id));
+            clone.set_self_type_subst(source_decl.decl_id, concrete_type_id);
         }
     }
     jir.JirExprId cloned_id = clone.clone_expr_id(expr_id);
@@ -1466,10 +1513,14 @@ public () materialize_type_in_module(MonomorphContext^ mono, jir.JirModule^ modu
     if (source_decl_ref == null) { return; }
     if (source_module_ref == null) { return; }
     jir.JirTypeDecl& source_decl = source_decl_ref$.some()$.ref();
+    if (info.child_count == 0 && source_decl.generic_params.len() > 0) { return; }
     jir.JirModule^ source_module = source_module_ref$.some();
     CloneState! clone = CloneState(mono.ctx, source_module$.ref(), module$.ref());
     add_type_substs_from_nominal(table, clone$.ptr(), source_decl, info);
     jir.JirTypeDecl concrete_decl = clone.clone_type_decl(source_decl, type_id);
+    if (source_module.module_id.id == module.module_id.id && source_decl.generic_params.len() > 0) {
+        concrete_decl.deinit_decl = null;
+    }
     module.add_decl(jir.JirDecl(info.decl_id, source_decl.span, .type_decl(module.store.create<jir.JirTypeDecl>(concrete_decl))));
     materialize_type_decl_types(mono, module, concrete_decl$.ref());
 }
@@ -2043,9 +2094,17 @@ Bool try_monomorphize_method_candidate(MonomorphContext^ mono, jir.JirModule^ in
         types.TypeTable& table = mono.ctx.types_ref();
         list.ArrayList<TypeSubst>! substs = list.ArrayList<TypeSubst>();
         list.ArrayList<types.TypeId>! args = list.ArrayList<types.TypeId>();
+        Int! generic_arg_index = 0;
+        while (generic_arg_index < function_decl.generic_params.len() && generic_arg_index < call.generic_type_args.len()) {
+            add_subst(substs$.ptr(), args$.ptr(), function_decl.generic_params[generic_arg_index].symbol.id, call.generic_type_args[generic_arg_index]);
+            generic_arg_index = generic_arg_index + 1;
+        }
         jir.JirExpr base = input.expr_at(field.base);
         types.TypeId expected_receiver_type = monomorph_dispatch_receiver_type(table, function_decl.params[0].type_id);
-        types.TypeId receiver_type = base.type_id;
+        types.TypeId! receiver_type = base.type_id;
+        if (call.method_receiver_type_id.valid()) {
+            receiver_type = call.method_receiver_type_id;
+        }
         if (type_shape_matches(table, expected_receiver_type, receiver_type, 0)) {
             collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[0].type_id, receiver_type);
             collect_receiver_owner_generic_substs(table, substs$.ptr(), args$.ptr(), function_decl$.ref(), receiver_type);
@@ -2712,6 +2771,12 @@ public () monomorphize_jir_modules(context.CompilerContext& ctx, Int![*] inputs,
     monomorphize_active_calls(mono$.ptr());
     materialize_concrete_type_decls(mono$.ptr());
     verify_concrete_type_decls(mono$.ptr());
+    mark_active_root_exprs(mono$.ptr());
+    monomorphize_active_calls(mono$.ptr());
+}
+
+public () strip_jir_generic_templates(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
+    MonomorphContext! mono = MonomorphContext(ctx, inputs, input_count);
     strip_generic_function_templates(mono$.ptr());
     strip_generic_type_templates(mono$.ptr());
 }

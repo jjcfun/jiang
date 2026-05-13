@@ -370,6 +370,20 @@ public struct JirLowerer {
         return type_id;
     }
 
+    types.TypeId lower_value_type_id(types.TypeId type_id) {
+        types.TypeId lowered = self.lower_type_id(type_id);
+        if (!lowered.valid()) { return lowered; }
+        types.TypeTable& table = self.ctx.types_ref();
+        types.TypeInfo info = table.type_at(lowered);
+        if (info.kind == .layer && info.mutable) {
+            if (info.optional) {
+                return table.make_layer(info.span, info.element, true, false);
+            }
+            return info.element;
+        }
+        return lowered;
+    }
+
     types.NominalKind type_decl_nominal_kind(jir.JirTypeDeclKind kind) {
         if (kind == .struct_decl) { return .struct_decl; }
         if (kind == .enum_decl) { return .enum_decl; }
@@ -1594,7 +1608,7 @@ public struct JirLowerer {
             return CfgLoweredValue(block_id, jir.JirExprId());
         }
         hir.HirExpr expr = self.module_input.expr_at(value);
-        types.TypeId expr_type = self.lower_type_id(expr.type_id);
+        types.TypeId expr_type = self.lower_value_type_id(expr.type_id);
         if (self.expr_lowers_to_statements(expr)) {
             jir.JirTempId temp_id = self.next_temp_id();
             jir.JirExprId target = self.temp_target_expr(expr.span, expr_type, temp_id);
@@ -1682,7 +1696,7 @@ public struct JirLowerer {
             return CfgLoweredValue(tested.block, expr_id);
         }
         if (expr.body is .hir_call(call)) {
-            CfgLoweredValue callee = self.append_cfg_value_expr_from_hir(function, block_id, call.callee, context, break_target, continue_target, catch_target, catch_stmt_id);
+            CfgLoweredValue callee = self.append_cfg_call_callee_from_hir(function, block_id, call, context, break_target, continue_target, catch_target, catch_stmt_id);
             jir.JirCallExpr^ lowered = new jir.JirCallExpr(self.module.store, callee.value, call.target_decl_id, call.target_kind_id);
             lowered.set_target_overload_index(call.target_overload_index);
             Int! generic_index = 0;
@@ -1847,19 +1861,29 @@ public struct JirLowerer {
         jir.JirBlockId end_id = function.add_block(self.module.store, while_stmt.span);
         self.set_cfg_branch_if_open(function, block_id, cond_id, while_stmt.span);
 
+        Bool! constant_true = self.hir_expr_is_true_literal(while_stmt.cond);
         CfgLoweredValue cond = self.append_cfg_value_expr_from_hir(function, cond_id, while_stmt.cond, context, end_id, cond_id, catch_target, catch_stmt_id);
         if (!self.cfg_block_has_terminator(function, cond.block)) {
-            jir.JirTerminator! terminator = jir.JirTerminator(while_stmt.span, .cond_branch);
-            terminator.value = self.cfg_value_for_expr(cond.value);
-            terminator.target = body_id;
-            terminator.else_target = end_id;
             jir.JirBasicBlock& cond_block = function.block_ref_at(cond.block);
-            cond_block.set_terminator(terminator);
+            if (constant_true) {
+                jir.JirTerminator! terminator = jir.JirTerminator(while_stmt.span, .branch);
+                terminator.target = body_id;
+                cond_block.set_terminator(terminator);
+            } else {
+                jir.JirTerminator! terminator = jir.JirTerminator(while_stmt.span, .cond_branch);
+                terminator.value = self.cfg_value_for_expr(cond.value);
+                terminator.target = body_id;
+                terminator.else_target = end_id;
+                cond_block.set_terminator(terminator);
+            }
         }
 
         jir.JirBlockId body_start = self.append_cfg_condition_binds_from_hir(function, body_id, while_stmt.span, cond.value, while_stmt.cond, end_id, cond_id);
         jir.JirBlockId body_end = self.append_cfg_block_from_hir_with_context(function, body_start, while_stmt.body, end_id, cond_id, catch_target, catch_stmt_id, self.loop_body_cfg_defer_context(context));
         self.set_cfg_branch_if_open(function, body_end, cond_id, while_stmt.span);
+        if (constant_true && !self.hir_block_may_break(while_stmt.body)) {
+            return body_end;
+        }
         return end_id;
     }
 
@@ -2085,6 +2109,53 @@ public struct JirLowerer {
     jir.JirValueId cfg_value_for_expr(jir.JirExprId expr_id) {
         if (!expr_id.valid()) { return jir.JirValueId(); }
         return jir.JirValueId(expr_id.id);
+    }
+
+    CfgLoweredValue append_cfg_call_callee_from_hir(jir.JirCfgFunction^ function, jir.JirBlockId block_id, hir.HirCallExpr call, DeferContext context, jir.JirBlockId break_target, jir.JirBlockId continue_target, jir.JirBlockId catch_target, jir.JirStmtId catch_stmt_id) {
+        if (call.method_receiver_type_id.valid()) {
+            hir.HirExpr callee_expr = self.module_input.expr_at(call.callee);
+            if (callee_expr.body is .hir_field(field)) {
+                return self.append_cfg_method_callee_from_hir(function, block_id, callee_expr.span, callee_expr.type_id, field, context, break_target, continue_target, catch_target, catch_stmt_id);
+            }
+        }
+        return self.append_cfg_value_expr_from_hir(function, block_id, call.callee, context, break_target, continue_target, catch_target, catch_stmt_id);
+    }
+
+    CfgLoweredValue append_cfg_method_callee_from_hir(jir.JirCfgFunction^ function, jir.JirBlockId block_id, token.Span span, types.TypeId type_id, hir.HirFieldExpr field, DeferContext context, jir.JirBlockId break_target, jir.JirBlockId continue_target, jir.JirBlockId catch_target, jir.JirStmtId catch_stmt_id) {
+        CfgLoweredValue base = self.append_cfg_value_expr_from_hir(function, block_id, field.base, context, break_target, continue_target, catch_target, catch_stmt_id);
+        jir.JirExprId! receiver = base.value;
+        jir.JirBlockId! current = base.block;
+        if (!self.hir_expr_is_place(field.base)) {
+            hir.HirExpr base_expr = self.module_input.expr_at(field.base);
+            types.TypeId receiver_type = self.lower_type_id(base_expr.type_id);
+            jir.JirTempId temp_id = self.next_temp_id();
+            receiver = self.temp_target_expr(base_expr.span, receiver_type, temp_id);
+            jir.JirStmtId temp_stmt_id = self.module.add_stmt(jir.JirStmt(base_expr.span, .temp_local(jir.JirTempLocalStmt(base_expr.span, temp_id, receiver_type))));
+            self.append_cfg_stmt_marker(function, current, base_expr.span, .temp_local_stmt, temp_stmt_id, receiver_type, break_target, continue_target);
+            current = self.append_cfg_assign_expr_id(function, current, base_expr.span, receiver, base.value, break_target, continue_target);
+            self.append_cfg_expr_instruction_shallow(function, current, receiver);
+        }
+
+        jir.JirFieldExpr lowered = self.lower_field_expr(receiver, field.name, field.optional_chain, field.implicit_member, field.place_projection, field.field_index);
+        jir.JirFieldExpr^ boxed_field = new jir.JirFieldExpr(lowered.base, lowered.name, lowered.optional_chain, lowered.implicit_member, lowered.place_projection, lowered.field_index, lowered.field_type_optional, lowered.field_storage_type_id, lowered.type_decl_id, lowered.variant_index);
+        jir.JirExprId expr_id = self.module.add_expr(jir.JirExpr(span, self.lower_type_id(type_id), .field_expr(boxed_field)));
+        self.append_cfg_expr_instruction_shallow(function, current, expr_id);
+        return CfgLoweredValue(current, expr_id);
+    }
+
+    Bool hir_expr_is_place(hir.HirExprId expr_id) {
+        if (!expr_id.valid()) { return false; }
+        hir.HirExpr expr = self.module_input.expr_at(expr_id);
+        if (expr.body is .hir_name(name)) { return true; }
+        if (expr.body is .hir_self(span)) { return true; }
+        if (expr.body is .hir_implicit(span)) { return true; }
+        if (expr.body is .hir_field(field)) {
+            return self.hir_expr_is_place(field.base);
+        }
+        if (expr.body is .hir_index(index_expr)) {
+            return self.hir_expr_is_place(index_expr.base);
+        }
+        return false;
     }
 
     jir.JirInstKind cfg_inst_kind_for_expr(jir.JirExpr& expr) {
@@ -2433,6 +2504,50 @@ public struct JirLowerer {
         if (stmt.body is .throw_stmt(throw_stmt)) { return true; }
         if (stmt.body is .break_stmt(span)) { return true; }
         if (stmt.body is .continue_stmt(span)) { return true; }
+        return false;
+    }
+
+    Bool hir_expr_is_true_literal(hir.HirExprId expr_id) {
+        if (!expr_id.valid()) { return false; }
+        hir.HirExpr expr = self.module_input.expr_at(expr_id);
+        if (expr.body is .hir_literal(literal)) {
+            if (literal is .bool_lit(bool_lit)) {
+                return bool_lit.value;
+            }
+        }
+        return false;
+    }
+
+    Bool hir_stmt_may_break(hir.HirStmt stmt) {
+        if (stmt.body is .break_stmt(span)) { return true; }
+        if (stmt.body is .if_stmt(if_stmt)) {
+            if (self.hir_block_may_break(if_stmt.then_block)) { return true; }
+            if (if_stmt.else_block is some else_block) {
+                if (self.hir_block_may_break(else_block)) { return true; }
+            }
+            return false;
+        }
+        if (stmt.body is .block(block)) {
+            return self.hir_block_may_break(block);
+        }
+        if (stmt.body is .try_stmt(try_stmt)) {
+            if (self.hir_block_may_break(try_stmt.body)) { return true; }
+            Int! index = 0;
+            while (index < try_stmt.catches.len()) {
+                if (self.hir_block_may_break(try_stmt.catches[index].body)) { return true; }
+                index = index + 1;
+            }
+        }
+        return false;
+    }
+
+    Bool hir_block_may_break(hir.HirBlock block) {
+        Int! index = 0;
+        while (index < block.stmts.len()) {
+            hir.HirStmt stmt = self.module_input.stmt_at(block.stmts.get(index));
+            if (self.hir_stmt_may_break(stmt)) { return true; }
+            index = index + 1;
+        }
         return false;
     }
 

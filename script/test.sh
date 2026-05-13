@@ -319,6 +319,7 @@ run_sample optional_null_compare_minimal.jiang 42
 run_compile_fail optional_if_narrow_minimal.jiang
 run_compile_fail optional_else_narrow_minimal.jiang
 run_sample optional_coalesce_minimal.jiang 42
+run_sample optional_coalesce_call_minimal.jiang 42
 run_sample coalesce_value_minimal.jiang 42
 run_sample coalesce_fallback_call_minimal.jiang 42
 run_sample coalesce_return_minimal.jiang 42
@@ -507,7 +508,6 @@ run_compile_fail invalid_array_return_length.jiang
 run_compile_fail invalid_infer_optional_null.jiang
 run_compile_fail invalid_optional_null_non_optional.jiang
 run_compile_fail invalid_optional_coalesce_non_optional.jiang
-run_compile_fail invalid_optional_coalesce_impure_left.jiang
 run_compile_fail invalid_coalesce_break_outside_loop.jiang
 run_compile_fail invalid_coalesce_continue_outside_loop.jiang
 run_compile_fail invalid_coalesce_return_value_type.jiang
