@@ -11,18 +11,21 @@ stage2 将采取人工方式编写和审核代码。
 
 ## 安装 stage1 编译器
 
-stage2 当前使用 stage1 编译器编译和运行 smoke。先在切到 stage1 分支并构建：
+stage2 当前使用 stage1 编译器编译和运行 smoke。先在 stage1 worktree 或 stage1 分支中构建：
 
 ```bash
 git switch stage1
 bash ./script/build_stage1.sh
 ```
 
-构建完成后，stage1 编译器产物位于：
+构建完成后，把 stage1 编译器安装到用户目录：
 
-```text
-build/stage1/jiangc
+```bash
+mkdir -p ~/.jiang/stage1/bin
+cp dist/stage1/jiangc ~/.jiang/stage1/bin/jiangc
 ```
+
+stage2 smoke 默认使用 `~/.jiang/stage1/bin/jiangc`。如需临时指定其他编译器，可以设置 `STAGE1_BIN`。
 
 
 

@@ -157,6 +157,8 @@ public trait Indexable {
 
 ## 测试目录
 
-- `tests/smoke/`：当前 stage2 骨架的端到端 smoke，使用 stage1 编译器编译。
-- `tests/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
+- `test/smoke/`：当前 stage2 骨架的端到端 smoke，使用 stage1 编译器编译。
+- `test/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
+- `test/compiler/fixture/`：编译器阶段测试的辅助输入。
+- `test/lang/`：语言语义覆盖测试，按 `run/`、`check/`、`fail/`、`diagnostic/` 分组。
   后续 syntax、resolve、sema、query、backend、incremental 的专项测试放到对应目录。

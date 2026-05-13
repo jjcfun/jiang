@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STAGE1_BIN="${STAGE1_BIN:-/Users/jjc/project/jiang/jiang/build/stage1/jiangc}"
+STAGE1_BIN="${STAGE1_BIN:-$HOME/.jiang/stage1/bin/jiangc}"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage1"
 
@@ -10,7 +10,7 @@ mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
 
 status=0
-for source in tests/smoke/*.jiang; do
+for source in test/smoke/*.jiang; do
   name="$(basename "$source" .jiang)"
   output="$SMOKE_BUILD_DIR/$name"
 
