@@ -64,7 +64,7 @@ LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage0
 1. 先用 `stage0c` 把 `compiler/jiangc.jiang` 编译成 LLVM IR。
 2. 再用 LLVM 21.1.x 对应的 `clang` 和 LLVM link flags 链接成 `jiangc`。
 
-推荐直接运行构建脚本，它会构建 `build/stage1/jiangc` 并用它编译样例：
+推荐直接运行构建脚本。脚本会把中间产物放在 `build/stage1/`，把发布产物放在 `dist/stage1/jiangc`，再安装到 `~/.jiang/stage1/bin/jiangc`，随后用它编译样例：
 
 ```bash
 LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage1.sh
@@ -75,7 +75,11 @@ LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config bash ./script/build_stage1
 ```bash
 LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config
 STAGE1_BUILD_DIR=build/stage1
-mkdir -p "$STAGE1_BUILD_DIR"
+STAGE1_DIST_DIR=dist/stage1
+STAGE1_INSTALL_DIR="$HOME/.jiang/stage1/bin"
+STAGE1_DIST_BIN="$STAGE1_DIST_DIR/jiangc"
+STAGE1_INSTALL_BIN="$STAGE1_INSTALL_DIR/jiangc"
+mkdir -p "$STAGE1_BUILD_DIR" "$STAGE1_DIST_DIR" "$STAGE1_INSTALL_DIR"
 
 ./build/stage0c --emit-llvm compiler/jiangc.jiang > "$STAGE1_BUILD_DIR/jiangc.ll"
 
@@ -84,11 +88,13 @@ read -r -a llvm_libs <<< "$("$LLVM_CONFIG" --libs core analysis target native na
 read -r -a llvm_system_libs <<< "$("$LLVM_CONFIG" --system-libs)"
 
 "$(dirname "$LLVM_CONFIG")/clang" "$STAGE1_BUILD_DIR/jiangc.ll" \
-  -o "$STAGE1_BUILD_DIR/jiangc" \
+  -o "$STAGE1_DIST_BIN" \
   "${llvm_ldflags[@]}" \
   "${llvm_libs[@]}" \
   "${llvm_system_libs[@]}" \
   -lc++
+
+cp "$STAGE1_DIST_BIN" "$STAGE1_INSTALL_BIN"
 ```
 
 ## 使用
@@ -109,12 +115,12 @@ read -r -a llvm_system_libs <<< "$("$LLVM_CONFIG" --system-libs)"
 
 ### 使用 Stage1 编译器
 
-构建出 `build/stage1/jiangc` 后，可以用它编译 Jiang 源文件：
+构建出 `~/.jiang/stage1/bin/jiangc` 后，可以用它编译 Jiang 源文件：
 
 ```bash
-./build/stage1/jiangc --emit-llvm tests/samples/minimal.jiang
-./build/stage1/jiangc --emit-obj -o minimal.o tests/samples/minimal.jiang
-./build/stage1/jiangc -o minimal tests/samples/minimal.jiang
+~/.jiang/stage1/bin/jiangc --emit-llvm tests/samples/minimal.jiang
+~/.jiang/stage1/bin/jiangc --emit-obj -o minimal.o tests/samples/minimal.jiang
+~/.jiang/stage1/bin/jiangc -o minimal tests/samples/minimal.jiang
 ```
 
 生成可执行文件后直接运行：

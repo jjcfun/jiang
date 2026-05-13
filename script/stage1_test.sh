@@ -6,7 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build/stage1-tests}"
 SAMPLES_DIR="$PROJECT_ROOT/tests/samples"
 NEXT_SAMPLES_DIR="$PROJECT_ROOT/tests/samples_next"
-STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1/jiangc}"
+STAGE1_BIN="${STAGE1_BIN:-$HOME/.jiang/stage1/bin/jiangc}"
 
 if [[ -n "${LLVM_CONFIG:-}" ]]; then
   LLI="$(cd "$(dirname "$LLVM_CONFIG")" && pwd)/lli"

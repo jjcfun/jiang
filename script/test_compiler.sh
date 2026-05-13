@@ -6,7 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
 COMPILER_TESTS_DIR="$PROJECT_ROOT/tests/compiler"
 STAGE0_BIN="${STAGE0_BIN:-$BUILD_DIR/stage0c}"
-STAGE1_BIN="${STAGE1_BIN:-$PROJECT_ROOT/build/stage1/jiangc}"
+STAGE1_BIN="${STAGE1_BIN:-$HOME/.jiang/stage1/bin/jiangc}"
 
 LLVM_CONFIG_BIN="${LLVM_CONFIG:-}"
 if [ -z "$LLVM_CONFIG_BIN" ] && [ -n "${JIANG_LLVM_ROOT:-}" ]; then

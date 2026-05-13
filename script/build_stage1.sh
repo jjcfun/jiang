@@ -11,12 +11,17 @@ fi
 LLVM_CONFIG="${LLVM_CONFIG:-llvm-config}"
 
 STAGE1_BUILD_DIR="${STAGE1_BUILD_DIR:-$ROOT_DIR/build/stage1}"
+STAGE1_DIST_DIR="${STAGE1_DIST_DIR:-$ROOT_DIR/dist/stage1}"
+STAGE1_INSTALL_DIR="${STAGE1_INSTALL_DIR:-$HOME/.jiang/stage1/bin}"
 STAGE1_LL="$STAGE1_BUILD_DIR/jiangc.ll"
-STAGE1_BIN="$STAGE1_BUILD_DIR/jiangc"
+STAGE1_DIST_BIN="$STAGE1_DIST_DIR/jiangc"
+STAGE1_BIN="${STAGE1_BIN:-$STAGE1_INSTALL_DIR/jiangc}"
 INPUT="$STAGE1_BUILD_DIR/input.jiang"
 OUTPUT="$STAGE1_BUILD_DIR/output"
 
 mkdir -p "$STAGE1_BUILD_DIR"
+mkdir -p "$STAGE1_DIST_DIR"
+mkdir -p "$(dirname "$STAGE1_BIN")"
 
 if [ ! -x ./build/stage0c ]; then
   bash script/build_stage0.sh >/dev/null
@@ -41,17 +46,19 @@ else
 fi
 
 if [ "${#llvm_system_libs[@]}" -eq 0 ]; then
-  "$CC_BIN" "$STAGE1_LL" -o "$STAGE1_BIN" \
+  "$CC_BIN" "$STAGE1_LL" -o "$STAGE1_DIST_BIN" \
     "${llvm_ldflags[@]}" \
     "${llvm_libs[@]}" \
     -lc++
 else
-  "$CC_BIN" "$STAGE1_LL" -o "$STAGE1_BIN" \
+  "$CC_BIN" "$STAGE1_LL" -o "$STAGE1_DIST_BIN" \
     "${llvm_ldflags[@]}" \
     "${llvm_libs[@]}" \
     "${llvm_system_libs[@]}" \
     -lc++
 fi
+
+cp "$STAGE1_DIST_BIN" "$STAGE1_BIN"
 
 printf 'Int main() { return 42; }\n' > "$INPUT"
 "$STAGE1_BIN" -o "$OUTPUT" "$INPUT"
