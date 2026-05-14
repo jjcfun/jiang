@@ -165,7 +165,6 @@ typedef enum HirBuiltinKind {
     HIR_BUILTIN_ALLOC,
     HIR_BUILTIN_ALLOC_ARRAY,
     HIR_BUILTIN_POINTER_OFFSET,
-    HIR_BUILTIN_EQUAL,
     HIR_BUILTIN_HASH,
 } HirBuiltinKind;
 

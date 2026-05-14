@@ -1090,6 +1090,13 @@ FunctionTarget? function_target_for_call(context.CompilerContext& ctx, types.Typ
         FunctionTarget? method_target = function_target_for_method_lookup(ctx, type_table, env, field.name.symbol, receiver_type, call.args.len());
         if (method_target != null) { return method_target; }
     }
+    if (callee.body is .variant_expr(variant)) {
+        if (variant.path.segment_len() == 2) {
+            interner.Symbol method_symbol = variant.path.segments[1].symbol;
+            FunctionTarget? static_method_target = function_target_for_static_method_lookup(ctx, type_table, env, local_input, method_symbol, call);
+            if (static_method_target != null) { return static_method_target; }
+        }
+    }
     if (callee.body is .name_expr(name)) {
         jir.JirExpr call_expr = local_input.module.expr_at(expr_id);
         FunctionTarget? name_target = function_target_for_name_lookup(ctx, type_table, env, local_input, name.name.symbol, call, call_expr.type_id);
@@ -1160,6 +1167,41 @@ FunctionTarget? function_target_for_method_lookup(context.CompilerContext& ctx, 
         }
         module_index = module_index + 1;
     }
+    return null;
+}
+
+FunctionTarget? function_target_for_static_method_lookup(context.CompilerContext& ctx, types.TypeTable& type_table, FunctionEnv& env, ModuleInput local_input, interner.Symbol method_symbol, jir.JirCallExpr^ call) {
+    if (!method_symbol.valid()) { return null; }
+    FunctionTarget?! found = null;
+    Int! found_count = 0;
+    Int! module_index = 0;
+    while (module_index < env.state.all_input_count) {
+        ModuleInput input = env.state.all_input_data[module_index];
+        Int! decl_index = 0;
+        while (decl_index < input.module.decl_count()) {
+            jir.JirDecl decl = input.module.decl_at(jir.JirDeclId(decl_index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (function_decl.static_flag && function_decl.name.symbol.id == method_symbol.id && function_decl.params.len() == call.args.len()) {
+                    Bool! args_match = true;
+                    Int! arg_index = 0;
+                    while (arg_index < call.args.len()) {
+                        jir.JirExpr arg = local_input.module.expr_at(call.args[arg_index]);
+                        if (!codegen_type_shape_matches(type_table, function_decl.params[arg_index].type_id, arg.type_id, 0)) {
+                            args_match = false;
+                        }
+                        arg_index = arg_index + 1;
+                    }
+                    if (args_match) {
+                        found = FunctionTarget(input.module, decl.decl_id, function_decl);
+                        found_count = found_count + 1;
+                    }
+                }
+            }
+            decl_index = decl_index + 1;
+        }
+        module_index = module_index + 1;
+    }
+    if (found_count == 1) { return found; }
     return null;
 }
 
@@ -1251,10 +1293,6 @@ Bool is_builtin_constructor_symbol(context.CompilerContext& ctx, Int symbol_id) 
 
 Bool is_builtin_hash_method(context.CompilerContext& ctx, Int symbol_id) {
     return symbol_id >= 0 && ctx.symbol_equal(interner.Symbol(symbol_id), "hash");
-}
-
-Bool is_builtin_equal_method(context.CompilerContext& ctx, Int symbol_id) {
-    return symbol_id >= 0 && ctx.symbol_equal(interner.Symbol(symbol_id), "equal");
 }
 
 Bool is_builtin_runtime_symbol(context.CompilerContext& ctx, Int symbol_id) {
@@ -1363,23 +1401,6 @@ Bool is_scalar_type(context.CompilerContext& ctx, types.TypeTable& type_table, t
 
 api.Value emit_builtin_hash_call(context.CompilerContext& ctx, types.TypeTable& type_table, jir.JirModule& input, api.Context llvm_context, api.Builder builder, jir.JirExpr expr, jir.JirExpr base_expr, api.Value base_value) {
     return cast_value(ctx, type_table, builder, base_expr.type_id, expr.type_id, llvm_type(ctx, type_table, input, llvm_context, expr.type_id), base_value);
-}
-
-api.Value emit_builtin_equal_call(context.CompilerContext& ctx, types.TypeTable& type_table, jir.JirModule& input, api.Context llvm_context, api.Builder builder, jir.JirExpr left_expr, api.Value left, jir.JirExpr right_expr, api.Value right) {
-    types.TypeId! right_value_type = right_expr.type_id;
-    api.Value! right_value = right;
-    if (right_expr.type_id.valid()) {
-        types.TypeInfo right_info = type_table.type_at(right_expr.type_id);
-        if (right_info.kind == .pointer && right_info.pointer_kind == types.PointerKind.borrow) {
-            right_value_type = right_info.element;
-            right_value = builder.build_load(llvm_type(ctx, type_table, input, llvm_context, right_value_type), right, "equal.arg");
-        }
-    }
-    api.Value right_cast = cast_value(ctx, type_table, builder, right_value_type, left_expr.type_id, llvm_type(ctx, type_table, input, llvm_context, left_expr.type_id), right_value);
-    if (is_float_type(ctx, type_table, left_expr.type_id)) {
-        return builder.build_fcmp(1, left, right_cast, "feq");
-    }
-    return builder.build_icmp(32, left, right_cast, "eq");
 }
 
 api.Value exit_function(api.Module llvm_module, api.Context llvm_context) {
@@ -3075,12 +3096,6 @@ api.Value emit_cfg_call_value(CodegenContext& cg, CfgValueEnv& values, jir.JirIn
         if (is_builtin_hash_method(ctx, field.name.symbol.id) && call.args.len() == 0 && is_scalar_type(ctx, type_table, base_expr.type_id)) {
             api.Value base_value = cfg_value_or_expr(cg, values, jir.JirValueId(field.base.id), env);
             return emit_builtin_hash_call(ctx, type_table, input, llvm_context, builder, expr, base_expr, base_value);
-        }
-        if (is_builtin_equal_method(ctx, field.name.symbol.id) && call.args.len() == 1 && is_scalar_type(ctx, type_table, base_expr.type_id)) {
-            api.Value left = cfg_value_or_expr(cg, values, jir.JirValueId(field.base.id), env);
-            jir.JirExpr right_expr = input.expr_at(call.args[0]);
-            api.Value right = cfg_value_or_expr(cg, values, jir.JirValueId(call.args[0].id), env);
-            return emit_builtin_equal_call(ctx, type_table, input, llvm_context, builder, base_expr, left, right_expr, right);
         }
     }
     Int! builtin_symbol_id = call_symbol_id(input, call);

@@ -3614,17 +3614,19 @@ static int type_has_concept_methods(const AstProgram* program, const AstType* ty
                 continue;
             }
             if (strcmp(method->name, "equal") == 0) {
-                AstType expected_param;
+                AstType expected_lhs;
+                AstType expected_rhs;
                 AstType expected_ref;
-                if (method->params.count != 1 || method->return_type.kind != AST_TYPE_BOOL) {
+                if (!method->static_method_flag || method->params.count != 2 || method->return_type.kind != AST_TYPE_BOOL) {
                     return 0;
                 }
-                expected_param = substitute_self_type(&method->params.items[0].type, type);
+                expected_lhs = substitute_self_type(&method->params.items[0].type, type);
+                expected_rhs = substitute_self_type(&method->params.items[1].type, type);
                 memset(&expected_ref, 0, sizeof(expected_ref));
                 expected_ref.kind = AST_TYPE_REFERENCE;
                 expected_ref.array_item = (AstType*)malloc(sizeof(AstType));
                 *expected_ref.array_item = ast_type_copy(type);
-                if (!ast_type_is_equal(&expected_param, &expected_ref)) {
+                if (!ast_type_is_equal(&expected_lhs, &expected_ref) || !ast_type_is_equal(&expected_rhs, &expected_ref)) {
                     return 0;
                 }
                 if (!(builtin->kind == AST_BUILTIN_NOMINAL_INT ||
@@ -3736,10 +3738,14 @@ static int type_has_builtin_concept_methods(const AstProgram* program, const Ast
         ref_type.kind = AST_TYPE_REFERENCE;
         ref_type.array_item = (AstType*)malloc(sizeof(AstType));
         *ref_type.array_item = self_type;
-        param.name = "other";
+        param.name = "lhs";
         param.type = ref_type;
         method.name = "equal";
+        method.static_method_flag = 1;
         method.return_type.kind = AST_TYPE_BOOL;
+        param_list_push(&method.params, param);
+        param.name = "rhs";
+        param.type = ref_type;
         param_list_push(&method.params, param);
         concept_method_list_push(&synthetic.methods, method);
         return type_has_concept_methods(program, type, &synthetic);

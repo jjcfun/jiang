@@ -3184,30 +3184,6 @@ static HirBuiltinKind builtin_method_kind(HirType* receiver_type, const char* me
         return HIR_BUILTIN_NONE;
     }
     builtin = (const HirBuiltinNominalDecl*)query.nominal.decl;
-    if (strcmp(method_name, "equal") == 0) {
-            switch (builtin->kind) {
-            case HIR_BUILTIN_NOMINAL_INT:
-            case HIR_BUILTIN_NOMINAL_I8:
-            case HIR_BUILTIN_NOMINAL_I16:
-            case HIR_BUILTIN_NOMINAL_I32:
-            case HIR_BUILTIN_NOMINAL_I64:
-            case HIR_BUILTIN_NOMINAL_U8:
-            case HIR_BUILTIN_NOMINAL_U16:
-            case HIR_BUILTIN_NOMINAL_U32:
-            case HIR_BUILTIN_NOMINAL_U64:
-            case HIR_BUILTIN_NOMINAL_F16:
-            case HIR_BUILTIN_NOMINAL_F32:
-            case HIR_BUILTIN_NOMINAL_F64:
-            case HIR_BUILTIN_NOMINAL_FLOAT:
-            case HIR_BUILTIN_NOMINAL_DOUBLE:
-            case HIR_BUILTIN_NOMINAL_CHARACTER:
-            case HIR_BUILTIN_NOMINAL_UINT8:
-            case HIR_BUILTIN_NOMINAL_BOOL:
-                return HIR_BUILTIN_EQUAL;
-            default:
-                return HIR_BUILTIN_NONE;
-        }
-    }
     if (strcmp(method_name, "hash") == 0) {
             switch (builtin->kind) {
             case HIR_BUILTIN_NOMINAL_INT:
@@ -3262,33 +3238,6 @@ static int lower_builtin_method_call(LowerContext* ctx,
     out->as.call.builtin = builtin;
     out->as.call.callee = 0;
     expr_list_push(&out->as.call.args, receiver_arg);
-    if (builtin == HIR_BUILTIN_EQUAL) {
-        HirExpr* arg = 0;
-        HirType* value_type = primitive_type(ctx->program, receiver_type->kind);
-        HirType* expected_type = 0;
-        if (!value_type) {
-            value_type = receiver_type;
-        }
-        expected_type = reference_to_type(ctx, value_type);
-        if (ast_args->count != 1 || ast_args->items[0].name) {
-            return fail(ctx, "equal expects exactly one argument");
-        }
-        arg = lower_expr_expected(ctx, ast_args->items[0].value, expected_type);
-        if (!arg) {
-            return 0;
-        }
-        if (!type_assignment_compatible(arg->type, expected_type)) {
-            return fail(ctx, "equal argument type mismatch");
-        }
-        {
-            HirExpr* deref = new_expr(HIR_EXPR_DEREF, value_type, line);
-            deref->as.unary.value = arg;
-            arg = deref;
-        }
-        expr_list_push(&out->as.call.args, arg);
-        out->type = primitive_type(ctx->program, HIR_TYPE_BOOL);
-        return 1;
-    }
     if (builtin == HIR_BUILTIN_HASH) {
         if (ast_args->count != 0) {
             return fail(ctx, "hash expects no arguments");
@@ -3306,18 +3255,23 @@ static HirExpr* lower_equatable_binary_method_call(LowerContext* ctx,
                                                    HirExpr* right,
                                                    int line) {
     HirFunction* method = 0;
-    HirExpr* receiver_arg = 0;
+    HirExpr* left_ref = 0;
     HirExpr* right_ref = 0;
     HirExpr* call = 0;
     if ((op != AST_BIN_EQ && op != AST_BIN_NE) || !left || !right || !type_equals(left->type, right->type)) {
         return 0;
     }
-    method = find_type_method(ctx->program, left->type, "equal", 0);
+    method = find_type_method(ctx->program, left->type, "equal", 1);
     if (!method || method->return_type->kind != HIR_TYPE_BOOL || method->params.count != 2) {
         return 0;
     }
-    receiver_arg = make_instance_method_receiver(ctx, left, left->type, line);
-    if (!receiver_arg) {
+    if (!is_lvalue_expr(left)) {
+        fail(ctx, "equal argument requires lvalue");
+        return 0;
+    }
+    left_ref = new_expr(HIR_EXPR_ADDR, reference_to_type(ctx, left->type), line);
+    left_ref->as.unary.value = left;
+    if (!type_assignment_compatible(left_ref->type, method->params.items[0]->type)) {
         return 0;
     }
     if (!is_lvalue_expr(right)) {
@@ -3331,7 +3285,7 @@ static HirExpr* lower_equatable_binary_method_call(LowerContext* ctx,
     }
     call = new_expr(HIR_EXPR_CALL, primitive_type(ctx->program, HIR_TYPE_BOOL), line);
     call->as.call.callee = method;
-    expr_list_push(&call->as.call.args, receiver_arg);
+    expr_list_push(&call->as.call.args, left_ref);
     expr_list_push(&call->as.call.args, right_ref);
     if (op == AST_BIN_NE) {
         HirExpr* false_lit = new_expr(HIR_EXPR_BOOL, primitive_type(ctx->program, HIR_TYPE_BOOL), line);
@@ -5461,10 +5415,7 @@ static HirExpr* lower_expr_expected(LowerContext* ctx, const AstExpr* expr, HirT
                     {
                         HirBuiltinKind builtin_method = builtin_method_kind(owner_type, member_name, 0);
                         if (builtin_method != HIR_BUILTIN_NONE) {
-                            out = new_expr(HIR_EXPR_CALL,
-                                           builtin_method == HIR_BUILTIN_EQUAL ? primitive_type(ctx->program, HIR_TYPE_BOOL)
-                                                                               : primitive_type(ctx->program, HIR_TYPE_INT),
-                                           expr->line);
+                            out = new_expr(HIR_EXPR_CALL, primitive_type(ctx->program, HIR_TYPE_INT), expr->line);
                             if (!lower_builtin_method_call(ctx, expr->line, builtin_method, owner_type, receiver_arg, &expr->as.call.args, out)) {
                                 free(owner_name);
                                 free(trait_name);

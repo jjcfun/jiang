@@ -1765,7 +1765,7 @@ trait 也可以继承一个或多个父 trait：
 
 ```c
 trait HashEq: Hashable {
-  Bool equal(Self other);
+  static Bool equal(Self& lhs, Self& rhs);
 }
 ```
 
