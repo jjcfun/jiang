@@ -42,12 +42,17 @@ literal     <- int_lit
 ## 源文件
 
 ```peg
-file        <- (extern_block / global_destructure / decl)* eof
+file        <- top_level_item* eof
+
+top_level_item
+            <- extern_block
+             / global_destructure
+             / top_level_decl
 
 extern_block
             <- "extern" "{" extern_item* "}"
 
-extern_item <- "public"? "static"? function_or_global
+extern_item <- "public"? "static"? (function_decl / global_decl)
 
 global_destructure
             <- "(" destructure_binding ("," destructure_binding)* ")"
@@ -60,7 +65,10 @@ destructure_binding
 ## 声明
 
 ```peg
-decl        <- leading_annotation* decl_modifier* decl_body
+top_level_decl
+            <- leading_annotation* decl_modifier* top_level_decl_body
+
+member_decl <- leading_annotation* member_modifier* member_decl_body
 
 leading_annotation
             <- "@" "where" "(" where_constraints ")"
@@ -68,17 +76,31 @@ leading_annotation
 decl_modifier
             <- "public"
              / "extern"
+
+member_modifier
+            <- "public"
              / "static"
 
-decl_body   <- import_decl
+top_level_decl_body
+            <- import_decl
              / alias_decl
-             / struct_decl
+             / nominal_decl
+             / trait_decl
+             / extend_decl
+             / function_decl
+             / global_decl
+
+member_decl_body
+            <- alias_decl
+             / nominal_decl
+             / trait_decl
+             / function_decl
+
+nominal_decl
+            <- struct_decl
              / record_decl
              / enum_decl
              / union_decl
-             / trait_decl
-             / extend_decl
-             / function_or_global
 
 import_decl <- "import" (import_alias "=")? import_path ";"
 
@@ -89,8 +111,10 @@ import_path <- string_lit / ident
 
 alias_decl  <- "alias" name "=" type ";"
 
-function_or_global
-            <- type name (function_tail / global_tail)
+function_decl
+            <- result_type name function_tail
+
+global_decl <- type name global_tail
 
 global_tail <- ("=" expr)? ";"
 
@@ -102,9 +126,11 @@ param_list  <- param ("," param)* ","?
 param       <- type name ("=" expr)?
 ```
 
-说明：顶层 `public`、`extern`、`static` 由 `decl_modifier` 统一解析。
+说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。
 因此 `struct_decl`、`record_decl`、`enum_decl`、`union_decl`、`trait_decl`
 等规则本身不重复写 `"public"`。
+`global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
+成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
 
 ## 泛型和 where 约束
 
@@ -117,11 +143,11 @@ where_constraints
 
 where_constraint
             <- projected_where_constraint
-             / name ":" type_bound ("=" type)?
-             / name "=" type
+             / name ":" type_bound
+             / name "==" type
 
 projected_where_constraint
-            <- name "." "[" path "]" "." name "=" type
+            <- name "." "[" path "]" "." name "==" type
 
 type_bound  <- trait_bound ("&" trait_bound)*
 
@@ -140,6 +166,8 @@ trait_bound_arg
 ```peg
 type        <- type_primary type_postfix*
 
+result_type <- type ("@" type)?
+
 type_primary
             <- "_"
              / path type_args?
@@ -154,28 +182,11 @@ type_postfix
              / "!"
              / "&"
              / "^"
-             / "@" error_type
              / "[" "]"
              / "[" "*" "]"
              / "[" array_count "]"
 
 array_count <- "_" / int_lit
-
-error_type  <- error_type_primary error_type_postfix*
-
-error_type_primary
-            <- "_"
-             / path type_args?
-             / "(" ")"
-             / "(" type "," type ("," type)* ","? ")"
-             / "(" error_type ")"
-
-error_type_postfix
-            <- "&"
-             / "^"
-             / "[" "]"
-             / "[" "*" "]"
-             / "[" array_count "]"
 
 path        <- name ("." name)*
 
@@ -191,7 +202,7 @@ name        <- ident / "self"
 - `T[]` 表示 slice。
 - `T[*]` 表示 many pointer。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
-- `T@E` 表示 errorable。
+- `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 - `RawPointer<T>` 在语义上等价于裸指针类型；语法上仍按命名泛型类型解析。
 
 ## struct / record
@@ -214,7 +225,7 @@ struct_member
 struct_member_body
             <- deinit_decl
              / init_decl
-             / "static"? assoc_type_impl
+             / assoc_type_impl
              / "static"? method_decl
              / field_decl
 
@@ -225,7 +236,7 @@ init_decl   <- "init" "?"? name? "(" param_list? ")" block
 assoc_type_impl
             <- "associated" path "=" type ";"
 
-method_decl <- type name function_tail
+method_decl <- result_type name function_tail
 
 field_decl  <- type field_init ("," field_init)* ";"
 
@@ -286,7 +297,7 @@ associated_type_decl
             <- "associated" name (":" type_bound)? ";"
 
 trait_method_decl
-            <- "static"? type name function_tail
+            <- "static"? result_type name function_tail
 ```
 
 ## extend
@@ -296,7 +307,7 @@ extend_decl <- "extend" type (":" path)? "{" extend_member* "}"
 
 extend_member
             <- assoc_type_impl
-             / decl
+             / member_decl
 ```
 
 ## 语句和 block
@@ -310,9 +321,6 @@ stmt        <- return_stmt
              / continue_stmt
              / defer_stmt
              / block
-             / if_stmt
-             / switch_stmt
-             / try_stmt
              / while_stmt
              / for_stmt
              / destructure_stmt
@@ -345,8 +353,6 @@ assign_op   <- "=" / "+=" / "-=" / "*=" / "/=" / "%="
 
 expr_stmt   <- expr ";"
 
-if_stmt     <- "if" expr block ("else" (if_stmt / block))?
-
 while_stmt  <- "while" expr block
 
 for_stmt    <- "for" for_binding "in" expr block
@@ -354,32 +360,25 @@ for_stmt    <- "for" for_binding "in" expr block
 for_binding <- type name
              / pattern
 
-try_stmt    <- "try" postfix_expr catch_stmt+ ";"?
-
-catch_stmt  <- "catch" ("(" catch_binding? ")")? block
-
 catch_binding
             <- type name?
              / name
 
-switch_stmt <- "switch" expr "{" switch_stmt_case* "}"
-
-switch_stmt_case
-            <- (pattern / "else") "=>" switch_stmt_body ","?
-
-switch_stmt_body
-            <- block / stmt
+switch_pattern_list
+            <- "else"
+             / pattern ("," pattern)*
 ```
+
+说明：`block` 内只允许 `stmt`，不允许独立的 tail expression。
+`expr_stmt` 必须以 `;` 结束。`block` 的值由最后一条 `stmt` 决定；
+空 `block` 的值为 `Unit`。
 
 ## 表达式
 
 表达式按优先级从低到高定义：
 
 ```peg
-expr        <- conditional_expr
-
-conditional_expr
-            <- (range_expr / logic_or_expr) ("?" expr ":" expr)?
+expr        <- range_expr
 
 range_expr  <- logic_or_expr ".." logic_or_expr
 
@@ -427,6 +426,7 @@ postfix_expr
 postfix_tail
             <- type_args "(" call_args? ")"
              / "(" call_args? ")"
+             / catch_expr
              / "?." name
              / "." name
              / "?" "[" index_or_slice "]"
@@ -468,10 +468,9 @@ primary_expr
              / "." name
              / paren_expr
              / array_expr
-             / block_expr
+             / block
              / if_expr
              / switch_expr
-             / try_expr
 
 paren_expr  <- "(" ")"
              / "(" expr "," expr ("," expr)* ","? ")"
@@ -479,26 +478,24 @@ paren_expr  <- "(" ")"
 
 array_expr  <- "[" (expr ("," expr)* ","?)? "]"
 
-block_expr  <- "{" stmt* expr? "}"
-
 struct_lit  <- "{" (field_init_expr ("," field_init_expr)* ","?)? "}"
 
 field_init_expr
             <- (name ":")? expr
 
-if_expr     <- "if" expr block_expr "else" block_expr
+if_expr     <- "if" expr block "else" block
 
 switch_expr <- "switch" expr "{" switch_expr_case* "}"
 
 switch_expr_case
-            <- (pattern / "else") "=>" switch_expr_body ("," / ";")?
+            <- switch_pattern_list "=>" switch_expr_body
 
 switch_expr_body
-            <- block_expr / expr
+            <- block / stmt
 
-try_expr    <- "try" postfix_expr catch_expr+
+catch_expr  <- "catch" "(" catch_binding? ")" "=>" catch_body
 
-catch_expr  <- "catch" ("(" catch_binding? ")")? block_expr
+catch_body  <- block / expr
 ```
 
 ## pattern
@@ -540,8 +537,8 @@ pattern_list
 - 这份 PEG 描述的是 Jiang 语言语法本身，不以旧编译器内部结构为边界。
 - 少数语义限制不在 PEG 中表达，例如：
   - type suffix 的规范顺序是 `?` 再 `!`。
-  - `@` 后的 error type 不能带顶层 `?` 或 `!`。
-  - `try` 的 source 必须是单个 errorable call。
+  - `return` 只能返回 `result_type` 中 `@` 左侧的成功值类型；错误值只能通过 `throw` 返回。
+  - `@` 右侧类型是否可作为 error payload 由 type check 判断。
   - `switch` exhaustiveness、trait bound、visibility 等由 resolve/sema 阶段检查。
-- `struct_lit` 与 `block_expr` 在语法上都使用 `{ ... }`，parser 依赖上下文和有序选择区分。
-- 泛型类型参数中的 `>>` 可能由 lexer 合并为一个 token，parser 在类型参数上下文中会按两个 `>` 处理。
+  - `struct_lit` 与 `block` 在语法上都使用 `{ ... }`，parser 依赖上下文和有序选择区分。
+  - 泛型类型参数中的 `>>` 可能由 lexer 合并为一个 token，parser 在类型参数上下文中会按两个 `>` 处理。

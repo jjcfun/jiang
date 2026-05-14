@@ -667,9 +667,8 @@ Int add(Int base, Int extra) {
 ```c
 Int[_] list = [5, 3, 4, 1, 2];
 
-sort(list, { $0 < $1 });
-sort(list, { (a, b) -> a < b });
-sort(list, { (_ a, _ b) -> a < b });
+sort(list, (left, right) => left < right);
+sort(list, (Int left, Int right) => left < right);
 ```
 
 #### 函数签名
@@ -712,6 +711,7 @@ Fn<Bool, Int, Int> compare;
 - 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
 - `Fn<...>` 的返回类型可以写成 `T@E`
 - 通过 `Fn<...>` 变量进行调用
+- 非捕获 lambda 表达式赋值给 `Fn<...>`
 - 若同名函数/方法存在多个重载：
   - 调用时按参数个数和参数类型**精确匹配**
   - 返回类型不参与重载决议
@@ -797,11 +797,29 @@ Fn<Int, Int> inc = add;
 Fn<Int, Int, Int> sum = add;
 ```
 
+示例 6：lambda 表达式
+
+```c
+Fn<Int, Int> inc = (Int value) => value + 1;
+Fn<Int, Int, Int> add = (Int left, Int right) => left + right;
+Fn<Int> answer = () => 42;
+```
+
+lambda 规则：
+
+- 参数列表必须写 `(...)`
+- 参数可以省略类型；目标 `Fn<...>` 类型会参与参数类型推断
+- 单参数也必须写括号，例如 `(Int x) => x`
+- 无参数写 `() => expr`
+- body 可以是表达式或 block
+- 当前只支持非捕获闭包；不能读取或写入外层局部变量
+- lambda 可以赋值给 `Fn<...>` 或传给需要 `Fn<...>` 的参数
+
 当前不支持：
 
 - 通过实例值获取绑定方法函数值（例如 `value.method`）
 - `init` 转函数指针
-- 闭包
+- 捕获外部变量的闭包
 
 #### 异步函数（Async）
 
@@ -846,16 +864,15 @@ if (a == 10) {
 
 #### if表达式
 
-`if` 也可以作为表达式使用：
+`if` 只有表达式形式；作为语句使用时写成 `if ...;`。
 
 ```c
-Int x = if (flag) { 1 } else { 2 };
-Int y = if (flag) 1 else 2;
+Int x = if (flag) { 1; } else { 2; };
 Int z = if (flag) {
     Int base = 40;
-    base + 2
+    base + 2;
 } else {
-    0
+    0;
 };
 ```
 
@@ -863,10 +880,10 @@ Int z = if (flag) {
 
 - `else` 分支必填
 - 两个分支的结果类型必须一致
-- 分支可以写成单个裸表达式，或写成 `{ ... }`
-- 裸表达式分支不需要 `;`
-- `{ ... }` 内可以写多条语句，最后一个**不带 `;`** 的表达式作为分支结果
-- 前置语句当前主要支持局部变量声明、赋值和普通表达式语句
+- 分支必须写成 `{ ... }`
+- `{ ... }` 内只允许语句，不允许独立的 tail expression
+- 表达式语句必须以 `;` 结束
+- 分支结果是 block 中最后一条语句的值；空 block 的结果是 `Unit`
 
 #### switch表达式
 
@@ -882,7 +899,7 @@ Int x = switch (value) {
 Int y = switch (value) {
     1 => {
         Int base = 40;
-        base + 1
+        base + 1;
     }
     else => 0;
 };
@@ -891,10 +908,11 @@ Int y = switch (value) {
 当前规则：
 
 - 分支使用 `=>`
-- 分支右侧可以写成单个裸表达式，或 `{ ... }`
-- 裸表达式分支必须以 `;` 结束
-- `{ ... }` 分支后面不需要再写 `;`
-- `{ ... }` 内可以写多条语句，最后一个**不带 `;`** 的表达式作为分支结果
+- `=>` 左侧可以用 `,` 匹配多个 pattern，例如 `.a, .b => ...`
+- `switch` 只有表达式形式；作为语句使用时写成 `switch ...;`
+- 分支右侧可以写成单条语句，或 `{ ... }`
+- `{ ... }` 内只允许语句，不允许独立的 tail expression
+- 分支结果是右侧语句或 block 最后一条语句的值
 - 所有分支结果类型必须一致
 - `enum` / `union` / `optional` 仍然做穷尽性检查
 - 当前不支持模式绑定形式的 `switch` 表达式
@@ -964,13 +982,11 @@ Int@Err outer(Bool fail) {
 异常的使用方式是：
 
 - 在 `@E` 函数里依靠普通调用做同 `E` 的隐式传播
-- 用 `try expr catch fallback` 处理单个失败结果
-- 用 `try expr catch (e) fallback` 或 `try expr catch (e) { expr }` 处理单个失败结果并读取错误值
-- 在需要拦截错误时使用语句级 `try-catch`
+- 用 `expr catch (...) => fallback` 处理单个失败结果
 
 异常结果不通过 `switch` 匹配。
 
-单个可错表达式可以用前置 `try` 加 `catch` 处理：
+单个可错表达式可以用后缀 `catch` 处理：
 
 ```c
 enum Err {
@@ -985,94 +1001,42 @@ Int@Err parse(Bool fail) {
 }
 
 Int main() {
-    Int a = try parse(false) catch 0;
-    Int b = try parse(true) catch (e) if (e == Err.bad) 42 else 0;
-    Int! handled = 0;
-    try parse(true) catch (e) {
+    Int a = parse(false) catch () => 0;
+    Int b = parse(true) catch (e) => {
         if (e == Err.bad) {
-            handled = handled + 1;
-        }
+            42;
+        } else {
+            0;
+        };
     };
-    Int c = try parse(true) catch (e) {
+    Int c = parse(true) catch (e) => {
         Int base = 0;
-        if (e == Err.bad) base + 7 else base
+        if (e == Err.bad) {
+            base + 7;
+        } else {
+            base;
+        };
     };
-    return a + b + handled + c;
+    return a + b + c;
 }
 ```
 
-单条 `catch` 规则：
+`catch` 规则：
 
-- `try expr catch fallback`
-  - `expr` 必须是 `T@E`
-  - 结果类型是 `T`
-  - `fallback` 的类型必须能赋给 `T`
-- `try expr catch (name) fallback`
-  - `expr` 必须是 `T@E`
-  - `name` 的类型自动推断为错误类型 `E`
-  - 结果类型是 `T`
-  - `fallback` 的类型必须能赋给 `T`
-- `try expr catch (name) { expr }`
-  - 只在表达式位置可用
-  - `expr` 必须是 `T@E`
-  - `name` 的类型自动推断为错误类型 `E`
-  - 花括号内可以写多条语句，最后一个不带 `;` 的表达式作为结果
-- `try expr catch (name) { ... };`
-  - 这是语句级形式
-  - 成功时继续执行，错误时进入块
-- `catch` 不会做 runtime unwind，仍然只是结果值分支
-
-示例：
-
-```c
-enum ErrA {
-    a,
-}
-
-enum ErrB {
-    b,
-}
-
-Int@ErrA fail_a() {
-    throw ErrA.a;
-}
-
-Int@ErrB fail_b() {
-    throw ErrB.b;
-}
-
-Int main() {
-    Int! result = 0;
-    try {
-        fail_a();
-        fail_b();
-    } catch (ErrA e) {
-        result = 1;
-    } catch (ErrB e) {
-        result = 2;
-    }
-    return result;
-}
-```
-
-`try-catch` 规则：
-
-- 只支持语句级：
-  - `try { ... } catch (Type name) { ... }`
-- `catch` 至少一个，可多个
-- `catch` 类型必须显式写出，且必须带绑定名
-- `try` 块中所有可能出现的错误类型都必须被 `catch` 完整覆盖，否则编译错误
-- 匹配按**精确错误类型**进行
-- 在 `try` 中，原本会隐式传播到当前函数外部的错误，优先跳转到匹配的 `catch`
-- 语句级 `try` 不产值
-- 表达式级 `try` 只支持：
-  - `try` body 的最后一个不带 `;` 的表达式必须是可错表达式
-  - `catch` 分支可以是单个表达式，或多语句 `{ ... }`
-  - body 只能产生一种错误类型；`catch` 类型必须与它精确一致
+- 只支持后缀表达式形式：`expr catch (...) => fallback`
+- `catch` 是 postfix 操作，只处理它左侧的单个可错表达式
+- `expr` 必须是 `T@E`
+- `catch` 参数列表必须写 `(...)`；不需要错误值时写 `()`
+- `catch` 绑定可省略类型；如果写绑定，类型自动推断为错误类型 `E`
+- fallback 可以是表达式或 block
+- 成功结果类型为 `T`，fallback 的结果类型必须能与 `T` 统一
+- `catch` 不做 runtime unwind，仍然只是结果值分支
 
 不支持：
 
-- `try expr`
+- 前置 `try`
+- 多条 `catch`
+- 无 `=>` 的 `catch` fallback
 - `finally`
 - 不同错误类型自动组合
 
@@ -1660,7 +1624,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 - `Name: Trait`
 - `Name: Trait<Assoc = Type>`
 - `Name: TraitA & TraitB & TraitC`
-- `Name = Type`
+- `Name == Type`
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
@@ -1768,7 +1732,7 @@ trait Numeric;
 
 ```c
 trait Equatable {
-  Bool equal(Self& other);
+  static Bool equal(Self& lhs, Self& rhs);
 }
 
 trait Hashable: Equatable {
@@ -1780,7 +1744,7 @@ trait 也可以继承一个或多个父 trait：
 
 ```c
 trait HashEq: Hashable {
-  Bool equal(Self& other);
+  static Bool equal(Self& lhs, Self& rhs);
 }
 ```
 
@@ -1846,7 +1810,7 @@ trait Iterator {
   Item next();
 }
 
-@where(Item = UInt8)
+@where(Item == UInt8)
 trait ByteIterator: Iterator {
   Int next_int();
 }
@@ -1884,7 +1848,7 @@ public trait SubscriptSet: SubscriptGet {
 - 关联类型 bound 可写作 `associated Item: Hashable;`
 - 多个关联类型 bound 可写作 `associated Item: Hashable & Equatable;`
 - 子 trait 会继承父 trait 的关联类型，且当前不允许重新声明父 trait 的同名关联类型
-- 子 trait 可以通过 `@where(Item: Hashable)` 或 `@where(Item = UInt8)` 继续约束继承来的关联类型
+- 子 trait 可以通过 `@where(Item: Hashable)` 或 `@where(Item == UInt8)` 继续约束继承来的关联类型
 - `@where(...)` 中多个 trait 约束也支持 `&`，例如 `@where(T: Hashable & Equatable)`
 - `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[] bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
 - 若继承链中出现同名 requirement：

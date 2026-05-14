@@ -59,7 +59,7 @@ Token 只表示词法事实，不承载语义类型。
   和 resolve/sema 解释。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
   `else`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、
-  `extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、
+  `extend`、`associated`、`static`、`switch`、`catch`、`break`、`continue`、
   `defer`、`throw`、`true`、`false`、`null`、`self`、`some`、`Self`。
 - 字符字面量使用单引号，例如 `'a'`。
 - 字符串字面量使用双引号，文本按 UTF-8 字节序列处理。
@@ -531,7 +531,7 @@ union Maybe<T> {
 
 ```jiang
 trait Equatable {
-    Bool equal(Self& other);
+    static Bool equal(Self& lhs, Self& rhs);
 }
 
 trait Hashable: Equatable {
@@ -693,7 +693,6 @@ Result@(Error!);
 未定事项：
 
 - `throw expr` 的类型。
-- `try expr catch ...` 和 `try { ... } catch ...` 的统一模型。
 - catch binding 的作用域和类型。
 - 未捕获错误如何向外传播。
 
@@ -708,7 +707,6 @@ Result@(Error!);
 - `defer`
 - `if`
 - `switch`
-- `try`
 - `while`
 - `for`
 - block
@@ -718,12 +716,47 @@ Result@(Error!);
 
 表达式：
 
-- block expr
 - if expr
 - switch expr
-- try/catch expr
+- catch expr
 - binary/unary expr
 - call/field/index/slice/postfix expr
+
+`stmt` 和 `expr` 在语法上保持分离，但每条 `stmt` 在类型系统中都有
+result type。`block` 内只允许语句，不存在独立的 tail expression。表达式语句
+必须写 `;`。`block` 作为表达式使用时，其值等于最后一条语句的值；空
+`block` 的值为 `Unit`。因此：
+
+```jiang
+Int x = {
+    foo();
+    1;
+};
+```
+
+上面的 `block` 类型为 `Int`。如果最后一条语句是赋值、局部变量声明、
+`defer` 等无值语句，则 `block` 类型为 `Unit`。
+
+语句 result type 规则：
+
+| 语句 | result type |
+| --- | --- |
+| `expr;` | `expr` 的类型 |
+| `block` | block 最后一条语句的 result type；空 block 为 `Unit` |
+| `return expr?;` | `Never` |
+| `throw expr;` | `Never` |
+| `break;` | `Never` |
+| `continue;` | `Never` |
+| `var_decl_stmt` | `Unit` |
+| `destructure_stmt` | `Unit` |
+| `assign_stmt` | `Unit` |
+| `defer_stmt` | `Unit` |
+| `while_stmt` | `Unit` |
+| `for_stmt` | `Unit` |
+
+非最后一条语句的 result value 会被隐式丢弃。`Never` 表示该语句不会正常
+继续执行，可以在分支类型统一时转换为任意目标类型。`return`、`throw`、
+`break`、`continue` 仍然是语句，不属于普通表达式语法。
 
 `defer` 在当前块退出时按 LIFO 顺序执行。`defer` 内不支持 `return`、`break`、`continue`。
 

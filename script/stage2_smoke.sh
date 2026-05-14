@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE1_BIN="${STAGE1_BIN:-$HOME/.jiang/stage1/bin/jiangc}"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage1"
+SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2"
 
 mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"

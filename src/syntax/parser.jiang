@@ -19,13 +19,27 @@ public struct ParseResult {
     }
 }
 
+struct ParserMark {
+    Int current;
+    Int temp_len;
+    Int node_len;
+    Int child_len;
+
+    init(Int current, Int temp_len, Int node_len, Int child_len) {
+        self.current = current;
+        self.temp_len = temp_len;
+        self.node_len = node_len;
+        self.child_len = child_len;
+    }
+}
+
 public struct Parser {
     query.QuerySystem& query;
     list.ArrayList<token.Token> tokens;
     Int! current;
     ast.AstFile! file;
     list.ArrayList<error.ParseError>! errors;
-    list.ArrayList<ast.AstId>! scratch;
+    list.ArrayList<ast.AstId>! temp;
 
     public init(query.QuerySystem& query, list.ArrayList<token.Token> tokens, ast.AstSource source) {
         self.query = query;
@@ -33,7 +47,7 @@ public struct Parser {
         self.current = 0;
         self.file = ast.AstFile(source);
         self.errors = list.ArrayList<error.ParseError>();
-        self.scratch = list.ArrayList<ast.AstId>();
+        self.temp = list.ArrayList<ast.AstId>();
     }
 
     public ParseResult parse() {
@@ -42,10 +56,10 @@ public struct Parser {
     }
 
     () parse_file() {
-        Int! item_start = self.scratch.len();
+        Int! item_start = self.temp.len();
         while (!self.at_end()) {
             if (self.parse_top_level_item() is some item) {
-                self.scratch.add(item);
+                self.temp.add(item);
                 continue;
             }
             self.recover_top_level_item();
@@ -58,8 +72,1778 @@ public struct Parser {
 
     // source_file <- top_level_item* EOF
     ast.AstId? parse_top_level_item() {
-        // TODO(parser): dispatch extern blocks, declarations, and top-level destructuring.
+        if (self.check_keyword(.kw_extern) && self.peek_next().kind == .left_brace) {
+            return self.parse_extern_block();
+        }
+        if (self.check(.left_paren)) {
+            ast.AstId? destructure = self.parse_global_destructure();
+            if (destructure != null) { return destructure; }
+        }
+        return self.parse_top_level_decl();
+    }
+
+    ast.AstId? parse_extern_block() {
+        token.Token start = self.expect_keyword(.kw_extern);
+        self.expect(.left_brace);
+        Int item_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            if (self.parse_extern_item() is some item) {
+                self.temp.add(item);
+            } else {
+                self.recover_member();
+            }
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange items = self.take_children(item_start);
+        return self.node(self.span_from(start.span, end.span), .extern_block(ast.ExternBlockData {items: items}));
+    }
+
+    ast.AstId? parse_extern_item() {
+        token.Token start = self.peek();
+        ast.MemberModifiers modifiers = self.parse_member_modifiers();
+        ast.AstId?! body = self.parse_function_decl();
+        if (body == null) {
+            body = self.parse_global_decl();
+        }
+        ast.AstId parsed = body ?? return null;
+        return self.node(
+            self.span_from(start.span, self.file.get(parsed).span),
+            .extern_item(ast.ExternItemData {modifiers: modifiers, body: parsed})
+        );
+    }
+
+    ast.AstId? parse_top_level_decl() {
+        token.Token start = self.peek();
+        Int annotation_start = self.temp.len();
+        self.parse_annotations();
+        ast.DeclModifiers modifiers = self.parse_decl_modifiers();
+        ast.AstId body = self.parse_top_level_decl_body() ?? return null;
+        ast.AstRange annotations = self.take_children(annotation_start);
+        return self.node(
+            self.span_from(start.span, self.file.get(body).span),
+            .top_level_decl(ast.TopLevelDeclData {
+                modifiers: modifiers,
+                annotations: annotations,
+                body: body
+            })
+        );
+    }
+
+    ast.AstId? parse_member_decl() {
+        token.Token start = self.peek();
+        Int annotation_start = self.temp.len();
+        self.parse_annotations();
+        ast.MemberModifiers modifiers = self.parse_member_modifiers();
+        ast.AstId body = self.parse_member_decl_body() ?? return null;
+        ast.AstRange annotations = self.take_children(annotation_start);
+        token.Span span = self.span_from(start.span, self.file.get(body).span);
+        return self.member_decl_node(span, modifiers, annotations, body);
+    }
+
+    ast.AstId? parse_top_level_decl_body() {
+        if (self.check_keyword(.kw_import)) { return self.parse_import_decl(); }
+        if (self.check_keyword(.kw_alias)) { return self.parse_alias_decl(); }
+        if (self.check_keyword(.kw_struct)
+            || self.check_keyword(.kw_record)
+            || self.check_keyword(.kw_enum)
+            || self.check_keyword(.kw_union)) {
+            return self.parse_nominal_decl();
+        }
+        if (self.check_keyword(.kw_trait)) { return self.parse_trait_decl(); }
+        if (self.check_keyword(.kw_extend)) { return self.parse_extend_decl(); }
+        ast.AstId? function_decl = self.parse_function_decl();
+        if (function_decl != null) { return function_decl; }
+        return self.parse_global_decl();
+    }
+
+    ast.AstId? parse_member_decl_body() {
+        if (self.check_keyword(.kw_alias)) { return self.parse_alias_decl(); }
+        if (self.check_keyword(.kw_struct)
+            || self.check_keyword(.kw_record)
+            || self.check_keyword(.kw_enum)
+            || self.check_keyword(.kw_union)) {
+            return self.parse_nominal_decl();
+        }
+        if (self.check_keyword(.kw_trait)) { return self.parse_trait_decl(); }
+        return self.parse_function_decl();
+    }
+
+    () parse_annotations() {
+        while (self.check(.at)) {
+            ParserMark mark = self.mark();
+            token.Token start = self.advance();
+            self.reject_spacing();
+            if (!self.match_keyword(.kw_where)) {
+                self.reset(mark);
+                return;
+            }
+            self.expect(.left_paren);
+            Int constraint_start = self.temp.len();
+            if (!self.check(.right_paren)) {
+                self.parse_where_constraints();
+            }
+            token.Token end = self.expect(.right_paren);
+            ast.AstRange constraints = self.take_children(constraint_start);
+            self.temp.add(self.node(
+                self.span_from(start.span, end.span),
+                .type_bound_intersection(ast.TypeBoundIntersectionData {
+                    left: self.unit_node(start.span),
+                    right: self.unit_node(end.span)
+                })
+            ));
+        }
+    }
+
+    () reject_spacing() {
+        token.Token next = self.peek();
+        if (next.leading.has_any()) {
+            self.errors.add(error.ParseError(.unexpected_trivia, next.span, null, null, next.kind));
+        }
+    }
+
+    () parse_where_constraints() {
+        while (!self.at_end() && !self.check(.right_paren)) {
+            if (self.parse_where_constraint() is some constraint) {
+                self.temp.add(constraint);
+            } else {
+                self.error_at_current(.expected_type);
+                self.advance();
+            }
+            if (!self.match(.comma)) { return; }
+        }
+    }
+
+    ast.AstId? parse_where_constraint() {
+        ast.AstId name = self.parse_name();
+        if (self.check(.dot)) {
+            return self.parse_projected_where_constraint(name);
+        }
+        if (self.match(.colon)) {
+            ast.AstId bound = self.parse_type_bound();
+            return self.node_from_children(
+                name,
+                bound,
+                .where_type_bound(ast.WhereTypeBoundData {param: name, bound: bound})
+            );
+        }
+        if (self.match(.eq_eq)) {
+            ast.AstId value = self.parse_type();
+            return self.node_from_children(
+                name,
+                value,
+                .where_type_equal(ast.WhereTypeEqualData {param: name, value: value})
+            );
+        }
         return null;
+    }
+
+    ast.AstId parse_projected_where_constraint(ast.AstId param) {
+        self.expect(.dot);
+        self.expect(.left_bracket);
+        ast.AstId trait_path = self.parse_path();
+        self.expect(.right_bracket);
+        self.expect(.dot);
+        ast.AstId assoc_name = self.parse_name();
+        self.expect(.eq_eq);
+        ast.AstId value = self.parse_type();
+        return self.node_from_children(
+            param,
+            value,
+            .where_projection_equal(ast.WhereProjectionEqualData {
+                param: param,
+                trait_path: trait_path,
+                assoc_name: assoc_name,
+                value: value
+            })
+        );
+    }
+
+    ast.DeclModifiers parse_decl_modifiers() {
+        Bool! public_flag = false;
+        Bool! extern_flag = false;
+        Bool! keep_going = true;
+        while (keep_going) {
+            if (self.match_keyword(.kw_public)) {
+                public_flag = true;
+            } else if (self.match_keyword(.kw_extern)) {
+                extern_flag = true;
+            } else {
+                keep_going = false;
+            }
+        }
+        return ast.DeclModifiers {public_flag: public_flag, extern_flag: extern_flag};
+    }
+
+    ast.MemberModifiers parse_member_modifiers() {
+        Bool! public_flag = false;
+        Bool! static_flag = false;
+        Bool! keep_going = true;
+        while (keep_going) {
+            if (self.match_keyword(.kw_public)) {
+                public_flag = true;
+            } else if (self.match_keyword(.kw_static)) {
+                static_flag = true;
+            } else {
+                keep_going = false;
+            }
+        }
+        return ast.MemberModifiers {public_flag: public_flag, static_flag: static_flag};
+    }
+
+    ast.AstId parse_import_decl() {
+        token.Token start = self.expect_keyword(.kw_import);
+        ast.AstId?! alias_name = null;
+        ast.ImportKind! kind = .package_name;
+        ast.AstId! path = self.unit_node(start.span);
+        if (self.check(.ident) && self.peek_next().kind == .assign) {
+            alias_name = self.parse_name();
+            self.expect(.assign);
+        }
+        if (self.check(.string_lit)) {
+            kind = .string_path;
+            path = self.literal_node(self.advance(), .string_lit);
+        } else {
+            path = self.parse_name();
+        }
+        token.Token end = self.expect(.semicolon);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .import_decl(ast.ImportData {kind: kind, alias_name: alias_name, path: path})
+        );
+    }
+
+    ast.AstId parse_alias_decl() {
+        token.Token start = self.expect_keyword(.kw_alias);
+        ast.AstId name = self.parse_name();
+        self.expect(.assign);
+        ast.AstId target = self.parse_type();
+        token.Token end = self.expect(.semicolon);
+        return self.node(self.span_from(start.span, end.span), .alias_decl(ast.AliasData {name: name, target: target}));
+    }
+
+    ast.AstId? parse_nominal_decl() {
+        if (self.check_keyword(.kw_struct)) { return self.parse_struct_or_record(.struct_kind); }
+        if (self.check_keyword(.kw_record)) { return self.parse_struct_or_record(.record_kind); }
+        if (self.check_keyword(.kw_enum)) { return self.parse_enum_decl(); }
+        if (self.check_keyword(.kw_union)) { return self.parse_union_decl(); }
+        return null;
+    }
+
+    ast.AstId parse_struct_or_record(ast.NominalKind kind) {
+        token.Token start = self.advance();
+        ast.AstId name = self.parse_name();
+        ast.AstId?! generics = null;
+        if (self.check(.lt)) { generics = self.parse_generic_params(); }
+        ast.AstRange traits = self.parse_trait_list();
+        ast.AstRange members = self.parse_struct_body();
+        token.Span span = self.span_from(start.span, self.previous().span);
+        return self.node(
+            span,
+            .nominal_decl(ast.NominalData {
+                nominal_kind: kind,
+                name: name,
+                generics: generics,
+                traits: traits,
+                members: members
+            })
+        );
+    }
+
+    ast.AstId parse_enum_decl() {
+        token.Token start = self.expect_keyword(.kw_enum);
+        ast.AstId name = self.parse_name();
+        ast.AstRange traits = self.parse_trait_list();
+        self.expect(.left_brace);
+        Int member_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            if (self.parse_enum_member() is some member) {
+                self.temp.add(member);
+            } else {
+                self.recover_member();
+            }
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange members = self.take_children(member_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .nominal_decl(ast.NominalData {
+                nominal_kind: .enum_kind,
+                name: name,
+                generics: null,
+                traits: traits,
+                members: members
+            })
+        );
+    }
+
+    ast.AstId parse_union_decl() {
+        token.Token start = self.expect_keyword(.kw_union);
+        if (self.match(.left_paren)) {
+            self.parse_name();
+            self.expect(.right_paren);
+        }
+        ast.AstId name = self.parse_name();
+        if (self.match(.colon)) { self.parse_name(); }
+        ast.AstId?! generics = null;
+        if (self.check(.lt)) { generics = self.parse_generic_params(); }
+        ast.AstRange traits = self.parse_trait_list();
+        self.expect(.left_brace);
+        Int member_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            if (self.parse_union_member() is some member) {
+                self.temp.add(member);
+            } else {
+                self.recover_member();
+            }
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange members = self.take_children(member_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .nominal_decl(ast.NominalData {
+                nominal_kind: .union_kind,
+                name: name,
+                generics: generics,
+                traits: traits,
+                members: members
+            })
+        );
+    }
+
+    ast.AstId parse_trait_decl() {
+        token.Token start = self.expect_keyword(.kw_trait);
+        ast.AstId name = self.parse_name();
+        ast.AstId?! generics = null;
+        if (self.check(.lt)) { generics = self.parse_generic_params(); }
+        ast.AstRange parents = self.parse_trait_parents();
+        Bool has_body = !self.match(.semicolon);
+        Int member_start = self.temp.len();
+        if (has_body) { self.parse_trait_body_members(); }
+        ast.AstRange members = self.take_children(member_start);
+        return self.node(
+            self.span_from(start.span, self.previous().span),
+            .trait_decl(ast.TraitData {
+                name: name,
+                generics: generics,
+                parents: parents,
+                has_body: has_body,
+                members: members
+            })
+        );
+    }
+
+    ast.AstRange parse_trait_parents() {
+        Int parent_start = self.temp.len();
+        if (!self.match(.colon)) { return self.take_children(parent_start); }
+        self.temp.add(self.parse_path());
+        while (self.match(.comma)) {
+            self.temp.add(self.parse_path());
+        }
+        return self.take_children(parent_start);
+    }
+
+    () parse_trait_body_members() {
+        self.expect(.left_brace);
+        while (!self.at_end() && !self.check(.right_brace)) {
+            if (self.parse_trait_member() is some member) {
+                self.temp.add(member);
+                continue;
+            }
+            self.recover_member();
+        }
+        self.expect(.right_brace);
+    }
+
+    ast.AstId parse_extend_decl() {
+        token.Token start = self.expect_keyword(.kw_extend);
+        ast.AstId target = self.parse_type();
+        ast.AstId?! trait_path = null;
+        if (self.match(.colon)) { trait_path = self.parse_path(); }
+        self.expect(.left_brace);
+        Int member_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            if (self.parse_extend_member() is some member) {
+                self.temp.add(member);
+            } else {
+                self.recover_member();
+            }
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange members = self.take_children(member_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .extend_decl(ast.ExtendData {
+                target_type: target,
+                trait_path: trait_path,
+                members: members
+            })
+        );
+    }
+
+    ast.AstId? parse_function_decl() {
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_result_type();
+        if (!self.can_start_name()) {
+            self.reset(mark);
+            return null;
+        }
+        ast.AstId name = self.parse_name();
+        if (self.check(.lt) || self.check(.left_paren)) {
+            return self.parse_function_tail(type_ref, name);
+        }
+        self.reset(mark);
+        return null;
+    }
+
+    ast.AstId? parse_global_decl() {
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_type();
+        if (!self.can_start_name()) {
+            self.reset(mark);
+            return null;
+        }
+        ast.AstId name = self.parse_name();
+        if (self.check(.lt) || self.check(.left_paren)) {
+            self.reset(mark);
+            return null;
+        }
+        ast.AstId?! initializer = null;
+        if (self.match(.assign)) { initializer = self.parse_expr(); }
+        token.Token end = self.expect(.semicolon);
+        return self.node(
+            self.span_from(self.file.get(type_ref).span, end.span),
+            .global_decl(ast.GlobalData {
+                type_ref: type_ref,
+                name: name,
+                initializer: initializer
+            })
+        );
+    }
+
+    ast.AstId parse_function_tail(ast.AstId result_type, ast.AstId name) {
+        ast.AstId?! generics = null;
+        if (self.check(.lt)) { generics = self.parse_generic_params(); }
+        self.expect(.left_paren);
+        ast.AstRange params = self.parse_param_list_until(.right_paren);
+        self.expect(.right_paren);
+        ast.AstId?! body = null;
+        if (self.match(.semicolon)) {
+            body = null;
+        } else {
+            body = self.parse_block();
+        }
+        token.Span end = self.previous().span;
+        return self.node(
+            self.span_from(self.file.get(result_type).span, end),
+            .function_decl(ast.FunctionData {
+                result_type: result_type,
+                name: name,
+                generics: generics,
+                params: params,
+                body: body
+            })
+        );
+    }
+
+    ast.AstId? parse_global_destructure() {
+        ParserMark mark = self.mark();
+        token.Token start = self.expect(.left_paren);
+        Int binding_start = self.temp.len();
+        self.temp.add(self.parse_destructure_binding());
+        while (self.match(.comma)) {
+            if (self.check(.right_paren)) { break; }
+            self.temp.add(self.parse_destructure_binding());
+        }
+        self.expect(.right_paren);
+        if (!self.match(.assign)) {
+            self.reset(mark);
+            return null;
+        }
+        ast.AstId initializer = self.parse_expr();
+        token.Token end = self.expect(.semicolon);
+        ast.AstRange bindings = self.take_children(binding_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .global_destructure_decl(ast.GlobalDestructureData {
+                bindings: bindings,
+                initializer: initializer
+            })
+        );
+    }
+
+    ast.AstId parse_destructure_binding() {
+        ast.AstId type_ref = self.parse_type();
+        ast.AstId name = self.parse_name();
+        return self.node_from_children(
+            type_ref,
+            name,
+            .param(ast.ParamData {type_ref: type_ref, name: name, default_value: null})
+        );
+    }
+
+    ast.AstId parse_generic_params() {
+        token.Token start = self.expect(.lt);
+        Int type_param_start = self.temp.len();
+        if (!self.check(.gt)) {
+            self.temp.add(self.parse_name());
+            while (self.match(.comma)) {
+                if (self.check(.gt)) { break; }
+                self.temp.add(self.parse_name());
+            }
+        }
+        token.Token end = self.expect(.gt);
+        ast.AstRange type_params = self.take_children(type_param_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .generic_params(ast.GenericParamsData {type_params: type_params})
+        );
+    }
+
+    ast.AstRange parse_trait_list() {
+        Int start = self.temp.len();
+        if (self.match(.colon)) {
+            self.temp.add(self.parse_path());
+            while (self.match(.comma)) {
+                self.temp.add(self.parse_path());
+            }
+        }
+        return self.take_children(start);
+    }
+
+    ast.AstRange parse_struct_body() {
+        self.expect(.left_brace);
+        Int member_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            if (self.parse_struct_member() is some member) {
+                self.temp.add(member);
+            } else {
+                self.recover_member();
+            }
+        }
+        self.expect(.right_brace);
+        return self.take_children(member_start);
+    }
+
+    ast.AstId? parse_struct_member() {
+        ast.MemberModifiers modifiers = self.parse_member_modifiers();
+        ast.AstId body = self.parse_struct_member_body() ?? return null;
+        return self.member_decl_node(self.file.get(body).span, modifiers, self.empty_range(), body);
+    }
+
+    ast.AstId member_decl_node(
+        token.Span span,
+        ast.MemberModifiers modifiers,
+        ast.AstRange annotations,
+        ast.AstId body
+    ) {
+        return self.node(
+            span,
+            .member_decl(ast.MemberDeclData {
+                modifiers: modifiers,
+                annotations: annotations,
+                body: body
+            })
+        );
+    }
+
+    ast.AstId? parse_struct_member_body() {
+        if (self.check_keyword(.kw_deinit)) { return self.parse_deinit_decl(); }
+        if (self.check_keyword(.kw_init)) { return self.parse_init_decl(); }
+        if (self.check_keyword(.kw_associated)) { return self.parse_assoc_type_impl(); }
+        if (self.match_keyword(.kw_static)) {
+            return self.parse_function_decl();
+        }
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_result_type();
+        if (!self.can_start_name()) {
+            self.reset(mark);
+            return null;
+        }
+        ast.AstId name = self.parse_name();
+        if (self.check(.left_paren) || self.check(.lt)) {
+            return self.parse_function_tail(type_ref, name);
+        }
+        self.reset(mark);
+        return self.parse_field_decl();
+    }
+
+    ast.AstId parse_field_decl() {
+        ast.AstId type_ref = self.parse_type();
+        Int field_start = self.temp.len();
+        self.temp.add(self.parse_field_declarator());
+        while (self.match(.comma)) {
+            if (self.check(.semicolon)) { break; }
+            self.temp.add(self.parse_field_declarator());
+        }
+        token.Token end = self.expect(.semicolon);
+        ast.AstRange fields = self.take_children(field_start);
+        return self.node(
+            self.span_from(self.file.get(type_ref).span, end.span),
+            .field_decl(ast.FieldData {type_ref: type_ref, fields: fields})
+        );
+    }
+
+    ast.AstId parse_field_declarator() {
+        ast.AstId name = self.parse_name();
+        ast.AstId?! default_value = null;
+        if (self.match(.assign)) { default_value = self.parse_expr(); }
+        token.Span! end = self.file.get(name).span;
+        if (default_value is some value) { end = self.file.get(value).span; }
+        return self.node(
+            self.span_from(self.file.get(name).span, end),
+            .field_declarator(ast.FieldDeclaratorData {
+                name: name,
+                default_value: default_value
+            })
+        );
+    }
+
+    ast.AstId parse_deinit_decl() {
+        token.Token start = self.expect_keyword(.kw_deinit);
+        self.expect(.left_paren);
+        self.expect(.right_paren);
+        ast.AstId body = self.parse_block();
+        return self.node(
+            self.span_from(start.span, self.file.get(body).span),
+            .deinit_decl(ast.StmtData {value: body})
+        );
+    }
+
+    ast.AstId parse_init_decl() {
+        token.Token start = self.expect_keyword(.kw_init);
+        Bool failable = self.match(.question);
+        ast.AstId?! name = null;
+        if (self.can_start_name() && self.peek_next().kind == .left_paren) {
+            name = self.parse_name();
+        }
+        self.expect(.left_paren);
+        ast.AstRange params = self.parse_param_list_until(.right_paren);
+        self.expect(.right_paren);
+        ast.AstId body = self.parse_block();
+        return self.node(
+            self.span_from(start.span, self.file.get(body).span),
+            .init_decl(ast.InitData {
+                failable: failable,
+                name: name,
+                params: params,
+                body: body
+            })
+        );
+    }
+
+    ast.AstId parse_assoc_type_impl() {
+        token.Token start = self.expect_keyword(.kw_associated);
+        ast.AstId name = self.parse_path();
+        self.expect(.assign);
+        ast.AstId value = self.parse_type();
+        token.Token end = self.expect(.semicolon);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .assoc_type(ast.AssocTypeData {
+                name: name,
+                value: value,
+                constraints: self.empty_range()
+            })
+        );
+    }
+
+    ast.AstId? parse_enum_member() {
+        ast.MemberModifiers modifiers = self.parse_member_modifiers();
+        if (self.parse_static_or_method_member(modifiers) is some method) { return method; }
+        ast.AstId name = self.parse_name();
+        ast.AstId?! value = null;
+        if (self.match(.assign)) { value = self.parse_expr(); }
+        if (!self.match(.comma)) { self.match(.semicolon); }
+        return self.node_from_child(name, .enum_case(ast.EnumCaseData {name: name, value: value}));
+    }
+
+    ast.AstId? parse_union_member() {
+        ast.MemberModifiers modifiers = self.parse_member_modifiers();
+        if (self.parse_static_or_method_member(modifiers) is some method) { return method; }
+        if (self.parse_typed_union_variants() is some variants) { return variants; }
+        return self.parse_union_variant();
+    }
+
+    ast.AstId? parse_static_or_method_member(ast.MemberModifiers modifiers) {
+        if (!self.check_keyword(.kw_static) && !self.looks_like_function_decl()) { return null; }
+        if (self.check_keyword(.kw_static)) { self.advance(); }
+        ast.AstId method = self.parse_function_decl() ?? return null;
+        return self.member_decl_node(self.file.get(method).span, modifiers, self.empty_range(), method);
+    }
+
+    ast.AstId? parse_typed_union_variants() {
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_type();
+        if (!self.can_start_name()) {
+            self.reset(mark);
+            return null;
+        }
+        ast.AstId first_name = self.parse_name();
+        if (self.check(.comma) || self.check(.semicolon)) {
+            return self.finish_typed_union_variants(type_ref, first_name);
+        }
+        self.reset(mark);
+        return null;
+    }
+
+    ast.AstId finish_typed_union_variants(ast.AstId type_ref, ast.AstId first_name) {
+        Int name_start = self.temp.len();
+        self.temp.add(first_name);
+        while (self.match(.comma)) {
+            if (self.check(.semicolon)) { break; }
+            self.temp.add(self.parse_name());
+        }
+        self.match(.semicolon);
+        ast.AstRange names = self.take_children(name_start);
+        return self.node_from_range(
+            type_ref,
+            names,
+            .typed_union_variants(ast.TypedUnionVariantsData {
+                type_ref: type_ref,
+                names: names
+            })
+        );
+    }
+
+    ast.AstId parse_union_variant() {
+        ast.AstId name = self.parse_name();
+        ast.UnionVariantPayloadKind! payload_kind = .none;
+        ast.AstId?! payload_type = null;
+        if (self.match(.left_paren)) {
+            payload_kind = .paren_payload;
+            payload_type = self.parse_type();
+            self.expect(.right_paren);
+        } else if (self.match(.colon)) {
+            payload_kind = .colon_payload;
+            payload_type = self.parse_type();
+        }
+        if (!self.match(.comma)) { self.match(.semicolon); }
+        return self.node_from_child(
+            name,
+            .union_variant(ast.UnionVariantData {
+                name: name,
+                payload_kind: payload_kind,
+                payload_type: payload_type
+            })
+        );
+    }
+
+    ast.AstId? parse_trait_member() {
+        if (self.check_keyword(.kw_associated)) { return self.parse_associated_type_decl(); }
+        if (self.match_keyword(.kw_static)) {
+            return self.parse_function_decl();
+        }
+        return self.parse_function_decl();
+    }
+
+    ast.AstId parse_associated_type_decl() {
+        token.Token start = self.expect_keyword(.kw_associated);
+        ast.AstId name = self.parse_name();
+        Int constraint_start = self.temp.len();
+        if (self.match(.colon)) {
+            self.temp.add(self.parse_type_bound());
+        }
+        token.Token end = self.expect(.semicolon);
+        ast.AstRange constraints = self.take_children(constraint_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .assoc_type(ast.AssocTypeData {
+                name: name,
+                value: null,
+                constraints: constraints
+            })
+        );
+    }
+
+    ast.AstId? parse_extend_member() {
+        if (self.check_keyword(.kw_associated)) { return self.parse_assoc_type_impl(); }
+        return self.parse_member_decl();
+    }
+
+    ast.AstRange parse_param_list_until(token.TokenKind end_kind) {
+        Int param_start = self.temp.len();
+        if (!self.check(end_kind)) {
+            self.temp.add(self.parse_param());
+            while (self.match(.comma)) {
+                if (self.check(end_kind)) { break; }
+                self.temp.add(self.parse_param());
+            }
+        }
+        return self.take_children(param_start);
+    }
+
+    ast.AstId parse_param() {
+        ast.AstId type_ref = self.parse_type();
+        ast.AstId name = self.parse_name();
+        ast.AstId?! default_value = null;
+        if (self.match(.assign)) { default_value = self.parse_expr(); }
+        token.Span! end = self.file.get(name).span;
+        if (default_value is some value) { end = self.file.get(value).span; }
+        return self.node(
+            self.span_from(self.file.get(type_ref).span, end),
+            .param(ast.ParamData {
+                type_ref: type_ref,
+                name: name,
+                default_value: default_value
+            })
+        );
+    }
+
+    ast.AstId parse_type_bound() {
+        ast.AstId! left = self.parse_trait_bound();
+        while (self.match(.amp)) {
+            ast.AstId right = self.parse_trait_bound();
+            left = self.node_from_children(
+                left,
+                right,
+                .type_bound_intersection(ast.TypeBoundIntersectionData {
+                    left: left,
+                    right: right
+                })
+            );
+        }
+        return left;
+    }
+
+    ast.AstId parse_trait_bound() {
+        ast.AstId path = self.parse_path();
+        ast.AstRange args = self.parse_trait_bound_args_opt();
+        return self.node_from_child(path, .trait_bound(ast.TraitBoundData {path: path, args: args}));
+    }
+
+    ast.AstRange parse_trait_bound_args_opt() {
+        Int arg_start = self.temp.len();
+        if (!self.match(.lt)) { return self.take_children(arg_start); }
+        if (!self.check(.gt)) {
+            self.parse_trait_bound_arg_list();
+        }
+        self.expect(.gt);
+        return self.take_children(arg_start);
+    }
+
+    () parse_trait_bound_arg_list() {
+        self.temp.add(self.parse_trait_bound_arg());
+        while (self.match(.comma)) {
+            if (self.check(.gt)) { return; }
+            self.temp.add(self.parse_trait_bound_arg());
+        }
+    }
+
+    ast.AstId parse_trait_bound_arg() {
+        if (self.can_start_name() && self.peek_next().kind == .assign) {
+            ast.AstId name = self.parse_name();
+            self.expect(.assign);
+            ast.AstId value = self.parse_type();
+            return self.node_from_children(
+                name,
+                value,
+                .assoc_type_binding(ast.AssocTypeBindingData {name: name, value: value})
+            );
+        }
+        return self.parse_type();
+    }
+
+    ast.AstId parse_type() {
+        ast.AstId! result = self.parse_type_primary();
+        while (true) {
+            if (self.match_type_postfix(.question)) {
+                result = self.type_layer_node(result, .optional);
+                continue;
+            }
+            if (self.match_type_postfix(.bang)) {
+                result = self.type_layer_node(result, .mutable_type);
+                continue;
+            }
+            if (self.match_type_postfix(.amp)) {
+                result = self.type_layer_node(result, .reference);
+                continue;
+            }
+            if (self.match_type_postfix(.caret)) {
+                result = self.type_layer_node(result, .owner_pointer);
+                continue;
+            }
+            if (self.match_type_postfix(.left_bracket)) {
+                result = self.finish_type_bracket(result);
+                continue;
+            }
+            return result;
+        }
+    }
+
+    ast.AstId parse_result_type() {
+        ast.AstId value_type = self.parse_type();
+        if (!self.match_type_postfix(.at)) { return value_type; }
+        ast.AstId error_type = self.parse_type();
+        ast.ErrorableTypeData data = ast.ErrorableTypeData {
+            value_type: value_type,
+            error_type: error_type
+        };
+        return self.node_from_children(
+            value_type,
+            error_type,
+            .errorable_type(data)
+        );
+    }
+
+    Bool match_type_postfix(token.TokenKind kind) {
+        if (!self.check(kind)) { return false; }
+        self.reject_spacing();
+        self.advance();
+        return true;
+    }
+
+    ast.AstId type_layer_node(ast.AstId base, ast.TypeLayerKind layer) {
+        return self.node_from_child(base, .type_ref(ast.TypeData {base: base, layer: layer}));
+    }
+
+    ast.AstId finish_type_bracket(ast.AstId element) {
+        if (self.match(.right_bracket)) {
+            return self.type_layer_node(element, .slice);
+        }
+        if (self.match(.star)) {
+            self.expect(.right_bracket);
+            return self.type_layer_node(element, .many_pointer);
+        }
+        return self.finish_array_type(element);
+    }
+
+    ast.AstId finish_array_type(ast.AstId element) {
+        ast.ArrayCountKind! kind = .int_lit;
+        token.Span! count_span = self.peek().span;
+        if (self.check(.ident)) {
+            kind = .inferred;
+            count_span = self.advance().span;
+        } else {
+            count_span = self.expect(.int_lit).span;
+        }
+        self.expect(.right_bracket);
+        return self.node_from_child(
+            element,
+            .array_type(ast.ArrayTypeData {
+                element: element,
+                count_kind: kind,
+                count_span: count_span
+            })
+        );
+    }
+
+    ast.AstId parse_type_primary() {
+        if (self.match(.left_paren)) {
+            return self.parse_paren_type(self.previous());
+        }
+        return self.parse_named_or_infer_type_primary();
+    }
+
+    ast.AstId parse_named_or_infer_type_primary() {
+        if (self.check_symbol_text("_")) {
+            return self.node(self.advance().span, .infer_type);
+        }
+        if (self.check(.ident)) {
+            ast.AstId path = self.parse_path();
+            ast.AstRange! args = self.empty_range();
+            if (self.check(.lt)) { args = self.parse_type_args(); }
+            return self.node_from_child(path, .named_type(ast.NamedTypeData {path: path, args: args}));
+        }
+        if (self.match_keyword(.kw_self_type)) {
+            ast.AstId name = self.name_node_from_token(self.previous());
+            ast.AstId path = self.node_from_child(name, .path(ast.PathData {segments: self.file.add_child(name)}));
+            return self.node_from_child(path, .named_type(ast.NamedTypeData {path: path, args: self.empty_range()}));
+        }
+        self.error_at_current(.expected_type);
+        return self.unit_node(self.advance().span);
+    }
+
+    ast.AstId parse_paren_type(token.Token start) {
+        if (self.match(.right_paren)) {
+            return self.node(self.span_from(start.span, self.previous().span), .unit_type);
+        }
+        ast.AstId first = self.parse_type();
+        if (!self.match(.comma)) {
+            self.expect(.right_paren);
+            return first;
+        }
+        return self.finish_tuple_type(start, first);
+    }
+
+    ast.AstId finish_tuple_type(token.Token start, ast.AstId first) {
+        Int item_start = self.temp.len();
+        self.temp.add(first);
+        if (!self.check(.right_paren)) {
+            self.temp.add(self.parse_type());
+            self.parse_remaining_tuple_types();
+        }
+        token.Token end = self.expect(.right_paren);
+        ast.AstRange items = self.take_children(item_start);
+        return self.node(self.span_from(start.span, end.span), .tuple_type(items));
+    }
+
+    () parse_remaining_tuple_types() {
+        while (self.match(.comma)) {
+            if (self.check(.right_paren)) { return; }
+            self.temp.add(self.parse_type());
+        }
+    }
+
+    ast.AstRange parse_type_args() {
+        self.expect(.lt);
+        Int arg_start = self.temp.len();
+        if (!self.check(.gt)) {
+            self.temp.add(self.parse_type());
+            while (self.match(.comma)) {
+                if (self.check(.gt)) { break; }
+                self.temp.add(self.parse_type());
+            }
+        }
+        self.expect(.gt);
+        return self.take_children(arg_start);
+    }
+
+    ast.AstId parse_block() {
+        token.Token start = self.expect(.left_brace);
+        Int stmt_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            ast.AstId? stmt = self.parse_stmt();
+            if (stmt is some parsed) {
+                self.temp.add(parsed);
+            } else {
+                self.recover_stmt();
+            }
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange statements = self.take_children(stmt_start);
+        return self.node(self.span_from(start.span, end.span), .block(ast.BlockData {statements: statements}));
+    }
+
+    ast.AstId? parse_stmt() {
+        if (self.check_keyword(.kw_return)) { return self.parse_control_stmt(.return_value); }
+        if (self.check_keyword(.kw_throw)) { return self.parse_control_stmt(.throw_value); }
+        if (self.check_keyword(.kw_break)) { return self.parse_control_stmt(.break_loop); }
+        if (self.check_keyword(.kw_continue)) { return self.parse_control_stmt(.continue_loop); }
+        if (self.check_keyword(.kw_defer)) { return self.parse_defer_stmt(); }
+        if (self.check(.left_brace)) { return self.parse_block(); }
+        if (self.check_keyword(.kw_while)) { return self.parse_while_stmt(); }
+        if (self.check_keyword(.kw_for)) { return self.parse_for_stmt(); }
+        if (self.check(.left_paren)) {
+            ParserMark mark = self.mark();
+            ast.AstId? destructure = self.parse_destructure_stmt();
+            if (destructure != null) { return destructure; }
+            self.reset(mark);
+        }
+        ParserMark mark = self.mark();
+        ast.AstId? var_decl = self.parse_var_decl_stmt();
+        if (var_decl != null) { return var_decl; }
+        self.reset(mark);
+        ast.AstId expr = self.parse_expr();
+        if (self.assign_op_from_current() is some op) {
+            self.advance();
+            ast.AstId value = self.parse_expr();
+            token.Token end = self.expect(.semicolon);
+            return self.node(
+                self.span_from(self.file.get(expr).span, end.span),
+                .assign_stmt(ast.AssignData {op: op, target: expr, value: value})
+            );
+        }
+        token.Token semi = self.expect(.semicolon);
+        return self.node(self.span_from(self.file.get(expr).span, semi.span), .stmt(ast.StmtData {value: expr}));
+    }
+
+    ast.AstId parse_control_stmt(ast.ControlStmtKind kind) {
+        token.Token start = self.advance();
+        ast.AstId?! value = null;
+        if (kind == .return_value) {
+            if (!self.check(.semicolon)) { value = self.parse_expr(); }
+        } else if (kind == .throw_value) {
+            value = self.parse_expr();
+        }
+        token.Token end = self.expect(.semicolon);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .control_stmt(ast.ControlStmtData {kind: kind, value: value})
+        );
+    }
+
+    ast.AstId parse_defer_stmt() {
+        token.Token start = self.expect_keyword(.kw_defer);
+        ast.AstId! value = self.unit_node(start.span);
+        token.Span! end = start.span;
+        if (self.check(.left_brace)) {
+            value = self.parse_block();
+            end = self.file.get(value).span;
+        } else {
+            value = self.parse_expr();
+            end = self.expect(.semicolon).span;
+        }
+        return self.node(self.span_from(start.span, end), .defer_stmt(ast.StmtData {value: value}));
+    }
+
+    ast.AstId? parse_var_decl_stmt() {
+        ast.AstId type_ref = self.parse_type();
+        if (!self.can_start_name()) { return null; }
+        ast.AstId name = self.parse_name();
+        ast.AstId?! initializer = null;
+        if (self.match(.assign)) { initializer = self.parse_expr(); }
+        token.Token end = self.expect(.semicolon);
+        return self.node(
+            self.span_from(self.file.get(type_ref).span, end.span),
+            .let_stmt(ast.LetData {
+                type_ref: type_ref,
+                name: name,
+                initializer: initializer,
+                mutable_binding: false
+            })
+        );
+    }
+
+    ast.AstId? parse_destructure_stmt() {
+        token.Token start = self.expect(.left_paren);
+        Int binding_start = self.temp.len();
+        self.temp.add(self.parse_destructure_binding());
+        while (self.match(.comma)) {
+            if (self.check(.right_paren)) { break; }
+            self.temp.add(self.parse_destructure_binding());
+        }
+        self.expect(.right_paren);
+        if (!self.match(.assign)) { return null; }
+        ast.AstId initializer = self.parse_expr();
+        token.Token end = self.expect(.semicolon);
+        ast.AstRange bindings = self.take_children(binding_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .destructure_stmt(ast.GlobalDestructureData {
+                bindings: bindings,
+                initializer: initializer
+            })
+        );
+    }
+
+    ast.AstId parse_while_stmt() {
+        token.Token start = self.expect_keyword(.kw_while);
+        ast.AstId cond = self.parse_expr();
+        ast.AstId body = self.parse_block();
+        return self.node(
+            self.span_from(start.span, self.file.get(body).span),
+            .loop_expr(ast.LoopData {
+                condition: cond,
+                pattern: null,
+                iterable: null,
+                body: body
+            })
+        );
+    }
+
+    ast.AstId parse_for_stmt() {
+        token.Token start = self.expect_keyword(.kw_for);
+        ast.AstId pattern = self.parse_for_binding();
+        self.expect_keyword(.kw_in);
+        ast.AstId iterable = self.parse_expr();
+        ast.AstId body = self.parse_block();
+        return self.node(
+            self.span_from(start.span, self.file.get(body).span),
+            .loop_expr(ast.LoopData {
+                condition: null,
+                pattern: pattern,
+                iterable: iterable,
+                body: body
+            })
+        );
+    }
+
+    ast.AstId parse_for_binding() {
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_type();
+        if (self.can_start_name()) {
+            ast.AstId name = self.parse_name();
+            return self.node_from_children(
+                type_ref,
+                name,
+                .param(ast.ParamData {type_ref: type_ref, name: name, default_value: null})
+            );
+        }
+        self.reset(mark);
+        return self.parse_pattern();
+    }
+
+    ast.AstId parse_expr() {
+        return self.parse_range_expr();
+    }
+
+    ast.AstId parse_range_expr() {
+        ast.AstId left = self.parse_logic_or_expr();
+        if (self.match(.dot_dot)) {
+            ast.AstId right = self.parse_logic_or_expr();
+            return self.node_from_children(left, right, .range(ast.RangeData {start: left, end: right}));
+        }
+        return left;
+    }
+
+    ast.AstId parse_logic_or_expr() {
+        return self.parse_binary_left_assoc(1);
+    }
+
+    ast.AstId parse_binary_left_assoc(Int min_prec) {
+        ast.AstId! left = self.parse_unary_expr();
+        Bool! keep_going = true;
+        while (keep_going) {
+            if (self.check_keyword(.kw_is)) {
+                Int is_prec = 4;
+                if (is_prec < min_prec) { return left; }
+                self.advance();
+                ast.AstId pattern = self.parse_pattern();
+                left = self.node_from_children(
+                    left,
+                    pattern,
+                    .is_pattern(ast.IsPatternData {value: left, pattern: pattern})
+                );
+                continue;
+            }
+            ast.BinaryOp? op = self.binary_op_from_current();
+            if (op == null) { return left; }
+            Int prec = self.binary_precedence(op$.some());
+            if (prec < min_prec) { return left; }
+            self.advance();
+            ast.AstId right = self.parse_binary_left_assoc(prec + 1);
+            left = self.node_from_children(
+                left,
+                right,
+                .binary(ast.BinaryData {op: op$.some(), left: left, right: right})
+            );
+        }
+        return left;
+    }
+
+    ast.AstId parse_unary_expr() {
+        if (self.unary_op_from_current() is some op) {
+            token.Token start = self.advance();
+            ast.AstId value = self.parse_unary_expr();
+            return self.node(
+                self.span_from(start.span, self.file.get(value).span),
+                .unary(ast.UnaryData {op: op, value: value})
+            );
+        }
+        if (self.match_keyword(.kw_new)) {
+            token.Token start = self.previous();
+            ast.AstId value = self.parse_unary_expr();
+            return self.node(
+                self.span_from(start.span, self.file.get(value).span),
+                .unary(ast.UnaryData {op: .new_value, value: value})
+            );
+        }
+        return self.parse_postfix_expr();
+    }
+
+    ast.AstId parse_postfix_expr() {
+        ast.AstId! result = self.parse_primary_expr();
+        while (true) {
+            if (self.check(.left_paren)) {
+                ast.AstRange type_args = self.empty_range();
+                ast.AstRange args = self.parse_call_parens();
+                result = self.node_from_range(
+                    result,
+                    args,
+                    .call(ast.CallData {callee: result, type_args: type_args, args: args})
+                );
+                continue;
+            }
+            if (self.check(.lt) && self.type_args_before_call()) {
+                ast.AstRange type_args = self.parse_type_args();
+                ast.AstRange args = self.parse_call_parens();
+                result = self.node_from_range(
+                    result,
+                    args,
+                    .call(ast.CallData {callee: result, type_args: type_args, args: args})
+                );
+                continue;
+            }
+            if (self.match(.dot)) {
+                ast.AstId name = self.parse_name();
+                ast.FieldExprData data = ast.FieldExprData {
+                    base: result,
+                    name: name,
+                    optional_chain: false
+                };
+                result = self.node_from_children(result, name, .field_expr(data));
+                continue;
+            }
+            if (self.match(.question_dot)) {
+                ast.AstId name = self.parse_name();
+                ast.FieldExprData data = ast.FieldExprData {
+                    base: result,
+                    name: name,
+                    optional_chain: true
+                };
+                result = self.node_from_children(result, name, .field_expr(data));
+                continue;
+            }
+            if (self.match(.left_bracket)) {
+                result = self.finish_index_or_slice(result, false);
+                continue;
+            }
+            if (self.match(.question)) {
+                result = self.finish_question_postfix(result) ?? return result;
+                continue;
+            }
+            if (self.match(.dollar)) {
+                result = self.finish_implicit_call(result, false);
+                continue;
+            }
+            if (self.check_keyword(.kw_catch)) {
+                result = self.finish_catch_expr(result);
+                continue;
+            }
+            return result;
+        }
+    }
+
+    ast.AstId? finish_question_postfix(ast.AstId base) {
+        if (self.match(.dollar)) { return self.finish_implicit_call(base, true); }
+        if (self.match(.left_bracket)) { return self.finish_index_or_slice(base, true); }
+        return null;
+    }
+
+    ast.AstId finish_implicit_call(ast.AstId base, Bool optional_chain) {
+        self.expect(.dot);
+        ast.AstId name = self.parse_name();
+        self.expect(.left_paren);
+        Int arg_start = self.temp.len();
+        if (!self.check(.right_paren)) {
+            self.temp.add(self.parse_implicit_arg());
+            while (self.match(.comma)) {
+                if (self.check(.right_paren)) { break; }
+                self.temp.add(self.parse_implicit_arg());
+            }
+        }
+        self.expect(.right_paren);
+        ast.AstRange args = self.take_children(arg_start);
+        return self.node_from_range(
+            base,
+            args,
+            .implicit_call(ast.ImplicitCallData {
+                base: base,
+                name: name,
+                optional_chain: optional_chain,
+                args: args
+            })
+        );
+    }
+
+    ast.AstId parse_implicit_arg() {
+        ast.AstId value = self.parse_expr();
+        return self.node_from_child(value, .implicit_arg(ast.ImplicitArgData {value_arg: value}));
+    }
+
+    ast.AstId finish_index_or_slice(ast.AstId base, Bool optional_chain) {
+        if (self.match(.dot_dot)) {
+            ast.AstId?! end_expr = null;
+            if (!self.check(.right_bracket)) { end_expr = self.parse_expr(); }
+            self.expect(.right_bracket);
+            return self.node_from_child(
+                base,
+                .slice_expr(ast.SliceExprData {
+                    base: base,
+                    start: null,
+                    end: end_expr,
+                    optional_chain: optional_chain
+                })
+            );
+        }
+        ast.AstId index = self.parse_expr();
+        if (self.match(.dot_dot)) {
+            ast.AstId?! end_expr = null;
+            if (!self.check(.right_bracket)) { end_expr = self.parse_expr(); }
+            self.expect(.right_bracket);
+            return self.node_from_child(
+                base,
+                .slice_expr(ast.SliceExprData {
+                    base: base,
+                    start: index,
+                    end: end_expr,
+                    optional_chain: optional_chain
+                })
+            );
+        }
+        self.expect(.right_bracket);
+        return self.node_from_children(
+            base,
+            index,
+            .index_expr(ast.IndexExprData {
+                base: base,
+                index: index,
+                optional_chain: optional_chain
+            })
+        );
+    }
+
+    ast.AstRange parse_call_parens() {
+        self.expect(.left_paren);
+        Int arg_start = self.temp.len();
+        if (!self.check(.right_paren)) {
+            self.temp.add(self.parse_call_arg());
+            while (self.match(.comma)) {
+                if (self.check(.right_paren)) { break; }
+                self.temp.add(self.parse_call_arg());
+            }
+        }
+        self.expect(.right_paren);
+        return self.take_children(arg_start);
+    }
+
+    ast.AstId parse_call_arg() {
+        ast.AstId?! label = null;
+        if (self.can_start_name() && self.peek_next().kind == .colon) {
+            label = self.parse_name();
+            self.expect(.colon);
+        }
+        ast.AstId value = self.parse_expr();
+        return self.node_from_child(value, .call_arg(ast.CallArgData {label: label, value: value}));
+    }
+
+    ast.AstId parse_primary_expr() {
+        if (self.check(.int_lit)) { return self.literal_node(self.advance(), .int_lit); }
+        if (self.check(.float_lit)) { return self.literal_node(self.advance(), .float_lit); }
+        if (self.check(.char_lit)) { return self.literal_node(self.advance(), .char_lit); }
+        if (self.check(.string_lit)) { return self.literal_node(self.advance(), .string_lit); }
+        if (self.match_keyword(.kw_true)) {
+            return self.node(
+                self.previous().span,
+                .literal(ast.LiteralData {kind: .bool_lit, bool_value: true})
+            );
+        }
+        if (self.match_keyword(.kw_false)) {
+            return self.node(
+                self.previous().span,
+                .literal(ast.LiteralData {kind: .bool_lit, bool_value: false})
+            );
+        }
+        if (self.match_keyword(.kw_null)) {
+            return self.node(
+                self.previous().span,
+                .literal(ast.LiteralData {kind: .null_lit, bool_value: false})
+            );
+        }
+        if (self.match_keyword(.kw_self)) { return self.name_expr_from_token(self.previous()); }
+        if (self.match(.dollar)) {
+            ast.AstId value = self.unit_node(self.previous().span);
+            return self.node(self.previous().span, .name_expr(ast.StmtData {value: value}));
+        }
+        if (self.match(.dot)) {
+            ast.AstId name = self.parse_name();
+            ast.AstId base = self.unit_node(self.file.get(name).span);
+            return self.node_from_child(
+                name,
+                .field_expr(ast.FieldExprData {
+                    base: base,
+                    name: name,
+                    optional_chain: false
+                })
+            );
+        }
+        if (self.check(.left_paren)) { return self.parse_paren_expr(); }
+        if (self.check(.left_bracket)) { return self.parse_array_expr(); }
+        if (self.check(.left_brace)) { return self.parse_block(); }
+        if (self.check_keyword(.kw_if)) { return self.parse_if_expr(false); }
+        if (self.check_keyword(.kw_switch)) { return self.parse_switch_expr(false); }
+        if (self.can_start_name()) {
+            ast.AstId path = self.parse_path();
+            if (self.check(.left_brace)) {
+                return self.parse_struct_literal(path, self.empty_range());
+            }
+            return self.node_from_child(path, .name_expr(ast.StmtData {value: path}));
+        }
+        self.error_at_current(.expected_expression);
+        return self.unit_node(self.advance().span);
+    }
+
+    ast.AstId parse_paren_expr() {
+        token.Token start = self.expect(.left_paren);
+        if (self.match(.right_paren)) {
+            return self.node(self.span_from(start.span, self.previous().span), .tuple_expr(self.empty_range()));
+        }
+        ast.AstId first = self.parse_expr();
+        if (self.match(.comma)) {
+            Int item_start = self.temp.len();
+            self.temp.add(first);
+            if (!self.check(.right_paren)) {
+                self.temp.add(self.parse_expr());
+                while (self.match(.comma)) {
+                    if (self.check(.right_paren)) { break; }
+                    self.temp.add(self.parse_expr());
+                }
+            }
+            token.Token end = self.expect(.right_paren);
+            ast.AstRange items = self.take_children(item_start);
+            return self.node(self.span_from(start.span, end.span), .tuple_expr(items));
+        }
+        self.expect(.right_paren);
+        return first;
+    }
+
+    ast.AstId parse_array_expr() {
+        token.Token start = self.expect(.left_bracket);
+        Int item_start = self.temp.len();
+        if (!self.check(.right_bracket)) {
+            self.temp.add(self.parse_expr());
+            while (self.match(.comma)) {
+                if (self.check(.right_bracket)) { break; }
+                self.temp.add(self.parse_expr());
+            }
+        }
+        token.Token end = self.expect(.right_bracket);
+        ast.AstRange items = self.take_children(item_start);
+        return self.node(self.span_from(start.span, end.span), .tuple_expr(items));
+    }
+
+    ast.AstId parse_struct_literal(ast.AstId type_ref, ast.AstRange type_args) {
+        token.Token start = self.expect(.left_brace);
+        Int field_start = self.temp.len();
+        if (!self.check(.right_brace)) {
+            self.temp.add(self.parse_field_init_expr());
+            while (self.match(.comma)) {
+                if (self.check(.right_brace)) { break; }
+                self.temp.add(self.parse_field_init_expr());
+            }
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange fields = self.take_children(field_start);
+        return self.node(
+            self.span_from(self.file.get(type_ref).span, end.span),
+            .struct_literal(ast.StructLiteralData {
+                type_ref: type_ref,
+                type_args: type_args,
+                fields: fields
+            })
+        );
+    }
+
+    ast.AstId parse_field_init_expr() {
+        ast.AstId! name = self.unit_node(self.peek().span);
+        ast.AstId! value = self.unit_node(self.peek().span);
+        if (self.can_start_name() && self.peek_next().kind == .colon) {
+            name = self.parse_name();
+            self.expect(.colon);
+            value = self.parse_expr();
+        } else {
+            value = self.parse_expr();
+            name = self.unit_node(self.file.get(value).span);
+        }
+        return self.node_from_child(value, .field_init(ast.FieldInitData {name: name, value: value}));
+    }
+
+    ast.AstId parse_if_expr(Bool statement_mode) {
+        token.Token start = self.expect_keyword(.kw_if);
+        ast.AstId condition = self.parse_expr();
+        ast.AstId then_body = self.parse_block();
+        ast.AstId?! else_body = null;
+        if (self.match_keyword(.kw_else)) {
+            else_body = self.parse_else_body(statement_mode);
+        }
+        return self.node(
+            self.span_from(start.span, self.file.get(then_body).span),
+            .if_expr(ast.IfData {
+                condition: condition,
+                then_body: then_body,
+                else_body: else_body
+            })
+        );
+    }
+
+    ast.AstId parse_else_body(Bool statement_mode) {
+        if (self.check_keyword(.kw_if)) { return self.parse_if_expr(statement_mode); }
+        return self.parse_block();
+    }
+
+    ast.AstId parse_switch_expr(Bool statement_mode) {
+        token.Token start = self.expect_keyword(.kw_switch);
+        ast.AstId value = self.parse_expr();
+        self.expect(.left_brace);
+        Int case_start = self.temp.len();
+        while (!self.at_end() && !self.check(.right_brace)) {
+            self.temp.add(self.parse_switch_case());
+        }
+        token.Token end = self.expect(.right_brace);
+        ast.AstRange cases = self.take_children(case_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .switch_expr(ast.SwitchData {value: value, cases: cases})
+        );
+    }
+
+    ast.AstId parse_switch_case() {
+        Int pattern_start = self.temp.len();
+        if (self.match_keyword(.kw_else)) {
+            self.temp.add(self.unit_node(self.previous().span));
+        } else {
+            self.temp.add(self.parse_pattern());
+            while (self.match(.comma)) {
+                self.temp.add(self.parse_pattern());
+            }
+        }
+        ast.AstRange patterns = self.take_children(pattern_start);
+        self.expect(.fat_arrow);
+        ast.AstId body = self.parse_switch_case_body();
+        return self.node_from_children(
+            self.range_first(patterns),
+            body,
+            .switch_case(ast.SwitchCaseData {patterns: patterns, body: body})
+        );
+    }
+
+    ast.AstId parse_switch_case_body() {
+        if (self.check(.left_brace)) { return self.parse_block(); }
+        ast.AstId? parsed_body = self.parse_stmt();
+        if (parsed_body is some parsed) { return parsed; }
+        return self.unit_node(self.peek().span);
+    }
+
+    ast.AstId finish_catch_expr(ast.AstId value) {
+        ast.AstId catch_clause = self.parse_catch_clause();
+        return self.node(
+            self.span_from(self.file.get(value).span, self.file.get(catch_clause).span),
+            .catch_expr(ast.CatchExprData {value: value, catch_clause: catch_clause})
+        );
+    }
+
+    ast.AstId parse_catch_clause() {
+        token.Token start = self.expect_keyword(.kw_catch);
+        ast.AstId?! pattern = null;
+        self.expect(.left_paren);
+        if (!self.check(.right_paren)) {
+            pattern = self.parse_catch_binding();
+        }
+        self.expect(.right_paren);
+        self.expect(.fat_arrow);
+        ast.AstId body = self.parse_catch_body();
+        return self.node(
+            self.span_from(start.span, self.file.get(body).span),
+            .catch_clause(ast.CatchClauseData {pattern: pattern, body: body})
+        );
+    }
+
+    ast.AstId parse_catch_body() {
+        if (self.check(.left_brace)) { return self.parse_block(); }
+        return self.parse_expr();
+    }
+
+    ast.AstId parse_catch_binding() {
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_type();
+        if (self.can_start_name()) {
+            ast.AstId name = self.parse_name();
+            return self.node_from_children(
+                type_ref,
+                name,
+                .param(ast.ParamData {type_ref: type_ref, name: name, default_value: null})
+            );
+        }
+        self.reset(mark);
+        return self.parse_pattern();
+    }
+
+    ast.AstId parse_pattern() {
+        if (self.match_keyword(.kw_some)) {
+            ast.AstId value = self.parse_pattern();
+            return self.node(
+                self.span_from(self.previous().span, self.file.get(value).span),
+                .pattern(ast.PatternData {
+                    name: null,
+                    value: value,
+                    payload: self.empty_range()
+                })
+            );
+        }
+        if (self.check_symbol_text("_")) {
+            return self.parse_wildcard_binding_pattern();
+        }
+        if (self.match(.dot)) {
+            ast.AstId name = self.parse_name();
+            ast.AstRange payload = self.parse_pattern_payload_opt();
+            return self.node_from_range(
+                name,
+                payload,
+                .pattern(ast.PatternData {name: name, value: null, payload: payload})
+            );
+        }
+        if (self.check(.left_paren)) {
+            return self.parse_tuple_pattern();
+        }
+        if (self.check(.int_lit) || self.check(.float_lit) || self.check(.char_lit) || self.check(.string_lit)) {
+            ast.AstId literal = self.parse_primary_expr();
+            return self.node_from_child(
+                literal,
+                .pattern(ast.PatternData {
+                    name: null,
+                    value: literal,
+                    payload: self.empty_range()
+                })
+            );
+        }
+        if (self.check_keyword(.kw_true) || self.check_keyword(.kw_false) || self.check_keyword(.kw_null)) {
+            ast.AstId literal = self.parse_primary_expr();
+            return self.node_from_child(
+                literal,
+                .pattern(ast.PatternData {
+                    name: null,
+                    value: literal,
+                    payload: self.empty_range()
+                })
+            );
+        }
+        ast.AstId name = self.parse_path();
+        ast.AstRange payload = self.parse_pattern_payload_opt();
+        return self.node_from_range(
+            name,
+            payload,
+            .pattern(ast.PatternData {name: name, value: null, payload: payload})
+        );
+    }
+
+    ast.AstId parse_wildcard_binding_pattern() {
+        token.Token start = self.advance();
+        ast.AstId?! name = null;
+        if (self.match(.bang)) {
+            if (self.can_start_name()) { name = self.parse_name(); }
+        } else if (self.can_start_name()) {
+            name = self.parse_name();
+        }
+        token.Span! end = start.span;
+        if (name is some parsed) { end = self.file.get(parsed).span; }
+        return self.node(
+            self.span_from(start.span, end),
+            .pattern(ast.PatternData {
+                name: name,
+                value: null,
+                payload: self.empty_range()
+            })
+        );
+    }
+
+    ast.AstRange parse_pattern_payload_opt() {
+        Int payload_start = self.temp.len();
+        if (self.match(.left_paren)) {
+            self.parse_pattern_list_until_right_paren();
+            self.expect(.right_paren);
+        }
+        return self.take_children(payload_start);
+    }
+
+    ast.AstId parse_tuple_pattern() {
+        token.Token start = self.expect(.left_paren);
+        Int item_start = self.temp.len();
+        self.parse_pattern_list_until_right_paren();
+        token.Token end = self.expect(.right_paren);
+        ast.AstRange payload = self.take_children(item_start);
+        return self.node(
+            self.span_from(start.span, end.span),
+            .pattern(ast.PatternData {name: null, value: null, payload: payload})
+        );
+    }
+
+    () parse_pattern_list_until_right_paren() {
+        if (self.check(.right_paren)) { return; }
+        self.temp.add(self.parse_pattern());
+        while (self.match(.comma)) {
+            if (self.check(.right_paren)) { return; }
+            self.temp.add(self.parse_pattern());
+        }
     }
 
     // After a failed top-level parse, skip to a boundary where another item may start.
@@ -94,7 +1878,15 @@ public struct Parser {
     }
 
     ast.AstRange take_children(Int start) {
-        return self.file.add_children_from(self.scratch$.ref(), start);
+        Int! range_start = self.file.children.len();
+        Int! index = start;
+        Int! end = self.temp.len();
+        while (index < end) {
+            self.file.add_child(self.temp.get(index));
+            index = index + 1;
+        }
+        self.temp.truncate(start);
+        return ast.AstRange(range_start, end - start);
     }
 
     ast.AstRange empty_range() {
@@ -137,6 +1929,151 @@ public struct Parser {
         return self.node_from_children(first, self.range_last(range), data);
     }
 
+    ast.AstId unit_node(token.Span span) {
+        return self.node(span, .unit_type);
+    }
+
+    ast.AstId literal_node(token.Token tok, ast.LiteralKind kind) {
+        return self.node(tok.span, .literal(ast.LiteralData {kind: kind, bool_value: false}));
+    }
+
+    ast.AstId name_expr_from_token(token.Token tok) {
+        ast.AstId name = self.name_node_from_token(tok);
+        return self.node(tok.span, .name_expr(ast.StmtData {value: name}));
+    }
+
+    ast.AstId name_node_from_token(token.Token tok) {
+        Int! symbol = 0;
+        if (tok.symbol_id is some symbol_id) {
+            symbol = symbol_id.to_index();
+        }
+        return self.node(tok.span, .name(ast.NameData {symbol_id: symbol}));
+    }
+
+    ast.AstId parse_name() {
+        if (self.can_start_name()) {
+            return self.name_node_from_token(self.advance());
+        }
+        self.error_at_current(.expected_name, .ident);
+        return self.name_node_from_token(token.Token.missing(.ident, self.peek().span));
+    }
+
+    ast.AstId parse_path() {
+        Int segment_start = self.temp.len();
+        ast.AstId first = self.parse_name();
+        self.temp.add(first);
+        while (self.match(.dot)) {
+            self.temp.add(self.parse_name());
+        }
+        ast.AstRange segments = self.take_children(segment_start);
+        return self.node_from_range(first, segments, .path(ast.PathData {segments: segments}));
+    }
+
+    Bool can_start_name() {
+        if (self.check(.ident)) { return true; }
+        if (self.check_keyword(.kw_self)) { return true; }
+        if (self.check_keyword(.kw_self_type)) { return true; }
+        return false;
+    }
+
+    Bool looks_like_function_decl() {
+        ParserMark mark = self.mark();
+        ast.AstId type_ref = self.parse_result_type();
+        Bool! result = false;
+        if (self.can_start_name()) {
+            self.advance();
+            result = self.check(.left_paren) || self.check(.lt);
+        }
+        self.reset(mark);
+        return result;
+    }
+
+    Bool type_args_before_call() {
+        ParserMark mark = self.mark();
+        self.parse_type_args();
+        Bool result = self.check(.left_paren);
+        self.reset(mark);
+        return result;
+    }
+
+    ast.BinaryOp? binary_op_from_current() {
+        if (self.check(.pipe_pipe)) { return .logic_or; }
+        if (self.check(.amp_amp)) { return .logic_and; }
+        if (self.check(.question_question)) { return .coalesce; }
+        if (self.check(.eq_eq)) { return .equal; }
+        if (self.check(.bang_eq)) { return .not_equal; }
+        if (self.check(.lt)) { return .less; }
+        if (self.check(.lt_eq)) { return .less_equal; }
+        if (self.check(.gt)) { return .greater; }
+        if (self.check(.gt_eq)) { return .greater_equal; }
+        if (self.check(.pipe)) { return .bit_or; }
+        if (self.check(.caret)) { return .bit_xor; }
+        if (self.check(.amp)) { return .bit_and; }
+        if (self.check(.lt_lt)) { return .shift_left; }
+        if (self.check(.gt_gt)) { return .shift_right; }
+        if (self.check(.plus)) { return .add; }
+        if (self.check(.minus)) { return .sub; }
+        if (self.check(.star)) { return .mul; }
+        if (self.check(.slash)) { return .div; }
+        if (self.check(.percent)) { return .mod; }
+        return null;
+    }
+
+    Int binary_precedence(ast.BinaryOp op) {
+        if (op == .logic_or) { return 1; }
+        if (op == .logic_and) { return 2; }
+        if (op == .coalesce) { return 3; }
+        if (op == .equal
+            || op == .not_equal
+            || op == .less
+            || op == .less_equal
+            || op == .greater
+            || op == .greater_equal) {
+            return 4;
+        }
+        if (op == .bit_or) { return 5; }
+        if (op == .bit_xor) { return 6; }
+        if (op == .bit_and) { return 7; }
+        if (op == .shift_left || op == .shift_right) { return 8; }
+        if (op == .add || op == .sub) { return 9; }
+        return 10;
+    }
+
+    ast.UnaryOp? unary_op_from_current() {
+        if (self.check(.minus)) { return .negate; }
+        if (self.check(.bang)) { return .not; }
+        if (self.check(.tilde)) { return .bit_not; }
+        if (self.check(.amp)) { return .address_of; }
+        if (self.check(.star)) { return .deref; }
+        return null;
+    }
+
+    ast.AssignOp? assign_op_from_current() {
+        if (self.check(.assign)) { return .assign; }
+        if (self.check(.plus_assign)) { return .add_assign; }
+        if (self.check(.minus_assign)) { return .sub_assign; }
+        if (self.check(.star_assign)) { return .mul_assign; }
+        if (self.check(.slash_assign)) { return .div_assign; }
+        if (self.check(.percent_assign)) { return .mod_assign; }
+        if (self.check(.amp_assign)) { return .bit_and_assign; }
+        if (self.check(.pipe_assign)) { return .bit_or_assign; }
+        if (self.check(.caret_assign)) { return .bit_xor_assign; }
+        if (self.check(.lt_lt_assign)) { return .shift_left_assign; }
+        if (self.check(.gt_gt_assign)) { return .shift_right_assign; }
+        return null;
+    }
+
+    ParserMark mark() {
+        return ParserMark(self.current, self.temp.len(), self.file.nodes.len(), self.file.children.len());
+    }
+
+    () reset(ParserMark mark) {
+        self.current = mark.current;
+        self.temp.truncate(mark.temp_len);
+        self.file.nodes.truncate(mark.node_len);
+        self.file.children.truncate(mark.child_len);
+    }
+
     Bool at_end() {
         return self.peek_kind() == .eof;
     }
@@ -154,7 +2091,7 @@ public struct Parser {
     token.Token expect(token.TokenKind expected) {
         if (self.check(expected)) { return self.advance(); }
         self.error_at_current(.expected_token, expected);
-        return token.Token(expected, self.peek().span);
+        return token.Token.missing(expected, self.peek().span);
     }
 
     Bool check_keyword(token.Keyword keyword) {
@@ -169,6 +2106,23 @@ public struct Parser {
         return false;
     }
 
+    Bool check_symbol_text(UInt8[] expected) {
+        if (self.peek().kind != .ident) {
+            return false;
+        }
+        if (self.peek().symbol_id is some symbol) {
+            UInt8[] text = self.query.symbol_text(symbol);
+            if (text.length != expected.length) { return false; }
+            Int! index = 0;
+            while (index < text.length) {
+                if (text[index] != expected[index]) { return false; }
+                index = index + 1;
+            }
+            return true;
+        }
+        return false;
+    }
+
     Bool match_keyword(token.Keyword keyword) {
         if (!self.check_keyword(keyword)) { return false; }
         self.advance();
@@ -177,8 +2131,8 @@ public struct Parser {
 
     token.Token expect_keyword(token.Keyword keyword) {
         if (self.check_keyword(keyword)) { return self.advance(); }
-        self.error_at_current(.expected_name, .ident);
-        return token.Token(.ident, self.peek().span);
+        self.error_at_current_keyword(keyword);
+        return token.Token.missing(.ident, self.peek().span);
     }
 
     token.Token advance() {
@@ -207,12 +2161,17 @@ public struct Parser {
 
     () error_at_current(error.ParseErrorKind kind, token.TokenKind expected) {
         token.Token actual = self.peek();
-        self.errors.add(error.ParseError(kind, actual.span, expected, actual.kind));
+        self.errors.add(error.ParseError(kind, actual.span, expected, null, actual.kind));
+    }
+
+    () error_at_current_keyword(token.Keyword expected) {
+        token.Token actual = self.peek();
+        self.errors.add(error.ParseError(.expected_keyword, actual.span, null, expected, actual.kind));
     }
 
     () error_at_current(error.ParseErrorKind kind) {
         token.Token actual = self.peek();
-        self.errors.add(error.ParseError(kind, actual.span, null, actual.kind));
+        self.errors.add(error.ParseError(kind, actual.span, null, null, actual.kind));
     }
 
     token.Span span_from(token.Span start, token.Span end) {
