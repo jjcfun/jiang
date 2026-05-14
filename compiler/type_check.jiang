@@ -221,11 +221,20 @@ public ResolvedCalleeKind resolved_callee_kind_from_id(Int id) {
 public struct TraitMethodRef {
     public scope.DeclId trait_decl_id;
     public Int method_index;
+    public Int owner_file_ptr;
     public ast.FunctionDecl function;
 
     public init(scope.DeclId trait_decl_id, Int method_index, ast.FunctionDecl function) {
         self.trait_decl_id = trait_decl_id;
         self.method_index = method_index;
+        self.owner_file_ptr = 0;
+        self.function = function;
+    }
+
+    public init(scope.DeclId trait_decl_id, Int method_index, Int owner_file_ptr, ast.FunctionDecl function) {
+        self.trait_decl_id = trait_decl_id;
+        self.method_index = method_index;
+        self.owner_file_ptr = owner_file_ptr;
         self.function = function;
     }
 }
@@ -2858,7 +2867,11 @@ public struct TypeChecker {
             types.TypeId right_type = self.rvalue_type(expr.span, self.expr_type(expr.right$.ptr(), left_type));
             self.check_compatible(left_type, right_type, expr.span, "binary operand type mismatch");
             if (expr.op == .equal || expr.op == .not_equal) {
-                scope.DeclId equal_decl = self.equatable_equal_method_decl(left_type);
+                types.TypeId equatable_type = self.equality_operand_type(left_type);
+                if (self.equality_requires_equatable(equatable_type) && !self.type_declares_trait_symbol(equatable_type, self.ctx.intern("Equatable").id)) {
+                    self.mismatch(expr.span, "operator == requires Equatable");
+                }
+                scope.DeclId equal_decl = self.equatable_equal_method_decl(equatable_type);
                 if (equal_decl.valid()) {
                     self.result.add_resolved_callee(expr_ref, expr.span, equal_decl, .equatable_method);
                 }
@@ -4577,6 +4590,9 @@ public struct TypeChecker {
         if (candidate.segments[0].symbol.id == trait_symbol_id) {
             return true;
         }
+        if (trait_symbol_id == self.ctx.intern("Equatable").id && candidate.segments[0].symbol.id == self.ctx.intern("Hashable").id) {
+            return true;
+        }
         ast.TraitDecl? candidate_decl = self.trait_decl_for_path(candidate);
         if (candidate_decl is some resolved_candidate) {
             return self.trait_decl_inherits_symbol(resolved_candidate, trait_symbol_id);
@@ -4594,6 +4610,22 @@ public struct TypeChecker {
             index = index + 1;
         }
         return false;
+    }
+
+    types.TypeId equality_operand_type(types.TypeId type_id) {
+        if (!type_id.valid()) { return type_id; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .layer && info.mutable && !info.optional && info.element.valid()) {
+            return self.equality_operand_type(info.element);
+        }
+        return type_id;
+    }
+
+    Bool equality_requires_equatable(types.TypeId type_id) {
+        if (!type_id.valid()) { return false; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .type_param) { return false; }
+        return info.kind == .nominal && info.nominal_kind != .enum_decl;
     }
 
     scope.DeclId equatable_equal_method_decl(types.TypeId receiver_type) {
@@ -4976,7 +5008,7 @@ public struct TypeChecker {
         TraitMethodRef? trait_method = self.trait_method_ref_for_receiver(receiver_type, field.name.symbol.id);
         if (trait_method is some resolved_trait_method) {
             self.result.add_resolved_callee_with_index(call_expr, call.span, resolved_trait_method.trait_decl_id, .trait_method, resolved_trait_method.method_index);
-            return self.check_function_call(resolved_trait_method.function, call, expected, "method argument type mismatch", "method result type mismatch");
+            return self.check_trait_method_call(receiver_type, resolved_trait_method, call, expected);
         }
         resolve.ResolveResult^ method_result = self.method_result_for_receiver_type(receiver_type);
         Int! index = 0;
@@ -5047,7 +5079,7 @@ public struct TypeChecker {
         TraitMethodRef? trait_method = self.static_trait_method_ref_for_receiver(receiver_type, method_name.symbol.id);
         if (trait_method is some resolved_trait_method) {
             self.result.add_resolved_callee_with_index(call_expr, call.span, resolved_trait_method.trait_decl_id, .trait_method, resolved_trait_method.method_index);
-            return self.check_function_call(resolved_trait_method.function, call, expected, "method argument type mismatch", "method result type mismatch");
+            return self.check_trait_method_call(receiver_type, resolved_trait_method, call, expected);
         }
         resolve.ResolveResult^ method_result = self.method_result_for_receiver_type(receiver_type);
 
@@ -5367,6 +5399,40 @@ public struct TypeChecker {
         return result_type;
     }
 
+    types.TypeId check_trait_method_call(types.TypeId receiver_type, TraitMethodRef method, ast.CallExpr call, types.TypeId expected) {
+        list.ArrayList<types.TypeId> generic_args = self.collect_call_generic_args(method.function, call);
+        Int! index = 0;
+        while (index < call.args.len()) {
+            types.TypeId expected_arg = self.trait_method_type_from_receiver_args(method, receiver_type, method.function.params[index].type_ref, generic_args);
+            types.TypeId actual_arg = self.argument_rvalue_type(call.args[index].span, expected_arg, self.expr_type(call.args[index].value, expected_arg));
+            self.check_assignment_compatible(expected_arg, actual_arg, call.args[index].span, "method argument type mismatch");
+            index = index + 1;
+        }
+        types.TypeId result_type = self.trait_method_type_from_receiver_args(method, receiver_type, method.function.result, generic_args);
+        if (expected.valid()) {
+            self.check_assignment_compatible(expected, result_type, call.span, "method result type mismatch");
+        }
+        if (!self.generic_args_satisfy_constraints(method.function.generics, generic_args)) {
+            self.mismatch(call.span, "generic constraint not satisfied");
+        }
+        return result_type;
+    }
+
+    types.TypeId trait_method_type_from_receiver_args(TraitMethodRef method, types.TypeId receiver_type, ast.AstType type_ref, list.ArrayList<types.TypeId> generic_args) {
+        types.TypeId! method_type = types.TypeId();
+        if (method.owner_file_ptr != 0) {
+            resolve.ResolveResult^? owner_result = self.resolve_result_for_file_ptr_in(self.resolved, method.owner_file_ptr, 0);
+            if (owner_result is some resolved_owner) {
+                ast.AstFile^ owner_file = method.owner_file_ptr$.as(ast.AstFile^);
+                method_type = self.type_from_ast_with_generic_args_in_context(type_ref, method.function.generics, generic_args, resolved_owner, owner_file);
+            }
+        }
+        if (!method_type.valid()) {
+            method_type = self.type_from_ast_with_generic_args(type_ref, method.function.generics, generic_args);
+        }
+        return self.substitute_self_type_param(method_type, receiver_type);
+    }
+
     types.TypeId method_type_from_receiver_call_args(resolve.MethodBinding method, types.TypeId receiver_type, ast.CallExpr call, list.ArrayList<types.TypeId> generic_args, ast.AstType type_ref) {
         if (method.function.generics.type_params.len() > 0) {
             types.TypeId method_type = self.method_type_from_ast_with_generic_args(method, type_ref, method.function.generics, generic_args);
@@ -5418,6 +5484,41 @@ public struct TypeChecker {
             }
         }
         return self.substitute_single_receiver_type_param(self.method_type_from_ast(method, type_ref), receiver_info);
+    }
+
+    types.TypeId substitute_self_type_param(types.TypeId type_id, types.TypeId self_type) {
+        if (!type_id.valid()) { return type_id; }
+        types.TypeInfo info = self.type_table.type_at(type_id);
+        if (info.kind == .type_param && self.ctx.symbol_equal(info.symbol, "Self")) {
+            return self_type;
+        }
+        if (info.kind == .pointer) {
+            types.TypeId element = self.substitute_self_type_param(info.element, self_type);
+            if (element == info.element) { return type_id; }
+            return self.type_table.make_pointer_kind(info.span, element, info.pointer_kind, info.mutable_item, info.many);
+        }
+        if (info.kind == .layer) {
+            types.TypeId element = self.substitute_self_type_param(info.element, self_type);
+            if (element == info.element) { return type_id; }
+            return self.type_table.make_layer(info.span, element, info.optional, info.mutable);
+        }
+        if (info.kind == .slice) {
+            types.TypeId element = self.substitute_self_type_param(info.element, self_type);
+            if (element == info.element) { return type_id; }
+            return self.type_table.make_slice(info.span, element);
+        }
+        if (info.kind == .array) {
+            types.TypeId element = self.substitute_self_type_param(info.element, self_type);
+            if (element == info.element) { return type_id; }
+            return self.type_table.make_array(info.span, element, info.inferred_count, info.child_count);
+        }
+        if (info.kind == .errorable) {
+            types.TypeId value = self.substitute_self_type_param(info.element, self_type);
+            types.TypeId error = self.substitute_self_type_param(info.other, self_type);
+            if (value == info.element && error == info.other) { return type_id; }
+            return self.type_table.make_errorable(info.span, value, error);
+        }
+        return type_id;
     }
 
     types.TypeId substitute_single_receiver_type_param(types.TypeId type_id, types.TypeInfo receiver_info) {
@@ -5666,7 +5767,7 @@ public struct TypeChecker {
                         TraitMethodRef? method = self.trait_method_ref_in_decl(resolved_binding.decl_id, resolved_trait, method_symbol_id);
                         if (method is some resolved_method) {
                             if (resolved_method.function.static_flag) {
-                                return resolved_method;
+                                return TraitMethodRef(resolved_method.trait_decl_id, resolved_method.method_index, self.trait_owner_file_ptr_for_path(trait_bound.path), resolved_method.function);
                             }
                         }
                     }
@@ -5725,7 +5826,10 @@ public struct TypeChecker {
                 ast.AstDecl? decl = self.trait_decl_ast_for_path(trait_bound.path, resolved_binding);
                 if (decl is some resolved_decl) {
                     if (resolved_decl is .trait_decl(resolved_trait)) {
-                        return self.trait_method_ref_in_decl(resolved_binding.decl_id, resolved_trait, method_symbol_id);
+                        TraitMethodRef? method = self.trait_method_ref_in_decl(resolved_binding.decl_id, resolved_trait, method_symbol_id);
+                        if (method is some resolved_method) {
+                            return TraitMethodRef(resolved_method.trait_decl_id, resolved_method.method_index, self.trait_owner_file_ptr_for_path(trait_bound.path), resolved_method.function);
+                        }
                     }
                 }
             }
@@ -5743,6 +5847,22 @@ public struct TypeChecker {
 
     TraitMethodRef? trait_method_ref_for_bound_ptr(ast.TypeBound^ bound, Int method_symbol_id) {
         return self.trait_method_ref_for_bound(bound$.get(), method_symbol_id);
+    }
+
+    Int trait_owner_file_ptr_for_path(ast.Path path) {
+        if (path.segment_len() <= 1) {
+            return 0;
+        }
+        resolve.ImportedModule? module = self.imported_module_for_path(path);
+        if (module == null) {
+            return 0;
+        }
+        resolve.ImportedModule imported_module = module$.some();
+        if (imported_module.result.file == null) {
+            return 0;
+        }
+        ast.AstFile^ file = imported_module.result.file$.some();
+        return file$.ptr()$.as(Int);
     }
 
     ast.FunctionDecl? trait_method_in_decl(ast.TraitDecl decl, Int method_symbol_id) {

@@ -1,4 +1,5 @@
 import "./context.jiang";
+import ast = "./ast.jiang";
 import ir = "./ir_common.jiang";
 import "./interner.jiang";
 import "./jir.jiang";
@@ -2314,6 +2315,214 @@ Bool collect_expr_ids_binary(jir.JirModule^ input, jir.JirExpr& expr, list.Array
     return false;
 }
 
+types.TypeId concrete_equality_type(context.CompilerContext& ctx, types.TypeId type_id) {
+    if (!type_id.valid()) { return type_id; }
+    types.TypeTable& table = ctx.types_ref();
+    types.TypeInfo info = table.type_at(type_id);
+    if (info.kind == .layer && info.mutable && !info.optional && info.element.valid()) {
+        return concrete_equality_type(ctx, info.element);
+    }
+    return type_id;
+}
+
+Bool concrete_equality_needs_equatable(context.CompilerContext& ctx, types.TypeId type_id) {
+    if (!type_id.valid()) { return false; }
+    types.TypeTable& table = ctx.types_ref();
+    types.TypeInfo info = table.type_at(type_id);
+    return info.kind == .nominal && info.nominal_kind != .enum_decl;
+}
+
+Bool equatable_trait_path(context.CompilerContext& ctx, ast.Path path) {
+    if (path.segment_len() != 1) { return false; }
+    Int symbol_id = path.segments[0].symbol.id;
+    if (symbol_id == ctx.intern("Equatable").id) { return true; }
+    if (symbol_id == ctx.intern("Hashable").id) { return true; }
+    return false;
+}
+
+Bool trait_list_has_equatable(context.CompilerContext& ctx, list.ArrayList<ast.Path> traits) {
+    Int! index = 0;
+    while (index < traits.len()) {
+        if (equatable_trait_path(ctx, traits[index])) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool concrete_type_supports_equatable(context.CompilerContext& ctx, types.TypeId type_id) {
+    if (!type_id.valid()) { return false; }
+    types.TypeTable& table = ctx.types_ref();
+    types.TypeInfo info = table.type_at(type_id);
+    if (info.kind != .nominal) { return false; }
+    ast.AstDecl? decl = ctx.semantic_decl_ast(info.decl_id);
+    if (decl is some resolved_decl) {
+        if (resolved_decl is .struct_decl(struct_decl)) {
+            return trait_list_has_equatable(ctx, struct_decl.traits);
+        }
+        if (resolved_decl is .enum_decl(enum_decl)) {
+            return trait_list_has_equatable(ctx, enum_decl.traits);
+        }
+        if (resolved_decl is .union_decl(union_decl)) {
+            return trait_list_has_equatable(ctx, union_decl.traits);
+        }
+    }
+    return false;
+}
+
+jir.JirExprId add_equal_call_expr(context.CompilerContext& ctx, jir.JirModule& module, token.Span span, types.TypeId result_type, jir.JirExprId left, jir.JirExprId right, types.TypeId left_type, types.TypeId right_type) {
+    types.TypeTable& table = ctx.types_ref();
+    jir.JirExprId callee = module.add_expr(jir.JirExpr(span, table.make_unit(span), .name_expr(jir.JirNameExpr(ir.Name(span, ctx.intern("equal")), scope.BindingId(), scope.LocalBindingId()))));
+    types.TypeId left_ref_type = table.make_pointer_kind(span, left_type, types.PointerKind.borrow, false, false);
+    types.TypeId right_ref_type = table.make_pointer_kind(span, right_type, types.PointerKind.borrow, false, false);
+    jir.JirExprId left_ref = module.add_expr(jir.JirExpr(span, left_ref_type, .unary_expr(jir.JirUnaryExpr(.address_of, left))));
+    jir.JirExprId right_ref = module.add_expr(jir.JirExpr(span, right_ref_type, .unary_expr(jir.JirUnaryExpr(.address_of, right))));
+    jir.JirCallExpr^ call = new jir.JirCallExpr(module.store, callee);
+    call.args.add(left_ref);
+    call.args.add(right_ref);
+    return module.add_expr(jir.JirExpr(span, result_type, .call_expr(call)));
+}
+
+jir.JirInstruction call_instruction_from_expr(jir.JirModule& module, jir.JirInstruction base, jir.JirExprId call_id, jir.JirValueId result) {
+    jir.JirInstruction! inst = jir.JirInstruction(module.store, base.span, .call, base.type_id, result);
+    inst.stmt_id = base.stmt_id;
+    inst.local_meta = base.local_meta;
+    inst.temp_local_meta = base.temp_local_meta;
+    inst.assign_meta = base.assign_meta;
+    inst.pattern_bind_meta = base.pattern_bind_meta;
+    inst.expr_meta = base.expr_meta;
+    inst.for_each_meta = base.for_each_meta;
+    inst.try_meta = base.try_meta;
+    inst.coalesce_meta = base.coalesce_meta;
+    jir.JirExpr call_expr = module.expr_at(call_id);
+    if (call_expr.body is .call_expr(call)) {
+        inst.add_operand(jir.JirValueId(call.callee.id));
+        Int! index = 0;
+        while (index < call.args.len()) {
+            inst.add_operand(jir.JirValueId(call.args[index].id));
+            index = index + 1;
+        }
+        inst.target_decl_id = call.target_decl_id;
+        inst.target_ref = module.call_target_at(call_id);
+        inst.method_receiver_type_id = call.method_receiver_type_id;
+        inst.method_symbol = call.method_symbol;
+    }
+    return inst;
+}
+
+() add_call_arg_dependency_instructions(jir.JirModule& module, jir.JirExprId call_id, list.ArrayList<jir.JirInstruction>^ output) {
+    jir.JirExpr call_expr = module.expr_at(call_id);
+    if (call_expr.body is .call_expr(call)) {
+        Int! index = 0;
+        while (index < call.args.len()) {
+            jir.JirExprId arg_id = call.args[index];
+            jir.JirExpr arg_expr = module.expr_at(arg_id);
+            if (arg_expr.body is .unary_expr(unary)) {
+                jir.JirInstruction! inst = jir.JirInstruction(module.store, arg_expr.span, .unary, arg_expr.type_id, jir.JirValueId(arg_id.id));
+                inst.unary_op = unary.op;
+                inst.add_operand(jir.JirValueId(unary.value.id));
+                output.add(inst);
+            }
+            index = index + 1;
+        }
+    }
+}
+
+Bool rewrite_equatable_binary_instruction(context.CompilerContext& ctx, jir.JirModule& module, jir.JirInstruction inst, list.ArrayList<jir.JirInstruction>^ output) {
+    if (inst.kind != .binary) { return false; }
+    if (inst.binary_op != .equal && inst.binary_op != .not_equal) { return false; }
+    if (!inst.result.valid()) { return false; }
+    jir.JirExprId expr_id = jir.JirExprId(inst.result.id);
+    if (expr_id.id >= module.expr_count()) { return false; }
+    jir.JirExpr& expr = module.expr_ref_at(expr_id);
+    if (expr.body is .binary_expr(binary)) {
+        jir.JirExpr left_expr = module.expr_at(binary.left);
+        jir.JirExpr right_expr = module.expr_at(binary.right);
+        types.TypeId left_type = concrete_equality_type(ctx, left_expr.type_id);
+        types.TypeId right_type = concrete_equality_type(ctx, right_expr.type_id);
+        if (!concrete_equality_needs_equatable(ctx, left_type) && !concrete_equality_needs_equatable(ctx, right_type)) {
+            return false;
+        }
+        if (!concrete_type_supports_equatable(ctx, left_type) || !concrete_type_supports_equatable(ctx, right_type)) {
+            ctx.diagnostics.add_error(expr.span, "operator == requires Equatable");
+            return false;
+        }
+        jir.JirExprId equal_call = add_equal_call_expr(ctx, module, expr.span, expr.type_id, binary.left, binary.right, left_type, right_type);
+        if (inst.binary_op == .equal) {
+            jir.JirExpr equal_expr = module.expr_at(equal_call);
+            expr.set_body(equal_expr.body);
+            add_call_arg_dependency_instructions(module, expr_id, output);
+            output.add(call_instruction_from_expr(module, inst, expr_id, inst.result));
+            return true;
+        }
+        add_call_arg_dependency_instructions(module, equal_call, output);
+        output.add(call_instruction_from_expr(module, inst, equal_call, jir.JirValueId(equal_call.id)));
+        expr.set_body(.unary_expr(jir.JirUnaryExpr(.not, equal_call)));
+        jir.JirInstruction! not_inst = jir.JirInstruction(module.store, inst.span, .unary, inst.type_id, inst.result);
+        not_inst.unary_op = .not;
+        not_inst.add_operand(jir.JirValueId(equal_call.id));
+        output.add(not_inst);
+        return true;
+    }
+    return false;
+}
+
+() rewrite_concrete_equatable_binaries_in_cfg(context.CompilerContext& ctx, jir.JirModule& module, jir.JirCfgFunctionId cfg_id) {
+    jir.JirCfgFunction& cfg = module.cfg_function_ref_at(cfg_id);
+    Int! block_index = 0;
+    while (block_index < cfg.blocks.len()) {
+        jir.JirBasicBlock& block = cfg.blocks.get(block_index);
+        list.ArrayList<jir.JirInstruction>! rewritten = list.ArrayList<jir.JirInstruction>();
+        Int! inst_index = 0;
+        while (inst_index < block.instructions.len()) {
+            jir.JirInstruction inst = block.instructions.get(inst_index);
+            if (!rewrite_equatable_binary_instruction(ctx, module, inst, rewritten$.ptr())) {
+                rewritten.add(inst);
+            }
+            inst_index = inst_index + 1;
+        }
+        block.instructions.clear();
+        inst_index = 0;
+        while (inst_index < rewritten.len()) {
+            block.instructions.add(rewritten[inst_index]);
+            inst_index = inst_index + 1;
+        }
+        block_index = block_index + 1;
+    }
+}
+
+() rewrite_concrete_equatable_binaries(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
+    Int! module_index = 0;
+    while (module_index < input_count) {
+        jir.JirModule& module = inputs[module_index]$.as(jir.JirModule^)$.ref();
+        Int! decl_index = 0;
+        while (decl_index < module.decl_count()) {
+            jir.JirDecl decl = module.decl_at(jir.JirDeclId(decl_index));
+            if (decl.body is .function_decl(function_decl)) {
+                if (function_decl.cfg_function_id.valid()) {
+                    rewrite_concrete_equatable_binaries_in_cfg(ctx, module, function_decl.cfg_function_id);
+                }
+            }
+            if (decl.body is .type_decl(type_decl)) {
+                Int! init_index = 0;
+                while (init_index < type_decl.inits.len()) {
+                    jir.JirInitDecl init_decl = type_decl.inits[init_index];
+                    if (init_decl.cfg_function_id.valid()) {
+                        rewrite_concrete_equatable_binaries_in_cfg(ctx, module, init_decl.cfg_function_id);
+                    }
+                    init_index = init_index + 1;
+                }
+                if (type_decl.deinit_decl is some deinit_decl) {
+                    if (deinit_decl.cfg_function_id.valid()) {
+                        rewrite_concrete_equatable_binaries_in_cfg(ctx, module, deinit_decl.cfg_function_id);
+                    }
+                }
+            }
+            decl_index = decl_index + 1;
+        }
+        module_index = module_index + 1;
+    }
+}
+
 Bool collect_expr_ids_struct(jir.JirModule^ input, jir.JirExpr& expr, list.ArrayList<Int>^ output, Int input_index, Bool generic_mark) {
     if (expr.body is .struct_expr(struct_expr)) {
         Int! index = 0;
@@ -2773,6 +2982,7 @@ public () monomorphize_jir_modules(context.CompilerContext& ctx, Int![*] inputs,
     verify_concrete_type_decls(mono$.ptr());
     mark_active_root_exprs(mono$.ptr());
     monomorphize_active_calls(mono$.ptr());
+    rewrite_concrete_equatable_binaries(ctx$.ref(), inputs, input_count);
 }
 
 public () strip_jir_generic_templates(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
