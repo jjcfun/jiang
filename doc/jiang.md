@@ -185,20 +185,20 @@ Int value = maybe ?? 42;
 Int other = maybe ?? fallback();
 ```
 
-`??` 也支持在局部变量初始化位置提前退出：
+提前退出使用 `guard`：
 
 ```c
-Int value = maybe ?? return;
-Int value = maybe ?? return 42;
-Int value = maybe ?? break;
-Int value = maybe ?? continue;
+guard maybe is some value else {
+    return;
+}
 ```
 
 其中：
 
 - 左侧必须是 optional
-- `return` / `break` / `continue` 只支持出现在局部变量初始化右侧
-- `return expr` 会按当前函数返回类型检查
+- `??` 右侧必须是 fallback 值，不支持 `return` / `break` / `continue`
+- `guard` 的 `else` block 必须非空，且最后一条语句必须是
+  `return`、`break`、`continue` 或 `throw`
 
 ### Defer
 
@@ -221,7 +221,6 @@ defer {
 当前限制：
 
 - `defer` 体内不支持 `return`、`break`、`continue`
-- `defer` 体内也不支持 `?? return`、`?? break`、`?? continue`
 
 
 
@@ -915,7 +914,9 @@ Int y = switch (value) {
 - 分支结果是右侧语句或 block 最后一条语句的值
 - 所有分支结果类型必须一致
 - `enum` / `union` / `optional` 仍然做穷尽性检查
-- 当前不支持模式绑定形式的 `switch` 表达式
+- 分支根 pattern 只支持 variant / optional / literal
+- binding/wildcard 只作为 variant 或 optional payload 的子 pattern 使用
+- 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法
 - 当前不支持对 `T@E` 结果直接使用 `switch` 表达式
 
 #### 异常
@@ -982,11 +983,11 @@ Int@Err outer(Bool fail) {
 异常的使用方式是：
 
 - 在 `@E` 函数里依靠普通调用做同 `E` 的隐式传播
-- 用 `expr catch (...) => fallback` 处理单个失败结果
+- 用 `try expr catch (...) => fallback` 处理单个失败结果
 
 异常结果不通过 `switch` 匹配。
 
-单个可错表达式可以用后缀 `catch` 处理：
+单个可错表达式可以用 `try catch` 处理：
 
 ```c
 enum Err {
@@ -1001,15 +1002,15 @@ Int@Err parse(Bool fail) {
 }
 
 Int main() {
-    Int a = parse(false) catch () => 0;
-    Int b = parse(true) catch (e) => {
+    Int a = try parse(false) catch () => 0;
+    Int b = try parse(true) catch (e) => {
         if (e == Err.bad) {
             42;
         } else {
             0;
         };
     };
-    Int c = parse(true) catch (e) => {
+    Int c = try parse(true) catch (e) => {
         Int base = 0;
         if (e == Err.bad) {
             base + 7;
@@ -1023,8 +1024,8 @@ Int main() {
 
 `catch` 规则：
 
-- 只支持后缀表达式形式：`expr catch (...) => fallback`
-- `catch` 是 postfix 操作，只处理它左侧的单个可错表达式
+- 只支持前置 `try catch` 表达式形式：`try expr catch (...) => fallback`
+- `try` 只包住 `catch` 前面的单个表达式
 - `expr` 必须是 `T@E`
 - `catch` 参数列表必须写 `(...)`；不需要错误值时写 `()`
 - `catch` 绑定可省略类型；如果写绑定，类型自动推断为错误类型 `E`
@@ -1034,7 +1035,7 @@ Int main() {
 
 不支持：
 
-- 前置 `try`
+- 后缀 `expr catch`
 - 多条 `catch`
 - 无 `=>` 的 `catch` fallback
 - `finally`
@@ -1061,7 +1062,6 @@ defer {
 当前限制：
 
 - `defer` 体内不支持 `return`、`break`、`continue`
-- `defer` 体内也不支持 `?? return`、`?? break`、`?? continue`
 
 #### 算术运算符
 
@@ -1160,31 +1160,28 @@ for item in list {
 ```
 
 **3. 带索引的遍历 (Explicit Indexing)**
-Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.indexed()` 方法，该方法会返回一个包含 `(Int, Element)` 元组的序列。
+Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.indexed()` 方法，
+该方法会返回一个包含 `(Int, Element)` 元组的序列。
 
 ```c
 Int[_] list = [10, 20];
 
-for (i, item) in list.indexed() {
+for pair in list.indexed() {
+    (i, item) = pair;
     print("index: %d, value: %d", i, item);
 }
 ```
 
-**4. 解构规则 (Destructuring Rules)**
-为了保持语法的一致性与严谨性，Jiang 规定：
-
-- 如果 `in` 前面的模式（Pattern）包含超过 1 个元素，**必须** 使用括号 `()` 包裹。
-- 单个元素的迭代可以不用括号。
+**4. 绑定规则**
+`for` 的 `in` 前面只接受不可失败的 binding pattern，不接受 optional、variant、literal
+这类可失败 match pattern。需要解构时，在循环体内使用独立 destructure 语句。
 
 ```c
 (Int, Int)[_] pairs = [(1, 2), (3, 4)];
 
-for (a, b) in pairs {
+for pair in pairs {
+    (a, b) = pair;
     print("a=%d, b=%d", a, b);
-}
-
-for (i, (a, b)) in pairs.indexed() {
-    print("index=%d, a=%d, b=%d", i, a, b);
 }
 ```
 

@@ -22,7 +22,7 @@ source -> syntax -> resolve -> sema -> ir -> backend
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
 - `syntax` 只产生 token 和 AST；它不应理解类型语义。
 - `diagnostic` 负责诊断数据结构、source map、终端输出和未来 LSP 位置转换。
-- `resolve` 负责 symbol interning、keyword table、import、module graph、scope 和
+- `resolve` 负责 symbol interning、keyword table、import、module graph、namespace 和
   declaration 的名字解析。
 - `sema` 负责类型检查、overload resolution、trait、generic 和类型转换。
 - `ir` 包含 HIR/MIR 数据定义，以及从上一阶段 lower 到目标 IR 的逻辑。
@@ -48,7 +48,7 @@ src/
   ir/           common、HIR、MIR、AST lower、HIR lower
   backend/      target 和后端入口
   incremental/  cache key、fingerprint、依赖图、symbol index
-  query/        query API、engine、db、id、key
+  query/        query system、cache、id、key、result
   support/      arena、list、table、hash、unicode 等通用工具
 ```
 
@@ -112,7 +112,7 @@ public trait Indexable {
 - 函数、方法、局部变量、字段、模块文件名使用 `lower_snake_case`。
 - 常量使用 `SCREAMING_SNAKE_CASE`。
 - 缩写词按普通单词处理，只首字母大写：
-  - 使用 `QueryDb`，不要用 `QueryDB`。
+  - 使用 `QuerySystem`，不要用 `QuerySYSTEM`。
   - 使用 `ModuleId`、`DefId`、`AstId`、`MirId`。
   - 使用 `LspServer`、`Utf8`、`Utf16`。
 - 文件名使用 lower snake case：`source_manager.jiang`、`type_check.jiang`。
@@ -126,18 +126,22 @@ public trait Indexable {
 - `*Key`：可 hash、可缓存或可持久化的查询键。
 - `*Table`：具体数据表或通用容器。
 - `*Index`：由多张表组成的查询索引。
-- `*Db`：全局表聚合和生命周期所有者。
+- `*System`：跨阶段状态聚合和生命周期所有者。
 
 ### Resolve 与 Query
 
 - `resolve/interner.jiang` 定义 `SymbolTable` 和 `KeywordTable`。`SymbolTable`
   用 `InternTable<SymbolText, SymbolId>` 维护源码文本驻留；`KeywordTable`
   用 `HashTable<SymbolId, Keyword>` 做关键字反查。
-- `query/db.jiang` 的 `QueryDb` 持有 `QueryEngine`、`SymbolTable`、`KeywordTable`
-  等全局生命周期对象。新增全局事实表优先挂到 `QueryDb`，具体 record/key 类型仍由
-  owner 模块定义。
-- 普通编译阶段不直接读取其他阶段的内部表。
-- 跨阶段问题通过 `query/api.jiang` 查询。
+- `query/api.jiang` 的 `QuerySystem` 持有 `QueryCache`、`SymbolTable`、`KeywordTable`、
+  `DefTable`、`TypeTable`、`ResolveStore` 等全局生命周期对象。长期事实表优先挂到
+  `QuerySystem`，具体 record/key 类型仍由 owner 模块定义。
+- `resolve/def.jiang` 定义 `DefKind`、`Visibility`、`NameDomain`、`DefRecord` 和
+  `DefTable`。
+- `resolve/namespace.jiang` 定义持久 namespace、namespace binding 和 lookup key。
+- `resolve/store.jiang` 组合 package/module、import/export 和 namespace table 等名字解析组织结构。
+- 编译阶段通过 `QuerySystem` 访问所属 store/table；不要绕过 `QuerySystem` 自行创建全局事实表。
+- 后续需要缓存或依赖追踪的跨阶段问题，再在 `query/api.jiang` 增加高阶查询入口。
 - `query/id.jiang` 放跨阶段共享 Id。
 - `query/key.jiang` 放稳定 key、query key 和依赖 key。
 - 阶段私有的局部 index 不放入 `query/id.jiang`；只有能跨阶段、跨缓存或被外部工具引用的

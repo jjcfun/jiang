@@ -321,6 +321,7 @@ stmt        <- return_stmt
              / continue_stmt
              / defer_stmt
              / block
+             / guard_stmt
              / while_stmt
              / for_stmt
              / destructure_stmt
@@ -339,6 +340,11 @@ continue_stmt
 
 defer_stmt  <- "defer" (block / expr ";")
 
+guard_stmt  <- "guard" expr "else" block
+
+// guard 的 else block 必须非空，且最后一条语句必须是
+// return、break、continue 或 throw。
+
 var_decl_stmt
             <- type name ("=" expr)? ";"
 
@@ -355,10 +361,7 @@ expr_stmt   <- expr ";"
 
 while_stmt  <- "while" expr block
 
-for_stmt    <- "for" for_binding "in" expr block
-
-for_binding <- type name
-             / pattern
+for_stmt    <- "for" binding_pattern "in" expr block
 
 catch_binding
             <- type name?
@@ -366,7 +369,7 @@ catch_binding
 
 switch_pattern_list
             <- "else"
-             / pattern ("," pattern)*
+             / match_pattern ("," match_pattern)*
 ```
 
 说明：`block` 内只允许 `stmt`，不允许独立的 tail expression。
@@ -389,17 +392,10 @@ logic_and_expr
             <- coalesce_expr ("&&" coalesce_expr)*
 
 coalesce_expr
-            <- compare_expr ("??" coalesce_rhs)*
-
-coalesce_rhs
-            <- "return" compare_expr?
-             / "break"
-             / "continue"
-             / "throw" compare_expr
-             / expr
+            <- compare_expr ("??" compare_expr)*
 
 compare_expr
-            <- bit_or_expr ((compare_op bit_or_expr) / ("is" pattern))*
+            <- bit_or_expr ((compare_op bit_or_expr) / ("is" match_pattern))*
 
 compare_op  <- "==" / "!=" / "<=" / "<" / ">=" / ">"
 
@@ -426,7 +422,6 @@ postfix_expr
 postfix_tail
             <- type_args "(" call_args? ")"
              / "(" call_args? ")"
-             / catch_expr
              / "?." name
              / "." name
              / "?" "[" index_or_slice "]"
@@ -471,6 +466,7 @@ primary_expr
              / block
              / if_expr
              / switch_expr
+             / try_catch_expr
 
 paren_expr  <- "(" ")"
              / "(" expr "," expr ("," expr)* ","? ")"
@@ -493,7 +489,11 @@ switch_expr_case
 switch_expr_body
             <- block / stmt
 
-catch_expr  <- "catch" "(" catch_binding? ")" "=>" catch_body
+try_catch_expr
+            <- "try" expr catch_clause
+
+catch_clause
+            <- "catch" "(" catch_binding? ")" "=>" catch_body
 
 catch_body  <- block / expr
 ```
@@ -501,27 +501,31 @@ catch_body  <- block / expr
 ## pattern
 
 ```peg
-pattern     <- optional_pattern
-             / wildcard_binding_pattern
+match_pattern
+            <- optional_pattern
              / literal
-             / implicit_variant_pattern
-             / tuple_pattern
-             / variant_or_binding_pattern
+             / variant_pattern
+
+pattern     <- match_pattern
+             / binding_pattern
 
 optional_pattern
             <- "some" pattern
 
-wildcard_binding_pattern
+binding_pattern
             <- "_" ("!"? name)?
+             / type name
+             / name
 
-variant_or_binding_pattern
-            <- path ("(" pattern_list? ")")?
+variant_pattern
+            <- variant_name ("(" pattern_list? ")")?
 
-implicit_variant_pattern
-            <- "." name ("(" pattern_list? ")")?
+variant_name
+            <- "." name
+             / qualified_name
 
-tuple_pattern
-            <- "(" pattern_list? ")"
+qualified_name
+            <- name "." name ("." name)*
 
 pattern_list
             <- pattern ("," pattern)* ","?
@@ -529,8 +533,10 @@ pattern_list
 
 说明：
 
-- 单段 `path` 在 pattern 中通常先按 binding 解释；多段 `path` 或带 payload 的形式用于 variant。
-- `_` 是 wildcard；`_ name` 和 `_! name` 是显式推导 binding。
+- `match_pattern` 用于 `is` 和 `switch` 分支根，只接受 optional、variant、literal。
+- 单段 `path` 只作为 binding 子 pattern 使用，不能作为 `is` 或 `switch` 的分支根。
+- `_` 是 wildcard；`_ name` 和 `_! name` 是显式推导 binding，只能作为 payload 子 pattern。
+- 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法。
 
 ## 说明
 
@@ -541,4 +547,5 @@ pattern_list
   - `@` 右侧类型是否可作为 error payload 由 type check 判断。
   - `switch` exhaustiveness、trait bound、visibility 等由 resolve/sema 阶段检查。
   - `struct_lit` 与 `block` 在语法上都使用 `{ ... }`，parser 依赖上下文和有序选择区分。
-  - 泛型类型参数中的 `>>` 可能由 lexer 合并为一个 token，parser 在类型参数上下文中会按两个 `>` 处理。
+  - 泛型类型参数中的 `>>` 可能由 lexer 合并为一个 token，
+    parser 在类型参数上下文中会按两个 `>` 处理。

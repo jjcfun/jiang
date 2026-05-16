@@ -58,8 +58,8 @@ Token 只表示词法事实，不承载语义类型。
 - identifier、关键字和基本类型名在 token 层统一为 `ident`；后续由 `KeywordTable`
   和 resolve/sema 解释。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
-  `else`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、
-  `extend`、`associated`、`static`、`switch`、`catch`、`break`、`continue`、
+  `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、
+  `extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、
   `defer`、`throw`、`true`、`false`、`null`、`self`、`some`、`Self`。
 - 字符字面量使用单引号，例如 `'a'`。
 - 字符串字面量使用双引号，文本按 UTF-8 字节序列处理。
@@ -633,7 +633,7 @@ T? value; // 归一化为 Int?
 
 - optional chaining: `value?.field`
 - coalesce: `value ?? fallback`
-- early-exit coalesce: `value ?? return`
+- guard: `guard value is some payload else { return; }`
 - 强制解包: `value$.some()`
 - 条件解包 pattern: `value is some payload` 或 `value is some _ payload`
 - 可变条件解包 pattern: `value is some _! payload`
@@ -705,6 +705,7 @@ Result@(Error!);
 - `break`
 - `continue`
 - `defer`
+- `guard`
 - `if`
 - `switch`
 - `while`
@@ -718,7 +719,7 @@ Result@(Error!);
 
 - if expr
 - switch expr
-- catch expr
+- try catch expr
 - binary/unary expr
 - call/field/index/slice/postfix expr
 
@@ -751,6 +752,7 @@ Int x = {
 | `destructure_stmt` | `Unit` |
 | `assign_stmt` | `Unit` |
 | `defer_stmt` | `Unit` |
+| `guard_stmt` | `Unit` |
 | `while_stmt` | `Unit` |
 | `for_stmt` | `Unit` |
 
@@ -758,18 +760,23 @@ Int x = {
 继续执行，可以在分支类型统一时转换为任意目标类型。`return`、`throw`、
 `break`、`continue` 仍然是语句，不属于普通表达式语法。
 
+`guard expr else { ... }` 用于提前退出并把 pattern 绑定带到后续作用域。
+`else` block 必须非空，且最后一条语句必须是 `return`、`break`、`continue`
+或 `throw`。更复杂的“所有分支都退出”由后续控制流分析处理。
+
 `defer` 在当前块退出时按 LIFO 顺序执行。`defer` 内不支持 `return`、`break`、`continue`。
 
 ## Pattern Matching
 
 pattern 目前包括：
 
-- wildcard
-- binding
 - literal
-- tuple
 - variant
 - optional
+
+binding/wildcard 只作为 optional 或 variant payload 的子 pattern 使用，不能作为
+`is` 或 `switch` 分支根。当前不支持 tuple pattern；tuple 解构应使用独立
+destructure 语法。
 
 `is` 用于 pattern matching，不再使用 `==` 表达 pattern 解构。
 

@@ -1,2 +1,254 @@
 // Declaration and reference name resolution.
 
+import context = "../context.jiang";
+import query = "../query/api.jiang";
+import qid = "../query/id.jiang";
+import ast = "../syntax/ast.jiang";
+import token = "../syntax/token.jiang";
+import def = "./def.jiang";
+import scope = "./scope.jiang";
+import store = "./store.jiang";
+
+struct FileResolveContext {
+    qid.ModuleId module_id;
+    qid.NamespaceId namespace_id;
+    Int! declared_count;
+    Int! unresolved_count;
+
+    public init(qid.ModuleId module_id, qid.NamespaceId namespace_id) {
+        self.module_id = module_id;
+        self.namespace_id = namespace_id;
+        self.declared_count = 0;
+        self.unresolved_count = 0;
+    }
+}
+
+public struct NameResolver {
+    query.QuerySystem& query;
+    ast.AstFile& file;
+    FileResolveContext file_ctx;
+    scope.LexicalEnv env;
+
+    public init(context.CompilerContext& ctx, ast.AstFile& file, qid.ModuleId module_id) {
+        self.query = ctx.query$.ref();
+        self.file = file;
+        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
+        self.file_ctx = FileResolveContext(module_id, module.namespace_id);
+        self.env = scope.LexicalEnv();
+    }
+
+    public () resolve() {
+        self.collect_imports();
+        self.collect_declarations();
+        self.resolve_references();
+    }
+
+    public () collect_imports() {
+        self.for_each_top_level_item(.collect_import);
+    }
+
+    public () collect_declarations() {
+        self.for_each_top_level_item(.collect_declaration);
+    }
+
+    public () resolve_references() {
+        self.env.enter_scope(.file_scope);
+        self.env.exit_scope();
+    }
+
+    () for_each_top_level_item(TopLevelPass pass) {
+        guard self.file.root is some root_id else { return; }
+        ast.AstNode root = self.file.get(root_id);
+        if (root.data is .root(root_data)) {
+            Int! index = 0;
+            while (index < root_data.items.len) {
+                ast.AstId item = self.file.child_at(root_data.items, index);
+                self.visit_top_level_item(item, pass);
+                index = index + 1;
+            }
+        }
+    }
+
+    () visit_top_level_item(ast.AstId item, TopLevelPass pass) {
+        ast.AstNode node = self.file.get(item);
+        if (node.data is .top_level_decl(top_level)) {
+            self.visit_top_level_decl(top_level, pass);
+        }
+    }
+
+    () visit_top_level_decl(ast.TopLevelDeclData decl, TopLevelPass pass) {
+        ast.AstNode body = self.file.get(decl.body);
+        if (body.data is .import_decl(import_decl)) {
+            if (pass == .collect_import) {
+                self.collect_import(import_decl, body.span);
+            }
+            return;
+        }
+        if (pass != .collect_declaration) {
+            return;
+        }
+
+        def.Visibility visibility = self.decl_visibility(decl.modifiers);
+        if (body.data is .nominal_decl(nominal)) {
+            self.define_top_level_name(
+                nominal.name,
+                .type_def,
+                .type_name,
+                visibility,
+                body.span
+            );
+            return;
+        }
+        if (body.data is .trait_decl(trait_decl)) {
+            self.define_top_level_name(
+                trait_decl.name,
+                .trait_def,
+                .type_name,
+                visibility,
+                body.span
+            );
+            return;
+        }
+        if (body.data is .alias_decl(alias_decl)) {
+            self.define_top_level_name(
+                alias_decl.name,
+                .type_def,
+                .type_name,
+                visibility,
+                body.span
+            );
+            return;
+        }
+        if (body.data is .function_decl(function_decl)) {
+            self.define_top_level_name(
+                function_decl.name,
+                .function_def,
+                .value_name,
+                visibility,
+                body.span
+            );
+            return;
+        }
+        if (body.data is .global_decl(global_decl)) {
+            self.define_top_level_name(
+                global_decl.name,
+                .global_def,
+                .value_name,
+                visibility,
+                body.span
+            );
+            return;
+        }
+    }
+
+    () define_top_level_name(
+        ast.AstId name_id,
+        def.DefKind kind,
+        def.NameDomain domain,
+        def.Visibility visibility,
+        token.Span span
+    ) {
+        if (self.name_symbol(name_id) is some symbol) {
+            qid.DefId def_id = self.query.defs.create(
+                kind,
+                domain,
+                visibility,
+                def.Name {symbol: symbol, span: self.file.get(name_id).span},
+                null,
+                self.file_ctx.module_id,
+                self.file_ctx.namespace_id,
+                span
+            );
+            self.query.resolve.bind_name(self.file_ctx.namespace_id, symbol, domain, def_id, span);
+            self.record_module_def(self.file_ctx.module_id, symbol, domain, visibility, def_id, span);
+            self.file_ctx.declared_count = self.file_ctx.declared_count + 1;
+        } else {
+            self.file_ctx.unresolved_count = self.file_ctx.unresolved_count + 1;
+        }
+    }
+
+    () record_module_def(
+        qid.ModuleId module_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain,
+        def.Visibility visibility,
+        qid.DefId def_id,
+        token.Span span
+    ) {
+        if (!self.query.resolve.modules.has(module_id)) {
+            return;
+        }
+        if (visibility == .public_visibility) {
+            self.query.resolve.add_export(
+                module_id,
+                store.ExportRecord {
+                    kind: self.export_kind(domain),
+                    symbol: symbol,
+                    domain: domain,
+                    def_id: def_id,
+                    span: span
+                }
+            );
+        } else {
+            self.query.resolve.add_private_def(module_id, def_id);
+        }
+    }
+
+    () collect_import(ast.ImportData import_decl, token.Span span) {
+        if (!self.query.resolve.modules.has(self.file_ctx.module_id)) {
+            return;
+        }
+        store.ImportKind! import_kind = .package_import;
+        if (import_decl.kind == .string_path) {
+            import_kind = .file_import;
+        }
+        qid.SymbolId! path_symbol = qid.SymbolId(0);
+        if (self.name_symbol(import_decl.path) is some symbol) {
+            path_symbol = symbol;
+        }
+        qid.SymbolId?! alias_symbol = null;
+        if (import_decl.alias_name is some alias_name) {
+            alias_symbol = self.name_symbol(alias_name);
+        }
+        self.query.resolve.add_import(
+            self.file_ctx.module_id,
+            store.ImportRecord {
+                kind: import_kind,
+                span: span,
+                path_symbol: path_symbol,
+                alias_symbol: alias_symbol,
+                target_module: null
+            }
+        );
+    }
+
+    def.Visibility decl_visibility(ast.DeclModifiers modifiers) {
+        if (modifiers.public_flag) {
+            return .public_visibility;
+        }
+        return .private_visibility;
+    }
+
+    store.ExportKind export_kind(def.NameDomain domain) {
+        if (domain == .type_name) { return .type_export; }
+        if (domain == .member_name) { return .member_export; }
+        if (domain == .namespace_name) { return .module_export; }
+        return .value_export;
+    }
+
+    qid.SymbolId? name_symbol(ast.AstId name_id) {
+        ast.AstNode node = self.file.get(name_id);
+        if (node.data is .name(name_data)) {
+            if (name_data.symbol_id > 0) {
+                return qid.SymbolId.from_index(name_data.symbol_id);
+            }
+        }
+        return null;
+    }
+
+}
+
+enum TopLevelPass {
+    collect_import,
+    collect_declaration,
+}
