@@ -22,8 +22,8 @@ source -> syntax -> resolve -> sema -> ir -> backend
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
 - `syntax` 只产生 token 和 AST；它不应理解类型语义。
 - `diagnostic` 负责诊断数据结构、source map、终端输出和未来 LSP 位置转换。
-- `resolve` 负责 symbol interning、keyword table、import、module graph、namespace 和
-  declaration 的名字解析。
+- `resolve` 负责 symbol interning、keyword table、import、module、namespace 和
+  declaration/reference 的名字解析。
 - `sema` 负责类型检查、overload resolution、trait、generic 和类型转换。
 - `ir` 包含 HIR/MIR 数据定义，以及从上一阶段 lower 到目标 IR 的逻辑。
   `ir/common.jiang` 放共享 IR 结构，`ir/hir.jiang` 放 HIR，`ir/mir.jiang` 放 MIR；
@@ -140,12 +140,79 @@ public trait Indexable {
   `DefTable`。
 - `resolve/namespace.jiang` 定义持久 namespace、namespace binding 和 lookup key。
 - `resolve/store.jiang` 组合 package/module、import/export 和 namespace table 等名字解析组织结构。
+- `ResolveStore.modules` 是 `ModuleId -> ModuleRecord` 主表。
+- `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的 side table，只用于从 source
+  快速找到当前 module；module 内容仍以 `modules` 为准。
 - 编译阶段通过 `QuerySystem` 访问所属 store/table；不要绕过 `QuerySystem` 自行创建全局事实表。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `query/api.jiang` 增加高阶查询入口。
 - `query/id.jiang` 放跨阶段共享 Id。
 - `query/key.jiang` 放稳定 key、query key 和依赖 key。
 - 阶段私有的局部 index 不放入 `query/id.jiang`；只有能跨阶段、跨缓存或被外部工具引用的
   Id 才进入 query 层。
+
+### 当前 Resolve 流程
+
+`resolve/module_resolver.jiang` 是当前 resolve 入口。外部只需要调用：
+
+```jiang
+ModuleResolver.resolve_file(ctx, ast_file)
+```
+
+流程分为 module 级驱动和单文件名字解析两层：
+
+```text
+resolve_file(ctx, ast_file)
+  -> ensure_module(ast_file.source_id)
+  -> NameResolver.collect_imports()
+  -> ModuleResolver.resolve_import_targets()
+  -> NameResolver.collect_declarations()
+  -> NameResolver.resolve_references()
+```
+
+`ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
+
+- 如果 `source_modules` 中没有这个 `SourceId`，创建 package/module/namespace/def，并写入
+  `modules` 和 `source_modules`。
+- 如果已有 module 且 `source_revision` 未变化，直接复用原 `ModuleId`。
+- 如果 source revision 变化，保持 `ModuleId` 不变，调用 `reset_module` 清空该 module 的
+  imports、exports、private_defs，并创建新的 module namespace。旧 namespace 和旧 def
+  暂时留在全局表中，但不再通过当前 module 可达；后续如需长期增量会再引入 GC 或
+  版本化策略。
+
+`NameResolver` 是单个 AST file/module 的 resolver。它不负责创建 module，也不负责跨文件
+加载；初始化时只拿当前 `module_id` 和 `namespace_id`：
+
+```text
+NameResolver {
+  query
+  file
+  module_id
+  namespace_id
+  lexical env
+}
+```
+
+当前 `NameResolver` 的 pass：
+
+- `collect_imports`：扫描 top-level import，向 `ModuleRecord.imports` 写入 `ImportRecord`。
+- `collect_declarations`：扫描 top-level declaration，创建 `DefId`，绑定到当前 module namespace，
+  并按 visibility 记录到 exports 或 private_defs。
+- `resolve_references`：目前还是骨架，只创建 file scope；后续应从这里开始做表达式/类型
+  引用查找。
+
+`resolve_import_targets` 在 imports 收集后运行。当前规则很窄：
+
+- 对普通 `import dep`，取 import path symbol 的文本，构造 virtual `SourceKey` 查 `SourceStore`。
+- 找到 source 后调用 `ensure_module(source_id)`，允许目标 module 只先创建 shell。
+- 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module namespace。
+- string import 还没有完整实现；目前只把 import kind 标成 `file_import`。
+
+当前还未完成的部分：
+
+- import path 到 source/package 的正式解析规则。
+- duplicate definition、unresolved name、import not found 等诊断。
+- 函数/block/local scope 内的 reference resolve。
+- reset 后旧 namespace/def 的回收或版本化。
 
 ### 代码风格
 
