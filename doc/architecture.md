@@ -152,10 +152,11 @@ public trait Indexable {
 
 ### 当前 Resolve 流程
 
-`resolve/module_resolver.jiang` 是当前 resolve 入口。外部只需要调用：
+`resolve/module_resolver.jiang` 是当前 resolve 入口。外部调用 `resolve_file` 后拿到当前
+文件的 resolve 阶段产物：
 
 ```jiang
-ModuleResolver.resolve_file(ctx, ast_file)
+ResolvedFile^ resolved = ModuleResolver.resolve_file(ctx, ast_file)
 ```
 
 流程分为 module 级驱动和单文件名字解析两层：
@@ -163,10 +164,12 @@ ModuleResolver.resolve_file(ctx, ast_file)
 ```text
 resolve_file(ctx, ast_file)
   -> ensure_module(ast_file.source_id)
+  -> create caller-owned ResolvedFile
   -> NameResolver.collect_imports()
   -> ModuleResolver.resolve_import_targets()
   -> NameResolver.collect_declarations()
   -> NameResolver.resolve_references()
+  -> return ResolvedFile^
 ```
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
@@ -188,6 +191,7 @@ NameResolver {
   file
   module_id
   namespace_id
+  resolved_file&
   lexical env
 }
 ```
@@ -198,20 +202,24 @@ NameResolver {
 - `collect_declarations`：扫描 top-level declaration，创建 `DefId`，绑定到当前 module namespace，
   并按 visibility 记录到 exports 或 private_defs。
 - `resolve_references`：遍历当前 file 的 declaration body，解析基础 type reference、
-  expression name、local binding 和 import alias path，并把结果写入单文件 `ResolvedFile`。
+  expression name、local binding 和 import alias path，并把结果写入调用方持有的
+  `ResolvedFile`。
 
 `resolve_import_targets` 在 imports 收集后运行。当前规则很窄：
 
 - 对普通 `import dep`，取 import path symbol 的文本，构造 virtual `SourceKey` 查 `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`，允许目标 module 只先创建 shell。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module namespace。
-- string import 还没有完整实现；目前只把 import kind 标成 `file_import`。
+- 对 string import，当前取字符串字面量的 symbol 文本，构造 file `SourceKey` 查 `SourceStore`。
 
 当前还未完成的部分：
 
 - import path 到 source/package 的正式解析规则。
-- duplicate definition、unresolved name、import not found 等诊断。
-- 函数/block/local scope 内的 reference resolve。
+- import target 的递归 declaration pass 和 cycle 状态。
+- generic、member、pattern binding 的精确 scope。
+- qualified path 的逐段 lookup。
+- declaration/member namespace。
+- duplicate definition、unresolved name、import not found 等诊断细节。
 - reset 后旧 namespace/def 的回收或版本化。
 
 ### 代码风格

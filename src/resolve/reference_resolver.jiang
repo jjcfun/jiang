@@ -80,21 +80,89 @@ public struct ReferenceResolver {
             if (extend_decl.trait_path is some trait_path) {
                 self.resolve_path(trait_path, .type_name);
             }
+            self.env.enter_scope(.generic_scope);
+            if (self.resolved_type_def(extend_decl.target_type) is some owner_def) {
+                self.define_self_type(owner_def);
+            }
             self.resolve_member_range(extend_decl.members);
+            self.env.exit_scope();
             return;
         }
     }
 
     () resolve_nominal(ast.NominalData nominal) {
+        self.env.enter_scope(.generic_scope);
+        if (self.owner_type_def(nominal.name) is some owner_def) {
+            self.define_self_type(owner_def);
+        }
         self.resolve_optional_generics(nominal.generics);
         self.resolve_path_range(nominal.traits, .type_name);
         self.resolve_member_range(nominal.members);
+        self.env.exit_scope();
     }
 
     () resolve_trait(ast.TraitData trait_decl) {
+        self.env.enter_scope(.generic_scope);
+        if (self.owner_type_def(trait_decl.name) is some owner_def) {
+            self.define_self_type(owner_def);
+        }
         self.resolve_optional_generics(trait_decl.generics);
         self.resolve_path_range(trait_decl.parents, .type_name);
         self.resolve_member_range(trait_decl.members);
+        self.env.exit_scope();
+    }
+
+    qid.DefId? owner_type_def(ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_namespace(
+                self.state.namespace_id,
+                symbol,
+                .type_name,
+                false
+            ) is some binding
+        ) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    () define_self_type(qid.DefId owner_def) {
+        qid.SymbolId self_symbol = self.state.query.symbols.intern("Self");
+        token.Span span = self.state.query.defs.get(owner_def).span;
+        if (!self.env.define(self_symbol, .type_name, owner_def, span)) {
+            self.add_diagnostic(span, "duplicate Self definition", "duplicate_def");
+        }
+    }
+
+    qid.DefId? resolved_type_def(ast.AstId type_id) {
+        ast.AstNode node = self.state.file.get(type_id);
+        if (node.data is .type_ref(type_data)) {
+            return self.resolved_type_def(type_data.base);
+        }
+        if (node.data is .named_type(named_type)) {
+            return self.resolved_path_def(named_type.path);
+        }
+        if (node.data is .path(_)) {
+            return self.resolved_path_def(type_id);
+        }
+        if (node.data is .name(_)) {
+            return self.state.resolved.name(type_id);
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_path_def(ast.AstId path_id) {
+        if (self.state.resolved.name(path_id) is some def_id) {
+            return def_id;
+        }
+        ast.AstNode path_node = self.state.file.get(path_id);
+        if (path_node.data is .path(path_data)) {
+            if (path_data.segments.len == 1) {
+                return self.state.resolved.name(self.state.file.child_at(path_data.segments, 0));
+            }
+        }
+        return null;
     }
 
     () resolve_member_range(ast.AstRange members) {
@@ -164,13 +232,16 @@ public struct ReferenceResolver {
     }
 
     () resolve_function(ast.FunctionData function_decl) {
-        self.resolve_type_ref(function_decl.result_type);
+        self.env.enter_scope(.generic_scope);
         self.resolve_optional_generics(function_decl.generics);
+        self.resolve_type_ref(function_decl.result_type);
+
         self.env.enter_scope(.function_scope);
         self.resolve_params(function_decl.params);
         if (function_decl.body is some body) {
             self.resolve_block(body);
         }
+        self.env.exit_scope();
         self.env.exit_scope();
     }
 
@@ -464,8 +535,11 @@ public struct ReferenceResolver {
         while (index < cases.len) {
             ast.AstNode case_node = self.state.file.get(self.state.file.child_at(cases, index));
             if (case_node.data is .switch_case(case_data)) {
+                self.env.enter_scope(.block_scope);
                 self.resolve_match_pattern_range(case_data.patterns);
-                self.resolve_expr(case_data.body);
+                self.define_match_pattern_binding_range(case_data.patterns);
+                self.resolve_stmt(case_data.body);
+                self.env.exit_scope();
             }
             index = index + 1;
         }
@@ -476,10 +550,23 @@ public struct ReferenceResolver {
         if (catch_node.data is .catch_clause(catch_clause)) {
             self.env.enter_scope(.block_scope);
             if (catch_clause.pattern is some pattern) {
-                self.define_binding_pattern(pattern);
+                self.resolve_catch_binding(pattern);
             }
             self.resolve_expr(catch_clause.body);
             self.env.exit_scope();
+        }
+    }
+
+    () resolve_catch_binding(ast.AstId binding_id) {
+        ast.AstNode binding = self.state.file.get(binding_id);
+        if (binding.data is .param(param)) {
+            self.resolve_type_ref(param.type_ref);
+            self.define_local_name(param.name, .local_def, .value_name);
+            return;
+        }
+        if (binding.data is .pattern(_)) {
+            self.resolve_match_pattern(binding_id);
+            self.define_match_pattern_bindings(binding_id);
         }
     }
 
@@ -592,13 +679,32 @@ public struct ReferenceResolver {
         if (pattern_node.data is .pattern(pattern_data)) {
             if (pattern_data.name is some name) {
                 if (pattern_data.payload.empty() && pattern_data.value == null) {
-                    self.define_local_name(name, .local_def, .value_name);
+                    self.define_match_binding_name(name, pattern_data.type_ref != null);
                 }
             }
             if (pattern_data.value is some value) {
                 self.define_match_pattern_bindings(value);
             }
             self.define_match_pattern_binding_range(pattern_data.payload);
+        }
+    }
+
+    () define_match_binding_name(ast.AstId name_id, Bool typed_binding) {
+        ast.AstNode name_node = self.state.file.get(name_id);
+        if (name_node.data is .name(_)) {
+            if (typed_binding) {
+                self.define_local_name(name_id, .local_def, .value_name);
+            }
+            return;
+        }
+        if (name_node.data is .path(path_data)) {
+            if (path_data.segments.len == 1) {
+                self.define_local_name(
+                    self.state.file.child_at(path_data.segments, 0),
+                    .local_def,
+                    .value_name
+                );
+            }
         }
     }
 
