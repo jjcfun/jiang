@@ -340,7 +340,7 @@ continue_stmt
 
 defer_stmt  <- "defer" (block / expr ";")
 
-guard_stmt  <- "guard" expr "else" block
+guard_stmt  <- "guard" expr_without_block "else" block
 
 // guard 的 else block 必须非空，且最后一条语句必须是
 // return、break、continue 或 throw。
@@ -359,9 +359,9 @@ assign_op   <- "=" / "+=" / "-=" / "*=" / "/=" / "%="
 
 expr_stmt   <- expr ";"
 
-while_stmt  <- "while" expr block
+while_stmt  <- "while" expr_without_block block
 
-for_stmt    <- "for" binding_pattern "in" expr block
+for_stmt    <- "for" binding_pattern "in" expr_without_block block
 
 catch_binding
             <- type name?
@@ -381,9 +381,21 @@ switch_pattern_list
 表达式按优先级从低到高定义：
 
 ```peg
-expr        <- range_expr
+expr        <- expr_with_block
+             / expr_without_block
+
+expr_with_block
+            <- block_expr
+             / struct_expr
+             / if_expr
+             / switch_expr
+             / try_catch_expr
+
+expr_without_block
+            <- range_expr
 
 range_expr  <- logic_or_expr ".." logic_or_expr
+             / logic_or_expr
 
 logic_or_expr
             <- logic_and_expr ("||" logic_and_expr)*
@@ -445,9 +457,12 @@ call_args   <- call_arg ("," call_arg)* ","?
 call_arg    <- (name ":")? expr
 ```
 
-`range_expr` 只表示 `logic_or_expr ".." logic_or_expr` 这种形式；
-普通 `logic_or_expr` 不归入 `range_expr`。AST 使用独立的 `RangeExpr` 节点，
-`..` 的优先级低于逻辑或，高于条件表达式。
+`range_expr` 表示 range 这一优先级层；只有 `logic_or_expr ".." logic_or_expr`
+这种形式会产生 `RangeExpr` AST，普通 `logic_or_expr` 直接向下传递。
+`..` 的优先级低于逻辑或。
+`expr_without_block` 用于 `guard`、`while`、`for` 等后面紧跟 `block` 的位置。
+`paren_expr` 属于 `expr_without_block`，但括号内部重新进入完整 `expr`；
+因此 block/struct/if/switch/try-catch 等 `expr_with_block` 可以通过括号出现在这些位置。
 
 ## primary expression
 
@@ -458,15 +473,10 @@ primary_expr
              / "self"
              / "$"
              / path type_args "(" call_args? ")"
-             / path type_args? struct_lit
              / path
              / "." name
              / paren_expr
              / array_expr
-             / block
-             / if_expr
-             / switch_expr
-             / try_catch_expr
 
 paren_expr  <- "(" ")"
              / "(" expr "," expr ("," expr)* ","? ")"
@@ -477,11 +487,15 @@ array_expr  <- "[" (expr ("," expr)* ","?)? "]"
 struct_lit  <- "{" (field_init_expr ("," field_init_expr)* ","?)? "}"
 
 field_init_expr
-            <- (name ":")? expr
+            <- name ":" expr
 
-if_expr     <- "if" expr block "else" block
+block_expr  <- block
 
-switch_expr <- "switch" expr "{" switch_expr_case* "}"
+struct_expr <- path type_args? struct_lit
+
+if_expr     <- "if" expr_without_block block "else" block
+
+switch_expr <- "switch" expr_without_block "{" switch_expr_case* "}"
 
 switch_expr_case
             <- switch_pattern_list "=>" switch_expr_body

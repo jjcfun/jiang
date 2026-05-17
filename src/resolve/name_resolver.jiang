@@ -1,20 +1,17 @@
-// Declaration and reference name resolution.
+// 声明收集和引用解析编排。
 
 import context = "../context.jiang";
-import query = "../query/api.jiang";
 import qid = "../query/id.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
 import def = "./def.jiang";
-import scope = "./scope.jiang";
+import diagnostics = "./diagnostics.jiang";
+import reference_resolver = "./reference_resolver.jiang";
+import resolve_state = "./state.jiang";
 import store = "./store.jiang";
 
 public struct NameResolver {
-    query.QuerySystem& query;
-    ast.AstFile& file;
-    qid.ModuleId module_id;
-    qid.NamespaceId namespace_id;
-    scope.LexicalEnv env;
+    public resolve_state.FileResolveState state;
 
     public init(
         context.CompilerContext& ctx,
@@ -22,11 +19,7 @@ public struct NameResolver {
         qid.ModuleId module_id,
         qid.NamespaceId namespace_id
     ) {
-        self.query = ctx.query$.ref();
-        self.file = file;
-        self.module_id = module_id;
-        self.namespace_id = namespace_id;
-        self.env = scope.LexicalEnv();
+        self.state = resolve_state.FileResolveState(ctx, file, module_id, namespace_id);
     }
 
     public () resolve() {
@@ -44,17 +37,17 @@ public struct NameResolver {
     }
 
     public () resolve_references() {
-        self.env.enter_scope(.file_scope);
-        self.env.exit_scope();
+        reference_resolver.ReferenceResolver resolver = reference_resolver.ReferenceResolver(self.state$.ref());
+        resolver.resolve();
     }
 
     () for_each_top_level_item(TopLevelPass pass) {
-        guard self.file.root is some root_id else { return; }
-        ast.AstNode root = self.file.get(root_id);
+        guard self.state.file.root is some root_id else { return; }
+        ast.AstNode root = self.state.file.get(root_id);
         if (root.data is .root(root_data)) {
             Int! index = 0;
             while (index < root_data.items.len) {
-                ast.AstId item = self.file.child_at(root_data.items, index);
+                ast.AstId item = self.state.file.child_at(root_data.items, index);
                 self.visit_top_level_item(item, pass);
                 index = index + 1;
             }
@@ -62,14 +55,14 @@ public struct NameResolver {
     }
 
     () visit_top_level_item(ast.AstId item, TopLevelPass pass) {
-        ast.AstNode node = self.file.get(item);
+        ast.AstNode node = self.state.file.get(item);
         if (node.data is .top_level_decl(top_level)) {
             self.visit_top_level_decl(top_level, pass);
         }
     }
 
     () visit_top_level_decl(ast.TopLevelDeclData decl, TopLevelPass pass) {
-        ast.AstNode body = self.file.get(decl.body);
+        ast.AstNode body = self.state.file.get(decl.body);
         if (body.data is .import_decl(import_decl)) {
             if (pass == .collect_import) {
                 self.collect_import(import_decl, body.span);
@@ -140,19 +133,27 @@ public struct NameResolver {
         def.Visibility visibility,
         token.Span span
     ) {
-        if (self.name_symbol(name_id) is some symbol) {
-            qid.DefId def_id = self.query.defs.create(
-                kind,
-                domain,
-                visibility,
-                def.Name {symbol: symbol, span: self.file.get(name_id).span},
-                null,
-                self.module_id,
-                self.namespace_id,
-                span
-            );
-            self.query.resolve.bind_name(self.namespace_id, symbol, domain, def_id, span);
-            self.record_module_def(self.module_id, symbol, domain, visibility, def_id, span);
+        guard self.state.name_symbol(name_id) is some symbol else { return; }
+        token.Span name_span = self.state.file.get(name_id).span;
+        Bool! duplicate = false;
+        if (self.state.query.resolve.first_binding(self.state.namespace_id, symbol, domain) is some existing) {
+            duplicate = true;
+            self.add_duplicate_def_diagnostic(name_span, existing.span);
+        }
+        qid.DefId def_id = self.state.query.defs.create(
+            kind,
+            domain,
+            visibility,
+            def.Name {symbol: symbol, span: name_span},
+            null,
+            self.state.module_id,
+            self.state.namespace_id,
+            span
+        );
+        self.state.query.resolve.bind_name(self.state.namespace_id, symbol, domain, def_id, name_span);
+        self.state.resolved.set_name(name_id, def_id);
+        if (!duplicate) {
+            self.record_module_def(self.state.module_id, symbol, domain, visibility, def_id, span);
         }
     }
 
@@ -164,11 +165,11 @@ public struct NameResolver {
         qid.DefId def_id,
         token.Span span
     ) {
-        if (!self.query.resolve.modules.has(module_id)) {
+        if (!self.state.query.resolve.modules.has(module_id)) {
             return;
         }
         if (visibility == .public_visibility) {
-            self.query.resolve.add_export(
+            self.state.query.resolve.add_export(
                 module_id,
                 store.ExportRecord {
                     kind: self.export_kind(domain),
@@ -179,12 +180,12 @@ public struct NameResolver {
                 }
             );
         } else {
-            self.query.resolve.add_private_def(module_id, def_id);
+            self.state.query.resolve.add_private_def(module_id, def_id);
         }
     }
 
     () collect_import(ast.ImportData import_decl, token.Span span) {
-        if (!self.query.resolve.modules.has(self.module_id)) {
+        if (!self.state.query.resolve.modules.has(self.state.module_id)) {
             return;
         }
         store.ImportKind! import_kind = .package_import;
@@ -192,15 +193,15 @@ public struct NameResolver {
             import_kind = .file_import;
         }
         qid.SymbolId! path_symbol = qid.SymbolId(0);
-        if (self.name_symbol(import_decl.path) is some symbol) {
+        if (self.state.import_path_symbol(import_decl.path) is some symbol) {
             path_symbol = symbol;
         }
         qid.SymbolId?! alias_symbol = null;
         if (import_decl.alias_name is some alias_name) {
-            alias_symbol = self.name_symbol(alias_name);
+            alias_symbol = self.state.name_symbol(alias_name);
         }
-        self.query.resolve.add_import(
-            self.module_id,
+        self.state.query.resolve.add_import(
+            self.state.module_id,
             store.ImportRecord {
                 kind: import_kind,
                 span: span,
@@ -226,14 +227,13 @@ public struct NameResolver {
         return .value_export;
     }
 
-    qid.SymbolId? name_symbol(ast.AstId name_id) {
-        ast.AstNode node = self.file.get(name_id);
-        if (node.data is .name(name_data)) {
-            if (name_data.symbol_id > 0) {
-                return qid.SymbolId.from_index(name_data.symbol_id);
-            }
-        }
-        return null;
+    () add_duplicate_def_diagnostic(token.Span duplicate_span, token.Span first_span) {
+        diagnostics.add_duplicate_def(
+            self.state.diagnostics,
+            self.state.file.source_id,
+            duplicate_span,
+            first_span
+        );
     }
 
 }

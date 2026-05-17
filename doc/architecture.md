@@ -197,8 +197,8 @@ NameResolver {
 - `collect_imports`：扫描 top-level import，向 `ModuleRecord.imports` 写入 `ImportRecord`。
 - `collect_declarations`：扫描 top-level declaration，创建 `DefId`，绑定到当前 module namespace，
   并按 visibility 记录到 exports 或 private_defs。
-- `resolve_references`：目前还是骨架，只创建 file scope；后续应从这里开始做表达式/类型
-  引用查找。
+- `resolve_references`：遍历当前 file 的 declaration body，解析基础 type reference、
+  expression name、local binding 和 import alias path，并把结果写入单文件 `ResolvedFile`。
 
 `resolve_import_targets` 在 imports 收集后运行。当前规则很窄：
 

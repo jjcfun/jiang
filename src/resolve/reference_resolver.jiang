@@ -1,0 +1,755 @@
+// 单个文件内的引用解析。
+//
+// NameResolver 负责阶段编排和 top-level 声明收集；这里负责遍历声明 body、
+// 管理局部 scope，并把 name/path lookup 结果写入 ResolvedFile。
+
+import qid = "../query/id.jiang";
+import ast = "../syntax/ast.jiang";
+import token = "../syntax/token.jiang";
+import def = "./def.jiang";
+import diagnostics = "./diagnostics.jiang";
+import scope = "./scope.jiang";
+import resolve_state = "./state.jiang";
+import store = "./store.jiang";
+
+public struct ReferenceResolver {
+    resolve_state.FileResolveState& state;
+    scope.LexicalEnv env;
+
+    public init(resolve_state.FileResolveState& state) {
+        self.state = state;
+        self.env = scope.LexicalEnv();
+    }
+
+    public () resolve() {
+        self.env.enter_scope(.file_scope);
+        self.for_each_top_level_item();
+        self.env.exit_scope();
+    }
+
+    () for_each_top_level_item() {
+        guard self.state.file.root is some root_id else { return; }
+        ast.AstNode root = self.state.file.get(root_id);
+        if (root.data is .root(root_data)) {
+            Int! index = 0;
+            while (index < root_data.items.len) {
+                ast.AstId item = self.state.file.child_at(root_data.items, index);
+                self.visit_top_level_item(item);
+                index = index + 1;
+            }
+        }
+    }
+
+    () visit_top_level_item(ast.AstId item) {
+        ast.AstNode node = self.state.file.get(item);
+        if (node.data is .top_level_decl(top_level)) {
+            ast.AstNode body = self.state.file.get(top_level.body);
+            self.resolve_top_level_decl_body(body);
+        }
+    }
+
+    () resolve_top_level_decl_body(ast.AstNode body) {
+        if (body.data is .import_decl(_)) {
+            return;
+        }
+        if (body.data is .alias_decl(alias_decl)) {
+            self.resolve_type_ref(alias_decl.target);
+            return;
+        }
+        if (body.data is .global_decl(global_decl)) {
+            self.resolve_type_ref(global_decl.type_ref);
+            if (global_decl.initializer is some initializer) {
+                self.resolve_expr(initializer);
+            }
+            return;
+        }
+        if (body.data is .function_decl(function_decl)) {
+            self.resolve_function(function_decl);
+            return;
+        }
+        if (body.data is .nominal_decl(nominal)) {
+            self.resolve_nominal(nominal);
+            return;
+        }
+        if (body.data is .trait_decl(trait_decl)) {
+            self.resolve_trait(trait_decl);
+            return;
+        }
+        if (body.data is .extend_decl(extend_decl)) {
+            self.resolve_type_ref(extend_decl.target_type);
+            if (extend_decl.trait_path is some trait_path) {
+                self.resolve_path(trait_path, .type_name);
+            }
+            self.resolve_member_range(extend_decl.members);
+            return;
+        }
+    }
+
+    () resolve_nominal(ast.NominalData nominal) {
+        self.resolve_optional_generics(nominal.generics);
+        self.resolve_path_range(nominal.traits, .type_name);
+        self.resolve_member_range(nominal.members);
+    }
+
+    () resolve_trait(ast.TraitData trait_decl) {
+        self.resolve_optional_generics(trait_decl.generics);
+        self.resolve_path_range(trait_decl.parents, .type_name);
+        self.resolve_member_range(trait_decl.members);
+    }
+
+    () resolve_member_range(ast.AstRange members) {
+        Int! index = 0;
+        while (index < members.len) {
+            self.resolve_member_decl(self.state.file.child_at(members, index));
+            index = index + 1;
+        }
+    }
+
+    () resolve_member_decl(ast.AstId member_id) {
+        ast.AstNode member = self.state.file.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            ast.AstNode body = self.state.file.get(member_decl.body);
+            self.resolve_member_body(body);
+            return;
+        }
+        self.resolve_member_body(member);
+    }
+
+    () resolve_member_body(ast.AstNode body) {
+        if (body.data is .function_decl(function_decl)) {
+            self.resolve_function(function_decl);
+            return;
+        }
+        if (body.data is .field_decl(field_decl)) {
+            self.resolve_type_ref(field_decl.type_ref);
+            self.resolve_field_declarators(field_decl.fields);
+            return;
+        }
+        if (body.data is .enum_case(enum_case)) {
+            if (enum_case.value is some value) {
+                self.resolve_expr(value);
+            }
+            return;
+        }
+        if (body.data is .union_variant(variant)) {
+            if (variant.payload_type is some payload_type) {
+                self.resolve_type_ref(payload_type);
+            }
+            return;
+        }
+        if (body.data is .typed_union_variants(variants)) {
+            self.resolve_type_ref(variants.type_ref);
+            return;
+        }
+        if (body.data is .assoc_type(assoc_type)) {
+            if (assoc_type.value is some value) {
+                self.resolve_type_ref(value);
+            }
+            self.resolve_type_range(assoc_type.constraints);
+            return;
+        }
+    }
+
+    () resolve_field_declarators(ast.AstRange fields) {
+        Int! index = 0;
+        while (index < fields.len) {
+            ast.AstNode field = self.state.file.get(self.state.file.child_at(fields, index));
+            if (field.data is .field_declarator(field_decl)) {
+                if (field_decl.default_value is some default_value) {
+                    self.resolve_expr(default_value);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () resolve_function(ast.FunctionData function_decl) {
+        self.resolve_type_ref(function_decl.result_type);
+        self.resolve_optional_generics(function_decl.generics);
+        self.env.enter_scope(.function_scope);
+        self.resolve_params(function_decl.params);
+        if (function_decl.body is some body) {
+            self.resolve_block(body);
+        }
+        self.env.exit_scope();
+    }
+
+    () resolve_params(ast.AstRange params) {
+        Int! index = 0;
+        while (index < params.len) {
+            ast.AstId param_id = self.state.file.child_at(params, index);
+            ast.AstNode param = self.state.file.get(param_id);
+            if (param.data is .param(param_data)) {
+                self.resolve_type_ref(param_data.type_ref);
+                self.define_local_name(param_data.name, .parameter_def, .value_name);
+                if (param_data.default_value is some default_value) {
+                    self.resolve_expr(default_value);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () resolve_optional_generics(ast.AstId? generics) {
+        guard generics is some generic_id else { return; }
+        ast.AstNode generic_node = self.state.file.get(generic_id);
+        guard generic_node.data is .generic_params(generic_data) else { return; }
+
+        Int! index = 0;
+        while (index < generic_data.type_params.len) {
+            self.define_local_name(
+                self.state.file.child_at(generic_data.type_params, index),
+                .generic_param_def,
+                .type_name
+            );
+            index = index + 1;
+        }
+    }
+
+    () resolve_type_range(ast.AstRange range) {
+        Int! index = 0;
+        while (index < range.len) {
+            self.resolve_type_ref(self.state.file.child_at(range, index));
+            index = index + 1;
+        }
+    }
+
+    () resolve_path_range(ast.AstRange range, def.NameDomain domain) {
+        Int! index = 0;
+        while (index < range.len) {
+            self.resolve_path(self.state.file.child_at(range, index), domain);
+            index = index + 1;
+        }
+    }
+
+    () resolve_type_ref(ast.AstId type_id) {
+        ast.AstNode node = self.state.file.get(type_id);
+        if (node.data is .infer_type) { return; }
+        if (node.data is .unit_type) { return; }
+        if (node.data is .type_ref(type_data)) {
+            self.resolve_type_ref(type_data.base);
+            return;
+        }
+        if (node.data is .named_type(named_type)) {
+            self.resolve_path(named_type.path, .type_name);
+            self.resolve_type_range(named_type.args);
+            return;
+        }
+        if (node.data is .array_type(array_type)) {
+            self.resolve_type_ref(array_type.element);
+            return;
+        }
+        if (node.data is .errorable_type(errorable_type)) {
+            self.resolve_type_ref(errorable_type.value_type);
+            if (errorable_type.error_type is some error_type) {
+                self.resolve_type_ref(error_type);
+            }
+            return;
+        }
+        if (node.data is .function_type(function_type)) {
+            self.resolve_type_range(function_type.params);
+            self.resolve_type_ref(function_type.result);
+            return;
+        }
+        if (node.data is .tuple_type(items)) {
+            self.resolve_type_range(items);
+            return;
+        }
+        if (node.data is .path(_)) {
+            self.resolve_path(type_id, .type_name);
+            return;
+        }
+        if (node.data is .name(_)) {
+            self.resolve_path(type_id, .type_name);
+            return;
+        }
+    }
+
+    () resolve_stmt(ast.AstId stmt_id) {
+        ast.AstNode stmt = self.state.file.get(stmt_id);
+        if (stmt.data is .stmt(stmt_data)) {
+            self.resolve_expr(stmt_data.value);
+            return;
+        }
+        if (stmt.data is .defer_stmt(defer_stmt)) {
+            self.resolve_expr(defer_stmt.value);
+            return;
+        }
+        if (stmt.data is .let_stmt(let_stmt)) {
+            if (let_stmt.type_ref is some type_ref) {
+                self.resolve_type_ref(type_ref);
+            }
+            if (let_stmt.initializer is some initializer) {
+                self.resolve_expr(initializer);
+            }
+            self.define_local_name(let_stmt.name, .local_def, .value_name);
+            return;
+        }
+        if (stmt.data is .destructure_stmt(destructure)) {
+            self.resolve_expr(destructure.initializer);
+            self.define_binding_range(destructure.bindings);
+            return;
+        }
+        if (stmt.data is .assign_stmt(assign)) {
+            self.resolve_expr(assign.target);
+            self.resolve_expr(assign.value);
+            return;
+        }
+        if (stmt.data is .control_stmt(control_stmt)) {
+            if (control_stmt.value is some value) {
+                self.resolve_expr(value);
+            }
+            return;
+        }
+        if (stmt.data is .guard_stmt(guard_stmt)) {
+            self.resolve_guard_stmt(guard_stmt);
+            return;
+        }
+        self.resolve_expr(stmt_id);
+    }
+
+    () resolve_guard_stmt(ast.GuardData guard_stmt) {
+        ast.AstNode condition = self.state.file.get(guard_stmt.condition);
+        if (condition.data is .is_pattern(is_pattern)) {
+            self.resolve_expr(is_pattern.value);
+            self.resolve_match_pattern(is_pattern.pattern);
+            self.resolve_block(guard_stmt.else_body);
+            self.define_match_pattern_bindings(is_pattern.pattern);
+            return;
+        }
+        self.resolve_expr(guard_stmt.condition);
+        self.resolve_block(guard_stmt.else_body);
+    }
+
+    () resolve_expr(ast.AstId expr_id) {
+        ast.AstNode expr = self.state.file.get(expr_id);
+        if (expr.data is .literal(_)) { return; }
+        if (expr.data is .name_expr(name_expr)) {
+            self.resolve_path(name_expr.value, .value_name);
+            return;
+        }
+        if (expr.data is .unary(unary)) {
+            self.resolve_expr(unary.value);
+            return;
+        }
+        if (expr.data is .binary(binary)) {
+            self.resolve_expr(binary.left);
+            self.resolve_expr(binary.right);
+            return;
+        }
+        if (expr.data is .is_pattern(is_pattern)) {
+            self.resolve_expr(is_pattern.value);
+            self.resolve_match_pattern(is_pattern.pattern);
+            return;
+        }
+        if (expr.data is .range(range)) {
+            self.resolve_expr(range.start);
+            self.resolve_expr(range.end);
+            return;
+        }
+        if (expr.data is .call(call)) {
+            self.resolve_expr(call.callee);
+            self.resolve_type_range(call.type_args);
+            self.resolve_call_args(call.args);
+            return;
+        }
+        if (expr.data is .call_arg(call_arg)) {
+            self.resolve_expr(call_arg.value);
+            return;
+        }
+        if (expr.data is .field_expr(field)) {
+            self.resolve_expr(field.base);
+            return;
+        }
+        if (expr.data is .index_expr(index_expr)) {
+            self.resolve_expr(index_expr.base);
+            self.resolve_expr(index_expr.index);
+            return;
+        }
+        if (expr.data is .slice_expr(slice_expr)) {
+            self.resolve_expr(slice_expr.base);
+            if (slice_expr.start is some start) { self.resolve_expr(start); }
+            if (slice_expr.end is some end) { self.resolve_expr(end); }
+            return;
+        }
+        if (expr.data is .implicit_call(implicit_call)) {
+            self.resolve_expr(implicit_call.base);
+            self.resolve_implicit_args(implicit_call.args);
+            return;
+        }
+        if (expr.data is .type_implicit_call(implicit_call)) {
+            self.resolve_expr(implicit_call.base);
+            self.resolve_implicit_args(implicit_call.args);
+            return;
+        }
+        if (expr.data is .implicit_arg(arg)) {
+            self.resolve_implicit_arg(arg);
+            return;
+        }
+        if (expr.data is .cast_expr(cast_expr)) {
+            self.resolve_expr(cast_expr.value);
+            self.resolve_type_ref(cast_expr.type_ref);
+            return;
+        }
+        if (expr.data is .struct_literal(struct_literal)) {
+            if (struct_literal.type_ref is some type_ref) {
+                self.resolve_type_ref(type_ref);
+            }
+            self.resolve_type_range(struct_literal.type_args);
+            self.resolve_field_inits(struct_literal.fields);
+            return;
+        }
+        if (expr.data is .block(_)) {
+            self.resolve_block(expr_id);
+            return;
+        }
+        if (expr.data is .if_expr(if_expr)) {
+            self.resolve_expr(if_expr.condition);
+            self.resolve_expr(if_expr.then_body);
+            if (if_expr.else_body is some else_body) {
+                self.resolve_expr(else_body);
+            }
+            return;
+        }
+        if (expr.data is .loop_expr(loop_expr)) {
+            self.resolve_loop(loop_expr);
+            return;
+        }
+        if (expr.data is .switch_expr(switch_expr)) {
+            self.resolve_expr(switch_expr.value);
+            self.resolve_switch_cases(switch_expr.cases);
+            return;
+        }
+        if (expr.data is .catch_expr(catch_expr)) {
+            self.resolve_expr(catch_expr.value);
+            self.resolve_catch_clause(catch_expr.catch_clause);
+            return;
+        }
+        if (expr.data is .tuple_expr(items)) {
+            self.resolve_expr_range(items);
+            return;
+        }
+    }
+
+    () resolve_block(ast.AstId block_id) {
+        ast.AstNode block = self.state.file.get(block_id);
+        if (block.data is .block(block_data)) {
+            self.env.enter_scope(.block_scope);
+            Int! index = 0;
+            while (index < block_data.statements.len) {
+                self.resolve_stmt(self.state.file.child_at(block_data.statements, index));
+                index = index + 1;
+            }
+            self.env.exit_scope();
+        }
+    }
+
+    () resolve_loop(ast.LoopData loop_expr) {
+        if (loop_expr.condition is some condition) {
+            self.resolve_expr(condition);
+        }
+        if (loop_expr.iterable is some iterable) {
+            self.resolve_expr(iterable);
+        }
+        self.env.enter_scope(.loop_scope);
+        if (loop_expr.pattern is some pattern) {
+            self.define_binding_pattern(pattern);
+        }
+        self.resolve_block(loop_expr.body);
+        self.env.exit_scope();
+    }
+
+    () resolve_switch_cases(ast.AstRange cases) {
+        Int! index = 0;
+        while (index < cases.len) {
+            ast.AstNode case_node = self.state.file.get(self.state.file.child_at(cases, index));
+            if (case_node.data is .switch_case(case_data)) {
+                self.resolve_match_pattern_range(case_data.patterns);
+                self.resolve_expr(case_data.body);
+            }
+            index = index + 1;
+        }
+    }
+
+    () resolve_catch_clause(ast.AstId catch_id) {
+        ast.AstNode catch_node = self.state.file.get(catch_id);
+        if (catch_node.data is .catch_clause(catch_clause)) {
+            self.env.enter_scope(.block_scope);
+            if (catch_clause.pattern is some pattern) {
+                self.define_binding_pattern(pattern);
+            }
+            self.resolve_expr(catch_clause.body);
+            self.env.exit_scope();
+        }
+    }
+
+    () resolve_call_args(ast.AstRange args) {
+        Int! index = 0;
+        while (index < args.len) {
+            self.resolve_expr(self.state.file.child_at(args, index));
+            index = index + 1;
+        }
+    }
+
+    () resolve_implicit_args(ast.AstRange args) {
+        Int! index = 0;
+        while (index < args.len) {
+            ast.AstNode arg_node = self.state.file.get(self.state.file.child_at(args, index));
+            if (arg_node.data is .implicit_arg(arg)) {
+                self.resolve_implicit_arg(arg);
+            }
+            index = index + 1;
+        }
+    }
+
+    () resolve_implicit_arg(ast.ImplicitArgData arg) {
+        if (arg is .type_arg(type_arg)) {
+            self.resolve_type_ref(type_arg);
+            return;
+        }
+        if (arg is .value_arg(value_arg)) {
+            self.resolve_expr(value_arg);
+            return;
+        }
+    }
+
+    () resolve_field_inits(ast.AstRange fields) {
+        Int! index = 0;
+        while (index < fields.len) {
+            ast.AstNode field = self.state.file.get(self.state.file.child_at(fields, index));
+            if (field.data is .field_init(field_init)) {
+                self.resolve_expr(field_init.value);
+            }
+            index = index + 1;
+        }
+    }
+
+    () resolve_expr_range(ast.AstRange range) {
+        Int! index = 0;
+        while (index < range.len) {
+            self.resolve_expr(self.state.file.child_at(range, index));
+            index = index + 1;
+        }
+    }
+
+    () define_binding_range(ast.AstRange bindings) {
+        Int! index = 0;
+        while (index < bindings.len) {
+            self.define_binding_pattern(self.state.file.child_at(bindings, index));
+            index = index + 1;
+        }
+    }
+
+    () define_binding_pattern(ast.AstId pattern_id) {
+        ast.AstNode pattern_node = self.state.file.get(pattern_id);
+        if (pattern_node.data is .pattern(pattern_data)) {
+            if (pattern_data.type_ref is some type_ref) {
+                self.resolve_type_ref(type_ref);
+            }
+            if (pattern_data.name is some name) {
+                self.define_local_name(name, .local_def, .value_name);
+            }
+            self.define_binding_range(pattern_data.payload);
+            if (pattern_data.value is some value) {
+                self.resolve_expr(value);
+            }
+        }
+    }
+
+    () resolve_match_pattern_range(ast.AstRange patterns) {
+        Int! index = 0;
+        while (index < patterns.len) {
+            self.resolve_match_pattern(self.state.file.child_at(patterns, index));
+            index = index + 1;
+        }
+    }
+
+    () resolve_match_pattern(ast.AstId pattern_id) {
+        ast.AstNode pattern_node = self.state.file.get(pattern_id);
+        if (pattern_node.data is .pattern(pattern_data)) {
+            if (pattern_data.type_ref is some type_ref) {
+                self.resolve_type_ref(type_ref);
+            }
+            if (pattern_data.name is some name) {
+                self.resolve_pattern_name(name, pattern_data.payload);
+            }
+            if (pattern_data.value is some value) {
+                self.resolve_match_pattern(value);
+            }
+            self.resolve_match_pattern_range(pattern_data.payload);
+        }
+    }
+
+    () resolve_pattern_name(ast.AstId name_or_path, ast.AstRange payload) {
+        if (payload.empty()) {
+            return;
+        }
+        self.resolve_path(name_or_path, .type_name);
+    }
+
+    () define_match_pattern_bindings(ast.AstId pattern_id) {
+        ast.AstNode pattern_node = self.state.file.get(pattern_id);
+        if (pattern_node.data is .pattern(pattern_data)) {
+            if (pattern_data.name is some name) {
+                if (pattern_data.payload.empty() && pattern_data.value == null) {
+                    self.define_local_name(name, .local_def, .value_name);
+                }
+            }
+            if (pattern_data.value is some value) {
+                self.define_match_pattern_bindings(value);
+            }
+            self.define_match_pattern_binding_range(pattern_data.payload);
+        }
+    }
+
+    () define_match_pattern_binding_range(ast.AstRange patterns) {
+        Int! index = 0;
+        while (index < patterns.len) {
+            self.define_match_pattern_bindings(self.state.file.child_at(patterns, index));
+            index = index + 1;
+        }
+    }
+
+    () define_local_name(ast.AstId name_id, def.DefKind kind, def.NameDomain domain) {
+        if (self.state.name_symbol(name_id) is some symbol) {
+            qid.DefId def_id = self.state.query.defs.create(
+                kind,
+                domain,
+                .private_visibility,
+                def.Name {symbol: symbol, span: self.state.file.get(name_id).span},
+                null,
+                self.state.module_id,
+                self.state.namespace_id,
+                self.state.file.get(name_id).span
+            );
+            if (!self.env.define(symbol, domain, def_id, self.state.file.get(name_id).span)) {
+                self.add_diagnostic(self.state.file.get(name_id).span, "duplicate local definition", "duplicate_def");
+            }
+            self.state.resolved.set_name(name_id, def_id);
+        }
+    }
+
+    qid.DefId? resolve_path(ast.AstId path_id, def.NameDomain domain) {
+        ast.AstNode node = self.state.file.get(path_id);
+        if (node.data is .name(_)) {
+            return self.resolve_name_reference(path_id, domain);
+        }
+        if (node.data is .path(path_data)) {
+            if (path_data.segments.len == 1) {
+                return self.resolve_name_reference(self.state.file.child_at(path_data.segments, 0), domain);
+            }
+            if (path_data.segments.len >= 2) {
+                return self.resolve_qualified_path(path_id, path_data, domain);
+            }
+        }
+        return null;
+    }
+
+    qid.DefId? resolve_name_reference(ast.AstId name_id, def.NameDomain domain) {
+        if (self.state.name_symbol(name_id) is some symbol) {
+            if (self.env.lookup_def(symbol, domain) is some local_def) {
+                self.state.resolved.set_name(name_id, local_def);
+                return local_def;
+            }
+            if (
+                self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
+                is some binding
+            ) {
+                self.state.resolved.set_name(name_id, binding.def_id);
+                return binding.def_id;
+            }
+            self.add_unresolved_diagnostic(self.state.file.get(name_id).span, domain);
+        }
+        return null;
+    }
+
+    qid.DefId? resolve_qualified_path(ast.AstId path_id, ast.PathData path_data, def.NameDomain domain) {
+        ast.AstId first_id = self.state.file.child_at(path_data.segments, 0);
+        ast.AstId last_id = self.state.file.child_at(path_data.segments, path_data.segments.len - 1);
+        if (self.state.name_symbol(first_id) is some first_symbol) {
+            if (
+                self.state.query.resolve.lookup_visible_name(
+                    self.state.namespace_id,
+                    first_symbol,
+                    .namespace_name,
+                    true
+                ) is some namespace_binding
+            ) {
+                self.state.resolved.set_name(first_id, namespace_binding.def_id);
+                return self.resolve_import_member_path(path_id, last_id, namespace_binding.def_id, domain);
+            }
+        }
+        self.add_unresolved_diagnostic(self.state.file.get(first_id).span, .namespace_name);
+        return null;
+    }
+
+    qid.DefId? resolve_import_member_path(
+        ast.AstId path_id,
+        ast.AstId last_id,
+        qid.DefId namespace_def,
+        def.NameDomain domain
+    ) {
+        if (self.state.name_symbol(last_id) is some last_symbol) {
+            if (self.import_target_for_alias(namespace_def) is some target_module) {
+                store.ModuleRecord target = self.state.query.resolve.modules.get(target_module);
+                if (
+                    self.state.query.resolve.lookup_namespace(
+                        target.namespace_id,
+                        last_symbol,
+                        domain,
+                        false
+                    ) is some binding
+                ) {
+                    self.state.resolved.set_name(last_id, binding.def_id);
+                    self.state.resolved.set_name(path_id, binding.def_id);
+                    return binding.def_id;
+                }
+            }
+            self.add_unresolved_in_namespace_diagnostic(self.state.file.get(last_id).span, domain);
+        }
+        return null;
+    }
+
+    qid.ModuleId? import_target_for_alias(qid.DefId alias_def) {
+        store.ModuleRecord module = self.state.query.resolve.modules.get(self.state.module_id);
+        Int! index = 0;
+        while (index < module.imports.len()) {
+            store.ImportRecord import_record = module.imports.get(index);
+            if (import_record.alias_def is some candidate) {
+                if (candidate.to_index() == alias_def.to_index()) {
+                    return import_record.target_module;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    () add_diagnostic(token.Span span, UInt8[] message, UInt8[] code) {
+        diagnostics.add_error(
+            self.state.diagnostics,
+            self.state.file.source_id,
+            span,
+            message,
+            code
+        );
+    }
+
+    () add_unresolved_diagnostic(token.Span span, def.NameDomain domain) {
+        diagnostics.add_unresolved(
+            self.state.diagnostics,
+            self.state.file.source_id,
+            span,
+            domain
+        );
+    }
+
+    () add_unresolved_in_namespace_diagnostic(token.Span span, def.NameDomain domain) {
+        diagnostics.add_unresolved_in_namespace(
+            self.state.diagnostics,
+            self.state.file.source_id,
+            span,
+            domain
+        );
+    }
+}
