@@ -149,7 +149,44 @@ Bool function_matches_call_target(types.TypeTable& type_table, jir.JirModule& in
     return true;
 }
 
-jir.JirCallTargetRef resolve_jir_call_target(context.CompilerContext& ctx, list.ArrayList<codegen.ModuleInput> inputs, Int input_index, jir.JirExprId expr_id, jir.JirCallExpr^ call) {
+Bool function_matches_static_method_target(
+    types.TypeTable& type_table,
+    jir.JirModule& input,
+    jir.JirFunctionDecl^ decl,
+    interner.Symbol method_symbol,
+    jir.JirCallExpr^ call,
+    types.TypeId result_type
+) {
+    if (!method_symbol.valid()) { return false; }
+    if (!decl.static_flag) { return false; }
+    if (decl.name.symbol.id != method_symbol.id) { return false; }
+    if (decl.params.len() != call.args.len()) { return false; }
+    if (!decl.result_type.valid()) { return false; }
+    if (type_table.type_at(decl.result_type).kind == .type_param) { return false; }
+    if (!type_shape_matches_for_call(type_table, decl.result_type, result_type, 0)) { return false; }
+
+    Int! index = 0;
+    while (index < call.args.len()) {
+        jir.JirExprId arg_id = call.args[index];
+        if (!arg_id.valid()) { return false; }
+        if (arg_id.id >= input.expr_count()) { return false; }
+        jir.JirExpr arg = input.expr_at(arg_id);
+        if (!type_shape_matches_for_call(type_table, decl.params[index].type_id, arg.type_id, 0)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+jir.JirCallTargetRef resolve_jir_call_target(
+    context.CompilerContext& ctx,
+    list.ArrayList<codegen.ModuleInput> inputs,
+    Int input_index,
+    jir.JirExprId expr_id,
+    jir.JirCallExpr^ call,
+    types.TypeId expected_result_type
+) {
     if (call.target_decl_id.valid() && call.target_kind_id != type_check.resolved_callee_kind_id(type_check.ResolvedCalleeKind.trait_method)) {
         return resolve_decl_jir_call_target(ctx, call.target_decl_id);
     }
@@ -168,6 +205,11 @@ jir.JirCallTargetRef resolve_jir_call_target(context.CompilerContext& ctx, list.
             jir.JirExpr base = local_input.module.expr_at(field.base);
             method_receiver_type_id = base.type_id;
             method_symbol = field.name.symbol;
+        }
+        if (callee.body is .variant_expr(variant)) {
+            if (variant.path.segment_len() >= 2) {
+                method_symbol = variant.path.segments[variant.path.segment_len() - 1].symbol;
+            }
         }
     }
     if (method_receiver_type_id.valid() && method_symbol.valid()) {
@@ -192,6 +234,61 @@ jir.JirCallTargetRef resolve_jir_call_target(context.CompilerContext& ctx, list.
                 candidate_index = candidate_index + 1;
             }
             module_index = module_index + 1;
+        }
+    }
+    if (method_symbol.valid()) {
+        jir.JirExpr call_expr = local_input.module.expr_at(expr_id);
+        types.TypeId! result_type = call_expr.type_id;
+        if (result_type.valid()) {
+            types.TypeTable& type_table = ctx.types_ref();
+            types.TypeInfo result_info = type_table.type_at(result_type);
+            if (result_info.kind == .type_param) {
+                result_type = types.TypeId();
+            }
+        }
+        if (!result_type.valid() && expected_result_type.valid()) {
+            result_type = expected_result_type;
+        }
+        if (result_type.valid()) {
+            types.TypeTable& type_table = ctx.types_ref();
+            types.TypeInfo result_info = type_table.type_at(result_type);
+            if (result_info.kind == .type_param) {
+                result_type = types.TypeId();
+            }
+        }
+        if (!result_type.valid() && method_receiver_type_id.valid()) {
+            result_type = method_receiver_type_id;
+        }
+        jir.JirCallTargetRef! static_target = jir.JirCallTargetRef();
+        Int! static_target_count = 0;
+        Int! module_index = 0;
+        while (module_index < inputs.len()) {
+            codegen.ModuleInput& input = inputs.get(module_index);
+            Int! decl_index = 0;
+            while (decl_index < input.module.decl_count()) {
+                jir.JirDeclId decl_id = jir.JirDeclId(decl_index);
+                jir.JirDecl decl = input.module.decl_at(decl_id);
+                if (decl.body is .function_decl(function_decl)) {
+                    if (
+                        function_matches_static_method_target(
+                            ctx.types_ref(),
+                            local_input.module,
+                            function_decl,
+                            method_symbol,
+                            call,
+                            result_type
+                        )
+                    ) {
+                        static_target = jir.JirCallTargetRef(input.module.module_id, decl_id);
+                        static_target_count = static_target_count + 1;
+                    }
+                }
+                decl_index = decl_index + 1;
+            }
+            module_index = module_index + 1;
+        }
+        if (static_target_count == 1) {
+            return static_target;
         }
     }
     return jir.JirCallTargetRef();
@@ -258,8 +355,12 @@ jir.JirCallTargetRef resolve_jir_call_target(context.CompilerContext& ctx, list.
                 jir.JirExpr& expr = input.module.expr_ref_at(expr_id);
                 if (expr.body is .call_expr(call)) {
                     jir.JirCallTargetRef current_target = input.module.call_target_at(expr_id);
-                    if (!current_target.module_id.valid() || !current_target.jir_decl_id.valid()) {
-                        jir.JirCallTargetRef target = resolve_jir_call_target(ctx, inputs, input_index, expr_id, call);
+                    Bool! needs_target = !current_target.module_id.valid() || !current_target.jir_decl_id.valid();
+                    if (call.target_kind_id == type_check.resolved_callee_kind_id(type_check.ResolvedCalleeKind.trait_method)) {
+                        needs_target = true;
+                    }
+                    if (needs_target) {
+                        jir.JirCallTargetRef target = resolve_jir_call_target(ctx, inputs, input_index, expr_id, call, inst.type_id);
                         if (target.valid()) {
                             input.module.set_call_target(expr_id, target);
                             inst.target_ref = target;

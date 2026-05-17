@@ -320,6 +320,7 @@ run_sample optional_chain_index_minimal.jiang 40
 run_sample optional_chain_nested_pure_base_minimal.jiang 42
 run_sample optional_some_minimal.jiang 42
 run_sample optional_some_pattern_minimal.jiang 42
+run_sample guard_pattern_minimal.jiang 42
 run_sample optional_if_mutable_pattern_minimal.jiang 42
 run_sample optional_while_is_pattern_minimal.jiang 6
 run_sample optional_switch_pattern_minimal.jiang 42
@@ -331,6 +332,7 @@ run_sample generic_decl_minimal.jiang 42
 run_sample generic_func_call_minimal.jiang 42
 run_sample generic_func_infer_minimal.jiang 42
 run_sample generic_method_on_self_field_minimal.jiang 42
+run_sample generic_static_trait_method_minimal.jiang 42
 run_sample concept_generic_minimal.jiang 42
 run_sample concept_method_minimal.jiang 42
 run_sample where_amp_minimal.jiang 42
@@ -500,6 +502,7 @@ run_next_compile_fail invalid_coalesce_throw_outside_errorable.jiang
 run_next_compile_fail invalid_coalesce_throw_type_mismatch.jiang
 run_compile_fail invalid_coalesce_non_optional_exit.jiang
 run_compile_fail invalid_coalesce_exit_in_call_arg.jiang
+run_compile_fail invalid_guard_else_fallthrough.jiang
 run_compile_fail invalid_optional_no_narrow_then_null_branch.jiang
 run_compile_fail invalid_optional_chain_impure_base.jiang
 run_compile_fail invalid_optional_chain_impure_member_base.jiang
