@@ -165,9 +165,10 @@ ResolvedFile^ resolved = ModuleResolver.resolve_file(ctx, ast_file)
 resolve_file(ctx, ast_file)
   -> ensure_module(ast_file.source_id)
   -> create caller-owned ResolvedFile
-  -> NameResolver.collect_imports()
-  -> ModuleResolver.resolve_import_targets()
-  -> NameResolver.collect_declarations()
+  -> collect current module imports if needed
+  -> mark current module as collecting declarations
+  -> resolve import targets
+  -> collect current module declarations
   -> NameResolver.resolve_references()
   -> return ResolvedFile^
 ```
@@ -181,6 +182,16 @@ resolve_file(ctx, ast_file)
   imports、exports、private_defs，并创建新的 module namespace。旧 namespace 和旧 def
   暂时留在全局表中，但不再通过当前 module 可达；后续如需长期增量会再引入 GC 或
   版本化策略。
+
+`ModuleRecord.resolve_state` 记录 module 级 pass 进度：
+
+- `unresolved`：module shell 已存在，但 import/declaration 还未收集。
+- `collecting_imports` / `imports_collected`：正在或已经完成 import 收集。
+- `collecting_declarations` / `declarations_collected`：正在或已经完成 top-level declaration 收集。
+
+这些状态用于避免重复收集同一个 module。后续接入正式 source loader 后，也会用于 import cycle：
+如果 A 和 B 互相 import，A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归，
+等 A 当前 pass 自己完成。
 
 `NameResolver` 是单个 AST file/module 的 resolver。它不负责创建 module，也不负责跨文件
 加载；初始化时只拿当前 `module_id` 和 `namespace_id`：
@@ -208,15 +219,14 @@ NameResolver {
 `resolve_import_targets` 在 imports 收集后运行。当前规则很窄：
 
 - 对普通 `import dep`，取 import path symbol 的文本，构造 virtual `SourceKey` 查 `SourceStore`。
-- 找到 source 后调用 `ensure_module(source_id)`，允许目标 module 只先创建 shell。
+- 找到 source 后调用 `ensure_module(source_id)`，当前只保证目标 module shell 存在。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module namespace。
 - 对 string import，当前取字符串字面量的 symbol 文本，构造 file `SourceKey` 查 `SourceStore`。
 
 当前还未完成的部分：
 
 - import path 到 source/package 的正式解析规则。
-- import target 的递归 declaration pass 和 cycle 状态。
-- generic、member、pattern binding 的精确 scope。
+- import target 的递归 declaration pass 和 cycle 状态需要接入正式 source loader。
 - qualified path 的逐段 lookup。
 - declaration/member namespace。
 - duplicate definition、unresolved name、import not found 等诊断细节。
