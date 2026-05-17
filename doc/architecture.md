@@ -116,7 +116,7 @@ public trait Indexable {
   - 使用 `ModuleId`、`DefId`、`AstId`、`MirId`。
   - 使用 `LspServer`、`Utf8`、`Utf16`。
 - 文件名使用 lower snake case：`source_manager.jiang`、`type_check.jiang`。
-- 数据/模型文件优先使用名词：`token.jiang`、`type.jiang`、`artifact.jiang`。
+- 数据/模型文件优先使用名词：`token.jiang`、`type.jiang`。
 
 ### 后缀语义
 
@@ -152,22 +152,24 @@ public trait Indexable {
 
 ### 当前 Resolve 流程
 
-`resolve/module_resolver.jiang` 是当前 resolve 入口。外部调用 `resolve_file` 后拿到当前
-文件的 resolve 阶段产物：
+`resolve/module_resolver.jiang` 是当前 resolve 入口。外部创建 `ModuleResolver(ctx)`，调用
+`resolve_file` 后拿到当前文件的 resolve 阶段产物：
 
 ```jiang
-ResolvedFile^ resolved = ModuleResolver.resolve_file(ctx, ast_file)
+ModuleResolver! resolver = ModuleResolver(ctx)
+ResolvedFile^ resolved = resolver.resolve_file(ast_file)
 ```
 
 流程分为 module 级驱动和单文件名字解析两层：
 
 ```text
 resolve_file(ctx, ast_file)
+  -> parse_source has registered AstFile in QuerySystem.asts
   -> ensure_module(ast_file.source_id)
   -> create caller-owned ResolvedFile
   -> collect current module imports if needed
   -> mark current module as collecting declarations
-  -> resolve import targets
+  -> resolve import targets and collect registered target declarations
   -> collect current module declarations
   -> NameResolver.resolve_references()
   -> return ResolvedFile^
@@ -189,9 +191,8 @@ resolve_file(ctx, ast_file)
 - `collecting_imports` / `imports_collected`：正在或已经完成 import 收集。
 - `collecting_declarations` / `declarations_collected`：正在或已经完成 top-level declaration 收集。
 
-这些状态用于避免重复收集同一个 module。后续接入正式 source loader 后，也会用于 import cycle：
-如果 A 和 B 互相 import，A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归，
-等 A 当前 pass 自己完成。
+这些状态用于避免重复收集同一个 module，也用于 import cycle：如果 A 和 B 互相 import，
+A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归，等 A 当前 pass 自己完成。
 
 `NameResolver` 是单个 AST file/module 的 resolver。它不负责创建 module，也不负责跨文件
 加载；初始化时只拿当前 `module_id` 和 `namespace_id`：
@@ -219,14 +220,16 @@ NameResolver {
 `resolve_import_targets` 在 imports 收集后运行。当前规则很窄：
 
 - 对普通 `import dep`，取 import path symbol 的文本，构造 virtual `SourceKey` 查 `SourceStore`。
-- 找到 source 后调用 `ensure_module(source_id)`，当前只保证目标 module shell 存在。
+- 找到 source 后调用 `ensure_module(source_id)`。如果目标 source 的 `AstFile` 已经登记到
+  `QuerySystem.asts`，会递归推进目标 module 的 import/declaration pass。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module namespace。
 - 对 string import，当前取字符串字面量的 symbol 文本，构造 file `SourceKey` 查 `SourceStore`。
 
 当前还未完成的部分：
 
 - import path 到 source/package 的正式解析规则。
-- import target 的递归 declaration pass 和 cycle 状态需要接入正式 source loader。
+- import target 的自动加载还没有接正式 source loader；目前只调度 `QuerySystem.asts`
+  中已登记的 `AstFile`。
 - qualified path 的逐段 lookup。
 - declaration/member namespace。
 - duplicate definition、unresolved name、import not found 等诊断细节。
