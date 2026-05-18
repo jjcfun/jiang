@@ -461,6 +461,22 @@ Slice make_slice(Buffer& buffer);
 
 目标语言支持 `public import`，用于 re-export 被导入模块的 public API。
 
+### Alias
+
+stage2 当前只定义 type alias：
+
+```jiang
+alias Name = Type;
+```
+
+type alias 在 resolve 中绑定到 type namespace。右侧必须是类型语法，不能是普通 value
+表达式或 module namespace。
+
+通用 alias 暂不冻结。后续如果需要支持 value/module/member alias，仍使用
+`alias name = target;` 形式，再明确 target 推断、声明收集和循环依赖规则。
+
+在通用 alias 语义冻结前，`alias Name = Type;` 一律按 type alias 理解。
+
 未定事项：
 
 - ambiguous re-export 的诊断和恢复策略。
