@@ -661,7 +661,7 @@ public struct ReferenceResolver {
                 self.resolve_type_ref(type_ref);
             }
             if (pattern_data.name is some name) {
-                self.resolve_pattern_name(name, pattern_data.payload);
+                self.resolve_pattern_name(name, pattern_data.type_ref != null);
             }
             if (pattern_data.value is some value) {
                 self.resolve_match_pattern(value);
@@ -670,11 +670,104 @@ public struct ReferenceResolver {
         }
     }
 
-    () resolve_pattern_name(ast.AstId name_or_path, ast.AstRange payload) {
-        if (payload.empty()) {
+    // 解析 pattern 头部的名字/路径。
+    // 多段路径表示显式 variant pattern，例如 `Result.ok(value)`。
+    () resolve_pattern_name(ast.AstId name_or_path, Bool typed_binding) {
+        // typed binding 里的名字只是绑定目标，例如 `Int value`，不需要解析。
+        if (typed_binding) {
             return;
         }
-        self.resolve_path(name_or_path, .type_name);
+        if (self.pattern_path_segment_len(name_or_path) <= 1) {
+            // `ok => ...` 这种根 pattern 单名字暂不允许，避免和 variant 名歧义。
+            return;
+        }
+        self.resolve_variant_pattern(name_or_path);
+    }
+
+    qid.DefId? resolve_variant_pattern(ast.AstId name_or_path) {
+        ast.AstNode node = self.state.file.get(name_or_path);
+        guard node.data is .path(path_data) else { return null; }
+
+        // 显式 variant pattern 的第一段可以是本地 type，也可以是 import alias。
+        // 例如 `Result.ok` 从 Result 的 declaration namespace 开始；
+        // `dep.Result.ok` 从 dep 的 module namespace 开始。
+        ast.AstId first_id = self.state.file.child_at(path_data.segments, 0);
+        guard self.resolve_pattern_root_namespace(first_id) is some namespace_id else {
+            self.add_unresolved_diagnostic(first_id, .namespace_name);
+            return null;
+        }
+
+        qid.NamespaceId! current_namespace = namespace_id;
+        Int! index = 1;
+        while (index < path_data.segments.len) {
+            ast.AstId segment_id = self.state.file.child_at(path_data.segments, index);
+            Bool is_last = index + 1 == path_data.segments.len;
+            if (is_last) {
+                // 最后一段才是真正的 variant 名，必须落到 enum case 或 union variant。
+                return self.resolve_last_variant_segment(name_or_path, segment_id, current_namespace);
+            }
+
+            // 中间段只负责继续进入 namespace：import alias 或 declaration container。
+            // 例如 `dep.Result.ok` 中的 Result 会进入 Result 的 declaration namespace。
+            guard self.resolve_next_qualified_namespace(segment_id, current_namespace) is some next_namespace else {
+                return null;
+            }
+            current_namespace = next_namespace;
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.NamespaceId? resolve_pattern_root_namespace(ast.AstId segment_id) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
+            is some type_binding
+        ) {
+            guard self.check_accessible(type_binding.def_id, segment_id) else { return null; }
+            self.resolved.set_name(segment_id, type_binding.def_id);
+            return self.state.query.defs.get(type_binding.def_id).namespace_id;
+        }
+        return self.resolve_first_qualified_namespace(segment_id);
+    }
+
+    qid.DefId? resolve_last_variant_segment(
+        ast.AstId path_id,
+        ast.AstId segment_id,
+        qid.NamespaceId namespace_id
+    ) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        guard (
+            self.state.query.resolve.lookup_namespace(namespace_id, symbol, .member_name, false)
+            is some binding
+        ) else {
+            self.add_unresolved_in_namespace_diagnostic(segment_id, .member_name);
+            return null;
+        }
+        guard self.check_accessible(binding.def_id, segment_id) else { return null; }
+        def.DefKind kind = self.state.query.defs.get(binding.def_id).kind;
+        guard kind == .enum_case_def || kind == .union_variant_def else {
+            self.add_diagnostic(
+                self.state.file.get(segment_id).span,
+                "expected enum case or union variant",
+                "expected_variant_pattern"
+            );
+            return null;
+        }
+        self.resolved.set_name(segment_id, binding.def_id);
+        self.resolved.set_name(path_id, binding.def_id);
+        return binding.def_id;
+    }
+
+    Int pattern_path_segment_len(ast.AstId name_or_path) {
+        ast.AstNode node = self.state.file.get(name_or_path);
+        if (node.data is .path(path_data)) {
+            return path_data.segments.len;
+        }
+        if (node.data is .name(_)) {
+            return 1;
+        }
+        return 0;
     }
 
     () define_match_pattern_bindings(ast.AstId pattern_id) {
@@ -686,6 +779,8 @@ public struct ReferenceResolver {
                 }
             }
             if (pattern_data.value is some value) {
+                // `some item` 在 AST 中表现为 value 子 pattern；
+                // 这里递归后，item 会在 define 阶段作为 payload binding 进入作用域。
                 self.define_match_pattern_bindings(value);
             }
             self.define_match_pattern_binding_range(pattern_data.payload);
