@@ -191,6 +191,8 @@ resolve_file(ctx, ast_file)
   imports、exports、private_defs，并创建新的 module namespace。旧 namespace 和旧 def
   暂时留在全局表中，但不再通过当前 module 可达；后续如需长期增量会再引入 GC 或
   版本化策略。
+- `ResolvedFile` 带 `source_id + revision`，后续阶段使用前必须确认它仍匹配当前
+  `SourceStore`。旧 `ResolvedFile` 即使还持有旧 `AstId -> DefId` 映射，也不能进入 sema/HIR。
 
 `ModuleRecord.resolve_state` 记录 module 级 pass 进度：
 
