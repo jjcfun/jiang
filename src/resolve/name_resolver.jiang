@@ -77,23 +77,29 @@ public struct NameResolver {
 
         def.Visibility visibility = self.decl_visibility(decl.modifiers);
         if (body.data is .nominal_decl(nominal)) {
-            self.define_top_level_name(
+            if (self.define_top_level_name(
                 nominal.name,
                 .type_def,
                 .type_name,
                 visibility,
-                body.span
-            );
+                body.span,
+                true
+            ) is some owner_def) {
+                self.collect_member_declarations(owner_def, nominal.members);
+            }
             return;
         }
         if (body.data is .trait_decl(trait_decl)) {
-            self.define_top_level_name(
+            if (self.define_top_level_name(
                 trait_decl.name,
                 .trait_def,
                 .type_name,
                 visibility,
-                body.span
-            );
+                body.span,
+                true
+            ) is some owner_def) {
+                self.collect_member_declarations(owner_def, trait_decl.members);
+            }
             return;
         }
         if (body.data is .alias_decl(alias_decl)) {
@@ -102,7 +108,8 @@ public struct NameResolver {
                 .type_def,
                 .type_name,
                 visibility,
-                body.span
+                body.span,
+                false
             );
             return;
         }
@@ -112,7 +119,8 @@ public struct NameResolver {
                 .function_def,
                 .value_name,
                 visibility,
-                body.span
+                body.span,
+                false
             );
             return;
         }
@@ -122,25 +130,42 @@ public struct NameResolver {
                 .global_def,
                 .value_name,
                 visibility,
-                body.span
+                body.span,
+                false
             );
             return;
         }
     }
 
-    () define_top_level_name(
+    // 定义模块顶层名字，并按需要给该定义创建 declaration namespace。
+    //
+    // struct/enum/union/trait 这种 declaration container 后续可以被
+    // `dep.Type.member` 继续访问，所以需要自己的 namespace；alias/function/global
+    // 只绑定在模块 namespace 中即可。
+    qid.DefId? define_top_level_name(
         ast.AstId name_id,
         def.DefKind kind,
         def.NameDomain domain,
         def.Visibility visibility,
-        token.Span span
+        token.Span span,
+        Bool owns_namespace
     ) {
-        guard self.state.name_symbol(name_id) is some symbol else { return; }
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
         token.Span name_span = self.state.file.get(name_id).span;
         Bool! duplicate = false;
         if (self.state.query.resolve.first_binding(self.state.namespace_id, symbol, domain) is some existing) {
             duplicate = true;
             self.add_duplicate_def_diagnostic(name_span, existing.span);
+        }
+        qid.NamespaceId! def_namespace = self.state.namespace_id;
+        if (owns_namespace) {
+            def_namespace = self.state.query.resolve.create_namespace(
+                .declaration_namespace,
+                self.state.namespace_id,
+                null,
+                self.state.module_id,
+                span
+            );
         }
         qid.DefId def_id = self.state.query.defs.create(
             kind,
@@ -149,7 +174,7 @@ public struct NameResolver {
             def.Name {symbol: symbol, span: name_span},
             null,
             self.state.module_id,
-            self.state.namespace_id,
+            def_namespace,
             span
         );
         self.state.query.resolve.bind_name(self.state.namespace_id, symbol, domain, def_id, name_span);
@@ -158,6 +183,124 @@ public struct NameResolver {
         }
         if (!duplicate) {
             self.record_module_def(self.state.module_id, symbol, domain, visibility, def_id, span);
+        }
+        return def_id;
+    }
+
+    // 收集 declaration container 内部的 member 声明。
+    //
+    // 这里仍然只做声明收集，不解析 member body；body traversal 留给
+    // ReferenceResolver。收集出的 member def 会绑定到 owner def 的 namespace，
+    // 供 qualified path lookup 使用。
+    () collect_member_declarations(qid.DefId owner_def, ast.AstRange members) {
+        Int! index = 0;
+        while (index < members.len) {
+            ast.AstId member_id = self.state.file.child_at(members, index);
+            ast.AstNode member = self.state.file.get(member_id);
+            if (member.data is .member_decl(member_decl)) {
+                ast.AstNode body = self.state.file.get(member_decl.body);
+                self.collect_member_body(owner_def, body, self.member_visibility(member_decl.modifiers));
+            } else {
+                self.collect_member_body(owner_def, member, .private_visibility);
+            }
+            index = index + 1;
+        }
+    }
+
+    // 按具体 member AST 形态创建对应 def：
+    // - field -> member_name
+    // - enum case / union variant -> member_name
+    // - associated type -> type_name
+    // - function member -> value_name
+    //
+    // function member 先作为 value_name 进入 owner namespace；后续 method lookup
+    // 需要 receiver/trait 规则时，再细化专门的 method table。
+    () collect_member_body(qid.DefId owner_def, ast.AstNode body, def.Visibility visibility) {
+        if (body.data is .function_decl(function_decl)) {
+            self.define_member_name(owner_def, function_decl.name, .function_def, .value_name, visibility, body.span);
+            return;
+        }
+        if (body.data is .field_decl(field_decl)) {
+            Int! index = 0;
+            while (index < field_decl.fields.len) {
+                ast.AstId field_id = self.state.file.child_at(field_decl.fields, index);
+                ast.AstNode field = self.state.file.get(field_id);
+                guard field.data is .field_declarator(field_data) else {
+                    index = index + 1;
+                    continue;
+                }
+                self.define_member_name(
+                    owner_def,
+                    field_data.name,
+                    .field_def,
+                    .member_name,
+                    visibility,
+                    field.span
+                );
+                index = index + 1;
+            }
+            return;
+        }
+        if (body.data is .enum_case(enum_case)) {
+            self.define_member_name(owner_def, enum_case.name, .enum_case_def, .member_name, visibility, body.span);
+            return;
+        }
+        if (body.data is .union_variant(variant)) {
+            self.define_member_name(owner_def, variant.name, .union_variant_def, .member_name, visibility, body.span);
+            return;
+        }
+        if (body.data is .typed_union_variants(variants)) {
+            Int! index = 0;
+            while (index < variants.names.len) {
+                ast.AstId name = self.state.file.child_at(variants.names, index);
+                self.define_member_name(owner_def, name, .union_variant_def, .member_name, visibility, body.span);
+                index = index + 1;
+            }
+            return;
+        }
+        if (body.data is .assoc_type(assoc_type)) {
+            self.define_member_name(
+                owner_def,
+                assoc_type.name,
+                .associated_type_def,
+                .type_name,
+                visibility,
+                body.span
+            );
+        }
+    }
+
+    // 在 owner declaration namespace 中定义一个 member。
+    //
+    // member 的 owner_def 指向所属 type/trait def；namespace_id 使用 owner 的
+    // namespace_id，这样 `dep.Type.member` 可以从 Type 的 namespace 继续查找。
+    () define_member_name(
+        qid.DefId owner_def,
+        ast.AstId name_id,
+        def.DefKind kind,
+        def.NameDomain domain,
+        def.Visibility visibility,
+        token.Span span
+    ) {
+        guard self.state.name_symbol(name_id) is some symbol else { return; }
+        def.DefRecord owner = self.state.query.defs.get(owner_def);
+        token.Span name_span = self.state.file.get(name_id).span;
+        if (self.state.query.resolve.first_binding(owner.namespace_id, symbol, domain) is some existing) {
+            self.add_duplicate_def_diagnostic(name_span, existing.span);
+        }
+        qid.DefId def_id = self.state.query.defs.create(
+            kind,
+            domain,
+            visibility,
+            def.Name {symbol: symbol, span: name_span},
+            owner_def,
+            self.state.module_id,
+            owner.namespace_id,
+            span
+        );
+        self.state.query.resolve.bind_name(owner.namespace_id, symbol, domain, def_id, name_span);
+        if (self.resolved is some resolved) {
+            resolved.set_name(name_id, def_id);
         }
     }
 
@@ -218,6 +361,13 @@ public struct NameResolver {
     }
 
     def.Visibility decl_visibility(ast.DeclModifiers modifiers) {
+        if (modifiers.public_flag) {
+            return .public_visibility;
+        }
+        return .private_visibility;
+    }
+
+    def.Visibility member_visibility(ast.MemberModifiers modifiers) {
         if (modifiers.public_flag) {
             return .public_visibility;
         }

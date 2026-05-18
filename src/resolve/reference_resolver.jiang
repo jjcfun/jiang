@@ -773,54 +773,149 @@ public struct ReferenceResolver {
     }
 
     qid.DefId? resolve_qualified_path(ast.AstId path_id, ast.PathData path_data, def.NameDomain domain) {
+        // qualified path 的第一段必须先解析成 namespace alias。
+        // 当前可进入的 namespace alias 主要来自 import：`dep.User` 中的 `dep`。
         ast.AstId first_id = self.state.file.child_at(path_data.segments, 0);
-        ast.AstId last_id = self.state.file.child_at(path_data.segments, path_data.segments.len - 1);
-        if (self.state.name_symbol(first_id) is some first_symbol) {
-            if (
-                self.state.query.resolve.lookup_visible_name(
-                    self.state.namespace_id,
-                    first_symbol,
-                    .namespace_name,
-                    true
-                ) is some namespace_binding
-            ) {
-                self.resolved.set_name(first_id, namespace_binding.def_id);
-                return self.resolve_import_member_path(path_id, last_id, namespace_binding.def_id, domain);
-            }
+        if (self.resolve_first_qualified_namespace(first_id) is some namespace_id) {
+            return self.resolve_qualified_segments(path_id, path_data, 1, namespace_id, domain);
         }
         self.add_unresolved_diagnostic(self.state.file.get(first_id).span, .namespace_name);
         return null;
     }
 
-    qid.DefId? resolve_import_member_path(
+    qid.NamespaceId? resolve_first_qualified_namespace(ast.AstId segment_id) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        guard (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, .namespace_name, true)
+            is some binding
+        ) else {
+            return null;
+        }
+        self.resolved.set_name(segment_id, binding.def_id);
+        guard self.import_target_for_alias(binding.def_id) is some target_module else { return null; }
+        return self.state.query.resolve.modules.get(target_module).namespace_id;
+    }
+
+    // 从已经确定的 namespace 开始，逐段解析剩余 path。
+    //
+    // 例子：`mid.leaf.answer`
+    // - `mid` 已在 resolve_qualified_path 中解析成 module namespace
+    // - `leaf` 继续解析成 import alias，并切换到 leaf module namespace
+    // - `answer` 作为最后一段按调用方要求的 domain lookup
+    //
+    // 例子：`dep.User.id`
+    // - `User` 作为中间段无法按 namespace_name 命中时，会按 type_name 找到 container
+    // - `id` 作为最后一段 value lookup 失败后，会退到 member_name lookup
+    qid.DefId? resolve_qualified_segments(
         ast.AstId path_id,
-        ast.AstId last_id,
-        qid.DefId namespace_def,
+        ast.PathData path_data,
+        Int start_index,
+        qid.NamespaceId namespace_id,
         def.NameDomain domain
     ) {
-        if (self.state.name_symbol(last_id) is some last_symbol) {
-            if (self.import_target_for_alias(namespace_def) is some target_module) {
-                store.ModuleRecord target = self.state.query.resolve.modules.get(target_module);
-                if (
-                    self.state.query.resolve.lookup_namespace(
-                        target.namespace_id,
-                        last_symbol,
-                        domain,
-                        false
-                    ) is some binding
-                ) {
-                    self.resolved.set_name(last_id, binding.def_id);
-                    self.resolved.set_name(path_id, binding.def_id);
-                    return binding.def_id;
-                }
+        qid.NamespaceId! current_namespace = namespace_id;
+        Int! index = start_index;
+        while (index < path_data.segments.len) {
+            ast.AstId segment_id = self.state.file.child_at(path_data.segments, index);
+            Bool is_last = index + 1 == path_data.segments.len;
+            if (is_last) {
+                return self.resolve_last_qualified_segment(path_id, segment_id, current_namespace, domain);
             }
-            self.add_unresolved_in_namespace_diagnostic(self.state.file.get(last_id).span, domain);
+            if (
+                self.resolve_next_qualified_namespace(segment_id, current_namespace)
+                is some next_namespace
+            ) {
+                current_namespace = next_namespace;
+            } else {
+                return null;
+            }
+            index = index + 1;
         }
         return null;
     }
 
+    qid.NamespaceId? resolve_next_qualified_namespace(
+        ast.AstId segment_id,
+        qid.NamespaceId namespace_id
+    ) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_namespace(namespace_id, symbol, .namespace_name, false)
+            is some binding
+        ) {
+            return self.resolve_import_alias_segment(segment_id, binding.def_id);
+        }
+        if (self.resolve_container_segment(segment_id, namespace_id) is some next_namespace) {
+            return next_namespace;
+        }
+        self.add_unresolved_in_namespace_diagnostic(self.state.file.get(segment_id).span, .namespace_name);
+        return null;
+    }
+
+    qid.NamespaceId? resolve_import_alias_segment(
+        ast.AstId segment_id,
+        qid.DefId def_id
+    ) {
+        self.resolved.set_name(segment_id, def_id);
+        guard self.import_target_for_alias(def_id) is some target_module else {
+            self.add_unresolved_diagnostic(self.state.file.get(segment_id).span, .namespace_name);
+            return null;
+        }
+        return self.state.query.resolve.modules.get(target_module).namespace_id;
+    }
+
+    qid.DefId? resolve_last_qualified_segment(
+        ast.AstId path_id,
+        ast.AstId segment_id,
+        qid.NamespaceId namespace_id,
+        def.NameDomain domain
+    ) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_namespace(namespace_id, symbol, domain, false)
+            is some binding
+        ) {
+            self.resolved.set_name(segment_id, binding.def_id);
+            self.resolved.set_name(path_id, binding.def_id);
+            return binding.def_id;
+        }
+        if (domain == .value_name) {
+            if (self.resolve_member_segment(segment_id, namespace_id) is some member_def) {
+                self.resolved.set_name(path_id, member_def);
+                return member_def;
+            }
+        }
+        self.add_unresolved_in_namespace_diagnostic(self.state.file.get(segment_id).span, domain);
+        return null;
+    }
+
+    // 中间段可以是 declaration container，例如 `dep.User.id` 中的 `User`。
+    // 命中 type def 后返回该 def 拥有的 declaration namespace，供后续 segment 使用。
+    qid.NamespaceId? resolve_container_segment(ast.AstId segment_id, qid.NamespaceId namespace_id) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        guard self.state.query.resolve.lookup_namespace(namespace_id, symbol, .type_name, false) is some binding else {
+            return null;
+        }
+        self.resolved.set_name(segment_id, binding.def_id);
+        return self.state.query.defs.get(binding.def_id).namespace_id;
+    }
+
+    // 最后一段在 value lookup 失败后允许退到 member lookup。
+    // 这让 `dep.User.id` 可以解析到 User namespace 中的 field/variant/member def。
+    qid.DefId? resolve_member_segment(ast.AstId segment_id, qid.NamespaceId namespace_id) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        guard self.state.query.resolve.lookup_namespace(namespace_id, symbol, .member_name, false) is some binding else {
+            return null;
+        }
+        self.resolved.set_name(segment_id, binding.def_id);
+        return binding.def_id;
+    }
+
+    // import alias def 本身不直接保存 target module。
+    // 这里根据 alias def 所属 module 回查该 module 的 imports，找到 alias 对应的 target。
     qid.ModuleId? import_target_for_alias(qid.DefId alias_def) {
-        store.ModuleRecord module = self.state.query.resolve.modules.get(self.state.module_id);
+        qid.ModuleId module_id = self.state.query.defs.get(alias_def).module_id;
+        store.ModuleRecord module = self.state.query.resolve.modules.get(module_id);
         Int! index = 0;
         while (index < module.imports.len()) {
             store.ImportRecord import_record = module.imports.get(index);
