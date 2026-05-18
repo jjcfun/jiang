@@ -447,8 +447,10 @@ Slice make_slice(Buffer& buffer);
 
 顶层声明包括：
 
-- `import "path";`
-- `public import "path";`
+- `import name;`
+- `import alias = "path.jiang";`
+- `public import name;`
+- `public import alias = "path.jiang";`
 - `alias Name = Type;`
 - global declaration: `Type name = expr;`
 - function declaration / definition
@@ -460,6 +462,28 @@ Slice make_slice(Buffer& buffer);
 - `extend`
 
 目标语言支持 `public import`，用于 re-export 被导入模块的 public API。
+
+### Import
+
+stage2 当前固定两种 import path：
+
+```jiang
+import dep;
+import dep = "foo/bar.jiang";
+```
+
+`import dep;` 中的 `dep` 是 module/package 名称，不是文件路径。它通过当前编译上下文中已登记
+的 module/package 名称解析；后续接入 package manifest 后，跨 package dependency 也走这条规则。
+
+`import dep = "foo/bar.jiang";` 中的字符串是显式文件路径。路径按 Zig 风格解析：相对路径以
+当前 import 所在源文件的目录为基准，绝对路径按原路径规范化。编译器只加载字面路径
+本身，不隐式补 `.jiang`，也不尝试目录入口 `mod.jiang`。
+
+如果当前 source 是 virtual/buffer，没有真实文件路径，相对 file import 暂按字符串本身规范化；
+后续如果需要 IDE buffer 的相对文件 import，需要给 virtual source 增加 base directory。
+
+import 只引入一个模块命名空间 alias，不把目标模块的声明平铺到当前 namespace。被导入模块
+的 public API 通过 `dep.Name` 访问。`public import` re-export 的也是这个模块命名空间 alias。
 
 ### Alias
 
@@ -813,10 +837,13 @@ if block is some _! dead {
 目标规则：
 
 - `import` 只导入当前模块使用，不做 re-export。
-- 普通 `import "path";` 会绑定一个模块名，默认模块名来自 import path 的文件名部分，例如 `import "utils/math.jiang";` 绑定模块名 `math`。
-- `import alias = "path";` 使用显式 alias 作为模块名。
+- `import dep;` 按 module/package 名称解析，并绑定模块命名空间 `dep`。
+- `import alias = "path.jiang";` 按当前文件目录相对路径解析，并绑定模块命名空间 `alias`。
+- file import 必须显式写出目标文件路径，不隐式补扩展名或目录入口。
 - 被导入模块的 public API 通过 `module.Name` 访问，不默认平铺到当前模块。
-- `public import` 导入当前模块使用，并将被导入模块作为当前模块 public API 中的一个模块命名空间重新导出。它不摊平被导入模块的声明；例如 `middle` 中 `public import "leaf";` 后，外部通过 `middle.leaf.Name` 访问，而不是 `middle.Name`。
+- `public import` 导入当前模块使用，并将被导入模块作为当前模块 public API 中的一个模块
+  命名空间重新导出。它不摊平被导入模块的声明；例如 `middle` 中 `public import leaf;` 后，
+  外部通过 `middle.leaf.Name` 访问，而不是 `middle.Name`。
 - `public` 标记声明对外可见。
 - 基本类型不是关键字，由名字解析绑定到内建声明。
 

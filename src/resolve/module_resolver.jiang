@@ -13,6 +13,7 @@ import syntax = "../syntax/api.jiang";
 import token = "../syntax/token.jiang";
 import def = "./def.jiang";
 import diagnostics = "./diagnostics.jiang";
+import import_path_resolver = "./import_path_resolver.jiang";
 import name_resolver = "./name_resolver.jiang";
 import result = "./result.jiang";
 import store = "./store.jiang";
@@ -20,10 +21,12 @@ import store = "./store.jiang";
 public struct ModuleResolver {
     context.CompilerContext& ctx;
     query.QuerySystem& query;
+    import_path_resolver.ImportPathResolver import_paths;
 
     public init(context.CompilerContext& ctx) {
         self.ctx = ctx;
         self.query = ctx.query$.ref();
+        self.import_paths = import_path_resolver.ImportPathResolver(self.query);
     }
 
     public result.ResolvedFile^ resolve_file(ast.AstFile& file) {
@@ -139,14 +142,23 @@ public struct ModuleResolver {
     }
 
     () resolve_import_targets(qid.ModuleId module_id) {
-        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
+        store.ModuleRecord module_info = self.query.resolve.modules.get(module_id);
         Int! index = 0;
-        while (index < module.imports.len()) {
-            store.ImportRecord import_record = module.imports.get(index);
+        while (index < module_info.imports.len()) {
+            // import 解析可能递归触发其他 module 创建，避免长期持有可能失效的引用。
+            store.ModuleRecord& module = self.query.resolve.modules.ref_at(module_id);
+            store.ImportRecord& import_record = module.imports.ref_at(index);
             if (import_record.alias_def == null) {
-                if (self.resolve_import_target(import_record) is some target_module) {
+                if (!self.import_paths.valid_import_path(import_record)) {
+                    self.add_invalid_import_path_diagnostic(module, import_record);
+                } else if (self.resolve_import_target(module_id, import_record) is some target_module) {
+                    // alias 可见后，后续 reference lookup 需要目标 module 的 top-level 声明
+                    // 已进入 namespace。
                     self.ensure_module_declarations_collected(target_module);
-                    qid.DefId alias_def = self.create_import_alias(module_id, module, import_record);
+
+                    store.ModuleRecord& updated_module = self.query.resolve.modules.ref_at(module_id);
+                    store.ImportRecord& updated_import = updated_module.imports.ref_at(index);
+                    qid.DefId alias_def = self.create_import_alias(module_id, updated_module, updated_import);
                     self.query.resolve.set_import_resolution(module_id, index, target_module, alias_def);
                 } else {
                     self.add_import_not_found_diagnostic(module, import_record);
@@ -158,8 +170,8 @@ public struct ModuleResolver {
 
     qid.DefId create_import_alias(
         qid.ModuleId module_id,
-        store.ModuleRecord module,
-        store.ImportRecord import_record
+        store.ModuleRecord& module,
+        store.ImportRecord& import_record
     ) {
         qid.SymbolId alias_symbol = self.import_alias_symbol(import_record);
         qid.DefId alias_def = self.query.defs.create(
@@ -190,25 +202,30 @@ public struct ModuleResolver {
         return alias_def;
     }
 
-    qid.SymbolId import_alias_symbol(store.ImportRecord import_record) {
+    qid.SymbolId import_alias_symbol(store.ImportRecord& import_record) {
         if (import_record.alias_symbol is some explicit_alias) {
             return explicit_alias;
         }
         return import_record.path_symbol;
     }
 
-    qid.ModuleId? resolve_import_target(store.ImportRecord import_record) {
-        guard import_record.path_symbol.to_index() > 0 else { return null; }
-        UInt8[] path = self.query.symbols.text(import_record.path_symbol);
-        source.SourceKey key = source.SourceKey(self.source_kind_for_import(import_record.kind), path);
-        source.SourceId?! source_id = self.query.sources.find(key);
+    qid.ModuleId? resolve_import_target(qid.ModuleId module_id, store.ImportRecord& import_record) {
+        source.SourceId?! source_id = self.import_paths.find_import_source(module_id, import_record);
         if (source_id == null && import_record.kind == .file_import) {
-            source_id = self.load_file_import(path);
+            source_id = self.load_file_import_target(module_id, import_record);
         }
         guard source_id is some target_source else { return null; }
         return self.ensure_module(target_source);
     }
 
+    source.SourceId? load_file_import_target(qid.ModuleId module_id, store.ImportRecord& import_record) {
+        UInt8[] import_path = self.query.symbols.text(import_record.path_symbol);
+        UInt8[] primary = self.import_paths.primary_file_import_path(module_id, import_path);
+        return self.load_file_import(primary);
+    }
+
+    // 磁盘加载只发生在 SourceStore 未命中时。
+    // 这里会把成功读取的文件注册成 source，并把 AST 缓存在 QuerySystem.asts。
     source.SourceId? load_file_import(UInt8[] path) {
         guard fs.read_all(path) is some bytes else { return null; }
         source.SourceId source_id = self.query.sources.intern_path(path, source.content_hash(bytes));
@@ -219,16 +236,22 @@ public struct ModuleResolver {
         return source_id;
     }
 
-    source.SourceKind source_kind_for_import(store.ImportKind kind) {
-        if (kind == .file_import) {
-            return .file;
-        }
-        return .virtual;
+    () add_invalid_import_path_diagnostic(
+        store.ModuleRecord& module,
+        store.ImportRecord& import_record
+    ) {
+        diagnostics.add_error(
+            self.ctx.diagnostics$.ref(),
+            module.source_id,
+            import_record.span,
+            "invalid import path",
+            "invalid_import_path"
+        );
     }
 
     () add_import_not_found_diagnostic(
-        store.ModuleRecord module,
-        store.ImportRecord import_record
+        store.ModuleRecord& module,
+        store.ImportRecord& import_record
     ) {
         diagnostics.add_error(
             self.ctx.diagnostics$.ref(),
