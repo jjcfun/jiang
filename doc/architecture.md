@@ -160,6 +160,10 @@ ModuleResolver! resolver = ModuleResolver(ctx)
 ResolvedFile^ resolved = resolver.resolve_file(ast_file)
 ```
 
+`pipeline.compile_path(ctx, input_path)` 是当前 source/syntax/resolve 的路径入口：如果
+`input_path` 可直接读取为文件，就按单文件编译；否则按 package 目录处理，读取
+`input_path/package.ini`，再编译 manifest 指定的 root source。
+
 流程分为 module 级驱动和单文件名字解析两层：
 
 ```text
@@ -177,8 +181,11 @@ resolve_file(ctx, ast_file)
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
 
-- 如果 `source_modules` 中没有这个 `SourceId`，创建 package/module/namespace/def，并写入
-  `modules` 和 `source_modules`。
+- 如果 `source_modules` 中没有这个 `SourceId`，先根据 source 文件路径向上查找
+  `package.ini`。找到 manifest 时创建或复用对应 package owner；找不到 manifest 或 source 是
+  virtual/buffer 时，复用默认 root package。
+- `PackageId` 表示 package owner，`ModuleId` 表示单个 source file module，`SourceId` 表示
+  输入源文件或虚拟文本；一个 package 可以拥有多个 module，一个 source 当前对应一个 module。
 - 如果已有 module 且 `source_revision` 未变化，直接复用原 `ModuleId`。
 - 如果 source revision 变化，保持 `ModuleId` 不变，调用 `reset_module` 清空该 module 的
   imports、exports、private_defs，并创建新的 module namespace。旧 namespace 和旧 def
@@ -217,22 +224,21 @@ NameResolver {
   expression name、local binding 和 import alias path，并把结果写入调用方持有的
   `ResolvedFile`。
 
-`resolve_import_targets` 在 imports 收集后运行。当前规则很窄：
+`resolve_import_targets` 在 imports 收集后运行：
 
-- 对普通 `import dep`，取 import path symbol 的文本，构造 virtual `SourceKey` 查 `SourceStore`。
+- 对普通 `import dep`，优先在当前 package 的 `[dependencies]` 中查找 `dep`，找到后读取依赖
+  package 的 manifest root 文件；未命中 dependency 时，再按已登记 virtual/module 名称查
+  `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`。如果目标 source 的 `AstFile` 已经登记到
   `QuerySystem.asts`，会递归推进目标 module 的 import/declaration pass。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module namespace。
-- 对 string import，当前取字符串字面量的 symbol 文本，构造 file `SourceKey` 查 `SourceStore`。
+- 对 string/file import，当前取字符串字面量的 symbol 文本，按当前源文件目录解析显式文件路径；
+  未命中 `SourceStore` 时从磁盘读取并解析。
 
 当前还未完成的部分：
 
-- import path 到 source/package 的正式解析规则。
-- import target 的自动加载还没有接正式 source loader；目前只调度 `QuerySystem.asts`
-  中已登记的 `AstFile`。
-- qualified path 的逐段 lookup。
-- declaration/member namespace。
-- duplicate definition、unresolved name、import not found 等诊断细节。
+- CLI 目录入口还没有接入 `package.ini` root。
+- package manifest 诊断还比较粗，只记录错误文本，没有 package.ini 的精确行列 span。
 - reset 后旧 namespace/def 的回收或版本化。
 
 ### 代码风格

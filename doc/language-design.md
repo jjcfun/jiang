@@ -485,6 +485,34 @@ import dep = "foo/bar.jiang";
 import 只引入一个模块命名空间 alias，不把目标模块的声明平铺到当前 namespace。被导入模块
 的 public API 通过 `dep.Name` 访问。`public import` re-export 的也是这个模块命名空间 alias。
 
+### Package
+
+目标语言支持把目录作为 package 入口。目录入口使用固定文件名 `package.ini` 描述 package：
+
+```ini
+[package]
+name = frontend
+root = src/main.jiang
+
+[dependencies]
+util = ../util_pkg
+```
+
+当前 manifest 只固定这些字段：
+
+- `[package].name`：package 名称。未写时默认取 package 目录名。
+- `[package].root`：package 入口源文件。未写时默认取 `<name>.jiang`。
+- `[dependencies]`：本地依赖表，key 是依赖 package alias，value 是依赖 package 路径。
+
+manifest 中的 `name` 和 dependency key 使用 Jiang lexer 的 identifier 规则，而不是 ASCII-only
+正则：ASCII 字母或 `_` 可作为首字符，ASCII 数字可作为后续字符，UTF-8 标识符字符也可作为
+首字符和后续字符。完整 Unicode XID 表后续可以替换 lexer 的底层判定，但 manifest 必须复用
+lexer 语义，不能另起一套名字规则。
+
+stage2 当前已经有 manifest parser，但 package/root 还没有接入完整编译入口；`ModuleResolver`
+暂时在一个 `QuerySystem` 内复用默认 root package。后续接入 manifest 后，`import dep;` 会优先
+按当前 package 的 dependency alias 解析到依赖 package root，再进入该 package 的 module namespace。
+
 ### Alias
 
 stage2 当前只定义 type alias：

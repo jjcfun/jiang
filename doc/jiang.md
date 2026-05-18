@@ -2086,7 +2086,8 @@ jiangc path/to/pkg -o pkg
 - `name` 未写时，默认取当前目录名
 - `root` 未写时，默认取 `<name>.jiang`
 - 若显式写了，则覆盖默认值
-- `name` 无论显式还是默认值，都必须满足 Jiang 标识符规则：`[A-Za-z_][A-Za-z0-9_]*`
+- `name` 无论显式还是默认值，都必须满足 Jiang lexer 的标识符规则：ASCII 字母或 `_`
+  可作为首字符，ASCII 数字可作为后续字符，UTF-8 标识符字符也可作为首字符和后续字符。
 
 例如：
 

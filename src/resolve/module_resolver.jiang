@@ -7,7 +7,9 @@ import context = "../context.jiang";
 import query = "../query/api.jiang";
 import qid = "../query/id.jiang";
 import source = "../source/source.jiang";
+import package_manifest = "../source/package_manifest.jiang";
 import fs = "../support/fs.jiang";
+import path = "../support/path.jiang";
 import string = "../support/string.jiang";
 import ast = "../syntax/ast.jiang";
 import syntax = "../syntax/api.jiang";
@@ -261,12 +263,31 @@ public struct ModuleResolver {
     }
 
     qid.ModuleId? resolve_import_target(qid.ModuleId module_id, store.ImportRecord& import_record) {
-        source.SourceId?! source_id = self.import_paths.find_import_source(module_id, import_record);
+        source.SourceId?! source_id = null;
+        if (import_record.kind == .package_import) {
+            source_id = self.load_package_import_target(module_id, import_record);
+        }
+        if (source_id == null) {
+            source_id = self.import_paths.find_import_source(module_id, import_record);
+        }
         if (source_id == null && import_record.kind == .file_import) {
             source_id = self.load_file_import_target(module_id, import_record);
         }
         guard source_id is some target_source else { return null; }
         return self.ensure_module(target_source);
+    }
+
+    source.SourceId? load_package_import_target(qid.ModuleId module_id, store.ImportRecord& import_record) {
+        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
+        guard self.query.resolve.package_dependency(module.package_id, import_record.path_symbol) is some dependency else {
+            return null;
+        }
+        UInt8[] dependency_dir = self.query.symbols.text(dependency.path_symbol);
+        package_manifest.PackageManifest manifest = package_manifest.read(dependency_dir);
+        if (!manifest.ok) {
+            return null;
+        }
+        return self.load_file_import(package_manifest.root_file_path(dependency_dir, manifest$.ref()));
     }
 
     source.SourceId? load_file_import_target(qid.ModuleId module_id, store.ImportRecord& import_record) {
@@ -316,10 +337,147 @@ public struct ModuleResolver {
     qid.ModuleId create_source_module(source.SourceId source_id, Int source_revision) {
         token.Span span = token.Span();
         source.SourceRecord source_record = self.query.sources.get(source_id);
-        qid.SymbolId package_symbol = self.query.symbols.intern("__main_package");
+        qid.PackageId package_id = self.ensure_package_for_source(source_id);
+        store.PackageRecord package_record = self.query.resolve.packages.get(package_id);
         qid.SymbolId module_symbol = self.query.symbols.intern(source_record.name());
         qid.ModuleId module_id = qid.ModuleId.from_index(self.query.resolve.modules.len());
 
+        qid.NamespaceId namespace_id = self.query.resolve.create_namespace(
+            .module_namespace,
+            package_record.namespace_id,
+            null,
+            module_id,
+            span
+        );
+        qid.DefId module_def = self.query.defs.create(
+            .module_def,
+            .namespace_name,
+            .public_visibility,
+            def.Name {symbol: module_symbol, span: span},
+            package_record.def_id,
+            module_id,
+            namespace_id,
+            span
+        );
+        qid.ModuleId created_module = self.query.resolve.create_module(
+            source_id,
+            source_revision,
+            module_def,
+            package_id,
+            module_symbol,
+            namespace_id
+        );
+        assert(created_module.to_index() == module_id.to_index());
+        self.query.resolve.add_module_to_package(package_id, created_module);
+
+        return created_module;
+    }
+
+    qid.PackageId ensure_root_package() {
+        if (self.query.resolve.root_package is some package_id) {
+            return package_id;
+        }
+        return self.create_root_package();
+    }
+
+    qid.PackageId ensure_package_for_source(source.SourceId source_id) {
+        source.SourceRecord source_record = self.query.sources.get(source_id);
+        if (source_record.key.kind != .file) {
+            return self.ensure_root_package();
+        }
+
+        UInt8[] package_dir = package_manifest.find_enclosing_dir(source_record.key.value);
+        if (package_dir.length == 0) {
+            return self.ensure_root_package();
+        }
+        return self.ensure_manifest_package(package_dir, source_id);
+    }
+
+    qid.PackageId ensure_manifest_package(UInt8[] package_dir, source.SourceId source_id) {
+        UInt8[] normalized_dir = path.normalize(package_dir);
+        qid.SymbolId dir_symbol = self.query.symbols.intern(normalized_dir);
+        if (self.query.resolve.package_for_dir(dir_symbol) is some package_id) {
+            return package_id;
+        }
+
+        package_manifest.PackageManifest manifest = package_manifest.read(normalized_dir);
+        if (!manifest.ok) {
+            self.add_package_manifest_diagnostic(source_id, manifest.error);
+            return self.ensure_root_package();
+        }
+        return self.create_manifest_package(normalized_dir, manifest$.ref());
+    }
+
+    qid.PackageId create_manifest_package(UInt8[] package_dir, package_manifest.PackageManifest& manifest) {
+        token.Span span = token.Span();
+        qid.SymbolId package_symbol = self.query.symbols.intern(manifest.name);
+        qid.SymbolId dir_symbol = self.query.symbols.intern(package_dir);
+        qid.SymbolId root_symbol = self.query.symbols.intern(package_manifest.root_file_path(package_dir, manifest));
+        qid.NamespaceId package_namespace = self.query.resolve.create_namespace(
+            .package_namespace,
+            null,
+            null,
+            qid.ModuleId(-1),
+            span
+        );
+        qid.DefId package_def = self.query.defs.create(
+            .package_def,
+            .namespace_name,
+            .public_visibility,
+            def.Name {symbol: package_symbol, span: span},
+            null,
+            qid.ModuleId(-1),
+            package_namespace,
+            span
+        );
+        qid.PackageId package_id = self.query.resolve.create_package(
+            package_def,
+            package_symbol,
+            dir_symbol,
+            root_symbol,
+            package_namespace
+        );
+        self.add_manifest_dependencies(package_id, package_dir, manifest);
+        if (self.query.resolve.root_package == null) {
+            self.query.resolve.set_root_package(package_id);
+        }
+        return package_id;
+    }
+
+    () add_manifest_dependencies(
+        qid.PackageId package_id,
+        UInt8[] package_dir,
+        package_manifest.PackageManifest& manifest
+    ) {
+        Int! index = 0;
+        while (index < manifest.dependencies.len()) {
+            package_manifest.PackageDependency dependency = manifest.dependencies.get(index);
+            UInt8[] dependency_dir = path.normalize(path.join(package_dir, dependency.path));
+            self.query.resolve.add_package_dependency(
+                package_id,
+                store.PackageDependencyRecord {
+                    alias_symbol: self.query.symbols.intern(dependency.name),
+                    path_symbol: self.query.symbols.intern(dependency_dir)
+                }
+            );
+            index = index + 1;
+        }
+    }
+
+    () add_package_manifest_diagnostic(source.SourceId source_id, UInt8[] message) {
+        diagnostics.add_error(
+            self.ctx.diagnostics$.ref(),
+            source_id,
+            token.Span(),
+            message,
+            "invalid_package_manifest"
+        );
+    }
+
+    // 没有真实 package.ini 的虚拟 source 仍挂到默认 root package。
+    qid.PackageId create_root_package() {
+        token.Span span = token.Span();
+        qid.SymbolId package_symbol = self.query.symbols.intern("__main_package");
         qid.NamespaceId package_namespace = self.query.resolve.create_namespace(
             .package_namespace,
             null,
@@ -341,37 +499,10 @@ public struct ModuleResolver {
             package_def,
             package_symbol,
             package_symbol,
+            package_symbol,
             package_namespace
         );
-
-        qid.NamespaceId namespace_id = self.query.resolve.create_namespace(
-            .module_namespace,
-            package_namespace,
-            null,
-            module_id,
-            span
-        );
-        qid.DefId module_def = self.query.defs.create(
-            .module_def,
-            .namespace_name,
-            .public_visibility,
-            def.Name {symbol: module_symbol, span: span},
-            package_def,
-            module_id,
-            namespace_id,
-            span
-        );
-        qid.ModuleId created_module = self.query.resolve.create_module(
-            source_id,
-            source_revision,
-            module_def,
-            package_id,
-            module_symbol,
-            namespace_id
-        );
-        assert(created_module.to_index() == module_id.to_index());
-        self.query.resolve.add_module_to_package(package_id, created_module);
-
-        return created_module;
+        self.query.resolve.set_root_package(package_id);
+        return package_id;
     }
 }
