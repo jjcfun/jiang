@@ -2,9 +2,12 @@
 
 import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
+import query = "../query/api.jiang";
 import qid = "../query/id.jiang";
+import def = "../resolve/def.jiang";
 import resolve_result = "../resolve/result.jiang";
 import source = "../source/source.jiang";
+import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
@@ -14,12 +17,14 @@ public struct TypedFile {
     public Int revision;
     public Bool! ok;
     public table.SideTable<ast.AstId, qid.TypeId> types;
+    public table.SideTable<qid.DefId, qid.TypeId> def_types;
 
     public init(source.SourceId source_id, Int revision, Bool ok) {
         self.source_id = source_id;
         self.revision = revision;
         self.ok = ok;
         self.types = table.SideTable<ast.AstId, qid.TypeId>();
+        self.def_types = table.SideTable<qid.DefId, qid.TypeId>();
     }
 
     public Bool valid_for_resolve(resolve_result.ResolvedFile& resolved) {
@@ -36,15 +41,16 @@ public struct TypedFile {
         }
         return null;
     }
-}
 
-public struct TypeCheckResult {
-    public TypedFile^ file;
-    public Bool ok;
+    public () bind_def_type(qid.DefId def_id, qid.TypeId type_id) {
+        self.def_types.set(def_id, type_id);
+    }
 
-    public init(TypedFile^ file, Bool ok) {
-        self.file = file;
-        self.ok = ok;
+    public qid.TypeId? type_for_def(qid.DefId def_id) {
+        if (self.def_types.has(def_id)) {
+            return self.def_types.get(def_id);
+        }
+        return null;
     }
 
     public Bool has_errors() {
@@ -53,30 +59,317 @@ public struct TypeCheckResult {
 }
 
 struct TypeChecker {
-    context.CompilerContext& ctx;
+    query.QuerySystem^ queries;
     ast.AstFile& file;
     resolve_result.ResolvedFile& resolved;
-    TypedFile& typed;
+    TypedFile^ typed;
 
     public init(
         context.CompilerContext& ctx,
         ast.AstFile& file,
         resolve_result.ResolvedFile& resolved,
-        TypedFile& typed
+        TypedFile^ typed
     ) {
-        self.ctx = ctx;
+        self.queries = ctx.query;
         self.file = file;
         self.resolved = resolved;
         self.typed = typed;
     }
 
     public Bool check() {
-        // 这里先只建立 type check 的文件级入口。具体声明和表达式检查会逐步填入。
+        self.check_declaration_signatures();
         return true;
+    }
+
+    () check_declaration_signatures() {
+        if (self.file.root is some root_id) {
+            ast.AstNode root = self.file.get(root_id);
+            if (root.data is .root(root_data)) {
+                Int! index = 0;
+                while (index < root_data.items.len) {
+                    self.check_top_level_item(self.file.child_at(root_data.items, index));
+                    index = index + 1;
+                }
+            }
+        }
+    }
+
+    () check_top_level_item(ast.AstId item_id) {
+        ast.AstNode item = self.file.get(item_id);
+        if (item.data is .top_level_decl(top_level)) {
+            self.check_top_level_body(top_level.body);
+        }
+    }
+
+    () check_top_level_body(ast.AstId body_id) {
+        ast.AstNode body = self.file.get(body_id);
+        if (body.data is .alias_decl(alias_decl)) {
+            if (self.resolved.name(alias_decl.name) is some alias_def) {
+                self.resolve_alias_type(alias_def);
+            } else {
+                self.check_type_ref(alias_decl.target);
+            }
+            return;
+        }
+        if (body.data is .global_decl(global_decl)) {
+            qid.TypeId value_type = self.check_type_ref(global_decl.type_ref);
+            if (self.resolved.name(global_decl.name) is some global_def) {
+                self.typed.bind_def_type(global_def, value_type);
+            }
+            return;
+        }
+        if (body.data is .function_decl(function_decl)) {
+            self.check_function_decl(function_decl, body.span);
+            return;
+        }
+        if (body.data is .nominal_decl(nominal)) {
+            self.check_nominal_decl(nominal, body.span);
+            return;
+        }
+    }
+
+    () check_nominal_decl(ast.NominalData nominal, token.Span span) {
+        guard self.resolved.name(nominal.name) is some owner_def else { return; }
+        qid.TypeId owner_type = self.queries.types.named_type(owner_def, span);
+        self.typed.bind_def_type(owner_def, owner_type);
+        self.typed.set_type(nominal.name, owner_type);
+
+        Int! index = 0;
+        while (index < nominal.members.len) {
+            self.check_member_decl(self.file.child_at(nominal.members, index), owner_type);
+            index = index + 1;
+        }
+    }
+
+    () check_member_decl(ast.AstId member_id, qid.TypeId owner_type) {
+        ast.AstNode member = self.file.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            self.check_member_body(member_decl.body, owner_type);
+        } else {
+            self.check_member_body(member_id, owner_type);
+        }
+    }
+
+    () check_member_body(ast.AstId body_id, qid.TypeId owner_type) {
+        ast.AstNode body = self.file.get(body_id);
+        if (body.data is .field_decl(field_decl)) {
+            self.check_field_decl(field_decl);
+            return;
+        }
+        if (body.data is .function_decl(function_decl)) {
+            self.check_function_decl(function_decl, body.span);
+            return;
+        }
+        if (body.data is .enum_case(enum_case)) {
+            if (self.resolved.name(enum_case.name) is some case_def) {
+                self.typed.bind_def_type(case_def, owner_type);
+            }
+            return;
+        }
+        if (body.data is .union_variant(variant)) {
+            qid.TypeId! variant_type = owner_type;
+            if (variant.payload_type is some payload_type) {
+                qid.TypeId payload = self.check_type_ref(payload_type);
+                variant_type = self.single_param_function_type(payload, owner_type, body.span);
+            }
+            if (self.resolved.name(variant.name) is some variant_def) {
+                self.typed.bind_def_type(variant_def, variant_type);
+            }
+            return;
+        }
+        if (body.data is .typed_union_variants(variants)) {
+            qid.TypeId payload = self.check_type_ref(variants.type_ref);
+            qid.TypeId variant_type = self.single_param_function_type(payload, owner_type, body.span);
+            Int! index = 0;
+            while (index < variants.names.len) {
+                ast.AstId name_id = self.file.child_at(variants.names, index);
+                if (self.resolved.name(name_id) is some variant_def) {
+                    self.typed.bind_def_type(variant_def, variant_type);
+                }
+                index = index + 1;
+            }
+            return;
+        }
+        if (body.data is .assoc_type(assoc_type)) {
+            self.check_assoc_type(assoc_type);
+        }
+    }
+
+    () check_assoc_type(ast.AssocTypeData assoc_type) {
+        guard assoc_type.value is some value else { return; }
+        guard self.resolved.name(assoc_type.name) is some assoc_def else { return; }
+        self.typed.bind_def_type(assoc_def, self.check_type_ref(value));
+    }
+
+    () check_field_decl(ast.FieldData field_decl) {
+        qid.TypeId field_type = self.check_type_ref(field_decl.type_ref);
+        Int! index = 0;
+        while (index < field_decl.fields.len) {
+            self.bind_field_declarator_type(self.file.child_at(field_decl.fields, index), field_type);
+            index = index + 1;
+        }
+    }
+
+    () bind_field_declarator_type(ast.AstId field_id, qid.TypeId field_type) {
+        ast.AstNode field = self.file.get(field_id);
+        guard field.data is .field_declarator(field_data) else { return; }
+        guard self.resolved.name(field_data.name) is some field_def else { return; }
+        self.typed.bind_def_type(field_def, field_type);
+    }
+
+    () check_function_decl(ast.FunctionData function_decl, token.Span span) {
+        qid.TypeId result_type = self.check_type_ref(function_decl.result_type);
+        list.ArrayList<qid.TypeId>! params = self.check_param_types(function_decl.params);
+        qid.TypeId function_type = self.queries.types.function_type(params, result_type, span);
+        if (self.resolved.name(function_decl.name) is some function_def) {
+            self.typed.bind_def_type(function_def, function_type);
+        }
+    }
+
+    list.ArrayList<qid.TypeId>! check_param_types(ast.AstRange params) {
+        list.ArrayList<qid.TypeId>! values = list.ArrayList<qid.TypeId>(params.len);
+        Int! index = 0;
+        while (index < params.len) {
+            ast.AstId param_id = self.file.child_at(params, index);
+            ast.AstNode param = self.file.get(param_id);
+            qid.TypeId! param_type = self.queries.types.invalid_type();
+            if (param.data is .param(param_data)) {
+                param_type = self.check_type_ref(param_data.type_ref);
+                if (self.resolved.name(param_data.name) is some param_def) {
+                    self.typed.bind_def_type(param_def, param_type);
+                }
+            }
+            values.add(param_type);
+            index = index + 1;
+        }
+        return values;
+    }
+
+    qid.TypeId single_param_function_type(qid.TypeId param, qid.TypeId result, token.Span span) {
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(1);
+        params.add(param);
+        return self.queries.types.function_type(params, result, span);
+    }
+
+    qid.TypeId check_type_ref(ast.AstId type_id) {
+        ast.AstNode node = self.file.get(type_id);
+        qid.TypeId type_result = self.type_ref_to_type(type_id, node);
+        self.typed.set_type(type_id, type_result);
+        return type_result;
+    }
+
+    qid.TypeId type_ref_to_type(ast.AstId type_id, ast.AstNode node) {
+        if (node.data is .unit_type) {
+            return self.queries.types.unit_type();
+        }
+        if (node.data is .type_ref(type_data)) {
+            qid.TypeId base = self.check_type_ref(type_data.base);
+            if (type_data.layer == .optional) {
+                return self.queries.types.optional_type(base, node.span);
+            }
+            return self.queries.types.invalid_type();
+        }
+        if (node.data is .named_type(named_type)) {
+            return self.named_type_ref(type_id, named_type, node.span);
+        }
+        if (node.data is .path(_)) {
+            return self.named_type_from_path(type_id, node.span);
+        }
+        if (node.data is .name(_)) {
+            return self.named_type_from_path(type_id, node.span);
+        }
+        if (node.data is .function_type(function_type)) {
+            list.ArrayList<qid.TypeId>! params = self.check_type_range(function_type.params);
+            qid.TypeId result = self.check_type_ref(function_type.result);
+            return self.queries.types.function_type(params, result, node.span);
+        }
+        return self.queries.types.invalid_type();
+    }
+
+    list.ArrayList<qid.TypeId>! check_type_range(ast.AstRange range) {
+        list.ArrayList<qid.TypeId>! values = list.ArrayList<qid.TypeId>(range.len);
+        Int! index = 0;
+        while (index < range.len) {
+            values.add(self.check_type_ref(self.file.child_at(range, index)));
+            index = index + 1;
+        }
+        return values;
+    }
+
+    qid.TypeId named_type_ref(ast.AstId type_id, ast.NamedTypeData named_type, token.Span span) {
+        qid.TypeId result = self.named_type_from_path(named_type.path, span);
+        self.typed.set_type(named_type.path, result);
+        return result;
+    }
+
+    qid.TypeId named_type_from_path(ast.AstId path_id, token.Span span) {
+        guard self.resolved_def_for_type_path(path_id) is some def_id else {
+            return self.queries.types.invalid_type();
+        }
+        if (self.typed.type_for_def(def_id) is some type_id) {
+            return type_id;
+        }
+        if (self.queries.types.type_for_def(def_id) is some builtin_type) {
+            return builtin_type;
+        }
+        if (self.queries.defs.get(def_id).kind == def.DefKind.alias_def) {
+            return self.resolve_alias_type(def_id);
+        }
+        return self.queries.types.named_type(def_id, span);
+    }
+
+    qid.TypeId resolve_alias_type(qid.DefId alias_def) {
+        if (self.typed.type_for_def(alias_def) is some type_id) {
+            return type_id;
+        }
+
+        qid.TypeId invalid = self.queries.types.invalid_type();
+        self.typed.bind_def_type(alias_def, invalid);
+        guard self.alias_target_for_def(alias_def) is some target else {
+            return invalid;
+        }
+
+        qid.TypeId target_type = self.check_type_ref(target);
+        self.typed.bind_def_type(alias_def, target_type);
+        return target_type;
+    }
+
+    ast.AstId? alias_target_for_def(qid.DefId alias_def) {
+        Int! index = 0;
+        while (index < self.file.nodes.len()) {
+            ast.AstId node_id = ast.AstId(index);
+            if (self.alias_node_matches_def(self.file.get(node_id), alias_def) is some target) {
+                return target;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    ast.AstId? alias_node_matches_def(ast.AstNode node, qid.DefId alias_def) {
+        guard node.data is .alias_decl(alias_decl) else { return null; }
+        guard self.resolved.name(alias_decl.name) is some resolved_def else { return null; }
+        if (resolved_def.to_index() != alias_def.to_index()) {
+            return null;
+        }
+        return alias_decl.target;
+    }
+
+    qid.DefId? resolved_def_for_type_path(ast.AstId path_id) {
+        if (self.resolved.name(path_id) is some def_id) {
+            return def_id;
+        }
+        ast.AstNode path = self.file.get(path_id);
+        if (path.data is .path(path_data)) {
+            if (path_data.segments.len == 1) {
+                return self.resolved.name(self.file.child_at(path_data.segments, 0));
+            }
+        }
+        return null;
     }
 }
 
-public TypeCheckResult check_file(
+public TypedFile^ check_file(
     context.CompilerContext& ctx,
     ast.AstFile& file,
     resolve_result.ResolvedFile& resolved
@@ -84,13 +377,13 @@ public TypeCheckResult check_file(
     Bool valid = validate_type_check_inputs(ctx, file, resolved);
     TypedFile^ typed = new TypedFile(file.source_id, resolved.revision, valid);
     if (!valid) {
-        return TypeCheckResult(typed, false);
+        return typed;
     }
 
-    TypeChecker checker = TypeChecker(ctx, file, resolved, typed$.ref());
+    TypeChecker! checker = TypeChecker(ctx, file, resolved, typed);
     Bool ok = checker.check();
     typed.ok = ok;
-    return TypeCheckResult(typed, ok);
+    return typed;
 }
 
 Bool validate_type_check_inputs(

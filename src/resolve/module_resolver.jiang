@@ -9,6 +9,7 @@ import qid = "../query/id.jiang";
 import source = "../source/source.jiang";
 import package_manifest = "../source/package_manifest.jiang";
 import fs = "../support/fs.jiang";
+import list = "../support/list.jiang";
 import path = "../support/path.jiang";
 import string = "../support/string.jiang";
 import ast = "../syntax/ast.jiang";
@@ -19,6 +20,7 @@ import diagnostics = "./diagnostics.jiang";
 import import_path_resolver = "./import_path_resolver.jiang";
 import name_resolver = "./name_resolver.jiang";
 import namespace = "./namespace.jiang";
+import resolve_state = "./state.jiang";
 import result = "./result.jiang";
 import store = "./store.jiang";
 
@@ -26,11 +28,13 @@ public struct ModuleResolver {
     context.CompilerContext& ctx;
     query.QuerySystem& query;
     import_path_resolver.ImportPathResolver import_paths;
+    list.ArrayList<result.ResolvedFile&> resolved_files;
 
     public init(context.CompilerContext& ctx) {
         self.ctx = ctx;
         self.query = ctx.query$.ref();
         self.import_paths = import_path_resolver.ImportPathResolver(self.query);
+        self.resolved_files = list.ArrayList<result.ResolvedFile&>();
     }
 
     public result.ResolvedFile^ resolve_file(ast.AstFile& file) {
@@ -40,15 +44,20 @@ public struct ModuleResolver {
             file.source_id,
             module.source_revision
         );
-        name_resolver.NameResolver resolver = name_resolver.NameResolver(
+        resolve_state.FileResolveState state = resolve_state.FileResolveState(
             self.ctx,
             file,
             module_id,
-            module.namespace_id,
+            module.namespace_id
+        );
+        self.resolved_files.add(resolved$.ref());
+        name_resolver.NameResolver resolver = name_resolver.NameResolver(
+            state,
             resolved$.ref()
         );
         self.collect_declarations_for_module(module_id, resolver$.ref());
         resolver.resolve_references();
+        self.resolved_files.pop();
         return resolved;
     }
 
@@ -132,16 +141,29 @@ public struct ModuleResolver {
     }
 
     () ensure_module_declarations_collected(qid.ModuleId module_id) {
+        result.ResolvedFile& parent_resolved = self.current_resolved_file();
         store.ModuleRecord module = self.query.resolve.modules.get(module_id);
         if (self.query.asts.file(module.source_id, module.source_revision) is some file) {
-            name_resolver.NameResolver resolver = name_resolver.NameResolver(
+            result.ResolvedFile^ resolved = new result.ResolvedFile(
+                module.source_id,
+                module.source_revision
+            );
+            resolve_state.FileResolveState state = resolve_state.FileResolveState(
                 self.ctx,
                 file,
                 module_id,
-                module.namespace_id,
-                null
+                module.namespace_id
+            );
+            self.resolved_files.add(resolved$.ref());
+            name_resolver.NameResolver resolver = name_resolver.NameResolver(
+                state,
+                resolved$.ref()
             );
             self.collect_declarations_for_module(module_id, resolver$.ref());
+            self.resolved_files.pop();
+            if (!resolved.ok) {
+                parent_resolved.ok = false;
+            }
         }
     }
 
@@ -157,20 +179,24 @@ public struct ModuleResolver {
                 continue;
             }
             if (!self.import_paths.valid_import_path(import_record)) {
-                self.add_invalid_import_path_diagnostic(module, import_record);
+                self.add_invalid_import_path_diagnostic(module.source_id, import_record);
                 index = index + 1;
                 continue;
             }
             if (self.resolve_import_target(module_id, import_record) is some target_module) {
                 self.record_import_resolution(module_id, index, target_module);
             } else {
-                self.add_import_not_found_diagnostic(module, import_record);
+                self.add_import_not_found_diagnostic(module.source_id, import_record);
             }
             index = index + 1;
         }
     }
 
-    () record_import_resolution(qid.ModuleId module_id, Int import_index, qid.ModuleId target_module) {
+    () record_import_resolution(
+        qid.ModuleId module_id,
+        Int import_index,
+        qid.ModuleId target_module
+    ) {
         // alias 可见后，后续 reference lookup 需要目标 module 的 top-level 声明
         // 已进入 namespace。
         self.ensure_module_declarations_collected(target_module);
@@ -237,16 +263,20 @@ public struct ModuleResolver {
         return import_record.path_symbol;
     }
 
-    Bool import_alias_has_conflict(store.ModuleRecord& module, store.ImportRecord& import_record) {
+    Bool import_alias_has_conflict(
+        store.ModuleRecord& module,
+        store.ImportRecord& import_record
+    ) {
         qid.SymbolId alias_symbol = self.import_alias_symbol(import_record);
         if (self.first_import_alias_conflict(module.namespace_id, alias_symbol) is some existing) {
             diagnostics.add_duplicate_def(
-                self.ctx.diagnostics$.ref(),
+                self.ctx,
                 module.source_id,
                 import_record.span,
                 existing.span,
                 self.query.symbols.text(alias_symbol)
             );
+            self.current_resolved_file().ok = false;
             return true;
         }
         return false;
@@ -312,29 +342,31 @@ public struct ModuleResolver {
     }
 
     () add_invalid_import_path_diagnostic(
-        store.ModuleRecord& module,
+        source.SourceId source_id,
         store.ImportRecord& import_record
     ) {
         diagnostics.add_error(
-            self.ctx.diagnostics$.ref(),
-            module.source_id,
+            self.ctx,
+            source_id,
             import_record.span,
             "invalid import path",
             "invalid_import_path"
         );
+        self.current_resolved_file().ok = false;
     }
 
     () add_import_not_found_diagnostic(
-        store.ModuleRecord& module,
+        source.SourceId source_id,
         store.ImportRecord& import_record
     ) {
         diagnostics.add_error(
-            self.ctx.diagnostics$.ref(),
-            module.source_id,
+            self.ctx,
+            source_id,
             import_record.span,
             string.append("import not found: ", self.query.symbols.text(import_record.path_symbol)),
             "import_not_found"
         );
+        self.current_resolved_file().ok = false;
     }
 
     qid.ModuleId create_source_module(source.SourceId source_id, Int source_revision) {
@@ -470,13 +502,14 @@ public struct ModuleResolver {
     }
 
     () add_package_manifest_diagnostic(source.SourceId source_id, UInt8[] message) {
-        diagnostics.add_error(
-            self.ctx.diagnostics$.ref(),
-            source_id,
-            token.Span(),
-            message,
-            "invalid_package_manifest"
-        );
+        diagnostics.add_package_manifest_error(self.ctx, source_id, message);
+        if (!self.resolved_files.empty()) {
+            self.current_resolved_file().ok = false;
+        }
+    }
+
+    result.ResolvedFile& current_resolved_file() {
+        return self.resolved_files.last();
     }
 
     // 没有真实 package.ini 的虚拟 source 仍挂到默认 root package。
