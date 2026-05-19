@@ -5,9 +5,9 @@ Jiang Next 编译器应围绕稳定的阶段边界组织。
 ## 顶层流程
 
 ```text
-driver -> api -> pipeline
-                  |
-                  v
+driver -> session -> pipeline
+                       |
+                       v
 source -> syntax -> resolve -> sema -> ir -> backend
                            \          /
                             v        v
@@ -17,7 +17,7 @@ source -> syntax -> resolve -> sema -> ir -> backend
 ## 边界
 
 - `driver` 把进程参数转换成编译请求。
-- `api` 向 CLI、测试和未来工具暴露编译请求/结果。
+- `session` 持有一次编译会话的 `CompilerContext`，向 CLI、测试和未来工具暴露编译请求。
 - `pipeline` 串联各阶段，并负责跨阶段错误处理。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
 - `syntax` 只产生 token 和 AST；它不应理解类型语义。
