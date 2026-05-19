@@ -11,6 +11,7 @@ import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
+import types = "./type.jiang";
 
 public struct TypedFile {
     public source.SourceId source_id;
@@ -56,10 +57,32 @@ public struct TypedFile {
     public Bool has_errors() {
         return !self.ok;
     }
+
+    public () mark_error() {
+        self.ok = false;
+    }
+}
+
+public TypedFile^ check_file(
+    context.CompilerContext& ctx,
+    ast.AstFile& file,
+    resolve_result.ResolvedFile& resolved
+) {
+    Bool valid = validate_type_check_inputs(ctx, file, resolved);
+    TypedFile^ typed = new TypedFile(file.source_id, resolved.revision, valid);
+    if (!valid) {
+        return typed;
+    }
+
+    TypeChecker! checker = TypeChecker(ctx, file, resolved, typed);
+    Bool ok = checker.check();
+    typed.ok = ok;
+    return typed;
 }
 
 struct TypeChecker {
-    query.QuerySystem^ queries;
+    context.CompilerContext& ctx;
+    query.QuerySystem& query;
     ast.AstFile& file;
     resolve_result.ResolvedFile& resolved;
     TypedFile^ typed;
@@ -70,7 +93,8 @@ struct TypeChecker {
         resolve_result.ResolvedFile& resolved,
         TypedFile^ typed
     ) {
-        self.queries = ctx.query;
+        self.ctx = ctx;
+        self.query = ctx.query$.ref();
         self.file = file;
         self.resolved = resolved;
         self.typed = typed;
@@ -78,19 +102,49 @@ struct TypeChecker {
 
     public Bool check() {
         self.check_declaration_signatures();
-        return true;
+        self.check_bodies();
+        return self.typed.ok;
     }
 
     () check_declaration_signatures() {
-        if (self.file.root is some root_id) {
-            ast.AstNode root = self.file.get(root_id);
-            if (root.data is .root(root_data)) {
-                Int! index = 0;
-                while (index < root_data.items.len) {
-                    self.check_top_level_item(self.file.child_at(root_data.items, index));
-                    index = index + 1;
-                }
+        guard (self.file.root is some root_id) else { return; }
+        ast.AstNode root = self.file.get(root_id);
+        if (root.data is .root(root_data)) {
+            Int! index = 0;
+            while (index < root_data.items.len) {
+                self.check_top_level_item(self.file.child_at(root_data.items, index));
+                index = index + 1;
             }
+        }
+    }
+
+    () check_bodies() {
+        guard self.file.root is some root_id else { return; }
+        ast.AstNode root = self.file.get(root_id);
+        guard root.data is .root(root_data) else { return; }
+
+        Int! index = 0;
+        while (index < root_data.items.len) {
+            self.check_top_level_body_exprs(self.file.child_at(root_data.items, index));
+            index = index + 1;
+        }
+    }
+
+    () check_top_level_body_exprs(ast.AstId item_id) {
+        ast.AstNode item = self.file.get(item_id);
+        guard item.data is .top_level_decl(top_level) else { return; }
+        ast.AstNode body = self.file.get(top_level.body);
+        if (body.data is .global_decl(global_decl)) {
+            self.check_global_initializer(global_decl);
+            return;
+        }
+        if (body.data is .function_decl(function_decl)) {
+            self.check_function_body(function_decl);
+            return;
+        }
+        if (body.data is .nominal_decl(nominal)) {
+            self.check_nominal_member_bodies(nominal);
+            return;
         }
     }
 
@@ -130,7 +184,7 @@ struct TypeChecker {
 
     () check_nominal_decl(ast.NominalData nominal, token.Span span) {
         guard self.resolved.name(nominal.name) is some owner_def else { return; }
-        qid.TypeId owner_type = self.queries.types.named_type(owner_def, span);
+        qid.TypeId owner_type = self.query.types.named_type(owner_def, span);
         self.typed.bind_def_type(owner_def, owner_type);
         self.typed.set_type(nominal.name, owner_type);
 
@@ -220,10 +274,63 @@ struct TypeChecker {
     () check_function_decl(ast.FunctionData function_decl, token.Span span) {
         qid.TypeId result_type = self.check_type_ref(function_decl.result_type);
         list.ArrayList<qid.TypeId>! params = self.check_param_types(function_decl.params);
-        qid.TypeId function_type = self.queries.types.function_type(params, result_type, span);
+        qid.TypeId function_type = self.query.types.function_type(params, result_type, span);
         if (self.resolved.name(function_decl.name) is some function_def) {
             self.typed.bind_def_type(function_def, function_type);
         }
+    }
+
+    () check_global_initializer(ast.GlobalData global_decl) {
+        guard global_decl.initializer is some initializer else { return; }
+        qid.TypeId expected = self.check_type_ref(global_decl.type_ref);
+        qid.TypeId actual = self.check_expr(initializer);
+        self.require_assignable(expected, actual, self.file.get(initializer).span);
+    }
+
+    () check_function_body(ast.FunctionData function_decl) {
+        guard function_decl.body is some body else { return; }
+        qid.TypeId result_type = self.check_type_ref(function_decl.result_type);
+        self.check_block(body, result_type);
+    }
+
+    () check_nominal_member_bodies(ast.NominalData nominal) {
+        Int! index = 0;
+        while (index < nominal.members.len) {
+            self.check_member_body_exprs(self.file.child_at(nominal.members, index));
+            index = index + 1;
+        }
+    }
+
+    () check_member_body_exprs(ast.AstId member_id) {
+        ast.AstNode member = self.file.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            self.check_member_body_exprs(member_decl.body);
+            return;
+        }
+        if (member.data is .function_decl(function_decl)) {
+            self.check_function_body(function_decl);
+            return;
+        }
+        if (member.data is .field_decl(field_decl)) {
+            self.check_field_defaults(field_decl);
+        }
+    }
+
+    () check_field_defaults(ast.FieldData field_decl) {
+        qid.TypeId field_type = self.check_type_ref(field_decl.type_ref);
+        Int! index = 0;
+        while (index < field_decl.fields.len) {
+            self.check_field_default(self.file.child_at(field_decl.fields, index), field_type);
+            index = index + 1;
+        }
+    }
+
+    () check_field_default(ast.AstId field_id, qid.TypeId field_type) {
+        ast.AstNode field = self.file.get(field_id);
+        guard field.data is .field_declarator(field_decl) else { return; }
+        guard field_decl.default_value is some default_value else { return; }
+        qid.TypeId actual = self.check_expr(default_value);
+        self.require_assignable(field_type, actual, self.file.get(default_value).span);
     }
 
     list.ArrayList<qid.TypeId>! check_param_types(ast.AstRange params) {
@@ -232,7 +339,7 @@ struct TypeChecker {
         while (index < params.len) {
             ast.AstId param_id = self.file.child_at(params, index);
             ast.AstNode param = self.file.get(param_id);
-            qid.TypeId! param_type = self.queries.types.invalid_type();
+            qid.TypeId! param_type = self.query.types.invalid_type();
             if (param.data is .param(param_data)) {
                 param_type = self.check_type_ref(param_data.type_ref);
                 if (self.resolved.name(param_data.name) is some param_def) {
@@ -248,7 +355,231 @@ struct TypeChecker {
     qid.TypeId single_param_function_type(qid.TypeId param, qid.TypeId result, token.Span span) {
         list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(1);
         params.add(param);
-        return self.queries.types.function_type(params, result, span);
+        return self.query.types.function_type(params, result, span);
+    }
+
+    qid.TypeId check_block(ast.AstId block_id, qid.TypeId expected_return) {
+        ast.AstNode block = self.file.get(block_id);
+        guard block.data is .block(block_data) else {
+            return self.check_expr(block_id);
+        }
+
+        Int! index = 0;
+        while (index < block_data.statements.len) {
+            self.check_stmt(self.file.child_at(block_data.statements, index), expected_return);
+            index = index + 1;
+        }
+
+        qid.TypeId unit = self.query.types.unit_type();
+        self.typed.set_type(block_id, unit);
+        return unit;
+    }
+
+    qid.TypeId check_stmt(ast.AstId stmt_id, qid.TypeId expected_return) {
+        ast.AstNode stmt = self.file.get(stmt_id);
+        qid.TypeId unit = self.query.types.unit_type();
+        if (stmt.data is .stmt(stmt_data)) {
+            self.check_expr(stmt_data.value);
+            self.typed.set_type(stmt_id, unit);
+            return unit;
+        }
+        if (stmt.data is .let_stmt(let_stmt)) {
+            self.check_let_stmt(let_stmt);
+            self.typed.set_type(stmt_id, unit);
+            return unit;
+        }
+        if (stmt.data is .assign_stmt(assign)) {
+            self.check_assign_stmt(assign, stmt.span);
+            self.typed.set_type(stmt_id, unit);
+            return unit;
+        }
+        if (stmt.data is .control_stmt(control_stmt)) {
+            self.check_control_stmt(control_stmt, expected_return, stmt.span);
+            self.typed.set_type(stmt_id, unit);
+            return unit;
+        }
+        if (stmt.data is .block(_)) {
+            self.check_block(stmt_id, expected_return);
+            self.typed.set_type(stmt_id, unit);
+            return unit;
+        }
+        qid.TypeId result = self.check_expr(stmt_id);
+        self.typed.set_type(stmt_id, result);
+        return result;
+    }
+
+    () check_let_stmt(ast.LetData let_stmt) {
+        qid.TypeId declared_type = self.declared_local_type(let_stmt);
+        if (self.resolved.name(let_stmt.name) is some local_def) {
+            self.typed.bind_def_type(local_def, declared_type);
+        }
+        if (let_stmt.initializer is some initializer) {
+            qid.TypeId actual = self.check_expr(initializer);
+            self.require_assignable(declared_type, actual, self.file.get(initializer).span);
+        }
+    }
+
+    qid.TypeId declared_local_type(ast.LetData let_stmt) {
+        if (let_stmt.type_ref is some type_ref) {
+            return self.check_type_ref(type_ref);
+        }
+        return self.query.types.invalid_type();
+    }
+
+    () check_assign_stmt(ast.AssignData assign, token.Span span) {
+        qid.TypeId target = self.check_expr(assign.target);
+        qid.TypeId value = self.check_expr(assign.value);
+        self.require_assignable(target, value, span);
+    }
+
+    () check_control_stmt(ast.ControlStmtData control_stmt, qid.TypeId expected_return, token.Span span) {
+        if (control_stmt.kind != .return_value) {
+            if (control_stmt.value is some value) {
+                self.check_expr(value);
+            }
+            return;
+        }
+        qid.TypeId! actual = self.query.types.unit_type();
+        if (control_stmt.value is some value) {
+            actual = self.check_expr(value);
+        }
+        self.require_assignable(expected_return, actual, span);
+    }
+
+    qid.TypeId check_expr(ast.AstId expr_id) {
+        ast.AstNode expr = self.file.get(expr_id);
+        qid.TypeId type_id = self.expr_to_type(expr_id, expr);
+        self.typed.set_type(expr_id, type_id);
+        return type_id;
+    }
+
+    qid.TypeId expr_to_type(ast.AstId expr_id, ast.AstNode expr) {
+        if (expr.data is .literal(literal)) {
+            return self.literal_type(literal);
+        }
+        if (expr.data is .unit_type) {
+            return self.query.types.unit_type();
+        }
+        if (expr.data is .name_expr(name_expr)) {
+            return self.check_name_expr(expr_id, name_expr.value);
+        }
+        if (expr.data is .name(_)) {
+            return self.type_for_resolved_name(expr_id);
+        }
+        if (expr.data is .path(_)) {
+            return self.type_for_resolved_name(expr_id);
+        }
+        if (expr.data is .call(call)) {
+            return self.check_call_expr(call, expr.span);
+        }
+        if (expr.data is .call_arg(call_arg)) {
+            return self.check_expr(call_arg.value);
+        }
+        if (expr.data is .binary(binary)) {
+            return self.check_binary_expr(binary, expr.span);
+        }
+        if (expr.data is .block(_)) {
+            return self.check_block(expr_id, self.query.types.unit_type());
+        }
+        return self.query.types.invalid_type();
+    }
+
+    qid.TypeId literal_type(ast.LiteralData literal) {
+        if (literal.kind == .int_lit) {
+            return self.query.types.int_type();
+        }
+        if (literal.kind == .bool_lit) {
+            return self.query.types.bool_type();
+        }
+        if (literal.kind == .char_lit) {
+            return self.query.types.builtins.char_type;
+        }
+        return self.query.types.invalid_type();
+    }
+
+    qid.TypeId check_name_expr(ast.AstId expr_id, ast.AstId value_id) {
+        qid.TypeId type_id = self.check_expr(value_id);
+        self.typed.set_type(expr_id, type_id);
+        return type_id;
+    }
+
+    qid.TypeId type_for_resolved_name(ast.AstId name_id) {
+        guard self.resolved_def_for_path(name_id) is some def_id else {
+            return self.query.types.invalid_type();
+        }
+        return self.type_for_def(def_id);
+    }
+
+    qid.TypeId type_for_def(qid.DefId def_id) {
+        if (self.typed.type_for_def(def_id) is some type_id) {
+            return type_id;
+        }
+        if (self.query.types.type_for_def(def_id) is some type_id) {
+            return type_id;
+        }
+        return self.query.types.invalid_type();
+    }
+
+    qid.TypeId check_call_expr(ast.CallData call, token.Span span) {
+        qid.TypeId callee_type = self.check_expr(call.callee);
+        types.TypeInfo callee_info = self.query.types.get(callee_type);
+        guard callee_info.data is .function_type(function_type) else {
+            self.add_type_diagnostic(span, "not callable", "not_callable");
+            return self.query.types.invalid_type();
+        }
+
+        self.check_call_args(call.args, function_type);
+        return function_type.result;
+    }
+
+    () check_call_args(ast.AstRange args, types.FunctionType function_type) {
+        if (args.len != function_type.params.length) {
+            self.add_type_diagnostic(self.range_span(args), "call argument count mismatch", "call_arg_count_mismatch");
+        }
+
+        Int! index = 0;
+        while (index < args.len) {
+            ast.AstId arg_id = self.file.child_at(args, index);
+            qid.TypeId actual = self.check_call_arg(arg_id);
+            if (index < function_type.params.length) {
+                self.require_assignable(function_type.params[index], actual, self.file.get(arg_id).span);
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId check_call_arg(ast.AstId arg_id) {
+        ast.AstNode arg = self.file.get(arg_id);
+        if (arg.data is .call_arg(call_arg)) {
+            return self.check_expr(call_arg.value);
+        }
+        return self.check_expr(arg_id);
+    }
+
+    qid.TypeId check_binary_expr(ast.BinaryData binary, token.Span span) {
+        qid.TypeId lhs = self.check_expr(binary.left);
+        qid.TypeId rhs = self.check_expr(binary.right);
+        if (self.binary_returns_bool(binary.op)) {
+            self.require_assignable(lhs, rhs, span);
+            return self.query.types.bool_type();
+        }
+        if (self.binary_requires_bool(binary.op)) {
+            self.require_assignable(self.query.types.bool_type(), lhs, span);
+            self.require_assignable(self.query.types.bool_type(), rhs, span);
+            return self.query.types.bool_type();
+        }
+        self.require_assignable(lhs, rhs, span);
+        return lhs;
+    }
+
+    Bool binary_returns_bool(ast.BinaryOp op) {
+        if (op == .equal || op == .not_equal) { return true; }
+        if (op == .less || op == .less_equal) { return true; }
+        return op == .greater || op == .greater_equal;
+    }
+
+    Bool binary_requires_bool(ast.BinaryOp op) {
+        return op == .logic_and || op == .logic_or;
     }
 
     qid.TypeId check_type_ref(ast.AstId type_id) {
@@ -260,14 +591,14 @@ struct TypeChecker {
 
     qid.TypeId type_ref_to_type(ast.AstId type_id, ast.AstNode node) {
         if (node.data is .unit_type) {
-            return self.queries.types.unit_type();
+            return self.query.types.unit_type();
         }
         if (node.data is .type_ref(type_data)) {
             qid.TypeId base = self.check_type_ref(type_data.base);
             if (type_data.layer == .optional) {
-                return self.queries.types.optional_type(base, node.span);
+                return self.query.types.optional_type(base, node.span);
             }
-            return self.queries.types.invalid_type();
+            return self.query.types.invalid_type();
         }
         if (node.data is .named_type(named_type)) {
             return self.named_type_ref(type_id, named_type, node.span);
@@ -281,9 +612,9 @@ struct TypeChecker {
         if (node.data is .function_type(function_type)) {
             list.ArrayList<qid.TypeId>! params = self.check_type_range(function_type.params);
             qid.TypeId result = self.check_type_ref(function_type.result);
-            return self.queries.types.function_type(params, result, node.span);
+            return self.query.types.function_type(params, result, node.span);
         }
-        return self.queries.types.invalid_type();
+        return self.query.types.invalid_type();
     }
 
     list.ArrayList<qid.TypeId>! check_type_range(ast.AstRange range) {
@@ -303,19 +634,19 @@ struct TypeChecker {
     }
 
     qid.TypeId named_type_from_path(ast.AstId path_id, token.Span span) {
-        guard self.resolved_def_for_type_path(path_id) is some def_id else {
-            return self.queries.types.invalid_type();
+        guard self.resolved_def_for_path(path_id) is some def_id else {
+            return self.query.types.invalid_type();
         }
         if (self.typed.type_for_def(def_id) is some type_id) {
             return type_id;
         }
-        if (self.queries.types.type_for_def(def_id) is some builtin_type) {
+        if (self.query.types.type_for_def(def_id) is some builtin_type) {
             return builtin_type;
         }
-        if (self.queries.defs.get(def_id).kind == def.DefKind.alias_def) {
+        if (self.query.defs.get(def_id).kind == def.DefKind.alias_def) {
             return self.resolve_alias_type(def_id);
         }
-        return self.queries.types.named_type(def_id, span);
+        return self.query.types.named_type(def_id, span);
     }
 
     qid.TypeId resolve_alias_type(qid.DefId alias_def) {
@@ -323,7 +654,7 @@ struct TypeChecker {
             return type_id;
         }
 
-        qid.TypeId invalid = self.queries.types.invalid_type();
+        qid.TypeId invalid = self.query.types.invalid_type();
         self.typed.bind_def_type(alias_def, invalid);
         guard self.alias_target_for_def(alias_def) is some target else {
             return invalid;
@@ -355,7 +686,7 @@ struct TypeChecker {
         return alias_decl.target;
     }
 
-    qid.DefId? resolved_def_for_type_path(ast.AstId path_id) {
+    qid.DefId? resolved_def_for_path(ast.AstId path_id) {
         if (self.resolved.name(path_id) is some def_id) {
             return def_id;
         }
@@ -367,23 +698,92 @@ struct TypeChecker {
         }
         return null;
     }
-}
 
-public TypedFile^ check_file(
-    context.CompilerContext& ctx,
-    ast.AstFile& file,
-    resolve_result.ResolvedFile& resolved
-) {
-    Bool valid = validate_type_check_inputs(ctx, file, resolved);
-    TypedFile^ typed = new TypedFile(file.source_id, resolved.revision, valid);
-    if (!valid) {
-        return typed;
+    () require_assignable(qid.TypeId expected, qid.TypeId actual, token.Span span) {
+        if (self.assignable(expected, actual)) {
+            return;
+        }
+        self.add_type_diagnostic(span, "type mismatch", "type_mismatch");
     }
 
-    TypeChecker! checker = TypeChecker(ctx, file, resolved, typed);
-    Bool ok = checker.check();
-    typed.ok = ok;
-    return typed;
+    Bool assignable(qid.TypeId expected, qid.TypeId actual) {
+        if (self.is_invalid_type(expected) || self.is_invalid_type(actual)) {
+            return true;
+        }
+        return self.same_type(expected, actual);
+    }
+
+    Bool same_type(qid.TypeId lhs, qid.TypeId rhs) {
+        if (lhs.to_index() == rhs.to_index()) {
+            return true;
+        }
+        types.TypeInfo lhs_info = self.query.types.get(lhs);
+        types.TypeInfo rhs_info = self.query.types.get(rhs);
+        return self.same_type_data(lhs_info.data, rhs_info.data);
+    }
+
+    Bool same_type_data(types.TypeData lhs, types.TypeData rhs) {
+        if (lhs is .invalid) { return rhs is .invalid; }
+        if (lhs is .never) { return rhs is .never; }
+        if (lhs is .unit) { return rhs is .unit; }
+        if (lhs is .bool_type) { return rhs is .bool_type; }
+        if (lhs is .char_type) { return rhs is .char_type; }
+        if (lhs is .int_type(lhs_int)) {
+            guard rhs is .int_type(rhs_int) else { return false; }
+            return lhs_int.bits == rhs_int.bits && lhs_int.signed == rhs_int.signed;
+        }
+        if (lhs is .float_type(lhs_float)) {
+            guard rhs is .float_type(rhs_float) else { return false; }
+            return lhs_float.bits == rhs_float.bits;
+        }
+        if (lhs is .named(lhs_named)) {
+            guard rhs is .named(rhs_named) else { return false; }
+            return lhs_named.def_id.to_index() == rhs_named.def_id.to_index();
+        }
+        if (lhs is .optional(lhs_optional)) {
+            guard rhs is .optional(rhs_optional) else { return false; }
+            return self.same_type(lhs_optional.element, rhs_optional.element);
+        }
+        if (lhs is .function_type(lhs_function)) {
+            guard rhs is .function_type(rhs_function) else { return false; }
+            return self.same_function_type(lhs_function, rhs_function);
+        }
+        return false;
+    }
+
+    Bool same_function_type(types.FunctionType lhs, types.FunctionType rhs) {
+        if (lhs.params.length != rhs.params.length) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < lhs.params.length) {
+            if (!self.same_type(lhs.params[index], rhs.params[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return self.same_type(lhs.result, rhs.result);
+    }
+
+    Bool is_invalid_type(qid.TypeId type_id) {
+        return self.query.types.get(type_id).data is .invalid;
+    }
+
+    token.Span range_span(ast.AstRange range) {
+        if (range.empty()) {
+            return token.Span();
+        }
+        ast.AstId first = self.file.child_at(range, 0);
+        ast.AstId last = self.file.child_at(range, range.len - 1);
+        token.Span first_span = self.file.get(first).span;
+        token.Span last_span = self.file.get(last).span;
+        return token.Span(first_span.start, last_span.end() - first_span.start);
+    }
+
+    () add_type_diagnostic(token.Span span, UInt8[] message, UInt8[] code) {
+        self.typed.mark_error();
+        add_type_check_diagnostic(self.ctx, self.file.source_id, span, message, code);
+    }
 }
 
 Bool validate_type_check_inputs(
@@ -403,12 +803,28 @@ Bool validate_type_check_inputs(
 }
 
 () add_type_check_input_diagnostic(context.CompilerContext& ctx, source.SourceId source_id, UInt8[] message) {
+    add_type_check_diagnostic(
+        ctx,
+        source_id,
+        token.Span(),
+        message,
+        "invalid_type_check_input"
+    );
+}
+
+() add_type_check_diagnostic(
+    context.CompilerContext& ctx,
+    source.SourceId source_id,
+    token.Span span,
+    UInt8[] message,
+    UInt8[] code
+) {
     ctx.diagnostics.add(
         diagnostic.Diagnostic(
             .error,
             .type_check,
-            diagnostic.DiagnosticCode("invalid_type_check_input"),
-            diagnostic.SourceRange(source_id, token.Span()),
+            diagnostic.DiagnosticCode(code),
+            diagnostic.SourceRange(source_id, span),
             message
         )
     );
