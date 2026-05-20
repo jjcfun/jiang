@@ -18,14 +18,22 @@ public struct TypedFile {
     public Int revision;
     public Bool! ok;
     public table.SideTable<ast.AstId, qid.TypeId> types;
-    public table.SideTable<qid.DefId, qid.TypeId> def_types;
+    public table.HashTable<qid.DefId, qid.TypeId> def_types;
+    // `value.member` 的类型驱动成员选择结果。
+    //
+    // Resolve 可以绑定普通名字，也可以绑定 `Type.member` 这种 namespace path；
+    // 但它不能绑定 `value.member`，因为 owner namespace 取决于 `value` 的类型。
+    // TypeChecker 在算出 base 类型后把成员选择结果记录到这里，后续降级阶段
+    // 对普通名字读 ResolvedFile，对成员表达式读 TypedFile。
+    public table.SideTable<ast.AstId, qid.DefId> member_selections;
 
     public init(source.SourceId source_id, Int revision, Bool ok) {
         self.source_id = source_id;
         self.revision = revision;
         self.ok = ok;
         self.types = table.SideTable<ast.AstId, qid.TypeId>();
-        self.def_types = table.SideTable<qid.DefId, qid.TypeId>();
+        self.def_types = table.HashTable<qid.DefId, qid.TypeId>();
+        self.member_selections = table.SideTable<ast.AstId, qid.DefId>();
     }
 
     public Bool valid_for_resolve(resolve_result.ResolvedFile& resolved) {
@@ -50,6 +58,17 @@ public struct TypedFile {
     public qid.TypeId? type_for_def(qid.DefId def_id) {
         if (self.def_types.has(def_id)) {
             return self.def_types.get(def_id);
+        }
+        return null;
+    }
+
+    public () bind_member_selection(ast.AstId ast_id, qid.DefId def_id) {
+        self.member_selections.set(ast_id, def_id);
+    }
+
+    public qid.DefId? member_selection(ast.AstId ast_id) {
+        if (self.member_selections.has(ast_id)) {
+            return self.member_selections.get(ast_id);
         }
         return null;
     }
@@ -80,12 +99,15 @@ public TypedFile^ check_file(
     return typed;
 }
 
+// 单文件 type check 的工作对象。它只消费 AST + ResolvedFile，
+// 不重新做名字查找，所有类型结果写入 TypedFile。
 struct TypeChecker {
     context.CompilerContext& ctx;
     query.QuerySystem& query;
     ast.AstFile& file;
     resolve_result.ResolvedFile& resolved;
     TypedFile^ typed;
+    Int! loop_depth;
 
     public init(
         context.CompilerContext& ctx,
@@ -98,6 +120,7 @@ struct TypeChecker {
         self.file = file;
         self.resolved = resolved;
         self.typed = typed;
+        self.loop_depth = 0;
     }
 
     public Bool check() {
@@ -106,6 +129,8 @@ struct TypeChecker {
         return self.typed.ok;
     }
 
+    // 第一遍只建立声明外壳类型，让后续 body 检查可以引用函数、
+    // global、field、variant 和 alias 的类型。
     () check_declaration_signatures() {
         guard (self.file.root is some root_id) else { return; }
         ast.AstNode root = self.file.get(root_id);
@@ -118,6 +143,8 @@ struct TypeChecker {
         }
     }
 
+    // 第二遍检查可执行代码：global initializer、函数体、
+    // 成员函数体以及 field default。
     () check_bodies() {
         guard self.file.root is some root_id else { return; }
         ast.AstNode root = self.file.get(root_id);
@@ -130,6 +157,7 @@ struct TypeChecker {
         }
     }
 
+    // 根据顶层声明种类分发 body 检查；签名已经在第一遍处理过。
     () check_top_level_body_exprs(ast.AstId item_id) {
         ast.AstNode item = self.file.get(item_id);
         guard item.data is .top_level_decl(top_level) else { return; }
@@ -148,6 +176,7 @@ struct TypeChecker {
         }
     }
 
+    // 第一遍的顶层声明入口，只关心声明的类型形状。
     () check_top_level_item(ast.AstId item_id) {
         ast.AstNode item = self.file.get(item_id);
         if (item.data is .top_level_decl(top_level)) {
@@ -155,6 +184,7 @@ struct TypeChecker {
         }
     }
 
+    // 为顶层 alias/global/function/nominal 声明绑定 DefId -> TypeId。
     () check_top_level_body(ast.AstId body_id) {
         ast.AstNode body = self.file.get(body_id);
         if (body.data is .alias_decl(alias_decl)) {
@@ -182,6 +212,7 @@ struct TypeChecker {
         }
     }
 
+    // 为 struct/record/enum/union 自身创建 named type，并检查成员签名。
     () check_nominal_decl(ast.NominalData nominal, token.Span span) {
         guard self.resolved.name(nominal.name) is some owner_def else { return; }
         qid.TypeId owner_type = self.query.types.named_type(owner_def, span);
@@ -195,6 +226,7 @@ struct TypeChecker {
         }
     }
 
+    // 兼容带 member wrapper 和直接成员节点两种 AST 形状。
     () check_member_decl(ast.AstId member_id, qid.TypeId owner_type) {
         ast.AstNode member = self.file.get(member_id);
         if (member.data is .member_decl(member_decl)) {
@@ -204,6 +236,7 @@ struct TypeChecker {
         }
     }
 
+    // 检查 nominal 成员的声明类型：field、method、case、variant、assoc type。
     () check_member_body(ast.AstId body_id, qid.TypeId owner_type) {
         ast.AstNode body = self.file.get(body_id);
         if (body.data is .field_decl(field_decl)) {
@@ -249,12 +282,14 @@ struct TypeChecker {
         }
     }
 
+    // associated type 有默认值时，把默认值类型绑定到对应 DefId。
     () check_assoc_type(ast.AssocTypeData assoc_type) {
         guard assoc_type.value is some value else { return; }
         guard self.resolved.name(assoc_type.name) is some assoc_def else { return; }
         self.typed.bind_def_type(assoc_def, self.check_type_ref(value));
     }
 
+    // 一个 field declaration 可能声明多个 field，共享同一个类型引用。
     () check_field_decl(ast.FieldData field_decl) {
         qid.TypeId field_type = self.check_type_ref(field_decl.type_ref);
         Int! index = 0;
@@ -264,6 +299,7 @@ struct TypeChecker {
         }
     }
 
+    // 将单个 field declarator 的 DefId 绑定到所属 field 类型。
     () bind_field_declarator_type(ast.AstId field_id, qid.TypeId field_type) {
         ast.AstNode field = self.file.get(field_id);
         guard field.data is .field_declarator(field_data) else { return; }
@@ -271,6 +307,7 @@ struct TypeChecker {
         self.typed.bind_def_type(field_def, field_type);
     }
 
+    // 构造函数签名类型，并把参数类型提前写入 TypedFile。
     () check_function_decl(ast.FunctionData function_decl, token.Span span) {
         qid.TypeId result_type = self.check_type_ref(function_decl.result_type);
         list.ArrayList<qid.TypeId>! params = self.check_param_types(function_decl.params);
@@ -280,6 +317,7 @@ struct TypeChecker {
         }
     }
 
+    // 检查 global initializer 是否能赋给显式声明类型。
     () check_global_initializer(ast.GlobalData global_decl) {
         guard global_decl.initializer is some initializer else { return; }
         qid.TypeId expected = self.check_type_ref(global_decl.type_ref);
@@ -287,12 +325,14 @@ struct TypeChecker {
         self.require_assignable(expected, actual, self.file.get(initializer).span);
     }
 
+    // 使用函数声明的 return type 作为当前 body 的 return 期望类型。
     () check_function_body(ast.FunctionData function_decl) {
         guard function_decl.body is some body else { return; }
         qid.TypeId result_type = self.check_type_ref(function_decl.result_type);
         self.check_block(body, result_type);
     }
 
+    // nominal 第二遍只检查成员 body/default，不重复处理成员签名。
     () check_nominal_member_bodies(ast.NominalData nominal) {
         Int! index = 0;
         while (index < nominal.members.len) {
@@ -301,6 +341,7 @@ struct TypeChecker {
         }
     }
 
+    // 从 nominal member 中挑出需要检查可执行表达式的节点。
     () check_member_body_exprs(ast.AstId member_id) {
         ast.AstNode member = self.file.get(member_id);
         if (member.data is .member_decl(member_decl)) {
@@ -316,6 +357,7 @@ struct TypeChecker {
         }
     }
 
+    // 检查 field default initializer 是否可赋给 field 类型。
     () check_field_defaults(ast.FieldData field_decl) {
         qid.TypeId field_type = self.check_type_ref(field_decl.type_ref);
         Int! index = 0;
@@ -325,6 +367,7 @@ struct TypeChecker {
         }
     }
 
+    // 单个 field declarator 的 default value 检查。
     () check_field_default(ast.AstId field_id, qid.TypeId field_type) {
         ast.AstNode field = self.file.get(field_id);
         guard field.data is .field_declarator(field_decl) else { return; }
@@ -333,6 +376,7 @@ struct TypeChecker {
         self.require_assignable(field_type, actual, self.file.get(default_value).span);
     }
 
+    // 收集函数参数类型，并把每个参数 DefId 绑定为局部可引用类型。
     list.ArrayList<qid.TypeId>! check_param_types(ast.AstRange params) {
         list.ArrayList<qid.TypeId>! values = list.ArrayList<qid.TypeId>(params.len);
         Int! index = 0;
@@ -352,12 +396,14 @@ struct TypeChecker {
         return values;
     }
 
+    // union variant payload 当前表示成 payload -> owner 的单参数函数类型。
     qid.TypeId single_param_function_type(qid.TypeId param, qid.TypeId result, token.Span span) {
         list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(1);
         params.add(param);
         return self.query.types.function_type(params, result, span);
     }
 
+    // 按顺序检查 block 内语句；当前阶段还不支持尾表达式类型，block 结果统一为 unit。
     qid.TypeId check_block(ast.AstId block_id, qid.TypeId expected_return) {
         ast.AstNode block = self.file.get(block_id);
         guard block.data is .block(block_data) else {
@@ -375,6 +421,7 @@ struct TypeChecker {
         return unit;
     }
 
+    // 检查语句节点，并保证语句自身在 type side table 中有结果类型。
     qid.TypeId check_stmt(ast.AstId stmt_id, qid.TypeId expected_return) {
         ast.AstNode stmt = self.file.get(stmt_id);
         qid.TypeId unit = self.query.types.unit_type();
@@ -398,6 +445,11 @@ struct TypeChecker {
             self.typed.set_type(stmt_id, unit);
             return unit;
         }
+        if (stmt.data is .guard_stmt(guard_stmt)) {
+            self.check_guard_stmt(guard_stmt, expected_return);
+            self.typed.set_type(stmt_id, unit);
+            return unit;
+        }
         if (stmt.data is .block(_)) {
             self.check_block(stmt_id, expected_return);
             self.typed.set_type(stmt_id, unit);
@@ -408,6 +460,7 @@ struct TypeChecker {
         return result;
     }
 
+    // 检查局部变量声明：显式类型、DefId 绑定和 initializer assignability。
     () check_let_stmt(ast.LetData let_stmt) {
         qid.TypeId declared_type = self.declared_local_type(let_stmt);
         if (self.resolved.name(let_stmt.name) is some local_def) {
@@ -419,6 +472,7 @@ struct TypeChecker {
         }
     }
 
+    // 当前阶段还不做局部变量类型推断；缺失显式类型时用 invalid 做错误恢复。
     qid.TypeId declared_local_type(ast.LetData let_stmt) {
         if (let_stmt.type_ref is some type_ref) {
             return self.check_type_ref(type_ref);
@@ -426,13 +480,21 @@ struct TypeChecker {
         return self.query.types.invalid_type();
     }
 
+    // 检查赋值语句左右两侧类型是否可赋值。
     () check_assign_stmt(ast.AssignData assign, token.Span span) {
         qid.TypeId target = self.check_expr(assign.target);
         qid.TypeId value = self.check_expr(assign.value);
         self.require_assignable(target, value, span);
     }
 
+    // return 做返回类型约束；break/continue 必须出现在 loop 内。
     () check_control_stmt(ast.ControlStmtData control_stmt, qid.TypeId expected_return, token.Span span) {
+        if (control_stmt.kind == .break_loop || control_stmt.kind == .continue_loop) {
+            if (self.loop_depth == 0) {
+                self.add_type_diagnostic(span, "loop control outside loop", "invalid_loop_control");
+            }
+            return;
+        }
         if (control_stmt.kind != .return_value) {
             if (control_stmt.value is some value) {
                 self.check_expr(value);
@@ -446,6 +508,7 @@ struct TypeChecker {
         self.require_assignable(expected_return, actual, span);
     }
 
+    // 表达式检查统一入口：计算类型并写入 AstId -> TypeId。
     qid.TypeId check_expr(ast.AstId expr_id) {
         ast.AstNode expr = self.file.get(expr_id);
         qid.TypeId type_id = self.expr_to_type(expr_id, expr);
@@ -453,6 +516,7 @@ struct TypeChecker {
         return type_id;
     }
 
+    // 根据表达式 AST kind 分派到具体规则；未支持节点返回 invalid。
     qid.TypeId expr_to_type(ast.AstId expr_id, ast.AstNode expr) {
         if (expr.data is .literal(literal)) {
             return self.literal_type(literal);
@@ -466,7 +530,14 @@ struct TypeChecker {
         if (expr.data is .name(_)) {
             return self.type_for_resolved_name(expr_id);
         }
-        if (expr.data is .path(_)) {
+        if (expr.data is .path(path)) {
+            // 多段 path 有两种来源：
+            // - `Type.member` / `module.name` 已在 resolve 阶段绑定到整个 path；
+            // - `value.member` 只能先绑定第一段 value，剩余成员要等 base type 出来后处理。
+            // 如果整个 path 没有 DefId，就按第二种情况做类型驱动成员选择。
+            if (self.resolved.name(expr_id) == null) {
+                return self.check_member_path_expr(expr_id, path, expr.span);
+            }
             return self.type_for_resolved_name(expr_id);
         }
         if (expr.data is .call(call)) {
@@ -478,12 +549,25 @@ struct TypeChecker {
         if (expr.data is .binary(binary)) {
             return self.check_binary_expr(binary, expr.span);
         }
+        if (expr.data is .field_expr(field)) {
+            return self.check_field_expr(expr_id, field, expr.span);
+        }
         if (expr.data is .block(_)) {
             return self.check_block(expr_id, self.query.types.unit_type());
+        }
+        if (expr.data is .if_expr(if_expr)) {
+            return self.check_if_expr(if_expr, expr.span);
+        }
+        if (expr.data is .loop_expr(loop_expr)) {
+            return self.check_loop_expr(loop_expr);
+        }
+        if (expr.data is .switch_expr(switch_expr)) {
+            return self.check_switch_expr(switch_expr);
         }
         return self.query.types.invalid_type();
     }
 
+    // literal 的内建类型规则；String 暂不作为 builtin，所以 string 返回 invalid。
     qid.TypeId literal_type(ast.LiteralData literal) {
         if (literal.kind == .int_lit) {
             return self.query.types.int_type();
@@ -497,12 +581,124 @@ struct TypeChecker {
         return self.query.types.invalid_type();
     }
 
+    // name_expr 是对内部 name/path 的包装，类型直接继承内部节点。
     qid.TypeId check_name_expr(ast.AstId expr_id, ast.AstId value_id) {
         qid.TypeId type_id = self.check_expr(value_id);
         self.typed.set_type(expr_id, type_id);
         return type_id;
     }
 
+    // `value.member` 要等 `value` 有 TypeId 后才能解析。
+    //
+    // Resolve 已经绑定 base 表达式里的普通名字；例如 `User user; user.address`
+    // 中，引用处的 `user` 和声明处的 `user` 指向同一个 local DefId。
+    // TypeChecker 再根据 base 类型 `User` 进入 User 的 declaration namespace，
+    // 选中 `address`，把这个 DefId 记录到 TypedFile.member_selections，
+    // 并返回被选中成员的类型。
+    qid.TypeId check_field_expr(ast.AstId expr_id, ast.FieldExprData field, token.Span span) {
+        qid.TypeId base_type = self.check_expr(field.base);
+        guard self.member_owner_namespace(base_type) is some namespace_id else {
+            self.add_type_diagnostic(span, "invalid member access", "invalid_member_access");
+            return self.query.types.invalid_type();
+        }
+        guard self.name_symbol(field.name) is some symbol else {
+            return self.query.types.invalid_type();
+        }
+        guard self.lookup_member(namespace_id, symbol) is some member_def else {
+            self.add_type_diagnostic(self.file.get(field.name).span, "invalid member access", "invalid_member_access");
+            return self.query.types.invalid_type();
+        }
+        if (!self.member_accessible(member_def)) {
+            self.add_type_diagnostic(self.file.get(field.name).span, "private member access", "private_member_access");
+            return self.query.types.invalid_type();
+        }
+        self.typed.bind_member_selection(expr_id, member_def);
+        self.typed.bind_member_selection(field.name, member_def);
+        return self.type_for_def(member_def);
+    }
+
+    // Parser 目前会把 `user.address.zip` 解析成 path，而不是嵌套 field_expr。
+    // Resolve 已经为第一段 `user` 写入普通名字 DefId；这里从第一段类型开始，
+    // 对后续每个 segment 逐层做成员选择，并把每段选择写入 member_selections。
+    qid.TypeId check_member_path_expr(ast.AstId path_id, ast.PathData path, token.Span span) {
+        if (path.segments.len == 0) {
+            return self.query.types.invalid_type();
+        }
+        ast.AstId first = self.file.child_at(path.segments, 0);
+        qid.TypeId! current_type = self.type_for_resolved_name(first);
+        Int! index = 1;
+        while (index < path.segments.len) {
+            ast.AstId segment = self.file.child_at(path.segments, index);
+            current_type = self.select_member(segment, current_type, self.file.get(segment).span);
+            index = index + 1;
+        }
+        if (path.segments.len > 1) {
+            ast.AstId last = self.file.child_at(path.segments, path.segments.len - 1);
+            if (self.typed.member_selection(last) is some member_def) {
+                self.typed.bind_member_selection(path_id, member_def);
+            }
+        }
+        self.typed.set_type(path_id, current_type);
+        return current_type;
+    }
+
+    qid.TypeId select_member(ast.AstId name_id, qid.TypeId base_type, token.Span span) {
+        guard self.member_owner_namespace(base_type) is some namespace_id else {
+            self.add_type_diagnostic(span, "invalid member access", "invalid_member_access");
+            return self.query.types.invalid_type();
+        }
+        guard self.name_symbol(name_id) is some symbol else {
+            return self.query.types.invalid_type();
+        }
+        guard self.lookup_member(namespace_id, symbol) is some member_def else {
+            self.add_type_diagnostic(span, "invalid member access", "invalid_member_access");
+            return self.query.types.invalid_type();
+        }
+        if (!self.member_accessible(member_def)) {
+            self.add_type_diagnostic(span, "private member access", "private_member_access");
+            return self.query.types.invalid_type();
+        }
+        self.typed.bind_member_selection(name_id, member_def);
+        return self.type_for_def(member_def);
+    }
+
+    qid.NamespaceId? member_owner_namespace(qid.TypeId base_type) {
+        types.TypeInfo base_info = self.query.types.get(base_type);
+        guard base_info.data is .named(named_type) else { return null; }
+        return self.query.defs.get(named_type.def_id).owned_namespace_id;
+    }
+
+    qid.SymbolId? name_symbol(ast.AstId name_id) {
+        ast.AstNode node = self.file.get(name_id);
+        if (node.data is .name(name_data)) {
+            if (name_data.symbol_id > 0) {
+                return qid.SymbolId.from_index(name_data.symbol_id);
+            }
+        }
+        return null;
+    }
+
+    qid.DefId? lookup_member(qid.NamespaceId namespace_id, qid.SymbolId symbol) {
+        if (self.query.resolve.lookup_namespace(namespace_id, symbol, .member_name, false) is some binding) {
+            return binding.def_id;
+        }
+        if (self.query.resolve.lookup_namespace(namespace_id, symbol, .value_name, false) is some binding) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    Bool member_accessible(qid.DefId member_def) {
+        def.DefRecord member = self.query.defs.get(member_def);
+        if (member.visibility == .public_visibility) {
+            return true;
+        }
+        guard member.module_id is some member_module else { return true; }
+        guard self.query.resolve.module_for_source(self.file.source_id) is some current_module else { return true; }
+        return member_module.to_index() == current_module.to_index();
+    }
+
+    // 从 ResolvedFile 中读取表达式引用到的 DefId，再映射到声明类型。
     qid.TypeId type_for_resolved_name(ast.AstId name_id) {
         guard self.resolved_def_for_path(name_id) is some def_id else {
             return self.query.types.invalid_type();
@@ -510,6 +706,7 @@ struct TypeChecker {
         return self.type_for_def(def_id);
     }
 
+    // 查找 DefId 的类型：优先当前文件 TypedFile，再查全局 builtin/type table。
     qid.TypeId type_for_def(qid.DefId def_id) {
         if (self.typed.type_for_def(def_id) is some type_id) {
             return type_id;
@@ -520,6 +717,7 @@ struct TypeChecker {
         return self.query.types.invalid_type();
     }
 
+    // 检查函数调用：callee 必须是 function type，结果为函数返回类型。
     qid.TypeId check_call_expr(ast.CallData call, token.Span span) {
         qid.TypeId callee_type = self.check_expr(call.callee);
         types.TypeInfo callee_info = self.query.types.get(callee_type);
@@ -532,6 +730,7 @@ struct TypeChecker {
         return function_type.result;
     }
 
+    // 检查调用参数个数，并对重叠部分做逐项 assignability 检查。
     () check_call_args(ast.AstRange args, types.FunctionType function_type) {
         if (args.len != function_type.params.length) {
             self.add_type_diagnostic(self.range_span(args), "call argument count mismatch", "call_arg_count_mismatch");
@@ -548,6 +747,7 @@ struct TypeChecker {
         }
     }
 
+    // call_arg 只是语法包装，真正类型来自参数表达式。
     qid.TypeId check_call_arg(ast.AstId arg_id) {
         ast.AstNode arg = self.file.get(arg_id);
         if (arg.data is .call_arg(call_arg)) {
@@ -556,6 +756,7 @@ struct TypeChecker {
         return self.check_expr(arg_id);
     }
 
+    // 基础 binary 规则：比较返回 bool，逻辑运算要求 bool，其余先要求两侧同型。
     qid.TypeId check_binary_expr(ast.BinaryData binary, token.Span span) {
         qid.TypeId lhs = self.check_expr(binary.left);
         qid.TypeId rhs = self.check_expr(binary.right);
@@ -572,16 +773,82 @@ struct TypeChecker {
         return lhs;
     }
 
+    // 比较类二元操作的结果类型固定为 bool。
     Bool binary_returns_bool(ast.BinaryOp op) {
         if (op == .equal || op == .not_equal) { return true; }
         if (op == .less || op == .less_equal) { return true; }
         return op == .greater || op == .greater_equal;
     }
 
+    // 逻辑二元操作要求两侧操作数都是 bool。
     Bool binary_requires_bool(ast.BinaryOp op) {
         return op == .logic_and || op == .logic_or;
     }
 
+    // if condition 必须是 bool；有 else 时两个分支类型必须一致。
+    qid.TypeId check_if_expr(ast.IfData if_expr, token.Span span) {
+        qid.TypeId condition = self.check_expr(if_expr.condition);
+        self.require_assignable(self.query.types.bool_type(), condition, self.file.get(if_expr.condition).span);
+        qid.TypeId then_type = self.check_expr(if_expr.then_body);
+        if (if_expr.else_body is some else_body) {
+            qid.TypeId else_type = self.check_expr(else_body);
+            self.require_assignable(then_type, else_type, span);
+            return then_type;
+        }
+        return self.query.types.unit_type();
+    }
+
+    // guard 的条件必须是 bool；else body 已由 parser 保证包含退出语句。
+    () check_guard_stmt(ast.GuardData guard_stmt, qid.TypeId expected_return) {
+        qid.TypeId condition = self.check_expr(guard_stmt.condition);
+        self.require_assignable(self.query.types.bool_type(), condition, self.file.get(guard_stmt.condition).span);
+        self.check_block(guard_stmt.else_body, expected_return);
+    }
+
+    // while condition 必须是 bool；loop body 内允许 break/continue。
+    qid.TypeId check_loop_expr(ast.LoopData loop_expr) {
+        if (loop_expr.condition is some condition) {
+            qid.TypeId condition_type = self.check_expr(condition);
+            self.require_assignable(self.query.types.bool_type(), condition_type, self.file.get(condition).span);
+        }
+        if (loop_expr.iterable is some iterable) {
+            self.check_expr(iterable);
+        }
+        self.loop_depth = self.loop_depth + 1;
+        self.check_block(loop_expr.body, self.query.types.unit_type());
+        self.loop_depth = self.loop_depth - 1;
+        return self.query.types.unit_type();
+    }
+
+    // switch 先检查 scrutinee 和各 case body；pattern 类型留到 Pattern 小节处理。
+    qid.TypeId check_switch_expr(ast.SwitchData switch_expr) {
+        self.check_expr(switch_expr.value);
+        qid.TypeId! result = self.query.types.unit_type();
+        Bool! has_result = false;
+        Int! index = 0;
+        while (index < switch_expr.cases.len) {
+            ast.AstId case_id = self.file.child_at(switch_expr.cases, index);
+            qid.TypeId case_type = self.check_switch_case(case_id);
+            if (has_result) {
+                self.require_assignable(result, case_type, self.file.get(case_id).span);
+            } else {
+                result = case_type;
+                has_result = true;
+            }
+            index = index + 1;
+        }
+        return result;
+    }
+
+    qid.TypeId check_switch_case(ast.AstId case_id) {
+        ast.AstNode case_node = self.file.get(case_id);
+        guard case_node.data is .switch_case(case_data) else {
+            return self.query.types.invalid_type();
+        }
+        return self.check_stmt(case_data.body, self.query.types.unit_type());
+    }
+
+    // 类型引用检查统一入口：计算类型并写入 AstId -> TypeId。
     qid.TypeId check_type_ref(ast.AstId type_id) {
         ast.AstNode node = self.file.get(type_id);
         qid.TypeId type_result = self.type_ref_to_type(type_id, node);
@@ -589,6 +856,7 @@ struct TypeChecker {
         return type_result;
     }
 
+    // 根据类型引用 AST kind 构造 TypeId；复杂类型递归检查子类型。
     qid.TypeId type_ref_to_type(ast.AstId type_id, ast.AstNode node) {
         if (node.data is .unit_type) {
             return self.query.types.unit_type();
@@ -617,6 +885,7 @@ struct TypeChecker {
         return self.query.types.invalid_type();
     }
 
+    // 检查一组类型引用，通常用于函数类型参数列表。
     list.ArrayList<qid.TypeId>! check_type_range(ast.AstRange range) {
         list.ArrayList<qid.TypeId>! values = list.ArrayList<qid.TypeId>(range.len);
         Int! index = 0;
@@ -627,12 +896,14 @@ struct TypeChecker {
         return values;
     }
 
+    // named_type 包装 path/type args；当前先只使用已 resolve 的 path。
     qid.TypeId named_type_ref(ast.AstId type_id, ast.NamedTypeData named_type, token.Span span) {
         qid.TypeId result = self.named_type_from_path(named_type.path, span);
         self.typed.set_type(named_type.path, result);
         return result;
     }
 
+    // 把已 resolve 的类型路径转换成 TypeId，alias 会按需展开。
     qid.TypeId named_type_from_path(ast.AstId path_id, token.Span span) {
         guard self.resolved_def_for_path(path_id) is some def_id else {
             return self.query.types.invalid_type();
@@ -649,6 +920,7 @@ struct TypeChecker {
         return self.query.types.named_type(def_id, span);
     }
 
+    // 解析 alias 目标类型，并用 invalid 作为临时值避免简单自递归卡住。
     qid.TypeId resolve_alias_type(qid.DefId alias_def) {
         if (self.typed.type_for_def(alias_def) is some type_id) {
             return type_id;
@@ -665,6 +937,7 @@ struct TypeChecker {
         return target_type;
     }
 
+    // 通过 DefId 找回当前文件中 alias 的 target AST。
     ast.AstId? alias_target_for_def(qid.DefId alias_def) {
         Int! index = 0;
         while (index < self.file.nodes.len()) {
@@ -677,6 +950,7 @@ struct TypeChecker {
         return null;
     }
 
+    // 判断一个 alias_decl 是否对应目标 DefId。
     ast.AstId? alias_node_matches_def(ast.AstNode node, qid.DefId alias_def) {
         guard node.data is .alias_decl(alias_decl) else { return null; }
         guard self.resolved.name(alias_decl.name) is some resolved_def else { return null; }
@@ -686,6 +960,7 @@ struct TypeChecker {
         return alias_decl.target;
     }
 
+    // Resolve 对单段 path 可能只在 segment 上记录 DefId，这里统一做回退。
     qid.DefId? resolved_def_for_path(ast.AstId path_id) {
         if (self.resolved.name(path_id) is some def_id) {
             return def_id;
@@ -699,6 +974,7 @@ struct TypeChecker {
         return null;
     }
 
+    // assignability 的诊断入口；invalid 参与时不级联报错。
     () require_assignable(qid.TypeId expected, qid.TypeId actual, token.Span span) {
         if (self.assignable(expected, actual)) {
             return;
@@ -706,6 +982,7 @@ struct TypeChecker {
         self.add_type_diagnostic(span, "type mismatch", "type_mismatch");
     }
 
+    // 当前阶段只支持完全同型赋值；后续隐式转换从这里扩展。
     Bool assignable(qid.TypeId expected, qid.TypeId actual) {
         if (self.is_invalid_type(expected) || self.is_invalid_type(actual)) {
             return true;
@@ -713,6 +990,7 @@ struct TypeChecker {
         return self.same_type(expected, actual);
     }
 
+    // TypeId 快路径相等后，比较底层 TypeData 结构。
     Bool same_type(qid.TypeId lhs, qid.TypeId rhs) {
         if (lhs.to_index() == rhs.to_index()) {
             return true;
@@ -722,6 +1000,7 @@ struct TypeChecker {
         return self.same_type_data(lhs_info.data, rhs_info.data);
     }
 
+    // 结构化类型相等规则；同 variant 再比较 payload。
     Bool same_type_data(types.TypeData lhs, types.TypeData rhs) {
         if (lhs is .invalid) { return rhs is .invalid; }
         if (lhs is .never) { return rhs is .never; }
@@ -751,6 +1030,7 @@ struct TypeChecker {
         return false;
     }
 
+    // function type 相等要求参数数量、参数类型和返回类型都一致。
     Bool same_function_type(types.FunctionType lhs, types.FunctionType rhs) {
         if (lhs.params.length != rhs.params.length) {
             return false;
@@ -765,10 +1045,12 @@ struct TypeChecker {
         return self.same_type(lhs.result, rhs.result);
     }
 
+    // invalid 类型用于错误恢复，不参与后续级联诊断。
     Bool is_invalid_type(qid.TypeId type_id) {
         return self.query.types.get(type_id).data is .invalid;
     }
 
+    // 计算一个 AstRange 覆盖的源码 span，用于参数列表等合成诊断位置。
     token.Span range_span(ast.AstRange range) {
         if (range.empty()) {
             return token.Span();
@@ -780,6 +1062,7 @@ struct TypeChecker {
         return token.Span(first_span.start, last_span.end() - first_span.start);
     }
 
+    // 记录类型检查诊断，并标记当前 TypedFile 不可继续降级。
     () add_type_diagnostic(token.Span span, UInt8[] message, UInt8[] code) {
         self.typed.mark_error();
         add_type_check_diagnostic(self.ctx, self.file.source_id, span, message, code);
