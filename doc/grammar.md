@@ -315,7 +315,7 @@ extend_member
 ## 语句和 block
 
 ```peg
-block       <- "{" stmt* "}"
+block       <- "{" stmt* tail_expr? "}"
 
 stmt        <- return_stmt
              / throw_stmt
@@ -326,10 +326,14 @@ stmt        <- return_stmt
              / guard_stmt
              / while_stmt
              / for_stmt
+             / if_stmt
+             / switch_stmt
              / destructure_stmt
              / var_decl_stmt
              / assign_stmt
-             / expr_stmt
+             / call_stmt
+
+tail_expr   <- expr
 
 return_stmt <- "return" expr? ";"
 
@@ -359,7 +363,11 @@ assign_stmt <- expr assign_op expr ";"
 assign_op   <- "=" / "+=" / "-=" / "*=" / "/=" / "%="
              / "&=" / "|=" / "^=" / "<<=" / ">>="
 
-expr_stmt   <- expr ";"
+call_stmt   <- postfix_expr ";"
+
+if_stmt     <- if_expr
+
+switch_stmt <- switch_expr
 
 while_stmt  <- "while" expr_without_block block
 
@@ -374,9 +382,12 @@ switch_pattern_list
              / match_pattern ("," match_pattern)*
 ```
 
-说明：`block` 内只允许 `stmt`，不允许独立的 tail expression。
-`expr_stmt` 必须以 `;` 结束。`block` 的值由最后一条 `stmt` 决定；
-空 `block` 的值为 `Unit`。
+说明：`stmt` 永远不贡献 `block` 的值；`block` 的值只来自最后一个不带分号的
+`tail_expr`。没有 `tail_expr` 的 `block` 值为 `Unit`。普通表达式不能随意写成
+`expr;`，只有调用语句、赋值语句、控制语句和声明等明确 statement 形态可以带
+分号出现。这样可以避免 `T x;` 声明和任意表达式语句在 block 开头互相抢解析。
+`call_stmt` 在语法上先解析为 `postfix_expr`，但要求最外层 postfix 必须是调用；
+`foo();`、`value$.ref();` 合法，`foo.bar;`、`a + b;` 不合法。
 
 ## 表达式
 
@@ -500,10 +511,10 @@ if_expr     <- "if" expr_without_block block "else" block
 switch_expr <- "switch" expr_without_block "{" switch_expr_case* "}"
 
 switch_expr_case
-            <- switch_pattern_list "=>" switch_expr_body
+            <- switch_pattern_list "=>" switch_expr_body ","?
 
 switch_expr_body
-            <- block / stmt
+            <- block / expr_without_block / if_expr / switch_expr / try_catch_expr
 
 try_catch_expr
             <- "try" expr catch_clause
