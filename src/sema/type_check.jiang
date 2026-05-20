@@ -108,6 +108,7 @@ struct TypeChecker {
     resolve_result.ResolvedFile& resolved;
     TypedFile^ typed;
     Int! loop_depth;
+    qid.TypeId! expected_return_type;
 
     public init(
         context.CompilerContext& ctx,
@@ -121,6 +122,7 @@ struct TypeChecker {
         self.resolved = resolved;
         self.typed = typed;
         self.loop_depth = 0;
+        self.expected_return_type = self.query.types.unit_type();
     }
 
     public Bool check() {
@@ -329,7 +331,10 @@ struct TypeChecker {
     () check_function_body(ast.FunctionData function_decl) {
         guard function_decl.body is some body else { return; }
         qid.TypeId result_type = self.check_type_ref(function_decl.result_type);
+        qid.TypeId previous_return_type = self.expected_return_type;
+        self.expected_return_type = result_type;
         self.check_block(body, result_type);
+        self.expected_return_type = previous_return_type;
     }
 
     // nominal 第二遍只检查成员 body/default，不重复处理成员签名。
@@ -388,6 +393,7 @@ struct TypeChecker {
                 param_type = self.check_type_ref(param_data.type_ref);
                 if (self.resolved.name(param_data.name) is some param_def) {
                     self.typed.bind_def_type(param_def, param_type);
+                    self.typed.set_type(param_data.name, param_type);
                 }
             }
             values.add(param_type);
@@ -465,6 +471,7 @@ struct TypeChecker {
         qid.TypeId declared_type = self.declared_local_type(let_stmt);
         if (self.resolved.name(let_stmt.name) is some local_def) {
             self.typed.bind_def_type(local_def, declared_type);
+            self.typed.set_type(let_stmt.name, declared_type);
         }
         if (let_stmt.initializer is some initializer) {
             qid.TypeId actual = self.check_expr(initializer);
@@ -480,11 +487,53 @@ struct TypeChecker {
         return self.query.types.invalid_type();
     }
 
-    // 检查赋值语句左右两侧类型是否可赋值。
+    // 检查赋值语句：左侧必须是可写位置，右侧类型必须能赋给左侧。
     () check_assign_stmt(ast.AssignData assign, token.Span span) {
         qid.TypeId target = self.check_expr(assign.target);
+        if (!self.is_invalid_type(target)) {
+            if (!self.is_assignment_target(assign.target)) {
+                self.add_type_diagnostic(span, "invalid assignment target", "invalid_assignment_target");
+            } else if (!self.is_mutable_type(target)) {
+                self.add_type_diagnostic(span, "immutable assignment target", "immutable_assignment_target");
+            }
+        }
         qid.TypeId value = self.check_expr(assign.value);
         self.require_assignable(target, value, span);
+    }
+
+    // 这里只判断“是不是位置表达式”；是否可写由 target TypeId 的最外层 mutable 决定。
+    Bool is_assignment_target(ast.AstId target_id) {
+        ast.AstNode target = self.file.get(target_id);
+        if (target.data is .name_expr(name_expr)) {
+            return self.is_assignment_target(name_expr.value);
+        }
+        if (target.data is .name(_)) {
+            if (self.resolved_def_for_path(target_id) is some def_id) {
+                def.DefKind kind = self.query.defs.get(def_id).kind;
+                return kind == .local_def || kind == .global_def;
+            }
+            return false;
+        }
+        if (target.data is .path(path)) {
+            // parser 仍会把 `value.member` 解析成 path；type check 先查
+            // member_selection，查不到时才把单段 path 当普通绑定处理。
+            if (self.typed.member_selection(target_id) is some member_def) {
+                return self.query.defs.get(member_def).kind == .field_def;
+            }
+            if (path.segments.len != 1) { return false; }
+            if (self.resolved_def_for_path(target_id) is some def_id) {
+                def.DefKind kind = self.query.defs.get(def_id).kind;
+                return kind == .local_def || kind == .global_def;
+            }
+            return false;
+        }
+        if (target.data is .field_expr(_)) {
+            if (self.typed.member_selection(target_id) is some member_def) {
+                return self.query.defs.get(member_def).kind == .field_def;
+            }
+            return false;
+        }
+        return false;
     }
 
     // return 做返回类型约束；break/continue 必须出现在 loop 内。
@@ -538,7 +587,11 @@ struct TypeChecker {
             if (self.resolved.name(expr_id) == null) {
                 return self.check_member_path_expr(expr_id, path, expr.span);
             }
-            return self.type_for_resolved_name(expr_id);
+            qid.TypeId type_id = self.type_for_resolved_name(expr_id);
+            if (path.segments.len == 1) {
+                self.typed.set_type(self.file.child_at(path.segments, 0), type_id);
+            }
+            return type_id;
         }
         if (expr.data is .call(call)) {
             return self.check_call_expr(call, expr.span);
@@ -556,7 +609,7 @@ struct TypeChecker {
             return self.check_field_expr(expr_id, field, expr.span);
         }
         if (expr.data is .block(_)) {
-            return self.check_block(expr_id, self.query.types.unit_type());
+            return self.check_block(expr_id, self.expected_return_type);
         }
         if (expr.data is .if_expr(if_expr)) {
             return self.check_if_expr(if_expr, expr.span);
@@ -736,7 +789,7 @@ struct TypeChecker {
     // 检查调用参数个数，并对重叠部分做逐项 assignability 检查。
     () check_call_args(ast.AstRange args, types.FunctionType function_type) {
         if (args.len != function_type.params.length) {
-            self.add_type_diagnostic(self.range_span(args), "call argument count mismatch", "call_arg_count_mismatch");
+            self.add_call_arg_count_diagnostic(self.range_span(args));
         }
 
         Int! index = 0;
@@ -818,7 +871,7 @@ struct TypeChecker {
             self.check_expr(iterable);
         }
         self.loop_depth = self.loop_depth + 1;
-        self.check_block(loop_expr.body, self.query.types.unit_type());
+        self.check_block(loop_expr.body, self.expected_return_type);
         self.loop_depth = self.loop_depth - 1;
         return self.query.types.unit_type();
     }
@@ -849,7 +902,7 @@ struct TypeChecker {
             return self.query.types.invalid_type();
         }
         self.check_pattern_range(case_data.patterns, scrutinee_type);
-        return self.check_stmt(case_data.body, self.query.types.unit_type());
+        return self.check_stmt(case_data.body, self.expected_return_type);
     }
 
     // `value is pattern` 的结果是 bool，pattern 负责绑定局部名字的类型。
@@ -1024,6 +1077,9 @@ struct TypeChecker {
         }
         if (node.data is .type_ref(type_data)) {
             qid.TypeId base = self.check_type_ref(type_data.base);
+            if (type_data.layer == .mutable_type) {
+                return self.query.types.mutable_type(base, node.span);
+            }
             if (type_data.layer == .optional) {
                 return self.query.types.optional_type(base, node.span);
             }
@@ -1140,7 +1196,7 @@ struct TypeChecker {
         if (self.assignable(expected, actual)) {
             return;
         }
-        self.add_type_diagnostic(span, "type mismatch", "type_mismatch");
+        self.add_type_mismatch_diagnostic(span);
     }
 
     // 当前阶段只支持完全同型赋值；后续隐式转换从这里扩展。
@@ -1211,6 +1267,11 @@ struct TypeChecker {
         return self.query.types.get(type_id).data is .invalid;
     }
 
+    // 声明中的 `T!` 是 TypeInfo 上的外层 qualifier，只用于判断位置是否可写。
+    Bool is_mutable_type(qid.TypeId type_id) {
+        return self.query.types.get(type_id).is_mutable;
+    }
+
     // 计算一个 AstRange 覆盖的源码 span，用于参数列表等合成诊断位置。
     token.Span range_span(ast.AstRange range) {
         if (range.empty()) {
@@ -1227,6 +1288,53 @@ struct TypeChecker {
     () add_type_diagnostic(token.Span span, UInt8[] message, UInt8[] code) {
         self.typed.mark_error();
         add_type_check_diagnostic(self.ctx, self.file.source_id, span, message, code);
+    }
+
+    // 结构化 type mismatch 诊断：先用 expected/actual label 表达角色，
+    // 后续补 TypeId pretty-printer 后再把具体类型名写入 label message。
+    () add_type_mismatch_diagnostic(token.Span span) {
+        self.typed.mark_error();
+        diagnostic.Diagnostic! diag = diagnostic.Diagnostic(
+            .error,
+            .type_check,
+            diagnostic.DiagnosticCode("type_mismatch"),
+            diagnostic.SourceRange(self.file.source_id, span),
+            "type mismatch"
+        );
+        diag.add_label(diagnostic.DiagnosticLabel(
+            .primary,
+            diagnostic.SourceRange(self.file.source_id, span),
+            "expected type"
+        ));
+        diag.add_label(diagnostic.DiagnosticLabel(
+            .secondary,
+            diagnostic.SourceRange(self.file.source_id, span),
+            "actual type"
+        ));
+        self.ctx.diagnostics.add(diag);
+    }
+
+    // 参数数量错误也用 expected/actual label，避免调用方只能解析纯文本。
+    () add_call_arg_count_diagnostic(token.Span span) {
+        self.typed.mark_error();
+        diagnostic.Diagnostic! diag = diagnostic.Diagnostic(
+            .error,
+            .type_check,
+            diagnostic.DiagnosticCode("call_arg_count_mismatch"),
+            diagnostic.SourceRange(self.file.source_id, span),
+            "call argument count mismatch"
+        );
+        diag.add_label(diagnostic.DiagnosticLabel(
+            .primary,
+            diagnostic.SourceRange(self.file.source_id, span),
+            "expected parameter count"
+        ));
+        diag.add_label(diagnostic.DiagnosticLabel(
+            .secondary,
+            diagnostic.SourceRange(self.file.source_id, span),
+            "actual argument count"
+        ));
+        self.ctx.diagnostics.add(diag);
     }
 }
 
