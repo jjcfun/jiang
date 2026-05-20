@@ -549,6 +549,9 @@ struct TypeChecker {
         if (expr.data is .binary(binary)) {
             return self.check_binary_expr(binary, expr.span);
         }
+        if (expr.data is .is_pattern(is_pattern)) {
+            return self.check_is_pattern_expr(is_pattern);
+        }
         if (expr.data is .field_expr(field)) {
             return self.check_field_expr(expr_id, field, expr.span);
         }
@@ -820,15 +823,15 @@ struct TypeChecker {
         return self.query.types.unit_type();
     }
 
-    // switch 先检查 scrutinee 和各 case body；pattern 类型留到 Pattern 小节处理。
+    // switch 先检查 scrutinee，再用 scrutinee 类型约束每个 case pattern。
     qid.TypeId check_switch_expr(ast.SwitchData switch_expr) {
-        self.check_expr(switch_expr.value);
+        qid.TypeId scrutinee_type = self.check_expr(switch_expr.value);
         qid.TypeId! result = self.query.types.unit_type();
         Bool! has_result = false;
         Int! index = 0;
         while (index < switch_expr.cases.len) {
             ast.AstId case_id = self.file.child_at(switch_expr.cases, index);
-            qid.TypeId case_type = self.check_switch_case(case_id);
+            qid.TypeId case_type = self.check_switch_case(case_id, scrutinee_type);
             if (has_result) {
                 self.require_assignable(result, case_type, self.file.get(case_id).span);
             } else {
@@ -840,12 +843,170 @@ struct TypeChecker {
         return result;
     }
 
-    qid.TypeId check_switch_case(ast.AstId case_id) {
+    qid.TypeId check_switch_case(ast.AstId case_id, qid.TypeId scrutinee_type) {
         ast.AstNode case_node = self.file.get(case_id);
         guard case_node.data is .switch_case(case_data) else {
             return self.query.types.invalid_type();
         }
+        self.check_pattern_range(case_data.patterns, scrutinee_type);
         return self.check_stmt(case_data.body, self.query.types.unit_type());
+    }
+
+    // `value is pattern` 的结果是 bool，pattern 负责绑定局部名字的类型。
+    qid.TypeId check_is_pattern_expr(ast.IsPatternData is_pattern) {
+        qid.TypeId input_type = self.check_expr(is_pattern.value);
+        self.check_pattern(is_pattern.pattern, input_type);
+        return self.query.types.bool_type();
+    }
+
+    // switch case 允许多个 pattern 共用同一个 body，每个 pattern 都匹配同一个 scrutinee 类型。
+    () check_pattern_range(ast.AstRange patterns, qid.TypeId input_type) {
+        Int! index = 0;
+        while (index < patterns.len) {
+            self.check_pattern(self.file.child_at(patterns, index), input_type);
+            index = index + 1;
+        }
+    }
+
+    // Pattern 不产生运行期值类型；它把匹配输入类型分发到绑定名和 payload。
+    () check_pattern(ast.AstId pattern_id, qid.TypeId input_type) {
+        ast.AstNode pattern_node = self.file.get(pattern_id);
+        guard pattern_node.data is .pattern(pattern) else { return; }
+        self.typed.set_type(pattern_id, self.query.types.unit_type());
+        if (pattern.type_ref is some type_ref) {
+            self.check_typed_binding_pattern(pattern, type_ref, input_type, pattern_node.span);
+            return;
+        }
+        if (pattern.value is some value) {
+            self.check_value_pattern(value, input_type, pattern_node.span);
+            return;
+        }
+        if (pattern.name is some name) {
+            self.check_named_pattern(name, pattern.payload, input_type, pattern_node.span);
+            return;
+        }
+        self.check_pattern_range(pattern.payload, input_type);
+    }
+
+    // `Int item` 这种 typed binding 同时约束输入类型，并把声明类型写给 item。
+    () check_typed_binding_pattern(
+        ast.PatternData pattern,
+        ast.AstId type_ref,
+        qid.TypeId input_type,
+        token.Span span
+    ) {
+        qid.TypeId declared_type = self.check_type_ref(type_ref);
+        self.require_assignable(declared_type, input_type, span);
+        if (pattern.name is some name) {
+            self.bind_pattern_name_type(name, declared_type);
+        }
+        self.check_pattern_range(pattern.payload, declared_type);
+    }
+
+    // PatternData.value 有两种形态：
+    // - 子 pattern：来自 `some pattern`，需要先解 optional；
+    // - 普通表达式/literal：按常量 pattern 检查它能否赋给输入类型。
+    () check_value_pattern(ast.AstId value, qid.TypeId input_type, token.Span span) {
+        ast.AstNode value_node = self.file.get(value);
+        if (value_node.data is .pattern(_)) {
+            self.check_optional_pattern(value, input_type, span);
+            return;
+        }
+        qid.TypeId value_type = self.check_expr(value);
+        self.require_assignable(input_type, value_type, span);
+    }
+
+    // `some item` 只接受 optional 输入，内部 pattern 看到的是 element type。
+    // 例如输入 `Int?` 时，`item` 会被绑定为 `Int`。
+    () check_optional_pattern(ast.AstId nested_pattern, qid.TypeId input_type, token.Span span) {
+        types.TypeInfo input_info = self.query.types.get(input_type);
+        guard input_info.data is .optional(optional_type) else {
+            if (!self.is_invalid_type(input_type)) {
+                self.add_type_diagnostic(span, "optional pattern requires optional input", "invalid_optional_pattern");
+            }
+            self.check_pattern(nested_pattern, self.query.types.invalid_type());
+            return;
+        }
+        self.check_pattern(nested_pattern, optional_type.element);
+    }
+
+    // name pattern 可能是 binding，也可能是 resolve 已绑定的 variant path。
+    // resolve 阶段已经把 `R.ok` 这种显式 variant pattern 写入 ResolvedFile；
+    // type check 这里只负责区分 variant 和普通 binding，并分发 payload 类型。
+    () check_named_pattern(ast.AstId name, ast.AstRange payload, qid.TypeId input_type, token.Span span) {
+        if (self.resolved_def_for_path(name) is some def_id) {
+            def.DefKind kind = self.query.defs.get(def_id).kind;
+            if (kind == .enum_case_def || kind == .union_variant_def) {
+                self.check_variant_def_pattern(def_id, payload, input_type, span);
+                return;
+            }
+        }
+        if (!payload.empty()) {
+            self.add_type_diagnostic(span, "invalid pattern payload", "invalid_pattern_payload");
+            self.check_pattern_range(payload, self.query.types.invalid_type());
+            return;
+        }
+        self.bind_pattern_name_type(name, input_type);
+    }
+
+    // 点前缀 pattern（如 `.ok`）后续可以在这里根据输入类型补 owner lookup；
+    // 当前 resolve 只处理显式 path，所以没有 DefId 时只检查 payload 以避免级联。
+    () check_variant_pattern(ast.AstId name, ast.AstRange payload, qid.TypeId input_type, token.Span span) {
+        guard self.resolved_def_for_path(name) is some def_id else {
+            self.check_pattern_range(payload, self.query.types.invalid_type());
+            return;
+        }
+        self.check_variant_def_pattern(def_id, payload, input_type, span);
+    }
+
+    // enum case 的类型是 owner type；带 payload 的 union variant 表示成
+    // payload -> owner 的函数类型，所以先检查 result 能匹配输入，再把参数类型分给 payload。
+    () check_variant_def_pattern(qid.DefId def_id, ast.AstRange payload, qid.TypeId input_type, token.Span span) {
+        def.DefKind kind = self.query.defs.get(def_id).kind;
+        if (kind != .enum_case_def && kind != .union_variant_def) {
+            self.add_type_diagnostic(span, "expected enum case or union variant", "invalid_variant_pattern");
+            self.check_pattern_range(payload, self.query.types.invalid_type());
+            return;
+        }
+        qid.TypeId variant_type = self.type_for_def(def_id);
+        if (self.query.types.get(variant_type).data is .function_type(function_type)) {
+            self.require_assignable(function_type.result, input_type, span);
+            self.check_variant_payload(payload, function_type);
+            return;
+        }
+        self.require_assignable(variant_type, input_type, span);
+        if (!payload.empty()) {
+            self.add_type_diagnostic(span, "invalid pattern payload", "invalid_pattern_payload");
+            self.check_pattern_range(payload, self.query.types.invalid_type());
+        }
+    }
+
+    // 只对实参范围内的 payload 继续递归检查；数量不一致时先报一次专门诊断。
+    () check_variant_payload(ast.AstRange payload, types.FunctionType function_type) {
+        if (payload.len != function_type.params.length) {
+            self.add_type_diagnostic(
+                self.range_span(payload),
+                "pattern payload count mismatch", "pattern_payload_count_mismatch"
+            );
+        }
+        Int! count = payload.len;
+        if (function_type.params.length < count) {
+            count = function_type.params.length;
+        }
+        Int! index = 0;
+        while (index < count) {
+            self.check_pattern(self.file.child_at(payload, index), function_type.params[index]);
+            index = index + 1;
+        }
+    }
+
+    // Resolve 已经为 binding pattern 创建 local DefId；这里补上 DefId -> TypeId，
+    // 后续 `item` 这样的 name reference 就能通过 type_for_def 读到类型。
+    () bind_pattern_name_type(ast.AstId name, qid.TypeId type_id) {
+        if (self.resolved_def_for_path(name) is some def_id) {
+            self.typed.bind_def_type(def_id, type_id);
+            self.typed.set_type(name, type_id);
+        }
     }
 
     // 类型引用检查统一入口：计算类型并写入 AstId -> TypeId。
