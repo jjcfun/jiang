@@ -11,6 +11,7 @@ import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
+import dependency_graph = "./dependency_graph.jiang";
 import types = "./type.jiang";
 
 public struct TypedFile {
@@ -87,7 +88,13 @@ public TypedFile^ check_file(
     ast.AstFile& file,
     resolve_result.ResolvedFile& resolved
 ) {
-    Bool valid = validate_type_check_inputs(ctx, file, resolved);
+    Bool! valid = validate_type_check_inputs(ctx, file, resolved);
+    if (valid) {
+        // 在真正展开 alias/签名/body 前，先检查定义级语义依赖。
+        // 当前入口仍是单文件临时版本；它保证本文件内 alias cycle 不会
+        // 进入下面的按需 alias 展开路径。
+        valid = dependency_graph.check_file_dependencies(ctx, file, resolved);
+    }
     TypedFile^ typed = new TypedFile(file.source_id, resolved.revision, valid);
     if (!valid) {
         return typed;
@@ -491,26 +498,66 @@ struct TypeChecker {
         }
     }
 
-    // 当前阶段还不做局部变量类型推断；缺失显式类型时用 invalid 做错误恢复。
+    // 当前阶段还不做局部变量类型推断；缺失显式类型时给独立诊断，
+    // 再用 invalid 做错误恢复，避免后续引用级联报错。
     qid.TypeId declared_local_type(ast.LetData let_stmt) {
         if (let_stmt.type_ref is some type_ref) {
             return self.check_type_ref(type_ref);
         }
+        self.add_type_diagnostic(
+            self.file.get(let_stmt.name).span,
+            "missing type annotation",
+            "missing_type_annotation"
+        );
         return self.query.types.invalid_type();
     }
 
     // 检查赋值语句：左侧必须是可写位置，右侧类型必须能赋给左侧。
     () check_assign_stmt(ast.AssignData assign, token.Span span) {
         qid.TypeId target = self.check_expr(assign.target);
-        if (!self.is_invalid_type(target)) {
-            if (!self.is_assignment_target(assign.target)) {
-                self.add_type_diagnostic(span, "invalid assignment target", "invalid_assignment_target");
-            } else if (!self.is_mutable_type(target)) {
-                self.add_type_diagnostic(span, "immutable assignment target", "immutable_assignment_target");
-            }
-        }
+        self.check_assign_target(assign.target, target, span);
         qid.TypeId value = self.check_expr(assign.value);
-        self.require_assignable(target, value, span);
+        if (assign.op == .assign) {
+            self.require_assignable(target, value, span);
+            return;
+        }
+        qid.TypeId result = self.check_binary_operation_types(
+            self.compound_assign_binary_op(assign.op),
+            target,
+            value,
+            span
+        );
+        self.require_assignable(target, result, span);
+    }
+
+    // 赋值目标分两层判断：语法/resolve 层先确认它是不是位置表达式，
+    // 类型层再根据 TypeInfo 上的外层 mutable flag 判断是否可写。
+    () check_assign_target(ast.AstId target_id, qid.TypeId target_type, token.Span span) {
+        if (self.is_invalid_type(target_type)) {
+            return;
+        }
+        if (!self.is_assignment_target(target_id)) {
+            self.add_type_diagnostic(span, "invalid assignment target", "invalid_assignment_target");
+            return;
+        }
+        if (!self.is_mutable_type(target_type)) {
+            self.add_type_diagnostic(span, "immutable assignment target", "immutable_assignment_target");
+        }
+    }
+
+    // 复合赋值先按对应二元运算求结果类型，再要求结果能写回左侧。
+    // 这样 `a += b` 和 `a + b` 共享同一套操作数规则。
+    ast.BinaryOp compound_assign_binary_op(ast.AssignOp op) {
+        if (op == .add_assign) { return .add; }
+        if (op == .sub_assign) { return .sub; }
+        if (op == .mul_assign) { return .mul; }
+        if (op == .div_assign) { return .div; }
+        if (op == .mod_assign) { return .mod; }
+        if (op == .bit_and_assign) { return .bit_and; }
+        if (op == .bit_or_assign) { return .bit_or; }
+        if (op == .bit_xor_assign) { return .bit_xor; }
+        if (op == .shift_left_assign) { return .shift_left; }
+        return .shift_right;
     }
 
     // 这里只判断“是不是位置表达式”；是否可写由 target TypeId 的最外层 mutable 决定。
@@ -577,7 +624,8 @@ struct TypeChecker {
         return type_id;
     }
 
-    // 根据表达式 AST kind 分派到具体规则；未支持节点返回 invalid。
+    // 根据表达式 AST kind 分派到具体规则；当前类型系统承载不了的节点
+    // 要显式诊断，不能静默变成 invalid。
     qid.TypeId expr_to_type(ast.AstId expr_id, ast.AstNode expr) {
         if (expr.data is .literal(literal)) {
             return self.literal_type(literal);
@@ -611,8 +659,41 @@ struct TypeChecker {
         if (expr.data is .call_arg(call_arg)) {
             return self.check_expr(call_arg.value);
         }
+        if (expr.data is .unary(unary)) {
+            return self.check_unary_expr(unary, expr.span);
+        }
         if (expr.data is .binary(binary)) {
             return self.check_binary_expr(binary, expr.span);
+        }
+        if (expr.data is .range(range)) {
+            return self.check_range_expr(range, expr.span);
+        }
+        if (expr.data is .tuple_expr(tuple_expr)) {
+            return self.check_expr_range_unsupported(tuple_expr, expr.span, "unsupported tuple expression");
+        }
+        if (expr.data is .index_expr(index_expr)) {
+            return self.check_index_expr(index_expr, expr.span);
+        }
+        if (expr.data is .slice_expr(slice_expr)) {
+            return self.check_slice_expr(slice_expr, expr.span);
+        }
+        if (expr.data is .cast_expr(cast_expr)) {
+            return self.check_cast_expr(cast_expr, expr.span);
+        }
+        if (expr.data is .struct_literal(struct_literal)) {
+            return self.check_struct_literal_expr(struct_literal, expr.span);
+        }
+        if (expr.data is .field_init(field_init)) {
+            return self.check_expr(field_init.value);
+        }
+        if (expr.data is .implicit_call(implicit_call)) {
+            return self.check_implicit_call_expr(implicit_call, expr.span);
+        }
+        if (expr.data is .type_implicit_call(implicit_call)) {
+            return self.check_implicit_call_expr(implicit_call, expr.span);
+        }
+        if (expr.data is .implicit_arg(implicit_arg)) {
+            return self.check_implicit_arg_expr(implicit_arg);
         }
         if (expr.data is .is_pattern(is_pattern)) {
             return self.check_is_pattern_expr(is_pattern);
@@ -631,6 +712,12 @@ struct TypeChecker {
         }
         if (expr.data is .switch_expr(switch_expr)) {
             return self.check_switch_expr(switch_expr);
+        }
+        if (expr.data is .catch_expr(catch_expr)) {
+            return self.check_catch_expr(catch_expr, expr.span);
+        }
+        if (expr.data is .catch_clause(catch_clause)) {
+            return self.check_catch_clause(catch_clause);
         }
         return self.query.types.invalid_type();
     }
@@ -824,15 +911,46 @@ struct TypeChecker {
         return self.check_expr(arg_id);
     }
 
+    qid.TypeId check_unary_expr(ast.UnaryData unary, token.Span span) {
+        qid.TypeId value = self.check_expr(unary.value);
+        if (unary.op == .not) {
+            self.require_assignable(self.query.types.bool_type(), value, span);
+            return self.query.types.bool_type();
+        }
+        if (unary.op == .negate) {
+            if (!self.is_numeric_type(value)) {
+                self.add_type_diagnostic(span, "numeric operand required", "invalid_unary_operand");
+            }
+            return value;
+        }
+        if (unary.op == .bit_not) {
+            if (!self.is_int_type(value)) {
+                self.add_type_diagnostic(span, "integer operand required", "invalid_unary_operand");
+            }
+            return value;
+        }
+        return self.unsupported_expr(span, "unsupported unary expression");
+    }
+
     // 基础 binary 规则：比较返回 bool，逻辑运算要求 bool，其余先要求两侧同型。
     qid.TypeId check_binary_expr(ast.BinaryData binary, token.Span span) {
         qid.TypeId lhs = self.check_expr(binary.left);
         qid.TypeId rhs = self.check_expr(binary.right);
-        if (self.binary_returns_bool(binary.op)) {
+        return self.check_binary_operation_types(binary.op, lhs, rhs, span);
+    }
+
+    // 二元表达式和复合赋值都走这里，避免两处维护不同的运算类型规则。
+    qid.TypeId check_binary_operation_types(
+        ast.BinaryOp op,
+        qid.TypeId lhs,
+        qid.TypeId rhs,
+        token.Span span
+    ) {
+        if (self.binary_returns_bool(op)) {
             self.require_assignable(lhs, rhs, span);
             return self.query.types.bool_type();
         }
-        if (self.binary_requires_bool(binary.op)) {
+        if (self.binary_requires_bool(op)) {
             self.require_assignable(self.query.types.bool_type(), lhs, span);
             self.require_assignable(self.query.types.bool_type(), rhs, span);
             return self.query.types.bool_type();
@@ -851,6 +969,91 @@ struct TypeChecker {
     // 逻辑二元操作要求两侧操作数都是 bool。
     Bool binary_requires_bool(ast.BinaryOp op) {
         return op == .logic_and || op == .logic_or;
+    }
+
+    qid.TypeId check_range_expr(ast.RangeData range, token.Span span) {
+        qid.TypeId start = self.check_expr(range.start);
+        qid.TypeId end = self.check_expr(range.end);
+        self.require_assignable(start, end, span);
+        return self.unsupported_expr(span, "unsupported range expression");
+    }
+
+    qid.TypeId check_expr_range_unsupported(ast.AstRange range, token.Span span, UInt8[] message) {
+        Int! index = 0;
+        while (index < range.len) {
+            self.check_expr(self.file.child_at(range, index));
+            index = index + 1;
+        }
+        return self.unsupported_expr(span, message);
+    }
+
+    qid.TypeId check_index_expr(ast.IndexExprData index_expr, token.Span span) {
+        self.check_expr(index_expr.base);
+        self.check_expr(index_expr.index);
+        return self.unsupported_expr(span, "unsupported index expression");
+    }
+
+    qid.TypeId check_slice_expr(ast.SliceExprData slice_expr, token.Span span) {
+        self.check_expr(slice_expr.base);
+        if (slice_expr.start is some start) {
+            self.check_expr(start);
+        }
+        if (slice_expr.end is some end) {
+            self.check_expr(end);
+        }
+        return self.unsupported_expr(span, "unsupported slice expression");
+    }
+
+    qid.TypeId check_cast_expr(ast.CastData cast_expr, token.Span span) {
+        self.check_expr(cast_expr.value);
+        self.check_type_ref(cast_expr.type_ref);
+        return self.unsupported_expr(span, "unsupported cast expression");
+    }
+
+    qid.TypeId check_struct_literal_expr(ast.StructLiteralData struct_literal, token.Span span) {
+        if (struct_literal.type_ref is some type_ref) {
+            self.check_type_ref(type_ref);
+        }
+        self.check_type_arg_range(struct_literal.type_args);
+        Int! index = 0;
+        while (index < struct_literal.fields.len) {
+            self.check_expr(self.file.child_at(struct_literal.fields, index));
+            index = index + 1;
+        }
+        return self.unsupported_expr(span, "unsupported struct literal");
+    }
+
+    qid.TypeId check_implicit_call_expr(ast.ImplicitCallData implicit_call, token.Span span) {
+        self.check_expr(implicit_call.base);
+        Int! index = 0;
+        while (index < implicit_call.args.len) {
+            self.check_expr(self.file.child_at(implicit_call.args, index));
+            index = index + 1;
+        }
+        return self.unsupported_expr(span, "unsupported implicit call");
+    }
+
+    qid.TypeId check_implicit_arg_expr(ast.ImplicitArgData implicit_arg) {
+        if (implicit_arg is .value_arg(value)) {
+            return self.check_expr(value);
+        }
+        if (implicit_arg is .type_arg(type_arg)) {
+            self.check_type_ref(type_arg);
+        }
+        return self.query.types.unit_type();
+    }
+
+    qid.TypeId check_catch_expr(ast.CatchExprData catch_expr, token.Span span) {
+        self.check_expr(catch_expr.value);
+        self.check_expr(catch_expr.catch_clause);
+        return self.unsupported_expr(span, "unsupported catch expression");
+    }
+
+    qid.TypeId check_catch_clause(ast.CatchClauseData catch_clause) {
+        if (catch_clause.pattern is some pattern) {
+            self.check_pattern(pattern, self.query.types.invalid_type());
+        }
+        return self.check_expr(catch_clause.body);
     }
 
     // if condition 必须是 bool；有 else 时两个分支类型必须一致。
@@ -874,6 +1077,7 @@ struct TypeChecker {
     }
 
     // while condition 必须是 bool；loop body 内允许 break/continue。
+    // for 的 iterable element type 尚未建模，遇到 for pattern 先给明确诊断。
     qid.TypeId check_loop_expr(ast.LoopData loop_expr) {
         if (loop_expr.condition is some condition) {
             qid.TypeId condition_type = self.check_expr(condition);
@@ -881,6 +1085,14 @@ struct TypeChecker {
         }
         if (loop_expr.iterable is some iterable) {
             self.check_expr(iterable);
+            if (loop_expr.pattern is some pattern) {
+                self.add_type_diagnostic(
+                    self.file.get(pattern).span,
+                    "for pattern type is not supported yet",
+                    "unsupported_for_pattern"
+                );
+                self.check_pattern(pattern, self.query.types.invalid_type());
+            }
         }
         self.loop_depth = self.loop_depth + 1;
         self.check_block(loop_expr.body, self.expected_return_type);
@@ -977,8 +1189,23 @@ struct TypeChecker {
             self.check_optional_pattern(value, input_type, span);
             return;
         }
+        if (value_node.data is .literal(literal)) {
+            if (literal.kind == .null_lit) {
+                self.check_null_pattern(input_type, span);
+                return;
+            }
+        }
         qid.TypeId value_type = self.check_expr(value);
         self.require_assignable(input_type, value_type, span);
+    }
+
+    () check_null_pattern(qid.TypeId input_type, token.Span span) {
+        if (self.query.types.get(input_type).data is .optional(_)) {
+            return;
+        }
+        if (!self.is_invalid_type(input_type)) {
+            self.add_type_diagnostic(span, "null pattern requires optional input", "invalid_null_pattern");
+        }
     }
 
     // `some item` 只接受 optional 输入，内部 pattern 看到的是 element type。
@@ -1006,6 +1233,10 @@ struct TypeChecker {
                 return;
             }
         }
+        if (self.is_dot_prefix_pattern(name, span)) {
+            self.check_dot_prefix_variant_pattern(name, payload, input_type, span);
+            return;
+        }
         if (!payload.empty()) {
             self.add_type_diagnostic(span, "invalid pattern payload", "invalid_pattern_payload");
             self.check_pattern_range(payload, self.query.types.invalid_type());
@@ -1014,10 +1245,24 @@ struct TypeChecker {
         self.bind_pattern_name_type(name, input_type);
     }
 
-    // 点前缀 pattern（如 `.ok`）后续可以在这里根据输入类型补 owner lookup；
-    // 当前 resolve 只处理显式 path，所以没有 DefId 时只检查 payload 以避免级联。
-    () check_variant_pattern(ast.AstId name, ast.AstRange payload, qid.TypeId input_type, token.Span span) {
-        guard self.resolved_def_for_path(name) is some def_id else {
+    Bool is_dot_prefix_pattern(ast.AstId name, token.Span pattern_span) {
+        return pattern_span.start < self.file.get(name).span.start;
+    }
+
+    // `.ok` 这种 pattern 没有显式 owner，resolve 阶段无法绑定。
+    // TypeChecker 用 scrutinee 类型的 declaration namespace 查 member。
+    () check_dot_prefix_variant_pattern(ast.AstId name, ast.AstRange payload, qid.TypeId input_type, token.Span span) {
+        guard self.member_owner_namespace(input_type) is some namespace_id else {
+            self.add_type_diagnostic(span, "dot-prefix pattern requires nominal input", "invalid_variant_pattern");
+            self.check_pattern_range(payload, self.query.types.invalid_type());
+            return;
+        }
+        guard self.name_symbol(name) is some symbol else {
+            self.check_pattern_range(payload, self.query.types.invalid_type());
+            return;
+        }
+        guard self.lookup_member(namespace_id, symbol) is some def_id else {
+            self.add_type_diagnostic(span, "unknown variant pattern", "invalid_variant_pattern");
             self.check_pattern_range(payload, self.query.types.invalid_type());
             return;
         }
@@ -1049,10 +1294,7 @@ struct TypeChecker {
     // 只对实参范围内的 payload 继续递归检查；数量不一致时先报一次专门诊断。
     () check_variant_payload(ast.AstRange payload, types.FunctionType function_type) {
         if (payload.len != function_type.params.length) {
-            self.add_type_diagnostic(
-                self.range_span(payload),
-                "pattern payload count mismatch", "pattern_payload_count_mismatch"
-            );
+            self.add_pattern_payload_count_diagnostic(self.range_span(payload));
         }
         Int! count = payload.len;
         if (function_type.params.length < count) {
@@ -1084,6 +1326,10 @@ struct TypeChecker {
 
     // 根据类型引用 AST kind 构造 TypeId；复杂类型递归检查子类型。
     qid.TypeId type_ref_to_type(ast.AstId type_id, ast.AstNode node) {
+        if (node.data is .infer_type) {
+            self.add_type_diagnostic(node.span, "missing type annotation", "missing_type_annotation");
+            return self.query.types.invalid_type();
+        }
         if (node.data is .unit_type) {
             return self.query.types.unit_type();
         }
@@ -1094,6 +1340,33 @@ struct TypeChecker {
             }
             if (type_data.layer == .optional) {
                 return self.query.types.optional_type(base, node.span);
+            }
+            return self.unsupported_type_ref(node.span, "unsupported type layer");
+        }
+        if (node.data is .tuple_type(tuple_type)) {
+            self.check_type_range(tuple_type);
+            return self.unsupported_type_ref(node.span, "unsupported tuple type");
+        }
+        if (node.data is .array_type(array_type)) {
+            self.check_type_ref(array_type.element);
+            return self.unsupported_type_ref(node.span, "unsupported array type");
+        }
+        if (node.data is .errorable_type(errorable_type)) {
+            self.check_type_ref(errorable_type.value_type);
+            if (errorable_type.error_type is some error_type) {
+                self.check_type_ref(error_type);
+            }
+            return self.unsupported_type_ref(node.span, "unsupported errorable type");
+        }
+        if (node.data is .paren_type(paren_type)) {
+            return self.check_type_ref(paren_type.value);
+        }
+        if (node.data is .name_expr(name_expr)) {
+            return self.check_type_ref(name_expr.value);
+        }
+        if (node.data is .implicit_arg(implicit_arg)) {
+            if (implicit_arg is .type_arg(type_arg)) {
+                return self.check_type_ref(type_arg);
             }
             return self.query.types.invalid_type();
         }
@@ -1129,6 +1402,10 @@ struct TypeChecker {
     qid.TypeId named_type_ref(ast.AstId type_id, ast.NamedTypeData named_type, token.Span span) {
         qid.TypeId result = self.named_type_from_path(named_type.path, span);
         self.typed.set_type(named_type.path, result);
+        if (!named_type.args.empty()) {
+            self.check_type_arg_range(named_type.args);
+            return self.unsupported_type_ref(span, "unsupported generic type arguments");
+        }
         return result;
     }
 
@@ -1149,7 +1426,8 @@ struct TypeChecker {
         return self.query.types.named_type(def_id, span);
     }
 
-    // 解析 alias 目标类型，并用 invalid 作为临时值避免简单自递归卡住。
+    // 解析 alias 目标类型；alias cycle 已在 check_file 入口的语义依赖图诊断。
+    // 这里仍先绑定 invalid 作为递归展开的错误恢复，避免旧的脏输入把检查卡死。
     qid.TypeId resolve_alias_type(qid.DefId alias_def) {
         if (self.typed.type_for_def(alias_def) is some type_id) {
             return type_id;
@@ -1279,6 +1557,16 @@ struct TypeChecker {
         return self.query.types.get(type_id).data is .invalid;
     }
 
+    Bool is_numeric_type(qid.TypeId type_id) {
+        types.TypeData data = self.query.types.get(type_id).data;
+        if (data is .int_type(_)) { return true; }
+        return data is .float_type(_);
+    }
+
+    Bool is_int_type(qid.TypeId type_id) {
+        return self.query.types.get(type_id).data is .int_type(_);
+    }
+
     // 声明中的 `T!` 是 TypeInfo 上的外层 qualifier，只用于判断位置是否可写。
     Bool is_mutable_type(qid.TypeId type_id) {
         return self.query.types.get(type_id).is_mutable;
@@ -1300,6 +1588,24 @@ struct TypeChecker {
     () add_type_diagnostic(token.Span span, UInt8[] message, UInt8[] code) {
         self.typed.mark_error();
         add_type_check_diagnostic(self.ctx, self.file.source_id, span, message, code);
+    }
+
+    qid.TypeId unsupported_expr(token.Span span, UInt8[] message) {
+        self.add_type_diagnostic(span, message, "unsupported_expression");
+        return self.query.types.invalid_type();
+    }
+
+    qid.TypeId unsupported_type_ref(token.Span span, UInt8[] message) {
+        self.add_type_diagnostic(span, message, "unsupported_type_ref");
+        return self.query.types.invalid_type();
+    }
+
+    () check_type_arg_range(ast.AstRange args) {
+        Int! index = 0;
+        while (index < args.len) {
+            self.check_type_ref(self.file.child_at(args, index));
+            index = index + 1;
+        }
     }
 
     // 结构化 type mismatch 诊断：先用 expected/actual label 表达角色，
@@ -1345,6 +1651,28 @@ struct TypeChecker {
             .secondary,
             diagnostic.SourceRange(self.file.source_id, span),
             "actual argument count"
+        ));
+        self.ctx.diagnostics.add(diag);
+    }
+
+    () add_pattern_payload_count_diagnostic(token.Span span) {
+        self.typed.mark_error();
+        diagnostic.Diagnostic! diag = diagnostic.Diagnostic(
+            .error,
+            .type_check,
+            diagnostic.DiagnosticCode("pattern_payload_count_mismatch"),
+            diagnostic.SourceRange(self.file.source_id, span),
+            "pattern payload count mismatch"
+        );
+        diag.add_label(diagnostic.DiagnosticLabel(
+            .primary,
+            diagnostic.SourceRange(self.file.source_id, span),
+            "expected payload count"
+        ));
+        diag.add_label(diagnostic.DiagnosticLabel(
+            .secondary,
+            diagnostic.SourceRange(self.file.source_id, span),
+            "actual payload count"
         ));
         self.ctx.diagnostics.add(diag);
     }

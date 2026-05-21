@@ -1,0 +1,198 @@
+// Semantic definition dependency graph.
+//
+// Resolve 只负责把类型引用绑定成 DefId；这里把定义之间的语义依赖
+// 收集成 DefId -> DefId 图，并在 type check 展开定义前先检查 cycle。
+
+import context = "../context.jiang";
+import diagnostic = "../diagnostic/diagnostic.jiang";
+import qid = "../query/id.jiang";
+import def = "../resolve/def.jiang";
+import resolve_result = "../resolve/result.jiang";
+import source = "../source/source.jiang";
+import table = "../support/table.jiang";
+import ast = "../syntax/ast.jiang";
+import token = "../syntax/token.jiang";
+
+public Bool check_file_dependencies(
+    context.CompilerContext& ctx,
+    ast.AstFile& file,
+    resolve_result.ResolvedFile& resolved
+) {
+    DefinitionDependencyGraph! graph = DefinitionDependencyGraph(ctx, file, resolved);
+    graph.collect_file();
+    graph.check_cycles();
+    return graph.ok;
+}
+
+enum VisitState {
+    visiting,
+    checked,
+}
+
+struct DefinitionDependencyGraph {
+    context.CompilerContext& ctx;
+    ast.AstFile& file;
+    resolve_result.ResolvedFile& resolved;
+    table.MultiTable<qid.DefId, qid.DefId> edges;
+    table.HashTable<qid.DefId, VisitState> states;
+    Bool! ok;
+
+    public init(
+        context.CompilerContext& ctx,
+        ast.AstFile& file,
+        resolve_result.ResolvedFile& resolved
+    ) {
+        self.ctx = ctx;
+        self.file = file;
+        self.resolved = resolved;
+        self.edges = table.MultiTable<qid.DefId, qid.DefId>();
+        self.states = table.HashTable<qid.DefId, VisitState>();
+        self.ok = true;
+    }
+
+    public () collect_file() {
+        Int! index = 0;
+        while (index < self.file.nodes.len()) {
+            ast.AstNode node = self.file.get(ast.AstId(index));
+            if (node.data is .alias_decl(alias_decl)) {
+                self.collect_alias(alias_decl);
+            }
+            index = index + 1;
+        }
+    }
+
+    () collect_alias(ast.AliasData alias_decl) {
+        guard self.resolved.name(alias_decl.name) is some alias_def else { return; }
+        self.collect_type_edges(alias_def, alias_decl.target);
+    }
+
+    () collect_type_edges(qid.DefId owner, ast.AstId type_id) {
+        ast.AstNode node = self.file.get(type_id);
+        if (node.data is .type_ref(type_data)) {
+            self.collect_type_edges(owner, type_data.base);
+            return;
+        }
+        if (node.data is .named_type(named_type)) {
+            self.collect_named_type_edge(owner, named_type.path);
+            self.collect_type_range_edges(owner, named_type.args);
+            return;
+        }
+        if (node.data is .path(_)) {
+            self.collect_named_type_edge(owner, type_id);
+            return;
+        }
+        if (node.data is .name(_)) {
+            self.collect_named_type_edge(owner, type_id);
+            return;
+        }
+        if (node.data is .array_type(array_type)) {
+            self.collect_type_edges(owner, array_type.element);
+            return;
+        }
+        if (node.data is .errorable_type(errorable_type)) {
+            self.collect_type_edges(owner, errorable_type.value_type);
+            if (errorable_type.error_type is some error_type) {
+                self.collect_type_edges(owner, error_type);
+            }
+            return;
+        }
+        if (node.data is .function_type(function_type)) {
+            self.collect_type_range_edges(owner, function_type.params);
+            self.collect_type_edges(owner, function_type.result);
+            return;
+        }
+        if (node.data is .tuple_type(items)) {
+            self.collect_type_range_edges(owner, items);
+        }
+    }
+
+    () collect_named_type_edge(qid.DefId owner, ast.AstId path_id) {
+        guard self.resolved_def_for_type_path(path_id) is some target else { return; }
+        if (self.ctx.query.defs.get(target).kind == .alias_def) {
+            self.edges.add(owner, target);
+        }
+    }
+
+    () collect_type_range_edges(qid.DefId owner, ast.AstRange range) {
+        Int! index = 0;
+        while (index < range.len) {
+            self.collect_type_edges(owner, self.file.child_at(range, index));
+            index = index + 1;
+        }
+    }
+
+    public () check_cycles() {
+        Int! index = 0;
+        while (index < self.file.nodes.len()) {
+            ast.AstNode node = self.file.get(ast.AstId(index));
+            if (node.data is .alias_decl(alias_decl)) {
+                if (self.resolved.name(alias_decl.name) is some alias_def) {
+                    self.visit(alias_def);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () visit(qid.DefId def_id) {
+        if (self.states.get(def_id) is some state) {
+            if (state is .checked) {
+                return;
+            }
+            self.add_cycle_diagnostic(def_id);
+            return;
+        }
+        self.states.set(def_id, .visiting);
+
+        table.MultiTableCursor! cursor = self.edges.first(def_id);
+        while (cursor.valid()) {
+            self.visit(self.edges.get(cursor));
+            cursor = self.edges.next(cursor);
+        }
+
+        self.states.set(def_id, .checked);
+    }
+
+    qid.DefId? resolved_def_for_type_path(ast.AstId path_id) {
+        if (self.resolved.name(path_id) is some def_id) {
+            return def_id;
+        }
+        ast.AstNode path = self.file.get(path_id);
+        if (path.data is .path(path_data)) {
+            if (path_data.segments.len == 1) {
+                return self.resolved.name(self.file.child_at(path_data.segments, 0));
+            }
+        }
+        return null;
+    }
+
+    () add_cycle_diagnostic(qid.DefId def_id) {
+        def.DefRecord def_record = self.ctx.query.defs.get(def_id);
+        add_dependency_diagnostic(
+            self.ctx,
+            self.file.source_id,
+            def_record.span,
+            "alias cycle",
+            "alias_cycle"
+        );
+        self.ok = false;
+    }
+}
+
+() add_dependency_diagnostic(
+    context.CompilerContext& ctx,
+    source.SourceId source_id,
+    token.Span span,
+    UInt8[] message,
+    UInt8[] code
+) {
+    ctx.diagnostics.add(
+        diagnostic.Diagnostic(
+            .error,
+            .type_check,
+            diagnostic.DiagnosticCode(code),
+            diagnostic.SourceRange(source_id, span),
+            message
+        )
+    );
+}
