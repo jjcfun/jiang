@@ -32,6 +32,13 @@ public struct NameResolver {
         self.for_each_top_level_item(.collect_declaration);
     }
 
+    public () record_existing_declarations() {
+        // module declarations 可能已经在 graph discovery/其他 pass 中收集过。
+        // 这一步不创建新 Def，只把当前 ResolvedFile 的 AstId -> existing
+        // DefId 映射补齐，保证后续 reference/type check 能消费同一张表。
+        self.for_each_top_level_item(.record_declaration);
+    }
+
     public () resolve_references() {
         guard self.resolved is some resolved else { return; }
         reference_resolver.ReferenceResolver resolver = reference_resolver.ReferenceResolver(
@@ -67,6 +74,10 @@ public struct NameResolver {
             if (pass == .collect_import) {
                 self.collect_import(import_decl, self.decl_visibility(decl.modifiers), body.span);
             }
+            return;
+        }
+        if (pass == .record_declaration) {
+            self.record_existing_top_level_decl(body);
             return;
         }
         if (pass != .collect_declaration) {
@@ -136,6 +147,45 @@ public struct NameResolver {
         }
     }
 
+    // module graph 构建阶段可能已经把声明写入全局 ResolveStore。
+    // 最终生成单文件 ResolvedFile 时，不能再次创建 Def，只需要把当前
+    // AstId 重新指向已有 DefId，供 type check/lowering 消费。
+    () record_existing_top_level_decl(ast.AstNode body) {
+        if (body.data is .nominal_decl(nominal)) {
+            if (self.record_existing_top_level_name(nominal.name, .type_name) is some owner_def) {
+                self.record_existing_member_declarations(owner_def, nominal.members);
+            }
+            return;
+        }
+        if (body.data is .trait_decl(trait_decl)) {
+            if (self.record_existing_top_level_name(trait_decl.name, .type_name) is some owner_def) {
+                self.record_existing_member_declarations(owner_def, trait_decl.members);
+            }
+            return;
+        }
+        if (body.data is .alias_decl(alias_decl)) {
+            self.record_existing_top_level_name(alias_decl.name, .type_name);
+            return;
+        }
+        if (body.data is .function_decl(function_decl)) {
+            self.record_existing_top_level_name(function_decl.name, .value_name);
+            return;
+        }
+        if (body.data is .global_decl(global_decl)) {
+            self.record_existing_top_level_name(global_decl.name, .value_name);
+            return;
+        }
+    }
+
+    qid.DefId? record_existing_top_level_name(ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        guard self.state.query.resolve.first_binding(self.state.namespace_id, symbol, domain) is some binding else {
+            return null;
+        }
+        self.record_declaration_name(name_id, binding.def_id);
+        return binding.def_id;
+    }
+
     // 定义模块顶层名字，并按需要给该定义创建 declaration namespace。
     //
     // struct/enum/union/trait 这种 declaration container 后续可以被
@@ -184,9 +234,7 @@ public struct NameResolver {
         if (!duplicate) {
             self.state.query.resolve.bind_name(self.state.namespace_id, symbol, domain, def_id, name_span);
         }
-        if (self.resolved is some resolved) {
-            resolved.set_name(name_id, def_id);
-        }
+        self.record_declaration_name(name_id, def_id);
         if (!duplicate) {
             self.record_module_def(self.state.module_id, symbol, domain, visibility, def_id, span);
         }
@@ -216,6 +264,23 @@ public struct NameResolver {
                     member,
                     self.member_visibility(owner_kind, ast.MemberModifiers())
                 );
+            }
+            index = index + 1;
+        }
+    }
+
+    () record_existing_member_declarations(qid.DefId owner_def, ast.AstRange members) {
+        // 与 collect_member_declarations 对称：不重复定义 member，只把 AST
+        // name 重新关联到 owner namespace 中已有的 member DefId。
+        Int! index = 0;
+        while (index < members.len) {
+            ast.AstId member_id = self.state.file.child_at(members, index);
+            ast.AstNode member = self.state.file.get(member_id);
+            if (member.data is .member_decl(member_decl)) {
+                ast.AstNode body = self.state.file.get(member_decl.body);
+                self.record_existing_member_body(owner_def, body);
+            } else {
+                self.record_existing_member_body(owner_def, member);
             }
             index = index + 1;
         }
@@ -284,6 +349,64 @@ public struct NameResolver {
         }
     }
 
+    () record_existing_member_body(qid.DefId owner_def, ast.AstNode body) {
+        // record pass 必须覆盖 collect pass 创建过的所有 member 形态，
+        // 否则复用已收集 declarations 时 ResolvedFile 会缺少 AstId 映射。
+        if (body.data is .function_decl(function_decl)) {
+            self.record_existing_member_name(owner_def, function_decl.name, .value_name);
+            return;
+        }
+        if (body.data is .field_decl(field_decl)) {
+            Int! index = 0;
+            while (index < field_decl.fields.len) {
+                ast.AstId field_id = self.state.file.child_at(field_decl.fields, index);
+                ast.AstNode field = self.state.file.get(field_id);
+                if (field.data is .field_declarator(field_data)) {
+                    self.record_existing_member_name(owner_def, field_data.name, .member_name);
+                }
+                index = index + 1;
+            }
+            return;
+        }
+        if (body.data is .enum_case(enum_case)) {
+            self.record_existing_member_name(owner_def, enum_case.name, .member_name);
+            return;
+        }
+        if (body.data is .union_variant(variant)) {
+            self.record_existing_member_name(owner_def, variant.name, .member_name);
+            return;
+        }
+        if (body.data is .typed_union_variants(variants)) {
+            Int! index = 0;
+            while (index < variants.names.len) {
+                ast.AstId name = self.state.file.child_at(variants.names, index);
+                self.record_existing_member_name(owner_def, name, .member_name);
+                index = index + 1;
+            }
+            return;
+        }
+        if (body.data is .assoc_type(assoc_type)) {
+            self.record_existing_member_name(owner_def, assoc_type.name, .type_name);
+        }
+    }
+
+    () record_existing_member_name(
+        qid.DefId owner_def,
+        ast.AstId name_id,
+        def.NameDomain domain
+    ) {
+        // 从 owner declaration namespace 反查既有 binding，写回当前
+        // ResolvedFile。这里不处理 duplicate，因为 duplicate 已在 collect
+        // pass 诊断过。
+        guard self.state.name_symbol(name_id) is some symbol else { return; }
+        def.DefRecord owner = self.state.query.defs.get(owner_def);
+        guard owner.owned_namespace_id is some owner_namespace else { return; }
+        guard self.state.query.resolve.first_binding(owner_namespace, symbol, domain) is some binding else {
+            return;
+        }
+        self.record_declaration_name(name_id, binding.def_id);
+    }
+
     // 在 owner declaration namespace 中定义一个 member。
     //
     // member 的 owner_def 指向所属 type/trait def；decl namespace 使用 owner
@@ -319,6 +442,17 @@ public struct NameResolver {
         if (!duplicate) {
             self.state.query.resolve.bind_name(owner_namespace, symbol, domain, def_id, name_span);
         }
+        self.record_declaration_name(name_id, def_id);
+    }
+
+    () record_declaration_name(ast.AstId name_id, qid.DefId def_id) {
+        store.ModuleRecord module = self.state.query.resolve.modules.get(self.state.module_id);
+        self.state.query.resolve.set_declaration_name(
+            module.source_id,
+            module.source_revision,
+            name_id,
+            def_id
+        );
         if (self.resolved is some resolved) {
             resolved.set_name(name_id, def_id);
         }
@@ -449,4 +583,5 @@ public struct NameResolver {
 enum TopLevelPass {
     collect_import,
     collect_declaration,
+    record_declaration,
 }

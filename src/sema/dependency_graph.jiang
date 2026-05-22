@@ -7,134 +7,158 @@ import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import qid = "../query/id.jiang";
 import def = "../resolve/def.jiang";
-import resolve_result = "../resolve/result.jiang";
+import module_graph = "../resolve/module_graph.jiang";
+import resolve_store = "../resolve/store.jiang";
 import source = "../source/source.jiang";
+import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
 
-public Bool check_file_dependencies(
+public Bool check_module_dependencies(
     context.CompilerContext& ctx,
-    ast.AstFile& file,
-    resolve_result.ResolvedFile& resolved
+    module_graph.ModuleGraph& module_graph
 ) {
-    DefinitionDependencyGraph! graph = DefinitionDependencyGraph(ctx, file, resolved);
-    graph.collect_file();
+    // ModuleGraph 已经保证 import closure 内的声明都写入 ResolveStore。
+    // 这里只需要 AST + module_id + declaration side table，不再依赖
+    // 每个文件的 ResolvedFile。ResolvedFile 应只表示“某个文件的引用解析结果”，
+    // 不应该成为 package 级 declaration dependency check 的输入。
+    DependencyGraph! graph = DependencyGraph(ctx);
+    Int! index = 0;
+    while (index < module_graph.modules.len()) {
+        qid.ModuleId module_id = module_graph.modules.get(index);
+        resolve_store.ModuleRecord& module = ctx.query.resolve.modules.ref_at(module_id);
+        if (ctx.query.asts.file(module.source_id, module.source_revision) is some file) {
+            graph.collect_file(file, module_id);
+        } else {
+            // ModuleGraph 里出现没有 AST 的 module，说明 import discovery
+            // 和 AST store 状态不一致；这里直接让语义依赖检查失败。
+            graph.ok = false;
+        }
+        index = index + 1;
+    }
     graph.check_cycles();
     return graph.ok;
 }
 
 enum VisitState {
+    // DFS 栈上的节点；再次遇到说明有 cycle。
     visiting,
+    // 已完整检查过的节点；再次遇到可以直接跳过。
     checked,
 }
 
-struct DefinitionDependencyGraph {
+struct DependencyGraph {
     context.CompilerContext& ctx;
-    ast.AstFile& file;
-    resolve_result.ResolvedFile& resolved;
+    // owner DefId -> target alias DefId。当前只收 alias 类型展开依赖，
+    // 因为这是 type check 前最容易形成无限展开的定义级 cycle。
     table.MultiTable<qid.DefId, qid.DefId> edges;
+    // DFS 从所有收集到的 alias def 出发。module-level check 会把 root
+    // import closure 内所有文件都 collect 进同一张图，因此能覆盖跨文件 cycle。
+    list.ArrayList<qid.DefId> alias_defs;
+    // 用一张 HashTable 表达 DFS 状态，避免维护 visiting/checked 两张表。
     table.HashTable<qid.DefId, VisitState> states;
     Bool! ok;
 
-    public init(
-        context.CompilerContext& ctx,
-        ast.AstFile& file,
-        resolve_result.ResolvedFile& resolved
-    ) {
+    public init(context.CompilerContext& ctx) {
         self.ctx = ctx;
-        self.file = file;
-        self.resolved = resolved;
         self.edges = table.MultiTable<qid.DefId, qid.DefId>();
+        self.alias_defs = list.ArrayList<qid.DefId>();
         self.states = table.HashTable<qid.DefId, VisitState>();
         self.ok = true;
     }
 
-    public () collect_file() {
+    public () collect_file(ast.AstFile& file, qid.ModuleId module_id) {
+        // 现阶段只收 alias declaration。struct/function/global 的语义
+        // dependency 还没接进来，后续会扩展这里而不是放到 type check 里
+        // 临时递归检测。
         Int! index = 0;
-        while (index < self.file.nodes.len()) {
-            ast.AstNode node = self.file.get(ast.AstId(index));
+        while (index < file.nodes.len()) {
+            ast.AstNode node = file.get(ast.AstId(index));
             if (node.data is .alias_decl(alias_decl)) {
-                self.collect_alias(alias_decl);
+                self.collect_alias(file, module_id, alias_decl);
             }
             index = index + 1;
         }
     }
 
-    () collect_alias(ast.AliasData alias_decl) {
-        guard self.resolved.name(alias_decl.name) is some alias_def else { return; }
-        self.collect_type_edges(alias_def, alias_decl.target);
+    () collect_alias(ast.AstFile& file, qid.ModuleId module_id, ast.AliasData alias_decl) {
+        guard self.declaration_def(file, module_id, alias_decl.name) is some alias_def else { return; }
+        self.alias_defs.add(alias_def);
+        self.collect_type_edges(file, module_id, alias_def, alias_decl.target);
     }
 
-    () collect_type_edges(qid.DefId owner, ast.AstId type_id) {
-        ast.AstNode node = self.file.get(type_id);
+    () collect_type_edges(ast.AstFile& file, qid.ModuleId module_id, qid.DefId owner, ast.AstId type_id) {
+        // 类型 AST 里只有 named/path/name 可能产生 alias -> alias 边；
+        // 其他类型节点递归检查内部 type child。
+        ast.AstNode node = file.get(type_id);
         if (node.data is .type_ref(type_data)) {
-            self.collect_type_edges(owner, type_data.base);
+            self.collect_type_edges(file, module_id, owner, type_data.base);
             return;
         }
         if (node.data is .named_type(named_type)) {
-            self.collect_named_type_edge(owner, named_type.path);
-            self.collect_type_range_edges(owner, named_type.args);
+            self.collect_named_type_edge(file, module_id, owner, named_type.path);
+            self.collect_type_range_edges(file, module_id, owner, named_type.args);
             return;
         }
         if (node.data is .path(_)) {
-            self.collect_named_type_edge(owner, type_id);
+            self.collect_named_type_edge(file, module_id, owner, type_id);
             return;
         }
         if (node.data is .name(_)) {
-            self.collect_named_type_edge(owner, type_id);
+            self.collect_named_type_edge(file, module_id, owner, type_id);
             return;
         }
         if (node.data is .array_type(array_type)) {
-            self.collect_type_edges(owner, array_type.element);
+            self.collect_type_edges(file, module_id, owner, array_type.element);
             return;
         }
         if (node.data is .errorable_type(errorable_type)) {
-            self.collect_type_edges(owner, errorable_type.value_type);
+            self.collect_type_edges(file, module_id, owner, errorable_type.value_type);
             if (errorable_type.error_type is some error_type) {
-                self.collect_type_edges(owner, error_type);
+                self.collect_type_edges(file, module_id, owner, error_type);
             }
             return;
         }
         if (node.data is .function_type(function_type)) {
-            self.collect_type_range_edges(owner, function_type.params);
-            self.collect_type_edges(owner, function_type.result);
+            self.collect_type_range_edges(file, module_id, owner, function_type.params);
+            self.collect_type_edges(file, module_id, owner, function_type.result);
             return;
         }
         if (node.data is .tuple_type(items)) {
-            self.collect_type_range_edges(owner, items);
+            self.collect_type_range_edges(file, module_id, owner, items);
         }
     }
 
-    () collect_named_type_edge(qid.DefId owner, ast.AstId path_id) {
-        guard self.resolved_def_for_type_path(path_id) is some target else { return; }
+    () collect_named_type_edge(ast.AstFile& file, qid.ModuleId module_id, qid.DefId owner, ast.AstId path_id) {
+        // 声明依赖检查运行在 package/module closure 上，不能要求每个文件
+        // 都已经生成 ResolvedFile。这里只解析类型位置需要的 namespace path，
+        // 例如 `B` 或 `dep.B`，用于发现 alias -> alias 展开边。
+        guard self.def_for_type_path(file, module_id, path_id) is some target else { return; }
         if (self.ctx.query.defs.get(target).kind == .alias_def) {
             self.edges.add(owner, target);
         }
     }
 
-    () collect_type_range_edges(qid.DefId owner, ast.AstRange range) {
+    () collect_type_range_edges(ast.AstFile& file, qid.ModuleId module_id, qid.DefId owner, ast.AstRange range) {
         Int! index = 0;
         while (index < range.len) {
-            self.collect_type_edges(owner, self.file.child_at(range, index));
+            self.collect_type_edges(file, module_id, owner, file.child_at(range, index));
             index = index + 1;
         }
     }
 
     public () check_cycles() {
         Int! index = 0;
-        while (index < self.file.nodes.len()) {
-            ast.AstNode node = self.file.get(ast.AstId(index));
-            if (node.data is .alias_decl(alias_decl)) {
-                if (self.resolved.name(alias_decl.name) is some alias_def) {
-                    self.visit(alias_def);
-                }
-            }
+        while (index < self.alias_defs.len()) {
+            self.visit(self.alias_defs.get(index));
             index = index + 1;
         }
     }
 
     () visit(qid.DefId def_id) {
+        // 标准三色 DFS 的二状态写法：HashTable 里不存在表示 white，
+        // visiting 表示 gray，checked 表示 black。
         if (self.states.get(def_id) is some state) {
             if (state is .checked) {
                 return;
@@ -153,28 +177,133 @@ struct DefinitionDependencyGraph {
         self.states.set(def_id, .checked);
     }
 
-    qid.DefId? resolved_def_for_type_path(ast.AstId path_id) {
-        if (self.resolved.name(path_id) is some def_id) {
-            return def_id;
+    qid.DefId? declaration_def(ast.AstFile& file, qid.ModuleId module_id, ast.AstId name_id) {
+        // 声明 AstId -> DefId 已在 resolve collect declarations 时写入
+        // ResolveStore；dependency graph 不依赖 ResolvedFile 的引用结果。
+        resolve_store.ModuleRecord& module = self.ctx.query.resolve.modules.ref_at(module_id);
+        return self.ctx.query.resolve.declaration_name(module.source_id, module.source_revision, name_id);
+    }
+
+    qid.DefId? def_for_type_path(ast.AstFile& file, qid.ModuleId module_id, ast.AstId path_id) {
+        ast.AstNode path = file.get(path_id);
+        if (path.data is .name(_)) {
+            return self.def_for_name_in_module(file, module_id, path_id, .type_name);
         }
-        ast.AstNode path = self.file.get(path_id);
         if (path.data is .path(path_data)) {
-            if (path_data.segments.len == 1) {
-                return self.resolved.name(self.file.child_at(path_data.segments, 0));
-            }
+            return self.def_for_qualified_type_path(file, module_id, path_data);
         }
         return null;
     }
 
+    qid.DefId? def_for_qualified_type_path(ast.AstFile& file, qid.ModuleId module_id, ast.PathData path_data) {
+        if (path_data.segments.len == 0) { return null; }
+        ast.AstId first_id = file.child_at(path_data.segments, 0);
+        if (path_data.segments.len == 1) {
+            return self.def_for_name_in_module(file, module_id, first_id, .type_name);
+        }
+        // 多段类型路径先把 head 当 namespace/type container 解析，
+        // 再在该 namespace 中查最后一段 type name。这样可以覆盖
+        // import alias 形式的 `dep.User` 和类型 namespace 里的 nested type。
+        guard self.namespace_for_path_head(file, module_id, first_id) is some namespace_id else { return null; }
+        return self.def_for_qualified_segments(file, path_data, 1, namespace_id);
+    }
+
+    qid.DefId? def_for_qualified_segments(
+        ast.AstFile& file,
+        ast.PathData path_data,
+        Int start_index,
+        qid.NamespaceId namespace_id
+    ) {
+        qid.NamespaceId! current_namespace = namespace_id;
+        Int! index = start_index;
+        while (index < path_data.segments.len) {
+            ast.AstId segment_id = file.child_at(path_data.segments, index);
+            Bool is_last = index + 1 == path_data.segments.len;
+            if (is_last) {
+                return self.def_for_name_in_namespace(file, segment_id, current_namespace, .type_name);
+            }
+            guard self.namespace_for_segment(file, segment_id, current_namespace) is some next_namespace else {
+                return null;
+            }
+            current_namespace = next_namespace;
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.NamespaceId? namespace_for_path_head(ast.AstFile& file, qid.ModuleId module_id, ast.AstId name_id) {
+        if (self.def_for_name_in_module(file, module_id, name_id, .namespace_name) is some namespace_def) {
+            return self.ctx.query.defs.get(namespace_def).owned_namespace_id;
+        }
+        guard self.def_for_name_in_module(file, module_id, name_id, .type_name) is some type_def else {
+            return null;
+        }
+        return self.ctx.query.defs.get(type_def).owned_namespace_id;
+    }
+
+    qid.NamespaceId? namespace_for_segment(ast.AstFile& file, ast.AstId name_id, qid.NamespaceId namespace_id) {
+        if (self.def_for_name_in_namespace(file, name_id, namespace_id, .namespace_name) is some namespace_def) {
+            return self.ctx.query.defs.get(namespace_def).owned_namespace_id;
+        }
+        guard self.def_for_name_in_namespace(file, name_id, namespace_id, .type_name) is some type_def else {
+            return null;
+        }
+        return self.ctx.query.defs.get(type_def).owned_namespace_id;
+    }
+
+    qid.DefId? def_for_name_in_module(
+        ast.AstFile& file,
+        qid.ModuleId module_id,
+        ast.AstId name_id,
+        def.NameDomain domain
+    ) {
+        guard self.name_symbol(file, name_id) is some symbol else { return null; }
+        resolve_store.ModuleRecord& module = self.ctx.query.resolve.modules.ref_at(module_id);
+        qid.NamespaceId namespace_id = module.namespace_id;
+        if (self.ctx.query.resolve.lookup_visible_name(namespace_id, symbol, domain, true) is some binding) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    qid.DefId? def_for_name_in_namespace(
+        ast.AstFile& file,
+        ast.AstId name_id,
+        qid.NamespaceId namespace_id,
+        def.NameDomain domain
+    ) {
+        guard self.name_symbol(file, name_id) is some symbol else { return null; }
+        if (self.ctx.query.resolve.lookup_namespace(namespace_id, symbol, domain, false) is some binding) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    qid.SymbolId? name_symbol(ast.AstFile& file, ast.AstId name_id) {
+        ast.AstNode node = file.get(name_id);
+        guard node.data is .name(name_data) else { return null; }
+        if (name_data.symbol_id <= 0) { return null; }
+        return qid.SymbolId.from_index(name_data.symbol_id);
+    }
+
     () add_cycle_diagnostic(qid.DefId def_id) {
         def.DefRecord def_record = self.ctx.query.defs.get(def_id);
-        add_dependency_diagnostic(
-            self.ctx,
-            self.file.source_id,
-            def_record.span,
-            "alias cycle",
-            "alias_cycle"
-        );
+        if (def_record.module_id is some module_id) {
+            add_dependency_diagnostic(
+                self.ctx,
+                self.ctx.query.resolve.modules.ref_at(module_id).source_id,
+                def_record.span,
+                "alias cycle",
+                "alias_cycle"
+            );
+        } else {
+            add_dependency_diagnostic_without_source(
+                self.ctx,
+                def_record.span,
+                "alias cycle",
+                "alias_cycle"
+            );
+        }
         self.ok = false;
     }
 }
@@ -192,6 +321,23 @@ struct DefinitionDependencyGraph {
             .type_check,
             diagnostic.DiagnosticCode(code),
             diagnostic.SourceRange(source_id, span),
+            message
+        )
+    );
+}
+
+() add_dependency_diagnostic_without_source(
+    context.CompilerContext& ctx,
+    token.Span span,
+    UInt8[] message,
+    UInt8[] code
+) {
+    ctx.diagnostics.add(
+        diagnostic.Diagnostic(
+            .error,
+            .type_check,
+            diagnostic.DiagnosticCode(code),
+            diagnostic.SourceRange(),
             message
         )
     );
