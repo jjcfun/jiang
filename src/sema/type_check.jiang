@@ -14,7 +14,6 @@ import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
-import dependency_graph = "./dependency_graph.jiang";
 import types = "./type.jiang";
 
 public struct TypedFile {
@@ -135,12 +134,6 @@ public PackageCheckResult check_module_graph(
         result.ok = false;
         return result;
     }
-    // 先 full resolve graph 内所有文件，确保 ResolveStore 已经有完整 declarations，
-    // 再做 package 级 definition dependency 检查。
-    if (!dependency_graph.check_module_dependencies(ctx, graph)) {
-        result.ok = false;
-        return result;
-    }
     type_check_module_graph(ctx, result$.ref());
     return result;
 }
@@ -209,6 +202,11 @@ public TypedFile^ check_file(
     return typed;
 }
 
+enum TypeQueryState {
+    visiting,
+    checked,
+}
+
 // 单文件 type check 的工作对象。它只消费 AST + ResolvedFile，
 // 不重新做名字查找，所有类型结果写入 TypedFile。
 struct TypeChecker {
@@ -219,6 +217,7 @@ struct TypeChecker {
     TypedFile^ typed;
     Int! loop_depth;
     qid.TypeId! expected_return_type;
+    table.HashTable<qid.DefId, TypeQueryState> alias_states;
 
     public init(
         context.CompilerContext& ctx,
@@ -233,6 +232,7 @@ struct TypeChecker {
         self.typed = typed;
         self.loop_depth = 0;
         self.expected_return_type = self.query.types.unit_type();
+        self.alias_states = table.HashTable<qid.DefId, TypeQueryState>();
     }
 
     public Bool check() {
@@ -1551,20 +1551,39 @@ struct TypeChecker {
         return self.query.types.named_type(def_id, span);
     }
 
-    // 解析 alias 目标类型；alias cycle 已在 check_file 入口的语义依赖图诊断。
-    // 这里仍先绑定 invalid 作为递归展开的错误恢复，避免旧的脏输入把检查卡死。
+    // alias 展开按需触发 cycle guard。这里不再依赖 type check 前的
+    // 完整 dependency graph；如果展开同一个 alias 时发现 active stack 重入，
+    // 直接诊断 alias_cycle，并把该 alias 固化成 invalid 供后续恢复。
     qid.TypeId resolve_alias_type(qid.DefId alias_def) {
         if (self.typed.type_for_def(alias_def) is some type_id) {
             return type_id;
         }
+        if (self.query.types.type_for_def(alias_def) is some type_id) {
+            return type_id;
+        }
+        if (self.alias_states.get(alias_def) is some state) {
+            if (state == .visiting) {
+                qid.TypeId invalid = self.query.types.invalid_type();
+                self.add_alias_cycle_diagnostic(alias_def);
+                self.bind_def_type(alias_def, invalid);
+                self.alias_states.set(alias_def, .checked);
+                return invalid;
+            }
+            if (state == .checked) {
+                return self.query.types.invalid_type();
+            }
+        }
 
         qid.TypeId invalid = self.query.types.invalid_type();
-        self.bind_def_type(alias_def, invalid);
+        self.alias_states.set(alias_def, .visiting);
         guard self.alias_target_for_def(alias_def) is some target else {
+            self.alias_states.set(alias_def, .checked);
+            self.bind_def_type(alias_def, invalid);
             return invalid;
         }
 
         qid.TypeId target_type = self.check_type_ref(target);
+        self.alias_states.set(alias_def, .checked);
         self.bind_def_type(alias_def, target_type);
         return target_type;
     }
@@ -1713,6 +1732,11 @@ struct TypeChecker {
     () add_type_diagnostic(token.Span span, UInt8[] message, UInt8[] code) {
         self.typed.mark_error();
         add_type_check_diagnostic(self.ctx, self.file.source_id, span, message, code);
+    }
+
+    () add_alias_cycle_diagnostic(qid.DefId alias_def) {
+        def.DefRecord alias_record = self.query.defs.get(alias_def);
+        self.add_type_diagnostic(alias_record.name.span, "alias cycle", "alias_cycle");
     }
 
     qid.TypeId unsupported_expr(token.Span span, UInt8[] message) {
