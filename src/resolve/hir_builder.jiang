@@ -1,0 +1,807 @@
+// 从已经完成引用解析的 AST 文件生成 resolved、未类型化的 HIR。
+//
+// 这个 builder 属于 resolve 阶段。调用它之前，ModuleResolver 已经完成：
+// 1. 构建 module graph / import closure；
+// 2. 对所有可达 module 收集 declaration，创建 DefId 和 HirDef skeleton；
+// 3. 对当前文件完成 reference resolve。
+//
+// 输入：
+// - FileResolveState：当前 AstFile + module/namespace/query 上下文。
+//
+// 输出：
+// - 原地写入 QuerySystem.hirs。function/global definition 会得到自己的
+//   def-local HirNode 表和可选 HirBody root。
+//
+// 边界：
+// - HIR 已经 resolve，但还没有 type check；这里不读写 TypeId。
+// - value.member 只保存 base HirId + member symbol；具体 member DefId
+//   后续由 type check 根据 base type 选出来。
+// - AstId -> DefId 的引用解析事实来自 ResolveStore；ResolvedFile 只留给
+//   旧 type check 过渡，不再是 HIR builder 的输入。
+
+import diagnostic = "../diagnostic/diagnostic.jiang";
+import hir = "../hir/hir.jiang";
+import qid = "../query/id.jiang";
+import list = "../support/list.jiang";
+import ast = "../syntax/ast.jiang";
+import token = "../syntax/token.jiang";
+import def = "./def.jiang";
+import resolve_state = "./state.jiang";
+
+public Bool lower_file(resolve_state.FileResolveState& state) {
+    HirBuilder! builder = HirBuilder(state);
+    builder.lower();
+    return !state.query.hirs.has_errors();
+}
+
+struct HirBuilder {
+    resolve_state.FileResolveState& state;
+    qid.DefId?! current_owner_def;
+
+    public init(resolve_state.FileResolveState& state) {
+        self.state = state;
+        self.current_owner_def = null;
+    }
+
+    public () lower() {
+        // 只遍历能在 HIR 中拥有可执行/类型语法的 declaration。declaration
+        // skeleton 已经存在，这一趟只为当前文件填充 body 和 def-local nodes。
+        guard self.state.file.root is some root_id else { return; }
+        ast.AstNode root = self.state.file.get(root_id);
+        guard root.data is .root(root_data) else { return; }
+
+        Int! index = 0;
+        while (index < root_data.items.len) {
+            self.lower_top_level_item(self.state.file.child_at(root_data.items, index));
+            index = index + 1;
+        }
+    }
+
+    () lower_top_level_item(ast.AstId item_id) {
+        ast.AstNode item = self.state.file.get(item_id);
+        if (item.data is .top_level_decl(top_level)) {
+            self.lower_decl(top_level.body);
+            return;
+        }
+        self.lower_decl(item_id);
+    }
+
+    () lower_decl(ast.AstId decl_id) {
+        ast.AstNode decl = self.state.file.get(decl_id);
+        if (decl.data is .function_decl(function_decl)) {
+            self.lower_function(function_decl);
+            return;
+        }
+        if (decl.data is .global_decl(global_decl)) {
+            self.lower_global(global_decl);
+            return;
+        }
+        if (decl.data is .nominal_decl(nominal)) {
+            self.lower_member_range(nominal.members);
+            return;
+        }
+        if (decl.data is .trait_decl(trait_decl)) {
+            self.lower_member_range(trait_decl.members);
+            return;
+        }
+        if (decl.data is .extend_decl(extend_decl)) {
+            self.lower_member_range(extend_decl.members);
+        }
+    }
+
+    () lower_member_range(ast.AstRange members) {
+        Int! index = 0;
+        while (index < members.len) {
+            ast.AstId member_id = self.state.file.child_at(members, index);
+            ast.AstNode member = self.state.file.get(member_id);
+            if (member.data is .member_decl(member_decl)) {
+                self.lower_decl(member_decl.body);
+            } else {
+                self.lower_decl(member_id);
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_function(ast.FunctionData function_decl) {
+        guard self.resolved_def_for_ast(function_decl.name) is some function_def else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = function_def;
+
+        if (function_decl.body is some body_ast) {
+            // Body 拥有自己的 def-local node 空间。先放一个临时 invalid root，
+            // 这样可以在真实 root expression lower 之前创建 params/locals。
+            hir.HirId placeholder = self.add_invalid_node();
+            self.state.query.hirs.set_body(function_def, hir.HirBody(function_def, placeholder));
+            self.lower_parameters(function_def, function_decl.params);
+            hir.HirId root = self.lower_expr(body_ast);
+            self.state.query.hirs.set_body_root(function_def, root);
+        }
+
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_global(ast.GlobalData global_decl) {
+        guard self.resolved_def_for_ast(global_decl.name) is some global_def else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = global_def;
+
+        if (global_decl.initializer is some initializer) {
+            hir.HirId placeholder = self.add_invalid_node();
+            self.state.query.hirs.set_body(global_def, hir.HirBody(global_def, placeholder));
+            hir.HirId root = self.lower_expr(initializer);
+            self.state.query.hirs.set_body_root(global_def, root);
+        }
+
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_parameters(qid.DefId owner_def, ast.AstRange params) {
+        Int! index = 0;
+        while (index < params.len) {
+            ast.AstId param_id = self.state.file.child_at(params, index);
+            ast.AstNode param_node = self.state.file.get(param_id);
+            if (param_node.data is .param(param)) {
+                hir.HirId type_ref = self.lower_type_ref(param.type_ref);
+                self.add_local_for_name(owner_def, param.name, .parameter, type_ref);
+            }
+            index = index + 1;
+        }
+    }
+
+    hir.HirId lower_stmt(ast.AstId stmt_id) {
+        ast.AstNode stmt = self.state.file.get(stmt_id);
+        if (stmt.data is .stmt(stmt_data)) {
+            return self.lower_expr(stmt_data.value);
+        }
+        if (stmt.data is .let_stmt(let_stmt)) {
+            return self.lower_let_stmt(let_stmt);
+        }
+        if (stmt.data is .guard_stmt(guard_stmt)) {
+            return self.lower_guard_stmt(guard_stmt);
+        }
+        if (stmt.data is .control_stmt(control_stmt)) {
+            return self.lower_control_stmt(control_stmt);
+        }
+        if (stmt.data is .assign_stmt(assign_stmt)) {
+            return self.add_node(.assign_stmt(hir.HirAssign {
+                op: self.assign_op(assign_stmt.op),
+                target: self.lower_expr(assign_stmt.target),
+                value: self.lower_expr(assign_stmt.value)
+            }));
+        }
+        return self.lower_expr(stmt_id);
+    }
+
+    hir.HirId lower_expr(ast.AstId expr_id) {
+        // 表达式 lowering 保留的是 resolve 后的语义，不是原始表层语法。
+        // 尚未接入的 AST 形态先显式 lower 成 invalid node，等 HIR/type check
+        // 支持对应结构后再补齐。
+        ast.AstNode expr = self.state.file.get(expr_id);
+        if (expr.data is .literal(literal)) {
+            return self.add_node(.literal(self.hir_literal(literal)));
+        }
+        if (expr.data is .unit_type) {
+            return self.add_node(.literal(hir.HirLiteral {value: .unit_value()}));
+        }
+        if (expr.data is .name_expr(name_expr)) {
+            return self.lower_expr(name_expr.value);
+        }
+        if (expr.data is .name(_)) {
+            return self.lower_name_ref(expr_id);
+        }
+        if (expr.data is .path(path)) {
+            return self.lower_path_expr(expr_id, path);
+        }
+        if (expr.data is .call(call)) {
+            return self.lower_call_expr(call);
+        }
+        if (expr.data is .call_arg(call_arg)) {
+            return self.lower_expr(call_arg.value);
+        }
+        if (expr.data is .block(block)) {
+            return self.lower_block(block);
+        }
+        if (expr.data is .field_expr(field)) {
+            return self.lower_field_expr(field);
+        }
+        if (expr.data is .unary(unary)) {
+            return self.add_node(.unary(hir.HirUnary {
+                op: self.unary_op(unary.op),
+                value: self.lower_expr(unary.value)
+            }));
+        }
+        if (expr.data is .binary(binary)) {
+            return self.add_node(.binary(hir.HirBinary {
+                op: self.binary_op(binary.op),
+                left: self.lower_expr(binary.left),
+                right: self.lower_expr(binary.right)
+            }));
+        }
+        if (expr.data is .if_expr(if_expr)) {
+            return self.lower_if_expr(if_expr);
+        }
+        if (expr.data is .loop_expr(loop_expr)) {
+            return self.lower_loop_expr(loop_expr);
+        }
+        if (expr.data is .switch_expr(switch_expr)) {
+            return self.lower_switch_expr(switch_expr);
+        }
+        if (expr.data is .is_pattern(is_pattern)) {
+            return self.add_node(.is_pattern(hir.HirIsPattern {
+                value: self.lower_expr(is_pattern.value),
+                pattern: self.lower_pattern(is_pattern.pattern)
+            }));
+        }
+        return self.add_invalid_node();
+    }
+
+    hir.HirId lower_block(ast.BlockData block) {
+        list.ArrayList<hir.HirId>! statements = list.ArrayList<hir.HirId>(block.statements.len);
+        Int! index = 0;
+        while (index < block.statements.len) {
+            statements.add(self.lower_stmt(self.state.file.child_at(block.statements, index)));
+            index = index + 1;
+        }
+
+        hir.HirId?! result = null;
+        if (block.tail_expr is some tail_expr) {
+            result = self.lower_expr(tail_expr);
+        }
+        return self.add_node(.block(hir.HirBlock {
+            statements: self.freeze_hir_ids(statements),
+            result: result
+        }));
+    }
+
+    hir.HirId lower_let_stmt(ast.LetData let_stmt) {
+        guard self.current_owner_def is some owner_def else { return self.add_invalid_node(); }
+        hir.HirId?! type_ref = null;
+        if (let_stmt.type_ref is some type_ast) {
+            type_ref = self.lower_type_ref(type_ast);
+        }
+        hir.HirLocalId local_id = self.add_local_for_name(owner_def, let_stmt.name, .local_variable, type_ref);
+        hir.HirId?! initializer = null;
+        if (let_stmt.initializer is some initializer_ast) {
+            initializer = self.lower_expr(initializer_ast);
+        }
+        return self.add_node(.let_stmt(hir.HirLet {local_id: local_id, initializer: initializer}));
+    }
+
+    hir.HirId lower_guard_stmt(ast.GuardData guard_stmt) {
+        // guard 是语句，不是 if 表达式。else body 在 parser 阶段已经要求
+        // 必须退出当前控制流；HIR 保留这个结构，后续 type check 只验证条件
+        // 和 else body 的返回/退出类型。
+        return self.add_node(.guard_stmt(hir.HirGuard {
+            condition: self.lower_expr(guard_stmt.condition),
+            else_body: self.lower_expr(guard_stmt.else_body)
+        }));
+    }
+
+    hir.HirId lower_control_stmt(ast.ControlStmtData control_stmt) {
+        if (control_stmt.kind == .return_value) {
+            hir.HirId?! value = null;
+            if (control_stmt.value is some value_ast) {
+                value = self.lower_expr(value_ast);
+            }
+            return self.add_node(.return_stmt(hir.HirReturn {value: value}));
+        }
+        if (control_stmt.kind == .break_loop) {
+            return self.add_node(.break_stmt());
+        }
+        if (control_stmt.kind == .continue_loop) {
+            return self.add_node(.continue_stmt());
+        }
+        return self.add_invalid_node();
+    }
+
+    hir.HirId lower_call_expr(ast.CallData call) {
+        list.ArrayList<hir.HirId>! args = list.ArrayList<hir.HirId>(call.args.len);
+        Int! index = 0;
+        while (index < call.args.len) {
+            args.add(self.lower_expr(self.state.file.child_at(call.args, index)));
+            index = index + 1;
+        }
+        return self.add_node(.call(hir.HirCall {
+            callee: self.lower_expr(call.callee),
+            args: self.freeze_hir_ids(args),
+            target: self.call_target(call.callee)
+        }));
+    }
+
+    hir.HirId lower_field_expr(ast.FieldExprData field) {
+        return self.add_node(.member_access(hir.HirMemberAccess {
+            base: self.lower_expr(field.base),
+            member_symbol: self.name_symbol_or_zero(field.name)
+        }));
+    }
+
+    hir.HirId lower_path_expr(ast.AstId path_id, ast.PathData path) {
+        // Parser 目前会把 `value.field.subfield` 表示成一个 path。如果
+        // resolve 没有把整个 path 绑定到 namespace/type target，就按链式
+        // value member access lower。每一段 member 是否存在，由 type check
+        // 根据 base type 验证。
+        if (path.segments.len > 1 && self.resolved_def_for_ast(path_id) == null) {
+            return self.lower_member_path(path);
+        }
+        return self.lower_name_ref(path_id);
+    }
+
+    hir.HirId lower_member_path(ast.PathData path) {
+        if (path.segments.len == 0) {
+            return self.add_invalid_node();
+        }
+        hir.HirId! current = self.lower_name_ref(self.state.file.child_at(path.segments, 0));
+        Int! index = 1;
+        while (index < path.segments.len) {
+            ast.AstId segment = self.state.file.child_at(path.segments, index);
+            current = self.add_node(.member_access(hir.HirMemberAccess {
+                base: current,
+                member_symbol: self.name_symbol_or_zero(segment)
+            }));
+            index = index + 1;
+        }
+        return current;
+    }
+
+    hir.HirId lower_if_expr(ast.IfData if_expr) {
+        hir.HirId?! else_body = null;
+        if (if_expr.else_body is some else_ast) {
+            else_body = self.lower_expr(else_ast);
+        }
+        return self.add_node(.if_expr(hir.HirIf {
+            condition: self.lower_expr(if_expr.condition),
+            then_body: self.lower_expr(if_expr.then_body),
+            else_body: else_body
+        }));
+    }
+
+    hir.HirId lower_loop_expr(ast.LoopData loop_expr) {
+        // while/for 在 AST 里共用 LoopData：while 只有 condition，
+        // for 只有 pattern + iterable。HIR 保留三者的 optional 形态，
+        // 让后续 type check 按不同组合解释。
+        hir.HirId?! condition = null;
+        if (loop_expr.condition is some condition_ast) {
+            condition = self.lower_expr(condition_ast);
+        }
+        hir.HirId?! pattern = null;
+        if (loop_expr.pattern is some pattern_ast) {
+            pattern = self.lower_pattern(pattern_ast);
+        }
+        hir.HirId?! iterable = null;
+        if (loop_expr.iterable is some iterable_ast) {
+            iterable = self.lower_expr(iterable_ast);
+        }
+        return self.add_node(.loop_expr(hir.HirLoop {
+            condition: condition,
+            pattern: pattern,
+            iterable: iterable,
+            body: self.lower_expr(loop_expr.body)
+        }));
+    }
+
+    hir.HirId lower_switch_expr(ast.SwitchData switch_expr) {
+        list.ArrayList<hir.HirSwitchCase>! cases = list.ArrayList<hir.HirSwitchCase>(switch_expr.cases.len);
+        Int! index = 0;
+        while (index < switch_expr.cases.len) {
+            cases.add(self.lower_switch_case(self.state.file.child_at(switch_expr.cases, index)));
+            index = index + 1;
+        }
+        return self.add_node(.switch_expr(hir.HirSwitch {
+            value: self.lower_expr(switch_expr.value),
+            cases: self.freeze_switch_cases(cases)
+        }));
+    }
+
+    hir.HirSwitchCase lower_switch_case(ast.AstId case_id) {
+        ast.AstNode case_node = self.state.file.get(case_id);
+        guard case_node.data is .switch_case(case_data) else {
+            return hir.HirSwitchCase {
+                patterns: self.empty_hir_ids(),
+                body: self.add_invalid_node()
+            };
+        }
+        return hir.HirSwitchCase {
+            patterns: self.lower_switch_patterns(case_data.patterns),
+            body: self.lower_expr(case_data.body)
+        };
+    }
+
+    hir.HirId[] lower_switch_patterns(ast.AstRange patterns) {
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>(patterns.len);
+        Int! index = 0;
+        while (index < patterns.len) {
+            values.add(self.lower_switch_pattern(self.state.file.child_at(patterns, index)));
+            index = index + 1;
+        }
+        return self.freeze_hir_ids(values);
+    }
+
+    hir.HirId lower_switch_pattern(ast.AstId pattern_id) {
+        // switch 的 else case 在 parser 中用 unit node 占位；HIR 中把它
+        // 归一成 wildcard pattern，后续阶段不需要知道这个 parser 细节。
+        ast.AstNode pattern_node = self.state.file.get(pattern_id);
+        if (pattern_node.data is .unit_type) {
+            return self.add_node(.wildcard_pattern());
+        }
+        return self.lower_pattern(pattern_id);
+    }
+
+    hir.HirId lower_pattern(ast.AstId pattern_id) {
+        // Pattern 也是 HIR node。binding pattern 额外在当前 HirBody 中创建
+        // HirLocalId；需要类型参与选择的 variant pattern 先保持未定，等
+        // type check 根据 scrutinee type 处理。
+        ast.AstNode pattern_node = self.state.file.get(pattern_id);
+        guard pattern_node.data is .pattern(pattern) else { return self.add_invalid_node(); }
+
+        if (pattern.value is some value) {
+            ast.AstNode value_node = self.state.file.get(value);
+            if (value_node.data is .pattern(_)) {
+                return self.add_node(.optional_pattern(hir.HirOptionalPattern {
+                    nested: self.lower_pattern(value)
+                }));
+            }
+            if (value_node.data is .literal(literal)) {
+                return self.add_node(.literal_pattern(hir.HirLiteralPattern {
+                    literal: self.hir_literal(literal)
+                }));
+            }
+            return self.add_invalid_node();
+        }
+
+        if (pattern.name is some name) {
+            if (self.pattern_is_variant(pattern, name)) {
+                return self.add_node(.variant_pattern(hir.HirVariantPattern {
+                    variant_def: self.resolved_def_for_expr(name),
+                    payload: self.lower_pattern_range(pattern.payload)
+                }));
+            }
+            return self.lower_binding_pattern(pattern, name);
+        }
+
+        if (pattern.payload.empty()) {
+            return self.add_node(.wildcard_pattern());
+        }
+        return self.add_invalid_node();
+    }
+
+    hir.HirId lower_binding_pattern(ast.PatternData pattern, ast.AstId name) {
+        guard self.current_owner_def is some owner_def else { return self.add_invalid_node(); }
+        hir.HirId?! type_ref = null;
+        if (pattern.type_ref is some type_ast) {
+            type_ref = self.lower_type_ref(type_ast);
+        }
+        guard self.resolved_def_for_pattern_name(name) is some def_id else {
+            return self.add_invalid_node();
+        }
+        def.DefRecord def_record = self.state.query.defs.get(def_id);
+        hir.HirLocalId local_id = self.state.query.hirs.add_local(
+            owner_def,
+            .pattern_binding,
+            def_record.name.symbol,
+            def_id,
+            type_ref
+        );
+        return self.add_node(.binding_pattern(hir.HirBindingPattern {local_id: local_id}));
+    }
+
+    hir.HirId[] lower_pattern_range(ast.AstRange patterns) {
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>(patterns.len);
+        Int! index = 0;
+        while (index < patterns.len) {
+            values.add(self.lower_pattern(self.state.file.child_at(patterns, index)));
+            index = index + 1;
+        }
+        return self.freeze_hir_ids(values);
+    }
+
+    Bool pattern_is_variant(ast.PatternData pattern, ast.AstId name) {
+        if (pattern.dot_prefix) {
+            return true;
+        }
+        if (!pattern.payload.empty()) {
+            return true;
+        }
+        if (self.resolved_def_for_expr(name) is some def_id) {
+            def.DefKind kind = self.state.query.defs.get(def_id).kind;
+            return kind == .enum_case_def || kind == .union_variant_def;
+        }
+        return false;
+    }
+
+    hir.HirId lower_type_ref(ast.AstId type_id) {
+        ast.AstNode node = self.state.file.get(type_id);
+        if (node.data is .infer_type) {
+            return self.add_node(.infer_type_ref());
+        }
+        if (node.data is .unit_type) {
+            return self.add_node(.unit_type_ref());
+        }
+        if (node.data is .type_ref(type_data)) {
+            return self.add_node(.layered_type_ref(hir.HirLayeredTypeRef {
+                kind: self.type_layer_kind(type_data.layer),
+                element: self.lower_type_ref(type_data.base)
+            }));
+        }
+        if (node.data is .named_type(named_type)) {
+            return self.lower_named_type_ref(named_type);
+        }
+        if (node.data is .array_type(array_type)) {
+            return self.add_node(.array_type_ref(hir.HirArrayTypeRef {
+                element: self.lower_type_ref(array_type.element),
+                count_kind: self.array_count_kind(array_type.count_kind),
+                count_value: UInt64(0)
+            }));
+        }
+        if (node.data is .errorable_type(errorable_type)) {
+            hir.HirId?! error_type = null;
+            if (errorable_type.error_type is some error_ast) {
+                error_type = self.lower_type_ref(error_ast);
+            }
+            return self.add_node(.errorable_type_ref(hir.HirErrorableTypeRef {
+                value_type: self.lower_type_ref(errorable_type.value_type),
+                error_type: error_type
+            }));
+        }
+        if (node.data is .function_type(function_type)) {
+            return self.add_node(.function_type_ref(hir.HirFunctionTypeRef {
+                params: self.lower_type_ref_range(function_type.params),
+                result: self.lower_type_ref(function_type.result)
+            }));
+        }
+        if (node.data is .tuple_type(items)) {
+            return self.add_node(.tuple_type_ref(hir.HirTupleTypeRef {
+                items: self.lower_type_ref_range(items)
+            }));
+        }
+        if (node.data is .path(_) || node.data is .name(_)) {
+            guard self.resolved_def_for_expr(type_id) is some def_id else {
+                return self.add_node(.invalid_type_ref());
+            }
+            return self.add_node(.named_type_ref(hir.HirNamedTypeRef {
+                def_id: def_id,
+                args: self.empty_hir_ids()
+            }));
+        }
+        return self.add_node(.invalid_type_ref());
+    }
+
+    hir.HirId lower_named_type_ref(ast.NamedTypeData named_type) {
+        guard self.resolved_def_for_expr(named_type.path) is some def_id else {
+            return self.add_node(.invalid_type_ref());
+        }
+        return self.add_node(.named_type_ref(hir.HirNamedTypeRef {
+            def_id: def_id,
+            args: self.lower_type_ref_range(named_type.args)
+        }));
+    }
+
+    hir.HirId[] lower_type_ref_range(ast.AstRange range) {
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>(range.len);
+        Int! index = 0;
+        while (index < range.len) {
+            values.add(self.lower_type_ref(self.state.file.child_at(range, index)));
+            index = index + 1;
+        }
+        return self.freeze_hir_ids(values);
+    }
+
+    hir.HirId lower_name_ref(ast.AstId expr_id) {
+        guard self.resolved_def_for_expr(expr_id) is some def_id else {
+            return self.add_invalid_node();
+        }
+        hir.HirNameRef! name_ref = .def_ref(def_id);
+        if (self.current_owner_def is some owner_def) {
+            if (self.state.query.hirs.local_for_def(owner_def, def_id) is some local_id) {
+                name_ref = .local(local_id);
+            }
+        }
+        return self.add_node(.name_ref(name_ref));
+    }
+
+    hir.HirLocalId add_local_for_name(
+        qid.DefId owner_def,
+        ast.AstId name_id,
+        hir.HirLocalKind kind,
+        hir.HirId? type_ref
+    ) {
+        guard self.resolved_def_for_ast(name_id) is some def_id else { return hir.HirLocalId.from_index(0); }
+        def.DefRecord def_record = self.state.query.defs.get(def_id);
+        return self.state.query.hirs.add_local(owner_def, kind, def_record.name.symbol, def_id, type_ref);
+    }
+
+    hir.HirCallTarget? call_target(ast.AstId callee_id) {
+        guard self.resolved_def_for_expr(callee_id) is some def_id else { return null; }
+        if (self.state.query.defs.get(def_id).kind != .function_def) {
+            return null;
+        }
+        return hir.HirCallTarget {def_id: def_id, signature_id: null};
+    }
+
+    qid.DefId? resolved_def_for_expr(ast.AstId expr_id) {
+        if (self.resolved_def_for_ast(expr_id) is some def_id) {
+            return def_id;
+        }
+        ast.AstNode expr = self.state.file.get(expr_id);
+        if (expr.data is .name_expr(name_expr)) {
+            return self.resolved_def_for_expr(name_expr.value);
+        }
+        if (expr.data is .path(path)) {
+            if (path.segments.len == 1) {
+                return self.resolved_def_for_ast(self.state.file.child_at(path.segments, 0));
+            }
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_def_for_pattern_name(ast.AstId name_id) {
+        if (self.resolved_def_for_ast(name_id) is some def_id) {
+            return def_id;
+        }
+        ast.AstNode node = self.state.file.get(name_id);
+        if (node.data is .path(path)) {
+            if (path.segments.len == 1) {
+                return self.resolved_def_for_ast(self.state.file.child_at(path.segments, 0));
+            }
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_def_for_ast(ast.AstId ast_id) {
+        return self.state.query.resolve.ast_resolution(
+            self.state.file.source_id,
+            self.state.query.sources.get(self.state.file.source_id).revision,
+            ast_id
+        );
+    }
+
+    hir.HirId add_node(hir.HirNodeData data) {
+        guard self.current_owner_def is some owner_def else {
+            self.add_internal_error(token.Span(), "HIR node lowered without owner", "hir_node_without_owner");
+            return hir.HirId(qid.DefId.from_index(0), 0);
+        }
+        return self.state.query.hirs.add_node(owner_def, data);
+    }
+
+    hir.HirId add_invalid_node() {
+        return self.add_node(.invalid());
+    }
+
+    hir.HirId[] empty_hir_ids() {
+        list.ArrayList<hir.HirId> empty = list.ArrayList<hir.HirId>();
+        return self.freeze_hir_ids(empty);
+    }
+
+    hir.HirId[] freeze_hir_ids(list.ArrayList<hir.HirId> values) {
+        Int count = values.len();
+        Int! capacity = count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        hir.HirId![*] stored = self.state.query.hirs.storage.alloc_array<hir.HirId>(capacity);
+        Int! index = 0;
+        while (index < count) {
+            stored[index] = values.get(index);
+            index = index + 1;
+        }
+        return stored[0..count];
+    }
+
+    hir.HirSwitchCase[] freeze_switch_cases(list.ArrayList<hir.HirSwitchCase> values) {
+        Int count = values.len();
+        Int! capacity = count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        hir.HirSwitchCase![*] stored = self.state.query.hirs.storage.alloc_array<hir.HirSwitchCase>(capacity);
+        Int! index = 0;
+        while (index < count) {
+            stored[index] = values.get(index);
+            index = index + 1;
+        }
+        return stored[0..count];
+    }
+
+    qid.SymbolId name_symbol_or_zero(ast.AstId name_id) {
+        if (self.state.name_symbol(name_id) is some symbol) {
+            return symbol;
+        }
+        return qid.SymbolId.from_index(0);
+    }
+
+    hir.HirLiteral hir_literal(ast.LiteralData literal) {
+        hir.HirLiteralValue! value = .null_value();
+        if (literal.kind == .int_lit) {
+            value = .int_value(hir.HirIntLiteral {bits: UInt64(0), signed_value: true});
+        }
+        if (literal.kind == .float_lit) {
+            value = .float_value(hir.HirFloatLiteral {value: Float64(0)});
+        }
+        if (literal.kind == .char_lit) {
+            value = .char_value(UInt32(0));
+        }
+        if (literal.kind == .string_lit) {
+            if (literal.symbol_id is some symbol_index) {
+                value = .string_value(qid.SymbolId.from_index(symbol_index));
+            }
+        }
+        if (literal.kind == .bool_lit) {
+            value = .bool_value(literal.bool_value);
+        }
+        return hir.HirLiteral {value: value};
+    }
+
+    hir.HirTypeLayerKind type_layer_kind(ast.TypeLayerKind kind) {
+        if (kind == .optional) { return .optional_type; }
+        if (kind == .mutable_type) { return .mutable_type; }
+        if (kind == .reference) { return .reference; }
+        if (kind == .owner_pointer) { return .owner_pointer; }
+        if (kind == .many_pointer) { return .many_pointer; }
+        return .slice;
+    }
+
+    hir.HirArrayCountKind array_count_kind(ast.ArrayCountKind kind) {
+        if (kind == .int_lit) {
+            return .int_lit;
+        }
+        return .inferred;
+    }
+
+    hir.HirUnaryOp unary_op(ast.UnaryOp op) {
+        if (op == .negate) { return .negate; }
+        if (op == .not) { return .not; }
+        if (op == .bit_not) { return .bit_not; }
+        if (op == .address_of) { return .address_of; }
+        if (op == .deref) { return .deref; }
+        return .new_value;
+    }
+
+    hir.HirBinaryOp binary_op(ast.BinaryOp op) {
+        if (op == .add) { return .add; }
+        if (op == .sub) { return .sub; }
+        if (op == .mul) { return .mul; }
+        if (op == .div) { return .div; }
+        if (op == .mod) { return .mod; }
+        if (op == .bit_and) { return .bit_and; }
+        if (op == .bit_or) { return .bit_or; }
+        if (op == .bit_xor) { return .bit_xor; }
+        if (op == .logic_and) { return .logic_and; }
+        if (op == .logic_or) { return .logic_or; }
+        if (op == .coalesce) { return .coalesce; }
+        if (op == .shift_left) { return .shift_left; }
+        if (op == .shift_right) { return .shift_right; }
+        if (op == .equal) { return .equal; }
+        if (op == .not_equal) { return .not_equal; }
+        if (op == .less) { return .less; }
+        if (op == .less_equal) { return .less_equal; }
+        if (op == .greater) { return .greater; }
+        return .greater_equal;
+    }
+
+    hir.HirAssignOp assign_op(ast.AssignOp op) {
+        if (op == .assign) { return .assign; }
+        if (op == .add_assign) { return .add_assign; }
+        if (op == .sub_assign) { return .sub_assign; }
+        if (op == .mul_assign) { return .mul_assign; }
+        if (op == .div_assign) { return .div_assign; }
+        if (op == .mod_assign) { return .mod_assign; }
+        if (op == .bit_and_assign) { return .bit_and_assign; }
+        if (op == .bit_or_assign) { return .bit_or_assign; }
+        if (op == .bit_xor_assign) { return .bit_xor_assign; }
+        if (op == .shift_left_assign) { return .shift_left_assign; }
+        return .shift_right_assign;
+    }
+
+    () add_internal_error(token.Span span, UInt8[] message, UInt8[] code) {
+        self.state.query.hirs.mark_error();
+        self.state.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .internal,
+                diagnostic.DiagnosticCode(code),
+                diagnostic.SourceRange(self.state.file.source_id, span),
+                message
+            )
+        );
+    }
+}
