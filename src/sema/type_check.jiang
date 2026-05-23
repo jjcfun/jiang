@@ -2,6 +2,7 @@
 
 import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
+import hir = "../hir/hir.jiang";
 import query = "../query/api.jiang";
 import qid = "../query/id.jiang";
 import def = "../resolve/def.jiang";
@@ -15,6 +16,7 @@ import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
 import types = "./type.jiang";
+import sema_result = "./result.jiang";
 
 public struct TypedFile {
     public source.SourceId source_id;
@@ -121,6 +123,203 @@ public struct PackageCheckResult {
     public TypedFile^ typed_file_for_graph_index(Int graph_index) {
         Int reverse_index = self.typed_files.len() - 1 - graph_index;
         return self.typed_files.get(reverse_index);
+    }
+}
+
+public Bool check_hir_package(context.CompilerContext& ctx) {
+    // 新 pipeline 的 type check 入口。当前阶段先只建立 HIR -> TypeCheckResults
+    // 的边界：结果表归 QuerySystem 所有，每次 package check 重新初始化。
+    //
+    // 旧 AST/ResolvedFile checker 还保留在下面；后续迁移时，把声明签名、
+    // 表达式、pattern visitor 逐步搬到 HirTypeChecker 内部，并删除旧入口。
+    ctx.query.typeck.reset();
+    HirTypeChecker! checker = HirTypeChecker(ctx, ctx.query.hirs$.ref(), ctx.query.typeck$.ref());
+    return checker.check();
+}
+
+struct HirTypeChecker {
+    context.CompilerContext& ctx;
+    hir.HirStore& hirs;
+    sema_result.TypeCheckResults& results;
+
+    public init(
+        context.CompilerContext& ctx,
+        hir.HirStore& hirs,
+        sema_result.TypeCheckResults& results
+    ) {
+        self.ctx = ctx;
+        self.hirs = hirs;
+        self.results = results;
+    }
+
+    public Bool check() {
+        if (self.hirs.has_errors()) {
+            self.results.mark_error();
+        }
+        self.check_declaration_signatures();
+        self.check_bodies();
+        return !self.results.has_errors();
+    }
+
+    () check_declaration_signatures() {
+        Int! index = 0;
+        while (index < self.hirs.def_len()) {
+            qid.DefId def_id = self.hirs.def_at(index);
+            hir.HirDef hir_def = self.hirs.def(def_id)$.some();
+            if (hir_def.decl.function_signature is some signature) {
+                self.bind_def_type(def_id, self.check_function_signature(signature));
+            } else {
+                if (hir_def.decl.type_ref is some type_ref) {
+                    self.bind_def_type(def_id, self.check_type_ref(type_ref));
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId check_function_signature(hir.HirFunctionSignature signature) {
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(signature.params.length);
+        Int! index = 0;
+        while (index < signature.params.length) {
+            params.add(self.check_type_ref(signature.params[index]));
+            index = index + 1;
+        }
+        return self.ctx.query.types.function_type(
+            params,
+            self.check_type_ref(signature.result),
+            token.Span()
+        );
+    }
+
+    qid.TypeId check_type_ref(hir.HirId type_ref) {
+        hir.HirNode node = self.hirs.node(type_ref);
+        qid.TypeId! type_id = self.ctx.query.types.invalid_type();
+        if (node.data is .named_type_ref(named)) {
+            type_id = self.type_for_named_ref(named);
+        }
+        if (node.data is .layered_type_ref(layered)) {
+            type_id = self.type_for_layered_ref(layered);
+        }
+        if (node.data is .function_type_ref(function_type)) {
+            type_id = self.type_for_function_ref(function_type);
+        }
+        if (node.data is .unit_type_ref) {
+            type_id = self.ctx.query.types.unit_type();
+        }
+        if (node.data is .infer_type_ref) {
+            type_id = self.ctx.query.types.invalid_type();
+        }
+        if (node.data is .invalid_type_ref) {
+            type_id = self.ctx.query.types.invalid_type();
+        }
+        self.results.set_node_type(type_ref, type_id);
+        return type_id;
+    }
+
+    qid.TypeId type_for_named_ref(hir.HirNamedTypeRef named) {
+        if (self.ctx.query.types.type_for_def(named.def_id) is some type_id) {
+            return type_id;
+        }
+        return self.ctx.query.types.named_type(named.def_id, token.Span());
+    }
+
+    qid.TypeId type_for_layered_ref(hir.HirLayeredTypeRef layered) {
+        qid.TypeId element = self.check_type_ref(layered.element);
+        if (layered.kind == .optional_type) {
+            return self.ctx.query.types.optional_type(element, token.Span());
+        }
+        if (layered.kind == .mutable_type) {
+            return self.ctx.query.types.mutable_type(element, token.Span());
+        }
+        return self.ctx.query.types.invalid_type();
+    }
+
+    qid.TypeId type_for_function_ref(hir.HirFunctionTypeRef function_type) {
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(function_type.params.length);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            params.add(self.check_type_ref(function_type.params[index]));
+            index = index + 1;
+        }
+        return self.ctx.query.types.function_type(
+            params,
+            self.check_type_ref(function_type.result),
+            token.Span()
+        );
+    }
+
+    () check_bodies() {
+        Int! index = 0;
+        while (index < self.hirs.def_len()) {
+            qid.DefId def_id = self.hirs.def_at(index);
+            hir.HirDef hir_def = self.hirs.def(def_id)$.some();
+            if (hir_def.body is some body) {
+                self.check_node(body.root);
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId check_node(hir.HirId node_id) {
+        hir.HirNode node = self.hirs.node(node_id);
+        qid.TypeId! type_id = self.ctx.query.types.invalid_type();
+        if (node.data is .literal(literal)) {
+            type_id = self.check_literal(literal);
+        }
+        if (node.data is .block(block)) {
+            type_id = self.check_block(block);
+        }
+        if (node.data is .return_stmt(return_stmt)) {
+            type_id = self.check_return(return_stmt);
+        }
+        if (node.data is .invalid) {
+            type_id = self.ctx.query.types.invalid_type();
+        }
+        self.results.set_node_type(node_id, type_id);
+        return type_id;
+    }
+
+    qid.TypeId check_block(hir.HirBlock block) {
+        Int! index = 0;
+        while (index < block.statements.length) {
+            self.check_node(block.statements[index]);
+            index = index + 1;
+        }
+        if (block.result is some result) {
+            return self.check_node(result);
+        }
+        return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId check_return(hir.HirReturn return_stmt) {
+        if (return_stmt.value is some value) {
+            self.check_node(value);
+        }
+        return self.ctx.query.types.never_type();
+    }
+
+    qid.TypeId check_literal(hir.HirLiteral literal) {
+        if (literal.value is .int_value) {
+            return self.ctx.query.types.int_type();
+        }
+        if (literal.value is .float_value) {
+            return self.ctx.query.types.builtins.double_type;
+        }
+        if (literal.value is .bool_value) {
+            return self.ctx.query.types.bool_type();
+        }
+        if (literal.value is .char_value) {
+            return self.ctx.query.types.builtins.char_type;
+        }
+        if (literal.value is .unit_value) {
+            return self.ctx.query.types.unit_type();
+        }
+        return self.ctx.query.types.invalid_type();
+    }
+
+    () bind_def_type(qid.DefId def_id, qid.TypeId type_id) {
+        self.results.set_def_type(def_id, type_id);
+        self.ctx.query.types.bind_def_type(def_id, type_id);
     }
 }
 
