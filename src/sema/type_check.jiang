@@ -5,12 +5,16 @@ import diagnostic = "../diagnostic/diagnostic.jiang";
 import query = "../query/api.jiang";
 import qid = "../query/id.jiang";
 import def = "../resolve/def.jiang";
+import module_graph = "../resolve/module_graph.jiang";
+import module_resolver = "../resolve/module_resolver.jiang";
 import resolve_result = "../resolve/result.jiang";
+import resolve_store = "../resolve/store.jiang";
 import source = "../source/source.jiang";
 import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
+import dependency_graph = "./dependency_graph.jiang";
 import types = "./type.jiang";
 
 public struct TypedFile {
@@ -26,6 +30,12 @@ public struct TypedFile {
     // TypeChecker 在算出 base 类型后把成员选择结果记录到这里，后续降级阶段
     // 对普通名字读 ResolvedFile，对成员表达式读 TypedFile。
     public table.SideTable<ast.AstId, qid.DefId> member_selections;
+    // pattern 的类型驱动 variant 选择结果。
+    //
+    // 显式 `R.ok` pattern 可以由 resolve 绑定；`.ok` 这种 dot-prefix pattern
+    // 必须等 type check 得到 scrutinee 类型后才能选中具体 variant。HIR lowering
+    // 只消费这里的结果，不重新按类型查 owner namespace。
+    public table.SideTable<ast.AstId, qid.DefId> pattern_selections;
 
     public init(source.SourceId source_id, Int revision, Bool ok) {
         self.source_id = source_id;
@@ -34,6 +44,7 @@ public struct TypedFile {
         self.types = table.SideTable<ast.AstId, qid.TypeId>();
         self.def_types = table.HashTable<qid.DefId, qid.TypeId>();
         self.member_selections = table.SideTable<ast.AstId, qid.DefId>();
+        self.pattern_selections = table.SideTable<ast.AstId, qid.DefId>();
     }
 
     public Bool valid_for_resolve(resolve_result.ResolvedFile& resolved) {
@@ -73,6 +84,17 @@ public struct TypedFile {
         return null;
     }
 
+    public () bind_pattern_selection(ast.AstId ast_id, qid.DefId def_id) {
+        self.pattern_selections.set(ast_id, def_id);
+    }
+
+    public qid.DefId? pattern_selection(ast.AstId ast_id) {
+        if (self.pattern_selections.has(ast_id)) {
+            return self.pattern_selections.get(ast_id);
+        }
+        return null;
+    }
+
     public Bool has_errors() {
         return !self.ok;
     }
@@ -80,6 +102,94 @@ public struct TypedFile {
     public () mark_error() {
         self.ok = false;
     }
+}
+
+public struct PackageCheckResult {
+    public Bool! ok;
+    public list.ArrayList<ast.AstFile&> files;
+    public list.ArrayList<resolve_result.ResolvedFile^> resolved_files;
+    // Type check 需要依赖优先，因此按 graph 反向顺序保存。
+    // 读取时统一走 typed_file_for_graph_index。
+    public list.ArrayList<TypedFile^> typed_files;
+
+    public init(Int capacity) {
+        self.ok = true;
+        self.files = list.ArrayList<ast.AstFile&>(capacity);
+        self.resolved_files = list.ArrayList<resolve_result.ResolvedFile^>(capacity);
+        self.typed_files = list.ArrayList<TypedFile^>(capacity);
+    }
+
+    public TypedFile^ typed_file_for_graph_index(Int graph_index) {
+        Int reverse_index = self.typed_files.len() - 1 - graph_index;
+        return self.typed_files.get(reverse_index);
+    }
+}
+
+public PackageCheckResult check_module_graph(
+    context.CompilerContext& ctx,
+    module_resolver.ModuleResolver& resolver,
+    module_graph.ModuleGraph& graph
+) {
+    PackageCheckResult! result = PackageCheckResult(graph.modules.len());
+    if (!resolve_module_graph_files(ctx, resolver, graph, result$.ref())) {
+        result.ok = false;
+        return result;
+    }
+    // 先 full resolve graph 内所有文件，确保 ResolveStore 已经有完整 declarations，
+    // 再做 package 级 definition dependency 检查。
+    if (!dependency_graph.check_module_dependencies(ctx, graph)) {
+        result.ok = false;
+        return result;
+    }
+    type_check_module_graph(ctx, result$.ref());
+    return result;
+}
+
+Bool resolve_module_graph_files(
+    context.CompilerContext& ctx,
+    module_resolver.ModuleResolver& resolver,
+    module_graph.ModuleGraph& graph,
+    PackageCheckResult& output
+) {
+    Int! index = 0;
+    while (index < graph.modules.len()) {
+        guard module_file(ctx, graph.modules.get(index)) is some file else {
+            output.ok = false;
+            return false;
+        }
+        resolve_result.ResolvedFile^ resolved = resolver.resolve_file(graph, file);
+        if (!resolved.ok) {
+            output.ok = false;
+            return false;
+        }
+        output.files.add(file);
+        output.resolved_files.add(resolved);
+        index = index + 1;
+    }
+    return true;
+}
+
+() type_check_module_graph(context.CompilerContext& ctx, PackageCheckResult& result) {
+    // TypeTable 是 package 级共享表。这里反向检查 graph，让 import 依赖
+    // 通常先写入 DefId -> TypeId，root 在读取跨文件符号时能看到签名。
+    Int! index = result.files.len();
+    while (index > 0) {
+        index = index - 1;
+        TypedFile^ typed = check_file(
+            ctx,
+            result.files.get(index),
+            result.resolved_files.get(index)$.ref()
+        );
+        if (typed.has_errors()) {
+            result.ok = false;
+        }
+        result.typed_files.add(typed);
+    }
+}
+
+ast.AstFile&? module_file(context.CompilerContext& ctx, qid.ModuleId module_id) {
+    resolve_store.ModuleRecord module = ctx.query.resolve.modules.get(module_id);
+    return ctx.query.asts.file(module.source_id, module.source_revision);
 }
 
 public TypedFile^ check_file(
@@ -1162,7 +1272,7 @@ struct TypeChecker {
             return;
         }
         if (pattern.name is some name) {
-            self.check_named_pattern(pattern, name, input_type, pattern_node.span);
+            self.check_named_pattern(pattern_id, pattern, name, input_type, pattern_node.span);
             return;
         }
         self.check_pattern_range(pattern.payload, input_type);
@@ -1228,16 +1338,24 @@ struct TypeChecker {
     // name pattern 可能是 binding，也可能是 resolve 已绑定的 variant path。
     // resolve 阶段已经把 `R.ok` 这种显式 variant pattern 写入 ResolvedFile；
     // type check 这里只负责区分 variant 和普通 binding，并分发 payload 类型。
-    () check_named_pattern(ast.PatternData pattern, ast.AstId name, qid.TypeId input_type, token.Span span) {
+    () check_named_pattern(
+        ast.AstId pattern_id,
+        ast.PatternData pattern,
+        ast.AstId name,
+        qid.TypeId input_type,
+        token.Span span
+    ) {
         if (self.resolved_def_for_path(name) is some def_id) {
             def.DefKind kind = self.query.defs.get(def_id).kind;
             if (kind == .enum_case_def || kind == .union_variant_def) {
+                self.typed.bind_pattern_selection(pattern_id, def_id);
+                self.typed.bind_pattern_selection(name, def_id);
                 self.check_variant_def_pattern(def_id, pattern.payload, input_type, span);
                 return;
             }
         }
         if (pattern.dot_prefix) {
-            self.check_dot_prefix_variant_pattern(name, pattern.payload, input_type, span);
+            self.check_dot_prefix_variant_pattern(pattern_id, name, pattern.payload, input_type, span);
             return;
         }
         if (!pattern.payload.empty()) {
@@ -1250,7 +1368,13 @@ struct TypeChecker {
 
     // `.ok` 这种 pattern 没有显式 owner，resolve 阶段无法绑定。
     // TypeChecker 用 scrutinee 类型的 declaration namespace 查 member。
-    () check_dot_prefix_variant_pattern(ast.AstId name, ast.AstRange payload, qid.TypeId input_type, token.Span span) {
+    () check_dot_prefix_variant_pattern(
+        ast.AstId pattern_id,
+        ast.AstId name,
+        ast.AstRange payload,
+        qid.TypeId input_type,
+        token.Span span
+    ) {
         guard self.member_owner_namespace(input_type) is some namespace_id else {
             self.add_type_diagnostic(span, "dot-prefix pattern requires nominal input", "invalid_variant_pattern");
             self.check_pattern_range(payload, self.query.types.invalid_type());
@@ -1265,6 +1389,8 @@ struct TypeChecker {
             self.check_pattern_range(payload, self.query.types.invalid_type());
             return;
         }
+        self.typed.bind_pattern_selection(pattern_id, def_id);
+        self.typed.bind_pattern_selection(name, def_id);
         self.check_variant_def_pattern(def_id, payload, input_type, span);
     }
 
