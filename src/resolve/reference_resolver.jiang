@@ -1,7 +1,7 @@
 // 单个文件内的引用解析。
 //
 // NameResolver 负责阶段编排和 top-level 声明收集；这里负责遍历声明 body、
-// 管理局部 scope，并把 name/path lookup 结果写入 ResolveStore。
+// 管理局部 scope，并验证 name/path lookup 是否能命中已有 DefId。
 
 import qid = "../query/id.jiang";
 import ast = "../syntax/ast.jiang";
@@ -21,10 +21,6 @@ public struct ReferenceResolver {
         self.state = state;
         self.env = scope.LexicalEnv();
         self.current_owner_def = null;
-    }
-
-    () record_name(ast.AstId ast_id, qid.DefId def_id) {
-        self.state.set_ast_resolution(ast_id, def_id);
     }
 
     public () resolve() {
@@ -63,10 +59,15 @@ public struct ReferenceResolver {
             return;
         }
         if (body.data is .global_decl(global_decl)) {
+            qid.DefId? previous_owner = self.current_owner_def;
+            if (self.owner_value_def(global_decl.name) is some global_def) {
+                self.current_owner_def = global_def;
+            }
             self.resolve_type_ref(global_decl.type_ref);
             if (global_decl.initializer is some initializer) {
                 self.resolve_expr(initializer);
             }
+            self.current_owner_def = previous_owner;
             return;
         }
         if (body.data is .function_decl(function_decl)) {
@@ -125,12 +126,26 @@ public struct ReferenceResolver {
     }
 
     qid.DefId? owner_type_def(ast.AstId name_id) {
+        return self.owner_def(name_id, .type_name);
+    }
+
+    qid.DefId? owner_value_def(ast.AstId name_id) {
+        return self.owner_def(name_id, .value_name);
+    }
+
+    qid.DefId? owner_def(ast.AstId name_id, def.NameDomain domain) {
         guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        qid.NamespaceId! namespace_id = self.state.namespace_id;
+        if (self.current_owner_def is some owner_def) {
+            if (self.state.query.defs.get(owner_def).owned_namespace_id is some owner_namespace) {
+                namespace_id = owner_namespace;
+            }
+        }
         if (
             self.state.query.resolve.lookup_namespace(
-                self.state.namespace_id,
+                namespace_id,
                 symbol,
-                .type_name,
+                domain,
                 false
             ) is some binding
         ) {
@@ -156,25 +171,28 @@ public struct ReferenceResolver {
             return self.resolved_type_def(type_data.base);
         }
         if (node.data is .named_type(named_type)) {
-            return self.resolved_path_def(named_type.path);
+            return self.resolved_path_def(named_type.path, .type_name);
         }
         if (node.data is .path(_)) {
-            return self.resolved_path_def(type_id);
+            return self.resolved_path_def(type_id, .type_name);
         }
         if (node.data is .name(_)) {
-            return self.resolved_name(type_id);
+            return self.resolved_name(type_id, .type_name);
         }
         return null;
     }
 
-    qid.DefId? resolved_path_def(ast.AstId path_id) {
-        if (self.resolved_name(path_id) is some def_id) {
+    qid.DefId? resolved_path_def(ast.AstId path_id, def.NameDomain domain) {
+        if (self.resolved_name(path_id, domain) is some def_id) {
             return def_id;
         }
         ast.AstNode path_node = self.state.file.get(path_id);
         if (path_node.data is .path(path_data)) {
             if (path_data.segments.len == 1) {
-                return self.resolved_name(self.state.file.child_at(path_data.segments, 0));
+                return self.resolved_name(self.state.file.child_at(path_data.segments, 0), domain);
+            }
+            if (path_data.segments.len >= 2) {
+                return self.resolve_qualified_path(path_id, path_data, domain);
             }
         }
         return null;
@@ -248,7 +266,7 @@ public struct ReferenceResolver {
 
     () resolve_function(ast.FunctionData function_decl) {
         qid.DefId? previous_owner = self.current_owner_def;
-        if (self.resolved_name(function_decl.name) is some function_def) {
+        if (self.owner_value_def(function_decl.name) is some function_def) {
             self.current_owner_def = function_def;
         }
         self.env.enter_scope(.generic_scope);
@@ -767,7 +785,6 @@ public struct ReferenceResolver {
             is some type_binding
         ) {
             guard self.check_accessible(type_binding.def_id, segment_id) else { return null; }
-            self.record_name(segment_id, type_binding.def_id);
             return self.state.query.defs.get(type_binding.def_id).owned_namespace_id;
         }
         return self.resolve_first_qualified_namespace(segment_id);
@@ -796,8 +813,6 @@ public struct ReferenceResolver {
             );
             return null;
         }
-        self.record_name(segment_id, binding.def_id);
-        self.record_name(path_id, binding.def_id);
         return binding.def_id;
     }
 
@@ -873,7 +888,6 @@ public struct ReferenceResolver {
             if (!duplicate) {
                 self.env.define(symbol, domain, def_id, span);
             }
-            self.record_name(name_id, def_id);
         }
     }
 
@@ -911,14 +925,12 @@ public struct ReferenceResolver {
     qid.DefId? resolve_name_reference(ast.AstId name_id, def.NameDomain domain) {
         if (self.state.name_symbol(name_id) is some symbol) {
             if (self.env.lookup_def(symbol, domain) is some local_def) {
-                self.record_name(name_id, local_def);
                 return local_def;
             }
             if (
                 self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
                 is some binding
             ) {
-                self.record_name(name_id, binding.def_id);
                 return binding.def_id;
             }
             self.add_unresolved_diagnostic(name_id, domain);
@@ -953,21 +965,18 @@ public struct ReferenceResolver {
             return null;
         }
         guard self.check_accessible(binding.def_id, name_id) else { return null; }
-        self.record_name(name_id, binding.def_id);
         return self.state.query.defs.get(binding.def_id).owned_namespace_id;
     }
 
     qid.DefId? resolve_value_path_root(ast.AstId name_id) {
         guard self.state.name_symbol(name_id) is some symbol else { return null; }
         if (self.env.lookup_def(symbol, .value_name) is some local_def) {
-            self.record_name(name_id, local_def);
             return local_def;
         }
         if (
             self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, .value_name, true)
             is some binding
         ) {
-            self.record_name(name_id, binding.def_id);
             return binding.def_id;
         }
         return null;
@@ -981,7 +990,6 @@ public struct ReferenceResolver {
         ) else {
             return null;
         }
-        self.record_name(segment_id, binding.def_id);
         return self.state.query.defs.get(binding.def_id).owned_namespace_id;
     }
 
@@ -1048,7 +1056,6 @@ public struct ReferenceResolver {
         ast.AstId segment_id,
         qid.DefId def_id
     ) {
-        self.record_name(segment_id, def_id);
         guard self.state.query.defs.get(def_id).owned_namespace_id is some namespace_id else {
             self.add_unresolved_diagnostic(segment_id, .namespace_name);
             return null;
@@ -1070,8 +1077,6 @@ public struct ReferenceResolver {
             guard self.check_accessible(binding.def_id, segment_id) else {
                 return null;
             }
-            self.record_name(segment_id, binding.def_id);
-            self.record_name(path_id, binding.def_id);
             return binding.def_id;
         }
         if (domain == .value_name) {
@@ -1082,8 +1087,6 @@ public struct ReferenceResolver {
                 guard self.check_accessible(member_binding.def_id, segment_id) else {
                     return null;
                 }
-                self.record_name(segment_id, member_binding.def_id);
-                self.record_name(path_id, member_binding.def_id);
                 return member_binding.def_id;
             }
         }
@@ -1101,7 +1104,6 @@ public struct ReferenceResolver {
         guard self.check_accessible(binding.def_id, segment_id) else {
             return null;
         }
-        self.record_name(segment_id, binding.def_id);
         return self.state.query.defs.get(binding.def_id).owned_namespace_id;
     }
 
@@ -1159,8 +1161,18 @@ public struct ReferenceResolver {
         self.mark_error();
     }
 
-    qid.DefId? resolved_name(ast.AstId ast_id) {
-        return self.state.ast_resolution(ast_id);
+    qid.DefId? resolved_name(ast.AstId ast_id, def.NameDomain domain) {
+        guard self.state.name_symbol(ast_id) is some symbol else { return null; }
+        if (self.env.lookup_def(symbol, domain) is some local_def) {
+            return local_def;
+        }
+        if (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
+            is some binding
+        ) {
+            return binding.def_id;
+        }
+        return null;
     }
 
     () mark_error() {

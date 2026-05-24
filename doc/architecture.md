@@ -8,10 +8,10 @@ Jiang Next 编译器应围绕稳定的阶段边界组织。
 driver -> session -> pipeline
                        |
                        v
-source -> syntax -> resolve -> sema -> ir -> backend
-                           \          /
-                            v        v
-                              query
+source -> syntax -> resolve/HIR -> sema -> MIR -> backend
+                              \       /
+                               v     v
+                                query
 ```
 
 ## 边界
@@ -20,14 +20,16 @@ source -> syntax -> resolve -> sema -> ir -> backend
 - `session` 持有一次编译会话的 `CompilerContext`，向 CLI、测试和未来工具暴露编译请求。
 - `pipeline` 串联各阶段，并负责跨阶段错误处理。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
-- `syntax` 只产生 token 和 AST；它不应理解类型语义。
+- `syntax` 只产生 token 和 AST；它不应理解类型语义，也不把 AST 写入
+  `QuerySystem`。
 - `diagnostic` 负责诊断数据结构、source map、终端输出和未来 LSP 位置转换。
 - `resolve` 负责 symbol interning、keyword table、import、module、namespace 和
-  declaration/reference 的名字解析。
+  declaration/reference 的名字解析，并直接生成 resolved HIR。
 - `sema` 负责类型检查、overload resolution、trait、generic 和类型转换。
-- `ir` 包含 HIR/MIR 数据定义，以及从上一阶段 lower 到目标 IR 的逻辑。
-  `ir/common.jiang` 放共享 IR 结构，`ir/hir.jiang` 放 HIR，`ir/mir.jiang` 放 MIR；
-  `ir/ast_lower/` 放 AST 到 HIR 的 lowering，`ir/hir_lower/` 放 HIR 到 MIR 的 lowering。
+- `hir` 包含 HIR 数据定义。HIR 是 resolved、未类型化的语义树，按 `DefId`
+  组织 def-local node table。
+- `mir` 包含 MIR 数据定义和 HIR -> MIR lowering。MIR 只消费 HIR 和
+  `TypeCheckResults`。
 - `backend` 把 MIR 转成产物。当前仅保留 target 骨架；后续如果引入 LLVM 后端，
   LLVM 细节放在 `backend/llvm`。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略。
@@ -42,10 +44,11 @@ src/
   driver/       CLI 参数和命令入口
   source/       package、source file、source manager
   syntax/       token、lexer、parser、flat AST
-  diagnostic/   diagnostic、source map、reporter
+  diagnostic/   diagnostic、reporter
   resolve/      symbol table、keyword table、import/module/name resolver
   sema/         type、trait、generic、overload、type check
-  ir/           common、HIR、MIR、AST lower、HIR lower
+  hir/          HIR 数据结构
+  mir/          MIR 数据结构和 HIR -> MIR lowering
   backend/      target 和后端入口
   incremental/  cache key、fingerprint、依赖图、symbol index
   query/        query system、cache、id、key、result
@@ -134,8 +137,9 @@ public trait Indexable {
   用 `InternTable<SymbolText, SymbolId>` 维护源码文本驻留；`KeywordTable`
   用 `HashTable<SymbolId, Keyword>` 做关键字反查。
 - `query/api.jiang` 的 `QuerySystem` 持有 `QueryCache`、`SymbolTable`、`KeywordTable`、
-  `DefTable`、`TypeTable`、`ResolveStore` 等全局生命周期对象。长期事实表优先挂到
-  `QuerySystem`，具体 record/key 类型仍由 owner 模块定义。
+  `DefTable`、`TypeTable`、`ResolveStore`、`HirStore`、`TypeCheckResults` 等全局
+  生命周期对象。长期事实表优先挂到 `QuerySystem`，具体 record/key 类型仍由
+  owner 模块定义。`AstStore` 不是长期事实表，不挂到 `QuerySystem`。
 - `resolve/def.jiang` 定义 `DefKind`、`Visibility`、`NameDomain`、`DefRecord` 和
   `DefTable`。
 - `resolve/namespace.jiang` 定义持久 namespace、namespace binding 和 lookup key。
@@ -152,35 +156,39 @@ public trait Indexable {
 
 ### 当前 Resolve 流程
 
-`resolve/module_resolver.jiang` 是当前 resolve 入口。外部创建 `ModuleResolver(ctx)`，
-先构建 root import closure 的 `ModuleGraph`，再把 graph 内可达 module 直接 lower 到 HIR：
+`resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 先创建本次 package
+编译的临时 `AstStore`，root/import closure 的 AST 都放在这张表里。外部创建
+`ModuleResolver(ctx, asts)`，先构建 root import closure 的 `ModuleGraph`，再把
+graph 内可达 module 直接 lower 到 HIR：
 
 ```jiang
-ModuleResolver! resolver = ModuleResolver(ctx)
+AstStore! asts = AstStore()
+SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
+asts.set_file(root.file, source_revision)
+ModuleResolver! resolver = ModuleResolver(ctx, asts$.ref())
 ModuleGraph^ graph = resolver.build_module_graph(root_file)
 resolver.lower_module_graph_to_hir(graph$.ref())
 ```
 
-`pipeline.compile_path(ctx, input_path)` 是当前 source/syntax/resolve 的路径入口：如果
-`input_path` 可直接读取为文件，就按单文件编译；否则按 package 目录处理，读取
-`input_path/package.ini`，再编译 manifest 指定的 root source。
+`pipeline.compile_package_path(ctx, input_path)` 是当前 source/syntax/resolve 的路径入口：
+如果 `input_path` 可直接读取为文件，就按单文件 root 编译；否则按 package 目录处理，
+读取 `input_path/package.ini`，再编译 manifest 指定的 root source。
 
 流程分为 module 级驱动和单文件名字解析两层：
 
 ```text
 build_module_graph(root_file)
-  -> parse_source has registered AstFile in QuerySystem.asts
+  -> root AstFile already lives in this compile_package AstStore
   -> ensure_module(root_file.source_id)
   -> collect root module imports
-  -> resolve import targets, parse/load target AstFile when needed
+  -> resolve import targets, parse/load target AstFile into the same AstStore when needed
   -> add ModuleGraph import edges
   -> recursively discover reachable module imports
 
 lower_module_graph_to_hir(graph)
   -> collect declarations for all graph modules
   -> NameResolver.resolve_references()
-  -> write AstId -> DefId facts into ResolveStore
-  -> lower resolved AST nodes into QuerySystem.hirs
+  -> lower resolved AST nodes directly into QuerySystem.hirs
 ```
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
@@ -192,11 +200,8 @@ lower_module_graph_to_hir(graph)
   输入源文件或虚拟文本；一个 package 可以拥有多个 module，一个 source 当前对应一个 module。
 - 如果已有 module 且 `source_revision` 未变化，直接复用原 `ModuleId`。
 - 如果 source revision 变化，保持 `ModuleId` 不变，调用 `reset_module` 清空该 module 的
-  imports、exports、private_defs，并创建新的 module namespace。旧 namespace 和旧 def
-  暂时留在全局表中，但不再通过当前 module 可达；后续如需长期增量会再引入 GC 或
-  版本化策略。
-- `AstId -> DefId` facts 带 `source_id + revision` 写入 `ResolveStore`。HIR lowering
-  只读取当前 revision 的 facts，避免旧 AST 映射污染新 HIR。
+  imports，并创建新的 module namespace。旧 namespace 和旧 def 暂时留在全局表中；
+  后续如需长期增量会再引入 GC 或版本化策略。
 
 `ModuleRecord.resolve_state` 记录 module 级 pass 进度：
 
@@ -221,10 +226,10 @@ NameResolver {
 
 - `collect_imports`：扫描 top-level import，向 `ModuleRecord.imports` 写入 `ImportRecord`。
 - `collect_declarations`：扫描 top-level declaration，创建 `DefId`，绑定到当前 module namespace，
-  并按 visibility 记录到 exports 或 private_defs。
-- `resolve_references`：遍历当前 file 的 declaration body，解析基础 type reference、
-  expression name、local binding 和 import alias path，并把结果写入 `ResolveStore`
-  的 source-revision scoped ast facts。
+  并按 visibility 记录到 namespace/export facts。
+- `resolve_references`：遍历当前 file 的 declaration body，校验基础 type reference、
+  expression name、local binding 和 import alias path；随后 HIR lowering 使用同一套
+  namespace/local lookup 直接写入 resolved HIR。
 
 `resolve_import_targets` 在 imports 收集后运行：
 
@@ -232,7 +237,7 @@ NameResolver {
   package 的 manifest root 文件；未命中 dependency 时，再按已登记 virtual/module 名称查
   `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`。如果目标 source 的 `AstFile` 已经登记到
-  `QuerySystem.asts`，会递归推进目标 module 的 import/declaration pass。
+  本轮 `AstStore`，会递归推进目标 module 的 import/declaration pass。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module namespace。
 - 对 string/file import，当前取字符串字面量的 symbol 文本，按当前源文件目录解析显式文件路径；
   未命中 `SourceStore` 时从磁盘读取并解析。

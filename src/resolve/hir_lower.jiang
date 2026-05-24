@@ -2,7 +2,7 @@
 //
 // 这个 lowering 属于 resolve 阶段。调用它之前，ModuleResolver 已经完成：
 // 1. 构建 module graph / import closure；
-// 2. 对所有可达 module 收集 declaration，创建 DefId 和 HirDef skeleton；
+// 2. 对所有可达 module 收集 declaration，创建 DefId 和 HirDefRecord skeleton；
 // 3. 对当前文件完成 reference resolve。
 //
 // 输入：
@@ -16,7 +16,8 @@
 // - HIR 已经 resolve，但还没有 type check；这里不读写 TypeId。
 // - value.member 只保存 base HirId + member symbol；具体 member DefId
 //   后续由 type check 根据 base type 选出来。
-// - AstId -> DefId 的引用解析事实来自 ResolveStore。
+// - 局部绑定由 lowering 维护词法环境并直接创建 DefId，不再经过
+//   AstId -> DefId 的临时桥接表。
 
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
@@ -26,6 +27,7 @@ import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
 import def = "./def.jiang";
 import resolve_state = "./state.jiang";
+import scope = "./scope.jiang";
 
 public Bool lower_file(resolve_state.FileResolveState& state) {
     HirLower! lower = HirLower(state);
@@ -36,10 +38,12 @@ public Bool lower_file(resolve_state.FileResolveState& state) {
 struct HirLower {
     resolve_state.FileResolveState& state;
     qid.DefId?! current_owner_def;
+    scope.LexicalEnv env;
 
     public init(resolve_state.FileResolveState& state) {
         self.state = state;
         self.current_owner_def = null;
+        self.env = scope.LexicalEnv();
     }
 
     public () lower() {
@@ -141,8 +145,10 @@ struct HirLower {
             // 这样可以在真实 root expression lower 之前创建 params/locals。
             hir.HirId placeholder = self.add_invalid_node(self.state.file.get(function_decl.name).span);
             self.state.query.hirs.set_body(function_def, hir.HirBody(function_def, placeholder));
+            self.env.enter_scope(.function_scope);
             self.lower_parameters(function_def, function_decl.params, signature.params);
             hir.HirId root = self.lower_expr(body_ast);
+            self.env.exit_scope();
             self.state.query.hirs.set_body_root(function_def, root);
         }
 
@@ -232,7 +238,7 @@ struct HirLower {
             ast.AstId param_id = self.state.file.child_at(params, index);
             ast.AstNode param_node = self.state.file.get(param_id);
             if (param_node.data is .param(param)) {
-                self.add_local_for_name(owner_def, param.name, .parameter, param_type_refs[index]);
+                self.add_local_for_name(owner_def, param.name, .parameter_def, .parameter, param_type_refs[index]);
             }
             index = index + 1;
         }
@@ -326,6 +332,7 @@ struct HirLower {
     }
 
     hir.HirId lower_block(ast.BlockData block, token.Span span) {
+        self.env.enter_scope(.block_scope);
         list.ArrayList<hir.HirId>! statements = list.ArrayList<hir.HirId>(block.statements.len);
         Int! index = 0;
         while (index < block.statements.len) {
@@ -337,10 +344,12 @@ struct HirLower {
         if (block.tail_expr is some tail_expr) {
             result = self.lower_expr(tail_expr);
         }
-        return self.add_node(.block(hir.HirBlock {
+        hir.HirId block_id = self.add_node(.block(hir.HirBlock {
             statements: self.freeze_hir_ids(statements),
             result: result
         }), span);
+        self.env.exit_scope();
+        return block_id;
     }
 
     hir.HirId lower_let_stmt(ast.LetData let_stmt) {
@@ -350,11 +359,17 @@ struct HirLower {
         if (let_stmt.type_ref is some type_ast) {
             type_ref = self.lower_type_ref(type_ast);
         }
-        hir.HirLocalId local_id = self.add_local_for_name(owner_def, let_stmt.name, .local_variable, type_ref);
         hir.HirId?! initializer = null;
         if (let_stmt.initializer is some initializer_ast) {
             initializer = self.lower_expr(initializer_ast);
         }
+        hir.HirLocalId local_id = self.add_local_for_name(
+            owner_def,
+            let_stmt.name,
+            .local_def,
+            .local_variable,
+            type_ref
+        );
         return self.add_node(.let_stmt(hir.HirLet {local_id: local_id, initializer: initializer}), span);
     }
 
@@ -416,7 +431,7 @@ struct HirLower {
         // resolve 没有把整个 path 绑定到 namespace/type target，就按链式
         // value member access lower。每一段 member 是否存在，由 type check
         // 根据 base type 验证。
-        if (path.segments.len > 1 && self.resolved_def_for_ast(path_id) == null) {
+        if (path.segments.len > 1 && self.resolved_value_def_for_expr(path_id) == null) {
             return self.lower_member_path(path);
         }
         return self.lower_name_ref(path_id);
@@ -459,19 +474,22 @@ struct HirLower {
         if (loop_expr.condition is some condition_ast) {
             condition = self.lower_expr(condition_ast);
         }
-        hir.HirId?! pattern = null;
-        if (loop_expr.pattern is some pattern_ast) {
-            pattern = self.lower_pattern(pattern_ast);
-        }
         hir.HirId?! iterable = null;
         if (loop_expr.iterable is some iterable_ast) {
             iterable = self.lower_expr(iterable_ast);
         }
+        self.env.enter_scope(.loop_scope);
+        hir.HirId?! pattern = null;
+        if (loop_expr.pattern is some pattern_ast) {
+            pattern = self.lower_pattern(pattern_ast);
+        }
+        hir.HirId body = self.lower_expr(loop_expr.body);
+        self.env.exit_scope();
         return self.add_node(.loop_expr(hir.HirLoop {
             condition: condition,
             pattern: pattern,
             iterable: iterable,
-            body: self.lower_expr(loop_expr.body)
+            body: body
         }), span);
     }
 
@@ -496,10 +514,11 @@ struct HirLower {
                 body: self.add_invalid_node(case_node.span)
             };
         }
-        return hir.HirSwitchCase {
-            patterns: self.lower_switch_patterns(case_data.patterns),
-            body: self.lower_expr(case_data.body)
-        };
+        self.env.enter_scope(.block_scope);
+        hir.HirId[] patterns = self.lower_switch_patterns(case_data.patterns);
+        hir.HirId body = self.lower_expr(case_data.body);
+        self.env.exit_scope();
+        return hir.HirSwitchCase {patterns: patterns, body: body};
     }
 
     hir.HirId[] lower_switch_patterns(ast.AstRange patterns) {
@@ -567,15 +586,11 @@ struct HirLower {
         if (pattern.type_ref is some type_ast) {
             type_ref = self.lower_type_ref(type_ast);
         }
-        guard self.resolved_def_for_pattern_name(name) is some def_id else {
-            return self.add_invalid_node(span);
-        }
-        def.DefRecord def_record = self.state.query.defs.get(def_id);
-        hir.HirLocalId local_id = self.state.query.hirs.add_local(
+        hir.HirLocalId local_id = self.add_local_for_name(
             owner_def,
+            name,
+            .local_def,
             .pattern_binding,
-            def_record.name.symbol,
-            def_id,
             type_ref
         );
         return self.add_node(.binding_pattern(hir.HirBindingPattern {local_id: local_id}), span);
@@ -651,7 +666,7 @@ struct HirLower {
             }), node.span);
         }
         if (node.data is .path(_) || node.data is .name(_)) {
-            guard self.resolved_def_for_expr(type_id) is some def_id else {
+            guard self.resolved_type_def_for_expr(type_id) is some def_id else {
                 return self.add_node(.invalid_type_ref(), node.span);
             }
             return self.add_node(.named_type_ref(hir.HirNamedTypeRef {
@@ -664,7 +679,7 @@ struct HirLower {
 
     hir.HirId lower_named_type_ref(ast.NamedTypeData named_type) {
         token.Span span = self.state.file.get(named_type.path).span;
-        guard self.resolved_def_for_expr(named_type.path) is some def_id else {
+        guard self.resolved_type_def_for_expr(named_type.path) is some def_id else {
             return self.add_node(.invalid_type_ref(), span);
         }
         return self.add_node(.named_type_ref(hir.HirNamedTypeRef {
@@ -684,7 +699,7 @@ struct HirLower {
     }
 
     hir.HirId lower_name_ref(ast.AstId expr_id) {
-        guard self.resolved_def_for_expr(expr_id) is some def_id else {
+        guard self.resolved_value_def_for_expr(expr_id) is some def_id else {
             return self.add_invalid_node(self.state.file.get(expr_id).span);
         }
         hir.HirNameRef! name_ref = .def_ref(def_id);
@@ -699,16 +714,30 @@ struct HirLower {
     hir.HirLocalId add_local_for_name(
         qid.DefId owner_def,
         ast.AstId name_id,
+        def.DefKind def_kind,
         hir.HirLocalKind kind,
         hir.HirId? type_ref
     ) {
-        guard self.resolved_def_for_ast(name_id) is some def_id else { return hir.HirLocalId.from_index(0); }
-        def.DefRecord def_record = self.state.query.defs.get(def_id);
-        return self.state.query.hirs.add_local(owner_def, kind, def_record.name.symbol, def_id, type_ref);
+        guard self.state.name_symbol(name_id) is some symbol else { return hir.HirLocalId.from_index(0); }
+        token.Span span = self.state.file.get(name_id).span;
+        qid.DefId def_id = self.state.query.defs.create(
+            def_kind,
+            .value_name,
+            .private_visibility,
+            def.Name {symbol: symbol, span: span},
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        if (!self.env.empty()) {
+            self.env.define(symbol, .value_name, def_id, span);
+        }
+        return self.state.query.hirs.add_local(owner_def, kind, symbol, def_id, type_ref);
     }
 
     hir.HirCallTarget? call_target(ast.AstId callee_id) {
-        guard self.resolved_def_for_expr(callee_id) is some def_id else { return null; }
+        guard self.resolved_value_def_for_expr(callee_id) is some def_id else { return null; }
         if (self.state.query.defs.get(def_id).kind != .function_def) {
             return null;
         }
@@ -716,38 +745,144 @@ struct HirLower {
     }
 
     qid.DefId? resolved_def_for_expr(ast.AstId expr_id) {
-        if (self.resolved_def_for_ast(expr_id) is some def_id) {
-            return def_id;
-        }
+        if (self.resolved_value_def_for_expr(expr_id) is some def_id) { return def_id; }
+        if (self.resolved_type_def_for_expr(expr_id) is some def_id) { return def_id; }
+        return self.resolved_path_def(expr_id, .member_name);
+    }
+
+    qid.DefId? resolved_value_def_for_expr(ast.AstId expr_id) {
+        return self.resolved_path_def(expr_id, .value_name);
+    }
+
+    qid.DefId? resolved_type_def_for_expr(ast.AstId expr_id) {
+        return self.resolved_path_def(expr_id, .type_name);
+    }
+
+    qid.DefId? resolved_path_def(ast.AstId expr_id, def.NameDomain domain) {
         ast.AstNode expr = self.state.file.get(expr_id);
         if (expr.data is .name_expr(name_expr)) {
-            return self.resolved_def_for_expr(name_expr.value);
+            return self.resolved_path_def(name_expr.value, domain);
+        }
+        if (expr.data is .name(_)) {
+            return self.resolved_name_def(expr_id, domain);
         }
         if (expr.data is .path(path)) {
             if (path.segments.len == 1) {
-                return self.resolved_def_for_ast(self.state.file.child_at(path.segments, 0));
+                return self.resolved_name_def(self.state.file.child_at(path.segments, 0), domain);
+            }
+            if (path.segments.len >= 2) {
+                return self.resolved_qualified_path_def(path, domain);
             }
         }
         return null;
     }
 
-    qid.DefId? resolved_def_for_pattern_name(ast.AstId name_id) {
-        if (self.resolved_def_for_ast(name_id) is some def_id) {
-            return def_id;
+    qid.DefId? resolved_name_def(ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        if (domain == .value_name) {
+            if (self.env.lookup_def(symbol, .value_name) is some local_def) {
+                return local_def;
+            }
         }
-        ast.AstNode node = self.state.file.get(name_id);
-        if (node.data is .path(path)) {
-            if (path.segments.len == 1) {
-                return self.resolved_def_for_ast(self.state.file.child_at(path.segments, 0));
+        if (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
+            is some binding
+        ) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_qualified_path_def(ast.PathData path, def.NameDomain domain) {
+        ast.AstId first_id = self.state.file.child_at(path.segments, 0);
+        if (self.qualified_root_namespace(first_id) is some namespace_id) {
+            return self.resolved_qualified_segments(path, 1, namespace_id, domain);
+        }
+        return null;
+    }
+
+    qid.NamespaceId? qualified_root_namespace(ast.AstId first_id) {
+        guard self.state.name_symbol(first_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, .namespace_name, true)
+            is some namespace_binding
+        ) {
+            return self.state.query.defs.get(namespace_binding.def_id).owned_namespace_id;
+        }
+        if (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, .type_name, true)
+            is some type_binding
+        ) {
+            return self.state.query.defs.get(type_binding.def_id).owned_namespace_id;
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_qualified_segments(
+        ast.PathData path,
+        Int start_index,
+        qid.NamespaceId namespace_id,
+        def.NameDomain domain
+    ) {
+        qid.NamespaceId! current_namespace = namespace_id;
+        Int! index = start_index;
+        while (index < path.segments.len) {
+            ast.AstId segment_id = self.state.file.child_at(path.segments, index);
+            Bool is_last = index + 1 == path.segments.len;
+            if (is_last) {
+                return self.resolved_last_qualified_segment(segment_id, current_namespace, domain);
+            }
+            if (self.next_qualified_namespace(segment_id, current_namespace) is some next_namespace) {
+                current_namespace = next_namespace;
+            } else {
+                return null;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.NamespaceId? next_qualified_namespace(ast.AstId segment_id, qid.NamespaceId namespace_id) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_namespace(namespace_id, symbol, .namespace_name, false)
+            is some namespace_binding
+        ) {
+            return self.state.query.defs.get(namespace_binding.def_id).owned_namespace_id;
+        }
+        if (
+            self.state.query.resolve.lookup_namespace(namespace_id, symbol, .type_name, false)
+            is some type_binding
+        ) {
+            return self.state.query.defs.get(type_binding.def_id).owned_namespace_id;
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_last_qualified_segment(
+        ast.AstId segment_id,
+        qid.NamespaceId namespace_id,
+        def.NameDomain domain
+    ) {
+        guard self.state.name_symbol(segment_id) is some symbol else { return null; }
+        if (
+            self.state.query.resolve.lookup_namespace(namespace_id, symbol, domain, false)
+            is some binding
+        ) {
+            return binding.def_id;
+        }
+        if (domain == .value_name) {
+            if (
+                self.state.query.resolve.lookup_namespace(namespace_id, symbol, .member_name, false)
+                is some member_binding
+            ) {
+                return member_binding.def_id;
             }
         }
         return null;
     }
 
     qid.DefId? decl_def_for_name(ast.AstId name_id, def.NameDomain domain) {
-        if (self.resolved_def_for_ast(name_id) is some def_id) {
-            return def_id;
-        }
         guard self.state.name_symbol(name_id) is some symbol else { return null; }
 
         qid.NamespaceId! namespace_id = self.state.namespace_id;
@@ -760,10 +895,6 @@ struct HirLower {
             return binding.def_id;
         }
         return null;
-    }
-
-    qid.DefId? resolved_def_for_ast(ast.AstId ast_id) {
-        return self.state.ast_resolution(ast_id);
     }
 
     hir.HirId add_node(hir.HirNodeData data, token.Span span) {

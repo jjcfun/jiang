@@ -3,31 +3,36 @@
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
 import qid = "../query/id.jiang";
+import module_graph = "../resolve/module_graph.jiang";
+import store = "../resolve/store.jiang";
 import list = "../support/list.jiang";
 import token = "../syntax/token.jiang";
 import types = "./type.jiang";
 import sema_result = "./result.jiang";
 
-public Bool check_hir_package(context.CompilerContext& ctx) {
+public Bool check_hir_package(context.CompilerContext& ctx, module_graph.ModuleGraph& graph) {
     // 新 pipeline 的唯一 type check 入口。type check 只消费 HIR，
-    // HIR node/member/pattern 结果写入 TypeCheckResults；DefId -> TypeId
-    // 统一写入 TypeTable，避免两张定义类型表互相漂移。
+    // HIR node/member/pattern 和普通 DefId -> TypeId 结果都写入
+    // TypeCheckResults。TypeTable 只保留 canonical type arena 和 builtin 映射。
     ctx.query.typeck.reset();
-    HirTypeChecker! checker = HirTypeChecker(ctx, ctx.query.hirs$.ref(), ctx.query.typeck$.ref());
+    HirTypeChecker! checker = HirTypeChecker(ctx, graph, ctx.query.hirs$.ref(), ctx.query.typeck$.ref());
     return checker.check();
 }
 
 struct HirTypeChecker {
     context.CompilerContext& ctx;
+    module_graph.ModuleGraph& graph;
     hir.HirStore& hirs;
     sema_result.TypeCheckResults& results;
 
     public init(
         context.CompilerContext& ctx,
+        module_graph.ModuleGraph& graph,
         hir.HirStore& hirs,
         sema_result.TypeCheckResults& results
     ) {
         self.ctx = ctx;
+        self.graph = graph;
         self.hirs = hirs;
         self.results = results;
     }
@@ -42,17 +47,28 @@ struct HirTypeChecker {
     }
 
     () check_declaration_signatures() {
-        Int! index = 0;
-        while (index < self.hirs.def_len()) {
-            qid.DefId def_id = self.hirs.def_at(index);
-            hir.HirDef hir_def = self.hirs.def(def_id)$.some();
-            if (hir_def.decl.function_signature is some signature) {
-                self.bind_def_type(def_id, self.check_function_signature(signature));
-            } else {
-                if (hir_def.decl.type_ref is some type_ref) {
-                    self.bind_def_type(def_id, self.check_type_ref(type_ref));
-                }
+        Int! module_index = 0;
+        while (module_index < self.graph.modules.len()) {
+            store.ModuleRecord module = self.ctx.query.resolve.modules.get(self.graph.modules.get(module_index));
+            self.check_declaration_signature_tree(module.def_id);
+            module_index = module_index + 1;
+        }
+    }
+
+    () check_declaration_signature_tree(qid.DefId def_id) {
+        guard self.hirs.def(def_id) is some hir_def else {
+            return;
+        }
+        if (hir_def.decl.function_signature is some signature) {
+            self.bind_def_type(def_id, self.check_function_signature(signature));
+        } else {
+            if (hir_def.decl.type_ref is some type_ref) {
+                self.bind_def_type(def_id, self.check_type_ref(type_ref));
             }
+        }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            self.check_declaration_signature_tree(hir_def.members.get(index));
             index = index + 1;
         }
     }
@@ -97,7 +113,10 @@ struct HirTypeChecker {
     }
 
     qid.TypeId type_for_named_ref(hir.HirNamedTypeRef named) {
-        if (self.ctx.query.types.type_for_def(named.def_id) is some type_id) {
+        if (self.results.def_type(named.def_id) is some type_id) {
+            return type_id;
+        }
+        if (self.ctx.query.types.builtin_type_for_def(named.def_id) is some type_id) {
             return type_id;
         }
         return self.ctx.query.types.named_type(named.def_id, token.Span());
@@ -129,13 +148,24 @@ struct HirTypeChecker {
     }
 
     () check_bodies() {
+        Int! module_index = 0;
+        while (module_index < self.graph.modules.len()) {
+            store.ModuleRecord module = self.ctx.query.resolve.modules.get(self.graph.modules.get(module_index));
+            self.check_body_tree(module.def_id);
+            module_index = module_index + 1;
+        }
+    }
+
+    () check_body_tree(qid.DefId def_id) {
+        guard self.hirs.def(def_id) is some hir_def else {
+            return;
+        }
+        if (hir_def.body is some body) {
+            self.check_node(body.root);
+        }
         Int! index = 0;
-        while (index < self.hirs.def_len()) {
-            qid.DefId def_id = self.hirs.def_at(index);
-            hir.HirDef hir_def = self.hirs.def(def_id)$.some();
-            if (hir_def.body is some body) {
-                self.check_node(body.root);
-            }
+        while (index < hir_def.members.len()) {
+            self.check_body_tree(hir_def.members.get(index));
             index = index + 1;
         }
     }
@@ -166,6 +196,30 @@ struct HirTypeChecker {
         }
         if (node.data is .return_stmt(return_stmt)) {
             type_id = self.check_return(return_stmt);
+        }
+        if (node.data is .guard_stmt(guard_stmt)) {
+            type_id = self.check_guard(guard_stmt);
+        }
+        if (node.data is .assign_stmt(assign_stmt)) {
+            type_id = self.check_assign(assign_stmt);
+        }
+        if (node.data is .member_access(member_access)) {
+            type_id = self.check_member_access(node_id, member_access);
+        }
+        if (node.data is .if_expr(if_expr)) {
+            type_id = self.check_if(if_expr);
+        }
+        if (node.data is .loop_expr(loop_expr)) {
+            type_id = self.check_loop(loop_expr);
+        }
+        if (node.data is .switch_expr(switch_expr)) {
+            type_id = self.check_switch(switch_expr);
+        }
+        if (node.data is .is_pattern(is_pattern)) {
+            type_id = self.check_is_pattern(is_pattern);
+        }
+        if (self.is_pattern_node(node)) {
+            type_id = self.check_pattern(node_id, self.ctx.query.types.invalid_type());
         }
         if (node.data is .invalid) {
             type_id = self.ctx.query.types.invalid_type();
@@ -212,6 +266,173 @@ struct HirTypeChecker {
         return self.ctx.query.types.invalid_type();
     }
 
+    qid.TypeId check_guard(hir.HirGuard guard_stmt) {
+        self.expect_bool(self.check_node(guard_stmt.condition));
+        self.check_node(guard_stmt.else_body);
+        return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId check_assign(hir.HirAssign assign_stmt) {
+        qid.TypeId target_type = self.check_node(assign_stmt.target);
+        qid.TypeId value_type = self.check_node(assign_stmt.value);
+        if (!self.is_assignable(target_type, value_type)) {
+            self.results.mark_error();
+        }
+        return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId check_member_access(hir.HirId node_id, hir.HirMemberAccess member_access) {
+        // value.member 的 resolve 阶段只知道 member 名字；真正的 owner
+        // 需要 base 类型参与，所以这里根据 base 的 named type namespace
+        // 选出 field/variant/case，并把选择结果写入 TypeCheckResults。
+        qid.TypeId base_type = self.check_node(member_access.base);
+        guard self.member_namespace_for_type(base_type) is some namespace_id else {
+            self.results.mark_error();
+            return self.ctx.query.types.invalid_type();
+        }
+        guard self.ctx.query.resolve.namespaces.first_binding(
+            namespace_id,
+            member_access.member_symbol,
+            .member_name
+        ) is some binding else {
+            self.results.mark_error();
+            return self.ctx.query.types.invalid_type();
+        }
+        self.results.select_member(node_id, binding.def_id);
+        return self.type_for_def(binding.def_id);
+    }
+
+    qid.TypeId check_if(hir.HirIf if_expr) {
+        self.expect_bool(self.check_node(if_expr.condition));
+        qid.TypeId then_type = self.check_node(if_expr.then_body);
+        if (if_expr.else_body is some else_body) {
+            qid.TypeId else_type = self.check_node(else_body);
+            if (self.is_assignable(then_type, else_type)) {
+                return then_type;
+            }
+            self.results.mark_error();
+            return self.ctx.query.types.invalid_type();
+        }
+        return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId check_loop(hir.HirLoop loop_expr) {
+        if (loop_expr.condition is some condition) {
+            self.expect_bool(self.check_node(condition));
+        }
+        qid.TypeId! iterable_type = self.ctx.query.types.invalid_type();
+        if (loop_expr.iterable is some iterable) {
+            iterable_type = self.check_node(iterable);
+        }
+        if (loop_expr.pattern is some pattern) {
+            self.check_pattern(pattern, iterable_type);
+        }
+        self.check_node(loop_expr.body);
+        return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId check_switch(hir.HirSwitch switch_expr) {
+        qid.TypeId value_type = self.check_node(switch_expr.value);
+        qid.TypeId! result_type = self.ctx.query.types.invalid_type();
+        Bool! have_result = false;
+        Int! case_index = 0;
+        while (case_index < switch_expr.cases.length) {
+            hir.HirSwitchCase switch_case = switch_expr.cases[case_index];
+            Int! pattern_index = 0;
+            while (pattern_index < switch_case.patterns.length) {
+                self.check_pattern(switch_case.patterns[pattern_index], value_type);
+                pattern_index = pattern_index + 1;
+            }
+            qid.TypeId body_type = self.check_node(switch_case.body);
+            if (!have_result) {
+                result_type = body_type;
+                have_result = true;
+            } else {
+                if (!self.is_assignable(result_type, body_type)) {
+                    self.results.mark_error();
+                    result_type = self.ctx.query.types.invalid_type();
+                }
+            }
+            case_index = case_index + 1;
+        }
+        if (have_result) {
+            return result_type;
+        }
+        return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId check_is_pattern(hir.HirIsPattern is_pattern) {
+        qid.TypeId value_type = self.check_node(is_pattern.value);
+        self.check_pattern(is_pattern.pattern, value_type);
+        return self.ctx.query.types.bool_type();
+    }
+
+    qid.TypeId check_pattern(hir.HirId pattern_id, qid.TypeId expected_type) {
+        hir.HirNode pattern = self.hirs.node(pattern_id);
+        qid.TypeId! pattern_type = expected_type;
+        if (pattern.data is .binding_pattern(binding)) {
+            pattern_type = self.bind_pattern_local(pattern_id.owner_def, binding, expected_type);
+        }
+        if (pattern.data is .literal_pattern(literal_pattern)) {
+            pattern_type = self.check_literal(literal_pattern.literal);
+            if (!self.is_invalid_type(expected_type) && !self.is_assignable(expected_type, pattern_type)) {
+                self.results.mark_error();
+            }
+        }
+        if (pattern.data is .optional_pattern(optional_pattern)) {
+            pattern_type = self.check_optional_pattern(optional_pattern, expected_type);
+        }
+        if (pattern.data is .variant_pattern(variant_pattern)) {
+            pattern_type = self.check_variant_pattern(pattern_id, variant_pattern, expected_type);
+        }
+        if (pattern.data is .wildcard_pattern) {
+            pattern_type = expected_type;
+        }
+        self.results.set_node_type(pattern_id, pattern_type);
+        return pattern_type;
+    }
+
+    qid.TypeId bind_pattern_local(qid.DefId owner_def, hir.HirBindingPattern binding, qid.TypeId expected_type) {
+        hir.HirDefRecord owner = self.hirs.def(owner_def)$.some();
+        guard owner.body is some body else { return self.ctx.query.types.invalid_type(); }
+        hir.HirLocal local = body.local(binding.local_id);
+        qid.TypeId! local_type = expected_type;
+        if (local.type_ref is some type_ref) {
+            local_type = self.check_type_ref(type_ref);
+        }
+        self.bind_def_type(local.def_id, local_type);
+        return local_type;
+    }
+
+    qid.TypeId check_optional_pattern(hir.HirOptionalPattern optional_pattern, qid.TypeId expected_type) {
+        types.TypeInfo expected_info = self.ctx.query.types.get(expected_type);
+        guard expected_info.data is .optional(optional) else {
+            if (!self.is_invalid_type(expected_type)) {
+                self.results.mark_error();
+            }
+            self.check_pattern(optional_pattern.nested, self.ctx.query.types.invalid_type());
+            return self.ctx.query.types.invalid_type();
+        }
+        self.check_pattern(optional_pattern.nested, optional.element);
+        return expected_type;
+    }
+
+    qid.TypeId check_variant_pattern(
+        hir.HirId pattern_id,
+        hir.HirVariantPattern variant_pattern,
+        qid.TypeId expected_type
+    ) {
+        if (variant_pattern.variant_def is some variant_def) {
+            self.results.select_pattern(pattern_id, variant_def);
+        }
+        Int! index = 0;
+        while (index < variant_pattern.payload.length) {
+            self.check_pattern(variant_pattern.payload[index], self.ctx.query.types.invalid_type());
+            index = index + 1;
+        }
+        return expected_type;
+    }
+
     qid.TypeId check_name_ref(hir.HirId node_id, hir.HirNameRef name_ref) {
         // HIR 中的名字已经由 resolve 阶段变成 DefId 或 def-local HirLocalId。
         // type check 在这里不重新查名字，只读取对应定义/局部绑定的类型。
@@ -232,7 +453,7 @@ struct HirTypeChecker {
             value_type = self.check_node(initializer);
         }
 
-        hir.HirDef owner = self.hirs.def(node_id.owner_def)$.some();
+        hir.HirDefRecord owner = self.hirs.def(node_id.owner_def)$.some();
         guard owner.body is some body else { return self.ctx.query.types.invalid_type(); }
         hir.HirLocal local = body.local(let_stmt.local_id);
         qid.TypeId! local_type = value_type;
@@ -291,10 +512,10 @@ struct HirTypeChecker {
     }
 
     qid.TypeId type_for_local(qid.DefId owner_def, hir.HirLocalId local_id) {
-        hir.HirDef owner = self.hirs.def(owner_def)$.some();
+        hir.HirDefRecord owner = self.hirs.def(owner_def)$.some();
         guard owner.body is some body else { return self.ctx.query.types.invalid_type(); }
         hir.HirLocal local = body.local(local_id);
-        if (self.ctx.query.types.type_for_def(local.def_id) is some type_id) {
+        if (self.results.def_type(local.def_id) is some type_id) {
             return type_id;
         }
         if (local.type_ref is some type_ref) {
@@ -306,13 +527,115 @@ struct HirTypeChecker {
     }
 
     qid.TypeId type_for_def(qid.DefId def_id) {
-        if (self.ctx.query.types.type_for_def(def_id) is some type_id) {
+        if (self.results.def_type(def_id) is some type_id) {
+            return type_id;
+        }
+        if (self.ctx.query.types.builtin_type_for_def(def_id) is some type_id) {
             return type_id;
         }
         return self.ctx.query.types.invalid_type();
     }
 
+    Bool is_pattern_node(hir.HirNode node) {
+        if (node.data is .binding_pattern(_)) { return true; }
+        if (node.data is .literal_pattern(_)) { return true; }
+        if (node.data is .optional_pattern(_)) { return true; }
+        if (node.data is .variant_pattern(_)) { return true; }
+        if (node.data is .wildcard_pattern) { return true; }
+        return false;
+    }
+
+    qid.NamespaceId? member_namespace_for_type(qid.TypeId type_id) {
+        types.TypeInfo type_info = self.ctx.query.types.get(type_id);
+        guard type_info.data is .named(named) else { return null; }
+        return self.ctx.query.defs.get(named.def_id).owned_namespace_id;
+    }
+
+    () expect_bool(qid.TypeId type_id) {
+        if (!self.same_type(type_id, self.ctx.query.types.bool_type())) {
+            self.results.mark_error();
+        }
+    }
+
+    Bool is_assignable(qid.TypeId expected, qid.TypeId actual) {
+        if (self.is_invalid_type(expected) || self.is_invalid_type(actual)) {
+            return true;
+        }
+        if (self.is_never_type(actual)) {
+            return true;
+        }
+        return self.same_type_ignoring_mutability(expected, actual);
+    }
+
+    Bool same_type_ignoring_mutability(qid.TypeId lhs, qid.TypeId rhs) {
+        if (lhs.to_index() == rhs.to_index()) {
+            return true;
+        }
+        types.TypeInfo lhs_info = self.ctx.query.types.get(lhs);
+        types.TypeInfo rhs_info = self.ctx.query.types.get(rhs);
+        return self.same_type_data(lhs_info.data, rhs_info.data);
+    }
+
+    Bool same_type(qid.TypeId lhs, qid.TypeId rhs) {
+        if (lhs.to_index() == rhs.to_index()) {
+            return true;
+        }
+        types.TypeInfo lhs_info = self.ctx.query.types.get(lhs);
+        types.TypeInfo rhs_info = self.ctx.query.types.get(rhs);
+        if (lhs_info.is_mutable != rhs_info.is_mutable) {
+            return false;
+        }
+        return self.same_type_data(lhs_info.data, rhs_info.data);
+    }
+
+    Bool same_type_data(types.TypeData lhs, types.TypeData rhs) {
+        if (lhs is .invalid) { return rhs is .invalid; }
+        if (lhs is .never) { return rhs is .never; }
+        if (lhs is .unit) { return rhs is .unit; }
+        if (lhs is .bool_type) { return rhs is .bool_type; }
+        if (lhs is .char_type) { return rhs is .char_type; }
+        if (lhs is .int_type(lhs_int)) {
+            guard rhs is .int_type(rhs_int) else { return false; }
+            return lhs_int.bits == rhs_int.bits && lhs_int.signed == rhs_int.signed;
+        }
+        if (lhs is .float_type(lhs_float)) {
+            guard rhs is .float_type(rhs_float) else { return false; }
+            return lhs_float.bits == rhs_float.bits;
+        }
+        if (lhs is .named(lhs_named)) {
+            guard rhs is .named(rhs_named) else { return false; }
+            return lhs_named.def_id.to_index() == rhs_named.def_id.to_index();
+        }
+        if (lhs is .optional(lhs_optional)) {
+            guard rhs is .optional(rhs_optional) else { return false; }
+            return self.same_type(lhs_optional.element, rhs_optional.element);
+        }
+        if (lhs is .function_type(lhs_function)) {
+            guard rhs is .function_type(rhs_function) else { return false; }
+            if (lhs_function.params.length != rhs_function.params.length) {
+                return false;
+            }
+            Int! index = 0;
+            while (index < lhs_function.params.length) {
+                if (!self.same_type(lhs_function.params[index], rhs_function.params[index])) {
+                    return false;
+                }
+                index = index + 1;
+            }
+            return self.same_type(lhs_function.result, rhs_function.result);
+        }
+        return false;
+    }
+
+    Bool is_invalid_type(qid.TypeId type_id) {
+        return self.ctx.query.types.get(type_id).data is .invalid;
+    }
+
+    Bool is_never_type(qid.TypeId type_id) {
+        return self.ctx.query.types.get(type_id).data is .never;
+    }
+
     () bind_def_type(qid.DefId def_id, qid.TypeId type_id) {
-        self.ctx.query.types.bind_def_type(def_id, type_id);
+        self.results.set_def_type(def_id, type_id);
     }
 }

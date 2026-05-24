@@ -2,19 +2,25 @@
 
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
+import qid = "../query/id.jiang";
+import module_graph = "../resolve/module_graph.jiang";
+import store = "../resolve/store.jiang";
+import sema_result = "../sema/result.jiang";
 import token = "../syntax/token.jiang";
 import mir = "./mir.jiang";
 
 public mir.MirStore^ lower_package(
     context.CompilerContext& ctx,
-    hir.HirStore& hir_store
+    hir.HirStore& hir_store,
+    sema_result.TypeCheckResults& typeck,
+    module_graph.ModuleGraph& graph
 ) {
-    mir.MirStore^ output = new mir.MirStore(hir_store.ok);
-    if (hir_store.has_errors()) {
+    mir.MirStore^ output = new mir.MirStore(hir_store.ok && typeck.ok);
+    if (hir_store.has_errors() || typeck.has_errors()) {
         return output;
     }
 
-    MirLowerer! lowerer = MirLowerer(ctx, hir_store, output);
+    MirLowerer! lowerer = MirLowerer(ctx, hir_store, graph, output);
     lowerer.lower_package();
     return output;
 }
@@ -22,36 +28,56 @@ public mir.MirStore^ lower_package(
 struct MirLowerer {
     context.CompilerContext& ctx;
     hir.HirStore& hirs;
+    module_graph.ModuleGraph& graph;
     mir.MirStore^ output;
 
-    public init(context.CompilerContext& ctx, hir.HirStore& hirs, mir.MirStore^ output) {
+    public init(
+        context.CompilerContext& ctx,
+        hir.HirStore& hirs,
+        module_graph.ModuleGraph& graph,
+        mir.MirStore^ output
+    ) {
         self.ctx = ctx;
         self.hirs = hirs;
+        self.graph = graph;
         self.output = output;
     }
 
     public () lower_package() {
-        // MIR 调度以 HIR def_order 为稳定顺序。
-        // 函数调用只在 MIR 中记录 callee DefId，不要求 callee 先 lower。
-        Int! index = 0;
-        while (index < self.hirs.def_len()) {
-            hir.HirDef hir_def = self.hirs.def(self.hirs.def_at(index))$.some();
-            if (hir_def.decl.kind == .function_decl) {
-                if (hir_def.body != null) {
-                    self.lower_function(hir_def);
-                }
+        // MIR 调度从 module graph + HIR ownership tree 派生：graph 给出本次
+        // 编译的 root/import closure，module HirDefRecord.members 给出当前
+        // module 的顶层声明集合。HirStore 不维护 package 级全量 def 顺序表。
+        Int! module_index = 0;
+        while (module_index < self.graph.modules.len()) {
+            store.ModuleRecord module = self.ctx.query.resolve.modules.get(self.graph.modules.get(module_index));
+            self.lower_def_tree(module.def_id);
+            module_index = module_index + 1;
+        }
+    }
+
+    () lower_def_tree(qid.DefId def_id) {
+        guard self.hirs.def(def_id) is some hir_def else {
+            return;
+        }
+        if (hir_def.decl.kind == .function_decl) {
+            if (hir_def.body != null) {
+                self.lower_function(hir_def);
             }
+        }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            self.lower_def_tree(hir_def.members.get(index));
             index = index + 1;
         }
     }
 
-    () lower_function(hir.HirDef hir_def) {
+    () lower_function(hir.HirDefRecord hir_def) {
         // 当前只是 MIR 骨架：为每个 HIR function 建立 MirFunction/MirBody，
         // 具体 statement/rvalue/terminator lowering 后续再补。
         Int function_index = self.output.functions.len();
         // HIR 不再直接携带 span；诊断位置后续通过 SourceMap 查询。
-        token.Span span = token.Span();
-        mir.MirBody mir_body = self.empty_body(mir.MirBodyId.from_index(function_index), span);
+        token.Span span = self.def_span(hir_def.def_id);
+        mir.MirBody mir_body = self.empty_body(mir.MirBodyId.from_index(function_index), hir_def, span);
         self.output.add_function(mir.MirFunction {
             id: mir.MirFunctionId.from_index(function_index),
             def_id: hir_def.def_id,
@@ -61,7 +87,7 @@ struct MirLowerer {
         });
     }
 
-    mir.MirBody empty_body(mir.MirBodyId body_id, token.Span span) {
+    mir.MirBody empty_body(mir.MirBodyId body_id, hir.HirDefRecord hir_def, token.Span span) {
         mir.MirBlockId entry = mir.MirBlockId.from_index(0);
         mir.MirBlock block = mir.MirBlock {
             id: entry,
@@ -75,10 +101,41 @@ struct MirLowerer {
         return mir.MirBody {
             id: body_id,
             span: span,
-            locals: self.output.empty_locals(),
+            locals: self.return_only_locals(hir_def),
             blocks: self.output.single_block(block),
             entry: entry,
             return_local: mir.MirLocalId.from_index(0)
         };
+    }
+
+    mir.MirLocalDecl[] return_only_locals(hir.HirDefRecord hir_def) {
+        mir.MirLocalDecl![*] locals = self.output.alloc_local_array(1);
+        locals[0] = mir.MirLocalDecl {
+            id: mir.MirLocalId.from_index(0),
+            kind: .return_place,
+            type_id: self.return_type(hir_def),
+            span: self.def_span(hir_def.def_id),
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        };
+        return locals[0..1];
+    }
+
+    qid.TypeId return_type(hir.HirDefRecord hir_def) {
+        if (self.ctx.query.typeck.def_types.get(hir_def.def_id) is some function_type_id) {
+            if (self.ctx.query.types.get(function_type_id).data is .function_type(function_type)) {
+                return function_type.result;
+            }
+        }
+        return self.ctx.query.types.unit_type();
+    }
+
+    token.Span def_span(qid.DefId def_id) {
+        if (self.ctx.query.source_map.def_span(def_id) is some loc) {
+            return loc.span;
+        }
+        return token.Span();
     }
 }
