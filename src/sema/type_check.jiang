@@ -3,10 +3,12 @@
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
 import qid = "../query/id.jiang";
+import def = "../resolve/def.jiang";
 import module_graph = "../resolve/module_graph.jiang";
 import store = "../resolve/store.jiang";
 import list = "../support/list.jiang";
 import token = "../syntax/token.jiang";
+import diagnostics = "./diagnostics.jiang";
 import types = "./type.jiang";
 import sema_result = "./result.jiang";
 
@@ -64,6 +66,10 @@ struct HirTypeChecker {
         } else {
             if (hir_def.decl.type_ref is some type_ref) {
                 self.bind_def_type(def_id, self.check_type_ref(type_ref));
+            } else {
+                if (hir_def.decl.kind == .enum_case_decl || hir_def.decl.kind == .union_variant_decl) {
+                    self.bind_def_type(def_id, self.ctx.query.types.unit_type());
+                }
             }
         }
         Int! index = 0;
@@ -186,13 +192,13 @@ struct HirTypeChecker {
             type_id = self.check_let(node_id, let_stmt);
         }
         if (node.data is .call(call)) {
-            type_id = self.check_call(call);
+            type_id = self.check_call(node_id, call);
         }
         if (node.data is .unary(unary)) {
-            type_id = self.check_unary(unary);
+            type_id = self.check_unary(node_id, unary);
         }
         if (node.data is .binary(binary)) {
-            type_id = self.check_binary(binary);
+            type_id = self.check_binary(node_id, binary);
         }
         if (node.data is .return_stmt(return_stmt)) {
             type_id = self.check_return(return_stmt);
@@ -201,19 +207,19 @@ struct HirTypeChecker {
             type_id = self.check_guard(guard_stmt);
         }
         if (node.data is .assign_stmt(assign_stmt)) {
-            type_id = self.check_assign(assign_stmt);
+            type_id = self.check_assign(node_id, assign_stmt);
         }
         if (node.data is .member_access(member_access)) {
             type_id = self.check_member_access(node_id, member_access);
         }
         if (node.data is .if_expr(if_expr)) {
-            type_id = self.check_if(if_expr);
+            type_id = self.check_if(node_id, if_expr);
         }
         if (node.data is .loop_expr(loop_expr)) {
             type_id = self.check_loop(loop_expr);
         }
         if (node.data is .switch_expr(switch_expr)) {
-            type_id = self.check_switch(switch_expr);
+            type_id = self.check_switch(node_id, switch_expr);
         }
         if (node.data is .is_pattern(is_pattern)) {
             type_id = self.check_is_pattern(is_pattern);
@@ -267,16 +273,32 @@ struct HirTypeChecker {
     }
 
     qid.TypeId check_guard(hir.HirGuard guard_stmt) {
-        self.expect_bool(self.check_node(guard_stmt.condition));
+        self.expect_bool(guard_stmt.condition, self.check_node(guard_stmt.condition));
         self.check_node(guard_stmt.else_body);
         return self.ctx.query.types.unit_type();
     }
 
-    qid.TypeId check_assign(hir.HirAssign assign_stmt) {
+    qid.TypeId check_assign(hir.HirId node_id, hir.HirAssign assign_stmt) {
         qid.TypeId target_type = self.check_node(assign_stmt.target);
         qid.TypeId value_type = self.check_node(assign_stmt.value);
+        Bool target_valid = self.is_assignment_target(assign_stmt.target);
+        if (!target_valid) {
+            self.add_node_error(assign_stmt.target, "invalid assignment target", "invalid_assignment_target");
+        } else {
+            if (!self.is_invalid_type(target_type) && !self.ctx.query.types.get(target_type).is_mutable) {
+                self.add_node_error(
+                    assign_stmt.target,
+                    "assignment target is immutable",
+                    "immutable_assignment_target"
+                );
+            }
+        }
         if (!self.is_assignable(target_type, value_type)) {
-            self.results.mark_error();
+            self.add_node_error(
+                node_id,
+                "assigned value type does not match target type",
+                "assignment_type_mismatch"
+            );
         }
         return self.ctx.query.types.unit_type();
     }
@@ -287,7 +309,13 @@ struct HirTypeChecker {
         // 选出 field/variant/case，并把选择结果写入 TypeCheckResults。
         qid.TypeId base_type = self.check_node(member_access.base);
         guard self.member_namespace_for_type(base_type) is some namespace_id else {
-            self.results.mark_error();
+            if (!self.is_invalid_type(base_type)) {
+                self.add_node_error(
+                    member_access.base,
+                    "member access base has no members",
+                    "member_base_has_no_members"
+                );
+            }
             return self.ctx.query.types.invalid_type();
         }
         guard self.ctx.query.resolve.namespaces.first_binding(
@@ -295,22 +323,30 @@ struct HirTypeChecker {
             member_access.member_symbol,
             .member_name
         ) is some binding else {
-            self.results.mark_error();
+            self.add_node_error(
+                node_id,
+                "unresolved member for base type",
+                "unresolved_member_for_type"
+            );
             return self.ctx.query.types.invalid_type();
         }
         self.results.select_member(node_id, binding.def_id);
-        return self.type_for_def(binding.def_id);
+        qid.TypeId member_type = self.type_for_def(binding.def_id);
+        if (self.ctx.query.types.get(base_type).is_mutable && !self.is_invalid_type(member_type)) {
+            return self.ctx.query.types.mutable_type(member_type, token.Span());
+        }
+        return member_type;
     }
 
-    qid.TypeId check_if(hir.HirIf if_expr) {
-        self.expect_bool(self.check_node(if_expr.condition));
+    qid.TypeId check_if(hir.HirId node_id, hir.HirIf if_expr) {
+        self.expect_bool(if_expr.condition, self.check_node(if_expr.condition));
         qid.TypeId then_type = self.check_node(if_expr.then_body);
         if (if_expr.else_body is some else_body) {
             qid.TypeId else_type = self.check_node(else_body);
             if (self.is_assignable(then_type, else_type)) {
                 return then_type;
             }
-            self.results.mark_error();
+            self.add_node_error(node_id, "if branches have incompatible types", "if_branch_type_mismatch");
             return self.ctx.query.types.invalid_type();
         }
         return self.ctx.query.types.unit_type();
@@ -318,7 +354,7 @@ struct HirTypeChecker {
 
     qid.TypeId check_loop(hir.HirLoop loop_expr) {
         if (loop_expr.condition is some condition) {
-            self.expect_bool(self.check_node(condition));
+            self.expect_bool(condition, self.check_node(condition));
         }
         qid.TypeId! iterable_type = self.ctx.query.types.invalid_type();
         if (loop_expr.iterable is some iterable) {
@@ -331,7 +367,7 @@ struct HirTypeChecker {
         return self.ctx.query.types.unit_type();
     }
 
-    qid.TypeId check_switch(hir.HirSwitch switch_expr) {
+    qid.TypeId check_switch(hir.HirId node_id, hir.HirSwitch switch_expr) {
         qid.TypeId value_type = self.check_node(switch_expr.value);
         qid.TypeId! result_type = self.ctx.query.types.invalid_type();
         Bool! have_result = false;
@@ -349,7 +385,11 @@ struct HirTypeChecker {
                 have_result = true;
             } else {
                 if (!self.is_assignable(result_type, body_type)) {
-                    self.results.mark_error();
+                    self.add_node_error(
+                        node_id,
+                        "switch case bodies have incompatible types",
+                        "switch_case_type_mismatch"
+                    );
                     result_type = self.ctx.query.types.invalid_type();
                 }
             }
@@ -376,11 +416,15 @@ struct HirTypeChecker {
         if (pattern.data is .literal_pattern(literal_pattern)) {
             pattern_type = self.check_literal(literal_pattern.literal);
             if (!self.is_invalid_type(expected_type) && !self.is_assignable(expected_type, pattern_type)) {
-                self.results.mark_error();
+                self.add_node_error(
+                    pattern_id,
+                    "literal pattern type does not match value type",
+                    "pattern_type_mismatch"
+                );
             }
         }
         if (pattern.data is .optional_pattern(optional_pattern)) {
-            pattern_type = self.check_optional_pattern(optional_pattern, expected_type);
+            pattern_type = self.check_optional_pattern(pattern_id, optional_pattern, expected_type);
         }
         if (pattern.data is .variant_pattern(variant_pattern)) {
             pattern_type = self.check_variant_pattern(pattern_id, variant_pattern, expected_type);
@@ -404,11 +448,19 @@ struct HirTypeChecker {
         return local_type;
     }
 
-    qid.TypeId check_optional_pattern(hir.HirOptionalPattern optional_pattern, qid.TypeId expected_type) {
+    qid.TypeId check_optional_pattern(
+        hir.HirId pattern_id,
+        hir.HirOptionalPattern optional_pattern,
+        qid.TypeId expected_type
+    ) {
         types.TypeInfo expected_info = self.ctx.query.types.get(expected_type);
         guard expected_info.data is .optional(optional) else {
             if (!self.is_invalid_type(expected_type)) {
-                self.results.mark_error();
+                self.add_node_error(
+                    pattern_id,
+                    "optional pattern requires optional value type",
+                    "optional_pattern_type_mismatch"
+                );
             }
             self.check_pattern(optional_pattern.nested, self.ctx.query.types.invalid_type());
             return self.ctx.query.types.invalid_type();
@@ -424,6 +476,24 @@ struct HirTypeChecker {
     ) {
         if (variant_pattern.variant_def is some variant_def) {
             self.results.select_pattern(pattern_id, variant_def);
+            self.check_variant_pattern_owner(pattern_id, variant_def, expected_type);
+            qid.TypeId! payload_type = self.variant_payload_type(variant_def);
+            Int! expected_payload_count = 0;
+            if (!self.is_unit_type(payload_type)) {
+                expected_payload_count = 1;
+            }
+            if (variant_pattern.payload.length != expected_payload_count) {
+                self.add_node_error(
+                    pattern_id,
+                    "variant pattern payload count mismatch",
+                    "variant_payload_count_mismatch"
+                );
+                payload_type = self.ctx.query.types.invalid_type();
+            }
+            if (variant_pattern.payload.length == 1 && expected_payload_count == 1) {
+                self.check_pattern(variant_pattern.payload[0], payload_type);
+                return expected_type;
+            }
         }
         Int! index = 0;
         while (index < variant_pattern.payload.length) {
@@ -431,6 +501,40 @@ struct HirTypeChecker {
             index = index + 1;
         }
         return expected_type;
+    }
+
+    () check_variant_pattern_owner(hir.HirId pattern_id, qid.DefId variant_def, qid.TypeId expected_type) {
+        if (self.is_invalid_type(expected_type)) {
+            return;
+        }
+        types.TypeInfo expected_info = self.ctx.query.types.get(expected_type);
+        guard expected_info.data is .named(named) else {
+            self.add_node_error(
+                pattern_id,
+                "variant pattern requires enum or union value",
+                "variant_pattern_type_mismatch"
+            );
+            return;
+        }
+        qid.DefId? owner = self.ctx.query.defs.get(variant_def).owner_def;
+        guard owner is some owner_def else {
+            self.add_node_error(pattern_id, "variant pattern has no owner type", "variant_pattern_missing_owner");
+            return;
+        }
+        if (owner_def.to_index() != named.def_id.to_index()) {
+            self.add_node_error(
+                pattern_id,
+                "variant pattern does not belong to matched type",
+                "variant_owner_mismatch"
+            );
+        }
+    }
+
+    qid.TypeId variant_payload_type(qid.DefId variant_def) {
+        if (self.results.def_type(variant_def) is some type_id) {
+            return type_id;
+        }
+        return self.ctx.query.types.unit_type();
     }
 
     qid.TypeId check_name_ref(hir.HirId node_id, hir.HirNameRef name_ref) {
@@ -464,12 +568,15 @@ struct HirTypeChecker {
         return self.ctx.query.types.unit_type();
     }
 
-    qid.TypeId check_call(hir.HirCall call) {
+    qid.TypeId check_call(hir.HirId node_id, hir.HirCall call) {
         // call 先要求 callee 已经能得到 function type；参数逐个检查后，
         // 再用函数签名决定 call 表达式的结果类型。
         qid.TypeId callee_type = self.check_node(call.callee);
         types.TypeInfo callee_info = self.ctx.query.types.get(callee_type);
         guard callee_info.data is .function_type(function_type) else {
+            if (!self.is_invalid_type(callee_type)) {
+                self.add_node_error(call.callee, "callee is not a function", "callee_not_function");
+            }
             return self.ctx.query.types.invalid_type();
         }
         Int! index = 0;
@@ -478,35 +585,80 @@ struct HirTypeChecker {
             index = index + 1;
         }
         if (call.args.length != function_type.params.length) {
+            self.add_node_error(
+                node_id,
+                "call argument count does not match function signature",
+                "call_arity_mismatch"
+            );
             return self.ctx.query.types.invalid_type();
+        }
+        index = 0;
+        while (index < call.args.length) {
+            qid.TypeId arg_type = self.results.node_type(call.args[index])$.some();
+            if (!self.is_assignable(function_type.params[index], arg_type)) {
+                self.add_node_error(
+                    call.args[index],
+                    "call argument type does not match parameter type",
+                    "call_arg_type_mismatch"
+                );
+            }
+            index = index + 1;
         }
         return function_type.result;
     }
 
-    qid.TypeId check_unary(hir.HirUnary unary) {
+    qid.TypeId check_unary(hir.HirId node_id, hir.HirUnary unary) {
         qid.TypeId value_type = self.check_node(unary.value);
         if (unary.op == .not) {
+            self.expect_bool(unary.value, value_type);
             return self.ctx.query.types.bool_type();
         }
-        if (unary.op == .negate || unary.op == .bit_not) {
+        if (unary.op == .negate) {
+            if (!self.is_invalid_type(value_type) && !self.is_numeric_type(value_type)) {
+                self.add_node_error(node_id, "unary '-' requires numeric operand", "unary_numeric_operand_required");
+                return self.ctx.query.types.invalid_type();
+            }
             return value_type;
+        }
+        if (unary.op == .bit_not) {
+            if (!self.is_invalid_type(value_type) && !self.is_integer_type(value_type)) {
+                self.add_node_error(node_id, "bitwise not requires integer operand", "unary_integer_operand_required");
+                return self.ctx.query.types.invalid_type();
+            }
+            return value_type;
+        }
+        if (!self.is_invalid_type(value_type)) {
+            self.add_node_error(node_id, "unsupported unary operand type", "unsupported_unary_operand");
         }
         return self.ctx.query.types.invalid_type();
     }
 
-    qid.TypeId check_binary(hir.HirBinary binary) {
+    qid.TypeId check_binary(hir.HirId node_id, hir.HirBinary binary) {
         qid.TypeId left = self.check_node(binary.left);
         qid.TypeId right = self.check_node(binary.right);
-        if (binary.op == .equal || binary.op == .not_equal
-            || binary.op == .less || binary.op == .less_equal
+        if (binary.op == .equal || binary.op == .not_equal) {
+            self.expect_compatible_binary_operands(node_id, left, right);
+            return self.ctx.query.types.bool_type();
+        }
+        if (binary.op == .less || binary.op == .less_equal
             || binary.op == .greater || binary.op == .greater_equal) {
+            self.expect_numeric_binary_operands(node_id, left, right);
             return self.ctx.query.types.bool_type();
         }
         if (binary.op == .logic_and || binary.op == .logic_or) {
+            self.expect_bool(binary.left, left);
+            self.expect_bool(binary.right, right);
             return self.ctx.query.types.bool_type();
         }
-        if (left.to_index() == right.to_index()) {
-            return left;
+        if (binary.op == .coalesce) {
+            return self.check_coalesce(node_id, left, right);
+        }
+        if (binary.op == .add || binary.op == .sub || binary.op == .mul || binary.op == .div) {
+            return self.check_numeric_binary(node_id, left, right);
+        }
+        if (binary.op == .mod || binary.op == .bit_and || binary.op == .bit_or
+            || binary.op == .bit_xor || binary.op == .shift_left || binary.op == .shift_right) {
+            return self.check_integer_binary(node_id, left, right);
         }
         return self.ctx.query.types.invalid_type();
     }
@@ -551,10 +703,87 @@ struct HirTypeChecker {
         return self.ctx.query.defs.get(named.def_id).owned_namespace_id;
     }
 
-    () expect_bool(qid.TypeId type_id) {
-        if (!self.same_type(type_id, self.ctx.query.types.bool_type())) {
-            self.results.mark_error();
+    () expect_bool(hir.HirId node_id, qid.TypeId type_id) {
+        if (self.is_invalid_type(type_id)) {
+            return;
         }
+        if (!self.same_type(type_id, self.ctx.query.types.bool_type())) {
+            self.add_node_error(node_id, "expected bool type", "expected_bool");
+        }
+    }
+
+    () expect_compatible_binary_operands(hir.HirId node_id, qid.TypeId left, qid.TypeId right) {
+        if (self.is_invalid_type(left) || self.is_invalid_type(right)) {
+            return;
+        }
+        if (!self.same_type_ignoring_mutability(left, right)) {
+            self.add_node_error(
+                node_id,
+                "binary operands have incompatible types",
+                "binary_operand_type_mismatch"
+            );
+        }
+    }
+
+    qid.TypeId check_numeric_binary(hir.HirId node_id, qid.TypeId left, qid.TypeId right) {
+        if (self.is_invalid_type(left) || self.is_invalid_type(right)) {
+            return self.ctx.query.types.invalid_type();
+        }
+        if (!self.is_numeric_type(left) || !self.is_numeric_type(right)) {
+            self.add_node_error(node_id, "arithmetic operands must be numeric", "numeric_operand_required");
+            return self.ctx.query.types.invalid_type();
+        }
+        self.expect_compatible_binary_operands(node_id, left, right);
+        if (self.same_type_ignoring_mutability(left, right)) {
+            return left;
+        }
+        return self.ctx.query.types.invalid_type();
+    }
+
+    qid.TypeId check_integer_binary(hir.HirId node_id, qid.TypeId left, qid.TypeId right) {
+        if (self.is_invalid_type(left) || self.is_invalid_type(right)) {
+            return self.ctx.query.types.invalid_type();
+        }
+        if (!self.is_integer_type(left) || !self.is_integer_type(right)) {
+            self.add_node_error(node_id, "integer operands required", "integer_operand_required");
+            return self.ctx.query.types.invalid_type();
+        }
+        self.expect_compatible_binary_operands(node_id, left, right);
+        if (self.same_type_ignoring_mutability(left, right)) {
+            return left;
+        }
+        return self.ctx.query.types.invalid_type();
+    }
+
+    () expect_numeric_binary_operands(hir.HirId node_id, qid.TypeId left, qid.TypeId right) {
+        if (self.is_invalid_type(left) || self.is_invalid_type(right)) {
+            return;
+        }
+        if (!self.is_numeric_type(left) || !self.is_numeric_type(right)) {
+            self.add_node_error(node_id, "comparison operands must be numeric", "numeric_operand_required");
+            return;
+        }
+        self.expect_compatible_binary_operands(node_id, left, right);
+    }
+
+    qid.TypeId check_coalesce(hir.HirId node_id, qid.TypeId left, qid.TypeId right) {
+        if (self.is_invalid_type(left) || self.is_invalid_type(right)) {
+            return self.ctx.query.types.invalid_type();
+        }
+        types.TypeInfo left_info = self.ctx.query.types.get(left);
+        guard left_info.data is .optional(optional) else {
+            self.add_node_error(node_id, "left operand of ?? must be optional", "coalesce_left_not_optional");
+            return self.ctx.query.types.invalid_type();
+        }
+        if (!self.is_assignable(optional.element, right)) {
+            self.add_node_error(
+                node_id,
+                "fallback value does not match optional element type",
+                "coalesce_type_mismatch"
+            );
+            return self.ctx.query.types.invalid_type();
+        }
+        return optional.element;
     }
 
     Bool is_assignable(qid.TypeId expected, qid.TypeId actual) {
@@ -635,7 +864,63 @@ struct HirTypeChecker {
         return self.ctx.query.types.get(type_id).data is .never;
     }
 
+    Bool is_unit_type(qid.TypeId type_id) {
+        return self.ctx.query.types.get(type_id).data is .unit;
+    }
+
+    Bool is_numeric_type(qid.TypeId type_id) {
+        types.TypeInfo type_info = self.ctx.query.types.get(type_id);
+        if (type_info.data is .int_type(_)) { return true; }
+        if (type_info.data is .float_type(_)) { return true; }
+        return false;
+    }
+
+    Bool is_integer_type(qid.TypeId type_id) {
+        return self.ctx.query.types.get(type_id).data is .int_type(_);
+    }
+
+    Bool is_assignment_target(hir.HirId target_id) {
+        hir.HirNode target = self.hirs.node(target_id);
+        if (target.data is .member_access(_)) {
+            return true;
+        }
+        if (target.data is .unary(unary)) {
+            return unary.op == .deref;
+        }
+        guard target.data is .name_ref(name_ref) else {
+            return false;
+        }
+        if (name_ref is .local(_)) {
+            return true;
+        }
+        guard name_ref is .def_ref(def_id) else {
+            return false;
+        }
+        def.DefKind kind = self.ctx.query.defs.get(def_id).kind;
+        return kind == .global_def || kind == .field_def;
+    }
+
     () bind_def_type(qid.DefId def_id, qid.TypeId type_id) {
         self.results.set_def_type(def_id, type_id);
+    }
+
+    () add_node_error(hir.HirId node_id, UInt8[] message, UInt8[] code) {
+        // 所有 type check 报错都从这里落到 TypeCheckResults 和 DiagnosticBag，
+        // 防止出现只有 ok=false 但没有用户可见诊断的状态。
+        self.results.mark_error();
+        if (self.ctx.query.source_map.hir_span(node_id) is some loc) {
+            diagnostics.add_error_at_loc(self.ctx, loc, message, code);
+            return;
+        }
+        self.add_def_error(node_id.owner_def, message, code);
+    }
+
+    () add_def_error(qid.DefId def_id, UInt8[] message, UInt8[] code) {
+        self.results.mark_error();
+        if (self.ctx.query.source_map.def_span(def_id) is some loc) {
+            diagnostics.add_error_at_loc(self.ctx, loc, message, code);
+            return;
+        }
+        diagnostics.add_global_error(self.ctx, message, code);
     }
 }
