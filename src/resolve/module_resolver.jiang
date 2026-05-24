@@ -9,7 +9,6 @@ import qid = "../query/id.jiang";
 import source = "../source/source.jiang";
 import package_manifest = "../source/package_manifest.jiang";
 import fs = "../support/fs.jiang";
-import list = "../support/list.jiang";
 import path = "../support/path.jiang";
 import string = "../support/string.jiang";
 import ast = "../syntax/ast.jiang";
@@ -17,31 +16,28 @@ import syntax = "../syntax/api.jiang";
 import token = "../syntax/token.jiang";
 import def = "./def.jiang";
 import diagnostics = "./diagnostics.jiang";
-import hir_builder = "./hir_builder.jiang";
+import hir_lower = "./hir_lower.jiang";
 import import_path_resolver = "./import_path_resolver.jiang";
 import module_graph = "./module_graph.jiang";
 import name_resolver = "./name_resolver.jiang";
 import namespace = "./namespace.jiang";
 import resolve_state = "./state.jiang";
-import result = "./result.jiang";
 import store = "./store.jiang";
 
 public struct ModuleResolver {
     context.CompilerContext& ctx;
     query.QuerySystem& query;
     import_path_resolver.ImportPathResolver import_paths;
-    list.ArrayList<result.ResolvedFile&> resolved_files;
 
     public init(context.CompilerContext& ctx) {
         self.ctx = ctx;
         self.query = ctx.query$.ref();
         self.import_paths = import_path_resolver.ImportPathResolver(self.query);
-        self.resolved_files = list.ArrayList<result.ResolvedFile&>();
     }
 
     public module_graph.ModuleGraph^ build_module_graph(ast.AstFile& file) {
         // 只做 import discovery：创建 module shell、解析 import target、
-        // 填充 ModuleGraph。这里不生成 ResolvedFile。
+        // 填充 ModuleGraph。这里不做 body reference resolve，也不生成中间文件结果。
         // ModuleGraph 是从 root module 递归展开 import 得到的闭包。
         // 它可以包含 package dependency 的 module；package graph 后续
         // 单独建，不在这里混入 package-level 调度语义。
@@ -56,22 +52,6 @@ public struct ModuleResolver {
         return graph;
     }
 
-    public result.ResolvedFile^ resolve_file(module_graph.ModuleGraph& graph, ast.AstFile& file) {
-        // graph 确定后，只对传入 file 生成 ResolvedFile 并 resolve references。
-        // dependency modules 只收 declarations，避免把 package closure 全部
-        // 提前 full resolve。
-        qid.ModuleId module_id = self.ensure_module(file.source_id);
-        store.ModuleRecord! module = self.query.resolve.modules.get(module_id);
-        result.ResolvedFile^ resolved = new result.ResolvedFile(file.source_id, module.source_revision);
-        if (!graph.has_module(module_id)) {
-            resolved.mark_error();
-            return resolved;
-        }
-        self.collect_module_graph_declarations(graph, module_id, resolved$.ref());
-        self.resolve_module_references_into(module_id, file, resolved$.ref());
-        return resolved;
-    }
-
     public Bool lower_module_graph_to_hir(module_graph.ModuleGraph& graph) {
         // HIR lowering 分两段：
         // 1. 对 graph 内所有 module 收 declaration。这里写入的是 DefTable /
@@ -84,7 +64,7 @@ public struct ModuleResolver {
         }
         Int! index = 0;
         while (index < graph.modules.len()) {
-            self.collect_module_declarations_without_result(graph.modules.get(index));
+            self.collect_module_declarations(graph.modules.get(index));
             index = index + 1;
         }
 
@@ -101,49 +81,21 @@ public struct ModuleResolver {
     Bool lower_module_bodies_to_hir(qid.ModuleId module_id) {
         store.ModuleRecord module = self.query.resolve.modules.get(module_id);
         ast.AstFile& file = self.query.asts.file(module.source_id, module.source_revision)$.some();
-        result.ResolvedFile^ resolved = new result.ResolvedFile(module.source_id, module.source_revision);
-        self.collect_module_declarations_into(module_id, file, resolved$.ref());
-        self.resolve_module_references_into(module_id, file, resolved$.ref());
-        if (!resolved.ok) {
+        resolve_state.FileResolveState state = resolve_state.FileResolveState(
+            self.ctx,
+            file,
+            module_id,
+            module.namespace_id
+        );
+        self.resolve_module_references(state$.ref());
+        if (self.query.hirs.has_errors()) {
             self.query.hirs.mark_error();
             return false;
         }
-
-        resolve_state.FileResolveState state = resolve_state.FileResolveState(
-            self.ctx,
-            file,
-            module_id,
-            module.namespace_id
-        );
-        return hir_builder.lower_file(state$.ref());
+        return hir_lower.lower_file(state$.ref());
     }
 
-    () collect_module_declarations_into(
-        qid.ModuleId module_id,
-        ast.AstFile& file,
-        result.ResolvedFile& resolved
-    ) {
-        store.ModuleRecord! module = self.query.resolve.modules.get(module_id);
-        resolve_state.FileResolveState state = resolve_state.FileResolveState(
-            self.ctx,
-            file,
-            module_id,
-            module.namespace_id
-        );
-        self.resolved_files.add(resolved);
-        name_resolver.NameResolver resolver = name_resolver.NameResolver(
-            state,
-            resolved
-        );
-        Bool declarations_already_collected = self.query.resolve.modules.get(module_id).resolve_state == .declarations_collected;
-        self.collect_declarations_for_module(module_id, resolver$.ref());
-        if (declarations_already_collected) {
-            resolver.record_existing_declarations();
-        }
-        self.resolved_files.pop();
-    }
-
-    () collect_module_declarations_without_result(qid.ModuleId module_id) {
+    () collect_module_declarations(qid.ModuleId module_id) {
         store.ModuleRecord! module = self.query.resolve.modules.get(module_id);
         ast.AstFile& file = self.query.asts.file(module.source_id, module.source_revision)$.some();
         resolve_state.FileResolveState state = resolve_state.FileResolveState(
@@ -152,48 +104,13 @@ public struct ModuleResolver {
             module_id,
             module.namespace_id
         );
-        name_resolver.NameResolver resolver = name_resolver.NameResolver(state, null);
+        name_resolver.NameResolver resolver = name_resolver.NameResolver(state$.ref());
         self.collect_declarations_for_module(module_id, resolver$.ref());
     }
 
-    () collect_module_graph_declarations(
-        module_graph.ModuleGraph& graph,
-        qid.ModuleId resolved_module,
-        result.ResolvedFile& resolved
-    ) {
-        Int! index = 0;
-        while (index < graph.modules.len()) {
-            qid.ModuleId module_id = graph.modules.get(index);
-            if (module_id.to_index() == resolved_module.to_index()) {
-                store.ModuleRecord module = self.query.resolve.modules.get(module_id);
-                ast.AstFile& file = self.query.asts.file(module.source_id, module.source_revision)$.some();
-                self.collect_module_declarations_into(module_id, file, resolved);
-            } else {
-                self.collect_module_declarations_without_result(module_id);
-            }
-            index = index + 1;
-        }
-    }
-
-    () resolve_module_references_into(
-        qid.ModuleId module_id,
-        ast.AstFile& file,
-        result.ResolvedFile& resolved
-    ) {
-        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
-        resolve_state.FileResolveState state = resolve_state.FileResolveState(
-            self.ctx,
-            file,
-            module_id,
-            module.namespace_id
-        );
-        self.resolved_files.add(resolved);
-        name_resolver.NameResolver resolver = name_resolver.NameResolver(
-            state,
-            resolved
-        );
+    () resolve_module_references(resolve_state.FileResolveState& state) {
+        name_resolver.NameResolver resolver = name_resolver.NameResolver(state);
         resolver.resolve_references();
-        self.resolved_files.pop();
     }
 
     public qid.ModuleId ensure_module(source.SourceId source_id) {
@@ -232,7 +149,6 @@ public struct ModuleResolver {
     ) {
         store.ModuleResolveState! state = self.query.resolve.modules.get(module_id).resolve_state;
         if (state == .declarations_collected) {
-            self.record_module_hir_defs(module_id);
             return;
         }
         if (state == .collecting_declarations) {
@@ -243,7 +159,6 @@ public struct ModuleResolver {
 
         state = self.query.resolve.modules.get(module_id).resolve_state;
         if (state == .declarations_collected) {
-            self.record_module_hir_defs(module_id);
             return;
         }
         if (state == .collecting_declarations) {
@@ -254,33 +169,6 @@ public struct ModuleResolver {
         self.bind_import_aliases(module_id);
         resolver.collect_declarations();
         self.query.resolve.set_module_state(module_id, .declarations_collected);
-        self.record_module_hir_defs(module_id);
-    }
-
-    () record_module_hir_defs(qid.ModuleId module_id) {
-        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
-        Int count = 1 + module.private_defs.len() + module.exports.len();
-        qid.DefId![*] defs = self.query.hirs.storage.alloc_array<qid.DefId>(count);
-        Int! out = 0;
-
-        defs[out] = module.def_id;
-        out = out + 1;
-
-        Int! index = 0;
-        while (index < module.private_defs.len()) {
-            defs[out] = module.private_defs.get(index);
-            out = out + 1;
-            index = index + 1;
-        }
-
-        index = 0;
-        while (index < module.exports.len()) {
-            defs[out] = module.exports.get(index).def_id;
-            out = out + 1;
-            index = index + 1;
-        }
-
-        self.query.hirs.set_module_defs(module_id, defs[0..count]);
     }
 
     () ensure_imports_collected(
@@ -323,7 +211,7 @@ public struct ModuleResolver {
             module_id,
             module.namespace_id
         );
-        name_resolver.NameResolver resolver = name_resolver.NameResolver(state, null);
+        name_resolver.NameResolver resolver = name_resolver.NameResolver(state$.ref());
         self.ensure_imports_collected(module_id, resolver$.ref());
     }
 
@@ -424,31 +312,17 @@ public struct ModuleResolver {
             module.def_id,
             module_id,
             module.namespace_id,
-            self.query.resolve.modules.get(target_module).namespace_id,
-            import_record.span
+            self.query.resolve.modules.get(target_module).namespace_id
         );
         self.query.hirs.declare_def(alias_def, .import_alias_decl);
         self.query.source_map.set_def_span(alias_def, module.source_id, import_record.span);
         if (duplicate) {
-            self.query.resolve.add_private_def(module_id, alias_def);
+            self.query.resolve.add_module_def(module_id, alias_def);
             return alias_def;
         }
 
         self.query.resolve.bind_name(module.namespace_id, alias_symbol, .namespace_name, alias_def, import_record.span);
-        if (import_record.visibility == .public_visibility) {
-            self.query.resolve.add_export(
-                module_id,
-                store.ExportRecord {
-                    kind: .module_export,
-                    symbol: alias_symbol,
-                    domain: .namespace_name,
-                    def_id: alias_def,
-                    span: import_record.span
-                }
-            );
-        } else {
-            self.query.resolve.add_private_def(module_id, alias_def);
-        }
+        self.query.resolve.add_module_def(module_id, alias_def);
         return alias_def;
     }
 
@@ -472,7 +346,7 @@ public struct ModuleResolver {
                 existing.span,
                 self.query.symbols.text(alias_symbol)
             );
-            self.mark_current_resolved_file_error();
+            self.query.hirs.mark_error();
             return true;
         }
         return false;
@@ -581,7 +455,7 @@ public struct ModuleResolver {
             "invalid import path",
             "invalid_import_path"
         );
-        self.mark_current_resolved_file_error();
+        self.query.hirs.mark_error();
     }
 
     () add_import_not_found_diagnostic(
@@ -595,7 +469,7 @@ public struct ModuleResolver {
             string.append("import not found: ", self.query.symbols.text(import_record.path_symbol)),
             "import_not_found"
         );
-        self.mark_current_resolved_file_error();
+        self.query.hirs.mark_error();
     }
 
     qid.ModuleId create_source_module(source.SourceId source_id, Int source_revision) {
@@ -621,8 +495,7 @@ public struct ModuleResolver {
             package_record.def_id,
             module_id,
             package_record.namespace_id,
-            namespace_id,
-            span
+            namespace_id
         );
         self.query.hirs.declare_def(module_def, .module_decl);
         self.query.source_map.set_def_span(module_def, source_id, span);
@@ -695,8 +568,7 @@ public struct ModuleResolver {
             null,
             null,
             package_namespace,
-            package_namespace,
-            span
+            package_namespace
         );
         self.query.hirs.declare_def(package_def, .package_decl);
         qid.PackageId package_id = self.query.resolve.create_package(
@@ -735,19 +607,7 @@ public struct ModuleResolver {
 
     () add_package_manifest_diagnostic(source.SourceId source_id, UInt8[] message) {
         diagnostics.add_package_manifest_error(self.ctx, source_id, message);
-        self.mark_current_resolved_file_error();
-    }
-
-    result.ResolvedFile& current_resolved_file() {
-        return self.resolved_files.last();
-    }
-
-    () mark_current_resolved_file_error() {
-        if (self.resolved_files.empty()) {
-            return;
-        }
-        result.ResolvedFile& resolved = self.resolved_files.ref_at(self.resolved_files.len() - 1);
-        resolved.mark_error();
+        self.query.hirs.mark_error();
     }
 
     // 没有真实 package.ini 的虚拟 source 仍挂到默认 root package。
@@ -769,8 +629,7 @@ public struct ModuleResolver {
             null,
             null,
             package_namespace,
-            package_namespace,
-            span
+            package_namespace
         );
         self.query.hirs.declare_def(package_def, .package_decl);
         qid.PackageId package_id = self.query.resolve.create_package(

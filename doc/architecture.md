@@ -152,12 +152,13 @@ public trait Indexable {
 
 ### 当前 Resolve 流程
 
-`resolve/module_resolver.jiang` 是当前 resolve 入口。外部创建 `ModuleResolver(ctx)`，调用
-`resolve_file` 后拿到当前文件的 resolve 阶段产物：
+`resolve/module_resolver.jiang` 是当前 resolve 入口。外部创建 `ModuleResolver(ctx)`，
+先构建 root import closure 的 `ModuleGraph`，再把 graph 内可达 module 直接 lower 到 HIR：
 
 ```jiang
 ModuleResolver! resolver = ModuleResolver(ctx)
-ResolvedFile^ resolved = resolver.resolve_file(ast_file)
+ModuleGraph^ graph = resolver.build_module_graph(root_file)
+resolver.lower_module_graph_to_hir(graph$.ref())
 ```
 
 `pipeline.compile_path(ctx, input_path)` 是当前 source/syntax/resolve 的路径入口：如果
@@ -167,16 +168,19 @@ ResolvedFile^ resolved = resolver.resolve_file(ast_file)
 流程分为 module 级驱动和单文件名字解析两层：
 
 ```text
-resolve_file(ctx, ast_file)
+build_module_graph(root_file)
   -> parse_source has registered AstFile in QuerySystem.asts
-  -> ensure_module(ast_file.source_id)
-  -> create caller-owned ResolvedFile
-  -> collect current module imports if needed
-  -> mark current module as collecting declarations
-  -> resolve import targets and collect registered target declarations
-  -> collect current module declarations
+  -> ensure_module(root_file.source_id)
+  -> collect root module imports
+  -> resolve import targets, parse/load target AstFile when needed
+  -> add ModuleGraph import edges
+  -> recursively discover reachable module imports
+
+lower_module_graph_to_hir(graph)
+  -> collect declarations for all graph modules
   -> NameResolver.resolve_references()
-  -> return ResolvedFile^
+  -> write AstId -> DefId facts into ResolveStore
+  -> lower resolved AST nodes into QuerySystem.hirs
 ```
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
@@ -191,8 +195,8 @@ resolve_file(ctx, ast_file)
   imports、exports、private_defs，并创建新的 module namespace。旧 namespace 和旧 def
   暂时留在全局表中，但不再通过当前 module 可达；后续如需长期增量会再引入 GC 或
   版本化策略。
-- `ResolvedFile` 带 `source_id + revision`，后续阶段使用前必须确认它仍匹配当前
-  `SourceStore`。旧 `ResolvedFile` 即使还持有旧 `AstId -> DefId` 映射，也不能进入 sema/HIR。
+- `AstId -> DefId` facts 带 `source_id + revision` 写入 `ResolveStore`。HIR lowering
+  只读取当前 revision 的 facts，避免旧 AST 映射污染新 HIR。
 
 `ModuleRecord.resolve_state` 记录 module 级 pass 进度：
 
@@ -204,16 +208,12 @@ resolve_file(ctx, ast_file)
 A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归，等 A 当前 pass 自己完成。
 
 `NameResolver` 是单个 AST file/module 的 resolver。它不负责创建 module，也不负责跨文件
-加载；初始化时只拿当前 `module_id` 和 `namespace_id`：
+加载；初始化时只拿当前 `FileResolveState`：
 
 ```text
 NameResolver {
-  query
-  file
-  module_id
-  namespace_id
-  resolved_file&
-  lexical env
+  FileResolveState
+  lexical env for ReferenceResolver
 }
 ```
 
@@ -223,8 +223,8 @@ NameResolver {
 - `collect_declarations`：扫描 top-level declaration，创建 `DefId`，绑定到当前 module namespace，
   并按 visibility 记录到 exports 或 private_defs。
 - `resolve_references`：遍历当前 file 的 declaration body，解析基础 type reference、
-  expression name、local binding 和 import alias path，并把结果写入调用方持有的
-  `ResolvedFile`。
+  expression name、local binding 和 import alias path，并把结果写入 `ResolveStore`
+  的 source-revision scoped ast facts。
 
 `resolve_import_targets` 在 imports 收集后运行：
 
