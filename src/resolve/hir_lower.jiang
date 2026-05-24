@@ -2,7 +2,7 @@
 //
 // 这个 lowering 属于 resolve 阶段。调用它之前，ModuleResolver 已经完成：
 // 1. 构建 module graph / import closure；
-// 2. 对所有可达 module 收集 declaration，创建 DefId 和 HirDefRecord skeleton；
+// 2. 对所有可达 module 收集 declaration，创建 DefId 和 HirDef skeleton；
 // 3. 对当前文件完成 reference resolve。
 //
 // 输入：
@@ -46,9 +46,9 @@ struct HirLower {
         self.env = scope.LexicalEnv();
     }
 
+    // 只遍历能在 HIR 中拥有可执行/类型语法的 declaration。declaration
+    // skeleton 已经存在，这一趟只为当前文件填充 body 和 def-local nodes。
     public () lower() {
-        // 只遍历能在 HIR 中拥有可执行/类型语法的 declaration。declaration
-        // skeleton 已经存在，这一趟只为当前文件填充 body 和 def-local nodes。
         guard self.state.file.root is some root_id else { return; }
         ast.AstNode root = self.state.file.get(root_id);
         guard root.data is .root(root_data) else { return; }
@@ -100,6 +100,9 @@ struct HirLower {
             return;
         }
         if (decl.data is .nominal_decl(nominal)) {
+            // 成员 declaration 的 DefId 已经在 name resolve 阶段创建。
+            // 这里切到 owner def，只是为了让 field/case/method 的 HIR
+            // 节点落到各自 owner 的 def-local 表里。
             qid.DefId? previous_owner = self.current_owner_def;
             if (self.decl_def_for_name(nominal.name, .type_name) is some owner_def) {
                 self.current_owner_def = owner_def;
@@ -136,6 +139,9 @@ struct HirLower {
         }
     }
 
+    // 函数 body 是一个独立 HIR owner。函数签名里的 type refs 和 body
+    // expression nodes 都归到 function_def，后续 type check/MIR lowering
+    // 只需要从 DefId 找到这一份 HirDef。
     () lower_function(ast.FunctionData function_decl) {
         guard self.decl_def_for_name(function_decl.name, .value_name) is some function_def else { return; }
         qid.DefId? previous_owner = self.current_owner_def;
@@ -159,6 +165,8 @@ struct HirLower {
         self.current_owner_def = previous_owner;
     }
 
+    // global initializer 也需要 body/root，这样 MIR/codegen 可以像处理
+    // function body 一样消费它；没有 initializer 的 global 只有 decl type。
     () lower_global(ast.GlobalData global_decl) {
         guard self.decl_def_for_name(global_decl.name, .value_name) is some global_def else { return; }
         qid.DefId? previous_owner = self.current_owner_def;
@@ -352,6 +360,8 @@ struct HirLower {
         return self.add_invalid_node(expr.span);
     }
 
+    // LexicalEnv 只在 lowering 期间使用：把刚创建的 local DefId 解析回
+    // HirLocalId/name_ref.local。lowering 完成后，长期状态在 HirBody.locals。
     hir.HirId lower_block(ast.BlockData block, token.Span span) {
         self.env.enter_scope(.block_scope);
         list.ArrayList<hir.HirId>! statements = list.ArrayList<hir.HirId>(block.statements.len);
@@ -447,17 +457,20 @@ struct HirLower {
         }), span);
     }
 
+    // Parser 目前会把 `value.field.subfield` 表示成一个 path。如果
+    // resolve 没有把整个 path 绑定到 namespace/type target，就按链式
+    // value member access lower。每一段 member 是否存在，由 type check
+    // 根据 base type 验证。
     hir.HirId lower_path_expr(ast.AstId path_id, ast.PathData path) {
-        // Parser 目前会把 `value.field.subfield` 表示成一个 path。如果
-        // resolve 没有把整个 path 绑定到 namespace/type target，就按链式
-        // value member access lower。每一段 member 是否存在，由 type check
-        // 根据 base type 验证。
         if (path.segments.len > 1 && self.resolved_value_def_for_expr(path_id) == null) {
             return self.lower_member_path(path);
         }
         return self.lower_name_ref(path_id);
     }
 
+    // `value.a.b` 被 parser 表示成 path 时，这里左折成
+    // member_access(member_access(value, a), b)。每一步的具体 member
+    // 选择仍然留给 type check，因为它依赖上一段表达式的类型。
     hir.HirId lower_member_path(ast.PathData path) {
         if (path.segments.len == 0) {
             return self.add_invalid_node(token.Span());
@@ -604,7 +617,8 @@ struct HirLower {
     }
 
     hir.HirId lower_binding_pattern(ast.PatternData pattern, ast.AstId name) {
-        token.Span span = self.state.file.get(name).span;
+        ast.AstId binding_name = self.pattern_binding_name_id(name);
+        token.Span span = self.state.file.get(binding_name).span;
         guard self.current_owner_def is some owner_def else { return self.add_invalid_node(span); }
         hir.HirId?! type_ref = null;
         if (pattern.type_ref is some type_ast) {
@@ -612,12 +626,22 @@ struct HirLower {
         }
         hir.HirLocalId local_id = self.add_local_for_name(
             owner_def,
-            name,
+            binding_name,
             .local_def,
             .pattern_binding,
             type_ref
         );
         return self.add_node(.binding_pattern(hir.HirBindingPattern {local_id: local_id}), span);
+    }
+
+    ast.AstId pattern_binding_name_id(ast.AstId name_or_path) {
+        ast.AstNode node = self.state.file.get(name_or_path);
+        if (node.data is .path(path)) {
+            if (path.segments.len == 1) {
+                return self.state.file.child_at(path.segments, 0);
+            }
+        }
+        return name_or_path;
     }
 
     hir.HirId[] lower_pattern_range(ast.AstRange patterns) {
@@ -727,6 +751,8 @@ struct HirLower {
             return self.add_invalid_node(self.state.file.get(expr_id).span);
         }
         hir.HirNameRef! name_ref = .def_ref(def_id);
+        // 本地绑定虽然也有 DefId，但在当前 body 内用 HirLocalId 更直接；
+        // 跨 owner 或非 local 定义仍保留 DefId 引用。
         if (self.current_owner_def is some owner_def) {
             if (self.state.query.hirs.local_for_def(owner_def, def_id) is some local_id) {
                 name_ref = .local(local_id);
@@ -940,6 +966,8 @@ struct HirLower {
         return self.freeze_hir_ids(empty);
     }
 
+    // HIR node 里的 slice 不能指向临时 ArrayList；统一复制到
+    // HirStore arena，让它和 package HIR 生命周期一致。
     hir.HirId[] freeze_hir_ids(list.ArrayList<hir.HirId> values) {
         Int count = values.len();
         Int! capacity = count;
