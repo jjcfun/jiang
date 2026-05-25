@@ -3,9 +3,9 @@
 borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCheckResults` 类型事实和
 `LayoutStore` 中的 concrete layout，不重新推导类型，不重新计算布局。
 
-Jiang 的目标不是完整复制 Rust 的 aliasing 模型。第一版 borrow check 先固定所有权、
-move/use-after-move、引用逃逸和析构安全边界；共享/独占可变借用、数据竞争和 effect system
-后续再单独设计。
+Jiang 的 borrow check 只处理所有权、move/use-after-move、引用逃逸和析构安全边界。
+它不检查 Rust 式 shared/mutable aliasing，不负责 data-race freedom，也不根据外层
+slot 是否可变决定内部字段能否写入。并发安全和数据竞争策略后续作为单独语言机制设计。
 
 ## 输入
 
@@ -24,7 +24,8 @@ move/use-after-move、引用逃逸和析构安全边界；共享/独占可变借
 - 为 drop 插入和后续 backend 提供约束结果。
 
 mutability 的基本 assignment 检查已经在 type check 阶段完成；borrow check 只处理需要 CFG
-和 lifetime 信息的约束。
+和 lifetime 信息的约束。字段、tuple 元素、union payload、数组元素能否写入，只由对应成员
+类型自己的 `!` 可变性决定；不由 owner/local/reference slot 的可变性决定。
 
 ## 数据结构
 
@@ -38,7 +39,7 @@ MovePath
 
 Loan
   borrowed_place: MovePathId
-  borrow_kind: shared | mutable | raw
+  handle_kind: reference | raw_pointer
   issued_at: MirLocation
   expires_at: RegionId?
 
@@ -51,8 +52,9 @@ BorrowCheckResults
 `MovePath` 按 MIR place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
 里的不同节点。移动父 path 会使子 path 不可用；重新赋值父 path 会重新初始化整棵子树。
 
-`Loan` 表示某个 MIR location 产生的引用或指针视图。第一版只需要足够表达防悬垂：
-loan 的来源 place 必须活到所有使用点之后。
+`Loan` 表示某个 MIR location 产生的引用或指针视图。`handle_kind` 只区分语言引用和裸指针，
+不表达 shared/mutable 或只读/独占语义。第一版只需要足够表达防悬垂：loan 的来源 place
+必须活到所有使用点之后。
 
 ## 分析流程
 
