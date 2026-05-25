@@ -64,6 +64,7 @@ struct FunctionBorrowChecker {
     public mir.MirBody body;
     public move_path.MovePathTree! paths;
     public table.HashTable<move_path.MovePathId, Bool>! moved;
+    public table.HashTable<move_path.MovePathId, loan.LoanId>! active_loans;
 
     public init(
         context.CompilerContext& ctx,
@@ -81,6 +82,7 @@ struct FunctionBorrowChecker {
         mir.MirBody! body = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
         self.moved = table.HashTable<move_path.MovePathId, Bool>();
+        self.active_loans = table.HashTable<move_path.MovePathId, loan.LoanId>();
     }
 
     public () check() {
@@ -123,12 +125,13 @@ struct FunctionBorrowChecker {
     }
 
     () add_loan(loan.LoanKind kind, mir.MirPlace source, mir.MirPlace target) {
-        self.results.add_loan(
+        loan.LoanId loan_id = self.results.add_loan(
             kind,
             self.function_id,
             self.paths.path_for_place(source),
             self.paths.path_for_place(target)
         );
+        self.active_loans.set(self.paths.path_for_place(target), loan_id);
     }
 
     loan.LoanKind loan_kind_for_borrow(mir.MirBorrowKind kind) {
@@ -162,9 +165,21 @@ struct FunctionBorrowChecker {
             self.check_operand(assert_term.condition);
             return;
         }
+        if (terminator.kind is .return_term(return_term)) {
+            self.check_return(return_term);
+            return;
+        }
         if (terminator.kind is .throw_term(throw_term)) {
             self.check_operand(throw_term.error_value);
+            self.check_operand_escape(throw_term.error_value);
         }
+    }
+
+    () check_return(mir.MirReturnTerminator return_term) {
+        if (return_term.implicit_unit) {
+            return;
+        }
+        self.check_path_escape(self.paths.root_for_local(self.body.return_local));
     }
 
     () check_call(mir.MirCallTerminator call_term) {
@@ -172,9 +187,31 @@ struct FunctionBorrowChecker {
         Int! index = 0;
         while (index < call_term.args.length) {
             self.check_operand(call_term.args[index]);
+            self.check_operand_escape(call_term.args[index]);
             index = index + 1;
         }
         self.clear_place(call_term.destination);
+    }
+
+    () check_operand_escape(mir.MirOperand operand) {
+        if (operand is .copy_operand(copy_operand)) {
+            self.check_place_escape(copy_operand.place);
+            return;
+        }
+        if (operand is .move_operand(move_operand)) {
+            self.check_place_escape(move_operand.place);
+        }
+    }
+
+    () check_place_escape(mir.MirPlace place) {
+        self.check_path_escape(self.paths.path_for_place(place));
+    }
+
+    () check_path_escape(move_path.MovePathId path) {
+        if (self.active_loan_for_path(path) is some _) {
+            self.results.mark_error();
+            self.add_borrow_escape_diagnostic();
+        }
     }
 
     () check_rvalue(mir.MirRvalue value) {
@@ -253,7 +290,9 @@ struct FunctionBorrowChecker {
     () consume_place(mir.MirPlace place) {
         self.check_place_use(place);
         if (!self.is_implicit_copy_place(place)) {
-            self.mark_moved(self.paths.path_for_place(place));
+            move_path.MovePathId path = self.paths.path_for_place(place);
+            self.check_source_invalidation(path);
+            self.mark_moved(path);
         }
     }
 
@@ -278,7 +317,97 @@ struct FunctionBorrowChecker {
     }
 
     () clear_place(mir.MirPlace place) {
-        self.clear_path_and_descendants(self.paths.path_for_place(place));
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        self.check_source_invalidation(path);
+        self.clear_path_and_descendants(path);
+    }
+
+    () add_borrow_escape_diagnostic() {
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("borrowed_value_escape"),
+                diagnostic.SourceRange(),
+                "borrowed value escapes its owner"
+            )
+        );
+    }
+
+    () add_borrow_invalidated_diagnostic() {
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("borrowed_value_invalidated"),
+                diagnostic.SourceRange(),
+                "borrowed value is invalidated while borrowed"
+            )
+        );
+    }
+
+    loan.LoanId? active_loan_for_path(move_path.MovePathId path) {
+        if (self.active_loans.get(path) is some loan_id) {
+            return loan_id;
+        }
+        if (self.active_loan_for_ancestor(path) is some loan_id) {
+            return loan_id;
+        }
+        return self.active_loan_for_descendant(path);
+    }
+
+    loan.LoanId? active_loan_for_ancestor(move_path.MovePathId path) {
+        move_path.MovePath! current = self.paths.get(path);
+        while (current.parent is some parent) {
+            if (self.active_loans.get(parent) is some loan_id) {
+                return loan_id;
+            }
+            current = self.paths.get(parent);
+        }
+        return null;
+    }
+
+    loan.LoanId? active_loan_for_descendant(move_path.MovePathId path) {
+        Int! index = 0;
+        while (index < self.paths.len()) {
+            move_path.MovePathId candidate = move_path.MovePathId(index);
+            if (self.active_loans.get(candidate) is some loan_id) {
+                if (self.is_descendant_of(candidate, path)) {
+                    return loan_id;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    () check_source_invalidation(move_path.MovePathId path) {
+        if (self.active_loan_source_overlaps(path)) {
+            self.results.mark_error();
+            self.add_borrow_invalidated_diagnostic();
+        }
+    }
+
+    Bool active_loan_source_overlaps(move_path.MovePathId path) {
+        Int! index = 0;
+        while (index < self.results.loans.len()) {
+            loan.Loan current = self.results.loans.get(loan.LoanId(index));
+            if (self.active_loans.has(current.target) && self.paths_overlap(current.source, path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool paths_overlap(move_path.MovePathId lhs, move_path.MovePathId rhs) {
+        if (lhs == rhs) {
+            return true;
+        }
+        if (self.is_descendant_of(lhs, rhs)) {
+            return true;
+        }
+        return self.is_descendant_of(rhs, lhs);
     }
 
     () mark_moved(move_path.MovePathId path) {
@@ -332,6 +461,7 @@ struct FunctionBorrowChecker {
 
     () clear_path_and_descendants(move_path.MovePathId path) {
         self.moved.remove(path);
+        self.active_loans.remove(path);
         self.clear_descendants(path);
     }
 
@@ -341,6 +471,7 @@ struct FunctionBorrowChecker {
             move_path.MovePathId candidate = move_path.MovePathId(index);
             if (self.is_descendant_of(candidate, path)) {
                 self.moved.remove(candidate);
+                self.active_loans.remove(candidate);
             }
             index = index + 1;
         }
