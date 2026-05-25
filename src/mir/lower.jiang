@@ -2,16 +2,18 @@
 
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
+import hir_store = "../hir/store.jiang";
 import qid = "../query/id.jiang";
 import module_graph = "../resolve/module_graph.jiang";
 import store = "../resolve/store.jiang";
 import sema_result = "../sema/result.jiang";
+import list = "../support/list.jiang";
 import token = "../syntax/token.jiang";
 import mir = "./mir.jiang";
 
 public mir.MirStore^ lower_package(
     context.CompilerContext& ctx,
-    hir.HirStore& hir_store,
+    hir_store.HirStore& hir_store,
     sema_result.TypeCheckResults& typeck,
     module_graph.ModuleGraph& graph
 ) {
@@ -27,14 +29,14 @@ public mir.MirStore^ lower_package(
 
 struct MirLowerer {
     context.CompilerContext& ctx;
-    hir.HirStore& hirs;
+    hir_store.HirStore& hirs;
     sema_result.TypeCheckResults& typeck;
     module_graph.ModuleGraph& graph;
     mir.MirStore^ output;
 
     public init(
         context.CompilerContext& ctx,
-        hir.HirStore& hirs,
+        hir_store.HirStore& hirs,
         sema_result.TypeCheckResults& typeck,
         module_graph.ModuleGraph& graph,
         mir.MirStore^ output
@@ -75,12 +77,11 @@ struct MirLowerer {
     }
 
     () lower_function(hir.HirDef hir_def) {
-        // 当前只是 MIR 骨架：为每个 HIR function 建立 MirFunction/MirBody，
-        // 具体 statement/rvalue/terminator lowering 后续再补。
         Int function_index = self.output.functions.len();
         // HIR 不再直接携带 span；诊断位置后续通过 SourceMap 查询。
         token.Span span = self.def_span(hir_def.def_id);
-        mir.MirBody mir_body = self.empty_body(mir.MirBodyId.from_index(function_index), hir_def, span);
+        BodyLowerer! body_lowerer = BodyLowerer(self$.ref(), mir.MirBodyId.from_index(function_index), hir_def, span);
+        mir.MirBody mir_body = body_lowerer.lower();
         self.output.add_function(mir.MirFunction {
             id: mir.MirFunctionId.from_index(function_index),
             def_id: hir_def.def_id,
@@ -90,34 +91,8 @@ struct MirLowerer {
         });
     }
 
-    mir.MirBody empty_body(mir.MirBodyId body_id, hir.HirDef hir_def, token.Span span) {
-        mir.MirBlockId entry = mir.MirBlockId.from_index(0);
-        mir.MirBlock block = mir.MirBlock {
-            id: entry,
-            span: span,
-            statements: self.output.empty_statements(),
-            terminator: mir.MirTerminator {
-                span: span,
-                kind: .return_term(mir.MirReturnTerminator {implicit_unit: true})
-            }
-        };
-        return mir.MirBody {
-            id: body_id,
-            span: span,
-            locals: self.locals_for_body(hir_def),
-            blocks: self.output.single_block(block),
-            entry: entry,
-            return_local: mir.MirLocalId.from_index(0)
-        };
-    }
-
-    mir.MirLocalDecl[] locals_for_body(hir.HirDef hir_def) {
-        Int! hir_local_count = 0;
-        if (hir_def.body is some body) {
-            hir_local_count = body.locals.len();
-        }
-        mir.MirLocalDecl![*] locals = self.output.alloc_local_array(hir_local_count + 1);
-        locals[0] = mir.MirLocalDecl {
+    () add_initial_locals(hir.HirDef hir_def, list.ArrayList<mir.MirLocalDecl>& locals) {
+        locals.add(mir.MirLocalDecl {
             id: mir.MirLocalId.from_index(0),
             kind: .return_place,
             type_id: self.return_type(hir_def),
@@ -126,17 +101,16 @@ struct MirLowerer {
             def_id: null,
             mutable_local: true,
             address_taken: false
-        };
+        });
         guard hir_def.body is some body else {
-            return locals[0..1];
+            return;
         }
         Int! index = 0;
         while (index < body.locals.len()) {
             hir.HirLocal local = body.locals.get_index(index);
-            locals[index + 1] = self.lower_local(local, index + 1);
+            locals.add(self.lower_local(local, index + 1));
             index = index + 1;
         }
-        return locals[0..hir_local_count + 1];
     }
 
     mir.MirLocalDecl lower_local(hir.HirLocal local, Int mir_index) {
@@ -179,5 +153,316 @@ struct MirLowerer {
             return loc.span;
         }
         return token.Span();
+    }
+
+    token.Span hir_span(hir.HirId hir_id) {
+        if (self.ctx.query.source_map.hir_span(hir_id) is some loc) {
+            return loc.span;
+        }
+        return token.Span();
+    }
+}
+
+// BodyLowerer 负责把单个 HIR function body 转成 MIR CFG。
+// 当前只实现直线控制流的最小路径：let initializer、return、tail expr、
+// literal/name/local 和 call。遇到 call 时结束当前 basic block，并从
+// continuation block 继续写后续语句。
+struct BodyLowerer {
+    MirLowerer& lowerer;
+    mir.MirBodyId body_id;
+    hir.HirDef hir_def;
+    token.Span span;
+    list.ArrayList<mir.MirLocalDecl>! locals;
+    list.ArrayList<mir.MirBlock>! blocks;
+    list.ArrayList<mir.MirStatement>! statements;
+    mir.MirBlockId! current_block;
+    Bool! terminated;
+
+    public init(MirLowerer& lowerer, mir.MirBodyId body_id, hir.HirDef hir_def, token.Span span) {
+        self.lowerer = lowerer;
+        self.body_id = body_id;
+        self.hir_def = hir_def;
+        self.span = span;
+        self.locals = list.ArrayList<mir.MirLocalDecl>();
+        self.blocks = list.ArrayList<mir.MirBlock>();
+        self.statements = list.ArrayList<mir.MirStatement>();
+        self.current_block = mir.MirBlockId.from_index(0);
+        self.terminated = false;
+        self.lowerer.add_initial_locals(hir_def, self.locals$.ref());
+    }
+
+    mir.MirBody lower() {
+        if (self.hir_def.body is some body) {
+            self.lower_root(body.root);
+        }
+        if (!self.terminated) {
+            self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: true}), self.span);
+        }
+        return mir.MirBody {
+            id: self.body_id,
+            span: self.span,
+            locals: self.freeze_locals(),
+            blocks: self.lowerer.output.block_array(self.blocks$.ref()),
+            entry: mir.MirBlockId.from_index(0),
+            return_local: self.return_local()
+        };
+    }
+
+    () lower_root(hir.HirId root) {
+        hir.HirNode node = self.lowerer.hirs.node(root);
+        if (node.data is .block(block)) {
+            self.lower_root_block(block);
+            return;
+        }
+        self.lower_into_place(root, self.place_for_local(self.return_local()));
+        if (!self.terminated) {
+            self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: false}), self.lowerer.hir_span(root));
+        }
+    }
+
+    () lower_root_block(hir.HirBlock block) {
+        Int! index = 0;
+        while (index < block.statements.length) {
+            if (self.terminated) { return; }
+            self.lower_statement_node(block.statements[index]);
+            index = index + 1;
+        }
+        if (self.terminated) { return; }
+        if (block.result is some result) {
+            self.lower_into_place(result, self.place_for_local(self.return_local()));
+            if (!self.terminated) {
+                self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: false}), self.lowerer.hir_span(result));
+            }
+            return;
+        }
+        self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: true}), self.span);
+    }
+
+    () lower_statement_node(hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        if (node.data is .let_stmt(let_stmt)) {
+            self.lower_let(node_id, let_stmt);
+            return;
+        }
+        if (node.data is .return_stmt(return_stmt)) {
+            self.lower_return(node_id, return_stmt);
+            return;
+        }
+        if (node.data is .call(_)) {
+            mir.MirLocalId temp = self.add_temp(self.type_for_node(node_id), self.lowerer.hir_span(node_id));
+            self.lower_into_place(node_id, self.place_for_local(temp));
+            return;
+        }
+        self.mark_unsupported(node_id);
+    }
+
+    () lower_let(hir.HirId node_id, hir.HirLet let_stmt) {
+        if (let_stmt.initializer is some initializer) {
+            self.lower_into_place(initializer, self.place_for_local(self.mir_local_for_hir(let_stmt.local_id)));
+        }
+    }
+
+    () lower_return(hir.HirId node_id, hir.HirReturn return_stmt) {
+        if (return_stmt.value is some value) {
+            self.lower_into_place(value, self.place_for_local(self.return_local()));
+            if (self.terminated) { return; }
+            self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: false}), self.lowerer.hir_span(node_id));
+            return;
+        }
+        self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: true}), self.lowerer.hir_span(node_id));
+    }
+
+    () lower_into_place(hir.HirId node_id, mir.MirPlace destination) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        if (node.data is .call(call)) {
+            self.lower_call(node_id, call, destination);
+            return;
+        }
+        mir.MirOperand value = self.lower_operand(node_id);
+        self.push_assign(destination, .use_value(mir.MirUseRvalue {value: value}), self.lowerer.hir_span(node_id));
+    }
+
+    mir.MirOperand lower_operand(hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        if (node.data is .literal(literal)) {
+            return .const_operand(self.lower_const(node_id, literal));
+        }
+        if (node.data is .name_ref(name_ref)) {
+            if (name_ref is .local(local_id)) {
+                return .copy_operand(mir.MirCopyOperand {place: self.place_for_local(self.mir_local_for_hir(local_id))});
+            }
+            if (name_ref is .def_ref(def_id)) {
+                if (self.lowerer.ctx.query.defs.get(def_id).kind == .function_def) {
+                    return .const_operand(mir.MirConst {
+                        type_id: self.type_for_node(node_id),
+                        span: self.lowerer.hir_span(node_id),
+                        value: .function_value(mir.MirFunctionConst {function_def: def_id})
+                    });
+                }
+            }
+        }
+        return self.unsupported_operand(node_id);
+    }
+
+    mir.MirConst lower_const(hir.HirId node_id, hir.HirLiteral literal) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId type_id = self.type_for_node(node_id);
+        if (literal.value is .int_value(int_value)) {
+            return mir.MirConst {
+                type_id: type_id,
+                span: span,
+                value: .int_value(mir.MirIntConst {bits: int_value.bits, signed_value: int_value.signed_value})
+            };
+        }
+        if (literal.value is .float_value(float_value)) {
+            return mir.MirConst {
+                type_id: type_id,
+                span: span,
+                value: .float_value(mir.MirFloatConst {value: float_value.value})
+            };
+        }
+        if (literal.value is .bool_value(bool_value)) {
+            return mir.MirConst {
+                type_id: type_id,
+                span: span,
+                value: .bool_value(mir.MirBoolConst {value: bool_value})
+            };
+        }
+        if (literal.value is .string_value(symbol_id)) {
+            return mir.MirConst {
+                type_id: type_id,
+                span: span,
+                value: .string_value(mir.MirStringConst {symbol_id: symbol_id})
+            };
+        }
+        if (literal.value is .char_value(char_value)) {
+            return mir.MirConst {
+                type_id: type_id,
+                span: span,
+                value: .int_value(mir.MirIntConst {bits: UInt64(char_value), signed_value: false})
+            };
+        }
+        if (literal.value is .null_value) {
+            return mir.MirConst {
+                type_id: type_id,
+                span: span,
+                value: .null_value(mir.MirNullConst {typed_null: true})
+            };
+        }
+        return mir.MirConst {
+            type_id: type_id,
+            span: span,
+            value: .unit_value(mir.MirUnitConst {unit_value: true})
+        };
+    }
+
+    () lower_call(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
+        Int! index = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_operand(call.args[index]));
+            index = index + 1;
+        }
+        mir.MirBlockId next_block = self.next_block_id();
+        self.finish_block(.call_term(mir.MirCallTerminator {
+            callee: self.lower_operand(call.callee),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            destination: destination,
+            target: next_block,
+            cleanup: null
+        }), self.lowerer.hir_span(node_id));
+        self.current_block = next_block;
+        self.terminated = false;
+        self.statements.clear();
+    }
+
+    mir.MirOperand unsupported_operand(hir.HirId node_id) {
+        self.mark_unsupported(node_id);
+        return .const_operand(mir.MirConst {
+            type_id: self.lowerer.ctx.query.types.invalid_type(),
+            span: self.lowerer.hir_span(node_id),
+            value: .unit_value(mir.MirUnitConst {unit_value: true})
+        });
+    }
+
+    () mark_unsupported(hir.HirId node_id) {
+        self.lowerer.output.mark_error();
+    }
+
+    () push_assign(mir.MirPlace destination, mir.MirRvalue value, token.Span span) {
+        if (self.terminated) { return; }
+        self.statements.add(mir.MirStatement {
+            span: span,
+            kind: .assign_stmt(mir.MirAssignStatement {
+                destination: destination,
+                value: value
+            })
+        });
+    }
+
+    () finish_block(mir.MirTerminatorKind terminator, token.Span span) {
+        if (self.terminated) { return; }
+        self.blocks.add(mir.MirBlock {
+            id: self.current_block,
+            span: span,
+            statements: self.lowerer.output.statement_array(self.statements$.ref()),
+            terminator: mir.MirTerminator {
+                span: span,
+                kind: terminator
+            }
+        });
+        self.terminated = true;
+    }
+
+    mir.MirBlockId next_block_id() {
+        return mir.MirBlockId.from_index(self.current_block.to_index() + 1);
+    }
+
+    mir.MirLocalId add_temp(qid.TypeId type_id, token.Span span) {
+        mir.MirLocalId local_id = mir.MirLocalId.from_index(self.locals.len());
+        self.locals.add(mir.MirLocalDecl {
+            id: local_id,
+            kind: .compiler_temp,
+            type_id: type_id,
+            span: span,
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        });
+        return local_id;
+    }
+
+    qid.TypeId type_for_node(hir.HirId node_id) {
+        if (self.lowerer.typeck.node_type(node_id) is some type_id) {
+            return type_id;
+        }
+        return self.lowerer.ctx.query.types.invalid_type();
+    }
+
+    mir.MirLocalId return_local() {
+        return mir.MirLocalId.from_index(0);
+    }
+
+    mir.MirLocalId mir_local_for_hir(hir.HirLocalId local_id) {
+        return mir.MirLocalId.from_index(local_id.to_index() + 1);
+    }
+
+    mir.MirPlace place_for_local(mir.MirLocalId local_id) {
+        return mir.MirPlace {
+            local_id: local_id,
+            projection: self.lowerer.output.empty_projection()
+        };
+    }
+
+    mir.MirLocalDecl[] freeze_locals() {
+        Int count = self.locals.len();
+        mir.MirLocalDecl![*] values = self.lowerer.output.alloc_local_array(count);
+        Int! index = 0;
+        while (index < count) {
+            values[index] = self.locals.get(index);
+            index = index + 1;
+        }
+        return values[0..count];
     }
 }
