@@ -108,23 +108,35 @@ struct HirLower {
             // 这里切到 owner def，只是为了让 field/case/method 的 HIR
             // 节点落到各自 owner 的 def-local 表里。
             qid.DefId? previous_owner = self.current_owner_def;
+            Bool! entered_generics = false;
             if (self.decl_def_for_name(nominal.name, .type_name) is some owner_def) {
                 self.current_owner_def = owner_def;
+                self.enter_generic_scope_for_owner(owner_def, nominal.generics);
+                entered_generics = true;
                 self.lower_where_annotations(owner_def, annotations);
                 self.lower_trait_ref_range(owner_def, nominal.traits);
             }
             self.lower_member_range(nominal.members);
+            if (entered_generics) {
+                self.env.exit_scope();
+            }
             self.current_owner_def = previous_owner;
             return;
         }
         if (decl.data is .trait_decl(trait_decl)) {
             qid.DefId? previous_owner = self.current_owner_def;
+            Bool! entered_generics = false;
             if (self.decl_def_for_name(trait_decl.name, .type_name) is some owner_def) {
                 self.current_owner_def = owner_def;
+                self.enter_generic_scope_for_owner(owner_def, trait_decl.generics);
+                entered_generics = true;
                 self.lower_where_annotations(owner_def, annotations);
                 self.lower_trait_ref_range(owner_def, trait_decl.parents);
             }
             self.lower_member_range(trait_decl.members);
+            if (entered_generics) {
+                self.env.exit_scope();
+            }
             self.current_owner_def = previous_owner;
             return;
         }
@@ -187,6 +199,7 @@ struct HirLower {
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = function_def;
 
+        self.enter_generic_scope_for_owner(function_def, function_decl.generics);
         hir.HirFunctionSignature signature = self.lower_function_signature(function_decl);
         self.state.query.hirs.set_function_signature(function_def, signature);
         self.lower_where_annotations(function_def, annotations);
@@ -203,6 +216,7 @@ struct HirLower {
             self.state.query.hirs.set_body_root(function_def, root);
         }
 
+        self.env.exit_scope();
         self.current_owner_def = previous_owner;
     }
 
@@ -251,6 +265,48 @@ struct HirLower {
             }
             index = index + 1;
         }
+    }
+
+    // HIR lowering 不能重新做 name resolve，但 generic param 是局部 type
+    // binding，不在 module namespace 里。这里把 reference resolve 已经创建
+    // 的 generic_param DefId 重新挂进 lowering 的临时 env，保证签名、
+    // where 和成员类型里的 `T` 能降成 named_type_ref(T)。
+    () enter_generic_scope_for_owner(qid.DefId owner_def, ast.AstId? generics) {
+        self.env.enter_scope(.generic_scope);
+        guard generics is some generic_id else { return; }
+        ast.AstNode generic_node = self.state.file.get(generic_id);
+        guard generic_node.data is .generic_params(generic_data) else { return; }
+
+        Int! index = 0;
+        while (index < generic_data.type_params.len) {
+            ast.AstId name_id = self.state.file.child_at(generic_data.type_params, index);
+            if (self.generic_param_def_for_name(owner_def, name_id) is some generic_def) {
+                self.define_existing_local(name_id, .type_name, generic_def);
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.DefId? generic_param_def_for_name(qid.DefId owner_def, ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        guard self.state.query.hirs.def(owner_def) is some hir_def else { return null; }
+
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            def.DefRecord member_record = self.state.query.defs.get(member_def);
+            if (member_record.kind == .generic_param_def && member_record.name.symbol == symbol) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    () define_existing_local(ast.AstId name_id, def.NameDomain domain, qid.DefId def_id) {
+        guard self.state.name_symbol(name_id) is some symbol else { return; }
+        token.Span span = self.state.file.get(name_id).span;
+        self.env.define(symbol, domain, def_id, span);
     }
 
     () lower_where_annotations(qid.DefId owner_def, ast.AstRange annotations) {
@@ -588,6 +644,12 @@ struct HirLower {
     }
 
     hir.HirId lower_call_expr(ast.CallData call, token.Span span) {
+        list.ArrayList<hir.HirId>! type_args = list.ArrayList<hir.HirId>(call.type_args.len);
+        Int! type_index = 0;
+        while (type_index < call.type_args.len) {
+            type_args.add(self.lower_type_ref(self.state.file.child_at(call.type_args, type_index)));
+            type_index = type_index + 1;
+        }
         list.ArrayList<hir.HirId>! args = list.ArrayList<hir.HirId>(call.args.len);
         Int! index = 0;
         while (index < call.args.len) {
@@ -596,6 +658,7 @@ struct HirLower {
         }
         return self.add_node(.call(hir.HirCall {
             callee: self.lower_expr(call.callee),
+            type_args: self.freeze_hir_ids(type_args),
             args: self.freeze_hir_ids(args),
             target: self.call_target(call.callee)
         }), span);
@@ -991,10 +1054,8 @@ struct HirLower {
 
     qid.DefId? resolved_name_def(ast.AstId name_id, def.NameDomain domain) {
         guard self.state.name_symbol(name_id) is some symbol else { return null; }
-        if (domain == .value_name) {
-            if (self.env.lookup_def(symbol, .value_name) is some local_def) {
-                return local_def;
-            }
+        if (self.env.lookup_def(symbol, domain) is some local_def) {
+            return local_def;
         }
         if (
             self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)

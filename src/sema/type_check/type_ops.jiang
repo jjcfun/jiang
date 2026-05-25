@@ -6,6 +6,7 @@
 import hir = "../../hir/hir.jiang";
 import qid = "../../query/id.jiang";
 import def = "../../resolve/def.jiang";
+import hash = "../../support/hash.jiang";
 import list = "../../support/list.jiang";
 import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
@@ -13,16 +14,51 @@ import diagnostics = "../diagnostics.jiang";
 import types = "../type.jiang";
 import check_context = "./context.jiang";
 
+enum TypeQueryKind {
+    type_of_def,
+    alias_target_type,
+    field_type,
+    function_signature,
+}
+
+struct TypeQueryKey: Hashable, Equatable {
+    TypeQueryKind kind;
+    qid.DefId def_id;
+
+    public init(TypeQueryKind kind, qid.DefId def_id) {
+        self.kind = kind;
+        self.def_id = def_id;
+    }
+
+    public UInt64 hash() {
+        hash.WyHasher hasher = hash.WyHasher();
+        hasher.write_int(self.kind_index());
+        hasher.write_int(self.def_id.to_index());
+        return hasher.finish();
+    }
+
+    public static Bool equal(TypeQueryKey& lhs, TypeQueryKey& rhs) {
+        return lhs.kind == rhs.kind && lhs.def_id == rhs.def_id;
+    }
+
+    Int kind_index() {
+        if (self.kind == .type_of_def) { return 1; }
+        if (self.kind == .alias_target_type) { return 2; }
+        if (self.kind == .field_type) { return 3; }
+        return 4;
+    }
+}
+
 public struct TypeOps {
     check_context.CheckContext& state;
-    // DefId -> lazy type-of-definition 查询状态：
-    // 1 表示 visiting，2 表示 done。当前主要用于 alias/decl type cycle guard；
-    // 后续会扩展成明确的 query key 表。
-    table.HashTable<qid.DefId, Int>! def_states;
+    // lazy sema query 状态表。key 里显式区分 query kind，避免未来
+    // `field_type(F)` 和 `function_signature(F)` 之类查询共用一个 DefId 状态。
+    // value: 1 = visiting, 2 = done。
+    table.HashTable<TypeQueryKey, Int>! query_states;
 
     public init(check_context.CheckContext& state) {
         self.state = state;
-        self.def_states = table.HashTable<qid.DefId, Int>();
+        self.query_states = table.HashTable<TypeQueryKey, Int>();
     }
 
     public qid.TypeId literal_type(hir.HirLiteral literal) {
@@ -90,10 +126,12 @@ public struct TypeOps {
         list.ArrayList<qid.TypeId>! args = self.check_type_args(named.args);
         if (self.state.results.def_type(named.def_id) is some type_id) {
             self.check_type_arg_arity(type_ref, named.def_id, args.len());
+            self.record_generic_instance(type_ref, named.def_id, args);
             return type_id;
         }
         if (self.state.query.types.builtin_type_for_def(named.def_id) is some type_id) {
             self.check_type_arg_arity(type_ref, named.def_id, args.len());
+            self.record_generic_instance(type_ref, named.def_id, args);
             return type_id;
         }
         def.DefKind kind = self.state.query.defs.get(named.def_id).kind;
@@ -103,10 +141,26 @@ public struct TypeOps {
         }
         if (self.def_kind_has_decl_type(kind)) {
             self.check_type_arg_arity(type_ref, named.def_id, args.len());
+            self.record_generic_instance(type_ref, named.def_id, args);
             return self.type_for_decl_def(named.def_id);
         }
         self.check_type_arg_arity(type_ref, named.def_id, args.len());
+        self.record_generic_instance(type_ref, named.def_id, args);
         return self.state.query.types.named_type_with_args(named.def_id, args, token.Span());
+    }
+
+    public () record_generic_instance(
+        hir.HirId node_id,
+        qid.DefId def_id,
+        list.ArrayList<qid.TypeId> args
+    ) {
+        if (args.len() == 0) {
+            return;
+        }
+        // 单态化只关心实际带类型实参的使用点。这里在 type check 完成
+        // type ref/call type args 解析后记录 TypeId slice，后续实例收集
+        // 不需要回读 HIR type arg 节点。
+        self.state.results.record_generic_instance_from_list(node_id, def_id, args);
     }
 
     public list.ArrayList<qid.TypeId> check_type_args(hir.HirId[] arg_refs) {
@@ -117,6 +171,102 @@ public struct TypeOps {
             index = index + 1;
         }
         return args;
+    }
+
+    public qid.TypeId substitute_generic_type(
+        qid.TypeId type_id,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId> type_args
+    ) {
+        if (type_args.len() == 0) {
+            return type_id;
+        }
+        types.TypeInfo type_info = self.state.query.types.get(type_id);
+        if (type_info.data is .named(named)) {
+            return self.substitute_named_type(type_info, named, generic_owner, type_args);
+        }
+        if (type_info.data is .optional(optional)) {
+            qid.TypeId element = self.substitute_generic_type(optional.element, generic_owner, type_args);
+            qid.TypeId optional_id = self.state.query.types.optional_type(element, type_info.span);
+            return self.type_with_original_mutability(type_info, optional_id);
+        }
+        if (type_info.data is .tuple_type(tuple_type)) {
+            list.ArrayList<qid.TypeId>! items = list.ArrayList<qid.TypeId>(tuple_type.items.length);
+            Int! index = 0;
+            while (index < tuple_type.items.length) {
+                items.add(self.substitute_generic_type(tuple_type.items[index], generic_owner, type_args));
+                index = index + 1;
+            }
+            qid.TypeId tuple_id = self.state.query.types.tuple_type(items, type_info.span);
+            return self.type_with_original_mutability(type_info, tuple_id);
+        }
+        if (type_info.data is .function_type(function_type)) {
+            return self.substitute_function_type(type_info, function_type, generic_owner, type_args);
+        }
+        return type_id;
+    }
+
+    qid.TypeId substitute_named_type(
+        types.TypeInfo type_info,
+        types.NamedType named,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId> type_args
+    ) {
+        if (self.generic_param_index(generic_owner, named.def_id) is some index) {
+            if (index < type_args.len()) {
+                return type_args.get(index);
+            }
+            return self.state.query.types.invalid_type();
+        }
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>(named.args.length);
+        Int! index = 0;
+        while (index < named.args.length) {
+            args.add(self.substitute_generic_type(named.args[index], generic_owner, type_args));
+            index = index + 1;
+        }
+        qid.TypeId named_id = self.state.query.types.named_type_with_args(named.def_id, args, type_info.span);
+        return self.type_with_original_mutability(type_info, named_id);
+    }
+
+    qid.TypeId substitute_function_type(
+        types.TypeInfo type_info,
+        types.FunctionType function_type,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId> type_args
+    ) {
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(function_type.params.length);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            params.add(self.substitute_generic_type(function_type.params[index], generic_owner, type_args));
+            index = index + 1;
+        }
+        qid.TypeId result = self.substitute_generic_type(function_type.result, generic_owner, type_args);
+        qid.TypeId function_id = self.state.query.types.function_type(params, result, type_info.span);
+        return self.type_with_original_mutability(type_info, function_id);
+    }
+
+    qid.TypeId type_with_original_mutability(types.TypeInfo original, qid.TypeId substituted) {
+        if (original.is_mutable) {
+            return self.state.query.types.mutable_type(substituted, original.span);
+        }
+        return substituted;
+    }
+
+    Int? generic_param_index(qid.DefId generic_owner, qid.DefId generic_param) {
+        guard self.state.hirs.def(generic_owner) is some hir_def else { return null; }
+        Int! param_index = 0;
+        Int! member_index = 0;
+        while (member_index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(member_index);
+            if (self.state.query.defs.get(member_def).kind == .generic_param_def) {
+                if (member_def == generic_param) {
+                    return param_index;
+                }
+                param_index = param_index + 1;
+            }
+            member_index = member_index + 1;
+        }
+        return null;
     }
 
     public () check_type_arg_arity(hir.HirId type_ref, qid.DefId def_id, Int actual) {
@@ -220,25 +370,50 @@ public struct TypeOps {
         if (self.state.query.types.builtin_type_for_def(def_id) is some type_id) {
             return type_id;
         }
-        if (self.def_states.has(def_id)) {
-            Int state = self.def_states.get(def_id)$.some();
-            if (state == 1) {
-                self.add_def_error(def_id, "cyclic type definition", "cyclic_type_definition");
-                self.bind_def_type(def_id, self.state.query.types.invalid_type());
-                self.def_states.set(def_id, 2);
-                return self.state.query.types.invalid_type();
-            }
+        TypeQueryKey key = self.type_query_key_for_def(def_id);
+        if (!self.begin_type_query(key, def_id)) {
             if (self.state.results.def_type(def_id) is some done_type) {
                 return done_type;
             }
             return self.state.query.types.invalid_type();
         }
 
-        self.def_states.set(def_id, 1);
         qid.TypeId type_id = self.compute_decl_type(def_id);
         self.bind_def_type(def_id, type_id);
-        self.def_states.set(def_id, 2);
+        self.finish_type_query(key);
         return type_id;
+    }
+
+    TypeQueryKey type_query_key_for_def(qid.DefId def_id) {
+        def.DefKind kind = self.state.query.defs.get(def_id).kind;
+        if (kind == .alias_def) {
+            return TypeQueryKey(.alias_target_type, def_id);
+        }
+        if (kind == .field_def) {
+            return TypeQueryKey(.field_type, def_id);
+        }
+        if (kind == .function_def) {
+            return TypeQueryKey(.function_signature, def_id);
+        }
+        return TypeQueryKey(.type_of_def, def_id);
+    }
+
+    Bool begin_type_query(TypeQueryKey key, qid.DefId def_id) {
+        if (self.query_states.has(key)) {
+            Int state = self.query_states.get(key)$.some();
+            if (state == 1) {
+                self.add_def_error(def_id, "cyclic type definition", "cyclic_type_definition");
+                self.bind_def_type(def_id, self.state.query.types.invalid_type());
+                self.query_states.set(key, 2);
+            }
+            return false;
+        }
+        self.query_states.set(key, 1);
+        return true;
+    }
+
+    () finish_type_query(TypeQueryKey key) {
+        self.query_states.set(key, 2);
     }
 
     public qid.TypeId compute_decl_type(qid.DefId def_id) {
@@ -365,6 +540,131 @@ public struct TypeOps {
         types.TypeInfo type_info = self.state.query.types.get(type_id);
         guard type_info.data is .named(named) else { return null; }
         return self.state.query.defs.get(named.def_id).owned_namespace_id;
+    }
+
+    public qid.DefId? value_member_for_type(
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        qid.SymbolId member_symbol
+    ) {
+        // 普通 nominal type 先查自己的 member namespace；generic param 没有
+        // 自己的 namespace，需要继续从 `T: Trait` / `@where(T: Trait)`
+        // 这样的 bound 里查 trait member。
+        if (self.direct_member_for_type(type_id, member_symbol) is some member_def) {
+            return member_def;
+        }
+        return self.bound_member_for_type(type_id, use_owner, member_symbol);
+    }
+
+    public Bool type_may_have_members(qid.TypeId type_id) {
+        if (self.is_invalid_type(type_id)) {
+            return true;
+        }
+        if (self.member_namespace_for_type(type_id) != null) {
+            return true;
+        }
+        types.TypeInfo type_info = self.state.query.types.get(type_id);
+        guard type_info.data is .named(named) else { return false; }
+        return self.state.query.defs.get(named.def_id).kind == .generic_param_def;
+    }
+
+    qid.DefId? direct_member_for_type(qid.TypeId type_id, qid.SymbolId member_symbol) {
+        guard self.member_namespace_for_type(type_id) is some namespace_id else { return null; }
+        return self.value_member_in_namespace(namespace_id, member_symbol);
+    }
+
+    qid.DefId? bound_member_for_type(
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        qid.SymbolId member_symbol
+    ) {
+        types.TypeInfo type_info = self.state.query.types.get(type_id);
+        guard type_info.data is .named(named) else { return null; }
+        if (self.state.query.defs.get(named.def_id).kind != .generic_param_def) {
+            return null;
+        }
+        return self.bound_member_for_generic_param(named.def_id, use_owner, member_symbol);
+    }
+
+    qid.DefId? bound_member_for_generic_param(
+        qid.DefId generic_def,
+        qid.DefId use_owner,
+        qid.SymbolId member_symbol
+    ) {
+        if (self.trait_ref_member_for_owner(generic_def, member_symbol) is some direct_bound) {
+            return direct_bound;
+        }
+        qid.DefId?! current = use_owner;
+        while (current is some owner_def) {
+            if (self.where_bound_member_for_owner(generic_def, owner_def, member_symbol) is some member_def) {
+                return member_def;
+            }
+            current = self.state.query.defs.get(owner_def).owner_def;
+        }
+        return null;
+    }
+
+    qid.DefId? where_bound_member_for_owner(
+        qid.DefId generic_def,
+        qid.DefId owner_def,
+        qid.SymbolId member_symbol
+    ) {
+        guard self.state.hirs.def(owner_def) is some hir_def else { return null; }
+        Int! index = 0;
+        while (index < hir_def.where_predicates.len()) {
+            hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
+            index = index + 1;
+            guard predicate is .type_bound(bound) else { continue; }
+            if (!self.type_ref_names_def(bound.subject, generic_def)) {
+                continue;
+            }
+            if (self.trait_member_from_ref(bound.bound, member_symbol) is some member_def) {
+                return member_def;
+            }
+        }
+        return null;
+    }
+
+    qid.DefId? trait_ref_member_for_owner(qid.DefId owner_def, qid.SymbolId member_symbol) {
+        guard self.state.hirs.def(owner_def) is some hir_def else { return null; }
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            if (self.trait_member_from_ref(hir_def.trait_refs.get(index), member_symbol) is some member_def) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.DefId? trait_member_from_ref(hir.HirId trait_ref, qid.SymbolId member_symbol) {
+        hir.HirNode node = self.state.hirs.node(trait_ref);
+        guard node.data is .named_type_ref(named) else { return null; }
+        if (self.state.query.defs.get(named.def_id).kind != .trait_def) {
+            return null;
+        }
+        guard self.state.query.defs.get(named.def_id).owned_namespace_id is some namespace_id else {
+            return null;
+        }
+        return self.value_member_in_namespace(namespace_id, member_symbol);
+    }
+
+    qid.DefId? value_member_in_namespace(qid.NamespaceId namespace_id, qid.SymbolId member_symbol) {
+        if (self.state.query.resolve.namespaces.first_binding(namespace_id, member_symbol, .member_name)
+            is some member_binding) {
+            return member_binding.def_id;
+        }
+        guard self.state.query.resolve.namespaces.first_binding(namespace_id, member_symbol, .value_name)
+            is some value_binding else {
+            return null;
+        }
+        return value_binding.def_id;
+    }
+
+    Bool type_ref_names_def(hir.HirId type_ref, qid.DefId def_id) {
+        hir.HirNode node = self.state.hirs.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return false; }
+        return named.def_id == def_id;
     }
 
     public () expect_bool(hir.HirId node_id, qid.TypeId type_id) {
