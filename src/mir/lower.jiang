@@ -1,11 +1,13 @@
 // Facade for HIR to MIR lowering.
 
 import context = "../context.jiang";
+import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
 import hir_store = "../hir/store.jiang";
 import qid = "../query/id.jiang";
 import module_graph = "../resolve/module_graph.jiang";
 import store = "../resolve/store.jiang";
+import monomorph = "../sema/monomorph.jiang";
 import sema_result = "../sema/result.jiang";
 import list = "../support/list.jiang";
 import token = "../syntax/token.jiang";
@@ -15,22 +17,43 @@ public mir.MirStore^ lower_package(
     context.CompilerContext& ctx,
     hir_store.HirStore& hir_store,
     sema_result.TypeCheckResults& typeck,
+    monomorph.InstancePlan& instances,
     module_graph.ModuleGraph& graph
 ) {
     mir.MirStore^ output = new mir.MirStore(hir_store.ok && typeck.ok);
     if (hir_store.has_errors() || typeck.has_errors()) {
         return output;
     }
+    // collect 阶段只标记递归实例化，真正的 diagnostic 在 lowering 入口
+    // 统一发出，避免 monomorph 依赖 CompilerContext/diagnostic 模块。
+    if (instances.recursive_expansion) {
+        add_recursive_instance_diagnostic(ctx);
+        output.mark_error();
+        return output;
+    }
 
-    MirLowerer! lowerer = MirLowerer(ctx, hir_store, typeck, graph, output);
+    MirLowerer! lowerer = MirLowerer(ctx, hir_store, typeck, instances, graph, output);
     lowerer.lower_package();
     return output;
+}
+
+() add_recursive_instance_diagnostic(context.CompilerContext& ctx) {
+    ctx.diagnostics.add(
+        diagnostic.Diagnostic(
+            .error,
+            .lowering,
+            diagnostic.DiagnosticCode("recursive_generic_instantiation"),
+            diagnostic.SourceRange(),
+            "recursive generic instantiation"
+        )
+    );
 }
 
 struct MirLowerer {
     context.CompilerContext& ctx;
     hir_store.HirStore& hirs;
     sema_result.TypeCheckResults& typeck;
+    monomorph.InstancePlan& instances;
     module_graph.ModuleGraph& graph;
     mir.MirStore^ output;
 
@@ -38,12 +61,14 @@ struct MirLowerer {
         context.CompilerContext& ctx,
         hir_store.HirStore& hirs,
         sema_result.TypeCheckResults& typeck,
+        monomorph.InstancePlan& instances,
         module_graph.ModuleGraph& graph,
         mir.MirStore^ output
     ) {
         self.ctx = ctx;
         self.hirs = hirs;
         self.typeck = typeck;
+        self.instances = instances;
         self.graph = graph;
         self.output = output;
     }
@@ -51,13 +76,15 @@ struct MirLowerer {
     public () lower_package() {
         // MIR 调度从 module graph + HIR ownership tree 派生：graph 给出本次
         // 编译的 root/import closure，module HirDef.members 给出当前
-        // module 的顶层声明集合。HirStore 不维护 package 级全量 def 顺序表。
+        // module 的顶层声明集合。泛型模板本身不生成 MIR；后面按
+        // InstancePlan 为每个 concrete type args 生成独立函数体。
         Int! module_index = 0;
         while (module_index < self.graph.modules.len()) {
             store.ModuleRecord module = self.ctx.query.resolve.modules.get(self.graph.modules.get(module_index));
             self.lower_def_tree(module.def_id);
             module_index = module_index + 1;
         }
+        self.lower_instances();
     }
 
     () lower_def_tree(qid.DefId def_id) {
@@ -65,7 +92,7 @@ struct MirLowerer {
             return;
         }
         if (hir_def.decl.kind == .function_decl) {
-            if (hir_def.body != null) {
+            if (hir_def.body != null && self.generic_param_count(hir_def) == 0) {
                 self.lower_function(hir_def);
             }
         }
@@ -77,25 +104,87 @@ struct MirLowerer {
     }
 
     () lower_function(hir.HirDef hir_def) {
+        self.lower_function_with_substitution(hir_def, monomorph.SubstitutionMap(), self.output.empty_type_args());
+    }
+
+    // 第二阶段 lower concrete generic instances。它们不会出现在 HIR ownership
+    // tree 里，只存在于 InstancePlan 中。
+    () lower_instances() {
+        Int! index = 0;
+        while (index < self.instances.len()) {
+            self.lower_instance(self.instances.get(index));
+            index = index + 1;
+        }
+    }
+
+    () lower_instance(monomorph.InstanceKey instance) {
+        if (monomorph.instance_kind(self.ctx.query$.ref(), instance) != .function_body) {
+            return;
+        }
+        guard self.hirs.def(instance.def_id) is some hir_def else {
+            return;
+        }
+        if (hir_def.body == null) {
+            return;
+        }
+        // instance.type_args 先绑定到泛型参数 DefId，body lowering 后续所有
+        // 类型读取都通过 substitutions 转成 concrete TypeId。
+        monomorph.SubstitutionMap substitutions = monomorph.build_substitution(
+            self.ctx.query$.ref(),
+            hir_def,
+            instance
+        );
+        self.lower_function_with_substitution(hir_def, substitutions, instance.type_args);
+    }
+
+    () lower_function_with_substitution(
+        hir.HirDef hir_def,
+        monomorph.SubstitutionMap substitutions,
+        qid.TypeId[] type_args
+    ) {
         Int function_index = self.output.functions.len();
         // HIR 不再直接携带 span；诊断位置后续通过 SourceMap 查询。
         token.Span span = self.def_span(hir_def.def_id);
-        BodyLowerer! body_lowerer = BodyLowerer(self$.ref(), mir.MirBodyId.from_index(function_index), hir_def, span);
+        BodyLowerer! body_lowerer = BodyLowerer(
+            self$.ref(),
+            mir.MirBodyId.from_index(function_index),
+            hir_def,
+            substitutions,
+            span
+        );
         mir.MirBody mir_body = body_lowerer.lower();
         self.output.add_function(mir.MirFunction {
             id: mir.MirFunctionId.from_index(function_index),
             def_id: hir_def.def_id,
+            type_args: self.output.type_arg_array(type_args),
             signature_id: null,
             span: span,
             body: mir_body
         });
     }
 
-    () add_initial_locals(hir.HirDef hir_def, list.ArrayList<mir.MirLocalDecl>& locals) {
+    Int generic_param_count(hir.HirDef hir_def) {
+        Int! count = 0;
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.ctx.query.defs.get(member_def).kind == .generic_param_def) {
+                count = count + 1;
+            }
+            index = index + 1;
+        }
+        return count;
+    }
+
+    () add_initial_locals(
+        hir.HirDef hir_def,
+        monomorph.SubstitutionMap substitutions,
+        list.ArrayList<mir.MirLocalDecl>& locals
+    ) {
         locals.add(mir.MirLocalDecl {
             id: mir.MirLocalId.from_index(0),
             kind: .return_place,
-            type_id: self.return_type(hir_def),
+            type_id: self.return_type(hir_def, substitutions),
             span: self.def_span(hir_def.def_id),
             name: null,
             def_id: null,
@@ -108,13 +197,13 @@ struct MirLowerer {
         Int! index = 0;
         while (index < body.locals.len()) {
             hir.HirLocal local = body.locals.get_index(index);
-            locals.add(self.lower_local(local, index + 1));
+            locals.add(self.lower_local(local, substitutions, index + 1));
             index = index + 1;
         }
     }
 
-    mir.MirLocalDecl lower_local(hir.HirLocal local, Int mir_index) {
-        qid.TypeId type_id = self.type_for_local(local);
+    mir.MirLocalDecl lower_local(hir.HirLocal local, monomorph.SubstitutionMap substitutions, Int mir_index) {
+        qid.TypeId type_id = self.type_for_local(local, substitutions);
         return mir.MirLocalDecl {
             id: mir.MirLocalId.from_index(mir_index),
             kind: self.local_kind(local.kind),
@@ -127,9 +216,9 @@ struct MirLowerer {
         };
     }
 
-    qid.TypeId type_for_local(hir.HirLocal local) {
+    qid.TypeId type_for_local(hir.HirLocal local, monomorph.SubstitutionMap substitutions) {
         if (self.typeck.def_type(local.def_id) is some type_id) {
-            return type_id;
+            return self.substitute_type(type_id, substitutions);
         }
         return self.ctx.query.types.invalid_type();
     }
@@ -139,13 +228,23 @@ struct MirLowerer {
         return .user_local;
     }
 
-    qid.TypeId return_type(hir.HirDef hir_def) {
+    qid.TypeId return_type(hir.HirDef hir_def, monomorph.SubstitutionMap substitutions) {
         if (self.typeck.def_type(hir_def.def_id) is some function_type_id) {
-            if (self.ctx.query.types.get(function_type_id).data is .function_type(function_type)) {
+            qid.TypeId substituted = self.substitute_type(function_type_id, substitutions);
+            if (self.ctx.query.types.get(substituted).data is .function_type(function_type)) {
                 return function_type.result;
             }
         }
         return self.ctx.query.types.unit_type();
+    }
+
+    qid.TypeId substitute_type(qid.TypeId type_id, monomorph.SubstitutionMap substitutions) {
+        if (substitutions.len() == 0) {
+            return type_id;
+        }
+        // TypeCheckResults 保存的是泛型模板视角的 TypeId；具体实例的 MIR
+        // local/const/temp 必须在这里替换成 concrete TypeId。
+        return monomorph.substitute_type(self.ctx.query$.ref(), type_id, substitutions);
     }
 
     token.Span def_span(qid.DefId def_id) {
@@ -171,6 +270,7 @@ struct BodyLowerer {
     MirLowerer& lowerer;
     mir.MirBodyId body_id;
     hir.HirDef hir_def;
+    monomorph.SubstitutionMap substitutions;
     token.Span span;
     list.ArrayList<mir.MirLocalDecl>! locals;
     list.ArrayList<mir.MirBlock>! blocks;
@@ -178,17 +278,24 @@ struct BodyLowerer {
     mir.MirBlockId! current_block;
     Bool! terminated;
 
-    public init(MirLowerer& lowerer, mir.MirBodyId body_id, hir.HirDef hir_def, token.Span span) {
+    public init(
+        MirLowerer& lowerer,
+        mir.MirBodyId body_id,
+        hir.HirDef hir_def,
+        monomorph.SubstitutionMap substitutions,
+        token.Span span
+    ) {
         self.lowerer = lowerer;
         self.body_id = body_id;
         self.hir_def = hir_def;
+        self.substitutions = substitutions;
         self.span = span;
         self.locals = list.ArrayList<mir.MirLocalDecl>();
         self.blocks = list.ArrayList<mir.MirBlock>();
         self.statements = list.ArrayList<mir.MirStatement>();
         self.current_block = mir.MirBlockId.from_index(0);
         self.terminated = false;
-        self.lowerer.add_initial_locals(hir_def, self.locals$.ref());
+        self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
     }
 
     mir.MirBody lower() {
@@ -216,7 +323,7 @@ struct BodyLowerer {
         }
         self.lower_into_place(root, self.place_for_local(self.return_local()));
         if (!self.terminated) {
-            self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: false}), self.lowerer.hir_span(root));
+            self.finish_return(false, self.lowerer.hir_span(root));
         }
     }
 
@@ -231,11 +338,11 @@ struct BodyLowerer {
         if (block.result is some result) {
             self.lower_into_place(result, self.place_for_local(self.return_local()));
             if (!self.terminated) {
-                self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: false}), self.lowerer.hir_span(result));
+                self.finish_return(false, self.lowerer.hir_span(result));
             }
             return;
         }
-        self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: true}), self.span);
+        self.finish_return(true, self.span);
     }
 
     () lower_statement_node(hir.HirId node_id) {
@@ -266,10 +373,10 @@ struct BodyLowerer {
         if (return_stmt.value is some value) {
             self.lower_into_place(value, self.place_for_local(self.return_local()));
             if (self.terminated) { return; }
-            self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: false}), self.lowerer.hir_span(node_id));
+            self.finish_return(false, self.lowerer.hir_span(node_id));
             return;
         }
-        self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: true}), self.lowerer.hir_span(node_id));
+        self.finish_return(true, self.lowerer.hir_span(node_id));
     }
 
     () lower_into_place(hir.HirId node_id, mir.MirPlace destination) {
@@ -289,7 +396,8 @@ struct BodyLowerer {
         }
         if (node.data is .name_ref(name_ref)) {
             if (name_ref is .local(local_id)) {
-                return .copy_operand(mir.MirCopyOperand {place: self.place_for_local(self.mir_local_for_hir(local_id))});
+                mir.MirPlace place = self.place_for_local(self.mir_local_for_hir(local_id));
+                return .copy_operand(mir.MirCopyOperand {place: place});
             }
             if (name_ref is .def_ref(def_id)) {
                 if (self.lowerer.ctx.query.defs.get(def_id).kind == .function_def) {
@@ -304,8 +412,14 @@ struct BodyLowerer {
         return self.unsupported_operand(node_id);
     }
 
+    () finish_return(Bool implicit_unit, token.Span span) {
+        self.finish_block(.return_term(mir.MirReturnTerminator {implicit_unit: implicit_unit}), span);
+    }
+
     mir.MirConst lower_const(hir.HirId node_id, hir.HirLiteral literal) {
         token.Span span = self.lowerer.hir_span(node_id);
+        // literal 的目标类型也可能是泛型参数，例如 T id<T>(T value)
+        // 内部的返回值；type_for_node 会自动套用当前 instance substitution。
         qid.TypeId type_id = self.type_for_node(node_id);
         if (literal.value is .int_value(int_value)) {
             return mir.MirConst {
@@ -435,7 +549,7 @@ struct BodyLowerer {
 
     qid.TypeId type_for_node(hir.HirId node_id) {
         if (self.lowerer.typeck.node_type(node_id) is some type_id) {
-            return type_id;
+            return self.lowerer.substitute_type(type_id, self.substitutions);
         }
         return self.lowerer.ctx.query.types.invalid_type();
     }

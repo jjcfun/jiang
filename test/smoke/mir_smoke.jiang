@@ -4,9 +4,11 @@ import mir = "../../src/mir/mir.jiang";
 import mir_lower = "../../src/mir/lower.jiang";
 import module_graph = "../../src/resolve/module_graph.jiang";
 import resolve = "../../src/resolve/module_resolver.jiang";
+import rdef = "../../src/resolve/def.jiang";
 import store = "../../src/resolve/store.jiang";
 import qid = "../../src/query/id.jiang";
 import ast_store = "../../src/query/ast_store.jiang";
+import monomorph = "../../src/sema/monomorph.jiang";
 import type_check = "../../src/sema/type_check/api.jiang";
 import source = "../../src/source/source.jiang";
 import syntax = "../../src/syntax/api.jiang";
@@ -15,6 +17,7 @@ Int main() {
     check_function_skeletons_follow_hir_ownership_tree();
     check_function_locals_include_params_and_user_locals();
     check_call_lowers_to_call_terminator();
+    check_generic_function_lowers_as_concrete_instance();
     check_lower_rejects_errored_hir_store();
     return 0;
 }
@@ -27,12 +30,7 @@ Int main() {
         "Int first(Int x) { x } Int second(Int y) { y }"
     );
 
-    mir.MirStore^ lowered = mir_lower.lower_package(
-        ctx$.ref(),
-        ctx.query.hirs$.ref(),
-        ctx.query.typeck$.ref(),
-        graph$.ref()
-    );
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
     assert(!lowered.has_errors());
     assert(lowered.functions.len() == 2);
 
@@ -52,19 +50,16 @@ Int main() {
         "Int main(Int p) { Int! x = p; x }"
     );
 
-    mir.MirStore^ lowered = mir_lower.lower_package(
-        ctx$.ref(),
-        ctx.query.hirs$.ref(),
-        ctx.query.typeck$.ref(),
-        graph$.ref()
-    );
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
     assert(!lowered.has_errors());
     mir.MirFunction function = lowered.function(mir.MirFunctionId.from_index(0));
     assert(function.body.locals.length == 3);
     assert(function.body.locals[0].kind == .return_place);
     assert(function.body.locals[1].kind == .param);
     assert(function.body.locals[2].kind == .user_local);
-    assert(function.body.locals[1].type_id.to_index() == ctx.query.types.int_type().to_index());
+    qid.TypeId param_type = function.body.locals[1].type_id;
+    qid.TypeId int_type = ctx.query.types.int_type();
+    assert(param_type.to_index() == int_type.to_index());
     assert(function.body.locals[2].mutable_local);
     assert(function.body.blocks.length == 1);
     assert(function.body.blocks[0].statements.length == 2);
@@ -80,12 +75,7 @@ Int main() {
         "Int callee() { 1 } Int main() { callee() }"
     );
 
-    mir.MirStore^ lowered = mir_lower.lower_package(
-        ctx$.ref(),
-        ctx.query.hirs$.ref(),
-        ctx.query.typeck$.ref(),
-        graph$.ref()
-    );
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
     assert(!lowered.has_errors());
     assert(lowered.functions.len() == 2);
 
@@ -108,17 +98,44 @@ Int main() {
     assert(!return_term.implicit_unit);
 }
 
+() check_generic_function_lowers_as_concrete_instance() {
+    context.CompilerContext! ctx = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_hir(
+        ctx$.ref(),
+        "mir_lower_generic_instance",
+        "T id<T>(T value) { value } Int main() { id<Int>(1) }"
+    );
+
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    assert(lowered.functions.len() == 2);
+
+    qid.DefId id_def = find_named_function_def(ctx$.ref(), graph.root_module, "id");
+    qid.TypeId![*] int_args = ctx.query.hirs.storage.alloc_array<qid.TypeId>(1);
+    int_args[0] = ctx.query.types.int_type();
+    guard lowered.function_id_for_instance(id_def, int_args[0..1]) is some id_instance else {
+        assert(false);
+        return;
+    }
+
+    mir.MirFunction function = lowered.function(id_instance);
+    assert(function.def_id.to_index() == id_def.to_index());
+    assert(function.type_args.length == 1);
+    qid.TypeId instance_arg = function.type_args[0];
+    qid.TypeId return_type = function.body.locals[0].type_id;
+    qid.TypeId value_type = function.body.locals[1].type_id;
+    qid.TypeId int_type = ctx.query.types.int_type();
+    assert(instance_arg.to_index() == int_type.to_index());
+    assert(return_type.to_index() == int_type.to_index());
+    assert(value_type.to_index() == int_type.to_index());
+}
+
 () check_lower_rejects_errored_hir_store() {
     context.CompilerContext! ctx = context.CompilerContext();
     module_graph.ModuleGraph^ graph = lower_text_to_hir(ctx$.ref(), "mir_lower_error", "Int main() { 0 }");
     ctx.query.hirs.mark_error();
 
-    mir.MirStore^ lowered = mir_lower.lower_package(
-        ctx$.ref(),
-        ctx.query.hirs$.ref(),
-        ctx.query.typeck$.ref(),
-        graph$.ref()
-    );
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
     assert(lowered.has_errors());
     assert(lowered.functions.len() == 0);
 }
@@ -136,6 +153,22 @@ module_graph.ModuleGraph^ lower_text_to_hir(context.CompilerContext& ctx, UInt8[
     assert(resolver.lower_module_graph_to_hir(graph$.ref()));
     assert(type_check.check_hir_package(ctx, graph$.ref()));
     return graph;
+}
+
+mir.MirStore^ lower_mir(context.CompilerContext& ctx, module_graph.ModuleGraph& graph) {
+    monomorph.InstancePlan^ instances = monomorph.collect_reachable_instances(
+        ctx.query$.ref(),
+        ctx.query.hirs$.ref(),
+        ctx.query.typeck$.ref(),
+        graph
+    );
+    return mir_lower.lower_package(
+        ctx,
+        ctx.query.hirs$.ref(),
+        ctx.query.typeck$.ref(),
+        instances$.ref(),
+        graph
+    );
 }
 
 () assert_function_matches_module_def(
@@ -194,5 +227,23 @@ module_graph.ModuleGraph^ lower_text_to_hir(context.CompilerContext& ctx, UInt8[
 () assert_return_local_uses_type_check_result(mir.MirFunction function) {
     assert(function.body.locals.length >= 1);
     assert(function.body.locals[0].kind == .return_place);
-    assert(function.body.locals[0].type_id.to_index() >= 0);
+    qid.TypeId return_type = function.body.locals[0].type_id;
+    assert(return_type.to_index() >= 0);
+}
+
+qid.DefId find_named_function_def(context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[] name) {
+    store.ModuleRecord module = ctx.query.resolve.modules.get(module_id);
+    hir.HirDef module_hir = ctx.query.hirs.def(module.def_id)$.some();
+    qid.SymbolId symbol = ctx.query.symbols.intern(name);
+    Int! index = 0;
+    while (index < module_hir.members.len()) {
+        qid.DefId def_id = module_hir.members.get(index);
+        rdef.DefRecord def_record = ctx.query.defs.get(def_id);
+        if (def_record.kind == .function_def && def_record.name.symbol == symbol) {
+            return def_id;
+        }
+        index = index + 1;
+    }
+    assert(false);
+    return module.def_id;
 }
