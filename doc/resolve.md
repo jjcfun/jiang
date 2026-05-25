@@ -1,0 +1,122 @@
+# Resolve 设计
+
+resolve 是 package root 入口之后的名字解析阶段。它负责 module graph、import 解析、
+namespace 建立、declaration collection 和 reference resolution。当前 resolve 直接把
+resolved AST lower 成 HIR，不再产生 `ResolvedFile` 这种中间文件结果。
+
+## 入口
+
+`resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 先创建本次 package 编译的
+临时 `AstStore`，root/import closure 的 AST 都放在这张表里。外部创建
+`ModuleResolver(ctx, asts)`，先构建 root import closure 的 `ModuleGraph`，再把 graph
+内可达 module 直接 lower 到 HIR：
+
+```jiang
+AstStore! asts = AstStore()
+SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
+asts.set_file(root.file, source_revision)
+ModuleResolver! resolver = ModuleResolver(ctx, asts$.ref())
+ModuleGraph^ graph = resolver.build_module_graph(root_file)
+resolver.lower_module_graph_to_hir(graph$.ref())
+```
+
+`pipeline.compile_package_path(ctx, input_path)` 是当前 source/syntax/resolve 的路径入口：
+如果 `input_path` 可直接读取为文件，就按单文件 root 编译；否则按 package 目录处理，
+读取 `input_path/package.ini`，再编译 manifest 指定的 root source。
+
+## Module Graph
+
+module graph 只描述 root 可达 module 的 import closure。它不替代 namespace，也不保存
+declaration/reference 的解析结果。
+
+```text
+build_module_graph(root_file)
+  -> root AstFile already lives in this compile_package AstStore
+  -> ensure_module(root_file.source_id)
+  -> collect root module imports
+  -> resolve import targets, parse/load target AstFile into the same AstStore when needed
+  -> add ModuleGraph import edges
+  -> recursively discover reachable module imports
+```
+
+`ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
+
+- 如果 `source_modules` 中没有这个 `SourceId`，先根据 source 文件路径向上查找
+  `package.ini`。找到 manifest 时创建或复用对应 package owner；找不到 manifest 或
+  source 是 virtual/buffer 时，复用默认 root package。
+- `PackageId` 表示 package owner，`ModuleId` 表示单个 source file module，`SourceId`
+  表示输入源文件或虚拟文本。
+- 一个 package 可以拥有多个 module，一个 source 当前对应一个 module。
+- 如果已有 module 且 `source_revision` 未变化，直接复用原 `ModuleId`。
+- 如果 source revision 变化，保持 `ModuleId` 不变，调用 `reset_module` 清空该 module
+  的 imports，并创建新的 module namespace。
+
+旧 namespace 和旧 def 暂时留在全局表中；后续如需长期增量会再引入 GC 或版本化策略。
+
+## Resolve State
+
+`ModuleRecord.resolve_state` 记录 module 级 pass 进度：
+
+- `unresolved`：module shell 已存在，但 import/declaration 还未收集。
+- `collecting_imports` / `imports_collected`：正在或已经完成 import 收集。
+- `collecting_declarations` / `declarations_collected`：正在或已经完成 top-level declaration 收集。
+
+这些状态用于避免重复收集同一个 module，也用于 import cycle。如果 A 和 B 互相 import，
+A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归，等 A 当前 pass 自己完成。
+
+## Name Resolver
+
+`NameResolver` 是单个 AST file/module 的 resolver。它不负责创建 module，也不负责跨文件
+加载；初始化时只拿当前 `FileResolveState`：
+
+```text
+NameResolver {
+  FileResolveState
+  lexical env for ReferenceResolver
+}
+```
+
+当前 `NameResolver` 的 pass：
+
+- `collect_imports`：扫描 top-level import，向 `ModuleRecord.imports` 写入 `ImportRecord`。
+- `collect_declarations`：扫描 top-level declaration，创建 `DefId`，绑定到当前 module
+  namespace，并按 visibility 记录到 namespace/export facts。
+- `resolve_references`：遍历当前 file 的 declaration body，校验基础 type reference、
+  expression name、local binding 和 import alias path。
+
+reference resolution 完成后，HIR lowering 使用同一套 namespace/local lookup 直接写入
+resolved HIR。
+
+## Import Target
+
+`resolve_import_targets` 在 imports 收集后运行：
+
+- 对普通 `import dep`，优先在当前 package 的 `[dependencies]` 中查找 `dep`。
+- 命中 dependency 时读取依赖 package 的 manifest root 文件。
+- 未命中 dependency 时，再按已登记 virtual/module 名称查 `SourceStore`。
+- 找到 source 后调用 `ensure_module(source_id)`。
+- 如果目标 source 的 `AstFile` 已经登记到本轮 `AstStore`，会递归推进目标 module pass。
+- 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module
+  namespace。
+- 对 string/file import，当前取字符串字面量的 symbol 文本，
+  按当前源文件目录解析显式文件路径。
+
+## HIR Lowering
+
+resolve 的最终输出是 HIR facts：
+
+```text
+lower_module_graph_to_hir(graph)
+  -> collect declarations for all graph modules
+  -> NameResolver.resolve_references()
+  -> lower resolved AST nodes directly into QuerySystem.hirs
+```
+
+resolve 不输出 `ResolvedFile`，也不把 AST 持久化到 query。HIR lowering 只在 resolve 阶段
+使用 AST 和 resolve state。
+
+## 待完成
+
+- package manifest 诊断还比较粗，只记录错误文本，没有 `package.ini` 的精确行列 span。
+- reset 后旧 namespace/def 的回收或版本化。
+- 长期增量需要 stable def key、source revision diff 和 query invalidation。

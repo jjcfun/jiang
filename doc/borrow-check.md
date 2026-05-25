@@ -1,0 +1,117 @@
+# Borrow Check 设计
+
+borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCheckResults` 类型事实和
+`LayoutStore` 中的 concrete layout，不重新推导类型，不重新计算布局。
+
+Jiang 的目标不是完整复制 Rust 的 aliasing 模型。第一版 borrow check 先固定所有权、
+move/use-after-move、引用逃逸和析构安全边界；共享/独占可变借用、数据竞争和 effect system
+后续再单独设计。
+
+## 输入
+
+- MIR locals、places、moves、borrows、assignments 和 CFG。
+- `TypeCheckResults` 中的 expression/local/member 类型事实。
+- `LayoutStore` 中的 copy/drop/layout 相关 concrete type 信息。
+- source map，用于把诊断定位回源码。
+
+## 职责
+
+- 检查 move 后使用。
+- 检查 owner 被 move/drop/free 后，依赖它的引用不能继续使用。
+- 检查局部引用不能逃出来源 owner 的有效范围。
+- 检查引用存入字段、返回值、闭包捕获等逃逸位置时满足 lifetime 约束。
+- 检查需要析构的值在所有 CFG 路径上至多析构一次。
+- 为 drop 插入和后续 backend 提供约束结果。
+
+mutability 的基本 assignment 检查已经在 type check 阶段完成；borrow check 只处理需要 CFG
+和 lifetime 信息的约束。
+
+## 数据结构
+
+第一版需要三类核心表：
+
+```text
+MovePath
+  place: MirPlace
+  parent: MovePathId?
+  children: MovePathId[]
+
+Loan
+  borrowed_place: MovePathId
+  borrow_kind: shared | mutable | raw
+  issued_at: MirLocation
+  expires_at: RegionId?
+
+BorrowCheckResults
+  move_state per block
+  active loans per block
+  diagnostics
+```
+
+`MovePath` 按 MIR place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
+里的不同节点。移动父 path 会使子 path 不可用；重新赋值父 path 会重新初始化整棵子树。
+
+`Loan` 表示某个 MIR location 产生的引用或指针视图。第一版只需要足够表达防悬垂：
+loan 的来源 place 必须活到所有使用点之后。
+
+## 分析流程
+
+```text
+build move paths from MIR places
+  -> compute copy/drop category from TypeCheckResults + LayoutStore
+  -> forward dataflow: maybe-uninitialized / maybe-moved
+  -> forward dataflow: active loans
+  -> validate returns, stores, calls and drops
+  -> emit BorrowCheckResults
+```
+
+MIR basic block 是 borrow check 的 CFG 单元。每条 statement/terminator 内部的位置用
+`MirLocation { block, statement_or_terminator_index }` 表达。
+
+## Layout 的作用
+
+layout 不决定 borrow 语义，但它会影响以下分类：
+
+- 类型是否零大小。
+- 类型是否含 owning pointer 或需要 drop。
+- 类型是否允许 implicit copy。
+- packed/alignment 规则是否限制对字段取引用。
+
+borrow check 通过 `LayoutStore` 查询这些事实；不能从 MIR 自己推导 field offset 或 ABI layout。
+
+## Drop 插入
+
+drop elaboration 应在 borrow check 之后或与 borrow check 紧密串联：
+
+- borrow check 先证明 drop 点合法。
+- drop elaboration 根据 MIR CFG 和 drop category 插入 `drop` terminator/statement。
+- backend 只消费插入后的 MIR，不再推导析构路径。
+
+第一版可以先只产出检查结果，不急着实际改写 MIR。
+
+## 诊断
+
+诊断必须通过 source map 回到 HIR/source 位置：
+
+- move 发生的位置。
+- use-after-move 的使用位置。
+- 引用来源 owner 的定义/最后有效位置。
+- 引用逃逸的位置。
+
+MIR 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap` 查询。
+
+## 边界
+
+- borrow check 不回读 AST。
+- borrow check 不重新做 name resolution。
+- borrow check 不重新 type check。
+- borrow check 不自己计算 field offset 或 ABI layout。
+- borrow check 的诊断通过 HIR/source map 定位，不要求 MIR 保存 AST id。
+
+## 待设计
+
+- `T&`、`T&!`、`T[]` 和 raw pointer 的精确 lifetime 规则。
+- copy/drop trait 或 builtin copy 规则。
+- packed/alignment 对 borrow 的限制。
+- 与 `@life(...)` annotation 的集成。
+- 闭包捕获和 async/generator 状态机的借用规则。

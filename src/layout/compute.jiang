@@ -1,0 +1,350 @@
+// Concrete type layout 计算入口。
+//
+// compute 层依赖 QuerySystem；`layout.jiang` 只定义数据结构，避免 query
+// 和 layout model 之间形成 import cycle。
+
+import layout = "./layout.jiang";
+import context = "../context.jiang";
+import diagnostic = "../diagnostic/diagnostic.jiang";
+import def = "../resolve/def.jiang";
+import monomorph = "../sema/monomorph.jiang";
+import query_api = "../query/api.jiang";
+import qid = "../query/id.jiang";
+import list = "../support/list.jiang";
+import table = "../support/table.jiang";
+import types = "../sema/type.jiang";
+
+public layout.LayoutId layout_of_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+    LayoutComputer! computer = LayoutComputer(ctx);
+    return computer.layout_of_type(type_id);
+}
+
+struct LayoutComputer {
+    context.CompilerContext& ctx;
+    query_api.QuerySystem& query;
+    // value: 1 = visiting, 2 = done。layout cycle 独立于 type query
+    // cycle，因为 by-value object layout 有自己的递归规则。
+    table.HashTable<layout.LayoutKey, Int>! states;
+
+    public init(context.CompilerContext& ctx) {
+        self.ctx = ctx;
+        self.query = ctx.query$.ref();
+        self.states = table.HashTable<layout.LayoutKey, Int>();
+    }
+
+    public layout.LayoutId layout_of_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.query.types.get(type_id);
+        layout.LayoutKey key = self.key_for_type(type_id);
+        if (self.query.layouts.layout_id(key) is some existing) {
+            return existing;
+        }
+        if (self.states.get(key) is some state) {
+            if (state == 1) {
+                return self.add_cycle_layout(key);
+            }
+        }
+
+        self.states.set(key, 1);
+        layout.LayoutId id = self.compute_layout(info, key);
+        self.states.set(key, 2);
+        return id;
+    }
+
+    layout.LayoutId compute_layout(types.TypeInfo info, layout.LayoutKey key) {
+        if (info.data is .invalid) {
+            return self.add_builtin(key, .invalid, 0, 1);
+        }
+        if (info.data is .never) {
+            return self.add_builtin(key, .never, 0, 1);
+        }
+        if (info.data is .unit) {
+            return self.add_builtin(key, .unit, 0, 1);
+        }
+        if (info.data is .bool_type) {
+            return self.add_builtin(key, .bool_type, 1, 1);
+        }
+        if (info.data is .char_type) {
+            return self.add_builtin(key, .char_type, 4, 4);
+        }
+        if (info.data is .int_type(int_type)) {
+            Int size = self.integer_size(int_type);
+            return self.add_builtin(key, .int_type, size, self.scalar_align(size, self.query.layouts.target.int_align));
+        }
+        if (info.data is .float_type(float_type)) {
+            Int size = self.bits_to_bytes(float_type.bits);
+            Int align = self.scalar_align(size, self.query.layouts.target.float_align);
+            return self.add_builtin(key, .float_type, size, align);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.layout_tuple(key, tuple_type);
+        }
+        if (info.data is .function_type) {
+            return self.add_function_pointer(key);
+        }
+        if (info.data is .named(named)) {
+            return self.layout_nominal(key, named);
+        }
+        return self.add_invalid(key);
+    }
+
+    layout.LayoutId add_builtin(layout.LayoutKey key, layout.BuiltinLayoutKind kind, Int size, Int align) {
+        layout.TypeLayoutKind! layout_kind = .scalar;
+        if (kind == .invalid) {
+            layout_kind = .invalid;
+        }
+        if (kind == .never || kind == .unit) {
+            layout_kind = .zero_sized;
+        }
+        return self.query.layouts.add_layout(
+            key,
+            layout_kind,
+            size,
+            align,
+            self.align_to(size, align),
+            self.query.layouts.empty_fields()
+        );
+    }
+
+    layout.LayoutId add_function_pointer(layout.LayoutKey key) {
+        return self.query.layouts.add_layout(
+            key,
+            .function_pointer,
+            self.query.layouts.target.pointer_size,
+            self.query.layouts.target.pointer_align,
+            self.query.layouts.target.pointer_size,
+            self.query.layouts.empty_fields()
+        );
+    }
+
+    layout.LayoutId add_invalid(layout.LayoutKey key) {
+        self.query.layouts.mark_error();
+        return self.query.layouts.add_layout(
+            key,
+            .invalid,
+            0,
+            1,
+            0,
+            self.query.layouts.empty_fields()
+        );
+    }
+
+    layout.LayoutId add_cycle_layout(layout.LayoutKey key) {
+        self.query.layouts.mark_error();
+        self.add_cycle_diagnostic(key);
+        return self.query.layouts.add_layout(
+            key,
+            .invalid,
+            0,
+            1,
+            0,
+            self.query.layouts.empty_fields()
+        );
+    }
+
+    () add_cycle_diagnostic(layout.LayoutKey key) {
+        diagnostic.SourceRange! range = diagnostic.SourceRange();
+        if (key.data is .nominal_type(nominal)) {
+            if (self.query.source_map.def_span(nominal.def_id) is some loc) {
+                if (loc.source_id is some source_id) {
+                    range = diagnostic.SourceRange(source_id, loc.span);
+                }
+            }
+        }
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .layout,
+                diagnostic.DiagnosticCode("layout_cycle"),
+                range,
+                "by-value type layout cycle"
+            )
+        );
+    }
+
+    layout.LayoutId layout_tuple(layout.LayoutKey key, types.TupleType tuple_type) {
+        list.ArrayList<layout.FieldLayout>! fields = list.ArrayList<layout.FieldLayout>(tuple_type.items.length);
+        Int! offset = 0;
+        Int! max_align = 1;
+        Int! index = 0;
+        while (index < tuple_type.items.length) {
+            qid.TypeId field_type = tuple_type.items[index];
+            layout.TypeLayout field_layout = self.query.layouts.layout(self.layout_of_type(field_type));
+            offset = self.align_to(offset, field_layout.align);
+            fields.add(layout.FieldLayout(null, field_type, offset));
+            offset = offset + field_layout.size;
+            max_align = self.max_int(max_align, field_layout.align);
+            index = index + 1;
+        }
+
+        Int size = self.align_to(offset, max_align);
+        return self.query.layouts.add_layout(
+            key,
+            .aggregate,
+            size,
+            max_align,
+            self.align_to(size, max_align),
+            self.query.layouts.field_array(fields$.ref())
+        );
+    }
+
+    layout.LayoutId layout_nominal(layout.LayoutKey key, types.NamedType named) {
+        def.DefKind kind = self.query.defs.get(named.def_id).kind;
+        if (kind == .struct_def || kind == .record_def) {
+            return self.layout_nominal_fields(key, named);
+        }
+        return self.add_invalid(key);
+    }
+
+    layout.LayoutId layout_nominal_fields(layout.LayoutKey key, types.NamedType named) {
+        guard self.query.hirs.def(named.def_id) is some hir_def else {
+            return self.add_invalid(key);
+        }
+        monomorph.InstanceKey instance = monomorph.InstanceKey(named.def_id, named.args);
+        list.ArrayList<layout.FieldLayout>! fields = list.ArrayList<layout.FieldLayout>(hir_def.members.len());
+        Int! offset = 0;
+        Int! max_align = 1;
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.query.defs.get(member_def).kind == .field_def) {
+                qid.TypeId field_type = self.concrete_field_type(instance, member_def);
+                layout.TypeLayout field_layout = self.query.layouts.layout(self.layout_of_type(field_type));
+                offset = self.align_to(offset, field_layout.align);
+                fields.add(layout.FieldLayout(member_def, field_type, offset));
+                offset = offset + field_layout.size;
+                max_align = self.max_int(max_align, field_layout.align);
+            }
+            index = index + 1;
+        }
+
+        Int size = self.align_to(offset, max_align);
+        return self.query.layouts.add_layout(
+            key,
+            .aggregate,
+            size,
+            max_align,
+            self.align_to(size, max_align),
+            self.query.layouts.field_array(fields$.ref())
+        );
+    }
+
+    qid.TypeId concrete_field_type(monomorph.InstanceKey instance, qid.DefId field_def) {
+        if (monomorph.concrete_member_type(
+            self.query,
+            self.query.hirs$.ref(),
+            self.query.typeck$.ref(),
+            instance,
+            field_def
+        ) is some field_type) {
+            return field_type;
+        }
+        self.query.layouts.mark_error();
+        return self.query.types.invalid_type();
+    }
+
+    layout.LayoutKey key_for_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.query.types.get(type_id);
+        if (info.data is .invalid) {
+            return self.builtin_key(.invalid, 0, false);
+        }
+        if (info.data is .never) {
+            return self.builtin_key(.never, 0, false);
+        }
+        if (info.data is .unit) {
+            return self.builtin_key(.unit, 0, false);
+        }
+        if (info.data is .bool_type) {
+            return self.builtin_key(.bool_type, 1, false);
+        }
+        if (info.data is .char_type) {
+            return self.builtin_key(.char_type, 32, false);
+        }
+        if (info.data is .int_type(int_type)) {
+            return self.builtin_key(.int_type, int_type.bits, int_type.signed);
+        }
+        if (info.data is .float_type(float_type)) {
+            return self.builtin_key(.float_type, float_type.bits, false);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return layout.LayoutKey(.tuple_type(layout.SequenceLayoutKey(self.key_array_for_types(tuple_type.items))));
+        }
+        if (info.data is .optional(optional_type)) {
+            return layout.LayoutKey(.optional_type(layout.SequenceLayoutKey(self.one_type_key(optional_type.element))));
+        }
+        if (info.data is .function_type(function_type)) {
+            return layout.LayoutKey(.function_type(layout.FunctionLayoutKey(
+                self.key_array_for_types(function_type.params),
+                self.one_type_key(function_type.result)
+            )));
+        }
+        if (info.data is .named(named)) {
+            return layout.LayoutKey(.nominal_type(layout.NominalLayoutKey(
+                named.def_id,
+                self.key_array_for_types(named.args)
+            )));
+        }
+        return self.builtin_key(.invalid, 0, false);
+    }
+
+    layout.LayoutKey builtin_key(layout.BuiltinLayoutKind kind, Int bits, Bool signed) {
+        return layout.LayoutKey(.builtin(layout.BuiltinLayoutKey(kind, bits, signed)));
+    }
+
+    layout.LayoutKey[] one_type_key(qid.TypeId type_id) {
+        list.ArrayList<layout.LayoutKey>! keys = list.ArrayList<layout.LayoutKey>(1);
+        keys.add(self.key_for_type(type_id));
+        return self.query.layouts.key_array(keys$.ref());
+    }
+
+    layout.LayoutKey[] key_array_for_types(qid.TypeId[] type_ids) {
+        list.ArrayList<layout.LayoutKey>! keys = list.ArrayList<layout.LayoutKey>(type_ids.length);
+        Int! index = 0;
+        while (index < type_ids.length) {
+            keys.add(self.key_for_type(type_ids[index]));
+            index = index + 1;
+        }
+        return self.query.layouts.key_array(keys$.ref());
+    }
+
+    Int integer_size(types.IntType int_type) {
+        if (int_type.bits <= 0) {
+            return self.query.layouts.target.pointer_size;
+        }
+        return self.bits_to_bytes(int_type.bits);
+    }
+
+    Int bits_to_bytes(Int bits) {
+        if (bits <= 0) {
+            return 0;
+        }
+        return (bits + 7) / 8;
+    }
+
+    Int scalar_align(Int size, Int max_align) {
+        if (size <= 1) {
+            return 1;
+        }
+        if (size < max_align) {
+            return size;
+        }
+        return max_align;
+    }
+
+    Int align_to(Int value, Int align) {
+        if (align <= 1) {
+            return value;
+        }
+        Int remainder = value % align;
+        if (remainder == 0) {
+            return value;
+        }
+        return value + (align - remainder);
+    }
+
+    Int max_int(Int lhs, Int rhs) {
+        if (lhs > rhs) {
+            return lhs;
+        }
+        return rhs;
+    }
+}
