@@ -1,0 +1,240 @@
+// Pattern 的 HIR type check。
+//
+// pattern 检查只依赖 expected type 和共享 TypeOps；表达式/控制流检查
+// 在 body.jiang 中完成，避免 pattern 和 expression 之间形成循环依赖。
+
+import hir = "../../hir/hir.jiang";
+import qid = "../../query/id.jiang";
+import def = "../../resolve/def.jiang";
+import types = "../type.jiang";
+import check_context = "./context.jiang";
+import type_ops_mod = "./type_ops.jiang";
+
+public struct PatternCheck {
+    check_context.CheckContext& state;
+    type_ops_mod.TypeOps& type_ops;
+
+    public init(check_context.CheckContext& state, type_ops_mod.TypeOps& type_ops) {
+        self.state = state;
+        self.type_ops = type_ops;
+    }
+
+    public qid.TypeId check_pattern(hir.HirId pattern_id, qid.TypeId expected_type) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_id);
+        qid.TypeId! pattern_type = expected_type;
+        if (pattern.data is .binding_pattern(binding)) {
+            pattern_type = self.bind_pattern_local(pattern_id.owner_def, binding, expected_type);
+        }
+        if (pattern.data is .literal_pattern(literal_pattern)) {
+            pattern_type = self.check_literal_pattern(pattern_id, literal_pattern.literal, expected_type);
+        }
+        if (pattern.data is .optional_pattern(optional_pattern)) {
+            pattern_type = self.check_optional_pattern(pattern_id, optional_pattern, expected_type);
+        }
+        if (pattern.data is .variant_pattern(variant_pattern)) {
+            pattern_type = self.check_variant_pattern(pattern_id, variant_pattern, expected_type);
+        }
+        if (pattern.data is .wildcard_pattern) {
+            pattern_type = expected_type;
+        }
+        self.state.results.set_node_type(pattern_id, pattern_type);
+        return pattern_type;
+    }
+
+    qid.TypeId check_literal_pattern(
+        hir.HirId pattern_id,
+        hir.HirLiteral literal,
+        qid.TypeId expected_type
+    ) {
+        if (self.type_ops.is_invalid_type(expected_type)) {
+            return self.type_ops.literal_type(literal);
+        }
+        // Literal pattern 按 scrutinee 的 expected type 解释，和带显式类型
+        // 的 initializer 一样允许 untyped literal 落到目标整数/浮点类型。
+        if (self.type_ops.literal_can_match_type(literal, expected_type)) {
+            return expected_type;
+        }
+        self.type_ops.add_node_error(
+            pattern_id,
+            "literal pattern type does not match value type",
+            "pattern_type_mismatch"
+        );
+        return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId bind_pattern_local(qid.DefId owner_def, hir.HirBindingPattern binding, qid.TypeId expected_type) {
+        hir.HirDef owner = self.state.hirs.def(owner_def)$.some();
+        guard owner.body is some body else { return self.state.query.types.invalid_type(); }
+        hir.HirLocal local = body.local(binding.local_id);
+        qid.TypeId! local_type = expected_type;
+        if (local.type_ref is some type_ref) {
+            local_type = self.type_ops.check_type_ref(type_ref);
+        }
+        self.type_ops.bind_def_type(local.def_id, local_type);
+        return local_type;
+    }
+
+    qid.TypeId check_optional_pattern(
+        hir.HirId pattern_id,
+        hir.HirOptionalPattern optional_pattern,
+        qid.TypeId expected_type
+    ) {
+        types.TypeInfo expected_info = self.state.query.types.get(expected_type);
+        guard expected_info.data is .optional(optional) else {
+            if (!self.type_ops.is_invalid_type(expected_type)) {
+                self.type_ops.add_node_error(
+                    pattern_id,
+                    "optional pattern requires optional value type",
+                    "optional_pattern_type_mismatch"
+                );
+            }
+            self.check_pattern(optional_pattern.nested, self.state.query.types.invalid_type());
+            return self.state.query.types.invalid_type();
+        }
+        self.check_pattern(optional_pattern.nested, optional.element);
+        return expected_type;
+    }
+
+    qid.TypeId check_variant_pattern(
+        hir.HirId pattern_id,
+        hir.HirVariantPattern variant_pattern,
+        qid.TypeId expected_type
+    ) {
+        if (self.variant_def_for_pattern(pattern_id, variant_pattern, expected_type) is some variant_def) {
+            self.state.results.select_pattern(pattern_id, variant_def);
+            self.check_variant_pattern_owner(pattern_id, variant_def, expected_type);
+            qid.TypeId! payload_type = self.variant_payload_type(variant_def);
+            Int expected_payload_count = self.variant_payload_count(payload_type);
+            if (variant_pattern.payload.length != expected_payload_count) {
+                self.type_ops.add_node_error(
+                    pattern_id,
+                    "variant pattern payload count mismatch",
+                    "variant_payload_count_mismatch"
+                );
+                payload_type = self.state.query.types.invalid_type();
+            }
+            if (variant_pattern.payload.length == expected_payload_count) {
+                self.check_variant_payload_patterns(variant_pattern, payload_type);
+                return expected_type;
+            }
+        }
+        Int! index = 0;
+        while (index < variant_pattern.payload.length) {
+            self.check_pattern(variant_pattern.payload[index], self.state.query.types.invalid_type());
+            index = index + 1;
+        }
+        return expected_type;
+    }
+
+    Int variant_payload_count(qid.TypeId payload_type) {
+        if (self.type_ops.is_unit_type(payload_type)) {
+            return 0;
+        }
+        types.TypeInfo payload_info = self.state.query.types.get(payload_type);
+        if (payload_info.data is .tuple_type(tuple_type)) {
+            return tuple_type.items.length;
+        }
+        return 1;
+    }
+
+    () check_variant_payload_patterns(hir.HirVariantPattern variant_pattern, qid.TypeId payload_type) {
+        types.TypeInfo payload_info = self.state.query.types.get(payload_type);
+        if (payload_info.data is .tuple_type(tuple_type)) {
+            Int! index = 0;
+            while (index < variant_pattern.payload.length) {
+                self.check_pattern(variant_pattern.payload[index], tuple_type.items[index]);
+                index = index + 1;
+            }
+            return;
+        }
+        if (variant_pattern.payload.length == 1) {
+            self.check_pattern(variant_pattern.payload[0], payload_type);
+        }
+    }
+
+    qid.DefId? variant_def_for_pattern(
+        hir.HirId pattern_id,
+        hir.HirVariantPattern variant_pattern,
+        qid.TypeId expected_type
+    ) {
+        if (variant_pattern.variant_def is some variant_def) {
+            return variant_def;
+        }
+        if (self.type_ops.is_invalid_type(expected_type)) {
+            return null;
+        }
+        guard variant_pattern.member_symbol is some member_symbol else {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "variant pattern is missing a member name",
+                "variant_pattern_missing_name"
+            );
+            return null;
+        }
+        // Dot-prefix pattern 的 owner 来自 expected_type，例如
+        // `switch value { .case => ... }` 先检查 `value` 的类型，再到该
+        // type 的 member namespace 里查 `.case`。
+        guard self.type_ops.member_namespace_for_type(expected_type) is some namespace_id else {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "dot-prefix variant pattern requires enum or union value",
+                "variant_pattern_type_mismatch"
+            );
+            return null;
+        }
+        guard self.state.query.resolve.namespaces.first_binding(namespace_id, member_symbol, .member_name)
+            is some binding else {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "unresolved variant for matched type",
+                "unresolved_variant_for_type"
+            );
+            return null;
+        }
+        def.DefKind kind = self.state.query.defs.get(binding.def_id).kind;
+        if (kind == .enum_case_def || kind == .union_variant_def) {
+            return binding.def_id;
+        }
+        self.type_ops.add_node_error(pattern_id, "matched member is not a variant", "expected_variant_pattern");
+        return null;
+    }
+
+    () check_variant_pattern_owner(hir.HirId pattern_id, qid.DefId variant_def, qid.TypeId expected_type) {
+        if (self.type_ops.is_invalid_type(expected_type)) {
+            return;
+        }
+        types.TypeInfo expected_info = self.state.query.types.get(expected_type);
+        guard expected_info.data is .named(named) else {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "variant pattern requires enum or union value",
+                "variant_pattern_type_mismatch"
+            );
+            return;
+        }
+        qid.DefId? owner = self.state.query.defs.get(variant_def).owner_def;
+        guard owner is some owner_def else {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "variant pattern has no owner type",
+                "variant_pattern_missing_owner"
+            );
+            return;
+        }
+        if (owner_def.to_index() != named.def_id.to_index()) {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "variant pattern does not belong to matched type",
+                "variant_owner_mismatch"
+            );
+        }
+    }
+
+    qid.TypeId variant_payload_type(qid.DefId variant_def) {
+        if (self.state.results.def_type(variant_def) is some type_id) {
+            return type_id;
+        }
+        return self.state.query.types.unit_type();
+    }
+
+}

@@ -1,0 +1,340 @@
+// 声明签名、where predicate 和 trait conformance 检查。
+
+import hir = "../../hir/hir.jiang";
+import qid = "../../query/id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import types = "../type.jiang";
+import check_context = "./context.jiang";
+import type_ops_mod = "./type_ops.jiang";
+
+public struct DeclCheck {
+    check_context.CheckContext& state;
+    type_ops_mod.TypeOps& type_ops;
+
+    public init(check_context.CheckContext& state, type_ops_mod.TypeOps& type_ops) {
+        self.state = state;
+        self.type_ops = type_ops;
+    }
+
+    public () check_declaration_signatures() {
+        // 第一遍只检查声明签名和类型引用，不进入函数体。这样函数体
+        // type check 时可以跨 module 读取已绑定的 DefId -> TypeId。
+        Int! module_index = 0;
+        while (module_index < self.state.graph.modules.len()) {
+            qid.ModuleId module_id = self.state.graph.modules.get(module_index);
+            store.ModuleRecord module = self.state.query.resolve.modules.get(module_id);
+            self.check_declaration_signature_tree(module.def_id);
+            module_index = module_index + 1;
+        }
+    }
+
+    () check_declaration_signature_tree(qid.DefId def_id) {
+        guard self.state.hirs.def(def_id) is some hir_def else {
+            return;
+        }
+        self.check_trait_refs(hir_def);
+        self.check_where_predicates(hir_def);
+        self.check_associated_type_owner(hir_def);
+        self.check_trait_conformance(hir_def);
+        if (self.type_ops.decl_has_type(hir_def.decl)) {
+            self.type_ops.type_for_decl_def(def_id);
+        }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            self.check_declaration_signature_tree(hir_def.members.get(index));
+            index = index + 1;
+        }
+    }
+
+    () check_trait_refs(hir.HirDef hir_def) {
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            self.check_trait_ref(hir_def.trait_refs.get(index));
+            index = index + 1;
+        }
+    }
+
+    () check_trait_ref(hir.HirId trait_ref) {
+        self.type_ops.check_type_ref(trait_ref);
+        hir.HirNode node = self.state.hirs.node(trait_ref);
+        guard node.data is .named_type_ref(named) else {
+            self.type_ops.add_node_error(trait_ref, "trait bound must name a trait", "expected_trait_bound");
+            return;
+        }
+        if (self.state.query.defs.get(named.def_id).kind != .trait_def) {
+            self.type_ops.add_node_error(trait_ref, "trait bound must name a trait", "expected_trait_bound");
+        }
+    }
+
+    () check_where_predicates(hir.HirDef hir_def) {
+        Int! index = 0;
+        while (index < hir_def.where_predicates.len()) {
+            self.check_where_predicate(hir_def.where_predicates.get(index));
+            index = index + 1;
+        }
+    }
+
+    () check_where_predicate(hir.HirWherePredicate predicate) {
+        if (predicate is .type_bound(bound)) {
+            self.type_ops.check_type_ref(bound.subject);
+            self.check_trait_ref(bound.bound);
+            return;
+        }
+        if (predicate is .type_equal(equal)) {
+            self.type_ops.check_type_ref(equal.subject);
+            self.type_ops.check_type_ref(equal.value);
+            return;
+        }
+        if (predicate is .projection_equal(equal)) {
+            self.type_ops.check_type_ref(equal.subject);
+            self.check_trait_ref(equal.trait_ref);
+            self.check_projected_assoc_type(equal);
+            self.type_ops.check_type_ref(equal.value);
+        }
+    }
+
+    () check_projected_assoc_type(hir.HirWhereProjectionEqual equal) {
+        hir.HirNode trait_node = self.state.hirs.node(equal.trait_ref);
+        guard trait_node.data is .named_type_ref(named) else { return; }
+        if (self.state.query.defs.get(named.def_id).kind != .trait_def) {
+            return;
+        }
+        guard self.state.query.defs.get(named.def_id).owned_namespace_id is some namespace_id else {
+            self.type_ops.add_node_error(
+                equal.trait_ref,
+                "trait has no associated type namespace",
+                "unresolved_associated_type"
+            );
+            return;
+        }
+        guard self.state.query.resolve.namespaces.first_binding(namespace_id, equal.assoc_symbol, .type_name)
+            is some binding else {
+            self.type_ops.add_node_error(
+                equal.trait_ref,
+                "unresolved associated type in trait",
+                "unresolved_associated_type"
+            );
+            return;
+        }
+        if (self.state.query.defs.get(binding.def_id).kind != .associated_type_def) {
+            self.type_ops.add_node_error(
+                equal.trait_ref,
+                "projected name is not an associated type",
+                "expected_associated_type"
+            );
+        }
+    }
+
+    () check_associated_type_owner(hir.HirDef hir_def) {
+        if (hir_def.decl.kind != .associated_type_decl) {
+            return;
+        }
+        guard self.state.query.defs.get(hir_def.def_id).owner_def is some owner_def else {
+            self.add_invalid_associated_type_owner_error(hir_def.def_id);
+            return;
+        }
+        def.DefKind owner_kind = self.state.query.defs.get(owner_def).kind;
+        if (owner_kind == .trait_def) {
+            return;
+        }
+        if (self.is_nominal_def_kind(owner_kind)) {
+            if (hir_def.decl.type_ref is some _) {
+                return;
+            }
+            self.type_ops.add_def_error(
+                hir_def.def_id,
+                "associated type implementation requires a value type",
+                "missing_associated_type_value"
+            );
+            return;
+        }
+        self.add_invalid_associated_type_owner_error(hir_def.def_id);
+    }
+
+    () add_invalid_associated_type_owner_error(qid.DefId def_id) {
+        self.type_ops.add_def_error(
+            def_id,
+            "associated type must belong to a trait or type",
+            "invalid_associated_type_owner"
+        );
+    }
+
+    Bool is_nominal_def_kind(def.DefKind kind) {
+        if (kind == .struct_def) { return true; }
+        if (kind == .record_def) { return true; }
+        if (kind == .enum_def) { return true; }
+        if (kind == .union_def) { return true; }
+        return false;
+    }
+
+    () check_trait_conformance(hir.HirDef hir_def) {
+        if (!self.is_nominal_def_kind(self.state.query.defs.get(hir_def.def_id).kind)) {
+            return;
+        }
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            self.check_trait_conformance_ref(hir_def.def_id, hir_def.trait_refs.get(index));
+            index = index + 1;
+        }
+    }
+
+    () check_trait_conformance_ref(qid.DefId impl_def, hir.HirId trait_ref) {
+        hir.HirNode node = self.state.hirs.node(trait_ref);
+        guard node.data is .named_type_ref(named) else { return; }
+        if (self.state.query.defs.get(named.def_id).kind != .trait_def) {
+            return;
+        }
+        self.check_trait_members_implemented(impl_def, named.def_id);
+    }
+
+    () check_trait_members_implemented(qid.DefId impl_def, qid.DefId trait_def) {
+        guard self.state.hirs.def(trait_def) is some trait_hir else { return; }
+        Int! index = 0;
+        while (index < trait_hir.members.len()) {
+            qid.DefId trait_member = trait_hir.members.get(index);
+            self.check_trait_member_implemented(impl_def, trait_member);
+            index = index + 1;
+        }
+    }
+
+    () check_trait_member_implemented(qid.DefId impl_def, qid.DefId trait_member) {
+        def.DefRecord trait_record = self.state.query.defs.get(trait_member);
+        if (trait_record.kind == .function_def) {
+            self.check_trait_method_implemented(impl_def, trait_member);
+            return;
+        }
+        if (trait_record.kind == .associated_type_def) {
+            self.check_trait_associated_type_implemented(impl_def, trait_member);
+        }
+    }
+
+    () check_trait_method_implemented(qid.DefId impl_def, qid.DefId trait_method) {
+        guard self.member_impl_for_trait_member(impl_def, trait_method, .value_name) is some impl_method else {
+            self.type_ops.add_def_error(impl_def, "missing trait method implementation", "missing_trait_method_impl");
+            return;
+        }
+        if (self.state.query.defs.get(impl_method).kind != .function_def) {
+            self.type_ops.add_def_error(
+                impl_method,
+                "trait method implementation must be a function",
+                "expected_trait_method_impl"
+            );
+            return;
+        }
+        if (!self.trait_method_signature_compatible(trait_method, impl_method)) {
+            self.type_ops.add_def_error(
+                impl_method,
+                "trait method implementation type does not match trait declaration",
+                "trait_method_signature_mismatch"
+            );
+        }
+    }
+
+    Bool trait_method_signature_compatible(qid.DefId trait_method, qid.DefId impl_method) {
+        guard self.state.hirs.def(trait_method) is some trait_hir else { return false; }
+        guard self.state.hirs.def(impl_method) is some impl_hir else { return false; }
+        guard trait_hir.decl.function_signature is some trait_signature else { return false; }
+        guard impl_hir.decl.function_signature is some impl_signature else { return false; }
+        if (trait_signature.params.length != impl_signature.params.length) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < trait_signature.params.length) {
+            qid.TypeId trait_param = self.type_ops.check_type_ref(trait_signature.params[index]);
+            qid.TypeId impl_param = self.type_ops.check_type_ref(impl_signature.params[index]);
+            if (!self.type_ops.same_type_ignoring_mutability(trait_param, impl_param)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        qid.TypeId trait_result = self.type_ops.check_type_ref(trait_signature.result);
+        qid.TypeId impl_result = self.type_ops.check_type_ref(impl_signature.result);
+        return self.type_ops.same_type_ignoring_mutability(trait_result, impl_result);
+    }
+
+    () check_trait_associated_type_implemented(qid.DefId impl_def, qid.DefId trait_assoc) {
+        guard self.member_impl_for_trait_member(impl_def, trait_assoc, .type_name) is some impl_assoc else {
+            self.type_ops.add_def_error(
+                impl_def,
+                "missing associated type implementation",
+                "missing_associated_type_impl"
+            );
+            return;
+        }
+        if (self.state.query.defs.get(impl_assoc).kind != .associated_type_def) {
+            self.type_ops.add_def_error(
+                impl_assoc,
+                "associated type implementation must be an associated type",
+                "expected_associated_type_impl"
+            );
+            return;
+        }
+        self.check_associated_type_impl_bounds(impl_assoc, trait_assoc);
+    }
+
+    qid.DefId? member_impl_for_trait_member(
+        qid.DefId impl_def,
+        qid.DefId trait_member,
+        def.NameDomain domain
+    ) {
+        guard self.state.query.defs.get(impl_def).owned_namespace_id is some namespace_id else { return null; }
+        qid.SymbolId symbol = self.state.query.defs.get(trait_member).name.symbol;
+        guard self.state.query.resolve.namespaces.first_binding(namespace_id, symbol, domain) is some binding else {
+            return null;
+        }
+        return binding.def_id;
+    }
+
+    () check_associated_type_impl_bounds(qid.DefId impl_assoc, qid.DefId trait_assoc) {
+        guard self.state.hirs.def(trait_assoc) is some trait_assoc_hir else { return; }
+        qid.TypeId impl_type = self.type_ops.type_for_decl_def(impl_assoc);
+        Int! index = 0;
+        while (index < trait_assoc_hir.trait_refs.len()) {
+            self.check_associated_type_impl_bound(impl_assoc, impl_type, trait_assoc_hir.trait_refs.get(index));
+            index = index + 1;
+        }
+    }
+
+    () check_associated_type_impl_bound(qid.DefId impl_assoc, qid.TypeId impl_type, hir.HirId trait_ref) {
+        hir.HirNode node = self.state.hirs.node(trait_ref);
+        guard node.data is .named_type_ref(named) else { return; }
+        if (self.state.query.defs.get(named.def_id).kind != .trait_def) {
+            return;
+        }
+        if (!self.type_satisfies_trait(impl_type, named.def_id)) {
+            self.type_ops.add_def_error(
+                impl_assoc,
+                "associated type implementation does not satisfy trait bound",
+                "associated_type_bound_not_satisfied"
+            );
+        }
+    }
+
+    Bool type_satisfies_trait(qid.TypeId type_id, qid.DefId trait_def) {
+        if (self.type_ops.is_invalid_type(type_id)) {
+            return true;
+        }
+        types.TypeInfo type_info = self.state.query.types.get(type_id);
+        guard type_info.data is .named(named) else {
+            return false;
+        }
+        return self.def_declares_trait(named.def_id, trait_def);
+    }
+
+    Bool def_declares_trait(qid.DefId def_id, qid.DefId trait_def) {
+        guard self.state.hirs.def(def_id) is some hir_def else { return false; }
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            hir.HirNode node = self.state.hirs.node(hir_def.trait_refs.get(index));
+            if (node.data is .named_type_ref(named)) {
+                if (named.def_id == trait_def) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+}
