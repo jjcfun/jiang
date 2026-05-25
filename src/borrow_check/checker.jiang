@@ -1,0 +1,429 @@
+// Borrow check 的函数体检查器。
+//
+// 当前先实现 move/use 的基础语义：MIR operand 读 place 时，根据类型决定
+// 是 implicit copy 还是 move；move 后再次读取同一个 move path、祖先 path
+// 或子 path 都会把 BorrowCheckResults 标成失败。完整 CFG dataflow 后续会
+// 在这里替换线性扫描状态，而不是改 MIR 结构。
+
+import context = "../context.jiang";
+import diagnostic = "../diagnostic/diagnostic.jiang";
+import layout = "../layout/layout.jiang";
+import mir = "../mir/mir.jiang";
+import qid = "../query/id.jiang";
+import sema_result = "../sema/result.jiang";
+import types = "../sema/type.jiang";
+import table = "../support/table.jiang";
+import loan = "./loan.jiang";
+import move_path = "./move_path.jiang";
+import result = "./result.jiang";
+
+public struct PackageBorrowChecker {
+    public context.CompilerContext& ctx;
+    public sema_result.TypeCheckResults& typeck;
+    public layout.LayoutStore& layouts;
+    public result.BorrowCheckResults& results;
+
+    public init(
+        context.CompilerContext& ctx,
+        sema_result.TypeCheckResults& typeck,
+        layout.LayoutStore& layouts,
+        result.BorrowCheckResults& results
+    ) {
+        self.ctx = ctx;
+        self.typeck = typeck;
+        self.layouts = layouts;
+        self.results = results;
+    }
+
+    public () check_store(mir.MirStore& store) {
+        Int! index = 0;
+        while (index < store.functions.len()) {
+            self.check_function(store.functions.get(index));
+            index = index + 1;
+        }
+    }
+
+    () check_function(mir.MirFunction function) {
+        FunctionBorrowChecker! checker = FunctionBorrowChecker(
+            self.ctx,
+            self.typeck,
+            self.layouts,
+            self.results,
+            function
+        );
+        checker.check();
+    }
+}
+
+struct FunctionBorrowChecker {
+    public context.CompilerContext& ctx;
+    public sema_result.TypeCheckResults& typeck;
+    public layout.LayoutStore& layouts;
+    public result.BorrowCheckResults& results;
+    public mir.MirFunctionId function_id;
+    public mir.MirBody body;
+    public move_path.MovePathTree! paths;
+    public table.HashTable<move_path.MovePathId, Bool>! moved;
+
+    public init(
+        context.CompilerContext& ctx,
+        sema_result.TypeCheckResults& typeck,
+        layout.LayoutStore& layouts,
+        result.BorrowCheckResults& results,
+        mir.MirFunction function
+    ) {
+        self.ctx = ctx;
+        self.typeck = typeck;
+        self.layouts = layouts;
+        self.results = results;
+        self.function_id = function.id;
+        self.body = function.body;
+        mir.MirBody! body = function.body;
+        self.paths = move_path.build_move_path_tree(body$.ref());
+        self.moved = table.HashTable<move_path.MovePathId, Bool>();
+    }
+
+    public () check() {
+        Int! block_index = 0;
+        while (block_index < self.body.blocks.length) {
+            self.check_block(self.body.blocks[block_index]);
+            block_index = block_index + 1;
+        }
+    }
+
+    () check_block(mir.MirBlock block) {
+        Int! stmt_index = 0;
+        while (stmt_index < block.statements.length) {
+            self.check_statement(block.statements[stmt_index]);
+            stmt_index = stmt_index + 1;
+        }
+        self.check_terminator(block.terminator);
+    }
+
+    () check_statement(mir.MirStatement statement) {
+        if (statement.kind is .assign_stmt(assign_stmt)) {
+            self.check_rvalue(assign_stmt.value);
+            self.clear_place(assign_stmt.destination);
+            self.record_assignment_loan(assign_stmt.destination, assign_stmt.value);
+            return;
+        }
+        if (statement.kind is .set_discriminant_stmt(discriminant_stmt)) {
+            self.clear_place(discriminant_stmt.destination);
+        }
+    }
+
+    () record_assignment_loan(mir.MirPlace destination, mir.MirRvalue value) {
+        if (value is .borrow_value(borrow_value)) {
+            self.add_loan(self.loan_kind_for_borrow(borrow_value.kind), borrow_value.place, destination);
+            return;
+        }
+        if (value is .address_of_value(address_of_value)) {
+            self.add_loan(self.loan_kind_for_address_of(address_of_value), address_of_value.place, destination);
+        }
+    }
+
+    () add_loan(loan.LoanKind kind, mir.MirPlace source, mir.MirPlace target) {
+        self.results.add_loan(
+            kind,
+            self.function_id,
+            self.paths.path_for_place(source),
+            self.paths.path_for_place(target)
+        );
+    }
+
+    loan.LoanKind loan_kind_for_borrow(mir.MirBorrowKind kind) {
+        if (kind == .mutable_borrow) {
+            return .mutable_borrow;
+        }
+        return .shared_borrow;
+    }
+
+    loan.LoanKind loan_kind_for_address_of(mir.MirAddressOfRvalue value) {
+        if (value.mutable_pointer) {
+            return .mutable_raw_pointer;
+        }
+        return .shared_raw_pointer;
+    }
+
+    () check_terminator(mir.MirTerminator terminator) {
+        if (terminator.kind is .branch_term(branch)) {
+            self.check_operand(branch.condition);
+            return;
+        }
+        if (terminator.kind is .call_term(call_term)) {
+            self.check_call(call_term);
+            return;
+        }
+        if (terminator.kind is .drop_term(drop_term)) {
+            self.consume_place(drop_term.place);
+            return;
+        }
+        if (terminator.kind is .assert_term(assert_term)) {
+            self.check_operand(assert_term.condition);
+            return;
+        }
+        if (terminator.kind is .throw_term(throw_term)) {
+            self.check_operand(throw_term.error_value);
+        }
+    }
+
+    () check_call(mir.MirCallTerminator call_term) {
+        self.check_operand(call_term.callee);
+        Int! index = 0;
+        while (index < call_term.args.length) {
+            self.check_operand(call_term.args[index]);
+            index = index + 1;
+        }
+        self.clear_place(call_term.destination);
+    }
+
+    () check_rvalue(mir.MirRvalue value) {
+        if (value is .use_value(use_value)) {
+            self.check_operand(use_value.value);
+            return;
+        }
+        if (value is .unary_value(unary_value)) {
+            self.check_operand(unary_value.value);
+            return;
+        }
+        if (value is .binary_value(binary_value)) {
+            self.check_operand(binary_value.lhs);
+            self.check_operand(binary_value.rhs);
+            return;
+        }
+        if (value is .cast_value(cast_value)) {
+            self.check_operand(cast_value.value);
+            return;
+        }
+        if (value is .borrow_value(borrow_value)) {
+            self.check_place_use(borrow_value.place);
+            return;
+        }
+        if (value is .address_of_value(address_of_value)) {
+            self.check_place_use(address_of_value.place);
+            return;
+        }
+        if (value is .len_value(len_value)) {
+            self.check_place_use(len_value.place);
+            return;
+        }
+        if (value is .discriminant_value(discriminant_value)) {
+            self.check_place_use(discriminant_value.place);
+            return;
+        }
+        if (value is .aggregate_value(aggregate_value)) {
+            self.check_operands(aggregate_value.fields);
+            return;
+        }
+        if (value is .optional_value(optional_value)) {
+            self.check_operand(optional_value.value);
+            return;
+        }
+        if (value is .error_union_value(error_union_value)) {
+            self.check_operand(error_union_value.value);
+        }
+    }
+
+    () check_operands(mir.MirOperand[] operands) {
+        Int! index = 0;
+        while (index < operands.length) {
+            self.check_operand(operands[index]);
+            index = index + 1;
+        }
+    }
+
+    () check_operand(mir.MirOperand operand) {
+        if (operand is .copy_operand(copy_operand)) {
+            self.check_copy_or_move(copy_operand.place);
+            return;
+        }
+        if (operand is .move_operand(move_operand)) {
+            self.consume_place(move_operand.place);
+        }
+    }
+
+    () check_copy_or_move(mir.MirPlace place) {
+        if (self.is_implicit_copy_place(place)) {
+            self.check_place_use(place);
+            return;
+        }
+        self.consume_place(place);
+    }
+
+    () consume_place(mir.MirPlace place) {
+        self.check_place_use(place);
+        if (!self.is_implicit_copy_place(place)) {
+            self.mark_moved(self.paths.path_for_place(place));
+        }
+    }
+
+    () check_place_use(mir.MirPlace place) {
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        if (self.is_path_uninitialized(path)) {
+            self.results.mark_error();
+            self.add_use_after_move_diagnostic();
+        }
+    }
+
+    () add_use_after_move_diagnostic() {
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("use_after_move"),
+                diagnostic.SourceRange(),
+                "use of moved value"
+            )
+        );
+    }
+
+    () clear_place(mir.MirPlace place) {
+        self.clear_path_and_descendants(self.paths.path_for_place(place));
+    }
+
+    () mark_moved(move_path.MovePathId path) {
+        self.clear_descendants(path);
+        self.moved.set(path, true);
+    }
+
+    Bool is_path_uninitialized(move_path.MovePathId path) {
+        if (self.moved.has(path)) {
+            return true;
+        }
+        if (self.has_moved_ancestor(path)) {
+            return true;
+        }
+        return self.has_moved_descendant(path);
+    }
+
+    Bool has_moved_ancestor(move_path.MovePathId path) {
+        move_path.MovePath! current = self.paths.get(path);
+        while (current.parent is some parent) {
+            if (self.moved.has(parent)) {
+                return true;
+            }
+            current = self.paths.get(parent);
+        }
+        return false;
+    }
+
+    Bool has_moved_descendant(move_path.MovePathId path) {
+        Int! index = 0;
+        while (index < self.paths.len()) {
+            move_path.MovePathId candidate = move_path.MovePathId(index);
+            if (self.moved.has(candidate) && self.is_descendant_of(candidate, path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool is_descendant_of(move_path.MovePathId child, move_path.MovePathId parent) {
+        move_path.MovePath! current = self.paths.get(child);
+        while (current.parent is some current_parent) {
+            if (current_parent == parent) {
+                return true;
+            }
+            current = self.paths.get(current_parent);
+        }
+        return false;
+    }
+
+    () clear_path_and_descendants(move_path.MovePathId path) {
+        self.moved.remove(path);
+        self.clear_descendants(path);
+    }
+
+    () clear_descendants(move_path.MovePathId path) {
+        Int! index = 0;
+        while (index < self.paths.len()) {
+            move_path.MovePathId candidate = move_path.MovePathId(index);
+            if (self.is_descendant_of(candidate, path)) {
+                self.moved.remove(candidate);
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool is_implicit_copy_place(mir.MirPlace place) {
+        return self.is_implicit_copy_type(self.place_type(place));
+    }
+
+    qid.TypeId place_type(mir.MirPlace place) {
+        qid.TypeId! type_id = self.local_type(place.local_id);
+        Int! index = 0;
+        while (index < place.projection.length) {
+            type_id = self.projected_type(type_id, place.projection[index]);
+            index = index + 1;
+        }
+        return type_id;
+    }
+
+    qid.TypeId local_type(mir.MirLocalId local_id) {
+        Int index = local_id.to_index();
+        if (index >= 0 && index < self.body.locals.length) {
+            return self.body.locals[index].type_id;
+        }
+        return self.ctx.query.types.invalid_type();
+    }
+
+    qid.TypeId projected_type(qid.TypeId base_type, mir.MirPlaceElem projection) {
+        if (projection is .field_projection(field)) {
+            return field.field_type;
+        }
+        if (projection is .deref_projection) {
+            return base_type;
+        }
+        if (projection is .index_projection) {
+            return self.indexed_type(base_type);
+        }
+        if (projection is .constant_index_projection) {
+            return self.indexed_type(base_type);
+        }
+        if (projection is .subslice_projection) {
+            return base_type;
+        }
+        return self.ctx.query.types.invalid_type();
+    }
+
+    qid.TypeId indexed_type(qid.TypeId base_type) {
+        types.TypeInfo info = self.ctx.query.types.get(base_type);
+        if (info.data is .tuple_type(tuple_type)) {
+            if (tuple_type.items.length > 0) {
+                return tuple_type.items[0];
+            }
+        }
+        return base_type;
+    }
+
+    Bool is_implicit_copy_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.query.types.get(type_id);
+        if (info.data is .invalid) { return true; }
+        if (info.data is .never) { return true; }
+        if (info.data is .unit) { return true; }
+        if (info.data is .bool_type) { return true; }
+        if (info.data is .char_type) { return true; }
+        if (info.data is .int_type) { return true; }
+        if (info.data is .float_type) { return true; }
+        if (info.data is .function_type) { return true; }
+        if (info.data is .optional(optional)) {
+            return self.is_implicit_copy_type(optional.element);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.tuple_is_implicit_copy(tuple_type);
+        }
+        return false;
+    }
+
+    Bool tuple_is_implicit_copy(types.TupleType tuple_type) {
+        Int! index = 0;
+        while (index < tuple_type.items.length) {
+            if (!self.is_implicit_copy_type(tuple_type.items[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+}

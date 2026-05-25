@@ -1,0 +1,289 @@
+// Move path tree。
+//
+// Move path 把 MIR place 拆成一棵树：local 是根，field/index/deref
+// projection 是子节点。后续 use-after-move dataflow 只处理 MovePathId，
+// 不直接比较完整 MirPlace。
+
+import mir = "../mir/mir.jiang";
+import table = "../support/table.jiang";
+import traits = "../support/traits.jiang";
+
+public struct MovePathId: traits.Indexable, Hashable, Equatable {
+    public Int index;
+
+    public init(Int index) {
+        self.index = index;
+    }
+
+    public Int to_index() {
+        return self.index;
+    }
+
+    public static MovePathId from_index(Int index) {
+        return MovePathId(index);
+    }
+
+    public UInt64 hash() {
+        return UInt64(self.index + 1);
+    }
+
+    public static Bool equal(MovePathId& lhs, MovePathId& rhs) {
+        return lhs.index == rhs.index;
+    }
+}
+
+public struct MovePath {
+    public MovePathId id;
+    public MovePathId? parent;
+    public mir.MirLocalId local_id;
+
+    // null 表示 local root；非 null 表示 parent place 后追加的一段 projection。
+    public mir.MirPlaceElem? projection;
+
+    public init(
+        MovePathId id,
+        MovePathId? parent,
+        mir.MirLocalId local_id,
+        mir.MirPlaceElem? projection
+    ) {
+        self.id = id;
+        self.parent = parent;
+        self.local_id = local_id;
+        self.projection = projection;
+    }
+}
+
+public struct MovePathTree {
+    public table.ArrayTable<MovePathId, MovePath> paths;
+    table.SideTable<mir.MirLocalId, MovePathId> local_roots;
+    table.MultiTable<MovePathId, MovePathId> children;
+
+    public init() {
+        self.paths = table.ArrayTable<MovePathId, MovePath>();
+        self.local_roots = table.SideTable<mir.MirLocalId, MovePathId>();
+        self.children = table.MultiTable<MovePathId, MovePathId>();
+    }
+
+    public Int len() {
+        return self.paths.len();
+    }
+
+    public MovePath get(MovePathId id) {
+        return self.paths.get(id);
+    }
+
+    public MovePathId root_for_local(mir.MirLocalId local_id) {
+        if (self.local_roots.has(local_id)) {
+            return self.local_roots.get(local_id);
+        }
+        MovePathId id = self.paths.next_id();
+        self.paths.append(MovePath(id, null, local_id, null));
+        self.local_roots.set(local_id, id);
+        return id;
+    }
+
+    public MovePathId path_for_place(mir.MirPlace place) {
+        MovePathId! current = self.root_for_local(place.local_id);
+        Int! index = 0;
+        while (index < place.projection.length) {
+            current = self.child_for_projection(current, place.local_id, place.projection[index]);
+            index = index + 1;
+        }
+        return current;
+    }
+
+    MovePathId child_for_projection(
+        MovePathId parent,
+        mir.MirLocalId local_id,
+        mir.MirPlaceElem projection
+    ) {
+        table.MultiTableCursor! cursor = self.children.first(parent);
+        while (cursor.valid()) {
+            MovePath child = self.paths.get(self.children.get(cursor));
+            if (child.projection is some child_projection) {
+                if (place_elem_equal(child_projection, projection)) {
+                    return child.id;
+                }
+            }
+            cursor = self.children.next(cursor);
+        }
+
+        MovePathId id = self.paths.next_id();
+        self.paths.append(MovePath(id, parent, local_id, projection));
+        self.children.add(parent, id);
+        return id;
+    }
+}
+
+public MovePathTree build_move_path_tree(mir.MirBody& body) {
+    MovePathTree tree = MovePathTree();
+    Int! local_index = 0;
+    while (local_index < body.locals.length) {
+        tree.root_for_local(body.locals[local_index].id);
+        local_index = local_index + 1;
+    }
+
+    Int! block_index = 0;
+    while (block_index < body.blocks.length) {
+        add_block_places(tree$.ref(), body.blocks[block_index]$.ref());
+        block_index = block_index + 1;
+    }
+    return tree;
+}
+
+() add_block_places(MovePathTree& tree, mir.MirBlock& block) {
+    Int! stmt_index = 0;
+    while (stmt_index < block.statements.length) {
+        add_statement_places(tree, block.statements[stmt_index]);
+        stmt_index = stmt_index + 1;
+    }
+    add_terminator_places(tree, block.terminator);
+}
+
+() add_statement_places(MovePathTree& tree, mir.MirStatement statement) {
+    if (statement.kind is .assign_stmt(assign_stmt)) {
+        tree.path_for_place(assign_stmt.destination);
+        add_rvalue_places(tree, assign_stmt.value);
+        return;
+    }
+    if (statement.kind is .set_discriminant_stmt(discriminant_stmt)) {
+        tree.path_for_place(discriminant_stmt.destination);
+    }
+}
+
+() add_terminator_places(MovePathTree& tree, mir.MirTerminator terminator) {
+    if (terminator.kind is .branch_term(branch)) {
+        add_operand_places(tree, branch.condition);
+        return;
+    }
+    if (terminator.kind is .call_term(call_term)) {
+        add_call_places(tree, call_term);
+        return;
+    }
+    if (terminator.kind is .drop_term(drop_term)) {
+        tree.path_for_place(drop_term.place);
+        return;
+    }
+    if (terminator.kind is .assert_term(assert_term)) {
+        add_operand_places(tree, assert_term.condition);
+        return;
+    }
+    if (terminator.kind is .throw_term(throw_term)) {
+        add_operand_places(tree, throw_term.error_value);
+    }
+}
+
+() add_call_places(MovePathTree& tree, mir.MirCallTerminator call_term) {
+    add_operand_places(tree, call_term.callee);
+    Int! index = 0;
+    while (index < call_term.args.length) {
+        add_operand_places(tree, call_term.args[index]);
+        index = index + 1;
+    }
+    tree.path_for_place(call_term.destination);
+}
+
+() add_rvalue_places(MovePathTree& tree, mir.MirRvalue value) {
+    if (value is .use_value(use_value)) {
+        add_operand_places(tree, use_value.value);
+        return;
+    }
+    if (value is .unary_value(unary_value)) {
+        add_operand_places(tree, unary_value.value);
+        return;
+    }
+    if (value is .binary_value(binary_value)) {
+        add_operand_places(tree, binary_value.lhs);
+        add_operand_places(tree, binary_value.rhs);
+        return;
+    }
+    if (value is .cast_value(cast_value)) {
+        add_operand_places(tree, cast_value.value);
+        return;
+    }
+    if (value is .borrow_value(borrow_value)) {
+        tree.path_for_place(borrow_value.place);
+        return;
+    }
+    if (value is .address_of_value(address_of_value)) {
+        tree.path_for_place(address_of_value.place);
+        return;
+    }
+    if (value is .len_value(len_value)) {
+        tree.path_for_place(len_value.place);
+        return;
+    }
+    if (value is .discriminant_value(discriminant_value)) {
+        tree.path_for_place(discriminant_value.place);
+        return;
+    }
+    if (value is .aggregate_value(aggregate_value)) {
+        add_operand_array_places(tree, aggregate_value.fields);
+        return;
+    }
+    if (value is .optional_value(optional_value)) {
+        add_operand_places(tree, optional_value.value);
+        return;
+    }
+    if (value is .error_union_value(error_union_value)) {
+        add_operand_places(tree, error_union_value.value);
+    }
+}
+
+() add_operand_array_places(MovePathTree& tree, mir.MirOperand[] operands) {
+    Int! index = 0;
+    while (index < operands.length) {
+        add_operand_places(tree, operands[index]);
+        index = index + 1;
+    }
+}
+
+() add_operand_places(MovePathTree& tree, mir.MirOperand operand) {
+    if (operand is .copy_operand(copy_operand)) {
+        tree.path_for_place(copy_operand.place);
+        return;
+    }
+    if (operand is .move_operand(move_operand)) {
+        tree.path_for_place(move_operand.place);
+    }
+}
+
+Bool place_elem_equal(mir.MirPlaceElem lhs, mir.MirPlaceElem rhs) {
+    if (lhs is .deref_projection(lhs_deref)) {
+        if (rhs is .deref_projection(rhs_deref)) {
+            return lhs_deref.raw_pointer == rhs_deref.raw_pointer;
+        }
+        return false;
+    }
+    if (lhs is .field_projection(lhs_field)) {
+        return field_projection_equal(lhs_field, rhs);
+    }
+    if (lhs is .index_projection(lhs_index)) {
+        if (rhs is .index_projection(rhs_index)) {
+            return lhs_index.index_local.to_index() == rhs_index.index_local.to_index();
+        }
+        return false;
+    }
+    if (lhs is .constant_index_projection(lhs_const)) {
+        if (rhs is .constant_index_projection(rhs_const)) {
+            return lhs_const.offset == rhs_const.offset;
+        }
+        return false;
+    }
+    if (lhs is .subslice_projection(lhs_subslice)) {
+        if (rhs is .subslice_projection(rhs_subslice)) {
+            return lhs_subslice.from == rhs_subslice.from && lhs_subslice.to == rhs_subslice.to;
+        }
+    }
+    return false;
+}
+
+Bool field_projection_equal(mir.MirFieldProjection lhs, mir.MirPlaceElem rhs) {
+    if (rhs is .field_projection(rhs_field)) {
+        if (lhs.field_def != rhs_field.field_def) {
+            return false;
+        }
+        return lhs.field_type.to_index() == rhs_field.field_type.to_index();
+    }
+    return false;
+}
