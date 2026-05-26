@@ -9,12 +9,16 @@ import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
 import layout = "../layout/layout.jiang";
+import layout_compute = "../layout/compute.jiang";
 import mir = "../mir/mir.jiang";
 import qid = "../query/id.jiang";
 import sema_result = "../sema/result.jiang";
 import types = "../sema/type.jiang";
+import hash = "../support/hash.jiang";
+import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import loan = "./loan.jiang";
+import location = "./location.jiang";
 import move_path = "./move_path.jiang";
 import result = "./result.jiang";
 
@@ -66,6 +70,47 @@ struct BorrowDataflowState {
     }
 }
 
+struct BorrowDiagnosticKey: Hashable, Equatable {
+    public mir.MirFunctionId function_id;
+    public mir.MirBlockId block_id;
+    public location.MirLocationKind kind;
+    public Int statement_index;
+    public Int code;
+
+    public init(location.MirLocation current, Int code) {
+        self.function_id = current.function_id;
+        self.block_id = current.block_id;
+        self.kind = current.kind;
+        self.statement_index = current.statement_index;
+        self.code = code;
+    }
+
+    public UInt64 hash() {
+        hash.WyHasher! hasher = hash.WyHasher();
+        hasher.write_int(self.function_id.to_index());
+        hasher.write_int(self.block_id.to_index());
+        hasher.write_int(self.kind_index());
+        hasher.write_int(self.statement_index);
+        hasher.write_int(self.code);
+        return hasher.finish();
+    }
+
+    Int kind_index() {
+        if (self.kind == .statement) {
+            return 1;
+        }
+        return 2;
+    }
+
+    public static Bool equal(BorrowDiagnosticKey& lhs, BorrowDiagnosticKey& rhs) {
+        if (lhs.function_id.to_index() != rhs.function_id.to_index()) { return false; }
+        if (lhs.block_id.to_index() != rhs.block_id.to_index()) { return false; }
+        if (lhs.kind_index() != rhs.kind_index()) { return false; }
+        if (lhs.statement_index != rhs.statement_index) { return false; }
+        return lhs.code == rhs.code;
+    }
+}
+
 struct FunctionBorrowChecker {
     public context.CompilerContext& ctx;
     public sema_result.TypeCheckResults& typeck;
@@ -76,6 +121,8 @@ struct FunctionBorrowChecker {
     public mir.MirBody body;
     public move_path.MovePathTree! paths;
     public BorrowDataflowState! dataflow;
+    public location.MirLocation! current_location;
+    public table.HashTable<BorrowDiagnosticKey, Bool>! reported_diagnostics;
 
     public init(
         context.CompilerContext& ctx,
@@ -94,22 +141,172 @@ struct FunctionBorrowChecker {
         mir.MirBody! body = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
         self.dataflow = BorrowDataflowState();
+        self.current_location = location.MirLocation(function.id, body.entry, .terminator, -1);
+        self.reported_diagnostics = table.HashTable<BorrowDiagnosticKey, Bool>();
     }
 
     public () check() {
-        Int! block_index = 0;
-        while (block_index < self.body.blocks.length) {
-            self.check_block(self.body.blocks[block_index]);
-            block_index = block_index + 1;
+        Int block_count = self.body.blocks.length;
+        if (block_count == 0) {
+            return;
         }
+
+        BorrowDataflowState![*] in_states = BorrowDataflowState!$.alloc_array(block_count);
+        Bool![*] reachable = Bool!$.alloc_array(block_count);
+        Bool![*] queued = Bool!$.alloc_array(block_count);
+        self.init_dataflow_arrays(in_states, reachable, queued, block_count);
+
+        list.ArrayList<Int>! worklist = list.ArrayList<Int>();
+        Int entry_index = self.body.entry.to_index();
+        if (!self.valid_block_index(entry_index)) {
+            return;
+        }
+        self.enqueue_block(entry_index, reachable, queued, worklist$.ref());
+
+        while (!worklist.empty()) {
+            Int block_index = worklist.pop();
+            queued[block_index] = false;
+            self.dataflow = self.clone_state(in_states[block_index]$.ref());
+            self.check_block(self.body.blocks[block_index]);
+            self.propagate_successors(
+                self.body.blocks[block_index],
+                in_states,
+                reachable,
+                queued,
+                worklist$.ref()
+            );
+        }
+    }
+
+    () init_dataflow_arrays(
+        BorrowDataflowState![*] in_states,
+        Bool![*] reachable,
+        Bool![*] queued,
+        Int block_count
+    ) {
+        Int! index = 0;
+        while (index < block_count) {
+            in_states[index] = BorrowDataflowState();
+            reachable[index] = false;
+            queued[index] = false;
+            index = index + 1;
+        }
+    }
+
+    Bool valid_block_index(Int block_index) {
+        return block_index >= 0 && block_index < self.body.blocks.length;
+    }
+
+    () enqueue_block(
+        Int block_index,
+        Bool![*] reachable,
+        Bool![*] queued,
+        list.ArrayList<Int>& worklist
+    ) {
+        reachable[block_index] = true;
+        if (queued[block_index]) {
+            return;
+        }
+        queued[block_index] = true;
+        worklist.add(block_index);
+    }
+
+    () propagate_successors(
+        mir.MirBlock block,
+        BorrowDataflowState![*] in_states,
+        Bool![*] reachable,
+        Bool![*] queued,
+        list.ArrayList<Int>& worklist
+    ) {
+        Int! successor_index = 0;
+        while (successor_index < mir.terminator_successor_count(block.terminator)) {
+            mir.MirBlockId successor = mir.terminator_successor_at(block.terminator, successor_index);
+            self.propagate_successor(successor, in_states, reachable, queued, worklist);
+            successor_index = successor_index + 1;
+        }
+    }
+
+    () propagate_successor(
+        mir.MirBlockId successor,
+        BorrowDataflowState![*] in_states,
+        Bool![*] reachable,
+        Bool![*] queued,
+        list.ArrayList<Int>& worklist
+    ) {
+        Int successor_index = successor.to_index();
+        if (!self.valid_block_index(successor_index)) {
+            return;
+        }
+
+        Bool was_reachable = reachable[successor_index];
+        Bool changed = self.merge_state(in_states[successor_index]$.ref(), self.dataflow$.ref());
+        if (!was_reachable || changed) {
+            self.enqueue_block(successor_index, reachable, queued, worklist);
+        }
+    }
+
+    BorrowDataflowState clone_state(BorrowDataflowState& source) {
+        BorrowDataflowState! clone = BorrowDataflowState();
+        self.merge_state(clone$.ref(), source);
+        return clone;
+    }
+
+    // CFG 合流采用 may-analysis：任一前驱 move/borrow 过的 path，在后继入口都视为可能存在。
+    Bool merge_state(BorrowDataflowState& target, BorrowDataflowState& source) {
+        Bool! changed = false;
+        Int! index = 0;
+        while (index < self.paths.len()) {
+            move_path.MovePathId path = move_path.MovePathId(index);
+            changed = self.merge_moved_path(target, source, path) || changed;
+            changed = self.merge_active_loan(target, source, path) || changed;
+            index = index + 1;
+        }
+        return changed;
+    }
+
+    Bool merge_moved_path(
+        BorrowDataflowState& target,
+        BorrowDataflowState& source,
+        move_path.MovePathId path
+    ) {
+        if (!source.moved.has(path)) {
+            return false;
+        }
+        if (target.moved.has(path)) {
+            return false;
+        }
+        target.moved.set(path, true);
+        return true;
+    }
+
+    Bool merge_active_loan(
+        BorrowDataflowState& target,
+        BorrowDataflowState& source,
+        move_path.MovePathId path
+    ) {
+        guard source.active_loans.get(path) is some loan_id else {
+            return false;
+        }
+        if (target.active_loans.has(path)) {
+            return false;
+        }
+        target.active_loans.set(path, loan_id);
+        return true;
     }
 
     () check_block(mir.MirBlock block) {
         Int! stmt_index = 0;
         while (stmt_index < block.statements.length) {
+            self.current_location = location.MirLocation(
+                self.function_id,
+                block.id,
+                .statement,
+                stmt_index
+            );
             self.check_statement(block.statements[stmt_index]);
             stmt_index = stmt_index + 1;
         }
+        self.current_location = location.MirLocation(self.function_id, block.id, .terminator, -1);
         self.check_terminator(block.terminator);
     }
 
@@ -280,7 +477,7 @@ struct FunctionBorrowChecker {
             return;
         }
         if (terminator.kind is .drop_term(drop_term)) {
-            self.consume_place(drop_term.place);
+            self.check_drop(drop_term.place);
             return;
         }
         if (terminator.kind is .assert_term(assert_term)) {
@@ -295,6 +492,21 @@ struct FunctionBorrowChecker {
             self.check_operand(throw_term.error_value);
             self.check_operand_escape(throw_term.error_value);
         }
+    }
+
+    () check_drop(mir.MirPlace place) {
+        if (!self.place_needs_drop(place)) {
+            return;
+        }
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        self.check_place_use(place);
+        self.check_source_invalidation(path);
+        self.mark_moved(path);
+    }
+
+    Bool place_needs_drop(mir.MirPlace place) {
+        layout.DropCategoryKind category = layout_compute.drop_category_of_type(self.ctx, self.place_type(place));
+        return category != .no_drop;
     }
 
     () check_return(mir.MirReturnTerminator return_term) {
@@ -485,6 +697,9 @@ struct FunctionBorrowChecker {
     }
 
     () add_use_after_move_diagnostic() {
+        if (!self.record_diagnostic(1)) {
+            return;
+        }
         self.ctx.diagnostics.add(
             diagnostic.Diagnostic(
                 .error,
@@ -503,6 +718,9 @@ struct FunctionBorrowChecker {
     }
 
     () add_borrow_escape_diagnostic() {
+        if (!self.record_diagnostic(2)) {
+            return;
+        }
         self.ctx.diagnostics.add(
             diagnostic.Diagnostic(
                 .error,
@@ -515,6 +733,9 @@ struct FunctionBorrowChecker {
     }
 
     () add_borrow_invalidated_diagnostic() {
+        if (!self.record_diagnostic(3)) {
+            return;
+        }
         self.ctx.diagnostics.add(
             diagnostic.Diagnostic(
                 .error,
@@ -524,6 +745,15 @@ struct FunctionBorrowChecker {
                 "borrowed value is invalidated while borrowed"
             )
         );
+    }
+
+    Bool record_diagnostic(Int code) {
+        BorrowDiagnosticKey key = BorrowDiagnosticKey(self.current_location, code);
+        if (self.reported_diagnostics.has(key)) {
+            return false;
+        }
+        self.reported_diagnostics.set(key, true);
+        return true;
     }
 
     loan.LoanId? active_loan_for_path(move_path.MovePathId path) {
