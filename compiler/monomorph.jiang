@@ -1839,16 +1839,22 @@ Bool type_shape_matches(types.TypeTable& table, types.TypeId expected_type, type
     return true;
 }
 
-types.TypeId monomorph_dispatch_receiver_type(types.TypeTable& table, types.TypeId type_id) {
+types.TypeId monomorph_dispatch_receiver_type_depth(types.TypeTable& table, types.TypeId type_id, Int depth) {
     if (!type_id.valid()) { return type_id; }
+    if (depth > 64) { return types.TypeId(); }
+    if (type_id.id >= table.len()) { return types.TypeId(); }
     types.TypeInfo info = table.type_at(type_id);
     if (info.kind == .pointer && (info.pointer_kind == types.PointerKind.borrow || info.pointer_kind == types.PointerKind.owner)) {
         return info.element;
     }
     if (info.kind == .layer) {
-        return monomorph_dispatch_receiver_type(table, info.element);
+        return monomorph_dispatch_receiver_type_depth(table, info.element, depth + 1);
     }
     return type_id;
+}
+
+types.TypeId monomorph_dispatch_receiver_type(types.TypeTable& table, types.TypeId type_id) {
+    return monomorph_dispatch_receiver_type_depth(table, type_id, 0);
 }
 
 Bool monomorph_type_equal(types.TypeTable& table, types.TypeId left, types.TypeId right, Int depth) {
@@ -2046,6 +2052,12 @@ Bool instance_args_concrete(types.TypeTable& table, list.ArrayList<types.TypeId>
     return true;
 }
 
+Bool jir_expr_id_available(jir.JirModule^ input, jir.JirExprId expr_id) {
+    if (!expr_id.valid()) { return false; }
+    if (expr_id.id < 0) { return false; }
+    return expr_id.id < input.expr_count();
+}
+
 jir.JirDeclId lookup_instance(MonomorphContext^ mono, semantic_ctx.ModuleId template_module_id, semantic_ctx.ModuleId instance_module_id, scope.DeclId decl_id, list.ArrayList<types.TypeId> args) {
     Int! index = 0;
     while (index < mono.instances.len()) {
@@ -2103,10 +2115,20 @@ jir.JirDeclId instantiate_function(MonomorphContext^ mono, jir.JirModule^ templa
     return new_id;
 }
 
-Bool try_monomorphize_method_candidate(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExprId expr_id, jir.JirCallExpr^ call, jir.JirExpr callee, jir.JirFieldExpr^ field, jir.JirModule^ target_module, jir.JirDeclId target_decl_id, jir.JirDecl& target_decl) {
+Bool try_monomorphize_method_candidate(
+    MonomorphContext^ mono,
+    jir.JirModule^ input,
+    jir.JirExprId expr_id,
+    jir.JirCallExpr^ call,
+    interner.Symbol method_symbol,
+    types.TypeId receiver_type,
+    jir.JirModule^ target_module,
+    jir.JirDeclId target_decl_id,
+    jir.JirDecl& target_decl
+) {
     if (target_decl.body is .function_decl(function_decl)) {
         if (function_decl.static_flag) { return false; }
-        if (function_decl.name.symbol.id != field.name.symbol.id) { return false; }
+        if (function_decl.name.symbol.id != method_symbol.id) { return false; }
         if (function_decl.params.len() != call.args.len() + 1) { return false; }
         types.TypeTable& table = mono.ctx.types_ref();
         list.ArrayList<TypeSubst>! substs = list.ArrayList<TypeSubst>();
@@ -2116,17 +2138,16 @@ Bool try_monomorphize_method_candidate(MonomorphContext^ mono, jir.JirModule^ in
             add_subst(substs$.ptr(), args$.ptr(), function_decl.generic_params[generic_arg_index].symbol.id, call.generic_type_args[generic_arg_index]);
             generic_arg_index = generic_arg_index + 1;
         }
-        jir.JirExpr base = input.expr_at(field.base);
         types.TypeId expected_receiver_type = monomorph_dispatch_receiver_type(table, function_decl.params[0].type_id);
-        types.TypeId! receiver_type = base.type_id;
+        types.TypeId! actual_receiver_type = receiver_type;
         if (call.method_receiver_type_id.valid()) {
-            receiver_type = call.method_receiver_type_id;
+            actual_receiver_type = call.method_receiver_type_id;
         }
-        if (type_shape_matches(table, expected_receiver_type, receiver_type, 0)) {
-            collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[0].type_id, receiver_type);
-            collect_receiver_owner_generic_substs(table, substs$.ptr(), args$.ptr(), function_decl$.ref(), receiver_type);
+        if (type_shape_matches(table, expected_receiver_type, actual_receiver_type, 0)) {
+            collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[0].type_id, actual_receiver_type);
+            collect_receiver_owner_generic_substs(table, substs$.ptr(), args$.ptr(), function_decl$.ref(), actual_receiver_type);
         } else {
-            types.TypeId! receiver_match_type = monomorph_dispatch_receiver_type(table, receiver_type);
+            types.TypeId! receiver_match_type = monomorph_dispatch_receiver_type(table, actual_receiver_type);
             if (!receiver_match_type.valid() && call.method_receiver_type_id.valid()) {
                 receiver_match_type = call.method_receiver_type_id;
             }
@@ -2136,11 +2157,14 @@ Bool try_monomorphize_method_candidate(MonomorphContext^ mono, jir.JirModule^ in
         }
         Int! index = 0;
         while (index < call.args.len()) {
-            jir.JirExpr arg = input.expr_at(call.args[index]);
+            jir.JirExprId arg_id = call.args[index];
+            if (!jir_expr_id_available(input, arg_id)) { return false; }
+            jir.JirExpr& arg = input.expr_ref_at(arg_id);
             collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[index + 1].type_id, arg.type_id);
             index = index + 1;
         }
-        jir.JirExpr call_expr = input.expr_at(expr_id);
+        if (!jir_expr_id_available(input, expr_id)) { return false; }
+        jir.JirExpr& call_expr = input.expr_ref_at(expr_id);
         collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.result_type, call_expr.type_id);
         if (args.len() == 0) { return false; }
         if (!instance_args_concrete(table, args)) { return false; }
@@ -2153,38 +2177,88 @@ Bool try_monomorphize_method_candidate(MonomorphContext^ mono, jir.JirModule^ in
     return false;
 }
 
-Bool try_monomorphize_method_call(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExprId expr_id, jir.JirCallExpr^ call) {
-    jir.JirExpr callee = input.expr_at(call.callee);
-    if (callee.body is .field_expr(field)) {
-        jir.JirExpr base_expr = input.expr_at(field.base);
-        if (base_expr.body is .implicit_expr(_)) { return false; }
-        if (base_expr.body is .type_value_expr(_)) { return false; }
-        Int! input_index = 0;
-        while (input_index < mono.input_count) {
-            jir.JirModule^ target_module = mono.inputs[input_index]$.as(jir.JirModule^);
-            Int! candidate_index = 0;
-            while (candidate_index < target_module.method_candidate_count()) {
-                if (!target_module.method_candidate_matches(candidate_index, field.name.symbol, call.args.len() + 1)) {
-                    candidate_index = candidate_index + 1;
-                    continue;
-                }
-                jir.JirDeclId target_decl_id = target_module.method_candidate_decl_id(candidate_index);
-                jir.JirDecl& target_decl = target_module.decl_ref_at(target_decl_id);
-                if (try_monomorphize_method_candidate(mono, input, expr_id, call, callee, field, target_module, target_decl_id, target_decl)) {
-                    return true;
-                }
+Bool try_monomorphize_method_with_receiver(
+    MonomorphContext^ mono,
+    jir.JirModule^ input,
+    jir.JirExprId expr_id,
+    jir.JirCallExpr^ call,
+    interner.Symbol method_symbol,
+    types.TypeId receiver_type
+) {
+    if (!method_symbol.valid() || !receiver_type.valid()) { return false; }
+
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ target_module = mono.inputs[input_index]$.as(jir.JirModule^);
+        Int! candidate_index = 0;
+        while (candidate_index < target_module.method_candidate_count()) {
+            if (!target_module.method_candidate_matches(candidate_index, method_symbol, call.args.len() + 1)) {
                 candidate_index = candidate_index + 1;
+                continue;
             }
-            input_index = input_index + 1;
+            jir.JirDeclId target_decl_id = target_module.method_candidate_decl_id(candidate_index);
+            jir.JirDecl& target_decl = target_module.decl_ref_at(target_decl_id);
+            if (
+                try_monomorphize_method_candidate(
+                    mono,
+                    input,
+                    expr_id,
+                    call,
+                    method_symbol,
+                    receiver_type,
+                    target_module,
+                    target_decl_id,
+                    target_decl
+                )
+            ) {
+                return true;
+            }
+            candidate_index = candidate_index + 1;
         }
+        input_index = input_index + 1;
     }
     return false;
 }
 
+Bool try_monomorphize_method_call_from_callee(
+    MonomorphContext^ mono,
+    jir.JirModule^ input,
+    jir.JirExprId expr_id,
+    jir.JirCallExpr^ call,
+    interner.Symbol method_symbol,
+    types.TypeId receiver_type
+) {
+    if (!jir_expr_id_available(input, call.callee)) { return false; }
+    interner.Symbol! resolved_symbol = method_symbol;
+    types.TypeId! resolved_receiver = receiver_type;
+    jir.JirExpr& callee = input.expr_ref_at(call.callee);
+    if (callee.body is .field_expr(field)) {
+        if (!resolved_symbol.valid()) { resolved_symbol = field.name.symbol; }
+        if (!resolved_receiver.valid()) {
+            if (!jir_expr_id_available(input, field.base)) { return false; }
+            jir.JirExpr& base_expr = input.expr_ref_at(field.base);
+            if (base_expr.body is .implicit_expr(_)) { return false; }
+            if (base_expr.body is .type_value_expr(_)) { return false; }
+            resolved_receiver = base_expr.type_id;
+        }
+        return try_monomorphize_method_with_receiver(mono, input, expr_id, call, resolved_symbol, resolved_receiver);
+    }
+    return false;
+}
+
+Bool try_monomorphize_method_call(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExprId expr_id, jir.JirCallExpr^ call) {
+    interner.Symbol! method_symbol = call.method_symbol;
+    types.TypeId! receiver_type = call.method_receiver_type_id;
+    if (method_symbol.valid() && receiver_type.valid()) {
+        return try_monomorphize_method_with_receiver(mono, input, expr_id, call, method_symbol, receiver_type);
+    }
+    return try_monomorphize_method_call_from_callee(mono, input, expr_id, call, method_symbol, receiver_type);
+}
+
 interner.Symbol static_call_method_symbol(jir.JirModule^ input, jir.JirCallExpr^ call) {
     if (call.method_symbol.valid()) { return call.method_symbol; }
-    if (!call.callee.valid()) { return interner.Symbol(); }
-    jir.JirExpr callee = input.expr_at(call.callee);
+    if (!jir_expr_id_available(input, call.callee)) { return interner.Symbol(); }
+    jir.JirExpr& callee = input.expr_ref_at(call.callee);
     if (callee.body is .field_expr(field)) {
         return field.name.symbol;
     }
@@ -2200,7 +2274,8 @@ Bool try_resolve_static_trait_method_call(MonomorphContext^ mono, jir.JirModule^
     interner.Symbol method_symbol = static_call_method_symbol(input, call);
     if (!method_symbol.valid()) { return false; }
     types.TypeTable& table = mono.ctx.types_ref();
-    jir.JirExpr call_expr = input.expr_at(expr_id);
+    if (!jir_expr_id_available(input, expr_id)) { return false; }
+    jir.JirExpr& call_expr = input.expr_ref_at(expr_id);
     types.TypeId! result_type = call_expr.type_id;
     if (result_type.valid()) {
         types.TypeInfo result_info = table.type_at(result_type);
@@ -2216,35 +2291,54 @@ Bool try_resolve_static_trait_method_call(MonomorphContext^ mono, jir.JirModule^
     Int! input_index = 0;
     while (input_index < mono.input_count) {
         jir.JirModule^ target_module = mono.inputs[input_index]$.as(jir.JirModule^);
-        Int! decl_index = 0;
-        while (decl_index < target_module.decl_count()) {
-            jir.JirDeclId target_decl_id = jir.JirDeclId(decl_index);
-            jir.JirDecl& target_decl = target_module.decl_ref_at(target_decl_id);
-            if (target_decl.body is .function_decl(function_decl)) {
-                if (function_decl.static_flag && function_decl.name.symbol.id == method_symbol.id && function_decl.params.len() == call.args.len()) {
-                    if (function_decl.result_type.valid()) {
-                        types.TypeInfo function_result_info = table.type_at(function_decl.result_type);
-                        if (function_result_info.kind != .type_param && type_shape_matches(table, function_decl.result_type, result_type, 0)) {
-                            Bool! args_match = true;
-                            Int! arg_index = 0;
-                            while (arg_index < call.args.len()) {
-                                jir.JirExpr arg = input.expr_at(call.args[arg_index]);
-                                if (!type_shape_matches(table, function_decl.params[arg_index].type_id, arg.type_id, 0)) {
-                                    args_match = false;
-                                }
-                                arg_index = arg_index + 1;
-                            }
-                            if (args_match && function_decl.generic_params.len() == 0) {
-                                input.set_call_target(expr_id, jir.JirCallTargetRef(target_module.module_id, target_decl_id));
-                                return true;
-                            }
-                        }
-                    }
-                }
+        Int! candidate_index = 0;
+        while (candidate_index < target_module.static_method_candidate_count()) {
+            if (!target_module.static_method_candidate_matches(candidate_index, method_symbol, call.args.len())) {
+                candidate_index = candidate_index + 1;
+                continue;
             }
-            decl_index = decl_index + 1;
+            jir.JirDeclId target_decl_id = target_module.static_method_candidate_decl_id(candidate_index);
+            if (static_trait_method_candidate_matches(table, input, call, result_type, target_module, target_decl_id)) {
+                input.set_call_target(expr_id, jir.JirCallTargetRef(target_module.module_id, target_decl_id));
+                return true;
+            }
+            candidate_index = candidate_index + 1;
         }
         input_index = input_index + 1;
+    }
+    return false;
+}
+
+Bool static_trait_method_candidate_matches(
+    types.TypeTable& table,
+    jir.JirModule^ input,
+    jir.JirCallExpr^ call,
+    types.TypeId result_type,
+    jir.JirModule^ target_module,
+    jir.JirDeclId target_decl_id
+) {
+    if (!target_decl_id.valid()) { return false; }
+    jir.JirDecl& target_decl = target_module.decl_ref_at(target_decl_id);
+    if (target_decl.body is .function_decl(function_decl)) {
+        if (!function_decl.result_type.valid()) { return false; }
+        types.TypeInfo function_result_info = table.type_at(function_decl.result_type);
+        if (function_result_info.kind == .type_param) { return false; }
+        if (!type_shape_matches(table, function_decl.result_type, result_type, 0)) {
+            return false;
+        }
+        if (function_decl.generic_params.len() != 0) { return false; }
+
+        Int! arg_index = 0;
+        while (arg_index < call.args.len()) {
+            jir.JirExprId arg_id = call.args[arg_index];
+            if (!jir_expr_id_available(input, arg_id)) { return false; }
+            jir.JirExpr& arg = input.expr_ref_at(arg_id);
+            if (!type_shape_matches(table, function_decl.params[arg_index].type_id, arg.type_id, 0)) {
+                return false;
+            }
+            arg_index = arg_index + 1;
+        }
+        return true;
     }
     return false;
 }
@@ -2298,11 +2392,13 @@ Bool monomorphize_call(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExpr
             index = index + 1;
         }
         Bool! method_call = false;
-        jir.JirExpr callee = input.expr_at(call.callee);
+        if (!jir_expr_id_available(input, call.callee)) { return false; }
+        jir.JirExpr& callee = input.expr_ref_at(call.callee);
         if (callee.body is .field_expr(field)) {
             method_call = function_decl.params.len() == call.args.len() + 1;
             if (method_call && function_decl.params.len() > 0) {
-                jir.JirExpr base = input.expr_at(field.base);
+                if (!jir_expr_id_available(input, field.base)) { return false; }
+                jir.JirExpr& base = input.expr_ref_at(field.base);
                 types.TypeId expected_receiver_type = monomorph_dispatch_receiver_type(table, function_decl.params[0].type_id);
                 types.TypeId receiver_type = base.type_id;
                 if (type_shape_matches(table, expected_receiver_type, receiver_type, 0)) {
@@ -2323,12 +2419,15 @@ Bool monomorphize_call(MonomorphContext^ mono, jir.JirModule^ input, jir.JirExpr
             Int! param_index = index;
             if (method_call) { param_index = index + 1; }
             if (param_index < function_decl.params.len()) {
-                jir.JirExpr arg = input.expr_at(call.args[index]);
+                jir.JirExprId arg_id = call.args[index];
+                if (!jir_expr_id_available(input, arg_id)) { return false; }
+                jir.JirExpr& arg = input.expr_ref_at(arg_id);
                 collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.params[param_index].type_id, arg.type_id);
             }
             index = index + 1;
         }
-        jir.JirExpr call_expr = input.expr_at(expr_id);
+        if (!jir_expr_id_available(input, expr_id)) { return false; }
+        jir.JirExpr& call_expr = input.expr_ref_at(expr_id);
         collect_type_substs(table, substs$.ptr(), args$.ptr(), function_decl.result_type, call_expr.type_id);
         if (args.len() == 0) { return false; }
         if (!instance_args_concrete(table, args)) { return false; }
@@ -3042,25 +3141,33 @@ Bool mark_stmt_exprs_nested(jir.JirModule^ input, jir.JirStmt& stmt, list.ArrayL
             }
             active_index = active_index + 1;
         }
-        Int! input_index = 0;
-        while (input_index < mono.input_count) {
-            jir.JirModule^ input = mono.inputs[input_index]$.as(jir.JirModule^);
-            Int! expr_index = 0;
-            while (expr_index < input.expr_count()) {
-                jir.JirExprId expr_id = jir.JirExprId(expr_index);
-                if (!input.monomorph_expr_marked(true, expr_id)) {
-                    jir.JirExpr& expr = input.expr_ref_at(expr_id);
-                    if (expr.body is .call_expr(call)) {
-                        if (monomorphize_call(mono$.ptr(), input, expr_id, call)) {
-                            changed = true;
-                        }
-                    }
-                }
-                expr_index = expr_index + 1;
-            }
-            input_index = input_index + 1;
+        if (monomorphize_unmarked_module_calls(mono)) {
+            changed = true;
         }
     }
+}
+
+Bool monomorphize_unmarked_module_calls(MonomorphContext^ mono) {
+    Bool! changed = false;
+    Int! input_index = 0;
+    while (input_index < mono.input_count) {
+        jir.JirModule^ input = mono.inputs[input_index]$.as(jir.JirModule^);
+        Int! expr_index = 0;
+        while (expr_index < input.expr_count()) {
+            jir.JirExprId expr_id = jir.JirExprId(expr_index);
+            if (!input.monomorph_expr_marked(true, expr_id)) {
+                jir.JirExpr& expr = input.expr_ref_at(expr_id);
+                if (expr.body is .call_expr(call)) {
+                    if (monomorphize_call(mono, input, expr_id, call)) {
+                        changed = true;
+                    }
+                }
+            }
+            expr_index = expr_index + 1;
+        }
+        input_index = input_index + 1;
+    }
+    return changed;
 }
 
 public () monomorphize_jir_modules(context.CompilerContext& ctx, Int![*] inputs, Int input_count) {
