@@ -1,0 +1,220 @@
+// LLVM type lowering。
+//
+// 这一层只负责把 semantic TypeId / layout fact 映射成 LLVM Type，并提供
+// projection lowering 需要的 layout field 查询。它不生成 LLVM instruction。
+
+import layout_compute = "../../layout/compute.jiang";
+import layout = "../../layout/layout.jiang";
+import qid = "../../query/id.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import ffi = "./ffi.jiang";
+import llvm_state = "./state.jiang";
+
+public ffi.Type lower_type(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    if (info.data is .invalid) {
+        return ffi.Type();
+    }
+    if (info.data is .never) {
+        return ffi.context_void_type(state.llvm_context);
+    }
+    if (info.data is .unit) {
+        return ffi.context_void_type(state.llvm_context);
+    }
+    if (info.data is .bool_type) {
+        return ffi.context_int_type(state.llvm_context, 1);
+    }
+    if (info.data is .char_type) {
+        return ffi.context_int_type(state.llvm_context, 32);
+    }
+    if (info.data is .int_type(int_type)) {
+        return lower_int_type(state, int_type);
+    }
+    if (info.data is .float_type(float_type)) {
+        return lower_float_type(state, float_type);
+    }
+    if (info.data is .handle_type) {
+        return ffi.context_pointer_type(state.llvm_context);
+    }
+    if (info.data is .function_type) {
+        return ffi.context_pointer_type(state.llvm_context);
+    }
+    return lower_layout_backed_type(state, type_id);
+}
+
+public ffi.Type lower_int_type(llvm_state.LowerState& state, types.IntType int_type) {
+    Int! bits = int_type.bits;
+    if (bits == 0) {
+        bits = state.ctx.query.layouts.target.pointer_size * 8;
+    }
+    return ffi.context_int_type(state.llvm_context, bits);
+}
+
+public ffi.Type lower_float_type(llvm_state.LowerState& state, types.FloatType float_type) {
+    if (float_type.bits == 32) {
+        return ffi.context_float_type(state.llvm_context);
+    }
+    return ffi.context_double_type(state.llvm_context);
+}
+
+public Int int_type_bits(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    if (info.data is .int_type(int_type)) {
+        if (int_type.bits == 0) {
+            return state.ctx.query.layouts.target.pointer_size * 8;
+        }
+        return int_type.bits;
+    }
+    if (info.data is .bool_type) { return 1; }
+    if (info.data is .char_type) { return 32; }
+    return state.ctx.query.layouts.target.pointer_size * 8;
+}
+
+public Int float_type_bits(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    if (info.data is .float_type(float_type)) {
+        return float_type.bits;
+    }
+    return 64;
+}
+
+public Bool type_is_unit_or_never(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    if (info.data is .unit) { return true; }
+    if (info.data is .never) { return true; }
+    return false;
+}
+
+public Bool type_is_slice(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    if (info.data is .handle_type(handle_type)) {
+        return handle_type.kind == .slice;
+    }
+    return false;
+}
+
+public Bool type_is_handle(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    return info.data is .handle_type(_);
+}
+
+public qid.TypeId element_type(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    if (info.data is .handle_type(handle_type)) {
+        return handle_type.element;
+    }
+    if (info.data is .optional(optional_type)) {
+        return optional_type.element;
+    }
+    return state.ctx.query.types.invalid_type();
+}
+
+public qid.TypeId constant_index_type(llvm_state.LowerState& state, qid.TypeId type_id, Int offset) {
+    if (offset < layout_field_count(state, type_id)) {
+        return layout_for_type(state, type_id).fields[offset].field_type;
+    }
+    return element_type(state, type_id);
+}
+
+public Int layout_field_count(llvm_state.LowerState& state, qid.TypeId type_id) {
+    layout.TypeLayout type_layout = layout_for_type(state, type_id);
+    return type_layout.fields.length;
+}
+
+public Int layout_field_element_index(llvm_state.LowerState& state, qid.TypeId type_id, Int field_index) {
+    layout.TypeLayout type_layout = layout_for_type(state, type_id);
+    Int! element_index = 0;
+    Int! offset = 0;
+    Int! index = 0;
+    while (index < field_index) {
+        layout.FieldLayout field = type_layout.fields[index];
+        if (field.offset > offset) {
+            element_index = element_index + 1;
+        }
+        element_index = element_index + 1;
+        offset = field.offset + layout_size(state, field.field_type);
+        index = index + 1;
+    }
+    if (type_layout.fields[field_index].offset > offset) {
+        element_index = element_index + 1;
+    }
+    return element_index;
+}
+
+public Int? layout_field_index_for_def(llvm_state.LowerState& state, qid.TypeId type_id, qid.DefId field_def) {
+    layout.TypeLayout type_layout = layout_for_type(state, type_id);
+    Int! index = 0;
+    while (index < type_layout.fields.length) {
+        if (type_layout.fields[index].field_def is some candidate) {
+            if (candidate == field_def) {
+                return index;
+            }
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+public layout.TypeLayout layout_for_type(llvm_state.LowerState& state, qid.TypeId type_id) {
+    layout.LayoutId layout_id = layout_compute.layout_of_type(state.ctx, type_id);
+    return state.ctx.query.layouts.layout(layout_id);
+}
+
+public Int layout_size(llvm_state.LowerState& state, qid.TypeId type_id) {
+    return layout_for_type(state, type_id).size;
+}
+
+ffi.Type lower_layout_backed_type(llvm_state.LowerState& state, qid.TypeId type_id) {
+    layout.TypeLayout type_layout = layout_for_type(state, type_id);
+    if (type_layout.kind == .invalid) {
+        return ffi.Type();
+    }
+    if (type_layout.kind == .zero_sized) {
+        return ffi.context_void_type(state.llvm_context);
+    }
+    if (type_layout.kind == .scalar) {
+        return ffi.context_int_type(state.llvm_context, type_layout.size * 8);
+    }
+    if (type_layout.kind == .function_pointer) {
+        return ffi.context_pointer_type(state.llvm_context);
+    }
+    return lower_aggregate_layout_type(state, type_layout);
+}
+
+ffi.Type lower_aggregate_layout_type(llvm_state.LowerState& state, layout.TypeLayout type_layout) {
+    list.ArrayList<ffi.Type>! elements = list.ArrayList<ffi.Type>(type_layout.fields.length);
+    Int! offset = 0;
+    Int! index = 0;
+    while (index < type_layout.fields.length) {
+        layout.FieldLayout field = type_layout.fields[index];
+        if (field.offset < offset) {
+            return lower_byte_array_type(state, type_layout.size);
+        }
+        add_padding_elements(state, elements$.ref(), field.offset - offset);
+        ffi.Type field_type = lower_type(state, field.field_type);
+        if (!ffi.type_valid(field_type)) {
+            return ffi.Type();
+        }
+        elements.add(field_type);
+        layout.TypeLayout field_layout = layout_for_type(state, field.field_type);
+        offset = field.offset + field_layout.size;
+        index = index + 1;
+    }
+    add_padding_elements(state, elements$.ref(), type_layout.size - offset);
+    return ffi.context_struct_type(state.llvm_context, elements$.ref());
+}
+
+ffi.Type lower_byte_array_type(llvm_state.LowerState& state, Int size) {
+    if (size <= 0) {
+        return ffi.context_void_type(state.llvm_context);
+    }
+    return ffi.array_type(ffi.context_int_type(state.llvm_context, 8), size);
+}
+
+() add_padding_elements(llvm_state.LowerState& state, list.ArrayList<ffi.Type>& elements, Int size) {
+    if (size <= 0) {
+        return;
+    }
+    elements.add(lower_byte_array_type(state, size));
+}

@@ -1,0 +1,232 @@
+// MIR place -> LLVM pointer/value lowering。
+//
+// MIR place 负责描述 local + projection。这里把 projection walk 集中起来，
+// 避免 rvalue/terminator lowering 直接关心 field、deref、index 的 LLVM GEP 细节。
+
+import mir = "../../mir/mir.jiang";
+import qid = "../../query/id.jiang";
+import list = "../../support/list.jiang";
+import ffi = "./ffi.jiang";
+import llvm_state = "./state.jiang";
+import llvm_type = "./type.jiang";
+
+public qid.TypeId place_type(llvm_state.LowerState& state, mir.MirBody body, mir.MirPlace place) {
+    qid.TypeId! current = local_type(body, place.local_id);
+    Int! index = 0;
+    while (index < place.projection.length) {
+        mir.MirPlaceElem elem = place.projection[index];
+        if (elem is .field_projection(field)) {
+            current = field.field_type;
+        } else if (elem is .deref_projection) {
+            current = llvm_type.element_type(state, current);
+        } else if (elem is .index_projection) {
+            current = llvm_type.element_type(state, current);
+        } else if (elem is .constant_index_projection(constant_index)) {
+            current = llvm_type.constant_index_type(state, current, constant_index.offset);
+        } else {
+            return state.ctx.query.types.invalid_type();
+        }
+        index = index + 1;
+    }
+    return current;
+}
+
+public ffi.Value lower_local_load(
+    llvm_state.LowerState& state,
+    mir.MirLocalDecl local,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Type type = llvm_type.lower_type(state, local.type_id);
+    if (!ffi.type_valid(type)) {
+        return ffi.Value();
+    }
+    ffi.Value slot = local_slots.get(local.id.to_index());
+    if (!ffi.value_valid(slot)) {
+        return ffi.Value();
+    }
+    return ffi.builder_build_load(state.builder, type, slot);
+}
+
+public ffi.Value lower_place_value(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirPlace place,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value pointer = lower_place_pointer(state, body, place, local_slots);
+    if (!ffi.value_valid(pointer)) {
+        return ffi.Value();
+    }
+    ffi.Type type = llvm_type.lower_type(state, place_type(state, body, place));
+    if (!ffi.type_valid(type)) {
+        return ffi.Value();
+    }
+    return ffi.builder_build_load(state.builder, type, pointer);
+}
+
+public ffi.Value lower_place_pointer(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirPlace place,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value! pointer = local_slots.get(place.local_id.to_index());
+    qid.TypeId! current_type = local_type(body, place.local_id);
+    Int! index = 0;
+    while (index < place.projection.length) {
+        mir.MirPlaceElem elem = place.projection[index];
+        pointer = lower_projection_elem(state, pointer, current_type, elem, local_slots);
+        if (!ffi.value_valid(pointer)) {
+            return ffi.Value();
+        }
+        current_type = next_projection_type(state, current_type, elem);
+        index = index + 1;
+    }
+    return pointer;
+}
+
+ffi.Value lower_projection_elem(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    qid.TypeId current_type,
+    mir.MirPlaceElem elem,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (elem is .deref_projection) {
+        return lower_deref_pointer(state, pointer);
+    }
+    if (elem is .field_projection(field)) {
+        return lower_field_pointer(state, pointer, current_type, field.field_def);
+    }
+    if (elem is .index_projection(index_projection)) {
+        return lower_index_pointer(state, pointer, current_type, index_projection.index_local, local_slots);
+    }
+    if (elem is .constant_index_projection(constant_index)) {
+        return lower_constant_index_pointer(state, pointer, current_type, constant_index.offset);
+    }
+    return ffi.Value();
+}
+
+qid.TypeId next_projection_type(llvm_state.LowerState& state, qid.TypeId current_type, mir.MirPlaceElem elem) {
+    if (elem is .field_projection(field)) {
+        return field.field_type;
+    }
+    if (elem is .constant_index_projection(constant_index)) {
+        return llvm_type.constant_index_type(state, current_type, constant_index.offset);
+    }
+    return llvm_type.element_type(state, current_type);
+}
+
+ffi.Value lower_deref_pointer(llvm_state.LowerState& state, ffi.Value pointer) {
+    ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context);
+    return ffi.builder_build_load(state.builder, pointer_type, pointer);
+}
+
+ffi.Value lower_field_pointer(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    qid.TypeId owner_type,
+    qid.DefId field_def
+) {
+    if (llvm_type.layout_field_index_for_def(state, owner_type, field_def) is some field_index) {
+        return lower_layout_field_pointer(state, pointer, owner_type, field_index);
+    }
+    return ffi.Value();
+}
+
+ffi.Value lower_layout_field_pointer(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    qid.TypeId owner_type,
+    Int field_index
+) {
+    ffi.Type owner_llvm_type = llvm_type.lower_type(state, owner_type);
+    if (!ffi.type_valid(owner_llvm_type)) {
+        return ffi.Value();
+    }
+
+    list.ArrayList<ffi.Value>! indices = list.ArrayList<ffi.Value>(2);
+    indices.add(int32_value(state, 0));
+    indices.add(int32_value(state, llvm_type.layout_field_element_index(state, owner_type, field_index)));
+    return ffi.builder_build_gep(state.builder, owner_llvm_type, pointer, indices$.ref());
+}
+
+ffi.Value lower_index_pointer(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    qid.TypeId owner_type,
+    mir.MirLocalId index_local,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value index_value = lower_local_index_value(state, index_local, local_slots);
+    return lower_dynamic_index_pointer(state, pointer, owner_type, index_value);
+}
+
+ffi.Value lower_constant_index_pointer(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    qid.TypeId owner_type,
+    Int offset
+) {
+    if (offset < llvm_type.layout_field_count(state, owner_type)) {
+        return lower_layout_field_pointer(state, pointer, owner_type, offset);
+    }
+    return lower_dynamic_index_pointer(state, pointer, owner_type, int32_value(state, offset));
+}
+
+ffi.Value lower_dynamic_index_pointer(
+    llvm_state.LowerState& state,
+    ffi.Value pointer,
+    qid.TypeId owner_type,
+    ffi.Value index_value
+) {
+    if (!ffi.value_valid(index_value)) {
+        return ffi.Value();
+    }
+    qid.TypeId element_type = llvm_type.element_type(state, owner_type);
+    ffi.Type element_llvm_type = llvm_type.lower_type(state, element_type);
+    if (!ffi.type_valid(element_llvm_type)) {
+        return ffi.Value();
+    }
+
+    ffi.Value data_pointer = lower_index_base_pointer(state, pointer, owner_type);
+    if (!ffi.value_valid(data_pointer)) {
+        return ffi.Value();
+    }
+
+    list.ArrayList<ffi.Value>! indices = list.ArrayList<ffi.Value>(1);
+    indices.add(index_value);
+    return ffi.builder_build_gep(state.builder, element_llvm_type, data_pointer, indices$.ref());
+}
+
+ffi.Value lower_index_base_pointer(llvm_state.LowerState& state, ffi.Value pointer, qid.TypeId owner_type) {
+    if (llvm_type.type_is_slice(state, owner_type)) {
+        ffi.Value data_field = lower_layout_field_pointer(state, pointer, owner_type, 0);
+        return lower_deref_pointer(state, data_field);
+    }
+    if (llvm_type.type_is_handle(state, owner_type)) {
+        return lower_deref_pointer(state, pointer);
+    }
+    return pointer;
+}
+
+ffi.Value lower_local_index_value(
+    llvm_state.LowerState& state,
+    mir.MirLocalId index_local,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value slot = local_slots.get(index_local.to_index());
+    if (!ffi.value_valid(slot)) {
+        return ffi.Value();
+    }
+    ffi.Type int_type = ffi.context_int_type(state.llvm_context, 64);
+    return ffi.builder_build_load(state.builder, int_type, slot);
+}
+
+qid.TypeId local_type(mir.MirBody body, mir.MirLocalId local_id) {
+    return body.locals[local_id.to_index()].type_id;
+}
+
+ffi.Value int32_value(llvm_state.LowerState& state, Int value) {
+    return ffi.const_int(ffi.context_int_type(state.llvm_context, 32), UInt64(value));
+}

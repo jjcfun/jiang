@@ -1,0 +1,224 @@
+// MIR terminator -> LLVM terminator instruction lowering。
+//
+// terminator 是 CFG 的唯一出口。本文件只负责 block 之间的跳转、return、
+// call terminator 等控制流指令，表达式值统一委托给 value helper。
+
+import mir = "../../mir/mir.jiang";
+import qid = "../../query/id.jiang";
+import list = "../../support/list.jiang";
+import ffi = "./ffi.jiang";
+import llvm_state = "./state.jiang";
+import llvm_place = "./place.jiang";
+import llvm_type = "./type.jiang";
+import llvm_value = "./value.jiang";
+
+public Bool lower_terminator(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirTerminator terminator,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (terminator.kind is .goto_term(goto_term)) {
+        return ffi.value_valid(ffi.builder_build_br(state.builder, blocks.get(goto_term.target.to_index())));
+    }
+    if (terminator.kind is .branch_term(branch_term)) {
+        return lower_branch_terminator(state, body, branch_term, blocks, local_slots);
+    }
+    if (terminator.kind is .switch_term(switch_term)) {
+        return lower_switch_terminator(state, body, switch_term, blocks, local_slots);
+    }
+    if (terminator.kind is .call_term(call_term)) {
+        return lower_call_terminator(state, body, call_term, blocks, local_slots);
+    }
+    if (terminator.kind is .return_term(return_term)) {
+        return lower_return_terminator(state, body, return_term, local_slots);
+    }
+    if (terminator.kind is .unreachable_term) {
+        return ffi.value_valid(ffi.builder_build_unreachable(state.builder));
+    }
+    return ffi.value_valid(ffi.builder_build_unreachable(state.builder));
+}
+
+Bool lower_branch_terminator(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirBranchTerminator branch_term,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value condition = llvm_value.lower_operand(state, body, branch_term.condition, local_slots);
+    if (!ffi.value_valid(condition)) {
+        return false;
+    }
+    return ffi.value_valid(
+        ffi.builder_build_cond_br(
+            state.builder,
+            condition,
+            blocks.get(branch_term.then_target.to_index()),
+            blocks.get(branch_term.else_target.to_index())
+        )
+    );
+}
+
+Bool lower_switch_terminator(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirSwitchTerminator switch_term,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value discriminator = llvm_value.lower_operand(
+        state,
+        body,
+        switch_term.discriminator,
+        local_slots
+    );
+    if (!ffi.value_valid(discriminator)) {
+        return false;
+    }
+    ffi.Value switch_value = ffi.builder_build_switch(
+        state.builder,
+        discriminator,
+        blocks.get(switch_term.default_target.to_index()),
+        switch_term.cases.length
+    );
+    if (!ffi.value_valid(switch_value)) {
+        return false;
+    }
+    Int! index = 0;
+    while (index < switch_term.cases.length) {
+        mir.MirSwitchCase switch_case = switch_term.cases[index];
+        ffi.Value case_value = llvm_value.lower_const(state, switch_case.value);
+        if (!ffi.value_valid(case_value)) {
+            return false;
+        }
+        ffi.switch_add_case(switch_value, case_value, blocks.get(switch_case.target.to_index()));
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool lower_call_terminator(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirCallTerminator call_term,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value callee = llvm_value.lower_operand(state, body, call_term.callee, local_slots);
+    if (!ffi.value_valid(callee)) {
+        return false;
+    }
+    list.ArrayList<ffi.Value>! args = lower_call_args(state, body, call_term, local_slots);
+    if (args.len() != call_term.args.length) {
+        return false;
+    }
+    qid.TypeId result_type = local_type(state, body, call_term.destination.local_id);
+    ffi.Type function_type = lower_call_function_type(state, body, call_term, result_type);
+    if (!ffi.type_valid(function_type)) {
+        return false;
+    }
+    ffi.Value result = ffi.builder_build_call(state.builder, function_type, callee, args$.ref());
+    if (!ffi.value_valid(result)) {
+        return false;
+    }
+    if (!store_call_result(state, body, call_term.destination, result, result_type, local_slots)) {
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_br(state.builder, blocks.get(call_term.target.to_index())));
+}
+
+list.ArrayList<ffi.Value> lower_call_args(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirCallTerminator call_term,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(call_term.args.length);
+    Int! index = 0;
+    while (index < call_term.args.length) {
+        ffi.Value arg = llvm_value.lower_operand(state, body, call_term.args[index], local_slots);
+        if (!ffi.value_valid(arg)) {
+            return args;
+        }
+        args.add(arg);
+        index = index + 1;
+    }
+    return args;
+}
+
+ffi.Type lower_call_function_type(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirCallTerminator call_term,
+    qid.TypeId result_type
+) {
+    ffi.Type return_type = llvm_type.lower_type(state, result_type);
+    if (!ffi.type_valid(return_type)) {
+        return ffi.Type();
+    }
+    list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(call_term.args.length);
+    Int! index = 0;
+    while (index < call_term.args.length) {
+        qid.TypeId arg_type = llvm_value.operand_type(state, body, call_term.args[index]);
+        ffi.Type param_type = llvm_type.lower_type(state, arg_type);
+        if (!ffi.type_valid(param_type)) {
+            return ffi.Type();
+        }
+        params.add(param_type);
+        index = index + 1;
+    }
+    return ffi.function_type(return_type, params$.ref());
+}
+
+Bool store_call_result(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirPlace destination,
+    ffi.Value result,
+    qid.TypeId result_type,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (llvm_type.type_is_unit_or_never(state, result_type)) {
+        return true;
+    }
+    ffi.Value pointer = llvm_place.lower_place_pointer(state, body, destination, local_slots);
+    if (!ffi.value_valid(pointer)) {
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_store(state.builder, result, pointer));
+}
+
+Bool lower_return_terminator(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirReturnTerminator return_term,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (return_term.implicit_unit) {
+        return ffi.value_valid(ffi.builder_build_return_void(state.builder));
+    }
+    qid.TypeId return_type = local_type(state, body, body.return_local);
+    if (llvm_type.type_is_unit_or_never(state, return_type)) {
+        return ffi.value_valid(ffi.builder_build_return_void(state.builder));
+    }
+    return lower_return_value(state, body, local_slots);
+}
+
+Bool lower_return_value(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    mir.MirLocalDecl return_local = body.locals[body.return_local.to_index()];
+    ffi.Value llvm_value = llvm_place.lower_local_load(state, return_local, local_slots);
+    if (!ffi.value_valid(llvm_value)) {
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_return(state.builder, llvm_value));
+}
+
+qid.TypeId local_type(llvm_state.LowerState& state, mir.MirBody body, mir.MirLocalId local_id) {
+    return body.locals[local_id.to_index()].type_id;
+}
