@@ -4,6 +4,43 @@ import layout_compute = "../layout/compute.jiang";
 import list = "../support/list.jiang";
 import mir = "./mir.jiang";
 
+struct LocalMoveState {
+    public Bool![*] moved;
+    public Int length;
+
+    public init(Int length) {
+        self.length = length;
+        self.moved = Bool!$.alloc_array(length);
+        Int! index = 0;
+        while (index < length) {
+            self.moved[index] = false;
+            index = index + 1;
+        }
+    }
+
+    public Bool is_moved(mir.MirLocalId local_id) {
+        Int index = local_id.to_index();
+        if (index < 0 || index >= self.length) {
+            return false;
+        }
+        return self.moved[index];
+    }
+
+    public () mark_moved(mir.MirLocalId local_id) {
+        Int index = local_id.to_index();
+        if (index >= 0 && index < self.length) {
+            self.moved[index] = true;
+        }
+    }
+
+    public () clear_moved(mir.MirLocalId local_id) {
+        Int index = local_id.to_index();
+        if (index >= 0 && index < self.length) {
+            self.moved[index] = false;
+        }
+    }
+}
+
 public mir.MirStore^ elaborate_package(
     context.CompilerContext& ctx,
     mir.MirStore^ input,
@@ -35,7 +72,8 @@ mir.MirFunction elaborate_function(
 
     Int original_block_count = body.blocks.length;
     list.ArrayList<mir.MirBlock>! blocks = copy_blocks(body.blocks);
-    elaborate_return_blocks(ctx, output, body, original_block_count, blocks$.ref());
+    LocalMoveState![*] moved_after_blocks = analyze_moved_locals(body);
+    elaborate_return_blocks(ctx, output, body, original_block_count, moved_after_blocks, blocks$.ref());
 
     return copy_function(output, function, output.block_array(blocks$.ref()));
 }
@@ -55,11 +93,12 @@ list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
     mir.MirStore^ output,
     mir.MirBody body,
     Int original_block_count,
+    LocalMoveState![*] moved_after_blocks,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
     Int! block_index = 0;
     while (block_index < original_block_count) {
-        elaborate_return_block(ctx, output, body, blocks.get(block_index), blocks);
+        elaborate_return_block(ctx, output, body, blocks.get(block_index), moved_after_blocks[block_index], blocks);
         block_index = block_index + 1;
     }
 }
@@ -69,6 +108,7 @@ list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
     mir.MirStore^ output,
     mir.MirBody body,
     mir.MirBlock block,
+    LocalMoveState moved_after_block,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
     guard block.terminator.kind is .return_term(return_term) else {
@@ -78,7 +118,7 @@ list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
     mir.MirBlockId final_return = mir.MirBlockId.from_index(blocks.len());
     blocks.add(return_block(output, final_return, block, return_term));
 
-    mir.MirBlockId target = append_drop_chain(ctx, output, body, block, final_return, blocks);
+    mir.MirBlockId target = append_drop_chain(ctx, output, body, block, moved_after_block, final_return, blocks);
     blocks.set(block.id.to_index(), goto_block(block, target));
 }
 
@@ -87,6 +127,7 @@ mir.MirBlockId append_drop_chain(
     mir.MirStore^ output,
     mir.MirBody body,
     mir.MirBlock block,
+    LocalMoveState moved_after_block,
     mir.MirBlockId final_return,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
@@ -95,7 +136,7 @@ mir.MirBlockId append_drop_chain(
     while (local_index >= 0) {
         mir.MirLocalDecl local = body.locals[local_index];
         local_index = local_index - 1;
-        if (!local_needs_drop(ctx, local, body.return_local)) {
+        if (!local_needs_drop(ctx, local, body.return_local, moved_after_block)) {
             continue;
         }
         mir.MirBlockId next_target = target;
@@ -168,6 +209,235 @@ mir.MirBlock goto_block(mir.MirBlock source_block, mir.MirBlockId target) {
     };
 }
 
+// 这里做的是 definite-move 分析：只有所有到达某个 block 的路径都已经 move
+// 掉的 local，才会在 return drop chain 里跳过自动 drop。部分路径 move 的情况
+// 不能在这里直接跳过，否则未 move 的路径会泄漏；后续 drop flag 会精确处理。
+LocalMoveState![*] analyze_moved_locals(mir.MirBody body) {
+    Int block_count = body.blocks.length;
+    LocalMoveState![*] in_states = LocalMoveState!$.alloc_array(block_count);
+    LocalMoveState![*] out_states = LocalMoveState!$.alloc_array(block_count);
+    Bool![*] reachable = Bool!$.alloc_array(block_count);
+    Bool![*] queued = Bool!$.alloc_array(block_count);
+    Bool![*] processed = Bool!$.alloc_array(block_count);
+    init_move_state_arrays(body.locals.length, in_states, out_states, reachable, queued, processed, block_count);
+
+    list.ArrayList<Int>! worklist = list.ArrayList<Int>();
+    enqueue_block(body.entry.to_index(), reachable, queued, worklist$.ref(), block_count);
+
+    while (!worklist.empty()) {
+        Int block_index = worklist.pop();
+        queued[block_index] = false;
+        LocalMoveState current = clone_move_state(in_states[block_index]);
+        apply_block_moves(current$.ref(), body.blocks[block_index]);
+        Bool first_process = !processed[block_index];
+        processed[block_index] = true;
+        if (set_move_state(out_states[block_index]$.ref(), current) || first_process) {
+            propagate_move_successors(
+                body.blocks[block_index],
+                current,
+                in_states,
+                reachable,
+                queued,
+                worklist$.ref(),
+                block_count
+            );
+        }
+    }
+    return out_states;
+}
+
+() init_move_state_arrays(
+    Int local_count,
+    LocalMoveState![*] in_states,
+    LocalMoveState![*] out_states,
+    Bool![*] reachable,
+    Bool![*] queued,
+    Bool![*] processed,
+    Int block_count
+) {
+    Int! index = 0;
+    while (index < block_count) {
+        in_states[index] = LocalMoveState(local_count);
+        out_states[index] = LocalMoveState(local_count);
+        reachable[index] = false;
+        queued[index] = false;
+        processed[index] = false;
+        index = index + 1;
+    }
+}
+
+() enqueue_block(Int block_index, Bool![*] reachable, Bool![*] queued, list.ArrayList<Int>& worklist, Int block_count) {
+    if (block_index < 0 || block_index >= block_count) {
+        return;
+    }
+    reachable[block_index] = true;
+    if (queued[block_index]) {
+        return;
+    }
+    queued[block_index] = true;
+    worklist.add(block_index);
+}
+
+LocalMoveState clone_move_state(LocalMoveState source) {
+    LocalMoveState! clone = LocalMoveState(source.length);
+    copy_move_state(clone$.ref(), source);
+    return clone;
+}
+
+Bool copy_move_state(LocalMoveState& target, LocalMoveState source) {
+    Bool! changed = false;
+    Int! index = 0;
+    while (index < target.length) {
+        if (target.moved[index] != source.moved[index]) {
+            target.moved[index] = source.moved[index];
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool set_move_state(LocalMoveState& target, LocalMoveState source) {
+    return copy_move_state(target, source);
+}
+
+Bool intersect_move_state(LocalMoveState& target, LocalMoveState source) {
+    Bool! changed = false;
+    Int! index = 0;
+    while (index < target.length) {
+        Bool value = target.moved[index] && source.moved[index];
+        if (target.moved[index] != value) {
+            target.moved[index] = value;
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+() propagate_move_successors(
+    mir.MirBlock block,
+    LocalMoveState current,
+    LocalMoveState![*] in_states,
+    Bool![*] reachable,
+    Bool![*] queued,
+    list.ArrayList<Int>& worklist,
+    Int block_count
+) {
+    Int! successor_index = 0;
+    while (successor_index < mir.terminator_successor_count(block.terminator)) {
+        mir.MirBlockId successor = mir.terminator_successor_at(block.terminator, successor_index);
+        Int block_index = successor.to_index();
+        if (block_index < 0 || block_index >= block_count) {
+            successor_index = successor_index + 1;
+            continue;
+        }
+        Bool was_reachable = reachable[block_index];
+        Bool changed = update_successor_in_state(in_states[block_index]$.ref(), current, was_reachable);
+        if (!was_reachable || changed) {
+            enqueue_block(block_index, reachable, queued, worklist, block_count);
+        }
+        successor_index = successor_index + 1;
+    }
+}
+
+Bool update_successor_in_state(LocalMoveState& target, LocalMoveState source, Bool was_reachable) {
+    if (!was_reachable) {
+        return copy_move_state(target, source);
+    }
+    return intersect_move_state(target, source);
+}
+
+() apply_block_moves(LocalMoveState& state, mir.MirBlock block) {
+    Int! statement_index = 0;
+    while (statement_index < block.statements.length) {
+        apply_statement_moves(state, block.statements[statement_index]);
+        statement_index = statement_index + 1;
+    }
+    apply_terminator_moves(state, block.terminator);
+}
+
+() apply_statement_moves(LocalMoveState& state, mir.MirStatement statement) {
+    if (statement.kind is .assign_stmt(assign_stmt)) {
+        apply_rvalue_moves(state, assign_stmt.value);
+        clear_whole_place_move(state, assign_stmt.destination);
+    }
+}
+
+() apply_terminator_moves(LocalMoveState& state, mir.MirTerminator terminator) {
+    if (terminator.kind is .branch_term(branch_term)) {
+        apply_operand_moves(state, branch_term.condition);
+    }
+    if (terminator.kind is .switch_term(switch_term)) {
+        apply_operand_moves(state, switch_term.discriminator);
+    }
+    if (terminator.kind is .call_term(call_term)) {
+        apply_operand_moves(state, call_term.callee);
+        apply_operand_array_moves(state, call_term.args);
+        clear_whole_place_move(state, call_term.destination);
+    }
+    if (terminator.kind is .drop_term(drop_term)) {
+        mark_whole_place_moved(state, drop_term.place);
+    }
+    if (terminator.kind is .assert_term(assert_term)) {
+        apply_operand_moves(state, assert_term.condition);
+    }
+    if (terminator.kind is .throw_term(throw_term)) {
+        apply_operand_moves(state, throw_term.error_value);
+    }
+}
+
+() apply_rvalue_moves(LocalMoveState& state, mir.MirRvalue value) {
+    if (value is .use_value(use_value)) {
+        apply_operand_moves(state, use_value.value);
+    }
+    if (value is .unary_value(unary_value)) {
+        apply_operand_moves(state, unary_value.value);
+    }
+    if (value is .binary_value(binary_value)) {
+        apply_operand_moves(state, binary_value.lhs);
+        apply_operand_moves(state, binary_value.rhs);
+    }
+    if (value is .cast_value(cast_value)) {
+        apply_operand_moves(state, cast_value.value);
+    }
+    if (value is .aggregate_value(aggregate_value)) {
+        apply_operand_array_moves(state, aggregate_value.fields);
+    }
+    if (value is .optional_value(optional_value)) {
+        apply_operand_moves(state, optional_value.value);
+    }
+    if (value is .error_union_value(error_union_value)) {
+        apply_operand_moves(state, error_union_value.value);
+    }
+}
+
+() apply_operand_array_moves(LocalMoveState& state, mir.MirOperand[] operands) {
+    Int! index = 0;
+    while (index < operands.length) {
+        apply_operand_moves(state, operands[index]);
+        index = index + 1;
+    }
+}
+
+() apply_operand_moves(LocalMoveState& state, mir.MirOperand operand) {
+    if (operand is .move_operand(move_operand)) {
+        mark_whole_place_moved(state, move_operand.place);
+    }
+}
+
+() mark_whole_place_moved(LocalMoveState& state, mir.MirPlace place) {
+    if (place.projection.length == 0) {
+        state.mark_moved(place.local_id);
+    }
+}
+
+() clear_whole_place_move(LocalMoveState& state, mir.MirPlace place) {
+    if (place.projection.length == 0) {
+        state.clear_moved(place.local_id);
+    }
+}
+
 mir.MirFunction copy_function(mir.MirStore^ output, mir.MirFunction function, mir.MirBlock[] blocks) {
     return mir.MirFunction {
         id: function.id,
@@ -196,8 +466,16 @@ mir.MirLocalDecl[] copy_locals(mir.MirStore^ output, mir.MirLocalDecl[] locals) 
     return copied[0..locals.length];
 }
 
-Bool local_needs_drop(context.CompilerContext& ctx, mir.MirLocalDecl local, mir.MirLocalId return_local) {
+Bool local_needs_drop(
+    context.CompilerContext& ctx,
+    mir.MirLocalDecl local,
+    mir.MirLocalId return_local,
+    LocalMoveState moved_after_block
+) {
     if (local.id.to_index() == return_local.to_index()) {
+        return false;
+    }
+    if (moved_after_block.is_moved(local.id)) {
         return false;
     }
     if (local.kind == .compiler_temp) {
