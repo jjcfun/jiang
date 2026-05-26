@@ -83,11 +83,28 @@ borrow check 通过 `LayoutStore` 查询这些事实；不能从 MIR 自己推�
 
 ## Drop 插入
 
-drop elaboration 应在 borrow check 之后或与 borrow check 紧密串联：
+drop elaboration 不在 type check 或 layout 中完成，也不由 backend 临时推导。长期顺序固定为：
 
-- borrow check 先证明 drop 点合法。
-- drop elaboration 根据 MIR CFG 和 drop category 插入 `drop` terminator/statement。
-- backend 只消费插入后的 MIR，不再推导析构路径。
+```text
+MIR lowering
+  -> layout drop category query
+  -> borrow check 验证已有 drop/隐式 drop 候选是否合法
+  -> drop elaboration 改写 MIR，插入具体 drop/deinit CFG
+  -> borrow check 复核 elaborated MIR 的 move/drop 不变量
+  -> backend
+```
+
+第一轮 borrow check 只处理语义合法性：一个需要 drop 的 place 在所有 CFG 路径上至多 drop 一次，
+并且 drop 时不会使仍然活跃的 loan 悬垂。它不展开自定义 `deinit` body，也不生成字段析构 CFG。
+
+drop elaboration 读取 layout 的 drop category：
+
+- `no_drop`：不插入 drop。
+- `trivial_drop` / `recursive_drop`：插入字段/owner pointer 的自动 drop 路径。
+- `custom_drop`：先调用 nominal type 的 `deinit`，再按语言规则插入自动 `T^` 字段析构。
+
+`custom_drop` 的事实来自 HIR owner 上的 `has_custom_deinit`。resolve 只记录该 fact；layout 根据
+fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 MIR 层展开。
 
 第一版可以先只产出检查结果，不急着实际改写 MIR。
 

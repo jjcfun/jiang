@@ -390,6 +390,7 @@ struct BodyLowerer {
         if (node.data is .binary) { return true; }
         if (node.data is .if_expr) { return true; }
         if (node.data is .loop_expr) { return true; }
+        if (node.data is .switch_expr) { return true; }
         return false;
     }
 
@@ -452,6 +453,10 @@ struct BodyLowerer {
         }
         if (node.data is .loop_expr(loop_expr)) {
             self.lower_loop(node_id, loop_expr, destination);
+            return;
+        }
+        if (node.data is .switch_expr(switch_expr)) {
+            self.lower_switch(node_id, switch_expr, destination);
             return;
         }
         if (node.data is .unary(unary)) {
@@ -550,6 +555,111 @@ struct BodyLowerer {
         self.push_assign(destination, self.unit_rvalue(self.lowerer.hir_span(node_id)), self.lowerer.hir_span(node_id));
     }
 
+    () lower_switch(hir.HirId node_id, hir.HirSwitch switch_expr, mir.MirPlace destination) {
+        mir.MirOperand discriminator = self.lower_to_operand(switch_expr.value);
+        qid.TypeId discriminator_type = self.type_for_node(switch_expr.value);
+        mir.MirBlockId join_block = self.reserve_block(self.lowerer.hir_span(node_id));
+        mir.MirBlockId default_block = self.reserve_block(self.lowerer.hir_span(node_id));
+        mir.MirBlockId! default_target = default_block;
+        list.ArrayList<mir.MirBlockId>! body_blocks = list.ArrayList<mir.MirBlockId>(switch_expr.cases.length);
+        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>();
+
+        Int! case_index = 0;
+        while (case_index < switch_expr.cases.length) {
+            mir.MirBlockId body_block = self.reserve_block(self.lowerer.hir_span(switch_expr.cases[case_index].body));
+            body_blocks.add(body_block);
+            default_target = self.add_switch_patterns(
+                switch_expr.cases[case_index],
+                body_block,
+                default_target,
+                discriminator_type,
+                cases$.ref()
+            );
+            case_index = case_index + 1;
+        }
+
+        self.finish_block(.switch_term(mir.MirSwitchTerminator {
+            discriminator: discriminator,
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: default_target
+        }), self.lowerer.hir_span(node_id));
+
+        self.lower_switch_case_bodies(switch_expr, body_blocks$.ref(), destination, join_block);
+        if (default_target.to_index() == default_block.to_index()) {
+            self.start_block(default_block);
+            self.finish_block(
+                .unreachable_term(mir.MirUnreachableTerminator {generated_by_check: true}),
+                self.lowerer.hir_span(node_id)
+            );
+        }
+        self.start_block(join_block);
+    }
+
+    mir.MirBlockId add_switch_patterns(
+        hir.HirSwitchCase switch_case,
+        mir.MirBlockId body_block,
+        mir.MirBlockId default_target,
+        qid.TypeId discriminator_type,
+        list.ArrayList<mir.MirSwitchCase>& cases
+    ) {
+        mir.MirBlockId! updated_default = default_target;
+        Int! pattern_index = 0;
+        while (pattern_index < switch_case.patterns.length) {
+            hir.HirId pattern_id = switch_case.patterns[pattern_index];
+            updated_default = self.add_switch_pattern(
+                pattern_id,
+                body_block,
+                updated_default,
+                discriminator_type,
+                cases
+            );
+            pattern_index = pattern_index + 1;
+        }
+        return updated_default;
+    }
+
+    mir.MirBlockId add_switch_pattern(
+        hir.HirId pattern_id,
+        mir.MirBlockId body_block,
+        mir.MirBlockId default_target,
+        qid.TypeId discriminator_type,
+        list.ArrayList<mir.MirSwitchCase>& cases
+    ) {
+        hir.HirNode pattern = self.lowerer.hirs.node(pattern_id);
+        if (pattern.data is .wildcard_pattern) {
+            return body_block;
+        }
+        if (pattern.data is .literal_pattern(literal_pattern)) {
+            cases.add(mir.MirSwitchCase {
+                value: self.lower_literal_as_const(pattern_id, literal_pattern.literal, discriminator_type),
+                target: body_block
+            });
+            return default_target;
+        }
+        self.mark_unsupported(pattern_id);
+        return default_target;
+    }
+
+    () lower_switch_case_bodies(
+        hir.HirSwitch switch_expr,
+        list.ArrayList<mir.MirBlockId>& body_blocks,
+        mir.MirPlace destination,
+        mir.MirBlockId join_block
+    ) {
+        Int! case_index = 0;
+        while (case_index < switch_expr.cases.length) {
+            self.start_block(body_blocks.get(case_index));
+            self.lower_into_place(switch_expr.cases[case_index].body, destination);
+            if (!self.terminated) {
+                self.finish_block(
+                    .goto_term(mir.MirGotoTerminator {target: join_block}),
+                    self.lowerer.hir_span(switch_expr.cases[case_index].body)
+                );
+            }
+            case_index = case_index + 1;
+        }
+    }
+
     () lower_break(hir.HirId node_id) {
         if (self.loop_targets.empty()) {
             self.mark_unsupported(node_id);
@@ -635,19 +745,24 @@ struct BodyLowerer {
                 return .copy_operand(mir.MirCopyOperand {place: place});
             }
             if (name_ref is .def_ref(def_id)) {
-                if (self.lowerer.ctx.query.defs.get(def_id).kind == .function_def) {
-                    return .const_operand(mir.MirConst {
-                        type_id: self.type_for_node(node_id),
-                        span: self.lowerer.hir_span(node_id),
-                        value: .function_value(mir.MirFunctionConst {function_def: def_id})
-                    });
-                }
+                return self.lower_def_operand(node_id, def_id);
             }
         }
         if (self.place_for_expr(node_id) is some place) {
             return .copy_operand(mir.MirCopyOperand {place: place});
         }
         return self.unsupported_operand(node_id);
+    }
+
+    mir.MirOperand lower_def_operand(hir.HirId node_id, qid.DefId def_id) {
+        if (self.lowerer.ctx.query.defs.get(def_id).kind != .function_def) {
+            return self.unsupported_operand(node_id);
+        }
+        return .const_operand(mir.MirConst {
+            type_id: self.type_for_node(node_id),
+            span: self.lowerer.hir_span(node_id),
+            value: .function_value(mir.MirFunctionConst {function_def: def_id})
+        });
     }
 
     mir.MirPlace? place_for_expr(hir.HirId node_id) {
@@ -700,6 +815,11 @@ struct BodyLowerer {
         // literal 的目标类型也可能是泛型参数，例如 T id<T>(T value)
         // 内部的返回值；type_for_node 会自动套用当前 instance substitution。
         qid.TypeId type_id = self.type_for_node(node_id);
+        return self.lower_literal_as_const(node_id, literal, type_id);
+    }
+
+    mir.MirConst lower_literal_as_const(hir.HirId node_id, hir.HirLiteral literal, qid.TypeId type_id) {
+        token.Span span = self.lowerer.hir_span(node_id);
         if (literal.value is .int_value(int_value)) {
             return mir.MirConst {
                 type_id: type_id,

@@ -17,6 +17,33 @@ MIR 的输入是 HIR、`TypeCheckResults`、monomorph `InstancePlan` 和 `Module
 
 MIR 生成完成后，borrow check 和 backend 可以把 MIR 与 layout 查询结果组合使用。
 
+## Drop Elaboration
+
+MIR lowering 初始产物只表达源码中已经显式形成的控制流和当前阶段能确定的 drop terminator。
+隐式析构路径不在 HIR lowering 或 type check 中展开，而是在 borrow check 验证后由 drop
+elaboration 改写 MIR。
+
+固定顺序如下：
+
+```text
+HIR/type facts -> initial MIR
+  -> layout drop category
+  -> borrow check
+  -> drop elaboration
+  -> borrow check verification
+  -> backend
+```
+
+drop elaboration 的职责：
+
+- 根据 locals 的 live range 和 CFG exit 插入隐式 drop。
+- 对 `custom_drop` nominal type 先生成 `deinit` call，再生成自动 owning field drop。
+- 对 `recursive_drop` 类型递归展开字段/owner pointer drop。
+- 保持所有插入的控制流仍然是普通 MIR basic block / terminator，不引入 backend-only 节点。
+
+borrow check 负责证明这些 drop 点不会 double-drop、use-after-move 或 invalidating active loan。
+backend 只消费 elaborated MIR，不再自行推导析构顺序。
+
 ## 结构
 
 第一版 MIR 使用非 SSA 的 local + assignment 形式：
