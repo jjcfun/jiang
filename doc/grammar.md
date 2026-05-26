@@ -193,6 +193,7 @@ type_postfix
              / "!"
              / "&"
              / "^"
+             / "*"
              / "[" "]"
              / "[" "*" "]"
              / "[" array_count "]"
@@ -212,11 +213,11 @@ name        <- ident / "self"
   `T!?` 应改成 `T?!`，`T??` / `T!!` 不合法。
 - `T&` 表示引用外层。
 - `T^` 表示 owning pointer 外层。
+- `T*` 表示 raw pointer；主要用于 FFI / ABI / 低层 capability 场景，不参与自动解引用。
 - `T[]` 表示 slice。
 - `T[*]` 表示 many pointer。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
-- `RawPointer<T>` 在语义上等价于裸指针类型；语法上仍按命名泛型类型解析。
 
 ## struct / record
 
@@ -449,7 +450,7 @@ add_expr    <- mul_expr (("+" / "-") mul_expr)*
 
 mul_expr    <- unary_expr (("*" / "/" / "%") unary_expr)*
 
-unary_expr  <- ("-" / "!" / "~" / "&" / "*" / "new") unary_expr
+unary_expr  <- ("-" / "!" / "~" / "&" / "new") unary_expr
              / postfix_expr
 
 postfix_expr

@@ -18,6 +18,10 @@ LLVM IR 是 backend 产物，不是 MIR 的替代品。MIR 保留 Jiang 语义�
 backend-specific symbol/mangling 可以从 `MirFunctionKey` 或 backend-specific key 派生。
 这层 symbol 只服务目标代码生成，不应该反向写入 MIR。
 
+LLVM 对接通过 `backend/llvm/ffi.jiang` 的最小 C binding 完成。不要一次性封装完整
+LLVM API；每个 lowering/emission 任务只补当前需要的少量 FFI 声明。
+`backend/llvm/lower.jiang` 直接调用这层 FFI，不再维护自定义 LLVM IR 中间模型。
+
 ## 边界
 
 - backend 不重新 type check。

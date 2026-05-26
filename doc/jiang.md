@@ -247,7 +247,7 @@ Jiang 语言把安全转换和低层强制转换分开：
 
 - `a$.as(Int)`：对值 `a` 做低层强制转换
 - `a$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`
-- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `RawPointer<T>`
+- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`
 - `a$.get()`：显式解引用 `T^` / `T&`，返回指向的值
 - `a$.move()`：显式转交当前变量的值，源变量随后失效且不再析构
 - `a$.addr()`：获取值 `a` 的地址值
@@ -293,7 +293,7 @@ UInt8 small_val = UInt8(val);
 // 注意：某些危险的转换（如裸指针强转）需要对应 capability
 Int addr = 0x12345678;
 sudo {
-    RawPointer<Int> ptr = addr$.as(RawPointer<Int>);
+    Int* ptr = addr$.as(Int*);
 }
 ```
 
@@ -387,11 +387,11 @@ Jiang 不引入完整 Rust 式 borrow checker，但会固定所有权、引用�
 - `T^`：自动解引用的 owning heap pointer，适合 `new T` 这类场景；它不是 C 风格 raw pointer
 - `T&`：自动解引用的非 owning 引用，通常用于引用已有值，不承担释放职责
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
-- `RawPointer<T>`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
+- `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
 - `T[]`：slice reference，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权
 
-只有 `T^` 表达语言级所有权。`T&`、`T[]`、`T[*]` 和 `RawPointer<T>` 都不拥有目标对象。
+只有 `T^` 表达语言级所有权。`T&`、`T[]`、`T[*]` 和 `T*` 都不拥有目标对象。
 
 #### Pointer / Reference 类型
 
@@ -437,22 +437,27 @@ Int& b;
 
 #### 自动解引用
 
-使用 `T^` 或 `T&` 时默认自动解引用，除非 expected type 本身与 pointer/reference 类型一致。`T^` 是 owning heap pointer，不是 C 风格 raw pointer。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；需要显式解引用时使用 `ptr$.get()`。
+使用 `T^` 时默认自动解引用，除非 expected type 本身与 owning pointer 类型一致。`T&`、`T*` 和
+`T[*]` 不参与默认自动解引用。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；
+需要显式解引用或写入单对象指针/引用时使用 `ptr$.get()` / `ptr$.set(value)`。其中 `ptr$.set(value)`
+只有在 pointee 类型带顶层 `!` 时才合法，例如 `Int!*` 可以写入，`Int*` 只能读取。
 
-类型推导会保留 pointer/reference 层，并默认得到不可变绑定；写出 expected type 才会触发自动解引用：
+类型推导会保留 pointer/reference 层，并默认得到不可变绑定；写出 expected type 只会让 `T^`
+触发自动解引用，`T&` / `T*` 仍需要显式 `$.get()`：
 
 ```c
 Int&! ref = value$.ref();
 
 _ copied = ref;      // copied: Int&
 _! mutable = ref;    // mutable: Int&!
-Int copied_value = ref; // expected type 是 Int，自动解引用
+Int copied_value = ref$.get();
 Int& kept = ref;     // expected type 是 Int&，保留 reference
 _ raw_ref = ref$.ref(); // raw_ref: Int&
 Int explicit_value = ref$.get(); // 显式解引用
 ```
 
-`$` 操作符会阻止自动解引用，并进入隐式操作层。通过类似 `ptr$.free()`、`ptr$.ref()`、`ptr$.ptr()` 的语法，可以调用 pointer/reference 自身的一些低层操作。
+`$` 操作符会阻止自动解引用，并进入隐式操作层。通过类似 `ptr$.free()`、`ptr$.ref()`、`ptr$.ptr()`、
+`ptr$.get()`、`ptr$.set(value)` 的语法，可以调用 pointer/reference 自身的一些低层操作。
 
 ```c
 Int a = 100;
@@ -468,13 +473,13 @@ print("c = %d", c); // 输出： c = 300
 b$.free();
 ```
 
-`$.ref()` 和 `$.ptr()` 的返回类型固定为 `T&` 和 `RawPointer<T>`：
+`$.ref()` 和 `$.ptr()` 的返回类型固定为 `T&` 和 `T*`：
 
 ```c
 Int^ p = new Int(41);
 
 _ ref = p$.ref(); // ref: Int&
-_ raw = p$.ptr(); // raw: RawPointer<Int>
+_ raw = p$.ptr(); // raw: Int*
 
 // 普通值上下文会自动解引用
 Int x = p + 1;
@@ -485,6 +490,10 @@ Int bad = p$.ref() + 1; // 编译错误
 // 显式解引用
 Int explicit = p$.get();
 
+Int!* raw_ptr = p$.ptr();
+Int raw_value = raw_ptr$.get();
+raw_ptr$.set(42);
+
 Int[1] items = [41];
 Int[*] raw = items[0]$.as(Int[*]);
 
@@ -492,7 +501,9 @@ Int[*] raw = items[0]$.as(Int[*]);
 Int y = raw[0];
 ```
 
-`T[*]` many-pointer 不参与默认自动解引用。它表示一段可按元素索引的连续地址，必须通过下标表达式取元素：
+`T*` raw pointer 不参与默认自动解引用，只能通过 `$.get()` 显式读取单个目标对象；只有 pointee
+类型带顶层 `!` 的 raw pointer，例如 `T!*`，才允许通过 `$.set(value)` 显式写入。
+`T[*]` many-pointer 也不参与默认自动解引用。它表示一段可按元素索引的连续地址，必须通过下标表达式取元素：
 
 ```c
 Int[*] ptr = items[0]$.as(Int[*]);
@@ -502,7 +513,7 @@ Int value = ptr[0];
 ptr[1] = 42;
 
 _ item_ref = ptr[1]$.ref(); // item_ref: Int&
-_ item_ptr = ptr[1]$.ptr(); // item_ptr: RawPointer<Int>
+_ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 ```
 
 `T[*]` many-pointer 支持下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
@@ -526,10 +537,10 @@ Jiang 的目标规则是不引入完整 Rust 式 borrow checker，但明确资�
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
-- `T[*]`、`RawPointer<T>` 是低层指针；`T[]` 是 slice reference。它们不表达语言级所有权。
+- `T[*]`、`T*` 是低层指针；`T[]` 是 slice reference。它们不表达语言级所有权。
 - 局部变量离开作用域时，如果变量类型有 `deinit`，编译器自动调用该 `deinit`。
 - struct 的 `T^` 字段会自动析构，无论该 struct 是否实现了自定义 `deinit`。
-- `T&`、`T&!`、`T[*]`、`RawPointer<T>`、`T[]` 字段不会被编译器自动释放。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 字段不会被编译器自动释放。
 - 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的 `T^` 字段析构。
 - 指针和引用视图类型以及直接或间接包含这类字段的 struct 默认禁止隐式 copy，除非类型显式定义 copy 语义。
 
@@ -1596,7 +1607,7 @@ union MyUnion {
 - `T^`
 - `T&`
 - `T[*]`
-- `RawPointer<T>`
+- `T*`
 - optional
 - 其他 `union` / `enum`
 

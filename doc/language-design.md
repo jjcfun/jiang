@@ -102,7 +102,7 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T&`：自动解引用的非 owning 引用，不表达释放职责。
 - `T[]`：slice reference。
 - `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
-- `RawPointer<T>`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
+- `T*`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
 - `T[_]`：数组长度由初始化器推断。
 - `T@E`：errorable。
@@ -236,7 +236,7 @@ ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明�
 - `T^`：owning heap pointer，通常来自 `new T(...)`，拥有堆上对象；它不是 C 风格 raw pointer。
 - `T&`：非 owning 引用，不表达释放职责。通过 `T&` 可以读写目标内部声明为 `!` 的成员。
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
-- `RawPointer<T>`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
+- `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
 - `T[]`：slice reference，语义上类似 `{ T[*], length }&` 的连续内存引用视图；它不表达所有权。
 
@@ -246,7 +246,7 @@ Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多�
 
 `^` 和 `&` 会创建新的 pointer/reference 外层。一个完整源码类型中最多只能出现一个 pointer/reference 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。归一化阶段如果因为泛型替换得到重复同类 handle，可以合并；如果得到 `^` 与 `&` 混合的 handle 层，必须保留错误状态并报告 diagnostic。
 
-`T^` 和 `T&` 在普通值上下文中默认自动解引用。只有 expected type 本身就是同一个 pointer/reference 类型时，表达式才保留 pointer/reference 层：
+`T^` 在普通值上下文中默认自动解引用。`T&` 和 `T*` 不默认解引用，必须通过 `$.get()` 显式读取：
 
 ```jiang
 Int^ foo();
@@ -259,16 +259,20 @@ _ d = foo() + 123;   // 算术上下文，自动解引用为 Int
 Int&! ref = value$.ref();
 _ copied = ref;      // 推导上下文保留 reference，copied: Int&
 _! mutable = ref;    // mutable: Int&!
-Int copied_value = ref; // expected type 是 Int，自动解引用
+Int copied_value = ref$.get();
 Int& kept = ref;     // expected type 是 Int&，保留 reference
 _ raw_ref = ref$.ref(); // '$' 阻止自动解引用，raw_ref: Int&
 ```
 
-Jiang 没有前缀手动解引用语法，`*foo()` 这类写法不成立。需要显式取出 `T^` / `T&` 指向的值时，使用隐式操作层的 `value$.get()`：
+Jiang 没有前缀手动解引用语法，`*foo()` 这类写法不成立。需要显式取出 `T^` / `T&` / `T*`
+指向的值时，使用隐式操作层的 `value$.get()`；需要通过 pointer/reference 写入目标对象时使用
+`value$.set(new_value)`，并且 pointee 类型必须带顶层 `!`。
 
 ```jiang
 Int& ref = value$.ref();
 Int copied = ref$.get();
+Int!* ptr = value$.ptr();
+ptr$.set(42);
 ```
 
 `$` 会阻止自动解引用，并进入隐式操作层。`$.ref()` 和 `$.ptr()` 分别投影到语言引用和裸指针：
@@ -277,7 +281,7 @@ Int copied = ref$.get();
 Int^ value = new Int(42);
 
 _ ref = value$.ref(); // ref: Int&
-_ ptr = value$.ptr(); // ptr: RawPointer<Int>
+_ ptr = value$.ptr(); // ptr: Int*
 value$.free();
 
 Int sum = value + 100;        // 允许：value 自动解引用为 Int
@@ -294,7 +298,7 @@ Int value = ptr[0];
 ptr[1] = 42;
 
 _ item_ref = ptr[1]$.ref(); // item_ref: Int&
-_ item_ptr = ptr[1]$.ptr(); // item_ptr: RawPointer<Int>
+_ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 ```
 
 数组长度是类型的一部分；slice 长度是运行时值。
@@ -307,14 +311,14 @@ _ item_ptr = ptr[1]$.ptr(); // item_ptr: RawPointer<Int>
 
 - `T^` 是 owning pointer。它拥有指向的堆对象，并参与自动析构。
 - `T&` 是非 owning 引用。它不拥有资源，不参与自动析构。
-- `T[*]`、`RawPointer<T>` 是低层指针；`T[]` 是 slice reference。它们不表达所有权，不参与自动析构。
+- `T[*]`、`T*` 是低层指针；`T[]` 是 slice reference。它们不表达所有权，不参与自动析构。
 
 自动析构规则：
 
 - 局部变量离开作用域时，如果变量类型有 `deinit`，编译器自动调用该 `deinit`。
 - `T^` 本身是内建资源类型；离开作用域时自动析构指向的 `T`，并释放其堆存储。
 - struct 的 `T^` 字段会自动析构，无论该 struct 是否实现了自定义 `deinit`。
-- `T&`、`T&!`、`T[*]`、`RawPointer<T>`、`T[]` 字段不会被编译器自动释放。需要释放这些资源时，必须由类型作者在自定义 `deinit` 中显式处理。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 字段不会被编译器自动释放。需要释放这些资源时，必须由类型作者在自定义 `deinit` 中显式处理。
 - 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的 `T^` 字段析构。这样自定义 `deinit` 仍然可以读取 owning 字段。
 - 自动字段析构只认 `T^`。是否级联调用非 `T^` 字段类型自己的 `deinit`，不作为默认规则；外层类型需要释放这类字段时，应在自定义 `deinit` 中显式调用。
 
@@ -341,7 +345,7 @@ struct Node {
 Copy 规则：
 
 - 没有指针字段、没有资源语义的普通值类型可以隐式 copy。
-- 指针和引用视图类型以及直接或间接包含这类字段的 struct 默认禁止隐式 copy。这里包括 `T^`、`T&`、`T&!`、`T[*]`、`RawPointer<T>` 和 `T[]`。
+- 指针和引用视图类型以及直接或间接包含这类字段的 struct 默认禁止隐式 copy。这里包括 `T^`、`T&`、`T&!`、`T[*]`、`T*` 和 `T[]`。
 - 禁止隐式 copy 的类型如果确实需要复制，必须由类型作者手动实现 copy/clone 语义。实现可以选择深拷贝、共享引用计数或直接禁止复制。
 - 存在自定义 copy/clone 不会恢复隐式 copy；调用方必须显式调用该方法。
 
@@ -418,8 +422,9 @@ Slice make_slice(Buffer& buffer);
 
 - `value$.as(Type)`：强制类型转换，不保证类型安全。
 - `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
-- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `RawPointer<T>`。
-- `value$.get()`：显式解引用 `T^` / `T&`，返回指向的值；`T[*]` many pointer 必须使用下标访问。
+- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`。
+- `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；`T[*]` many pointer 必须使用下标访问。
+- `value$.set(new_value)`：显式写入 `T!*` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
 - `value$.addr()`：获取地址值。
 - `value$.free()`：释放默认堆分配器上的对象。
