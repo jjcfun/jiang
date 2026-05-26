@@ -10,6 +10,7 @@ import layout = "../../layout/layout.jiang";
 import mir = "../../mir/mir.jiang";
 import qid = "../../query/id.jiang";
 import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
 import symbol = "../symbol.jiang";
 import ffi = "./ffi.jiang";
 
@@ -20,19 +21,21 @@ public Bool lower_module(context.CompilerContext& ctx, mir.MirStore& store) {
 
 struct LlvmLowerer {
     context.CompilerContext& ctx;
-    ffi.Context context;
+    ffi.Context llvm_context;
     ffi.Module module;
     ffi.Builder builder;
 
     init(context.CompilerContext& ctx) {
         self.ctx = ctx;
-        self.context = ffi.Context();
-        self.module = ffi.Module(self.context$.ref(), "jiang_module");
-        self.builder = ffi.Builder(self.context$.ref());
+        self.llvm_context = ffi.Context();
+        self.module = ffi.Module(self.llvm_context$.ref(), "jiang_module");
+        self.builder = ffi.Builder(self.llvm_context$.ref());
     }
 
     Bool lower_module(mir.MirStore& store) {
-        Bool! ok = self.context.valid() && self.module.valid() && self.builder.valid();
+        Bool! ok = ffi.context_valid(self.llvm_context$.ref())
+            && ffi.module_valid(self.module$.ref())
+            && ffi.builder_valid(self.builder$.ref());
         Int! index = 0;
         while (ok && index < store.functions.len()) {
             ok = self.declare_function(store.functions.get(index));
@@ -43,23 +46,378 @@ struct LlvmLowerer {
     }
 
     () dispose() {
-        self.builder.dispose();
-        self.module.dispose();
-        self.context.dispose();
+        ffi.builder_dispose(self.builder$.ref());
+        ffi.module_dispose(self.module$.ref());
+        ffi.context_dispose(self.llvm_context$.ref());
     }
 
     Bool declare_function(mir.MirFunction function) {
-        mir.MirLocalDecl return_local = function.body.locals[function.body.return_local.to_index()];
+        mir.MirBody body = function.body;
+        Int return_index = body.return_local.to_index();
+        mir.MirLocalDecl return_local = body.locals[return_index];
         ffi.Type return_type = self.lower_type(return_local.type_id);
-        if (!return_type.valid()) {
+        if (!ffi.type_valid(return_type)) {
             return false;
         }
-        ffi.Type function_type = ffi.function_type(return_type);
-        if (!function_type.valid()) {
+        ffi.Type function_type = self.lower_function_type(body, return_type);
+        if (!ffi.type_valid(function_type)) {
             return false;
         }
         UInt8[] name = symbol.function_symbol_name(function);
-        return self.module.add_function(name$.as(UInt8[*]), function_type).valid();
+        UInt8[*] raw_name = name$.as(UInt8[*]);
+        ffi.Value llvm_function = ffi.module_add_function(self.module$.ref(), raw_name, function_type);
+        if (!ffi.value_valid(llvm_function)) {
+            return false;
+        }
+        return self.lower_body(body, llvm_function);
+    }
+
+    ffi.Type lower_function_type(mir.MirBody body, ffi.Type return_type) {
+        list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>();
+        Int! index = 0;
+        while (index < body.locals.length) {
+            mir.MirLocalDecl local = body.locals[index];
+            if (local.kind == .param) {
+                ffi.Type param_type = self.lower_type(local.type_id);
+                if (!ffi.type_valid(param_type)) {
+                    return ffi.Type();
+                }
+                params.add(param_type);
+            }
+            index = index + 1;
+        }
+        return ffi.function_type(return_type, params$.ref());
+    }
+
+    Bool lower_body(mir.MirBody body, ffi.Value llvm_function) {
+        if (body.blocks.length == 0) {
+            return true;
+        }
+        Int entry_index = body.entry.to_index();
+        mir.MirBlock entry = body.blocks[entry_index];
+        ffi.BasicBlock block = ffi.context_append_block(self.llvm_context$.ref(), llvm_function, "entry");
+        if (!ffi.block_valid(block)) {
+            return false;
+        }
+        ffi.builder_position_at_end(self.builder$.ref(), block);
+        list.ArrayList<ffi.Value>! local_slots = self.allocate_local_slots(body);
+        if (local_slots.len() != body.locals.length) {
+            return false;
+        }
+        if (!self.store_function_params(body, llvm_function, local_slots$.ref())) {
+            return false;
+        }
+        if (!self.lower_statements(body, entry, local_slots$.ref())) {
+            return false;
+        }
+        return self.lower_entry_block(body, entry, local_slots$.ref());
+    }
+
+    Bool store_function_params(
+        mir.MirBody body,
+        ffi.Value llvm_function,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        Int! param_index = 0;
+        Int! local_index = 0;
+        while (local_index < body.locals.length) {
+            mir.MirLocalDecl local = body.locals[local_index];
+            if (local.kind == .param) {
+                ffi.Value param = ffi.function_param(llvm_function, param_index);
+                if (!self.store_local_value(local, local_slots, param)) {
+                    return false;
+                }
+                param_index = param_index + 1;
+            }
+            local_index = local_index + 1;
+        }
+        return true;
+    }
+
+    Bool store_local_value(
+        mir.MirLocalDecl local,
+        list.ArrayList<ffi.Value>& local_slots,
+        ffi.Value value
+    ) {
+        if (!ffi.value_valid(value)) {
+            return false;
+        }
+        ffi.Value pointer = local_slots.get(local.id.to_index());
+        if (!ffi.value_valid(pointer)) {
+            return false;
+        }
+        return ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), value, pointer));
+    }
+
+    list.ArrayList<ffi.Value> allocate_local_slots(mir.MirBody body) {
+        list.ArrayList<ffi.Value>! values = list.ArrayList<ffi.Value>(body.locals.length);
+        Int! index = 0;
+        while (index < body.locals.length) {
+            ffi.Value slot = self.allocate_local_slot(body.locals[index]);
+            if (!ffi.value_valid(slot)) {
+                return values;
+            }
+            values.add(slot);
+            index = index + 1;
+        }
+        return values;
+    }
+
+    ffi.Value allocate_local_slot(mir.MirLocalDecl local) {
+        ffi.Type type = self.lower_type(local.type_id);
+        if (!ffi.type_valid(type)) {
+            return ffi.Value();
+        }
+        return ffi.builder_build_alloca(self.builder$.ref(), type);
+    }
+
+    // MIR 是 place-based、非 SSA。LLVM lowering 的 baseline 先把 local
+    // 映射为 stack slot，assignment 生成 store，operand 生成 load。
+    Bool lower_statements(
+        mir.MirBody body,
+        mir.MirBlock block,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        Int! index = 0;
+        while (index < block.statements.length) {
+            if (!self.lower_statement(body, block.statements[index], local_slots)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool lower_statement(
+        mir.MirBody body,
+        mir.MirStatement statement,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        if (statement.kind is .assign_stmt(assign_stmt)) {
+            return self.lower_assign(body, assign_stmt, local_slots);
+        }
+        if (statement.kind is .storage_live_stmt || statement.kind is .storage_dead_stmt) {
+            return true;
+        }
+        return false;
+    }
+
+    Bool lower_assign(
+        mir.MirBody body,
+        mir.MirAssignStatement assign_stmt,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        qid.TypeId result_type = self.local_type(body, assign_stmt.destination.local_id);
+        ffi.Value value = self.lower_rvalue(body, assign_stmt.value, local_slots, result_type);
+        if (!ffi.value_valid(value)) {
+            return false;
+        }
+        ffi.Value pointer = self.lower_place_pointer(assign_stmt.destination, local_slots);
+        if (!ffi.value_valid(pointer)) {
+            return false;
+        }
+        return ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), value, pointer));
+    }
+
+    Bool lower_entry_block(
+        mir.MirBody body,
+        mir.MirBlock block,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        guard block.terminator.kind is .return_term(return_term) else {
+            return ffi.value_valid(ffi.builder_build_unreachable(self.builder$.ref()));
+        }
+        if (return_term.implicit_unit) {
+            return ffi.value_valid(ffi.builder_build_return_void(self.builder$.ref()));
+        }
+        return self.lower_return_value(body, local_slots);
+    }
+
+    Bool lower_return_value(mir.MirBody body, list.ArrayList<ffi.Value>& local_slots) {
+        mir.MirLocalDecl return_local = body.locals[body.return_local.to_index()];
+        ffi.Value llvm_value = self.lower_local_load(return_local, local_slots);
+        if (!ffi.value_valid(llvm_value)) {
+            return false;
+        }
+        return ffi.value_valid(ffi.builder_build_return(self.builder$.ref(), llvm_value));
+    }
+
+    qid.TypeId local_type(mir.MirBody body, mir.MirLocalId local_id) {
+        return body.locals[local_id.to_index()].type_id;
+    }
+
+    ffi.Value lower_rvalue(
+        mir.MirBody body,
+        mir.MirRvalue value,
+        list.ArrayList<ffi.Value>& local_slots,
+        qid.TypeId result_type
+    ) {
+        if (value is .use_value(use_value)) {
+            return self.lower_operand(body, use_value.value, local_slots);
+        }
+        if (value is .unary_value(unary_value)) {
+            return self.lower_unary(body, unary_value, local_slots, result_type);
+        }
+        if (value is .binary_value(binary_value)) {
+            return self.lower_binary(body, binary_value, local_slots);
+        }
+        return ffi.Value();
+    }
+
+    ffi.Value lower_unary(
+        mir.MirBody body,
+        mir.MirUnaryRvalue value,
+        list.ArrayList<ffi.Value>& local_slots,
+        qid.TypeId result_type
+    ) {
+        ffi.Value operand = self.lower_operand(body, value.value, local_slots);
+        if (!ffi.value_valid(operand)) {
+            return ffi.Value();
+        }
+        if (value.op == .logic_not) {
+            return self.lower_int_compare(32, operand, self.zero_value(result_type));
+        }
+        if (value.op == .bit_not) {
+            return ffi.builder_build_binary(self.builder$.ref(), 7, operand, self.all_ones_value(result_type));
+        }
+        if (value.op == .neg) {
+            return ffi.builder_build_binary(self.builder$.ref(), 1, self.zero_value(result_type), operand);
+        }
+        return ffi.Value();
+    }
+
+    ffi.Value lower_binary(
+        mir.MirBody body,
+        mir.MirBinaryRvalue value,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        ffi.Value lhs = self.lower_operand(body, value.lhs, local_slots);
+        ffi.Value rhs = self.lower_operand(body, value.rhs, local_slots);
+        if (!ffi.value_valid(lhs) || !ffi.value_valid(rhs)) {
+            return ffi.Value();
+        }
+        if (self.binary_op_code(value.op) is some op) {
+            return ffi.builder_build_binary(self.builder$.ref(), op, lhs, rhs);
+        }
+        if (self.int_predicate(value.op) is some predicate) {
+            return self.lower_int_compare(predicate, lhs, rhs);
+        }
+        return ffi.Value();
+    }
+
+    ffi.Value lower_int_compare(Int32 predicate, ffi.Value lhs, ffi.Value rhs) {
+        return ffi.builder_build_icmp(self.builder$.ref(), predicate, lhs, rhs);
+    }
+
+    Int? binary_op_code(mir.MirBinaryOp op) {
+        if (op == .add) { return 0; }
+        if (op == .sub) { return 1; }
+        if (op == .mul) { return 2; }
+        if (op == .div) { return 3; }
+        if (op == .rem) { return 4; }
+        if (op == .bit_and) { return 5; }
+        if (op == .bit_or) { return 6; }
+        if (op == .bit_xor) { return 7; }
+        if (op == .shl) { return 8; }
+        if (op == .shr) { return 9; }
+        return null;
+    }
+
+    Int32? int_predicate(mir.MirBinaryOp op) {
+        if (op == .eq) { return 32; }
+        if (op == .ne) { return 33; }
+        if (op == .gt) { return 38; }
+        if (op == .ge) { return 39; }
+        if (op == .lt) { return 40; }
+        if (op == .le) { return 41; }
+        return null;
+    }
+
+    ffi.Value zero_value(qid.TypeId type_id) {
+        ffi.Type type = self.lower_type(type_id);
+        if (!ffi.type_valid(type)) {
+            return ffi.Value();
+        }
+        return ffi.const_int(type, 0);
+    }
+
+    ffi.Value all_ones_value(qid.TypeId type_id) {
+        ffi.Type type = self.lower_type(type_id);
+        if (!ffi.type_valid(type)) {
+            return ffi.Value();
+        }
+        return ffi.const_int(type, 18446744073709551615);
+    }
+
+    ffi.Value lower_operand(
+        mir.MirBody body,
+        mir.MirOperand operand,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        if (operand is .const_operand(const_value)) {
+            return self.lower_const(const_value);
+        }
+        if (operand is .copy_operand(copy_operand)) {
+            return self.lower_place_value(body, copy_operand.place, local_slots);
+        }
+        if (operand is .move_operand(move_operand)) {
+            return self.lower_place_value(body, move_operand.place, local_slots);
+        }
+        return ffi.Value();
+    }
+
+    ffi.Value lower_local_load(mir.MirLocalDecl local, list.ArrayList<ffi.Value>& local_slots) {
+        ffi.Type type = self.lower_type(local.type_id);
+        if (!ffi.type_valid(type)) {
+            return ffi.Value();
+        }
+        ffi.Value slot = local_slots.get(local.id.to_index());
+        if (!ffi.value_valid(slot)) {
+            return ffi.Value();
+        }
+        return ffi.builder_build_load(self.builder$.ref(), type, slot);
+    }
+
+    ffi.Value lower_place_value(
+        mir.MirBody body,
+        mir.MirPlace place,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        if (!self.place_has_no_projection(place)) {
+            return ffi.Value();
+        }
+        return self.lower_local_load(body.locals[place.local_id.to_index()], local_slots);
+    }
+
+    ffi.Value lower_place_pointer(mir.MirPlace place, list.ArrayList<ffi.Value>& local_slots) {
+        if (!self.place_has_no_projection(place)) {
+            return ffi.Value();
+        }
+        return local_slots.get(place.local_id.to_index());
+    }
+
+    Bool place_has_no_projection(mir.MirPlace place) {
+        return place.projection.length == 0;
+    }
+
+    ffi.Value lower_const(mir.MirConst value) {
+        ffi.Type value_type = self.lower_type(value.type_id);
+        if (!ffi.type_valid(value_type)) {
+            return ffi.Value();
+        }
+        if (value.value is .int_value(int_value)) {
+            return ffi.const_int(value_type, int_value.bits);
+        }
+        if (value.value is .bool_value(bool_value)) {
+            if (bool_value.value) {
+                return ffi.const_int(value_type, 1);
+            }
+            return ffi.const_int(value_type, 0);
+        }
+        if (value.value is .unit_value) {
+            return ffi.Value();
+        }
+        return ffi.Value();
     }
 
     ffi.Type lower_type(qid.TypeId type_id) {
@@ -67,14 +425,17 @@ struct LlvmLowerer {
         if (info.data is .invalid) {
             return ffi.Type();
         }
-        if (info.data is .never || info.data is .unit) {
-            return self.context.void_type();
+        if (info.data is .never) {
+            return ffi.context_void_type(self.llvm_context$.ref());
+        }
+        if (info.data is .unit) {
+            return ffi.context_void_type(self.llvm_context$.ref());
         }
         if (info.data is .bool_type) {
-            return self.context.int_type(1);
+            return ffi.context_int_type(self.llvm_context$.ref(), 1);
         }
         if (info.data is .char_type) {
-            return self.context.int_type(32);
+            return ffi.context_int_type(self.llvm_context$.ref(), 32);
         }
         if (info.data is .int_type(int_type)) {
             return self.lower_int_type(int_type);
@@ -82,8 +443,11 @@ struct LlvmLowerer {
         if (info.data is .float_type(float_type)) {
             return self.lower_float_type(float_type);
         }
-        if (info.data is .handle_type || info.data is .function_type) {
-            return self.context.pointer_type();
+        if (info.data is .handle_type) {
+            return ffi.context_pointer_type(self.llvm_context$.ref());
+        }
+        if (info.data is .function_type) {
+            return ffi.context_pointer_type(self.llvm_context$.ref());
         }
         return self.lower_layout_backed_type(type_id);
     }
@@ -93,14 +457,14 @@ struct LlvmLowerer {
         if (bits == 0) {
             bits = self.ctx.query.layouts.target.pointer_size * 8;
         }
-        return self.context.int_type(bits);
+        return ffi.context_int_type(self.llvm_context$.ref(), bits);
     }
 
     ffi.Type lower_float_type(types.FloatType float_type) {
         if (float_type.bits == 32) {
-            return self.context.float_type();
+            return ffi.context_float_type(self.llvm_context$.ref());
         }
-        return self.context.double_type();
+        return ffi.context_double_type(self.llvm_context$.ref());
     }
 
     ffi.Type lower_layout_backed_type(qid.TypeId type_id) {
@@ -109,6 +473,6 @@ struct LlvmLowerer {
         if (type_layout.kind == .invalid) {
             return ffi.Type();
         }
-        return self.context.pointer_type();
+        return ffi.context_pointer_type(self.llvm_context$.ref());
     }
 }
