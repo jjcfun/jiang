@@ -72,6 +72,7 @@ member_decl <- leading_annotation* member_modifier* member_decl_body
 
 leading_annotation
             <- "@" "where" "(" where_constraints ")"
+             / "@" "life" "(" life_constraints ")"
 
 decl_modifier
             <- "public"
@@ -148,6 +149,16 @@ where_constraint
 
 projected_where_constraint
             <- name "." "[" path "]" "." name "==" type
+
+life_constraints
+            <- (life_constraint ("," life_constraint)* ","?)?
+
+life_constraint
+            <- life_name ">" life_name
+
+life_name  <- name
+             / "self"
+             / "return"
 
 type_bound  <- trait_bound ("&" trait_bound)*
 

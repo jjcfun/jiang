@@ -49,6 +49,13 @@ LayoutStore
 
 `FieldLayout` 保存 field `DefId?`、field `TypeId`、offset 和 field layout。
 
+`DropCategoryKind` 保存 concrete type 的析构类别：
+
+- `no_drop`：标量、function pointer、non-owning handle 等不需要析构。
+- `trivial_drop`：aggregate/optional/union 本身不需要自定义析构，成员也没有 owning drop。
+- `recursive_drop`：类型自身或成员包含 `T^` owning pointer，需要 drop elaboration 递归处理。
+- `custom_drop`：预留给后续 `deinit` lowering；当前语义尚未生成 custom drop facts。
+
 ## TargetLayout
 
 `TargetLayout` 描述目标平台基础规则：
@@ -57,9 +64,18 @@ LayoutStore
 - integer and float builtin layout
 - bool layout
 - function pointer layout
+- optional layout：第一版使用显式 `{ tag, payload }`，不做 niche 优化
+- `T&` / `T^` / `T[*]` / `RawPointer<T>` layout：pointer-sized scalar，layout key 保留 handle kind
+- `T[]` layout：pointer + pointer-sized unsigned length
+- enum layout：当前 enum 无 associated value，使用 target int discriminant scalar
+- union layout：Jiang union 是 tagged union，第一版使用 target int tag + max payload slot
 - aggregate alignment policy
 
 不同 target 的 `LayoutKey` 查询结果不能复用。
+因此 `LayoutStore.set_target(...)` 必须清空已缓存的 `keys/layouts/storage`。
+
+aggregate layout 第一版使用自然 ABI 规则：每个 field offset 按 field align
+向上对齐，最终 size/stride 按所有 field align 的最大值向上对齐。
 
 ## Cycle
 

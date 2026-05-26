@@ -7,6 +7,7 @@
 
 import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
+import hir = "../hir/hir.jiang";
 import layout = "../layout/layout.jiang";
 import mir = "../mir/mir.jiang";
 import qid = "../query/id.jiang";
@@ -55,16 +56,26 @@ public struct PackageBorrowChecker {
     }
 }
 
+struct BorrowDataflowState {
+    public table.HashTable<move_path.MovePathId, Bool>! moved;
+    public table.HashTable<move_path.MovePathId, loan.LoanId>! active_loans;
+
+    public init() {
+        self.moved = table.HashTable<move_path.MovePathId, Bool>();
+        self.active_loans = table.HashTable<move_path.MovePathId, loan.LoanId>();
+    }
+}
+
 struct FunctionBorrowChecker {
     public context.CompilerContext& ctx;
     public sema_result.TypeCheckResults& typeck;
     public layout.LayoutStore& layouts;
     public result.BorrowCheckResults& results;
     public mir.MirFunctionId function_id;
+    public qid.DefId function_def;
     public mir.MirBody body;
     public move_path.MovePathTree! paths;
-    public table.HashTable<move_path.MovePathId, Bool>! moved;
-    public table.HashTable<move_path.MovePathId, loan.LoanId>! active_loans;
+    public BorrowDataflowState! dataflow;
 
     public init(
         context.CompilerContext& ctx,
@@ -78,11 +89,11 @@ struct FunctionBorrowChecker {
         self.layouts = layouts;
         self.results = results;
         self.function_id = function.id;
+        self.function_def = function.def_id;
         self.body = function.body;
         mir.MirBody! body = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
-        self.moved = table.HashTable<move_path.MovePathId, Bool>();
-        self.active_loans = table.HashTable<move_path.MovePathId, loan.LoanId>();
+        self.dataflow = BorrowDataflowState();
     }
 
     public () check() {
@@ -120,9 +131,66 @@ struct FunctionBorrowChecker {
             return;
         }
         if (self.rvalue_contains_borrowed_value(value)) {
+            if (self.assignment_lifetime_allows_escape(destination, value)) {
+                return;
+            }
             self.results.mark_error();
             self.add_borrow_escape_diagnostic();
         }
+    }
+
+    Bool assignment_lifetime_allows_escape(mir.MirPlace destination, mir.MirRvalue value) {
+        if (value is .borrow_value(borrow_value)) {
+            return self.field_lifetime_allows_borrow_store(destination, borrow_value.place);
+        }
+        if (value is .address_of_value(address_of_value)) {
+            return self.field_lifetime_allows_borrow_store(destination, address_of_value.place);
+        }
+        return false;
+    }
+
+    Bool field_lifetime_allows_borrow_store(mir.MirPlace destination, mir.MirPlace source) {
+        guard self.destination_field_def(destination) is some field_def else {
+            return false;
+        }
+        if (!self.field_has_self_lifetime(field_def)) {
+            return false;
+        }
+        return destination.local_id.to_index() == source.local_id.to_index();
+    }
+
+    qid.DefId? destination_field_def(mir.MirPlace destination) {
+        qid.DefId?! field_def = null;
+        Int! index = 0;
+        while (index < destination.projection.length) {
+            if (destination.projection[index] is .field_projection(field)) {
+                field_def = field.field_def;
+            }
+            index = index + 1;
+        }
+        return field_def;
+    }
+
+    Bool field_has_self_lifetime(qid.DefId field_def) {
+        guard self.ctx.query.hirs.def(field_def) is some hir_def else {
+            return false;
+        }
+        Int! index = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            if (self.is_field_self_lifetime_constraint(constraint)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool is_field_self_lifetime_constraint(hir.HirLifetimeConstraint constraint) {
+        if (constraint.shorter.kind != .self_lifetime) {
+            return false;
+        }
+        return constraint.longer.kind == .named_lifetime;
     }
 
     Bool place_may_write_outside_current_body(mir.MirPlace place) {
@@ -199,7 +267,7 @@ struct FunctionBorrowChecker {
             self.paths.path_for_place(source),
             self.paths.path_for_place(target)
         );
-        self.active_loans.set(self.paths.path_for_place(target), loan_id);
+        self.dataflow.active_loans.set(self.paths.path_for_place(target), loan_id);
     }
 
     () check_terminator(mir.MirTerminator terminator) {
@@ -233,7 +301,65 @@ struct FunctionBorrowChecker {
         if (return_term.implicit_unit) {
             return;
         }
-        self.check_path_escape(self.paths.root_for_local(self.body.return_local));
+        self.check_return_path_escape(self.paths.root_for_local(self.body.return_local));
+    }
+
+    () check_return_path_escape(move_path.MovePathId path) {
+        guard self.active_loan_for_path(path) is some loan_id else { return; }
+        if (self.return_lifetime_allows_loan(loan_id)) {
+            return;
+        }
+        self.results.mark_error();
+        self.add_borrow_escape_diagnostic();
+    }
+
+    Bool return_lifetime_allows_loan(loan.LoanId loan_id) {
+        loan.Loan current = self.results.loans.get(loan_id);
+        guard self.source_root_param_symbol(current.source) is some source_symbol else {
+            return false;
+        }
+        guard self.ctx.query.hirs.def(self.function_def) is some hir_def else {
+            return false;
+        }
+        return self.hir_allows_return_lifetime(hir_def, source_symbol);
+    }
+
+    qid.SymbolId? source_root_param_symbol(move_path.MovePathId source) {
+        move_path.MovePath path = self.paths.get(source);
+        Int local_index = path.local_id.to_index();
+        if (local_index < 0 || local_index >= self.body.locals.length) {
+            return null;
+        }
+        mir.MirLocalDecl local = self.body.locals[local_index];
+        if (local.kind != .param) {
+            return null;
+        }
+        return local.name;
+    }
+
+    Bool hir_allows_return_lifetime(hir.HirDef hir_def, qid.SymbolId source_symbol) {
+        Int! index = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            if (self.is_return_lifetime_constraint(constraint, source_symbol)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool is_return_lifetime_constraint(hir.HirLifetimeConstraint constraint, qid.SymbolId source_symbol) {
+        if (constraint.shorter.kind != .return_lifetime) {
+            return false;
+        }
+        if (constraint.longer.kind != .named_lifetime) {
+            return false;
+        }
+        guard constraint.longer.symbol is some longer_symbol else {
+            return false;
+        }
+        return longer_symbol == source_symbol;
     }
 
     () check_call(mir.MirCallTerminator call_term) {
@@ -401,7 +527,7 @@ struct FunctionBorrowChecker {
     }
 
     loan.LoanId? active_loan_for_path(move_path.MovePathId path) {
-        if (self.active_loans.get(path) is some loan_id) {
+        if (self.dataflow.active_loans.get(path) is some loan_id) {
             return loan_id;
         }
         if (self.active_loan_for_ancestor(path) is some loan_id) {
@@ -413,7 +539,7 @@ struct FunctionBorrowChecker {
     loan.LoanId? active_loan_for_ancestor(move_path.MovePathId path) {
         move_path.MovePath! current = self.paths.get(path);
         while (current.parent is some parent) {
-            if (self.active_loans.get(parent) is some loan_id) {
+            if (self.dataflow.active_loans.get(parent) is some loan_id) {
                 return loan_id;
             }
             current = self.paths.get(parent);
@@ -425,7 +551,7 @@ struct FunctionBorrowChecker {
         Int! index = 0;
         while (index < self.paths.len()) {
             move_path.MovePathId candidate = move_path.MovePathId(index);
-            if (self.active_loans.get(candidate) is some loan_id) {
+            if (self.dataflow.active_loans.get(candidate) is some loan_id) {
                 if (self.is_descendant_of(candidate, path)) {
                     return loan_id;
                 }
@@ -446,7 +572,7 @@ struct FunctionBorrowChecker {
         Int! index = 0;
         while (index < self.results.loans.len()) {
             loan.Loan current = self.results.loans.get(loan.LoanId(index));
-            if (self.active_loans.has(current.target) && self.paths_overlap(current.source, path)) {
+            if (self.dataflow.active_loans.has(current.target) && self.paths_overlap(current.source, path)) {
                 return true;
             }
             index = index + 1;
@@ -466,11 +592,11 @@ struct FunctionBorrowChecker {
 
     () mark_moved(move_path.MovePathId path) {
         self.clear_descendants(path);
-        self.moved.set(path, true);
+        self.dataflow.moved.set(path, true);
     }
 
     Bool is_path_uninitialized(move_path.MovePathId path) {
-        if (self.moved.has(path)) {
+        if (self.dataflow.moved.has(path)) {
             return true;
         }
         if (self.has_moved_ancestor(path)) {
@@ -482,7 +608,7 @@ struct FunctionBorrowChecker {
     Bool has_moved_ancestor(move_path.MovePathId path) {
         move_path.MovePath! current = self.paths.get(path);
         while (current.parent is some parent) {
-            if (self.moved.has(parent)) {
+            if (self.dataflow.moved.has(parent)) {
                 return true;
             }
             current = self.paths.get(parent);
@@ -494,7 +620,7 @@ struct FunctionBorrowChecker {
         Int! index = 0;
         while (index < self.paths.len()) {
             move_path.MovePathId candidate = move_path.MovePathId(index);
-            if (self.moved.has(candidate) && self.is_descendant_of(candidate, path)) {
+            if (self.dataflow.moved.has(candidate) && self.is_descendant_of(candidate, path)) {
                 return true;
             }
             index = index + 1;
@@ -514,8 +640,8 @@ struct FunctionBorrowChecker {
     }
 
     () clear_path_and_descendants(move_path.MovePathId path) {
-        self.moved.remove(path);
-        self.active_loans.remove(path);
+        self.dataflow.moved.remove(path);
+        self.dataflow.active_loans.remove(path);
         self.clear_descendants(path);
     }
 
@@ -524,8 +650,8 @@ struct FunctionBorrowChecker {
         while (index < self.paths.len()) {
             move_path.MovePathId candidate = move_path.MovePathId(index);
             if (self.is_descendant_of(candidate, path)) {
-                self.moved.remove(candidate);
-                self.active_loans.remove(candidate);
+                self.dataflow.moved.remove(candidate);
+                self.dataflow.active_loans.remove(candidate);
             }
             index = index + 1;
         }

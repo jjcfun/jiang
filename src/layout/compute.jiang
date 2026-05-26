@@ -7,16 +7,23 @@ import layout = "./layout.jiang";
 import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import def = "../resolve/def.jiang";
+import hir = "../hir/hir.jiang";
 import monomorph = "../sema/monomorph.jiang";
 import query_api = "../query/api.jiang";
 import qid = "../query/id.jiang";
 import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 import types = "../sema/type.jiang";
+import token = "../syntax/token.jiang";
 
 public layout.LayoutId layout_of_type(context.CompilerContext& ctx, qid.TypeId type_id) {
     LayoutComputer! computer = LayoutComputer(ctx);
     return computer.layout_of_type(type_id);
+}
+
+public layout.DropCategoryKind drop_category_of_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+    LayoutComputer! computer = LayoutComputer(ctx);
+    return computer.drop_category_of_type(type_id);
 }
 
 struct LayoutComputer {
@@ -25,11 +32,13 @@ struct LayoutComputer {
     // value: 1 = visiting, 2 = done。layout cycle 独立于 type query
     // cycle，因为 by-value object layout 有自己的递归规则。
     table.HashTable<layout.LayoutKey, Int>! states;
+    table.HashTable<layout.LayoutKey, Int>! drop_states;
 
     public init(context.CompilerContext& ctx) {
         self.ctx = ctx;
         self.query = ctx.query$.ref();
         self.states = table.HashTable<layout.LayoutKey, Int>();
+        self.drop_states = table.HashTable<layout.LayoutKey, Int>();
     }
 
     public layout.LayoutId layout_of_type(qid.TypeId type_id) {
@@ -48,6 +57,49 @@ struct LayoutComputer {
         layout.LayoutId id = self.compute_layout(info, key);
         self.states.set(key, 2);
         return id;
+    }
+
+    public layout.DropCategoryKind drop_category_of_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.query.types.get(type_id);
+        layout.LayoutKey key = self.key_for_type(type_id);
+        if (self.query.layouts.drop_category(key) is some existing) {
+            return existing;
+        }
+        if (self.drop_states.get(key) is some state) {
+            if (state == 1) {
+                return .recursive_drop;
+            }
+        }
+
+        self.drop_states.set(key, 1);
+        layout.DropCategoryKind category = self.compute_drop_category(info);
+        self.query.layouts.set_drop_category(key, category);
+        self.drop_states.set(key, 2);
+        return category;
+    }
+
+    layout.DropCategoryKind compute_drop_category(types.TypeInfo info) {
+        if (info.data is .invalid) { return .no_drop; }
+        if (info.data is .never) { return .no_drop; }
+        if (info.data is .unit) { return .no_drop; }
+        if (info.data is .bool_type) { return .no_drop; }
+        if (info.data is .char_type) { return .no_drop; }
+        if (info.data is .int_type) { return .no_drop; }
+        if (info.data is .float_type) { return .no_drop; }
+        if (info.data is .function_type) { return .no_drop; }
+        if (info.data is .handle_type(handle_type)) {
+            return self.drop_category_for_handle(handle_type);
+        }
+        if (info.data is .optional(optional_type)) {
+            return self.aggregate_drop_category_for_type(optional_type.element);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.drop_category_for_sequence(tuple_type.items);
+        }
+        if (info.data is .named(named)) {
+            return self.drop_category_for_nominal(named);
+        }
+        return .no_drop;
     }
 
     layout.LayoutId compute_layout(types.TypeInfo info, layout.LayoutKey key) {
@@ -78,6 +130,12 @@ struct LayoutComputer {
         if (info.data is .tuple_type(tuple_type)) {
             return self.layout_tuple(key, tuple_type);
         }
+        if (info.data is .optional(optional_type)) {
+            return self.layout_optional(key, optional_type);
+        }
+        if (info.data is .handle_type(handle_type)) {
+            return self.layout_handle(key, handle_type);
+        }
         if (info.data is .function_type) {
             return self.add_function_pointer(key);
         }
@@ -85,6 +143,80 @@ struct LayoutComputer {
             return self.layout_nominal(key, named);
         }
         return self.add_invalid(key);
+    }
+
+    layout.DropCategoryKind drop_category_for_handle(types.HandleType handle_type) {
+        if (handle_type.kind == .owner_pointer) {
+            return .recursive_drop;
+        }
+        return .no_drop;
+    }
+
+    layout.DropCategoryKind drop_category_for_sequence(qid.TypeId[] type_ids) {
+        layout.DropCategoryKind! category = .trivial_drop;
+        Int! index = 0;
+        while (index < type_ids.length) {
+            category = self.merge_drop_category(category, self.drop_category_of_type(type_ids[index]));
+            index = index + 1;
+        }
+        return category;
+    }
+
+    layout.DropCategoryKind aggregate_drop_category_for_type(qid.TypeId type_id) {
+        return self.merge_drop_category(.trivial_drop, self.drop_category_of_type(type_id));
+    }
+
+    layout.DropCategoryKind drop_category_for_nominal(types.NamedType named) {
+        def.DefKind kind = self.query.defs.get(named.def_id).kind;
+        if (kind == .enum_def) {
+            return .no_drop;
+        }
+        if (kind == .struct_def || kind == .record_def || kind == .union_def) {
+            return self.drop_category_for_nominal_members(named, kind);
+        }
+        return .no_drop;
+    }
+
+    layout.DropCategoryKind drop_category_for_nominal_members(types.NamedType named, def.DefKind kind) {
+        guard self.query.hirs.def(named.def_id) is some hir_def else {
+            return .no_drop;
+        }
+        monomorph.InstanceKey instance = monomorph.InstanceKey(named.def_id, named.args);
+        layout.DropCategoryKind! category = .trivial_drop;
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.member_participates_in_drop(kind, member_def)) {
+                qid.TypeId member_type = self.concrete_member_type(instance, member_def);
+                category = self.merge_drop_category(category, self.drop_category_of_type(member_type));
+            }
+            index = index + 1;
+        }
+        return category;
+    }
+
+    Bool member_participates_in_drop(def.DefKind owner_kind, qid.DefId member_def) {
+        def.DefKind member_kind = self.query.defs.get(member_def).kind;
+        if (owner_kind == .union_def) {
+            return member_kind == .union_variant_def;
+        }
+        return member_kind == .field_def;
+    }
+
+    layout.DropCategoryKind merge_drop_category(
+        layout.DropCategoryKind lhs,
+        layout.DropCategoryKind rhs
+    ) {
+        if (lhs == .custom_drop || rhs == .custom_drop) {
+            return .custom_drop;
+        }
+        if (lhs == .recursive_drop || rhs == .recursive_drop) {
+            return .recursive_drop;
+        }
+        if (lhs == .trivial_drop || rhs == .trivial_drop) {
+            return .trivial_drop;
+        }
+        return .no_drop;
     }
 
     layout.LayoutId add_builtin(layout.LayoutKey key, layout.BuiltinLayoutKind kind, Int size, Int align) {
@@ -187,10 +319,76 @@ struct LayoutComputer {
         );
     }
 
+    layout.LayoutId layout_optional(layout.LayoutKey key, types.OptionalType optional_type) {
+        // 第一版 optional 不做 niche 优化，显式表示为 `{ tag, payload }`。
+        // 后续 niche 只应该改变 layout query 结果，不能改变 semantic TypeId。
+        qid.TypeId tag_type = self.query.types.bool_type();
+        layout.TypeLayout payload_layout = self.query.layouts.layout(self.layout_of_type(optional_type.element));
+        list.ArrayList<layout.FieldLayout>! fields = list.ArrayList<layout.FieldLayout>(2);
+        fields.add(layout.FieldLayout(null, tag_type, 0));
+
+        Int payload_offset = self.align_to(1, payload_layout.align);
+        fields.add(layout.FieldLayout(null, optional_type.element, payload_offset));
+
+        Int max_align = self.max_int(1, payload_layout.align);
+        Int size = self.align_to(payload_offset + payload_layout.size, max_align);
+        return self.query.layouts.add_layout(
+            key,
+            .aggregate,
+            size,
+            max_align,
+            self.align_to(size, max_align),
+            self.query.layouts.field_array(fields$.ref())
+        );
+    }
+
+    layout.LayoutId layout_handle(layout.LayoutKey key, types.HandleType handle_type) {
+        if (handle_type.kind == .slice) {
+            return self.layout_slice(key, handle_type);
+        }
+        return self.add_pointer_sized_scalar(key);
+    }
+
+    layout.LayoutId add_pointer_sized_scalar(layout.LayoutKey key) {
+        return self.query.layouts.add_layout(
+            key,
+            .scalar,
+            self.query.layouts.target.pointer_size,
+            self.query.layouts.target.pointer_align,
+            self.query.layouts.target.pointer_size,
+            self.query.layouts.empty_fields()
+        );
+    }
+
+    layout.LayoutId layout_slice(layout.LayoutKey key, types.HandleType slice_type) {
+        qid.TypeId pointer_type = self.query.types.many_pointer_type(slice_type.element, token.Span());
+        qid.TypeId length_type = self.query.types.uint_type();
+        list.ArrayList<layout.FieldLayout>! fields = list.ArrayList<layout.FieldLayout>(2);
+        fields.add(layout.FieldLayout(null, pointer_type, 0));
+        fields.add(layout.FieldLayout(null, length_type, self.query.layouts.target.pointer_size));
+
+        Int size = self.query.layouts.target.pointer_size * 2;
+        Int align = self.query.layouts.target.pointer_align;
+        return self.query.layouts.add_layout(
+            key,
+            .aggregate,
+            size,
+            align,
+            self.align_to(size, align),
+            self.query.layouts.field_array(fields$.ref())
+        );
+    }
+
     layout.LayoutId layout_nominal(layout.LayoutKey key, types.NamedType named) {
         def.DefKind kind = self.query.defs.get(named.def_id).kind;
         if (kind == .struct_def || kind == .record_def) {
             return self.layout_nominal_fields(key, named);
+        }
+        if (kind == .enum_def) {
+            return self.add_discriminant_scalar(key);
+        }
+        if (kind == .union_def) {
+            return self.layout_union(key, named);
         }
         return self.add_invalid(key);
     }
@@ -207,7 +405,7 @@ struct LayoutComputer {
         while (index < hir_def.members.len()) {
             qid.DefId member_def = hir_def.members.get(index);
             if (self.query.defs.get(member_def).kind == .field_def) {
-                qid.TypeId field_type = self.concrete_field_type(instance, member_def);
+                qid.TypeId field_type = self.concrete_member_type(instance, member_def);
                 layout.TypeLayout field_layout = self.query.layouts.layout(self.layout_of_type(field_type));
                 offset = self.align_to(offset, field_layout.align);
                 fields.add(layout.FieldLayout(member_def, field_type, offset));
@@ -228,7 +426,85 @@ struct LayoutComputer {
         );
     }
 
-    qid.TypeId concrete_field_type(monomorph.InstanceKey instance, qid.DefId field_def) {
+    layout.LayoutId add_discriminant_scalar(layout.LayoutKey key) {
+        Int size = self.query.layouts.target.pointer_size;
+        return self.query.layouts.add_layout(
+            key,
+            .scalar,
+            size,
+            self.scalar_align(size, self.query.layouts.target.int_align),
+            size,
+            self.query.layouts.empty_fields()
+        );
+    }
+
+    layout.LayoutId layout_union(layout.LayoutKey key, types.NamedType named) {
+        guard self.query.hirs.def(named.def_id) is some hir_def else {
+            return self.add_invalid(key);
+        }
+        monomorph.InstanceKey instance = monomorph.InstanceKey(named.def_id, named.args);
+        list.ArrayList<layout.FieldLayout>! fields = list.ArrayList<layout.FieldLayout>(hir_def.members.len() + 1);
+
+        // Jiang union 是 tagged union。当前阶段还没有显式 tag enum layout，
+        // 先用 target int 表示 tag，并把所有 payload 放到同一 payload offset。
+        qid.TypeId tag_type = self.query.types.int_type();
+        Int tag_size = self.query.layouts.target.pointer_size;
+        Int tag_align = self.scalar_align(tag_size, self.query.layouts.target.int_align);
+        fields.add(layout.FieldLayout(null, tag_type, 0));
+
+        Int! max_payload_size = 0;
+        Int! max_payload_align = 1;
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.query.defs.get(member_def).kind == .union_variant_def) {
+                qid.TypeId payload_type = self.concrete_member_type(instance, member_def);
+                layout.TypeLayout payload_layout = self.query.layouts.layout(self.layout_of_type(payload_type));
+                max_payload_size = self.max_int(max_payload_size, payload_layout.size);
+                max_payload_align = self.max_int(max_payload_align, payload_layout.align);
+            }
+            index = index + 1;
+        }
+
+        Int payload_offset = self.align_to(tag_size, max_payload_align);
+        self.add_union_payload_fields(fields$.ref(), instance, hir_def, payload_offset);
+
+        Int max_align = self.max_int(tag_align, max_payload_align);
+        Int size = self.align_to(payload_offset + max_payload_size, max_align);
+        return self.query.layouts.add_layout(
+            key,
+            .aggregate,
+            size,
+            max_align,
+            self.align_to(size, max_align),
+            self.query.layouts.field_array(fields$.ref())
+        );
+    }
+
+    () add_union_payload_fields(
+        list.ArrayList<layout.FieldLayout>& fields,
+        monomorph.InstanceKey instance,
+        hir.HirDef hir_def,
+        Int payload_offset
+    ) {
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.query.defs.get(member_def).kind != .union_variant_def) {
+                index = index + 1;
+                continue;
+            }
+            fields.add(layout.FieldLayout(
+                    member_def,
+                    self.concrete_member_type(instance, member_def),
+                    payload_offset
+                )
+            );
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId concrete_member_type(monomorph.InstanceKey instance, qid.DefId field_def) {
         if (monomorph.concrete_member_type(
             self.query,
             self.query.hirs$.ref(),
@@ -271,6 +547,12 @@ struct LayoutComputer {
         if (info.data is .optional(optional_type)) {
             return layout.LayoutKey(.optional_type(layout.SequenceLayoutKey(self.one_type_key(optional_type.element))));
         }
+        if (info.data is .handle_type(handle_type)) {
+            return layout.LayoutKey(.handle_type(layout.HandleLayoutKey(
+                self.handle_layout_kind(handle_type.kind),
+                self.one_type_key(handle_type.element)
+            )));
+        }
         if (info.data is .function_type(function_type)) {
             return layout.LayoutKey(.function_type(layout.FunctionLayoutKey(
                 self.key_array_for_types(function_type.params),
@@ -284,6 +566,14 @@ struct LayoutComputer {
             )));
         }
         return self.builtin_key(.invalid, 0, false);
+    }
+
+    layout.HandleLayoutKind handle_layout_kind(types.HandleTypeKind kind) {
+        if (kind == .reference) { return .reference; }
+        if (kind == .owner_pointer) { return .owner_pointer; }
+        if (kind == .many_pointer) { return .many_pointer; }
+        if (kind == .raw_pointer) { return .raw_pointer; }
+        return .slice;
     }
 
     layout.LayoutKey builtin_key(layout.BuiltinLayoutKind kind, Int bits, Bool signed) {
