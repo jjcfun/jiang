@@ -4,6 +4,8 @@ import context = "../context.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
 import hir_store = "../hir/store.jiang";
+import layout = "../layout/layout.jiang";
+import layout_compute = "../layout/compute.jiang";
 import qid = "../query/id.jiang";
 import def = "../resolve/def.jiang";
 import module_graph = "../resolve/module_graph.jiang";
@@ -758,22 +760,83 @@ struct BodyLowerer {
     // type check 已经保证 get/set 的 base 是 pointer/reference。MIR 只把
     // 它们降成现有 place deref 读写，不再重新做语义判定。
     () lower_implicit_call(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
-        qid.SymbolId get_symbol = self.lowerer.ctx.query.symbols.intern("get");
-        if (call.name == get_symbol) {
+        if (call.op == .alloc_array) {
+            self.lower_alloc_array(node_id, call, destination);
+            return;
+        }
+        if (call.op == .size) {
+            self.lower_type_info_value(node_id, call, destination, 0);
+            return;
+        }
+        if (call.op == .align) {
+            self.lower_type_info_value(node_id, call, destination, 1);
+            return;
+        }
+        if (call.op == .max_align) {
+            self.lower_type_info_value(node_id, call, destination, 2);
+            return;
+        }
+        if (call.op == .get) {
             self.lower_pointer_get(node_id, call, destination);
             return;
         }
-        qid.SymbolId set_symbol = self.lowerer.ctx.query.symbols.intern("set");
-        if (call.name == set_symbol) {
+        if (call.op == .set) {
             self.lower_pointer_set(node_id, call, destination);
             return;
         }
-        qid.SymbolId move_symbol = self.lowerer.ctx.query.symbols.intern("move");
-        if (call.name == move_symbol) {
+        if (call.op == .move) {
             self.lower_move(node_id, call, destination);
             return;
         }
+        if (call.op == .ref) {
+            self.lower_borrow_ref(node_id, call, destination, false);
+            return;
+        }
+        if (call.op == .addr) {
+            self.lower_borrow_ref(node_id, call, destination, true);
+            return;
+        }
+        if (call.op == .cast) {
+            self.lower_cast(node_id, call, destination);
+            return;
+        }
+        if (call.op == .free) {
+            self.lower_free(node_id, call, destination);
+            return;
+        }
+        if (call.op == .optional_some) {
+            self.lower_optional_some(node_id, call, destination);
+            return;
+        }
         self.mark_unsupported(node_id);
+    }
+
+    () lower_alloc_array(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.push_assign(
+            destination,
+            .alloc_array_value(mir.MirAllocArrayRvalue {
+                element_type: self.type_for_node(call.base),
+                count: self.lower_to_operand(call.args[0])
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    () lower_type_info_value(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination, Int kind) {
+        qid.TypeId type_id = self.type_for_node(call.base);
+        layout.LayoutId layout_id = layout_compute.layout_of_type(self.lowerer.ctx, type_id);
+        layout.TypeLayout type_layout = self.lowerer.ctx.query.layouts.layout(layout_id);
+        Int! value = 8;
+        if (kind == 0) {
+            value = type_layout.size;
+        } else if (kind == 1) {
+            value = type_layout.align;
+        }
+        self.push_assign(destination, self.int_rvalue(node_id, value), self.lowerer.hir_span(node_id));
     }
 
     () lower_pointer_get(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
@@ -811,6 +874,106 @@ struct BodyLowerer {
             .use_value(mir.MirUseRvalue {value: .move_operand(mir.MirMoveOperand {place: source})}),
             self.lowerer.hir_span(node_id)
         );
+    }
+
+    () lower_borrow_ref(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination, Bool raw_pointer) {
+        guard self.place_for_expr(call.base) is some source else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        mir.MirRvalue! value = .borrow_value(mir.MirBorrowRvalue {place: source});
+        if (raw_pointer) {
+            value = .address_of_value(mir.MirAddressOfRvalue {
+                mutable_pointer: true,
+                place: source
+            });
+        }
+        self.push_assign(destination, value, self.lowerer.hir_span(node_id));
+    }
+
+    () lower_cast(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        qid.TypeId source_type = self.type_for_node(call.base);
+        qid.TypeId target_type = self.type_for_node(call.args[0]);
+        self.push_assign(
+            destination,
+            .cast_value(mir.MirCastRvalue {
+                kind: self.cast_kind(source_type, target_type),
+                value: self.lower_to_operand(call.base),
+                target_type: target_type
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    () lower_free(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
+        if (call.args.length != 0) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.push_assign(
+            destination,
+            .free_value(mir.MirFreeRvalue {pointer: self.free_pointer_operand(node_id, call)}),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    mir.MirOperand free_pointer_operand(hir.HirId node_id, hir.HirImplicitCall call) {
+        if (!call.optional_chain) {
+            return self.lower_to_operand(call.base);
+        }
+        mir.MirLocalId temp = self.add_temp(self.optional_element_type(call.base), self.lowerer.hir_span(node_id));
+        self.push_assign(
+            self.place_for_local(temp),
+            .optional_value(mir.MirOptionalRvalue {
+                op: .unwrap_some,
+                value: self.lower_to_operand(call.base)
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+        return .copy_operand(mir.MirCopyOperand {place: self.place_for_local(temp)});
+    }
+
+    qid.TypeId optional_element_type(hir.HirId node_id) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        if (info.data is .optional(optional)) {
+            return optional.element;
+        }
+        return type_id;
+    }
+
+    () lower_optional_some(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
+        self.push_assign(
+            destination,
+            .optional_value(mir.MirOptionalRvalue {
+                op: .unwrap_some,
+                value: self.lower_to_operand(call.base)
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    mir.MirCastKind cast_kind(qid.TypeId source_type, qid.TypeId target_type) {
+        types.TypeInfo source = self.lowerer.ctx.query.types.get(source_type);
+        types.TypeInfo target = self.lowerer.ctx.query.types.get(target_type);
+        if (source.data is .handle_type) {
+            if (target.data is .handle_type) { return .ptr_to_ptr; }
+            if (target.data is .int_type) { return .ptr_to_int; }
+        }
+        if (source.data is .int_type) {
+            if (target.data is .handle_type) { return .int_to_ptr; }
+            if (target.data is .float_type) { return .int_to_float; }
+            if (target.data is .int_type) { return .int_to_int; }
+        }
+        if (source.data is .float_type) {
+            if (target.data is .int_type) { return .float_to_int; }
+            if (target.data is .float_type) { return .float_to_float; }
+        }
+        return .bitcast;
     }
 
     // 如果 base 本身不是 place（例如返回 pointer 的 call），先落入临时
@@ -863,8 +1026,7 @@ struct BodyLowerer {
         guard node.data is .implicit_call(call) else {
             return null;
         }
-        qid.SymbolId move_symbol = self.lowerer.ctx.query.symbols.intern("move");
-        if (call.name == move_symbol) {
+        if (call.op == .move) {
             guard self.place_for_expr(call.base) is some source else {
                 self.mark_unsupported(node_id);
                 return null;
@@ -901,6 +1063,13 @@ struct BodyLowerer {
                 return self.lower_def_operand(node_id, def_id);
             }
         }
+        if (node.data is .member_access(_)) {
+            if (self.lowerer.typeck.member_selection(node_id) is some member_def) {
+                if (self.def_can_be_function_operand(member_def)) {
+                    return self.lower_def_operand(node_id, member_def);
+                }
+            }
+        }
         if (self.place_for_expr(node_id) is some place) {
             return .copy_operand(mir.MirCopyOperand {place: place});
         }
@@ -908,8 +1077,7 @@ struct BodyLowerer {
     }
 
     mir.MirOperand lower_def_operand(hir.HirId node_id, qid.DefId def_id) {
-        def.DefKind kind = self.lowerer.ctx.query.defs.get(def_id).kind;
-        if (kind != .function_def && kind != .deinit_def) {
+        if (!self.def_can_be_function_operand(def_id)) {
             return self.unsupported_operand(node_id);
         }
         qid.TypeId[] type_args = self.function_const_type_args(node_id, def_id);
@@ -921,6 +1089,14 @@ struct BodyLowerer {
                 type_args: type_args
             })
         });
+    }
+
+    Bool def_can_be_function_operand(qid.DefId def_id) {
+        def.DefKind kind = self.lowerer.ctx.query.defs.get(def_id).kind;
+        if (kind == .function_def) {
+            return true;
+        }
+        return kind == .deinit_def;
     }
 
     qid.TypeId[] function_const_type_args(hir.HirId node_id, qid.DefId def_id) {
@@ -1158,6 +1334,16 @@ struct BodyLowerer {
                 type_id: self.lowerer.ctx.query.types.unit_type(),
                 span: span,
                 value: .unit_value(mir.MirUnitConst {unit_value: true})
+            })
+        });
+    }
+
+    mir.MirRvalue int_rvalue(hir.HirId node_id, Int value) {
+        return .use_value(mir.MirUseRvalue {
+            value: .const_operand(mir.MirConst {
+                type_id: self.lowerer.ctx.query.types.int_type(),
+                span: self.lowerer.hir_span(node_id),
+                value: .int_value(mir.MirIntConst {bits: UInt64(value), signed_value: true})
             })
         });
     }

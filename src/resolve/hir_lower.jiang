@@ -23,6 +23,7 @@ import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
 import qid = "../query/id.jiang";
 import list = "../support/list.jiang";
+import string = "../support/string.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
 import def = "./def.jiang";
@@ -52,6 +53,7 @@ struct HirLower {
         guard self.state.file.root is some root_id else { return; }
         ast.AstNode root = self.state.file.get(root_id);
         guard root.data is .root(root_data) else { return; }
+
 
         Int! index = 0;
         while (index < root_data.items.len) {
@@ -189,6 +191,7 @@ struct HirLower {
         hir.HirId placeholder = self.add_invalid_node(self.state.file.get(deinit_decl.value).span);
         self.state.query.hirs.set_body(deinit_def, hir.HirBody(deinit_def, placeholder));
         self.env.enter_scope(.function_scope);
+        self.add_self_local(deinit_def, owner_def);
         hir.HirId root = self.lower_expr(deinit_decl.value);
         self.env.exit_scope();
         self.state.query.hirs.set_body_root(deinit_def, root);
@@ -239,6 +242,9 @@ struct HirLower {
             hir.HirId placeholder = self.add_invalid_node(self.state.file.get(function_decl.name).span);
             self.state.query.hirs.set_body(function_def, hir.HirBody(function_def, placeholder));
             self.env.enter_scope(.function_scope);
+            if (self.state.query.defs.get(function_def).owner_def is some owner_def) {
+                self.add_self_local(function_def, owner_def);
+            }
             self.lower_parameters(function_def, function_decl.params, signature.params);
             hir.HirId root = self.lower_expr(body_ast);
             self.env.exit_scope();
@@ -551,6 +557,32 @@ struct HirLower {
         }
     }
 
+    () add_self_local(qid.DefId function_def, qid.DefId owner_def) {
+        qid.SymbolId self_symbol = self.state.query.symbols.intern("self");
+        token.Span! span = token.Span();
+        if (self.state.query.source_map.def_span(owner_def) is some loc) {
+            span = loc.span;
+        }
+        qid.DefId self_def = self.state.query.defs.create(
+            .parameter_def,
+            .value_name,
+            .private_visibility,
+            def.Name {symbol: self_symbol, span: span},
+            function_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        hir.HirId type_ref = self.add_node(
+            .named_type_ref(hir.HirNamedTypeRef {def_id: owner_def, args: self.empty_hir_ids()}),
+            span
+        );
+        if (!self.env.empty()) {
+            self.env.define(self_symbol, .value_name, self_def, span);
+        }
+        self.state.query.hirs.add_local(function_def, .parameter, self_symbol, self_def, type_ref);
+    }
+
     hir.HirId lower_stmt(ast.AstId stmt_id) {
         ast.AstNode stmt = self.state.file.get(stmt_id);
         if (stmt.data is .stmt(stmt_data)) {
@@ -602,7 +634,7 @@ struct HirLower {
             return self.lower_implicit_call_expr(implicit_call, expr.span);
         }
         if (expr.data is .type_implicit_call(implicit_call)) {
-            return self.lower_implicit_call_expr(implicit_call, expr.span);
+            return self.lower_type_implicit_call_expr(implicit_call, expr.span);
         }
         if (expr.data is .call_arg(call_arg)) {
             return self.lower_expr(call_arg.value);
@@ -737,11 +769,21 @@ struct HirLower {
             index = index + 1;
         }
         return self.add_node(.call(hir.HirCall {
-            callee: self.lower_expr(call.callee),
+            callee: self.lower_call_callee(call.callee),
             type_args: self.freeze_hir_ids(type_args),
             args: self.freeze_hir_ids(args),
             target: self.call_target(call.callee)
         }), span);
+    }
+
+    hir.HirId lower_call_callee(ast.AstId callee_id) {
+        if (self.resolved_value_def_for_expr(callee_id) is some _) {
+            return self.lower_expr(callee_id);
+        }
+        if (self.resolved_type_def_for_expr(callee_id) is some _) {
+            return self.lower_type_ref(callee_id);
+        }
+        return self.lower_expr(callee_id);
     }
 
     hir.HirId lower_implicit_call_expr(ast.ImplicitCallData call, token.Span span) {
@@ -753,10 +795,45 @@ struct HirLower {
         }
         return self.add_node(.implicit_call(hir.HirImplicitCall {
             base: self.lower_expr(call.base),
-            name: self.name_symbol_or_zero(call.name),
+            op: self.implicit_op(call.name),
             args: self.freeze_hir_ids(args),
             optional_chain: call.optional_chain
         }), span);
+    }
+
+    hir.HirId lower_type_implicit_call_expr(ast.ImplicitCallData call, token.Span span) {
+        list.ArrayList<hir.HirId>! args = list.ArrayList<hir.HirId>(call.args.len);
+        Int! index = 0;
+        while (index < call.args.len) {
+            args.add(self.lower_expr(self.state.file.child_at(call.args, index)));
+            index = index + 1;
+        }
+        // Type receiver 会保留为 HIR type-ref node；type check 根据
+        // receiver type 解释 size/align/alloc_array 这类内建操作。
+        return self.add_node(.implicit_call(hir.HirImplicitCall {
+            base: self.lower_type_ref(call.base),
+            op: self.implicit_op(call.name),
+            args: self.freeze_hir_ids(args),
+            optional_chain: call.optional_chain
+        }), span);
+    }
+
+    hir.HirImplicitOp implicit_op(ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is some symbol else { return .unknown; }
+        UInt8[] text = self.state.query.symbols.text(symbol);
+        if (string.equal(text, "get")) { return .get; }
+        if (string.equal(text, "set")) { return .set; }
+        if (string.equal(text, "move")) { return .move; }
+        if (string.equal(text, "ref")) { return .ref; }
+        if (string.equal(text, "addr")) { return .addr; }
+        if (string.equal(text, "as")) { return .cast; }
+        if (string.equal(text, "free")) { return .free; }
+        if (string.equal(text, "some")) { return .optional_some; }
+        if (string.equal(text, "alloc_array")) { return .alloc_array; }
+        if (string.equal(text, "size")) { return .size; }
+        if (string.equal(text, "align")) { return .align; }
+        if (string.equal(text, "max_align")) { return .max_align; }
+        return .unknown;
     }
 
     hir.HirId lower_implicit_arg(ast.ImplicitArgData implicit_arg, token.Span span) {
@@ -794,7 +871,7 @@ struct HirLower {
         if (path.segments.len == 0) {
             return self.add_invalid_node(token.Span());
         }
-        hir.HirId! current = self.lower_name_ref(self.state.file.child_at(path.segments, 0));
+        hir.HirId! current = self.lower_member_path_base(self.state.file.child_at(path.segments, 0));
         Int! index = 1;
         while (index < path.segments.len) {
             ast.AstId segment = self.state.file.child_at(path.segments, index);
@@ -805,6 +882,13 @@ struct HirLower {
             index = index + 1;
         }
         return current;
+    }
+
+    hir.HirId lower_member_path_base(ast.AstId first_segment) {
+        if (self.resolved_type_def_for_expr(first_segment) is some _) {
+            return self.lower_type_ref(first_segment);
+        }
+        return self.lower_name_ref(first_segment);
     }
 
     hir.HirId lower_if_expr(ast.IfData if_expr, token.Span span) {
@@ -823,6 +907,7 @@ struct HirLower {
         // while/for 在 AST 里共用 LoopData：while 只有 condition，
         // for 只有 pattern + iterable。HIR 保留三者的 optional 形态，
         // 让后续 type check 按不同组合解释。
+        self.env.enter_scope(.loop_scope);
         hir.HirId?! condition = null;
         if (loop_expr.condition is some condition_ast) {
             condition = self.lower_expr(condition_ast);
@@ -831,7 +916,6 @@ struct HirLower {
         if (loop_expr.iterable is some iterable_ast) {
             iterable = self.lower_expr(iterable_ast);
         }
-        self.env.enter_scope(.loop_scope);
         hir.HirId?! pattern = null;
         if (loop_expr.pattern is some pattern_ast) {
             pattern = self.lower_pattern(pattern_ast);
@@ -1107,7 +1191,8 @@ struct HirLower {
 
     hir.HirCallTarget? call_target(ast.AstId callee_id) {
         guard self.resolved_value_def_for_expr(callee_id) is some def_id else { return null; }
-        if (self.state.query.defs.get(def_id).kind != .function_def) {
+        def.DefKind kind = self.state.query.defs.get(def_id).kind;
+        if (kind != .function_def && kind != .builtin_value_def) {
             return null;
         }
         return hir.HirCallTarget {def_id: def_id, signature_id: null};

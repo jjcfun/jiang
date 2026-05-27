@@ -285,7 +285,7 @@ public struct BodyCheck {
         // value.member 的 resolve 阶段只知道 member 名字；真正的 owner
         // 需要 base 类型参与，所以这里根据 base 的 named type namespace
         // 选出 field/variant/case，并把选择结果写入 TypeCheckResults。
-        qid.TypeId base_type = self.check_node(member_access.base);
+        qid.TypeId base_type = self.member_access_base_type(member_access.base);
         guard self.type_ops.value_member_for_type(
             base_type,
             node_id.owner_def,
@@ -320,6 +320,32 @@ public struct BodyCheck {
             return self.state.query.types.mutable_type(member_type, token.Span());
         }
         return member_type;
+    }
+
+    qid.TypeId member_access_base_type(hir.HirId base) {
+        if (self.is_type_ref_node(base)) {
+            return self.type_ops.check_type_ref(base);
+        }
+        return self.member_lookup_type(self.check_node(base));
+    }
+
+    qid.TypeId member_lookup_type(qid.TypeId base_type) {
+        if (self.type_ops.is_invalid_type(base_type)) {
+            return base_type;
+        }
+        types.TypeInfo info = self.state.query.types.get(base_type);
+        if (info.data is .handle_type(handle)) {
+            if (self.handle_supports_member_access(handle.kind)) {
+                return handle.element;
+            }
+        }
+        return base_type;
+    }
+
+    Bool handle_supports_member_access(types.HandleTypeKind kind) {
+        if (kind == .reference) { return true; }
+        if (kind == .owner_pointer) { return true; }
+        return kind == .raw_pointer;
     }
 
     Bool member_can_be_used_as_value(qid.DefId member_def) {
@@ -488,6 +514,9 @@ public struct BodyCheck {
     qid.TypeId check_call(hir.HirId node_id, hir.HirCall call) {
         // call 先要求 callee 已经能得到 function type；参数逐个检查后，
         // 再用函数签名决定 call 表达式的结果类型。
+        if (self.is_type_ref_node(call.callee)) {
+            return self.check_type_constructor_call(node_id, call);
+        }
         list.ArrayList<qid.TypeId>! type_args = self.type_ops.check_type_args(call.type_args);
         if (call.target is some target) {
             self.type_ops.record_generic_instance(node_id, target.def_id, type_args);
@@ -530,24 +559,113 @@ public struct BodyCheck {
         return self.substituted_call_result_type(call, type_args, function_type.result);
     }
 
+    qid.TypeId check_type_constructor_call(hir.HirId node_id, hir.HirCall call) {
+        // `T()` / `T(value)` 的 callee 是类型，不是函数 definition。
+        // resolve/HIR 已经把 callee 降成 type-ref；这里只负责检查参数并产出 T。
+        qid.TypeId result_type = self.type_ops.check_type_ref(call.callee);
+        Int! index = 0;
+        while (index < call.args.length) {
+            self.check_node(call.args[index]);
+            index = index + 1;
+        }
+        if (call.args.length <= 1) {
+            return result_type;
+        }
+        self.type_ops.add_node_error(
+            node_id,
+            "type constructor accepts at most one argument",
+            "type_constructor_arity_mismatch"
+        );
+        return self.state.query.types.invalid_type();
+    }
+
     // `$` 进入隐式操作层。get/set 是 pointer/reference 的显式解引用读写；
     // move 是 owning/non-copy value 的显式所有权转移入口。
     qid.TypeId check_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
-        qid.SymbolId get_symbol = self.state.query.symbols.intern("get");
-        if (call.name == get_symbol) {
+        if (self.is_type_ref_node(call.base)) {
+            return self.check_type_receiver_implicit_call(node_id, call);
+        }
+        if (call.op == .get) {
             return self.check_pointer_get(node_id, call);
         }
-        qid.SymbolId set_symbol = self.state.query.symbols.intern("set");
-        if (call.name == set_symbol) {
+        if (call.op == .set) {
             return self.check_pointer_set(node_id, call);
         }
-        qid.SymbolId move_symbol = self.state.query.symbols.intern("move");
-        if (call.name == move_symbol) {
+        if (call.op == .move) {
             return self.check_move(node_id, call);
+        }
+        if (call.op == .ref) {
+            return self.check_borrow_ref(node_id, call, false);
+        }
+        if (call.op == .addr) {
+            return self.check_borrow_ref(node_id, call, true);
+        }
+        if (call.op == .cast) {
+            return self.check_cast_implicit_call(node_id, call);
+        }
+        if (call.op == .free) {
+            return self.check_free_implicit_call(node_id, call);
+        }
+        if (call.op == .optional_some) {
+            return self.check_optional_some_implicit_call(node_id, call);
         }
         self.check_implicit_call_args(call);
         self.type_ops.add_node_error(node_id, "unsupported implicit operation", "unsupported_implicit_operation");
         return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId check_type_receiver_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
+        if (call.op == .alloc_array) {
+            return self.check_alloc_array_implicit_call(node_id, call);
+        }
+        if (call.op == .size) {
+            return self.check_type_info_implicit_call(node_id, call);
+        }
+        if (call.op == .align) {
+            return self.check_type_info_implicit_call(node_id, call);
+        }
+        if (call.op == .max_align) {
+            return self.check_type_info_implicit_call(node_id, call);
+        }
+        self.check_implicit_call_args(call);
+        self.type_ops.add_node_error(node_id, "unsupported type implicit operation", "unsupported_implicit_operation");
+        return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId check_alloc_array_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
+        qid.TypeId element = self.type_ops.check_type_ref(call.base);
+        if (!self.expect_implicit_arg_count(node_id, call, 1)) {
+            self.check_implicit_call_args(call);
+            return self.state.query.types.many_pointer_type(element, token.Span());
+        }
+        qid.TypeId count_type = self.check_node(call.args[0]);
+        self.type_ops.expect_value_assignable(
+            call.args[0],
+            self.state.query.types.int_type(),
+            count_type,
+            "alloc_array count must be Int",
+            "alloc_array_count_type_mismatch"
+        );
+        return self.state.query.types.many_pointer_type(element, token.Span());
+    }
+
+    qid.TypeId check_type_info_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
+        self.type_ops.check_type_ref(call.base);
+        self.expect_implicit_arg_count(node_id, call, 0);
+        return self.state.query.types.int_type();
+    }
+
+    Bool is_type_ref_node(hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .named_type_ref) { return true; }
+        if (node.data is .layered_type_ref) { return true; }
+        if (node.data is .array_type_ref) { return true; }
+        if (node.data is .errorable_type_ref) { return true; }
+        if (node.data is .function_type_ref) { return true; }
+        if (node.data is .tuple_type_ref) { return true; }
+        if (node.data is .unit_type_ref) { return true; }
+        if (node.data is .infer_type_ref) { return true; }
+        return node.data is .invalid_type_ref;
     }
 
     qid.TypeId check_pointer_get(hir.HirId node_id, hir.HirImplicitCall call) {
@@ -585,6 +703,80 @@ public struct BodyCheck {
             return self.state.query.types.invalid_type();
         }
         return base_type;
+    }
+
+    qid.TypeId check_borrow_ref(hir.HirId node_id, hir.HirImplicitCall call, Bool raw_pointer) {
+        qid.TypeId base_type = self.check_node(call.base);
+        self.expect_implicit_arg_count(node_id, call, 0);
+        if (!self.is_assignment_target(call.base)) {
+            self.type_ops.add_node_error(node_id, "borrow requires a place expression", "borrow_requires_place");
+            return self.state.query.types.invalid_type();
+        }
+        if (raw_pointer) {
+            return self.state.query.types.raw_pointer_type(base_type, token.Span());
+        }
+        return self.state.query.types.reference_type(base_type, token.Span());
+    }
+
+    qid.TypeId check_cast_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
+        self.check_node(call.base);
+        guard self.implicit_type_arg(call, 0) is some target_type else {
+            self.type_ops.add_node_error(node_id, "cast requires one type argument", "cast_type_arg_required");
+            return self.state.query.types.invalid_type();
+        }
+        if (call.args.length != 1) {
+            self.type_ops.add_node_error(node_id, "cast requires one type argument", "implicit_call_arity_mismatch");
+        }
+        return target_type;
+    }
+
+    qid.TypeId check_free_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
+        qid.TypeId base_type = self.check_node(call.base);
+        self.expect_implicit_arg_count(node_id, call, 0);
+        if (!self.is_free_receiver_type(base_type)) {
+            self.type_ops.add_node_error(node_id, "free requires pointer receiver", "free_receiver_type_mismatch");
+        }
+        return self.state.query.types.unit_type();
+    }
+
+    qid.TypeId check_optional_some_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
+        qid.TypeId base_type = self.check_node(call.base);
+        self.expect_implicit_arg_count(node_id, call, 0);
+        types.TypeInfo base_info = self.state.query.types.get(base_type);
+        if (base_info.data is .optional(optional)) {
+            return optional.element;
+        }
+        if (!self.type_ops.is_invalid_type(base_type)) {
+            self.type_ops.add_node_error(node_id, "some requires optional receiver", "some_receiver_type_mismatch");
+        }
+        return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId? implicit_type_arg(hir.HirImplicitCall call, Int index) {
+        if (index < 0 || index >= call.args.length) {
+            return null;
+        }
+        hir.HirNode arg = self.state.hirs.node(call.args[index]);
+        if (!self.is_type_ref_node(arg.id)) {
+            return null;
+        }
+        return self.type_ops.check_type_ref(call.args[index]);
+    }
+
+    Bool is_free_receiver_type(qid.TypeId type_id) {
+        if (self.type_ops.is_invalid_type(type_id)) {
+            return true;
+        }
+        types.TypeInfo info = self.state.query.types.get(type_id);
+        if (info.data is .optional(optional)) {
+            return self.is_free_receiver_type(optional.element);
+        }
+        guard info.data is .handle_type(handle) else {
+            return false;
+        }
+        if (handle.kind == .many_pointer) { return true; }
+        if (handle.kind == .raw_pointer) { return true; }
+        return handle.kind == .owner_pointer;
     }
 
     () check_pointer_set_value(
