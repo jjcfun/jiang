@@ -56,7 +56,7 @@ public struct BodyCheck {
         qid.TypeId body_type
     ) {
         if (hir_def.decl.kind == .function_decl || hir_def.decl.kind == .deinit_decl) {
-            qid.TypeId expected = self.type_ops.function_result_type(def_id);
+            qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(def_id));
             hir.HirId value_id = self.body_result_value(root);
             self.type_ops.expect_value_assignable(
                 value_id,
@@ -119,6 +119,9 @@ public struct BodyCheck {
         if (node.data is .return_stmt(return_stmt)) {
             type_id = self.check_return(node_id, return_stmt);
         }
+        if (node.data is .throw_stmt(throw_stmt)) {
+            type_id = self.check_throw(node_id, throw_stmt);
+        }
         if (node.data is .guard_stmt(guard_stmt)) {
             type_id = self.check_guard(guard_stmt);
         }
@@ -131,6 +134,9 @@ public struct BodyCheck {
         if (node.data is .index_access(index_access)) {
             type_id = self.check_index_access(node_id, index_access);
         }
+        if (node.data is .slice_access(slice_access)) {
+            type_id = self.check_slice_access(node_id, slice_access);
+        }
         if (node.data is .if_expr(if_expr)) {
             type_id = self.check_if(node_id, if_expr);
         }
@@ -139,6 +145,9 @@ public struct BodyCheck {
         }
         if (node.data is .switch_expr(switch_expr)) {
             type_id = self.check_switch(node_id, switch_expr);
+        }
+        if (node.data is .catch_expr(catch_expr)) {
+            type_id = self.check_catch_expr(node_id, catch_expr);
         }
         if (node.data is .is_pattern(is_pattern)) {
             type_id = self.check_is_pattern(is_pattern);
@@ -177,7 +186,7 @@ public struct BodyCheck {
     }
 
     qid.TypeId check_return(hir.HirId node_id, hir.HirReturn return_stmt) {
-        qid.TypeId expected = self.type_ops.function_result_type(node_id.owner_def);
+        qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(node_id.owner_def));
         if (return_stmt.value is some value) {
             qid.TypeId value_type = self.check_node(value);
             self.type_ops.expect_value_assignable(
@@ -195,6 +204,43 @@ public struct BodyCheck {
             );
         }
         return self.state.query.types.never_type();
+    }
+
+    qid.TypeId success_result_type(qid.TypeId result_type) {
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        if (result_info.data is .error_union(error_union)) {
+            return error_union.value;
+        }
+        return result_type;
+    }
+
+    qid.TypeId check_throw(hir.HirId node_id, hir.HirThrow throw_stmt) {
+        qid.TypeId value_type = self.check_node(throw_stmt.value);
+        guard self.current_error_type(node_id.owner_def) is some error_type else {
+            self.type_ops.add_node_error(
+                node_id,
+                "throw requires current function to return an errorable type",
+                "throw_requires_errorable_return"
+            );
+            return self.state.query.types.never_type();
+        }
+        self.type_ops.expect_value_assignable(
+            throw_stmt.value,
+            error_type,
+            value_type,
+            "throw value does not match function error type",
+            "throw_error_type_mismatch"
+        );
+        return self.state.query.types.never_type();
+    }
+
+    qid.TypeId? current_error_type(qid.DefId owner_def) {
+        qid.TypeId result_type = self.type_ops.function_result_type(owner_def);
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        if (result_info.data is .error_union(error_union)) {
+            return error_union.error;
+        }
+        return null;
     }
 
 
@@ -358,6 +404,45 @@ public struct BodyCheck {
         return self.state.query.types.invalid_type();
     }
 
+    qid.TypeId check_slice_access(hir.HirId node_id, hir.HirSliceAccess slice_access) {
+        qid.TypeId base_type = self.check_node(slice_access.base);
+        self.check_optional_slice_bound(slice_access.start);
+        self.check_optional_slice_bound(slice_access.end);
+        self.check_slice_open_end(node_id, slice_access, base_type);
+        if (self.index_element_type(base_type) is some element_type) {
+            return self.state.query.types.slice_type(element_type, token.Span());
+        }
+        self.type_ops.add_node_error(node_id, "sliced value is not sliceable", "not_sliceable");
+        return self.state.query.types.invalid_type();
+    }
+
+    () check_optional_slice_bound(hir.HirId? bound) {
+        guard bound is some bound_id else { return; }
+        qid.TypeId bound_type = self.check_node(bound_id);
+        self.type_ops.expect_value_assignable(
+            bound_id,
+            self.state.query.types.int_type(),
+            bound_type,
+            "slice bound requires Int index",
+            "slice_bound_type_mismatch"
+        );
+    }
+
+    () check_slice_open_end(hir.HirId node_id, hir.HirSliceAccess slice_access, qid.TypeId base_type) {
+        if (slice_access.end != null || self.type_ops.is_invalid_type(base_type)) {
+            return;
+        }
+        types.TypeInfo info = self.state.query.types.get(base_type);
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .slice) { return; }
+        }
+        self.type_ops.add_node_error(
+            node_id,
+            "open-ended slice requires a slice base",
+            "open_slice_requires_slice_base"
+        );
+    }
+
     qid.TypeId? index_element_type(qid.TypeId base_type) {
         if (self.type_ops.is_invalid_type(base_type)) {
             return base_type;
@@ -470,6 +555,40 @@ public struct BodyCheck {
             return result_type;
         }
         return self.state.query.types.unit_type();
+    }
+
+    qid.TypeId check_catch_expr(hir.HirId node_id, hir.HirCatch catch_expr) {
+        qid.TypeId value_type = self.check_node(catch_expr.value);
+        types.TypeInfo value_info = self.state.query.types.get(value_type);
+        guard value_info.data is .error_union(error_union) else {
+            if (!self.type_ops.is_invalid_type(value_type)) {
+                self.type_ops.add_node_error(
+                    catch_expr.value,
+                    "try/catch value must be errorable",
+                    "catch_value_not_errorable"
+                );
+            }
+            self.check_optional_catch_pattern(catch_expr.pattern, self.state.query.types.invalid_type());
+            self.check_node(catch_expr.body);
+            return self.state.query.types.invalid_type();
+        }
+        self.check_optional_catch_pattern(catch_expr.pattern, error_union.error);
+        qid.TypeId body_type = self.check_node(catch_expr.body);
+        if (self.common_control_type(error_union.value, body_type) is some result_type) {
+            return result_type;
+        }
+        self.type_ops.add_node_error(
+            node_id,
+            "catch body type is incompatible with success value type",
+            "catch_body_type_mismatch"
+        );
+        return self.state.query.types.invalid_type();
+    }
+
+    () check_optional_catch_pattern(hir.HirId? pattern, qid.TypeId error_type) {
+        if (pattern is some pattern_id) {
+            self.pattern_check.check_pattern(pattern_id, error_type);
+        }
     }
 
     qid.TypeId check_is_pattern(hir.HirIsPattern is_pattern) {
