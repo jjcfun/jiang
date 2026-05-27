@@ -41,6 +41,11 @@ struct LocalMoveState {
     }
 }
 
+struct MoveAnalysis {
+    public LocalMoveState![*] in_states;
+    public LocalMoveState![*] out_states;
+}
+
 public mir.MirStore^ elaborate_package(
     context.CompilerContext& ctx,
     mir.MirStore^ input,
@@ -72,10 +77,33 @@ mir.MirFunction elaborate_function(
 
     Int original_block_count = body.blocks.length;
     list.ArrayList<mir.MirBlock>! blocks = copy_blocks(body.blocks);
-    LocalMoveState![*] moved_after_blocks = analyze_moved_locals(body);
-    elaborate_return_blocks(ctx, output, body, original_block_count, moved_after_blocks, blocks$.ref());
+    MoveAnalysis analysis = analyze_moved_locals(body);
+    elaborate_storage_dead_blocks(ctx, output$.ref(), body, original_block_count, analysis.in_states, blocks$.ref());
+
+    mir.MirBody storage_body = body_with_blocks(output$.ref(), body, blocks$.ref());
+    MoveAnalysis return_analysis = analyze_moved_locals(storage_body);
+    Int return_block_count = blocks.len();
+    elaborate_return_blocks(
+        ctx,
+        output$.ref(),
+        storage_body,
+        return_block_count,
+        return_analysis.out_states,
+        blocks$.ref()
+    );
 
     return copy_function(output, function, output.block_array(blocks$.ref()));
+}
+
+mir.MirBody body_with_blocks(mir.MirStore& output, mir.MirBody body, list.ArrayList<mir.MirBlock>& blocks) {
+    return mir.MirBody {
+        id: body.id,
+        span: body.span,
+        locals: body.locals,
+        blocks: output.block_array(blocks),
+        entry: body.entry,
+        return_local: body.return_local
+    };
 }
 
 list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
@@ -88,9 +116,129 @@ list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
     return blocks;
 }
 
+() elaborate_storage_dead_blocks(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBody body,
+    Int original_block_count,
+    LocalMoveState![*] moved_before_blocks,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    Int! block_index = 0;
+    while (block_index < original_block_count) {
+        elaborate_storage_dead_block(
+            ctx,
+            output,
+            body,
+            blocks.get(block_index),
+            clone_move_state(moved_before_blocks[block_index]),
+            blocks
+        );
+        block_index = block_index + 1;
+    }
+}
+
+() elaborate_storage_dead_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirBlock block,
+    LocalMoveState state,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    list.ArrayList<mir.MirStatement>! kept = list.ArrayList<mir.MirStatement>(block.statements.length);
+    Int! statement_index = 0;
+    while (statement_index < block.statements.length) {
+        mir.MirStatement statement = block.statements[statement_index];
+        if (storage_dead_needs_drop(ctx, body, statement, state) is some local) {
+            split_storage_dead_block(ctx, output, body, block, state, kept$.ref(), statement_index, local, blocks);
+            return;
+        }
+        kept.add(statement);
+        apply_statement_moves(state$.ref(), statement);
+        statement_index = statement_index + 1;
+    }
+    blocks.set(block.id.to_index(), replace_block_statements(output, block, kept$.ref()));
+}
+
+mir.MirLocalDecl? storage_dead_needs_drop(
+    context.CompilerContext& ctx,
+    mir.MirBody body,
+    mir.MirStatement statement,
+    LocalMoveState state
+) {
+    guard statement.kind is .storage_dead_stmt(storage_dead) else {
+        return null;
+    }
+    mir.MirLocalDecl local = body.locals[storage_dead.local_id.to_index()];
+    if (!local_needs_drop(ctx, local, body.return_local, state)) {
+        return null;
+    }
+    return local;
+}
+
+() split_storage_dead_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirBlock block,
+    LocalMoveState state,
+    list.ArrayList<mir.MirStatement>& kept,
+    Int statement_index,
+    mir.MirLocalDecl local,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId continuation = append_storage_dead_continuation(
+        output,
+        block,
+        statement_index,
+        blocks
+    );
+    mir.MirBlockId drop_target = append_local_drop_block(output, block, local, continuation, blocks);
+    blocks.set(block.id.to_index(), goto_block_with_statements(output, block, kept$.ref(), drop_target));
+
+    state.mark_moved(local.id);
+    mir.MirBlock next_block = blocks.get(continuation.to_index());
+    elaborate_storage_dead_block(ctx, output, body, next_block, state, blocks);
+}
+
+mir.MirBlockId append_storage_dead_continuation(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    Int statement_index,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId continuation = mir.MirBlockId.from_index(blocks.len());
+    list.ArrayList<mir.MirStatement>! rest = list.ArrayList<mir.MirStatement>();
+    Int! index = statement_index + 1;
+    while (index < block.statements.length) {
+        rest.add(block.statements[index]);
+        index = index + 1;
+    }
+    blocks.add(mir.MirBlock {
+        id: continuation,
+        span: block.span,
+        statements: output.statement_array(rest$.ref()),
+        terminator: block.terminator
+    });
+    return continuation;
+}
+
+mir.MirBlockId append_local_drop_block(
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    mir.MirLocalDecl local,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId drop_id = mir.MirBlockId.from_index(blocks.len());
+    blocks.add(drop_block(output, drop_id, source_block, local, next_target));
+    return drop_id;
+}
+
 () elaborate_return_blocks(
     context.CompilerContext& ctx,
-    mir.MirStore^ output,
+    mir.MirStore& output,
     mir.MirBody body,
     Int original_block_count,
     LocalMoveState![*] moved_after_blocks,
@@ -105,7 +253,7 @@ list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
 
 () elaborate_return_block(
     context.CompilerContext& ctx,
-    mir.MirStore^ output,
+    mir.MirStore& output,
     mir.MirBody body,
     mir.MirBlock block,
     LocalMoveState moved_after_block,
@@ -119,12 +267,12 @@ list.ArrayList<mir.MirBlock> copy_blocks(mir.MirBlock[] source_blocks) {
     blocks.add(return_block(output, final_return, block, return_term));
 
     mir.MirBlockId target = append_drop_chain(ctx, output, body, block, moved_after_block, final_return, blocks);
-    blocks.set(block.id.to_index(), goto_block(block, target));
+    blocks.set(block.id.to_index(), goto_block(output, block, target));
 }
 
 mir.MirBlockId append_drop_chain(
     context.CompilerContext& ctx,
-    mir.MirStore^ output,
+    mir.MirStore& output,
     mir.MirBody body,
     mir.MirBlock block,
     LocalMoveState moved_after_block,
@@ -147,7 +295,7 @@ mir.MirBlockId append_drop_chain(
 }
 
 mir.MirBlock return_block(
-    mir.MirStore^ output,
+    mir.MirStore& output,
     mir.MirBlockId id,
     mir.MirBlock source_block,
     mir.MirReturnTerminator return_term
@@ -164,7 +312,7 @@ mir.MirBlock return_block(
 }
 
 mir.MirBlock drop_block(
-    mir.MirStore^ output,
+    mir.MirStore& output,
     mir.MirBlockId id,
     mir.MirBlock source_block,
     mir.MirLocalDecl local,
@@ -179,7 +327,7 @@ mir.MirBlock drop_block(
 }
 
 mir.MirTerminator drop_terminator(
-    mir.MirStore^ output,
+    mir.MirStore& output,
     mir.MirBlock source_block,
     mir.MirLocalDecl local,
     mir.MirBlockId next_target
@@ -197,11 +345,26 @@ mir.MirTerminator drop_terminator(
     };
 }
 
-mir.MirBlock goto_block(mir.MirBlock source_block, mir.MirBlockId target) {
+mir.MirBlock goto_block(mir.MirStore& output, mir.MirBlock source_block, mir.MirBlockId target) {
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
+    Int! index = 0;
+    while (index < source_block.statements.length) {
+        statements.add(source_block.statements[index]);
+        index = index + 1;
+    }
+    return goto_block_with_statements(output, source_block, statements$.ref(), target);
+}
+
+mir.MirBlock goto_block_with_statements(
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    list.ArrayList<mir.MirStatement>& statements,
+    mir.MirBlockId target
+) {
     return mir.MirBlock {
         id: source_block.id,
         span: source_block.span,
-        statements: source_block.statements,
+        statements: output.statement_array(statements),
         terminator: mir.MirTerminator {
             span: source_block.terminator.span,
             kind: .goto_term(mir.MirGotoTerminator {target: target})
@@ -209,10 +372,23 @@ mir.MirBlock goto_block(mir.MirBlock source_block, mir.MirBlockId target) {
     };
 }
 
+mir.MirBlock replace_block_statements(
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    list.ArrayList<mir.MirStatement>& statements
+) {
+    return mir.MirBlock {
+        id: source_block.id,
+        span: source_block.span,
+        statements: output.statement_array(statements),
+        terminator: source_block.terminator
+    };
+}
+
 // 这里做的是 definite-move 分析：只有所有到达某个 block 的路径都已经 move
 // 掉的 local，才会在 return drop chain 里跳过自动 drop。部分路径 move 的情况
 // 不能在这里直接跳过，否则未 move 的路径会泄漏；后续 drop flag 会精确处理。
-LocalMoveState![*] analyze_moved_locals(mir.MirBody body) {
+MoveAnalysis analyze_moved_locals(mir.MirBody body) {
     Int block_count = body.blocks.length;
     LocalMoveState![*] in_states = LocalMoveState!$.alloc_array(block_count);
     LocalMoveState![*] out_states = LocalMoveState!$.alloc_array(block_count);
@@ -243,7 +419,7 @@ LocalMoveState![*] analyze_moved_locals(mir.MirBody body) {
             );
         }
     }
-    return out_states;
+    return MoveAnalysis {in_states: in_states, out_states: out_states};
 }
 
 () init_move_state_arrays(
