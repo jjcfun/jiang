@@ -17,12 +17,14 @@ status=0
 run_check_case() {
   local source="$1"
 
+  local code
   if "$JIANGC" --check "$source" >/tmp/jiang_lang_check.out 2>&1; then
-    echo "OK check $source"
+    echo "PASS check $source"
     return
+  else
+    code=$?
   fi
 
-  local code=$?
   echo "FAIL check $source exited $code"
   sed -n '1,120p' /tmp/jiang_lang_check.out
   status=1
@@ -46,7 +48,7 @@ run_fail_case() {
     return
   fi
 
-  echo "OK fail $source"
+  echo "PASS fail $source"
 }
 
 while IFS= read -r source; do
