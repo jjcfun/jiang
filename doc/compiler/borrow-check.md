@@ -4,8 +4,8 @@ borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCh
 `LayoutStore` 中的 concrete layout，不重新推导类型，不重新计算布局。
 
 Jiang 的 borrow check 只处理所有权、move/use-after-move、引用逃逸和析构安全边界。
-它不检查 Rust 式 shared/mutable aliasing，不负责 data-race freedom，也不根据外层
-slot 是否可变决定内部字段能否写入。并发安全和数据竞争策略后续作为单独语言机制设计。
+它不检查 Rust 式 shared/mutable aliasing，不负责 data-race freedom，也不根据外层 slot
+是否可变决定内部字段能否写入。并发安全和数据竞争策略后续作为单独语言机制设计。
 
 ## 输入
 
@@ -94,8 +94,9 @@ MIR lowering
   -> backend
 ```
 
-第一轮 borrow check 只处理语义合法性：一个需要 drop 的 place 在所有 CFG 路径上至多 drop 一次，
-并且 drop 时不会使仍然活跃的 loan 悬垂。它不展开自定义 `deinit` body，也不生成字段析构 CFG。
+第一轮 borrow check 只处理语义合法性：一个需要 drop 的 place 在所有 CFG 路径上至多
+drop 一次，并且 drop 时不会使仍然活跃的 loan 悬垂。它不展开自定义 `deinit` body，
+也不生成字段析构 CFG。
 
 drop elaboration 读取 layout 的 drop category：
 
@@ -103,8 +104,8 @@ drop elaboration 读取 layout 的 drop category：
 - `trivial_drop` / `recursive_drop`：插入字段/owner pointer 的自动 drop 路径。
 - `custom_drop`：先调用 nominal type 的 `deinit`，再按语言规则插入自动 `T^` 字段析构。
 
-`custom_drop` 的事实来自 HIR owner 上的 `has_custom_deinit`。resolve 只记录该 fact；layout 根据
-fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 MIR 层展开。
+`custom_drop` 的事实来自 HIR owner 上的 `custom_deinit_def`。resolve 只记录该 fact；
+layout 根据 fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 MIR 层展开。
 
 第一版可以先只产出检查结果，不急着实际改写 MIR。
 

@@ -2,6 +2,8 @@ import context = "../context.jiang";
 import layout = "../layout/layout.jiang";
 import layout_compute = "../layout/compute.jiang";
 import list = "../support/list.jiang";
+import qid = "../query/id.jiang";
+import types = "../sema/type.jiang";
 import token = "../syntax/token.jiang";
 import mir = "./mir.jiang";
 
@@ -73,13 +75,23 @@ mir.MirFunction elaborate_function(
     }
 
     DropFlagMap flags = build_drop_flags(ctx, body);
-    mir.MirLocalDecl[] locals = copy_locals_with_drop_flags(ctx, output, body.locals, flags);
+    Bool needs_deinit_result = body_needs_custom_drop(ctx, body);
+    mir.MirLocalId? deinit_result = deinit_result_local_id(body, flags, needs_deinit_result);
+    mir.MirLocalDecl[] locals = copy_locals_with_drop_flags(ctx, output, body.locals, flags, needs_deinit_result);
     body = body_with_locals(body, locals);
 
     Int original_block_count = body.blocks.length;
     list.ArrayList<mir.MirBlock>! blocks = copy_blocks(body.blocks);
     instrument_drop_flag_blocks(ctx, output$.ref(), body, flags, original_block_count, blocks$.ref());
-    elaborate_storage_dead_blocks(ctx, output$.ref(), body, flags, original_block_count, blocks$.ref());
+    elaborate_storage_dead_blocks(
+        ctx,
+        output$.ref(),
+        body,
+        flags,
+        deinit_result,
+        original_block_count,
+        blocks$.ref()
+    );
 
     mir.MirBody storage_body = body_with_blocks(output$.ref(), body, blocks$.ref());
     Int return_block_count = blocks.len();
@@ -88,6 +100,7 @@ mir.MirFunction elaborate_function(
         output$.ref(),
         storage_body,
         flags,
+        deinit_result,
         return_block_count,
         blocks$.ref()
     );
@@ -142,6 +155,36 @@ DropFlagMap build_drop_flags(context.CompilerContext& ctx, mir.MirBody body) {
     return flags;
 }
 
+Bool body_needs_custom_drop(context.CompilerContext& ctx, mir.MirBody body) {
+    Int! local_index = 0;
+    while (local_index < body.locals.length) {
+        mir.MirLocalDecl local = body.locals[local_index];
+        if (drop_local_has_custom_deinit(ctx, local, body.return_local)) {
+            return true;
+        }
+        local_index = local_index + 1;
+    }
+    return false;
+}
+
+Bool drop_local_has_custom_deinit(
+    context.CompilerContext& ctx,
+    mir.MirLocalDecl local,
+    mir.MirLocalId return_local
+) {
+    if (!local_has_drop_flag(ctx, local, return_local)) {
+        return false;
+    }
+    return custom_deinit_def_for_type(ctx, local.type_id) != null;
+}
+
+mir.MirLocalId? deinit_result_local_id(mir.MirBody body, DropFlagMap flags, Bool needs_deinit_result) {
+    if (!needs_deinit_result) {
+        return null;
+    }
+    return mir.MirLocalId.from_index(body.locals.length + flags.flag_count);
+}
+
 Bool local_has_drop_flag(context.CompilerContext& ctx, mir.MirLocalDecl local, mir.MirLocalId return_local) {
     if (local.id.to_index() == return_local.to_index()) {
         return false;
@@ -156,9 +199,14 @@ mir.MirLocalDecl[] copy_locals_with_drop_flags(
     context.CompilerContext& ctx,
     mir.MirStore^ output,
     mir.MirLocalDecl[] locals,
-    DropFlagMap flags
+    DropFlagMap flags,
+    Bool needs_deinit_result
 ) {
-    mir.MirLocalDecl![*] copied = output.alloc_local_array(locals.length + flags.flag_count);
+    Int! extra_deinit_result = 0;
+    if (needs_deinit_result) {
+        extra_deinit_result = 1;
+    }
+    mir.MirLocalDecl![*] copied = output.alloc_local_array(locals.length + flags.flag_count + extra_deinit_result);
     Int! index = 0;
     while (index < locals.length) {
         copied[index] = locals[index];
@@ -173,7 +221,12 @@ mir.MirLocalDecl[] copy_locals_with_drop_flags(
         }
         local_index = local_index + 1;
     }
-    return copied[0..locals.length + flags.flag_count];
+    Int total = locals.length + flags.flag_count + extra_deinit_result;
+    if (needs_deinit_result) {
+        mir.MirLocalId id = mir.MirLocalId.from_index(total - 1);
+        copied[id.to_index()] = deinit_result_local(ctx, id, token.Span());
+    }
+    return copied[0..total];
 }
 
 mir.MirLocalDecl drop_flag_local(context.CompilerContext& ctx, mir.MirLocalId flag, token.Span span) {
@@ -181,6 +234,19 @@ mir.MirLocalDecl drop_flag_local(context.CompilerContext& ctx, mir.MirLocalId fl
         id: flag,
         kind: .compiler_temp,
         type_id: ctx.query.types.bool_type(),
+        span: span,
+        name: null,
+        def_id: null,
+        mutable_local: true,
+        address_taken: false
+    };
+}
+
+mir.MirLocalDecl deinit_result_local(context.CompilerContext& ctx, mir.MirLocalId id, token.Span span) {
+    return mir.MirLocalDecl {
+        id: id,
+        kind: .compiler_temp,
+        type_id: ctx.query.types.unit_type(),
         span: span,
         name: null,
         def_id: null,
@@ -362,6 +428,7 @@ mir.MirTerminator call_terminator_with_target(
     mir.MirStore& output,
     mir.MirBody body,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     Int original_block_count,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
@@ -372,6 +439,7 @@ mir.MirTerminator call_terminator_with_target(
             output,
             body,
             flags,
+            deinit_result,
             blocks.get(block_index),
             blocks
         );
@@ -384,6 +452,7 @@ mir.MirTerminator call_terminator_with_target(
     mir.MirStore& output,
     mir.MirBody body,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     mir.MirBlock block,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
@@ -392,7 +461,18 @@ mir.MirTerminator call_terminator_with_target(
     while (statement_index < block.statements.length) {
         mir.MirStatement statement = block.statements[statement_index];
         if (storage_dead_needs_drop(ctx, body, flags, statement) is some local) {
-            split_storage_dead_block(ctx, output, body, flags, block, kept$.ref(), statement_index, local, blocks);
+            split_storage_dead_block(
+                ctx,
+                output,
+                body,
+                flags,
+                deinit_result,
+                block,
+                kept$.ref(),
+                statement_index,
+                local,
+                blocks
+            );
             return;
         }
         kept.add(statement);
@@ -422,6 +502,7 @@ mir.MirLocalDecl? storage_dead_needs_drop(
     mir.MirStore& output,
     mir.MirBody body,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     mir.MirBlock block,
     list.ArrayList<mir.MirStatement>& kept,
     Int statement_index,
@@ -434,14 +515,23 @@ mir.MirLocalDecl? storage_dead_needs_drop(
         statement_index,
         blocks
     );
-    mir.MirBlockId drop_target = append_local_drop_block(ctx, output, flags, block, local, continuation, blocks);
+    mir.MirBlockId drop_target = append_local_drop_block(
+        ctx,
+        output,
+        flags,
+        deinit_result,
+        block,
+        local,
+        continuation,
+        blocks
+    );
     blocks.set(
         block.id.to_index(),
         branch_on_drop_flag(ctx, output, flags, block, kept$.ref(), local, drop_target, continuation)
     );
 
     mir.MirBlock next_block = blocks.get(continuation.to_index());
-    elaborate_storage_dead_block(ctx, output, body, flags, next_block, blocks);
+    elaborate_storage_dead_block(ctx, output, body, flags, deinit_result, next_block, blocks);
 }
 
 mir.MirBlockId append_storage_dead_continuation(
@@ -470,13 +560,14 @@ mir.MirBlockId append_local_drop_block(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     mir.MirBlock source_block,
     mir.MirLocalDecl local,
     mir.MirBlockId next_target,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
     mir.MirBlockId drop_id = mir.MirBlockId.from_index(blocks.len());
-    blocks.add(drop_block(ctx, output, flags, drop_id, source_block, local, next_target));
+    blocks.add(drop_block(ctx, output, flags, deinit_result, drop_id, source_block, local, next_target));
     return drop_id;
 }
 
@@ -485,12 +576,13 @@ mir.MirBlockId append_local_drop_block(
     mir.MirStore& output,
     mir.MirBody body,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     Int original_block_count,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
     Int! block_index = 0;
     while (block_index < original_block_count) {
-        elaborate_return_block(ctx, output, body, flags, blocks.get(block_index), blocks);
+        elaborate_return_block(ctx, output, body, flags, deinit_result, blocks.get(block_index), blocks);
         block_index = block_index + 1;
     }
 }
@@ -500,6 +592,7 @@ mir.MirBlockId append_local_drop_block(
     mir.MirStore& output,
     mir.MirBody body,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     mir.MirBlock block,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
@@ -510,7 +603,7 @@ mir.MirBlockId append_local_drop_block(
     mir.MirBlockId final_return = mir.MirBlockId.from_index(blocks.len());
     blocks.add(return_block(output, final_return, block, return_term));
 
-    mir.MirBlockId target = append_drop_chain(ctx, output, body, flags, block, final_return, blocks);
+    mir.MirBlockId target = append_drop_chain(ctx, output, body, flags, deinit_result, block, final_return, blocks);
     blocks.set(block.id.to_index(), goto_block(output, block, target));
 }
 
@@ -519,6 +612,7 @@ mir.MirBlockId append_drop_chain(
     mir.MirStore& output,
     mir.MirBody body,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     mir.MirBlock block,
     mir.MirBlockId final_return,
     list.ArrayList<mir.MirBlock>& blocks
@@ -531,7 +625,16 @@ mir.MirBlockId append_drop_chain(
         if (!return_fallback_needs_drop(local, flags)) {
             continue;
         }
-        mir.MirBlockId drop_target = append_local_drop_block(ctx, output, flags, block, local, target, blocks);
+        mir.MirBlockId drop_target = append_local_drop_block(
+            ctx,
+            output,
+            flags,
+            deinit_result,
+            block,
+            local,
+            target,
+            blocks
+        );
         target = append_drop_flag_branch(ctx, output, flags, block, local, drop_target, target, blocks);
     }
     return target;
@@ -567,6 +670,7 @@ mir.MirBlock drop_block(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     DropFlagMap flags,
+    mir.MirLocalId? deinit_result,
     mir.MirBlockId id,
     mir.MirBlock source_block,
     mir.MirLocalDecl local,
@@ -578,16 +682,23 @@ mir.MirBlock drop_block(
         id: id,
         span: source_block.terminator.span,
         statements: output.statement_array(statements$.ref()),
-        terminator: drop_terminator(output, source_block, local, next_target)
+        terminator: drop_terminator(ctx, output, source_block, local, deinit_result, next_target)
     };
 }
 
 mir.MirTerminator drop_terminator(
+    context.CompilerContext& ctx,
     mir.MirStore& output,
     mir.MirBlock source_block,
     mir.MirLocalDecl local,
+    mir.MirLocalId? deinit_result,
     mir.MirBlockId next_target
 ) {
+    if (custom_deinit_def_for_type(ctx, local.type_id) is some deinit_def) {
+        if (deinit_result is some destination) {
+            return custom_deinit_terminator(ctx, output, source_block, deinit_def, destination, next_target);
+        }
+    }
     return mir.MirTerminator {
         span: source_block.terminator.span,
         kind: .drop_term(mir.MirDropTerminator {
@@ -599,6 +710,55 @@ mir.MirTerminator drop_terminator(
             cleanup: null
         })
     };
+}
+
+mir.MirTerminator custom_deinit_terminator(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    qid.DefId deinit_def,
+    mir.MirLocalId destination,
+    mir.MirBlockId next_target
+) {
+    list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>();
+    return mir.MirTerminator {
+        span: source_block.terminator.span,
+        kind: .call_term(mir.MirCallTerminator {
+            callee: .const_operand(mir.MirConst {
+                type_id: deinit_function_type(ctx, deinit_def),
+                span: source_block.terminator.span,
+                value: .function_value(mir.MirFunctionConst {
+                    function_def: deinit_def,
+                    type_args: output.empty_type_args()
+                })
+            }),
+            args: output.operand_array(args$.ref()),
+            destination: mir.MirPlace {
+                local_id: destination,
+                projection: output.empty_projection()
+            },
+            target: next_target,
+            cleanup: null
+        })
+    };
+}
+
+qid.TypeId deinit_function_type(context.CompilerContext& ctx, qid.DefId deinit_def) {
+    if (ctx.query.typeck.def_type(deinit_def) is some type_id) {
+        return type_id;
+    }
+    return ctx.query.types.invalid_type();
+}
+
+qid.DefId? custom_deinit_def_for_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+    types.TypeInfo info = ctx.query.types.get(type_id);
+    guard info.data is .named(named) else {
+        return null;
+    }
+    guard ctx.query.hirs.def(named.def_id) is some hir_def else {
+        return null;
+    }
+    return hir_def.custom_deinit_def;
 }
 
 mir.MirBlockId append_drop_flag_branch(

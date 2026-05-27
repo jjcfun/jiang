@@ -24,19 +24,21 @@ source -> syntax/AST -> resolve/HIR -> type_check -> monomorph -> MIR -> layout 
 - `session` 持有一次编译会话的 `CompilerContext`，向 CLI、测试和未来工具暴露编译请求。
 - `pipeline` 串联各阶段，并负责跨阶段错误处理。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
-- `syntax` 只产生 token 和 AST；详见 [AST 设计](ast.md)。
+- `syntax` 只产生 token 和 AST；详见 [AST 设计](compiler/ast.md)。
 - `diagnostic` 负责诊断数据结构、source map、终端输出和未来 LSP 位置转换。
 - `resolve` 负责 import、module、namespace 和名字解析，并直接生成 HIR；
-  详见 [Resolve 设计](resolve.md)。
-- `hir` 包含 resolved、未类型化的语义树；详见 [HIR 设计](hir.md)。
+  详见 [Resolve 设计](compiler/resolve.md)。
+- `hir` 包含 resolved、未类型化的语义树；详见 [HIR 设计](compiler/hir.md)。
 - `sema` 负责类型检查、trait、generic、overload 和类型转换；
-  详见 [Type Check 设计](type-check.md)。
-- `monomorph` 负责收集 concrete generic instances；详见 [Monomorph 设计](monomorph.md)。
-- `mir` 包含 MIR 数据定义和 HIR -> MIR lowering；详见 [MIR 设计](mir.md)。
-- `layout` 负责 concrete type layout 查询和缓存；详见 [Layout 设计](layout.md)。
-- `borrow_check` 消费 MIR、`TypeCheckResults` 和 layout；详见 [Borrow Check 设计](borrow-check.md)。
-- `backend` 把 MIR 和 layout 转成目标产物；详见 [Backend 设计](backend.md)。
-- `incremental` 负责 hashing、cache key、依赖图和复用策略。
+  详见 [Type Check 设计](compiler/type-check.md)。
+- `monomorph` 负责收集 concrete generic instances；详见 [Monomorph 设计](compiler/monomorph.md)。
+- `mir` 包含 MIR 数据定义和 HIR -> MIR lowering；详见 [MIR 设计](compiler/mir.md)。
+- `layout` 负责 concrete type layout 查询和缓存；详见 [Layout 设计](compiler/layout.md)。
+- `borrow_check` 消费 MIR、`TypeCheckResults` 和 layout；详见
+  [Borrow Check 设计](compiler/borrow-check.md)。
+- `backend` 把 MIR 和 layout 转成目标产物；详见 [Backend 设计](compiler/backend.md)。
+- `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
+  [Incremental Compilation 设计](compiler/incremental.md)。
 - `query` 是跨阶段查询入口和全局事实表聚合点；普通阶段通过 API 查询，不直接依赖
   其他阶段的内部表。
 - `support` 只放可复用容器和工具，不 import 编译阶段模块。

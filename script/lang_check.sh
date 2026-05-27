@@ -37,6 +37,15 @@ run_fail_case() {
     return
   fi
 
+  local expected
+  expected="$(sed -n 's/^.*expected:[[:space:]]*//p' "$source" | head -n 1)"
+  if [ -n "$expected" ] && ! grep -q "$expected" /tmp/jiang_lang_fail.out; then
+    echo "FAIL fail $source missing expected diagnostic: $expected"
+    sed -n '1,120p' /tmp/jiang_lang_fail.out
+    status=1
+    return
+  fi
+
   echo "OK fail $source"
 }
 
