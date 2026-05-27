@@ -672,7 +672,8 @@ struct BodyLowerer {
 
     () lower_switch(hir.HirId node_id, hir.HirSwitch switch_expr, mir.MirPlace destination) {
         qid.TypeId value_type = self.type_for_node(switch_expr.value);
-        mir.MirOperand discriminator = self.lower_switch_discriminator(switch_expr.value, value_type);
+        mir.MirPlace?! subject_place = self.switch_subject_place(switch_expr, value_type);
+        mir.MirOperand discriminator = self.lower_switch_discriminator(switch_expr.value, value_type, subject_place);
         qid.TypeId discriminator_type = self.switch_discriminator_type(value_type);
         mir.MirBlockId join_block = self.reserve_block(self.lowerer.hir_span(node_id));
         mir.MirBlockId default_block = self.reserve_block(self.lowerer.hir_span(node_id));
@@ -701,7 +702,15 @@ struct BodyLowerer {
         }), self.lowerer.hir_span(node_id));
 
         Int active_depth = self.active_locals.len();
-        self.lower_switch_case_bodies(switch_expr, body_blocks$.ref(), destination, join_block, active_depth);
+        self.lower_switch_case_bodies(
+            switch_expr,
+            body_blocks$.ref(),
+            destination,
+            join_block,
+            active_depth,
+            subject_place,
+            value_type
+        );
         self.restore_active_locals(active_depth);
         if (default_target.to_index() == default_block.to_index()) {
             self.start_block(default_block);
@@ -713,12 +722,58 @@ struct BodyLowerer {
         self.start_block(join_block);
     }
 
-    mir.MirOperand lower_switch_discriminator(hir.HirId value, qid.TypeId value_type) {
+    mir.MirPlace? switch_subject_place(hir.HirSwitch switch_expr, qid.TypeId value_type) {
+        if (self.switch_needs_explicit_discriminant(value_type)) {
+            return self.pointer_base_place(switch_expr.value);
+        }
+        if (self.switch_has_payload_patterns(switch_expr)) {
+            return self.pointer_base_place(switch_expr.value);
+        }
+        return null;
+    }
+
+    Bool switch_has_payload_patterns(hir.HirSwitch switch_expr) {
+        Int! case_index = 0;
+        while (case_index < switch_expr.cases.length) {
+            if (self.switch_case_has_payload_pattern(switch_expr.cases[case_index])) {
+                return true;
+            }
+            case_index = case_index + 1;
+        }
+        return false;
+    }
+
+    Bool switch_case_has_payload_pattern(hir.HirSwitchCase switch_case) {
+        Int! pattern_index = 0;
+        while (pattern_index < switch_case.patterns.length) {
+            if (self.pattern_has_payload(switch_case.patterns[pattern_index])) {
+                return true;
+            }
+            pattern_index = pattern_index + 1;
+        }
+        return false;
+    }
+
+    Bool pattern_has_payload(hir.HirId pattern_id) {
+        hir.HirNode pattern = self.lowerer.hirs.node(pattern_id);
+        guard pattern.data is .variant_pattern(variant_pattern) else {
+            return false;
+        }
+        return variant_pattern.payload.length != 0;
+    }
+
+    mir.MirOperand lower_switch_discriminator(
+        hir.HirId value,
+        qid.TypeId value_type,
+        mir.MirPlace? subject_place
+    ) {
         if (!self.switch_needs_explicit_discriminant(value_type)) {
             return self.lower_to_operand(value);
         }
         token.Span span = self.lowerer.hir_span(value);
-        mir.MirPlace place = self.pointer_base_place(value);
+        guard subject_place is some place else {
+            return self.unsupported_operand(value);
+        }
         mir.MirLocalId temp = self.add_temp(self.lowerer.ctx.query.types.int_type(), span);
         self.push_assign(
             self.place_for_local(temp),
@@ -798,10 +853,6 @@ struct BodyLowerer {
         qid.TypeId discriminator_type,
         list.ArrayList<mir.MirSwitchCase>& cases
     ) {
-        if (variant_pattern.payload.length != 0) {
-            self.mark_unsupported(pattern_id);
-            return;
-        }
         guard self.lowerer.typeck.pattern_selection(pattern_id) is some variant_def else {
             self.mark_unsupported(pattern_id);
             return;
@@ -854,11 +905,18 @@ struct BodyLowerer {
     }
 
     def.DefKind? nominal_def_kind(qid.TypeId type_id) {
+        guard self.nominal_type_data(type_id) is some named else {
+            return null;
+        }
+        return self.lowerer.ctx.query.defs.get(named.def_id).kind;
+    }
+
+    types.NamedType? nominal_type_data(qid.TypeId type_id) {
         types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
         guard info.data is .named(named) else {
             return null;
         }
-        return self.lowerer.ctx.query.defs.get(named.def_id).kind;
+        return named;
     }
 
     () lower_switch_case_bodies(
@@ -866,13 +924,23 @@ struct BodyLowerer {
         list.ArrayList<mir.MirBlockId>& body_blocks,
         mir.MirPlace destination,
         mir.MirBlockId join_block,
-        Int active_depth
+        Int active_depth,
+        mir.MirPlace? subject_place,
+        qid.TypeId subject_type
     ) {
         Int! case_index = 0;
         while (case_index < switch_expr.cases.length) {
             self.start_block(body_blocks.get(case_index));
+            list.ArrayList<mir.MirLocalId>! case_locals = list.ArrayList<mir.MirLocalId>();
+            self.lower_switch_case_payloads(
+                switch_expr.cases[case_index],
+                subject_place,
+                subject_type,
+                case_locals$.ref()
+            );
             self.lower_into_place(switch_expr.cases[case_index].body, destination);
             if (!self.terminated) {
+                self.end_scope(case_locals$.ref(), self.lowerer.hir_span(switch_expr.cases[case_index].body));
                 self.finish_block(
                     .goto_term(mir.MirGotoTerminator {target: join_block}),
                     self.lowerer.hir_span(switch_expr.cases[case_index].body)
@@ -881,6 +949,111 @@ struct BodyLowerer {
             self.restore_active_locals(active_depth);
             case_index = case_index + 1;
         }
+    }
+
+    () lower_switch_case_payloads(
+        hir.HirSwitchCase switch_case,
+        mir.MirPlace? subject_place,
+        qid.TypeId subject_type,
+        list.ArrayList<mir.MirLocalId>& case_locals
+    ) {
+        if (!self.switch_case_has_payload_pattern(switch_case)) {
+            return;
+        }
+        if (switch_case.patterns.length != 1) {
+            self.mark_unsupported(switch_case.body);
+            return;
+        }
+        self.lower_variant_payload_binding(switch_case.patterns[0], subject_place, subject_type, case_locals);
+    }
+
+    () lower_variant_payload_binding(
+        hir.HirId pattern_id,
+        mir.MirPlace? subject_place,
+        qid.TypeId subject_type,
+        list.ArrayList<mir.MirLocalId>& case_locals
+    ) {
+        guard subject_place is some base_place else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        hir.HirNode pattern = self.lowerer.hirs.node(pattern_id);
+        guard pattern.data is .variant_pattern(variant_pattern) else { return; }
+        guard self.lowerer.typeck.pattern_selection(pattern_id) is some variant_def else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        qid.TypeId payload_type = self.variant_payload_type(variant_def, subject_type);
+        mir.MirPlace payload_place = self.project_field(base_place, variant_def, payload_type);
+        self.lower_variant_payload_patterns(variant_pattern, payload_place, payload_type, case_locals);
+    }
+
+    () lower_variant_payload_patterns(
+        hir.HirVariantPattern variant_pattern,
+        mir.MirPlace payload_place,
+        qid.TypeId payload_type,
+        list.ArrayList<mir.MirLocalId>& case_locals
+    ) {
+        if (variant_pattern.payload.length == 1) {
+            self.lower_payload_pattern(variant_pattern.payload[0], payload_place, case_locals);
+            return;
+        }
+        if (!self.payload_type_is_tuple(payload_type)) {
+            self.mark_unsupported(variant_pattern.payload[0]);
+            return;
+        }
+        Int! index = 0;
+        while (index < variant_pattern.payload.length) {
+            self.lower_payload_pattern(
+                variant_pattern.payload[index],
+                self.project_constant_index(payload_place, index),
+                case_locals
+            );
+            index = index + 1;
+        }
+    }
+
+    () lower_payload_pattern(
+        hir.HirId pattern_id,
+        mir.MirPlace source,
+        list.ArrayList<mir.MirLocalId>& case_locals
+    ) {
+        hir.HirNode pattern = self.lowerer.hirs.node(pattern_id);
+        if (pattern.data is .wildcard_pattern) { return; }
+        guard pattern.data is .binding_pattern(binding) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        mir.MirLocalId local_id = self.mir_local_for_hir(binding.local_id);
+        case_locals.add(local_id);
+        self.active_locals.add(local_id);
+        self.push_storage_live(local_id, self.lowerer.hir_span(pattern_id));
+        self.push_assign(
+            self.place_for_local(local_id),
+            .use_value(mir.MirUseRvalue {value: .copy_operand(mir.MirCopyOperand {place: source})}),
+            self.lowerer.hir_span(pattern_id)
+        );
+    }
+
+    qid.TypeId variant_payload_type(qid.DefId variant_def, qid.TypeId subject_type) {
+        guard self.nominal_type_data(subject_type) is some named else {
+            return self.lowerer.ctx.query.types.invalid_type();
+        }
+        if (monomorph.concrete_member_type(
+            self.lowerer.ctx.query,
+            self.lowerer.hirs,
+            self.lowerer.typeck,
+            monomorph.InstanceKey(named.def_id, named.args),
+            variant_def
+        ) is some payload_type) {
+            return payload_type;
+        }
+        return self.lowerer.ctx.query.types.invalid_type();
+    }
+
+    Bool payload_type_is_tuple(qid.TypeId payload_type) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(payload_type);
+        return info.data is .tuple_type(_);
     }
 
     () lower_catch(hir.HirId node_id, hir.HirCatch catch_expr, mir.MirPlace destination) {
