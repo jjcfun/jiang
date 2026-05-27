@@ -3,6 +3,7 @@ import layout = "../layout/layout.jiang";
 import layout_compute = "../layout/compute.jiang";
 import list = "../support/list.jiang";
 import qid = "../query/id.jiang";
+import def = "../resolve/def.jiang";
 import types = "../sema/type.jiang";
 import token = "../syntax/token.jiang";
 import mir = "./mir.jiang";
@@ -42,6 +43,16 @@ struct DropFlagMap {
         }
         self.flag_indexes[index] = flag_index;
         self.flag_count = self.flag_count + 1;
+    }
+}
+
+struct DropExpansion {
+    public mir.MirBlockId target;
+    public Bool expanded;
+
+    public init(mir.MirBlockId target, Bool expanded) {
+        self.target = target;
+        self.expanded = expanded;
     }
 }
 
@@ -159,7 +170,7 @@ Bool body_needs_custom_drop(context.CompilerContext& ctx, mir.MirBody body) {
     Int! local_index = 0;
     while (local_index < body.locals.length) {
         mir.MirLocalDecl local = body.locals[local_index];
-        if (drop_local_has_custom_deinit(ctx, local, body.return_local)) {
+        if (drop_local_needs_deinit_result(ctx, local, body.return_local)) {
             return true;
         }
         local_index = local_index + 1;
@@ -167,7 +178,7 @@ Bool body_needs_custom_drop(context.CompilerContext& ctx, mir.MirBody body) {
     return false;
 }
 
-Bool drop_local_has_custom_deinit(
+Bool drop_local_needs_deinit_result(
     context.CompilerContext& ctx,
     mir.MirLocalDecl local,
     mir.MirLocalId return_local
@@ -175,7 +186,7 @@ Bool drop_local_has_custom_deinit(
     if (!local_has_drop_flag(ctx, local, return_local)) {
         return false;
     }
-    return custom_deinit_def_for_type(ctx, local.type_id) != null;
+    return layout_compute.drop_category_of_type(ctx, local.type_id) == .custom_drop;
 }
 
 mir.MirLocalId? deinit_result_local_id(mir.MirBody body, DropFlagMap flags, Bool needs_deinit_result) {
@@ -567,7 +578,21 @@ mir.MirBlockId append_local_drop_block(
     list.ArrayList<mir.MirBlock>& blocks
 ) {
     mir.MirBlockId drop_id = mir.MirBlockId.from_index(blocks.len());
-    blocks.add(drop_block(ctx, output, flags, deinit_result, drop_id, source_block, local, next_target));
+    blocks.add(placeholder_block(output, drop_id, source_block, next_target));
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
+    push_set_drop_flag(ctx, output, flags.flag_for(local.id), false, source_block.terminator.span, statements$.ref());
+    blocks.set(drop_id.to_index(), drop_block(
+        ctx,
+        output,
+        deinit_result,
+        drop_id,
+        source_block,
+        local_place(output, local.id),
+        local.type_id,
+        statements$.ref(),
+        next_target,
+        blocks
+    ));
     return drop_id;
 }
 
@@ -666,23 +691,49 @@ mir.MirBlock return_block(
     };
 }
 
-mir.MirBlock drop_block(
-    context.CompilerContext& ctx,
+mir.MirBlock placeholder_block(
     mir.MirStore& output,
-    DropFlagMap flags,
-    mir.MirLocalId? deinit_result,
     mir.MirBlockId id,
     mir.MirBlock source_block,
-    mir.MirLocalDecl local,
-    mir.MirBlockId next_target
+    mir.MirBlockId target
 ) {
-    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
-    push_set_drop_flag(ctx, output, flags.flag_for(local.id), false, source_block.terminator.span, statements$.ref());
     return mir.MirBlock {
         id: id,
         span: source_block.terminator.span,
-        statements: output.statement_array(statements$.ref()),
-        terminator: drop_terminator(ctx, output, source_block, local, deinit_result, next_target)
+        statements: output.empty_statements(),
+        terminator: mir.MirTerminator {
+            span: source_block.terminator.span,
+            kind: .goto_term(mir.MirGotoTerminator {target: target})
+        }
+    };
+}
+
+mir.MirBlock drop_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirLocalId? deinit_result,
+    mir.MirBlockId id,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    qid.TypeId type_id,
+    list.ArrayList<mir.MirStatement>& statements,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    DropExpansion expansion = append_owned_field_drop_chain(
+        ctx,
+        output,
+        source_block,
+        place,
+        type_id,
+        next_target,
+        blocks
+    );
+    return mir.MirBlock {
+        id: id,
+        span: source_block.terminator.span,
+        statements: output.statement_array(statements),
+        terminator: drop_terminator(ctx, output, source_block, place, type_id, deinit_result, expansion)
     };
 }
 
@@ -690,25 +741,132 @@ mir.MirTerminator drop_terminator(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     mir.MirBlock source_block,
-    mir.MirLocalDecl local,
+    mir.MirPlace place,
+    qid.TypeId type_id,
     mir.MirLocalId? deinit_result,
-    mir.MirBlockId next_target
+    DropExpansion expansion
 ) {
-    if (custom_deinit_def_for_type(ctx, local.type_id) is some deinit_def) {
+    if (custom_deinit_def_for_type(ctx, type_id) is some deinit_def) {
         if (deinit_result is some destination) {
-            return custom_deinit_terminator(ctx, output, source_block, deinit_def, destination, next_target);
+            return custom_deinit_terminator(ctx, output, source_block, deinit_def, destination, expansion.target);
         }
+    }
+    if (expansion.expanded) {
+        return goto_terminator(source_block, expansion.target);
     }
     return mir.MirTerminator {
         span: source_block.terminator.span,
         kind: .drop_term(mir.MirDropTerminator {
-            place: mir.MirPlace {
-                local_id: local.id,
-                projection: output.empty_projection()
-            },
-            target: next_target,
+            place: place,
+            target: expansion.target,
             cleanup: null
         })
+    };
+}
+
+DropExpansion append_owned_field_drop_chain(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    qid.TypeId type_id,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    if (!type_has_drop_expandable_fields(ctx, type_id)) {
+        return DropExpansion(next_target, false);
+    }
+    layout.TypeLayout type_layout = layout_for_type(ctx, type_id);
+    mir.MirBlockId! target = next_target;
+    Bool! expanded = false;
+    Int! field_index = type_layout.fields.length - 1;
+    while (field_index >= 0) {
+        layout.FieldLayout field = type_layout.fields[field_index];
+        field_index = field_index - 1;
+        if (field_needs_drop(ctx, field)) {
+            target = append_field_drop_block(ctx, output, source_block, place, field, target, blocks);
+            expanded = true;
+        }
+    }
+    return DropExpansion(target, expanded);
+}
+
+Bool type_has_drop_expandable_fields(context.CompilerContext& ctx, qid.TypeId type_id) {
+    types.TypeInfo info = ctx.query.types.get(type_id);
+    guard info.data is .named(named) else {
+        return false;
+    }
+    def.DefKind kind = ctx.query.defs.get(named.def_id).kind;
+    return kind == .struct_def || kind == .record_def;
+}
+
+layout.TypeLayout layout_for_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+    layout.LayoutId layout_id = layout_compute.layout_of_type(ctx, type_id);
+    return ctx.query.layouts.layout(layout_id);
+}
+
+Bool field_needs_drop(context.CompilerContext& ctx, layout.FieldLayout field) {
+    if (field.field_def == null) {
+        return false;
+    }
+    return layout_compute.drop_category_of_type(ctx, field.field_type) != .no_drop;
+}
+
+mir.MirBlockId append_field_drop_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    mir.MirPlace owner_place,
+    layout.FieldLayout field,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId id = mir.MirBlockId.from_index(blocks.len());
+    blocks.add(placeholder_block(output, id, source_block, next_target));
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
+    blocks.set(id.to_index(), drop_block(
+        ctx,
+        output,
+        null,
+        id,
+        source_block,
+        field_place(output, owner_place, field),
+        field.field_type,
+        statements$.ref(),
+        next_target,
+        blocks
+    ));
+    return id;
+}
+
+mir.MirPlace field_place(mir.MirStore& output, mir.MirPlace owner_place, layout.FieldLayout field) {
+    list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(owner_place.projection.length + 1);
+    Int! index = 0;
+    while (index < owner_place.projection.length) {
+        projection.add(owner_place.projection[index]);
+        index = index + 1;
+    }
+    projection.add(.field_projection(mir.MirFieldProjection {
+        field_def: field.field_def$.some(),
+        field_type: field.field_type
+    }));
+    return mir.MirPlace {
+        local_id: owner_place.local_id,
+        projection: output.projection_array(projection$.ref())
+    };
+}
+
+mir.MirPlace local_place(mir.MirStore& output, mir.MirLocalId local_id) {
+    return mir.MirPlace {
+        local_id: local_id,
+        projection: output.empty_projection()
+    };
+}
+
+mir.MirTerminator goto_terminator(mir.MirBlock source_block, mir.MirBlockId target) {
+    return mir.MirTerminator {
+        span: source_block.terminator.span,
+        kind: .goto_term(mir.MirGotoTerminator {target: target})
     };
 }
 

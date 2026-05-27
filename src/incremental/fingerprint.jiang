@@ -1,0 +1,169 @@
+// HIR fingerprint 计算。
+//
+// fingerprint 只描述语义结构，不写入 span/source offset。源码位置变化应该更新
+// SourceMap，但不应该让 signature/body cache 失效。
+
+import context = "../context.jiang";
+import hir = "../hir/hir.jiang";
+import qid = "../query/id.jiang";
+import qkey = "../query/key.jiang";
+import def = "../resolve/def.jiang";
+import module_graph = "../resolve/module_graph.jiang";
+import blake3 = "../support/blake3.jiang";
+import list = "../support/list.jiang";
+
+public () fingerprint_module_graph(context.CompilerContext& ctx, module_graph.ModuleGraph& graph) {
+    Int! index = 0;
+    while (index < graph.modules.len()) {
+        qid.ModuleId module_id = graph.modules.get(index);
+        qid.DefId module_def = ctx.query.resolve.modules.get(module_id).def_id;
+        fingerprint_def_tree(ctx, module_def);
+        index = index + 1;
+    }
+}
+
+() fingerprint_def_tree(context.CompilerContext& ctx, qid.DefId def_id) {
+    guard ctx.query.hirs.def(def_id) != null else { return; }
+    hir.HirDef& hir_def = ctx.query.hirs.def_ref(def_id);
+    if (ctx.query.incremental.stable_id_for_def(def_id) is some stable_id) {
+        ctx.query.incremental.set_signature_fingerprint(stable_id, hir_signature_fingerprint(ctx, hir_def));
+        ctx.query.incremental.set_body_fingerprint(stable_id, hir_body_fingerprint(ctx, hir_def));
+    }
+
+    Int! index = 0;
+    while (index < hir_def.members.len()) {
+        fingerprint_def_tree(ctx, hir_def.members.get(index));
+        index = index + 1;
+    }
+}
+
+public qkey.Fingerprint128 hir_signature_fingerprint(context.CompilerContext& ctx, hir.HirDef& hir_def) {
+    FingerprintWriter writer = FingerprintWriter();
+    def.DefRecord def_record = ctx.query.defs.get(hir_def.def_id);
+    writer.write_int(1);
+    writer.write_def_record(ctx, def_record);
+    writer.write_hir_decl(ctx, hir_def.decl);
+    writer.write_int(hir_def.members.len());
+    writer.write_int(hir_def.trait_refs.len());
+    writer.write_int(hir_def.where_predicates.len());
+    writer.write_int(hir_def.lifetime_constraints.len());
+    if (hir_def.custom_deinit_def is some deinit_def) {
+        writer.write_bool(true);
+        writer.write_def_ref(ctx, deinit_def);
+    } else {
+        writer.write_bool(false);
+    }
+    return writer.finish();
+}
+
+public qkey.Fingerprint128 hir_body_fingerprint(context.CompilerContext& ctx, hir.HirDef& hir_def) {
+    FingerprintWriter writer = FingerprintWriter();
+    writer.write_int(2);
+    if (hir_def.body is some body) {
+        writer.write_bool(true);
+        writer.write_hir_id(ctx, body.root);
+        writer.write_int(body.locals.len());
+        writer.write_int(hir_def.nodes.len());
+    } else {
+        writer.write_bool(false);
+    }
+    return writer.finish();
+}
+
+struct FingerprintWriter {
+    list.ArrayList<UInt8>! bytes;
+
+    public init() {
+        self.bytes = list.ArrayList<UInt8>();
+    }
+
+    qkey.Fingerprint128 finish() {
+        blake3.Blake3Hash digest = blake3.blake3_hash(self.bytes.data[0..self.bytes.len()]);
+        return qkey.Fingerprint128(digest.a, digest.b);
+    }
+
+    () write_bool(Bool value) {
+        if (value) {
+            self.write_byte(1);
+        } else {
+            self.write_byte(0);
+        }
+    }
+
+    () write_int(Int value) {
+        self.write_uint64(UInt64(value));
+    }
+
+    () write_uint64(UInt64 value) {
+        UInt64! current = value;
+        Int! index = 0;
+        while (index < 8) {
+            self.write_byte(UInt8(current & 255));
+            current = current >> 8;
+            index = index + 1;
+        }
+    }
+
+    () write_byte(UInt8 value) {
+        self.bytes.add(value);
+    }
+
+    () write_symbol(qid.SymbolId symbol) {
+        self.write_int(symbol.to_index());
+    }
+
+    () write_def_record(context.CompilerContext& ctx, def.DefRecord def_record) {
+        self.write_int(def_record.kind.value);
+        self.write_int(def_record.domain.value);
+        self.write_int(def_record.visibility.value);
+        self.write_symbol(def_record.name.symbol);
+        if (def_record.owner_def is some owner_def) {
+            self.write_bool(true);
+            self.write_def_ref(ctx, owner_def);
+        } else {
+            self.write_bool(false);
+        }
+    }
+
+    () write_def_ref(context.CompilerContext& ctx, qid.DefId def_id) {
+        if (ctx.query.incremental.stable_id_for_def(def_id) is some stable_id) {
+            self.write_bool(true);
+            self.write_uint64(stable_id.low);
+            self.write_uint64(stable_id.high);
+            return;
+        }
+
+        // builtin 和尚未接入 stable key 的内部 def 暂时用 DefRecord 结构兜底；
+        // 后续磁盘 cache 前必须给这些跨 session 可见 def 补稳定 key。
+        self.write_bool(false);
+        self.write_def_record(ctx, ctx.query.defs.get(def_id));
+    }
+
+    () write_hir_id(context.CompilerContext& ctx, hir.HirId id) {
+        self.write_def_ref(ctx, id.owner_def);
+        self.write_int(id.local_index);
+    }
+
+    () write_hir_decl(context.CompilerContext& ctx, hir.HirDecl decl) {
+        self.write_int(decl.kind.value);
+        if (decl.type_ref is some type_ref) {
+            self.write_bool(true);
+            self.write_type_ref_node(ctx, type_ref);
+        } else {
+            self.write_bool(false);
+        }
+        if (decl.function_signature is some signature) {
+            self.write_bool(true);
+            self.write_int(signature.params.length);
+            self.write_type_ref_node(ctx, signature.result);
+        } else {
+            self.write_bool(false);
+        }
+    }
+
+    () write_type_ref_node(context.CompilerContext& ctx, hir.HirId node_id) {
+        // 第一版 fingerprint 先用 HirId 记录 type-ref 结构边界。后续会继续展开
+        // named/layered/function/tuple type-ref 节点，避免 body 局部变化影响 signature。
+        self.write_hir_id(ctx, node_id);
+    }
+}
