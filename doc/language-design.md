@@ -796,27 +796,29 @@ Result@(Error!);
 - binary/unary expr
 - call/field/index/slice/postfix expr
 
-`stmt` 和 `expr` 在语法上保持分离，但每条 `stmt` 在类型系统中都有
-result type。`block` 内只允许语句，不存在独立的 tail expression。表达式语句
-必须写 `;`。`block` 作为表达式使用时，其值等于最后一条语句的值；空
-`block` 的值为 `Unit`。因此：
+`stmt` 和 `expr` 在语法上保持分离。`block` 的语法以 `doc/grammar.md` 为准：
+`block <- "{" stmt* tail_expr? "}"`。`stmt` 不贡献 `block` 的值；`block`
+作为表达式使用时，其值只来自最后一个不带分号的 `tail_expr`。没有
+`tail_expr` 的 `block` 值为 `Unit`。Jiang 没有通用表达式语句，只有
+`call_stmt`、赋值、控制语句和声明等明确 statement 形态可以在语句位置出现。
+因此：
 
 ```jiang
 Int x = {
     foo();
-    1;
+    1
 };
 ```
 
-上面的 `block` 类型为 `Int`。如果最后一条语句是赋值、局部变量声明、
-`defer` 等无值语句，则 `block` 类型为 `Unit`。
+上面的 `block` 类型为 `Int`。如果没有最后的 `tail_expr`，或者最后一个
+源码元素是赋值、局部变量声明、`defer` 等语句，则 `block` 类型为 `Unit`。
 
 语句 result type 规则：
 
 | 语句 | result type |
 | --- | --- |
-| `expr;` | `expr` 的类型 |
-| `block` | block 最后一条语句的 result type；空 block 为 `Unit` |
+| `call_stmt` | `Unit` |
+| `block` | block 的 tail expr result type；无 tail expr 时为 `Unit` |
 | `return expr?;` | `Never` |
 | `throw expr;` | `Never` |
 | `break;` | `Never` |
@@ -829,9 +831,8 @@ Int x = {
 | `while_stmt` | `Unit` |
 | `for_stmt` | `Unit` |
 
-非最后一条语句的 result value 会被隐式丢弃。`Never` 表示该语句不会正常
-继续执行，可以在分支类型统一时转换为任意目标类型。`return`、`throw`、
-`break`、`continue` 仍然是语句，不属于普通表达式语法。
+`Never` 表示该语句不会正常继续执行，可以在分支类型统一时转换为任意目标类型。
+`return`、`throw`、`break`、`continue` 仍然是语句，不属于普通表达式语法。
 
 `guard expr else { ... }` 用于提前退出并把 pattern 绑定带到后续作用域。
 `else` block 必须非空，且最后一条语句必须是 `return`、`break`、`continue`
