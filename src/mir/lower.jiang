@@ -266,6 +266,7 @@ struct MirLowerer {
 struct LoopTargets {
     mir.MirBlockId continue_target;
     mir.MirBlockId break_target;
+    Int active_depth;
 }
 
 // BodyLowerer 负责把单个 HIR function body 转成 MIR CFG。
@@ -281,6 +282,7 @@ struct BodyLowerer {
     list.ArrayList<mir.MirBlock>! blocks;
     list.ArrayList<mir.MirStatement>! statements;
     list.ArrayList<LoopTargets>! loop_targets;
+    list.ArrayList<mir.MirLocalId>! active_locals;
     mir.MirBlockId! current_block;
     Bool! terminated;
 
@@ -300,6 +302,7 @@ struct BodyLowerer {
         self.blocks = list.ArrayList<mir.MirBlock>();
         self.statements = list.ArrayList<mir.MirStatement>();
         self.loop_targets = list.ArrayList<LoopTargets>();
+        self.active_locals = list.ArrayList<mir.MirLocalId>();
         self.current_block = self.reserve_block(span);
         self.terminated = false;
         self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
@@ -348,12 +351,12 @@ struct BodyLowerer {
         if (block.result is some result) {
             self.lower_into_place(result, self.place_for_local(self.return_local()));
             if (!self.terminated) {
-                self.push_scope_storage_dead(scope_locals$.ref(), self.lowerer.hir_span(result));
+                self.end_scope(scope_locals$.ref(), self.lowerer.hir_span(result));
                 self.finish_return(false, self.lowerer.hir_span(result));
             }
             return;
         }
-        self.push_scope_storage_dead(scope_locals$.ref(), self.span);
+        self.end_scope(scope_locals$.ref(), self.span);
         self.finish_return(true, self.span);
     }
 
@@ -408,6 +411,7 @@ struct BodyLowerer {
 
     mir.MirLocalId lower_let(hir.HirId node_id, hir.HirLet let_stmt) {
         mir.MirLocalId local_id = self.mir_local_for_hir(let_stmt.local_id);
+        self.active_locals.add(local_id);
         self.push_storage_live(local_id, self.lowerer.hir_span(node_id));
         if (let_stmt.initializer is some initializer) {
             self.lower_into_place(initializer, self.place_for_local(local_id));
@@ -419,9 +423,11 @@ struct BodyLowerer {
         if (return_stmt.value is some value) {
             self.lower_into_place(value, self.place_for_local(self.return_local()));
             if (self.terminated) { return; }
+            self.push_active_storage_dead_from(0, self.lowerer.hir_span(node_id));
             self.finish_return(false, self.lowerer.hir_span(node_id));
             return;
         }
+        self.push_active_storage_dead_from(0, self.lowerer.hir_span(node_id));
         self.finish_return(true, self.lowerer.hir_span(node_id));
     }
 
@@ -499,12 +505,12 @@ struct BodyLowerer {
         if (block.result is some result) {
             self.lower_into_place(result, destination);
             if (!self.terminated) {
-                self.push_scope_storage_dead(scope_locals$.ref(), self.lowerer.hir_span(result));
+                self.end_scope(scope_locals$.ref(), self.lowerer.hir_span(result));
             }
             return;
         }
         self.push_assign(destination, self.unit_rvalue(token.Span()), token.Span());
-        self.push_scope_storage_dead(scope_locals$.ref(), token.Span());
+        self.end_scope(scope_locals$.ref(), token.Span());
     }
 
     () lower_if(hir.HirId node_id, hir.HirIf if_expr, mir.MirPlace destination) {
@@ -519,11 +525,13 @@ struct BodyLowerer {
             else_target: else_block
         }), self.lowerer.hir_span(if_expr.condition));
 
+        Int active_depth = self.active_locals.len();
         self.start_block(then_block);
         self.lower_into_place(if_expr.then_body, destination);
         if (!self.terminated) {
             self.finish_block(.goto_term(mir.MirGotoTerminator {target: join_block}), self.lowerer.hir_span(node_id));
         }
+        self.restore_active_locals(active_depth);
 
         self.start_block(else_block);
         if (if_expr.else_body is some else_body) {
@@ -538,6 +546,7 @@ struct BodyLowerer {
         if (!self.terminated) {
             self.finish_block(.goto_term(mir.MirGotoTerminator {target: join_block}), self.lowerer.hir_span(node_id));
         }
+        self.restore_active_locals(active_depth);
 
         self.start_block(join_block);
     }
@@ -564,13 +573,19 @@ struct BodyLowerer {
             self.finish_block(.goto_term(mir.MirGotoTerminator {target: body_block}), self.lowerer.hir_span(node_id));
         }
 
-        self.loop_targets.add(LoopTargets {continue_target: header_block, break_target: exit_block});
+        Int active_depth = self.active_locals.len();
+        self.loop_targets.add(LoopTargets {
+            continue_target: header_block,
+            break_target: exit_block,
+            active_depth: active_depth
+        });
         self.start_block(body_block);
         self.lower_expr_statement(loop_expr.body);
         if (!self.terminated) {
             self.finish_block(.goto_term(mir.MirGotoTerminator {target: header_block}), self.lowerer.hir_span(node_id));
         }
         LoopTargets unused = self.loop_targets.pop();
+        self.restore_active_locals(active_depth);
 
         self.start_block(exit_block);
         self.push_assign(destination, self.unit_rvalue(self.lowerer.hir_span(node_id)), self.lowerer.hir_span(node_id));
@@ -605,7 +620,9 @@ struct BodyLowerer {
             default_target: default_target
         }), self.lowerer.hir_span(node_id));
 
-        self.lower_switch_case_bodies(switch_expr, body_blocks$.ref(), destination, join_block);
+        Int active_depth = self.active_locals.len();
+        self.lower_switch_case_bodies(switch_expr, body_blocks$.ref(), destination, join_block, active_depth);
+        self.restore_active_locals(active_depth);
         if (default_target.to_index() == default_block.to_index()) {
             self.start_block(default_block);
             self.finish_block(
@@ -665,7 +682,8 @@ struct BodyLowerer {
         hir.HirSwitch switch_expr,
         list.ArrayList<mir.MirBlockId>& body_blocks,
         mir.MirPlace destination,
-        mir.MirBlockId join_block
+        mir.MirBlockId join_block,
+        Int active_depth
     ) {
         Int! case_index = 0;
         while (case_index < switch_expr.cases.length) {
@@ -677,6 +695,7 @@ struct BodyLowerer {
                     self.lowerer.hir_span(switch_expr.cases[case_index].body)
                 );
             }
+            self.restore_active_locals(active_depth);
             case_index = case_index + 1;
         }
     }
@@ -687,6 +706,7 @@ struct BodyLowerer {
             return;
         }
         LoopTargets target = self.loop_targets.last();
+        self.push_active_storage_dead_from(target.active_depth, self.lowerer.hir_span(node_id));
         self.finish_block(
             .goto_term(mir.MirGotoTerminator {target: target.break_target}),
             self.lowerer.hir_span(node_id)
@@ -699,6 +719,7 @@ struct BodyLowerer {
             return;
         }
         LoopTargets target = self.loop_targets.last();
+        self.push_active_storage_dead_from(target.active_depth, self.lowerer.hir_span(node_id));
         self.finish_block(
             .goto_term(mir.MirGotoTerminator {target: target.continue_target}),
             self.lowerer.hir_span(node_id)
@@ -1072,14 +1093,27 @@ struct BodyLowerer {
         });
     }
 
-    // StorageDead 先作为词法 scope 边界写进 MIR。drop elaboration 后续会
-    // 在这些边界前插入真实 drop，并保留 return 点作为函数级兜底。
-    () push_scope_storage_dead(list.ArrayList<mir.MirLocalId>& scope_locals, token.Span span) {
+    // StorageDead 是词法 scope 边界。drop elaboration 会在这些边界前
+    // 插入真实 drop；return 点只保留函数级兜底。
+    () end_scope(list.ArrayList<mir.MirLocalId>& scope_locals, token.Span span) {
         Int! index = scope_locals.len() - 1;
         while (index >= 0) {
             self.push_storage_dead(scope_locals.get(index), span);
             index = index - 1;
         }
+        self.restore_active_locals(self.active_locals.len() - scope_locals.len());
+    }
+
+    () push_active_storage_dead_from(Int active_depth, token.Span span) {
+        Int! index = self.active_locals.len() - 1;
+        while (index >= active_depth) {
+            self.push_storage_dead(self.active_locals.get(index), span);
+            index = index - 1;
+        }
+    }
+
+    () restore_active_locals(Int active_depth) {
+        self.active_locals.truncate(active_depth);
     }
 
     () finish_block(mir.MirTerminatorKind terminator, token.Span span) {

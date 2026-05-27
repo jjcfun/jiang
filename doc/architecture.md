@@ -143,5 +143,30 @@ public trait Indexable {
 - `test/smoke/`：当前 stage2 骨架的端到端 smoke，使用 stage1 编译器编译。
 - `test/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
-- `test/lang/`：语言语义覆盖测试，按 `run/`、`check/`、`fail/`、`diagnostic/` 分组。
-  后续 syntax、resolve、sema、query、backend、incremental 的专项测试放到对应目录。
+- `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。
+  目录按语言功能优先组织，每个功能目录内部再按测试结果类型分组。
+
+`test/lang` 当前约定：
+
+```text
+test/lang/
+  ownership/
+    check/
+    fail/
+    run/
+  diagnostic/
+```
+
+- `ownership/check/`：ownership、borrow、drop、lifetime 相关，期望 `jiangc --check` 成功。
+- `ownership/fail/`：ownership、borrow、drop、lifetime 相关，期望 `jiangc --check` 失败。
+- `ownership/run/`：后续用于需要生成并运行目标程序的 ownership 端到端用例。
+- `diagnostic/`：后续用于精确检查多条 diagnostic、span 和消息的用例。
+
+运行方式：
+
+```bash
+JIANGC=/path/to/jiangc ./script/lang_check.sh
+```
+
+`lang_check.sh` 递归扫描 `*/check/*.jiang` 和 `*/fail/*.jiang`；精确 diagnostic
+匹配等 CLI 输出稳定后再接入。

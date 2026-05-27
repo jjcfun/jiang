@@ -40,14 +40,12 @@ run_fail_case() {
   echo "OK fail $source"
 }
 
-for source in test/lang/check/*.jiang; do
-  [ -e "$source" ] || continue
+while IFS= read -r source; do
   run_check_case "$source"
-done
+done < <(find test/lang -path '*/check/*.jiang' -type f | sort)
 
-for source in test/lang/fail/*.jiang; do
-  [ -e "$source" ] || continue
+while IFS= read -r source; do
   run_fail_case "$source"
-done
+done < <(find test/lang -path '*/fail/*.jiang' -type f | sort)
 
 exit "$status"
