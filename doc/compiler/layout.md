@@ -1,13 +1,13 @@
 # Layout 设计
 
 layout 是 MIR 之后按需查询或批量物化的 concrete type layout 层。它的顺序位置在 MIR 之后，
-但数据来源不是 MIR body。layout 消费 HIR、`TypeCheckResults`、monomorph `InstancePlan` 和
+但数据来源不是 MIR body。layout 消费 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和
 `TargetLayout`，输出 `LayoutStore`。
 
 ## 边界
 
 - layout 不回读 AST，不重新 resolve，不重新 type check。
-- layout 不修改 HIR、`TypeCheckResults`、`TypeTable`、`InstancePlan` 或 MIR。
+- layout 不修改 HIR、`TypeCheckResults`、`TypeTable`、`MonomorphInstances` 或 MIR。
 - layout 不遍历 MIR 来决定类型布局。
 - layout key 表达 concrete type 语义身份，nominal generic type 必须带 type args。
 - layout 负责 size、align、stride、field offset 和 target ABI 分类。
@@ -17,14 +17,13 @@ layout 是 MIR 之后按需查询或批量物化的 concrete type layout 层。�
 ## 顺序
 
 ```text
-HIR + TypeCheckResults + InstancePlan + TargetLayout
+HIR + TypeCheckResults + MonomorphInstances + TargetLayout
   -> layout query
   -> LayoutStore
 ```
 
-borrow check 消费 `MIR + TypeCheckResults + LayoutStore`；backend 消费 `MIR + LayoutStore`。
-borrow check 在 layout 之后运行，因为 move/copy/drop、niche、可能的 packed/alignment 规则都需要
-concrete layout 支撑。
+borrow check 消费 `MIR + TypeCheckResults + LayoutStore`；drop elaboration 和 backend 消费
+`MIR + LayoutStore`。layout 查询由这些阶段按需触发，不要求在 MIR lowering 之前批量完成。
 
 ## Store
 
@@ -54,7 +53,8 @@ LayoutStore
 - `no_drop`：标量、function pointer、non-owning handle 等不需要析构。
 - `trivial_drop`：aggregate/optional/union 本身不需要自定义析构，成员也没有 owning drop。
 - `recursive_drop`：类型自身或成员包含 `T^` owning pointer，需要 drop elaboration 递归处理。
-- `custom_drop`：预留给后续 `deinit` lowering；当前语义尚未生成 custom drop facts。
+- `custom_drop`：nominal type 定义了 `deinit`，drop elaboration 先调用 custom deinit，
+  再继续展开 owning field 自动 drop。
 
 ## TargetLayout
 

@@ -87,10 +87,8 @@ drop elaboration 不在 type check 或 layout 中完成，也不由 backend 临�
 
 ```text
 MIR lowering
-  -> layout drop category query
   -> borrow check 验证已有 drop/隐式 drop 候选是否合法
   -> drop elaboration 改写 MIR，插入具体 drop/deinit CFG
-  -> borrow check 复核 elaborated MIR 的 move/drop 不变量
   -> backend
 ```
 
@@ -106,8 +104,6 @@ drop elaboration 读取 layout 的 drop category：
 
 `custom_drop` 的事实来自 HIR owner 上的 `custom_deinit_def`。resolve 只记录该 fact；
 layout 根据 fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 MIR 层展开。
-
-第一版可以先只产出检查结果，不急着实际改写 MIR。
 
 ## 诊断
 

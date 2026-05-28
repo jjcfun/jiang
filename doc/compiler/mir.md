@@ -1,7 +1,7 @@
 # MIR 设计
 
 MIR 是 type check 之后的可执行语义 IR，用来承接后续 borrow check、drop 插入、优化和 backend。
-MIR 的输入是 HIR、`TypeCheckResults`、monomorph `InstancePlan` 和 `ModuleGraph`；它不回读 AST，
+MIR 的输入是 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和 `ModuleGraph`；它不回读 AST，
 不重新 resolve，也不重新 type check。
 
 ## 边界
@@ -11,9 +11,10 @@ MIR 的输入是 HIR、`TypeCheckResults`、monomorph `InstancePlan` 和 `Module
 - HIR block 是表达式/语句容器；MIR basic block 是 CFG 节点。
 - MIR place 表达语义位置，例如 local、field、index、deref。
 - MIR field projection 保存 field `DefId` 和 field `TypeId`，不保存 field offset。
-- 泛型模板函数不直接生成 MIR body；只有 `InstancePlan` 中的 concrete function instance
+- 泛型模板函数不直接生成 MIR body；只有 `MonomorphInstances` 中的 concrete function instance
   会生成 MIR body。
 - MIR lowering 不依赖 layout，也不等待 `LayoutStore` 先计算完成。
+- HIR `for in` 在 MIR 中统一降成 index-loop CFG；range、array、slice 只影响 index 来源。
 
 MIR 生成完成后，borrow check 和 backend 可以把 MIR 与 layout 查询结果组合使用。
 
@@ -27,10 +28,8 @@ elaboration 改写 MIR。
 
 ```text
 HIR/type facts -> initial MIR
-  -> layout drop category
   -> borrow check
   -> drop elaboration
-  -> borrow check verification
   -> backend
 ```
 
@@ -41,8 +40,8 @@ drop elaboration 的职责：
 - 对 `recursive_drop` 类型递归展开字段/owner pointer drop。
 - 保持所有插入的控制流仍然是普通 MIR basic block / terminator，不引入 backend-only 节点。
 
-borrow check 负责证明这些 drop 点不会 double-drop、use-after-move 或 invalidating active loan。
-backend 只消费 elaborated MIR，不再自行推导析构顺序。
+borrow check 负责在 drop elaboration 前证明已有 move/drop/use 不变量。drop elaboration 按
+layout drop category 改写 CFG；backend 只消费 elaborated MIR，不再自行推导析构顺序。
 
 ## 结构
 
@@ -94,12 +93,14 @@ control flow 由 terminator 表达：
 - `if` 使用 branch / then / else / join blocks。
 - `loop` 和 `while` 使用 header / body / exit blocks，并维护 loop target stack。
 - `return expr` 先把 expr lower 到 return local，再生成 return terminator。
-- `switch` 先等 pattern lowering 规则稳定后接入。
+- `switch` 使用 discriminant/tag branch blocks；enum/union variant pattern 的具体选择来自
+  `TypeCheckResults`。
+- `for in` 对 range 使用 `[start, end)` index loop；对 array/slice 使用 `len` 和 indexed place。
 - field/member access lowering 生成 concrete `MirPlace` projection。
 
 ## 泛型实例
 
-MIR lowering 接收 `InstancePlan`。非泛型函数按 `DefId` 直接 lower；泛型函数只按 concrete
+MIR lowering 接收 `MonomorphInstances`。非泛型函数按 `DefId` 直接 lower；泛型函数只按 concrete
 `InstanceKey` lower。lowering 中的 type substitution 只用于当前 concrete body。
 
 ## 不变量

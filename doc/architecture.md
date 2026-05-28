@@ -6,37 +6,50 @@ Jiang Next 编译器围绕稳定的阶段边界组织。本文只保留整体架
 ## 顶层流程
 
 ```text
-driver -> session -> pipeline
-                       |
-                       v
-source -> syntax/AST -> resolve/HIR -> type_check -> monomorph -> MIR -> layout -> borrow_check -> backend
-                                  \          \           \       \       \        /
-                                   v          v           v       v       v      v
-                                                   query
+driver/cli -> pipeline.compile_with_options
+                |
+                v
+source -> syntax/AST -> ModuleGraph -> resolve/HIR -> type_check -> monomorph -> initial MIR
+                                                                            |         |
+                                                                            v         v
+                                                                        layout   borrow_check
+                                                                                      |
+                                                                                      v
+                                                                              drop_elaboration
+                                                                                      |
+                                                                                      v
+                                                                                   backend
 ```
 
-`layout` 的顺序位置在 MIR 之后，但它不从 MIR body 生成。layout 作为 query 层事实表，
-消费 HIR、`TypeCheckResults`、monomorph `InstancePlan` 和 target layout。
+`layout` 是 query 层事实表，不从 MIR body 生成。它消费 HIR、`TypeCheckResults`、
+monomorph `MonomorphInstances` 和 target layout。MIR lowering 不依赖 layout；borrow check、
+drop elaboration 和 backend 按需查询 layout。
+
+`--check` 当前仍会跑到 MIR、borrow check 和 drop elaboration，保证源码级语言契约不只停在
+type check。
 
 ## 阶段边界
 
-- `driver` 把进程参数转换成编译请求。
-- `session` 持有一次编译会话的 `CompilerContext`，向 CLI、测试和未来工具暴露编译请求。
-- `pipeline` 串联各阶段，并负责跨阶段错误处理。
+- `driver` 把进程参数转换成编译请求，直接创建 `CompilerContext` 并调用 pipeline。
+- `pipeline` 以 package root file 为入口串联各阶段，并负责跨阶段错误处理。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
 - `syntax` 只产生 token 和 AST；详见 [AST 设计](compiler/ast.md)。
-- `diagnostic` 负责诊断数据结构、source map、终端输出和未来 LSP 位置转换。
-- `resolve` 负责 import、module、namespace 和名字解析，并直接生成 HIR；
+- `diagnostic` 负责诊断数据结构、终端输出和未来 LSP 位置转换。
+- `source_map` 属于 `source` 模块，保存 `DefId` / `HirId` 到源码 span 的定位事实。
+- `resolve` 负责 import、module graph、namespace 和名字解析，并直接生成 HIR；
   详见 [Resolve 设计](compiler/resolve.md)。
 - `hir` 包含 resolved、未类型化的语义树；详见 [HIR 设计](compiler/hir.md)。
 - `sema` 负责类型检查、trait、generic、overload 和类型转换；
   详见 [Type Check 设计](compiler/type-check.md)。
-- `monomorph` 负责收集 concrete generic instances；详见 [Monomorph 设计](compiler/monomorph.md)。
-- `mir` 包含 MIR 数据定义和 HIR -> MIR lowering；详见 [MIR 设计](compiler/mir.md)。
+- `monomorph` 运行在 type check 之后，负责收集 concrete generic instances；
+  详见 [Monomorph 设计](compiler/monomorph.md)。
+- `mir` 包含 MIR 数据定义、HIR -> MIR lowering 和 drop elaboration；
+  详见 [MIR 设计](compiler/mir.md)。
 - `layout` 负责 concrete type layout 查询和缓存；详见 [Layout 设计](compiler/layout.md)。
 - `borrow_check` 消费 MIR、`TypeCheckResults` 和 layout；详见
   [Borrow Check 设计](compiler/borrow-check.md)。
-- `backend` 把 MIR 和 layout 转成目标产物；详见 [Backend 设计](compiler/backend.md)。
+- `backend` 把 elaborated MIR 和 layout 转成 LLVM IR、object file 或可执行产物；
+  详见 [Backend 设计](compiler/backend.md)。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
   [Incremental Compilation 设计](compiler/incremental.md)。
 - `query` 是跨阶段查询入口和全局事实表聚合点；普通阶段通过 API 查询，不直接依赖
@@ -55,8 +68,10 @@ source -> syntax/AST -> resolve/HIR -> type_check -> monomorph -> MIR -> layout 
 - `resolve/store.jiang` 组合 package/module、import/export 和 namespace table。
 - `ResolveStore.modules` 是 `ModuleId -> ModuleRecord` 主表。
 - `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的 side table。
-- `HirStore`、`TypeCheckResults`、`LayoutStore` 和 `MirStore` 都挂在 `QuerySystem`。
+- `HirStore`、`TypeCheckResults`、`LayoutStore` 和 `IncrementalSymbolIndex` 都挂在 `QuerySystem`。
+- `MonomorphInstances`、`MirStore` 和 `BorrowCheckResults` 是单次 pipeline 调用中的阶段产物。
 - `AstStore` 是一次 `compile_package` 的临时 AST cache，不挂到 `QuerySystem`。
+- `QueryCache` 当前只保留入口结构；0.3 再接入 cache-backed query dependency tracking。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `query/api.jiang` 增加高阶查询入口。
 
 ## 源码目录
@@ -72,6 +87,7 @@ src/
   hir/          HIR 数据结构和 HIR store
   mir/          MIR 数据结构和 HIR -> MIR lowering
   layout/       concrete type layout 查询层
+  borrow_check/ ownership、loan、lifetime 和 drop safety 检查
   backend/      target 和后端入口
   incremental/  cache key、fingerprint、依赖图、symbol index
   query/        query system、cache、id、key、result
@@ -148,20 +164,46 @@ public trait Indexable {
 - `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。
   目录按语言功能优先组织，每个功能目录内部再按测试结果类型分组。
 
-`test/lang` 当前约定：
+`test/lang` 当前按语言功能组织，每个功能目录内部再按结果类型组织：
 
 ```text
 test/lang/
+  aggregate/
+    check/
+    fail/
+  control_flow/
+    check/
+    fail/
+  error_handling/
+    check/
+    fail/
+  function/
+    check/
+    fail/
+  generic/
+    check/
+    fail/
+  import/
+    check/
+    fail/
+  lifetime/
+    check/
+  nominal/
+    check/
+    fail/
   ownership/
     check/
     fail/
     run/
+  type/
+    check/
+    fail/
   diagnostic/
 ```
 
-- `ownership/check/`：ownership、borrow、drop、lifetime 相关，期望 `jiangc --check` 成功。
-- `ownership/fail/`：ownership、borrow、drop、lifetime 相关，期望 `jiangc --check` 失败。
-- `ownership/run/`：后续用于需要生成并运行目标程序的 ownership 端到端用例。
+- `check/`：期望 `jiangc --check` 成功。
+- `fail/`：期望 `jiangc --check` 失败，可用 `// expected: diagnostic_code` 精确匹配诊断。
+- `run/`：后续用于需要生成并运行目标程序的端到端用例。
 - `diagnostic/`：后续用于精确检查多条 diagnostic、span 和消息的用例。
 
 运行方式：
@@ -170,5 +212,4 @@ test/lang/
 JIANGC=/path/to/jiangc ./script/lang_check.sh
 ```
 
-`lang_check.sh` 递归扫描 `*/check/*.jiang` 和 `*/fail/*.jiang`；精确 diagnostic
-匹配等 CLI 输出稳定后再接入。
+`lang_check.sh` 递归扫描 `*/check/*.jiang` 和 `*/fail/*.jiang`，每个用例都会打印通过/失败状态。
