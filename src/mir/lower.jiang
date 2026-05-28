@@ -271,6 +271,7 @@ struct LoopTargets {
     mir.MirBlockId continue_target;
     mir.MirBlockId break_target;
     Int active_depth;
+    Int defer_depth;
 }
 
 // BodyLowerer 负责把单个 HIR function body 转成 MIR CFG。
@@ -287,6 +288,7 @@ struct BodyLowerer {
     list.ArrayList<mir.MirStatement>! statements;
     list.ArrayList<LoopTargets>! loop_targets;
     list.ArrayList<mir.MirLocalId>! active_locals;
+    list.ArrayList<hir.HirId>! active_defers;
     mir.MirBlockId! current_block;
     Bool! terminated;
 
@@ -307,6 +309,7 @@ struct BodyLowerer {
         self.statements = list.ArrayList<mir.MirStatement>();
         self.loop_targets = list.ArrayList<LoopTargets>();
         self.active_locals = list.ArrayList<mir.MirLocalId>();
+        self.active_defers = list.ArrayList<hir.HirId>();
         self.current_block = self.reserve_block(span);
         self.terminated = false;
         self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
@@ -343,6 +346,7 @@ struct BodyLowerer {
 
     () lower_root_block(hir.HirBlock block) {
         list.ArrayList<mir.MirLocalId>! scope_locals = list.ArrayList<mir.MirLocalId>();
+        Int defer_depth = self.active_defers.len();
         Int! index = 0;
         while (index < block.statements.length) {
             if (self.terminated) { return; }
@@ -355,11 +359,13 @@ struct BodyLowerer {
         if (block.result is some result) {
             self.assign_return_value(result);
             if (!self.terminated) {
+                self.run_deferred_from(defer_depth, self.lowerer.hir_span(result));
                 self.end_scope(scope_locals$.ref(), self.lowerer.hir_span(result));
                 self.finish_return(false, self.lowerer.hir_span(result));
             }
             return;
         }
+        self.run_deferred_from(defer_depth, self.span);
         self.end_scope(scope_locals$.ref(), self.span);
         self.finish_unit_return(self.span);
     }
@@ -368,6 +374,10 @@ struct BodyLowerer {
         hir.HirNode node = self.lowerer.hirs.node(node_id);
         if (node.data is .let_stmt(let_stmt)) {
             return self.lower_let(node_id, let_stmt);
+        }
+        if (node.data is .defer_stmt(defer_stmt)) {
+            self.lower_defer(defer_stmt);
+            return null;
         }
         if (node.data is .return_stmt(return_stmt)) {
             self.lower_return(node_id, return_stmt);
@@ -420,6 +430,10 @@ struct BodyLowerer {
         self.lower_into_place(node_id, self.place_for_local(temp));
     }
 
+    () lower_defer(hir.HirDefer defer_stmt) {
+        self.active_defers.add(defer_stmt.body);
+    }
+
     mir.MirLocalId lower_let(hir.HirId node_id, hir.HirLet let_stmt) {
         mir.MirLocalId local_id = self.mir_local_for_hir(let_stmt.local_id);
         self.active_locals.add(local_id);
@@ -434,10 +448,12 @@ struct BodyLowerer {
         if (return_stmt.value is some value) {
             self.assign_return_value(value);
             if (self.terminated) { return; }
+            self.run_deferred_from(0, self.lowerer.hir_span(node_id));
             self.push_active_storage_dead_from(0, self.lowerer.hir_span(node_id));
             self.finish_return(false, self.lowerer.hir_span(node_id));
             return;
         }
+        self.run_deferred_from(0, self.lowerer.hir_span(node_id));
         self.push_active_storage_dead_from(0, self.lowerer.hir_span(node_id));
         self.finish_unit_return(self.lowerer.hir_span(node_id));
     }
@@ -498,6 +514,7 @@ struct BodyLowerer {
             self.lowerer.hir_span(node_id)
         );
         if (self.terminated) { return; }
+        self.run_deferred_from(0, self.lowerer.hir_span(node_id));
         self.push_active_storage_dead_from(0, self.lowerer.hir_span(node_id));
         self.finish_return(false, self.lowerer.hir_span(node_id));
     }
@@ -542,6 +559,10 @@ struct BodyLowerer {
             self.lower_slice(node_id, slice_access, destination);
             return;
         }
+        if (node.data is .struct_literal(struct_literal)) {
+            self.lower_struct_literal(node_id, struct_literal, destination);
+            return;
+        }
         if (node.data is .if_expr(if_expr)) {
             self.lower_if(node_id, if_expr, destination);
             return;
@@ -572,6 +593,7 @@ struct BodyLowerer {
 
     () lower_block_into_place(hir.HirBlock block, mir.MirPlace destination) {
         list.ArrayList<mir.MirLocalId>! scope_locals = list.ArrayList<mir.MirLocalId>();
+        Int defer_depth = self.active_defers.len();
         Int! index = 0;
         while (index < block.statements.length) {
             if (self.terminated) { return; }
@@ -584,11 +606,13 @@ struct BodyLowerer {
         if (block.result is some result) {
             self.lower_into_place(result, destination);
             if (!self.terminated) {
+                self.run_deferred_from(defer_depth, self.lowerer.hir_span(result));
                 self.end_scope(scope_locals$.ref(), self.lowerer.hir_span(result));
             }
             return;
         }
         self.push_assign(destination, self.unit_rvalue(token.Span()), token.Span());
+        self.run_deferred_from(defer_depth, token.Span());
         self.end_scope(scope_locals$.ref(), token.Span());
     }
 
@@ -653,10 +677,12 @@ struct BodyLowerer {
         }
 
         Int active_depth = self.active_locals.len();
+        Int defer_depth = self.active_defers.len();
         self.loop_targets.add(LoopTargets {
             continue_target: header_block,
             break_target: exit_block,
-            active_depth: active_depth
+            active_depth: active_depth,
+            defer_depth: defer_depth
         });
         self.start_block(body_block);
         self.lower_expr_statement(loop_expr.body);
@@ -665,6 +691,7 @@ struct BodyLowerer {
         }
         LoopTargets unused = self.loop_targets.pop();
         self.restore_active_locals(active_depth);
+        self.restore_active_defers(defer_depth);
 
         self.start_block(exit_block);
         self.push_assign(destination, self.unit_rvalue(self.lowerer.hir_span(node_id)), self.lowerer.hir_span(node_id));
@@ -775,10 +802,12 @@ struct BodyLowerer {
         mir.MirPlace destination
     ) {
         Int active_depth = self.active_locals.len();
+        Int defer_depth = self.active_defers.len();
         self.loop_targets.add(LoopTargets {
             continue_target: increment_block,
             break_target: exit_block,
-            active_depth: active_depth
+            active_depth: active_depth,
+            defer_depth: defer_depth
         });
         self.start_block(body_block);
         list.ArrayList<mir.MirLocalId>! item_locals = list.ArrayList<mir.MirLocalId>();
@@ -787,6 +816,7 @@ struct BodyLowerer {
         self.finish_for_loop_body(increment_block, loop_expr, item_locals$.ref());
         LoopTargets unused = self.loop_targets.pop();
         self.restore_active_locals(active_depth);
+        self.restore_active_defers(defer_depth);
     }
 
     () finish_for_loop_body(
@@ -1315,6 +1345,7 @@ struct BodyLowerer {
             return;
         }
         LoopTargets target = self.loop_targets.last();
+        self.run_deferred_from(target.defer_depth, self.lowerer.hir_span(node_id));
         self.push_active_storage_dead_from(target.active_depth, self.lowerer.hir_span(node_id));
         self.finish_block(
             .goto_term(mir.MirGotoTerminator {target: target.break_target}),
@@ -1328,6 +1359,7 @@ struct BodyLowerer {
             return;
         }
         LoopTargets target = self.loop_targets.last();
+        self.run_deferred_from(target.defer_depth, self.lowerer.hir_span(node_id));
         self.push_active_storage_dead_from(target.active_depth, self.lowerer.hir_span(node_id));
         self.finish_block(
             .goto_term(mir.MirGotoTerminator {target: target.continue_target}),
@@ -1593,6 +1625,66 @@ struct BodyLowerer {
             }),
             self.lowerer.hir_span(node_id)
         );
+    }
+
+    () lower_struct_literal(hir.HirId node_id, hir.HirStructLiteral literal, mir.MirPlace destination) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        guard self.lowerer.ctx.query.types.get(type_id).data is .named(named) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>();
+        guard self.append_struct_literal_fields(literal, named.def_id, fields$.ref()) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.push_assign(
+            destination,
+            .aggregate_value(mir.MirAggregateRvalue {
+                kind: self.struct_literal_aggregate_kind(named.def_id),
+                def_id: named.def_id,
+                type_id: type_id,
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    Bool append_struct_literal_fields(
+        hir.HirStructLiteral literal,
+        qid.DefId owner_def,
+        list.ArrayList<mir.MirOperand>& fields
+    ) {
+        guard self.lowerer.hirs.def(owner_def) is some owner_hir else { return false; }
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.lowerer.ctx.query.defs.get(member_def).kind == .field_def) {
+                guard self.struct_literal_field_value(literal, member_def) is some value else { return false; }
+                fields.add(self.lower_to_operand(value));
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    hir.HirId? struct_literal_field_value(hir.HirStructLiteral literal, qid.DefId field_def) {
+        qid.SymbolId field_symbol = self.lowerer.ctx.query.defs.get(field_def).name.symbol;
+        Int! index = 0;
+        while (index < literal.fields.length) {
+            if (qid.SymbolId.equal(literal.fields[index].field_symbol$.ref(), field_symbol$.ref())) {
+                return literal.fields[index].value;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    mir.MirAggregateKind struct_literal_aggregate_kind(qid.DefId def_id) {
+        if (self.lowerer.ctx.query.defs.get(def_id).kind == .record_def) {
+            return .record_value;
+        }
+        return .struct_value;
     }
 
     mir.MirOperand? optional_slice_bound(hir.HirId? bound) {
@@ -1908,6 +2000,13 @@ struct BodyLowerer {
     }
 
     () lower_call(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        if (call.target is some target) {
+            def.DefKind kind = self.lowerer.ctx.query.defs.get(target.def_id).kind;
+            if (kind == .union_variant_def) {
+                self.lower_union_variant_constructor(node_id, call, target.def_id, destination);
+                return;
+            }
+        }
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
         mir.MirOperand callee = self.lower_to_operand(call.callee);
         Int! index = 0;
@@ -1924,6 +2023,30 @@ struct BodyLowerer {
             cleanup: null
         }), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    () lower_union_variant_constructor(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.DefId variant_def,
+        mir.MirPlace destination
+    ) {
+        list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>(call.args.length);
+        Int! index = 0;
+        while (index < call.args.length) {
+            fields.add(self.lower_to_operand(call.args[index]));
+            index = index + 1;
+        }
+        self.push_assign(
+            destination,
+            .aggregate_value(mir.MirAggregateRvalue {
+                kind: .union_variant,
+                def_id: variant_def,
+                type_id: self.type_for_node(node_id),
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            }),
+            self.lowerer.hir_span(node_id)
+        );
     }
 
     mir.MirOperand unsupported_operand(hir.HirId node_id) {
@@ -1987,6 +2110,21 @@ struct BodyLowerer {
 
     () restore_active_locals(Int active_depth) {
         self.active_locals.truncate(active_depth);
+    }
+
+    // defer 是词法 scope cleanup。提前退出路径会从当前 defer 栈一路
+    // 执行到目标 scope 的深度，然后再释放离开的 locals。
+    () run_deferred_from(Int defer_depth, token.Span span) {
+        Int! index = self.active_defers.len() - 1;
+        while (index >= defer_depth) {
+            self.lower_expr_statement(self.active_defers.get(index));
+            index = index - 1;
+        }
+        self.restore_active_defers(defer_depth);
+    }
+
+    () restore_active_defers(Int defer_depth) {
+        self.active_defers.truncate(defer_depth);
     }
 
     () finish_block(mir.MirTerminatorKind terminator, token.Span span) {

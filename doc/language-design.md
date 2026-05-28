@@ -573,15 +573,27 @@ T add<T>(T left, T right);
 
 ## Struct、Record、Enum、Union
 
-`struct` 用于普通名义类型。
+`struct` 用于普通名义类型，支持实例方法、static 方法、`init` 和 `deinit`。
 
-`record` 是更偏数据记录的结构体形式。record 与 struct 的完整语义差异仍需定稿。
+`record` 是偏数据记录的名义类型。0.2 中 record 与 struct 使用相同的字段布局、可变性规则和
+drop 规则，但 record 只承诺字段字面量初始化，不承诺自定义生命周期入口。
 
 `enum` 表示有限命名成员集合。
 
 `union` 是 tagged union，也属于 sum type。Jiang 的 `union` 可以复用 enum-like tag，但语义上是带 tag 的 union。
 
+union variant 和普通/static method 共用 `Type.member` 访问面，不能同名。
+
 union 的 public 规则类似 record：字段和 variant 的外部可见性由外层类型是否 public 控制。
+
+0.2 的命名空间规则：
+
+- module/package/import alias 使用 namespace namespace。
+- 顶层类型、trait 和 associated type 使用 type namespace。
+- 函数、全局变量、builtin value 和普通方法使用 value namespace。
+- 字段、enum case 和 union variant 使用 member namespace。
+- declaration container 拥有自己的 member/type/value 子 namespace，供 `Type.member` 路径继续解析。
+- union variant 虽然底层在 member namespace，仍会和 method 的 value namespace 做额外同名冲突检查。
 
 示例：
 
@@ -676,7 +688,7 @@ T id<T>(T value);
 支持 associated type equality constraint；相等关系使用 `==`，不使用赋值语义的 `=`：
 
 ```jiang
-@where(T: Iterator, T.Item == Int)
+@where(T: Iterable, T.Item == Int)
 ```
 
 当前 AST 使用：
@@ -761,13 +773,10 @@ Result@(Error?);
 Result@(Error!);
 ```
 
-完整 errorable 类型检查和传播规则仍需在 sema 阶段定义。
-
-未定事项：
-
-- `throw expr` 的类型。
-- catch binding 的作用域和类型。
-- 未捕获错误如何向外传播。
+0.2 中 errorable value 不做隐式传播。`T@E` 只能作为完整 errorable value 保存或返回；
+如果上下文需要 `T`，必须用 `try expr catch (...) => ...` 显式处理 error 分支。
+`throw expr` 只能出现在返回 errorable type 的函数中，`expr` 必须可赋给该函数的 error type。
+catch binding 只在 catch body 内可见，类型来自被处理 errorable value 的 error type。
 
 ## 控制流
 
@@ -839,6 +848,37 @@ Int x = {
 或 `throw`。更复杂的“所有分支都退出”由后续控制流分析处理。
 
 `defer` 在当前块退出时按 LIFO 顺序执行。`defer` 内不支持 `return`、`break`、`continue`。
+
+### For-in 和 Iterable
+
+`for pattern in expr` 的协议名使用 `Iterable`。这个名字描述“某个值可以作为
+for-in 的输入”，不会和真正保存遍历状态的游标混在一起。
+
+0.2 先支持内建 iterable：
+
+- `T[]`：slice，item type 是 `T`。
+- `T[N]`：定长数组，item type 是 `T`。
+- `T[*]`：many pointer 不是无边界 iterable；只有显式长度/range 包装后才能参与 for-in。
+
+长期自定义遍历协议预留为两层：
+
+```jiang
+trait IterState {
+    associated Item;
+    Item? next();
+}
+
+trait Iterable {
+    associated Item;
+    associated State: IterState<Item = Item>;
+    State iter();
+}
+```
+
+`IterState` 是有状态游标，`next()` 每次返回下一个元素，`none` 表示结束。
+`Iterable` 是容器或视图，`iter()` 产生游标。`for pattern in expr` 的 type check
+负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Item`。MIR
+lowering 只消费这个 plan，不在 MIR 阶段重新做 trait lookup。
 
 ## Pattern Matching
 

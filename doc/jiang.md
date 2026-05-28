@@ -1321,7 +1321,8 @@ struct Buffer {
 - `union`：支持 static 方法、实例方法
 - `enum`：支持 static 方法、实例方法
 
-`init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。`record` / `union` / `enum` 是否允许自定义生命周期入口，需要在语义阶段进一步定稿。
+`init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。`record` / `union` / `enum` 不承诺自定义生命周期入口。
+union variant 和普通/static method 共用 `Type.member` 访问面，不能同名。
 
 ```c
 struct User {
@@ -1435,7 +1436,8 @@ user1.id = 200; // 编译错误，不可变属性无法修改
 
 ### record
 
-`record` 是轻量数据类型，使用字段字面量初始化：
+`record` 是轻量数据类型，使用字段字面量初始化。0.2 中 record 与 struct 使用相同的字段布局、
+可变性规则和 drop 规则，但 record 只承诺字段字面量初始化，不承诺自定义生命周期入口：
 
 ```c
 record Point {
@@ -1454,6 +1456,7 @@ Point p2 = { x: 1, y: 2 };
 - `record` 字段支持默认值
 - `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
 - `struct` 只有在没有定义 `init` 时才支持 `Type { ... }`
+- `record` 和 `struct` 的字段 layout、可变性和 drop 规则在 0.2 中保持一致
 
 局部变量声明也支持同类型多名字写法，但它只是语法糖，每个变量仍然必须显式初始化：
 
@@ -1636,7 +1639,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
-关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Iterator<Item = Int>)`。
+关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Iterable<Item = Int>)`。
 例如：
 
 ```c
@@ -1795,9 +1798,9 @@ Int b = counter.apply(true);
 trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
 
 ```c
-trait Iterator {
+trait Iterable {
   associated Item;
-  Item next();
+  Item item();
 }
 ```
 
@@ -1813,13 +1816,13 @@ trait HasItem {
 子 trait 会自动继承父 trait 的关联类型，并可以继续对它加约束：
 
 ```c
-trait Iterator {
+trait Iterable {
   associated Item;
-  Item next();
+  Item item();
 }
 
 @where(Item == UInt8)
-trait ByteIterator: Iterator {
+trait ByteIterable: Iterable {
   Int next_int();
 }
 ```
@@ -1889,15 +1892,15 @@ struct Box: HasValue {
 类型实现带关联类型的 trait 时，需要在实现体中显式绑定关联类型：
 
 ```c
-trait Iterator {
+trait Iterable {
   associated Item;
-  Item next();
+  Item item();
 }
 
-struct Counter: Iterator {
+struct Counter: Iterable {
   associated Item = UInt8;
 
-  UInt8 next() {
+  UInt8 item() {
     return 42;
   }
 }
@@ -1935,17 +1938,17 @@ struct Pair: Left, Right {
 同样地，`extend` 中也可以绑定关联类型：
 
 ```c
-trait Iterator {
+trait Iterable {
   associated Item;
-  Item next();
+  Item item();
 }
 
 struct Counter {}
 
-extend Counter: Iterator {
+extend Counter: Iterable {
   associated Item = UInt8;
 
-  UInt8 next() {
+  UInt8 item() {
     return 42;
   }
 }

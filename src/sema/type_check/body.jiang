@@ -104,6 +104,9 @@ public struct BodyCheck {
         if (node.data is .let_stmt(let_stmt)) {
             type_id = self.check_let(node_id, let_stmt);
         }
+        if (node.data is .defer_stmt(defer_stmt)) {
+            type_id = self.check_defer(node_id, defer_stmt);
+        }
         if (node.data is .call(call)) {
             type_id = self.check_call(node_id, call);
         }
@@ -136,6 +139,9 @@ public struct BodyCheck {
         }
         if (node.data is .slice_access(slice_access)) {
             type_id = self.check_slice_access(node_id, slice_access);
+        }
+        if (node.data is .struct_literal(struct_literal)) {
+            type_id = self.check_struct_literal(node_id, struct_literal);
         }
         if (node.data is .if_expr(if_expr)) {
             type_id = self.check_if(node_id, if_expr);
@@ -183,6 +189,67 @@ public struct BodyCheck {
             return self.check_node(result);
         }
         return self.state.query.types.unit_type();
+    }
+
+    qid.TypeId check_defer(hir.HirId node_id, hir.HirDefer defer_stmt) {
+        self.check_node(defer_stmt.body);
+        if (self.defer_body_has_control_exit(defer_stmt.body)) {
+            self.type_ops.add_node_error(
+                node_id,
+                "defer body cannot return, break, continue, or throw",
+                "invalid_defer_control_flow"
+            );
+        }
+        return self.state.query.types.unit_type();
+    }
+
+    Bool defer_body_has_control_exit(hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .return_stmt) { return true; }
+        if (node.data is .break_stmt) { return true; }
+        if (node.data is .continue_stmt) { return true; }
+        if (node.data is .throw_stmt) { return true; }
+        if (node.data is .block(block)) { return self.block_has_control_exit(block); }
+        if (node.data is .guard_stmt(guard_stmt)) { return self.defer_body_has_control_exit(guard_stmt.else_body); }
+        if (node.data is .if_expr(if_expr)) { return self.if_has_control_exit(if_expr); }
+        if (node.data is .loop_expr(loop_expr)) { return self.defer_body_has_control_exit(loop_expr.body); }
+        if (node.data is .switch_expr(switch_expr)) { return self.switch_has_control_exit(switch_expr); }
+        if (node.data is .catch_expr(catch_expr)) { return self.catch_has_control_exit(catch_expr); }
+        return false;
+    }
+
+    Bool block_has_control_exit(hir.HirBlock block) {
+        Int! index = 0;
+        while (index < block.statements.length) {
+            if (self.defer_body_has_control_exit(block.statements[index])) { return true; }
+            index = index + 1;
+        }
+        if (block.result is some result) {
+            return self.defer_body_has_control_exit(result);
+        }
+        return false;
+    }
+
+    Bool if_has_control_exit(hir.HirIf if_expr) {
+        if (self.defer_body_has_control_exit(if_expr.then_body)) { return true; }
+        if (if_expr.else_body is some else_body) {
+            return self.defer_body_has_control_exit(else_body);
+        }
+        return false;
+    }
+
+    Bool switch_has_control_exit(hir.HirSwitch switch_expr) {
+        Int! index = 0;
+        while (index < switch_expr.cases.length) {
+            if (self.defer_body_has_control_exit(switch_expr.cases[index].body)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool catch_has_control_exit(hir.HirCatch catch_expr) {
+        if (self.defer_body_has_control_exit(catch_expr.value)) { return true; }
+        return self.defer_body_has_control_exit(catch_expr.body);
     }
 
     qid.TypeId check_return(hir.HirId node_id, hir.HirReturn return_stmt) {
@@ -626,6 +693,145 @@ public struct BodyCheck {
         return self.state.query.types.bool_type();
     }
 
+    qid.TypeId check_struct_literal(hir.HirId node_id, hir.HirStructLiteral literal) {
+        qid.TypeId result_type = self.type_ops.check_type_ref(literal.type_ref);
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        guard result_info.data is .named(named) else {
+            self.type_ops.add_node_error(
+                literal.type_ref,
+                "constructor target must be a nominal type",
+                "expected_nominal_type"
+            );
+            self.check_struct_literal_values(literal);
+            return self.state.query.types.invalid_type();
+        }
+        def.DefKind kind = self.state.query.defs.get(named.def_id).kind;
+        if (kind != .struct_def && kind != .record_def) {
+            self.type_ops.add_node_error(
+                literal.type_ref,
+                "field literal target must be struct or record",
+                "expected_field_literal_type"
+            );
+            self.check_struct_literal_values(literal);
+            return self.state.query.types.invalid_type();
+        }
+        self.check_struct_literal_fields(node_id, literal, result_type, named);
+        return result_type;
+    }
+
+    () check_struct_literal_values(hir.HirStructLiteral literal) {
+        Int! index = 0;
+        while (index < literal.fields.length) {
+            self.check_node(literal.fields[index].value);
+            index = index + 1;
+        }
+    }
+
+    () check_struct_literal_fields(
+        hir.HirId node_id,
+        hir.HirStructLiteral literal,
+        qid.TypeId result_type,
+        types.NamedType named
+    ) {
+        Int! index = 0;
+        while (index < literal.fields.length) {
+            self.check_struct_literal_field(literal, index, named);
+            index = index + 1;
+        }
+        self.check_struct_literal_missing_fields(node_id, literal, named.def_id);
+    }
+
+    () check_struct_literal_field(
+        hir.HirStructLiteral literal,
+        Int field_index,
+        types.NamedType named
+    ) {
+        hir.HirFieldInit field = literal.fields[field_index];
+        qid.TypeId value_type = self.check_node(field.value);
+        if (self.struct_literal_field_seen_before(literal, field_index)) {
+            self.type_ops.add_node_error(field.value, "duplicate field initializer", "duplicate_field_initializer");
+            return;
+        }
+        guard self.field_def_for_struct_literal(named.def_id, field.field_symbol) is some field_def else {
+            self.type_ops.add_node_error(field.value, "unknown field initializer", "unknown_field_initializer");
+            return;
+        }
+        qid.TypeId field_type = self.struct_literal_field_type(named, field_def);
+        self.type_ops.expect_value_assignable(
+            field.value,
+            field_type,
+            value_type,
+            "field initializer type does not match field type",
+            "field_initializer_type_mismatch"
+        );
+    }
+
+    Bool struct_literal_field_seen_before(hir.HirStructLiteral literal, Int field_index) {
+        qid.SymbolId symbol = literal.fields[field_index].field_symbol;
+        Int! index = 0;
+        while (index < field_index) {
+            if (qid.SymbolId.equal(literal.fields[index].field_symbol$.ref(), symbol$.ref())) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    qid.DefId? field_def_for_struct_literal(qid.DefId owner_def, qid.SymbolId symbol) {
+        guard self.state.query.defs.get(owner_def).owned_namespace_id is some namespace_id else {
+            return null;
+        }
+        guard self.state.query.resolve.namespaces.first_binding(namespace_id, symbol, .member_name)
+            is some binding else {
+            return null;
+        }
+        if (self.state.query.defs.get(binding.def_id).kind == .field_def) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    qid.TypeId struct_literal_field_type(types.NamedType named, qid.DefId field_def) {
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
+        return self.type_ops.substitute_generic_type(field_type, named.def_id, type_args);
+    }
+
+    list.ArrayList<qid.TypeId> named_type_args_list(types.NamedType named) {
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>(named.args.length);
+        Int! index = 0;
+        while (index < named.args.length) {
+            args.add(named.args[index]);
+            index = index + 1;
+        }
+        return args;
+    }
+
+    () check_struct_literal_missing_fields(hir.HirId node_id, hir.HirStructLiteral literal, qid.DefId owner_def) {
+        guard self.state.hirs.def(owner_def) is some owner_hir else { return; }
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.state.query.defs.get(member_def).kind == .field_def) {
+                self.check_struct_literal_missing_field(node_id, literal, member_def);
+            }
+            index = index + 1;
+        }
+    }
+
+    () check_struct_literal_missing_field(hir.HirId node_id, hir.HirStructLiteral literal, qid.DefId field_def) {
+        qid.SymbolId symbol = self.state.query.defs.get(field_def).name.symbol;
+        Int! index = 0;
+        while (index < literal.fields.length) {
+            if (qid.SymbolId.equal(literal.fields[index].field_symbol$.ref(), symbol$.ref())) {
+                return;
+            }
+            index = index + 1;
+        }
+        self.type_ops.add_node_error(node_id, "missing field initializer", "missing_field_initializer");
+    }
+
     qid.TypeId? common_control_type(qid.TypeId left, qid.TypeId right) {
         if (self.type_ops.is_invalid_type(left) || self.type_ops.is_invalid_type(right)) {
             return self.state.query.types.invalid_type();
@@ -723,6 +929,12 @@ public struct BodyCheck {
         }
         list.ArrayList<qid.TypeId>! type_args = self.type_ops.check_type_args(call.type_args);
         if (call.target is some target) {
+            def.DefKind target_kind = self.state.query.defs.get(target.def_id).kind;
+            if (target_kind == .union_variant_def || target_kind == .enum_case_def) {
+                return self.check_variant_constructor_call(node_id, call, target.def_id);
+            }
+        }
+        if (call.target is some target) {
             self.type_ops.record_generic_instance(node_id, target.def_id, type_args);
             self.type_ops.check_type_arg_arity(node_id, target.def_id, type_args.len());
         }
@@ -761,6 +973,63 @@ public struct BodyCheck {
             index = index + 1;
         }
         return self.substituted_call_result_type(call, type_args, function_type.result);
+    }
+
+    qid.TypeId check_variant_constructor_call(hir.HirId node_id, hir.HirCall call, qid.DefId variant_def) {
+        self.check_call_args(call);
+        def.DefRecord variant = self.state.query.defs.get(variant_def);
+        guard variant.owner_def is some owner_def else {
+            return self.state.query.types.invalid_type();
+        }
+        qid.TypeId result_type = self.state.query.types.named_type(owner_def, token.Span());
+        qid.TypeId payload_type = self.type_ops.type_for_def(variant_def);
+        if (self.variant_constructor_args_match(call, payload_type)) {
+            return result_type;
+        }
+        self.type_ops.add_node_error(
+            node_id,
+            "variant constructor arguments do not match payload type",
+            "variant_constructor_type_mismatch"
+        );
+        return self.state.query.types.invalid_type();
+    }
+
+    () check_call_args(hir.HirCall call) {
+        Int! index = 0;
+        while (index < call.args.length) {
+            self.check_node(call.args[index]);
+            index = index + 1;
+        }
+    }
+
+    Bool variant_constructor_args_match(hir.HirCall call, qid.TypeId payload_type) {
+        if (self.type_ops.is_unit_type(payload_type)) {
+            return call.args.length == 0;
+        }
+        types.TypeInfo payload_info = self.state.query.types.get(payload_type);
+        if (payload_info.data is .tuple_type(tuple_type)) {
+            return self.tuple_variant_args_match(call, tuple_type);
+        }
+        if (call.args.length != 1) {
+            return false;
+        }
+        qid.TypeId arg_type = self.state.results.node_type(call.args[0])$.some();
+        return self.type_ops.value_assignable_to_expected(payload_type, call.args[0], arg_type);
+    }
+
+    Bool tuple_variant_args_match(hir.HirCall call, types.TupleType tuple_type) {
+        if (call.args.length != tuple_type.items.length) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < call.args.length) {
+            qid.TypeId arg_type = self.state.results.node_type(call.args[index])$.some();
+            if (!self.type_ops.value_assignable_to_expected(tuple_type.items[index], call.args[index], arg_type)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
     }
 
     qid.TypeId check_type_constructor_call(hir.HirId node_id, hir.HirCall call) {
