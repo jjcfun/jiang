@@ -1150,6 +1150,8 @@ while (i < 10) {
 ##### For 循环
 
 Jiang 语言支持 `for-in` 语法，用于遍历区间、数组或任何可迭代对象。
+裸 `T[*]` many pointer 不作为 iterable；需要遍历指针区间时，使用 range 产生 index，
+再在循环体内写 `p[i]`。
 
 **1. 区间遍历**
 目前仅支持左闭右开区间 `start..end`。
@@ -1172,7 +1174,7 @@ for item in list {
 
 **3. 带索引的遍历 (Explicit Indexing)**
 Jiang 不支持隐式的索引迭代。如果需要索引，必须调用 `list.indexed()` 方法，
-该方法会返回一个包含 `(Int, Element)` 元组的序列。
+该方法会返回一个包含 `(Int, Item)` 元组的序列。
 
 ```c
 Int[_] list = [10, 20];
@@ -1800,7 +1802,7 @@ trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
 ```c
 trait Iterable {
   associated Item;
-  Item item();
+  Item next_item();
 }
 ```
 
@@ -1818,7 +1820,7 @@ trait HasItem {
 ```c
 trait Iterable {
   associated Item;
-  Item item();
+  Item next_item();
 }
 
 @where(Item == UInt8)
@@ -1894,13 +1896,13 @@ struct Box: HasValue {
 ```c
 trait Iterable {
   associated Item;
-  Item item();
+  Item next_item();
 }
 
 struct Counter: Iterable {
   associated Item = UInt8;
 
-  UInt8 item() {
+  UInt8 next_item() {
     return 42;
   }
 }
@@ -1940,7 +1942,7 @@ struct Pair: Left, Right {
 ```c
 trait Iterable {
   associated Item;
-  Item item();
+  Item next_item();
 }
 
 struct Counter {}
@@ -1948,7 +1950,7 @@ struct Counter {}
 extend Counter: Iterable {
   associated Item = UInt8;
 
-  UInt8 item() {
+  UInt8 next_item() {
     return 42;
   }
 }

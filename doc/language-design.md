@@ -857,16 +857,17 @@ for-in 的输入”，不会和真正保存遍历状态的游标混在一起。
 
 0.2 先支持内建 iterable：
 
+- `start..end`：range，左闭右开，item type 是 `Int`。
 - `T[]`：slice，item type 是 `T`。
 - `T[N]`：定长数组，item type 是 `T`。
-- `T[*]`：many pointer 不是无边界 iterable；只有显式长度/range 包装后才能参与 for-in。
+- `T[*]`：many pointer 不是 iterable；需要遍历时使用 range 产生 index，再用 `p[i]` 访问。
 
 长期自定义遍历协议预留为两层：
 
 ```jiang
 trait IterState {
     associated Item;
-    Item? next();
+    Item? next_item();
 }
 
 trait Iterable {
@@ -876,7 +877,7 @@ trait Iterable {
 }
 ```
 
-`IterState` 是有状态游标，`next()` 每次返回下一个元素，`none` 表示结束。
+`IterState` 是有状态游标，`next_item()` 每次返回下一个元素，`none` 表示结束。
 `Iterable` 是容器或视图，`iter()` 产生游标。`for pattern in expr` 的 type check
 负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Item`。MIR
 lowering 只消费这个 plan，不在 MIR 阶段重新做 trait lookup。
