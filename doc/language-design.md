@@ -125,7 +125,12 @@ Result?!@Error maybe_result;
 
 `?` / `!` 作用在当前类型层级，并且都是 type flag。同一类型层级中，每种 flag 最多出现一次；源码里重复写出时必须报 diagnostic。类型归一化阶段如果因为泛型替换或别名展开得到重复 flag，按幂等规则合并。
 
-`^` / `&` 会基于左侧已经形成的类型创建新的 pointer/reference 外层。创建出的外层也可以继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 pointer/reference 层；因此不支持 `T^^`、`T&&`、`T^&` 或 `T&^` 这类 handle 的 handle。类型归一化阶段如果得到重复 handle 层，按当前同类 handle 合并；如果同时出现 `^` 和 `&`，必须保留错误状态并报告 diagnostic，不能静默选择一种。
+`^` / `&` 会基于左侧已经形成的类型创建新的 language handle 外层。创建出的外层也可以
+继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 `^` 或 `&` 外层；因此不支持
+`T^^`、`T&&`、`T^&` 或 `T&^` 这类 language handle 的 handle。raw pointer、many pointer
+和 slice 是 ABI/低层指针形态，允许按 C ABI 需要叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
+类型归一化阶段如果得到重复 `^` / `&` 层，按当前同类 handle 合并；如果同时出现 `^`
+和 `&`，必须保留错误状态并报告 diagnostic，不能静默选择一种。
 
 为了避免用户在不同排列之间做选择，同一层级的 type suffix 顺序固定：
 
@@ -156,7 +161,9 @@ Int?! value; // optional 层可变
 
 重复可变标记是语法错误。编译器恢复时可以把 `T!!` 当作 `T!` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `?` 也要报错，例如 `T!?!`。
 
-pointer/reference 外层只能是 `^` 或 `&` 之一，不能写成 `T^&` 或 `T&^`。
+language handle 外层只能是 `^` 或 `&` 之一，不能写成 `T^&` 或 `T&^`。raw pointer、
+many pointer 和 slice 可以继续叠加，用于描述 FFI 中的 pointer-to-pointer、pointer array
+或 C 字符串数组。
 
 源码报错规则和类型归一化规则要分开：源码中直接写出的重复 suffix 必须报错；归一化阶段因为泛型替换得到重复 flag 时，重复的 `?` / `!` / 同类 handle 可以合并。
 
@@ -244,7 +251,11 @@ ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明�
 
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入 `!` 成员时，语言类型系统不做 Rust 式排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、channel 或用户协议保证。
 
-`^` 和 `&` 会创建新的 pointer/reference 外层。一个完整源码类型中最多只能出现一个 pointer/reference 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。归一化阶段如果因为泛型替换得到重复同类 handle，可以合并；如果得到 `^` 与 `&` 混合的 handle 层，必须保留错误状态并报告 diagnostic。
+`^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
+或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*`、`T[*]` 和 `T[]`
+是 ABI/低层指针视图，可以按 C ABI 需要叠加。归一化阶段如果因为泛型替换得到重复同类
+language handle，可以合并；如果得到 `^` 与 `&` 混合的 handle 层，必须保留错误状态并报告
+diagnostic。
 
 `T^` 在普通值上下文中默认自动解引用。`T&` 和 `T*` 不默认解引用，必须通过 `$.get()` 显式读取：
 
