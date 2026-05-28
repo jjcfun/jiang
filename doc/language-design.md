@@ -448,7 +448,12 @@ Slice make_slice(Buffer& buffer);
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
-未来规划：隐式操作层会纳入 capability 系统。`$` 不是绕过语言规则的普通后门，而是进入受编译期 capability 约束的低层操作层。每个 `$` 操作都需要对应能力；缺少能力时编译失败。
+0.2 阶段 package 默认处在全局 unsafe 模式。隐式操作层的低层操作，尤其是裸指针转换、裸指针取值、
+地址获取和显式释放，不因为缺少 unsafe/capability gate 而报错；borrow check 仍然只检查所有权、
+lifetime 和 drop safety。
+
+未来如果引入 capability 系统，`$` 会成为受编译期 capability 约束的低层操作层。每个 `$` 操作都需要
+对应能力；缺少能力时编译失败。
 
 初步分类：
 
@@ -457,7 +462,8 @@ Slice make_slice(Buffer& buffer);
 - 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.free()`、`Type$.alloc()`、`Type$.alloc_array(n)`。
 - 需要 unsafe/cast 能力：`value$.as(Type)`。
 
-编译器自身源码包默认拥有全部 capability，这是编译器实现的特殊配置，不代表普通 Jiang 包默认拥有这些能力。普通包默认应采用最小能力集合，并通过显式配置或受控上下文获得额外能力。
+当前阶段不区分编译器源码包和普通 Jiang 包，普通 package 也默认拥有这些低层能力。最小能力集合和
+显式授权规则推迟到 capability 系统设计时再固定。
 
 ## 声明
 
@@ -660,6 +666,8 @@ trait Indexable {
 - 同名函数和同名方法允许 overload；参数数量或参数类型必须不同。
 - `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。
 - `Hashable` 继承 `Equatable`；可作为 hash key 的类型必须同时定义 hash 和相等比较。
+- `Hashable` / `Equatable` 属于 compiler core trait。std prelude 只导出同一个
+  DefId；即使后续启用 no-std，它们仍然是语言核心约束。
 
 完整 trait solving、trait method lookup、associated type projection 仍需单独定稿。
 
@@ -984,6 +992,6 @@ Void save(File& file) {
 - `write(self)` / `write(arg)` / `write(global)`：可能修改对应对象或状态。
 - `io`：执行输入输出。
 - `alloc`：分配内存。
-- `unsafe`：使用需要 unsafe/capability 的低层操作。
+- `unsafe`：未来 capability 系统中可用于标记低层操作；0.2 阶段暂不启用检查。
 
 未标注函数在该提案中默认为 `unknown` / impure，不强制第一版代码全量标注。若未来启用检查，`@effect(read)` 函数中写入 `self` 的 `!` 字段应编译失败；trait requirement 也可以携带 effect，要求实现不比 requirement 更“脏”。

@@ -17,6 +17,7 @@ import types = "../sema/type.jiang";
 import hash = "../support/hash.jiang";
 import list = "../support/list.jiang";
 import table = "../support/table.jiang";
+import token = "../syntax/token.jiang";
 import loan = "./loan.jiang";
 import location = "./location.jiang";
 import move_path = "./move_path.jiang";
@@ -587,13 +588,19 @@ struct FunctionBorrowChecker {
         if (constraint.shorter.kind != .return_lifetime) {
             return false;
         }
-        if (constraint.longer.kind != .named_lifetime) {
-            return false;
+        if (constraint.longer.kind == .self_lifetime) {
+            return self.source_symbol_is_self(source_symbol);
         }
+        if (constraint.longer.kind != .named_lifetime) { return false; }
         guard constraint.longer.symbol is some longer_symbol else {
             return false;
         }
         return longer_symbol == source_symbol;
+    }
+
+    Bool source_symbol_is_self(qid.SymbolId source_symbol) {
+        qid.SymbolId self_symbol = self.ctx.query.symbols.intern("self");
+        return qid.SymbolId.equal(source_symbol$.ref(), self_symbol$.ref());
     }
 
     () check_call(mir.MirCallTerminator call_term) {
@@ -737,11 +744,47 @@ struct FunctionBorrowChecker {
 
     () consume_place(mir.MirPlace place) {
         self.check_place_use(place);
+        if (self.place_is_indirect_memory(place)) {
+            return;
+        }
         if (!self.is_implicit_copy_place(place)) {
             move_path.MovePathId path = self.paths.path_for_place(place);
             self.check_source_invalidation(path);
             self.mark_moved(path);
         }
+    }
+
+    // raw pointer / many pointer 指向的是编译器无法静态枚举的外部内存。
+    // 读取 `p[i]` 会移动元素值，但不能把保存指针的本地变量 `p` 本身标成 moved。
+    Bool place_is_indirect_memory(mir.MirPlace place) {
+        qid.TypeId! base_type = self.local_type(place.local_id);
+        Int! index = 0;
+        while (index < place.projection.length) {
+            if (self.projection_enters_untracked_memory(base_type, place.projection[index])) {
+                return true;
+            }
+            base_type = self.projected_type(base_type, place.projection[index]);
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool projection_enters_untracked_memory(qid.TypeId base_type, mir.MirPlaceElem projection) {
+        if (projection is .index_projection || projection is .constant_index_projection) {
+            return self.type_is_raw_or_many_pointer(base_type);
+        }
+        if (projection is .deref_projection(deref)) {
+            return deref.raw_pointer || self.type_is_raw_or_many_pointer(base_type);
+        }
+        return false;
+    }
+
+    Bool type_is_raw_or_many_pointer(qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.query.types.get(type_id);
+        guard info.data is .handle_type(handle) else {
+            return false;
+        }
+        return handle.kind == .many_pointer || handle.kind == .raw_pointer;
     }
 
     () check_place_use(mir.MirPlace place) {
@@ -761,7 +804,7 @@ struct FunctionBorrowChecker {
                 .error,
                 .borrow_check,
                 diagnostic.DiagnosticCode("use_after_move"),
-                diagnostic.SourceRange(),
+                self.current_source_range(),
                 "use of moved value"
             )
         );
@@ -782,7 +825,7 @@ struct FunctionBorrowChecker {
                 .error,
                 .borrow_check,
                 diagnostic.DiagnosticCode("borrowed_value_escape"),
-                diagnostic.SourceRange(),
+                self.current_source_range(),
                 "borrowed value escapes its owner"
             )
         );
@@ -797,10 +840,37 @@ struct FunctionBorrowChecker {
                 .error,
                 .borrow_check,
                 diagnostic.DiagnosticCode("borrowed_value_invalidated"),
-                diagnostic.SourceRange(),
+                self.current_source_range(),
                 "borrowed value is invalidated while borrowed"
             )
         );
+    }
+
+    // MIR 只保存 byte span，不重复保存 source_id。borrow check 诊断用当前
+    // 函数 DefId 的 SourceMap 记录补回 source_id，再取当前 statement/terminator span。
+    diagnostic.SourceRange current_source_range() {
+        guard self.ctx.query.source_map.def_span(self.function_def) is some function_loc else {
+            return diagnostic.SourceRange();
+        }
+        guard function_loc.source_id is some source_id else {
+            return diagnostic.SourceRange();
+        }
+        return diagnostic.SourceRange(source_id, self.current_span());
+    }
+
+    token.Span current_span() {
+        if (self.current_location.kind == .terminator) {
+            return self.current_block().terminator.span;
+        }
+        return self.current_statement().span;
+    }
+
+    mir.MirBlock current_block() {
+        return self.body.blocks[self.current_location.block_id.to_index()];
+    }
+
+    mir.MirStatement current_statement() {
+        return self.current_block().statements[self.current_location.statement_index];
     }
 
     Bool record_diagnostic(Int code) {

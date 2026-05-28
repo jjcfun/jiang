@@ -9,6 +9,7 @@ import layout_compute = "../layout/compute.jiang";
 import qid = "../query/id.jiang";
 import def = "../resolve/def.jiang";
 import module_graph = "../resolve/module_graph.jiang";
+import source_map = "../source/source_map.jiang";
 import store = "../resolve/store.jiang";
 import monomorph = "../sema/monomorph.jiang";
 import sema_result = "../sema/result.jiang";
@@ -1508,6 +1509,10 @@ struct BodyLowerer {
     }
 
     () lower_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
+        if (binary.op == .logic_and || binary.op == .logic_or) {
+            self.lower_logic_binary(node_id, binary, destination);
+            return;
+        }
         guard self.binary_op(binary.op) is some op else {
             self.mark_unsupported(node_id);
             return;
@@ -1521,6 +1526,62 @@ struct BodyLowerer {
             }),
             self.lowerer.hir_span(node_id)
         );
+    }
+
+    () lower_logic_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
+        if (binary.op == .logic_and) {
+            self.lower_logic_and(node_id, binary, destination);
+            return;
+        }
+        self.lower_logic_or(node_id, binary, destination);
+    }
+
+    () lower_logic_and(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirBlockId rhs_block = self.reserve_block(self.lowerer.hir_span(binary.right));
+        mir.MirBlockId false_block = self.reserve_block(span);
+        mir.MirBlockId join_block = self.reserve_block(span);
+        mir.MirOperand condition = self.lower_to_operand(binary.left);
+        self.finish_block(.branch_term(mir.MirBranchTerminator {
+            condition: condition,
+            then_target: rhs_block,
+            else_target: false_block
+        }), self.lowerer.hir_span(binary.left));
+
+        self.start_block(rhs_block);
+        self.lower_into_place(binary.right, destination);
+        if (!self.terminated) {
+            self.finish_block(self.goto_terminator(join_block), span);
+        }
+
+        self.start_block(false_block);
+        self.push_assign(destination, self.bool_rvalue(false, span), span);
+        self.finish_block(self.goto_terminator(join_block), span);
+        self.start_block(join_block);
+    }
+
+    () lower_logic_or(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirBlockId true_block = self.reserve_block(span);
+        mir.MirBlockId rhs_block = self.reserve_block(self.lowerer.hir_span(binary.right));
+        mir.MirBlockId join_block = self.reserve_block(span);
+        mir.MirOperand condition = self.lower_to_operand(binary.left);
+        self.finish_block(.branch_term(mir.MirBranchTerminator {
+            condition: condition,
+            then_target: true_block,
+            else_target: rhs_block
+        }), self.lowerer.hir_span(binary.left));
+
+        self.start_block(true_block);
+        self.push_assign(destination, self.bool_rvalue(true, span), span);
+        self.finish_block(self.goto_terminator(join_block), span);
+
+        self.start_block(rhs_block);
+        self.lower_into_place(binary.right, destination);
+        if (!self.terminated) {
+            self.finish_block(self.goto_terminator(join_block), span);
+        }
+        self.start_block(join_block);
     }
 
     // type check 已经保证 get/set 的 base 是 pointer/reference。MIR 只把
@@ -2168,8 +2229,19 @@ struct BodyLowerer {
     () lower_call(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
         if (call.target is some target) {
             def.DefKind kind = self.lowerer.ctx.query.defs.get(target.def_id).kind;
+            if (kind == .builtin_value_def && self.is_builtin_call(target.def_id, "assert")) {
+                self.lower_builtin_assert(node_id, call);
+                return;
+            }
             if (kind == .union_variant_def) {
                 self.lower_union_variant_constructor(node_id, call, target.def_id, destination);
+                return;
+            }
+        }
+        if (self.lowerer.ctx.query.typeck.member_selection(call.callee) is some member_def) {
+            def.DefKind kind = self.lowerer.ctx.query.defs.get(member_def).kind;
+            if (kind == .union_variant_def) {
+                self.lower_union_variant_constructor(node_id, call, member_def, destination);
                 return;
             }
         }
@@ -2185,6 +2257,27 @@ struct BodyLowerer {
             callee: callee,
             args: self.lowerer.output.operand_array(args$.ref()),
             destination: destination,
+            target: next_block,
+            cleanup: null
+        }), self.lowerer.hir_span(node_id));
+        self.start_block(next_block);
+    }
+
+    Bool is_builtin_call(qid.DefId def_id, UInt8[] name) {
+        def.DefRecord def_record = self.lowerer.ctx.query.defs.get(def_id);
+        return string.equal(self.lowerer.ctx.query.symbols.text(def_record.name.symbol), name);
+    }
+
+    () lower_builtin_assert(hir.HirId node_id, hir.HirCall call) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        mir.MirBlockId next_block = self.reserve_block(self.lowerer.hir_span(node_id));
+        self.finish_block(.assert_term(mir.MirAssertTerminator {
+            condition: self.lower_to_operand(call.args[0]),
+            expected: true,
+            message: null,
             target: next_block,
             cleanup: null
         }), self.lowerer.hir_span(node_id));
@@ -2226,6 +2319,30 @@ struct BodyLowerer {
 
     () mark_unsupported(hir.HirId node_id) {
         self.lowerer.output.mark_error();
+        self.add_unsupported_diagnostic(node_id);
+    }
+
+    () add_unsupported_diagnostic(hir.HirId node_id) {
+        diagnostic.SourceRange! range = diagnostic.SourceRange();
+        if (self.lowerer.ctx.query.source_map.hir_span(node_id) is some loc) {
+            range = self.source_range(loc);
+        }
+        self.lowerer.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .lowering,
+                diagnostic.DiagnosticCode("mir_unsupported_hir"),
+                range,
+                "unsupported HIR node for MIR lowering"
+            )
+        );
+    }
+
+    diagnostic.SourceRange source_range(source_map.SourceLoc loc) {
+        guard loc.source_id is some source_id else {
+            return diagnostic.SourceRange();
+        }
+        return diagnostic.SourceRange(source_id, loc.span);
     }
 
     () push_assign(mir.MirPlace destination, mir.MirRvalue value, token.Span span) {
@@ -2307,6 +2424,10 @@ struct BodyLowerer {
         self.terminated = true;
     }
 
+    mir.MirTerminatorKind goto_terminator(mir.MirBlockId target) {
+        return .goto_term(mir.MirGotoTerminator {target: target});
+    }
+
     mir.MirBlockId reserve_block(token.Span span) {
         mir.MirBlockId block_id = mir.MirBlockId.from_index(self.blocks.len());
         self.blocks.add(mir.MirBlock {
@@ -2339,6 +2460,14 @@ struct BodyLowerer {
 
     mir.MirRvalue int_const_rvalue(Int value, token.Span span) {
         return .use_value(mir.MirUseRvalue {value: .const_operand(self.int_const(value, span))});
+    }
+
+    mir.MirRvalue bool_rvalue(Bool value, token.Span span) {
+        return .use_value(mir.MirUseRvalue {value: .const_operand(mir.MirConst {
+            type_id: self.lowerer.ctx.query.types.bool_type(),
+            span: span,
+            value: .bool_value(mir.MirBoolConst {value: value})
+        })});
     }
 
     mir.MirConst int_const(Int value, token.Span span) {

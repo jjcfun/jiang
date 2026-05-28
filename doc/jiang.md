@@ -287,14 +287,13 @@ Int val = 255;
 UInt8 small_val = UInt8(val);
 ```
 
-`as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换：
+`as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换。
+0.2 阶段 package 默认处在全局 unsafe 模式，编译器不会因为裸指针转换或裸指针访问本身报错；后续如果
+引入 capability/unsafe gate，再把这些低层操作纳入显式能力检查。
 
 ```c
-// 注意：某些危险的转换（如裸指针强转）需要对应 capability
 Int addr = 0x12345678;
-sudo {
-    Int* ptr = addr$.as(Int*);
-}
+Int* ptr = addr$.as(Int*);
 ```
 
 ### 数组（Array）
@@ -1719,14 +1718,21 @@ MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
 trait Numeric;
 ```
 
-`std/prelude.jiang` 中默认提供了一些常用 trait，例如：
+编译器 core 会内建一组最小 trait，并把它们导出到默认 prelude。`std/prelude.jiang`
+会继续导出标准库层的便利 API，但 `Hashable`、`Equatable` 这类 core trait
+不依赖 std package 本身；后续 no-std 模式关闭 std prelude 时，这些 core trait
+仍然有效。
+
+默认 prelude 中常用 trait 例如：
 
 - `Numeric`
 - `FromStringLiteral`
 - `Hashable`
 - `Equatable`
 
-其中 `Numeric`、`FromStringLiteral`、`Hashable` 和 `Equatable` 因为来自隐式预导入的 `std/prelude.jiang`，所以可以直接用于 `@where(...)`。
+其中 `Hashable` 和 `Equatable` 来自 compiler core，并通过 prelude 以普通 trait
+DefId 暴露，所以可以直接用于 `@where(...)`。标准库 trait 也可以由
+`std/prelude.jiang` 继续导出。
 
 若一个 `public trait` 被 `public` 类型显式实现，那么模块外可以通过该 trait requirement 调用对应方法。  
 若 trait 本身不是 `public`，则类型本身仍然可以对外可见，但外部不能通过该 private trait requirement 调用这些方法。
