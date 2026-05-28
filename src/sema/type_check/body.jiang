@@ -55,7 +55,7 @@ public struct BodyCheck {
         hir.HirId root,
         qid.TypeId body_type
     ) {
-        if (hir_def.decl.kind == .function_decl || hir_def.decl.kind == .deinit_decl) {
+        if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
             qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(def_id));
             hir.HirId value_id = self.body_result_value(root);
             self.type_ops.expect_value_assignable(
@@ -205,6 +205,14 @@ public struct BodyCheck {
         if (node.data is .call(call)) {
             if (self.dot_prefix_variant_def(call.callee, expected_type) is some variant_def) {
                 qid.TypeId type_id = self.check_selected_variant_call(node_id, call, variant_def);
+                self.state.results.set_node_type(node_id, type_id);
+                return type_id;
+            }
+        }
+        if (node.data is .member_access(_)) {
+            if (self.dot_prefix_variant_def(node_id, expected_type) is some variant_def) {
+                qid.TypeId type_id = self.enum_case_value_type(variant_def);
+                self.state.results.select_member(node_id, variant_def);
                 self.state.results.set_node_type(node_id, type_id);
                 return type_id;
             }
@@ -387,12 +395,14 @@ public struct BodyCheck {
 
     qid.TypeId check_assign(hir.HirId node_id, hir.HirAssign assign_stmt) {
         qid.TypeId target_type = self.check_node(assign_stmt.target);
-        qid.TypeId value_type = self.check_node(assign_stmt.value);
+        qid.TypeId value_type = self.check_node_expected(assign_stmt.value, target_type);
         Bool target_valid = self.is_assignment_target(assign_stmt.target);
         if (!target_valid) {
             self.type_ops.add_node_error(assign_stmt.target, "invalid assignment target", "invalid_assignment_target");
         } else {
-            if (!self.type_ops.is_invalid_type(target_type) && !self.state.query.types.get(target_type).is_mutable) {
+            if (!self.init_self_member_assignment(assign_stmt.target)
+                && !self.type_ops.is_invalid_type(target_type)
+                && !self.state.query.types.get(target_type).is_mutable) {
                 self.type_ops.add_node_error(
                     assign_stmt.target,
                     "assignment target is immutable",
@@ -402,6 +412,28 @@ public struct BodyCheck {
         }
         self.check_assignment_value(node_id, assign_stmt, target_type, value_type);
         return self.state.query.types.unit_type();
+    }
+
+    Bool init_self_member_assignment(hir.HirId target_id) {
+        guard self.state.hirs.def(target_id.owner_def) is some owner_hir else { return false; }
+        if (owner_hir.decl.kind != .init_decl) {
+            return false;
+        }
+        hir.HirNode target = self.state.hirs.node(target_id);
+        guard target.data is .member_access(member_access) else {
+            return false;
+        }
+        return self.is_self_local_ref(member_access.base);
+    }
+
+    Bool is_self_local_ref(hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        guard node.data is .name_ref(name_ref) else { return false; }
+        guard name_ref is .local(local_id) else { return false; }
+        guard self.state.hirs.body(node_id.owner_def) is some body else { return false; }
+        hir.HirLocal local = body.local(local_id);
+        UInt8[] text = self.state.query.symbols.text(local.symbol);
+        return string.equal(text, "self");
     }
 
     () check_assignment_value(
@@ -470,11 +502,17 @@ public struct BodyCheck {
         // value.member 的 resolve 阶段只知道 member 名字；真正的 owner
         // 需要 base 类型参与，所以这里根据 base 的 named type namespace
         // 选出 field/variant/case，并把选择结果写入 TypeCheckResults。
+        if (self.dot_prefix_variant_value_member_type(member_access) is some value_type) {
+            return value_type;
+        }
         qid.TypeId raw_base_type = self.raw_member_base_type(member_access.base);
         if (self.slice_length_type(raw_base_type, member_access.member_symbol) is some length_type) {
             return length_type;
         }
         qid.TypeId base_type = self.member_lookup_type(raw_base_type);
+        if (self.enum_value_member_type(base_type, member_access.member_symbol) is some value_type) {
+            return value_type;
+        }
         guard self.type_ops.value_member_for_type(
             base_type,
             node_id.owner_def,
@@ -504,11 +542,74 @@ public struct BodyCheck {
             return self.state.query.types.invalid_type();
         }
         self.state.results.select_member(node_id, member_def);
+        if (self.state.query.defs.get(member_def).kind == .enum_case_def) {
+            return self.enum_case_value_type(member_def);
+        }
         qid.TypeId member_type = self.type_ops.type_for_def(member_def);
         if (self.state.query.types.get(base_type).is_mutable && !self.type_ops.is_invalid_type(member_type)) {
             return self.state.query.types.mutable_type(member_type, token.Span());
         }
         return member_type;
+    }
+
+    qid.TypeId? enum_value_member_type(qid.TypeId base_type, qid.SymbolId member_symbol) {
+        if (!self.symbol_text_equal(member_symbol, "value")) {
+            return null;
+        }
+        guard self.nominal_def_kind(base_type) is some kind else { return null; }
+        if (kind != .enum_def) {
+            return null;
+        }
+        return self.state.query.types.int_type();
+    }
+
+    qid.TypeId? dot_prefix_variant_value_member_type(hir.HirMemberAccess member_access) {
+        if (!self.symbol_text_equal(member_access.member_symbol, "value")) {
+            return null;
+        }
+        hir.HirNode base = self.state.hirs.node(member_access.base);
+        guard base.data is .member_access(base_member) else { return null; }
+        if (!self.member_access_is_dot_prefix(base_member)) {
+            return null;
+        }
+        guard self.unique_enum_case_for_symbol(base_member.member_symbol) is some case_def else {
+            return null;
+        }
+        self.state.results.select_member(member_access.base, case_def);
+        self.state.results.set_node_type(member_access.base, self.enum_case_value_type(case_def));
+        return self.state.query.types.int_type();
+    }
+
+    qid.DefId? unique_enum_case_for_symbol(qid.SymbolId symbol) {
+        Bool! found_any = false;
+        qid.DefId! found = qid.DefId.from_index(0);
+        Int! cursor = self.state.query.resolve.first_enum_case_index(symbol);
+        while (cursor >= 0) {
+            qid.DefId case_def = self.state.query.resolve.enum_case_at_index(cursor);
+            if (found_any) {
+                return null;
+            }
+            found = case_def;
+            found_any = true;
+            cursor = self.state.query.resolve.next_enum_case_index(cursor);
+        }
+        if (found_any) {
+            return found;
+        }
+        return null;
+    }
+
+    qid.TypeId enum_case_value_type(qid.DefId case_def) {
+        guard self.state.query.defs.get(case_def).owner_def is some owner_def else {
+            return self.state.query.types.invalid_type();
+        }
+        return self.state.query.types.named_type(owner_def, token.Span());
+    }
+
+    def.DefKind? nominal_def_kind(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.query.types.get(type_id);
+        guard info.data is .named(named) else { return null; }
+        return self.state.query.defs.get(named.def_id).kind;
     }
 
     qid.TypeId member_access_base_type(hir.HirId base) {
@@ -1062,21 +1163,20 @@ public struct BodyCheck {
         // let/local 的类型属于绑定本身，后续 name_ref.local 会从同一个
         // local def 读取这里写入的 TypeId。
         qid.TypeId! value_type = self.state.query.types.unit_type();
-        if (let_stmt.initializer is some initializer) {
-            value_type = self.check_node(initializer);
-        }
 
         hir.HirDef owner = self.state.hirs.def(node_id.owner_def)$.some();
         guard owner.body is some body else { return self.state.query.types.invalid_type(); }
         hir.HirLocal local = body.local(let_stmt.local_id);
-        qid.TypeId! local_type = value_type;
         if (local.type_ref is some type_ref) {
+            qid.TypeId! local_type = self.state.query.types.invalid_type();
             if (let_stmt.initializer is some initializer) {
-                local_type = self.type_for_decl_initializer(type_ref, initializer, value_type);
-            } else {
-                local_type = self.type_ops.check_type_ref(type_ref);
-            }
-            if (let_stmt.initializer is some initializer) {
+                if (self.type_ops.type_ref_is_inferred_array(type_ref)) {
+                    value_type = self.check_node(initializer);
+                    local_type = self.type_ops.infer_array_type_from_initializer(type_ref, initializer, value_type);
+                } else {
+                    local_type = self.type_ops.check_type_ref(type_ref);
+                    value_type = self.check_node_expected(initializer, local_type);
+                }
                 self.type_ops.expect_value_assignable(
                     initializer,
                     local_type,
@@ -1084,9 +1184,16 @@ public struct BodyCheck {
                     "initializer type does not match local type",
                     "initializer_type_mismatch"
                 );
+            } else {
+                local_type = self.type_ops.check_type_ref(type_ref);
             }
+            self.type_ops.bind_def_type(local.def_id, local_type);
+            return self.state.query.types.unit_type();
         }
-        self.type_ops.bind_def_type(local.def_id, local_type);
+        if (let_stmt.initializer is some initializer) {
+            value_type = self.check_node(initializer);
+        }
+        self.type_ops.bind_def_type(local.def_id, value_type);
         return self.state.query.types.unit_type();
     }
 
@@ -1115,12 +1222,8 @@ public struct BodyCheck {
             }
             return self.state.query.types.invalid_type();
         }
-        Int! index = 0;
-        while (index < call.args.length) {
-            self.check_node(call.args[index]);
-            index = index + 1;
-        }
         if (call.args.length != function_type.params.length) {
+            self.check_call_args(call);
             self.type_ops.add_node_error(
                 node_id,
                 "call argument count does not match function signature",
@@ -1128,10 +1231,10 @@ public struct BodyCheck {
             );
             return self.state.query.types.invalid_type();
         }
-        index = 0;
+        Int! index = 0;
         while (index < call.args.length) {
-            qid.TypeId arg_type = self.state.results.node_type(call.args[index])$.some();
             qid.TypeId expected = self.substituted_call_param_type(call, type_args, function_type.params[index]);
+            qid.TypeId arg_type = self.check_node_expected(call.args[index], expected);
             if (!self.type_ops.value_assignable_to_expected(expected, call.args[index], arg_type)) {
                 self.type_ops.add_node_error(
                     call.args[index],
@@ -1145,7 +1248,6 @@ public struct BodyCheck {
     }
 
     qid.TypeId check_variant_constructor_call(hir.HirId node_id, hir.HirCall call, qid.DefId variant_def) {
-        self.check_call_args(call);
         def.DefRecord variant = self.state.query.defs.get(variant_def);
         guard variant.owner_def is some owner_def else {
             return self.state.query.types.invalid_type();
@@ -1181,6 +1283,7 @@ public struct BodyCheck {
 
     Bool variant_constructor_args_match(hir.HirCall call, qid.TypeId payload_type) {
         if (self.type_ops.is_unit_type(payload_type)) {
+            self.check_call_args(call);
             return call.args.length == 0;
         }
         types.TypeInfo payload_info = self.state.query.types.get(payload_type);
@@ -1188,19 +1291,21 @@ public struct BodyCheck {
             return self.tuple_variant_args_match(call, tuple_type);
         }
         if (call.args.length != 1) {
+            self.check_call_args(call);
             return false;
         }
-        qid.TypeId arg_type = self.state.results.node_type(call.args[0])$.some();
+        qid.TypeId arg_type = self.check_node_expected(call.args[0], payload_type);
         return self.type_ops.value_assignable_to_expected(payload_type, call.args[0], arg_type);
     }
 
     Bool tuple_variant_args_match(hir.HirCall call, types.TupleType tuple_type) {
         if (call.args.length != tuple_type.items.length) {
+            self.check_call_args(call);
             return false;
         }
         Int! index = 0;
         while (index < call.args.length) {
-            qid.TypeId arg_type = self.state.results.node_type(call.args[index])$.some();
+            qid.TypeId arg_type = self.check_node_expected(call.args[index], tuple_type.items[index]);
             if (!self.type_ops.value_assignable_to_expected(tuple_type.items[index], call.args[index], arg_type)) {
                 return false;
             }
@@ -1210,23 +1315,159 @@ public struct BodyCheck {
     }
 
     qid.TypeId check_type_constructor_call(hir.HirId node_id, hir.HirCall call) {
-        // `T()` / `T(value)` 的 callee 是类型，不是函数 definition。
-        // resolve/HIR 已经把 callee 降成 type-ref；这里只负责检查参数并产出 T。
-        qid.TypeId result_type = self.type_ops.check_type_ref(call.callee);
-        Int! index = 0;
-        while (index < call.args.length) {
-            self.check_node(call.args[index]);
-            index = index + 1;
+        // `Type(...)` 不是普通 function call：callee 是 type-ref。
+        // 这里先解析出 owner type，再从隐藏 init_def 集合中选择构造器。
+        qid.TypeId result_type = self.type_constructor_result_type(call);
+        self.check_call_args(call);
+        if (self.type_constructor_init_def(result_type, call) is some init_def) {
+            self.state.results.select_member(call.callee, init_def);
+            self.record_constructor_instance(result_type, call, init_def);
+            self.check_constructor_args(result_type, call, init_def);
+            return result_type;
         }
-        if (call.args.length <= 1) {
+        if (self.builtin_numeric_constructor_call(node_id, result_type, call)) {
+            return result_type;
+        }
+        if (self.default_nominal_constructor_call(node_id, result_type, call)) {
             return result_type;
         }
         self.type_ops.add_node_error(
             node_id,
-            "type constructor accepts at most one argument",
+            "no matching init constructor for type call",
             "type_constructor_arity_mismatch"
         );
         return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId type_constructor_result_type(hir.HirCall call) {
+        if (call.type_args.length == 0) {
+            return self.type_ops.check_type_ref(call.callee);
+        }
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .named_type_ref(named) else {
+            self.type_ops.check_type_args(call.type_args);
+            return self.type_ops.check_type_ref(call.callee);
+        }
+        if (named.args.length != 0) {
+            self.type_ops.check_type_args(call.type_args);
+            return self.type_ops.check_type_ref(call.callee);
+        }
+        list.ArrayList<qid.TypeId> args = self.type_ops.check_type_args(call.type_args);
+        self.type_ops.check_type_arg_arity(call.callee, named.def_id, args.len());
+        self.type_ops.record_generic_instance(call.callee, named.def_id, args);
+        return self.state.query.types.named_type_with_args(named.def_id, args, token.Span());
+    }
+
+    Bool builtin_numeric_constructor_call(hir.HirId node_id, qid.TypeId result_type, hir.HirCall call) {
+        if (!self.type_ops.is_numeric_type(result_type)) {
+            return false;
+        }
+        // builtin numeric type 也走统一 `Type(value)` constructor/init 语义。
+        // 这里只记录“这是 builtin constructor init”；MIR 再选择合适的底层表示。
+        self.state.results.mark_type_constructor_init(node_id, .builtin_numeric);
+        if (call.args.length != 1) {
+            self.type_ops.add_node_error(
+                node_id,
+                "numeric type constructor expects one argument",
+                "type_constructor_arity_mismatch"
+            );
+            return true;
+        }
+        qid.TypeId arg_type = self.state.results.node_type(call.args[0])$.some();
+        if (!self.type_ops.is_numeric_type(arg_type)) {
+            self.type_ops.add_node_error(
+                call.args[0],
+                "numeric type constructor argument must be numeric",
+                "call_arg_type_mismatch"
+            );
+        }
+        return true;
+    }
+
+    Bool default_nominal_constructor_call(hir.HirId node_id, qid.TypeId result_type, hir.HirCall call) {
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        guard result_info.data is .named(named) else { return false; }
+        if (!self.default_constructor_owner_kind(named.def_id)) {
+            return false;
+        }
+        if (self.type_constructor_has_init(named.def_id)) {
+            return false;
+        }
+        if (call.args.length != 0) {
+            return false;
+        }
+        self.state.results.mark_type_constructor_init(node_id, .default_nominal);
+        return true;
+    }
+
+    Bool default_constructor_owner_kind(qid.DefId def_id) {
+        def.DefKind kind = self.state.query.defs.get(def_id).kind;
+        if (kind == .struct_def) { return true; }
+        return kind == .record_def;
+    }
+
+    Bool type_constructor_has_init(qid.DefId owner_def) {
+        hir.HirDef& owner_hir = self.state.hirs.def_ref(owner_def);
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.state.query.defs.get(member_def).kind == .init_def) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () record_constructor_instance(qid.TypeId result_type, hir.HirCall call, qid.DefId init_def) {
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        guard result_info.data is .named(named) else { return; }
+        self.state.results.record_generic_instance_from_list(call.callee, init_def, self.named_type_args_list(named));
+    }
+
+    qid.DefId? type_constructor_init_def(qid.TypeId result_type, hir.HirCall call) {
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        guard result_info.data is .named(named) else { return null; }
+        hir.HirDef& owner_hir = self.state.hirs.def_ref(named.def_id);
+
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.state.query.defs.get(member_def).kind == .init_def
+                && self.init_args_match(member_def, call)) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool init_args_match(qid.DefId init_def, hir.HirCall call) {
+        guard self.state.hirs.def(init_def) is some init_hir else { return false; }
+        guard init_hir.decl.function_signature is some signature else { return false; }
+        return signature.params.length == call.args.length;
+    }
+
+    () check_constructor_args(qid.TypeId result_type, hir.HirCall call, qid.DefId init_def) {
+        types.TypeInfo result_info = self.state.query.types.get(result_type);
+        guard result_info.data is .named(named) else { return; }
+        guard self.state.hirs.def(init_def) is some init_hir else { return; }
+        guard init_hir.decl.function_signature is some signature else { return; }
+        list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
+        Int! index = 0;
+        while (index < call.args.length) {
+            qid.TypeId arg_type = self.state.results.node_type(call.args[index])$.some();
+            qid.TypeId param_type = self.type_ops.check_type_ref(signature.params[index]);
+            qid.TypeId expected = self.type_ops.substitute_generic_type(param_type, named.def_id, type_args);
+            if (!self.type_ops.value_assignable_to_expected(expected, call.args[index], arg_type)) {
+                self.type_ops.add_node_error(
+                    call.args[index],
+                    "constructor argument type does not match init parameter type",
+                    "call_arg_type_mismatch"
+                );
+            }
+            index = index + 1;
+        }
     }
 
     // `$` 进入隐式操作层。get/set 是 pointer/reference 的显式解引用读写；
@@ -1541,6 +1782,9 @@ public struct BodyCheck {
             }
             return value_type;
         }
+        if (unary.op == .new_value) {
+            return self.state.query.types.owner_pointer_type(value_type, token.Span());
+        }
         if (!self.type_ops.is_invalid_type(value_type)) {
             self.type_ops.add_node_error(node_id, "unsupported unary operand type", "unsupported_unary_operand");
         }
@@ -1549,7 +1793,7 @@ public struct BodyCheck {
 
     qid.TypeId check_binary(hir.HirId node_id, hir.HirBinary binary) {
         qid.TypeId left = self.check_node(binary.left);
-        qid.TypeId right = self.check_node(binary.right);
+        qid.TypeId right = self.check_binary_right(binary, left);
         if (binary.op == .equal || binary.op == .not_equal) {
             self.type_ops.expect_compatible_binary_operands(node_id, left, right);
             return self.state.query.types.bool_type();
@@ -1575,6 +1819,13 @@ public struct BodyCheck {
             return self.type_ops.check_integer_binary(node_id, left, right);
         }
         return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId check_binary_right(hir.HirBinary binary, qid.TypeId left) {
+        if (binary.op == .equal || binary.op == .not_equal) {
+            return self.check_node_expected(binary.right, left);
+        }
+        return self.check_node(binary.right);
     }
 
     Bool is_pattern_node(hir.HirNode node) {

@@ -97,6 +97,10 @@ struct HirLower {
             self.lower_function(function_decl, annotations, static_member);
             return;
         }
+        if (decl.data is .init_decl(init_decl)) {
+            self.lower_init(init_decl, annotations);
+            return;
+        }
         if (decl.data is .deinit_decl(deinit_decl)) {
             self.lower_deinit(deinit_decl);
             return;
@@ -187,6 +191,118 @@ struct HirLower {
         self.lower_member_range(extend_decl.members);
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
+    }
+
+    // init body 归属于隐藏 init_def。init 语义返回 Self：lowering 在用户
+    // body 后合成 `self` tail expression，让普通 function/MIR pipeline 消费。
+    () lower_init(ast.InitData init_decl, ast.AstRange annotations) {
+        guard self.current_owner_def is some owner_def else { return; }
+        token.Span span = self.state.file.get(init_decl.body).span;
+        guard self.init_def_for_init_decl(owner_def, span) is some init_def else { return; }
+
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = init_def;
+        self.env.enter_scope(.generic_scope);
+        self.define_self_type(owner_def);
+        hir.HirFunctionSignature signature = self.lower_init_signature(init_decl, owner_def, span);
+        self.state.query.hirs.set_function_signature(init_def, signature);
+        self.lower_annotations(init_def, annotations);
+
+        hir.HirId placeholder = self.add_invalid_node(span);
+        self.state.query.hirs.set_body(init_def, hir.HirBody(init_def, placeholder));
+        self.env.enter_scope(.function_scope);
+        hir.HirLocalId self_local = self.add_init_self_local(init_def, owner_def);
+        self.lower_parameters(init_def, init_decl.params, signature.params);
+        hir.HirId user_body = self.lower_expr(init_decl.body);
+        hir.HirId self_ref = self.add_node(.name_ref(.local(self_local)), span);
+        hir.HirId self_move = self.add_node(.implicit_call(hir.HirImplicitCall {
+            base: self_ref,
+            op: .move,
+            args: self.empty_hir_ids(),
+            optional_chain: false
+        }), span);
+        hir.HirId root = self.synthetic_init_root(user_body, self_move, span);
+        self.env.exit_scope();
+        self.env.exit_scope();
+
+        self.state.query.hirs.set_body_root(init_def, root);
+        self.current_owner_def = previous_owner;
+    }
+
+    hir.HirFunctionSignature lower_init_signature(ast.InitData init_decl, qid.DefId owner_def, token.Span span) {
+        list.ArrayList<hir.HirId>! params = list.ArrayList<hir.HirId>(init_decl.params.len);
+        list.ArrayList<qid.SymbolId>! param_symbols = list.ArrayList<qid.SymbolId>(init_decl.params.len);
+        Int! index = 0;
+        while (index < init_decl.params.len) {
+            ast.AstId param_id = self.state.file.child_at(init_decl.params, index);
+            ast.AstNode param_node = self.state.file.get(param_id);
+            if (param_node.data is .param(param)) {
+                params.add(self.lower_type_ref(param.type_ref));
+                param_symbols.add(self.name_symbol_or_zero(param.name));
+            }
+            index = index + 1;
+        }
+        return hir.HirFunctionSignature {
+            params: self.freeze_hir_ids(params),
+            param_symbols: self.freeze_symbol_ids(param_symbols),
+            result: self.lower_self_type_ref(owner_def, span)
+        };
+    }
+
+    hir.HirId synthetic_init_root(hir.HirId user_body, hir.HirId self_ref, token.Span span) {
+        list.ArrayList<hir.HirId>! statements = list.ArrayList<hir.HirId>(1);
+        statements.add(user_body);
+        return self.add_node(.block(hir.HirBlock {
+            statements: self.freeze_hir_ids(statements),
+            result: self_ref
+        }), span);
+    }
+
+    qid.DefId? init_def_for_span(qid.DefId owner_def, token.Span span) {
+        hir.HirDef& owner_hir = self.state.query.hirs.def_ref(owner_def);
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.state.query.defs.get(member_def).kind == .init_def
+                && self.def_span_matches(member_def, span)) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.DefId? init_def_for_init_decl(qid.DefId owner_def, token.Span span) {
+        if (self.init_def_for_span(owner_def, span) is some init_def) {
+            return init_def;
+        }
+        return self.next_unlowered_init_def(owner_def);
+    }
+
+    qid.DefId? next_unlowered_init_def(qid.DefId owner_def) {
+        hir.HirDef& owner_hir = self.state.query.hirs.def_ref(owner_def);
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.unlowered_init_def(member_def)) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool unlowered_init_def(qid.DefId def_id) {
+        if (self.state.query.defs.get(def_id).kind != .init_def) {
+            return false;
+        }
+        hir.HirDef& init_hir = self.state.query.hirs.def_ref(def_id);
+        return init_hir.decl.function_signature == null;
+    }
+
+    Bool def_span_matches(qid.DefId def_id, token.Span span) {
+        guard self.state.query.source_map.def_span(def_id) is some loc else { return false; }
+        return loc.span.start == span.start && loc.span.length == span.length;
     }
 
     // deinit body 归属于隐藏 deinit_def。它没有显式参数，返回 unit；
@@ -355,7 +471,7 @@ struct HirLower {
 
     qid.DefId? generic_param_def_for_name(qid.DefId owner_def, ast.AstId name_id) {
         guard self.state.name_symbol(name_id) is some symbol else { return null; }
-        guard self.state.query.hirs.def(owner_def) is some hir_def else { return null; }
+        hir.HirDef& hir_def = self.state.query.hirs.def_ref(owner_def);
 
         Int! index = 0;
         while (index < hir_def.members.len()) {
@@ -618,6 +734,27 @@ struct HirLower {
         self.state.query.hirs.add_local(function_def, .parameter, self_symbol, self_def, false, type_ref);
     }
 
+    hir.HirLocalId add_init_self_local(qid.DefId init_def, qid.DefId owner_def) {
+        qid.SymbolId self_symbol = self.state.query.symbols.intern("self");
+        token.Span! span = token.Span();
+        if (self.state.query.source_map.def_span(owner_def) is some loc) {
+            span = loc.span;
+        }
+        qid.DefId self_def = self.state.query.defs.create(
+            .local_def,
+            .value_name,
+            .private_visibility,
+            def.Name {symbol: self_symbol, span: span},
+            init_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.env.define(self_symbol, .value_name, self_def, span);
+        hir.HirId type_ref = self.lower_self_type_ref(owner_def, span);
+        return self.state.query.hirs.add_local(init_def, .local_variable, self_symbol, self_def, true, type_ref);
+    }
+
     hir.HirId lower_self_type_ref(qid.DefId owner_def, token.Span span) {
         return self.add_node(.named_type_ref(hir.HirNamedTypeRef {
             def_id: owner_def,
@@ -627,9 +764,7 @@ struct HirLower {
 
     hir.HirId[] lower_owner_generic_type_args(qid.DefId owner_def, token.Span span) {
         list.ArrayList<hir.HirId>! args = list.ArrayList<hir.HirId>();
-        guard self.state.query.hirs.def(owner_def) is some owner_hir else {
-            return self.freeze_hir_ids(args);
-        }
+        hir.HirDef& owner_hir = self.state.query.hirs.def_ref(owner_def);
 
         Int! index = 0;
         while (index < owner_hir.members.len()) {
@@ -1288,6 +1423,11 @@ struct HirLower {
 
     hir.HirId lower_type_ref(ast.AstId type_id) {
         ast.AstNode node = self.state.file.get(type_id);
+        // 表达式位置的 type constructor callee 可能仍包着 name_expr，
+        // 先剥掉语法外壳，再按真正的 name/path 做 type-ref lowering。
+        if (node.data is .name_expr(name_expr)) {
+            return self.lower_type_ref(name_expr.value);
+        }
         if (node.data is .infer_type) {
             return self.add_node(.infer_type_ref(), node.span);
         }

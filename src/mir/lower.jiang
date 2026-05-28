@@ -97,7 +97,7 @@ struct MirLowerer {
         guard self.hirs.def(def_id) is some hir_def else {
             return;
         }
-        if (hir_def.decl.kind == .function_decl || hir_def.decl.kind == .deinit_decl) {
+        if (self.is_lowerable_function_decl(hir_def.decl.kind)) {
             if (hir_def.body != null && self.generic_param_count(hir_def) == 0) {
                 self.lower_function(hir_def);
             }
@@ -111,6 +111,12 @@ struct MirLowerer {
 
     () lower_function(hir.HirDef hir_def) {
         self.lower_function_with_substitution(hir_def, monomorph.SubstitutionMap(), self.output.empty_type_args());
+    }
+
+    Bool is_lowerable_function_decl(hir.HirDeclKind kind) {
+        if (kind == .function_decl) { return true; }
+        if (kind == .init_decl) { return true; }
+        return kind == .deinit_decl;
     }
 
     // 第二阶段 lower concrete generic instances。它们不会出现在 HIR ownership
@@ -170,6 +176,15 @@ struct MirLowerer {
     }
 
     Int generic_param_count(hir.HirDef hir_def) {
+        Int! count = 0;
+        if (self.ctx.query.defs.get(hir_def.def_id).owner_def is some owner_def) {
+            count = count + self.generic_param_count_for_def(owner_def);
+        }
+        return count + self.generic_param_count_for_def(hir_def.def_id);
+    }
+
+    Int generic_param_count_for_def(qid.DefId def_id) {
+        hir.HirDef& hir_def = self.hirs.def_ref(def_id);
         Int! count = 0;
         Int! index = 0;
         while (index < hir_def.members.len()) {
@@ -1497,6 +1512,10 @@ struct BodyLowerer {
     }
 
     () lower_unary(hir.HirId node_id, hir.HirUnary unary, mir.MirPlace destination) {
+        if (unary.op == .new_value) {
+            self.lower_new_value(node_id, unary, destination);
+            return;
+        }
         guard self.unary_op(unary.op) is some op else {
             self.mark_unsupported(node_id);
             return;
@@ -1504,6 +1523,17 @@ struct BodyLowerer {
         self.push_assign(
             destination,
             .unary_value(mir.MirUnaryRvalue {op: op, value: self.lower_to_operand(unary.value)}),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    () lower_new_value(hir.HirId node_id, hir.HirUnary unary, mir.MirPlace destination) {
+        self.push_assign(
+            destination,
+            .alloc_value(mir.MirAllocValueRvalue {
+                value_type: self.type_for_node(unary.value),
+                value: self.lower_to_operand(unary.value)
+            }),
             self.lowerer.hir_span(node_id)
         );
     }
@@ -2011,7 +2041,13 @@ struct BodyLowerer {
             }
         }
         if (node.data is .member_access(_)) {
+            if (self.enum_value_operand(node_id) is some value) {
+                return value;
+            }
             if (self.lowerer.typeck.member_selection(node_id) is some member_def) {
+                if (self.lowerer.ctx.query.defs.get(member_def).kind == .enum_case_def) {
+                    return self.lower_def_operand(node_id, member_def);
+                }
                 if (self.def_can_be_function_operand(member_def)) {
                     return self.lower_def_operand(node_id, member_def);
                 }
@@ -2024,6 +2060,16 @@ struct BodyLowerer {
     }
 
     mir.MirOperand lower_def_operand(hir.HirId node_id, qid.DefId def_id) {
+        if (self.lowerer.ctx.query.defs.get(def_id).kind == .enum_case_def) {
+            return .const_operand(mir.MirConst {
+                type_id: self.type_for_node(node_id),
+                span: self.lowerer.hir_span(node_id),
+                value: .int_value(mir.MirIntConst {
+                    bits: UInt64(self.variant_tag_index(def_id)),
+                    signed_value: true
+                })
+            });
+        }
         if (!self.def_can_be_function_operand(def_id)) {
             return self.unsupported_operand(node_id);
         }
@@ -2040,7 +2086,7 @@ struct BodyLowerer {
 
     Bool def_can_be_function_operand(qid.DefId def_id) {
         def.DefKind kind = self.lowerer.ctx.query.defs.get(def_id).kind;
-        if (kind == .function_def) {
+        if (kind == .function_def || kind == .init_def) {
             return true;
         }
         return kind == .deinit_def;
@@ -2053,6 +2099,24 @@ struct BodyLowerer {
             }
         }
         return self.lowerer.output.empty_type_args();
+    }
+
+    mir.MirOperand? enum_value_operand(hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        guard node.data is .member_access(member_access) else { return null; }
+        if (!self.enum_value_access(member_access)) {
+            return null;
+        }
+        return self.lower_to_operand(member_access.base);
+    }
+
+    Bool enum_value_access(hir.HirMemberAccess member_access) {
+        if (!self.symbol_text_equal(member_access.member_symbol, "value")) {
+            return false;
+        }
+        qid.TypeId base_type = self.type_for_node(member_access.base);
+        guard self.nominal_def_kind(base_type) is some kind else { return false; }
+        return kind == .enum_def;
     }
 
     mir.MirPlace? place_for_expr(hir.HirId node_id) {
@@ -2240,10 +2304,18 @@ struct BodyLowerer {
         }
         if (self.lowerer.ctx.query.typeck.member_selection(call.callee) is some member_def) {
             def.DefKind kind = self.lowerer.ctx.query.defs.get(member_def).kind;
+            if (kind == .init_def) {
+                self.lower_call_to_function_def(node_id, call, member_def, destination);
+                return;
+            }
             if (kind == .union_variant_def) {
                 self.lower_union_variant_constructor(node_id, call, member_def, destination);
                 return;
             }
+        }
+        if (self.lowerer.typeck.type_constructor_init(node_id) is some constructor_kind) {
+            self.lower_type_constructor_init(node_id, call, constructor_kind, destination);
+            return;
         }
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
         mir.MirOperand callee = self.lower_to_operand(call.callee);
@@ -2261,6 +2333,106 @@ struct BodyLowerer {
             cleanup: null
         }), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    () lower_type_constructor_init(
+        hir.HirId node_id,
+        hir.HirCall call,
+        sema_result.TypeConstructorKind constructor_kind,
+        mir.MirPlace destination
+    ) {
+        if (constructor_kind == .builtin_numeric) {
+            self.lower_builtin_numeric_init(node_id, call, destination);
+            return;
+        }
+        self.lower_default_nominal_init(node_id, call, destination);
+    }
+
+    () lower_builtin_numeric_init(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        qid.TypeId source_type = self.type_for_node(call.args[0]);
+        qid.TypeId target_type = self.type_for_node(node_id);
+        // builtin numeric init 目前没有用户可见函数体；MIR 用 cast_value
+        // 表达底层转换，仍由 type check 的 constructor side table 触发。
+        self.push_assign(
+            destination,
+            .cast_value(mir.MirCastRvalue {
+                kind: self.cast_kind(source_type, target_type),
+                value: self.lower_to_operand(call.args[0]),
+                target_type: target_type
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    () lower_default_nominal_init(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        if (call.args.length != 0) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        qid.TypeId type_id = self.type_for_node(node_id);
+        guard self.lowerer.ctx.query.types.get(type_id).data is .named(named) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>();
+        self.push_assign(
+            destination,
+            .aggregate_value(mir.MirAggregateRvalue {
+                kind: self.struct_literal_aggregate_kind(named.def_id),
+                def_id: named.def_id,
+                type_id: type_id,
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            }),
+            self.lowerer.hir_span(node_id)
+        );
+    }
+
+    () lower_call_to_function_def(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.DefId function_def,
+        mir.MirPlace destination
+    ) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
+        Int! index = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_to_operand(call.args[index]));
+            index = index + 1;
+        }
+        qid.TypeId! function_type = self.lowerer.ctx.query.types.invalid_type();
+        if (self.lowerer.typeck.def_type(function_def) is some type_id) {
+            function_type = type_id;
+        }
+        mir.MirBlockId next_block = self.reserve_block(self.lowerer.hir_span(node_id));
+        self.finish_block(.call_term(mir.MirCallTerminator {
+            callee: self.function_const_operand(call.callee, function_def, function_type),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            destination: destination,
+            target: next_block,
+            cleanup: null
+        }), self.lowerer.hir_span(node_id));
+        self.start_block(next_block);
+    }
+
+    mir.MirOperand function_const_operand(hir.HirId node_id, qid.DefId function_def, qid.TypeId function_type) {
+        qid.TypeId[]! type_args = self.lowerer.output.empty_type_args();
+        if (self.lowerer.typeck.generic_instance(node_id) is some instance) {
+            if (instance.def_id == function_def) {
+                type_args = self.lowerer.output.type_arg_array(instance.type_args);
+            }
+        }
+        return .const_operand(mir.MirConst {
+            type_id: function_type,
+            span: self.lowerer.hir_span(node_id),
+            value: .function_value(mir.MirFunctionConst {
+                function_def: function_def,
+                type_args: type_args
+            })
+        });
     }
 
     Bool is_builtin_call(qid.DefId def_id, UInt8[] name) {
