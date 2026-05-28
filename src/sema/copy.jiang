@@ -1,0 +1,235 @@
+// Copy trait 的统一判定入口。
+//
+// type check 用它决定赋值/传参/返回是否需要 `$.move()`；borrow check 用同一
+// 套规则决定 MIR copy operand 会不会消耗 move path。这里只读 HIR、DefStore、
+// TypeTable 和 TypeCheckResults，不反向依赖 type_check 过程本身。
+
+import context = "../context.jiang";
+import hir = "../hir/hir.jiang";
+import qid = "../query/id.jiang";
+import def = "../resolve/def.jiang";
+import list = "../support/list.jiang";
+import sema_result = "./result.jiang";
+import types = "./type.jiang";
+
+public struct CopyQuery {
+    public context.CompilerContext& ctx;
+    public sema_result.TypeCheckResults& typeck;
+
+    public init(context.CompilerContext& ctx, sema_result.TypeCheckResults& typeck) {
+        self.ctx = ctx;
+        self.typeck = typeck;
+    }
+
+    public Bool is_implicit_copy_type(qid.TypeId type_id) {
+        list.ArrayList<qid.DefId>! visiting = list.ArrayList<qid.DefId>();
+        return self.is_implicit_copy_type_inner(type_id, visiting$.ref());
+    }
+
+    Bool is_implicit_copy_type_inner(qid.TypeId type_id, list.ArrayList<qid.DefId>& visiting) {
+        types.TypeInfo info = self.ctx.query.types.get(type_id);
+        if (info.data is .invalid) { return true; }
+        if (info.data is .never) { return true; }
+        if (info.data is .unit) { return true; }
+        if (info.data is .bool_type) { return true; }
+        if (info.data is .char_type) { return true; }
+        if (info.data is .int_type) { return true; }
+        if (info.data is .float_type) { return true; }
+        if (info.data is .function_type) { return true; }
+        if (info.data is .handle_type(handle)) {
+            return handle.kind != .owner_pointer;
+        }
+        if (info.data is .optional(optional)) {
+            return self.is_implicit_copy_type_inner(optional.element, visiting);
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.is_implicit_copy_type_inner(error_union.value, visiting)
+                && self.is_implicit_copy_type_inner(error_union.error, visiting);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.is_implicit_copy_type_inner(array_type.element, visiting);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.tuple_is_implicit_copy(tuple_type, visiting);
+        }
+        if (info.data is .named(named)) {
+            return self.named_is_implicit_copy(named, visiting);
+        }
+        return false;
+    }
+
+    Bool tuple_is_implicit_copy(types.TupleType tuple_type, list.ArrayList<qid.DefId>& visiting) {
+        Int! index = 0;
+        while (index < tuple_type.items.length) {
+            if (!self.is_implicit_copy_type_inner(tuple_type.items[index], visiting)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool named_is_implicit_copy(types.NamedType named_type, list.ArrayList<qid.DefId>& visiting) {
+        def.DefRecord def_record = self.ctx.query.defs.get(named_type.def_id);
+        if (def_record.kind == .generic_param_def) {
+            return self.def_declares_copy(named_type.def_id);
+        }
+        if (def_record.kind == .enum_def) {
+            return true;
+        }
+        if (!self.copy_nominal_kind(def_record.kind)) {
+            return false;
+        }
+        if (!self.def_declares_copy(named_type.def_id)) {
+            return false;
+        }
+        if (self.copy_stack_has(visiting, named_type.def_id)) {
+            return false;
+        }
+        guard self.ctx.query.hirs.def(named_type.def_id) is some hir_def else {
+            return false;
+        }
+        if (hir_def.custom_deinit_def != null) {
+            return false;
+        }
+        Int depth = visiting.len();
+        visiting.add(named_type.def_id);
+        Bool result = self.named_members_are_implicit_copy(hir_def, visiting);
+        visiting.truncate(depth);
+        return result;
+    }
+
+    public Bool def_declares_copy(qid.DefId def_id) {
+        guard self.ctx.query.resolve.core_traits.copy_trait is some copy_trait else {
+            return false;
+        }
+        def.DefRecord def_record = self.ctx.query.defs.get(def_id);
+        if (def_record.kind == .generic_param_def) {
+            return self.generic_param_declares_trait(def_record, copy_trait);
+        }
+        list.ArrayList<qid.DefId>! visited = list.ArrayList<qid.DefId>();
+        return self.def_declares_trait(def_id, copy_trait, visited$.ref());
+    }
+
+    Bool generic_param_declares_trait(def.DefRecord def_record, qid.DefId trait_def) {
+        if (self.generic_param_direct_trait(def_record.id, trait_def)) {
+            return true;
+        }
+        guard def_record.owner_def is some owner_def else {
+            return false;
+        }
+        return self.generic_param_where_trait(def_record.id, owner_def, trait_def);
+    }
+
+    Bool generic_param_direct_trait(qid.DefId generic_def, qid.DefId trait_def) {
+        guard self.ctx.query.hirs.def(generic_def) is some hir_def else {
+            return false;
+        }
+        return self.hir_def_declares_trait_ref(hir_def, trait_def);
+    }
+
+    Bool generic_param_where_trait(qid.DefId generic_def, qid.DefId owner_def, qid.DefId trait_def) {
+        guard self.ctx.query.hirs.def(owner_def) is some hir_def else {
+            return false;
+        }
+        Int! index = 0;
+        while (index < hir_def.where_predicates.len()) {
+            hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
+            index = index + 1;
+            guard predicate is .type_bound(bound) else { continue; }
+            if (!self.type_ref_names_def(bound.subject, generic_def)) { continue; }
+            if (self.type_ref_names_def(bound.bound, trait_def)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Bool def_declares_trait(qid.DefId def_id, qid.DefId trait_def, list.ArrayList<qid.DefId>& visited) {
+        if (self.copy_stack_has(visited, def_id)) {
+            return false;
+        }
+        guard self.ctx.query.hirs.def(def_id) is some hir_def else {
+            return false;
+        }
+        Int depth = visited.len();
+        visited.add(def_id);
+        Bool result = self.hir_def_declares_trait(hir_def, trait_def, visited);
+        visited.truncate(depth);
+        return result;
+    }
+
+    Bool hir_def_declares_trait(hir.HirDef hir_def, qid.DefId trait_def, list.ArrayList<qid.DefId>& visited) {
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            hir.HirNode node = self.ctx.query.hirs.node(hir_def.trait_refs.get(index));
+            index = index + 1;
+            guard node.data is .named_type_ref(named) else { continue; }
+            if (named.def_id == trait_def) {
+                return true;
+            }
+            if (self.def_declares_trait(named.def_id, trait_def, visited)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Bool hir_def_declares_trait_ref(hir.HirDef hir_def, qid.DefId trait_def) {
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            if (self.type_ref_names_def(hir_def.trait_refs.get(index), trait_def)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool named_members_are_implicit_copy(hir.HirDef hir_def, list.ArrayList<qid.DefId>& visiting) {
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            index = index + 1;
+            if (!self.copy_relevant_member(member_def)) { continue; }
+            guard self.typeck.def_type(member_def) is some member_type else { return false; }
+            if (!self.is_implicit_copy_type_inner(member_type, visiting)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public Bool copy_relevant_member(qid.DefId member_def) {
+        def.DefKind kind = self.ctx.query.defs.get(member_def).kind;
+        if (kind == .field_def) { return true; }
+        if (kind == .union_variant_def) { return true; }
+        return false;
+    }
+
+    Bool copy_nominal_kind(def.DefKind kind) {
+        if (kind == .struct_def) { return true; }
+        if (kind == .record_def) { return true; }
+        if (kind == .union_def) { return true; }
+        return false;
+    }
+
+    Bool copy_stack_has(list.ArrayList<qid.DefId>& stack, qid.DefId def_id) {
+        Int! index = 0;
+        while (index < stack.len()) {
+            if (stack.get(index) == def_id) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool type_ref_names_def(hir.HirId type_ref, qid.DefId def_id) {
+        hir.HirNode node = self.ctx.query.hirs.node(type_ref);
+        guard node.data is .named_type_ref(named) else {
+            return false;
+        }
+        return named.def_id == def_id;
+    }
+}

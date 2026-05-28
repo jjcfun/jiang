@@ -277,8 +277,7 @@ enum_member <- "public"? "static"? method_decl
 `public union Value { ... }`。
 
 ```peg
-union_decl  <- "union" ("(" name ")")? name (":" name)?
-               generic_params? trait_list? union_body
+union_decl  <- "union" ("(" name ")")? name generic_params? trait_list? union_body
 
 union_body  <- "{" union_member* "}"
 
