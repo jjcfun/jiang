@@ -282,14 +282,10 @@ union_body  <- "{" union_member* "}"
 
 union_member
             <- "public"? "static"? method_decl
-             / typed_union_variants
-             / union_variant ("," / ";")?
+             / union_variants
 
-typed_union_variants
-            <- type name ("," name)* ";"?
-
-union_variant
-            <- name ( "(" type ")" / ":" type )?
+union_variants
+            <- type name ("," name)* ";"
 ```
 
 ## trait

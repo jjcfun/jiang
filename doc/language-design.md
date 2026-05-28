@@ -599,12 +599,13 @@ union 的 public 规则类似 record：字段和 variant 的外部可见性由�
 
 ```jiang
 union Maybe<T> {
-    some(T),
-    none
+    T some;
+    () none;
 }
 ```
 
-目标语法采用 enum-like variant 形式：`union Maybe<T> { some(T), none }`。
+union variant 声明按 grammar 使用字段式写法，所有 variant 必须写出 payload 类型。
+没有 payload 的 tag 使用 unit 类型：`union Maybe<T> { T some; () none; }`。
 
 ## Trait 和 Extend
 
