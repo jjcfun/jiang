@@ -6,6 +6,7 @@ import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
 import list = "../../support/list.jiang";
 import set = "../../support/set.jiang";
+import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
 import copy_semantics = "../copy.jiang";
 import types = "../type.jiang";
@@ -15,10 +16,12 @@ import type_ops_mod = "./type_ops.jiang";
 public struct DeclCheck {
     check_state.CheckState& state;
     type_ops_mod.TypeOps& type_ops;
+    table.HashTable<qid.DefId, Int>! value_recursion_states;
 
     public init(check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
         self.state = state;
         self.type_ops = type_ops;
+        self.value_recursion_states = table.HashTable<qid.DefId, Int>();
     }
 
     public () check_declaration_signatures() {
@@ -50,6 +53,7 @@ public struct DeclCheck {
             self.check_declaration_signature_tree(members.get(index));
             index = index + 1;
         }
+        self.check_nominal_value_recursion(hir_def.def_id);
         // Copy conformance 需要读取成员 TypeId。先递归检查子声明签名，
         // 再检查 trait conformance，避免 CopyQuery 反向依赖 type check 计算。
         self.check_trait_conformance(hir_def);
@@ -271,6 +275,79 @@ public struct DeclCheck {
         return false;
     }
 
+    Bool is_value_recursive_nominal_kind(def.DefKind kind) {
+        if (kind == .struct_def) { return true; }
+        if (kind == .record_def) { return true; }
+        return kind == .union_def;
+    }
+
+    () check_nominal_value_recursion(qid.DefId def_id) {
+        def.DefKind kind = self.state.query.defs.get(def_id).kind;
+        if (!self.is_value_recursive_nominal_kind(kind)) {
+            return;
+        }
+        if (self.value_recursion_states.get(def_id) is some state) {
+            if (state == 1) {
+                self.type_ops.add_def_error(def_id, "recursive by-value type", "recursive_value_type");
+            }
+            return;
+        }
+        self.value_recursion_states.set(def_id, 1);
+        self.check_nominal_member_value_recursion(def_id, kind);
+        self.value_recursion_states.set(def_id, 2);
+    }
+
+    () check_nominal_member_value_recursion(qid.DefId def_id, def.DefKind owner_kind) {
+        guard self.state.hirs.def(def_id) is some hir_def else { return; }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            index = index + 1;
+            if (!self.member_participates_in_value_layout(owner_kind, member_def)) { continue; }
+            self.check_value_type_recursion(self.type_ops.type_for_def(member_def));
+        }
+    }
+
+    Bool member_participates_in_value_layout(def.DefKind owner_kind, qid.DefId member_def) {
+        def.DefKind member_kind = self.state.query.defs.get(member_def).kind;
+        if (owner_kind == .union_def) {
+            return member_kind == .union_variant_def;
+        }
+        return member_kind == .field_def;
+    }
+
+    () check_value_type_recursion(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.query.types.get(type_id);
+        if (info.data is .optional(optional)) {
+            self.check_value_type_recursion(optional.element);
+            return;
+        }
+        if (info.data is .error_union(error_union)) {
+            self.check_value_type_recursion(error_union.value);
+            self.check_value_type_recursion(error_union.error);
+            return;
+        }
+        if (info.data is .array_type(array_type)) {
+            self.check_value_type_recursion(array_type.element);
+            return;
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            self.check_tuple_value_recursion(tuple_type);
+            return;
+        }
+        if (info.data is .named(named)) {
+            self.check_nominal_value_recursion(named.def_id);
+        }
+    }
+
+    () check_tuple_value_recursion(types.TupleType tuple_type) {
+        Int! index = 0;
+        while (index < tuple_type.items.length) {
+            self.check_value_type_recursion(tuple_type.items[index]);
+            index = index + 1;
+        }
+    }
+
     () check_trait_conformance(hir.HirDef hir_def) {
         if (!self.is_nominal_def_kind(self.state.query.defs.get(hir_def.def_id).kind)) {
             return;
@@ -309,95 +386,17 @@ public struct DeclCheck {
             return;
         }
         guard self.state.hirs.def(impl_def) is some hir_def else { return; }
-        copy_semantics.CopyQuery query = copy_semantics.CopyQuery(self.state.ctx, self.state.results);
+        copy_semantics.CopyQuery query = copy_semantics.CopyQuery(self.state.ctx);
         Int! index = 0;
         while (index < hir_def.members.len()) {
             qid.DefId member_def = hir_def.members.get(index);
             index = index + 1;
             if (!query.copy_relevant_member(member_def)) { continue; }
             qid.TypeId member_type = self.type_ops.type_for_def(member_def);
-            list.ArrayList<qid.DefId>! visiting = list.ArrayList<qid.DefId>();
-            self.ensure_copy_dependency_member_types(member_type, visiting$.ref());
             if (!query.is_implicit_copy_type(member_type)) {
                 self.type_ops.add_def_error(member_def, "Copy member type must also be Copy", "copy_member_not_copy");
             }
         }
-    }
-
-    () ensure_copy_dependency_member_types(qid.TypeId type_id, list.ArrayList<qid.DefId>& visiting) {
-        types.TypeInfo info = self.state.query.types.get(type_id);
-        if (info.data is .optional(optional)) {
-            self.ensure_copy_dependency_member_types(optional.element, visiting);
-            return;
-        }
-        if (info.data is .error_union(error_union)) {
-            self.ensure_copy_dependency_member_types(error_union.value, visiting);
-            self.ensure_copy_dependency_member_types(error_union.error, visiting);
-            return;
-        }
-        if (info.data is .array_type(array_type)) {
-            self.ensure_copy_dependency_member_types(array_type.element, visiting);
-            return;
-        }
-        if (info.data is .tuple_type(tuple_type)) {
-            self.ensure_copy_tuple_member_types(tuple_type, visiting);
-            return;
-        }
-        guard info.data is .named(named) else { return; }
-        self.ensure_named_copy_member_types(named.def_id, visiting);
-    }
-
-    () ensure_copy_tuple_member_types(types.TupleType tuple_type, list.ArrayList<qid.DefId>& visiting) {
-        Int! index = 0;
-        while (index < tuple_type.items.length) {
-            self.ensure_copy_dependency_member_types(tuple_type.items[index], visiting);
-            index = index + 1;
-        }
-    }
-
-    () ensure_named_copy_member_types(qid.DefId def_id, list.ArrayList<qid.DefId>& visiting) {
-        if (self.copy_dependency_stack_has(visiting, def_id)) {
-            return;
-        }
-        def.DefKind kind = self.state.query.defs.get(def_id).kind;
-        if (!self.copy_nominal_kind(kind)) {
-            return;
-        }
-        guard self.state.hirs.def(def_id) is some hir_def else { return; }
-        Int depth = visiting.len();
-        visiting.add(def_id);
-        Int! index = 0;
-        while (index < hir_def.members.len()) {
-            qid.DefId member_def = hir_def.members.get(index);
-            index = index + 1;
-            if (!self.copy_relevant_member(member_def)) { continue; }
-            qid.TypeId member_type = self.type_ops.type_for_def(member_def);
-            self.ensure_copy_dependency_member_types(member_type, visiting);
-        }
-        visiting.truncate(depth);
-    }
-
-    Bool copy_nominal_kind(def.DefKind kind) {
-        if (kind == .struct_def) { return true; }
-        if (kind == .record_def) { return true; }
-        return kind == .union_def;
-    }
-
-    Bool copy_relevant_member(qid.DefId member_def) {
-        def.DefKind kind = self.state.query.defs.get(member_def).kind;
-        if (kind == .field_def) { return true; }
-        return kind == .union_variant_def;
-    }
-
-    Bool copy_dependency_stack_has(list.ArrayList<qid.DefId>& stack, qid.DefId def_id) {
-        Int! index = 0;
-        while (index < stack.len()) {
-            if (stack.get(index) == def_id) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
     }
 
     Bool type_has_custom_deinit(qid.DefId impl_def) {
