@@ -551,11 +551,33 @@ public struct BodyCheck {
         if (self.state.query.defs.get(member_def).kind == .enum_case_def) {
             return self.enum_case_value_type(member_def);
         }
-        qid.TypeId member_type = self.type_ops.type_for_def(member_def);
+        qid.TypeId member_type = self.member_type_for_base(base_type, member_def);
         if (self.state.query.types.get(base_type).is_mutable && !self.type_ops.is_invalid_type(member_type)) {
             return self.state.query.types.mutable_type(member_type, token.Span());
         }
         return member_type;
+    }
+
+    qid.TypeId member_type_for_base(qid.TypeId base_type, qid.DefId member_def) {
+        qid.TypeId member_type = self.type_ops.type_for_def(member_def);
+        types.TypeInfo base_info = self.state.query.types.get(base_type);
+        guard base_info.data is .named(named) else {
+            return member_type;
+        }
+        if (named.args.length == 0) {
+            return member_type;
+        }
+        guard self.state.query.defs.get(member_def).owner_def is some owner_def else {
+            return member_type;
+        }
+        if (owner_def.to_index() != named.def_id.to_index()) {
+            return member_type;
+        }
+
+        // `Box<T>.set(T)` 通过 `Box<Int>` 访问时，member signature 里的
+        // owner generic param 必须先代入 receiver 的 concrete type args。
+        list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
+        return self.type_ops.substitute_generic_type(member_type, named.def_id, type_args);
     }
 
     qid.TypeId? enum_value_member_type(qid.TypeId base_type, qid.SymbolId member_symbol) {
@@ -706,7 +728,7 @@ public struct BodyCheck {
         types.TypeInfo info = self.state.query.types.get(base_type);
         guard info.data is .handle_type(handle) else { return null; }
         if (handle.kind == .slice) {
-            return self.state.query.types.uint_type();
+            return self.state.query.types.int_type();
         }
         return null;
     }
@@ -1324,7 +1346,6 @@ public struct BodyCheck {
         // `Type(...)` 不是普通 function call：callee 是 type-ref。
         // 这里先解析出 owner type，再从隐藏 init_def 集合中选择构造器。
         qid.TypeId result_type = self.type_constructor_result_type(call);
-        self.check_call_args(call);
         if (self.type_constructor_init_def(result_type, call) is some init_def) {
             self.state.results.select_member(call.callee, init_def);
             self.record_constructor_instance(result_type, call, init_def);
@@ -1337,6 +1358,7 @@ public struct BodyCheck {
         if (self.default_nominal_constructor_call(node_id, result_type, call)) {
             return result_type;
         }
+        self.check_call_args(call);
         self.type_ops.add_node_error(
             node_id,
             "no matching init constructor for type call",
@@ -1379,7 +1401,7 @@ public struct BodyCheck {
             );
             return true;
         }
-        qid.TypeId arg_type = self.state.results.node_type(call.args[0])$.some();
+        qid.TypeId arg_type = self.check_node(call.args[0]);
         if (!self.type_ops.is_numeric_type(arg_type)) {
             self.type_ops.add_node_error(
                 call.args[0],
@@ -1462,9 +1484,9 @@ public struct BodyCheck {
         list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
         Int! index = 0;
         while (index < call.args.length) {
-            qid.TypeId arg_type = self.state.results.node_type(call.args[index])$.some();
             qid.TypeId param_type = self.type_ops.check_type_ref(signature.params[index]);
             qid.TypeId expected = self.type_ops.substitute_generic_type(param_type, named.def_id, type_args);
+            qid.TypeId arg_type = self.check_node_expected(call.args[index], expected);
             if (!self.type_ops.value_assignable_to_expected(expected, call.args[index], arg_type)) {
                 self.type_ops.add_node_error(
                     call.args[index],
@@ -1705,7 +1727,7 @@ public struct BodyCheck {
         }
         types.TypeInfo type_info = self.state.query.types.get(type_id);
         guard type_info.data is .handle_type(handle) else { return null; }
-        if (handle.kind == .reference || handle.kind == .raw_pointer) {
+        if (handle.kind == .reference || handle.kind == .raw_pointer || handle.kind == .owner_pointer) {
             return handle.element;
         }
         return null;
@@ -1747,8 +1769,9 @@ public struct BodyCheck {
         list.ArrayList<qid.TypeId> type_args,
         qid.TypeId param_type
     ) {
-        guard call.target is some target else { return param_type; }
-        return self.type_ops.substitute_generic_type(param_type, target.def_id, type_args);
+        guard self.call_target_def(call) is some target_def else { return param_type; }
+        qid.TypeId substituted = self.type_ops.substitute_generic_type(param_type, target_def, type_args);
+        return self.substitute_call_self_type(call, target_def, substituted);
     }
 
     qid.TypeId substituted_call_result_type(
@@ -1756,8 +1779,39 @@ public struct BodyCheck {
         list.ArrayList<qid.TypeId> type_args,
         qid.TypeId result_type
     ) {
-        guard call.target is some target else { return result_type; }
-        return self.type_ops.substitute_generic_type(result_type, target.def_id, type_args);
+        guard self.call_target_def(call) is some target_def else { return result_type; }
+        qid.TypeId substituted = self.type_ops.substitute_generic_type(result_type, target_def, type_args);
+        return self.substitute_call_self_type(call, target_def, substituted);
+    }
+
+    qid.DefId? call_target_def(hir.HirCall call) {
+        if (call.target is some target) {
+            return target.def_id;
+        }
+        return self.state.results.member_selection(call.callee);
+    }
+
+    qid.TypeId substitute_call_self_type(hir.HirCall call, qid.DefId target_def, qid.TypeId type_id) {
+        guard self.trait_owner_for_def(target_def) is some trait_def else { return type_id; }
+        guard self.static_member_receiver_type(call.callee) is some self_type else { return type_id; }
+        return self.type_ops.substitute_self_type(type_id, trait_def, self_type);
+    }
+
+    qid.DefId? trait_owner_for_def(qid.DefId def_id) {
+        guard self.state.query.defs.get(def_id).owner_def is some owner_def else { return null; }
+        if (self.state.query.defs.get(owner_def).kind == .trait_def) {
+            return owner_def;
+        }
+        return null;
+    }
+
+    qid.TypeId? static_member_receiver_type(hir.HirId callee) {
+        hir.HirNode node = self.state.hirs.node(callee);
+        guard node.data is .member_access(member_access) else { return null; }
+        if (!self.is_type_ref_node(member_access.base)) {
+            return null;
+        }
+        return self.type_ops.check_type_ref(member_access.base);
     }
 
     qid.TypeId check_unary(hir.HirId node_id, hir.HirUnary unary) {

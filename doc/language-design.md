@@ -314,7 +314,7 @@ _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 
 数组长度是类型的一部分；slice 长度是运行时值。
 
-## 所有权、Copy 和析构
+## 所有权、implicit copy 和析构
 
 目标规则：Jiang 不引入完整 Rust 式 borrow checker，但必须把资源释放、自动析构、隐式复制和显式 move 的边界固定下来。
 
@@ -353,10 +353,15 @@ struct Node {
 - 自定义 `deinit` 发生在自动 `T^` 字段析构之前。
 - 已经被显式 move 的局部变量不再参与析构。
 
-Copy 规则：
+implicit copy / Movable 规则：
 
-- 没有指针字段、没有资源语义的普通值类型可以隐式 copy。
-- 指针和引用视图类型以及直接或间接包含这类字段的 struct 默认禁止隐式 copy。这里包括 `T^`、`T&`、`T&!`、`T[*]`、`T*` 和 `T[]`。
+- 普通 `struct`、`record`、`union` 默认可以隐式 copy。
+- `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
+- 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
+- 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
+- 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 - 禁止隐式 copy 的类型如果确实需要复制，必须由类型作者手动实现 copy/clone 语义。实现可以选择深拷贝、共享引用计数或直接禁止复制。
 - 存在自定义 copy/clone 不会恢复隐式 copy；调用方必须显式调用该方法。
 
@@ -368,13 +373,13 @@ struct Point {
 
 Point p2 = p1; // 允许：普通值类型
 
-struct Buffer {
-    UInt8[*] data;
+struct Buffer: Movable {
+    UInt8^ data;
     Int length;
 }
 
-Buffer b2 = b1;        // 编译错误：包含指针字段，禁止隐式 copy
-Buffer b3 = b1.copy(); // 允许：如果 Buffer 显式实现 copy
+Buffer b2 = b1;        // 编译错误：包含 owning pointer 字段，禁止隐式 copy
+Buffer b3 = b1$.move(); // 允许：显式转移所有权
 ```
 
 显式 move：

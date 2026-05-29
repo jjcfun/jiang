@@ -530,7 +530,7 @@ Int^ a = new Int(100);
 a$.free();
 ```
 
-### 所有权、Copy 和析构
+### 所有权、implicit copy 和析构
 
 Jiang 的目标规则是不引入完整 Rust 式 borrow checker，但明确资源释放、自动析构、隐式 copy 和显式 move 的边界。
 
@@ -541,7 +541,11 @@ Jiang 的目标规则是不引入完整 Rust 式 borrow checker，但明确资�
 - struct 的 `T^` 字段会自动析构，无论该 struct 是否实现了自定义 `deinit`。
 - `T&`、`T&!`、`T[*]`、`T*`、`T[]` 字段不会被编译器自动释放。
 - 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的 `T^` 字段析构。
-- 指针和引用视图类型以及直接或间接包含这类字段的 struct 默认禁止隐式 copy，除非类型显式定义 copy 语义。
+- 普通 `struct`、`record`、`union` 默认可以隐式 copy。
+- `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
+- 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 
 显式转移所有权使用 `move()`：
 
