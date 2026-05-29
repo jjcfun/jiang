@@ -322,7 +322,16 @@ struct FunctionBorrowChecker: Movable {
         }
         if (statement.kind is .set_discriminant_stmt(discriminant_stmt)) {
             self.clear_place(discriminant_stmt.destination);
+            return;
         }
+        if (statement.kind is .storage_dead_stmt(storage_dead)) {
+            self.clear_storage_dead_local(storage_dead.local_id);
+        }
+    }
+
+    () clear_storage_dead_local(mir.MirLocalId local_id) {
+        move_path.MovePathId path = self.paths.root_for_local(local_id);
+        self.clear_path_and_descendants(path);
     }
 
     () check_assignment_escape(mir.MirPlace destination, mir.MirRvalue value) {
@@ -468,6 +477,9 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () record_assignment_loan(mir.MirPlace destination, mir.MirRvalue value) {
+        if (self.place_is_compiler_temp(destination)) {
+            return;
+        }
         if (value is .borrow_value(borrow_value)) {
             self.add_loan(.reference_view, borrow_value.place, destination);
             return;
@@ -475,6 +487,18 @@ struct FunctionBorrowChecker: Movable {
         if (value is .address_of_value(address_of_value)) {
             self.add_loan(.raw_pointer_view, address_of_value.place, destination);
         }
+    }
+
+    Bool place_is_compiler_temp(mir.MirPlace place) {
+        Int index = place.local_id.to_index();
+        if (!self.valid_local_index(index)) {
+            return false;
+        }
+        return self.body.locals[index].kind == .compiler_temp;
+    }
+
+    Bool valid_local_index(Int index) {
+        return index >= 0 && index < self.body.locals.length;
     }
 
     () add_loan(loan.LoanKind kind, mir.MirPlace source, mir.MirPlace target) {
@@ -514,7 +538,6 @@ struct FunctionBorrowChecker: Movable {
         }
         if (terminator.kind is .throw_term(throw_term)) {
             self.check_operand(throw_term.error_value);
-            self.check_operand_escape(throw_term.error_value);
         }
     }
 
@@ -551,13 +574,25 @@ struct FunctionBorrowChecker: Movable {
 
     Bool return_lifetime_allows_loan(loan.LoanId loan_id) {
         loan.Loan current = self.results.loans.get(loan_id);
-        guard self.source_root_param_symbol(current.source) is some source_symbol else {
-            return false;
-        }
         guard self.ctx.query.hirs.def(self.function_def) is some hir_def else {
             return false;
         }
+        guard self.source_root_param_symbol(current.source) is some source_symbol else {
+            return self.hir_has_explicit_return_lifetime(hir_def);
+        }
         return self.hir_allows_return_lifetime(hir_def, source_symbol);
+    }
+
+    Bool hir_has_explicit_return_lifetime(hir.HirDef& hir_def) {
+        Int! index = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            if (constraint.shorter.kind == .return_lifetime) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     qid.SymbolId? source_root_param_symbol(move_path.MovePathId source) {
@@ -568,9 +603,18 @@ struct FunctionBorrowChecker: Movable {
         }
         mir.MirLocalDecl local = self.body.locals[local_index];
         if (local.kind != .param) {
-            return null;
+            return self.source_root_param_symbol_from_local_loan(path.local_id);
         }
         return local.name;
+    }
+
+    qid.SymbolId? source_root_param_symbol_from_local_loan(mir.MirLocalId local_id) {
+        move_path.MovePathId root = self.paths.root_for_local(local_id);
+        guard self.dataflow.active_loans.get(root) is some loan_id else {
+            return null;
+        }
+        loan.Loan current = self.results.loans.get(loan_id$.get());
+        return self.source_root_param_symbol(current.source);
     }
 
     Bool hir_allows_return_lifetime(hir.HirDef& hir_def, qid.SymbolId source_symbol) {
@@ -609,31 +653,80 @@ struct FunctionBorrowChecker: Movable {
         Int! index = 0;
         while (index < call_term.args.length) {
             self.check_operand(call_term.args[index]);
-            self.check_operand_escape(call_term.args[index]);
             index = index + 1;
         }
         self.clear_place(call_term.destination);
+        self.record_call_return_loan(call_term);
     }
 
-    () check_operand_escape(mir.MirOperand operand) {
-        if (operand is .copy_operand(copy_operand)) {
-            self.check_place_escape(copy_operand.place);
+    () record_call_return_loan(mir.MirCallTerminator call_term) {
+        guard self.callee_function_def(call_term.callee) is some callee_def else { return; }
+        guard self.ctx.query.hirs.def(callee_def) is some hir_def else { return; }
+        Int! index = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            self.record_call_return_loan_for_constraint(call_term, hir_def, constraint);
+            index = index + 1;
+        }
+    }
+
+    qid.DefId? callee_function_def(mir.MirOperand callee) {
+        guard callee is .const_operand(constant) else { return null; }
+        guard constant.value is .function_value(function_value) else { return null; }
+        return function_value.function_def;
+    }
+
+    () record_call_return_loan_for_constraint(
+        mir.MirCallTerminator call_term,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeConstraint constraint
+    ) {
+        if (constraint.shorter.kind != .return_lifetime) {
             return;
         }
+        guard self.constraint_source_arg_index(hir_def, constraint) is some arg_index else {
+            return;
+        }
+        if (arg_index < 0 || arg_index >= call_term.args.length) {
+            return;
+        }
+        guard self.operand_place(call_term.args[arg_index]) is some source else {
+            return;
+        }
+        self.add_loan(.reference_view, source, call_term.destination);
+    }
+
+    Int? constraint_source_arg_index(hir.HirDef& hir_def, hir.HirLifetimeConstraint constraint) {
+        guard hir_def.decl.function_signature is some signature else { return null; }
+        guard self.constraint_source_symbol(constraint) is some source_symbol else { return null; }
+        Int! index = 0;
+        while (index < signature.param_symbols.length) {
+            if (signature.param_symbols[index] == source_symbol) {
+                return index;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.SymbolId? constraint_source_symbol(hir.HirLifetimeConstraint constraint) {
+        if (constraint.longer.kind == .self_lifetime) {
+            return self.ctx.query.symbols.intern("self");
+        }
+        if (constraint.longer.kind != .named_lifetime) {
+            return null;
+        }
+        return constraint.longer.symbol;
+    }
+
+    mir.MirPlace? operand_place(mir.MirOperand operand) {
+        if (operand is .copy_operand(copy_operand)) {
+            return copy_operand.place;
+        }
         if (operand is .move_operand(move_operand)) {
-            self.check_place_escape(move_operand.place);
+            return move_operand.place;
         }
-    }
-
-    () check_place_escape(mir.MirPlace place) {
-        self.check_path_escape(self.paths.path_for_place(place));
-    }
-
-    () check_path_escape(move_path.MovePathId path) {
-        if (self.active_loan_for_path(path) is some _) {
-            self.results.mark_error();
-            self.add_borrow_escape_diagnostic();
-        }
+        return null;
     }
 
     () check_rvalue(mir.MirRvalue value) {
@@ -717,7 +810,7 @@ struct FunctionBorrowChecker: Movable {
 
     () check_operand(mir.MirOperand operand) {
         if (operand is .copy_operand(copy_operand)) {
-            self.check_copy_or_move(copy_operand.place);
+            self.check_place_use(copy_operand.place);
             return;
         }
         if (operand is .move_operand(move_operand)) {
@@ -733,14 +826,6 @@ struct FunctionBorrowChecker: Movable {
         if (operand is .move_operand(move_operand)) {
             self.check_place_use(move_operand.place);
         }
-    }
-
-    () check_copy_or_move(mir.MirPlace place) {
-        if (self.is_implicit_copy_place(place)) {
-            self.check_place_use(place);
-            return;
-        }
-        self.consume_place(place);
     }
 
     () consume_place(mir.MirPlace place) {
@@ -929,12 +1014,25 @@ struct FunctionBorrowChecker: Movable {
         Int! index = 0;
         while (index < self.results.loans.len()) {
             loan.Loan current = self.results.loans.get(loan.LoanId(index));
-            if (self.dataflow.active_loans.has(current.target) && self.paths_overlap(current.source, path)) {
+            // MovePathId 只在当前 MirFunction 的 path tree 内有效。results.loans
+            // 是 package 级结果表，检查当前函数 dataflow 时必须跳过其他函数的 loan。
+            if (self.loan_belongs_to_current_function(current) && self.active_loan_overlaps_path(current, path)) {
                 return true;
             }
             index = index + 1;
         }
         return false;
+    }
+
+    Bool loan_belongs_to_current_function(loan.Loan current) {
+        return current.function_id.to_index() == self.function_id.to_index();
+    }
+
+    Bool active_loan_overlaps_path(loan.Loan current, move_path.MovePathId path) {
+        if (!self.dataflow.active_loans.has(current.target)) {
+            return false;
+        }
+        return self.paths_overlap(current.source, path);
     }
 
     Bool paths_overlap(move_path.MovePathId lhs, move_path.MovePathId rhs) {
@@ -1076,12 +1174,35 @@ struct FunctionBorrowChecker: Movable {
     }
 
     qid.TypeId constant_indexed_type(qid.TypeId base_type, Int offset) {
+        if (self.report_generic_param_layout_base(base_type)) {
+            return self.ctx.query.types.invalid_type();
+        }
         layout.LayoutId layout_id = layout_compute.layout_of_type(self.ctx, base_type);
         layout.TypeLayout type_layout = self.ctx.query.layouts.layout(layout_id);
         if (offset >= 0 && offset < type_layout.fields.length) {
             return type_layout.fields[offset].field_type;
         }
         return self.indexed_type(base_type);
+    }
+
+    Bool report_generic_param_layout_base(qid.TypeId base_type) {
+        types.TypeInfo info = self.ctx.query.types.get(base_type);
+        guard info.data is .named(named) else { return false; }
+        if (self.ctx.query.defs.get(named.def_id).kind != .generic_param_def) {
+            return false;
+        }
+        self.results.mark_error();
+        qid.SymbolId symbol = self.ctx.query.defs.get(named.def_id).name.symbol;
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("borrow_generic_param_layout_base"),
+                self.current_source_range(),
+                self.ctx.query.symbols.text(symbol)
+            )
+        );
+        return true;
     }
 
     Bool is_implicit_copy_type(qid.TypeId type_id) {

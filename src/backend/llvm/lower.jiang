@@ -5,9 +5,11 @@
 // 成必要的 LLVM calls。
 
 import context = "../../context.jiang";
+import diagnostic = "../../diagnostic/diagnostic.jiang";
 import mir = "../../mir/mir.jiang";
 import qid = "../../query/id.jiang";
 import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
 import symbol = "../symbol.jiang";
 import ffi = "./ffi.jiang";
 import llvm_place = "./place.jiang";
@@ -31,17 +33,25 @@ public Bool emit_llvm_ir_file(context.CompilerContext& ctx, mir.MirStore& store,
     return lowerer.emit_llvm_ir_file(store, output_path);
 }
 
-struct LlvmLowerer {
+struct LlvmLowerer: Movable {
     context.CompilerContext& ctx;
     ffi.Context llvm_context;
     ffi.Module module;
     ffi.Builder builder;
+    table.HashTable<symbol.BackendSymbolKey, Int> declared_function_indexes;
+    list.ArrayList<ffi.Value> declared_function_values;
+    table.HashTable<qid.SymbolId, Int> external_function_indexes;
+    list.ArrayList<ffi.Value> external_function_values;
 
     init(context.CompilerContext& ctx) {
         self.ctx = ctx;
         self.llvm_context = ffi.Context();
         self.module = ffi.Module(self.llvm_context$.ref(), "jiang_module");
         self.builder = ffi.Builder(self.llvm_context$.ref());
+        self.declared_function_indexes = table.HashTable<symbol.BackendSymbolKey, Int>();
+        self.declared_function_values = list.ArrayList<ffi.Value>();
+        self.external_function_indexes = table.HashTable<qid.SymbolId, Int>();
+        self.external_function_values = list.ArrayList<ffi.Value>();
     }
 
     Bool lower_module(mir.MirStore& store) {
@@ -63,6 +73,11 @@ struct LlvmLowerer {
         Bool! ok = self.lower_store(store);
         if (ok) {
             ok = ffi.module_emit_llvm_ir(self.module$.ref(), output_path);
+            if (!ok) {
+                self.add_codegen_error("LLVM failed to write IR file", "llvm_write_ir_failed");
+            }
+        } else {
+            self.add_codegen_error("LLVM lowering failed before writing IR", "llvm_lowering_failed");
         }
         self.dispose();
         return ok;
@@ -76,11 +91,30 @@ struct LlvmLowerer {
         while (ok && index < store.functions.len()) {
             ffi.Value llvm_function = self.declare_function(store.functions.get(index));
             ok = ffi.value_valid(llvm_function);
+            if (!ok) {
+                self.add_function_codegen_error(
+                    store.functions.get(index),
+                    "failed to declare LLVM function",
+                    "llvm_function_declare_failed"
+                );
+            }
             index = index + 1;
         }
         index = 0;
         while (ok && index < store.functions.len()) {
-            ok = self.lower_function(store.functions.get(index));
+            mir.MirFunction function = store.functions.get(index);
+            if (function.is_external) {
+                index = index + 1;
+                continue;
+            }
+            ok = self.lower_function(function);
+            if (!ok) {
+                self.add_function_codegen_error(
+                    function,
+                    "failed to lower LLVM function body",
+                    "llvm_function_body_lower_failed"
+                );
+            }
             index = index + 1;
         }
         return ok;
@@ -99,15 +133,33 @@ struct LlvmLowerer {
         mir.MirLocalDecl return_local = body.locals[return_index];
         ffi.Type return_type = llvm_type.lower_type(state$.ref(), return_local.type_id);
         if (!ffi.type_valid(return_type)) {
+            self.add_function_codegen_error(
+                function,
+                "failed to lower LLVM function return type",
+                "llvm_return_type_lower_failed"
+            );
             return ffi.Value();
         }
         ffi.Type function_type = self.lower_function_type(body, return_type);
         if (!ffi.type_valid(function_type)) {
+            self.add_function_codegen_error(
+                function,
+                "failed to lower LLVM function parameter type",
+                "llvm_param_type_lower_failed"
+            );
             return ffi.Value();
         }
         UInt8[] name = symbol.function_symbol_name(self.ctx, function);
         UInt8[*] raw_name = name$.as(UInt8[*]);
-        return ffi.module_add_function(self.module$.ref(), raw_name, function_type);
+        ffi.Value llvm_function = ffi.module_add_function(self.module$.ref(), raw_name, function_type);
+        if (ffi.value_valid(llvm_function)) {
+            self.declared_function_indexes.set(
+                symbol.function_symbol_key(function),
+                self.declared_function_values.len()
+            );
+            self.declared_function_values.add(llvm_function);
+        }
+        return llvm_function;
     }
 
     Bool lower_function(
@@ -121,9 +173,15 @@ struct LlvmLowerer {
     }
 
     ffi.Value function_value(mir.MirFunction function) {
-        UInt8[] name = symbol.function_symbol_name(self.ctx, function);
-        UInt8[*] raw_name = name$.as(UInt8[*]);
-        return ffi.module_get_function(self.module$.ref(), raw_name);
+        if (
+            table.hash_table_get_value<symbol.BackendSymbolKey, Int>(
+                self.declared_function_indexes$.ref(),
+                symbol.function_symbol_key(function)
+            ) is some index
+        ) {
+            return self.declared_function_values.get(index);
+        }
+        return ffi.Value();
     }
 
     ffi.Type lower_function_type(mir.MirBody body, ffi.Type return_type) {
@@ -133,6 +191,10 @@ struct LlvmLowerer {
         while (index < body.locals.length) {
             mir.MirLocalDecl local = body.locals[index];
             if (local.kind == .param) {
+                if (!llvm_type.type_has_abi_value(state$.ref(), local.type_id)) {
+                    index = index + 1;
+                    continue;
+                }
                 ffi.Type param_type = llvm_type.lower_type(state$.ref(), local.type_id);
                 if (!ffi.type_valid(param_type)) {
                     return ffi.Type();
@@ -153,14 +215,17 @@ struct LlvmLowerer {
         }
         list.ArrayList<ffi.BasicBlock>! blocks = self.create_basic_blocks(body, llvm_function);
         if (blocks.len() != body.blocks.length) {
+            self.add_codegen_error("failed to create LLVM basic blocks", "llvm_block_create_failed");
             return false;
         }
         ffi.builder_position_at_end(self.builder$.ref(), blocks.get(body.entry.to_index()));
         list.ArrayList<ffi.Value>! local_slots = self.allocate_local_slots(body);
         if (local_slots.len() != body.locals.length) {
+            self.add_codegen_error("failed to allocate LLVM local slots", "llvm_local_slot_alloc_failed");
             return false;
         }
         if (!self.store_function_params(body, llvm_function, local_slots$.ref())) {
+            self.add_codegen_error("failed to store LLVM function parameters", "llvm_param_store_failed");
             return false;
         }
         return self.lower_blocks(body, blocks$.ref(), local_slots$.ref());
@@ -185,11 +250,16 @@ struct LlvmLowerer {
         ffi.Value llvm_function,
         list.ArrayList<ffi.Value>& local_slots
     ) {
+        llvm_state.LowerState! state = self.lower_state();
         Int! param_index = 0;
         Int! local_index = 0;
         while (local_index < body.locals.length) {
             mir.MirLocalDecl local = body.locals[local_index];
             if (local.kind == .param) {
+                if (!llvm_type.type_has_abi_value(state$.ref(), local.type_id)) {
+                    local_index = local_index + 1;
+                    continue;
+                }
                 ffi.Value param = ffi.function_param(llvm_function, param_index);
                 if (!self.store_local_value(local, local_slots, param)) {
                     return false;
@@ -232,7 +302,7 @@ struct LlvmLowerer {
 
     ffi.Value allocate_local_slot(mir.MirLocalDecl local) {
         llvm_state.LowerState! state = self.lower_state();
-        if (llvm_type.type_is_unit_or_never(state$.ref(), local.type_id)) {
+        if (!llvm_type.type_has_abi_value(state$.ref(), local.type_id)) {
             return ffi.const_null(ffi.context_pointer_type(self.llvm_context$.ref()));
         }
         ffi.Type type = llvm_type.lower_type(state$.ref(), local.type_id);
@@ -285,7 +355,11 @@ struct LlvmLowerer {
         list.ArrayList<ffi.Value>& local_slots
     ) {
         if (statement.kind is .assign_stmt(assign_stmt)) {
-            return self.lower_assign(body, assign_stmt, local_slots);
+            if (!self.lower_assign(body, assign_stmt, local_slots)) {
+                self.add_codegen_error("failed to lower LLVM assignment", "llvm_assign_lower_failed");
+                return false;
+            }
+            return true;
         }
         if (statement.kind is .storage_live_stmt(_)) {
             return true;
@@ -293,6 +367,16 @@ struct LlvmLowerer {
         if (statement.kind is .storage_dead_stmt(_)) {
             return true;
         }
+        if (statement.kind is .set_discriminant_stmt(set_discriminant)) {
+            llvm_state.LowerState! state = self.lower_state();
+            return llvm_value.lower_set_discriminant(
+                state$.ref(),
+                body,
+                set_discriminant,
+                local_slots
+            );
+        }
+        self.add_codegen_error("unsupported MIR statement in LLVM lowering", "llvm_statement_unsupported");
         return false;
     }
 
@@ -310,10 +394,11 @@ struct LlvmLowerer {
             local_slots,
             result_type
         );
-        if (llvm_type.type_is_unit_or_never(state$.ref(), result_type)) {
+        if (!llvm_type.type_has_abi_value(state$.ref(), result_type)) {
             return true;
         }
         if (!ffi.value_valid(value)) {
+            self.add_assign_rvalue_error(assign_stmt.value);
             return false;
         }
         ffi.Value pointer = llvm_place.lower_place_pointer(
@@ -323,9 +408,74 @@ struct LlvmLowerer {
             local_slots
         );
         if (!ffi.value_valid(pointer)) {
+            self.add_codegen_error("failed to lower LLVM assignment destination", "llvm_assign_place_lower_failed");
             return false;
         }
         return ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), value, pointer));
+    }
+
+    () add_assign_rvalue_error(mir.MirRvalue value) {
+        if (value is .use_value(use_value)) {
+            self.add_use_rvalue_error(use_value.value);
+            return;
+        }
+        if (value is .binary_value(_)) {
+            self.add_codegen_error("failed to lower LLVM binary rvalue", "llvm_binary_rvalue_lower_failed");
+            return;
+        }
+        if (value is .cast_value(_)) {
+            self.add_codegen_error("failed to lower LLVM cast rvalue", "llvm_cast_rvalue_lower_failed");
+            return;
+        }
+        if (value is .aggregate_value(_)) {
+            self.add_codegen_error("failed to lower LLVM aggregate rvalue", "llvm_aggregate_rvalue_lower_failed");
+            return;
+        }
+        if (value is .optional_value(_)) {
+            self.add_codegen_error("failed to lower LLVM optional rvalue", "llvm_optional_rvalue_lower_failed");
+            return;
+        }
+        if (value is .error_union_value(_)) {
+            self.add_codegen_error("failed to lower LLVM error union rvalue", "llvm_error_union_rvalue_lower_failed");
+            return;
+        }
+        self.add_codegen_error("failed to lower LLVM assignment rvalue", "llvm_assign_rvalue_lower_failed");
+    }
+
+    () add_use_rvalue_error(mir.MirOperand operand) {
+        if (operand is .const_operand(const_value)) {
+            self.add_const_operand_error(const_value.value);
+            return;
+        }
+        if (operand is .copy_operand(_)) {
+            self.add_codegen_error("failed to lower LLVM copy operand", "llvm_copy_operand_lower_failed");
+            return;
+        }
+        if (operand is .move_operand(_)) {
+            self.add_codegen_error("failed to lower LLVM move operand", "llvm_move_operand_lower_failed");
+            return;
+        }
+        self.add_codegen_error("failed to lower LLVM use rvalue", "llvm_use_rvalue_lower_failed");
+    }
+
+    () add_const_operand_error(mir.MirConstValue value) {
+        if (mir.string_const_value(value) is some _) {
+            self.add_codegen_error("failed to lower LLVM string const", "llvm_string_const_lower_failed");
+            return;
+        }
+        if (mir.function_const_value(value) is some _) {
+            self.add_codegen_error("failed to lower LLVM function const", "llvm_function_const_lower_failed");
+            return;
+        }
+        if (mir.int_const_value(value) is some _) {
+            self.add_codegen_error("failed to lower LLVM int const", "llvm_int_const_lower_failed");
+            return;
+        }
+        if (mir.is_null_const_value(value)) {
+            self.add_codegen_error("failed to lower LLVM null const", "llvm_null_const_lower_failed");
+            return;
+        }
+        self.add_codegen_error("failed to lower LLVM const operand", "llvm_const_operand_lower_failed");
     }
 
     Bool lower_terminator(
@@ -343,7 +493,45 @@ struct LlvmLowerer {
             self.ctx,
             self.llvm_context$.ref(),
             self.module$.ref(),
-            self.builder$.ref()
+            self.builder$.ref(),
+            self.declared_function_indexes$.ref(),
+            self.declared_function_values$.ref(),
+            self.external_function_indexes$.ref(),
+            self.external_function_values$.ref()
         );
+    }
+
+    () add_codegen_error(UInt8[] message, UInt8[] code) {
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .codegen,
+                diagnostic.DiagnosticCode(code),
+                diagnostic.SourceRange(),
+                message
+            )
+        );
+    }
+
+    () add_function_codegen_error(mir.MirFunction function, UInt8[] message, UInt8[] code) {
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .codegen,
+                diagnostic.DiagnosticCode(code),
+                self.def_source_range(function.def_id),
+                message
+            )
+        );
+    }
+
+    diagnostic.SourceRange def_source_range(qid.DefId def_id) {
+        guard self.ctx.query.source_map.def_span(def_id) is some loc else {
+            return diagnostic.SourceRange();
+        }
+        guard loc.source_id is some source_id else {
+            return diagnostic.SourceRange();
+        }
+        return diagnostic.SourceRange(source_id, loc.span);
     }
 }

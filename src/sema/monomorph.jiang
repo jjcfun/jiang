@@ -72,7 +72,7 @@ public enum InstanceKind {
 
 public InstanceKind instance_kind(query_api.QuerySystem& query, InstanceKey instance) {
     def.DefKind kind = query.defs.get(instance.def_id).kind;
-    if (kind == .function_def || kind == .init_def) {
+    if (kind == .function_def || kind == .init_def || kind == .deinit_def) {
         return .function_body;
     }
     if (is_nominal_type_kind(kind)) {
@@ -146,9 +146,11 @@ public struct SubstitutionMap: Movable {
     // 泛型参数 DefId 到 concrete TypeId 的映射。HIR/type table 本身不改写，
     // 所有 concrete type 都在 MIR lowering 时通过这张表按需替换。
     table.HashTable<qid.DefId, qid.TypeId> param_types;
+    table.HashTable<Int, qid.TypeId> type_cache;
 
     public init() {
         self.param_types = table.HashTable<qid.DefId, qid.TypeId>();
+        self.type_cache = table.HashTable<Int, qid.TypeId>();
     }
 
     public Int len() {
@@ -165,6 +167,14 @@ public struct SubstitutionMap: Movable {
 
     public () set(qid.DefId generic_param, qid.TypeId concrete_type) {
         self.param_types.set(generic_param, concrete_type);
+    }
+
+    public qid.TypeId? cached_type(qid.TypeId template_type) {
+        return table.hash_table_get_value<Int, qid.TypeId>(self.type_cache$.ref(), template_type.to_index());
+    }
+
+    public () cache_type(qid.TypeId template_type, qid.TypeId concrete_type) {
+        self.type_cache.set(template_type.to_index(), concrete_type);
     }
 }
 
@@ -274,6 +284,7 @@ struct InstanceCollector: Movable {
     MonomorphInstances& instances;
     sema_result.TypeCheckResults& results;
     table.HashTable<qid.DefId, Bool> visited_defs;
+    table.HashTable<Int, Int> visiting_types;
 
     // instance_states: 1 = visiting, 2 = done。这里的 visiting 不是错误：
     // 递归函数会在收集 body 时再次引用同一个 concrete instance。遇到
@@ -284,6 +295,7 @@ struct InstanceCollector: Movable {
         self.instances = instances;
         self.results = results;
         self.visited_defs = table.HashTable<qid.DefId, Bool>();
+        self.visiting_types = table.HashTable<Int, Int>();
         self.instance_states = table.HashTable<InstanceKey, Int>();
     }
 
@@ -325,6 +337,7 @@ struct InstanceCollector: Movable {
     ) {
         // 声明上的类型也会触发单态化，例如全局 `Box<Int> boxed;`
         // 没有 body，但仍然需要记录 `Box<Int>` 的 concrete nominal instance。
+        self.collect_def_type(query, hirs, hir_def.def_id, substitutions);
         if (hir_def.decl.type_ref is some type_ref) {
             self.collect_node(query, hirs, type_ref, substitutions);
         }
@@ -404,6 +417,7 @@ struct InstanceCollector: Movable {
         }
         if (instance_kind(query, instance) == .nominal_type) {
             self.collect_nominal_member_types(query, hirs, hir_def, substitutions$.ref());
+            self.collect_nominal_custom_deinit(query, hirs, hir_def, instance.type_args);
         }
         self.instance_states.set(instance, done);
     }
@@ -426,12 +440,29 @@ struct InstanceCollector: Movable {
         }
     }
 
+    () collect_nominal_custom_deinit(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        hir.HirDef& hir_def,
+        qid.TypeId[] type_args
+    ) {
+        guard hir_def.custom_deinit_def is some deinit_def else { return; }
+        if (!self.instances.add_instance(deinit_def, type_args)) {
+            return;
+        }
+        guard self.instances.instance_index(deinit_def, type_args) is some instance_index else {
+            return;
+        }
+        self.collect_instance_at(query, hirs, instance_index);
+    }
+
     () collect_node(
         query_api.QuerySystem& query,
         hir_store.HirStore& hirs,
         hir.HirId node_id,
         SubstitutionMap& substitutions
     ) {
+        self.collect_node_type(query, hirs, node_id, substitutions);
         self.collect_instance_use(query, hirs, node_id, substitutions);
 
         hir.HirNode node = hirs.node(node_id);
@@ -460,9 +491,7 @@ struct InstanceCollector: Movable {
             self.collect_node(query, hirs, range_expr.end, substitutions);
         }
         if (node.data is .call(call)) { self.collect_call(query, hirs, call, substitutions); }
-        if (node.data is .let_stmt(let_stmt)) {
-            self.collect_optional_node(query, hirs, let_stmt.initializer, substitutions);
-        }
+        if (node.data is .let_stmt(let_stmt)) { self.collect_let(query, hirs, node_id, let_stmt, substitutions); }
         if (node.data is .defer_stmt(defer_stmt)) {
             self.collect_node(query, hirs, defer_stmt.body, substitutions);
         }
@@ -511,6 +540,21 @@ struct InstanceCollector: Movable {
         }
     }
 
+    () collect_let(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        hir.HirId owner_node,
+        hir.HirLet let_stmt,
+        SubstitutionMap& substitutions
+    ) {
+        guard hirs.def(owner_node.owner_def) is some hir_def else { return; }
+        guard hir_def.body is some body else { return; }
+        hir.HirLocal local = body.local(let_stmt.local_id);
+        self.collect_def_type(query, hirs, local.def_id, substitutions);
+        self.collect_optional_node(query, hirs, local.type_ref, substitutions);
+        self.collect_optional_node(query, hirs, let_stmt.initializer, substitutions);
+    }
+
     () collect_catch(
         query_api.QuerySystem& query,
         hir_store.HirStore& hirs,
@@ -538,11 +582,135 @@ struct InstanceCollector: Movable {
             index = index + 1;
         }
         qid.TypeId[] type_args = concrete_args.data[0..concrete_args.len()];
+        if (!self.type_args_are_concrete(query, type_args)) {
+            return;
+        }
         self.instances.add_instance(instance.def_id, type_args);
         guard self.instances.instance_index(instance.def_id, type_args) is some instance_index else {
             return;
         }
         self.collect_instance_at(query, hirs, instance_index);
+    }
+
+    () collect_def_type(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        qid.DefId def_id,
+        SubstitutionMap& substitutions
+    ) {
+        guard self.results.def_type(def_id) is some type_id else { return; }
+        self.collect_type(query, hirs, type_id, substitutions);
+    }
+
+    () collect_node_type(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        hir.HirId node_id,
+        SubstitutionMap& substitutions
+    ) {
+        guard self.results.node_type(node_id) is some type_id else { return; }
+        self.collect_type(query, hirs, type_id, substitutions);
+    }
+
+    () collect_type(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        qid.TypeId type_id,
+        SubstitutionMap& substitutions
+    ) {
+        if (substitutions.len() > 0) {
+            // generic body 内的 node/decl type 仍然是模板 TypeId。这里先把它
+            // 替换成当前 instance 的 concrete type，再按普通类型收集。
+            // 这样 custom deinit、字段 nominal type 等隐式依赖不会漏掉。
+            qid.TypeId concrete_type = substitute_type(query, type_id, substitutions);
+            if (!self.type_is_concrete(query, concrete_type)) {
+                return;
+            }
+            SubstitutionMap! empty = SubstitutionMap();
+            self.collect_type(query, hirs, concrete_type, empty$.ref());
+            return;
+        }
+        qid.TypeId! concrete_type = type_id;
+        Int type_index = concrete_type.to_index();
+        if (table.hash_table_get_value<Int, Int>(self.visiting_types$.ref(), type_index) is some active) {
+            if (active == 1) {
+                return;
+            }
+        }
+        self.visiting_types.set(type_index, 1);
+        types.TypeInfo type_info = query.types.get(concrete_type);
+        if (type_info.data is .named(named)) {
+            self.collect_named_type(query, hirs, named);
+        }
+        if (type_info.data is .optional(optional)) {
+            self.collect_type(query, hirs, optional.element, substitutions);
+        }
+        if (type_info.data is .error_union(error_union)) {
+            self.collect_type(query, hirs, error_union.value, substitutions);
+            self.collect_type(query, hirs, error_union.error, substitutions);
+        }
+        if (type_info.data is .handle_type(handle)) {
+            self.collect_type(query, hirs, handle.element, substitutions);
+        }
+        if (type_info.data is .array_type(array_type)) {
+            self.collect_type(query, hirs, array_type.element, substitutions);
+        }
+        if (type_info.data is .tuple_type(tuple_type)) {
+            self.collect_type_list(query, hirs, tuple_type.items, substitutions);
+        }
+        if (type_info.data is .function_type(function_type)) {
+            self.collect_type_list(query, hirs, function_type.params, substitutions);
+            self.collect_type(query, hirs, function_type.result, substitutions);
+        }
+        self.visiting_types.set(type_index, 0);
+    }
+
+    () collect_named_type(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        types.NamedType named
+    ) {
+        Bool! added = false;
+        if (named.args.length == 0) {
+            return;
+        }
+        if (!self.type_args_are_concrete(query, named.args)) {
+            return;
+        }
+        added = self.instances.add_instance(named.def_id, named.args);
+        if (added) {
+            guard self.instances.instance_index(named.def_id, named.args) is some instance_index else {
+                return;
+            }
+            self.collect_instance_at(query, hirs, instance_index);
+        }
+        self.collect_type_args(query, hirs, named.args);
+    }
+
+    () collect_type_args(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        qid.TypeId[] type_args
+    ) {
+        SubstitutionMap! empty = SubstitutionMap();
+        Int! index = 0;
+        while (index < type_args.length) {
+            self.collect_type(query, hirs, type_args[index], empty$.ref());
+            index = index + 1;
+        }
+    }
+
+    () collect_type_list(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        qid.TypeId[] type_ids,
+        SubstitutionMap& substitutions
+    ) {
+        Int! index = 0;
+        while (index < type_ids.length) {
+            self.collect_type(query, hirs, type_ids[index], substitutions);
+            index = index + 1;
+        }
     }
 
     () collect_block(
@@ -564,11 +732,118 @@ struct InstanceCollector: Movable {
         self.collect_node(query, hirs, call.callee, substitutions);
         self.collect_hir_ids(query, hirs, call.type_args, substitutions);
         self.collect_hir_ids(query, hirs, call.args, substitutions);
-        if (call.target is some target) {
+        if (self.call_target_def(call) is some target_def) {
+            if (self.call_receiver_type_args(query, hirs, call, target_def, substitutions) is some receiver_args) {
+                self.add_function_instance(query, hirs, target_def, receiver_args);
+                return;
+            }
             if (call.type_args.length == 0) {
-                self.collect_def_body(query, hirs, target.def_id, substitutions);
+                self.collect_def_body(query, hirs, target_def, substitutions);
             }
         }
+    }
+
+    qid.DefId? call_target_def(hir.HirCall call) {
+        if (call.target is some target) {
+            return target.def_id;
+        }
+        return self.results.member_selection(call.callee);
+    }
+
+    qid.TypeId[]? call_receiver_type_args(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        hir.HirCall call,
+        qid.DefId function_def,
+        SubstitutionMap& substitutions
+    ) {
+        hir.HirNode callee = hirs.node(call.callee);
+        guard callee.data is .member_access(member_access) else { return null; }
+        guard query.defs.get(function_def).owner_def is some owner_def else { return null; }
+        guard self.results.node_type(member_access.base) is some base_type else { return null; }
+        types.TypeInfo base_info = query.types.get(base_type);
+        guard base_info.data is .named(named) else { return null; }
+        if (named.def_id != owner_def || named.args.length == 0) {
+            return null;
+        }
+        return self.substitute_type_args(query, named.args, substitutions);
+    }
+
+    qid.TypeId[] substitute_type_args(
+        query_api.QuerySystem& query,
+        qid.TypeId[] type_args,
+        SubstitutionMap& substitutions
+    ) {
+        if (substitutions.len() == 0) {
+            return type_args;
+        }
+        list.ArrayList<qid.TypeId>! concrete_args = list.ArrayList<qid.TypeId>(type_args.length);
+        Int! index = 0;
+        while (index < type_args.length) {
+            concrete_args.add(substitute_type(query, type_args[index], substitutions));
+            index = index + 1;
+        }
+        return self.instances.copy_type_args(concrete_args.data[0..concrete_args.len()]);
+    }
+
+    () add_function_instance(
+        query_api.QuerySystem& query,
+        hir_store.HirStore& hirs,
+        qid.DefId function_def,
+        qid.TypeId[] type_args
+    ) {
+        if (!self.type_args_are_concrete(query, type_args)) {
+            return;
+        }
+        if (!self.instances.add_instance(function_def, type_args)) {
+            return;
+        }
+        guard self.instances.instance_index(function_def, type_args) is some instance_index else {
+            return;
+        }
+        self.collect_instance_at(query, hirs, instance_index);
+    }
+
+    Bool type_args_are_concrete(query_api.QuerySystem& query, qid.TypeId[] type_args) {
+        Int! index = 0;
+        while (index < type_args.length) {
+            if (!self.type_is_concrete(query, type_args[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool type_is_concrete(query_api.QuerySystem& query, qid.TypeId type_id) {
+        types.TypeInfo info = query.types.get(type_id);
+        if (info.data is .named(named)) {
+            if (query.defs.get(named.def_id).kind == .generic_param_def) {
+                return false;
+            }
+            return self.type_args_are_concrete(query, named.args);
+        }
+        if (info.data is .optional(optional)) {
+            return self.type_is_concrete(query, optional.element);
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.type_is_concrete(query, error_union.value)
+                && self.type_is_concrete(query, error_union.error);
+        }
+        if (info.data is .handle_type(handle)) {
+            return self.type_is_concrete(query, handle.element);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.type_is_concrete(query, array_type.element);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.type_args_are_concrete(query, tuple_type.items);
+        }
+        if (info.data is .function_type(function_type)) {
+            return self.type_args_are_concrete(query, function_type.params)
+                && self.type_is_concrete(query, function_type.result);
+        }
+        return true;
     }
 
     () collect_guard(
@@ -704,37 +979,56 @@ struct TypeSubstituter: Movable {
     }
 
     public qid.TypeId substitute(qid.TypeId type_id) {
+        if (self.substitutions.len() == 0) {
+            return type_id;
+        }
+        if (self.substitutions.cached_type(type_id) is some cached) {
+            return cached;
+        }
         types.TypeInfo type_info = self.query.types.get(type_id);
+        qid.TypeId! result = type_id;
+        // 先写入占位，避免递归类型在替换阶段无限展开。真正结果会在
+        // 当前分支完成后覆盖。
+        self.substitutions.cache_type(type_id, type_id);
         if (type_info.data is .named(named)) {
-            return self.substitute_named(type_info, named);
+            result = self.substitute_named(type_info, named);
+            return self.cache_result(type_id, result);
         }
         if (type_info.data is .optional(optional)) {
             qid.TypeId element = self.substitute(optional.element);
-            return self.preserve_mutability(type_info, self.query.types.optional_type(element, type_info.span));
+            result = self.preserve_mutability(type_info, self.query.types.optional_type(element, type_info.span));
+            return self.cache_result(type_id, result);
         }
         if (type_info.data is .error_union(error_union)) {
             qid.TypeId value = self.substitute(error_union.value);
             qid.TypeId error = self.substitute(error_union.error);
-            qid.TypeId type_id = self.query.types.error_union_type(value, error, type_info.span);
-            return self.preserve_mutability(type_info, type_id);
+            result = self.query.types.error_union_type(value, error, type_info.span);
+            return self.cache_result(type_id, self.preserve_mutability(type_info, result));
         }
         if (type_info.data is .handle_type(handle)) {
             qid.TypeId element = self.substitute(handle.element);
             qid.TypeId handle_id = self.query.types.handle_type(handle.kind, element, type_info.span);
-            return self.preserve_mutability(type_info, handle_id);
+            return self.cache_result(type_id, self.preserve_mutability(type_info, handle_id));
         }
         if (type_info.data is .array_type(array_type)) {
             qid.TypeId element = self.substitute(array_type.element);
             qid.TypeId array_id = self.query.types.array_type(element, array_type.count, type_info.span);
-            return self.preserve_mutability(type_info, array_id);
+            return self.cache_result(type_id, self.preserve_mutability(type_info, array_id));
         }
         if (type_info.data is .tuple_type(tuple_type)) {
-            return self.substitute_tuple(type_info, tuple_type);
+            result = self.substitute_tuple(type_info, tuple_type);
+            return self.cache_result(type_id, result);
         }
         if (type_info.data is .function_type(function_type)) {
-            return self.substitute_function(type_info, function_type);
+            result = self.substitute_function(type_info, function_type);
+            return self.cache_result(type_id, result);
         }
         return type_id;
+    }
+
+    qid.TypeId cache_result(qid.TypeId template_type, qid.TypeId concrete_type) {
+        self.substitutions.cache_type(template_type, concrete_type);
+        return concrete_type;
     }
 
     qid.TypeId substitute_named(types.TypeInfo type_info, types.NamedType named) {

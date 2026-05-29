@@ -332,7 +332,7 @@ mir.MirBlock instrument_drop_flag_block(
         mir.MirLocalDecl local = body.locals[index];
         if (flags.has_flag(local.id)) {
             push_set_drop_flag(ctx, output, flags.flag_for(local.id), false, local.span, statements);
-            if (local.kind == .param) {
+            if (local.kind == .param && !is_self_param(ctx, local)) {
                 push_set_drop_flag(ctx, output, flags.flag_for(local.id), true, local.span, statements);
             }
         }
@@ -647,7 +647,7 @@ mir.MirBlockId append_drop_chain(
     while (local_index >= 0) {
         mir.MirLocalDecl local = body.locals[local_index];
         local_index = local_index - 1;
-        if (!return_fallback_needs_drop(local, flags)) {
+        if (!return_fallback_needs_drop(ctx, local, flags)) {
             continue;
         }
         mir.MirBlockId drop_target = append_local_drop_block(
@@ -665,13 +665,20 @@ mir.MirBlockId append_drop_chain(
     return target;
 }
 
-Bool return_fallback_needs_drop(mir.MirLocalDecl local, DropFlagMap flags) {
+Bool return_fallback_needs_drop(context.CompilerContext& ctx, mir.MirLocalDecl local, DropFlagMap flags) {
     if (!flags.has_flag(local.id)) {
         return false;
     }
     // block/local scope 的 cleanup 已由 lowering 在各个离开路径插入 StorageDead。
     // return chain 只兜底函数入口即 live 的 local，目前就是 by-value param。
-    return local.kind == .param;
+    return local.kind == .param && !is_self_param(ctx, local);
+}
+
+Bool is_self_param(context.CompilerContext& ctx, mir.MirLocalDecl local) {
+    guard local.name is some name else {
+        return false;
+    }
+    return name.to_index() == ctx.query.symbols.intern("self").to_index();
 }
 
 mir.MirBlock return_block(
@@ -749,7 +756,16 @@ mir.MirTerminator drop_terminator(
 ) {
     if (custom_deinit_def_for_type(ctx, type_id) is some deinit_def) {
         if (deinit_result is some destination) {
-            return custom_deinit_terminator(ctx, output, source_block, deinit_def, destination, expansion.target);
+            return custom_deinit_terminator(
+                ctx,
+                output,
+                source_block,
+                place,
+                deinit_def,
+                custom_deinit_type_args(ctx, output, type_id),
+                destination,
+                expansion.target
+            );
         }
     }
     if (expansion.expanded) {
@@ -899,11 +915,21 @@ DropExpansion append_owned_field_drop_chain(
     Int! field_index = type_layout.fields.length - 1;
     while (field_index >= 0) {
         layout.FieldLayout field = type_layout.fields[field_index];
-        field_index = field_index - 1;
         if (field_needs_drop(ctx, field)) {
-            target = append_field_drop_block(ctx, output, deinit_result, source_block, place, field, target, blocks);
+            target = append_field_drop_block(
+                ctx,
+                output,
+                deinit_result,
+                source_block,
+                place,
+                field,
+                field_index,
+                target,
+                blocks
+            );
             expanded = true;
         }
+        field_index = field_index - 1;
     }
     return DropExpansion(target, expanded);
 }
@@ -940,6 +966,7 @@ mir.MirBlockId append_field_drop_block(
     mir.MirBlock source_block,
     mir.MirPlace owner_place,
     layout.FieldLayout field,
+    Int field_index,
     mir.MirBlockId next_target,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
@@ -952,7 +979,7 @@ mir.MirBlockId append_field_drop_block(
         deinit_result,
         id,
         source_block,
-        field_place(output, owner_place, field),
+        field_place(output, owner_place, field, field_index),
         field.field_type,
         statements$.ref(),
         next_target,
@@ -1019,7 +1046,7 @@ mir.MirBlockId append_layout_tag_branch(
     return id;
 }
 
-mir.MirPlace field_place(mir.MirStore& output, mir.MirPlace owner_place, layout.FieldLayout field) {
+mir.MirPlace field_place(mir.MirStore& output, mir.MirPlace owner_place, layout.FieldLayout field, Int field_index) {
     list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(owner_place.projection.length + 1);
     Int! index = 0;
     while (index < owner_place.projection.length) {
@@ -1028,7 +1055,8 @@ mir.MirPlace field_place(mir.MirStore& output, mir.MirPlace owner_place, layout.
     }
     projection.add(mir.field_projection_elem(mir.MirFieldProjection {
         field_def: field.field_def$.some(),
-        field_type: field.field_type
+        field_type: field.field_type,
+        field_index: field_index
     }));
     return mir.MirPlace {
         local_id: owner_place.local_id,
@@ -1069,11 +1097,14 @@ mir.MirTerminator custom_deinit_terminator(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     mir.MirBlock source_block,
+    mir.MirPlace place,
     qid.DefId deinit_def,
+    qid.TypeId[] type_args,
     mir.MirLocalId destination,
     mir.MirBlockId next_target
 ) {
     list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>();
+    args.add(mir.move_operand_value(mir.MirMoveOperand {place: place}));
     return mir.MirTerminator {
         span: source_block.terminator.span,
         kind: mir.call_terminator_kind(mir.MirCallTerminator {
@@ -1082,7 +1113,7 @@ mir.MirTerminator custom_deinit_terminator(
                 span: source_block.terminator.span,
                 value: mir.function_const_kind(mir.MirFunctionConst {
                     function_def: deinit_def,
-                    type_args: output.empty_type_args()
+                    type_args: output.type_arg_array(type_args)
                 })
             }),
             args: output.operand_array(args$.ref()),
@@ -1094,6 +1125,14 @@ mir.MirTerminator custom_deinit_terminator(
             cleanup: null
         })
     };
+}
+
+qid.TypeId[] custom_deinit_type_args(context.CompilerContext& ctx, mir.MirStore& output, qid.TypeId type_id) {
+    types.TypeInfo info = ctx.query.types.get(type_id);
+    if (info.data is .named(named)) {
+        return named.args;
+    }
+    return output.empty_type_args();
 }
 
 qid.TypeId deinit_function_type(context.CompilerContext& ctx, qid.DefId deinit_def) {
@@ -1364,6 +1403,8 @@ mir.MirFunction copy_function_with_body(mir.MirStore& output, mir.MirFunction fu
         def_id: function.def_id,
         type_args: output.type_arg_array(function.type_args),
         signature_id: function.signature_id,
+        is_runtime_entry: function.is_runtime_entry,
+        is_external: function.is_external,
         span: function.span,
         body: mir.MirBody {
             id: body.id,

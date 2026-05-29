@@ -4,9 +4,12 @@
 // value。place projection 和 type/layout 规则分别委托给同目录 helper。
 
 import mir = "../../mir/mir.jiang";
+import diagnostic = "../../diagnostic/diagnostic.jiang";
 import qid = "../../query/id.jiang";
 import list = "../../support/list.jiang";
 import symbol = "../symbol.jiang";
+import string = "../../support/string.jiang";
+import table = "../../support/table.jiang";
 import ffi = "./ffi.jiang";
 import llvm_state = "./state.jiang";
 import llvm_place = "./place.jiang";
@@ -33,6 +36,9 @@ public ffi.Value lower_rvalue(
     qid.TypeId result_type
 ) {
     if (value is .use_value(use_value)) {
+        if (use_value.value is .const_operand(const_value)) {
+            return lower_const_as_type(state, const_value, result_type);
+        }
         return lower_operand(state, body, use_value.value, local_slots);
     }
     if (value is .unary_value(unary_value)) {
@@ -98,12 +104,35 @@ public ffi.Value lower_operand(
     return ffi.Value();
 }
 
+public ffi.Value lower_operand_as_type(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirOperand operand,
+    list.ArrayList<ffi.Value>& local_slots,
+    qid.TypeId result_type
+) {
+    if (operand is .const_operand(const_value)) {
+        return lower_const_as_type(state, const_value, result_type);
+    }
+    return lower_operand(state, body, operand, local_slots);
+}
+
 public ffi.Value lower_const(llvm_state.LowerState& state, mir.MirConst value) {
+    return lower_const_as_type(state, value, value.type_id);
+}
+
+public ffi.Value lower_const_as_type(llvm_state.LowerState& state, mir.MirConst value, qid.TypeId result_type) {
+    mir.MirConstValue const_value = value.value;
+    if (mir.string_const_value(const_value) is some string_value) {
+        return lower_string_const(state, string_value, result_type);
+    }
+    if (mir.is_null_const_value(const_value)) {
+        return lower_null_const(state, result_type);
+    }
     ffi.Type value_type = llvm_type.lower_type(state, value.type_id);
     if (!ffi.type_valid(value_type)) {
         return ffi.Value();
     }
-    mir.MirConstValue const_value = value.value;
     if (mir.int_const_value(const_value) is some int_value) {
         return ffi.const_int(value_type, int_value.bits);
     }
@@ -116,18 +145,59 @@ public ffi.Value lower_const(llvm_state.LowerState& state, mir.MirConst value) {
     if (mir.is_unit_const_value(const_value)) {
         return ffi.Value();
     }
-    if (mir.is_null_const_value(const_value)) {
-        return ffi.const_null(value_type);
-    }
-    if (mir.string_const_value(const_value) is some string_value) {
-        UInt8[] text = state.ctx.query.symbols.text(string_value.symbol_id);
-        UInt8[*] raw_text = text$.as(UInt8[*]);
-        return ffi.builder_build_global_string_ptr(state.builder, raw_text);
-    }
     if (mir.function_const_value(const_value) is some function_value) {
         return function_value_for_const(state, function_value);
     }
     return ffi.Value();
+}
+
+ffi.Value lower_null_const(llvm_state.LowerState& state, qid.TypeId result_type) {
+    ffi.Type value_type = llvm_type.lower_type(state, result_type);
+    if (!ffi.type_valid(value_type)) {
+        return ffi.Value();
+    }
+    return ffi.const_null(value_type);
+}
+
+ffi.Value lower_string_const(
+    llvm_state.LowerState& state,
+    mir.MirStringConst value,
+    qid.TypeId result_type
+) {
+    UInt8[] text = state.ctx.query.symbols.text(value.symbol_id);
+    UInt8[*] raw_text = text$.as(UInt8[*]);
+    ffi.Value data = ffi.builder_build_global_string_ptr(state.builder, raw_text);
+    if (!ffi.value_valid(data)) {
+        add_value_codegen_error(state, "failed to build LLVM global string", "llvm_global_string_lower_failed");
+        return ffi.Value();
+    }
+    if (!llvm_type.type_is_slice(state, result_type)) {
+        return data;
+    }
+    ffi.Value! aggregate = zero_aggregate(state, result_type);
+    aggregate = insert_layout_field(state, result_type, aggregate, 0, data);
+    if (!ffi.value_valid(aggregate)) {
+        add_value_codegen_error(state, "failed to store string data in LLVM slice", "llvm_string_slice_data_lower_failed");
+        return ffi.Value();
+    }
+    ffi.Type int_type = ffi.context_int_type(state.llvm_context, state.ctx.query.layouts.target.pointer_size * 8);
+    ffi.Value length = insert_layout_field(state, result_type, aggregate, 1, ffi.const_int(int_type, UInt64(text.length)));
+    if (!ffi.value_valid(length)) {
+        add_value_codegen_error(state, "failed to store string length in LLVM slice", "llvm_string_slice_length_lower_failed");
+    }
+    return length;
+}
+
+() add_value_codegen_error(llvm_state.LowerState& state, UInt8[] message, UInt8[] code) {
+    state.ctx.diagnostics.add(
+        diagnostic.Diagnostic(
+            .error,
+            .codegen,
+            diagnostic.DiagnosticCode(code),
+            diagnostic.SourceRange(),
+            message
+        )
+    );
 }
 
 ffi.Value bool_const(llvm_state.LowerState& state, ffi.Type value_type, Bool value) {
@@ -234,25 +304,35 @@ ffi.Value lower_free(
 }
 
 ffi.Value declare_malloc(llvm_state.LowerState& state) {
-    ffi.Value existing = ffi.module_get_function(state.module, "malloc");
-    if (ffi.value_valid(existing)) {
-        return existing;
+    qid.SymbolId symbol_id = state.ctx.query.symbols.intern("malloc");
+    if (table.hash_table_get_value<qid.SymbolId, Int>(state.external_function_indexes, symbol_id) is some existing) {
+        return state.external_function_values.get(existing);
     }
     list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(1);
     params.add(ffi.context_int_type(state.llvm_context, state.ctx.query.layouts.target.pointer_size * 8));
     ffi.Type fn_type = ffi.function_type(ffi.context_pointer_type(state.llvm_context), params$.ref());
-    return ffi.module_add_function(state.module, "malloc", fn_type);
+    ffi.Value function = ffi.module_add_function(state.module, "malloc", fn_type);
+    if (ffi.value_valid(function)) {
+        state.external_function_indexes.set(symbol_id, state.external_function_values.len());
+        state.external_function_values.add(function);
+    }
+    return function;
 }
 
 ffi.Value declare_free(llvm_state.LowerState& state) {
-    ffi.Value existing = ffi.module_get_function(state.module, "free");
-    if (ffi.value_valid(existing)) {
-        return existing;
+    qid.SymbolId symbol_id = state.ctx.query.symbols.intern("free");
+    if (table.hash_table_get_value<qid.SymbolId, Int>(state.external_function_indexes, symbol_id) is some existing) {
+        return state.external_function_values.get(existing);
     }
     list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(1);
     params.add(ffi.context_pointer_type(state.llvm_context));
     ffi.Type fn_type = ffi.function_type(ffi.context_void_type(state.llvm_context), params$.ref());
-    return ffi.module_add_function(state.module, "free", fn_type);
+    ffi.Value function = ffi.module_add_function(state.module, "free", fn_type);
+    if (ffi.value_valid(function)) {
+        state.external_function_indexes.set(symbol_id, state.external_function_values.len());
+        state.external_function_values.add(function);
+    }
+    return function;
 }
 
 ffi.Value lower_slice(
@@ -385,6 +465,40 @@ ffi.Value lower_discriminant(
     return extract_layout_field(state, place_type_id, aggregate, 0);
 }
 
+public Bool lower_set_discriminant(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirSetDiscriminantStatement statement,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    qid.TypeId place_type_id = llvm_place.place_type(state, body, statement.destination);
+    if (llvm_type.layout_field_count(state, place_type_id) == 0) {
+        return true;
+    }
+    ffi.Value! aggregate = llvm_place.lower_place_value(state, body, statement.destination, local_slots);
+    if (!ffi.value_valid(aggregate)) {
+        return false;
+    }
+    ffi.Value tag = llvm_discriminant_value(state, statement.discriminant);
+    aggregate = insert_layout_field(state, place_type_id, aggregate, 0, tag);
+    if (!ffi.value_valid(aggregate)) {
+        return false;
+    }
+    ffi.Value pointer = llvm_place.lower_place_pointer(state, body, statement.destination, local_slots);
+    if (!ffi.value_valid(pointer)) {
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_store(state.builder, aggregate, pointer));
+}
+
+ffi.Value llvm_discriminant_value(llvm_state.LowerState& state, Int discriminant) {
+    ffi.Type tag_type = llvm_type.lower_type(state, state.ctx.query.types.int_type());
+    if (!ffi.type_valid(tag_type)) {
+        return ffi.Value();
+    }
+    return ffi.const_int(tag_type, UInt64(discriminant));
+}
+
 ffi.Value lower_aggregate(
     llvm_state.LowerState& state,
     mir.MirBody body,
@@ -401,7 +515,12 @@ ffi.Value lower_aggregate(
     ffi.Value! aggregate = ffi.const_null(type);
     Int! index = 0;
     while (index < value.fields.length) {
-        ffi.Value field_value = lower_operand(state, body, value.fields[index], local_slots);
+        qid.TypeId field_type = llvm_type.constant_index_type(state, value.type_id, index);
+        if (!llvm_type.type_has_abi_value(state, field_type)) {
+            index = index + 1;
+            continue;
+        }
+        ffi.Value field_value = lower_operand_as_type(state, body, value.fields[index], local_slots, field_type);
         if (!ffi.value_valid(field_value)) {
             return ffi.Value();
         }
@@ -420,56 +539,30 @@ ffi.Value lower_union_variant_aggregate(
     mir.MirAggregateRvalue value,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    guard value.def_id is some variant_def else {
-        return ffi.Value();
-    }
     ffi.Value! aggregate = zero_aggregate(state, value.type_id);
     if (!ffi.value_valid(aggregate)) {
         return ffi.Value();
     }
 
-    aggregate = insert_layout_field(state, value.type_id, aggregate, 0, union_variant_tag_value(state, variant_def));
+    guard value.tag is some tag_operand else {
+        return ffi.Value();
+    }
+    ffi.Value tag = lower_operand(state, body, tag_operand, local_slots);
+    if (!ffi.value_valid(tag)) {
+        return ffi.Value();
+    }
+    aggregate = insert_layout_field(state, value.type_id, aggregate, 0, tag);
     if (!ffi.value_valid(aggregate) || value.fields.length == 0) {
         return aggregate;
     }
     if (value.fields.length != 1) {
         return ffi.Value();
     }
-    if (llvm_type.layout_field_index_for_def(state, value.type_id, variant_def) is some payload_field) {
-        ffi.Value payload = lower_operand(state, body, value.fields[0], local_slots);
-        return insert_layout_field(state, value.type_id, aggregate, payload_field, payload);
-    }
-    return ffi.Value();
-}
-
-ffi.Value union_variant_tag_value(llvm_state.LowerState& state, qid.DefId variant_def) {
-    ffi.Type tag_type = llvm_type.lower_type(state, state.ctx.query.types.int_type());
-    if (!ffi.type_valid(tag_type)) {
+    if (value.payload_field_index < 0) {
         return ffi.Value();
     }
-    return ffi.const_int(tag_type, UInt64(union_variant_tag_index(state, variant_def)));
-}
-
-Int union_variant_tag_index(llvm_state.LowerState& state, qid.DefId variant_def) {
-    guard state.ctx.query.defs.get(variant_def).owner_def is some owner_def else {
-        return 0;
-    }
-    guard state.ctx.query.hirs.def(owner_def) is some owner_hir else {
-        return 0;
-    }
-    Int! tag = 0;
-    Int! index = 0;
-    while (index < owner_hir.members.len()) {
-        qid.DefId member_def = owner_hir.members.get(index);
-        if (member_def == variant_def) {
-            return tag;
-        }
-        if (state.ctx.query.defs.get(member_def).kind == .union_variant_def) {
-            tag = tag + 1;
-        }
-        index = index + 1;
-    }
-    return 0;
+    ffi.Value payload = lower_operand(state, body, value.fields[0], local_slots);
+    return insert_layout_field(state, value.type_id, aggregate, value.payload_field_index, payload);
 }
 
 ffi.Value lower_optional(
@@ -485,15 +578,29 @@ ffi.Value lower_optional(
     if (value.op == .make_some) {
         return lower_make_some(state, body, value, local_slots, result_type);
     }
+    qid.TypeId value_type = operand_type(state, body, value.value);
     ffi.Value aggregate = lower_operand(state, body, value.value, local_slots);
     if (!ffi.value_valid(aggregate)) {
+        add_value_codegen_error(state, "failed to lower LLVM optional operand", "llvm_optional_operand_lower_failed");
         return ffi.Value();
     }
     if (value.op == .is_some) {
-        return extract_layout_field(state, operand_type(state, body, value.value), aggregate, 0);
+        ffi.Value result = extract_layout_field(state, value_type, aggregate, 0);
+        if (!ffi.value_valid(result)) {
+            add_value_codegen_error(state, "failed to extract LLVM optional tag", "llvm_optional_tag_lower_failed");
+        }
+        return result;
     }
     if (value.op == .unwrap_some) {
-        return extract_layout_field(state, operand_type(state, body, value.value), aggregate, 1);
+        qid.TypeId payload_type = llvm_type.element_type(state, value_type);
+        if (!llvm_type.type_has_abi_value(state, payload_type)) {
+            return ffi.const_null(ffi.context_pointer_type(state.llvm_context));
+        }
+        ffi.Value result = extract_layout_field(state, value_type, aggregate, 1);
+        if (!ffi.value_valid(result)) {
+            add_value_codegen_error(state, "failed to extract LLVM optional payload", "llvm_optional_payload_lower_failed");
+        }
+        return result;
     }
     return ffi.Value();
 }
@@ -667,10 +774,19 @@ ffi.Value lower_binary(
     mir.MirBinaryRvalue value,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    ffi.Value lhs = lower_operand(state, body, value.lhs, local_slots);
-    ffi.Value rhs = lower_operand(state, body, value.rhs, local_slots);
+    qid.TypeId lhs_type = operand_type(state, body, value.lhs);
+    qid.TypeId rhs_type = operand_type(state, body, value.rhs);
+    qid.TypeId compare_type = binary_compare_type(state, lhs_type, rhs_type);
+    ffi.Value lhs = lower_operand_as_type(state, body, value.lhs, local_slots, compare_type);
+    ffi.Value rhs = lower_operand_as_type(state, body, value.rhs, local_slots, compare_type);
     if (!ffi.value_valid(lhs) || !ffi.value_valid(rhs)) {
         return ffi.Value();
+    }
+    if (value.op == .eq || value.op == .ne) {
+        guard int_predicate(state, value.op) is some predicate else {
+            return ffi.Value();
+        }
+        return lower_int_compare(state, predicate, lhs, rhs);
     }
     if (binary_op_code(state, value.op) is some op) {
         return ffi.builder_build_binary(state.builder, op, lhs, rhs);
@@ -679,6 +795,16 @@ ffi.Value lower_binary(
         return lower_int_compare(state, predicate, lhs, rhs);
     }
     return ffi.Value();
+}
+
+qid.TypeId binary_compare_type(llvm_state.LowerState& state, qid.TypeId lhs_type, qid.TypeId rhs_type) {
+    if (type_id_valid(lhs_type)) { return lhs_type; }
+    if (type_id_valid(rhs_type)) { return rhs_type; }
+    return state.ctx.query.types.invalid_type();
+}
+
+Bool type_id_valid(qid.TypeId type_id) {
+    return type_id.to_index() >= 0;
 }
 
 ffi.Value lower_int_compare(llvm_state.LowerState& state, Int32 predicate, ffi.Value lhs, ffi.Value rhs) {
@@ -812,13 +938,72 @@ ffi.Value extract_layout_field(
     if (field_index >= llvm_type.layout_field_count(state, type_id)) {
         return ffi.Value();
     }
+    if (llvm_type.layout_field_uses_payload_storage(state, type_id, field_index)) {
+        return extract_payload_storage_field(state, type_id, aggregate, field_index);
+    }
     Int element_index = llvm_type.layout_field_element_index(state, type_id, field_index);
     return ffi.builder_build_extract_value(state.builder, aggregate, element_index);
 }
 
+ffi.Value extract_payload_storage_field(
+    llvm_state.LowerState& state,
+    qid.TypeId type_id,
+    ffi.Value aggregate,
+    Int field_index
+) {
+    ffi.Type aggregate_type = llvm_type.lower_type(state, type_id);
+    if (!ffi.type_valid(aggregate_type)) {
+        return ffi.Value();
+    }
+    ffi.Value slot = ffi.builder_build_alloca(state.builder, aggregate_type);
+    if (!ffi.value_valid(slot)) {
+        return ffi.Value();
+    }
+    if (!ffi.value_valid(ffi.builder_build_store(state.builder, aggregate, slot))) {
+        return ffi.Value();
+    }
+    ffi.Value field_pointer = lower_payload_storage_field_pointer(state, type_id, slot, field_index);
+    if (!ffi.value_valid(field_pointer)) {
+        return ffi.Value();
+    }
+    qid.TypeId field_type = llvm_type.constant_index_type(state, type_id, field_index);
+    ffi.Type llvm_field_type = llvm_type.lower_type(state, field_type);
+    if (!ffi.type_valid(llvm_field_type)) {
+        return ffi.Value();
+    }
+    return ffi.builder_build_load(state.builder, llvm_field_type, field_pointer);
+}
+
 ffi.Value function_value_for_const(llvm_state.LowerState& state, mir.MirFunctionConst value) {
-    symbol.BackendSymbolKey key = symbol.BackendSymbolKey(value.function_def, value.type_args);
+    symbol.BackendSymbolKey key = symbol.BackendSymbolKey(value.function_def, value.type_args, false);
     UInt8[] name = symbol.symbol_name(key);
-    UInt8[*] raw_name = name$.as(UInt8[*]);
-    return ffi.module_get_function(state.module, raw_name);
+    if (table.hash_table_get_value<symbol.BackendSymbolKey, Int>(state.declared_function_indexes, key) is some index) {
+        return state.declared_function_values.get(index);
+    }
+    add_missing_function_error(state, value.function_def, name);
+    return ffi.Value();
+}
+
+() add_missing_function_error(llvm_state.LowerState& state, qid.DefId function_def, UInt8[] name) {
+    diagnostic.SourceRange! range = diagnostic.SourceRange();
+    if (state.ctx.query.source_map.def_span(function_def) is some loc) {
+        guard loc.source_id is some source_id else {
+            add_value_codegen_error(
+                state,
+                string.append("LLVM function symbol was not declared: ", name),
+                "llvm_function_symbol_missing"
+            );
+            return;
+        }
+        range = diagnostic.SourceRange(source_id, loc.span);
+    }
+    state.ctx.diagnostics.add(
+        diagnostic.Diagnostic(
+            .error,
+            .codegen,
+            diagnostic.DiagnosticCode("llvm_function_symbol_missing"),
+            range,
+            string.append("LLVM function symbol was not declared: ", name)
+        )
+    );
 }
