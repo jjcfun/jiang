@@ -37,7 +37,12 @@ build_module_graph(root_file)
   -> resolve import targets, parse/load target AstFile into the same AstStore when needed
   -> add ModuleGraph import edges
   -> recursively discover reachable module imports
+  -> check package dependency cycle on cross-package edges
 ```
+
+`ModuleGraph.package_id` 只记录入口 root package。`ModuleGraph.modules` 可以包含多个
+package 的 module；后续 HIR/type check/monomorph/MIR/layout/borrow/backend 都消费同一张
+root import closure。
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
 
@@ -93,6 +98,8 @@ resolved HIR。
 
 - 对普通 `import dep`，优先在当前 package 的 `[dependencies]` 中查找 `dep`。
 - 命中 dependency 时读取依赖 package 的 manifest root 文件。
+- dependency package 内部继续按它自己的 `package.ini` 解析 `[dependencies]`，因此
+  `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
 - 未命中 dependency 时，再按已登记 virtual/module 名称查 `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`。
 - 如果目标 source 的 `AstFile` 已经登记到本轮 `AstStore`，会递归推进目标 module pass。
@@ -100,6 +107,23 @@ resolved HIR。
   namespace。
 - 对 string/file import，当前取字符串字面量的 symbol 文本，
   按当前源文件目录解析显式文件路径。
+- file import 只能跨当前 package 内部 source。跨 package 必须使用 manifest dependency
+  alias；如果 string import 解析到另一个 package，会报 `cross_package_file_import`。
+
+module import cycle 允许。package dependency cycle 不允许：ModuleGraph 构建完成后会从
+跨 package import 边汇总 package-level reachability，如果发现 package 闭环，报
+`package_dependency_cycle`。
+
+## Package Public Surface
+
+跨 package 可见性只看 dependency package 的 root module public namespace：
+
+- root module 的 public function/type/global 可作为 package API 访问。
+- root module 的 `public import` 可以把目标 module namespace 作为 public API 的一个成员
+  重新导出，但不会 flatten 目标 module declarations。
+- root module 的 `public alias` 可以把一个具体 public symbol 重新导出到 package API。
+- 非 root module 中的 public declaration 不会自动成为 package API。
+- private declaration、private alias 和非 root public declaration 跨 package lookup 都会诊断。
 
 ## HIR Lowering
 

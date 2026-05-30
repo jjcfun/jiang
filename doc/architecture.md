@@ -9,14 +9,14 @@ Jiang Next 编译器围绕稳定的阶段边界组织。本文只保留整体架
 driver/cli -> pipeline.compile_with_options
                 |
                 v
-        source/AST -> HIR -> type facts -> MIR -> checked MIR -> backend output
+        package source/AST -> HIR -> type facts -> MIR -> checked MIR -> backend output
                                       \      \          \          \
                                        ------ layout facts --------
 ```
 
 流程中的几个块对应：
 
-- `source/AST`：source、syntax、module graph 和 resolve。
+- `package source/AST`：package manifest、source、syntax、module graph 和 resolve。
 - `HIR`：resolve 直接生成的未类型化语义树。
 - `type facts`：`TypeCheckResults` 和 `MonomorphInstances`。
 - `MIR`：HIR lowering 生成的 CFG。
@@ -36,7 +36,8 @@ type check。
 ## 阶段边界
 
 - `driver` 把进程参数转换成编译请求，直接创建 `CompilerContext` 并调用 pipeline。
-- `pipeline` 以 package root file 为入口串联各阶段，并负责跨阶段错误处理。
+- `pipeline` 以 package root file 为入口串联各阶段，并负责跨阶段错误处理。目录入口读取
+  `package.ini`，文件入口把该文件作为 root source。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
 - `syntax` 只产生 token 和 AST；详见 [AST 设计](compiler/ast.md)。
 - `diagnostic` 负责诊断数据结构、终端输出和未来 LSP 位置转换。
@@ -75,7 +76,8 @@ type check。
 - `ResolveStore.modules` 是 `ModuleId -> ModuleRecord` 主表。
 - `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的 side table。
 - `HirStore`、`TypeCheckResults`、`LayoutStore` 和 `IncrementalSymbolIndex` 都挂在 `QuerySystem`。
-- `MonomorphInstances`、`MirStore` 和 `BorrowCheckResults` 是单次 pipeline 调用中的阶段产物。
+- `MonomorphInstances`、`MirStore`、`ModuleGraph` 和 `BorrowCheckResults` 是单次 pipeline
+  调用中的阶段产物。
 - `AstStore` 是一次 `compile_package` 的临时 AST cache，不挂到 `QuerySystem`。
 - `QueryCache` 当前只保留入口结构；0.3 再接入 cache-backed query dependency tracking。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `query/api.jiang` 增加高阶查询入口。
@@ -195,6 +197,10 @@ test/lang/
   import/
     check/
     fail/
+  package/
+    check/
+    fail/
+    run/
   lifetime/
     check/
   literal/

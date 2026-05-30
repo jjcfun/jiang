@@ -2038,24 +2038,28 @@ Jiang语言的模块以文件为单位，文件内的所有定义都属于该模
 
 // public关键字表示这是个公开方法，可以在模块外调用，否则只能在文件内使用
 public Int max(Int a, Int b) {
-	return a > b ? a : b;
+    if a > b {
+        a
+    } else {
+        b
+    }
 }
 
 public Int min(Int a, Int b) {
-	return a < b ? a : b;
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 // foo只能在文件内部使用
 () foo() {
-	Int a = 1
-  Int b = 2
-  Int c = 3
-
-  // 输出：the maximum value of 1 and 2 is 2
-  print("the maximum value of 1 and 2 is %d", max(a, b))
-
-  // 输出：the minimum value of 2 and 3 is 2
-  print("the minimum value of 2 and 3 is %d" min(b, c))
+    Int a = 1;
+    Int b = 2;
+    Int c = 3;
+    _ maximum = max(a, b);
+    _ minimum = min(b, c);
 }
 ```
 
@@ -2093,7 +2097,6 @@ public alias min = math_utils.min;
 其中：
 
 - `import "utils/math.jiang";` 会导入整个模块，并默认使用文件名 `math` 作为模块名
-- 编译时会隐式预导入 `std/prelude.jiang`，该文件中的 `public` 定义无需显式 `import`
 - `public import "utils/math.jiang";` 会在导入模块的同时，将模块名 `math` 对外导出
 - 显式 `import alias = "..."` 中的 `alias` 约定使用 snake_case
 - `import math_utils = "utils/math.jiang";` 会导入模块并使用 snake_case 别名 `math_utils` 作为模块名
@@ -2111,10 +2114,11 @@ jiangc --emit-obj path/to/pkg -o pkg.o
 jiangc path/to/pkg -o pkg
 ```
 
-当输入路径是目录时，编译器会读取该目录下固定文件名的 `package.ini`。当前只识别 `[package]` 段里的：
+当输入路径是目录时，编译器会读取该目录下固定文件名的 `package.ini`。当前识别：
 
-- `name`
-- `root`
+- `[package].name`
+- `[package].root`
+- `[dependencies]`
 
 这两个字段都可选：
 
@@ -2136,8 +2140,6 @@ lexer/
 
 ```ini
 [package]
-version = 0.1.0
-type = lib
 ```
 
 此时默认：
@@ -2151,8 +2153,6 @@ type = lib
 [package]
 name = frontend
 root = src/main.jiang
-version = 0.1.0
-type = lib
 ```
 
 当前第一版 package 机制还支持本地依赖：
@@ -2173,9 +2173,14 @@ import util;
 注意：
 
 - package import 不能加引号，必须写成 `import util;`
-- 带引号的 `import "..."` 继续保留给文件路径导入
-- 标准库 package `std` 由编译器内置提供，可直接写 `import std;`
-- `std` 的 package 入口统一是 `std/std.jiang`
+- 带引号的 `import "..."` 只用于当前 package 内的文件路径导入
+- 跨 package 不能用字符串路径直接导入 source，必须通过 `[dependencies]`
+- package dependency cycle 不允许；同一 package 内的 module import cycle 允许
+- package 对外只暴露 root file 的 public namespace
+- root file 可以通过 `public import` 重新导出模块 namespace，也可以通过 `public alias`
+  重新导出具体 public symbol
+- 非 root module 的 public 声明不会自动成为 package API
+- dependency package 中的 `main` 不会成为当前 package 的 runtime entry
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 
@@ -2207,11 +2212,12 @@ alias x = a + b;
 
 ### FFI
 
-传给 C 风格 API 的字符串指针当前使用 `UInt8[*]` 表示。字符串字面量在 `UInt8[*]` 上下文中会自动生成以 `\0` 结尾的只读全局数据。
+传给 C 风格 API 的字符串当前使用 `CString` 表示。字符串字面量在 `CString` 上下文中会生成以
+`\0` 结尾的只读全局数据。`UInt8[*]` 是裸 many pointer，不直接接收字符串字面量。
 
 ```c
 extern {
-  public Int open(UInt8[*] path, Int options);
+  public Int open(CString path, Int options);
   public Int write(Int fd, UInt8[] buf, Int count);
   public Int errno;
 }
@@ -2221,6 +2227,6 @@ extern {
 也支持单条声明：
 
 ```c
-extern public Int puts(UInt8[*] text);
+extern public Int puts(CString text);
 public extern Int errno;
 ```

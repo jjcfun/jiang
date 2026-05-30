@@ -45,7 +45,8 @@ test/lang/<feature>/
 - `ownership`：implicit copy、Movable、explicit move、borrow reference、drop/defer cleanup。
 - `lifetime`：`@life` 语法、返回引用、字段引用、逃逸失败。
 - `error_handling`：`T@E`、throw、try/catch、catch binding、未处理错误。
-- `import`：file import、package dependency、public import re-export、visibility。
+- `import`：file import、public import re-export、visibility。
+- `package`：manifest dependency、package public surface、跨 package 访问、dependency cycle。
 - `runtime`：main/runtime entry、CString、print/panic/assert 等 runtime-visible 能力。
 
 ## 补测试顺序

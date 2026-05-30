@@ -513,8 +513,9 @@ import dep;
 import dep = "foo/bar.jiang";
 ```
 
-`import dep;` 中的 `dep` 是 module/package 名称，不是文件路径。它通过当前编译上下文中已登记
-的 module/package 名称解析；后续接入 package manifest 后，跨 package dependency 也走这条规则。
+`import dep;` 中的 `dep` 是 module/package 名称，不是文件路径。它会优先按当前 package
+manifest 的 `[dependencies]` alias 解析到依赖 package root；未命中 dependency 时，再按当前
+编译上下文中已登记的 module/package 名称解析。
 
 `import dep = "foo/bar.jiang";` 中的字符串是显式文件路径。路径按 Zig 风格解析：相对路径以
 当前 import 所在源文件的目录为基准，绝对路径按原路径规范化。编译器只加载字面路径
@@ -525,6 +526,9 @@ import dep = "foo/bar.jiang";
 
 import 只引入一个模块命名空间 alias，不把目标模块的声明平铺到当前 namespace。被导入模块
 的 public API 通过 `dep.Name` 访问。`public import` re-export 的也是这个模块命名空间 alias。
+
+file import 只允许引用当前 package 内的 source file。跨 package 源码依赖必须通过
+`[dependencies]` 和 `import dep;` 进入；直接用字符串路径导入另一个 package 的 source 会报错。
 
 ### Package
 
@@ -552,8 +556,21 @@ lexer 语义，不能另起一套名字规则。
 
 stage2 当前已经把 manifest root 接入 compile path：目录输入会读取 `package.ini`，再编译
 manifest 指定的 root source。`ModuleResolver` 会按 source 所在目录向上查找 `package.ini`，
-创建或复用对应 package，并登记 `[dependencies]`。`import dep;` 会优先按当前 package
-的 dependency alias 解析到依赖 package root，再进入该 package 的 module namespace。
+创建或复用对应 package，并登记 `[dependencies]`。依赖 package 内部继续按自己的 manifest
+解析相对 dependency path，因此 `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
+
+package dependency cycle 不允许；module import cycle 允许。也就是说，同一 package 内的
+source file 可以形成 import cycle，resolve 会用 visited set 截断递归；不同 package 之间通过
+manifest dependency 形成闭环时必须诊断。
+
+package 对外导出面固定为 root file 的 public namespace：
+
+- root file 的 public declaration 是 package API。
+- root file 的 `public import` 可以重新导出一个 module namespace，但不 flatten 目标 module
+  的 declarations。
+- root file 的 `public alias` 可以重新导出一个具体 public symbol。
+- 非 root module 的 public declaration 不会自动暴露为 package API。
+- dependency package 中的 `main` 不参与当前 package runtime entry 选择。
 
 ### Alias
 
@@ -575,7 +592,7 @@ alias name = module.symbol;
 未定事项：
 
 - ambiguous re-export 的诊断和恢复策略。
-- 跨 package import 的产物边界和依赖版本规则。
+- package artifact、版本求解、lockfile 和 registry 规则。
 
 ## 函数和方法
 
@@ -987,13 +1004,13 @@ if block is some _! dead {
 - `public` 标记声明对外可见。
 - 基本类型不是关键字，由名字解析绑定到内建声明。
 
-ambiguous re-export 和 package path 解析仍需后续完善。
+ambiguous re-export 仍需后续完善；package dependency 第一版只支持本地源码路径。
 
 名称解析需要单独定稿：
 
 - type namespace、value namespace、field namespace、variant namespace、trait/associated type namespace 是否分离。
 - `foo.Bar` 在不同上下文中如何解析为 module path、type member、variant 或 field。
-- import alias 和 package path 的解析顺序。
+- import alias 和 package path 的解析顺序：`import dep;` 优先查当前 package dependency alias。
 - 重复声明、shadowing 和 visibility 规则。
 
 ## 自定义语法
