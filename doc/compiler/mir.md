@@ -1,8 +1,8 @@
 # MIR 设计
 
 MIR 是 type check 之后的可执行语义 IR，用来承接后续 borrow check、drop 插入、优化和 backend。
-MIR 的输入是 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和 `ModuleGraph`；它不回读 AST，
-不重新 resolve，也不重新 type check。
+MIR 的输入是 HIR、`TypeCheckResults`、monomorph `MonomorphInstances`、`ModuleGraph`
+和按需查询的 `LayoutStore`；它不回读 AST，不重新 resolve，也不重新 type check。
 
 ## 边界
 
@@ -10,13 +10,15 @@ MIR 的输入是 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和 `
 - MIR body 由 locals、basic blocks、statements 和 terminators 组成。
 - HIR block 是表达式/语句容器；MIR basic block 是 CFG 节点。
 - MIR place 表达语义位置，例如 local、field、index、deref。
-- MIR field projection 保存 field `DefId` 和 field `TypeId`，不保存 field offset。
+- MIR field projection 保存 field `DefId`、field `TypeId` 和 layout field index，不保存 field offset。
 - 泛型模板函数不直接生成 MIR body；只有 `MonomorphInstances` 中的 concrete function instance
   会生成 MIR body。
-- MIR lowering 不依赖 layout，也不等待 `LayoutStore` 先计算完成。
+- MIR lowering 不自己计算 layout，但可以按需查询 `LayoutStore` 来固定 field index、type info
+  和 aggregate representation。layout 不需要在 MIR lowering 前批量完成。
 - HIR `for in` 在 MIR 中统一降成 index-loop CFG；range、array、slice 只影响 index 来源。
 
-MIR 生成完成后，borrow check 和 backend 可以把 MIR 与 layout 查询结果组合使用。
+MIR 生成完成后，borrow check、drop elaboration 和 backend 会继续把 MIR 与 layout 查询结果
+组合使用。
 
 ## Drop Elaboration
 
@@ -107,5 +109,5 @@ MIR lowering 接收 `MonomorphInstances`。非泛型函数按 `DefId` 直接 low
 
 - MIR 不保存 AST id。
 - MIR local 保留 `TypeId`；类型来源是 `TypeCheckResults`，不是 HIR nullable type 字段。
-- MIR 不保存 field offset、size、align 或 ABI 信息。
+- MIR 不保存 field offset、size、align 或 ABI 信息；这些事实只来自 `LayoutStore`。
 - backend-specific symbol/mangling 不写入 MIR。

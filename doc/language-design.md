@@ -3,7 +3,8 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前目标是固定 stage2 / 1.0 需要依赖的语言边界：词法、语法、类型、声明、泛型和错误处理。
+当前目标是固定 stage2 / 0.2 需要依赖的语言边界：词法、语法、类型、声明、泛型和
+错误处理。
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
 ## 状态标记
@@ -149,7 +150,8 @@ Int?& ref;         // reference to optional Int
 Int&! ref_slot;    // mutable slot containing non-owning reference to Int
 ```
 
-`T!&` 不作为目标语言类型存在。Jiang 的引用类型不表达 Rust 式“可变借用”或独占访问；`T&!` 中的 `!` 属于 reference 外层，只表示引用 slot 本身可重绑定。
+`T!&` 不作为目标语言类型存在。Jiang 的引用类型不表达“可变借用”或独占访问；
+`T&!` 中的 `!` 属于 reference 外层，只表示引用 slot 本身可重绑定。
 
 `Int!?`、`Int^!?`、`Int^^`、`Int&&`、`Int^&` 都是语法错误。编译器可以按规范顺序恢复后继续解析，但必须报告 diagnostic。
 
@@ -240,7 +242,8 @@ ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明�
 
 ## 指针、引用、数组和 Slice
 
-现阶段不引入 Rust 式 borrow checker，但先固定 pointer/reference 的目标语义：
+Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、lifetime 和 drop safety。
+这里先固定 pointer/reference 的目标语义：
 
 - `T^`：owning heap pointer，通常来自 `new T(...)`，拥有堆上对象；它不是 C 风格 raw pointer。
 - `T&`：非 owning 引用，不表达释放职责。通过 `T&` 可以读写目标内部声明为 `!` 的成员。
@@ -251,7 +254,9 @@ ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明�
 
 `T&`、`T&!` 和 `T[]` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]` 字段时，目标对象的生命周期必须覆盖包含该字段的值。
 
-Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入 `!` 成员时，语言类型系统不做 Rust 式排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、channel 或用户协议保证。
+Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
+`!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、
+channel 或用户协议保证。
 
 `^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
 或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*`、`T[*]` 和 `T[]`
@@ -318,7 +323,10 @@ _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 
 ## 所有权、implicit copy 和析构
 
-目标规则：Jiang 不引入完整 Rust 式 borrow checker，但必须把资源释放、自动析构、隐式复制和显式 move 的边界固定下来。
+目标规则：Jiang 不引入完整 alias borrow checker，但必须把资源释放、自动析构、隐式复制和
+显式 move 的边界固定下来。当前 borrow check 已经作为 MIR 后的必经阶段，用于检查
+move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable aliasing，
+也不负责 data-race freedom。
 
 所有权类型：
 
@@ -399,7 +407,8 @@ a.length; // 编译错误：a 已经 move
 // 作用域结束时只析构 b，不析构 a
 ```
 
-这套规则只解决所有权转移、析构和悬垂引用安全，不等同于 Rust 式 borrow checker。`T&` 不表达只读或独占访问，也不用于静态防止数据竞争。
+这套规则只解决所有权转移、析构和悬垂引用安全，不等同于完整 alias borrow checker。
+`T&` 不表达只读或独占访问，也不用于静态防止数据竞争。
 
 生命周期约束使用 `@life(...)` leading annotation 表达。`@life(a > b)` 表示 `a` 的目标 lifetime 必须 outlive `b`；`>` 只表示 outlives，不表示值比较或依赖方向。`@life` 与 `@where` 分离：`@where` 只描述类型、trait 和 associated type 约束，`@life` 只描述引用 lifetime 约束。
 
@@ -430,7 +439,9 @@ UInt8& first(UInt8& input);
 Slice make_slice(Buffer& buffer);
 ```
 
-第一版 lifetime 检查目标是防悬垂：局部引用不能逃出其来源 owner 的有效范围；owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数和存储到类型字段的关系通过 `@life` 检查。Jiang 不做 Rust 式 shared/mutable alias borrow checking。
+第一版 lifetime 检查目标是防悬垂：局部引用不能逃出其来源 owner 的有效范围；
+owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数和存储到类型字段的关系通过
+`@life` 检查。Jiang 不做 shared/mutable alias borrow checking。
 
 ## 隐式操作层
 
@@ -538,9 +549,10 @@ manifest 中的 `name` 和 dependency key 使用 Jiang lexer 的 identifier 规�
 首字符和后续字符。完整 Unicode XID 表后续可以替换 lexer 的底层判定，但 manifest 必须复用
 lexer 语义，不能另起一套名字规则。
 
-stage2 当前已经有 manifest parser，但 package/root 还没有接入完整编译入口；`ModuleResolver`
-暂时在一个 `QuerySystem` 内复用默认 root package。后续接入 manifest 后，`import dep;` 会优先
-按当前 package 的 dependency alias 解析到依赖 package root，再进入该 package 的 module namespace。
+stage2 当前已经把 manifest root 接入 compile path：目录输入会读取 `package.ini`，再编译
+manifest 指定的 root source。`ModuleResolver` 会按 source 所在目录向上查找 `package.ini`，
+创建或复用对应 package，并登记 `[dependencies]`。`import dep;` 会优先按当前 package
+的 dependency alias 解析到依赖 package root，再进入该 package 的 module namespace。
 
 ### Alias
 
@@ -573,10 +585,6 @@ type alias 在 resolve 中绑定到 type namespace。右侧必须是类型语法
 }
 ```
 
-Jiang 目标语言不支持函数参数标签和默认参数。函数参数按定义顺序进行位置匹配，调用参数也必须按位置提供。
-
-目标规则：resolve/sema 不基于参数标签或默认参数设计调用匹配规则。
-
 函数声明示例：
 
 ```jiang
@@ -584,6 +592,31 @@ Int add(Int left, Int right) {
     return left + right;
 }
 ```
+
+函数参数支持默认值。带默认值的参数必须位于参数列表尾部；当前默认值只支持 literal，
+并按参数的 expected type 检查：
+
+```jiang
+Int add(Int left, Int right = 1) {
+    return left + right;
+}
+```
+
+调用支持 C# 风格命名参数。位置参数必须出现在命名参数之前；命名参数可以重排，
+也可以跳过带默认值的参数：
+
+```jiang
+add(10);
+add(10, right: 20);
+draw(x: 1, y: 2);
+```
+
+type check 会把 call args 重排成函数签名顺序，并把缺失参数替换成默认值。这个结果写入
+`TypeCheckResults.call_args`，MIR lowering 只消费重排后的参数列表，不重新做 overload
+或默认参数匹配。
+
+同名函数和同名方法允许 overload。默认参数参与 overload 检查：如果两个 overload
+在同一调用点可能同时满足参数数量和参数类型，必须诊断为歧义，而不是依赖声明顺序选择其中一个。
 
 泛型函数：
 
@@ -667,13 +700,15 @@ trait Indexable {
 - `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver reference。
 - instance method 作为函数值时，隐式 receiver 展开为第一个参数。例如 `Int get()` 的函数值类型是 `Fn<Int, Self&>`，`Void set(Int value)` 的函数值类型是 `Fn<Void, Self&, Int>`。`static` 函数值没有 receiver 参数。
 - trait 可以声明 static function requirement；static requirement 没有 `self`，通过
-  `Type.method(args...)` 调用，也可以在泛型约束中通过 `T.method(args...)` 调用。非 `static` trait function requirement 隐含 `Self&` receiver。
+  `Type.method(args...)` 调用，也可以在泛型约束中通过 `T.method(args...)` 调用。
+  非 `static` trait function requirement 隐含 `Self&` receiver。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get() -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
 - union variant name 和同一 union 的 static/显式 method name 共享类型成员命名空间，不能重名，避免 `Union.member(...)` 歧义。
-- 同名函数和同名方法允许 overload；参数数量或参数类型必须不同。
+- 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须
+  能区分调用。
 - `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。
 - `Hashable` 继承 `Equatable`；可作为 hash key 的类型必须同时定义 hash 和相等比较。
-- `Hashable` / `Equatable` 属于 compiler core trait。std prelude 只导出同一个
+- `Movable` / `Hashable` / `Equatable` 属于 compiler core trait。std prelude 只导出同一个
   DefId；即使后续启用 no-std，它们仍然是语言核心约束。
 
 完整 trait solving、trait method lookup、associated type projection 仍需单独定稿。

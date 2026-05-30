@@ -486,7 +486,34 @@ struct FunctionBorrowChecker: Movable {
         }
         if (value is .address_of_value(address_of_value)) {
             self.add_loan(.raw_pointer_view, address_of_value.place, destination);
+            return;
         }
+        if (value is .use_value(use_value)) {
+            self.record_operand_loan(destination, use_value.value);
+        }
+    }
+
+    // 复制 `T&`/`T*` 值本身不会创建新 owner，但会把来源 loan 传播到目标 place。
+    // 这让 `return_value.field = input_ref` 这类字段写入能在 return 检查时被看见。
+    () record_operand_loan(mir.MirPlace destination, mir.MirOperand operand) {
+        guard self.operand_place(operand) is some source else { return; }
+        move_path.MovePathId source_path = self.paths.path_for_place(source);
+        if (self.active_loan_for_path(source_path) is some loan_id) {
+            loan.Loan current = self.results.loans.get(loan_id);
+            self.add_loan_from_paths(current.kind, current.source, self.paths.path_for_place(destination));
+            return;
+        }
+        if (self.place_handle_loan_kind(source) is some kind) {
+            self.add_loan(kind, source, destination);
+        }
+    }
+
+    loan.LoanKind? place_handle_loan_kind(mir.MirPlace place) {
+        types.TypeInfo info = self.ctx.query.types.get(self.place_type(place));
+        guard info.data is .handle_type(handle) else { return null; }
+        if (handle.kind == .reference) { return .reference_view; }
+        if (handle.kind == .raw_pointer) { return .raw_pointer_view; }
+        return null;
     }
 
     Bool place_is_compiler_temp(mir.MirPlace place) {
@@ -502,13 +529,14 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () add_loan(loan.LoanKind kind, mir.MirPlace source, mir.MirPlace target) {
-        loan.LoanId loan_id = self.results.add_loan(
-            kind,
-            self.function_id,
-            self.paths.path_for_place(source),
-            self.paths.path_for_place(target)
-        );
-        self.dataflow.active_loans.set(self.paths.path_for_place(target), loan_id);
+        move_path.MovePathId source_path = self.paths.path_for_place(source);
+        move_path.MovePathId target_path = self.paths.path_for_place(target);
+        self.add_loan_from_paths(kind, source_path, target_path);
+    }
+
+    () add_loan_from_paths(loan.LoanKind kind, move_path.MovePathId source, move_path.MovePathId target) {
+        loan.LoanId loan_id = self.results.add_loan(kind, self.function_id, source, target);
+        self.dataflow.active_loans.set(target, loan_id);
     }
 
     () check_terminator(mir.MirTerminator terminator) {
@@ -574,6 +602,9 @@ struct FunctionBorrowChecker: Movable {
 
     Bool return_lifetime_allows_loan(loan.LoanId loan_id) {
         loan.Loan current = self.results.loans.get(loan_id);
+        if (!self.return_target_lifetime_allows_loan(current)) {
+            return false;
+        }
         guard self.ctx.query.hirs.def(self.function_def) is some hir_def else {
             return false;
         }
@@ -581,6 +612,38 @@ struct FunctionBorrowChecker: Movable {
             return self.hir_has_explicit_return_lifetime(hir_def);
         }
         return self.hir_allows_return_lifetime(hir_def, source_symbol);
+    }
+
+    // 返回 aggregate 时，字段里的引用不仅需要函数 `source > return`，
+    // 还需要目标字段声明 `field > self`，否则返回值无法承诺字段引用不悬垂。
+    Bool return_target_lifetime_allows_loan(loan.Loan current) {
+        if (!self.is_return_local_path(current.target)) {
+            return true;
+        }
+        guard self.target_field_def(current.target) is some field_def else {
+            return true;
+        }
+        return self.field_has_self_lifetime(field_def);
+    }
+
+    Bool is_return_local_path(move_path.MovePathId path_id) {
+        move_path.MovePath path = self.paths.get(path_id);
+        return path.local_id.to_index() == self.body.return_local.to_index();
+    }
+
+    qid.DefId? target_field_def(move_path.MovePathId path_id) {
+        qid.DefId?! field_def = null;
+        move_path.MovePath! current = self.paths.get(path_id);
+        while (true) {
+            if (current.projection is some projection) {
+                if (projection is .field_projection(field)) {
+                    field_def = field.field_def;
+                }
+            }
+            guard current.parent is some parent else { return field_def; }
+            current = self.paths.get(parent);
+        }
+        return field_def;
     }
 
     Bool hir_has_explicit_return_lifetime(hir.HirDef& hir_def) {

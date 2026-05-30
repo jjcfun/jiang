@@ -9,21 +9,26 @@ Jiang Next 编译器围绕稳定的阶段边界组织。本文只保留整体架
 driver/cli -> pipeline.compile_with_options
                 |
                 v
-source -> syntax/AST -> ModuleGraph -> resolve/HIR -> type_check -> monomorph -> initial MIR
-                                                                            |         |
-                                                                            v         v
-                                                                        layout   borrow_check
-                                                                                      |
-                                                                                      v
-                                                                              drop_elaboration
-                                                                                      |
-                                                                                      v
-                                                                                   backend
+        source/AST -> HIR -> type facts -> MIR -> checked MIR -> backend output
+                                      \      \          \          \
+                                       ------ layout facts --------
 ```
 
+流程中的几个块对应：
+
+- `source/AST`：source、syntax、module graph 和 resolve。
+- `HIR`：resolve 直接生成的未类型化语义树。
+- `type facts`：`TypeCheckResults` 和 `MonomorphInstances`。
+- `MIR`：HIR lowering 生成的 CFG。
+- `checked MIR`：borrow check 后经过 drop elaboration 的 MIR。
+- `backend output`：LLVM IR、object file 或 executable。
+- `layout facts`：由 HIR、type facts 和 target layout 按需查询得到，供 MIR、borrow/drop 和
+  backend 使用。
+
 `layout` 是 query 层事实表，不从 MIR body 生成。它消费 HIR、`TypeCheckResults`、
-monomorph `MonomorphInstances` 和 target layout。MIR lowering 不依赖 layout；borrow check、
-drop elaboration 和 backend 按需查询 layout。
+monomorph `MonomorphInstances` 和 target layout。MIR lowering、borrow check、drop elaboration
+和 backend 都可以按需查询 layout；各阶段不能绕过 `LayoutStore` 自己推导 field offset、size
+或 ABI 表达。
 
 `--check` 当前仍会跑到 MIR、borrow check 和 drop elaboration，保证源码级语言契约不只停在
 type check。
@@ -43,7 +48,8 @@ type check。
   详见 [Type Check 设计](compiler/type-check.md)。
 - `monomorph` 运行在 type check 之后，负责收集 concrete generic instances；
   详见 [Monomorph 设计](compiler/monomorph.md)。
-- `mir` 包含 MIR 数据定义、HIR -> MIR lowering 和 drop elaboration；
+- `mir` 包含 MIR 数据定义、HIR -> MIR lowering 和 drop elaboration；MIR lowering 可以查询
+  layout 做布局相关的 representation 决策，但 layout 仍由 `layout` 模块统一计算；
   详见 [MIR 设计](compiler/mir.md)。
 - `layout` 负责 concrete type layout 查询和缓存；详见 [Layout 设计](compiler/layout.md)。
 - `borrow_check` 消费 MIR、`TypeCheckResults` 和 layout；详见
@@ -162,7 +168,8 @@ public trait Indexable {
 - `test/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
 - `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。
-  目录按语言功能优先组织，每个功能目录内部再按测试结果类型分组。
+  目录按语言功能优先组织，每个功能目录内部再按测试结果类型分组；覆盖策略见
+  [Language Testing 设计](compiler/lang-testing.md)。
 
 `test/lang` 当前按语言功能组织，每个功能目录内部再按结果类型组织：
 
@@ -180,19 +187,28 @@ test/lang/
   function/
     check/
     fail/
+    run/
   generic/
     check/
     fail/
+    run/
   import/
     check/
     fail/
   lifetime/
     check/
+  literal/
+    check/
+    fail/
+    run/
   nominal/
     check/
     fail/
   ownership/
     check/
+    fail/
+    run/
+  runtime/
     fail/
     run/
   type/
@@ -203,6 +219,7 @@ test/lang/
 
 - `check/`：期望 `jiangc --check` 成功。
 - `fail/`：期望 `jiangc --check` 失败，可用 `// expected: diagnostic_code` 精确匹配诊断。
+- `emit/`：期望 `jiangc --emit-llvm` 成功。
 - `run/`：后续用于需要生成并运行目标程序的端到端用例。
 - `diagnostic/`：后续用于精确检查多条 diagnostic、span 和消息的用例。
 
@@ -212,4 +229,5 @@ test/lang/
 JIANGC=/path/to/jiangc ./script/lang_check.sh
 ```
 
-`lang_check.sh` 递归扫描 `*/check/*.jiang` 和 `*/fail/*.jiang`，每个用例都会打印通过/失败状态。
+`lang_check.sh` 递归扫描 `*/check/*.jiang`、`*/fail/*.jiang`、`*/emit/*.jiang` 和
+`*/run/*.jiang`，每个用例都会打印通过/失败状态。

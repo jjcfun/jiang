@@ -298,7 +298,7 @@ Int* ptr = addr$.as(Int*);
 
 ### 数组（Array）
 
-数组的长度是类型的一部分，必须在编译期就确定，所以数组类型不支运行时改变长度，这与C、Rust、Zig类似。
+数组的长度是类型的一部分，必须在编译期就确定，所以数组类型不支持运行时改变长度。
 
 #### 不可变数组
 
@@ -380,7 +380,7 @@ foo[0][1] // 2
 
 ### 指针与引用
 
-Jiang 不引入完整 Rust 式 borrow checker，但会固定所有权、引用、析构和显式 move 的边界。
+Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、析构和显式 move 的边界。
 指针语义约定为：
 
 - `T^`：自动解引用的 owning heap pointer，适合 `new T` 这类场景；它不是 C 风格 raw pointer
@@ -532,7 +532,8 @@ a$.free();
 
 ### 所有权、implicit copy 和析构
 
-Jiang 的目标规则是不引入完整 Rust 式 borrow checker，但明确资源释放、自动析构、隐式 copy 和显式 move 的边界。
+Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源释放、自动析构、隐式 copy 和
+显式 move 的边界。
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
@@ -661,19 +662,27 @@ Jiang 的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 表�
 
 #### 函数参数
 
-Jiang 目前只支持普通位置参数：
+Jiang 支持位置参数、命名参数和尾部默认参数：
 
 ```c
-Int add(Int base, Int extra) {
+Int add(Int base, Int extra = 1) {
     return base + extra;
 }
 ```
 
 规则如下：
 
-- 参数按定义顺序匹配
-- 当前不支持标签参数
-- 当前不支持默认参数
+- 位置参数按定义顺序匹配
+- 带默认值的参数必须位于参数列表尾部
+- 当前默认值只支持 literal，并按参数 expected type 检查
+- 命名参数使用 `name: value`，可以重排或跳过带默认值的参数
+- 命名参数出现后，后续不能再出现位置参数
+- overload 决议必须能按参数数量和参数类型区分候选，否则诊断为歧义
+
+```c
+add(10);
+add(10, extra: 20);
+```
 
 #### 函数调用
 
@@ -1250,7 +1259,7 @@ struct 可以自定义 `init` 函数。
 - `init` 不能写成 `static init`
 - `Point(...)` / `new Point(...)` 是结构体构造语法
 - 如果类型定义了一个或多个 `init`，那么 `Point(...)` 会在这些 `init` 中按参数个数和参数类型做重载决议
-- `init` 只支持普通位置参数，不支持标签参数
+- `init` 支持普通位置参数、命名参数和尾部默认参数，规则与普通函数一致
 - 如果类型没有定义 `init`，那么默认字段初始化使用 `Point { field: value }`
 - 只要类型定义了 `init`，就不允许再用 `Point { ... }`
 - `new` 只接受构造形式，不支持任意表达式

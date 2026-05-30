@@ -1,8 +1,8 @@
 # Layout 设计
 
-layout 是 MIR 之后按需查询或批量物化的 concrete type layout 层。它的顺序位置在 MIR 之后，
-但数据来源不是 MIR body。layout 消费 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和
-`TargetLayout`，输出 `LayoutStore`。
+layout 是按需查询或批量物化的 concrete type layout 层。它的数据来源不是 MIR body。
+layout 消费 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和 `TargetLayout`，
+输出 `LayoutStore`。MIR lowering 可以触发 layout 查询，但不能自己计算 layout。
 
 ## 边界
 
@@ -22,8 +22,8 @@ HIR + TypeCheckResults + MonomorphInstances + TargetLayout
   -> LayoutStore
 ```
 
-borrow check 消费 `MIR + TypeCheckResults + LayoutStore`；drop elaboration 和 backend 消费
-`MIR + LayoutStore`。layout 查询由这些阶段按需触发，不要求在 MIR lowering 之前批量完成。
+MIR lowering、borrow check、drop elaboration 和 backend 都可以按需触发 layout 查询。
+layout 不要求在任何阶段之前批量完成。
 
 ## Store
 
@@ -82,12 +82,12 @@ aggregate layout 第一版使用自然 ABI 规则：每个 field offset 按 fiel
 layout 需要独立 active stack：
 
 - by-value struct/record 自递归是 layout cycle。
-- pointer/reference/slice/function pointer 后续接入后会打断 by-value layout cycle。
+- pointer/reference/slice/function pointer 会打断 by-value layout cycle。
 - cycle diagnostic 应通过 source map 指向参与 cycle 的 nominal definitions。
 
 ## 不变量
 
-- MIR lowering 不依赖 layout。
+- MIR lowering 不自己计算 layout；布局事实统一来自 `LayoutStore`。
 - layout 不改变类型检查结果。
 - backend 不能绕过 `LayoutStore` 自己推导 field offset。
 - generic nominal type layout 必须使用 concrete type args。
