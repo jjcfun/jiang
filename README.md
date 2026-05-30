@@ -4,8 +4,13 @@
 
 # Jiang语言
 
-当前jiang语言编译器处于 stage2 开发阶段。stage0 和 stage1 由 vibe coding 产生（在stage1分支）；
-stage2 将采取人工方式编写和审核代码。
+当前 Jiang 语言编译器处于 stage2 开发阶段，已经初步完成自举。stage0 和 stage1 由 vibe coding
+产生（在 stage1 分支）；stage2 将采取人工方式编写和审核代码。
+
+Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。这里先卖个关子：0.4 版本会引入一个
+杀手级特性，它会是这门语言真正拉开差异的起点。
+
+[官网与语言文档](https://jiang-lang.org/)
 
 
 
@@ -32,7 +37,7 @@ stage2 smoke 默认使用 `~/.jiang/stage1/bin/jiangc`。如需临时指定其�
 
 ## 文档
 
-- [语言指南](doc/jiang.md)
+- [官网与语言文档](https://jiang-lang.org/)
 - [架构文档](doc/architecture.md)
 - 阶段设计：[AST](doc/ast.md)、[Resolve](doc/resolve.md)、[HIR](doc/hir.md)、
   [Type Check](doc/type-check.md)、[Monomorph](doc/monomorph.md)、[MIR](doc/mir.md)、
