@@ -4,9 +4,12 @@ import hir = "../../hir/hir.jiang";
 import qid = "../../query/id.jiang";
 import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
+import namespace = "../../resolve/namespace.jiang";
 import list = "../../support/list.jiang";
 import string = "../../support/string.jiang";
+import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
+import sema_result = "../result.jiang";
 import types = "../type.jiang";
 import check_state = "./state.jiang";
 import type_ops_mod = "./type_ops.jiang";
@@ -37,6 +40,7 @@ public struct BodyCheck {
         guard self.state.hirs.def(def_id) is some hir_def else {
             return;
         }
+        self.check_parameter_defaults(hir_def);
         if (hir_def.body is some body) {
             qid.TypeId body_type = self.check_node(body.root);
             self.check_decl_body_result(def_id, hir_def, body.root, body_type);
@@ -46,6 +50,51 @@ public struct BodyCheck {
             self.check_body_tree(hir_def.members.get(index));
             index = index + 1;
         }
+    }
+
+    () check_parameter_defaults(hir.HirDef& hir_def) {
+        guard hir_def.decl.function_signature is some signature else { return; }
+        Bool! seen_default = false;
+        Int! index = 0;
+        while (index < signature.params.length) {
+            if (self.param_default_value(signature, index) is some value) {
+                seen_default = true;
+                self.check_parameter_default_value(signature, index, value);
+            } else if (seen_default) {
+                self.type_ops.add_def_error(
+                    hir_def.def_id,
+                    "required parameter cannot follow a default parameter",
+                    "default_parameter_order"
+                );
+            }
+            index = index + 1;
+        }
+    }
+
+    () check_parameter_default_value(hir.HirFunctionSignature signature, Int param_index, hir.HirId value) {
+        if (!self.supported_parameter_default(value)) {
+            self.type_ops.add_node_error(
+                value,
+                "parameter default value must be a literal",
+                "unsupported_parameter_default"
+            );
+            return;
+        }
+        qid.TypeId expected = self.type_ops.check_type_ref(signature.params[param_index]);
+        qid.TypeId value_type = self.check_node_expected(value, expected);
+        if (self.type_ops.value_assignable_to_expected(expected, value, value_type)) {
+            return;
+        }
+        self.type_ops.add_node_error(
+            value,
+            "parameter default value does not match parameter type",
+            "parameter_default_type_mismatch"
+        );
+    }
+
+    Bool supported_parameter_default(hir.HirId value) {
+        hir.HirNode node = self.state.hirs.node(value);
+        return node.data is .literal(_);
     }
 
     () check_decl_body_result(
@@ -1160,6 +1209,9 @@ public struct BodyCheck {
         if (literal.value is .char_value(_)) {
             return expected_info.data is .char_type;
         }
+        if (literal.value is .string_value(_)) {
+            return self.type_ops.string_literal_can_match_type(expected_type);
+        }
         if (literal.value is .unit_value) {
             return expected_info.data is .unit;
         }
@@ -1178,6 +1230,7 @@ public struct BodyCheck {
         // HIR 中的名字已经由 resolve 阶段变成 DefId 或 def-local HirLocalId。
         // type check 在这里不重新查名字，只读取对应定义/局部绑定的类型。
         if (name_ref is .def_ref(def_id)) {
+            self.state.results.select_member(node_id, def_id);
             return self.type_ops.type_for_def(def_id);
         }
         if (name_ref is .local(local_id)) {
@@ -1237,9 +1290,9 @@ public struct BodyCheck {
                 return self.check_variant_constructor_call(node_id, call, target.def_id);
             }
         }
-        if (call.target is some target) {
-            self.type_ops.record_generic_instance(node_id, target.def_id, type_args$.ref());
-            self.type_ops.check_type_arg_arity(node_id, target.def_id, type_args.len());
+        self.prepare_call_callee_selection(call);
+        if (self.selected_function_call_def(node_id, call, type_args$.ref()) is some selected_def) {
+            return self.check_selected_function_call(node_id, call, selected_def, type_args$.ref());
         }
         qid.TypeId callee_type = self.check_node(call.callee);
         types.TypeInfo callee_info = self.state.query.types.get(callee_type);
@@ -1249,7 +1302,7 @@ public struct BodyCheck {
             }
             return self.state.query.types.invalid_type();
         }
-        if (call.args.length != function_type.params.length) {
+        if (!self.record_ordered_call_args(node_id, call, function_type.params.length)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
                 node_id,
@@ -1258,13 +1311,15 @@ public struct BodyCheck {
             );
             return self.state.query.types.invalid_type();
         }
+        sema_result.OrderedCallArgs arg_values = self.state.results.ordered_call_args(node_id)$.some();
         Int! index = 0;
-        while (index < call.args.length) {
+        while (index < arg_values.values.length) {
             qid.TypeId expected = self.substituted_call_param_type(call, type_args$.ref(), function_type.params[index]);
-            qid.TypeId arg_type = self.check_node_expected(call.args[index], expected);
-            if (!self.type_ops.value_assignable_to_expected(expected, call.args[index], arg_type)) {
+            hir.HirId arg_value = arg_values.values[index];
+            qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
+            if (!self.type_ops.value_assignable_to_expected(expected, arg_value, arg_type)) {
                 self.type_ops.add_node_error(
-                    call.args[index],
+                    arg_value,
                     "call argument type does not match parameter type",
                     "call_arg_type_mismatch"
                 );
@@ -1272,6 +1327,356 @@ public struct BodyCheck {
             index = index + 1;
         }
         return self.substituted_call_result_type(call, type_args$.ref(), function_type.result);
+    }
+
+    () prepare_call_callee_selection(hir.HirCall call) {
+        if (self.initial_call_def(call) != null) {
+            return;
+        }
+        self.check_node(call.callee);
+    }
+
+    qid.TypeId check_selected_function_call(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.DefId selected_def,
+        list.ArrayList<qid.TypeId>& type_args
+    ) {
+        self.state.results.select_member(call.callee, selected_def);
+        self.type_ops.record_generic_instance(node_id, selected_def, type_args);
+        self.type_ops.check_type_arg_arity(node_id, selected_def, type_args.len());
+        qid.TypeId callee_type = self.selected_callee_type(call, selected_def);
+        types.TypeInfo callee_info = self.state.query.types.get(callee_type);
+        guard callee_info.data is .function_type(function_type) else {
+            if (!self.type_ops.is_invalid_type(callee_type)) {
+                self.type_ops.add_node_error(call.callee, "callee is not a function", "callee_not_function");
+            }
+            return self.state.query.types.invalid_type();
+        }
+        if (!self.record_ordered_call_args(node_id, call, function_type.params.length)) {
+            self.check_call_args(call);
+            self.type_ops.add_node_error(
+                node_id,
+                "call argument count does not match function signature",
+                "call_arity_mismatch"
+            );
+            return self.state.query.types.invalid_type();
+        }
+        return self.check_selected_call_args(node_id, call, selected_def, type_args, function_type);
+    }
+
+    qid.TypeId selected_callee_type(hir.HirCall call, qid.DefId selected_def) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        if (callee.data is .member_access(_)) {
+            return self.check_node(call.callee);
+        }
+        return self.type_ops.type_for_def(selected_def);
+    }
+
+    qid.TypeId check_selected_call_args(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.DefId selected_def,
+        list.ArrayList<qid.TypeId>& type_args,
+        types.FunctionType function_type
+    ) {
+        sema_result.OrderedCallArgs arg_values = self.state.results.ordered_call_args(node_id)$.some();
+        Int! index = 0;
+        while (index < arg_values.values.length) {
+            qid.TypeId param_type = function_type.params[index];
+            qid.TypeId expected = self.substituted_call_param_type_for_def(call, selected_def, type_args, param_type);
+            hir.HirId arg_value = arg_values.values[index];
+            qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
+            if (!self.type_ops.value_assignable_to_expected(expected, arg_value, arg_type)) {
+                self.type_ops.add_node_error(
+                    arg_value,
+                    "call argument type does not match parameter type",
+                    "call_arg_type_mismatch"
+                );
+            }
+            index = index + 1;
+        }
+        return self.substituted_call_result_type_for_def(call, selected_def, type_args, function_type.result);
+    }
+
+    qid.DefId? selected_function_call_def(
+        hir.HirId node_id,
+        hir.HirCall call,
+        list.ArrayList<qid.TypeId>& type_args
+    ) {
+        guard self.initial_call_def(call) is some initial_def else { return null; }
+        def.DefRecord initial = self.state.query.defs.get(initial_def);
+        if (!self.overloadable_call_kind(initial.kind)) {
+            return initial_def;
+        }
+        qid.DefId! selected = initial_def;
+        Int! matches = 0;
+        table.MultiTableCursor! cursor = self.state.query.resolve.first_binding_cursor(
+            initial.decl_namespace_id,
+            initial.name.symbol,
+            initial.domain
+        );
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.state.query.resolve.binding_at(cursor);
+            if (self.call_candidate_matches(call, binding.def_id, type_args)) {
+                selected = binding.def_id;
+                matches = matches + 1;
+            }
+            cursor = self.state.query.resolve.next_binding_cursor(cursor);
+        }
+        if (matches == 1) {
+            return selected;
+        }
+        if (matches > 1) {
+            self.type_ops.add_node_error(node_id, "function call is ambiguous", "ambiguous_call_overload");
+            return null;
+        }
+        return initial_def;
+    }
+
+    qid.DefId? initial_call_def(hir.HirCall call) {
+        if (self.state.results.member_selection(call.callee) is some selected_def) {
+            return selected_def;
+        }
+        if (call.target is some target) {
+            return target.def_id;
+        }
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .name_ref(name_ref) else { return null; }
+        if (name_ref is .def_ref(def_id)) {
+            return def_id;
+        }
+        return null;
+    }
+
+    Bool overloadable_call_kind(def.DefKind kind) {
+        if (kind == .function_def) { return true; }
+        if (kind == .init_def) { return true; }
+        if (kind == .deinit_def) { return true; }
+        return false;
+    }
+
+    Bool call_candidate_matches(
+        hir.HirCall call,
+        qid.DefId candidate_def,
+        list.ArrayList<qid.TypeId>& type_args
+    ) {
+        def.DefKind kind = self.state.query.defs.get(candidate_def).kind;
+        if (!self.overloadable_call_kind(kind)) {
+            return false;
+        }
+        guard self.function_signature_for_def(candidate_def) is some signature else { return false; }
+        qid.TypeId candidate_type = self.type_ops.type_for_def(candidate_def);
+        types.TypeInfo candidate_info = self.state.query.types.get(candidate_type);
+        guard candidate_info.data is .function_type(function_type) else { return false; }
+        list.ArrayList<hir.HirId>! values = self.empty_argument_values_count(function_type.params.length);
+        if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false)) {
+            return false;
+        }
+        return self.call_args_match_candidate_types(call, candidate_def, type_args, function_type, values$.ref());
+    }
+
+    Bool call_args_match_candidate_types(
+        hir.HirCall call,
+        qid.DefId candidate_def,
+        list.ArrayList<qid.TypeId>& type_args,
+        types.FunctionType function_type,
+        list.ArrayList<hir.HirId>& values
+    ) {
+        Int! index = 0;
+        while (index < values.len()) {
+            qid.TypeId param_type = function_type.params[index];
+            qid.TypeId expected = self.substituted_call_param_type_for_def(call, candidate_def, type_args, param_type);
+            hir.HirId value = values.get(index);
+            qid.TypeId value_type = self.check_node(value);
+            if (!self.type_ops.value_assignable_to_expected(expected, value, value_type)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool record_ordered_call_args(hir.HirId node_id, hir.HirCall call, Int param_count) {
+        guard self.call_signature(call) is some signature else {
+            return false;
+        }
+        if (signature.params.length != param_count) {
+            return false;
+        }
+        if (!self.order_call_argument_values(node_id, call, signature)) {
+            return false;
+        }
+        return true;
+    }
+
+    Bool order_call_argument_values(
+        hir.HirId node_id,
+        hir.HirCall call,
+        hir.HirFunctionSignature signature
+    ) {
+        list.ArrayList<hir.HirId>! values = self.empty_argument_values(signature);
+        if (!self.build_ordered_call_args(node_id, call, signature, values$.ref(), true)) {
+            return false;
+        }
+        self.state.results.set_call_args(node_id, values$.ref());
+        return true;
+    }
+
+    Bool build_ordered_call_args(
+        hir.HirId node_id,
+        hir.HirCall call,
+        hir.HirFunctionSignature signature,
+        list.ArrayList<hir.HirId>& values,
+        Bool emit_errors
+    ) {
+        Bool! seen_named = false;
+        Int! index = 0;
+        while (index < call.args.length) {
+            hir.HirCallArg arg = call.args[index];
+            if (!self.place_call_arg(node_id, arg, index, signature, values, seen_named, emit_errors)) {
+                return false;
+            }
+            seen_named = seen_named || arg.label != null;
+            index = index + 1;
+        }
+        if (!self.fill_missing_argument_defaults(signature, values)) {
+            return false;
+        }
+        return true;
+    }
+
+    Bool place_call_arg(
+        hir.HirId node_id,
+        hir.HirCallArg arg,
+        Int position,
+        hir.HirFunctionSignature signature,
+        list.ArrayList<hir.HirId>& values,
+        Bool seen_named,
+        Bool emit_errors
+    ) {
+        guard arg.label is some label else {
+            if (seen_named) {
+                if (emit_errors) {
+                    self.type_ops.add_node_error(
+                        node_id,
+                        "positional argument after named argument",
+                        "positional_after_named_arg"
+                    );
+                }
+                return false;
+            }
+            return self.place_positional_arg(arg.value, position, values);
+        }
+        guard self.param_index_for_label(signature, label) is some param_index else {
+            if (emit_errors) {
+                self.type_ops.add_node_error(arg.value, "unknown named argument", "unknown_named_argument");
+            }
+            return false;
+        }
+        return self.place_named_arg(arg.value, param_index, values, emit_errors);
+    }
+
+    list.ArrayList<hir.HirId> empty_argument_values(hir.HirFunctionSignature signature) {
+        return self.empty_argument_values_count(signature.params.length);
+    }
+
+    list.ArrayList<hir.HirId> empty_argument_values_count(Int count) {
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>(count);
+        Int! index = 0;
+        while (index < count) {
+            values.add(self.invalid_hir_id());
+            index = index + 1;
+        }
+        return values$.move();
+    }
+
+    Bool fill_missing_argument_defaults(hir.HirFunctionSignature signature, list.ArrayList<hir.HirId>& values) {
+        Int! index = 0;
+        while (index < values.len()) {
+            if (self.is_invalid_hir_id(values.get(index))) {
+                guard self.param_default_value(signature, index) is some value else { return false; }
+                values.set(index, value);
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool place_positional_arg(hir.HirId value, Int position, list.ArrayList<hir.HirId>& values) {
+        if (position >= values.len()) {
+            return false;
+        }
+        values.set(position, value);
+        return true;
+    }
+
+    Bool place_named_arg(hir.HirId value, Int param_index, list.ArrayList<hir.HirId>& values, Bool emit_errors) {
+        if (!self.is_invalid_hir_id(values.get(param_index))) {
+            if (emit_errors) {
+                self.type_ops.add_node_error(value, "duplicate named argument", "duplicate_named_argument");
+            }
+            return false;
+        }
+        values.set(param_index, value);
+        return true;
+    }
+
+    hir.HirId invalid_hir_id() {
+        return hir.HirId(qid.DefId.from_index(-1), -1);
+    }
+
+    Bool is_invalid_hir_id(hir.HirId id) {
+        return id.local_index < 0;
+    }
+
+    Int? param_index_for_label(hir.HirFunctionSignature signature, qid.SymbolId label) {
+        Int! index = 0;
+        while (index < signature.param_symbols.length) {
+            if (qid.SymbolId.equal(signature.param_symbols[index]$.ref(), label$.ref())) {
+                return index;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    hir.HirFunctionSignature? call_signature(hir.HirCall call) {
+        if (self.state.results.member_selection(call.callee) is some member_def) {
+            return self.function_signature_for_def(member_def);
+        }
+        if (call.target is some target) {
+            return self.function_signature_for_def(target.def_id);
+        }
+        return null;
+    }
+
+    hir.HirFunctionSignature? function_signature_for_def(qid.DefId def_id) {
+        guard self.state.hirs.def(def_id) is some hir_def else { return null; }
+        return hir_def.decl.function_signature;
+    }
+
+    Bool missing_params_have_defaults(hir.HirFunctionSignature signature, Int first_missing) {
+        Int! index = first_missing;
+        while (index < signature.params.length) {
+            if (self.param_default_value(signature, index) == null) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    hir.HirId? param_default_value(hir.HirFunctionSignature signature, Int param_index) {
+        Int! index = 0;
+        while (index < signature.param_defaults.length) {
+            hir.HirParamDefault param_default = signature.param_defaults[index];
+            if (param_default.param_index == param_index) {
+                return param_default.value;
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     qid.TypeId check_variant_constructor_call(hir.HirId node_id, hir.HirCall call, qid.DefId variant_def) {
@@ -1303,7 +1708,7 @@ public struct BodyCheck {
     () check_call_args(hir.HirCall call) {
         Int! index = 0;
         while (index < call.args.length) {
-            self.check_node(call.args[index]);
+            self.check_node(call.args[index].value);
             index = index + 1;
         }
     }
@@ -1321,8 +1726,8 @@ public struct BodyCheck {
             self.check_call_args(call);
             return false;
         }
-        qid.TypeId arg_type = self.check_node_expected(call.args[0], payload_type);
-        return self.type_ops.value_assignable_to_expected(payload_type, call.args[0], arg_type);
+        qid.TypeId arg_type = self.check_node_expected(call.args[0].value, payload_type);
+        return self.type_ops.value_assignable_to_expected(payload_type, call.args[0].value, arg_type);
     }
 
     Bool tuple_variant_args_match(hir.HirCall call, types.TupleType tuple_type) {
@@ -1332,8 +1737,9 @@ public struct BodyCheck {
         }
         Int! index = 0;
         while (index < call.args.length) {
-            qid.TypeId arg_type = self.check_node_expected(call.args[index], tuple_type.items[index]);
-            if (!self.type_ops.value_assignable_to_expected(tuple_type.items[index], call.args[index], arg_type)) {
+            hir.HirId arg_value = call.args[index].value;
+            qid.TypeId arg_type = self.check_node_expected(arg_value, tuple_type.items[index]);
+            if (!self.type_ops.value_assignable_to_expected(tuple_type.items[index], arg_value, arg_type)) {
                 return false;
             }
             index = index + 1;
@@ -1348,7 +1754,7 @@ public struct BodyCheck {
         if (self.type_constructor_init_def(result_type, call) is some init_def) {
             self.state.results.select_member(call.callee, init_def);
             self.record_constructor_instance(result_type, call, init_def);
-            self.check_constructor_args(result_type, call, init_def);
+            self.check_constructor_args(node_id, result_type, call, init_def);
             return result_type;
         }
         if (self.builtin_numeric_constructor_call(node_id, result_type, call)) {
@@ -1400,10 +1806,10 @@ public struct BodyCheck {
             );
             return true;
         }
-        qid.TypeId arg_type = self.check_node(call.args[0]);
+        qid.TypeId arg_type = self.check_node(call.args[0].value);
         if (!self.type_ops.is_numeric_type(arg_type)) {
             self.type_ops.add_node_error(
-                call.args[0],
+                call.args[0].value,
                 "numeric type constructor argument must be numeric",
                 "call_arg_type_mismatch"
             );
@@ -1473,23 +1879,35 @@ public struct BodyCheck {
     Bool init_args_match(qid.DefId init_def, hir.HirCall call) {
         guard self.state.hirs.def(init_def) is some init_hir else { return false; }
         guard init_hir.decl.function_signature is some signature else { return false; }
-        return signature.params.length == call.args.length;
+        list.ArrayList<hir.HirId>! values = self.empty_argument_values(signature);
+        return self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false);
     }
 
-    () check_constructor_args(qid.TypeId result_type, hir.HirCall call, qid.DefId init_def) {
+    () check_constructor_args(hir.HirId node_id, qid.TypeId result_type, hir.HirCall call, qid.DefId init_def) {
         types.TypeInfo result_info = self.state.query.types.get(result_type);
         guard result_info.data is .named(named) else { return; }
         guard self.state.hirs.def(init_def) is some init_hir else { return; }
         guard init_hir.decl.function_signature is some signature else { return; }
+        if (!self.record_ordered_call_args(node_id, call, signature.params.length)) {
+            self.check_call_args(call);
+            self.type_ops.add_node_error(
+                node_id,
+                "constructor argument count does not match init signature",
+                "type_constructor_arity_mismatch"
+            );
+            return;
+        }
+        sema_result.OrderedCallArgs arg_values = self.state.results.ordered_call_args(node_id)$.some();
         list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
         Int! index = 0;
-        while (index < call.args.length) {
+        while (index < arg_values.values.length) {
             qid.TypeId param_type = self.type_ops.check_type_ref(signature.params[index]);
             qid.TypeId expected = self.type_ops.substitute_generic_type(param_type, named.def_id, type_args$.ref());
-            qid.TypeId arg_type = self.check_node_expected(call.args[index], expected);
-            if (!self.type_ops.value_assignable_to_expected(expected, call.args[index], arg_type)) {
+            hir.HirId arg_value = arg_values.values[index];
+            qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
+            if (!self.type_ops.value_assignable_to_expected(expected, arg_value, arg_type)) {
                 self.type_ops.add_node_error(
-                    call.args[index],
+                    arg_value,
                     "constructor argument type does not match init parameter type",
                     "call_arg_type_mismatch"
                 );
@@ -1770,8 +2188,7 @@ public struct BodyCheck {
         qid.TypeId param_type
     ) {
         guard self.call_target_def(call) is some target_def else { return param_type; }
-        qid.TypeId substituted = self.type_ops.substitute_generic_type(param_type, target_def, type_args);
-        return self.substitute_call_self_type(call, target_def, substituted);
+        return self.substituted_call_param_type_for_def(call, target_def, type_args, param_type);
     }
 
     qid.TypeId substituted_call_result_type(
@@ -1780,15 +2197,37 @@ public struct BodyCheck {
         qid.TypeId result_type
     ) {
         guard self.call_target_def(call) is some target_def else { return result_type; }
+        return self.substituted_call_result_type_for_def(call, target_def, type_args, result_type);
+    }
+
+    qid.TypeId substituted_call_param_type_for_def(
+        hir.HirCall call,
+        qid.DefId target_def,
+        list.ArrayList<qid.TypeId>& type_args,
+        qid.TypeId param_type
+    ) {
+        qid.TypeId substituted = self.type_ops.substitute_generic_type(param_type, target_def, type_args);
+        return self.substitute_call_self_type(call, target_def, substituted);
+    }
+
+    qid.TypeId substituted_call_result_type_for_def(
+        hir.HirCall call,
+        qid.DefId target_def,
+        list.ArrayList<qid.TypeId>& type_args,
+        qid.TypeId result_type
+    ) {
         qid.TypeId substituted = self.type_ops.substitute_generic_type(result_type, target_def, type_args);
         return self.substitute_call_self_type(call, target_def, substituted);
     }
 
     qid.DefId? call_target_def(hir.HirCall call) {
+        if (self.state.results.member_selection(call.callee) is some member_def) {
+            return member_def;
+        }
         if (call.target is some target) {
             return target.def_id;
         }
-        return self.state.results.member_selection(call.callee);
+        return null;
     }
 
     qid.TypeId substitute_call_self_type(hir.HirCall call, qid.DefId target_def, qid.TypeId type_id) {

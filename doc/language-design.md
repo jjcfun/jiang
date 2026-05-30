@@ -81,6 +81,8 @@ Token 只表示词法事实，不承载语义类型。
 字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
 字符串字面量默认是 UTF-8 字节序列，当前可用于 `UInt8[_]` / `UInt8[]`。
+当 expected type 是 `CString` 时，字符串字面量表示以 `\0` 结尾的 C 字符串。
+这个语义由 type check/MIR 明确记录，不能依赖后端 API 自动补 NUL。
 
 ## 类型系统
 

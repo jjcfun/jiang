@@ -122,9 +122,14 @@ global_tail <- ("=" expr)? ";"
 function_tail
             <- generic_params? "(" param_list? ")" (";" / block)
 
-param_list  <- param ("," param)* ","?
+param_list  <- required_param ("," required_param)* ("," default_param)* ","?
+            / default_param ("," default_param)* ","?
 
-param       <- type name ("=" expr)?
+required_param
+            <- type name
+
+default_param
+            <- type name "=" expr
 ```
 
 说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。
@@ -132,6 +137,7 @@ param       <- type name ("=" expr)?
 等规则本身不重复写 `"public"`。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
+默认参数只能出现在参数列表尾部；带默认值的参数后面不能再出现必填参数。
 
 ## 泛型和 where 约束
 
