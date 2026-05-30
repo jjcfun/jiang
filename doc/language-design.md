@@ -492,6 +492,7 @@ lifetime 和 drop safety。
 - `public import name;`
 - `public import alias = "path.jiang";`
 - `alias Name = Type;`
+- `public alias exported = module.symbol;`
 - global declaration: `Type name = expr;`
 - function declaration / definition
 - `struct`
@@ -556,24 +557,25 @@ manifest 指定的 root source。`ModuleResolver` 会按 source 所在目录向�
 
 ### Alias
 
-stage2 当前只定义 type alias：
+alias 有两种目标：
 
 ```jiang
 alias Name = Type;
+alias name = module.symbol;
 ```
 
-type alias 在 resolve 中绑定到 type namespace。右侧必须是类型语法，不能是普通 value
-表达式或 module namespace。
+如果右侧解析为已有 namespace/type/value/member symbol，alias 会绑定到同一个 name domain，
+并在 HIR 中记录目标 `DefId`。如果右侧不能解析为已有 symbol，则按 type alias 处理，右侧必须
+是类型语法。
 
-通用 alias 暂不冻结。后续如果需要支持 value/module/member alias，仍使用
-`alias name = target;` 形式，再明确 target 推断、声明收集和循环依赖规则。
-
-在通用 alias 语义冻结前，`alias Name = Type;` 一律按 type alias 理解。
+`public alias` 是 package public surface 的显式 re-export 机制。package 对外只暴露 root file
+的 public namespace；root file 可以通过 `public import` 重新导出模块命名空间，也可以通过
+`public alias` 重新导出某个具体符号。非 root module 的 public 声明不会自动成为 package API。
 
 未定事项：
 
 - ambiguous re-export 的诊断和恢复策略。
-- 跨 package import 的路径解析和可见性边界。
+- 跨 package import 的产物边界和依赖版本规则。
 
 ## 函数和方法
 
@@ -981,6 +983,7 @@ if block is some _! dead {
 - `public import` 导入当前模块使用，并将被导入模块作为当前模块 public API 中的一个模块
   命名空间重新导出。它不摊平被导入模块的声明；例如 `middle` 中 `public import leaf;` 后，
   外部通过 `middle.leaf.Name` 访问，而不是 `middle.Name`。
+- `public alias name = target;` 将一个具体 symbol 重新导出到当前模块 public namespace。
 - `public` 标记声明对外可见。
 - 基本类型不是关键字，由名字解析绑定到内建声明。
 

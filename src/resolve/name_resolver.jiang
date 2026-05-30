@@ -26,7 +26,20 @@ public struct NameResolver {
     }
 
     public () collect_declarations() {
+        self.collect_declaration_names();
+        self.collect_aliases();
+        self.collect_extend_members();
+    }
+
+    public () collect_declaration_names() {
         self.for_each_top_level_item(.collect_declaration);
+    }
+
+    public () collect_aliases() {
+        self.for_each_top_level_item(.collect_alias);
+    }
+
+    public () collect_extend_members() {
         self.for_each_top_level_item(.collect_extend_member);
     }
 
@@ -108,6 +121,12 @@ public struct NameResolver {
             }
             return;
         }
+        if (pass == .collect_alias) {
+            if (body.data is .alias_decl(alias_decl)) {
+                self.collect_alias(alias_decl, self.decl_visibility(decl.modifiers), body.span);
+            }
+            return;
+        }
         if (pass == .collect_extend_member) {
             if (body.data is .extend_decl(extend_decl)) {
                 self.collect_extend_members(extend_decl);
@@ -146,17 +165,7 @@ public struct NameResolver {
             }
             return;
         }
-        if (body.data is .alias_decl(alias_decl)) {
-            self.define_top_level_name(
-                alias_decl.name,
-                .alias_def,
-                .type_name,
-                visibility,
-                body.span,
-                false
-            );
-            return;
-        }
+        if (body.data is .alias_decl(_)) { return; }
         if (body.data is .function_decl(function_decl)) {
             self.define_top_level_name(
                 function_decl.name,
@@ -250,6 +259,112 @@ public struct NameResolver {
         return binding.def_id;
     }
 
+    () collect_alias(ast.AliasData alias_decl, def.Visibility visibility, token.Span span) {
+        if (self.alias_target(alias_decl.target) is some target) {
+            self.define_alias_name(alias_decl.name, target, visibility, span);
+            return;
+        }
+        self.define_type_alias(alias_decl.name, visibility, span);
+    }
+
+    AliasTarget? alias_target(ast.AstId target_id) {
+        ast.AstNode target_node = self.state.file.get(target_id);
+        if (target_node.data is .type_ref(type_ref)) {
+            return self.alias_target(type_ref.base);
+        }
+        if (target_node.data is .named_type(named_type)) {
+            if (named_type.args.len == 0) {
+                return self.alias_target(named_type.path);
+            }
+            return null;
+        }
+        if (target_node.data is .path(path_data)) {
+            return self.alias_target_path(target_id, path_data);
+        }
+        if (target_node.data is .name(_)) {
+            return self.alias_target_name(target_id);
+        }
+        return null;
+    }
+
+    () define_type_alias(ast.AstId name_id, def.Visibility visibility, token.Span span) {
+        self.define_top_level_name(name_id, .alias_def, .type_name, visibility, span, false);
+    }
+
+    AliasTarget? alias_target_name(ast.AstId name_id) {
+        if (self.visible_binding(name_id, .namespace_name) is some target) { return target; }
+        if (self.visible_binding(name_id, .type_name) is some target) { return target; }
+        return self.visible_binding(name_id, .value_name);
+    }
+
+    AliasTarget? visible_binding(ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        guard (
+            self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
+            is some binding
+        ) else {
+            return null;
+        }
+        if (!self.def_accessible(binding.def_id)) {
+            return null;
+        }
+        return AliasTarget {def_id: binding.def_id, domain: domain};
+    }
+
+    AliasTarget? alias_target_path(ast.AstId target_id, ast.PathData path_data) {
+        if (path_data.segments.len == 1) {
+            return self.alias_target_name(self.state.file.child_at(path_data.segments, 0));
+        }
+        guard self.namespace_for_path_root(self.state.file.child_at(path_data.segments, 0)) is some namespace_id else {
+            return null;
+        }
+        qid.NamespaceId! current_namespace = namespace_id;
+        Int! index = 1;
+        while (index < path_data.segments.len) {
+            ast.AstId segment_id = self.state.file.child_at(path_data.segments, index);
+            Bool is_last = index + 1 == path_data.segments.len;
+            if (is_last) {
+                return self.alias_target_in_namespace(current_namespace, segment_id);
+            }
+            guard self.namespace_for_segment(current_namespace, segment_id) is some next_namespace else {
+                return null;
+            }
+            current_namespace = next_namespace;
+            index = index + 1;
+        }
+        return null;
+    }
+
+    AliasTarget? alias_target_in_namespace(qid.NamespaceId namespace_id, ast.AstId name_id) {
+        if (self.namespace_binding(namespace_id, name_id, .namespace_name) is some target) { return target; }
+        if (self.namespace_binding(namespace_id, name_id, .type_name) is some target) { return target; }
+        if (self.namespace_binding(namespace_id, name_id, .value_name) is some target) { return target; }
+        return self.namespace_binding(namespace_id, name_id, .member_name);
+    }
+
+    AliasTarget? namespace_binding(qid.NamespaceId namespace_id, ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        guard self.state.query.resolve.lookup_namespace(namespace_id, symbol, domain, false) is some binding else {
+            return null;
+        }
+        if (!self.def_accessible(binding.def_id)) {
+            return null;
+        }
+        return AliasTarget {def_id: binding.def_id, domain: domain};
+    }
+
+    Bool def_accessible(qid.DefId def_id) {
+        def.DefRecord def_record = self.state.query.defs.get(def_id);
+        if (def_record.visibility == .public_visibility) {
+            return true;
+        }
+        qid.ModuleId? maybe_module = def_record.module_id;
+        if (maybe_module is some module_id) {
+            return module_id.index == self.state.module_id.index;
+        }
+        return true;
+    }
+
     qid.NamespaceId? namespace_for_path_root(ast.AstId name_id) {
         guard self.state.name_symbol(name_id) is some symbol else { return null; }
         if (
@@ -330,6 +445,47 @@ public struct NameResolver {
         self.record_stable_def(def_id, kind, domain, symbol, self.module_owner_def(), span);
         self.record_hir_member(self.state.query.resolve.modules.get(self.state.module_id).def_id, def_id);
         return def_id;
+    }
+
+    qid.DefId? define_alias_name(
+        ast.AstId name_id,
+        AliasTarget target,
+        def.Visibility visibility,
+        token.Span span
+    ) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        token.Span name_span = self.state.file.get(name_id).span;
+        Bool! duplicate = false;
+        if (self.existing_top_level_conflict(symbol, target.domain, .alias_def) is some existing) {
+            duplicate = true;
+            self.add_duplicate_def_diagnostic(name_span, existing.span, symbol);
+        }
+        qid.NamespaceId?! owned_namespace = self.state.query.defs.get(target.def_id).owned_namespace_id;
+        qid.DefId alias_def = self.state.query.defs.create(
+            .alias_def,
+            target.domain,
+            visibility,
+            def.Name {symbol: symbol, span: name_span},
+            null,
+            self.state.module_id,
+            self.state.namespace_id,
+            owned_namespace
+        );
+        if (!duplicate) {
+            self.state.query.resolve.bind_name(
+                self.state.namespace_id,
+                symbol,
+                target.domain,
+                alias_def,
+                name_span
+            );
+        }
+        self.state.record_declaration_def(name_id, alias_def);
+        self.declare_hir_def(alias_def, .alias_def, span);
+        self.state.query.hirs.set_alias_target(alias_def, target.def_id);
+        self.record_stable_def(alias_def, .alias_def, target.domain, symbol, self.module_owner_def(), span);
+        self.record_hir_member(self.state.query.resolve.modules.get(self.state.module_id).def_id, alias_def);
+        return alias_def;
     }
 
     // 收集 declaration container 内部的 member 声明。
@@ -607,6 +763,9 @@ public struct NameResolver {
         if (kind == .generic_param_def) {
             return .generic_param_decl;
         }
+        if (kind == .alias_def) {
+            return .alias_decl;
+        }
         return .type_decl;
     }
 
@@ -808,5 +967,11 @@ public struct NameResolver {
 enum TopLevelPass {
     collect_import,
     collect_declaration,
+    collect_alias,
     collect_extend_member,
+}
+
+struct AliasTarget {
+    qid.DefId def_id;
+    def.NameDomain domain;
 }
