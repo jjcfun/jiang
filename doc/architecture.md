@@ -79,7 +79,7 @@ type check。
 - `MonomorphInstances`、`MirStore`、`ModuleGraph` 和 `BorrowCheckResults` 是单次 pipeline
   调用中的阶段产物。
 - `AstStore` 是一次 `compile_package` 的临时 AST cache，不挂到 `QuerySystem`。
-- `QueryCache` 当前只保留入口结构；0.3 再接入 cache-backed query dependency tracking。
+- 0.3 再引入 cache-backed query dependency tracking；0.2 不保留未接入的 cache 骨架。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `query/api.jiang` 增加高阶查询入口。
 
 ## 源码目录
