@@ -1351,8 +1351,6 @@ public struct BodyCheck {
         list.ArrayList<qid.TypeId>& type_args
     ) {
         self.state.results.select_member(call.callee, selected_def);
-        self.type_ops.record_generic_instance(node_id, selected_def, type_args);
-        self.type_ops.check_type_arg_arity(node_id, selected_def, type_args.len());
         qid.TypeId callee_type = self.selected_callee_type(call, selected_def);
         types.TypeInfo callee_info = self.state.query.types.get(callee_type);
         guard callee_info.data is .function_type(function_type) else {
@@ -1370,7 +1368,24 @@ public struct BodyCheck {
             );
             return self.state.query.types.invalid_type();
         }
+        self.complete_call_type_args(node_id, selected_def, type_args, function_type);
+        qid.DefId target_def = self.concrete_call_target(call, selected_def);
+        self.state.results.select_call_target(node_id, target_def);
         return self.check_selected_call_args(node_id, call, selected_def, type_args, function_type);
+    }
+
+    () complete_call_type_args(
+        hir.HirId node_id,
+        qid.DefId selected_def,
+        list.ArrayList<qid.TypeId>& type_args,
+        types.FunctionType function_type
+    ) {
+        if (type_args.len() == 0) {
+            sema_result.OrderedCallArgs values = self.state.results.ordered_call_args(node_id)$.some();
+            self.infer_function_type_args(selected_def, function_type, values.values, type_args);
+        }
+        self.type_ops.record_generic_instance(node_id, selected_def, type_args);
+        self.type_ops.check_type_arg_arity(node_id, selected_def, type_args.len());
     }
 
     qid.TypeId selected_callee_type(hir.HirCall call, qid.DefId selected_def) {
@@ -1405,6 +1420,47 @@ public struct BodyCheck {
             index = index + 1;
         }
         return self.substituted_call_result_type_for_def(call, selected_def, type_args, function_type.result);
+    }
+
+    qid.DefId concrete_call_target(hir.HirCall call, qid.DefId function_def) {
+        guard self.trait_owner_for_def(function_def) is some trait_def else {
+            return function_def;
+        }
+        guard self.concrete_static_receiver_def(call.callee) is some receiver_def else {
+            return function_def;
+        }
+        qid.SymbolId member_symbol = self.state.query.defs.get(function_def).name.symbol;
+        if (self.member_def_by_symbol(receiver_def, member_symbol) is some member_def) {
+            return member_def;
+        }
+        return function_def;
+    }
+
+    qid.DefId? concrete_static_receiver_def(hir.HirId callee_id) {
+        hir.HirNode callee = self.state.hirs.node(callee_id);
+        guard callee.data is .member_access(member_access) else { return null; }
+        qid.TypeId receiver_type = self.check_node(member_access.base);
+        types.TypeInfo receiver_info = self.state.query.types.get(receiver_type);
+        guard receiver_info.data is .named(named) else { return null; }
+        def.DefKind kind = self.state.query.defs.get(named.def_id).kind;
+        if (kind == .generic_param_def || kind == .trait_def) {
+            return null;
+        }
+        return named.def_id;
+    }
+
+    qid.DefId? member_def_by_symbol(qid.DefId owner_def, qid.SymbolId symbol) {
+        guard self.state.hirs.def(owner_def) is some owner_hir else { return null; }
+        Int! index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            def.DefRecord member_record = self.state.query.defs.get(member_def);
+            if (member_record.name.symbol.to_index() == symbol.to_index()) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     qid.DefId? selected_function_call_def(
@@ -1498,6 +1554,176 @@ public struct BodyCheck {
             hir.HirId value = values.get(index);
             qid.TypeId value_type = self.check_node(value);
             if (!self.type_ops.value_assignable_to_expected(expected, value, value_type)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    () infer_function_type_args(
+        qid.DefId function_def,
+        types.FunctionType function_type,
+        hir.HirId[] values,
+        list.ArrayList<qid.TypeId>& inferred
+    ) {
+        list.ArrayList<qid.DefId> param_defs = self.generic_param_defs(function_def);
+        if (param_defs.len() == 0) {
+            return;
+        }
+        self.init_inferred_type_args(param_defs$.ref(), inferred);
+        Int! index = 0;
+        while (index < values.length && index < function_type.params.length) {
+            qid.TypeId value_type = self.check_node(values[index]);
+            self.infer_type_arg(function_type.params[index], value_type, param_defs$.ref(), inferred);
+            index = index + 1;
+        }
+        if (!self.inferred_type_args_complete(inferred)) {
+            inferred.clear();
+        }
+    }
+
+    () init_inferred_type_args(list.ArrayList<qid.DefId>& param_defs, list.ArrayList<qid.TypeId>& inferred) {
+        Int! index = 0;
+        while (index < param_defs.len()) {
+            inferred.add(self.state.query.types.invalid_type());
+            index = index + 1;
+        }
+    }
+
+    list.ArrayList<qid.DefId> generic_param_defs(qid.DefId function_def) {
+        list.ArrayList<qid.DefId>! params = list.ArrayList<qid.DefId>();
+        if (self.state.query.defs.get(function_def).owner_def is some owner_def) {
+            self.add_generic_param_defs(owner_def, params$.ref());
+        }
+        self.add_generic_param_defs(function_def, params$.ref());
+        if (params.len() == 0) {
+            self.add_generic_param_defs_from_signature(function_def, params$.ref());
+        }
+        return params$.move();
+    }
+
+    () add_generic_param_defs(qid.DefId owner_def, list.ArrayList<qid.DefId>& params) {
+        guard self.state.hirs.def(owner_def) is some hir_def else { return; }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.state.query.defs.get(member_def).kind == .generic_param_def) {
+                params.add(member_def);
+            }
+            index = index + 1;
+        }
+    }
+
+    () add_generic_param_defs_from_signature(qid.DefId function_def, list.ArrayList<qid.DefId>& params) {
+        qid.TypeId function_type_id = self.type_ops.type_for_def(function_def);
+        types.TypeInfo info = self.state.query.types.get(function_type_id);
+        guard info.data is .function_type(function_type) else { return; }
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            self.add_generic_param_defs_from_type(function_type.params[index], params);
+            index = index + 1;
+        }
+        self.add_generic_param_defs_from_type(function_type.result, params);
+    }
+
+    () add_generic_param_defs_from_type(qid.TypeId type_id, list.ArrayList<qid.DefId>& params) {
+        types.TypeInfo info = self.state.query.types.get(type_id);
+        if (info.data is .named(named)) {
+            self.add_generic_param_defs_from_named(named, params);
+            return;
+        }
+        if (info.data is .handle_type(handle)) {
+            self.add_generic_param_defs_from_type(handle.element, params);
+        }
+    }
+
+    () add_generic_param_defs_from_named(types.NamedType named, list.ArrayList<qid.DefId>& params) {
+        if (self.state.query.defs.get(named.def_id).kind == .generic_param_def) {
+            self.add_unique_generic_param_def(named.def_id, params);
+            return;
+        }
+        Int! index = 0;
+        while (index < named.args.length) {
+            self.add_generic_param_defs_from_type(named.args[index], params);
+            index = index + 1;
+        }
+    }
+
+    () add_unique_generic_param_def(qid.DefId def_id, list.ArrayList<qid.DefId>& params) {
+        if (self.generic_param_index(params, def_id) != null) {
+            return;
+        }
+        params.add(def_id);
+    }
+
+    () infer_type_arg(
+        qid.TypeId template_type,
+        qid.TypeId actual_type,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred
+    ) {
+        types.TypeInfo template_info = self.state.query.types.get(template_type);
+        if (template_info.data is .named(named)) {
+            self.infer_named_type_arg(named, actual_type, param_defs, inferred);
+            return;
+        }
+        if (template_info.data is .handle_type(template_handle)) {
+            self.infer_handle_type_arg(template_handle, actual_type, param_defs, inferred);
+        }
+    }
+
+    () infer_named_type_arg(
+        types.NamedType template_named,
+        qid.TypeId actual_type,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred
+    ) {
+        if (self.generic_param_index(param_defs, template_named.def_id) is some param_index) {
+            inferred.set(param_index, actual_type);
+            return;
+        }
+        types.TypeInfo actual_info = self.state.query.types.get(actual_type);
+        guard actual_info.data is .named(actual_named) else { return; }
+        if (template_named.def_id != actual_named.def_id) {
+            return;
+        }
+        Int! index = 0;
+        while (index < template_named.args.length && index < actual_named.args.length) {
+            self.infer_type_arg(template_named.args[index], actual_named.args[index], param_defs, inferred);
+            index = index + 1;
+        }
+    }
+
+    () infer_handle_type_arg(
+        types.HandleType template_handle,
+        qid.TypeId actual_type,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred
+    ) {
+        types.TypeInfo actual_info = self.state.query.types.get(actual_type);
+        guard actual_info.data is .handle_type(actual_handle) else { return; }
+        if (template_handle.kind != actual_handle.kind) {
+            return;
+        }
+        self.infer_type_arg(template_handle.element, actual_handle.element, param_defs, inferred);
+    }
+
+    Int? generic_param_index(list.ArrayList<qid.DefId>& param_defs, qid.DefId def_id) {
+        Int! index = 0;
+        while (index < param_defs.len()) {
+            if (param_defs.get(index).to_index() == def_id.to_index()) {
+                return index;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool inferred_type_args_complete(list.ArrayList<qid.TypeId>& inferred) {
+        Int! index = 0;
+        while (index < inferred.len()) {
+            if (self.state.query.types.get(inferred.get(index)).data is .invalid) {
                 return false;
             }
             index = index + 1;
