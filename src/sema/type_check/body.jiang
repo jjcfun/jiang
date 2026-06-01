@@ -20,6 +20,7 @@ public struct BodyCheck {
     type_ops_mod.TypeOps& type_ops;
     pattern_mod.PatternCheck! pattern_check;
 
+    @life(state > self, type_ops > self)
     public init(check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
         self.state = state;
         self.type_ops = type_ops;
@@ -28,9 +29,9 @@ public struct BodyCheck {
 
     public () check_bodies() {
         Int! module_index = 0;
-        while (module_index < self.state.graph.modules.len()) {
-            qid.ModuleId module_id = self.state.graph.modules.get(module_index);
-            store.ModuleRecord module = self.state.query.resolve.modules.get(module_id);
+        while (module_index < self.state.graph.module_count()) {
+            qid.ModuleId module_id = self.state.graph.module_at(module_index);
+            store.ModuleRecord& module = self.state.query.resolve.modules.ref_at(module_id);
             self.check_body_tree(module.def_id);
             module_index = module_index + 1;
         }
@@ -600,6 +601,7 @@ public struct BodyCheck {
             return self.state.query.types.invalid_type();
         }
         self.state.results.select_member(node_id, member_def);
+        self.record_member_receiver_instance(node_id, base_type, member_def);
         if (self.state.query.defs.get(member_def).kind == .enum_case_def) {
             return self.enum_case_value_type(member_def);
         }
@@ -608,6 +610,23 @@ public struct BodyCheck {
             return self.state.query.types.mutable_type(member_type, token.Span());
         }
         return member_type;
+    }
+
+    () record_member_receiver_instance(hir.HirId node_id, qid.TypeId base_type, qid.DefId member_def) {
+        guard self.receiver_type_args(base_type, member_def) is some receiver_args else {
+            return;
+        }
+        list.ArrayList<qid.TypeId> args = self.type_args_list(receiver_args);
+        self.state.results.record_generic_instance_from_list(node_id, member_def, args$.ref());
+    }
+
+    qid.TypeId[]? receiver_type_args(qid.TypeId base_type, qid.DefId member_def) {
+        types.TypeInfo base_info = self.state.query.types.get(base_type);
+        guard base_info.data is .named(named) else { return null; }
+        if (named.args.length == 0) { return null; }
+        guard self.state.query.defs.get(member_def).owner_def is some owner_def else { return null; }
+        if (owner_def.to_index() != named.def_id.to_index()) { return null; }
+        return named.args;
     }
 
     qid.TypeId member_type_for_base(qid.TypeId base_type, qid.DefId member_def) {
@@ -630,6 +649,16 @@ public struct BodyCheck {
         // owner generic param 必须先代入 receiver 的 concrete type args。
         list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
         return self.type_ops.substitute_generic_type(member_type, named.def_id, type_args$.ref());
+    }
+
+    list.ArrayList<qid.TypeId> type_args_list(qid.TypeId[] type_args) {
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>(type_args.length);
+        Int! index = 0;
+        while (index < type_args.length) {
+            args.add(type_args[index]);
+            index = index + 1;
+        }
+        return args$.move();
     }
 
     qid.TypeId? enum_value_member_type(qid.TypeId base_type, qid.SymbolId member_symbol) {
@@ -716,8 +745,52 @@ public struct BodyCheck {
         if (self.index_element_type(base_type) is some element_type) {
             return element_type;
         }
+        if (self.subscript_get_type(node_id, index_access, base_type, index_type) is some element_type) {
+            return element_type;
+        }
         self.type_ops.add_node_error(node_id, "indexed value is not indexable", "not_indexable");
         return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId? subscript_get_type(
+        hir.HirId node_id,
+        hir.HirIndexAccess index_access,
+        qid.TypeId base_type,
+        qid.TypeId index_type
+    ) {
+        qid.SymbolId symbol = self.state.query.symbols.intern("subscript_get");
+        guard self.type_ops.value_member_for_type(base_type, node_id.owner_def, symbol) is some member_def else {
+            return null;
+        }
+        if (!self.type_ops.def_accessible_from(member_def, node_id.owner_def)) {
+            self.type_ops.add_node_error(node_id, "private definition is not accessible", "private_access");
+            return self.state.query.types.invalid_type();
+        }
+        qid.TypeId member_type = self.member_type_for_base(base_type, member_def);
+        types.TypeInfo member_info = self.state.query.types.get(member_type);
+        guard member_info.data is .function_type(function_type) else {
+            return null;
+        }
+        self.check_subscript_index_arg(index_access.index, index_type, member_def, function_type);
+        self.state.results.select_member(node_id, member_def);
+        self.record_member_receiver_instance(node_id, base_type, member_def);
+        return function_type.result;
+    }
+
+    () check_subscript_index_arg(
+        hir.HirId index_id,
+        qid.TypeId index_type,
+        qid.DefId member_def,
+        types.FunctionType function_type
+    ) {
+        Int param_offset = self.call_param_offset(member_def);
+        if (function_type.params.length <= param_offset) {
+            return;
+        }
+        qid.TypeId expected = function_type.params[param_offset];
+        if (!self.type_ops.value_assignable_to_expected(expected, index_id, index_type)) {
+            self.type_ops.add_node_error(index_id, "subscript index type does not match", "subscript_index_type_mismatch");
+        }
     }
 
     qid.TypeId check_slice_access(hir.HirId node_id, hir.HirSliceAccess slice_access) {
@@ -1215,7 +1288,7 @@ public struct BodyCheck {
             return expected_info.data is .bool_type;
         }
         if (literal.value is .char_value(_)) {
-            return expected_info.data is .char_type;
+            return expected_info.data is .char_type || self.type_ops.type_is_uint8(expected_type);
         }
         if (literal.value is .string_value(_)) {
             return self.type_ops.string_literal_can_match_type(expected_type);
@@ -1310,7 +1383,7 @@ public struct BodyCheck {
             }
             return self.state.query.types.invalid_type();
         }
-        if (!self.record_ordered_call_args(node_id, call, function_type.params.length)) {
+        if (!self.record_ordered_call_args(node_id, call)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
                 node_id,
@@ -1359,7 +1432,7 @@ public struct BodyCheck {
             }
             return self.state.query.types.invalid_type();
         }
-        if (!self.record_ordered_call_args(node_id, call, function_type.params.length)) {
+        if (!self.record_ordered_call_args(node_id, call)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
                 node_id,
@@ -1368,9 +1441,10 @@ public struct BodyCheck {
             );
             return self.state.query.types.invalid_type();
         }
-        self.complete_call_type_args(node_id, selected_def, type_args, function_type);
         qid.DefId target_def = self.concrete_call_target(call, selected_def);
+        self.complete_call_type_args(node_id, selected_def, type_args, function_type);
         self.state.results.select_call_target(node_id, target_def);
+        self.record_call_generic_instance(node_id, call, target_def, type_args);
         self.mark_call_lowering_plan(node_id, call, selected_def);
         return self.check_selected_call_args(node_id, call, selected_def, type_args, function_type);
     }
@@ -1382,7 +1456,7 @@ public struct BodyCheck {
         guard self.hash_receiver_node(call.callee) is some receiver else {
             return;
         }
-        if (self.type_has_builtin_integer_hash(self.check_node(receiver))) {
+        if (self.receiver_may_use_builtin_hash(self.check_node(receiver))) {
             self.state.results.mark_expr_lowering(node_id, .builtin_integer_hash);
         }
     }
@@ -1414,6 +1488,13 @@ public struct BodyCheck {
         return info.data is .int_type(_);
     }
 
+    Bool receiver_may_use_builtin_hash(qid.TypeId type_id) {
+        if (self.type_has_builtin_integer_hash(type_id)) {
+            return true;
+        }
+        return self.type_ops.is_generic_param_type(type_id);
+    }
+
     () complete_call_type_args(
         hir.HirId node_id,
         qid.DefId selected_def,
@@ -1424,8 +1505,49 @@ public struct BodyCheck {
             sema_result.OrderedCallArgs values = self.state.results.ordered_call_args(node_id)$.some();
             self.infer_function_type_args(selected_def, function_type, values.values, type_args);
         }
-        self.type_ops.record_generic_instance(node_id, selected_def, type_args);
         self.type_ops.check_type_arg_arity(node_id, selected_def, type_args.len());
+    }
+
+    () record_call_generic_instance(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.DefId target_def,
+        list.ArrayList<qid.TypeId>& function_args
+    ) {
+        list.ArrayList<qid.TypeId> args = self.call_instance_type_args(call, target_def, function_args);
+        self.state.results.record_generic_instance_from_list(node_id, target_def, args$.ref());
+    }
+
+    list.ArrayList<qid.TypeId> call_instance_type_args(
+        hir.HirCall call,
+        qid.DefId target_def,
+        list.ArrayList<qid.TypeId>& function_args
+    ) {
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>();
+        if (self.member_receiver_type_args(call.callee, target_def) is some receiver_args) {
+            self.append_type_arg_slice(args$.ref(), receiver_args);
+        }
+        Int! index = 0;
+        while (index < function_args.len()) {
+            args.add(function_args.get(index));
+            index = index + 1;
+        }
+        return args$.move();
+    }
+
+    qid.TypeId[]? member_receiver_type_args(hir.HirId callee_id, qid.DefId member_def) {
+        hir.HirNode callee = self.state.hirs.node(callee_id);
+        guard callee.data is .member_access(member_access) else { return null; }
+        qid.TypeId base_type = self.member_lookup_type(self.raw_member_base_type(member_access.base));
+        return self.receiver_type_args(base_type, member_def);
+    }
+
+    () append_type_arg_slice(list.ArrayList<qid.TypeId>& args, qid.TypeId[] type_args) {
+        Int! index = 0;
+        while (index < type_args.length) {
+            args.add(type_args[index]);
+            index = index + 1;
+        }
     }
 
     qid.TypeId selected_callee_type(hir.HirCall call, qid.DefId selected_def) {
@@ -1444,9 +1566,10 @@ public struct BodyCheck {
         types.FunctionType function_type
     ) {
         sema_result.OrderedCallArgs arg_values = self.state.results.ordered_call_args(node_id)$.some();
+        Int param_offset = self.call_param_offset(selected_def);
         Int! index = 0;
         while (index < arg_values.values.length) {
-            qid.TypeId param_type = function_type.params[index];
+            qid.TypeId param_type = function_type.params[index + param_offset];
             qid.TypeId expected = self.substituted_call_param_type_for_def(call, selected_def, type_args, param_type);
             hir.HirId arg_value = arg_values.values[index];
             qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
@@ -1460,6 +1583,16 @@ public struct BodyCheck {
             index = index + 1;
         }
         return self.substituted_call_result_type_for_def(call, selected_def, type_args, function_type.result);
+    }
+
+    Int call_param_offset(qid.DefId function_def) {
+        guard self.function_signature_for_def(function_def) is some signature else {
+            return 0;
+        }
+        if (signature.has_receiver) {
+            return 1;
+        }
+        return 0;
     }
 
     qid.DefId concrete_call_target(hir.HirCall call, qid.DefId function_def) {
@@ -1573,7 +1706,7 @@ public struct BodyCheck {
         qid.TypeId candidate_type = self.type_ops.type_for_def(candidate_def);
         types.TypeInfo candidate_info = self.state.query.types.get(candidate_type);
         guard candidate_info.data is .function_type(function_type) else { return false; }
-        list.ArrayList<hir.HirId>! values = self.empty_argument_values_count(function_type.params.length);
+        list.ArrayList<hir.HirId>! values = self.empty_argument_values(signature);
         if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false)) {
             return false;
         }
@@ -1587,18 +1720,37 @@ public struct BodyCheck {
         types.FunctionType function_type,
         list.ArrayList<hir.HirId>& values
     ) {
+        Int param_offset = self.call_param_offset(candidate_def);
         Int! index = 0;
         while (index < values.len()) {
-            qid.TypeId param_type = function_type.params[index];
+            qid.TypeId param_type = function_type.params[index + param_offset];
             qid.TypeId expected = self.substituted_call_param_type_for_def(call, candidate_def, type_args, param_type);
             hir.HirId value = values.get(index);
-            qid.TypeId value_type = self.check_node(value);
+            guard self.candidate_arg_type(value, expected) is some value_type else {
+                return false;
+            }
             if (!self.type_ops.value_assignable_to_expected(expected, value, value_type)) {
                 return false;
             }
             index = index + 1;
         }
         return true;
+    }
+
+    qid.TypeId? candidate_arg_type(hir.HirId value, qid.TypeId expected) {
+        hir.HirNode node = self.state.hirs.node(value);
+        if (node.data is .member_access(_)) {
+            if (self.dot_prefix_variant_def(value, expected) is some _) {
+                return expected;
+            }
+            return null;
+        }
+        if (node.data is .call(call)) {
+            if (self.dot_prefix_variant_def(call.callee, expected) is some _) {
+                return expected;
+            }
+        }
+        return self.check_node(value);
     }
 
     () infer_function_type_args(
@@ -1612,10 +1764,11 @@ public struct BodyCheck {
             return;
         }
         self.init_inferred_type_args(param_defs$.ref(), inferred);
+        Int param_offset = self.call_param_offset(function_def);
         Int! index = 0;
-        while (index < values.length && index < function_type.params.length) {
+        while (index < values.length && index + param_offset < function_type.params.length) {
             qid.TypeId value_type = self.check_node(values[index]);
-            self.infer_type_arg(function_type.params[index], value_type, param_defs$.ref(), inferred);
+            self.infer_type_arg(function_type.params[index + param_offset], value_type, param_defs$.ref(), inferred);
             index = index + 1;
         }
         if (!self.inferred_type_args_complete(inferred)) {
@@ -1633,13 +1786,7 @@ public struct BodyCheck {
 
     list.ArrayList<qid.DefId> generic_param_defs(qid.DefId function_def) {
         list.ArrayList<qid.DefId>! params = list.ArrayList<qid.DefId>();
-        if (self.state.query.defs.get(function_def).owner_def is some owner_def) {
-            self.add_generic_param_defs(owner_def, params$.ref());
-        }
         self.add_generic_param_defs(function_def, params$.ref());
-        if (params.len() == 0) {
-            self.add_generic_param_defs_from_signature(function_def, params$.ref());
-        }
         return params$.move();
     }
 
@@ -1771,11 +1918,8 @@ public struct BodyCheck {
         return true;
     }
 
-    Bool record_ordered_call_args(hir.HirId node_id, hir.HirCall call, Int param_count) {
+    Bool record_ordered_call_args(hir.HirId node_id, hir.HirCall call) {
         guard self.call_signature(call) is some signature else {
-            return false;
-        }
-        if (signature.params.length != param_count) {
             return false;
         }
         if (!self.order_call_argument_values(node_id, call, signature)) {
@@ -2027,6 +2171,7 @@ public struct BodyCheck {
         qid.TypeId result_type = self.type_constructor_result_type(call);
         if (self.type_constructor_init_def(result_type, call) is some init_def) {
             self.state.results.select_member(call.callee, init_def);
+            self.state.results.select_call_target(node_id, init_def);
             self.record_constructor_instance(result_type, call, init_def);
             self.check_constructor_args(node_id, result_type, call, init_def);
             return result_type;
@@ -2162,7 +2307,7 @@ public struct BodyCheck {
         guard result_info.data is .named(named) else { return; }
         guard self.state.hirs.def(init_def) is some init_hir else { return; }
         guard init_hir.decl.function_signature is some signature else { return; }
-        if (!self.record_ordered_call_args(node_id, call, signature.params.length)) {
+        if (!self.record_ordered_call_args(node_id, call)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
                 node_id,
@@ -2569,6 +2714,7 @@ public struct BodyCheck {
         qid.TypeId right = self.check_binary_right(binary, left);
         if (binary.op == .equal || binary.op == .not_equal) {
             self.type_ops.expect_compatible_binary_operands(node_id, left, right);
+            self.mark_aggregate_equality_if_needed(node_id, left, right);
             return self.state.query.types.bool_type();
         }
         if (binary.op == .less || binary.op == .less_equal
@@ -2594,6 +2740,29 @@ public struct BodyCheck {
             return self.type_ops.check_integer_binary(node_id, left, right);
         }
         return self.state.query.types.invalid_type();
+    }
+
+    () mark_aggregate_equality_if_needed(hir.HirId node_id, qid.TypeId left, qid.TypeId right) {
+        if (self.type_has_aggregate_equality(left) || self.type_has_aggregate_equality(right)) {
+            self.state.results.mark_expr_lowering(node_id, .aggregate_equality);
+        }
+    }
+
+    Bool type_has_aggregate_equality(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.query.types.get(type_id);
+        if (info.data is .tuple_type(_)) { return true; }
+        if (info.data is .array_type(_)) { return true; }
+        if (info.data is .optional(_)) { return true; }
+        if (info.data is .error_union(_)) { return true; }
+        if (info.data is .handle_type(handle)) { return handle.kind == .slice; }
+        if (info.data is .named(named)) { return self.named_type_has_aggregate_equality(named.def_id); }
+        return false;
+    }
+
+    Bool named_type_has_aggregate_equality(qid.DefId def_id) {
+        def.DefKind kind = self.state.query.defs.get(def_id).kind;
+        if (kind == .struct_def || kind == .record_def) { return true; }
+        return kind == .union_def;
     }
 
     qid.TypeId check_binary_right(hir.HirBinary binary, qid.TypeId left) {

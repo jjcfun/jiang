@@ -30,6 +30,7 @@ public struct PackageBorrowChecker {
     public layout.LayoutStore& layouts;
     public result.BorrowCheckResults& results;
 
+    @life(ctx > self, typeck > self, layouts > self, results > self)
     public init(
         context.CompilerContext& ctx,
         sema_result.TypeCheckResults& typeck,
@@ -339,6 +340,9 @@ struct FunctionBorrowChecker: Movable {
             return;
         }
         if (self.rvalue_contains_borrowed_value(value)) {
+            if (self.current_function_is_init() && self.destination_has_deref_projection(destination)) {
+                return;
+            }
             if (self.assignment_lifetime_allows_escape(destination, value)) {
                 return;
             }
@@ -354,17 +358,67 @@ struct FunctionBorrowChecker: Movable {
         if (value is .address_of_value(address_of_value)) {
             return self.field_lifetime_allows_borrow_store(destination, address_of_value.place);
         }
+        if (value is .use_value(use_value)) {
+            return self.self_lifetime_allows_borrow_store(destination, use_value.value);
+        }
+        if (value is .cast_value(cast_value)) {
+            return self.self_lifetime_allows_borrow_store(destination, cast_value.value);
+        }
         return false;
     }
 
+    Bool self_lifetime_allows_borrow_store(mir.MirPlace destination, mir.MirOperand operand) {
+        guard self.operand_place(operand) is some source else { return false; }
+        if (!self.destination_may_be_initialized_self(destination)) {
+            return false;
+        }
+        return self.source_root_param_symbol(self.paths.path_for_place(source)) != null;
+    }
+
+    Bool destination_is_self_place(mir.MirPlace destination) {
+        move_path.MovePath path = self.paths.get(self.paths.root_for_local(destination.local_id));
+        Int local_index = path.local_id.to_index();
+        if (local_index < 0 || local_index >= self.body.locals.length) {
+            return false;
+        }
+        mir.MirLocalDecl local = self.body.locals[local_index];
+        guard local.name is some symbol else { return false; }
+        return self.source_symbol_is_self(symbol);
+    }
+
     Bool field_lifetime_allows_borrow_store(mir.MirPlace destination, mir.MirPlace source) {
-        guard self.destination_field_def(destination) is some field_def else {
+        guard self.destination_field_def(destination) is some _ else {
             return false;
         }
-        if (!self.field_has_self_lifetime(field_def)) {
+        if (destination.local_id.to_index() == source.local_id.to_index()) {
+            return true;
+        }
+        if (!self.destination_may_be_initialized_self(destination)) {
             return false;
         }
-        return destination.local_id.to_index() == source.local_id.to_index();
+        return self.source_root_param_symbol(self.paths.path_for_place(source)) != null;
+    }
+
+    Bool destination_may_be_initialized_self(mir.MirPlace destination) {
+        if (self.destination_is_self_place(destination)) {
+            return true;
+        }
+        return self.current_function_is_init() && self.destination_has_deref_projection(destination);
+    }
+
+    Bool current_function_is_init() {
+        return self.ctx.query.defs.get(self.function_def).kind == .init_def;
+    }
+
+    Bool destination_has_deref_projection(mir.MirPlace destination) {
+        Int! index = 0;
+        while (index < destination.projection.length) {
+            if (destination.projection[index] is .deref_projection) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     qid.DefId? destination_field_def(mir.MirPlace destination) {
@@ -377,28 +431,6 @@ struct FunctionBorrowChecker: Movable {
             index = index + 1;
         }
         return field_def;
-    }
-
-    Bool field_has_self_lifetime(qid.DefId field_def) {
-        guard self.ctx.query.hirs.def(field_def) is some hir_def else {
-            return false;
-        }
-        Int! index = 0;
-        while (index < hir_def.lifetime_constraints.len()) {
-            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
-            if (self.is_field_self_lifetime_constraint(constraint)) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool is_field_self_lifetime_constraint(hir.HirLifetimeConstraint constraint) {
-        if (constraint.shorter.kind != .self_lifetime) {
-            return false;
-        }
-        return constraint.longer.kind == .named_lifetime;
     }
 
     Bool place_may_write_outside_current_body(mir.MirPlace place) {
@@ -511,8 +543,8 @@ struct FunctionBorrowChecker: Movable {
     loan.LoanKind? place_handle_loan_kind(mir.MirPlace place) {
         types.TypeInfo info = self.ctx.query.types.get(self.place_type(place));
         guard info.data is .handle_type(handle) else { return null; }
-        if (handle.kind == .reference) { return .reference_view; }
-        if (handle.kind == .raw_pointer) { return .raw_pointer_view; }
+        if (types.is_reference_handle(handle)) { return loan.reference_view_kind(); }
+        if (types.is_raw_pointer_handle(handle)) { return loan.raw_pointer_view_kind(); }
         return null;
     }
 
@@ -601,6 +633,9 @@ struct FunctionBorrowChecker: Movable {
     }
 
     Bool return_lifetime_allows_loan(loan.LoanId loan_id) {
+        if (self.current_function_is_init()) {
+            return true;
+        }
         loan.Loan current = self.results.loans.get(loan_id);
         if (!self.return_target_lifetime_allows_loan(current)) {
             return false;
@@ -614,16 +649,11 @@ struct FunctionBorrowChecker: Movable {
         return self.hir_allows_return_lifetime(hir_def, source_symbol);
     }
 
-    // 返回 aggregate 时，字段里的引用不仅需要函数 `source > return`，
-    // 还需要目标字段声明 `field > self`，否则返回值无法承诺字段引用不悬垂。
     Bool return_target_lifetime_allows_loan(loan.Loan current) {
         if (!self.is_return_local_path(current.target)) {
             return true;
         }
-        guard self.target_field_def(current.target) is some field_def else {
-            return true;
-        }
-        return self.field_has_self_lifetime(field_def);
+        return true;
     }
 
     Bool is_return_local_path(move_path.MovePathId path_id) {
@@ -712,7 +742,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () check_call(mir.MirCallTerminator call_term) {
-        self.check_operand(call_term.callee);
+        self.check_call_callee(call_term.callee);
         Int! index = 0;
         while (index < call_term.args.length) {
             self.check_operand(call_term.args[index]);
@@ -720,6 +750,12 @@ struct FunctionBorrowChecker: Movable {
         }
         self.clear_place(call_term.destination);
         self.record_call_return_loan(call_term);
+    }
+
+    () check_call_callee(mir.MirCallCallee callee) {
+        if (callee is .indirect_operand(operand)) {
+            self.check_operand(operand);
+        }
     }
 
     () record_call_return_loan(mir.MirCallTerminator call_term) {
@@ -733,9 +769,8 @@ struct FunctionBorrowChecker: Movable {
         }
     }
 
-    qid.DefId? callee_function_def(mir.MirOperand callee) {
-        guard callee is .const_operand(constant) else { return null; }
-        guard constant.value is .function_value(function_value) else { return null; }
+    qid.DefId? callee_function_def(mir.MirCallCallee callee) {
+        guard callee is .direct_function(function_value) else { return null; }
         return function_value.function_def;
     }
 
