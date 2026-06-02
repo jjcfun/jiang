@@ -1,0 +1,208 @@
+// Object artifact 复用计划。
+//
+// CodegenUnitKey 只是本轮 MIR 分组 key，里面包含 session-local module/def/type
+// index，不能直接作为本地 cache key。这里把 codegen unit 转成稳定 object key、
+// 规划 cache path，并统一执行 object lookup。pipeline 后续只消费这个计划，不
+// 需要知道 object key/path 的拼装细节。
+
+import codegen_unit = "../backend/codegen_unit.jiang";
+import context = "../context.jiang";
+import mir = "../mir/mir.jiang";
+import qid = "../query/id.jiang";
+import qkey = "../query/key.jiang";
+import list = "../support/list.jiang";
+import object_artifact = "./object.jiang";
+import object_key = "./object_key.jiang";
+import object_key_builder = "./object_key_builder.jiang";
+import object_lookup = "./object_lookup.jiang";
+import artifact_path = "./path.jiang";
+
+public enum ObjectPlanEntryKind {
+    source_object,
+    monomorph_object,
+    unsupported,
+}
+
+public struct ObjectPlanEntry: Movable {
+    public ObjectPlanEntryKind kind;
+    public Int unit_index;
+    public UInt8[] path;
+    public object_artifact.ObjectArtifactLookup lookup;
+    public object_artifact.SourceObjectKey? source_key;
+    public object_key.StableInstanceKey? monomorph_key;
+
+    public init(
+        ObjectPlanEntryKind kind,
+        Int unit_index,
+        UInt8[] path,
+        object_artifact.ObjectArtifactLookup lookup
+    ) {
+        self.kind = kind;
+        self.unit_index = unit_index;
+        self.path = path;
+        self.lookup = lookup;
+        self.source_key = null;
+        self.monomorph_key = null;
+    }
+
+    public static ObjectPlanEntry source(
+        Int unit_index,
+        UInt8[] path,
+        object_artifact.SourceObjectKey key,
+        object_artifact.ObjectArtifactLookup lookup
+    ) {
+        ObjectPlanEntry! entry = ObjectPlanEntry(.source_object, unit_index, path, lookup);
+        entry.source_key = key;
+        return entry$.move();
+    }
+
+    public static ObjectPlanEntry monomorph(
+        Int unit_index,
+        UInt8[] path,
+        object_key.StableInstanceKey key,
+        object_artifact.ObjectArtifactLookup lookup
+    ) {
+        ObjectPlanEntry! entry = ObjectPlanEntry(.monomorph_object, unit_index, path, lookup);
+        entry.monomorph_key = key$.move();
+        return entry$.move();
+    }
+
+    public static ObjectPlanEntry unsupported(Int unit_index) {
+        return ObjectPlanEntry(
+            .unsupported,
+            unit_index,
+            "",
+            object_artifact.ObjectArtifactLookup.make_missing(.source_object)
+        );
+    }
+
+    public Bool can_reuse() {
+        return self.lookup.status == .hit;
+    }
+}
+
+public struct ObjectReusePlan: Movable {
+    public list.ArrayList<ObjectPlanEntry> entries;
+
+    public init() {
+        self.entries = list.ArrayList<ObjectPlanEntry>();
+    }
+
+    public Int len() {
+        return self.entries.len();
+    }
+
+    @life(self > return)
+    public ObjectPlanEntry& entry_at(Int index) {
+        return self.entries.ref_at(index);
+    }
+
+    public Int reusable_count() {
+        Int! count = 0;
+        Int! index = 0;
+        while (index < self.entries.len()) {
+            if (self.entries.ref_at(index).can_reuse()) {
+                count = count + 1;
+            }
+            index = index + 1;
+        }
+        return count;
+    }
+}
+
+public ObjectReusePlan build_object_reuse_plan(
+    context.CompilerContext& ctx,
+    mir.MirStore& store,
+    codegen_unit.CodegenUnitSet& units,
+    UInt8[] cache_root,
+    UInt8[] target_triple,
+    UInt8[] compiler_version
+) {
+    ObjectReusePlan! plan = ObjectReusePlan();
+    qkey.Fingerprint128 target_hash = object_key_builder.target_fingerprint(target_triple);
+    qkey.Fingerprint128 compiler_hash = object_key_builder.compiler_fingerprint(compiler_version);
+    Int! index = 0;
+    while (index < units.len()) {
+        plan.entries.add(plan_entry_for_unit(
+            ctx,
+            store,
+            units.unit_at(index),
+            index,
+            cache_root,
+            target_hash,
+            compiler_hash
+        ));
+        index = index + 1;
+    }
+    return plan$.move();
+}
+
+ObjectPlanEntry plan_entry_for_unit(
+    context.CompilerContext& ctx,
+    mir.MirStore& store,
+    codegen_unit.CodegenUnit& unit,
+    Int unit_index,
+    UInt8[] cache_root,
+    qkey.Fingerprint128 target_hash,
+    qkey.Fingerprint128 compiler_hash
+) {
+    if (unit.key.kind == .source_unit) {
+        return source_entry_for_unit(ctx, unit, unit_index, cache_root, target_hash, compiler_hash);
+    }
+    return monomorph_entry_for_unit(ctx, store, unit, unit_index, cache_root, target_hash, compiler_hash);
+}
+
+ObjectPlanEntry source_entry_for_unit(
+    context.CompilerContext& ctx,
+    codegen_unit.CodegenUnit& unit,
+    Int unit_index,
+    UInt8[] cache_root,
+    qkey.Fingerprint128 target_hash,
+    qkey.Fingerprint128 compiler_hash
+) {
+    qid.ModuleId module_id = qid.ModuleId.from_index(unit.key.module_index);
+    object_key_builder.SourceObjectFingerprints fingerprints =
+        object_key_builder.source_object_fingerprints_for_module(ctx, module_id);
+    guard object_key_builder.source_object_key_for_module(
+        ctx,
+        module_id,
+        fingerprints,
+        target_hash,
+        compiler_hash
+    ) is some key else {
+        return ObjectPlanEntry.unsupported(unit_index);
+    }
+
+    UInt8[] path = artifact_path.source_object_path(cache_root, key);
+    object_artifact.ObjectArtifactLookup lookup =
+        object_lookup.lookup_source_object_file(ctx.query.object_artifacts$.ref(), key);
+    return ObjectPlanEntry.source(unit_index, path, key, lookup);
+}
+
+ObjectPlanEntry monomorph_entry_for_unit(
+    context.CompilerContext& ctx,
+    mir.MirStore& store,
+    codegen_unit.CodegenUnit& unit,
+    Int unit_index,
+    UInt8[] cache_root,
+    qkey.Fingerprint128 target_hash,
+    qkey.Fingerprint128 compiler_hash
+) {
+    if (unit.functions.len() == 0) {
+        return ObjectPlanEntry.unsupported(unit_index);
+    }
+    mir.MirFunction function = store.function(unit.functions.get(0));
+    guard object_key_builder.stable_instance_key_for_function(
+        ctx,
+        function,
+        target_hash,
+        compiler_hash
+    ) is some key else {
+        return ObjectPlanEntry.unsupported(unit_index);
+    }
+
+    UInt8[] path = artifact_path.monomorph_object_path(cache_root, key$.ref());
+    object_artifact.ObjectArtifactLookup lookup =
+        object_lookup.lookup_monomorph_object_file(ctx.query.object_artifacts$.ref(), key$.ref());
+    return ObjectPlanEntry.monomorph(unit_index, path, key$.move(), lookup);
+}

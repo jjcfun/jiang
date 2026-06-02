@@ -1,0 +1,304 @@
+// 从 ModuleInterface 加载 declaration skeleton。
+//
+// InterfaceLoader 不加载 body，也不伪造 type-check 结果。它只把 `.ji`
+// interface 里的声明面重建到当前 session 的 DefTable / NamespaceTable /
+// HirStore 中，让下游 module 可以做 name resolve 和签名查询。
+
+import context = "../context.jiang";
+import artifact = "../artifact/source.jiang";
+import query = "../query/api.jiang";
+import ast_store = "../query/ast_store.jiang";
+import qid = "../query/id.jiang";
+import qkey = "../query/key.jiang";
+import list = "../support/list.jiang";
+import table = "../support/table.jiang";
+import hir = "../hir/hir.jiang";
+import source = "../source/source.jiang";
+import token = "../syntax/token.jiang";
+import def = "./def.jiang";
+import module_graph_builder = "./module_graph_builder.jiang";
+import resolve_state = "./state.jiang";
+import store = "./store.jiang";
+
+public struct InterfaceLoader {
+    context.CompilerContext& ctx;
+    query.QuerySystem& query;
+    ast_store.AstStore& asts;
+    table.HashTable<qid.ModuleId, module_graph_builder.ModuleResolvePassState>& module_states;
+    table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs;
+
+    @life(ctx > self, asts > self, module_states > self, declaration_defs > self)
+    public init(
+        context.CompilerContext& ctx,
+        ast_store.AstStore& asts,
+        table.HashTable<qid.ModuleId, module_graph_builder.ModuleResolvePassState>& module_states,
+        table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs
+    ) {
+        self.ctx = ctx;
+        self.query = ctx.query$.ref();
+        self.asts = asts;
+        self.module_states = module_states;
+        self.declaration_defs = declaration_defs;
+    }
+
+    public qid.ModuleId load_module_interface(artifact.ModuleInterface& module_interface) {
+        module_graph_builder.ModuleGraphBuilder builder = module_graph_builder.ModuleGraphBuilder(
+            self.ctx,
+            self.asts,
+            self.module_states,
+            self.declaration_defs
+        );
+        qid.ModuleId module_id = builder.ensure_module(module_interface.source_id);
+        Int! index = 0;
+        while (index < module_interface.declarations.len()) {
+            self.load_declaration(module_id, module_interface, module_interface.declarations.get(index));
+            index = index + 1;
+        }
+        return module_id;
+    }
+
+    qid.DefId? load_declaration(
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface,
+        artifact.InterfaceDeclSummary declaration
+    ) {
+        if (self.query.incremental.current_def_for_stable(declaration.stable_id) is some existing) {
+            return existing;
+        }
+        guard self.owner_def(module_id, declaration) is some semantic_owner else {
+            self.query.hirs.mark_error();
+            return null;
+        }
+
+        store.ModuleRecord& module = self.query.resolve.modules.ref_at(module_id);
+        qid.NamespaceId decl_namespace = self.decl_namespace(module, semantic_owner);
+        qid.NamespaceId?! owned_namespace = null;
+        if (self.def_kind_owns_namespace(declaration.kind)) {
+            owned_namespace = self.query.resolve.create_namespace(
+                .declaration_namespace,
+                decl_namespace,
+                null,
+                module_id,
+                token.Span()
+            );
+        }
+
+        qid.DefId?! record_owner = null;
+        if (semantic_owner.to_index() != module.def_id.to_index()) {
+            record_owner = semantic_owner;
+        }
+        qid.DefId def_id = self.query.defs.create(
+            declaration.kind,
+            declaration.domain,
+            declaration.visibility,
+            def.Name {symbol: declaration.name, span: token.Span()},
+            record_owner,
+            module_id,
+            decl_namespace,
+            owned_namespace
+        );
+        self.query.resolve.bind_name(decl_namespace, declaration.name, declaration.domain, def_id, token.Span());
+        self.query.hirs.declare_def(def_id, self.hir_decl_kind(declaration.kind));
+        self.query.hirs.add_member(semantic_owner, def_id);
+        self.load_function_signature(def_id, module_interface, declaration);
+        self.query.source_map.set_def_span(def_id, module_interface.source_id, token.Span());
+        self.bind_type_identity(def_id, declaration.kind);
+        self.record_interface_stable_key(module, module_interface, declaration, def_id);
+        if (declaration.kind == .enum_case_def) {
+            self.query.resolve.add_enum_case_symbol(declaration.name, def_id);
+        }
+        return def_id;
+    }
+
+    () load_function_signature(
+        qid.DefId def_id,
+        artifact.ModuleInterface& module_interface,
+        artifact.InterfaceDeclSummary declaration
+    ) {
+        if (declaration.kind != .function_def && declaration.kind != .init_def && declaration.kind != .deinit_def) {
+            return;
+        }
+        guard module_interface.function_signature(declaration.stable_id) is some signature else { return; }
+
+        list.ArrayList<hir.HirId>! params = list.ArrayList<hir.HirId>(signature.params.len());
+        list.ArrayList<qid.SymbolId>! param_symbols = list.ArrayList<qid.SymbolId>(signature.params.len());
+        Int! index = 0;
+        while (index < signature.params.len()) {
+            artifact.InterfaceParamSummary& param = signature.params.ref_at(index);
+            params.add(self.lower_interface_type_ref(def_id, param.type_ref$.ref()));
+            param_symbols.add(param.symbol);
+            index = index + 1;
+        }
+
+        // interface skeleton 只恢复调用签名。默认参数表达式属于 body/template
+        // 编码范围，不能在这里伪造 HIR expression。
+        self.query.hirs.declare_signature(def_id, hir.HirFunctionSignature {
+            has_receiver: signature.has_receiver,
+            params: self.freeze_hir_ids(params$.move()),
+            param_symbols: self.freeze_symbol_ids(param_symbols$.move()),
+            param_defaults: self.empty_param_defaults(),
+            result: self.lower_interface_type_ref(def_id, signature.result$.ref())
+        });
+    }
+
+    hir.HirId lower_interface_type_ref(qid.DefId owner_def, artifact.InterfaceTypeRef& type_ref) {
+        if (type_ref.kind == .unit_type) {
+            return self.query.hirs.add_node(owner_def, .unit_type_ref());
+        }
+        if (type_ref.kind != .named_type) {
+            return self.query.hirs.add_node(owner_def, .invalid_type_ref());
+        }
+
+        guard type_ref.stable_def is some stable_def else {
+            self.query.hirs.mark_error();
+            return self.query.hirs.add_node(owner_def, .invalid_type_ref());
+        }
+        guard self.query.incremental.current_def_for_stable(stable_def) is some def_id else {
+            self.query.hirs.mark_error();
+            return self.query.hirs.add_node(owner_def, .invalid_type_ref());
+        }
+
+        list.ArrayList<hir.HirId>! args = list.ArrayList<hir.HirId>(type_ref.args.len());
+        Int! index = 0;
+        while (index < type_ref.args.len()) {
+            artifact.InterfaceTypeRef& arg = type_ref.args.ref_at(index);
+            args.add(self.lower_interface_type_ref(owner_def, arg));
+            index = index + 1;
+        }
+        return self.query.hirs.add_node(owner_def, .named_type_ref(hir.HirNamedTypeRef {
+            def_id: def_id,
+            args: self.freeze_hir_ids(args$.move())
+        }));
+    }
+
+    hir.HirId[] freeze_hir_ids(list.ArrayList<hir.HirId> values) {
+        Int count = values.len();
+        Int! capacity = count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        hir.HirId![*] stored = self.query.hirs.storage.alloc_array<hir.HirId>(capacity);
+        Int! index = 0;
+        while (index < count) {
+            stored[index] = values.get(index);
+            index = index + 1;
+        }
+        return stored[0..count];
+    }
+
+    qid.SymbolId[] freeze_symbol_ids(list.ArrayList<qid.SymbolId> values) {
+        Int count = values.len();
+        Int! capacity = count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        qid.SymbolId![*] stored = self.query.hirs.storage.alloc_array<qid.SymbolId>(capacity);
+        Int! index = 0;
+        while (index < count) {
+            stored[index] = values.get(index);
+            index = index + 1;
+        }
+        return stored[0..count];
+    }
+
+    hir.HirParamDefault[] empty_param_defaults() {
+        hir.HirParamDefault![*] stored = self.query.hirs.storage.alloc_array<hir.HirParamDefault>(1);
+        return stored[0..0];
+    }
+
+    qid.DefId? owner_def(qid.ModuleId module_id, artifact.InterfaceDeclSummary declaration) {
+        if (declaration.owner is some owner_stable) {
+            return self.query.incremental.current_def_for_stable(owner_stable);
+        }
+        return self.query.resolve.modules.get(module_id).def_id;
+    }
+
+    qid.NamespaceId decl_namespace(store.ModuleRecord& module, qid.DefId semantic_owner) {
+        if (semantic_owner.to_index() == module.def_id.to_index()) {
+            return module.namespace_id;
+        }
+        if (self.query.defs.get(semantic_owner).owned_namespace_id is some owner_namespace) {
+            return owner_namespace;
+        }
+        return module.namespace_id;
+    }
+
+    () record_interface_stable_key(
+        store.ModuleRecord& module,
+        artifact.ModuleInterface& module_interface,
+        artifact.InterfaceDeclSummary declaration,
+        qid.DefId def_id
+    ) {
+        qkey.StableSymbolId?! owner = declaration.owner;
+        if (owner == null) {
+            owner = self.query.incremental.stable_id_for_def(module.def_id);
+        }
+        qkey.StableSymbolId recorded = self.query.incremental.record_symbol(
+            self.query.symbols$.ref(),
+            qkey.StableSymbolKey {
+                kind: self.stable_symbol_kind(declaration.kind),
+                package_name: module_interface.package_name,
+                module_path: module_interface.module_path,
+                owner: owner,
+                name: declaration.name,
+                domain: declaration.domain
+            },
+            def_id
+        );
+        if (recorded != declaration.stable_id) {
+            self.query.hirs.mark_error();
+        }
+    }
+
+    () bind_type_identity(qid.DefId def_id, def.DefKind kind) {
+        if (!self.def_kind_has_type_identity(kind)) {
+            return;
+        }
+        self.query.types.bind_named_type_def(def_id, self.query.types.named_type(def_id, token.Span()));
+    }
+
+    Bool def_kind_has_type_identity(def.DefKind kind) {
+        if (kind == .struct_def) { return true; }
+        if (kind == .record_def) { return true; }
+        if (kind == .enum_def) { return true; }
+        if (kind == .union_def) { return true; }
+        if (kind == .trait_def) { return true; }
+        return kind == .generic_param_def;
+    }
+
+    Bool def_kind_owns_namespace(def.DefKind kind) {
+        if (kind == .struct_def) { return true; }
+        if (kind == .record_def) { return true; }
+        if (kind == .enum_def) { return true; }
+        if (kind == .union_def) { return true; }
+        return kind == .trait_def;
+    }
+
+    hir.HirDeclKind hir_decl_kind(def.DefKind kind) {
+        if (kind == .function_def) { return .function_decl; }
+        if (kind == .init_def) { return .init_decl; }
+        if (kind == .deinit_def) { return .deinit_decl; }
+        if (kind == .global_def) { return .global_decl; }
+        if (kind == .field_def) { return .field_decl; }
+        if (kind == .enum_case_def) { return .enum_case_decl; }
+        if (kind == .union_variant_def) { return .union_variant_decl; }
+        if (kind == .associated_type_def) { return .associated_type_decl; }
+        if (kind == .generic_param_def) { return .generic_param_decl; }
+        if (kind == .alias_def) { return .alias_decl; }
+        if (kind == .import_alias_def) { return .import_alias_decl; }
+        return .type_decl;
+    }
+
+    qkey.StableSymbolKind stable_symbol_kind(def.DefKind kind) {
+        if (kind == .trait_def) { return .trait_symbol; }
+        if (kind == .function_def || kind == .init_def || kind == .deinit_def) { return .function_symbol; }
+        if (kind == .global_def) { return .global_symbol; }
+        if (kind == .field_def) { return .field_symbol; }
+        if (kind == .enum_case_def) { return .enum_case_symbol; }
+        if (kind == .union_variant_def) { return .union_variant_symbol; }
+        if (kind == .associated_type_def) { return .associated_type_symbol; }
+        if (kind == .generic_param_def || kind == .local_def || kind == .parameter_def) { return .local_symbol; }
+        if (kind == .module_def || kind == .package_def || kind == .import_alias_def) { return .module_symbol; }
+        return .type_symbol;
+    }
+}

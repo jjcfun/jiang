@@ -3,7 +3,12 @@
 import context = "./context.jiang";
 import diagnostic = "./diagnostic/diagnostic.jiang";
 import ast_store = "./query/ast_store.jiang";
+import object_artifact = "./artifact/object.jiang";
+import object_hash = "./artifact/object_hash.jiang";
+import object_plan = "./artifact/object_plan.jiang";
+import artifact_path = "./artifact/path.jiang";
 import backend = "./backend/api.jiang";
+import codegen_unit = "./backend/codegen_unit.jiang";
 import borrow_check = "./borrow_check/api.jiang";
 import borrow_result = "./borrow_check/result.jiang";
 import driver_options = "./driver/options.jiang";
@@ -18,17 +23,18 @@ import fs = "./support/fs.jiang";
 import path = "./support/path.jiang";
 import string = "./support/string.jiang";
 import package_manifest = "./source/package_manifest.jiang";
-import incremental_fingerprint = "./incremental/fingerprint.jiang";
 import monomorph = "./sema/monomorph.jiang";
 import type_check = "./sema/type_check/api.jiang";
 import source = "./source/source.jiang";
 
 public () compile_source(context.CompilerContext& ctx, UInt8[] text) {
+    ctx.begin_compilation();
     source.SourceId source_id = ctx.query.sources.add_anonymous(source.content_hash(text));
     compile_package(ctx, source_id, text);
 }
 
 public () compile_file(context.CompilerContext& ctx, UInt8[] file_path) {
+    ctx.begin_compilation();
     UInt8[] normalized = path.normalize(file_path);
     guard fs.read_all(normalized) is some text else {
         add_package_error(ctx, string.append("failed to read source file: ", normalized), "source_file_not_found");
@@ -47,6 +53,7 @@ public () compile_package_path(context.CompilerContext& ctx, UInt8[] input_path)
 }
 
 public () compile_with_options(context.CompilerContext& ctx, driver_options.CompileOptions options) {
+    ctx.begin_compilation();
     UInt8[] root_path = package_root_file_path(options.input_path);
     UInt8[] normalized = path.normalize(root_path);
     guard fs.read_all(normalized) is some text else {
@@ -54,7 +61,16 @@ public () compile_with_options(context.CompilerContext& ctx, driver_options.Comp
         return;
     }
     source.SourceId source_id = ctx.query.sources.intern_path(normalized, source.content_hash(text));
-    compile_package_with_emit(ctx, source_id, text, options.emit, options.output_path);
+    compile_package_with_emit(
+        ctx,
+        source_id,
+        text,
+        options.emit,
+        options.output_path,
+        options.artifact_cache_dir,
+        options.target_triple,
+        options.compiler_version
+    );
 }
 
 public UInt8[] package_root_file_path(UInt8[] input_path) {
@@ -71,7 +87,7 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
 }
 
 () compile_package(context.CompilerContext& ctx, source.SourceId source_id, UInt8[] text) {
-    compile_package_with_emit(ctx, source_id, text, .executable, "");
+    compile_package_with_emit(ctx, source_id, text, .executable, "", ".jiang-cache", "default-target", "jiang-dev");
 }
 
 () compile_package_with_emit(
@@ -79,7 +95,10 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     source.SourceId source_id,
     UInt8[] text,
     driver_options.EmitKind emit,
-    UInt8[] output_path
+    UInt8[] output_path,
+    UInt8[] artifact_cache_dir,
+    UInt8[] target_triple,
+    UInt8[] compiler_version
 ) {
     // AstStore 是本次 package 编译的临时 parse cache。resolve/HIR 完成后，
     // AST 不再进入 QuerySystem 的长期状态。
@@ -106,7 +125,6 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     if (!type_check.check_hir_package(ctx, graph$.ref())) {
         return;
     }
-    incremental_fingerprint.fingerprint_type_check_results(ctx, graph$.ref());
     monomorph.MonomorphInstances^ instances = monomorph.collect_reachable_instances(
         ctx.query$.ref(),
         ctx.query.hirs$.ref(),
@@ -139,32 +157,145 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
         add_package_error(ctx, "drop elaboration failed", "drop_elaboration_failed");
         return;
     }
-    incremental_fingerprint.fingerprint_mir_store(ctx, dropped$.ref());
     if (emit == .check_only) {
         return;
     }
-    backend.BackendResult result = emit_backend(ctx, dropped$.ref(), emit, output_path);
+    if (!prepare_artifact_cache(ctx, emit, artifact_cache_dir)) {
+        return;
+    }
+    backend.BackendResult result = emit_backend(
+        ctx,
+        dropped$.ref(),
+        emit,
+        output_path,
+        artifact_cache_dir,
+        target_triple,
+        compiler_version
+    );
     if (result.has_errors()) {
         add_package_error(ctx, "backend emission failed", "backend_emit_failed");
         return;
     }
 }
 
+public Bool prepare_artifact_cache(
+    context.CompilerContext& ctx,
+    driver_options.EmitKind emit,
+    UInt8[] artifact_cache_dir
+) {
+    if (emit == .check_only || emit == .llvm_ir) {
+        return true;
+    }
+    UInt8[] object_dir = artifact_path.object_dir(artifact_cache_dir);
+    if (fs.create_dirs(object_dir)) {
+        return true;
+    }
+    add_package_error(ctx, string.append("failed to create artifact cache directory: ", object_dir), "cache_dir_failed");
+    return false;
+}
+
 backend.BackendResult emit_backend(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
     driver_options.EmitKind emit,
-    UInt8[] output_path
+    UInt8[] output_path,
+    UInt8[] artifact_cache_dir,
+    UInt8[] target_triple,
+    UInt8[] compiler_version
 ) {
     if (emit == .object_file) {
-        UInt8![*] c_output_path = backend_output_buffer(output_path);
-        return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]));
+        return emit_object_with_cache(ctx, lowered, output_path, artifact_cache_dir, target_triple, compiler_version);
     }
     if (emit == .llvm_ir) {
         UInt8![*] c_output_path = backend_output_buffer(output_path);
         return backend.emit_llvm_ir(ctx, lowered, c_output_path$.as(UInt8[*]));
     }
     return backend.emit(ctx, lowered);
+}
+
+backend.BackendResult emit_object_with_cache(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    UInt8[] output_path,
+    UInt8[] artifact_cache_dir,
+    UInt8[] target_triple,
+    UInt8[] compiler_version
+) {
+    codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx, lowered);
+    object_plan.ObjectReusePlan plan = object_plan.build_object_reuse_plan(
+        ctx,
+        lowered,
+        units$.ref(),
+        artifact_cache_dir,
+        target_triple,
+        compiler_version
+    );
+    if (plan.len() == 1) {
+        return emit_single_object_unit_with_cache(ctx, lowered, units$.ref(), plan.entry_at(0), output_path);
+    }
+    UInt8![*] c_output_path = backend_output_buffer(output_path);
+    return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]));
+}
+
+backend.BackendResult emit_single_object_unit_with_cache(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectPlanEntry& entry,
+    UInt8[] output_path
+) {
+    if (entry.kind == .unsupported) {
+        UInt8![*] c_output_path = backend_output_buffer(output_path);
+        return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]));
+    }
+
+    UInt8[] final_path = final_object_path(output_path, entry.path);
+    if (entry.can_reuse()) {
+        return backend.BackendResult(copy_cached_object(ctx, entry.path, final_path));
+    }
+
+    UInt8![*] c_cache_path = backend_output_buffer(entry.path);
+    backend.BackendResult emitted = backend.emit_object_for_unit(
+        ctx,
+        lowered,
+        units.unit_at(entry.unit_index),
+        c_cache_path$.as(UInt8[*])
+    );
+    if (emitted.has_errors()) {
+        return emitted;
+    }
+    record_emitted_object(ctx, entry);
+    return backend.BackendResult(copy_cached_object(ctx, entry.path, final_path));
+}
+
+UInt8[] final_object_path(UInt8[] output_path, UInt8[] cache_path) {
+    if (output_path.length == 0) {
+        return cache_path;
+    }
+    return output_path;
+}
+
+Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[] output_path) {
+    if (string.equal(cache_path, output_path)) {
+        return true;
+    }
+    if (fs.copy_file(cache_path, output_path)) {
+        return true;
+    }
+    add_package_error(ctx, "failed to copy cached object file", "cached_object_copy_failed");
+    return false;
+}
+
+() record_emitted_object(context.CompilerContext& ctx, object_plan.ObjectPlanEntry& entry) {
+    guard object_hash.hash_file(entry.path) is some emitted_hash else {
+        return;
+    }
+    if (entry.source_key is some source_key) {
+        ctx.query.object_artifacts.store_source_object(
+            source_key,
+            object_artifact.ObjectArtifactRecord(.source_object, emitted_hash, entry.path)
+        );
+    }
 }
 
 UInt8![*] backend_output_buffer(UInt8[] output_path) {
