@@ -5,7 +5,10 @@
 // declaration，也不做 reference resolve / HIR lowering。
 
 import context = "../context.jiang";
+import diagnostic = "../diagnostic/diagnostic.jiang";
 import artifact = "../artifact/source.jiang";
+import artifact_path = "../artifact/path.jiang";
+import source_ji = "../artifact/source_ji.jiang";
 import query = "../query/api.jiang";
 import ast_store = "../query/ast_store.jiang";
 import qid = "../query/id.jiang";
@@ -42,6 +45,8 @@ public struct ModuleGraphBuilder {
     ast_store.AstStore& asts;
     table.HashTable<qid.ModuleId, ModuleResolvePassState>& module_states;
     table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs;
+    UInt8[] artifact_cache_dir;
+    UInt64 compiler_version_hash;
     import_path_resolver.ImportPathResolver import_paths;
 
     @life(ctx > self, asts > self, module_states > self, declaration_defs > self)
@@ -56,6 +61,27 @@ public struct ModuleGraphBuilder {
         self.asts = asts;
         self.module_states = module_states;
         self.declaration_defs = declaration_defs;
+        self.artifact_cache_dir = "build/cache";
+        self.compiler_version_hash = source.content_hash("jiang-dev");
+        self.import_paths = import_path_resolver.ImportPathResolver(self.query);
+    }
+
+    @life(ctx > self, asts > self, module_states > self, declaration_defs > self)
+    public init(
+        context.CompilerContext& ctx,
+        ast_store.AstStore& asts,
+        table.HashTable<qid.ModuleId, ModuleResolvePassState>& module_states,
+        table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs,
+        UInt8[] artifact_cache_dir,
+        UInt64 compiler_version_hash
+    ) {
+        self.ctx = ctx;
+        self.query = ctx.query$.ref();
+        self.asts = asts;
+        self.module_states = module_states;
+        self.declaration_defs = declaration_defs;
+        self.artifact_cache_dir = artifact_cache_dir;
+        self.compiler_version_hash = compiler_version_hash;
         self.import_paths = import_path_resolver.ImportPathResolver(self.query);
     }
 
@@ -156,12 +182,18 @@ public struct ModuleGraphBuilder {
     Bool collect_imports_from_summary(qid.ModuleId module_id) {
         store.ModuleRecord module = self.query.resolve.modules.get(module_id);
         source.SourceRecord source_record = self.query.sources.get(module.source_id);
+        if (self.query.artifacts.load_import_summary(module.source_id) == null) {
+            self.load_source_artifacts_from_file(module_id);
+        }
         guard self.query.artifacts.load_import_summary(module.source_id) is some summary else {
+            self.query.artifacts.record_import_lookup(.missing);
             return false;
         }
         if (summary.source_hash != source_record.content_hash) {
+            self.query.artifacts.record_import_lookup(.stale);
             return false;
         }
+        self.query.artifacts.record_import_lookup(.hit);
 
         Int! index = 0;
         while (index < summary.imports.len()) {
@@ -316,6 +348,17 @@ public struct ModuleGraphBuilder {
         if (self.query.artifacts.load_import_summary(source_id) is some summary) {
             return summary.source_hash == source_record.content_hash;
         }
+        qid.ModuleId module_id = self.ensure_module(source_id);
+        if (self.load_source_artifacts_from_file(module_id)) {
+            return self.has_fresh_import_summary(source_id, source_record);
+        }
+        return false;
+    }
+
+    Bool has_fresh_import_summary(source.SourceId source_id, source.SourceRecord source_record) {
+        if (self.query.artifacts.load_import_summary(source_id) is some summary) {
+            return summary.source_hash == source_record.content_hash;
+        }
         return false;
     }
 
@@ -362,9 +405,15 @@ public struct ModuleGraphBuilder {
     }
 
     source.SourceId? load_file_import(UInt8[] path) {
-        guard fs.read_all(path) is some bytes else { return null; }
-        source.SourceId source_id = self.query.sources.intern_path(path, source.content_hash(bytes));
+        UInt8[]? loaded = fs.read_all(path);
+        guard loaded is some bytes else { return null; }
+        UInt64 content_hash = source.content_hash(bytes);
+        source.SourceId source_id = self.query.sources.intern_path(path, content_hash);
         if (self.source_has_ast_or_summary(source_id)) {
+            return source_id;
+        }
+        qid.ModuleId module_id = self.ensure_module(source_id);
+        if (self.load_source_artifacts_from_file(module_id)) {
             return source_id;
         }
         syntax.SyntaxResult parsed = syntax.parse_source(self.ctx, bytes, source_id);
@@ -380,6 +429,46 @@ public struct ModuleGraphBuilder {
         }
         self.asts.set_file(parsed.file$.move(), self.query.sources.get(source_id).revision);
         return source_id;
+    }
+
+    public Bool load_source_artifacts_from_file(qid.ModuleId module_id) {
+        UInt8[] artifact_file = self.source_artifact_file(module_id);
+        if (artifact_file.length == 0 || !fs.file_exists(artifact_file)) {
+            return false;
+        }
+        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
+        if (source_ji.load_source_artifacts_from_ji(
+            self.ctx,
+            self.query.artifacts$.ref(),
+            module.source_id,
+            artifact_file,
+            self.compiler_version_hash
+        )) {
+            return true;
+        }
+        self.add_source_artifact_load_warning(module.source_id, artifact_file);
+        return false;
+    }
+
+    UInt8[] source_artifact_file(qid.ModuleId module_id) {
+        store.ModuleRecord module = self.query.resolve.modules.get(module_id);
+        guard self.query.incremental.stable_id_for_def(module.def_id) is some stable_id else {
+            return "";
+        }
+        source.SourceRecord source_record = self.query.sources.get(module.source_id);
+        return artifact_path.source_ji_path(self.artifact_cache_dir, stable_id, source_record.content_hash);
+    }
+
+    () add_source_artifact_load_warning(source.SourceId source_id, UInt8[] artifact_file) {
+        self.ctx.diagnostics.add(
+            diagnostic.Diagnostic(
+                .warning,
+                .incremental,
+                diagnostic.DiagnosticCode("source_artifact_load_failed"),
+                diagnostic.SourceRange(source_id, token.Span()),
+                string.append("failed to load source artifact: ", artifact_file)
+            )
+        );
     }
 
     () check_package_dependency_cycles(module_graph.ModuleGraph& graph) {

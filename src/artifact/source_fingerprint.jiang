@@ -2,14 +2,21 @@
 //
 // 这里刻意不写入 SourceId、SourceHash、SymbolId.to_index() 等 session-local 或
 // source-local 数据。Interface hash 只描述对依赖方可见的语义表面：公开声明、
-// public import / alias 以及 public generic template 索引。
+// public import / alias、trait/where/lifetime 约束以及签名信息。
 
 import context = "../context.jiang";
 import qid = "../query/id.jiang";
 import qkey = "../query/key.jiang";
+import def = "../resolve/def.jiang";
+import store = "../resolve/store.jiang";
 import blake3 = "../support/blake3.jiang";
 import list = "../support/list.jiang";
+import source = "../source/source.jiang";
 import source_artifact = "./source.jiang";
+
+extern {
+    () memcpy(UInt8[*] dest, UInt8[*] source, Int count);
+}
 
 public struct SourceSectionImage: Movable {
     public list.ArrayList<UInt8> bytes;
@@ -41,11 +48,90 @@ public SourceSectionImage encode_module_interface_section(
     return SourceSectionImage(writer.bytes$.move(), fingerprint);
 }
 
-public SourceSectionImage encode_generic_template_section(source_artifact.GenericTemplate& template) {
+public SourceSectionImage encode_generic_templates_section(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface
+) {
     SourceSectionWriter! writer = SourceSectionWriter();
-    write_generic_template_payload(writer$.ref(), template);
+    write_generic_templates(ctx, writer$.ref(), module_interface);
     qkey.Fingerprint128 fingerprint = writer.finish();
     return SourceSectionImage(writer.bytes$.move(), fingerprint);
+}
+
+public source_artifact.ImportSummary? decode_import_summary_section(
+    context.CompilerContext& ctx,
+    source.SourceId source_id,
+    UInt8[] bytes
+) {
+    SourceSectionReader! reader = SourceSectionReader(bytes);
+    if (!reader.read_magic("jiang.import-summary.v1")) {
+        return null;
+    }
+    guard reader.read_uint64() is some source_hash else { return null; }
+    guard reader.read_int() is some source_revision else { return null; }
+    guard reader.read_symbol(ctx) is some package_name else { return null; }
+    guard reader.read_symbol(ctx) is some module_path else { return null; }
+    guard reader.read_symbol(ctx) is some source_path else { return null; }
+
+    source_artifact.ImportSummary! summary = source_artifact.ImportSummary(
+        source_id,
+        source_hash,
+        source_revision,
+        package_name,
+        module_path,
+        source_path
+    );
+    if (!read_import_entries(ctx, reader$.ref(), summary$.ref())) { return null; }
+    if (!read_alias_entries(ctx, reader$.ref(), summary$.ref())) { return null; }
+    if (!reader.finished()) { return null; }
+    return summary$.move();
+}
+
+public source_artifact.ModuleInterface? decode_module_interface_section(
+    context.CompilerContext& ctx,
+    source.SourceId source_id,
+    UInt64 source_hash,
+    UInt8[] bytes
+) {
+    SourceSectionReader! reader = SourceSectionReader(bytes);
+    if (!reader.read_magic("jiang.interface.v1")) {
+        return null;
+    }
+    guard reader.read_symbol(ctx) is some package_name else { return null; }
+    guard reader.read_symbol(ctx) is some module_path else { return null; }
+
+    source_artifact.ModuleInterface! module_interface = source_artifact.ModuleInterface(
+        source_id,
+        source_hash,
+        package_name,
+        module_path
+    );
+    if (!read_interface_declarations(ctx, reader$.ref(), module_interface$.ref())) { return null; }
+    if (!read_interface_imports(ctx, reader$.ref(), module_interface$.ref())) { return null; }
+    if (!read_interface_aliases(ctx, reader$.ref(), module_interface$.ref())) { return null; }
+    if (!reader.finished()) { return null; }
+    module_interface.interface_hash = module_interface_fingerprint(ctx, module_interface$.ref());
+    return module_interface$.move();
+}
+
+public Bool decode_generic_templates_section(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    UInt8[] bytes
+) {
+    SourceSectionReader! reader = SourceSectionReader(bytes);
+    if (!reader.read_magic("jiang.generic-templates.v1")) {
+        return false;
+    }
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        if (!read_generic_template(ctx, reader$.ref(), module_interface)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return reader.finished();
 }
 
 public qkey.Fingerprint128 module_interface_fingerprint(
@@ -99,6 +185,542 @@ struct SourceSectionWriter: Movable {
     }
 }
 
+struct SourceSectionReader {
+    UInt8[] bytes;
+    Int! offset;
+
+    init(UInt8[] bytes) {
+        self.bytes = bytes;
+        self.offset = 0;
+    }
+
+    Bool finished() {
+        return self.offset == self.bytes.length;
+    }
+
+    Bool read_magic(UInt8[] text) {
+        guard self.read_bytes(text.length) is some bytes else { return false; }
+        return bytes_equal(bytes, text);
+    }
+
+    Int? read_int() {
+        guard self.read_uint64() is some value else { return null; }
+        return Int(value);
+    }
+
+    UInt64? read_uint64() {
+        guard self.read_bytes(8) is some bytes else { return null; }
+        UInt64! value = 0;
+        Int! index = 7;
+        while (index >= 0) {
+            value = value << 8;
+            value = value | UInt64(bytes[index]);
+            index = index - 1;
+        }
+        return value;
+    }
+
+    qkey.StableSymbolId? read_stable_id() {
+        guard self.read_uint64() is some low else { return null; }
+        guard self.read_uint64() is some high else { return null; }
+        return qkey.StableSymbolId(low, high);
+    }
+
+    qkey.Fingerprint128? read_fingerprint() {
+        guard self.read_uint64() is some low else { return null; }
+        guard self.read_uint64() is some high else { return null; }
+        return qkey.Fingerprint128(low, high);
+    }
+
+    UInt8[]? read_bytes(Int length) {
+        if (length < 0) {
+            return null;
+        }
+        if (self.offset + length > self.bytes.length) {
+            return null;
+        }
+        Int start = self.offset;
+        self.offset = self.offset + length;
+        return self.bytes[start..self.offset];
+    }
+
+    UInt8[]? read_bytes_with_length() {
+        guard self.read_int() is some length else { return null; }
+        return self.read_bytes(length);
+    }
+
+    qid.SymbolId? read_symbol(context.CompilerContext& ctx) {
+        guard self.read_int() is some length else { return null; }
+        guard self.read_bytes(length) is some text else { return null; }
+        return ctx.query.symbols.intern(text);
+    }
+
+    qid.SymbolId? read_optional_symbol(context.CompilerContext& ctx) {
+        guard self.read_bool() is some has_value else { return null; }
+        if (!has_value) {
+            return null;
+        }
+        return self.read_symbol(ctx);
+    }
+
+    qkey.StableSymbolId? read_optional_stable_id() {
+        guard self.read_bool() is some has_value else { return null; }
+        if (!has_value) {
+            return null;
+        }
+        return self.read_stable_id();
+    }
+
+    Bool? read_bool() {
+        guard self.read_bytes(1) is some bytes else { return null; }
+        return bytes[0] != 0;
+    }
+}
+
+Bool bytes_equal(UInt8[] lhs, UInt8[] rhs) {
+    if (lhs.length != rhs.length) {
+        return false;
+    }
+    Int! index = 0;
+    while (index < lhs.length) {
+        if (lhs[index] != rhs[index]) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_import_entries(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ImportSummary& summary
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_import_entry(ctx, reader) is some entry else { return false; }
+        summary.add_import(entry);
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_alias_entries(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ImportSummary& summary
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_alias_entry(ctx, reader) is some alias_export else { return false; }
+        summary.add_public_alias(alias_export);
+        index = index + 1;
+    }
+    return true;
+}
+
+source_artifact.ImportSummaryEntry? read_import_entry(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader
+) {
+    guard reader.read_int() is some kind_value else { return null; }
+    guard reader.read_int() is some visibility_value else { return null; }
+    guard reader.read_symbol(ctx) is some path_symbol else { return null; }
+    qid.SymbolId? alias_symbol = reader.read_optional_symbol(ctx);
+    return source_artifact.ImportSummaryEntry(
+        import_kind_from_int(kind_value),
+        visibility_from_int(visibility_value),
+        path_symbol,
+        alias_symbol
+    );
+}
+
+source_artifact.AliasExportSummary? read_alias_entry(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader
+) {
+    guard reader.read_symbol(ctx) is some alias_symbol else { return null; }
+    guard reader.read_stable_id() is some target_stable_id else { return null; }
+    return source_artifact.AliasExportSummary(alias_symbol, target_stable_id);
+}
+
+Bool read_interface_declarations(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_interface_declaration(ctx, reader, module_interface) is some decl else { return false; }
+        module_interface.add_declaration(decl);
+        index = index + 1;
+    }
+    return true;
+}
+
+source_artifact.InterfaceDeclSummary? read_interface_declaration(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_stable_id() is some stable_id else { return null; }
+    guard reader.read_int() is some kind_value else { return null; }
+    guard reader.read_int() is some domain_value else { return null; }
+    guard reader.read_int() is some visibility_value else { return null; }
+    guard reader.read_symbol(ctx) is some name else { return null; }
+    qkey.StableSymbolId? owner = reader.read_optional_stable_id();
+    guard reader.read_fingerprint() is some signature_fingerprint else { return null; }
+    guard reader.read_fingerprint() is some body_fingerprint else { return null; }
+
+    source_artifact.InterfaceDeclSummary! decl = source_artifact.InterfaceDeclSummary(
+        stable_id,
+        def_kind_from_int(kind_value),
+        domain_from_int(domain_value),
+        visibility_from_int(visibility_value),
+        name,
+        owner
+    );
+    decl.signature_fingerprint = signature_fingerprint;
+    decl.body_fingerprint = body_fingerprint;
+    guard reader.read_bool() is some has_type_ref else { return null; }
+    if (has_type_ref) {
+        guard read_type_ref(reader) is some type_ref else { return null; }
+        module_interface.set_decl_type_ref(stable_id, type_ref$.move());
+    }
+    if (!read_trait_refs(reader, module_interface, stable_id)) {
+        return null;
+    }
+    if (!read_where_predicates(ctx, reader, module_interface, stable_id)) {
+        return null;
+    }
+    if (!read_lifetime_constraints(ctx, reader, module_interface, stable_id)) {
+        return null;
+    }
+    guard reader.read_bool() is some has_signature else { return null; }
+    if (has_signature && !read_function_signature(ctx, reader, module_interface, stable_id)) {
+        return null;
+    }
+    return decl;
+}
+
+Bool read_trait_refs(
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_type_ref(reader) is some trait_ref else { return false; }
+        module_interface.add_trait_ref(stable_id, trait_ref$.move());
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_where_predicates(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        if (!read_where_predicate(ctx, reader, module_interface, stable_id)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_where_predicate(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    guard reader.read_int() is some kind_value else { return false; }
+    guard read_type_ref(reader) is some subject else { return false; }
+    guard read_type_ref(reader) is some bound_or_value else { return false; }
+    guard read_type_ref(reader) is some trait_ref else { return false; }
+    qid.SymbolId? assoc_symbol = reader.read_optional_symbol(ctx);
+    source_artifact.InterfaceWherePredicateKind kind = where_predicate_kind_from_int(kind_value);
+    if (kind == .projection_equal && assoc_symbol == null) {
+        return false;
+    }
+    module_interface.add_where_predicate_parts(
+        stable_id,
+        kind,
+        subject$.move(),
+        bound_or_value$.move(),
+        trait_ref$.move(),
+        assoc_symbol
+    );
+    return true;
+}
+
+Bool read_lifetime_constraints(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_lifetime_constraint(ctx, reader, stable_id) is some constraint else { return false; }
+        module_interface.add_lifetime_constraint(constraint);
+        index = index + 1;
+    }
+    return true;
+}
+
+source_artifact.InterfaceLifetimeConstraint? read_lifetime_constraint(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    qkey.StableSymbolId stable_id
+) {
+    guard read_lifetime_name(ctx, reader) is some longer else { return null; }
+    guard read_lifetime_name(ctx, reader) is some shorter else { return null; }
+    return source_artifact.InterfaceLifetimeConstraint(stable_id, longer, shorter);
+}
+
+source_artifact.InterfaceLifetimeName? read_lifetime_name(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader
+) {
+    guard reader.read_int() is some kind else { return null; }
+    qid.SymbolId? symbol = reader.read_optional_symbol(ctx);
+    return source_artifact.InterfaceLifetimeName(kind, symbol);
+}
+
+Bool read_function_signature(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    guard reader.read_bool() is some has_receiver else { return false; }
+    guard reader.read_int() is some param_count else { return false; }
+    source_artifact.InterfaceFunctionSignature! signature =
+        source_artifact.InterfaceFunctionSignature(has_receiver, source_artifact.InterfaceTypeRef.invalid_type());
+    Int! index = 0;
+    while (index < param_count) {
+        guard read_signature_param(ctx, reader) is some param else { return false; }
+        signature.add_param(param$.move());
+        index = index + 1;
+    }
+    if (!read_param_defaults(ctx, reader, signature$.ref())) {
+        return false;
+    }
+    guard read_type_ref(reader) is some result else { return false; }
+    signature.result = result$.move();
+    module_interface.set_function_signature(stable_id, signature$.move());
+    return true;
+}
+
+source_artifact.InterfaceParamSummary? read_signature_param(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader
+) {
+    guard reader.read_symbol(ctx) is some symbol else { return null; }
+    guard read_type_ref(reader) is some type_ref else { return null; }
+    return source_artifact.InterfaceParamSummary(symbol, type_ref$.move());
+}
+
+Bool read_param_defaults(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.InterfaceFunctionSignature& signature
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard reader.read_int() is some param_index else { return false; }
+        guard read_literal(ctx, reader) is some value else { return false; }
+        signature.add_param_default(source_artifact.InterfaceParamDefault(param_index, value));
+        index = index + 1;
+    }
+    return true;
+}
+
+source_artifact.InterfaceLiteral? read_literal(context.CompilerContext& ctx, SourceSectionReader& reader) {
+    guard reader.read_int() is some kind_value else { return null; }
+    source_artifact.InterfaceLiteral! literal = source_artifact.InterfaceLiteral(literal_kind_from_int(kind_value));
+    guard reader.read_uint64() is some int_bits else { return null; }
+    guard reader.read_bool() is some signed_int else { return null; }
+    guard reader.read_uint64() is some float_bits else { return null; }
+    guard reader.read_bool() is some bool_value else { return null; }
+    qid.SymbolId? string_symbol = reader.read_optional_symbol(ctx);
+    guard reader.read_uint64() is some char_value else { return null; }
+    literal.int_bits = int_bits;
+    literal.signed_int = signed_int;
+    literal.float_value = float64_from_bits(float_bits);
+    literal.bool_value = bool_value;
+    literal.string_symbol = string_symbol;
+    literal.char_value = UInt32(char_value);
+    return literal;
+}
+
+source_artifact.InterfaceTypeRef? read_type_ref(SourceSectionReader& reader) {
+    guard reader.read_int() is some kind_value else { return null; }
+    qkey.StableSymbolId? stable_def = reader.read_optional_stable_id();
+    guard reader.read_int() is some count_kind else { return null; }
+    guard reader.read_uint64() is some count_value else { return null; }
+    guard reader.read_int() is some arg_count else { return null; }
+    source_artifact.InterfaceTypeRef! type_ref =
+        source_artifact.InterfaceTypeRef(type_ref_kind_from_int(kind_value));
+    if (stable_def is some stable_id) {
+        type_ref.has_stable_def = true;
+        type_ref.stable_def_low = stable_id.low;
+        type_ref.stable_def_high = stable_id.high;
+    }
+    type_ref.count_kind = count_kind;
+    type_ref.count_value = count_value;
+    Int! index = 0;
+    while (index < arg_count) {
+        guard read_type_ref(reader) is some arg else { return null; }
+        type_ref.add_arg(arg$.move());
+        index = index + 1;
+    }
+    return type_ref$.move();
+}
+
+Bool read_interface_imports(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_import_entry(ctx, reader) is some entry else { return false; }
+        module_interface.add_public_import(entry);
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_interface_aliases(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_int() is some count else { return false; }
+    Int! index = 0;
+    while (index < count) {
+        guard read_alias_entry(ctx, reader) is some alias_export else { return false; }
+        module_interface.add_public_alias(alias_export);
+        index = index + 1;
+    }
+    return true;
+}
+
+store.ImportKind import_kind_from_int(Int value) {
+    store.ImportKind package_import = .package_import;
+    store.ImportKind module_import = .module_import;
+    if (value == package_import.value) { return .package_import; }
+    if (value == module_import.value) { return .module_import; }
+    return .file_import;
+}
+
+def.Visibility visibility_from_int(Int value) {
+    def.Visibility public_visibility = .public_visibility;
+    if (value == public_visibility.value) { return .public_visibility; }
+    return .private_visibility;
+}
+
+def.NameDomain domain_from_int(Int value) {
+    def.NameDomain value_name = .value_name;
+    def.NameDomain member_name = .member_name;
+    def.NameDomain label_name = .label_name;
+    def.NameDomain namespace_name = .namespace_name;
+    if (value == value_name.value) { return .value_name; }
+    if (value == member_name.value) { return .member_name; }
+    if (value == label_name.value) { return .label_name; }
+    if (value == namespace_name.value) { return .namespace_name; }
+    return .type_name;
+}
+
+def.DefKind def_kind_from_int(Int value) {
+    def.DefKind module_def = .module_def;
+    def.DefKind function_def = .function_def;
+    def.DefKind struct_def = .struct_def;
+    def.DefKind record_def = .record_def;
+    def.DefKind enum_def = .enum_def;
+    def.DefKind union_def = .union_def;
+    def.DefKind trait_def = .trait_def;
+    def.DefKind alias_def = .alias_def;
+    def.DefKind field_def = .field_def;
+    def.DefKind generic_param_def = .generic_param_def;
+    if (value == module_def.value) { return .module_def; }
+    if (value == function_def.value) { return .function_def; }
+    if (value == struct_def.value) { return .struct_def; }
+    if (value == record_def.value) { return .record_def; }
+    if (value == enum_def.value) { return .enum_def; }
+    if (value == union_def.value) { return .union_def; }
+    if (value == trait_def.value) { return .trait_def; }
+    if (value == alias_def.value) { return .alias_def; }
+    if (value == field_def.value) { return .field_def; }
+    if (value == generic_param_def.value) { return .generic_param_def; }
+    return .package_def;
+}
+
+source_artifact.InterfaceTypeRefKind type_ref_kind_from_int(Int value) {
+    source_artifact.InterfaceTypeRefKind unit_type = .unit_type;
+    source_artifact.InterfaceTypeRefKind named_type = .named_type;
+    source_artifact.InterfaceTypeRefKind layered_type = .layered_type;
+    source_artifact.InterfaceTypeRefKind array_type = .array_type;
+    source_artifact.InterfaceTypeRefKind errorable_type = .errorable_type;
+    source_artifact.InterfaceTypeRefKind function_type = .function_type;
+    source_artifact.InterfaceTypeRefKind tuple_type = .tuple_type;
+    source_artifact.InterfaceTypeRefKind infer_type = .infer_type;
+    if (value == unit_type.value) { return .unit_type; }
+    if (value == named_type.value) { return .named_type; }
+    if (value == layered_type.value) { return .layered_type; }
+    if (value == array_type.value) { return .array_type; }
+    if (value == errorable_type.value) { return .errorable_type; }
+    if (value == function_type.value) { return .function_type; }
+    if (value == tuple_type.value) { return .tuple_type; }
+    if (value == infer_type.value) { return .infer_type; }
+    return .invalid_type;
+}
+
+source_artifact.InterfaceWherePredicateKind where_predicate_kind_from_int(Int value) {
+    source_artifact.InterfaceWherePredicateKind type_bound = .type_bound;
+    source_artifact.InterfaceWherePredicateKind negative_type_bound = .negative_type_bound;
+    source_artifact.InterfaceWherePredicateKind type_equal = .type_equal;
+    source_artifact.InterfaceWherePredicateKind projection_equal = .projection_equal;
+    if (value == type_bound.value) { return .type_bound; }
+    if (value == negative_type_bound.value) { return .negative_type_bound; }
+    if (value == type_equal.value) { return .type_equal; }
+    if (value == projection_equal.value) { return .projection_equal; }
+    return .type_bound;
+}
+
+source_artifact.InterfaceLiteralKind literal_kind_from_int(Int value) {
+    source_artifact.InterfaceLiteralKind int_value = .int_value;
+    source_artifact.InterfaceLiteralKind float_value = .float_value;
+    source_artifact.InterfaceLiteralKind bool_value = .bool_value;
+    source_artifact.InterfaceLiteralKind string_value = .string_value;
+    source_artifact.InterfaceLiteralKind char_value = .char_value;
+    source_artifact.InterfaceLiteralKind null_value = .null_value;
+    source_artifact.InterfaceLiteralKind unit_value = .unit_value;
+    if (value == int_value.value) { return .int_value; }
+    if (value == float_value.value) { return .float_value; }
+    if (value == bool_value.value) { return .bool_value; }
+    if (value == string_value.value) { return .string_value; }
+    if (value == char_value.value) { return .char_value; }
+    if (value == null_value.value) { return .null_value; }
+    if (value == unit_value.value) { return .unit_value; }
+    return .invalid_literal;
+}
+
 () write_import_summary(
     context.CompilerContext& ctx,
     SourceSectionWriter& writer,
@@ -114,17 +736,6 @@ struct SourceSectionWriter: Movable {
     write_summary_public_aliases(ctx, writer, summary);
 }
 
-() write_generic_template_payload(
-    SourceSectionWriter& writer,
-    source_artifact.GenericTemplate& template
-) {
-    writer.write_bytes("jiang.generic-template.v1");
-    write_stable_id(writer, template.owner_stable_id);
-    write_fingerprint(writer, template.body_fingerprint);
-    writer.write_int(template.encoded_body.length);
-    writer.write_bytes(template.encoded_body);
-}
-
 () write_module_interface(
     context.CompilerContext& ctx,
     SourceSectionWriter& writer,
@@ -136,7 +747,39 @@ struct SourceSectionWriter: Movable {
     write_declarations(ctx, writer, module_interface);
     write_public_imports(ctx, writer, module_interface);
     write_public_aliases(ctx, writer, module_interface);
-    write_generic_templates(writer, module_interface);
+}
+
+() write_generic_templates(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface
+) {
+    writer.write_bytes("jiang.generic-templates.v1");
+    writer.write_int(module_interface.generic_templates.len());
+    Int! index = 0;
+    while (index < module_interface.generic_templates.len()) {
+        source_artifact.GenericTemplate& generic_template = module_interface.generic_templates.ref_at(index);
+        write_stable_id(writer, generic_template.owner_stable_id);
+        write_fingerprint(writer, generic_template.body_fingerprint);
+        write_bytes_with_length(writer, generic_template.payload.slice());
+        index = index + 1;
+    }
+}
+
+Bool read_generic_template(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_stable_id() is some owner_stable_id else { return false; }
+    guard reader.read_fingerprint() is some body_fingerprint else { return false; }
+    guard reader.read_bytes_with_length() is some payload else { return false; }
+    module_interface.add_generic_template(source_artifact.GenericTemplate(
+        owner_stable_id,
+        body_fingerprint,
+        payload
+    ));
+    return true;
 }
 
 () write_declarations(
@@ -167,7 +810,143 @@ struct SourceSectionWriter: Movable {
     write_symbol_text(ctx, writer, decl.name);
     write_optional_stable_id(writer, decl.owner);
     write_fingerprint(writer, decl.signature_fingerprint);
+    write_fingerprint(writer, decl.body_fingerprint);
+    write_decl_type_ref(writer, module_interface, decl.stable_id);
+    write_trait_refs(writer, module_interface, decl.stable_id);
+    write_where_predicates(ctx, writer, module_interface, decl.stable_id);
+    write_lifetime_constraints(ctx, writer, module_interface, decl.stable_id);
     write_function_signature(ctx, writer, module_interface, decl.stable_id);
+}
+
+() write_decl_type_ref(
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    if (module_interface.decl_type_ref(stable_id) is some type_ref) {
+        writer.write_bool(true);
+        write_type_ref(writer, type_ref);
+        return;
+    }
+    writer.write_bool(false);
+}
+
+() write_trait_refs(
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    writer.write_int(trait_ref_count(module_interface, stable_id));
+    Int! index = 0;
+    while (index < module_interface.trait_refs.len()) {
+        source_artifact.InterfaceTraitRefEntry& entry = module_interface.trait_refs.ref_at(index);
+        if (entry.owner_stable_id == stable_id) {
+            write_type_ref(writer, entry.trait_ref$.ref());
+        }
+        index = index + 1;
+    }
+}
+
+Int trait_ref_count(
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    Int! count = 0;
+    Int! index = 0;
+    while (index < module_interface.trait_refs.len()) {
+        if (module_interface.trait_refs.ref_at(index).owner_stable_id == stable_id) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
+}
+
+() write_where_predicates(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    writer.write_int(where_predicate_count(module_interface, stable_id));
+    Int! index = 0;
+    while (index < module_interface.where_predicates.len()) {
+        source_artifact.InterfaceWherePredicateEntry& entry = module_interface.where_predicates.ref_at(index);
+        if (entry.owner_stable_id == stable_id) {
+            write_where_predicate(ctx, writer, module_interface, entry.predicate$.ref());
+        }
+        index = index + 1;
+    }
+}
+
+Int where_predicate_count(
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    Int! count = 0;
+    Int! index = 0;
+    while (index < module_interface.where_predicates.len()) {
+        if (module_interface.where_predicates.ref_at(index).owner_stable_id == stable_id) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
+}
+
+() write_where_predicate(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceWherePredicate& predicate
+) {
+    writer.write_int(predicate.kind.value);
+    write_type_ref(writer, module_interface.where_type_ref_at(predicate.subject_index));
+    write_type_ref(writer, module_interface.where_type_ref_at(predicate.bound_or_value_index));
+    write_type_ref(writer, module_interface.where_type_ref_at(predicate.trait_ref_index));
+    write_optional_symbol_text(ctx, writer, predicate.assoc_symbol);
+}
+
+() write_lifetime_constraints(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    writer.write_int(lifetime_constraint_count(module_interface, stable_id));
+    Int! index = 0;
+    while (index < module_interface.lifetime_constraints.len()) {
+        source_artifact.InterfaceLifetimeConstraint& constraint = module_interface.lifetime_constraints.ref_at(index);
+        if (constraint.owner_stable_id == stable_id) {
+            write_lifetime_name(ctx, writer, constraint.longer$.ref());
+            write_lifetime_name(ctx, writer, constraint.shorter$.ref());
+        }
+        index = index + 1;
+    }
+}
+
+Int lifetime_constraint_count(
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    Int! count = 0;
+    Int! index = 0;
+    while (index < module_interface.lifetime_constraints.len()) {
+        if (module_interface.lifetime_constraints.ref_at(index).owner_stable_id == stable_id) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
+}
+
+() write_lifetime_name(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.InterfaceLifetimeName& name
+) {
+    writer.write_int(name.kind);
+    write_optional_symbol_text(ctx, writer, name.symbol);
 }
 
 () write_function_signature(
@@ -198,17 +977,53 @@ struct SourceSectionWriter: Movable {
         write_type_ref(writer, param.type_ref$.ref());
         index = index + 1;
     }
+    write_param_defaults(ctx, writer, signature);
     write_type_ref(writer, signature.result$.ref());
+}
+
+() write_param_defaults(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.InterfaceFunctionSignature& signature
+) {
+    writer.write_int(signature.param_defaults.len());
+    Int! index = 0;
+    while (index < signature.param_defaults.len()) {
+        source_artifact.InterfaceParamDefault param_default = signature.param_defaults.get(index);
+        writer.write_int(param_default.param_index);
+        write_literal(ctx, writer, param_default.value);
+        index = index + 1;
+    }
+}
+
+() write_literal(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.InterfaceLiteral literal
+) {
+    writer.write_int(literal.kind.value);
+    writer.write_uint64(literal.int_bits);
+    writer.write_bool(literal.signed_int);
+    writer.write_uint64(float64_to_bits(literal.float_value));
+    writer.write_bool(literal.bool_value);
+    write_optional_symbol_text(ctx, writer, literal.string_symbol);
+    writer.write_uint64(UInt64(literal.char_value));
 }
 
 () write_type_ref(SourceSectionWriter& writer, source_artifact.InterfaceTypeRef& type_ref) {
     writer.write_int(type_ref.kind.value);
-    write_optional_stable_id(writer, type_ref.stable_def);
-    writer.write_int(type_ref.args.len());
+    writer.write_bool(type_ref.has_stable_def);
+    if (type_ref.has_stable_def) {
+        writer.write_uint64(type_ref.stable_def_low);
+        writer.write_uint64(type_ref.stable_def_high);
+    }
+    writer.write_int(type_ref.count_kind);
+    writer.write_uint64(type_ref.count_value);
+    writer.write_int(type_ref.arg_count());
     Int! index = 0;
-    while (index < type_ref.args.len()) {
-        source_artifact.InterfaceTypeRef& arg = type_ref.args.ref_at(index);
-        write_type_ref(writer, arg);
+    while (index < type_ref.arg_count()) {
+        source_artifact.InterfaceTypeRef arg = type_ref.arg_at(index);
+        write_type_ref(writer, arg$.ref());
         index = index + 1;
     }
 }
@@ -251,21 +1066,6 @@ struct SourceSectionWriter: Movable {
         source_artifact.AliasExportSummary alias_export = module_interface.public_aliases.get(indexes.get(index));
         write_symbol_text(ctx, writer, alias_export.alias_symbol);
         write_stable_id(writer, alias_export.target_stable_id);
-        index = index + 1;
-    }
-}
-
-() write_generic_templates(
-    SourceSectionWriter& writer,
-    source_artifact.ModuleInterface& module_interface
-) {
-    writer.write_int(module_interface.generic_templates.len());
-    list.ArrayList<Int> indexes = sorted_generic_template_indexes(module_interface);
-    Int! index = 0;
-    while (index < module_interface.generic_templates.len()) {
-        source_artifact.GenericTemplateIndexEntry entry = module_interface.generic_templates.get(indexes.get(index));
-        write_stable_id(writer, entry.owner_stable_id);
-        write_fingerprint(writer, entry.body_fingerprint);
         index = index + 1;
     }
 }
@@ -337,6 +1137,11 @@ struct SourceSectionWriter: Movable {
 () write_fingerprint(SourceSectionWriter& writer, qkey.Fingerprint128 fingerprint) {
     writer.write_uint64(fingerprint.low);
     writer.write_uint64(fingerprint.high);
+}
+
+() write_bytes_with_length(SourceSectionWriter& writer, UInt8[] bytes) {
+    writer.write_int(bytes.length);
+    writer.write_bytes(bytes);
 }
 
 list.ArrayList<Int> sorted_declaration_indexes(source_artifact.ModuleInterface& module_interface) {
@@ -527,36 +1332,6 @@ Bool alias_less(
     return lhs_index < rhs_index;
 }
 
-list.ArrayList<Int> sorted_generic_template_indexes(source_artifact.ModuleInterface& module_interface) {
-    list.ArrayList<Int> indexes = index_list(module_interface.generic_templates.len());
-    Int! index = 0;
-    while (index < indexes.len()) {
-        Int! min_index = index;
-        Int! scan = index + 1;
-        while (scan < indexes.len()) {
-            if (generic_template_index_less(module_interface, indexes.get(scan), indexes.get(min_index))) {
-                min_index = scan;
-            }
-            scan = scan + 1;
-        }
-        swap_indexes(indexes$.ref(), index, min_index);
-        index = index + 1;
-    }
-    return indexes$.move();
-}
-
-Bool generic_template_index_less(
-    source_artifact.ModuleInterface& module_interface,
-    Int lhs_index,
-    Int rhs_index
-) {
-    source_artifact.GenericTemplateIndexEntry lhs = module_interface.generic_templates.get(lhs_index);
-    source_artifact.GenericTemplateIndexEntry rhs = module_interface.generic_templates.get(rhs_index);
-    if (stable_id_less(lhs.owner_stable_id, rhs.owner_stable_id)) { return true; }
-    if (stable_id_less(rhs.owner_stable_id, lhs.owner_stable_id)) { return false; }
-    return lhs_index < rhs_index;
-}
-
 list.ArrayList<Int> index_list(Int len) {
     list.ArrayList<Int> indexes = list.ArrayList<Int>(len);
     Int! index = 0;
@@ -610,4 +1385,20 @@ Bool bytes_less(UInt8[] lhs, UInt8[] rhs) {
         index = index + 1;
     }
     return lhs.length < rhs.length;
+}
+
+UInt64 float64_to_bits(Float64 value) {
+    Float64![*] input = Float64!$.alloc_array(1);
+    UInt64![*] output = UInt64!$.alloc_array(1);
+    input[0] = value;
+    memcpy(output[0]$.addr()$.as(UInt8[*]), input[0]$.addr()$.as(UInt8[*]), 8);
+    return output[0];
+}
+
+Float64 float64_from_bits(UInt64 bits) {
+    UInt64![*] input = UInt64!$.alloc_array(1);
+    Float64![*] output = Float64!$.alloc_array(1);
+    input[0] = bits;
+    memcpy(output[0]$.addr()$.as(UInt8[*]), input[0]$.addr()$.as(UInt8[*]), 8);
+    return output[0];
 }

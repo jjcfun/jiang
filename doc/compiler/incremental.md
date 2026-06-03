@@ -59,14 +59,9 @@ load_interface(source) -> ModuleInterface
 load_generic_template(stable_id) -> GenericTemplate
 ```
 
-`ModuleInterface` 内的 generic template 信息只是一张索引：
-
-```text
-stable owner id -> body fingerprint
-```
-
-真实的 template body 编码保存在 `GenericTemplate` / `.ji` template payload section 中。这样下游
-可以先通过 interface 判断某个 public 泛型 body 是否可加载，再按 stable id 读取对应 payload。
+`ModuleInterface` 只保存 public signature 和 template index；generic body payload 保存在 `.ji`
+的独立 HIR template section。跨 package 泛型实例化不重新读取依赖源码，而是按 stable id 读取
+generic HIR template。
 
 `ModuleInterface.interface_hash` 是 public semantic surface 的 hash，不是 source hash：
 
@@ -74,8 +69,7 @@ stable owner id -> body fingerprint
 - 写入 symbol 文本和 stable id，不写 session-local `SymbolId` / `DefId` / `TypeId`。
 - 写入 public declaration signature、public import、public alias 和 public generic template index。
 - 不写 `SourceId`、`source_hash`、span/source offset。
-- 非泛型函数 body 变化不应改变 interface hash；public 泛型 body 只通过 template index 的
-  body fingerprint 影响下游。
+- 函数 body 变化不应改变 interface hash，除非改变 public signature。
 
 `.ji` 不保存：
 
@@ -141,8 +135,7 @@ JiHeader
 SectionTable
   ImportSummarySection: offset / length / hash
   InterfaceSection: offset / length / hash
-  TemplateIndexSection: offset / length / hash
-  TemplatePayloadSection: offset / length / hash
+  GenericTemplateSection: offset / length / hash
   SourceMapSection: offset / length / hash
 ```
 
@@ -156,8 +149,7 @@ decl/type graph:
   read interface section
 
 monomorph:
-  read template index
-  read one generic template payload by offset / length
+  read one generic template payload by stable owner id
 ```
 
 编译阶段只依赖 `load_import_summary` / `load_interface` / `load_generic_template`，不直接依赖
@@ -173,7 +165,7 @@ JiIndexEntry
   section_table
   loaded_import_summary?
   loaded_interface?
-  template_index?
+  loaded_generic_template_index?
 ```
 
 读取 section 时临时 open -> read_at -> close。后续可以加小型 LRU file handle cache，但这只是
@@ -257,15 +249,13 @@ interface 保存：
 - 参数默认值表达式、where/lifetime 约束的 template/body 编码。
 - nominal type 的字段、variant、associated type、method signature。
 - trait / impl 的签名关系。
-- public 泛型 body template index。
-- inline body template。
 - 影响下游 resolve/type check 的 fingerprint。
 
 interface 不保存单态化结果，也不直接内联完整 body payload。单态化结果只存在于当前
-compilation 的内存 `MonomorphStore` 中；generic body template payload 由独立 template
-cache / `.ji` section 提供。
+compilation 的内存 `MonomorphStore` 中。public generic body 以 HIR template payload 的形式
+保存在 `.ji`，不保存成 concrete MIR。
 
-跨 package 调用 public 泛型时，下游需要能读取上游 interface 里的 generic body template：
+跨 package 调用 public 泛型时，下游需要能恢复上游泛型 body：
 
 ```text
 package util:
@@ -275,8 +265,8 @@ package app:
   Int x = util.id<Int>(1)
 ```
 
-如果 Jiang 不使用 runtime metadata 泛型，`app` 必须读取 `id<T>` 的 template，生成 `id<Int>`
-的 concrete MIR 和 `.o`。
+如果 Jiang 不使用 runtime metadata 泛型，`app` 必须拿到 `id<T>` 的 body，生成 `id<Int>` 的
+concrete MIR 和 `.o`。这个 body 来自 `.ji` 的 generic HIR template section，不依赖上游源码。
 
 ## Object Cache
 
@@ -306,7 +296,7 @@ cache_root/objects/mono_<stable_instance_fingerprint>.o
 planner 是纯函数，不创建目录、不写文件。pipeline 接入 object lookup 前，driver/OS 层需要先
 调度 `support/fs` 已有的递归建目录能力和 `artifact/object_hash` 的 object hash 计算。
 
-`CompileOptions.artifact_cache_dir` 是当前编译的 cache root，默认值为 `.jiang-cache`。
+`CompileOptions.artifact_cache_dir` 是当前编译的 cache root，默认值为 `build/cache`。
 pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
 
 推荐分成两类：

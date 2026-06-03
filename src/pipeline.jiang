@@ -3,12 +3,16 @@
 import context = "./context.jiang";
 import diagnostic = "./diagnostic/diagnostic.jiang";
 import ast_store = "./query/ast_store.jiang";
+import qid = "./query/id.jiang";
 import object_artifact = "./artifact/object.jiang";
 import object_hash = "./artifact/object_hash.jiang";
 import object_plan = "./artifact/object_plan.jiang";
 import artifact_path = "./artifact/path.jiang";
+import source_ji = "./artifact/source_ji.jiang";
 import backend = "./backend/api.jiang";
 import codegen_unit = "./backend/codegen_unit.jiang";
+import link_plan = "./backend/link_plan.jiang";
+import linker = "./backend/linker.jiang";
 import borrow_check = "./borrow_check/api.jiang";
 import borrow_result = "./borrow_check/result.jiang";
 import driver_options = "./driver/options.jiang";
@@ -17,6 +21,7 @@ import mir_drop = "./mir/drop_elaborate.jiang";
 import mir_lower = "./mir/lower.jiang";
 import resolve = "./resolve/module_resolver.jiang";
 import module_graph = "./resolve/module_graph.jiang";
+import store = "./resolve/store.jiang";
 import syntax = "./syntax/api.jiang";
 import syntax_diagnostics = "./syntax/diagnostics.jiang";
 import fs = "./support/fs.jiang";
@@ -69,7 +74,8 @@ public () compile_with_options(context.CompilerContext& ctx, driver_options.Comp
         options.output_path,
         options.artifact_cache_dir,
         options.target_triple,
-        options.compiler_version
+        options.compiler_version,
+        options.linker_path
     );
 }
 
@@ -87,7 +93,17 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
 }
 
 () compile_package(context.CompilerContext& ctx, source.SourceId source_id, UInt8[] text) {
-    compile_package_with_emit(ctx, source_id, text, .executable, "", ".jiang-cache", "default-target", "jiang-dev");
+    compile_package_with_emit(
+        ctx,
+        source_id,
+        text,
+        .executable,
+        "",
+        "build/cache",
+        "default-target",
+        "jiang-dev",
+        "clang"
+    );
 }
 
 () compile_package_with_emit(
@@ -98,7 +114,8 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     UInt8[] output_path,
     UInt8[] artifact_cache_dir,
     UInt8[] target_triple,
-    UInt8[] compiler_version
+    UInt8[] compiler_version,
+    UInt8[] linker_path
 ) {
     // AstStore 是本次 package 编译的临时 parse cache。resolve/HIR 完成后，
     // AST 不再进入 QuerySystem 的长期状态。
@@ -114,7 +131,13 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
         add_package_error(ctx, "failed to load parsed root file", "root_ast_missing");
         return;
     }
-    resolve.ModuleResolver resolver = resolve.ModuleResolver(ctx, asts$.ref());
+    UInt64 compiler_version_hash = source_artifact_version_hash(compiler_version);
+    resolve.ModuleResolver resolver = resolve.ModuleResolver(
+        ctx,
+        asts$.ref(),
+        artifact_cache_dir,
+        compiler_version_hash
+    );
     module_graph.ModuleGraph^ graph = resolver.build_module_graph(root_file);
     if (!graph.ok) {
         return;
@@ -125,8 +148,9 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     if (!type_check.check_hir_package(ctx, graph$.ref())) {
         return;
     }
+    write_source_artifact_cache(ctx, graph$.ref(), artifact_cache_dir, compiler_version);
     monomorph.MonomorphInstances^ instances = monomorph.collect_reachable_instances(
-        ctx.query$.ref(),
+        ctx,
         ctx.query.hirs$.ref(),
         ctx.query.typeck$.ref(),
         graph$.ref()
@@ -170,7 +194,8 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
         output_path,
         artifact_cache_dir,
         target_triple,
-        compiler_version
+        compiler_version,
+        linker_path
     );
     if (result.has_errors()) {
         add_package_error(ctx, "backend emission failed", "backend_emit_failed");
@@ -190,8 +215,60 @@ public Bool prepare_artifact_cache(
     if (fs.create_dirs(object_dir)) {
         return true;
     }
-    add_package_error(ctx, string.append("failed to create artifact cache directory: ", object_dir), "cache_dir_failed");
+    add_package_error(
+        ctx,
+        string.append("failed to create artifact cache directory: ", object_dir),
+        "cache_dir_failed"
+    );
     return false;
+}
+
+() write_source_artifact_cache(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph,
+    UInt8[] artifact_cache_dir,
+    UInt8[] compiler_version
+) {
+    UInt8[] source_dir = artifact_path.source_dir(artifact_cache_dir);
+    if (!fs.create_dirs(source_dir)) {
+        return;
+    }
+
+    UInt64 version_hash = source_artifact_version_hash(compiler_version);
+    Int! index = 0;
+    while (index < graph.module_count()) {
+        write_module_source_artifact(ctx, graph.module_at(index), artifact_cache_dir, version_hash);
+        index = index + 1;
+    }
+}
+
+() write_module_source_artifact(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id,
+    UInt8[] artifact_cache_dir,
+    UInt64 compiler_version
+) {
+    store.ModuleRecord module = ctx.query.resolve.modules.get(module_id);
+    guard ctx.query.incremental.stable_id_for_def(module.def_id) is some stable_id else {
+        return;
+    }
+    source.SourceRecord source_record = ctx.query.sources.get(module.source_id);
+    UInt8[] artifact_file = artifact_path.source_ji_path(
+        artifact_cache_dir,
+        stable_id,
+        source_record.content_hash
+    );
+    source_ji.write_source_ji_file(
+        ctx,
+        ctx.query.artifacts$.ref(),
+        module.source_id,
+        compiler_version,
+        artifact_file
+    );
+}
+
+UInt64 source_artifact_version_hash(UInt8[] compiler_version) {
+    return source.content_hash(compiler_version) ^ source.content_hash("source-ji-v2");
 }
 
 backend.BackendResult emit_backend(
@@ -201,7 +278,8 @@ backend.BackendResult emit_backend(
     UInt8[] output_path,
     UInt8[] artifact_cache_dir,
     UInt8[] target_triple,
-    UInt8[] compiler_version
+    UInt8[] compiler_version,
+    UInt8[] linker_path
 ) {
     if (emit == .object_file) {
         return emit_object_with_cache(ctx, lowered, output_path, artifact_cache_dir, target_triple, compiler_version);
@@ -210,7 +288,15 @@ backend.BackendResult emit_backend(
         UInt8![*] c_output_path = backend_output_buffer(output_path);
         return backend.emit_llvm_ir(ctx, lowered, c_output_path$.as(UInt8[*]));
     }
-    return backend.emit(ctx, lowered);
+    return emit_executable_with_cache_plan(
+        ctx,
+        lowered,
+        output_path,
+        artifact_cache_dir,
+        target_triple,
+        compiler_version,
+        linker_path
+    );
 }
 
 backend.BackendResult emit_object_with_cache(
@@ -230,17 +316,115 @@ backend.BackendResult emit_object_with_cache(
         target_triple,
         compiler_version
     );
+    record_object_plan_stats(ctx, plan$.ref());
     if (plan.len() == 1) {
-        return emit_single_object_unit_with_cache(ctx, lowered, units$.ref(), plan.entry_at(0), output_path);
+        return emit_single_object_unit_with_cache(
+            ctx,
+            lowered,
+            units$.ref(),
+            plan$.ref(),
+            plan.entry_at(0),
+            output_path
+        );
+    }
+    if (!emit_plan_cache_objects(ctx, lowered, units$.ref(), plan$.ref())) {
+        return backend.BackendResult(false);
     }
     UInt8![*] c_output_path = backend_output_buffer(output_path);
     return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]));
+}
+
+backend.BackendResult emit_executable_with_cache_plan(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    UInt8[] output_path,
+    UInt8[] artifact_cache_dir,
+    UInt8[] target_triple,
+    UInt8[] compiler_version,
+    UInt8[] linker_path
+) {
+    codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx, lowered);
+    object_plan.ObjectReusePlan plan = object_plan.build_object_reuse_plan(
+        ctx,
+        lowered,
+        units$.ref(),
+        artifact_cache_dir,
+        target_triple,
+        compiler_version
+    );
+    record_object_plan_stats(ctx, plan$.ref());
+    if (!emit_plan_cache_objects(ctx, lowered, units$.ref(), plan$.ref())) {
+        return backend.BackendResult(false);
+    }
+    link_plan.LinkPlan links = link_plan.link_plan_from_object_plan(plan$.ref());
+    linker.LinkResult result = linker.link(links$.ref(), linker_path, output_path);
+    if (!result.ok) {
+        add_package_error(ctx, "linker execution failed", "linker_execution_failed");
+    }
+    return backend.BackendResult(result.ok);
+}
+
+() record_object_plan_stats(context.CompilerContext& ctx, object_plan.ObjectReusePlan& plan) {
+    Int! index = 0;
+    while (index < plan.len()) {
+        object_plan.ObjectPlanEntry& entry = plan.entry_at(index);
+        if (entry.kind == .unsupported) {
+            ctx.query.object_artifacts.record_unsupported_unit();
+        } else if (entry.kind == .source_object) {
+            ctx.query.object_artifacts.record_source_lookup(entry.lookup_status);
+        } else {
+            ctx.query.object_artifacts.record_monomorph_lookup(entry.lookup_status);
+        }
+        index = index + 1;
+    }
+}
+
+Bool emit_plan_cache_objects(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectReusePlan& plan
+) {
+    Int! index = 0;
+    while (index < plan.len()) {
+        if (!emit_plan_cache_object(ctx, lowered, units, plan, plan.entry_at(index))) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool emit_plan_cache_object(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectReusePlan& plan,
+    object_plan.ObjectPlanEntry& entry
+) {
+    if (entry.kind == .unsupported || entry.can_reuse()) {
+        return true;
+    }
+    UInt8[] cache_path = plan.path_at(entry.path_index);
+    UInt8![*] c_cache_path = backend_output_buffer(cache_path);
+    backend.BackendResult emitted = backend.emit_object_for_unit(
+        ctx,
+        lowered,
+        units.unit_at(entry.unit_index),
+        c_cache_path$.as(UInt8[*])
+    );
+    if (emitted.has_errors()) {
+        return false;
+    }
+    record_emitted_object(ctx, plan, entry);
+    return true;
 }
 
 backend.BackendResult emit_single_object_unit_with_cache(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
     codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectReusePlan& plan,
     object_plan.ObjectPlanEntry& entry,
     UInt8[] output_path
 ) {
@@ -249,23 +433,16 @@ backend.BackendResult emit_single_object_unit_with_cache(
         return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]));
     }
 
-    UInt8[] final_path = final_object_path(output_path, entry.path);
+    UInt8[] cache_path = plan.path_at(entry.path_index);
+    UInt8[] final_path = final_object_path(output_path, cache_path);
     if (entry.can_reuse()) {
-        return backend.BackendResult(copy_cached_object(ctx, entry.path, final_path));
+        return backend.BackendResult(copy_cached_object(ctx, cache_path, final_path));
     }
 
-    UInt8![*] c_cache_path = backend_output_buffer(entry.path);
-    backend.BackendResult emitted = backend.emit_object_for_unit(
-        ctx,
-        lowered,
-        units.unit_at(entry.unit_index),
-        c_cache_path$.as(UInt8[*])
-    );
-    if (emitted.has_errors()) {
-        return emitted;
+    if (!emit_plan_cache_object(ctx, lowered, units, plan, entry)) {
+        return backend.BackendResult(false);
     }
-    record_emitted_object(ctx, entry);
-    return backend.BackendResult(copy_cached_object(ctx, entry.path, final_path));
+    return backend.BackendResult(copy_cached_object(ctx, cache_path, final_path));
 }
 
 UInt8[] final_object_path(UInt8[] output_path, UInt8[] cache_path) {
@@ -286,14 +463,26 @@ Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[
     return false;
 }
 
-() record_emitted_object(context.CompilerContext& ctx, object_plan.ObjectPlanEntry& entry) {
-    guard object_hash.hash_file(entry.path) is some emitted_hash else {
+() record_emitted_object(
+    context.CompilerContext& ctx,
+    object_plan.ObjectReusePlan& plan,
+    object_plan.ObjectPlanEntry& entry
+) {
+    UInt8[] cache_path = plan.path_at(entry.path_index);
+    guard object_hash.hash_file(cache_path) is some emitted_hash else {
         return;
     }
-    if (entry.source_key is some source_key) {
+    if (entry.kind == .source_object && entry.source_key_index >= 0) {
         ctx.query.object_artifacts.store_source_object(
-            source_key,
-            object_artifact.ObjectArtifactRecord(.source_object, emitted_hash, entry.path)
+            plan.source_key_at(entry.source_key_index),
+            object_artifact.ObjectArtifactRecord(.source_object, emitted_hash, cache_path)
+        );
+        return;
+    }
+    if (entry.kind == .monomorph_object && entry.monomorph_key_index >= 0) {
+        ctx.query.object_artifacts.store_monomorph_object(
+            plan.monomorph_key_at(entry.monomorph_key_index),
+            object_artifact.ObjectArtifactRecord(.monomorph_object, emitted_hash, cache_path)
         );
     }
 }

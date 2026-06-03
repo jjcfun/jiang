@@ -1,0 +1,474 @@
+// 从当前 session 的 Def/HIR facts 构造可落盘 ModuleInterface。
+//
+// Interface 只描述依赖方需要的公开语义表面：public declaration、public import /
+// alias 和可稳定表达的函数签名。复杂 type ref 如果暂时不能稳定编码，宁可写成
+// invalid_type，也不能把 session-local TypeId/HirId 写入 artifact。
+
+import context = "../context.jiang";
+import hir = "../hir/hir.jiang";
+import hir_template = "./hir_template.jiang";
+import qid = "../query/id.jiang";
+import qkey = "../query/key.jiang";
+import def = "../resolve/def.jiang";
+import store = "../resolve/store.jiang";
+import source = "../source/source.jiang";
+import source_artifact = "./source.jiang";
+import source_fingerprint = "./source_fingerprint.jiang";
+
+public Bool store_module_interface(context.CompilerContext& ctx, qid.ModuleId module_id) {
+    guard build_module_interface(ctx, module_id) is some module_interface else {
+        return false;
+    }
+    source.SourceId source_id = module_interface.source_id;
+    ctx.query.artifacts.store_interface(source_id, module_interface$.move());
+    return true;
+}
+
+public source_artifact.ModuleInterface? build_module_interface(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id
+) {
+    store.ModuleRecord module = ctx.query.resolve.modules.get(module_id);
+    store.PackageRecord package_record = ctx.query.resolve.packages.get(module.package_id);
+    source.SourceRecord source_record = ctx.query.sources.get(module.source_id);
+    source_artifact.ModuleInterface! module_interface = source_artifact.ModuleInterface(
+        module.source_id,
+        source_record.content_hash,
+        package_record.name,
+        module.path_symbol
+    );
+
+    add_public_imports(ctx, module_interface$.ref(), module$.ref());
+    add_public_members(ctx, module_interface$.ref(), module.def_id);
+    module_interface.interface_hash = source_fingerprint.module_interface_fingerprint(
+        ctx,
+        module_interface$.ref()
+    );
+    return module_interface$.move();
+}
+
+() add_public_imports(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    store.ModuleRecord& module
+) {
+    Int! index = 0;
+    while (index < module.imports.len()) {
+        store.ImportRecord import_record = module.imports.get(index);
+        add_public_import(ctx, module_interface, import_record);
+        index = index + 1;
+    }
+}
+
+() add_public_import(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    store.ImportRecord import_record
+) {
+    if (import_record.visibility != .public_visibility) {
+        return;
+    }
+    module_interface.add_public_import(source_artifact.ImportSummaryEntry(
+        import_record.kind,
+        import_record.visibility,
+        import_record.path_symbol,
+        import_record.alias_symbol
+    ));
+    add_public_import_alias(ctx, module_interface, import_record);
+}
+
+() add_public_import_alias(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    store.ImportRecord import_record
+) {
+    guard import_record.alias_def is some alias_def else { return; }
+    guard import_record.target_module is some target_module else { return; }
+    store.ModuleRecord target = ctx.query.resolve.modules.get(target_module);
+    guard ctx.query.incremental.stable_id_for_def(target.def_id) is some target_stable_id else { return; }
+    def.DefRecord alias_record = ctx.query.defs.get(alias_def);
+    module_interface.add_public_alias(source_artifact.AliasExportSummary(
+        alias_record.name.symbol,
+        target_stable_id
+    ));
+}
+
+() add_public_members(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qid.DefId owner_def
+) {
+    hir.HirDef& owner_hir = ctx.query.hirs.def_ref(owner_def);
+    Int! index = 0;
+    while (index < owner_hir.members.len()) {
+        qid.DefId member_def = owner_hir.members.get(index);
+        add_public_member(ctx, module_interface, member_def);
+        index = index + 1;
+    }
+}
+
+() add_public_member(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qid.DefId member_def
+) {
+    def.DefRecord def_record = ctx.query.defs.get(member_def);
+    if (def_record.visibility != .public_visibility) {
+        return;
+    }
+    guard ctx.query.hirs.def(member_def) is some hir_def else { return; }
+    guard ctx.query.incremental.stable_id_for_def(member_def) is some stable_id else { return; }
+    source_artifact.InterfaceDeclSummary! summary = source_artifact.InterfaceDeclSummary(
+        stable_id,
+        def_record.kind,
+        def_record.domain,
+        def_record.visibility,
+        def_record.name.symbol,
+        stable_owner(ctx, def_record.owner_def)
+    );
+    summary.signature_fingerprint = ctx.query.incremental.signature_fingerprint(stable_id);
+    summary.body_fingerprint = ctx.query.incremental.body_fingerprint(stable_id);
+    module_interface.add_declaration(summary);
+    add_decl_type_ref(ctx, module_interface, stable_id, hir_def);
+    add_trait_refs(ctx, module_interface, stable_id, hir_def);
+    add_where_predicates(ctx, module_interface, stable_id, hir_def);
+    add_lifetime_constraints(module_interface, stable_id, hir_def);
+    add_function_signature(ctx, module_interface, stable_id, hir_def);
+    add_generic_template(ctx, module_interface, stable_id, hir_def);
+    add_public_members(ctx, module_interface, member_def);
+}
+
+qkey.StableSymbolId? stable_owner(context.CompilerContext& ctx, qid.DefId? owner_def) {
+    guard owner_def is some owner else { return null; }
+    return ctx.query.incremental.stable_id_for_def(owner);
+}
+
+() add_decl_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id,
+    hir.HirDef& hir_def
+) {
+    guard hir_def.decl.type_ref is some type_ref else { return; }
+    module_interface.set_decl_type_ref(stable_id, interface_type_ref(ctx, type_ref));
+}
+
+() add_trait_refs(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id,
+    hir.HirDef& hir_def
+) {
+    Int! index = 0;
+    while (index < hir_def.trait_refs.len()) {
+        module_interface.add_trait_ref(stable_id, interface_type_ref(ctx, hir_def.trait_refs.get(index)));
+        index = index + 1;
+    }
+}
+
+() add_where_predicates(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id,
+    hir.HirDef& hir_def
+) {
+    Int! index = 0;
+    while (index < hir_def.where_predicates.len()) {
+        add_interface_where_predicate(module_interface, ctx, stable_id, hir_def.where_predicates.get(index));
+        index = index + 1;
+    }
+}
+
+() add_interface_where_predicate(
+    source_artifact.ModuleInterface& module_interface,
+    context.CompilerContext& ctx,
+    qkey.StableSymbolId stable_id,
+    hir.HirWherePredicate predicate
+) {
+    if (predicate is .type_bound(bound)) {
+        add_interface_type_bound(module_interface, ctx, stable_id, .type_bound, bound);
+        return;
+    }
+    if (predicate is .negative_type_bound(bound)) {
+        add_interface_type_bound(module_interface, ctx, stable_id, .negative_type_bound, bound);
+        return;
+    }
+    if (predicate is .type_equal(equal)) {
+        module_interface.add_where_predicate_parts(
+            stable_id,
+            .type_equal,
+            interface_type_ref(ctx, equal.subject),
+            interface_type_ref(ctx, equal.value),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            null
+        );
+        return;
+    }
+    guard predicate is .projection_equal(projection) else {
+        module_interface.add_where_predicate_parts(
+            stable_id,
+            .type_bound,
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            source_artifact.InterfaceTypeRef.invalid_type(),
+            null
+        );
+        return;
+    }
+    module_interface.add_where_predicate_parts(
+        stable_id,
+        .projection_equal,
+        interface_type_ref(ctx, projection.subject),
+        interface_type_ref(ctx, projection.value),
+        interface_type_ref(ctx, projection.trait_ref),
+        projection.assoc_symbol
+    );
+}
+
+() add_interface_type_bound(
+    source_artifact.ModuleInterface& module_interface,
+    context.CompilerContext& ctx,
+    qkey.StableSymbolId stable_id,
+    source_artifact.InterfaceWherePredicateKind kind,
+    hir.HirWhereTypeBound bound
+) {
+    module_interface.add_where_predicate_parts(
+        stable_id,
+        kind,
+        interface_type_ref(ctx, bound.subject),
+        interface_type_ref(ctx, bound.bound),
+        source_artifact.InterfaceTypeRef.invalid_type(),
+        null
+    );
+}
+
+() add_lifetime_constraints(
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id,
+    hir.HirDef& hir_def
+) {
+    Int! index = 0;
+    while (index < hir_def.lifetime_constraints.len()) {
+        hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+        module_interface.add_lifetime_constraint(source_artifact.InterfaceLifetimeConstraint(
+            stable_id,
+            interface_lifetime_name(constraint.longer),
+            interface_lifetime_name(constraint.shorter)
+        ));
+        index = index + 1;
+    }
+}
+
+source_artifact.InterfaceLifetimeName interface_lifetime_name(hir.HirLifetimeName name) {
+    return source_artifact.InterfaceLifetimeName(name.kind.value, name.symbol);
+}
+
+() add_function_signature(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id,
+    hir.HirDef& hir_def
+) {
+    guard hir_def.decl.function_signature is some signature else { return; }
+    source_artifact.InterfaceFunctionSignature! iface_signature =
+        source_artifact.InterfaceFunctionSignature(
+            signature.has_receiver,
+            interface_type_ref(ctx, signature.result)
+        );
+    Int! index = 0;
+    while (index < signature.params.length) {
+        iface_signature.add_param(source_artifact.InterfaceParamSummary(
+            signature.param_symbols[index],
+            interface_type_ref(ctx, signature.params[index])
+        ));
+        index = index + 1;
+    }
+    add_param_defaults(ctx, iface_signature$.ref(), signature);
+    module_interface.set_function_signature(stable_id, iface_signature$.move());
+}
+
+() add_generic_template(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id,
+    hir.HirDef& hir_def
+) {
+    if (hir_def.body == null || generic_param_count(ctx, hir_def.def_id) == 0) {
+        return;
+    }
+    UInt8[] payload = hir_template.encode_body(ctx, hir_def);
+    if (payload.length == 0) {
+        return;
+    }
+    module_interface.add_generic_template(source_artifact.GenericTemplate(
+        stable_id,
+        ctx.query.incremental.body_fingerprint(stable_id),
+        payload
+    ));
+}
+
+Int generic_param_count(context.CompilerContext& ctx, qid.DefId def_id) {
+    Int! count = 0;
+    qid.DefId?! current = def_id;
+    while (current is some current_def) {
+        count = count + ctx.query.hirs.def_ref(current_def).generic_params.len();
+        current = ctx.query.defs.get(current_def).owner_def;
+    }
+    return count;
+}
+
+() add_param_defaults(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceFunctionSignature& iface_signature,
+    hir.HirFunctionSignature signature
+) {
+    Int! index = 0;
+    while (index < signature.param_defaults.length) {
+        hir.HirParamDefault param_default = signature.param_defaults[index];
+        iface_signature.add_param_default(source_artifact.InterfaceParamDefault(
+            param_default.param_index,
+            interface_default_literal(ctx, param_default.value)
+        ));
+        index = index + 1;
+    }
+}
+
+source_artifact.InterfaceLiteral interface_default_literal(context.CompilerContext& ctx, hir.HirId value) {
+    hir.HirNode node = ctx.query.hirs.node(value);
+    guard node.data is .literal(literal) else {
+        return source_artifact.InterfaceLiteral(.invalid_literal);
+    }
+    return interface_literal(literal);
+}
+
+source_artifact.InterfaceLiteral interface_literal(hir.HirLiteral literal) {
+    if (literal.value is .int_value(int_value)) {
+        source_artifact.InterfaceLiteral! result = source_artifact.InterfaceLiteral(.int_value);
+        result.int_bits = int_value.bits;
+        result.signed_int = int_value.signed_value;
+        return result;
+    }
+    if (literal.value is .bool_value(bool_value)) {
+        source_artifact.InterfaceLiteral! result = source_artifact.InterfaceLiteral(.bool_value);
+        result.bool_value = bool_value;
+        return result;
+    }
+    if (literal.value is .float_value(float_value)) {
+        source_artifact.InterfaceLiteral! result = source_artifact.InterfaceLiteral(.float_value);
+        result.float_value = float_value.value;
+        return result;
+    }
+    if (literal.value is .string_value(symbol)) {
+        source_artifact.InterfaceLiteral! result = source_artifact.InterfaceLiteral(.string_value);
+        result.string_symbol = symbol;
+        return result;
+    }
+    if (literal.value is .char_value(char_value)) {
+        source_artifact.InterfaceLiteral! result = source_artifact.InterfaceLiteral(.char_value);
+        result.char_value = char_value;
+        return result;
+    }
+    if (literal.value is .null_value) {
+        return source_artifact.InterfaceLiteral(.null_value);
+    }
+    if (literal.value is .unit_value) {
+        return source_artifact.InterfaceLiteral(.unit_value);
+    }
+    return source_artifact.InterfaceLiteral(.invalid_literal);
+}
+
+source_artifact.InterfaceTypeRef interface_type_ref(
+    context.CompilerContext& ctx,
+    hir.HirId type_ref
+) {
+    hir.HirNode node = ctx.query.hirs.node(type_ref);
+    if (node.data is .unit_type_ref) {
+        return source_artifact.InterfaceTypeRef.unit_type();
+    }
+    if (node.data is .named_type_ref(named)) {
+        return named_interface_type_ref(ctx, named);
+    }
+    if (node.data is .layered_type_ref(layered)) {
+        source_artifact.InterfaceTypeRef! result = source_artifact.InterfaceTypeRef(.layered_type);
+        result.count_kind = layered.kind.value;
+        result.add_arg(interface_type_ref(ctx, layered.element));
+        return result$.move();
+    }
+    if (node.data is .array_type_ref(array)) {
+        source_artifact.InterfaceTypeRef! result = source_artifact.InterfaceTypeRef(.array_type);
+        result.count_kind = array.count_kind.value;
+        result.count_value = array.count_value;
+        result.add_arg(interface_type_ref(ctx, array.element));
+        return result$.move();
+    }
+    if (node.data is .errorable_type_ref(errorable)) {
+        return errorable_interface_type_ref(ctx, errorable);
+    }
+    if (node.data is .function_type_ref(function_type)) {
+        return function_interface_type_ref(ctx, function_type);
+    }
+    if (node.data is .tuple_type_ref(tuple)) {
+        return tuple_interface_type_ref(ctx, tuple);
+    }
+    if (node.data is .infer_type_ref) {
+        return source_artifact.InterfaceTypeRef.infer_type();
+    }
+    return source_artifact.InterfaceTypeRef.invalid_type();
+}
+
+source_artifact.InterfaceTypeRef errorable_interface_type_ref(
+    context.CompilerContext& ctx,
+    hir.HirErrorableTypeRef errorable
+) {
+    source_artifact.InterfaceTypeRef! type_ref =
+        source_artifact.InterfaceTypeRef(.errorable_type);
+    type_ref.add_arg(interface_type_ref(ctx, errorable.value_type));
+    if (errorable.error_type is some error_ref) {
+        type_ref.add_arg(interface_type_ref(ctx, error_ref));
+    }
+    return type_ref$.move();
+}
+
+source_artifact.InterfaceTypeRef function_interface_type_ref(
+    context.CompilerContext& ctx,
+    hir.HirFunctionTypeRef function_type
+) {
+    source_artifact.InterfaceTypeRef! type_ref = source_artifact.InterfaceTypeRef.function_type();
+    Int! index = 0;
+    while (index < function_type.params.length) {
+        type_ref.add_arg(interface_type_ref(ctx, function_type.params[index]));
+        index = index + 1;
+    }
+    type_ref.add_arg(interface_type_ref(ctx, function_type.result));
+    return type_ref$.move();
+}
+
+source_artifact.InterfaceTypeRef tuple_interface_type_ref(
+    context.CompilerContext& ctx,
+    hir.HirTupleTypeRef tuple
+) {
+    source_artifact.InterfaceTypeRef! type_ref = source_artifact.InterfaceTypeRef.tuple_type();
+    Int! index = 0;
+    while (index < tuple.items.length) {
+        type_ref.add_arg(interface_type_ref(ctx, tuple.items[index]));
+        index = index + 1;
+    }
+    return type_ref$.move();
+}
+
+source_artifact.InterfaceTypeRef named_interface_type_ref(
+    context.CompilerContext& ctx,
+    hir.HirNamedTypeRef named
+) {
+    guard ctx.query.incremental.stable_id_for_def(named.def_id) is some stable_id else {
+        return source_artifact.InterfaceTypeRef.invalid_type();
+    }
+    source_artifact.InterfaceTypeRef! type_ref =
+        source_artifact.InterfaceTypeRef.named_type(stable_id.low, stable_id.high);
+    Int! index = 0;
+    while (index < named.args.length) {
+        type_ref.add_arg(interface_type_ref(ctx, named.args[index]));
+        index = index + 1;
+    }
+    return type_ref$.move();
+}
