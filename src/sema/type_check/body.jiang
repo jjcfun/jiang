@@ -15,16 +15,20 @@ import check_state = "./state.jiang";
 import type_ops_mod = "./type_ops.jiang";
 import pattern_mod = "./pattern.jiang";
 
-public struct BodyCheck {
+public struct BodyCheck: Movable {
     check_state.CheckState& state;
     type_ops_mod.TypeOps& type_ops;
     pattern_mod.PatternCheck! pattern_check;
+    // expression type 也按 HirId 做 lazy query。递归函数调用只需要 callee
+    // signature，不能让同一个 HIR node 的 type check 重入到自身。
+    table.HashTable<hir.HirId, Int>! node_states;
 
     @life(state > self, type_ops > self)
     public init(check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
         self.state = state;
         self.type_ops = type_ops;
         self.pattern_check = pattern_mod.PatternCheck(state, type_ops);
+        self.node_states = table.HashTable<hir.HirId, Int>();
     }
 
     public () check_bodies() {
@@ -156,6 +160,21 @@ public struct BodyCheck {
     }
 
     qid.TypeId check_node(hir.HirId node_id) {
+        if (self.state.results.node_type(node_id) is some existing) {
+            return existing;
+        }
+        if (table.hash_table_get_value<hir.HirId, Int>(self.node_states$.ref(), node_id) is some state) {
+            if (state == 1) {
+                self.type_ops.add_node_error(
+                    node_id,
+                    "cyclic expression type dependency",
+                    "cyclic_expression_type"
+                );
+                return self.state.query.types.invalid_type();
+            }
+        }
+        self.node_states.set(node_id, 1);
+
         hir.HirNode node = self.state.hirs.node(node_id);
         qid.TypeId! type_id = self.state.query.types.invalid_type();
         if (node.data is .literal(literal)) {
@@ -246,6 +265,7 @@ public struct BodyCheck {
             type_id = self.state.query.types.invalid_type();
         }
         self.state.results.set_node_type(node_id, type_id);
+        self.node_states.set(node_id, 2);
         return type_id;
     }
 
@@ -707,7 +727,10 @@ public struct BodyCheck {
         if (kind != .enum_def) {
             return null;
         }
-        return self.state.query.types.int_type();
+        guard self.state.query.types.get(base_type).data is .named(named) else {
+            return self.state.query.types.invalid_type();
+        }
+        return self.type_ops.enum_underlying_type(named.def_id);
     }
 
     qid.TypeId? dot_prefix_variant_value_member_type(hir.HirMemberAccess member_access) {
@@ -724,7 +747,7 @@ public struct BodyCheck {
         }
         self.state.results.select_member(member_access.base, case_def);
         self.state.results.set_node_type(member_access.base, self.enum_case_value_type(case_def));
-        return self.state.query.types.int_type();
+        return self.type_ops.enum_case_underlying_type(case_def);
     }
 
     qid.DefId? unique_enum_case_for_symbol(qid.SymbolId symbol) {
@@ -921,7 +944,7 @@ public struct BodyCheck {
 
     Bool member_can_be_used_as_value(qid.DefId member_def) {
         def.DefKind kind = self.state.query.defs.get(member_def).kind;
-        return kind == .field_def || kind == .function_def;
+        return kind == .field_def || kind == .function_def || kind == .enum_case_def;
     }
 
     qid.TypeId check_if(hir.HirId node_id, hir.HirIf if_expr) {
@@ -1401,6 +1424,9 @@ public struct BodyCheck {
         // 再用函数签名决定 call 表达式的结果类型。
         if (self.is_type_ref_node(call.callee)) {
             return self.check_type_constructor_call(node_id, call);
+        }
+        if (self.check_enum_init_call(node_id, call) is some type_id) {
+            return type_id;
         }
         list.ArrayList<qid.TypeId>! type_args = self.type_ops.check_type_args(call.type_args);
         if (call.target is some target) {
@@ -2148,6 +2174,30 @@ public struct BodyCheck {
             "variant_constructor_type_mismatch"
         );
         return self.state.query.types.invalid_type();
+    }
+
+    qid.TypeId? check_enum_init_call(hir.HirId node_id, hir.HirCall call) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .member_access(member_access) else { return null; }
+        if (!self.symbol_text_equal(member_access.member_symbol, "init?")) { return null; }
+        if (!self.is_type_ref_node(member_access.base)) { return null; }
+        qid.TypeId enum_type = self.type_ops.check_type_ref(member_access.base);
+        guard self.state.query.types.get(enum_type).data is .named(named) else { return null; }
+        if (self.state.query.defs.get(named.def_id).kind != .enum_def) { return null; }
+        qid.TypeId underlying_type = self.type_ops.enum_underlying_type(named.def_id);
+        if (call.args.length != 1) {
+            self.type_ops.add_node_error(node_id, "enum init? expects one argument", "enum_init_arity");
+            return self.state.query.types.optional_type(enum_type, token.Span());
+        }
+        qid.TypeId value_type = self.check_node_expected(call.args[0].value, underlying_type);
+        self.type_ops.expect_value_assignable(
+            call.args[0].value,
+            underlying_type,
+            value_type,
+            "enum init? argument does not match underlying type",
+            "enum_init_argument_type_mismatch"
+        );
+        return self.state.query.types.optional_type(enum_type, token.Span());
     }
 
     qid.TypeId check_selected_variant_call(hir.HirId node_id, hir.HirCall call, qid.DefId variant_def) {

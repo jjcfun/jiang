@@ -1509,6 +1509,9 @@ print("enum value: %d", PetKind.dog.value)
 // 初始化
 Priority priority = Priority.medium
 
+// 从底层整数值尝试恢复 enum，失败时返回 null
+Priority? parsed = Priority.init?(2)
+
 // 通过类型推导，可以省略枚举名
 HttpStatus status = .ok
 

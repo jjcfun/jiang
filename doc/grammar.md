@@ -275,11 +275,14 @@ field_init  <- name ("=" expr)?
 `public enum Color { ... }`。
 
 ```peg
-enum_decl   <- "enum" name trait_list? "{" enum_member* "}"
+enum_decl   <- "enum" ("(" type ")")? name trait_list? "{" enum_member* "}"
 
 enum_member <- "public"? "static"? method_decl
              / name ("=" expr)? ("," / ";")?
 ```
+
+`enum(T)` 的 `T` 必须是具体整数类型。未显式指定值的 enum case 从 `0` 开始递增；
+显式值目前只接受整数 literal，包括负整数字面量。
 
 ## union
 

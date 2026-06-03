@@ -1844,10 +1844,25 @@ struct BodyLowerer: Movable {
             type_id: discriminator_type,
             span: self.lowerer.hir_span(pattern_id),
             value: mir.int_const_kind(mir.MirIntConst {
-                bits: UInt64(self.variant_tag_index(variant_def)),
+                bits: UInt64(self.variant_tag_value(variant_def)),
                 signed_value: true
             })
         };
+    }
+
+    Int variant_tag_value(qid.DefId variant_def) {
+        if (self.lowerer.ctx.query.defs.get(variant_def).kind == .enum_case_def) {
+            return self.enum_case_value_or_error(variant_def);
+        }
+        return self.variant_tag_index(variant_def);
+    }
+
+    Int enum_case_value_or_error(qid.DefId case_def) {
+        if (self.lowerer.typeck.enum_case_value(case_def) is some value) {
+            return value;
+        }
+        self.lowerer.output.mark_error();
+        return 0;
     }
 
     Int variant_tag_index(qid.DefId variant_def) {
@@ -3244,7 +3259,7 @@ struct BodyLowerer: Movable {
                 type_id: self.type_for_node(node_id),
                 span: self.lowerer.hir_span(node_id),
                 value: mir.int_const_kind(mir.MirIntConst {
-                    bits: UInt64(self.variant_tag_index(def_id)),
+                    bits: UInt64(self.enum_case_value_or_error(def_id)),
                     signed_value: true
                 })
             });
@@ -3543,6 +3558,10 @@ struct BodyLowerer: Movable {
     }
 
     () lower_call(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        if (self.is_enum_init_call(node_id, call)) {
+            self.lower_enum_init_call(node_id, call, destination);
+            return;
+        }
         if (self.lowerer.typeck.expr_lowering(node_id) is some lowering_kind) {
             self.lower_special_call(node_id, call, lowering_kind, destination);
             return;
@@ -3589,6 +3608,134 @@ struct BodyLowerer: Movable {
             cleanup: null
         }), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    Bool is_enum_init_call(hir.HirId node_id, hir.HirCall call) {
+        hir.HirNode callee = self.lowerer.hirs.node(call.callee);
+        guard callee.data is .member_access(member_access) else { return false; }
+        if (!self.symbol_text_equal(member_access.member_symbol, "init?")) { return false; }
+        qid.TypeId enum_type = self.optional_payload_type(self.type_for_node(node_id));
+        guard self.nominal_def_kind(enum_type) is some kind else { return false; }
+        return kind == .enum_def;
+    }
+
+    () lower_enum_init_call(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId enum_type = self.optional_payload_type(self.type_for_node(node_id));
+        qid.TypeId value_type = self.type_for_node(call.args[0].value);
+        mir.MirLocalId value_local = self.add_temp(value_type, span);
+        mir.MirPlace value_place = self.place_for_local(value_local);
+        self.lower_into_place(call.args[0].value, value_place);
+
+        mir.MirBlockId default_block = self.reserve_block(span);
+        mir.MirBlockId join_block = self.reserve_block(span);
+        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>();
+        self.add_enum_init_cases(enum_type, value_type, span, cases$.ref());
+        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator {
+            discriminator: mir.copy_operand_value(mir.MirCopyOperand {place: value_place}),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: default_block
+        }), span);
+
+        self.lower_enum_init_case_blocks(enum_type, destination, join_block, cases$.ref(), span);
+        self.start_block(default_block);
+        self.push_assign(destination, self.optional_none_rvalue(span), span);
+        self.finish_block(mir.goto_terminator_kind(mir.MirGotoTerminator {target: join_block}), span);
+        self.start_block(join_block);
+    }
+
+    () add_enum_init_cases(
+        qid.TypeId enum_type,
+        qid.TypeId value_type,
+        token.Span span,
+        list.ArrayList<mir.MirSwitchCase>& cases
+    ) {
+        guard self.nominal_type_data(enum_type) is some named else { return; }
+        guard self.lowerer.hirs.def(named.def_id) is some enum_hir else { return; }
+        Int! index = 0;
+        while (index < enum_hir.members.len()) {
+            qid.DefId case_def = enum_hir.members.get(index);
+            index = index + 1;
+            if (self.lowerer.ctx.query.defs.get(case_def).kind != .enum_case_def) { continue; }
+            cases.add(mir.MirSwitchCase {
+                value: self.enum_case_int_const(case_def, value_type, span),
+                target: self.reserve_block(span)
+            });
+        }
+    }
+
+    () lower_enum_init_case_blocks(
+        qid.TypeId enum_type,
+        mir.MirPlace destination,
+        mir.MirBlockId join_block,
+        list.ArrayList<mir.MirSwitchCase>& cases,
+        token.Span span
+    ) {
+        Int! index = 0;
+        while (index < cases.len()) {
+            mir.MirSwitchCase switch_case = cases.get(index);
+            self.start_block(switch_case.target);
+            self.push_assign(
+                destination,
+                self.optional_some_enum_rvalue(enum_type, switch_case.value, span),
+                span
+            );
+            self.finish_block(mir.goto_terminator_kind(mir.MirGotoTerminator {target: join_block}), span);
+            index = index + 1;
+        }
+    }
+
+    mir.MirRvalue optional_some_enum_rvalue(
+        qid.TypeId enum_type,
+        mir.MirConst switch_value,
+        token.Span span
+    ) {
+        return mir.optional_rvalue(mir.MirOptionalRvalue {
+            op: mir.MirOptionalOp.make_some,
+            value: mir.const_operand_value(mir.MirConst {
+                type_id: enum_type,
+                span: span,
+                value: switch_value.value
+            })
+        });
+    }
+
+    mir.MirRvalue optional_none_rvalue(token.Span span) {
+        return mir.optional_rvalue(mir.MirOptionalRvalue {
+            op: mir.MirOptionalOp.make_none,
+            value: self.unit_operand(span)
+        });
+    }
+
+    mir.MirOperand unit_operand(token.Span span) {
+        return mir.const_operand_value(mir.MirConst {
+            type_id: self.lowerer.ctx.query.types.unit_type(),
+            span: span,
+            value: mir.unit_const_kind(mir.MirUnitConst {unit_value: true})
+        });
+    }
+
+    mir.MirConst enum_case_int_const(qid.DefId case_def, qid.TypeId value_type, token.Span span) {
+        return mir.MirConst {
+            type_id: value_type,
+            span: span,
+            value: mir.int_const_kind(mir.MirIntConst {
+                bits: UInt64(self.enum_case_value_or_error(case_def)),
+                signed_value: true
+            })
+        };
+    }
+
+    qid.TypeId optional_payload_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        if (info.data is .optional(optional)) {
+            return optional.element;
+        }
+        return self.lowerer.ctx.query.types.invalid_type();
     }
 
     () lower_special_call(
@@ -3683,7 +3830,8 @@ struct BodyLowerer: Movable {
         qid.DefId function_def,
         mir.MirPlace destination
     ) {
-        qid.DefId target_def = self.direct_call_target(node_id, function_def);
+        qid.DefId! target_def = self.direct_call_target(node_id, function_def);
+        target_def = self.static_dispatch_target_for_call(call, target_def);
         list.ArrayList<mir.MirOperand>! args = self.lower_call_operands(node_id, call, target_def);
         qid.TypeId! function_type = self.lowerer.ctx.query.types.invalid_type();
         if (self.lowerer.typeck.def_type(target_def) is some type_id) {
@@ -3718,6 +3866,36 @@ struct BodyLowerer: Movable {
             return target_def;
         }
         return resolved_def;
+    }
+
+    qid.DefId static_dispatch_target_for_call(hir.HirCall call, qid.DefId target_def) {
+        if (!self.lowerer.def_is_trait_member(target_def)) {
+            return target_def;
+        }
+        hir.HirNode callee = self.lowerer.hirs.node(call.callee);
+        guard callee.data is .member_access(member_access) else {
+            return target_def;
+        }
+        if (self.concrete_member_for_trait_member(target_def, member_access.base) is some concrete_def) {
+            return concrete_def;
+        }
+        return target_def;
+    }
+
+    qid.DefId? concrete_member_for_trait_member(qid.DefId trait_member_def, hir.HirId receiver_id) {
+        qid.SymbolId member_symbol = self.lowerer.ctx.query.defs.get(trait_member_def).name.symbol;
+        qid.TypeId receiver_type = self.type_for_node(receiver_id);
+        guard self.nominal_type_data(receiver_type) is some named else {
+            return null;
+        }
+        qid.DefId? member_def = self.member_def_by_symbol(named.def_id, member_symbol);
+        guard member_def is some concrete_def else {
+            return null;
+        }
+        if (self.lowerer.def_is_trait_member(concrete_def)) {
+            return null;
+        }
+        return concrete_def;
     }
 
     Bool lower_subscript_get(hir.HirId node_id, hir.HirIndexAccess index_access, mir.MirPlace destination) {
