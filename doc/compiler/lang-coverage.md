@@ -14,8 +14,9 @@
 
 | Grammar area | Feature dir | Status | Missing cases |
 | --- | --- | --- | --- |
-| literal tokens | `literal` | partial | float 边界、char escape、string escape、非法数字分隔符 |
+| literal tokens | `literal` | partial | float 边界、escape 解码语义、非法数字分隔符 |
 | identifier tokens | `import` | covered | 普通 escaped identifier deferred；0.2 只允许 extern symbol name |
+| trivia / recovery tokens | `token` | covered | block comment deferred |
 | import / alias | `import`, `package` | covered | package registry/lockfile deferred |
 | top-level global | `import`, `runtime` | partial | global destructure 正反例 |
 | function declaration | `function` | covered | 更多 overload + named/default 参数交互 |
@@ -24,7 +25,7 @@
 | where constraints | `generic` | partial | projected equality 多关联类型链、负 trait bound 组合 |
 | lifetime annotation | `lifetime` | partial | return/self 组合、非法 ordering |
 | type postfix | `type` | covered | pointer-to-pointer ABI 场景已有基础覆盖 |
-| tuple / unit type | `type`, `aggregate` | partial | 单元素 tuple 反例、嵌套 tuple type |
+| tuple / unit type | `type`, `aggregate` | partial | 嵌套 tuple type |
 | struct / record | `nominal`, `aggregate` | covered | record 专属语义后续补充 |
 | enum | `nominal`, `control_flow` | covered | underlying int 类型的更多边界值 |
 | union | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
