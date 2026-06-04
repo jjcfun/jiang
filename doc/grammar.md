@@ -19,6 +19,8 @@
 
 ```peg
 ident       <- /* ASCII [_A-Za-z][_A-Za-z0-9]*，或包含 UTF-8 非 ASCII 字节的标识符 */
+escaped_ident
+            <- "`" /* 任意非反引号字节序列 */ "`"
 int_lit     <- decimal_int / binary_int / octal_int / hex_int
 decimal_int <- digit ("_"? digit)*
 binary_int  <- ("0b" / "0B") binary_digit ("_"? binary_digit)*
@@ -52,7 +54,7 @@ top_level_item
 extern_block
             <- "extern" "{" extern_item* "}"
 
-extern_item <- "public"? "static"? (function_decl / global_decl)
+extern_item <- "public"? "static"? (extern_function_decl / extern_global_decl)
 
 global_destructure
             <- "(" destructure_binding ("," destructure_binding)* ")"
@@ -113,13 +115,24 @@ import_path <- string_lit / ident
 alias_decl  <- "alias" name "=" alias_target ";"
 
 alias_target
-            <- path
+            <- escaped_ident
+             / path
              / type
 
 function_decl
             <- result_type name function_tail
 
 global_decl <- type name global_tail
+
+extern_function_decl
+            <- result_type extern_symbol_name function_tail
+
+extern_global_decl
+            <- type extern_symbol_name global_tail
+
+extern_symbol_name
+            <- name
+             / escaped_ident
 
 global_tail <- ("=" expr)? ";"
 

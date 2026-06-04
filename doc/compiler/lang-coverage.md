@@ -15,8 +15,9 @@
 | Grammar area | Feature dir | Status | Missing cases |
 | --- | --- | --- | --- |
 | literal tokens | `literal` | partial | float 边界、char escape、string escape、非法数字分隔符 |
+| identifier tokens | `import` | covered | 普通 escaped identifier deferred；0.2 只允许 extern symbol name |
 | import / alias | `import`, `package` | covered | package registry/lockfile deferred |
-| top-level global | `import`, `runtime` | partial | global destructure 正反例、extern global 可见性 |
+| top-level global | `import`, `runtime` | partial | global destructure 正反例 |
 | function declaration | `function` | covered | 更多 overload + named/default 参数交互 |
 | parameter list | `function` | covered | 默认参数表达式覆盖更多 literal/constructor 场景 |
 | generic params | `generic` | partial | nested generic decl、尾逗号、空参数列表反例 |
@@ -32,6 +33,7 @@
 | var / destructure stmt | `function`, `aggregate` | partial | local/global destructure 尚未接入 HIR/type check/MIR |
 | assignment stmt | `control_flow`, `type` | covered | compound assignment 与 overload deferred |
 | call stmt | `function` | covered | implicit call statement 的更多反例 |
+| extern declaration | `import` | covered | `@link_name` 不支持；ABI 非普通名字通过 extern escaped identifier |
 | if / switch | `control_flow` | covered | switch exhaustiveness deferred |
 | guard | `control_flow` | covered | guard pattern deferred |
 | while / for | `control_flow` | partial | nested break/continue cleanup run 用例 |
