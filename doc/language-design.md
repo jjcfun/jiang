@@ -429,7 +429,10 @@ struct Slice {
 }
 ```
 
-返回引用或返回含引用字段的值时，需要表达返回值不超过来源：
+直接返回某个参数引用时，参数目标 lifetime 默认覆盖当前函数返回值，不需要额外写
+`@life(param > return)`。如果函数显式写了 return lifetime 约束，则按显式约束收窄允许来源。
+
+跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，需要表达返回值不超过来源：
 
 ```jiang
 @life(input > return)

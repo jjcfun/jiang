@@ -40,4 +40,5 @@ HIR 是 resolve 之后的高级语义树。它已经完成名字解析，但仍�
 - resolve 完成后才能生成 HIR。
 - type check 不回读 AST，只消费 HIR。
 - MIR lowering 不重新 resolve，也不重新 type check。
-- 后续增量应围绕 `DefId` owner 粒度替换 HIR body，而不是按 source file 保存 `HirFile`。
+- HIR 是 session-local 语义表；每轮 `CompilerContext.begin_compilation` 都会重建 `HirStore`。
+- 长期增量只保存稳定 fingerprint 和 public generic HIR template，不保存当前轮的 `HirId` / `HirDef`。

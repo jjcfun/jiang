@@ -1,8 +1,11 @@
 // 从当前 session 的 Def/HIR facts 构造可落盘 ModuleInterface。
 //
-// Interface 只描述依赖方需要的公开语义表面：public declaration、public import /
-// alias 和可稳定表达的函数签名。复杂 type ref 如果暂时不能稳定编码，宁可写成
-// invalid_type，也不能把 session-local TypeId/HirId 写入 artifact。
+// Interface 保存 public 语义事实和 private 声明壳。
+//
+// public declaration 需要完整签名，供依赖方继续 type check；private 声明只保存
+// name/kind/owner/visibility，让跨模块访问能稳定报 private_access，而不是退化成
+// unresolved。复杂 type ref 如果暂时不能稳定编码，宁可写成 invalid_type，也不能把
+// session-local TypeId/HirId 写入 artifact。
 
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
@@ -113,9 +116,6 @@ public source_artifact.ModuleInterface? build_module_interface(
     qid.DefId member_def
 ) {
     def.DefRecord def_record = ctx.query.defs.get(member_def);
-    if (def_record.visibility != .public_visibility) {
-        return;
-    }
     guard ctx.query.hirs.def(member_def) is some hir_def else { return; }
     guard ctx.query.incremental.stable_id_for_def(member_def) is some stable_id else { return; }
     source_artifact.InterfaceDeclSummary! summary = source_artifact.InterfaceDeclSummary(
@@ -129,13 +129,33 @@ public source_artifact.ModuleInterface? build_module_interface(
     summary.signature_fingerprint = ctx.query.incremental.signature_fingerprint(stable_id);
     summary.body_fingerprint = ctx.query.incremental.body_fingerprint(stable_id);
     module_interface.add_declaration(summary);
+    // private 声明不会成为 public API，但依赖方仍需要它们的类型事实来完成
+    // public nominal 的成员检查和 public generic template 的按需 type check。
     add_decl_type_ref(ctx, module_interface, stable_id, hir_def);
     add_trait_refs(ctx, module_interface, stable_id, hir_def);
     add_where_predicates(ctx, module_interface, stable_id, hir_def);
     add_lifetime_constraints(module_interface, stable_id, hir_def);
     add_function_signature(ctx, module_interface, stable_id, hir_def);
+    if (def_record.visibility != .public_visibility) {
+        return;
+    }
     add_generic_template(ctx, module_interface, stable_id, hir_def);
+    add_symbol_alias(ctx, module_interface, def_record, hir_def);
     add_public_members(ctx, module_interface, member_def);
+}
+
+() add_symbol_alias(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface,
+    def.DefRecord def_record,
+    hir.HirDef& hir_def
+) {
+    guard hir_def.decl.alias_target is some target_def else { return; }
+    guard ctx.query.incremental.stable_id_for_def(target_def) is some target_stable_id else { return; }
+    module_interface.add_public_alias(source_artifact.AliasExportSummary(
+        def_record.name.symbol,
+        target_stable_id
+    ));
 }
 
 qkey.StableSymbolId? stable_owner(context.CompilerContext& ctx, qid.DefId? owner_def) {
@@ -271,10 +291,10 @@ source_artifact.InterfaceLifetimeName interface_lifetime_name(hir.HirLifetimeNam
 ) {
     guard hir_def.decl.function_signature is some signature else { return; }
     source_artifact.InterfaceFunctionSignature! iface_signature =
-        source_artifact.InterfaceFunctionSignature(
-            signature.has_receiver,
-            interface_type_ref(ctx, signature.result)
-        );
+        source_artifact.InterfaceFunctionSignature.empty(signature.has_receiver);
+    source_artifact.InterfaceTypeRef! result_ref = source_artifact.InterfaceTypeRef.invalid_type();
+    fill_interface_type_ref(ctx, result_ref$.ref(), signature.result);
+    iface_signature.set_result_ref(result_ref$.ref());
     Int! index = 0;
     while (index < signature.params.length) {
         iface_signature.add_param(source_artifact.InterfaceParamSummary(
@@ -285,6 +305,107 @@ source_artifact.InterfaceLifetimeName interface_lifetime_name(hir.HirLifetimeNam
     }
     add_param_defaults(ctx, iface_signature$.ref(), signature);
     module_interface.set_function_signature(stable_id, iface_signature$.move());
+}
+
+() fill_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef& result,
+    hir.HirId type_ref
+) {
+    hir.HirNode node = ctx.query.hirs.node(type_ref);
+    if (node.data is .unit_type_ref) {
+        reset_interface_type_ref(result, 1);
+        return;
+    }
+    if (node.data is .named_type_ref(named)) {
+        fill_named_interface_type_ref(ctx, result, named);
+        return;
+    }
+    if (node.data is .layered_type_ref(layered)) {
+        reset_interface_type_ref(result, 3);
+        result.count_kind = layered.kind.value;
+        add_interface_type_ref_arg(ctx, result, layered.element);
+        return;
+    }
+    if (node.data is .array_type_ref(array)) {
+        reset_interface_type_ref(result, 4);
+        result.count_kind = array.count_kind.value;
+        result.count_value = array.count_value;
+        add_interface_type_ref_arg(ctx, result, array.element);
+        return;
+    }
+    if (node.data is .errorable_type_ref(errorable)) {
+        reset_interface_type_ref(result, 5);
+        add_interface_type_ref_arg(ctx, result, errorable.value_type);
+        if (errorable.error_type is some error_ref) {
+            add_interface_type_ref_arg(ctx, result, error_ref);
+        }
+        return;
+    }
+    if (node.data is .function_type_ref(function_type)) {
+        reset_interface_type_ref(result, 6);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            add_interface_type_ref_arg(ctx, result, function_type.params[index]);
+            index = index + 1;
+        }
+        add_interface_type_ref_arg(ctx, result, function_type.result);
+        return;
+    }
+    if (node.data is .tuple_type_ref(tuple)) {
+        reset_interface_type_ref(result, 7);
+        Int! index = 0;
+        while (index < tuple.items.length) {
+            add_interface_type_ref_arg(ctx, result, tuple.items[index]);
+            index = index + 1;
+        }
+        return;
+    }
+    if (node.data is .infer_type_ref) {
+        reset_interface_type_ref(result, 8);
+        return;
+    }
+    reset_interface_type_ref(result, 0);
+}
+
+() reset_interface_type_ref(source_artifact.InterfaceTypeRef& result, Int kind_tag) {
+    result.kind_tag = kind_tag;
+    result.has_stable_def = false;
+    result.stable_def_low = 0;
+    result.stable_def_high = 0;
+    result.count_kind = 0;
+    result.count_value = 0;
+    result.args.clear();
+}
+
+() fill_named_interface_type_ref(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef& result,
+    hir.HirNamedTypeRef named
+) {
+    guard ctx.query.incremental.stable_id_for_def(named.def_id) is some stable_id else {
+        reset_interface_type_ref(result, 0);
+        return;
+    }
+    reset_interface_type_ref(result, 2);
+    result.has_stable_def = true;
+    result.stable_def_low = stable_id.low;
+    result.stable_def_high = stable_id.high;
+    Int! index = 0;
+    while (index < named.args.length) {
+        add_interface_type_ref_arg(ctx, result, named.args[index]);
+        index = index + 1;
+    }
+}
+
+() add_interface_type_ref_arg(
+    context.CompilerContext& ctx,
+    source_artifact.InterfaceTypeRef& result,
+    hir.HirId arg
+) {
+    source_artifact.InterfaceTypeRef! arg_ref = source_artifact.InterfaceTypeRef.invalid_type();
+    fill_interface_type_ref(ctx, arg_ref$.ref(), arg);
+    result.add_arg(arg_ref$.move());
 }
 
 () add_generic_template(
@@ -389,13 +510,17 @@ source_artifact.InterfaceTypeRef interface_type_ref(
         return named_interface_type_ref(ctx, named);
     }
     if (node.data is .layered_type_ref(layered)) {
-        source_artifact.InterfaceTypeRef! result = source_artifact.InterfaceTypeRef(.layered_type);
+        source_artifact.InterfaceTypeRef! result =
+            source_artifact.InterfaceTypeRef(source_artifact.InterfaceTypeRefKind.layered_type);
+        result.kind_tag = 3;
         result.count_kind = layered.kind.value;
         result.add_arg(interface_type_ref(ctx, layered.element));
         return result$.move();
     }
     if (node.data is .array_type_ref(array)) {
-        source_artifact.InterfaceTypeRef! result = source_artifact.InterfaceTypeRef(.array_type);
+        source_artifact.InterfaceTypeRef! result =
+            source_artifact.InterfaceTypeRef(source_artifact.InterfaceTypeRefKind.array_type);
+        result.kind_tag = 4;
         result.count_kind = array.count_kind.value;
         result.count_value = array.count_value;
         result.add_arg(interface_type_ref(ctx, array.element));
@@ -421,7 +546,8 @@ source_artifact.InterfaceTypeRef errorable_interface_type_ref(
     hir.HirErrorableTypeRef errorable
 ) {
     source_artifact.InterfaceTypeRef! type_ref =
-        source_artifact.InterfaceTypeRef(.errorable_type);
+        source_artifact.InterfaceTypeRef(source_artifact.InterfaceTypeRefKind.errorable_type);
+    type_ref.kind_tag = 5;
     type_ref.add_arg(interface_type_ref(ctx, errorable.value_type));
     if (errorable.error_type is some error_ref) {
         type_ref.add_arg(interface_type_ref(ctx, error_ref));

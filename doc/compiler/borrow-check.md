@@ -25,6 +25,10 @@ unsafe/capability gate；borrow check 只在这些操作影响 owner/lifetime/dr
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
 - 为 drop 插入和后续 backend 提供约束结果。
 
+直接返回参数引用时，参数目标 lifetime 默认覆盖当前函数返回值。如果函数显式声明了
+`@life(... > return)`，borrow check 按显式约束收窄允许来源。跨函数调用返回引用、返回含
+引用字段的聚合值、或 public API 需要表达返回来源时，仍应使用 `@life(source > return)`。
+
 mutability 的基本 assignment 检查已经在 type check 阶段完成；borrow check 只处理需要 CFG
 和 lifetime 信息的约束。字段、tuple 元素、union payload、数组元素能否写入，只由对应成员
 类型自己的 `!` 可变性决定；不由 owner/local/reference slot 的可变性决定。

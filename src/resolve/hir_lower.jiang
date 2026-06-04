@@ -21,13 +21,16 @@
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
 import qid = "../query/id.jiang";
+import qkey = "../query/key.jiang";
 import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import ast = "../syntax/ast.jiang";
 import token = "../syntax/token.jiang";
 import def = "./def.jiang";
+import namespace = "./namespace.jiang";
 import resolve_state = "./state.jiang";
 import scope = "./scope.jiang";
+import store = "./store.jiang";
 
 public Bool lower_file(resolve_state.FileResolveState& state) {
     HirLower! lower = HirLower(state);
@@ -1278,6 +1281,18 @@ struct HirLower: Movable {
     }
 
     hir.HirId lower_member_path_base(ast.AstId first_segment) {
+        // `value.member` 和 `module.member` 都会先进入 path/member lowering。
+        // 如果第一段在当前 lexical scope 里是 value binding，必须先按 value
+        // 处理，避免同名 import alias 抢走局部变量的 member access。
+        if (self.resolved_name_def(first_segment, .value_name) is some _) {
+            return self.lower_name_ref(first_segment);
+        }
+        if (self.resolved_namespace_def_for_expr(first_segment) is some namespace_def) {
+            return self.add_node(
+                .name_ref(.def_ref(namespace_def)),
+                self.state.file.get(first_segment).span
+            );
+        }
         if (self.resolved_type_def_for_expr(first_segment) is some _) {
             return self.lower_type_ref(first_segment);
         }
@@ -1710,6 +1725,11 @@ struct HirLower: Movable {
         return self.resolve_alias_target(def_id);
     }
 
+    qid.DefId? resolved_namespace_def_for_expr(ast.AstId expr_id) {
+        guard self.resolved_path_def(expr_id, .namespace_name) is some def_id else { return null; }
+        return self.resolve_alias_target(def_id);
+    }
+
     qid.DefId? resolved_type_def_for_type_ref(ast.AstId type_id) {
         ast.AstNode node = self.state.file.get(type_id);
         if (node.data is .type_ref(type_ref)) {
@@ -1783,6 +1803,9 @@ struct HirLower: Movable {
             self.state.query.resolve.lookup_visible_name(self.state.namespace_id, symbol, .namespace_name, true)
             is some namespace_binding
         ) {
+            if (self.import_alias_target_namespace(namespace_binding.def_id) is some target_namespace) {
+                return target_namespace;
+            }
             return self.state.query.defs.get(namespace_binding.def_id).owned_namespace_id;
         }
         if (
@@ -1790,6 +1813,22 @@ struct HirLower: Movable {
             is some type_binding
         ) {
             return self.state.query.defs.get(type_binding.def_id).owned_namespace_id;
+        }
+        return null;
+    }
+
+    qid.NamespaceId? import_alias_target_namespace(qid.DefId alias_def) {
+        store.ModuleRecord module = self.state.query.resolve.modules.get(self.state.module_id);
+        Int! index = 0;
+        while (index < module.imports.len()) {
+            store.ImportRecord import_record = module.imports.get(index);
+            if (import_record.alias_def is some import_alias_def) {
+                if (import_alias_def == alias_def) {
+                    guard import_record.target_module is some target_module else { return null; }
+                    return self.state.query.resolve.modules.get(target_module).namespace_id;
+                }
+            }
+            index = index + 1;
         }
         return null;
     }
@@ -1847,6 +1886,9 @@ struct HirLower: Movable {
         ) {
             return binding.def_id;
         }
+        if (self.stable_def_in_namespace(namespace_id, symbol, domain) is some def_id) {
+            return def_id;
+        }
         if (domain == .value_name) {
             if (
                 self.state.query.resolve.lookup_namespace(namespace_id, symbol, .member_name, false)
@@ -1854,8 +1896,93 @@ struct HirLower: Movable {
             ) {
                 return member_binding.def_id;
             }
+            if (self.stable_def_in_namespace(namespace_id, symbol, .member_name) is some member_def) {
+                return member_def;
+            }
         }
         return null;
+    }
+
+    qid.DefId? stable_def_in_namespace(
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain
+    ) {
+        guard self.stable_owner_for_namespace(namespace_id) is some owner else { return null; }
+        if (self.current_def_for_stable_member(owner, symbol, domain) is some def_id) {
+            return def_id;
+        }
+        namespace.NamespaceRecord namespace_record = self.state.query.resolve.namespaces.get(namespace_id);
+        guard namespace_record.module_id is some module_id else { return null; }
+        if (!self.stable_symbol_domain_supported(domain)) { return null; }
+        store.ModuleRecord module = self.state.query.resolve.modules.get(module_id);
+        store.PackageRecord package_record = self.state.query.resolve.packages.get(module.package_id);
+        qkey.StableSymbolKey key = qkey.StableSymbolKey {
+            kind: self.stable_symbol_kind_for_domain(domain),
+            package_name: package_record.name,
+            module_path: module.path_symbol,
+            owner: owner,
+            name: symbol,
+            domain: domain
+        };
+        qkey.StableSymbolId stable_id = qkey.stable_symbol_id_for_key(self.state.query.symbols$.ref(), key);
+        return self.state.query.incremental.current_def_for_stable(stable_id);
+    }
+
+    qid.DefId? current_def_for_stable_member(
+        qkey.StableSymbolId owner,
+        qid.SymbolId symbol,
+        def.NameDomain domain
+    ) {
+        if (domain == .member_name) {
+            if (self.current_def_for_stable_kind(owner, symbol, .field_symbol, domain) is some def_id) {
+                return def_id;
+            }
+            if (self.current_def_for_stable_kind(owner, symbol, .function_symbol, domain) is some def_id) {
+                return def_id;
+            }
+            if (self.current_def_for_stable_kind(owner, symbol, .enum_case_symbol, domain) is some def_id) {
+                return def_id;
+            }
+            return self.current_def_for_stable_kind(owner, symbol, .union_variant_symbol, domain);
+        }
+        if (!self.stable_symbol_domain_supported(domain)) { return null; }
+        return self.current_def_for_stable_kind(
+            owner,
+            symbol,
+            self.stable_symbol_kind_for_domain(domain),
+            domain
+        );
+    }
+
+    qid.DefId? current_def_for_stable_kind(
+        qkey.StableSymbolId owner,
+        qid.SymbolId symbol,
+        qkey.StableSymbolKind kind,
+        def.NameDomain domain
+    ) {
+        return self.state.query.incremental.current_def_for_owner_name(owner, symbol, kind, domain);
+    }
+
+    qkey.StableSymbolId? stable_owner_for_namespace(qid.NamespaceId namespace_id) {
+        namespace.NamespaceRecord namespace_record = self.state.query.resolve.namespaces.get(namespace_id);
+        if (namespace_record.owner_def is some owner_def) {
+            return self.state.query.incremental.stable_id_for_def(owner_def);
+        }
+        guard namespace_record.module_id is some module_id else { return null; }
+        store.ModuleRecord module = self.state.query.resolve.modules.get(module_id);
+        return self.state.query.incremental.stable_id_for_def(module.def_id);
+    }
+
+    Bool stable_symbol_domain_supported(def.NameDomain domain) {
+        if (domain == .label_name) { return false; }
+        return domain != .member_name;
+    }
+
+    qkey.StableSymbolKind stable_symbol_kind_for_domain(def.NameDomain domain) {
+        if (domain == .type_name) { return .type_symbol; }
+        if (domain == .namespace_name) { return .module_symbol; }
+        return .function_symbol;
     }
 
     qid.DefId? decl_def_for_name(ast.AstId name_id, def.NameDomain domain) {

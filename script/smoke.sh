@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STAGE1_BIN="${STAGE1_BIN:-$HOME/.jiang/stage1/bin/jiangc}"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
+JIANGC="${JIANGC:-$BUILD_DIR/jiangc}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
 
@@ -29,7 +29,7 @@ for source in test/smoke/*.jiang; do
   output="$SMOKE_BUILD_DIR/$name"
 
   printf '\n== %s ==\n' "$source"
-  if "$STAGE1_BIN" --check "$source"; then
+  if "$JIANGC" --check "$source"; then
     echo "OK"
   else
     code=$?

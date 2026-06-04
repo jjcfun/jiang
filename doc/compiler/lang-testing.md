@@ -33,7 +33,7 @@ test/lang/<feature>/
 
 ## 当前功能矩阵
 
-0.2 需要优先覆盖这些 feature：
+详细覆盖状态见 `doc/compiler/lang-coverage.md`。0.2 需要优先覆盖这些 feature：
 
 - `literal`：integer/float/char/string/bool/null，expected type 转换，CString NUL 语义。
 - `type`：type suffix 顺序、handle 限制、raw pointer/many pointer/slice/array、errorable。

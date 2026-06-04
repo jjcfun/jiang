@@ -5,7 +5,6 @@
 // declaration，也不做 reference resolve / HIR lowering。
 
 import context = "../context.jiang";
-import diagnostic = "../diagnostic/diagnostic.jiang";
 import artifact = "../artifact/source.jiang";
 import artifact_path = "../artifact/path.jiang";
 import source_ji = "../artifact/source_ji.jiang";
@@ -47,6 +46,7 @@ public struct ModuleGraphBuilder {
     table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs;
     UInt8[] artifact_cache_dir;
     UInt64 compiler_version_hash;
+    Bool! use_source_artifacts;
     import_path_resolver.ImportPathResolver import_paths;
 
     @life(ctx > self, asts > self, module_states > self, declaration_defs > self)
@@ -62,7 +62,27 @@ public struct ModuleGraphBuilder {
         self.module_states = module_states;
         self.declaration_defs = declaration_defs;
         self.artifact_cache_dir = "build/cache";
-        self.compiler_version_hash = source.content_hash("jiang-dev");
+        self.compiler_version_hash = source_ji.artifact_version_hash("jiang-dev");
+        self.use_source_artifacts = true;
+        self.import_paths = import_path_resolver.ImportPathResolver(self.query);
+    }
+
+    @life(ctx > self, asts > self, module_states > self, declaration_defs > self)
+    public init(
+        context.CompilerContext& ctx,
+        ast_store.AstStore& asts,
+        table.HashTable<qid.ModuleId, ModuleResolvePassState>& module_states,
+        table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs,
+        UInt8[] artifact_cache_dir
+    ) {
+        self.ctx = ctx;
+        self.query = ctx.query$.ref();
+        self.asts = asts;
+        self.module_states = module_states;
+        self.declaration_defs = declaration_defs;
+        self.artifact_cache_dir = artifact_cache_dir;
+        self.compiler_version_hash = source_ji.artifact_version_hash("jiang-dev");
+        self.use_source_artifacts = true;
         self.import_paths = import_path_resolver.ImportPathResolver(self.query);
     }
 
@@ -82,6 +102,28 @@ public struct ModuleGraphBuilder {
         self.declaration_defs = declaration_defs;
         self.artifact_cache_dir = artifact_cache_dir;
         self.compiler_version_hash = compiler_version_hash;
+        self.use_source_artifacts = true;
+        self.import_paths = import_path_resolver.ImportPathResolver(self.query);
+    }
+
+    @life(ctx > self, asts > self, module_states > self, declaration_defs > self)
+    public init(
+        context.CompilerContext& ctx,
+        ast_store.AstStore& asts,
+        table.HashTable<qid.ModuleId, ModuleResolvePassState>& module_states,
+        table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>& declaration_defs,
+        UInt8[] artifact_cache_dir,
+        UInt64 compiler_version_hash,
+        Bool use_source_artifacts
+    ) {
+        self.ctx = ctx;
+        self.query = ctx.query$.ref();
+        self.asts = asts;
+        self.module_states = module_states;
+        self.declaration_defs = declaration_defs;
+        self.artifact_cache_dir = artifact_cache_dir;
+        self.compiler_version_hash = compiler_version_hash;
+        self.use_source_artifacts = use_source_artifacts;
         self.import_paths = import_path_resolver.ImportPathResolver(self.query);
     }
 
@@ -334,16 +376,36 @@ public struct ModuleGraphBuilder {
             source_id = self.load_file_import_target(module_id, import_record);
         }
         guard source_id is some target_source else { return null; }
+        if (import_record.kind == .file_import) {
+            if (!self.ensure_file_source_ast(target_source)) {
+                return null;
+            }
+            return self.ensure_module(target_source);
+        }
         if (!self.source_has_ast_or_summary(target_source)) {
             return null;
         }
         return self.ensure_module(target_source);
     }
 
+    Bool ensure_file_source_ast(source.SourceId source_id) {
+        if (self.source_has_ast(source_id)) {
+            return true;
+        }
+        source.SourceRecord source_record = self.query.sources.get(source_id);
+        if (source_record.key.kind != .file) {
+            return false;
+        }
+        return self.load_file_import(source_record.key.value, false) != null && self.source_has_ast(source_id);
+    }
+
     Bool source_has_ast_or_summary(source.SourceId source_id) {
         source.SourceRecord source_record = self.query.sources.get(source_id);
         if (self.asts.file(source_id, source_record.revision) is some file) {
             return true;
+        }
+        if (!self.use_source_artifacts) {
+            return false;
         }
         if (self.query.artifacts.load_import_summary(source_id) is some summary) {
             return summary.source_hash == source_record.content_hash;
@@ -392,7 +454,7 @@ public struct ModuleGraphBuilder {
         if (!manifest.ok) {
             return null;
         }
-        return self.load_file_import(package_manifest.root_file_path(dependency_dir, manifest$.ref()));
+        return self.load_file_import(package_manifest.root_file_path(dependency_dir, manifest$.ref()), true);
     }
 
     source.SourceId? load_file_import_target(
@@ -401,19 +463,20 @@ public struct ModuleGraphBuilder {
     ) {
         UInt8[] import_path = self.query.symbols.text(import_record.path_symbol);
         UInt8[] primary = self.import_paths.primary_file_import_path(module_id, import_path);
-        return self.load_file_import(primary);
+        return self.load_file_import(primary, false);
     }
 
-    source.SourceId? load_file_import(UInt8[] path) {
+    source.SourceId? load_file_import(UInt8[] path, Bool allow_summary) {
         UInt8[]? loaded = fs.read_all(path);
         guard loaded is some bytes else { return null; }
         UInt64 content_hash = source.content_hash(bytes);
         source.SourceId source_id = self.query.sources.intern_path(path, content_hash);
-        if (self.source_has_ast_or_summary(source_id)) {
+        if (self.source_has_ast(source_id)) {
             return source_id;
         }
+        if (allow_summary && self.source_has_ast_or_summary(source_id)) { return source_id; }
         qid.ModuleId module_id = self.ensure_module(source_id);
-        if (self.load_source_artifacts_from_file(module_id)) {
+        if (allow_summary && self.load_source_artifacts_from_file(module_id)) {
             return source_id;
         }
         syntax.SyntaxResult parsed = syntax.parse_source(self.ctx, bytes, source_id);
@@ -431,7 +494,15 @@ public struct ModuleGraphBuilder {
         return source_id;
     }
 
+    Bool source_has_ast(source.SourceId source_id) {
+        source.SourceRecord source_record = self.query.sources.get(source_id);
+        return self.asts.file(source_id, source_record.revision) != null;
+    }
+
     public Bool load_source_artifacts_from_file(qid.ModuleId module_id) {
+        if (!self.use_source_artifacts) {
+            return false;
+        }
         UInt8[] artifact_file = self.source_artifact_file(module_id);
         if (artifact_file.length == 0 || !fs.file_exists(artifact_file)) {
             return false;
@@ -446,7 +517,6 @@ public struct ModuleGraphBuilder {
         )) {
             return true;
         }
-        self.add_source_artifact_load_warning(module.source_id, artifact_file);
         return false;
     }
 
@@ -457,18 +527,6 @@ public struct ModuleGraphBuilder {
         }
         source.SourceRecord source_record = self.query.sources.get(module.source_id);
         return artifact_path.source_ji_path(self.artifact_cache_dir, stable_id, source_record.content_hash);
-    }
-
-    () add_source_artifact_load_warning(source.SourceId source_id, UInt8[] artifact_file) {
-        self.ctx.diagnostics.add(
-            diagnostic.Diagnostic(
-                .warning,
-                .incremental,
-                diagnostic.DiagnosticCode("source_artifact_load_failed"),
-                diagnostic.SourceRange(source_id, token.Span()),
-                string.append("failed to load source artifact: ", artifact_file)
-            )
-        );
     }
 
     () check_package_dependency_cycles(module_graph.ModuleGraph& graph) {
