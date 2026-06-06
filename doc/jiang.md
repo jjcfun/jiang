@@ -538,10 +538,11 @@ Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源�
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T[*]`、`T*` 是低层指针；`T[]` 是 slice reference。它们不表达语言级所有权。
-- 局部变量离开作用域时，如果变量类型有 `deinit`，编译器自动调用该 `deinit`。
-- struct 的 `T^` 字段会自动析构，无论该 struct 是否实现了自定义 `deinit`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 字段不会被编译器自动释放。
-- 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的 `T^` 字段析构。
+- 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
+- `T&`、`T&!`、`T[*]`、`T*` 字段不会被编译器自动释放。
+- `T[]` 本身不拥有整段 buffer；drop slice 变量时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
+- 经过 `T*` / `T[*]` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
+- 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - 普通 `struct`、`record`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
@@ -1306,10 +1307,10 @@ struct 还可以定义 `deinit` 函数。
 - `deinit` 不声明返回类型，语义等价于 `()`
 - `deinit` 只允许 `return;` / `return ();`
 - `deinit` 不允许 `public` / `static` 等可见性或静态修饰
-- `deinit` 由作用域退出、owning pointer 析构和 owning 字段析构触发，不作为普通方法暴露
+- `deinit` 由该 nominal 的 drop 触发，不作为普通方法暴露
 - `ptr$.free()` 是低层释放操作，不作为普通析构入口使用
-- struct 的 `T^` 字段会自动析构，无论该 struct 是否实现了自定义 `deinit`
-- 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的 `T^` 字段析构
+- 定义了 `deinit` 的 nominal type 必须声明 `Movable`
+- 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构
 
 ```c
 struct Buffer {

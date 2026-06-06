@@ -81,11 +81,12 @@ MIR basic block 是 borrow check 的 CFG 单元。每条 statement/terminator �
 layout 不决定 borrow 语义，但它会影响以下分类：
 
 - 类型是否零大小。
-- 类型是否含 owning pointer 或需要 drop。
+- 类型是否进入 `Movable` 语义，以及是否需要 runtime drop。
 - 类型是否允许 implicit copy。
 - packed/alignment 规则是否限制对字段取引用。
 
-borrow check 通过 `LayoutStore` 查询这些事实；不能从 MIR 自己推导 field offset 或 ABI layout。
+borrow check 通过 sema drop query 判断所有权/drop 语义，通过 `LayoutStore` 查询 field offset
+或 ABI layout；不能从 MIR 自己推导 ABI layout。
 
 ## Drop 插入
 
@@ -102,11 +103,13 @@ MIR lowering
 drop 一次，并且 drop 时不会使仍然活跃的 loan 悬垂。它不展开自定义 `deinit` body，
 也不生成字段析构 CFG。
 
-drop elaboration 读取 layout 的 drop category：
+drop elaboration 先读取 sema drop query。只有 `Movable` 类型会被考虑自动 drop；
+`T*` / `T[*]` 派生 place 是 raw memory，不做隐式 drop。确认需要 drop 后，再读取 layout
+的 drop category 决定具体展开方式：
 
 - `no_drop`：不插入 drop。
 - `trivial_drop` / `recursive_drop`：插入字段/owner pointer 的自动 drop 路径。
-- `custom_drop`：先调用 nominal type 的 `deinit`，再按语言规则插入自动 `T^` 字段析构。
+- `custom_drop`：先调用 nominal type 的 `deinit`，再按语言规则插入自动递归字段析构。
 
 `custom_drop` 的事实来自 HIR owner 上的 `custom_deinit_def`。resolve 只记录该 fact；
 layout 根据 fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 MIR 层展开。

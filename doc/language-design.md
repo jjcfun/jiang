@@ -336,17 +336,23 @@ move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable 
 
 自动析构规则：
 
-- 局部变量离开作用域时，如果变量类型有 `deinit`，编译器自动调用该 `deinit`。
-- `T^` 本身是内建资源类型；离开作用域时自动析构指向的 `T`，并释放其堆存储。
-- struct 的 `T^` 字段会自动析构，无论该 struct 是否实现了自定义 `deinit`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 字段不会被编译器自动释放。需要释放这些资源时，必须由类型作者在自定义 `deinit` 中显式处理。
-- 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的 `T^` 字段析构。这样自定义 `deinit` 仍然可以读取 owning 字段。
-- 自动字段析构只认 `T^`。是否级联调用非 `T^` 字段类型自己的 `deinit`，不作为默认规则；外层类型需要释放这类字段时，应在自定义 `deinit` 中显式调用。
+- 只有 `Movable` 类型会自动 drop。
+- `T^` 是内建 `Movable`，drop 时先 drop pointee，再释放其堆存储。
+- nominal、tuple、array、optional、errorable 作为值拥有自己的字段、元素或 payload；
+  如果内部类型需要 drop，外层按结构递归 drop。
+- `T&`、`T*`、`T[*]` 本身不拥有目标对象，不会因为 element type 是 `Movable`
+  就自动 drop。
+- `T[]` 本身不拥有整段 buffer，drop slice 变量时不 drop 全部元素；但 `slice[i]`
+  是一个已初始化 `T` place，覆盖该元素时按 `T` 的 drop 规则处理旧值。
+- 经过 `T*` / `T[*]` 得到的 place 是低层裸指针派生 place，写入时是 raw write，
+  不隐式 drop 旧值。
+- 如果 nominal 有自定义 `deinit`，它必须声明 `Movable`；drop 该 nominal 时先执行
+  自定义 `deinit`，再递归 drop 字段。
 
 示例：
 
 ```jiang
-struct Node {
+struct Node: Movable {
     Node^ next;      // 自动析构
     UInt8[*] bytes;  // 不自动析构
     Int length;
@@ -359,8 +365,8 @@ struct Node {
 
 析构顺序：
 
-- 同一个 struct 内，自动析构的 `T^` 字段按字段声明逆序执行。
-- 自定义 `deinit` 发生在自动 `T^` 字段析构之前。
+- 同一个 nominal 内，自动析构的字段按字段声明逆序执行。
+- 自定义 `deinit` 发生在自动递归字段析构之前。
 - 已经被显式 move 的局部变量不再参与析构。
 
 implicit copy / Movable 规则：

@@ -38,12 +38,14 @@ HIR/type facts -> initial MIR
 drop elaboration 的职责：
 
 - 根据 locals 的 live range 和 CFG exit 插入隐式 drop。
-- 对 `custom_drop` nominal type 先生成 `deinit` call，再生成自动 owning field drop。
+- 只对 sema drop query 判定为需要 runtime drop 的 `Movable` 类型生成 drop。
+- 对 `custom_drop` nominal type 先生成 `deinit` call，再生成自动递归字段 drop。
 - 对 `recursive_drop` 类型递归展开字段/owner pointer drop。
 - 保持所有插入的控制流仍然是普通 MIR basic block / terminator，不引入 backend-only 节点。
 
-borrow check 负责在 drop elaboration 前证明已有 move/drop/use 不变量。drop elaboration 按
-layout drop category 改写 CFG；backend 只消费 elaborated MIR，不再自行推导析构顺序。
+borrow check 负责在 drop elaboration 前证明已有 move/drop/use 不变量。drop elaboration 先按
+sema drop query 判断是否需要 runtime drop，再按 layout drop category 改写 CFG；backend 只消费
+elaborated MIR，不再自行推导析构顺序。
 
 ## 结构
 
