@@ -145,7 +145,7 @@ CompilerStore
 - `CompilerStore` 是业务事实集合的生命周期所有者。
 - `CompilerContext` 不直接平铺业务 store；所有业务 store 都通过 `ctx.store` 访问。
 - 阶段产物只有确实被多个后续阶段消费时才挂入 `CompilerStore`。
-- `AstStore` 是单次 compilation 的 parse cache，不作为跨阶段长期语义 store。
+- `syntax.Store` 是单次 compilation 的 parse cache，不作为跨阶段长期语义 store。
 - `ResolveStore` 保存 package、module、namespace、import/export 和 def store，是名字事实 owner。
 - `HirStore` 保存每个 `DefId` 的 HIR signature/body，是 HIR 事实 owner。
 - `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
@@ -223,7 +223,7 @@ CompilerStore
   都挂在 `CompilerStore`。
 - `MonomorphStore`、`MirStore`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
   调用中的阶段产物。
-- `AstStore` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
+- `syntax.Store` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
 - 0.3 再引入 cache-backed query dependency tracking；0.2 不保留未接入的 cache 骨架。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `store/api.jiang` 增加高阶查询入口。
 

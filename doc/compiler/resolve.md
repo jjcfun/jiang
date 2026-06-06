@@ -7,16 +7,16 @@ resolved AST lower 成 HIR，不再产生 `ResolvedFile` 这种中间文件结�
 ## 入口
 
 `resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 先创建本次 package 编译的
-临时 `AstStore`，root/import closure 的 AST 都放在这张表里。外部创建
+临时 `syntax.Store`，root/import closure 的 AST 都放在这张表里。外部创建
 `ModuleResolver(ctx, asts)`，先构建 root import closure 的 `ModuleGraph`，再把 graph
 内可达 module 直接 lower 到 HIR：
 
 ```jiang
-AstStore! asts = AstStore()
+syntax_store.Store! asts = syntax_store.Store()
 SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
-asts.set_file(root.file, source_revision)
+asts.set_unit(root.unit, source_revision)
 ModuleResolver! resolver = ModuleResolver(ctx, asts$.ref())
-ModuleGraph^ graph = resolver.build_module_graph(root_file)
+ModuleGraph^ graph = resolver.build_module_graph(root_unit)
 resolver.lower_module_graph_to_hir(graph$.ref())
 ```
 
@@ -30,11 +30,11 @@ module graph 只描述 root 可达 module 的 import closure。它不替代 name
 declaration/reference 的解析结果。
 
 ```text
-build_module_graph(root_file)
-  -> root AstFile already lives in this compile_package AstStore
-  -> ensure_module(root_file.source_id)
+build_module_graph(root_unit)
+  -> root AstUnit already lives in this compile_package syntax.Store
+  -> ensure_module(root_unit.source_id)
   -> collect root module imports
-  -> resolve import targets, parse/load target AstFile into the same AstStore when needed
+  -> resolve import targets, parse/load target AstUnit into the same syntax.Store when needed
   -> add ModuleGraph import edges
   -> recursively discover reachable module imports
   -> check package dependency cycle on cross-package edges
@@ -72,11 +72,11 @@ A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归�
 ## Name Resolver
 
 `NameResolver` 是单个 AST file/module 的 resolver。它不负责创建 module，也不负责跨文件
-加载；初始化时只拿当前 `FileResolveState`：
+加载；初始化时只拿当前 `AstResolveState`：
 
 ```text
 NameResolver {
-  FileResolveState
+  AstResolveState
   lexical env for ReferenceResolver
 }
 ```
@@ -102,7 +102,7 @@ resolved HIR。
   `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
 - 未命中 dependency 时，再按已登记 virtual/module 名称查 `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`。
-- 如果目标 source 的 `AstFile` 已经登记到本轮 `AstStore`，会递归推进目标 module pass。
+- 如果目标 source 的 `AstUnit` 已经登记到本轮 `syntax.Store`，会递归推进目标 module pass。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module
   namespace。
 - 对 string/file import，当前取字符串字面量的 symbol 文本，

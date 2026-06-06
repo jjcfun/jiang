@@ -15,9 +15,9 @@ AST 是 `syntax` 阶段的输出，只表达源码语法结构。它不进入长
 AST 使用 flat table 结构：
 
 ```text
-AstFile.nodes    -> ArrayList<AstNode>
-AstFile.children -> ArrayList<AstId>
-AstId            -> 单个 AstFile 内部的有效 node index
+AstUnit.nodes    -> ArrayList<AstNode>
+AstUnit.children -> ArrayList<AstId>
+AstId            -> 单个 AstUnit 内部的有效 node index
 ```
 
 `AstNode` 是固定大小节点，只包含 `span` 和 `AstData`。`AstData` 是 tagged union，
@@ -37,11 +37,11 @@ AstId            -> 单个 AstFile 内部的有效 node index
 
 ## Source
 
-`AstFile.source` 记录 AST 来源；它只能是普通 `SourceFileId` 或 virtual source。
+`AstUnit.source` 记录 AST 来源；它只能是普通 `SourceFileId` 或 virtual source。
 测试、宏展开、REPL 片段使用 virtual source，不引入 none 状态。
 
-当前 pipeline 会为一次 `compile_package` 创建临时 `AstStore`，保存 root/import closure
-内的 AST。`AstStore` 用完即可释放，不挂到 `CompilerStore`。
+当前 pipeline 会为一次 `compile_package` 创建临时 `syntax.Store`，保存 root/import closure
+内的 AST。`syntax.Store` 用完即可释放，不挂到 `CompilerStore`。
 
 ## 不变量
 
