@@ -20,6 +20,7 @@ import llvm_value = "./value.jiang";
 public Bool lower_terminator(
     llvm_state.LowerState& state,
     mir.MirBody body,
+    ffi.Value llvm_function,
     mir.MirTerminator terminator,
     list.ArrayList<ffi.BasicBlock>& blocks,
     list.ArrayList<ffi.Value>& local_slots
@@ -41,6 +42,9 @@ public Bool lower_terminator(
     }
     if (terminator.kind is .unreachable_term(_)) {
         return ffi.value_valid(ffi.builder_build_unreachable(state.builder));
+    }
+    if (terminator.kind is .assert_term(assert_term)) {
+        return lower_assert_terminator(state, body, llvm_function, assert_term, blocks, local_slots);
     }
     return ffi.value_valid(ffi.builder_build_unreachable(state.builder));
 }
@@ -125,8 +129,8 @@ Bool lower_call_terminator(
         add_backend_error(state, "failed to lower call arguments", "llvm_call_args_lower_failed");
         return false;
     }
-    qid.TypeId result_type = local_type(state, body, call_term.destination.local_id);
-    ffi.Type function_type = lower_call_function_type(state, body, call_term, result_type);
+    qid.TypeId result_type = call_result_type(state, body, call_term);
+    ffi.Type function_type = lower_call_function_type(state, body, call_term);
     if (!ffi.type_valid(function_type)) {
         add_backend_error(state, "failed to lower call function type", "llvm_call_type_lower_failed");
         return false;
@@ -141,6 +145,43 @@ Bool lower_call_terminator(
         return false;
     }
     return ffi.value_valid(ffi.builder_build_br(state.builder, blocks.get(call_term.target.to_index())));
+}
+
+Bool lower_assert_terminator(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    ffi.Value llvm_function,
+    mir.MirAssertTerminator assert_term,
+    list.ArrayList<ffi.BasicBlock>& blocks,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value condition = llvm_value.lower_operand(state, body, assert_term.condition, local_slots);
+    if (!ffi.value_valid(condition)) {
+        return false;
+    }
+    ffi.BasicBlock target = blocks.get(assert_term.target.to_index());
+    ffi.BasicBlock fail_block = ffi.context_append_block(state.llvm_context, llvm_function, "assert_fail");
+    if (!ffi.block_valid(fail_block)) {
+        return false;
+    }
+    if (!build_assert_branch(state, assert_term.expected, condition, target, fail_block)) {
+        return false;
+    }
+    ffi.builder_position_at_end(state.builder, fail_block);
+    return ffi.value_valid(ffi.builder_build_unreachable(state.builder));
+}
+
+Bool build_assert_branch(
+    llvm_state.LowerState& state,
+    Bool expected,
+    ffi.Value condition,
+    ffi.BasicBlock target,
+    ffi.BasicBlock fail_block
+) {
+    if (expected) {
+        return ffi.value_valid(ffi.builder_build_cond_br(state.builder, condition, target, fail_block));
+    }
+    return ffi.value_valid(ffi.builder_build_cond_br(state.builder, condition, fail_block, target));
 }
 
 ffi.Value lower_call_callee(
@@ -192,23 +233,26 @@ UInt8[] call_callee_error_message(llvm_state.LowerState& state, mir.MirCallCalle
     qid.SymbolId name = state.ctx.query.defs.get(function_value.function_def).name.symbol;
     message = string.append(message, " ");
     message = string.append(message, state.ctx.query.symbols.text(name));
-    return append_type_arg_debug(state, message, function_value.type_args);
+    return append_type_arg_message(state, message, function_value.type_args);
 }
 
-UInt8[] append_type_arg_debug(llvm_state.LowerState& state, UInt8[] message, qid.TypeId[] type_args) {
+UInt8[] append_type_arg_message(llvm_state.LowerState& state, UInt8[] message, qid.TypeId[] type_args) {
+    if (type_args.length == 0) {
+        return message;
+    }
     Int! index = 0;
     UInt8[]! result = string.append(message, " type_args=");
     while (index < type_args.length) {
         if (index > 0) {
             result = string.append(result, ",");
         }
-        result = string.append(result, type_arg_debug_text(state, type_args[index]));
+        result = string.append(result, type_arg_message_text(state, type_args[index]));
         index = index + 1;
     }
     return result;
 }
 
-UInt8[] type_arg_debug_text(llvm_state.LowerState& state, qid.TypeId type_id) {
+UInt8[] type_arg_message_text(llvm_state.LowerState& state, qid.TypeId type_id) {
     types.TypeInfo info = state.ctx.query.types.get(type_id);
     if (info.data is .named(named)) {
         qid.SymbolId symbol = state.ctx.query.defs.get(named.def_id).name.symbol;
@@ -238,12 +282,12 @@ list.ArrayList<ffi.Value> lower_call_args(
     list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(call_term.args.length);
     Int! index = 0;
     while (index < call_term.args.length) {
-        qid.TypeId arg_type = llvm_value.operand_type(state, body, call_term.args[index]);
-        if (!llvm_type.type_has_abi_value(state, arg_type)) {
+        qid.TypeId param_type = call_param_type(state, body, call_term, index);
+        if (!llvm_type.type_has_abi_value(state, param_type)) {
             index = index + 1;
             continue;
         }
-        ffi.Value arg = llvm_value.lower_operand(state, body, call_term.args[index], local_slots);
+        ffi.Value arg = lower_call_arg(state, body, call_term.args[index], param_type, local_slots);
         if (!ffi.value_valid(arg)) {
             add_call_arg_error(state, call_term.args[index]);
             return args$.move();
@@ -252,6 +296,68 @@ list.ArrayList<ffi.Value> lower_call_args(
         index = index + 1;
     }
     return args$.move();
+}
+
+ffi.Value lower_call_arg(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirOperand operand,
+    qid.TypeId param_type,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (should_pass_place_pointer(state, body, operand, param_type)) {
+        guard operand_place(operand) is some place else {
+            return llvm_value.lower_operand(state, body, operand, local_slots);
+        }
+        return llvm_place.lower_place_pointer(state, body, place, local_slots);
+    }
+    return llvm_value.lower_operand(state, body, operand, local_slots);
+}
+
+Bool should_pass_place_pointer(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirOperand operand,
+    qid.TypeId param_type
+) {
+    if (!type_is_reference(state, param_type)) {
+        return false;
+    }
+    if (type_is_reference(state, llvm_value.operand_type(state, body, operand))) {
+        return false;
+    }
+    return operand_place(operand) != null;
+}
+
+mir.MirPlace? operand_place(mir.MirOperand operand) {
+    if (operand is .copy_operand(copy_operand)) {
+        return copy_operand.place;
+    }
+    if (operand is .move_operand(move_operand)) {
+        return move_operand.place;
+    }
+    return null;
+}
+
+Bool type_is_reference(llvm_state.LowerState& state, qid.TypeId type_id) {
+    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    guard info.data is .handle_type(handle) else { return false; }
+    return handle.kind == .reference;
+}
+
+qid.TypeId call_param_type(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirCallTerminator call_term,
+    Int index
+) {
+    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
+    if (state.ctx.query.types.get(function_type_id).data is .function_type(function_info)) {
+        if (index < function_info.params.length) {
+            return function_info.params[index];
+        }
+    }
+    return llvm_value.operand_type(state, body, call_term.args[index]);
 }
 
 () add_call_arg_error(llvm_state.LowerState& state, mir.MirOperand operand) {
@@ -277,17 +383,20 @@ list.ArrayList<ffi.Value> lower_call_args(
 ffi.Type lower_call_function_type(
     llvm_state.LowerState& state,
     mir.MirBody body,
-    mir.MirCallTerminator call_term,
-    qid.TypeId result_type
+    mir.MirCallTerminator call_term
 ) {
-    ffi.Type return_type = llvm_type.lower_type(state, result_type);
+    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
+    guard state.ctx.query.types.get(function_type_id).data is .function_type(function_info) else {
+        return ffi.Type();
+    }
+    ffi.Type return_type = llvm_type.lower_type(state, function_info.result);
     if (!ffi.type_valid(return_type)) {
         return ffi.Type();
     }
-    list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(call_term.args.length);
+    list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(function_info.params.length);
     Int! index = 0;
-    while (index < call_term.args.length) {
-        qid.TypeId arg_type = llvm_value.operand_type(state, body, call_term.args[index]);
+    while (index < function_info.params.length) {
+        qid.TypeId arg_type = function_info.params[index];
         if (!llvm_type.type_has_abi_value(state, arg_type)) {
             index = index + 1;
             continue;
@@ -302,6 +411,32 @@ ffi.Type lower_call_function_type(
     return ffi.function_type(return_type, params$.ref());
 }
 
+qid.TypeId call_result_type(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirCallTerminator call_term
+) {
+    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
+    if (state.ctx.query.types.get(function_type_id).data is .function_type(function_info)) {
+        return function_info.result;
+    }
+    return local_type(state, body, call_term.destination.local_id);
+}
+
+qid.TypeId call_callee_type(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirCallCallee callee
+) {
+    if (callee is .direct_function(function_value)) {
+        return function_value.type_id;
+    }
+    if (callee is .indirect_operand(operand)) {
+        return llvm_value.operand_type(state, body, operand);
+    }
+    return state.ctx.query.types.invalid_type();
+}
+
 Int expected_call_arg_count(
     llvm_state.LowerState& state,
     mir.MirBody body,
@@ -310,8 +445,8 @@ Int expected_call_arg_count(
     Int! count = 0;
     Int! index = 0;
     while (index < call_term.args.length) {
-        qid.TypeId arg_type = llvm_value.operand_type(state, body, call_term.args[index]);
-        if (llvm_type.type_has_abi_value(state, arg_type)) {
+        qid.TypeId param_type = call_param_type(state, body, call_term, index);
+        if (llvm_type.type_has_abi_value(state, param_type)) {
             count = count + 1;
         }
         index = index + 1;

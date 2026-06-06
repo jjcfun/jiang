@@ -2,6 +2,7 @@ import context = "../context.jiang";
 import layout = "../layout/layout.jiang";
 import layout_compute = "../layout/compute.jiang";
 import list = "../support/list.jiang";
+import string = "../support/string.jiang";
 import qid = "../query/id.jiang";
 import def = "../resolve/def.jiang";
 import drop_semantics = "../sema/drop.jiang";
@@ -87,9 +88,10 @@ mir.MirFunction elaborate_function(
     }
 
     DropFlagMap flags = build_drop_flags(ctx, body);
-    Bool needs_deinit_result = body_needs_custom_drop(ctx, body);
-    mir.MirLocalId? deinit_result = deinit_result_local_id(body, flags, needs_deinit_result);
-    mir.MirLocalDecl[] locals = copy_locals_with_drop_flags(ctx, output, body.locals, flags, needs_deinit_result);
+    // cleanup 临时位既用于自定义 deinit 的 unit 结果，也用于 owner pointer 的 free statement。
+    Bool needs_cleanup_result = flags.flag_count > 0;
+    mir.MirLocalId? deinit_result = deinit_result_local_id(body, flags, needs_cleanup_result);
+    mir.MirLocalDecl[] locals = copy_locals_with_drop_flags(ctx, output, body.locals, flags, needs_cleanup_result);
     body = body_with_locals(body, locals);
 
     Int original_block_count = body.blocks.length;
@@ -167,30 +169,6 @@ DropFlagMap build_drop_flags(context.CompilerContext& ctx, mir.MirBody body) {
     return flags;
 }
 
-Bool body_needs_custom_drop(context.CompilerContext& ctx, mir.MirBody body) {
-    Int! local_index = 0;
-    while (local_index < body.locals.length) {
-        mir.MirLocalDecl local = body.locals[local_index];
-        if (drop_local_needs_deinit_result(ctx, local, body.return_local)) {
-            return true;
-        }
-        local_index = local_index + 1;
-    }
-    return false;
-}
-
-Bool drop_local_needs_deinit_result(
-    context.CompilerContext& ctx,
-    mir.MirLocalDecl local,
-    mir.MirLocalId return_local
-) {
-    if (!local_has_drop_flag(ctx, local, return_local)) {
-        return false;
-    }
-    drop_semantics.DropQuery query = drop_semantics.DropQuery(ctx);
-    return query.type_needs_deinit_result(local.type_id);
-}
-
 mir.MirLocalId? deinit_result_local_id(mir.MirBody body, DropFlagMap flags, Bool needs_deinit_result) {
     if (!needs_deinit_result) {
         return null;
@@ -202,6 +180,9 @@ Bool local_has_drop_flag(context.CompilerContext& ctx, mir.MirLocalDecl local, m
     if (local.id.to_index() == return_local.to_index()) {
         return false;
     }
+    if (local_is_init_self(ctx, local)) {
+        return false;
+    }
     if (local.kind == .compiler_temp) {
         return false;
     }
@@ -209,18 +190,28 @@ Bool local_has_drop_flag(context.CompilerContext& ctx, mir.MirLocalDecl local, m
     return query.type_needs_runtime_drop(local.type_id);
 }
 
+Bool local_is_init_self(context.CompilerContext& ctx, mir.MirLocalDecl local) {
+    guard local.def_id is some local_def else { return false; }
+    guard local.name is some symbol else { return false; }
+    if (!string.equal(ctx.query.symbols.text(symbol), "self")) {
+        return false;
+    }
+    guard ctx.query.defs.get(local_def).owner_def is some owner_def else { return false; }
+    return ctx.query.defs.get(owner_def).kind == .init_def;
+}
+
 mir.MirLocalDecl[] copy_locals_with_drop_flags(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     mir.MirLocalDecl[] locals,
     DropFlagMap flags,
-    Bool needs_deinit_result
+    Bool needs_cleanup_result
 ) {
-    Int! extra_deinit_result = 0;
-    if (needs_deinit_result) {
-        extra_deinit_result = 1;
+    Int! extra_cleanup_result = 0;
+    if (needs_cleanup_result) {
+        extra_cleanup_result = 1;
     }
-    mir.MirLocalDecl![*] copied = output.alloc_local_array(locals.length + flags.flag_count + extra_deinit_result);
+    mir.MirLocalDecl![*] copied = output.alloc_local_array(locals.length + flags.flag_count + extra_cleanup_result);
     Int! index = 0;
     while (index < locals.length) {
         copied[index] = locals[index];
@@ -235,8 +226,8 @@ mir.MirLocalDecl[] copy_locals_with_drop_flags(
         }
         local_index = local_index + 1;
     }
-    Int total = locals.length + flags.flag_count + extra_deinit_result;
-    if (needs_deinit_result) {
+    Int total = locals.length + flags.flag_count + extra_cleanup_result;
+    if (needs_cleanup_result) {
         mir.MirLocalId id = mir.MirLocalId.from_index(total - 1);
         copied[id.to_index()] = deinit_result_local(ctx, id, token.Span());
     }
@@ -445,6 +436,7 @@ mir.MirTerminator call_terminator_with_target(
             args: call_term.args,
             destination: call_term.destination,
             target: target,
+            initialized_place: call_term.initialized_place,
             cleanup: call_term.cleanup
         })
     };
@@ -832,7 +824,87 @@ DropExpansion append_drop_expansion_chain(
             blocks
         );
     }
+    if (info.data is .handle_type(handle_type)) {
+        if (handle_type.kind == .owner_pointer) {
+            return append_owner_pointer_drop_chain(
+                ctx,
+                output,
+                deinit_result,
+                source_block,
+                place,
+                handle_type.element,
+                next_target,
+                blocks
+            );
+        }
+        return DropExpansion(next_target, false);
+    }
     return append_owned_field_drop_chain(ctx, output, deinit_result, source_block, place, type_id, next_target, blocks);
+}
+
+DropExpansion append_owner_pointer_drop_chain(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirLocalId? deinit_result,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    qid.TypeId element_type,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    guard deinit_result is some cleanup_result else {
+        return DropExpansion(next_target, false);
+    }
+    mir.MirBlockId free_target = append_owner_pointer_free_block(
+        output,
+        cleanup_result,
+        source_block,
+        place,
+        next_target,
+        blocks
+    );
+    if (!type_needs_drop(ctx, element_type)) {
+        return DropExpansion(free_target, true);
+    }
+
+    mir.MirPlace pointee = deref_place(output, place);
+    mir.MirBlockId pointee_drop = append_place_drop_block(
+        ctx,
+        output,
+        deinit_result,
+        source_block,
+        pointee,
+        element_type,
+        free_target,
+        blocks
+    );
+    return DropExpansion(pointee_drop, true);
+}
+
+mir.MirBlockId append_owner_pointer_free_block(
+    mir.MirStore& output,
+    mir.MirLocalId cleanup_result,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId id = mir.MirBlockId.from_index(blocks.len());
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
+    statements.add(mir.MirStatement {
+        span: source_block.terminator.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement {
+            destination: local_place(output, cleanup_result),
+            value: mir.free_rvalue(mir.MirFreeRvalue {pointer: copy_operand_for_place(place)})
+        })
+    });
+    blocks.add(mir.MirBlock {
+        id: id,
+        span: source_block.terminator.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: goto_terminator(source_block, next_target)
+    });
+    return id;
 }
 
 DropExpansion append_optional_payload_drop_chain(
@@ -987,6 +1059,28 @@ mir.MirBlockId append_field_drop_block(
     mir.MirBlockId next_target,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
+    return append_place_drop_block(
+        ctx,
+        output,
+        deinit_result,
+        source_block,
+        field_place(output, owner_place, field, field_index),
+        field.field_type,
+        next_target,
+        blocks
+    );
+}
+
+mir.MirBlockId append_place_drop_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirLocalId? deinit_result,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    qid.TypeId type_id,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
     mir.MirBlockId id = mir.MirBlockId.from_index(blocks.len());
     blocks.add(placeholder_block(output, id, source_block, next_target));
     list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
@@ -996,8 +1090,8 @@ mir.MirBlockId append_field_drop_block(
         deinit_result,
         id,
         source_block,
-        field_place(output, owner_place, field, field_index),
-        field.field_type,
+        place,
+        type_id,
         statements$.ref(),
         next_target,
         blocks
@@ -1096,6 +1190,20 @@ mir.MirPlace field_index_place(mir.MirStore& output, mir.MirPlace owner_place, I
     };
 }
 
+mir.MirPlace deref_place(mir.MirStore& output, mir.MirPlace owner_place) {
+    list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(owner_place.projection.length + 1);
+    Int! index = 0;
+    while (index < owner_place.projection.length) {
+        projection.add(owner_place.projection[index]);
+        index = index + 1;
+    }
+    projection.add(mir.deref_projection_elem(mir.MirDerefProjection {raw_pointer: false}));
+    return mir.MirPlace {
+        local_id: owner_place.local_id,
+        projection: output.projection_array(projection$.ref())
+    };
+}
+
 mir.MirPlace local_place(mir.MirStore& output, mir.MirLocalId local_id) {
     return mir.MirPlace {
         local_id: local_id,
@@ -1137,6 +1245,7 @@ mir.MirTerminator custom_deinit_terminator(
                 projection: output.empty_projection()
             },
             target: next_target,
+            initialized_place: null,
             cleanup: null
         })
     };
@@ -1296,6 +1405,9 @@ mir.MirBlock replace_block(
     }
     if (value is .cast_value(cast_value)) {
         push_operand_move_flag_clear(ctx, output, flags, cast_value.value, span, statements);
+    }
+    if (value is .alloc_value(alloc_value)) {
+        push_operand_move_flag_clear(ctx, output, flags, alloc_value.value, span, statements);
     }
     if (value is .slice_value(slice_value)) {
         push_optional_operand_move_flag_clear(ctx, output, flags, slice_value.start, span, statements);

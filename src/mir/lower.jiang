@@ -178,7 +178,7 @@ struct MirLowerer: Movable {
         // HIR 不再直接携带 span；诊断位置后续通过 SourceMap 查询。
         token.Span span = self.def_span(hir_def.def_id);
         BodyLowerer! body_lowerer = BodyLowerer(
-            self$.ref(),
+            self,
             mir.MirBodyId.from_index(function_index),
             hir_def,
             substitutions,
@@ -368,7 +368,7 @@ struct MirLowerer: Movable {
     }
 
     qid.DefId? language_main_def() {
-        store.ModuleRecord module = self.ctx.query.resolve.modules.get(self.graph.root_module);
+        store.ModuleRecord& module = self.ctx.query.resolve.modules.ref_at(self.graph.root_module);
         return self.main_member_def(module.def_id);
     }
 
@@ -554,6 +554,7 @@ struct MirLowerer: Movable {
                     args: self.output.operand_slice(args.slice()),
                     destination: self.runtime_place(mir.MirLocalId.from_index(1)),
                     target: mir.MirBlockId.from_index(1),
+                    initialized_place: null,
                     cleanup: null
                 })
             }
@@ -625,7 +626,7 @@ struct MirLowerer: Movable {
         return self.hirs.def_ref(def_id).generic_params.len();
     }
 
-    () add_initial_locals(
+    Int add_initial_locals(
         hir.HirDef& hir_def,
         monomorph.SubstitutionMap& substitutions,
         list.ArrayList<mir.MirLocalDecl>& locals
@@ -641,25 +642,82 @@ struct MirLowerer: Movable {
             address_taken: false
         });
         guard hir_def.body is some body else {
-            return;
+            return 0;
+        }
+        Int! hir_local_offset = 0;
+        if (self.should_synthesize_receiver_local(hir_def, body$.ref())) {
+            locals.add(self.synthetic_receiver_local(hir_def, substitutions));
+            hir_local_offset = 1;
         }
         Int! index = 0;
         while (index < body.locals.len()) {
             hir.HirLocal local = body.locals.get_index(index);
-            locals.add(self.lower_local(local, substitutions, index + 1));
+            locals.add(self.lower_local(hir_def, local, substitutions, index + 1 + hir_local_offset));
             index = index + 1;
         }
+        return hir_local_offset;
+    }
+
+    Bool should_synthesize_receiver_local(hir.HirDef& hir_def, hir.HirBody& body) {
+        guard hir_def.decl.function_signature is some signature else { return false; }
+        if (!signature.has_receiver) {
+            return false;
+        }
+        if (body.locals.len() == 0) {
+            return true;
+        }
+        hir.HirLocal first = body.locals.get_index(0);
+        return !string.equal(self.ctx.query.symbols.text(first.symbol), "self");
+    }
+
+    mir.MirLocalDecl synthetic_receiver_local(
+        hir.HirDef& hir_def,
+        monomorph.SubstitutionMap& substitutions
+    ) {
+        token.Span span = self.def_span(hir_def.def_id);
+        qid.TypeId type_id = self.receiver_type(hir_def, substitutions, span);
+        return mir.MirLocalDecl {
+            id: mir.MirLocalId.from_index(1),
+            kind: mir.MirLocalKind.param,
+            type_id: type_id,
+            span: span,
+            name: self.ctx.query.symbols.intern("self"),
+            def_id: null,
+            mutable_local: false,
+            address_taken: false
+        };
+    }
+
+    qid.TypeId receiver_type(
+        hir.HirDef& hir_def,
+        monomorph.SubstitutionMap& substitutions,
+        token.Span span
+    ) {
+        if (self.typeck.def_type(hir_def.def_id) is some function_type_id) {
+            qid.TypeId substituted = self.substitute_type(function_type_id, substitutions);
+            types.TypeInfo info = self.ctx.query.types.get(substituted);
+            if (info.data is .function_type(function_type)) {
+                if (function_type.params.length > 0) {
+                    return function_type.params[0];
+                }
+            }
+        }
+        guard self.ctx.query.defs.get(hir_def.def_id).owner_def is some owner_def else {
+            return self.ctx.query.types.invalid_type();
+        }
+        return self.ctx.query.types.reference_type(self.ctx.query.types.named_type(owner_def, span), span);
     }
 
     mir.MirLocalDecl lower_local(
+        hir.HirDef& hir_def,
         hir.HirLocal local,
         monomorph.SubstitutionMap& substitutions,
         Int mir_index
     ) {
-        qid.TypeId type_id = self.type_for_local(local, substitutions);
+        qid.TypeId type_id = self.type_for_local(hir_def, local, substitutions);
         return mir.MirLocalDecl {
             id: mir.MirLocalId.from_index(mir_index),
-            kind: self.local_kind(local.kind),
+            kind: self.local_kind(hir_def, local),
             type_id: type_id,
             span: self.def_span(local.def_id),
             name: local.symbol,
@@ -669,15 +727,41 @@ struct MirLowerer: Movable {
         };
     }
 
-    qid.TypeId type_for_local(hir.HirLocal local, monomorph.SubstitutionMap& substitutions) {
+    qid.TypeId type_for_local(
+        hir.HirDef& hir_def,
+        hir.HirLocal local,
+        monomorph.SubstitutionMap& substitutions
+    ) {
+        if (self.local_is_self_receiver(hir_def, local)) {
+            return self.receiver_type(hir_def, substitutions, self.def_span(local.def_id));
+        }
         if (self.typeck.def_type(local.def_id) is some type_id) {
             return self.substitute_type(type_id, substitutions);
+        }
+        if (local.type_ref is some type_ref) {
+            if (self.typeck.node_type(type_ref) is some type_id) {
+                return self.substitute_type(type_id, substitutions);
+            }
         }
         return self.ctx.query.types.invalid_type();
     }
 
-    mir.MirLocalKind local_kind(hir.HirLocalKind kind) {
-        if (kind == .parameter) { return mir.MirLocalKind.param; }
+    Bool local_is_self_receiver(hir.HirDef& hir_def, hir.HirLocal local) {
+        guard hir_def.decl.function_signature is some signature else { return false; }
+        if (!signature.has_receiver) {
+            return false;
+        }
+        return string.equal(self.ctx.query.symbols.text(local.symbol), "self");
+    }
+
+    mir.MirLocalKind local_kind(hir.HirDef& hir_def, hir.HirLocal local) {
+        if (self.local_is_self_receiver(hir_def, local)) {
+            return mir.MirLocalKind.param;
+        }
+        if (local.kind == .parameter) { return mir.MirLocalKind.param; }
+        if (self.ctx.query.defs.get(local.def_id).kind == .parameter_def) {
+            return mir.MirLocalKind.param;
+        }
         return mir.MirLocalKind.user_local;
     }
 
@@ -730,6 +814,7 @@ struct BodyLowerer: Movable {
     list.ArrayList<lower_support.LoopTargets>! loop_targets;
     list.ArrayList<mir.MirLocalId>! active_locals;
     list.ArrayList<hir.HirId>! active_defers;
+    Int! hir_local_offset;
     mir.MirBlockId! current_block;
     Bool! terminated;
 
@@ -753,7 +838,7 @@ struct BodyLowerer: Movable {
         self.active_defers = list.ArrayList<hir.HirId>();
         self.current_block = self.reserve_block(span);
         self.terminated = false;
-        self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
+        self.hir_local_offset = self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
     }
 
     mir.MirBody lower() {
@@ -930,11 +1015,12 @@ struct BodyLowerer: Movable {
     () assign_return_value(hir.HirId value) {
         mir.MirPlace destination = self.place_for_local(self.return_local());
         if (self.return_type_is_error_union()) {
+            qid.TypeId return_type = self.locals.get(self.return_local().to_index()).type_id;
             self.push_assign(
                 destination,
                 mir.error_union_rvalue(mir.MirErrorUnionRvalue {
                     op: mir.MirErrorUnionOp.make_value,
-                    value: self.lower_to_operand(value)
+                    value: self.lower_to_operand_as_type(value, self.error_union_value_type(return_type))
                 }),
                 self.lowerer.hir_span(value)
             );
@@ -950,11 +1036,12 @@ struct BodyLowerer: Movable {
     }
 
     () lower_throw(hir.HirId node_id, hir.HirThrow throw_stmt) {
+        qid.TypeId return_type = self.locals.get(self.return_local().to_index()).type_id;
         self.push_assign(
             self.place_for_local(self.return_local()),
             mir.error_union_rvalue(mir.MirErrorUnionRvalue {
                 op: mir.MirErrorUnionOp.make_error,
-                value: self.lower_to_operand(throw_stmt.value)
+                value: self.lower_to_operand_as_type(throw_stmt.value, self.error_union_error_type(return_type))
             }),
             self.lowerer.hir_span(node_id)
         );
@@ -962,6 +1049,22 @@ struct BodyLowerer: Movable {
         self.run_deferred_from(0, self.lowerer.hir_span(node_id));
         self.push_active_storage_dead_from(0, self.lowerer.hir_span(node_id));
         self.finish_return(false, self.lowerer.hir_span(node_id));
+    }
+
+    qid.TypeId error_union_value_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        if (info.data is .error_union(error_union)) {
+            return error_union.value;
+        }
+        return self.lowerer.ctx.query.types.invalid_type();
+    }
+
+    qid.TypeId error_union_error_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        if (info.data is .error_union(error_union)) {
+            return error_union.error;
+        }
+        return self.lowerer.ctx.query.types.invalid_type();
     }
 
     () lower_assign(hir.HirId node_id, hir.HirAssign assign_stmt) {
@@ -1010,7 +1113,7 @@ struct BodyLowerer: Movable {
         mir.MirLocalId temp = self.add_temp(self.type_for_node(node_id), span);
         mir.MirPlace temp_place = self.place_for_local(temp);
         self.lower_direct_into_place(node_id, temp_place);
-        mir.MirOperand value = mir.copy_operand_value(mir.MirCopyOperand {place: temp_place});
+        mir.MirOperand value = self.operand_for_place(temp_place);
         self.push_assign(
             destination,
             mir.use_rvalue(mir.MirUseRvalue {
@@ -2249,14 +2352,15 @@ struct BodyLowerer: Movable {
     }
 
     () lower_new_value(hir.HirId node_id, hir.HirUnary unary, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(node_id);
         self.push_assign(
             destination,
-            mir.alloc_rvalue(mir.MirAllocValueRvalue {
-                value_type: self.type_for_node(unary.value),
-                value: self.lower_to_operand(unary.value)
-            }),
-            self.lowerer.hir_span(node_id)
+            mir.alloc_box_rvalue(mir.MirAllocBoxRvalue {value_type: self.type_for_node(unary.value)}),
+            span
         );
+        // `new T(expr)` 的 initializer 必须直接写进 heap pointee。不能先把
+        // 拥有资源的 aggregate 构造成 rvalue 再复制到 heap，否则会破坏所有权。
+        self.lower_into_place(unary.value, self.project_deref(destination, false));
     }
 
     () lower_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
@@ -2286,7 +2390,10 @@ struct BodyLowerer: Movable {
     () lower_equal_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
         token.Span span = self.lowerer.hir_span(node_id);
         qid.TypeId compare_type = self.type_for_node(binary.left);
-        if (!self.has_aggregate_equality_plan(node_id)) {
+        if (self.lower_trait_equal_binary(node_id, binary, compare_type, destination, span)) {
+            return;
+        }
+        if (!self.has_aggregate_equality_plan(node_id) && !self.type_has_aggregate_equality(compare_type)) {
             self.lower_scalar_equal_binary(node_id, binary, destination);
             return;
         }
@@ -2311,11 +2418,81 @@ struct BodyLowerer: Movable {
         );
     }
 
+    Bool lower_trait_equal_binary(
+        hir.HirId node_id,
+        hir.HirBinary binary,
+        qid.TypeId compare_type,
+        mir.MirPlace destination,
+        token.Span span
+    ) {
+        guard self.lowerer.typeck.member_selection(node_id) is some trait_member else {
+            return false;
+        }
+        guard self.concrete_member_for_type(trait_member, compare_type) is some target else {
+            return false;
+        }
+        mir.MirPlace lhs = self.lower_equality_operand(binary.left, compare_type, span);
+        mir.MirPlace rhs = self.lower_equality_operand(binary.right, compare_type, span);
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(2);
+        args.add(mir.copy_operand_value(mir.MirCopyOperand {place: lhs}));
+        args.add(mir.copy_operand_value(mir.MirCopyOperand {place: rhs}));
+        if (binary.op == .equal) {
+            self.lower_direct_function_call(node_id, target, args$.ref(), destination);
+            return true;
+        }
+        mir.MirLocalId result = self.add_temp(self.lowerer.ctx.query.types.bool_type(), span);
+        self.lower_direct_function_call(node_id, target, args$.ref(), self.place_for_local(result));
+        self.finish_equal_places(result, destination, true, span);
+        return true;
+    }
+
+    qid.DefId? concrete_member_for_type(qid.DefId trait_member_def, qid.TypeId type_id) {
+        qid.SymbolId member_symbol = self.lowerer.ctx.query.defs.get(trait_member_def).name.symbol;
+        guard self.nominal_type_data(self.member_lookup_value_type(type_id)) is some named else {
+            return null;
+        }
+        qid.DefId? member_def = self.member_def_by_symbol(named.def_id, member_symbol);
+        guard member_def is some concrete_def else {
+            return null;
+        }
+        if (self.lowerer.def_is_trait_member(concrete_def)) {
+            return null;
+        }
+        return concrete_def;
+    }
+
+    qid.TypeId member_lookup_value_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) {
+                return handle.element;
+            }
+        }
+        return type_id;
+    }
+
     Bool has_aggregate_equality_plan(hir.HirId node_id) {
         guard self.lowerer.typeck.expr_lowering(node_id) is some lowering else {
             return false;
         }
         return lowering == .aggregate_equality;
+    }
+
+    Bool type_has_aggregate_equality(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        if (info.data is .tuple_type(_)) { return true; }
+        if (info.data is .array_type(_)) { return true; }
+        if (info.data is .optional(_)) { return true; }
+        if (info.data is .error_union(_)) { return true; }
+        if (info.data is .handle_type(handle)) { return handle.kind == .slice; }
+        if (info.data is .named(named)) { return self.named_type_has_aggregate_equality(named.def_id); }
+        return false;
+    }
+
+    Bool named_type_has_aggregate_equality(qid.DefId def_id) {
+        def.DefKind kind = self.lowerer.ctx.query.defs.get(def_id).kind;
+        if (kind == .struct_def || kind == .record_def) { return true; }
+        return kind == .union_def;
     }
 
     mir.MirPlace lower_equality_operand(hir.HirId node_id, qid.TypeId compare_type, token.Span span) {
@@ -2609,6 +2786,10 @@ struct BodyLowerer: Movable {
             self.mark_unsupported(node_id);
             return;
         }
+        if (source.projection.length != 0) {
+            self.mark_unsupported(node_id);
+            return;
+        }
         self.push_assign(
             destination,
             mir.use_rvalue(mir.MirUseRvalue {value: mir.move_operand_value(mir.MirMoveOperand {place: source})}),
@@ -2621,7 +2802,15 @@ struct BodyLowerer: Movable {
             self.mark_unsupported(node_id);
             return;
         }
+        Bool! borrow_pointee = false;
+        if (!raw_pointer && self.borrow_ref_should_deref_owner(source, destination)) {
+            borrow_pointee = true;
+        }
         mir.MirRvalue! value = mir.borrow_rvalue(mir.MirBorrowRvalue {place: source});
+        if (borrow_pointee) {
+            mir.MirPlace borrow_source = self.project_deref(source, false);
+            value = mir.borrow_rvalue(mir.MirBorrowRvalue {place: borrow_source});
+        }
         if (raw_pointer) {
             value = mir.address_of_rvalue(mir.MirAddressOfRvalue {
                 mutable_pointer: true,
@@ -2629,6 +2818,17 @@ struct BodyLowerer: Movable {
             });
         }
         self.push_assign(destination, value, self.lowerer.hir_span(node_id));
+    }
+
+    Bool borrow_ref_should_deref_owner(mir.MirPlace source, mir.MirPlace destination) {
+        types.TypeInfo source_info = self.lowerer.ctx.query.types.get(self.mir_place_type(source));
+        types.TypeInfo destination_info = self.lowerer.ctx.query.types.get(self.mir_place_type(destination));
+        guard source_info.data is .handle_type(source_handle) else { return false; }
+        guard destination_info.data is .handle_type(destination_handle) else { return false; }
+        if (source_handle.kind != .owner_pointer || destination_handle.kind != .reference) {
+            return false;
+        }
+        return self.lowerer.ctx.query.types.same_type(source_handle.element, destination_handle.element);
     }
 
     () lower_cast(hir.HirId node_id, hir.HirImplicitCall call, mir.MirPlace destination) {
@@ -3005,25 +3205,14 @@ struct BodyLowerer: Movable {
     }
 
     () lower_tuple_literal(hir.HirId node_id, hir.HirTupleLiteral literal, mir.MirPlace destination) {
-        list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>(literal.items.length);
         qid.TypeId[] item_types = self.tuple_item_types(node_id);
         Int! index = 0;
         while (index < literal.items.length) {
-            fields.add(self.lower_tuple_item_operand(literal.items[index], item_types, index));
+            qid.TypeId item_type = self.tuple_item_type(item_types, index);
+            mir.MirPlace item_place = self.project_constant_index(destination, index);
+            self.lower_into_place_as_type(literal.items[index], item_place, item_type);
             index = index + 1;
         }
-        self.push_assign(
-            destination,
-            self.aggregate_rvalue(mir.MirAggregateRvalue {
-                kind: mir.MirAggregateKind.tuple,
-                def_id: null,
-                type_id: self.type_for_node(node_id),
-                tag: null,
-                payload_field_index: -1,
-                fields: self.lowerer.output.operand_array(fields$.ref())
-            }, self.lowerer.hir_span(node_id)),
-            self.lowerer.hir_span(node_id)
-        );
     }
 
     qid.TypeId[] tuple_item_types(hir.HirId node_id) {
@@ -3035,33 +3224,21 @@ struct BodyLowerer: Movable {
         return self.lowerer.output.empty_type_args();
     }
 
-    mir.MirOperand lower_tuple_item_operand(hir.HirId item, qid.TypeId[] item_types, Int index) {
+    qid.TypeId tuple_item_type(qid.TypeId[] item_types, Int index) {
         if (index < item_types.length) {
-            return self.lower_to_operand_as_type(item, item_types[index]);
+            return item_types[index];
         }
-        return self.lower_to_operand(item);
+        return self.lowerer.ctx.query.types.invalid_type();
     }
 
     () lower_array_literal(hir.HirId node_id, hir.HirArrayLiteral literal, mir.MirPlace destination) {
-        list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>(literal.items.length);
         qid.TypeId element_type = self.array_element_type(node_id);
         Int! index = 0;
         while (index < literal.items.length) {
-            fields.add(self.lower_to_operand_as_type(literal.items[index], element_type));
+            mir.MirPlace element_place = self.project_constant_index(destination, index);
+            self.lower_into_place_as_type(literal.items[index], element_place, element_type);
             index = index + 1;
         }
-        self.push_assign(
-            destination,
-            self.aggregate_rvalue(mir.MirAggregateRvalue {
-                kind: mir.MirAggregateKind.array,
-                def_id: null,
-                type_id: self.type_for_node(node_id),
-                tag: null,
-                payload_field_index: -1,
-                fields: self.lowerer.output.operand_array(fields$.ref())
-            }, self.lowerer.hir_span(node_id)),
-            self.lowerer.hir_span(node_id)
-        );
     }
 
     qid.TypeId array_element_type(hir.HirId node_id) {
@@ -3090,7 +3267,9 @@ struct BodyLowerer: Movable {
             elems.add(base_place.projection[index]);
             index = index + 1;
         }
-        elems.add(mir.deref_projection_elem(mir.MirDerefProjection {raw_pointer: self.is_raw_pointer_type(base_id)}));
+        elems.add(mir.deref_projection_elem(mir.MirDerefProjection {
+            raw_pointer: self.place_is_raw_pointer(base_place)
+        }));
         return self.place_with_projection(base_place.local_id, elems$.ref());
     }
 
@@ -3128,6 +3307,12 @@ struct BodyLowerer: Movable {
         return handle.kind == .raw_pointer;
     }
 
+    Bool place_is_raw_pointer(mir.MirPlace place) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(self.mir_place_type(place));
+        guard info.data is .handle_type(handle) else { return false; }
+        return handle.kind == .raw_pointer;
+    }
+
     mir.MirOperand lower_to_operand(hir.HirId node_id) {
         if (self.move_operand_for_expr(node_id) is some operand) {
             return operand;
@@ -3147,6 +3332,10 @@ struct BodyLowerer: Movable {
         }
         if (call.op == .move) {
             guard self.place_for_expr(call.base) is some source else {
+                self.mark_unsupported(node_id);
+                return null;
+            }
+            if (source.projection.length != 0) {
                 self.mark_unsupported(node_id);
                 return null;
             }
@@ -3342,15 +3531,14 @@ struct BodyLowerer: Movable {
             return null;
         }
         mir.MirPlace! base = self.pointer_base_place(member_access.base);
-        if (self.member_base_needs_deref(member_access.base)) {
-            base = self.project_deref(base, self.is_raw_pointer_type(member_access.base));
+        if (self.member_base_needs_deref(base)) {
+            base = self.project_deref(base, self.place_is_raw_pointer(base));
         }
         return self.project_field(base, member_def, self.type_for_node(node_id));
     }
 
-    Bool member_base_needs_deref(hir.HirId base_id) {
-        qid.TypeId base_type = self.type_for_node(base_id);
-        types.TypeInfo info = self.lowerer.ctx.query.types.get(base_type);
+    Bool member_base_needs_deref(mir.MirPlace base) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(self.mir_place_type(base));
         guard info.data is .handle_type(handle) else { return false; }
         if (handle.kind == .reference) { return true; }
         if (handle.kind == .owner_pointer) { return true; }
@@ -3570,8 +3758,16 @@ struct BodyLowerer: Movable {
             self.lower_special_call(node_id, call, lowering_kind, destination);
             return;
         }
+        if (self.call_can_lower_builtin_integer_hash(call)) {
+            self.lower_core_hash_call(node_id, call, destination);
+            return;
+        }
         if (self.lowerer.ctx.query.typeck.member_selection(call.callee) is some member_def) {
             def.DefKind kind = self.lowerer.ctx.query.defs.get(member_def).kind;
+            if (kind == .init_def) {
+                self.lower_init_constructor_call(node_id, call, member_def, destination);
+                return;
+            }
             if (kind == .function_def || kind == .init_def || kind == .deinit_def) {
                 self.lower_call_to_function_def(node_id, call, member_def, destination);
                 return;
@@ -3589,6 +3785,10 @@ struct BodyLowerer: Movable {
             }
             if (kind == .union_variant_def) {
                 self.lower_union_variant_constructor(node_id, call, target.def_id, destination);
+                return;
+            }
+            if (kind == .init_def) {
+                self.lower_init_constructor_call(node_id, call, target.def_id, destination);
                 return;
             }
             if (kind == .function_def || kind == .init_def || kind == .deinit_def) {
@@ -3609,9 +3809,71 @@ struct BodyLowerer: Movable {
             args: self.lowerer.output.operand_slice(args.slice()),
             destination: destination,
             target: next_block,
+            initialized_place: null,
             cleanup: null
         }), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    () lower_init_constructor_call(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.DefId init_def,
+        mir.MirPlace destination
+    ) {
+        qid.DefId target_def = self.direct_call_target(node_id, init_def);
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>();
+        qid.TypeId[] type_args = self.function_call_type_args(node_id, call.callee, target_def);
+        qid.TypeId function_type = self.function_type_for_ref(target_def, type_args);
+        args.add(self.borrow_destination_operand(destination, self.lowerer.hir_span(node_id)));
+        self.add_constructor_call_operands(node_id, call, args$.ref(), function_type);
+        if (type_args.length > 0) {
+            self.lowerer.ensure_function_instance(target_def, type_args);
+        } else {
+            self.lowerer.ensure_external_function(target_def);
+        }
+
+        mir.MirLocalId unit_local = self.add_temp(
+            self.lowerer.ctx.query.types.unit_type(),
+            self.lowerer.hir_span(node_id)
+        );
+        mir.MirBlockId next_block = self.reserve_block(self.lowerer.hir_span(node_id));
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator {
+            callee: self.function_callee_with_args(
+                call.callee,
+                target_def,
+                function_type,
+                type_args
+            ),
+            args: self.lowerer.output.operand_slice(args.slice()),
+            destination: self.place_for_local(unit_local),
+            target: next_block,
+            initialized_place: destination,
+            cleanup: null
+        }), self.lowerer.hir_span(node_id));
+        self.start_block(next_block);
+    }
+
+    mir.MirOperand borrow_destination_operand(mir.MirPlace destination, token.Span span) {
+        return mir.out_operand_value(mir.MirOutOperand {place: destination});
+    }
+
+    () add_constructor_call_operands(
+        hir.HirId node_id,
+        hir.HirCall call,
+        list.ArrayList<mir.MirOperand>& args,
+        qid.TypeId function_type
+    ) {
+        types.FunctionType signature = self.function_type_or_empty(function_type);
+        if (self.lowerer.typeck.ordered_call_args(node_id) is some ordered) {
+            self.add_ordered_call_operands(args, ordered.values, signature, 1);
+            return;
+        }
+        Int! index = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_call_arg_operand(call.args[index].value, signature, index + 1));
+            index = index + 1;
+        }
     }
 
     Bool is_enum_init_call(hir.HirId node_id, hir.HirCall call) {
@@ -3795,12 +4057,44 @@ struct BodyLowerer: Movable {
         return true;
     }
 
+    Bool call_can_lower_builtin_integer_hash(hir.HirCall call) {
+        guard self.lowerer.ctx.query.typeck.member_selection(call.callee) is some member_def else {
+            return false;
+        }
+        if (!self.is_core_hash_method(member_def)) {
+            return false;
+        }
+        guard self.hash_receiver_node(call.callee) is some receiver else {
+            return false;
+        }
+        return self.type_has_builtin_integer_hash(self.type_for_node(receiver));
+    }
+
+    Bool is_core_hash_method(qid.DefId function_def) {
+        guard self.lowerer.ctx.query.resolve.core_traits.hashable_trait is some hashable_def else {
+            return false;
+        }
+        guard self.lowerer.ctx.query.defs.get(function_def).owner_def is some owner_def else {
+            return false;
+        }
+        if (owner_def.to_index() != hashable_def.to_index()) {
+            return false;
+        }
+        qid.SymbolId symbol = self.lowerer.ctx.query.defs.get(function_def).name.symbol;
+        return string.equal(self.lowerer.ctx.query.symbols.text(symbol), "hash");
+    }
+
     hir.HirId? hash_receiver_node(hir.HirId callee_id) {
         hir.HirNode callee = self.lowerer.hirs.node(callee_id);
         if (callee.data is .member_access(member_access)) {
             return member_access.base;
         }
         return null;
+    }
+
+    Bool type_has_builtin_integer_hash(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        return info.data is .int_type(_);
     }
 
     () lower_builtin_numeric_init(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
@@ -3856,12 +4150,9 @@ struct BodyLowerer: Movable {
     ) {
         qid.DefId! target_def = self.direct_call_target(node_id, function_def);
         target_def = self.static_dispatch_target_for_call(call, target_def);
-        list.ArrayList<mir.MirOperand>! args = self.lower_call_operands(node_id, call, target_def);
-        qid.TypeId! function_type = self.lowerer.ctx.query.types.invalid_type();
-        if (self.lowerer.typeck.def_type(target_def) is some type_id) {
-            function_type = type_id;
-        }
         qid.TypeId[] type_args = self.function_call_type_args(node_id, call.callee, target_def);
+        qid.TypeId function_type = self.function_type_for_ref(target_def, type_args);
+        list.ArrayList<mir.MirOperand>! args = self.lower_call_operands(node_id, call, target_def, function_type);
         if (type_args.length > 0) {
             self.lowerer.ensure_function_instance(target_def, type_args);
         } else {
@@ -3878,6 +4169,7 @@ struct BodyLowerer: Movable {
             args: self.lowerer.output.operand_slice(args.slice()),
             destination: destination,
             target: next_block,
+            initialized_place: null,
             cleanup: null
         }), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
@@ -3988,11 +4280,8 @@ struct BodyLowerer: Movable {
         list.ArrayList<mir.MirOperand>& args,
         mir.MirPlace destination
     ) {
-        qid.TypeId! function_type = self.lowerer.ctx.query.types.invalid_type();
-        if (self.lowerer.typeck.def_type(function_def) is some type_id) {
-            function_type = type_id;
-        }
         qid.TypeId[] type_args = self.selected_member_type_args(node_id);
+        qid.TypeId function_type = self.function_type_for_ref(function_def, type_args);
         if (type_args.length > 0) {
             self.lowerer.ensure_function_instance(function_def, type_args);
         } else {
@@ -4004,6 +4293,7 @@ struct BodyLowerer: Movable {
             args: self.lowerer.output.operand_slice(args.slice()),
             destination: destination,
             target: next_block,
+            initialized_place: null,
             cleanup: null
         }), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
@@ -4019,17 +4309,20 @@ struct BodyLowerer: Movable {
     list.ArrayList<mir.MirOperand> lower_call_operands(
         hir.HirId node_id,
         hir.HirCall call,
-        qid.DefId target_def
+        qid.DefId target_def,
+        qid.TypeId function_type
     ) {
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>();
+        types.FunctionType signature = self.function_type_or_empty(function_type);
         self.add_receiver_call_operand(call, target_def, args$.ref());
+        Int param_offset = args.len();
         if (self.lowerer.typeck.ordered_call_args(node_id) is some ordered) {
-            self.add_ordered_call_operands(args$.ref(), ordered.values);
+            self.add_ordered_call_operands(args$.ref(), ordered.values, signature, param_offset);
             return args$.move();
         }
         Int! index = 0;
         while (index < call.args.length) {
-            args.add(self.lower_to_operand(call.args[index].value));
+            args.add(self.lower_call_arg_operand(call.args[index].value, signature, index + param_offset));
             index = index + 1;
         }
         return args$.move();
@@ -4040,7 +4333,7 @@ struct BodyLowerer: Movable {
         qid.DefId target_def,
         list.ArrayList<mir.MirOperand>& args
     ) {
-        if (!self.function_has_receiver(target_def)) {
+        if (!self.function_has_receiver_abi(target_def)) {
             return;
         }
         hir.HirNode callee = self.lowerer.hirs.node(call.callee);
@@ -4051,13 +4344,75 @@ struct BodyLowerer: Movable {
     }
 
     mir.MirOperand lower_receiver_operand(hir.HirId receiver) {
-        if (self.place_for_expr(receiver) is some place) {
-            return mir.copy_operand_value(mir.MirCopyOperand {place: place});
+        token.Span span = self.lowerer.hir_span(receiver);
+        if (self.reference_receiver_place(receiver) is some reference_place) {
+            return mir.copy_operand_value(mir.MirCopyOperand {place: reference_place});
         }
-        return self.lower_to_operand(receiver);
+        qid.TypeId receiver_type = self.type_for_node(receiver);
+        if (self.receiver_pointee_place(receiver) is some pointee) {
+            return self.borrow_receiver_place(pointee, self.mir_place_type(pointee), span);
+        }
+        mir.MirPlace source = self.receiver_source_place(receiver, span);
+        return self.borrow_receiver_place(source, receiver_type, span);
     }
 
-    Bool function_has_receiver(qid.DefId function_def) {
+    mir.MirOperand borrow_receiver_place(mir.MirPlace source, qid.TypeId value_type, token.Span span) {
+        qid.TypeId reference_type = self.lowerer.ctx.query.types.reference_type(value_type, span);
+        mir.MirLocalId reference_local = self.add_temp(reference_type, span);
+        mir.MirPlace reference_place = self.place_for_local(reference_local);
+        self.push_assign(
+            reference_place,
+            mir.borrow_rvalue(mir.MirBorrowRvalue {place: source}),
+            span
+        );
+        return mir.copy_operand_value(mir.MirCopyOperand {place: reference_place});
+    }
+
+    mir.MirPlace? receiver_pointee_place(hir.HirId receiver) {
+        qid.TypeId receiver_type = self.type_for_node(receiver);
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(receiver_type);
+        guard info.data is .handle_type(handle) else { return null; }
+        if (!self.handle_receiver_needs_deref(handle.kind)) {
+            return null;
+        }
+        return self.pointer_deref_place(receiver);
+    }
+
+    Bool handle_receiver_needs_deref(types.HandleTypeKind kind) {
+        if (kind == .owner_pointer) { return true; }
+        return kind == .raw_pointer;
+    }
+
+    mir.MirPlace? reference_receiver_place(hir.HirId receiver) {
+        guard self.place_for_expr(receiver) is some place else {
+            return null;
+        }
+        if (self.type_is_reference(self.mir_place_type(place))) {
+            return place;
+        }
+        return null;
+    }
+
+    Bool type_is_reference(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        return handle.kind == .reference;
+    }
+
+    mir.MirPlace receiver_source_place(hir.HirId receiver, token.Span span) {
+        if (self.place_for_expr(receiver) is some place) {
+            return place;
+        }
+        mir.MirLocalId local = self.add_temp(self.type_for_node(receiver), span);
+        mir.MirPlace place = self.place_for_local(local);
+        self.lower_into_place(receiver, place);
+        return place;
+    }
+
+    Bool function_has_receiver_abi(qid.DefId function_def) {
+        // MIR function ABI 由 signature 决定。body lower 会在 HIR 没有显式
+        // `self` local 时合成 receiver local，所以 call 侧不能再用 body.locals
+        // 反推，否则会漏传 receiver 并导致所有后续参数错位。
         guard self.lowerer.hirs.def(function_def) is some hir_def else {
             return false;
         }
@@ -4067,12 +4422,39 @@ struct BodyLowerer: Movable {
         return signature.has_receiver;
     }
 
-    () add_ordered_call_operands(list.ArrayList<mir.MirOperand>& args, hir.HirId[] values) {
+    () add_ordered_call_operands(
+        list.ArrayList<mir.MirOperand>& args,
+        hir.HirId[] values,
+        types.FunctionType signature,
+        Int param_offset
+    ) {
         Int! index = 0;
         while (index < values.length) {
-            args.add(self.lower_to_operand(values[index]));
+            args.add(self.lower_call_arg_operand(values[index], signature, index + param_offset));
             index = index + 1;
         }
+    }
+
+    mir.MirOperand lower_call_arg_operand(hir.HirId value, types.FunctionType signature, Int param_index) {
+        if (param_index < 0 || param_index >= signature.params.length) {
+            return self.lower_to_operand(value);
+        }
+        token.Span span = self.lowerer.hir_span(value);
+        mir.MirLocalId local = self.add_temp(signature.params[param_index], span);
+        mir.MirPlace place = self.place_for_local(local);
+        self.lower_into_place(value, place);
+        return self.operand_for_place(place);
+    }
+
+    types.FunctionType function_type_or_empty(qid.TypeId function_type) {
+        types.TypeInfo info = self.lowerer.ctx.query.types.get(function_type);
+        if (info.data is .function_type(signature)) {
+            return signature;
+        }
+        return types.FunctionType {
+            params: self.lowerer.output.empty_type_args(),
+            result: self.lowerer.ctx.query.types.unit_type()
+        };
     }
 
     mir.MirOperand function_operand(hir.HirId node_id, qid.DefId function_def, qid.TypeId function_type) {
@@ -4082,7 +4464,10 @@ struct BodyLowerer: Movable {
                 type_args = self.substituted_type_arg_array(instance.type_args);
             }
         }
-        return mir.function_operand_value(self.function_ref(node_id, function_def, function_type, type_args));
+        qid.TypeId concrete_function_type = self.function_type_for_ref(function_def, type_args);
+        return mir.function_operand_value(
+            self.function_ref(node_id, function_def, concrete_function_type, type_args)
+        );
     }
 
     mir.MirCallCallee function_callee_with_args(
@@ -4114,7 +4499,51 @@ struct BodyLowerer: Movable {
                 return self.concrete_instance_type_args(instance.type_args);
             }
         }
+        if (self.receiver_owner_type_args(callee_id, function_def) is some receiver_args) {
+            return receiver_args;
+        }
         return self.function_ref_type_args(callee_id, function_def);
+    }
+
+    qid.TypeId[]? receiver_owner_type_args(hir.HirId callee_id, qid.DefId function_def) {
+        hir.HirNode callee = self.lowerer.hirs.node(callee_id);
+        guard callee.data is .member_access(member_access) else { return null; }
+        guard self.lowerer.ctx.query.defs.get(function_def).owner_def is some owner_def else { return null; }
+        guard self.named_receiver_type(member_access.base) is some named else { return null; }
+        if (named.def_id != owner_def || named.args.length == 0) {
+            return null;
+        }
+        return self.concrete_instance_type_args(named.args);
+    }
+
+    types.NamedType? named_receiver_type(hir.HirId receiver_id) {
+        qid.TypeId receiver_type = self.type_for_node(receiver_id);
+        types.TypeInfo! info = self.lowerer.ctx.query.types.get(receiver_type);
+        if (info.data is .handle_type(handle)) {
+            info = self.lowerer.ctx.query.types.get(handle.element);
+        }
+        guard info.data is .named(named) else { return null; }
+        return named;
+    }
+
+    qid.TypeId function_type_for_ref(qid.DefId function_def, qid.TypeId[] type_args) {
+        guard self.lowerer.typeck.def_type(function_def) is some raw_type else {
+            return self.lowerer.ctx.query.types.invalid_type();
+        }
+        if (type_args.length == 0) {
+            return self.lowerer.substitute_type(raw_type, self.substitutions);
+        }
+        guard self.lowerer.hirs.def(function_def) is some hir_def else {
+            return self.lowerer.ctx.query.types.invalid_type();
+        }
+        // MIR function ref 必须保存 concrete 函数签名。不能用 call 表达式的
+        // 结果类型，否则 LLVM call site 会把 callee ABI lowering 成错误类型。
+        monomorph.SubstitutionMap substitutions = monomorph.build_substitution(
+            self.lowerer.ctx.query$.ref(),
+            hir_def,
+            monomorph.InstanceKey(function_def, type_args)
+        );
+        return self.lowerer.substitute_type(raw_type, substitutions$.ref());
     }
 
     qid.TypeId[] concrete_instance_type_args(qid.TypeId[] type_args) {
@@ -4537,7 +4966,7 @@ struct BodyLowerer: Movable {
     }
 
     mir.MirLocalId mir_local_for_hir(hir.HirLocalId local_id) {
-        return mir.MirLocalId.from_index(local_id.to_index() + 1);
+        return mir.MirLocalId.from_index(local_id.to_index() + 1 + self.hir_local_offset);
     }
 
     mir.MirPlace place_for_local(mir.MirLocalId local_id) {
