@@ -18,20 +18,165 @@ driver/cli -> pipeline.compile_with_options
 
 - `package source/AST`：package manifest、source、syntax、module graph 和 resolve。
 - `HIR`：resolve 直接生成的未类型化语义树。
-- `type facts`：`TypeCheckResults` 和 `MonomorphInstances`。
+- `type facts`：`TypeCheckStore` 和 `MonomorphStore`。
 - `MIR`：HIR lowering 生成的 CFG。
 - `checked MIR`：borrow check 后经过 drop elaboration 的 MIR。
 - `backend output`：LLVM IR、object file 或 executable。
 - `layout facts`：由 HIR、type facts 和 target layout 按需查询得到，供 MIR、borrow/drop 和
   backend 使用。
 
-`layout` 是 query 层事实表，不从 MIR body 生成。它消费 HIR、`TypeCheckResults`、
-monomorph `MonomorphInstances` 和 target layout。MIR lowering、borrow check、drop elaboration
+`layout` 是 store 层事实，不从 MIR body 生成。它消费 HIR、`TypeCheckStore`、
+`MonomorphStore` 和 target layout。MIR lowering、borrow check、drop elaboration
 和 backend 都可以按需查询 layout；各阶段不能绕过 `LayoutStore` 自己推导 field offset、size
 或 ABI 表达。
 
 `--check` 当前仍会跑到 MIR、borrow check 和 drop elaboration，保证源码级语言契约不只停在
 type check。
+
+## 架构规则
+
+Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发模式。每个阶段只生产
+本阶段事实，跨阶段访问必须通过显式 store API。新增功能先确定阶段归属，再实现代码。
+
+### 总原则
+
+- 编译器内部数据按事实表组织，不让 AST/HIR/MIR 节点直接持有跨阶段复杂对象。
+- `DefId`、`HirId`、`TypeId`、`LayoutId`、`MirFunctionId` 都是 session-local handle。
+- 跨次编译身份统一使用 `StableKey`，不能写入 session-local ID。
+- fingerprint 只表示内容摘要，artifact cache key 只能由 `StableKey` 和编译配置组合计算得到。
+- 每个事实只能有一个 owner store；其他模块只能查询或引用，不能复制一份并长期维护。
+- 每张新增 store 都必须明确 owner、key、value、生命周期和失效条件。
+- `span`、`SourceMap` 和 source offset 只用于诊断定位，不能参与符号身份、重载匹配或缓存 key。
+- stage2 自举修复必须优先修正语义或 IR 边界，不能通过绕过语法、跳过检查或
+  backend 补语义解决。
+
+### 阶段 Contract
+
+- `syntax`
+  - 生产：token、AST、语法诊断。
+  - 消费：source text、keyword store。
+  - 禁止：名字解析、类型判断、布局、codegen 语义。
+- `resolve`
+  - 生产：module graph、namespace、`DefId`、名字绑定、HIR。
+  - 消费：AST、source、package manifest。
+  - 禁止：类型推导、layout、MIR/backend 逻辑。
+- `hir`
+  - 生产：resolved untyped HIR、HIR store。
+  - 消费：resolve facts。
+  - 禁止：保存 type check 结果、layout、backend symbol。
+- `type_check`
+  - 生产：`TypeCheckStore`、trait/overload/type facts。
+  - 消费：HIR、resolve facts。
+  - 禁止：改写 HIR、计算 ABI layout、生成 MIR。
+- `monomorph`
+  - 生产：concrete generic instance 集合。
+  - 消费：type facts、HIR generic template。
+  - 禁止：生成目标代码、修改 type facts。
+- `mir`
+  - 生产：CFG、local、place、rvalue、terminator。
+  - 消费：HIR、type facts、monomorph、layout query。
+  - 禁止：重新 resolve/type check、写 backend symbol。
+- `layout`
+  - 生产：size、align、field index、ABI representation。
+  - 消费：TypeId、type facts、target data layout。
+  - 禁止：类型推导、读取 MIR 控制流、插入 drop。
+- `borrow_check`
+  - 生产：borrow/drop safety 结果。
+  - 消费：MIR、type facts、layout。
+  - 禁止：修改 HIR/type facts、处理数据竞争策略。
+- `drop_elaborate`
+  - 生产：elaborated MIR CFG。
+  - 消费：MIR、borrow store、drop/layout query。
+  - 禁止：重新判断类型规则、生成 backend-only 节点。
+- `backend`
+  - 生产：LLVM IR、object、executable。
+  - 消费：elaborated MIR、layout、target、symbols。
+  - 禁止：语言语义判断、HIR fallback、修改 MIR/layout。
+- `incremental`
+  - 生产：`StableKey`、fingerprint、artifact metadata。
+  - 消费：source、interface、object artifact。
+  - 禁止：缓存 session-local HIR/type/MIR 对象。
+
+如果某个实现需要违反上述 contract，优先修改前一阶段产出的事实，
+而不是在后一阶段补临时逻辑。
+
+### CompilerContext 与 CompilerStore
+
+`CompilerContext` 是一次编译请求的运行上下文，保存配置、target、输出层和统一 store。
+它不直接平铺业务事实表。
+
+```text
+CompilerContext
+  options
+  target
+  reporter
+  store: CompilerStore
+```
+
+`CompilerStore` 是所有业务事实集合的生命周期所有者。长期事实和单次 compilation cache 都挂在
+这里，但每个 store 自己声明生命周期和失效规则。
+
+```text
+CompilerStore
+  diagnostics
+  sources
+  source_map
+  asts
+  symbols
+  keywords
+  defs
+  resolve
+  hirs
+  types
+  typeck
+  monomorph
+  layouts
+  mirs
+  borrow_check
+  artifacts
+  incremental
+```
+
+`DiagnosticStore` 放在 `CompilerStore` 内，因为它保存编译过程中产生的诊断事实。
+`DiagnosticReporter` 不放进 `CompilerStore`，它只负责终端输出和未来 LSP 消息发布。
+
+### Store 规则
+
+- `CompilerStore` 是业务事实集合的生命周期所有者。
+- `CompilerContext` 不直接平铺业务 store；所有业务 store 都通过 `ctx.store` 访问。
+- 阶段产物只有确实被多个后续阶段消费时才挂入 `CompilerStore`。
+- `AstStore` 是单次 compilation 的 parse cache，不作为跨阶段长期语义 store。
+- `ResolveStore` 保存 package、module、namespace、import/export 和 def store，是名字事实 owner。
+- `HirStore` 保存每个 `DefId` 的 HIR signature/body，是 HIR 事实 owner。
+- `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
+- `TypeCheckStore` 保存 node/def/call/pattern 的类型事实，不和 `TypeStore` 合并所有权语义。
+- `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
+- `MirStore` 保存 MIR function/body；backend 不维护一份等价 MIR。
+- `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
+
+### Pass 规则
+
+- 每个 pass 必须有明确输入和输出，不能顺手修复其他阶段遗漏的语义。
+- pass 可以查询上游事实，但不能修改上游事实表。
+- pass 修改 MIR 时只产生普通 MIR block、statement 和 terminator。
+- backend 只能消费最终 elaborated MIR。
+- 如果 backend 需要理解语言级结构，说明 MIR 还没有表达清楚。
+- layout query 可以被 MIR、borrow/drop 和 backend 使用，但 field offset/size/align 只能来自
+  `LayoutStore`。
+
+### 开发检查清单
+
+新增或修改一个语言功能前，先回答：
+
+1. 这个语义属于哪个阶段？
+2. 这个阶段新增或修改哪张事实表？
+3. 下游阶段能否只靠这些事实工作？
+4. 是否引入了 session-local ID 到 artifact/cache？
+5. 是否把 source span 当成身份或匹配条件？
+6. 是否让 backend、layout 或 parser 承担了不属于它的语义？
+7. 是否需要新增 lang test、smoke test 或 artifact/incremental test？
+
+回答不清楚时，先调整阶段 contract 或数据模型，再写实现。
 
 ## 阶段边界
 
@@ -53,34 +198,34 @@ type check。
   layout 做布局相关的 representation 决策，但 layout 仍由 `layout` 模块统一计算；
   详见 [MIR 设计](compiler/mir.md)。
 - `layout` 负责 concrete type layout 查询和缓存；详见 [Layout 设计](compiler/layout.md)。
-- `borrow_check` 消费 MIR、`TypeCheckResults` 和 layout；详见
+- `borrow_check` 消费 MIR、`TypeCheckStore` 和 layout；详见
   [Borrow Check 设计](compiler/borrow-check.md)。
 - `backend` 把 elaborated MIR 和 layout 转成 LLVM IR、object file 或可执行产物；
   详见 [Backend 设计](compiler/backend.md)。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
   [Incremental Compilation 设计](compiler/incremental.md)。
-- `query` 是跨阶段查询入口和全局事实表聚合点；普通阶段通过 API 查询，不直接依赖
-  其他阶段的内部表。
+- `store` 是跨阶段事实集合聚合点；普通阶段通过 store API 查询，
+  不直接依赖其他阶段内部表。
 - `support` 只放可复用容器和工具，不 import 编译阶段模块。
 
-## Query 与 Store
+## CompilerStore
 
-`QuerySystem` 是跨阶段事实表的生命周期所有者。长期事实表优先挂到 `QuerySystem`，
-具体 record/key 类型仍由 owner 模块定义。
+`CompilerStore` 是跨阶段事实集合的生命周期所有者。具体 record/key 类型仍由 owner 模块定义。
 
-- `query/api.jiang` 定义 `QuerySystem`。
-- `resolve/interner.jiang` 定义 `SymbolTable` 和 `KeywordTable`。
-- `resolve/def.jiang` 定义 `DefKind`、`Visibility`、`NameDomain`、`DefRecord` 和 `DefTable`。
+- `store/api.jiang` 定义 `CompilerStore`。
+- `resolve/interner.jiang` 定义 `SymbolStore`；关键字分类是 symbol 的附加事实。
+- `resolve/def.jiang` 定义 `DefKind`、`Visibility`、`NameDomain`、`DefRecord` 和 `DefStore`。
 - `resolve/namespace.jiang` 定义持久 namespace、namespace binding 和 lookup key。
-- `resolve/store.jiang` 组合 package/module、import/export 和 namespace table。
+- `resolve/store.jiang` 组合 package/module、import/export 和 namespace store。
 - `ResolveStore.modules` 是 `ModuleId -> ModuleRecord` 主表。
-- `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的 side table。
-- `HirStore`、`TypeCheckResults`、`LayoutStore` 和 `IncrementalSymbolIndex` 都挂在 `QuerySystem`。
-- `MonomorphInstances`、`MirStore`、`ModuleGraph` 和 `BorrowCheckResults` 是单次 pipeline
+- `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的辅助 store。
+- `HirStore`、`TypeStore`、`TypeCheckStore`、`LayoutStore` 和 `IncrementalSymbolStore`
+  都挂在 `CompilerStore`。
+- `MonomorphStore`、`MirStore`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
   调用中的阶段产物。
-- `AstStore` 是一次 `compile_package` 的临时 AST cache，不挂到 `QuerySystem`。
+- `AstStore` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
 - 0.3 再引入 cache-backed query dependency tracking；0.2 不保留未接入的 cache 骨架。
-- 后续需要缓存或依赖追踪的跨阶段问题，再在 `query/api.jiang` 增加高阶查询入口。
+- 后续需要缓存或依赖追踪的跨阶段问题，再在 `store/api.jiang` 增加高阶查询入口。
 
 ## 源码目录
 
@@ -90,22 +235,22 @@ src/
   source/       package、source file、source manager、source map
   syntax/       token、lexer、parser、flat AST
   diagnostic/   diagnostic、reporter
-  resolve/      symbol table、keyword table、import/module/name resolver
-  sema/         type、trait、generic、overload、type check、monomorph
+  resolve/      symbol store、keyword store、import/module/name resolver
+  sema/         type store、trait、generic、overload、type check、monomorph
   hir/          HIR 数据结构和 HIR store
   mir/          MIR 数据结构和 HIR -> MIR lowering
   layout/       concrete type layout 查询层
   borrow_check/ ownership、loan、lifetime 和 drop safety 检查
   backend/      target 和后端入口
-  incremental/  cache key、fingerprint、依赖图、symbol index
-  query/        query system、cache、id、key、result
-  support/      arena、list、table、hash、unicode 等通用工具
+  incremental/  cache key、fingerprint、依赖图、symbol store
+  store/        compiler store、cache、id、key
+  support/      arena、list、hash、unicode 等通用工具
 ```
 
-## Support Table
+## Support 容器
 
-编译器内部表结构统一沉淀在 `support`，阶段模块优先复用这些结构，而不是在
-`resolve`、`sema`、`query` 中各自实现同类容器。
+业务事实集合统一命名为 `Store`。`support` 只提供底层容器实现，
+不建立额外的业务层命名分类。
 
 - `HashTable<K, V>`：复杂 key 到 value 的 hash 映射；key 必须满足 `Hashable`，
   而 `Hashable` 继承 `Equatable`；`get` 返回 `V?`，`get_ref` 返回 `V&?`。
@@ -135,7 +280,7 @@ public trait Indexable {
 - 函数、方法、局部变量、字段、模块文件名使用 `lower_snake_case`。
 - 常量使用 `SCREAMING_SNAKE_CASE`。
 - 缩写词按普通单词处理，只首字母大写：
-  - 使用 `QuerySystem`，不要用 `QuerySYSTEM`。
+  - 使用 `CompilerStore`，不要用 `CompilerSTORE`。
   - 使用 `ModuleId`、`DefId`、`AstId`、`MirId`。
   - 使用 `LspServer`、`Utf8`、`Utf16`。
 - 文件名使用 lower snake case：`source_manager.jiang`、`type_check.jiang`。
@@ -147,8 +292,7 @@ public trait Indexable {
 - `*Record`：实体表中的存储行。
 - `*Entry`：lookup bucket、链表或临时索引中的条目。
 - `*Key`：可 hash、可缓存或可持久化的查询键。
-- `*Table`：具体数据表或通用容器。
-- `*Index`：由多张表组成的查询索引。
+- `*Store`：业务事实集合；保存数据并按 key/id 查询数据的结构都使用这个后缀。
 - `*System`：跨阶段状态聚合和生命周期所有者。
 
 ### 代码风格

@@ -1,23 +1,24 @@
 # Layout 设计
 
 layout 是按需查询或批量物化的 concrete type layout 层。它的数据来源不是 MIR body。
-layout 消费 HIR、`TypeCheckResults`、monomorph `MonomorphInstances` 和 `TargetLayout`，
+layout 消费 HIR、`TypeCheckStore`、monomorph `MonomorphStore` 和 `TargetLayout`，
 输出 `LayoutStore`。MIR lowering 可以触发 layout 查询，但不能自己计算 layout。
 
 ## 边界
 
 - layout 不回读 AST，不重新 resolve，不重新 type check。
-- layout 不修改 HIR、`TypeCheckResults`、`TypeTable`、`MonomorphInstances` 或 MIR。
+- layout 不修改 HIR、`TypeCheckStore`、`TypeStore`、`MonomorphStore` 或 MIR。
 - layout 不遍历 MIR 来决定类型布局。
 - layout key 表达 concrete type 语义身份，nominal generic type 必须带 type args。
-- layout 负责 size、align、stride、field offset 和 target ABI 分类。
+- layout 负责 size、align、stride 和 field offset。
+- C ABI 参数/返回值分类由 backend ABI classifier 消费 layout facts 后完成。
 - field offset 只存在于 `LayoutStore`，不写回 MIR。
 - target 变化必须使 layout 查询失效。
 
 ## 顺序
 
 ```text
-HIR + TypeCheckResults + MonomorphInstances + TargetLayout
+HIR + TypeCheckStore + MonomorphStore + TargetLayout
   -> layout query
   -> LayoutStore
 ```
@@ -44,7 +45,6 @@ LayoutStore
 - `stride`
 - layout kind
 - field layouts
-- target ABI 分类
 
 `FieldLayout` 保存 field `DefId?`、field `TypeId`、offset 和 field layout。
 
@@ -91,4 +91,5 @@ layout 需要独立 active stack：
 - MIR lowering 不自己计算 layout；布局事实统一来自 `LayoutStore`。
 - layout 不改变类型检查结果。
 - backend 不能绕过 `LayoutStore` 自己推导 field offset。
+- backend ABI classifier 可以读取 `LayoutStore` 的 size/align，但不写 layout facts。
 - generic nominal type layout 必须使用 concrete type args。

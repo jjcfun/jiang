@@ -10,8 +10,10 @@ import mir = "../../mir/mir.jiang";
 import qid = "../../query/id.jiang";
 import list = "../../support/list.jiang";
 import table = "../../support/table.jiang";
+import backend_abi = "../abi.jiang";
 import codegen_unit = "../codegen_unit.jiang";
 import symbol = "../symbol.jiang";
+import llvm_abi = "./abi.jiang";
 import ffi = "./ffi.jiang";
 import llvm_place = "./place.jiang";
 import llvm_state = "./state.jiang";
@@ -42,6 +44,11 @@ public Bool emit_object_unit_file(
 public Bool emit_llvm_ir_file(context.CompilerContext& ctx, mir.MirStore& store, UInt8[*] output_path) {
     LlvmLowerer! lowerer = LlvmLowerer(ctx);
     return lowerer.emit_llvm_ir_file(store, output_path);
+}
+
+public UInt8[]? emit_llvm_ir_text(context.CompilerContext& ctx, mir.MirStore& store) {
+    LlvmLowerer! lowerer = LlvmLowerer(ctx);
+    return lowerer.emit_llvm_ir_text(store);
 }
 
 struct LlvmLowerer: Movable {
@@ -107,6 +114,21 @@ struct LlvmLowerer: Movable {
         }
         self.dispose();
         return ok;
+    }
+
+    UInt8[]? emit_llvm_ir_text(mir.MirStore& store) {
+        Bool! ok = self.lower_store(store);
+        if (!ok) {
+            self.add_codegen_error("LLVM lowering failed before writing IR", "llvm_lowering_failed");
+            self.dispose();
+            return null;
+        }
+        UInt8[]? text = ffi.module_llvm_ir_text(self.module$.ref());
+        if (text == null) {
+            self.add_codegen_error("LLVM failed to print IR", "llvm_print_ir_failed");
+        }
+        self.dispose();
+        return text;
     }
 
     Bool lower_unit(mir.MirStore& store, codegen_unit.CodegenUnit& unit) {
@@ -194,7 +216,7 @@ struct LlvmLowerer: Movable {
     }
 
     ffi.Value declare_external_function(mir.MirFunction function) {
-        qid.SymbolId symbol_id = self.ctx.query.defs.get(function.def_id).name.symbol;
+        qid.SymbolId symbol_id = self.ctx.store.defs.get(function.def_id).name.symbol;
         if (
             table.hash_table_get_value<qid.SymbolId, Int>(
                 self.declared_external_function_indexes$.ref(),
@@ -213,25 +235,15 @@ struct LlvmLowerer: Movable {
     }
 
     ffi.Value declare_new_function(mir.MirFunction function) {
-        llvm_state.LowerState! state = self.lower_state();
         mir.MirBody body = function.body;
-        Int return_index = body.return_local.to_index();
-        mir.MirLocalDecl return_local = body.locals[return_index];
-        ffi.Type return_type = llvm_type.lower_type(state$.ref(), return_local.type_id);
-        if (!ffi.type_valid(return_type)) {
-            self.add_function_codegen_error(
-                function,
-                "failed to lower LLVM function return type",
-                "llvm_return_type_lower_failed"
-            );
-            return ffi.Value();
-        }
-        ffi.Type function_type = self.lower_function_type(body, return_type);
+        backend_abi.FunctionAbi! function_abi = backend_abi.classify_mir_body(self.ctx, body);
+        llvm_state.LowerState! state = self.lower_state();
+        ffi.Type function_type = llvm_abi.function_type(state$.ref(), function_abi$.ref());
         if (!ffi.type_valid(function_type)) {
             self.add_function_codegen_error(
                 function,
-                "failed to lower LLVM function parameter type",
-                "llvm_param_type_lower_failed"
+                "failed to lower LLVM function ABI type",
+                "llvm_function_abi_type_lower_failed"
             );
             return ffi.Value();
         }
@@ -239,6 +251,7 @@ struct LlvmLowerer: Movable {
         CString raw_name = name$.as(UInt8[*])$.as(CString);
         ffi.Value llvm_function = ffi.module_add_function(self.module$.ref(), raw_name, function_type);
         if (ffi.value_valid(llvm_function)) {
+            llvm_abi.add_function_attributes(state$.ref(), llvm_function, function_abi$.ref());
             self.declared_function_indexes.set(
                 symbol.function_symbol_key(self.ctx, function),
                 self.declared_function_values.len()
@@ -270,28 +283,6 @@ struct LlvmLowerer: Movable {
         return ffi.Value();
     }
 
-    ffi.Type lower_function_type(mir.MirBody body, ffi.Type return_type) {
-        llvm_state.LowerState! state = self.lower_state();
-        list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>();
-        Int! index = 0;
-        while (index < body.locals.length) {
-            mir.MirLocalDecl local = body.locals[index];
-            if (local.kind == .param) {
-                if (!llvm_type.type_has_abi_value(state$.ref(), local.type_id)) {
-                    index = index + 1;
-                    continue;
-                }
-                ffi.Type param_type = llvm_type.lower_type(state$.ref(), local.type_id);
-                if (!ffi.type_valid(param_type)) {
-                    return ffi.Type();
-                }
-                params.add(param_type);
-            }
-            index = index + 1;
-        }
-        return ffi.function_type(return_type, params$.ref());
-    }
-
     Bool lower_body(
         mir.MirBody body,
         ffi.Value llvm_function
@@ -310,11 +301,12 @@ struct LlvmLowerer: Movable {
             self.add_codegen_error("failed to allocate LLVM local slots", "llvm_local_slot_alloc_failed");
             return false;
         }
-        if (!self.store_function_params(body, llvm_function, local_slots$.ref())) {
+        backend_abi.FunctionAbi! function_abi = backend_abi.classify_mir_body(self.ctx, body);
+        if (!self.store_function_params(body, function_abi$.ref(), llvm_function, local_slots$.ref())) {
             self.add_codegen_error("failed to store LLVM function parameters", "llvm_param_store_failed");
             return false;
         }
-        return self.lower_blocks(body, llvm_function, blocks$.ref(), local_slots$.ref());
+        return self.lower_blocks(body, function_abi$.ref(), llvm_function, blocks$.ref(), local_slots$.ref());
     }
 
     list.ArrayList<ffi.BasicBlock> create_basic_blocks(mir.MirBody body, ffi.Value llvm_function) {
@@ -333,28 +325,48 @@ struct LlvmLowerer: Movable {
 
     Bool store_function_params(
         mir.MirBody body,
+        backend_abi.FunctionAbi& function_abi,
         ffi.Value llvm_function,
         list.ArrayList<ffi.Value>& local_slots
     ) {
-        llvm_state.LowerState! state = self.lower_state();
-        Int! param_index = 0;
+        Int! llvm_index = 0;
+        if (function_abi.result.is_indirect()) {
+            llvm_index = 1;
+        }
+        Int! source_param_index = 0;
         Int! local_index = 0;
         while (local_index < body.locals.length) {
             mir.MirLocalDecl local = body.locals[local_index];
             if (local.kind == .param) {
-                if (!llvm_type.type_has_abi_value(state$.ref(), local.type_id)) {
-                    local_index = local_index + 1;
-                    continue;
+                backend_abi.AbiArg param_abi = function_abi.params.get(source_param_index);
+                if (param_abi.kind == .direct) {
+                    ffi.Value param = ffi.function_param(llvm_function, llvm_index);
+                    if (!self.store_local_value(local, local_slots, param)) { return false; }
+                    llvm_index = llvm_index + 1;
+                } else if (param_abi.kind == .indirect) {
+                    ffi.Value param = ffi.function_param(llvm_function, llvm_index);
+                    if (!self.store_indirect_param(local, local_slots, param)) { return false; }
+                    llvm_index = llvm_index + 1;
                 }
-                ffi.Value param = ffi.function_param(llvm_function, param_index);
-                if (!self.store_local_value(local, local_slots, param)) {
-                    return false;
-                }
-                param_index = param_index + 1;
+                source_param_index = source_param_index + 1;
             }
             local_index = local_index + 1;
         }
         return true;
+    }
+
+    Bool store_indirect_param(
+        mir.MirLocalDecl local,
+        list.ArrayList<ffi.Value>& local_slots,
+        ffi.Value param_pointer
+    ) {
+        llvm_state.LowerState! state = self.lower_state();
+        ffi.Type value_type = llvm_type.lower_type(state$.ref(), local.type_id);
+        if (!ffi.type_valid(value_type)) {
+            return false;
+        }
+        ffi.Value value = ffi.builder_build_load(self.builder$.ref(), value_type, param_pointer);
+        return self.store_local_value(local, local_slots, value);
     }
 
     Bool store_local_value(
@@ -417,6 +429,7 @@ struct LlvmLowerer: Movable {
 
     Bool lower_blocks(
         mir.MirBody body,
+        backend_abi.FunctionAbi& function_abi,
         ffi.Value llvm_function,
         list.ArrayList<ffi.BasicBlock>& blocks,
         list.ArrayList<ffi.Value>& local_slots
@@ -428,7 +441,7 @@ struct LlvmLowerer: Movable {
             if (!self.lower_statements(body, block, local_slots)) {
                 return false;
             }
-            if (!self.lower_terminator(body, llvm_function, block.terminator, blocks, local_slots)) {
+            if (!self.lower_terminator(body, function_abi, llvm_function, block.terminator, blocks, local_slots)) {
                 return false;
             }
             index = index + 1;
@@ -567,13 +580,22 @@ struct LlvmLowerer: Movable {
 
     Bool lower_terminator(
         mir.MirBody body,
+        backend_abi.FunctionAbi& function_abi,
         ffi.Value llvm_function,
         mir.MirTerminator terminator,
         list.ArrayList<ffi.BasicBlock>& blocks,
         list.ArrayList<ffi.Value>& local_slots
     ) {
         llvm_state.LowerState! state = self.lower_state();
-        return llvm_terminator.lower_terminator(state$.ref(), body, llvm_function, terminator, blocks, local_slots);
+        return llvm_terminator.lower_terminator(
+            state$.ref(),
+            body,
+            function_abi,
+            llvm_function,
+            terminator,
+            blocks,
+            local_slots
+        );
     }
 
     llvm_state.LowerState lower_state() {
@@ -590,7 +612,7 @@ struct LlvmLowerer: Movable {
     }
 
     () add_codegen_error(UInt8[] message, UInt8[] code) {
-        self.ctx.diagnostics.add(
+        self.ctx.store.diagnostics.add(
             diagnostic.Diagnostic(
                 .error,
                 .codegen,
@@ -602,7 +624,7 @@ struct LlvmLowerer: Movable {
     }
 
     () add_function_codegen_error(mir.MirFunction function, UInt8[] message, UInt8[] code) {
-        self.ctx.diagnostics.add(
+        self.ctx.store.diagnostics.add(
             diagnostic.Diagnostic(
                 .error,
                 .codegen,
@@ -614,7 +636,7 @@ struct LlvmLowerer: Movable {
     }
 
     diagnostic.SourceRange def_source_range(qid.DefId def_id) {
-        guard self.ctx.query.source_map.def_span(def_id) is some loc else {
+        guard self.ctx.store.source_map.def_span(def_id) is some loc else {
             return diagnostic.SourceRange();
         }
         guard loc.source_id is some source_id else {

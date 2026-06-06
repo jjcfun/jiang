@@ -15,14 +15,14 @@ HIR 是 resolve 之后的高级语义树。它已经完成名字解析，但仍�
 
 - HIR 不保存 AST id。
 - HIR 保存 source-level 语义结构，不保存 CFG。
-- HIR 不保存 `TypeId`；类型事实由 `TypeCheckResults` 维护。
+- HIR 不保存 `TypeId`；类型事实由 `TypeCheckStore` 维护。
 - HIR definition ownership tree 使用 `HirDef.members` 表达。
 - HIR body 使用 def-local node table，便于后续按 definition 替换和缓存。
 - HIR type ref、pattern、expression 都是 HIR node；type check 才产出 `TypeId`。
 
 ## Store
 
-`HirStore` 挂在 `QuerySystem` 中，保存当前 package 的 HIR facts。它不是文件级 `HirFile`，
+`HirStore` 挂在 `CompilerStore` 中，保存当前 package 的 HIR facts。它不是文件级 `HirFile`，
 也不维护 package 级全量 def 顺序。
 
 当前设计避免依赖一个全量 `def_order` 数组。需要遍历 package definition 时，应从
@@ -33,7 +33,7 @@ HIR 是 resolve 之后的高级语义树。它已经完成名字解析，但仍�
 - `DefId` 是跨阶段 definition 句柄。
 - `HirId` 表示某个 `DefId` owner 内的 local HIR node。
 - `HirId` 不是全局连续 node index，也不是 hash key。
-- 需要从 `HirId` 找类型时查 `TypeCheckResults`，不写回 HIR node。
+- 需要从 `HirId` 找类型时查 `TypeCheckStore`，不写回 HIR node。
 
 ## 不变量
 

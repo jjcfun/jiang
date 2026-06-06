@@ -1,6 +1,6 @@
 # AST 设计
 
-AST 是 `syntax` 阶段的输出，只表达源码语法结构。它不进入长期 `QuerySystem`，
+AST 是 `syntax` 阶段的输出，只表达源码语法结构。它不进入长期 `CompilerStore`，
 也不承担名字解析、类型推断或 lowered IR 的职责。
 
 ## 职责
@@ -41,7 +41,7 @@ AstId            -> 单个 AstFile 内部的有效 node index
 测试、宏展开、REPL 片段使用 virtual source，不引入 none 状态。
 
 当前 pipeline 会为一次 `compile_package` 创建临时 `AstStore`，保存 root/import closure
-内的 AST。`AstStore` 用完即可释放，不挂到 `QuerySystem`。
+内的 AST。`AstStore` 用完即可释放，不挂到 `CompilerStore`。
 
 ## 不变量
 

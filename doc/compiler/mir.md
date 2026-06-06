@@ -1,7 +1,7 @@
 # MIR 设计
 
 MIR 是 type check 之后的可执行语义 IR，用来承接后续 borrow check、drop 插入、优化和 backend。
-MIR 的输入是 HIR、`TypeCheckResults`、monomorph `MonomorphInstances`、`ModuleGraph`
+MIR 的输入是 HIR、`TypeCheckStore`、monomorph `MonomorphStore`、`ModuleGraph`
 和按需查询的 `LayoutStore`；它不回读 AST，不重新 resolve，也不重新 type check。
 
 ## 边界
@@ -11,7 +11,7 @@ MIR 的输入是 HIR、`TypeCheckResults`、monomorph `MonomorphInstances`、`Mo
 - HIR block 是表达式/语句容器；MIR basic block 是 CFG 节点。
 - MIR place 表达语义位置，例如 local、field、index、deref。
 - MIR field projection 保存 field `DefId`、field `TypeId` 和 layout field index，不保存 field offset。
-- 泛型模板函数不直接生成 MIR body；只有 `MonomorphInstances` 中的 concrete function instance
+- 泛型模板函数不直接生成 MIR body；只有 `MonomorphStore` 中的 concrete function instance
   会生成 MIR body。
 - MIR lowering 不自己计算 layout，但可以按需查询 `LayoutStore` 来固定 field index、type info
   和 aggregate representation。layout 不需要在 MIR lowering 前批量完成。
@@ -98,7 +98,7 @@ control flow 由 terminator 表达：
 - `loop` 和 `while` 使用 header / body / exit blocks，并维护 loop target stack。
 - `return expr` 先把 expr lower 到 return local，再生成 return terminator。
 - `switch` 使用 discriminant/tag branch blocks；enum/union variant pattern 的具体选择来自
-  `TypeCheckResults`。
+  `TypeCheckStore`。
 - `for in` 对 range 使用 `[start, end)` index loop；对 array/slice 使用 `len` 和 indexed place。
 - field/member access lowering 生成 concrete `MirPlace` projection。
 - runtime entry lowering 只从 `ModuleGraph.root_module` 查找 language `main`，dependency
@@ -106,12 +106,12 @@ control flow 由 terminator 表达：
 
 ## 泛型实例
 
-MIR lowering 接收 `MonomorphInstances`。非泛型函数按 `DefId` 直接 lower；泛型函数只按 concrete
+MIR lowering 接收 `MonomorphStore`。非泛型函数按 `DefId` 直接 lower；泛型函数只按 concrete
 `InstanceKey` lower。lowering 中的 type substitution 只用于当前 concrete body。
 
 ## 不变量
 
 - MIR 不保存 AST id。
-- MIR local 保留 `TypeId`；类型来源是 `TypeCheckResults`，不是 HIR nullable type 字段。
+- MIR local 保留 `TypeId`；类型来源是 `TypeCheckStore`，不是 HIR nullable type 字段。
 - MIR 不保存 field offset、size、align 或 ABI 信息；这些事实只来自 `LayoutStore`。
 - backend-specific symbol/mangling 不写入 MIR。

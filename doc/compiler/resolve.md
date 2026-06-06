@@ -133,7 +133,7 @@ resolve 的最终输出是 HIR facts：
 lower_module_graph_to_hir(graph)
   -> collect declarations for all graph modules
   -> NameResolver.resolve_references()
-  -> lower resolved AST nodes directly into QuerySystem.hirs
+  -> lower resolved AST nodes directly into CompilerStore.hirs
 ```
 
 resolve 不输出 `ResolvedFile`，也不把 AST 持久化到 query。HIR lowering 只在 resolve 阶段

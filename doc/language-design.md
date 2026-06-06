@@ -56,7 +56,7 @@ Token 只表示词法事实，不承载语义类型。
 
 已确定：
 
-- identifier、关键字和基本类型名在 token 层统一为 `ident`；后续由 `KeywordTable`
+- identifier、关键字和基本类型名在 token 层统一为 `ident`；后续由 `SymbolStore`
   和 resolve/sema 解释。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
   `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、
@@ -640,7 +640,7 @@ draw(x: 1, y: 2);
 ```
 
 type check 会把 call args 重排成函数签名顺序，并把缺失参数替换成默认值。这个结果写入
-`TypeCheckResults.call_args`，MIR lowering 只消费重排后的参数列表，不重新做 overload
+`TypeCheckStore.call_args`，MIR lowering 只消费重排后的参数列表，不重新做 overload
 或默认参数匹配。
 
 同名函数和同名方法允许 overload。默认参数参与 overload 检查：如果两个 overload

@@ -1,6 +1,6 @@
 # Borrow Check 设计
 
-borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCheckResults` 类型事实和
+borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCheckStore` 类型事实和
 `LayoutStore` 中的 concrete layout，不重新推导类型，不重新计算布局。
 
 Jiang 的 borrow check 只处理所有权、move/use-after-move、引用逃逸和析构安全边界。
@@ -12,7 +12,7 @@ unsafe/capability gate；borrow check 只在这些操作影响 owner/lifetime/dr
 ## 输入
 
 - MIR locals、places、moves、borrows、assignments 和 CFG。
-- `TypeCheckResults` 中的 expression/local/member 类型事实。
+- `TypeCheckStore` 中的 expression/local/member 类型事实。
 - `LayoutStore` 中的 copy/drop/layout 相关 concrete type 信息。
 - source map，用于把诊断定位回源码。
 
@@ -49,7 +49,7 @@ Loan
   issued_at: MirLocation
   expires_at: RegionId?
 
-BorrowCheckResults
+BorrowCheckStore
   move_state per block
   active loans per block
   diagnostics
@@ -66,11 +66,11 @@ BorrowCheckResults
 
 ```text
 build move paths from MIR places
-  -> compute copy/drop category from TypeCheckResults + LayoutStore
+  -> compute copy/drop category from TypeCheckStore + LayoutStore
   -> forward dataflow: maybe-uninitialized / maybe-moved
   -> forward dataflow: active loans
   -> validate returns, stores, calls and drops
-  -> emit BorrowCheckResults
+  -> emit BorrowCheckStore
 ```
 
 MIR basic block 是 borrow check 的 CFG 单元。每条 statement/terminator 内部的位置用

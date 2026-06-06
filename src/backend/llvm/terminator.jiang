@@ -10,8 +10,10 @@ import list = "../../support/list.jiang";
 import string = "../../support/string.jiang";
 import table = "../../support/table.jiang";
 import symbol = "../symbol.jiang";
+import backend_abi = "../abi.jiang";
 import types = "../../sema/type.jiang";
 import ffi = "./ffi.jiang";
+import llvm_abi = "./abi.jiang";
 import llvm_state = "./state.jiang";
 import llvm_place = "./place.jiang";
 import llvm_type = "./type.jiang";
@@ -20,6 +22,7 @@ import llvm_value = "./value.jiang";
 public Bool lower_terminator(
     llvm_state.LowerState& state,
     mir.MirBody body,
+    backend_abi.FunctionAbi& function_abi,
     ffi.Value llvm_function,
     mir.MirTerminator terminator,
     list.ArrayList<ffi.BasicBlock>& blocks,
@@ -38,7 +41,7 @@ public Bool lower_terminator(
         return lower_call_terminator(state, body, call_term, blocks, local_slots);
     }
     if (terminator.kind is .return_term(return_term)) {
-        return lower_return_terminator(state, body, return_term, local_slots);
+        return lower_return_terminator(state, body, function_abi, llvm_function, return_term, local_slots);
     }
     if (terminator.kind is .unreachable_term(_)) {
         return ffi.value_valid(ffi.builder_build_unreachable(state.builder));
@@ -124,13 +127,15 @@ Bool lower_call_terminator(
         add_backend_error(state, "failed to lower call callee", "llvm_call_callee_lower_failed");
         return false;
     }
-    list.ArrayList<ffi.Value>! args = lower_call_args(state, body, call_term, local_slots);
-    if (args.len() != expected_call_arg_count(state, body, call_term)) {
+    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
+    backend_abi.FunctionAbi! call_abi = backend_abi.classify_function_type(state.ctx, function_type_id);
+    list.ArrayList<ffi.Value>! args = lower_call_args(state, body, call_term, call_abi$.ref(), local_slots);
+    if (args.len() != call_abi.llvm_param_count()) {
         add_backend_error(state, "failed to lower call arguments", "llvm_call_args_lower_failed");
         return false;
     }
     qid.TypeId result_type = call_result_type(state, body, call_term);
-    ffi.Type function_type = lower_call_function_type(state, body, call_term);
+    ffi.Type function_type = llvm_abi.function_type(state, call_abi$.ref());
     if (!ffi.type_valid(function_type)) {
         add_backend_error(state, "failed to lower call function type", "llvm_call_type_lower_failed");
         return false;
@@ -140,7 +145,8 @@ Bool lower_call_terminator(
         add_backend_error(state, "failed to build llvm call", "llvm_call_build_failed");
         return false;
     }
-    if (!store_call_result(state, body, call_term.destination, result, result_type, local_slots)) {
+    llvm_abi.add_call_attributes(state, result, call_abi$.ref());
+    if (!store_call_result(state, body, call_term.destination, result, result_type, call_abi$.ref(), local_slots)) {
         add_backend_error(state, "failed to store call result", "llvm_call_result_store_failed");
         return false;
     }
@@ -230,9 +236,9 @@ UInt8[] call_callee_error_message(llvm_state.LowerState& state, mir.MirCallCalle
         false
     );
     UInt8[]! message = string.append("call callee is not declared: ", symbol.symbol_name(key));
-    qid.SymbolId name = state.ctx.query.defs.get(function_value.function_def).name.symbol;
+    qid.SymbolId name = state.ctx.store.defs.get(function_value.function_def).name.symbol;
     message = string.append(message, " ");
-    message = string.append(message, state.ctx.query.symbols.text(name));
+    message = string.append(message, state.ctx.store.symbols.text(name));
     return append_type_arg_message(state, message, function_value.type_args);
 }
 
@@ -253,16 +259,16 @@ UInt8[] append_type_arg_message(llvm_state.LowerState& state, UInt8[] message, q
 }
 
 UInt8[] type_arg_message_text(llvm_state.LowerState& state, qid.TypeId type_id) {
-    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    types.TypeInfo info = state.ctx.store.types.get(type_id);
     if (info.data is .named(named)) {
-        qid.SymbolId symbol = state.ctx.query.defs.get(named.def_id).name.symbol;
-        return state.ctx.query.symbols.text(symbol);
+        qid.SymbolId symbol = state.ctx.store.defs.get(named.def_id).name.symbol;
+        return state.ctx.store.symbols.text(symbol);
     }
     return "type";
 }
 
 () add_backend_error(llvm_state.LowerState& state, UInt8[] message, UInt8[] code) {
-    state.ctx.diagnostics.add(
+    state.ctx.store.diagnostics.add(
         diagnostic.Diagnostic(
             .error,
             .codegen,
@@ -277,17 +283,25 @@ list.ArrayList<ffi.Value> lower_call_args(
     llvm_state.LowerState& state,
     mir.MirBody body,
     mir.MirCallTerminator call_term,
+    backend_abi.FunctionAbi& call_abi,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(call_term.args.length);
+    list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(call_abi.llvm_param_count());
+    if (call_abi.result.is_indirect()) {
+        ffi.Value result_pointer = llvm_place.lower_place_pointer(state, body, call_term.destination, local_slots);
+        if (!ffi.value_valid(result_pointer)) {
+            return args$.move();
+        }
+        args.add(result_pointer);
+    }
     Int! index = 0;
     while (index < call_term.args.length) {
-        qid.TypeId param_type = call_param_type(state, body, call_term, index);
-        if (!llvm_type.type_has_abi_value(state, param_type)) {
+        backend_abi.AbiArg param_abi = call_abi.params.get(index);
+        if (param_abi.kind == .none) {
             index = index + 1;
             continue;
         }
-        ffi.Value arg = lower_call_arg(state, body, call_term.args[index], param_type, local_slots);
+        ffi.Value arg = lower_call_arg(state, body, call_term.args[index], param_abi, local_slots);
         if (!ffi.value_valid(arg)) {
             add_call_arg_error(state, call_term.args[index]);
             return args$.move();
@@ -302,10 +316,13 @@ ffi.Value lower_call_arg(
     llvm_state.LowerState& state,
     mir.MirBody body,
     mir.MirOperand operand,
-    qid.TypeId param_type,
+    backend_abi.AbiArg param_abi,
     list.ArrayList<ffi.Value>& local_slots
 ) {
-    if (should_pass_place_pointer(state, body, operand, param_type)) {
+    if (param_abi.kind == .indirect) {
+        return lower_indirect_call_arg(state, body, operand, param_abi.type_id, local_slots);
+    }
+    if (should_pass_reference_place_pointer(state, body, operand, param_abi.type_id)) {
         guard operand_place(operand) is some place else {
             return llvm_value.lower_operand(state, body, operand, local_slots);
         }
@@ -314,7 +331,35 @@ ffi.Value lower_call_arg(
     return llvm_value.lower_operand(state, body, operand, local_slots);
 }
 
-Bool should_pass_place_pointer(
+ffi.Value lower_indirect_call_arg(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirOperand operand,
+    qid.TypeId param_type,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (operand_place(operand) is some place) {
+        return llvm_place.lower_place_pointer(state, body, place, local_slots);
+    }
+    ffi.Value value = llvm_value.lower_operand(state, body, operand, local_slots);
+    if (!ffi.value_valid(value)) {
+        return ffi.Value();
+    }
+    ffi.Type value_type = llvm_type.lower_type(state, param_type);
+    if (!ffi.type_valid(value_type)) {
+        return ffi.Value();
+    }
+    ffi.Value temp = ffi.builder_build_alloca(state.builder, value_type);
+    if (!ffi.value_valid(temp)) {
+        return ffi.Value();
+    }
+    if (!ffi.value_valid(ffi.builder_build_store(state.builder, value, temp))) {
+        return ffi.Value();
+    }
+    return temp;
+}
+
+Bool should_pass_reference_place_pointer(
     llvm_state.LowerState& state,
     mir.MirBody body,
     mir.MirOperand operand,
@@ -340,24 +385,9 @@ mir.MirPlace? operand_place(mir.MirOperand operand) {
 }
 
 Bool type_is_reference(llvm_state.LowerState& state, qid.TypeId type_id) {
-    types.TypeInfo info = state.ctx.query.types.get(type_id);
+    types.TypeInfo info = state.ctx.store.types.get(type_id);
     guard info.data is .handle_type(handle) else { return false; }
     return handle.kind == .reference;
-}
-
-qid.TypeId call_param_type(
-    llvm_state.LowerState& state,
-    mir.MirBody body,
-    mir.MirCallTerminator call_term,
-    Int index
-) {
-    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
-    if (state.ctx.query.types.get(function_type_id).data is .function_type(function_info)) {
-        if (index < function_info.params.length) {
-            return function_info.params[index];
-        }
-    }
-    return llvm_value.operand_type(state, body, call_term.args[index]);
 }
 
 () add_call_arg_error(llvm_state.LowerState& state, mir.MirOperand operand) {
@@ -380,44 +410,13 @@ qid.TypeId call_param_type(
     add_backend_error(state, "failed to lower LLVM call argument", "llvm_call_arg_lower_failed");
 }
 
-ffi.Type lower_call_function_type(
-    llvm_state.LowerState& state,
-    mir.MirBody body,
-    mir.MirCallTerminator call_term
-) {
-    qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
-    guard state.ctx.query.types.get(function_type_id).data is .function_type(function_info) else {
-        return ffi.Type();
-    }
-    ffi.Type return_type = llvm_type.lower_type(state, function_info.result);
-    if (!ffi.type_valid(return_type)) {
-        return ffi.Type();
-    }
-    list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(function_info.params.length);
-    Int! index = 0;
-    while (index < function_info.params.length) {
-        qid.TypeId arg_type = function_info.params[index];
-        if (!llvm_type.type_has_abi_value(state, arg_type)) {
-            index = index + 1;
-            continue;
-        }
-        ffi.Type param_type = llvm_type.lower_type(state, arg_type);
-        if (!ffi.type_valid(param_type)) {
-            return ffi.Type();
-        }
-        params.add(param_type);
-        index = index + 1;
-    }
-    return ffi.function_type(return_type, params$.ref());
-}
-
 qid.TypeId call_result_type(
     llvm_state.LowerState& state,
     mir.MirBody body,
     mir.MirCallTerminator call_term
 ) {
     qid.TypeId function_type_id = call_callee_type(state, body, call_term.callee);
-    if (state.ctx.query.types.get(function_type_id).data is .function_type(function_info)) {
+    if (state.ctx.store.types.get(function_type_id).data is .function_type(function_info)) {
         return function_info.result;
     }
     return local_type(state, body, call_term.destination.local_id);
@@ -434,24 +433,7 @@ qid.TypeId call_callee_type(
     if (callee is .indirect_operand(operand)) {
         return llvm_value.operand_type(state, body, operand);
     }
-    return state.ctx.query.types.invalid_type();
-}
-
-Int expected_call_arg_count(
-    llvm_state.LowerState& state,
-    mir.MirBody body,
-    mir.MirCallTerminator call_term
-) {
-    Int! count = 0;
-    Int! index = 0;
-    while (index < call_term.args.length) {
-        qid.TypeId param_type = call_param_type(state, body, call_term, index);
-        if (llvm_type.type_has_abi_value(state, param_type)) {
-            count = count + 1;
-        }
-        index = index + 1;
-    }
-    return count;
+    return state.ctx.store.types.invalid_type();
 }
 
 Bool store_call_result(
@@ -460,8 +442,12 @@ Bool store_call_result(
     mir.MirPlace destination,
     ffi.Value result,
     qid.TypeId result_type,
+    backend_abi.FunctionAbi& call_abi,
     list.ArrayList<ffi.Value>& local_slots
 ) {
+    if (call_abi.result.is_indirect()) {
+        return true;
+    }
     if (llvm_type.type_is_unit_or_never(state, result_type)) {
         return true;
     }
@@ -475,6 +461,8 @@ Bool store_call_result(
 Bool lower_return_terminator(
     llvm_state.LowerState& state,
     mir.MirBody body,
+    backend_abi.FunctionAbi& function_abi,
+    ffi.Value llvm_function,
     mir.MirReturnTerminator return_term,
     list.ArrayList<ffi.Value>& local_slots
 ) {
@@ -482,10 +470,33 @@ Bool lower_return_terminator(
         return ffi.value_valid(ffi.builder_build_return_void(state.builder));
     }
     qid.TypeId return_type = local_type(state, body, body.return_local);
-    if (!llvm_type.type_has_abi_value(state, return_type)) {
+    if (function_abi.result.kind == .none || !llvm_type.type_has_abi_value(state, return_type)) {
         return ffi.value_valid(ffi.builder_build_return_void(state.builder));
     }
+    if (function_abi.result.is_indirect()) {
+        return lower_indirect_return_value(state, body, llvm_function, local_slots);
+    }
     return lower_return_value(state, body, local_slots);
+}
+
+Bool lower_indirect_return_value(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    ffi.Value llvm_function,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    mir.MirLocalDecl return_local = body.locals[body.return_local.to_index()];
+    ffi.Value value = llvm_place.lower_local_load(state, return_local, local_slots);
+    if (!ffi.value_valid(value)) {
+        add_backend_error(state, "failed to load LLVM indirect return value", "llvm_indirect_return_load_failed");
+        return false;
+    }
+    ffi.Value return_pointer = ffi.function_param(llvm_function, 0);
+    if (!ffi.value_valid(ffi.builder_build_store(state.builder, value, return_pointer))) {
+        add_backend_error(state, "failed to store LLVM indirect return value", "llvm_indirect_return_store_failed");
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_return_void(state.builder));
 }
 
 Bool lower_return_value(

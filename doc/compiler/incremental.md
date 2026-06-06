@@ -74,8 +74,8 @@ generic HIR template。
 `.ji` 不保存：
 
 - session-local ID。
-- `TypeCheckResults`。
-- `MonomorphInstances`。
+- `TypeCheckStore`。
+- `MonomorphStore`。
 - concrete MIR。
 - borrow check 临时状态。
 - layout 临时状态。
@@ -200,7 +200,7 @@ build_module_graph(root):
 - `ModuleGraph`
 - `ResolveStore`
 - `HirStore`
-- `TypeCheckResults`
+- `TypeCheckStore`
 - `LayoutStore`
 - `MirStore`
 
@@ -209,20 +209,20 @@ build_module_graph(root):
 `CompilerContext.begin_compilation` 是当前实现里的轮次边界。它保留：
 
 - `SourceStore`
-- `SymbolTable` / `KeywordTable`
+- `SymbolStore`
 - `SourceArtifactCache`
 - `ObjectArtifactCache`
-- `IncrementalSymbolIndex`
+- `IncrementalSymbolStore`
 - `QueryDependencyGraph`
 
 同时重建：
 
 - `SourceMap`
-- `DefTable`
-- `TypeTable`
+- `DefStore`
+- `TypeStore`
 - `ResolveStore`
 - `HirStore`
-- `TypeCheckResults`
+- `TypeCheckStore`
 - `LayoutStore`
 
 因此同一个 context 可以进入下一轮 package 编译，但旧的 `DefId`、`HirId`、`TypeId`
@@ -232,7 +232,7 @@ build_module_graph(root):
 
 - `ResolveStore` 可以重建当前 `DefId -> DefRecord`，长期层保存 stable id 与当前 def 的对齐结果。
 - `HirStore` 可以重建当前 HIR，长期层保存 signature/body fingerprint。
-- `TypeCheckResults` 是 HIR -> MIR side table，不作为长期 cache artifact。
+- `TypeCheckStore` 是 HIR -> MIR side table，不作为长期 cache artifact。
 - `LayoutStore` 按 session 重建；后续如果要缓存 layout fact，key 不能包含 session-local `TypeId`。
 - `MirStore` 按 session 重建；长期层只保存 object artifact key 和 `.o` 路径。
 
@@ -348,7 +348,7 @@ StableInstanceKey
   compiler_version
 ```
 
-当前 session 内的 `MonomorphInstances` 仍然使用 `DefId + TypeId[]` 做内存去重。这个 key
+当前 session 内的 `MonomorphStore` 仍然使用 `DefId + TypeId[]` 做内存去重。这个 key
 不能写入本地 cache。`StableInstanceKey` 只用于 object cache，type args 必须先转换成不含
 session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/object_key_builder.jiang`。
 
