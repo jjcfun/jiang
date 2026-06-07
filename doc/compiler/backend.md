@@ -62,7 +62,7 @@ attribute。LLVM declaration 和 call site 必须使用同一个 plan。
 - function symbol key / mangling，包含 package/module/concrete type args。
 - LLVM IR / object file / executable emission。
 - target triple / data layout 接入。
-- struct/record/tuple/array aggregate。
+- struct/tuple/array aggregate。
 - enum/union tag 与 union payload。
 - branch、switch、call、return、range/array/slice loop。
 

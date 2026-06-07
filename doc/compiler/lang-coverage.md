@@ -26,7 +26,7 @@
 | lifetime annotation | `lifetime` | partial | return/self 组合、非法 ordering |
 | type postfix | `type` | covered | pointer-to-pointer ABI 场景已有基础覆盖 |
 | tuple / unit type | `type`, `aggregate` | partial | 嵌套 tuple type |
-| struct / record | `nominal`, `aggregate` | covered | record 专属语义后续补充 |
+| struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
 | enum | `nominal`, `control_flow` | covered | underlying int 类型的更多边界值 |
 | union | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
 | trait / extend | `generic` | partial | static trait method、extend private/public member |

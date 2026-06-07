@@ -82,7 +82,7 @@ aggregate layout 第一版使用自然 ABI 规则：每个 field offset 按 fiel
 
 layout 需要独立 active stack：
 
-- by-value struct/record 自递归是 layout cycle。
+- by-value struct 自递归是 layout cycle。
 - pointer/reference/slice/function pointer 会打断 by-value layout cycle。
 - cycle diagnostic 应通过 source map 指向参与 cycle 的 nominal definitions。
 

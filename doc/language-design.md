@@ -59,7 +59,7 @@ Token 只表示词法事实，不承载语义类型。
 - identifier、关键字和基本类型名在 token 层统一为 `ident`；后续由 `SymbolStore`
   和 resolve/sema 解释。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
-  `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`record`、`trait`、
+  `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`trait`、
   `extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、
   `defer`、`throw`、`true`、`false`、`null`、`self`、`some`、`Self`。
 - 字符字面量使用单引号，例如 `'a'`。
@@ -210,7 +210,7 @@ Int& ref = value$.ref(); // 允许：reference 结构相同，pointee 的 mutabl
 
 这条规则只属于写入目标的场景，不能把 `Int` 与 `Int!` 视为全局等价类型。二元运算、分支合并、重载判定中不应该因为某一侧带 `!` 就把两种类型普遍合并；这些上下文需要先有明确的 expected type 或目标位置，再按上面的写入规则检查。
 
-类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 record 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
+类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 struct 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
 
 解构语法可以为每个解构出来的绑定重新指定可变性，因为解构本质上是在声明多个局部绑定。但这种可变性也只作用于对应元素类型的最外层，不能深入修改该元素类型的内部层级：
 
@@ -222,7 +222,7 @@ Int& ref = value$.ref(); // 允许：reference 结构相同，pointee 的 mutabl
 (_! inferred_array) = arrays; // 只能让 inferred_array 这个外层绑定可变
 ```
 
-内部成员的可变性来自类型定义本身。对于 `struct` / `record` 字段、tuple 元素、union payload、数组元素，只要成员类型在其定义处是可变的，该成员就可以通过 owner 或 `T&` 引用写入；这不受外层变量本身是否带 `!` 影响，也不由引用类型提供额外的只读/独占权限。
+内部成员的可变性来自类型定义本身。对于 `struct` 字段、tuple 元素、union payload、数组元素，只要成员类型在其定义处是可变的，该成员就可以通过 owner 或 `T&` 引用写入；这不受外层变量本身是否带 `!` 影响，也不由引用类型提供额外的只读/独占权限。
 
 ```jiang
 struct User {
@@ -238,7 +238,7 @@ User& ref = user$.ref();
 ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明为 ! 的字段
 ```
 
-数组、tuple、union、record 也遵循同一条分层规则：外层变量或引用 slot 的可变性只控制该 slot 是否可整体重赋值；成员或元素能否被修改，由成员或元素类型自己的可变性决定。`T&` 不提供数据竞争保护，也不阻止写入内部 `!` 成员。
+数组、tuple、union 和 struct 也遵循同一条分层规则：外层变量或引用 slot 的可变性只控制该 slot 是否可整体重赋值；成员或元素能否被修改，由成员或元素类型自己的可变性决定。`T&` 不提供数据竞争保护，也不阻止写入内部 `!` 成员。
 
 ## 指针、引用、数组和 Slice
 
@@ -371,7 +371,7 @@ struct Node: Movable {
 
 implicit copy / Movable 规则：
 
-- 普通 `struct`、`record`、`union` 默认可以隐式 copy。
+- 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
 - 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
 - `T&`、`T&!`、`T[*]`、`T*`、`T[]` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
@@ -420,7 +420,7 @@ a.length; // 编译错误：a 已经 move
 
 常用 lifetime 名：
 
-- `self`：当前 `struct` / `record` / `union` 实例 lifetime。
+- `self`：当前 `struct` / `union` 实例 lifetime。
 - `return`：函数返回值 lifetime。
 - 参数名：参数或参数引用目标 lifetime。
 - 字段名：该字段引用目标 lifetime。
@@ -507,7 +507,6 @@ lifetime 和 drop safety。
 - global declaration: `Type name = expr;`
 - function declaration / definition
 - `struct`
-- `record`
 - `enum`
 - `union`
 - `trait`
@@ -658,12 +657,9 @@ T add<T>(T left, T right);
 `init` / `deinit` 是目标语言的一部分。`init(...)` 定义构造函数，
 `deinit()` 定义析构逻辑；构造 sugar 使用 `Type(...)`，堆分配构造使用 `new Type(...)`。
 
-## Struct、Record、Enum、Union
+## Struct、Enum、Union
 
 `struct` 用于普通名义类型，支持实例方法、static 方法、`init` 和 `deinit`。
-
-`record` 是偏数据记录的名义类型。0.2 中 record 与 struct 使用相同的字段布局、可变性规则和
-drop 规则，但 record 只承诺字段字面量初始化，不承诺自定义生命周期入口。
 
 `enum` 表示有限命名成员集合。
 
@@ -671,7 +667,7 @@ drop 规则，但 record 只承诺字段字面量初始化，不承诺自定义�
 
 union variant 和普通/static method 共用 `Type.member` 访问面，不能同名。
 
-union 的 public 规则类似 record：字段和 variant 的外部可见性由外层类型是否 public 控制。
+union variant 的外部可见性由外层类型是否 public 控制。
 
 0.2 的命名空间规则：
 

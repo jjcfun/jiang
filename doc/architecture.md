@@ -210,7 +210,7 @@ CompilerStore
 
 ## CompilerStore
 
-`CompilerStore` 是跨阶段事实集合的生命周期所有者。具体 record/key 类型仍由 owner 模块定义。
+`CompilerStore` 是跨阶段事实集合的生命周期所有者。具体 entry/key 类型仍由 owner 模块定义。
 
 - `store/api.jiang` 定义 `CompilerStore`。
 - `resolve/interner.jiang` 定义 `SymbolStore`；关键字分类是 symbol 的附加事实。

@@ -244,15 +244,13 @@ name        <- ident / "self"
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 
-## struct / record
+## struct
 
 顶层可见性写在外层 `decl` 的 `decl_modifier` 中，例如
 `public struct User { ... }`。
 
 ```peg
 struct_decl <- "struct" name generic_params? trait_list? struct_body
-
-record_decl <- "record" name generic_params? trait_list? struct_body
 
 trait_list  <- ":" path ("," path)*
 

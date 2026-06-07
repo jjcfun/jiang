@@ -46,8 +46,9 @@ public struct BodyCheck: Movable {
             return;
         }
         self.check_parameter_defaults(hir_def);
+        self.check_field_default(hir_def);
         if (hir_def.body is some body) {
-            qid.TypeId body_type = self.check_node(body.root);
+            qid.TypeId body_type = self.check_decl_body(def_id, hir_def, body.root);
             self.check_decl_body_result(def_id, hir_def, body.root, body_type);
         }
         Int! index = 0;
@@ -76,6 +77,25 @@ public struct BodyCheck: Movable {
         }
     }
 
+    // 字段默认值参与默认构造，所以需要和普通参数默认值一样先按字段类型检查。
+    () check_field_default(hir.HirDef& hir_def) {
+        if (hir_def.decl.kind != .field_decl) {
+            return;
+        }
+        guard hir_def.decl.field_default is some value else {
+            return;
+        }
+        qid.TypeId expected = self.type_ops.type_for_def(hir_def.def_id);
+        qid.TypeId value_type = self.check_node_expected(value, expected);
+        self.type_ops.expect_value_assignable(
+            value,
+            expected,
+            value_type,
+            "field default value does not match field type",
+            "field_default_type_mismatch"
+        );
+    }
+
     () check_parameter_default_value(hir.HirFunctionSignature signature, Int param_index, hir.HirId value) {
         if (!self.supported_parameter_default(value)) {
             self.type_ops.add_node_error(
@@ -100,6 +120,28 @@ public struct BodyCheck: Movable {
     Bool supported_parameter_default(hir.HirId value) {
         hir.HirNode node = self.state.hirs.node(value);
         return node.data is .literal(_);
+    }
+
+    qid.TypeId check_decl_body(qid.DefId def_id, hir.HirDef& hir_def, hir.HirId root) {
+        if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
+            qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(def_id));
+            return self.check_node_expected(root, expected);
+        }
+        if (hir_def.decl.kind == .global_decl) {
+            return self.check_global_body(hir_def, root);
+        }
+        return self.check_node(root);
+    }
+
+    qid.TypeId check_global_body(hir.HirDef& hir_def, hir.HirId root) {
+        guard hir_def.decl.type_ref is some type_ref else {
+            return self.check_node(root);
+        }
+        if (self.type_ops.type_ref_is_inferred_array(type_ref)) {
+            return self.check_node(root);
+        }
+        qid.TypeId expected = self.type_ops.check_type_ref(type_ref);
+        return self.check_node_expected(root, expected);
     }
 
     () check_decl_body_result(
@@ -277,11 +319,37 @@ public struct BodyCheck: Movable {
                 return expected_type;
             }
         }
+        if (node.data is .block(block)) {
+            qid.TypeId type_id = self.check_block_expected(block, expected_type);
+            self.state.results.set_node_type(node_id, type_id);
+            return type_id;
+        }
         if (node.data is .call(call)) {
+            if (self.expected_type_constructor_callee(call.callee)) {
+                qid.TypeId type_id = self.check_type_constructor_call_with_result(node_id, call, expected_type);
+                self.state.results.set_node_type(node_id, type_id);
+                return type_id;
+            }
             if (self.dot_prefix_variant_def(call.callee, expected_type) is some variant_def) {
                 qid.TypeId type_id = self.check_selected_variant_call(node_id, call, variant_def);
                 self.state.results.set_node_type(node_id, type_id);
                 return type_id;
+            }
+        }
+        if (node.data is .unary(unary)) {
+            if (unary.op == .new_value) {
+                if (self.owner_pointer_expected_type(expected_type) is some value_type) {
+                    qid.TypeId checked = self.check_node_expected(unary.value, value_type);
+                    self.type_ops.expect_value_assignable(
+                        unary.value,
+                        value_type,
+                        checked,
+                        "new initializer type does not match expected pointer element type",
+                        "new_initializer_type_mismatch"
+                    );
+                    self.state.results.set_node_type(node_id, expected_type);
+                    return expected_type;
+                }
             }
         }
         if (node.data is .member_access(_)) {
@@ -299,6 +367,20 @@ public struct BodyCheck: Movable {
             }
         }
         return self.check_node(node_id);
+    }
+
+    qid.TypeId? owner_pointer_expected_type(qid.TypeId expected_type) {
+        types.TypeInfo info = self.state.store.types.get(expected_type);
+        guard info.data is .handle_type(handle) else { return null; }
+        if (handle.kind == .owner_pointer) {
+            return handle.element;
+        }
+        return null;
+    }
+
+    Bool expected_type_constructor_callee(hir.HirId callee_id) {
+        hir.HirNode callee = self.state.hirs.node(callee_id);
+        return callee.data is .infer_type_ref;
     }
 
     qid.TypeId? expected_array_literal_type(
@@ -376,6 +458,21 @@ public struct BodyCheck: Movable {
         }
         if (block.result is some result) {
             return self.check_node(result);
+        }
+        return self.state.store.types.unit_type();
+    }
+
+    qid.TypeId check_block_expected(hir.HirBlock block, qid.TypeId expected_type) {
+        Int! index = 0;
+        while (index < block.statements.length) {
+            qid.TypeId statement_type = self.check_node(block.statements[index]);
+            if (self.type_ops.is_never_type(statement_type)) {
+                return statement_type;
+            }
+            index = index + 1;
+        }
+        if (block.result is some result) {
+            return self.check_node_expected(result, expected_type);
         }
         return self.state.store.types.unit_type();
     }
@@ -691,7 +788,7 @@ public struct BodyCheck: Movable {
 
     Bool namespace_type_member_can_be_used(qid.DefId member_def) {
         def.DefKind kind = self.state.store.defs.get(member_def).kind;
-        if (kind == .struct_def || kind == .record_def) { return true; }
+        if (kind == .struct_def) { return true; }
         if (kind == .enum_def || kind == .union_def) { return true; }
         if (kind == .trait_def || kind == .builtin_type_def) { return true; }
         return kind == .alias_def;
@@ -1154,10 +1251,10 @@ public struct BodyCheck: Movable {
             return self.state.store.types.invalid_type();
         }
         def.DefKind kind = self.state.store.defs.get(named.def_id).kind;
-        if (kind != .struct_def && kind != .record_def) {
+        if (kind != .struct_def) {
             self.type_ops.add_node_error(
                 literal.type_ref,
-                "field literal target must be struct or record",
+                "field literal target must be struct",
                 "expected_field_literal_type"
             );
             self.check_struct_literal_values(literal);
@@ -1779,7 +1876,7 @@ public struct BodyCheck: Movable {
         types.TypeInfo candidate_info = self.state.store.types.get(candidate_type);
         guard candidate_info.data is .function_type(function_type) else { return false; }
         list.ArrayList<hir.HirId>! values = self.empty_argument_values(signature);
-        if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false)) {
+        if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false, true)) {
             return false;
         }
         return self.call_args_match_candidate_types(call, candidate_def, type_args, function_type, values$.ref());
@@ -2003,7 +2100,7 @@ public struct BodyCheck: Movable {
         hir.HirFunctionSignature signature
     ) {
         list.ArrayList<hir.HirId>! values = self.empty_argument_values(signature);
-        if (!self.build_ordered_call_args(node_id, call, signature, values$.ref(), true)) {
+        if (!self.build_ordered_call_args(node_id, call, signature, values$.ref(), true, true)) {
             return false;
         }
         self.state.results.set_call_args(node_id, values$.ref());
@@ -2015,13 +2112,23 @@ public struct BodyCheck: Movable {
         hir.HirCall call,
         hir.HirFunctionSignature signature,
         list.ArrayList<hir.HirId>& values,
-        Bool emit_errors
+        Bool emit_errors,
+        Bool allow_positional
     ) {
         Bool! seen_named = false;
         Int! index = 0;
         while (index < call.args.length) {
             hir.HirCallArg arg = call.args[index];
-            if (!self.place_call_arg(node_id, arg, index, signature, values, seen_named, emit_errors)) {
+            if (!self.place_call_arg(
+                node_id,
+                arg,
+                index,
+                signature,
+                values,
+                seen_named,
+                emit_errors,
+                allow_positional
+            )) {
                 return false;
             }
             seen_named = seen_named || arg.label != null;
@@ -2040,9 +2147,20 @@ public struct BodyCheck: Movable {
         hir.HirFunctionSignature signature,
         list.ArrayList<hir.HirId>& values,
         Bool seen_named,
-        Bool emit_errors
+        Bool emit_errors,
+        Bool allow_positional
     ) {
         guard arg.label is some label else {
+            if (!allow_positional) {
+                if (emit_errors) {
+                    self.type_ops.add_node_error(
+                        arg.value,
+                        "default initializer arguments must use field labels",
+                        "default_initializer_requires_labels"
+                    );
+                }
+                return false;
+            }
             if (seen_named) {
                 if (emit_errors) {
                     self.type_ops.add_node_error(
@@ -2262,6 +2380,14 @@ public struct BodyCheck: Movable {
         // `Type(...)` 不是普通 function call：callee 是 type-ref。
         // 这里先解析出 owner type，再从隐藏 init_def 集合中选择构造器。
         qid.TypeId result_type = self.type_constructor_result_type(call);
+        return self.check_type_constructor_call_with_result(node_id, call, result_type);
+    }
+
+    qid.TypeId check_type_constructor_call_with_result(
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.TypeId result_type
+    ) {
         if (self.type_constructor_init_def(result_type, call) is some init_def) {
             self.state.results.select_member(call.callee, init_def);
             self.state.results.select_call_target(node_id, init_def);
@@ -2358,6 +2484,15 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId type_constructor_result_type(hir.HirCall call) {
+        if (self.expected_type_constructor_callee(call.callee)) {
+            self.type_ops.check_type_args(call.type_args);
+            self.type_ops.add_node_error(
+                call.callee,
+                "expected-type constructor requires a contextual type",
+                "expected_type_constructor_requires_context"
+            );
+            return self.state.store.types.invalid_type();
+        }
         if (call.type_args.length == 0) {
             return self.type_ops.check_type_ref(call.callee);
         }
@@ -2411,17 +2546,110 @@ public struct BodyCheck: Movable {
         if (self.type_constructor_has_init(named.def_id)) {
             return false;
         }
-        if (call.args.length != 0) {
-            return false;
-        }
+        self.check_default_constructor_args(node_id, call, named);
         self.state.results.mark_expr_lowering(node_id, .default_nominal);
         return true;
+    }
+
+    () check_default_constructor_args(hir.HirId node_id, hir.HirCall call, types.NamedType named) {
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>();
+        Int! index = 0;
+        while (index < call.args.length) {
+            self.check_default_constructor_arg(call, index, named);
+            index = index + 1;
+        }
+        guard self.state.hirs.def(named.def_id) is some owner_hir else { return; }
+        index = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            if (self.state.store.defs.get(member_def).kind == .field_def) {
+                self.check_default_constructor_field_value(node_id, call, named, member_def, values$.ref());
+            }
+            index = index + 1;
+        }
+        self.state.results.set_call_args(node_id, values$.ref());
+    }
+
+    () check_default_constructor_arg(hir.HirCall call, Int arg_index, types.NamedType named) {
+        hir.HirCallArg arg = call.args[arg_index];
+        guard arg.label is some label else {
+            self.type_ops.add_node_error(
+                arg.value,
+                "default initializer arguments must use field labels",
+                "default_initializer_requires_labels"
+            );
+            return;
+        }
+        if (self.default_constructor_arg_seen_before(call, arg_index, label)) {
+            self.type_ops.add_node_error(arg.value, "duplicate field initializer", "duplicate_field_initializer");
+            return;
+        }
+        guard self.field_def_for_struct_literal(named.def_id, label) is some field_def else {
+            self.type_ops.add_node_error(arg.value, "unknown field initializer", "unknown_field_initializer");
+            return;
+        }
+        if (!self.type_ops.def_accessible_from(field_def, arg.value.owner_def)) {
+            self.type_ops.add_node_error(arg.value, "private definition is not accessible", "private_access");
+            return;
+        }
+    }
+
+    Bool default_constructor_arg_seen_before(hir.HirCall call, Int arg_index, qid.SymbolId label) {
+        Int! index = 0;
+        while (index < arg_index) {
+            if (call.args[index].label is some previous) {
+                if (qid.SymbolId.equal(previous$.ref(), label$.ref())) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () check_default_constructor_field_value(
+        hir.HirId node_id,
+        hir.HirCall call,
+        types.NamedType named,
+        qid.DefId field_def,
+        list.ArrayList<hir.HirId>& values
+    ) {
+        guard self.default_constructor_field_value(call, field_def) is some value else {
+            self.type_ops.add_node_error(node_id, "missing field initializer", "missing_field_initializer");
+            values.add(self.invalid_hir_id());
+            return;
+        }
+        qid.TypeId field_type = self.struct_literal_field_type(named, field_def);
+        qid.TypeId value_type = self.check_node_expected(value, field_type);
+        self.type_ops.expect_value_assignable(
+            value,
+            field_type,
+            value_type,
+            "field initializer type does not match field type",
+            "field_initializer_type_mismatch"
+        );
+        values.add(value);
+    }
+
+    hir.HirId? default_constructor_field_value(hir.HirCall call, qid.DefId field_def) {
+        qid.SymbolId symbol = self.state.store.defs.get(field_def).name.symbol;
+        Int! index = 0;
+        while (index < call.args.length) {
+            if (call.args[index].label is some label) {
+                if (qid.SymbolId.equal(label$.ref(), symbol$.ref())) {
+                    return call.args[index].value;
+                }
+            }
+            index = index + 1;
+        }
+        guard self.state.hirs.def(field_def) is some field_hir else { return null; }
+        return field_hir.decl.field_default;
     }
 
     Bool default_constructor_owner_kind(qid.DefId def_id) {
         def.DefKind kind = self.state.store.defs.get(def_id).kind;
         if (kind == .struct_def) { return true; }
-        return kind == .record_def;
+        return false;
     }
 
     Bool type_constructor_has_init(qid.DefId owner_def) {
@@ -2465,7 +2693,7 @@ public struct BodyCheck: Movable {
         guard self.state.hirs.def(init_def) is some init_hir else { return false; }
         guard init_hir.decl.function_signature is some signature else { return false; }
         list.ArrayList<hir.HirId>! values = self.empty_argument_values(signature);
-        return self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false);
+        return self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false, true);
     }
 
     () check_constructor_args(hir.HirId node_id, qid.TypeId result_type, hir.HirCall call, qid.DefId init_def) {
@@ -2939,7 +3167,7 @@ public struct BodyCheck: Movable {
 
     Bool named_type_has_aggregate_equality(qid.DefId def_id) {
         def.DefKind kind = self.state.store.defs.get(def_id).kind;
-        if (kind == .struct_def || kind == .record_def) { return true; }
+        if (kind == .struct_def) { return true; }
         return kind == .union_def;
     }
 

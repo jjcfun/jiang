@@ -87,9 +87,9 @@ mutable_items[0] = 10;
 mutable_items = [4, 5, 6];
 ```
 
-如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导默认得到不可变绑定；需要可变绑定时显式写 `_!` 或写出带 `!` 的左侧类型。类型推导会保留表达式的自然类型，不自动解引用 `T^` / `T&`；需要值类型时写出 expected type。类型推导只能影响推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 record 字段等内部层级的可变性。
+如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导默认得到不可变绑定；需要可变绑定时显式写 `_!` 或写出带 `!` 的左侧类型。类型推导会保留表达式的自然类型，不自动解引用 `T^` / `T&`；需要值类型时写出 expected type。类型推导只能影响推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 struct 字段等内部层级的可变性。
 
-结构体、record、tuple、union 和数组的内部成员是否可修改，由成员类型自己的可变性决定，不由外层变量是否带 `!` 决定。
+结构体、tuple、union 和数组的内部成员是否可修改，由成员类型自己的可变性决定，不由外层变量是否带 `!` 决定。
 
 ### 基本类型
 
@@ -543,7 +543,7 @@ Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源�
 - `T[]` 本身不拥有整段 buffer；drop slice 变量时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
 - 经过 `T*` / `T[*]` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
-- 普通 `struct`、`record`、`union` 默认可以隐式 copy。
+- 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
 - `T&`、`T&!`、`T[*]`、`T*`、`T[]` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
@@ -1268,10 +1268,10 @@ struct 可以自定义 `init` 函数。
   - `new Int`
   - `new Int(123)`
   - `new Point(...)`
-  - `new Point { ... }`
+  - `new .(...)`
   - `new [1, 2, 3]`
 - `new Point(...)` 会先按上面的规则构造出 `Point` 值，再把这个值放到堆上
-- `struct` / `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
+- `struct` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
 
 ```c
 struct Point {
@@ -1291,9 +1291,9 @@ struct Point {
 ```
 
 ```c
-Point p1 = Point(1, 2);
+Point p1 = Point(x: 1, y: 2);
 Point p2 = Point(3);
-Point^ p3 = new Point(4, 5);
+Point^ p3 = new .(x: 4, y: 5);
 ```
 
 #### deinit函数
@@ -1336,7 +1336,7 @@ struct Buffer {
 - `union`：支持 static 方法、实例方法
 - `enum`：支持 static 方法、实例方法
 
-`init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。`record` / `union` / `enum` 不承诺自定义生命周期入口。
+`init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。`union` / `enum` 不承诺自定义生命周期入口。
 union variant 和普通/static method 共用 `Type.member` 访问面，不能同名。
 
 ```c
@@ -1448,30 +1448,6 @@ print("user age = %d", user1.age); // 输出：user age = 19
 user1.id = 200; // 编译错误，不可变属性无法修改
 
 ```
-
-### record
-
-`record` 是轻量数据类型，使用字段字面量初始化。0.2 中 record 与 struct 使用相同的字段布局、
-可变性规则和 drop 规则，但 record 只承诺字段字面量初始化，不承诺自定义生命周期入口：
-
-```c
-record Point {
-  Int x;
-  Int y = 2;
-}
-
-Point p1 = Point { x: 40 };
-Point p2 = { x: 1, y: 2 };
-```
-
-规则：
-
-- `record` 支持 `Type { field: value }`
-- 当 expected type 已知且为 `record` 时，允许直接写 `{ field: value }`
-- `record` 字段支持默认值
-- `record` 字段声明支持同类型多名字写法，例如 `Int x, y, z;`
-- `struct` 只有在没有定义 `init` 时才支持 `Type { ... }`
-- `record` 和 `struct` 的字段 layout、可变性和 drop 规则在 0.2 中保持一致
 
 局部变量声明也支持同类型多名字写法，但它只是语法糖，每个变量仍然必须显式初始化：
 
@@ -1604,7 +1580,7 @@ union ImplicitResult {
 
 - `union(TagEnum)` 的 variant 名必须能对应到 `TagEnum` 的成员。
 - 省略 tag enum 时，编译器按 variant 声明生成隐式 tag。
-- `union` variant 的可见性规则类似 `record` 字段：variant 本身不单独声明 `public` / `private`，只由外层 `union` 是否公开决定。
+- `union` variant 本身不单独声明 `public` / `private`，只由外层 `union` 是否公开决定。
 - 如果 `union` 是 `public`，它的 variant 属于公开类型表面；如果 `union` 不公开，variant 也只在模块内可见。
 - 如果需要隐藏 union 的部分实现细节，优先用 public `struct` 包装 private union/data。
 
@@ -1620,7 +1596,6 @@ union MyUnion {
 `union` 的 payload 当前支持任意普通类型，包括：
 
 - `struct`
-- `record`
 - tuple
 - array
 - slice
