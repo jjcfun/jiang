@@ -1482,7 +1482,7 @@ Int a = 1, b = 2, c = 3;
 ### 枚举类型（Enum）
 
 ```c
-// 定义枚举类型，枚举值默认从0开始，类型为Int
+// 定义枚举类型，枚举值默认从0开始，底层类型为Int32
 enum PetKind {
 	dog,
   cat,
@@ -1505,7 +1505,7 @@ enum(UInt16) HttpStatus {
 }
 
 // 获取枚举值
-print("enum value: %d", PetKind.dog.value)
+print("enum value: %d", Int(PetKind.dog))
 
 // 初始化
 Priority priority = Priority.medium
@@ -1517,9 +1517,9 @@ Priority? parsed = Priority.init?(2)
 HttpStatus status = .ok
 
 switch (priority) {
-	.low => print("priority value: %d", priority.value)
-  .medium => print("priority value: %d", priority.value)
-  .high => print("priority value: %d", priority.value)
+	.low => print("priority value: %d", Int(priority))
+  .medium => print("priority value: %d", Int(priority))
+  .high => print("priority value: %d", Int(priority))
 }
 ```
 

@@ -4,7 +4,7 @@
 // 再通过 keyword store 识别。
 
 import ast = "./ast.jiang";
-import error = "./error.jiang";
+import syntax_diagnostics = "./diagnostics.jiang";
 import token = "./token.jiang";
 import list = "../support/list.jiang";
 import store_api = "../store/api.jiang";
@@ -13,19 +13,13 @@ import source = "../source/source.jiang";
 
 public struct ParseResult: Movable {
     public ast.AstUnit unit;
-    public list.ArrayList<error.ParseError> errors;
 
-    public init(ast.AstUnit unit, list.ArrayList<error.ParseError> errors) {
+    public init(ast.AstUnit unit) {
         self.unit = unit$.move();
-        self.errors = errors$.move();
     }
 
     public ast.AstUnit take_unit() {
         return self.unit.take();
-    }
-
-    public list.ArrayList<error.ParseError> take_errors() {
-        return self.errors.take();
     }
 }
 
@@ -35,10 +29,9 @@ public ParseResult parse_tokens(
     source.SourceId source_id
 ) {
     ast.AstUnit! unit = ast.AstUnit(source_id);
-    list.ArrayList<error.ParseError>! errors = list.ArrayList<error.ParseError>();
-    Parser! parser = Parser(store, tokens, unit$.ref(), errors$.ref());
+    Parser! parser = Parser(store, tokens, unit$.ref(), source_id);
     parser.parse();
-    return ParseResult(unit$.move(), errors$.move());
+    return ParseResult(unit$.move());
 }
 
 struct ParserMark {
@@ -46,15 +39,15 @@ struct ParserMark {
     Int temp_len;
     Int node_len;
     Int child_len;
-    Int error_len;
+    Int diagnostic_len;
     Int pending_gt_start;
 
-    init(Int current, Int temp_len, Int node_len, Int child_len, Int error_len, Int pending_gt_start) {
+    init(Int current, Int temp_len, Int node_len, Int child_len, Int diagnostic_len, Int pending_gt_start) {
         self.current = current;
         self.temp_len = temp_len;
         self.node_len = node_len;
         self.child_len = child_len;
-        self.error_len = error_len;
+        self.diagnostic_len = diagnostic_len;
         self.pending_gt_start = pending_gt_start;
     }
 }
@@ -64,7 +57,7 @@ public struct Parser: Movable {
     list.ArrayList<token.Token>& tokens;
     Int! current;
     ast.AstUnit& unit;
-    list.ArrayList<error.ParseError>& errors;
+    source.SourceId source_id;
     list.ArrayList<ast.AstId>! temp;
     Int! pending_gt_start;
 
@@ -72,13 +65,13 @@ public struct Parser: Movable {
         store_api.CompilerStore& store,
         list.ArrayList<token.Token>& tokens,
         ast.AstUnit& unit,
-        list.ArrayList<error.ParseError>& errors
+        source.SourceId source_id
     ) {
         self.store = store;
         self.tokens = tokens;
         self.current = 0;
         self.unit = unit;
-        self.errors = errors;
+        self.source_id = source_id;
         self.temp = list.ArrayList<ast.AstId>();
         self.pending_gt_start = -1;
     }
@@ -147,13 +140,21 @@ public struct Parser: Movable {
     }
 
     ast.AstId? parse_extern_function_decl() {
+        return self.parse_named_function_decl(true);
+    }
+
+    ast.AstId? parse_extern_global_decl() {
+        return self.parse_named_global_decl(true);
+    }
+
+    ast.AstId? parse_named_function_decl(Bool allow_escaped_name) {
         ParserMark mark = self.mark();
         ast.AstId type_ref = self.parse_result_type();
-        if (!self.can_start_extern_symbol_name()) {
+        if (!self.can_start_symbol_name(allow_escaped_name)) {
             self.reset(mark);
             return null;
         }
-        ast.AstId name = self.parse_extern_symbol_name();
+        ast.AstId name = self.parse_symbol_name(allow_escaped_name);
         if (self.check(.lt) || self.check(.left_paren)) {
             return self.parse_function_tail(type_ref, name);
         }
@@ -161,14 +162,14 @@ public struct Parser: Movable {
         return null;
     }
 
-    ast.AstId? parse_extern_global_decl() {
+    ast.AstId? parse_named_global_decl(Bool allow_escaped_name) {
         ParserMark mark = self.mark();
         ast.AstId type_ref = self.parse_type();
-        if (!self.can_start_extern_symbol_name()) {
+        if (!self.can_start_symbol_name(allow_escaped_name)) {
             self.reset(mark);
             return null;
         }
-        ast.AstId name = self.parse_extern_symbol_name();
+        ast.AstId name = self.parse_symbol_name(allow_escaped_name);
         if (self.check(.lt) || self.check(.left_paren)) {
             self.reset(mark);
             return null;
@@ -291,7 +292,7 @@ public struct Parser: Movable {
             if (self.parse_life_constraint() is some constraint) {
                 self.temp.add(constraint);
             } else {
-                self.error_at_current_kind(.expected_name);
+                self.error_at_current_kind("expected_name");
                 self.advance();
             }
             if (!self.match(.comma)) { return; }
@@ -322,7 +323,7 @@ public struct Parser: Movable {
             return self.lifetime_name_node_from_token(self.advance(), ast.LifetimeNameKind.named_lifetime);
         }
         token.Token actual = self.peek();
-        self.error_at_current(.expected_name, .ident);
+        self.error_at_current("expected_name", .ident);
         if (!self.at_end()) {
             self.advance();
         }
@@ -354,15 +355,7 @@ public struct Parser: Movable {
     () reject_spacing() {
         token.Token next = self.peek();
         if (next.leading.has_any()) {
-            self.errors.add(error.ParseError {
-                kind: error.ParseErrorKind.unexpected_trivia,
-                span: next.span,
-                expected: null,
-                expected_keyword: null,
-                actual: next.kind,
-                message: "",
-                help: ""
-            });
+            self.add_parse_error(next.span, "unexpected_trivia");
         }
     }
 
@@ -371,7 +364,7 @@ public struct Parser: Movable {
             if (self.parse_where_constraint() is some constraint) {
                 self.temp.add(constraint);
             } else {
-                self.error_at_current_kind(.expected_type);
+                self.error_at_current_kind("expected_type");
                 self.advance();
             }
             if (!self.match(.comma)) { return; }
@@ -663,43 +656,11 @@ public struct Parser: Movable {
     }
 
     ast.AstId? parse_function_decl() {
-        ParserMark mark = self.mark();
-        ast.AstId type_ref = self.parse_result_type();
-        if (!self.can_start_name()) {
-            self.reset(mark);
-            return null;
-        }
-        ast.AstId name = self.parse_name();
-        if (self.check(.lt) || self.check(.left_paren)) {
-            return self.parse_function_tail(type_ref, name);
-        }
-        self.reset(mark);
-        return null;
+        return self.parse_named_function_decl(false);
     }
 
     ast.AstId? parse_global_decl() {
-        ParserMark mark = self.mark();
-        ast.AstId type_ref = self.parse_type();
-        if (!self.can_start_name()) {
-            self.reset(mark);
-            return null;
-        }
-        ast.AstId name = self.parse_name();
-        if (self.check(.lt) || self.check(.left_paren)) {
-            self.reset(mark);
-            return null;
-        }
-        ast.AstId?! initializer = null;
-        if (self.match(.assign)) { initializer = self.parse_expr(); }
-        token.Token end = self.expect(.semicolon);
-        return self.node(
-            self.span_from(self.unit.get(type_ref).span, end.span),
-            .global_decl(ast.GlobalData {
-                type_ref: type_ref,
-                name: name,
-                initializer: initializer
-            })
-        );
+        return self.parse_named_global_decl(false);
     }
 
     ast.AstId parse_function_tail(ast.AstId result_type, ast.AstId name) {
@@ -1247,7 +1208,7 @@ public struct Parser: Movable {
 
     () add_invalid_handle_type_error() {
         self.add_type_postfix_error(
-            .invalid_handle_type,
+            "invalid_handle_type",
             "owner/reference handle cannot be combined with another handle layer",
             "use raw pointer or many pointer layers for FFI pointer nesting"
         );
@@ -1259,7 +1220,7 @@ public struct Parser: Movable {
 
     () add_optional_after_mutable_type_error() {
         self.add_type_postfix_error(
-            .optional_after_mutable_type,
+            "optional_after_mutable_type",
             "optional suffix cannot follow mutable suffix",
             "put ? before !, for example Int?!"
         );
@@ -1267,7 +1228,7 @@ public struct Parser: Movable {
 
     () add_repeated_optional_type_error() {
         self.add_type_postfix_error(
-            .repeated_optional_type,
+            "repeated_optional_type",
             "optional suffix cannot be repeated",
             "remove the extra ?"
         );
@@ -1275,23 +1236,15 @@ public struct Parser: Movable {
 
     () add_repeated_mutable_type_error() {
         self.add_type_postfix_error(
-            .repeated_mutable_type,
+            "repeated_mutable_type",
             "mutable suffix cannot be repeated",
             "remove the extra !"
         );
     }
 
-    () add_type_postfix_error(error.ParseErrorKind kind, UInt8[] message, UInt8[] help) {
+    () add_type_postfix_error(UInt8[] code, UInt8[] message, UInt8[] help) {
         token.Token actual = self.previous();
-        self.errors.add(error.ParseError {
-            kind: kind,
-            span: actual.span,
-            expected: null,
-            expected_keyword: null,
-            actual: actual.kind,
-            message: message,
-            help: help
-        });
+        self.add_parse_error_message(actual.span, code, message);
     }
 
     ast.AstId parse_result_type() {
@@ -1379,7 +1332,7 @@ public struct Parser: Movable {
             ast.AstId path = self.node_from_child(name, .path(ast.PathData {segments: self.unit.add_child(name)}));
             return self.node_from_child(path, .named_type(ast.NamedTypeData {path: path, args: self.empty_range()}));
         }
-        self.error_at_current_kind(.expected_type);
+        self.error_at_current_kind("expected_type");
         return self.unit_node(self.advance().span);
     }
 
@@ -1399,7 +1352,7 @@ public struct Parser: Movable {
         Int item_start = self.temp.len();
         self.temp.add(first);
         if (self.check(.right_paren)) {
-            self.error_at_current_kind(.expected_type);
+            self.error_at_current_kind("expected_type");
         } else {
             self.temp.add(self.parse_type());
             self.parse_remaining_tuple_types();
@@ -1500,7 +1453,7 @@ public struct Parser: Movable {
         }
         if (self.match(.semicolon)) {
             if (!self.expr_is_call_stmt(expr)) {
-                self.error_at_span(.expected_statement, self.unit.get(expr).span);
+                self.error_at_span("expected_statement", self.unit.get(expr).span);
             }
             return self.node(
                 self.span_from(self.unit.get(expr).span, self.previous().span),
@@ -1562,7 +1515,7 @@ public struct Parser: Movable {
         self.expect_keyword(.kw_else);
         ast.AstId else_body = self.parse_block();
         if (!self.guard_else_body_exits(else_body)) {
-            self.error_at_span(.expected_guard_exit, self.unit.get(else_body).span);
+            self.error_at_span("expected_guard_exit", self.unit.get(else_body).span);
         }
         return self.node(
             self.span_from(start.span, self.unit.get(else_body).span),
@@ -1750,41 +1703,23 @@ public struct Parser: Movable {
             if (self.check(.left_paren)) {
                 ast.AstRange type_args = self.empty_range();
                 ast.AstRange args = self.parse_call_parens();
-                result = self.node_from_range(
-                    result,
-                    args,
-                    .call(ast.CallData {callee: result, type_args: type_args, args: args})
-                );
+                result = self.call_expr_node(result, type_args, args);
                 continue;
             }
             if (self.check(.lt) && self.type_args_before_call()) {
                 ast.AstRange type_args = self.parse_type_args();
                 ast.AstRange args = self.parse_call_parens();
-                result = self.node_from_range(
-                    result,
-                    args,
-                    .call(ast.CallData {callee: result, type_args: type_args, args: args})
-                );
+                result = self.call_expr_node(result, type_args, args);
                 continue;
             }
             if (self.match(.dot)) {
                 ast.AstId name = self.parse_member_name();
-                ast.FieldExprData data = ast.FieldExprData {
-                    base: result,
-                    name: name,
-                    optional_chain: false
-                };
-                result = self.node_from_children(result, name, .field_expr(data));
+                result = self.field_expr_node(result, name, false);
                 continue;
             }
             if (self.match(.question_dot)) {
                 ast.AstId name = self.parse_member_name();
-                ast.FieldExprData data = ast.FieldExprData {
-                    base: result,
-                    name: name,
-                    optional_chain: true
-                };
-                result = self.node_from_children(result, name, .field_expr(data));
+                result = self.field_expr_node(result, name, true);
                 continue;
             }
             if (self.match(.left_bracket)) {
@@ -1805,6 +1740,26 @@ public struct Parser: Movable {
             break;
         }
         return result;
+    }
+
+    ast.AstId call_expr_node(ast.AstId callee, ast.AstRange type_args, ast.AstRange args) {
+        return self.node_from_range(
+            callee,
+            args,
+            .call(ast.CallData {callee: callee, type_args: type_args, args: args})
+        );
+    }
+
+    ast.AstId field_expr_node(ast.AstId base, ast.AstId name, Bool optional_chain) {
+        return self.node_from_children(
+            base,
+            name,
+            .field_expr(ast.FieldExprData {
+                base: base,
+                name: name,
+                optional_chain: optional_chain
+            })
+        );
     }
 
     ast.AstId? finish_question_postfix(ast.AstId base) {
@@ -1861,32 +1816,37 @@ public struct Parser: Movable {
             ast.AstId?! end_expr = null;
             if (!self.check(.right_bracket)) { end_expr = self.parse_slice_bound_expr(); }
             self.expect(.right_bracket);
-            return self.node_from_child(
-                base,
-                .slice_expr(ast.SliceExprData {
-                    base: base,
-                    start: null,
-                    end: end_expr,
-                    optional_chain: optional_chain
-                })
-            );
+            return self.slice_expr_node(base, null, end_expr, optional_chain);
         }
         ast.AstId index = self.parse_slice_bound_expr();
         if (self.match(.dot_dot)) {
             ast.AstId?! end_expr = null;
             if (!self.check(.right_bracket)) { end_expr = self.parse_slice_bound_expr(); }
             self.expect(.right_bracket);
-            return self.node_from_child(
-                base,
-                .slice_expr(ast.SliceExprData {
-                    base: base,
-                    start: index,
-                    end: end_expr,
-                    optional_chain: optional_chain
-                })
-            );
+            return self.slice_expr_node(base, index, end_expr, optional_chain);
         }
         self.expect(.right_bracket);
+        return self.index_expr_node(base, index, optional_chain);
+    }
+
+    ast.AstId slice_expr_node(
+        ast.AstId base,
+        ast.AstId?! start,
+        ast.AstId?! end,
+        Bool optional_chain
+    ) {
+        return self.node_from_child(
+            base,
+            .slice_expr(ast.SliceExprData {
+                base: base,
+                start: start,
+                end: end,
+                optional_chain: optional_chain
+            })
+        );
+    }
+
+    ast.AstId index_expr_node(ast.AstId base, ast.AstId index, Bool optional_chain) {
         return self.node_from_children(
             base,
             index,
@@ -1957,14 +1917,7 @@ public struct Parser: Movable {
         if (self.match(.dot)) {
             ast.AstId name = self.parse_name();
             ast.AstId base = self.unit_node(self.unit.get(name).span);
-            return self.node_from_child(
-                name,
-                .field_expr(ast.FieldExprData {
-                    base: base,
-                    name: name,
-                    optional_chain: false
-                })
-            );
+            return self.field_expr_node(base, name, false);
         }
         if (self.starts_type_implicit_expr()) {
             return self.parse_type_implicit_call_expr();
@@ -1982,7 +1935,7 @@ public struct Parser: Movable {
             }
             return self.node_from_child(path, .name_expr(ast.StmtData {value: path}));
         }
-        self.error_at_current_kind(.expected_expression);
+        self.error_at_current_kind("expected_expression");
         return self.unit_node(self.advance().span);
     }
 
@@ -2002,7 +1955,7 @@ public struct Parser: Movable {
             Int item_start = self.temp.len();
             self.temp.add(first);
             if (self.check(.right_paren)) {
-                self.error_at_current_kind(.expected_expression);
+                self.error_at_current_kind("expected_expression");
             } else {
                 self.temp.add(self.parse_expr());
                 while (self.match(.comma)) {
@@ -2319,12 +2272,12 @@ public struct Parser: Movable {
                 })
             );
             if (payload.empty() && self.path_segment_len(name) == 1) {
-                self.error_at_span(.expected_match_pattern, self.unit.get(pattern).span);
+                self.error_at_span("expected_match_pattern", self.unit.get(pattern).span);
             }
             return pattern;
         }
         ast.AstId pattern = self.parse_pattern();
-        self.error_at_span(.expected_match_pattern, self.unit.get(pattern).span);
+        self.error_at_span("expected_match_pattern", self.unit.get(pattern).span);
         return pattern;
     }
 
@@ -2428,7 +2381,7 @@ public struct Parser: Movable {
         token.Token end = self.expect(.right_paren);
         ast.AstRange payload = self.take_children(item_start);
         token.Span span = self.span_from(start.span, end.span);
-        self.error_at_span(.expected_match_pattern, span);
+        self.error_at_span("expected_match_pattern", span);
         return self.node(
             span,
             .pattern(ast.PatternData {
@@ -2467,7 +2420,7 @@ public struct Parser: Movable {
 
     // After a failed top-level parse, skip to a boundary where another item may start.
     () recover_top_level_item() {
-        self.error_at_current_kind(.expected_top_level_item);
+        self.error_at_current_kind("expected_top_level_item");
         Bool! consumed = false;
         while (!self.at_end()) {
             if (consumed && self.previous().kind == .semicolon) { return; }
@@ -2483,7 +2436,7 @@ public struct Parser: Movable {
 
     // After a failed member parse, skip to the next member boundary.
     () recover_member() {
-        self.error_at_current_kind(.expected_member);
+        self.error_at_current_kind("expected_member");
         while (!self.at_end()) {
             if (self.previous().kind == .semicolon) { return; }
             if (self.check(.right_brace)) { return; }
@@ -2493,7 +2446,7 @@ public struct Parser: Movable {
 
     // After a failed statement parse, skip to the next statement boundary.
     () recover_stmt() {
-        self.error_at_current_kind(.expected_statement);
+        self.error_at_current_kind("expected_statement");
         while (!self.at_end()) {
             if (self.previous().kind == .semicolon) { return; }
             if (self.check(.right_brace)) { return; }
@@ -2603,7 +2556,7 @@ public struct Parser: Movable {
             return self.name_node_from_token(self.advance());
         }
         token.Token actual = self.peek();
-        self.error_at_current(.expected_name, .ident);
+        self.error_at_current("expected_name", .ident);
         // Error recovery must consume the offending token. Otherwise callers
         // that keep parsing member/name lists can retry the same token forever.
         if (!self.at_end()) {
@@ -2612,8 +2565,8 @@ public struct Parser: Movable {
         return self.name_node_from_token(token.Token.missing(.ident, actual.span));
     }
 
-    ast.AstId parse_extern_symbol_name() {
-        if (self.check(.escaped_ident)) {
+    ast.AstId parse_symbol_name(Bool allow_escaped_name) {
+        if (allow_escaped_name && self.check(.escaped_ident)) {
             return self.parse_escaped_symbol_name();
         }
         return self.parse_name();
@@ -2624,7 +2577,7 @@ public struct Parser: Movable {
             return self.name_node_from_token(self.advance());
         }
         token.Token actual = self.peek();
-        self.error_at_current(.expected_name, .escaped_ident);
+        self.error_at_current("expected_name", .escaped_ident);
         if (!self.at_end()) {
             self.advance();
         }
@@ -2644,7 +2597,7 @@ public struct Parser: Movable {
             return self.name_node_from_token(self.advance());
         }
         token.Token actual = self.peek();
-        self.error_at_current(.expected_name, .ident);
+        self.error_at_current("expected_name", .ident);
         if (!self.at_end()) {
             self.advance();
         }
@@ -2680,8 +2633,11 @@ public struct Parser: Movable {
         return false;
     }
 
-    Bool can_start_extern_symbol_name() {
-        return self.check(.escaped_ident) || self.can_start_name();
+    Bool can_start_symbol_name(Bool allow_escaped_name) {
+        if (allow_escaped_name && self.check(.escaped_ident)) {
+            return true;
+        }
+        return self.can_start_name();
     }
 
     Bool can_start_decl_name() {
@@ -2857,7 +2813,7 @@ public struct Parser: Movable {
             self.temp.len(),
             self.unit.nodes.len(),
             self.unit.children.len(),
-            self.errors.len(),
+            self.store.diagnostics.len(),
             self.pending_gt_start
         );
     }
@@ -2867,7 +2823,7 @@ public struct Parser: Movable {
         self.temp.truncate(mark.temp_len);
         self.unit.nodes.truncate(mark.node_len);
         self.unit.children.truncate(mark.child_len);
-        self.errors.truncate(mark.error_len);
+        self.store.diagnostics.truncate(mark.diagnostic_len);
         self.pending_gt_start = mark.pending_gt_start;
     }
 
@@ -2887,7 +2843,7 @@ public struct Parser: Movable {
 
     token.Token expect(token.TokenKind expected) {
         if (self.check(expected)) { return self.advance(); }
-        self.error_at_current(.expected_token, expected);
+        self.error_at_current("expected_token", expected);
         return token.Token.missing(expected, self.peek().span);
     }
 
@@ -2898,7 +2854,7 @@ public struct Parser: Movable {
     token.Token expect_type_arg_gt() {
         if (self.check(.gt)) { return self.advance(); }
         if (self.check(.gt_gt)) { return self.split_gt_gt_token(); }
-        self.error_at_current(.expected_token, .gt);
+        self.error_at_current("expected_token", .gt);
         return token.Token.missing(token.TokenKind.gt, self.peek().span);
     }
 
@@ -3031,56 +2987,31 @@ public struct Parser: Movable {
         return self.tokens.get(self.current - 1);
     }
 
-    () error_at_current(error.ParseErrorKind kind, token.TokenKind expected) {
+    () error_at_current(UInt8[] code, token.TokenKind expected) {
         token.Token actual = self.peek();
-        self.errors.add(error.ParseError {
-            kind: kind,
-            span: actual.span,
-            expected: expected,
-            expected_keyword: null,
-            actual: actual.kind,
-            message: "",
-            help: ""
-        });
+        self.add_parse_error(actual.span, code);
     }
 
     () error_at_current_keyword(token.Keyword expected) {
         token.Token actual = self.peek();
-        self.errors.add(error.ParseError {
-            kind: error.ParseErrorKind.expected_keyword,
-            span: actual.span,
-            expected: null,
-            expected_keyword: expected,
-            actual: actual.kind,
-            message: "",
-            help: ""
-        });
+        self.add_parse_error(actual.span, "expected_keyword");
     }
 
-    () error_at_current_kind(error.ParseErrorKind kind) {
+    () error_at_current_kind(UInt8[] code) {
         token.Token actual = self.peek();
-        self.errors.add(error.ParseError {
-            kind: kind,
-            span: actual.span,
-            expected: null,
-            expected_keyword: null,
-            actual: actual.kind,
-            message: "",
-            help: ""
-        });
+        self.add_parse_error(actual.span, code);
     }
 
-    () error_at_span(error.ParseErrorKind kind, token.Span span) {
-        token.Token actual = self.previous();
-        self.errors.add(error.ParseError {
-            kind: kind,
-            span: span,
-            expected: null,
-            expected_keyword: null,
-            actual: actual.kind,
-            message: "",
-            help: ""
-        });
+    () error_at_span(UInt8[] code, token.Span span) {
+        self.add_parse_error(span, code);
+    }
+
+    () add_parse_error(token.Span span, UInt8[] code) {
+        syntax_diagnostics.add_parse_error(self.store, self.source_id, span, code);
+    }
+
+    () add_parse_error_message(token.Span span, UInt8[] code, UInt8[] message) {
+        syntax_diagnostics.add_parse_error_message(self.store, self.source_id, span, code, message);
     }
 
     token.Span span_from(token.Span start, token.Span end) {

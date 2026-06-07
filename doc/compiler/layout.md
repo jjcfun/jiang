@@ -68,7 +68,7 @@ LayoutStore
 - optional layout：第一版使用显式 `{ tag, payload }`，不做 niche 优化
 - `T&` / `T^` / `T*` / `T[*]` layout：pointer-sized scalar，layout key 保留 handle kind
 - `T[]` layout：pointer + pointer-sized unsigned length
-- enum layout：当前 enum 无 associated value，使用 target int discriminant scalar
+- enum layout：当前 enum 无 associated value，使用 enum underlying integer scalar
 - union layout：Jiang union 是 tagged union，第一版使用 target int tag + max payload slot
 - aggregate alignment policy
 
