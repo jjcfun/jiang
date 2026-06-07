@@ -6,7 +6,7 @@ Jiang Next 编译器围绕稳定的阶段边界组织。本文只保留整体架
 ## 顶层流程
 
 ```text
-driver/cli -> pipeline.compile_with_options
+driver/cli -> pipeline.compile
                 |
                 v
         package source/AST -> HIR -> type facts -> MIR -> checked MIR -> backend output

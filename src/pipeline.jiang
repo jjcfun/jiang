@@ -31,44 +31,21 @@ import monomorph = "./sema/monomorph.jiang";
 import type_check = "./sema/type_check/api.jiang";
 import source = "./source/source.jiang";
 
-public () compile_source(context.CompilerContext& ctx, UInt8[] text) {
-    ctx.begin_compilation();
-    source.SourceId source_id = ctx.store.sources.add_anonymous(source.content_hash(text));
-    compile_package(ctx, source_id, text);
-}
-
-public () compile_file(context.CompilerContext& ctx, UInt8[] file_path) {
-    ctx.begin_compilation();
-    UInt8[] normalized = path.normalize(file_path);
-    guard fs.read_all(normalized) is some text else {
-        add_package_error(ctx, string.append("failed to read source file: ", normalized), "source_file_not_found");
-        return;
-    }
-    compile_path_text(ctx, normalized, text);
-}
-
-() compile_path_text(context.CompilerContext& ctx, UInt8[] file_path, UInt8[] text) {
-    source.SourceId source_id = ctx.store.sources.intern_path(file_path, source.content_hash(text));
-    compile_package(ctx, source_id, text);
-}
-
-public () compile_package_path(context.CompilerContext& ctx, UInt8[] input_path) {
-    compile_file(ctx, package_root_file_path(input_path));
-}
-
-public () compile_with_options(context.CompilerContext& ctx, driver_options.CompileOptions options) {
+// 编译器唯一公开入口。driver 负责把命令行整理成 CompileOptions，
+// pipeline 只按 options 串联 source 到 backend 的阶段。
+public () compile(context.CompilerContext& ctx, driver_options.CompileOptions options) {
     ctx.begin_compilation();
     UInt8[] root_path = package_root_file_path(options.input_path);
     UInt8[] normalized = path.normalize(root_path);
-    guard fs.read_all(normalized) is some text else {
+    guard fs.read_all(normalized) is some source_text else {
         add_package_error(ctx, string.append("failed to read source file: ", normalized), "source_file_not_found");
         return;
     }
-    source.SourceId source_id = ctx.store.sources.intern_path(normalized, source.content_hash(text));
+    source.SourceId source_id = ctx.store.sources.intern_path(normalized, source.content_hash(source_text));
     compile_package_with_emit(
         ctx,
         source_id,
-        text,
+        source_text,
         options.emit,
         options.output_path,
         options.artifact_cache_dir,
@@ -78,7 +55,9 @@ public () compile_with_options(context.CompilerContext& ctx, driver_options.Comp
     );
 }
 
-public UInt8[] package_root_file_path(UInt8[] input_path) {
+// 将输入路径归一化为 package root source。这里只处理入口文件选择，
+// 不读取 source，也不创建任何语义 store。
+UInt8[] package_root_file_path(UInt8[] input_path) {
     UInt8[] normalized = path.normalize(input_path);
     if (package_manifest.exists(normalized)) {
         return package_manifest_root_file_path(normalized);
@@ -86,29 +65,19 @@ public UInt8[] package_root_file_path(UInt8[] input_path) {
     return normalized;
 }
 
+// 从 package manifest 中解析 root source 路径。manifest 只影响入口文件，
+// 后续 import closure 仍由 resolve 阶段负责发现。
 UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     package_manifest.PackageManifest manifest = package_manifest.read(package_dir);
     return package_manifest.root_file_path(package_dir, manifest$.ref());
 }
 
-() compile_package(context.CompilerContext& ctx, source.SourceId source_id, UInt8[] text) {
-    compile_package_with_emit(
-        ctx,
-        source_id,
-        text,
-        .executable,
-        "",
-        "build/cache",
-        "default-target",
-        "jiang-dev",
-        "clang"
-    );
-}
-
+// package 编译主干。这个函数只编排阶段顺序和早停条件；
+// 具体语义检查、MIR 改写和 backend lowering 必须留在各自阶段内。
 () compile_package_with_emit(
     context.CompilerContext& ctx,
     source.SourceId source_id,
-    UInt8[] text,
+    UInt8[] source_text,
     driver_options.EmitKind emit,
     UInt8[] output_path,
     UInt8[] artifact_cache_dir,
@@ -119,7 +88,7 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     // syntax.Store 是本次 package 编译的临时 parse cache。resolve/HIR 完成后，
     // AST 不再进入 CompilerStore 的长期状态。
     syntax_store.Store! asts = syntax_store.Store();
-    syntax.SyntaxResult! syntax_result = syntax.parse_source(ctx, text, source_id);
+    syntax.SyntaxResult! syntax_result = syntax.parse_source(ctx, source_text, source_id);
     if (syntax_result.has_errors()) {
         return;
     }
@@ -148,7 +117,9 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     if (!type_check.check_hir_package(ctx, graph$.ref())) {
         return;
     }
-    write_source_artifact_cache(ctx, graph$.ref(), artifact_cache_dir, compiler_version);
+    if (use_source_artifacts) {
+        write_source_artifact_cache(ctx, graph$.ref(), artifact_cache_dir, compiler_version);
+    }
     monomorph.MonomorphStore^ instances = monomorph.collect_reachable_instances(
         ctx,
         ctx.store.hirs$.ref(),
@@ -203,7 +174,9 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     }
 }
 
-public Bool prepare_artifact_cache(
+// 确保需要 object cache 的 emit 模式有 cache 目录。check/llvm-ir 不产生 object，
+// 因此不创建 artifact 目录。
+Bool prepare_artifact_cache(
     context.CompilerContext& ctx,
     driver_options.EmitKind emit,
     UInt8[] artifact_cache_dir
@@ -223,6 +196,8 @@ public Bool prepare_artifact_cache(
     return false;
 }
 
+// 写入 source interface cache。source artifact 只缓存跨编译可复用的公开事实，
+// 不能写入 session-local HIR/Type/MIR 对象。
 () write_source_artifact_cache(
     context.CompilerContext& ctx,
     module_graph.ModuleGraph& graph,
@@ -242,6 +217,8 @@ public Bool prepare_artifact_cache(
     }
 }
 
+// 为单个 module 写入 `.ji` interface。没有 stable def id 的 module 不具备
+// 跨编译身份，不能进入本地 artifact cache。
 () write_module_source_artifact(
     context.CompilerContext& ctx,
     qid.ModuleId module_id,
@@ -267,10 +244,13 @@ public Bool prepare_artifact_cache(
     );
 }
 
+// source interface 的版本 hash 统一委托给 artifact 层，pipeline 不定义格式。
 UInt64 source_artifact_version_hash(UInt8[] compiler_version) {
     return source_ji.artifact_version_hash(compiler_version);
 }
 
+// 根据 emit kind 分发 backend 输出。executable/object 可以使用 object cache；
+// llvm-ir 是调试输出，直接消费最终 MIR。
 backend.BackendResult emit_backend(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
@@ -316,6 +296,8 @@ backend.BackendResult emit_backend(
     return backend.BackendResult(result.ok);
 }
 
+// 生成单个 object 输出。能复用单个 cache object 时直接复制；多 codegen unit
+// 当前仍回退为整包 object 输出，避免输出路径语义不清。
 backend.BackendResult emit_object_with_cache(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
@@ -351,6 +333,7 @@ backend.BackendResult emit_object_with_cache(
     return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]));
 }
 
+// 将 object reuse plan 的命中情况记录到 store，供 smoke 和后续增量诊断使用。
 () record_object_plan_stats(context.CompilerContext& ctx, object_plan.ObjectReusePlan& plan) {
     Int! index = 0;
     while (index < plan.len()) {
@@ -366,6 +349,7 @@ backend.BackendResult emit_object_with_cache(
     }
 }
 
+// 按 object plan 补齐所有缺失 cache object。命中的 entry 不触发 backend。
 Bool emit_plan_cache_objects(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
@@ -382,6 +366,7 @@ Bool emit_plan_cache_objects(
     return true;
 }
 
+// 为一个 codegen unit 生成 cache object，并在成功后登记实际文件 hash。
 Bool emit_plan_cache_object(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
@@ -407,6 +392,8 @@ Bool emit_plan_cache_object(
     return true;
 }
 
+// 单 codegen unit 的 object 输出路径可以直接使用 cache artifact。这个路径同时覆盖
+// `--emit-obj` 未指定 `-o` 时的默认输出行为。
 backend.BackendResult emit_single_object_unit_with_cache(
     context.CompilerContext& ctx,
     mir.MirStore& lowered,
@@ -432,6 +419,7 @@ backend.BackendResult emit_single_object_unit_with_cache(
     return backend.BackendResult(copy_cached_object(ctx, cache_path, final_path));
 }
 
+// 没有显式 output path 时，cache path 就是最终 object path。
 UInt8[] final_object_path(UInt8[] output_path, UInt8[] cache_path) {
     if (output_path.length == 0) {
         return cache_path;
@@ -439,6 +427,7 @@ UInt8[] final_object_path(UInt8[] output_path, UInt8[] cache_path) {
     return output_path;
 }
 
+// 将 cache object 复制到用户指定输出路径。源和目标相同时直接视为成功。
 Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[] output_path) {
     if (string.equal(cache_path, output_path)) {
         return true;
@@ -450,6 +439,8 @@ Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[
     return false;
 }
 
+// 记录刚生成的 object artifact。source object 和 monomorph object 使用不同 key，
+// 但都只保存文件 hash 和路径，不保存 backend 内存对象。
 () record_emitted_object(
     context.CompilerContext& ctx,
     object_plan.ObjectReusePlan& plan,
@@ -474,10 +465,12 @@ Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[
     }
 }
 
+// backend FFI 需要 C string buffer，pipeline 只负责路径格式转换。
 UInt8![*] backend_output_buffer(UInt8[] output_path) {
     return fs.c_string(output_path);
 }
 
+// pipeline 只产生 package 级错误；具体阶段错误应在对应阶段写入自己的 category/code。
 () add_package_error(context.CompilerContext& ctx, UInt8[] message, UInt8[] code) {
     ctx.store.diagnostics.add(
         diagnostic.Diagnostic(

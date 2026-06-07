@@ -20,7 +20,7 @@ ModuleGraph^ graph = resolver.build_module_graph(root_unit)
 resolver.lower_module_graph_to_hir(graph$.ref())
 ```
 
-`pipeline.compile_package_path(ctx, input_path)` 是当前 source/syntax/resolve 的路径入口：
+`pipeline.compile(ctx, options)` 是当前 source/syntax/resolve 的路径入口：
 如果 `input_path` 可直接读取为文件，就按单文件 root 编译；否则按 package 目录处理，
 读取 `input_path/package.ini`，再编译 manifest 指定的 root source。
 
