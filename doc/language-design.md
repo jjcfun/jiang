@@ -435,10 +435,12 @@ struct Slice {
 }
 ```
 
-直接返回某个参数引用时，参数目标 lifetime 默认覆盖当前函数返回值，不需要额外写
-`@life(param > return)`。如果函数显式写了 return lifetime 约束，则按显式约束收窄允许来源。
+返回引用只来自同一种输入来源时，该来源 lifetime 默认覆盖当前函数返回值，不需要额外写
+`@life(source > return)`。例如只返回 `self` 内部字段，或只返回同一个参数引用，都可以使用默认规则。
+如果返回引用可能来自多种输入来源，必须显式写出所有允许来源。函数显式写了 return lifetime
+约束后，borrow check 只允许标注中的来源。
 
-跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，需要表达返回值不超过来源：
+跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，仍建议显式表达返回值不超过来源：
 
 ```jiang
 @life(input > return)
