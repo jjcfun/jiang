@@ -20,19 +20,27 @@ public struct PatternCheck {
     }
 
     public qid.TypeId check_pattern(hir.HirId pattern_id, qid.TypeId expected_type) {
+        return self.check_pattern_with_owning_binding(pattern_id, expected_type, false);
+    }
+
+    public qid.TypeId check_pattern_with_owning_binding(
+        hir.HirId pattern_id,
+        qid.TypeId expected_type,
+        Bool allow_owning_binding
+    ) {
         hir.HirNode pattern = self.state.hirs.node(pattern_id);
         qid.TypeId! pattern_type = expected_type;
         if (pattern.data is .binding_pattern(binding)) {
-            pattern_type = self.bind_pattern_local(pattern_id.owner_def, binding, expected_type);
+            pattern_type = self.bind_pattern_local(pattern_id, binding, expected_type, allow_owning_binding);
         }
         if (pattern.data is .literal_pattern(literal_pattern)) {
             pattern_type = self.check_literal_pattern(pattern_id, literal_pattern.literal, expected_type);
         }
         if (pattern.data is .optional_pattern(optional_pattern)) {
-            pattern_type = self.check_optional_pattern(pattern_id, optional_pattern, expected_type);
+            pattern_type = self.check_optional_pattern(pattern_id, optional_pattern, expected_type, allow_owning_binding);
         }
         if (pattern.data is .variant_pattern(variant_pattern)) {
-            pattern_type = self.check_variant_pattern(pattern_id, variant_pattern, expected_type);
+            pattern_type = self.check_variant_pattern(pattern_id, variant_pattern, expected_type, allow_owning_binding);
         }
         if (pattern.data is .wildcard_pattern) {
             pattern_type = expected_type;
@@ -62,10 +70,28 @@ public struct PatternCheck {
         return self.state.store.types.invalid_type();
     }
 
-    qid.TypeId bind_pattern_local(qid.DefId owner_def, hir.HirBindingPattern binding, qid.TypeId expected_type) {
+    qid.TypeId bind_pattern_local(
+        hir.HirId pattern_id,
+        hir.HirBindingPattern binding,
+        qid.TypeId expected_type,
+        Bool allow_owning_binding
+    ) {
+        qid.DefId owner_def = pattern_id.owner_def;
         hir.HirDef& owner = self.state.hirs.def(owner_def)$.some();
-        guard owner.body is some body else { return self.state.store.types.invalid_type(); }
+        guard owner.body is some _& body else { return self.state.store.types.invalid_type(); }
         hir.HirLocal local = body.local(binding.local_id);
+        if (local.borrow_binding) {
+            return self.bind_borrow_pattern_local(local, expected_type);
+        }
+        if (!allow_owning_binding && !self.type_ops.is_implicit_copy_type(expected_type)) {
+            self.type_ops.add_node_error(
+                pattern_id,
+                "owning pattern payload requires borrow binding",
+                "explicit_move_required"
+            );
+            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
+            return self.state.store.types.invalid_type();
+        }
         qid.TypeId! local_type = expected_type;
         if (local.type_ref is some type_ref) {
             local_type = self.type_ops.check_type_ref(type_ref);
@@ -84,10 +110,21 @@ public struct PatternCheck {
         return local_type;
     }
 
+    qid.TypeId bind_borrow_pattern_local(hir.HirLocal local, qid.TypeId expected_type) {
+        if (self.type_ops.is_reference_type(expected_type)) {
+            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
+            return self.state.store.types.invalid_type();
+        }
+        qid.TypeId local_type = self.type_ops.borrow_binding_type(expected_type, local.mutable_binding);
+        self.type_ops.bind_def_type(local.def_id, local_type);
+        return local_type;
+    }
+
     qid.TypeId check_optional_pattern(
         hir.HirId pattern_id,
         hir.HirOptionalPattern optional_pattern,
-        qid.TypeId expected_type
+        qid.TypeId expected_type,
+        Bool allow_owning_binding
     ) {
         types.TypeInfo expected_info = self.state.store.types.get(expected_type);
         guard expected_info.data is .optional(optional) else {
@@ -98,17 +135,26 @@ public struct PatternCheck {
                     "optional_pattern_type_mismatch"
                 );
             }
-            self.check_pattern(optional_pattern.nested, self.state.store.types.invalid_type());
+            if (optional_pattern.nested is some nested) {
+                self.check_pattern_with_owning_binding(
+                    nested,
+                    self.state.store.types.invalid_type(),
+                    allow_owning_binding
+                );
+            }
             return self.state.store.types.invalid_type();
         }
-        self.check_pattern(optional_pattern.nested, optional.element);
+        if (optional_pattern.nested is some nested) {
+            self.check_pattern_with_owning_binding(nested, optional.element, allow_owning_binding);
+        }
         return expected_type;
     }
 
     qid.TypeId check_variant_pattern(
         hir.HirId pattern_id,
         hir.HirVariantPattern variant_pattern,
-        qid.TypeId expected_type
+        qid.TypeId expected_type,
+        Bool allow_owning_binding
     ) {
         if (self.variant_def_for_pattern(pattern_id, variant_pattern, expected_type) is some variant_def) {
             self.state.results.select_pattern(pattern_id, variant_def);
@@ -126,13 +172,17 @@ public struct PatternCheck {
                 payload_type = self.state.store.types.invalid_type();
             }
             if (variant_pattern.payload.length == 0 || variant_pattern.payload.length == expected_payload_count) {
-                self.check_variant_payload_patterns(variant_pattern, payload_type);
+                self.check_variant_payload_patterns(variant_pattern, payload_type, allow_owning_binding);
                 return expected_type;
             }
         }
         Int! index = 0;
         while (index < variant_pattern.payload.length) {
-            self.check_pattern(variant_pattern.payload[index], self.state.store.types.invalid_type());
+            self.check_pattern_with_owning_binding(
+                variant_pattern.payload[index],
+                self.state.store.types.invalid_type(),
+                allow_owning_binding
+            );
             index = index + 1;
         }
         return expected_type;
@@ -149,18 +199,26 @@ public struct PatternCheck {
         return 1;
     }
 
-    () check_variant_payload_patterns(hir.HirVariantPattern variant_pattern, qid.TypeId payload_type) {
+    () check_variant_payload_patterns(
+        hir.HirVariantPattern variant_pattern,
+        qid.TypeId payload_type,
+        Bool allow_owning_binding
+    ) {
         types.TypeInfo payload_info = self.state.store.types.get(payload_type);
         if (payload_info.data is .tuple_type(tuple_type)) {
             Int! index = 0;
             while (index < variant_pattern.payload.length) {
-                self.check_pattern(variant_pattern.payload[index], tuple_type.items[index]);
+                self.check_pattern_with_owning_binding(
+                    variant_pattern.payload[index],
+                    tuple_type.items[index],
+                    allow_owning_binding
+                );
                 index = index + 1;
             }
             return;
         }
         if (variant_pattern.payload.length == 1) {
-            self.check_pattern(variant_pattern.payload[0], payload_type);
+            self.check_pattern_with_owning_binding(variant_pattern.payload[0], payload_type, allow_owning_binding);
         }
     }
 
