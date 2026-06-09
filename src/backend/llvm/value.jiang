@@ -123,7 +123,298 @@ public ffi.Value lower_operand(
     return ffi.Value();
 }
 
-ffi.Value global_value_for_ref(llvm_state.LowerState& state, mir.MirGlobalRef value) {
+public Bool lower_aggregate_into_place(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirRvalue rvalue,
+    mir.MirPlace destination,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    guard rvalue is .aggregate_value(value) else {
+        return false;
+    }
+    // 构造聚合值时直接写目标 slot，避免先构造一个 LLVM aggregate value。
+    // union 的 payload 存在共享存储区，尤其不能依赖普通 struct extract/insert。
+    ffi.Value destination_pointer = llvm_place.lower_place_pointer(state, body, destination, local_slots);
+    if (!ffi.value_valid(destination_pointer)) {
+        return false;
+    }
+    if (value.kind != .union_variant) {
+        return lower_plain_aggregate_into_pointer(state, body, value, destination_pointer, local_slots);
+    }
+    guard value.tag is some tag_operand else {
+        return false;
+    }
+    ffi.Value tag = lower_operand(state, body, tag_operand, local_slots);
+    if (!ffi.value_valid(tag)) {
+        return false;
+    }
+    if (!store_layout_field(state, value.type_id, destination_pointer, 0, tag)) {
+        return false;
+    }
+    if (value.fields.length == 0) {
+        return true;
+    }
+    if (value.payload_field_index < 0) {
+        return false;
+    }
+    qid.TypeId payload_type = llvm_type.constant_index_type(state, value.type_id, value.payload_field_index);
+    if (value.fields.length != 1) {
+        return lower_union_payload_fields_into_pointer(
+            state,
+            body,
+            value,
+            destination_pointer,
+            payload_type,
+            local_slots
+        );
+    }
+    if (copy_operand_into_layout_field(
+            state,
+            body,
+            value.fields[0],
+            local_slots,
+            value.type_id,
+            destination_pointer,
+            value.payload_field_index,
+            payload_type
+        )
+    ) {
+        return true;
+    }
+    ffi.Value payload = lower_operand(state, body, value.fields[0], local_slots);
+    if (!ffi.value_valid(payload)) {
+        return false;
+    }
+    return store_layout_field(state, value.type_id, destination_pointer, value.payload_field_index, payload);
+}
+
+Bool lower_union_payload_fields_into_pointer(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirAggregateRvalue value,
+    ffi.Value destination_pointer,
+    qid.TypeId payload_type,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    ffi.Value payload_pointer = lower_payload_storage_field_pointer(
+        state,
+        value.type_id,
+        destination_pointer,
+        value.payload_field_index
+    );
+    if (!ffi.value_valid(payload_pointer)) {
+        return false;
+    }
+    Int! index = 0;
+    while (index < value.fields.length) {
+        qid.TypeId field_type = llvm_type.constant_index_type(state, payload_type, index);
+        // 多字段 union payload 先定位到 payload storage，再按 payload struct 的
+        // 字段布局逐个写入；大字段继续走 memcpy。
+        if (!llvm_type.type_has_abi_value(state, field_type)) {
+            index = index + 1;
+            continue;
+        }
+        if (copy_operand_into_layout_field(
+                state,
+                body,
+                value.fields[index],
+                local_slots,
+                payload_type,
+                payload_pointer,
+                index,
+                field_type
+            )
+        ) {
+            index = index + 1;
+            continue;
+        }
+        ffi.Value field_value = lower_operand_as_type(state, body, value.fields[index], local_slots, field_type);
+        if (!ffi.value_valid(field_value)) {
+            return false;
+        }
+        if (!store_layout_field(state, payload_type, payload_pointer, index, field_value)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+public Bool lower_optional_into_place(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirRvalue rvalue,
+    mir.MirPlace destination,
+    list.ArrayList<ffi.Value>& local_slots,
+    qid.TypeId result_type
+) {
+    guard rvalue is .optional_value(value) else {
+        return false;
+    }
+    ffi.Value destination_pointer = llvm_place.lower_place_pointer(state, body, destination, local_slots);
+    if (!ffi.value_valid(destination_pointer)) {
+        return false;
+    }
+    if (value.op == .make_some) {
+        if (!store_layout_field(state, result_type, destination_pointer, 0, bool_value(state, true))) {
+            return false;
+        }
+        qid.TypeId payload_type = llvm_type.element_type(state, result_type);
+        if (copy_operand_into_layout_field(
+                state,
+                body,
+                value.value,
+                local_slots,
+                result_type,
+                destination_pointer,
+                1,
+                payload_type
+            )
+        ) {
+            return true;
+        }
+        ffi.Value payload = lower_operand(state, body, value.value, local_slots);
+        if (!ffi.value_valid(payload)) {
+            return false;
+        }
+        return store_layout_field(state, result_type, destination_pointer, 1, payload);
+    }
+    if (value.op == .unwrap_some) {
+        qid.TypeId source_type = operand_type(state, body, value.value);
+        qid.TypeId payload_type = llvm_type.element_type(state, source_type);
+        guard operand_place(value.value) is some source_place else {
+            return false;
+        }
+        // optional 解包到 place 时直接复制 payload 字节，保证大 payload 不经过
+        // LLVM aggregate value。
+        ffi.Value source_pointer = llvm_place.lower_place_pointer(state, body, source_place, local_slots);
+        if (!ffi.value_valid(source_pointer)) {
+            return false;
+        }
+        ffi.Value payload_pointer = lower_payload_storage_field_pointer(state, source_type, source_pointer, 1);
+        if (!ffi.value_valid(payload_pointer)) {
+            return false;
+        }
+        return copy_pointer_bytes(state, payload_pointer, destination_pointer, payload_type);
+    }
+    if (value.op == .make_none) {
+        ffi.Value zero = zero_aggregate(state, result_type);
+        if (!ffi.value_valid(zero)) {
+            return false;
+        }
+        return ffi.value_valid(ffi.builder_build_store(state.builder, zero, destination_pointer));
+    }
+    return false;
+}
+
+Bool lower_plain_aggregate_into_pointer(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirAggregateRvalue value,
+    ffi.Value destination_pointer,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    Int! index = 0;
+    while (index < value.fields.length) {
+        qid.TypeId field_type = llvm_type.constant_index_type(state, value.type_id, index);
+        if (!llvm_type.type_has_abi_value(state, field_type)) {
+            index = index + 1;
+            continue;
+        }
+        if (copy_operand_into_layout_field(
+                state,
+                body,
+                value.fields[index],
+                local_slots,
+                value.type_id,
+                destination_pointer,
+                index,
+                field_type
+            )
+        ) {
+            index = index + 1;
+            continue;
+        }
+        ffi.Value field_value = lower_operand_as_type(state, body, value.fields[index], local_slots, field_type);
+        if (!ffi.value_valid(field_value)) {
+            return false;
+        }
+        if (!store_layout_field(state, value.type_id, destination_pointer, index, field_value)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool copy_operand_into_layout_field(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirOperand operand,
+    list.ArrayList<ffi.Value>& local_slots,
+    qid.TypeId owner_type,
+    ffi.Value destination_pointer,
+    Int field_index,
+    qid.TypeId field_type
+) {
+    if (!type_should_copy_bytes(state, field_type)) {
+        return false;
+    }
+    guard operand_place(operand) is some source_place else {
+        return false;
+    }
+    // 只有源值仍能追溯到 MIR place 时才能 memcpy；常量和计算结果仍回退到
+    // 普通 value lowering。
+    ffi.Value source_pointer = llvm_place.lower_place_pointer(state, body, source_place, local_slots);
+    if (!ffi.value_valid(source_pointer)) {
+        return false;
+    }
+    ffi.Value field_pointer = lower_payload_storage_field_pointer(state, owner_type, destination_pointer, field_index);
+    if (!ffi.value_valid(field_pointer)) {
+        return false;
+    }
+    return copy_pointer_bytes(state, source_pointer, field_pointer, field_type);
+}
+
+mir.MirPlace? operand_place(mir.MirOperand operand) {
+    if (operand is .copy_operand(copy_operand)) {
+        return copy_operand.place;
+    }
+    if (operand is .move_operand(move_operand)) {
+        return move_operand.place;
+    }
+    return null;
+}
+
+Bool type_should_copy_bytes(llvm_state.LowerState& state, qid.TypeId type_id) {
+    if (!llvm_type.type_has_abi_value(state, type_id)) {
+        return false;
+    }
+    return llvm_type.layout_size(state, type_id) > state.ctx.store.layouts.target.pointer_size * 2;
+}
+
+Bool copy_pointer_bytes(
+    llvm_state.LowerState& state,
+    ffi.Value source_pointer,
+    ffi.Value destination_pointer,
+    qid.TypeId type_id
+) {
+    ffi.Type size_type = ffi.context_int_type(state.llvm_context, state.ctx.store.layouts.target.pointer_size * 8);
+    ffi.Value size = ffi.const_int(size_type, UInt64(llvm_type.layout_size(state, type_id)));
+    Int align = llvm_type.layout_align(state, type_id);
+    return ffi.value_valid(ffi.builder_build_memcpy(
+            state.builder,
+            destination_pointer,
+            align,
+            source_pointer,
+            align,
+            size
+        )
+    );
+}
+
+public ffi.Value global_value_for_ref(llvm_state.LowerState& state, mir.MirGlobalRef value) {
     ffi.Type value_type = llvm_type.lower_type(state, value.type_id);
     if (!ffi.type_valid(value_type)) {
         return ffi.Value();
@@ -539,11 +830,19 @@ ffi.Value lower_discriminant(
     if (llvm_type.layout_field_count(state, place_type_id) == 0) {
         return llvm_place.lower_place_value(state, body, value.place, local_slots);
     }
-    ffi.Value aggregate = llvm_place.lower_place_value(state, body, value.place, local_slots);
-    if (!ffi.value_valid(aggregate)) {
+    ffi.Value place_pointer = llvm_place.lower_place_pointer(state, body, value.place, local_slots);
+    if (!ffi.value_valid(place_pointer)) {
         return ffi.Value();
     }
-    return extract_layout_field(state, place_type_id, aggregate, 0);
+    ffi.Value tag_pointer = lower_payload_storage_field_pointer(state, place_type_id, place_pointer, 0);
+    if (!ffi.value_valid(tag_pointer)) {
+        return ffi.Value();
+    }
+    ffi.Type tag_type = llvm_type.lower_type(state, llvm_type.constant_index_type(state, place_type_id, 0));
+    if (!ffi.type_valid(tag_type)) {
+        return ffi.Value();
+    }
+    return ffi.builder_build_load(state.builder, tag_type, tag_pointer);
 }
 
 public Bool lower_set_discriminant(
@@ -660,6 +959,23 @@ ffi.Value lower_optional(
         return lower_make_some(state, body, value, local_slots, result_type);
     }
     qid.TypeId value_type = operand_type(state, body, value.value);
+    if (operand_place(value.value) is some source_place) {
+        ffi.Value source_pointer = llvm_place.lower_place_pointer(state, body, source_place, local_slots);
+        if (!ffi.value_valid(source_pointer)) {
+            return ffi.Value();
+        }
+        if (value.op == .is_some) {
+            return load_layout_field(state, value_type, source_pointer, 0);
+        }
+        if (value.op == .unwrap_some) {
+            qid.TypeId payload_type = llvm_type.element_type(state, value_type);
+            if (type_should_copy_bytes(state, payload_type)) {
+                add_value_codegen_error(state, "large optional payload must lower into a place", "llvm_optional_large_payload_value_lower_failed");
+                return ffi.Value();
+            }
+            return load_layout_field(state, value_type, source_pointer, 1);
+        }
+    }
     ffi.Value aggregate = lower_operand(state, body, value.value, local_slots);
     if (!ffi.value_valid(aggregate)) {
         add_value_codegen_error(state, "failed to lower LLVM optional operand", "llvm_optional_operand_lower_failed");
@@ -1045,6 +1361,44 @@ ffi.Value lower_payload_storage_field_pointer(
         )
     );
     return ffi.builder_build_gep(state.builder, llvm_type.lower_type(state, type_id), slot, indices$.ref());
+}
+
+Bool store_layout_field(
+    llvm_state.LowerState& state,
+    qid.TypeId type_id,
+    ffi.Value slot,
+    Int field_index,
+    ffi.Value field_value
+) {
+    if (field_index >= llvm_type.layout_field_count(state, type_id)) {
+        return false;
+    }
+    ffi.Value field_pointer = lower_payload_storage_field_pointer(state, type_id, slot, field_index);
+    if (!ffi.value_valid(field_pointer)) {
+        return false;
+    }
+    return ffi.value_valid(ffi.builder_build_store(state.builder, field_value, field_pointer));
+}
+
+ffi.Value load_layout_field(
+    llvm_state.LowerState& state,
+    qid.TypeId type_id,
+    ffi.Value slot,
+    Int field_index
+) {
+    if (field_index >= llvm_type.layout_field_count(state, type_id)) {
+        return ffi.Value();
+    }
+    ffi.Value field_pointer = lower_payload_storage_field_pointer(state, type_id, slot, field_index);
+    if (!ffi.value_valid(field_pointer)) {
+        return ffi.Value();
+    }
+    qid.TypeId field_type = llvm_type.constant_index_type(state, type_id, field_index);
+    ffi.Type llvm_field_type = llvm_type.lower_type(state, field_type);
+    if (!ffi.type_valid(llvm_field_type)) {
+        return ffi.Value();
+    }
+    return ffi.builder_build_load(state.builder, llvm_field_type, field_pointer);
 }
 
 ffi.Value extract_layout_field(

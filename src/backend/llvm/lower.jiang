@@ -361,12 +361,13 @@ struct LlvmLowerer: Movable {
         ffi.Value param_pointer
     ) {
         llvm_state.LowerState! state = self.lower_state();
-        ffi.Type value_type = llvm_type.lower_type(state$.ref(), local.type_id);
-        if (!ffi.type_valid(value_type)) {
+        ffi.Value pointer = local_slots.get(local.id.to_index());
+        if (!ffi.value_valid(pointer)) {
             return false;
         }
-        ffi.Value value = ffi.builder_build_load(self.builder$.ref(), value_type, param_pointer);
-        return self.store_local_value(local, local_slots, value);
+        // indirect 参数在 LLVM ABI 中已经是指针；本地 slot 需要拷贝参数指向的
+        // 实际对象，不能先 load 成聚合值再 store。
+        return self.copy_pointer_bytes(state$.ref(), param_pointer, pointer, local.type_id);
     }
 
     Bool store_local_value(
@@ -487,6 +488,33 @@ struct LlvmLowerer: Movable {
     ) {
         llvm_state.LowerState! state = self.lower_state();
         qid.TypeId result_type = llvm_place.place_type(state$.ref(), body, assign_stmt.destination);
+        // 大 struct/union/optional 的赋值优先直接写入目标 place。这样可以保留
+        // layout 计算出的真实字节布局，避免 LLVM aggregate value 在大 payload 上
+        // 产生不可靠的按值 load/store。
+        if (llvm_value.lower_optional_into_place(
+                state$.ref(),
+                body,
+                assign_stmt.value,
+                assign_stmt.destination,
+                local_slots,
+                result_type
+            )
+        ) {
+            return true;
+        }
+        if (llvm_value.lower_aggregate_into_place(
+                state$.ref(),
+                body,
+                assign_stmt.value,
+                assign_stmt.destination,
+                local_slots
+            )
+        ) {
+            return true;
+        }
+        if (self.lower_place_copy_assign(state$.ref(), body, assign_stmt, result_type, local_slots)) {
+            return true;
+        }
         ffi.Value value = llvm_value.lower_rvalue(
             state$.ref(),
             body,
@@ -512,6 +540,68 @@ struct LlvmLowerer: Movable {
             return false;
         }
         return ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), value, pointer));
+    }
+
+    Bool lower_place_copy_assign(
+        llvm_state.LowerState& state,
+        mir.MirBody body,
+        mir.MirAssignStatement assign_stmt,
+        qid.TypeId result_type,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        if (!llvm_type.type_has_abi_value(state, result_type)) {
+            return false;
+        }
+        guard assign_stmt.value is .use_value(use_value) else {
+            return false;
+        }
+        if (use_value.value is .copy_operand(copy_operand)) {
+            return self.copy_place_bytes(state, body, copy_operand.place, assign_stmt.destination, result_type, local_slots);
+        }
+        if (use_value.value is .move_operand(move_operand)) {
+            return self.copy_place_bytes(state, body, move_operand.place, assign_stmt.destination, result_type, local_slots);
+        }
+        return false;
+    }
+
+    Bool copy_place_bytes(
+        llvm_state.LowerState& state,
+        mir.MirBody body,
+        mir.MirPlace source,
+        mir.MirPlace destination,
+        qid.TypeId type_id,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        // MIR 的 copy/move 语义是按值复制；backend 对大聚合用 memcpy 实现这层语义。
+        ffi.Value source_pointer = llvm_place.lower_place_pointer(state, body, source, local_slots);
+        if (!ffi.value_valid(source_pointer)) {
+            return false;
+        }
+        ffi.Value destination_pointer = llvm_place.lower_place_pointer(state, body, destination, local_slots);
+        if (!ffi.value_valid(destination_pointer)) {
+            return false;
+        }
+        return self.copy_pointer_bytes(state, source_pointer, destination_pointer, type_id);
+    }
+
+    Bool copy_pointer_bytes(
+        llvm_state.LowerState& state,
+        ffi.Value source_pointer,
+        ffi.Value destination_pointer,
+        qid.TypeId type_id
+    ) {
+        ffi.Type size_type = ffi.context_int_type(state.llvm_context, state.ctx.store.layouts.target.pointer_size * 8);
+        ffi.Value size = ffi.const_int(size_type, UInt64(llvm_type.layout_size(state, type_id)));
+        Int align = llvm_type.layout_align(state, type_id);
+        return ffi.value_valid(ffi.builder_build_memcpy(
+                self.builder$.ref(),
+                destination_pointer,
+                align,
+                source_pointer,
+                align,
+                size
+            )
+        );
     }
 
     () add_assign_rvalue_error(mir.MirRvalue value) {

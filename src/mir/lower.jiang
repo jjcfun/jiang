@@ -1211,10 +1211,38 @@ struct BodyLowerer: Movable {
     }
 
     qid.TypeId source_type_for_expected_conversion(hir.HirId node_id) {
-        if (self.place_for_expr(node_id) is some place) {
+        // `place_for_expr` 可能为复杂 place 生成临时值；探测期望转换类型时，
+        // 只对确定无副作用的表达式调用它。
+        if (self.place_lookup_has_no_lowering_side_effect(node_id)) {
+            guard self.place_for_expr(node_id) is some place else {
+                return self.type_for_node(node_id);
+            }
             return self.mir_place_type(place);
         }
         return self.type_for_node(node_id);
+    }
+
+    Bool place_lookup_has_no_lowering_side_effect(hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        if (node.data is .name_ref(name_ref)) {
+            return name_ref is .local;
+        }
+        if (node.data is .member_access(member_access)) {
+            return self.place_lookup_has_no_lowering_side_effect(member_access.base);
+        }
+        if (node.data is .index_access(index_access)) {
+            return self.place_lookup_has_no_lowering_side_effect(index_access.base)
+                && self.index_lookup_has_no_lowering_side_effect(index_access.index);
+        }
+        return false;
+    }
+
+    Bool index_lookup_has_no_lowering_side_effect(hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        guard node.data is .name_ref(name_ref) else {
+            return false;
+        }
+        return name_ref is .local;
     }
 
     Bool type_needs_array_to_slice(qid.TypeId actual, qid.TypeId expected) {
@@ -1477,6 +1505,7 @@ struct BodyLowerer: Movable {
     ) {
         token.Span span = self.lowerer.hir_span(node_id);
         mir.MirPlace subject_place = self.optional_pattern_subject_place(is_pattern, span);
+        qid.TypeId subject_type = self.pattern_subject_type(self.type_for_node(is_pattern.value));
         mir.MirLocalId condition_local = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(condition_local),
@@ -1490,20 +1519,21 @@ struct BodyLowerer: Movable {
             condition: mir.copy_operand_value(mir.MirCopyOperand (place: self.place_for_local(condition_local))),
             pattern_id: is_pattern.pattern,
             subject_place: subject_place,
-            subject_type: self.type_for_node(is_pattern.value)
+            subject_type: subject_type
         );
     }
 
     mir.MirPlace optional_pattern_subject_place(hir.HirIsPattern is_pattern, token.Span span) {
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
         if (self.optional_pattern_has_borrow_binding(is_pattern.pattern)) {
             if (self.place_for_expr(is_pattern.value) is some place) {
-                return place;
+                return self.pattern_subject_place_for_value(place, value_type);
             }
         }
-        mir.MirLocalId subject_local = self.add_temp(self.type_for_node(is_pattern.value), span);
-        mir.MirPlace subject_place = self.place_for_local(subject_local);
+        mir.MirLocalId subject_local = self.add_temp(value_type, span);
+        mir.MirPlace! subject_place = self.place_for_local(subject_local);
         self.lower_into_place(is_pattern.value, subject_place);
-        return subject_place;
+        return self.pattern_subject_place_for_value(subject_place, value_type);
     }
 
     Bool optional_pattern_has_borrow_binding(hir.HirId pattern_id) {
@@ -1521,10 +1551,12 @@ struct BodyLowerer: Movable {
         hir.HirIsPattern is_pattern
     ) {
         token.Span span = self.lowerer.hir_span(node_id);
-        qid.TypeId subject_type = self.type_for_node(is_pattern.value);
-        mir.MirLocalId subject_local = self.add_temp(subject_type, span);
-        mir.MirPlace subject_place = self.place_for_local(subject_local);
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        qid.TypeId subject_type = self.pattern_subject_type(value_type);
+        mir.MirLocalId subject_local = self.add_temp(value_type, span);
+        mir.MirPlace! subject_place = self.place_for_local(subject_local);
         self.lower_into_place(is_pattern.value, subject_place);
+        subject_place = self.pattern_subject_place_for_value(subject_place, value_type);
         mir.MirLocalId condition_local = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(condition_local),
@@ -1546,6 +1578,38 @@ struct BodyLowerer: Movable {
             subject_place: subject_place,
             subject_type: subject_type
         );
+    }
+
+    qid.TypeId pattern_subject_type(qid.TypeId value_type) {
+        // MIR subject 类型需要和 type check 一致：pattern 检查引用指向的值，
+        // 而不是引用 handle 本身。
+        qid.TypeId read_type = self.read_value_type(value_type);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(read_type);
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) {
+                return self.read_value_type(handle.element);
+            }
+        }
+        return read_type;
+    }
+
+    mir.MirPlace pattern_subject_place_for_value(mir.MirPlace value_place, qid.TypeId value_type) {
+        // 源表达式是引用时，discriminant/payload 要从被引用的 place 读取。
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.read_value_type(value_type));
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) {
+                return self.project_deref(value_place, false);
+            }
+        }
+        return value_place;
+    }
+
+    qid.TypeId read_value_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (!info.is_mutable) {
+            return type_id;
+        }
+        return self.lowerer.ctx.store.types.create(info.data, info.span);
     }
 
     mir.MirOperand variant_pattern_discriminator(

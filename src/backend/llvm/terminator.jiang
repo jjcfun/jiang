@@ -319,16 +319,21 @@ ffi.Value lower_call_arg(
     backend_abi.AbiArg param_abi,
     list.ArrayList<ffi.Value>& local_slots
 ) {
+    if (operand is .out_operand(out_operand)) {
+        return llvm_place.lower_place_pointer(state, body, out_operand.place, local_slots);
+    }
     if (param_abi.kind == .indirect) {
+        // indirect 参数的 ABI 形态是指针，传入 place 指针即可；临时 rvalue 才需要
+        // 先落到 stack slot。
         return lower_indirect_call_arg(state, body, operand, param_abi.type_id, local_slots);
     }
     if (should_pass_reference_place_pointer(state, body, operand, param_abi.type_id)) {
         guard operand_place(operand) is some place else {
-            return llvm_value.lower_operand(state, body, operand, local_slots);
+            return lower_call_arg_value(state, body, operand, local_slots);
         }
         return llvm_place.lower_place_pointer(state, body, place, local_slots);
     }
-    return llvm_value.lower_operand(state, body, operand, local_slots);
+    return lower_call_arg_value(state, body, operand, local_slots);
 }
 
 ffi.Value lower_indirect_call_arg(
@@ -339,9 +344,13 @@ ffi.Value lower_indirect_call_arg(
     list.ArrayList<ffi.Value>& local_slots
 ) {
     if (operand_place(operand) is some place) {
-        return llvm_place.lower_place_pointer(state, body, place, local_slots);
+        ffi.Value pointer = llvm_place.lower_place_pointer(state, body, place, local_slots);
+        if (!ffi.value_valid(pointer)) {
+            add_backend_error(state, "failed to lower indirect LLVM call argument place", "llvm_indirect_call_arg_place_lower_failed");
+        }
+        return pointer;
     }
-    ffi.Value value = llvm_value.lower_operand(state, body, operand, local_slots);
+    ffi.Value value = lower_call_arg_value(state, body, operand, local_slots);
     if (!ffi.value_valid(value)) {
         return ffi.Value();
     }
@@ -359,6 +368,33 @@ ffi.Value lower_indirect_call_arg(
     return temp;
 }
 
+ffi.Value lower_call_arg_value(
+    llvm_state.LowerState& state,
+    mir.MirBody body,
+    mir.MirOperand operand,
+    list.ArrayList<ffi.Value>& local_slots
+) {
+    if (operand is .const_operand(const_value)) {
+        return llvm_value.lower_const(state, const_value);
+    }
+    if (operand is .function_operand(function_value)) {
+        return llvm_value.function_value_for_ref(state, function_value);
+    }
+    if (operand is .global_operand(global_value)) {
+        return llvm_value.global_value_for_ref(state, global_value);
+    }
+    if (operand is .copy_operand(copy_operand)) {
+        return llvm_place.lower_place_value(state, body, copy_operand.place, local_slots);
+    }
+    if (operand is .move_operand(move_operand)) {
+        return llvm_place.lower_place_value(state, body, move_operand.place, local_slots);
+    }
+    if (operand is .out_operand(out_operand)) {
+        return llvm_place.lower_place_pointer(state, body, out_operand.place, local_slots);
+    }
+    return ffi.Value();
+}
+
 Bool should_pass_reference_place_pointer(
     llvm_state.LowerState& state,
     mir.MirBody body,
@@ -368,10 +404,29 @@ Bool should_pass_reference_place_pointer(
     if (!type_is_reference(state, param_type)) {
         return false;
     }
-    if (type_is_reference(state, llvm_value.operand_type(state, body, operand))) {
+    if (type_is_reference(state, call_arg_operand_type(state, body, operand))) {
         return false;
     }
     return operand_place(operand) != null;
+}
+
+qid.TypeId call_arg_operand_type(llvm_state.LowerState& state, mir.MirBody body, mir.MirOperand operand) {
+    if (operand is .const_operand(const_value)) {
+        return const_value.type_id;
+    }
+    if (operand is .function_operand(function_value)) {
+        return function_value.type_id;
+    }
+    if (operand is .global_operand(global_value)) {
+        return global_value.type_id;
+    }
+    if (operand is .copy_operand(copy_operand)) {
+        return llvm_place.place_type(state, body, copy_operand.place);
+    }
+    if (operand is .move_operand(move_operand)) {
+        return llvm_place.place_type(state, body, move_operand.place);
+    }
+    return state.ctx.store.types.invalid_type();
 }
 
 mir.MirPlace? operand_place(mir.MirOperand operand) {
@@ -380,6 +435,9 @@ mir.MirPlace? operand_place(mir.MirOperand operand) {
     }
     if (operand is .move_operand(move_operand)) {
         return move_operand.place;
+    }
+    if (operand is .out_operand(out_operand)) {
+        return out_operand.place;
     }
     return null;
 }
@@ -403,8 +461,16 @@ Bool type_is_reference(llvm_state.LowerState& state, qid.TypeId type_id) {
         add_backend_error(state, "failed to lower LLVM move call argument", "llvm_call_move_arg_lower_failed");
         return;
     }
+    if (operand is .out_operand(_)) {
+        add_backend_error(state, "failed to lower LLVM out call argument", "llvm_call_out_arg_lower_failed");
+        return;
+    }
     if (operand is .function_operand(_)) {
         add_backend_error(state, "failed to lower LLVM function call argument", "llvm_call_function_arg_lower_failed");
+        return;
+    }
+    if (operand is .global_operand(_)) {
+        add_backend_error(state, "failed to lower LLVM global call argument", "llvm_call_global_arg_lower_failed");
         return;
     }
     add_backend_error(state, "failed to lower LLVM call argument", "llvm_call_arg_lower_failed");
@@ -486,17 +552,38 @@ Bool lower_indirect_return_value(
     list.ArrayList<ffi.Value>& local_slots
 ) {
     mir.MirLocalDecl return_local = body.locals[body.return_local.to_index()];
-    ffi.Value value = llvm_place.lower_local_load(state, return_local, local_slots);
-    if (!ffi.value_valid(value)) {
-        add_backend_error(state, "failed to load LLVM indirect return value", "llvm_indirect_return_load_failed");
+    ffi.Value source_pointer = local_slots.get(return_local.id.to_index());
+    if (!ffi.value_valid(source_pointer)) {
+        add_backend_error(state, "failed to lower LLVM indirect return source", "llvm_indirect_return_source_lower_failed");
         return false;
     }
     ffi.Value return_pointer = ffi.function_param(llvm_function, 0);
-    if (!ffi.value_valid(ffi.builder_build_store(state.builder, value, return_pointer))) {
-        add_backend_error(state, "failed to store LLVM indirect return value", "llvm_indirect_return_store_failed");
+    // sret 返回值同样是调用方提供的指针，按布局字节复制 return local。
+    if (!copy_return_bytes(state, return_local.type_id, source_pointer, return_pointer)) {
+        add_backend_error(state, "failed to copy LLVM indirect return value", "llvm_indirect_return_copy_failed");
         return false;
     }
     return ffi.value_valid(ffi.builder_build_return_void(state.builder));
+}
+
+Bool copy_return_bytes(
+    llvm_state.LowerState& state,
+    qid.TypeId type_id,
+    ffi.Value source_pointer,
+    ffi.Value destination_pointer
+) {
+    ffi.Type size_type = ffi.context_int_type(state.llvm_context, state.ctx.store.layouts.target.pointer_size * 8);
+    ffi.Value size = ffi.const_int(size_type, UInt64(llvm_type.layout_size(state, type_id)));
+    Int align = llvm_type.layout_align(state, type_id);
+    return ffi.value_valid(ffi.builder_build_memcpy(
+            state.builder,
+            destination_pointer,
+            align,
+            source_pointer,
+            align,
+            size
+        )
+    );
 }
 
 Bool lower_return_value(
