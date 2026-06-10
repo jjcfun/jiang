@@ -18,6 +18,7 @@ sample_ll="$SMOKE_BUILD_DIR/minimal.ll"
 sample_obj="$SMOKE_BUILD_DIR/minimal.o"
 sample_from_ll="$SMOKE_BUILD_DIR/minimal_from_ll"
 sample_from_obj="$SMOKE_BUILD_DIR/minimal_from_obj"
+sample_with_link_arg="$SMOKE_BUILD_DIR/minimal_with_link_arg"
 field_sample="$SMOKE_BUILD_DIR/field_projection.jiang"
 field_ll="$SMOKE_BUILD_DIR/field_projection.ll"
 field_bin="$SMOKE_BUILD_DIR/field_projection"
@@ -46,6 +47,9 @@ test -s "$sample_obj"
   $("$LLVM_CONFIG" --libs all) \
   $("$LLVM_CONFIG" --system-libs)
 "$sample_from_obj"
+
+"$compiler_bin" --link-arg -Wl,-dead_strip -o "$sample_with_link_arg" "$sample"
+"$sample_with_link_arg"
 
 "$compiler_bin" --emit-llvm -o "$field_ll" "$field_sample"
 test -s "$field_ll"
