@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
-VERSION="${VERSION:-0.2.0-dev}"
+PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+VERSION="${VERSION:-$PACKAGE_VERSION}"
 TARGET="${TARGET:-macos-arm64}"
 STABLE_BIN="${STABLE_BIN:-$BUILD_DIR/jiangc.stable}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
@@ -14,6 +15,13 @@ PACKAGE_DIR="$DIST_DIR/$PACKAGE_NAME"
 PACKAGE_ZIP="$DIST_DIR/$PACKAGE_NAME.zip"
 
 cd "$ROOT_DIR"
+
+case "$VERSION" in
+  (*[!A-Za-z0-9._+-]*|'')
+    echo "invalid VERSION=$VERSION; expected [A-Za-z0-9._+-]+" >&2
+    exit 2
+    ;;
+esac
 
 if [ ! -x "$STABLE_BIN" ]; then
   echo "missing stable compiler: $STABLE_BIN" >&2
@@ -37,6 +45,14 @@ llvm_lib_dir="$("$LLVM_CONFIG" --libdir)"
 llvm_dylib="$llvm_lib_dir/libLLVM.dylib"
 if [ ! -f "$llvm_dylib" ]; then
   echo "missing LLVM dylib: $llvm_dylib" >&2
+  exit 2
+fi
+
+actual_version="$("$STABLE_BIN" --version | sed -n '1p')"
+expected_version="jiang $VERSION"
+if [ "$actual_version" != "$expected_version" ]; then
+  echo "stable compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
+  echo "run: JIANG_VERSION=$VERSION VERIFY=full bash ./script/build_stable.sh" >&2
   exit 2
 fi
 

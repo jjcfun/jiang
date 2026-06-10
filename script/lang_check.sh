@@ -112,6 +112,46 @@ run_run_case() {
   status=1
 }
 
+run_release_case() {
+  local source="$1"
+  local stem
+  stem="$(basename "$source" .jiang)"
+  local executable="/tmp/jiang_lang_release_${stem}"
+
+  if ! "$JIANGC" \
+    --mode release \
+    --link-arg "-L$LLVM_LIB_DIR" \
+    --link-arg -lLLVM \
+    -o "$executable" \
+    "$source" >/tmp/jiang_lang_release_build.out 2>&1; then
+    echo "FAIL release-run $source build failed"
+    sed -n '1,120p' /tmp/jiang_lang_release_build.out
+    status=1
+    return
+  fi
+
+  local expected
+  expected="$(sed -n 's/^.*expected-exit:[[:space:]]*//p' "$source" | head -n 1)"
+  if [ -z "$expected" ]; then
+    expected=0
+  fi
+
+  set +e
+  "$executable" >/tmp/jiang_lang_release_run.out 2>&1
+  local code=$?
+  set -e
+  rm -f "$executable"
+
+  if [ "$code" = "$expected" ]; then
+    echo "PASS release-run $source"
+    return
+  fi
+
+  echo "FAIL release-run $source exited $code, expected $expected"
+  sed -n '1,120p' /tmp/jiang_lang_release_run.out
+  status=1
+}
+
 while IFS= read -r source; do
   run_check_case "$source"
 done < <(find test/lang -path '*/check/*.jiang' -type f | sort)
@@ -130,6 +170,12 @@ if [ -x "$LLVM_CLANG" ]; then
   done < <(find test/lang -path '*/run/*.jiang' -type f | sort)
 else
   echo "SKIP run cases: missing LLVM_CLANG=$LLVM_CLANG"
+fi
+
+if [ "${LANG_CHECK_RELEASE_RUNS:-0}" = "1" ]; then
+  while IFS= read -r source; do
+    run_release_case "$source"
+  done < <(find test/lang -path '*/run/*.jiang' -type f | sort)
 fi
 
 exit "$status"

@@ -9,6 +9,9 @@ NEXT_BIN="${NEXT_BIN:-$BUILD_DIR/jiangc.next}"
 NEXT2_BIN="${NEXT2_BIN:-$BUILD_DIR/jiangc.next2}"
 STABLE_BIN="${STABLE_BIN:-$BUILD_DIR/jiangc.stable}"
 VERIFY="${VERIFY:-full}"
+PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
+OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
 
 mkdir -p "$BUILD_DIR"
 cd "$ROOT_DIR"
@@ -26,6 +29,21 @@ case "$VERIFY" in
     exit 2
     ;;
 esac
+
+case "$JIANG_VERSION" in
+  (*[!A-Za-z0-9._+-]*|'')
+    echo "invalid JIANG_VERSION=$JIANG_VERSION; expected [A-Za-z0-9._+-]+" >&2
+    exit 2
+    ;;
+esac
+
+OPTIONS_FILE_ORIGINAL="$(cat "$OPTIONS_FILE")"
+restore_options_file() {
+  printf '%s' "$OPTIONS_FILE_ORIGINAL" >"$OPTIONS_FILE"
+}
+trap restore_options_file EXIT
+
+perl -0pi -e 's/public UInt8\[\] default_compiler_version\(\) \{\n    return "[^"]*";\n\}/public UInt8[] default_compiler_version() {\n    return "'"$JIANG_VERSION"'";\n}/' "$OPTIONS_FILE"
 
 printf '== stable bootstrap: stage1 -> stage2 ==\n'
 STAGE1_BIN="$STAGE1_BIN" \
@@ -65,6 +83,13 @@ fi
 
 cp "$NEXT2_BIN" "$STABLE_BIN"
 chmod +x "$STABLE_BIN"
+
+actual_version="$("$STABLE_BIN" --version | sed -n '1p')"
+expected_version="jiang $JIANG_VERSION"
+if [ "$actual_version" != "$expected_version" ]; then
+  echo "stable compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
+  exit 1
+fi
 
 printf '\nOK stable compiler: %s\n' "$STABLE_BIN"
 printf 'candidate source: %s\n' "$NEXT2_BIN"
