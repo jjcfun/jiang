@@ -35,6 +35,17 @@ LLVM 对接通过 `backend/llvm/ffi.jiang` 的最小 C binding 完成。不要�
 LLVM API；每个 lowering/emission 任务只补当前需要的少量 FFI 声明。
 `backend/llvm` 直接调用这层 FFI，不维护自定义 LLVM IR 中间模型。
 
+## 编译模式
+
+backend 当前区分 debug/release：
+
+- debug：object emission 使用 LLVM codegen opt level 0，不跑 module pass pipeline。
+- release：object emission 使用 LLVM codegen opt level 2，并在写 object 前通过 LLVM
+  `LLVMRunPasses` 运行 `default<O2>` module pass pipeline。
+
+backend profile 由 driver options 统一描述，包含 mode、codegen opt level 和 pass pipeline。
+这个 profile 必须进入 object cache key，避免优化策略变化后复用旧 object。
+
 ## C ABI classifier
 
 `backend/abi.jiang` 是 backend-independent 的 C ABI classifier。它消费 semantic `TypeId`
@@ -61,6 +72,7 @@ attribute。LLVM declaration 和 call site 必须使用同一个 plan。
 - C ABI classifier：zero-sized/direct/indirect、`byval` 参数、`sret` 返回。
 - function symbol key / mangling，包含 package/module/concrete type args。
 - LLVM IR / object file / executable emission。
+- debug/release object emission；release 默认跑 LLVM `default<O2>`。
 - target triple / data layout 接入。
 - struct/tuple/array aggregate。
 - enum/union tag 与 union payload。

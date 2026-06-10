@@ -9,7 +9,7 @@
 test/lang/<feature>/
   check/       期望 jiangc --check 成功
   fail/        期望 jiangc --check 失败，并用 expected 精确匹配诊断
-  run/         期望 emit + link + run 成功，可用 expected-exit 匹配退出码
+  run/         期望 emit/link/run 成功，可用 expected-exit 匹配退出码
   emit/        期望 emit-llvm 成功，不要求运行
   diagnostic/ 未来用于精确检查多条诊断、span 和消息
 ```
@@ -54,6 +54,16 @@ test/lang/<feature>/
 1. 先按 `doc/grammar.md` 的语法规则补 parser/type check 可见的 check/fail 用例。
 2. 再按 `doc/language-design.md` 的语义章节补类型、所有权、lifetime、泛型和模块用例。
 3. 最后给所有会影响 MIR/layout/backend 的功能补 `run/` 或 `emit/` 用例。
+
+`script/lang_check.sh` 默认的 `run/` 会用 `jiangc --emit-llvm` 生成 LLVM IR，再用 LLVM clang
+链接运行。需要覆盖 release object/executable 路径时，设置：
+
+```bash
+LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/jiangc.stable bash ./script/lang_check.sh
+```
+
+这会额外对所有 `run/` 用例执行 `jiangc --mode release -o ...`，覆盖 LLVM codegen opt level 2
+和 `default<O2>` pass pipeline。
 
 任何新增语言能力必须同步更新本矩阵；如果某个语义尚未定稿，应在对应 TODO 中标注，不能用临时
 测试假定长期规则。

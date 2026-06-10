@@ -291,10 +291,11 @@ object path 由 backend artifact path planner 生成：
 ```text
 cache_root/objects/source_<hash>.o
 cache_root/objects/mono_<stable_instance_fingerprint>.o
+cache_root/objects/release_pkg_<hash>.o
 ```
 
-planner 是纯函数，不创建目录、不写文件。pipeline 接入 object lookup 前，driver/OS 层需要先
-调度 `support/fs` 已有的递归建目录能力和 `artifact/object_hash` 的 object hash 计算。
+planner 是纯函数，不创建目录、不写文件。pipeline 负责在 object emit 前创建 cache 目录，
+并在 cache lookup / validate 时使用 `artifact/object_hash` 计算实际 object hash。
 
 `CompileOptions.artifact_cache_dir` 是当前编译的 cache root，默认值为 `build/cache`。
 pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
@@ -332,6 +333,8 @@ stable monomorph instance key。
 输入；pipeline 不应直接读取 `ResolveStore` / `SourceStore` 拼 cache key。
 target/compiler fingerprint 由调用方传入真实 target triple 和 compiler version，builder 只做
 domain-separated hash，不提供临时默认值。
+backend profile fingerprint 同样由 compile mode 派生，当前编码 mode、LLVM codegen opt level 和
+LLVM pass pipeline。任何会改变 object 语义的 backend 选项都必须进入这个 profile。
 interface/body/layout 等多段 fingerprint 通过 `artifact/object_key.jiang` 的组合 helper 聚合，
 组合顺序必须稳定，不能使用 session-local id 排序。
 
@@ -346,6 +349,7 @@ StableInstanceKey
   layout_hash
   target / ABI
   compiler_version
+  backend_profile
 ```
 
 当前 session 内的 `MonomorphStore` 仍然使用 `DefId + TypeId[]` 做内存去重。这个 key
@@ -369,9 +373,9 @@ session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/obj
 - `QueryDependencyGraph`：记录 query dependency / reverse dependency，并提供 transitive invalidation。
 - `CompilerSession`：持有可复用 `CompilerContext`，通过 `begin_compilation` 进入下一轮编译。
 
-这些结构现在仍然是内存/mock API；真正磁盘落盘、object lookup 和长驻服务在后续阶段接入。
-`support/fs` 已提供文件存在性检查、递归建目录和覆盖写文件，`artifact/object_hash` 已提供
-object 文件内容 hash；pipeline 还没有把这些能力接到 object cache lookup / validate 流程。
+这些结构中，source/interface artifact 和 object artifact 仍主要以内存 index 描述长期身份；
+pipeline 已接入 object cache 目录创建、object lookup/validate、缺失 object emission 和命中
+object 复制。长驻服务、磁盘 artifact index 持久化和更细粒度 invalidation 仍在后续阶段。
 
 ## Invalidation
 

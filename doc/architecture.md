@@ -310,7 +310,8 @@ public trait Indexable {
 
 ## 测试目录
 
-- `test/smoke/`：当前 stage2 骨架的端到端 smoke，使用 stage1 编译器编译。
+- `test/smoke/`：当前 stage2 骨架的端到端 smoke，由脚本通过 `JIANGC` 指定编译器；
+  稳定自举验证使用 `build/jiangc.next2` 或 `build/jiangc.stable`。
 - `test/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
 - `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。

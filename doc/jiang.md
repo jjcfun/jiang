@@ -2097,15 +2097,18 @@ jiangc path/to/pkg -o pkg
 
 - `[package].name`
 - `[package].root`
+- `[package].version`
 - `[dependencies]`
 
-这两个字段都可选：
+这些 package 字段都可选：
 
 - `name` 未写时，默认取当前目录名
 - `root` 未写时，默认取 `<name>.jiang`
+- `version` 未写时，manifest 内保留为空；编译器自身 release 构建从根 `package.ini` 读取版本
 - 若显式写了，则覆盖默认值
 - `name` 无论显式还是默认值，都必须满足 Jiang lexer 的标识符规则：ASCII 字母或 `_`
   可作为首字符，ASCII 数字可作为后续字符，UTF-8 标识符字符也可作为首字符和后续字符。
+- `version` 目前允许 ASCII 字母、数字、`.`、`_`、`+`、`-`。
 
 例如：
 
@@ -2132,6 +2135,7 @@ lexer/
 [package]
 name = frontend
 root = src/main.jiang
+version = 0.2.0
 ```
 
 当前第一版 package 机制还支持本地依赖：
