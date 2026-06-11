@@ -7,7 +7,7 @@ DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 TARGET="${TARGET:-macos-arm64}"
-STABLE_BIN="${STABLE_BIN:-$BUILD_DIR/jiangc.stable}"
+JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
 
 PACKAGE_NAME="jiang-$VERSION-$TARGET"
@@ -23,9 +23,9 @@ case "$VERSION" in
     ;;
 esac
 
-if [ ! -x "$STABLE_BIN" ]; then
-  echo "missing stable compiler: $STABLE_BIN" >&2
-  echo "run: VERIFY=full bash ./script/build_stable.sh" >&2
+if [ ! -x "$JIANGC_BIN" ]; then
+  echo "missing compiler: $JIANGC_BIN" >&2
+  echo "run: VERIFY=full bash ./script/build_next.sh" >&2
   exit 2
 fi
 
@@ -48,18 +48,18 @@ if [ ! -f "$llvm_dylib" ]; then
   exit 2
 fi
 
-actual_version="$("$STABLE_BIN" --version | sed -n '1p')"
+actual_version="$("$JIANGC_BIN" --version | sed -n '1p')"
 expected_version="jiang $VERSION"
 if [ "$actual_version" != "$expected_version" ]; then
-  echo "stable compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
-  echo "run: JIANG_VERSION=$VERSION VERIFY=full bash ./script/build_stable.sh" >&2
+  echo "compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
+  echo "run: JIANG_VERSION=$VERSION VERIFY=full bash ./script/build_next.sh" >&2
   exit 2
 fi
 
 rm -rf "$PACKAGE_DIR" "$PACKAGE_ZIP"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/script"
 
-cp "$STABLE_BIN" "$PACKAGE_DIR/bin/jiangc"
+cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiangc"
 cp "$ROOT_DIR/script/install_llvm_macos.sh" "$PACKAGE_DIR/script/install_llvm_macos.sh"
 chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/script/install_llvm_macos.sh"
 

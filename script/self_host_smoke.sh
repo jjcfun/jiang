@@ -2,13 +2,35 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STAGE1_BIN="${STAGE1_BIN:-$HOME/.jiang/stage1/bin/jiangc}"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_self_host"
 LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
 
 mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
+
+COMPILER_UNDER_TEST="${JIANGC:-}"
+if [ -z "$COMPILER_UNDER_TEST" ]; then
+  COMPILER_UNDER_TEST="$(command -v jiangc || true)"
+  if [ -z "$COMPILER_UNDER_TEST" ] || [ ! -x "$COMPILER_UNDER_TEST" ]; then
+    echo "missing compiler: set JIANGC or put jiangc on PATH" >&2
+    echo "install Jiang 0.2 so jiangc is on PATH" >&2
+    exit 2
+  fi
+  COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
+  case "$COMPILER_VERSION" in
+    "jiang 0.2"|"jiang 0.2."*) ;;
+    *)
+      echo "unsupported bootstrap compiler: $COMPILER_VERSION" >&2
+      echo "install Jiang 0.2 so jiangc is on PATH, or pass JIANGC=<compiler>" >&2
+      exit 2
+      ;;
+  esac
+elif [ ! -x "$COMPILER_UNDER_TEST" ]; then
+  echo "missing compiler: $COMPILER_UNDER_TEST" >&2
+  exit 2
+fi
+COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
 
 minimal_sample="$SMOKE_BUILD_DIR/minimal.jiang"
 field_sample="$SMOKE_BUILD_DIR/field_projection.jiang"
@@ -26,7 +48,8 @@ clang_bin="$("$LLVM_CONFIG" --bindir)/clang"
 compiler_ll="$SMOKE_BUILD_DIR/jiangc.stage2.ll"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc.stage2"
 
-"$STAGE1_BIN" --emit-llvm src/jiangc.jiang >"$compiler_ll"
+printf '== self-host smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
+"$COMPILER_UNDER_TEST" --emit-llvm src/jiangc.jiang >"$compiler_ll"
 "$clang_bin" "$compiler_ll" -o "$compiler_bin" \
   $("$LLVM_CONFIG" --ldflags) \
   $("$LLVM_CONFIG" --libs all) \

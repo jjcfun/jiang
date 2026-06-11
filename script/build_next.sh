@@ -3,26 +3,126 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
-STAGE2_BIN="${STAGE2_BIN:-$BUILD_DIR/jiangc}"
 NEXT_BIN="${NEXT_BIN:-$BUILD_DIR/jiangc.next}"
+JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
+LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
+VERIFY="${VERIFY:-full}"
+PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
+OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
 
 mkdir -p "$BUILD_DIR"
 cd "$ROOT_DIR"
 
-clang_bin="$("$LLVM_CONFIG" --bindir)/clang"
-next_ll="$BUILD_DIR/jiangc.next.ll"
+BOOTSTRAP_BIN="$(command -v jiangc || true)"
+if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
+  echo "missing bootstrap compiler: jiangc" >&2
+  echo "install Jiang 0.2 so jiangc is on PATH" >&2
+  exit 2
+fi
+BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
+case "$BOOTSTRAP_VERSION" in
+  "jiang 0.2"|"jiang 0.2."*) ;;
+  *)
+    echo "unsupported bootstrap compiler: $BOOTSTRAP_VERSION" >&2
+    echo "install Jiang 0.2 so jiangc is on PATH" >&2
+    exit 2
+    ;;
+esac
 
-test -x "$STAGE2_BIN"
+if [ ! -x "$LLVM_CONFIG" ]; then
+  echo "missing llvm-config: $LLVM_CONFIG" >&2
+  exit 2
+fi
+CLANG_BIN="$("$LLVM_CONFIG" --bindir)/clang"
 
-printf '== build next: emit llvm with %s ==\n' "$STAGE2_BIN"
-"$STAGE2_BIN" --emit-llvm -o "$next_ll" src/jiangc.jiang
+case "$VERIFY" in
+  none|smoke|full) ;;
+  *)
+    echo "invalid VERIFY=$VERIFY; expected none, smoke, or full" >&2
+    exit 2
+    ;;
+esac
 
-printf '== build next: link %s ==\n' "$NEXT_BIN"
-"$clang_bin" "$next_ll" -o "$NEXT_BIN" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+case "$JIANG_VERSION" in
+  (*[!A-Za-z0-9._+-]*|'')
+    echo "invalid JIANG_VERSION=$JIANG_VERSION; expected [A-Za-z0-9._+-]+" >&2
+    exit 2
+    ;;
+esac
 
-test -x "$NEXT_BIN"
-printf 'OK %s\n' "$NEXT_BIN"
+OPTIONS_FILE_ORIGINAL="$(cat "$OPTIONS_FILE")"
+restore_options_file() {
+  printf '%s' "$OPTIONS_FILE_ORIGINAL" >"$OPTIONS_FILE"
+}
+trap restore_options_file EXIT
+
+perl -0pi -e 's/public UInt8\[\] default_compiler_version\(\) \{\n    return "[^"]*";\n\}/public UInt8[] default_compiler_version() {\n    return "'"$JIANG_VERSION"'";\n}/' "$OPTIONS_FILE"
+
+link_llvm() {
+  local input_ll="$1"
+  local output_bin="$2"
+  "$CLANG_BIN" "$input_ll" -o "$output_bin" \
+    $("$LLVM_CONFIG" --ldflags) \
+    $("$LLVM_CONFIG" --libs all) \
+    $("$LLVM_CONFIG" --system-libs)
+  test -x "$output_bin"
+}
+
+emit_next_from_bootstrap() {
+  local output_bin="$1"
+  local output_ll="$BUILD_DIR/jiangc.next.ll"
+  printf '== build next: emit next llvm with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
+  "$BOOTSTRAP_BIN" --emit-llvm src/jiangc.jiang >"$output_ll"
+  printf '== build next: link %s ==\n' "$output_bin"
+  link_llvm "$output_ll" "$output_bin"
+  printf 'OK %s\n' "$output_bin"
+}
+
+emit_compiler_with_compiler() {
+  local source_bin="$1"
+  local output_bin="$2"
+  local output_ll="$3"
+  test -x "$source_bin"
+  printf '== build next: emit llvm with %s ==\n' "$source_bin"
+  "$source_bin" --emit-llvm -o "$output_ll" src/jiangc.jiang
+  printf '== build next: link %s ==\n' "$output_bin"
+  link_llvm "$output_ll" "$output_bin"
+  printf 'OK %s\n' "$output_bin"
+}
+
+printf '== build next: 0.2 -> next ==\n'
+emit_next_from_bootstrap "$NEXT_BIN"
+
+printf '\n== build next: next -> jiangc ==\n'
+emit_compiler_with_compiler "$NEXT_BIN" "$JIANGC_BIN" "$BUILD_DIR/jiangc.ll"
+
+if [ "$VERIFY" != "none" ]; then
+  printf '\n== next verify: smoke with %s ==\n' "$JIANGC_BIN"
+  BUILD_DIR="$BUILD_DIR" \
+  JIANGC="$JIANGC_BIN" \
+  bash "$ROOT_DIR/script/smoke.sh"
+
+  printf '\n== next verify: backend cli smoke ==\n'
+  BUILD_DIR="$BUILD_DIR" \
+  JIANGC="$JIANGC_BIN" \
+  bash "$ROOT_DIR/script/backend_cli_smoke.sh"
+fi
+
+if [ "$VERIFY" = "full" ]; then
+  printf '\n== next verify: lang check with %s ==\n' "$JIANGC_BIN"
+  JIANGC="$JIANGC_BIN" \
+  bash "$ROOT_DIR/script/lang_check.sh"
+fi
+
+chmod +x "$JIANGC_BIN"
+
+actual_version="$("$JIANGC_BIN" --version | sed -n '1p')"
+expected_version="jiang $JIANG_VERSION"
+if [ "$actual_version" != "$expected_version" ]; then
+  echo "compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
+  exit 1
+fi
+
+printf '\nOK compiler: %s\n' "$JIANGC_BIN"
+printf 'bootstrap candidate: %s\n' "$NEXT_BIN"
