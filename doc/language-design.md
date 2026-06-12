@@ -509,6 +509,7 @@ lifetime 和 drop safety。
 - `public import alias = "path.jiang";`
 - `alias Name = Type;`
 - `public alias exported = module.symbol;`
+- const global declaration: `const Type name = expr;`
 - global declaration: `Type name = expr;`
 - function declaration / definition
 - `struct`
@@ -518,6 +519,8 @@ lifetime 和 drop safety。
 - `extend`
 
 目标语言支持 `public import`，用于 re-export 被导入模块的 public API。
+
+顶层 `const` 是编译期常量声明。0.2.1 支持 literal、整数/Bool 的一元和二元常量表达式、括号表达式，以及引用同模块已定义的非递归 `const`。`const` 不能 `public`，也不能使用函数调用、block 或运行时值作为 initializer；跨模块常量序列化后续再补。
 
 ### Import
 

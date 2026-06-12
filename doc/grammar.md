@@ -91,6 +91,7 @@ top_level_decl_body
              / trait_decl
              / extend_decl
              / function_decl
+             / const_global_decl
              / global_decl
 
 member_decl_body
@@ -121,6 +122,9 @@ alias_target
 
 function_decl
             <- result_type name function_tail
+
+const_global_decl
+            <- "const" type name "=" expr ";"
 
 global_decl <- type name global_tail
 
