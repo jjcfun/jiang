@@ -81,9 +81,9 @@ Token 只表示词法事实，不承载语义类型。
 
 字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
-字符串字面量是 UTF-8 字节序列。0.2.1 起，字符串字面量的 backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。当前兼容实现中，字符串字面量可用于 `UInt8[_]` / `UInt8[]` / `UInt8[]&` / `UInt8[:0]` / `UInt8[:0]&`，也可在 C ABI expected type 下转换为 `UInt8[*:0]`。
+字符串字面量是 UTF-8 字节序列。0.2.2 起，字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8[*:0]` 或 `UInt8[N:0]`。
 
-`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。`CString` / `CString&` 仍作为兼容路径保留，后续会迁移到 `UInt8[*:0]`。
+`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。`CString` / `CString&` 仍作为只读 C string 兼容路径保留；它不能表达可变 sentinel buffer，新代码应优先使用 `UInt8[:0]&`、`UInt8[*:0]` 或后续的可变 sentinel buffer 类型。
 
 ## 类型系统
 
@@ -103,19 +103,21 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T?!`：optional 类型层可变的规范写法。
 - `T^`：自动解引用的 owning heap pointer，通常来自 `new T(...)`；它不是 C 风格 raw pointer。
 - `T&`：自动解引用的非 owning 引用，不表达释放职责。
-- `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。0.2.1 兼容期仍接受裸 `T[]` 作为同一类型。
-- `T[:0]&`：borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。0.2.1 兼容期仍接受裸 `T[:0]` 作为同一类型；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
+- `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` 是 unsized array pointee，不能作为普通 value。
+- `T[:0]&`：borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。裸 `T[:0]` 是带 sentinel 的 unsized array pointee，不能作为普通 value；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
 - `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
 - `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
 - `T*`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
-- `T[N:0]`：sentinel 定长数组语法；0.2.1 先保留类型标记，完整 array sentinel storage 语义后续补齐。
+- `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
 - `T@E`：errorable。
 - `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
 - 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
 
 内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Optional<T>`、`Array<T>`、`UnsizedArray<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T@E` 等表面语法。
+
+0.2.2 的 sentinel value 只支持整数 literal，element type 必须是整数类型，并且 sentinel value 必须能被 element type 表示。例如 `UInt8[5:0]` 合法，`UInt8[5:300]` 和 `Bool[1:0]` 不合法。HIR 只保留未定型 literal；sema 阶段会将 sentinel 绑定到 element type。
 
 示例：
 
@@ -255,9 +257,9 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
-- `T[]`：slice reference，语义上类似 `{ T[*], length }&` 的连续内存引用视图；它不表达所有权。
+- `T[]`：unsized array pointee，必须通过 `T[]&` 形成 borrowed slice view；slice view 语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权。
 - `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
-- `T[:0]`：sentinel slice reference，语义上类似 `{ T[*:0], length }&`，并保证 `data[length] == 0`。
+- `T[:0]`：带 sentinel 的 unsized array pointee，必须通过 `T[:0]&` 形成 sentinel slice view；slice view 语义上类似 `{ T[*:0], length }&`，并保证 `data[length] == 0`。
 
 `T&`、`T&!` 和 `T[]` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]` 字段时，目标对象的生命周期必须覆盖包含该字段的值。
 

@@ -124,7 +124,7 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 - `Int` / `UInt` 是 pointer-sized 整数，语义上分别对应 `isize` / `usize`；在 64-bit target 上通常是 64 位，在 32-bit target 上通常是 32 位。
 - 需要固定 ABI 宽度、文件格式或网络协议布局时，使用 `Int8/Int16/Int32/Int64` 与 `UInt8/UInt16/UInt32/UInt64`。
 - `Char` 表示单个 Unicode 标量，例如 `'a'`、`'中'`
-- 字符串字面量按 UTF-8 字节序列处理，backing storage 自动追加末尾 `0`，但 sentinel 不计入 length。当前可用于 `UInt8[_]` / `UInt8[]` / `UInt8[]&` / `UInt8[:0]` / `UInt8[:0]&`，也可按 expected type 转成 `UInt8[*:0]`
+- 字符串字面量按 UTF-8 字节序列处理，默认类型为 `UInt8[:0]&`；backing storage 自动追加末尾 `0`，但 sentinel 不计入 length。当前可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可按 expected type 转成 `UInt8[*:0]` 或 `UInt8[N:0]`
 - `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
 
 数值字面量在类型检查前保持未定型，优先由上下文决定最终类型。普通已经定型的数值之间不做隐式提升：
@@ -388,9 +388,9 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
-- `T[]&`：borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；0.2.1 兼容期仍接受裸 `T[]` 作为同一类型
+- `T[]&`：borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；裸 `T[]` 是 unsized array pointee，不能作为普通 value
 - `T[*:0]`：sentinel many-pointer，不带 length，适合 C string ABI
-- `T[:0]&`：sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；0.2.1 兼容期仍接受裸 `T[:0]` 作为同一类型
+- `T[:0]&`：sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array pointee，不能作为普通 value
 
 只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T[*]` 和 `T*` 都不拥有目标对象。
 
@@ -636,13 +636,13 @@ Int! x = add(1, 2); 		// 定义变量
 
 ```c
 UInt8[_] str1 = "hello";
-UInt8[] str2 = "hello";
-UInt8[:0] str3 = "hello";
+UInt8[]& str2 = "hello";
+UInt8[5:0] str3 = "hello";
 UInt8[:0]& str4 = "hello";
 UInt8[*:0] c_str = "hello";
 ```
 
-字符串字面量的底层存储会自动追加末尾 `0`，但 `length` 不包含这个 sentinel。例如 `"hello"` 作为 `UInt8[:0]&` 时，`length == 5`。普通 `UInt8[*]` 不直接接收字符串字面量；需要 C 风格 NUL 结尾指针时使用 `UInt8[*:0]`。
+字符串字面量的底层存储会自动追加末尾 `0`，但 `length` 不包含这个 sentinel。例如 `"hello"` 作为 `UInt8[:0]&` 时，`length == 5`。`UInt8[5:0]` 的逻辑长度是 5，但实际 storage 是 6 个 `UInt8`，因此 `UInt8[5:0]$.size() == 6`。普通 `UInt8[*]` 不直接接收字符串字面量；需要 C 风格 NUL 结尾指针时使用 `UInt8[*:0]`。
 
 ### Range
 
@@ -2204,7 +2204,7 @@ alias x = a + b;
 
 传给 C 风格 API 的字符串优先使用 `UInt8[*:0]` 表示。字符串字面量在 `UInt8[*:0]` 上下文中会生成以 `\0` 结尾的只读全局数据。`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量。
 
-`CString` / `CString&` 仍作为兼容路径保留，但新代码应优先使用 `UInt8[*:0]`。
+`CString` / `CString&` 仍作为只读 C string 兼容路径保留，但不能表达可变 sentinel buffer；新代码应优先使用 `UInt8[:0]&`、`UInt8[*:0]` 或后续的可变 sentinel buffer 类型。
 
 ```c
 extern {
