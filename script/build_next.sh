@@ -57,7 +57,7 @@ restore_options_file() {
 }
 trap restore_options_file EXIT
 
-perl -0pi -e 's/public UInt8\[\] default_compiler_version\(\) \{\n    return "[^"]*";\n\}/public UInt8[] default_compiler_version() {\n    return "'"$JIANG_VERSION"'";\n}/' "$OPTIONS_FILE"
+perl -0pi -e 's/public UInt8\[\]&? default_compiler_version\(\) \{\n    return "[^"]*";\n\}/public UInt8[]& default_compiler_version() {\n    return "'"$JIANG_VERSION"'";\n}/' "$OPTIONS_FILE"
 
 link_llvm() {
   local input_ll="$1"

@@ -5,8 +5,8 @@
 # Jiang语言
 
 当前 Jiang 语言编译器处于 stage2 开发阶段，已经可以稳定自举。stage0 和 stage1 由 vibe coding
-产生（在 stage1 分支）；stage2 将采取人工方式编写和审核代码。0.2 之后的编译器开发只依赖
-已发布的 0.2 稳定版 `jiangc` 作为 bootstrap 输入，不再依赖 stage1 工作区或 stage1 产物。
+产生（在 stage1 分支）；stage2 将采取人工方式编写和审核代码。0.2.2 之后的编译器开发只依赖
+0.2 系列稳定版 `jiangc` 作为 bootstrap 输入，不再依赖 stage1 工作区或 stage1 产物。
 
 Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。这里先卖个关子：0.4 版本会引入一个
 杀手级特性，它会是这门语言真正拉开差异的起点。
@@ -24,7 +24,8 @@ Homebrew 的 `llvm@21` 约定查找。
 bash ./script/install_llvm_macos.sh
 ```
 
-构建当前源码需要先安装 Jiang 0.2 release，并确保 0.2 稳定版 `jiangc` 已在 PATH 中：
+构建当前 0.2.2 源码需要先安装 Jiang `0.2.1-bootstrap` 产物，并确保对应的 `jiangc` 已在
+PATH 中。`0.2.1-bootstrap` 只作为 0.2.2 的自举锚点，不作为面向用户的正式 release：
 
 ```bash
 jiangc --version
@@ -39,7 +40,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-jiangc 0.2 -> build/jiangc.next -> build/jiangc
+jiangc 0.2.1-bootstrap -> build/jiangc.next -> build/jiangc
 ```
 
 并默认用最终产物 `build/jiangc` 跑 smoke、backend CLI smoke 和 lang check。输出为：
