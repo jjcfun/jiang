@@ -23,10 +23,11 @@ import resolve = "./resolve/module_resolver.jiang";
 import module_graph = "./resolve/module_graph.jiang";
 import resolve_store = "./resolve/store.jiang";
 import syntax = "./syntax/api.jiang";
-import fs = "./support/fs.jiang";
 import list = "./support/list.jiang";
 import path = "./support/path.jiang";
 import string = "./support/string.jiang";
+import system_fs = "./system/fs.jiang";
+import system_io = "./system/io.jiang";
 import package_manifest = "./source/package_manifest.jiang";
 import monomorph = "./sema/monomorph.jiang";
 import type_check = "./sema/type_check/api.jiang";
@@ -38,7 +39,7 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     ctx.begin_compilation();
     UInt8[] root_path = package_root_file_path(options.input_path);
     UInt8[] normalized = path.normalize(root_path);
-    guard fs.read_all(normalized) is some source_text else {
+    guard system_fs.read_all(normalized) is some source_text else {
         add_package_error(ctx, string.append("failed to read source file: ", normalized), "source_file_not_found");
         return;
     }
@@ -54,6 +55,7 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
         options.compiler_version,
         options.linker_path,
         options.link_args$.ref(),
+        options.link_libc,
         options.mode
     );
 }
@@ -88,8 +90,17 @@ UInt8[] package_manifest_root_file_path(UInt8[] package_dir) {
     UInt8[] compiler_version,
     UInt8[] linker_path,
     list.ArrayList<UInt8[]>& link_args,
+    Bool link_libc,
     driver_options.CompileMode mode
 ) {
+    if (!link_libc && emit == .executable) {
+        add_package_error(
+            ctx,
+            "--no-link-libc executable output is not supported yet; select object/llvm output or use --link-libc",
+            "no_link_libc_executable_unsupported"
+        );
+        return;
+    }
     // syntax.Store 是本次 package 编译的临时 parse cache。resolve/HIR 完成后，
     // AST 不再进入 CompilerStore 的长期状态。
     syntax_store.Store! asts = syntax_store.Store();
@@ -193,7 +204,7 @@ Bool prepare_artifact_cache(
         return true;
     }
     UInt8[] object_dir = artifact_path.object_dir(artifact_cache_dir);
-    if (fs.create_dirs(object_dir)) {
+    if (system_fs.create_dirs(object_dir)) {
         return true;
     }
     add_package_error(
@@ -213,7 +224,7 @@ Bool prepare_artifact_cache(
     UInt8[] compiler_version
 ) {
     UInt8[] source_dir = artifact_path.source_dir(artifact_cache_dir);
-    if (!fs.create_dirs(source_dir)) {
+    if (!system_fs.create_dirs(source_dir)) {
         return;
     }
 
@@ -290,10 +301,10 @@ backend.BackendResult emit_backend(
             if (!text.ok) {
                 return backend.BackendResult(false);
             }
-            return backend.BackendResult(fs.write_stdout(text.text));
+            system_fs.File out = system_io.stdout();
+            return backend.BackendResult(out.write_all(text.text));
         }
-        UInt8![*] c_output_path = backend_output_buffer(output_path);
-        return backend.emit_llvm_ir(ctx, lowered, c_output_path$.as(UInt8[*]));
+        return backend.emit_llvm_ir(ctx, lowered, output_path);
     }
     if (mode == .release) {
         return emit_release_executable(
@@ -365,11 +376,10 @@ Bool emit_release_package_object(
     mir.MirStore& lowered,
     UInt8[] output_path
 ) {
-    UInt8![*] c_output_path = backend_output_buffer(output_path);
     backend.BackendResult emitted = backend.emit_object(
         ctx,
         lowered,
-        c_output_path$.as(UInt8[*]),
+        output_path,
         driver_options.CompileMode.release
     );
     return !emitted.has_errors();
@@ -455,8 +465,7 @@ backend.BackendResult emit_object_with_cache(
     if (!emit_plan_cache_objects(ctx, lowered, units$.ref(), plan$.ref(), mode)) {
         return backend.BackendResult(false);
     }
-    UInt8![*] c_output_path = backend_output_buffer(output_path);
-    return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]), mode);
+    return backend.emit_object(ctx, lowered, output_path, mode);
 }
 
 // 将 object reuse plan 的命中情况记录到 store，供 smoke 和后续增量诊断使用。
@@ -506,12 +515,11 @@ Bool emit_plan_cache_object(
         return true;
     }
     UInt8[] cache_path = plan.path_at(entry.path_index);
-    UInt8![*] c_cache_path = backend_output_buffer(cache_path);
     backend.BackendResult emitted = backend.emit_object_for_unit(
         ctx,
         lowered,
         units.unit_at(entry.unit_index),
-        c_cache_path$.as(UInt8[*]),
+        cache_path,
         mode
     );
     if (emitted.has_errors()) {
@@ -533,8 +541,7 @@ backend.BackendResult emit_single_object_unit_with_cache(
     driver_options.CompileMode mode
 ) {
     if (entry.kind == .unsupported) {
-        UInt8![*] c_output_path = backend_output_buffer(output_path);
-        return backend.emit_object(ctx, lowered, c_output_path$.as(UInt8[*]), mode);
+        return backend.emit_object(ctx, lowered, output_path, mode);
     }
 
     UInt8[] cache_path = plan.path_at(entry.path_index);
@@ -563,7 +570,7 @@ Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[
     if (string.equal(cache_path, output_path)) {
         return true;
     }
-    if (fs.copy_file(cache_path, output_path)) {
+    if (system_fs.copy_file(cache_path, output_path)) {
         return true;
     }
     add_package_error(ctx, "failed to copy cached object file", "cached_object_copy_failed");
@@ -594,11 +601,6 @@ Bool copy_cached_object(context.CompilerContext& ctx, UInt8[] cache_path, UInt8[
             object_artifact.ObjectArtifactRecord(.monomorph_object, emitted_hash, cache_path)
         );
     }
-}
-
-// backend FFI 需要 C string buffer，pipeline 只负责路径格式转换。
-UInt8![*] backend_output_buffer(UInt8[] output_path) {
-    return fs.c_string(output_path);
 }
 
 // pipeline 只产生 package 级错误；具体阶段错误应在对应阶段写入自己的 category/code。

@@ -63,7 +63,7 @@
 | layout-sensitive aggregate | `aggregate`, `nominal` | partial | emit/run 覆盖更多 tuple/array/union 嵌套 |
 | MIR control flow | `control_flow`, `error_handling` | partial | loop cleanup、nested try/catch run 用例 |
 | backend runtime entry | `runtime` | covered | argv/env deferred |
-| CString | `runtime`, `literal` | covered | CString field/global 组合 |
+| sentinel string | `runtime`, `literal` | covered | `UInt8[:0]` / `UInt8[*:0]` 基础转换已覆盖；CString 保留兼容测试 |
 
 ## 补测优先级
 

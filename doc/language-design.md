@@ -81,9 +81,9 @@ Token 只表示词法事实，不承载语义类型。
 
 字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
-字符串字面量默认是 UTF-8 字节序列，当前可用于 `UInt8[_]` / `UInt8[]`。
-当 expected type 是 `CString` 时，字符串字面量表示以 `\0` 结尾的 C 字符串。
-这个语义由 type check/MIR 明确记录，不能依赖后端 API 自动补 NUL。
+字符串字面量是 UTF-8 字节序列。0.2.1 起，字符串字面量的 backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。当前兼容实现中，字符串字面量可用于 `UInt8[_]` / `UInt8[]` / `UInt8[:0]`，也可在 C ABI expected type 下转换为 `UInt8[*:0]`。
+
+`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。`CString` / `CString&` 仍作为兼容路径保留，后续会迁移到 `UInt8[*:0]`。
 
 ## 类型系统
 
@@ -104,9 +104,12 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T^`：自动解引用的 owning heap pointer，通常来自 `new T(...)`；它不是 C 风格 raw pointer。
 - `T&`：自动解引用的非 owning 引用，不表达释放职责。
 - `T[]`：slice reference。
+- `T[:0]`：sentinel slice reference，layout 与 `T[]` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。当前 0.2.1 先支持整数 sentinel 语法，主用例是 `UInt8[:0]`。
 - `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
+- `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
 - `T*`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
+- `T[N:0]`：sentinel 定长数组语法；0.2.1 先保留类型标记，完整 array sentinel storage 语义后续补齐。
 - `T[_]`：数组长度由初始化器推断。
 - `T@E`：errorable。
 - `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
@@ -251,6 +254,8 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
 - `T[]`：slice reference，语义上类似 `{ T[*], length }&` 的连续内存引用视图；它不表达所有权。
+- `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
+- `T[:0]`：sentinel slice reference，语义上类似 `{ T[*:0], length }&`，并保证 `data[length] == 0`。
 
 `T&`、`T&!` 和 `T[]` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]` 字段时，目标对象的生命周期必须覆盖包含该字段的值。
 

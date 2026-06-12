@@ -218,8 +218,11 @@ type_postfix
              / "^"
              / "*"
              / "[" "]"
+             / "[" ":" int_lit "]"
              / "[" "*" "]"
+             / "[" "*" ":" int_lit "]"
              / "[" array_count "]"
+             / "[" array_count ":" int_lit "]"
 
 array_count <- "_" / int_lit
 
@@ -238,10 +241,13 @@ name        <- ident / "self"
 - `T^` 表示 owning pointer 外层。
 - `T*` 表示 raw pointer；主要用于 FFI / ABI / 低层 capability 场景，不参与自动解引用。
 - `T[]` 表示 slice。
+- `T[:0]` 表示 sentinel slice；当前 0.2.1 兼容实现中它仍使用 `T[]` 的 fat pointer layout，并额外记录 `data[length] == 0` 的类型语义。
 - `T[*]` 表示 many pointer。
+- `T[*:0]` 表示 sentinel many pointer；它不带 length，适合 C string ABI。
 - raw pointer、many pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
 - `T^` / `T&` 是语言级 ownership/reference handle，不能与其他 handle 叠加。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
+- `T[N:0]` 表示 sentinel 定长数组语法；0.2.1 先保留类型标记，完整 array sentinel storage 语义后续补齐。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 
 ## struct

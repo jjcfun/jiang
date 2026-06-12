@@ -35,7 +35,7 @@ test/lang/<feature>/
 
 详细覆盖状态见 `doc/compiler/lang-coverage.md`。0.2 需要优先覆盖这些 feature：
 
-- `literal`：integer/float/char/string/bool/null，expected type 转换，CString NUL 语义。
+- `literal`：integer/float/char/string/bool/null，expected type 转换，sentinel 字符串和 CString 兼容语义。
 - `type`：type suffix 顺序、handle 限制、raw pointer/many pointer/slice/array、errorable。
 - `aggregate`：tuple、array、slice、struct 默认构造、union constructor。
 - `function`：tail expr、call stmt、overload、default params、named args、constructor args。
@@ -47,7 +47,7 @@ test/lang/<feature>/
 - `error_handling`：`T@E`、throw、try/catch、catch binding、未处理错误。
 - `import`：file import、public import re-export、visibility。
 - `package`：manifest dependency、package public surface、跨 package 访问、dependency cycle。
-- `runtime`：main/runtime entry、CString、print/panic/assert 等 runtime-visible 能力。
+- `runtime`：main/runtime entry、sentinel C string、CString 兼容、print/panic/assert 等 runtime-visible 能力。
 
 ## 补测试顺序
 
