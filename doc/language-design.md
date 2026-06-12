@@ -81,7 +81,7 @@ Token 只表示词法事实，不承载语义类型。
 
 字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
-字符串字面量是 UTF-8 字节序列。0.2.1 起，字符串字面量的 backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。当前兼容实现中，字符串字面量可用于 `UInt8[_]` / `UInt8[]` / `UInt8[:0]`，也可在 C ABI expected type 下转换为 `UInt8[*:0]`。
+字符串字面量是 UTF-8 字节序列。0.2.1 起，字符串字面量的 backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。当前兼容实现中，字符串字面量可用于 `UInt8[_]` / `UInt8[]` / `UInt8[]&` / `UInt8[:0]` / `UInt8[:0]&`，也可在 C ABI expected type 下转换为 `UInt8[*:0]`。
 
 `UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。`CString` / `CString&` 仍作为兼容路径保留，后续会迁移到 `UInt8[*:0]`。
 
@@ -103,8 +103,8 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T?!`：optional 类型层可变的规范写法。
 - `T^`：自动解引用的 owning heap pointer，通常来自 `new T(...)`；它不是 C 风格 raw pointer。
 - `T&`：自动解引用的非 owning 引用，不表达释放职责。
-- `T[]`：slice reference。
-- `T[:0]`：sentinel slice reference，layout 与 `T[]` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。当前 0.2.1 先支持整数 sentinel 语法，主用例是 `UInt8[:0]`。
+- `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。0.2.1 兼容期仍接受裸 `T[]` 作为同一类型。
+- `T[:0]&`：borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。0.2.1 兼容期仍接受裸 `T[:0]` 作为同一类型；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
 - `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
 - `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
 - `T*`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
@@ -114,6 +114,8 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T@E`：errorable。
 - `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
 - 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
+
+内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Optional<T>`、`Array<T>`、`UnsizedArray<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T@E` 等表面语法。
 
 示例：
 

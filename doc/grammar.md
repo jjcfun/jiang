@@ -244,8 +244,8 @@ name        <- ident / "self"
 - `T&` 表示引用外层。
 - `T^` 表示 owning pointer 外层。
 - `T*` 表示 raw pointer；主要用于 FFI / ABI / 低层 capability 场景，不参与自动解引用。
-- `T[]` 表示 slice。
-- `T[:0]` 表示 sentinel slice；当前 0.2.1 兼容实现中它仍使用 `T[]` 的 fat pointer layout，并额外记录 `data[length] == 0` 的类型语义。
+- `T[]&` 表示 borrowed slice view。当前 0.2.1 兼容实现中，裸 `T[]` 仍作为同一 fat pointer 类型接受。
+- `T[:0]&` 表示 borrowed sentinel slice view；当前 0.2.1 兼容实现中，裸 `T[:0]` 仍作为同一 fat pointer 类型接受，并额外记录 `data[length] == 0` 的类型语义。
 - `T[*]` 表示 many pointer。
 - `T[*:0]` 表示 sentinel many pointer；它不带 length，适合 C string ABI。
 - raw pointer、many pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
@@ -253,6 +253,8 @@ name        <- ident / "self"
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T[N:0]` 表示 sentinel 定长数组语法；0.2.1 先保留类型标记，完整 array sentinel storage 语义后续补齐。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
+
+`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Optional`、`Array`、`UnsizedArray`、`Result` 不会改变这些语法的含义。
 
 ## struct
 
