@@ -24,11 +24,11 @@ enum TokenKind {
 }
 
 struct SourceFile {
-    UInt8[] file_path;
+    UInt8[]& file_path;
     Int start_offset;
 }
 
-UInt8[] read_source(UInt8[] file_path) {
+UInt8[]& read_source(UInt8[]& file_path) {
     return file_path;
 }
 
@@ -955,7 +955,7 @@ Int y = switch (value) {
 Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，语法写作 `T@E`：
 
 ```c
-Int@Err parse(UInt8[] text)
+Int@Err parse(UInt8[]& text)
   
 ()@Err flush()
   
@@ -1438,7 +1438,7 @@ struct User {
   // age为可变属性
   Int! age;
   // nick_name为可空的可变属性
-  UInt8[]?! nick_name;
+  UInt8[]&?! nick_name;
 }
 
 // 定义一个结构体常量并初始化
@@ -1868,7 +1868,7 @@ public trait SubscriptSet: SubscriptGet {
 - 子 trait 会继承父 trait 的关联类型，且当前不允许重新声明父 trait 的同名关联类型
 - 子 trait 可以通过 `@where(Item: Hashable)` 或 `@where(Item == UInt8)` 继续约束继承来的关联类型
 - `@where(...)` 中多个 trait 约束也支持 `&`，例如 `@where(T: Hashable & Equatable)`
-- `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[] bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
+- `FromStringLiteral` 是 builtin trait。显式声明该 trait，且类型提供 `init(UInt8[]& bytes)` 后，可在有目标类型的上下文里直接写 `T x = "hello";`
 - 若继承链中出现同名 requirement：
   - 同名且签名完全一致：允许合并
   - 同名但签名不同：编译报错
@@ -2209,7 +2209,7 @@ alias x = a + b;
 ```c
 extern {
   public Int open(UInt8[*:0] path, Int options);
-  public Int write(Int fd, UInt8[] buf, Int count);
+  public Int write(Int fd, UInt8[]& buf, Int count);
   public Int errno;
 }
 

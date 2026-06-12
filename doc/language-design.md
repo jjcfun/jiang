@@ -39,11 +39,11 @@ Jiang 是面向系统编程的语言，目标是在低层控制能力、工程�
 
 ```jiang
 struct SourceFile {
-    UInt8[] file_path;
+    UInt8[]& file_path;
     Int start_offset;
 }
 
-UInt8[] read_source(UInt8[] file_path) {
+UInt8[]& read_source(UInt8[]& file_path) {
     return file_path;
 }
 
@@ -434,12 +434,12 @@ a.length; // 编译错误：a 已经 move
 - 参数名：参数或参数引用目标 lifetime。
 - 字段名：该字段引用目标 lifetime。
 
-带 `T&` / `T&!` / `T[]` 字段的类型需要表达字段目标必须覆盖包含者：
+带 `T&` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
 
 ```jiang
 @life(data > self)
 struct Slice {
-    UInt8[] data;
+    UInt8[]& data;
     Int len;
 }
 ```
@@ -957,7 +957,7 @@ for-in 的输入”，不会和真正保存遍历状态的游标混在一起。
 0.2 先支持内建 iterable：
 
 - `start..end`：range，左闭右开，item type 是 `Int`。
-- `T[]`：slice，item type 是 `T`。
+- `T[]&`：slice view，item type 是 `T`。
 - `T[N]`：定长数组，item type 是 `T`。
 - `T[*]`：many pointer 不是 iterable；需要遍历时使用 range 产生 index，再用 `p[i]` 访问。
 
