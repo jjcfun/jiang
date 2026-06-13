@@ -1,1 +1,0 @@
-/* Jiang C runtime shim placeholder. */

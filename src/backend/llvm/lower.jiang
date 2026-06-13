@@ -8,8 +8,10 @@ import context = "../../context.jiang";
 import diagnostic = "../../diagnostic/diagnostic.jiang";
 import mir = "../../mir/mir.jiang";
 import qid = "../../store/id.jiang";
+import types = "../../sema/type.jiang";
 import list = "../../support/list.jiang";
 import table = "../../support/table.jiang";
+import system_memory = "../../system/memory.jiang";
 import backend_abi = "../abi.jiang";
 import codegen_unit = "../codegen_unit.jiang";
 import symbol = "../symbol.jiang";
@@ -22,7 +24,7 @@ import llvm_type = "./type.jiang";
 import llvm_value = "./value.jiang";
 
 public Bool lower_module(context.CompilerContext& ctx, mir.MirStore& store) {
-    LlvmLowerer! lowerer = LlvmLowerer(ctx);
+    LlvmLowerer! lowerer = LlvmLowerer(ctx, true);
     return lowerer.lower_module(store);
 }
 
@@ -31,9 +33,10 @@ public Bool emit_object_file(
     mir.MirStore& store,
     UInt8[]& output_path,
     Int opt_level,
-    UInt8[]& pass_pipeline
+    UInt8[]& pass_pipeline,
+    Bool link_libc
 ) {
-    LlvmLowerer! lowerer = LlvmLowerer(ctx);
+    LlvmLowerer! lowerer = LlvmLowerer(ctx, link_libc);
     return lowerer.emit_object_file(store, output_path, opt_level, pass_pipeline);
 }
 
@@ -43,19 +46,20 @@ public Bool emit_object_unit_file(
     codegen_unit.CodegenUnit& unit,
     UInt8[]& output_path,
     Int opt_level,
-    UInt8[]& pass_pipeline
+    UInt8[]& pass_pipeline,
+    Bool link_libc
 ) {
-    LlvmLowerer! lowerer = LlvmLowerer(ctx);
+    LlvmLowerer! lowerer = LlvmLowerer(ctx, link_libc);
     return lowerer.emit_object_unit_file(store, unit, output_path, opt_level, pass_pipeline);
 }
 
-public Bool emit_llvm_ir_file(context.CompilerContext& ctx, mir.MirStore& store, UInt8[]& output_path) {
-    LlvmLowerer! lowerer = LlvmLowerer(ctx);
+public Bool emit_llvm_ir_file(context.CompilerContext& ctx, mir.MirStore& store, UInt8[]& output_path, Bool link_libc) {
+    LlvmLowerer! lowerer = LlvmLowerer(ctx, link_libc);
     return lowerer.emit_llvm_ir_file(store, output_path);
 }
 
-public UInt8[]&? emit_llvm_ir_text(context.CompilerContext& ctx, mir.MirStore& store) {
-    LlvmLowerer! lowerer = LlvmLowerer(ctx);
+public UInt8[]&? emit_llvm_ir_text(context.CompilerContext& ctx, mir.MirStore& store, Bool link_libc) {
+    LlvmLowerer! lowerer = LlvmLowerer(ctx, link_libc);
     return lowerer.emit_llvm_ir_text(store);
 }
 
@@ -69,8 +73,9 @@ struct LlvmLowerer: Movable {
     table.HashTable<qid.SymbolId, Int> declared_external_function_indexes;
     table.HashTable<qid.SymbolId, Int> external_function_indexes;
     list.ArrayList<ffi.Value> external_function_values;
+    system_memory.RuntimeAllocator allocator;
 
-    init(context.CompilerContext& ctx) {
+    init(context.CompilerContext& ctx, Bool link_libc) {
         self.ctx = ctx;
         self.llvm_context = ffi.Context();
         self.module = ffi.Module(self.llvm_context$.ref(), "jiang_module");
@@ -80,6 +85,7 @@ struct LlvmLowerer: Movable {
         self.declared_external_function_indexes = table.HashTable<qid.SymbolId, Int>();
         self.external_function_indexes = table.HashTable<qid.SymbolId, Int>();
         self.external_function_values = list.ArrayList<ffi.Value>();
+        self.allocator = system_memory.runtime_allocator(link_libc);
     }
 
     Bool lower_module(mir.MirStore& store) {
@@ -317,7 +323,128 @@ struct LlvmLowerer: Movable {
         if (!ffi.value_valid(llvm_function)) {
             return false;
         }
+        if (function.is_runtime_entry) {
+            return self.lower_runtime_entry_function(function, llvm_function);
+        }
         return self.lower_body(function.body$.ref(), llvm_function);
+    }
+
+    Bool lower_runtime_entry_function(mir.MirFunction& function, ffi.Value llvm_function) {
+        llvm_state.LowerState! state = self.lower_state();
+        if (!self.declare_process_argument_globals(state$.ref())) {
+            return false;
+        }
+        ffi.BasicBlock block = ffi.context_append_block(self.llvm_context$.ref(), llvm_function, "entry");
+        if (!ffi.block_valid(block)) {
+            self.add_codegen_error("failed to create LLVM runtime entry block", "llvm_runtime_entry_block_failed");
+            return false;
+        }
+        ffi.builder_position_at_end(self.builder$.ref(), block);
+        ffi.Value argc = ffi.function_param(llvm_function, 0);
+        ffi.Value argv = ffi.function_param(llvm_function, 1);
+        if (!self.store_process_argument_globals(state$.ref(), argc, argv)) {
+            return false;
+        }
+        return self.call_language_main_from_runtime_entry(state$.ref(), function);
+    }
+
+    Bool declare_process_argument_globals(llvm_state.LowerState& state) {
+        ffi.Type int_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+        if (!ffi.type_valid(int_type)) {
+            self.add_codegen_error("failed to lower runtime argc type", "llvm_runtime_argc_type_lower_failed");
+            return false;
+        }
+        ffi.Value argc_global = self.runtime_global("__jiang_process_argc", int_type);
+        if (!ffi.value_valid(argc_global)) {
+            self.add_codegen_error("failed to declare runtime argc global", "llvm_runtime_argc_global_failed");
+            return false;
+        }
+        ffi.global_set_initializer(argc_global, ffi.const_int(int_type, UInt64(0)));
+
+        ffi.Type argv_type = ffi.context_pointer_type(self.llvm_context$.ref());
+        ffi.Value argv_global = self.runtime_global("__jiang_process_argv", argv_type);
+        if (!ffi.value_valid(argv_global)) {
+            self.add_codegen_error("failed to declare runtime argv global", "llvm_runtime_argv_global_failed");
+            return false;
+        }
+        ffi.global_set_initializer(argv_global, ffi.const_null(argv_type));
+        return true;
+    }
+
+    Bool store_process_argument_globals(llvm_state.LowerState& state, ffi.Value argc, ffi.Value argv) {
+        ffi.Type int_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+        ffi.Value argc_global = self.runtime_global("__jiang_process_argc", int_type);
+        ffi.Type argv_type = ffi.context_pointer_type(self.llvm_context$.ref());
+        ffi.Value argv_global = self.runtime_global("__jiang_process_argv", argv_type);
+        if (!ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), argc, argc_global))) {
+            self.add_codegen_error("failed to store runtime argc", "llvm_runtime_argc_store_failed");
+            return false;
+        }
+        if (!ffi.value_valid(ffi.builder_build_store(self.builder$.ref(), argv, argv_global))) {
+            self.add_codegen_error("failed to store runtime argv", "llvm_runtime_argv_store_failed");
+            return false;
+        }
+        return true;
+    }
+
+    ffi.Value runtime_global(UInt8[]& name, ffi.Type type) {
+        ffi.Value existing = ffi.module_get_global(self.module$.ref(), name);
+        if (ffi.value_valid(existing)) {
+            return existing;
+        }
+        return ffi.module_add_global(self.module$.ref(), name, type);
+    }
+
+    Bool call_language_main_from_runtime_entry(llvm_state.LowerState& state, mir.MirFunction& runtime_function) {
+        symbol.BackendSymbolKey main_key = symbol.symbol_key_for_def(
+            self.ctx,
+            runtime_function.def_id,
+            runtime_function.type_args,
+            false
+        );
+        guard table.hash_table_get_value<symbol.BackendSymbolKey, Int>(
+            self.declared_function_indexes$.ref(),
+            main_key
+        ) is some main_index else {
+            self.add_codegen_error("failed to find language main symbol", "llvm_language_main_missing");
+            return false;
+        }
+        ffi.Value main_function = self.declared_function_values.get(main_index);
+        qid.TypeId main_type = self.ctx.store.typeck.def_type(runtime_function.def_id)$.some();
+        backend_abi.FunctionAbi main_abi = backend_abi.classify_function_type(self.ctx, main_type);
+        ffi.Type main_function_type = llvm_abi.function_type(state, main_abi$.ref());
+        list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(0);
+        ffi.Value result = ffi.builder_build_call(self.builder$.ref(), main_function_type, main_function, args$.ref());
+        qid.TypeId unit_type = self.ctx.store.types.unit_type();
+        qid.TypeId result_type = self.language_main_result_type(main_type);
+        if (result_type.to_index() == unit_type.to_index()) {
+            ffi.Type int_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+            return ffi.value_valid(ffi.builder_build_return(self.builder$.ref(), ffi.const_int(int_type, UInt64(0))));
+        }
+        ffi.Value exit_code = self.runtime_exit_code_value(state, result, result_type);
+        return ffi.value_valid(ffi.builder_build_return(self.builder$.ref(), exit_code));
+    }
+
+    ffi.Value runtime_exit_code_value(llvm_state.LowerState& state, ffi.Value result, qid.TypeId result_type) {
+        qid.TypeId int_type_id = self.ctx.store.types.int_type();
+        ffi.Type int_type = llvm_type.lower_type(state, int_type_id);
+        if (result_type.to_index() == int_type_id.to_index()) {
+            return result;
+        }
+        Int source_bits = llvm_type.int_type_bits(state, result_type);
+        Int target_bits = llvm_type.int_type_bits(state, int_type_id);
+        if (target_bits < source_bits) {
+            return ffi.builder_build_cast(self.builder$.ref(), 1, result, int_type);
+        }
+        return ffi.builder_build_cast(self.builder$.ref(), 0, result, int_type);
+    }
+
+    qid.TypeId language_main_result_type(qid.TypeId main_type) {
+        types.TypeInfo info = self.ctx.store.types.get(main_type);
+        if (info.data is .function_type(function_type)) {
+            return function_type.result;
+        }
+        return self.ctx.store.types.unit_type();
     }
 
     ffi.Value function_value(mir.MirFunction& function) {
@@ -749,7 +876,8 @@ struct LlvmLowerer: Movable {
             self.declared_function_indexes$.ref(),
             self.declared_function_values$.ref(),
             self.external_function_indexes$.ref(),
-            self.external_function_values$.ref()
+            self.external_function_values$.ref(),
+            self.allocator
         );
     }
 
