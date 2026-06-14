@@ -44,6 +44,7 @@ sample_with_link_arg="$SMOKE_BUILD_DIR/minimal_with_link_arg"
 sample_release_obj="$SMOKE_BUILD_DIR/minimal_release.o"
 sample_from_release_obj="$SMOKE_BUILD_DIR/minimal_from_release_obj"
 sample_release_bin="$SMOKE_BUILD_DIR/minimal_release"
+system_env_bin="$SMOKE_BUILD_DIR/system_env"
 package_release_bin="$SMOKE_BUILD_DIR/package_release"
 field_sample="$SMOKE_BUILD_DIR/field_projection.jiang"
 field_ll="$SMOKE_BUILD_DIR/field_projection.ll"
@@ -77,6 +78,9 @@ test -s "$sample_obj"
 
 "$compiler_bin" --link-arg -Wl,-dead_strip -o "$sample_with_link_arg" "$sample"
 "$sample_with_link_arg"
+
+"$compiler_bin" -o "$system_env_bin" test/lang/system/run/env_get.jiang
+"$system_env_bin"
 
 "$compiler_bin" --mode release --emit-obj -o "$sample_release_obj" "$sample"
 test -s "$sample_release_obj"

@@ -97,7 +97,7 @@ run_run_case() {
   fi
 
   set +e
-  "$executable" >/tmp/jiang_lang_run.out 2>&1
+  bash -c '"$1"; exit $?' _ "$executable" >/tmp/jiang_lang_run.out 2>&1
   local code=$?
   set -e
   rm -f "$llvm_output" "$executable"
@@ -137,7 +137,7 @@ run_release_case() {
   fi
 
   set +e
-  "$executable" >/tmp/jiang_lang_release_run.out 2>&1
+  bash -c '"$1"; exit $?' _ "$executable" >/tmp/jiang_lang_release_run.out 2>&1
   local code=$?
   set -e
   rm -f "$executable"
