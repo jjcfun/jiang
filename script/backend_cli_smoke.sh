@@ -52,11 +52,21 @@ field_bin="$SMOKE_BUILD_DIR/field_projection"
 alloc_sample="$SMOKE_BUILD_DIR/no_libc_alloc.jiang"
 alloc_no_libc_ll="$SMOKE_BUILD_DIR/no_libc_alloc.ll"
 alloc_no_libc_obj="$SMOKE_BUILD_DIR/no_libc_alloc.o"
+alloc_linux_no_libc_ll="$SMOKE_BUILD_DIR/no_libc_alloc_linux.ll"
+alloc_linux_no_libc_obj="$SMOKE_BUILD_DIR/no_libc_alloc_linux.o"
+alloc_wasm_ll="$SMOKE_BUILD_DIR/no_libc_alloc_wasm.ll"
 macos_target_ll="$SMOKE_BUILD_DIR/minimal_macos.ll"
 macos_target_obj="$SMOKE_BUILD_DIR/minimal_macos.o"
 macos_target_bin="$SMOKE_BUILD_DIR/minimal_macos"
 linux_target_ll="$SMOKE_BUILD_DIR/minimal_linux.ll"
 linux_target_obj="$SMOKE_BUILD_DIR/minimal_linux.o"
+windows_target_ll="$SMOKE_BUILD_DIR/minimal_windows.ll"
+windows_target_obj="$SMOKE_BUILD_DIR/minimal_windows.obj"
+wasm_target_ll="$SMOKE_BUILD_DIR/minimal_wasm.ll"
+wasm_target_obj="$SMOKE_BUILD_DIR/minimal_wasm.o"
+linux_no_libc_exe_log="$SMOKE_BUILD_DIR/linux_no_libc_executable.log"
+windows_exe_log="$SMOKE_BUILD_DIR/windows_executable.log"
+wasm_exe_log="$SMOKE_BUILD_DIR/wasm_executable.log"
 unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
 
 printf 'Int main() { 0 }\n' >"$sample"
@@ -111,9 +121,48 @@ if nm -u "$alloc_no_libc_obj" | grep -q "^_free$"; then
   exit 1
 fi
 
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-llvm -o "$alloc_linux_no_libc_ll" "$alloc_sample"
+test -s "$alloc_linux_no_libc_ll"
+grep -q "__jiang_malloc" "$alloc_linux_no_libc_ll"
+grep -q "__jiang_free" "$alloc_linux_no_libc_ll"
+if grep -q "@malloc" "$alloc_linux_no_libc_ll"; then
+  echo "unexpected malloc reference in linux --no-link-libc LLVM output" >&2
+  exit 1
+fi
+if grep -q "@free" "$alloc_linux_no_libc_ll"; then
+  echo "unexpected free reference in linux --no-link-libc LLVM output" >&2
+  exit 1
+fi
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-obj -o "$alloc_linux_no_libc_obj" "$alloc_sample"
+test -s "$alloc_linux_no_libc_obj"
+nm -u "$alloc_linux_no_libc_obj" | grep -q "__jiang_malloc"
+nm -u "$alloc_linux_no_libc_obj" | grep -q "__jiang_free"
+if nm -u "$alloc_linux_no_libc_obj" | grep -q " malloc$"; then
+  echo "unexpected malloc reference in linux --no-link-libc object output" >&2
+  exit 1
+fi
+if nm -u "$alloc_linux_no_libc_obj" | grep -q " free$"; then
+  echo "unexpected free reference in linux --no-link-libc object output" >&2
+  exit 1
+fi
+
+"$compiler_bin" --target wasm32-unknown-unknown --emit-llvm -o "$alloc_wasm_ll" "$alloc_sample"
+test -s "$alloc_wasm_ll"
+grep -q "__jiang_malloc" "$alloc_wasm_ll"
+grep -q "__jiang_free" "$alloc_wasm_ll"
+if grep -q "@malloc" "$alloc_wasm_ll"; then
+  echo "unexpected malloc reference in wasm LLVM output" >&2
+  exit 1
+fi
+if grep -q "@free" "$alloc_wasm_ll"; then
+  echo "unexpected free reference in wasm LLVM output" >&2
+  exit 1
+fi
+
 "$compiler_bin" --target arm64-apple-macosx --emit-llvm -o "$macos_target_ll" "$sample"
 test -s "$macos_target_ll"
 grep -q 'target triple = "arm64-apple-macosx11.0.0"' "$macos_target_ll"
+grep -q 'target datalayout = ' "$macos_target_ll"
 "$compiler_bin" --target arm64-apple-macosx --emit-obj -o "$macos_target_obj" "$sample"
 test -s "$macos_target_obj"
 file "$macos_target_obj" | grep -q "Mach-O 64-bit object arm64"
@@ -123,9 +172,47 @@ file "$macos_target_obj" | grep -q "Mach-O 64-bit object arm64"
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$linux_target_ll" "$sample"
 test -s "$linux_target_ll"
 grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$linux_target_ll"
+grep -q 'target datalayout = ' "$linux_target_ll"
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-obj -o "$linux_target_obj" "$sample"
 test -s "$linux_target_obj"
 file "$linux_target_obj" | grep -q "ELF 64-bit.*x86-64"
+
+"$compiler_bin" --target x86_64-pc-windows-msvc --emit-llvm -o "$windows_target_ll" "$sample"
+test -s "$windows_target_ll"
+grep -q 'target triple = "x86_64-pc-windows-msvc"' "$windows_target_ll"
+grep -q 'target datalayout = ' "$windows_target_ll"
+"$compiler_bin" --target x86_64-pc-windows-msvc --emit-obj -o "$windows_target_obj" "$sample"
+test -s "$windows_target_obj"
+file "$windows_target_obj" | grep -q "COFF"
+
+"$compiler_bin" --target wasm32-unknown-unknown --emit-llvm -o "$wasm_target_ll" "$sample"
+test -s "$wasm_target_ll"
+grep -q 'target triple = "wasm32-unknown-unknown"' "$wasm_target_ll"
+grep -q 'target datalayout = ' "$wasm_target_ll"
+"$compiler_bin" --target wasm32-unknown-unknown --emit-obj -o "$wasm_target_obj" "$sample"
+test -s "$wasm_target_obj"
+file "$wasm_target_obj" | grep -qi "WebAssembly"
+
+set +e
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc -o "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" "$sample" >"$linux_no_libc_exe_log" 2>&1
+linux_no_libc_exe_status=$?
+set -e
+test "$linux_no_libc_exe_status" -ne 0
+grep -q "no_link_libc_executable_unsupported" "$linux_no_libc_exe_log"
+
+set +e
+"$compiler_bin" --target x86_64-pc-windows-msvc -o "$SMOKE_BUILD_DIR/minimal_windows_exe" "$sample" >"$windows_exe_log" 2>&1
+windows_exe_status=$?
+set -e
+test "$windows_exe_status" -ne 0
+grep -q "target_executable_unsupported" "$windows_exe_log"
+
+set +e
+"$compiler_bin" --target wasm32-unknown-unknown -o "$SMOKE_BUILD_DIR/minimal_wasm_exe" "$sample" >"$wasm_exe_log" 2>&1
+wasm_exe_status=$?
+set -e
+test "$wasm_exe_status" -ne 0
+grep -q "no_link_libc_executable_unsupported" "$wasm_exe_log"
 
 set +e
 "$compiler_bin" --target x86_64-unknown-freebsd --emit-llvm -o "$SMOKE_BUILD_DIR/minimal_freebsd.ll" "$sample" >"$unsupported_target_log" 2>&1
