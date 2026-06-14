@@ -49,9 +49,19 @@ package_release_bin="$SMOKE_BUILD_DIR/package_release"
 field_sample="$SMOKE_BUILD_DIR/field_projection.jiang"
 field_ll="$SMOKE_BUILD_DIR/field_projection.ll"
 field_bin="$SMOKE_BUILD_DIR/field_projection"
+alloc_sample="$SMOKE_BUILD_DIR/no_libc_alloc.jiang"
+alloc_no_libc_ll="$SMOKE_BUILD_DIR/no_libc_alloc.ll"
+alloc_no_libc_obj="$SMOKE_BUILD_DIR/no_libc_alloc.o"
+macos_target_ll="$SMOKE_BUILD_DIR/minimal_macos.ll"
+macos_target_obj="$SMOKE_BUILD_DIR/minimal_macos.o"
+macos_target_bin="$SMOKE_BUILD_DIR/minimal_macos"
+linux_target_ll="$SMOKE_BUILD_DIR/minimal_linux.ll"
+linux_target_obj="$SMOKE_BUILD_DIR/minimal_linux.o"
+unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
 
 printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
+printf 'Int main() { Int![*] values = Int!$.alloc_array(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
 
 printf '== backend cli smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
 "$COMPILER_UNDER_TEST" --emit-llvm src/jiangc.jiang >"$compiler_ll"
@@ -75,6 +85,54 @@ test -s "$sample_obj"
   $("$LLVM_CONFIG" --libs all) \
   $("$LLVM_CONFIG" --system-libs)
 "$sample_from_obj"
+
+"$compiler_bin" --no-link-libc --emit-llvm -o "$alloc_no_libc_ll" "$alloc_sample"
+test -s "$alloc_no_libc_ll"
+grep -q "__jiang_malloc" "$alloc_no_libc_ll"
+grep -q "__jiang_free" "$alloc_no_libc_ll"
+if grep -q "@malloc" "$alloc_no_libc_ll"; then
+  echo "unexpected malloc reference in --no-link-libc LLVM output" >&2
+  exit 1
+fi
+if grep -q "@free" "$alloc_no_libc_ll"; then
+  echo "unexpected free reference in --no-link-libc LLVM output" >&2
+  exit 1
+fi
+"$compiler_bin" --no-link-libc --emit-obj -o "$alloc_no_libc_obj" "$alloc_sample"
+test -s "$alloc_no_libc_obj"
+nm -u "$alloc_no_libc_obj" | grep -q "___jiang_malloc"
+nm -u "$alloc_no_libc_obj" | grep -q "___jiang_free"
+if nm -u "$alloc_no_libc_obj" | grep -q "^_malloc$"; then
+  echo "unexpected malloc reference in --no-link-libc object output" >&2
+  exit 1
+fi
+if nm -u "$alloc_no_libc_obj" | grep -q "^_free$"; then
+  echo "unexpected free reference in --no-link-libc object output" >&2
+  exit 1
+fi
+
+"$compiler_bin" --target arm64-apple-macosx --emit-llvm -o "$macos_target_ll" "$sample"
+test -s "$macos_target_ll"
+grep -q 'target triple = "arm64-apple-macosx11.0.0"' "$macos_target_ll"
+"$compiler_bin" --target arm64-apple-macosx --emit-obj -o "$macos_target_obj" "$sample"
+test -s "$macos_target_obj"
+file "$macos_target_obj" | grep -q "Mach-O 64-bit object arm64"
+"$compiler_bin" --target arm64-apple-macosx -o "$macos_target_bin" "$sample"
+"$macos_target_bin"
+
+"$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$linux_target_ll" "$sample"
+test -s "$linux_target_ll"
+grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$linux_target_ll"
+"$compiler_bin" --target x86_64-unknown-linux-gnu --emit-obj -o "$linux_target_obj" "$sample"
+test -s "$linux_target_obj"
+file "$linux_target_obj" | grep -q "ELF 64-bit.*x86-64"
+
+set +e
+"$compiler_bin" --target x86_64-unknown-freebsd --emit-llvm -o "$SMOKE_BUILD_DIR/minimal_freebsd.ll" "$sample" >"$unsupported_target_log" 2>&1
+unsupported_target_status=$?
+set -e
+test "$unsupported_target_status" -ne 0
+grep -q "unsupported target triple: x86_64-unknown-freebsd" "$unsupported_target_log"
 
 "$compiler_bin" --link-arg -Wl,-dead_strip -o "$sample_with_link_arg" "$sample"
 "$sample_with_link_arg"

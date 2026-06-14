@@ -7,10 +7,31 @@ import list = "../../../support/list.jiang";
 public struct SpawnResult {
     public Bool started;
     public Int exit_code;
+    public UInt8[]&! stdout;
+    public UInt8[]&! stderr;
 
     public init(Bool started, Int exit_code) {
         self.started = started;
         self.exit_code = exit_code;
+        self.stdout = "";
+        self.stderr = "";
+    }
+
+    public init(Bool started, Int exit_code, UInt8[]& stdout, UInt8[]& stderr) {
+        self.started = started;
+        self.exit_code = exit_code;
+        self.stdout = stdout;
+        self.stderr = stderr;
+    }
+}
+
+public struct SpawnOptions {
+    public Bool capture_stdout;
+    public Bool capture_stderr;
+
+    public init() {
+        self.capture_stdout = false;
+        self.capture_stderr = false;
     }
 }
 
@@ -33,10 +54,24 @@ public UInt8[*:0][*] argument_values() {
 // `args` 只借用到本次调用结束。macOS provider 会把每个 slice 复制成 C argv，
 // 因此不会把调用方的 ArrayList 或其中的元素引用保存到 posix_spawnp 返回之后。
 public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    SpawnOptions options = SpawnOptions();
+    return spawn_wait(executable, args, options$.ref());
+}
+
+public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args, SpawnOptions& options) {
+    if (!options.capture_stdout && !options.capture_stderr) {
+        return spawn_wait_inherit(executable, args);
+    }
+    if (options.capture_stderr) {
+        return SpawnResult(false, -1);
+    }
+    return spawn_wait_stdout_pipe(executable, args);
+}
+
+SpawnResult spawn_wait_inherit(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
     UInt8[*:0]![*] argv = argv_array(executable, args);
     UInt8[*:0]![*] envp = inherited_environment();
     Int argv_count = args.len() + 1;
-
     Int32![*] pid = Int32!$.alloc_array(1);
     Int32 spawn_result = c.posix_spawnp(
         pid$.as(Int32[*]),
@@ -64,6 +99,152 @@ public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& arg
     pid$.free();
     status$.free();
     return SpawnResult(true, exit_code);
+}
+
+SpawnResult spawn_wait_stdout_pipe(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    UInt8[*:0]![*] argv = argv_array(executable, args);
+    UInt8[*:0]![*] envp = inherited_environment();
+    Int argv_count = args.len() + 1;
+    PipeCapture! stdout_capture = PipeCapture();
+    if (!stdout_capture.open()) {
+        free_argv(argv, argv_count);
+        return SpawnResult(false, -1);
+    }
+    Int32![*] pid = Int32!$.alloc_array(1);
+    Int32 spawn_result = c.posix_spawnp(
+        pid$.as(Int32[*]),
+        argv[0],
+        stdout_capture.file_actions()$.as(Int),
+        0,
+        argv,
+        envp
+    );
+    if (spawn_result != 0) {
+        stdout_capture.close_parent();
+        free_argv(argv, argv_count);
+        pid$.free();
+        return SpawnResult(false, Int(spawn_result));
+    }
+    stdout_capture.close_child_end();
+    UInt8[]& stdout = stdout_capture.read_all();
+    Int32![*] status = Int32!$.alloc_array(1);
+    if (c.waitpid(pid[0], status$.as(Int32[*]), 0) < 0) {
+        stdout_capture.close_parent();
+        free_argv(argv, argv_count);
+        pid$.free();
+        status$.free();
+        return SpawnResult(false, -1);
+    }
+    Int exit_code = exit_code_from_status(status[0]);
+    stdout_capture.close_parent();
+    free_argv(argv, argv_count);
+    pid$.free();
+    status$.free();
+    return SpawnResult(true, exit_code, stdout, "");
+}
+
+struct PipeCapture: Movable {
+    Int32! read_fd;
+    Int32! write_fd;
+    UInt8*![*]! actions;
+
+    init() {
+        self.read_fd = Int32(-1);
+        self.write_fd = Int32(-1);
+        self.actions = null;
+    }
+
+    Bool open() {
+        Int32![*] fds = Int32!$.alloc_array(2);
+        if (c.pipe(fds$.as(Int32[*])) != 0) {
+            fds$.free();
+            return false;
+        }
+        self.read_fd = fds[0];
+        self.write_fd = fds[1];
+        fds$.free();
+        UInt8*![*]! raw = UInt8*$.alloc_array(1);
+        raw[0] = null;
+        if (c.posix_spawn_file_actions_init(raw) != 0) {
+            raw$.free();
+            self.close_parent();
+            return false;
+        }
+        if (c.posix_spawn_file_actions_adddup2(raw, self.write_fd, Int32(1)) != 0) {
+            c.posix_spawn_file_actions_destroy(raw);
+            raw$.free();
+            self.close_parent();
+            return false;
+        }
+        c.posix_spawn_file_actions_addclose(raw, self.read_fd);
+        self.actions = raw;
+        return true;
+    }
+
+    UInt8*![*] file_actions() {
+        return self.actions;
+    }
+
+    () close_child_end() {
+        if (self.write_fd >= 0) {
+            c.close(self.write_fd);
+            self.write_fd = Int32(-1);
+        }
+        self.destroy_actions();
+    }
+
+    () close_parent() {
+        if (self.read_fd >= 0) {
+            c.close(self.read_fd);
+            self.read_fd = Int32(-1);
+        }
+        if (self.write_fd >= 0) {
+            c.close(self.write_fd);
+            self.write_fd = Int32(-1);
+        }
+        self.destroy_actions();
+    }
+
+    UInt8[]& read_all() {
+        if (self.read_fd < 0) {
+            return "";
+        }
+        Int! capacity = 4096;
+        Int! length = 0;
+        UInt8![*]! buffer = UInt8!$.alloc_array(capacity + 1);
+        while (true) {
+            if (length + 1024 + 1 > capacity) {
+                capacity = capacity * 2;
+                UInt8![*] next = UInt8!$.alloc_array(capacity + 1);
+                copy_bytes(next, buffer, length);
+                buffer$.free();
+                buffer = next;
+            }
+            Int count = c.read(self.read_fd, buffer[length..(length + 1024)]$.ptr(), 1024);
+            if (count <= 0) {
+                buffer[length] = 0;
+                return buffer[0..length];
+            }
+            length = length + count;
+        }
+        return "";
+    }
+
+    () destroy_actions() {
+        if (self.actions != null) {
+            c.posix_spawn_file_actions_destroy(self.actions);
+            self.actions$.free();
+            self.actions = null;
+        }
+    }
+}
+
+() copy_bytes(UInt8![*] dest, UInt8![*] source, Int length) {
+    Int! index = 0;
+    while (index < length) {
+        dest[index] = source[index];
+        index = index + 1;
+    }
 }
 
 UInt8[*:0]![*] argv_array(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
