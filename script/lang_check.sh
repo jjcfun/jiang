@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JIANGC="${JIANGC:-$ROOT_DIR/build/jiangc}"
-LLVM_CLANG="${LLVM_CLANG:-/opt/homebrew/opt/llvm@21/bin/clang}"
-LLVM_LIB_DIR="${LLVM_LIB_DIR:-/opt/homebrew/opt/llvm@21/lib}"
+
+source "$ROOT_DIR/script/llvm_env.sh"
 
 if [ ! -x "$JIANGC" ]; then
   echo "missing compiler: $JIANGC" >&2

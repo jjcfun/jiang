@@ -101,8 +101,8 @@ control flow 由 terminator 表达：
   `TypeCheckStore`。
 - `for in` 对 range 使用 `[start, end)` index loop；对 array/slice 使用 `len` 和 indexed place。
 - field/member access lowering 生成 concrete `MirPlace` projection。
-- runtime entry lowering 只从 `ModuleGraph.root_module` 查找 language `main`，dependency
-  package 的 `main` 不会生成 C ABI 入口。
+- hosted entry lowering 只从 `ModuleGraph.root_module` 查找 language `main`，dependency
+  package 的 `main` 不会生成 C ABI `main` wrapper。
 
 ## 泛型实例
 

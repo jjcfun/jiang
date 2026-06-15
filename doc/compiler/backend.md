@@ -28,12 +28,54 @@ backend-specific symbol/mangling 从 `BackendSymbolKey` 派生。key 包含：
 `_Jp<package>_m<module>_f<def>` 形态，并在泛型实例后追加 concrete type args。这样不同
 package/module 中同名函数不会在 LLVM module 里冲突。
 
-只有 runtime entry wrapper 输出 C ABI `main`。language main 的选择只发生在 root package
+只有 hosted entry wrapper 输出 C ABI `main`。language main 的选择只发生在 root package
 root module 中；dependency package 即使也定义 `main`，也只是普通 Jiang 函数。
 
 LLVM 对接通过 `backend/llvm/ffi.jiang` 的最小 C binding 完成。不要一次性封装完整
 LLVM API；每个 lowering/emission 任务只补当前需要的少量 FFI 声明。
 `backend/llvm` 直接调用这层 FFI，不维护自定义 LLVM IR 中间模型。
+
+LLVM module 必须同时设置 target triple 和 target data layout。data layout 由 LLVM
+`TargetMachine` 生成并写回 module，Jiang 侧不手写 macOS/Linux/Wasm/Windows 的 layout 字符串。
+
+## Target 和 System Provider
+
+`driver/target.jiang` 是 target triple 到编译策略的唯一入口。`TargetInfo` 描述：
+
+- LLVM triple、arch、OS、ABI 和 object format。
+- system provider kind。
+- 默认 linker driver 和 sysroot 发现策略。
+- target 是否有 hosted libc/CRT。
+
+`system/startup.jiang` 固定 backend 和 startup object 共享的内部启动符号约定。平台入口可以是
+hosted `main(argc, argv)`、no-libc `_start` 或 Wasm/Windows 的专用入口，但语言层入口统一是
+`__jiang_main`。平台入口负责初始化 `__jiang_startup_state`，然后调用 `__jiang_main`。
+`StartupState` 只保存启动瞬间由平台入口交给语言运行时的初始事实；当前包含
+`ProgramArguments`。运行过程中会变化的 process 状态不放进 startup state。
+
+0.3.0 仍保持 macOS hosted release 路径由 `_NSGetArgc/_NSGetArgv` 读取启动参数，因此源码不会
+强依赖 0.2.2 backend 无法生成的 `__jiang_startup_state` 读取路径。后续以 0.3.0 release 为
+bootstrap anchor 后，`system.process.arguments()` 可以改为直接读取 startup state。
+
+`libc`、`libSystem` 和 POSIX/C ABI 都不是 Jiang 语言语义的一部分。它们只属于 hosted
+compatibility provider：
+
+- `system/os/macos.jiang` 是 macOS hosted target provider，可以依赖 libSystem。
+- `system/os/linux.jiang` 是 Linux hosted target provider，可以依赖 libc。
+- `system/os/macos/libc.jiang` 和 `system/os/linux/libc.jiang` 是 hosted C ABI 边界。
+- `src/system/*.jiang` 只 import virtual `./os/provider.jiang`。resolver 根据
+  `CompilerContext` 中的 target provider 和 effective link-libc 模式，把它映射到具体 OS provider。
+- `system/os/provider.jiang` 只作为 0.2.2 bootstrap shim 存在，默认转发到 macOS hosted provider；
+  mapping-aware compiler 在支持的 target 上应该先完成映射，不依赖这个 fallback 文件。
+- 0.3.0 不保留可 import 的 `system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
+  避免把 POSIX 固定成 hosted libc。
+- no-libc provider 不能通过 hosted libc ABI 间接依赖 libc；它必须走 syscall、compiler
+  intrinsic、inline asm、Wasm host import 或 target runtime object。真实 no-libc 和 inline asm
+  后置到自定义 DSL 机制稳定后的 proposal。
+
+`--no-link-libc` 不是单纯少传 linker 参数。pipeline 会先根据 target 判断是否存在 hosted
+libc/CRT，再结合用户请求得到 effective link-libc 模式。当前 object/LLVM 输出已经按这个模式选择
+`malloc/free` 或 `__jiang_malloc/__jiang_free`；no-libc executable 仍明确诊断为暂不支持。
 
 ## 编译模式
 

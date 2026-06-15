@@ -17,15 +17,15 @@ Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。
 
 ## 构建自举编译器
 
-当前 0.2 开发目标只支持 macOS arm64。编译和发布包都依赖本机 LLVM 21；默认路径按
-Homebrew 的 `llvm@21` 约定查找。
+当前 0.3.0 主线仍以 macOS arm64 作为开发、验证和 release host。编译器本身依赖本机 LLVM 21；
+默认路径按 Homebrew 的 `llvm@21` 约定查找。
 
 ```bash
 bash ./script/install_llvm_macos.sh
 ```
 
-构建当前 0.2.2 源码需要先安装 Jiang `0.2.1-bootstrap` 产物，并确保对应的 `jiangc` 已在
-PATH 中。`0.2.1-bootstrap` 只作为 0.2.2 的自举锚点，不作为面向用户的正式 release：
+构建当前源码需要先安装 Jiang `0.2.2` 稳定版，并确保对应的 `jiangc` 已在 PATH 中。0.3.0
+不再依赖 stage1 工作区或 stage1 产物：
 
 ```bash
 jiangc --version
@@ -40,7 +40,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-jiangc 0.2.1-bootstrap -> build/jiangc.next -> build/jiangc
+jiangc 0.2.2 -> build/jiangc.next -> build/jiangc
 ```
 
 并默认用最终产物 `build/jiangc` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -49,11 +49,16 @@ jiangc 0.2.1-bootstrap -> build/jiangc.next -> build/jiangc
 build/jiangc
 ```
 
-构建脚本会直接检测 PATH 中的 `jiangc`，并要求版本为 `0.2.x`。如只想构建不跑验证，可设置
+构建脚本会直接检测 PATH 中的 `jiangc`，并要求版本为 `0.2.2`。如只想构建不跑验证，可设置
 `VERIFY=none`；只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
 `build/jiangc --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。
+
+0.3.0 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
+Wasm `wasm32-unknown-unknown` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke，
+但这些 target 的 executable、linker 和 startup 路径迁移到后续版本稳定。no-libc、syscall 和
+inline asm 相关能力等待自定义 DSL 机制稳定后再进入实现阶段。
 
 
 

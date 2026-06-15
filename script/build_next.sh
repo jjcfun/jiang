@@ -5,11 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 NEXT_BIN="${NEXT_BIN:-$BUILD_DIR/jiangc.next}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
 VERIFY="${VERIFY:-full}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
 OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
+
+source "$ROOT_DIR/script/llvm_env.sh"
 
 mkdir -p "$BUILD_DIR"
 cd "$ROOT_DIR"
@@ -30,11 +31,7 @@ case "$BOOTSTRAP_VERSION" in
     ;;
 esac
 
-if [ ! -x "$LLVM_CONFIG" ]; then
-  echo "missing llvm-config: $LLVM_CONFIG" >&2
-  exit 2
-fi
-CLANG_BIN="$("$LLVM_CONFIG" --bindir)/clang"
+CLANG_BIN="$LLVM_CLANG"
 
 case "$VERIFY" in
   none|smoke|full) ;;

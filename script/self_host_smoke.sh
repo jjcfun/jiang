@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_self_host"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
+
+source "$ROOT_DIR/script/llvm_env.sh"
 
 mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
@@ -44,7 +45,7 @@ default_sources=(
   "test/lang/ownership/check/ownership_explicit_move.jiang"
 )
 
-clang_bin="$("$LLVM_CONFIG" --bindir)/clang"
+clang_bin="$LLVM_CLANG"
 compiler_ll="$SMOKE_BUILD_DIR/jiangc.stage2.ll"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc.stage2"
 

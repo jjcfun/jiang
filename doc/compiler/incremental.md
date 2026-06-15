@@ -304,7 +304,7 @@ pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
 
 ```text
 source object:
-  普通 concrete 函数、global、runtime entry。
+  普通 concrete 函数、global、hosted entry wrapper。
 
 monomorph object:
   泛型函数实例。

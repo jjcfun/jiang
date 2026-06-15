@@ -2170,7 +2170,7 @@ import util;
 - root file 可以通过 `public import` 重新导出模块 namespace，也可以通过 `public alias`
   重新导出具体 public symbol
 - 非 root module 的 public 声明不会自动成为 package API
-- dependency package 中的 `main` 不会成为当前 package 的 runtime entry
+- dependency package 中的 `main` 不会成为当前 package 的 hosted entry wrapper
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。
 

@@ -592,7 +592,7 @@ package 对外导出面固定为 root file 的 public namespace：
   的 declarations。
 - root file 的 `public alias` 可以重新导出一个具体 public symbol。
 - 非 root module 的 public declaration 不会自动暴露为 package API。
-- dependency package 中的 `main` 不参与当前 package runtime entry 选择。
+- dependency package 中的 `main` 不参与当前 package 的 hosted entry wrapper 选择。
 
 ### Alias
 

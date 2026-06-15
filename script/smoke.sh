@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 JIANGC="${JIANGC:-$BUILD_DIR/jiangc}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
+
+source "$ROOT_DIR/script/llvm_env.sh"
 
 mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
@@ -16,7 +17,7 @@ link_and_run_llvm_smoke() {
   local output="$2"
   local clang_bin
 
-  clang_bin="$("$LLVM_CONFIG" --bindir)/clang"
+  clang_bin="$LLVM_CLANG"
   "$clang_bin" "$ll_file" -o "$output" \
     $("$LLVM_CONFIG" --ldflags) \
     $("$LLVM_CONFIG" --libs all) \

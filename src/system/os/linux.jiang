@@ -1,0 +1,304 @@
+// Linux hosted target provider.
+//
+// 这个模块承载 Linux target 的 provider-facing API。0.3.0 只固定 hosted
+// provider 形状；no-libc 后续应在 linux/arch 文件中实现 syscall ABI。
+
+import libc = "./linux/libc.jiang";
+import c_string = "../../support/c_string.jiang";
+import list = "../../support/list.jiang";
+
+public struct SpawnResult {
+    public Bool started;
+    public Int exit_code;
+    public UInt8[]&! stdout;
+    public UInt8[]&! stderr;
+
+    public init(Bool started, Int exit_code) {
+        self.started = started;
+        self.exit_code = exit_code;
+        self.stdout = "";
+        self.stderr = "";
+    }
+
+    public init(Bool started, Int exit_code, UInt8[]& stdout, UInt8[]& stderr) {
+        self.started = started;
+        self.exit_code = exit_code;
+        self.stdout = stdout;
+        self.stderr = stderr;
+    }
+}
+
+public struct SpawnOptions {
+    public Bool capture_stdout;
+    public Bool capture_stderr;
+    public Bool discard_stderr;
+
+    public init() {
+        self.capture_stdout = false;
+        self.capture_stderr = false;
+        self.discard_stderr = false;
+    }
+}
+
+public Int32? open_read(UInt8[]& path) {
+    UInt8![*] c_path = c_string.from_slice(path);
+    Int32 fd = libc.open(c_path$.as(UInt8[*:0]), 0);
+    if (fd < 0) {
+        return null;
+    }
+    return fd;
+}
+
+public Int32? open_write(UInt8[]& path) {
+    UInt8![*] c_path = c_string.from_slice(path);
+    Int32 fd = libc.creat(c_path$.as(UInt8[*:0]), 438);
+    if (fd < 0) {
+        return null;
+    }
+    return fd;
+}
+
+public Bool exists(UInt8[]& path) {
+    UInt8![*] c_path = c_string.from_slice(path);
+    return libc.access(c_path$.as(UInt8[*:0]), 0) == 0;
+}
+
+public Bool file_exists(UInt8[]& path) {
+    guard open_read(path) is some fd else { return false; }
+    close_file(fd);
+    return true;
+}
+
+public Bool dir_exists(UInt8[]& path) {
+    UInt8![*] c_path = c_string.from_slice(path);
+    libc.CDir* handle = libc.opendir(c_path$.as(UInt8[*:0]));
+    if (handle == null) {
+        return false;
+    }
+    libc.closedir(handle);
+    return true;
+}
+
+public Bool create_dir(UInt8[]& path) {
+    if (dir_exists(path)) {
+        return true;
+    }
+    UInt8![*] c_path = c_string.from_slice(path);
+    if (libc.mkdir(c_path$.as(UInt8[*:0]), 493) == 0) {
+        return true;
+    }
+    return dir_exists(path);
+}
+
+public Bool create_dirs(UInt8[]& path) {
+    if (path.length == 0) {
+        return true;
+    }
+
+    Int! index = first_segment_start(path);
+    while (index < path.length) {
+        index = skip_separators(path, index);
+        Int start = index;
+        index = scan_segment_end(path, index);
+        if (start == index) {
+            continue;
+        }
+        if (!create_dir(path[0..index])) {
+            return false;
+        }
+    }
+    return create_dir(path);
+}
+
+public Bool write_file_all(Int32 fd, UInt8[]& bytes) {
+    return write_fd(fd, bytes);
+}
+
+public UInt8[]&? read_file_all(Int32 fd) {
+    Int64 size = libc.lseek(fd, 0, 2);
+    if (size < 0) {
+        return null;
+    }
+    if (libc.lseek(fd, 0, 0) < 0) {
+        return null;
+    }
+
+    Int length = Int(size);
+    UInt8![*] bytes = UInt8!$.alloc_array(length + 1);
+    Int! read_count = 0;
+    if (length > 0) {
+        read_count = libc.read(fd, bytes$.as(UInt8[*]), length);
+    }
+    if (read_count != length) {
+        return null;
+    }
+    bytes[length] = 0;
+    UInt8[*] frozen = bytes$.as(UInt8[*]);
+    return frozen[0..length];
+}
+
+public Bool close_file(Int32 fd) {
+    return libc.close(fd) == 0;
+}
+
+public () memory_copy(UInt8[*] dest, UInt8[*] source, Int count) {
+    libc.memcpy(dest, source, count);
+}
+
+public () memory_set(UInt8[*] dest, Int value, Int count) {
+    libc.memset(dest, value, count);
+}
+
+public () exit_process(Int code) {
+    libc.exit(Int32(code));
+}
+
+public () abort_process() {
+    libc.abort();
+}
+
+public () trap() {
+    libc.abort();
+}
+
+public UInt8[:0]&? environment_value(UInt8[]& name) {
+    UInt8![*] c_name = c_string.from_slice(name);
+    UInt8[*:0] value = libc.getenv(c_name$.as(UInt8[*:0]));
+    c_name$.free();
+    if (value == null) {
+        return null;
+    }
+    return value[0..c_string_length(value)]$.as(UInt8[:0]&);
+}
+
+public Int argument_count() {
+    // 0.3.0 不承诺 Linux hosted executable，Linux argv 暂不从 libc 或临时
+    // backend 符号读取。后续 hosted executable 会通过 StartupState 统一入口。
+    return 0;
+}
+
+public UInt8[*:0][*] argument_values() {
+    return null;
+}
+
+public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    SpawnOptions options = SpawnOptions();
+    return spawn_wait(executable, args, options$.ref());
+}
+
+public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args, SpawnOptions& options) {
+    if (!options.capture_stdout && !options.capture_stderr && !options.discard_stderr) {
+        return spawn_wait_inherit(executable, args);
+    }
+    if (options.capture_stderr) {
+        return SpawnResult(false, -1);
+    }
+    if (options.capture_stdout) {
+        // Linux hosted capture 需要正确建模 glibc 的 posix_spawn_file_actions_t。
+        // 它不是 macOS 的 void* 形状，先保持 unsupported，避免错误 ABI。
+        return SpawnResult(false, -1);
+    }
+    return SpawnResult(false, -1);
+}
+
+SpawnResult spawn_wait_inherit(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    UInt8[*:0]![*] argv = argv_array(executable, args);
+    UInt8[*:0]![*] envp = inherited_environment();
+    Int argv_count = args.len() + 1;
+    Int32![*] pid = Int32!$.alloc_array(1);
+    Int32 spawn_result = libc.posix_spawnp(
+        pid$.as(Int32[*]),
+        argv[0],
+        0,
+        0,
+        argv,
+        envp
+    );
+    if (spawn_result != 0) {
+        free_argv(argv, argv_count);
+        pid$.free();
+        return SpawnResult(false, Int(spawn_result));
+    }
+
+    Int32![*] status = Int32!$.alloc_array(1);
+    if (libc.waitpid(pid[0], status$.as(Int32[*]), 0) < 0) {
+        free_argv(argv, argv_count);
+        pid$.free();
+        status$.free();
+        return SpawnResult(false, -1);
+    }
+    Int exit_code = exit_code_from_status(status[0]);
+    free_argv(argv, argv_count);
+    pid$.free();
+    status$.free();
+    return SpawnResult(true, exit_code);
+}
+
+Bool write_fd(Int32 fd, UInt8[]& bytes) {
+    if (bytes.length == 0) {
+        return true;
+    }
+    Int written = libc.write(fd, bytes[0]$.addr()$.as(UInt8[*]), bytes.length);
+    return written == bytes.length;
+}
+
+Int first_segment_start(UInt8[]& path) {
+    if (path.length > 0 && path[0] == UInt8(47)) {
+        return 1;
+    }
+    return 0;
+}
+
+Int skip_separators(UInt8[]& path, Int start) {
+    Int! index = start;
+    while (index < path.length && path[index] == UInt8(47)) {
+        index = index + 1;
+    }
+    return index;
+}
+
+Int scan_segment_end(UInt8[]& path, Int start) {
+    Int! index = start;
+    while (index < path.length && path[index] != UInt8(47)) {
+        index = index + 1;
+    }
+    return index;
+}
+
+Int c_string_length(UInt8[*:0] text) {
+    Int! length = 0;
+    while (text[length] != 0) {
+        length = length + 1;
+    }
+    return length;
+}
+
+UInt8[*:0]![*] argv_array(UInt8[]& executable, list.ArrayList<UInt8[]&>& args) {
+    UInt8[*:0]![*] argv = libc.calloc(args.len() + 2, UInt8*$.size());
+    UInt8![*] executable_arg = c_string.from_slice(executable);
+    argv[0] = executable_arg$.as(UInt8[*:0]);
+    Int! index = 0;
+    while (index < args.len()) {
+        UInt8![*] arg = c_string.from_slice(args.get(index));
+        argv[index + 1] = arg$.as(UInt8[*:0]);
+        index = index + 1;
+    }
+    return argv;
+}
+
+() free_argv(UInt8[*:0]![*] argv, Int count) {
+    Int! index = 0;
+    while (index < count) {
+        argv[index]$.free();
+        index = index + 1;
+    }
+    argv$.free();
+}
+
+UInt8[*:0]![*] inherited_environment() {
+    return libc.environ;
+}
+
+Int exit_code_from_status(Int32 status) {
+    return Int((status >> 8) & 255);
+}

@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_backend_cli"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
+
+source "$ROOT_DIR/script/llvm_env.sh"
 
 mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
@@ -32,7 +33,7 @@ elif [ ! -x "$COMPILER_UNDER_TEST" ]; then
 fi
 COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
 
-clang_bin="$("$LLVM_CONFIG" --bindir)/clang"
+clang_bin="$LLVM_CLANG"
 compiler_ll="$SMOKE_BUILD_DIR/jiangc.ll"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc"
 sample="$SMOKE_BUILD_DIR/minimal.jiang"
@@ -49,6 +50,11 @@ package_release_bin="$SMOKE_BUILD_DIR/package_release"
 field_sample="$SMOKE_BUILD_DIR/field_projection.jiang"
 field_ll="$SMOKE_BUILD_DIR/field_projection.ll"
 field_bin="$SMOKE_BUILD_DIR/field_projection"
+system_fs_sample="$SMOKE_BUILD_DIR/system_fs_target.jiang"
+system_fs_linux_ll="$SMOKE_BUILD_DIR/system_fs_linux.ll"
+system_fs_linux_obj="$SMOKE_BUILD_DIR/system_fs_linux.o"
+system_fs_linux_no_libc_ll="$SMOKE_BUILD_DIR/system_fs_linux_no_libc.ll"
+system_fs_linux_no_libc_obj="$SMOKE_BUILD_DIR/system_fs_linux_no_libc.o"
 alloc_sample="$SMOKE_BUILD_DIR/no_libc_alloc.jiang"
 alloc_no_libc_ll="$SMOKE_BUILD_DIR/no_libc_alloc.ll"
 alloc_no_libc_obj="$SMOKE_BUILD_DIR/no_libc_alloc.o"
@@ -71,6 +77,7 @@ unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
 
 printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
+printf 'import fs = "../../../src/system/fs.jiang";\nInt main() { if (fs.exists("/tmp")) { 0 } else { 1 } }\n' >"$system_fs_sample"
 printf 'Int main() { Int![*] values = Int!$.alloc_array(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
 
 printf '== backend cli smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
@@ -177,6 +184,24 @@ grep -q 'target datalayout = ' "$linux_target_ll"
 test -s "$linux_target_obj"
 file "$linux_target_obj" | grep -q "ELF 64-bit.*x86-64"
 
+"$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$system_fs_linux_ll" "$system_fs_sample"
+test -s "$system_fs_linux_ll"
+grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$system_fs_linux_ll"
+"$compiler_bin" --target x86_64-unknown-linux-gnu --emit-obj -o "$system_fs_linux_obj" "$system_fs_sample"
+test -s "$system_fs_linux_obj"
+file "$system_fs_linux_obj" | grep -q "ELF 64-bit.*x86-64"
+
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-llvm -o "$system_fs_linux_no_libc_ll" "$system_fs_sample"
+test -s "$system_fs_linux_no_libc_ll"
+grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$system_fs_linux_no_libc_ll"
+if grep -Eq "@(getenv|posix_spawn|opendir|memcpy|memset)\\b" "$system_fs_linux_no_libc_ll"; then
+  echo "unexpected hosted/libc symbol in linux no-libc system provider LLVM output" >&2
+  exit 1
+fi
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-obj -o "$system_fs_linux_no_libc_obj" "$system_fs_sample"
+test -s "$system_fs_linux_no_libc_obj"
+file "$system_fs_linux_no_libc_obj" | grep -q "ELF 64-bit.*x86-64"
+
 "$compiler_bin" --target x86_64-pc-windows-msvc --emit-llvm -o "$windows_target_ll" "$sample"
 test -s "$windows_target_ll"
 grep -q 'target triple = "x86_64-pc-windows-msvc"' "$windows_target_ll"
@@ -198,7 +223,7 @@ set +e
 linux_no_libc_exe_status=$?
 set -e
 test "$linux_no_libc_exe_status" -ne 0
-grep -q "no_link_libc_executable_unsupported" "$linux_no_libc_exe_log"
+grep -q "linux_no_libc_runtime_missing" "$linux_no_libc_exe_log"
 
 set +e
 "$compiler_bin" --target x86_64-pc-windows-msvc -o "$SMOKE_BUILD_DIR/minimal_windows_exe" "$sample" >"$windows_exe_log" 2>&1

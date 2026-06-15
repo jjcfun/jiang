@@ -8,7 +8,8 @@ PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 TARGET="${TARGET:-macos-arm64}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
-LLVM_CONFIG="${LLVM_CONFIG:-/opt/homebrew/opt/llvm@21/bin/llvm-config}"
+
+source "$ROOT_DIR/script/llvm_env.sh"
 
 PACKAGE_NAME="jiang-$VERSION-$TARGET"
 PACKAGE_DIR="$DIST_DIR/$PACKAGE_NAME"
@@ -29,19 +30,13 @@ if [ ! -x "$JIANGC_BIN" ]; then
   exit 2
 fi
 
-if [ ! -x "$LLVM_CONFIG" ]; then
-  echo "missing llvm-config: $LLVM_CONFIG" >&2
-  echo "run: bash ./script/install_llvm_macos.sh" >&2
-  exit 2
-fi
-
 if ! command -v zip >/dev/null 2>&1; then
   echo "missing zip command" >&2
   exit 2
 fi
 
 llvm_version="$("$LLVM_CONFIG" --version)"
-llvm_lib_dir="$("$LLVM_CONFIG" --libdir)"
+llvm_lib_dir="$LLVM_LIB_DIR"
 llvm_dylib="$llvm_lib_dir/libLLVM.dylib"
 if [ ! -f "$llvm_dylib" ]; then
   echo "missing LLVM dylib: $llvm_dylib" >&2
