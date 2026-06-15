@@ -5,8 +5,8 @@
 # Jiang语言
 
 当前 Jiang 语言编译器处于 stage2 开发阶段，已经可以稳定自举。stage0 和 stage1 由 vibe coding
-产生（在 stage1 分支）；stage2 将采取人工方式编写和审核代码。0.2.2 之后的编译器开发只依赖
-0.2 系列稳定版 `jiangc` 作为 bootstrap 输入，不再依赖 stage1 工作区或 stage1 产物。
+产生（在 stage1 分支）；stage2 将采取人工方式编写和审核代码。0.3.1 之后的编译器开发只依赖
+上一版稳定 `jiangc` 作为 bootstrap 输入，不再依赖 stage1 工作区或 stage1 产物。
 
 Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。这里先卖个关子：0.4 版本会引入一个
 杀手级特性，它会是这门语言真正拉开差异的起点。
@@ -17,14 +17,15 @@ Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。
 
 ## 构建自举编译器
 
-当前 0.3.0 主线仍以 macOS arm64 作为开发、验证和 release host。编译器本身依赖本机 LLVM 21；
-默认路径按 Homebrew 的 `llvm@21` 约定查找。
+当前 0.3.1 主线仍以 macOS arm64 作为开发、验证和 release host。编译器本身依赖本机 LLVM 21。
+构建脚本会通过 `script/llvm_env.sh` 查找 `LLVM_CONFIG`、`JIANG_LLVM_ROOT`、`LLVM_ROOT`、
+`llvm-config-21`、Homebrew `llvm@21` 和 Linux 常见 `/usr/lib/llvm-21` 等路径。
 
 ```bash
 bash ./script/install_llvm_macos.sh
 ```
 
-构建当前源码需要先安装 Jiang `0.2.2` 稳定版，并确保对应的 `jiangc` 已在 PATH 中。0.3.0
+构建当前源码需要先安装 Jiang `0.3.0` 稳定版，并确保对应的 `jiangc` 已在 PATH 中。0.3.1
 不再依赖 stage1 工作区或 stage1 产物：
 
 ```bash
@@ -40,7 +41,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-jiangc 0.2.2 -> build/jiangc.next -> build/jiangc
+jiangc 0.3.0 -> build/jiangc.next -> build/jiangc
 ```
 
 并默认用最终产物 `build/jiangc` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -49,13 +50,13 @@ jiangc 0.2.2 -> build/jiangc.next -> build/jiangc
 build/jiangc
 ```
 
-构建脚本会直接检测 PATH 中的 `jiangc`，并要求版本为 `0.2.2`。如只想构建不跑验证，可设置
+构建脚本会直接检测 PATH 中的 `jiangc`，并要求版本为 `0.3.0`。如只想构建不跑验证，可设置
 `VERIFY=none`；只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
 `build/jiangc --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。
 
-0.3.0 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
+0.3.1 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
 Wasm `wasm32-unknown-unknown` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke，
 但这些 target 的 executable、linker 和 startup 路径迁移到后续版本稳定。no-libc、syscall 和
 inline asm 相关能力等待自定义 DSL 机制稳定后再进入实现阶段。
@@ -93,10 +94,12 @@ release zip 不内置 `libLLVM.dylib`，用户机器需要安装 `llvm@21`。包
 
 - [官网与语言文档](https://jiang-lang.org/)
 - [架构文档](doc/architecture.md)
+- [Std incubator](doc/std.md)
 - 阶段设计：[AST](doc/compiler/ast.md)、[Resolve](doc/compiler/resolve.md)、[HIR](doc/compiler/hir.md)、
   [Type Check](doc/compiler/type-check.md)、[Monomorph](doc/compiler/monomorph.md)、
   [MIR](doc/compiler/mir.md)、[Layout](doc/compiler/layout.md)、
-  [Borrow Check](doc/compiler/borrow-check.md)、[Backend](doc/compiler/backend.md)
+  [Borrow Check](doc/compiler/borrow-check.md)、[Backend](doc/compiler/backend.md)、
+  [Startup](doc/compiler/startup.md)、[Targets](doc/compiler/targets.md)
 - [PEG 语法](doc/grammar.md)
 - [语言设计](doc/language-design.md)
 

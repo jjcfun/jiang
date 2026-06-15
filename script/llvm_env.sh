@@ -12,6 +12,10 @@ jiang_find_llvm_config() {
     printf '%s\n' "$LLVM_CONFIG"
     return
   fi
+  if [ -n "${JIANG_LLVM_ROOT:-}" ] && [ -x "$JIANG_LLVM_ROOT/bin/llvm-config" ]; then
+    printf '%s\n' "$JIANG_LLVM_ROOT/bin/llvm-config"
+    return
+  fi
   if [ -n "${LLVM_ROOT:-}" ] && [ -x "$LLVM_ROOT/bin/llvm-config" ]; then
     printf '%s\n' "$LLVM_ROOT/bin/llvm-config"
     return
@@ -20,14 +24,19 @@ jiang_find_llvm_config() {
     command -v "llvm-config-$JIANG_LLVM_VERSION"
     return
   fi
-  if [ -x "/opt/homebrew/opt/llvm@$JIANG_LLVM_VERSION/bin/llvm-config" ]; then
-    printf '%s\n' "/opt/homebrew/opt/llvm@$JIANG_LLVM_VERSION/bin/llvm-config"
-    return
-  fi
-  if [ -x "/usr/local/opt/llvm@$JIANG_LLVM_VERSION/bin/llvm-config" ]; then
-    printf '%s\n' "/usr/local/opt/llvm@$JIANG_LLVM_VERSION/bin/llvm-config"
-    return
-  fi
+  for root in \
+    "/usr/lib/llvm-$JIANG_LLVM_VERSION" \
+    "/usr/local/llvm-$JIANG_LLVM_VERSION" \
+    "/opt/llvm-$JIANG_LLVM_VERSION" \
+    "/opt/llvm@$JIANG_LLVM_VERSION" \
+    "/opt/homebrew/opt/llvm@$JIANG_LLVM_VERSION" \
+    "/usr/local/opt/llvm@$JIANG_LLVM_VERSION"
+  do
+    if [ -x "$root/bin/llvm-config" ]; then
+      printf '%s\n' "$root/bin/llvm-config"
+      return
+    fi
+  done
   if command -v llvm-config >/dev/null 2>&1; then
     command -v llvm-config
     return
@@ -38,7 +47,7 @@ jiang_find_llvm_config() {
 jiang_resolve_llvm_env() {
   LLVM_CONFIG="$(jiang_find_llvm_config || true)"
   if [ -z "$LLVM_CONFIG" ] || [ ! -x "$LLVM_CONFIG" ]; then
-    echo "missing llvm-config; install LLVM $JIANG_LLVM_VERSION or set LLVM_CONFIG" >&2
+    echo "missing llvm-config; install LLVM $JIANG_LLVM_VERSION or set LLVM_CONFIG/JIANG_LLVM_ROOT" >&2
     return 2
   fi
 

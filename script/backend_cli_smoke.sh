@@ -223,21 +223,21 @@ set +e
 linux_no_libc_exe_status=$?
 set -e
 test "$linux_no_libc_exe_status" -ne 0
-grep -q "linux_no_libc_runtime_missing" "$linux_no_libc_exe_log"
+grep -q "target_executable_requires_runtime" "$linux_no_libc_exe_log"
 
 set +e
 "$compiler_bin" --target x86_64-pc-windows-msvc -o "$SMOKE_BUILD_DIR/minimal_windows_exe" "$sample" >"$windows_exe_log" 2>&1
 windows_exe_status=$?
 set -e
 test "$windows_exe_status" -ne 0
-grep -q "target_executable_unsupported" "$windows_exe_log"
+grep -q "target_executable_runtime_unsupported" "$windows_exe_log"
 
 set +e
 "$compiler_bin" --target wasm32-unknown-unknown -o "$SMOKE_BUILD_DIR/minimal_wasm_exe" "$sample" >"$wasm_exe_log" 2>&1
 wasm_exe_status=$?
 set -e
 test "$wasm_exe_status" -ne 0
-grep -q "no_link_libc_executable_unsupported" "$wasm_exe_log"
+grep -q "target_executable_runtime_unsupported" "$wasm_exe_log"
 
 set +e
 "$compiler_bin" --target x86_64-unknown-freebsd --emit-llvm -o "$SMOKE_BUILD_DIR/minimal_freebsd.ll" "$sample" >"$unsupported_target_log" 2>&1
