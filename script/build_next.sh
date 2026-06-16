@@ -6,6 +6,7 @@ BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 NEXT_BIN="${NEXT_BIN:-$BUILD_DIR/jiangc.next}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
 VERIFY="${VERIFY:-full}"
+BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
 OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
@@ -37,6 +38,14 @@ case "$VERIFY" in
   none|smoke|full) ;;
   *)
     echo "invalid VERIFY=$VERIFY; expected none, smoke, or full" >&2
+    exit 2
+    ;;
+esac
+
+case "$BOOTSTRAP_DEPTH" in
+  next|stable) ;;
+  *)
+    echo "invalid BOOTSTRAP_DEPTH=$BOOTSTRAP_DEPTH; expected next or stable" >&2
     exit 2
     ;;
 esac
@@ -91,35 +100,43 @@ emit_compiler_with_compiler() {
 printf '== build next: 0.3.0 -> next ==\n'
 emit_next_from_bootstrap "$NEXT_BIN"
 
-printf '\n== build next: next -> jiangc ==\n'
-emit_compiler_with_compiler "$NEXT_BIN" "$JIANGC_BIN" "$BUILD_DIR/jiangc.ll"
+VERIFY_BIN="$NEXT_BIN"
+if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then
+  printf '\n== build stable: next -> jiangc ==\n'
+  emit_compiler_with_compiler "$NEXT_BIN" "$JIANGC_BIN" "$BUILD_DIR/jiangc.ll"
+  VERIFY_BIN="$JIANGC_BIN"
+fi
 
 if [ "$VERIFY" != "none" ]; then
-  printf '\n== next verify: smoke with %s ==\n' "$JIANGC_BIN"
+  printf '\n== next verify: smoke with %s ==\n' "$VERIFY_BIN"
   BUILD_DIR="$BUILD_DIR" \
-  JIANGC="$JIANGC_BIN" \
+  JIANGC="$VERIFY_BIN" \
   bash "$ROOT_DIR/script/smoke.sh"
 
   printf '\n== next verify: backend cli smoke ==\n'
   BUILD_DIR="$BUILD_DIR" \
-  JIANGC="$JIANGC_BIN" \
+  JIANGC="$VERIFY_BIN" \
   bash "$ROOT_DIR/script/backend_cli_smoke.sh"
 fi
 
 if [ "$VERIFY" = "full" ]; then
-  printf '\n== next verify: lang check with %s ==\n' "$JIANGC_BIN"
-  JIANGC="$JIANGC_BIN" \
+  printf '\n== next verify: lang check with %s ==\n' "$VERIFY_BIN"
+  JIANGC="$VERIFY_BIN" \
   bash "$ROOT_DIR/script/lang_check.sh"
 fi
 
-chmod +x "$JIANGC_BIN"
+chmod +x "$VERIFY_BIN"
 
-actual_version="$("$JIANGC_BIN" --version | sed -n '1p')"
+actual_version="$("$VERIFY_BIN" --version | sed -n '1p')"
 expected_version="jiang $JIANG_VERSION"
 if [ "$actual_version" != "$expected_version" ]; then
   echo "compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
   exit 1
 fi
 
-printf '\nOK compiler: %s\n' "$JIANGC_BIN"
-printf 'bootstrap candidate: %s\n' "$NEXT_BIN"
+printf '\nOK compiler: %s\n' "$VERIFY_BIN"
+if [ "$BOOTSTRAP_DEPTH" = "next" ]; then
+  printf 'stable compiler not rebuilt; run BOOTSTRAP_DEPTH=stable for release verification.\n'
+else
+  printf 'bootstrap candidate: %s\n' "$NEXT_BIN"
+fi

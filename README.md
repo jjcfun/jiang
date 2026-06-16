@@ -41,20 +41,25 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-jiangc 0.3.0 -> build/jiangc.next -> build/jiangc
+jiangc 0.3.0 -> build/jiangc.next
 ```
 
-并默认用最终产物 `build/jiangc` 跑 smoke、backend CLI smoke 和 lang check。输出为：
+并默认用 `build/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
 
 ```text
-build/jiangc
+build/jiangc.next
 ```
 
 构建脚本会直接检测 PATH 中的 `jiangc`，并要求版本为 `0.3.0`。如只想构建不跑验证，可设置
 `VERIFY=none`；只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
-`build/jiangc --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。
+`build/jiangc.next --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。release 阶段需要完整
+两跳自举时，使用：
+
+```bash
+BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
+```
 
 0.3.1 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
 Wasm `wasm32-unknown-unknown` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke，

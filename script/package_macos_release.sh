@@ -26,7 +26,7 @@ esac
 
 if [ ! -x "$JIANGC_BIN" ]; then
   echo "missing compiler: $JIANGC_BIN" >&2
-  echo "run: VERIFY=full bash ./script/build_next.sh" >&2
+  echo "run: BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh" >&2
   exit 2
 fi
 
@@ -47,7 +47,7 @@ actual_version="$("$JIANGC_BIN" --version | sed -n '1p')"
 expected_version="jiang $VERSION"
 if [ "$actual_version" != "$expected_version" ]; then
   echo "compiler version mismatch: expected '$expected_version', got '$actual_version'" >&2
-  echo "run: JIANG_VERSION=$VERSION VERIFY=full bash ./script/build_next.sh" >&2
+  echo "run: JIANG_VERSION=$VERSION BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh" >&2
   exit 2
 fi
 

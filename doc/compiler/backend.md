@@ -63,10 +63,10 @@ compatibility provider：
 - `system/os/macos.jiang` 是 macOS hosted target provider，可以依赖 libSystem。
 - `system/os/linux.jiang` 是 Linux hosted target provider，可以依赖 libc。
 - `system/os/macos/libc.jiang` 和 `system/os/linux/libc.jiang` 是 hosted C ABI 边界。
-- `src/system/*.jiang` 只 import virtual `./os/provider.jiang`。resolver 根据
-  `CompilerContext` 中的 target provider 和 effective link-libc 模式，把它映射到具体 OS provider。
-- `system/os/provider.jiang` 仍作为 bootstrap fallback 文件存在，默认转发到 macOS hosted provider；
-  mapping-aware compiler 在支持的 target 上应该先完成映射，不依赖这个 fallback 文件。
+- `src/system/*.jiang` 只 import `./os/provider.jiang`。该文件通过 `comptime` 根据 `build.target`
+  选择具体 OS provider；resolver 不再对 system provider 做路径重写。
+- `system/os/unsupported.jiang` 保持 type-check/object 输出路径可用；executable 是否支持仍由
+  target/link plan 诊断决定。
 - 0.3.0 不保留可 import 的 `system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
   避免把 POSIX 固定成 hosted libc。
 - no-libc provider 不能通过 hosted libc ABI 间接依赖 libc；它必须走 syscall、compiler

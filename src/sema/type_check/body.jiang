@@ -6,6 +6,7 @@ import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
 import namespace = "../../resolve/namespace.jiang";
 import list = "../../support/list.jiang";
+import memory = "../../support/memory.jiang";
 import string = "../../support/string.jiang";
 import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
@@ -14,6 +15,7 @@ import types = "../type.jiang";
 import check_state = "./state.jiang";
 import type_ops_mod = "./type_ops.jiang";
 import pattern_mod = "./pattern.jiang";
+import comptime_value = "../comptime/value.jiang";
 
 public struct BodyCheck: Movable {
     check_state.CheckState& state;
@@ -132,23 +134,33 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_global_body(hir.HirDef& hir_def, hir.HirId root) {
-        if (hir_def.decl.compile_time_constant) {
-            self.check_const_initializer(hir_def.def_id, root);
-        }
         guard hir_def.decl.type_ref is some type_ref else {
-            return self.check_node(root);
+            qid.TypeId type_id = self.check_node(root);
+            if (hir_def.decl.is_const) {
+                self.check_const_initializer(hir_def.def_id, root);
+            }
+            return type_id;
         }
         if (self.type_ops.type_ref_is_inferred_array(type_ref)) {
-            return self.check_node(root);
+            qid.TypeId type_id = self.check_node(root);
+            if (hir_def.decl.is_const) {
+                self.check_const_initializer(hir_def.def_id, root);
+            }
+            return type_id;
         }
         qid.TypeId expected = self.type_ops.check_value_type_ref(type_ref);
-        return self.check_node_expected(root, expected);
+        qid.TypeId type_id = self.check_node_expected(root, expected);
+        if (hir_def.decl.is_const) {
+            self.check_const_initializer(hir_def.def_id, root);
+        }
+        return type_id;
     }
 
     () check_const_initializer(qid.DefId def_id, hir.HirId root) {
         list.ArrayList<qid.DefId>! visiting = list.ArrayList<qid.DefId>();
         visiting.add(def_id);
-        if (self.const_initializer_expr(root, visiting$.ref())) {
+        if (self.const_initializer_value(root, visiting$.ref()) is some value) {
+            self.state.store.comptime_store.set_const_value(def_id, value);
             return;
         }
         self.type_ops.add_node_error(
@@ -158,50 +170,312 @@ public struct BodyCheck: Movable {
         );
     }
 
-    Bool const_initializer_expr(hir.HirId node_id, list.ArrayList<qid.DefId>& visiting) {
+    comptime_value.ComptimeValue? const_initializer_value(
+        hir.HirId node_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
         hir.HirNode node = self.state.hirs.node(node_id);
-        if (node.data is .literal(_)) {
-            return true;
+        if (node.data is .literal(literal)) {
+            return self.literal_const_value(node_id, literal);
         }
         if (node.data is .name_ref(name_ref)) {
-            guard name_ref is .def_ref(def_id) else {
-                return false;
+            guard name_ref is .def_ref(def_id) else { return null; }
+            if (self.state.store.defs.get(def_id).kind == .enum_case_def) {
+                return self.enum_case_const_value(node_id, def_id);
             }
-            return self.const_initializer_def_ref(def_id, visiting);
+            return self.const_initializer_def_value(node_id, def_id, visiting);
+        }
+        if (node.data is .member_access(_)) {
+            guard self.state.results.member_selection(node_id) is some member_def else { return null; }
+            if (self.state.store.defs.get(member_def).kind == .enum_case_def) {
+                return self.enum_case_const_value(node_id, member_def);
+            }
+            return self.const_initializer_def_value(node_id, member_def, visiting);
+        }
+        if (node.data is .struct_literal(struct_literal)) {
+            return self.struct_literal_const_value(node_id, struct_literal, visiting);
+        }
+        if (node.data is .tuple_literal(tuple_literal)) {
+            return self.tuple_literal_const_value(node_id, tuple_literal, visiting);
+        }
+        if (node.data is .array_literal(array_literal)) {
+            return self.array_literal_const_value(node_id, array_literal, visiting);
         }
         if (node.data is .unary(unary)) {
-            if (unary.op == .negate || unary.op == .not || unary.op == .bit_not) {
-                return self.const_initializer_expr(unary.value, visiting);
-            }
-            return false;
+            return self.unary_const_value(node_id, unary, visiting);
         }
         if (node.data is .binary(binary)) {
-            if (!self.const_binary_op(binary.op)) {
-                return false;
-            }
-            return self.const_initializer_expr(binary.left, visiting)
-                && self.const_initializer_expr(binary.right, visiting);
+            return self.binary_const_value(node_id, binary, visiting);
         }
-        return false;
+        if (node.data is .call(_)) {
+            return self.call_const_value(node_id, visiting);
+        }
+        return null;
     }
 
-    Bool const_initializer_def_ref(qid.DefId def_id, list.ArrayList<qid.DefId>& visiting) {
-        guard self.state.hirs.def(def_id) is some hir_def else {
-            return false;
+    comptime_value.ComptimeValue? const_initializer_def_value(
+        hir.HirId node_id,
+        qid.DefId def_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        if (self.state.store.comptime_store.const_value(def_id) is some value) {
+            return value;
         }
-        if (hir_def.decl.kind != .global_decl || !hir_def.decl.compile_time_constant) {
-            return false;
+        guard self.state.hirs.def(def_id) is some hir_def else { return null; }
+        if (hir_def.decl.kind != .global_decl || !hir_def.decl.is_const) {
+            return null;
         }
         if (self.const_visiting_contains(visiting, def_id)) {
-            return false;
+            return null;
         }
-        guard hir_def.body is some _& body else {
-            return false;
-        }
+        guard hir_def.body is some _& body else { return null; }
         visiting.add(def_id);
-        Bool result = self.const_initializer_expr(body.root, visiting);
+        comptime_value.ComptimeValue? result = self.const_initializer_value(body.root, visiting);
         visiting.pop();
         return result;
+    }
+
+    comptime_value.ComptimeValue enum_case_const_value(hir.HirId node_id, qid.DefId case_def) {
+        qid.TypeId type_id = self.const_node_type(node_id);
+        return comptime_value.ComptimeValue(type_id: type_id, data: .enum_case_value(case_def));
+    }
+
+    qid.TypeId const_node_type(hir.HirId node_id) {
+        if (self.state.results.node_type(node_id) is some type_id) {
+            return type_id;
+        }
+        return self.state.store.types.invalid_type();
+    }
+
+    comptime_value.ComptimeValue? literal_const_value(hir.HirId node_id, hir.HirLiteral literal) {
+        qid.TypeId! type_id = self.state.store.types.invalid_type();
+        // Const initializer value recording runs after initializer type check, so
+        // the node result carries contextual types such as Int16 or UInt8.
+        // If a future caller evaluates before type check, keep invalid_type
+        // rather than guessing a builtin default.
+        if (self.state.results.node_type(node_id) is some checked_type) {
+            type_id = checked_type;
+        }
+        if (literal.value is .int_value(int_value)) {
+            return comptime_value.ComptimeValue(type_id: type_id, data: .int_value(Int(int_value.bits)));
+        }
+        if (literal.value is .bool_value(bool_value)) {
+            return comptime_value.ComptimeValue(type_id: type_id, data: .bool_value(bool_value));
+        }
+        if (literal.value is .float_value(float_value)) {
+            return comptime_value.ComptimeValue(type_id: type_id, data: .float_bits(self.float64_to_bits(float_value.value)));
+        }
+        if (literal.value is .char_value(char_value)) {
+            return comptime_value.ComptimeValue(type_id: type_id, data: .char_value(UInt64(char_value)));
+        }
+        if (literal.value is .string_value(symbol)) {
+            return comptime_value.ComptimeValue(type_id: type_id, data: .symbol_value(symbol));
+        }
+        return null;
+    }
+
+    comptime_value.ComptimeValue? struct_literal_const_value(
+        hir.HirId node_id,
+        hir.HirStructLiteral literal,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        comptime_value.ComptimeAggregateField![*] fields = comptime_value.ComptimeAggregateField!$.alloc_array(literal.fields.length);
+        qid.TypeId type_id = self.const_node_type(node_id);
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .named(named) else { return null; }
+        Int! index = 0;
+        while (index < literal.fields.length) {
+            hir.HirFieldInit field = literal.fields[index];
+            guard self.field_def_for_struct_literal(named.def_id, field.field_symbol) is some field_def else {
+                return null;
+            }
+            guard self.const_initializer_value(field.value, visiting) is some field_value else {
+                return null;
+            }
+            fields[index] = comptime_value.ComptimeAggregateField(field_def: field_def, value: field_value);
+            index = index + 1;
+        }
+        return comptime_value.ComptimeValue(type_id: type_id, data: .struct_value(fields[0..literal.fields.length]));
+    }
+
+    comptime_value.ComptimeValue? tuple_literal_const_value(
+        hir.HirId node_id,
+        hir.HirTupleLiteral literal,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        comptime_value.ComptimeValue![*] items = comptime_value.ComptimeValue!$.alloc_array(literal.items.length);
+        Int! index = 0;
+        while (index < literal.items.length) {
+            guard self.const_initializer_value(literal.items[index], visiting) is some item_value else {
+                return null;
+            }
+            items[index] = item_value;
+            index = index + 1;
+        }
+        return comptime_value.ComptimeValue(type_id: self.const_node_type(node_id), data: .tuple_value(items[0..literal.items.length]));
+    }
+
+    comptime_value.ComptimeValue? array_literal_const_value(
+        hir.HirId node_id,
+        hir.HirArrayLiteral literal,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        comptime_value.ComptimeValue![*] items = comptime_value.ComptimeValue!$.alloc_array(literal.items.length);
+        Int! index = 0;
+        while (index < literal.items.length) {
+            guard self.const_initializer_value(literal.items[index], visiting) is some item_value else {
+                return null;
+            }
+            items[index] = item_value;
+            index = index + 1;
+        }
+        return comptime_value.ComptimeValue(type_id: self.const_node_type(node_id), data: .array_value(items[0..literal.items.length]));
+    }
+
+    comptime_value.ComptimeValue? unary_const_value(
+        hir.HirId node_id,
+        hir.HirUnary unary,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.const_initializer_value(unary.value, visiting) is some value else { return null; }
+        if (unary.op == .not) {
+            guard value.data is .bool_value(bool_value) else { return null; }
+            return self.bool_const_value(node_id, !bool_value);
+        }
+        guard value.data is .int_value(int_value) else { return null; }
+        if (unary.op == .negate) {
+            return self.int_const_value(node_id, Int(0) - int_value);
+        }
+        if (unary.op == .bit_not) {
+            return self.int_const_value(node_id, ~int_value);
+        }
+        return null;
+    }
+
+    comptime_value.ComptimeValue? binary_const_value(
+        hir.HirId node_id,
+        hir.HirBinary binary,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.const_initializer_value(binary.left, visiting) is some left else { return null; }
+        guard self.const_initializer_value(binary.right, visiting) is some right else { return null; }
+        if (left.data is .bool_value(left_bool)) {
+            guard right.data is .bool_value(right_bool) else { return null; }
+            return self.bool_binary_const_value(node_id, binary.op, left_bool, right_bool);
+        }
+        guard left.data is .int_value(left_int) else { return null; }
+        guard right.data is .int_value(right_int) else { return null; }
+        return self.int_binary_const_value(node_id, binary.op, left_int, right_int);
+    }
+
+    comptime_value.ComptimeValue? bool_binary_const_value(
+        hir.HirId node_id,
+        hir.HirBinaryOp op,
+        Bool left,
+        Bool right
+    ) {
+        if (op == .logic_and) { return self.bool_const_value(node_id, left && right); }
+        if (op == .logic_or) { return self.bool_const_value(node_id, left || right); }
+        if (op == .equal) { return self.bool_const_value(node_id, left == right); }
+        if (op == .not_equal) { return self.bool_const_value(node_id, left != right); }
+        return null;
+    }
+
+    comptime_value.ComptimeValue? int_binary_const_value(
+        hir.HirId node_id,
+        hir.HirBinaryOp op,
+        Int left,
+        Int right
+    ) {
+        if (op == .equal) { return self.bool_const_value(node_id, left == right); }
+        if (op == .not_equal) { return self.bool_const_value(node_id, left != right); }
+        if (op == .less) { return self.bool_const_value(node_id, left < right); }
+        if (op == .less_equal) { return self.bool_const_value(node_id, left <= right); }
+        if (op == .greater) { return self.bool_const_value(node_id, left > right); }
+        if (op == .greater_equal) { return self.bool_const_value(node_id, left >= right); }
+        if (op == .add) { return self.int_const_value(node_id, left + right); }
+        if (op == .sub) { return self.int_const_value(node_id, left - right); }
+        if (op == .mul) { return self.int_const_value(node_id, left * right); }
+        if (op == .div) {
+            if (right == 0) { return null; }
+            return self.int_const_value(node_id, left / right);
+        }
+        if (op == .mod) {
+            if (right == 0) { return null; }
+            return self.int_const_value(node_id, left % right);
+        }
+        if (op == .bit_and) { return self.int_const_value(node_id, left & right); }
+        if (op == .bit_or) { return self.int_const_value(node_id, left | right); }
+        if (op == .bit_xor) { return self.int_const_value(node_id, left ^ right); }
+        if (op == .shift_left) { return self.int_const_value(node_id, left << right); }
+        if (op == .shift_right) { return self.int_const_value(node_id, left >> right); }
+        return null;
+    }
+
+    comptime_value.ComptimeValue bool_const_value(hir.HirId node_id, Bool value) {
+        return comptime_value.ComptimeValue(type_id: self.const_node_type(node_id), data: .bool_value(value));
+    }
+
+    comptime_value.ComptimeValue int_const_value(hir.HirId node_id, Int value) {
+        return comptime_value.ComptimeValue(type_id: self.const_node_type(node_id), data: .int_value(value));
+    }
+
+    comptime_value.ComptimeValue? call_const_value(
+        hir.HirId node_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.state.results.expr_lowering(node_id) is some lowering else { return null; }
+        if (lowering == .default_nominal) {
+            return self.default_nominal_const_value(node_id, visiting);
+        }
+        return null;
+    }
+
+    comptime_value.ComptimeValue? default_nominal_const_value(
+        hir.HirId node_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        qid.TypeId type_id = self.const_node_type(node_id);
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .named(named) else { return null; }
+        guard self.state.results.ordered_call_args(node_id) is some args else { return null; }
+        comptime_value.ComptimeAggregateField![*] fields = comptime_value.ComptimeAggregateField!$.alloc_array(args.values.length);
+        Int! index = 0;
+        while (index < args.values.length) {
+            guard self.field_def_at_value_index(named.def_id, index) is some field_def else { return null; }
+            guard self.const_initializer_value(args.values[index], visiting) is some field_value else { return null; }
+            fields[index] = comptime_value.ComptimeAggregateField(field_def: field_def, value: field_value);
+            index = index + 1;
+        }
+        return comptime_value.ComptimeValue(type_id: type_id, data: .struct_value(fields[0..args.values.length]));
+    }
+
+    qid.DefId? field_def_at_value_index(qid.DefId owner_def, Int value_index) {
+        guard self.state.hirs.def(owner_def) is some owner_hir else { return null; }
+        Int! member_index = 0;
+        Int! field_index = 0;
+        while (member_index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(member_index);
+            if (self.state.store.defs.get(member_def).kind == .field_def) {
+                if (field_index == value_index) {
+                    return member_def;
+                }
+                field_index = field_index + 1;
+            }
+            member_index = member_index + 1;
+        }
+        return null;
+    }
+
+    UInt64 float64_to_bits(Float64 value) {
+        Float64![*] input = Float64!$.alloc_array(1);
+        UInt64![*] output = UInt64!$.alloc_array(1);
+        input[0] = value;
+        memory.copy_bytes(output[0]$.addr()$.as(UInt8[*]), input[0]$.addr()$.as(UInt8[*]), 8);
+        UInt64 bits = output[0];
+        input$.free();
+        output$.free();
+        return bits;
     }
 
     Bool const_visiting_contains(list.ArrayList<qid.DefId>& visiting, qid.DefId def_id) {
@@ -213,13 +487,6 @@ public struct BodyCheck: Movable {
             index = index + 1;
         }
         return false;
-    }
-
-    Bool const_binary_op(hir.HirBinaryOp op) {
-        if (op == .coalesce) {
-            return false;
-        }
-        return true;
     }
 
     () check_decl_body_result(

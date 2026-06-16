@@ -1032,13 +1032,64 @@ ambiguous re-export 仍需后续完善；package dependency 第一版只支持�
 - import alias 和 package path 的解析顺序：`import dep;` 优先查当前 package dependency alias。
 - 重复声明、shadowing 和 visibility 规则。
 
+## 编译期执行
+
+目标规则：
+
+- `comptime { ... }` 是语言内建编译期 block，表示 block 内 Jiang 代码在编译期执行。
+- `comptime` 使用普通关键字入口，不占用后续 `#sql { ... }`、`#asm { ... }` 这类 custom syntax
+  namespace；`@` 保留给 attribute / annotation。
+- 第一版 `comptime` 先只支持 module-level，用于 target-specific import / declaration 选择。
+- `comptime` block 不生成 runtime code。
+- `comptime` block 内使用普通 Jiang 语法。`if`、布尔表达式、字段访问、枚举比较等都复用普通
+  parser、resolve、type check 和 const eval，不引入 `#if` 小语言，也不维护第二套 compile-only
+  AST/type system。
+- `comptime` block 内未执行的分支不参与 import graph、name resolve、type check 或 codegen。
+- 第一版仍然先完整 parse `comptime` block，所以未执行分支里的语法错误仍然诊断；只有 parse
+  之后的语义阶段会跳过未执行分支。
+- `comptime if` 的 condition 最终语义是普通表达式，但类型必须是可编译期求值的 `const Bool`。
+  因为 conditional import 需要在 module graph 阶段就决定依赖边，第一版会在 import discovery
+  阶段先跑受限 const evaluator；后续完整 const/type check 接入后，这个早期 evaluator 只能作为
+  import graph 的前置选择器，不能扩展成独立语义。
+- 第一版 const eval 只支持常量表达式子集：bool/int/enum/struct 常量、字段访问、`==` / `!=`、
+  `&&` / `||` / `!`、const global 引用和普通 struct/enum literal。不执行任意用户函数，不执行
+  IO，不访问运行时变量。
+
+示例：
+
+```jiang
+import build;
+
+comptime {
+    if (build.target.os == .macos) {
+        import provider = "os/macos.jiang";
+    } else if (build.target.os == .linux) {
+        import provider = "os/linux.jiang";
+    } else {
+        import provider = "os/unsupported.jiang";
+    }
+}
+```
+
+这里 `if` 仍然是普通 Jiang `if`，区别只是它处在 `comptime` block 内，因此 condition
+必须能 const eval 为 `Bool`。
+
+编译器提供 `build` virtual package 承载本次构建的编译期信息。`build` 下直接平铺常用 facts，
+不引入 `BuildInfo` 总结构。目标形态包括 `build.target`、后续的 `build.mode`、
+`build.compiler`、`build.features` 等。`comptime` 第一版把 `build.target` 映射为编译期 fact；
+后续补齐 public const struct 的 interface serialization 后，source surface 应收紧为真正只读
+`const`。
+
 ## 自定义语法
 
 Jiang 后续要支持自定义语法。当前原则：
 
+- DSL 入口使用 `#name { ... }` 或后续等价形式，例如 `#sql { ... }`、`#asm { ... }`。
+- `#` 用于 custom syntax / DSL；`comptime {}` 是核心语言语法，`@` 用于 attribute。
 - lexer 保持通用，不把所有未来语法过早硬编码。
 - AST/parser 先稳定核心语言。
 - 自定义语法必须明确进入哪个阶段展开：token-level、AST-level、HIR-level。
+- DSL 产物必须落回编译器已知 AST/HIR 结构，不能通过字符串拼接重新 parse 来隐藏错误位置。
 - 自定义语法不能破坏基础语言的错误恢复和 IDE/LSP 能力。
 
 该部分暂不定稿，等 resolve/sema 基础稳定后再设计。
