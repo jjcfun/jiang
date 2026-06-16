@@ -1,0 +1,172 @@
+// 泛型实例绑定。
+//
+// GenericBindings 只描述“当前实例中泛型参数绑定到了什么”，不负责
+// 收集实例或生成 concrete MIR。comptime interpreter 和 monomorph 后续
+// 都应消费同一套绑定/替换逻辑，避免各自维护一份泛型替换规则。
+
+import store_api = "../../store/api.jiang";
+import qid = "../../store/id.jiang";
+import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
+import types = "../type.jiang";
+
+public struct GenericBindings: Movable {
+    // 第一阶段只支持 type binding。const binding 和 associated type binding
+    // 预留在这个结构上扩展，避免先把 comptime/monomorph 绑定到旧名字上。
+    table.HashTable<qid.DefId, qid.TypeId> type_bindings;
+    table.HashTable<Int, qid.TypeId> type_cache;
+
+    public init() {
+        self.type_bindings = table.HashTable<qid.DefId, qid.TypeId>();
+        self.type_cache = table.HashTable<Int, qid.TypeId>();
+    }
+
+    public Int len() {
+        return self.type_bindings.len();
+    }
+
+    public Bool has_type(qid.DefId generic_param) {
+        return self.type_bindings.has(generic_param);
+    }
+
+    public qid.TypeId? type_binding(qid.DefId generic_param) {
+        return table.hash_table_get_value<qid.DefId, qid.TypeId>(self.type_bindings$.ref(), generic_param);
+    }
+
+    public () set_type(qid.DefId generic_param, qid.TypeId concrete_type) {
+        self.type_bindings.set(generic_param, concrete_type);
+    }
+
+    public qid.TypeId? cached_type(qid.TypeId template_type) {
+        return table.hash_table_get_value<Int, qid.TypeId>(self.type_cache$.ref(), template_type.to_index());
+    }
+
+    public () cache_type(qid.TypeId template_type, qid.TypeId concrete_type) {
+        self.type_cache.set(template_type.to_index(), concrete_type);
+    }
+}
+
+public qid.TypeId substitute_type(
+    store_api.CompilerStore& compiler_store,
+    qid.TypeId type_id,
+    GenericBindings& bindings
+) {
+    TypeSubstituter! substituter = TypeSubstituter(compiler_store, bindings);
+    return substituter.substitute(type_id);
+}
+
+struct TypeSubstituter: Movable {
+    store_api.CompilerStore& store;
+    GenericBindings& bindings;
+
+    public init(store_api.CompilerStore& compiler_store, GenericBindings& bindings) {
+        self.store = compiler_store;
+        self.bindings = bindings;
+    }
+
+    public qid.TypeId substitute(qid.TypeId type_id) {
+        if (self.bindings.len() == 0) {
+            return type_id;
+        }
+        if (self.bindings.cached_type(type_id) is some cached) {
+            return cached;
+        }
+        types.TypeInfo type_info = self.store.types.get(type_id);
+        qid.TypeId! result = type_id;
+        // 先写入占位，避免递归类型在替换阶段无限展开。真正结果会在
+        // 当前分支完成后覆盖。
+        self.bindings.cache_type(type_id, type_id);
+        if (type_info.data is .named(named)) {
+            result = self.substitute_named(type_info, named);
+            return self.cache_result(type_id, result);
+        }
+        if (type_info.data is .optional(optional)) {
+            qid.TypeId element = self.substitute(optional.element);
+            result = self.preserve_mutability(type_info, self.store.types.optional_type(element, type_info.span));
+            return self.cache_result(type_id, result);
+        }
+        if (type_info.data is .error_union(error_union)) {
+            qid.TypeId value = self.substitute(error_union.value);
+            qid.TypeId error = self.substitute(error_union.error);
+            result = self.store.types.error_union_type(value, error, type_info.span);
+            return self.cache_result(type_id, self.preserve_mutability(type_info, result));
+        }
+        if (type_info.data is .handle_type(handle)) {
+            qid.TypeId element = self.substitute(handle.element);
+            qid.TypeId handle_id = self.store.types.handle_type_with_sentinel(
+                handle.kind,
+                element,
+                handle.sentinel,
+                type_info.span
+            );
+            return self.cache_result(type_id, self.preserve_mutability(type_info, handle_id));
+        }
+        if (type_info.data is .array_type(array_type)) {
+            qid.TypeId element = self.substitute(array_type.element);
+            qid.TypeId array_id = self.store.types.array_type_with_sentinel(
+                element,
+                array_type.count,
+                array_type.sentinel,
+                type_info.span
+            );
+            return self.cache_result(type_id, self.preserve_mutability(type_info, array_id));
+        }
+        if (type_info.data is .tuple_type(tuple_type)) {
+            result = self.substitute_tuple(type_info, tuple_type);
+            return self.cache_result(type_id, result);
+        }
+        if (type_info.data is .function_type(function_type)) {
+            result = self.substitute_function(type_info, function_type);
+            return self.cache_result(type_id, result);
+        }
+        return type_id;
+    }
+
+    qid.TypeId cache_result(qid.TypeId template_type, qid.TypeId concrete_type) {
+        self.bindings.cache_type(template_type, concrete_type);
+        return concrete_type;
+    }
+
+    qid.TypeId substitute_named(types.TypeInfo type_info, types.NamedType named) {
+        if (self.bindings.type_binding(named.def_id) is some concrete_type) {
+            return concrete_type;
+        }
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>(named.args.length);
+        Int! index = 0;
+        while (index < named.args.length) {
+            args.add(self.substitute(named.args[index]));
+            index = index + 1;
+        }
+        qid.TypeId named_id = self.store.types.named_type_with_args(named.def_id, args$.move(), type_info.span);
+        return self.preserve_mutability(type_info, named_id);
+    }
+
+    qid.TypeId substitute_tuple(types.TypeInfo type_info, types.TupleType tuple_type) {
+        list.ArrayList<qid.TypeId>! items = list.ArrayList<qid.TypeId>(tuple_type.items.length);
+        Int! index = 0;
+        while (index < tuple_type.items.length) {
+            items.add(self.substitute(tuple_type.items[index]));
+            index = index + 1;
+        }
+        return self.preserve_mutability(type_info, self.store.types.tuple_type(items$.move(), type_info.span));
+    }
+
+    qid.TypeId substitute_function(types.TypeInfo type_info, types.FunctionType function_type) {
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(function_type.params.length);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            params.add(self.substitute(function_type.params[index]));
+            index = index + 1;
+        }
+        qid.TypeId result = self.substitute(function_type.result);
+        qid.TypeId function_id = self.store.types.function_type(params$.move(), result, type_info.span);
+        return self.preserve_mutability(type_info, function_id);
+    }
+
+    qid.TypeId preserve_mutability(types.TypeInfo original, qid.TypeId substituted) {
+        if (original.is_mutable) {
+            return self.store.types.mutable_type(substituted, original.span);
+        }
+        return substituted;
+    }
+}
