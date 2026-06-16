@@ -1076,9 +1076,9 @@ comptime {
 
 编译器提供 `build` virtual package 承载本次构建的编译期信息。`build` 下直接平铺常用 facts，
 不引入 `BuildInfo` 总结构。目标形态包括 `build.target`、后续的 `build.mode`、
-`build.compiler`、`build.features` 等。`comptime` 第一版把 `build.target` 映射为编译期 fact；
-后续补齐 public const struct 的 interface serialization 后，source surface 应收紧为真正只读
-`const`。
+`build.compiler`、`build.features` 等。当前 `build.target` 已经以
+`public const TargetInfo target` 的形式暴露；module graph 阶段的 conditional import
+仍需要前置读取这些 facts，后续完整 comptime/sema 融合后再收敛到同一条 const eval 路径。
 
 ## 自定义语法
 

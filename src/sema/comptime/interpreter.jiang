@@ -8,6 +8,7 @@ import qid = "../../store/id.jiang";
 import def = "../../resolve/def.jiang";
 import list = "../../support/list.jiang";
 import memory = "../../support/memory.jiang";
+import string = "../../support/string.jiang";
 import generic_bindings = "../generic/bindings.jiang";
 import types = "../type.jiang";
 import check_state = "../type_check/state.jiang";
@@ -94,6 +95,9 @@ public struct Interpreter: Movable {
         }
         if (node.data is .return_stmt(return_stmt)) {
             return self.return_stmt_value(node_id, return_stmt, visiting);
+        }
+        if (node.data is .assign_stmt(assign_stmt)) {
+            return self.assign_value(node_id, assign_stmt, visiting);
         }
         return null;
     }
@@ -405,6 +409,9 @@ public struct Interpreter: Movable {
             }
         }
         guard self.state.results.call_target(node_id) is some target_def else { return null; }
+        if (self.state.store.defs.get(target_def).kind == .init_def) {
+            return self.init_call_value(node_id, target_def, visiting);
+        }
         return self.function_call_value(node_id, target_def, visiting);
     }
 
@@ -446,6 +453,48 @@ public struct Interpreter: Movable {
             self.return_value = outer_return_value;
             return return_result;
         }
+        self.frame.leave_scope();
+        self.binding_index = outer_binding_index;
+        self.returning = outer_returning;
+        self.return_value = outer_return_value;
+        return result;
+    }
+
+    value.ComptimeValue? init_call_value(
+        hir.HirId node_id,
+        qid.DefId init_def,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.state.hirs.def(init_def) is some init_hir else { return null; }
+        guard init_hir.body is some _& body else { return null; }
+        guard self.state.results.ordered_call_args(node_id) is some ordered else { return null; }
+        guard self.state.store.defs.get(init_def).owner_def is some owner_def else { return null; }
+
+        value.ComptimeValue! self_value = self.empty_struct_value(node_id, owner_def);
+        generic_bindings.GenericBindings callee_bindings = self.callee_bindings(node_id, init_def);
+        Int outer_binding_index = self.binding_index;
+        Bool outer_returning = self.returning;
+        value.ComptimeValue? outer_return_value = self.return_value;
+        self.binding_stack.add(callee_bindings$.move());
+        self.binding_index = self.binding_stack.len() - 1;
+        self.returning = false;
+        self.return_value = null;
+        self.frame.enter_scope();
+        if (!self.bind_init_self(body, self_value) || !self.bind_call_params(body, ordered.values, visiting)) {
+            self.frame.leave_scope();
+            self.binding_index = outer_binding_index;
+            self.returning = outer_returning;
+            self.return_value = outer_return_value;
+            return null;
+        }
+        guard self.eval(body.root, visiting) is some _ else {
+            self.frame.leave_scope();
+            self.binding_index = outer_binding_index;
+            self.returning = outer_returning;
+            self.return_value = outer_return_value;
+            return null;
+        }
+        value.ComptimeValue? result = self.init_self_value(body);
         self.frame.leave_scope();
         self.binding_index = outer_binding_index;
         self.returning = outer_returning;
@@ -503,6 +552,122 @@ public struct Interpreter: Movable {
             local_index = local_index + 1;
         }
         return param_index == args.length;
+    }
+
+    Bool bind_init_self(hir.HirBody& body, value.ComptimeValue self_value) {
+        guard self.init_self_local(body) is some self_local else { return false; }
+        self.frame.set_local(body.owner_def, self_local, self_value);
+        return true;
+    }
+
+    value.ComptimeValue? init_self_value(hir.HirBody& body) {
+        guard self.init_self_local(body) is some self_local else { return null; }
+        return self.frame.local(body.owner_def, self_local);
+    }
+
+    hir.HirLocalId? init_self_local(hir.HirBody& body) {
+        Int! index = 0;
+        while (index < body.locals.len()) {
+            hir.HirLocal local = body.locals.get_index(index);
+            if (string.equal(self.state.store.symbols.text(local.symbol), "self")) {
+                return local.id;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    value.ComptimeValue empty_struct_value(hir.HirId node_id, qid.DefId owner_def) {
+        Int count = self.field_count(owner_def);
+        value.ComptimeAggregateField![*] fields = value.ComptimeAggregateField!$.alloc_array(count);
+        Int! member_index = 0;
+        Int! field_index = 0;
+        while (member_index < self.state.hirs.def_ref(owner_def).members.len()) {
+            qid.DefId member_def = self.state.hirs.def_ref(owner_def).members.get(member_index);
+            if (self.state.store.defs.get(member_def).kind == .field_def) {
+                fields[field_index] = value.ComptimeAggregateField(
+                    field_def: member_def,
+                    value: value.ComptimeValue(type_id: self.state.store.types.invalid_type(), data: .invalid())
+                );
+                field_index = field_index + 1;
+            }
+            member_index = member_index + 1;
+        }
+        return value.ComptimeValue(type_id: self.node_type(node_id), data: .struct_value(fields[0..count]));
+    }
+
+    Int field_count(qid.DefId owner_def) {
+        Int! count = 0;
+        Int! index = 0;
+        while (index < self.state.hirs.def_ref(owner_def).members.len()) {
+            qid.DefId member_def = self.state.hirs.def_ref(owner_def).members.get(index);
+            if (self.state.store.defs.get(member_def).kind == .field_def) {
+                count = count + 1;
+            }
+            index = index + 1;
+        }
+        return count;
+    }
+
+    value.ComptimeValue? assign_value(
+        hir.HirId node_id,
+        hir.HirAssign assign_stmt,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        if (assign_stmt.op != .assign) {
+            return null;
+        }
+        guard self.eval(assign_stmt.value, visiting) is some assigned else { return null; }
+        if (!self.assign_place(assign_stmt.target, assigned, visiting)) {
+            return null;
+        }
+        return self.unit_value(node_id);
+    }
+
+    Bool assign_place(
+        hir.HirId target_id,
+        value.ComptimeValue assigned,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        hir.HirNode target = self.state.hirs.node(target_id);
+        if (target.data is .name_ref(name_ref)) {
+            guard name_ref is .local(local_id) else { return false; }
+            return self.frame.update_local(target_id.owner_def, local_id, assigned);
+        }
+        if (target.data is .member_access(member_access)) {
+            guard self.state.results.member_selection(target_id) is some field_def else { return false; }
+            return self.assign_member_place(member_access.base, field_def, assigned, visiting);
+        }
+        return false;
+    }
+
+    Bool assign_member_place(
+        hir.HirId base_id,
+        qid.DefId field_def,
+        value.ComptimeValue assigned,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.eval(base_id, visiting) is some base_value else { return false; }
+        guard base_value.data is .struct_value(fields) else { return false; }
+        Int! index = 0;
+        while (index < fields.length) {
+            if (fields[index].field_def == field_def) {
+                value.ComptimeAggregateField![*] copied = value.ComptimeAggregateField!$.alloc_array(fields.length);
+                Int! copy_index = 0;
+                while (copy_index < fields.length) {
+                    copied[copy_index] = fields[copy_index];
+                    copy_index = copy_index + 1;
+                }
+                copied[index] = value.ComptimeAggregateField(field_def: field_def, value: assigned);
+                return self.assign_place(
+                    base_id,
+                    value.ComptimeValue(type_id: base_value.type_id, data: .struct_value(copied[0..fields.length])),
+                    visiting
+                );
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     value.ComptimeValue? default_nominal_value(
