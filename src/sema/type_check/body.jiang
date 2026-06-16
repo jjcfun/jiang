@@ -16,6 +16,18 @@ import type_ops_mod = "./type_ops.jiang";
 import pattern_mod = "./pattern.jiang";
 import comptime_evaluator = "../comptime/evaluator.jiang";
 
+enum LocalInitState {
+    uninitialized,
+    initialized,
+    maybe_initialized,
+}
+
+struct LocalInitBinding {
+    qid.DefId owner_def;
+    hir.HirLocalId local_id;
+    LocalInitState state;
+}
+
 public struct BodyCheck: Movable {
     check_state.CheckState& state;
     type_ops_mod.TypeOps& type_ops;
@@ -26,12 +38,17 @@ public struct BodyCheck: Movable {
     // declaration body 也支持按需检查。const initializer 可能引用后声明的
     // const；解释前必须先保证被引用 const 的 body side table 已经写好。
     table.HashTable<qid.DefId, Int>! body_states;
+    list.ArrayList<LocalInitBinding>! local_init_states;
+    Int! assignment_target_depth;
+
     public init(check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
         self.state = state;
         self.type_ops = type_ops;
         self.pattern_check = pattern_mod.PatternCheck(state, type_ops);
         self.node_states = table.HashTable<hir.HirId, Int>();
         self.body_states = table.HashTable<qid.DefId, Int>();
+        self.local_init_states = list.ArrayList<LocalInitBinding>();
+        self.assignment_target_depth = 0;
     }
 
     public () check_bodies() {
@@ -133,14 +150,56 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_decl_body(qid.DefId def_id, hir.HirDef& hir_def, hir.HirId root) {
+        list.ArrayList<LocalInitBinding>! saved_local_init_states = self.clone_local_init_states();
+        Int saved_assignment_target_depth = self.assignment_target_depth;
+        self.begin_local_init_body(def_id);
+
+        qid.TypeId! result = self.state.store.types.invalid_type();
         if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
             qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(def_id));
-            return self.check_node_expected(root, expected);
+            result = self.check_node_expected(root, expected);
+        } else if (hir_def.decl.kind == .global_decl) {
+            result = self.check_global_body(hir_def, root);
+        } else {
+            result = self.check_node(root);
         }
-        if (hir_def.decl.kind == .global_decl) {
-            return self.check_global_body(hir_def, root);
+
+        self.restore_local_init_states(saved_local_init_states$.ref());
+        self.assignment_target_depth = saved_assignment_target_depth;
+        return result;
+    }
+
+    () begin_local_init_body(qid.DefId def_id) {
+        self.local_init_states.clear();
+        self.assignment_target_depth = 0;
+        guard self.state.hirs.body(def_id) is some body else { return; }
+        Int! index = 0;
+        while (index < body.locals.len()) {
+            hir.HirLocal local = body.locals.get(hir.HirLocalId(index));
+            if (local.kind == .parameter || local.kind == .generic_parameter) {
+                self.set_local_init_state(def_id, local.id, .initialized);
+            }
+            index = index + 1;
         }
-        return self.check_node(root);
+    }
+
+    list.ArrayList<LocalInitBinding> clone_local_init_states() {
+        list.ArrayList<LocalInitBinding>! result = list.ArrayList<LocalInitBinding>(self.local_init_states.len());
+        Int! index = 0;
+        while (index < self.local_init_states.len()) {
+            result.add(self.local_init_states.get(index));
+            index = index + 1;
+        }
+        return result$.move();
+    }
+
+    () restore_local_init_states(list.ArrayList<LocalInitBinding>& snapshot) {
+        self.local_init_states.clear();
+        Int! index = 0;
+        while (index < snapshot.len()) {
+            self.local_init_states.add(snapshot.get(index));
+            index = index + 1;
+        }
     }
 
     qid.TypeId check_global_body(hir.HirDef& hir_def, hir.HirId root) {
@@ -641,13 +700,17 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_assign(hir.HirId node_id, hir.HirAssign assign_stmt) {
+        self.assignment_target_depth = self.assignment_target_depth + 1;
         qid.TypeId target_type = self.check_node(assign_stmt.target);
+        self.assignment_target_depth = self.assignment_target_depth - 1;
         qid.TypeId value_type = self.check_node_expected(assign_stmt.value, target_type);
         Bool target_valid = self.is_assignment_target(assign_stmt.target);
         if (!target_valid) {
             self.type_ops.add_node_error(assign_stmt.target, "invalid assignment target", "invalid_assignment_target");
         } else {
-            if (!self.init_self_member_assignment(assign_stmt.target)
+            Bool initializes_local = self.assignment_initializes_local(assign_stmt);
+            if (!initializes_local
+                && !self.init_self_member_assignment(assign_stmt.target)
                 && !self.type_ops.is_invalid_type(target_type)
                 && !self.state.store.types.get(target_type).is_mutable) {
                 self.type_ops.add_node_error(
@@ -656,9 +719,28 @@ public struct BodyCheck: Movable {
                     "immutable_assignment_target"
                 );
             }
+            if (initializes_local) {
+                self.mark_direct_local_target_initialized(assign_stmt.target);
+            }
         }
         self.check_assignment_value(node_id, assign_stmt, target_type, value_type);
         return self.state.store.types.unit_type();
+    }
+
+    Bool assignment_initializes_local(hir.HirAssign assign_stmt) {
+        if (assign_stmt.op != .assign) {
+            return false;
+        }
+        guard self.direct_local_ref(assign_stmt.target) is some local_id else {
+            return false;
+        }
+        LocalInitState state = self.local_init_state(assign_stmt.target.owner_def, local_id);
+        return state == .uninitialized || state == .maybe_initialized;
+    }
+
+    () mark_direct_local_target_initialized(hir.HirId target_id) {
+        guard self.direct_local_ref(target_id) is some local_id else { return; }
+        self.set_local_init_state(target_id.owner_def, local_id, .initialized);
     }
 
     Bool init_self_member_assignment(hir.HirId target_id) {
@@ -1089,16 +1171,87 @@ public struct BodyCheck: Movable {
 
     qid.TypeId check_if(hir.HirId node_id, hir.HirIf if_expr) {
         self.type_ops.expect_bool(if_expr.condition, self.check_node(if_expr.condition));
+        list.ArrayList<LocalInitBinding>! before_state = self.clone_local_init_states();
         qid.TypeId then_type = self.check_node(if_expr.then_body);
+        list.ArrayList<LocalInitBinding>! then_state = self.clone_local_init_states();
+        self.restore_local_init_states(before_state$.ref());
         if (if_expr.else_body is some else_body) {
             qid.TypeId else_type = self.check_node(else_body);
+            list.ArrayList<LocalInitBinding>! else_state = self.clone_local_init_states();
+            self.merge_if_local_init_states(
+                before_state$.ref(),
+                then_state$.ref(),
+                else_state$.ref(),
+                !self.type_ops.is_never_type(then_type),
+                !self.type_ops.is_never_type(else_type)
+            );
             if (self.common_control_type(then_type, else_type) is some result_type) {
                 return result_type;
             }
             self.type_ops.add_node_error(node_id, "if branches have incompatible types", "if_branch_type_mismatch");
             return self.state.store.types.invalid_type();
         }
+        self.merge_if_local_init_states(
+            before_state$.ref(),
+            then_state$.ref(),
+            before_state$.ref(),
+            !self.type_ops.is_never_type(then_type),
+            true
+        );
         return self.state.store.types.unit_type();
+    }
+
+    () merge_if_local_init_states(
+        list.ArrayList<LocalInitBinding>& before_state,
+        list.ArrayList<LocalInitBinding>& then_state,
+        list.ArrayList<LocalInitBinding>& else_state,
+        Bool then_continues,
+        Bool else_continues
+    ) {
+        self.restore_local_init_states(before_state);
+        Int! index = 0;
+        while (index < before_state.len()) {
+            LocalInitBinding binding = before_state.get(index);
+            LocalInitState merged = self.merged_local_init_state(
+                binding,
+                then_state,
+                else_state,
+                then_continues,
+                else_continues
+            );
+            self.set_local_init_state(binding.owner_def, binding.local_id, merged);
+            index = index + 1;
+        }
+    }
+
+    LocalInitState merged_local_init_state(
+        LocalInitBinding binding,
+        list.ArrayList<LocalInitBinding>& then_state,
+        list.ArrayList<LocalInitBinding>& else_state,
+        Bool then_continues,
+        Bool else_continues
+    ) {
+        if (binding.state == .initialized) {
+            return .initialized;
+        }
+        LocalInitState then_init = self.local_init_state_in(then_state, binding.owner_def, binding.local_id);
+        LocalInitState else_init = self.local_init_state_in(else_state, binding.owner_def, binding.local_id);
+        if (!then_continues && else_continues) {
+            return else_init;
+        }
+        if (then_continues && !else_continues) {
+            return then_init;
+        }
+        if (!then_continues && !else_continues) {
+            return binding.state;
+        }
+        if (then_init == .initialized && else_init == .initialized) {
+            return .initialized;
+        }
+        if (then_init == .uninitialized && else_init == .uninitialized) {
+            return .uninitialized;
+        }
+        return .maybe_initialized;
     }
 
     qid.TypeId check_loop(hir.HirLoop loop_expr) {
@@ -1530,9 +1683,71 @@ public struct BodyCheck: Movable {
             return self.type_ops.type_for_def(def_id);
         }
         if (name_ref is .local(local_id)) {
+            if (self.assignment_target_depth == 0) {
+                self.check_local_read_initialized(node_id, local_id);
+            }
             return self.type_ops.type_for_local(node_id.owner_def, local_id);
         }
         return self.state.store.types.invalid_type();
+    }
+
+    () check_local_read_initialized(hir.HirId node_id, hir.HirLocalId local_id) {
+        LocalInitState state = self.local_init_state(node_id.owner_def, local_id);
+        if (state == .uninitialized) {
+            self.type_ops.add_node_error(
+                node_id,
+                "local variable is used before initialization",
+                "use_before_initialization"
+            );
+        }
+        if (state == .maybe_initialized) {
+            self.type_ops.add_node_error(
+                node_id,
+                "local variable may be uninitialized on this control-flow path",
+                "local_maybe_uninitialized"
+            );
+        }
+    }
+
+    LocalInitState local_init_state(qid.DefId owner_def, hir.HirLocalId local_id) {
+        return self.local_init_state_in(self.local_init_states$.ref(), owner_def, local_id);
+    }
+
+    LocalInitState local_init_state_in(
+        list.ArrayList<LocalInitBinding>& states,
+        qid.DefId owner_def,
+        hir.HirLocalId local_id
+    ) {
+        Int! index = 0;
+        while (index < states.len()) {
+            LocalInitBinding binding = states.get(index);
+            if (qid.DefId.equal(binding.owner_def$.ref(), owner_def$.ref()) && binding.local_id.index == local_id.index) {
+                return binding.state;
+            }
+            index = index + 1;
+        }
+        return .initialized;
+    }
+
+    () set_local_init_state(qid.DefId owner_def, hir.HirLocalId local_id, LocalInitState state) {
+        Int! index = 0;
+        while (index < self.local_init_states.len()) {
+            LocalInitBinding! binding = self.local_init_states.get(index);
+            if (qid.DefId.equal(binding.owner_def$.ref(), owner_def$.ref()) && binding.local_id.index == local_id.index) {
+                binding.state = state;
+                self.local_init_states.set(index, binding);
+                return;
+            }
+            index = index + 1;
+        }
+        self.local_init_states.add(LocalInitBinding(owner_def: owner_def, local_id: local_id, state: state));
+    }
+
+    hir.HirLocalId? direct_local_ref(hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        guard node.data is .name_ref(name_ref) else { return null; }
+        guard name_ref is .local(local_id) else { return null; }
+        return local_id;
     }
 
     () ensure_const_dependency_checked(qid.DefId def_id) {
@@ -1553,11 +1768,13 @@ public struct BodyCheck: Movable {
         hir.HirLocal local = body.local(let_stmt.local_id);
         if (local.borrow_binding) {
             self.check_borrow_binding_let(node_id, local, let_stmt);
+            self.mark_let_initialized(node_id.owner_def, local.id, true);
             return self.state.store.types.unit_type();
         }
         if (local.type_ref is some type_ref) {
             if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
                 self.check_inferred_binding_let(node_id, local, let_stmt);
+                self.mark_let_initialized(node_id.owner_def, local.id, true);
                 return self.state.store.types.unit_type();
             }
             qid.TypeId! local_type = self.state.store.types.invalid_type();
@@ -1580,13 +1797,23 @@ public struct BodyCheck: Movable {
                 local_type = self.type_ops.check_value_type_ref(type_ref);
             }
             self.type_ops.bind_def_type(local.def_id, local_type);
+            self.mark_let_initialized(node_id.owner_def, local.id, let_stmt.initializer != null);
             return self.state.store.types.unit_type();
         }
         if (let_stmt.initializer is some initializer) {
             value_type = self.check_node(initializer);
         }
         self.type_ops.bind_def_type(local.def_id, value_type);
+        self.mark_let_initialized(node_id.owner_def, local.id, let_stmt.initializer != null);
         return self.state.store.types.unit_type();
+    }
+
+    () mark_let_initialized(qid.DefId owner_def, hir.HirLocalId local_id, Bool initialized) {
+        if (initialized) {
+            self.set_local_init_state(owner_def, local_id, .initialized);
+        } else {
+            self.set_local_init_state(owner_def, local_id, .uninitialized);
+        }
     }
 
     () check_inferred_binding_let(hir.HirId node_id, hir.HirLocal local, hir.HirLet let_stmt) {
@@ -3002,7 +3229,9 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_move(hir.HirId node_id, hir.HirImplicitCall call) {
+        self.assignment_target_depth = self.assignment_target_depth + 1;
         qid.TypeId base_type = self.check_node(call.base);
+        self.assignment_target_depth = self.assignment_target_depth - 1;
         self.expect_implicit_arg_count(node_id, call, 0);
         if (!self.is_root_move_target(call.base)) {
             return self.state.store.types.invalid_type();
