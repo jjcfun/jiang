@@ -5,6 +5,10 @@
 
 import hir = "../../hir/hir.jiang";
 import qid = "../../store/id.jiang";
+import string = "../../support/string.jiang";
+import ast = "../../syntax/ast.jiang";
+import diagnostics = "../../resolve/diagnostics.jiang";
+import resolve_state = "../../resolve/state.jiang";
 import check_state = "../type_check/state.jiang";
 import interpreter_mod = "./interpreter.jiang";
 import value = "./value.jiang";
@@ -27,5 +31,261 @@ public struct ComptimeEvaluator: Movable {
         }
         self.state.store.comptime_store.set_const_value(def_id, const_value);
         return const_value;
+    }
+}
+
+// Early source selection still runs before HIR lowering and full type check, so
+// it cannot execute the HIR interpreter yet. Keep that phase intentionally
+// narrow, but make it produce the same ComptimeValue model as the later
+// evaluator path.
+public struct SourceSelectionEvaluator {
+    resolve_state.AstResolveState& state;
+
+    public init(resolve_state.AstResolveState& state) {
+        self.state = state;
+    }
+
+    public Bool condition_true(ast.AstId condition, Bool diagnose) {
+        guard self.eval_ast(condition) is some result else {
+            if (diagnose) {
+                self.add_error(
+                    condition,
+                    "comptime condition must be a compile-time Bool",
+                    "compile_condition_not_bool"
+                );
+            }
+            return false;
+        }
+        if (result.data is .bool_value(bool_value)) {
+            return bool_value;
+        }
+        if (diagnose) {
+            self.add_error(
+                condition,
+                "comptime condition must be a compile-time Bool",
+                "compile_condition_not_bool"
+            );
+        }
+        return false;
+    }
+
+    value.ComptimeValue? eval_ast(ast.AstId expr_id) {
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        if (expr.data is .literal(literal)) {
+            if (literal.kind == .bool_lit) {
+                return self.bool_value(literal.bool_value);
+            }
+            return null;
+        }
+        if (expr.data is .unary(unary)) {
+            return self.eval_unary(unary);
+        }
+        if (expr.data is .binary(binary)) {
+            return self.eval_binary(binary);
+        }
+        if (expr.data is .name_expr(name_expr)) {
+            return self.eval_name_expr(name_expr);
+        }
+        if (expr.data is .field_expr(field)) {
+            return self.eval_field_expr(field);
+        }
+        return null;
+    }
+
+    value.ComptimeValue? eval_name_expr(ast.StmtData name_expr) {
+        ast.AstNode target = self.state.unit.get(name_expr.value);
+        guard target.data is .path(path_data) else { return null; }
+        if (path_data.segments.len == 1) {
+            guard self.state.name_symbol(self.state.unit.child_at(path_data.segments, 0)) is some symbol else {
+                return null;
+            }
+            return self.symbol_value_for_id(symbol);
+        }
+        if (path_data.segments.len != 3) {
+            return null;
+        }
+        if (!self.path_segment_equal(path_data, 0, "build")) { return null; }
+        if (!self.path_segment_equal(path_data, 1, "target")) { return null; }
+        guard self.path_segment_text(path_data, 2) is some field_name else {
+            return null;
+        }
+        if (string.equal(field_name, "os")) { return self.target_os_value(); }
+        if (string.equal(field_name, "arch")) { return self.target_arch_value(); }
+        if (string.equal(field_name, "abi")) { return self.target_abi_value(); }
+        if (string.equal(field_name, "link_libc")) {
+            return self.bool_value(self.state.ctx.target.link_libc);
+        }
+        return null;
+    }
+
+    value.ComptimeValue? eval_unary(ast.UnaryData unary) {
+        if (unary.op != .not) {
+            return null;
+        }
+        guard self.eval_ast(unary.value) is some operand else { return null; }
+        guard operand.data is .bool_value(bool_value) else { return null; }
+        return self.bool_value(!bool_value);
+    }
+
+    value.ComptimeValue? eval_binary(ast.BinaryData binary) {
+        if (binary.op == .logic_and) {
+            guard self.eval_ast(binary.left) is some left else { return null; }
+            guard left.data is .bool_value(left_value) else { return null; }
+            if (!left_value) { return self.bool_value(false); }
+            guard self.eval_ast(binary.right) is some right else { return null; }
+            guard right.data is .bool_value(right_value) else { return null; }
+            return self.bool_value(right_value);
+        }
+        if (binary.op == .logic_or) {
+            guard self.eval_ast(binary.left) is some left else { return null; }
+            guard left.data is .bool_value(left_value) else { return null; }
+            if (left_value) { return self.bool_value(true); }
+            guard self.eval_ast(binary.right) is some right else { return null; }
+            guard right.data is .bool_value(right_value) else { return null; }
+            return self.bool_value(right_value);
+        }
+        if (binary.op == .equal || binary.op == .not_equal) {
+            guard self.eval_ast(binary.left) is some left else { return null; }
+            guard self.eval_ast(binary.right) is some right else { return null; }
+            guard self.values_equal(left, right) is some equal_value else { return null; }
+            if (binary.op == .not_equal) {
+                return self.bool_value(!equal_value);
+            }
+            return self.bool_value(equal_value);
+        }
+        return null;
+    }
+
+    Bool? values_equal(value.ComptimeValue left, value.ComptimeValue right) {
+        if (left.data is .bool_value(left_value)) {
+            guard right.data is .bool_value(right_value) else { return null; }
+            return left_value == right_value;
+        }
+        if (left.data is .symbol_value(left_symbol)) {
+            guard right.data is .symbol_value(right_symbol) else { return null; }
+            return left_symbol == right_symbol;
+        }
+        return null;
+    }
+
+    value.ComptimeValue? eval_field_expr(ast.FieldExprData field) {
+        guard self.state.name_symbol(field.name) is some field_symbol else {
+            return null;
+        }
+        UInt8[]& field_name = self.state.store.symbols.text(field_symbol);
+        ast.AstNode base = self.state.unit.get(field.base);
+        if (base.data is .unit_type) {
+            return self.symbol_value_for_id(field_symbol);
+        }
+        if (base.data is .tuple_expr(items)) {
+            if (items.len == 0) {
+                return self.symbol_value_for_id(field_symbol);
+            }
+        }
+        if (self.is_build_target_field(field.base, "os")) {
+            return self.target_os_value();
+        }
+        if (self.is_build_target_field(field.base, "arch")) {
+            return self.target_arch_value();
+        }
+        if (self.is_build_target_field(field.base, "abi")) {
+            return self.target_abi_value();
+        }
+        if (self.is_build_target_root(field.base) && string.equal(field_name, "link_libc")) {
+            return self.bool_value(self.state.ctx.target.link_libc);
+        }
+        return null;
+    }
+
+    Bool is_build_target_field(ast.AstId expr_id, UInt8[]& expected_field) {
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        guard expr.data is .field_expr(field) else { return false; }
+        guard self.name_text(field.name) is some field_name else { return false; }
+        if (!string.equal(field_name, expected_field)) {
+            return false;
+        }
+        return self.is_build_target_root(field.base);
+    }
+
+    Bool is_build_target_root(ast.AstId expr_id) {
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        guard expr.data is .field_expr(field) else { return false; }
+        guard self.name_text(field.name) is some field_name else { return false; }
+        if (!string.equal(field_name, "target")) {
+            return false;
+        }
+        return self.is_name_expr(expr_id: field.base, expected: "build");
+    }
+
+    Bool is_name_expr(ast.AstId expr_id, UInt8[]& expected) {
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        guard expr.data is .name_expr(name_expr) else { return false; }
+        guard self.name_text(name_expr.value) is some name else { return false; }
+        return string.equal(name, expected);
+    }
+
+    value.ComptimeValue target_os_value() {
+        if (self.state.ctx.target.os == .host) { return self.symbol_value("host"); }
+        if (self.state.ctx.target.os == .macos) { return self.symbol_value("macos"); }
+        if (self.state.ctx.target.os == .linux) { return self.symbol_value("linux"); }
+        if (self.state.ctx.target.os == .windows) { return self.symbol_value("windows"); }
+        if (self.state.ctx.target.os == .wasm) { return self.symbol_value("wasm"); }
+        return self.invalid_value();
+    }
+
+    value.ComptimeValue target_arch_value() {
+        if (self.state.ctx.target.arch == .host) { return self.symbol_value("host"); }
+        if (self.state.ctx.target.arch == .arm64) { return self.symbol_value("arm64"); }
+        if (self.state.ctx.target.arch == .x86_64) { return self.symbol_value("x86_64"); }
+        if (self.state.ctx.target.arch == .wasm32) { return self.symbol_value("wasm32"); }
+        return self.invalid_value();
+    }
+
+    value.ComptimeValue target_abi_value() {
+        if (self.state.ctx.target.abi == .host) { return self.symbol_value("host"); }
+        if (self.state.ctx.target.abi == .darwin) { return self.symbol_value("darwin"); }
+        if (self.state.ctx.target.abi == .gnu) { return self.symbol_value("gnu"); }
+        if (self.state.ctx.target.abi == .msvc) { return self.symbol_value("msvc"); }
+        if (self.state.ctx.target.abi == .none) { return self.symbol_value("none"); }
+        return self.invalid_value();
+    }
+
+    value.ComptimeValue symbol_value(UInt8[]& text) {
+        return self.symbol_value_for_id(self.state.store.symbols.intern(text));
+    }
+
+    value.ComptimeValue symbol_value_for_id(qid.SymbolId symbol) {
+        return value.ComptimeValue(type_id: self.invalid_type(), data: .symbol_value(symbol));
+    }
+
+    value.ComptimeValue bool_value(Bool bool_value) {
+        return value.ComptimeValue(type_id: self.invalid_type(), data: .bool_value(bool_value));
+    }
+
+    value.ComptimeValue invalid_value() {
+        return value.ComptimeValue(type_id: self.invalid_type(), data: .invalid());
+    }
+
+    qid.TypeId invalid_type() {
+        return self.state.store.types.invalid_type();
+    }
+
+    UInt8[]&? name_text(ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is some symbol else { return null; }
+        return self.state.store.symbols.text(symbol);
+    }
+
+    Bool path_segment_equal(ast.PathData path_data, Int index, UInt8[]& expected) {
+        guard self.path_segment_text(path_data, index) is some actual else { return false; }
+        return string.equal(actual, expected);
+    }
+
+    UInt8[]&? path_segment_text(ast.PathData path_data, Int index) {
+        return self.name_text(self.state.unit.child_at(path_data.segments, index));
+    }
+
+    () add_error(ast.AstId node_id, UInt8[]& message, UInt8[]& code) {
+        diagnostics.add_error(self.state.ctx, self.state.unit.source_id, self.state.unit.get(node_id).span, message, code);
+        self.state.store.hirs.mark_error();
     }
 }

@@ -5,6 +5,7 @@
 
 import hir = "../../hir/hir.jiang";
 import qid = "../../store/id.jiang";
+import diagnostic = "../../diagnostic/diagnostic.jiang";
 import def = "../../resolve/def.jiang";
 import list = "../../support/list.jiang";
 import memory = "../../support/memory.jiang";
@@ -24,6 +25,8 @@ public struct Interpreter: Movable {
     Bool! returning;
     value.ComptimeValue?! return_value;
     Int! call_depth;
+    Int! branch_count;
+    list.ArrayList<hir.HirId>! call_stack;
 
     public init(check_state.CheckState& state) {
         self.state = state;
@@ -34,11 +37,15 @@ public struct Interpreter: Movable {
         self.returning = false;
         self.return_value = null;
         self.call_depth = 0;
+        self.branch_count = 0;
+        self.call_stack = list.ArrayList<hir.HirId>();
     }
 
     public value.ComptimeValue? eval_const_initializer(qid.DefId def_id, hir.HirId root) {
         list.ArrayList<qid.DefId>! visiting = list.ArrayList<qid.DefId>();
         visiting.add(def_id);
+        self.branch_count = 0;
+        self.call_stack.clear();
         return self.eval(root, visiting$.ref());
     }
 
@@ -52,6 +59,9 @@ public struct Interpreter: Movable {
                 return self.frame.local(node_id.owner_def, local_id);
             }
             if (name_ref is .def_ref(def_id)) {
+                if (self.const_generic_binding(def_id) is some const_value) {
+                    return const_value;
+                }
                 if (self.state.store.defs.get(def_id).kind == .enum_case_def) {
                     return self.enum_case_value(node_id, def_id);
                 }
@@ -149,19 +159,46 @@ public struct Interpreter: Movable {
     Bool enter_call(hir.HirId node_id) {
         self.call_depth = self.call_depth + 1;
         if (self.call_depth <= self.call_depth_limit()) {
+            self.call_stack.add(node_id);
             return true;
         }
         self.call_depth = self.call_depth - 1;
-        self.add_node_error(node_id, "comptime call recursion limit exceeded", "comptime_recursion_limit");
+        self.add_node_error_with_call_stack(
+            node_id,
+            "comptime call recursion limit exceeded",
+            "comptime_recursion_limit"
+        );
         return false;
     }
 
     () leave_call() {
+        self.call_stack.pop();
         self.call_depth = self.call_depth - 1;
     }
 
     Int call_depth_limit() {
         return 128;
+    }
+
+    Bool enter_branch(hir.HirId node_id) {
+        self.branch_count = self.branch_count + 1;
+        if (self.branch_count <= self.branch_quota()) {
+            return true;
+        }
+        // This is a work quota, not a language recursion rule. It prevents
+        // accidentally exponential comptime execution from turning into an
+        // unbounded compiler run while keeping the diagnostic anchored at the
+        // branch that crossed the limit.
+        self.add_node_error_with_call_stack(
+            node_id,
+            "comptime branch quota exceeded",
+            "comptime_branch_quota_exceeded"
+        );
+        return false;
+    }
+
+    Int branch_quota() {
+        return 64;
     }
 
     () add_node_error(hir.HirId node_id, UInt8[]& message, UInt8[]& code) {
@@ -172,8 +209,69 @@ public struct Interpreter: Movable {
         diagnostics.add_global_error(self.state.ctx, message, code);
     }
 
+    () add_node_error_with_call_stack(hir.HirId node_id, UInt8[]& message, UInt8[]& code) {
+        diagnostic.Diagnostic! item = self.node_diagnostic(node_id, message, code);
+        Int! index = self.call_stack.len() - 1;
+        Int! note_count = 0;
+        hir.HirId?! previous_call_id = null;
+        // Recursive functions often repeat the same call expression many
+        // times. Compress adjacent duplicates so diagnostics stay readable.
+        while (index >= 0 && note_count < self.call_stack_note_limit()) {
+            hir.HirId call_id = self.call_stack.get(index);
+            if (!self.same_call_site(call_id, previous_call_id)) {
+                if (self.node_range(call_id) is some range) {
+                    item.add_related(diagnostic.DiagnosticRelatedInformation(range, "comptime call here"));
+                    note_count = note_count + 1;
+                }
+                previous_call_id = call_id;
+            }
+            index = index - 1;
+        }
+        self.state.ctx.store.diagnostics.add(item$.move());
+    }
+
+    Bool same_call_site(hir.HirId call_id, hir.HirId? previous_call_id) {
+        guard previous_call_id is some previous else { return false; }
+        return call_id.owner_def.to_index() == previous.owner_def.to_index()
+            && call_id.local_index == previous.local_index;
+    }
+
+    Int call_stack_note_limit() {
+        return 8;
+    }
+
+    diagnostic.Diagnostic node_diagnostic(hir.HirId node_id, UInt8[]& message, UInt8[]& code) {
+        return diagnostic.Diagnostic(
+            .error,
+            .type_check,
+            diagnostic.DiagnosticCode(code),
+            self.node_range_or_global(node_id),
+            message
+        );
+    }
+
+    diagnostic.SourceRange node_range_or_global(hir.HirId node_id) {
+        if (self.node_range(node_id) is some range) {
+            return range;
+        }
+        return diagnostic.SourceRange();
+    }
+
+    diagnostic.SourceRange? node_range(hir.HirId node_id) {
+        guard self.state.store.source_map.hir_span(node_id) is some loc else { return null; }
+        guard loc.source_id is some source_id else { return null; }
+        return diagnostic.SourceRange(source_id, loc.span);
+    }
+
     generic_bindings.GenericBindings& current_bindings() {
         return self.binding_stack.ref_at(self.binding_index);
+    }
+
+    value.ComptimeValue? const_generic_binding(qid.DefId def_id) {
+        if (self.state.store.defs.get(def_id).kind != .generic_param_def) {
+            return null;
+        }
+        return self.current_bindings().const_binding(def_id);
     }
 
     value.ComptimeValue? literal_value(hir.HirId node_id, hir.HirLiteral literal) {
@@ -251,6 +349,9 @@ public struct Interpreter: Movable {
         hir.HirIf if_expr,
         list.ArrayList<qid.DefId>& visiting
     ) {
+        if (!self.enter_branch(node_id)) {
+            return null;
+        }
         guard self.eval(if_expr.condition, visiting) is some condition else { return null; }
         guard condition.data is .bool_value(condition_value) else { return null; }
         if (condition_value) {
