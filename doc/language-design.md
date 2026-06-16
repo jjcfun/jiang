@@ -514,6 +514,7 @@ lifetime 和 drop safety。
 - `alias Name = Type;`
 - `public alias exported = module.symbol;`
 - const global declaration: `const Type name = expr;`
+- public const global declaration: `public const Type name = expr;`
 - global declaration: `Type name = expr;`
 - function declaration / definition
 - `struct`
@@ -524,7 +525,24 @@ lifetime 和 drop safety。
 
 目标语言支持 `public import`，用于 re-export 被导入模块的 public API。
 
-顶层 `const` 是编译期常量声明。0.2.1 支持 literal、整数/Bool 的一元和二元常量表达式、括号表达式，以及引用同模块已定义的非递归 `const`。`const` 不能 `public`，也不能使用函数调用、block 或运行时值作为 initializer；跨模块常量序列化后续再补。
+顶层 `const` 是编译期常量声明。initializer 在 type check 后通过 sema 级 comptime evaluator
+求值，并记录到 `ComptimeStore`。当前支持 literal、`const` 引用、枚举 case、tuple/array/struct
+字面量、默认 struct constructor、字段访问、一元/二元表达式、`if`、block 尾表达式、普通 Jiang
+函数调用、自定义 `init`、泛型 struct constructor 和泛型函数调用。
+
+`public const` 是模块公开接口的一部分。编译器在 interface artifact 中保存最终实例化后的
+declaration type 和 const payload；跨模块使用时由 importer 还原成 `ComptimeValue`，不重新执行
+定义模块的 initializer。value path 会先解析出真实 value root，再由 type check 验证后续 member
+chain，因此 `build.target.link_libc` 这类 public aggregate const 字段读取按普通字段访问处理。
+
+`ComptimeValue` 只存在于 sema、interface loading/building 和 HIR->MIR lowering 之前。标量 const
+在 MIR 中降成 `MirConst`，枚举 case 降成整数 tag const；复合 const 整体作为运行时值使用时按需
+materialize 成 readonly `MirGlobal`，initializer 用 `MirStaticValue` 表达。backend 只消费 MIR
+事实，不读取 `ComptimeValue`。
+
+const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
+`recursive_const_initializer`；comptime 函数调用受递归深度和 branch quota 限制，避免编译期执行失控。
+const generic 的语法和 type check 接入暂放到 0.4。
 
 ### Import
 
@@ -1039,7 +1057,7 @@ ambiguous re-export 仍需后续完善；package dependency 第一版只支持�
 - `comptime { ... }` 是语言内建编译期 block，表示 block 内 Jiang 代码在编译期执行。
 - `comptime` 使用普通关键字入口，不占用后续 `#sql { ... }`、`#asm { ... }` 这类 custom syntax
   namespace；`@` 保留给 attribute / annotation。
-- 第一版 `comptime` 先只支持 module-level，用于 target-specific import / declaration 选择。
+- 当前 `comptime` 只支持 module-level，用于 target-specific import / declaration 选择。
 - `comptime` block 不生成 runtime code。
 - `comptime` block 内使用普通 Jiang 语法。`if`、布尔表达式、字段访问、枚举比较等都复用普通
   parser、resolve、type check 和 const eval，不引入 `#if` 小语言，也不维护第二套 compile-only
@@ -1047,12 +1065,11 @@ ambiguous re-export 仍需后续完善；package dependency 第一版只支持�
 - `comptime` block 内未执行的分支不参与 import graph、name resolve、type check 或 codegen。
 - 第一版仍然先完整 parse `comptime` block，所以未执行分支里的语法错误仍然诊断；只有 parse
   之后的语义阶段会跳过未执行分支。
-- `comptime if` 的 condition 最终语义是普通表达式，但类型必须是可编译期求值的 `const Bool`。
-  因为 conditional import 需要在 module graph 阶段就决定依赖边，第一版会在 import discovery
-  阶段先跑受限 const evaluator；后续完整 const/type check 接入后，这个早期 evaluator 只能作为
-  import graph 的前置选择器，不能扩展成独立语义。
-- 第一版 const eval 只支持常量表达式子集：bool/int/enum/struct 常量、字段访问、`==` / `!=`、
-  `&&` / `||` / `!`、const global 引用和普通 struct/enum literal。不执行任意用户函数，不执行
+- `comptime if` 的 condition 是普通表达式，但类型必须能在编译期求值为 `Bool`。
+  conditional import 需要在 module graph 阶段就决定依赖边，因此 source selection 使用一个窄的
+  AST-level 前置 evaluator；它只负责选源文件里的顶层 item，并产出同一套 `ComptimeValue` 模型。
+- 常规 const initializer 由 type check 后的 HIR comptime interpreter 执行。它支持 const 引用、
+  aggregate literal、字段访问、控制流、block 尾表达式、普通函数调用和自定义 `init`，但不执行
   IO，不访问运行时变量。
 
 示例：
@@ -1076,9 +1093,10 @@ comptime {
 
 编译器提供 `build` virtual package 承载本次构建的编译期信息。`build` 下直接平铺常用 facts，
 不引入 `BuildInfo` 总结构。目标形态包括 `build.target`、后续的 `build.mode`、
-`build.compiler`、`build.features` 等。当前 `build.target` 已经以
-`public const TargetInfo target` 的形式暴露；module graph 阶段的 conditional import
-仍需要前置读取这些 facts，后续完整 comptime/sema 融合后再收敛到同一条 const eval 路径。
+`build.compiler`、`build.features` 等。当前 `build.target` 以
+`public const TargetInfo target` 的形式暴露，包含 `os`、`arch`、`abi` 和 `link_libc`。
+普通源码、`comptime` 条件和 public const aggregate 字段读取都通过同一套 value path / const value
+机制访问这些 facts。
 
 ## 自定义语法
 

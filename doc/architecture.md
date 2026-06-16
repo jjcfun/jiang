@@ -9,16 +9,16 @@ Jiang Next 编译器围绕稳定的阶段边界组织。本文只保留整体架
 driver/cli -> pipeline.compile
                 |
                 v
-        package source/AST -> HIR -> type facts -> MIR -> checked MIR -> backend output
-                                      \      \          \          \
-                                       ------ layout facts --------
+        package source/AST -> HIR -> type/comptime facts -> MIR -> checked MIR -> backend output
+                                      \           \          \          \
+                                       ----------- layout facts --------
 ```
 
 流程中的几个块对应：
 
 - `package source/AST`：package manifest、source、syntax、module graph 和 resolve。
 - `HIR`：resolve 直接生成的未类型化语义树。
-- `type facts`：`TypeCheckStore` 和 `MonomorphStore`。
+- `type/comptime facts`：`TypeCheckStore`、`ComptimeStore` 和 `MonomorphStore`。
 - `MIR`：HIR lowering 生成的 CFG。
 - `checked MIR`：borrow check 后经过 drop elaboration 的 MIR。
 - `backend output`：LLVM IR、object file 或 executable。
@@ -65,9 +65,13 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：resolve facts。
   - 禁止：保存 type check 结果、layout、backend symbol。
 - `type_check`
-  - 生产：`TypeCheckStore`、trait/overload/type facts。
+  - 生产：`TypeCheckStore`、trait/overload/type facts、const initializer 的 `ComptimeValue`。
   - 消费：HIR、resolve facts。
   - 禁止：改写 HIR、计算 ABI layout、生成 MIR。
+- `comptime`
+  - 生产：`ComptimeStore` 中的 const value，以及 `comptime {}` 选择出的顶层 item 集合。
+  - 消费：AST/HIR、resolve facts、type facts、target facts。
+  - 禁止：执行运行时副作用、生成 MIR/backend 节点、把 `ComptimeValue` 泄漏到 backend。
 - `monomorph`
   - 生产：concrete generic instance 集合。
   - 消费：type facts、HIR generic template。
@@ -129,6 +133,7 @@ CompilerStore
   hirs
   types
   typeck
+  comptime
   monomorph
   layouts
   mirs
@@ -150,6 +155,9 @@ CompilerStore
 - `HirStore` 保存每个 `DefId` 的 HIR signature/body，是 HIR 事实 owner。
 - `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
 - `TypeCheckStore` 保存 node/def/call/pattern 的类型事实，不和 `TypeStore` 合并所有权语义。
+- `ComptimeStore` 保存 `DefId -> ComptimeValue` 的编译期常量事实。它只服务 sema、
+  public interface artifact 和 HIR->MIR lowering；MIR 之后的阶段只能看 `MirConst`、
+  `MirGlobal` 和 `MirStaticValue`。
 - `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
 - `MirStore` 保存 MIR function/body；backend 不维护一份等价 MIR。
 - `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
@@ -160,6 +168,8 @@ CompilerStore
 - pass 可以查询上游事实，但不能修改上游事实表。
 - pass 修改 MIR 时只产生普通 MIR block、statement 和 terminator。
 - backend 只能消费最终 elaborated MIR。
+- backend 不消费 `ComptimeValue`。标量 const 必须在 MIR lowering 前降成 `MirConst`；
+  复合 const 作为运行时值使用时，必须先 materialize 成 readonly `MirGlobal`。
 - 如果 backend 需要理解语言级结构，说明 MIR 还没有表达清楚。
 - layout query 可以被 MIR、borrow/drop 和 backend 使用，但 field offset/size/align 只能来自
   `LayoutStore`。

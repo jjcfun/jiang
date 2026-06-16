@@ -47,9 +47,13 @@ literal     <- int_lit
 file        <- top_level_item* eof
 
 top_level_item
-            <- extern_block
+            <- compile_block
+             / extern_block
              / global_destructure
              / top_level_decl
+
+compile_block
+            <- "comptime" "{" top_level_item* "}"
 
 extern_block
             <- "extern" "{" extern_item* "}"
@@ -156,6 +160,9 @@ default_param
 说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。
 因此 `struct_decl`、`record_decl`、`enum_decl`、`union_decl`、`trait_decl`
 等规则本身不重复写 `"public"`。
+`const_global_decl` 同样经由 `top_level_decl` 接受 modifier，因此 `public const Type name = expr;`
+是合法顶层声明。
+`comptime` block 是顶层 item，不经由 `decl_modifier`，只负责在编译期选择其中的顶层 item。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
 默认参数只能出现在参数列表尾部；带默认值的参数后面不能再出现必填参数。
@@ -244,14 +251,15 @@ name        <- ident / "self"
 - `T&` 表示引用外层。
 - `T^` 表示 owning pointer 外层。
 - `T*` 表示 raw pointer；主要用于 FFI / ABI / 低层 capability 场景，不参与自动解引用。
-- `T[]&` 表示 borrowed slice view。当前 0.2.1 兼容实现中，裸 `T[]` 仍作为同一 fat pointer 类型接受。
-- `T[:0]&` 表示 borrowed sentinel slice view；当前 0.2.1 兼容实现中，裸 `T[:0]` 仍作为同一 fat pointer 类型接受，并额外记录 `data[length] == 0` 的类型语义。
+- `T[]` 表示 unsized array pointee，`T[]&` 表示 borrowed slice view。
+- `T[:0]` 表示 sentinel unsized array pointee，`T[:0]&` 表示 borrowed sentinel slice view，
+  并额外记录 `data[length] == 0` 的类型语义。
 - `T[*]` 表示 many pointer。
 - `T[*:0]` 表示 sentinel many pointer；它不带 length，适合 C string ABI。
 - raw pointer、many pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
 - `T^` / `T&` 是语言级 ownership/reference handle，不能与其他 handle 叠加。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
-- `T[N:0]` 表示 sentinel 定长数组语法；0.2.1 先保留类型标记，完整 array sentinel storage 语义后续补齐。
+- `T[N:0]` 表示 sentinel 定长数组语法；完整 array sentinel storage 语义后续补齐。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Optional`、`Array`、`UnsizedArray`、`Result` 不会改变这些语法的含义。
