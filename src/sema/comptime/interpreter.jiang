@@ -11,13 +11,16 @@ import list = "../../support/list.jiang";
 import memory = "../../support/memory.jiang";
 import types = "../type.jiang";
 import check_state = "../type_check/state.jiang";
+import frame = "./frame.jiang";
 import value = "./value.jiang";
 
 public struct Interpreter: Movable {
     check_state.CheckState& state;
+    frame.ComptimeFrame! frame;
 
     public init(check_state.CheckState& state) {
         self.state = state;
+        self.frame = frame.ComptimeFrame();
     }
 
     public value.ComptimeValue? eval_const_initializer(qid.DefId def_id, hir.HirId root) {
@@ -32,11 +35,16 @@ public struct Interpreter: Movable {
             return self.literal_value(node_id, literal);
         }
         if (node.data is .name_ref(name_ref)) {
-            guard name_ref is .def_ref(def_id) else { return null; }
-            if (self.state.store.defs.get(def_id).kind == .enum_case_def) {
-                return self.enum_case_value(node_id, def_id);
+            if (name_ref is .local(local_id)) {
+                return self.frame.local(node_id.owner_def, local_id);
             }
-            return self.const_def_value(node_id, def_id, visiting);
+            if (name_ref is .def_ref(def_id)) {
+                if (self.state.store.defs.get(def_id).kind == .enum_case_def) {
+                    return self.enum_case_value(node_id, def_id);
+                }
+                return self.const_def_value(node_id, def_id, visiting);
+            }
+            return null;
         }
         if (node.data is .member_access(_)) {
             guard self.state.results.member_selection(node_id) is some member_def else { return null; }
@@ -62,6 +70,15 @@ public struct Interpreter: Movable {
         }
         if (node.data is .call(_)) {
             return self.call_value(node_id, visiting);
+        }
+        if (node.data is .let_stmt(let_stmt)) {
+            return self.let_value(node_id, let_stmt, visiting);
+        }
+        if (node.data is .block(block)) {
+            return self.block_value(node_id, block, visiting);
+        }
+        if (node.data is .if_expr(if_expr)) {
+            return self.if_value(node_id, if_expr, visiting);
         }
         return null;
     }
@@ -90,6 +107,10 @@ public struct Interpreter: Movable {
 
     value.ComptimeValue enum_case_value(hir.HirId node_id, qid.DefId case_def) {
         return value.ComptimeValue(type_id: self.node_type(node_id), data: .enum_case_value(case_def));
+    }
+
+    value.ComptimeValue unit_value(hir.HirId node_id) {
+        return value.ComptimeValue(type_id: self.node_type(node_id), data: .unit_value());
     }
 
     qid.TypeId node_type(hir.HirId node_id) {
@@ -121,7 +142,63 @@ public struct Interpreter: Movable {
         if (literal.value is .string_value(symbol)) {
             return value.ComptimeValue(type_id: type_id, data: .symbol_value(symbol));
         }
+        if (literal.value is .unit_value) {
+            return value.ComptimeValue(type_id: type_id, data: .unit_value());
+        }
         return null;
+    }
+
+    value.ComptimeValue? let_value(
+        hir.HirId node_id,
+        hir.HirLet let_stmt,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard let_stmt.initializer is some initializer else { return null; }
+        guard self.eval(initializer, visiting) is some initializer_value else { return null; }
+        self.frame.set_local(node_id.owner_def, let_stmt.local_id, initializer_value);
+        return self.unit_value(node_id);
+    }
+
+    value.ComptimeValue? block_value(
+        hir.HirId node_id,
+        hir.HirBlock block,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        self.frame.enter_scope();
+        Int! index = 0;
+        while (index < block.statements.length) {
+            guard self.eval(block.statements[index], visiting) is some _ else {
+                self.frame.leave_scope();
+                return null;
+            }
+            index = index + 1;
+        }
+        value.ComptimeValue! result = self.unit_value(node_id);
+        if (block.result is some result_id) {
+            guard self.eval(result_id, visiting) is some result_value else {
+                self.frame.leave_scope();
+                return null;
+            }
+            result = result_value;
+        }
+        self.frame.leave_scope();
+        return result;
+    }
+
+    value.ComptimeValue? if_value(
+        hir.HirId node_id,
+        hir.HirIf if_expr,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.eval(if_expr.condition, visiting) is some condition else { return null; }
+        guard condition.data is .bool_value(condition_value) else { return null; }
+        if (condition_value) {
+            return self.eval(if_expr.then_body, visiting);
+        }
+        if (if_expr.else_body is some else_body) {
+            return self.eval(else_body, visiting);
+        }
+        return self.unit_value(node_id);
     }
 
     value.ComptimeValue? struct_literal_value(
@@ -261,11 +338,62 @@ public struct Interpreter: Movable {
     }
 
     value.ComptimeValue? call_value(hir.HirId node_id, list.ArrayList<qid.DefId>& visiting) {
-        guard self.state.results.expr_lowering(node_id) is some lowering else { return null; }
-        if (lowering == .default_nominal) {
-            return self.default_nominal_value(node_id, visiting);
+        if (self.state.results.expr_lowering(node_id) is some lowering) {
+            if (lowering == .default_nominal) {
+                return self.default_nominal_value(node_id, visiting);
+            }
         }
-        return null;
+        guard self.state.results.call_target(node_id) is some target_def else { return null; }
+        return self.function_call_value(node_id, target_def, visiting);
+    }
+
+    value.ComptimeValue? function_call_value(
+        hir.HirId node_id,
+        qid.DefId target_def,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        guard self.state.hirs.def(target_def) is some target_hir else { return null; }
+        if (target_hir.decl.kind != .function_decl) {
+            return null;
+        }
+        guard target_hir.body is some _& body else { return null; }
+        guard self.state.results.ordered_call_args(node_id) is some ordered else { return null; }
+        // 这里解释已经 type-check 的函数体，不重新做 overload/default 参数规则。
+        // ordered_call_args 是 type check 的最终调用语义，interpreter 只消费这个结果。
+        self.frame.enter_scope();
+        if (!self.bind_call_params(body, ordered.values, visiting)) {
+            self.frame.leave_scope();
+            return null;
+        }
+        value.ComptimeValue? result = self.eval(body.root, visiting);
+        self.frame.leave_scope();
+        return result;
+    }
+
+    Bool bind_call_params(
+        hir.HirBody& body,
+        hir.HirId[]& args,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        Int! param_index = 0;
+        Int! local_index = 0;
+        while (local_index < body.locals.len()) {
+            hir.HirLocal local = body.locals.get_index(local_index);
+            if (local.kind == .parameter) {
+                // 参数 local 由 HIR lowering 按源码参数顺序加入 body.locals；
+                // 这里保持同一顺序绑定，避免再从符号名或 AST 重新推导调用形状。
+                if (param_index >= args.length) {
+                    return false;
+                }
+                guard self.eval(args[param_index], visiting) is some arg_value else {
+                    return false;
+                }
+                self.frame.set_local(body.owner_def, local.id, arg_value);
+                param_index = param_index + 1;
+            }
+            local_index = local_index + 1;
+        }
+        return param_index == args.length;
     }
 
     value.ComptimeValue? default_nominal_value(hir.HirId node_id, list.ArrayList<qid.DefId>& visiting) {
