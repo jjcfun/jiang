@@ -70,6 +70,11 @@ struct HirLower: Movable {
     () lower_top_level_item(ast.AstId item_id) {
         ast.AstNode item = self.state.unit.get(item_id);
         if (item.data is .top_level_decl(top_level)) {
+            ast.AstNode body = self.state.unit.get(top_level.body);
+            if (body.data is .extend_decl(extend_decl)) {
+                self.lower_extend(extend_decl, top_level.annotations, top_level.modifiers.public_flag);
+                return;
+            }
             self.lower_decl_with_annotations(top_level.body, top_level.annotations, false);
             return;
         }
@@ -204,7 +209,7 @@ struct HirLower: Movable {
             return;
         }
         if (decl.data is .extend_decl(extend_decl)) {
-            self.lower_extend(extend_decl, annotations);
+            self.lower_extend(extend_decl, annotations, false);
             return;
         }
     }
@@ -213,7 +218,7 @@ struct HirLower: Movable {
         return ast.AstRange(0, 0);
     }
 
-    () lower_extend(ast.ExtendData extend_decl, ast.AstRange annotations) {
+    () lower_extend(ast.ExtendData extend_decl, ast.AstRange annotations, Bool public_flag) {
         guard self.resolved_type_def_for_type_ref(extend_decl.target_type) is some owner_def else {
             self.lower_member_range(extend_decl.members);
             return;
@@ -224,13 +229,78 @@ struct HirLower: Movable {
         self.env.enter_scope(.generic_scope);
         self.define_self_type(owner_def);
         self.define_owner_generic_params(owner_def);
-        self.lower_annotations(owner_def, annotations);
+        Int extension_index = self.state.store.hirs.add_extension_group(self.state.module_id, owner_def, public_flag);
+        self.lower_extension_annotations(extension_index, annotations);
         if (extend_decl.trait_path is some trait_path) {
-            self.state.store.hirs.add_trait_ref(owner_def, self.lower_type_ref(trait_path));
+            hir.HirId lowered_trait_ref = self.lower_type_ref(trait_path);
+            self.state.store.hirs.add_trait_ref(owner_def, lowered_trait_ref);
+            self.state.store.hirs.set_extension_trait_ref(extension_index, lowered_trait_ref);
         }
         self.lower_member_range(extend_decl.members);
+        self.record_extension_members(extension_index, extend_decl.members);
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
+    }
+
+    () lower_extension_annotations(Int extension_index, ast.AstRange annotations) {
+        Int! index = 0;
+        while (index < annotations.len) {
+            self.lower_extension_where_constraint(extension_index, self.state.unit.child_at(annotations, index));
+            index = index + 1;
+        }
+    }
+
+    () lower_extension_where_constraint(Int extension_index, ast.AstId constraint_id) {
+        ast.AstNode constraint = self.state.unit.get(constraint_id);
+        if (constraint.data is .where_type_bound(bound)) {
+            self.lower_extension_where_type_bound(extension_index, bound.param, bound.bound);
+            return;
+        }
+        if (constraint.data is .where_type_equal(equal)) {
+            self.state.store.hirs.add_extension_where_predicate(extension_index, .type_equal(hir.HirWhereTypeEqual(
+                    subject: self.lower_type_ref(equal.param),
+                    value: self.lower_type_ref(equal.value)
+                ))
+            );
+            return;
+        }
+        if (constraint.data is .where_type_not_equal(equal)) {
+            self.state.store.hirs.add_extension_where_predicate(extension_index, .type_not_equal(hir.HirWhereTypeEqual(
+                    subject: self.lower_type_ref(equal.param),
+                    value: self.lower_type_ref(equal.value)
+                ))
+            );
+            return;
+        }
+        if (constraint.data is .where_projection_equal(equal)) {
+            self.state.store.hirs.add_extension_where_predicate(extension_index, .projection_equal(hir.HirWhereProjectionEqual(
+                    subject: self.lower_type_ref(equal.param),
+                    trait_ref: self.lower_type_ref(equal.trait_path),
+                    assoc_symbol: self.symbol_for_name(equal.assoc_name),
+                    value: self.lower_type_ref(equal.value)
+                ))
+            );
+        }
+    }
+
+    () lower_extension_where_type_bound(Int extension_index, ast.AstId subject, ast.AstId bound_id) {
+        ast.AstNode bound = self.state.unit.get(bound_id);
+        if (bound.data is .trait_bound(trait_bound)) {
+            hir.HirWhereTypeBound lowered = hir.HirWhereTypeBound(
+                    subject: self.lower_type_ref(subject),
+                    bound: self.lower_trait_bound_ref(trait_bound)
+                );
+            if (trait_bound.negative) {
+                self.state.store.hirs.add_extension_where_predicate(extension_index, .negative_type_bound(lowered));
+            } else {
+                self.state.store.hirs.add_extension_where_predicate(extension_index, .type_bound(lowered));
+            }
+            return;
+        }
+        if (bound.data is .type_bound_intersection(intersection)) {
+            self.lower_extension_where_type_bound(extension_index, subject, intersection.left);
+            self.lower_extension_where_type_bound(extension_index, subject, intersection.right);
+        }
     }
 
     // init body 归属于隐藏 init_def。init ABI 使用 hidden `self` receiver，
@@ -361,6 +431,45 @@ struct HirLower: Movable {
             }
             index = index + 1;
         }
+    }
+
+    () record_extension_members(Int extension_index, ast.AstRange members) {
+        Int! index = 0;
+        while (index < members.len) {
+            ast.AstId member_id = self.state.unit.child_at(members, index);
+            if (self.member_def_for_ast(member_id) is some member_def) {
+                self.state.store.hirs.add_extension_member(extension_index, member_def);
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.DefId? member_def_for_ast(ast.AstId member_id) {
+        ast.AstNode member = self.state.unit.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            return self.member_def_for_ast(member_decl.body);
+        }
+        if (member.data is .function_decl(function_decl)) {
+            return self.decl_def_for_name(function_decl.name, .value_name);
+        }
+        if (member.data is .global_decl(global_decl)) {
+            return self.decl_def_for_name(global_decl.name, .value_name);
+        }
+        if (member.data is .field_decl(field_decl)) {
+            return self.first_field_def(field_decl);
+        }
+        if (member.data is .assoc_type(assoc_type)) {
+            return self.decl_def_for_name(assoc_type.name, .type_name);
+        }
+        return null;
+    }
+
+    qid.DefId? first_field_def(ast.FieldData field_decl) {
+        if (field_decl.fields.len == 0) { return null; }
+        ast.AstId field_id = self.state.unit.child_at(field_decl.fields, 0);
+        ast.AstNode field_node = self.state.unit.get(field_id);
+        guard field_node.data is .field_declarator(field_data) else { return null; }
+        return self.decl_def_for_name(field_data.name, .member_name);
     }
 
     () lower_trait_ref_range(qid.DefId owner_def, ast.AstRange traits) {

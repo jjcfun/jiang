@@ -6,6 +6,8 @@
 import hir = "../../hir/hir.jiang";
 import qid = "../../store/id.jiang";
 import def = "../../resolve/def.jiang";
+import namespace = "../../resolve/namespace.jiang";
+import store = "../../resolve/store.jiang";
 import hash = "../../support/hash.jiang";
 import list = "../../support/list.jiang";
 import set = "../../support/set.jiang";
@@ -2007,7 +2009,7 @@ public struct TypeOps: Movable {
         // 普通 nominal type 先查自己的 member namespace；generic param 没有
         // 自己的 namespace，需要继续从 `T: Trait` / `@where(T: Trait)`
         // 这样的 bound 里查 trait member。
-        if (self.direct_member_for_type(type_id, member_symbol) is some member_def) {
+        if (self.direct_member_for_type(type_id, use_owner, member_symbol) is some member_def) {
             return member_def;
         }
         return self.bound_member_for_type(type_id, use_owner, member_symbol);
@@ -2051,9 +2053,148 @@ public struct TypeOps: Movable {
         return target_module.index == use_module.index;
     }
 
-    qid.DefId? direct_member_for_type(qid.TypeId type_id, qid.SymbolId member_symbol) {
+    qid.DefId? direct_member_for_type(qid.TypeId type_id, qid.DefId use_owner, qid.SymbolId member_symbol) {
         guard self.member_namespace_for_type(type_id) is some namespace_id else { return null; }
-        return self.value_member_in_namespace(namespace_id, member_symbol);
+        return self.visible_value_member_in_namespace(type_id, use_owner, namespace_id, member_symbol);
+    }
+
+    public qid.DefId? visible_value_member_in_namespace(
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId member_symbol
+    ) {
+        if (self.visible_member_in_domain(type_id, use_owner, namespace_id, member_symbol, .member_name)
+            is some member_def) {
+            return member_def;
+        }
+        return self.visible_member_in_domain(type_id, use_owner, namespace_id, member_symbol, .value_name);
+    }
+
+    qid.DefId? visible_member_in_domain(
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId member_symbol,
+        def.NameDomain domain
+    ) {
+        table.MultiTableCursor! cursor = self.state.store.resolve.first_binding_cursor(
+            namespace_id,
+            member_symbol,
+            domain
+        );
+        qid.DefId?! selected = null;
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
+            if (self.extension_member_visible_for_type(type_id, use_owner, binding.def_id)) {
+                selected = binding.def_id;
+            }
+            cursor = self.state.store.resolve.next_binding_cursor(cursor);
+        }
+        return selected;
+    }
+
+    Bool extension_member_visible_for_type(qid.TypeId type_id, qid.DefId use_owner, qid.DefId member_def) {
+        guard self.state.store.hirs.extension_group_for_member(member_def) is some extension_index else {
+            return true;
+        }
+        hir.HirExtensionGroup& group = self.state.store.hirs.extension_group_ref(extension_index);
+        if (!self.extension_visible_from_use_owner(group, use_owner)) {
+            return false;
+        }
+        return self.extension_where_satisfied_for_type(type_id, use_owner, group);
+    }
+
+    Bool extension_visible_from_use_owner(hir.HirExtensionGroup& group, qid.DefId use_owner) {
+        guard self.state.store.defs.get(use_owner).module_id is some use_module else { return false; }
+        if (use_module.index == group.module_id.index) {
+            return true;
+        }
+        if (!group.public_flag) {
+            return false;
+        }
+        list.ArrayList<qid.ModuleId>! visited = list.ArrayList<qid.ModuleId>();
+        return self.module_can_see_public_extension(use_module, group.module_id, false, visited$.ref());
+    }
+
+    Bool module_can_see_public_extension(
+        qid.ModuleId from_module,
+        qid.ModuleId extension_module,
+        Bool require_public_edge,
+        list.ArrayList<qid.ModuleId>& visited
+    ) {
+        if (self.module_id_list_contains(visited, from_module)) {
+            return false;
+        }
+        visited.add(from_module);
+        store.ModuleRecord& module_record = self.state.store.resolve.module_ref(from_module);
+        Int! index = 0;
+        while (index < module_record.imports.len()) {
+            store.ImportRecord import_record = module_record.imports.get(index);
+            if (require_public_edge && import_record.visibility != .public_visibility) {
+                index = index + 1;
+                continue;
+            }
+            guard import_record.target_module is some target_module else {
+                index = index + 1;
+                continue;
+            }
+            if (target_module.index == extension_module.index) {
+                return true;
+            }
+            if (self.module_can_see_public_extension(target_module, extension_module, true, visited)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool module_id_list_contains(list.ArrayList<qid.ModuleId>& modules, qid.ModuleId module_id) {
+        Int! index = 0;
+        while (index < modules.len()) {
+            if (modules.get(index).index == module_id.index) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool extension_where_satisfied_for_type(
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        hir.HirExtensionGroup& group
+    ) {
+        if (group.where_predicates.len() == 0) {
+            return true;
+        }
+        list.ArrayList<qid.TypeId> args = self.extension_receiver_type_args(type_id, group.target_owner_def);
+        Int! index = 0;
+        while (index < group.where_predicates.len()) {
+            hir.HirWherePredicate predicate = group.where_predicates.get(index);
+            if (!self.type_owner_where_predicate_satisfied(
+                use_owner,
+                group.target_owner_def,
+                args$.ref(),
+                predicate
+            )) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    list.ArrayList<qid.TypeId> extension_receiver_type_args(qid.TypeId type_id, qid.DefId owner_def) {
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>();
+        Int arg_count = self.actual_type_constructor_arg_count(type_id, owner_def);
+        Int! index = 0;
+        while (index < arg_count) {
+            args.add(self.actual_type_constructor_arg(type_id, owner_def, index));
+            index = index + 1;
+        }
+        return args$.move();
     }
 
     public qid.DefId? bound_member_for_type(
