@@ -354,6 +354,9 @@ public struct TypeOps: Movable {
             );
             return self.state.store.types.invalid_type();
         }
+        if (!self.type_owner_where_predicates_satisfied(type_ref, owner_def, type_args)) {
+            return self.state.store.types.invalid_type();
+        }
         return self.type_with_owner(self.state.store.types.optional_type(type_args.get(0), token.Span()), owner_def);
     }
 
@@ -361,8 +364,11 @@ public struct TypeOps: Movable {
         guard self.single_builtin_type_arg(type_ref, type_args, "Ref") is some element else {
             return self.state.store.types.invalid_type();
         }
-        if (!self.validate_ref_element(type_ref, element)) {
+        if (!self.type_owner_where_predicates_satisfied(type_ref, owner_def, type_args)) {
             return self.state.store.types.invalid_type();
+        }
+        if (self.type_is_unsized_array(element)) {
+            return self.type_with_owner(self.slice_type_for_unsized_array(element), owner_def);
         }
         return self.type_with_owner(self.state.store.types.reference_type(element, token.Span()), owner_def);
     }
@@ -371,7 +377,7 @@ public struct TypeOps: Movable {
         guard self.single_builtin_type_arg(type_ref, type_args, "Box") is some element else {
             return self.state.store.types.invalid_type();
         }
-        if (!self.validate_box_element(type_ref, element)) {
+        if (!self.type_owner_where_predicates_satisfied(type_ref, owner_def, type_args)) {
             return self.state.store.types.invalid_type();
         }
         return self.type_with_owner(self.state.store.types.owner_pointer_type(element, token.Span()), owner_def);
@@ -398,37 +404,215 @@ public struct TypeOps: Movable {
         return null;
     }
 
-    Bool validate_ref_element(hir.HirId type_ref, qid.TypeId element) {
-        if (self.type_is_handle(element)) {
-            self.add_invalid_handle_type_error(type_ref);
-            return false;
-        }
-        if (self.state.store.types.get(element).is_mutable) {
-            self.add_node_error(type_ref, "Ref cannot reference a mutable type", "invalid_ref_element_type");
-            return false;
-        }
-        return true;
-    }
-
-    Bool validate_box_element(hir.HirId type_ref, qid.TypeId element) {
-        if (self.type_is_handle(element)) {
-            self.add_invalid_handle_type_error(type_ref);
-            return false;
-        }
-        return true;
-    }
-
     Bool type_is_handle(qid.TypeId type_id) {
         types.TypeInfo info = self.state.store.types.get(type_id);
         return info.data is .handle_type(_);
     }
 
-    () add_invalid_handle_type_error(hir.HirId type_ref) {
-        self.add_node_error(
-            type_ref,
-            "owner/reference handle cannot be combined with another handle layer",
-            "invalid_handle_type"
-        );
+    Bool type_owner_where_predicates_satisfied(
+        hir.HirId type_ref,
+        qid.DefId owner_def,
+        list.ArrayList<qid.TypeId>& type_args
+    ) {
+        guard self.state.hirs.def(owner_def) is some hir_def else { return true; }
+        Bool! satisfied = true;
+        Int! index = 0;
+        while (index < hir_def.where_predicates.len()) {
+            hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
+            if (!self.type_owner_where_predicate_satisfied(owner_def, type_args, predicate)) {
+                self.add_node_error(type_ref, "generic constraint is not satisfied", "generic_constraint_not_satisfied");
+                satisfied = false;
+            }
+            index = index + 1;
+        }
+        return satisfied;
+    }
+
+    Bool type_owner_where_predicate_satisfied(
+        qid.DefId owner_def,
+        list.ArrayList<qid.TypeId>& type_args,
+        hir.HirWherePredicate predicate
+    ) {
+        if (predicate is .type_equal(equal)) {
+            qid.TypeId subject = self.substituted_where_type_ref(owner_def, type_args, equal.subject);
+            return self.where_type_pattern_matches(subject, owner_def, type_args, equal.value);
+        }
+        if (predicate is .type_not_equal(equal)) {
+            qid.TypeId subject = self.substituted_where_type_ref(owner_def, type_args, equal.subject);
+            return !self.where_type_pattern_matches(subject, owner_def, type_args, equal.value);
+        }
+        return true;
+    }
+
+    public qid.TypeId substituted_where_type_ref(
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId>& type_args,
+        hir.HirId type_ref
+    ) {
+        qid.TypeId raw_type = self.check_type_ref(type_ref);
+        return self.substitute_generic_type(raw_type, generic_owner, type_args);
+    }
+
+    public Bool where_type_pattern_matches(
+        qid.TypeId actual_type,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId>& type_args,
+        hir.HirId pattern_ref
+    ) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) {
+            return true;
+        }
+        if (pattern.data is .named_type_ref(named)) {
+            return self.named_where_type_pattern_matches(actual_type, generic_owner, type_args, pattern_ref, named);
+        }
+        qid.TypeId expected_type = self.substituted_where_type_ref(generic_owner, type_args, pattern_ref);
+        return self.same_type_ignoring_mutability(actual_type, expected_type);
+    }
+
+    Bool named_where_type_pattern_matches(
+        qid.TypeId actual_type,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId>& type_args,
+        hir.HirId pattern_ref,
+        hir.HirNamedTypeRef named
+    ) {
+        if (self.state.store.defs.get(named.def_id).kind == .generic_param_def) {
+            qid.TypeId expected_type = self.substituted_where_type_ref(generic_owner, type_args, pattern_ref);
+            return self.same_type_ignoring_mutability(actual_type, expected_type);
+        }
+        if (named.args.length == 0) {
+            qid.TypeId expected_type = self.substituted_where_type_ref(generic_owner, type_args, pattern_ref);
+            return self.same_type_ignoring_mutability(actual_type, expected_type);
+        }
+        return self.constructor_where_type_pattern_matches(actual_type, generic_owner, type_args, named);
+    }
+
+    Bool constructor_where_type_pattern_matches(
+        qid.TypeId actual_type,
+        qid.DefId generic_owner,
+        list.ArrayList<qid.TypeId>& type_args,
+        hir.HirNamedTypeRef named
+    ) {
+        if (!self.actual_type_has_constructor(actual_type, named.def_id)) {
+            return false;
+        }
+        if (!self.actual_type_arg_count_matches(actual_type, named.def_id, named.args.length)) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < named.args.length) {
+            qid.TypeId actual_arg = self.actual_type_constructor_arg(actual_type, named.def_id, index);
+            if (!self.where_type_pattern_matches(actual_arg, generic_owner, type_args, named.args[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool actual_type_has_constructor(qid.TypeId actual_type, qid.DefId constructor_def) {
+        types.TypeInfo info = self.state.store.types.get(actual_type);
+        if (info.data is .named(named)) {
+            return named.def_id.to_index() == constructor_def.to_index();
+        }
+        guard info.type_owner_def is some owner_def else { return false; }
+        return owner_def.to_index() == constructor_def.to_index();
+    }
+
+    Bool actual_type_arg_count_matches(qid.TypeId actual_type, qid.DefId constructor_def, Int expected) {
+        types.TypeInfo info = self.state.store.types.get(actual_type);
+        if (info.data is .named(named)) {
+            return named.args.length == expected;
+        }
+        if (expected == 0) {
+            return true;
+        }
+        return expected == 1 && self.actual_type_has_single_owner_arg(actual_type, constructor_def);
+    }
+
+    Bool actual_type_has_single_owner_arg(qid.TypeId actual_type, qid.DefId constructor_def) {
+        types.TypeInfo info = self.state.store.types.get(actual_type);
+        if (info.data is .optional(_)) {
+            return self.is_option_builtin_type_def(constructor_def);
+        }
+        if (info.data is .handle_type(_)) {
+            return self.is_ref_builtin_type_def(constructor_def) || self.is_box_builtin_type_def(constructor_def);
+        }
+        return false;
+    }
+
+    qid.TypeId actual_type_constructor_arg(qid.TypeId actual_type, qid.DefId constructor_def, Int index) {
+        types.TypeInfo info = self.state.store.types.get(actual_type);
+        if (info.data is .named(named)) {
+            return named.args[index];
+        }
+        if (index != 0) {
+            return self.state.store.types.invalid_type();
+        }
+        if (info.data is .optional(optional)) {
+            return optional.element;
+        }
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .slice && self.is_ref_builtin_type_def(constructor_def)) {
+                return self.state.store.types.unsized_array_type_with_sentinel(
+                    handle.element,
+                    handle.sentinel,
+                    info.span
+                );
+            }
+            return handle.element;
+        }
+        return self.state.store.types.invalid_type();
+    }
+
+    public qid.TypeId check_where_type_pattern_ref(hir.HirId pattern_ref) {
+        if (self.where_type_pattern_is_wildcard(pattern_ref)) {
+            return self.state.store.types.invalid_type();
+        }
+        if (self.where_type_pattern_contains_wildcard(pattern_ref)) {
+            self.check_where_type_pattern_shape(pattern_ref);
+            return self.state.store.types.invalid_type();
+        }
+        return self.check_type_ref(pattern_ref);
+    }
+
+    Bool where_type_pattern_is_wildcard(hir.HirId pattern_ref) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        return pattern.data is .infer_type_ref;
+    }
+
+    Bool where_type_pattern_contains_wildcard(hir.HirId pattern_ref) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) {
+            return true;
+        }
+        if (pattern.data is .named_type_ref(named)) {
+            return self.named_pattern_contains_wildcard(named);
+        }
+        return false;
+    }
+
+    Bool named_pattern_contains_wildcard(hir.HirNamedTypeRef named) {
+        Int! index = 0;
+        while (index < named.args.length) {
+            if (self.where_type_pattern_contains_wildcard(named.args[index])) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () check_where_type_pattern_shape(hir.HirId pattern_ref) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        guard pattern.data is .named_type_ref(named) else { return; }
+        self.check_type_arg_arity(pattern_ref, named.def_id, named.args.length);
+        Int! index = 0;
+        while (index < named.args.length) {
+            self.check_where_type_pattern_ref(named.args[index]);
+            index = index + 1;
+        }
     }
 
     Bool is_abstract_associated_type_def(qid.DefId def_id) {
@@ -462,6 +646,12 @@ public struct TypeOps: Movable {
             args.add(self.check_type_ref(arg_refs[index]));
             index = index + 1;
         }
+        return args$.move();
+    }
+
+    list.ArrayList<qid.TypeId> single_type_arg_list(qid.TypeId type_id) {
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>(1);
+        args.add(type_id);
         return args$.move();
     }
 
@@ -772,25 +962,47 @@ public struct TypeOps: Movable {
     public qid.TypeId type_for_layered_ref(hir.HirId type_ref, hir.HirLayeredTypeRef layered) {
         qid.TypeId element = self.check_type_ref(layered.element);
         if (layered.kind == .optional_type) {
-            return self.state.store.types.optional_type(element, token.Span());
+            qid.TypeId optional_id = self.state.store.types.optional_type(element, token.Span());
+            guard self.state.store.resolve.core_types.option_type is some option_def else { return optional_id; }
+            list.ArrayList<qid.TypeId>! args = self.single_type_arg_list(element);
+            if (!self.type_owner_where_predicates_satisfied(type_ref, option_def, args$.ref())) {
+                return self.state.store.types.invalid_type();
+            }
+            return self.type_with_owner(optional_id, option_def);
         }
         if (layered.kind == .mutable_type) {
             return self.state.store.types.mutable_type(element, token.Span());
         }
         if (layered.kind == .reference) {
-            // `T[]&` 表示 borrowed slice view。`T[]` 本身已经是
-            // unsized array pointee；加上 `&` 后归一成现有
-            // handle_type(.slice)，继续复用 fat pointer ABI/layout。
+            // 语言层 `T[]&` 等价于 `Ref<T[]>`。内部仍归一到 slice
+            // fat pointer ABI/layout，但 owner def 和 where 约束走 Ref。
+            guard self.state.store.resolve.core_types.ref_type is some ref_def else {
+                if (self.type_is_unsized_array(element)) {
+                    return self.slice_type_for_unsized_array(element);
+                }
+                return self.state.store.types.reference_type(element, token.Span());
+            }
+            list.ArrayList<qid.TypeId>! args = self.single_type_arg_list(element);
+            if (!self.type_owner_where_predicates_satisfied(type_ref, ref_def, args$.ref())) {
+                return self.state.store.types.invalid_type();
+            }
             if (self.type_is_unsized_array(element)) {
-                return self.slice_type_for_unsized_array(element);
+                return self.type_with_owner(self.slice_type_for_unsized_array(element), ref_def);
             }
             if (self.type_is_slice_handle(element)) {
                 return element;
             }
-            return self.state.store.types.reference_type(element, token.Span());
+            return self.type_with_owner(self.state.store.types.reference_type(element, token.Span()), ref_def);
         }
         if (layered.kind == .owner_pointer) {
-            return self.state.store.types.owner_pointer_type(element, token.Span());
+            guard self.state.store.resolve.core_types.box_type is some box_def else {
+                return self.state.store.types.owner_pointer_type(element, token.Span());
+            }
+            list.ArrayList<qid.TypeId>! args = self.single_type_arg_list(element);
+            if (!self.type_owner_where_predicates_satisfied(type_ref, box_def, args$.ref())) {
+                return self.state.store.types.invalid_type();
+            }
+            return self.type_with_owner(self.state.store.types.owner_pointer_type(element, token.Span()), box_def);
         }
         if (layered.kind == .raw_pointer) {
             return self.state.store.types.raw_pointer_type(element, token.Span());
