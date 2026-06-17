@@ -283,6 +283,9 @@ public struct TypeOps: Movable {
         if (self.is_option_builtin_type_def(target_def)) {
             return self.type_for_option_ref(type_ref, target_def, type_args_list$.ref());
         }
+        if (self.is_result_builtin_type_def(target_def)) {
+            return self.type_for_result_ref(type_ref, target_def, ref_data.args, type_args_list$.ref());
+        }
         if (self.is_reference_builtin_type_def(target_def)) {
             return self.type_for_reference_ref(type_ref, target_def, type_args_list$.ref());
         }
@@ -322,6 +325,9 @@ public struct TypeOps: Movable {
         }
         self.check_type_arg_arity(type_ref, target_def, type_args_list.len());
         self.record_generic_instance(type_ref, target_def, type_args_list$.ref());
+        if (!self.type_owner_where_predicates_satisfied(type_ref, target_def, type_args_list$.ref())) {
+            return self.state.store.types.invalid_type();
+        }
         if (type_args_list.len() == 0) {
             if (self.state.store.types.named_type_for_def(target_def) is some type_id) {
                 return type_id;
@@ -332,6 +338,10 @@ public struct TypeOps: Movable {
 
     Bool is_option_builtin_type_def(qid.DefId def_id) {
         return self.core_type_def_matches(self.state.store.resolve.core_types.option_type, def_id);
+    }
+
+    Bool is_result_builtin_type_def(qid.DefId def_id) {
+        return self.core_type_def_matches(self.state.store.resolve.core_types.result_type, def_id);
     }
 
     Bool is_reference_builtin_type_def(qid.DefId def_id) {
@@ -372,6 +382,27 @@ public struct TypeOps: Movable {
             return self.state.store.types.invalid_type();
         }
         return self.type_with_owner(self.state.store.types.optional_type(type_args.get(0), token.Span()), owner_def);
+    }
+
+    qid.TypeId type_for_result_ref(
+        hir.HirId type_ref,
+        qid.DefId owner_def,
+        hir.HirId[]& arg_refs,
+        list.ArrayList<qid.TypeId>& type_args
+    ) {
+        if (type_args.len() != 2) {
+            self.add_node_error(
+                type_ref,
+                "Result type argument count does not match declaration",
+                "generic_arg_arity_mismatch"
+            );
+            return self.state.store.types.invalid_type();
+        }
+        if (!self.type_owner_where_predicates_satisfied(type_ref, owner_def, type_args)) {
+            return self.state.store.types.invalid_type();
+        }
+        qid.TypeId result = self.state.store.types.error_union_type(type_args.get(0), type_args.get(1), token.Span());
+        return self.type_with_owner(result, owner_def);
     }
 
     qid.TypeId type_for_reference_ref(hir.HirId type_ref, qid.DefId owner_def, list.ArrayList<qid.TypeId>& type_args) {
@@ -464,7 +495,7 @@ public struct TypeOps: Movable {
         Int! index = 0;
         while (index < hir_def.where_predicates.len()) {
             hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
-            if (!self.type_owner_where_predicate_satisfied(owner_def, type_args, predicate)) {
+            if (!self.type_owner_where_predicate_satisfied(type_ref.owner_def, owner_def, type_args, predicate)) {
                 self.add_node_error(type_ref, "generic constraint is not satisfied", "generic_constraint_not_satisfied");
                 satisfied = false;
             }
@@ -474,10 +505,19 @@ public struct TypeOps: Movable {
     }
 
     Bool type_owner_where_predicate_satisfied(
+        qid.DefId use_owner,
         qid.DefId owner_def,
         list.ArrayList<qid.TypeId>& type_args,
         hir.HirWherePredicate predicate
     ) {
+        if (predicate is .type_bound(bound)) {
+            qid.TypeId subject = self.substituted_where_type_ref(owner_def, type_args, bound.subject);
+            return self.type_owner_type_bound_satisfied(use_owner, subject, bound.bound);
+        }
+        if (predicate is .negative_type_bound(bound)) {
+            qid.TypeId subject = self.substituted_where_type_ref(owner_def, type_args, bound.subject);
+            return !self.type_owner_type_bound_satisfied(use_owner, subject, bound.bound);
+        }
         if (predicate is .type_equal(equal)) {
             qid.TypeId subject = self.substituted_where_type_ref(owner_def, type_args, equal.subject);
             return self.where_type_pattern_matches(subject, owner_def, type_args, equal.value);
@@ -487,6 +527,115 @@ public struct TypeOps: Movable {
             return !self.where_type_pattern_matches(subject, owner_def, type_args, equal.value);
         }
         return true;
+    }
+
+    Bool type_owner_type_bound_satisfied(qid.DefId use_owner, qid.TypeId subject, hir.HirId bound_ref) {
+        hir.HirNode bound_node = self.state.hirs.node(bound_ref);
+        guard bound_node.data is .named_type_ref(named) else { return true; }
+        return self.type_satisfies_trait(subject, named.def_id, use_owner);
+    }
+
+    Bool type_satisfies_trait(qid.TypeId subject, qid.DefId trait_def, qid.DefId use_owner) {
+        if (self.is_invalid_type(subject)) { return true; }
+        if (self.core_trait_matches(self.state.store.resolve.core_traits.mutable_trait, trait_def)) {
+            return self.type_is_mutable(subject);
+        }
+        if (self.type_satisfies_integer_trait(subject, trait_def)) {
+            return true;
+        }
+        types.TypeInfo info = self.state.store.types.get(subject);
+        guard info.data is .named(named) else { return false; }
+        set.HashSet<qid.DefId>! visited = set.HashSet<qid.DefId>();
+        if (self.def_declares_trait(named.def_id, trait_def, visited$.ref())) {
+            return true;
+        }
+        if (self.state.store.defs.get(named.def_id).kind != .generic_param_def) {
+            return false;
+        }
+        return self.owner_where_bounds_satisfy_trait(named.def_id, use_owner, trait_def);
+    }
+
+    Bool type_satisfies_integer_trait(qid.TypeId subject, qid.DefId trait_def) {
+        if (!self.is_integer_type(subject)) { return false; }
+        if (self.core_trait_matches(self.state.store.resolve.core_traits.hashable_trait, trait_def)) {
+            return true;
+        }
+        return self.core_trait_matches(self.state.store.resolve.core_traits.equatable_trait, trait_def);
+    }
+
+    Bool owner_where_bounds_satisfy_trait(qid.DefId generic_def, qid.DefId use_owner, qid.DefId trait_def) {
+        qid.DefId?! current = use_owner;
+        while (current is some owner_def) {
+            if (self.where_bounds_satisfy_trait(generic_def, owner_def, trait_def)) {
+                return true;
+            }
+            current = self.state.store.defs.get(owner_def).owner_def;
+        }
+        return false;
+    }
+
+    Bool where_bounds_satisfy_trait(qid.DefId generic_def, qid.DefId owner_def, qid.DefId trait_def) {
+        guard self.state.hirs.def(owner_def) is some hir_def else { return false; }
+        Int! index = 0;
+        while (index < hir_def.where_predicates.len()) {
+            hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
+            index = index + 1;
+            guard predicate is .type_bound(bound) else { continue; }
+            if (!self.type_ref_names_def(bound.subject, generic_def)) { continue; }
+            if (self.trait_ref_satisfies_trait(bound.bound, trait_def)) { return true; }
+        }
+        return false;
+    }
+
+    Bool trait_ref_satisfies_trait(hir.HirId trait_ref, qid.DefId trait_def) {
+        hir.HirNode node = self.state.hirs.node(trait_ref);
+        guard node.data is .named_type_ref(named) else { return false; }
+        set.HashSet<qid.DefId>! visited = set.HashSet<qid.DefId>();
+        return self.trait_def_satisfies_trait(named.def_id, trait_def, visited$.ref());
+    }
+
+    Bool def_declares_trait(qid.DefId def_id, qid.DefId trait_def, set.HashSet<qid.DefId>& visited) {
+        if (visited.has(def_id)) { return false; }
+        visited.add(def_id);
+        guard self.state.hirs.def(def_id) is some hir_def else { return false; }
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            hir.HirNode node = self.state.hirs.node(hir_def.trait_refs.get(index));
+            index = index + 1;
+            guard node.data is .named_type_ref(named) else { continue; }
+            if (named.def_id.to_index() == trait_def.to_index()) { return true; }
+            if (self.def_declares_trait(named.def_id, trait_def, visited)) { return true; }
+        }
+        return false;
+    }
+
+    Bool trait_def_satisfies_trait(
+        qid.DefId candidate_trait,
+        qid.DefId target_trait,
+        set.HashSet<qid.DefId>& visited
+    ) {
+        if (visited.has(candidate_trait)) { return false; }
+        visited.add(candidate_trait);
+        if (candidate_trait.to_index() == target_trait.to_index()) { return true; }
+        guard self.state.hirs.def(candidate_trait) is some hir_def else { return false; }
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            hir.HirNode node = self.state.hirs.node(hir_def.trait_refs.get(index));
+            index = index + 1;
+            guard node.data is .named_type_ref(parent) else { continue; }
+            if (self.trait_def_satisfies_trait(parent.def_id, target_trait, visited)) { return true; }
+        }
+        return false;
+    }
+
+    Bool core_trait_matches(qid.DefId? core_trait, qid.DefId trait_def) {
+        guard core_trait is some core_def else { return false; }
+        return core_def.to_index() == trait_def.to_index();
+    }
+
+    Bool type_is_mutable(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        return info.is_mutable;
     }
 
     public qid.TypeId substituted_where_type_ref(
