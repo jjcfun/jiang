@@ -380,7 +380,7 @@ public struct BodyCheck: Movable {
             type_id = self.check_if(node_id, if_expr);
         }
         if (node.data is .loop_expr(loop_expr)) {
-            type_id = self.check_loop(loop_expr);
+            type_id = self.check_loop(node_id, loop_expr);
         }
         if (node.data is .switch_expr(switch_expr)) {
             type_id = self.check_switch(node_id, switch_expr);
@@ -1351,18 +1351,18 @@ public struct BodyCheck: Movable {
         return .maybe_initialized;
     }
 
-    qid.TypeId check_loop(hir.HirLoop loop_expr) {
+    qid.TypeId check_loop(hir.HirId node_id, hir.HirLoop loop_expr) {
         if (loop_expr.condition is some condition) {
             self.type_ops.expect_bool(condition, self.check_node(condition));
         }
         if (loop_expr.pattern != null || loop_expr.iterable != null) {
-            return self.check_for_loop(loop_expr);
+            return self.check_for_loop(node_id, loop_expr);
         }
         self.check_node(loop_expr.body);
         return self.state.store.types.unit_type();
     }
 
-    qid.TypeId check_for_loop(hir.HirLoop loop_expr) {
+    qid.TypeId check_for_loop(hir.HirId node_id, hir.HirLoop loop_expr) {
         qid.TypeId! iterable_type = self.state.store.types.invalid_type();
         if (loop_expr.iterable is some iterable) {
             if (self.for_range_element_type(iterable) is some range_element) {
@@ -1371,7 +1371,7 @@ public struct BodyCheck: Movable {
                 iterable_type = self.check_node(iterable);
             }
         }
-        qid.TypeId element_type = self.for_iterable_element_type(loop_expr.iterable, iterable_type);
+        qid.TypeId element_type = self.for_iterable_element_type(node_id, loop_expr.iterable, iterable_type);
         if (loop_expr.pattern is some pattern) {
             self.pattern_check.check_pattern(pattern, element_type);
         }
@@ -1403,7 +1403,7 @@ public struct BodyCheck: Movable {
         return int_type;
     }
 
-    qid.TypeId for_iterable_element_type(hir.HirId? iterable_node, qid.TypeId iterable_type) {
+    qid.TypeId for_iterable_element_type(hir.HirId loop_id, hir.HirId? iterable_node, qid.TypeId iterable_type) {
         if (self.type_ops.is_invalid_type(iterable_type)) {
             return iterable_type;
         }
@@ -1423,14 +1423,94 @@ public struct BodyCheck: Movable {
                 return handle.element;
             }
         }
+        if (self.sequence_for_loop_plan(iterable_type, loop_id.owner_def) is some plan) {
+            self.state.results.record_for_loop_sequence_plan(loop_id, plan);
+            return plan.element_type;
+        }
         if (iterable_node is some node_id) {
             self.type_ops.add_node_error(
                 node_id,
-                "for-in currently requires a range, array, or slice iterable",
+                "for-in requires a range, array, slice, or Sequence iterable",
                 "for_iterable_type_mismatch"
             );
         }
         return self.state.store.types.invalid_type();
+    }
+
+    typeck_store.ForLoopSequencePlan? sequence_for_loop_plan(qid.TypeId iterable_type, qid.DefId use_owner) {
+        guard self.state.store.resolve.core_traits.sequence_trait is some sequence_def else { return null; }
+        if (!self.type_satisfies_trait(iterable_type, sequence_def, use_owner)) { return null; }
+        guard self.sequence_plan_parts(iterable_type, sequence_def) is some parts else { return null; }
+        return typeck_store.ForLoopSequencePlan (
+            iterator_type: parts.iterator_type,
+            element_type: parts.element_type,
+            make_iterator_def: parts.make_iterator_def,
+            next_def: parts.next_def
+        );
+    }
+
+    typeck_store.ForLoopSequencePlan? sequence_plan_parts(qid.TypeId iterable_type, qid.DefId sequence_def) {
+        guard self.associated_type_for_trait(iterable_type, sequence_def, "Element") is some element_type else {
+            return null;
+        }
+        guard self.associated_type_for_trait(iterable_type, sequence_def, "Iter") is some iterator_type else {
+            return null;
+        }
+        guard self.impl_method_for_trait(iterable_type, sequence_def, "make_iterator") is some make_iterator_def else {
+            return null;
+        }
+        guard self.iterator_next_def(iterator_type) is some next_def else { return null; }
+        self.check_iterator_next_result(next_def, element_type);
+        return typeck_store.ForLoopSequencePlan (
+            iterator_type: iterator_type,
+            element_type: element_type,
+            make_iterator_def: make_iterator_def,
+            next_def: next_def
+        );
+    }
+
+    qid.TypeId? associated_type_for_trait(qid.TypeId type_id, qid.DefId trait_def, UInt8[]& name) {
+        guard self.trait_member_def(trait_def, name, .type_name) is some trait_assoc else { return null; }
+        guard self.named_def_for_type(type_id) is some impl_def else { return null; }
+        guard self.member_impl_for_trait_member(impl_def, trait_assoc, .type_name) is some impl_assoc else {
+            return null;
+        }
+        return self.type_ops.type_for_def(impl_assoc);
+    }
+
+    qid.DefId? impl_method_for_trait(qid.TypeId type_id, qid.DefId trait_def, UInt8[]& name) {
+        guard self.trait_member_def(trait_def, name, .value_name) is some trait_method else { return null; }
+        guard self.named_def_for_type(type_id) is some impl_def else { return null; }
+        return self.member_impl_for_trait_member(impl_def, trait_method, .value_name);
+    }
+
+    qid.DefId? iterator_next_def(qid.TypeId iterator_type) {
+        guard self.state.store.resolve.core_traits.iterator_trait is some iterator_def else { return null; }
+        return self.impl_method_for_trait(iterator_type, iterator_def, "next");
+    }
+
+    () check_iterator_next_result(qid.DefId next_def, qid.TypeId element_type) {
+        qid.TypeId expected = self.state.store.types.optional_type(element_type, token.Span());
+        qid.TypeId actual = self.type_ops.type_for_def(next_def);
+        types.TypeInfo info = self.state.store.types.get(actual);
+        guard info.data is .function_type(function_type) else { return; }
+        if (self.type_ops.same_type_ignoring_mutability(function_type.result, expected)) { return; }
+        self.type_ops.add_def_error(next_def, "Iterator.next result must be Element?", "iterator_next_result_mismatch");
+    }
+
+    qid.DefId? trait_member_def(qid.DefId trait_def, UInt8[]& name, def.NameDomain domain) {
+        guard self.state.store.defs.get(trait_def).owned_namespace_id is some namespace_id else { return null; }
+        qid.SymbolId symbol = self.state.store.symbols.intern(name);
+        guard self.state.store.resolve.namespaces.first_binding(namespace_id, symbol, domain) is some binding else {
+            return null;
+        }
+        return binding.def_id;
+    }
+
+    qid.DefId? named_def_for_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .named(named) else { return null; }
+        return named.def_id;
     }
 
     qid.TypeId check_range_expr(hir.HirId node_id, hir.HirRange range_expr) {
