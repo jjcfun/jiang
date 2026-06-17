@@ -1485,7 +1485,10 @@ struct BodyLowerer: Movable {
         if (pattern_node.data is .optional_pattern(_)) {
             return self.lower_optional_pattern_condition(node_id, is_pattern);
         }
-        if (pattern_node.data is .variant_pattern(_)) {
+        if (pattern_node.data is .variant_pattern(variant_pattern)) {
+            if (self.variant_pattern_is_optional(variant_pattern, self.type_for_node(is_pattern.value))) {
+                return self.lower_optional_variant_pattern_condition(node_id, is_pattern, variant_pattern);
+            }
             return self.lower_variant_pattern_condition(node_id, is_pattern);
         }
         if (pattern_node.data is .wildcard_pattern) {
@@ -1529,6 +1532,41 @@ struct BodyLowerer: Movable {
         );
     }
 
+    lower_support.IfConditionLowerResult lower_optional_variant_pattern_condition(
+        hir.HirId node_id,
+        hir.HirIsPattern is_pattern,
+        hir.HirVariantPattern variant_pattern
+    ) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirPlace subject_place = self.optional_variant_pattern_subject_place(is_pattern, variant_pattern, span);
+        qid.TypeId subject_type = self.pattern_subject_type(self.type_for_node(is_pattern.value));
+        mir.MirLocalId condition_local = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(condition_local),
+            mir.optional_rvalue(mir.MirOptionalRvalue (
+                op: mir.MirOptionalOp.is_some,
+                value: mir.copy_operand_value(mir.MirCopyOperand (place: subject_place))
+            )),
+            span
+        );
+        if (self.optional_variant_pattern_is_none(variant_pattern)) {
+            self.push_assign(
+                self.place_for_local(condition_local),
+                mir.unary_rvalue(mir.MirUnaryRvalue (
+                    op: mir.MirUnaryOp.logic_not,
+                    value: mir.copy_operand_value(mir.MirCopyOperand (place: self.place_for_local(condition_local)))
+                )),
+                span
+            );
+        }
+        return lower_support.IfConditionLowerResult (
+            condition: mir.copy_operand_value(mir.MirCopyOperand (place: self.place_for_local(condition_local))),
+            pattern_id: is_pattern.pattern,
+            subject_place: subject_place,
+            subject_type: subject_type
+        );
+    }
+
     mir.MirPlace optional_pattern_subject_place(hir.HirIsPattern is_pattern, token.Span span) {
         qid.TypeId value_type = self.type_for_node(is_pattern.value);
         if (self.optional_pattern_has_borrow_binding(is_pattern.pattern)) {
@@ -1547,6 +1585,31 @@ struct BodyLowerer: Movable {
         guard pattern_node.data is .optional_pattern(optional_pattern) else { return false; }
         guard optional_pattern.nested is some nested else { return false; }
         hir.HirNode nested_node = self.lowerer.hirs.node(nested);
+        guard nested_node.data is .binding_pattern(binding) else { return false; }
+        hir.HirLocal local = self.hir_local(binding.local_id);
+        return local.borrow_binding;
+    }
+
+    mir.MirPlace optional_variant_pattern_subject_place(
+        hir.HirIsPattern is_pattern,
+        hir.HirVariantPattern variant_pattern,
+        token.Span span
+    ) {
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        if (self.optional_variant_pattern_has_borrow_binding(variant_pattern)) {
+            if (self.place_for_expr(is_pattern.value) is some place) {
+                return self.pattern_subject_place_for_value(place, value_type);
+            }
+        }
+        mir.MirLocalId subject_local = self.add_temp(value_type, span);
+        mir.MirPlace! subject_place = self.place_for_local(subject_local);
+        self.lower_into_place(is_pattern.value, subject_place);
+        return self.pattern_subject_place_for_value(subject_place, value_type);
+    }
+
+    Bool optional_variant_pattern_has_borrow_binding(hir.HirVariantPattern variant_pattern) {
+        if (variant_pattern.payload.length != 1) { return false; }
+        hir.HirNode nested_node = self.lowerer.hirs.node(variant_pattern.payload[0]);
         guard nested_node.data is .binding_pattern(binding) else { return false; }
         hir.HirLocal local = self.hir_local(binding.local_id);
         return local.borrow_binding;
@@ -1669,11 +1732,53 @@ struct BodyLowerer: Movable {
             return;
         }
         if (pattern_node.data is .variant_pattern(variant_pattern)) {
+            if (self.variant_pattern_is_optional(variant_pattern, condition.subject_type)) {
+                self.lower_optional_variant_condition_binding(variant_pattern, subject_place, condition_locals);
+                return;
+            }
             if (variant_pattern.payload.length != 0) {
                 self.lower_variant_payload_binding(pattern_id, subject_place, condition.subject_type, condition_locals);
             }
             return;
         }
+    }
+
+    () lower_optional_variant_condition_binding(
+        hir.HirVariantPattern variant_pattern,
+        mir.MirPlace subject_place,
+        list.ArrayList<mir.MirLocalId>& condition_locals
+    ) {
+        if (self.optional_variant_pattern_is_none(variant_pattern)) { return; }
+        if (variant_pattern.payload.length != 1) { return; }
+        self.lower_optional_pattern_binding(
+            variant_pattern.payload[0],
+            subject_place,
+            condition_locals
+        );
+    }
+
+    Bool variant_pattern_is_optional(hir.HirVariantPattern variant_pattern, qid.TypeId value_type) {
+        qid.TypeId subject_type = self.pattern_subject_type(value_type);
+        types.TypeInfo subject_info = self.lowerer.ctx.store.types.get(subject_type);
+        if (!(subject_info.data is .optional(_))) { return false; }
+        guard variant_pattern.member_symbol is some symbol else { return false; }
+        UInt8[]& name = self.lowerer.ctx.store.symbols.text(symbol);
+        return self.string_equal(name, "some") || self.string_equal(name, "none");
+    }
+
+    Bool optional_variant_pattern_is_none(hir.HirVariantPattern variant_pattern) {
+        guard variant_pattern.member_symbol is some symbol else { return false; }
+        return self.string_equal(self.lowerer.ctx.store.symbols.text(symbol), "none");
+    }
+
+    Bool string_equal(UInt8[]& lhs, UInt8[]& rhs) {
+        if (lhs.length != rhs.length) { return false; }
+        Int! index = 0;
+        while (index < lhs.length) {
+            if (lhs[index] != rhs[index]) { return false; }
+            index = index + 1;
+        }
+        return true;
     }
 
     () lower_optional_pattern_binding(
@@ -2613,6 +2718,10 @@ struct BodyLowerer: Movable {
     }
 
     () lower_new_value(hir.HirId node_id, hir.HirUnary unary, mir.MirPlace destination) {
+        if (self.place_is_owned_unsized_array(destination)) {
+            self.lower_owned_unsized_array_new(node_id, unary.value, destination);
+            return;
+        }
         token.Span span = self.lowerer.hir_span(node_id);
         self.push_assign(
             destination,
@@ -2622,6 +2731,102 @@ struct BodyLowerer: Movable {
         // `new T(expr)` 的 initializer 必须直接写进 heap pointee。不能先把
         // 拥有资源的 aggregate 构造成 rvalue 再复制到 heap，否则会破坏所有权。
         self.lower_into_place(unary.value, self.project_deref(destination, false));
+    }
+
+    () lower_owned_unsized_array_new(hir.HirId node_id, hir.HirId value_id, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId element_type = self.owned_unsized_array_element_type(self.mir_place_type(destination));
+        Int count = self.owned_unsized_array_initializer_count(value_id);
+        self.push_assign(
+            destination,
+            mir.alloc_array_rvalue(mir.MirAllocArrayRvalue (
+                element_type: element_type,
+                count: self.int_operand(count, span)
+            )),
+            span
+        );
+
+        hir.HirNode value = self.lowerer.hirs.node(value_id);
+        if (value.data is .array_literal(array_literal)) {
+            self.lower_owned_unsized_array_literal(array_literal, destination, element_type, span);
+            return;
+        }
+        if (value.data is .literal(literal)) {
+            if (literal.value is .string_value(symbol_id)) {
+                self.lower_owned_unsized_string_literal(symbol_id, destination, element_type, span);
+                return;
+            }
+        }
+        self.mark_unsupported(value_id);
+    }
+
+    () lower_owned_unsized_array_literal(
+        hir.HirArrayLiteral literal,
+        mir.MirPlace destination,
+        qid.TypeId element_type,
+        token.Span span
+    ) {
+        Int! index = 0;
+        while (index < literal.items.length) {
+            mir.MirPlace element_place = self.project_runtime_index(destination, index, span);
+            self.lower_into_place_as_type(literal.items[index], element_place, element_type);
+            index = index + 1;
+        }
+    }
+
+    () lower_owned_unsized_string_literal(
+        qid.SymbolId symbol_id,
+        mir.MirPlace destination,
+        qid.TypeId element_type,
+        token.Span span
+    ) {
+        UInt8[]& text = self.lowerer.ctx.store.symbols.text(symbol_id);
+        Int! index = 0;
+        while (index < text.length) {
+            self.push_assign(
+                self.project_runtime_index(destination, index, span),
+                self.uint8_rvalue(Int(text[index]), span),
+                span
+            );
+            index = index + 1;
+        }
+    }
+
+    Int owned_unsized_array_initializer_count(hir.HirId value_id) {
+        hir.HirNode value = self.lowerer.hirs.node(value_id);
+        if (value.data is .array_literal(array_literal)) {
+            return array_literal.items.length;
+        }
+        if (value.data is .literal(literal)) {
+            if (literal.value is .string_value(symbol_id)) {
+                return self.lowerer.ctx.store.symbols.text(symbol_id).length;
+            }
+        }
+        return 0;
+    }
+
+    mir.MirPlace project_runtime_index(mir.MirPlace base, Int offset, token.Span span) {
+        mir.MirLocalId index_local = self.add_temp(self.lowerer.ctx.store.types.int_type(), span);
+        self.push_assign(self.place_for_local(index_local), self.int_const_rvalue(offset, span), span);
+        return self.project_index(base, index_local);
+    }
+
+    qid.TypeId owned_unsized_array_element_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        guard element_info.data is .unsized_array_type(array_type) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        return array_type.element;
+    }
+
+    Bool place_is_owned_unsized_array(mir.MirPlace place) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.mir_place_type(place));
+        guard info.data is .handle_type(handle) else { return false; }
+        return self.handle_is_owned_unsized_array(handle);
     }
 
     () lower_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
@@ -4493,12 +4698,23 @@ struct BodyLowerer: Movable {
     qid.TypeId pointer_like_element_type(qid.TypeId type_id) {
         types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
         if (info.data is .handle_type(handle)) {
+            if (self.handle_is_owned_unsized_array(handle)) {
+                return self.owned_unsized_array_handle_element_type(handle);
+            }
             return handle.element;
         }
         if (info.data is .array_type(array_type)) {
             return array_type.element;
         }
         return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    qid.TypeId owned_unsized_array_handle_element_type(types.HandleType handle) {
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        guard element_info.data is .unsized_array_type(array_type) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        return array_type.element;
     }
 
     Int? layout_field_index_for_def(qid.TypeId owner_type, qid.DefId field_def) {
@@ -4522,7 +4738,14 @@ struct BodyLowerer: Movable {
         qid.TypeId base_type = self.type_for_node(member_access.base);
         types.TypeInfo info = self.lowerer.ctx.store.types.get(base_type);
         guard info.data is .handle_type(handle) else { return false; }
-        return handle.kind == .slice;
+        if (handle.kind == .slice) { return true; }
+        return self.handle_is_owned_unsized_array(handle);
+    }
+
+    Bool handle_is_owned_unsized_array(types.HandleType handle) {
+        if (handle.kind != .owner_pointer) { return false; }
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        return element_info.data is .unsized_array_type(_);
     }
 
     Bool symbol_text_equal(qid.SymbolId symbol, UInt8[]& text) {
@@ -6105,6 +6328,20 @@ struct BodyLowerer: Movable {
 
     mir.MirRvalue int_const_rvalue(Int value, token.Span span) {
         return mir.use_rvalue(mir.MirUseRvalue (value: mir.const_operand_value(self.int_const(value, span))));
+    }
+
+    mir.MirOperand int_operand(Int value, token.Span span) {
+        return mir.const_operand_value(self.int_const(value, span));
+    }
+
+    mir.MirRvalue uint8_rvalue(Int value, token.Span span) {
+        return mir.use_rvalue(mir.MirUseRvalue (
+            value: mir.const_operand_value(mir.MirConst (
+                type_id: self.lowerer.ctx.store.types.uint8_type(),
+                span: span,
+                value: mir.int_const_kind(mir.MirIntConst (bits: UInt64(value), signed_value: false))
+            ))
+        ));
     }
 
     mir.MirRvalue bool_rvalue(Bool value, token.Span span) {

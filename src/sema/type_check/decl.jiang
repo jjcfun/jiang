@@ -33,6 +33,7 @@ public struct DeclCheck: Movable {
     public () check_declaration_signatures() {
         // 第一遍只检查声明签名和类型引用，不进入函数体。这样函数体
         // type check 时可以跨 module 读取已绑定的 DefId -> TypeId。
+        self.check_builtin_declaration_signatures();
         Int! module_index = 0;
         while (module_index < self.state.graph.module_count()) {
             qid.ModuleId module_id = self.state.graph.module_at(module_index);
@@ -40,6 +41,27 @@ public struct DeclCheck: Movable {
             self.check_declaration_signature_tree(module.def_id);
             module_index = module_index + 1;
         }
+    }
+
+    () check_builtin_declaration_signatures() {
+        self.check_builtin_declaration_signature("String");
+        self.check_builtin_declaration_signature("Iterator");
+        self.check_builtin_declaration_signature("Sequence");
+    }
+
+    () check_builtin_declaration_signature(UInt8[]& name) {
+        qid.SymbolId symbol = self.state.store.symbols.intern(name);
+        guard self.state.store.resolve.first_binding(
+            self.state.store.resolve.builtin_namespace,
+            symbol,
+            .type_name
+        ) is some binding else {
+            return;
+        }
+        if (!self.state.hirs.has_def(binding.def_id)) {
+            return;
+        }
+        self.check_declaration_signature_tree(binding.def_id);
     }
 
     () check_declaration_signature_tree(qid.DefId def_id) {
@@ -646,7 +668,12 @@ public struct DeclCheck: Movable {
         Int! index = 0;
         while (index < trait_signature.params.length) {
             qid.TypeId raw_trait_param = self.type_ops.check_type_ref(trait_signature.params[index]);
-            qid.TypeId trait_param = self.type_ops.substitute_self_type(raw_trait_param, trait_def, self_type);
+            qid.TypeId trait_param = self.substitute_trait_signature_type(
+                raw_trait_param,
+                trait_def,
+                impl_def,
+                self_type
+            );
             qid.TypeId impl_param = self.type_ops.check_type_ref(impl_signature.params[index]);
             if (!self.type_ops.same_type_ignoring_mutability(trait_param, impl_param)) {
                 return false;
@@ -654,9 +681,51 @@ public struct DeclCheck: Movable {
             index = index + 1;
         }
         qid.TypeId raw_trait_result = self.type_ops.check_type_ref(trait_signature.result);
-        qid.TypeId trait_result = self.type_ops.substitute_self_type(raw_trait_result, trait_def, self_type);
+        qid.TypeId trait_result = self.substitute_trait_signature_type(
+            raw_trait_result,
+            trait_def,
+            impl_def,
+            self_type
+        );
         qid.TypeId impl_result = self.type_ops.check_type_ref(impl_signature.result);
         return self.type_ops.same_type_ignoring_mutability(trait_result, impl_result);
+    }
+
+    qid.TypeId substitute_trait_signature_type(
+        qid.TypeId type_id,
+        qid.DefId trait_def,
+        qid.DefId impl_def,
+        qid.TypeId self_type
+    ) {
+        qid.TypeId self_substituted = self.type_ops.substitute_self_type(type_id, trait_def, self_type);
+        return self.substitute_trait_associated_type(self_substituted, trait_def, impl_def);
+    }
+
+    qid.TypeId substitute_trait_associated_type(qid.TypeId type_id, qid.DefId trait_def, qid.DefId impl_def) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (info.data is .named(named)) {
+            if (!self.abstract_associated_type_belongs_to_trait(named.def_id, trait_def)) {
+                return type_id;
+            }
+            guard self.member_impl_for_trait_member(impl_def, named.def_id, .type_name) is some impl_assoc else {
+                return type_id;
+            }
+            return self.type_ops.type_for_decl_def(impl_assoc);
+        }
+        if (info.data is .optional(optional)) {
+            qid.TypeId element = self.substitute_trait_associated_type(optional.element, trait_def, impl_def);
+            return self.state.store.types.optional_type(element, token.Span());
+        }
+        return type_id;
+    }
+
+    Bool abstract_associated_type_belongs_to_trait(qid.DefId assoc_def, qid.DefId trait_def) {
+        def.DefRecord record = self.state.store.defs.get(assoc_def);
+        if (record.kind != .associated_type_def) { return false; }
+        guard record.owner_def is some owner_def else { return false; }
+        if (owner_def != trait_def) { return false; }
+        guard self.state.hirs.def(assoc_def) is some hir_def else { return false; }
+        return hir_def.decl.type_ref == null;
     }
 
     qid.TypeId impl_self_type(qid.DefId impl_def) {
@@ -715,6 +784,15 @@ public struct DeclCheck: Movable {
             self.check_associated_type_impl_bound(impl_assoc, impl_type, trait_assoc_hir.trait_refs.get(index));
             index = index + 1;
         }
+        index = 0;
+        while (index < trait_assoc_hir.where_predicates.len()) {
+            self.check_associated_type_impl_where_predicate(
+                impl_assoc,
+                impl_type,
+                trait_assoc_hir.where_predicates.get(index)
+            );
+            index = index + 1;
+        }
     }
 
     () check_associated_type_impl_bound(qid.DefId impl_assoc, qid.TypeId impl_type, hir.HirId trait_ref) {
@@ -730,6 +808,76 @@ public struct DeclCheck: Movable {
                 "associated_type_bound_not_satisfied"
             );
         }
+    }
+
+    () check_associated_type_impl_where_predicate(
+        qid.DefId impl_assoc,
+        qid.TypeId impl_type,
+        hir.HirWherePredicate predicate
+    ) {
+        if (predicate is .projection_equal(equal)) {
+            self.check_associated_type_impl_projection_equal(impl_assoc, impl_type, equal);
+        }
+    }
+
+    () check_associated_type_impl_projection_equal(
+        qid.DefId impl_assoc,
+        qid.TypeId impl_type,
+        hir.HirWhereProjectionEqual equal
+    ) {
+        guard self.trait_associated_type_def(equal.trait_ref, equal.assoc_symbol) is some projected_assoc else {
+            return;
+        }
+        guard self.impl_type_associated_type(impl_type, projected_assoc) is some projected_type else {
+            self.type_ops.add_def_error(
+                impl_assoc,
+                "associated type implementation does not satisfy trait bound",
+                "associated_type_bound_not_satisfied"
+            );
+            return;
+        }
+        qid.TypeId expected_type = self.type_ops.check_type_ref(equal.value);
+        if (self.type_ops.is_invalid_type(expected_type) || self.type_ops.is_invalid_type(projected_type)) {
+            return;
+        }
+        if (!self.type_ops.same_type_ignoring_mutability(projected_type, expected_type)) {
+            self.type_ops.add_def_error(
+                impl_assoc,
+                "associated type implementation does not satisfy trait bound",
+                "associated_type_bound_not_satisfied"
+            );
+        }
+    }
+
+    qid.DefId? trait_associated_type_def(hir.HirId trait_ref, qid.SymbolId assoc_symbol) {
+        hir.HirNode node = self.state.hirs.node(trait_ref);
+        guard node.data is .named_type_ref(named) else { return null; }
+        if (self.state.store.defs.get(named.def_id).kind != .trait_def) {
+            return null;
+        }
+        guard self.state.store.defs.get(named.def_id).owned_namespace_id is some namespace_id else {
+            return null;
+        }
+        guard self.state.store.resolve.namespaces.first_binding(namespace_id, assoc_symbol, .type_name)
+            is some binding else {
+            return null;
+        }
+        if (self.state.store.defs.get(binding.def_id).kind != .associated_type_def) {
+            return null;
+        }
+        return binding.def_id;
+    }
+
+    qid.TypeId? impl_type_associated_type(qid.TypeId impl_type, qid.DefId trait_assoc) {
+        if (self.type_ops.is_invalid_type(impl_type)) {
+            return null;
+        }
+        types.TypeInfo info = self.state.store.types.get(impl_type);
+        guard info.data is .named(named) else { return null; }
+        guard self.member_impl_for_trait_member(named.def_id, trait_assoc, .type_name) is some impl_assoc else {
+            return null;
+        }
+        return self.type_ops.type_for_decl_def(impl_assoc);
     }
 
     Bool type_satisfies_trait(qid.TypeId type_id, qid.DefId trait_def) {

@@ -1058,24 +1058,30 @@ public struct Parser: Movable {
 
     ast.AstId? parse_trait_member() {
         token.Token start = self.peek();
+        Int annotation_start = self.temp.len();
+        self.parse_annotations();
         ast.MemberModifiers modifiers = self.parse_member_modifiers();
         Bool! static_flag = modifiers.static_flag;
         ast.AstId?! body = null;
-        if (self.check_keyword(.kw_associated)) { return self.parse_associated_type_decl(); }
-        if (self.check_keyword(.kw_static)) {
-            self.advance();
-            static_flag = true;
+        if (self.check_keyword(.kw_associated)) {
+            body = self.parse_associated_type_decl();
+        } else {
+            if (self.check_keyword(.kw_static)) {
+                self.advance();
+                static_flag = true;
+            }
+            body = self.parse_function_decl();
         }
-        body = self.parse_function_decl();
         guard body is some parsed else { return null; }
-        ast.MemberModifiers effective_modifiers = ast.MemberModifiers (
+        ast.AstRange annotations = self.take_children(annotation_start);
+        ast.MemberModifiers effective_modifiers = ast.MemberModifiers(
             public_flag: modifiers.public_flag,
             static_flag: static_flag
         );
         return self.member_decl_node(
             self.span_from(start.span, self.unit.get(parsed).span),
             effective_modifiers,
-            self.empty_range(),
+            annotations,
             parsed
         );
     }
@@ -1197,15 +1203,15 @@ public struct Parser: Movable {
     }
 
     ast.AstId parse_ambiguous_stmt_type() {
-        // block 里的声明和表达式共享起点；这里不能把 `??` 当作
-        // repeated optional 后缀消费，否则 `value ?? fallback;` 会被
-        // var-decl probe 误解析成 `value?? fallback;`。
+        // block 里的声明和表达式共享起点；这里不能把 `??` 直接当作
+        // optional 后缀消费，否则 `value ?? fallback;` 会被 var-decl probe
+        // 误解析成 `value?? fallback;`。声明恢复点会在看到 decl name 后
+        // 再把 `??` 补成两层 optional。
         return self.parse_type_impl(false);
     }
 
     ast.AstId parse_type_impl(Bool recover_double_question) {
         ast.AstId! result = self.parse_type_primary();
-        Bool! seen_optional = false;
         Bool! seen_mutable = false;
         // `^`/`&` 是语言级 ownership/reference handle，不能和其他 handle 叠加。
         // raw pointer、many pointer 和 slice 允许叠加，用来表达 C ABI 指针层级。
@@ -1214,24 +1220,18 @@ public struct Parser: Movable {
         while (true) {
             if (recover_double_question && seen_mutable && self.match_type_postfix(.question_question)) {
                 self.add_optional_after_mutable_type_error();
-                seen_optional = true;
                 continue;
             }
             if (recover_double_question && self.match_type_postfix(.question_question)) {
-                self.add_repeated_optional_type_error();
-                seen_optional = true;
+                result = self.type_layer_node(result, .optional);
+                result = self.type_layer_node(result, .optional);
                 continue;
             }
             if (seen_mutable && self.match_type_postfix(.question)) {
                 self.add_optional_after_mutable_type_error();
                 continue;
             }
-            if (seen_optional && self.match_type_postfix(.question)) {
-                self.add_repeated_optional_type_error();
-                continue;
-            }
             if (self.match_type_postfix(.question)) {
-                seen_optional = true;
                 result = self.type_layer_node(result, .optional);
                 continue;
             }
@@ -1256,16 +1256,20 @@ public struct Parser: Movable {
                 result = self.type_layer_node(result, .reference);
                 // `&`/`^`/`*`/`[]` 会创建新的外层 type layer；前一层已经
                 // 看到的 `?`/`!` 不能影响新外层的后缀检查。
-                seen_optional = false;
                 seen_mutable = false;
                 continue;
             }
             if (self.match_type_postfix(.caret)) {
-                if (seen_any_handle) { self.add_invalid_handle_type_error(); }
+                // `T[]^` 是 owned unsized array 的表面语法。`T[]` 自身是
+                // unsized pointee，不是 borrowed slice handle；允许 `^`
+                // 接在这一层之后，后续 type check 保留为 owner pointer
+                // to unsized array。其他 handle 组合仍然非法。
+                if (seen_any_handle && !self.type_ref_is_slice_layer(result)) {
+                    self.add_invalid_handle_type_error();
+                }
                 seen_any_handle = true;
                 seen_restricted_handle = true;
                 result = self.type_layer_node(result, .owner_pointer);
-                seen_optional = false;
                 seen_mutable = false;
                 continue;
             }
@@ -1273,7 +1277,6 @@ public struct Parser: Movable {
                 if (seen_restricted_handle) { self.add_invalid_handle_type_error(); }
                 seen_any_handle = true;
                 result = self.type_layer_node(result, .raw_pointer);
-                seen_optional = false;
                 seen_mutable = false;
                 continue;
             }
@@ -1283,7 +1286,6 @@ public struct Parser: Movable {
                     seen_any_handle = true;
                 }
                 result = self.finish_type_bracket(result);
-                seen_optional = false;
                 seen_mutable = false;
                 continue;
             }
@@ -1317,14 +1319,6 @@ public struct Parser: Movable {
             "optional_after_mutable_type",
             "optional suffix cannot follow mutable suffix",
             "put ? before !, for example Int?!"
-        );
-    }
-
-    () add_repeated_optional_type_error() {
-        self.add_type_postfix_error(
-            "repeated_optional_type",
-            "optional suffix cannot be repeated",
-            "remove the extra ?"
         );
     }
 
@@ -1723,10 +1717,12 @@ public struct Parser: Movable {
         if (!self.can_start_type()) { return null; }
         ast.AstId type_ref = self.parse_ambiguous_stmt_type();
         if (self.match(.question_question)) {
-            // block 里 `T?? name;` 和 coalesce expr-stmt 共享 token 形态。
-            // 由于普通 expr-stmt 已被禁用，这里优先按声明恢复并给出类型后缀诊断。
-            self.add_repeated_optional_type_error();
-            return self.finish_var_decl_stmt(type_ref);
+            ast.AstId nested_type_ref = self.double_optional_type_ref(type_ref);
+            if (self.can_start_decl_name() || self.current_token_is_reserved_keyword()) {
+                return self.finish_var_decl_stmt(nested_type_ref);
+            }
+            self.error_at_current("expected_decl_name", .ident);
+            return self.finish_var_decl_stmt(nested_type_ref);
         }
         if (!self.can_start_decl_name()) {
             if (self.current_token_is_reserved_keyword()) {
@@ -1735,6 +1731,10 @@ public struct Parser: Movable {
             return null;
         }
         return self.finish_var_decl_stmt(type_ref);
+    }
+
+    ast.AstId double_optional_type_ref(ast.AstId type_ref) {
+        return self.type_layer_node(self.type_layer_node(type_ref, .optional), .optional);
     }
 
     ast.AstId finish_var_decl_stmt(ast.AstId type_ref) {
@@ -2370,7 +2370,7 @@ public struct Parser: Movable {
             // `.case` pattern 需要显式记录 dot_prefix。不能靠 span 判断，
             // 因为后续 AST 形态调整会让 span 推断变脆。
             token.Span start = self.previous().span;
-            ast.AstId name = self.parse_name();
+            ast.AstId name = self.parse_variant_name();
             ast.AstRange payload = self.parse_pattern_payload_opt();
             return self.node(
                 self.span_from(start, self.unit.get(self.pattern_end(name, payload)).span),
@@ -2450,7 +2450,7 @@ public struct Parser: Movable {
             // match pattern 中的 `.case` 同样保留语法事实，供 type check
             // 根据 scrutinee type 做 owner/member lookup。
             token.Span start = self.previous().span;
-            ast.AstId name = self.parse_name();
+            ast.AstId name = self.parse_variant_name();
             ast.AstRange payload = self.parse_pattern_payload_opt();
             return self.node(
                 self.span_from(start, self.unit.get(self.pattern_end(name, payload)).span),
