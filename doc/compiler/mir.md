@@ -20,6 +20,15 @@ MIR 的输入是 HIR、`TypeCheckStore`、monomorph `MonomorphStore`、`ModuleGr
 MIR 生成完成后，borrow check、drop elaboration 和 backend 会继续把 MIR 与 layout 查询结果
 组合使用。
 
+`$` builtin operation 不在 MIR lowering 中重新按文本猜测。type check 先根据
+`@builtin(value, Pattern)` / `@builtin(type, Pattern)` 的 receiver pattern 和 where 约束
+选出 builtin lowering kind；MIR lowering 只消费这个 side table。带所有权副作用的
+operation 需要显式表达：
+
+- `move`：生成所有权转移，源 place 失效。
+- `forget`：源 place 失效，不生成释放。
+- `free`：生成释放，并使 receiver place 失效。
+
 ## Drop Elaboration
 
 MIR lowering 初始产物只表达源码中已经显式形成的控制流和当前阶段能确定的 drop terminator。

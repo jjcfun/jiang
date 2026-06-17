@@ -65,7 +65,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：resolve facts。
   - 禁止：保存 type check 结果、layout、backend symbol。
 - `type_check`
-  - 生产：`TypeCheckStore`、trait/overload/type facts、const initializer 的 `ComptimeValue`。
+  - 生产：`TypeCheckStore`、trait/overload/type facts、builtin operation lowering kind、
+    const initializer 的 `ComptimeValue`。
   - 消费：HIR、resolve facts。
   - 禁止：改写 HIR、计算 ABI layout、生成 MIR。
 - `comptime`
@@ -78,8 +79,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 禁止：生成目标代码、修改 type facts。
 - `mir`
   - 生产：CFG、local、place、rvalue、terminator。
-  - 消费：HIR、type facts、monomorph、layout query。
-  - 禁止：重新 resolve/type check、写 backend symbol。
+  - 消费：HIR、type facts、builtin operation lowering kind、monomorph、layout query。
+  - 禁止：重新 resolve/type check、按源码文本重新判断 builtin operation、写 backend symbol。
 - `layout`
   - 生产：size、align、field index、ABI representation。
   - 消费：TypeId、type facts、target data layout。
