@@ -85,7 +85,7 @@ decl_modifier
              / "extern"
 
 member_modifier
-            <- "public"
+            <- "public" ("(" "get" ")")?
              / "static"
 
 top_level_decl_body
@@ -171,7 +171,11 @@ default_param
 
 ```peg
 generic_params
-            <- "<" name ("," name)* ","? ">"
+            <- "<" generic_param ("," generic_param)* ","? ">"
+
+generic_param
+            <- "const" type name
+             / name
 
 where_constraints
             <- (where_constraint ("," where_constraint)* ","?)?
@@ -180,6 +184,7 @@ where_constraint
             <- projected_where_constraint
              / name ":" type_bound
              / name "==" type
+             / name "!=" type
 
 projected_where_constraint
             <- name "." "[" path "]" "." name "==" type
@@ -196,7 +201,7 @@ life_name  <- name
 
 type_bound  <- trait_bound ("&" trait_bound)*
 
-trait_bound <- path ("<" trait_bound_arg_list? ">")?
+trait_bound <- "!"? path ("<" trait_bound_arg_list? ">")?
 
 trait_bound_arg_list
             <- trait_bound_arg ("," trait_bound_arg)* ","?
@@ -262,7 +267,7 @@ name        <- ident / "self"
 - `T[N:0]` 表示 sentinel 定长数组语法；完整 array sentinel storage 语义后续补齐。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 
-`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Optional`、`Array`、`UnsizedArray`、`Result` 不会改变这些语法的含义。
+`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`UnsizedArray`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
 
 ## struct
 
@@ -277,7 +282,7 @@ trait_list  <- ":" path ("," path)*
 struct_body <- "{" struct_member* "}"
 
 struct_member
-            <- "public"? struct_member_body
+            <- member_modifier* struct_member_body
 
 struct_member_body
             <- deinit_decl
@@ -308,7 +313,7 @@ field_init  <- name ("=" expr)?
 ```peg
 enum_decl   <- "enum" ("(" type ")")? name trait_list? "{" enum_member* "}"
 
-enum_member <- "public"? "static"? method_decl
+enum_member <- member_modifier* method_decl
              / name ("=" expr)? ("," / ";")?
 ```
 
@@ -326,7 +331,7 @@ union_decl  <- "union" ("(" name ")")? name generic_params? trait_list? union_bo
 union_body  <- "{" union_member* "}"
 
 union_member
-            <- "public"? "static"? method_decl
+            <- member_modifier* method_decl
              / union_variants
 
 union_variants
@@ -345,8 +350,8 @@ trait_decl  <- "trait" name generic_params? (":" path ("," path)*)?
 trait_body  <- "{" trait_member* "}"
 
 trait_member
-            <- associated_type_decl
-             / trait_method_decl
+            <- leading_annotation* member_modifier* associated_type_decl
+             / leading_annotation* member_modifier* trait_method_decl
 
 associated_type_decl
             <- "associated" name (":" type_bound)? ";"
@@ -535,9 +540,11 @@ call_arg    <- (name ":")? expr
 ```peg
 primary_expr
             <- type "$" implicit_call
+             / type "." name
              / literal
              / "self"
              / "$"
+             / "." "(" call_args? ")"
              / path type_args "(" call_args? ")"
              / path
              / "." name

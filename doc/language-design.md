@@ -99,23 +99,23 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T<A, B>`：泛型类型参数。
 - `(A, B)`：tuple type。
 - `T!`：当前类型层级的可变 flag。
-- `T?`：内建 optional 类型层；optional 不是可直接命名的 `Option<T>` 普通泛型类型。
+- `T?`：`Option<T>` 的类型语法糖。
 - `T?!`：optional 类型层可变的规范写法。
-- `T^`：自动解引用的 owning heap pointer，通常来自 `new T(...)`；它不是 C 风格 raw pointer。
-- `T&`：自动解引用的非 owning 引用，不表达释放职责。
+- `T^`：`Box<T>` 的类型语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
+- `T&`：`Reference<T>` 的类型语法糖，表示非 owning 引用，不表达释放职责。
 - `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` 是 unsized array pointee，不能作为普通 value。
 - `T[:0]&`：borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。裸 `T[:0]` 是带 sentinel 的 unsized array pointee，不能作为普通 value；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
-- `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
+- `T[*]`：`ManyPointer<T>` 的类型语法糖，不默认自动解引用，只能通过下标访问元素。
 - `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
-- `T*`：裸指针，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
+- `T*`：`RawPointer<T>` 的类型语法糖，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
-- `T@E`：errorable。
+- `T@E`：`Result<T, E>` 的返回类型语法糖。
 - `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
 - 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
 
-内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Optional<T>`、`Array<T>`、`UnsizedArray<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T@E` 等表面语法。
+内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、`UnsizedArray<T>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的 static extension 方法。
 
 0.2.2 的 sentinel value 只支持整数 literal，element type 必须是整数类型，并且 sentinel value 必须能被 element type 表示。例如 `UInt8[5:0]` 合法，`UInt8[5:300]` 和 `Bool[1:0]` 不合法。HIR 只保留未定型 literal；sema 阶段会将 sentinel 绑定到 element type。
 
@@ -252,7 +252,7 @@ ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明�
 Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、lifetime 和 drop safety。
 这里先固定 pointer/reference 的目标语义：
 
-- `T^`：owning heap pointer，通常来自 `new T(...)`，拥有堆上对象；它不是 C 风格 raw pointer。
+- `T^`：`Box<T>` 的语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
 - `T&`：非 owning 引用，不表达释放职责。通过 `T&` 可以读写目标内部声明为 `!` 的成员。
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
@@ -542,7 +542,7 @@ materialize 成 readonly `MirGlobal`，initializer 用 `MirStaticValue` 表达�
 
 const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
 `recursive_const_initializer`；comptime 函数调用受递归深度和 branch quota 限制，避免编译期执行失控。
-const generic 的语法和 type check 接入暂放到 0.4。
+const generic 参数使用 `const Type Name` 写在泛型参数列表中，例如 `struct Array<T, const Int N>` 或 `Int size<const Int N>() { N }`。const generic 名字是值层参数，可在表达式中使用；不能作为类型名使用。
 
 ### Import
 
@@ -767,7 +767,7 @@ trait Indexable {
 - `Movable` / `Hashable` / `Equatable` 属于 compiler core trait。std prelude 只导出同一个
   DefId；即使后续启用 no-std，它们仍然是语言核心约束。
 
-完整 trait solving、trait method lookup、associated type projection 仍需单独定稿。
+完整 trait solving 仍需继续补齐；trait method lookup 和显式 associated type projection 已进入当前类型检查路径。
 
 未定事项：
 
@@ -803,10 +803,10 @@ T id<T>(T value);
 @where(T: Hashable & Equatable)
 ```
 
-支持 associated type equality constraint；相等关系使用 `==`，不使用赋值语义的 `=`：
+支持类型相等/不等约束、negative trait bound，以及 associated type equality constraint；相等关系使用 `==`，不使用赋值语义的 `=`。associated type projection 需要显式写出 trait，以避免短投影歧义：
 
 ```jiang
-@where(T: Iterable, T.Item == Int)
+@where(T: Sequence, T.[Sequence].Element == Int, T: !Mutable, T != Box<_>)
 ```
 
 当前 AST 使用：
@@ -819,9 +819,9 @@ T id<T>(T value);
 
 ## Optional 和 Errorable
 
-Optional 使用 `T?` 表示。
+Optional 使用 `T?` 表示，也可以显式写作 `Option<T>`。
 
-`?` 是语言内建 optional 类型层，不暴露为可直接命名的 `Option<T>` 普通泛型类型。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
+`?` 是 `Option<T>` 的语法糖。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
 
 重复 optional 标记是语法错误。编译器恢复时可以把 `T??` 当作 `T?` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `!` 也要报错，例如 `T?!?`。`!` 与 `?` 一样属于当前类型层级的 type flag，`Int?!` 表示 optional 层本身可变。
 
@@ -967,36 +967,35 @@ Int x = {
 
 `defer` 在当前块退出时按 LIFO 顺序执行。`defer` 内不支持 `return`、`break`、`continue`。
 
-### For-in 和 Iterable
+### For-in、Sequence 和 Iterator
 
-`for pattern in expr` 的协议名使用 `Iterable`。这个名字描述“某个值可以作为
-for-in 的输入”，不会和真正保存遍历状态的游标混在一起。
+`for pattern in expr` 优先使用 `Sequence`。`Sequence` 描述“某个值可以产生遍历器”，不会和真正保存遍历状态的 `Iterator` 混在一起。
 
-0.2 先支持内建 iterable：
+当前内建 iterable：
 
 - `start..end`：range，左闭右开，item type 是 `Int`。
 - `T[]&`：slice view，item type 是 `T`。
 - `T[N]`：定长数组，item type 是 `T`。
 - `T[*]`：many pointer 不是 iterable；需要遍历时使用 range 产生 index，再用 `p[i]` 访问。
 
-长期自定义遍历协议预留为两层：
+自定义遍历协议分为两层：
 
 ```jiang
-trait IterState {
-    associated Item;
-    Item? next_item();
+trait Iterator {
+    associated Element;
+    Element? next();
 }
 
-trait Iterable {
-    associated Item;
-    associated State: IterState<Item = Item>;
-    State iter();
+trait Sequence {
+    associated Element;
+    associated Iter: Iterator<Element = Element>;
+    Iter make_iterator();
 }
 ```
 
-`IterState` 是有状态游标，`next_item()` 每次返回下一个元素，`none` 表示结束。
-`Iterable` 是容器或视图，`iter()` 产生游标。`for pattern in expr` 的 type check
-负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Item`。MIR
+`Iterator` 是有状态游标，`next()` 每次返回下一个元素，`none` 表示结束。
+`Sequence` 是容器或视图，`make_iterator()` 产生游标。`for pattern in expr` 的 type check
+负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Element`。MIR
 lowering 只消费这个 plan，不在 MIR 阶段重新做 trait lookup。
 
 ## Pattern Matching

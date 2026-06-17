@@ -64,7 +64,7 @@ Int?[2][3] b = [[1, null], [3, 4], [5, 6]]
 
 Int?[2]?[3] c = [[1, null], null, [5, 6]]
 
-// owning heap pointer 同理
+// owning pointer 同理
 Int[3]^ b = new [1, 2, 3]
 
 Int?[3]^ c = new [1, null, 3]
@@ -146,7 +146,7 @@ Float c = two + f;      // 错误：Int 变量不会隐式提升为 Float
 
 ### 可选类型 (Optional)
 
-Optional 是语言内建类型层，使用 `T?` 表示。当前设计不把它暴露为可直接命名的 `Option<T>` 普通泛型类型。
+Optional 使用 `T?` 表示，也可以显式写作 `Option<T>`。`T?` 是 `Option<T>` 的类型语法糖。
 
 ```c
 Int? a1 = 123;
@@ -383,7 +383,7 @@ foo[0][1] // 2
 Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、析构和显式 move 的边界。
 指针语义约定为：
 
-- `T^`：自动解引用的 owning heap pointer，适合 `new T` 这类场景；它不是 C 风格 raw pointer
+- `T^`：`Box<T>` 的语法糖，表示自动解引用的 owning pointer；它不是 C 风格 raw pointer
 - `T&`：自动解引用的非 owning 引用，通常用于引用已有值，不承担释放职责
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
@@ -396,16 +396,16 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 
 #### Pointer / Reference 类型
 
-Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 表示 owning heap pointer 外层，`&` 表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
+Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 是 `Box<T>` 的语法糖，表示 owning pointer 外层；`&` 是 `Reference<T>` 的语法糖，表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
 
 ```c
 // 在栈中开辟内存空间
 Int a = 123;
 
-// new关键字可以在堆中开辟内存空间，并返回一个 owning heap pointer
+// new关键字可以创建拥有所有权的对象，并返回一个 owning pointer
 Int^ b = new Int(123);
 
-// 在堆中创建数组，并返回一个 owning heap pointer
+// 创建数组，并返回一个 owning pointer
 Int[3]^ c = new [1, 2, 3];
 
 // 临时引用
@@ -1630,16 +1630,19 @@ union Result<T, E> {
 Jiang 语言通常以 `<T>` 形式声明泛型参数。
 
 `@where(...)` 是一种编译期约束注解，用于约束其后一个泛型声明中的类型参数。  
-当前 `@where(...)` 支持两类约束项：
+当前 `@where(...)` 支持以下约束项：
 
 - `Name: Trait`
+- `Name: !Trait`
 - `Name: Trait<Assoc = Type>`
 - `Name: TraitA & TraitB & TraitC`
 - `Name == Type`
+- `Name != Type`
+- `Name.[Trait].Assoc == Type`
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
-关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Iterable<Item = Int>)`。
+关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Sequence<Element = Int>)`；需要单独写 projection equality 时，使用显式 trait 投影，例如 `@where(T.[Sequence].Element == Int)`。
 例如：
 
 ```c
@@ -1805,9 +1808,9 @@ Int b = counter.apply(true);
 trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
 
 ```c
-trait Iterable {
-  associated Item;
-  Item next_item();
+trait Iterator {
+  associated Element;
+  Element? next();
 }
 ```
 
@@ -1823,13 +1826,14 @@ trait HasItem {
 子 trait 会自动继承父 trait 的关联类型，并可以继续对它加约束：
 
 ```c
-trait Iterable {
-  associated Item;
-  Item next_item();
+trait Sequence {
+  associated Element;
+  associated Iter: Iterator<Element = Element>;
+  Iter make_iterator();
 }
 
-@where(Item == UInt8)
-trait ByteIterable: Iterable {
+@where(Iter.[Iterator].Element == Element)
+trait ByteSequence: Sequence {
   Int next_int();
 }
 ```
@@ -1899,15 +1903,15 @@ struct Box: HasValue {
 类型实现带关联类型的 trait 时，需要在实现体中显式绑定关联类型：
 
 ```c
-trait Iterable {
-  associated Item;
-  Item next_item();
+trait Iterator {
+  associated Element;
+  Element? next();
 }
 
-struct Counter: Iterable {
-  associated Item = UInt8;
+struct Counter: Iterator {
+  associated Element = UInt8;
 
-  UInt8 next_item() {
+  UInt8? next() {
     return 42;
   }
 }
@@ -1945,17 +1949,17 @@ struct Pair: Left, Right {
 同样地，`extend` 中也可以绑定关联类型：
 
 ```c
-trait Iterable {
-  associated Item;
-  Item next_item();
+trait Iterator {
+  associated Element;
+  Element? next();
 }
 
 struct Counter {}
 
-extend Counter: Iterable {
-  associated Item = UInt8;
+extend Counter: Iterator {
+  associated Element = UInt8;
 
-  UInt8 next_item() {
+  UInt8? next() {
     return 42;
   }
 }
@@ -1995,12 +1999,15 @@ extend User: HasValue {
 - `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式
+- `extend Holder<T>` / `extend Box<T>` 可以声明 generic receiver extension；`extend Holder<Int>` 这类 specialized target 暂不支持，使用 `@where(T == Int) extend Holder<T> { ... }`
+- `T^` / `T&` / `T*` / `T[*]` 等 type-layer 语法糖作为类型 receiver 时，会按对应具名 builtin owner 查找 extension，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的方法
+- `public extend` 可以跨模块传播；普通 `extend` 只在声明模块和直接导入者可见。`public import` 会继续 re-export imported module 的 public extensions
 - union variant name 和同一 union 的 method name 不能重名，避免 `Union.member(...)` 歧义
 - 同名 method 可以 overload，但参数数量或参数类型必须不同
 - `extend Type: Trait { ... }` 会做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现
 - 不支持 `init`
 - 不支持 `deinit`
-- 完整 trait solving、trait method lookup、associated type projection 后续实现
+- 完整 trait solving 仍需继续补齐
 
 ### 模块（Module）
 
