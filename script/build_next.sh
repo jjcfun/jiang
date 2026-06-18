@@ -24,10 +24,10 @@ if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
 case "$BOOTSTRAP_VERSION" in
-  "jiang 0.3.1"|"jiang 0.3.2") ;;
+  "jiang 0.3.1"|"jiang 0.3.2"|"jiang 0.3.3") ;;
   *)
     echo "unsupported bootstrap compiler: $BOOTSTRAP_VERSION" >&2
-    echo "install Jiang 0.3.1 or 0.3.2 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
+    echo "install Jiang 0.3.1, 0.3.2, or 0.3.3 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
     exit 2
     ;;
 esac
