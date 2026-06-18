@@ -33,7 +33,7 @@ test/lang/<feature>/
 
 ## 当前功能矩阵
 
-详细覆盖状态见 `doc/compiler/lang-coverage.md`。0.2 需要优先覆盖这些 feature：
+详细覆盖状态见 `doc/compiler/lang-coverage.md`。当前 release 需要优先覆盖这些 feature：
 
 - `literal`：integer/float/char/string/bool/null，expected type 转换，sentinel 字符串与 UInt8[:0]&、UInt8[*:0] 兼容语义。
 - `type`：type suffix 顺序、handle 限制、raw pointer/many pointer/slice/array、errorable。
@@ -59,7 +59,7 @@ test/lang/<feature>/
 链接运行。需要覆盖 release object/executable 路径时，设置：
 
 ```bash
-LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/jiangc.stable bash ./script/lang_check.sh
+LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/jiangc bash ./script/lang_check.sh
 ```
 
 这会额外对所有 `run/` 用例执行 `jiangc --mode release -o ...`，覆盖 LLVM codegen opt level 2

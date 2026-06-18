@@ -8,14 +8,14 @@
 - **covered**：已有正例和关键反例。
 - **partial**：已有用例，但还缺边界或交互场景。
 - **missing**：还没有稳定用例。
-- **deferred**：语言规则未定稿，暂不作为 0.2/0.3 验收前置。
+- **deferred**：语言规则未定稿，暂不作为当前 release 验收前置。
 
 ## Grammar Coverage
 
 | Grammar area | Feature dir | Status | Missing cases |
 | --- | --- | --- | --- |
 | literal tokens | `literal` | partial | float 边界、escape 解码语义、非法数字分隔符 |
-| identifier tokens | `import` | covered | 普通 escaped identifier deferred；0.2 只允许 extern symbol name |
+| identifier tokens | `import` | covered | 普通 escaped identifier deferred；当前只允许 extern symbol name |
 | trivia / recovery tokens | `token` | covered | block comment deferred |
 | import / alias | `import`, `package` | covered | package registry/lockfile deferred |
 | top-level global | `import`, `runtime` | partial | global destructure 正反例 |

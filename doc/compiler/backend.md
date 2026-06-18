@@ -53,7 +53,7 @@ hosted `main(argc, argv)`、no-libc `_start` 或 Wasm/Windows 的专用入口，
 `StartupState` 只保存启动瞬间由平台入口交给语言运行时的初始事实；当前包含
 `ProgramArguments`。运行过程中会变化的 process 状态不放进 startup state。
 
-0.3.1 起，`system.process.arguments()` 直接读取 `__jiang_startup_state`。hosted path 仍由
+`system.process.arguments()` 直接读取 `__jiang_startup_state`。hosted path 仍由
 `main(argc, argv)` 接收平台启动参数，但 backend 会在进入 `__jiang_main` 前把 argc/argv 写入
 startup state；system provider 不再通过 `_NSGetArgc/_NSGetArgv` 或平台临时符号读取用户参数。
 
@@ -78,7 +78,7 @@ libc/CRT，再结合用户请求得到 effective link-libc 模式。当前 objec
 `malloc/free` 或 `__jiang_malloc/__jiang_free`；no-libc executable 仍明确诊断为暂不支持。
 
 target-specific linker argv 统一由 `backend/linker.jiang` 生成。pipeline 只负责 executable 支持状态、
-object emission 和 `LinkPlan`，不拼 `-target`、`-isysroot` 等具体 linker 参数。0.3.1 的 target
+object emission 和 `LinkPlan`，不拼 `-target`、`-isysroot` 等具体 linker 参数。当前 target
 支持矩阵见 [Targets](targets.md)。
 
 ## 编译模式

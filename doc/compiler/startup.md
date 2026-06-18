@@ -19,7 +19,7 @@ runtime entry 生成出来，并在函数体开始时写入 `__jiang_startup_sta
 Jiang 源码中的 root module `main` 会被 backend lowering 为 `__jiang_main`。用户源码不直接声明
 `__jiang_main`，也不接收 `argc/argv` 参数。需要启动参数时，通过 `system.process.arguments()` 读取。
 
-0.3.1 支持的 `main` 返回类型：
+当前支持的 `main` 返回类型：
 
 - `()`：进程 exit code 为 0。
 - 整数类型：返回值作为进程 exit code。

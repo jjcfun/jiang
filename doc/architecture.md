@@ -1,6 +1,6 @@
-# Jiang Next 架构
+# Jiang 编译器架构
 
-Jiang Next 编译器围绕稳定的阶段边界组织。本文只保留整体架构、跨阶段边界和目录约定；
+Jiang 编译器围绕稳定的阶段边界组织。本文只保留整体架构、跨阶段边界和目录约定；
 各阶段的详细设计放在对应阶段文档中。
 
 ## 顶层流程
@@ -47,7 +47,7 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 - 每个事实只能有一个 owner store；其他模块只能查询或引用，不能复制一份并长期维护。
 - 每张新增 store 都必须明确 owner、key、value、生命周期和失效条件。
 - `span`、`SourceMap` 和 source offset 只用于诊断定位，不能参与符号身份、重载匹配或缓存 key。
-- stage2 自举修复必须优先修正语义或 IR 边界，不能通过绕过语法、跳过检查或
+- 自举修复必须优先修正语义或 IR 边界，不能通过绕过语法、跳过检查或
   backend 补语义解决。
 
 ### 阶段 Contract
@@ -235,7 +235,7 @@ CompilerStore
 - `MonomorphStore`、`MirStore`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
   调用中的阶段产物。
 - `syntax.Store` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
-- 0.3 再引入 cache-backed query dependency tracking；0.2 不保留未接入的 cache 骨架。
+- cache-backed query dependency tracking 后续按实际 artifact cache 需求继续收敛；当前不保留未接入的 cache 骨架。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `store/api.jiang` 增加高阶查询入口。
 
 ## 源码目录
@@ -321,8 +321,8 @@ public trait Indexable {
 
 ## 测试目录
 
-- `test/smoke/`：当前 stage2 骨架的端到端 smoke，由脚本通过 `JIANGC` 指定编译器；
-  稳定自举验证使用 `build/jiangc.next2` 或 `build/jiangc.stable`。
+- `test/smoke/`：编译器内部模块和端到端 smoke，由脚本通过 `JIANGC` 指定被测编译器；
+  稳定自举验证使用 `build/jiangc.next` 或 `build/jiangc`。
 - `test/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
 - `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。

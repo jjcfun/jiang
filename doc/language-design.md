@@ -3,18 +3,18 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前目标是固定 stage2 / 0.2 需要依赖的语言边界：词法、语法、类型、声明、泛型和
-错误处理。
-未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
+当前 `release/0.4` 分支已经具备自举编译器、标准库孵化入口、泛型/trait 基础、MIR/backend
+和源码级语言测试。本文档描述当前分支希望稳定下来的语言规则；未定设计必须显式标注，避免
+parser、resolve、sema 在隐含假设上继续扩展。
 
 ## 状态标记
 
-本文档只记录目标设计和 stage2 当前设计差异。
+本文档只记录目标设计和当前实现差异。
 为避免混淆，后续章节使用这些状态：
 
 - **目标规则**：希望长期保留的语言规则。
-- **stage2 已定义**：stage2 PEG/AST/骨架已能表达，但还没有完整语义检查。
-- **stage2 缺口**：目标设计需要，但 stage2 尚未实现。
+- **当前已定义**：parser、HIR/type check/MIR/backend 中已经接入并有测试覆盖的规则。
+- **当前缺口**：目标设计需要，但当前实现尚未完整接入。
 - **未定**：设计尚未冻结，不能作为 resolve/sema 的硬前提。
 
 ## 设计目标
@@ -81,7 +81,7 @@ Token 只表示词法事实，不承载语义类型。
 
 字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
-字符串字面量是 UTF-8 字节序列。0.2.2 起，字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8[*:0]` 或 `UInt8[N:0]`。
+字符串字面量是 UTF-8 字节序列。字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8[*:0]` 或 `UInt8[N:0]`。
 
 `UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。新代码使用 `UInt8[:0]&` 表达只读 sentinel slice，使用 `UInt8[*:0]` 表达 C ABI 的 NUL 结尾 many pointer。
 
@@ -117,7 +117,7 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 
 内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的 static extension 方法。
 
-0.2.2 的 sentinel value 只支持整数 literal，element type 必须是整数类型，并且 sentinel value 必须能被 element type 表示。例如 `UInt8[5:0]` 合法，`UInt8[5:300]` 和 `Bool[1:0]` 不合法。HIR 只保留未定型 literal；sema 阶段会将 sentinel 绑定到 element type。
+当前 sentinel value 只支持整数 literal，element type 必须是整数类型，并且 sentinel value 必须能被 element type 表示。例如 `UInt8[5:0]` 合法，`UInt8[5:300]` 和 `Bool[1:0]` 不合法。HIR 只保留未定型 literal；sema 阶段会将 sentinel 绑定到 element type。
 
 示例：
 
@@ -489,7 +489,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
-0.2 阶段 package 默认处在全局 unsafe 模式。隐式操作层的低层操作，尤其是裸指针转换、裸指针取值、
+当前 package 默认处在全局 unsafe 模式。隐式操作层的低层操作，尤其是裸指针转换、裸指针取值、
 地址获取和显式释放，不因为缺少 unsafe/capability gate 而报错；borrow check 仍然只检查所有权、
 lifetime 和 drop safety。
 
@@ -551,7 +551,7 @@ const generic 参数使用 `const Type Name` 写在泛型参数列表中，例�
 
 ### Import
 
-stage2 当前固定两种 import path：
+当前固定两种 import path：
 
 ```jiang
 import dep;
@@ -599,7 +599,7 @@ manifest 中的 `name` 和 dependency key 使用 Jiang lexer 的 identifier 规�
 首字符和后续字符。完整 Unicode XID 表后续可以替换 lexer 的底层判定，但 manifest 必须复用
 lexer 语义，不能另起一套名字规则。
 
-stage2 当前已经把 manifest root 接入 compile path：目录输入会读取 `package.ini`，再编译
+当前已经把 manifest root 接入 compile path：目录输入会读取 `package.ini`，再编译
 manifest 指定的 root source。`ModuleResolver` 会按 source 所在目录向上查找 `package.ini`，
 创建或复用对应 package，并登记 `[dependencies]`。依赖 package 内部继续按自己的 manifest
 解析相对 dependency path，因此 `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
@@ -710,7 +710,7 @@ union variant 和普通/static method 共用 `Type.member` 访问面，不能同
 
 union variant 的外部可见性由外层类型是否 public 控制。
 
-0.2 的命名空间规则：
+当前命名空间规则：
 
 - module/package/import alias 使用 namespace namespace。
 - 顶层类型、trait 和 associated type 使用 type namespace。
@@ -899,7 +899,7 @@ Result@(Error?);
 Result@(Error!);
 ```
 
-0.2 中 errorable value 不做隐式传播。`T@E` 只能作为完整 errorable value 保存或返回；
+当前 errorable value 不做隐式传播。`T@E` 只能作为完整 errorable value 保存或返回；
 如果上下文需要 `T`，必须用 `try expr catch (...) => ...` 显式处理 error 分支。
 `throw expr` 只能出现在返回 errorable type 的函数中，`expr` 必须可赋给该函数的 error type。
 catch binding 只在 catch body 内可见，类型来自被处理 errorable value 的 error type。
@@ -1149,6 +1149,6 @@ Void save(File& file) {
 - `write(self)` / `write(arg)` / `write(global)`：可能修改对应对象或状态。
 - `io`：执行输入输出。
 - `alloc`：分配内存。
-- `unsafe`：未来 capability 系统中可用于标记低层操作；0.2 阶段暂不启用检查。
+- `unsafe`：未来 capability 系统中可用于标记低层操作；当前暂不启用检查。
 
 未标注函数在该提案中默认为 `unknown` / impure，不强制第一版代码全量标注。若未来启用检查，`@effect(read)` 函数中写入 `self` 的 `!` 字段应编译失败；trait requirement 也可以携带 effect，要求实现不比 requirement 更“脏”。

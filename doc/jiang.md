@@ -288,7 +288,7 @@ UInt8 small_val = UInt8(val);
 ```
 
 `as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换。
-0.2 阶段 package 默认处在全局 unsafe 模式，编译器不会因为裸指针转换或裸指针访问本身报错；后续如果
+当前 package 默认处在全局 unsafe 模式，编译器不会因为裸指针转换或裸指针访问本身报错；后续如果
 引入 capability/unsafe gate，再把这些低层操作纳入显式能力检查。
 
 ```c
@@ -2173,7 +2173,7 @@ lexer/
 [package]
 name = frontend
 root = src/main.jiang
-version = 0.2.0
+version = 0.4
 ```
 
 当前第一版 package 机制还支持本地依赖：

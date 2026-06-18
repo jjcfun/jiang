@@ -1,6 +1,6 @@
 # Targets
 
-0.3.1 的 release host 仍只承诺 macOS arm64 hosted `jiangc`。其他 target 先固定 target model、
+当前 release host 仍只承诺 macOS arm64 hosted `jiangc`。其他 target 先固定 target model、
 LLVM/object 输出和 executable 诊断边界，不承诺可运行 release。
 
 ## Supported Matrix
@@ -21,7 +21,7 @@ executable 必须早停诊断，不能误用 host `cc` 链接 Linux object。
 Wasm 和 Windows 当前只承诺 LLVM/object 输出。可运行 module、CRT/startup、host import 或 Windows
 linker integration 都是后续任务。
 
-no-libc / freestanding executable 不属于 0.3.1。相关设计迁移到 proposal，等待自定义 DSL 和 inline
+no-libc / freestanding executable 不属于当前 release。相关设计迁移到 proposal，等待自定义 DSL 和 inline
 asm 能力稳定后再推进。
 
 ## Linker Boundary
