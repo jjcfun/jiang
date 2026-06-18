@@ -610,15 +610,11 @@ catch_body  <- block / expr
 
 ```peg
 match_pattern
-            <- optional_pattern
-             / literal
+            <- literal
              / variant_pattern
 
 pattern     <- match_pattern
              / binding_pattern
-
-optional_pattern
-            <- "some" pattern
 
 binding_pattern
             <- "_"
@@ -649,9 +645,8 @@ pattern_list
 - 单段 `path` 只作为 binding 子 pattern 使用，不能作为 `is` 或 `switch` 的分支根。
 - `ref T name` 表示借用绑定；`ref T! name` 等价于 `(ref T)! name`，最外层 `!` 属于绑定可变性，例如 `ref Int! value` 生成 `Int&!` 绑定。`ref` 是绑定模式，不是类型名。
 - 新代码中 pattern 的 `_` 只表示 wildcard，不作为类型占位；需要借用 payload 时写 `.some(ref T name)` 或 `.case(ref T name)`。
-- `some pattern` 是旧 optional pattern 兼容语法；新代码使用 `.some(pattern)` / `.none`。
 - destructure 和 local declaration 仍支持 `_` 类型占位，例如 `_ value = expr;`、`(_ left, Int right) = pair;`。
-- `_! name`、`_& name`、`_&! name` 是旧式显式推导 binding，当前在 pattern、destructure、local declaration 中仍作为 0.3.2 自举兼容语法保留；不作为新代码推荐写法。
+- `_! name` 可在 pattern 中表示可变绑定；`_& name`、`_&! name` 不再作为 pattern 借用绑定语法，payload 借用使用 `ref T name`。
 - 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法。
 
 ## 说明

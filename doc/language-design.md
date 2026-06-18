@@ -61,7 +61,7 @@ Token 只表示词法事实，不承载语义类型。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
   `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`trait`、
   `extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、
-  `defer`、`throw`、`true`、`false`、`null`、`self`、`some`、`Self`。
+  `defer`、`throw`、`true`、`false`、`null`、`self`、`Self`。
 - 字符字面量使用单引号，例如 `'a'`。
 - 字符串字面量使用双引号，文本按 UTF-8 字节序列处理。
 - `Span` 使用字节偏移和字节长度；line/column 在诊断阶段计算。
@@ -848,9 +848,9 @@ Optional 不再幂等：`T??` 表示 `Option<Option<T>>`。`!` 是当前绑定�
 - 借用解包 pattern: `value is .some(ref Int payload)`
 - 可变借用解包 pattern: `value is .some(ref Int! payload)`
 
-`.some(...)` / `.none` 是 `Option<T>` 的 pattern 写法。旧 `some payload` 语法仍作为兼容入口保留，
-但新代码和文档都使用 dot case 形式。`ref` 是绑定模式，不是类型名；`ref Int! payload`
-等价于 `(ref Int)! payload`，生成可变的引用绑定。
+`.some(...)` / `.none` 是 `Option<T>` 的 pattern 写法。`some` 是普通标识符，
+不再作为 optional pattern 关键字。`ref` 是绑定模式，不是类型名；
+`ref Int! payload` 等价于 `(ref Int)! payload`，生成可变的引用绑定。
 
 示例：
 
@@ -874,7 +874,7 @@ switch value {
 }
 ```
 
-同一个 optional match/switch 层级中，不同 `some` 分支匹配范围相同，只是绑定形式不同，因此只能出现一个 `some` 分支，同时出现是编译错误。
+同一个 optional match/switch 层级中，不同 `.some(...)` 分支匹配范围相同，只是绑定形式不同，因此只能出现一个 `.some(...)` 分支，同时出现是编译错误。
 
 目标设计偏向显式 optional handling。是否支持 `x == null` / `x != null`
 分支窄化仍未定；在定稿前，sema 不应依赖该能力。
@@ -1030,7 +1030,7 @@ if block is .some(Int! dead) {
 }
 ```
 
-普通 union variant 和 optional 都使用 dot case pattern；optional 旧 `some` 关键字只作为兼容语法保留。
+普通 union variant 和 optional 都使用 dot case pattern；optional 不再支持旧 `some payload` pattern。
 
 ## Module 和 Visibility
 
