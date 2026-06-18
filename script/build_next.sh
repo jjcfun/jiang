@@ -19,15 +19,15 @@ cd "$ROOT_DIR"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$(command -v jiangc || true)}"
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
   echo "missing bootstrap compiler: jiangc" >&2
-  echo "install Jiang 0.3.1 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
+  echo "install a supported Jiang bootstrap compiler so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
   exit 2
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
 case "$BOOTSTRAP_VERSION" in
-  "jiang 0.3.1") ;;
+  "jiang 0.3.1"|"jiang 0.3.2") ;;
   *)
     echo "unsupported bootstrap compiler: $BOOTSTRAP_VERSION" >&2
-    echo "install Jiang 0.3.1 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
+    echo "install Jiang 0.3.1 or 0.3.2 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
     exit 2
     ;;
 esac
@@ -97,7 +97,7 @@ emit_compiler_with_compiler() {
   printf 'OK %s\n' "$output_bin"
 }
 
-printf '== build next: 0.3.1 -> next ==\n'
+printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
 emit_next_from_bootstrap "$NEXT_BIN"
 
 VERIFY_BIN="$NEXT_BIN"
