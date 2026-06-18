@@ -87,7 +87,7 @@ mutable_items[0] = 10;
 mutable_items = [4, 5, 6];
 ```
 
-如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导默认得到不可变绑定；需要可变绑定时显式写 `_!` 或写出带 `!` 的左侧类型。类型推导会保留表达式的自然类型，不自动解引用 `T^` / `T&`；需要值类型时写出 expected type。类型推导只能影响推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 struct 字段等内部层级的可变性。
+如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导默认得到不可变绑定；需要可变绑定时写 `_ value!` 或写出带 `!` 的左侧类型。类型推导会保留表达式的自然类型，不自动解引用 `T^` / `T&`；需要值类型时写出 expected type。类型推导只能影响推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 struct 字段等内部层级的可变性。
 
 结构体、tuple、union 和数组的内部成员是否可修改，由成员类型自己的可变性决定，不由外层变量是否带 `!` 决定。
 
@@ -167,12 +167,12 @@ if a1 is some x {
 	// 这里x为null
 }
 
-if a1 is some _ x {
-  // 等价于 some x，但显式写出推导类型
+if a1 is some x! {
+  // 这里x为可变绑定
 }
 
-if a1 is some _! x {
-  // 这里x为可变绑定
+if a1 is some x& {
+  // 这里x为借用绑定，不会移动payload
 }
 ```
 
@@ -450,7 +450,7 @@ Int& b;
 Int&! ref = value$.ref();
 
 _ copied = ref;      // copied: Int&
-_! mutable = ref;    // mutable: Int&!
+_ mutable! = ref;    // mutable: Int&!
 Int copied_value = ref$.get();
 Int& kept = ref;     // expected type 是 Int&，保留 reference
 _ raw_ref = ref$.ref(); // raw_ref: Int&
@@ -599,7 +599,7 @@ print("result1 = %d", result[1]); // 输出：result1 = 200;
 print("x = %d, y = %d", x, y); // 输出：a = 100, b = 200
 
 /// 解构元组的时候，可直接定义变量
-(_ x, _! y) = foo(10, 200);
+(_ x, _ y!) = foo(10, 200);
 y += 100;
 print("x = %d, y = %d", x, y); // 输出：x = 100, y = 300
 ```
@@ -1565,23 +1565,23 @@ MyUnion y = .b(3.15);
 // 使用 switch 处理所有情况（编译器确保完整性）
 switch (x) {
 	// 单个语句可以不用 {}
-  .a(_ value) => print("value = %d", value);
+  .a(value) => print("value = %d", value);
 
   // 多个语句必须用 {}
-  .b(_! value) => {
+  .b(value!) => {
     value += 0.1;
     print("value = %f", value);
   }
 
-  .c(_ v1, _ b2) => print("value = (%d, %d)", v1, v2);
+  .c(v1, b2) => print("value = (%d, %d)", v1, v2);
 
-  .d(_ v) => print("value = Foo {x: %d, y: %d}", v.x, v.y);
+  .d(v) => print("value = Foo {x: %d, y: %d}", v.x, v.y);
 
 	else => break;
 }
 
 // 使用 if 判断
-if (x is .a(_ value)) {
+if (x is .a(value)) {
   print("value = %d", value)
 }
 ```

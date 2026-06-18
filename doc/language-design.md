@@ -217,16 +217,16 @@ Int& ref = value$.ref(); // 允许：reference 结构相同，pointee 的 mutabl
 
 这条规则只属于写入目标的场景，不能把 `Int` 与 `Int!` 视为全局等价类型。二元运算、分支合并、重载判定中不应该因为某一侧带 `!` 就把两种类型普遍合并；这些上下文需要先有明确的 expected type 或目标位置，再按上面的写入规则检查。
 
-类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 struct 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
+类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_ value!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 struct 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
 
 解构语法可以为每个解构出来的绑定重新指定可变性，因为解构本质上是在声明多个局部绑定。但这种可变性也只作用于对应元素类型的最外层，不能深入修改该元素类型的内部层级：
 
 ```jiang
 (Int, User) pair = (1, user);
-(_! count, _! current_user) = pair; // count 和 current_user 两个绑定本身可变
+(_ count!, _ current_user!) = pair; // count 和 current_user 两个绑定本身可变
 
 (Int[3]) arrays = ([1, 2, 3]);
-(_! inferred_array) = arrays; // 只能让 inferred_array 这个外层绑定可变
+(_ inferred_array!) = arrays; // 只能让 inferred_array 这个外层绑定可变
 ```
 
 内部成员的可变性来自类型定义本身。对于 `struct` 字段、tuple 元素、union payload、数组元素，只要成员类型在其定义处是可变的，该成员就可以通过 owner 或 `T&` 引用写入；这不受外层变量本身是否带 `!` 影响，也不由引用类型提供额外的只读/独占权限。
@@ -285,7 +285,7 @@ _ d = foo() + 123;   // 算术上下文，自动解引用为 Int
 
 Int&! ref = value$.ref();
 _ copied = ref;      // 推导上下文保留 reference，copied: Int&
-_! mutable = ref;    // mutable: Int&!
+_ mutable! = ref;    // mutable: Int&!
 Int copied_value = ref$.get();
 Int& kept = ref;     // expected type 是 Int&，保留 reference
 _ raw_ref = ref$.ref(); // '$' 阻止自动解引用，raw_ref: Int&
@@ -846,10 +846,12 @@ T? value; // 归一化为 Int?
 - coalesce: `value ?? fallback`
 - guard: `guard value is some payload else { return; }`
 - 强制解包: `value$.some()`
-- 条件解包 pattern: `value is some payload` 或 `value is some _ payload`
-- 可变条件解包 pattern: `value is some _! payload`
+- 条件解包 pattern: `value is some payload`
+- 可变条件解包 pattern: `value is some payload!`
+- 借用解包 pattern: `value is some payload&`
+- 可变借用解包 pattern: `value is some payload&!`
 
-`some` 是 optional pattern 位置的 contextual keyword，类似 `init` 在初始化声明中的特殊角色；它不是普通类型名，也不是 `Option.some` 这种公开 union variant。`some` 后面接普通 binding pattern：`some payload` 是 `some _ payload` 的简写，`some _! payload` 表示可变绑定。`!` 仍然属于 binding pattern 的类型部分，不挂在 `some` 关键字上。
+`some` 是 optional pattern 位置的 contextual keyword，类似 `init` 在初始化声明中的特殊角色；它不是普通类型名，也不是 `Option.some` 这种公开 union variant。`some` 后面接普通 binding pattern：`some payload` 绑定 payload，`some payload!` 表示可变绑定，`some payload&` 表示借用绑定。`!`、`&` 属于 binding pattern，不挂在 `some` 关键字上。
 
 示例：
 
@@ -858,18 +860,18 @@ if value is some payload {
     // payload: T
 }
 
-if value is some _ payload {
-    // payload: T
+if value is some payload! {
+    // payload: T!
 }
 
-if value is some _! payload {
-    // payload: T!
+if value is some payload& {
+    // payload: T&
 }
 
 switch value {
     some payload => ...
-    some _ payload => ...
-    some _! payload => ...
+    some payload! => ...
+    some payload& => ...
     null => ...
 }
 ```
@@ -1026,7 +1028,7 @@ destructure 语法。
 if value is some payload {
 }
 
-if block is some _! dead {
+if block is some dead! {
 }
 ```
 
