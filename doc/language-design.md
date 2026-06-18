@@ -261,6 +261,9 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 - `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
 - `T[:0]`：带 sentinel 的 unsized array pointee，必须通过 `T[:0]&` 形成 sentinel slice view；slice view 语义上类似 `{ T[*:0], length }&`，并保证 `data[length] == 0`。
 
+标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_array()` 使用 `@self(move)` 消耗
+receiver，并把 initialized 区间转移为 owning `T[]^`。
+
 `T&`、`T&!` 和 `T[]` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]` 字段时，目标对象的生命周期必须覆盖包含该字段的值。
 
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入

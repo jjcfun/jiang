@@ -563,6 +563,8 @@ Buffer^ b = a$.move();
 
 slice 是一个带有 `length` 属性的连续内存引用视图。它与数组的区别在于：数组类型的长度是在编译器确定的，而 slice 的长度在运行时确定。
 `T[]` 本身不持有所有权，语义上类似 `{ T[*], length }&`：它引用一段外部连续存储，并要求被引用存储的 lifetime 覆盖 slice 的使用范围。
+标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_array()` 会消耗 `Vector`，
+把已初始化区间交给返回的 `T[]^` 拥有，调用后原 `Vector` 失效。
 
 ```c
 // x为一个数组
