@@ -68,14 +68,22 @@ public struct ReferenceResolver: Movable {
             self.resolve_compile_if(compile_if);
             return;
         }
-        if (node.data is .builtin_block(builtin_block)) {
-            self.resolve_builtin_block(node, builtin_block);
+        if (node.data is .intrinsic_block(intrinsic_block)) {
+            self.resolve_intrinsic_block(node, intrinsic_block);
         }
     }
 
-    () resolve_builtin_block(ast.AstNode node, ast.BuiltinBlockData builtin_block) {
-        if (self.current_source_allows_builtin()) {
-            self.resolve_where_annotations(builtin_block.attributes);
+    () resolve_intrinsic_block(ast.AstNode node, ast.IntrinsicBlockData intrinsic_block) {
+        if (self.current_source_allows_intrinsic()) {
+            qid.DefId module_def = self.state.store.resolve.module_ref(self.state.module_id).def_id;
+            qid.DefId? previous_owner = self.current_owner_def;
+            self.current_owner_def = module_def;
+            self.env.enter_scope(.generic_scope);
+            self.define_intrinsic_receiver_pattern_type(intrinsic_block);
+            self.resolve_type_ref(intrinsic_block.receiver_type);
+            self.resolve_where_annotations(intrinsic_block.attributes);
+            self.env.exit_scope();
+            self.current_owner_def = previous_owner;
             return;
         }
         self.add_diagnostic(
@@ -85,30 +93,50 @@ public struct ReferenceResolver: Movable {
         );
     }
 
-    Bool current_source_allows_builtin() {
+    () define_intrinsic_receiver_pattern_type(ast.IntrinsicBlockData intrinsic_block) {
+        if (!intrinsic_block.receiver_generic) { return; }
+        guard self.intrinsic_receiver_bare_name(intrinsic_block.receiver_type) is some name_id else { return; }
+        self.define_local_name(name_id, .generic_param_def, .type_name);
+    }
+
+    ast.AstId? intrinsic_receiver_bare_name(ast.AstId receiver_type) {
+        ast.AstNode node = self.state.unit.get(receiver_type);
+        if (node.data is .name(_)) { return receiver_type; }
+        if (node.data is .path(path)) {
+            if (path.segments.len == 1) {
+                return self.intrinsic_receiver_bare_name(self.state.unit.child_at(path.segments, 0));
+            }
+            return null;
+        }
+        guard node.data is .named_type(named_type) else { return null; }
+        if (named_type.args.len != 0) { return null; }
+        return self.intrinsic_receiver_bare_name(named_type.path);
+    }
+
+    Bool current_source_allows_intrinsic() {
         store.ModuleRecord& module = self.state.store.resolve.module_ref(self.state.module_id);
         source.SourceRecord source_record = self.state.store.sources.get(module.source_id);
         if (source_record.key.kind != .file) {
             return false;
         }
         UInt8[]& source_path = source_record.key.value;
-        return self.intrinsic_source_allows_builtin(source_path)
-            || self.compiler_source_allows_builtin(module, source_path)
-            || self.std_source_allows_builtin(module, source_path);
+        return self.intrinsic_source_allows_intrinsic(source_path)
+            || self.compiler_source_allows_intrinsic(module, source_path)
+            || self.std_source_allows_intrinsic(module, source_path);
     }
 
-    Bool intrinsic_source_allows_builtin(UInt8[]& source_path) {
+    Bool intrinsic_source_allows_intrinsic(UInt8[]& source_path) {
         return self.text_has_path_part(source_path, "src/intrinsic/");
     }
 
-    Bool compiler_source_allows_builtin(store.ModuleRecord& module, UInt8[]& source_path) {
+    Bool compiler_source_allows_intrinsic(store.ModuleRecord& module, UInt8[]& source_path) {
         if (!self.current_package_name_equals(module, "jiang")) {
             return false;
         }
         return self.text_has_path_part(source_path, "src/");
     }
 
-    Bool std_source_allows_builtin(store.ModuleRecord& module, UInt8[]& source_path) {
+    Bool std_source_allows_intrinsic(store.ModuleRecord& module, UInt8[]& source_path) {
         if (!self.current_package_name_equals(module, "std")) {
             return false;
         }
@@ -346,8 +374,38 @@ public struct ReferenceResolver: Movable {
     }
 
     Bool extend_target_arg_matches_param(ast.AstId arg, qid.DefId param_def) {
+        ast.AstNode node = self.state.unit.get(arg);
+        if (node.data is .infer_type) { return true; }
+        if (self.extend_target_arg_is_pattern(arg)) { return true; }
         guard self.resolved_type_def(arg) is some arg_def else { return false; }
         return arg_def.to_index() == param_def.to_index();
+    }
+
+    Bool extend_target_arg_is_pattern(ast.AstId arg) {
+        ast.AstNode node = self.state.unit.get(arg);
+        if (node.data is .type_ref(type_data)) {
+            return type_data.sentinel_kind == .wildcard || self.extend_target_arg_is_pattern(type_data.base);
+        }
+        if (node.data is .array_type(array_type)) {
+            return array_type.sentinel_kind == .wildcard || self.extend_target_arg_is_pattern(array_type.element);
+        }
+        if (node.data is .named_type(named_type)) {
+            return self.extend_target_type_args_contain_pattern(named_type.args);
+        }
+        return false;
+    }
+
+    Bool extend_target_type_args_contain_pattern(ast.AstRange args) {
+        Int! index = 0;
+        while (index < args.len) {
+            ast.AstId arg = self.state.unit.child_at(args, index);
+            ast.AstNode node = self.state.unit.get(arg);
+            if (node.data is .infer_type || self.extend_target_arg_is_pattern(arg)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     list.ArrayList<qid.DefId> owner_type_generic_params(qid.DefId owner_def) {
@@ -1482,6 +1540,7 @@ public struct ReferenceResolver: Movable {
             if (!duplicate) {
                 self.env.define(symbol, domain, def_id, span);
             }
+            self.state.record_declaration_def(name_id, def_id);
             self.declare_generic_param_def(kind, def_id, span);
         }
     }

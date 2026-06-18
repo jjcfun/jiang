@@ -2145,7 +2145,7 @@ public struct BodyCheck: Movable {
         if (self.check_enum_init_call(node_id, call) is some type_id) {
             return type_id;
         }
-        list.ArrayList<qid.TypeId>! type_args = self.type_ops.check_type_args(call.type_args);
+        list.ArrayList<qid.TypeId>! type_args = self.preselect_call_type_args(call.type_args);
         if (call.target is some target) {
             def.DefKind target_kind = self.state.store.defs.get(target.def_id).kind;
             if (target_kind == .union_variant_def || target_kind == .enum_case_def) {
@@ -2191,6 +2191,25 @@ public struct BodyCheck: Movable {
         return self.substituted_call_result_type(call, type_args$.ref(), function_type.result);
     }
 
+    list.ArrayList<qid.TypeId> preselect_call_type_args(hir.HirId[]& arg_refs) {
+        if (self.all_call_generic_args_are_types(arg_refs)) {
+            return self.type_ops.check_type_args(arg_refs);
+        }
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>();
+        return args$.move();
+    }
+
+    Bool all_call_generic_args_are_types(hir.HirId[]& arg_refs) {
+        Int! index = 0;
+        while (index < arg_refs.length) {
+            if (!self.is_type_ref_node(arg_refs[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
     () prepare_call_callee_selection(hir.HirCall call) {
         if (self.initial_call_def(call) != null) {
             return;
@@ -2223,7 +2242,7 @@ public struct BodyCheck: Movable {
             return self.state.store.types.invalid_type();
         }
         qid.DefId target_def = self.concrete_call_target(call, selected_def);
-        self.complete_call_type_args(node_id, selected_def, type_args, function_type);
+        self.complete_call_type_args(node_id, call, selected_def, type_args, function_type);
         self.check_generic_call_constraints(node_id, selected_def, type_args);
         self.state.results.select_call_target(node_id, target_def);
         self.record_call_generic_instance(node_id, call, target_def, type_args);
@@ -2390,6 +2409,9 @@ public struct BodyCheck: Movable {
     }
 
     Bool type_satisfies_builtin_trait(qid.TypeId type_id, qid.DefId trait_def) {
+        if (self.core_trait_matches(self.state.store.resolve.core_traits.movable_trait, trait_def)) {
+            return self.type_is_movable(type_id);
+        }
         if (self.core_trait_matches(self.state.store.resolve.core_traits.mutable_trait, trait_def)) {
             return self.type_is_mutable(type_id);
         }
@@ -2401,6 +2423,11 @@ public struct BodyCheck: Movable {
     Bool type_is_mutable(qid.TypeId type_id) {
         types.TypeInfo info = self.state.store.types.get(type_id);
         return info.is_mutable;
+    }
+
+    Bool type_is_movable(qid.TypeId type_id) {
+        drop_semantics.DropQuery query = drop_semantics.DropQuery(self.state.ctx);
+        return query.type_is_movable(type_id);
     }
 
     Bool core_trait_matches(qid.DefId? core_trait, qid.DefId trait_def) {
@@ -2524,10 +2551,15 @@ public struct BodyCheck: Movable {
 
     () complete_call_type_args(
         hir.HirId node_id,
+        hir.HirCall call,
         qid.DefId selected_def,
         list.ArrayList<qid.TypeId>& type_args,
         types.FunctionType function_type
     ) {
+        if (!self.all_call_generic_args_are_types(call.type_args)) {
+            self.type_ops.check_generic_instance_args_into(node_id, selected_def, call.type_args, type_args);
+            return;
+        }
         if (type_args.len() == 0) {
             typeck_store.OrderedCallArgs values = self.state.results.ordered_call_args(node_id)$.some();
             self.infer_function_type_args(selected_def, function_type, values.values, type_args);
@@ -2541,6 +2573,11 @@ public struct BodyCheck: Movable {
         qid.DefId target_def,
         list.ArrayList<qid.TypeId>& function_args
     ) {
+        if (self.state.results.generic_instance(node_id) is some existing) {
+            if (existing.const_args.length > 0) {
+                return;
+            }
+        }
         list.ArrayList<qid.TypeId> args = self.call_instance_type_args(call, target_def, function_args);
         self.state.results.record_generic_instance_from_list(node_id, target_def, args$.ref());
     }
@@ -3377,10 +3414,7 @@ public struct BodyCheck: Movable {
             self.type_ops.check_type_args(call.type_args);
             return self.type_ops.check_type_ref(call.callee);
         }
-        list.ArrayList<qid.TypeId> args = self.type_ops.check_type_args(call.type_args);
-        self.type_ops.check_type_arg_arity(call.callee, named.def_id, args.len());
-        self.type_ops.record_generic_instance(call.callee, named.def_id, args$.ref());
-        return self.state.store.types.named_type_with_args(named.def_id, args$.move(), token.Span());
+        return self.type_ops.named_type_with_checked_generic_args(call.callee, named.def_id, call.type_args);
     }
 
     Bool builtin_numeric_constructor_call(hir.HirId node_id, qid.TypeId result_type, hir.HirCall call) {
@@ -3622,46 +3656,213 @@ public struct BodyCheck: Movable {
     // move 是 owning/non-copy value 的显式所有权转移入口。
     qid.TypeId check_implicit_call(hir.HirId node_id, hir.HirImplicitCall call) {
         Bool type_receiver = self.is_type_ref_node(call.base);
-        if (self.select_builtin_operation(call, type_receiver) is some operation) {
-            return self.check_builtin_operation(node_id, call, operation);
+        qid.TypeId receiver_type = self.check_implicit_receiver_type(call, type_receiver);
+        if (self.select_intrinsic_operation(call, type_receiver, receiver_type) is some operation) {
+            return self.check_intrinsic_operation(node_id, call, operation);
         }
         self.check_implicit_call_args(call);
-        self.add_unsupported_builtin_operation_error(node_id, type_receiver);
+        self.add_unsupported_intrinsic_operation_error(node_id, type_receiver);
         return self.state.store.types.invalid_type();
     }
 
-    typeck_store.BuiltinOperationKind? select_builtin_operation(hir.HirImplicitCall call, Bool type_receiver) {
-        hir.HirBuiltinReceiverKind receiver_kind = self.builtin_receiver_kind(type_receiver);
+    qid.TypeId check_implicit_receiver_type(hir.HirImplicitCall call, Bool type_receiver) {
+        if (type_receiver) {
+            return self.type_ops.check_type_ref(call.base);
+        }
+        if (call.op == .move) {
+            self.assignment_target_depth = self.assignment_target_depth + 1;
+            qid.TypeId base_type = self.check_node(call.base);
+            self.assignment_target_depth = self.assignment_target_depth - 1;
+            return base_type;
+        }
+        return self.check_node(call.base);
+    }
+
+    typeck_store.IntrinsicOperationKind? select_intrinsic_operation(
+        hir.HirImplicitCall call,
+        Bool type_receiver,
+        qid.TypeId receiver_type
+    ) {
+        hir.HirIntrinsicReceiverKind receiver_kind = self.intrinsic_receiver_kind(type_receiver);
         Int! index = 0;
-        while (index < self.state.hirs.builtin_groups.len()) {
-            hir.HirBuiltinGroup& group = self.state.hirs.builtin_group_ref(index);
-            if (self.builtin_group_matches(group, receiver_kind, call.op)) {
-                return self.builtin_operation_kind(call.op);
+        while (index < self.state.hirs.intrinsic_groups.len()) {
+            hir.HirIntrinsicGroup& group = self.state.hirs.intrinsic_group_ref(index);
+            table.HashTable<qid.DefId, qid.TypeId>! bindings = table.HashTable<qid.DefId, qid.TypeId>();
+            if (self.intrinsic_group_matches(group, receiver_kind, receiver_type, call.op, bindings$.ref())) {
+                return self.intrinsic_operation_kind(call.op);
             }
             index = index + 1;
         }
         return null;
     }
 
-    hir.HirBuiltinReceiverKind builtin_receiver_kind(Bool type_receiver) {
+    hir.HirIntrinsicReceiverKind intrinsic_receiver_kind(Bool type_receiver) {
         if (type_receiver) {
-            return hir.HirBuiltinReceiverKind.type_receiver;
+            return hir.HirIntrinsicReceiverKind.type_receiver;
         }
-        return hir.HirBuiltinReceiverKind.value_receiver;
+        return hir.HirIntrinsicReceiverKind.value_receiver;
     }
 
-    Bool builtin_group_matches(
-        hir.HirBuiltinGroup& group,
-        hir.HirBuiltinReceiverKind receiver_kind,
-        hir.HirImplicitOp op
+    Bool intrinsic_group_matches(
+        hir.HirIntrinsicGroup& group,
+        hir.HirIntrinsicReceiverKind receiver_kind,
+        qid.TypeId receiver_type,
+        hir.HirImplicitOp op,
+        table.HashTable<qid.DefId, qid.TypeId>& bindings
     ) {
         if (group.receiver_kind != receiver_kind) {
             return false;
         }
-        return self.builtin_group_has_member(group, op);
+        if (!self.intrinsic_group_receiver_matches(group, receiver_type, bindings)) {
+            return false;
+        }
+        if (!self.intrinsic_group_where_satisfied(group, receiver_type, bindings)) {
+            return false;
+        }
+        return self.intrinsic_group_has_member(group, op);
     }
 
-    Bool builtin_group_has_member(hir.HirBuiltinGroup& group, hir.HirImplicitOp op) {
+    Bool intrinsic_group_receiver_matches(
+        hir.HirIntrinsicGroup& group,
+        qid.TypeId receiver_type,
+        table.HashTable<qid.DefId, qid.TypeId>& bindings
+    ) {
+        qid.TypeId match_type = self.intrinsic_group_match_type(receiver_type);
+        if (self.type_ref_generic_param_def(group.receiver_type) is some param_def) {
+            bindings.set(param_def, match_type);
+            return true;
+        }
+        list.ArrayList<qid.TypeId>! type_args = list.ArrayList<qid.TypeId>();
+        return self.type_ops.where_type_pattern_matches(
+            match_type,
+            self.intrinsic_group_owner(group),
+            type_args$.ref(),
+            group.receiver_type
+        );
+    }
+
+    qid.TypeId intrinsic_group_match_type(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (!info.is_mutable) {
+            return type_id;
+        }
+        qid.TypeId stripped = self.state.store.types.create(info.data, info.span);
+        if (info.type_owner_def is some owner_def) {
+            self.state.store.types.ref_at(stripped).type_owner_def = owner_def;
+            return stripped;
+        }
+        if (self.intrinsic_group_owner_for_type_info(info) is some owner_def) {
+            self.state.store.types.ref_at(stripped).type_owner_def = owner_def;
+        }
+        return stripped;
+    }
+
+    qid.DefId? intrinsic_group_owner_for_type_info(types.TypeInfo info) {
+        if (info.data is .optional(_)) {
+            return self.state.store.resolve.core_types.option_type;
+        }
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) { return self.state.store.resolve.core_types.ref_type; }
+            if (handle.kind == .owner_pointer) { return self.state.store.resolve.core_types.box_type; }
+            if (handle.kind == .raw_pointer) { return self.state.store.resolve.core_types.raw_pointer_type; }
+            if (handle.kind == .many_pointer) { return self.state.store.resolve.core_types.many_pointer_type; }
+        }
+        return null;
+    }
+
+    Bool intrinsic_group_where_satisfied(
+        hir.HirIntrinsicGroup& group,
+        qid.TypeId receiver_type,
+        table.HashTable<qid.DefId, qid.TypeId>& bindings
+    ) {
+        list.ArrayList<qid.TypeId> type_args = self.intrinsic_group_type_args(group, receiver_type, bindings);
+        Int! index = 0;
+        while (index < group.where_predicates.len()) {
+            hir.HirWherePredicate predicate = group.where_predicates.get(index);
+            if (!self.type_ops.type_owner_where_predicate_satisfied(
+                self.intrinsic_group_owner(group),
+                self.intrinsic_group_owner(group),
+                type_args$.ref(),
+                predicate
+            )) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    list.ArrayList<qid.TypeId> intrinsic_group_type_args(
+        hir.HirIntrinsicGroup& group,
+        qid.TypeId receiver_type,
+        table.HashTable<qid.DefId, qid.TypeId>& bindings
+    ) {
+        if (self.type_ref_generic_param_def(group.receiver_type) is some param_def) {
+            return self.intrinsic_group_single_receiver_arg(param_def, receiver_type, bindings);
+        }
+        if (self.type_ref_owner_def(group.receiver_type) is some owner_def) {
+            return self.type_ops.extension_receiver_type_args(receiver_type, owner_def);
+        }
+        list.ArrayList<qid.TypeId>! empty = list.ArrayList<qid.TypeId>();
+        return empty$.move();
+    }
+
+    list.ArrayList<qid.TypeId> intrinsic_group_single_receiver_arg(
+        qid.DefId param_def,
+        qid.TypeId receiver_type,
+        table.HashTable<qid.DefId, qid.TypeId>& bindings
+    ) {
+        list.ArrayList<qid.TypeId>! args = list.ArrayList<qid.TypeId>();
+        guard self.state.store.defs.get(param_def).owner_def is some owner_def else {
+            args.add(self.intrinsic_group_type_arg_for_param(param_def, receiver_type, bindings));
+            return args$.move();
+        }
+        guard self.state.hirs.def(owner_def) is some owner_hir else {
+            args.add(self.intrinsic_group_type_arg_for_param(param_def, receiver_type, bindings));
+            return args$.move();
+        }
+        Int! index = 0;
+        while (index < owner_hir.generic_params.len()) {
+            qid.DefId candidate = owner_hir.generic_params.get(index);
+            if (self.state.store.defs.get(candidate).domain == .type_name) {
+                args.add(self.intrinsic_group_type_arg_for_param(candidate, receiver_type, bindings));
+            }
+            index = index + 1;
+        }
+        return args$.move();
+    }
+
+    qid.TypeId intrinsic_group_type_arg_for_param(
+        qid.DefId param_def,
+        qid.TypeId receiver_type,
+        table.HashTable<qid.DefId, qid.TypeId>& bindings
+    ) {
+        if (table.hash_table_get_value<qid.DefId, qid.TypeId>(bindings, param_def) is some bound_type) {
+            return bound_type;
+        }
+        return self.state.store.types.invalid_type();
+    }
+
+    qid.DefId? type_ref_generic_param_def(hir.HirId type_ref) {
+        hir.HirNode node = self.state.hirs.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return null; }
+        if (self.state.store.defs.get(named.def_id).kind == .generic_param_def) {
+            return named.def_id;
+        }
+        return null;
+    }
+
+    qid.DefId? type_ref_owner_def(hir.HirId type_ref) {
+        hir.HirNode node = self.state.hirs.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return null; }
+        return named.def_id;
+    }
+
+    qid.DefId intrinsic_group_owner(hir.HirIntrinsicGroup& group) {
+        return self.state.store.resolve.module_ref(group.module_id).def_id;
+    }
+
+    Bool intrinsic_group_has_member(hir.HirIntrinsicGroup& group, hir.HirImplicitOp op) {
         Int! index = 0;
         while (index < group.members.len()) {
             if (group.members.ref_at(index).op == op) {
@@ -3672,30 +3873,30 @@ public struct BodyCheck: Movable {
         return false;
     }
 
-    typeck_store.BuiltinOperationKind? builtin_operation_kind(hir.HirImplicitOp op) {
-        if (op == hir.HirImplicitOp.alloc_array) { return typeck_store.BuiltinOperationKind.alloc_array; }
-        if (op == hir.HirImplicitOp.size) { return typeck_store.BuiltinOperationKind.type_size; }
-        if (op == hir.HirImplicitOp.align) { return typeck_store.BuiltinOperationKind.type_align; }
-        if (op == hir.HirImplicitOp.max_align) { return typeck_store.BuiltinOperationKind.type_max_align; }
-        if (op == hir.HirImplicitOp.get) { return typeck_store.BuiltinOperationKind.pointer_get; }
-        if (op == hir.HirImplicitOp.set) { return typeck_store.BuiltinOperationKind.pointer_set; }
-        if (op == hir.HirImplicitOp.move) { return typeck_store.BuiltinOperationKind.move; }
-        if (op == hir.HirImplicitOp.ref) { return typeck_store.BuiltinOperationKind.borrow_ref; }
-        if (op == hir.HirImplicitOp.addr) { return typeck_store.BuiltinOperationKind.address_of; }
-        if (op == hir.HirImplicitOp.cast) { return typeck_store.BuiltinOperationKind.cast; }
-        if (op == hir.HirImplicitOp.ptr) { return typeck_store.BuiltinOperationKind.slice_ptr; }
-        if (op == hir.HirImplicitOp.free) { return typeck_store.BuiltinOperationKind.free; }
-        if (op == hir.HirImplicitOp.forget) { return typeck_store.BuiltinOperationKind.forget; }
-        if (op == hir.HirImplicitOp.optional_some) { return typeck_store.BuiltinOperationKind.optional_some; }
+    typeck_store.IntrinsicOperationKind? intrinsic_operation_kind(hir.HirImplicitOp op) {
+        if (op == hir.HirImplicitOp.alloc_array) { return typeck_store.IntrinsicOperationKind.alloc_array; }
+        if (op == hir.HirImplicitOp.size) { return typeck_store.IntrinsicOperationKind.type_size; }
+        if (op == hir.HirImplicitOp.align) { return typeck_store.IntrinsicOperationKind.type_align; }
+        if (op == hir.HirImplicitOp.max_align) { return typeck_store.IntrinsicOperationKind.type_max_align; }
+        if (op == hir.HirImplicitOp.get) { return typeck_store.IntrinsicOperationKind.pointer_get; }
+        if (op == hir.HirImplicitOp.set) { return typeck_store.IntrinsicOperationKind.pointer_set; }
+        if (op == hir.HirImplicitOp.move) { return typeck_store.IntrinsicOperationKind.move; }
+        if (op == hir.HirImplicitOp.ref) { return typeck_store.IntrinsicOperationKind.borrow_ref; }
+        if (op == hir.HirImplicitOp.addr) { return typeck_store.IntrinsicOperationKind.address_of; }
+        if (op == hir.HirImplicitOp.cast) { return typeck_store.IntrinsicOperationKind.cast; }
+        if (op == hir.HirImplicitOp.ptr) { return typeck_store.IntrinsicOperationKind.slice_ptr; }
+        if (op == hir.HirImplicitOp.free) { return typeck_store.IntrinsicOperationKind.free; }
+        if (op == hir.HirImplicitOp.forget) { return typeck_store.IntrinsicOperationKind.forget; }
+        if (op == hir.HirImplicitOp.optional_some) { return typeck_store.IntrinsicOperationKind.optional_some; }
         return null;
     }
 
-    qid.TypeId check_builtin_operation(
+    qid.TypeId check_intrinsic_operation(
         hir.HirId node_id,
         hir.HirImplicitCall call,
-        typeck_store.BuiltinOperationKind operation
+        typeck_store.IntrinsicOperationKind operation
     ) {
-        self.state.results.select_builtin_operation(node_id, operation);
+        self.state.results.select_intrinsic_operation(node_id, operation);
         return switch (operation) {
             .alloc_array => self.check_alloc_array_builtin(node_id, call),
             .type_size => self.check_type_info_builtin(node_id, call),
@@ -3714,7 +3915,7 @@ public struct BodyCheck: Movable {
         };
     }
 
-    () add_unsupported_builtin_operation_error(hir.HirId node_id, Bool type_receiver) {
+    () add_unsupported_intrinsic_operation_error(hir.HirId node_id, Bool type_receiver) {
         if (type_receiver) {
             self.type_ops.add_node_error(
                 node_id,
@@ -3829,12 +4030,8 @@ public struct BodyCheck: Movable {
         qid.TypeId base_type = self.check_node(call.base);
         self.expect_implicit_arg_count(node_id, call, 0);
         types.TypeInfo info = self.state.store.types.get(base_type);
-        guard info.data is .handle_type(handle) else {
-            self.add_slice_ptr_base_error(node_id, base_type);
-            return self.state.store.types.invalid_type();
-        }
+        guard info.data is .handle_type(handle) else { return self.state.store.types.invalid_type(); }
         if (handle.kind != .slice) {
-            self.add_slice_ptr_base_error(node_id, base_type);
             return self.state.store.types.invalid_type();
         }
         if (handle.sentinel is some sentinel) {
@@ -3848,22 +4045,15 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_free_builtin(hir.HirId node_id, hir.HirImplicitCall call) {
-        qid.TypeId base_type = self.check_node(call.base);
+        self.check_node(call.base);
         self.expect_implicit_arg_count(node_id, call, 0);
-        if (!self.is_free_receiver_type(base_type)) {
-            self.type_ops.add_node_error(node_id, "free requires pointer receiver", "free_receiver_type_mismatch");
-        }
         return self.state.store.types.unit_type();
     }
 
     qid.TypeId check_forget_builtin(hir.HirId node_id, hir.HirImplicitCall call) {
-        qid.TypeId base_type = self.check_node(call.base);
         self.expect_implicit_arg_count(node_id, call, 0);
         if (!self.is_assignment_target(call.base)) {
             self.type_ops.add_node_error(call.base, "forget receiver must be a place", "forget_receiver_not_place");
-        }
-        if (!self.type_needs_runtime_drop(base_type)) {
-            self.type_ops.add_node_error(node_id, "forget requires runtime drop receiver", "forget_requires_movable");
         }
         return self.state.store.types.unit_type();
     }
@@ -3874,9 +4064,6 @@ public struct BodyCheck: Movable {
         types.TypeInfo base_info = self.state.store.types.get(base_type);
         if (base_info.data is .optional(optional)) {
             return optional.element;
-        }
-        if (!self.type_ops.is_invalid_type(base_type)) {
-            self.type_ops.add_node_error(node_id, "some requires optional receiver", "some_receiver_type_mismatch");
         }
         return self.state.store.types.invalid_type();
     }
@@ -3890,30 +4077,6 @@ public struct BodyCheck: Movable {
             return null;
         }
         return self.type_ops.check_type_ref(call.args[index]);
-    }
-
-    Bool is_free_receiver_type(qid.TypeId type_id) {
-        if (self.type_ops.is_invalid_type(type_id)) {
-            return true;
-        }
-        types.TypeInfo info = self.state.store.types.get(type_id);
-        if (info.data is .optional(optional)) {
-            return self.is_free_receiver_type(optional.element);
-        }
-        guard info.data is .handle_type(handle) else {
-            return false;
-        }
-        if (handle.kind == .many_pointer) { return true; }
-        if (handle.kind == .raw_pointer) { return true; }
-        return handle.kind == .owner_pointer;
-    }
-
-    Bool type_needs_runtime_drop(qid.TypeId type_id) {
-        if (self.type_ops.is_invalid_type(type_id)) {
-            return true;
-        }
-        drop_semantics.DropQuery query = drop_semantics.DropQuery(self.state.ctx);
-        return query.type_needs_runtime_drop(type_id);
     }
 
     () check_pointer_set_value(
@@ -3979,17 +4142,6 @@ public struct BodyCheck: Movable {
             node_id,
             "implicit pointer operation requires pointer or reference base",
             "pointer_operation_base_required"
-        );
-    }
-
-    () add_slice_ptr_base_error(hir.HirId node_id, qid.TypeId base_type) {
-        if (self.type_ops.is_invalid_type(base_type)) {
-            return;
-        }
-        self.type_ops.add_node_error(
-            node_id,
-            "ptr requires slice receiver",
-            "slice_ptr_receiver_type_mismatch"
         );
     }
 
