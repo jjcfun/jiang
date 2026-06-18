@@ -284,7 +284,7 @@ name        <- ident / "self"
 - `T[N:0]` 表示 sentinel 定长数组语法；完整 array sentinel storage 语义后续补齐。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 
-`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`UnsizedArray`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
+`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
 
 ## struct
 

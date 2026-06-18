@@ -83,7 +83,7 @@ Token 只表示词法事实，不承载语义类型。
 
 字符串字面量是 UTF-8 字节序列。0.2.2 起，字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8[*:0]` 或 `UInt8[N:0]`。
 
-`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。`CString` / `CString&` 仍作为只读 C string 兼容路径保留；它不能表达可变 sentinel buffer，新代码应优先使用 `UInt8[:0]&`、`UInt8[*:0]` 或后续的可变 sentinel buffer 类型。
+`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。新代码使用 `UInt8[:0]&` 表达只读 sentinel slice，使用 `UInt8[*:0]` 表达 C ABI 的 NUL 结尾 many pointer。
 
 ## 类型系统
 
@@ -115,7 +115,7 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
 - 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
 
-内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、`UnsizedArray<T>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的 static extension 方法。
+内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的 static extension 方法。
 
 0.2.2 的 sentinel value 只支持整数 literal，element type 必须是整数类型，并且 sentinel value 必须能被 element type 表示。例如 `UInt8[5:0]` 合法，`UInt8[5:300]` 和 `Bool[1:0]` 不合法。HIR 只保留未定型 literal；sema 阶段会将 sentinel 绑定到 element type。
 

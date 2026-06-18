@@ -2211,7 +2211,7 @@ alias x = a + b;
 
 传给 C 风格 API 的字符串优先使用 `UInt8[*:0]` 表示。字符串字面量在 `UInt8[*:0]` 上下文中会生成以 `\0` 结尾的只读全局数据。`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量。
 
-`CString` / `CString&` 仍作为只读 C string 兼容路径保留，但不能表达可变 sentinel buffer；新代码应优先使用 `UInt8[:0]&`、`UInt8[*:0]` 或后续的可变 sentinel buffer 类型。
+如果需要借用 NUL 结尾的只读字节序列，使用 `UInt8[:0]&`；如果需要传给 C ABI，使用 `UInt8[*:0]`。
 
 ```c
 extern {
