@@ -134,7 +134,7 @@ import_alias
 
 import_path <- string_lit / ident
 
-alias_decl  <- "alias" name "=" alias_target ";"
+alias_decl  <- "alias" name ("=" alias_target)? ";"
 
 alias_target
             <- escaped_ident

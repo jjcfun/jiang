@@ -512,7 +512,9 @@ lifetime 和 drop safety。
 - `public import name;`
 - `public import alias = "path.jiang";`
 - `alias Name = Type;`
+- `alias Name;`
 - `public alias exported = module.symbol;`
+- `public alias exported;`
 - const global declaration: `const Type name = expr;`
 - public const global declaration: `public const Type name = expr;`
 - global declaration: `Type name = expr;`
@@ -619,6 +621,12 @@ alias 有两种目标：
 ```jiang
 alias Name = Type;
 alias name = module.symbol;
+```
+
+如果省略右侧目标，`alias Name;` 等价于 `alias Name = Name;`，通常用于同名 re-export：
+
+```jiang
+public alias Bool;
 ```
 
 如果右侧解析为已有 namespace/type/value/member symbol，alias 会绑定到同一个 name domain，
