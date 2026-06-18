@@ -133,7 +133,7 @@ Result?!@Error maybe_result;
 
 可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变；它不表示 optional，也不表示空值。也就是说，`Int` 与 `Int!` 是不同的 Jiang 类型形态，虽然类型检查可以在受控位置做兼容判断。
 
-`?` / `!` 作用在当前类型层级，并且都是 type flag。同一类型层级中，每种 flag 最多出现一次；源码里重复写出时必须报 diagnostic。类型归一化阶段如果因为泛型替换或别名展开得到重复 flag，按幂等规则合并。
+`!` 作用在当前类型层级，表示这一层可变；同一类型层级中最多出现一次。`?` 是 `Option<T>` 的语法糖，可以重复出现，`T??` 表示 `Option<Option<T>>`。
 
 `^` / `&` 会基于左侧已经形成的类型创建新的 language handle 外层。创建出的外层也可以
 继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 `^` 或 `&` 外层；因此不支持
@@ -831,48 +831,43 @@ Optional 使用 `T?` 表示，也可以显式写作 `Option<T>`。
 
 `?` 是 `Option<T>` 的语法糖。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
 
-重复 optional 标记是语法错误。编译器恢复时可以把 `T??` 当作 `T?` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `!` 也要报错，例如 `T?!?`。`!` 与 `?` 一样属于当前类型层级的 type flag，`Int?!` 表示 optional 层本身可变。
-
-这个规则只针对源码中直接写出的 type flag。类型归一化阶段如果因为泛型替换得到重复 optional，`?` 按幂等规则合并：
-
-```jiang
-// 假设 T 实例化为 Int?
-T? value; // 归一化为 Int?
-```
+Optional 不再幂等：`T??` 表示 `Option<Option<T>>`。`!` 是当前绑定或类型层的可变标记，
+例如 `Int?!` 表示 optional 这一层本身可变。
 
 已确定表达式能力：
 
 - optional chaining: `value?.field`
 - coalesce: `value ?? fallback`
-- guard: `guard value is some payload else { return; }`
+- guard: `guard value is .some(payload) else { return; }`
 - 强制解包: `value$.some()`
-- 条件解包 pattern: `value is some payload`
-- 可变条件解包 pattern: `value is some payload!`
-- 借用解包 pattern: `value is some payload&`
-- 可变借用解包 pattern: `value is some payload&!`
+- 条件解包 pattern: `value is .some(payload)`
+- 可变条件解包 pattern: `value is .some(Int! payload)`
+- 借用解包 pattern: `value is .some(ref Int payload)`
+- 可变借用解包 pattern: `value is .some(ref Int! payload)`
 
-`some` 是 optional pattern 位置的 contextual keyword，类似 `init` 在初始化声明中的特殊角色；它不是普通类型名，也不是 `Option.some` 这种公开 union variant。`some` 后面接普通 binding pattern：`some payload` 绑定 payload，`some payload!` 表示可变绑定，`some payload&` 表示借用绑定。`!`、`&` 属于 binding pattern，不挂在 `some` 关键字上。
+`.some(...)` / `.none` 是 `Option<T>` 的 pattern 写法。旧 `some payload` 语法仍作为兼容入口保留，
+但新代码和文档都使用 dot case 形式。`ref` 是绑定模式，不是类型名；`ref Int! payload`
+等价于 `(ref Int)! payload`，生成可变的引用绑定。
 
 示例：
 
 ```jiang
-if value is some payload {
+if value is .some(payload) {
     // payload: T
 }
 
-if value is some payload! {
+if value is .some(Int! payload) {
     // payload: T!
 }
 
-if value is some payload& {
+if value is .some(ref Int payload) {
     // payload: T&
 }
 
 switch value {
-    some payload => ...
-    some payload! => ...
-    some payload& => ...
-    null => ...
+    .some(payload) => ...
+    .some(ref Int payload) => ...
+    .none => ...
 }
 ```
 
@@ -1025,14 +1020,14 @@ destructure 语法。
 示例方向：
 
 ```jiang
-if value is some payload {
+if value is .some(payload) {
 }
 
-if block is some dead! {
+if block is .some(Int! dead) {
 }
 ```
 
-`some` 只用于 optional pattern。普通 union variant 仍然使用 variant pattern，不复用 optional 的 `some` 语法。
+普通 union variant 和 optional 都使用 dot case pattern；optional 旧 `some` 关键字只作为兼容语法保留。
 
 ## Module 和 Visibility
 

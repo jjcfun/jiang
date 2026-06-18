@@ -648,7 +648,8 @@ pattern_list
 - `match_pattern` 用于 `is` 和 `switch` 分支根，只接受 optional、variant、literal。
 - 单段 `path` 只作为 binding 子 pattern 使用，不能作为 `is` 或 `switch` 的分支根。
 - `ref T name` 表示借用绑定；`ref T! name` 等价于 `(ref T)! name`，最外层 `!` 属于绑定可变性，例如 `ref Int! value` 生成 `Int&!` 绑定。`ref` 是绑定模式，不是类型名。
-- 新代码中 pattern 的 `_` 只表示 wildcard，不作为类型占位；需要借用 payload 时写 `some ref T name` 或 `.case(ref T name)`。
+- 新代码中 pattern 的 `_` 只表示 wildcard，不作为类型占位；需要借用 payload 时写 `.some(ref T name)` 或 `.case(ref T name)`。
+- `some pattern` 是旧 optional pattern 兼容语法；新代码使用 `.some(pattern)` / `.none`。
 - destructure 和 local declaration 仍支持 `_` 类型占位，例如 `_ value = expr;`、`(_ left, Int right) = pair;`。
 - `_! name`、`_& name`、`_&! name` 是旧式显式推导 binding，当前在 pattern、destructure、local declaration 中仍作为 0.3.2 自举兼容语法保留；不作为新代码推荐写法。
 - 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法。

@@ -161,17 +161,17 @@ _ b2 = b1?.x;
 _ foo = x?.y?.z
 
 // 条件解包
-if a1 is some x {
+if a1 is .some(x) {
   // 这里x不为null，类型为Int
 } else {
 	// 这里x为null
 }
 
-if a1 is some x! {
+if a1 is .some(Int! x) {
   // 这里x为可变绑定
 }
 
-if a1 is some x& {
+if a1 is .some(ref Int x) {
   // 这里x为借用绑定，不会移动payload
 }
 ```
@@ -188,7 +188,7 @@ Int other = maybe ?? fallback();
 提前退出使用 `guard`：
 
 ```c
-guard maybe is some value else {
+guard maybe is .some(value) else {
     return;
 }
 ```
