@@ -89,6 +89,10 @@ member_decl <- leading_annotation* member_modifier* member_decl_body
 leading_annotation
             <- "@" "where" "(" where_constraints ")"
              / "@" "life" "(" life_constraints ")"
+             / "@" "self" "(" self_receiver_mode ")"
+
+self_receiver_mode
+            <- "ref" / "move"
 
 decl_modifier
             <- "public"

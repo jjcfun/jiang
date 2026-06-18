@@ -539,6 +539,7 @@ struct HirLower: Movable {
         }
         return hir.HirFunctionSignature (
             has_receiver: true,
+            receiver_mode: .ref_receiver,
             params: self.freeze_hir_ids(params$.move()),
             param_symbols: self.freeze_symbol_ids(param_symbols$.move()),
             param_defaults: self.freeze_param_defaults(param_defaults$.move()),
@@ -589,6 +590,7 @@ struct HirLower: Movable {
         self.current_owner_def = deinit_def;
         hir.HirFunctionSignature signature = hir.HirFunctionSignature (
             has_receiver: true,
+            receiver_mode: .ref_receiver,
             params: self.empty_hir_ids(),
             param_symbols: self.empty_symbol_ids(),
             param_defaults: self.empty_param_defaults(),
@@ -598,7 +600,7 @@ struct HirLower: Movable {
         hir.HirId placeholder = self.add_invalid_node(self.state.unit.get(deinit_decl.value).span);
         self.state.store.hirs.load_body(deinit_def, hir.HirBody(deinit_def, placeholder));
         self.env.enter_scope(.function_scope);
-        self.add_self_local(deinit_def, owner_def);
+        self.add_self_local(deinit_def, owner_def, .ref_receiver);
         hir.HirId root = self.lower_expr(deinit_decl.value);
         self.env.exit_scope();
         self.state.store.hirs.set_body_root(deinit_def, root);
@@ -687,7 +689,8 @@ struct HirLower: Movable {
         }
         hir.HirFunctionSignature signature = self.lower_function_signature(
             function_decl,
-            self.function_has_receiver(function_def, static_member)
+            self.function_has_receiver(function_def, static_member),
+            self.self_receiver_mode_from_annotations(annotations)
         );
         self.state.store.hirs.declare_signature(function_def, signature);
         self.lower_annotations(function_def, annotations);
@@ -714,7 +717,7 @@ struct HirLower: Movable {
             return;
         }
         if (self.state.store.defs.get(function_def).owner_def is some owner_def) {
-            self.add_self_local(function_def, owner_def);
+            self.add_self_local(function_def, owner_def, self.self_local_receiver_mode(function_def));
         }
     }
 
@@ -867,6 +870,9 @@ struct HirLower: Movable {
 
     () lower_annotation(qid.DefId owner_def, ast.AstId annotation_id) {
         ast.AstNode annotation = self.state.unit.get(annotation_id);
+        if (annotation.data is .self_attribute(_)) {
+            return;
+        }
         if (annotation.data is .lifetime_constraint(lifetime)) {
             self.state.store.hirs.add_lifetime_constraint(owner_def, hir.HirLifetimeConstraint (
                 longer: self.lower_lifetime_name(lifetime.longer),
@@ -1118,7 +1124,11 @@ struct HirLower: Movable {
         return self.state.store.defs.get(function_def).owner_def != null;
     }
 
-    hir.HirFunctionSignature lower_function_signature(ast.FunctionData function_decl, Bool has_receiver) {
+    hir.HirFunctionSignature lower_function_signature(
+        ast.FunctionData function_decl,
+        Bool has_receiver,
+        hir.HirSelfReceiverMode receiver_mode
+    ) {
         list.ArrayList<hir.HirId>! params = list.ArrayList<hir.HirId>(function_decl.params.len);
         list.ArrayList<qid.SymbolId>! param_symbols = list.ArrayList<qid.SymbolId>(function_decl.params.len);
         list.ArrayList<hir.HirParamDefault>! param_defaults = list.ArrayList<hir.HirParamDefault>();
@@ -1135,11 +1145,31 @@ struct HirLower: Movable {
         }
         return hir.HirFunctionSignature (
             has_receiver: has_receiver,
+            receiver_mode: receiver_mode,
             params: self.freeze_hir_ids(params$.move()),
             param_symbols: self.freeze_symbol_ids(param_symbols$.move()),
             param_defaults: self.freeze_param_defaults(param_defaults$.move()),
             result: self.lower_type_ref(function_decl.result_type)
         );
+    }
+
+    hir.HirSelfReceiverMode self_receiver_mode_from_annotations(ast.AstRange annotations) {
+        Int! index = 0;
+        while (index < annotations.len) {
+            ast.AstNode annotation = self.state.unit.get(self.state.unit.child_at(annotations, index));
+            if (annotation.data is .self_attribute(self_attr)) {
+                return self.lower_self_receiver_mode(self_attr.mode);
+            }
+            index = index + 1;
+        }
+        return .ref_receiver;
+    }
+
+    hir.HirSelfReceiverMode lower_self_receiver_mode(ast.SelfReceiverMode mode) {
+        if (mode == .move_receiver) {
+            return .move_receiver;
+        }
+        return .ref_receiver;
     }
 
     () lower_param_default(
@@ -1185,7 +1215,7 @@ struct HirLower: Movable {
         }
     }
 
-    () add_self_local(qid.DefId function_def, qid.DefId owner_def) {
+    () add_self_local(qid.DefId function_def, qid.DefId owner_def, hir.HirSelfReceiverMode receiver_mode) {
         qid.SymbolId self_symbol = self.state.store.symbols.intern("self");
         token.Span! span = token.Span();
         if (self.state.store.source_map.def_span(owner_def) is some loc) {
@@ -1204,8 +1234,26 @@ struct HirLower: Movable {
         if (!self.env.empty()) {
             self.env.define(self_symbol, .value_name, self_def, span);
         }
-        hir.HirId type_ref = self.lower_self_reference_type_ref(owner_def, span);
+        hir.HirId type_ref = self.lower_self_receiver_type_ref(owner_def, receiver_mode, span);
         self.state.store.hirs.add_local(function_def, .parameter, self_symbol, self_def, false, type_ref);
+    }
+
+    hir.HirSelfReceiverMode self_local_receiver_mode(qid.DefId function_def) {
+        guard self.state.store.hirs.def_ref(function_def).decl.function_signature is some signature else {
+            return .ref_receiver;
+        }
+        return signature.receiver_mode;
+    }
+
+    hir.HirId lower_self_receiver_type_ref(
+        qid.DefId owner_def,
+        hir.HirSelfReceiverMode receiver_mode,
+        token.Span span
+    ) {
+        if (receiver_mode == .move_receiver) {
+            return self.lower_self_type_ref(owner_def, span);
+        }
+        return self.lower_self_reference_type_ref(owner_def, span);
     }
 
     hir.HirLocalId add_init_self_local(qid.DefId init_def, qid.DefId owner_def) {

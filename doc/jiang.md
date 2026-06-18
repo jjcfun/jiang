@@ -1337,6 +1337,28 @@ struct Buffer {
 - `static Ret foo(...)`：类型函数，只允许 `Type.foo(...)`
 - `Ret foo(...)`：实例函数，函数体内有隐式 `self`，只允许 `value.foo(...)`
 
+实例函数默认使用 `@self(ref)` receiver，也就是 `self` 的类型为 `Self&`。
+需要让方法消耗 receiver 时，可以写 `@self(move)`：
+
+```jiang
+struct Box: Movable {
+    Int value;
+
+    @self(move)
+    Int consume() {
+        self.value
+    }
+}
+
+Int use() {
+    Box box = Box(value: 1);
+    box.consume()
+}
+```
+
+调用 `box.consume()` 后，`box` 已经被 move，后续不能再使用。`@self(...)` 只支持
+`ref` 和 `move`，并且只能写在实例方法上；`static` 方法、`init` 和 `deinit` 不支持。
+
 当前适用范围：
 
 - `struct`：支持 `init`、static 方法、实例方法
@@ -1994,9 +2016,9 @@ extend User: HasValue {
 当前 `extend` 的限制：
 
 - method 不进入模块顶层命名空间
-- method body 中的 `self` 是 receiver `Self&`
+- method body 中的 `self` 默认是 receiver `Self&`；`@self(move)` 方法中 `self` 是拥有值 `Self`
 - 字段能否赋值只由字段类型本身是否 mutable 决定
-- `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`
+- 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`@self(move)` 方法会消耗 `value`
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式
 - `extend Holder<T>` / `extend Box<T>` 可以声明 generic receiver extension；`extend Holder<Int>` 这类 specialized target 暂不支持，使用 `@where(T == Int) extend Holder<T> { ... }`

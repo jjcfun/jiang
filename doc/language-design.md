@@ -754,15 +754,15 @@ trait Indexable {
 当前规则：
 
 - method 不进入模块顶层命名空间；它们记录在 extend/method side table 中。
-- 类型内部非 `static` 函数是 instance method，拥有隐式 receiver `self: Self&`。`self` 是 method body 中的 contextual keyword。
+- 类型内部非 `static` 函数是 instance method，拥有隐式 receiver。默认 receiver 是 `@self(ref)`，函数体内 `self: Self&`；`@self(move)` 表示调用会消耗 receiver，函数体内 `self: Self`。
 - `static` 类型函数没有 receiver，函数体中不能使用 `self`。
 - `init(...)` 是 constructor，拥有初始化中的 `self` 目标；`self` 在 `init` body 中表示正在初始化的 `Self` storage。`init` 只能通过 `Type(...)` / `new Type(...)` 调用，不作为普通函数值暴露。
 - 字段能否被赋值由字段类型本身决定：字段类型必须带 `!`。instance method 的 `self` 可以写入 `Self` 内部声明为 `!` 的字段。
 - 第一版不需要 `mutating` 或等价标记；修改 `!` 字段是普通 instance method 能力。方法是否会修改状态属于后续 effect proposal，不进入第一版类型规则。
-- `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`。
+- 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`@self(move)` 方法等价于传入 `value$.move()`，调用后原 receiver 失效。
 - 如果 receiver 已经是 pointer/reference，`ref.method(args...)` 也等价于 `Type.method(ref, args...)`。
-- `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver reference。
-- instance method 作为函数值时，隐式 receiver 展开为第一个参数。例如 `Int get()` 的函数值类型是 `Fn<Int, Self&>`，`Void set(Int value)` 的函数值类型是 `Fn<Void, Self&, Int>`。`static` 函数值没有 receiver 参数。
+- `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver 类型。
+- instance method 作为函数值时，隐式 receiver 展开为第一个参数。例如 `Int get()` 的函数值类型是 `Fn<Int, Self&>`；`@self(move) Int take()` 的函数值类型是 `Fn<Int, Self>`。`static` 函数值没有 receiver 参数。
 - trait 可以声明 static function requirement；static requirement 没有 `self`，通过
   `Type.method(args...)` 调用，也可以在泛型约束中通过 `T.method(args...)` 调用。
   非 `static` trait function requirement 隐含 `Self&` receiver。
