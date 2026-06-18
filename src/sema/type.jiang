@@ -1,6 +1,7 @@
 // Semantic type model and canonical type IDs.
 
 import qid = "../store/id.jiang";
+import comptime_value = "./comptime/value.jiang";
 import arena = "../support/arena.jiang";
 import list = "../support/list.jiang";
 import table = "../support/table.jiang";
@@ -42,7 +43,45 @@ public struct FloatType {
 
 public struct NamedType {
     public qid.DefId def_id;
-    public qid.TypeId[]& args;
+    // args preserves the declaration/call-site order, e.g.
+    // Foo<T, const Int N, R> becomes [type_arg(T), const_arg(N), type_arg(R)].
+    // The projection fields below keep existing type-only algorithms simple
+    // while identity/layout/symbol code can use args without reconstructing
+    // mixed ordering from two separate slices.
+    public GenericArg[]& args;
+    public qid.TypeId[]& type_args;
+    public comptime_value.ComptimeValue[]& const_args;
+}
+
+public struct GenericTypeArg {
+    public qid.DefId? param_def = null;
+    public qid.TypeId value;
+}
+
+public struct GenericConstArg {
+    public qid.DefId? param_def = null;
+    public comptime_value.ComptimeValue value;
+}
+
+public union GenericArg {
+    GenericTypeArg type_arg;
+    GenericConstArg const_arg;
+}
+
+public GenericArg generic_type_arg(qid.TypeId value) {
+    return .type_arg(GenericTypeArg (param_def: null, value: value));
+}
+
+public GenericArg generic_type_param_arg(qid.DefId param_def, qid.TypeId value) {
+    return .type_arg(GenericTypeArg (param_def: param_def, value: value));
+}
+
+public GenericArg generic_const_arg(comptime_value.ComptimeValue value) {
+    return .const_arg(GenericConstArg (param_def: null, value: value));
+}
+
+public GenericArg generic_const_param_arg(qid.DefId param_def, comptime_value.ComptimeValue value) {
+    return .const_arg(GenericConstArg (param_def: param_def, value: value));
 }
 
 public struct OptionalType {
@@ -57,10 +96,18 @@ public struct ErrorUnionType {
 public struct Sentinel {
     public qid.TypeId type_id;
     public UInt64 value;
+    public qid.DefId? value_param = null;
 
     public init(qid.TypeId type_id, UInt64 value) {
         self.type_id = type_id;
         self.value = value;
+        self.value_param = null;
+    }
+
+    public init(qid.TypeId type_id, UInt64 value, qid.DefId value_param) {
+        self.type_id = type_id;
+        self.value = value;
+        self.value_param = value_param;
     }
 }
 
@@ -68,6 +115,7 @@ public Bool sentinel_equal(Sentinel? lhs, Sentinel? rhs) {
     if (lhs is .some(lhs_value)) {
         guard rhs is .some(rhs_value) else { return false; }
         return lhs_value.type_id.to_index() == rhs_value.type_id.to_index()
+            && optional_def_equal(lhs_value.value_param, rhs_value.value_param)
             && lhs_value.value == rhs_value.value;
     }
     return rhs == null;
@@ -88,11 +136,37 @@ public Int array_storage_count(ArrayType array_type) {
     return array_type.count + sentinel_storage_extra(array_type.sentinel);
 }
 
+public Bool array_count_is_symbolic(ArrayType array_type) {
+    return array_type.count_param != null;
+}
+
+public Bool array_count_equal(ArrayType lhs, ArrayType rhs) {
+    if (lhs.count != rhs.count) {
+        return false;
+    }
+    return optional_def_equal(lhs.count_param, rhs.count_param);
+}
+
+public Bool optional_def_equal(qid.DefId? lhs, qid.DefId? rhs) {
+    if (lhs is .some(left)) {
+        guard rhs is .some(right) else { return false; }
+        return left.to_index() == right.to_index();
+    }
+    return rhs == null;
+}
+
 public UInt64 sentinel_value(Sentinel? sentinel) {
     if (sentinel is .some(value)) {
         return value.value;
     }
     return UInt64(0);
+}
+
+public qid.DefId? sentinel_param(Sentinel? sentinel) {
+    if (sentinel is .some(value)) {
+        return value.value_param;
+    }
+    return null;
 }
 
 public enum HandleTypeKind {
@@ -132,6 +206,7 @@ public Bool is_slice_handle(HandleType handle) {
 public struct ArrayType {
     public qid.TypeId element;
     public Int count;
+    public qid.DefId? count_param = null;
     public Sentinel? sentinel = null;
 }
 
@@ -340,6 +415,84 @@ public struct TypeStore: Movable {
     }
 
     public qid.TypeId named_type_with_args(qid.DefId def_id, list.ArrayList<qid.TypeId> args, token.Span span) {
+        list.ArrayList<GenericArg>! generic_args = list.ArrayList<GenericArg>(args.len());
+        Int! index = 0;
+        while (index < args.len()) {
+            generic_args.add(generic_type_arg(args.get(index)));
+            index = index + 1;
+        }
+        return self.named_type_with_ordered_generic_args(def_id, generic_args$.move(), span);
+    }
+
+    public qid.TypeId named_type_with_generic_args(
+        qid.DefId def_id,
+        list.ArrayList<qid.TypeId> args,
+        list.ArrayList<comptime_value.ComptimeValue> const_args,
+        token.Span span
+    ) {
+        list.ArrayList<GenericArg>! generic_args = list.ArrayList<GenericArg>(args.len() + const_args.len());
+        Int! index = 0;
+        while (index < args.len()) {
+            generic_args.add(generic_type_arg(args.get(index)));
+            index = index + 1;
+        }
+        index = 0;
+        while (index < const_args.len()) {
+            generic_args.add(generic_const_arg(const_args.get(index)));
+            index = index + 1;
+        }
+        return self.named_type_with_ordered_generic_args(def_id, generic_args$.move(), span);
+    }
+
+    public qid.TypeId named_type_with_ordered_generic_args(
+        qid.DefId def_id,
+        list.ArrayList<GenericArg> args,
+        token.Span span
+    ) {
+        list.ArrayList<qid.TypeId>! type_args = list.ArrayList<qid.TypeId>(args.len());
+        list.ArrayList<comptime_value.ComptimeValue>! const_args =
+            list.ArrayList<comptime_value.ComptimeValue>(args.len());
+        Int! index = 0;
+        while (index < args.len()) {
+            GenericArg arg = args.get(index);
+            if (arg is .type_arg(type_arg)) {
+                type_args.add(type_arg.value);
+            }
+            if (arg is .const_arg(const_arg)) {
+                const_args.add(const_arg.value);
+            }
+            index = index + 1;
+        }
+        return self.create_named_type(def_id, args$.ref(), type_args$.ref(), const_args$.ref(), span);
+    }
+
+    qid.TypeId create_named_type(
+        qid.DefId def_id,
+        list.ArrayList<GenericArg>& args,
+        list.ArrayList<qid.TypeId>& type_args,
+        list.ArrayList<comptime_value.ComptimeValue>& const_args,
+        token.Span span
+    ) {
+        Int arg_count = args.len();
+        Int! capacity = arg_count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        GenericArg![*] stored_args = self.storage.alloc_array<GenericArg>(capacity);
+        Int! index = 0;
+        while (index < arg_count) {
+            stored_args[index] = args.get(index);
+            index = index + 1;
+        }
+        return self.create(.named(NamedType (
+            def_id: def_id,
+            args: stored_args[0..arg_count],
+            type_args: self.type_arg_array(type_args),
+            const_args: self.const_arg_array(const_args)
+        )), span);
+    }
+
+    qid.TypeId[]& type_arg_array(list.ArrayList<qid.TypeId>& args) {
         Int arg_count = args.len();
         Int! capacity = arg_count;
         if (capacity == 0) {
@@ -351,7 +504,23 @@ public struct TypeStore: Movable {
             stored_args[index] = args.get(index);
             index = index + 1;
         }
-        return self.create(.named(NamedType (def_id: def_id, args: stored_args[0..arg_count])), span);
+        return stored_args[0..arg_count];
+    }
+
+    comptime_value.ComptimeValue[]& const_arg_array(list.ArrayList<comptime_value.ComptimeValue>& args) {
+        Int arg_count = args.len();
+        Int! capacity = arg_count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        comptime_value.ComptimeValue![*] stored_args =
+            self.storage.alloc_array<comptime_value.ComptimeValue>(capacity);
+        Int! index = 0;
+        while (index < arg_count) {
+            stored_args[index] = args.get(index);
+            index = index + 1;
+        }
+        return stored_args[0..arg_count];
     }
 
     public qid.TypeId optional_type(qid.TypeId element, token.Span span) {
@@ -430,6 +599,20 @@ public struct TypeStore: Movable {
         return self.array_type_with_sentinel(element, count, null, span);
     }
 
+    public qid.TypeId array_type_with_const_count(
+        qid.TypeId element,
+        qid.DefId count_param,
+        Sentinel? sentinel,
+        token.Span span
+    ) {
+        return self.create(.array_type(ArrayType (
+            element: element,
+            count: 0,
+            count_param: count_param,
+            sentinel: sentinel
+        )), span);
+    }
+
     public qid.TypeId array_type_with_sentinel(
         qid.TypeId element,
         Int count,
@@ -439,6 +622,7 @@ public struct TypeStore: Movable {
         return self.create(.array_type(ArrayType (
             element: element,
             count: count,
+            count_param: null,
             sentinel: sentinel
         )), span);
     }
@@ -559,7 +743,7 @@ public struct TypeStore: Movable {
         }
         if (lhs is .array_type(lhs_array)) {
             guard rhs is .array_type(rhs_array) else { return false; }
-            return lhs_array.count == rhs_array.count
+            return array_count_equal(lhs_array, rhs_array)
                 && sentinel_equal(lhs_array.sentinel, rhs_array.sentinel)
                 && self.same_type_with_mutability(lhs_array.element, rhs_array.element, compare_mutability);
         }
@@ -575,7 +759,7 @@ public struct TypeStore: Movable {
         if (lhs.def_id.to_index() != rhs.def_id.to_index()) {
             return false;
         }
-        return self.same_type_list(lhs.args, rhs.args, compare_mutability);
+        return self.same_generic_args(lhs.args, rhs.args, compare_mutability);
     }
 
     Bool same_type_list(qid.TypeId[]& lhs, qid.TypeId[]& rhs, Bool compare_mutability) {
@@ -591,4 +775,84 @@ public struct TypeStore: Movable {
         }
         return true;
     }
+
+    Bool same_generic_args(GenericArg[]& lhs, GenericArg[]& rhs, Bool compare_mutability) {
+        if (lhs.length != rhs.length) {
+            return false;
+        }
+        Int! index = 0;
+        while (index < lhs.length) {
+            if (!self.same_generic_arg(lhs[index], rhs[index], compare_mutability)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool same_generic_arg(GenericArg lhs, GenericArg rhs, Bool compare_mutability) {
+        if (lhs is .type_arg(lhs_type)) {
+            guard rhs is .type_arg(rhs_type) else { return false; }
+            return self.same_type_with_mutability(lhs_type.value, rhs_type.value, compare_mutability);
+        }
+        if (lhs is .const_arg(lhs_const)) {
+            guard rhs is .const_arg(rhs_const) else { return false; }
+            return comptime_value_equal(lhs_const.value, rhs_const.value);
+        }
+        return false;
+    }
+}
+
+Bool comptime_value_slices_equal(
+    comptime_value.ComptimeValue[]& lhs,
+    comptime_value.ComptimeValue[]& rhs
+) {
+    if (lhs.length != rhs.length) {
+        return false;
+    }
+    Int! index = 0;
+    while (index < lhs.length) {
+        if (!comptime_value_equal(lhs[index], rhs[index])) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool comptime_value_equal(comptime_value.ComptimeValue lhs, comptime_value.ComptimeValue rhs) {
+    if (lhs.type_id.to_index() != rhs.type_id.to_index()) {
+        return false;
+    }
+    if (lhs.data is .invalid) { return rhs.data is .invalid; }
+    if (lhs.data is .unit_value) { return rhs.data is .unit_value; }
+    if (lhs.data is .bool_value(lhs_value)) {
+        guard rhs.data is .bool_value(rhs_value) else { return false; }
+        return lhs_value == rhs_value;
+    }
+    if (lhs.data is .int_value(lhs_value)) {
+        guard rhs.data is .int_value(rhs_value) else { return false; }
+        return lhs_value == rhs_value;
+    }
+    if (lhs.data is .uint_value(lhs_value)) {
+        guard rhs.data is .uint_value(rhs_value) else { return false; }
+        return lhs_value == rhs_value;
+    }
+    if (lhs.data is .char_value(lhs_value)) {
+        guard rhs.data is .char_value(rhs_value) else { return false; }
+        return lhs_value == rhs_value;
+    }
+    if (lhs.data is .symbol_value(lhs_value)) {
+        guard rhs.data is .symbol_value(rhs_value) else { return false; }
+        return lhs_value.to_index() == rhs_value.to_index();
+    }
+    if (lhs.data is .const_param_value(lhs_value)) {
+        guard rhs.data is .const_param_value(rhs_value) else { return false; }
+        return lhs_value.to_index() == rhs_value.to_index();
+    }
+    if (lhs.data is .enum_case_value(lhs_value)) {
+        guard rhs.data is .enum_case_value(rhs_value) else { return false; }
+        return lhs_value.to_index() == rhs_value.to_index();
+    }
+    return false;
 }
