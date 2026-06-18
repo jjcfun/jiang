@@ -48,7 +48,7 @@ file        <- top_level_item* eof
 
 top_level_item
             <- compile_block
-             / builtin_block
+             / intrinsic_block
              / extern_block
              / global_destructure
              / top_level_decl
@@ -56,13 +56,13 @@ top_level_item
 compile_block
             <- "comptime" "{" top_level_item* "}"
 
-builtin_block
-            <- builtin_attribute leading_annotation* "{" member_decl* "}"
+intrinsic_block
+            <- intrinsic_attribute leading_annotation* "{" member_decl* "}"
 
-builtin_attribute
-            <- "@" "builtin" "(" builtin_receiver_kind "," type ")"
+intrinsic_attribute
+            <- "@" "intrinsic" "(" intrinsic_receiver_kind "," type ")"
 
-builtin_receiver_kind
+intrinsic_receiver_kind
             <- "value" / "type"
 
 extern_block
@@ -115,10 +115,10 @@ member_decl_body
              / function_decl
 ```
 
-Jiang 统一把 `@where(...)`、`@life(...)`、`@builtin(...)` 这类
-`@name(...)` 形式称为 attribute。`@builtin(value, T)` /
-`@builtin(type, T)` 是编译器内部声明 `$` 操作的 attribute block，
-只允许编译器内部源码使用；普通用户源码写 `@builtin` 会报错。
+Jiang 统一把 `@where(...)`、`@life(...)`、`@intrinsic(...)` 这类
+`@name(...)` 形式称为 attribute。`@intrinsic(value, T)` /
+`@intrinsic(type, T)` 是编译器内部声明 `$` 内禀操作的 attribute block，
+只允许编译器内部源码和标准库内部源码使用；普通用户源码写 `@intrinsic` 会报错。
 
 ```peg
 nominal_decl
