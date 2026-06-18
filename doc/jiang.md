@@ -1667,6 +1667,9 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
 关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Sequence<Element = Int>)`；需要单独写 projection equality 时，使用显式 trait 投影，例如 `@where(T.[Sequence].Element == Int)`。
+`Name == Type` / `Name != Type` 也可用于类型形状匹配，pattern 中的 `_` 表示单个 type argument
+wildcard，例如 `@where(T == Box<_>)`、`@where(T != Option<_>)`。后缀语法糖在这里按 canonical
+builtin type 匹配：`T[]` 匹配 `Slice<_>`，`T[N]` 匹配 `Array<_, _>`。
 例如：
 
 ```c
@@ -2024,7 +2027,11 @@ extend User: HasValue {
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式
 - `extend Holder<T>` / `extend Box<T>` 可以声明 generic receiver extension；`extend Holder<Int>` 这类 specialized target 暂不支持，使用 `@where(T == Int) extend Holder<T> { ... }`
-- `T^` / `T&` / `T*` / `T[*]` 等 type-layer 语法糖作为类型 receiver 时，会按对应具名 builtin owner 查找 extension，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的方法
+- receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend Holder<T>` 或
+  `@where(T != Option<_>) extend Holder<T>`；`_` 只匹配一个 type argument。
+- `T^` / `T&` / `T*` / `T[*]`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型
+  receiver 或 where pattern 时，会按对应 canonical builtin owner 查找和匹配 extension，例如
+  `UInt8[]^` 可查找 `Box<UInt8[]>` 上的方法，`UInt8[3]` 可匹配 `Array<UInt8, _>`。
 - `public extend` 可以跨模块传播；普通 `extend` 只在声明模块和直接导入者可见。`public import` 会继续 re-export imported module 的 public extensions
 - union variant name 和同一 union 的 method name 不能重名，避免 `Union.member(...)` 歧义
 - 同名 method 可以 overload，但参数数量或参数类型必须不同

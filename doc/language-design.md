@@ -820,6 +820,11 @@ T id<T>(T value);
 @where(T: Sequence, T.[Sequence].Element == Int, T: !Mutable, T != Box<_>)
 ```
 
+类型相等/不等约束中的右侧类型可以作为形状 pattern 使用，`_` 匹配单个 type argument。
+例如 `@where(T == Box<_>)` 匹配任意 boxed value，`@where(T != Option<_>)` 排除 optional。
+内建后缀类型在 pattern 中按 canonical builtin type 处理：`T[]` 等价于 `Slice<T>`，`T[N]`
+等价于 `Array<T, N>`。
+
 当前 AST 使用：
 
 - `WhereConstraint`：一条泛型约束。
