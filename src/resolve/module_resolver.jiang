@@ -454,6 +454,7 @@ public struct ModuleResolver: Movable {
 
     () collect_module_aliases(qid.ModuleId module_id) {
         store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
+        self.bind_flatten_import_aliases(module_id, module);
         guard self.asts.unit(module.source_id, module.source_revision) is .some(unit) else { return; }
         resolve_state.AstResolveState state = resolve_state.AstResolveState(
             self.ctx,
@@ -530,7 +531,22 @@ public struct ModuleResolver: Movable {
                 continue;
             }
             if (import_record.target_module is .some(target_module)) {
-                self.record_import_resolution(module_id, index, target_module);
+                if (!import_record.flatten) {
+                    self.record_import_resolution(module_id, index, target_module);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () bind_flatten_import_aliases(qid.ModuleId module_id, store.ModuleRecord& module) {
+        Int! index = 0;
+        while (index < module.imports.len()) {
+            store.ImportRecord import_record = module.imports.get(index);
+            if (import_record.flatten) {
+                if (import_record.target_module is .some(target_module)) {
+                    self.create_flatten_import_aliases(module_id, module, import_record, target_module);
+                }
             }
             index = index + 1;
         }
@@ -557,6 +573,156 @@ public struct ModuleResolver: Movable {
         );
         self.store.resolve.set_import_resolution(module_id, import_index, target_module, alias_def);
         self.refresh_import_alias_namespace(alias_def, target_module);
+    }
+
+    () create_flatten_import_aliases(
+        qid.ModuleId module_id,
+        store.ModuleRecord& module,
+        store.ImportRecord import_record,
+        qid.ModuleId target_module
+    ) {
+        guard self.store.hirs.def(self.store.resolve.module_ref(target_module).def_id) is .some(target_hir) else {
+            return;
+        }
+        Int! index = 0;
+        while (index < target_hir.members.len()) {
+            qid.DefId target_def = target_hir.members.get(index);
+            self.create_flatten_import_alias(module_id, module, import_record, target_def);
+            index = index + 1;
+        }
+    }
+
+    () create_flatten_import_alias(
+        qid.ModuleId module_id,
+        store.ModuleRecord& module,
+        store.ImportRecord import_record,
+        qid.DefId target_def
+    ) {
+        def.DefRecord target_record = self.store.defs.get(target_def);
+        if (target_record.visibility != .public_visibility) {
+            return;
+        }
+        qid.SymbolId alias_symbol = target_record.name.symbol;
+        def.NameDomain domain = self.flatten_import_alias_domain(target_record);
+        Bool duplicate = self.flatten_import_alias_has_conflict(module, import_record, alias_symbol, domain);
+        qid.DefId alias_def = self.create_flatten_import_alias_def(
+            module_id,
+            module,
+            import_record,
+            target_def,
+            target_record,
+            domain
+        );
+        if (!duplicate) {
+            self.store.resolve.bind_name(module.namespace_id, alias_symbol, domain, alias_def, import_record.span);
+        }
+    }
+
+    def.NameDomain flatten_import_alias_domain(def.DefRecord target_record) {
+        if (target_record.kind == .module_def || target_record.kind == .import_alias_def) {
+            return .namespace_name;
+        }
+        return target_record.domain;
+    }
+
+    Bool flatten_import_alias_has_conflict(
+        store.ModuleRecord& module,
+        store.ImportRecord import_record,
+        qid.SymbolId alias_symbol,
+        def.NameDomain domain
+    ) {
+        if (self.store.resolve.first_binding(module.namespace_id, alias_symbol, domain) is .some(existing)) {
+            diagnostics.add_duplicate_def(
+                self.ctx,
+                module.source_id,
+                import_record.span,
+                existing.span,
+                self.store.symbols.text(alias_symbol)
+            );
+            self.store.hirs.mark_error();
+            return true;
+        }
+        return false;
+    }
+
+    qid.DefId create_flatten_import_alias_def(
+        qid.ModuleId module_id,
+        store.ModuleRecord& module,
+        store.ImportRecord import_record,
+        qid.DefId target_def,
+        def.DefRecord target_record,
+        def.NameDomain domain
+    ) {
+        def.DefKind! alias_kind = .alias_def;
+        if (target_record.kind == .module_def || target_record.kind == .import_alias_def) {
+            alias_kind = .import_alias_def;
+        }
+        qid.DefId alias_def = self.store.defs.create(
+            alias_kind,
+            domain,
+            import_record.visibility,
+            def.Name(symbol: target_record.name.symbol, span: import_record.span),
+            module.def_id,
+            module_id,
+            module.namespace_id,
+            target_record.owned_namespace_id
+        );
+        self.store.hirs.declare_def(alias_def, self.flatten_import_hir_decl_kind(alias_kind));
+        self.store.hirs.set_alias_target(alias_def, target_def);
+        self.store.hirs.add_member(module.def_id, alias_def);
+        self.store.source_map.set_def_span(alias_def, module.source_id, import_record.span);
+        self.record_flatten_import_alias_stable_key(
+            module,
+            alias_def,
+            target_record.kind,
+            domain,
+            target_record.name.symbol,
+            import_record.span
+        );
+        return alias_def;
+    }
+
+    hir.HirDeclKind flatten_import_hir_decl_kind(def.DefKind kind) {
+        if (kind == .import_alias_def) {
+            return .import_alias_decl;
+        }
+        return .alias_decl;
+    }
+
+    () record_flatten_import_alias_stable_key(
+        store.ModuleRecord& module,
+        qid.DefId alias_def,
+        def.DefKind target_kind,
+        def.NameDomain domain,
+        qid.SymbolId alias_symbol,
+        token.Span span
+    ) {
+        store.PackageRecord& package_record = self.store.resolve.package_ref(module.package_id);
+        self.store.incremental.record_symbol(
+            self.store.symbols$.ref(),
+            qkey.StableSymbolKey (
+                kind: self.flatten_import_stable_symbol_kind(target_kind),
+                package_name: package_record.name,
+                module_path: module.path_symbol,
+                owner: self.store.incremental.stable_id_for_def(module.def_id),
+                name: alias_symbol,
+                domain: domain
+            ),
+            alias_def
+        );
+    }
+
+    qkey.StableSymbolKind flatten_import_stable_symbol_kind(def.DefKind kind) {
+        if (kind == .trait_def) { return .trait_symbol; }
+        if (kind == .function_def || kind == .init_def || kind == .deinit_def) { return .function_symbol; }
+        if (kind == .global_def) { return .global_symbol; }
+        if (kind == .field_def) { return .field_symbol; }
+        if (kind == .enum_case_def) { return .enum_case_symbol; }
+        if (kind == .union_variant_def) { return .union_variant_symbol; }
+        if (kind == .associated_type_def) { return .associated_type_symbol; }
+        if (kind == .generic_param_def || kind == .local_def || kind == .parameter_def) { return .local_symbol; }
+        if (kind == .module_def || kind == .package_def || kind == .import_alias_def) { return .module_symbol; }
+        return .type_symbol;
     }
 
     // import alias 是目标 module namespace 的一个 view。target module 如果在
