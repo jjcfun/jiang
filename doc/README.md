@@ -12,8 +12,10 @@
 ## 编译器开发文档
 
 - [编译器架构](architecture.md)：阶段边界、store 规则和源码目录约定。
+- [编译器开发流程](develop.md)：破坏性版本升级时的 bootstrap / release 双 worktree 流程。
 - [compiler/](compiler/)：各阶段的详细设计，包括 AST、resolve、HIR、type check、MIR、borrow check、backend、incremental 和测试覆盖。
 
 ## 当前分支
 
-当前 `release/0.4` 分支基于本地安装的 Jiang 0.3.3 产物自举。面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。
+当前 `release/0.4.1` 分支使用 `bootstrap/0.4.1` 过渡编译器验证。面向用户的语言文档应描述
+当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

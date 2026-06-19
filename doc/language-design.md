@@ -3,9 +3,9 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4` 分支已经具备自举编译器、标准库孵化入口、泛型/trait 基础、MIR/backend
-和源码级语言测试。本文档描述当前分支希望稳定下来的语言规则；未定设计必须显式标注，避免
-parser、resolve、sema 在隐含假设上继续扩展。
+当前 `release/0.4.1` 分支已经具备自举编译器、core 源码化入口、标准库孵化入口、
+泛型/trait 基础、MIR/backend 和源码级语言测试。本文档描述当前分支希望稳定下来的语言规则；
+未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
 ## 状态标记
 
@@ -90,6 +90,19 @@ Token 只表示词法事实，不承载语义类型。
 Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越靠右，包裹范围越大。
 
 基础类型名例如 `Int`、`UInt8`、`Bool`、`Float`、`Double`、`Char` 都是普通名字，由 resolver 解析为内建类型。
+
+目标规则：除 `Tuple` 和 `Fn` 暂时排除外，所有类型都拥有自己的 namespace。这里的 namespace
+表示该类型可承载静态函数、实例方法、constructor、associated type、trait implementation
+和 extension 成员；它不要求该类型一定是 `struct` 内存模型。`Int`、`Bool`、array、slice、
+sentinel slice、pointer、reference、box、optional、result、user struct、enum、union、trait
+self type 等都应统一作为 type namespace provider 参与 `Type.member` 和 `value.method`
+lookup。
+
+内建类型和语法糖类型也遵循同一条规则：`UInt8[]&` 的成员 lookup 会落到
+`Reference<Slice<UInt8>>` 的 namespace，`Int[4]` 会落到 array 类型的 namespace，
+`Int` 会落到 builtin integer type 的 namespace。backend 或 MIR 可以继续把 builtin 类型
+lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不是 nominal struct 而拆出
+不同的成员查找路径。
 
 已确定类型语法：
 
@@ -716,8 +729,12 @@ union variant 的外部可见性由外层类型是否 public 控制。
 - 顶层类型、trait 和 associated type 使用 type namespace。
 - 函数、全局变量、builtin value 和普通方法使用 value namespace。
 - 字段、enum case 和 union variant 使用 member namespace。
-- declaration container 拥有自己的 member/type/value 子 namespace，供 `Type.member` 路径继续解析。
+- 每个 type namespace provider 拥有自己的 member/type/value 子 namespace，供 `Type.member`
+  路径继续解析；`struct`、`enum`、`union`、builtin type 和大部分语法糖类型都属于
+  type namespace provider。
 - union variant 虽然底层在 member namespace，仍会和 method 的 value namespace 做额外同名冲突检查。
+- `Tuple` 和 `Fn` 暂时不作为可扩展 namespace provider；后续如果需要 tuple method 或函数类型
+  method，再单独冻结 lookup 和 ABI 规则。
 
 示例：
 
@@ -756,7 +773,10 @@ trait Indexable {
 
 当前规则：
 
-- method 不进入模块顶层命名空间；它们记录在 extend/method side table 中。
+- method 不进入模块顶层命名空间；它们挂到对应 type namespace provider 的成员集合中。
+- `extend` 的目标只要求是可扩展 type namespace provider，不要求目标是源码中的 nominal
+  `struct`。因此 builtin type、array、slice、sentinel slice、pointer/reference/box 等类型
+  都可以通过 core 或 std 源码挂载方法和 trait implementation；`Tuple` 和 `Fn` 暂不支持。
 - 类型内部非 `static` 函数是 instance method，拥有隐式 receiver。默认 receiver 是 `@self(ref)`，函数体内 `self: Self&`；`@self(move)` 表示调用会消耗 receiver，函数体内 `self: Self`。
 - `static` 类型函数没有 receiver，函数体中不能使用 `self`。
 - `init(...)` 是 constructor，拥有初始化中的 `self` 目标；`self` 在 `init` body 中表示正在初始化的 `Self` storage。`init` 只能通过 `Type(...)` / `new Type(...)` 调用，不作为普通函数值暴露。

@@ -4,12 +4,11 @@
 
 # Jiang语言
 
-当前 Jiang 语言编译器处于 stage2 开发阶段，已经可以稳定自举。stage0 和 stage1 由 vibe coding
-产生（在 stage1 分支）；stage2 将采取人工方式编写和审核代码。0.3.1 之后的编译器开发只依赖
-上一版稳定 `jiangc` 作为 bootstrap 输入，不再依赖 stage1 工作区或 stage1 产物。
+当前 Jiang 语言编译器已经可以稳定自举。常规版本开发只依赖上一版稳定 `jiangc` 作为
+bootstrap 输入；如果新版本包含旧 release 编译器无法直接编译的破坏性升级，则使用
+`bootstrap/<version>` 和 `release/<version>` 双 worktree 流程。
 
-Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。这里先卖个关子：0.4 版本会引入一个
-杀手级特性，它会是这门语言真正拉开差异的起点。
+Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构会继续快速迭代。
 
 [官网与语言文档](https://jiang-lang.org/)
 
@@ -17,7 +16,7 @@ Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。
 
 ## 构建自举编译器
 
-当前 0.3.1 主线仍以 macOS arm64 作为开发、验证和 release host。编译器本身依赖本机 LLVM 21。
+当前 release 分支仍以 macOS arm64 作为主要开发、验证和 release host。编译器本身依赖本机 LLVM 21。
 构建脚本会通过 `script/llvm_env.sh` 查找 `LLVM_CONFIG`、`JIANG_LLVM_ROOT`、`LLVM_ROOT`、
 `llvm-config-21`、Homebrew `llvm@21` 和 Linux 常见 `/usr/lib/llvm-21` 等路径。
 
@@ -25,8 +24,8 @@ Jiang 目前仍处于 0.2 版本阶段，现阶段看上去或许平平无奇。
 bash ./script/install_llvm_macos.sh
 ```
 
-构建当前源码需要先安装 Jiang `0.3.0` 稳定版，并确保对应的 `jiangc` 已在 PATH 中。0.3.1
-不再依赖 stage1 工作区或 stage1 产物：
+构建当前源码需要先安装一个 `script/build_next.sh` 支持的 Jiang release 编译器，并确保
+对应的 `jiangc` 已在 PATH 中；也可以通过 `BOOTSTRAP_BIN` 显式指定：
 
 ```bash
 jiangc --version
@@ -41,7 +40,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-jiangc 0.3.0 -> build/jiangc.next
+bootstrap jiangc -> build/jiangc.next
 ```
 
 并默认用 `build/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -50,8 +49,8 @@ jiangc 0.3.0 -> build/jiangc.next
 build/jiangc.next
 ```
 
-构建脚本会直接检测 PATH 中的 `jiangc`，并要求版本为 `0.3.0`。如只想构建不跑验证，可设置
-`VERIFY=none`；只跑 smoke 可设置 `VERIFY=smoke`。
+构建脚本会检测 bootstrap compiler 版本。如只想构建不跑验证，可设置 `VERIFY=none`；
+只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
 `build/jiangc.next --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。release 阶段需要完整
@@ -61,7 +60,10 @@ build/jiangc.next
 BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 ```
 
-0.3.1 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
+破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。正式 release 前需要在
+`release/<version>` 上使用对应的 `bootstrap/<version>` 编译器完成构建、语言测试和 stable bootstrap。
+
+当前 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
 Wasm `wasm32-unknown-unknown` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke，
 但这些 target 的 executable、linker 和 startup 路径迁移到后续版本稳定。no-libc、syscall 和
 inline asm 相关能力等待自定义 DSL 机制稳定后再进入实现阶段。
@@ -99,6 +101,7 @@ release zip 不内置 `libLLVM.dylib`，用户机器需要安装 `llvm@21`。包
 
 - [官网与语言文档](https://jiang-lang.org/)
 - [架构文档](doc/architecture.md)
+- [编译器开发流程](doc/develop.md)
 - [Std incubator](doc/std.md)
 - 阶段设计：[AST](doc/compiler/ast.md)、[Resolve](doc/compiler/resolve.md)、[HIR](doc/compiler/hir.md)、
   [Type Check](doc/compiler/type-check.md)、[Monomorph](doc/compiler/monomorph.md)、
