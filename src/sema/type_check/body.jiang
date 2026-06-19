@@ -441,9 +441,19 @@ public struct BodyCheck: Movable {
             }
         }
         if (node.data is .member_access(_)) {
+            if (self.function_value_expected(node_id, expected_type) is .some(type_id)) {
+                self.state.results.set_node_type(node_id, type_id);
+                return type_id;
+            }
             if (self.dot_prefix_variant_def(node_id, expected_type) is .some(variant_def)) {
                 qid.TypeId type_id = self.enum_case_value_type(variant_def);
                 self.state.results.select_member(node_id, variant_def);
+                self.state.results.set_node_type(node_id, type_id);
+                return type_id;
+            }
+        }
+        if (node.data is .name_ref(_)) {
+            if (self.function_value_expected(node_id, expected_type) is .some(type_id)) {
                 self.state.results.set_node_type(node_id, type_id);
                 return type_id;
             }
@@ -455,6 +465,140 @@ public struct BodyCheck: Movable {
             }
         }
         return self.check_node(node_id);
+    }
+
+    qid.TypeId? function_value_expected(hir.HirId node_id, qid.TypeId expected_type) {
+        if (!self.type_is_function(expected_type)) {
+            return null;
+        }
+        guard self.expected_function_value_def(node_id, expected_type) is .some(function_def) else {
+            return null;
+        }
+        self.ensure_const_dependency_checked(function_def);
+        self.state.results.select_member(node_id, function_def);
+        self.record_function_value_instance(node_id, function_def);
+        return self.function_value_type(node_id, function_def);
+    }
+
+    Bool type_is_function(qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        return info.data is .function_type(_);
+    }
+
+    qid.DefId? expected_function_value_def(hir.HirId node_id, qid.TypeId expected_type) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(def_id) else { return null; }
+            return self.expected_function_overload_def(node_id, def_id, expected_type, null);
+        }
+        if (node.data is .member_access(member_access)) {
+            guard self.initial_function_member_def(member_access) is .some(member_def) else { return null; }
+            return self.expected_function_overload_def(node_id, member_def, expected_type, member_access);
+        }
+        return null;
+    }
+
+    qid.DefId? initial_function_member_def(hir.HirMemberAccess member_access) {
+        if (self.namespace_call_member_def(member_access) is .some(member_def)) {
+            return member_def;
+        }
+        qid.TypeId raw_base_type = self.raw_member_base_type(member_access.base);
+        qid.TypeId base_type = self.member_lookup_type_for_base(member_access.base, raw_base_type);
+        return self.type_ops.function_member_for_type(
+            base_type,
+            member_access.base.owner_def,
+            member_access.member_symbol
+        );
+    }
+
+    qid.DefId? expected_function_overload_def(
+        hir.HirId node_id,
+        qid.DefId initial_def,
+        qid.TypeId expected_type,
+        hir.HirMemberAccess? member_access
+    ) {
+        def.DefRecord initial = self.state.store.defs.get(initial_def);
+        if (!self.overloadable_call_kind(initial.kind)) {
+            return null;
+        }
+        qid.DefId! selected = initial_def;
+        Int! matches = 0;
+        table.MultiTableCursor! cursor = self.state.store.resolve.first_binding_cursor(
+            initial.decl_namespace_id,
+            initial.name.symbol,
+            initial.domain
+        );
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
+            if (self.function_value_candidate_matches(node_id, binding.def_id, expected_type, member_access)) {
+                selected = binding.def_id;
+                matches = matches + 1;
+            }
+            cursor = self.state.store.resolve.next_binding_cursor(cursor);
+        }
+        if (matches == 1) {
+            return selected;
+        }
+        if (matches > 1) {
+            self.type_ops.add_node_error(node_id, "function value is ambiguous", "ambiguous_function_value");
+        }
+        return null;
+    }
+
+    Bool function_value_candidate_matches(
+        hir.HirId node_id,
+        qid.DefId candidate_def,
+        qid.TypeId expected_type,
+        hir.HirMemberAccess? member_access
+    ) {
+        if (!self.type_ops.def_accessible_from(candidate_def, node_id.owner_def)) {
+            return false;
+        }
+        if (!self.overloadable_call_kind(self.state.store.defs.get(candidate_def).kind)) {
+            return false;
+        }
+        qid.TypeId candidate_type = self.function_value_type_for_member(candidate_def, member_access);
+        return self.type_ops.same_type_ignoring_mutability(candidate_type, expected_type);
+    }
+
+    qid.TypeId function_value_type(hir.HirId node_id, qid.DefId function_def) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .member_access(member_access)) {
+            return self.function_value_type_for_member(function_def, member_access);
+        }
+        return self.type_ops.type_for_def(function_def);
+    }
+
+    qid.TypeId function_value_type_for_member(qid.DefId function_def, hir.HirMemberAccess? member_access) {
+        qid.TypeId raw_type = self.function_value_raw_type(function_def);
+        guard member_access is .some(access) else {
+            return raw_type;
+        }
+        qid.TypeId raw_base_type = self.raw_member_base_type(access.base);
+        qid.TypeId base_type = self.member_lookup_type_for_base(access.base, raw_base_type);
+        guard self.state.store.defs.get(function_def).owner_def is .some(owner_def) else {
+            return raw_type;
+        }
+        list.ArrayList<qid.TypeId>! type_args = list.ArrayList<qid.TypeId>();
+        if (!self.append_receiver_type_args(type_args$.ref(), base_type, function_def)) {
+            return raw_type;
+        }
+        return self.type_ops.substitute_generic_type(raw_type, owner_def, type_args$.ref());
+    }
+
+    qid.TypeId function_value_raw_type(qid.DefId function_def) {
+        guard self.function_signature_for_def(function_def) is .some(signature) else {
+            return self.type_ops.type_for_def(function_def);
+        }
+        return self.type_ops.check_function_signature(function_def, signature);
+    }
+
+    () record_function_value_instance(hir.HirId node_id, qid.DefId function_def) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        guard node.data is .member_access(member_access) else { return; }
+        qid.TypeId raw_base_type = self.raw_member_base_type(member_access.base);
+        qid.TypeId base_type = self.member_lookup_type_for_base(member_access.base, raw_base_type);
+        self.record_member_receiver_instance(node_id, base_type, function_def);
     }
 
     qid.TypeId? check_new_value_expected(hir.HirId node_id, hir.HirUnary unary, qid.TypeId expected_type) {
@@ -2235,7 +2379,7 @@ public struct BodyCheck: Movable {
             }
             return self.state.store.types.invalid_type();
         }
-        if (!self.record_ordered_call_args(node_id, call)) {
+        if (!self.record_ordered_call_args_for_function_type(node_id, call, function_type)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
                 node_id,
@@ -2267,6 +2411,27 @@ public struct BodyCheck: Movable {
         return self.substituted_call_result_type(node_id, call, type_args$.ref(), function_type.result);
     }
 
+    Bool record_ordered_call_args_for_function_type(
+        hir.HirId node_id,
+        hir.HirCall call,
+        types.FunctionType function_type
+    ) {
+        if (call.args.length != function_type.params.length) {
+            return false;
+        }
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>(function_type.params.length);
+        Int! index = 0;
+        while (index < call.args.length) {
+            if (call.args[index].label != null) {
+                return false;
+            }
+            values.add(call.args[index].value);
+            index = index + 1;
+        }
+        self.state.results.set_call_args(node_id, values$.ref());
+        return true;
+    }
+
     list.ArrayList<qid.TypeId> preselect_call_type_args(hir.HirId[]& arg_refs) {
         if (self.all_call_generic_args_are_types(arg_refs)) {
             return self.type_ops.check_type_args(arg_refs);
@@ -2290,7 +2455,51 @@ public struct BodyCheck: Movable {
         if (self.initial_call_def(call) != null) {
             return;
         }
+        if (self.prepare_member_call_callee_selection(call.callee)) {
+            return;
+        }
         self.check_node(call.callee);
+    }
+
+    Bool prepare_member_call_callee_selection(hir.HirId callee_id) {
+        hir.HirNode callee = self.state.hirs.node(callee_id);
+        guard callee.data is .member_access(member_access) else { return false; }
+        guard self.call_member_def(member_access) is .some(member_def) else { return false; }
+        self.state.results.select_member(callee_id, member_def);
+        self.state.results.set_node_type(callee_id, self.call_member_type(member_access, member_def));
+        return true;
+    }
+
+    qid.DefId? call_member_def(hir.HirMemberAccess member_access) {
+        if (self.namespace_call_member_def(member_access) is .some(member_def)) {
+            return member_def;
+        }
+        qid.TypeId raw_base_type = self.raw_member_base_type(member_access.base);
+        qid.TypeId base_type = self.member_lookup_type_for_base(member_access.base, raw_base_type);
+        return self.type_ops.function_member_for_type(
+            base_type,
+            member_access.base.owner_def,
+            member_access.member_symbol
+        );
+    }
+
+    qid.DefId? namespace_call_member_def(hir.HirMemberAccess member_access) {
+        guard self.namespace_base_def(member_access.base) is .some(base_def) else { return null; }
+        guard self.state.store.defs.get(base_def).owned_namespace_id is .some(namespace_id) else { return null; }
+        qid.TypeId base_type = self.raw_member_base_type(member_access.base);
+        return self.type_ops.visible_member_in_domain(
+            base_type,
+            member_access.base.owner_def,
+            namespace_id,
+            member_access.member_symbol,
+            .value_name
+        );
+    }
+
+    qid.TypeId call_member_type(hir.HirMemberAccess member_access, qid.DefId member_def) {
+        qid.TypeId raw_base_type = self.raw_member_base_type(member_access.base);
+        qid.TypeId base_type = self.member_lookup_type_for_base(member_access.base, raw_base_type);
+        return self.member_type_for_base(base_type, member_def);
     }
 
     qid.TypeId check_selected_function_call(
@@ -2739,8 +2948,8 @@ public struct BodyCheck: Movable {
 
     qid.TypeId selected_callee_type(hir.HirCall call, qid.DefId selected_def) {
         hir.HirNode callee = self.state.hirs.node(call.callee);
-        if (callee.data is .member_access(_)) {
-            return self.check_node(call.callee);
+        if (callee.data is .member_access(member_access)) {
+            return self.call_member_type(member_access, selected_def);
         }
         return self.type_ops.type_for_def(selected_def);
     }
