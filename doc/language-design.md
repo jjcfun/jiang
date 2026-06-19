@@ -103,8 +103,8 @@ Jiang 类型语法遵循从左往右、从里到外的原则。类型后缀越�
 - `T?!`：optional 类型层可变的规范写法。
 - `T^`：`Box<T>` 的类型语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
 - `T&`：`Reference<T>` 的类型语法糖，表示非 owning 引用，不表达释放职责。
-- `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` 是 unsized array pointee，不能作为普通 value。
-- `T[:0]&`：borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。裸 `T[:0]` 是带 sentinel 的 unsized array pointee，不能作为普通 value；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
+- `T[]&`：`Reference<Slice<T>>` 的语法糖，borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value。
+- `T[:0]&`：`Reference<SentinelSlice<T, 0>>` 的语法糖，borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。裸 `T[:0]` / `SentinelSlice<T, 0>` 是带 sentinel 的 unsized array type，不能作为普通 value；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
 - `T[*]`：`ManyPointer<T>` 的类型语法糖，不默认自动解引用，只能通过下标访问元素。
 - `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
 - `T*`：`RawPointer<T>` 的类型语法糖，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
@@ -257,21 +257,21 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
-- `T[]`：unsized array pointee，必须通过 `T[]&` 形成 borrowed slice view；slice view 语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权。
+- `T[]`：`Slice<T>` 的语法糖，表示 unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^` 形成 owning handle。
 - `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
-- `T[:0]`：带 sentinel 的 unsized array pointee，必须通过 `T[:0]&` 形成 sentinel slice view；slice view 语义上类似 `{ T[*:0], length }&`，并保证 `data[length] == 0`。
+- `T[:0]`：带 sentinel 的 unsized array type，必须通过 `T[:0]&` 形成 sentinel slice view，或通过 `T[:0]^` 形成 owning handle；sentinel view 保证 `data[length] == 0`。
 
 标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_array()` 使用 `@self(move)` 消耗
 receiver，并把 initialized 区间转移为 owning `T[]^`。
 
-`T&`、`T&!` 和 `T[]` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]` 字段时，目标对象的生命周期必须覆盖包含该字段的值。
+`T&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]&` 字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，不能作为普通字段类型。
 
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
 `!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、
 channel 或用户协议保证。
 
 `^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
-或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*`、`T[*]` 和 `T[]`
+或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*`、`T[*]` 和 `T[]&`
 是 ABI/低层指针视图，可以按 C ABI 需要叠加。归一化阶段如果因为泛型替换得到重复同类
 language handle，可以合并；如果得到 `^` 与 `&` 混合的 handle 层，必须保留错误状态并报告
 diagnostic。
@@ -344,7 +344,7 @@ move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable 
 
 - `T^` 是 owning pointer。它拥有指向的堆对象，并参与自动析构。
 - `T&` 是非 owning 引用。它不拥有资源，不参与自动析构。
-- `T[*]`、`T*` 是低层指针；`T[]` 是 slice reference。它们不表达所有权，不参与自动析构。
+- `T[*]`、`T*` 是低层指针；`T[]&` 是 slice reference。它们不表达所有权，不参与自动析构。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 
 自动析构规则：
 
@@ -354,7 +354,7 @@ move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable 
   如果内部类型需要 drop，外层按结构递归 drop。
 - `T&`、`T*`、`T[*]` 本身不拥有目标对象，不会因为 element type 是 `Movable`
   就自动 drop。
-- `T[]` 本身不拥有整段 buffer，drop slice 变量时不 drop 全部元素；但 `slice[i]`
+- `T[]&` 本身不拥有整段 buffer，drop slice reference 时不 drop 全部元素；但 `slice[i]`
   是一个已初始化 `T` place，覆盖该元素时按 `T` 的 drop 规则处理旧值。
 - 经过 `T*` / `T[*]` 得到的 place 是低层裸指针派生 place，写入时是 raw write，
   不隐式 drop 旧值。
@@ -386,7 +386,7 @@ implicit copy / Movable 规则：
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
 - 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
 - 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。

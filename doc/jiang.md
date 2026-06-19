@@ -388,9 +388,9 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
-- `T[]&`：borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；裸 `T[]` 是 unsized array pointee，不能作为普通 value
+- `T[]&`：`Reference<Slice<T>>` 的语法糖，是 borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value
 - `T[*:0]`：sentinel many-pointer，不带 length，适合 C string ABI
-- `T[:0]&`：sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array pointee，不能作为普通 value
+- `T[:0]&`：`Reference<SentinelSlice<T, 0>>` 的语法糖，是 sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
 
 只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T[*]` 和 `T*` 都不拥有目标对象。
 
@@ -539,16 +539,16 @@ Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源�
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
-- `T[*]`、`T*` 是低层指针；`T[]` 是 slice reference。它们不表达语言级所有权。
+- `T[*]`、`T*` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 - 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
-- `T&`、`T&!`、`T[*]`、`T*` 字段不会被编译器自动释放。
-- `T[]` 本身不拥有整段 buffer；drop slice 变量时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]&` 字段不会被编译器自动释放。
+- `T[]&` 本身不拥有整段 buffer；drop slice reference 时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
 - 经过 `T*` / `T[*]` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 
 显式转移所有权使用 `move()`：
@@ -561,8 +561,10 @@ Buffer^ b = a$.move();
 
 ### 切片（Slice）
 
-slice 是一个带有 `length` 属性的连续内存引用视图。它与数组的区别在于：数组类型的长度是在编译器确定的，而 slice 的长度在运行时确定。
-`T[]` 本身不持有所有权，语义上类似 `{ T[*], length }&`：它引用一段外部连续存储，并要求被引用存储的 lifetime 覆盖 slice 的使用范围。
+`Slice<T>`（后缀写法 `T[]`）是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]` 不能作为普通 value 单独存放或传递。
+`T[]&` / `Reference<Slice<T>>` 才是借用的 slice view，运行时 layout 类似 `{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 slice view 的使用范围。
+`T[]^` / `Box<Slice<T>>` 是 owned unsized array，拥有已初始化的 buffer，drop 时会按元素类型逐个析构并释放底层 allocation。
+`SentinelSlice<T, S>`（后缀写法 `T[:S]`）同样是 unsized array type；`T[:S]&` 是带 sentinel 保证的 borrowed view。
 标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_array()` 会消耗 `Vector`，
 把已初始化区间交给返回的 `T[]^` 拥有，调用后原 `Vector` 失效。
 
@@ -570,8 +572,8 @@ slice 是一个带有 `length` 属性的连续内存引用视图。它与数组�
 // x为一个数组
 Int[_] x = [1, 2, 3];
 
-// 数组自动转换为切片
-Int[] y = x[..];
+// 数组自动转换为 borrowed slice view
+Int[]& y = x[..];
 
 print("y.length = %d", y.length); // 输出：y.length = 3
 ```
@@ -707,15 +709,15 @@ sort(list, (Int left, Int right) => left < right);
 
 ```c
 // 排序
-Int[] sort(Int[] list, Fn<Bool, Int, Int> compare)
+Int[]& sort(Int[]& list, Fn<Bool, Int, Int> compare)
 
 // 支持泛型的排序，其中 T 需要实现 Numeric
 @where(T: Numeric)
-T[] sort<T>(T[] list, Fn<Bool, T, T> compare)
+T[]& sort<T>(T[]& list, Fn<Bool, T, T> compare)
 
 // 支持泛型的排序，会抛出异常，其中 E 可以为任意类型
 @where(T: Numeric)
-T[]@E sort<T, E>(T[] list, Fn<Bool@E, T, T> compare)
+T[]&@E sort<T, E>(T[]& list, Fn<Bool@E, T, T> compare)
 ```
 
 #### 函数指针
@@ -857,11 +859,11 @@ lambda 规则：
 
 ```c
 @where(T: Numeric, E2: CompareError)
-async T[]@E1 sort<T, E1, E2>(T[] list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]> compare)
+async T[]&@E1 sort<T, E1, E2>(T[]& list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]&> compare)
 
 @where(T: Numeric, E2: CompareError)
 @alias(Cmp = Fn<async Bool@E2, T, T>)
-async T[]@E1 sort<T, E1, E2>(T[] list, Fn<async Cmp@E1, T[]> compare)
+async T[]&@E1 sort<T, E1, E2>(T[]& list, Fn<async Cmp@E1, T[]&> compare)
 ```
 
 ### 控制流（Control Flow）

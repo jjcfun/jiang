@@ -67,7 +67,8 @@ LayoutStore
 - function pointer layout
 - optional layout：第一版使用显式 `{ tag, payload }`，不做 niche 优化
 - `T&` / `T^` / `T*` / `T[*]` / `T[*:0]` layout：pointer-sized scalar，layout key 保留 handle kind 和 sentinel 标记
-- `T[]` / `T[:0]` layout：pointer + pointer-sized unsigned length；sentinel 不改变物理 layout，只改变类型语义
+- `T[]` / `T[:0]` 是 unsized array type，没有独立 by-value layout；`T[]&` / `T[:0]&` borrowed view layout 是 pointer + pointer-sized unsigned length，sentinel 不改变物理 layout，只改变类型语义
+- `T[]^` / `T[:0]^` owned unsized array handle 当前也使用 pointer + pointer-sized unsigned length，但它表达 buffer 所有权，drop 时需要析构元素并释放 allocation
 - enum layout：当前 enum 无 associated value，使用 enum underlying integer scalar
 - union layout：Jiang union 是 tagged union，第一版使用 target int tag + max payload slot
 - aggregate alignment policy
@@ -83,7 +84,7 @@ aggregate layout 第一版使用自然 ABI 规则：每个 field offset 按 fiel
 layout 需要独立 active stack：
 
 - by-value struct 自递归是 layout cycle。
-- pointer/reference/slice/function pointer 会打断 by-value layout cycle。
+- pointer/reference/slice handle/function pointer 会打断 by-value layout cycle；裸 unsized array type 不能作为普通 by-value 字段。
 - cycle diagnostic 应通过 source map 指向参与 cycle 的 nominal definitions。
 
 ## 不变量

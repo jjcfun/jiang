@@ -23,6 +23,8 @@ import std;
 - `String`：UTF-8 字节字符串，当前仍处于基础能力阶段。
 - 内建类型和 trait 的公开别名：例如 `Option<T>`、`Result<T, E>`、`Box<T>`、`Reference<T>`、
   `Slice<T>`、`SentinelSlice<T, S>`、`RawPointer<T>`、`ManyPointer<T>` 等。
+  其中 `Slice<T>` / `SentinelSlice<T, S>` 是 unsized array type 的公开名字；借用 view 需要通过
+  `Reference<Slice<T>>` / `Reference<SentinelSlice<T, S>>`，也就是后缀语法 `T[]&` / `T[:S]&` 表达。
 
 ## 稳定性边界
 
