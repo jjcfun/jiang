@@ -5,6 +5,7 @@ import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import qid = "../store/id.jiang";
 import def = "../resolve/def.jiang";
+import contiguous = "../sema/contiguous.jiang";
 import drop_semantics = "../sema/drop.jiang";
 import types = "../sema/type.jiang";
 import token = "../syntax/token.jiang";
@@ -97,7 +98,7 @@ mir.MirFunction elaborate_function(
     DropFlagMap flags = build_drop_flags(ctx, body);
     // cleanup 临时位既用于自定义 deinit 的 unit 结果，也用于 owner pointer 的 free statement。
     Bool needs_cleanup_result = flags.flag_count > 0;
-    Bool needs_slice_drop_temps = body_needs_owned_slice_drop_temps(ctx, body);
+    Bool needs_slice_drop_temps = body_needs_contiguous_drop_temps(ctx, body);
     DropTemps temps = drop_temps(body, flags, needs_cleanup_result, needs_slice_drop_temps);
     mir.MirLocalDecl[]& locals = copy_locals_with_drop_flags(
         ctx,
@@ -604,10 +605,10 @@ mir.MirLocalDecl deinit_result_local(context.CompilerContext& ctx, mir.MirLocalI
     );
 }
 
-Bool body_needs_owned_slice_drop_temps(context.CompilerContext& ctx, mir.MirBody body) {
+Bool body_needs_contiguous_drop_temps(context.CompilerContext& ctx, mir.MirBody body) {
     Int! index = 0;
     while (index < body.locals.length) {
-        if (type_needs_owned_slice_drop_loop(ctx, body.locals[index].type_id)) {
+        if (type_needs_contiguous_drop_loop(ctx, body.locals[index].type_id)) {
             return true;
         }
         index = index + 1;
@@ -615,27 +616,31 @@ Bool body_needs_owned_slice_drop_temps(context.CompilerContext& ctx, mir.MirBody
     return false;
 }
 
-Bool type_needs_owned_slice_drop_loop(context.CompilerContext& ctx, qid.TypeId type_id) {
-    types.TypeInfo info = ctx.store.types.get(type_id);
-    if (info.data is .handle_type(handle)) {
-        if (handle.kind != .owner_pointer) { return false; }
-        guard owned_slice_value_element_type(ctx, handle) is .some(element) else { return false; }
-        return type_needs_drop(ctx, element);
+Bool type_needs_contiguous_drop_loop(context.CompilerContext& ctx, qid.TypeId type_id) {
+    contiguous.ContiguousQuery query = contiguous.ContiguousQuery(ctx.store$.ref());
+    if (query.info_for_type(type_id) is .some(info)) {
+        if (info.static_count is .some(count)) {
+            return count > 0 && type_needs_drop(ctx, info.element);
+        }
+        if (info.owned_storage) {
+            return type_needs_drop(ctx, info.element);
+        }
     }
+    types.TypeInfo info = ctx.store.types.get(type_id);
     if (info.data is .optional(optional_type)) {
-        return type_needs_owned_slice_drop_loop(ctx, optional_type.element);
+        return type_needs_contiguous_drop_loop(ctx, optional_type.element);
     }
     if (info.data is .error_union(error_union_type)) {
-        return type_needs_owned_slice_drop_loop(ctx, error_union_type.value)
-            || type_needs_owned_slice_drop_loop(ctx, error_union_type.error);
+        return type_needs_contiguous_drop_loop(ctx, error_union_type.value)
+            || type_needs_contiguous_drop_loop(ctx, error_union_type.error);
     }
     if (info.data is .array_type(array_type)) {
-        return type_needs_owned_slice_drop_loop(ctx, array_type.element);
+        return type_needs_contiguous_drop_loop(ctx, array_type.element);
     }
     if (info.data is .tuple_type(tuple_type)) {
         Int! index = 0;
         while (index < tuple_type.items.length) {
-            if (type_needs_owned_slice_drop_loop(ctx, tuple_type.items[index])) {
+            if (type_needs_contiguous_drop_loop(ctx, tuple_type.items[index])) {
                 return true;
             }
             index = index + 1;
@@ -648,7 +653,7 @@ Bool type_needs_owned_slice_drop_loop(context.CompilerContext& ctx, qid.TypeId t
         layout.TypeLayout type_layout = layout_for_type(ctx, type_id);
         Int! index = 0;
         while (index < type_layout.fields.length) {
-            if (type_needs_owned_slice_drop_loop(ctx, type_layout.fields[index].field_type)) {
+            if (type_needs_contiguous_drop_loop(ctx, type_layout.fields[index].field_type)) {
                 return true;
             }
             index = index + 1;
@@ -1226,6 +1231,22 @@ DropExpansion append_drop_expansion_chain(
             blocks
         );
     }
+    if (info.data is .array_type(array_type)) {
+        if (array_type.count == 0 || !type_needs_drop(ctx, array_type.element)) {
+            return DropExpansion(next_target, false);
+        }
+        return append_contiguous_element_drop_chain(
+            ctx,
+            output,
+            temps,
+            source_block,
+            place,
+            array_type.element,
+            uint_operand(ctx, array_type.count, source_block.terminator.span),
+            next_target,
+            blocks
+        );
+    }
     if (info.data is .handle_type(handle_type)) {
         if (handle_type.kind == .owner_pointer) {
             return append_owner_pointer_drop_chain(
@@ -1265,17 +1286,19 @@ DropExpansion append_owner_pointer_drop_chain(
         next_target,
         blocks
     );
-    if (owned_slice_value_element_type(ctx, handle_type) is .some(slice_element)) {
-        if (!type_needs_drop(ctx, slice_element)) {
+    contiguous.ContiguousQuery query = contiguous.ContiguousQuery(ctx.store$.ref());
+    if (query.owned_storage_info_for_handle(handle_type) is .some(storage)) {
+        if (!type_needs_drop(ctx, storage.element)) {
             return DropExpansion(free_target, true);
         }
-        return append_owned_slice_element_drop_chain(
+        return append_contiguous_element_drop_chain(
             ctx,
             output,
             temps,
             source_block,
             place,
-            slice_element,
+            storage.element,
+            copy_operand_for_place(field_index_place(output, place, 1)),
             free_target,
             blocks
         );
@@ -1325,20 +1348,21 @@ mir.MirBlockId append_owner_pointer_free_block(
     return id;
 }
 
-DropExpansion append_owned_slice_element_drop_chain(
+DropExpansion append_contiguous_element_drop_chain(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     DropTemps temps,
     mir.MirBlock source_block,
     mir.MirPlace place,
     qid.TypeId element_type,
-    mir.MirBlockId free_target,
+    mir.MirOperand count,
+    mir.MirBlockId done_target,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
-    guard temps.slice_drop_index is .some(index_local) else { return DropExpansion(free_target, true); }
-    guard temps.slice_drop_condition is .some(condition_local) else { return DropExpansion(free_target, true); }
+    guard temps.slice_drop_index is .some(index_local) else { return DropExpansion(done_target, true); }
+    guard temps.slice_drop_condition is .some(condition_local) else { return DropExpansion(done_target, true); }
     mir.MirBlockId condition_id = mir.MirBlockId.from_index(blocks.len());
-    blocks.add(placeholder_block(output, condition_id, source_block, free_target));
+    blocks.add(placeholder_block(output, condition_id, source_block, done_target));
 
     mir.MirPlace element_place = indexed_place(output, place, index_local);
     mir.MirBlockId element_drop = append_place_drop_block(
@@ -1351,7 +1375,7 @@ DropExpansion append_owned_slice_element_drop_chain(
         condition_id,
         blocks
     );
-    mir.MirBlockId decrement = append_owned_slice_drop_decrement_block(
+    mir.MirBlockId decrement = append_contiguous_drop_decrement_block(
         ctx,
         output,
         source_block,
@@ -1359,15 +1383,15 @@ DropExpansion append_owned_slice_element_drop_chain(
         element_drop,
         blocks
     );
-    mir.MirBlockId init_block = append_owned_slice_drop_init_block(
+    mir.MirBlockId init_block = append_contiguous_drop_init_block(
         output,
         source_block,
         index_local,
-        field_index_place(output, place, 1),
+        count,
         condition_id,
         blocks
     );
-    blocks.set(condition_id.to_index(), owned_slice_drop_condition_block(
+    blocks.set(condition_id.to_index(), contiguous_drop_condition_block(
         ctx,
         output,
         condition_id,
@@ -1375,16 +1399,16 @@ DropExpansion append_owned_slice_element_drop_chain(
         index_local,
         condition_local,
         decrement,
-        free_target
+        done_target
     ));
     return DropExpansion(init_block, true);
 }
 
-mir.MirBlockId append_owned_slice_drop_init_block(
+mir.MirBlockId append_contiguous_drop_init_block(
     mir.MirStore& output,
     mir.MirBlock source_block,
     mir.MirLocalId index_local,
-    mir.MirPlace length_place,
+    mir.MirOperand count,
     mir.MirBlockId next_target,
     list.ArrayList<mir.MirBlock>& blocks
 ) {
@@ -1394,7 +1418,7 @@ mir.MirBlockId append_owned_slice_drop_init_block(
         span: source_block.terminator.span,
         kind: mir.assign_statement_kind(mir.MirAssignStatement (
             destination: local_place(output, index_local),
-            value: mir.use_rvalue(mir.MirUseRvalue (value: copy_operand_for_place(length_place)))
+            value: mir.use_rvalue(mir.MirUseRvalue (value: count))
         ))
     ));
     blocks.add(mir.MirBlock (
@@ -1406,7 +1430,7 @@ mir.MirBlockId append_owned_slice_drop_init_block(
     return id;
 }
 
-mir.MirBlockId append_owned_slice_drop_decrement_block(
+mir.MirBlockId append_contiguous_drop_decrement_block(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     mir.MirBlock source_block,
@@ -1436,7 +1460,7 @@ mir.MirBlockId append_owned_slice_drop_decrement_block(
     return id;
 }
 
-mir.MirBlock owned_slice_drop_condition_block(
+mir.MirBlock contiguous_drop_condition_block(
     context.CompilerContext& ctx,
     mir.MirStore& output,
     mir.MirBlockId id,
@@ -1612,13 +1636,6 @@ Bool field_needs_drop(context.CompilerContext& ctx, layout.FieldLayout field) {
 Bool type_needs_drop(context.CompilerContext& ctx, qid.TypeId type_id) {
     drop_semantics.DropQuery query = drop_semantics.DropQuery(ctx);
     return query.type_needs_runtime_drop(type_id);
-}
-
-qid.TypeId? owned_slice_value_element_type(context.CompilerContext& ctx, types.HandleType handle_type) {
-    if (handle_type.kind != .owner_pointer) { return null; }
-    types.TypeInfo element_info = ctx.store.types.get(handle_type.element);
-    guard element_info.data is .slice_value_type(slice_value) else { return null; }
-    return slice_value.element;
 }
 
 mir.MirBlockId append_field_drop_block(
