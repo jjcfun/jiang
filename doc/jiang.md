@@ -256,7 +256,7 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `Int$.align()`：获取类型 `Int` 的 ABI 对齐
 - `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
 - `Int$.alloc()`：分配一个未初始化的 `Int![*]`，长度为 `1`
-- `Int$.alloc(10)` / `Int$.alloc_many(10)` / `Int$.alloc_array(10)`：分配一个长度为 `10` 的 `Int![*]`
+- `Int$.alloc(10)` / `Int$.alloc_many(10)`：分配一个长度为 `10` 的 `Int![*]`
 
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
 
@@ -268,7 +268,6 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `T$.alloc()`
 - `T$.alloc(...)`
 - `T$.alloc_many(...)`
-- `T$.alloc_array(...)`
 - `value$.ref()`
 - `value$.ptr()`
 - `value$.get()`

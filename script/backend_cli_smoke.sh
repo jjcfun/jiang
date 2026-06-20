@@ -78,7 +78,7 @@ unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
 printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
 printf 'import fs = "../../../src/system/fs.jiang";\nInt main() { if (fs.exists("/tmp")) { 0 } else { 1 } }\n' >"$system_fs_sample"
-printf 'Int main() { Int![*] values = Int!$.alloc_array(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
+printf 'Int main() { Int![*] values = Int!$.alloc_many(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
 
 printf '== backend cli smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
 "$COMPILER_UNDER_TEST" --emit-llvm src/jiangc.jiang >"$compiler_ll"
