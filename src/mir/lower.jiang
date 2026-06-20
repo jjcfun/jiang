@@ -5541,6 +5541,10 @@ struct BodyLowerer: Movable {
             self.lower_core_hash_call(node_id, call, destination);
             return;
         }
+        if (self.call_can_lower_core_contiguous(call)) {
+            self.lower_core_contiguous_call(node_id, call, destination);
+            return;
+        }
         if (self.lowerer.ctx.store.typeck.member_selection(call.callee) is .some(member_def)) {
             def.DefKind kind = self.lowerer.ctx.store.defs.get(member_def).kind;
             if (kind == .init_def) {
@@ -5903,6 +5907,165 @@ struct BodyLowerer: Movable {
             return false;
         }
         return self.type_has_builtin_primitive_hash(self.type_for_node(receiver));
+    }
+
+    Bool call_can_lower_core_contiguous(hir.HirCall call) {
+        guard self.lowerer.ctx.store.typeck.member_selection(call.callee) is .some(member_def) else {
+            return false;
+        }
+        if (!self.is_core_contiguous_method(member_def)) {
+            return false;
+        }
+        guard self.contiguous_receiver_node(call.callee) is .some(receiver) else {
+            return false;
+        }
+        return self.receiver_has_builtin_contiguous_storage(receiver);
+    }
+
+    Bool lower_core_contiguous_call(hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        guard self.contiguous_receiver_node(call.callee) is .some(receiver) else {
+            return false;
+        }
+        guard self.lowerer.ctx.store.typeck.member_selection(call.callee) is .some(member_def) else {
+            return false;
+        }
+        qid.SymbolId symbol = self.lowerer.ctx.store.defs.get(member_def).name.symbol;
+        if (self.symbol_text_equal(symbol, "many_pointer")) {
+            return self.lower_core_contiguous_many_pointer(node_id, receiver, destination);
+        }
+        if (self.symbol_text_equal(symbol, "length")) {
+            return self.lower_core_contiguous_length(node_id, receiver, destination);
+        }
+        return false;
+    }
+
+    Bool lower_core_contiguous_many_pointer(hir.HirId node_id, hir.HirId receiver, mir.MirPlace destination) {
+        qid.TypeId value_type = self.contiguous_receiver_value_type(receiver);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(value_type);
+        if (info.data is .array_type(_)) {
+            self.lower_array_place_ptr(
+                node_id,
+                self.contiguous_receiver_storage_place(receiver),
+                self.mir_place_type(destination),
+                destination
+            );
+            return true;
+        }
+        if (self.contiguous_data_place(receiver, value_type) is .some(data_place)) {
+            self.push_assign(
+                destination,
+                mir.cast_rvalue(mir.MirCastRvalue (
+                    kind: mir.MirCastKind.ptr_to_ptr,
+                    value: mir.copy_operand_value(mir.MirCopyOperand (place: data_place)),
+                    target_type: self.mir_place_type(destination)
+                )),
+                self.lowerer.hir_span(node_id)
+            );
+            return true;
+        }
+        return false;
+    }
+
+    Bool lower_core_contiguous_length(hir.HirId node_id, hir.HirId receiver, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId value_type = self.contiguous_receiver_value_type(receiver);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(value_type);
+        if (info.data is .array_type(array_type)) {
+            self.push_assign(destination, self.int_const_rvalue(array_type.count, span), span);
+            return true;
+        }
+        if (self.contiguous_length_place(receiver, value_type) is .some(length_place)) {
+            self.push_assign(
+                destination,
+                mir.use_rvalue(mir.MirUseRvalue (
+                    value: mir.copy_operand_value(mir.MirCopyOperand (place: length_place))
+                )),
+                span
+            );
+            return true;
+        }
+        return false;
+    }
+
+    Bool is_core_contiguous_method(qid.DefId function_def) {
+        guard self.lowerer.ctx.store.resolve.core_traits.contiguous_trait is .some(contiguous_def) else {
+            return false;
+        }
+        guard self.lowerer.ctx.store.defs.get(function_def).owner_def is .some(owner_def) else {
+            return false;
+        }
+        if (owner_def.to_index() != contiguous_def.to_index()) {
+            return false;
+        }
+        qid.SymbolId symbol = self.lowerer.ctx.store.defs.get(function_def).name.symbol;
+        return self.symbol_text_equal(symbol, "many_pointer") || self.symbol_text_equal(symbol, "length");
+    }
+
+    hir.HirId? contiguous_receiver_node(hir.HirId callee_id) {
+        hir.HirNode callee = self.lowerer.hirs.node(callee_id);
+        if (callee.data is .member_access(member_access)) {
+            return member_access.base;
+        }
+        return null;
+    }
+
+    Bool receiver_has_builtin_contiguous_storage(hir.HirId receiver) {
+        return self.type_has_builtin_contiguous_storage(self.contiguous_receiver_value_type(receiver));
+    }
+
+    Bool type_has_builtin_contiguous_storage(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .array_type(_)) { return true; }
+        if (info.data is .slice_value_type(_)) { return true; }
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind == .slice) { return true; }
+        if (handle.kind != .owner_pointer) { return false; }
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        return element_info.data is .slice_value_type(_);
+    }
+
+    qid.TypeId contiguous_receiver_value_type(hir.HirId receiver) {
+        return self.member_lookup_value_type(self.receiver_expr_type(receiver));
+    }
+
+    mir.MirPlace contiguous_receiver_storage_place(hir.HirId receiver) {
+        mir.MirPlace! place = self.pointer_base_place(receiver);
+        if (self.contiguous_place_needs_deref(place)) {
+            place = self.project_deref(place, self.place_is_raw_pointer(place));
+        }
+        return place;
+    }
+
+    Bool contiguous_place_needs_deref(mir.MirPlace place) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.mir_place_type(place));
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind == .reference) { return true; }
+        if (handle.kind == .owner_pointer) { return true; }
+        return handle.kind == .raw_pointer;
+    }
+
+    mir.MirPlace? contiguous_data_place(hir.HirId receiver, qid.TypeId value_type) {
+        if (!self.type_has_contiguous_slice_layout(value_type)) {
+            return null;
+        }
+        return self.project_constant_index(self.contiguous_receiver_storage_place(receiver), 0);
+    }
+
+    mir.MirPlace? contiguous_length_place(hir.HirId receiver, qid.TypeId value_type) {
+        if (!self.type_has_contiguous_slice_layout(value_type)) {
+            return null;
+        }
+        return self.project_constant_index(self.contiguous_receiver_storage_place(receiver), 1);
+    }
+
+    Bool type_has_contiguous_slice_layout(qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .slice_value_type(_)) { return true; }
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind == .slice) { return true; }
+        if (handle.kind != .owner_pointer) { return false; }
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        return element_info.data is .slice_value_type(_);
     }
 
     Bool is_core_hash_method(qid.DefId function_def) {
