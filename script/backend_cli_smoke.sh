@@ -87,6 +87,11 @@ printf '== backend cli smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER
   $("$LLVM_CONFIG" --libs all) \
   $("$LLVM_CONFIG" --system-libs)
 
+# 开发分支中 compiler-under-test 和刚构建出的 compiler_bin 可能共享同一个
+# package 版本号，但 source artifact 格式已经变化。运行新 compiler 前清掉
+# 默认缓存，避免它误读前一阶段写出的 `.ji`。
+rm -rf "$BUILD_DIR/cache"
+
 "$compiler_bin" --emit-llvm -o "$sample_ll" "$sample"
 test -s "$sample_ll"
 "$clang_bin" "$sample_ll" -o "$sample_from_ll" \
