@@ -12,8 +12,10 @@ import mir = "../mir/mir.jiang";
 import qid = "../store/id.jiang";
 import qkey = "../incremental/key.jiang";
 import driver_options = "../driver/options.jiang";
+import comptime_value = "../sema/comptime/value.jiang";
 import types = "../sema/type.jiang";
 import blake3 = "../support/blake3.jiang";
+import hash = "../support/hash.jiang";
 import list = "../support/list.jiang";
 import object_artifact = "./object.jiang";
 import object_key = "./object_key.jiang";
@@ -358,14 +360,14 @@ object_key.StableTypeKey stable_aggregate_type_key(
     if (data is .handle_type(handle)) { return stable_handle_type_key(ctx, handle); }
     if (data is .slice_value_type(slice_value)) {
         object_key.StableTypeKey! key = object_key.StableTypeKey(.slice_value_type);
-        key.sentinel = stable_sentinel(slice_value.sentinel);
+        key.sentinel = stable_sentinel(ctx, slice_value.sentinel);
         key.add_arg(stable_type_key_for_type(ctx, slice_value.element));
         return key$.move();
     }
     if (data is .array_type(array_type)) {
         object_key.StableTypeKey! key = object_key.StableTypeKey(.array_type);
         key.array_length = array_type.count;
-        key.sentinel = stable_sentinel(array_type.sentinel);
+        key.sentinel = stable_sentinel(ctx, array_type.sentinel);
         key.add_arg(stable_type_key_for_type(ctx, array_type.element));
         return key$.move();
     }
@@ -402,16 +404,170 @@ object_key.StableTypeKey stable_handle_type_key(
     types.HandleType handle
 ) {
     object_key.StableTypeKey! key = object_key.StableTypeKey(stable_handle_kind(handle.kind));
-    key.sentinel = stable_sentinel(handle.sentinel);
+    key.sentinel = stable_sentinel(ctx, handle.sentinel);
     key.add_arg(stable_type_key_for_type(ctx, handle.element));
     return key$.move();
 }
 
-object_key.StableSentinel? stable_sentinel(types.Sentinel? sentinel) {
+object_key.StableSentinel? stable_sentinel(context.CompilerContext& ctx, types.Sentinel? sentinel) {
     if (sentinel is .some(value)) {
-        return object_key.StableSentinel(value.value);
+        return object_key.StableSentinel(stable_comptime_value_fingerprint(ctx, value.value));
     }
     return null;
+}
+
+qkey.Fingerprint128 stable_comptime_value_fingerprint(
+    context.CompilerContext& ctx,
+    comptime_value.ComptimeValue value
+) {
+    // Sentinel 现在可以是 bool/char/enum/struct 等完整 comptime 值，object key
+    // 不能再只记录整数；这里把类型和值一起写入稳定指纹，避免不同 sentinel 共用缓存产物。
+    hash.WyHasher low = hash.WyHasher();
+    low.write_uint64(UInt64(1469598103934665603));
+    write_stable_comptime_value(ctx, low$.ref(), value);
+
+    hash.WyHasher high = hash.WyHasher();
+    high.write_uint64(UInt64(1099511628211));
+    write_stable_comptime_value(ctx, high$.ref(), value);
+    return qkey.Fingerprint128(low.finish(), high.finish());
+}
+
+() write_stable_comptime_value(
+    context.CompilerContext& ctx,
+    hash.WyHasher& hasher,
+    comptime_value.ComptimeValue value
+) {
+    // 同一个字面值在不同 expected type 下语义不同，例如 0 可是 Int 也可是 UInt8。
+    // 因此稳定 key 必须先写 type key，再写具体 comptime payload。
+    object_key.StableTypeKey type_key = stable_type_key_for_type(ctx, value.type_id);
+    object_key.write_stable_type_key(hasher, type_key$.ref());
+    write_stable_comptime_value_data(ctx, hasher, value.data);
+}
+
+() write_stable_comptime_value_data(
+    context.CompilerContext& ctx,
+    hash.WyHasher& hasher,
+    comptime_value.ComptimeValueData data
+) {
+    if (data is .invalid) { hasher.write_int(1); return; }
+    if (data is .unit_value) { hasher.write_int(2); return; }
+    if (data is .bool_value(bool_value)) {
+        hasher.write_int(3);
+        hasher.write_bool(bool_value);
+        return;
+    }
+    if (data is .int_value(int_value)) {
+        hasher.write_int(4);
+        hasher.write_int(int_value);
+        return;
+    }
+    if (data is .uint_value(uint_value)) {
+        hasher.write_int(5);
+        hasher.write_uint64(uint_value);
+        return;
+    }
+    write_stable_aggregate_comptime_value(ctx, hasher, data);
+}
+
+() write_stable_aggregate_comptime_value(
+    context.CompilerContext& ctx,
+    hash.WyHasher& hasher,
+    comptime_value.ComptimeValueData data
+) {
+    if (data is .char_value(char_value)) {
+        hasher.write_int(6);
+        hasher.write_uint64(char_value);
+        return;
+    }
+    if (data is .float_bits(float_bits)) {
+        hasher.write_int(7);
+        hasher.write_uint64(float_bits);
+        return;
+    }
+    if (data is .string_value(string_value)) {
+        hasher.write_int(8);
+        hasher.write_int(string_value.length);
+        hasher.write_bytes(string_value);
+        return;
+    }
+    if (data is .symbol_value(symbol_value)) {
+        hasher.write_int(9);
+        hasher.write_bytes(ctx.store.symbols.text(symbol_value));
+        return;
+    }
+    write_stable_named_comptime_value(ctx, hasher, data);
+}
+
+() write_stable_named_comptime_value(
+    context.CompilerContext& ctx,
+    hash.WyHasher& hasher,
+    comptime_value.ComptimeValueData data
+) {
+    if (data is .const_param_value(const_param)) {
+        hasher.write_int(10);
+        write_stable_def_id(ctx, hasher, const_param);
+        return;
+    }
+    if (data is .enum_case_value(case_def)) {
+        hasher.write_int(11);
+        write_stable_def_id(ctx, hasher, case_def);
+        return;
+    }
+    if (data is .struct_value(fields)) {
+        hasher.write_int(12);
+        hasher.write_int(fields.length);
+        write_stable_comptime_fields(ctx, hasher, fields);
+        return;
+    }
+    if (data is .tuple_value(items)) {
+        hasher.write_int(13);
+        write_stable_comptime_values(ctx, hasher, items);
+        return;
+    }
+    if (data is .array_value(items)) {
+        hasher.write_int(14);
+        write_stable_comptime_values(ctx, hasher, items);
+        return;
+    }
+    hasher.write_int(0);
+}
+
+() write_stable_comptime_fields(
+    context.CompilerContext& ctx,
+    hash.WyHasher& hasher,
+    comptime_value.ComptimeAggregateField[]& fields
+) {
+    Int! index = 0;
+    while (index < fields.length) {
+        write_stable_def_id(ctx, hasher, fields[index].field_def);
+        write_stable_comptime_value(ctx, hasher, fields[index].value);
+        index = index + 1;
+    }
+}
+
+() write_stable_comptime_values(
+    context.CompilerContext& ctx,
+    hash.WyHasher& hasher,
+    comptime_value.ComptimeValue[]& items
+) {
+    hasher.write_int(items.length);
+    Int! index = 0;
+    while (index < items.length) {
+        write_stable_comptime_value(ctx, hasher, items[index]);
+        index = index + 1;
+    }
+}
+
+() write_stable_def_id(context.CompilerContext& ctx, hash.WyHasher& hasher, qid.DefId def_id) {
+    // 跨编译会话优先使用 incremental stable id；没有 stable id 的临时 def 退回本次
+    // 会话内 id，保证同一次构建内 object key 仍然可区分。
+    if (ctx.store.incremental.stable_id_for_def(def_id) is .some(stable_id)) {
+        hasher.write_uint64(stable_id.low);
+        hasher.write_uint64(stable_id.high);
+        return;
+    }
+    hasher.write_int(def_id.to_index());
+    hasher.write_uint64(UInt64(0));
 }
 
 object_key.StableTypeKeyKind stable_handle_kind(types.HandleTypeKind kind) {
