@@ -285,7 +285,8 @@ name        <- ident / "self"
 - raw pointer、many pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
 - `T^` / `T&` 是语言级 ownership/reference handle，不能与其他 handle 叠加。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
-- `T[N:0]` 表示 sentinel 定长数组语法；完整 array sentinel storage 语义后续补齐。
+- `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
+  个元素，末尾元素保存 sentinel。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。

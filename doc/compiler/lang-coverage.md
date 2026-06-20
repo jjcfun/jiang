@@ -29,7 +29,7 @@
 | struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
 | enum | `nominal`, `control_flow` | covered | underlying int 类型的更多边界值 |
 | union | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
-| trait / extend | `generic` | partial | static trait method、extend private/public member |
+| trait / extend | `generic` | partial | static trait method、extend private/public member、move receiver trait object deferred |
 | block / tail expr | `function`, `control_flow` | covered | tail expr 与 defer/drop 组合 |
 | var / destructure stmt | `function`, `aggregate` | partial | local/global destructure 尚未接入 HIR/type check/MIR |
 | assignment stmt | `control_flow`, `type` | covered | compound assignment 与 overload deferred |
@@ -58,11 +58,13 @@
 | overload resolution | `function` | partial | named args + overload + default args 的非歧义正例更多覆盖 |
 | constructor resolution | `function`, `nominal` | covered | generic constructor overload |
 | trait conformance | `generic` | partial | associated type equality 与 parent trait 混合 |
+| trait object companion | `generic`, `package` | covered | owned receiver / `@self(move)` trait object deferred |
 | monomorphization | `generic`, `package` | partial | 跨 package public generic body run 用例已覆盖，更多 nested instance 待补 |
 | package public surface | `package`, `import` | covered | public alias chain 已覆盖 |
 | layout-sensitive aggregate | `aggregate`, `nominal` | partial | emit/run 覆盖更多 tuple/array/union 嵌套 |
 | MIR control flow | `control_flow`, `error_handling` | partial | loop cleanup、nested try/catch run 用例 |
 | backend runtime entry | `runtime` | covered | argv/env deferred |
+| sentinel const | `generic`, `runtime`, `literal` | covered | `Bool` / `Char` / enum / struct sentinel 和 move-only 反例已覆盖 |
 | sentinel string | `runtime`, `literal` | covered | `UInt8[:0]` / `UInt8[*:0]` 基础转换已覆盖 |
 
 ## 补测优先级

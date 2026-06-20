@@ -24,10 +24,10 @@ if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
 case "$BOOTSTRAP_VERSION" in
-  "jiang 0.3.1"|"jiang 0.3.2"|"jiang 0.3.3"|"jiang 0.4"|"jiang 0.4.1") ;;
+  "jiang 0.3.1"|"jiang 0.3.2"|"jiang 0.3.3"|"jiang 0.4"|"jiang 0.4.1-bootstrap"|"jiang 0.4.1") ;;
   *)
     echo "unsupported bootstrap compiler: $BOOTSTRAP_VERSION" >&2
-    echo "install Jiang 0.3.1, 0.3.2, 0.3.3, 0.4, or 0.4.1 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
+    echo "install Jiang 0.3.1, 0.3.2, 0.3.3, 0.4, 0.4.1-bootstrap, or 0.4.1 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
     exit 2
     ;;
 esac
@@ -75,6 +75,12 @@ link_llvm() {
   test -x "$output_bin"
 }
 
+clear_bootstrap_artifact_cache() {
+  # bootstrap 编译器可能把旧 schema 的 source artifact 写到默认 build/cache。
+  # next/stable 阶段必须用当前编译器重新生成，避免 smoke 读到旧接口。
+  rm -rf "$ROOT_DIR/build/cache"
+}
+
 emit_next_from_bootstrap() {
   local output_bin="$1"
   local output_ll="$BUILD_DIR/jiangc.next.ll"
@@ -99,6 +105,7 @@ emit_compiler_with_compiler() {
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
 emit_next_from_bootstrap "$NEXT_BIN"
+clear_bootstrap_artifact_cache
 
 VERIFY_BIN="$NEXT_BIN"
 if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then

@@ -9,14 +9,15 @@ Jiang 编译器围绕稳定的阶段边界组织。本文只保留整体架构�
 driver/cli -> pipeline.compile
                 |
                 v
-        package source/AST -> HIR -> type/comptime facts -> MIR -> checked MIR -> backend output
+        core + package source/AST -> HIR -> type/comptime facts -> MIR -> checked MIR -> backend output
                                       \           \          \          \
                                        ----------- layout facts --------
 ```
 
 流程中的几个块对应：
 
-- `package source/AST`：package manifest、source、syntax、module graph 和 resolve。
+- `core + package source/AST`：compiler-known core 源码、package manifest、source、syntax、
+  module graph 和 resolve。
 - `HIR`：resolve 直接生成的未类型化语义树。
 - `type/comptime facts`：`TypeCheckStore`、`ComptimeStore` 和 `MonomorphStore`。
 - `MIR`：HIR lowering 生成的 CFG。
@@ -24,6 +25,10 @@ driver/cli -> pipeline.compile
 - `backend output`：LLVM IR、object file 或 executable。
 - `layout facts`：由 HIR、type facts 和 target layout 按需查询得到，供 MIR、borrow/drop 和
   backend 使用。
+
+0.4.1 的 root module 加载前会先加载 `src/core/core.jiang`。core 源码声明 compiler-known
+trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`
+intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。
 
 `layout` 是 store 层事实，不从 MIR body 生成。它消费 HIR、`TypeCheckStore`、
 `MonomorphStore` 和 target layout。MIR lowering、borrow check、drop elaboration
@@ -57,8 +62,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：source text、keyword store。
   - 禁止：名字解析、类型判断、布局、codegen 语义。
 - `resolve`
-  - 生产：module graph、namespace、`DefId`、名字绑定、HIR。
-  - 消费：AST、source、package manifest。
+  - 生产：core/module graph、namespace、`DefId`、名字绑定、HIR。
+  - 消费：AST、source、package manifest、compiler-known core root。
   - 禁止：类型推导、layout、MIR/backend 逻辑。
 - `hir`
   - 生产：resolved untyped HIR、HIR store。
@@ -66,7 +71,7 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 禁止：保存 type check 结果、layout、backend symbol。
 - `type_check`
   - 生产：`TypeCheckStore`、trait/overload/type facts、builtin operation lowering kind、
-    const initializer 的 `ComptimeValue`。
+    trait companion type facts、const initializer 的 `ComptimeValue`。
   - 消费：HIR、resolve facts。
   - 禁止：改写 HIR、计算 ABI layout、生成 MIR。
 - `comptime`
@@ -81,8 +86,11 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 生产：CFG、local、place、rvalue、terminator。
   - 消费：HIR、type facts、builtin operation lowering kind、monomorph、layout query。
   - 禁止：重新 resolve/type check、按源码文本重新判断 builtin operation、写 backend symbol。
+  - 备注：`Trait.Any` 动态调用、`Trait.VTable` slot 和 `Trait.Receiver` 构造在 MIR lowering
+    中消费 type check 已选出的 companion facts，不在 MIR 里重新做 trait lookup。
 - `layout`
-  - 生产：size、align、field index、ABI representation。
+  - 生产：size、align、field index、ABI representation，包括 `Trait.Any` / `Trait.VTable` /
+    `Trait.Receiver` 的 erased runtime representation。
   - 消费：TypeId、type facts、target data layout。
   - 禁止：类型推导、读取 MIR 控制流、插入 drop。
 - `borrow_check`
@@ -98,7 +106,7 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：elaborated MIR、layout、target、symbols。
   - 禁止：语言语义判断、HIR fallback、修改 MIR/layout。
 - `incremental`
-  - 生产：`StableKey`、fingerprint、artifact metadata。
+  - 生产：`StableKey`、fingerprint、source interface / HIR template / object artifact metadata。
   - 消费：source、interface、object artifact。
   - 禁止：缓存 session-local HIR/type/MIR 对象。
 
@@ -159,6 +167,9 @@ CompilerStore
 - `ComptimeStore` 保存 `DefId -> ComptimeValue` 的编译期常量事实。它只服务 sema、
   public interface artifact 和 HIR->MIR lowering；MIR 之后的阶段只能看 `MirConst`、
   `MirGlobal` 和 `MirStaticValue`。
+- `src/core` 是 compiler-known 源码入口，不作为用户可 import package；core 中的
+  body-less trait implementation 只声明 builtin type 的 trait 关系，具体 lowering 仍由
+  type check / MIR / layout 的 compiler-known facts 承接。
 - `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
 - `MirStore` 保存 MIR function/body；backend 不维护一份等价 MIR。
 - `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
@@ -195,6 +206,8 @@ CompilerStore
 - `pipeline` 以 package root file 为入口串联各阶段，并负责跨阶段错误处理。目录入口读取
   `package.ini`，文件入口把该文件作为 root source。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
+- `core` 在 root module 前加载，提供 compiler-known trait、builtin type namespace 壳和
+  intrinsic 声明；它不参与用户 import 解析。
 - `syntax` 只产生 token 和 AST；详见 [AST 设计](compiler/ast.md)。
 - `diagnostic` 负责诊断数据结构、终端输出和未来 LSP 位置转换。
 - `source_map` 属于 `source` 模块，保存 `DefId` / `HirId` 到源码 span 的定位事实。
@@ -246,6 +259,7 @@ src/
   source/       package、source file、source manager、source map
   syntax/       token、lexer、parser、flat AST
   diagnostic/   diagnostic、reporter
+  core/         compiler-known core 源码入口、builtin trait/type 外壳、intrinsic 声明
   resolve/      symbol store、keyword store、import/module/name resolver
   sema/         type store、trait、generic、overload、type check、monomorph
   hir/          HIR 数据结构和 HIR store
@@ -382,7 +396,7 @@ test/lang/
 - `check/`：期望 `jiangc --check` 成功。
 - `fail/`：期望 `jiangc --check` 失败，可用 `// expected: diagnostic_code` 精确匹配诊断。
 - `emit/`：期望 `jiangc --emit-llvm` 成功。
-- `run/`：后续用于需要生成并运行目标程序的端到端用例。
+- `run/`：需要生成并运行目标程序的端到端用例，可用 `// expected-exit: N` 匹配退出码。
 - `diagnostic/`：后续用于精确检查多条 diagnostic、span 和消息的用例。
 
 运行方式：

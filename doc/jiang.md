@@ -2205,7 +2205,7 @@ lexer/
 [package]
 name = frontend
 root = src/main.jiang
-version = 0.4
+version = 0.4.1
 ```
 
 当前第一版 package 机制还支持本地依赖：

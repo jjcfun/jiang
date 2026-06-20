@@ -117,7 +117,9 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T^`：`Box<T>` 的类型语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
 - `T&`：`Reference<T>` 的类型语法糖，表示非 owning 引用，不表达释放职责。
 - `T[]&`：`Reference<Slice<T>>` 的语法糖，borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value。
-- `T[:0]&`：`Reference<SentinelSlice<T, 0>>` 的语法糖，borrowed sentinel slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`。裸 `T[:0]` / `SentinelSlice<T, 0>` 是带 sentinel 的 unsized array type，不能作为普通 value；当前先支持整数 sentinel 语法，主用例是 `UInt8[:0]&`。
+- `T[:S]&`：`Reference<SentinelSlice<T, S>>` 的语法糖，borrowed sentinel slice view，
+  layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == S`。
+  裸 `T[:S]` / `SentinelSlice<T, S>` 是带 sentinel 的 unsized array type，不能作为普通 value。
 - `T[*]`：`ManyPointer<T>` 的类型语法糖，不默认自动解引用，只能通过下标访问元素。
 - `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
 - `T*`：`RawPointer<T>` 的类型语法糖，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
@@ -130,7 +132,9 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 
 内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的 static extension 方法。
 
-当前 sentinel value 只支持整数 literal，element type 必须是整数类型，并且 sentinel value 必须能被 element type 表示。例如 `UInt8[5:0]` 合法，`UInt8[5:300]` 和 `Bool[1:0]` 不合法。HIR 只保留未定型 literal；sema 阶段会将 sentinel 绑定到 element type。
+sentinel value 使用 `const T S` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
+元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型不是 move-only。
+例如 `UInt8[5:0]`、`Bool[1:true]`、`Char[3:'\0']` 和 enum/struct const sentinel 都是同一套规则。
 
 示例：
 

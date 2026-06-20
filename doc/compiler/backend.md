@@ -67,7 +67,7 @@ compatibility provider：
   选择具体 OS provider；resolver 不再对 system provider 做路径重写。
 - `system/os/unsupported.jiang` 保持 type-check/object 输出路径可用；executable 是否支持仍由
   target/link plan 诊断决定。
-- 0.3.0 不保留可 import 的 `system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
+- 当前不保留可 import 的 `system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
   避免把 POSIX 固定成 hosted libc。
 - no-libc provider 不能通过 hosted libc ABI 间接依赖 libc；它必须走 syscall、compiler
   intrinsic、inline asm、Wasm host import 或 target runtime object。真实 no-libc 和 inline asm

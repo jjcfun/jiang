@@ -8,7 +8,7 @@ Jiang 的启动路径分成三层：
 
 ## Hosted Entry
 
-0.3 系列的 hosted executable 入口仍是 C ABI 形状的 `main(argc, argv)`。backend 会把这个函数作为
+当前 hosted executable 入口仍是 C ABI 形状的 `main(argc, argv)`。backend 会把这个函数作为
 runtime entry 生成出来，并在函数体开始时写入 `__jiang_startup_state`。
 
 `argc` 保存到 `StartupState.arguments.length`，`argv` 保存到 `StartupState.arguments.raw`。
