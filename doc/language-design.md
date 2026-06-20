@@ -497,8 +497,8 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 - `Type$.size()`：类型大小。
 - `Type$.align()`：ABI 对齐。
 - `Type$.max_align()`：默认分配器保证支持的最大对齐。
-- `Type$.alloc()`：分配一个未初始化对象。
-- `Type$.alloc_array(n)`：分配数组。
+- `Type$.alloc()`：分配一个未初始化元素，返回 `Type![*]`。
+- `Type$.alloc(n)` / `Type$.alloc_many(n)` / `Type$.alloc_array(n)`：分配 `n` 个元素。
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
@@ -513,7 +513,7 @@ lifetime 和 drop safety。
 
 - 总是安全或低风险的编译期查询：`Type$.size()`、`Type$.align()`、`Type$.max_align()`。
 - 类型系统强制操作：`optional$.some()`，后续需要定义失败时的诊断、trap 或静态证明规则。
-- 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.free()`、`Type$.alloc()`、`Type$.alloc_array(n)`。
+- 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.free()`、`Type$.alloc()`、`Type$.alloc(n)`、`Type$.alloc_many(n)`、`Type$.alloc_array(n)`。
 - 需要 unsafe/cast 能力：`value$.as(Type)`。
 
 当前阶段不区分编译器源码包和普通 Jiang 包，普通 package 也默认拥有这些低层能力。最小能力集合和
