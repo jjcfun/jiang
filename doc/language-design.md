@@ -789,6 +789,11 @@ trait Indexable {
 - trait 可以声明 static function requirement；static requirement 没有 `self`，通过
   `Type.method(args...)` 调用，也可以在泛型约束中通过 `T.method(args...)` 调用。
   非 `static` trait function requirement 隐含 `Self&` receiver。
+- trait 本身不是普通值类型；动态 trait view 通过 compiler-provided companion type
+  表达：`Trait.Any`、`Trait.VTable`、`Trait.Receiver`。`Trait$.any(value)` 和
+  `Trait$.receiver(value)` 不移动原值，`Trait$.vtable(Type)` 生成 concrete type 的
+  方法表。0.4.1 支持 ref receiver method 的动态分派，暂不支持 `@self(move)` /
+  owned receiver trait object。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get() -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
 - union variant name 和同一 union 的 static/显式 method name 共享类型成员命名空间，不能重名，避免 `Union.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须

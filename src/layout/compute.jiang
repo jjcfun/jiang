@@ -94,6 +94,7 @@ struct LayoutComputer: Movable {
         if (info.data is .int_type(_)) { return .no_drop; }
         if (info.data is .float_type(_)) { return .no_drop; }
         if (info.data is .function_type(_)) { return .no_drop; }
+        if (info.data is .trait_companion(_)) { return .no_drop; }
         if (info.data is .handle_type(handle_type)) {
             return self.drop_category_for_handle(handle_type);
         }
@@ -164,6 +165,9 @@ struct LayoutComputer: Movable {
         }
         if (info.data is .function_type(_)) {
             return self.add_function_pointer(key);
+        }
+        if (info.data is .trait_companion(companion)) {
+            return self.layout_trait_companion(key, companion);
         }
         if (info.data is .named(named)) {
             return self.layout_nominal(key, named);
@@ -419,6 +423,113 @@ struct LayoutComputer: Movable {
             self.align_to(size, element_layout.align),
             self.store.layouts.field_array(fields$.ref())
         );
+    }
+
+    layout.LayoutId layout_trait_companion(layout.LayoutKey key, types.TraitCompanionType companion) {
+        if (companion.kind == .receiver) {
+            return self.add_pointer_layout(key);
+        }
+        if (companion.kind == .vtable) {
+            return self.layout_trait_vtable(key, companion.trait_def);
+        }
+        return self.layout_trait_any(key, companion.trait_def);
+    }
+
+    layout.LayoutId add_pointer_layout(layout.LayoutKey key) {
+        return self.store.layouts.add_layout(
+            key,
+            .scalar,
+            self.store.layouts.target.pointer_size,
+            self.store.layouts.target.pointer_align,
+            self.store.layouts.target.pointer_size,
+            self.store.layouts.empty_fields()
+        );
+    }
+
+    layout.LayoutId layout_trait_any(layout.LayoutKey key, qid.DefId trait_def) {
+        list.ArrayList<qid.TypeId> fields = self.trait_any_field_types(trait_def);
+        return self.layout_type_sequence(key, fields$.ref());
+    }
+
+    layout.LayoutId layout_trait_vtable(layout.LayoutKey key, qid.DefId trait_def) {
+        list.ArrayList<qid.TypeId> fields = self.trait_vtable_field_types(trait_def);
+        return self.layout_type_sequence(key, fields$.ref());
+    }
+
+    layout.LayoutId layout_type_sequence(layout.LayoutKey key, list.ArrayList<qid.TypeId>& field_types) {
+        list.ArrayList<layout.FieldLayout>! fields = list.ArrayList<layout.FieldLayout>(field_types.len());
+        Int! offset = 0;
+        Int! max_align = 1;
+        Int! index = 0;
+        while (index < field_types.len()) {
+            qid.TypeId field_type = field_types.get(index);
+            layout.TypeLayout field_layout = self.store.layouts.layout(self.layout_of_type(field_type));
+            offset = self.align_to(offset, field_layout.align);
+            fields.add(layout.FieldLayout(null, field_type, offset));
+            offset = offset + field_layout.size;
+            max_align = self.max_int(max_align, field_layout.align);
+            index = index + 1;
+        }
+
+        Int size = self.align_to(offset, max_align);
+        return self.store.layouts.add_layout(
+            key,
+            .aggregate,
+            size,
+            max_align,
+            self.align_to(size, max_align),
+            self.store.layouts.field_array(fields$.ref())
+        );
+    }
+
+    list.ArrayList<qid.TypeId> trait_any_field_types(qid.DefId trait_def) {
+        list.ArrayList<qid.TypeId>! fields = list.ArrayList<qid.TypeId>(2);
+        fields.add(self.store.types.trait_companion_type(trait_def, .receiver, token.Span()));
+        fields.add(self.store.types.trait_companion_type(trait_def, .vtable, token.Span()));
+        return fields$.move();
+    }
+
+    list.ArrayList<qid.TypeId> trait_vtable_field_types(qid.DefId trait_def) {
+        list.ArrayList<qid.TypeId>! fields = list.ArrayList<qid.TypeId>();
+        self.add_trait_vtable_field_types(trait_def, fields$.ref());
+        return fields$.move();
+    }
+
+    () add_trait_vtable_field_types(qid.DefId trait_def, list.ArrayList<qid.TypeId>& fields) {
+        guard self.store.hirs.def(trait_def) is .some(hir_def) else { return; }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.store.defs.get(member_def).kind == .function_def) {
+                fields.add(self.trait_vtable_slot_type(trait_def, member_def));
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId trait_vtable_slot_type(qid.DefId trait_def, qid.DefId method_def) {
+        guard self.store.typeck.def_type(method_def) is .some(method_type) else {
+            return self.store.types.invalid_type();
+        }
+        types.TypeInfo info = self.store.types.get(method_type);
+        guard info.data is .function_type(function_type) else { return self.store.types.invalid_type(); }
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(function_type.params.length);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            if (index == 0 && self.method_has_receiver(method_def)) {
+                params.add(self.store.types.trait_companion_type(trait_def, .receiver, token.Span()));
+            } else {
+                params.add(function_type.params[index]);
+            }
+            index = index + 1;
+        }
+        return self.store.types.function_type(params$.move(), function_type.result, token.Span());
+    }
+
+    Bool method_has_receiver(qid.DefId method_def) {
+        guard self.store.hirs.def(method_def) is .some(hir_def) else { return false; }
+        guard hir_def.decl.function_signature is .some(signature) else { return false; }
+        return signature.has_receiver;
     }
 
     layout.LayoutId layout_optional(layout.LayoutKey key, types.OptionalType optional_type) {
@@ -760,6 +871,12 @@ struct LayoutComputer: Movable {
         if (info.data is .function_type(_)) {
             // function type 在运行时按函数指针布局处理，参数和返回类型不影响 size/align。
             return layout.LayoutKey(.function_type(layout.FunctionLayoutKey()));
+        }
+        if (info.data is .trait_companion(companion)) {
+            return layout.LayoutKey(.trait_companion_type(layout.TraitCompanionLayoutKey(
+                companion.trait_def,
+                Int(companion.kind)
+            )));
         }
         if (info.data is .named(named)) {
             return layout.LayoutKey(.nominal_type(layout.NominalLayoutKey(

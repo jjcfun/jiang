@@ -1743,6 +1743,8 @@ MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
 
 `trait` 用于定义一种**仅存在于编译期**的约束类型。  
 它不作为运行时类型使用，也不能直接作为普通变量、字段、参数或返回值类型。
+需要动态 trait view 时，使用编译器提供的 companion type：`Trait.Any`、
+`Trait.VTable` 和 `Trait.Receiver`。
 
 例如，`Numeric` 可以被定义为一个 trait，表示“所有数值类型”：
 
@@ -1834,6 +1836,26 @@ Int b = counter.apply(true);
 
 - 同名不同签名的方法按普通重载规则区分
 - 同名同签名的多个 trait requirement 可以共用同一份实现
+
+每个 trait 都有三个保留的 companion type 名：
+
+- `Trait.Any`：borrowed dynamic trait view，保存 erased receiver 和 vtable，不移动原值。
+- `Trait.VTable`：某个 concrete type 对该 trait 的方法表。
+- `Trait.Receiver`：vtable slot 使用的 erased receiver。
+
+对应的 intrinsic type operation 为：
+
+```c
+Value.Any any = Value$.any(box);
+Value.VTable vtable = Value$.vtable(Box);
+Value.Receiver receiver = Value$.receiver(box);
+Int a = any.value();
+Int b = vtable.value(receiver);
+```
+
+0.4.1 支持 ref receiver trait instance method 的动态分派和 vtable slot 读取。
+`@self(move)` / owned receiver trait object 暂不支持；如果 trait 中存在 move receiver
+requirement，构造 `Trait.Any` / `Trait.VTable` / `Trait.Receiver` 会编译失败。
 
 trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
 

@@ -1068,6 +1068,9 @@ public struct BodyCheck: Movable {
         if (self.slice_length_type(raw_base_type, member_access.member_symbol) is .some(length_type)) {
             return length_type;
         }
+        if (self.trait_companion_member_access_type(raw_base_type, member_access.member_symbol) is .some(member_type)) {
+            return member_type;
+        }
         guard self.value_member_for_base(
             raw_base_type,
             node_id.owner_def,
@@ -1570,11 +1573,74 @@ public struct BodyCheck: Movable {
     }
 
     qid.DefId? function_member_for_base(qid.TypeId raw_base_type, qid.DefId use_owner, qid.SymbolId symbol) {
+        if (self.trait_any_function_member(raw_base_type, symbol) is .some(member_def)) {
+            return member_def;
+        }
         if (self.type_ops.function_member_for_type(raw_base_type, use_owner, symbol) is .some(member_def)) {
             return member_def;
         }
         qid.TypeId lookup_type = self.member_lookup_type(raw_base_type);
         return self.type_ops.function_member_for_type(lookup_type, use_owner, symbol);
+    }
+
+    qid.TypeId? trait_companion_member_access_type(qid.TypeId raw_base_type, qid.SymbolId symbol) {
+        types.TypeInfo info = self.state.store.types.get(raw_base_type);
+        guard info.data is .trait_companion(companion) else { return null; }
+        if (companion.kind == .any) {
+            if (self.symbol_text_equal(symbol, "receiver")) {
+                return self.state.store.types.trait_companion_type(companion.trait_def, .receiver, token.Span());
+            }
+            if (self.symbol_text_equal(symbol, "vtable")) {
+                return self.state.store.types.trait_companion_type(companion.trait_def, .vtable, token.Span());
+            }
+            return null;
+        }
+        if (companion.kind != .vtable) { return null; }
+        guard self.trait_function_member(companion.trait_def, symbol) is .some(method_def) else { return null; }
+        return self.trait_vtable_slot_type(companion.trait_def, method_def);
+    }
+
+    qid.DefId? trait_any_function_member(qid.TypeId raw_base_type, qid.SymbolId symbol) {
+        types.TypeInfo info = self.state.store.types.get(raw_base_type);
+        guard info.data is .trait_companion(companion) else { return null; }
+        if (companion.kind != .any) { return null; }
+        guard self.trait_function_member(companion.trait_def, symbol) is .some(method_def) else { return null; }
+        if (!self.function_has_receiver(method_def)) { return null; }
+        if (self.function_is_move_receiver(method_def)) { return null; }
+        return method_def;
+    }
+
+    qid.DefId? trait_function_member(qid.DefId trait_def, qid.SymbolId symbol) {
+        guard self.state.store.defs.get(trait_def).owned_namespace_id is .some(namespace_id) else { return null; }
+        guard self.state.store.resolve.namespaces.first_binding(namespace_id, symbol, .value_name)
+            is .some(binding) else {
+            return null;
+        }
+        if (self.state.store.defs.get(binding.def_id).kind != .function_def) { return null; }
+        return binding.def_id;
+    }
+
+    qid.TypeId trait_vtable_slot_type(qid.DefId trait_def, qid.DefId method_def) {
+        qid.TypeId method_type = self.type_ops.type_for_def(method_def);
+        types.TypeInfo info = self.state.store.types.get(method_type);
+        guard info.data is .function_type(function_type) else { return self.state.store.types.invalid_type(); }
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(function_type.params.length);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            if (index == 0 && self.function_has_receiver(method_def)) {
+                params.add(self.state.store.types.trait_companion_type(trait_def, .receiver, token.Span()));
+            } else {
+                params.add(function_type.params[index]);
+            }
+            index = index + 1;
+        }
+        return self.state.store.types.function_type(params$.move(), function_type.result, token.Span());
+    }
+
+    Bool function_has_receiver(qid.DefId function_def) {
+        guard self.state.hirs.def(function_def) is .some(hir_def) else { return false; }
+        guard hir_def.decl.function_signature is .some(signature) else { return false; }
+        return signature.has_receiver;
     }
 
     qid.TypeId member_type_base(qid.TypeId raw_base_type, qid.DefId member_def) {
@@ -4634,12 +4700,40 @@ public struct BodyCheck: Movable {
     ) {
         qid.TypeId receiver_type = self.type_ops.check_type_ref(call.base);
         guard self.trait_def_for_companion_receiver(receiver_type) is .some(trait_def) else { return; }
-        if (self.type_satisfies_trait(subject_type, trait_def, node_id.owner_def)) { return; }
-        self.type_ops.add_node_error(
-            subject_id,
-            "trait companion subject does not satisfy trait",
-            "trait_companion_bound_not_satisfied"
-        );
+        if (!self.type_satisfies_trait(subject_type, trait_def, node_id.owner_def)) {
+            self.type_ops.add_node_error(
+                subject_id,
+                "trait companion subject does not satisfy trait",
+                "trait_companion_bound_not_satisfied"
+            );
+            return;
+        }
+        if (self.trait_has_move_receiver_method(trait_def)) {
+            self.type_ops.add_node_error(
+                call.base,
+                "trait object does not support move receiver methods",
+                "trait_object_move_receiver_not_supported"
+            );
+        }
+    }
+
+    Bool trait_has_move_receiver_method(qid.DefId trait_def) {
+        guard self.state.hirs.def(trait_def) is .some(hir_def) else { return false; }
+        Int! index = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            if (self.function_is_move_receiver(member_def)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool function_is_move_receiver(qid.DefId function_def) {
+        if (self.state.store.defs.get(function_def).kind != .function_def) { return false; }
+        guard self.state.hirs.def(function_def) is .some(hir_def) else { return false; }
+        guard hir_def.decl.function_signature is .some(signature) else { return false; }
+        if (!signature.has_receiver) { return false; }
+        return signature.receiver_mode == .move_receiver;
     }
 
     qid.DefId? trait_def_for_companion_receiver(qid.TypeId receiver_type) {
