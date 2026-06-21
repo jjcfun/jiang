@@ -1,0 +1,159 @@
+# DSL / Lang Package
+
+Jiang 的 DSL 机制是 Jiang parse 之后、resolve 之前的 syntax expansion。普通 parser 先保留
+`#alias { ... }` invocation，expansion 阶段再调用 lang provider。DSL provider 不生成 HIR、MIR
+或 backend IR；它只把外部语法片段翻译成 Jiang 语法层能表示的 syntax tree。
+
+## Goal
+
+源码中的 lang invocation 形如：
+
+```jiang
+User user = #sql {
+    select * from User where id == \(id)
+};
+```
+
+`#sql` 中的 `sql` 只来自当前 package manifest 的 `[dependencies]` alias。目标 dependency
+必须是 `type = lang` package，并在 package root 中公开默认入口 `Lang`。
+
+lang invocation 使用 block 形式，不支持 `#sql(...)`，也不支持源码内声明多个 parser 入口。
+编译器按 invocation 所在语法位置传入对应 entry kind，provider 需要返回同类 Jiang syntax tree。
+
+## Public Syntax Tree
+
+`std/jiang/syntax/` 放 Jiang syntax 阶段共享 API，包括 source/span、symbol、syntax tree、
+syntax builder trait、syntax diagnostic 和 provider protocol。`std/std.jiang` 导出 `jiang`
+namespace，使用方通过 `std.jiang.syntax.*` 访问这些结构。
+
+`std.jiang.syntax.Tree` 是 lang provider 的 public Jiang syntax tree。它的定位是：
+
+- 表达 Jiang 当前语法层能解析和继续语义检查的结构。
+- 作为 DSL parser 的返回 ABI。
+- 只保存 syntax facts、span 和文本名，不保存 resolver/sema/type/backend 结果。
+
+它不是语言无关 AST，也不是编译器内部 `src/syntax/ast.jiang` 的逐字段暴露。公开 syntax tree
+会尽量贴近 Jiang 内部 AST 的概念，例如 `TopLevelDeclaration`、`MemberDeclaration`、`Expression`、
+`Statement`、`TypeReference`、`Pattern`、`Path`，但会避免公开内部 parser recovery、symbol id、
+token range 和 compiler-only 节点。
+
+`std.jiang.syntax.Span` 是单个 source 内的 byte range，只包含 `start/length`。source identity
+放在 `std.jiang.syntax.Source.source_id` 上，不在每个 span 重复保存。syntax 阶段诊断使用
+`std.jiang.syntax.Diagnostic`，避免和 compiler 内部包含 LSP/fix-it 信息的 rich `Diagnostic` 混用。
+
+## Internal AST Boundary
+
+短期边界如下：
+
+```text
+Jiang source
+  -> Jiang lexer/parser
+  -> lang expansion
+  -> src/syntax/ast.jiang
+  -> resolve/HIR/sema/MIR/backend
+
+DSL source
+  -> raw lang invocation node
+  -> lang provider
+  -> std.jiang.syntax.Tree
+  -> translate to src/syntax/ast.jiang
+  -> resolve/HIR/sema/MIR/backend
+```
+
+也就是说，普通 Jiang parser 暂时继续产出内部 AST，但遇到 `#alias { ... }` 时只记录 invocation
+和 raw block，不立即调用 provider。parse 完成后、resolve 开始前，lang expansion 根据 registry
+调用 provider；provider 返回 `std.jiang.syntax.Tree` 后，编译器把它翻译成内部 AST，再交给既有
+resolve/sema 流程。
+
+长期可以让内部 parser 逐步向 `std.jiang.syntax.Tree` 靠拢，但不要求当前重写 parser 或 resolve。
+
+## Lexer Behavior
+
+Jiang lexer 默认按普通 Jiang token 处理。看到 `#ident { ... }` 时，输出：
+
+```text
+hash ident raw_block
+```
+
+`raw_block` 的 span 覆盖完整 `{ ... }`，内部只递归匹配 `{}` 边界，不按 Jiang token 展开。
+未闭合 raw block 产生 `unterminated_raw_block` 诊断。
+
+## Registry
+
+解析 package manifest 后，编译器先加载 dependencies。对 `type = lang` package，编译器将其
+编译为 host-side provider，并把 dependency alias 注册到 lang registry：
+
+```text
+dependency alias -> provider package root public Lang
+```
+
+当前 package 的 lang expansion 遇到 parser 留下的 `#alias { ... }` invocation 时只查这个 registry，
+不查普通 import/name resolve。这样 DSL 机制不依赖 Jiang 普通名字解析。
+
+## Provider Contract
+
+provider 必须实现统一入口：
+
+```text
+Lang.parse(std.jiang.syntax.Builder.Any& builder, std.jiang.syntax.Input) -> std.jiang.syntax.NodeId
+```
+
+`Lang` 是 `type = lang` package root module 的 public 导出，并且必须满足
+`std.jiang.syntax.Provider`。provider 可以直接在 root file 定义：
+
+```jiang
+public struct Lang: std.jiang.syntax.Provider {
+    public static std.jiang.syntax.NodeId parse(
+        std.jiang.syntax.Builder.Any& builder,
+        std.jiang.syntax.Input input
+    ) {
+        ...
+    }
+}
+```
+
+也可以把实现放在内部模块，再从 root file 重新导出固定入口：
+
+```jiang
+import internal = "internal.jiang";
+
+public alias Lang = internal.SqlLang;
+```
+
+编译器只查 package root 的 public `Lang`，不查普通 import/name resolve，也不支持一个 lang
+package 同时导出多个默认 parser。
+
+`Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`，可为 `file`、`top_level_declaration`、
+`member_declaration`、`statement`、`expression`、`type_reference` 或 `pattern`。返回 syntax
+tree 的 root kind 必须等于 `input.entry_kind`；编译器根据 invocation 所在位置传入 entry kind，
+并拒绝不匹配的 tree。也就是说，DSL 输出需要落在 Jiang 当前语法层能表示的完整 syntax
+entry 中。
+
+provider 需要保留 source span。对于从 DSL 原文生成的节点，应使用 `Input.body_span` 内的局部
+span；对于插值表达式，provider 可以请求 host parser 解析 Jiang expression/type/path，并把解析
+结果嵌入返回 tree。
+
+## Excluded From Public Syntax Tree
+
+公开 syntax tree 不包含：
+
+- HIR/MIR/backend IR。
+- `DefId`、`TypeId`、内部 token range。
+- compiler-only intrinsic block。
+- 已废弃或内部兼容用的 compile-if 节点。
+
+如果 provider 需要按 target 或 build option 做条件选择，应直接在 provider 执行期返回最终 AST，
+不要把条件编译节点暴露给后续阶段。
+
+## Validation
+
+DSL provider 返回 syntax tree 后，translator 负责：
+
+- 校验 root entry kind。
+- 校验所有 `NodeId` / `NodeRange` 有效。
+- 把 `Name.text` intern 成内部 symbol。
+- 复用 public `Span` 作为内部 syntax token span。
+- 把 public syntax node 映射为 `src/syntax/ast.jiang` node。
+- 对不支持或不合法的 public syntax tree 结构产生 parser/syntax 诊断。
+
+后续 resolve、type check、MIR 和 backend 不区分这些节点来自 Jiang source 还是 lang provider。

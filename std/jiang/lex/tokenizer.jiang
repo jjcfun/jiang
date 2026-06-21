@@ -1,0 +1,508 @@
+import syntax = "../syntax.jiang";
+import builder = "../syntax/builder.jiang";
+import ident = "../text/ident.jiang";
+import unicode = "../text/unicode.jiang";
+import token = "token.jiang";
+
+public struct Tokenizer: Movable {
+    public syntax.Source source;
+    public syntax.Span span;
+    Int! start;
+    Int! current;
+    token.Trivia! leading;
+    Bool! lang_hash_seen;
+    Bool! lang_name_seen;
+
+    public init(syntax.Source source, syntax.Span span) {
+        self.source = source;
+        self.span = span;
+        self.start = span.start;
+        self.current = span.start;
+        self.leading = token.Trivia();
+        self.lang_hash_seen = false;
+        self.lang_name_seen = false;
+    }
+
+    public static Tokenizer from_source(syntax.Source source) {
+        return Tokenizer(source, source.span());
+    }
+
+    public token.Token next(builder.Builder.Any& syntax_builder) {
+        self.leading = self.skip_trivia();
+        self.start = self.current;
+
+        if (self.at_end()) { return self.make(.eof); }
+
+        UInt8 byte = self.peek();
+        self.advance(1);
+        if (self.lang_name_seen && byte == '{') { return self.raw_block(); }
+        if (byte == '`') { return self.escaped_identifier(syntax_builder); }
+        if (byte == '"') { return self.string_literal(syntax_builder); }
+        if (byte == '\'') { return self.char_literal(syntax_builder); }
+        if (byte == '(') { return self.make(.left_paren); }
+        if (byte == ')') { return self.make(.right_paren); }
+        if (byte == '{') { return self.make(.left_brace); }
+        if (byte == '}') { return self.make(.right_brace); }
+        if (byte == '[') { return self.make(.left_bracket); }
+        if (byte == ']') { return self.make(.right_bracket); }
+        if (byte == '@') { return self.make(.at); }
+        if (byte == '#') { return self.hash_token(); }
+        if (byte == ',') { return self.make(.comma); }
+        if (byte == ':') { return self.make(.colon); }
+        if (byte == ';') { return self.make(.semicolon); }
+        if (byte == '$') { return self.make(.dollar); }
+        if (byte == '_' && !self.ident_continue_at_current()) { return self.make(.underscore); }
+        if (byte == '~') { return self.make(.tilde); }
+        if (byte == '?') { return self.question_operator(); }
+        if (byte == '+') { return self.plus_operator(); }
+        if (byte == '-') { return self.minus_operator(); }
+        if (byte == '*') { return self.star_operator(); }
+        if (byte == '/') { return self.slash_operator(); }
+        if (byte == '%') { return self.percent_operator(); }
+        if (byte == '&') { return self.amp_operator(); }
+        if (byte == '|') { return self.pipe_operator(); }
+        if (byte == '^') { return self.caret_operator(); }
+        if (byte == '.') { return self.dot_operator(); }
+        if (byte == '=') { return self.equal_operator(); }
+        if (byte == '!') { return self.bang_operator(); }
+        if (byte == '<') { return self.less_operator(); }
+        if (byte == '>') { return self.greater_operator(); }
+        return self.identifier_number_or_error(syntax_builder, byte);
+    }
+
+    public UInt8[]& token_text(token.Token value) {
+        return self.source.bytes[value.span.start..value.span.end()];
+    }
+
+    Bool at_end() {
+        return self.current >= self.span.end();
+    }
+
+    UInt8 peek() {
+        if (self.at_end()) { return 0; }
+        return self.source.bytes[self.current];
+    }
+
+    UInt8 peek_next() {
+        if (self.current + 1 >= self.span.end()) { return 0; }
+        return self.source.bytes[self.current + 1];
+    }
+
+    () advance(Int offset) {
+        self.current = self.current + offset;
+    }
+
+    Bool match(UInt8 expected) {
+        if (self.at_end()) { return false; }
+        if (self.source.bytes[self.current] != expected) { return false; }
+        self.advance(1);
+        return true;
+    }
+
+    token.Token make(token.TokenTag tag) {
+        if (tag != .hash && tag != .raw_block) {
+            self.lang_hash_seen = false;
+            self.lang_name_seen = false;
+        }
+        return token.Token(token.token_kind(tag), self.current_span(), self.leading, .present);
+    }
+
+    token.Token make_error() {
+        self.lang_hash_seen = false;
+        self.lang_name_seen = false;
+        return token.Token(.error(), self.current_span(), self.leading, .present);
+    }
+
+    token.Token make_error_code(builder.Builder.Any& syntax_builder, UInt8[]& code) {
+        syntax_builder.add_error(self.current_span(), code, code);
+        return self.make_error();
+    }
+
+    token.Token make_symbol(builder.Builder.Any& syntax_builder, token.TokenTag tag) {
+        UInt8[]& text = self.current_text();
+        syntax.SymbolId symbol = syntax_builder.intern_symbol(self.symbol_text_for(tag, text));
+        return token.Token(self.symbol_kind(tag, symbol), self.current_span(), self.leading, .present);
+    }
+
+    token.TokenKind symbol_kind(token.TokenTag tag, syntax.SymbolId symbol) {
+        if (tag == .ident) { return .name(token.Name(symbol)); }
+        if (tag == .escaped_ident) { return .name(token.Name(symbol, true)); }
+        if (tag == .int_lit) { return .literal(token.Literal(.int_lit, symbol)); }
+        if (tag == .float_lit) { return .literal(token.Literal(.float_lit, symbol)); }
+        if (tag == .char_lit) { return .literal(token.Literal(.char_lit, symbol)); }
+        return .literal(token.Literal(.string_lit, symbol));
+    }
+
+    UInt8[]& symbol_text_for(token.TokenTag tag, UInt8[]& text) {
+        if (tag == .escaped_ident || tag == .string_lit || tag == .char_lit) {
+            if (text.length < 2) { return ""; }
+            return text[1..text.length - 1];
+        }
+        return text;
+    }
+
+    syntax.Span current_span() {
+        return syntax.Span(self.start, self.current - self.start);
+    }
+
+    UInt8[]& current_text() {
+        return self.source.bytes[self.start..self.current];
+    }
+
+    token.Trivia skip_trivia() {
+        token.Trivia! trivia = token.Trivia();
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            if (self.is_space(byte)) {
+                trivia.has_whitespace = true;
+                if (byte == '\n' || byte == '\r') { trivia.has_newline = true; }
+                self.advance(1);
+                continue;
+            }
+            if (byte == '/' && self.peek_next() == '/') {
+                trivia.has_comment = true;
+                self.skip_line_comment();
+                continue;
+            }
+            return trivia;
+        }
+        return trivia;
+    }
+
+    () skip_line_comment() {
+        self.advance(2);
+        while (!self.at_end() && self.peek() != '\n') {
+            self.advance(1);
+        }
+    }
+
+    token.Token identifier(builder.Builder.Any& syntax_builder) {
+        while (!self.at_end()) {
+            if (ident.is_ascii_ident_continue(self.peek())) {
+                self.advance(1);
+                continue;
+            }
+            if (ident.is_utf8_ident_at(self.source.bytes, self.current)) {
+                self.advance(ident.utf8_len_at(self.source.bytes, self.current));
+                continue;
+            }
+            return self.make_ident(syntax_builder);
+        }
+        return self.make_ident(syntax_builder);
+    }
+
+    token.Token make_ident(builder.Builder.Any& syntax_builder) {
+        if (self.lang_hash_seen) {
+            self.lang_hash_seen = false;
+            self.lang_name_seen = true;
+        } else {
+            self.lang_name_seen = false;
+        }
+        return self.make_symbol(syntax_builder, .ident);
+    }
+
+    token.Token hash_token() {
+        self.lang_hash_seen = true;
+        self.lang_name_seen = false;
+        return self.make(.hash);
+    }
+
+    token.Token raw_block() {
+        self.lang_hash_seen = false;
+        self.lang_name_seen = false;
+        Int! depth = 1;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (byte == '"') { self.skip_raw_string(); continue; }
+            if (byte == '\'') { self.skip_raw_char(); continue; }
+            if (byte == '/' && self.peek() == '/') { self.skip_raw_line_comment(); continue; }
+            if (byte == '{') { depth = depth + 1; continue; }
+            if (byte != '}') { continue; }
+            depth = depth - 1;
+            if (depth == 0) { return self.make(.raw_block); }
+        }
+        return self.make_error();
+    }
+
+    () skip_raw_string() {
+        Bool! escaped = false;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (escaped) { escaped = false; continue; }
+            if (byte == '\\') { escaped = true; continue; }
+            if (byte == '"') { return; }
+        }
+    }
+
+    () skip_raw_char() {
+        Bool! escaped = false;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (escaped) { escaped = false; continue; }
+            if (byte == '\\') { escaped = true; continue; }
+            if (byte == '\'') { return; }
+        }
+    }
+
+    () skip_raw_line_comment() {
+        self.advance(1);
+        while (!self.at_end() && self.peek() != '\n') {
+            self.advance(1);
+        }
+    }
+
+    token.Token escaped_identifier(builder.Builder.Any& syntax_builder) {
+        while (!self.at_end() && self.peek() != '`') {
+            self.advance(1);
+        }
+        if (!self.match('`')) { return self.make_error(); }
+        return self.make_symbol(syntax_builder, .escaped_ident);
+    }
+
+    token.Token string_literal(builder.Builder.Any& syntax_builder) {
+        Bool! escaped = false;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (escaped) { escaped = false; continue; }
+            if (byte == '\\') { escaped = true; continue; }
+            if (byte == '"') { return self.make_symbol(syntax_builder, .string_lit); }
+        }
+        return self.make_error();
+    }
+
+    token.Token char_literal(builder.Builder.Any& syntax_builder) {
+        Bool! escaped = false;
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            self.advance(1);
+            if (escaped) { escaped = false; continue; }
+            if (byte == '\\') { escaped = true; continue; }
+            if (byte == '\'') { return self.make_symbol(syntax_builder, .char_lit); }
+        }
+        return self.make_error();
+    }
+
+    token.Token identifier_number_or_error(builder.Builder.Any& syntax_builder, UInt8 byte) {
+        if (ident.is_ascii_ident_start(byte)) { return self.identifier(syntax_builder); }
+        if (self.is_digit(byte)) { return self.number(syntax_builder); }
+        if (unicode.is_utf8_lead(byte)) { return self.unicode_identifier_or_error(syntax_builder); }
+        return self.make_error_code(syntax_builder, "unexpected_character");
+    }
+
+    token.Token unicode_identifier_or_error(builder.Builder.Any& syntax_builder) {
+        if (ident.is_utf8_ident_at(self.source.bytes, self.start)) {
+            self.advance(ident.utf8_len_at(self.source.bytes, self.start) - 1);
+            return self.identifier(syntax_builder);
+        }
+        if (unicode.is_valid_utf8_at(self.source.bytes, self.start)) {
+            self.advance(unicode.utf8_len_at(self.source.bytes, self.start) - 1);
+        }
+        return self.make_error_code(syntax_builder, "unicode_punctuation");
+    }
+
+    token.Token number(builder.Builder.Any& syntax_builder) {
+        if (self.current_text_starts_with_zero()) {
+            Int base = self.consume_integer_base_prefix();
+            if (base != 0) { return self.based_number(syntax_builder, base); }
+        }
+        return self.decimal_number(syntax_builder);
+    }
+
+    token.Token based_number(builder.Builder.Any& syntax_builder, Int base) {
+        if (!self.consume_based_digits(base)) {
+            self.add_empty_based_literal_error(syntax_builder, base);
+            return self.make_error();
+        }
+        return self.make_symbol(syntax_builder, .int_lit);
+    }
+
+    token.Token decimal_number(builder.Builder.Any& syntax_builder) {
+        self.consume_decimal_digits();
+        Bool! is_float = false;
+        if (self.peek() == '.' && self.peek_next() != '.') {
+            is_float = true;
+            self.advance(1);
+            self.consume_decimal_digits();
+        }
+        if (self.consume_exponent()) {
+            is_float = true;
+        }
+        if (!is_float) { return self.make_symbol(syntax_builder, .int_lit); }
+        return self.make_symbol(syntax_builder, .float_lit);
+    }
+
+    Bool current_text_starts_with_zero() {
+        return self.start < self.current && self.source.bytes[self.start] == '0';
+    }
+
+    Int consume_integer_base_prefix() {
+        UInt8 byte = self.peek();
+        if (byte == 'b' || byte == 'B') { self.advance(1); return 2; }
+        if (byte == 'o' || byte == 'O') { self.advance(1); return 8; }
+        if (byte == 'x' || byte == 'X') { self.advance(1); return 16; }
+        return 0;
+    }
+
+    Bool consume_based_digits(Int base) {
+        Bool! has_digit = false;
+        while (!self.at_end()) {
+            Int digit = self.digit_value_for_base(self.peek(), base);
+            if (self.peek() == '_') { self.advance(1); continue; }
+            if (digit < 0) { return has_digit; }
+            has_digit = true;
+            self.advance(1);
+        }
+        return has_digit;
+    }
+
+    () add_empty_based_literal_error(builder.Builder.Any& syntax_builder, Int base) {
+        if (base == 2) { syntax_builder.add_error(self.current_span(), "empty_binary_literal", "empty_binary_literal"); }
+        if (base == 8) { syntax_builder.add_error(self.current_span(), "empty_octal_literal", "empty_octal_literal"); }
+        if (base == 16) { syntax_builder.add_error(self.current_span(), "empty_hex_literal", "empty_hex_literal"); }
+    }
+
+    Int digit_value_for_base(UInt8 byte, Int base) {
+        if (byte >= '0' && byte <= '9') {
+            Int digit = Int(byte - '0');
+            if (digit < base) { return digit; }
+            return -1;
+        }
+        if (byte >= 'a' && byte <= 'f' && base == 16) { return Int(byte - 'a') + 10; }
+        if (byte >= 'A' && byte <= 'F' && base == 16) { return Int(byte - 'A') + 10; }
+        return -1;
+    }
+
+    () consume_decimal_digits() {
+        while (!self.at_end()) {
+            UInt8 byte = self.peek();
+            if (byte == '_' || self.is_digit(byte)) {
+                self.advance(1);
+                continue;
+            }
+            return;
+        }
+    }
+
+    Bool consume_exponent() {
+        UInt8 byte = self.peek();
+        if (byte != 'e' && byte != 'E') { return false; }
+        if (!self.exponent_has_digits()) { return false; }
+        self.advance(1);
+        if (self.peek() == '+' || self.peek() == '-') {
+            self.advance(1);
+        }
+        self.consume_decimal_digits();
+        return true;
+    }
+
+    Bool exponent_has_digits() {
+        Int! offset = 1;
+        UInt8 byte = self.peek_at(offset);
+        if (byte == '+' || byte == '-') {
+            offset = offset + 1;
+        }
+        return self.is_digit(self.peek_at(offset));
+    }
+
+    UInt8 peek_at(Int offset) {
+        Int index = self.current + offset;
+        if (index >= self.span.end()) { return 0; }
+        return self.source.bytes[index];
+    }
+
+    token.Token question_operator() {
+        if (self.match('.')) { return self.make(.question_dot); }
+        if (self.match('?')) { return self.make(.question_question); }
+        return self.make(.question);
+    }
+
+    token.Token plus_operator() {
+        if (self.match('=')) { return self.make(.plus_assign); }
+        return self.make(.plus);
+    }
+
+    token.Token minus_operator() {
+        if (self.match('=')) { return self.make(.minus_assign); }
+        return self.make(.minus);
+    }
+
+    token.Token star_operator() {
+        if (self.match('=')) { return self.make(.star_assign); }
+        return self.make(.star);
+    }
+
+    token.Token slash_operator() {
+        if (self.match('=')) { return self.make(.slash_assign); }
+        return self.make(.slash);
+    }
+
+    token.Token percent_operator() {
+        if (self.match('=')) { return self.make(.percent_assign); }
+        return self.make(.percent);
+    }
+
+    token.Token amp_operator() {
+        if (self.match('=')) { return self.make(.amp_assign); }
+        if (self.match('&')) { return self.make(.amp_amp); }
+        return self.make(.amp);
+    }
+
+    token.Token pipe_operator() {
+        if (self.match('=')) { return self.make(.pipe_assign); }
+        if (self.match('|')) { return self.make(.pipe_pipe); }
+        return self.make(.pipe);
+    }
+
+    token.Token caret_operator() {
+        if (self.match('=')) { return self.make(.caret_assign); }
+        return self.make(.caret);
+    }
+
+    token.Token dot_operator() {
+        if (self.match('.')) { return self.make(.dot_dot); }
+        return self.make(.dot);
+    }
+
+    token.Token equal_operator() {
+        if (self.match('=')) { return self.make(.eq_eq); }
+        if (self.match('>')) { return self.make(.fat_arrow); }
+        return self.make(.assign);
+    }
+
+    token.Token bang_operator() {
+        if (self.match('=')) { return self.make(.bang_eq); }
+        return self.make(.bang);
+    }
+
+    token.Token less_operator() {
+        if (self.match('=')) { return self.make(.lt_eq); }
+        if (!self.match('<')) { return self.make(.lt); }
+        if (self.match('=')) { return self.make(.lt_lt_assign); }
+        return self.make(.lt_lt);
+    }
+
+    token.Token greater_operator() {
+        if (self.match('=')) { return self.make(.gt_eq); }
+        if (!self.match('>')) { return self.make(.gt); }
+        if (self.match('=')) { return self.make(.gt_gt_assign); }
+        return self.make(.gt_gt);
+    }
+
+    Bool is_space(UInt8 byte) {
+        return byte == ' ' || byte == '\n' || byte == '\r' || byte == '\t';
+    }
+
+    Bool is_digit(UInt8 byte) {
+        return byte >= '0' && byte <= '9';
+    }
+
+    Bool ident_continue_at_current() {
+        if (self.at_end()) { return false; }
+        if (ident.is_ascii_ident_continue(self.peek())) { return true; }
+        return ident.is_utf8_ident_at(self.source.bytes, self.current);
+    }
+}
