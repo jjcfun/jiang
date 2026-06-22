@@ -98,6 +98,16 @@ place 参与 read/write、borrow、field projection、index projection 和 deref
 标准库中生成的 Unicode XID 表使用 global array，以便 `std.jiang` tokenizer 能通过动态下标
 查询压缩 bitmap。
 
+backend 符号名不使用源码 global 名称。普通 Jiang global 使用 package/module/DefId 派生名：
+
+```text
+_Jp{package_index}_m{module_index}_g{def_id}
+```
+
+这样不同文件或不同 package 中同名 global 不会在 LLVM module 的全局符号表里冲突。`public`
+只影响 Jiang package API，不表示 backend 必须导出源码同名符号。`extern` global 保留源码名，
+用于和外部 ABI 对接；未来如果支持显式 link name/export attribute，也应在这里接入。
+
 ## Terminator
 
 control flow 由 terminator 表达：
