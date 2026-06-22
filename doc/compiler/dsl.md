@@ -24,7 +24,9 @@ lang invocation 使用 block 形式，不支持 `#sql(...)`，也不支持源码
 
 `std/jiang/syntax/` 放 Jiang syntax 阶段共享 API，包括 source/span、symbol、syntax tree、
 syntax builder trait、syntax diagnostic 和 provider protocol。`std/std.jiang` 导出 `jiang`
-namespace，使用方通过 `std.jiang.syntax.*` 访问这些结构。
+namespace，使用方通过 `std.jiang.syntax.*` 访问这些结构。Jiang 语言词法辅助放在
+`std/jiang/lex/` 和 `std/jiang/text/`，通过 `std.jiang.Tokenizer`、`std.jiang.Token` 和
+`std.jiang.ident` 复用。
 
 `std.jiang.syntax.Tree` 是 lang provider 的 public Jiang syntax tree。它的定位是：
 
@@ -77,6 +79,11 @@ hash ident raw_block
 
 `raw_block` 的 span 覆盖完整 `{ ... }`，内部只递归匹配 `{}` 边界，不按 Jiang token 展开。
 未闭合 raw block 产生 `unterminated_raw_block` 诊断。
+
+公开 `std.jiang.Tokenizer` 不保存 token text 或 compiler 内部 symbol id。token 的文本由
+`Token.span` 回到 `Source.bytes` 按需取得，identifier 的 intern 由调用方的 builder/compiler
+上下文负责。identifier 判定使用 ASCII fast path 加 Unicode `XID_Start` / `XID_Continue`，
+底层压缩表由 `script/gen_unicode_xid.js` 生成到 `std/jiang/text/generated/xid.jiang`。
 
 ## Registry
 

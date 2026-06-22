@@ -58,6 +58,10 @@ Token 只表示词法事实，不承载语义类型。
 
 - identifier、关键字和基本类型名在 token 层统一为 `ident`；后续由 `SymbolStore`
   和 resolve/sema 解释。
+- identifier 的 ASCII fast path 允许 ASCII 字母或 `_` 作为首字符，ASCII 字母、数字或 `_`
+  作为后续字符。非 ASCII UTF-8 字符按 Unicode `XID_Start` / `XID_Continue` 判定；
+  数字、组合标记等只能在 `XID_Continue` 允许的位置出现。Unicode punctuation 不属于
+  identifier，lexer 应产生 `unicode_punctuation` 诊断。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
   `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`trait`、
   `extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、
@@ -613,8 +617,8 @@ util = ../util_pkg
 
 manifest 中的 `name` 和 dependency key 使用 Jiang lexer 的 identifier 规则，而不是 ASCII-only
 正则：ASCII 字母或 `_` 可作为首字符，ASCII 数字可作为后续字符，UTF-8 标识符字符也可作为
-首字符和后续字符。完整 Unicode XID 表后续可以替换 lexer 的底层判定，但 manifest 必须复用
-lexer 语义，不能另起一套名字规则。
+首字符和后续字符；具体 UTF-8 判定复用 lexer 的 Unicode `XID_Start` / `XID_Continue` 规则。
+manifest 必须复用 lexer 语义，不能另起一套名字规则。
 
 当前已经把 manifest root 接入 compile path：目录输入会读取 `package.ini`，再编译
 manifest 指定的 root source。`ModuleResolver` 会按 source 所在目录向上查找 `package.ini`，

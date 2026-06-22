@@ -28,6 +28,26 @@ import std;
   `Slice<T>`、`SentinelSlice<T, S>`、`RawPointer<T>`、`ManyPointer<T>` 等。
   其中 `Slice<T>` / `SentinelSlice<T, S>` 是 unsized array type 的公开名字；借用 view 需要通过
   `Reference<Slice<T>>` / `Reference<SentinelSlice<T, S>>`，也就是后缀语法 `T[]&` / `T[:S]&` 表达。
+- `jiang`：Jiang 语言自身的词法和 syntax 辅助 API。当前包括 `std.jiang.syntax.*`、
+  `std.jiang.Token`、`std.jiang.Tokenizer` 和 `std.jiang.ident`。
+  这些 API 供 compiler 和 lang provider 共享，避免 DSL 从零实现 Jiang-compatible token 和
+  syntax tree。
+
+## std.jiang
+
+`std.jiang.syntax` 是 lang provider 的公共 syntax ABI。provider 通过
+`std.jiang.syntax.Builder.Any&` 构造 `NodeId` / `Tree`，并用 `std.jiang.syntax.Diagnostic`
+报告 syntax 阶段错误。compiler 可以复用这些结构，再在 lang expansion 后转换到内部 AST。
+
+`std.jiang.Tokenizer` 是 Jiang 语言 tokenizer 的公共版本。它接受 `std.jiang.syntax.Source`，
+每次 `next(builder)` 返回一个 `Token`，并把 lexer 诊断写入传入的 builder。`Token` 不保存
+text 或 compiler 内部 symbol id；调用方按 `Token.span` 从 `Source.bytes` 取回文本，并在自己的
+symbol store 中 intern。
+
+identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节；UTF-8 路径使用 Unicode
+`XID_Start` / `XID_Continue`。压缩 XID 表由 `script/gen_unicode_xid.js` 生成到
+`std/jiang/text/generated/xid.jiang`，当前以 global array 保存，依赖 MIR 对 global array
+动态下标访问的支持。
 
 ## 稳定性边界
 

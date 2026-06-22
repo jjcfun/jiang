@@ -85,6 +85,19 @@ params 和 user locals。temporary local 由 lowering 在需要 materialize comp
 
 complex operand 必须先 lower 到 temporary local，不能在 operand 中嵌套表达式树。
 
+## Global Place
+
+MIR place 支持 local base 和 global base。非 `const` 全局变量是 addressable storage，可以作为
+place 参与 read/write、borrow、field projection、index projection 和 deref projection。
+
+`const` 仍保持值语义，不承诺拥有唯一 storage，也不因为跨 package 使用就自动 materialize 成
+只读 global。因此动态下标访问、取地址或需要稳定 storage 的表数据应声明为非 `const` global，
+例如 `UInt8![N] TABLE = [...]`。编译器可以把只读使用的 global lowering 成只读 backend global，
+但这属于实现优化，不改变 source 层 `const` 和 global variable 的语义边界。
+
+标准库中生成的 Unicode XID 表使用 global array，以便 `std.jiang` tokenizer 能通过动态下标
+查询压缩 bitmap。
+
 ## Terminator
 
 control flow 由 terminator 表达：
