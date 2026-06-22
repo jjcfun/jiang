@@ -75,6 +75,8 @@ public mir.MirStore^ elaborate_package(
         return output$.move();
     }
 
+    copy_globals(input$.ref(), output$.ref());
+
     Int! function_index = 0;
     while (function_index < input.functions.len()) {
         mir.MirFunction function = input.functions.get(function_index);
@@ -83,6 +85,65 @@ public mir.MirStore^ elaborate_package(
         function_index = function_index + 1;
     }
     return output$.move();
+}
+
+() copy_globals(mir.MirStore& input, mir.MirStore& output) {
+    Int! index = 0;
+    while (index < input.globals.len()) {
+        mir.MirGlobal global = input.globals.get(index);
+        output.add_global(mir.MirGlobal (
+            id: global.id,
+            def_id: global.def_id,
+            type_id: global.type_id,
+            span: global.span,
+            read_only: global.read_only,
+            initializer: copy_optional_static_value(output, global.initializer)
+        ));
+        index = index + 1;
+    }
+}
+
+mir.MirStaticValue? copy_optional_static_value(mir.MirStore& output, mir.MirStaticValue? value) {
+    if (value is .some(static_value)) {
+        return copy_static_value(output, static_value);
+    }
+    return null;
+}
+
+mir.MirFunctionRef copy_function_ref(mir.MirStore& output, mir.MirFunctionRef function_ref) {
+    return mir.MirFunctionRef (
+        function_def: function_ref.function_def,
+        type_args: output.type_arg_array(function_ref.type_args),
+        const_args: output.const_arg_array(function_ref.const_args),
+        type_id: function_ref.type_id,
+        span: function_ref.span
+    );
+}
+
+mir.MirStaticValue copy_static_value(mir.MirStore& output, mir.MirStaticValue value) {
+    if (value is .scalar(scalar)) {
+        return mir.scalar_static_value(scalar);
+    }
+    if (value is .function(function_ref)) {
+        return mir.function_static_value(copy_function_ref(output, function_ref));
+    }
+    if (value is .global_address(global_ref)) {
+        return mir.global_address_static_value(global_ref);
+    }
+    guard value is .aggregate(fields) else {
+        list.ArrayList<mir.MirStaticField>! empty = list.ArrayList<mir.MirStaticField>();
+        return mir.aggregate_static_value(output.static_field_array(empty$.ref()));
+    }
+    list.ArrayList<mir.MirStaticField>! copied = list.ArrayList<mir.MirStaticField>(fields.length);
+    Int! index = 0;
+    while (index < fields.length) {
+        copied.add(mir.MirStaticField (
+            type_id: fields[index].type_id,
+            value: copy_static_value(output, fields[index].value)
+        ));
+        index = index + 1;
+    }
+    return mir.aggregate_static_value(output.static_field_array(copied$.ref()));
 }
 
 mir.MirFunction elaborate_function(
@@ -97,7 +158,7 @@ mir.MirFunction elaborate_function(
 
     DropFlagMap flags = build_drop_flags(ctx, body);
     // cleanup 临时位既用于自定义 deinit 的 unit 结果，也用于 owner pointer 的 free statement。
-    Bool needs_cleanup_result = flags.flag_count > 0;
+    Bool needs_cleanup_result = flags.flag_count > 0 || body_has_drop_terminator(body);
     Bool needs_slice_drop_temps = body_needs_contiguous_drop_temps(ctx, body);
     DropTemps temps = drop_temps(body, flags, needs_cleanup_result, needs_slice_drop_temps);
     mir.MirLocalDecl[]& locals = copy_locals_with_drop_flags(
@@ -123,6 +184,8 @@ mir.MirFunction elaborate_function(
         blocks$.ref()
     );
 
+    elaborate_drop_terminator_blocks(ctx, output, body, temps, original_block_count, blocks$.ref());
+
     mir.MirBody storage_body = body_with_blocks(output, body, blocks$.ref());
     Int return_block_count = blocks.len();
     elaborate_return_blocks(
@@ -136,6 +199,72 @@ mir.MirFunction elaborate_function(
     );
 
     return copy_function_with_body(output, function, body_with_blocks(output, body, blocks$.ref()));
+}
+
+Bool body_has_drop_terminator(mir.MirBody body) {
+    Int! block_index = 0;
+    while (block_index < body.blocks.length) {
+        if (body.blocks[block_index].terminator.kind is .drop_term(_)) {
+            return true;
+        }
+        block_index = block_index + 1;
+    }
+    return false;
+}
+
+() elaborate_drop_terminator_blocks(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBody body,
+    DropTemps temps,
+    Int original_block_count,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    Int! block_index = 0;
+    while (block_index < original_block_count) {
+        mir.MirBlock block = blocks.get(block_index);
+        if (block.terminator.kind is .drop_term(drop_term)) {
+            blocks.set(block.id.to_index(), expanded_drop_terminator_block(
+                ctx,
+                output,
+                body,
+                temps,
+                block,
+                drop_term,
+                blocks
+            ));
+        }
+        block_index = block_index + 1;
+    }
+}
+
+mir.MirBlock expanded_drop_terminator_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirBody body,
+    DropTemps temps,
+    mir.MirBlock block,
+    mir.MirDropTerminator drop_term,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(block.statements.length);
+    Int! index = 0;
+    while (index < block.statements.length) {
+        statements.add(block.statements[index]);
+        index = index + 1;
+    }
+    return drop_block(
+        ctx,
+        output,
+        temps,
+        block.id,
+        block,
+        drop_term.place,
+        place_type(ctx, body, drop_term.place),
+        statements$.ref(),
+        drop_term.target,
+        blocks
+    );
 }
 
 mir.MirBody body_with_locals(mir.MirBody body, mir.MirLocalDecl[]& locals) {
@@ -415,16 +544,13 @@ mir.MirOperand copy_operand(mir.MirStore& output, mir.MirOperand& operand) {
         return mir.out_operand_value(mir.MirOutOperand (place: copy_place(output, out_operand.place)));
     }
     if (operand is .function_operand(function_ref)) {
-        return mir.function_operand_value(mir.MirFunctionRef (
-            function_def: function_ref.function_def,
-            type_args: output.type_arg_array(function_ref.type_args),
-            const_args: output.const_arg_array(function_ref.const_args),
-            type_id: function_ref.type_id,
-            span: function_ref.span
-        ));
+        return mir.function_operand_value(copy_function_ref(output, function_ref));
     }
     if (operand is .global_operand(global_ref)) {
         return mir.global_operand_value(global_ref);
+    }
+    if (operand is .global_address_operand(global_ref)) {
+        return mir.global_address_operand_value(global_ref);
     }
     guard operand is .const_operand(const_value) else {
         return mir.const_operand_value(mir.MirConst (
@@ -1286,6 +1412,18 @@ DropExpansion append_owner_pointer_drop_chain(
         next_target,
         blocks
     );
+    if (handle_is_trait_object(ctx, handle_type)) {
+        mir.MirBlockId drop_target = append_trait_object_drop_block(
+            ctx,
+            output,
+            cleanup_result,
+            source_block,
+            place,
+            free_target,
+            blocks
+        );
+        return DropExpansion(drop_target, true);
+    }
     contiguous.ContiguousQuery query = contiguous.ContiguousQuery(ctx.store$.ref());
     if (query.owned_storage_info_for_handle(handle_type) is .some(storage)) {
         if (!type_needs_drop(ctx, storage.element)) {
@@ -1320,6 +1458,56 @@ DropExpansion append_owner_pointer_drop_chain(
         blocks
     );
     return DropExpansion(pointee_drop, true);
+}
+
+Bool handle_is_trait_object(context.CompilerContext& ctx, types.HandleType handle_type) {
+    if (handle_type.kind != .owner_pointer && handle_type.kind != .reference) {
+        return false;
+    }
+    return type_is_trait_any(ctx, handle_type.element);
+}
+
+Bool type_is_trait_any(context.CompilerContext& ctx, qid.TypeId type_id) {
+    types.TypeInfo info = ctx.store.types.get(type_id);
+    guard info.data is .trait_companion(companion) else { return false; }
+    return companion.kind == .any;
+}
+
+mir.MirBlockId append_trait_object_drop_block(
+    context.CompilerContext& ctx,
+    mir.MirStore& output,
+    mir.MirLocalId cleanup_result,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId id = mir.MirBlockId.from_index(blocks.len());
+    token.Span span = source_block.terminator.span;
+    mir.MirPlace receiver = field_index_place(output, place, 0);
+    mir.MirPlace vtable = field_index_place(output, place, 1);
+    mir.MirPlace receiver_info_ptr = field_index_place(output, vtable, 0);
+    mir.MirPlace receiver_info = deref_raw_place(output, receiver_info_ptr);
+    mir.MirPlace drop_fn = field_index_place(output, receiver_info, 0);
+    list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+    args.add(copy_operand_for_place(receiver));
+    blocks.add(mir.MirBlock(
+        id: id,
+        span: span,
+        statements: output.empty_statements(),
+        terminator: mir.MirTerminator(
+            span: span,
+            kind: mir.call_terminator_kind(mir.MirCallTerminator(
+                callee: mir.indirect_operand_callee(copy_operand_for_place(drop_fn)),
+                args: output.operand_array(args$.ref()),
+                destination: local_place(output, cleanup_result),
+                target: next_target,
+                initialized_place: null,
+                cleanup: null
+            ))
+        )
+    ));
+    return id;
 }
 
 mir.MirBlockId append_owner_pointer_free_block(
@@ -1780,6 +1968,31 @@ mir.MirPlace field_index_place(mir.MirStore& output, mir.MirPlace owner_place, I
     );
 }
 
+qid.TypeId place_type(context.CompilerContext& ctx, mir.MirBody body, mir.MirPlace place) {
+    qid.TypeId! current = body.locals[place.local_id.to_index()].type_id;
+    Int! index = 0;
+    while (index < place.projection.length) {
+        mir.MirPlaceElem elem = place.projection[index];
+        if (elem is .field_projection(field)) {
+            current = field.field_type;
+        } else if (elem is .constant_index_projection(constant_index)) {
+            current = layout_for_type(ctx, current).fields[constant_index.offset].field_type;
+        } else {
+            current = pointer_like_element_type(ctx, current);
+        }
+        index = index + 1;
+    }
+    return current;
+}
+
+qid.TypeId pointer_like_element_type(context.CompilerContext& ctx, qid.TypeId type_id) {
+    types.TypeInfo info = ctx.store.types.get(type_id);
+    if (info.data is .handle_type(handle)) {
+        return handle.element;
+    }
+    return ctx.store.types.invalid_type();
+}
+
 mir.MirPlace indexed_place(mir.MirStore& output, mir.MirPlace owner_place, mir.MirLocalId index_local) {
     list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(owner_place.projection.length + 1);
     Int! index = 0;
@@ -1802,6 +2015,20 @@ mir.MirPlace deref_place(mir.MirStore& output, mir.MirPlace owner_place) {
         index = index + 1;
     }
     projection.add(mir.deref_projection_elem(mir.MirDerefProjection (raw_pointer: false)));
+    return mir.MirPlace (
+        local_id: owner_place.local_id,
+        projection: output.projection_array(projection$.ref())
+    );
+}
+
+mir.MirPlace deref_raw_place(mir.MirStore& output, mir.MirPlace owner_place) {
+    list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(owner_place.projection.length + 1);
+    Int! index = 0;
+    while (index < owner_place.projection.length) {
+        projection.add(owner_place.projection[index]);
+        index = index + 1;
+    }
+    projection.add(mir.deref_projection_elem(mir.MirDerefProjection (raw_pointer: true)));
     return mir.MirPlace (
         local_id: owner_place.local_id,
         projection: output.projection_array(projection$.ref())
