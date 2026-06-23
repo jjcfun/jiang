@@ -104,6 +104,15 @@ lang dynamic library 是本机缓存产物。缓存 key 至少包含 provider so
 当前 `jiangc` 版本、std ABI 版本、lang ABI 版本和 host target。provider dylib 只暴露一个
 compiler-private 入口符号，例如 `jiang_lang_entry`；`jiangc` 自动生成低层 ABI wrapper。
 
+compiler-private wrapper scaffold 位于 `src/lang/`：
+
+- `abi.jiang` 定义 ABI version、固定入口符号、request kind、status 和低层 request/response。
+- `handle.jiang` 定义已加载 provider dylib 的 opaque handle。
+- `registry.jiang` 定义 dependency name 到 provider handle 的 registry。
+
+这层不是公开 std API。它后续才会接入 `dlopen` / `dlsym`、provider dylib cache 和 root `Lang`
+签名校验。
+
 ## Provider Contract
 
 provider 必须实现统一接口：
