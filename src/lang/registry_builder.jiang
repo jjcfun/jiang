@@ -4,14 +4,19 @@
 // handles. It does not compile, load, or execute provider dynamic libraries.
 
 import context = "../context.jiang";
+import artifact_path = "../artifact/path.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import package_manifest = "../source/package_manifest.jiang";
 import qid = "../store/id.jiang";
 import source_model = "../source/source.jiang";
 import syntax = "../syntax/api.jiang";
 import ast = "../syntax/ast.jiang";
+import hash = "../support/hash.jiang";
 import string = "../support/string.jiang";
 import fs = "../system/fs.jiang";
+import path = "../support/path.jiang";
+import system_target = "../system/target.jiang";
+import abi = "./abi.jiang";
 import registry = "./registry.jiang";
 import handle = "./handle.jiang";
 import store = "../resolve/store.jiang";
@@ -29,7 +34,60 @@ public struct BuildResult: Movable {
     }
 }
 
-public BuildResult build_for_package(context.CompilerContext& ctx, qid.PackageId package_id) {
+public BuildResult build_for_source_path(
+    context.CompilerContext& ctx,
+    UInt8[]& source_path,
+    UInt8[]& artifact_cache_dir
+) {
+    UInt8[]& package_dir = package_manifest.find_enclosing_dir(source_path);
+    if (package_dir.length == 0) {
+        return empty_result();
+    }
+    return build_for_manifest_dir(ctx, path.normalize(package_dir), artifact_cache_dir);
+}
+
+public BuildResult build_for_manifest_dir(
+    context.CompilerContext& ctx,
+    UInt8[]& package_dir,
+    UInt8[]& artifact_cache_dir
+) {
+    package_manifest.PackageManifest manifest = package_manifest.read(package_dir);
+    if (!manifest.ok) {
+        add_registry_error(
+            ctx,
+            string.append("failed to read package manifest: ", package_dir),
+            "package_manifest_error"
+        );
+        return BuildResult(registry.Registry(), false);
+    }
+    return build_for_manifest(ctx, package_dir, manifest$.ref(), artifact_cache_dir);
+}
+
+public BuildResult build_for_manifest(
+    context.CompilerContext& ctx,
+    UInt8[]& package_dir,
+    package_manifest.PackageManifest& manifest,
+    UInt8[]& artifact_cache_dir
+) {
+    registry.Registry! providers = registry.Registry();
+    Bool! ok = true;
+    Int! index = 0;
+    while (index < manifest.dependencies.len()) {
+        package_manifest.PackageDependency dependency = manifest.dependencies.get(index);
+        UInt8[]& dependency_dir = path.normalize(path.join(package_dir, dependency.path));
+        if (!add_lang_dependency_dir(ctx, providers$.ref(), dependency.name, dependency_dir, null, artifact_cache_dir)) {
+            ok = false;
+        }
+        index = index + 1;
+    }
+    return BuildResult(providers$.move(), ok);
+}
+
+public BuildResult build_for_package(
+    context.CompilerContext& ctx,
+    qid.PackageId package_id,
+    UInt8[]& artifact_cache_dir
+) {
     registry.Registry! providers = registry.Registry();
     Bool! ok = true;
     store.PackageRecord& package_record = ctx.store.resolve.package_ref(package_id);
@@ -37,7 +95,7 @@ public BuildResult build_for_package(context.CompilerContext& ctx, qid.PackageId
     Int! index = 0;
     while (index < package_record.dependencies.len()) {
         store.PackageDependencyRecord dependency = package_record.dependencies.get(index);
-        if (!add_lang_dependency(ctx, providers$.ref(), dependency)) {
+        if (!add_lang_dependency(ctx, providers$.ref(), dependency, artifact_cache_dir)) {
             ok = false;
         }
         index = index + 1;
@@ -48,9 +106,23 @@ public BuildResult build_for_package(context.CompilerContext& ctx, qid.PackageId
 Bool add_lang_dependency(
     context.CompilerContext& ctx,
     registry.Registry& providers,
-    store.PackageDependencyRecord dependency
+    store.PackageDependencyRecord dependency,
+    UInt8[]& artifact_cache_dir
 ) {
     UInt8[]& dependency_dir = ctx.store.symbols.text(dependency.path_symbol);
+    UInt8[]& dependency_name = ctx.store.symbols.text(dependency.alias_symbol);
+    qid.PackageId? package_id = ctx.store.resolve.package_for_dir(dependency.path_symbol);
+    return add_lang_dependency_dir(ctx, providers, dependency_name, dependency_dir, package_id, artifact_cache_dir);
+}
+
+Bool add_lang_dependency_dir(
+    context.CompilerContext& ctx,
+    registry.Registry& providers,
+    UInt8[]& dependency_name,
+    UInt8[]& dependency_dir,
+    qid.PackageId? package_id,
+    UInt8[]& artifact_cache_dir
+) {
     package_manifest.PackageManifest manifest = package_manifest.read(dependency_dir);
     if (!manifest.ok) {
         add_registry_error(
@@ -67,10 +139,53 @@ Bool add_lang_dependency(
         return false;
     }
 
-    UInt8[]& dependency_name = ctx.store.symbols.text(dependency.alias_symbol);
-    qid.PackageId? package_id = ctx.store.resolve.package_for_dir(dependency.path_symbol);
-    providers.add(handle.ProviderHandle(dependency_name, package_id, ""));
+    UInt8[]& dylib_path = provider_dylib_path(ctx, artifact_cache_dir, dependency_name, dependency_dir, manifest$.ref());
+    providers.add(handle.ProviderHandle(dependency_name, package_id, dylib_path));
     return true;
+}
+
+BuildResult empty_result() {
+    return BuildResult(registry.Registry(), true);
+}
+
+UInt8[]& provider_dylib_path(
+    context.CompilerContext& ctx,
+    UInt8[]& artifact_cache_dir,
+    UInt8[]& dependency_name,
+    UInt8[]& dependency_dir,
+    package_manifest.PackageManifest& manifest
+) {
+    hash.WyHasher hasher = hash.WyHasher();
+    hasher.write_bytes("lang-dylib");
+    hasher.write_bytes(dependency_name);
+    hasher.write_bytes(dependency_dir);
+    hasher.write_bytes(manifest.root);
+    hasher.write_uint64(provider_root_hash(dependency_dir, manifest));
+    hasher.write_uint64(UInt64(abi.abi_version()));
+    hasher.write_bytes(system_target.cache_key(ctx.target$.ref()));
+    return artifact_path.lang_dynamic_library_path(
+        artifact_cache_dir,
+        hasher.finish(),
+        dynamic_library_extension(ctx)
+    );
+}
+
+UInt64 provider_root_hash(UInt8[]& dependency_dir, package_manifest.PackageManifest& manifest) {
+    UInt8[]& root_path = package_manifest.root_file_path(dependency_dir, manifest);
+    guard fs.read_all(root_path) is .some(root_text) else {
+        return UInt64(0);
+    }
+    return source_model.content_hash(root_text);
+}
+
+UInt8[]& dynamic_library_extension(context.CompilerContext& ctx) {
+    if (ctx.target.os == .linux) {
+        return ".so";
+    }
+    if (ctx.target.os == .windows) {
+        return ".dll";
+    }
+    return ".dylib";
 }
 
 Bool validate_lang_provider_root(
