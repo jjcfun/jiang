@@ -132,7 +132,7 @@ package 同时导出多个默认 parser。
 
 `Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`，可为 `file`、`top_level_declaration`、
 `member_declaration`、`statement`、`expression`、`type_reference` 或 `pattern`。返回 syntax
-tree 的 root kind 必须等于 `input.entry_kind`；编译器根据 invocation 所在位置传入 entry kind，
+root node 的 root kind 必须等于 `input.entry_kind`；编译器根据 invocation 所在位置传入 entry kind，
 并拒绝不匹配的 tree。也就是说，DSL 输出需要落在 Jiang 当前语法层能表示的完整 syntax
 entry 中。
 
