@@ -19,6 +19,7 @@ User user = #sql {
 
 lang invocation 使用 block 形式，不支持 `#sql(...)`，也不支持源码内声明多个 parser 入口。
 编译器按 invocation 所在语法位置传入对应 entry kind，provider 需要返回同类 Jiang syntax tree。
+每个 lang invocation 会创建一个 provider 实例，`scan` 和 `parse` 通过该实例共享 DSL 私有状态。
 
 ## Public Syntax Tree
 
@@ -77,8 +78,10 @@ Jiang lexer 默认按普通 Jiang token 处理。看到 `#ident { ... }` 时，�
 hash ident raw_block
 ```
 
-`raw_block` 的 span 覆盖完整 `{ ... }`，内部只递归匹配 `{}` 边界，不按 Jiang token 展开。
-未闭合 raw block 产生 `unterminated_raw_block` 诊断。
+当前 parser 已支持把 `#ident { ... }` 保留为 lang invocation。动态库 provider 接入后，
+host 只需要识别 `#ident` 和 opening delimiter；完整 body 边界由 provider 的 `scan` 决定。
+在过渡实现中，`raw_block` 的 span 覆盖完整 `{ ... }`，内部只递归匹配 `{}` 边界，不按 Jiang
+token 展开。未闭合 raw block 产生 `unterminated_raw_block` 诊断。
 
 公开 `std.jiang.Tokenizer` 不保存 token text 或 compiler 内部 symbol id。token 的文本由
 `Token.span` 回到 `Source.bytes` 按需取得，identifier 的 intern 由调用方的 builder/compiler
@@ -88,21 +91,26 @@ hash ident raw_block
 ## Registry
 
 解析 package manifest 后，编译器先加载 dependencies。对 `type = lang` package，编译器将其
-编译为 host-side provider，并把 dependency alias 注册到 lang registry：
+编译为 host dynamic library，并把 dependency alias 注册到 lang registry：
 
 ```text
-dependency alias -> provider package root public Lang
+dependency alias -> provider handle for package root public Lang
 ```
 
 当前 package 的 lang expansion 遇到 parser 留下的 `#alias { ... }` invocation 时只查这个 registry，
 不查普通 import/name resolve。这样 DSL 机制不依赖 Jiang 普通名字解析。
 
+lang dynamic library 是本机缓存产物。缓存 key 至少包含 provider source hash、dependency hash、
+当前 `jiangc` 版本、std ABI 版本、lang ABI 版本和 host target。provider dylib 只暴露一个
+compiler-private 入口符号，例如 `jiang_lang_entry`；`jiangc` 自动生成低层 ABI wrapper。
+
 ## Provider Contract
 
-provider 必须实现统一入口：
+provider 必须实现统一接口：
 
 ```text
-Lang.parse(std.jiang.syntax.Builder.Any& builder, std.jiang.syntax.Input) -> std.jiang.syntax.NodeId
+Lang.scan(std.jiang.syntax.Input, std.jiang.syntax.Builder.Any&) -> std.jiang.syntax.ScanResult
+Lang.parse(std.jiang.syntax.Input, std.jiang.syntax.Builder.Any&) -> std.jiang.syntax.NodeId
 ```
 
 `Lang` 是 `type = lang` package root module 的 public 导出，并且必须满足
@@ -110,9 +118,19 @@ Lang.parse(std.jiang.syntax.Builder.Any& builder, std.jiang.syntax.Input) -> std
 
 ```jiang
 public struct Lang: std.jiang.syntax.Provider {
-    public static std.jiang.syntax.NodeId parse(
-        std.jiang.syntax.Builder.Any& builder,
-        std.jiang.syntax.Input input
+    SqlToken[] tokens;
+
+    public std.jiang.syntax.ScanResult scan(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Builder.Any& builder
+    ) {
+        self.tokens = tokenize_sql(input, builder);
+        return std.jiang.syntax.ScanResult.ok(...);
+    }
+
+    public std.jiang.syntax.NodeId parse(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Builder.Any& builder
     ) {
         ...
     }
@@ -130,14 +148,29 @@ public alias Lang = internal.SqlLang;
 编译器只查 package root 的 public `Lang`，不查普通 import/name resolve，也不支持一个 lang
 package 同时导出多个默认 parser。
 
+`Lang` 必须是可构造类型。每个 `#alias { ... }` invocation 创建一个新的 `Lang` 实例，先调用
+`scan`，scan 成功后再调用 `parse`，最后销毁实例。provider 私有 token、parser cache 或中间状态
+放在实例字段里，compiler 不理解也不保存 DSL 私有 token。
+
+`Input.delimiter` 表示 host envelope。当前 `#sql { ... }` 使用 `Delimiter.brace`；完整 DSL
+文件使用 `Delimiter.none`，表示 provider 从 `body_start` 扫到 source 结束。`Delimiter.paren`
+和 `Delimiter.bracket` 为后续语法保留。
+
+`Input.name_span` 表示 invocation 名字的源码范围，例如 `#sql { ... }` 中的 `sql`。它主要用于
+provider 诊断；registry 查找和 dependency 校验仍由 host 在调用 provider 前完成。
+
 `Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`，可为 `file`、`top_level_declaration`、
 `member_declaration`、`statement`、`expression`、`type_reference` 或 `pattern`。返回 syntax
 root node 的 root kind 必须等于 `input.entry_kind`；编译器根据 invocation 所在位置传入 entry kind，
 并拒绝不匹配的 tree。也就是说，DSL 输出需要落在 Jiang 当前语法层能表示的完整 syntax
 entry 中。
 
-provider 需要保留 source span。对于从 DSL 原文生成的节点，应使用 `Input.body_span` 内的局部
-span；对于插值表达式，provider 可以请求 host parser 解析 Jiang expression/type/path，并把解析
+`ScanResult` 返回 `status`、`body_span`、`full_span` 和 `end_offset`。scan 阶段负责判断 DSL
+body 的结束位置，并通过 `builder` 报告词法或边界错误；`status = error` 时 compiler 不再调用
+`parse`。
+
+provider 需要保留 source span。对于从 DSL 原文生成的节点，应使用 `ScanResult.body_span` 内的
+局部 span；对于插值表达式，provider 可以请求 host parser 解析 Jiang expression/type/path，并把解析
 结果嵌入返回 tree。
 
 ## Excluded From Public Syntax Tree
