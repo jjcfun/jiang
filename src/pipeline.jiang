@@ -164,6 +164,16 @@ UInt8[]& unsupported_output_code(system_target.TargetInfo& target, driver_option
     if (!lang_registry.ok) {
         return;
     }
+    if (emit != .dynamic_library && !ensure_lang_provider_dylibs(
+        ctx,
+        lang_registry.registry$.ref(),
+        artifact_cache_dir,
+        compiler_version,
+        linker_path,
+        mode
+    )) {
+        return;
+    }
     syntax.SyntaxResult! syntax_result = syntax.parse_source_with_lang(
         ctx,
         source_text,
@@ -280,14 +290,22 @@ Bool prepare_artifact_cache(
         return true;
     }
     UInt8[]& object_dir = artifact_path.object_dir(artifact_cache_dir);
-    if (system_fs.create_dirs(object_dir)) {
+    if (!system_fs.create_dirs(object_dir)) {
+        add_package_error(
+            ctx,
+            string.append("failed to create artifact cache directory: ", object_dir),
+            "cache_dir_failed"
+        );
+        return false;
+    }
+    if (emit != .dynamic_library) {
         return true;
     }
-    add_package_error(
-        ctx,
-        string.append("failed to create artifact cache directory: ", object_dir),
-        "cache_dir_failed"
-    );
+    UInt8[]& lang_dir = artifact_path.lang_dir(artifact_cache_dir);
+    if (system_fs.create_dirs(lang_dir)) {
+        return true;
+    }
+    add_package_error(ctx, string.append("failed to create lang artifact cache directory: ", lang_dir), "cache_dir_failed");
     return false;
 }
 
@@ -388,6 +406,23 @@ backend.BackendResult emit_backend(
         }
         return backend.emit_llvm_ir(ctx, lowered, output_path, link_libc, llvm_triple);
     }
+    if (emit == .dynamic_library) {
+        return emit_dynamic_library(
+            ctx,
+            lowered,
+            output_path,
+            artifact_cache_dir,
+            llvm_triple,
+            target_cache_key,
+            target_info,
+            compiler_version,
+            linker_path,
+            link_args,
+            root_source_hash,
+            link_libc,
+            mode
+        );
+    }
     if (mode == .release) {
         return emit_release_executable(
             ctx,
@@ -418,6 +453,99 @@ backend.BackendResult emit_backend(
         root_source_hash,
         link_libc
     );
+}
+
+Bool ensure_lang_provider_dylibs(
+    context.CompilerContext& ctx,
+    lang.registry.Registry& registry,
+    UInt8[]& artifact_cache_dir,
+    UInt8[]& compiler_version,
+    UInt8[]& linker_path,
+    driver_options.CompileMode mode
+) {
+    Int! index = 0;
+    while (index < registry.len()) {
+        if (!ensure_lang_provider_dylib(ctx, registry.ref_at(index), artifact_cache_dir, compiler_version, linker_path, mode)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool ensure_lang_provider_dylib(
+    context.CompilerContext& ctx,
+    lang.handle.ProviderHandle& provider,
+    UInt8[]& artifact_cache_dir,
+    UInt8[]& compiler_version,
+    UInt8[]& linker_path,
+    driver_options.CompileMode mode
+) {
+    if (provider.dylib_path.length == 0 || provider.source_path.length == 0) {
+        return true;
+    }
+    if (system_fs.file_exists(provider.dylib_path)) {
+        return true;
+    }
+    guard lang_provider_wrapper_source(ctx, provider) is .some(wrapper_source) else {
+        return false;
+    }
+
+    context.CompilerContext! provider_ctx = context.CompilerContext(system_target.copy(ctx.target$.ref()));
+    driver_options.CompileOptions! options = driver_options.CompileOptions(
+        .dynamic_library,
+        wrapper_source,
+        provider.dylib_path,
+        artifact_cache_dir,
+        ctx.target.requested_triple,
+        compiler_version,
+        linker_path,
+        mode
+    );
+    options.link_libc = ctx.target.link_libc;
+    compile(provider_ctx$.ref(), options$.ref());
+    if (!provider_ctx.store.diagnostics.has_errors() && system_fs.file_exists(provider.dylib_path)) {
+        return true;
+    }
+    add_package_error(
+        ctx,
+        string.append("failed to build lang provider dynamic library: ", provider.dependency_name),
+        "lang_provider_build_failed"
+    );
+    return false;
+}
+
+UInt8[]&? lang_provider_wrapper_source(context.CompilerContext& ctx, lang.handle.ProviderHandle& provider) {
+    UInt8[]& wrapper_dir = string.append(provider.dylib_path, ".wrapper");
+    UInt8[]& manifest_path = path.join(wrapper_dir, "package.ini");
+    UInt8[]& source_path = path.join(wrapper_dir, "wrapper.jiang");
+    if (!system_fs.create_dirs(wrapper_dir)) {
+        add_package_error(ctx, string.append("failed to create lang provider wrapper dir: ", wrapper_dir), "lang_provider_wrapper_failed");
+        return null;
+    }
+    if (!system_fs.write_all(manifest_path, lang_provider_wrapper_manifest(provider))) {
+        add_package_error(ctx, string.append("failed to write lang provider wrapper manifest: ", manifest_path), "lang_provider_wrapper_failed");
+        return null;
+    }
+    if (system_fs.write_all(source_path, lang_provider_wrapper_source_text())) {
+        return source_path;
+    }
+    add_package_error(ctx, string.append("failed to write lang provider wrapper source: ", source_path), "lang_provider_wrapper_failed");
+    return null;
+}
+
+UInt8[]& lang_provider_wrapper_manifest(lang.handle.ProviderHandle& provider) {
+    UInt8[]&! text = "[package]\nname = lang_wrapper\nroot = wrapper.jiang\ntype = lang\n\n[dependencies]\nprovider = ";
+    text = string.append(text, path.dirname(provider.source_path));
+    return string.append(text, "\n");
+}
+
+UInt8[]& lang_provider_wrapper_source_text() {
+    UInt8[]&! text = "import provider = \"provider\";\n\n";
+    text = string.append(text, "public alias Lang = provider.Lang;\n\n");
+    text = string.append(text, "public Int32 jiang_lang_entry(RawPointer<UInt8> request, RawPointer<UInt8> response) {\n");
+    text = string.append(text, "    return Int32(3);\n");
+    return string.append(text, "}\n");
 }
 
 backend.BackendResult emit_debug_package_executable(
@@ -486,6 +614,51 @@ backend.BackendResult emit_release_executable(
         return backend.BackendResult(false);
     }
     linker.LinkResult result = linker.link_for_target(links$.ref(), target_info, linker_path, output_path, link_args);
+    if (!result.ok) {
+        add_package_error(ctx, linker_failure_message(result, linker_path, output_path, links$.ref()), "linker_execution_failed");
+    }
+    return backend.BackendResult(result.ok);
+}
+
+backend.BackendResult emit_dynamic_library(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    UInt8[]& output_path,
+    UInt8[]& artifact_cache_dir,
+    UInt8[]& llvm_triple,
+    UInt8[]& target_cache_key,
+    system_target.TargetInfo& target_info,
+    UInt8[]& compiler_version,
+    UInt8[]& linker_path,
+    list.ArrayList<UInt8[]&>& link_args,
+    UInt64 root_source_hash,
+    Bool link_libc,
+    driver_options.CompileMode mode
+) {
+    UInt8[]& object_path = artifact_path.debug_package_object_path(
+        artifact_cache_dir,
+        target_cache_key,
+        compiler_version,
+        driver_options.backend_profile(mode),
+        root_source_hash
+    );
+    if (mode == .release) {
+        if (!emit_release_package_object(ctx, lowered, object_path, link_libc, llvm_triple)) {
+            return backend.BackendResult(false);
+        }
+    } else if (!emit_debug_package_object(ctx, lowered, object_path, link_libc, llvm_triple)) {
+        return backend.BackendResult(false);
+    }
+
+    link_plan.LinkPlan! links = link_plan.LinkPlan();
+    links.add_user_object(object_path);
+    linker.LinkResult result = linker.link_dynamic_library_for_target(
+        links$.ref(),
+        target_info,
+        linker_path,
+        output_path,
+        link_args
+    );
     if (!result.ok) {
         add_package_error(ctx, linker_failure_message(result, linker_path, output_path, links$.ref()), "linker_execution_failed");
     }
