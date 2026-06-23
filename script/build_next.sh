@@ -10,24 +10,25 @@ BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
 OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
+DEFAULT_BOOTSTRAP_BIN="$ROOT_DIR/../bootstrap-0.4.2/build/jiangc.next"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
 mkdir -p "$BUILD_DIR"
 cd "$ROOT_DIR"
 
-BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$(command -v jiangc || true)}"
+BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
-  echo "missing bootstrap compiler: jiangc" >&2
-  echo "install a supported Jiang bootstrap compiler so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
+  echo "missing Jiang 0.4.2 bootstrap compiler: $BOOTSTRAP_BIN" >&2
+  echo "build or install bootstrap/0.4.2 at ../bootstrap-0.4.2, or set BOOTSTRAP_BIN explicitly" >&2
   exit 2
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
 case "$BOOTSTRAP_VERSION" in
-  "jiang 0.3.1"|"jiang 0.3.2"|"jiang 0.3.3"|"jiang 0.4"|"jiang 0.4.1-bootstrap"|"jiang 0.4.1"|"jiang 0.4.2-bootstrap"|"jiang 0.4.2") ;;
+  "jiang 0.4.2-bootstrap"|"jiang 0.4.2") ;;
   *)
     echo "unsupported bootstrap compiler: $BOOTSTRAP_VERSION" >&2
-    echo "install Jiang 0.3.1, 0.3.2, 0.3.3, 0.4, 0.4.1-bootstrap, 0.4.1, 0.4.2-bootstrap, or 0.4.2 so jiangc is on PATH, or set BOOTSTRAP_BIN" >&2
+    echo "build_next requires Jiang 0.4.2 bootstrap; expected $DEFAULT_BOOTSTRAP_BIN or set BOOTSTRAP_BIN" >&2
     exit 2
     ;;
 esac

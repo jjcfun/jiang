@@ -24,12 +24,13 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 bash ./script/install_llvm_macos.sh
 ```
 
-构建当前源码需要先安装一个 `script/build_next.sh` 支持的 Jiang release 编译器，并确保
-对应的 `jiangc` 已在 PATH 中；也可以通过 `BOOTSTRAP_BIN` 显式指定：
+构建当前源码默认依赖同级 worktree 中的 0.4.2 bootstrap 编译器：
 
 ```bash
-jiangc --version
+../bootstrap-0.4.2/build/jiangc.next --version
 ```
+
+也可以通过 `BOOTSTRAP_BIN` 显式指定另一个 0.4.2 bootstrap 编译器。
 
 运行当前源码的自举构建：
 
@@ -49,7 +50,7 @@ bootstrap jiangc -> build/jiangc.next
 build/jiangc.next
 ```
 
-构建脚本会检测 bootstrap compiler 版本。如只想构建不跑验证，可设置 `VERIFY=none`；
+构建脚本会检测 bootstrap compiler 版本，只接受 0.4.2 bootstrap 系列。如只想构建不跑验证，可设置 `VERIFY=none`；
 只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
