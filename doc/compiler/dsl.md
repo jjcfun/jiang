@@ -44,7 +44,7 @@ token range 和 compiler-only 节点。
 放在 `std.jiang.syntax.Source.source_id` 上，不在每个 span 重复保存。syntax 阶段诊断使用
 `std.jiang.syntax.Diagnostic`，避免和 compiler 内部包含 LSP/fix-it 信息的 rich `Diagnostic` 混用。
 
-## Internal AST Boundary
+## Internal Boundary
 
 短期边界如下：
 
@@ -59,14 +59,14 @@ DSL source
   -> raw lang invocation node
   -> lang provider
   -> std.jiang.syntax.Tree
-  -> translate to src/syntax/ast.jiang
+  -> validate/convert into src/syntax/ast.jiang
   -> resolve/HIR/sema/MIR/backend
 ```
 
-也就是说，普通 Jiang parser 暂时继续产出内部 AST，但遇到 `#alias { ... }` 时只记录 invocation
-和 raw block，不立即调用 provider。parse 完成后、resolve 开始前，lang expansion 根据 registry
-调用 provider；provider 返回 `std.jiang.syntax.Tree` 后，编译器把它翻译成内部 AST，再交给既有
-resolve/sema 流程。
+也就是说，普通 Jiang parser 暂时继续产出内部 AST，并在遇到 `#alias { ... }` 时记录 invocation
+和 raw block。parse 完成后、resolve 开始前，lang expansion 根据 registry 调用 provider；
+provider 返回 `std.jiang.syntax.Tree` 后，编译器校验并转换成内部 AST，再交给既有 resolve/sema
+流程。
 
 长期可以让内部 parser 逐步向 `std.jiang.syntax.Tree` 靠拢，但不要求当前重写 parser 或 resolve。
 
@@ -78,15 +78,18 @@ Jiang lexer 默认按普通 Jiang token 处理。看到 `#ident { ... }` 时，�
 hash ident raw_block
 ```
 
-当前 parser 已支持把 `#ident { ... }` 保留为 lang invocation。动态库 provider 接入后，
-host 只需要识别 `#ident` 和 opening delimiter；完整 body 边界由 provider 的 `scan` 决定。
-在过渡实现中，`raw_block` 的 span 覆盖完整 `{ ... }`，内部只递归匹配 `{}` 边界，不按 Jiang
-token 展开。未闭合 raw block 产生 `unterminated_raw_block` 诊断。
+动态库 provider 接入后，host 只需要识别 `#ident` 和 opening delimiter；完整 body 边界由
+provider 的 `scan` 决定。
+在 provider scan 接入前，`raw_block` 仍作为过渡 lexer 能力存在：span 覆盖完整 `{ ... }`，
+内部只递归匹配 `{}` 边界，不按 Jiang token 展开。未闭合 raw block 产生 `unterminated_raw_block`
+诊断。
 
 公开 `std.jiang.Tokenizer` 不保存 token text 或 compiler 内部 symbol id。token 的文本由
 `Token.span` 回到 `Source.bytes` 按需取得，identifier 的 intern 由调用方的 builder/compiler
-上下文负责。identifier 判定使用 ASCII fast path 加 Unicode `XID_Start` / `XID_Continue`，
-底层压缩表由 `script/gen_unicode_xid.js` 生成到 `std/jiang/text/generated/xid.jiang`。
+上下文负责。`std.jiang.syntax.Tree` 中的 name 和 int/float/char/string literal 原始文本都保存为
+public `SymbolId`，由 `Builder.intern_symbol` 创建。identifier 判定使用 ASCII fast path 加 Unicode
+`XID_Start` / `XID_Continue`，底层压缩表由 `script/gen_unicode_xid.js` 生成到
+`std/jiang/text/generated/xid.jiang`。
 
 ## Registry
 
@@ -196,13 +199,13 @@ provider 需要保留 source span。对于从 DSL 原文生成的节点，应使
 
 ## Validation
 
-DSL provider 返回 syntax tree 后，translator 负责：
+DSL provider 返回 syntax tree 后，validator/converter 负责：
 
 - 校验 root entry kind。
 - 校验所有 `NodeId` / `NodeRange` 有效。
-- 把 `Name.text` intern 成内部 symbol。
+- 直接复用 public `SymbolId` 表示 name 和 literal 原始文本。
 - 复用 public `Span` 作为内部 syntax token span。
-- 把 public syntax node 映射为 `src/syntax/ast.jiang` node。
+- 把 public syntax node 转换成 `src/syntax/ast.jiang` 内部 AST。
 - 对不支持或不合法的 public syntax tree 结构产生 parser/syntax 诊断。
 
 后续 resolve、type check、MIR 和 backend 不区分这些节点来自 Jiang source 还是 lang provider。
