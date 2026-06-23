@@ -1,15 +1,19 @@
 import std;
 import syntax_builder = "./builder.jiang";
 import syntax_diagnostics = "./diagnostics.jiang";
+import lang_block = "../lang/block.jiang";
+import lang_registry = "../lang/registry.jiang";
 import list = "../support/list.jiang";
 import store_api = "../store/api.jiang";
 import source = "../source/source.jiang";
 
 public struct LexResult: Movable {
     public list.ArrayList<std.jiang.Token> tokens;
+    public lang_block.LangBlockStore blocks;
 
-    public init(list.ArrayList<std.jiang.Token> tokens) {
+    public init(list.ArrayList<std.jiang.Token> tokens, lang_block.LangBlockStore blocks) {
         self.tokens = tokens$.move();
+        self.blocks = blocks$.move();
     }
 
     public list.ArrayList<std.jiang.Token> take_tokens() {
@@ -20,25 +24,178 @@ public struct LexResult: Movable {
 public struct Lexer: Movable {
     store_api.CompilerStore& store;
     source.SourceId source_id;
+    UInt8[]& source_text;
     std.jiang.Tokenizer! tokenizer;
     syntax_builder.SyntaxBuilder! builder;
+    lang_registry.Registry&? registry;
+    lang_block.LangBlockStore! blocks;
+    Bool! pending_hash;
+    std.jiang.syntax.Span! pending_hash_span;
+    std.jiang.syntax.SymbolId?! pending_lang_alias;
+    std.jiang.syntax.Span! pending_lang_alias_span;
 
     public init(store_api.CompilerStore& store, UInt8[]& text, source.SourceId source_id) {
         std.jiang.syntax.SourceId std_source_id = std.jiang.syntax.SourceId(source_id.to_index());
         std.jiang.syntax.Source std_source = std.jiang.syntax.Source(std_source_id, text);
         self.store = store;
         self.source_id = source_id;
+        self.source_text = text;
         self.tokenizer = std.jiang.Tokenizer.from_source(std_source);
         self.builder = syntax_builder.SyntaxBuilder(store, source_id, text, .lexer);
+        self.registry = null;
+        self.blocks = lang_block.LangBlockStore();
+        self.pending_hash = false;
+        self.pending_hash_span = std.jiang.syntax.Span(0, 0);
+        self.pending_lang_alias = null;
+        self.pending_lang_alias_span = std.jiang.syntax.Span(0, 0);
+    }
+
+    public init(
+        store_api.CompilerStore& store,
+        UInt8[]& text,
+        source.SourceId source_id,
+        lang_registry.Registry& registry
+    ) {
+        std.jiang.syntax.SourceId std_source_id = std.jiang.syntax.SourceId(source_id.to_index());
+        std.jiang.syntax.Source std_source = std.jiang.syntax.Source(std_source_id, text);
+        self.store = store;
+        self.source_id = source_id;
+        self.source_text = text;
+        self.tokenizer = std.jiang.Tokenizer.from_source(std_source);
+        self.builder = syntax_builder.SyntaxBuilder(store, source_id, text, .lexer);
+        self.registry = registry;
+        self.blocks = lang_block.LangBlockStore();
+        self.pending_hash = false;
+        self.pending_hash_span = std.jiang.syntax.Span(0, 0);
+        self.pending_lang_alias = null;
+        self.pending_lang_alias_span = std.jiang.syntax.Span(0, 0);
     }
 
     public std.jiang.Token next() {
         std.jiang.syntax.Builder.Any& builder_ref = std.jiang.syntax.Builder$.ref(self.builder);
         std.jiang.Token tok = self.tokenizer.next(builder_ref);
+        if (self.should_start_lang_block(tok)) {
+            return self.lex_lang_block(tok);
+        }
         if (std.jiang.token_kind_is(tok.kind, .error)) {
             syntax_diagnostics.add_lexer_error(self.store, self.source_id, tok.span, "invalid_token");
         }
+        self.update_lang_prefix(tok);
         return tok;
+    }
+
+    Bool should_start_lang_block(std.jiang.Token tok) {
+        if (self.pending_lang_alias is .some(_)) {
+            return std.jiang.token_kind_is(tok.kind, .left_brace);
+        }
+        return false;
+    }
+
+    std.jiang.Token lex_lang_block(std.jiang.Token left_brace) {
+        guard self.pending_lang_alias is .some(alias_symbol) else {
+            return left_brace;
+        }
+        UInt8[]& alias_text = self.store.symbols.text(alias_symbol);
+        lang_block.LangBlockId block_id = self.create_lang_block(alias_text, left_brace);
+        std.jiang.Token raw_block = self.tokenizer.raw_block_from_left_brace(block_id.to_index(), left_brace.span);
+        self.update_lang_block_scan_result(block_id, left_brace, raw_block);
+        if (std.jiang.token_kind_is(raw_block.kind, .error)) {
+            syntax_diagnostics.add_lexer_error(self.store, self.source_id, raw_block.span, "unterminated_raw_block");
+        }
+        self.clear_lang_prefix();
+        return raw_block;
+    }
+
+    lang_block.LangBlockId create_lang_block(UInt8[]& alias_text, std.jiang.Token left_brace) {
+        std.jiang.syntax.ScanResult scan_result = std.jiang.syntax.ScanResult.ok(
+            std.jiang.syntax.Span(left_brace.span.end(), 0),
+            std.jiang.syntax.Span(self.pending_hash_span.start, 0),
+            left_brace.span.end()
+        );
+        Bool! provider_found = false;
+        if (self.registry is .some(providers)) {
+            if (providers.find(alias_text) is .some(provider)) {
+                provider_found = true;
+                return self.blocks.add(lang_block.LangBlock(
+                    provider$.move(),
+                    provider_found,
+                    self.lang_syntax_builder(),
+                    self.lang_input(left_brace),
+                    scan_result
+                ));
+            }
+        }
+        syntax_diagnostics.add_lexer_error(self.store, self.source_id, self.pending_lang_alias_span, "lang_provider_not_found");
+        return self.blocks.add(lang_block.make_missing_provider_block(
+            self.store,
+            self.source_id,
+            self.source_text,
+            alias_text,
+            self.pending_lang_alias_span,
+            left_brace.span.end(),
+            scan_result
+        ));
+    }
+
+    () update_lang_block_scan_result(
+        lang_block.LangBlockId block_id,
+        std.jiang.Token left_brace,
+        std.jiang.Token raw_block
+    ) {
+        lang_block.LangBlock&! block = self.blocks.ref_at(block_id);
+        Int! body_length = raw_block.span.end() - left_brace.span.end();
+        if (!std.jiang.token_kind_is(raw_block.kind, .error)) {
+            body_length = body_length - 1;
+        }
+        if (body_length < 0) { body_length = 0; }
+        std.jiang.syntax.Span body_span = std.jiang.syntax.Span(left_brace.span.end(), body_length);
+        std.jiang.syntax.Span full_span = std.jiang.syntax.Span(
+            self.pending_hash_span.start,
+            raw_block.span.end() - self.pending_hash_span.start
+        );
+        if (std.jiang.token_kind_is(raw_block.kind, .error)) {
+            block.set_scan_result(std.jiang.syntax.ScanResult.error(body_span, full_span, raw_block.span.end()));
+            return;
+        }
+        block.set_scan_result(std.jiang.syntax.ScanResult.ok(body_span, full_span, raw_block.span.end()));
+    }
+
+    syntax_builder.SyntaxBuilder lang_syntax_builder() {
+        return syntax_builder.SyntaxBuilder(self.store, self.source_id, self.source_text, .parser);
+    }
+
+    std.jiang.syntax.Input lang_input(std.jiang.Token left_brace) {
+        return std.jiang.syntax.Input(
+            std.jiang.syntax.Source(
+                std.jiang.syntax.SourceId(self.source_id.to_index()),
+                self.source_text
+            ),
+            self.pending_lang_alias_span,
+            left_brace.span.end(),
+            .brace,
+            std.jiang.syntax.Root.Kind.expression
+        );
+    }
+
+    () update_lang_prefix(std.jiang.Token tok) {
+        if (std.jiang.token_kind_is(tok.kind, .hash)) {
+            self.pending_hash = true;
+            self.pending_hash_span = tok.span;
+            self.pending_lang_alias = null;
+            return;
+        }
+        if (self.pending_hash && std.jiang.token_kind_is(tok.kind, .ident)) {
+            self.pending_hash = false;
+            self.pending_lang_alias = tok.symbol_id();
+            self.pending_lang_alias_span = tok.span;
+            return;
+        }
+        self.clear_lang_prefix();
+    }
+
+    () clear_lang_prefix() {
+        self.pending_hash = false;
+        self.pending_lang_alias = null;
     }
 
     public LexResult tokenize() {
@@ -47,9 +204,9 @@ public struct Lexer: Movable {
             std.jiang.Token tok = self.next();
             buffer.add(tok);
             if (std.jiang.token_kind_is(tok.kind, .eof)) {
-                return LexResult(buffer$.move());
+                return LexResult(buffer$.move(), self.blocks.take());
             }
         }
-        return LexResult(buffer$.move());
+        return LexResult(buffer$.move(), self.blocks.take());
     }
 }

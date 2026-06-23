@@ -1,8 +1,9 @@
 # DSL / Lang Package
 
-Jiang 的 DSL 机制是 Jiang parse 之后、resolve 之前的 syntax expansion。普通 parser 先保留
-`#alias { ... }` invocation，expansion 阶段再调用 lang provider。DSL provider 不生成 HIR、MIR
-或 backend IR；它只把外部语法片段翻译成 Jiang 语法层能表示的 syntax tree。
+Jiang 的 DSL 机制是 syntax-stage provider expansion。lexer 看到 `#alias { ... }` 后创建
+per-block provider 实例并调用 `scan` 决定 block 边界；parser 后续读到 `raw_block` token 时调用
+同一 provider 的 `parse`，再把 public syntax tree 转成 compiler 内部 AST。DSL provider 不生成
+HIR、MIR 或 backend IR；它只把外部语法片段翻译成 Jiang 语法层能表示的 syntax tree。
 
 ## Goal
 
@@ -50,23 +51,23 @@ token range 和 compiler-only 节点。
 
 ```text
 Jiang source
-  -> Jiang lexer/parser
-  -> lang expansion
+  -> Jiang lexer creates provider and scans raw block
+  -> Jiang parser calls provider.parse at raw_block
   -> src/syntax/ast.jiang
   -> resolve/HIR/sema/MIR/backend
 
 DSL source
-  -> raw lang invocation node
+  -> raw_block token with block id
   -> lang provider
   -> std.jiang.syntax.Tree
   -> validate/convert into src/syntax/ast.jiang
   -> resolve/HIR/sema/MIR/backend
 ```
 
-也就是说，普通 Jiang parser 暂时继续产出内部 AST，并在遇到 `#alias { ... }` 时记录 invocation
-和 raw block。parse 完成后、resolve 开始前，lang expansion 根据 registry 调用 provider；
-provider 返回 `std.jiang.syntax.Tree` 后，编译器校验并转换成内部 AST，再交给既有 resolve/sema
-流程。
+也就是说，`#alias { ... }` 不会进入内部 AST 成为占位节点。lexer 只产出 `hash ident raw_block`
+三个 token，其中 `raw_block` 携带 compiler-private block id。parser 根据 invocation 所在语法位置
+传入 `Root.Kind`，调用 provider parse，provider 返回 `std.jiang.syntax.Tree` 后，编译器校验并转换
+成内部 AST，再交给既有 resolve/sema 流程。
 
 长期可以让内部 parser 逐步向 `std.jiang.syntax.Tree` 靠拢，但不要求当前重写 parser 或 resolve。
 
@@ -78,11 +79,10 @@ Jiang lexer 默认按普通 Jiang token 处理。看到 `#ident { ... }` 时，�
 hash ident raw_block
 ```
 
-动态库 provider 接入后，host 只需要识别 `#ident` 和 opening delimiter；完整 body 边界由
-provider 的 `scan` 决定。
-在 provider scan 接入前，`raw_block` 仍作为过渡 lexer 能力存在：span 覆盖完整 `{ ... }`，
-内部只递归匹配 `{}` 边界，不按 Jiang token 展开。未闭合 raw block 产生 `unterminated_raw_block`
-诊断。
+host 识别 `#ident` 和 opening delimiter 后，完整 body 边界由 provider 的 `scan` 决定。`raw_block`
+token 携带 compiler-private block id，parser 通过该 id 找到 lexer 阶段创建的 provider、builder 和
+scan state。provider scan 接入完整动态库前，compiler lexer 仍使用 `{}` 递归匹配作为 recovery
+fallback；未闭合 raw block 产生 `unterminated_raw_block` 诊断。
 
 公开 `std.jiang.Tokenizer` 不保存 token text 或 compiler 内部 symbol id。token 的文本由
 `Token.span` 回到 `Source.bytes` 按需取得，identifier 的 intern 由调用方的 builder/compiler
@@ -100,8 +100,8 @@ public `SymbolId`，由 `Builder.intern_symbol` 创建。identifier 判定使用
 dependency alias -> provider handle for package root public Lang
 ```
 
-当前 package 的 lang expansion 遇到 parser 留下的 `#alias { ... }` invocation 时只查这个 registry，
-不查普通 import/name resolve。这样 DSL 机制不依赖 Jiang 普通名字解析。
+lexer 读到 `#alias { ... }` 时只查这个 registry，不查普通 import/name resolve。这样 DSL 机制不依赖
+Jiang 普通名字解析；如果 provider 不能加载，源码已经不可解析，编译器直接报告 syntax/package 错误。
 
 lang dynamic library 是本机缓存产物。缓存 key 至少包含 provider source hash、dependency hash、
 当前 `jiangc` 版本、std ABI 版本、lang ABI 版本和 host target。provider dylib 只暴露一个
