@@ -4,6 +4,7 @@
 // 再通过 keyword store 识别。
 
 import ast = "./ast.jiang";
+import syntax_builder = "./builder.jiang";
 import syntax_diagnostics = "./diagnostics.jiang";
 import lang_block = "../lang/block.jiang";
 import lang_runtime = "../lang/runtime.jiang";
@@ -30,10 +31,11 @@ public ParseResult parse_tokens(
     store_api.CompilerStore& store,
     list.ArrayList<std.jiang.Token>& tokens,
     lang_block.LangBlockStore& blocks,
+    UInt8[]& source_text,
     source.SourceId source_id
 ) {
     ast.AstUnit! unit = ast.AstUnit(source_id);
-    Parser! parser = Parser(store, tokens, blocks, unit$.ref(), source_id);
+    Parser! parser = Parser(store, tokens, blocks, unit$.ref(), source_text, source_id);
     parser.parse();
     return ParseResult(unit$.move());
 }
@@ -95,6 +97,7 @@ public struct Parser: Movable {
     lang_block.LangBlockStore& blocks;
     Int! current;
     ast.AstUnit& unit;
+    UInt8[]& source_text;
     source.SourceId source_id;
     list.ArrayList<ast.AstId>! temp;
     Int! pending_gt_start;
@@ -104,6 +107,7 @@ public struct Parser: Movable {
         list.ArrayList<std.jiang.Token>& tokens,
         lang_block.LangBlockStore& blocks,
         ast.AstUnit& unit,
+        UInt8[]& source_text,
         source.SourceId source_id
     ) {
         self.store = store;
@@ -111,6 +115,7 @@ public struct Parser: Movable {
         self.blocks = blocks;
         self.current = 0;
         self.unit = unit;
+        self.source_text = source_text;
         self.source_id = source_id;
         self.temp = list.ArrayList<ast.AstId>();
         self.pending_gt_start = -1;
@@ -2464,7 +2469,7 @@ public struct Parser: Movable {
         if (self.check(.int_lit)) { return self.literal_node(self.advance(), ast.LiteralKind.int_lit); }
         if (self.check(.float_lit)) { return self.literal_node(self.advance(), ast.LiteralKind.float_lit); }
         if (self.check(.char_lit)) { return self.literal_node(self.advance(), ast.LiteralKind.char_lit); }
-        if (self.check(.string_lit)) { return self.literal_node(self.advance(), ast.LiteralKind.string_lit); }
+        if (self.check(.string_lit)) { return self.parse_string_literal_expr(); }
         if (self.match_keyword(.kw_true)) {
             return self.node(
                 self.previous().span,
@@ -3273,6 +3278,272 @@ public struct Parser: Movable {
 
     ast.AstId unit_node(std.jiang.syntax.Span span) {
         return self.node(span, .unit_type);
+    }
+
+    ast.AstId parse_string_literal_expr() {
+        std.jiang.Token tok = self.advance();
+        if (!self.string_token_has_interpolation(tok)) {
+            return self.literal_node(tok, ast.LiteralKind.string_lit);
+        }
+        return self.interpolated_string_block(tok);
+    }
+
+    Bool string_token_has_interpolation(std.jiang.Token tok) {
+        Int! index = tok.span.start + 1;
+        Int end = tok.span.end() - 1;
+        while (index < end) {
+            if (self.source_text[index] == UInt8(92) && index + 1 < end && self.source_text[index + 1] == UInt8(40)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    ast.AstId interpolated_string_block(std.jiang.Token tok) {
+        qid.SymbolId formatter_symbol = self.store.symbols.intern("__jiang_interpolation_formatter");
+        Int stmt_start = self.temp.len();
+        self.temp.add(self.interpolation_formatter_decl(formatter_symbol, tok.span));
+
+        Int! segment_start = tok.span.start + 1;
+        Int! index = segment_start;
+        Int end = tok.span.end() - 1;
+        while (index < end) {
+            if (self.source_text[index] == UInt8(92) && index + 1 < end && self.source_text[index + 1] == UInt8(40)) {
+                self.add_interpolation_segment_statement(formatter_symbol, segment_start, index);
+                Int close_paren = self.interpolation_close_paren(index + 1, end);
+                ast.AstRange args = self.parse_interpolation_args(index + 1, close_paren);
+                self.temp.add(self.interpolation_write_statement(formatter_symbol, args, tok.span));
+                index = close_paren + 1;
+                segment_start = index;
+                continue;
+            }
+            index = index + 1;
+        }
+        self.add_interpolation_segment_statement(formatter_symbol, segment_start, end);
+        ast.AstRange statements = self.take_children(stmt_start);
+        ast.AstId tail = self.interpolation_to_string_call(formatter_symbol, tok.span);
+        return self.node(tok.span, .block(ast.BlockData (statements: statements, tail_expr: tail)));
+    }
+
+    ast.AstId interpolation_formatter_decl(qid.SymbolId formatter_symbol, std.jiang.syntax.Span span) {
+        ast.AstId type_ref = self.named_type_from_symbol(self.store.symbols.intern("Formatter"), span);
+        ast.AstId name = self.name_node_from_symbol(formatter_symbol, span);
+        ast.AstId initializer = self.empty_call(
+            self.name_expr_from_symbol(self.store.symbols.intern("Formatter"), span)
+        );
+        return self.node(span, .let_stmt(ast.LetData (
+            type_ref: type_ref,
+            name: name,
+            initializer: initializer,
+            mutable_binding: true,
+            borrow_binding: false
+        )));
+    }
+
+    () add_interpolation_segment_statement(qid.SymbolId formatter_symbol, Int start, Int end) {
+        if (start >= end) {
+            return;
+        }
+        std.jiang.syntax.Span span = std.jiang.syntax.Span(start, end - start);
+        ast.AstId literal = self.string_literal_from_body(span, self.source_text[start..end]);
+        ast.AstRange args = self.single_call_arg_range(literal);
+        self.temp.add(self.interpolation_write_statement(formatter_symbol, args, span));
+    }
+
+    ast.AstId interpolation_write_statement(
+        qid.SymbolId formatter_symbol,
+        ast.AstRange args,
+        std.jiang.syntax.Span span
+    ) {
+        ast.AstId call = self.interpolation_method_call(formatter_symbol, "write", args, span);
+        return self.node_from_child(call, .stmt(ast.StmtData (value: call)));
+    }
+
+    ast.AstId interpolation_to_string_call(qid.SymbolId formatter_symbol, std.jiang.syntax.Span span) {
+        return self.interpolation_method_call(formatter_symbol, "to_string", self.empty_range(), span);
+    }
+
+    ast.AstId interpolation_method_call(
+        qid.SymbolId formatter_symbol,
+        UInt8[]& method_name,
+        ast.AstRange args,
+        std.jiang.syntax.Span span
+    ) {
+        ast.AstId base = self.name_expr_from_symbol(formatter_symbol, span);
+        ast.AstId method = self.name_node_from_symbol(self.store.symbols.intern(method_name), span);
+        ast.AstId callee = self.field_expr_node(base, method, false);
+        return self.call_expr_node(callee, self.empty_range(), args);
+    }
+
+    ast.AstRange parse_interpolation_args(Int open_paren, Int close_paren) {
+        list.ArrayList<std.jiang.Token>! tokens = self.tokenize_interpolation_args(open_paren, close_paren);
+        Parser! parser = Parser(
+            self.store,
+            tokens$.ref(),
+            self.blocks,
+            self.unit,
+            self.source_text,
+            self.source_id
+        );
+        return parser.parse_call_parens();
+    }
+
+    list.ArrayList<std.jiang.Token> tokenize_interpolation_args(Int open_paren, Int close_paren) {
+        std.jiang.syntax.SourceId std_source_id = std.jiang.syntax.SourceId(self.source_id.to_index());
+        std.jiang.syntax.Source std_source = std.jiang.syntax.Source(std_source_id, self.source_text);
+        std.jiang.Tokenizer! tokenizer = std.jiang.Tokenizer(std_source, std.jiang.syntax.Span(
+            open_paren,
+            close_paren - open_paren + 1
+        ));
+        syntax_builder.SyntaxBuilder! builder = syntax_builder.SyntaxBuilder(
+            self.store,
+            self.source_id,
+            self.source_text,
+            .parser
+        );
+        std.jiang.syntax.Builder.Any& builder_ref = std.jiang.syntax.Builder$.ref(builder);
+        list.ArrayList<std.jiang.Token>! result = list.ArrayList<std.jiang.Token>();
+        while (true) {
+            std.jiang.Token token = tokenizer.next(builder_ref);
+            result.add(token);
+            if (token.tag() == .eof) {
+                break;
+            }
+        }
+        return result$.move();
+    }
+
+    Int interpolation_close_paren(Int open_paren, Int limit) {
+        Int! depth = 0;
+        Int! index = open_paren;
+        while (index < limit) {
+            UInt8 byte = self.source_text[index];
+            if (byte == UInt8(34)) {
+                index = self.skip_interpolation_quoted(index, limit, UInt8(34));
+                continue;
+            }
+            if (byte == UInt8(39)) {
+                index = self.skip_interpolation_quoted(index, limit, UInt8(39));
+                continue;
+            }
+            if (byte == UInt8(96)) {
+                index = self.skip_interpolation_raw_name(index, limit);
+                continue;
+            }
+            if (byte == UInt8(40)) {
+                depth = depth + 1;
+            }
+            if (byte == UInt8(41)) {
+                depth = depth - 1;
+                if (depth == 0) {
+                    return index;
+                }
+            }
+            index = index + 1;
+        }
+        self.error_at_span("unterminated_string_interpolation", std.jiang.syntax.Span(open_paren, 1));
+        return limit;
+    }
+
+    Int skip_interpolation_quoted(Int start, Int limit, UInt8 delimiter) {
+        Int! index = start + 1;
+        Bool! escaped = false;
+        while (index < limit) {
+            UInt8 byte = self.source_text[index];
+            if (escaped) {
+                escaped = false;
+            } else if (byte == UInt8(92)) {
+                escaped = true;
+            } else if (byte == delimiter) {
+                return index + 1;
+            }
+            index = index + 1;
+        }
+        return limit;
+    }
+
+    Int skip_interpolation_raw_name(Int start, Int limit) {
+        Int! index = start + 1;
+        while (index < limit) {
+            if (self.source_text[index] == UInt8(96)) {
+                return index + 1;
+            }
+            index = index + 1;
+        }
+        return limit;
+    }
+
+    ast.AstRange single_call_arg_range(ast.AstId value) {
+        ast.AstId arg = self.node_from_child(value, .call_arg(ast.CallArgData (label: null, value: value)));
+        return self.unit.add_child(arg);
+    }
+
+    ast.AstId string_literal_from_body(std.jiang.syntax.Span span, UInt8[]& body) {
+        qid.SymbolId symbol = self.store.symbols.intern(self.unescaped_string_segment(body));
+        return self.node(span, .literal(ast.LiteralData (
+            kind: ast.LiteralKind.string_lit,
+            bool_value: false,
+            symbol_id: symbol
+        )));
+    }
+
+    UInt8[]& unescaped_string_segment(UInt8[]& body) {
+        if (!self.string_segment_has_escape(body)) {
+            return body;
+        }
+        UInt8![*] buffer = UInt8!$.alloc_many(body.length);
+        Int! read = 0;
+        Int! write = 0;
+        while (read < body.length) {
+            if (body[read] != UInt8(92)) {
+                buffer[write] = body[read];
+                read = read + 1;
+                write = write + 1;
+                continue;
+            }
+            buffer[write] = self.string_escape_value(body[read + 1]);
+            read = read + 2;
+            write = write + 1;
+        }
+        return buffer[0..write];
+    }
+
+    Bool string_segment_has_escape(UInt8[]& body) {
+        Int! index = 0;
+        while (index < body.length) {
+            if (body[index] == UInt8(92)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    UInt8 string_escape_value(UInt8 value) {
+        if (value == UInt8(110)) { return UInt8(10); }
+        if (value == UInt8(114)) { return UInt8(13); }
+        if (value == UInt8(116)) { return UInt8(9); }
+        if (value == UInt8(48)) { return UInt8(0); }
+        return value;
+    }
+
+    ast.AstId name_expr_from_symbol(qid.SymbolId symbol, std.jiang.syntax.Span span) {
+        ast.AstId name = self.name_node_from_symbol(symbol, span);
+        ast.AstRange segments = self.unit.add_child(name);
+        ast.AstId path = self.node(span, .path(ast.PathData (segments: segments)));
+        return self.node(span, .name_expr(ast.StmtData (value: path)));
+    }
+
+    ast.AstId named_type_from_symbol(qid.SymbolId symbol, std.jiang.syntax.Span span) {
+        ast.AstId name = self.name_node_from_symbol(symbol, span);
+        ast.AstRange segments = self.unit.add_child(name);
+        ast.AstId path = self.node(span, .path(ast.PathData (segments: segments)));
+        return self.node(span, .named_type(ast.NamedTypeData (path: path, args: self.empty_range())));
+    }
+
+    ast.AstId empty_call(ast.AstId callee) {
+        return self.call_expr_node(callee, self.empty_range(), self.empty_range());
     }
 
     ast.AstId literal_node(std.jiang.Token tok, ast.LiteralKind kind) {
