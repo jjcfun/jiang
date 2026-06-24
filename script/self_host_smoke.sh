@@ -46,15 +46,15 @@ default_sources=(
 )
 
 clang_bin="$LLVM_CLANG"
-compiler_ll="$SMOKE_BUILD_DIR/jiangc.stage2.ll"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc.stage2"
+llvm_link_args=()
+
+for arg in $("$LLVM_CONFIG" --ldflags) $("$LLVM_CONFIG" --libs all) $("$LLVM_CONFIG" --system-libs); do
+  llvm_link_args+=(--link-arg "$arg")
+done
 
 printf '== self-host smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
-"$COMPILER_UNDER_TEST" --emit-llvm src/jiangc.jiang >"$compiler_ll"
-"$clang_bin" "$compiler_ll" -o "$compiler_bin" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+"$COMPILER_UNDER_TEST" --linker "$clang_bin" "${llvm_link_args[@]}" -o "$compiler_bin" src/jiangc.jiang
 
 if [[ -n "${STAGE2_SELF_HOST_SOURCES:-}" ]]; then
   read -r -a sources <<<"$STAGE2_SELF_HOST_SOURCES"

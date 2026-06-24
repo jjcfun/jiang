@@ -34,6 +34,7 @@ case "$BOOTSTRAP_VERSION" in
 esac
 
 CLANG_BIN="$LLVM_CLANG"
+LLVM_LINK_ARGS=()
 
 case "$VERIFY" in
   none|smoke|full) ;;
@@ -66,14 +67,11 @@ trap restore_options_file EXIT
 
 perl -0pi -e 's/public UInt8\[\]&? default_compiler_version\(\) \{\n    return "[^"]*";\n\}/public UInt8[]& default_compiler_version() {\n    return "'"$JIANG_VERSION"'";\n}/' "$OPTIONS_FILE"
 
-link_llvm() {
-  local input_ll="$1"
-  local output_bin="$2"
-  "$CLANG_BIN" "$input_ll" -o "$output_bin" \
-    $("$LLVM_CONFIG" --ldflags) \
-    $("$LLVM_CONFIG" --libs all) \
-    $("$LLVM_CONFIG" --system-libs)
-  test -x "$output_bin"
+collect_llvm_link_args() {
+  local arg
+  for arg in $("$LLVM_CONFIG" --ldflags) $("$LLVM_CONFIG" --libs all) $("$LLVM_CONFIG" --system-libs); do
+    LLVM_LINK_ARGS+=(--link-arg "$arg")
+  done
 }
 
 clear_bootstrap_artifact_cache() {
@@ -84,25 +82,23 @@ clear_bootstrap_artifact_cache() {
 
 emit_next_from_bootstrap() {
   local output_bin="$1"
-  local output_ll="$BUILD_DIR/jiangc.next.ll"
-  printf '== build next: emit next llvm with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
-  "$BOOTSTRAP_BIN" --emit-llvm src/jiangc.jiang >"$output_ll"
-  printf '== build next: link %s ==\n' "$output_bin"
-  link_llvm "$output_ll" "$output_bin"
+  printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
+  "$BOOTSTRAP_BIN" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
+  test -x "$output_bin"
   printf 'OK %s\n' "$output_bin"
 }
 
 emit_compiler_with_compiler() {
   local source_bin="$1"
   local output_bin="$2"
-  local output_ll="$3"
   test -x "$source_bin"
-  printf '== build next: emit llvm with %s ==\n' "$source_bin"
-  "$source_bin" --emit-llvm -o "$output_ll" src/jiangc.jiang
-  printf '== build next: link %s ==\n' "$output_bin"
-  link_llvm "$output_ll" "$output_bin"
+  printf '== build next: compile executable with %s ==\n' "$source_bin"
+  "$source_bin" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
+  test -x "$output_bin"
   printf 'OK %s\n' "$output_bin"
 }
+
+collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
 emit_next_from_bootstrap "$NEXT_BIN"
@@ -111,7 +107,7 @@ clear_bootstrap_artifact_cache
 VERIFY_BIN="$NEXT_BIN"
 if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then
   printf '\n== build stable: next -> jiangc ==\n'
-  emit_compiler_with_compiler "$NEXT_BIN" "$JIANGC_BIN" "$BUILD_DIR/jiangc.ll"
+  emit_compiler_with_compiler "$NEXT_BIN" "$JIANGC_BIN"
   VERIFY_BIN="$JIANGC_BIN"
 fi
 

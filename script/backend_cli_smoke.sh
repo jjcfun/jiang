@@ -34,8 +34,8 @@ fi
 COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
 
 clang_bin="$LLVM_CLANG"
-compiler_ll="$SMOKE_BUILD_DIR/jiangc.ll"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc"
+llvm_link_args=()
 sample="$SMOKE_BUILD_DIR/minimal.jiang"
 sample_ll="$SMOKE_BUILD_DIR/minimal.ll"
 sample_obj="$SMOKE_BUILD_DIR/minimal.o"
@@ -81,12 +81,12 @@ printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nI
 printf 'import fs = "%s";\nInt main() { if (fs.exists("/tmp")) { 0 } else { 1 } }\n' "$system_fs_import_path" >"$system_fs_sample"
 printf 'Int main() { Int![*] values = Int!$.alloc_many(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
 
+for arg in $("$LLVM_CONFIG" --ldflags) $("$LLVM_CONFIG" --libs all) $("$LLVM_CONFIG" --system-libs); do
+  llvm_link_args+=(--link-arg "$arg")
+done
+
 printf '== backend cli smoke: build compiler with %s (%s) ==\n' "$COMPILER_UNDER_TEST" "$COMPILER_VERSION"
-"$COMPILER_UNDER_TEST" --emit-llvm src/jiangc.jiang >"$compiler_ll"
-"$clang_bin" "$compiler_ll" -o "$compiler_bin" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+"$COMPILER_UNDER_TEST" --linker "$clang_bin" "${llvm_link_args[@]}" -o "$compiler_bin" src/jiangc.jiang
 
 # 开发分支中 compiler-under-test 和刚构建出的 compiler_bin 可能共享同一个
 # package 版本号，但 source artifact 格式已经变化。运行新 compiler 前清掉
