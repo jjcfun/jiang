@@ -21,8 +21,8 @@ executable 必须早停诊断，不能误用 host `cc` 链接 Linux object。
 Wasm 和 Windows 当前只承诺 LLVM/object 输出。可运行 module、CRT/startup、host import 或 Windows
 linker integration 都是后续任务。
 
-no-libc / freestanding executable 不属于当前 release。相关设计迁移到 proposal，等待自定义 DSL 和 inline
-asm 能力稳定后再推进。
+no-libc / freestanding executable 不属于当前 release。相关设计迁移到 proposal，后续随 inline asm、
+target runtime object 和 platform entry 设计推进。
 
 ## Linker Boundary
 

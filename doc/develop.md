@@ -18,11 +18,11 @@
 /Users/jjc/project/jiang/jiang                -> release/<version>
 ```
 
-例如 0.4.1：
+例如 0.4.2：
 
 ```text
-/Users/jjc/project/jiang/bootstrap-0.4.1  -> bootstrap/0.4.1
-/Users/jjc/project/jiang/jiang            -> release/0.4.1
+/Users/jjc/project/jiang/bootstrap-0.4.2  -> bootstrap/0.4.2
+/Users/jjc/project/jiang/jiang            -> release/0.4.2
 ```
 
 ## 开发步骤

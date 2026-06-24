@@ -18,7 +18,7 @@
 ## 词法 token
 
 ```peg
-ident       <- /* ASCII [_A-Za-z][_A-Za-z0-9]*，或包含 UTF-8 非 ASCII 字节的标识符 */
+ident       <- /* ASCII [_A-Za-z][_A-Za-z0-9]*，或符合 Unicode XID_Start / XID_Continue 的 UTF-8 标识符 */
 escaped_ident
             <- "`" /* 任意非反引号字节序列 */ "`"
 int_lit     <- decimal_int / binary_int / octal_int / hex_int
@@ -31,6 +31,7 @@ float_lit   <- decimal_int "." decimal_int exponent?
 exponent    <- ("e" / "E") ("+" / "-")? decimal_int
 char_lit    <- /* 字符字面量 */
 string_lit  <- /* UTF-8 字符串字面量 */
+raw_block   <- /* `#ident { ... }` 中由 lang provider scan 确定边界的原始 block */
 
 literal     <- int_lit
              / float_lit
@@ -561,7 +562,8 @@ call_arg    <- (name ":")? expr
 
 ```peg
 primary_expr
-            <- type "$" implicit_call
+            <- lang_invocation
+             / type "$" implicit_call
              / type "." name
              / literal
              / "self"
@@ -578,6 +580,9 @@ paren_expr  <- "(" ")"
              / "(" expr ")"
 
 array_expr  <- "[" (expr ("," expr)* ","?)? "]"
+
+lang_invocation
+            <- "#" ident raw_block
 
 struct_lit  <- "{" (field_init_expr ("," field_init_expr)* ","?)? "}"
 

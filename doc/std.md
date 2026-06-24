@@ -38,6 +38,8 @@ import std;
 `std.jiang.syntax` 是 lang provider 的公共 syntax ABI。provider 通过
 `std.jiang.syntax.Builder.Any&` 构造 `NodeId` / `Tree`，并用 `std.jiang.syntax.Diagnostic`
 报告 syntax 阶段错误。compiler 可以复用这些结构，再在 lang expansion 后转换到内部 AST。
+`std.jiang.syntax.Provider` 是 `type = lang` package root `Lang` 需要实现的 trait；compiler
+为该类型生成 host dynamic library wrapper，普通用户代码不直接调用 wrapper 符号。
 
 `std.jiang.Tokenizer` 是 Jiang 语言 tokenizer 的公共版本。它接受 `std.jiang.syntax.Source`，
 每次 `next(builder)` 返回一个 `Token`，并把 lexer 诊断写入传入的 builder。`Token` 不保存

@@ -37,7 +37,7 @@ interface 做 name resolve 和 type check。
 
 ## 缓存产物
 
-长期缓存分成三类：
+长期缓存分成四类：
 
 ```text
 ImportSummary:
@@ -48,6 +48,9 @@ ModuleInterface:
 
 ObjectArtifact:
   用于复用 concrete codegen output。
+
+PackageArtifact:
+  用于整包产物路径和命中判断，例如 package object、dynamic library、lang provider dylib。
 ```
 
 `ImportSummary` 和 `ModuleInterface` 在类型和 API 上必须分开，但物理上可以放在同一个 `.ji`
@@ -91,6 +94,31 @@ codegen 的稳定输入：
 - target triple / ABI。
 - compiler version。
 - dependency interface hash。
+
+Package artifact 是比 source object 更粗的整包边界。它不替代 `.ji` 或 debug source object；
+它只负责最终 package-level 产物的 key/path：
+
+```text
+PackageArtifactKey:
+  kind
+  package_hash
+  compiler_hash
+  wrapper_hash
+  target_cache_key
+  compile_mode
+```
+
+当前 kind 包括：
+
+- `package_object`：普通 package 整包 object，可用于 executable 或 dynamic library link。
+- `lang_provider_dynamic_library`：`type = lang` provider 的 host dylib。
+
+`wrapper_hash` 由 lang provider dylib 使用，用于 wrapper template / provider ABI 变化时失效旧产物；
+普通 package object 使用 0。package artifact path 统一由 `artifact/package_artifact.jiang`
+生成，不能在 pipeline 或 lang builder 里另写一套 hash/path 逻辑。
+
+`package_hash` 统一由 `artifact/package_fingerprint.jiang` 计算。manifest 入口用于 resolve 前的
+lang provider registry；package record 入口用于 module graph 已经构建后的普通 target package。
 
 ## AST
 
@@ -291,7 +319,8 @@ object path 由 backend artifact path planner 生成：
 ```text
 cache_root/objects/source_<hash>.o
 cache_root/objects/mono_<stable_instance_fingerprint>.o
-cache_root/objects/release_pkg_<hash>.o
+cache_root/objects/package_<package_artifact_hash>.o
+cache_root/lang/lang_<package_artifact_hash>.<dylib-ext>
 ```
 
 planner 是纯函数，不创建目录、不写文件。pipeline 负责在 object emit 前创建 cache 目录，
@@ -361,7 +390,7 @@ session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/obj
 
 ## 当前实现边界
 
-当前 0.4.1 实现已经具备这些内存和 artifact 结构：
+当前 0.4.2 实现已经具备这些内存和 artifact 结构：
 
 - `SourceArtifactCache`：保存 `ImportSummary`、`ModuleInterface` 和 `GenericTemplate`。
 - `JiFileImage`：提供 `.ji` header / section table / read_at 的最小 API。
@@ -370,6 +399,8 @@ session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/obj
 - `StableInstanceKey`：描述 monomorph object 的稳定输入。
 - `ConcreteInstanceRegistry`：在同一 compilation 内按 stable instance 复用 concrete MIR body 位置。
 - `ObjectArtifactCache`：区分 source object 和 monomorph object，不保存 semantic interface。
+- `PackageArtifactKey`：描述整包产物 cache key，当前用于普通 package object 和 lang provider dylib。
+- `package_fingerprint`：统一计算 target package 和 `type = lang` provider package 的 package hash。
 - `QueryDependencyGraph`：记录 query dependency / reverse dependency，并提供 transitive invalidation。
 - `CompilerSession`：持有可复用 `CompilerContext`，通过 `begin_compilation` 进入下一轮编译。
 
@@ -403,6 +434,11 @@ Interface 命中:
 
 ObjectArtifact 命中:
   可以跳过 HIR/type_check/MIR/codegen，但不能跳过 interface loading。
+
+PackageArtifact 命中:
+  可以复用整包最终产物路径，但不能替代 `.ji` / interface loading。
+  对 lang provider dylib，命中只表示 package key 对应的 dylib 文件存在；如果 dylib 加载失败、
+  缺少固定符号或 ABI 不匹配，应报告诊断，不自动重建来掩盖错误。
 ```
 
 只改 private function body 时，通常：

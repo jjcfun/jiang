@@ -70,8 +70,8 @@ compatibility provider：
 - 当前不保留可 import 的 `system/os/posix/*` 实现层；POSIX 只作为未来 façade / 语义分组，
   避免把 POSIX 固定成 hosted libc。
 - no-libc provider 不能通过 hosted libc ABI 间接依赖 libc；它必须走 syscall、compiler
-  intrinsic、inline asm、Wasm host import 或 target runtime object。真实 no-libc 和 inline asm
-  后置到自定义 DSL 机制稳定后的 proposal。
+  intrinsic、inline asm、Wasm host import 或 target runtime object。真实 no-libc executable、
+  inline asm 和 target runtime object 仍是后续 proposal；不再把它们绑定到 lang package 机制完成度。
 
 `--no-link-libc` 不是单纯少传 linker 参数。pipeline 会先根据 target 判断是否存在 hosted
 libc/CRT，再结合用户请求得到 effective link-libc 模式。当前 object/LLVM 输出已经按这个模式选择

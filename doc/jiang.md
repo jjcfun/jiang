@@ -1837,25 +1837,31 @@ Int b = counter.apply(true);
 - 同名不同签名的方法按普通重载规则区分
 - 同名同签名的多个 trait requirement 可以共用同一份实现
 
-每个 trait 都有三个保留的 companion type 名：
+每个 trait 都有保留的 companion type 名：
 
-- `Trait.Any`：borrowed dynamic trait view，保存 erased receiver 和 vtable，不移动原值。
-- `Trait.VTable`：某个 concrete type 对该 trait 的方法表。
+- `Trait.Any`：dynamic trait view，保存 erased receiver 和 compiler-private vtable。
 - `Trait.Receiver`：vtable slot 使用的 erased receiver。
+- `Trait.VTable`：compiler-private 方法表类型，用户源码不能直接命名或传参。
 
 对应的 intrinsic type operation 为：
 
 ```c
-Value.Any any = Value$.any(box);
-Value.VTable vtable = Value$.vtable(Box);
-Value.Receiver receiver = Value$.receiver(box);
+Value.Any& any = Value$.ref(box);
 Int a = any.value();
-Int b = vtable.value(receiver);
+
+Value.Any^ owned = Value$.new(Box(data: 1));
+Value.Any& owned_ref = owned$.ref();
+Int b = owned_ref.value();
+
+Value.Receiver receiver = any.receiver;
+Fn<Int, Value.Receiver> value_fn = any.value;
+Int c = value_fn(receiver);
 ```
 
-0.4.1 支持 ref receiver trait instance method 的动态分派和 vtable slot 读取。
-`@self(move)` / owned receiver trait object 暂不支持；如果 trait 中存在 move receiver
-requirement，构造 `Trait.Any` / `Trait.VTable` / `Trait.Receiver` 会编译失败。
+0.4.2 支持 borrowed trait object `Trait$.ref(value)` 和 owning trait object `Trait$.new(value)`。
+`Trait$.new(value)` 会为 receiver 创建 owning storage，并在 `Trait.Any^` drop 时通过
+receiver type info 触发 receiver drop。`@self(move)` trait object dispatch 暂不支持；如果 trait
+中存在 move receiver requirement，构造 `Trait.Any` / `Trait.Receiver` 会编译失败。
 
 trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
 
@@ -2167,6 +2173,7 @@ jiangc path/to/pkg -o pkg
 
 - `[package].name`
 - `[package].root`
+- `[package].type`
 - `[package].version`
 - `[dependencies]`
 
@@ -2174,6 +2181,7 @@ jiangc path/to/pkg -o pkg
 
 - `name` 未写时，默认取当前目录名
 - `root` 未写时，默认取 `<name>.jiang`
+- `type` 未写时，默认是普通 package；`type = lang` 表示该 package 提供自定义语法 provider
 - `version` 未写时，manifest 内保留为空；编译器自身 release 构建从根 `package.ini` 读取版本
 - 若显式写了，则覆盖默认值
 - `name` 无论显式还是默认值，都必须满足 Jiang lexer 的标识符规则：ASCII 字母或 `_`
@@ -2205,7 +2213,7 @@ lexer/
 [package]
 name = frontend
 root = src/main.jiang
-version = 0.4.1
+version = 0.4.2
 ```
 
 当前第一版 package 机制还支持本地依赖：
@@ -2233,6 +2241,45 @@ import util;
 - root file 可以通过 `public import` 重新导出模块 namespace，也可以通过 `public alias`
   重新导出具体 public symbol
 - 非 root module 的 public 声明不会自动成为 package API
+
+#### Lang Package / 自定义语法
+
+`type = lang` package 可以提供 syntax-stage provider。使用方仍通过普通 `[dependencies]`
+声明依赖：
+
+```ini
+[dependencies]
+sql = ../sql-lang
+```
+
+源码中用 dependency alias 调用：
+
+```jiang
+User user = #sql {
+    select * from User where id == \(id)
+};
+```
+
+provider package manifest：
+
+```ini
+[package]
+name = sql-lang
+root = lang.jiang
+type = lang
+```
+
+provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider`。编译器在 host 上
+把 lang package 编译成 dynamic library；lexer 调用 `scan` 决定 block 边界，parser 调用 `parse`
+取得 `std.jiang.syntax.Tree`，再转换成普通 Jiang AST。DSL 返回的节点继续走普通 resolve、
+type check、MIR 和 backend。
+
+当前限制：
+
+- 只支持 block invocation：`#alias { ... }`
+- 不支持 `#alias(...)`
+- 一个 lang package 只提供一个默认 provider
+- provider 不能直接生成 HIR/MIR/backend IR
 - dependency package 中的 `main` 不会成为当前 package 的 hosted entry wrapper
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。

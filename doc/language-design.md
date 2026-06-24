@@ -3,8 +3,8 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.1` 分支已经具备自举编译器、core 源码化入口、标准库孵化入口、
-泛型/trait 基础、MIR/backend 和源码级语言测试。本文档描述当前分支希望稳定下来的语言规则；
+当前 `release/0.4.2` 分支已经具备自举编译器、core 源码化入口、标准库孵化入口、
+泛型/trait 基础、Lang Package 自定义语法、MIR/backend 和源码级语言测试。本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
 ## 状态标记
@@ -27,7 +27,7 @@ Jiang 是面向系统编程的语言，目标是在低层控制能力、工程�
 - 可读的泛型和 trait 约束。
 - AST 保留源码结构，语义信息进入 resolve/sema/HIR。
 - 字符串、数组、slice、指针等系统级类型有直接语法支持。
-- 后续支持自定义语法，但基础语言语法必须先稳定。
+- 通过 lang package 支持场景化语法扩展；扩展必须回到 Jiang syntax tree，再进入普通语义检查。
 
 ## 命名规范
 
@@ -71,6 +71,61 @@ Token 只表示词法事实，不承载语义类型。
 - `Span` 使用字节偏移和字节长度；line/column 在诊断阶段计算。
 
 `Self` 是类型位置的特殊名字。`self` 是类型内部 instance method 和 constructor body 中的 contextual keyword，表示当前 receiver 或初始化目标；`static` 类型函数中没有 `self`。
+
+## Lang Package / 自定义语法
+
+当前已定义：Jiang 支持 block 形式的 lang invocation：
+
+```jiang
+User user = #sql {
+    select * from User where id == \(id)
+};
+```
+
+`#sql` 中的 `sql` 不是普通名字，也不通过 `import` / resolve 查找。它只来自当前 package
+manifest 的 dependency alias：
+
+```ini
+[dependencies]
+sql = ../sql-lang
+```
+
+被调用 dependency 必须声明为 lang package：
+
+```ini
+[package]
+name = sql-lang
+root = lang.jiang
+type = lang
+```
+
+lang package root 必须 public 导出固定入口 `Lang`，并满足 `std.jiang.syntax.Provider`。
+编译器在 host 上把该 package 编译成 dynamic library，lexer/parser 在 syntax 阶段调用 provider。
+
+语言层规则：
+
+- 只支持 block invocation：`#alias { ... }`。
+- 当前不支持 `#alias(...)`。
+- 当前不支持源码内声明多个 parser 入口。
+- 一个 lang package 只提供一个默认 provider。
+- provider 输出必须是 `std.jiang.syntax.Tree`。当前只支持 expression 位置，因此 root kind 必须是
+  `expression`；其他 root kind 是 public syntax tree 为后续扩展保留的结构。
+- provider 不能直接生成 HIR、MIR、后端 IR，也不能绕过普通 resolve/type check。
+- DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/MIR/backend。
+
+provider 有两个阶段：
+
+```text
+scan(input, builder) -> ScanResult
+parse(input, builder) -> NodeId
+```
+
+lexer 看到 `#alias {` 后创建 per-block provider 实例并调用 `scan`。`scan` 负责判断 DSL block
+边界，并可把私有 token/cache 保存在 provider 实例字段中。parser 后续读到 `raw_block` token 时
+调用同一实例的 `parse`，得到 public syntax tree，再由 compiler 转换成内部 AST。
+
+这种机制的目标不是把 Jiang 变成文本宏语言，而是让不同领域可以使用更适合的表面语法，例如
+SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态化和 backend 仍由 Jiang 编译器统一处理。
 
 ## 字面量
 
@@ -664,7 +719,7 @@ public alias Bool;
 未定事项：
 
 - ambiguous re-export 的诊断和恢复策略。
-- package artifact、版本求解、lockfile 和 registry 规则。
+- 版本求解、lockfile 和 registry 规则。
 
 ## 函数和方法
 
@@ -798,10 +853,11 @@ trait Indexable {
   `Type.method(args...)` 调用，也可以在泛型约束中通过 `T.method(args...)` 调用。
   非 `static` trait function requirement 隐含 `Self&` receiver。
 - trait 本身不是普通值类型；动态 trait view 通过 compiler-provided companion type
-  表达：`Trait.Any`、`Trait.VTable`、`Trait.Receiver`。`Trait$.any(value)` 和
-  `Trait$.receiver(value)` 不移动原值，`Trait$.vtable(Type)` 生成 concrete type 的
-  方法表。0.4.1 支持 ref receiver method 的动态分派，暂不支持 `@self(move)` /
-  owned receiver trait object。
+  表达：`Trait.Any` 和 `Trait.Receiver`。`Trait$.ref(value)` 生成 borrowed dynamic view，
+  不移动原值；`Trait$.new(value)` 生成 owning dynamic view，返回 `Trait.Any^`。
+  `Trait.VTable` 是 compiler-private 方法表类型，用户源码不能直接命名或传参。0.4.2 支持
+  ref receiver method 的动态分派和 owning trait object drop，暂不支持 `@self(move)` trait
+  object dispatch。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get() -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
 - union variant name 和同一 union 的 static/显式 method name 共享类型成员命名空间，不能重名，避免 `Union.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须
@@ -1143,19 +1199,18 @@ comptime {
 普通源码、`comptime` 条件和 public const aggregate 字段读取都通过同一套 value path / const value
 机制访问这些 facts。
 
-## 自定义语法
+## 自定义语法补充规则
 
-Jiang 后续要支持自定义语法。当前原则：
+0.4.2 的自定义语法固定为 syntax-stage lang package 机制，入口见本文前面的
+“Lang Package / 自定义语法”章节。
 
-- DSL 入口使用 `#name { ... }` 或后续等价形式，例如 `#sql { ... }`、`#asm { ... }`。
-- `#` 用于 custom syntax / DSL；`comptime {}` 是核心语言语法，`@` 用于 attribute。
-- lexer 保持通用，不把所有未来语法过早硬编码。
-- AST/parser 先稳定核心语言。
-- 自定义语法必须明确进入哪个阶段展开：token-level、AST-level、HIR-level。
-- DSL 产物必须落回编译器已知 AST/HIR 结构，不能通过字符串拼接重新 parse 来隐藏错误位置。
-- 自定义语法不能破坏基础语言的错误恢复和 IDE/LSP 能力。
+补充原则：
 
-该部分暂不定稿，等 resolve/sema 基础稳定后再设计。
+- `#` 保留给 custom syntax / lang invocation；`comptime {}` 是核心语言语法，`@` 用于 attribute。
+- host lexer 只识别 `#alias` 和 raw block envelope；DSL body 的内部 token/cache 由 provider 自己维护。
+- 自定义语法必须返回 Jiang syntax tree，不能通过字符串拼接回灌 host parser 来隐藏错误位置。
+- 自定义语法不能绕过基础语言的错误恢复、诊断 span 和 IDE/LSP 能力。
+- HIR-level、MIR-level 或 backend-level plugin 不属于当前 Lang Package 设计。
 
 ## 后续提案
 

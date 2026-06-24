@@ -19,8 +19,10 @@ User user = #sql {
 必须是 `type = lang` package，并在 package root 中公开默认入口 `Lang`。
 
 lang invocation 使用 block 形式，不支持 `#sql(...)`，也不支持源码内声明多个 parser 入口。
-编译器按 invocation 所在语法位置传入对应 entry kind，provider 需要返回同类 Jiang syntax tree。
-每个 lang invocation 会创建一个 provider 实例，`scan` 和 `parse` 通过该实例共享 DSL 私有状态。
+当前 parser 只在 expression 位置接入 `#alias { ... }`，因此 provider 需要返回 expression entry
+syntax tree。public syntax tree 已保留 `file`、declaration、statement、type、pattern 等 root kind，
+用于后续扩展。每个 lang invocation 会创建一个 provider 实例，`scan` 和 `parse` 通过该实例共享
+DSL 私有状态。
 
 ## Public Syntax Tree
 
@@ -65,9 +67,9 @@ DSL source
 ```
 
 也就是说，`#alias { ... }` 不会进入内部 AST 成为占位节点。lexer 只产出 `hash ident raw_block`
-三个 token，其中 `raw_block` 携带 compiler-private block id。parser 根据 invocation 所在语法位置
-传入 `Root.Kind`，调用 provider parse，provider 返回 `std.jiang.syntax.Tree` 后，编译器校验并转换
-成内部 AST，再交给既有 resolve/sema 流程。
+三个 token，其中 `raw_block` 携带 compiler-private block id。当前 parser 只在 expression 位置
+调用 provider parse，并传入 `Root.Kind.expression`。provider 返回 `std.jiang.syntax.Tree` 后，
+编译器校验并转换成内部 AST，再交给既有 resolve/sema 流程。
 
 长期可以让内部 parser 逐步向 `std.jiang.syntax.Tree` 靠拢，但不要求当前重写 parser 或 resolve。
 
@@ -91,7 +93,7 @@ public `SymbolId`，由 `Builder.intern_symbol` 创建。identifier 判定使用
 `XID_Start` / `XID_Continue`，底层压缩表由 `script/gen_unicode_xid.js` 生成到
 `std/jiang/text/generated/xid.jiang`。
 
-## Registry
+## Registry And Dynamic Library
 
 解析 package manifest 后，编译器先加载 dependencies。对 `type = lang` package，编译器将其
 编译为 host dynamic library，并把 dependency alias 注册到 lang registry：
@@ -103,18 +105,60 @@ dependency alias -> provider handle for package root public Lang
 lexer 读到 `#alias { ... }` 时只查这个 registry，不查普通 import/name resolve。这样 DSL 机制不依赖
 Jiang 普通名字解析；如果 provider 不能加载，源码已经不可解析，编译器直接报告 syntax/package 错误。
 
-lang dynamic library 是本机缓存产物。缓存 key 至少包含 provider source hash、dependency hash、
-当前 `jiangc` 版本、std ABI 版本、lang ABI 版本和 host target。provider dylib 只暴露一个
-compiler-private 入口符号，例如 `jiang_lang_entry`；`jiangc` 自动生成低层 ABI wrapper。
+lang dynamic library 是本机缓存产物，不承诺跨 `jiangc` 版本复用。provider package 仍以源码发布；
+当前 compiler 在 host 上为它生成 wrapper package，再编译成 dynamic library 并加载。
 
 compiler-private wrapper scaffold 位于 `src/lang/`：
 
-- `abi.jiang` 定义 ABI version、固定入口符号、request kind、status 和低层 request/response。
-- `handle.jiang` 定义已加载 provider dylib 的 opaque handle。
+- `abi.jiang` 定义 wrapper version 和固定入口符号。
+- `wrapper_template.jiang` 生成固定 ABI 入口。
+- `dylib_builder.jiang` 负责按需编译 provider wrapper package。
+- `runtime.jiang` 负责 `dlopen` / `dlsym`、调用 `scan` / `parse` 和 provider 生命周期。
+- `handle.jiang` 定义已加载 provider dylib 的 opaque handle 和 provider trait object bits。
 - `registry.jiang` 定义 dependency name 到 provider handle 的 registry。
 
-这层不是公开 std API。它后续才会接入 `dlopen` / `dlsym`、provider dylib cache 和 root `Lang`
-签名校验。
+wrapper 当前导出四个 compiler-private 符号：
+
+```text
+jiang_lang_create
+jiang_lang_scan
+jiang_lang_parse
+jiang_lang_destroy
+```
+
+`jiang_lang_create` 返回 `std.jiang.syntax.Provider.Any^` 的低层 bits。compiler 持有 provider
+生命周期，在 lexer 阶段创建实例并调用 scan，在 parser 阶段调用 parse，最后调用 destroy。普通
+用户代码不直接调用这些符号。
+
+## Package Artifact Cache
+
+Lang provider dylib 和普通 target package 的 package-level 产物共用同一套 cache key/path 抽象：
+
+- `src/artifact/package_fingerprint.jiang` 计算 package 指纹。
+- `src/artifact/package_artifact.jiang` 计算 package-level artifact key 和路径。
+
+package fingerprint 汇总：
+
+- package manifest。
+- package root 和 file import source closure。
+- manifest dependency package 的 manifest/source closure。
+- 已经进入 module graph 的 package modules source hash。
+
+package artifact key 在 package fingerprint 外还包含：
+
+- compiler/source artifact version hash。
+- wrapper version，lang provider dylib 使用；普通 package object 为 0。
+- target cache key。
+- compile mode。
+- artifact kind。
+
+因此 provider root、provider internal import、provider dependency 源码、manifest、compiler version、
+wrapper version、host target 或 mode 变化都会让 provider dylib path 变化并触发重建。target 源码
+变化不混入 provider dylib key；target 自身通过普通 package/source/object artifact 失效，并重新
+scan/parse DSL block。
+
+缓存命中但 dylib 加载失败、缺少固定符号或 ABI 不匹配是产物损坏或 compiler/wrapper bug，
+应报告诊断，不应靠“坏 dylib 自动重建”掩盖。
 
 ## Provider Contract
 
@@ -171,11 +215,11 @@ package 同时导出多个默认 parser。
 `Input.name_span` 表示 invocation 名字的源码范围，例如 `#sql { ... }` 中的 `sql`。它主要用于
 provider 诊断；registry 查找和 dependency 校验仍由 host 在调用 provider 前完成。
 
-`Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`，可为 `file`、`top_level_declaration`、
-`member_declaration`、`statement`、`expression`、`type_reference` 或 `pattern`。返回 syntax
-root node 的 root kind 必须等于 `input.entry_kind`；编译器根据 invocation 所在位置传入 entry kind，
-并拒绝不匹配的 tree。也就是说，DSL 输出需要落在 Jiang 当前语法层能表示的完整 syntax
-entry 中。
+`Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`。当前实现传入 `expression`；public
+tree 同时定义了 `file`、`top_level_declaration`、`member_declaration`、`statement`、
+`type_reference` 和 `pattern`，用于后续把 lang invocation 扩展到其他语法位置。返回 syntax root
+node 的 root kind 必须等于 `input.entry_kind`，否则 compiler 拒绝该 tree。也就是说，DSL 输出
+需要落在 Jiang 当前语法层能表示的完整 syntax entry 中。
 
 `ScanResult` 返回 `status`、`body_span`、`full_span` 和 `end_offset`。scan 阶段负责判断 DSL
 body 的结束位置，并通过 `builder` 报告词法或边界错误；`status = error` 时 compiler 不再调用

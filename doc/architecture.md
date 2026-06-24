@@ -12,12 +12,16 @@ driver/cli -> pipeline.compile
         core + package source/AST -> HIR -> type/comptime facts -> MIR -> checked MIR -> backend output
                                       \           \          \          \
                                        ----------- layout facts --------
+             \
+              lang provider scan/parse -> public syntax tree -> internal AST
 ```
 
 流程中的几个块对应：
 
 - `core + package source/AST`：compiler-known core 源码、package manifest、source、syntax、
   module graph 和 resolve。
+- `lang provider scan/parse`：`#alias { ... }` 调用 manifest dependency 中的 `type = lang`
+  provider，provider 返回 public syntax tree，compiler 转换为内部 AST。
 - `HIR`：resolve 直接生成的未类型化语义树。
 - `type/comptime facts`：`TypeCheckStore`、`ComptimeStore` 和 `MonomorphStore`。
 - `MIR`：HIR lowering 生成的 CFG。
@@ -26,7 +30,7 @@ driver/cli -> pipeline.compile
 - `layout facts`：由 HIR、type facts 和 target layout 按需查询得到，供 MIR、borrow/drop 和
   backend 使用。
 
-0.4.1 的 root module 加载前会先加载 `src/core/core.jiang`。core 源码声明 compiler-known
+0.4.2 的 root module 加载前会先加载 `src/core/core.jiang`。core 源码声明 compiler-known
 trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`
 intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。
 
@@ -59,8 +63,12 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 
 - `syntax`
   - 生产：token、AST、语法诊断。
-  - 消费：source text、keyword store。
+  - 消费：source text、keyword store、lang registry。
   - 禁止：名字解析、类型判断、布局、codegen 语义。
+- `lang`
+  - 生产：lang provider registry、provider dynamic library handle、public syntax tree expansion。
+  - 消费：package manifest、artifact cache、host dynamic library loader、`std.jiang.syntax.Provider`。
+  - 禁止：生成 HIR/MIR/backend IR、依赖普通 import/name resolve 查找 provider。
 - `resolve`
   - 生产：core/module graph、namespace、`DefId`、名字绑定、HIR。
   - 消费：AST、source、package manifest、compiler-known core root。
@@ -106,7 +114,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：elaborated MIR、layout、target、symbols。
   - 禁止：语言语义判断、HIR fallback、修改 MIR/layout。
 - `incremental`
-  - 生产：`StableKey`、fingerprint、source interface / HIR template / object artifact metadata。
+  - 生产：`StableKey`、fingerprint、source interface / HIR template / object artifact metadata、
+    package-level artifact key/path。
   - 消费：source、interface、object artifact。
   - 禁止：缓存 session-local HIR/type/MIR 对象。
 
@@ -228,6 +237,10 @@ CompilerStore
   详见 [Backend 设计](compiler/backend.md)。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
   [Incremental Compilation 设计](compiler/incremental.md)。
+- `lang` 负责 `type = lang` provider discovery、wrapper dylib 构建、host dylib 加载和
+  syntax-stage provider invocation；详见 [DSL / Lang Package](compiler/dsl.md)。
+- `artifact` 保存 source/interface/object/package artifact 的 key、fingerprint、path 和物理容器
+  适配；package-level 产物通过 `package_fingerprint` 和 `package_artifact` 统一失效规则。
 - `store` 是跨阶段事实集合聚合点；普通阶段通过 store API 查询，
   不直接依赖其他阶段内部表。
 - `support` 只放可复用容器和工具，不 import 编译阶段模块。
@@ -258,6 +271,8 @@ src/
   driver/       CLI 参数和命令入口
   source/       package、source file、source manager、source map
   syntax/       token、lexer、parser、flat AST
+  lang/         lang package registry、wrapper dylib、provider runtime bridge
+  artifact/     source .ji、object key、package artifact key/path、fingerprint
   diagnostic/   diagnostic、reporter
   core/         compiler-known core 源码入口、builtin trait/type 外壳、intrinsic 声明
   resolve/      symbol store、keyword store、import/module/name resolver
