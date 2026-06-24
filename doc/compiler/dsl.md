@@ -114,21 +114,22 @@ compiler-private wrapper scaffold 位于 `src/lang/`：
 - `wrapper_template.jiang` 生成固定 ABI 入口。
 - `dylib_builder.jiang` 负责按需编译 provider wrapper package。
 - `runtime.jiang` 负责 `dlopen` / `dlsym`、调用 `scan` / `parse` 和 provider 生命周期。
-- `handle.jiang` 定义已加载 provider dylib 的 opaque handle 和 provider trait object bits。
-- `registry.jiang` 定义 dependency name 到 provider handle 的 registry。
+- `handle.jiang` 定义已加载 provider dylib 的 runtime handle。
+- `registry.jiang` 定义 dependency alias 到 lang package id 的 registry，并持有该 dependency edge 的 dylib handle。
+- `resolve/store.jiang` 的 `PackageRecord.info` 使用 union 保存 package-specific info；lang package 的 dylib path、
+  source path、wrapper version 和 cache 标记保存在 `PackageInfo.lang`。
+- `LangBlock` 只保存单个 DSL block 的 `Provider.Any^?` 实例和 syntax builder/input/scan result。
 
-wrapper 当前导出四个 compiler-private 符号：
+wrapper 当前只导出一个 compiler-private 符号：
 
 ```text
-jiang_lang_create
-jiang_lang_scan
-jiang_lang_parse
-jiang_lang_destroy
+jiang_lang_provider_create
 ```
 
-`jiang_lang_create` 返回 `std.jiang.syntax.Provider.Any^` 的低层 bits。compiler 持有 provider
-生命周期，在 lexer 阶段创建实例并调用 scan，在 parser 阶段调用 parse，最后调用 destroy。普通
-用户代码不直接调用这些符号。
+`jiang_lang_provider_create` 返回 `std.jiang.syntax.Provider.Any^`。compiler 持有 provider
+生命周期，在 lexer 阶段创建实例并通过 `Provider.scan` 扫描 DSL block，在 parser 阶段通过
+`Provider.parse` 生成 syntax tree。provider 实例由 owner pointer 自动释放，普通用户代码不直接
+调用这个符号。
 
 ## Package Artifact Cache
 

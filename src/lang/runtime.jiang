@@ -1,14 +1,15 @@
 // Runtime call boundary for lang provider instances.
 //
 // Lexer/parser code should use this module instead of touching dynamic library
-// ABI details directly. The real dlopen/dlsym bridge will fill in the call
-// sites here; until then the wrapper returns precise unsupported statuses.
+// ABI details directly.
 
 import ast = "../syntax/ast.jiang";
 import abi = "./abi.jiang";
 import block = "./block.jiang";
 import dylib = "../system/dylib.jiang";
-import handle = "./handle.jiang";
+import registry = "./registry.jiang";
+import store = "../resolve/store.jiang";
+import store_api = "../store/api.jiang";
 import tree_converter = "../syntax/tree_converter.jiang";
 import std;
 
@@ -62,21 +63,25 @@ public struct ScanBlockResult {
     }
 }
 
-public ScanBlockResult scan_block(block.LangBlock& lang_block, std.jiang.syntax.ScanResult fallback) {
-    if (!ensure_loaded(lang_block)) {
+public ScanBlockResult scan_block(
+    store_api.CompilerStore& compiler_store,
+    registry.LangDependency& dependency,
+    store.PackageRecord& provider,
+    block.LangBlock& lang_block,
+    std.jiang.syntax.ScanResult fallback
+) {
+    if (!ensure_loaded(compiler_store, dependency, provider)) {
         return ScanBlockResult.failure(.not_loaded, scan_error(fallback));
     }
-    CallStatus create_status = ensure_provider_instance(lang_block);
+    CallStatus create_status = ensure_provider_instance(dependency, lang_block);
     if (create_status != .ok) {
         return ScanBlockResult.failure(create_status, scan_error(fallback));
     }
     std.jiang.syntax.Builder.Any& builder_ref = std.jiang.syntax.Builder$.ref(lang_block.builder);
-    std.jiang.syntax.ScanResult result = call_scan_entry(
-        lang_block.provider.scan_pointer,
-        lang_block.provider.provider_bits,
-        lang_block.input,
-        builder_ref
-    );
+    guard lang_block.provider_ref() is .some(provider_ref) else {
+        return ScanBlockResult.failure(.invalid_request, scan_error(fallback));
+    }
+    std.jiang.syntax.ScanResult result = provider_ref.scan(lang_block.input, builder_ref);
     if (result.status == .error) {
         return ScanBlockResult.failure(.error, scan_error(result));
     }
@@ -95,20 +100,11 @@ public ParseIntoResult parse_into(ast.AstUnit& unit, block.LangBlock& lang_block
     if (lang_block.scan_result.status == .error) {
         return ParseIntoResult.failure(.invalid_request);
     }
-    if (!ensure_loaded(lang_block)) {
-        return ParseIntoResult.failure(.not_loaded);
-    }
-    CallStatus create_status = ensure_provider_instance(lang_block);
-    if (create_status != .ok) {
-        return ParseIntoResult.failure(create_status);
-    }
     std.jiang.syntax.Builder.Any& builder_ref = std.jiang.syntax.Builder$.ref(lang_block.builder);
-    std.jiang.syntax.NodeId root = call_parse_entry(
-        lang_block.provider.parse_pointer,
-        lang_block.provider.provider_bits,
-        lang_block.input,
-        builder_ref
-    );
+    guard lang_block.provider_ref() is .some(provider_ref) else {
+        return ParseIntoResult.failure(.invalid_request);
+    }
+    std.jiang.syntax.NodeId root = provider_ref.parse(lang_block.input, builder_ref);
     std.jiang.syntax.Tree tree = lang_block.builder.tree(root);
     guard node_for_entry(tree$.ref(), root, lang_block.input.entry_kind) is .some(node_id) else {
         return ParseIntoResult.failure(.invalid_request);
@@ -134,89 +130,53 @@ std.jiang.syntax.NodeId? node_for_entry(
     return tree.child_at(provider_root.nodes, 0);
 }
 
-Bool ensure_loaded(block.LangBlock& lang_block) {
-    if (lang_block.provider.loaded()) {
-        return true;
-    }
-    if (lang_block.provider.dylib_path.length == 0) {
+Bool ensure_loaded(
+    store_api.CompilerStore& compiler_store,
+    registry.LangDependency& dependency,
+    store.PackageRecord& provider
+) {
+    guard provider.lang_info_ref() is .some(lang_info) else {
         return false;
     }
-    guard dylib.open(lang_block.provider.dylib_path) is .some(opened) else {
+    if (dependency.loaded()) {
+        return true;
+    }
+    UInt8[]& dylib_path = compiler_store.symbols.text(lang_info.dylib_path);
+    if (dylib_path.length == 0) {
+        return false;
+    }
+    guard dylib.open(dylib_path) is .some(opened) else {
         return false;
     }
 
     dylib.Library! library = opened$.move();
     UInt8* create_pointer = library.symbol(abi.create_symbol());
-    UInt8* scan_pointer = library.symbol(abi.scan_symbol());
-    UInt8* parse_pointer = library.symbol(abi.parse_symbol());
-    UInt8* destroy_pointer = library.symbol(abi.destroy_symbol());
-    if (create_pointer == null
-        || scan_pointer == null
-        || parse_pointer == null
-        || destroy_pointer == null) {
+    if (create_pointer == null) {
         library.close();
         return false;
     }
-    lang_block.provider.dylib_handle = library.handle;
-    lang_block.provider.create_pointer = create_pointer;
-    lang_block.provider.scan_pointer = scan_pointer;
-    lang_block.provider.parse_pointer = parse_pointer;
-    lang_block.provider.destroy_pointer = destroy_pointer;
+    dependency.dylib_handle = library.handle;
+    dependency.create_pointer = create_pointer;
     library.owns = false;
     return true;
 }
 
-CallStatus ensure_provider_instance(block.LangBlock& lang_block) {
-    if (lang_block.provider.has_provider_instance()) {
+CallStatus ensure_provider_instance(
+    registry.LangDependency& dependency,
+    block.LangBlock& lang_block
+) {
+    if (lang_block.has_provider_instance()) {
         return .ok;
     }
 
-    lang_block.provider.provider_bits = call_create_entry(lang_block.provider.create_pointer);
-    lang_block.provider.provider_instance_created = true;
+    if (dependency.create_pointer == null) {
+        return .invalid_request;
+    }
+    lang_block.set_provider(call_create_entry(dependency.create_pointer));
     return .ok;
 }
 
-handle.ProviderBits call_create_entry(UInt8* entry_pointer) {
-    Fn<handle.ProviderBits> entry = entry_pointer$.as(Fn<handle.ProviderBits>);
+std.jiang.syntax.Provider.Any^ call_create_entry(UInt8* entry_pointer) {
+    Fn<std.jiang.syntax.Provider.Any^> entry = entry_pointer$.as(Fn<std.jiang.syntax.Provider.Any^>);
     return entry();
-}
-
-std.jiang.syntax.ScanResult call_scan_entry(
-    UInt8* entry_pointer,
-    handle.ProviderBits provider,
-    std.jiang.syntax.Input input,
-    std.jiang.syntax.Builder.Any& builder
-) {
-    Fn<
-        std.jiang.syntax.ScanResult,
-        handle.ProviderBits,
-        std.jiang.syntax.Input,
-        std.jiang.syntax.Builder.Any&
-    > entry = entry_pointer$.as(Fn<
-        std.jiang.syntax.ScanResult,
-        handle.ProviderBits,
-        std.jiang.syntax.Input,
-        std.jiang.syntax.Builder.Any&
-    >);
-    return entry(provider, input, builder);
-}
-
-std.jiang.syntax.NodeId call_parse_entry(
-    UInt8* entry_pointer,
-    handle.ProviderBits provider,
-    std.jiang.syntax.Input input,
-    std.jiang.syntax.Builder.Any& builder
-) {
-    Fn<
-        std.jiang.syntax.NodeId,
-        handle.ProviderBits,
-        std.jiang.syntax.Input,
-        std.jiang.syntax.Builder.Any&
-    > entry = entry_pointer$.as(Fn<
-        std.jiang.syntax.NodeId,
-        handle.ProviderBits,
-        std.jiang.syntax.Input,
-        std.jiang.syntax.Builder.Any&
-    >);
-    return entry(provider, input, builder);
 }
