@@ -101,6 +101,7 @@ emit_compiler_with_compiler() {
 collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
+clear_bootstrap_artifact_cache
 emit_next_from_bootstrap "$NEXT_BIN"
 clear_bootstrap_artifact_cache
 

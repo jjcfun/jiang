@@ -3295,6 +3295,9 @@ struct BodyLowerer: Movable {
     () lower_equal_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
         token.Span span = self.lowerer.hir_span(node_id);
         qid.TypeId compare_type = self.receiver_expr_type(binary.left);
+        if (self.lower_null_handle_equal_binary(binary, compare_type, destination, span)) {
+            return;
+        }
         if (self.lower_trait_equal_binary(node_id, binary, compare_type, destination, span)) {
             return;
         }
@@ -3308,6 +3311,89 @@ struct BodyLowerer: Movable {
         mir.MirPlace lhs = self.lower_equality_operand(binary.left, compare_type, span);
         mir.MirPlace rhs = self.lower_equality_operand(binary.right, compare_type, span);
         self.lower_equal_places(compare_type, lhs, rhs, destination, binary.op == .not_equal, span);
+    }
+
+    Bool lower_null_handle_equal_binary(
+        hir.HirBinary binary,
+        qid.TypeId compare_type,
+        mir.MirPlace destination,
+        token.Span span
+    ) {
+        if (self.is_null_literal(binary.right)) {
+            return self.lower_null_handle_compare(binary.left, compare_type, destination, binary.op == .not_equal, span);
+        }
+        if (self.is_null_literal(binary.left)) {
+            qid.TypeId right_type = self.receiver_expr_type(binary.right);
+            return self.lower_null_handle_compare(binary.right, right_type, destination, binary.op == .not_equal, span);
+        }
+        return false;
+    }
+
+    Bool lower_null_handle_compare(
+        hir.HirId value_id,
+        qid.TypeId handle_type,
+        mir.MirPlace destination,
+        Bool not_equal,
+        token.Span span
+    ) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(handle_type);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (!self.handle_can_compare_null(handle)) {
+            return false;
+        }
+        mir.MirPlace handle_place = self.null_compare_handle_place(value_id, handle_type, span);
+        mir.MirPlace compare_place = self.null_compare_payload_place(handle_place, handle_type);
+        qid.TypeId compare_type = self.mir_place_type(compare_place);
+        mir.MirBinaryOp! op = mir.MirBinaryOp.eq;
+        if (not_equal) {
+            op = mir.MirBinaryOp.ne;
+        }
+        self.push_assign(
+            destination,
+            mir.binary_rvalue(mir.MirBinaryRvalue (
+                op: op,
+                lhs: mir.copy_operand_value(mir.MirCopyOperand (place: compare_place)),
+                rhs: self.null_operand(compare_type, span)
+            )),
+            span
+        );
+        return true;
+    }
+
+    Bool handle_can_compare_null(types.HandleType handle) {
+        if (handle.kind == .raw_pointer) { return true; }
+        return handle.kind == .many_pointer;
+    }
+
+    mir.MirPlace null_compare_handle_place(hir.HirId value_id, qid.TypeId handle_type, token.Span span) {
+        if (self.place_for_expr(value_id) is .some(place)) {
+            return place;
+        }
+        mir.MirLocalId local = self.add_temp(handle_type, span);
+        mir.MirPlace place = self.place_for_local(local);
+        self.lower_into_place(value_id, place);
+        return place;
+    }
+
+    mir.MirPlace null_compare_payload_place(mir.MirPlace handle_place, qid.TypeId handle_type) {
+        if (self.layout_for_type(handle_type).fields.length > 0) {
+            return self.project_constant_index(handle_place, 0);
+        }
+        return handle_place;
+    }
+
+    mir.MirOperand null_operand(qid.TypeId type_id, token.Span span) {
+        return mir.const_operand_value(mir.MirConst (
+            type_id: type_id,
+            span: span,
+            value: mir.null_const_kind(mir.MirNullConst (typed_null: true))
+        ));
+    }
+
+    Bool is_null_literal(hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        guard node.data is .literal(literal) else { return false; }
+        return literal.value is .null_value;
     }
 
     () lower_scalar_equal_binary(hir.HirId node_id, hir.HirBinary binary, mir.MirPlace destination) {
@@ -4636,6 +4722,8 @@ struct BodyLowerer: Movable {
         locals.add(self.receiver_drop_local(2, .compiler_temp, subject_pointer, span));
 
         drop_semantics.DropQuery query = drop_semantics.DropQuery(self.lowerer.ctx);
+        Bool needs_runtime_drop = query.type_needs_runtime_drop(subject_type);
+        Bool needs_free = self.receiver_type_needs_free(subject_type);
         mir.MirPlace pointer_place = mir.local_place(
             mir.MirLocalId.from_index(2),
             self.lowerer.output.empty_projection()
@@ -4646,20 +4734,24 @@ struct BodyLowerer: Movable {
             mir.MirLocalId.from_index(2),
             self.lowerer.output.projection_array(deref_projection$.ref())
         );
-        list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(1);
-        if (query.type_needs_runtime_drop(subject_type)) {
-            statements.add(self.receiver_drop_pointer_assign(pointer_place, subject_pointer, span));
+        list.ArrayList<mir.MirStatement>! entry_statements = list.ArrayList<mir.MirStatement>(1);
+        if (needs_runtime_drop) {
+            entry_statements.add(self.receiver_drop_pointer_assign(pointer_place, subject_pointer, span));
+        }
+        list.ArrayList<mir.MirStatement>! return_statements = list.ArrayList<mir.MirStatement>(1);
+        if (needs_free) {
+            return_statements.add(self.receiver_drop_free_statement(span));
         }
         list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(2);
-        if (query.type_needs_runtime_drop(subject_type)) {
-            blocks.add(self.receiver_drop_block(pointee, statements$.ref(), span));
+        if (needs_runtime_drop) {
+            blocks.add(self.receiver_drop_block(pointee, entry_statements$.ref(), span));
         } else {
-            blocks.add(self.receiver_drop_return_block(statements$.ref(), span));
+            blocks.add(self.receiver_drop_return_block(return_statements$.ref(), span));
         }
         blocks.add(mir.MirBlock(
             id: mir.MirBlockId.from_index(1),
             span: span,
-            statements: self.lowerer.output.empty_statements(),
+            statements: self.lowerer.output.statement_array(return_statements$.ref()),
             terminator: mir.MirTerminator(
                 span: span,
                 kind: mir.return_terminator_kind(mir.MirReturnTerminator(implicit_unit: true))
@@ -4692,6 +4784,12 @@ struct BodyLowerer: Movable {
             span: span,
             body: body
         ));
+    }
+
+    Bool receiver_type_needs_free(qid.TypeId subject_type) {
+        layout.LayoutId layout_id = layout_compute.layout_of_type(self.lowerer.ctx, subject_type);
+        layout.TypeLayout type_layout = self.lowerer.ctx.store.layouts.layout(layout_id);
+        return type_layout.kind != .invalid && type_layout.kind != .zero_sized;
     }
 
     mir.MirBlock receiver_drop_block(
@@ -4751,6 +4849,24 @@ struct BodyLowerer: Movable {
             kind: mir.assign_statement_kind(mir.MirAssignStatement (
                 destination: pointer_place,
                 value: cast_value
+            ))
+        );
+    }
+
+    mir.MirStatement receiver_drop_free_statement(token.Span span) {
+        mir.MirPlace return_place = mir.local_place(
+            mir.MirLocalId.from_index(0),
+            self.lowerer.output.empty_projection()
+        );
+        mir.MirOperand pointer = mir.copy_operand_value(mir.MirCopyOperand (
+            place: self.receiver_drop_param_place()
+        ));
+        mir.MirRvalue free_value = mir.free_rvalue(mir.MirFreeRvalue (pointer: pointer));
+        return mir.MirStatement (
+            span: span,
+            kind: mir.assign_statement_kind(mir.MirAssignStatement (
+                destination: return_place,
+                value: free_value
             ))
         );
     }
