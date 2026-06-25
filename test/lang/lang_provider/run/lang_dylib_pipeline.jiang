@@ -1,15 +1,22 @@
+import abi = "../../../../src/lang/abi.jiang";
+import source_ji = "../../../../src/artifact/source_ji.jiang";
 import context = "../../../../src/context.jiang";
 import diagnostic = "../../../../src/diagnostic/diagnostic.jiang";
 import driver_options = "../../../../src/driver/options.jiang";
 import pipeline = "../../../../src/pipeline.jiang";
+import dylib = "../../../../src/system/dylib.jiang";
 import env = "../../../../src/system/env.jiang";
 import fs = "../../../../src/system/fs.jiang";
+import lang_builder = "../../../../src/lang/dylib_builder.jiang";
+import lang_registry_builder = "../../../../src/lang/registry_builder.jiang";
+import list = "../../../../src/support/list.jiang";
 import path = "../../../../src/support/path.jiang";
 import std;
 
 Int main() {
     UInt8[]& app_dir = "/tmp/jiang_lang_dylib_pipeline_app";
     UInt8[]& lang_dir = "/tmp/jiang_lang_dylib_pipeline_sql";
+    UInt8[]& cache_dir = "build/test-cache/jiang_lang_dylib_pipeline_cache";
     assert(fs.create_dirs(app_dir));
     assert(fs.create_dirs(lang_dir));
     assert(fs.write_all(
@@ -26,12 +33,18 @@ Int main() {
     ));
     assert(fs.write_all(path.join(lang_dir, "lang.jiang"), lang_source()));
 
+    context.CompilerContext! abi_ctx = context.CompilerContext();
+    if (!check_provider_abi(abi_ctx$.ref(), path.join(app_dir, "main.jiang"), cache_dir)) {
+        dump_diagnostics(abi_ctx$.ref());
+        return 1;
+    }
+
     context.CompilerContext! ctx = context.CompilerContext();
     driver_options.CompileOptions options = driver_options.CompileOptions(
         .check_only,
         app_dir,
         "",
-        "build/test-cache/jiang_lang_dylib_pipeline_cache",
+        cache_dir,
         "test-target",
         "testc",
         linker_path(),
@@ -40,9 +53,149 @@ Int main() {
     pipeline.compile(ctx$.ref(), options$.ref());
     if (ctx.store.diagnostics.has_errors()) {
         dump_diagnostics(ctx$.ref());
-        return 1;
+        return 2;
     }
     return 0;
+}
+
+struct TestBuilder: Movable, std.jiang.syntax.Builder {
+    std.Vector<std.jiang.syntax.Node>! nodes;
+
+    std.Vector<std.jiang.syntax.NodeId>! children;
+
+    Int! diagnostic_count;
+
+    Int! last_symbol;
+
+    init() {
+        self.nodes = std.Vector<std.jiang.syntax.Node>();
+        self.children = std.Vector<std.jiang.syntax.NodeId>();
+        self.diagnostic_count = 0;
+        self.last_symbol = 0;
+    }
+
+    std.jiang.syntax.NodeId add_node(std.jiang.syntax.Span span, std.jiang.syntax.Data data) {
+        std.jiang.syntax.NodeId id = std.jiang.syntax.NodeId(self.nodes.length());
+        self.nodes.append(std.jiang.syntax.Node(span, data$.move()));
+        return id;
+    }
+
+    Int mark_children() {
+        return self.children.length();
+    }
+
+    () add_child(std.jiang.syntax.NodeId id) {
+        self.children.append(id);
+    }
+
+    std.jiang.syntax.NodeRange take_children(Int start) {
+        return std.jiang.syntax.NodeRange(start, self.children.length() - start);
+    }
+
+    std.jiang.syntax.SymbolId intern_symbol(UInt8[]& text) {
+        self.last_symbol = text.length;
+        return std.jiang.syntax.SymbolId(text.length);
+    }
+
+    UInt8[]& symbol_text(std.jiang.syntax.SymbolId symbol) {
+        self.last_symbol = symbol.to_index();
+        if (symbol.to_index() == 1) {
+            return "1";
+        }
+        return "";
+    }
+
+    () add_diagnostic(std.jiang.syntax.Diagnostic value) {
+        self.diagnostic_count = self.diagnostic_count + 1;
+    }
+
+    () add_error(std.jiang.syntax.Span span, UInt8[]& code, UInt8[]& message) {
+        self.diagnostic_count = self.diagnostic_count + 1;
+    }
+}
+
+Bool check_provider_abi(context.CompilerContext& ctx, UInt8[]& app_main_path, UInt8[]& cache_dir) {
+    lang_registry_builder.BuildResult! registry = lang_registry_builder.build_for_source_path(
+        ctx,
+        app_main_path,
+        cache_dir,
+        source_ji.artifact_version_hash("testc"),
+        .debug
+    );
+    if (!registry.ok) {
+        return false;
+    }
+
+    list.ArrayList<UInt8[]&>! used_aliases = list.ArrayList<UInt8[]&>();
+    used_aliases.add("sql");
+    if (!lang_builder.ensure_provider_dylibs(
+            ctx,
+            registry.registry$.ref(),
+            used_aliases$.ref(),
+            cache_dir,
+            "testc",
+            linker_path(),
+            .debug
+        )
+    ) {
+        return false;
+    }
+
+    guard registry.registry.find_ref("sql") is .some(dependency) else {
+        return false;
+    }
+    guard ctx.store.resolve.package_ref(dependency.package_id).lang_info_ref() is .some(lang_info) else {
+        return false;
+    }
+    return call_dylib(ctx.store.symbols.text(lang_info.dylib_path));
+}
+
+Bool call_dylib(UInt8[]& dylib_path) {
+    guard dylib.open(dylib_path) is .some(opened) else {
+        return false;
+    }
+    dylib.Library! library = opened$.move();
+    UInt8* create_pointer = library.symbol(abi.create_symbol());
+    if (create_pointer == null) {
+        library.close();
+        return false;
+    }
+
+    Bool ok = check_created_provider(create_pointer);
+    library.close();
+    return ok;
+}
+
+Bool check_created_provider(UInt8* create_pointer) {
+    Fn<std.jiang.syntax.Provider.Any^> create =
+        create_pointer$.as(Fn<std.jiang.syntax.Provider.Any^>);
+    std.jiang.syntax.Provider.Any^ provider = create();
+    std.jiang.syntax.Provider.Any& provider_ref = provider$.ref();
+
+    TestBuilder! builder = TestBuilder();
+    std.jiang.syntax.Builder.Any& builder_ref = std.jiang.syntax.Builder$.ref(builder);
+    std.jiang.syntax.ScanResult scan = provider_ref.scan(make_input(.brace), builder_ref);
+    if (scan.status != .ok) { return false; }
+
+    std.jiang.syntax.NodeId root = provider_ref.parse(make_input(.brace), .expression, builder_ref);
+    if (root.to_index() != 1) { return false; }
+    if (builder.nodes.length() != 2) { return false; }
+    if (builder.children.length() != 1) { return false; }
+    if (builder.last_symbol != 1) { return false; }
+
+    std.jiang.syntax.ScanResult error = provider_ref.scan(make_input(.none), builder_ref);
+    if (error.status != .error) { return false; }
+    return builder.diagnostic_count == 1;
+}
+
+std.jiang.syntax.Input make_input(std.jiang.syntax.Delimiter delimiter) {
+    UInt8[]& text = "#sql { 1 }";
+    return std.jiang.syntax.Input(
+        std.jiang.syntax.Source(std.jiang.syntax.SourceId(21), text),
+        std.jiang.syntax.Span(1, 3),
+        7,
+        delimiter
+    );
 }
 
 UInt8[]& linker_path() {
@@ -57,6 +210,10 @@ UInt8[]& lang_source() {
     text = append_fragment(text, "public struct Lang: std.jiang.syntax.Provider {\n");
     text = append_fragment(text, "    public init() {}\n\n");
     text = append_fragment(text, "    public std.jiang.syntax.ScanResult scan(std.jiang.syntax.Input input, std.jiang.syntax.Builder.Any& builder) {\n");
+    text = append_fragment(text, "        if (input.delimiter == .none) {\n");
+    text = append_fragment(text, "            builder.add_error(input.name_span, \"dylib_scan_error\", \"dylib scan error\");\n");
+    text = append_fragment(text, "            return std.jiang.syntax.ScanResult.error(input.name_span, input.source.span(), input.body_start);\n");
+    text = append_fragment(text, "        }\n");
     text = append_fragment(text, "        std.jiang.syntax.Span span = std.jiang.syntax.Span(input.name_span.start, input.source.length() - input.name_span.start);\n");
     text = append_fragment(text, "        return std.jiang.syntax.ScanResult.ok(span, span, input.source.length());\n");
     text = append_fragment(text, "    }\n\n");
