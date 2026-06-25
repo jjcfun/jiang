@@ -9,21 +9,27 @@ Jiang 编译器围绕稳定的阶段边界组织。本文只保留整体架构�
 driver/cli -> pipeline.compile
                 |
                 v
-        core + package source/AST -> HIR -> type/comptime facts -> MIR -> checked MIR -> backend output
-                                      \           \          \          \
-                                       ----------- layout facts --------
-             \
-              lang provider scan/parse -> public syntax tree -> internal AST
+        source/package -> lang registry -> syntax parse -> module graph/resolve -> HIR
+                              |                 |                 |
+                              v                 v                 v
+                       provider dylib      public syntax       early comptime
+                         prepare           expansion           source select
+
+        HIR -> type facts + const values -> monomorph instances -> MIR -> checked MIR -> backend output
+                 \                    \              \             \          \
+                  --------------------- layout facts --------------------------
 ```
 
 流程中的几个块对应：
 
-- `core + package source/AST`：compiler-known core 源码、package manifest、source、syntax、
-  module graph 和 resolve。
-- `lang provider scan/parse`：`#alias { ... }` 调用 manifest dependency 中的 `type = lang`
+- `source/package`：入口文件或 package manifest 归一化、source 读取和 `SourceId` 建立。
+- `lang registry`：先按入口 source path 构建 provider registry，再按 module graph/package
+  补全 package 级 registry。`#alias { ... }` 调用 manifest dependency 中的 `type = lang`
   provider，provider 返回 public syntax tree，compiler 转换为内部 AST。
 - `HIR`：resolve 直接生成的未类型化语义树。
-- `type/comptime facts`：`TypeCheckStore`、`ComptimeStore` 和 `MonomorphStore`。
+- `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
+  source selection 在 resolve/HIR lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
+- `monomorph instances`：type check 之后收集的 concrete generic instance 集合。
 - `MIR`：HIR lowering 生成的 CFG。
 - `checked MIR`：borrow check 后经过 drop elaboration 的 MIR。
 - `backend output`：LLVM IR、object file 或 executable。
@@ -83,9 +89,11 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：HIR、resolve facts。
   - 禁止：改写 HIR、计算 ABI layout、生成 MIR。
 - `comptime`
-  - 生产：`ComptimeStore` 中的 const value，以及 `comptime {}` 选择出的顶层 item 集合。
-  - 消费：AST/HIR、resolve facts、type facts、target facts。
+  - 生产：早期 source selection 结果，以及 `ComptimeStore` 中的 `DefId -> ComptimeValue`。
+  - 消费：AST、resolve facts、type facts。
   - 禁止：执行运行时副作用、生成 MIR/backend 节点、把 `ComptimeValue` 泄漏到 backend。
+  - 备注：`comptime if` 的 top-level item 选择目前嵌在 resolve/name resolver 和 HIR lowering
+    中，通过 `CompileSelector` 判断条件；`ComptimeStore` 本身只保存 const value。
 - `monomorph`
   - 生产：concrete generic instance 集合。
   - 消费：type facts、HIR generic template。
@@ -124,14 +132,13 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 
 ### CompilerContext 与 CompilerStore
 
-`CompilerContext` 是一次编译请求的运行上下文，保存配置、target、输出层和统一 store。
-它不直接平铺业务事实表。
+`CompilerContext` 是一次编译 session 的运行上下文，目前只保存 target 和统一 store。
+命令行选项、输出模式和 reporter 作为 driver/pipeline 参数或诊断模块职责存在，不挂在
+`CompilerContext` 上。
 
 ```text
 CompilerContext
-  options
   target
-  reporter
   store: CompilerStore
 ```
 
@@ -143,20 +150,17 @@ CompilerStore
   diagnostics
   sources
   source_map
-  asts
   symbols
-  keywords
   defs
-  resolve
-  hirs
   types
   typeck
-  comptime
-  monomorph
+  comptime_store
+  resolve
+  hirs
   layouts
-  mirs
-  borrow_check
   artifacts
+  object_artifacts
+  query_dependencies
   incremental
 ```
 
@@ -180,7 +184,9 @@ CompilerStore
   body-less trait implementation 只声明 builtin type 的 trait 关系，具体 lowering 仍由
   type check / MIR / layout 的 compiler-known facts 承接。
 - `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
-- `MirStore` 保存 MIR function/body；backend 不维护一份等价 MIR。
+- `MonomorphStore`、`MirStore` 和 `BorrowCheckStore` 是单次 pipeline 中的阶段产物，
+  不挂在 `CompilerStore` 上；backend 直接消费 drop elaboration 后的 `MirStore`，
+  不维护一份等价 MIR。
 - `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
 
 ### Pass 规则
@@ -237,8 +243,9 @@ CompilerStore
   详见 [Backend 设计](compiler/backend.md)。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
   [Incremental Compilation 设计](compiler/incremental.md)。
-- `lang` 负责 `type = lang` provider discovery、wrapper dylib 构建、host dylib 加载和
-  syntax-stage provider invocation；详见 [DSL / Lang Package](compiler/dsl.md)。
+- `lang` 负责 `type = lang` provider discovery、入口 source path/package 两级 registry 构建、
+  wrapper dylib 构建、host dylib 加载和 syntax-stage provider invocation；
+  详见 [DSL / Lang Package](compiler/dsl.md)。
 - `artifact` 保存 source/interface/object/package artifact 的 key、fingerprint、path 和物理容器
   适配；package-level 产物通过 `package_fingerprint` 和 `package_artifact` 统一失效规则。
 - `store` 是跨阶段事实集合聚合点；普通阶段通过 store API 查询，
@@ -258,6 +265,8 @@ CompilerStore
 - `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的辅助 store。
 - `HirStore`、`TypeStore`、`TypeCheckStore`、`LayoutStore` 和 `IncrementalSymbolStore`
   都挂在 `CompilerStore`。
+- `SourceArtifactCache`、`ObjectArtifactCache` 和 `QueryDependencyGraph` 也挂在
+  `CompilerStore`，用于 artifact 复用统计、object 复用和 query dependency 记录。
 - `MonomorphStore`、`MirStore`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
   调用中的阶段产物。
 - `syntax.Store` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
@@ -274,16 +283,22 @@ src/
   lang/         lang package registry、wrapper dylib、provider runtime bridge
   artifact/     source .ji、object key、package artifact key/path、fingerprint
   diagnostic/   diagnostic、reporter
+  builtin/      compiler-known builtin type、trait 和 intrinsic 初始化
   core/         compiler-known core 源码入口、builtin trait/type 外壳、intrinsic 声明
   resolve/      symbol store、keyword store、import/module/name resolver
-  sema/         type store、trait、generic、overload、type check、monomorph
+  sema/         type store、trait、generic、overload、type check、comptime、monomorph
+    comptime/   source selection、const value evaluator/interpreter、ComptimeStore
+    generic/    generic substitution 和实例化辅助
+    type_check/ type check 主体、类型事实和调用/模式/表达式 side table
   hir/          HIR 数据结构和 HIR store
   mir/          MIR 数据结构和 HIR -> MIR lowering
   layout/       concrete type layout 查询层
   borrow_check/ ownership、loan、lifetime 和 drop safety 检查
-  backend/      target 和后端入口
+  backend/      target、output、codegen unit、link plan 和后端入口
+    llvm/       LLVM IR/object emission
   incremental/  cache key、fingerprint、依赖图、symbol store
-  store/        compiler store、cache、id、key
+  store/        compiler store 和 session-local id
+  system/       host/target OS、filesystem、process、dynamic library、target info
   support/      arena、list、hash、unicode 等通用工具
 ```
 
@@ -352,67 +367,33 @@ public trait Indexable {
 
 - `test/smoke/`：编译器内部模块和端到端 smoke，由脚本通过 `JIANGC` 指定被测编译器；
   稳定自举验证使用 `build/jiangc.next` 或 `build/jiangc`。
-- `test/compiler/`：按编译阶段归档的测试目录，当前以 `.gitkeep` 保留结构。
+- `test/compiler/`：按编译器内部阶段归档的测试目录，覆盖 backend、driver、incremental、
+  IR dump/lower、query、resolve、sema 和 syntax 等阶段。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
 - `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。
   目录按语言功能优先组织，每个功能目录内部再按测试结果类型分组；覆盖策略见
   [Language Testing 设计](compiler/lang-testing.md)。
 
-`test/lang` 当前按语言功能组织，每个功能目录内部再按结果类型组织：
+`test/lang` 当前按语言功能组织，每个功能目录内部再按结果类型组织。功能目录会随语言能力增长，
+例如 aggregate、backend、comptime、constant、control_flow、driver、error_handling、
+function、generic、import、lang_package、lang_provider、lifetime、literal、nominal、
+ownership、package、process、runtime、syntax、system、token 和 type 等。不要在架构文档里
+维护完整目录镜像；新增语言功能时按实际功能归档，并保证结果类型目录语义一致。
 
 ```text
 test/lang/
-  aggregate/
+  <feature>/
     check/
     fail/
-  control_flow/
-    check/
-    fail/
-  error_handling/
-    check/
-    fail/
-  function/
-    check/
-    fail/
+    emit/
     run/
-  generic/
-    check/
-    fail/
-    run/
-  import/
-    check/
-    fail/
-  package/
-    check/
-    fail/
-    run/
-  lifetime/
-    check/
-  literal/
-    check/
-    fail/
-    run/
-  nominal/
-    check/
-    fail/
-  ownership/
-    check/
-    fail/
-    run/
-  runtime/
-    fail/
-    run/
-  type/
-    check/
-    fail/
-  diagnostic/
 ```
 
 - `check/`：期望 `jiangc --check` 成功。
 - `fail/`：期望 `jiangc --check` 失败，可用 `// expected: diagnostic_code` 精确匹配诊断。
 - `emit/`：期望 `jiangc --emit-llvm` 成功。
 - `run/`：需要生成并运行目标程序的端到端用例，可用 `// expected-exit: N` 匹配退出码。
-- `diagnostic/`：后续用于精确检查多条 diagnostic、span 和消息的用例。
+- `diagnostic/` 或专门 fixture：用于精确检查多条 diagnostic、span 和消息的用例。
 
 运行方式：
 
