@@ -3,8 +3,9 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.2` 分支已经具备自举编译器、core 源码化入口、标准库孵化入口、
-泛型/trait 基础、Lang Package 自定义语法、MIR/backend 和源码级语言测试。本文档描述当前分支希望稳定下来的语言规则；
+当前 `release/0.4.3` 分支继承 0.4.2 已实现的自举编译器、core 源码化入口、
+标准库孵化入口、泛型/trait 基础、Lang Package 自定义语法、MIR/backend 和源码级语言测试。
+本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
 ## 状态标记
@@ -855,7 +856,7 @@ trait Indexable {
 - trait 本身不是普通值类型；动态 trait view 通过 compiler-provided companion type
   表达：`Trait.Any` 和 `Trait.Receiver`。`Trait$.ref(value)` 生成 borrowed dynamic view，
   不移动原值；`Trait$.new(value)` 生成 owning dynamic view，返回 `Trait.Any^`。
-  `Trait.VTable` 是 compiler-private 方法表类型，用户源码不能直接命名或传参。0.4.2 支持
+  `Trait.VTable` 是 compiler-private 方法表类型，用户源码不能直接命名或传参。当前实现支持
   ref receiver method 的动态分派和 owning trait object drop，暂不支持 `@self(move)` trait
   object dispatch。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get() -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
@@ -1201,7 +1202,7 @@ comptime {
 
 ## 自定义语法补充规则
 
-0.4.2 的自定义语法固定为 syntax-stage lang package 机制，入口见本文前面的
+当前自定义语法固定为 syntax-stage lang package 机制，入口见本文前面的
 “Lang Package / 自定义语法”章节。
 
 补充原则：

@@ -390,7 +390,7 @@ session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/obj
 
 ## 当前实现边界
 
-当前 0.4.2 实现已经具备这些内存和 artifact 结构：
+当前实现已经具备这些内存和 artifact 结构：
 
 - `SourceArtifactCache`：保存 `ImportSummary`、`ModuleInterface` 和 `GenericTemplate`。
 - `JiFileImage`：提供 `.ji` header / section table / read_at 的最小 API。

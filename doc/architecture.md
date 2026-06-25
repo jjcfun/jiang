@@ -30,7 +30,7 @@ driver/cli -> pipeline.compile
 - `layout facts`：由 HIR、type facts 和 target layout 按需查询得到，供 MIR、borrow/drop 和
   backend 使用。
 
-0.4.2 的 root module 加载前会先加载 `src/core/core.jiang`。core 源码声明 compiler-known
+当前 root module 加载前会先加载 `src/core/core.jiang`。core 源码声明 compiler-known
 trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`
 intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。
 

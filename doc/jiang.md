@@ -1,5 +1,11 @@
 # Jiang语言指南
 
+> **过时文档，不再维护。**
+>
+> 这个单文件指南保留为历史参考和官网内容迁移来源。新的用户文档入口是
+> [jiang-lang.org](https://jiang-lang.org/)。仓库内仍维护 `grammar.md`、
+> `language-design.md`、`std.md` 和 `compiler/` 下的开发文档。
+
 > Jiang语言的目标是成为系统编程语言的“银弹”。`All in one`是Jiang语言的核心思想。
 
 
@@ -1858,7 +1864,7 @@ Fn<Int, Value.Receiver> value_fn = any.value;
 Int c = value_fn(receiver);
 ```
 
-0.4.2 支持 borrowed trait object `Trait$.ref(value)` 和 owning trait object `Trait$.new(value)`。
+当前实现支持 borrowed trait object `Trait$.ref(value)` 和 owning trait object `Trait$.new(value)`。
 `Trait$.new(value)` 会为 receiver 创建 owning storage，并在 `Trait.Any^` drop 时通过
 receiver type info 触发 receiver drop。`@self(move)` trait object dispatch 暂不支持；如果 trait
 中存在 move receiver requirement，构造 `Trait.Any` / `Trait.Receiver` 会编译失败。
@@ -2213,7 +2219,7 @@ lexer/
 [package]
 name = frontend
 root = src/main.jiang
-version = 0.4.2
+version = 0.4.3
 ```
 
 当前第一版 package 机制还支持本地依赖：
