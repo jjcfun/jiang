@@ -19,7 +19,7 @@ import std;
 - `fs`：文件读写和路径相关能力，当前主要 re-export `system/fs.jiang`。
 - `io`：标准输入输出能力，当前主要 re-export `system/io.jiang`。
 - `process`：进程参数、环境变量和可执行文件查找，当前主要 re-export `system/process.jiang`。
-- `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`many_pointer()` 和 `into_array()`。
+- `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`many_pointer()` 和 `into_slice()`。
   `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；字段 `length` 和方法 `length()` 都表示
   已初始化元素数量，不包含 `capacity`。`capacity` 只表示 `Vector` 自己管理的 spare capacity，
   不属于 `Contiguous` 语义。

@@ -566,7 +566,7 @@ Buffer^ b = a$.move();
 `T[]&` / `Reference<Slice<T>>` 才是借用的 slice view，运行时 layout 类似 `{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 slice view 的使用范围。
 `T[]^` / `Box<Slice<T>>` 是 owned unsized array，拥有已初始化的 buffer，drop 时会按元素类型逐个析构并释放底层 allocation。
 `SentinelSlice<T, S>`（后缀写法 `T[:S]`）同样是 unsized array type；`T[:S]&` 是带 sentinel 保证的 borrowed view。
-标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_array()` 会消耗 `Vector`，
+标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_slice()` 会消耗 `Vector`，
 把已初始化区间交给返回的 `T[]^` 拥有，调用后原 `Vector` 失效。
 
 ```c
