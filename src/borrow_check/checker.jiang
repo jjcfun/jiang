@@ -25,6 +25,8 @@ import location = "./location.jiang";
 import move_path = "./move_path.jiang";
 import borrow_store = "./store.jiang";
 import carry = "./carry.jiang";
+import loan_facts = "./loan_facts.jiang";
+import return_lifetime = "./return_lifetime.jiang";
 
 public struct PackageBorrowChecker {
     public context.CompilerContext& ctx;
@@ -65,23 +67,13 @@ public struct PackageBorrowChecker {
 
 struct BorrowDataflowState: Movable {
     public table.HashTable<move_path.MovePathId, Bool>! moved;
-    public list.ArrayList<ActiveLoanFact>! active_loans;
+    public loan_facts.ActiveLoanFacts! active_loans;
     public table.HashTable<move_path.MovePathId, Bool>! live_locals;
 
     public init() {
         self.moved = table.HashTable<move_path.MovePathId, Bool>();
-        self.active_loans = list.ArrayList<ActiveLoanFact>();
+        self.active_loans = loan_facts.ActiveLoanFacts();
         self.live_locals = table.HashTable<move_path.MovePathId, Bool>();
-    }
-}
-
-struct ActiveLoanFact {
-    public move_path.MovePathId target;
-    public loan.LoanId loan_id;
-
-    public init(move_path.MovePathId target, loan.LoanId loan_id) {
-        self.target = target;
-        self.loan_id = loan_id;
     }
 }
 
@@ -139,7 +131,7 @@ struct FunctionBorrowChecker: Movable {
     public location.MirLocation! current_location;
     public table.HashTable<BorrowDiagnosticKey, Bool>! reported_diagnostics;
     public table.HashTable<move_path.MovePathId, Bool>! reported_dead_loan_sources;
-    public list.ArrayList<qid.SymbolId>! return_lifetime_sources;
+    public return_lifetime.ReturnLifetimeChecker! return_lifetimes;
 
     public init(
         context.CompilerContext& ctx,
@@ -161,7 +153,7 @@ struct FunctionBorrowChecker: Movable {
         self.current_location = location.MirLocation(function.id, body.entry, .terminator, -1);
         self.reported_diagnostics = table.HashTable<BorrowDiagnosticKey, Bool>();
         self.reported_dead_loan_sources = table.HashTable<move_path.MovePathId, Bool>();
-        self.return_lifetime_sources = list.ArrayList<qid.SymbolId>();
+        self.return_lifetimes = return_lifetime.ReturnLifetimeChecker(ctx, self.function_def);
     }
 
     public () check() {
@@ -383,39 +375,19 @@ struct FunctionBorrowChecker: Movable {
         Bool! changed = false;
         Int! index = 0;
         while (index < source.active_loans.len()) {
-            ActiveLoanFact fact = source.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = source.active_loans.get(index);
             changed = self.merge_active_loan_fact(target, fact) || changed;
             index = index + 1;
         }
         return changed;
     }
 
-    Bool merge_active_loan_fact(BorrowDataflowState& target, ActiveLoanFact fact) {
+    Bool merge_active_loan_fact(BorrowDataflowState& target, loan_facts.ActiveLoanFact fact) {
         return self.add_active_loan_fact(target, fact);
     }
 
-    Bool add_active_loan_fact(BorrowDataflowState& state, ActiveLoanFact fact) {
-        if (self.has_active_loan_fact(state, fact.target, fact.loan_id)) {
-            return false;
-        }
-        state.active_loans.add(fact);
-        return true;
-    }
-
-    Bool has_active_loan_fact(
-        BorrowDataflowState& state,
-        move_path.MovePathId path,
-        loan.LoanId loan_id
-    ) {
-        Int! index = 0;
-        while (index < state.active_loans.len()) {
-            ActiveLoanFact fact = state.active_loans.get(index);
-            if (fact.target == path && fact.loan_id.to_index() == loan_id.to_index()) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
+    Bool add_active_loan_fact(BorrowDataflowState& state, loan_facts.ActiveLoanFact fact) {
+        return state.active_loans.add(fact);
     }
 
     () check_block(mir.MirBlock block) {
@@ -802,7 +774,7 @@ struct FunctionBorrowChecker: Movable {
         Int original_len = self.dataflow.active_loans.len();
         Int! index = 0;
         while (index < original_len) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (self.loan_target_matches_path(fact.target, source_path)) {
                 loan.Loan current = self.results.loans.get(fact.loan_id);
                 self.add_loan_from_paths(current.kind, current.source, destination_path);
@@ -906,7 +878,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () add_active_loan(move_path.MovePathId target, loan.LoanId loan_id) {
-        self.add_active_loan_fact(self.dataflow$.ref(), ActiveLoanFact(target, loan_id));
+        self.add_active_loan_fact(self.dataflow$.ref(), loan_facts.ActiveLoanFact(target, loan_id));
     }
 
     move_path.MovePathId canonical_loan_source(move_path.MovePathId source) {
@@ -984,7 +956,7 @@ struct FunctionBorrowChecker: Movable {
     () check_return_path_escape(move_path.MovePathId path) {
         Int! index = 0;
         while (index < self.dataflow.active_loans.len()) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (self.return_path_contains_target(path, fact.target)) {
                 self.check_return_loan_escape(fact);
             }
@@ -992,15 +964,16 @@ struct FunctionBorrowChecker: Movable {
         }
     }
 
-    () check_return_loan_escape(ActiveLoanFact fact) {
+    () check_return_loan_escape(loan_facts.ActiveLoanFact fact) {
         if (!self.check_loan_valid_for_fact(fact)) {
             return;
         }
-        if (self.return_lifetime_allows_loan(fact.loan_id)) {
+        return_lifetime.ReturnLifetimeStatus status = self.return_lifetime_status(fact.loan_id);
+        if (status == .allowed) {
             return;
         }
         self.results.mark_error();
-        self.add_borrow_escape_diagnostic();
+        self.add_return_lifetime_diagnostic(status);
     }
 
     Bool return_path_contains_target(move_path.MovePathId return_path, move_path.MovePathId target_path) {
@@ -1008,71 +981,20 @@ struct FunctionBorrowChecker: Movable {
         return self.is_descendant_of(target_path, return_path);
     }
 
-    Bool return_lifetime_allows_loan(loan.LoanId loan_id) {
+    return_lifetime.ReturnLifetimeStatus return_lifetime_status(loan.LoanId loan_id) {
         if (self.current_function_is_init()) {
-            return true;
+            return .allowed;
         }
         loan.Loan current = self.results.loans.get(loan_id);
-        guard self.ctx.store.hirs.def(self.function_def) is .some(hir_def) else {
-            return false;
+        guard self.source_root_param_symbol(current.source) is .some(source_symbol) else {
+            return .source_not_allowed;
         }
-        guard self.source_root_param_symbol(current.source) is .some(source_symbol) else { return false; }
-        self.add_return_lifetime_source(source_symbol);
-        // 显式 return lifetime 出现后只允许标注中的来源；否则使用默认规则：
-        // 本函数所有返回引用只能来自同一种输入来源。
-        if (self.hir_has_explicit_return_lifetime(hir_def)) {
-            return self.hir_allows_all_return_lifetime_sources(hir_def);
-        }
-        return self.return_lifetime_sources.len() == 1;
-    }
-
-    Bool add_return_lifetime_source(qid.SymbolId source_symbol) {
-        if (self.has_return_lifetime_source(source_symbol)) {
-            return false;
-        }
-        self.return_lifetime_sources.add(source_symbol);
-        return true;
-    }
-
-    Bool has_return_lifetime_source(qid.SymbolId source_symbol) {
-        Int! index = 0;
-        while (index < self.return_lifetime_sources.len()) {
-            qid.SymbolId existing = self.return_lifetime_sources.get(index);
-            if (existing == source_symbol) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool hir_allows_all_return_lifetime_sources(hir.HirDef& hir_def) {
-        Int! index = 0;
-        while (index < self.return_lifetime_sources.len()) {
-            qid.SymbolId source_symbol = self.return_lifetime_sources.get(index);
-            if (!self.hir_allows_return_lifetime(hir_def, source_symbol)) {
-                return false;
-            }
-            index = index + 1;
-        }
-        return true;
+        return self.return_lifetimes.check_source(source_symbol);
     }
 
     Bool is_return_local_path(move_path.MovePathId path_id) {
         move_path.MovePath path = self.paths.get(path_id);
         return path.local_id.to_index() == self.body.return_local.to_index();
-    }
-
-    Bool hir_has_explicit_return_lifetime(hir.HirDef& hir_def) {
-        Int! index = 0;
-        while (index < hir_def.lifetime_constraints.len()) {
-            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
-            if (constraint.shorter.kind == .return_lifetime) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
     }
 
     qid.SymbolId? source_root_param_symbol(move_path.MovePathId source) {
@@ -1095,32 +1017,6 @@ struct FunctionBorrowChecker: Movable {
         }
         loan.Loan current = self.results.loans.get(loan_id);
         return self.source_root_param_symbol(current.source);
-    }
-
-    Bool hir_allows_return_lifetime(hir.HirDef& hir_def, qid.SymbolId source_symbol) {
-        Int! index = 0;
-        while (index < hir_def.lifetime_constraints.len()) {
-            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
-            if (self.is_return_lifetime_constraint(constraint, source_symbol)) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
-    }
-
-    Bool is_return_lifetime_constraint(hir.HirLifetimeConstraint constraint, qid.SymbolId source_symbol) {
-        if (constraint.shorter.kind != .return_lifetime) {
-            return false;
-        }
-        if (constraint.longer.kind == .self_lifetime) {
-            return self.source_symbol_is_self(source_symbol);
-        }
-        if (constraint.longer.kind != .named_lifetime) { return false; }
-        guard constraint.longer.symbol is .some(longer_symbol) else {
-            return false;
-        }
-        return longer_symbol == source_symbol;
     }
 
     Bool source_symbol_is_self(qid.SymbolId source_symbol) {
@@ -1383,7 +1279,7 @@ struct FunctionBorrowChecker: Movable {
     () check_active_loan_valid(move_path.MovePathId path) {
         Int! index = 0;
         while (index < self.dataflow.active_loans.len()) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (self.loan_target_matches_path(fact.target, path) && self.loan_source_is_dead(fact)) {
                 self.report_dead_source_loan(fact.loan_id);
             }
@@ -1391,7 +1287,7 @@ struct FunctionBorrowChecker: Movable {
         }
     }
 
-    Bool check_loan_valid_for_fact(ActiveLoanFact fact) {
+    Bool check_loan_valid_for_fact(loan_facts.ActiveLoanFact fact) {
         if (!self.loan_source_is_dead(fact)) {
             return true;
         }
@@ -1409,7 +1305,7 @@ struct FunctionBorrowChecker: Movable {
         self.add_borrow_escape_diagnostic();
     }
 
-    Bool loan_source_is_dead(ActiveLoanFact fact) {
+    Bool loan_source_is_dead(loan_facts.ActiveLoanFact fact) {
         loan.Loan current = self.results.loans.get(fact.loan_id);
         if (self.loan_source_is_live(current)) {
             return false;
@@ -1459,6 +1355,46 @@ struct FunctionBorrowChecker: Movable {
         );
     }
 
+    () add_return_lifetime_diagnostic(return_lifetime.ReturnLifetimeStatus status) {
+        if (status == .needs_explicit_lifetime) {
+            self.add_return_lifetime_needs_annotation_diagnostic();
+            return;
+        }
+        if (status == .source_not_allowed) {
+            self.add_return_lifetime_source_not_allowed_diagnostic();
+        }
+    }
+
+    () add_return_lifetime_needs_annotation_diagnostic() {
+        if (!self.record_diagnostic(3)) {
+            return;
+        }
+        self.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("return_lifetime_needs_annotation"),
+                self.current_source_range(),
+                "return lifetime cannot be inferred from multiple sources"
+            )
+        );
+    }
+
+    () add_return_lifetime_source_not_allowed_diagnostic() {
+        if (!self.record_diagnostic(4)) {
+            return;
+        }
+        self.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("return_lifetime_source_not_allowed"),
+                self.current_source_range(),
+                "returned borrow source is not allowed by lifetime annotations"
+            )
+        );
+    }
+
     // MIR 只保存 byte span，不重复保存 source_id。borrow check 诊断用当前
     // 函数 DefId 的 SourceMap 记录补回 source_id，再取当前 statement/terminator span。
     diagnostic.SourceRange current_source_range() {
@@ -1498,7 +1434,7 @@ struct FunctionBorrowChecker: Movable {
     Bool has_active_loan_for_path(move_path.MovePathId path) {
         Int! index = 0;
         while (index < self.dataflow.active_loans.len()) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (self.loan_target_matches_path(fact.target, path)) {
                 return true;
             }
@@ -1520,15 +1456,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     loan.LoanId? first_active_loan_for_exact_path(move_path.MovePathId path) {
-        Int! index = 0;
-        while (index < self.dataflow.active_loans.len()) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
-            if (fact.target == path) {
-                return fact.loan_id;
-            }
-            index = index + 1;
-        }
-        return null;
+        return self.dataflow.active_loans.first_exact(path);
     }
 
     loan.LoanId? first_active_loan_for_ancestor(move_path.MovePathId path) {
@@ -1545,7 +1473,7 @@ struct FunctionBorrowChecker: Movable {
     loan.LoanId? first_active_loan_for_descendant(move_path.MovePathId path) {
         Int! index = 0;
         while (index < self.dataflow.active_loans.len()) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (self.is_descendant_of(fact.target, path)) {
                 return fact.loan_id;
             }
@@ -1621,10 +1549,10 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () remove_active_loan_facts_under(move_path.MovePathId path) {
-        list.ArrayList<ActiveLoanFact>! kept = list.ArrayList<ActiveLoanFact>(self.dataflow.active_loans.len());
+        loan_facts.ActiveLoanFacts! kept = loan_facts.ActiveLoanFacts(self.dataflow.active_loans.len());
         Int! index = 0;
         while (index < self.dataflow.active_loans.len()) {
-            ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (!self.active_loan_target_under_path(fact, path)) {
                 kept.add(fact);
             }
@@ -1633,7 +1561,7 @@ struct FunctionBorrowChecker: Movable {
         self.dataflow.active_loans = kept$.move();
     }
 
-    Bool active_loan_target_under_path(ActiveLoanFact fact, move_path.MovePathId path) {
+    Bool active_loan_target_under_path(loan_facts.ActiveLoanFact fact, move_path.MovePathId path) {
         return self.path_matches_or_contains(path, fact.target);
     }
 
