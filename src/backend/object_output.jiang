@@ -1,0 +1,276 @@
+// backend object 输出和 object artifact 复用。
+
+import context = "../context.jiang";
+import diagnostic_helper = "../diagnostic/helper.jiang";
+import object_artifact = "../artifact/object.jiang";
+import object_hash = "../artifact/object_hash.jiang";
+import object_plan = "../artifact/object_plan.jiang";
+import package_artifact = "../artifact/package_artifact.jiang";
+import source_ji = "../artifact/source_ji.jiang";
+import codegen = "./codegen.jiang";
+import codegen_unit = "./codegen_unit.jiang";
+import driver_options = "../driver/options.jiang";
+import mir = "../mir/mir.jiang";
+import string = "../support/string.jiang";
+import system_fs = "../system/fs.jiang";
+
+public UInt8[]& package_object_path(
+    UInt8[]& artifact_cache_dir,
+    UInt8[]& target_cache_key,
+    UInt8[]& compiler_version,
+    driver_options.CompileMode mode,
+    UInt64 package_hash
+) {
+    package_artifact.PackageArtifactKey! key = package_artifact.PackageArtifactKey(
+        .package_object,
+        package_hash,
+        source_artifact_version_hash(compiler_version),
+        UInt64(0),
+        target_cache_key,
+        mode
+    );
+    return package_artifact.artifact_path_for(artifact_cache_dir, key$.ref(), ".o");
+}
+
+public Bool emit_debug_package_object(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    UInt8[]& output_path,
+    Bool link_libc,
+    UInt8[]& target_triple
+) {
+    codegen.BackendResult emitted = codegen.emit_object(
+        ctx,
+        lowered,
+        output_path,
+        driver_options.CompileMode.debug,
+        link_libc,
+        target_triple
+    );
+    return !emitted.has_errors();
+}
+
+public Bool emit_release_package_object(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    UInt8[]& output_path,
+    Bool link_libc,
+    UInt8[]& target_triple
+) {
+    codegen.BackendResult emitted = codegen.emit_object(
+        ctx,
+        lowered,
+        output_path,
+        driver_options.CompileMode.release,
+        link_libc,
+        target_triple
+    );
+    return !emitted.has_errors();
+}
+
+// 生成单个 object 输出。能复用单个 cache object 时直接复制；多 codegen unit
+// 当前仍回退为整包 object 输出，避免输出路径语义不清。
+public codegen.BackendResult emit_object_with_cache(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    UInt8[]& output_path,
+    UInt8[]& artifact_cache_dir,
+    UInt8[]& llvm_triple,
+    UInt8[]& target_cache_key,
+    UInt8[]& compiler_version,
+    UInt64 package_hash,
+    driver_options.CompileMode mode,
+    Bool link_libc
+) {
+    if (mode == .release) {
+        UInt8[]&! final_path = output_path;
+        if (final_path.length == 0) {
+            final_path = package_object_path(
+                artifact_cache_dir,
+                target_cache_key,
+                compiler_version,
+                driver_options.CompileMode.release,
+                package_hash
+            );
+        }
+        if (emit_release_package_object(ctx, lowered, final_path, link_libc, llvm_triple)) {
+            return codegen.BackendResult(true);
+        }
+        return codegen.BackendResult(false);
+    }
+    codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx, lowered);
+    object_plan.ObjectReusePlan plan = object_plan.build_object_reuse_plan(
+        ctx,
+        lowered,
+        units$.ref(),
+        artifact_cache_dir,
+        target_cache_key,
+        compiler_version,
+        mode
+    );
+    record_object_plan_stats(ctx, plan$.ref());
+    if (plan.len() == 1) {
+        return emit_single_object_unit_with_cache(
+            ctx,
+            lowered,
+            units$.ref(),
+            plan$.ref(),
+            plan.entry_at(0),
+            output_path,
+            mode,
+            link_libc,
+            llvm_triple
+        );
+    }
+    if (!emit_plan_cache_objects(ctx, lowered, units$.ref(), plan$.ref(), mode, link_libc, llvm_triple)) {
+        return codegen.BackendResult(false);
+    }
+    return codegen.emit_object(ctx, lowered, output_path, mode, link_libc, llvm_triple);
+}
+
+// 将 object reuse plan 的命中情况记录到 store，供 smoke 和后续增量诊断使用。
+() record_object_plan_stats(context.CompilerContext& ctx, object_plan.ObjectReusePlan& plan) {
+    Int! index = 0;
+    while (index < plan.len()) {
+        object_plan.ObjectPlanEntry& entry = plan.entry_at(index);
+        if (entry.kind == .unsupported) {
+            ctx.store.object_artifacts.record_unsupported_unit();
+        } else if (entry.kind == .source_object) {
+            ctx.store.object_artifacts.record_source_lookup(entry.lookup_status);
+        } else {
+            ctx.store.object_artifacts.record_monomorph_lookup(entry.lookup_status);
+        }
+        index = index + 1;
+    }
+}
+
+// 按 object plan 补齐所有缺失 cache object。命中的 entry 不触发 backend。
+Bool emit_plan_cache_objects(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectReusePlan& plan,
+    driver_options.CompileMode mode,
+    Bool link_libc,
+    UInt8[]& target_triple
+) {
+    Int! index = 0;
+    while (index < plan.len()) {
+        if (!emit_plan_cache_object(ctx, lowered, units, plan, plan.entry_at(index), mode, link_libc, target_triple)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+// 为一个 codegen unit 生成 cache object，并在成功后登记实际文件 hash。
+Bool emit_plan_cache_object(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectReusePlan& plan,
+    object_plan.ObjectPlanEntry& entry,
+    driver_options.CompileMode mode,
+    Bool link_libc,
+    UInt8[]& target_triple
+) {
+    if (entry.kind == .unsupported || entry.can_reuse()) {
+        return true;
+    }
+    UInt8[]& cache_path = plan.path_at(entry.path_index);
+    codegen.BackendResult emitted = codegen.emit_object_for_unit(
+        ctx,
+        lowered,
+        units.unit_at(entry.unit_index),
+        cache_path,
+        mode,
+        link_libc,
+        target_triple
+    );
+    if (emitted.has_errors()) {
+        return false;
+    }
+    record_emitted_object(ctx, plan, entry);
+    return true;
+}
+
+// 单 codegen unit 的 object 输出路径可以直接使用 cache artifact。这个路径同时覆盖
+// `--emit-obj` 未指定 `-o` 时的默认输出行为。
+codegen.BackendResult emit_single_object_unit_with_cache(
+    context.CompilerContext& ctx,
+    mir.MirStore& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    object_plan.ObjectReusePlan& plan,
+    object_plan.ObjectPlanEntry& entry,
+    UInt8[]& output_path,
+    driver_options.CompileMode mode,
+    Bool link_libc,
+    UInt8[]& target_triple
+) {
+    if (entry.kind == .unsupported) {
+        return codegen.emit_object(ctx, lowered, output_path, mode, link_libc, target_triple);
+    }
+
+    UInt8[]& cache_path = plan.path_at(entry.path_index);
+    UInt8[]& final_path = final_object_path(output_path, cache_path);
+    if (entry.can_reuse()) {
+        return codegen.BackendResult(copy_cached_object(ctx, cache_path, final_path));
+    }
+
+    if (!emit_plan_cache_object(ctx, lowered, units, plan, entry, mode, link_libc, target_triple)) {
+        return codegen.BackendResult(false);
+    }
+    return codegen.BackendResult(copy_cached_object(ctx, cache_path, final_path));
+}
+
+// 没有显式 output path 时，cache path 就是最终 object path。
+@life(output_path > return, cache_path > return)
+UInt8[]& final_object_path(UInt8[]& output_path, UInt8[]& cache_path) {
+    if (output_path.length == 0) {
+        return cache_path;
+    }
+    return output_path;
+}
+
+// 将 cache object 复制到用户指定输出路径。源和目标相同时直接视为成功。
+Bool copy_cached_object(context.CompilerContext& ctx, UInt8[]& cache_path, UInt8[]& output_path) {
+    if (string.equal(cache_path, output_path)) {
+        return true;
+    }
+    if (system_fs.copy_file(cache_path, output_path)) {
+        return true;
+    }
+    diagnostic_helper.add_package_error(ctx, "failed to copy cached object file", "cached_object_copy_failed");
+    return false;
+}
+
+// 记录刚生成的 object artifact。source object 和 monomorph object 使用不同 key，
+// 但都只保存文件 hash 和路径，不保存 backend 内存对象。
+() record_emitted_object(
+    context.CompilerContext& ctx,
+    object_plan.ObjectReusePlan& plan,
+    object_plan.ObjectPlanEntry& entry
+) {
+    UInt8[]& cache_path = plan.path_at(entry.path_index);
+    guard object_hash.hash_file(cache_path) is .some(emitted_hash) else {
+        return;
+    }
+    if (entry.kind == .source_object && entry.source_key_index >= 0) {
+        ctx.store.object_artifacts.store_source_object(
+            plan.source_key_at(entry.source_key_index),
+            object_artifact.ObjectArtifactRecord(.source_object, emitted_hash, cache_path)
+        );
+        return;
+    }
+    if (entry.kind == .monomorph_object && entry.monomorph_key_index >= 0) {
+        ctx.store.object_artifacts.store_monomorph_object(
+            plan.monomorph_key_at(entry.monomorph_key_index),
+            object_artifact.ObjectArtifactRecord(.monomorph_object, emitted_hash, cache_path)
+        );
+    }
+}
+
+UInt64 source_artifact_version_hash(UInt8[]& compiler_version) {
+    return source_ji.artifact_version_hash(compiler_version);
+}
