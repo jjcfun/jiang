@@ -55,8 +55,8 @@ rm -rf "$PACKAGE_DIR" "$PACKAGE_ZIP"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/script"
 
 cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiangc"
-cp "$ROOT_DIR/script/install_llvm_macos.sh" "$PACKAGE_DIR/script/install_llvm_macos.sh"
-chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/script/install_llvm_macos.sh"
+cp "$ROOT_DIR/script/install_llvm.sh" "$PACKAGE_DIR/script/install_llvm.sh"
+chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/script/install_llvm.sh"
 
 cat >"$PACKAGE_DIR/install.sh" <<'INSTALL_SH'
 #!/usr/bin/env bash
@@ -81,7 +81,7 @@ if [ -z "$llvm_dylib" ] || [ ! -f "$llvm_dylib" ]; then
     echo "Expected dylib: $llvm_dylib" >&2
   fi
   echo "Install it with:" >&2
-  echo "  bash \"$ROOT_DIR/script/install_llvm_macos.sh\"" >&2
+  echo "  bash \"$ROOT_DIR/script/install_llvm.sh\"" >&2
   exit 2
 fi
 
@@ -113,7 +113,7 @@ This package depends on macOS arm64 LLVM 21 at runtime.
 Install LLVM first:
 
 \`\`\`bash
-bash ./script/install_llvm_macos.sh
+bash ./script/install_llvm.sh
 \`\`\`
 
 Then install Jiang:

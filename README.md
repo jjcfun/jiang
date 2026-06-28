@@ -21,7 +21,7 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 `llvm-config-21`、Homebrew `llvm@21` 和 Linux 常见 `/usr/lib/llvm-21` 等路径。
 
 ```bash
-bash ./script/install_llvm_macos.sh
+bash ./script/install_llvm.sh
 ```
 
 构建当前源码默认依赖安装到本地环境的 0.4.2 release 编译器：
