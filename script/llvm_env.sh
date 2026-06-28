@@ -64,6 +64,28 @@ jiang_host_tag() {
   printf '%s-%s\n' "$os" "$arch"
 }
 
+jiang_host_target_triple() {
+  local os
+  local arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "$os:$arch" in
+    Darwin:arm64|Darwin:aarch64)
+      printf '%s\n' "arm64-apple-macosx"
+      ;;
+    Linux:x86_64|Linux:amd64)
+      printf '%s\n' "x86_64-unknown-linux-gnu"
+      ;;
+    Linux:aarch64|Linux:arm64)
+      printf '%s\n' "aarch64-unknown-linux-gnu"
+      ;;
+    *)
+      echo "unsupported host target: $os $arch" >&2
+      return 2
+      ;;
+  esac
+}
+
 jiang_managed_llvm_config() {
   local host
   host="$(jiang_host_tag)"
@@ -138,6 +160,8 @@ jiang_resolve_llvm_env() {
   fi
 
   export JIANG_LLVM_VERSION LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR
+  JIANG_HOST_TARGET="${JIANG_HOST_TARGET:-$(jiang_host_target_triple)}"
+  export JIANG_HOST_TARGET
   jiang_write_llvm_env_file
 }
 

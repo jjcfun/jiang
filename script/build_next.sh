@@ -10,7 +10,7 @@ BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
 OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
-BOOTSTRAP_RELEASE_VERSION="0.4.2"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.2}"
 DEFAULT_BOOTSTRAP_BIN="$HOME/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 
 source "$ROOT_DIR/script/llvm_env.sh"
@@ -84,7 +84,7 @@ clear_bootstrap_artifact_cache() {
 emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
-  "$BOOTSTRAP_BIN" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
+  "$BOOTSTRAP_BIN" --target "$JIANG_HOST_TARGET" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
   test -x "$output_bin"
   printf 'OK %s\n' "$output_bin"
 }
@@ -94,7 +94,7 @@ emit_compiler_with_compiler() {
   local output_bin="$2"
   test -x "$source_bin"
   printf '== build next: compile executable with %s ==\n' "$source_bin"
-  "$source_bin" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
+  "$source_bin" --target "$JIANG_HOST_TARGET" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
   test -x "$output_bin"
   printf 'OK %s\n' "$output_bin"
 }
