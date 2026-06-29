@@ -1,0 +1,406 @@
+// Builtin `#asm { ... }` / `#jiang.asm { ... }` language provider.
+//
+// 第一阶段只负责把内置 DSL 转成 public syntax tree 的 InlineAsmExpression。
+// HIR/MIR/backend 语义检查和真正 codegen 后续阶段接入。
+
+import std;
+import list = "../support/list.jiang";
+import string = "../support/string.jiang";
+
+public struct Provider: Movable, std.jiang.syntax.Provider {
+    std.jiang.syntax.Span! body_span;
+    std.jiang.syntax.Range! tokens;
+    Bool! scan_terminated;
+
+    public init() {
+        self.body_span = std.jiang.syntax.Span();
+        self.tokens = std.jiang.syntax.Range();
+        self.scan_terminated = false;
+    }
+
+    public std.jiang.syntax.ScanResult scan(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Builder.Any& builder
+    ) {
+        if (input.delimiter != .brace) {
+            builder.add_error(
+                input.name_span,
+                "inline_asm_requires_brace_delimiter",
+                "inline_asm_requires_brace_delimiter"
+            );
+            return std.jiang.syntax.ScanResult.error(input.name_span);
+        }
+        Int token_start = builder.mark_tokens();
+        self.scan_terminated = false;
+        self.body_span = self.scan_invocation_tokens(input, builder);
+        self.tokens = builder.take_tokens(token_start);
+        if (!self.scan_terminated) {
+            builder.add_error(input.name_span, "inline_asm_unterminated_block", "inline_asm_unterminated_block");
+            return std.jiang.syntax.ScanResult.error(self.body_span);
+        }
+        return std.jiang.syntax.ScanResult.ok(self.body_span);
+    }
+
+    std.jiang.syntax.Span scan_invocation_tokens(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Builder.Any& builder
+    ) {
+        std.jiang.Tokenizer! tokenizer = std.jiang.Tokenizer(input.source, input.source.span());
+        tokenizer.set_position(input.body_start);
+        Int! depth = 0;
+        while (true) {
+            std.jiang.Token tok = tokenizer.next(builder);
+            builder.add_token(tok);
+            if (std.jiang.token_kind_is(tok.kind, .eof)) {
+                return std.jiang.syntax.Span(input.body_start, tokenizer.position() - input.body_start);
+            }
+            if (std.jiang.token_kind_is(tok.kind, .left_brace)) {
+                depth = depth + 1;
+            } else if (std.jiang.token_kind_is(tok.kind, .right_brace)) {
+                depth = depth - 1;
+                if (depth == 0) {
+                    self.scan_terminated = true;
+                    return std.jiang.syntax.Span(input.body_start, tok.span.end() - input.body_start);
+                }
+            }
+        }
+        return std.jiang.syntax.Span(input.body_start, 0);
+    }
+
+    public std.jiang.syntax.NodeId parse(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Root.Kind entry_kind,
+        std.jiang.syntax.Builder.Any& builder
+    ) {
+        if (entry_kind != std.jiang.syntax.Root.Kind.expression && entry_kind != std.jiang.syntax.Root.Kind.statement) {
+            builder.add_error(
+                input.name_span,
+                "inline_asm_requires_expression_or_statement_context",
+                "inline_asm_requires_expression_or_statement_context"
+            );
+            return self.empty_root(input, entry_kind, builder);
+        }
+        Parser! parser = Parser(input, builder, self.body_span, self.tokens);
+        return parser.parse(entry_kind);
+    }
+
+    std.jiang.syntax.NodeId empty_root(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Root.Kind entry_kind,
+        std.jiang.syntax.Builder.Any& builder
+    ) {
+        Int children_start = builder.mark_children();
+        std.jiang.syntax.Range children = builder.take_children(children_start);
+        return builder.add_node(input.name_span, .root(std.jiang.syntax.Root(entry_kind, children)));
+    }
+}
+
+struct Parser: Movable {
+    std.jiang.syntax.Input input;
+    std.jiang.syntax.Builder.Any& builder;
+    std.jiang.syntax.Range tokens;
+    Int! token_index;
+    std.jiang.Token! current;
+    std.jiang.syntax.Span body_span;
+    std.jiang.syntax.NodeId! result_type;
+    std.jiang.syntax.SymbolId! code_symbol;
+    Bool! has_result_type;
+    Bool! has_code;
+    Bool! volatile_flag;
+    Bool! memory_flag;
+    Bool! noreturn_flag;
+    list.ArrayList<std.jiang.syntax.NodeId>! operands;
+    list.ArrayList<std.jiang.syntax.NodeId>! clobbers;
+
+    init(
+        std.jiang.syntax.Input input,
+        std.jiang.syntax.Builder.Any& builder,
+        std.jiang.syntax.Span body_span,
+        std.jiang.syntax.Range tokens
+    ) {
+        self.input = input;
+        self.builder = builder;
+        self.tokens = tokens;
+        self.token_index = tokens.start;
+        self.current = std.jiang.Token.missing(.eof, body_span);
+        self.body_span = body_span;
+        self.result_type = std.jiang.syntax.NodeId(0);
+        self.code_symbol = std.jiang.syntax.SymbolId(0);
+        self.has_result_type = false;
+        self.has_code = false;
+        self.volatile_flag = false;
+        self.memory_flag = false;
+        self.noreturn_flag = false;
+        self.operands = list.ArrayList<std.jiang.syntax.NodeId>();
+        self.clobbers = list.ArrayList<std.jiang.syntax.NodeId>();
+    }
+
+    std.jiang.syntax.NodeId parse(std.jiang.syntax.Root.Kind entry_kind) {
+        self.advance();
+        self.expect(.left_brace, "inline_asm_expected_left_brace");
+        while (!self.check(.eof)) {
+            if (self.check(.right_brace)) { break; }
+            self.parse_item();
+        }
+        self.expect(.right_brace, "inline_asm_expected_right_brace");
+        std.jiang.syntax.Range operands = self.node_range(self.operands$.ref());
+        std.jiang.syntax.Range clobbers = self.node_range(self.clobbers$.ref());
+        std.jiang.syntax.NodeId expr = self.build_inline_asm(operands, clobbers);
+        Int children_start = self.builder.mark_children();
+        self.builder.add_child(expr);
+        std.jiang.syntax.Range children = self.builder.take_children(children_start);
+        return self.builder.add_node(self.body_span, .root(std.jiang.syntax.Root(entry_kind, children)));
+    }
+
+    std.jiang.syntax.Range node_range(list.ArrayList<std.jiang.syntax.NodeId>& nodes) {
+        Int start = self.builder.mark_children();
+        Int! index = 0;
+        while (index < nodes.len()) {
+            self.builder.add_child(nodes.get(index));
+            index = index + 1;
+        }
+        return self.builder.take_children(start);
+    }
+
+    () parse_item() {
+        if (self.match_word("result")) {
+            self.parse_result();
+            return;
+        }
+        if (self.match_word("code")) {
+            self.parse_code();
+            return;
+        }
+        if (self.match_word("in")) {
+            self.parse_input();
+            return;
+        }
+        if (self.match_word("out")) {
+            self.parse_output();
+            return;
+        }
+        if (self.match_word("clobber")) {
+            self.parse_clobber();
+            return;
+        }
+        if (self.match_flag("volatile")) { self.volatile_flag = true; return; }
+        if (self.match_flag("memory")) { self.memory_flag = true; return; }
+        if (self.match_flag("noreturn")) { self.noreturn_flag = true; return; }
+        self.error_current("inline_asm_expected_item");
+        self.synchronize();
+    }
+
+    () parse_result() {
+        self.result_type = self.parse_type_reference();
+        self.has_result_type = true;
+        self.expect_semicolon();
+    }
+
+    () parse_code() {
+        if (!self.check(.string_lit)) {
+            self.error_current("inline_asm_expected_code_string");
+            self.synchronize();
+            return;
+        }
+        guard self.current.symbol_id() is .some(symbol) else {
+            self.error_current("inline_asm_expected_code_string");
+            self.advance();
+            return;
+        }
+        self.code_symbol = symbol;
+        self.has_code = true;
+        self.advance();
+        self.expect_semicolon();
+    }
+
+    () parse_input() {
+        std.jiang.syntax.SymbolId register = self.parse_string_symbol("inline_asm_expected_input_register");
+        std.jiang.syntax.NodeId value = self.parse_name_expression();
+        self.expect_semicolon();
+        std.jiang.syntax.Name name = std.jiang.syntax.Name(register);
+        std.jiang.syntax.InlineAsmExpression.Input input = std.jiang.syntax.InlineAsmExpression.Input(
+            name: name,
+            constraint: register,
+            value: value
+        );
+        self.add_operand(.input(input));
+    }
+
+    () parse_output() {
+        std.jiang.syntax.SymbolId register = self.parse_string_symbol("inline_asm_expected_output_register");
+        self.expect_semicolon();
+        std.jiang.syntax.Name name = std.jiang.syntax.Name(register);
+        std.jiang.syntax.InlineAsmExpression.Output output = std.jiang.syntax.InlineAsmExpression.Output(
+            name: name,
+            constraint: register,
+            type_reference: null
+        );
+        self.add_operand(.output(output));
+    }
+
+    () parse_clobber() {
+        std.jiang.syntax.SymbolId register = self.parse_string_symbol("inline_asm_expected_clobber_register");
+        self.expect_semicolon();
+        std.jiang.syntax.NodeId node = self.builder.add_node(
+            self.current.span,
+            .inline_asm_clobber(std.jiang.syntax.InlineAsmExpression.Clobber(name: register))
+        );
+        self.clobbers.add(node);
+    }
+
+    Bool match_flag(UInt8[]& name) {
+        if (!self.match_word(name)) { return false; }
+        self.expect_semicolon();
+        return true;
+    }
+
+    () add_operand(std.jiang.syntax.InlineAsmExpression.Operand operand) {
+        std.jiang.syntax.NodeId node = self.builder.add_node(self.current.span, .inline_asm_operand(operand));
+        self.operands.add(node);
+    }
+
+    std.jiang.syntax.NodeId build_inline_asm(
+        std.jiang.syntax.Range operands,
+        std.jiang.syntax.Range clobbers
+    ) {
+        if (!self.has_result_type) {
+            self.result_type = self.unit_type();
+        }
+        if (!self.has_code) {
+            self.code_symbol = self.builder.intern_symbol("");
+            self.error_span(self.body_span, "inline_asm_missing_code");
+        }
+        std.jiang.syntax.InlineAsmExpression.Options options = std.jiang.syntax.InlineAsmExpression.Options(
+            volatile: self.volatile_flag,
+            memory: self.memory_flag,
+            noreturn: self.noreturn_flag
+        );
+        std.jiang.syntax.InlineAsmExpression inline_asm = std.jiang.syntax.InlineAsmExpression(
+            result_type: self.result_type,
+            code: self.code_symbol,
+            operands: operands,
+            clobbers: clobbers,
+            options: options
+        );
+        return self.builder.add_node(self.body_span, .expression(.inline_asm(inline_asm)));
+    }
+
+    std.jiang.syntax.NodeId parse_type_reference() {
+        guard self.current.symbol_id() is .some(symbol) else {
+            self.error_current("inline_asm_expected_type");
+            return self.unit_type();
+        }
+        std.jiang.syntax.NodeId path = self.path_node(symbol, self.current.span);
+        self.advance();
+        return self.builder.add_node(
+            self.current.span,
+            .type_reference(.named(std.jiang.syntax.NamedTypeReference(path: path, arguments: self.empty_range())))
+        );
+    }
+
+    std.jiang.syntax.NodeId parse_name_expression() {
+        guard self.current.symbol_id() is .some(symbol) else {
+            self.error_current("inline_asm_expected_value");
+            return self.unit_expression();
+        }
+        std.jiang.syntax.NodeId result = self.builder.add_node(
+            self.current.span,
+            .expression(.name(std.jiang.syntax.NameExpression(name: std.jiang.syntax.Name(symbol))))
+        );
+        self.advance();
+        return result;
+    }
+
+    std.jiang.syntax.NodeId path_node(std.jiang.syntax.SymbolId symbol, std.jiang.syntax.Span span) {
+        std.jiang.syntax.NodeId segment = self.builder.add_node(
+            span,
+            .path_segment(std.jiang.syntax.PathSegment(
+                name: std.jiang.syntax.Name(symbol),
+                type_arguments: self.empty_range()
+            ))
+        );
+        Int start = self.builder.mark_children();
+        self.builder.add_child(segment);
+        return self.builder.add_node(span, .path(std.jiang.syntax.Path(segments: self.builder.take_children(start))));
+    }
+
+    std.jiang.syntax.NodeId unit_type() {
+        return self.builder.add_node(self.body_span, .type_reference(.unit()));
+    }
+
+    std.jiang.syntax.NodeId unit_expression() {
+        return self.builder.add_node(
+            self.body_span,
+            .expression(.tuple(std.jiang.syntax.TupleExpression(elements: self.empty_range())))
+        );
+    }
+
+    std.jiang.syntax.Range empty_range() {
+        Int start = self.builder.mark_children();
+        return self.builder.take_children(start);
+    }
+
+    std.jiang.syntax.SymbolId parse_string_symbol(UInt8[]& code) {
+        if (!self.check(.string_lit)) {
+            self.error_current(code);
+            return self.builder.intern_symbol("");
+        }
+        guard self.current.symbol_id() is .some(symbol) else {
+            self.error_current(code);
+            self.advance();
+            return self.builder.intern_symbol("");
+        }
+        self.advance();
+        return symbol;
+    }
+
+    Bool match_word(UInt8[]& text) {
+        if (!self.check(.ident)) { return false; }
+        guard self.current.symbol_id() is .some(symbol) else { return false; }
+        if (!string.equal(self.builder.symbol_text(symbol), text)) { return false; }
+        self.advance();
+        return true;
+    }
+
+    Bool check(std.jiang.TokenTag tag) {
+        return std.jiang.token_kind_is(self.current.kind, tag);
+    }
+
+    () advance() {
+        if (self.token_index >= self.tokens.end()) {
+            self.current = std.jiang.Token.missing(.eof, self.body_span);
+            return;
+        }
+        self.current = self.builder.token_at(self.token_index);
+        self.token_index = self.token_index + 1;
+    }
+
+    () expect_semicolon() {
+        self.expect(.semicolon, "inline_asm_expected_semicolon");
+    }
+
+    () expect(std.jiang.TokenTag tag, UInt8[]& code) {
+        if (!self.check(tag)) {
+            self.error_current(code);
+            return;
+        }
+        self.advance();
+    }
+
+    () synchronize() {
+        while (!self.check(.eof) && !self.check(.semicolon)) {
+            self.advance();
+        }
+        if (self.check(.semicolon)) {
+            self.advance();
+        }
+    }
+
+    () error_current(UInt8[]& code) {
+        self.error_span(self.current.span, code);
+    }
+
+    () error_span(std.jiang.syntax.Span span, UInt8[]& code) {
+        self.builder.add_error(span, code, code);
+    }
+}

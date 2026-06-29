@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_self_host"
-BOOTSTRAP_RELEASE_VERSION="0.4.2"
+PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+EXPECTED_COMPILER_VERSION="${EXPECTED_COMPILER_VERSION:-$PACKAGE_VERSION}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -16,15 +17,15 @@ if [ -z "$COMPILER_UNDER_TEST" ]; then
   COMPILER_UNDER_TEST="$(command -v jiangc || true)"
   if [ -z "$COMPILER_UNDER_TEST" ] || [ ! -x "$COMPILER_UNDER_TEST" ]; then
     echo "missing compiler: set JIANGC or put jiangc on PATH" >&2
-    echo "install Jiang $BOOTSTRAP_RELEASE_VERSION release so jiangc is on PATH" >&2
+    echo "install Jiang $EXPECTED_COMPILER_VERSION so jiangc is on PATH" >&2
     exit 2
   fi
   COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
   case "$COMPILER_VERSION" in
-    "jiang $BOOTSTRAP_RELEASE_VERSION") ;;
+    "jiang $EXPECTED_COMPILER_VERSION") ;;
     *)
       echo "unsupported bootstrap compiler: $COMPILER_VERSION" >&2
-      echo "install Jiang $BOOTSTRAP_RELEASE_VERSION release so jiangc is on PATH, or pass JIANGC=<compiler>" >&2
+      echo "install Jiang $EXPECTED_COMPILER_VERSION so jiangc is on PATH, or pass JIANGC=<compiler>" >&2
       exit 2
       ;;
   esac

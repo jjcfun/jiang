@@ -24,14 +24,14 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 bash ./script/install_llvm.sh
 ```
 
-构建当前源码默认依赖安装到本地环境的 0.4.2 release 编译器：
+构建当前源码默认依赖 `bootstrap/0.4.3` 分支产出的过渡编译器。推荐目录结构：
 
-```bash
-dist/jiang-0.4.2-macos-arm64/install.sh
-~/.jiang/versions/0.4.2/bin/jiangc --version
+```text
+../bootstrap-0.4.3/build/jiangc.next
 ```
 
-也可以通过 `BOOTSTRAP_BIN` 显式指定另一个 0.4.2 release 编译器。
+如果没有同级 bootstrap worktree，也可以把 0.4.3 bootstrap 编译器安装到
+`~/.jiang/versions/0.4.3/bin/jiangc`，或通过 `BOOTSTRAP_BIN` 显式指定。
 
 运行当前源码的自举构建：
 
@@ -42,7 +42,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-~/.jiang/versions/0.4.2/bin/jiangc -> build/jiangc.next
+../bootstrap-0.4.3/build/jiangc.next -> build/jiangc.next
 ```
 
 并默认用 `build/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -51,8 +51,8 @@ bash ./script/build_next.sh
 build/jiangc.next
 ```
 
-构建脚本会检测 bootstrap compiler 版本，只接受 0.4.2 release。如只想构建不跑验证，可设置 `VERIFY=none`；
-只跑 smoke 可设置 `VERIFY=smoke`。
+构建脚本会检测 bootstrap compiler 版本，只接受 `jiang 0.4.3`。如只想构建不跑验证，
+可设置 `VERIFY=none`；只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
 `build/jiangc.next --version` 的输出。也可以用 `JIANG_VERSION=...` 临时覆盖。release 阶段需要完整

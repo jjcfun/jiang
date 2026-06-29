@@ -10,8 +10,13 @@ BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
 OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
-BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.2}"
-DEFAULT_BOOTSTRAP_BIN="$HOME/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.3}"
+BOOTSTRAP_WORKTREE_BIN="${BOOTSTRAP_WORKTREE_BIN:-$ROOT_DIR/../bootstrap-$BOOTSTRAP_RELEASE_VERSION/build/jiangc.next}"
+INSTALLED_BOOTSTRAP_BIN="$HOME/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
+DEFAULT_BOOTSTRAP_BIN="$INSTALLED_BOOTSTRAP_BIN"
+if [ -x "$BOOTSTRAP_WORKTREE_BIN" ]; then
+  DEFAULT_BOOTSTRAP_BIN="$BOOTSTRAP_WORKTREE_BIN"
+fi
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -21,7 +26,9 @@ cd "$ROOT_DIR"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
   echo "missing Jiang $BOOTSTRAP_RELEASE_VERSION release compiler: $BOOTSTRAP_BIN" >&2
-  echo "install Jiang $BOOTSTRAP_RELEASE_VERSION release to ~/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION, or set BOOTSTRAP_BIN=/path/to/jiangc" >&2
+  echo "build bootstrap/$BOOTSTRAP_RELEASE_VERSION at $BOOTSTRAP_WORKTREE_BIN," >&2
+  echo "install Jiang $BOOTSTRAP_RELEASE_VERSION to ~/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION," >&2
+  echo "or set BOOTSTRAP_BIN=/path/to/jiangc" >&2
   exit 2
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
@@ -29,7 +36,8 @@ case "$BOOTSTRAP_VERSION" in
   "jiang $BOOTSTRAP_RELEASE_VERSION") ;;
   *)
     echo "unsupported bootstrap compiler: $BOOTSTRAP_VERSION" >&2
-    echo "build_next requires Jiang $BOOTSTRAP_RELEASE_VERSION release; expected $DEFAULT_BOOTSTRAP_BIN or set BOOTSTRAP_BIN" >&2
+    echo "build_next requires Jiang $BOOTSTRAP_RELEASE_VERSION; expected $DEFAULT_BOOTSTRAP_BIN" >&2
+    echo "or set BOOTSTRAP_BIN" >&2
     exit 2
     ;;
 esac

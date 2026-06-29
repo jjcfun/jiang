@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_backend_cli"
-BOOTSTRAP_RELEASE_VERSION="0.4.2"
+PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
+EXPECTED_COMPILER_VERSION="${EXPECTED_COMPILER_VERSION:-$PACKAGE_VERSION}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -16,15 +17,15 @@ if [ -z "$COMPILER_UNDER_TEST" ]; then
   COMPILER_UNDER_TEST="$(command -v jiangc || true)"
   if [ -z "$COMPILER_UNDER_TEST" ] || [ ! -x "$COMPILER_UNDER_TEST" ]; then
     echo "missing compiler: set JIANGC or put jiangc on PATH" >&2
-    echo "install Jiang $BOOTSTRAP_RELEASE_VERSION release so jiangc is on PATH" >&2
+    echo "install Jiang $EXPECTED_COMPILER_VERSION so jiangc is on PATH" >&2
     exit 2
   fi
   COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
   case "$COMPILER_VERSION" in
-    "jiang $BOOTSTRAP_RELEASE_VERSION") ;;
+    "jiang $EXPECTED_COMPILER_VERSION") ;;
     *)
       echo "unsupported bootstrap compiler: $COMPILER_VERSION" >&2
-      echo "install Jiang $BOOTSTRAP_RELEASE_VERSION release so jiangc is on PATH, or pass JIANGC=<compiler>" >&2
+      echo "install Jiang $EXPECTED_COMPILER_VERSION so jiangc is on PATH, or pass JIANGC=<compiler>" >&2
       exit 2
       ;;
   esac
@@ -68,6 +69,8 @@ macos_target_obj="$SMOKE_BUILD_DIR/minimal_macos.o"
 macos_target_bin="$SMOKE_BUILD_DIR/minimal_macos"
 linux_target_ll="$SMOKE_BUILD_DIR/minimal_linux.ll"
 linux_target_obj="$SMOKE_BUILD_DIR/minimal_linux.o"
+linux_aarch64_target_ll="$SMOKE_BUILD_DIR/minimal_linux_aarch64.ll"
+linux_aarch64_target_obj="$SMOKE_BUILD_DIR/minimal_linux_aarch64.o"
 windows_target_ll="$SMOKE_BUILD_DIR/minimal_windows.ll"
 windows_target_obj="$SMOKE_BUILD_DIR/minimal_windows.obj"
 wasm_target_ll="$SMOKE_BUILD_DIR/minimal_wasm.ll"
@@ -190,6 +193,14 @@ grep -q 'target datalayout = ' "$linux_target_ll"
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-obj -o "$linux_target_obj" "$sample"
 test -s "$linux_target_obj"
 file "$linux_target_obj" | grep -q "ELF 64-bit.*x86-64"
+
+"$compiler_bin" --target aarch64-unknown-linux-gnu --emit-llvm -o "$linux_aarch64_target_ll" "$sample"
+test -s "$linux_aarch64_target_ll"
+grep -q 'target triple = "aarch64-unknown-linux-gnu"' "$linux_aarch64_target_ll"
+grep -q 'target datalayout = ' "$linux_aarch64_target_ll"
+"$compiler_bin" --target aarch64-unknown-linux-gnu --emit-obj -o "$linux_aarch64_target_obj" "$sample"
+test -s "$linux_aarch64_target_obj"
+file "$linux_aarch64_target_obj" | grep -q "ELF 64-bit.*ARM aarch64"
 
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$system_fs_linux_ll" "$system_fs_sample"
 test -s "$system_fs_linux_ll"
