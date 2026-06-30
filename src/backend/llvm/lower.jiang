@@ -90,6 +90,7 @@ struct LlvmLowerer: Movable {
     list.ArrayList<ffi.Value> external_function_values;
     system_memory.Allocator allocator;
     UInt8[]&! target_triple;
+    Bool! link_libc;
 
     init(context.CompilerContext& ctx, Bool link_libc, UInt8[]& target_triple) {
         self.ctx = ctx;
@@ -107,6 +108,7 @@ struct LlvmLowerer: Movable {
         self.external_function_indexes = table.HashTable<qid.SymbolId, Int>();
         self.external_function_values = list.ArrayList<ffi.Value>();
         self.allocator = system_memory.allocator(link_libc);
+        self.link_libc = link_libc;
     }
 
     UInt8[]& effective_target_triple(UInt8[]& target_triple) {
@@ -180,7 +182,13 @@ struct LlvmLowerer: Movable {
             return false;
         }
         if (unit.key.kind == .source_unit) {
-            return self.lower_source_unit(store, unit);
+            if (!self.lower_source_unit(store, unit)) {
+                return false;
+            }
+            if (self.should_emit_linux_no_libc_start() && self.source_unit_contains_language_entry(store, unit)) {
+                return self.lower_linux_no_libc_runtime() && self.lower_linux_no_libc_start(store);
+            }
+            return true;
         }
 
         Int! index = 0;
@@ -201,6 +209,18 @@ struct LlvmLowerer: Movable {
             index = index + 1;
         }
         return true;
+    }
+
+    Bool source_unit_contains_language_entry(mir.MirStore& store, codegen_unit.CodegenUnit& unit) {
+        Int! index = 0;
+        while (index < store.functions.len()) {
+            mir.MirFunction& function = store.functions.ref_at(index);
+            if (function.is_language_entry && self.source_unit_contains_function(unit, function)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     Bool lower_source_unit(mir.MirStore& store, codegen_unit.CodegenUnit& unit) {
@@ -262,7 +282,191 @@ struct LlvmLowerer: Movable {
             }
             index = index + 1;
         }
+        if (self.should_emit_linux_no_libc_start()) {
+            return self.lower_linux_no_libc_runtime() && self.lower_linux_no_libc_start(store);
+        }
         return true;
+    }
+
+    Bool should_emit_linux_no_libc_start() {
+        if (self.link_libc) {
+            return false;
+        }
+        return string.equal(self.target_triple, "x86_64-unknown-linux-gnu");
+    }
+
+    Bool lower_linux_no_libc_runtime() {
+        if (!self.lower_linux_no_libc_malloc()) {
+            return false;
+        }
+        if (!self.lower_linux_no_libc_free()) {
+            return false;
+        }
+        return self.lower_linux_no_libc_extendhfsf2();
+    }
+
+    Bool lower_linux_no_libc_malloc() {
+        Int pointer_bits = self.ctx.store.layouts.target.pointer_size * 8;
+        ffi.Type size_type = ffi.context_int_type(self.llvm_context$.ref(), pointer_bits);
+        list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(1);
+        params.add(size_type);
+        ffi.Type fn_type = ffi.function_type(ffi.context_pointer_type(self.llvm_context$.ref()), params$.ref());
+        ffi.Value function = self.runtime_function("__jiang_malloc", fn_type);
+        if (!ffi.value_valid(function)) {
+            self.add_codegen_error("failed to declare Linux no-libc malloc", "llvm_linux_malloc_declare_failed");
+            return false;
+        }
+        return self.lower_linux_no_libc_null_pointer_function(function);
+    }
+
+    Bool lower_linux_no_libc_free() {
+        list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(1);
+        params.add(ffi.context_pointer_type(self.llvm_context$.ref()));
+        ffi.Type fn_type = ffi.function_type(ffi.context_void_type(self.llvm_context$.ref()), params$.ref());
+        ffi.Value function = self.runtime_function("__jiang_free", fn_type);
+        if (!ffi.value_valid(function)) {
+            self.add_codegen_error("failed to declare Linux no-libc free", "llvm_linux_free_declare_failed");
+            return false;
+        }
+        return self.lower_linux_no_libc_void_function(function);
+    }
+
+    Bool lower_linux_no_libc_extendhfsf2() {
+        list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(1);
+        params.add(ffi.context_int_type(self.llvm_context$.ref(), 16));
+        ffi.Type fn_type = ffi.function_type(ffi.context_float_type(self.llvm_context$.ref()), params$.ref());
+        ffi.Value function = self.runtime_function("__extendhfsf2", fn_type);
+        if (!ffi.value_valid(function)) {
+            self.add_codegen_error("failed to declare Linux no-libc half helper", "llvm_linux_half_declare_failed");
+            return false;
+        }
+        return self.lower_linux_no_libc_zero_float_function(function);
+    }
+
+    ffi.Value runtime_function(UInt8[]& name, ffi.Type function_type) {
+        ffi.Value existing = ffi.module_get_function(self.module$.ref(), name);
+        if (ffi.value_valid(existing)) {
+            return existing;
+        }
+        return ffi.module_add_function(self.module$.ref(), name, function_type);
+    }
+
+    Bool lower_linux_no_libc_null_pointer_function(ffi.Value function) {
+        ffi.BasicBlock block = ffi.context_append_block(self.llvm_context$.ref(), function, "entry");
+        if (!ffi.block_valid(block)) {
+            return false;
+        }
+        ffi.builder_position_at_end(self.builder$.ref(), block);
+        ffi.Type pointer_type = ffi.context_pointer_type(self.llvm_context$.ref());
+        return ffi.value_valid(ffi.builder_build_return(self.builder$.ref(), ffi.const_null(pointer_type)));
+    }
+
+    Bool lower_linux_no_libc_void_function(ffi.Value function) {
+        ffi.BasicBlock block = ffi.context_append_block(self.llvm_context$.ref(), function, "entry");
+        if (!ffi.block_valid(block)) {
+            return false;
+        }
+        ffi.builder_position_at_end(self.builder$.ref(), block);
+        return ffi.value_valid(ffi.builder_build_return_void(self.builder$.ref()));
+    }
+
+    Bool lower_linux_no_libc_zero_float_function(ffi.Value function) {
+        ffi.BasicBlock block = ffi.context_append_block(self.llvm_context$.ref(), function, "entry");
+        if (!ffi.block_valid(block)) {
+            return false;
+        }
+        ffi.builder_position_at_end(self.builder$.ref(), block);
+        ffi.Type float_type = ffi.context_float_type(self.llvm_context$.ref());
+        return ffi.value_valid(ffi.builder_build_return(self.builder$.ref(), ffi.const_real(float_type, 0.0)));
+    }
+
+    Bool lower_linux_no_libc_start(mir.MirStore& store) {
+        guard self.language_entry_function(store) is .some(language_main) else {
+            return true;
+        }
+        llvm_state.LowerState! state = self.lower_state();
+        if (!self.declare_startup_state_global(state$.ref())) {
+            return false;
+        }
+        ffi.Type start_type = self.no_arg_function_type(ffi.context_void_type(self.llvm_context$.ref()));
+        ffi.Value start_function = ffi.module_add_function(self.module$.ref(), "_start", start_type);
+        if (!ffi.value_valid(start_function)) {
+            self.add_codegen_error("failed to declare Linux no-libc _start", "llvm_linux_start_declare_failed");
+            return false;
+        }
+        ffi.function_add_enum_attribute(self.llvm_context$.ref(), start_function, -1, "noreturn");
+        ffi.BasicBlock block = ffi.context_append_block(self.llvm_context$.ref(), start_function, "entry");
+        if (!ffi.block_valid(block)) {
+            self.add_codegen_error("failed to create Linux no-libc _start block", "llvm_linux_start_block_failed");
+            return false;
+        }
+        ffi.builder_position_at_end(self.builder$.ref(), block);
+        ffi.Value exit_code = self.call_language_main_for_linux_start(state$.ref(), language_main);
+        if (!ffi.value_valid(exit_code)) {
+            return false;
+        }
+        if (!self.emit_linux_x86_64_exit_syscall(state$.ref(), exit_code)) {
+            return false;
+        }
+        return ffi.value_valid(ffi.builder_build_unreachable(self.builder$.ref()));
+    }
+
+    mir.MirFunction&? language_entry_function(mir.MirStore& store) {
+        Int! index = 0;
+        while (index < store.functions.len()) {
+            mir.MirFunction& function = store.functions.ref_at(index);
+            if (function.is_language_entry) {
+                return function;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    ffi.Type no_arg_function_type(ffi.Type return_type) {
+        list.ArrayList<ffi.Type>! params = list.ArrayList<ffi.Type>(0);
+        return ffi.function_type(return_type, params$.ref());
+    }
+
+    ffi.Value call_language_main_for_linux_start(llvm_state.LowerState& state, mir.MirFunction& language_main) {
+        ffi.Value main_function = self.function_value(language_main);
+        if (!ffi.value_valid(main_function)) {
+            self.add_codegen_error("failed to find Linux no-libc language main", "llvm_linux_main_missing");
+            return ffi.Value();
+        }
+        qid.TypeId main_type = self.ctx.store.typeck.def_type(language_main.def_id)$.some();
+        backend_abi.FunctionAbi main_abi = backend_abi.classify_function_type(self.ctx, main_type);
+        ffi.Type main_function_type = llvm_abi.function_type(state, main_abi$.ref());
+        list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(0);
+        ffi.Value result = ffi.builder_build_call(self.builder$.ref(), main_function_type, main_function, args$.ref());
+        qid.TypeId result_type = self.language_main_result_type(main_type);
+        if (result_type.to_index() == self.ctx.store.types.unit_type().to_index()) {
+            ffi.Type int_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+            return ffi.const_int(int_type, UInt64(0));
+        }
+        return self.runtime_exit_code_value(state, result, result_type);
+    }
+
+    Bool emit_linux_x86_64_exit_syscall(llvm_state.LowerState& state, ffi.Value exit_code) {
+        ffi.Type int_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+        list.ArrayList<ffi.Type>! param_types = list.ArrayList<ffi.Type>(2);
+        param_types.add(int_type);
+        param_types.add(int_type);
+        ffi.Type syscall_type = ffi.function_type(ffi.context_void_type(self.llvm_context$.ref()), param_types$.ref());
+        ffi.Value syscall_asm = ffi.inline_asm_value(
+            syscall_type,
+            "syscall",
+            "{rax},{rdi},~{rcx},~{r11},~{memory}",
+            true
+        );
+        if (!ffi.value_valid(syscall_asm)) {
+            self.add_codegen_error("failed to build Linux no-libc exit syscall", "llvm_linux_exit_syscall_failed");
+            return false;
+        }
+        list.ArrayList<ffi.Value>! args = list.ArrayList<ffi.Value>(2);
+        args.add(ffi.const_int(int_type, UInt64(60)));
+        args.add(exit_code);
+        return ffi.value_valid(ffi.builder_build_call(self.builder$.ref(), syscall_type, syscall_asm, args$.ref()));
     }
 
     Bool declare_store_globals(mir.MirStore& store) {

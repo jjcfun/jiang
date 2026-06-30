@@ -71,6 +71,7 @@ linux_target_ll="$SMOKE_BUILD_DIR/minimal_linux.ll"
 linux_target_obj="$SMOKE_BUILD_DIR/minimal_linux.o"
 linux_aarch64_target_ll="$SMOKE_BUILD_DIR/minimal_linux_aarch64.ll"
 linux_aarch64_target_obj="$SMOKE_BUILD_DIR/minimal_linux_aarch64.o"
+linux_aarch64_no_libc_exe_log="$SMOKE_BUILD_DIR/linux_aarch64_no_libc_executable.log"
 windows_target_ll="$SMOKE_BUILD_DIR/minimal_windows.ll"
 windows_target_obj="$SMOKE_BUILD_DIR/minimal_windows.obj"
 wasm_target_ll="$SMOKE_BUILD_DIR/minimal_wasm.ll"
@@ -152,8 +153,8 @@ if grep -q "@free" "$alloc_linux_no_libc_ll"; then
 fi
 "$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-obj -o "$alloc_linux_no_libc_obj" "$alloc_sample"
 test -s "$alloc_linux_no_libc_obj"
-nm -u "$alloc_linux_no_libc_obj" | grep -q "__jiang_malloc"
-nm -u "$alloc_linux_no_libc_obj" | grep -q "__jiang_free"
+nm "$alloc_linux_no_libc_obj" | grep -q " T __jiang_malloc"
+nm "$alloc_linux_no_libc_obj" | grep -q " T __jiang_free"
 if nm -u "$alloc_linux_no_libc_obj" | grep -q " malloc$"; then
   echo "unexpected malloc reference in linux --no-link-libc object output" >&2
   exit 1
@@ -236,12 +237,20 @@ grep -q 'target datalayout = ' "$wasm_target_ll"
 test -s "$wasm_target_obj"
 file "$wasm_target_obj" | grep -qi "WebAssembly"
 
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc \
+  -o "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" "$sample" \
+  >"$linux_no_libc_exe_log" 2>&1
+test -s "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe"
+file "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" | grep -q "ELF 64-bit.*x86-64"
+
 set +e
-"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc -o "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" "$sample" >"$linux_no_libc_exe_log" 2>&1
-linux_no_libc_exe_status=$?
+"$compiler_bin" --target aarch64-unknown-linux-gnu --no-link-libc \
+  -o "$SMOKE_BUILD_DIR/minimal_linux_aarch64_no_libc_exe" "$sample" \
+  >"$linux_aarch64_no_libc_exe_log" 2>&1
+linux_aarch64_no_libc_exe_status=$?
 set -e
-test "$linux_no_libc_exe_status" -ne 0
-grep -q "target_executable_requires_runtime" "$linux_no_libc_exe_log"
+test "$linux_aarch64_no_libc_exe_status" -ne 0
+grep -q "target_executable_requires_runtime" "$linux_aarch64_no_libc_exe_log"
 
 set +e
 "$compiler_bin" --target x86_64-pc-windows-msvc -o "$SMOKE_BUILD_DIR/minimal_windows_exe" "$sample" >"$windows_exe_log" 2>&1

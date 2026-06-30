@@ -116,6 +116,31 @@ jiang_cached_llvm_config() {
   return 1
 }
 
+jiang_find_lld() {
+  if [ -n "${JIANG_LLD:-}" ] && [ -x "$JIANG_LLD" ]; then
+    printf '%s\n' "$JIANG_LLD"
+    return 0
+  fi
+  if [ -n "${LLVM_BINDIR:-}" ] && [ -x "$LLVM_BINDIR/ld.lld" ]; then
+    printf '%s\n' "$LLVM_BINDIR/ld.lld"
+    return 0
+  fi
+  for path in \
+    "/opt/homebrew/opt/lld/bin/ld.lld" \
+    "/usr/local/opt/lld/bin/ld.lld"
+  do
+    if [ -x "$path" ]; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  if command -v ld.lld >/dev/null 2>&1; then
+    command -v ld.lld
+    return 0
+  fi
+  return 1
+}
+
 jiang_write_llvm_env_file() {
   mkdir -p "$JIANG_LLVM_CONFIG_DIR"
   {
@@ -126,6 +151,7 @@ jiang_write_llvm_env_file() {
     printf 'LLVM_ROOT=%s\n' "$LLVM_ROOT"
     printf 'LLVM_CLANG=%s\n' "$LLVM_CLANG"
     printf 'LLVM_LIB_DIR=%s\n' "$LLVM_LIB_DIR"
+    printf 'JIANG_LLD=%s\n' "${JIANG_LLD:-}"
   } >"$JIANG_LLVM_ENV_FILE"
 }
 
@@ -149,6 +175,7 @@ jiang_resolve_llvm_env() {
   LLVM_ROOT="$(cd "$LLVM_BINDIR/.." && pwd)"
   LLVM_CLANG="${LLVM_CLANG:-$LLVM_BINDIR/clang}"
   LLVM_LIB_DIR="${LLVM_LIB_DIR:-$("$LLVM_CONFIG" --libdir)}"
+  JIANG_LLD="${JIANG_LLD:-$(jiang_find_lld || true)}"
 
   if [ ! -x "$LLVM_CLANG" ]; then
     echo "missing LLVM clang: $LLVM_CLANG" >&2
@@ -159,7 +186,7 @@ jiang_resolve_llvm_env() {
     return 2
   fi
 
-  export JIANG_LLVM_VERSION LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR
+  export JIANG_LLVM_VERSION LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR JIANG_LLD
   JIANG_HOST_TARGET="${JIANG_HOST_TARGET:-$(jiang_host_target_triple)}"
   export JIANG_HOST_TARGET
   jiang_write_llvm_env_file
@@ -174,6 +201,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   printf 'LLVM_ROOT=%s\n' "$LLVM_ROOT"
   printf 'LLVM_CLANG=%s\n' "$LLVM_CLANG"
   printf 'LLVM_LIB_DIR=%s\n' "$LLVM_LIB_DIR"
+  printf 'JIANG_LLD=%s\n' "${JIANG_LLD:-}"
   printf 'LLVM_ENV_FILE=%s\n' "$JIANG_LLVM_ENV_FILE"
 else
   jiang_resolve_llvm_env
