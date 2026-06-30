@@ -54,8 +54,10 @@ hosted `main(argc, argv)`、no-libc `_start` 或 Wasm/Windows 的专用入口，
 `ProgramArguments`。运行过程中会变化的 process 状态不放进 startup state。
 
 `system.process.arguments()` 直接读取 `__jiang_startup_state`。hosted path 仍由
-`main(argc, argv)` 接收平台启动参数，但 backend 会在进入 `__jiang_main` 前把 argc/argv 写入
-startup state；system provider 不再通过 `_NSGetArgc/_NSGetArgv` 或平台临时符号读取用户参数。
+`main(argc, argv)` 接收平台启动参数，但这个入口由源码普通函数加 `@link_symbol("main")`
+定义。`__jiang_startup_state` 也是源码普通全局变量，通过 `@link_symbol("__jiang_startup_state")`
+绑定链接层符号。backend 不再合成 startup state global；system provider 不再通过
+`_NSGetArgc/_NSGetArgv` 或平台临时符号读取用户参数。
 
 `libc`、`libSystem` 和 POSIX/C ABI 都不是 Jiang 语言语义的一部分。它们只属于 hosted
 compatibility provider：

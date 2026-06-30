@@ -8,11 +8,11 @@ Jiang 的启动路径分成三层：
 
 ## Hosted Entry
 
-当前 hosted executable 入口仍是 C ABI 形状的 `main(argc, argv)`。backend 会把这个函数作为
-runtime entry 生成出来，并在函数体开始时写入 `__jiang_startup_state`。
+当前 hosted executable 入口仍是 C ABI 形状的 `main(argc, argv)`。它由
+`system/startup.jiang` 中的普通函数定义，并通过 `@link_symbol("main")` 绑定到链接层符号。
 
 `argc` 保存到 `StartupState.arguments.length`，`argv` 保存到 `StartupState.arguments.raw`。
-写入完成后，runtime entry 调用语言入口 `__jiang_main`。
+写入完成后，hosted entry 调用语言入口 `__jiang_main`。
 
 ## Language Entry
 
@@ -28,11 +28,15 @@ Jiang 源码中的 root module `main` 会被 backend lowering 为 `__jiang_main`
 
 ## Startup State
 
-`system/startup.jiang` 固定内部符号：
+`system/startup.jiang` 固定内部链接符号：
 
 - `main`：hosted platform entry。
 - `__jiang_main`：language entry。
 - `__jiang_startup_state`：启动状态 global。
+
+`main` 和 `__jiang_startup_state` 都由源码普通声明定义，通过 `@link_symbol` 绑定链接层符号。
+编译器不再在 LLVM lowering 中合成 startup state global。`__jiang_main` 仍由 MIR lowering 生成，
+只负责把用户 root `main` 的返回值适配成进程 exit code。
 
 `StartupState` 只保存启动瞬间由平台入口交给语言运行时的初始事实。当前只包含
 `ProgramArguments`。运行过程中会变化的 process 状态不放在这里。
@@ -43,5 +47,5 @@ Jiang 源码中的 root module `main` 会被 backend lowering 为 `__jiang_main`
 ## Future Entries
 
 no-libc `_start`、Wasm entry 和 Windows entry 后续也应遵循同一边界：平台入口负责初始化
-`__jiang_startup_state`，然后调用 `__jiang_main`。inline asm 基础链路已经可用；真实 no-libc
-startup object、syscall 封装和 target runtime object 后置到 proposal。
+`__jiang_startup_state`，然后调用 `__jiang_main`。Linux no-libc `_start` 也应是源码普通函数，
+并通过 `@link_symbol("_start")` 绑定链接层入口符号。
