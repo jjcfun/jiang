@@ -30,8 +30,8 @@ Jiang 官方 Linux All in one 路线优先支持 no-libc 静态 executable。`sr
 Wasm 和 Windows 当前只承诺 LLVM/object 输出。可运行 module、CRT/startup、host import 或 Windows
 linker integration 都是后续任务。
 
-no-libc / freestanding executable 不属于当前 release。相关设计迁移到 proposal，后续随 inline asm、
-target runtime object 和 platform entry 设计推进。
+no-libc / freestanding executable 不属于当前 release。inline asm 基础链路已经可用；相关 executable
+设计后续随 target runtime object、syscall 封装和 platform entry 继续推进。
 
 ## Linker Boundary
 

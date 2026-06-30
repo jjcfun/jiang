@@ -67,8 +67,9 @@ BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 
 当前 release 只承诺 macOS arm64 hosted `jiangc`。源码中已有 Linux x86_64/aarch64、
 Wasm `wasm32-unknown-unknown` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke，
-但这些 target 的 executable、linker 和 startup 路径迁移到后续版本稳定。no-libc、syscall 和
-inline asm 相关能力等待自定义 DSL 机制稳定后再进入实现阶段。
+但这些 target 的 executable、linker 和 startup 路径迁移到后续版本稳定。inline asm 已作为
+内建 DSL provider 提供基础 `#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc
+syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目标。
 
 
 

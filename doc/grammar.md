@@ -31,7 +31,9 @@ float_lit   <- decimal_int "." decimal_int exponent?
 exponent    <- ("e" / "E") ("+" / "-")? decimal_int
 char_lit    <- /* 字符字面量 */
 string_lit  <- /* UTF-8 字符串字面量 */
-raw_block   <- /* `#ident { ... }` 中由 lang provider scan 确定边界的原始 block */
+provider_path
+            <- ident ("." ident)*
+raw_block   <- /* `#provider_path { ... }` 中由 lang provider scan 确定边界的原始 block */
 
 literal     <- int_lit
              / float_lit
@@ -404,6 +406,7 @@ stmt        <- return_stmt
              / continue_stmt
              / defer_stmt
              / block
+             / lang_invocation_stmt
              / guard_stmt
              / while_stmt
              / for_stmt
@@ -445,6 +448,9 @@ assign_op   <- "=" / "+=" / "-=" / "*=" / "/=" / "%="
              / "&=" / "|=" / "^=" / "<<=" / ">>="
 
 call_stmt   <- postfix_expr ";"
+
+lang_invocation_stmt
+            <- lang_invocation
 
 if_stmt     <- if_expr
 
@@ -582,7 +588,7 @@ paren_expr  <- "(" ")"
 array_expr  <- "[" (expr ("," expr)* ","?)? "]"
 
 lang_invocation
-            <- "#" ident raw_block
+            <- "#" provider_path raw_block
 
 struct_lit  <- "{" (field_init_expr ("," field_init_expr)* ","?)? "}"
 

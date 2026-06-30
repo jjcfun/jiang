@@ -24,8 +24,9 @@ driver/cli -> pipeline.compile
 
 - `source/package`：入口文件或 package manifest 归一化、source 读取和 `SourceId` 建立。
 - `lang registry`：先按入口 source path 构建 provider registry，再按 module graph/package
-  补全 package 级 registry。`#alias { ... }` 调用 manifest dependency 中的 `type = lang`
-  provider，provider 返回 public syntax tree，compiler 转换为内部 AST。
+  补全 package 级 registry。`#alias { ... }` 优先匹配 compiler builtin provider；否则调用
+  manifest dependency 中的 `type = lang` provider。provider 返回 public syntax tree，compiler
+  转换为内部 AST。
 - `HIR`：resolve 直接生成的未类型化语义树。
 - `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
   source selection 在 resolve/HIR lower 中完成，const value 在 sema 中写入 `ComptimeStore`。

@@ -40,6 +40,8 @@ import std;
 报告 syntax 阶段错误。compiler 可以复用这些结构，再在 lang expansion 后转换到内部 AST。
 `std.jiang.syntax.Provider` 是 `type = lang` package root `Lang` 需要实现的 trait；compiler
 为该类型生成 host dynamic library wrapper，普通用户代码不直接调用 wrapper 符号。
+builtin provider 也复用同一套 syntax ABI。当前 inline asm 由编译器内建 provider 实现，
+用户源码可写 `#asm { ... }`，需要稳定指向内建实现时可写 `#jiang.asm { ... }`。
 
 `std.jiang.Tokenizer` 是 Jiang 语言 tokenizer 的公共版本。它接受 `std.jiang.syntax.Source`，
 每次 `next(builder)` 返回一个 `Token`，并把 lexer 诊断写入传入的 builder。`Token` 不保存
@@ -56,5 +58,6 @@ identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节�
 `std` 当前仍处于 0.x 孵化阶段。模块路径、类型命名和方法集合会随语言功能继续收敛；用户代码应尽量依赖
 `import std;` 后的顶层导出，而不是内部文件路径。
 
-`std` 不代表 no-libc/freestanding 已经可用。当前稳定路径仍是 hosted target；freestanding、inline asm
-和 target runtime object 后续在 0.4 之后继续设计。
+`std` 不代表 no-libc/freestanding 已经可用。当前稳定路径仍是 hosted target；inline asm 已作为
+builtin provider 提供基础能力，但 freestanding runtime、target runtime object 和 Linux no-libc
+静态 executable 仍在 0.4.3 后续阶段继续设计。

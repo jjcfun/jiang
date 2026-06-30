@@ -15,14 +15,16 @@ User user = #sql {
 };
 ```
 
-`#sql` 中的 `sql` 只来自当前 package manifest 的 `[dependencies]` alias。目标 dependency
-必须是 `type = lang` package，并在 package root 中公开默认入口 `Lang`。
+`#sql` 中的 `sql` 通常来自当前 package manifest 的 `[dependencies]` alias。目标 dependency
+必须是 `type = lang` package，并在 package root 中公开默认入口 `Lang`。编译器也可以提供
+builtin provider；当前 builtin inline asm 同时支持短名 `#asm { ... }` 和完整内建路径
+`#jiang.asm { ... }`。短名后续允许被用户 provider 覆盖，完整路径用于稳定指向编译器内建 provider。
 
 lang invocation 使用 block 形式，不支持 `#sql(...)`，也不支持源码内声明多个 parser 入口。
-当前 parser 只在 expression 位置接入 `#alias { ... }`，因此 provider 需要返回 expression entry
-syntax tree。public syntax tree 已保留 `file`、declaration、statement、type、pattern 等 root kind，
-用于后续扩展。每个 lang invocation 会创建一个 provider 实例，`scan` 和 `parse` 通过该实例共享
-DSL 私有状态。
+当前 parser 已在 expression 和 statement 位置接入 `#alias { ... }`。provider 需要根据
+`Input.entry_kind` 返回对应 root kind 的 syntax tree。public syntax tree 已保留 `file`、
+declaration、type、pattern 等 root kind，用于后续继续扩展。每个 lang invocation 会创建一个
+provider 实例，`scan` 和 `parse` 通过该实例共享 DSL 私有状态。
 
 ## Public Syntax Tree
 
@@ -66,25 +68,25 @@ DSL source
   -> resolve/HIR/sema/MIR/backend
 ```
 
-也就是说，`#alias { ... }` 不会进入内部 AST 成为占位节点。lexer 只产出 `hash ident raw_block`
-三个 token，其中 `raw_block` 携带 compiler-private block id。当前 parser 只在 expression 位置
-调用 provider parse，并传入 `Root.Kind.expression`。provider 返回 `std.jiang.syntax.Tree` 后，
-编译器校验并转换成内部 AST，再交给既有 resolve/sema 流程。
+也就是说，`#alias { ... }` 不会进入内部 AST 成为占位节点。lexer 只产出 provider path 和
+`raw_block`，其中 `raw_block` 携带 compiler-private block id。parser 根据当前位置传入
+`Root.Kind.expression` 或 `Root.Kind.statement` 并调用 provider parse。provider 返回
+`std.jiang.syntax.Tree` 后，编译器校验并转换成内部 AST，再交给既有 resolve/sema 流程。
 
 长期可以让内部 parser 逐步向 `std.jiang.syntax.Tree` 靠拢，但不要求当前重写 parser 或 resolve。
 
 ## Lexer Behavior
 
-Jiang lexer 默认按普通 Jiang token 处理。看到 `#ident { ... }` 时，输出：
+Jiang lexer 默认按普通 Jiang token 处理。看到 `#provider.path { ... }` 时，输出：
 
 ```text
-hash ident raw_block
+hash provider_path raw_block
 ```
 
-host 识别 `#ident` 和 opening delimiter 后，完整 body 边界由 provider 的 `scan` 决定。`raw_block`
-token 携带 compiler-private block id，parser 通过该 id 找到 lexer 阶段创建的 provider、builder 和
-scan state。provider scan 接入完整动态库前，compiler lexer 仍使用 `{}` 递归匹配作为 recovery
-fallback；未闭合 raw block 产生 `unterminated_raw_block` 诊断。
+host 识别 provider path 和 opening delimiter 后，完整 body 边界由 provider 的 `scan` 决定。
+`raw_block` token 携带 compiler-private block id，parser 通过该 id 找到 lexer 阶段创建的
+provider、builder 和 scan state。找不到 provider 时 lexer 直接报告 syntax/package 错误，不继续
+尝试恢复；provider 内部错误由 provider 自己报告，并负责把 `body_span` 推进到合适的结束位置。
 
 公开 `std.jiang.Tokenizer` 不保存 token text 或 compiler 内部 symbol id。token 的文本由
 `Token.span` 回到 `Source.bytes` 按需取得，identifier 的 intern 由调用方的 builder/compiler
@@ -102,8 +104,9 @@ public `SymbolId`，由 `Builder.intern_symbol` 创建。identifier 判定使用
 dependency alias -> provider handle for package root public Lang
 ```
 
-lexer 读到 `#alias { ... }` 时只查这个 registry，不查普通 import/name resolve。这样 DSL 机制不依赖
-Jiang 普通名字解析；如果 provider 不能加载，源码已经不可解析，编译器直接报告 syntax/package 错误。
+lexer 读到 `#alias { ... }` 或 `#jiang.alias { ... }` 时先检查 builtin provider，再查这个 registry，不查普通
+import/name resolve。这样 DSL 机制不依赖 Jiang 普通名字解析；如果 provider 不能加载，源码已经
+不可解析，编译器直接报告 syntax/package 错误。
 
 lang dynamic library 是本机缓存产物，不承诺跨 `jiangc` 版本复用。provider package 仍以源码发布；
 当前 compiler 在 host 上为它生成 wrapper package，再编译成 dynamic library 并加载。
@@ -216,15 +219,17 @@ package 同时导出多个默认 parser。
 `Input.name_span` 表示 invocation 名字的源码范围，例如 `#sql { ... }` 中的 `sql`。它主要用于
 provider 诊断；registry 查找和 dependency 校验仍由 host 在调用 provider 前完成。
 
-`Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`。当前实现传入 `expression`；public
-tree 同时定义了 `file`、`top_level_declaration`、`member_declaration`、`statement`、
+`Input.entry_kind` 直接使用 `std.jiang.syntax.Root.Kind`。当前实现会传入 `expression` 或
+`statement`；public tree 同时定义了 `file`、`top_level_declaration`、`member_declaration`、
 `type_reference` 和 `pattern`，用于后续把 lang invocation 扩展到其他语法位置。返回 syntax root
 node 的 root kind 必须等于 `input.entry_kind`，否则 compiler 拒绝该 tree。也就是说，DSL 输出
 需要落在 Jiang 当前语法层能表示的完整 syntax entry 中。
 
-`ScanResult` 返回 `status`、`body_span`、`full_span` 和 `end_offset`。scan 阶段负责判断 DSL
-body 的结束位置，并通过 `builder` 报告词法或边界错误；`status = error` 时 compiler 不再调用
-`parse`。
+`Input.body_start` 是 opening delimiter 后第一个字节的位置。`ScanResult` 只返回 `status` 和
+`body_span`。`body_span` 是 raw block 的完整源码范围，包含 opening delimiter 和 closing delimiter；
+scan 阶段负责判断 DSL body 的结束位置，并通过 `builder` 报告词法或边界错误。lexer 根据
+`body_span` 直接创建 `raw_block` token，不再让公共 tokenizer 重新解析 raw block。
+`status = error` 时 compiler 不再调用 `parse`。
 
 provider 需要保留 source span。对于从 DSL 原文生成的节点，应使用 `ScanResult.body_span` 内的
 局部 span；对于插值表达式，provider 可以请求 host parser 解析 Jiang expression/type/path，并把解析

@@ -43,5 +43,5 @@ Jiang 源码中的 root module `main` 会被 backend lowering 为 `__jiang_main`
 ## Future Entries
 
 no-libc `_start`、Wasm entry 和 Windows entry 后续也应遵循同一边界：平台入口负责初始化
-`__jiang_startup_state`，然后调用 `__jiang_main`。真实 no-libc startup object、syscall 和 inline asm
-后置到 proposal。
+`__jiang_startup_state`，然后调用 `__jiang_main`。inline asm 基础链路已经可用；真实 no-libc
+startup object、syscall 封装和 target runtime object 后置到 proposal。
