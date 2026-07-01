@@ -132,6 +132,16 @@ bash ./script/package_macos_release.sh
 release zip 中的 `jiangc` 静态链接 LLVM，不依赖本机 `libLLVM.dylib`。包内 `install.sh`
 会安装到 `~/.jiang/versions/<version>` 并更新 `~/.jiang/bin/jiangc`。
 
+验证完整 release 链路：
+
+```bash
+bash ./script/release_smoke.sh
+```
+
+该脚本会复用或安装本地 LLVM，执行 stable bootstrap 构建，生成 macOS release zip，解包运行
+`jiangc --version`，用临时 `PREFIX` 验证包内 `install.sh`，并检查产物没有动态依赖
+`libLLVM` / `liblld`。
+
 ## 文档
 
 - [官网与语言文档](https://jiang-lang.org/)
