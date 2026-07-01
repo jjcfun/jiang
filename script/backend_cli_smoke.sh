@@ -76,9 +76,13 @@ windows_target_ll="$SMOKE_BUILD_DIR/minimal_windows.ll"
 windows_target_obj="$SMOKE_BUILD_DIR/minimal_windows.obj"
 wasm_target_ll="$SMOKE_BUILD_DIR/minimal_wasm.ll"
 wasm_target_obj="$SMOKE_BUILD_DIR/minimal_wasm.o"
+wasi_target_ll="$SMOKE_BUILD_DIR/minimal_wasi.ll"
+wasi_target_obj="$SMOKE_BUILD_DIR/minimal_wasi.o"
+wasi_target_bin="$SMOKE_BUILD_DIR/minimal_wasi.wasm"
 linux_no_libc_exe_log="$SMOKE_BUILD_DIR/linux_no_libc_executable.log"
 windows_exe_log="$SMOKE_BUILD_DIR/windows_executable.log"
 wasm_exe_log="$SMOKE_BUILD_DIR/wasm_executable.log"
+wasi_exe_log="$SMOKE_BUILD_DIR/wasi_executable.log"
 unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
 
 printf 'Int main() { 0 }\n' >"$sample"
@@ -90,6 +94,7 @@ for arg in \
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_macos_sdkroot_link_args) \
   $(jiang_llvm_cxx_runtime_link_args)
 do
   llvm_link_args+=(--link-arg "$arg")
@@ -109,6 +114,7 @@ test -s "$sample_ll"
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_macos_sdkroot_link_args) \
   $(jiang_llvm_cxx_runtime_link_args)
 "$sample_from_ll"
 
@@ -118,6 +124,7 @@ test -s "$sample_obj"
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_macos_sdkroot_link_args) \
   $(jiang_llvm_cxx_runtime_link_args)
 "$sample_from_obj"
 
@@ -244,6 +251,32 @@ grep -q 'target datalayout = ' "$wasm_target_ll"
 test -s "$wasm_target_obj"
 file "$wasm_target_obj" | grep -qi "WebAssembly"
 
+"$compiler_bin" --target wasm32-wasi --emit-llvm -o "$wasi_target_ll" "$sample"
+test -s "$wasi_target_ll"
+grep -q 'target triple = "wasm32-wasip1"' "$wasi_target_ll"
+grep -q 'target datalayout = ' "$wasi_target_ll"
+"$compiler_bin" --target wasm32-wasi --emit-obj -o "$wasi_target_obj" "$sample"
+test -s "$wasi_target_obj"
+file "$wasi_target_obj" | grep -qi "WebAssembly"
+
+set +e
+"$compiler_bin" --target wasm32-wasi -o "$wasi_target_bin" "$sample" >"$wasi_exe_log" 2>&1
+wasi_exe_status=$?
+set -e
+if [ "$wasi_exe_status" -eq 0 ]; then
+  test -s "$wasi_target_bin"
+  file "$wasi_target_bin" | grep -qi "WebAssembly"
+  if grep -q "function signature mismatch" "$wasi_exe_log"; then
+    echo "unexpected WASI linker signature mismatch" >&2
+    exit 1
+  fi
+  if command -v wasmtime >/dev/null 2>&1; then
+    wasmtime -C cache=n "$wasi_target_bin"
+  fi
+else
+  grep -q "wasi_sdk_missing" "$wasi_exe_log"
+fi
+
 "$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc \
   -o "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" "$sample" \
   >"$linux_no_libc_exe_log" 2>&1
@@ -292,6 +325,7 @@ test -s "$sample_release_obj"
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_macos_sdkroot_link_args) \
   $(jiang_llvm_cxx_runtime_link_args)
 "$sample_from_release_obj"
 
@@ -311,6 +345,7 @@ test -s "$field_ll"
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_macos_sdkroot_link_args) \
   $(jiang_llvm_cxx_runtime_link_args)
 "$field_bin"
 

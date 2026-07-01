@@ -2,11 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
 JIANG_LLVM_REPO="${JIANG_LLVM_REPO:-https://github.com/jjcfun/llvm-project.git}"
 JIANG_LLVM_REF="${JIANG_LLVM_REF:-jiang/22.1.8}"
 JIANG_LLVM_SOURCE_DIR="${JIANG_LLVM_SOURCE_DIR:-$ROOT_DIR/vendor/llvm-project}"
-JIANG_LLVM_BUILD_DIR="${JIANG_LLVM_BUILD_DIR:-$ROOT_DIR/build/llvm}"
+JIANG_LLVM_BUILD_DIR="${JIANG_LLVM_BUILD_DIR:-$ROOT_DIR/build/toolchains/llvm}"
+JIANG_LLVM_TOOLCHAIN_DIR="${JIANG_LLVM_TOOLCHAIN_DIR:-$JIANG_HOME/toolchains/llvm}"
 JIANG_LLVM_PROJECTS="${JIANG_LLVM_PROJECTS:-clang;lld}"
 JIANG_LLVM_TARGETS="${JIANG_LLVM_TARGETS:-X86;AArch64;WebAssembly}"
 JIANG_LLVM_BUILD_TYPE="${JIANG_LLVM_BUILD_TYPE:-Release}"
@@ -23,7 +25,7 @@ host_tag() {
 }
 
 llvm_install_prefix() {
-  printf '%s/%s/install\n' "$JIANG_LLVM_BUILD_DIR" "$(host_tag)"
+  printf '%s/%s/%s\n' "$JIANG_LLVM_TOOLCHAIN_DIR" "$JIANG_LLVM_VERSION" "$(host_tag)"
 }
 
 ensure_llvm_source() {
@@ -78,7 +80,7 @@ install_managed_llvm() {
   local install_dir
   host="$(host_tag)"
   source_dir="$JIANG_LLVM_SOURCE_DIR/llvm"
-  build_dir="$JIANG_LLVM_BUILD_DIR/$host/build"
+  build_dir="$JIANG_LLVM_BUILD_DIR/$JIANG_LLVM_VERSION/$host/build"
   install_dir="$(llvm_install_prefix)"
 
   if [ "$JIANG_LLVM_FORCE_BUILD" != "1" ] && [ -x "$install_dir/bin/llvm-config" ]; then

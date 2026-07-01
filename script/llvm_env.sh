@@ -8,6 +8,7 @@
 
 JIANG_LLVM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JIANG_ROOT_DIR="$(cd "$JIANG_LLVM_SCRIPT_DIR/.." && pwd)"
+JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
 JIANG_MACOS_DEPLOYMENT_TARGET="${JIANG_MACOS_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-11.0}}"
 BUILD_DIR="${BUILD_DIR:-$JIANG_ROOT_DIR/build}"
@@ -70,7 +71,7 @@ jiang_managed_llvm_config() {
   local host
   host="$(jiang_host_tag)"
   for root in \
-    "$JIANG_ROOT_DIR/build/llvm/$host/install"
+    "$JIANG_HOME/toolchains/llvm/$JIANG_LLVM_VERSION/$host"
   do
     if [ -x "$root/bin/llvm-config" ]; then
       printf '%s\n' "$root/bin/llvm-config"
@@ -87,7 +88,7 @@ jiang_cached_llvm_config() {
   local cached_config
   cached_config="$(sed -n 's/^LLVM_CONFIG=//p' "$JIANG_LLVM_ENV_FILE" | head -n 1)"
   case "$cached_config" in
-    "$JIANG_ROOT_DIR/build/llvm/"*) ;;
+    "$JIANG_HOME/toolchains/llvm/"*) ;;
     *) return 1 ;;
   esac
   if [ -x "$cached_config" ]; then
@@ -131,6 +132,21 @@ jiang_llvm_cxx_runtime_link_args() {
       printf '%s\n' "-lstdc++"
       ;;
   esac
+}
+
+jiang_macos_sdkroot_link_args() {
+  if [ "$(uname -s)" != "Darwin" ]; then
+    return 0
+  fi
+  local sdkroot
+  sdkroot="${SDKROOT:-}"
+  if [ -z "$sdkroot" ] && command -v xcrun >/dev/null 2>&1; then
+    sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+  fi
+  if [ -n "$sdkroot" ]; then
+    printf '%s\n' "-isysroot"
+    printf '%s\n' "$sdkroot"
+  fi
 }
 
 jiang_write_llvm_env_file() {

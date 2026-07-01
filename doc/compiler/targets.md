@@ -15,6 +15,7 @@ target model、LLVM/object 输出和 executable 诊断边界。
 | `aarch64-unknown-linux-gnu` | experimental | experimental | `target_executable_requires_toolchain` |
 | Linux no-libc x86_64 | supported through `--no-link-libc` | supported | planned static executable |
 | `wasm32-unknown-unknown` | supported | supported | `target_executable_runtime_unsupported` |
+| `wasm32-wasi` | supported through `wasm32-wasip1` | supported | experimental with wasi-sdk |
 | `x86_64-pc-windows-msvc` | supported | supported | `target_executable_runtime_unsupported` |
 | `aarch64-pc-windows-msvc` | supported | supported | `target_executable_runtime_unsupported` |
 
@@ -27,8 +28,10 @@ Jiang 官方 Linux All in one 路线优先支持 no-libc 静态 executable。`sr
 入口、syscall、内存、panic/trap 和必要 runtime object 由 Jiang 维护并随 release 包集成；
 默认情况下用户和 Jiang 开发者都不需要配置 libc/sysroot。
 
-Wasm 和 Windows 当前只承诺 LLVM/object 输出。可运行 module、CRT/startup、host import 或 Windows
-linker integration 都是后续任务。
+裸 Wasm `wasm32-unknown-unknown` 当前只承诺 LLVM/object 输出。WASI 使用 `wasm32-wasi`
+作为 Jiang CLI 入口，内部 LLVM triple 使用 LLVM 22 推荐的 `wasm32-wasip1`。WASI
+executable 链接依赖 wasi-sdk，默认从 `$JIANG_HOME/toolchains/wasi-sdk` 查找；未设置
+`JIANG_HOME` 时使用 `~/.jiang`。Windows 的可运行 CRT/startup 和 linker integration 仍是后续任务。
 
 no-libc / freestanding executable 不属于当前 release。inline asm 基础链路已经可用；相关 executable
 设计后续随 target runtime object、syscall 封装和 platform entry 继续推进。

@@ -25,30 +25,29 @@ branch: jiang/22.1.8
 tag: llvmorg-22.1.8
 ```
 
-LLVM 本地工具链安装在仓库的 build cache 内，不写入用户全局目录：
+LLVM 本地工具链安装在 Jiang home 下：
 
 ```text
-build/llvm/<host>/build      # LLVM CMake build tree
-build/llvm/<host>/install    # Jiang 使用的 LLVM toolchain
+$JIANG_HOME/toolchains/llvm/<version>/<host>
 ```
 
-例如：
+未设置 `JIANG_HOME` 时使用 `~/.jiang`。CMake build tree 仍放在仓库 build cache 内：
 
 ```text
-build/llvm/darwin-arm64/install
-build/llvm/linux-x86_64/install
+build/toolchains/llvm/<version>/<host>/build
 ```
 
 构建脚本会通过 `script/llvm_env.sh` 查找 `LLVM_CONFIG`、`JIANG_LLVM_ROOT`、`LLVM_ROOT`、
-缓存的 `LLVM_CONFIG` 和 `build/llvm/<host>/install/bin/llvm-config`。不会自动 fallback 到
-系统全局 LLVM；需要使用外部 LLVM 时必须显式设置 `JIANG_LLVM_ROOT` 或 `LLVM_CONFIG`。
+缓存的 `LLVM_CONFIG` 和 `$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。
+不会自动 fallback 到系统全局 LLVM；需要使用外部 LLVM 时必须显式设置 `JIANG_LLVM_ROOT`
+或 `LLVM_CONFIG`。
 
 ```bash
 bash ./script/install_llvm.sh
 ```
 
 `install_llvm.sh` 默认从 `vendor/llvm-project` 构建 LLVM，并安装到
-`build/llvm/<host>/install`。如果在 release 包中运行脚本且没有 submodule，
+`$JIANG_HOME/toolchains/llvm/<version>/<host>`。如果在 release 包中运行脚本且没有 submodule，
 脚本会从 `jjcfun/llvm-project` 的 `jiang/22.1.8` 分支浅克隆源码。已存在的本地 LLVM 22
 会直接复用；需要强制重建时设置 `JIANG_LLVM_FORCE_BUILD=1`。LLVM 库默认以静态库形式链接进
 `jiangc`，release 用户不需要安装 LLVM runtime。
@@ -97,11 +96,23 @@ BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 `release/<version>` 上使用对应的 `bootstrap/<version>` 编译器完成构建、语言测试和 stable bootstrap。
 
 当前 release 只承诺 macOS arm64 hosted `jiangc`。Linux `jiangc` release 暂缓到语法和
-bootstrap pipeline 稳定之后。源码中已有 Linux x86_64/aarch64、Wasm `wasm32-unknown-unknown`
-和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke，但这些 target 的 executable、
-linker 和 startup 路径仍是实验能力。inline asm 已作为内建 DSL provider 提供基础
-`#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc syscall/runtime 路线；
-Linux no-libc 静态 executable 仍是后续阶段目标。
+bootstrap pipeline 稳定之后。源码中已有 Linux x86_64/aarch64、Wasm `wasm32-unknown-unknown`、
+WASI `wasm32-wasi` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke。
+WASI executable 依赖本地 wasi-sdk，默认安装在：
+
+```text
+$JIANG_HOME/toolchains/wasi-sdk/<version>/<host>
+```
+
+未设置 `JIANG_HOME` 时使用 `~/.jiang`。可通过以下脚本安装：
+
+```bash
+bash ./script/install_wasi.sh
+```
+
+其他 target 的 executable、linker 和 startup 路径仍是实验能力。inline asm 已作为内建
+DSL provider 提供基础 `#asm { ... }` / `#jiang.asm { ... }` 能力，用于后续 no-libc
+syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目标。
 
 
 

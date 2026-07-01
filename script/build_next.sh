@@ -83,6 +83,7 @@ collect_llvm_link_args() {
     $("$LLVM_CONFIG" --link-static --ldflags) \
     $("$LLVM_CONFIG" --link-static --libs all) \
     $("$LLVM_CONFIG" --link-static --system-libs) \
+    $(jiang_macos_sdkroot_link_args) \
     $(jiang_llvm_cxx_runtime_link_args)
   do
     LLVM_LINK_ARGS+=(--link-arg "$arg")
