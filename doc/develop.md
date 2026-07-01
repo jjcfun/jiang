@@ -19,7 +19,7 @@
 0.4.3 release 分支的默认 bootstrap compiler 是：
 
 ```text
-../bootstrap-0.4.3/build/jiangc.next
+../bootstrap-0.4.3/build/bin/jiangc.next
 ```
 
 如果没有同级 bootstrap worktree，也可以把 0.4.3 bootstrap 编译器安装到本地环境：
@@ -37,7 +37,7 @@ bash ./script/build_next.sh
 默认构建链路：
 
 ```text
-../bootstrap-0.4.3/build/jiangc.next -> build/jiangc.next
+../bootstrap-0.4.3/build/bin/jiangc.next -> build/bin/jiangc.next
 ```
 
 脚本会校验 bootstrap compiler 版本，0.4.3 release 分支只接受 `jiang 0.4.3`。
@@ -51,7 +51,7 @@ BOOTSTRAP_BIN=/path/to/jiang-0.4.3/bin/jiangc bash ./script/build_next.sh
 
 ```bash
 VERIFY=none bash ./script/build_next.sh
-JIANGC=./build/jiangc.next bash ./script/lang_check.sh
+JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 ```
 
 正式 release 前跑 stable bootstrap 和完整验证：
@@ -99,7 +99,7 @@ bash ./script/build_next.sh
 `release/<version>` 使用 bootstrap 编译器验证：
 
 ```bash
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-<version>/build/jiangc.next \
+BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-<version>/build/bin/jiangc.next \
 JIANG_VERSION=<version> \
 bash ./script/build_next.sh
 ```

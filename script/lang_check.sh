@@ -2,13 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JIANGC="${JIANGC:-$ROOT_DIR/build/jiangc}"
+JIANGC="${JIANGC:-$ROOT_DIR/build/bin/jiangc}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
 if [ ! -x "$JIANGC" ]; then
   echo "missing compiler: $JIANGC" >&2
-  echo "set JIANGC=/path/to/jiangc or build $ROOT_DIR/build/jiangc first" >&2
+  echo "set JIANGC=/path/to/jiangc or build $ROOT_DIR/build/bin/jiangc first" >&2
   exit 2
 fi
 

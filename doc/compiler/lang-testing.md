@@ -59,7 +59,7 @@ test/lang/<feature>/
 链接运行。需要覆盖 release object/executable 路径时，设置：
 
 ```bash
-LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/jiangc bash ./script/lang_check.sh
+LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 ```
 
 这会额外对所有 `run/` 用例执行 `jiangc --mode release -o ...`，覆盖 LLVM codegen opt level 2

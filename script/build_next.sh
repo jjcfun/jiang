@@ -3,15 +3,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-NEXT_BIN="${NEXT_BIN:-$BUILD_DIR/jiangc.next}"
-JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
+BUILD_BIN_DIR="${BUILD_BIN_DIR:-$BUILD_DIR/bin}"
+NEXT_BIN="${NEXT_BIN:-$BUILD_BIN_DIR/jiangc.next}"
+JIANGC_BIN="${JIANGC_BIN:-$BUILD_BIN_DIR/jiangc}"
 VERIFY="${VERIFY:-full}"
 BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
 OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
 BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.3}"
-BOOTSTRAP_WORKTREE_BIN="${BOOTSTRAP_WORKTREE_BIN:-$ROOT_DIR/../bootstrap-$BOOTSTRAP_RELEASE_VERSION/build/jiangc.next}"
+BOOTSTRAP_WORKTREE_BIN="${BOOTSTRAP_WORKTREE_BIN:-$ROOT_DIR/../bootstrap-$BOOTSTRAP_RELEASE_VERSION/build/bin/jiangc.next}"
 INSTALLED_BOOTSTRAP_BIN="$HOME/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 DEFAULT_BOOTSTRAP_BIN="$INSTALLED_BOOTSTRAP_BIN"
 if [ -x "$BOOTSTRAP_WORKTREE_BIN" ]; then
@@ -20,7 +21,7 @@ fi
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
-mkdir -p "$BUILD_DIR"
+mkdir -p "$BUILD_DIR" "$BUILD_BIN_DIR"
 cd "$ROOT_DIR"
 
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
@@ -78,7 +79,12 @@ perl -0pi -e 's/public UInt8\[\]&? default_compiler_version\(\) \{\n    return "
 
 collect_llvm_link_args() {
   local arg
-  for arg in $("$LLVM_CONFIG" --ldflags) $("$LLVM_CONFIG" --libs all) $("$LLVM_CONFIG" --system-libs); do
+  for arg in \
+    $("$LLVM_CONFIG" --link-static --ldflags) \
+    $("$LLVM_CONFIG" --link-static --libs all) \
+    $("$LLVM_CONFIG" --link-static --system-libs) \
+    $(jiang_llvm_cxx_runtime_link_args)
+  do
     LLVM_LINK_ARGS+=(--link-arg "$arg")
   done
 }

@@ -367,7 +367,7 @@ public trait Indexable {
 ## 测试目录
 
 - `test/smoke/`：编译器内部模块和端到端 smoke，由脚本通过 `JIANGC` 指定被测编译器；
-  稳定自举验证使用 `build/jiangc.next` 或 `build/jiangc`。
+  稳定自举验证使用 `build/bin/jiangc.next` 或 `build/bin/jiangc`。
 - `test/compiler/`：按编译器内部阶段归档的测试目录，覆盖 backend、driver、incremental、
   IR dump/lower、query、resolve、sema 和 syntax 等阶段。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。

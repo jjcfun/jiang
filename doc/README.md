@@ -22,7 +22,7 @@
 当前 `release/0.4.3` 分支默认使用 `bootstrap/0.4.3` 分支产出的过渡编译器自举：
 
 ```text
-../bootstrap-0.4.3/build/jiangc.next -> build/jiangc.next
+../bootstrap-0.4.3/build/bin/jiangc.next -> build/bin/jiangc.next
 ```
 
 0.4.3 继承 0.4.2 已实现的语言和编译器能力，包括 package / dependency、Lang Package

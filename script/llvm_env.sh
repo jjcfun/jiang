@@ -8,7 +8,8 @@
 
 JIANG_LLVM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JIANG_ROOT_DIR="$(cd "$JIANG_LLVM_SCRIPT_DIR/.." && pwd)"
-JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-21}"
+JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
+JIANG_MACOS_DEPLOYMENT_TARGET="${JIANG_MACOS_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-11.0}}"
 BUILD_DIR="${BUILD_DIR:-$JIANG_ROOT_DIR/build}"
 JIANG_LLVM_CONFIG_DIR="$BUILD_DIR/config"
 JIANG_LLVM_ENV_FILE="$JIANG_LLVM_CONFIG_DIR/llvm.env"
@@ -30,27 +31,6 @@ jiang_find_llvm_config() {
     return
   fi
   if jiang_managed_llvm_config; then
-    return
-  fi
-  if command -v "llvm-config-$JIANG_LLVM_VERSION" >/dev/null 2>&1; then
-    command -v "llvm-config-$JIANG_LLVM_VERSION"
-    return
-  fi
-  for root in \
-    "/usr/lib/llvm-$JIANG_LLVM_VERSION" \
-    "/usr/local/llvm-$JIANG_LLVM_VERSION" \
-    "/opt/llvm-$JIANG_LLVM_VERSION" \
-    "/opt/llvm@$JIANG_LLVM_VERSION" \
-    "/opt/homebrew/opt/llvm@$JIANG_LLVM_VERSION" \
-    "/usr/local/opt/llvm@$JIANG_LLVM_VERSION"
-  do
-    if [ -x "$root/bin/llvm-config" ]; then
-      printf '%s\n' "$root/bin/llvm-config"
-      return
-    fi
-  done
-  if command -v llvm-config >/dev/null 2>&1; then
-    command -v llvm-config
     return
   fi
   return 1
@@ -90,10 +70,7 @@ jiang_managed_llvm_config() {
   local host
   host="$(jiang_host_tag)"
   for root in \
-    "$JIANG_ROOT_DIR/build/llvm/$host" \
-    "$JIANG_ROOT_DIR/build/llvm" \
-    "$JIANG_ROOT_DIR/.jiang/llvm/$host" \
-    "$JIANG_ROOT_DIR/.jiang/llvm"
+    "$JIANG_ROOT_DIR/build/llvm/$host/install"
   do
     if [ -x "$root/bin/llvm-config" ]; then
       printf '%s\n' "$root/bin/llvm-config"
@@ -109,7 +86,11 @@ jiang_cached_llvm_config() {
   fi
   local cached_config
   cached_config="$(sed -n 's/^LLVM_CONFIG=//p' "$JIANG_LLVM_ENV_FILE" | head -n 1)"
-  if [ -n "$cached_config" ] && [ -x "$cached_config" ]; then
+  case "$cached_config" in
+    "$JIANG_ROOT_DIR/build/llvm/"*) ;;
+    *) return 1 ;;
+  esac
+  if [ -x "$cached_config" ]; then
     printf '%s\n' "$cached_config"
     return 0
   fi
@@ -141,6 +122,17 @@ jiang_find_lld() {
   return 1
 }
 
+jiang_llvm_cxx_runtime_link_args() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "-lc++"
+      ;;
+    Linux)
+      printf '%s\n' "-lstdc++"
+      ;;
+  esac
+}
+
 jiang_write_llvm_env_file() {
   mkdir -p "$JIANG_LLVM_CONFIG_DIR"
   {
@@ -151,6 +143,8 @@ jiang_write_llvm_env_file() {
     printf 'LLVM_ROOT=%s\n' "$LLVM_ROOT"
     printf 'LLVM_CLANG=%s\n' "$LLVM_CLANG"
     printf 'LLVM_LIB_DIR=%s\n' "$LLVM_LIB_DIR"
+    printf 'JIANG_MACOS_DEPLOYMENT_TARGET=%s\n' "$JIANG_MACOS_DEPLOYMENT_TARGET"
+    printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "${MACOSX_DEPLOYMENT_TARGET:-}"
     printf 'JIANG_LLD=%s\n' "${JIANG_LLD:-}"
   } >"$JIANG_LLVM_ENV_FILE"
 }
@@ -158,7 +152,7 @@ jiang_write_llvm_env_file() {
 jiang_resolve_llvm_env() {
   LLVM_CONFIG="$(jiang_find_llvm_config || true)"
   if [ -z "$LLVM_CONFIG" ] || [ ! -x "$LLVM_CONFIG" ]; then
-    echo "missing llvm-config; install LLVM $JIANG_LLVM_VERSION or set JIANG_LLVM_ROOT/LLVM_CONFIG" >&2
+    echo "missing llvm-config; run ./script/install_llvm.sh or set JIANG_LLVM_ROOT/LLVM_CONFIG" >&2
     return 2
   fi
 
@@ -186,7 +180,13 @@ jiang_resolve_llvm_env() {
     return 2
   fi
 
-  export JIANG_LLVM_VERSION LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR JIANG_LLD
+  if [ "$(uname -s)" = "Darwin" ]; then
+    MACOSX_DEPLOYMENT_TARGET="$JIANG_MACOS_DEPLOYMENT_TARGET"
+    export MACOSX_DEPLOYMENT_TARGET
+  fi
+
+  export JIANG_LLVM_VERSION JIANG_MACOS_DEPLOYMENT_TARGET
+  export LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR JIANG_LLD
   JIANG_HOST_TARGET="${JIANG_HOST_TARGET:-$(jiang_host_target_triple)}"
   export JIANG_HOST_TARGET
   jiang_write_llvm_env_file
@@ -201,6 +201,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   printf 'LLVM_ROOT=%s\n' "$LLVM_ROOT"
   printf 'LLVM_CLANG=%s\n' "$LLVM_CLANG"
   printf 'LLVM_LIB_DIR=%s\n' "$LLVM_LIB_DIR"
+  printf 'JIANG_MACOS_DEPLOYMENT_TARGET=%s\n' "$JIANG_MACOS_DEPLOYMENT_TARGET"
+  printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "${MACOSX_DEPLOYMENT_TARGET:-}"
   printf 'JIANG_LLD=%s\n' "${JIANG_LLD:-}"
   printf 'LLVM_ENV_FILE=%s\n' "$JIANG_LLVM_ENV_FILE"
 else

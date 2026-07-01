@@ -7,7 +7,7 @@ DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 VERSION="${VERSION:-$PACKAGE_VERSION}"
 TARGET="${TARGET:-macos-arm64}"
-JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/jiangc}"
+JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/bin/jiangc}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -36,12 +36,6 @@ if ! command -v zip >/dev/null 2>&1; then
 fi
 
 llvm_version="$("$LLVM_CONFIG" --version)"
-llvm_lib_dir="$LLVM_LIB_DIR"
-llvm_dylib="$llvm_lib_dir/libLLVM.dylib"
-if [ ! -f "$llvm_dylib" ]; then
-  echo "missing LLVM dylib: $llvm_dylib" >&2
-  exit 2
-fi
 
 actual_version="$("$JIANGC_BIN" --version | sed -n '1p')"
 expected_version="jiang $VERSION"
@@ -69,22 +63,6 @@ VERSION="${VERSION%-macos-arm64}"
 PREFIX="${PREFIX:-$HOME/.jiang}"
 VERSION_DIR="$PREFIX/versions/$VERSION"
 
-if ! command -v otool >/dev/null 2>&1; then
-  echo "missing otool; install Xcode Command Line Tools." >&2
-  exit 2
-fi
-
-llvm_dylib="$(otool -L "$ROOT_DIR/bin/jiangc" | awk '/libLLVM\.dylib/ { print $1; exit }')"
-if [ -z "$llvm_dylib" ] || [ ! -f "$llvm_dylib" ]; then
-  echo "missing llvm@21 runtime dependency." >&2
-  if [ -n "$llvm_dylib" ]; then
-    echo "Expected dylib: $llvm_dylib" >&2
-  fi
-  echo "Install it with:" >&2
-  echo "  bash \"$ROOT_DIR/script/install_llvm.sh\"" >&2
-  exit 2
-fi
-
 mkdir -p "$VERSION_DIR" "$PREFIX/bin"
 rm -rf "$VERSION_DIR/bin"
 cp -R "$ROOT_DIR/bin" "$VERSION_DIR/bin"
@@ -93,9 +71,6 @@ chmod +x "$VERSION_DIR/bin/jiangc"
 ln -sfn "../versions/$VERSION/bin/jiangc" "$PREFIX/bin/jiangc"
 
 echo "Installed Jiang $VERSION to $VERSION_DIR"
-echo
-echo "LLVM dependency:"
-echo "  $llvm_dylib"
 echo
 echo "Add this to your shell profile if needed:"
 echo "  export PATH=\"$PREFIX/bin:\$PATH\""
@@ -108,13 +83,7 @@ chmod +x "$PACKAGE_DIR/install.sh"
 cat >"$PACKAGE_DIR/README.md" <<README
 # Jiang $VERSION ($TARGET)
 
-This package depends on macOS arm64 LLVM 21 at runtime.
-
-Install LLVM first:
-
-\`\`\`bash
-bash ./script/install_llvm.sh
-\`\`\`
+This package statically links LLVM into `jiangc`; users do not need a local LLVM runtime.
 
 Then install Jiang:
 
@@ -135,11 +104,10 @@ Use a custom prefix with:
 PREFIX=/usr/local ./install.sh
 \`\`\`
 
-Build-time LLVM detected by the release script:
+Build-time LLVM used by the release script:
 
 \`\`\`text
 LLVM $llvm_version
-$llvm_dylib
 \`\`\`
 README
 

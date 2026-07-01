@@ -51,7 +51,12 @@ clang_bin="$LLVM_CLANG"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc.stage2"
 llvm_link_args=()
 
-for arg in $("$LLVM_CONFIG" --ldflags) $("$LLVM_CONFIG" --libs all) $("$LLVM_CONFIG" --system-libs); do
+for arg in \
+  $("$LLVM_CONFIG" --link-static --ldflags) \
+  $("$LLVM_CONFIG" --link-static --libs all) \
+  $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_llvm_cxx_runtime_link_args)
+do
   llvm_link_args+=(--link-arg "$arg")
 done
 

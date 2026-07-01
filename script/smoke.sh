@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
-JIANGC="${JIANGC:-$BUILD_DIR/jiangc}"
+JIANGC="${JIANGC:-$BUILD_DIR/bin/jiangc}"
 SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2"
 
 source "$ROOT_DIR/script/llvm_env.sh"
@@ -19,9 +19,10 @@ link_and_run_llvm_smoke() {
 
   clang_bin="$LLVM_CLANG"
   "$clang_bin" "$ll_file" -o "$output" \
-    $("$LLVM_CONFIG" --ldflags) \
-    $("$LLVM_CONFIG" --libs all) \
-    $("$LLVM_CONFIG" --system-libs)
+    $("$LLVM_CONFIG" --link-static --ldflags) \
+    $("$LLVM_CONFIG" --link-static --libs all) \
+    $("$LLVM_CONFIG" --link-static --system-libs) \
+    $(jiang_llvm_cxx_runtime_link_args)
   "$output"
 }
 

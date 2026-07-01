@@ -86,7 +86,12 @@ printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nI
 printf 'import fs = "%s";\nInt main() { if (fs.exists("/tmp")) { 0 } else { 1 } }\n' "$system_fs_import_path" >"$system_fs_sample"
 printf 'Int main() { Int![*] values = Int!$.alloc_many(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
 
-for arg in $("$LLVM_CONFIG" --ldflags) $("$LLVM_CONFIG" --libs all) $("$LLVM_CONFIG" --system-libs); do
+for arg in \
+  $("$LLVM_CONFIG" --link-static --ldflags) \
+  $("$LLVM_CONFIG" --link-static --libs all) \
+  $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_llvm_cxx_runtime_link_args)
+do
   llvm_link_args+=(--link-arg "$arg")
 done
 
@@ -101,17 +106,19 @@ rm -rf "$BUILD_DIR/cache"
 "$compiler_bin" --emit-llvm -o "$sample_ll" "$sample"
 test -s "$sample_ll"
 "$clang_bin" "$sample_ll" -o "$sample_from_ll" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+  $("$LLVM_CONFIG" --link-static --ldflags) \
+  $("$LLVM_CONFIG" --link-static --libs all) \
+  $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_llvm_cxx_runtime_link_args)
 "$sample_from_ll"
 
 "$compiler_bin" --emit-obj -o "$sample_obj" "$sample"
 test -s "$sample_obj"
 "$clang_bin" "$sample_obj" -o "$sample_from_obj" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+  $("$LLVM_CONFIG" --link-static --ldflags) \
+  $("$LLVM_CONFIG" --link-static --libs all) \
+  $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_llvm_cxx_runtime_link_args)
 "$sample_from_obj"
 
 "$compiler_bin" --no-link-libc --emit-llvm -o "$alloc_no_libc_ll" "$alloc_sample"
@@ -282,9 +289,10 @@ grep -q "unsupported target triple: x86_64-unknown-freebsd" "$unsupported_target
 "$compiler_bin" --mode release --emit-obj -o "$sample_release_obj" "$sample"
 test -s "$sample_release_obj"
 "$clang_bin" "$sample_release_obj" -o "$sample_from_release_obj" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+  $("$LLVM_CONFIG" --link-static --ldflags) \
+  $("$LLVM_CONFIG" --link-static --libs all) \
+  $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_llvm_cxx_runtime_link_args)
 "$sample_from_release_obj"
 
 "$compiler_bin" --mode release -o "$sample_release_bin" "$sample"
@@ -300,9 +308,10 @@ test "$package_status" -eq 52
 "$compiler_bin" --emit-llvm -o "$field_ll" "$field_sample"
 test -s "$field_ll"
 "$clang_bin" "$field_ll" -o "$field_bin" \
-  $("$LLVM_CONFIG" --ldflags) \
-  $("$LLVM_CONFIG" --libs all) \
-  $("$LLVM_CONFIG" --system-libs)
+  $("$LLVM_CONFIG" --link-static --ldflags) \
+  $("$LLVM_CONFIG" --link-static --libs all) \
+  $("$LLVM_CONFIG" --link-static --system-libs) \
+  $(jiang_llvm_cxx_runtime_link_args)
 "$field_bin"
 
 echo "OK"
