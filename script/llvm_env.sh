@@ -14,6 +14,7 @@ JIANG_MACOS_DEPLOYMENT_TARGET="${JIANG_MACOS_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYM
 BUILD_DIR="${BUILD_DIR:-$JIANG_ROOT_DIR/build}"
 JIANG_LLVM_CONFIG_DIR="$BUILD_DIR/config"
 JIANG_LLVM_ENV_FILE="$JIANG_LLVM_CONFIG_DIR/llvm.env"
+JIANG_BUILD_HELPER_BIN="${JIANG_BUILD_HELPER_BIN:-$BUILD_DIR/bin/jiang-build}"
 
 jiang_find_llvm_config() {
   if [ -n "${JIANG_LLVM_ROOT:-}" ] && [ -x "$JIANG_LLVM_ROOT/bin/llvm-config" ]; then
@@ -138,15 +139,47 @@ jiang_macos_sdkroot_link_args() {
   if [ "$(uname -s)" != "Darwin" ]; then
     return 0
   fi
-  local sdkroot
-  sdkroot="${SDKROOT:-}"
-  if [ -z "$sdkroot" ] && command -v xcrun >/dev/null 2>&1; then
-    sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+  jiang_build_helper macos-sdkroot-link-args
+}
+
+jiang_build_helper_compiler() {
+  for compiler in \
+    "${BOOTSTRAP_BIN:-}" \
+    "${COMPILER_UNDER_TEST:-}" \
+    "${JIANGC:-}"
+  do
+    if [ -n "$compiler" ] && [ -x "$compiler" ]; then
+      printf '%s\n' "$compiler"
+      return 0
+    fi
+  done
+  if command -v jiangc >/dev/null 2>&1; then
+    command -v jiangc
+    return 0
   fi
-  if [ -n "$sdkroot" ]; then
-    printf '%s\n' "-isysroot"
-    printf '%s\n' "$sdkroot"
+  return 1
+}
+
+jiang_ensure_build_helper() {
+  if [ -x "$JIANG_BUILD_HELPER_BIN" ] && \
+    [ "$JIANG_BUILD_HELPER_BIN" -nt "$JIANG_ROOT_DIR/src/build/main.jiang" ] && \
+    [ "$JIANG_BUILD_HELPER_BIN" -nt "$JIANG_ROOT_DIR/src/build/sdk.jiang" ]; then
+    return 0
   fi
+  local compiler
+  compiler="$(jiang_build_helper_compiler || true)"
+  if [ -z "$compiler" ]; then
+    echo "missing Jiang bootstrap compiler for build helper" >&2
+    return 2
+  fi
+  mkdir -p "$(dirname "$JIANG_BUILD_HELPER_BIN")"
+  "$compiler" --target "$JIANG_HOST_TARGET" --linker "$LLVM_CLANG" -o "$JIANG_BUILD_HELPER_BIN" \
+    "$JIANG_ROOT_DIR/src/build/main.jiang"
+}
+
+jiang_build_helper() {
+  jiang_ensure_build_helper
+  "$JIANG_BUILD_HELPER_BIN" "$@"
 }
 
 jiang_write_llvm_env_file() {
