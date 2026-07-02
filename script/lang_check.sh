@@ -15,6 +15,24 @@ fi
 cd "$ROOT_DIR"
 
 status=0
+llvm_link_args=()
+jiang_llvm_link_args=()
+
+collect_llvm_link_args() {
+  local arg
+  for arg in \
+    $("$LLVM_CONFIG" --link-static --ldflags) \
+    $("$LLVM_CONFIG" --link-static --libs all) \
+    $("$LLVM_CONFIG" --link-static --system-libs) \
+    $(jiang_macos_sdkroot_link_args) \
+    $(jiang_llvm_cxx_runtime_link_args)
+  do
+    llvm_link_args+=("$arg")
+    jiang_llvm_link_args+=(--link-arg "$arg")
+  done
+}
+
+collect_llvm_link_args
 
 run_check_case() {
   local source="$1"
@@ -83,7 +101,7 @@ run_run_case() {
     return
   fi
 
-  if ! "$LLVM_CLANG" "$llvm_output" -o "$executable" -L"$LLVM_LIB_DIR" -lLLVM >/tmp/jiang_lang_run_link.out 2>&1; then
+  if ! "$LLVM_CLANG" "$llvm_output" -o "$executable" "${llvm_link_args[@]}" >/tmp/jiang_lang_run_link.out 2>&1; then
     echo "FAIL run $source link failed"
     sed -n '1,120p' /tmp/jiang_lang_run_link.out
     status=1
@@ -120,8 +138,7 @@ run_release_case() {
 
   if ! "$JIANGC" \
     --mode release \
-    --link-arg "-L$LLVM_LIB_DIR" \
-    --link-arg -lLLVM \
+    "${jiang_llvm_link_args[@]}" \
     -o "$executable" \
     "$source" >/tmp/jiang_lang_release_build.out 2>&1; then
     echo "FAIL release-run $source build failed"

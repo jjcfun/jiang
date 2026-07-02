@@ -9,8 +9,7 @@ JIANGC_BIN="${JIANGC_BIN:-$BUILD_BIN_DIR/jiangc}"
 VERIFY="${VERIFY:-full}"
 BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
-JIANG_VERSION="${JIANG_VERSION:-$PACKAGE_VERSION}"
-OPTIONS_FILE="$ROOT_DIR/src/driver/options.jiang"
+JIANG_VERSION="$PACKAGE_VERSION"
 BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.3}"
 BOOTSTRAP_WORKTREE_BIN="${BOOTSTRAP_WORKTREE_BIN:-$ROOT_DIR/../bootstrap-$BOOTSTRAP_RELEASE_VERSION/build/bin/jiangc.next}"
 INSTALLED_BOOTSTRAP_BIN="$HOME/.jiang/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
@@ -22,6 +21,7 @@ fi
 source "$ROOT_DIR/script/llvm_env.sh"
 
 mkdir -p "$BUILD_DIR" "$BUILD_BIN_DIR"
+cp "$ROOT_DIR/package.ini" "$BUILD_DIR/package.ini"
 cd "$ROOT_DIR"
 
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
@@ -68,14 +68,6 @@ case "$JIANG_VERSION" in
     exit 2
     ;;
 esac
-
-OPTIONS_FILE_ORIGINAL="$(cat "$OPTIONS_FILE")"
-restore_options_file() {
-  printf '%s' "$OPTIONS_FILE_ORIGINAL" >"$OPTIONS_FILE"
-}
-trap restore_options_file EXIT
-
-perl -0pi -e 's/public UInt8\[\]&? default_compiler_version\(\) \{\n    return "[^"]*";\n\}/public UInt8[]& default_compiler_version() {\n    return "'"$JIANG_VERSION"'";\n}/' "$OPTIONS_FILE"
 
 collect_llvm_link_args() {
   local arg

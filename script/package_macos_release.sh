@@ -49,6 +49,7 @@ rm -rf "$PACKAGE_DIR" "$PACKAGE_ZIP"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/script"
 
 cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiangc"
+cp "$ROOT_DIR/package.ini" "$PACKAGE_DIR/package.ini"
 cp "$ROOT_DIR/script/install_llvm.sh" "$PACKAGE_DIR/script/install_llvm.sh"
 chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/script/install_llvm.sh"
 
@@ -66,6 +67,8 @@ VERSION_DIR="$PREFIX/versions/$VERSION"
 mkdir -p "$VERSION_DIR" "$PREFIX/bin"
 rm -rf "$VERSION_DIR/bin"
 cp -R "$ROOT_DIR/bin" "$VERSION_DIR/bin"
+cp "$ROOT_DIR/package.ini" "$VERSION_DIR/package.ini"
+cp "$ROOT_DIR/package.ini" "$PREFIX/package.ini"
 chmod +x "$VERSION_DIR/bin/jiangc"
 
 ln -sfn "../versions/$VERSION/bin/jiangc" "$PREFIX/bin/jiangc"
