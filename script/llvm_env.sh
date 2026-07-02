@@ -122,11 +122,46 @@ jiang_macos_sdkroot_link_args() {
   jiang_build_helper macos-sdkroot-link-args
 }
 
+jiang_build_helper_bootstrap_sdkroot_link_args() {
+  if [ "$(uname -s)" != "Darwin" ]; then
+    return 0
+  fi
+  if [ -x "$JIANG_BUILD_HELPER_BIN" ]; then
+    "$JIANG_BUILD_HELPER_BIN" macos-sdkroot-link-args
+    return $?
+  fi
+  if [ -n "${SDKROOT:-}" ] && [ -d "$SDKROOT" ]; then
+    printf '%s\n' "-isysroot"
+    printf '%s\n' "$SDKROOT"
+    return 0
+  fi
+  if command -v xcrun >/dev/null 2>&1; then
+    local sdkroot
+    sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+    if [ -n "$sdkroot" ] && [ -d "$sdkroot" ]; then
+      printf '%s\n' "-isysroot"
+      printf '%s\n' "$sdkroot"
+      return 0
+    fi
+  fi
+  return 0
+}
+
+jiang_build_helper_bootstrap_link_args() {
+  local arg
+  for arg in $(jiang_build_helper_bootstrap_sdkroot_link_args); do
+    printf '%s\n' "--link-arg"
+    printf '%s\n' "$arg"
+  done
+}
+
 jiang_build_helper_compiler() {
   for compiler in \
     "${BOOTSTRAP_BIN:-}" \
     "${COMPILER_UNDER_TEST:-}" \
-    "${JIANGC:-}"
+    "${JIANGC:-}" \
+    "$JIANG_ROOT_DIR/build/bin/jiangc.next" \
+    "$JIANG_ROOT_DIR/build/bin/jiangc"
   do
     if [ -n "$compiler" ] && [ -x "$compiler" ]; then
       printf '%s\n' "$compiler"
@@ -138,6 +173,17 @@ jiang_build_helper_compiler() {
     return 0
   fi
   return 1
+}
+
+jiang_absolute_path() {
+  case "$1" in
+    /*)
+      printf '%s\n' "$1"
+      ;;
+    *)
+      printf '%s/%s\n' "$(cd "$(dirname "$1")" && pwd)" "$(basename "$1")"
+      ;;
+  esac
 }
 
 jiang_ensure_build_helper() {
@@ -152,9 +198,15 @@ jiang_ensure_build_helper() {
     echo "missing Jiang bootstrap compiler for build helper" >&2
     return 2
   fi
+  compiler="$(jiang_absolute_path "$compiler")"
   mkdir -p "$(dirname "$JIANG_BUILD_HELPER_BIN")"
-  "$compiler" --target "$JIANG_HOST_TARGET" --linker "$LLVM_CLANG" -o "$JIANG_BUILD_HELPER_BIN" \
-    "$JIANG_ROOT_DIR/src/build/main.jiang"
+  (
+    cd "$JIANG_ROOT_DIR"
+    "$compiler" --linker "$LLVM_CLANG" \
+      $(jiang_build_helper_bootstrap_link_args) \
+      -o "$JIANG_BUILD_HELPER_BIN" \
+      "src/build/main.jiang"
+  )
 }
 
 jiang_build_helper() {
