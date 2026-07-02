@@ -81,6 +81,8 @@ wasi_target_obj="$SMOKE_BUILD_DIR/minimal_wasi.o"
 wasi_target_bin="$SMOKE_BUILD_DIR/minimal_wasi.wasm"
 wasi_provider_sample="$SMOKE_BUILD_DIR/wasi_provider.jiang"
 wasi_provider_bin="$SMOKE_BUILD_DIR/wasi_provider.wasm"
+wasi_provider_stdout="$SMOKE_BUILD_DIR/wasi_provider.stdout"
+wasi_provider_stderr="$SMOKE_BUILD_DIR/wasi_provider.stderr"
 wasi_provider_sandbox="$SMOKE_BUILD_DIR/wasi_sandbox"
 linux_no_libc_exe_log="$SMOKE_BUILD_DIR/linux_no_libc_executable.log"
 windows_exe_log="$SMOKE_BUILD_DIR/windows_executable.log"
@@ -116,6 +118,8 @@ Int main() {
     if (value[3] != UInt8(105)) { return 28; }
     if (value[4] != UInt8(111)) { return 29; }
     if (value[5] != UInt8(107)) { return 30; }
+    if (!std.io.stdout().write_all("stdout-ok"[..])) { return 31; }
+    if (!std.io.stderr().write_all("stderr-ok"[..])) { return 32; }
     return 0;
 }
 
@@ -315,8 +319,11 @@ if [ "$wasi_exe_status" -eq 0 ]; then
     mkdir -p "$wasi_provider_sandbox"
     rm -f "$wasi_provider_sandbox/wasi-file.txt"
     "$compiler_bin" --target wasm32-wasi -o "$wasi_provider_bin" "$wasi_provider_sample"
-    wasmtime -C cache=n --env JIANG_WASI_ENV=wasiok --dir "$wasi_provider_sandbox::/sandbox" "$wasi_provider_bin" a b
+    wasmtime -C cache=n --env JIANG_WASI_ENV=wasiok --dir "$wasi_provider_sandbox::/sandbox" \
+      "$wasi_provider_bin" a b >"$wasi_provider_stdout" 2>"$wasi_provider_stderr"
     grep -q "fs-ok" "$wasi_provider_sandbox/wasi-file.txt"
+    grep -q "stdout-ok" "$wasi_provider_stdout"
+    grep -q "stderr-ok" "$wasi_provider_stderr"
   fi
 else
   grep -q "wasi_sdk_missing" "$wasi_exe_log"
