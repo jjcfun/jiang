@@ -79,6 +79,9 @@ wasm_target_obj="$SMOKE_BUILD_DIR/minimal_wasm.o"
 wasi_target_ll="$SMOKE_BUILD_DIR/minimal_wasi.ll"
 wasi_target_obj="$SMOKE_BUILD_DIR/minimal_wasi.o"
 wasi_target_bin="$SMOKE_BUILD_DIR/minimal_wasi.wasm"
+wasi_provider_sample="$SMOKE_BUILD_DIR/wasi_provider.jiang"
+wasi_provider_bin="$SMOKE_BUILD_DIR/wasi_provider.wasm"
+wasi_provider_sandbox="$SMOKE_BUILD_DIR/wasi_sandbox"
 linux_no_libc_exe_log="$SMOKE_BUILD_DIR/linux_no_libc_executable.log"
 windows_exe_log="$SMOKE_BUILD_DIR/windows_executable.log"
 wasm_exe_log="$SMOKE_BUILD_DIR/wasm_executable.log"
@@ -89,6 +92,15 @@ printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
 printf 'import fs = "%s";\nInt main() { if (fs.exists("/tmp")) { 0 } else { 1 } }\n' "$system_fs_import_path" >"$system_fs_sample"
 printf 'Int main() { Int![*] values = Int!$.alloc_many(2); values[0] = 1; values$.free(); 0 }\n' >"$alloc_sample"
+cat >"$wasi_provider_sample" <<'EOF'
+import std;
+
+Int main() {
+    if (std.process.arguments().length < 1) { return 10; }
+    if (!std.fs.write_all("/sandbox/wasi-file.txt", "fs-ok"[..])) { return 15; }
+    return 0;
+}
+EOF
 
 for arg in \
   $("$LLVM_CONFIG" --link-static --ldflags) \
@@ -272,6 +284,11 @@ if [ "$wasi_exe_status" -eq 0 ]; then
   fi
   if command -v wasmtime >/dev/null 2>&1; then
     wasmtime -C cache=n "$wasi_target_bin"
+    mkdir -p "$wasi_provider_sandbox"
+    rm -f "$wasi_provider_sandbox/wasi-file.txt"
+    "$compiler_bin" --target wasm32-wasi -o "$wasi_provider_bin" "$wasi_provider_sample"
+    wasmtime -C cache=n --dir "$wasi_provider_sandbox::/sandbox" "$wasi_provider_bin"
+    grep -q "fs-ok" "$wasi_provider_sandbox/wasi-file.txt"
   fi
 else
   grep -q "wasi_sdk_missing" "$wasi_exe_log"
