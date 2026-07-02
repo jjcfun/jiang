@@ -15,6 +15,7 @@ JIANG_LLVM_BUILD_TYPE="${JIANG_LLVM_BUILD_TYPE:-Release}"
 JIANG_LLVM_PARALLEL="${JIANG_LLVM_PARALLEL:-}"
 JIANG_LLVM_FORCE_BUILD="${JIANG_LLVM_FORCE_BUILD:-0}"
 JIANG_MACOS_DEPLOYMENT_TARGET="${JIANG_MACOS_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-11.0}}"
+JIANG_LLVM_BOOTSTRAP_ROOT="${JIANG_LLVM_BOOTSTRAP_ROOT:-}"
 
 host_tag() {
   local os
@@ -67,6 +68,41 @@ build_parallel_args() {
   fi
 }
 
+bootstrap_clang() {
+  if [ -n "$JIANG_LLVM_BOOTSTRAP_ROOT" ] && [ -x "$JIANG_LLVM_BOOTSTRAP_ROOT/bin/clang" ]; then
+    printf '%s\n' "$JIANG_LLVM_BOOTSTRAP_ROOT/bin/clang"
+    return 0
+  fi
+  if command -v clang >/dev/null 2>&1; then
+    command -v clang
+    return 0
+  fi
+  return 1
+}
+
+bootstrap_clangxx() {
+  if [ -n "$JIANG_LLVM_BOOTSTRAP_ROOT" ] && [ -x "$JIANG_LLVM_BOOTSTRAP_ROOT/bin/clang++" ]; then
+    printf '%s\n' "$JIANG_LLVM_BOOTSTRAP_ROOT/bin/clang++"
+    return 0
+  fi
+  if command -v clang++ >/dev/null 2>&1; then
+    command -v clang++
+    return 0
+  fi
+  return 1
+}
+
+cmake_bootstrap_compiler_args() {
+  local clang
+  local clangxx
+  clang="$(bootstrap_clang || true)"
+  clangxx="$(bootstrap_clangxx || true)"
+  if [ -n "$clang" ] && [ -n "$clangxx" ]; then
+    printf '%s\n' "-DCMAKE_C_COMPILER=$clang"
+    printf '%s\n' "-DCMAKE_CXX_COMPILER=$clangxx"
+  fi
+}
+
 cmake_macos_deployment_args() {
   if [ "$(uname -s)" = "Darwin" ]; then
     printf '%s\n' "-DCMAKE_OSX_DEPLOYMENT_TARGET=$JIANG_MACOS_DEPLOYMENT_TARGET"
@@ -84,7 +120,7 @@ install_managed_llvm() {
   install_dir="$(llvm_install_prefix)"
 
   if [ "$JIANG_LLVM_FORCE_BUILD" != "1" ] && [ -x "$install_dir/bin/llvm-config" ]; then
-    JIANG_LLVM_ROOT="$install_dir" "$ROOT_DIR/script/llvm_env.sh"
+    "$ROOT_DIR/script/llvm_env.sh"
     exit 0
   fi
 
@@ -97,6 +133,7 @@ install_managed_llvm() {
 
   cmake \
     $(cmake_generator_args) \
+    $(cmake_bootstrap_compiler_args) \
     $(cmake_macos_deployment_args) \
     -S "$source_dir" \
     -B "$build_dir" \
@@ -117,7 +154,7 @@ install_managed_llvm() {
   cmake --build "$build_dir" $(build_parallel_args)
   cmake --install "$build_dir"
 
-  JIANG_LLVM_ROOT="$install_dir" "$ROOT_DIR/script/llvm_env.sh"
+  "$ROOT_DIR/script/llvm_env.sh"
 }
 
 case "$(uname -s)" in

@@ -9,6 +9,7 @@
 JIANG_LLVM_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JIANG_ROOT_DIR="$(cd "$JIANG_LLVM_SCRIPT_DIR/.." && pwd)"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
+JIANG_LLVM_TOOLCHAIN_DIR="${JIANG_LLVM_TOOLCHAIN_DIR:-$JIANG_HOME/toolchains/llvm}"
 JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
 JIANG_MACOS_DEPLOYMENT_TARGET="${JIANG_MACOS_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-11.0}}"
 BUILD_DIR="${BUILD_DIR:-$JIANG_ROOT_DIR/build}"
@@ -17,18 +18,6 @@ JIANG_LLVM_ENV_FILE="$JIANG_LLVM_CONFIG_DIR/llvm.env"
 JIANG_BUILD_HELPER_BIN="${JIANG_BUILD_HELPER_BIN:-$BUILD_DIR/bin/jiang-build}"
 
 jiang_find_llvm_config() {
-  if [ -n "${JIANG_LLVM_ROOT:-}" ] && [ -x "$JIANG_LLVM_ROOT/bin/llvm-config" ]; then
-    printf '%s\n' "$JIANG_LLVM_ROOT/bin/llvm-config"
-    return
-  fi
-  if [ -n "${LLVM_CONFIG:-}" ]; then
-    printf '%s\n' "$LLVM_CONFIG"
-    return
-  fi
-  if [ -n "${LLVM_ROOT:-}" ] && [ -x "$LLVM_ROOT/bin/llvm-config" ]; then
-    printf '%s\n' "$LLVM_ROOT/bin/llvm-config"
-    return
-  fi
   if jiang_cached_llvm_config; then
     return
   fi
@@ -72,7 +61,7 @@ jiang_managed_llvm_config() {
   local host
   host="$(jiang_host_tag)"
   for root in \
-    "$JIANG_HOME/toolchains/llvm/$JIANG_LLVM_VERSION/$host"
+    "$JIANG_LLVM_TOOLCHAIN_DIR/$JIANG_LLVM_VERSION/$host"
   do
     if [ -x "$root/bin/llvm-config" ]; then
       printf '%s\n' "$root/bin/llvm-config"
@@ -89,7 +78,7 @@ jiang_cached_llvm_config() {
   local cached_config
   cached_config="$(sed -n 's/^LLVM_CONFIG=//p' "$JIANG_LLVM_ENV_FILE" | head -n 1)"
   case "$cached_config" in
-    "$JIANG_HOME/toolchains/llvm/"*) ;;
+    "$JIANG_LLVM_TOOLCHAIN_DIR/"*) ;;
     *) return 1 ;;
   esac
   if [ -x "$cached_config" ]; then
@@ -108,15 +97,6 @@ jiang_find_lld() {
     printf '%s\n' "$LLVM_BINDIR/ld.lld"
     return 0
   fi
-  for path in \
-    "/opt/homebrew/opt/lld/bin/ld.lld" \
-    "/usr/local/opt/lld/bin/ld.lld"
-  do
-    if [ -x "$path" ]; then
-      printf '%s\n' "$path"
-      return 0
-    fi
-  done
   if command -v ld.lld >/dev/null 2>&1; then
     command -v ld.lld
     return 0
@@ -178,7 +158,7 @@ jiang_ensure_build_helper() {
 }
 
 jiang_build_helper() {
-  jiang_ensure_build_helper
+  jiang_ensure_build_helper || return $?
   "$JIANG_BUILD_HELPER_BIN" "$@"
 }
 
@@ -201,7 +181,7 @@ jiang_write_llvm_env_file() {
 jiang_resolve_llvm_env() {
   LLVM_CONFIG="$(jiang_find_llvm_config || true)"
   if [ -z "$LLVM_CONFIG" ] || [ ! -x "$LLVM_CONFIG" ]; then
-    echo "missing llvm-config; run ./script/install_llvm.sh or set JIANG_LLVM_ROOT/LLVM_CONFIG" >&2
+    echo "missing managed llvm-config; run ./script/install_llvm.sh" >&2
     return 2
   fi
 
@@ -234,7 +214,7 @@ jiang_resolve_llvm_env() {
     export MACOSX_DEPLOYMENT_TARGET
   fi
 
-  export JIANG_LLVM_VERSION JIANG_MACOS_DEPLOYMENT_TARGET
+  export JIANG_LLVM_VERSION JIANG_LLVM_TOOLCHAIN_DIR JIANG_MACOS_DEPLOYMENT_TARGET
   export LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR JIANG_LLD
   JIANG_HOST_TARGET="${JIANG_HOST_TARGET:-$(jiang_host_target_triple)}"
   export JIANG_HOST_TARGET

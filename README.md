@@ -37,10 +37,10 @@ $JIANG_HOME/toolchains/llvm/<version>/<host>
 build/toolchains/llvm/<version>/<host>/build
 ```
 
-构建脚本会通过 `script/llvm_env.sh` 查找 `LLVM_CONFIG`、`JIANG_LLVM_ROOT`、`LLVM_ROOT`、
-缓存的 `LLVM_CONFIG` 和 `$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。
-不会自动 fallback 到系统全局 LLVM；需要使用外部 LLVM 时必须显式设置 `JIANG_LLVM_ROOT`
-或 `LLVM_CONFIG`。
+构建脚本会通过 `script/llvm_env.sh` 查找 Jiang 托管的 LLVM：
+`$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。LLVM 源码来自
+`vendor/llvm-project` submodule，构建临时目录在 `build/toolchains/llvm/`，不会写入
+submodule 目录。脚本不会 fallback 到系统全局 LLVM，也不接受外部 `LLVM_CONFIG` 覆盖。
 
 ```bash
 bash ./script/install_llvm.sh

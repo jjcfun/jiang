@@ -13,8 +13,6 @@ TARGET="${TARGET:-macos-arm64}"
 PACKAGE_NAME="jiang-$VERSION-$TARGET"
 PACKAGE_ZIP="$DIST_DIR/$PACKAGE_NAME.zip"
 PACKAGE_DIR="$UNPACK_DIR/$PACKAGE_NAME"
-HOST_TAG="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
-MANAGED_LLVM_ROOT="$BUILD_DIR/llvm/$HOST_TAG/install"
 
 cd "$ROOT_DIR"
 
@@ -61,7 +59,6 @@ require_command otool
 
 printf '== release smoke: LLVM toolchain ==\n'
 bash ./script/install_llvm.sh >/dev/null
-export JIANG_LLVM_ROOT="${JIANG_LLVM_ROOT:-$MANAGED_LLVM_ROOT}"
 source ./script/llvm_env.sh
 printf 'LLVM %s at %s\n' "$LLVM_VERSION" "$LLVM_ROOT"
 printf 'macOS deployment target: %s\n' "${MACOSX_DEPLOYMENT_TARGET:-}"
