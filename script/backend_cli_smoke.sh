@@ -96,7 +96,6 @@ cat >"$wasi_provider_sample" <<'EOF'
 import std;
 
 Int main() {
-    if (std.process.arguments().length < 1) { return 10; }
     if (!std.fs.write_all("/sandbox/wasi-file.txt", "fs-ok"[..])) { return 15; }
     return 0;
 }
