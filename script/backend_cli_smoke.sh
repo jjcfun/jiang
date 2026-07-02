@@ -96,6 +96,10 @@ cat >"$wasi_provider_sample" <<'EOF'
 import std;
 
 Int main() {
+    std.process.ProgramArguments args = std.process.arguments();
+    if (args.length != 3) { return 14; }
+    if (!text_equal(args.argument(1)[..], "a")) { return 13; }
+    if (!text_equal(args.argument(2)[..], "b")) { return 12; }
     if (!std.fs.write_all("/sandbox/wasi-file.txt", "fs-ok"[..])) { return 15; }
     guard std.fs.read_all("/sandbox/wasi-file.txt") is .some(text) else { return 16; }
     if (text.length != 5) { return 17; }
@@ -113,6 +117,16 @@ Int main() {
     if (value[4] != UInt8(111)) { return 29; }
     if (value[5] != UInt8(107)) { return 30; }
     return 0;
+}
+
+Bool text_equal(UInt8[]& lhs, UInt8[]& rhs) {
+    if (lhs.length != rhs.length) { return false; }
+    Int! index = 0;
+    while (index < lhs.length) {
+        if (lhs[index] != rhs[index]) { return false; }
+        index = index + 1;
+    }
+    return true;
 }
 EOF
 
@@ -301,7 +315,7 @@ if [ "$wasi_exe_status" -eq 0 ]; then
     mkdir -p "$wasi_provider_sandbox"
     rm -f "$wasi_provider_sandbox/wasi-file.txt"
     "$compiler_bin" --target wasm32-wasi -o "$wasi_provider_bin" "$wasi_provider_sample"
-    wasmtime -C cache=n --env JIANG_WASI_ENV=wasiok --dir "$wasi_provider_sandbox::/sandbox" "$wasi_provider_bin"
+    wasmtime -C cache=n --env JIANG_WASI_ENV=wasiok --dir "$wasi_provider_sandbox::/sandbox" "$wasi_provider_bin" a b
     grep -q "fs-ok" "$wasi_provider_sandbox/wasi-file.txt"
   fi
 else
