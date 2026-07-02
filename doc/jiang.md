@@ -866,11 +866,25 @@ lambda 规则：
 
 ```c
 @where(T: Numeric, E2: CompareError)
-async T[]&@E1 sort<T, E1, E2>(T[]& list,Fn<async Fn<async Bool@E2, T, T>@E1, T[]&> compare)
+async T[]&@E1 sort<T, E1, E2>(T[]& list, Fn<async Fn<async Bool@E2, T, T>@E1, T[]&> compare)
 
 @where(T: Numeric, E2: CompareError)
 @alias(Cmp = Fn<async Bool@E2, T, T>)
 async T[]&@E1 sort<T, E1, E2>(T[]& list, Fn<async Cmp@E1, T[]&> compare)
+```
+
+`unsafe` 和 `async` 可以写在 `Fn<...>` 的返回类型前，表示这个函数类型带有对应调用效果：
+
+```c
+Fn<async Bool>[]& callback_list;
+Fn<unsafe Int, Int>[]& unsafe_callbacks;
+```
+
+`Fn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。`unsafe` 和 `async` 不修饰
+`Bool` 这个返回值类型，而是修饰外层 `Fn<...>` 函数类型。如果函数本身异步并返回切片引用，应写成：
+
+```c
+Fn<async Bool[]&> load_callbacks;
 ```
 
 ### 控制流（Control Flow）
@@ -1676,6 +1690,20 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
 关联类型绑定优先写在 trait bound 内部，例如 `@where(T: Sequence<Element = Int>)`；需要单独写 projection equality 时，使用显式 trait 投影，例如 `@where(T.[Sequence].Element == Int)`。
+
+同一个声明前的 attribute 按源码顺序应用，并且都作用在当前声明自己的 namespace 上。
+当前声明的泛型参数会先进入这个 namespace；后面的 attribute 可以引用前面 attribute
+引入的名字，前面的 attribute 不能引用后面的名字。attribute 引入的名字只在当前声明的
+签名、约束、成员和函数体中可见，不泄漏到外层模块。
+
+`@alias(Name = Type)` 可以定义声明局部类型别名。一个 `@alias(...)` 可以包含多个逗号分隔的
+绑定；这些绑定等价于按顺序拆成多个 `@alias`，因此后面的绑定可以引用前面引入的名字：
+
+```c
+@alias(Items = T[]&, Cmp = Fn<Bool, Items, Items>)
+@where(T: Hashable)
+Cmp compare<T>(Items left, Items right)
+```
 `Name == Type` / `Name != Type` 也可用于类型形状匹配，pattern 中的 `_` 表示单个 type argument
 wildcard，例如 `@where(T == Box<_>)`、`@where(T != Option<_>)`。后缀语法糖在这里按 canonical
 builtin type 匹配：`T[]` 匹配 `Slice<_>`，`T[N]` 匹配 `Array<_, _>`。

@@ -43,6 +43,7 @@ public struct BodyCheck: Movable {
     table.HashTable<qid.DefId, Int>! body_states;
     list.ArrayList<LocalInitBinding>! local_init_states;
     Int! assignment_target_depth;
+    types.EffectSet! current_effects;
 
     public init(check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
         self.state = state;
@@ -52,6 +53,7 @@ public struct BodyCheck: Movable {
         self.body_states = table.HashTable<qid.DefId, Int>();
         self.local_init_states = list.ArrayList<LocalInitBinding>();
         self.assignment_target_depth = 0;
+        self.current_effects = types.EffectSet();
     }
 
     public () check_bodies() {
@@ -184,7 +186,9 @@ public struct BodyCheck: Movable {
     qid.TypeId check_decl_body(qid.DefId def_id, hir.HirDef& hir_def, hir.HirId root) {
         list.ArrayList<LocalInitBinding>! saved_local_init_states = self.clone_local_init_states();
         Int saved_assignment_target_depth = self.assignment_target_depth;
+        types.EffectSet saved_effects = self.current_effects;
         self.begin_local_init_body(def_id);
+        self.current_effects = self.effects_for_decl_body(hir_def);
 
         qid.TypeId! result = self.state.store.types.invalid_type();
         if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
@@ -198,7 +202,18 @@ public struct BodyCheck: Movable {
 
         self.restore_local_init_states(saved_local_init_states$.ref());
         self.assignment_target_depth = saved_assignment_target_depth;
+        self.current_effects = saved_effects;
         return result;
+    }
+
+    types.EffectSet effects_for_decl_body(hir.HirDef& hir_def) {
+        guard hir_def.decl.function_signature is .some(signature) else {
+            return types.EffectSet();
+        }
+        return types.EffectSet(
+            has_unsafe: signature.effects.has_unsafe,
+            has_async: signature.effects.has_async
+        );
     }
 
     () begin_local_init_body(qid.DefId def_id) {
@@ -855,35 +870,54 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_block(hir.HirBlock block) {
+        types.EffectSet saved_effects = self.enter_block_effects(block.effects);
         Int! index = 0;
         while (index < block.statements.length) {
             qid.TypeId statement_type = self.check_node(block.statements[index]);
             // `return` / `break` / `continue` 的类型是 Never。block 一旦在语义上
-            // 已经终止，就不能再按“无 tail expr 的 Unit block”处理。
+            // 已经终止，就不能再按“无 tail expr 的 unit block”处理。
             if (self.type_ops.is_never_type(statement_type)) {
+                self.current_effects = saved_effects;
                 return statement_type;
             }
             index = index + 1;
         }
         if (block.result is .some(result)) {
-            return self.check_node(result);
+            qid.TypeId result_type = self.check_node(result);
+            self.current_effects = saved_effects;
+            return result_type;
         }
+        self.current_effects = saved_effects;
         return self.state.store.types.unit_type();
     }
 
     qid.TypeId check_block_expected(hir.HirBlock block, qid.TypeId expected_type) {
+        types.EffectSet saved_effects = self.enter_block_effects(block.effects);
         Int! index = 0;
         while (index < block.statements.length) {
             qid.TypeId statement_type = self.check_node(block.statements[index]);
             if (self.type_ops.is_never_type(statement_type)) {
+                self.current_effects = saved_effects;
                 return statement_type;
             }
             index = index + 1;
         }
         if (block.result is .some(result)) {
-            return self.check_node_expected(result, expected_type);
+            qid.TypeId result_type = self.check_node_expected(result, expected_type);
+            self.current_effects = saved_effects;
+            return result_type;
         }
+        self.current_effects = saved_effects;
         return self.state.store.types.unit_type();
+    }
+
+    types.EffectSet enter_block_effects(hir.HirEffectSet effects) {
+        types.EffectSet saved = self.current_effects;
+        self.current_effects = types.EffectSet(
+            has_unsafe: self.current_effects.has_unsafe || effects.has_unsafe,
+            has_async: self.current_effects.has_async || effects.has_async
+        );
+        return saved;
     }
 
     qid.TypeId check_defer(hir.HirId node_id, hir.HirDefer defer_stmt) {
@@ -1751,7 +1785,12 @@ public struct BodyCheck: Movable {
             }
             index = index + 1;
         }
-        return self.state.store.types.function_type(params$.move(), function_type.result, token.Span());
+        return self.state.store.types.function_type_with_effects(
+            params$.move(),
+            function_type.result,
+            token.Span(),
+            function_type.effects
+        );
     }
 
     Bool function_has_receiver(qid.DefId function_def) {
@@ -2798,6 +2837,7 @@ public struct BodyCheck: Movable {
             }
             return self.state.store.types.invalid_type();
         }
+        self.check_call_effects(node_id, function_type.effects);
         if (!self.record_ordered_call_args_for_function_type(node_id, call, function_type)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
@@ -2939,6 +2979,7 @@ public struct BodyCheck: Movable {
             }
             return self.state.store.types.invalid_type();
         }
+        self.check_call_effects(node_id, function_type.effects);
         if (!self.record_ordered_call_args(node_id, call)) {
             self.check_call_args(call);
             self.type_ops.add_node_error(
@@ -2955,6 +2996,23 @@ public struct BodyCheck: Movable {
         self.record_call_generic_instance(node_id, call, target_def, type_args);
         self.mark_call_lowering_plan(node_id, call, selected_def);
         return self.check_selected_call_args(node_id, call, selected_def, type_args, function_type);
+    }
+
+    () check_call_effects(hir.HirId node_id, types.EffectSet required) {
+        if (required.has_unsafe && !self.current_effects.has_unsafe) {
+            self.type_ops.add_node_error(
+                node_id,
+                "unsafe function call requires unsafe context",
+                "unsafe_call_requires_unsafe_context"
+            );
+        }
+        if (required.has_async && !self.current_effects.has_async) {
+            self.type_ops.add_node_error(
+                node_id,
+                "async function call requires async context",
+                "async_call_requires_async_context"
+            );
+        }
     }
 
     () record_call_callee_receiver_instance(hir.HirId callee_id, qid.DefId selected_def) {

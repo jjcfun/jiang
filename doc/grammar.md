@@ -92,7 +92,14 @@ member_decl <- leading_annotation* member_modifier* member_decl_body
 leading_annotation
             <- "@" "where" "(" where_constraints ")"
              / "@" "life" "(" life_constraints ")"
+             / "@" "alias" "(" alias_attribute_bindings ")"
              / "@" "self" "(" self_receiver_mode ")"
+
+alias_attribute_bindings
+            <- alias_attribute_binding ("," alias_attribute_binding)* ","?
+
+alias_attribute_binding
+            <- name "=" type
 
 self_receiver_mode
             <- "ref" / "move"
@@ -126,6 +133,14 @@ Jiang 统一把 `@where(...)`、`@life(...)`、`@intrinsic(...)` 这类
 `@name(...)` 形式称为 attribute。`@intrinsic(value, T)` /
 `@intrinsic(type, T)` 是编译器内部声明 `$` 内禀操作的 attribute block，
 只允许编译器内部源码和标准库内部源码使用；普通用户源码写 `@intrinsic` 会报错。
+
+同一个声明前的 attribute 按源码顺序应用，并且都作用在当前声明自己的 namespace 上。
+当前声明的泛型参数会先进入这个 namespace；后面的 attribute 可以引用前面 attribute
+引入的名字，前面的 attribute 不能引用后面的名字。attribute 引入的名字只在当前声明的
+签名、约束、成员和函数体中可见，不泄漏到外层模块。
+
+`@alias(Name = Type)` 是声明局部类型别名。一个 `@alias(...)` 可以包含多个逗号分隔的绑定；
+这些绑定等价于按顺序拆成多个 `@alias`，因此后面的绑定可以引用前面引入的名字。
 
 ```peg
 nominal_decl
@@ -291,6 +306,9 @@ name        <- ident / "self"
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
+- `Fn<unsafe T, ...>` 和 `Fn<async T, ...>` 表示带调用效果的函数类型。调用效果前缀写在
+  `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数类型；因此
+  `Fn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
 
