@@ -97,6 +97,13 @@ import std;
 
 Int main() {
     if (!std.fs.write_all("/sandbox/wasi-file.txt", "fs-ok"[..])) { return 15; }
+    guard std.fs.read_all("/sandbox/wasi-file.txt") is .some(text) else { return 16; }
+    if (text.length != 5) { return 17; }
+    if (text[0] != UInt8(102)) { return 18; }
+    if (text[1] != UInt8(115)) { return 19; }
+    if (text[2] != UInt8(45)) { return 20; }
+    if (text[3] != UInt8(111)) { return 21; }
+    if (text[4] != UInt8(107)) { return 22; }
     return 0;
 }
 EOF
