@@ -40,7 +40,7 @@ test/lang/<feature>/
 - `aggregate`：tuple、array、slice、struct 默认构造、union constructor。
 - `function`：tail expr、call stmt、overload、default params、named args、constructor args。
 - `control_flow`：if/switch/guard/while/for/range/defer/break/continue/Never 合并。
-- `nominal`：struct/enum/union/init/deinit/static/instance method/member namespace。
+- `nominal`：struct/enum/union/init/deinit/type function/instance method/member namespace。
 - `generic`：generic type/function、where bound、trait conformance、associated type、monomorph。
 - `ownership`：implicit copy、Movable、explicit move、borrow reference、drop/defer cleanup。
 - `lifetime`：`@life` 语法、返回引用、字段引用、逃逸失败。

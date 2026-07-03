@@ -66,13 +66,14 @@ Token 只表示词法事实，不承载语义类型。
   identifier，lexer 应产生 `unicode_punctuation` 诊断。
 - 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
   `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`trait`、
-  `extend`、`associated`、`static`、`switch`、`try`、`catch`、`break`、`continue`、
+  `extend`、`associated`、`switch`、`try`、`catch`、`break`、`continue`、
   `defer`、`throw`、`true`、`false`、`null`、`self`、`Self`。
 - 字符字面量使用单引号，例如 `'a'`。
 - 字符串字面量使用双引号，文本按 UTF-8 字节序列处理。
 - `Span` 使用字节偏移和字节长度；line/column 在诊断阶段计算。
 
-`Self` 是类型位置的特殊名字。`self` 是类型内部 instance method 和 constructor body 中的 contextual keyword，表示当前 receiver 或初始化目标；`static` 类型函数中没有 `self`。
+`Self` 是类型位置的特殊名字。`self` 是类型内部实例函数、`init` 和 `deinit` 的显式参数名，
+表示当前 receiver 或初始化目标。没有 `self` 参数的类型内部函数是类型函数。
 
 ## Lang Package / 自定义语法
 
@@ -192,7 +193,11 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
 - 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
 
-内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的 static extension 方法。
+内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、
+`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、
+`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
+`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应
+builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的类型函数。
 
 sentinel value 使用 `const T S` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
 元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型不是 move-only。
@@ -340,8 +345,8 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 - `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
 - `T[:0]`：带 sentinel 的 unsized array type，必须通过 `T[:0]&` 形成 sentinel slice view，或通过 `T[:0]^` 形成 owning handle；sentinel view 保证 `data[length] == 0`。
 
-标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice()` 使用 `@self(move)` 消耗
-receiver，并把 initialized 区间转移为 owning `T[]^`。
+标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice(Self self)` 消耗 receiver，
+并把 initialized 区间转移为 owning `T[]^`。
 
 `T&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]&` 字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，不能作为普通字段类型。
 
@@ -774,18 +779,18 @@ type check 会把 call args 重排成函数签名顺序，并把缺失参数替�
 T add<T>(T left, T right);
 ```
 
-`init` / `deinit` 是目标语言的一部分。`init(...)` 定义构造函数，
-`deinit()` 定义析构逻辑；构造 sugar 使用 `Type(...)`，堆分配构造使用 `new Type(...)`。
+`init` / `deinit` 是目标语言的一部分。`init(self, ...)` 定义构造函数，
+`deinit(self)` 定义析构逻辑；构造 sugar 使用 `Type(...)`，堆分配构造使用 `new Type(...)`。
 
 ## Struct、Enum、Union
 
-`struct` 用于普通名义类型，支持实例方法、static 方法、`init` 和 `deinit`。
+`struct` 用于普通名义类型，支持类型函数、实例函数、`init` 和 `deinit`。
 
 `enum` 表示有限命名成员集合。
 
 `union` 是 tagged union，也属于 sum type。Jiang 的 `union` 可以复用 enum-like tag，但语义上是带 tag 的 union。
 
-union variant 和普通/static method 共用 `Type.member` 访问面，不能同名。
+union variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
 
 union variant 的外部可见性由外层类型是否 public 控制。
 
@@ -824,16 +829,16 @@ union variant 声明按 grammar 使用字段式写法，所有 variant 必须写
 
 ```jiang
 trait Equatable {
-    static Bool equal(Self& lhs, Self& rhs);
+    Bool equal(Self& lhs, Self& rhs);
 }
 
 trait Hashable: Equatable {
-    UInt64 hash();
+    UInt64 hash(self);
 }
 
 trait Indexable {
-    Int to_index();
-    static Self from_index(Int index);
+    Int to_index(self);
+    Self from_index(Int index);
 }
 ```
 
@@ -843,26 +848,33 @@ trait Indexable {
 - `extend` 的目标只要求是可扩展 type namespace provider，不要求目标是源码中的 nominal
   `struct`。因此 builtin type、array、slice、sentinel slice、pointer/reference/box 等类型
   都可以通过 core 或 std 源码挂载方法和 trait implementation；`Tuple` 和 `Fn` 暂不支持。
-- 类型内部非 `static` 函数是 instance method，拥有隐式 receiver。默认 receiver 是 `@self(ref)`，函数体内 `self: Self&`；`@self(move)` 表示调用会消耗 receiver，函数体内 `self: Self`。
-- `static` 类型函数没有 receiver，函数体中不能使用 `self`。
-- `init(...)` 是 constructor，拥有初始化中的 `self` 目标；`self` 在 `init` body 中表示正在初始化的 `Self` storage。`init` 只能通过 `Type(...)` / `new Type(...)` 调用，不作为普通函数值暴露。
+- 第一个参数是 `self` 的类型内部函数是 instance method，`self` 的类型为 `Self&`。
+- 第一个参数是 `Self self` 的类型内部函数是 move receiver method，调用会消耗 receiver。
+- 没有 receiver 参数的类型内部函数是类型函数，函数体中不能使用 `self`。
+- `init(self, ...)` 是 constructor，拥有初始化中的 `self` 目标；`self` 在 `init` body
+  中表示正在初始化的 `Self` storage。`init` 只能通过 `Type(...)` / `new Type(...)`
+  调用，不作为普通函数值暴露。
 - 字段能否被赋值由字段类型本身决定：字段类型必须带 `!`。instance method 的 `self` 可以写入 `Self` 内部声明为 `!` 的字段。
 - 第一版不需要 `mutating` 或等价标记；修改 `!` 字段是普通 instance method 能力。方法是否会修改状态属于后续 effect proposal，不进入第一版类型规则。
-- 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`@self(move)` 方法等价于传入 `value$.move()`，调用后原 receiver 失效。
+- 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self`
+  方法等价于传入 `value$.move()`，调用后原 receiver 失效。
 - 如果 receiver 已经是 pointer/reference，`ref.method(args...)` 也等价于 `Type.method(ref, args...)`。
 - `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver 类型。
-- instance method 作为函数值时，隐式 receiver 展开为第一个参数。例如 `Int get()` 的函数值类型是 `Fn<Int, Self&>`；`@self(move) Int take()` 的函数值类型是 `Fn<Int, Self>`。`static` 函数值没有 receiver 参数。
-- trait 可以声明 static function requirement；static requirement 没有 `self`，通过
-  `Type.method(args...)` 调用，也可以在泛型约束中通过 `T.method(args...)` 调用。
-  非 `static` trait function requirement 隐含 `Self&` receiver。
+- instance method 作为函数值时，显式 receiver 保留为第一个参数。例如 `Int get(self)`
+  的函数值类型是 `Fn<Int, Self&>`；`Int take(Self self)` 的函数值类型是 `Fn<Int, Self>`。
+  类型函数没有 receiver 参数。
+- trait 可以声明没有 receiver 参数的类型函数 requirement，通过 `Type.method(args...)`
+  调用，也可以在泛型约束中通过 `T.method(args...)` 调用。
+  带 `self` 参数的 trait function requirement 是实例函数 requirement。
 - trait 本身不是普通值类型；动态 trait view 通过 compiler-provided companion type
   表达：`Trait.Any` 和 `Trait.Receiver`。`Trait$.ref(value)` 生成 borrowed dynamic view，
   不移动原值；`Trait$.new(value)` 生成 owning dynamic view，返回 `Trait.Any^`。
   `Trait.VTable` 是 compiler-private 方法表类型，用户源码不能直接命名或传参。当前实现支持
-  ref receiver method 的动态分派和 owning trait object drop，暂不支持 `@self(move)` trait
-  object dispatch。
+  ref receiver method 的动态分派和 owning trait object drop，暂不支持 move receiver
+  trait object dispatch。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get() -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
-- union variant name 和同一 union 的 static/显式 method name 共享类型成员命名空间，不能重名，避免 `Union.member(...)` 歧义。
+- union variant name 和同一 union 的类型函数/显式 method name 共享类型成员命名空间，
+  不能重名，避免 `Union.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须
   能区分调用。
 - `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。

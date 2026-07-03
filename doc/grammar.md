@@ -71,7 +71,7 @@ intrinsic_receiver_kind
 extern_block
             <- "extern" "{" extern_item* "}"
 
-extern_item <- "public"? "static"? (extern_function_decl / extern_global_decl)
+extern_item <- "public"? (extern_function_decl / extern_global_decl)
 
 global_destructure
             <- "(" destructure_binding ("," destructure_binding)* ")"
@@ -93,7 +93,6 @@ leading_annotation
             <- "@" "where" "(" where_constraints ")"
              / "@" "life" "(" life_constraints ")"
              / "@" "alias" "(" alias_attribute_bindings ")"
-             / "@" "self" "(" self_receiver_mode ")"
 
 alias_attribute_bindings
             <- alias_attribute_binding ("," alias_attribute_binding)* ","?
@@ -101,16 +100,12 @@ alias_attribute_bindings
 alias_attribute_binding
             <- name "=" type
 
-self_receiver_mode
-            <- "ref" / "move"
-
 decl_modifier
             <- "public"
              / "extern" keyword_options?
 
 member_modifier
             <- "public"
-             / "static"
 
 keyword_options
             <- "[" keyword_option ("," keyword_option)* ","? "]"
@@ -320,6 +315,8 @@ name        <- ident / "self"
 - `Fn<unsafe T, ...>` 和 `Fn<async T, ...>` 表示带调用效果的函数类型。调用效果前缀写在
   `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数类型；因此
   `Fn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
+- 需要进入调用效果上下文时使用 `do [options] { ... }`；例如 `do [unsafe] { ... }`
+  允许调用 unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
 
@@ -351,10 +348,10 @@ struct_member_body
             <- deinit_decl
              / init_decl
              / assoc_type_impl
-             / "static"? method_decl
+             / method_decl
              / field_decl
 
-deinit_decl <- "deinit" "(" ")" block
+deinit_decl <- "deinit" "(" "self" ")" block
 
 init_decl   <- "init" "?"? name? "(" param_list? ")" block
 
@@ -421,7 +418,7 @@ associated_type_decl
             <- "associated" name (":" type_bound)? ";"
 
 trait_method_decl
-            <- "static"? result_type name function_tail
+            <- result_type name function_tail
 ```
 
 ## extend

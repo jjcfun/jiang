@@ -55,7 +55,8 @@ Token 只记录词法事实，不承载语义类型。identifier、关键字和�
 
 基础类型名例如 `Int`、`UInt8`、`Bool`、`Float`、`Double`、`Char` 都不是词法关键字，而是由 resolver 解析到内建声明的普通名字。
 
-`Self` 是类型位置的特殊名字。`self` 是类型内部 instance method 和 constructor body 中的 contextual keyword，表示当前 receiver 或初始化目标；`static` 类型函数中没有 `self`。
+`Self` 是类型位置的特殊名字。`self` 是类型内部实例函数、`init` 和 `deinit` 的显式参数名，
+表示当前 receiver 或初始化目标。没有 `self` 参数的类型内部函数是类型函数。
 
 ### 类型概要
 
@@ -748,7 +749,7 @@ Fn<Bool, Int, Int> compare;
 当前支持：
 
 - 普通顶层函数衰减为 `Fn<...>`
-- `static` 方法衰减为 `Fn<...>`
+- 类型函数衰减为 `Fn<...>`
 - 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
 - `Fn<...>` 的返回类型可以写成 `T@E`
 - 通过 `Fn<...>` 变量进行调用
@@ -770,11 +771,11 @@ Fn<Bool, Int, Int> compare = less;
 Bool ok = compare(1, 2);
 ```
 
-示例 2：`static` 方法
+示例 2：类型函数
 
 ```c
 struct Math {
-    static Bool less(Int left, Int right) {
+    Bool less(Int left, Int right) {
         return left < right;
     }
 }
@@ -885,6 +886,14 @@ Fn<unsafe Int, Int>[]& unsafe_callbacks;
 
 ```c
 Fn<async Bool[]&> load_callbacks;
+```
+
+调用带 `unsafe` effect 的函数需要进入显式 effect context：
+
+```c
+Int value = do [unsafe] {
+    unsafe_callback(1)
+};
 ```
 
 ### 控制流（Control Flow）
@@ -1286,10 +1295,9 @@ struct 可以自定义 `init` 函数。
 
 - `init` 是结构体内的特殊构造器入口
 - `init` 允许可见性修饰，例如 `public init(...)`
-- `init` 隐式拥有 `self`
+- `init` 必须显式声明 `self` 参数
 - `init` 不声明返回类型，语义等价于 `()`
 - `init` 只允许 `return;` / `return ();`
-- `init` 不能写成 `static init`
 - `Point(...)` / `new Point(...)` 是结构体构造语法
 - 如果类型定义了一个或多个 `init`，那么 `Point(...)` 会在这些 `init` 中按参数个数和参数类型做重载决议
 - `init` 支持普通位置参数、命名参数和尾部默认参数，规则与普通函数一致
@@ -1310,12 +1318,12 @@ struct Point {
   Int x;
   Int y;
 
-  public init(Int x, Int y) {
+  public init(self, Int x, Int y) {
     self.x = x;
     self.y = y;
   }
 
-  public init(Int value) {
+  public init(self, Int value) {
     self.x = value;
     self.y = value;
   }
@@ -1335,10 +1343,10 @@ struct 还可以定义 `deinit` 函数。
 `deinit` 具有以下语义：
 
 - `deinit` 是结构体内唯一的特殊析构器入口
-- `deinit` 隐式拥有 `self`
+- `deinit` 必须显式声明 `self` 参数
 - `deinit` 不声明返回类型，语义等价于 `()`
 - `deinit` 只允许 `return;` / `return ();`
-- `deinit` 不允许 `public` / `static` 等可见性或静态修饰
+- `deinit` 不允许 `public` 等可见性修饰
 - `deinit` 由该 nominal 的 drop 触发，不作为普通方法暴露
 - `ptr$.dealloc()` 是低层释放操作，不作为普通析构入口使用
 - 定义了 `deinit` 的 nominal type 必须声明 `Movable`
@@ -1357,20 +1365,20 @@ struct Buffer {
 
 #### 名义类型内部函数
 
-除 `init` 外，名义类型当前都可以定义普通内部函数。第一版使用 `static` 区分类型函数与实例函数：
+除 `init` / `deinit` 外，名义类型当前都可以定义普通内部函数。
+函数是否是实例函数由参数列表决定：
 
-- `static Ret foo(...)`：类型函数，只允许 `Type.foo(...)`
-- `Ret foo(...)`：实例函数，函数体内有隐式 `self`，只允许 `value.foo(...)`
+- `Ret foo(...)`：类型函数，只允许 `Type.foo(...)`
+- `Ret foo(self, ...)`：实例函数，`self` 的类型为 `Self&`，支持 `value.foo(...)`
+- `Ret foo(Self self, ...)`：move receiver 实例函数，调用会消耗 receiver
 
-实例函数默认使用 `@self(ref)` receiver，也就是 `self` 的类型为 `Self&`。
-需要让方法消耗 receiver 时，可以写 `@self(move)`：
+需要让方法消耗 receiver 时，使用 `Self self` 作为第一个参数：
 
 ```jiang
 struct Box: Movable {
     Int value;
 
-    @self(move)
-    Int consume() {
+    Int consume(Self self) {
         self.value
     }
 }
@@ -1381,32 +1389,33 @@ Int use() {
 }
 ```
 
-调用 `box.consume()` 后，`box` 已经被 move，后续不能再使用。`@self(...)` 只支持
-`ref` 和 `move`，并且只能写在实例方法上；`static` 方法、`init` 和 `deinit` 不支持。
+调用 `box.consume()` 后，`box` 已经被 move，后续不能再使用。旧 receiver attribute
+当前不再作为合法实例方法语法使用。
 
 当前适用范围：
 
-- `struct`：支持 `init`、static 方法、实例方法
-- `union`：支持 static 方法、实例方法
-- `enum`：支持 static 方法、实例方法
+- `struct`：支持 `init`、`deinit`、类型函数、实例函数
+- `union`：支持类型函数、实例函数
+- `enum`：支持类型函数、实例函数
 
-`init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。`union` / `enum` 不承诺自定义生命周期入口。
-union variant 和普通/static method 共用 `Type.member` 访问面，不能同名。
+`init` / `deinit` 仍然是 `struct` 的特殊生命周期入口。
+`union` / `enum` 不承诺自定义生命周期入口。
+union variant 和普通类型函数/实例函数共用 `Type.member` 访问面，不能同名。
 
 ```c
 struct User {
   Int id;
 
-  init(Int id) {
+  init(self, Int id) {
     self.id = id;
     return;
   }
 
-  static Int zero() {
+  Int zero() {
     return 0;
   }
 
-  Int value() {
+  Int value(self) {
     return self.id;
   }
 }
@@ -1421,11 +1430,11 @@ enum Mode {
   read,
   write,
 
-  static Int answer() {
+  Int answer() {
     return 42;
   }
 
-  Int value() {
+  Int value(self) {
     return self.value;
   }
 }
@@ -1440,11 +1449,11 @@ union Result {
   Int a;
   Int b;
 
-  static Int answer() {
+  Int answer() {
     return 42;
   }
 
-  Int value() {
+  Int value(self) {
     return self.a;
   }
 }
@@ -1819,7 +1828,7 @@ DefId 暴露，所以可以直接用于 `@where(...)`。标准库 trait 也可�
 
 ```c
 trait Equatable {
-  static Bool equal(Self& lhs, Self& rhs);
+  Bool equal(Self& lhs, Self& rhs);
 }
 
 trait Hashable: Equatable {
@@ -1831,7 +1840,7 @@ trait 也可以继承一个或多个父 trait：
 
 ```c
 trait HashEq: Hashable {
-  static Bool equal(Self& lhs, Self& rhs);
+  Bool equal(Self& lhs, Self& rhs);
 }
 ```
 
@@ -1894,7 +1903,7 @@ Int c = value_fn(receiver);
 
 当前实现支持 borrowed trait object `Trait$.ref(value)` 和 owning trait object `Trait$.new(value)`。
 `Trait$.new(value)` 会为 receiver 创建 owning storage，并在 `Trait.Any^` drop 时通过
-receiver type info 触发 receiver drop。`@self(move)` trait object dispatch 暂不支持；如果 trait
+receiver type info 触发 receiver drop。move receiver trait object dispatch 暂不支持；如果 trait
 中存在 move receiver requirement，构造 `Trait.Any` / `Trait.Receiver` 会编译失败。
 
 trait 还可以在 trait 体内部使用 `associated` 声明关联类型：
@@ -2086,9 +2095,9 @@ extend User: HasValue {
 当前 `extend` 的限制：
 
 - method 不进入模块顶层命名空间
-- method body 中的 `self` 默认是 receiver `Self&`；`@self(move)` 方法中 `self` 是拥有值 `Self`
+- `self` 参数表示 receiver `Self&`；`Self self` 表示拥有值 receiver
 - 字段能否赋值只由字段类型本身是否 mutable 决定
-- 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`@self(move)` 方法会消耗 `value`
+- 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self` 方法会消耗 `value`
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式
 - `extend Holder<T>` / `extend Box<T>` 可以声明 generic receiver extension；`extend Holder<Int>` 这类 specialized target 暂不支持，使用 `@where(T == Int) extend Holder<T> { ... }`

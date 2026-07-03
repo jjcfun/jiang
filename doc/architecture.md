@@ -320,8 +320,8 @@ src/
 
 ```jiang
 public trait Indexable {
-    Int to_index();
-    static Self from_index(Int index);
+    Int to_index(self);
+    Self from_index(Int index);
 }
 ```
 
