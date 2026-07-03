@@ -19,12 +19,14 @@
 
 ## 当前分支
 
-当前 `release/0.4.3` 分支默认使用 `bootstrap/0.4.3` 分支产出的过渡编译器自举：
+当前 `release/0.4.4` 分支默认使用 `bootstrap/0.4.4` 分支产出的过渡编译器自举：
 
 ```text
-../bootstrap-0.4.3/build/bin/jiangc.next -> build/bin/jiangc.next
+../bootstrap-0.4.4/build/bin/jiangc.next -> build/bin/jiangc.next
 ```
 
-0.4.3 继承 0.4.2 已实现的语言和编译器能力，包括 package / dependency、Lang Package
-自定义语法、core 源码化入口、trait object、MIR/backend、layout/ABI 基础和源码级语言测试。
+0.4.4 继承 0.4.3 已实现的语言和编译器能力，包括 package / dependency、Lang Package
+自定义语法、core 源码化入口、trait object、MIR/backend、layout/ABI、inline asm、WASI
+输出和源码级语言测试。当前分支重点是关键字 options 语法收口、移除 `public [get]`，
+以及标准库容器和编译器内部字符串所有权修复。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

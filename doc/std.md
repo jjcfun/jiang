@@ -20,9 +20,9 @@ import std;
 - `io`：标准输入输出能力，当前主要 re-export `system/io.jiang`。
 - `process`：进程参数、环境变量和可执行文件查找，当前主要 re-export `system/process.jiang`。
 - `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`many_pointer()` 和 `into_slice()`。
-  `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；字段 `length` 和方法 `length()` 都表示
-  已初始化元素数量，不包含 `capacity`。`capacity` 只表示 `Vector` 自己管理的 spare capacity，
-  不属于 `Contiguous` 语义。
+  `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；`length()` 表示已初始化元素数量，
+  不包含 `capacity()`。`capacity()` 只表示 `Vector` 自己管理的 spare capacity，
+  不属于 `Contiguous` 语义。内部 `length` / `capacity` 字段不是公开接口。
 - `String`：UTF-8 字节字符串，当前仍处于基础能力阶段。
 - 内建类型和 trait 的公开别名：例如 `Option<T>`、`Result<T, E>`、`Box<T>`、`Reference<T>`、
   `Slice<T>`、`SentinelSlice<T, S>`、`RawPointer<T>`、`ManyPointer<T>` 等。
@@ -60,4 +60,4 @@ identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节�
 
 `std` 不代表 no-libc/freestanding 已经可用。当前稳定路径仍是 hosted target；inline asm 已作为
 builtin provider 提供基础能力，但 freestanding runtime、target runtime object 和 Linux no-libc
-静态 executable 仍在 0.4.3 后续阶段继续设计。
+静态 executable 仍在后续阶段继续设计。

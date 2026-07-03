@@ -8,7 +8,7 @@
 
 常规版本从 `main` 建立 `release/<version>`，使用上一版正式 release 的 `jiangc` 构建当前源码。
 当当前版本需要 bootstrap 分支承接破坏性升级时，`release/<version>` 使用同版本 bootstrap
-编译器继续开发和验证。0.4.3 属于这个模式。
+编译器继续开发和验证。0.4.4 属于这个模式。
 
 推荐安装路径：
 
@@ -16,16 +16,16 @@
 ~/.jiang/versions/<previous-version>/bin/jiangc
 ```
 
-0.4.3 release 分支的默认 bootstrap compiler 是：
+0.4.4 release 分支的默认 bootstrap compiler 是：
 
 ```text
-../bootstrap-0.4.3/build/bin/jiangc.next
+../bootstrap-0.4.4/build/bin/jiangc.next
 ```
 
-如果没有同级 bootstrap worktree，也可以把 0.4.3 bootstrap 编译器安装到本地环境：
+如果没有同级 bootstrap worktree，也可以把 0.4.4 bootstrap 编译器安装到本地环境：
 
 ```text
-~/.jiang/versions/0.4.3/bin/jiangc
+~/.jiang/versions/0.4.4-bootstrap/bin/jiangc
 ```
 
 构建当前源码：
@@ -37,14 +37,14 @@ bash ./script/build_next.sh
 默认构建链路：
 
 ```text
-../bootstrap-0.4.3/build/bin/jiangc.next -> build/bin/jiangc.next
+../bootstrap-0.4.4/build/bin/jiangc.next -> build/bin/jiangc.next
 ```
 
-脚本会校验 bootstrap compiler 版本，0.4.3 release 分支只接受 `jiang 0.4.3`。
+脚本会校验 bootstrap compiler 版本，0.4.4 release 分支只接受 `jiang 0.4.4-bootstrap`。
 如果需要使用其它路径的同版本编译器，可以显式指定：
 
 ```bash
-BOOTSTRAP_BIN=/path/to/jiang-0.4.3/bin/jiangc bash ./script/build_next.sh
+BOOTSTRAP_BIN=/path/to/jiang-0.4.4-bootstrap/bin/jiangc bash ./script/build_next.sh
 ```
 
 提交前至少跑：

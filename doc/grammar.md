@@ -106,11 +106,18 @@ self_receiver_mode
 
 decl_modifier
             <- "public"
-             / "extern"
+             / "extern" keyword_options?
 
 member_modifier
-            <- "public" ("(" "get" ")")?
+            <- "public"
              / "static"
+
+keyword_options
+            <- "[" keyword_option ("," keyword_option)* ","? "]"
+
+keyword_option
+            <- name (":" expr)?
+             / type
 
 top_level_decl_body
             <- import_decl
@@ -141,6 +148,10 @@ Jiang 统一把 `@where(...)`、`@life(...)`、`@intrinsic(...)` 这类
 
 `@alias(Name = Type)` 是声明局部类型别名。一个 `@alias(...)` 可以包含多个逗号分隔的绑定；
 这些绑定等价于按顺序拆成多个 `@alias`，因此后面的绑定可以引用前面引入的名字。
+
+关键字 options 使用 `keyword [options] ...` 形式。`extern [builtin]` 当前只用于标准库或
+编译器内部源码，用来声明编译器内建常量；普通用户源码不应依赖这个内部入口。
+旧的 `keyword(...)` options 写法不再作为 release 分支语法保留。
 
 ```peg
 nominal_decl
@@ -316,9 +327,18 @@ name        <- ident / "self"
 
 顶层可见性写在外层 `decl` 的 `decl_modifier` 中，例如
 `public struct User { ... }`。
+`struct` options 顺序无关；重复 option 会报错。`packed` 表示字段按 1 字节排列，
+`align: N` 表示结构体整体对齐至少为 `N`，`N` 必须是 2 的幂。
 
 ```peg
-struct_decl <- "struct" name generic_params? trait_list? struct_body
+struct_decl <- "struct" struct_options? name generic_params? trait_list? struct_body
+
+struct_options
+            <- "[" struct_option ("," struct_option)* ","? "]"
+
+struct_option
+            <- "packed"
+             / "align" ":" int_lit
 
 trait_list  <- ":" path ("," path)*
 
@@ -354,13 +374,14 @@ field_init  <- name ("=" expr)?
 `public enum Color { ... }`。
 
 ```peg
-enum_decl   <- "enum" ("(" type ")")? name trait_list? "{" enum_member* "}"
+enum_decl   <- "enum" ("[" type "]")? name trait_list? "{" enum_member* "}"
 
 enum_member <- member_modifier* method_decl
              / name ("=" expr)? ("," / ";")?
 ```
 
-`enum(T)` 的 `T` 必须是具体整数类型；未写 `T` 时默认使用 `Int32`。
+`enum [T]` 的 `T` 必须是具体整数类型；未写 `T` 时默认使用 `Int32`。
+旧的 `enum(T)` options 形式不再保留。
 未显式指定值的 enum case 从 `0` 开始递增；显式值目前只接受整数 literal，包括负整数字面量。
 
 ## union
@@ -369,7 +390,7 @@ enum_member <- member_modifier* method_decl
 `public union Value { ... }`。
 
 ```peg
-union_decl  <- "union" ("(" name ")")? name generic_params? trait_list? union_body
+union_decl  <- "union" ("[" name "]")? name generic_params? trait_list? union_body
 
 union_body  <- "{" union_member* "}"
 

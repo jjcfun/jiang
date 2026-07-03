@@ -3,8 +3,9 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.3` 分支继承 0.4.2 已实现的自举编译器、core 源码化入口、
-标准库孵化入口、泛型/trait 基础、Lang Package 自定义语法、MIR/backend 和源码级语言测试。
+当前 `release/0.4.4` 分支继承 0.4.3 已实现的自举编译器、core 源码化入口、
+标准库孵化入口、泛型/trait 基础、Lang Package 自定义语法、MIR/backend、inline asm、
+WASI 输出和源码级语言测试。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 

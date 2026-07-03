@@ -54,14 +54,14 @@ bash ./script/install_llvm.sh
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-构建当前源码默认依赖 `bootstrap/0.4.3` 分支产出的过渡编译器。推荐目录结构：
+构建当前源码默认依赖 `bootstrap/0.4.4` 分支产出的过渡编译器。推荐目录结构：
 
 ```text
-../bootstrap-0.4.3/build/bin/jiangc.next
+../bootstrap-0.4.4/build/bin/jiangc.next
 ```
 
-如果没有同级 bootstrap worktree，也可以把 0.4.3 bootstrap 编译器安装到
-`~/.jiang/versions/0.4.3/bin/jiangc`，或通过 `BOOTSTRAP_BIN` 显式指定。
+如果没有同级 bootstrap worktree，也可以把 0.4.4 bootstrap 编译器安装到
+`~/.jiang/versions/0.4.4-bootstrap/bin/jiangc`，或通过 `BOOTSTRAP_BIN` 显式指定。
 
 运行当前源码的自举构建：
 
@@ -72,7 +72,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-../bootstrap-0.4.3/build/bin/jiangc.next -> build/bin/jiangc.next
+../bootstrap-0.4.4/build/bin/jiangc.next -> build/bin/jiangc.next
 ```
 
 并默认用 `build/bin/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -81,7 +81,7 @@ bash ./script/build_next.sh
 build/bin/jiangc.next
 ```
 
-构建脚本会检测 bootstrap compiler 版本，只接受 `jiang 0.4.3`。如只想构建不跑验证，
+构建脚本会检测 bootstrap compiler 版本，只接受 `jiang 0.4.4-bootstrap`。如只想构建不跑验证，
 可设置 `VERIFY=none`；只跑 smoke 可设置 `VERIFY=smoke`。
 
 构建脚本默认从根目录 `package.ini` 的 `[package].version` 读取编译器版本，并校验
