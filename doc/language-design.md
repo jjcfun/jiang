@@ -390,7 +390,7 @@ Int^ value = new Int(42);
 
 _ ref = value$.ref(); // ref: Int&
 _ ptr = value$.ptr(); // ptr: Int*
-value$.free();
+value$.dealloc();
 
 Int sum = value + 100;        // 允许：value 自动解引用为 Int
 Int bad = value$.ref() + 100; // 错误：Int& 不会在结果位置继续自动解引用
@@ -448,7 +448,7 @@ struct Node: Movable {
     Int length;
 
     deinit() {
-        bytes$.free(); // 只有自定义 deinit 会释放 many pointer
+        bytes$.dealloc(); // 只有自定义 deinit 会释放 many pointer
     }
 }
 ```
@@ -557,7 +557,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 - `value$.set(new_value)`：显式写入 `T!*` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
 - `value$.addr()`：获取地址值。
-- `value$.free()`：释放默认堆分配器上的对象。
+- `value$.dealloc()`：释放默认堆分配器上的对象。
 - `optional$.some()`：强制解包 optional。
 - `Type$.size()`：类型大小。
 - `Type$.align()`：ABI 对齐。
@@ -578,7 +578,7 @@ lifetime 和 drop safety。
 
 - 总是安全或低风险的编译期查询：`Type$.size()`、`Type$.align()`、`Type$.max_align()`。
 - 类型系统强制操作：`optional$.some()`，后续需要定义失败时的诊断、trap 或静态证明规则。
-- 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.free()`、`Type$.alloc()`、`Type$.alloc(n)`、`Type$.alloc_many(n)`。
+- 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.dealloc()`、`Type$.alloc()`、`Type$.alloc(n)`、`Type$.alloc_many(n)`。
 - 需要 unsafe/cast 能力：`value$.as(Type)`。
 
 当前阶段不区分编译器源码包和普通 Jiang 包，普通 package 也默认拥有这些低层能力。最小能力集合和

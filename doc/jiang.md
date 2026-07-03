@@ -211,11 +211,11 @@ guard maybe is .some(value) else {
 `defer` 会在当前块退出时按 LIFO 顺序执行。
 
 ```c
-defer handle$.free();
+defer handle$.dealloc();
 
 defer {
     log("closing");
-    handle$.free();
+    handle$.dealloc();
 }
 ```
 
@@ -257,7 +257,7 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `a$.get()`：显式解引用 `T^` / `T&`，返回指向的值
 - `a$.move()`：显式转交当前变量的值，源变量随后失效且不再析构
 - `a$.addr()`：获取值 `a` 的地址值
-- `a$.free()`：对 `a` 做释放操作
+- `a$.dealloc()`：对 `a` 做释放操作
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.align()`：获取类型 `Int` 的 ABI 对齐
 - `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
@@ -464,7 +464,7 @@ _ raw_ref = ref$.ref(); // raw_ref: Int&
 Int explicit_value = ref$.get(); // 显式解引用
 ```
 
-`$` 操作符会阻止自动解引用，并进入隐式操作层。通过类似 `ptr$.free()`、`ptr$.ref()`、`ptr$.ptr()`、
+`$` 操作符会阻止自动解引用，并进入隐式操作层。通过类似 `ptr$.dealloc()`、`ptr$.ref()`、`ptr$.ptr()`、
 `ptr$.get()`、`ptr$.set(value)` 的语法，可以调用 pointer/reference 自身的一些低层操作。
 
 ```c
@@ -478,7 +478,7 @@ Int c = a + b;
 print("c = %d", c); // 输出： c = 300
 
 // '$' 符号阻止自动解引用，并进入 b 的隐式操作层
-b$.free();
+b$.dealloc();
 ```
 
 `$.ref()` 和 `$.ptr()` 的返回类型固定为 `T&` 和 `T*`：
@@ -528,15 +528,15 @@ _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 
 除数组、slice、many-pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]` 语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
 
-`^` owning pointer 可通过 `ptr$.free()` 主动释放默认堆分配器上的对象；`&` 引用只是非 owning 引用，不参与释放。
-`ptr$.free()` 是低层释放操作，不作为普通析构入口使用。目标语言的自动析构由作用域退出、`T^` 字段析构和类型的 `deinit()` 规则处理。
+`^` owning pointer 可通过 `ptr$.dealloc()` 主动释放默认堆分配器上的对象；`&` 引用只是非 owning 引用，不参与释放。
+`ptr$.dealloc()` 是低层释放操作，不作为普通析构入口使用。目标语言的自动析构由作用域退出、`T^` 字段析构和类型的 `deinit()` 规则处理。
 
 ```c
 // 定义一个 owning pointer，指向堆内存
 Int^ a = new Int(100);
 
 // 可以主动释放 owning pointer 管理的内存空间
-a$.free();
+a$.dealloc();
 ```
 
 ### 所有权、implicit copy 和析构
@@ -1102,11 +1102,11 @@ Int main() {
 `defer` 会在当前块退出时按 LIFO 顺序执行。
 
 ```c
-defer handle$.free();
+defer handle$.dealloc();
 
 defer {
     log("closing");
-    handle$.free();
+    handle$.dealloc();
 }
 ```
 
@@ -1340,7 +1340,7 @@ struct 还可以定义 `deinit` 函数。
 - `deinit` 只允许 `return;` / `return ();`
 - `deinit` 不允许 `public` / `static` 等可见性或静态修饰
 - `deinit` 由该 nominal 的 drop 触发，不作为普通方法暴露
-- `ptr$.free()` 是低层释放操作，不作为普通析构入口使用
+- `ptr$.dealloc()` 是低层释放操作，不作为普通析构入口使用
 - 定义了 `deinit` 的 nominal type 必须声明 `Movable`
 - 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构
 
@@ -1349,7 +1349,7 @@ struct Buffer {
   UInt8[*] data;
 
   deinit() {
-    self.data$.free();
+    self.data$.dealloc();
     return;
   }
 }
