@@ -1048,11 +1048,284 @@ struct FunctionBorrowChecker: Movable {
             self.check_operand(call_term.args[index]);
             index = index + 1;
         }
+        self.check_unique_places_call(call_term);
         self.clear_place(call_term.destination);
         if (call_term.initialized_place is .some(initialized_place)) {
             self.clear_place(initialized_place);
         }
         self.record_call_return_loan(call_term);
+    }
+
+    () check_unique_places_call(mir.MirCallTerminator call_term) {
+        Int! unique_index = 0;
+        while (unique_index < call_term.unique_places.length) {
+            self.check_unique_place_call(call_term, call_term.unique_places[unique_index]);
+            unique_index = unique_index + 1;
+        }
+    }
+
+    () check_unique_place_call(mir.MirCallTerminator call_term, mir.MirPlace unique_place) {
+        move_path.MovePathId unique_path = self.paths.path_for_place(unique_place);
+        if (!self.valid_move_path(unique_path)) { return; }
+        Int! index = 0;
+        while (index < self.dataflow.active_loans.len()) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (self.unique_place_loan_conflicts(call_term, unique_path, current, fact.target)) {
+                self.results.mark_error();
+                self.add_unique_borrow_diagnostic();
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool unique_place_loan_conflicts(
+        mir.MirCallTerminator call_term,
+        move_path.MovePathId unique_path,
+        loan.Loan current,
+        move_path.MovePathId target_path
+    ) {
+        if (!self.path_matches_or_contains(unique_path, current.source)) {
+            return false;
+        }
+        table.HashTable<Int, Bool>! visiting = table.HashTable<Int, Bool>();
+        return self.loan_target_future_used_from_successors(call_term, target_path, visiting$.ref());
+    }
+
+    Bool unique_call_uses_loan_target(mir.MirCallTerminator call_term, move_path.MovePathId target_path) {
+        Int! index = 1;
+        while (index < call_term.args.length) {
+            if (self.operand_uses_loan_target(call_term.args[index], target_path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool call_uses_loan_target(mir.MirCallTerminator call_term, move_path.MovePathId target_path) {
+        if (self.call_callee_uses_loan_target(call_term.callee, target_path)) { return true; }
+        Int! index = 0;
+        while (index < call_term.args.length) {
+            if (self.operand_uses_loan_target(call_term.args[index], target_path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool call_callee_uses_loan_target(mir.MirCallCallee callee, move_path.MovePathId target_path) {
+        if (callee is .indirect_operand(operand)) {
+            return self.operand_uses_loan_target(operand, target_path);
+        }
+        return false;
+    }
+
+    Bool loan_target_future_used_from_successors(
+        mir.MirCallTerminator call_term,
+        move_path.MovePathId target_path,
+        table.HashTable<Int, Bool>& visiting
+    ) {
+        mir.MirTerminator terminator = mir.MirTerminator (
+            span: token.Span(),
+            kind: mir.call_terminator_kind(call_term)
+        );
+        Int! index = 0;
+        while (index < mir.terminator_successor_count(terminator)) {
+            mir.MirBlockId successor = mir.terminator_successor_at(terminator, index);
+            if (self.loan_target_future_used_from_block(successor, target_path, visiting)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool loan_target_future_used_from_block(
+        mir.MirBlockId block_id,
+        move_path.MovePathId target_path,
+        table.HashTable<Int, Bool>& visiting
+    ) {
+        Int block_index = block_id.to_index();
+        if (!self.valid_block_index(block_index)) { return false; }
+        if (visiting.has(block_index)) {
+            return true;
+        }
+        visiting.set(block_index, true);
+        mir.MirBlock block = self.body.blocks[block_index];
+        Int! index = 0;
+        while (index < block.statements.length) {
+            mir.MirStatement statement = block.statements[index];
+            if (self.statement_uses_loan_target(statement, target_path)) {
+                return true;
+            }
+            if (self.statement_kills_loan_target(statement, target_path)) {
+                visiting.remove(block_index);
+                return false;
+            }
+            index = index + 1;
+        }
+        if (self.terminator_uses_loan_target(block.terminator, target_path)) {
+            return true;
+        }
+        Int! successor_index = 0;
+        while (successor_index < mir.terminator_successor_count(block.terminator)) {
+            mir.MirBlockId successor = mir.terminator_successor_at(block.terminator, successor_index);
+            if (self.loan_target_future_used_from_block(successor, target_path, visiting)) {
+                return true;
+            }
+            successor_index = successor_index + 1;
+        }
+        visiting.remove(block_index);
+        return false;
+    }
+
+    Bool statement_uses_loan_target(mir.MirStatement statement, move_path.MovePathId target_path) {
+        if (statement.kind is .assign_stmt(assign_stmt)) {
+            return self.rvalue_uses_loan_target(assign_stmt.value, target_path);
+        }
+        if (statement.kind is .forget_stmt(forget_stmt)) {
+            return self.place_uses_loan_target(forget_stmt.place, target_path);
+        }
+        return false;
+    }
+
+    Bool statement_kills_loan_target(mir.MirStatement statement, move_path.MovePathId target_path) {
+        if (statement.kind is .assign_stmt(assign_stmt)) {
+            return self.place_kills_loan_target(assign_stmt.destination, target_path);
+        }
+        if (statement.kind is .storage_dead_stmt(storage_dead)) {
+            move_path.MovePathId root = self.paths.root_for_local(storage_dead.local_id);
+            return self.path_matches_or_contains(root, target_path);
+        }
+        return false;
+    }
+
+    Bool terminator_uses_loan_target(mir.MirTerminator terminator, move_path.MovePathId target_path) {
+        if (terminator.kind is .branch_term(branch)) {
+            return self.operand_uses_loan_target(branch.condition, target_path);
+        }
+        if (terminator.kind is .switch_term(switch_term)) {
+            return self.operand_uses_loan_target(switch_term.discriminator, target_path);
+        }
+        if (terminator.kind is .call_term(call_term)) {
+            return self.call_uses_loan_target(call_term, target_path);
+        }
+        if (terminator.kind is .drop_term(drop_term)) {
+            return self.place_uses_loan_target(drop_term.place, target_path);
+        }
+        if (terminator.kind is .assert_term(assert_term)) {
+            return self.operand_uses_loan_target(assert_term.condition, target_path);
+        }
+        if (terminator.kind is .throw_term(throw_term)) {
+            return self.operand_uses_loan_target(throw_term.error_value, target_path);
+        }
+        return false;
+    }
+
+    Bool rvalue_uses_loan_target(mir.MirRvalue value, move_path.MovePathId target_path) {
+        if (value is .use_value(use_value)) {
+            return self.operand_uses_loan_target(use_value.value, target_path);
+        }
+        if (value is .unary_value(unary_value)) {
+            return self.operand_uses_loan_target(unary_value.value, target_path);
+        }
+        if (value is .binary_value(binary_value)) {
+            if (self.operand_uses_loan_target(binary_value.lhs, target_path)) { return true; }
+            return self.operand_uses_loan_target(binary_value.rhs, target_path);
+        }
+        if (value is .cast_value(cast_value)) {
+            return self.operand_uses_loan_target(cast_value.value, target_path);
+        }
+        if (value is .inline_asm_value(inline_asm)) {
+            return self.inline_asm_uses_loan_target(inline_asm, target_path);
+        }
+        if (value is .borrow_value(borrow_value)) {
+            return self.place_uses_loan_target(borrow_value.place, target_path);
+        }
+        if (value is .address_of_value(address_of_value)) {
+            return self.place_uses_loan_target(address_of_value.place, target_path);
+        }
+        if (value is .alloc_value(alloc_value)) {
+            return self.operand_uses_loan_target(alloc_value.value, target_path);
+        }
+        if (value is .alloc_array_value(alloc_array)) {
+            return self.operand_uses_loan_target(alloc_array.count, target_path);
+        }
+        if (value is .free_value(free_value)) {
+            return self.operand_uses_loan_target(free_value.pointer, target_path);
+        }
+        if (value is .slice_value(slice_value)) {
+            if (self.place_uses_loan_target(slice_value.base, target_path)) { return true; }
+            if (self.optional_operand_uses_loan_target(slice_value.start, target_path)) { return true; }
+            return self.optional_operand_uses_loan_target(slice_value.end, target_path);
+        }
+        if (value is .len_value(len_value)) {
+            return self.place_uses_loan_target(len_value.place, target_path);
+        }
+        if (value is .discriminant_value(discriminant_value)) {
+            return self.place_uses_loan_target(discriminant_value.place, target_path);
+        }
+        if (value is .aggregate_value(aggregate_value)) {
+            if (self.optional_operand_uses_loan_target(aggregate_value.tag, target_path)) { return true; }
+            return self.operands_use_loan_target(aggregate_value.fields, target_path);
+        }
+        if (value is .optional_value(optional_value)) {
+            return self.operand_uses_loan_target(optional_value.value, target_path);
+        }
+        if (value is .error_union_value(error_union_value)) {
+            return self.operand_uses_loan_target(error_union_value.value, target_path);
+        }
+        return false;
+    }
+
+    Bool inline_asm_uses_loan_target(mir.MirInlineAsmRvalue value, move_path.MovePathId target_path) {
+        Int! index = 0;
+        while (index < value.operands.length) {
+            if (value.operands[index] is .input(input)) {
+                if (self.operand_uses_loan_target(input.value, target_path)) {
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool operands_use_loan_target(mir.MirOperand[]& operands, move_path.MovePathId target_path) {
+        Int! index = 0;
+        while (index < operands.length) {
+            if (self.operand_uses_loan_target(operands[index], target_path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool optional_operand_uses_loan_target(mir.MirOperand? operand, move_path.MovePathId target_path) {
+        if (operand is .some(value)) {
+            return self.operand_uses_loan_target(value, target_path);
+        }
+        return false;
+    }
+
+    Bool operand_uses_loan_target(mir.MirOperand operand, move_path.MovePathId target_path) {
+        guard self.operand_place(operand) is .some(place) else { return false; }
+        return self.place_uses_loan_target(place, target_path);
+    }
+
+    Bool place_uses_loan_target(mir.MirPlace place, move_path.MovePathId target_path) {
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        if (!self.valid_move_path(path)) { return false; }
+        return self.loan_target_matches_path(target_path, path);
+    }
+
+    Bool place_kills_loan_target(mir.MirPlace place, move_path.MovePathId target_path) {
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        if (!self.valid_move_path(path)) { return false; }
+        return self.path_matches_or_contains(path, target_path);
     }
 
     () check_call_callee(mir.MirCallCallee callee) {
@@ -1361,6 +1634,21 @@ struct FunctionBorrowChecker: Movable {
                 diagnostic.DiagnosticCode("use_after_move"),
                 self.current_source_range(),
                 "use of moved value"
+            )
+        );
+    }
+
+    () add_unique_borrow_diagnostic() {
+        if (!self.record_diagnostic(5)) {
+            return;
+        }
+        self.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("unique_borrow_conflict"),
+                self.current_source_range(),
+                "unique call conflicts with a live borrow"
             )
         );
     }
