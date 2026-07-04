@@ -7,8 +7,9 @@ JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
 JIANG_LLVM_REPO="${JIANG_LLVM_REPO:-https://github.com/jjcfun/llvm-project.git}"
 JIANG_LLVM_REF="${JIANG_LLVM_REF:-jiang/22.1.8}"
 JIANG_LLVM_SOURCE_DIR="${JIANG_LLVM_SOURCE_DIR:-$ROOT_DIR/vendor/llvm-project}"
-JIANG_LLVM_BUILD_DIR="${JIANG_LLVM_BUILD_DIR:-$ROOT_DIR/build/toolchains/llvm}"
+JIANG_LLVM_BUILD_DIR="${JIANG_LLVM_BUILD_DIR:-}"
 JIANG_LLVM_TOOLCHAIN_DIR="${JIANG_LLVM_TOOLCHAIN_DIR:-$JIANG_HOME/toolchains/llvm}"
+JIANG_LLVM_INSTALL_SCOPE="${JIANG_LLVM_INSTALL_SCOPE:-local}"
 JIANG_LLVM_PROJECTS="${JIANG_LLVM_PROJECTS:-clang;lld}"
 JIANG_LLVM_TARGETS="${JIANG_LLVM_TARGETS:-X86;AArch64;WebAssembly}"
 JIANG_LLVM_BUILD_TYPE="${JIANG_LLVM_BUILD_TYPE:-Release}"
@@ -25,8 +26,74 @@ host_tag() {
   printf '%s-%s\n' "$os" "$arch"
 }
 
+usage() {
+  cat <<'EOF'
+usage: bash ./script/install_llvm.sh [--local|--user]
+
+  --local  install into build/llvm/<host>/install (default)
+  --user   install into $JIANG_HOME/toolchains/llvm/<version>/<host>
+EOF
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --local)
+        JIANG_LLVM_INSTALL_SCOPE="local"
+        ;;
+      --user)
+        JIANG_LLVM_INSTALL_SCOPE="user"
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+}
+
 llvm_install_prefix() {
-  printf '%s/%s/%s\n' "$JIANG_LLVM_TOOLCHAIN_DIR" "$JIANG_LLVM_VERSION" "$(host_tag)"
+  local host
+  host="$(host_tag)"
+  case "$JIANG_LLVM_INSTALL_SCOPE" in
+    local)
+      printf '%s/llvm/%s/install\n' "$ROOT_DIR/build" "$host"
+      ;;
+    user)
+      printf '%s/%s/%s\n' "$JIANG_LLVM_TOOLCHAIN_DIR" "$JIANG_LLVM_VERSION" "$host"
+      ;;
+    *)
+      echo "unknown LLVM install scope: $JIANG_LLVM_INSTALL_SCOPE" >&2
+      exit 2
+      ;;
+  esac
+}
+
+llvm_build_dir() {
+  local host
+  host="$(host_tag)"
+  if [ -n "$JIANG_LLVM_BUILD_DIR" ]; then
+    printf '%s/%s/%s/build\n' "$JIANG_LLVM_BUILD_DIR" "$JIANG_LLVM_VERSION" "$host"
+    return
+  fi
+  case "$JIANG_LLVM_INSTALL_SCOPE" in
+    local)
+      printf '%s/llvm/%s/build\n' "$ROOT_DIR/build" "$host"
+      ;;
+    user)
+      printf '%s/toolchains/llvm/%s/%s/build\n' "$ROOT_DIR/build" "$JIANG_LLVM_VERSION" "$host"
+      ;;
+    *)
+      echo "unknown LLVM install scope: $JIANG_LLVM_INSTALL_SCOPE" >&2
+      exit 2
+      ;;
+  esac
 }
 
 ensure_llvm_source() {
@@ -110,13 +177,11 @@ cmake_macos_deployment_args() {
 }
 
 install_managed_llvm() {
-  local host
   local source_dir
   local build_dir
   local install_dir
-  host="$(host_tag)"
   source_dir="$JIANG_LLVM_SOURCE_DIR/llvm"
-  build_dir="$JIANG_LLVM_BUILD_DIR/$JIANG_LLVM_VERSION/$host/build"
+  build_dir="$(llvm_build_dir)"
   install_dir="$(llvm_install_prefix)"
 
   if [ "$JIANG_LLVM_FORCE_BUILD" != "1" ] && [ -x "$install_dir/bin/llvm-config" ]; then
@@ -156,6 +221,8 @@ install_managed_llvm() {
 
   "$ROOT_DIR/script/llvm_env.sh"
 }
+
+parse_args "$@"
 
 case "$(uname -s)" in
   Darwin|Linux)

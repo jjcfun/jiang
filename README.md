@@ -25,32 +25,41 @@ branch: jiang/22.1.8
 tag: llvmorg-22.1.8
 ```
 
-LLVM 本地工具链安装在 Jiang home 下：
+LLVM 本地工具链默认安装在仓库 build 目录下：
+
+```text
+build/llvm/<host>/install
+```
+
+CMake build tree 放在同一组本地缓存目录：
+
+```text
+build/llvm/<host>/build
+```
+
+也可以把 LLVM 安装到 Jiang home，供多个 worktree 复用：
 
 ```text
 $JIANG_HOME/toolchains/llvm/<version>/<host>
 ```
 
-未设置 `JIANG_HOME` 时使用 `~/.jiang`。CMake build tree 仍放在仓库 build cache 内：
-
-```text
-build/toolchains/llvm/<version>/<host>/build
-```
-
-构建脚本会通过 `script/llvm_env.sh` 查找 Jiang 托管的 LLVM：
+未设置 `JIANG_HOME` 时使用 `~/.jiang`。构建脚本会通过 `script/llvm_env.sh` 查找 Jiang
+托管的 LLVM：优先使用 `build/llvm/<host>/install/bin/llvm-config`，再 fallback 到
 `$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。LLVM 源码来自
-`vendor/llvm-project` submodule，构建临时目录在 `build/toolchains/llvm/`，不会写入
-submodule 目录。脚本不会 fallback 到系统全局 LLVM，也不接受外部 `LLVM_CONFIG` 覆盖。
+`vendor/llvm-project` submodule，不会写入 submodule 目录。脚本不会 fallback 到系统全局
+LLVM，也不接受外部 `LLVM_CONFIG` 覆盖。
 
 ```bash
-bash ./script/install_llvm.sh
+bash ./script/install_llvm.sh --local
+bash ./script/install_llvm.sh --user
 ```
 
-`install_llvm.sh` 默认从 `vendor/llvm-project` 构建 LLVM，并安装到
-`$JIANG_HOME/toolchains/llvm/<version>/<host>`。如果在 release 包中运行脚本且没有 submodule，
-脚本会从 `jjcfun/llvm-project` 的 `jiang/22.1.8` 分支浅克隆源码。已存在的本地 LLVM 22
-会直接复用；需要强制重建时设置 `JIANG_LLVM_FORCE_BUILD=1`。LLVM 库默认以静态库形式链接进
-`jiangc`，release 用户不需要安装 LLVM runtime。
+`install_llvm.sh` 默认等价于 `--local`，从 `vendor/llvm-project` 构建 LLVM 并安装到
+`build/llvm/<host>/install`。`--user` 会安装到 `$JIANG_HOME/toolchains/llvm/<version>/<host>`。
+如果在 release 包中运行脚本且没有 submodule，脚本会从 `jjcfun/llvm-project` 的
+`jiang/22.1.8` 分支浅克隆源码。已存在的本地 LLVM 22 会直接复用；需要强制重建时设置
+`JIANG_LLVM_FORCE_BUILD=1`。LLVM 库默认以静态库形式链接进 `jiangc`，release 用户不需要
+安装 LLVM runtime。
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 

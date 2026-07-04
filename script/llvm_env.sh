@@ -18,12 +18,30 @@ JIANG_LLVM_ENV_FILE="$JIANG_LLVM_CONFIG_DIR/llvm.env"
 JIANG_BUILD_HELPER_BIN="${JIANG_BUILD_HELPER_BIN:-$BUILD_DIR/bin/jiang-build}"
 
 jiang_find_llvm_config() {
+  if jiang_local_llvm_config; then
+    return
+  fi
   if jiang_cached_llvm_config; then
     return
   fi
   if jiang_managed_llvm_config; then
     return
   fi
+  return 1
+}
+
+jiang_local_llvm_config() {
+  local host
+  host="$(jiang_host_tag)"
+  for root in \
+    "$JIANG_ROOT_DIR/build/llvm/$host/install" \
+    "$JIANG_ROOT_DIR/build/llvm/$host/build"
+  do
+    if [ -x "$root/bin/llvm-config" ]; then
+      printf '%s\n' "$root/bin/llvm-config"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -225,6 +243,7 @@ jiang_write_llvm_env_file() {
     printf 'LLVM_CLANG=%s\n' "$LLVM_CLANG"
     printf 'LLVM_LIB_DIR=%s\n' "$LLVM_LIB_DIR"
     printf 'JIANG_MACOS_DEPLOYMENT_TARGET=%s\n' "$JIANG_MACOS_DEPLOYMENT_TARGET"
+    printf 'JIANG_HOST_TARGET=%s\n' "${JIANG_HOST_TARGET:-}"
     printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "${MACOSX_DEPLOYMENT_TARGET:-}"
     printf 'JIANG_LLD=%s\n' "${JIANG_LLD:-}"
   } >"$JIANG_LLVM_ENV_FILE"
@@ -283,6 +302,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   printf 'LLVM_CLANG=%s\n' "$LLVM_CLANG"
   printf 'LLVM_LIB_DIR=%s\n' "$LLVM_LIB_DIR"
   printf 'JIANG_MACOS_DEPLOYMENT_TARGET=%s\n' "$JIANG_MACOS_DEPLOYMENT_TARGET"
+  printf 'JIANG_HOST_TARGET=%s\n' "${JIANG_HOST_TARGET:-}"
   printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "${MACOSX_DEPLOYMENT_TARGET:-}"
   printf 'JIANG_LLD=%s\n' "${JIANG_LLD:-}"
   printf 'LLVM_ENV_FILE=%s\n' "$JIANG_LLVM_ENV_FILE"
