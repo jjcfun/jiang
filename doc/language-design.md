@@ -385,8 +385,10 @@ Jiang 没有前缀手动解引用语法，`*foo()` 这类写法不成立。需�
 ```jiang
 Int& ref = value$.ref();
 Int copied = ref$.get();
-Int!* ptr = value$.ptr();
-ptr$.set(42);
+do [unsafe] {
+    Int!* ptr = value$.ptr();
+    ptr$.set(42);
+}
 ```
 
 `$` 会阻止自动解引用，并进入隐式操作层。`$.ref()` 和 `$.ptr()` 分别投影到语言引用和裸指针：
@@ -395,8 +397,10 @@ ptr$.set(42);
 Int^ value = new Int(42);
 
 _ ref = value$.ref(); // ref: Int&
-_ ptr = value$.ptr(); // ptr: Int*
-value$.dealloc();
+do [unsafe] {
+    _ ptr = value$.ptr(); // ptr: Int*
+    value$.dealloc();
+}
 
 Int sum = value + 100;        // 允许：value 自动解引用为 Int
 Int bad = value$.ref() + 100; // 错误：Int& 不会在结果位置继续自动解引用
@@ -412,7 +416,9 @@ Int value = ptr[0];
 ptr[1] = 42;
 
 _ item_ref = ptr[1]$.ref(); // item_ref: Int&
-_ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
+do [unsafe] {
+    _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
+}
 ```
 
 数组长度是类型的一部分；slice 长度是运行时值。
@@ -558,12 +564,12 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 - `value$.as(Type)`：强制类型转换，不保证类型安全。
 - `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
-- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`。
+- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `do [unsafe]`。
 - `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；`T[*]` many pointer 必须使用下标访问。
 - `value$.set(new_value)`：显式写入 `T!*` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
-- `value$.addr()`：获取地址值。
-- `value$.dealloc()`：释放默认堆分配器上的对象。
+- `value$.addr()`：获取裸指针，需要 `do [unsafe]`。
+- `value$.dealloc()`：释放默认堆分配器上的对象，需要 `do [unsafe]`。
 - `optional$.some()`：强制解包 optional。
 - `Type$.size()`：类型大小。
 - `Type$.align()`：ABI 对齐。
@@ -573,12 +579,11 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
-当前 package 默认处在全局 unsafe 模式。隐式操作层的低层操作，尤其是裸指针转换、裸指针取值、
-地址获取和显式释放，不因为缺少 unsafe/capability gate 而报错；borrow check 仍然只检查所有权、
-lifetime 和 drop safety。
+隐式操作层的低层操作会逐步接入 effect 检查。当前裸指针获取和显式释放需要放在 `do [unsafe]`
+中；borrow check 仍然只检查所有权、lifetime 和 drop safety。
 
-未来如果引入 capability 系统，`$` 会成为受编译期 capability 约束的低层操作层。每个 `$` 操作都需要
-对应能力；缺少能力时编译失败。
+如果后续引入更细的 capability 系统，`$` 会成为受编译期 capability 约束的低层操作层。每个 `$`
+操作都需要对应能力；缺少能力时编译失败。
 
 初步分类：
 

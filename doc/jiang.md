@@ -254,11 +254,11 @@ Jiang 语言把安全转换和低层强制转换分开：
 
 - `a$.as(Int)`：对值 `a` 做低层强制转换
 - `a$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`
-- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`
+- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `do [unsafe]`
 - `a$.get()`：显式解引用 `T^` / `T&`，返回指向的值
 - `a$.move()`：显式转交当前变量的值，源变量随后失效且不再析构
-- `a$.addr()`：获取值 `a` 的地址值
-- `a$.dealloc()`：对 `a` 做释放操作
+- `a$.addr()`：获取值 `a` 的裸指针，需要 `do [unsafe]`
+- `a$.dealloc()`：对 `a` 做释放操作，需要 `do [unsafe]`
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.align()`：获取类型 `Int` 的 ABI 对齐
 - `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
@@ -488,7 +488,9 @@ b$.dealloc();
 Int^ p = new Int(41);
 
 _ ref = p$.ref(); // ref: Int&
-_ raw = p$.ptr(); // raw: Int*
+do [unsafe] {
+    _ raw = p$.ptr(); // raw: Int*
+}
 
 // 普通值上下文会自动解引用
 Int x = p + 1;
@@ -499,9 +501,11 @@ Int bad = p$.ref() + 1; // 编译错误
 // 显式解引用
 Int explicit = p$.get();
 
-Int!* raw_ptr = p$.ptr();
-Int raw_value = raw_ptr$.get();
-raw_ptr$.set(42);
+do [unsafe] {
+    Int!* raw_ptr = p$.ptr();
+    Int raw_value = raw_ptr$.get();
+    raw_ptr$.set(42);
+}
 
 Int[1] items = [41];
 Int[*] raw = items[0]$.as(Int[*]);
@@ -522,7 +526,9 @@ Int value = ptr[0];
 ptr[1] = 42;
 
 _ item_ref = ptr[1]$.ref(); // item_ref: Int&
-_ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
+do [unsafe] {
+    _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
+}
 ```
 
 `T[*]` many-pointer 支持下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
