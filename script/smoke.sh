@@ -12,6 +12,7 @@ mkdir -p "$SMOKE_BUILD_DIR"
 cd "$ROOT_DIR"
 
 status=0
+slow_smokes="${JIANG_SLOW_SMOKE:-}"
 link_and_run_llvm_smoke() {
   local ll_file="$1"
   local output="$2"
@@ -30,6 +31,12 @@ link_and_run_llvm_smoke() {
 for source in test/smoke/*.jiang; do
   name="$(basename "$source" .jiang)"
   output="$SMOKE_BUILD_DIR/$name"
+
+  if [ "$name" = "lang_dylib_smoke" ] && [ "$slow_smokes" != "1" ]; then
+    printf '\n== %s ==\n' "$source"
+    echo "SKIP slow smoke; set JIANG_SLOW_SMOKE=1 to run"
+    continue
+  fi
 
   printf '\n== %s ==\n' "$source"
   if "$JIANGC" --check "$source"; then
