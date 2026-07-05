@@ -91,7 +91,16 @@ unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
 printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
 printf 'import std;\nInt main() { if (std.fs.exists("/tmp")) { 0 } else { 1 } }\n' >"$system_fs_sample"
-printf 'Int main() { Int![*] values = Int!$.alloc_many(2); values[0] = 1; values$.dealloc(); 0 }\n' >"$alloc_sample"
+cat >"$alloc_sample" <<'EOF'
+Int main() {
+    do [unsafe] {
+        Int![*] values = Int!$.alloc_many(2);
+        values[0] = 1;
+        values$.dealloc();
+    }
+    0
+}
+EOF
 cat >"$wasi_provider_sample" <<'EOF'
 import std;
 
