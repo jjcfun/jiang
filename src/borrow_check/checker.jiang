@@ -525,6 +525,14 @@ struct FunctionBorrowChecker: Movable {
         if (self.destination_is_self_place(destination)) {
             return true;
         }
+        move_path.MovePathId destination_path = self.paths.path_for_place(destination);
+        if (self.valid_move_path(destination_path)) {
+            if (self.source_root_param_symbol(destination_path) is .some(source_symbol)) {
+                if (self.source_symbol_is_self(source_symbol)) {
+                    return true;
+                }
+            }
+        }
         return self.current_function_is_init() && self.destination_has_deref_projection(destination);
     }
 
@@ -664,8 +672,20 @@ struct FunctionBorrowChecker: Movable {
             self.record_operand_loan(destination, use_value.value);
             return;
         }
+        if (value is .cast_value(cast_value)) {
+            self.record_operand_loan(destination, cast_value.value);
+            return;
+        }
         if (value is .slice_value(slice_value)) {
             self.record_slice_loan(destination, slice_value);
+            return;
+        }
+        if (value is .optional_value(optional_value)) {
+            self.record_operand_loan(destination, optional_value.value);
+            return;
+        }
+        if (value is .error_union_value(error_union_value)) {
+            self.record_operand_loan(destination, error_union_value.value);
             return;
         }
         if (value is .aggregate_value(aggregate_value)) {
@@ -784,6 +804,13 @@ struct FunctionBorrowChecker: Movable {
         }
         if (self.place_handle_loan_kind(source) is .some(kind)) {
             self.add_loan_from_paths(kind, self.paths.path_for_place(source), destination_path);
+            return;
+        }
+        if (self.place_type_may_carry_borrow(source)) {
+            move_path.MovePathId source_path = self.paths.path_for_place(source);
+            if (self.source_root_param_symbol(source_path) != null) {
+                self.add_loan_from_paths(.reference_view, source_path, destination_path);
+            }
         }
     }
 
@@ -993,6 +1020,7 @@ struct FunctionBorrowChecker: Movable {
         }
         return_lifetime.ReturnLifetimeStatus status = self.return_lifetime_status(fact.loan_id);
         if (status == .allowed) {
+            self.record_inferred_return_lifetime_source(fact.loan_id);
             return;
         }
         self.results.mark_error();
@@ -1015,6 +1043,15 @@ struct FunctionBorrowChecker: Movable {
         return self.return_lifetimes.check_source(source_symbol);
     }
 
+    () record_inferred_return_lifetime_source(self, loan.LoanId loan_id) {
+        if (self.current_function_is_init()) { return; }
+        guard self.ctx.store.hirs.def(self.function_def) is .some(hir_def) else { return; }
+        if (self.hir_has_explicit_return_lifetime(hir_def)) { return; }
+        loan.Loan current = self.results.loans.get(loan_id);
+        guard self.source_root_param_symbol(current.source) is .some(source_symbol) else { return; }
+        self.results.infer_return_lifetime_source(self.function_def, source_symbol);
+    }
+
     Bool is_return_local_path(self, move_path.MovePathId path_id) {
         move_path.MovePath path = self.paths.get(path_id);
         return path.local_id.to_index() == self.body.return_local.to_index();
@@ -1027,15 +1064,24 @@ struct FunctionBorrowChecker: Movable {
             return null;
         }
         mir.MirLocalDecl local = self.body.locals[local_index];
-        if (local.kind != .param) {
-            return self.source_root_param_symbol_from_local_loan(path.local_id);
+        if (local.kind == .param) {
+            return local.name;
         }
-        return local.name;
+        move_path.MovePath root_path = self.paths.get(self.paths.root_for_local(path.local_id));
+        Int root_index = root_path.local_id.to_index();
+        if (!self.valid_local_index(root_index)) {
+            return null;
+        }
+        mir.MirLocalDecl root_local = self.body.locals[root_index];
+        if (root_local.kind == .param) {
+            return root_local.name;
+        }
+        return self.source_root_param_symbol_from_local_loan(path.local_id);
     }
 
     qid.SymbolId? source_root_param_symbol_from_local_loan(self, mir.MirLocalId local_id) {
         move_path.MovePathId root = self.paths.root_for_local(local_id);
-        guard self.first_active_loan_for_exact_path(root) is .some(loan_id) else {
+        guard self.first_active_loan_for_path(root) is .some(loan_id) else {
             return null;
         }
         loan.Loan current = self.results.loans.get(loan_id);
@@ -1383,6 +1429,10 @@ struct FunctionBorrowChecker: Movable {
     () record_call_return_loan(self, mir.MirCallTerminator call_term) {
         guard self.callee_function_def(call_term.callee) is .some(callee_def) else { return; }
         guard self.ctx.store.hirs.def(callee_def) is .some(hir_def) else { return; }
+        if (!self.hir_has_explicit_return_lifetime(hir_def)) {
+            self.record_call_return_loan_for_default(call_term, callee_def, hir_def);
+            return;
+        }
         Int! index = 0;
         while (index < hir_def.lifetime_constraints.len()) {
             hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
@@ -1394,6 +1444,56 @@ struct FunctionBorrowChecker: Movable {
     qid.DefId? callee_function_def(self, mir.MirCallCallee callee) {
         guard callee is .direct_function(function_value) else { return null; }
         return function_value.function_def;
+    }
+
+    Bool hir_has_explicit_return_lifetime(self, hir.HirDef& hir_def) {
+        Int! index = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            if (constraint.shorter.kind == .return_lifetime) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () record_call_return_loan_for_default(
+        self,
+        mir.MirCallTerminator call_term,
+        qid.DefId callee_def,
+        hir.HirDef& hir_def
+    ) {
+        if (!self.place_type_may_carry_borrow(call_term.destination)) {
+            return;
+        }
+        guard self.results.inferred_return_lifetime_source(callee_def) is .some(source_symbol) else {
+            return;
+        }
+        guard self.return_source_arg_index(hir_def, source_symbol) is .some(arg_index) else {
+            return;
+        }
+        self.record_call_return_loan_from_arg(call_term, arg_index);
+    }
+
+    Int? return_source_arg_index(self, hir.HirDef& hir_def, qid.SymbolId source_symbol) {
+        guard hir_def.decl.function_signature is .some(signature) else { return null; }
+        if (self.source_symbol_is_self(source_symbol)) {
+            if (signature.has_receiver) { return 0; }
+            return null;
+        }
+        Int! arg_offset = 0;
+        if (signature.has_receiver) {
+            arg_offset = 1;
+        }
+        Int! index = 0;
+        while (index < signature.param_symbols.length) {
+            if (signature.param_symbols[index] == source_symbol) {
+                return index + arg_offset;
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     () record_call_return_loan_for_constraint(self,
@@ -1410,7 +1510,14 @@ struct FunctionBorrowChecker: Movable {
         if (arg_index < 0 || arg_index >= call_term.args.length) {
             return;
         }
+        self.record_call_return_loan_from_arg(call_term, arg_index);
+    }
+
+    () record_call_return_loan_from_arg(self, mir.MirCallTerminator call_term, Int arg_index) {
         guard self.operand_place(call_term.args[arg_index]) is .some(source) else {
+            return;
+        }
+        if (self.source_root_param_symbol(self.paths.path_for_place(source)) == null) {
             return;
         }
         self.add_loan(.reference_view, source, call_term.destination);
