@@ -212,11 +212,17 @@ guard maybe is .some(value) else {
 `defer` 会在当前块退出时按 LIFO 顺序执行。
 
 ```c
-defer handle$.dealloc();
+defer {
+    do [unsafe] {
+        handle$.dealloc();
+    }
+}
 
 defer {
     log("closing");
-    handle$.dealloc();
+    do [unsafe] {
+        handle$.dealloc();
+    }
 }
 ```
 
@@ -296,12 +302,14 @@ UInt8 small_val = UInt8(val);
 ```
 
 `as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换。
-当前 package 默认处在全局 unsafe 模式，编译器不会因为裸指针转换或裸指针访问本身报错；后续如果
-引入 capability/unsafe gate，再把这些低层操作纳入显式能力检查。
+当前裸指针获取、裸指针转换和显式释放等低层操作已经接入 `unsafe` effect。调用这些操作时，
+需要放在 `do [unsafe] { ... }` 中，或由外层 unsafe 函数承接。
 
 ```c
 Int addr = 0x12345678;
-Int* ptr = addr$.as(Int*);
+Int* ptr = do [unsafe] {
+    addr$.as(Int*)
+};
 ```
 
 ### 数组（Array）
@@ -479,7 +487,9 @@ Int c = a + b;
 print("c = %d", c); // 输出： c = 300
 
 // '$' 符号阻止自动解引用，并进入 b 的隐式操作层
-b$.dealloc();
+do [unsafe] {
+    b$.dealloc();
+}
 ```
 
 `$.ref()` 和 `$.ptr()` 的返回类型固定为 `T&` 和 `T*`：
@@ -508,7 +518,9 @@ do [unsafe] {
 }
 
 Int[1] items = [41];
-Int[*] raw = items[0]$.as(Int[*]);
+Int[*] raw = do [unsafe] {
+    items[0]$.as(Int[*])
+};
 
 // many-pointer 通过下标访问
 Int y = raw[0];
@@ -543,7 +555,9 @@ do [unsafe] {
 Int^ a = new Int(100);
 
 // 可以主动释放 owning pointer 管理的内存空间
-a$.dealloc();
+do [unsafe] {
+    a$.dealloc();
+}
 ```
 
 ### 所有权、implicit copy 和析构
@@ -1117,11 +1131,17 @@ Int main() {
 `defer` 会在当前块退出时按 LIFO 顺序执行。
 
 ```c
-defer handle$.dealloc();
+defer {
+    do [unsafe] {
+        handle$.dealloc();
+    }
+}
 
 defer {
     log("closing");
-    handle$.dealloc();
+    do [unsafe] {
+        handle$.dealloc();
+    }
 }
 ```
 
@@ -1363,7 +1383,9 @@ struct Buffer {
   UInt8[*] data;
 
   deinit() {
-    self.data$.dealloc();
+    do [unsafe] {
+      self.data$.dealloc();
+    }
     return;
   }
 }

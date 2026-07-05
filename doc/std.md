@@ -22,8 +22,13 @@ import std;
 - `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`many_pointer()` 和 `into_slice()`。
   `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；`length()` 表示已初始化元素数量，
   不包含 `capacity()`。`capacity()` 只表示 `Vector` 自己管理的 spare capacity，
-  不属于 `Contiguous` 语义。内部 `length` / `capacity` 字段不是公开接口。
-- `String`：UTF-8 字节字符串，当前仍处于基础能力阶段。
+  不属于 `Contiguous` 语义。`truncate()`、`clear()` 和 `deinit` 会析构被移出已初始化区间的元素。
+  内部 `length` / `capacity` 字段不是公开接口。
+- `String`：UTF-8 字节字符串，`bytes()` 返回借用字节视图。
+- `StringBuilder`：面向字符串构造的可增长 builder，支持追加字节切片、字符串、整数和浮点值；
+  `into_string()` 生成 `String`，`into_slice()` 生成拥有所有权的 `UInt8[]^`。
+- `Path` / `PathBuilder`：面向路径文本的 owned path 和 builder。`Path.text()` 返回借用视图，
+  `Path.into_slice()` 可转成拥有所有权的字节切片。路径算法仍保留在 `std.path` namespace 下。
 - 内建类型和 trait 的公开别名：例如 `Option<T>`、`Result<T, E>`、`Box<T>`、`Reference<T>`、
   `Slice<T>`、`SentinelSlice<T, S>`、`RawPointer<T>`、`ManyPointer<T>` 等。
   其中 `Slice<T>` / `SentinelSlice<T, S>` 是 unsized array type 的公开名字；借用 view 需要通过

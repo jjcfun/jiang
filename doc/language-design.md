@@ -460,7 +460,9 @@ struct Node: Movable {
     Int length;
 
     deinit() {
-        bytes$.dealloc(); // 只有自定义 deinit 会释放 many pointer
+        do [unsafe] {
+            bytes$.dealloc(); // 只有自定义 deinit 会释放 many pointer
+        }
     }
 }
 ```

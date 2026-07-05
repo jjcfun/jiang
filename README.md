@@ -135,6 +135,12 @@ JIANGC=./build/bin/jiangc bash ./script/backend_cli_smoke.sh
 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 ```
 
+`script/smoke.sh` 默认跳过较慢的 lang provider dylib smoke。需要覆盖该路径时，显式打开：
+
+```bash
+JIANG_SLOW_SMOKE=1 JIANGC=./build/bin/jiangc bash ./script/smoke.sh
+```
+
 `lang_check.sh` 默认的 `run/` 用例仍走 `--emit-llvm` 后用 LLVM clang 链接。需要验证
 release object/executable 路径和 LLVM O2 pass pipeline 时，打开 release run：
 

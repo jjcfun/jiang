@@ -6,8 +6,8 @@ borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCh
 Jiang 的 borrow check 只处理所有权、move/use-after-move、引用逃逸和析构安全边界。
 它不检查 shared/mutable aliasing，不负责 data-race freedom，也不根据外层 slot
 是否可变决定内部字段能否写入。并发安全和数据竞争策略后续作为单独语言机制设计。
-当前 package 默认全局 unsafe，裸指针的创建、转换和显式访问不由 borrow check 做
-unsafe/capability gate；borrow check 只在这些操作影响 owner/lifetime/drop safety 时介入。
+裸指针的创建、转换和显式释放由 sema 的 unsafe effect gate 检查；borrow check 不再重复做
+unsafe/capability gate。borrow check 只在这些操作影响 owner/lifetime/drop safety 时介入。
 
 ## 输入
 
