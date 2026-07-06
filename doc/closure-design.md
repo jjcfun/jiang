@@ -3,7 +3,8 @@
 本文描述 Jiang 闭包和函数指针的设计方向。核心区分是：
 
 - `RawFn<Ret, Args...>` 表示裸函数指针，不带 environment，可与 C 函数指针互通。
-- `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment，用于日常高阶函数。
+- `Fn<Ret, Args...>` 表示栈上的 Jiang 闭包值，可带 environment，movable。
+- `Fn<Ret, Args...>^` 表示堆上的 owned closure，environment 生命周期跟随 owner。
 
 闭包表达式必须出现在有明确 expected callable type 的位置，不能像普通局部变量一样从闭包
 表达式本身推导出公开匿名类型。这个规则接近 Swift 的 closure 使用方式：调用者先给出
@@ -12,7 +13,8 @@
 ## 目标
 
 - 支持读取外层局部变量的闭包。
-- 支持把闭包赋给显式 `Fn<...>` 类型的局部变量、字段或参数。
+- 支持把闭包赋给显式 `Fn<...>` 类型的局部变量或参数。
+- 支持后续用 `new lambda` 创建 `Fn<...>^` 堆闭包。
 - 支持非捕获 lambda 初始化 `RawFn<...>`。
 - 支持 `RawFn<...>` 与 C 函数指针互通。
 - 基础闭环支持默认捕获推导，并由 lifetime / borrow check 阻止借用逃逸。
@@ -32,20 +34,40 @@
 type parameter pack，不要求先开放普通用户泛型参数包。
 
 ```jiang
-Fn<Bool, Int, Int>       // 闭包值，可能带 environment
+Fn<Bool, Int, Int>       // 栈闭包值，可能带 environment
+Fn<Bool, Int, Int>^      // owned closure handle，environment 在 heap 上
 RawFn<Bool, Int, Int>    // 裸函数指针，不带 environment
 ```
 
 `RawFn<...>` 的运行时值是函数入口。它不保存捕获环境，适合 top-level function、type/static
 function、未绑定实例方法和非捕获 lambda。
 
-`Fn<...>` 的运行时值是 Jiang callable，表示为 `{env, code}`。`code` 的底层调用约定为
-`RawFn<Ret, RawPointer<UInt8>, Args...>`，调用时总是先传 `env`，再传源码参数。
-非捕获 lambda 的 `env` 是 null；`Fn(raw)` 的 `env` 保存 raw 函数入口，`code` 指向编译器生成的
-trampoline。
+`Fn<...>` 的源码语义是 movable stack closure object。运行时抽象为 `{env, code}`：`env` 是一段
+连续 environment memory，`code` 是使用该 env 的入口。普通 `Fn` 的 env memory 在当前栈帧或
+当前 aggregate 内，因此 `Fn<...>` 不能返回、保存到 heap/global，也不能写入可能比当前函数更久的
+外部位置。
+
+`Fn<...>^` 是 owned closure handle。`new () [captures] => body` 直接构造 heap closure object，
+heap object 内保存 `{env, code}` 或等价布局，其中 env memory 是连续的 closure fields。它不是把
+一个普通 stack `Fn` 再装进 `Box`。`Fn^` move 时只移动 owner handle；drop 时 drop heap env fields
+并释放 closure object。
+
+调用时仍可以抽象成 `code(env, args...)`：`code` 的底层调用约定为
+`RawFn<Ret, RawPointer<UInt8>, Args...>`，调用时先传 `env`，再传源码参数。
+
+`Fn<...>` 是统一 erased callable 类型，不把每个 closure 的匿名具体类型暴露给用户。每个
+closure expression 仍有内部 env layout；捕获字段按顺序紧密放入连续 env memory。非捕获 lambda
+的 env 为空；`Fn(raw)` 的 env 保存 raw 函数入口，`code` 指向编译器生成的 trampoline。
 
 源语言不暴露闭包表达式自己的匿名类型。每个捕获闭包表达式对应独立 environment layout。
 即使两个闭包形状相同，也不要求共享内部表示。
+
+`RawFn<...>` 是 copy；`Fn<...>` 和 `Fn<...>^` 都是 movable。`Fn<...>` 不应因为隐藏的 env layout
+在同一个公开类型下有时 copy、有时 non-copy；基础规则把 `Fn` 当作 move-only。后续如果需要
+可复制 closure，可以增加显式能力类型或约束，而不是让 `Fn<...>` 的 copy 能力依赖调用点。
+
+`Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。闭包值不是 C 函数指针，`ptr` 也不应泄漏 `{env, code}`
+或 heap closure object 的内部布局。需要 C ABI 函数指针时使用 `RawFn<...>`。
 
 ## Lambda 语法
 
@@ -233,7 +255,7 @@ extern fn qsort(
 
 默认捕获必须能从闭包 body 和 expected type 推导出安全 environment：
 
-- 只读取的外层 local 保存共享引用，闭包值不能逃逸超过被捕获 storage 的生命周期。
+- 只读取的外层 local 保存共享引用，闭包值不能活过被捕获 storage 的生命周期。
 - 写入外层 `!` storage 保存可变引用，闭包创建和调用都要满足 unique borrow 约束。
 - owner move 只能通过显式字段初始化进入 environment，不能由默认捕获隐式发生。
 
@@ -260,23 +282,23 @@ owner capture 牵涉 consuming call、drop 和闭包重复调用规则，应该�
 基础闭环保守处理：
 
 - `RawFn<...>`：不带 environment，可重复调用。
-- `Fn<...>`：可重复调用；允许共享引用捕获。
+- `Fn<...>`：movable stack closure object，可重复调用；允许共享引用捕获。
+- `Fn<...>^`：movable owned closure handle；调用时可临时借成 `Fn<...>&`。
 - 修改 capture 的闭包：调用需要 unique closure value。
-- owner capture / consuming closure：先拒绝，等 `FnOnce` 设计完成。
+- owner capture 可以进入 `Fn^` 的 heap environment；消费 environment 的调用能力等 `FnOnce` 设计完成。
 
-## Lifetime 和逃逸
+## Lifetime 和存储
 
-按引用捕获的闭包本质上把外层 local 的 borrow 存进 environment。规则应和“引用存入字段”
-保持一致：
+`Fn<...>` 的 env memory 在栈上。无论是否捕获，裸 `Fn` 都不能作为返回值、不能写入 heap/global，
+也不能保存到可能比当前函数更久的 aggregate 中：
 
 ```jiang
-Fn<Fn<Int>> make_bad = () => {
-    Int local = 1;
-    return () => local; // fail: local borrow escapes
-};
+Fn<Int> make_bad() {
+    () => 42 // fail: stack Fn outlives its env storage
+}
 ```
 
-非逃逸调用允许引用捕获：
+栈内调用允许引用捕获：
 
 ```jiang
 Int local = 1;
@@ -284,8 +306,29 @@ Fn<Int> f = () => local + 1;
 Int value = f();
 ```
 
-如果闭包作为参数传入函数，默认按可能逃逸处理，除非参数类型或调用约定能表达
-non-escaping。后续可以加入 `@noescape` 或等价约束，用于高阶函数内联调用。
+`Fn<...>^` 的 env memory 在 heap 上。`new lambda` 会直接构造 heap closure object；隐式捕获仍可
+使用，但默认是引用捕获，因此是否能流出当前作用域交给 lifetime / borrow check 判断：
+
+- `return new () => 1` 没有外部 borrow，可以通过。
+- `return new () => local` 隐式捕获 `local&`，如果 `local` 是当前栈局部，则生命周期检查失败。
+- `return new () [value = value$.move()] => value` 把 owner 移入 heap env，env 随 `Fn^` owner 存活。
+
+```jiang
+Fn<Int>^ make_bad() {
+    Int local = 1;
+    new () => local // fail: env 中的 local& 逃逸
+}
+
+Fn<Int>^ make_answer() {
+    new () => 42 // ok: heap env 为空
+}
+```
+
+`Fn^$.ref()` 返回 `Fn&`，表示把 heap closure 临时借成栈内 callable view。`Fn^&` 如果以后需要，
+应表示 owner handle slot 的引用，不作为普通调用所需的借用形式。
+
+tuple 先不支持 `@life(.0 > self)` 或类似显式写法；struct、tuple、union、closure env 的默认
+aggregate member lifetime 规则后续统一在 borrow/lifetime checker 中表达。
 
 ## Borrow 和可变捕获
 
@@ -313,8 +356,8 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 3. HIR：为 lambda 分配内部 function def，在 `HirLambda` 上记录 params、captures 和 call body。
 4. Type check：从 expected type 检查参数和返回，并推导 capture kind、call ability。
 5. Borrow check：检查 capture lifetime、unique conflict、move 后使用。
-6. MIR：构造 environment aggregate；闭包调用 lowering 成 `code(env, args...)`。
-7. Drop elaborate：基础闭包 environment 不拥有 capture，后续 owner capture 再接入 drop。
+6. MIR：`Fn` 构造 stack environment aggregate；`Fn^` 构造 heap closure object。
+7. Drop elaborate：`Fn` 的 environment 跟随 stack closure move/drop；`Fn^` drop heap env fields。
 
 当 expected type 是 `RawFn<...>` 时，不构造 environment；如果 capture analysis 发现任何捕获，
 直接报错。
@@ -395,6 +438,13 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 标量 `T!` 捕获后可读到外层 storage 的后续写入。
 - [x] 共享引用捕获外层非平凡 local 并立即调用。
 - [x] 可变捕获修改外层 `!` storage。
-- [x] 捕获闭包返回导致 local borrow escape 报错。
-- [ ] 对外层 local 执行 move 的闭包报错。
+- [x] 裸 `Fn` 返回导致 stack env 流出当前函数时报错。
+- [x] 裸 `Fn` 保存到返回 aggregate 导致 stack env 流出当前函数时报错。
+- [x] 捕获闭包传给只调用不保存的参数可以通过。
+- [x] 非捕获裸 `Fn` 返回也会报错。
+- [x] `Fn` 是 movable/non-copy closure value；已有 `Fn` 转移必须显式 `$.move()`。
+- [x] `Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。
+- [ ] `new lambda` 构造 `Fn<...>^`，env memory 位于 heap closure object。
+- [ ] `Fn^$.ref()` 返回 `Fn&`，用于把 heap closure 临时借成 callable view。
+- [ ] 对外层 local 执行非法 move 的闭包报错。
 - [ ] 修改 capture 的闭包需要 unique closure value。
