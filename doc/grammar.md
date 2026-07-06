@@ -691,10 +691,13 @@ pattern_list
 
 - `match_pattern` 用于 `is` 和 `switch` 分支根，只接受 optional、variant、literal。
 - 单段 `path` 只作为 binding 子 pattern 使用，不能作为 `is` 或 `switch` 的分支根。
-- `ref T name` 表示借用绑定；`ref T! name` 等价于 `(ref T)! name`，最外层 `!` 属于绑定可变性，例如 `ref Int! value` 生成 `Int&!` 绑定。`ref` 是绑定模式，不是类型名。
-- 新代码中 pattern 的 `_` 只表示 wildcard，不作为类型占位；需要借用 payload 时写 `.some(ref T name)` 或 `.case(ref T name)`。
+- `ref T name` 表示借用绑定；需要可重绑定引用 slot 时写 `ref! T name`。
+  `ref! Int value` 生成 `Int&!` 绑定。`ref` 是绑定模式，不是类型名。
+- `ref _ name` 可用在需要推导 payload 类型的借用 pattern 中；裸 `_` 仍表示 wildcard。
+  需要借用 payload 时写 `.some(ref T name)`、`.some(ref _ name)` 或 `.case(ref T name)`。
 - destructure 和 local declaration 仍支持 `_` 类型占位，例如 `_ value = expr;`、`(_ left, Int right) = pair;`。
-- `_! name` 可在 pattern 中表示可变绑定；`_& name`、`_&! name` 不再作为 pattern 借用绑定语法，payload 借用使用 `ref T name`。
+- `_! name` 可在 pattern 中表示可变绑定；旧的 `_` 后缀借用写法不再作为 pattern 借用绑定语法。
+  payload 借用使用 `ref T name`，需要可重绑定引用 slot 时使用 `ref! T name`。
 - 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法。
 
 ## 说明

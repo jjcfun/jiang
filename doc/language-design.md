@@ -238,11 +238,13 @@ Result?!@Error maybe_result;
 Int?! value;       // optional + mutable
 Int!^?! owner;     // optional mutable owning pointer to mutable Int
 Int?& ref;         // reference to optional Int
+Int!& mut_ref;     // reference to mutable Int storage
 Int&! ref_slot;    // mutable slot containing non-owning reference to Int
 ```
 
-`T!&` 不作为目标语言类型存在。Jiang 的引用类型不表达“可变借用”或独占访问；
-`T&!` 中的 `!` 属于 reference 外层，只表示引用 slot 本身可重绑定。
+`T!&` 表示从 `T!` storage 借出的引用；它保留目标 storage 的可变性，但不表达独占访问。
+`T&!` 中的 `!` 属于 reference 外层，只表示引用 slot 本身可重绑定。两者可以组合为
+`T!&!`：指向 `T!` storage 的、可重绑定的引用 slot。
 
 `Int!?`、`Int^!?`、`Int^^`、`Int&&`、`Int^&` 都是语法错误。编译器可以按规范顺序恢复后继续解析，但必须报告 diagnostic。
 
@@ -338,6 +340,7 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 
 - `T^`：`Box<T>` 的语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
 - `T&`：非 owning 引用，不表达释放职责。通过 `T&` 可以读写目标内部声明为 `!` 的成员。
+- `T!&`：从 `T!` storage 借出的非 owning 引用，目标 storage 的可变性保留在被引用类型中。
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
@@ -348,7 +351,9 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice(Self self)` 消耗 receiver，
 并把 initialized 区间转移为 owning `T[]^`。
 
-`T&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。存储 `T&` / `T&!` / `T[]&` 字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，不能作为普通字段类型。
+`T&`、`T!&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。
+存储引用字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，
+不能作为普通字段类型。
 
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
 `!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、
@@ -478,7 +483,7 @@ implicit copy / Movable 规则：
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
 - 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T!&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
 - 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
@@ -529,7 +534,7 @@ a.length; // 编译错误：a 已经 move
 - 参数名：参数或参数引用目标 lifetime。
 - 字段名：该字段引用目标 lifetime。
 
-带 `T&` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
+带 `T&` / `T!&` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
 
 ```jiang
 @life(data > self)
@@ -962,11 +967,13 @@ Optional 不再幂等：`T??` 表示 `Option<Option<T>>`。`!` 是当前绑定�
 - 条件解包 pattern: `value is .some(payload)`
 - 可变条件解包 pattern: `value is .some(Int! payload)`
 - 借用解包 pattern: `value is .some(ref Int payload)`
-- 可变借用解包 pattern: `value is .some(ref Int! payload)`
+- 可重绑定借用解包 pattern: `value is .some(ref! Int payload)`
 
 `.some(...)` / `.none` 是 `Option<T>` 的 pattern 写法。`some` 是普通标识符，
 不再作为 optional pattern 关键字。`ref` 是绑定模式，不是类型名；
-`ref Int! payload` 等价于 `(ref Int)! payload`，生成可变的引用绑定。
+`ref T payload` 借用 payload 并创建不可重绑定的引用绑定；`ref! T payload` 借用 payload
+并创建可重绑定的引用 slot。被引用类型的可变性来自 payload 本身，例如 `T!` payload 会得到
+`T!&`。
 
 示例：
 

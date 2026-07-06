@@ -401,6 +401,7 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 
 - `T^`：`Box<T>` 的语法糖，表示自动解引用的 owning pointer；它不是 C 风格 raw pointer
 - `T&`：自动解引用的非 owning 引用，通常用于引用已有值，不承担释放职责
+- `T!&`：从 `T!` storage 借出的非 owning 引用，保留目标 storage 的可变性
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
@@ -569,14 +570,14 @@ Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源�
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T[*]`、`T*` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 - 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]&` 字段不会被编译器自动释放。
+- `T&`、`T!&`、`T&!`、`T[*]`、`T*`、`T[]&` 字段不会被编译器自动释放。
 - `T[]&` 本身不拥有整段 buffer；drop slice reference 时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
 - 经过 `T*` / `T[*]` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
-- `T&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T!&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 
 显式转移所有权使用 `move()`：
