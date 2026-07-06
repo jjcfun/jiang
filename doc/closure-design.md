@@ -315,9 +315,11 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 ## 测试清单
 
 - [x] 非捕获 lambda 可赋给显式 `RawFn<...>`。
+- [x] 非捕获 lambda 可赋给显式 `Fn<...>`。
+- [x] 捕获 lambda 可在 `Fn<...>` expected type 下通过 type check。
 - [x] 捕获 lambda 赋给 `RawFn<...>` 报错。
 - [ ] `RawFn<...>` 可通过 `Fn(raw)` 包装成同签名 `Fn<...>`。
-- [ ] `Fn<...>` 不能转换成 `RawFn<...>`。
+- [x] `Fn<...>` 不能转换成 `RawFn<...>`。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
