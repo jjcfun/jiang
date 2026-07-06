@@ -32,6 +32,12 @@ struct LocalInitBinding {
     LocalInitState state;
 }
 
+struct LambdaCheckResult {
+    Bool ok;
+    Bool has_env;
+    qid.TypeId type_id;
+}
+
 public struct BodyCheck: Movable {
     check_state.CheckState& state;
     type_ops_mod.TypeOps& type_ops;
@@ -291,6 +297,9 @@ public struct BodyCheck: Movable {
         hir.HirId root,
         qid.TypeId body_type
     ) {
+        if (hir_def.decl.is_lambda_function) {
+            return;
+        }
         if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
             qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(def_id));
             hir.HirId value_id = self.body_result_value(root);
@@ -561,16 +570,39 @@ public struct BodyCheck: Movable {
             );
             return self.state.store.types.invalid_type();
         }
-        self.check_lambda_capture_initializers(lambda);
-        if (lambda.captures.length > 0) {
+        types.TypeInfo expected_info = self.state.store.types.get(expected_type);
+        guard expected_info.data is .function_type(function_type) else { return self.state.store.types.invalid_type(); }
+        LambdaCheckResult checked = self.check_lambda_against_callable_type(
+            node_id,
+            lambda,
+            expected_type,
+            function_type
+        );
+        if (!checked.ok) {
+            return self.state.store.types.invalid_type();
+        }
+        if (checked.has_env) {
             self.type_ops.add_node_error(node_id, "RawFn lambda cannot capture values", "rawfn_lambda_captures");
             return self.state.store.types.invalid_type();
         }
-        types.TypeInfo expected_info = self.state.store.types.get(expected_type);
-        guard expected_info.data is .function_type(function_type) else { return self.state.store.types.invalid_type(); }
+        return checked.type_id;
+    }
+
+    LambdaCheckResult check_lambda_against_callable_type(self,
+        hir.HirId node_id,
+        hir.HirLambda lambda,
+        qid.TypeId expected_type,
+        types.FunctionType function_type
+    ) {
+        self.check_lambda_capture_initializers(lambda);
+        Bool has_env = self.lambda_has_env(lambda);
         if (function_type.params.length != lambda.param_count) {
-            self.type_ops.add_node_error(node_id, "lambda parameter count does not match expected type", "lambda_arity");
-            return self.state.store.types.invalid_type();
+            self.type_ops.add_node_error(
+                node_id,
+                "lambda parameter count does not match expected type",
+                "lambda_arity"
+            );
+            return LambdaCheckResult(ok: false, has_env: has_env, type_id: self.state.store.types.invalid_type());
         }
         self.state.results.set_def_type(lambda.function_def, expected_type);
         self.bind_lambda_param_types(lambda.function_def, lambda, function_type);
@@ -582,7 +614,7 @@ public struct BodyCheck: Movable {
             "lambda body type does not match expected return type",
             "lambda_return_type_mismatch"
         );
-        return expected_type;
+        return LambdaCheckResult(ok: true, has_env: has_env, type_id: expected_type);
     }
 
     () check_lambda_capture_initializers(self, hir.HirLambda lambda) {
@@ -591,6 +623,183 @@ public struct BodyCheck: Movable {
             self.check_node(lambda.captures[index]);
             index = index + 1;
         }
+    }
+
+    Bool lambda_has_env(self, hir.HirLambda lambda) {
+        return lambda.captures.length > 0 || self.lambda_body_has_implicit_capture(lambda.function_def, lambda.body);
+    }
+
+    Bool lambda_body_has_implicit_capture(self, qid.DefId lambda_def, hir.HirId body) {
+        return self.lambda_node_has_implicit_capture(lambda_def, body);
+    }
+
+    Bool lambda_node_has_implicit_capture(self, qid.DefId lambda_def, hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .name_ref(name_ref)) {
+            return self.lambda_name_ref_is_capture(lambda_def, name_ref);
+        }
+        if (node.data is .block(block)) { return self.lambda_block_has_implicit_capture(lambda_def, block); }
+        if (node.data is .let_stmt(let_stmt)) {
+            return self.lambda_optional_has_implicit_capture(lambda_def, let_stmt.initializer);
+        }
+        if (node.data is .destructure_stmt(destructure)) {
+            if (self.lambda_node_has_implicit_capture(lambda_def, destructure.initializer)) { return true; }
+            return self.lambda_node_array_has_implicit_capture(lambda_def, destructure.bindings);
+        }
+        if (node.data is .defer_stmt(defer_stmt)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, defer_stmt.body);
+        }
+        if (node.data is .guard_stmt(guard_stmt)) {
+            return self.lambda_guard_has_implicit_capture(lambda_def, guard_stmt);
+        }
+        if (node.data is .assign_stmt(assign_stmt)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, assign_stmt.target)
+                || self.lambda_node_has_implicit_capture(lambda_def, assign_stmt.value);
+        }
+        if (node.data is .return_stmt(return_stmt)) {
+            return self.lambda_optional_has_implicit_capture(lambda_def, return_stmt.value);
+        }
+        if (node.data is .throw_stmt(throw_stmt)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, throw_stmt.value);
+        }
+        if (node.data is .member_access(member_access)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, member_access.base);
+        }
+        if (node.data is .index_access(index_access)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, index_access.base)
+                || self.lambda_node_has_implicit_capture(lambda_def, index_access.index);
+        }
+        if (node.data is .slice_access(slice_access)) {
+            return self.lambda_slice_has_implicit_capture(lambda_def, slice_access);
+        }
+        if (node.data is .struct_literal(struct_literal)) {
+            return self.lambda_field_inits_have_implicit_capture(lambda_def, struct_literal.fields);
+        }
+        if (node.data is .tuple_literal(tuple_literal)) {
+            return self.lambda_node_array_has_implicit_capture(lambda_def, tuple_literal.items);
+        }
+        if (node.data is .array_literal(array_literal)) {
+            return self.lambda_node_array_has_implicit_capture(lambda_def, array_literal.items);
+        }
+        if (node.data is .range_expr(range_expr)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, range_expr.start)
+                || self.lambda_node_has_implicit_capture(lambda_def, range_expr.end);
+        }
+        if (node.data is .call(call)) { return self.lambda_call_has_implicit_capture(lambda_def, call); }
+        if (node.data is .implicit_call(call)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, call.base)
+                || self.lambda_node_array_has_implicit_capture(lambda_def, call.args);
+        }
+        if (node.data is .unary(unary)) { return self.lambda_node_has_implicit_capture(lambda_def, unary.value); }
+        if (node.data is .binary(binary)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, binary.left)
+                || self.lambda_node_has_implicit_capture(lambda_def, binary.right);
+        }
+        if (node.data is .if_expr(if_expr)) { return self.lambda_if_has_implicit_capture(lambda_def, if_expr); }
+        if (node.data is .loop_expr(loop_expr)) { return self.lambda_loop_has_implicit_capture(lambda_def, loop_expr); }
+        if (node.data is .switch_expr(switch_expr)) {
+            return self.lambda_switch_has_implicit_capture(lambda_def, switch_expr);
+        }
+        if (node.data is .catch_expr(catch_expr)) {
+            return self.lambda_catch_has_implicit_capture(lambda_def, catch_expr);
+        }
+        if (node.data is .is_pattern(is_pattern)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, is_pattern.value)
+                || self.lambda_node_has_implicit_capture(lambda_def, is_pattern.pattern);
+        }
+        if (node.data is .variant_pattern(variant_pattern)) {
+            return self.lambda_node_array_has_implicit_capture(lambda_def, variant_pattern.payload);
+        }
+        return false;
+    }
+
+    Bool lambda_name_ref_is_capture(self, qid.DefId lambda_def, hir.HirNameRef name_ref) {
+        if (name_ref is .local(_)) { return false; }
+        guard name_ref is .def_ref(def_id) else { return false; }
+        def.DefRecord record = self.state.store.defs.get(def_id);
+        if (record.kind != .local_def && record.kind != .parameter_def) { return false; }
+        guard record.owner_def is .some(owner_def) else { return false; }
+        return owner_def != lambda_def;
+    }
+
+    Bool lambda_block_has_implicit_capture(self, qid.DefId lambda_def, hir.HirBlock block) {
+        if (self.lambda_node_array_has_implicit_capture(lambda_def, block.statements)) { return true; }
+        return self.lambda_optional_has_implicit_capture(lambda_def, block.result);
+    }
+
+    Bool lambda_guard_has_implicit_capture(self, qid.DefId lambda_def, hir.HirGuard guard_stmt) {
+        return self.lambda_node_has_implicit_capture(lambda_def, guard_stmt.condition)
+            || self.lambda_node_has_implicit_capture(lambda_def, guard_stmt.else_body);
+    }
+
+    Bool lambda_slice_has_implicit_capture(self, qid.DefId lambda_def, hir.HirSliceAccess slice_access) {
+        if (self.lambda_node_has_implicit_capture(lambda_def, slice_access.base)) { return true; }
+        if (self.lambda_optional_has_implicit_capture(lambda_def, slice_access.start)) { return true; }
+        return self.lambda_optional_has_implicit_capture(lambda_def, slice_access.end);
+    }
+
+    Bool lambda_call_has_implicit_capture(self, qid.DefId lambda_def, hir.HirCall call) {
+        if (self.lambda_node_has_implicit_capture(lambda_def, call.callee)) { return true; }
+        Int! index = 0;
+        while (index < call.args.length) {
+            if (self.lambda_node_has_implicit_capture(lambda_def, call.args[index].value)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool lambda_if_has_implicit_capture(self, qid.DefId lambda_def, hir.HirIf if_expr) {
+        if (self.lambda_node_has_implicit_capture(lambda_def, if_expr.condition)) { return true; }
+        if (self.lambda_node_has_implicit_capture(lambda_def, if_expr.then_body)) { return true; }
+        return self.lambda_optional_has_implicit_capture(lambda_def, if_expr.else_body);
+    }
+
+    Bool lambda_loop_has_implicit_capture(self, qid.DefId lambda_def, hir.HirLoop loop_expr) {
+        if (self.lambda_optional_has_implicit_capture(lambda_def, loop_expr.condition)) { return true; }
+        if (self.lambda_optional_has_implicit_capture(lambda_def, loop_expr.pattern)) { return true; }
+        if (self.lambda_optional_has_implicit_capture(lambda_def, loop_expr.iterable)) { return true; }
+        return self.lambda_node_has_implicit_capture(lambda_def, loop_expr.body);
+    }
+
+    Bool lambda_switch_has_implicit_capture(self, qid.DefId lambda_def, hir.HirSwitch switch_expr) {
+        if (self.lambda_node_has_implicit_capture(lambda_def, switch_expr.value)) { return true; }
+        Int! index = 0;
+        while (index < switch_expr.cases.length) {
+            hir.HirSwitchCase switch_case = switch_expr.cases[index];
+            if (self.lambda_node_array_has_implicit_capture(lambda_def, switch_case.patterns)) { return true; }
+            if (self.lambda_node_has_implicit_capture(lambda_def, switch_case.body)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool lambda_catch_has_implicit_capture(self, qid.DefId lambda_def, hir.HirCatch catch_expr) {
+        if (self.lambda_node_has_implicit_capture(lambda_def, catch_expr.value)) { return true; }
+        if (self.lambda_optional_has_implicit_capture(lambda_def, catch_expr.pattern)) { return true; }
+        return self.lambda_node_has_implicit_capture(lambda_def, catch_expr.body);
+    }
+
+    Bool lambda_field_inits_have_implicit_capture(self, qid.DefId lambda_def, hir.HirFieldInit[]& fields) {
+        Int! index = 0;
+        while (index < fields.length) {
+            if (self.lambda_node_has_implicit_capture(lambda_def, fields[index].value)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool lambda_node_array_has_implicit_capture(self, qid.DefId lambda_def, hir.HirId[]& nodes) {
+        Int! index = 0;
+        while (index < nodes.length) {
+            if (self.lambda_node_has_implicit_capture(lambda_def, nodes[index])) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool lambda_optional_has_implicit_capture(self, qid.DefId lambda_def, hir.HirId? node_id) {
+        guard node_id is .some(value) else { return false; }
+        return self.lambda_node_has_implicit_capture(lambda_def, value);
     }
 
     () bind_lambda_param_types(self, qid.DefId owner_def, hir.HirLambda lambda, types.FunctionType function_type) {
