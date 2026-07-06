@@ -129,7 +129,8 @@ Type alias = expr
 ## RawFn 和 Fn 转换
 
 `RawFn<...>` 可以通过 `Fn(raw)` 显式转换成同签名的 `Fn<...>`。这个转换只包装函数入口，
-不绑定参数，不捕获源码变量；运行时用一个按签名缓存的 trampoline 从 `env` 取回 raw 函数再调用：
+不绑定参数，不捕获源码变量。
+运行时用一个按签名缓存的 trampoline 从 `env` 取回 raw 函数再调用：
 
 ```jiang
 RawFn<Bool, Foo&, Int, Int> raw = Foo.compare;
@@ -325,6 +326,18 @@ lambda.params[i].local_id   -> HirLocal.def_id -> TypeCheckStore.def_type
 lambda.captures[i].local_id -> HirLocal.def_id -> TypeCheckStore.def_type
 ```
 
+type check 还会把显式 capture 和隐式 capture 合并记录到 `TypeCheckStore.lambda_captures`。
+这张 side table 按后续 env field 顺序保存 capture kind、source def、local def 和 capture type：
+
+```text
+lambda.function_def -> [
+  { kind: explicit, source_def: base?, local_def: snapshot, type: Int, field: 0 },
+  { kind: implicit, source_def: name, local_def: name, type: String&, field: 1 },
+]
+```
+
+隐式 capture 由 lambda body 中指向外层 local/parameter 的 `def_ref` 推导，按首次出现顺序去重。
+
 ## 与 async / 数据竞争的关系
 
 async closure 应建立在普通 closure 之上：async state machine 保存的是 closure environment
@@ -351,6 +364,7 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] HIR 使用 `HirLambda` 平铺记录 params 和显式 captures。
 - [x] lambda params 和显式 capture alias 同名时报错。
 - [x] 显式 capture alias 通过 initializer/type ref 绑定 `def_type`。
+- [x] type check side table 记录显式和隐式 capture metadata。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
