@@ -122,7 +122,10 @@ Type alias = expr
 - 只读取的外层 local 默认按共享引用捕获，environment 保存 `T&`。
 - 写入外层 `!` storage 时默认按可变引用捕获，environment 保存 `T!&`，并参与 unique borrow 检查。
 - 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
-- owner move 不做默认推导；需要写成 `field = value$.move()` 这类显式 environment 字段初始化。
+- `T*`、`T[*]`、`T&` 这类非 owning handle 默认捕获 handle 值，不再额外生成
+  `Reference<handle>`。
+- `T^` 这类 owning handle 不做默认捕获；需要写成 `field = value$.move()` 这类显式
+  environment 字段初始化，owner capture/drop 语义后续再完整设计。
 
 显式 capture alias 不会把 initializer 中的 source 名字注册成 body 里的等价名字。例如
 `[snapshot = base]` 只定义 `snapshot` 字段；如果 body 里还直接使用外层 `base`，`base`
