@@ -91,7 +91,7 @@ RawFn<Int, Int> bad_add = (value) => value + base; // fail: captures environment
 后续可以引入显式 environment 字段初始化列表。它写在参数列表之后、`=>` 之前：
 
 ```jiang
-Fn<Int, Int> f = (arg) [_ value = old_value$.move(), Config& config = config$.ref()] => {
+Fn<Int, Int> f = (arg) [value = old_value$.move(), Config& config = config$.ref()] => {
     arg + value + config.offset
 };
 ```
@@ -100,6 +100,7 @@ Fn<Int, Int> f = (arg) [_ value = old_value$.move(), Config& config = config$.re
 每个 item 的形式接近局部变量初始化：
 
 ```jiang
+alias = expr
 _ alias = expr
 _! alias = expr
 Type alias = expr
@@ -108,12 +109,12 @@ ref! _ alias = expr
 ```
 
 `expr` 在闭包创建时求值，结果保存为 environment 字段 `alias`；body 中的 `alias` 解析到
-这个字段。省略字段类型时必须显式写 `_`，不支持 bare `alias = expr`。移动、借用和复制都由
-普通表达式语义表达：
+这个字段。`alias = expr` 等价于 binding pattern 的裸名字绑定；也可以用 `_ alias = expr`
+显式表示类型推断。移动、借用和复制都由普通表达式语义表达：
 
 ```jiang
 (arg) [
-    _ owned = old_owned$.move(),
+    owned = old_owned$.move(),
     ref _ borrowed = old_value,
     Int snapshot = counter
 ] => {
