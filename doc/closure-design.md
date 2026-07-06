@@ -373,6 +373,6 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 标量 `T!` 捕获后可读到外层 storage 的后续写入。
 - [x] 共享引用捕获外层非平凡 local 并立即调用。
 - [x] 可变捕获修改外层 `!` storage。
-- [ ] 捕获闭包返回导致 local borrow escape 报错。
+- [x] 捕获闭包返回导致 local borrow escape 报错。
 - [ ] 对外层 local 执行 move 的闭包报错。
 - [ ] 修改 capture 的闭包需要 unique closure value。
