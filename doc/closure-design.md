@@ -124,6 +124,10 @@ Type alias = expr
 - 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
 - owner move 不做默认推导；需要写成 `field = value$.move()` 这类显式 environment 字段初始化。
 
+显式 capture alias 不会把 initializer 中的 source 名字注册成 body 里的等价名字。例如
+`[snapshot = base]` 只定义 `snapshot` 字段；如果 body 里还直接使用外层 `base`，`base`
+仍按默认规则生成独立的隐式引用捕获。
+
 基础闭环可以先实现默认捕获，再逐步补齐显式字段初始化列表的 owner capture 和 drop 语义。
 
 ## RawFn 和 Fn 转换
@@ -337,6 +341,8 @@ lambda.function_def -> [
 ```
 
 隐式 capture 由 lambda body 中指向外层 local/parameter 的 `def_ref` 推导，按首次出现顺序去重。
+显式 capture 的 `source_def` 只描述 initializer 来源，不参与 body 中外层 `def_ref` 到 env field 的匹配；
+只有隐式 capture 用 `source_def` 匹配外层名字。
 当前 HIR 不把这些 `def_ref` 重写成新的 capture local；type check、MIR lowering 和 borrow check
 通过 `lambda_captures` side table 把它们映射到 env field。
 
