@@ -787,7 +787,17 @@ struct MirLowerer: Movable {
         guard self.typeck.def_type(hir_def.def_id) is .some(type_id) else { return false; }
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         guard info.data is .function_type(function_type) else { return false; }
-        return function_type.params.length == body.locals.len() + 1;
+        Int! explicit_capture_count = 0;
+        if (self.typeck.lambda_capture_infos(hir_def.def_id) is .some(captures)) {
+            Int! index = 0;
+            while (index < captures.length) {
+                if (captures[index].kind == .explicit_capture) {
+                    explicit_capture_count = explicit_capture_count + 1;
+                }
+                index = index + 1;
+            }
+        }
+        return function_type.params.length == body.locals.len() - explicit_capture_count + 1;
     }
 
     mir.MirLocalDecl synthetic_closure_env_local(self, hir.HirDef& hir_def) {
@@ -952,6 +962,8 @@ struct BodyLowerer: Movable {
     list.ArrayList<lower_support.LoopTargets>! loop_targets;
     list.ArrayList<mir.MirLocalId>! active_locals;
     list.ArrayList<hir.HirId>! active_defers;
+    typeck_store.LambdaCaptureInfo[]&? lambda_capture_infos;
+    qid.TypeId?! lambda_env_tuple_type;
     Int! hir_local_offset;
     mir.MirBlockId! current_block;
     Bool! terminated;
@@ -974,6 +986,8 @@ struct BodyLowerer: Movable {
         self.loop_targets = list.ArrayList<lower_support.LoopTargets>();
         self.active_locals = list.ArrayList<mir.MirLocalId>();
         self.active_defers = list.ArrayList<hir.HirId>();
+        self.lambda_capture_infos = lowerer.typeck.lambda_capture_infos(hir_def.def_id);
+        self.lambda_env_tuple_type = null;
         self.current_block = self.reserve_block(span);
         self.terminated = false;
         self.hir_local_offset = self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
@@ -5915,10 +5929,16 @@ struct BodyLowerer: Movable {
         }
         if (node.data is .name_ref(name_ref)) {
             if (name_ref is .local(local_id)) {
+                if (self.lambda_capture_place_for_local(local_id) is .some(capture_place)) {
+                    return self.operand_for_place(capture_place);
+                }
                 mir.MirPlace place = self.place_for_local(self.mir_local_for_hir(local_id));
                 return self.operand_for_place(place);
             }
             if (name_ref is .def_ref(def_id)) {
+                if (self.lambda_capture_place_for_def(def_id) is .some(capture_place)) {
+                    return self.operand_for_place(capture_place);
+                }
                 if (self.selected_name_ref_def_operand(node_id) is .some(operand)) {
                     return operand;
                 }
@@ -5966,13 +5986,114 @@ struct BodyLowerer: Movable {
             self.function_ref(node_id, lambda.function_def, code_type, type_args, const_args)
         );
         token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirOperand env = self.lambda_env_operand(node_id, lambda, span);
         self.push_closure_assign(
             node_id,
             destination,
             self.type_for_node(node_id),
-            self.null_operand(self.closure_env_type(span), span),
+            env,
             code
         );
+    }
+
+    mir.MirOperand lambda_env_operand(self, hir.HirId node_id, hir.HirLambda lambda, token.Span span) {
+        guard self.lowerer.typeck.lambda_capture_infos(lambda.function_def) is .some(captures) else {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        if (captures.length == 0) {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        qid.TypeId env_type = self.lambda_env_tuple_type_for_infos(captures, span);
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        mir.MirLocalId env_local = self.add_temp(env_pointer_type, span);
+        mir.MirPlace env_place = self.place_for_local(env_local);
+        self.push_assign(
+            env_place,
+            mir.alloc_array_rvalue(mir.MirAllocArrayRvalue (
+                element_type: env_type,
+                count: self.int_operand(1, span)
+            )),
+            span
+        );
+        self.fill_lambda_env(node_id, lambda, captures, env_place);
+        return self.erased_lambda_env_operand(env_place, env_pointer_type, span);
+    }
+
+    qid.TypeId lambda_env_tuple_type_for_infos(self, typeck_store.LambdaCaptureInfo[]& captures, token.Span span) {
+        list.ArrayList<qid.TypeId>! fields = list.ArrayList<qid.TypeId>(captures.length);
+        Int! index = 0;
+        while (index < captures.length) {
+            fields.add(self.lowerer.substitute_type(captures[index].type_id, self.substitutions));
+            index = index + 1;
+        }
+        return self.lowerer.ctx.store.types.tuple_type(fields$.move(), span);
+    }
+
+    qid.TypeId raw_pointer_type(self, qid.TypeId element_type, token.Span span) {
+        return self.lowerer.ctx.store.types.raw_pointer_type(element_type, span);
+    }
+
+    () fill_lambda_env(self,
+        hir.HirId node_id,
+        hir.HirLambda lambda,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        mir.MirPlace env_place
+    ) {
+        mir.MirPlace env_value = self.project_deref(env_place, true);
+        Int! index = 0;
+        while (index < captures.length) {
+            typeck_store.LambdaCaptureInfo info = captures[index];
+            mir.MirPlace field_place = self.project_constant_index(env_value, info.field_index);
+            self.push_assign(
+                field_place,
+                mir.use_rvalue(mir.MirUseRvalue (value: self.lambda_capture_operand(node_id, lambda, info))),
+                self.lowerer.hir_span(node_id)
+            );
+            index = index + 1;
+        }
+    }
+
+    mir.MirOperand lambda_capture_operand(
+        self,
+        hir.HirId node_id,
+        hir.HirLambda lambda,
+        typeck_store.LambdaCaptureInfo info
+    ) {
+        if (info.kind == .explicit_capture) {
+            if (info.source_def is .some(source_def)) {
+                if (self.place_for_local_def(source_def) is .some(place)) {
+                    return self.operand_for_place(place);
+                }
+            }
+            return self.lower_to_operand(lambda.captures[info.field_index].value);
+        }
+        if (info.source_def is .some(source_def)) {
+            if (self.place_for_local_def(source_def) is .some(place)) {
+                return self.operand_for_place(place);
+            }
+        }
+        return self.unsupported_operand(node_id);
+    }
+
+    mir.MirOperand erased_lambda_env_operand(
+        self,
+        mir.MirPlace env_place,
+        qid.TypeId env_pointer_type,
+        token.Span span
+    ) {
+        qid.TypeId erased_type = self.closure_env_type(span);
+        mir.MirLocalId erased_local = self.add_temp(erased_type, span);
+        mir.MirPlace erased_place = self.place_for_local(erased_local);
+        self.push_assign(
+            erased_place,
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: self.cast_kind(env_pointer_type, erased_type),
+                value: self.operand_for_place(env_place),
+                target_type: erased_type
+            )),
+            span
+        );
+        return self.operand_for_place(erased_place);
     }
 
     () push_closure_assign(self,
@@ -6002,6 +6123,70 @@ struct BodyLowerer: Movable {
 
     qid.TypeId closure_env_type(self, token.Span span) {
         return self.lowerer.ctx.store.types.raw_pointer_type(self.lowerer.ctx.store.types.uint8_type(), span);
+    }
+
+    qid.TypeId lambda_env_tuple_type_for_body(self, token.Span span) {
+        if (self.lambda_env_tuple_type is .some(type_id)) {
+            return type_id;
+        }
+        guard self.lambda_capture_infos is .some(captures) else {
+            return self.lowerer.ctx.store.types.unit_type();
+        }
+        qid.TypeId type_id = self.lambda_env_tuple_type_for_infos(captures, span);
+        self.lambda_env_tuple_type = type_id;
+        return type_id;
+    }
+
+    mir.MirPlace? lambda_capture_place_for_local(self, hir.HirLocalId local_id) {
+        hir.HirLocal local = self.hir_local(local_id);
+        return self.lambda_capture_place_for_local_def(local.def_id, true);
+    }
+
+    mir.MirPlace? lambda_capture_place_for_def(self, qid.DefId def_id) {
+        return self.lambda_capture_place_for_local_def(def_id, false);
+    }
+
+    mir.MirPlace? lambda_capture_place_for_local_def(self, qid.DefId def_id, Bool explicit_only) {
+        guard self.lambda_capture_infos is .some(captures) else { return null; }
+        Int! index = 0;
+        while (index < captures.length) {
+            typeck_store.LambdaCaptureInfo info = captures[index];
+            if (explicit_only && info.kind != .explicit_capture) {
+                index = index + 1;
+                continue;
+            }
+            if (self.lambda_capture_matches_def(info, def_id)) {
+                return self.lambda_capture_field_place(info, token.Span());
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool lambda_capture_matches_def(self, typeck_store.LambdaCaptureInfo info, qid.DefId def_id) {
+        if (qid.DefId.equal(info.local_def$.ref(), def_id$.ref())) { return true; }
+        if (info.source_def is .some(source_def)) {
+            return qid.DefId.equal(source_def$.ref(), def_id$.ref());
+        }
+        return false;
+    }
+
+    mir.MirPlace lambda_capture_field_place(self, typeck_store.LambdaCaptureInfo info, token.Span span) {
+        qid.TypeId env_type = self.lambda_env_tuple_type_for_body(span);
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        mir.MirLocalId typed_env = self.add_temp(env_pointer_type, span);
+        mir.MirPlace typed_env_place = self.place_for_local(typed_env);
+        self.push_assign(
+            typed_env_place,
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: self.cast_kind(self.closure_env_type(span), env_pointer_type),
+                value: self.operand_for_place(self.place_for_local(mir.MirLocalId.from_index(1))),
+                target_type: env_pointer_type
+            )),
+            span
+        );
+        mir.MirPlace env_value = self.project_deref(typed_env_place, true);
+        return self.project_constant_index(env_value, info.field_index);
     }
 
     Bool type_is_closure(self, qid.TypeId type_id) {
@@ -6738,9 +6923,15 @@ struct BodyLowerer: Movable {
         hir.HirNode node = self.lowerer.hirs.node(node_id);
         if (node.data is .name_ref(name_ref)) {
             if (name_ref is .local(local_id)) {
+                if (self.lambda_capture_place_for_local(local_id) is .some(capture_place)) {
+                    return capture_place;
+                }
                 return self.place_for_local(self.mir_local_for_hir(local_id));
             }
             if (name_ref is .def_ref(def_id)) {
+                if (self.lambda_capture_place_for_def(def_id) is .some(capture_place)) {
+                    return capture_place;
+                }
                 return self.place_for_global_def(node_id, def_id);
             }
             return null;
@@ -6753,6 +6944,19 @@ struct BodyLowerer: Movable {
                 return null;
             }
             return self.place_for_index(index_access);
+        }
+        return null;
+    }
+
+    mir.MirPlace? place_for_local_def(self, qid.DefId def_id) {
+        guard self.hir_def.body is .some(ref _ body) else { return null; }
+        Int! index = 0;
+        while (index < body.locals.len()) {
+            hir.HirLocal local = body.locals.get_index(index);
+            if (qid.DefId.equal(local.def_id$.ref(), def_id$.ref())) {
+                return self.place_for_local(self.mir_local_for_hir(local.id));
+            }
+            index = index + 1;
         }
         return null;
     }
