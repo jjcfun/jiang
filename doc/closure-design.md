@@ -293,7 +293,7 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 
 1. AST：新增 `lambda_expr`，包含 params、body、是否 block body。
 2. Resolve：lambda body 进入子 scope；外层 local 引用标记为 capture candidate。
-3. HIR：为捕获 lambda 分配内部 closure def，记录显式字段初始化列表和 call body。
+3. HIR：为 lambda 分配内部 function def，用 `HirLambdaScope` 统一记录 params、captures 和 call body。
 4. Type check：从 expected type 检查参数和返回，并推导 capture kind、call ability。
 5. Borrow check：检查 capture lifetime、unique conflict、move 后使用。
 6. MIR：构造 environment aggregate；闭包调用 lowering 成 `code(env, args...)`。
@@ -301,6 +301,20 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 
 当 expected type 是 `RawFn<...>` 时，不构造 environment；如果 capture analysis 发现任何捕获，
 直接报错。
+
+HIR 不把 closure env 伪装成源码 struct，也不新增 AST 节点。`HirLambdaScope` 是 callable-local
+binding metadata，params 和 captures 属于同一个局部 binding namespace：
+
+```text
+HirLambdaScope {
+  params:   [x, y]
+  captures: [base, name]
+}
+```
+
+params 和 captures 不能同名；显式 capture alias 也占用这个 namespace。resolve 结束后，全局/成员
+namespace 仍保存在 `NamespaceStore`，但 lambda 内的参数、显式 capture local 和普通 local 都已经
+落成具体 `DefId` / `HirLocalId`，后续阶段不再通过字符串名字查找它们。
 
 ## 与 async / 数据竞争的关系
 
@@ -325,6 +339,8 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] `Fn<...>` code 使用 env-first 调用约定。
 - [x] `Fn(raw)` 通过 trampoline 适配 env-first 调用约定。
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
+- [x] HIR 使用 `HirLambdaScope` 统一记录 params 和显式 captures。
+- [x] lambda params 和显式 capture alias 同名时报错。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
