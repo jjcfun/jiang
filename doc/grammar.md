@@ -312,9 +312,9 @@ name        <- ident / "self"
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
-- `Fn<unsafe T, ...>` 和 `Fn<async T, ...>` 表示带调用效果的函数类型。调用效果前缀写在
-  `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数类型；因此
-  `Fn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
+- `RawFn<unsafe T, ...>` 和 `RawFn<async T, ...>` 表示带调用效果的函数指针类型。调用效果
+  前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型；
+  因此 `RawFn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
 - 需要进入调用效果上下文时使用 `do [options] { ... }`；例如 `do [unsafe] { ... }`
   允许调用 unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文。
 

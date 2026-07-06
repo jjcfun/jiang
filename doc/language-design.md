@@ -873,7 +873,7 @@ trait Indexable {
 - 如果 receiver 已经是 pointer/reference，`ref.method(args...)` 也等价于 `Type.method(ref, args...)`。
 - `Type.method(receiver, args...)` 是显式方法调用形式；第一个实参必须匹配 receiver 类型。
 - instance method 作为函数值时，显式 receiver 保留为第一个参数。例如 `Int get(self)`
-  的函数值类型是 `Fn<Int, Self&>`；`Int take(Self self)` 的函数值类型是 `Fn<Int, Self>`。
+  的函数值类型是 `RawFn<Int, Self&>`；`Int take(Self self)` 的函数值类型是 `RawFn<Int, Self>`。
   类型函数没有 receiver 参数。
 - trait 可以声明没有 receiver 参数的类型函数 requirement，通过 `Type.method(args...)`
   调用，也可以在泛型约束中通过 `T.method(args...)` 调用。

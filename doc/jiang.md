@@ -738,20 +738,20 @@ sort(list, (Int left, Int right) => left < right);
 
 ```c
 // 排序
-Int[]& sort(Int[]& list, Fn<Bool, Int, Int> compare)
+Int[]& sort(Int[]& list, RawFn<Bool, Int, Int> compare)
 
 // 支持泛型的排序，其中 T 需要实现 Numeric
 @where(T: Numeric)
-T[]& sort<T>(T[]& list, Fn<Bool, T, T> compare)
+T[]& sort<T>(T[]& list, RawFn<Bool, T, T> compare)
 
 // 支持泛型的排序，会抛出异常，其中 E 可以为任意类型
 @where(T: Numeric)
-T[]&@E sort<T, E>(T[]& list, Fn<Bool@E, T, T> compare)
+T[]&@E sort<T, E>(T[]& list, RawFn<Bool@E, T, T> compare)
 ```
 
 #### 函数指针
 
-`Fn<R, A, B, ...>` 表示函数指针类型：
+`RawFn<R, A, B, ...>` 表示函数指针类型：
 
 - 第一个类型参数是返回类型
 - 后续类型参数按顺序表示参数类型
@@ -759,7 +759,7 @@ T[]&@E sort<T, E>(T[]& list, Fn<Bool@E, T, T> compare)
 例如：
 
 ```c
-Fn<Bool, Int, Int> compare;
+RawFn<Bool, Int, Int> compare;
 ```
 
 表示：
@@ -769,16 +769,16 @@ Fn<Bool, Int, Int> compare;
 
 当前支持：
 
-- 普通顶层函数衰减为 `Fn<...>`
-- 类型函数衰减为 `Fn<...>`
-- 实例方法通过 `Type.method` 衰减为 `Fn<Ret, Receiver&, Args...>`
-- `Fn<...>` 的返回类型可以写成 `T@E`
-- 通过 `Fn<...>` 变量进行调用
-- 非捕获 lambda 表达式赋值给 `Fn<...>`
+- 普通顶层函数衰减为 `RawFn<...>`
+- 类型函数衰减为 `RawFn<...>`
+- 实例方法通过 `Type.method` 衰减为 `RawFn<Ret, Receiver&, Args...>`
+- `RawFn<...>` 的返回类型可以写成 `T@E`
+- 通过 `RawFn<...>` 变量进行调用
+- 非捕获 lambda 表达式赋值给 `RawFn<...>`
 - 若同名函数/方法存在多个重载：
   - 调用时按参数个数和参数类型**精确匹配**
   - 返回类型不参与重载决议
-  - 将函数值赋给 `Fn<...>` 时，目标 `Fn<...>` 类型会参与消歧
+  - 将函数值赋给 `RawFn<...>` 时，目标 `RawFn<...>` 类型会参与消歧
   - 若没有目标类型上下文（例如 `_ f = foo;`）且存在多个重载，则编译报歧义
 
 示例 1：顶层函数
@@ -788,7 +788,7 @@ Bool less(Int left, Int right) {
     return left < right;
 }
 
-Fn<Bool, Int, Int> compare = less;
+RawFn<Bool, Int, Int> compare = less;
 Bool ok = compare(1, 2);
 ```
 
@@ -801,7 +801,7 @@ struct Math {
     }
 }
 
-Fn<Bool, Int, Int> compare = Math.less;
+RawFn<Bool, Int, Int> compare = Math.less;
 Bool ok = compare(1, 2);
 ```
 
@@ -816,7 +816,7 @@ struct User {
     }
 }
 
-Fn<Int, User&, Int> add = User.add;
+RawFn<Int, User&, Int> add = User.add;
 
 User user = User { id: 40 };
 Int value = add(user$.ref(), 2);
@@ -842,10 +842,10 @@ Bool@Err less(Int left, Int right) {
     return left < right;
 }
 
-Fn<Bool@Err, Int, Int> compare = less;
+RawFn<Bool@Err, Int, Int> compare = less;
 ```
 
-示例 5：重载函数值按 `Fn<...>` 目标类型消歧
+示例 5：重载函数值按 `RawFn<...>` 目标类型消歧
 
 ```c
 Int add(Int value) {
@@ -856,27 +856,27 @@ Int add(Int left, Int right) {
     return left + right;
 }
 
-Fn<Int, Int> inc = add;
-Fn<Int, Int, Int> sum = add;
+RawFn<Int, Int> inc = add;
+RawFn<Int, Int, Int> sum = add;
 ```
 
 示例 6：lambda 表达式
 
 ```c
-Fn<Int, Int> inc = (Int value) => value + 1;
-Fn<Int, Int, Int> add = (Int left, Int right) => left + right;
-Fn<Int> answer = () => 42;
+RawFn<Int, Int> inc = (Int value) => value + 1;
+RawFn<Int, Int, Int> add = (Int left, Int right) => left + right;
+RawFn<Int> answer = () => 42;
 ```
 
 lambda 规则：
 
 - 参数列表必须写 `(...)`
-- 参数可以省略类型；目标 `Fn<...>` 类型会参与参数类型推断
+- 参数可以省略类型；目标 `RawFn<...>` 类型会参与参数类型推断
 - 单参数也必须写括号，例如 `(Int x) => x`
 - 无参数写 `() => expr`
 - body 可以是表达式或 block
 - 当前只支持非捕获闭包；不能读取或写入外层局部变量
-- lambda 可以赋值给 `Fn<...>` 或传给需要 `Fn<...>` 的参数
+- lambda 可以赋值给 `RawFn<...>` 或传给需要 `RawFn<...>` 的参数
 
 当前不支持：
 
@@ -888,25 +888,25 @@ lambda 规则：
 
 ```c
 @where(T: Numeric, E2: CompareError)
-async T[]&@E1 sort<T, E1, E2>(T[]& list, Fn<async Fn<async Bool@E2, T, T>@E1, T[]&> compare)
+async T[]&@E1 sort<T, E1, E2>(T[]& list, RawFn<async RawFn<async Bool@E2, T, T>@E1, T[]&> compare)
 
 @where(T: Numeric, E2: CompareError)
-@alias(Cmp = Fn<async Bool@E2, T, T>)
-async T[]&@E1 sort<T, E1, E2>(T[]& list, Fn<async Cmp@E1, T[]&> compare)
+@alias(Cmp = RawFn<async Bool@E2, T, T>)
+async T[]&@E1 sort<T, E1, E2>(T[]& list, RawFn<async Cmp@E1, T[]&> compare)
 ```
 
-`unsafe` 和 `async` 可以写在 `Fn<...>` 的返回类型前，表示这个函数类型带有对应调用效果：
+`unsafe` 和 `async` 可以写在 `RawFn<...>` 的返回类型前，表示这个函数类型带有对应调用效果：
 
 ```c
-Fn<async Bool>[]& callback_list;
-Fn<unsafe Int, Int>[]& unsafe_callbacks;
+RawFn<async Bool>[]& callback_list;
+RawFn<unsafe Int, Int>[]& unsafe_callbacks;
 ```
 
-`Fn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。`unsafe` 和 `async` 不修饰
-`Bool` 这个返回值类型，而是修饰外层 `Fn<...>` 函数类型。如果函数本身异步并返回切片引用，应写成：
+`RawFn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。`unsafe` 和 `async` 不修饰
+`Bool` 这个返回值类型，而是修饰外层 `RawFn<...>` 函数类型。如果函数本身异步并返回切片引用，应写成：
 
 ```c
-Fn<async Bool[]&> load_callbacks;
+RawFn<async Bool[]&> load_callbacks;
 ```
 
 调用带 `unsafe` effect 的函数需要进入显式 effect context：
@@ -1014,14 +1014,14 @@ Int@Err parse(UInt8[]& text)
   
 ()@Err flush()
   
-Fn<Bool@Err, Int, Int> compare
+RawFn<Bool@Err, Int, Int> compare
 ```
 
 其中：
 
 - `T` 是成功值类型
 - `E` 是错误值类型
-- `@E` 只允许出现在函数返回类型和 `Fn<...>` 的返回位
+- `@E` 只允许出现在函数返回类型和 `RawFn<...>` 的返回位
 - 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
 
 抛出错误使用 `throw expr;`：
@@ -1691,7 +1691,7 @@ union MyUnion {
 - tuple
 - array
 - slice
-- `Fn<...>`
+- `RawFn<...>`
 - `T^`
 - `T&`
 - `T[*]`
@@ -1738,7 +1738,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 绑定；这些绑定等价于按顺序拆成多个 `@alias`，因此后面的绑定可以引用前面引入的名字：
 
 ```c
-@alias(Items = T[]&, Cmp = Fn<Bool, Items, Items>)
+@alias(Items = T[]&, Cmp = RawFn<Bool, Items, Items>)
 @where(T: Hashable)
 Cmp compare<T>(Items left, Items right)
 ```
@@ -1926,7 +1926,7 @@ Value.Any& owned_ref = owned$.ref();
 Int b = owned_ref.value();
 
 Value.Receiver receiver = any.receiver;
-Fn<Int, Value.Receiver> value_fn = any.value;
+RawFn<Int, Value.Receiver> value_fn = any.value;
 Int c = value_fn(receiver);
 ```
 
