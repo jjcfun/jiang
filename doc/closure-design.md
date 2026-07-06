@@ -316,6 +316,15 @@ params 和 captures 不能同名；显式 capture alias 也占用这个 namespac
 namespace 仍保存在 `NamespaceStore`，但 lambda 内的参数、显式 capture local 和普通 local 都已经
 落成具体 `DefId` / `HirLocalId`，后续阶段不再通过字符串名字查找它们。
 
+`HirLambdaParam` 和 `HirLambdaCapture` 本身不直接保存 type。type check 从 expected callable type
+绑定参数类型，从 capture initializer 或显式 type ref 绑定 capture alias 类型，统一写入对应
+`HirLocal.def_id` 的 `def_type`：
+
+```text
+lambda.params[i].local_id   -> HirLocal.def_id -> TypeCheckStore.def_type
+lambda.captures[i].local_id -> HirLocal.def_id -> TypeCheckStore.def_type
+```
+
 ## 与 async / 数据竞争的关系
 
 async closure 应建立在普通 closure 之上：async state machine 保存的是 closure environment
@@ -341,6 +350,7 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
 - [x] HIR 使用 `HirLambda` 平铺记录 params 和显式 captures。
 - [x] lambda params 和显式 capture alias 同名时报错。
+- [x] 显式 capture alias 通过 initializer/type ref 绑定 `def_type`。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
