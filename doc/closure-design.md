@@ -302,8 +302,8 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 当 expected type 是 `RawFn<...>` 时，不构造 environment；如果 capture analysis 发现任何捕获，
 直接报错。
 
-HIR 不把 closure env 伪装成源码 struct，也不新增 AST 节点。`HirLambda` 平铺保存 callable-local
-binding metadata，params 和 captures 属于同一个局部 binding namespace：
+HIR 不把 closure env 伪装成源码 struct，也不新增 AST 节点。`HirLambda` 平铺保存显式
+callable-local binding metadata；params 和显式 captures 属于同一个局部 binding namespace：
 
 ```text
 HirLambda {
@@ -312,9 +312,9 @@ HirLambda {
 }
 ```
 
-params 和 captures 不能同名；显式 capture alias 也占用这个 namespace。resolve 结束后，全局/成员
-namespace 仍保存在 `NamespaceStore`，但 lambda 内的参数、显式 capture local 和普通 local 都已经
-落成具体 `DefId` / `HirLocalId`，后续阶段不再通过字符串名字查找它们。
+params 和显式 captures 不能同名；显式 capture alias 也占用这个 namespace。resolve 结束后，
+全局/成员 namespace 仍保存在 `NamespaceStore`，但 lambda 内的参数、显式 capture local 和普通
+local 都已经落成具体 `DefId` / `HirLocalId`，后续阶段不再通过字符串名字查找它们。
 
 `HirLambdaParam` 和 `HirLambdaCapture` 本身不直接保存 type。type check 从 expected callable type
 绑定参数类型，从 capture initializer 或显式 type ref 绑定 capture alias 类型，统一写入对应
@@ -326,7 +326,8 @@ lambda.captures[i].local_id -> HirLocal.def_id -> TypeCheckStore.def_type
 ```
 
 type check 还会把显式 capture 和隐式 capture 合并记录到 `TypeCheckStore.lambda_captures`。
-这张 side table 按后续 env field 顺序保存 capture kind、source def、local def 和 capture type：
+这张 side table 是统一 capture list，按后续 env field 顺序保存 capture kind、source def、
+local def 和 capture type：
 
 ```text
 lambda.function_def -> [
@@ -336,6 +337,8 @@ lambda.function_def -> [
 ```
 
 隐式 capture 由 lambda body 中指向外层 local/parameter 的 `def_ref` 推导，按首次出现顺序去重。
+当前 HIR 不把这些 `def_ref` 重写成新的 capture local；type check、MIR lowering 和 borrow check
+通过 `lambda_captures` side table 把它们映射到 env field。
 
 ## 与 async / 数据竞争的关系
 
