@@ -367,12 +367,12 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] type check side table 记录显式和隐式 capture metadata。
 - [x] lambda body 按 expected `RawFn` / `Fn` 的 unsafe、async effects 检查。
 - [x] `RawFn<Ret@Err, ...>` 和 `Fn<Ret@Err, ...>` 返回位解析。
-- [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
-- [ ] 需要绑定 receiver 时必须写显式 lambda。
+- [x] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
+- [x] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
-- [ ] 小的 `Copy` 值默认按值捕获。
-- [ ] 共享引用捕获外层非平凡 local 并立即调用。
-- [ ] 可变捕获修改外层 `!` storage。
+- [x] 小的 `Copy` 值默认按值捕获。
+- [x] 共享引用捕获外层非平凡 local 并立即调用。
+- [x] 可变捕获修改外层 `!` storage。
 - [ ] 捕获闭包返回导致 local borrow escape 报错。
 - [ ] 对外层 local 执行 move 的闭包报错。
 - [ ] 修改 capture 的闭包需要 unique closure value。
