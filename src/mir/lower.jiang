@@ -97,6 +97,7 @@ struct MirLowerer: Movable {
     table.HashTable<TraitVTableGlobalKey, qid.DefId> trait_vtable_globals;
     table.HashTable<Int, qid.DefId> receiver_type_globals;
     table.HashTable<Int, qid.DefId> receiver_drop_shims;
+    table.HashTable<Int, qid.DefId> raw_fn_to_fn_shims;
 
     public init(self,
         context.CompilerContext& ctx,
@@ -115,6 +116,7 @@ struct MirLowerer: Movable {
         self.trait_vtable_globals = table.HashTable<TraitVTableGlobalKey, qid.DefId>();
         self.receiver_type_globals = table.HashTable<Int, qid.DefId>();
         self.receiver_drop_shims = table.HashTable<Int, qid.DefId>();
+        self.raw_fn_to_fn_shims = table.HashTable<Int, qid.DefId>();
     }
 
     public () lower_package(self) {
@@ -751,9 +753,13 @@ struct MirLowerer: Movable {
             return 0;
         }
         Int! hir_local_offset = 0;
+        if (self.should_synthesize_closure_env_local(hir_def, body)) {
+            locals.add(self.synthetic_closure_env_local(hir_def));
+            hir_local_offset = hir_local_offset + 1;
+        }
         if (self.should_synthesize_receiver_local(hir_def, body)) {
-            locals.add(self.synthetic_receiver_local(hir_def, substitutions));
-            hir_local_offset = 1;
+            locals.add(self.synthetic_receiver_local(hir_def, substitutions, hir_local_offset + 1));
+            hir_local_offset = hir_local_offset + 1;
         }
         Int! index = 0;
         while (index < body.locals.len()) {
@@ -776,14 +782,37 @@ struct MirLowerer: Movable {
         return !string.equal(self.ctx.store.symbols.text(first.symbol), "self");
     }
 
+    Bool should_synthesize_closure_env_local(self, hir.HirDef& hir_def, hir.HirBody& body) {
+        if (!hir_def.decl.is_lambda_function) { return false; }
+        guard self.typeck.def_type(hir_def.def_id) is .some(type_id) else { return false; }
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        return function_type.params.length == body.locals.len() + 1;
+    }
+
+    mir.MirLocalDecl synthetic_closure_env_local(self, hir.HirDef& hir_def) {
+        token.Span span = self.def_span(hir_def.def_id);
+        return mir.MirLocalDecl (
+            id: mir.MirLocalId.from_index(1),
+            kind: mir.MirLocalKind.param,
+            type_id: self.ctx.store.types.raw_pointer_type(self.ctx.store.types.uint8_type(), span),
+            span: span,
+            name: self.ctx.store.symbols.intern("__env"),
+            def_id: null,
+            mutable_local: false,
+            address_taken: false
+        );
+    }
+
     mir.MirLocalDecl synthetic_receiver_local(self,
         hir.HirDef& hir_def,
-        monomorph.SubstitutionMap& substitutions
+        monomorph.SubstitutionMap& substitutions,
+        Int mir_index
     ) {
         token.Span span = self.def_span(hir_def.def_id);
         qid.TypeId type_id = self.receiver_type(hir_def, substitutions, span);
         return mir.MirLocalDecl (
-            id: mir.MirLocalId.from_index(1),
+            id: mir.MirLocalId.from_index(mir_index),
             kind: mir.MirLocalKind.param,
             type_id: type_id,
             span: span,
@@ -5936,13 +5965,26 @@ struct BodyLowerer: Movable {
         mir.MirOperand code = mir.function_operand_value(
             self.function_ref(node_id, lambda.function_def, code_type, type_args, const_args)
         );
-        self.push_closure_assign(node_id, destination, self.type_for_node(node_id), code);
+        token.Span span = self.lowerer.hir_span(node_id);
+        self.push_closure_assign(
+            node_id,
+            destination,
+            self.type_for_node(node_id),
+            self.null_operand(self.closure_env_type(span), span),
+            code
+        );
     }
 
-    () push_closure_assign(self, hir.HirId node_id, mir.MirPlace destination, qid.TypeId closure_type, mir.MirOperand code) {
+    () push_closure_assign(self,
+        hir.HirId node_id,
+        mir.MirPlace destination,
+        qid.TypeId closure_type,
+        mir.MirOperand env,
+        mir.MirOperand code
+    ) {
         token.Span span = self.lowerer.hir_span(node_id);
         list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>(2);
-        fields.add(self.null_operand(self.closure_env_type(span), span));
+        fields.add(env);
         fields.add(code);
         self.push_assign(
             destination,
@@ -7268,8 +7310,9 @@ struct BodyLowerer: Movable {
     }
 
     () lower_closure_call(self, hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
-        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length + 1);
         mir.MirCallCallee callee = mir.indirect_operand_callee(self.closure_code_operand(call.callee));
+        args.add(self.closure_env_operand(call.callee));
         Int! index = 0;
         while (index < call.args.length) {
             args.add(self.lower_to_operand(call.args[index].value));
@@ -7292,6 +7335,12 @@ struct BodyLowerer: Movable {
         mir.MirPlace closure_place = self.pointer_base_place(callee_id);
         mir.MirPlace code_place = self.project_constant_index(closure_place, 1);
         return mir.copy_operand_value(mir.MirCopyOperand (place: code_place));
+    }
+
+    mir.MirOperand closure_env_operand(self, hir.HirId callee_id) {
+        mir.MirPlace closure_place = self.pointer_base_place(callee_id);
+        mir.MirPlace env_place = self.project_constant_index(closure_place, 0);
+        return mir.copy_operand_value(mir.MirCopyOperand (place: env_place));
     }
 
     mir.MirPlace[]& unique_places_for_call(self, hir.HirId node_id, hir.HirCall call, qid.DefId target_def) {
@@ -7698,8 +7747,225 @@ struct BodyLowerer: Movable {
             self.mark_unsupported(node_id);
             return;
         }
-        mir.MirOperand code = self.lower_to_operand(call.args[0].value);
-        self.push_closure_assign(node_id, destination, self.type_for_node(node_id), code);
+        qid.TypeId raw_type = self.type_for_node(call.args[0].value);
+        qid.DefId shim_def = self.ensure_raw_fn_to_fn_shim(node_id, raw_type);
+        qid.TypeId code_type = self.closure_code_type(raw_type);
+        mir.MirOperand code = mir.function_operand_value(mir.MirFunctionRef (
+            function_def: shim_def,
+            type_id: code_type,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            span: self.lowerer.hir_span(node_id)
+        ));
+        self.push_closure_assign(
+            node_id,
+            destination,
+            self.type_for_node(node_id),
+            self.lower_to_operand(call.args[0].value),
+            code
+        );
+    }
+
+    qid.DefId ensure_raw_fn_to_fn_shim(self, hir.HirId node_id, qid.TypeId raw_type) {
+        Int key = raw_type.to_index();
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.raw_fn_to_fn_shims$.ref(),
+            key
+        ) is .some(existing)) {
+            return existing;
+        }
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.DefId shim_def = self.create_raw_fn_to_fn_shim_def(raw_type, span);
+        self.lowerer.raw_fn_to_fn_shims.set(key, shim_def);
+        self.add_raw_fn_to_fn_shim_function(shim_def, raw_type, span);
+        return shim_def;
+    }
+
+    qid.DefId create_raw_fn_to_fn_shim_def(self, qid.TypeId raw_type, token.Span span) {
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.hir_def.def_id);
+        std.String name = build_text_int("__raw_fn_to_fn_", raw_type.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    () add_raw_fn_to_fn_shim_function(self, qid.DefId shim_def, qid.TypeId raw_type, token.Span span) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(raw_type);
+        guard info.data is .function_type(function_type) else { return; }
+        Int function_index = self.lowerer.output.functions.len();
+        mir.MirLocalId raw_local = mir.MirLocalId.from_index(function_type.params.length + 2);
+        list.ArrayList<mir.MirLocalDecl>! locals = list.ArrayList<mir.MirLocalDecl>(function_type.params.length + 3);
+        locals.add(self.raw_fn_to_fn_local(0, .return_place, function_type.result, span, null));
+        locals.add(self.raw_fn_to_fn_local(
+            1,
+            .param,
+            self.closure_env_type(span),
+            span,
+            self.lowerer.ctx.store.symbols.intern("__env")
+        ));
+        Int! param_index = 0;
+        while (param_index < function_type.params.length) {
+            locals.add(self.raw_fn_to_fn_local(
+                param_index + 2,
+                .param,
+                function_type.params[param_index],
+                span,
+                null
+            ));
+            param_index = param_index + 1;
+        }
+        locals.add(self.raw_fn_to_fn_local(raw_local.to_index(), .compiler_temp, raw_type, span, null));
+
+        list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(1);
+        statements.add(self.raw_fn_to_fn_cast_statement(raw_local, raw_type, span));
+        list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(2);
+        blocks.add(self.raw_fn_to_fn_call_block(raw_local, function_type, statements$.ref(), span));
+        blocks.add(self.raw_fn_to_fn_return_block(span));
+        mir.MirBody body = mir.MirBody(
+            id: mir.MirBodyId.from_index(function_index),
+            span: span,
+            locals: self.raw_fn_to_fn_locals(locals$.ref()),
+            blocks: self.lowerer.output.block_array(blocks$.ref()),
+            entry: mir.MirBlockId.from_index(0),
+            return_local: mir.MirLocalId.from_index(0)
+        );
+        self.lowerer.output.add_function(mir.MirFunction(
+            id: mir.MirFunctionId.from_index(function_index),
+            def_id: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            signature_id: null,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: false,
+            naked: false,
+            span: span,
+            body: body
+        ));
+    }
+
+    mir.MirLocalDecl raw_fn_to_fn_local(
+        self,
+        Int index,
+        mir.MirLocalKind kind,
+        qid.TypeId type_id,
+        token.Span span,
+        qid.SymbolId? name
+    ) {
+        return mir.MirLocalDecl(
+            id: mir.MirLocalId.from_index(index),
+            kind: kind,
+            type_id: type_id,
+            span: span,
+            name: name,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        );
+    }
+
+    mir.MirLocalDecl[]& raw_fn_to_fn_locals(self, list.ArrayList<mir.MirLocalDecl>& locals) {
+        mir.MirLocalDecl![*] stored = self.lowerer.output.alloc_local_array(locals.len());
+        Int! index = 0;
+        while (index < locals.len()) {
+            stored[index] = locals.get(index);
+            index = index + 1;
+        }
+        return stored[0..locals.len()];
+    }
+
+    mir.MirStatement raw_fn_to_fn_cast_statement(
+        self,
+        mir.MirLocalId raw_local,
+        qid.TypeId raw_type,
+        token.Span span
+    ) {
+        return mir.MirStatement(
+            span: span,
+            kind: mir.assign_statement_kind(mir.MirAssignStatement(
+                destination: self.place_for_local(raw_local),
+                value: mir.cast_rvalue(mir.MirCastRvalue(
+                    kind: mir.MirCastKind.ptr_to_ptr,
+                    value: mir.copy_operand_value(mir.MirCopyOperand(place: self.place_for_local(mir.MirLocalId(1)))),
+                    target_type: raw_type
+                ))
+            ))
+        );
+    }
+
+    mir.MirBlock raw_fn_to_fn_call_block(
+        self,
+        mir.MirLocalId raw_local,
+        types.FunctionType function_type,
+        list.ArrayList<mir.MirStatement>& statements,
+        token.Span span
+    ) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(function_type.params.length);
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            args.add(mir.copy_operand_value(mir.MirCopyOperand(
+                place: self.place_for_local(mir.MirLocalId.from_index(index + 2))
+            )));
+            index = index + 1;
+        }
+        return mir.MirBlock(
+            id: mir.MirBlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements),
+            terminator: mir.MirTerminator(
+                span: span,
+                kind: mir.call_terminator_kind(mir.MirCallTerminator(
+                    callee: mir.indirect_operand_callee(mir.copy_operand_value(mir.MirCopyOperand(
+                        place: self.place_for_local(raw_local)
+                    ))),
+                    args: self.lowerer.output.operand_slice(args.slice()),
+                    destination: self.place_for_local(mir.MirLocalId(0)),
+                    target: mir.MirBlockId.from_index(1),
+                    initialized_place: null,
+                    unique_places: self.lowerer.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    mir.MirBlock raw_fn_to_fn_return_block(self, token.Span span) {
+        list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>();
+        return mir.MirBlock(
+            id: mir.MirBlockId.from_index(1),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements$.ref()),
+            terminator: mir.MirTerminator(
+                span: span,
+                kind: mir.return_terminator_kind(mir.MirReturnTerminator(implicit_unit: true))
+            )
+        );
+    }
+
+    qid.TypeId closure_code_type(self, qid.TypeId raw_type) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(raw_type);
+        guard info.data is .function_type(function_type) else { return self.lowerer.ctx.store.types.invalid_type(); }
+        list.ArrayList<qid.TypeId>! params = list.ArrayList<qid.TypeId>(function_type.params.length + 1);
+        params.add(self.closure_env_type(token.Span()));
+        Int! index = 0;
+        while (index < function_type.params.length) {
+            params.add(function_type.params[index]);
+            index = index + 1;
+        }
+        return self.lowerer.ctx.store.types.function_type_with_effects(
+            params$.move(),
+            function_type.result,
+            token.Span(),
+            function_type.effects
+        );
     }
 
     Bool lower_core_hash_call(self, hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
