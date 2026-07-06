@@ -1573,6 +1573,12 @@ struct BodyLowerer: Movable {
             self.lower_inline_asm(node_id, inline_asm, destination);
             return;
         }
+        if (node.data is .lambda_expr(lambda)) {
+            if (self.type_is_closure(self.type_for_node(node_id))) {
+                self.lower_lambda_closure(node_id, lambda, destination);
+                return;
+            }
+        }
         mir.MirOperand value = self.lower_operand(node_id);
         self.push_assign(destination, mir.use_rvalue(mir.MirUseRvalue (value: value)), self.lowerer.hir_span(node_id));
     }
@@ -5848,7 +5854,7 @@ struct BodyLowerer: Movable {
     Bool can_lower_as_direct_operand(self, hir.HirId node_id) {
         hir.HirNode node = self.lowerer.hirs.node(node_id);
         if (node.data is .literal(_)) { return true; }
-        if (node.data is .lambda_expr(_)) { return true; }
+        if (node.data is .lambda_expr(_)) { return !self.type_is_closure(self.type_for_node(node_id)); }
         if (node.data is .name_ref(_)) { return true; }
         if (node.data is .member_access(_)) {
             if (self.lowerer.typeck.expr_lowering(node_id) is .some(lowering_kind)) {
@@ -5913,11 +5919,53 @@ struct BodyLowerer: Movable {
 
     mir.MirOperand lambda_function_operand(self, hir.HirId node_id, hir.HirLambda lambda) {
         qid.TypeId function_type = self.type_for_node(node_id);
+        if (self.type_is_closure(function_type)) {
+            return self.unsupported_operand(node_id);
+        }
         qid.TypeId[]& type_args = self.lowerer.output.empty_type_args();
         comptime_value.ComptimeValue[]& const_args = self.lowerer.output.empty_const_args();
         return mir.function_operand_value(
             self.function_ref(node_id, lambda.function_def, function_type, type_args, const_args)
         );
+    }
+
+    () lower_lambda_closure(self, hir.HirId node_id, hir.HirLambda lambda, mir.MirPlace destination) {
+        qid.TypeId[]& type_args = self.lowerer.output.empty_type_args();
+        comptime_value.ComptimeValue[]& const_args = self.lowerer.output.empty_const_args();
+        qid.TypeId code_type = self.lowerer.typeck.def_type(lambda.function_def)$.some();
+        mir.MirOperand code = mir.function_operand_value(
+            self.function_ref(node_id, lambda.function_def, code_type, type_args, const_args)
+        );
+        self.push_closure_assign(node_id, destination, self.type_for_node(node_id), code);
+    }
+
+    () push_closure_assign(self, hir.HirId node_id, mir.MirPlace destination, qid.TypeId closure_type, mir.MirOperand code) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        list.ArrayList<mir.MirOperand>! fields = list.ArrayList<mir.MirOperand>(2);
+        fields.add(self.null_operand(self.closure_env_type(span), span));
+        fields.add(code);
+        self.push_assign(
+            destination,
+            mir.aggregate_rvalue(mir.MirAggregateRvalue (
+                kind: mir.MirAggregateKind.struct_value,
+                def_id: null,
+                type_id: closure_type,
+                tag: null,
+                payload_field_index: -1,
+                fields: self.lowerer.output.operand_slice(fields.slice())
+            )),
+            span
+        );
+    }
+
+    qid.TypeId closure_env_type(self, token.Span span) {
+        return self.lowerer.ctx.store.types.raw_pointer_type(self.lowerer.ctx.store.types.uint8_type(), span);
+    }
+
+    Bool type_is_closure(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        return function_type.kind == .closure;
     }
 
     mir.MirOperand? selected_name_ref_def_operand(self, hir.HirId node_id) {
@@ -7195,6 +7243,10 @@ struct BodyLowerer: Movable {
                 return;
             }
         }
+        if (self.type_is_closure(self.type_for_node(call.callee))) {
+            self.lower_closure_call(node_id, call, destination);
+            return;
+        }
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
         mir.MirCallCallee callee = mir.indirect_operand_callee(self.lower_to_operand(call.callee));
         Int! index = 0;
@@ -7213,6 +7265,33 @@ struct BodyLowerer: Movable {
             cleanup: null
         )), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    () lower_closure_call(self, hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length);
+        mir.MirCallCallee callee = mir.indirect_operand_callee(self.closure_code_operand(call.callee));
+        Int! index = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_to_operand(call.args[index].value));
+            index = index + 1;
+        }
+        mir.MirBlockId next_block = self.reserve_block(self.lowerer.hir_span(node_id));
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: callee,
+            args: self.lowerer.output.operand_slice(args.slice()),
+            destination: destination,
+            target: next_block,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), self.lowerer.hir_span(node_id));
+        self.start_block(next_block);
+    }
+
+    mir.MirOperand closure_code_operand(self, hir.HirId callee_id) {
+        mir.MirPlace closure_place = self.pointer_base_place(callee_id);
+        mir.MirPlace code_place = self.project_constant_index(closure_place, 1);
+        return mir.copy_operand_value(mir.MirCopyOperand (place: code_place));
     }
 
     mir.MirPlace[]& unique_places_for_call(self, hir.HirId node_id, hir.HirCall call, qid.DefId target_def) {
@@ -7619,11 +7698,8 @@ struct BodyLowerer: Movable {
             self.mark_unsupported(node_id);
             return;
         }
-        self.push_assign(
-            destination,
-            mir.use_rvalue(mir.MirUseRvalue (value: self.lower_to_operand(call.args[0].value))),
-            self.lowerer.hir_span(node_id)
-        );
+        mir.MirOperand code = self.lower_to_operand(call.args[0].value);
+        self.push_closure_assign(node_id, destination, self.type_for_node(node_id), code);
     }
 
     Bool lower_core_hash_call(self, hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {

@@ -39,8 +39,8 @@ RawFn<Bool, Int, Int>    // 裸函数指针，不带 environment
 `RawFn<...>` 的运行时值是函数入口。它不保存捕获环境，适合 top-level function、type/static
 function、未绑定实例方法和非捕获 lambda。
 
-`Fn<...>` 的运行时值是 Jiang callable。它可以表示 `{env, code}`，也可以由 `RawFn<...>`
-包装得到空 environment 的闭包值。
+`Fn<...>` 的运行时值是 Jiang callable，表示为 `{env, code}`。0.4.5 当前先为非捕获
+lambda 和 `Fn(raw)` 构造 `{null, code}`；捕获 thunk 接入后，`code` 会统一消费 `env`。
 
 源语言不暴露闭包表达式自己的匿名类型。每个捕获闭包表达式对应独立 environment layout。
 即使两个闭包形状相同，也不要求共享内部表示。
@@ -319,6 +319,7 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 捕获 lambda 可在 `Fn<...>` expected type 下通过 type check。
 - [x] 捕获 lambda 赋给 `RawFn<...>` 报错。
 - [x] `RawFn<...>` 可通过 `Fn(raw)` 包装成同签名 `Fn<...>`。
+- [x] `Fn<...>` 运行时值使用 `{env, code}` 二字段表示。
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
