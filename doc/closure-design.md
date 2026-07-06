@@ -117,12 +117,11 @@ Type alias = expr
 }
 ```
 
-未列入列表的外层 local 仍按默认规则自动捕获。默认规则不是“全部引用”：
+未列入列表的外层 local 仍按默认规则自动捕获。默认规则是“统一引用捕获”：
 
-- 内建标量、enum、指针/函数指针等简单值默认按值捕获，environment 保存创建闭包时的值。
-- struct、union、tuple 等聚合/自定义对象默认按引用捕获，即使字段本身都可复制。
-- 只读取的非平凡 local 默认按共享引用捕获，environment 保存 `T&`。
+- 只读取的外层 local 默认按共享引用捕获，environment 保存 `T&`。
 - 写入外层 `!` storage 时默认按可变引用捕获，environment 保存 `T!&`，并参与 unique borrow 检查。
+- 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
 - owner move 不做默认推导；需要写成 `field = value$.move()` 这类显式 environment 字段初始化。
 
 基础闭环可以先实现默认捕获，再逐步补齐显式字段初始化列表的 owner capture 和 drop 语义。
@@ -215,11 +214,9 @@ extern fn qsort(
 
 ## Capture 分类
 
-默认捕获必须能从闭包 body 和 expected type 推导出最小安全 environment：
+默认捕获必须能从闭包 body 和 expected type 推导出安全 environment：
 
-- 内建标量、enum、指针/函数指针等简单值可以按值保存，不借用外层 storage。
-- struct、union、tuple 等聚合/自定义对象默认保存共享引用，避免隐式对象快照。
-- 只读取的非平凡 local 保存共享引用，闭包值不能逃逸超过被捕获 storage 的生命周期。
+- 只读取的外层 local 保存共享引用，闭包值不能逃逸超过被捕获 storage 的生命周期。
 - 写入外层 `!` storage 保存可变引用，闭包创建和调用都要满足 unique borrow 约束。
 - owner move 只能通过显式字段初始化进入 environment，不能由默认捕获隐式发生。
 
@@ -372,8 +369,8 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [x] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
-- [x] 内建标量和 enum 默认按值捕获。
-- [x] struct、union、tuple 默认按引用捕获。
+- [x] 隐式捕获统一按引用捕获。
+- [x] 标量 `T!` 捕获后可读到外层 storage 的后续写入。
 - [x] 共享引用捕获外层非平凡 local 并立即调用。
 - [x] 可变捕获修改外层 `!` storage。
 - [ ] 捕获闭包返回导致 local borrow escape 报错。
