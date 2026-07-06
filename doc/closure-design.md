@@ -126,8 +126,8 @@ Type alias = expr
 
 ## RawFn 和 Fn 转换
 
-`RawFn<...>` 可以转换成同签名的 `Fn<...>`。这个转换只包装函数入口，不绑定参数，
-不捕获新环境：
+`RawFn<...>` 可以通过 `Fn(raw)` 显式转换成同签名的 `Fn<...>`。这个转换只包装函数入口，
+不绑定参数，不捕获新环境：
 
 ```jiang
 RawFn<Bool, Foo&, Int, Int> raw = Foo.compare;
@@ -318,7 +318,7 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 非捕获 lambda 可赋给显式 `Fn<...>`。
 - [x] 捕获 lambda 可在 `Fn<...>` expected type 下通过 type check。
 - [x] 捕获 lambda 赋给 `RawFn<...>` 报错。
-- [ ] `RawFn<...>` 可通过 `Fn(raw)` 包装成同签名 `Fn<...>`。
+- [x] `RawFn<...>` 可通过 `Fn(raw)` 包装成同签名 `Fn<...>`。
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
