@@ -91,7 +91,7 @@ RawFn<Int, Int> bad_add = (value) => value + base; // fail: captures environment
 后续可以引入显式 environment 字段初始化列表。它写在参数列表之后、`=>` 之前：
 
 ```jiang
-Fn<Int, Int> f = (arg) [value = old_value$.move(), Config& config = config$.ref()] => {
+Fn<Int, Int> f = (arg) [_ value = old_value$.move(), Config& config = config$.ref()] => {
     arg + value + config.offset
 };
 ```
@@ -100,17 +100,21 @@ Fn<Int, Int> f = (arg) [value = old_value$.move(), Config& config = config$.ref(
 每个 item 的形式接近局部变量初始化：
 
 ```jiang
-alias = expr
+_ alias = expr
+_! alias = expr
 Type alias = expr
+ref _ alias = expr
+ref! _ alias = expr
 ```
 
 `expr` 在闭包创建时求值，结果保存为 environment 字段 `alias`；body 中的 `alias` 解析到
-这个字段。移动、借用和复制都由普通表达式语义表达：
+这个字段。省略字段类型时必须显式写 `_`，不支持 bare `alias = expr`。移动、借用和复制都由
+普通表达式语义表达：
 
 ```jiang
 (arg) [
-    owned = old_owned$.move(),
-    borrowed = old_value$.ref(),
+    _ owned = old_owned$.move(),
+    ref _ borrowed = old_value,
     Int snapshot = counter
 ] => {
     arg + snapshot
@@ -133,7 +137,7 @@ Type alias = expr
 handle 类型。
 
 显式 capture alias 不会把 initializer 中的 source 名字注册成 body 里的等价名字。例如
-`[snapshot = base]` 只定义 `snapshot` 字段；如果 body 里还直接使用外层 `base`，`base`
+`[_ snapshot = base]` 只定义 `snapshot` 字段；如果 body 里还直接使用外层 `base`，`base`
 仍按默认规则生成独立的隐式引用捕获。
 
 基础闭环可以先实现默认捕获，再逐步补齐显式字段初始化列表的 owner capture 和 drop 语义。
@@ -237,7 +241,7 @@ storage。
 
 后续能力可以再加入：
 
-- environment 字段初始化列表：`[field = expr, Type field = expr]`。
+- environment 字段初始化列表：`[_ field = expr, Type field = expr]`。
 - owner capture：通过 `field = value$.move()` 移动 owner 进 environment，并在闭包销毁时 drop。
 - 精确字段捕获：只捕获被使用的字段，而不是整个 local。
 
