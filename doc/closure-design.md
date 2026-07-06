@@ -365,6 +365,8 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] lambda params 和显式 capture alias 同名时报错。
 - [x] 显式 capture alias 通过 initializer/type ref 绑定 `def_type`。
 - [x] type check side table 记录显式和隐式 capture metadata。
+- [x] lambda body 按 expected `RawFn` / `Fn` 的 unsafe、async effects 检查。
+- [x] `RawFn<Ret@Err, ...>` 和 `Fn<Ret@Err, ...>` 返回位解析。
 - [ ] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [ ] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
