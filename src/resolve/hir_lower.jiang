@@ -18,8 +18,8 @@
 //   后续由 type check 根据 base type 选出来。
 // - 局部绑定由 lowering 维护词法环境并直接创建 DefId。
 
-import diagnostic = "../diagnostic/diagnostic.jiang";
 import hir = "../hir/hir.jiang";
+import diagnostic = "../diagnostic/diagnostic.jiang";
 import qid = "../store/id.jiang";
 import list = "../support/list.jiang";
 import string = "../support/string.jiang";
@@ -1513,6 +1513,9 @@ struct HirLower: Movable {
         if (expr.data is .literal(literal)) {
             return self.add_node(.literal(self.hir_literal(literal)), expr.span);
         }
+        if (expr.data is .lambda_expr(lambda)) {
+            return self.lower_lambda_expr(lambda, expr.span);
+        }
         if (expr.data is .unit_type) {
             hir.HirLiteralValue value = .unit_value();
             return self.add_node(.literal(hir.HirLiteral (value: value)), expr.span);
@@ -1607,6 +1610,161 @@ struct HirLower: Movable {
             )), expr.span);
         }
         return self.add_invalid_node(expr.span);
+    }
+
+    hir.HirId lower_lambda_expr(self, ast.LambdaData lambda, token.Span span) {
+        hir.HirId[]& captures = self.lower_lambda_captures(lambda.captures);
+        guard self.current_owner_def is .some(owner_def) else { return self.add_invalid_node(span); }
+        qid.DefId lambda_def = self.create_lambda_function_def(owner_def, span);
+        list.ArrayList<hir.HirLambdaParam>! params = list.ArrayList<hir.HirLambdaParam>(lambda.params.length);
+        hir.HirId body = self.lower_lambda_body(lambda_def, lambda, params$.ref(), span);
+        hir.HirLambdaParam[]& lambda_params = self.freeze_hir_lambda_params(params$.move());
+        qid.DefId?! previous_owner = self.current_owner_def;
+        self.current_owner_def = owner_def;
+        hir.HirId result = self.add_node(.lambda_expr(hir.HirLambda (
+            param_count: lambda.params.length,
+            params: lambda_params,
+            captures: captures,
+            function_def: lambda_def,
+            body: body
+        )), span);
+        self.current_owner_def = previous_owner;
+        return result;
+    }
+
+    qid.DefId create_lambda_function_def(self, qid.DefId owner_def, token.Span span) {
+        qid.SymbolId symbol = self.state.store.symbols.intern("__lambda");
+        qid.DefId lambda_def = self.state.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: symbol, span: span),
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.state.store.hirs.declare_def(lambda_def, .function_decl);
+        self.state.store.hirs.add_member(owner_def, lambda_def);
+        self.state.store.source_map.set_def_span(lambda_def, self.state.unit.source_id, span);
+        return lambda_def;
+    }
+
+    hir.HirId lower_lambda_body(self,
+        qid.DefId lambda_def,
+        ast.LambdaData lambda,
+        list.ArrayList<hir.HirLambdaParam>& params,
+        token.Span span
+    ) {
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = lambda_def;
+        hir.HirId placeholder = self.add_invalid_node(span);
+        self.state.store.hirs.load_body(lambda_def, hir.HirBody(lambda_def, placeholder));
+
+        self.env.enter_scope(.function_scope);
+        self.lower_lambda_capture_locals(lambda_def, lambda.captures);
+        self.lower_lambda_params(lambda_def, lambda.params, params);
+        hir.HirId body = self.lower_expr(lambda.body);
+        self.env.exit_scope();
+        self.state.store.hirs.set_body_root(lambda_def, body);
+        self.current_owner_def = previous_owner;
+        return body;
+    }
+
+    hir.HirId[]& lower_lambda_captures(self, ast.AstRange captures) {
+        list.ArrayList<hir.HirId>! values = list.ArrayList<hir.HirId>(captures.length);
+        Int! index = 0;
+        while (index < captures.length) {
+            ast.AstId capture_id = self.state.unit.child_at(captures, index);
+            ast.AstNode capture_node = self.state.unit.get(capture_id);
+            if (capture_node.data is .lambda_capture_item(capture)) {
+                values.add(self.lower_expr(capture.value));
+            }
+            index = index + 1;
+        }
+        return self.freeze_hir_ids(values$.move());
+    }
+
+    () lower_lambda_capture_locals(self, qid.DefId owner_def, ast.AstRange captures) {
+        Int! index = 0;
+        while (index < captures.length) {
+            ast.AstId capture_id = self.state.unit.child_at(captures, index);
+            ast.AstNode capture_node = self.state.unit.get(capture_id);
+            if (capture_node.data is .lambda_capture_item(capture)) {
+                hir.HirId?! type_ref = null;
+                if (capture.type_ref is .some(type_ast)) {
+                    type_ref = self.lower_type_ref(type_ast);
+                }
+                self.add_local_for_name(
+                    owner_def,
+                    capture.name,
+                    .local_def,
+                    .local_variable,
+                    false,
+                    false,
+                    type_ref
+                );
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_lambda_params(self,
+        qid.DefId owner_def,
+        ast.AstRange params,
+        list.ArrayList<hir.HirLambdaParam>& values
+    ) {
+        Int! index = 0;
+        while (index < params.length) {
+            ast.AstId param_id = self.state.unit.child_at(params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .lambda_param(param)) {
+                if (param.name is .some(name)) {
+                    values.add(hir.HirLambdaParam (
+                        index: index,
+                        local_id: self.add_local_for_name(
+                            owner_def,
+                            name,
+                            .parameter_def,
+                            .parameter,
+                            false,
+                            false,
+                            null
+                        )
+                    ));
+                } else {
+                    values.add(hir.HirLambdaParam (
+                        index: index,
+                        local_id: self.add_anonymous_lambda_param_local(owner_def, param_node.span)
+                    ));
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    hir.HirLocalId add_anonymous_lambda_param_local(self, qid.DefId owner_def, token.Span span) {
+        qid.SymbolId symbol = self.state.store.symbols.intern("_");
+        qid.DefId def_id = self.state.store.defs.create(
+            .parameter_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: symbol, span: span),
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.state.store.source_map.set_def_span(def_id, self.state.unit.source_id, span);
+        return self.state.store.hirs.add_local_with_borrow_binding(
+            owner_def,
+            .parameter,
+            symbol,
+            def_id,
+            false,
+            false,
+            null
+        );
     }
 
     // LexicalEnv 只在 lowering 期间使用：把刚创建的 local DefId 解析回
@@ -2893,6 +3051,21 @@ struct HirLower: Movable {
         return stored[0..count];
     }
 
+    hir.HirLambdaParam[]& freeze_hir_lambda_params(self, list.ArrayList<hir.HirLambdaParam> values) {
+        Int count = values.len();
+        Int! capacity = count;
+        if (capacity == 0) {
+            capacity = 1;
+        }
+        hir.HirLambdaParam![*] stored = self.state.store.hirs.storage.alloc_array<hir.HirLambdaParam>(capacity);
+        Int! index = 0;
+        while (index < count) {
+            stored[index] = values.get(index);
+            index = index + 1;
+        }
+        return stored[0..count];
+    }
+
     hir.HirSwitchCase[]& freeze_switch_cases(self, list.ArrayList<hir.HirSwitchCase> values) {
         Int count = values.len();
         Int! capacity = count;
@@ -3230,4 +3403,5 @@ struct HirLower: Movable {
             )
         );
     }
+
 }

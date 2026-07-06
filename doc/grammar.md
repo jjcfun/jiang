@@ -311,10 +311,15 @@ name        <- ident / "self"
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
-- `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和函数类型的返回位。
+- `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和 callable 类型的返回位。
 - `RawFn<unsafe T, ...>` 和 `RawFn<async T, ...>` 表示带调用效果的函数指针类型。调用效果
   前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型；
   因此 `RawFn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
+- `Fn<unsafe T, ...>` 和 `Fn<async T, ...>` 表示带调用效果的闭包值类型。调用效果前缀写在
+  `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层闭包值类型；因此
+  `Fn<async Bool>[]&` 表示“元素为异步闭包值的切片引用”。
+- `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment；`RawFn<Ret, Args...>` 表示裸函数
+  指针，不带 environment，可用于 C ABI 函数指针边界。
 - 需要进入调用效果上下文时使用 `do [options] { ... }`；例如 `do [unsafe] { ... }`
   允许调用 unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文。
 
@@ -517,7 +522,8 @@ switch_pattern_list
 表达式按优先级从低到高定义：
 
 ```peg
-expr        <- expr_with_block
+expr        <- lambda_expr
+             / expr_with_block
              / expr_without_block
 
 expr_with_block
@@ -529,6 +535,24 @@ expr_with_block
 
 expr_without_block
             <- range_expr
+
+lambda_expr <- "(" lambda_param_list? ")" lambda_capture_list? "=>" lambda_body
+
+lambda_param_list
+            <- lambda_param ("," lambda_param)* ","?
+
+lambda_param
+            <- name
+             / "_"
+
+lambda_capture_list
+            <- "[" lambda_capture_item ("," lambda_capture_item)* ","? "]"
+
+lambda_capture_item
+            <- type name "=" expr
+             / name "=" expr
+
+lambda_body <- block / expr
 
 range_expr  <- logic_or_expr ".." logic_or_expr
              / logic_or_expr
@@ -599,6 +623,14 @@ call_arg    <- (name ":")? expr
 `expr_without_block` 用于 `guard`、`while`、`for` 等后面紧跟 `block` 的位置。
 `paren_expr` 属于 `expr_without_block`，但括号内部重新进入完整 `expr`；
 因此 block/struct/if/switch/try-catch 等 `expr_with_block` 可以通过括号出现在这些位置。
+
+`lambda_expr` 必须有 expected callable type。参数类型由 expected type 提供；
+参数列表只写绑定名。
+`lambda_capture_list` 是可选的 environment 字段初始化列表，每一项形如 `field = expr` 或
+`Type field = expr`。这些 initializer 在闭包创建时求值；未列入列表的外层 local 仍可按
+默认捕获规则处理：小的 `Copy` 值可按值捕获，非平凡只读 local 按共享引用捕获，写入外层
+`!` storage 时按可变引用捕获。`RawFn<...>` expected type 下不允许任何捕获，也不允许
+capture list。
 
 ## primary expression
 

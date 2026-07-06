@@ -8,6 +8,7 @@
 - [语法参考](grammar.md)：接近 parser 的语法规则，适合核对具体写法。
 - [标准库孵化文档](std.md)：当前 `std` 暴露的模块、类型和稳定性边界。
 - [语言设计草案](language-design.md)：语言规则、设计理由和仍在收敛的边界。
+- [闭包设计草案](closure-design.md)：捕获闭包、callable 类型和后续 async/data-race 关系。
 
 `jiang.md` 是过时的历史单文件指南，只保留为迁移参考，不再作为文档入口维护。
 
