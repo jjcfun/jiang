@@ -367,7 +367,7 @@ aggregate member lifetime 规则后续统一在 borrow/lifetime checker 中表�
 
 ## Borrow 和可变捕获
 
-可变捕获应借用被捕获 storage，并和 `@unique` 规则一致：
+可变捕获应借用被捕获 storage，并和 `unique` 参数规则一致：
 
 ```jiang
 Int! total = 0;
