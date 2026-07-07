@@ -454,5 +454,6 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] `new lambda` 构造 `Fn<...>^` 的非捕获闭包，并支持直接调用。
 - [x] `new lambda` 捕获字段的 heap env 后端 lowering 完整验证。
 - [x] `Fn^$.ref()` 返回 `Fn&`，用于把 heap closure 临时借成 callable view。
+- [x] 裸 `Fn` 显式 owner capture 随 stack closure object 离开 scope 自动 drop。
 - [x] 对外层 local 执行非法 move 的闭包报错。
 - [x] 修改 capture 字段不要求 unique closure value，后续交给 effect / 数据竞争机制约束。
