@@ -11,7 +11,7 @@
 - `T!&` 表示当前 serial token 下的可变引用；同一 serial token 内允许多个 `T!&` alias。
 - 数据竞争检查转换为 token 切换检查：普通 `T!&` 不能跨 serial token 逃逸。
 - `Atomic`、`Mutex`、`Channel` 等同步类型是跨 token 共享可变状态的显式入口。
-- `unique` 不作为普通 `T!&` 的默认语义；后续如需要，可作为额外能力用于 noalias、move/drop
+- `unique` 不作为普通 `T!&` 的默认语义；它是参数位置的额外能力，用于 noalias、move/drop
   协议或特殊 API 约束。
 
 本文的主体是 capability。`effect` 用来描述调用上下文，例如 `unsafe`、`async`、`io`；
@@ -101,8 +101,15 @@ async [worker] () update_worker(Int!& value) {
 这不是 Rust `&mut` 的唯一引用模型。安全性来自 serial token 的串行执行，而不是来自
 全局唯一。
 
-因此后端和优化不能默认把 `T!&` 当作 noalias。需要 noalias 或严格独占时，后续应引入单独的
-`unique` 能力或更具体的 API 约束。
+因此后端和优化不能默认把 `T!&` 当作 noalias。需要 noalias 或严格独占时，在参数位置写
+`unique`：
+
+```jiang
+() swap(unique Int!& left, unique Int!& right) {
+}
+```
+
+`unique` 是调用点能力要求，不是字段或局部变量的常驻类型属性。
 
 ## Async 调用与隐式 await
 
@@ -222,7 +229,7 @@ trait SerialToken: ExecutorToken;
 - `io`、`atomic`、`alloc` 等未来可作为独立 effect 讨论。
 
 普通 mutable access 由 serial token 和 token 切换检查保证。这样 `Fn`、capture list 和函数参数
-不需要额外写 `@unique` 或 `@effect(write)`。
+不需要额外写 `@effect(write)`。需要 noalias 时在参数位置写 `unique`。
 
 ## 未决问题
 
@@ -232,4 +239,4 @@ trait SerialToken: ExecutorToken;
 - `Fn<async [token] ...>` 的 parser 表达和错误信息如何设计。
 - `T!&` 返回值的生命周期和 token 如何在 HIR / type check 中表示。
 - 标准库同步类型如何声明跨 token 能力。
-- `unique` 是否作为独立能力保留，以及它和 optimizer noalias 的关系。
+- `unique` 和 optimizer noalias 的精确关系。

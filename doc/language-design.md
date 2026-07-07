@@ -356,6 +356,16 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 存储引用字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，
 不能作为普通字段类型。
 
+函数参数可以用 `unique` 声明调用点必须提供不别名的访问能力：
+
+```jiang
+() swap(unique Int!& left, unique Int!& right) {
+}
+```
+
+`unique` 是参数 capability，不是普通引用类型的一部分；普通 `T!&` 仍然允许同 serial token
+内 alias。
+
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
 `!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、
 channel 或用户协议保证。

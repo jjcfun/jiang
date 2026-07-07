@@ -196,10 +196,10 @@ param_list  <- required_param ("," required_param)* ("," default_param)* ","?
             / default_param ("," default_param)* ","?
 
 required_param
-            <- type name
+            <- "unique"? type name
 
 default_param
-            <- type name "=" expr
+            <- "unique"? type name "=" expr
 ```
 
 说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。
