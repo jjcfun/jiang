@@ -42,22 +42,29 @@ RawFn<Bool, Int, Int>    // 裸函数指针，不带 environment
 `RawFn<...>` 的运行时值是函数入口。它不保存捕获环境，适合 top-level function、type/static
 function、未绑定实例方法和非捕获 lambda。
 
-`Fn<...>` 的源码语义是 movable stack closure object。运行时抽象为 `{env, code}`：`env` 是一段
-连续 environment memory，`code` 是使用该 env 的入口。普通 `Fn` 的 env memory 在当前栈帧或
-当前 aggregate 内，因此 `Fn<...>` 不能返回、保存到 heap/global，也不能写入可能比当前函数更久的
-外部位置。
+`Fn<...>` 的源码语义是 movable stack closure object。每个 closure expression 有一个编译器内部
+匿名 closure object 类型，字段就是捕获 environment。公开的 `Fn<...>` 是 erased callable view，
+运行时抽象为 `{receiver, vtable}`：`receiver` 指向匿名 closure object，`vtable` 指向只读
+callable vtable。
 
-`Fn<...>^` 是 owned closure handle。`new () [captures] => body` 直接构造 heap closure object，
-heap object 内保存 `{env, code}` 或等价布局，其中 env memory 是连续的 closure fields。它不是把
-一个普通 stack `Fn` 再装进 `Box`。`Fn^` move 时只移动 owner handle；drop 时 drop heap env fields
-并释放 closure object。
+callable vtable 至少包含：
 
-调用时仍可以抽象成 `code(env, args...)`：`code` 的底层调用约定为
-`RawFn<Ret, RawPointer<UInt8>, Args...>`，调用时先传 `env`，再传源码参数。
+- `call: RawFn<Ret, UInt8*, Args...>`，使用 erased receiver 调用 closure body。
+- `drop: RawFn<Unit, UInt8*>`，销毁 receiver 指向的匿名 closure object。
+
+普通 `Fn` 的 receiver 指向当前栈帧或当前 aggregate 内的匿名 closure object，因此 `Fn<...>` 不能
+返回、保存到 heap/global，也不能写入可能比当前函数更久的外部位置。
+
+`Fn<...>^` 是 owned closure handle。`new () [captures] => body` 直接构造 heap closure object；
+它不是把一个普通 stack `Fn` 再装进 `Box`。`Fn^` move 时只移动 owner handle；drop 时通过
+vtable 中的 `drop(receiver)` drop heap closure object，并释放其 storage。
+
+调用时抽象成 `vtable.call(receiver, args...)`：call 槽的底层调用约定为
+`RawFn<Ret, RawPointer<UInt8>, Args...>`，调用时先传 `receiver`，再传源码参数。
 
 `Fn<...>` 是统一 erased callable 类型，不把每个 closure 的匿名具体类型暴露给用户。每个
 closure expression 仍有内部 env layout；捕获字段按顺序紧密放入连续 env memory。非捕获 lambda
-的 env 为空；`Fn(raw)` 的 env 保存 raw 函数入口，`code` 指向编译器生成的 trampoline。
+的 receiver 可以为空；`Fn(raw)` 的 receiver 保存 raw 函数入口，call 槽指向编译器生成的 trampoline。
 
 源语言不暴露闭包表达式自己的匿名类型。每个捕获闭包表达式对应独立 environment layout。
 即使两个闭包形状相同，也不要求共享内部表示。
@@ -66,8 +73,8 @@ closure expression 仍有内部 env layout；捕获字段按顺序紧密放入�
 在同一个公开类型下有时 copy、有时 non-copy；基础规则把 `Fn` 当作 move-only。后续如果需要
 可复制 closure，可以增加显式能力类型或约束，而不是让 `Fn<...>` 的 copy 能力依赖调用点。
 
-`Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。闭包值不是 C 函数指针，`ptr` 也不应泄漏 `{env, code}`
-或 heap closure object 的内部布局。需要 C ABI 函数指针时使用 `RawFn<...>`。
+`Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。闭包值不是 C 函数指针，`ptr` 也不应泄漏 receiver、
+type info 或 heap closure object 的内部布局。需要 C ABI 函数指针时使用 `RawFn<...>`。
 
 ## Lambda 语法
 
@@ -169,7 +176,7 @@ handle 类型。
 
 `RawFn<...>` 可以通过 `Fn(raw)` 显式转换成同签名的 `Fn<...>`。这个转换只包装函数入口，
 不绑定参数，不捕获源码变量。
-运行时用一个按签名缓存的 trampoline 从 `env` 取回 raw 函数再调用：
+运行时用一个按签名缓存的 trampoline 从 `receiver` 取回 raw 函数再调用：
 
 ```jiang
 RawFn<Bool, Foo&, Int, Int> raw = Foo.compare;
@@ -273,18 +280,17 @@ owner capture 牵涉 consuming call、drop 和闭包重复调用规则，应该�
 
 ## 调用能力
 
-长期应区分三种调用能力：
+长期可扩展消费 environment 的调用能力：
 
-- `Fn`：不修改 environment，可重复调用。
-- `FnMut`：可能修改 environment，需要 unique receiver，可重复调用。
+- `Fn`：可重复调用；environment 字段是否可变由字段类型决定。
 - `FnOnce`：会消费 environment，只能调用一次。
 
 基础闭环保守处理：
 
 - `RawFn<...>`：不带 environment，可重复调用。
-- `Fn<...>`：movable stack closure object，可重复调用；允许共享引用捕获。
+- `Fn<...>`：movable stack closure object，可重复调用；允许共享引用捕获和可变 env 字段。
 - `Fn<...>^`：movable owned closure handle；调用时可临时借成 `Fn<...>&`。
-- 修改 capture 的闭包：调用需要 unique closure value。
+- 修改 capture 字段不引入 `FnMut`；后续由 write / async / send-like effect 机制约束数据竞争。
 - owner capture 可以进入 `Fn^` 的 heap environment；消费 environment 的调用能力等 `FnOnce` 设计完成。
 
 ## Lifetime 和存储
@@ -356,8 +362,9 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 3. HIR：为 lambda 分配内部 function def，在 `HirLambda` 上记录 params、captures 和 call body。
 4. Type check：从 expected type 检查参数和返回，并推导 capture kind、call ability。
 5. Borrow check：检查 capture lifetime、unique conflict、move 后使用。
-6. MIR：`Fn` 构造 stack environment aggregate；`Fn^` 构造 heap closure object。
-7. Drop elaborate：`Fn` 的 environment 跟随 stack closure move/drop；`Fn^` drop heap env fields。
+6. MIR：`Fn` 构造 stack anonymous closure object，并生成 callable vtable。
+7. MIR：`Fn^` 构造 heap anonymous closure object，并复用 callable vtable call/drop 路径。
+8. Drop elaborate：通过 `vtable.drop(receiver)` 销毁 closure object。
 
 当 expected type 是 `RawFn<...>` 时，不构造 environment；如果 capture analysis 发现任何捕获，
 直接报错。
@@ -421,9 +428,9 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 捕获 lambda 可在 `Fn<...>` expected type 下通过 type check。
 - [x] 捕获 lambda 赋给 `RawFn<...>` 报错。
 - [x] `RawFn<...>` 可通过 `Fn(raw)` 包装成同签名 `Fn<...>`。
-- [x] `Fn<...>` 运行时值使用 `{env, code}` 二字段表示。
-- [x] `Fn<...>` code 使用 env-first 调用约定。
-- [x] `Fn(raw)` 通过 trampoline 适配 env-first 调用约定。
+- [x] `Fn<...>` 运行时值使用 `{receiver, vtable}` 两字段表示。
+- [x] `Fn<...>` call slot 使用 receiver-first 调用约定。
+- [x] `Fn(raw)` 通过 trampoline 适配 receiver-first 调用约定。
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
 - [x] HIR 使用 `HirLambda` 平铺记录 params 和显式 captures。
 - [x] lambda params 和显式 capture alias 同名时报错。
@@ -444,7 +451,8 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 非捕获裸 `Fn` 返回也会报错。
 - [x] `Fn` 是 movable/non-copy closure value；已有 `Fn` 转移必须显式 `$.move()`。
 - [x] `Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。
-- [ ] `new lambda` 构造 `Fn<...>^`，env memory 位于 heap closure object。
-- [ ] `Fn^$.ref()` 返回 `Fn&`，用于把 heap closure 临时借成 callable view。
-- [ ] 对外层 local 执行非法 move 的闭包报错。
-- [ ] 修改 capture 的闭包需要 unique closure value。
+- [x] `new lambda` 构造 `Fn<...>^` 的非捕获闭包，并支持直接调用。
+- [x] `new lambda` 捕获字段的 heap env 后端 lowering 完整验证。
+- [x] `Fn^$.ref()` 返回 `Fn&`，用于把 heap closure 临时借成 callable view。
+- [x] 对外层 local 执行非法 move 的闭包报错。
+- [x] 修改 capture 字段不要求 unique closure value，后续交给 effect / 数据竞争机制约束。

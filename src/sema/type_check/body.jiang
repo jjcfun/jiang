@@ -50,6 +50,7 @@ public struct BodyCheck: Movable {
     table.HashTable<qid.DefId, Int>! body_states;
     list.ArrayList<LocalInitBinding>! local_init_states;
     Int! assignment_target_depth;
+    Int! lambda_capture_initializer_depth;
     types.EffectSet! current_effects;
 
     public init(self, check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
@@ -60,6 +61,7 @@ public struct BodyCheck: Movable {
         self.body_states = table.HashTable<qid.DefId, Int>();
         self.local_init_states = list.ArrayList<LocalInitBinding>();
         self.assignment_target_depth = 0;
+        self.lambda_capture_initializer_depth = 0;
         self.current_effects = types.EffectSet();
     }
 
@@ -194,6 +196,7 @@ public struct BodyCheck: Movable {
         list.ArrayList<LocalInitBinding>! saved_local_init_states = self.clone_local_init_states();
         Int saved_assignment_target_depth = self.assignment_target_depth;
         types.EffectSet saved_effects = self.current_effects;
+        self.bind_decl_param_types(hir_def);
         self.begin_local_init_body(def_id);
         self.current_effects = self.effects_for_decl_body(hir_def);
 
@@ -211,6 +214,23 @@ public struct BodyCheck: Movable {
         self.assignment_target_depth = saved_assignment_target_depth;
         self.current_effects = saved_effects;
         return result;
+    }
+
+    () bind_decl_param_types(self, hir.HirDef& hir_def) {
+        guard hir_def.decl.function_signature is .some(signature) else { return; }
+        guard hir_def.body is .some(ref _ body) else { return; }
+        Int! param_index = 0;
+        Int! local_index = 0;
+        while (local_index < body.locals.len()) {
+            hir.HirLocal local = body.locals.get(hir.HirLocalId(local_index));
+            local_index = local_index + 1;
+            if (local.kind != .parameter) { continue; }
+            if (signature.has_receiver && self.symbol_text_equal(local.symbol, "self")) { continue; }
+            if (param_index >= signature.params.length) { return; }
+            qid.TypeId param_type = self.type_ops.check_value_type_ref(signature.params[param_index]);
+            self.type_ops.bind_def_type(local.def_id, param_type);
+            param_index = param_index + 1;
+        }
     }
 
     types.EffectSet effects_for_decl_body(self, hir.HirDef& hir_def) {
@@ -685,7 +705,7 @@ public struct BodyCheck: Movable {
                 kind: .explicit_capture,
                 source_def: self.lambda_capture_initializer_source_def(capture.value),
                 local_def: local.def_id,
-                type_id: self.type_for_lambda_capture_local(local),
+                type_id: self.type_for_lambda_capture(local, capture.value),
                 field_index: captures.len(),
                 deref_on_use: false
             ));
@@ -695,6 +715,11 @@ public struct BodyCheck: Movable {
 
     qid.DefId? lambda_capture_initializer_source_def(self, hir.HirId value) {
         hir.HirNode node = self.state.hirs.node(value);
+        if (node.data is .implicit_call(call)) {
+            if (call.op == .move) {
+                return self.lambda_capture_initializer_source_def(call.base);
+            }
+        }
         guard node.data is .name_ref(name_ref) else { return null; }
         guard name_ref is .def_ref(def_id) else { return null; }
         return def_id;
@@ -705,6 +730,21 @@ public struct BodyCheck: Movable {
             return type_id;
         }
         return self.state.store.types.invalid_type();
+    }
+
+    qid.TypeId type_for_lambda_capture(self, hir.HirLocal local, hir.HirId value) {
+        qid.TypeId local_type = self.type_for_lambda_capture_local(local);
+        if (!self.type_ops.is_invalid_type(local_type)) {
+            return local_type;
+        }
+        if (self.state.results.node_type(value) is .some(value_type)) {
+            return self.local_binding_type(local, self.type_ops.read_value_type(value_type));
+        }
+        if (self.lambda_capture_initializer_source_def(value) is .some(source_def)) {
+            qid.TypeId source_type = self.type_ops.type_for_def(source_def);
+            return self.local_binding_type(local, self.type_ops.read_value_type(source_type));
+        }
+        return local_type;
     }
 
     Bool lambda_body_has_implicit_capture(self, qid.DefId lambda_def, hir.HirId body) {
@@ -1195,7 +1235,7 @@ public struct BodyCheck: Movable {
     }
 
     () bind_lambda_capture_type(self, hir.HirLocal local, hir.HirId value) {
-        qid.TypeId! value_type = self.check_node(value);
+        qid.TypeId! value_type = self.check_lambda_capture_initializer(value);
         if (local.borrow_binding) {
             self.bind_borrow_binding_type(local, value, value_type);
             return;
@@ -1204,12 +1244,12 @@ public struct BodyCheck: Movable {
             if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
                 self.type_ops.bind_def_type(
                     local.def_id,
-                    self.local_binding_type(local, self.type_ops.read_value_type(value_type))
+                    self.type_for_inferred_lambda_capture(local, value, value_type)
                 );
                 return;
             }
             qid.TypeId local_type = self.type_ops.check_value_type_ref(type_ref);
-            value_type = self.check_node_expected(value, local_type);
+            value_type = self.check_lambda_capture_initializer_expected(value, local_type);
             self.type_ops.expect_value_assignable(
                 value,
                 local_type,
@@ -1220,7 +1260,31 @@ public struct BodyCheck: Movable {
             self.type_ops.bind_def_type(local.def_id, self.local_binding_type(local, local_type));
             return;
         }
-        self.type_ops.bind_def_type(local.def_id, self.local_binding_type(local, value_type));
+        self.type_ops.bind_def_type(local.def_id, self.type_for_inferred_lambda_capture(local, value, value_type));
+    }
+
+    qid.TypeId check_lambda_capture_initializer(self, hir.HirId value) {
+        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth + 1;
+        qid.TypeId value_type = self.check_node(value);
+        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth - 1;
+        return value_type;
+    }
+
+    qid.TypeId check_lambda_capture_initializer_expected(self, hir.HirId value, qid.TypeId expected) {
+        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth + 1;
+        qid.TypeId value_type = self.check_node_expected(value, expected);
+        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth - 1;
+        return value_type;
+    }
+
+    qid.TypeId type_for_inferred_lambda_capture(self, hir.HirLocal local, hir.HirId value, qid.TypeId value_type) {
+        if (self.lambda_capture_initializer_source_def(value) is .some(source_def)) {
+            qid.TypeId source_type = self.type_ops.type_for_def(source_def);
+            if (!self.type_ops.is_invalid_type(source_type)) {
+                return self.local_binding_type(local, self.type_ops.read_value_type(source_type));
+            }
+        }
+        return self.local_binding_type(local, self.type_ops.read_value_type(value_type));
     }
 
     () bind_borrow_binding_type(self, hir.HirLocal local, hir.HirId initializer, qid.TypeId value_type) {
@@ -3551,8 +3615,7 @@ public struct BodyCheck: Movable {
             return self.check_selected_function_call(node_id, call, selected_def, type_args$.ref());
         }
         qid.TypeId callee_type = self.check_node(call.callee);
-        types.TypeInfo callee_info = self.state.store.types.get(callee_type);
-        guard callee_info.data is .function_type(function_type) else {
+        guard self.callable_function_type(callee_type) is .some(function_type) else {
             if (!self.type_ops.is_invalid_type(callee_type)) {
                 self.type_ops.add_node_error(call.callee, "callee is not a function", "callee_not_function");
             }
@@ -3589,6 +3652,23 @@ public struct BodyCheck: Movable {
             index = index + 1;
         }
         return self.substituted_call_result_type(node_id, call, type_args$.ref(), function_type.result);
+    }
+
+    types.FunctionType? callable_function_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (info.data is .function_type(function_type)) {
+            return function_type;
+        }
+        guard info.data is .handle_type(handle) else { return null; }
+        if (handle.kind != .owner_pointer && handle.kind != .reference) {
+            return null;
+        }
+        types.TypeInfo element_info = self.state.store.types.get(handle.element);
+        guard element_info.data is .function_type(function_type) else { return null; }
+        if (function_type.kind != .closure) {
+            return null;
+        }
+        return function_type;
     }
 
     Bool record_ordered_call_args_for_function_type(self,
@@ -4942,6 +5022,14 @@ public struct BodyCheck: Movable {
         qid.TypeId arg_type = self.check_node(call.args[0].value);
         types.TypeInfo arg_info = self.state.store.types.get(arg_type);
         if (arg_info.data is .function_type(source)) {
+            if (source.kind != .raw) {
+                self.type_ops.add_node_error(
+                    call.args[0].value,
+                    "Fn constructor argument must be a matching RawFn",
+                    "call_arg_type_mismatch"
+                );
+                return self.state.store.types.invalid_type();
+            }
             qid.TypeId result_type = self.closure_type_from_function(source);
             self.fn_constructor_call(node_id, result_type, call);
             return result_type;
@@ -5018,6 +5106,7 @@ public struct BodyCheck: Movable {
                 "Fn constructor argument must be a matching RawFn",
                 "call_arg_type_mismatch"
             );
+            return true;
         }
         self.state.results.mark_expr_lowering(node_id, .raw_fn_to_fn);
         return true;
@@ -6360,6 +6449,9 @@ public struct BodyCheck: Movable {
                 "projection_move_not_allowed"
             );
             return false;
+        }
+        if (self.lambda_capture_initializer_depth > 0) {
+            return kind == .local_def || kind == .parameter_def;
         }
         if (kind != .global_def) {
             self.type_ops.add_node_error(target_id, "move requires a place expression", "move_requires_place");
