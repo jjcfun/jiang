@@ -351,7 +351,8 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice(Self self)` 消耗 receiver，
 并把 initialized 区间转移为 owning `T[]^`。
 
-`T&`、`T!&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。
+`T&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。
+`T!&` 不能作为普通字段类型，因为它需要携带当前 serial token 下的可写访问能力。
 存储引用字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，
 不能作为普通字段类型。
 
