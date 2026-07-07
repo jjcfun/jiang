@@ -76,6 +76,35 @@ closure expression 仍有内部 env layout；捕获字段按顺序紧密放入�
 `Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。闭包值不是 C 函数指针，`ptr` 也不应泄漏 receiver、
 type info 或 heap closure object 的内部布局。需要 C ABI 函数指针时使用 `RawFn<...>`。
 
+## Closure ABI
+
+`RawFn<Ret, Args...>` 的 ABI 就是函数入口地址。它不携带 receiver，不需要 drop，也不代表
+Jiang closure object。C ABI 函数指针只应该映射到 `RawFn<...>`。
+
+`Fn<Ret, Args...>` 的运行时值固定为两个字段：
+
+```text
+{
+  receiver: UInt8*,
+  vtable:   { call: RawFn<Ret, UInt8*, Args...>, drop: RawFn<Unit, UInt8*> }*
+}
+```
+
+`receiver` 指向编译器合成的 closure object。对普通 stack `Fn`，closure object 位于当前栈帧
+或当前 aggregate 内；对 `Fn^`，closure object 位于 heap。非捕获 lambda 可以使用空 receiver。
+
+`call` 槽负责把 erased receiver cast 回真实 closure object，再执行 lambda body。`drop` 槽负责
+销毁 receiver 指向的 closure object；对于 heap `Fn^`，drop shim 还会释放 heap storage。空 env
+或不需要 runtime drop 的 env 可以使用 noop drop shim。
+
+`Fn^` 是 owner handle。`Fn^` 本身可以直接调用；`Fn^$.ref()` 返回 `Fn&`，用于从 owner handle
+临时借出 callable view。`Fn^&` 表示 owner handle slot 的引用，不是 callable view；需要先通过
+`$.ref()` 借成 `Fn&` 后再调用。
+
+`Fn(raw)` 生成的 `Fn` 使用 raw 函数入口作为 receiver，vtable 的 `call` 槽是编译器生成的
+trampoline：先取出 receiver 中保存的 raw function，再以源码参数调用它。这个方向不影响 C ABI；
+反向 `Fn -> RawFn` 不支持。
+
 ## Lambda 语法
 
 沿用现有 lambda 语法：
