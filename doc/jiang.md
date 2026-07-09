@@ -744,9 +744,9 @@ Int[]& sort(Int[]& list, RawFn<Bool, Int, Int> compare)
 @where(T: Numeric)
 T[]& sort<T>(T[]& list, RawFn<Bool, T, T> compare)
 
-// 支持泛型的排序，会抛出异常，其中 E 可以为任意类型
+// 支持泛型的排序，会返回 Result，其中 E 可以为任意错误类型
 @where(T: Numeric)
-T[]&@E sort<T, E>(T[]& list, RawFn<Bool@E, T, T> compare)
+Result<T[]&, E> sort<T, E>(T[]& list, RawFn<Result<Bool, E>, T, T> compare)
 ```
 
 #### 函数指针
@@ -772,7 +772,7 @@ RawFn<Bool, Int, Int> compare;
 - 普通顶层函数衰减为 `RawFn<...>`
 - 类型函数衰减为 `RawFn<...>`
 - 实例方法通过 `Type.method` 衰减为 `RawFn<Ret, Receiver&, Args...>`
-- `RawFn<...>` 的返回类型可以写成 `T@E`
+- `RawFn<...>` 的返回类型可以写成 `Result<T, E>`
 - 通过 `RawFn<...>` 变量进行调用
 - 非捕获 lambda 表达式赋值给 `RawFn<...>`
 - 若同名函数/方法存在多个重载：
@@ -828,21 +828,21 @@ Int value = add(user$.ref(), 2);
 - 后续参数与方法声明中的普通参数保持一致
 - 当前需要显式传入 `user$.ref()`
 
-示例 4：可错返回的函数指针
+示例 4：返回 `Result` 的函数指针
 
 ```c
 enum Err {
     bad = 1,
 }
 
-Bool@Err less(Int left, Int right) {
+Result<Bool, Err> less(Int left, Int right) {
     if (left < 0) {
         throw Err.bad;
     }
     return left < right;
 }
 
-RawFn<Bool@Err, Int, Int> compare = less;
+RawFn<Result<Bool, Err>, Int, Int> compare = less;
 ```
 
 示例 5：重载函数值按 `RawFn<...>` 目标类型消歧
@@ -888,11 +888,17 @@ lambda 规则：
 
 ```c
 @where(T: Numeric, E2: CompareError)
-async T[]&@E1 sort<T, E1, E2>(T[]& list, RawFn<async RawFn<async Bool@E2, T, T>@E1, T[]&> compare)
+async Result<T[]&, E1> sort<T, E1, E2>(
+    T[]& list,
+    RawFn<async Result<RawFn<async Result<Bool, E2>, T, T>, E1>, T[]&> compare
+)
 
 @where(T: Numeric, E2: CompareError)
-@alias(Cmp = RawFn<async Bool@E2, T, T>)
-async T[]&@E1 sort<T, E1, E2>(T[]& list, RawFn<async Cmp@E1, T[]&> compare)
+@alias(Cmp = RawFn<async Result<Bool, E2>, T, T>)
+async Result<T[]&, E1> sort<T, E1, E2>(
+    T[]& list,
+    RawFn<async Result<Cmp, E1>, T[]&> compare
+)
 ```
 
 `unsafe` 和 `async` 可以写在 `RawFn<...>` 的返回类型前，表示这个函数类型带有对应调用效果：
@@ -1003,26 +1009,30 @@ Int y = switch (value) {
 - 分支根 pattern 只支持 variant / optional / literal
 - binding/wildcard 只作为 variant 或 optional payload 的子 pattern 使用
 - 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法
-- 当前不支持对 `T@E` 结果直接使用 `switch` 表达式
+- 当前不支持对 `Result<T, E>` 结果直接使用 `switch` 表达式
 
 #### 异常
 
-Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，语法写作 `T@E`：
+Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，推荐写作
+`Result<T, E>`：
 
 ```c
-Int@Err parse(UInt8[]& text)
+Result<Int, Err> parse(UInt8[]& text)
   
-()@Err flush()
+Result<(), Err> flush()
   
-RawFn<Bool@Err, Int, Int> compare
+RawFn<Result<Bool, Err>, Int, Int> compare
 ```
 
 其中：
 
 - `T` 是成功值类型
 - `E` 是错误值类型
-- `@E` 只允许出现在函数返回类型和 `RawFn<...>` 的返回位
+- `Result<T, E>` 只允许作为函数返回类型，或出现在 `RawFn<...>` / `Fn<...>` 的返回位
 - 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
+
+`T@E` 是 0.4.5 的兼容语法，只能出现在函数、方法和 callable 类型的返回位。新代码优先写
+`Result<T, E>`。
 
 抛出错误使用 `throw expr;`：
 
@@ -1031,7 +1041,7 @@ enum Err {
     bad = 7,
 }
 
-Int@Err parse(Bool fail) {
+Result<Int, Err> parse(Bool fail) {
     if (fail) {
         throw Err.bad;
     }
@@ -1041,18 +1051,18 @@ Int@Err parse(Bool fail) {
 
 `throw` 规则：
 
-- 只允许出现在返回类型为 `@E` 的函数里
+- 只允许出现在返回类型为 `Result<T, E>` 的函数里
 - `throw` 的值必须与当前函数的错误类型 `E` 一致
 - `throw` 只是语句，不是表达式
 
-在 `T@E` 函数里调用另一个 `U@E` 函数时，错误会自动传播：
+在 `Result<T, E>` 函数里调用另一个 `Result<U, E>` 函数时，错误会自动传播：
 
 ```c
-Int@Err ok() {
+Result<Int, Err> ok() {
     return 1;
 }
 
-Int@Err outer(Bool fail) {
+Result<Int, Err> outer(Bool fail) {
     parse(fail);
     Int x = ok();
     return x + 41;
@@ -1064,11 +1074,11 @@ Int@Err outer(Bool fail) {
 - `parse(fail)` 成功时继续执行
 - 失败时自动从 `outer` 返回同一个错误
 - 只支持**相同错误类型 `E`** 的隐式传播
-- 在非 `@E` 函数里，不能把 `@E` 调用结果当普通值直接使用
+- 在非 `Result<T, E>` 函数里，不能把 `Result<T, E>` 调用结果当普通值直接使用
 
 异常的使用方式是：
 
-- 在 `@E` 函数里依靠普通调用做同 `E` 的隐式传播
+- 在 `Result<T, E>` 函数里依靠普通调用做同 `E` 的隐式传播
 - 用 `try expr catch (...) => fallback` 处理单个失败结果
 
 异常结果不通过 `switch` 匹配。
@@ -1080,7 +1090,7 @@ enum Err {
     bad = 7,
 }
 
-Int@Err parse(Bool fail) {
+Result<Int, Err> parse(Bool fail) {
     if (fail) {
         throw Err.bad;
     }
@@ -1112,7 +1122,7 @@ Int main() {
 
 - 只支持前置 `try catch` 表达式形式：`try expr catch (...) => fallback`
 - `try` 只包住 `catch` 前面的单个表达式
-- `expr` 必须是 `T@E`
+- `expr` 必须是 `Result<T, E>` 或兼容语法 `T@E`
 - `catch` 参数列表必须写 `(...)`；不需要错误值时写 `()`
 - `catch` 绑定可省略类型；如果写绑定，类型自动推断为错误类型 `E`
 - fallback 可以是表达式或 block
