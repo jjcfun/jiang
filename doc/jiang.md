@@ -411,10 +411,9 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 
 只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T[*]` 和 `T*` 都不拥有目标对象。
 
-#### Pointer / Reference 类型
+#### Pointer / 引用类型
 
 Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 是 `Box<T>` 的语法糖，表示 owning pointer 外层；`&` 是 `Ref<T>` 的语法糖，表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
-`Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留。
 
 ```c
 // 在栈中开辟内存空间

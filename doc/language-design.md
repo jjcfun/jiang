@@ -199,8 +199,6 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 `T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应
 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的类型函数。
 
-`Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留，后续文档和新代码应优先使用 `Ref<T>`。
-
 sentinel value 使用 `const T S` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
 元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型不是 move-only。
 例如 `UInt8[5:0]`、`Bool[1:true]`、`Char[3:'\0']` 和 enum/struct const sentinel 都是同一套规则。

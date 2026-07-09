@@ -33,7 +33,6 @@ import std;
   `Slice<T>`、`SentinelSlice<T, S>`、`RawPointer<T>`、`ManyPointer<T>` 等。
   其中 `Slice<T>` / `SentinelSlice<T, S>` 是 unsized array type 的公开名字；借用 view 需要通过
   `Ref<Slice<T>>` / `Ref<SentinelSlice<T, S>>`，也就是后缀语法 `T[]&` / `T[:S]&` 表达。
-  `Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留。
 - `jiang`：Jiang 语言自身的词法和 syntax 辅助 API。当前包括 `std.jiang.syntax.*`、
   `std.jiang.Token`、`std.jiang.Tokenizer` 和 `std.jiang.ident`。
   这些 API 供 compiler 和 lang provider 共享，避免 DSL 从零实现 Jiang-compatible token 和

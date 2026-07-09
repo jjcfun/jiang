@@ -343,7 +343,6 @@ name        <- ident / "self"
 不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、
 `Ref`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
 `Result<T, E>` 由编译器识别为内建 result 类型，后续将替代 `T@E` 作为推荐写法。
-`Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留。
 
 ## struct
 
