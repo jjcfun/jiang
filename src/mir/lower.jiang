@@ -665,6 +665,7 @@ struct MirLowerer: Movable {
                 kind: mir.call_terminator_kind(mir.MirCallTerminator (
                     callee: self.runtime_main_callee(main_def, main_type, span),
                     args: self.output.operand_slice(args.slice()),
+                    current_effects: types.EffectSet(),
                     destination: self.runtime_place(mir.MirLocalId.from_index(1)),
                     target: mir.MirBlockId.from_index(1),
                     initialized_place: null,
@@ -931,6 +932,70 @@ struct MirLowerer: Movable {
         return self.ctx.store.types.unit_type();
     }
 
+    types.EffectSet function_effects_for_def(self,
+        qid.DefId function_def,
+        monomorph.SubstitutionMap& substitutions
+    ) {
+        guard self.typeck.def_type(function_def) is .some(function_type_id) else {
+            return types.EffectSet();
+        }
+        qid.TypeId substituted = self.substitute_type(function_type_id, substitutions);
+        types.TypeInfo info = self.ctx.store.types.get(substituted);
+        guard info.data is .function_type(function_type) else {
+            return types.EffectSet();
+        }
+        return function_type.effects;
+    }
+
+    types.EffectSet effect_set_for_hir(self, hir.HirEffectSet effects) {
+        return types.EffectSet(
+            has_unsafe: effects.has_unsafe,
+            has_async: effects.has_async,
+            domain_const: self.effect_domain_const(effects)
+        );
+    }
+
+    qid.DefId? effect_domain_const(self, hir.HirEffectSet effects) {
+        guard effects.domain is .some(domain) else { return null; }
+        return self.effect_domain_const_ref(domain);
+    }
+
+    qid.DefId? effect_domain_const_ref(self, hir.HirId domain) {
+        hir.HirNode node = self.hirs.node(domain);
+        if (node.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(def_id) else { return null; }
+            return self.effect_domain_const_def(def_id);
+        }
+        if (node.data is .member_access(_)) {
+            guard self.typeck.member_selection(domain) is .some(member_def) else { return null; }
+            return self.effect_domain_const_def(member_def);
+        }
+        return null;
+    }
+
+    qid.DefId? effect_domain_const_def(self, qid.DefId def_id) {
+        if (self.ctx.store.defs.get(def_id).kind == .enum_case_def) {
+            return def_id;
+        }
+        guard self.hirs.def(def_id) is .some(hir_def) else { return null; }
+        if (hir_def.decl.kind == .global_decl && hir_def.decl.is_const) {
+            return def_id;
+        }
+        return null;
+    }
+
+    types.EffectSet merge_effects(self, types.EffectSet base, types.EffectSet added) {
+        qid.DefId?! domain_const = base.domain_const;
+        if (added.domain_const is .some(_)) {
+            domain_const = added.domain_const;
+        }
+        return types.EffectSet(
+            has_unsafe: base.has_unsafe || added.has_unsafe,
+            has_async: base.has_async || added.has_async,
+            domain_const: domain_const
+        );
+    }
+
     qid.TypeId substitute_type(self, qid.TypeId type_id, monomorph.SubstitutionMap& substitutions) {
         if (substitutions.len() == 0) {
             return type_id;
@@ -971,6 +1036,7 @@ struct BodyLowerer: Movable {
     list.ArrayList<mir.MirLocalId>! active_locals;
     list.ArrayList<hir.HirId>! active_defers;
     typeck_store.LambdaCaptureInfo[]&? lambda_capture_infos;
+    types.EffectSet! current_effects;
     Int! hir_local_offset;
     mir.MirBlockId! current_block;
     Bool! terminated;
@@ -994,6 +1060,7 @@ struct BodyLowerer: Movable {
         self.active_locals = list.ArrayList<mir.MirLocalId>();
         self.active_defers = list.ArrayList<hir.HirId>();
         self.lambda_capture_infos = lowerer.typeck.lambda_capture_infos(hir_def.def_id);
+        self.current_effects = lowerer.function_effects_for_def(hir_def.def_id, substitutions);
         self.current_block = self.reserve_block(span);
         self.terminated = false;
         self.hir_local_offset = self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
@@ -1045,15 +1112,22 @@ struct BodyLowerer: Movable {
     }
 
     () lower_root_block(self, hir.HirBlock block) {
+        types.EffectSet saved_effects = self.enter_block_effects(block.effects);
         list.ArrayList<mir.MirLocalId>! scope_locals = list.ArrayList<mir.MirLocalId>();
         Int defer_depth = self.active_defers.len();
         Int! index = 0;
         while (index < block.statements.length) {
-            if (self.terminated) { return; }
+            if (self.terminated) {
+                self.current_effects = saved_effects;
+                return;
+            }
             self.lower_statement_node(block.statements[index], scope_locals$.ref());
             index = index + 1;
         }
-        if (self.terminated) { return; }
+        if (self.terminated) {
+            self.current_effects = saved_effects;
+            return;
+        }
         if (block.result is .some(result)) {
             self.assign_return_value(result);
             if (!self.terminated) {
@@ -1062,12 +1136,21 @@ struct BodyLowerer: Movable {
                 self.push_active_storage_dead_from(0, self.lowerer.hir_span(result));
                 self.finish_return(false, self.lowerer.hir_span(result));
             }
+            self.current_effects = saved_effects;
             return;
         }
         self.run_deferred_from(defer_depth, self.span);
         self.end_scope(scope_locals$.ref(), self.span);
         self.push_active_storage_dead_from(0, self.span);
         self.finish_unit_return(self.span);
+        self.current_effects = saved_effects;
+    }
+
+    types.EffectSet enter_block_effects(self, hir.HirEffectSet effects) {
+        types.EffectSet saved = self.current_effects;
+        types.EffectSet block_effects = self.lowerer.effect_set_for_hir(effects);
+        self.current_effects = self.lowerer.merge_effects(self.current_effects, block_effects);
+        return saved;
     }
 
     () lower_statement_node(self, hir.HirId node_id, list.ArrayList<mir.MirLocalId>& scope_locals) {
@@ -1433,6 +1516,7 @@ struct BodyLowerer: Movable {
                 span
             ),
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: self.place_for_local(unit_local),
             target: next_block,
             initialized_place: destination,
@@ -1701,26 +1785,35 @@ struct BodyLowerer: Movable {
     }
 
     () lower_block_into_place(self, hir.HirBlock block, mir.MirPlace destination) {
+        types.EffectSet saved_effects = self.enter_block_effects(block.effects);
         list.ArrayList<mir.MirLocalId>! scope_locals = list.ArrayList<mir.MirLocalId>();
         Int defer_depth = self.active_defers.len();
         Int! index = 0;
         while (index < block.statements.length) {
-            if (self.terminated) { return; }
+            if (self.terminated) {
+                self.current_effects = saved_effects;
+                return;
+            }
             self.lower_statement_node(block.statements[index], scope_locals$.ref());
             index = index + 1;
         }
-        if (self.terminated) { return; }
+        if (self.terminated) {
+            self.current_effects = saved_effects;
+            return;
+        }
         if (block.result is .some(result)) {
             self.lower_into_place(result, destination);
             if (!self.terminated) {
                 self.run_deferred_from(defer_depth, self.lowerer.hir_span(result));
                 self.end_scope(scope_locals$.ref(), self.lowerer.hir_span(result));
             }
+            self.current_effects = saved_effects;
             return;
         }
         self.push_assign(destination, self.unit_rvalue(token.Span()), token.Span());
         self.run_deferred_from(defer_depth, token.Span());
         self.end_scope(scope_locals$.ref(), token.Span());
+        self.current_effects = saved_effects;
     }
 
     () lower_if(self, hir.HirId node_id, hir.HirIf if_expr, mir.MirPlace destination) {
@@ -8025,6 +8118,7 @@ struct BodyLowerer: Movable {
         self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
             callee: callee,
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: destination,
             target: next_block,
             initialized_place: null,
@@ -8047,6 +8141,7 @@ struct BodyLowerer: Movable {
         self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
             callee: callee,
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: destination,
             target: next_block,
             initialized_place: null,
@@ -8213,6 +8308,7 @@ struct BodyLowerer: Movable {
         self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
             callee: mir.indirect_operand_callee(mir.copy_operand_value(mir.MirCopyOperand (place: slot_place))),
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: destination,
             target: next_block,
             initialized_place: null,
@@ -8275,6 +8371,7 @@ struct BodyLowerer: Movable {
                 const_args
             ),
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: self.place_for_local(unit_local),
             target: next_block,
             initialized_place: destination,
@@ -8745,6 +8842,7 @@ struct BodyLowerer: Movable {
                         place: self.place_for_local(raw_local)
                     ))),
                     args: self.lowerer.output.operand_slice(args.slice()),
+                    current_effects: types.EffectSet(),
                     destination: self.place_for_local(mir.MirLocalId(0)),
                     target: mir.MirBlockId.from_index(1),
                     initialized_place: null,
@@ -9273,6 +9371,7 @@ struct BodyLowerer: Movable {
                 const_args
             ),
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: destination,
             target: next_block,
             initialized_place: null,
@@ -9474,6 +9573,7 @@ struct BodyLowerer: Movable {
         self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
             callee: self.function_callee_with_args(node_id, function_def, function_type, type_args, const_args),
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: destination,
             target: next_block,
             initialized_place: null,
@@ -9501,6 +9601,7 @@ struct BodyLowerer: Movable {
         self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
             callee: self.direct_function_callee(function_def, function_type, type_args, const_args, span),
             args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
             destination: destination,
             target: next_block,
             initialized_place: null,

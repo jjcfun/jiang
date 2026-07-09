@@ -125,6 +125,8 @@ struct FunctionBorrowChecker: Movable {
     public borrow_store.BorrowCheckStore& results;
     public mir.MirFunctionId function_id;
     public qid.DefId function_def;
+    public types.EffectSet function_effects;
+    public types.EffectSet! current_effects;
     public mir.MirBody body;
     public move_path.MovePathTree! paths;
     public BorrowDataflowState! dataflow;
@@ -146,6 +148,8 @@ struct FunctionBorrowChecker: Movable {
         self.results = results;
         self.function_id = function.id;
         self.function_def = function.def_id;
+        self.function_effects = self.function_effects_for_def(function.def_id);
+        self.current_effects = self.function_effects;
         self.body = function.body;
         mir.MirBody! body = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
@@ -154,6 +158,17 @@ struct FunctionBorrowChecker: Movable {
         self.reported_diagnostics = table.HashTable<BorrowDiagnosticKey, Bool>();
         self.reported_dead_loan_sources = table.HashTable<move_path.MovePathId, Bool>();
         self.return_lifetimes = return_lifetime.ReturnLifetimeChecker(ctx, self.function_def);
+    }
+
+    types.EffectSet function_effects_for_def(self, qid.DefId function_def) {
+        guard self.typeck.def_type(function_def) is .some(type_id) else {
+            return types.EffectSet();
+        }
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else {
+            return types.EffectSet();
+        }
+        return function_type.effects;
     }
 
     public () check(self) {
@@ -867,7 +882,12 @@ struct FunctionBorrowChecker: Movable {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             if (self.loan_target_matches_path(fact.target, source_path)) {
                 loan.Loan current = self.results.loans.get(fact.loan_id);
-                self.add_loan_from_paths(current.kind, current.source, destination_path);
+                self.add_loan_from_paths_with_domain(
+                    current.kind,
+                    current.source,
+                    destination_path,
+                    current.domain_const
+                );
                 recorded = true;
             }
             index = index + 1;
@@ -924,31 +944,42 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () add_loan_from_paths(self, loan.LoanKind kind, move_path.MovePathId source, move_path.MovePathId target) {
+        self.add_loan_from_paths_with_domain(kind, source, target, self.current_effects.domain_const);
+    }
+
+    () add_loan_from_paths_with_domain(self,
+        loan.LoanKind kind,
+        move_path.MovePathId source,
+        move_path.MovePathId target,
+        qid.DefId? domain_const
+    ) {
         move_path.MovePathId canonical_source = self.canonical_loan_source(source);
-        loan.LoanId loan_id = self.get_or_add_loan(kind, canonical_source, target);
+        loan.LoanId loan_id = self.get_or_add_loan(kind, canonical_source, target, domain_const);
         self.add_active_loan(target, loan_id);
     }
 
     loan.LoanId get_or_add_loan(self,
         loan.LoanKind kind,
         move_path.MovePathId source,
-        move_path.MovePathId target
+        move_path.MovePathId target,
+        qid.DefId? domain_const
     ) {
-        if (self.existing_loan(kind, source, target) is .some(loan_id)) {
+        if (self.existing_loan(kind, source, target, domain_const) is .some(loan_id)) {
             return loan_id;
         }
-        return self.results.add_loan(kind, self.function_id, source, target);
+        return self.results.add_loan(kind, self.function_id, source, target, domain_const);
     }
 
     loan.LoanId? existing_loan(self,
         loan.LoanKind kind,
         move_path.MovePathId source,
-        move_path.MovePathId target
+        move_path.MovePathId target,
+        qid.DefId? domain_const
     ) {
         Int! index = 0;
         while (index < self.results.loans.len()) {
             loan.Loan current = self.results.loans.get(loan.LoanId(index));
-            if (self.same_loan(current, kind, source, target)) {
+            if (self.same_loan(current, kind, source, target, domain_const)) {
                 return current.id;
             }
             index = index + 1;
@@ -960,12 +991,22 @@ struct FunctionBorrowChecker: Movable {
         loan.Loan current,
         loan.LoanKind kind,
         move_path.MovePathId source,
-        move_path.MovePathId target
+        move_path.MovePathId target,
+        qid.DefId? domain_const
     ) {
         if (current.function_id.to_index() != self.function_id.to_index()) { return false; }
         if (current.kind != kind) { return false; }
         if (current.source != source) { return false; }
-        return current.target == target;
+        if (current.target != target) { return false; }
+        return self.same_optional_def(current.domain_const, domain_const);
+    }
+
+    Bool same_optional_def(self, qid.DefId? lhs, qid.DefId? rhs) {
+        if (lhs is .some(left)) {
+            guard rhs is .some(right) else { return false; }
+            return left.to_index() == right.to_index();
+        }
+        return rhs == null;
     }
 
     () add_active_loan(self, move_path.MovePathId target, loan.LoanId loan_id) {
@@ -1248,12 +1289,84 @@ struct FunctionBorrowChecker: Movable {
             self.check_operand(call_term.args[index]);
             index = index + 1;
         }
+        self.check_domain_call_args(call_term);
         self.check_unique_places_call(call_term);
         self.clear_place(call_term.destination);
         if (call_term.initialized_place is .some(initialized_place)) {
             self.clear_place(initialized_place);
         }
         self.record_call_return_loan(call_term);
+    }
+
+    () check_domain_call_args(self, mir.MirCallTerminator call_term) {
+        types.EffectSet required = self.callee_effects(call_term.callee);
+        guard required.domain_const is .some(required_domain) else { return; }
+        Int! index = 0;
+        while (index < call_term.args.length) {
+            self.check_domain_call_arg(call_term, index, required_domain);
+            index = index + 1;
+        }
+    }
+
+    () check_domain_call_arg(self, mir.MirCallTerminator call_term, Int index, qid.DefId required_domain) {
+        mir.MirOperand operand = call_term.args[index];
+        if (!self.type_is_mutable_borrowed_handle(self.operand_type(operand))) { return; }
+        if (self.argument_domain_const(operand) is .some(arg_domain)) {
+            if (arg_domain.to_index() == required_domain.to_index()) { return; }
+        }
+        self.results.mark_error();
+        self.add_domain_borrow_diagnostic();
+    }
+
+    types.EffectSet callee_effects(self, mir.MirCallCallee callee) {
+        qid.TypeId! type_id = self.ctx.store.types.invalid_type();
+        if (callee is .direct_function(function_ref)) {
+            type_id = function_ref.type_id;
+        }
+        if (callee is .indirect_operand(operand)) {
+            type_id = self.operand_type(operand);
+        }
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else {
+            return types.EffectSet();
+        }
+        return function_type.effects;
+    }
+
+    qid.DefId? argument_domain_const(self, mir.MirOperand operand) {
+        guard self.operand_place(operand) is .some(place) else { return null; }
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        if (self.first_active_loan_for_path(path) is .some(loan_id)) {
+            return self.results.loans.get(loan_id).domain_const;
+        }
+        if (self.place_is_borrowed_param(place)) {
+            return self.function_effects.domain_const;
+        }
+        return null;
+    }
+
+    Bool place_is_borrowed_param(self, mir.MirPlace place) {
+        guard mir.place_local_id(place) is .some(local_id) else { return false; }
+        if (!self.local_is_param(local_id)) { return false; }
+        return self.borrowed_handle_type(self.local_type(local_id));
+    }
+
+    qid.TypeId operand_type(self, mir.MirOperand operand) {
+        if (operand is .copy_operand(copy_operand)) { return self.place_type(copy_operand.place); }
+        if (operand is .move_operand(move_operand)) { return self.place_type(move_operand.place); }
+        if (operand is .out_operand(out_operand)) { return self.place_type(out_operand.place); }
+        if (operand is .function_operand(function_ref)) { return function_ref.type_id; }
+        if (operand is .global_operand(global_ref)) { return global_ref.type_id; }
+        if (operand is .global_address_operand(global_ref)) { return global_ref.type_id; }
+        if (operand is .const_operand(const_value)) { return const_value.type_id; }
+        return self.ctx.store.types.invalid_type();
+    }
+
+    Bool type_is_mutable_borrowed_handle(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind != .reference && handle.kind != .slice) { return false; }
+        return self.ctx.store.types.get(handle.element).is_mutable;
     }
 
     () check_unique_places_call(self, mir.MirCallTerminator call_term) {
@@ -2085,6 +2198,21 @@ struct FunctionBorrowChecker: Movable {
                 diagnostic.DiagnosticCode("move_borrow_conflict"),
                 self.current_source_range(),
                 "move conflicts with a live borrow"
+            )
+        );
+    }
+
+    () add_domain_borrow_diagnostic(self) {
+        if (!self.record_diagnostic(9)) {
+            return;
+        }
+        self.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("cross_domain_mutable_borrow"),
+                self.current_source_range(),
+                "mutable borrowed argument cannot cross domain boundary"
             )
         );
     }
