@@ -186,7 +186,7 @@ ref! _ alias = expr
 - 写入外层 `!` storage 时默认按可变引用捕获，environment 保存 `T!&`，并参与 unique borrow 检查。
 - 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
 - `T*`、`T[*]`、`T&` 这类非 owning handle 默认捕获 handle 值，不再额外生成
-  `Reference<handle>`。
+  `Ref<handle>`。
 - `T^` 这类 owning handle 不做默认捕获；需要写成 `field = value$.move()` 这类显式
   environment 字段初始化，owner capture/drop 语义后续再完整设计。
 

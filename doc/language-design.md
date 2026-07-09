@@ -162,7 +162,7 @@ self type 等都应统一作为 type namespace provider 参与 `Type.member` 和
 lookup。
 
 内建类型和语法糖类型也遵循同一条规则：`UInt8[]&` 的成员 lookup 会落到
-`Reference<Slice<UInt8>>` 的 namespace，`Int[4]` 会落到 array 类型的 namespace，
+`Ref<Slice<UInt8>>` 的 namespace，`Int[4]` 会落到 array 类型的 namespace，
 `Int` 会落到 builtin integer type 的 namespace。backend 或 MIR 可以继续把 builtin 类型
 lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不是 nominal struct 而拆出
 不同的成员查找路径。
@@ -178,9 +178,9 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T?`：`Option<T>` 的类型语法糖。
 - `T?!`：optional 类型层可变的规范写法。
 - `T^`：`Box<T>` 的类型语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
-- `T&`：`Reference<T>` 的类型语法糖，表示非 owning 引用，不表达释放职责。
-- `T[]&`：`Reference<Slice<T>>` 的语法糖，borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value。
-- `T[:S]&`：`Reference<SentinelSlice<T, S>>` 的语法糖，borrowed sentinel slice view，
+- `T&`：`Ref<T>` 的类型语法糖，表示非 owning 引用，不表达释放职责。
+- `T[]&`：`Ref<Slice<T>>` 的语法糖，borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value。
+- `T[:S]&`：`Ref<SentinelSlice<T, S>>` 的语法糖，borrowed sentinel slice view，
   layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == S`。
   裸 `T[:S]` / `SentinelSlice<T, S>` 是带 sentinel 的 unsized array type，不能作为普通 value。
 - `T[*]`：`ManyPointer<T>` 的类型语法糖，不默认自动解引用，只能通过下标访问元素。
@@ -194,10 +194,12 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
 
 内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、
-`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Reference<T>`、`RawPointer<T>`、
+`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Ref<T>`、`RawPointer<T>`、
 `ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
 `T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应
 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的类型函数。
+
+`Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留，后续文档和新代码应优先使用 `Ref<T>`。
 
 sentinel value 使用 `const T S` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
 元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型不是 move-only。

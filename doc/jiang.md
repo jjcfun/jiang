@@ -405,15 +405,16 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
-- `T[]&`：`Reference<Slice<T>>` 的语法糖，是 borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value
+- `T[]&`：`Ref<Slice<T>>` 的语法糖，是 borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value
 - `T[*:0]`：sentinel many-pointer，不带 length，适合 C string ABI
-- `T[:0]&`：`Reference<SentinelSlice<T, 0>>` 的语法糖，是 sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
+- `T[:0]&`：`Ref<SentinelSlice<T, 0>>` 的语法糖，是 sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
 
 只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T[*]` 和 `T*` 都不拥有目标对象。
 
 #### Pointer / Reference 类型
 
-Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 是 `Box<T>` 的语法糖，表示 owning pointer 外层；`&` 是 `Reference<T>` 的语法糖，表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
+Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 是 `Box<T>` 的语法糖，表示 owning pointer 外层；`&` 是 `Ref<T>` 的语法糖，表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
+`Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留。
 
 ```c
 // 在栈中开辟内存空间
@@ -591,7 +592,7 @@ Buffer^ b = a$.move();
 ### 切片（Slice）
 
 `Slice<T>`（后缀写法 `T[]`）是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]` 不能作为普通 value 单独存放或传递。
-`T[]&` / `Reference<Slice<T>>` 才是借用的 slice view，运行时 layout 类似 `{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 slice view 的使用范围。
+`T[]&` / `Ref<Slice<T>>` 才是借用的 slice view，运行时 layout 类似 `{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 slice view 的使用范围。
 `T[]^` / `Box<Slice<T>>` 是 owned unsized array，拥有已初始化的 buffer，drop 时会按元素类型逐个析构并释放底层 allocation。
 `SentinelSlice<T, S>`（后缀写法 `T[:S]`）同样是 unsized array type；`T[:S]&` 是带 sentinel 保证的 borrowed view。
 标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_slice()` 会消耗 `Vector`，

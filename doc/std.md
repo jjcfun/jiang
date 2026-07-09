@@ -29,10 +29,11 @@ import std;
   `into_string()` 生成 `String`，`into_slice()` 生成拥有所有权的 `UInt8[]^`。
 - `Path` / `PathBuilder`：面向路径文本的 owned path 和 builder。`Path.text()` 返回借用视图，
   `Path.into_slice()` 可转成拥有所有权的字节切片。路径算法仍保留在 `std.path` namespace 下。
-- 内建类型和 trait 的公开别名：例如 `Option<T>`、`Result<T, E>`、`Box<T>`、`Reference<T>`、
+- 内建类型和 trait 的公开别名：例如 `Option<T>`、`Result<T, E>`、`Box<T>`、`Ref<T>`、
   `Slice<T>`、`SentinelSlice<T, S>`、`RawPointer<T>`、`ManyPointer<T>` 等。
   其中 `Slice<T>` / `SentinelSlice<T, S>` 是 unsized array type 的公开名字；借用 view 需要通过
-  `Reference<Slice<T>>` / `Reference<SentinelSlice<T, S>>`，也就是后缀语法 `T[]&` / `T[:S]&` 表达。
+  `Ref<Slice<T>>` / `Ref<SentinelSlice<T, S>>`，也就是后缀语法 `T[]&` / `T[:S]&` 表达。
+  `Reference<T>` 在 0.4.5 中作为 `Ref<T>` 的兼容别名保留。
 - `jiang`：Jiang 语言自身的词法和 syntax 辅助 API。当前包括 `std.jiang.syntax.*`、
   `std.jiang.Token`、`std.jiang.Tokenizer` 和 `std.jiang.ident`。
   这些 API 供 compiler 和 lang provider 共享，避免 DSL 从零实现 Jiang-compatible token 和
