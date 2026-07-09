@@ -329,8 +329,11 @@ name        <- ident / "self"
   `context` 是运行时 async context。
 - `sync [domain]` 是 `sync [domain: domain]` 的短写。`sync` 不带独立运行时 flag；
   它只用于给同步调用效果显式指定 domain。
-- 需要进入调用效果上下文时使用 `do [options] { ... }`；例如 `do [unsafe] { ... }`
-  允许调用 unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文，
+- 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
+  `async [domain] { ... }`、`sync [domain] { ... }`、`unsafe async [domain] { ... }`。
+  effect keyword 的规范顺序是 `unsafe` 在前，`async` / `sync` 在后。
+- `do [options] { ... }` 是 0.4.5 兼容语法；例如 `do [unsafe] { ... }` 允许调用
+  unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文，
   `do [async [domain, context]] { ... }` 表示带 domain/context 的 async effect context，
   `do [sync [domain]] { ... }` 表示带 domain 的同步 effect context。
 
