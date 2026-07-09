@@ -213,14 +213,14 @@ guard maybe is .some(value) else {
 
 ```c
 defer {
-    do [unsafe] {
+    unsafe {
         handle$.dealloc();
     }
 }
 
 defer {
     log("closing");
-    do [unsafe] {
+    unsafe {
         handle$.dealloc();
     }
 }
@@ -260,11 +260,11 @@ Jiang 语言把安全转换和低层强制转换分开：
 
 - `a$.as(Int)`：对值 `a` 做低层强制转换
 - `a$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`
-- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `do [unsafe]`
+- `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `unsafe`
 - `a$.get()`：显式解引用 `T^` / `T&`，返回指向的值
 - `a$.move()`：显式转交当前变量的值，源变量随后失效且不再析构
-- `a$.addr()`：获取值 `a` 的裸指针，需要 `do [unsafe]`
-- `a$.dealloc()`：对 `a` 做释放操作，需要 `do [unsafe]`
+- `a$.addr()`：获取值 `a` 的裸指针，需要 `unsafe`
+- `a$.dealloc()`：对 `a` 做释放操作，需要 `unsafe`
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.align()`：获取类型 `Int` 的 ABI 对齐
 - `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
@@ -303,11 +303,11 @@ UInt8 small_val = UInt8(val);
 
 `as` 是一个特殊的隐式层方法，它接收一个类型表达式作为参数，用于不保证类型安全的强制转换。
 当前裸指针获取、裸指针转换和显式释放等低层操作已经接入 `unsafe` effect。调用这些操作时，
-需要放在 `do [unsafe] { ... }` 中，或由外层 unsafe 函数承接。
+需要放在 `unsafe { ... }` 中，或由外层 unsafe 函数承接。
 
 ```c
 Int addr = 0x12345678;
-Int* ptr = do [unsafe] {
+Int* ptr = unsafe {
     addr$.as(Int*)
 };
 ```
@@ -488,7 +488,7 @@ Int c = a + b;
 print("c = %d", c); // 输出： c = 300
 
 // '$' 符号阻止自动解引用，并进入 b 的隐式操作层
-do [unsafe] {
+unsafe {
     b$.dealloc();
 }
 ```
@@ -499,7 +499,7 @@ do [unsafe] {
 Int^ p = new Int(41);
 
 _ ref = p$.ref(); // ref: Int&
-do [unsafe] {
+unsafe {
     _ raw = p$.ptr(); // raw: Int*
 }
 
@@ -512,14 +512,14 @@ Int bad = p$.ref() + 1; // 编译错误
 // 显式解引用
 Int explicit = p$.get();
 
-do [unsafe] {
+unsafe {
     Int!* raw_ptr = p$.ptr();
     Int raw_value = raw_ptr$.get();
     raw_ptr$.set(42);
 }
 
 Int[1] items = [41];
-Int[*] raw = do [unsafe] {
+Int[*] raw = unsafe {
     items[0]$.as(Int[*])
 };
 
@@ -539,7 +539,7 @@ Int value = ptr[0];
 ptr[1] = 42;
 
 _ item_ref = ptr[1]$.ref(); // item_ref: Int&
-do [unsafe] {
+unsafe {
     _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 }
 ```
@@ -556,7 +556,7 @@ do [unsafe] {
 Int^ a = new Int(100);
 
 // 可以主动释放 owning pointer 管理的内存空间
-do [unsafe] {
+unsafe {
     a$.dealloc();
 }
 ```
@@ -918,7 +918,7 @@ RawFn<async Bool[]&> load_callbacks;
 调用带 `unsafe` effect 的函数需要进入显式 effect context：
 
 ```c
-Int value = do [unsafe] {
+Int value = unsafe {
     unsafe_callback(1)
 };
 ```
@@ -1143,14 +1143,14 @@ Int main() {
 
 ```c
 defer {
-    do [unsafe] {
+    unsafe {
         handle$.dealloc();
     }
 }
 
 defer {
     log("closing");
-    do [unsafe] {
+    unsafe {
         handle$.dealloc();
     }
 }
@@ -1394,7 +1394,7 @@ struct Buffer {
   UInt8[*] data;
 
   deinit() {
-    do [unsafe] {
+    unsafe {
       self.data$.dealloc();
     }
     return;

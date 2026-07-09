@@ -401,7 +401,7 @@ Jiang 没有前缀手动解引用语法，`*foo()` 这类写法不成立。需�
 ```jiang
 Int& ref = value$.ref();
 Int copied = ref$.get();
-do [unsafe] {
+unsafe {
     Int!* ptr = value$.ptr();
     ptr$.set(42);
 }
@@ -413,7 +413,7 @@ do [unsafe] {
 Int^ value = new Int(42);
 
 _ ref = value$.ref(); // ref: Int&
-do [unsafe] {
+unsafe {
     _ ptr = value$.ptr(); // ptr: Int*
     value$.dealloc();
 }
@@ -432,7 +432,7 @@ Int value = ptr[0];
 ptr[1] = 42;
 
 _ item_ref = ptr[1]$.ref(); // item_ref: Int&
-do [unsafe] {
+unsafe {
     _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
 }
 ```
@@ -476,7 +476,7 @@ struct Node: Movable {
     Int length;
 
     deinit() {
-        do [unsafe] {
+        unsafe {
             bytes$.dealloc(); // 只有自定义 deinit 会释放 many pointer
         }
     }
@@ -582,12 +582,12 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 - `value$.as(Type)`：强制类型转换，不保证类型安全。
 - `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
-- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `do [unsafe]`。
+- `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `unsafe`。
 - `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；`T[*]` many pointer 必须使用下标访问。
 - `value$.set(new_value)`：显式写入 `T!*` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
-- `value$.addr()`：获取裸指针，需要 `do [unsafe]`。
-- `value$.dealloc()`：释放默认堆分配器上的对象，需要 `do [unsafe]`。
+- `value$.addr()`：获取裸指针，需要 `unsafe`。
+- `value$.dealloc()`：释放默认堆分配器上的对象，需要 `unsafe`。
 - `optional$.some()`：强制解包 optional。
 - `Type$.size()`：类型大小。
 - `Type$.align()`：ABI 对齐。
@@ -597,7 +597,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
-隐式操作层的低层操作会逐步接入 effect 检查。当前裸指针获取和显式释放需要放在 `do [unsafe]`
+隐式操作层的低层操作会逐步接入 effect 检查。当前裸指针获取和显式释放需要放在 `unsafe`
 中；borrow check 仍然只检查所有权、lifetime 和 drop safety。
 
 如果后续引入更细的 capability 系统，`$` 会成为受编译期 capability 约束的低层操作层。每个 `$`

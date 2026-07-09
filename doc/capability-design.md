@@ -249,7 +249,7 @@ domain 恢复时，
 - 无显式 domain 的 async 调用不切 domain，callee 继承 caller 的 current domain。
 - `async [D]` callee 在 `D` 下运行，参数必须能安全进入 `D`。
 - `go async [D]` / `spawn async [D]` 创建并发任务，是严格 domain 切换边界。
-- `do async [D] {}` 是显式进入 `D` 的 block；进入 block 时不能携带原 domain 的普通 `T!&`。
+- `async [D] {}` 是显式进入 `D` 的 block；进入 block 时不能携带原 domain 的普通 `T!&`。
 
 跨 domain 时的能力检查：
 
@@ -356,4 +356,4 @@ Jiang 的草案不同：
 - `T!&` 返回值的生命周期和 domain 如何在 HIR / type check 中表示。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
 - `unique` 和 optimizer noalias 的精确关系。
-- `do async [D] {}`、`go async [D] {}`、结构化并发 scope 的最终语法。
+- `async [D] {}`、`go async [D] {}`、结构化并发 scope 的最终语法。
