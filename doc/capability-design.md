@@ -97,6 +97,22 @@ async [domain: app_runtime.ui] () render(Model!& model) {
 }
 ```
 
+`async` block 还可以带运行时 context：
+
+```jiang
+async [page, page_ctx] {
+    load(model$.ref());
+}
+
+async [domain: page, context: page_ctx] {
+    load(model$.ref());
+}
+```
+
+这里 `page` 是编译期可见的静态 domain tag，用于 data race 检查；`page_ctx` 是运行时
+async context，用于调度、取消、join、页面生命周期或 tracing 等 runtime 语义。`context`
+不参与 domain 静态相等判断，也不能替代 domain。
+
 函数类型沿用第一个类型参数作为 callable signature head：
 
 ```jiang
@@ -105,7 +121,8 @@ Fn<async [ui] (), Model!&>
 RawFn<unsafe async [ui] (), UInt8*>
 ```
 
-`async [ui]` 是 `async [domain: ui]` 的短写。`ui` 本质上仍是 const domain value，不是语言魔法。
+`async [ui]` 是 `async [domain: ui]` 的短写。`async [ui, ctx]` 是
+`async [domain: ui, context: ctx]` 的短写。`ui` 本质上仍是 const domain value，不是语言魔法。
 
 ## 默认 Domain
 

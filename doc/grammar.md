@@ -312,16 +312,27 @@ name        <- ident / "self"
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
 - `T@E` 表示 errorable，只能出现在 `result_type`，也就是函数、方法和 callable 类型的返回位。
-- `RawFn<unsafe T, ...>` 和 `RawFn<async T, ...>` 表示带调用效果的函数指针类型。调用效果
+- `RawFn<unsafe T, ...>`、`RawFn<async T, ...>`、`RawFn<async [domain] T, ...>` 和
+  `RawFn<sync [domain] T, ...>`
+  表示带调用效果的函数指针类型。调用效果
   前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型；
   因此 `RawFn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
-- `Fn<unsafe T, ...>` 和 `Fn<async T, ...>` 表示带调用效果的闭包值类型。调用效果前缀写在
+- `Fn<unsafe T, ...>`、`Fn<async T, ...>`、`Fn<async [domain] T, ...>` 和
+  `Fn<sync [domain] T, ...>`
+  表示带调用效果的闭包值类型。调用效果前缀写在
   `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层闭包值类型；因此
   `Fn<async Bool>[]&` 表示“元素为异步闭包值的切片引用”。
 - `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment；`RawFn<Ret, Args...>` 表示裸函数
   指针，不带 environment，可用于 C ABI 函数指针边界。
+- `async [domain]` 是 `async [domain: domain]` 的短写；`async [domain, context]`
+  是 `async [domain: domain, context: context]` 的短写。`domain` 是编译期 domain tag；
+  `context` 是运行时 async context。
+- `sync [domain]` 是 `sync [domain: domain]` 的短写。`sync` 不带独立运行时 flag；
+  它只用于给同步调用效果显式指定 domain。
 - 需要进入调用效果上下文时使用 `do [options] { ... }`；例如 `do [unsafe] { ... }`
-  允许调用 unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文。
+  允许调用 unsafe 函数，`do [unsafe, async] { ... }` 表示组合效果上下文，
+  `do [async [domain, context]] { ... }` 表示带 domain/context 的 async effect context，
+  `do [sync [domain]] { ... }` 表示带 domain 的同步 effect context。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、`Reference`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
 
