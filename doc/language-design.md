@@ -189,14 +189,15 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T[N]`：定长数组。
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
-- `T@E`：`Result<T, E>` 的返回类型语法糖。
-- `@E` 后的错误类型顶层不能带 `?` 或 `!`；errorable 类型层本身也不能再追加 `?` 或 `!`。如果值类型需要 optional/mutable，必须写在 `@E` 前，例如 `T?!@E`。
-- 由于 `(T)` 与 `T` 等价，`T@(E?)` 与 `T@E?` 等价；非法原因仍然是 `@` 后错误类型顶层不能带 `?`。
+- `Result<T, E>`：errorable result，只能出现在函数、方法和 callable 类型的返回位。
+- `Result` 的错误类型 `E` 顶层不能带 `?` 或 `!`。如果成功值类型需要 optional/mutable，
+  必须写在第一个类型参数上，例如 `Result<T?!, E>`。
+- 0.4.6 已移除旧的 `T@E` 返回类型语法。
 
 内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、
 `Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Ref<T>`、`RawPointer<T>`、
 `ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
-`T^`、`T&`、`T*`、`T[*]`、`T@E` 等表面语法。语法糖形成的类型仍会参与对应
+`T^`、`T&`、`T*`、`T[*]` 等表面语法。语法糖形成的类型仍会参与对应
 builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的类型函数。
 
 sentinel value 使用 `const T S` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
@@ -209,8 +210,8 @@ sentinel value 使用 `const T S` 语义，`S` 的类型来自元素类型 `T`�
 Int[2][3] matrix;
 Int?[] values;
 UInt8[*] raw;
-Result@Error result;
-Result?!@Error maybe_result;
+Result<Int, Error> result;
+Result<Int?!, Error> maybe_result;
 ```
 
 ## 可变性
@@ -1013,27 +1014,25 @@ switch value {
 目标设计偏向显式 optional handling。是否支持 `x == null` / `x != null`
 分支窄化仍未定；在定稿前，sema 不应依赖该能力。
 
-Errorable 使用 `T@E` 表示。`@E` 是 errorable 边界，`?` 和 `!` 只能作用在 `@` 左侧的值类型层，不能作用在 errorable 类型层或错误类型顶层。
+Errorable 使用 `Result<T, E>` 表示。`T` 是成功值类型，`E` 是错误类型。错误类型顶层不能带
+`?` 或 `!`；如果成功值需要 optional/mutable，必须写在第一个类型参数上。
 
 合法：
 
 ```jiang
-Result@Error value;
-Result?!@Error maybe_value;
-Result@(T1?, T2!) tuple_error;
+Result<Int, Error> value;
+Result<Int?!, Error> maybe_value;
+Result<Int, (T1?, T2!)> tuple_error;
 ```
 
 非法：
 
 ```jiang
-Result@Error?;
-Result@Error!;
-Result@Error?!;
-Result@(Error?);
-Result@(Error!);
+Result<Int, Error?>;
+Result<Int, Error!>;
 ```
 
-当前 errorable value 不做隐式传播。`T@E` 只能作为完整 errorable value 保存或返回；
+当前 errorable value 不做隐式传播。`Result<T, E>` 只能作为完整 errorable value 保存或返回；
 如果上下文需要 `T`，必须用 `try expr catch (...) => ...` 显式处理 error 分支。
 `throw expr` 只能出现在返回 errorable type 的函数中，`expr` 必须可赋给该函数的 error type。
 catch binding 只在 catch body 内可见，类型来自被处理 errorable value 的 error type。

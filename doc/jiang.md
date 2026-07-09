@@ -1031,8 +1031,7 @@ RawFn<Result<Bool, Err>, Int, Int> compare
 - `Result<T, E>` 只允许作为函数返回类型，或出现在 `RawFn<...>` / `Fn<...>` 的返回位
 - 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
 
-`T@E` 是 0.4.5 的兼容语法，只能出现在函数、方法和 callable 类型的返回位。新代码优先写
-`Result<T, E>`。
+0.4.6 已移除旧的 `T@E` 返回类型语法；代码应写 `Result<T, E>`。
 
 抛出错误使用 `throw expr;`：
 
@@ -1122,7 +1121,7 @@ Int main() {
 
 - 只支持前置 `try catch` 表达式形式：`try expr catch (...) => fallback`
 - `try` 只包住 `catch` 前面的单个表达式
-- `expr` 必须是 `Result<T, E>` 或兼容语法 `T@E`
+- `expr` 必须是 `Result<T, E>`
 - `catch` 参数列表必须写 `(...)`；不需要错误值时写 `()`
 - `catch` 绑定可省略类型；如果写绑定，类型自动推断为错误类型 `E`
 - fallback 可以是表达式或 block

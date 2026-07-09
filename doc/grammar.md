@@ -311,8 +311,8 @@ name        <- ident / "self"
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
-- `Result<T, E>` 表示 errorable result。`T@E` 是 0.4.5 兼容语法，只能出现在
-  `result_type`，也就是函数、方法和 callable 类型的返回位；新代码优先写 `Result<T, E>`。
+- `Result<T, E>` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位。
+  0.4.6 已移除旧的 `T@E` 返回类型语法。
 - `RawFn<unsafe T, ...>`、`RawFn<async T, ...>`、`RawFn<async [domain] T, ...>` 和
   `RawFn<sync [domain] T, ...>`
   表示带调用效果的函数指针类型。调用效果
@@ -334,10 +334,10 @@ name        <- ident / "self"
   `async [domain] { ... }`、`sync [domain] { ... }`、`unsafe async [domain] { ... }`。
   effect keyword 的规范顺序是 `unsafe` 在前，`async` / `sync` 在后。
 
-`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]`、`T@E` 等内建后缀类型语法
+`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]` 等内建后缀类型语法
 不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、
-`Ref`、`RawPointer`、`ManyPointer`、`Result` 不会改变这些语法的含义。
-`Result<T, E>` 由编译器识别为内建 result 类型，后续将替代 `T@E` 作为推荐写法。
+`Ref`、`RawPointer`、`ManyPointer` 不会改变这些语法的含义。`Result<T, E>` 由编译器识别为
+内建 result 类型。
 
 ## struct
 
