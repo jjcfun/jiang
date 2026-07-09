@@ -117,8 +117,13 @@ fi
 
 if [ "$VERIFY" != "none" ]; then
   printf '\n== next verify: smoke with %s ==\n' "$VERIFY_BIN"
+  slow_smoke=""
+  if [ "$VERIFY" = "full" ]; then
+    slow_smoke=1
+  fi
   BUILD_DIR="$BUILD_DIR" \
   JIANGC="$VERIFY_BIN" \
+  JIANG_SLOW_SMOKE="$slow_smoke" \
   bash "$ROOT_DIR/script/smoke.sh"
 
   printf '\n== next verify: backend cli smoke ==\n'
