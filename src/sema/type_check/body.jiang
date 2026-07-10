@@ -51,6 +51,8 @@ public struct BodyCheck: Movable {
     list.ArrayList<LocalInitBinding>! local_init_states;
     Int! assignment_target_depth;
     Int! lambda_capture_initializer_depth;
+    Int! await_depth;
+    Int! await_future_count;
     types.EffectSet! current_effects;
 
     public init(self, check_state.CheckState& state, type_ops_mod.TypeOps& type_ops) {
@@ -62,6 +64,8 @@ public struct BodyCheck: Movable {
         self.local_init_states = list.ArrayList<LocalInitBinding>();
         self.assignment_target_depth = 0;
         self.lambda_capture_initializer_depth = 0;
+        self.await_depth = 0;
+        self.await_future_count = 0;
         self.current_effects = types.EffectSet();
     }
 
@@ -469,6 +473,9 @@ public struct BodyCheck: Movable {
         if (node.data is .catch_expr(catch_expr)) {
             type_id = self.check_catch_expr(node_id, catch_expr);
         }
+        if (node.data is .await_expr(value)) {
+            type_id = self.check_await_expr(node_id, value);
+        }
         if (node.data is .lambda_expr(_)) {
             type_id = self.check_lambda_without_expected(node_id);
         }
@@ -487,6 +494,7 @@ public struct BodyCheck: Movable {
         if (node.data is .invalid) {
             type_id = self.state.store.types.invalid_type();
         }
+        type_id = self.project_await_future_type(node_id, type_id);
         self.state.results.set_node_type(node_id, type_id);
         self.node_states.set(node_id, 2);
         return type_id;
@@ -825,6 +833,9 @@ public struct BodyCheck: Movable {
         if (node.data is .catch_expr(catch_expr)) {
             return self.lambda_catch_has_implicit_capture(lambda_def, catch_expr);
         }
+        if (node.data is .await_expr(value)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, value);
+        }
         if (node.data is .is_pattern(is_pattern)) {
             return self.lambda_node_has_implicit_capture(lambda_def, is_pattern.value)
                 || self.lambda_node_has_implicit_capture(lambda_def, is_pattern.pattern);
@@ -985,6 +996,10 @@ public struct BodyCheck: Movable {
             self.collect_implicit_lambda_captures(lambda_def, catch_expr.value, captures);
             self.collect_optional_implicit_lambda_captures(lambda_def, catch_expr.pattern, captures);
             self.collect_implicit_lambda_captures(lambda_def, catch_expr.body, captures);
+            return;
+        }
+        if (node.data is .await_expr(value)) {
+            self.collect_implicit_lambda_captures(lambda_def, value, captures);
             return;
         }
         if (node.data is .is_pattern(is_pattern)) {
@@ -2149,6 +2164,7 @@ public struct BodyCheck: Movable {
         if (node.data is .loop_expr(loop_expr)) { return self.defer_body_has_control_exit(loop_expr.body); }
         if (node.data is .switch_expr(switch_expr)) { return self.switch_has_control_exit(switch_expr); }
         if (node.data is .catch_expr(catch_expr)) { return self.catch_has_control_exit(catch_expr); }
+        if (node.data is .await_expr(value)) { return self.defer_body_has_control_exit(value); }
         return false;
     }
 
@@ -3493,6 +3509,35 @@ public struct BodyCheck: Movable {
         return self.state.store.types.invalid_type();
     }
 
+    qid.TypeId check_await_expr(self, hir.HirId node_id, hir.HirId value) {
+        Int saved_depth = self.await_depth;
+        Int saved_count = self.await_future_count;
+        self.await_depth = self.await_depth + 1;
+        qid.TypeId result_type = self.check_node(value);
+        Int future_count = self.await_future_count - saved_count;
+        self.await_depth = saved_depth;
+        self.await_future_count = saved_count;
+        if (future_count == 0 && !self.type_ops.is_invalid_type(result_type)) {
+            self.type_ops.add_node_error(
+                node_id,
+                "await expression must use at least one Future value",
+                "await_requires_future"
+            );
+            return self.state.store.types.invalid_type();
+        }
+        return result_type;
+    }
+
+    qid.TypeId project_await_future_type(self, hir.HirId node_id, qid.TypeId type_id) {
+        if (self.await_depth == 0) { return type_id; }
+        if (self.type_ops.is_invalid_type(type_id)) { return type_id; }
+        types.TypeInfo type_info = self.state.store.types.get(type_id);
+        guard type_info.data is .future_type(future_type) else { return type_id; }
+        self.await_future_count = self.await_future_count + 1;
+        self.state.results.set_node_type(node_id, future_type.result);
+        return future_type.result;
+    }
+
     () check_optional_catch_pattern(self, hir.HirId? pattern, qid.TypeId error_type) {
         if (pattern is .some(pattern_id)) {
             self.pattern_check.check_pattern(pattern_id, error_type);
@@ -3869,7 +3914,7 @@ public struct BodyCheck: Movable {
                     local_type = self.type_ops.infer_array_type_from_initializer(type_ref, initializer, value_type);
                 } else if (self.local_type_ref_is_future(type_ref)) {
                     local_type = self.type_ops.check_future_local_type_ref(type_ref);
-                    value_type = self.check_node(initializer);
+                    value_type = self.check_future_local_initializer(initializer);
                     local_type = self.future_local_type_from_initializer(type_ref, initializer, local_type, value_type);
                 } else {
                     local_type = self.type_ops.check_value_type_ref(type_ref);
@@ -3899,6 +3944,14 @@ public struct BodyCheck: Movable {
         self.type_ops.bind_def_type(local.def_id, self.local_binding_type(local, value_type));
         self.mark_let_initialized(node_id.owner_def, local.id, let_stmt.initializer != null);
         return self.state.store.types.unit_type();
+    }
+
+    qid.TypeId check_future_local_initializer(self, hir.HirId initializer) {
+        Int saved_depth = self.await_depth;
+        self.await_depth = 0;
+        qid.TypeId value_type = self.check_node(initializer);
+        self.await_depth = saved_depth;
+        return value_type;
     }
 
     Bool local_type_ref_is_future(self, hir.HirId type_ref) {
