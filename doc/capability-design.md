@@ -248,7 +248,7 @@ domain 恢复时，
 - 普通函数调用不切 domain，callee 继承 caller 的 current domain。
 - 无显式 domain 的 async 调用不切 domain，callee 继承 caller 的 current domain。
 - `async [D]` callee 在 `D` 下运行，参数必须能安全进入 `D`。
-- function `$` Intrinsic Operation 形式的 task creation 是严格 domain 切换边界。
+- `async [D] {}` 创建 future，是严格 domain 切换边界。
 - `async [D] {}` 是显式进入 `D` 的 block；进入 block 时不能携带原 domain 的普通 `T!&`。
 
 跨 domain 时的能力检查：
@@ -260,10 +260,10 @@ domain 恢复时，
 - `T*` / `T[*]`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
 
-## Task Intrinsic Operation 与结构化并发
+## Future 与结构化并发
 
-Jiang 的并发启动入口走 `$` Intrinsic Operation，而不是普通方法或新的 statement keyword。
-普通 async 调用仍然表示隐式 await：
+普通 async 调用表示 suspend call，不创建 future，也不返回 future。调用点挂起当前 coroutine，
+callee 完成后继续执行：
 
 ```jiang
 async [page] Int load_page();
@@ -274,44 +274,76 @@ async [page] Int render() {
 }
 ```
 
-需要并发启动而不等待结果时，对函数名使用 function Intrinsic Operation receiver：
+需要并发启动而不等待结果时，使用 `async [D] {}`。它创建一个 future：
 
 ```jiang
-Task<Int> task = load_page$().async();
-```
-
-`load_page$()` 不是普通函数调用，也不是普通 member receiver。它产生一个仅供 Intrinsic Operation
-解析使用的 function receiver；`.async(...)` 在这个 receiver 上触发 async task creation。
-如果函数存在 overload，overload resolution 在 `.async(...)` 这一层完成，参数和 expected
-`Task<T>` 类型共同参与选择：
-
-```jiang
-async [page] Int load(Int id);
-async [page] User load(String name);
-
-Task<Int> by_id = load$().async(1);
-Task<User> by_name = load$().async("jjc");
-```
-
-Task result 的消费也应走 Intrinsic Operation，例如：
-
-```jiang
-Int value = task$.join();  // sync context 中阻塞等待
-Int next = task$.await();  // async context 中挂起等待
-```
-
-普通 `T!&` 不能被捕获到不同 domain。`load$().async(...)` 或后续 block-form task creation
-都是严格 domain 切换边界：
-
-```jiang
-async [ui] () render(Model!& model) {
-    update_worker$().async(model); // error: model 属于 ui domain，不能进入 worker task
+let future = async [page] {
+    load_page()
 }
 ```
 
-同 domain 的 task creation 仍需要生命周期约束。如果任务可能在当前函数返回后运行，
+Jiang 的 future 语义是 eager、single-completion、cached result：
+
+- 创建 future 后立即入队或开始执行，不等到 `await` / `join` 时才启动。
+- future body 只执行一次。
+- 完成值缓存一次；`await` / `join` 读取缓存结果，不重复执行 body。
+- 如果 body 返回 `Result<T, E>`，future 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
+  exception channel。
+- future result type 不能是 future；`async [D] { ... }` 不允许产生 nested future。实现上可以用
+  `@where` 风格的内部 type predicate 禁止 `Future<Future<T>>`。
+
+因此这里是合法的：
+
+```jiang
+let future = async [page] {
+    load_page() // body type: Int
+}
+```
+
+但这里应诊断：
+
+```jiang
+let nested = async [page] {
+    async [page] {
+        load_page()
+    }
+}
+```
+
+future result 的消费走 `$` Intrinsic Operation：
+
+```jiang
+Int value = future$.join();  // sync context 中阻塞等待
+Int next = future$.await();  // async context 中挂起等待
+```
+
+Future 只能在 body 内作为局部不透明值使用。用户不能主动写 `Future` 类型，也不能把 future
+作为函数返回值、参数类型、字段类型或 public ABI 暴露：
+
+```jiang
+Future<Int, page> make_future(); // error: Future 不能出现在签名中
+```
+
+编译器内部可以用 future kind 保存 result type 和 domain；如果写 `async { ... }`，domain
+默认是调用点 `current`。这个 kind 只服务 type check、borrow check、lowering 和 runtime ABI，
+不进入用户可命名类型空间。
+
+普通 `T!&` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
+
+```jiang
+async [ui] () render(Model!& model) {
+    async [worker] {
+        update_worker(model) // error: model 属于 ui domain，不能进入 worker future
+    }
+}
+```
+
+同 domain 的 future creation 仍需要生命周期约束。如果 future 可能在当前函数返回后运行，
 不能捕获栈上 borrow。
-结构化并发可以允许有限的同 domain capture，但必须证明所有任务在 scope 结束前完成。
+结构化并发可以允许有限的同 domain capture，但必须证明所有 future 在 scope 结束前完成。
+
+函数先不支持 future creation Intrinsic Operation。也就是说不提供 `foo$().task()`、
+`foo$().future()` 或类似形式；0.4.6 先以 block-form `async [D] {}` 为并发启动入口。
 
 ## Actor 与 Isolate
 
