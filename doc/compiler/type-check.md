@@ -20,9 +20,9 @@ type check 不回读 AST，不重新 resolve，也不直接修改 HIR。
 - `DefId -> TypeId`：definition 的类型结果。
 - `HirId -> TypeId`：expression、pattern、type ref 等 HIR node 的类型结果。
 - member access、variant pattern、generic call/type ref 的语义选择 side table。
-- `$` intrinsic operation 的语义选择 side table。`@intrinsic(value, Pattern)` /
+- `$` Intrinsic Operation 的语义选择 side table。`@intrinsic(value, Pattern)` /
   `@intrinsic(type, Pattern)` 只描述 receiver pattern、签名和 where 约束；
-  type check 负责选择具体 intrinsic operation 并记录 lowering kind。
+  type check 负责选择具体 Intrinsic Operation 并记录 lowering kind。
 - default/named call argument 的签名顺序重排结果。
 - generic instantiation 所需的 type args。
 - 错误状态和必要诊断。

@@ -248,7 +248,7 @@ domain 恢复时，
 - 普通函数调用不切 domain，callee 继承 caller 的 current domain。
 - 无显式 domain 的 async 调用不切 domain，callee 继承 caller 的 current domain。
 - `async [D]` callee 在 `D` 下运行，参数必须能安全进入 `D`。
-- `go async [D]` / `spawn async [D]` 创建并发任务，是严格 domain 切换边界。
+- function `$` Intrinsic Operation 形式的 task creation 是严格 domain 切换边界。
 - `async [D] {}` 是显式进入 `D` 的 block；进入 block 时不能携带原 domain 的普通 `T!&`。
 
 跨 domain 时的能力检查：
@@ -260,20 +260,56 @@ domain 恢复时，
 - `T*` / `T[*]`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
 
-## Spawn 与结构化并发
+## Task Intrinsic Operation 与结构化并发
 
-`go async [D]`、`spawn async [D]` 或类似 API 会创建可能并发执行的任务。
-普通 `T!&` 不能被捕获到不同 domain：
+Jiang 的并发启动入口走 `$` Intrinsic Operation，而不是普通方法或新的 statement keyword。
+普通 async 调用仍然表示隐式 await：
 
 ```jiang
-async [ui] () render(Model!& model) {
-    go async [worker] {
-        model.value = 1; // error: model 属于 ui domain
-    }
+async [page] Int load_page();
+
+async [page] Int render() {
+    Int value = load_page(); // 隐式 await，返回 Int
+    value + 1
 }
 ```
 
-同 domain 的 spawn 仍需要生命周期约束。如果任务可能在当前函数返回后运行，
+需要并发启动而不等待结果时，对函数名使用 function Intrinsic Operation receiver：
+
+```jiang
+Task<Int> task = load_page$().async();
+```
+
+`load_page$()` 不是普通函数调用，也不是普通 member receiver。它产生一个仅供 Intrinsic Operation
+解析使用的 function receiver；`.async(...)` 在这个 receiver 上触发 async task creation。
+如果函数存在 overload，overload resolution 在 `.async(...)` 这一层完成，参数和 expected
+`Task<T>` 类型共同参与选择：
+
+```jiang
+async [page] Int load(Int id);
+async [page] User load(String name);
+
+Task<Int> by_id = load$().async(1);
+Task<User> by_name = load$().async("jjc");
+```
+
+Task result 的消费也应走 Intrinsic Operation，例如：
+
+```jiang
+Int value = task$.join();  // sync context 中阻塞等待
+Int next = task$.await();  // async context 中挂起等待
+```
+
+普通 `T!&` 不能被捕获到不同 domain。`load$().async(...)` 或后续 block-form task creation
+都是严格 domain 切换边界：
+
+```jiang
+async [ui] () render(Model!& model) {
+    update_worker$().async(model); // error: model 属于 ui domain，不能进入 worker task
+}
+```
+
+同 domain 的 task creation 仍需要生命周期约束。如果任务可能在当前函数返回后运行，
 不能捕获栈上 borrow。
 结构化并发可以允许有限的同 domain capture，但必须证明所有任务在 scope 结束前完成。
 
