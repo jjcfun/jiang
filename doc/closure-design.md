@@ -451,8 +451,8 @@ lambda.function_def -> [
 
 ## Environment 表示评估
 
-0.4.6 结论：暂不把捕获 env 进一步提升为 resolver / HIR 可命名的匿名 struct。当前实现已经把
-env 的语义信息保存在 `LambdaCaptureInfo` side table 中：
+0.4.6 结论：捕获 env 降低为编译器合成的私有匿名 struct，而不是 tuple。env 的语义信息仍保存在
+`LambdaCaptureInfo` side table 中：
 
 - `kind` 区分显式 capture 和隐式 capture。
 - `source_def` / `local_def` 描述外层来源和闭包体中的绑定。
@@ -461,15 +461,15 @@ env 的语义信息保存在 `LambdaCaptureInfo` side table 中：
 - `deref_on_use` 描述隐式引用捕获在 body 中是否自动解引用。
 - `is_unique` 记录显式 unique capture 需求。
 
-MIR lowering 使用 tuple type 只是为了复用已有 layout、projection 和 drop 机制：stack `Fn`
-创建临时 env tuple，heap `Fn^` 分配同形状 env tuple，并把指针擦成 `UInt8*` 存入 closure
-object。borrow check、drop elaborate 和 backend 不从 tuple 名字推导语义，只消费
-`LambdaCaptureInfo`、field index 和普通类型/drop 规则。
+MIR lowering 从 `LambdaCaptureInfo` 生成 sourceless 的私有 struct def 和 field def。stack `Fn`
+创建临时 env struct，heap `Fn^` 分配同形状 env struct，并把指针擦成 `UInt8*` 存入 closure
+object。field 名字尽量沿用 capture 名字，没有稳定源码名字时使用 `_0`、`_1` 这类匿名字段名。
 
-因此 0.4.6 不需要引入编译器合成匿名 struct 来修正 lifetime、drop 或 layout 行为。后续如果
-需要在诊断、debug info、反射、跨 package artifact 或 async frame 统一 layout 中暴露更强的
-env 身份，再在 0.4.7 之后设计 synthetic env def；那时应从现有 `LambdaCaptureInfo` 生成，而
-不是把源码 HIR 改写成用户可见 struct。
+这个 synthetic env struct 只服务 layout、projection、drop 和诊断展示，不进入 resolver namespace，
+也不是用户可写或可引用的 HIR struct。borrow check、drop elaborate 和 backend 不从 struct 名字
+反推 capture 语义，只消费 `LambdaCaptureInfo`、field index 和普通类型/drop 规则。后续 debug info、
+artifact 或 async frame 如果需要更强的 env 身份，应继续从现有 `LambdaCaptureInfo` 生成，而不是把
+源码 HIR 改写成用户可见 struct。
 
 ## 与 async / 数据竞争的关系
 
