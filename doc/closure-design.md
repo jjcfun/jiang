@@ -449,6 +449,28 @@ lambda.function_def -> [
 当前 HIR 不把这些 `def_ref` 重写成新的 capture local；type check、MIR lowering 和 borrow check
 通过 `lambda_captures` side table 把它们映射到 env field。
 
+## Environment 表示评估
+
+0.4.6 结论：暂不把捕获 env 进一步提升为 resolver / HIR 可命名的匿名 struct。当前实现已经把
+env 的语义信息保存在 `LambdaCaptureInfo` side table 中：
+
+- `kind` 区分显式 capture 和隐式 capture。
+- `source_def` / `local_def` 描述外层来源和闭包体中的绑定。
+- `type_id` 是 capture 字段类型。
+- `field_index` 是后端 env layout 的稳定字段序。
+- `deref_on_use` 描述隐式引用捕获在 body 中是否自动解引用。
+- `is_unique` 记录显式 unique capture 需求。
+
+MIR lowering 使用 tuple type 只是为了复用已有 layout、projection 和 drop 机制：stack `Fn`
+创建临时 env tuple，heap `Fn^` 分配同形状 env tuple，并把指针擦成 `UInt8*` 存入 closure
+object。borrow check、drop elaborate 和 backend 不从 tuple 名字推导语义，只消费
+`LambdaCaptureInfo`、field index 和普通类型/drop 规则。
+
+因此 0.4.6 不需要引入编译器合成匿名 struct 来修正 lifetime、drop 或 layout 行为。后续如果
+需要在诊断、debug info、反射、跨 package artifact 或 async frame 统一 layout 中暴露更强的
+env 身份，再在 0.4.7 之后设计 synthetic env def；那时应从现有 `LambdaCaptureInfo` 生成，而
+不是把源码 HIR 改写成用户可见 struct。
+
 ## 与 async / 数据竞争的关系
 
 async closure 应建立在普通 closure 之上：async state machine 保存的是 closure environment
