@@ -93,7 +93,7 @@ printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nI
 printf 'import std;\nInt main() { if (std.fs.exists("/tmp")) { 0 } else { 1 } }\n' >"$system_fs_sample"
 cat >"$alloc_sample" <<'EOF'
 Int main() {
-    do [unsafe] {
+    unsafe {
         Int![*] values = Int!$.alloc_many(2);
         values[0] = 1;
         values$.dealloc();

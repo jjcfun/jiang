@@ -287,6 +287,7 @@ Jiang 的 future 语义是 eager、single-completion、cached result：
 - 创建 future 后立即入队或开始执行，不等到 `await` / `join` 时才启动。
 - future body 只执行一次。
 - 完成值缓存一次；`await` / `join` 读取缓存结果，不重复执行 body。
+- coroutine 是无栈协程；future 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
 - 如果 body 返回 `Result<T, E>`，future 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
   exception channel。
 - future result type 不能是 future；`async [D] { ... }` 不允许产生 nested future。实现上可以用
