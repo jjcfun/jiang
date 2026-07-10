@@ -274,7 +274,35 @@ async [page] Int render() {
 }
 ```
 
-需要并发启动而不等待结果时，使用 `async [D] {}`。它创建一个 future：
+需要并发启动而不等待结果时，使用函数调用的 `$` Intrinsic Operation：
+
+```jiang
+_ a = load_a$().async()
+_ b = load_b$().async()
+
+await (a + b)
+```
+
+`foo$().async()` 表示以 async call mode 启动 `foo`，阻止普通 `foo()` 调用的隐式 await，
+返回 body-local `Future<T>`。`$` 本身不产生值，只进入 Intrinsic Operation；`.async()` 是
+具体操作名。
+
+`await expr` 在 current domain 上等待 `expr` 中引用到的 Future slot，并在 `expr` 内把这些
+slot 投影为结果类型。`await` 不接受 domain 参数；async context 中是 suspend join，sync
+context 中是 blocking join。`await` 只处理包含 Future 的表达式，`await (1 + 2)` 或对已是
+具体类型的表达式 await 应诊断。
+
+`await` 对多个 Future 是统一 barrier，不按表达式求值顺序逐个等待：
+
+```jiang
+_ a = load_a$().async()
+_ b = load_b$().async()
+
+await (a + b) // 先等待 a 和 b 都完成，再用 Int + Int 求值
+```
+
+`async [D] {}` 仍可创建一个显式 block future，用于需要自定义 future body 或显式 domain
+边界的场景：
 
 ```jiang
 let future = async [page] {
@@ -309,13 +337,6 @@ let nested = async [page] {
         load_page()
     }
 }
-```
-
-future result 的消费走 `$` Intrinsic Operation：
-
-```jiang
-Int value = future$.join();  // sync context 中阻塞等待
-Int next = future$.await();  // async context 中挂起等待
 ```
 
 Future 只能在 body 内作为局部不透明值使用。用户不能主动写 `Future` 类型，也不能把 future
