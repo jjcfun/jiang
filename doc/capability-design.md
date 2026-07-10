@@ -8,7 +8,7 @@
 ## 目标
 
 - `async` 类似 Kotlin `suspend`：调用 async 函数表示可能挂起，不要求显式 `await`。
-- 普通函数默认运行在调用者当前 execution domain 中。
+- 普通函数不绑定 execution domain；它只在调用者当前同步控制流中直接执行。
 - `T!&` 表示某个 serial domain 下的可变引用；同一 serial domain 内允许多个 `T!&` alias。
 - 数据竞争检查转换为 domain 切换检查：普通 `T!&` 不能跨 serial domain 逃逸。
 - `Atomic`、`Mutex`、`Channel`、`Actor` 等同步/并发类型是跨 domain 共享可变状态的显式入口。
@@ -22,8 +22,9 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 
 - **domain**：执行域。它描述一段代码在哪里运行，以及可变引用属于哪个执行上下文。
 - **serial domain**：串行执行域。同一个 serial domain 上的 continuation 不会并发执行。
-- **current domain**：当前函数体运行所在的 domain。
-- **domain-polymorphic function**：没有显式 domain 的函数。它继承调用者的 current domain。
+- **current domain**：当前 async/sync domain block 或 coroutine 执行所在的 domain。
+- **domain-neutral async function**：没有显式 domain 的 async 函数。它本身不选择 executor，
+  只能在已有 current domain 的上下文中运行。
 - **domain switch / hop**：从一个 domain 进入另一个 domain 的执行上下文。
 
 普通 executor 或线程池不一定是 serial domain。只有能保证同一 domain 上代码串行执行的 domain，
@@ -31,85 +32,125 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 
 ## Domain 能力
 
-语言核心只认识抽象 capability，不内建 `ui`、`work` 这类具体 domain：
+语言核心只认识抽象 capability，不内建 `UiDomain`、`WorkerDomain` 这类具体 domain。
+0.4.6 使用单一 `Domain` trait，并用 `const` 约束形式的 associated item 表示 domain
+执行语义，避免 `Domain<.serial>` / `Domain<.concurrent>` 这种 generic 形式带来的多重实现问题：
 
 ```jiang
-trait Domain {
+enum DomainKind {
+    serial,
+    concurrent,
 }
 
-trait SerialDomain: Domain {
+trait Domain {
+    associated Kind: const DomainKind;
 }
 ```
 
-具体 domain 由 runtime、框架或第三方库提供：
+具体 domain 由 runtime、框架或第三方库提供，domain identity 由类型本身表示：
 
 ```jiang
-public struct UiDomain: SerialDomain {
+public struct UiDomain: Domain {
+    associated Kind = .serial;
 }
 
-public const ui = UiDomain();
+public struct WorkerPoolDomain: Domain {
+    associated Kind = .concurrent;
+}
 ```
 
 因此：
 
-- `current` 是语言内建特殊值，表示继承调用点当前 domain。
-- `ui`、`work`、`io` 等不是语言魔法；它们来自 import 后可见的 const value。
-- `async [domain_expr]` / `sync [domain_expr]` 中的 `domain_expr` 必须是编译期 const value，且实现
-  `SerialDomain`。
+- `current` 是语言内建特殊值，表示继承当前 async/sync domain context。
+- `UiDomain`、`WorkerPoolDomain` 等不是语言魔法；它们来自 import 后可见的类型。
+- `async [domain_type]` / `sync [domain_type]` 中的 `domain_type` 必须是实现
+  `Domain` 的类型；编译器通过 `Domain.Kind` 读取 serial/concurrent 语义。
 
-`ui`、`work`、`io` 的调度策略不属于 `std` 的固定职责。`std` 最多提供 `Domain`、`SerialDomain`、
-`Send`、`Sync` 或 executor 基础接口；具体事件循环、线程池、UI 主线程由库维护。
+`UiDomain`、`WorkerPoolDomain` 的调度策略不属于 `std` 的固定职责。`std` 最多提供
+`Domain`、`DomainKind`、`Send`、`Sync` 或 executor 基础接口；具体事件循环、线程池、
+UI 主线程由库维护。
+
+`Domain.Kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.Kind ==
+.concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T!&` 不能依赖它保证安全。在
+concurrent domain 中共享可变状态必须使用 `Mutex`、`Atomic`、`Channel` 或等价同步
+capability。
 
 ## 语法草案
 
-`async` / `sync` 沿用 Jiang keyword options 语法，可以带 domain：
+函数声明只使用 `async` 表示 suspend function。函数前不再使用 `sync` 关键字；普通函数就是
+同步函数。`async` 函数可以不带 domain，也可以在定义时指定 domain：
 
 ```jiang
-async [current] Int load_data();
+async Int load_data();
 
-async [ui] () render(Model!& model) {
+async [UiDomain] () render(Model!& model) {
     model.loading = true;
     load_data();
     model.loading = false;
 }
+
+() inc(Int!& value) {
+    value = value + 1;
+}
 ```
 
-不写 domain 时，默认继承 current domain：
+不带 domain 的 `async` 函数是 domain-neutral suspend function。它本身不选择 executor，只能
+在已有 current domain 的上下文中调用：
 
 ```jiang
-async Int load_data(); // 等价于 async [current]
-() inc(Int!& value);   // 等价于 sync [current]
+sync [UiDomain] {
+    Int value = load_data(); // 隐式 await，在 UiDomain current domain 上运行
+}
 ```
 
-也可以使用第三方库提供的 const domain value：
+带 domain 的 `async [D]` 函数是 domain-bound suspend function。调用它表示进入 `D` 执行
+callee body，参数按跨入 `D` 的规则检查；返回后 caller continuation 回到原 current domain。
+因此这类函数可以避免整个 body 再包一层 `sync [D] {}`。
+
+`async` / `sync` block 可以带 domain。最外层进入异步运行时必须显式写 domain：
 
 ```jiang
 import app_runtime;
 
-async [app_runtime.ui] () render(Model!& model) {
+sync [app_runtime.UiDomain] {
+    load_data();
 }
 ```
 
 如果一个 keyword 后续还有多个 option，可以用带 key 的形式：
 
 ```jiang
-async [domain: app_runtime.ui] () render(Model!& model) {
+async [domain: app_runtime.UiDomain] {
+    load_data();
 }
 ```
 
-`async` block 还可以带运行时 context：
+只有外层已有 current domain 时，内层 `async {}` / `sync {}` 才能省略 domain，并继承 current：
 
 ```jiang
-async [page, page_ctx] {
+sync [UiDomain] {
+    _ a = async { load_data() }; // 继承 UiDomain
+    _ b = async { load_data() }; // 继承 UiDomain
+    await (a + b)
+}
+```
+
+普通函数中直接写无 domain 的 `sync {}`、`async {}`、`await` 或 `foo$().async()` 应诊断，
+因为普通函数没有 current domain。
+
+`async` / `sync` block 后续可以带运行时 context：
+
+```jiang
+async [PageDomain, page_ctx] {
     load(model$.ref());
 }
 
-async [domain: page, context: page_ctx] {
+async [domain: PageDomain, context: page_ctx] {
     load(model$.ref());
 }
 ```
 
-这里 `page` 是编译期可见的静态 domain tag，用于 data race 检查；`page_ctx` 是运行时
+这里 `PageDomain` 是编译期可见的静态 domain type，用于 data race 检查；`page_ctx` 是运行时
 async context，用于调度、取消、join、页面生命周期或 tracing 等 runtime 语义。`context`
 不参与 domain 静态相等判断，也不能替代 domain。
 
@@ -117,16 +158,22 @@ async context，用于调度、取消、join、页面生命周期或 tracing 等
 
 ```jiang
 Fn<async Int>
-Fn<async [ui] (), Model!&>
-RawFn<unsafe async [ui] (), UInt8*>
+Fn<async [UiDomain] Int, Model!&>
+RawFn<unsafe async [UiDomain] Result<Int, Error>, UInt8*>
 ```
 
-`async [ui]` 是 `async [domain: ui]` 的短写。`async [ui, ctx]` 是
-`async [domain: ui, context: ctx]` 的短写。`ui` 本质上仍是 const domain value，不是语言魔法。
+在 callable type 中，`async [D]` 修饰 callable signature，不修饰返回值类型本身，也不表示
+异步地产生一个 `Fn` 值。`Fn<async [D] R, Args...>` 表示调用该 callable 时进入 `D` 并最终
+得到 `R`。
+
+`async [UiDomain]` / `sync [UiDomain]` 是 effect keyword option 中
+`async [domain: UiDomain]` / `sync [domain: UiDomain]` 的短写。`async [UiDomain, ctx]`
+是 `async [domain: UiDomain, context: ctx]` 的短写。函数声明和 callable type 只使用静态
+domain type；带 `context` 的形式只用于 block。`UiDomain` 本质上仍是 domain type，不是语言魔法。
 
 ## 默认 Domain
 
-普通函数默认是 `sync [current]`：
+普通函数没有默认 domain，也不是隐式 `sync [current]`：
 
 ```jiang
 () inc(Int!& value) {
@@ -134,27 +181,27 @@ RawFn<unsafe async [ui] (), UInt8*>
 }
 ```
 
-语义上可以理解为：
-
-```text
-for serial domain D:
-sync [D] () inc(Int!& @D value)
-```
-
-但用户不需要写 `D`。因此同一个函数可以在不同 domain 下调用：
+它可以被任意调用者同步调用，执行在调用者当前控制流中。普通函数不能直接建立或等待
+Future。如果普通函数要进入异步运行时，必须显式写外层 domain：
 
 ```jiang
-async [ui] () update_ui(Int!& value) {
-    inc(value); // inc 在 ui domain 下运行
-}
-
-async [worker] () update_worker(Int!& value) {
-    inc(value); // inc 在 worker domain 下运行
+Int main() {
+    sync [UiDomain] {
+        load_data()
+    }
 }
 ```
 
-`async` 默认是 `async [current]`。它表示 coroutine frame 继承调用点 domain；如果 frame 中有
-`T!& @D` 跨挂起点存在，那么每次 resume 都必须回到 `D`。
+在已有 current domain 的 async/sync block 或 async 调用链中，普通函数调用不切 domain，
+只是当前 coroutine 内的同步片段。普通函数没有 hidden domain/context 参数。
+
+domain-neutral `async` 函数不绑定 domain；调用点必须已经有 current domain，coroutine frame
+也在该 current domain 下执行和恢复。实现上 async frame 可以携带隐藏的 coroutine
+context/domain handle，但这个上下文不进入普通参数列表。
+
+domain-bound `async [D]` 函数在签名 metadata 中保存 domain type，调用点按进入 `D` 的规则
+检查参数和返回 continuation。它不是普通 `async` 函数的默认形态，而是给“整个函数必须在
+某个 domain 执行”的 API 使用。
 
 ## `T!&` 的 Domain 语义
 
@@ -190,66 +237,67 @@ Jiang 不需要显式 `await`。调用 async 函数就是挂起点：
 ```jiang
 async Int fetch();
 
-async [ui] () refresh(Model!& model) {
+async () refresh(Model!& model) {
     model.loading = true;
-    Int value = fetch(); // 可能挂起，默认保持 ui domain
+    Int value = fetch(); // 可能挂起，默认保持 UiDomain
     model.value = value;
 }
 ```
 
-如果 callee 没有显式 domain，它继承 caller 的 current domain。显式 domain 的 callee 在自己的
-domain 下运行，但调用返回后 caller continuation 仍回到 caller domain：
+`refresh` 本身不选择 domain。调用者需要在某个 current domain 中运行它：
 
 ```jiang
-async [worker] Int compute();
-
-async [ui] () refresh(Model!& model) {
-    Int value = compute(); // compute 在 worker domain 下运行
-    model.value = value;   // 返回后仍在 ui domain 下
+sync [UiDomain] {
+    refresh(model$.ref())
 }
 ```
 
-但是不能把 `ui` domain 下的普通 mutable ref 传给 `worker` domain 函数：
+如果需要在其他 domain 启动工作，应使用显式 domain block。普通 mutable ref 不能跨到其他
+domain：
 
 ```jiang
-async [worker] () compute_in_place(Model!& model);
-
-async [ui] () refresh(Model!& model) {
-    compute_in_place(model); // error: Model!& 属于 ui domain，不能传给 worker domain
+sync [UiDomain] {
+    async [WorkerPoolDomain] {
+        update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain
+    }
 }
 ```
 
 ## Resume 与运行时开销
 
-`async [D]` 的 domain 约束作用于整个 coroutine frame，不只作用于第一个挂起点之前：
+async coroutine frame 在创建它的 current domain 上执行和恢复：
 
 ```jiang
-async [current] () foo(T!& x) {
+async () foo(T!& x) {
     x = ...
     bar(); // 默认 await
-    x = ... // 这里仍必须在同一个 current domain 恢复
+    x = ... // 仍在同一个 current domain 恢复
 }
 ```
 
 实现上：
 
 - 同 domain await：不需要 domain hop，只是普通 coroutine resume。
-- 跨 domain 完成后恢复：需要 post/enqueue 回原 domain。
-- 如果 async frame 没有持有 domain-bound `T!&` 跨 await，后续可以允许更自由的 resume / Send future。
+- `await` 只能在 current domain 中进行；await 表达式内使用到的 Future 必须属于 current domain。
+- 跨 domain Future 不能直接 await；后续如果需要跨 domain bridge/post，应设计显式操作。
 
-因此 domain 机制不是必然比 Rust 更重。只有在 Jiang 为了保持 domain 约束而实际跨
-domain 恢复时，
-才比 Rust 多一次 hop/post。静态 capability 检查本身应当是零运行时开销。
+静态 capability 检查本身应当是零运行时开销。运行时开销来自实际的 enqueue、suspend/resume
+和 Future join。
 
 ## Domain 切换规则
 
 数据竞争检查主要发生在 domain 切换点。初步规则：
 
-- 普通函数调用不切 domain，callee 继承 caller 的 current domain。
-- 无显式 domain 的 async 调用不切 domain，callee 继承 caller 的 current domain。
-- `async [D]` callee 在 `D` 下运行，参数必须能安全进入 `D`。
-- `async [D] {}` 创建 future，是严格 domain 切换边界。
-- `async [D] {}` 是显式进入 `D` 的 block；进入 block 时不能携带原 domain 的普通 `T!&`。
+- 普通函数调用不切 domain，callee 只是 caller 当前控制流里的同步片段。
+- domain-neutral async 函数调用不切 domain；callee 在 caller 的 current domain 中挂起/恢复。
+- domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
+  current domain。
+- `async {}` / `sync {}` 只有外层已有 current domain 时可省略 domain，并继承 current。
+- `async [D] {}` 创建 future，是显式 domain 入口；如果 domain type `D` 不等于 current，
+  则是 domain 切换边界。
+- `sync [D] {}` 从普通同步世界阻塞进入 domain type `D`，也可以在已有 current domain 中
+  显式切到 `D`。
+- `await` 不切 domain；它只能等待 current domain 的 Future，并在同一个 current domain 恢复。
 
 跨 domain 时的能力检查：
 
@@ -260,15 +308,18 @@ domain 恢复时，
 - `T*` / `T[*]`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
 
+`sync [D] {}` 即使会阻塞等待，也不能把外层其他 domain 的普通 `T!&` 带入 `D`。阻塞只保证
+caller 等待 block 结束，不给普通引用增加跨 domain 同步语义。
+
 ## Future 与结构化并发
 
 普通 async 调用表示 suspend call，不创建 future，也不返回 future。调用点挂起当前 coroutine，
 callee 完成后继续执行：
 
 ```jiang
-async [page] Int load_page();
+async Int load_page();
 
-async [page] Int render() {
+async Int render() {
     Int value = load_page(); // 隐式 await，返回 Int
     value + 1
 }
@@ -284,13 +335,14 @@ await (a + b)
 ```
 
 `foo$().async()` 表示以 async call mode 启动 `foo`，阻止普通 `foo()` 调用的隐式 await，
-返回 body-local `Future<T>`。`$` 本身不产生值，只进入 Intrinsic Operation；`.async()` 是
-具体操作名。
+返回 body-local `Future<T>`。该操作只能在已有 current domain 的上下文中使用，Future 归属
+current domain。`$` 本身不产生值，只进入 Intrinsic Operation；`.async()` 是具体操作名。
 
 `await expr` 在 current domain 上等待 `expr` 中引用到的 Future slot，并在 `expr` 内把这些
 slot 投影为结果类型。`await` 不接受 domain 参数；async context 中是 suspend join，sync
-context 中是 blocking join。`await` 只处理包含 Future 的表达式，`await (1 + 2)` 或对已是
-具体类型的表达式 await 应诊断。
+context 中是 blocking join。`await` 只能处理 current domain 的 Future；不同 domain 的 Future
+应诊断。`await` 只处理包含 Future 的表达式，`await (1 + 2)` 或对已是具体类型的表达式 await
+应诊断。
 
 `await` 对多个 Future 是统一 barrier，不按表达式求值顺序逐个等待：
 
@@ -301,11 +353,11 @@ _ b = load_b$().async()
 await (a + b) // 先等待 a 和 b 都完成，再用 Int + Int 求值
 ```
 
-`async [D] {}` 仍可创建一个显式 block future，用于需要自定义 future body 或显式 domain
-边界的场景：
+`async {}` / `async [D] {}` 可创建一个显式 block future，用于需要自定义 future body 或显式
+domain 边界的场景：
 
 ```jiang
-let future = async [page] {
+let future = async {
     load_page()
 }
 ```
@@ -318,13 +370,13 @@ Jiang 的 future 语义是 eager、single-completion、cached result：
 - coroutine 是无栈协程；future 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
 - 如果 body 返回 `Result<T, E>`，future 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
   exception channel。
-- future result type 不能是 future；`async [D] { ... }` 不允许产生 nested future。实现上可以用
-  `@where` 风格的内部 type predicate 禁止 `Future<Future<T>>`。
+- future result type 不能是 future；`async { ... }` / `async [D] { ... }` 不允许产生
+  nested future。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Future<Future<T>>`。
 
 因此这里是合法的：
 
 ```jiang
-let future = async [page] {
+let future = async [PageDomain] {
     load_page() // body type: Int
 }
 ```
@@ -332,22 +384,23 @@ let future = async [page] {
 但这里应诊断：
 
 ```jiang
-let nested = async [page] {
-    async [page] {
+let nested = async [PageDomain] {
+    async [PageDomain] {
         load_page()
     }
 }
 ```
 
-Future 只能在 body 内作为局部不透明值使用。用户可以在局部变量上写 `Future<T>`，但不能
-显式写 domain 参数。编译器会根据 initializer 把它补全成内部 `Future<T, const D>`：
+Future 只能在 async/sync body 内作为局部不透明值使用。用户可以在局部变量上写
+`Future<T>`，但不能显式写 domain 参数。编译器会根据 initializer 把它补全成内部
+`Future<T, domain D>`：
 
 ```jiang
-Future<Int> future = load_page$().async() // internal type: Future<Int, page>
+Future<Int> future = load_page$().async() // internal type: Future<Int, PageDomain>
 ```
 
-如果局部变量没有 initializer，`Future<T>` 的 domain 默认是调用点 `current`。`Future<T, page>`
-这类显式 domain 参数暂不开放。
+如果局部变量没有 initializer，`Future<T>` 的 domain 默认是调用点 `current`。
+`Future<T, PageDomain>` 这类显式 domain 参数暂不开放。
 
 Future 不能出现在函数返回值、参数类型、字段类型或 public ABI：
 
@@ -361,9 +414,9 @@ lowering 和 runtime ABI；用户可见的 `Future<T>` 只是 body-local 标注�
 普通 `T!&` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
 
 ```jiang
-async [ui] () render(Model!& model) {
-    async [worker] {
-        update_worker(model) // error: model 属于 ui domain，不能进入 worker future
+sync [UiDomain] {
+    async [WorkerPoolDomain] {
+        update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain future
     }
 }
 ```
@@ -372,8 +425,10 @@ async [ui] () render(Model!& model) {
 不能捕获栈上 borrow。
 结构化并发可以允许有限的同 domain capture，但必须证明所有 future 在 scope 结束前完成。
 
-函数先不支持 future creation Intrinsic Operation。也就是说不提供 `foo$().task()`、
-`foo$().future()` 或类似形式；0.4.6 先以 block-form `async [D] {}` 为并发启动入口。
+跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
+`Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
+
+函数 future creation 使用 `foo$().async()`；不提供 `foo$().task()`、`foo$().future()` 或类似形式。
 
 ## Actor 与 Isolate
 
@@ -385,7 +440,8 @@ async [ui] () render(Model!& model) {
 - actor 内部方法在该 actor 的 serial domain 上串行执行。
 
 初版不建议把 actor 纳入核心 domain 语法，因为每个 actor instance 的 domain 往往是运行时值，
-而当前 `async [D]` 草案要求 `D` 是编译期 const value。可以先用库层 `Actor<T>` 封装状态；
+而当前 `async [D]` / `sync [D]` block 草案要求 `D` 是编译期 domain type。可以先用库层
+`Actor<T>` 封装状态；
 未来如果需要语言级 actor，再单独设计 `self domain` 或 instance domain。
 
 `isolate` 更适合表示隔离状态、独立 heap 或 actor-like container，不适合替代 `domain`。
@@ -423,7 +479,7 @@ Vector<Int!&> // error
 
 - `unsafe`：调用需要 unsafe context。
 - `async`：调用可能挂起。
-- `sync`：调用在某个 domain 同步执行。
+- `sync`：block 在某个 domain 同步执行；0.4.6 不保留函数前 `sync` 修饰符。
 - `io`、`atomic`、`alloc` 等未来可作为独立 effect 讨论。
 
 普通 mutable access 由 serial domain 和 domain 切换检查保证。这样 `Fn`、capture list 和函数参数
@@ -447,11 +503,11 @@ Jiang 的草案不同：
 
 ## 未决问题
 
-- `async [D]` 的 parser 表达和错误信息如何设计。
-- `D` 是否必须是 const value，还是未来允许 dependent / instance domain。
+- `async [D]` / `sync [D]` block 的 parser 表达和错误信息如何设计。
+- `D` 0.4.6 必须是 domain type；未来是否允许 dependent / instance domain。
 - `T&` 跨 domain 的 shareable 规则如何表达，是否需要公开 `Send` / `Sync` 等 trait 名称。
-- `Fn<async [D] ...>` 的 parser 表达和错误信息如何设计。
+- `Fn<async [D] ...>` 的 coroutine context ABI、闭包捕获和错误信息如何设计。
 - `T!&` 返回值的生命周期和 domain 如何在 HIR / type check 中表示。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
 - `unique` 和 optimizer noalias 的精确关系。
-- `async [D] {}`、`go async [D] {}`、结构化并发 scope 的最终语法。
+- `async [D] {}`、结构化并发 scope、detached future 的最终语法。

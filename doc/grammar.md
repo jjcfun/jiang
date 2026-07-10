@@ -219,8 +219,12 @@ generic_params
             <- "<" generic_param ("," generic_param)* ","? ">"
 
 generic_param
-            <- "const" type name
+            <- name ":" generic_param_bound
              / name
+
+generic_param_bound
+            <- type_bound
+             / "const" type
 
 where_constraints
             <- (where_constraint ("," where_constraint)* ","?)?
@@ -261,7 +265,10 @@ trait_bound_arg
 ```peg
 type        <- type_primary type_postfix*
 
-result_type <- type ("@" type)?
+result_type <- "unsafe"? async_effect? type ("@" type)?
+
+async_effect
+            <- "async" keyword_options?
 
 type_primary
             <- "_"
@@ -313,25 +320,29 @@ name        <- ident / "self"
   个元素，末尾元素保存 sentinel。
 - `Result<T, E>` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位。
   0.4.6 已移除旧的 `T@E` 返回类型语法。
-- `RawFn<unsafe T, ...>`、`RawFn<async T, ...>`、`RawFn<async [domain] T, ...>` 和
-  `RawFn<sync [domain] T, ...>`
+- `RawFn<unsafe T, ...>`、`RawFn<async T, ...>` 和 `RawFn<async [domain] T, ...>`
   表示带调用效果的函数指针类型。调用效果
-  前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型；
-  因此 `RawFn<async Bool>[]&` 表示“元素为异步函数指针的切片引用”。
-- `Fn<unsafe T, ...>`、`Fn<async T, ...>`、`Fn<async [domain] T, ...>` 和
-  `Fn<sync [domain] T, ...>`
+  前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型。
+  因此 `RawFn<async [UiDomain] Bool>[]&` 表示“元素为 UI domain 异步函数指针的切片引用”。
+- `Fn<unsafe T, ...>`、`Fn<async T, ...>` 和 `Fn<async [domain] T, ...>`
   表示带调用效果的闭包值类型。调用效果前缀写在
   `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层闭包值类型；因此
-  `Fn<async Bool>[]&` 表示“元素为异步闭包值的切片引用”。
+  `Fn<async [UiDomain] Bool>[]&` 表示“元素为 UI domain 异步闭包值的切片引用”。
 - `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment；`RawFn<Ret, Args...>` 表示裸函数
   指针，不带 environment，可用于 C ABI 函数指针边界。
-- `async [domain]` 是 `async [domain: domain]` 的短写；`async [domain, context]`
-  是 `async [domain: domain, context: context]` 的短写。`domain` 是编译期 domain tag；
-  `context` 是运行时 async context。
-- `sync [domain]` 是 `sync [domain: domain]` 的短写。`sync` 不带独立运行时 flag；
-  它只用于给同步调用效果显式指定 domain。
+- 函数声明只使用 `async` 表示 suspend function；函数前不保留 `sync` 修饰符。`async [domain]`
+  可用于函数声明，表示 domain-bound async function。
+- `async [domain]` / `sync [domain]` 是 block effect 中
+  `async [domain: domain]` / `sync [domain: domain]` 的短写；`async [domain, context]`
+  是 `async [domain: domain, context: context]` 的短写。`domain` 是实现 `Domain` 的编译期
+  domain type；编译器通过 `Domain.Kind` 区分 serial/concurrent 语义。`context` 是运行时
+  async context。
+- 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type；带 `context` 的形式
+  只用于 keyword block。
+- 无 domain 的 `async {}` / `sync {}` 只能在已有 current domain 的上下文中使用，并继承 current。
 - 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
-  `async [domain] { ... }`、`sync [domain] { ... }`、`unsafe async [domain] { ... }`。
+  `async [domain] { ... }`、`sync [domain] { ... }`、`async { ... }`、`sync { ... }`、
+  `unsafe async [domain] { ... }`。
   effect keyword 的规范顺序是 `unsafe` 在前，`async` / `sync` 在后。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]` 等内建后缀类型语法
@@ -375,7 +386,11 @@ deinit_decl <- "deinit" "(" "self" ")" block
 init_decl   <- "init" "?"? name? "(" param_list? ")" block
 
 assoc_type_impl
-            <- "associated" path "=" type ";"
+            <- "associated" path "=" associated_item_value ";"
+
+associated_item_value
+            <- type
+             / expr
 
 method_decl <- result_type name function_tail
 
@@ -434,7 +449,11 @@ trait_member
              / leading_annotation* member_modifier* trait_method_decl
 
 associated_type_decl
-            <- "associated" name (":" type_bound)? ";"
+            <- "associated" name (":" associated_item_bound)? ";"
+
+associated_item_bound
+            <- type_bound
+             / "const" type
 
 trait_method_decl
             <- result_type name function_tail
