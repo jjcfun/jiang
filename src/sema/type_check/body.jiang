@@ -321,13 +321,15 @@ public struct BodyCheck: Movable {
         if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
             qid.TypeId expected = self.success_result_type(self.type_ops.function_result_type(def_id));
             hir.HirId value_id = self.body_result_value(root);
-            self.type_ops.expect_value_assignable(
-                value_id,
-                expected,
-                body_type,
-                "function body type does not match return type",
-                "function_body_type_mismatch"
-            );
+            if (!self.type_ops.value_assignable_to_expected(expected, value_id, body_type)) {
+                if (!self.add_function_mismatch_error(value_id, expected, body_type)) {
+                    self.type_ops.add_node_error(
+                        value_id,
+                        "function body type does not match return type",
+                        "function_body_type_mismatch"
+                    );
+                }
+            }
             return;
         }
         if (hir_def.decl.kind == .global_decl) {
@@ -338,13 +340,15 @@ public struct BodyCheck: Movable {
             } else {
                 expected = self.type_ops.type_for_decl_def(def_id);
             }
-            self.type_ops.expect_value_assignable(
-                root,
-                expected,
-                body_type,
-                "global initializer type does not match declared type",
-                "global_initializer_type_mismatch"
-            );
+            if (!self.type_ops.value_assignable_to_expected(expected, root, body_type)) {
+                if (!self.add_function_mismatch_error(root, expected, body_type)) {
+                    self.type_ops.add_node_error(
+                        root,
+                        "global initializer type does not match declared type",
+                        "global_initializer_type_mismatch"
+                    );
+                }
+            }
         }
     }
 
@@ -1343,6 +1347,110 @@ public struct BodyCheck: Movable {
         return info.data is .function_type(_);
     }
 
+    Bool add_function_mismatch_error(self, hir.HirId node_id, qid.TypeId expected, qid.TypeId actual) {
+        if (self.add_function_kind_mismatch_error(node_id, expected, actual)) {
+            return true;
+        }
+        if (self.initial_function_value_type(node_id) is .some(value_type)) {
+            if (self.add_function_kind_mismatch_error(node_id, expected, value_type)) {
+                return true;
+            }
+        }
+        return self.add_self_method_to_fn_mismatch_error(node_id, expected);
+    }
+
+    Bool add_function_kind_mismatch_error(self, hir.HirId node_id, qid.TypeId expected, qid.TypeId actual) {
+        guard self.function_type_kind(expected) is .some(expected_kind) else { return false; }
+        guard self.function_type_kind(actual) is .some(actual_kind) else { return false; }
+        if (expected_kind == actual_kind) {
+            return false;
+        }
+        if (expected_kind == .raw && actual_kind == .closure) {
+            self.type_ops.add_node_error(
+                node_id,
+                "Fn value cannot be used as RawFn",
+                "fn_to_rawfn_not_supported"
+            );
+            return true;
+        }
+        if (expected_kind == .closure && actual_kind == .raw) {
+            self.type_ops.add_node_error(
+                node_id,
+                "RawFn value does not implicitly convert to Fn; use Fn(raw) or a lambda to bind a receiver",
+                "rawfn_to_fn_requires_constructor"
+            );
+            return true;
+        }
+        return false;
+    }
+
+    types.FunctionKind? function_type_kind(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (info.data is .function_type(function_type)) {
+            return function_type.kind;
+        }
+        guard info.data is .handle_type(handle) else { return null; }
+        if (handle.kind != .owner_pointer && handle.kind != .reference) {
+            return null;
+        }
+        types.TypeInfo element_info = self.state.store.types.get(handle.element);
+        guard element_info.data is .function_type(element_function) else { return null; }
+        return element_function.kind;
+    }
+
+    qid.TypeId? initial_function_value_type(self, hir.HirId node_id) {
+        guard self.initial_function_value_def(node_id) is .some(function_def) else { return null; }
+        qid.TypeId type_id = self.function_value_type(node_id, function_def);
+        if (self.function_type_kind(type_id) == null) {
+            return null;
+        }
+        return type_id;
+    }
+
+    qid.DefId? initial_function_value_def(self, hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(def_id) else { return null; }
+            if (!self.overloadable_call_kind(self.state.store.defs.get(def_id).kind)) {
+                return null;
+            }
+            return def_id;
+        }
+        if (node.data is .member_access(member_access)) {
+            return self.initial_function_member_def(member_access);
+        }
+        return null;
+    }
+
+    Bool add_self_method_to_fn_mismatch_error(self, hir.HirId node_id, qid.TypeId expected) {
+        guard self.function_type_kind(expected) is .some(expected_kind) else { return false; }
+        if (expected_kind != .closure) {
+            return false;
+        }
+        hir.HirNode node = self.state.hirs.node(node_id);
+        guard node.data is .member_access(member_access) else { return false; }
+        if (!self.is_self_local_ref(member_access.base)) {
+            return false;
+        }
+        qid.TypeId raw_base_type = self.raw_member_base_type(member_access.base);
+        if (self.self_member_access_resolves_to_value(raw_base_type, node_id.owner_def, member_access.member_symbol)) {
+            return false;
+        }
+        self.type_ops.add_node_error(
+            node_id,
+            "RawFn value does not implicitly convert to Fn; use Fn(raw) or a lambda to bind a receiver",
+            "rawfn_to_fn_requires_constructor"
+        );
+        return true;
+    }
+
+    Bool self_member_access_resolves_to_value(self, qid.TypeId raw_base_type, qid.DefId owner, qid.SymbolId symbol) {
+        guard self.value_member_for_base(raw_base_type, owner, symbol) is .some(member_def) else {
+            return false;
+        }
+        return self.state.store.defs.get(member_def).kind != .function_def;
+    }
+
     qid.DefId? expected_function_value_def(self, hir.HirId node_id, qid.TypeId expected_type) {
         hir.HirNode node = self.state.hirs.node(node_id);
         if (node.data is .name_ref(name_ref)) {
@@ -1981,11 +2089,13 @@ public struct BodyCheck: Movable {
     ) {
         if (assign_stmt.op == .assign) {
             if (!self.type_ops.value_assignable_to_expected(target_type, assign_stmt.value, value_type)) {
-                self.type_ops.add_node_error(
-                    node_id,
-                    "assigned value type does not match target type",
-                    "assignment_type_mismatch"
-                );
+                if (!self.add_function_mismatch_error(assign_stmt.value, target_type, value_type)) {
+                    self.type_ops.add_node_error(
+                        node_id,
+                        "assigned value type does not match target type",
+                        "assignment_type_mismatch"
+                    );
+                }
             }
             return;
         }
@@ -3500,13 +3610,15 @@ public struct BodyCheck: Movable {
                     local_type = self.type_ops.check_value_type_ref(type_ref);
                     value_type = self.check_node_expected(initializer, local_type);
                 }
-                self.type_ops.expect_value_assignable(
-                    initializer,
-                    local_type,
-                    value_type,
-                    "initializer type does not match local type",
-                    "initializer_type_mismatch"
-                );
+                if (!self.type_ops.value_assignable_to_expected(local_type, initializer, value_type)) {
+                    if (!self.add_function_mismatch_error(initializer, local_type, value_type)) {
+                        self.type_ops.add_node_error(
+                            initializer,
+                            "initializer type does not match local type",
+                            "initializer_type_mismatch"
+                        );
+                    }
+                }
             } else {
                 local_type = self.type_ops.check_value_type_ref(type_ref);
             }
@@ -3684,11 +3796,14 @@ public struct BodyCheck: Movable {
             hir.HirId arg_value = arg_values.values[index];
             qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
             if (!self.type_ops.value_assignable_to_expected(expected, arg_value, arg_type)) {
-                self.type_ops.add_node_error(
-                    arg_value,
-                    "call argument type does not match parameter type",
-                    "call_arg_type_mismatch"
-                );
+                if (!self.add_self_method_to_fn_mismatch_error(arg_value, expected)
+                    && !self.add_function_mismatch_error(arg_value, expected, arg_type)) {
+                    self.type_ops.add_node_error(
+                        arg_value,
+                        "call argument type does not match parameter type",
+                        "call_arg_type_mismatch"
+                    );
+                }
             }
             self.check_domain_call_arg(function_type.effects, expected, arg_value);
             index = index + 1;
@@ -4433,11 +4548,14 @@ public struct BodyCheck: Movable {
             hir.HirId arg_value = arg_values.values[index];
             qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
             if (!self.type_ops.value_assignable_to_expected(expected, arg_value, arg_type)) {
-                self.type_ops.add_node_error(
-                    arg_value,
-                    "call argument type does not match parameter type",
-                    "call_arg_type_mismatch"
-                );
+                if (!self.add_self_method_to_fn_mismatch_error(arg_value, expected)
+                    && !self.add_function_mismatch_error(arg_value, expected, arg_type)) {
+                    self.type_ops.add_node_error(
+                        arg_value,
+                        "call argument type does not match parameter type",
+                        "call_arg_type_mismatch"
+                    );
+                }
             }
             self.check_domain_call_arg(function_type.effects, expected, arg_value);
             index = index + 1;
