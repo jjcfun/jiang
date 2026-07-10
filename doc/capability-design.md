@@ -339,16 +339,24 @@ let nested = async [page] {
 }
 ```
 
-Future 只能在 body 内作为局部不透明值使用。用户不能主动写 `Future` 类型，也不能把 future
-作为函数返回值、参数类型、字段类型或 public ABI 暴露：
+Future 只能在 body 内作为局部不透明值使用。用户可以在局部变量上写 `Future<T>`，但不能
+显式写 domain 参数。编译器会根据 initializer 把它补全成内部 `Future<T, const D>`：
 
 ```jiang
-Future<Int, page> make_future(); // error: Future 不能出现在签名中
+Future<Int> future = load_page$().async() // internal type: Future<Int, page>
 ```
 
-编译器内部可以用 future kind 保存 result type 和 domain；如果写 `async { ... }`，domain
-默认是调用点 `current`。这个 kind 只服务 type check、borrow check、lowering 和 runtime ABI，
-不进入用户可命名类型空间。
+如果局部变量没有 initializer，`Future<T>` 的 domain 默认是调用点 `current`。`Future<T, page>`
+这类显式 domain 参数暂不开放。
+
+Future 不能出现在函数返回值、参数类型、字段类型或 public ABI：
+
+```jiang
+Future<Int> make_future(); // error: Future 不能出现在签名中
+```
+
+编译器内部用 future kind 保存 result type 和 domain。这个 kind 服务 type check、borrow check、
+lowering 和 runtime ABI；用户可见的 `Future<T>` 只是 body-local 标注表面。
 
 普通 `T!&` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
 
