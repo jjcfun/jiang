@@ -9,7 +9,7 @@
 - [语法参考](grammar.md)：接近 parser 的语法规则，适合核对具体写法。
 - [标准库孵化文档](std.md)：当前 `std` 暴露的模块、类型和稳定性边界。
 - [语言设计草案](language-design.md)：语言规则、设计理由和仍在收敛的边界。
-- [闭包设计草案](closure-design.md)：捕获闭包、callable 类型和后续 async/data-race 关系。
+- [闭包设计与实现状态](closure-design.md)：捕获闭包、callable 类型和后续 async/data-race 关系。
 - [Capability 设计草案](capability-design.md)：capability、effect、协程、异步和基于
   serial token 的数据竞争防护方案。
 
@@ -25,13 +25,14 @@
 
 ## 当前分支
 
-当前 `release/0.4.5` 分支默认使用 0.4.5 bootstrap 编译器继续开发：
+当前 `release/0.4.6` 分支默认使用 0.4.5 release 编译器继续开发：
 
 ```text
-../bootstrap-0.4.5/build/bin/jiangc.next -> build/bin/jiangc.next
+/Users/jjc/.jiang/versions/0.4.5/bin/jiangc -> build/bin/jiangc.next
 ```
 
-0.4.5 继承 0.4.4 已发布能力，包括 keyword options、显式 `self` 参数、`RawFn`/`Fn`
-拆分、unsafe effect context、标准库容器所有权修复和部分闭包实现。当前分支重点是
-闭包收尾、async/coroutine 设计和基于 serial token 的数据竞争防护方案。
+0.4.6 继承 0.4.5 已发布能力，包括 keyword block、显式 `self` 参数、`RawFn` / `Fn`
+拆分、`Fn^` heap closure、`Fn(raw)` 显式包装、`Fn^$.ref()` callable borrow view 和
+slow smoke 覆盖。当前分支重点是移除旧兼容语法、闭包收尾、async/coroutine 设计冻结和
+domain/effect 检查收口。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

@@ -1,4 +1,4 @@
-# 闭包设计草案
+# 闭包设计与实现状态
 
 本文描述 Jiang 闭包和函数指针的设计方向。核心区分是：
 
@@ -9,6 +9,17 @@
 闭包表达式必须出现在有明确 expected callable type 的位置，不能像普通局部变量一样从闭包
 表达式本身推导出公开匿名类型。这个规则接近 Swift 的 closure 使用方式：调用者先给出
 函数类型，闭包体再按这个 expected type 检查。
+
+## 0.4.5 发布状态
+
+0.4.5 已经落地基础闭包闭环：`RawFn` / `Fn` 分离、lambda expected type 下推、捕获分析、
+`Fn` / `Fn^` lowering、heap env、`Fn(raw)` 显式包装、`Fn^$.ref()` callable borrow view，
+以及对应 borrow / drop 检查。0.4.6 不重做这些主功能，只继续收口诊断、文档和 async/domain
+边界。
+
+已验证的行为见本文末尾测试清单。测试清单中的 `[x]` 表示 0.4.5 发布时或 0.4.6 收口阶段
+已经有语言测试或 smoke 覆盖；未在清单中标成 `[x]` 的 async closure、`FnOnce`、完整
+`Send` / `Sync` 等能力仍属于后续设计。
 
 ## 目标
 
@@ -451,6 +462,8 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 因此闭包设计应避免把“捕获即可跨线程/跨 task”作为默认承诺。
 
 ## 测试清单
+
+下面清单同步到 0.4.5 发布后的实现状态，并包含 0.4.6 已补的 Fn/RawFn 混用诊断。
 
 - [x] 非捕获 lambda 可赋给显式 `RawFn<...>`。
 - [x] 非捕获 lambda 可赋给显式 `Fn<...>`。

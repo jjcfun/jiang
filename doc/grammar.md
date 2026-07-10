@@ -642,9 +642,8 @@ call_arg    <- (name ":")? expr
 参数列表只写绑定名。
 `lambda_capture_list` 是可选的 environment 字段初始化列表，每一项形如 `field = expr` 或
 `Type field = expr`。这些 initializer 在闭包创建时求值；未列入列表的外层 local 仍可按
-默认捕获规则处理：小的 `Copy` 值可按值捕获，非平凡只读 local 按共享引用捕获，写入外层
-`!` storage 时按可变引用捕获。`RawFn<...>` expected type 下不允许任何捕获，也不允许
-capture list。
+默认捕获规则处理：只读 local 按共享引用捕获，写入外层 `!` storage 时按可变引用捕获。
+`RawFn<...>` expected type 下不允许任何捕获，也不允许 capture list。
 
 ## primary expression
 

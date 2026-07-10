@@ -3,9 +3,9 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.4` 分支继承 0.4.3 已实现的自举编译器、core 源码化入口、
+当前 `release/0.4.6` 分支继承 0.4.5 已发布的自举编译器、core 源码化入口、
 标准库孵化入口、泛型/trait 基础、Lang Package 自定义语法、MIR/backend、inline asm、
-WASI 输出和源码级语言测试。
+WASI 输出、闭包基础闭环和源码级语言测试。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
@@ -805,6 +805,72 @@ T add<T>(T left, T right);
 
 `init` / `deinit` 是目标语言的一部分。`init(self, ...)` 定义构造函数，
 `deinit(self)` 定义析构逻辑；构造 sugar 使用 `Type(...)`，堆分配构造使用 `new Type(...)`。
+
+## 函数指针和闭包
+
+当前已定义：Jiang 区分裸函数指针和闭包值。
+
+- `RawFn<Ret, Args...>` 是裸函数指针。它只保存函数入口，不携带捕获环境，不需要 drop，
+  可用于 C ABI 函数指针边界。
+- `Fn<Ret, Args...>` 是 erased callable view。它可以表示捕获 lambda，运行时模型是
+  `{ receiver, vtable }`；`receiver` 指向编译器合成的 closure object，`vtable` 提供
+  call/drop 槽。
+- `Fn<Ret, Args...>^` 是 owned heap closure。`new () [captures] => body` 会直接构造
+  heap closure object；移动 `Fn^` 只移动 owner handle，drop 时通过 closure vtable
+  销毁 environment。
+
+`RawFn` 适合顶层函数、类型函数、未绑定实例方法和非捕获 lambda：
+
+```jiang
+Int inc(Int value) {
+    value + 1
+}
+
+RawFn<Int, Int> raw = inc;
+RawFn<Int, Int> also_raw = (value) => value + 1;
+```
+
+`Fn` 可以捕获外层 local。lambda 必须出现在有 expected callable type 的位置，参数类型由
+expected type 下推：
+
+```jiang
+Int base = 10;
+Fn<Int, Int> add_base = (value) => value + base;
+```
+
+`RawFn` 不允许捕获。`RawFn` 可以通过 `Fn(raw)` 显式包装成同签名 `Fn`，但 `Fn` 不会隐式或
+显式退回 `RawFn`：
+
+```jiang
+Fn<Int, Int> callable = Fn(raw);
+RawFn<Int, Int> bad = callable; // fail
+```
+
+方法值不会自动绑定 receiver。`self.method` 或 `Type.method` 作为值时得到的是带显式
+receiver 参数的 `RawFn`；如果调用点需要不带 receiver 的 `Fn`，必须写 lambda 显式捕获并调用：
+
+```jiang
+struct Meter {
+    Int value;
+
+    Int add(self, Int extra) {
+        self.value + extra
+    }
+
+    Int call(self, Fn<Int, Int> callback) {
+        callback(1)
+    }
+
+    Int ok(self) {
+        self.call((extra) => self.add(extra))
+    }
+}
+```
+
+`Fn` 和 trait object 都是 erased value：调用者不直接知道具体实现类型，而是通过运行时表间接
+调用。区别是：trait object 的 vtable 来自 trait requirement，receiver 指向满足 trait 的具体
+值；closure object 的 vtable 来自某个 lambda/callable 签名，receiver 指向该闭包的 environment。
+trait object 表达“某个类型实现了某个 trait”，closure object 表达“某段代码加上它捕获的环境”。
 
 ## Struct、Enum、Union
 
