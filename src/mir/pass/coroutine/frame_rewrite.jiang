@@ -33,6 +33,10 @@ public struct ResumeFunctionLowering {
     public mir.MirLocalId resume_return_local_id;
 }
 
+public struct CompletionFunctionLowering {
+    public mir.MirFunction function;
+}
+
 public FrameRewritePlan build_plan(
     mir.MirBody body,
     mir.MirCoroutineFrameLayout& layout
@@ -87,6 +91,116 @@ public ResumeFunctionLowering add_resume_function(
     ResumeFunctionLowering lowered = lower_resume_function(output, source, layout, resume_function_id);
     output.add_generated_function(lowered.function);
     return lowered;
+}
+
+public CompletionFunctionLowering add_completion_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    mir.MirFunctionId function_id = mir.MirFunctionId.from_index(output.functions.len());
+    CompletionFunctionLowering lowered = CompletionFunctionLowering (
+        function: completion_function(output, source, layout, function_id)
+    );
+    output.add_generated_function(lowered.function);
+    return lowered;
+}
+
+mir.MirFunction completion_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId function_id
+) {
+    return mir.MirFunction (
+        id: function_id,
+        def_id: source.def_id,
+        type_args: output.type_arg_array(source.type_args),
+        const_args: output.const_arg_array(source.const_args),
+        signature_id: null,
+        effects: types.EffectSet(),
+        is_coroutine: false,
+        coroutine_frame: null,
+        is_coroutine_resume: false,
+        is_coroutine_completion: true,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: true,
+        naked: false,
+        span: source.span,
+        body: completion_body(output, layout, function_id, source.span)
+    );
+}
+
+mir.MirBody completion_body(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId function_id,
+    token.Span span
+) {
+    mir.MirLocalId return_local = mir.MirLocalId.from_index(0);
+    mir.MirLocalId context_local = mir.MirLocalId.from_index(1);
+    mir.MirLocalDecl![*] locals = output.alloc_local_array(2);
+    locals[0] = generated_local(
+        return_local,
+        mir.MirLocalKind.return_place,
+        layout.future_abi.resume_return_type_id,
+        span
+    );
+    locals[1] = generated_local(
+        context_local,
+        mir.MirLocalKind.param,
+        layout.fields[layout.continuation_context_field_index].type_id,
+        span
+    );
+    mir.MirPlace completed_place = deref_frame_pointer_place(output, context_local);
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(1);
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: completed_place,
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.const_operand_value(state_const(layout, span, 1))
+            ))
+        ))
+    ));
+    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(1);
+    blocks.add(mir.MirBlock (
+        id: mir.MirBlockId.from_index(0),
+        span: span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: mir.MirTerminator (
+            span: span,
+            kind: mir.return_terminator_kind(mir.MirReturnTerminator (implicit_unit: true))
+        )
+    ));
+    return mir.MirBody (
+        id: mir.MirBodyId.from_index(function_id.to_index()),
+        span: span,
+        locals: locals[0..2],
+        blocks: output.block_array(blocks$.ref()),
+        entry: mir.MirBlockId.from_index(0),
+        return_local: return_local
+    );
+}
+
+mir.MirLocalDecl generated_local(
+    mir.MirLocalId id,
+    mir.MirLocalKind kind,
+    qid.TypeId type_id,
+    token.Span span
+) {
+    return mir.MirLocalDecl (
+        id: id,
+        kind: kind,
+        type_id: type_id,
+        span: span,
+        name: null,
+        def_id: null,
+        mutable_local: true,
+        address_taken: false
+    );
 }
 
 public FrameRewriteResult rewrite_body_with_frame_local(
@@ -190,6 +304,7 @@ mir.MirFunction resume_function_for_body(
         is_coroutine: false,
         coroutine_frame: null,
         is_coroutine_resume: true,
+        is_coroutine_completion: false,
         is_language_entry: false,
         is_runtime_entry: false,
         is_external: false,
@@ -692,10 +807,57 @@ mir.MirBlock block_with_resume_return(
                 output,
                 continuation_result_write(output, layout, frame_place, result_place, block.terminator.span)
             ),
-            goto_terminator(block.terminator.span, resume_return_id)
+            continuation_call_terminator(
+                output,
+                body,
+                layout,
+                frame_place,
+                block.terminator.span,
+                resume_return_id
+            )
         );
     }
     return block;
+}
+
+mir.MirTerminator continuation_call_terminator(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    token.Span span,
+    mir.MirBlockId target
+) {
+    mir.MirPlace function_place = frame_field_place(
+        output,
+        layout,
+        frame_place,
+        layout.continuation_function_field_index
+    );
+    mir.MirPlace context_place = frame_field_place(
+        output,
+        layout,
+        frame_place,
+        layout.continuation_context_field_index
+    );
+    list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+    args.add(mir.copy_operand_value(mir.MirCopyOperand (place: context_place)));
+    return mir.MirTerminator (
+        span: span,
+        kind: mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.indirect_operand_callee(
+                mir.copy_operand_value(mir.MirCopyOperand (place: function_place))
+            ),
+            args: output.operand_array(args$.ref()),
+            current_effects: types.EffectSet(),
+            is_suspend_point: false,
+            destination: mir.local_place(body.return_local, output.empty_projection()),
+            target: target,
+            initialized_place: null,
+            unique_places: output.empty_places(),
+            cleanup: null
+        ))
+    );
 }
 
 mir.MirBlock block_with_terminator(mir.MirBlock block, mir.MirTerminator terminator) {
