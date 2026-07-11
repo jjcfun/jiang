@@ -1,0 +1,263 @@
+// Storage liveness across coroutine suspend points.
+
+import list = "../../../support/list.jiang";
+import mir = "../../mir.jiang";
+
+struct LiveState: Movable {
+    list.ArrayList<mir.MirLocalId>! locals;
+
+    public init(self) {
+        self.locals = list.ArrayList<mir.MirLocalId>();
+    }
+}
+
+public Bool![*] analyze(mir.MirBody body) {
+    Bool![*] result = unsafe {
+        Bool!$.alloc_many(body.locals.length)
+    };
+    init_bool_array(result, body.locals.length);
+    if (body.blocks.length == 0) { return result; }
+
+    LiveState![*] in_states = unsafe {
+        LiveState!$.alloc_many(body.blocks.length)
+    };
+    Bool![*] reachable = unsafe {
+        Bool!$.alloc_many(body.blocks.length)
+    };
+    Bool![*] queued = unsafe {
+        Bool!$.alloc_many(body.blocks.length)
+    };
+    init_analysis_arrays(in_states, reachable, queued, body.blocks.length);
+
+    list.ArrayList<Int>! worklist = list.ArrayList<Int>();
+    Int entry_index = body.entry.to_index();
+    if (!valid_block_index(body, entry_index)) { return result; }
+    init_entry_live_locals(body, in_states[entry_index]$.ref());
+    enqueue_block(entry_index, reachable, queued, worklist$.ref());
+
+    while (!worklist.empty()) {
+        Int block_index = worklist.pop();
+        queued[block_index] = false;
+        LiveState state = clone_state(in_states[block_index]$.ref());
+        transfer_block(body.blocks[block_index], state$.ref(), result);
+        propagate_successors(
+            body,
+            body.blocks[block_index],
+            state$.ref(),
+            in_states,
+            reachable,
+            queued,
+            worklist$.ref()
+        );
+    }
+    return result;
+}
+
+() init_bool_array(Bool![*] values, Int count) {
+    Int! index = 0;
+    while (index < count) {
+        values[index] = false;
+        index = index + 1;
+    }
+}
+
+() init_analysis_arrays(
+    LiveState![*] in_states,
+    Bool![*] reachable,
+    Bool![*] queued,
+    Int count
+) {
+    Int! index = 0;
+    while (index < count) {
+        in_states[index] = LiveState();
+        reachable[index] = false;
+        queued[index] = false;
+        index = index + 1;
+    }
+}
+
+() init_entry_live_locals(mir.MirBody body, LiveState& state) {
+    Int! index = 0;
+    while (index < body.locals.length) {
+        mir.MirLocalDecl local = body.locals[index];
+        if (local_is_live_at_entry(body, local)) {
+            add_live_local(state, local.id);
+        }
+        index = index + 1;
+    }
+}
+
+Bool local_is_live_at_entry(mir.MirBody body, mir.MirLocalDecl local) {
+    if (local.id.to_index() == body.return_local.to_index()) { return true; }
+    if (local.kind == .param) { return true; }
+    return !local_has_storage_marker(body, local.id);
+}
+
+Bool local_has_storage_marker(mir.MirBody body, mir.MirLocalId local_id) {
+    Int! block_index = 0;
+    while (block_index < body.blocks.length) {
+        if (block_has_storage_marker(body.blocks[block_index], local_id)) { return true; }
+        block_index = block_index + 1;
+    }
+    return false;
+}
+
+Bool block_has_storage_marker(mir.MirBlock block, mir.MirLocalId local_id) {
+    Int! stmt_index = 0;
+    while (stmt_index < block.statements.length) {
+        if (statement_is_storage_marker_for_local(block.statements[stmt_index], local_id)) { return true; }
+        stmt_index = stmt_index + 1;
+    }
+    return false;
+}
+
+Bool statement_is_storage_marker_for_local(mir.MirStatement statement, mir.MirLocalId local_id) {
+    if (statement.kind is .storage_live_stmt(storage_live)) {
+        return storage_live.local_id.to_index() == local_id.to_index();
+    }
+    if (statement.kind is .storage_dead_stmt(storage_dead)) {
+        return storage_dead.local_id.to_index() == local_id.to_index();
+    }
+    return false;
+}
+
+LiveState clone_state(LiveState& source) {
+    LiveState! clone = LiveState();
+    Int! index = 0;
+    while (index < source.locals.len()) {
+        clone.locals.add(source.locals.get(index));
+        index = index + 1;
+    }
+    return clone$.move();
+}
+
+() transfer_block(mir.MirBlock block, LiveState& state, Bool![*] live_across_suspend) {
+    Int! stmt_index = 0;
+    while (stmt_index < block.statements.length) {
+        transfer_statement(block.statements[stmt_index], state);
+        stmt_index = stmt_index + 1;
+    }
+    if (terminator_is_suspend_point(block.terminator)) {
+        mark_live_across_suspend(state, live_across_suspend);
+    }
+}
+
+() transfer_statement(mir.MirStatement statement, LiveState& state) {
+    if (statement.kind is .storage_live_stmt(storage_live)) {
+        add_live_local(state, storage_live.local_id);
+        return;
+    }
+    if (statement.kind is .storage_dead_stmt(storage_dead)) {
+        remove_live_local(state, storage_dead.local_id);
+    }
+}
+
+Bool terminator_is_suspend_point(mir.MirTerminator terminator) {
+    if (terminator.kind is .suspend_pending_term(_)) {
+        return true;
+    }
+    guard terminator.kind is .call_term(call_term) else { return false; }
+    return call_term.is_suspend_point;
+}
+
+() mark_live_across_suspend(LiveState& state, Bool![*] live_across_suspend) {
+    Int! index = 0;
+    while (index < state.locals.len()) {
+        live_across_suspend[state.locals.get(index).to_index()] = true;
+        index = index + 1;
+    }
+}
+
+() propagate_successors(
+    mir.MirBody body,
+    mir.MirBlock block,
+    LiveState& state,
+    LiveState![*] in_states,
+    Bool![*] reachable,
+    Bool![*] queued,
+    list.ArrayList<Int>& worklist
+) {
+    Int! successor_index = 0;
+    while (successor_index < mir.terminator_successor_count(block.terminator)) {
+        mir.MirBlockId successor = mir.terminator_successor_at(block.terminator, successor_index);
+        propagate_successor(body, successor, state, in_states, reachable, queued, worklist);
+        successor_index = successor_index + 1;
+    }
+}
+
+() propagate_successor(
+    mir.MirBody body,
+    mir.MirBlockId successor,
+    LiveState& state,
+    LiveState![*] in_states,
+    Bool![*] reachable,
+    Bool![*] queued,
+    list.ArrayList<Int>& worklist
+) {
+    Int successor_index = successor.to_index();
+    if (!valid_block_index(body, successor_index)) { return; }
+    Bool was_reachable = reachable[successor_index];
+    Bool changed = merge_state(in_states[successor_index]$.ref(), state);
+    if (was_reachable && !changed) { return; }
+    enqueue_block(successor_index, reachable, queued, worklist);
+}
+
+Bool merge_state(LiveState& target, LiveState& source) {
+    Bool! changed = false;
+    Int! index = 0;
+    while (index < source.locals.len()) {
+        changed = add_live_local(target, source.locals.get(index)) || changed;
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool add_live_local(LiveState& state, mir.MirLocalId local_id) {
+    if (has_live_local(state, local_id)) { return false; }
+    state.locals.add(local_id);
+    return true;
+}
+
+() remove_live_local(LiveState& state, mir.MirLocalId local_id) {
+    Int! index = 0;
+    while (index < state.locals.len()) {
+        if (state.locals.get(index).to_index() == local_id.to_index()) {
+            remove_live_local_at(state, index);
+            return;
+        }
+        index = index + 1;
+    }
+}
+
+() remove_live_local_at(LiveState& state, Int index) {
+    Int last_index = state.locals.len() - 1;
+    if (index != last_index) {
+        state.locals.set(index, state.locals.get(last_index));
+    }
+    state.locals.truncate(last_index);
+}
+
+Bool has_live_local(LiveState& state, mir.MirLocalId local_id) {
+    Int! index = 0;
+    while (index < state.locals.len()) {
+        if (state.locals.get(index).to_index() == local_id.to_index()) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool valid_block_index(mir.MirBody body, Int index) {
+    return index >= 0 && index < body.blocks.length;
+}
+
+() enqueue_block(
+    Int block_index,
+    Bool![*] reachable,
+    Bool![*] queued,
+    list.ArrayList<Int>& worklist
+) {
+    reachable[block_index] = true;
+    if (queued[block_index]) { return; }
+    queued[block_index] = true;
+    worklist.add(block_index);
+}

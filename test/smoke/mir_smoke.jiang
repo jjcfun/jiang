@@ -1,6 +1,8 @@
 import context = "../../src/context.jiang";
 import hir = "../../src/hir/hir.jiang";
 import mir = "../../src/mir/mir.jiang";
+import coroutine_future_abi = "../../src/mir/pass/coroutine/future_abi.jiang";
+import coroutine_frame_rewrite = "../../src/mir/pass/coroutine/frame_rewrite.jiang";
 import mir_lower = "../../src/mir/lower.jiang";
 import module_graph = "../../src/resolve/module_graph.jiang";
 import resolve = "../../src/resolve/module_resolver.jiang";
@@ -30,8 +32,62 @@ Int main() {
     check_return_emits_scope_cleanup();
     check_async_function_gets_coroutine_frame_layout();
     check_async_suspend_points_are_numbered();
+    check_async_intrinsic_initializes_future_fields();
+    check_await_projects_future_result_fields();
+    check_async_frame_keeps_only_live_across_suspend_locals();
+    check_coroutine_frame_rewrite_queries_local_mappings();
     check_lower_rejects_errored_hir_store();
     return 0;
+}
+
+() check_await_projects_future_result_fields() {
+    context.CompilerContext! ctx = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_hir(
+        ctx$.ref(),
+        "mir_lower_await_future_result",
+        "async Int load(Int value) { value } async Int entry() { Future<Int> left = load$(1).async(); Future<Int> right = load$(2).async(); await { left + right } }"
+    );
+
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    qid.DefId entry_def = find_named_function_def(ctx$.ref(), graph.root_module, "entry");
+    guard lowered.function_id_for_def(entry_def) is .some(entry_id) else {
+        assert(false);
+        return;
+    }
+    mir.MirFunction entry = lowered.function(entry_id);
+    guard entry.coroutine_frame is .some(frame) else {
+        assert(false);
+        return;
+    }
+    assert_function_has_indirect_poll_call(entry);
+    assert_function_has_suspend_pending(entry);
+    assert_function_uses_future_result_fields(entry, frame.future_abi.result_field_index);
+}
+
+() check_async_intrinsic_initializes_future_fields() {
+    context.CompilerContext! ctx = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_hir(
+        ctx$.ref(),
+        "mir_lower_async_intrinsic_future",
+        "async Int load(Int value) { value } async Int entry() { Future<Int> f = load$(7).async(); 0 }"
+    );
+
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    mir.MirFunction load = lowered.function(mir.MirFunctionId.from_index(0));
+    mir.MirFunction entry = lowered.function(mir.MirFunctionId.from_index(1));
+    guard load.coroutine_frame is .some(frame) else {
+        assert(false);
+        return;
+    }
+    assert_block_initializes_future_field(entry.body.blocks[0], mir.MirLocalId.from_index(1), frame.future_abi.state_field_index);
+    assert_block_initializes_future_field(entry.body.blocks[0], mir.MirLocalId.from_index(1), frame.future_abi.frame_field_index);
+    assert_block_initializes_frame_field(
+        entry.body.blocks[0],
+        mir.MirLocalId.from_index(2),
+        frame_field_for_local(frame, mir.MirLocalId.from_index(1))
+    );
 }
 
 () check_function_skeletons_follow_hir_ownership_tree() {
@@ -132,18 +188,22 @@ Int main() {
     assert(frame.state_field_index == 0);
     assert(frame.return_field_index == 1);
     assert(frame.context_field_index == 2);
-    assert(frame.fields.length == 5);
+    assert(frame.fields.length == 4);
     assert(frame.fields[0].kind == .state);
     assert(frame.fields[1].kind == .return_slot);
     assert(frame.fields[2].kind == .context);
     assert(frame.fields[3].kind == .param);
-    assert(frame.fields[4].kind == .local);
     assert(frame.suspend_points.length == 0);
     assert(frame.state_dispatch.entry_state_id == 0);
     assert(frame.state_dispatch.completed_state_id == 1);
     assert(frame.state_dispatch.resume_cases.length == 0);
     assert(frame.fields[3].local_id$.some().to_index() == 1);
-    assert(frame.fields[4].local_id$.some().to_index() == 2);
+    assert(!frame.fields[3].live_across_suspend);
+    assert(frame.local_mappings.length == 2);
+    assert(frame.local_mappings[0].local_id.to_index() == 0);
+    assert(frame.local_mappings[0].field_index == 1);
+    assert(frame.local_mappings[1].local_id.to_index() == 1);
+    assert(frame.local_mappings[1].field_index == 3);
 }
 
 () check_async_suspend_points_are_numbered() {
@@ -175,6 +235,699 @@ Int main() {
     assert(frame.state_dispatch.resume_cases.length == 1);
     assert(frame.state_dispatch.resume_cases[0].state_id == 1);
     assert(frame.state_dispatch.resume_cases[0].target.to_index() == 1);
+}
+
+() check_async_frame_keeps_only_live_across_suspend_locals() {
+    context.CompilerContext! ctx = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_hir(
+        ctx$.ref(),
+        "mir_lower_coroutine_live_across_suspend",
+        "async Int load() { 1 } async Int entry(Int s) { Int! live = s; { Int! dead = s; dead; } load() + live }"
+    );
+
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    qid.DefId entry_def = find_named_function_def(ctx$.ref(), graph.root_module, "entry");
+    guard lowered.function_id_for_def(entry_def) is .some(entry_id) else {
+        assert(false);
+        return;
+    }
+    mir.MirFunction function = lowered.function(entry_id);
+    guard function.coroutine_frame is .some(frame) else {
+        assert(false);
+        return;
+    }
+    assert(frame.fields.length == 5);
+    assert(frame.fields[3].kind == .param);
+    assert(frame.fields[4].kind == .local);
+    assert(frame.fields[3].local_id$.some().to_index() == 1);
+    assert(frame.fields[4].local_id$.some().to_index() == 2);
+    assert(frame.fields[4].live_across_suspend);
+    assert(frame.local_mappings.length == 3);
+    assert(frame.local_mappings[0].local_id.to_index() == 0);
+    assert(frame.local_mappings[0].field_index == 1);
+    assert(frame.local_mappings[1].local_id.to_index() == 1);
+    assert(frame.local_mappings[1].field_index == 3);
+    assert(frame.local_mappings[2].local_id.to_index() == 2);
+    assert(frame.local_mappings[2].field_index == 4);
+}
+
+() check_coroutine_frame_rewrite_queries_local_mappings() {
+    context.CompilerContext! ctx = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_hir(
+        ctx$.ref(),
+        "mir_lower_coroutine_frame_rewrite",
+        "async Int load() { 1 } async Int entry(Int s) { Int! live = s; { Int! dead = s; dead; } load() + live }"
+    );
+
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    qid.DefId entry_def = find_named_function_def(ctx$.ref(), graph.root_module, "entry");
+    guard lowered.function_id_for_def(entry_def) is .some(entry_id) else {
+        assert(false);
+        return;
+    }
+    mir.MirFunction function = lowered.function(entry_id);
+    guard function.coroutine_frame is .some(frame) else {
+        assert(false);
+        return;
+    }
+    assert_future_abi_layout(ctx$.ref(), frame$.ref());
+    assert(coroutine_frame_rewrite.field_index_for_local(frame$.ref(), mir.MirLocalId.from_index(0))$.some() == 1);
+    assert(coroutine_frame_rewrite.field_index_for_local(frame$.ref(), mir.MirLocalId.from_index(1))$.some() == 3);
+    assert(coroutine_frame_rewrite.field_index_for_local(frame$.ref(), mir.MirLocalId.from_index(2))$.some() == 4);
+    assert(coroutine_frame_rewrite.field_index_for_local(frame$.ref(), mir.MirLocalId.from_index(3)) == null);
+    assert(coroutine_frame_rewrite.local_is_frame_backed(frame$.ref(), mir.MirLocalId.from_index(2)));
+    assert(!coroutine_frame_rewrite.local_is_frame_backed(frame$.ref(), mir.MirLocalId.from_index(3)));
+    mir.MirPlace live_place = mir.local_place(mir.MirLocalId.from_index(2), lowered.empty_projection());
+    mir.MirPlace dead_place = mir.local_place(mir.MirLocalId.from_index(3), lowered.empty_projection());
+    assert(coroutine_frame_rewrite.field_index_for_place(frame$.ref(), live_place)$.some() == 4);
+    assert(coroutine_frame_rewrite.field_index_for_place(frame$.ref(), dead_place) == null);
+    assert(coroutine_frame_rewrite.place_is_frame_backed(frame$.ref(), live_place));
+    assert(!coroutine_frame_rewrite.place_is_frame_backed(frame$.ref(), dead_place));
+    mir.MirPlace frame_place = mir.local_place(mir.MirLocalId.from_index(8), lowered.empty_projection());
+    mir.MirPlace rewritten_live =
+        coroutine_frame_rewrite.rewrite_place_to_frame(lowered$.ref(), frame$.ref(), frame_place, live_place);
+    assert(rewritten_live.local_id.to_index() == 8);
+    assert(rewritten_live.projection.length == 1);
+    guard rewritten_live.projection[0] is .frame_field_projection(frame_field) else {
+        assert(false);
+        return;
+    }
+    assert(frame_field.field_index == 4);
+    assert(frame_field.field_type == frame.fields[4].type_id);
+    mir.MirPlace rewritten_dead =
+        coroutine_frame_rewrite.rewrite_place_to_frame(lowered$.ref(), frame$.ref(), frame_place, dead_place);
+    assert(rewritten_dead.local_id.to_index() == 3);
+    assert(rewritten_dead.projection.length == 0);
+    coroutine_frame_rewrite.FrameRewriteResult rewrite_result =
+        coroutine_frame_rewrite.rewrite_body_with_frame_local(lowered$.ref(), function.body, frame$.ref());
+    mir.MirBody rewritten_body = rewrite_result.body;
+    assert(rewrite_result.frame_local_id.to_index() == function.body.locals.length);
+    assert(rewritten_body.locals.length == function.body.locals.length + 1);
+    assert(rewritten_body.locals[rewrite_result.frame_local_id.to_index()].type_id == frame.frame_type_id);
+    mir.MirStatement first_statement = rewritten_body.blocks[rewritten_body.entry.to_index()].statements[0];
+    guard first_statement.kind is .assign_stmt(init_state) else {
+        assert(false);
+        return;
+    }
+    assert(init_state.destination.local_id.to_index() == rewrite_result.frame_local_id.to_index());
+    guard init_state.destination.projection[0] is .frame_field_projection(init_state_field) else {
+        assert(false);
+        return;
+    }
+    assert(init_state_field.field_index == frame.state_field_index);
+    coroutine_frame_rewrite.FrameRewriteResult state_machine =
+        coroutine_frame_rewrite.add_state_machine_skeleton(lowered$.ref(), rewrite_result, frame$.ref());
+    mir.MirBody state_body = state_machine.body;
+    assert(state_body.entry.to_index() == rewritten_body.blocks.length);
+    assert(state_body.blocks.length == rewritten_body.blocks.length + 2);
+    assert_state_dispatch_block(
+        state_body.blocks[state_body.entry.to_index()],
+        frame$.ref(),
+        rewrite_result.frame_local_id,
+        rewritten_body.entry
+    );
+    assert(state_body.blocks[state_body.blocks.length - 1].terminator.kind is .unreachable_term(_));
+    mir.MirBlock suspend_block = state_body.blocks[frame.suspend_points[0].block_id.to_index()];
+    assert_state_write_statement(
+        suspend_block.statements[suspend_block.statements.length - 1],
+        rewrite_result.frame_local_id,
+        frame.state_field_index,
+        frame.suspend_points[0].state_id
+    );
+    mir.MirBlock return_block = first_return_block(state_body);
+    assert_state_write_statement(
+        return_block.statements[return_block.statements.length - 1],
+        rewrite_result.frame_local_id,
+        frame.state_field_index,
+        frame.state_dispatch.completed_state_id
+    );
+    mir.MirPlace future_place = mir.local_place(mir.MirLocalId.from_index(99), lowered.empty_projection());
+    mir.MirPlace frame_storage_place =
+        mir.local_place(rewrite_result.frame_local_id, lowered.empty_projection());
+    mir.MirFunctionRef poll_function = mir.MirFunctionRef (
+        function_def: function.def_id,
+        type_args: lowered.empty_type_args(),
+        const_args: lowered.empty_const_args(),
+        coroutine_poll: true,
+        type_id: frame.future_abi.poll_function_type_id,
+        span: function.body.span
+    );
+    mir.MirStatement[]& future_initializers = coroutine_future_abi.initializers(
+        lowered$.ref(),
+        frame$.ref(),
+        future_place,
+        frame_storage_place,
+        poll_function,
+        function.body.span
+    );
+    assert(future_initializers.length == 3);
+    assert_future_state_initializer(future_initializers[0], frame$.ref(), future_place.local_id);
+    assert_future_frame_initializer(
+        future_initializers[1],
+        frame$.ref(),
+        future_place.local_id,
+        rewrite_result.frame_local_id
+    );
+    assert_future_poll_function_initializer(future_initializers[2], frame$.ref(), future_place.local_id);
+    mir.MirPlace poll_result_place = mir.local_place(mir.MirLocalId.from_index(100), lowered.empty_projection());
+    mir.MirStatement[]& pending_poll = coroutine_future_abi.pending_poll_result(
+        lowered$.ref(),
+        frame$.ref(),
+        poll_result_place,
+        function.body.span
+    );
+    assert(pending_poll.length == 1);
+    assert_poll_status_initializer(
+        pending_poll[0],
+        frame$.ref(),
+        poll_result_place.local_id,
+        frame.future_abi.pending_status_id
+    );
+    mir.MirPlace result_place = mir.local_place(function.body.return_local, lowered.empty_projection());
+    mir.MirStatement[]& ready_poll = coroutine_future_abi.ready_poll_result(
+        lowered$.ref(),
+        frame$.ref(),
+        poll_result_place,
+        result_place,
+        function.body.span
+    );
+    assert(ready_poll.length == 2);
+    assert_poll_status_initializer(
+        ready_poll[0],
+        frame$.ref(),
+        poll_result_place.local_id,
+        frame.future_abi.ready_status_id
+    );
+    assert_poll_result_initializer(
+        ready_poll[1],
+        frame$.ref(),
+        poll_result_place.local_id,
+        function.body.return_local
+    );
+    coroutine_frame_rewrite.PollRewriteResult poll_result =
+        coroutine_frame_rewrite.add_poll_result_skeleton(lowered$.ref(), state_machine, frame$.ref());
+    mir.MirBody poll_body = poll_result.body;
+    assert(poll_result.poll_result_local_id.to_index() == state_body.locals.length);
+    assert(poll_body.locals.length == state_body.locals.length + 1);
+    assert(poll_body.blocks.length == state_body.blocks.length + 1);
+    assert(poll_body.locals[poll_body.return_local.to_index()].type_id == frame.future_abi.poll_result_type_id);
+    assert(poll_body.locals[poll_result.poll_result_local_id.to_index()].type_id == frame.future_abi.poll_result_type_id);
+    mir.MirBlockId poll_return_id = mir.MirBlockId.from_index(state_body.blocks.length);
+    mir.MirBlock poll_suspend_block = poll_body.blocks[frame.suspend_points[0].block_id.to_index()];
+    assert_poll_status_initializer(
+        poll_suspend_block.statements[poll_suspend_block.statements.length - 1],
+        frame$.ref(),
+        poll_result.poll_result_local_id,
+        frame.future_abi.pending_status_id
+    );
+    assert_goto_terminator(poll_suspend_block.terminator, poll_return_id);
+    mir.MirBlock poll_original_return_block = poll_body.blocks[return_block.id.to_index()];
+    assert_poll_status_initializer(
+        poll_original_return_block.statements[poll_original_return_block.statements.length - 2],
+        frame$.ref(),
+        poll_result.poll_result_local_id,
+        frame.future_abi.ready_status_id
+    );
+    assert_poll_result_initializer(
+        poll_original_return_block.statements[poll_original_return_block.statements.length - 1],
+        frame$.ref(),
+        poll_result.poll_result_local_id,
+        function.body.return_local
+    );
+    assert_goto_terminator(poll_original_return_block.terminator, poll_return_id);
+    assert_return_poll_result_statement(
+        poll_body.blocks[poll_return_id.to_index()].statements[0],
+        poll_body.return_local,
+        poll_result.poll_result_local_id
+    );
+    assert(poll_body.blocks[poll_return_id.to_index()].terminator.kind is .return_term(_));
+    assert_lower_poll_body_result(lowered$.ref(), function, frame$.ref());
+    coroutine_frame_rewrite.FrameRewritePlan rewritten_plan =
+        coroutine_frame_rewrite.build_plan(rewritten_body, frame$.ref());
+    assert(rewritten_plan.read_count == 0);
+    assert(rewritten_plan.write_count == 0);
+    coroutine_frame_rewrite.FrameRewritePlan plan = coroutine_frame_rewrite.build_plan(function.body, frame$.ref());
+    assert(plan.read_count > 0);
+    assert(plan.write_count > 0);
+}
+
+() assert_lower_poll_body_result(
+    mir.MirStore& lowered,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& frame
+) {
+    coroutine_frame_rewrite.PollRewriteResult lowered_poll =
+        coroutine_frame_rewrite.lower_poll_body(lowered, source.body, frame);
+    mir.MirBody poll_body = lowered_poll.body;
+    assert(lowered_poll.frame_local_id.to_index() == source.body.locals.length);
+    assert(poll_body.locals[poll_body.return_local.to_index()].type_id == frame.future_abi.poll_result_type_id);
+    assert(poll_body.locals[lowered_poll.poll_result_local_id.to_index()].type_id == frame.future_abi.poll_result_type_id);
+    assert(poll_body.entry.to_index() == source.body.blocks.length + 1);
+    assert(poll_body.blocks.length == source.body.blocks.length + 4);
+    mir.MirBlockId poll_return_id = mir.MirBlockId.from_index(poll_body.blocks.length - 1);
+    assert_return_poll_result_statement(
+        poll_body.blocks[poll_return_id.to_index()].statements[0],
+        poll_body.return_local,
+        lowered_poll.poll_result_local_id
+    );
+    assert(poll_body.blocks[poll_return_id.to_index()].terminator.kind is .return_term(_));
+    coroutine_frame_rewrite.PollFunctionLowering poll_function =
+        coroutine_frame_rewrite.lower_poll_function(
+            lowered,
+            source,
+            frame,
+            mir.MirFunctionId.from_index(42)
+        );
+    assert_poll_function_lowering(poll_function, frame, mir.MirFunctionId.from_index(42));
+    Int function_count = lowered.functions.len();
+    coroutine_frame_rewrite.PollFunctionLowering registered_poll =
+        coroutine_frame_rewrite.add_poll_function(lowered, source, frame);
+    assert_poll_function_lowering(registered_poll, frame, mir.MirFunctionId.from_index(function_count));
+    assert(lowered.functions.len() == function_count + 1);
+    assert(registered_poll.function.body.id.to_index() == registered_poll.function.id.to_index());
+    assert(lowered.function(registered_poll.function.id).id.to_index() == registered_poll.function.id.to_index());
+    guard lowered.function_id_for_def(source.def_id) is .some(source_id) else {
+        assert(false);
+        return;
+    }
+    assert(source_id.to_index() == source.id.to_index());
+}
+
+() assert_poll_function_lowering(
+    coroutine_frame_rewrite.PollFunctionLowering lowering,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirFunctionId expected_id
+) {
+    mir.MirFunction function = lowering.function;
+    assert(function.id.to_index() == expected_id.to_index());
+    assert(!function.effects.has_async);
+    assert(!function.is_coroutine);
+    assert(function.coroutine_frame == null);
+    assert(function.is_coroutine_poll);
+    assert(!function.is_external);
+    assert(!function.naked);
+    assert(lowering.frame_local_id.to_index() == function.body.locals.length - 2);
+    assert(lowering.poll_result_local_id.to_index() == function.body.locals.length - 1);
+    assert(function.body.locals[function.body.return_local.to_index()].type_id == frame.future_abi.poll_result_type_id);
+    assert(function.body.locals[lowering.poll_result_local_id.to_index()].type_id == frame.future_abi.poll_result_type_id);
+}
+
+() assert_return_poll_result_statement(
+    mir.MirStatement statement,
+    mir.MirLocalId return_local_id,
+    mir.MirLocalId poll_result_local_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert(assign_stmt.destination.local_id.to_index() == return_local_id.to_index());
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .copy_operand(copy_operand) else {
+        assert(false);
+        return;
+    }
+    assert(copy_operand.place.local_id.to_index() == poll_result_local_id.to_index());
+}
+
+() assert_goto_terminator(mir.MirTerminator terminator, mir.MirBlockId target) {
+    guard terminator.kind is .goto_term(goto_term) else {
+        assert(false);
+        return;
+    }
+    assert(goto_term.target.to_index() == target.to_index());
+}
+
+() assert_future_state_initializer(
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId future_local_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert_future_field_place(assign_stmt.destination, future_local_id, frame.future_abi.state_field_index);
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .const_operand(constant) else {
+        assert(false);
+        return;
+    }
+    assert_int_const(constant, frame.state_dispatch.entry_state_id);
+}
+
+() assert_future_frame_initializer(
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId future_local_id,
+    mir.MirLocalId frame_local_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert_future_field_place(assign_stmt.destination, future_local_id, frame.future_abi.frame_field_index);
+    guard assign_stmt.value is .address_of_value(address_of) else {
+        assert(false);
+        return;
+    }
+    assert(address_of.place.local_id.to_index() == frame_local_id.to_index());
+}
+
+() assert_future_poll_function_initializer(
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId future_local_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert_future_field_place(assign_stmt.destination, future_local_id, frame.future_abi.poll_function_field_index);
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .function_operand(function_ref) else {
+        assert(false);
+        return;
+    }
+    assert(function_ref.coroutine_poll);
+    assert(function_ref.type_id == frame.future_abi.poll_function_type_id);
+}
+
+() assert_poll_status_initializer(
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId poll_result_local_id,
+    Int status_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert_future_field_place(
+        assign_stmt.destination,
+        poll_result_local_id,
+        frame.future_abi.poll_status_field_index
+    );
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .const_operand(constant) else {
+        assert(false);
+        return;
+    }
+    assert_int_const(constant, status_id);
+}
+
+() assert_poll_result_initializer(
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId poll_result_local_id,
+    mir.MirLocalId result_local_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert_future_field_place(
+        assign_stmt.destination,
+        poll_result_local_id,
+        frame.future_abi.poll_result_field_index
+    );
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .copy_operand(copy_operand) else {
+        assert(false);
+        return;
+    }
+    assert(copy_operand.place.local_id.to_index() == result_local_id.to_index());
+}
+
+() assert_future_field_place(mir.MirPlace place, mir.MirLocalId local_id, Int field_index) {
+    assert(place.local_id.to_index() == local_id.to_index());
+    assert(place.projection.length == 1);
+    guard place.projection[0] is .constant_index_projection(index_projection) else {
+        assert(false);
+        return;
+    }
+    assert(index_projection.offset == field_index);
+}
+
+() assert_block_initializes_future_field(mir.MirBlock block, mir.MirLocalId future_local_id, Int field_index) {
+    Int! index = 0;
+    while (index < block.statements.length) {
+        if (statement_assigns_future_field(block.statements[index], future_local_id, field_index)) {
+            return;
+        }
+        index = index + 1;
+    }
+    assert(false);
+}
+
+Bool statement_assigns_future_field(mir.MirStatement statement, mir.MirLocalId future_local_id, Int field_index) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        return false;
+    }
+    if (assign_stmt.destination.local_id.to_index() != future_local_id.to_index()) {
+        return false;
+    }
+    if (assign_stmt.destination.projection.length != 1) {
+        return false;
+    }
+    guard assign_stmt.destination.projection[0] is .constant_index_projection(index_projection) else {
+        return false;
+    }
+    return index_projection.offset == field_index;
+}
+
+() assert_function_uses_future_result_fields(mir.MirFunction function, Int result_field_index) {
+    Int! block_index = 0;
+    while (block_index < function.body.blocks.length) {
+        mir.MirBlock block = function.body.blocks[block_index];
+        Int! statement_index = 0;
+        while (statement_index < block.statements.length) {
+            if (statement_uses_future_result_fields(block.statements[statement_index], result_field_index)) {
+                return;
+            }
+            statement_index = statement_index + 1;
+        }
+        block_index = block_index + 1;
+    }
+    assert(false);
+}
+
+() assert_function_has_indirect_poll_call(mir.MirFunction function) {
+    Int! block_index = 0;
+    while (block_index < function.body.blocks.length) {
+        mir.MirBlock block = function.body.blocks[block_index];
+        if (block.terminator.kind is .call_term(call)) {
+            if (!call.is_suspend_point && call.callee is .indirect_operand(_)) {
+                assert(call.args.length == 1);
+                return;
+            }
+        }
+        block_index = block_index + 1;
+    }
+    assert(false);
+}
+
+() assert_function_has_suspend_pending(mir.MirFunction function) {
+    Int! block_index = 0;
+    while (block_index < function.body.blocks.length) {
+        mir.MirBlock block = function.body.blocks[block_index];
+        if (block.terminator.kind is .suspend_pending_term(_)) {
+            return;
+        }
+        block_index = block_index + 1;
+    }
+    assert(false);
+}
+
+Bool statement_uses_future_result_fields(mir.MirStatement statement, Int result_field_index) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        return false;
+    }
+    guard assign_stmt.value is .binary_value(binary) else {
+        return false;
+    }
+    return operand_is_future_field(binary.lhs, result_field_index)
+        && operand_is_future_field(binary.rhs, result_field_index);
+}
+
+Bool operand_is_future_field(mir.MirOperand operand, Int field_index) {
+    if (operand is .copy_operand(copy_operand)) {
+        return place_is_constant_field(copy_operand.place, field_index);
+    }
+    if (operand is .move_operand(move_operand)) {
+        return place_is_constant_field(move_operand.place, field_index);
+    }
+    return false;
+}
+
+Bool place_is_constant_field(mir.MirPlace place, Int field_index) {
+    if (place.projection.length != 1) {
+        return false;
+    }
+    guard place.projection[0] is .constant_index_projection(index_projection) else {
+        return false;
+    }
+    return index_projection.offset == field_index;
+}
+
+() assert_block_initializes_frame_field(mir.MirBlock block, mir.MirLocalId frame_local_id, Int field_index) {
+    Int! index = 0;
+    while (index < block.statements.length) {
+        if (statement_assigns_frame_field(block.statements[index], frame_local_id, field_index)) {
+            return;
+        }
+        index = index + 1;
+    }
+    assert(false);
+}
+
+Bool statement_assigns_frame_field(mir.MirStatement statement, mir.MirLocalId frame_local_id, Int field_index) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        return false;
+    }
+    if (assign_stmt.destination.local_id.to_index() != frame_local_id.to_index()) {
+        return false;
+    }
+    if (assign_stmt.destination.projection.length != 1) {
+        return false;
+    }
+    guard assign_stmt.destination.projection[0] is .frame_field_projection(frame_field) else {
+        return false;
+    }
+    return frame_field.field_index == field_index;
+}
+
+Int frame_field_for_local(mir.MirCoroutineFrameLayout frame, mir.MirLocalId local_id) {
+    Int! index = 0;
+    while (index < frame.local_mappings.length) {
+        mir.MirCoroutineLocalFrameField mapping = frame.local_mappings[index];
+        if (mapping.local_id.to_index() == local_id.to_index()) {
+            return mapping.field_index;
+        }
+        index = index + 1;
+    }
+    assert(false);
+    return -1;
+}
+
+() assert_future_abi_layout(context.CompilerContext& ctx, mir.MirCoroutineFrameLayout& frame) {
+    assert(frame.future_abi.state_field_index == 0);
+    assert(frame.future_abi.frame_field_index == 1);
+    assert(frame.future_abi.poll_function_field_index == 2);
+    assert(frame.future_abi.result_field_index == 3);
+    assert(frame.future_abi.poll_status_field_index == 0);
+    assert(frame.future_abi.poll_result_field_index == 1);
+    assert(frame.future_abi.pending_status_id == 0);
+    assert(frame.future_abi.ready_status_id == 1);
+    assert(frame.future_abi.result_type_id == frame.fields[frame.return_field_index].type_id);
+    guard ctx.store.types.get(frame.future_abi.frame_pointer_type_id).data is .handle_type(_) else {
+        assert(false);
+        return;
+    }
+    guard ctx.store.types.get(frame.future_abi.future_type_id).data is .future_type(future_type) else {
+        assert(false);
+        return;
+    }
+    assert(future_type.result == frame.future_abi.result_type_id);
+    guard ctx.store.types.get(frame.future_abi.poll_result_type_id).data is .tuple_type(poll_tuple) else {
+        assert(false);
+        return;
+    }
+    assert(poll_tuple.items.length == 2);
+    assert(poll_tuple.items[0] == frame.fields[frame.state_field_index].type_id);
+    assert(poll_tuple.items[1] == frame.future_abi.result_type_id);
+}
+
+() assert_state_dispatch_block(
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId frame_local_id,
+    mir.MirBlockId original_entry
+) {
+    guard block.terminator.kind is .switch_term(switch_term) else {
+        assert(false);
+        return;
+    }
+    guard switch_term.discriminator is .copy_operand(discriminator) else {
+        assert(false);
+        return;
+    }
+    assert(discriminator.place.local_id.to_index() == frame_local_id.to_index());
+    guard discriminator.place.projection[0] is .frame_field_projection(state_field) else {
+        assert(false);
+        return;
+    }
+    assert(state_field.field_index == frame.state_field_index);
+    assert(switch_term.cases.length == frame.state_dispatch.resume_cases.length + 1);
+    assert(switch_term.cases[0].target.to_index() == original_entry.to_index());
+    assert_int_const(switch_term.cases[0].value, frame.state_dispatch.entry_state_id);
+    assert_int_const(switch_term.cases[1].value, frame.state_dispatch.resume_cases[0].state_id);
+    assert(switch_term.cases[1].target.to_index() == frame.state_dispatch.resume_cases[0].target.to_index());
+}
+
+mir.MirBlock first_return_block(mir.MirBody body) {
+    Int! index = 0;
+    while (index < body.blocks.length) {
+        mir.MirBlock block = body.blocks[index];
+        if (block.terminator.kind is .return_term(_)) {
+            return block;
+        }
+        index = index + 1;
+    }
+    assert(false);
+    return body.blocks[0];
+}
+
+() assert_state_write_statement(
+    mir.MirStatement statement,
+    mir.MirLocalId frame_local_id,
+    Int state_field_index,
+    Int state_id
+) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert(assign_stmt.destination.local_id.to_index() == frame_local_id.to_index());
+    guard assign_stmt.destination.projection[0] is .frame_field_projection(state_field) else {
+        assert(false);
+        return;
+    }
+    assert(state_field.field_index == state_field_index);
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .const_operand(constant) else {
+        assert(false);
+        return;
+    }
+    assert_int_const(constant, state_id);
+}
+
+() assert_int_const(mir.MirConst constant, Int value) {
+    guard constant.value is .int_value(int_value) else {
+        assert(false);
+        return;
+    }
+    assert(int_value.bits == UInt64(value));
 }
 
 () check_generic_function_lowers_as_concrete_instance() {

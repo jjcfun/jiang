@@ -1,0 +1,1470 @@
+// Query helpers for rewriting coroutine locals into frame field places.
+
+import qid = "../../../store/id.jiang";
+import mir = "../../mir.jiang";
+import types = "../../../sema/type.jiang";
+import list = "../../../support/list.jiang";
+import token = "../../../syntax/token.jiang";
+import future_abi = "./future_abi.jiang";
+
+public struct FrameRewritePlan {
+    public Int read_count;
+    public Int write_count;
+    public Int move_count;
+    public Int borrow_count;
+    public Int address_count;
+    public Int call_destination_count;
+    public Int unique_count;
+}
+
+public struct FrameRewriteResult {
+    public mir.MirBody body;
+    public mir.MirLocalId frame_local_id;
+}
+
+public struct PollRewriteResult {
+    public mir.MirBody body;
+    public mir.MirLocalId frame_local_id;
+    public mir.MirLocalId poll_result_local_id;
+}
+
+public struct PollFunctionLowering {
+    public mir.MirFunction function;
+    public mir.MirLocalId frame_local_id;
+    public mir.MirLocalId poll_result_local_id;
+}
+
+public FrameRewritePlan build_plan(
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    FrameRewritePlan! plan = FrameRewritePlan (
+        read_count: 0,
+        write_count: 0,
+        move_count: 0,
+        borrow_count: 0,
+        address_count: 0,
+        call_destination_count: 0,
+        unique_count: 0
+    );
+    Int! block_index = 0;
+    while (block_index < body.blocks.length) {
+        collect_block(body.blocks[block_index], layout, plan$.ref());
+        block_index = block_index + 1;
+    }
+    return plan;
+}
+
+public PollRewriteResult lower_poll_body(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    FrameRewriteResult frame_result = rewrite_body_with_frame_local(output, body, layout);
+    FrameRewriteResult state_result = add_state_machine_skeleton(output, frame_result, layout);
+    return add_poll_result_skeleton(output, state_result, layout);
+}
+
+public PollFunctionLowering lower_poll_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId poll_function_id
+) {
+    PollRewriteResult lowered = lower_poll_body(output, source.body, layout);
+    return PollFunctionLowering (
+        function: poll_function_for_body(output, source, poll_function_id, body_with_id(lowered.body, poll_function_id)),
+        frame_local_id: lowered.frame_local_id,
+        poll_result_local_id: lowered.poll_result_local_id
+    );
+}
+
+public PollFunctionLowering add_poll_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    mir.MirFunctionId poll_function_id = mir.MirFunctionId.from_index(output.functions.len());
+    PollFunctionLowering lowered = lower_poll_function(output, source, layout, poll_function_id);
+    output.add_generated_function(lowered.function);
+    return lowered;
+}
+
+public FrameRewriteResult rewrite_body_with_frame_local(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    mir.MirLocalId frame_local_id = mir.MirLocalId.from_index(body.locals.length);
+    mir.MirLocalDecl[]& locals = locals_with_frame_local(output, body, layout, frame_local_id);
+    mir.MirPlace frame_place = deref_frame_pointer_place(output, frame_local_id);
+    mir.MirBody! rewritten = rewrite_body_places_to_frame(
+        output,
+        body_with_locals(body, locals),
+        layout,
+        frame_place
+    );
+    rewritten = body_with_blocks(
+        rewritten,
+        blocks_with_frame_initializers(output, rewritten, layout, frame_place)
+    );
+    return FrameRewriteResult (
+        body: rewritten,
+        frame_local_id: frame_local_id
+    );
+}
+
+mir.MirPlace deref_frame_pointer_place(mir.MirStore& output, mir.MirLocalId frame_local_id) {
+    list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(1);
+    projection.add(mir.deref_projection_elem(mir.MirDerefProjection (raw_pointer: true)));
+    return mir.local_place(frame_local_id, output.projection_array(projection$.ref()));
+}
+
+public FrameRewriteResult add_state_machine_skeleton(
+    mir.MirStore& output,
+    FrameRewriteResult result,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    mir.MirPlace frame_place = deref_frame_pointer_place(output, result.frame_local_id);
+    mir.MirBlockId dispatch_id = mir.MirBlockId.from_index(result.body.blocks.length);
+    mir.MirBody body = body_with_blocks(
+        result.body,
+        state_machine_blocks(output, result.body, layout, frame_place, dispatch_id)
+    );
+    return FrameRewriteResult (
+        body: body_with_entry(body, dispatch_id),
+        frame_local_id: result.frame_local_id
+    );
+}
+
+public PollRewriteResult add_poll_result_skeleton(
+    mir.MirStore& output,
+    FrameRewriteResult result,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    mir.MirLocalId poll_result_local_id = mir.MirLocalId.from_index(result.body.locals.length);
+    mir.MirLocalDecl[]& locals = locals_with_poll_result(output, result.body, layout, poll_result_local_id);
+    mir.MirBody! body = body_with_return_local_type(
+        output,
+        body_with_locals(result.body, locals),
+        layout.future_abi.poll_result_type_id
+    );
+    mir.MirPlace poll_result_place = mir.local_place(poll_result_local_id, output.empty_projection());
+    mir.MirBlockId poll_return_id = mir.MirBlockId.from_index(body.blocks.length);
+    body = body_with_blocks(
+        body,
+        blocks_with_poll_results(output, body, layout, poll_result_place, poll_return_id)
+    );
+    return PollRewriteResult (
+        body: body,
+        frame_local_id: result.frame_local_id,
+        poll_result_local_id: poll_result_local_id
+    );
+}
+
+public Int? field_index_for_local(
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId local_id
+) {
+    Int! index = 0;
+    while (index < layout.local_mappings.length) {
+        mir.MirCoroutineLocalFrameField mapping = layout.local_mappings[index];
+        if (mapping.local_id.to_index() == local_id.to_index()) {
+            return mapping.field_index;
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+mir.MirFunction poll_function_for_body(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirFunctionId poll_function_id,
+    mir.MirBody body
+) {
+    return mir.MirFunction (
+        id: poll_function_id,
+        def_id: source.def_id,
+        type_args: output.type_arg_array(source.type_args),
+        const_args: output.const_arg_array(source.const_args),
+        signature_id: null,
+        effects: types.EffectSet(),
+        is_coroutine: false,
+        coroutine_frame: null,
+        is_coroutine_poll: true,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: source.inline_always,
+        naked: false,
+        span: source.span,
+        body: body
+    );
+}
+
+public Bool local_is_frame_backed(
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId local_id
+) {
+    return field_index_for_local(layout, local_id) != null;
+}
+
+public Int? field_index_for_place(
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace place
+) {
+    guard mir.place_local_id(place) is .some(local_id) else { return null; }
+    return field_index_for_local(layout, local_id);
+}
+
+public Bool place_is_frame_backed(
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace place
+) {
+    return field_index_for_place(layout, place) != null;
+}
+
+public mir.MirPlace rewrite_place_to_frame(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    mir.MirPlace source_place
+) {
+    guard field_index_for_place(layout, source_place) is .some(field_index) else {
+        return source_place;
+    }
+    mir.MirCoroutineFrameField field = layout.fields[field_index];
+    list.ArrayList<mir.MirPlaceElem>! projection =
+        list.ArrayList<mir.MirPlaceElem>(frame_place.projection.length + 1 + source_place.projection.length);
+    copy_projection(frame_place.projection, projection$.ref());
+    projection.add(mir.frame_field_projection_elem(mir.MirFrameFieldProjection (
+        field_index: field_index,
+        field_type: field.type_id
+    )));
+    copy_projection(source_place.projection, projection$.ref());
+    return place_with_projection(output, frame_place, projection$.ref());
+}
+
+() copy_projection(
+    mir.MirPlaceElem[]& source,
+    list.ArrayList<mir.MirPlaceElem>& destination
+) {
+    Int! index = 0;
+    while (index < source.length) {
+        destination.add(source[index]);
+        index = index + 1;
+    }
+}
+
+mir.MirPlace place_with_projection(
+    mir.MirStore& output,
+    mir.MirPlace base_place,
+    list.ArrayList<mir.MirPlaceElem>& projection
+) {
+    if (base_place.base is .global(global_ref)) {
+        return mir.global_place(global_ref, output.projection_array(projection));
+    }
+    return mir.local_place(base_place.local_id, output.projection_array(projection));
+}
+
+mir.MirLocalDecl[]& locals_with_frame_local(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId frame_local_id
+) {
+    mir.MirLocalDecl![*] locals = output.alloc_local_array(body.locals.length + 1);
+    Int! index = 0;
+    while (index < body.locals.length) {
+        locals[index] = poll_body_source_local(body.locals[index]);
+        index = index + 1;
+    }
+    locals[body.locals.length] = mir.MirLocalDecl (
+        id: frame_local_id,
+        kind: mir.MirLocalKind.param,
+        type_id: layout.future_abi.frame_pointer_type_id,
+        span: body.span,
+        name: null,
+        def_id: null,
+        mutable_local: true,
+        address_taken: false
+    );
+    return locals[0..body.locals.length + 1];
+}
+
+mir.MirLocalDecl poll_body_source_local(mir.MirLocalDecl local) {
+    if (local.kind != mir.MirLocalKind.param) {
+        return local;
+    }
+    mir.MirLocalDecl! rewritten = local;
+    rewritten.kind = mir.MirLocalKind.compiler_temp;
+    return rewritten;
+}
+
+mir.MirLocalDecl[]& locals_with_poll_result(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId poll_result_local_id
+) {
+    mir.MirLocalDecl![*] locals = output.alloc_local_array(body.locals.length + 1);
+    Int! index = 0;
+    while (index < body.locals.length) {
+        locals[index] = body.locals[index];
+        index = index + 1;
+    }
+    locals[body.locals.length] = mir.MirLocalDecl (
+        id: poll_result_local_id,
+        kind: mir.MirLocalKind.compiler_temp,
+        type_id: layout.future_abi.poll_result_type_id,
+        span: body.span,
+        name: null,
+        def_id: null,
+        mutable_local: true,
+        address_taken: false
+    );
+    return locals[0..body.locals.length + 1];
+}
+
+mir.MirLocalDecl[]& locals_with_return_type(
+    mir.MirStore& output,
+    mir.MirBody body,
+    qid.TypeId return_type
+) {
+    mir.MirLocalDecl![*] locals = output.alloc_local_array(body.locals.length);
+    Int! index = 0;
+    while (index < body.locals.length) {
+        locals[index] = body.locals[index];
+        index = index + 1;
+    }
+    mir.MirLocalDecl! return_local = locals[body.return_local.to_index()];
+    return_local.type_id = return_type;
+    locals[body.return_local.to_index()] = return_local;
+    return locals[0..body.locals.length];
+}
+
+@life(body > return, locals > return)
+mir.MirBody body_with_locals(mir.MirBody body, mir.MirLocalDecl[]& locals) {
+    return mir.MirBody (
+        id: body.id,
+        span: body.span,
+        locals: locals,
+        blocks: body.blocks,
+        entry: body.entry,
+        return_local: body.return_local
+    );
+}
+
+mir.MirBody body_with_id(mir.MirBody body, mir.MirFunctionId function_id) {
+    return mir.MirBody (
+        id: mir.MirBodyId.from_index(function_id.to_index()),
+        span: body.span,
+        locals: body.locals,
+        blocks: body.blocks,
+        entry: body.entry,
+        return_local: body.return_local
+    );
+}
+
+mir.MirBody body_with_return_local_type(
+    mir.MirStore& output,
+    mir.MirBody body,
+    qid.TypeId return_type
+) {
+    return body_with_locals(body, locals_with_return_type(output, body, return_type));
+}
+
+@life(body > return, blocks > return)
+mir.MirBody body_with_blocks(mir.MirBody body, mir.MirBlock[]& blocks) {
+    return mir.MirBody (
+        id: body.id,
+        span: body.span,
+        locals: body.locals,
+        blocks: blocks,
+        entry: body.entry,
+        return_local: body.return_local
+    );
+}
+
+mir.MirBlock[]& blocks_with_frame_initializers(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(body.blocks.length);
+    Int! index = 0;
+    while (index < body.blocks.length) {
+        mir.MirBlock! block = body.blocks[index];
+        if (block.id.to_index() == body.entry.to_index()) {
+            block = block_with_frame_initializers(output, block, layout, frame_place);
+        }
+        blocks.add(block);
+        index = index + 1;
+    }
+    return output.block_array(blocks$.ref());
+}
+
+mir.MirBlock block_with_frame_initializers(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(block.statements.length + 1);
+    statements.add(frame_state_initializer(output, block.span, layout, frame_place));
+    Int! index = 0;
+    while (index < block.statements.length) {
+        statements.add(block.statements[index]);
+        index = index + 1;
+    }
+    return mir.MirBlock (
+        id: block.id,
+        span: block.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: block.terminator
+    );
+}
+
+@life(body > return)
+mir.MirBody body_with_entry(mir.MirBody body, mir.MirBlockId entry) {
+    return mir.MirBody (
+        id: body.id,
+        span: body.span,
+        locals: body.locals,
+        blocks: body.blocks,
+        entry: entry,
+        return_local: body.return_local
+    );
+}
+
+mir.MirStatement frame_state_initializer(
+    mir.MirStore& output,
+    token.Span span,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    qid.TypeId state_type = layout.fields[layout.state_field_index].type_id;
+    return mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: frame_field_place(output, layout, frame_place, layout.state_field_index),
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.const_operand_value(mir.MirConst (
+                    type_id: state_type,
+                    span: span,
+                    value: mir.int_const_kind(mir.MirIntConst (
+                        bits: UInt64(layout.state_dispatch.entry_state_id),
+                        signed_value: true
+                    ))
+                ))
+            ))
+        ))
+    );
+}
+
+mir.MirPlace frame_field_place(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    Int field_index
+) {
+    list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(frame_place.projection.length + 1);
+    copy_projection(frame_place.projection, projection$.ref());
+    projection.add(mir.frame_field_projection_elem(mir.MirFrameFieldProjection (
+        field_index: field_index,
+        field_type: layout.fields[field_index].type_id
+    )));
+    return place_with_projection(output, frame_place, projection$.ref());
+}
+
+mir.MirBlock[]& state_machine_blocks(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    mir.MirBlockId dispatch_id
+) {
+    mir.MirBlockId invalid_state_id = mir.MirBlockId.from_index(body.blocks.length + 1);
+    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(body.blocks.length + 2);
+    Int! index = 0;
+    while (index < body.blocks.length) {
+        blocks.add(state_machine_block(output, body.blocks[index], layout, frame_place));
+        index = index + 1;
+    }
+    blocks.add(dispatch_block(output, body, layout, frame_place, dispatch_id, invalid_state_id));
+    blocks.add(invalid_state_block(output, body.span, invalid_state_id));
+    return output.block_array(blocks$.ref());
+}
+
+mir.MirBlock state_machine_block(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (block.terminator.kind is .call_term(call_term)) {
+        if (call_term.is_suspend_point) {
+            return block_with_state_write(output, block, layout, frame_place, suspend_state_for_block(layout, block.id));
+        }
+    }
+    if (block.terminator.kind is .suspend_pending_term(_)) {
+        return block_with_state_write(output, block, layout, frame_place, suspend_state_for_block(layout, block.id));
+    }
+    if (block.terminator.kind is .return_term(_)) {
+        return block_with_state_write(output, block, layout, frame_place, layout.state_dispatch.completed_state_id);
+    }
+    return block;
+}
+
+Int suspend_state_for_block(mir.MirCoroutineFrameLayout& layout, mir.MirBlockId block_id) {
+    Int! index = 0;
+    while (index < layout.suspend_points.length) {
+        mir.MirCoroutineSuspendPoint point = layout.suspend_points[index];
+        if (point.block_id.to_index() == block_id.to_index()) {
+            return point.state_id;
+        }
+        index = index + 1;
+    }
+    return layout.state_dispatch.completed_state_id;
+}
+
+mir.MirBlock block_with_state_write(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    Int state_id
+) {
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(block.statements.length + 1);
+    Int! index = 0;
+    while (index < block.statements.length) {
+        statements.add(block.statements[index]);
+        index = index + 1;
+    }
+    statements.add(frame_state_write(output, block.terminator.span, layout, frame_place, state_id));
+    return mir.MirBlock (
+        id: block.id,
+        span: block.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: block.terminator
+    );
+}
+
+mir.MirStatement frame_state_write(
+    mir.MirStore& output,
+    token.Span span,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    Int state_id
+) {
+    return mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: frame_field_place(output, layout, frame_place, layout.state_field_index),
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.const_operand_value(state_const(layout, span, state_id))
+            ))
+        ))
+    );
+}
+
+mir.MirBlock dispatch_block(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    mir.MirBlockId dispatch_id,
+    mir.MirBlockId invalid_state_id
+) {
+    return mir.MirBlock (
+        id: dispatch_id,
+        span: body.span,
+        statements: output.empty_statements(),
+        terminator: mir.MirTerminator (
+            span: body.span,
+            kind: mir.switch_terminator_kind(mir.MirSwitchTerminator (
+                discriminator: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: frame_field_place(output, layout, frame_place, layout.state_field_index)
+                )),
+                cases: dispatch_cases(output, body, layout),
+                default_target: invalid_state_id
+            ))
+        )
+    );
+}
+
+mir.MirSwitchCase[]& dispatch_cases(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    list.ArrayList<mir.MirSwitchCase>! cases =
+        list.ArrayList<mir.MirSwitchCase>(layout.state_dispatch.resume_cases.length + 1);
+    cases.add(mir.MirSwitchCase (
+        value: state_const(layout, body.span, layout.state_dispatch.entry_state_id),
+        target: body.entry
+    ));
+    Int! index = 0;
+    while (index < layout.state_dispatch.resume_cases.length) {
+        mir.MirCoroutineResumeCase resume_case = layout.state_dispatch.resume_cases[index];
+        cases.add(mir.MirSwitchCase (
+            value: state_const(layout, body.span, resume_case.state_id),
+            target: resume_case.target
+        ));
+        index = index + 1;
+    }
+    return output.switch_case_array(cases$.ref());
+}
+
+mir.MirBlock invalid_state_block(mir.MirStore& output, token.Span span, mir.MirBlockId id) {
+    return mir.MirBlock (
+        id: id,
+        span: span,
+        statements: output.empty_statements(),
+        terminator: mir.MirTerminator (
+            span: span,
+            kind: mir.unreachable_terminator_kind(mir.MirUnreachableTerminator (generated_by_check: true))
+        )
+    );
+}
+
+mir.MirConst state_const(mir.MirCoroutineFrameLayout& layout, token.Span span, Int state_id) {
+    return mir.MirConst (
+        type_id: layout.fields[layout.state_field_index].type_id,
+        span: span,
+        value: mir.int_const_kind(mir.MirIntConst (
+            bits: UInt64(state_id),
+            signed_value: true
+        ))
+    );
+}
+
+mir.MirBlock[]& blocks_with_poll_results(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace poll_result_place,
+    mir.MirBlockId poll_return_id
+) {
+    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(body.blocks.length + 1);
+    Int! index = 0;
+    while (index < body.blocks.length) {
+        blocks.add(block_with_poll_result(output, body.blocks[index], body, layout, poll_result_place, poll_return_id));
+        index = index + 1;
+    }
+    blocks.add(poll_return_block(output, body, poll_result_place, poll_return_id));
+    return output.block_array(blocks$.ref());
+}
+
+mir.MirBlock block_with_poll_result(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace poll_result_place,
+    mir.MirBlockId poll_return_id
+) {
+    if (block.terminator.kind is .call_term(call_term)) {
+        if (call_term.is_suspend_point) {
+            return block_with_added_statements(
+                output,
+                block,
+                future_abi.pending_poll_result(output, layout, poll_result_place, block.terminator.span),
+                goto_terminator(block.terminator.span, poll_return_id)
+            );
+        }
+    }
+    if (block.terminator.kind is .suspend_pending_term(_)) {
+        return block_with_added_statements(
+            output,
+            block,
+            future_abi.pending_poll_result(output, layout, poll_result_place, block.terminator.span),
+            goto_terminator(block.terminator.span, poll_return_id)
+        );
+    }
+    if (block.terminator.kind is .return_term(_)) {
+        mir.MirPlace result_place = mir.local_place(body.return_local, output.empty_projection());
+        return block_with_added_statements(
+            output,
+            block,
+            future_abi.ready_poll_result(output, layout, poll_result_place, result_place, block.terminator.span),
+            goto_terminator(block.terminator.span, poll_return_id)
+        );
+    }
+    return block;
+}
+
+mir.MirBlock block_with_added_statements(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirStatement[]& added,
+    mir.MirTerminator terminator
+) {
+    list.ArrayList<mir.MirStatement>! statements =
+        list.ArrayList<mir.MirStatement>(block.statements.length + added.length);
+    Int! index = 0;
+    while (index < block.statements.length) {
+        statements.add(block.statements[index]);
+        index = index + 1;
+    }
+    index = 0;
+    while (index < added.length) {
+        statements.add(added[index]);
+        index = index + 1;
+    }
+    return mir.MirBlock (
+        id: block.id,
+        span: block.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: terminator
+    );
+}
+
+mir.MirBlock poll_return_block(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirPlace poll_result_place,
+    mir.MirBlockId id
+) {
+    return mir.MirBlock (
+        id: id,
+        span: body.span,
+        statements: single_statement_array(output, return_poll_result_statement(output, body, poll_result_place)),
+        terminator: mir.MirTerminator (
+            span: body.span,
+            kind: mir.return_terminator_kind(mir.MirReturnTerminator (implicit_unit: false))
+        )
+    );
+}
+
+mir.MirStatement[]& single_statement_array(mir.MirStore& output, mir.MirStatement statement) {
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(1);
+    statements.add(statement);
+    return output.statement_array(statements$.ref());
+}
+
+mir.MirStatement return_poll_result_statement(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirPlace poll_result_place
+) {
+    return mir.MirStatement (
+        span: body.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(body.return_local, output.empty_projection()),
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.copy_operand_value(mir.MirCopyOperand (place: poll_result_place))
+            ))
+        ))
+    );
+}
+
+mir.MirTerminator goto_terminator(token.Span span, mir.MirBlockId target) {
+    return mir.MirTerminator (
+        span: span,
+        kind: mir.goto_terminator_kind(mir.MirGotoTerminator (target: target))
+    );
+}
+
+public mir.MirBody rewrite_body_places_to_frame(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.MirBody (
+        id: body.id,
+        span: body.span,
+        locals: body.locals,
+        blocks: rewrite_blocks(output, body.blocks, layout, frame_place),
+        entry: body.entry,
+        return_local: body.return_local
+    );
+}
+
+mir.MirBlock[]& rewrite_blocks(
+    mir.MirStore& output,
+    mir.MirBlock[]& blocks,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirBlock>! rewritten = list.ArrayList<mir.MirBlock>(blocks.length);
+    Int! index = 0;
+    while (index < blocks.length) {
+        rewritten.add(rewrite_block(output, blocks[index], layout, frame_place));
+        index = index + 1;
+    }
+    return output.block_array(rewritten$.ref());
+}
+
+mir.MirBlock rewrite_block(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.MirBlock (
+        id: block.id,
+        span: block.span,
+        statements: rewrite_statements(output, block.statements, layout, frame_place),
+        terminator: rewrite_terminator(output, block.terminator, layout, frame_place)
+    );
+}
+
+mir.MirStatement[]& rewrite_statements(
+    mir.MirStore& output,
+    mir.MirStatement[]& statements,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirStatement>! rewritten = list.ArrayList<mir.MirStatement>(statements.length);
+    Int! index = 0;
+    while (index < statements.length) {
+        rewritten.add(rewrite_statement(output, statements[index], layout, frame_place));
+        index = index + 1;
+    }
+    return output.statement_array(rewritten$.ref());
+}
+
+mir.MirStatement rewrite_statement(
+    mir.MirStore& output,
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.MirStatement (
+        span: statement.span,
+        kind: rewrite_statement_kind(output, statement.kind, layout, frame_place)
+    );
+}
+
+mir.MirStatementKind rewrite_statement_kind(
+    mir.MirStore& output,
+    mir.MirStatementKind kind,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (kind is .assign_stmt(assign_stmt)) {
+        return mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: rewrite_place_to_frame(output, layout, frame_place, assign_stmt.destination),
+            value: rewrite_rvalue(output, assign_stmt.value, layout, frame_place)
+        ));
+    }
+    if (kind is .set_discriminant_stmt(set_discriminant)) {
+        return mir.set_discriminant_statement_kind(mir.MirSetDiscriminantStatement (
+            destination: rewrite_place_to_frame(output, layout, frame_place, set_discriminant.destination),
+            discriminant: set_discriminant.discriminant
+        ));
+    }
+    if (kind is .forget_stmt(forget_stmt)) {
+        return mir.forget_statement_kind(mir.MirForgetStatement (
+            place: rewrite_place_to_frame(output, layout, frame_place, forget_stmt.place)
+        ));
+    }
+    if (kind is .unique_stmt(unique_stmt)) {
+        return mir.unique_statement_kind(mir.MirUniqueStatement (
+            place: rewrite_place_to_frame(output, layout, frame_place, unique_stmt.place)
+        ));
+    }
+    return kind;
+}
+
+mir.MirTerminator rewrite_terminator(
+    mir.MirStore& output,
+    mir.MirTerminator terminator,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.MirTerminator (
+        span: terminator.span,
+        kind: rewrite_terminator_kind(output, terminator.kind, layout, frame_place)
+    );
+}
+
+mir.MirTerminatorKind rewrite_terminator_kind(
+    mir.MirStore& output,
+    mir.MirTerminatorKind kind,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (kind is .branch_term(branch_term)) {
+        return mir.branch_terminator_kind(mir.MirBranchTerminator (
+            condition: rewrite_operand(output, branch_term.condition, layout, frame_place),
+            then_target: branch_term.then_target,
+            else_target: branch_term.else_target
+        ));
+    }
+    if (kind is .switch_term(switch_term)) {
+        return mir.switch_terminator_kind(mir.MirSwitchTerminator (
+            discriminator: rewrite_operand(output, switch_term.discriminator, layout, frame_place),
+            cases: output.switch_case_slice(switch_term.cases),
+            default_target: switch_term.default_target
+        ));
+    }
+    if (kind is .call_term(call_term)) {
+        return rewrite_call_terminator(output, call_term, layout, frame_place);
+    }
+    if (kind is .drop_term(drop_term)) {
+        return mir.drop_terminator_kind(mir.MirDropTerminator (
+            place: rewrite_place_to_frame(output, layout, frame_place, drop_term.place),
+            target: drop_term.target,
+            cleanup: drop_term.cleanup
+        ));
+    }
+    if (kind is .assert_term(assert_term)) {
+        return mir.assert_terminator_kind(mir.MirAssertTerminator (
+            condition: rewrite_operand(output, assert_term.condition, layout, frame_place),
+            expected: assert_term.expected,
+            message: assert_term.message,
+            target: assert_term.target,
+            cleanup: assert_term.cleanup
+        ));
+    }
+    if (kind is .suspend_pending_term(suspend_pending)) {
+        return mir.suspend_pending_terminator_kind(suspend_pending);
+    }
+    if (kind is .throw_term(throw_term)) {
+        return .throw_term(mir.MirThrowTerminator (
+            error_value: rewrite_operand(output, throw_term.error_value, layout, frame_place)
+        ));
+    }
+    return kind;
+}
+
+mir.MirTerminatorKind rewrite_call_terminator(
+    mir.MirStore& output,
+    mir.MirCallTerminator call_term,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.call_terminator_kind(mir.MirCallTerminator (
+        callee: rewrite_callee(output, call_term.callee, layout, frame_place),
+        args: rewrite_operands(output, call_term.args, layout, frame_place),
+        current_effects: call_term.current_effects,
+        is_suspend_point: call_term.is_suspend_point,
+        destination: rewrite_place_to_frame(output, layout, frame_place, call_term.destination),
+        target: call_term.target,
+        initialized_place: rewrite_optional_place(output, call_term.initialized_place, layout, frame_place),
+        unique_places: rewrite_places(output, call_term.unique_places, layout, frame_place),
+        cleanup: call_term.cleanup
+    ));
+}
+
+mir.MirCallCallee rewrite_callee(
+    mir.MirStore& output,
+    mir.MirCallCallee callee,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (callee is .indirect_operand(operand)) {
+        return mir.indirect_operand_callee(rewrite_operand(output, operand, layout, frame_place));
+    }
+    return callee;
+}
+
+mir.MirOperand[]& rewrite_operands(
+    mir.MirStore& output,
+    mir.MirOperand[]& operands,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirOperand>! rewritten = list.ArrayList<mir.MirOperand>(operands.length);
+    Int! index = 0;
+    while (index < operands.length) {
+        rewritten.add(rewrite_operand(output, operands[index], layout, frame_place));
+        index = index + 1;
+    }
+    return output.operand_array(rewritten$.ref());
+}
+
+mir.MirOperand? rewrite_optional_operand(
+    mir.MirStore& output,
+    mir.MirOperand? operand,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (operand is .some(value)) {
+        return rewrite_operand(output, value, layout, frame_place);
+    }
+    return null;
+}
+
+mir.MirOperand rewrite_operand(
+    mir.MirStore& output,
+    mir.MirOperand operand,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (operand is .copy_operand(copy_operand)) {
+        return mir.copy_operand_value(mir.MirCopyOperand (
+            place: rewrite_place_to_frame(output, layout, frame_place, copy_operand.place)
+        ));
+    }
+    if (operand is .move_operand(move_operand)) {
+        return mir.move_operand_value(mir.MirMoveOperand (
+            place: rewrite_place_to_frame(output, layout, frame_place, move_operand.place)
+        ));
+    }
+    if (operand is .out_operand(out_operand)) {
+        return mir.out_operand_value(mir.MirOutOperand (
+            place: rewrite_place_to_frame(output, layout, frame_place, out_operand.place)
+        ));
+    }
+    return operand;
+}
+
+mir.MirPlace? rewrite_optional_place(
+    mir.MirStore& output,
+    mir.MirPlace? place,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (place is .some(value)) {
+        return rewrite_place_to_frame(output, layout, frame_place, value);
+    }
+    return null;
+}
+
+mir.MirPlace[]& rewrite_places(
+    mir.MirStore& output,
+    mir.MirPlace[]& places,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirPlace>! rewritten = list.ArrayList<mir.MirPlace>(places.length);
+    Int! index = 0;
+    while (index < places.length) {
+        rewritten.add(rewrite_place_to_frame(output, layout, frame_place, places[index]));
+        index = index + 1;
+    }
+    return output.place_array(rewritten$.ref());
+}
+
+mir.MirRvalue rewrite_rvalue(
+    mir.MirStore& output,
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (value is .use_value(use_value)) {
+        return mir.use_rvalue(mir.MirUseRvalue (
+            value: rewrite_operand(output, use_value.value, layout, frame_place)
+        ));
+    }
+    if (value is .unary_value(unary_value)) {
+        return mir.unary_rvalue(mir.MirUnaryRvalue (
+            op: unary_value.op,
+            value: rewrite_operand(output, unary_value.value, layout, frame_place)
+        ));
+    }
+    if (value is .binary_value(binary_value)) {
+        return mir.binary_rvalue(mir.MirBinaryRvalue (
+            op: binary_value.op,
+            lhs: rewrite_operand(output, binary_value.lhs, layout, frame_place),
+            rhs: rewrite_operand(output, binary_value.rhs, layout, frame_place)
+        ));
+    }
+    if (value is .cast_value(cast_value)) {
+        return mir.cast_rvalue(mir.MirCastRvalue (
+            kind: cast_value.kind,
+            value: rewrite_operand(output, cast_value.value, layout, frame_place),
+            target_type: cast_value.target_type
+        ));
+    }
+    return rewrite_place_rvalue(output, value, layout, frame_place);
+}
+
+mir.MirRvalue rewrite_place_rvalue(
+    mir.MirStore& output,
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (value is .borrow_value(borrow_value)) {
+        return mir.borrow_rvalue(mir.MirBorrowRvalue (
+            place: rewrite_place_to_frame(output, layout, frame_place, borrow_value.place)
+        ));
+    }
+    if (value is .address_of_value(address_of)) {
+        return mir.address_of_rvalue(mir.MirAddressOfRvalue (
+            mutable_pointer: address_of.mutable_pointer,
+            place: rewrite_place_to_frame(output, layout, frame_place, address_of.place)
+        ));
+    }
+    if (value is .slice_value(slice_value)) {
+        return mir.slice_rvalue(mir.MirSliceRvalue (
+            base: rewrite_place_to_frame(output, layout, frame_place, slice_value.base),
+            start: rewrite_optional_operand(output, slice_value.start, layout, frame_place),
+            end: rewrite_optional_operand(output, slice_value.end, layout, frame_place)
+        ));
+    }
+    if (value is .len_value(len_value)) {
+        return mir.len_rvalue(mir.MirLenRvalue (
+            place: rewrite_place_to_frame(output, layout, frame_place, len_value.place)
+        ));
+    }
+    if (value is .discriminant_value(discriminant)) {
+        return mir.discriminant_rvalue(mir.MirDiscriminantRvalue (
+            place: rewrite_place_to_frame(output, layout, frame_place, discriminant.place)
+        ));
+    }
+    return rewrite_non_place_rvalue(output, value, layout, frame_place);
+}
+
+mir.MirRvalue rewrite_non_place_rvalue(
+    mir.MirStore& output,
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (value is .alloc_value(alloc_value)) {
+        return mir.alloc_rvalue(mir.MirAllocValueRvalue (
+            value_type: alloc_value.value_type,
+            value: rewrite_operand(output, alloc_value.value, layout, frame_place)
+        ));
+    }
+    if (value is .alloc_array_value(alloc_array)) {
+        return mir.alloc_array_rvalue(mir.MirAllocArrayRvalue (
+            element_type: alloc_array.element_type,
+            count: rewrite_operand(output, alloc_array.count, layout, frame_place)
+        ));
+    }
+    if (value is .free_value(free_value)) {
+        return mir.free_rvalue(mir.MirFreeRvalue (
+            pointer: rewrite_operand(output, free_value.pointer, layout, frame_place)
+        ));
+    }
+    if (value is .aggregate_value(aggregate)) {
+        return rewrite_aggregate_rvalue(output, aggregate, layout, frame_place);
+    }
+    return rewrite_remaining_rvalue(output, value, layout, frame_place);
+}
+
+mir.MirRvalue rewrite_aggregate_rvalue(
+    mir.MirStore& output,
+    mir.MirAggregateRvalue aggregate,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.aggregate_rvalue(mir.MirAggregateRvalue (
+        kind: aggregate.kind,
+        def_id: aggregate.def_id,
+        type_id: aggregate.type_id,
+        tag: rewrite_optional_operand(output, aggregate.tag, layout, frame_place),
+        payload_field_index: aggregate.payload_field_index,
+        fields: rewrite_operands(output, aggregate.fields, layout, frame_place)
+    ));
+}
+
+mir.MirRvalue rewrite_remaining_rvalue(
+    mir.MirStore& output,
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (value is .optional_value(optional_value)) {
+        return mir.optional_rvalue(mir.MirOptionalRvalue (
+            op: optional_value.op,
+            value: rewrite_operand(output, optional_value.value, layout, frame_place)
+        ));
+    }
+    if (value is .error_union_value(error_union)) {
+        return mir.error_union_rvalue(mir.MirErrorUnionRvalue (
+            op: error_union.op,
+            value: rewrite_operand(output, error_union.value, layout, frame_place)
+        ));
+    }
+    if (value is .inline_asm_value(inline_asm)) {
+        return rewrite_inline_asm_rvalue(output, inline_asm, layout, frame_place);
+    }
+    return value;
+}
+
+mir.MirRvalue rewrite_inline_asm_rvalue(
+    mir.MirStore& output,
+    mir.MirInlineAsmRvalue inline_asm,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    return mir.inline_asm_rvalue(mir.MirInlineAsmRvalue (
+        result_type: inline_asm.result_type,
+        code_symbol: inline_asm.code_symbol,
+        operands: rewrite_inline_asm_operands(output, inline_asm.operands, layout, frame_place),
+        clobbers: inline_asm.clobbers,
+        volatile: inline_asm.volatile,
+        memory: inline_asm.memory,
+        noreturn: inline_asm.noreturn
+    ));
+}
+
+mir.MirInlineAsmOperand[]& rewrite_inline_asm_operands(
+    mir.MirStore& output,
+    mir.MirInlineAsmOperand[]& operands,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirInlineAsmOperand>! rewritten = list.ArrayList<mir.MirInlineAsmOperand>(operands.length);
+    Int! index = 0;
+    while (index < operands.length) {
+        rewritten.add(rewrite_inline_asm_operand(output, operands[index], layout, frame_place));
+        index = index + 1;
+    }
+    return output.inline_asm_operand_array(rewritten$.ref());
+}
+
+mir.MirInlineAsmOperand rewrite_inline_asm_operand(
+    mir.MirStore& output,
+    mir.MirInlineAsmOperand operand,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (operand is .input(input)) {
+        return .input(mir.MirInlineAsmInput (
+            constraint_symbol: input.constraint_symbol,
+            value: rewrite_operand(output, input.value, layout, frame_place)
+        ));
+    }
+    return operand;
+}
+
+() collect_block(
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    Int! statement_index = 0;
+    while (statement_index < block.statements.length) {
+        collect_statement(block.statements[statement_index], layout, plan);
+        statement_index = statement_index + 1;
+    }
+    collect_terminator(block.terminator, layout, plan);
+}
+
+() collect_statement(
+    mir.MirStatement statement,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (statement.kind is .assign_stmt(assign_stmt)) {
+        count_write_place(assign_stmt.destination, layout, plan);
+        collect_rvalue(assign_stmt.value, layout, plan);
+        return;
+    }
+    if (statement.kind is .set_discriminant_stmt(set_discriminant)) {
+        count_write_place(set_discriminant.destination, layout, plan);
+        return;
+    }
+    if (statement.kind is .forget_stmt(forget_stmt)) {
+        count_read_place(forget_stmt.place, layout, plan);
+        return;
+    }
+    if (statement.kind is .unique_stmt(unique_stmt)) {
+        count_unique_place(unique_stmt.place, layout, plan);
+    }
+}
+
+() collect_terminator(
+    mir.MirTerminator terminator,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (terminator.kind is .branch_term(branch_term)) {
+        collect_operand(branch_term.condition, layout, plan);
+        return;
+    }
+    if (terminator.kind is .switch_term(switch_term)) {
+        collect_operand(switch_term.discriminator, layout, plan);
+        return;
+    }
+    if (terminator.kind is .call_term(call_term)) {
+        collect_call_terminator(call_term, layout, plan);
+        return;
+    }
+    if (terminator.kind is .drop_term(drop_term)) {
+        count_read_place(drop_term.place, layout, plan);
+        return;
+    }
+    if (terminator.kind is .assert_term(assert_term)) {
+        collect_operand(assert_term.condition, layout, plan);
+        return;
+    }
+    if (terminator.kind is .throw_term(throw_term)) {
+        collect_operand(throw_term.error_value, layout, plan);
+    }
+}
+
+() collect_call_terminator(
+    mir.MirCallTerminator call_term,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    collect_callee(call_term.callee, layout, plan);
+    Int! index = 0;
+    while (index < call_term.args.length) {
+        collect_operand(call_term.args[index], layout, plan);
+        index = index + 1;
+    }
+    if (place_is_frame_backed(layout, call_term.destination)) {
+        plan.call_destination_count = plan.call_destination_count + 1;
+    }
+    if (call_term.initialized_place is .some(initialized_place)) {
+        count_write_place(initialized_place, layout, plan);
+    }
+    index = 0;
+    while (index < call_term.unique_places.length) {
+        count_unique_place(call_term.unique_places[index], layout, plan);
+        index = index + 1;
+    }
+}
+
+() collect_callee(
+    mir.MirCallCallee callee,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (callee is .indirect_operand(operand)) {
+        collect_operand(operand, layout, plan);
+    }
+}
+
+() collect_rvalue(
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (value is .use_value(use_value)) { collect_operand(use_value.value, layout, plan); return; }
+    if (value is .unary_value(unary_value)) { collect_operand(unary_value.value, layout, plan); return; }
+    if (value is .binary_value(binary_value)) {
+        collect_operand(binary_value.lhs, layout, plan);
+        collect_operand(binary_value.rhs, layout, plan);
+        return;
+    }
+    if (value is .cast_value(cast_value)) { collect_operand(cast_value.value, layout, plan); return; }
+    if (value is .borrow_value(borrow_value)) { count_borrow_place(borrow_value.place, layout, plan); return; }
+    if (value is .address_of_value(address_of)) { count_address_place(address_of.place, layout, plan); return; }
+    collect_non_scalar_rvalue(value, layout, plan);
+}
+
+() collect_non_scalar_rvalue(
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (value is .alloc_value(alloc_value)) { collect_operand(alloc_value.value, layout, plan); return; }
+    if (value is .alloc_array_value(alloc_array)) { collect_operand(alloc_array.count, layout, plan); return; }
+    if (value is .free_value(free_value)) { collect_operand(free_value.pointer, layout, plan); return; }
+    if (value is .slice_value(slice_value)) { collect_slice_rvalue(slice_value, layout, plan); return; }
+    if (value is .len_value(len_value)) { count_read_place(len_value.place, layout, plan); return; }
+    if (value is .discriminant_value(discriminant)) {
+        count_read_place(discriminant.place, layout, plan);
+        return;
+    }
+    collect_aggregate_like_rvalue(value, layout, plan);
+}
+
+() collect_slice_rvalue(
+    mir.MirSliceRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    count_read_place(value.base, layout, plan);
+    if (value.start is .some(start)) { collect_operand(start, layout, plan); }
+    if (value.end is .some(end)) { collect_operand(end, layout, plan); }
+}
+
+() collect_aggregate_like_rvalue(
+    mir.MirRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (value is .aggregate_value(aggregate)) {
+        if (aggregate.tag is .some(tag)) { collect_operand(tag, layout, plan); }
+        collect_operands(aggregate.fields, layout, plan);
+        return;
+    }
+    if (value is .optional_value(optional_value)) { collect_operand(optional_value.value, layout, plan); return; }
+    if (value is .error_union_value(error_union)) { collect_operand(error_union.value, layout, plan); return; }
+    if (value is .inline_asm_value(inline_asm)) { collect_inline_asm(inline_asm, layout, plan); }
+}
+
+() collect_inline_asm(
+    mir.MirInlineAsmRvalue value,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    Int! index = 0;
+    while (index < value.operands.length) {
+        if (value.operands[index] is .input(input)) {
+            collect_operand(input.value, layout, plan);
+        }
+        index = index + 1;
+    }
+}
+
+() collect_operands(
+    mir.MirOperand[]& operands,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    Int! index = 0;
+    while (index < operands.length) {
+        collect_operand(operands[index], layout, plan);
+        index = index + 1;
+    }
+}
+
+() collect_operand(
+    mir.MirOperand operand,
+    mir.MirCoroutineFrameLayout& layout,
+    FrameRewritePlan!& plan
+) {
+    if (operand is .copy_operand(copy_operand)) {
+        count_read_place(copy_operand.place, layout, plan);
+        return;
+    }
+    if (operand is .move_operand(move_operand)) {
+        count_move_place(move_operand.place, layout, plan);
+        return;
+    }
+    if (operand is .out_operand(out_operand)) {
+        count_write_place(out_operand.place, layout, plan);
+    }
+}
+
+() count_read_place(mir.MirPlace place, mir.MirCoroutineFrameLayout& layout, FrameRewritePlan!& plan) {
+    if (place_is_frame_backed(layout, place)) {
+        plan.read_count = plan.read_count + 1;
+    }
+}
+
+() count_write_place(mir.MirPlace place, mir.MirCoroutineFrameLayout& layout, FrameRewritePlan!& plan) {
+    if (place_is_frame_backed(layout, place)) {
+        plan.write_count = plan.write_count + 1;
+    }
+}
+
+() count_move_place(mir.MirPlace place, mir.MirCoroutineFrameLayout& layout, FrameRewritePlan!& plan) {
+    if (place_is_frame_backed(layout, place)) {
+        plan.move_count = plan.move_count + 1;
+    }
+}
+
+() count_borrow_place(mir.MirPlace place, mir.MirCoroutineFrameLayout& layout, FrameRewritePlan!& plan) {
+    if (place_is_frame_backed(layout, place)) {
+        plan.borrow_count = plan.borrow_count + 1;
+    }
+}
+
+() count_address_place(mir.MirPlace place, mir.MirCoroutineFrameLayout& layout, FrameRewritePlan!& plan) {
+    if (place_is_frame_backed(layout, place)) {
+        plan.address_count = plan.address_count + 1;
+    }
+}
+
+() count_unique_place(mir.MirPlace place, mir.MirCoroutineFrameLayout& layout, FrameRewritePlan!& plan) {
+    if (place_is_frame_backed(layout, place)) {
+        plan.unique_count = plan.unique_count + 1;
+    }
+}
