@@ -401,21 +401,18 @@ public struct DeclCheck: Movable {
             self.check_negative_type_bound(bound);
             return;
         }
-        if (predicate is .type_equal(equal)) {
-            self.type_ops.check_type_ref(equal.subject);
-            self.type_ops.check_where_type_pattern_ref(equal.value);
+        if (predicate is .equal(equal)) {
+            self.check_where_equal(equal);
             return;
         }
-        if (predicate is .type_not_equal(equal)) {
-            self.type_ops.check_type_ref(equal.subject);
-            self.type_ops.check_where_type_pattern_ref(equal.value);
+        if (predicate is .not_equal(equal)) {
+            self.check_where_equal(equal);
             return;
         }
         if (predicate is .projection_equal(equal)) {
             self.type_ops.check_type_ref(equal.subject);
             self.check_trait_ref(equal.trait_ref);
             self.check_projected_assoc_type(equal);
-            self.type_ops.check_type_ref(equal.value);
         }
     }
 
@@ -438,22 +435,88 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        guard self.state.store.resolve.namespaces.first_binding(namespace_id, equal.assoc_symbol, .type_name)
-            is .some(binding) else {
+        if (self.projected_assoc_def(namespace_id, equal.assoc_symbol, .type_name) is .some(_)) {
+            self.type_ops.check_type_ref(equal.value);
+            return;
+        }
+        if (self.projected_assoc_def(namespace_id, equal.assoc_symbol, .value_name) is .some(assoc_def)) {
+            qid.TypeId expected_type = self.type_ops.type_for_decl_def(assoc_def);
+            if (self.type_ops.const_value_for_expected_type(equal.value, expected_type) != null) {
+                return;
+            }
             self.type_ops.add_node_error(
-                equal.trait_ref,
-                "unresolved associated type in trait",
-                "unresolved_associated_type"
+                equal.value,
+                "associated const binding value must be a compile-time value",
+                "expected_associated_const_value"
             );
             return;
         }
-        if (self.state.store.defs.get(binding.def_id).kind != .associated_type_def) {
-            self.type_ops.add_node_error(
-                equal.trait_ref,
-                "projected name is not an associated type",
-                "expected_associated_type"
-            );
+        self.type_ops.add_node_error(
+            equal.trait_ref,
+            "unresolved associated item in trait",
+            "unresolved_associated_item"
+        );
+    }
+
+    qid.DefId? projected_assoc_def(self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId assoc_symbol,
+        def.NameDomain domain
+    ) {
+        guard self.state.store.resolve.namespaces.first_binding(namespace_id, assoc_symbol, domain)
+            is .some(binding) else {
+            return null;
         }
+        if (self.state.store.defs.get(binding.def_id).kind != .associated_type_def) {
+            return null;
+        }
+        return binding.def_id;
+    }
+
+    () check_where_equal(self, hir.HirWhereEqual equal) {
+        if (self.type_ops.const_generic_param_ref(equal.subject) is .some(param_def)) {
+            qid.TypeId expected_type = self.type_ops.type_for_def(param_def);
+            if (self.type_ops.const_value_for_expected_type(equal.value, expected_type) == null) {
+                self.type_ops.add_node_error(
+                    equal.value,
+                    "where const equality value must be a compile-time value",
+                    "expected_const_value"
+                );
+            }
+            return;
+        }
+        if (self.hir_node_is_type_ref(equal.subject)) {
+            self.type_ops.check_type_ref(equal.subject);
+            if (self.hir_node_is_type_ref(equal.value)) {
+                self.type_ops.check_where_type_pattern_ref(equal.value);
+                return;
+            }
+            self.type_ops.add_node_error(
+                equal.value,
+                "where type equality value must be a type",
+                "expected_type_ref"
+            );
+            return;
+        }
+        self.type_ops.add_node_error(
+            equal.subject,
+            "where equality subject must be a type or const parameter",
+            "invalid_where_equal_subject"
+        );
+    }
+
+    Bool hir_node_is_type_ref(self, hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .named_type_ref(_)) { return true; }
+        if (node.data is .layered_type_ref(_)) { return true; }
+        if (node.data is .array_type_ref(_)) { return true; }
+        if (node.data is .errorable_type_ref(_)) { return true; }
+        if (node.data is .function_type_ref(_)) { return true; }
+        if (node.data is .tuple_type_ref(_)) { return true; }
+        if (node.data is .unit_type_ref()) { return true; }
+        if (node.data is .infer_type_ref()) { return true; }
+        if (node.data is .trait_companion_type_ref(_)) { return true; }
+        return node.data is .invalid_type_ref;
     }
 
     () check_associated_type_owner(self, hir.HirDef& hir_def) {
@@ -709,11 +772,26 @@ public struct DeclCheck: Movable {
         if (trait_record.kind == .associated_type_def) {
             if (trait_record.domain == .value_name) {
                 if (self.trait_associated_const_has_default(trait_member)) { return; }
+                if (self.associated_const_binding_impl_exists(impl_def, trait_member)) { return; }
                 self.check_trait_associated_const_implemented(impl_def, trait_member);
                 return;
             }
             self.check_trait_associated_type_implemented(impl_def, trait_member);
         }
+    }
+
+    Bool associated_const_binding_impl_exists(self, qid.DefId impl_def, qid.DefId trait_assoc) {
+        guard self.state.store.defs.get(trait_assoc).owner_def is .some(trait_def) else { return false; }
+        qid.SymbolId assoc_symbol = self.state.store.defs.get(trait_assoc).name.symbol;
+        guard self.state.hirs.def(impl_def) is .some(impl_hir) else { return false; }
+        Int! index = 0;
+        while (index < impl_hir.where_predicates.len()) {
+            hir.HirWherePredicate predicate = impl_hir.where_predicates.get(index);
+            index = index + 1;
+            guard predicate is .projection_equal(equal) else { continue; }
+            if (self.projection_equal_targets_assoc(equal, trait_def, assoc_symbol)) { return true; }
+        }
+        return false;
     }
 
     Bool trait_associated_const_has_default(self, qid.DefId trait_member) {

@@ -1089,28 +1089,123 @@ public struct ReferenceResolver: Movable {
             self.resolve_type_bound(bound.bound);
             return;
         }
-        if (constraint.data is .where_type_equal(equal)) {
-            self.resolve_type_ref(equal.param);
-            self.resolve_type_ref(equal.value);
+        if (constraint.data is .where_equal(equal)) {
+            self.resolve_where_equal_constraint(equal);
             return;
         }
-        if (constraint.data is .where_type_not_equal(equal)) {
-            self.resolve_type_ref(equal.param);
-            self.resolve_type_ref(equal.value);
+        if (constraint.data is .where_not_equal(equal)) {
+            self.resolve_where_equal_constraint(equal);
             return;
         }
         if (constraint.data is .where_projection_equal(equal)) {
             self.resolve_type_ref(equal.param);
             self.resolve_path(equal.trait_path, .type_name);
-            self.resolve_type_ref(equal.value);
+            self.resolve_projection_equal_value(equal);
         }
+    }
+
+    () resolve_where_equal_constraint(self, ast.WhereEqualData equal) {
+        if (self.resolve_where_subject_as_const(equal.param)) {
+            self.resolve_expected_const_expr(equal.value);
+            return;
+        }
+        self.resolve_type_ref(equal.param);
+        self.resolve_type_ref(equal.value);
+    }
+
+    Bool resolve_where_subject_as_const(self, ast.AstId subject) {
+        if (self.try_resolve_value_expr_path(subject) is .some(def_id)) {
+            if (self.generic_param_is_value_param(def_id)) {
+                self.resolve_value_expr_path(subject);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Bool generic_param_is_value_param(self, qid.DefId def_id) {
+        def.DefRecord record = self.state.store.defs.get(def_id);
+        return record.kind == .generic_param_def && record.domain == .value_name;
+    }
+
+    () resolve_projection_equal_value(self, ast.WhereProjectionEqualData equal) {
+        guard self.try_resolve_path(equal.trait_path, .type_name) is .some(trait_def) else {
+            self.resolve_type_ref(equal.value);
+            return;
+        }
+        if (self.trait_associated_item_domain(trait_def, equal.assoc_name) is .some(domain)) {
+            if (domain == .value_name) {
+                self.resolve_expected_const_expr(equal.value);
+                return;
+            }
+        }
+        self.resolve_type_ref(equal.value);
+    }
+
+    () resolve_expected_const_expr(self, ast.AstId value) {
+        ast.AstNode node = self.state.unit.get(value);
+        if (node.data is .named_type(named_type) && named_type.args.length == 0) {
+            if (self.try_resolve_path(named_type.path, .value_name) != null) {
+                self.resolve_path(named_type.path, .value_name);
+                return;
+            }
+        }
+        if (node.data is .field_expr(field)) {
+            self.resolve_expected_const_field_expr(field);
+            return;
+        }
+        self.resolve_expr(value);
+    }
+
+    () resolve_expected_const_field_expr(self, ast.FieldExprData field) {
+        ast.AstNode base = self.state.unit.get(field.base);
+        if (base.data is .unit_type) {
+            return;
+        }
+        if (base.data is .named_type(_)) {
+            self.resolve_type_ref(field.base);
+            return;
+        }
+        if (self.ast_node_is_unambiguous_type_ref(field.base)) {
+            self.resolve_type_ref(field.base);
+            return;
+        }
+        self.resolve_expr(field.base);
+    }
+
+    def.NameDomain? trait_associated_item_domain(self, qid.DefId trait_def, ast.AstId assoc_name) {
+        guard self.state.name_symbol(assoc_name) is .some(symbol) else { return null; }
+        guard self.state.store.defs.get(trait_def).owned_namespace_id is .some(namespace_id) else { return null; }
+        if (self.associated_item_in_domain(namespace_id, symbol, .type_name) != null) {
+            return def.NameDomain.type_name;
+        }
+        if (self.associated_item_in_domain(namespace_id, symbol, .value_name) != null) {
+            return def.NameDomain.value_name;
+        }
+        return null;
+    }
+
+    qid.DefId? associated_item_in_domain(
+        self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain
+    ) {
+        guard self.state.store.resolve.namespaces.first_binding(namespace_id, symbol, domain)
+            is .some(binding) else {
+            return null;
+        }
+        if (self.state.store.defs.get(binding.def_id).kind != .associated_type_def) {
+            return null;
+        }
+        return binding.def_id;
     }
 
     () resolve_type_bound(self, ast.AstId bound_id) {
         ast.AstNode bound = self.state.unit.get(bound_id);
         if (bound.data is .trait_bound(trait_bound)) {
-            self.resolve_path(trait_bound.path, .type_name);
-            self.resolve_type_bound_args(trait_bound.args);
+            qid.DefId? trait_def = self.resolve_path(trait_bound.path, .type_name);
+            self.resolve_type_bound_args(trait_def, trait_bound.args);
             return;
         }
         if (bound.data is .type_bound_intersection(intersection)) {
@@ -1119,18 +1214,32 @@ public struct ReferenceResolver: Movable {
         }
     }
 
-    () resolve_type_bound_args(self, ast.AstRange args) {
+    () resolve_type_bound_args(self, qid.DefId? trait_def, ast.AstRange args) {
         Int! index = 0;
         while (index < args.length) {
             ast.AstId arg_id = self.state.unit.child_at(args, index);
             ast.AstNode arg = self.state.unit.get(arg_id);
             if (arg.data is .assoc_type_binding(binding)) {
-                self.resolve_type_ref(binding.value);
+                self.resolve_assoc_binding_value(trait_def, binding);
             } else {
                 self.resolve_type_ref(arg_id);
             }
             index = index + 1;
         }
+    }
+
+    () resolve_assoc_binding_value(self, qid.DefId? trait_def, ast.AssocTypeBindingData binding) {
+        guard trait_def is .some(trait_id) else {
+            self.resolve_type_ref(binding.value);
+            return;
+        }
+        if (self.trait_associated_item_domain(trait_id, binding.name) is .some(domain)) {
+            if (domain == .value_name) {
+                self.resolve_expected_const_expr(binding.value);
+                return;
+            }
+        }
+        self.resolve_type_ref(binding.value);
     }
 
     () resolve_params(self, ast.AstRange params) {
@@ -1697,6 +1806,18 @@ public struct ReferenceResolver: Movable {
             self.resolve_expr_range(items);
             return;
         }
+    }
+
+    Bool ast_node_is_unambiguous_type_ref(self, ast.AstId node_id) {
+        ast.AstNode node = self.state.unit.get(node_id);
+        if (node.data is .infer_type) { return true; }
+        if (node.data is .type_ref(_)) { return true; }
+        if (node.data is .array_type(_)) { return true; }
+        if (node.data is .errorable_type(_)) { return true; }
+        if (node.data is .function_type(_)) { return true; }
+        if (node.data is .effect_type(_)) { return true; }
+        if (node.data is .tuple_type(_)) { return true; }
+        return false;
     }
 
     () resolve_lambda_expr(self, ast.LambdaData lambda) {
