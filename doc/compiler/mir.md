@@ -141,6 +141,33 @@ control flow 由 terminator 表达：
 MIR lowering 接收 `MonomorphStore`。非泛型函数按 `DefId` 直接 lower；泛型函数只按 concrete
 `InstanceKey` lower。lowering 中的 type substitution 只用于当前 concrete body。
 
+## Async continuation ABI
+
+async source function 的普通 MIR body 只作为 coroutine pass 的输入，不直接生成源码形状的
+backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；普通隐式 await 直接把
+child frame 连接到 caller continuation，只有显式 `foo$().async()` 才 materialize `Future<T>`。
+
+第三方 runtime 提供的 `extern async` 使用单隐藏参数 ABI：
+
+```text
+extern_async(args..., AsyncContinuation*) -> Unit
+
+AsyncContinuation {
+  result_ptr
+  caller_context
+  resume_fn
+}
+```
+
+continuation record 嵌入 caller coroutine frame，不要求堆分配。runtime 可以保存该稳定指针，完成后
+先写 result，再调用 `resume_fn(caller_context)`。`result_ptr`、frame linkage 等 compiler 地址使用
+专用 MIR 来源标记，但 backend 仍 lower 成普通 raw pointer；用户 raw/reference 借用规则不因此放宽。
+
+跨线程 Future completion 必须使用 release/acquire 同步，并通过 waiter claim CAS 防止丢唤醒或重复
+resume。等待方先写 waiter context/function，再发布 armed 状态并重新 acquire 检查 ready；完成方发布
+ready 后只在成功把 armed claim 为 notified 时调用 waiter。等待方若观察到 ready，只在成功撤销 armed
+时直接继续，否则由已经 claim 的完成方负责恢复。serial domain 可以在证明不跨线程后消除原子操作。
+
 ## 不变量
 
 - MIR 不保存 AST id。
