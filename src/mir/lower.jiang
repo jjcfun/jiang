@@ -158,10 +158,14 @@ struct MirLowerer: Movable {
     }
 
     () lower_coroutine_resume_function(self, mir.MirFunction function) {
-        if (!function.is_coroutine || function.is_external || function.is_coroutine_resume) {
+        if (!function.is_coroutine || function.is_coroutine_resume) {
             return;
         }
         guard function.coroutine_frame is .some(frame) else {
+            return;
+        }
+        if (function.is_external) {
+            coroutine_frame_rewrite.add_completion_function(self.output, function, frame$.ref());
             return;
         }
         coroutine_frame_rewrite.add_resume_function(self.output, function, frame$.ref());
@@ -359,7 +363,9 @@ struct MirLowerer: Movable {
         monomorph.SubstitutionMap! empty = monomorph.SubstitutionMap();
         types.EffectSet effects = self.function_effects_for_def(hir_def.def_id, empty$.ref());
         mir.MirBody mir_body = self.external_function_body(mir.MirBodyId.from_index(function_index), hir_def, span);
-        mir.MirCoroutineFrameLayout? coroutine_frame = self.coroutine_frame_layout_for_body(mir_body, effects);
+        mir.MirCoroutineFrameLayout? coroutine_frame = self.external_coroutine_frame_layout(
+            mir.MirBodyId.from_index(function_index), hir_def.def_id, effects, span
+        );
         self.output.add_function(mir.MirFunction (
             id: mir.MirFunctionId.from_index(function_index),
             def_id: hir_def.def_id,
@@ -381,6 +387,18 @@ struct MirLowerer: Movable {
         ));
     }
 
+    mir.MirCoroutineFrameLayout? external_coroutine_frame_layout(
+        self,
+        mir.MirBodyId body_id,
+        qid.DefId function_def,
+        types.EffectSet effects,
+        token.Span span
+    ) {
+        if (!effects.has_async) { return null; }
+        mir.MirBody source_body = self.external_source_function_body(body_id, function_def, span);
+        return self.coroutine_frame_layout_for_body(source_body, effects);
+    }
+
     () ensure_external_function(self, qid.DefId function_def) {
         if (self.output.function_id_for_def(function_def) != null) {
             return;
@@ -390,6 +408,8 @@ struct MirLowerer: Movable {
         }
         if (self.hirs.def(function_def) is .some(hir_def)) {
             if (self.hirs.has_body(hir_def.def_id)) { return; }
+            self.lower_external_function(hir_def);
+            return;
         }
         self.lower_external_function_def(function_def);
     }
@@ -523,15 +543,22 @@ struct MirLowerer: Movable {
     () lower_external_function_def(self, qid.DefId function_def) {
         Int function_index = self.output.functions.len();
         token.Span span = self.def_span(function_def);
+        monomorph.SubstitutionMap! empty = monomorph.SubstitutionMap();
+        types.EffectSet effects = self.function_effects_for_def(function_def, empty$.ref());
+        mir.MirBody body = self.external_function_body_for_def(
+            mir.MirBodyId.from_index(function_index), function_def, span
+        );
         self.output.add_function(mir.MirFunction (
             id: mir.MirFunctionId.from_index(function_index),
             def_id: function_def,
             type_args: self.output.empty_type_args(),
             const_args: self.output.empty_const_args(),
             signature_id: null,
-            effects: types.EffectSet(),
-            is_coroutine: false,
-            coroutine_frame: null,
+            effects: effects,
+            is_coroutine: effects.has_async,
+            coroutine_frame: self.external_coroutine_frame_layout(
+                mir.MirBodyId.from_index(function_index), function_def, effects, span
+            ),
             is_coroutine_resume: false,
         is_coroutine_completion: false,
             is_language_entry: false,
@@ -540,7 +567,7 @@ struct MirLowerer: Movable {
             inline_always: false,
             naked: false,
             span: span,
-            body: self.external_function_body_for_def(mir.MirBodyId.from_index(function_index), function_def, span)
+            body: body
         ));
     }
 
@@ -620,6 +647,31 @@ struct MirLowerer: Movable {
             return self.external_async_function_body(body_id, function_type, span);
         }
 
+        return self.external_source_body_for_type(body_id, function_type, span);
+    }
+
+    mir.MirBody external_source_function_body(
+        self,
+        mir.MirBodyId body_id,
+        qid.DefId function_def,
+        token.Span span
+    ) {
+        guard self.typeck.def_type(function_def) is .some(function_type_id) else {
+            return self.empty_external_body(body_id, span);
+        }
+        types.TypeInfo info = self.ctx.store.types.get(function_type_id);
+        guard info.data is .function_type(function_type) else {
+            return self.empty_external_body(body_id, span);
+        }
+        return self.external_source_body_for_type(body_id, function_type, span);
+    }
+
+    mir.MirBody external_source_body_for_type(
+        self,
+        mir.MirBodyId body_id,
+        types.FunctionType function_type,
+        token.Span span
+    ) {
         Int local_count = function_type.params.length + 1;
         mir.MirLocalDecl![*] locals = self.output.alloc_local_array(local_count);
         locals[0] = self.runtime_local(mir.MirLocalId.from_index(0), .return_place, function_type.result, span);
@@ -4406,6 +4458,22 @@ struct BodyLowerer: Movable {
             self.mark_unsupported(node_id);
             return;
         }
+        guard self.async_call_target_def(call) is .some(target_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
+        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        guard self.async_call_target_function(target_def, type_args, const_args) is .some(function) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        if (function.is_external) {
+            self.lower_external_async_future(
+                node_id, call, target_def, type_args, const_args, layout$.ref(), destination, span
+            );
+            return;
+        }
         mir.MirLocalId frame_local = self.add_temp(layout.frame_type_id, span);
         mir.MirPlace frame_place = self.place_for_local(frame_local);
         self.lower_async_call_args_into_frame(call, layout$.ref(), frame_place);
@@ -4432,6 +4500,123 @@ struct BodyLowerer: Movable {
             index = index + 1;
         }
         self.lower_future_resume_call(destination, span);
+    }
+
+    () lower_external_async_future(
+        self,
+        hir.HirId node_id,
+        hir.HirImplicitCall call,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace future_place,
+        token.Span span
+    ) {
+        self.statements.add(coroutine_future_abi.state_initializer(
+            self.lowerer.output, layout, future_place, span
+        ));
+        self.statements.add(coroutine_future_abi.waiter_registered_initializer(
+            self.lowerer.output, layout, future_place, span
+        ));
+        qid.TypeId continuation_type = self.lowerer.external_async_continuation_type(
+            layout.future_abi.result_type_id, span
+        );
+        mir.MirLocalId continuation_local = self.add_temp(continuation_type, span);
+        mir.MirPlace continuation_place = self.place_for_local(continuation_local);
+        self.initialize_external_future_continuation(
+            node_id, call, layout, future_place, continuation_place, span
+        );
+        mir.MirLocalId continuation_pointer = self.add_temp(
+            self.lowerer.external_async_continuation_pointer_type(layout.future_abi.result_type_id, span),
+            span
+        );
+        self.push_assign(
+            self.place_for_local(continuation_pointer),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(call.args.length + 1);
+        Int! index = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_to_operand(call.args[index]));
+            index = index + 1;
+        }
+        args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        mir.MirOperand[]& abi_args = self.lowerer.output.operand_array(args$.ref());
+        self.lower_external_async_start_call(target_def, type_args, const_args, abi_args, span);
+    }
+
+    () initialize_external_future_continuation(
+        self,
+        hir.HirId node_id,
+        hir.HirImplicitCall call,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace future_place,
+        mir.MirPlace continuation_place,
+        token.Span span
+    ) {
+        self.push_assign(
+            self.project_constant_index(continuation_place, 0),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: self.project_constant_index(future_place, layout.future_abi.result_field_index),
+                frame_root: false
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, 1),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: future_place,
+                frame_root: false
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, 2),
+            mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.function_operand_value(
+                    self.async_call_completion_function_ref(node_id, call, layout)$.some()
+                )
+            )),
+            span
+        );
+    }
+
+    () lower_external_async_start_call(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        mir.MirOperand[]& args,
+        token.Span span
+    ) {
+        qid.TypeId source_type = self.function_type_for_ref(target_def, type_args, const_args);
+        mir.MirLocalId unit_result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        mir.MirBlockId next_block = self.reserve_block(span);
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.direct_function_callee(mir.MirFunctionRef (
+                function_def: target_def,
+                type_args: self.lowerer.output.type_arg_array(type_args),
+                const_args: self.lowerer.output.const_arg_array(const_args),
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: self.lowerer.external_async_abi_function_type(source_type, span),
+                span: span
+            )),
+            args: args,
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(unit_result),
+            target: next_block,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next_block);
     }
 
     mir.MirFunctionRef? async_call_completion_function_ref(
