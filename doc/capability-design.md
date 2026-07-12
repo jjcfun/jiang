@@ -43,7 +43,7 @@ enum DomainKind {
 }
 
 trait Domain {
-    associated Kind: const DomainKind;
+    associated kind: const DomainKind;
 }
 
 ```
@@ -52,11 +52,11 @@ trait Domain {
 
 ```jiang
 public struct UiDomain: Domain {
-    associated Kind = .serial;
+    associated kind = .serial;
 }
 
 public struct WorkerPoolDomain: Domain {
-    associated Kind = .concurrent;
+    associated kind = .concurrent;
 }
 ```
 
@@ -65,13 +65,13 @@ public struct WorkerPoolDomain: Domain {
 - `current` 是语言内建特殊值，表示继承当前 async/sync domain context。
 - `UiDomain`、`WorkerPoolDomain` 等不是语言魔法；它们来自 import 后可见的类型。
 - `async [domain_type]` / `sync [domain_type]` 中的 `domain_type` 必须是实现
-  `Domain` 的类型；编译器通过 `Domain.Kind` 读取 serial/concurrent 语义。
+  `Domain` 的类型；编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
 
 `Domain` 只描述 identity 和串行性。用户实现 `Domain` 时不需要接触 executor、coroutine frame
-或 continuation ABI。编译器根据 `Domain.Kind` 选择内部 runtime 调度入口；具体事件循环、线程池
+或 continuation ABI。编译器根据 `Domain.kind` 选择内部 runtime 调度入口；具体事件循环、线程池
 和 UI 主线程适配由 runtime 层提供，不作为 `Domain` 的公开成员。
 
-`Domain.Kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.Kind ==
+`Domain.kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.kind ==
 .concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T!&` 不能依赖它保证安全。在
 concurrent domain 中共享可变状态必须使用 `Mutex`、`Atomic`、`Channel` 或等价同步
 capability。

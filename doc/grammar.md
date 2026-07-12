@@ -335,7 +335,7 @@ name        <- ident / "self"
 - `async [domain]` / `sync [domain]` 是 block effect 中
   `async [domain: domain]` / `sync [domain: domain]` 的短写；`async [domain, context]`
   是 `async [domain: domain, context: context]` 的短写。`domain` 是实现 `Domain` 的编译期
-  domain type；编译器通过 `Domain.Kind` 区分 serial/concurrent 语义。`context` 是运行时
+  domain type；编译器通过 `Domain.kind` 区分 serial/concurrent 语义。`context` 是运行时
   async context。
 - 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type；带 `context` 的形式
   只用于 keyword block。

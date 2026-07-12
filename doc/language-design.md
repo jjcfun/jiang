@@ -659,7 +659,7 @@ const initializer 不能依赖运行时值，也不能执行 IO 或其他运行�
 `struct Array<T, N: const Int>` 或 `Int size<N: const Int>() { N }`。这里 `const Type` 是一种
 约束 kind，不是 trait；const generic 名字是值层参数，可在表达式中使用，不能作为类型名使用。
 trait associated item 也可以使用同一形式表达编译期值约束，例如
-`associated Kind: const DomainKind`。
+`associated kind: const DomainKind`。
 
 ### Import
 
