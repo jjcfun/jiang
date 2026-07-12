@@ -108,6 +108,48 @@ public CompletionFunctionLowering add_completion_function(
     return lowered;
 }
 
+public CompletionFunctionLowering add_detached_completion_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionRef? env_drop
+) {
+    mir.MirFunctionId function_id = mir.MirFunctionId.from_index(output.functions.len());
+    CompletionFunctionLowering lowered = CompletionFunctionLowering (
+        function: detached_completion_function(output, source, layout, function_id, env_drop)
+    );
+    output.add_generated_function(lowered.function);
+    return lowered;
+}
+
+mir.MirFunction detached_completion_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId function_id,
+    mir.MirFunctionRef? env_drop
+) {
+    return mir.MirFunction (
+        id: function_id,
+        def_id: source.def_id,
+        type_args: output.type_arg_array(source.type_args),
+        const_args: output.const_arg_array(source.const_args),
+        signature_id: null,
+        effects: types.EffectSet(),
+        is_coroutine: false,
+        coroutine_frame: null,
+        is_coroutine_resume: false,
+        is_coroutine_completion: true,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: true,
+        naked: false,
+        span: source.span,
+        body: detached_completion_body(output, layout, function_id, source.span, env_drop)
+    );
+}
+
 mir.MirFunction completion_function(
     mir.MirStore& output,
     mir.MirFunction source,
@@ -133,6 +175,143 @@ mir.MirFunction completion_function(
         naked: false,
         span: source.span,
         body: completion_body(output, layout, function_id, source.span, env_drop)
+    );
+}
+
+mir.MirBody detached_completion_body(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId function_id,
+    token.Span span,
+    mir.MirFunctionRef? env_drop
+) {
+    mir.MirLocalId return_local = mir.MirLocalId.from_index(0);
+    mir.MirLocalId context_local = mir.MirLocalId.from_index(1);
+    mir.MirLocalId frame_pointer_local = mir.MirLocalId.from_index(2);
+    mir.MirLocalDecl![*] locals = output.alloc_local_array(3);
+    locals[0] = generated_local(
+        return_local,
+        mir.MirLocalKind.return_place,
+        layout.future_abi.resume_return_type_id,
+        span
+    );
+    locals[1] = generated_local(
+        context_local,
+        mir.MirLocalKind.param,
+        layout.fields[layout.continuation_context_field_index].type_id,
+        span
+    );
+    locals[2] = generated_local(
+        frame_pointer_local,
+        mir.MirLocalKind.compiler_temp,
+        layout.future_abi.frame_pointer_type_id,
+        span
+    );
+    mir.MirPlace frame_pointer_place = mir.local_place(frame_pointer_local, output.empty_projection());
+    list.ArrayList<mir.MirStatement>! entry_statements = list.ArrayList<mir.MirStatement>(1);
+    entry_statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: frame_pointer_place,
+            value: mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.ptr_to_ptr,
+                value: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(context_local, output.empty_projection())
+                )),
+                target_type: layout.future_abi.frame_pointer_type_id
+            ))
+        ))
+    ));
+    mir.MirPlace frame_place = deref_frame_pointer_place(output, frame_pointer_local);
+    mir.MirBlockId free_id = mir.MirBlockId.from_index(1);
+    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(2);
+    if (env_drop is .some(drop_function)) {
+        blocks.add(detached_env_drop_block(
+            output,
+            layout,
+            frame_place,
+            return_local,
+            drop_function,
+            free_id,
+            entry_statements$.ref(),
+            span
+        ));
+    } else {
+        blocks.add(mir.MirBlock (
+            id: mir.MirBlockId.from_index(0),
+            span: span,
+            statements: output.statement_array(entry_statements$.ref()),
+            terminator: goto_terminator(span, free_id)
+        ));
+    }
+    list.ArrayList<mir.MirStatement>! free_statements = list.ArrayList<mir.MirStatement>(1);
+    free_statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(return_local, output.empty_projection()),
+            value: mir.free_rvalue(mir.MirFreeRvalue (
+                pointer: mir.copy_operand_value(mir.MirCopyOperand (place: frame_pointer_place))
+            ))
+        ))
+    ));
+    blocks.add(mir.MirBlock (
+        id: free_id,
+        span: span,
+        statements: output.statement_array(free_statements$.ref()),
+        terminator: mir.MirTerminator (
+            span: span,
+            kind: mir.return_terminator_kind(mir.MirReturnTerminator (implicit_unit: true))
+        )
+    ));
+    return mir.MirBody (
+        id: mir.MirBodyId.from_index(function_id.to_index()),
+        span: span,
+        locals: locals[0..3],
+        blocks: output.block_array(blocks$.ref()),
+        entry: mir.MirBlockId.from_index(0),
+        return_local: return_local
+    );
+}
+
+mir.MirBlock detached_env_drop_block(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    mir.MirLocalId return_local,
+    mir.MirFunctionRef drop_function,
+    mir.MirBlockId target,
+    list.ArrayList<mir.MirStatement>& statements,
+    token.Span span
+) {
+    guard field_index_for_local(layout, mir.MirLocalId.from_index(1)) is .some(env_field_index) else {
+        return mir.MirBlock (
+            id: mir.MirBlockId.from_index(0),
+            span: span,
+            statements: output.statement_array(statements),
+            terminator: goto_terminator(span, target)
+        );
+    }
+    mir.MirPlace env_place = frame_field_place(output, layout, frame_place, env_field_index);
+    list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+    args.add(mir.copy_operand_value(mir.MirCopyOperand (place: env_place)));
+    return mir.MirBlock (
+        id: mir.MirBlockId.from_index(0),
+        span: span,
+        statements: output.statement_array(statements),
+        terminator: mir.MirTerminator (
+            span: span,
+            kind: mir.call_terminator_kind(mir.MirCallTerminator (
+                callee: mir.direct_function_callee(drop_function),
+                args: output.operand_array(args$.ref()),
+                current_effects: types.EffectSet(),
+                is_suspend_point: false,
+                destination: mir.local_place(return_local, output.empty_projection()),
+                target: target,
+                initialized_place: null,
+                unique_places: output.empty_places(),
+                cleanup: null
+            ))
+        )
     );
 }
 
