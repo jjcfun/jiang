@@ -152,8 +152,11 @@ identity 和 resume operand。它不解析用户类型上的 `enqueue` 成员，
 LLVM backend 将其 lowering 为私有
 `__jiang_domain_enqueue(domain_id, domain_kind, context, resume)` runtime ABI。`domain_id` 是当前程序
 内的编译期 domain identity，`domain_kind` 来自 associated const `Domain.kind`；两者都不进入用户
-ABI。当前 runtime 函数使用直接 resume 作为同步 fallback；真正的 serial queue 和 concurrent
-worker pool 由后续内部 runtime lowering 接管，MIR 形状不再变化。
+ABI。MIR 不关心 runtime 使用单线程队列还是 worker pool，调度实现变化不再改变 MIR 形状。
+
+0.4.6 的 `__jiang_domain_enqueue` 使用进程内单线程 FIFO。嵌套 enqueue 只追加节点，由最外层 drain
+依次调用 resume，避免 completion 在当前 resume 栈内递归重入 continuation。该队列不提供跨线程
+同步；worker pool 和线程安全队列属于 0.4.7。
 
 第三方 runtime 提供的 `extern async` 使用单隐藏参数 ABI：
 
