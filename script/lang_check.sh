@@ -93,6 +93,11 @@ run_run_case() {
   stem="$(basename "$source" .jiang)"
   local llvm_output="/tmp/jiang_lang_run_${stem}.ll"
   local executable="/tmp/jiang_lang_run_${stem}"
+  local companion="${source%.jiang}.c"
+  local companion_args=()
+  if [ -f "$companion" ]; then
+    companion_args+=("$companion")
+  fi
 
   if ! "$JIANGC" --emit-llvm -o "$llvm_output" "$source" >/tmp/jiang_lang_run_emit.out 2>&1; then
     echo "FAIL run $source emit failed"
@@ -101,7 +106,8 @@ run_run_case() {
     return
   fi
 
-  if ! "$LLVM_CLANG" "$llvm_output" -o "$executable" "${llvm_link_args[@]}" >/tmp/jiang_lang_run_link.out 2>&1; then
+  if ! "$LLVM_CLANG" "$llvm_output" "${companion_args[@]}" -o "$executable" \
+    "${llvm_link_args[@]}" >/tmp/jiang_lang_run_link.out 2>&1; then
     echo "FAIL run $source link failed"
     sed -n '1,120p' /tmp/jiang_lang_run_link.out
     status=1
@@ -135,10 +141,23 @@ run_release_case() {
   local stem
   stem="$(basename "$source" .jiang)"
   local executable="/tmp/jiang_lang_release_${stem}"
+  local companion="${source%.jiang}.c"
+  local companion_object="/tmp/jiang_lang_release_${stem}_companion.o"
+  local companion_link_args=()
+  if [ -f "$companion" ]; then
+    if ! "$LLVM_CLANG" -c "$companion" -o "$companion_object" >/tmp/jiang_lang_release_companion.out 2>&1; then
+      echo "FAIL release-run $source companion compile failed"
+      sed -n '1,120p' /tmp/jiang_lang_release_companion.out
+      status=1
+      return
+    fi
+    companion_link_args+=(--link-arg "$companion_object")
+  fi
 
   if ! "$JIANGC" \
     --mode release \
     "${jiang_llvm_link_args[@]}" \
+    "${companion_link_args[@]}" \
     -o "$executable" \
     "$source" >/tmp/jiang_lang_release_build.out 2>&1; then
     echo "FAIL release-run $source build failed"
@@ -157,7 +176,7 @@ run_release_case() {
   bash -c '"$1"; exit $?' _ "$executable" >/tmp/jiang_lang_release_run.out 2>&1
   local code=$?
   set -e
-  rm -f "$executable"
+  rm -f "$executable" "$companion_object"
 
   if [ "$code" = "$expected" ]; then
     echo "PASS release-run $source"
