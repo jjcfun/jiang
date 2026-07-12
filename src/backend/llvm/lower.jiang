@@ -884,12 +884,13 @@ struct LlvmLowerer: Movable {
     // 映射为 stack slot，assignment 生成 store，operand 生成 load。
     Bool lower_statements(self,
         mir.MirBody& body,
+        ffi.Value llvm_function,
         mir.MirBlock& block,
         list.ArrayList<ffi.Value>& local_slots
     ) {
         Int! index = 0;
         while (index < block.statements.length) {
-            if (!self.lower_statement(body, block.statements[index], local_slots)) {
+            if (!self.lower_statement(body, llvm_function, block.statements[index], local_slots)) {
                 return false;
             }
             index = index + 1;
@@ -907,10 +908,17 @@ struct LlvmLowerer: Movable {
         Int! index = 0;
         while (index < body.blocks.length) {
             ffi.builder_position_at_end(self.builder$.ref(), blocks.get(index));
-            if (!self.lower_statements(body, body.blocks[index]$.ref(), local_slots)) {
+            if (!self.lower_statements(body, llvm_function, body.blocks[index]$.ref(), local_slots)) {
                 return false;
             }
-            if (!self.lower_terminator(body, function_abi, llvm_function, body.blocks[index].terminator$.ref(), blocks, local_slots)) {
+            if (!self.lower_terminator(
+                body,
+                function_abi,
+                llvm_function,
+                body.blocks[index].terminator$.ref(),
+                blocks,
+                local_slots
+            )) {
                 return false;
             }
             index = index + 1;
@@ -920,6 +928,7 @@ struct LlvmLowerer: Movable {
 
     Bool lower_statement(self,
         mir.MirBody& body,
+        ffi.Value llvm_function,
         mir.MirStatement statement,
         list.ArrayList<ffi.Value>& local_slots
     ) {
@@ -969,21 +978,7 @@ struct LlvmLowerer: Movable {
             ), local_slots);
         }
         if (statement.kind is .future_release_stmt(release)) {
-            if (release.storage == mir.MirFutureStorageKind.inline_observed) { return true; }
-            // observer detach 由 task ownership 协议决定最终释放方；该协议完成前，
-            // 只有已经取走结果的 await 路径可以直接释放 allocation。
-            if (!release.result_consumed) { return true; }
-            llvm_state.LowerState! state = self.lower_state();
-            ffi.Value value = llvm_value.lower_rvalue(
-                state$.ref(),
-                body,
-                mir.free_rvalue(mir.MirFreeRvalue (
-                    pointer: mir.copy_operand_value(mir.MirCopyOperand (place: release.allocation_pointer))
-                )),
-                local_slots,
-                self.ctx.store.types.unit_type()
-            );
-            return ffi.value_valid(value);
+            return self.lower_future_release(body, llvm_function, release, local_slots);
         }
         if (statement.kind is .set_discriminant_stmt(set_discriminant)) {
             llvm_state.LowerState! state = self.lower_state();
@@ -996,6 +991,134 @@ struct LlvmLowerer: Movable {
         }
         self.add_codegen_error("unsupported MIR statement in LLVM lowering", "llvm_statement_unsupported");
         return false;
+    }
+
+    Bool lower_future_release(
+        self,
+        mir.MirBody& body,
+        ffi.Value llvm_function,
+        mir.MirFutureReleaseStatement release,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        if (release.storage == mir.MirFutureStorageKind.inline_observed) { return true; }
+        llvm_state.LowerState! state = self.lower_state();
+        if (release.result_consumed) {
+            return self.lower_consumed_future_release(state$.ref(), body, release, local_slots);
+        }
+        return self.lower_shared_future_release(
+            state$.ref(), body, llvm_function, release, local_slots
+        );
+    }
+
+    Bool lower_consumed_future_release(
+        self,
+        llvm_state.LowerState& state,
+        mir.MirBody& body,
+        mir.MirFutureReleaseStatement release,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        ffi.Value value = llvm_value.lower_rvalue(
+            state,
+            body,
+            mir.free_rvalue(mir.MirFreeRvalue (
+                pointer: mir.copy_operand_value(mir.MirCopyOperand (place: release.allocation_pointer))
+            )),
+            local_slots,
+            self.ctx.store.types.unit_type()
+        );
+        return ffi.value_valid(value);
+    }
+
+    Bool lower_shared_future_release(
+        self,
+        llvm_state.LowerState& state,
+        mir.MirBody& body,
+        ffi.Value llvm_function,
+        mir.MirFutureReleaseStatement release,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        ffi.Value ownership_pointer = llvm_place.lower_place_pointer(
+            state, body, release.ownership_state, local_slots
+        );
+        if (!ffi.value_valid(ownership_pointer)) { return false; }
+        ffi.Type ownership_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+        Int! desired_state = 2;
+        if (release.task_completed) { desired_state = 1; }
+        ffi.Value claimed = ffi.builder_build_atomic_cmpxchg_success(
+            state.builder,
+            ownership_pointer,
+            ffi.const_int(ownership_type, 0),
+            ffi.const_int(ownership_type, UInt64(desired_state))
+        );
+        if (!ffi.value_valid(claimed)) { return false; }
+        return self.lower_unclaimed_future_release(
+            state, body, llvm_function, release, local_slots, claimed
+        );
+    }
+
+    Bool lower_unclaimed_future_release(
+        self,
+        llvm_state.LowerState& state,
+        mir.MirBody& body,
+        ffi.Value llvm_function,
+        mir.MirFutureReleaseStatement release,
+        list.ArrayList<ffi.Value>& local_slots,
+        ffi.Value claimed
+    ) {
+        ffi.BasicBlock release_block = ffi.context_append_block(
+            state.llvm_context, llvm_function, "future.release"
+        );
+        ffi.BasicBlock continue_block = ffi.context_append_block(
+            state.llvm_context, llvm_function, "future.release.continue"
+        );
+        if (!ffi.block_valid(release_block) || !ffi.block_valid(continue_block)) { return false; }
+        if (!ffi.value_valid(ffi.builder_build_cond_br(
+            state.builder, claimed, continue_block, release_block
+        ))) { return false; }
+
+        ffi.builder_position_at_end(state.builder, release_block);
+        if (!self.lower_future_result_drop(state, body, release, local_slots)) { return false; }
+        ffi.Value pointer = llvm_value.lower_operand(
+            state,
+            body,
+            mir.copy_operand_value(mir.MirCopyOperand (place: release.allocation_pointer)),
+            local_slots
+        );
+        if (!ffi.value_valid(pointer)) { return false; }
+        if (!ffi.value_valid(llvm_value.lower_heap_pointer_free(state, pointer))) { return false; }
+        if (!ffi.value_valid(ffi.builder_build_br(state.builder, continue_block))) { return false; }
+        ffi.builder_position_at_end(state.builder, continue_block);
+        return true;
+    }
+
+    Bool lower_future_result_drop(
+        self,
+        llvm_state.LowerState& state,
+        mir.MirBody& body,
+        mir.MirFutureReleaseStatement release,
+        list.ArrayList<ffi.Value>& local_slots
+    ) {
+        ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context);
+        ffi.Value drop_function = llvm_value.lower_operand(
+            state,
+            body,
+            mir.copy_operand_value(mir.MirCopyOperand (place: release.result_drop)),
+            local_slots
+        );
+        ffi.Value result_pointer = llvm_place.lower_place_pointer(
+            state, body, release.result, local_slots
+        );
+        if (!ffi.value_valid(drop_function) || !ffi.value_valid(result_pointer)) { return false; }
+        list.ArrayList<ffi.Type>! parameter_types = list.ArrayList<ffi.Type>(1);
+        parameter_types.add(pointer_type);
+        ffi.Type function_type = ffi.function_type(
+            ffi.context_void_type(state.llvm_context), parameter_types$.ref()
+        );
+        list.ArrayList<ffi.Value>! arguments = list.ArrayList<ffi.Value>(1);
+        arguments.add(result_pointer);
+        return ffi.value_valid(ffi.builder_build_call(
+            state.builder, function_type, drop_function, arguments$.ref()
+        ));
     }
 
     Bool lower_assign(self,
