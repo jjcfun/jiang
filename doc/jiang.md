@@ -923,6 +923,46 @@ Int value = unsafe {
 };
 ```
 
+异步函数调用默认是隐式挂起点，调用结果仍是函数声明的返回类型：
+
+```c
+async Int load_page();
+
+async Int render() {
+    Int page = load_page();
+    page + 1
+}
+```
+
+最外层从普通函数进入异步运行时，需要使用带静态 Domain 的 `sync` 或 `async` block。`sync` 等待
+block 完成并返回结果；`async` 直接启动，作为语句使用时不等待：
+
+```c
+struct UiDomain: Domain<kind = .serial> {}
+
+Int main() {
+    sync [UiDomain] {
+        render()
+    }
+}
+```
+
+需要并发启动调用时，在调用前写 `async`，得到 body-local `Future<T>`。Future 是 eager 的，创建后
+立即开始执行；依次调用 `await()` 不会把启动过程串行化：
+
+```c
+async Int load_both() {
+    Future<Int> left = async load_left();
+    Future<Int> right = async load_right();
+    left.await() + right.await()
+}
+```
+
+`async { ... }` 创建 block Future；`async [WorkerDomain] { ... }` 同时指定 execution domain。
+`Future<T>` 只能作为函数 body 内的局部值，不能出现在参数、返回类型、字段或 public ABI 中，也不能
+显式写 domain 参数。Future 未被 `await()` 就离开作用域表示 detach，不表示 cancellation；0.4.6
+不提供显式取消。
+
 ### 控制流（Control Flow）
 
 #### 块语句（Block）

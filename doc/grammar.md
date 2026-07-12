@@ -333,13 +333,15 @@ name        <- ident / "self"
 - 函数声明只使用 `async` 表示 suspend function；函数前不保留 `sync` 修饰符。`async [domain]`
   可用于函数声明，表示 domain-bound async function。
 - `async [domain]` / `sync [domain]` 是 block effect 中
-  `async [domain: domain]` / `sync [domain: domain]` 的短写；`async [domain, context]`
-  是 `async [domain: domain, context: context]` 的短写。`domain` 是实现 `Domain` 的编译期
-  domain type；编译器通过 `Domain.kind` 区分 serial/concurrent 语义。`context` 是运行时
-  async context。
-- 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type；带 `context` 的形式
-  只用于 keyword block。
+  `async [domain: domain]` / `sync [domain: domain]` 的短写。`domain` 是实现 `Domain` 的编译期
+  domain type；编译器通过 `Domain.kind` 区分 serial/concurrent 语义。运行时 `context` option
+  为后续版本保留，不属于 0.4.6 的用户语法。
+- 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type。
 - 无 domain 的 `async {}` / `sync {}` 只能在已有 current domain 的上下文中使用，并继承 current。
+- `async [domain]? call(...)` 是 Future creation expression，最外层 postfix 必须是函数调用；对任意
+  非调用表达式创建 Future 时使用 `async [domain]? { ... }`。
+- Future creation 是 eager 的并返回 body-local `Future<T>`；等待使用 `future.await()`。旧的
+  `callee$().async()` 和 `await expr` 不属于 0.4.6 语法。
 - 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
   `async [domain] { ... }`、`sync [domain] { ... }`、`async { ... }`、`sync { ... }`、
   `unsafe async [domain] { ... }`。
@@ -561,6 +563,8 @@ expr        <- lambda_expr
 
 expr_with_block
             <- block_expr
+             / effect_block_expr
+             / async_call_expr
              / struct_expr
              / if_expr
              / switch_expr
@@ -696,6 +700,16 @@ field_init_expr
             <- name ":" expr
 
 block_expr  <- block
+
+effect_block_expr
+            <- effect_keywords block
+
+async_call_expr
+            <- async_effect postfix_expr
+
+effect_keywords
+            <- "unsafe" (("async" / "sync") keyword_options?)?
+             / ("async" / "sync") keyword_options?
 
 struct_expr <- path type_args? struct_lit
 

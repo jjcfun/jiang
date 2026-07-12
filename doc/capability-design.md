@@ -130,14 +130,13 @@ async [domain: app_runtime.UiDomain] {
 
 ```jiang
 sync [UiDomain] {
-    _ a = async { load_data() }; // 继承 UiDomain
-    _ b = async { load_data() }; // 继承 UiDomain
-    await (a + b)
+    Future<Int> a = async { load_data() }; // 继承 UiDomain
+    Future<Int> b = async { load_data() }; // 继承 UiDomain
+    a.await() + b.await()
 }
 ```
 
-普通函数中直接写无 domain 的 `sync {}`、`async {}`、`await` 或 `foo$().async()` 应诊断，
-因为普通函数没有 current domain。
+普通函数中直接写无 domain 的 `sync {}` 或 `async {}` 应诊断，因为普通函数没有 current domain。
 
 `async` / `sync` block 后续可以带运行时 context：
 
@@ -151,9 +150,9 @@ async [domain: PageDomain, context: page_ctx] {
 }
 ```
 
-这里 `PageDomain` 是编译期可见的静态 domain type，用于 data race 检查；`page_ctx` 是运行时
-async context，用于调度、取消、join、页面生命周期或 tracing 等 runtime 语义。`context`
-不参与 domain 静态相等判断，也不能替代 domain。
+这里 `PageDomain` 是编译期可见的静态 domain type，用于 data race 检查；`page_ctx` 是后续版本
+预留的运行时 async context，可用于调度、取消、页面生命周期或 tracing。0.4.6 尚不开放
+`context` option；它不参与 domain 静态相等判断，也不能替代 domain。
 
 函数类型沿用第一个类型参数作为 callable signature head：
 
@@ -279,11 +278,11 @@ async () foo(T!& x) {
 实现上：
 
 - 同 domain await：不需要 domain hop，只是普通 coroutine resume。
-- `await` 只能在 current domain 中进行；await 表达式内使用到的 Future 必须属于 current domain。
-- 跨 domain Future 不能直接 await；后续如果需要跨 domain bridge/post，应设计显式操作。
+- `future.await()` 在 waiter 的 current domain 中挂起；Future 可以在其他 domain 执行。
+- 跨 domain completion 将 waiter continuation enqueue 回等待方 domain，再从原 current domain 恢复。
 
 静态 capability 检查本身应当是零运行时开销。运行时开销来自实际的 enqueue、suspend/resume
-和 Future join。
+和 Future 等待。
 
 ## Domain 切换规则
 
@@ -298,7 +297,7 @@ async () foo(T!& x) {
   则是 domain 切换边界。
 - `sync [D] {}` 从普通同步世界阻塞进入 domain type `D`，也可以在已有 current domain 中
   显式切到 `D`。
-- `await` 不切 domain；它只能等待 current domain 的 Future，并在同一个 current domain 恢复。
+- `future.await()` 不把 caller 留在 Future 的 execution domain；完成后 caller 回到等待方 current domain。
 
 跨 domain 时的能力检查：
 
@@ -326,33 +325,27 @@ async Int render() {
 }
 ```
 
-需要并发启动而不等待结果时，使用函数调用的 `$` Intrinsic Operation：
+需要并发启动而不等待结果时，使用 `async call` 或 async block：
 
 ```jiang
-_ a = load_a$().async()
-_ b = load_b$().async()
+Future<Int> a = async load_a();
+Future<Int> b = async load_b();
 
-await (a + b)
+a.await() + b.await()
 ```
 
-`foo$().async()` 表示以 async call mode 启动 `foo`，阻止普通 `foo()` 调用的隐式 await，
-返回 body-local `Future<T>`。该操作只能在已有 current domain 的上下文中使用，Future 归属
-current domain。`$` 本身不产生值，只进入 Intrinsic Operation；`.async()` 是具体操作名。
-
-`await expr` 在 current domain 上等待 `expr` 中引用到的 Future slot，并在 `expr` 内把这些
-slot 投影为结果类型。`await` 不接受 domain 参数；async context 中是 suspend join，sync
-context 中是 blocking join。`await` 只能处理 current domain 的 Future；不同 domain 的 Future
-应诊断。`await` 只处理包含 Future 的表达式，`await (1 + 2)` 或对已是具体类型的表达式 await
-应诊断。
-
-`await` 对多个 Future 是统一 barrier，不按表达式求值顺序逐个等待：
+`async load_a()` 阻止普通 `load_a()` 调用的隐式 await，并返回 body-local `Future<Int>`。
+`Future.await()` 消费一个 Future；多个 Future 提前启动后，即使按顺序调用 `await()`，仍保持并发执行：
 
 ```jiang
-_ a = load_a$().async()
-_ b = load_b$().async()
+Future<Int> a = async load_a();
+Future<Int> b = async load_b();
 
-await (a + b) // 先等待 a 和 b 都完成，再用 Int + Int 求值
+a.await() + b.await()
 ```
+
+Jiang 不提供 `await expr` 或隐式多 Future barrier。需要等待多个 Future 时，分别调用 `await()`；已完成
+Future 走 ready fast path，未完成 Future 才挂起当前 coroutine。
 
 `async {}` / `async [D] {}` 可创建一个显式 block future，用于需要自定义 future body 或显式
 domain 边界的场景：
@@ -365,9 +358,9 @@ let future = async {
 
 Jiang 的 future 语义是 eager、single-completion、cached result：
 
-- 创建 future 后立即入队或开始执行，不等到 `await` / `join` 时才启动。
+- 创建 future 后立即入队或开始执行，不等到 `await()` 时才启动。
 - future body 只执行一次。
-- 完成值缓存一次；`await` / `join` 读取缓存结果，不重复执行 body。
+- 完成值缓存一次；`await()` 读取缓存结果，不重复执行 body。
 - coroutine 是无栈协程；future 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
 - 如果 body 返回 `Result<T, E>`，future 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
   exception channel。
@@ -397,7 +390,7 @@ Future 只能在 async/sync body 内作为局部不透明值使用。用户可�
 `Future<T, domain D>`：
 
 ```jiang
-Future<Int> future = load_page$().async() // internal type: Future<Int, PageDomain>
+Future<Int> future = async [PageDomain] { load_page() }; // internal domain: PageDomain
 ```
 
 如果局部变量没有 initializer，`Future<T>` 的 domain 默认是调用点 `current`。
@@ -426,10 +419,12 @@ sync [UiDomain] {
 不能捕获栈上 borrow。
 结构化并发可以允许有限的同 domain capture，但必须证明所有 future 在 scope 结束前完成。
 
+0.4.6 不提供 cancellation。Future 在未 `await()` 时离开词法作用域表示 detach，task 继续执行；task
+完成后由 task/observer ownership 协议释放 frame、capture 和未消费 result。显式协作式取消以及外部
+async operation 的 cancel acknowledgement ABI 留到后续版本。
+
 跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
 `Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
-
-函数 future creation 使用 `foo$().async()`；不提供 `foo$().task()`、`foo$().future()` 或类似形式。
 
 ## Actor 与 Isolate
 

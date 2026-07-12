@@ -145,7 +145,8 @@ MIR lowering 接收 `MonomorphStore`。非泛型函数按 `DefId` 直接 lower�
 
 async source function 的普通 MIR body 只作为 coroutine pass 的输入，不直接生成源码形状的
 backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；普通隐式 await 直接把
-child frame 连接到 caller continuation，只有显式 `foo$().async()` 才 materialize `Future<T>`。
+child frame 连接到 caller continuation。`async call` 和 observed `async {}` 显式 materialize
+`Future<T>`；直接作为语句使用的 async block 生成 detached start。
 
 显式 Future 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 domain
 identity 和 resume operand。它不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
@@ -178,6 +179,10 @@ continuation record 嵌入 caller coroutine frame，不要求堆分配。runtime
 resume。等待方先写 waiter context/function，再发布 armed 状态并重新 acquire 检查 ready；完成方发布
 ready 后只在成功把 armed claim 为 notified 时调用 waiter。等待方若观察到 ready，只在成功撤销 armed
 时直接继续，否则由已经 claim 的完成方负责恢复。serial domain 可以在证明不跨线程后消除原子操作。
+
+observed Future 的 task 和 observer 各持有一次 ownership。`await()` 消费 observer，Future 在词法
+作用域结束时未消费则 detach；completion 与 observer release 通过 CAS 决定最后释放 task-state、frame
+和未消费 result 的一方。0.4.6 不提供 cancellation，detach 不会停止已经启动的 coroutine。
 
 ## 不变量
 
