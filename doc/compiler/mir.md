@@ -147,6 +147,11 @@ async source function 的普通 MIR body 只作为 coroutine pass 的输入，�
 backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；普通隐式 await 直接把
 child frame 连接到 caller continuation，只有显式 `foo$().async()` 才 materialize `Future<T>`。
 
+显式 Future 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 domain
+identity 和 resume operand。它不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
+LLVM backend 当前使用直接 resume 作为同步 fallback；真正的 serial queue 和 concurrent worker pool
+由后续内部 runtime lowering 接管，MIR 形状不再变化。
+
 第三方 runtime 提供的 `extern async` 使用单隐藏参数 ABI：
 
 ```text
