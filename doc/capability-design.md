@@ -45,6 +45,10 @@ enum DomainKind {
 trait Domain {
     associated Kind: const DomainKind;
 }
+
+trait DomainExecutor {
+    () enqueue(UInt8* context, RawFn<(), UInt8*> resume);
+}
 ```
 
 具体 domain 由 runtime、框架或第三方库提供，domain identity 由类型本身表示：
@@ -69,6 +73,10 @@ public struct WorkerPoolDomain: Domain {
 `UiDomain`、`WorkerPoolDomain` 的调度策略不属于 `std` 的固定职责。`std` 最多提供
 `Domain`、`DomainKind`、`Send`、`Sync` 或 executor 基础接口；具体事件循环、线程池、
 UI 主线程由库维护。
+
+`Domain` 只描述 identity 和串行性。需要被 `async [D]` / `sync [D]` 作为实际调度入口的类型还应
+同时实现正交的 `DomainExecutor` trait。`enqueue` 接收 compiler frame context 和 Resume function，
+不接触 Future result layout；第三方 runtime 可以把它们放入事件循环或 worker queue。
 
 `Domain.Kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.Kind ==
 .concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T!&` 不能依赖它保证安全。在
