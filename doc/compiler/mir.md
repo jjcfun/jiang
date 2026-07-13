@@ -151,13 +151,21 @@ child frame 连接到 caller continuation。`async call` 和 observed `async {}`
 显式 Future 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 domain
 identity 和 resume operand。它不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
 LLVM backend 将其 lowering 为私有
-`__jiang_domain_enqueue(domain_id, domain_kind, context, resume)` runtime ABI。`domain_id` 是当前程序
+`__jiang_runtime_domain_enqueue(domain_id, domain_kind, context, resume)` runtime ABI。`domain_id` 是当前程序
 内的编译期 domain identity，`domain_kind` 来自 associated const `Domain.kind`；两者都不进入用户
 ABI。MIR 不关心 runtime 使用单线程队列还是 worker pool，调度实现变化不再改变 MIR 形状。
 
-0.4.6 的 `__jiang_domain_enqueue` 使用进程内单线程 FIFO。嵌套 enqueue 只追加节点，由最外层 drain
+0.4.6 的 backend 内建 enqueue 使用进程内单线程 FIFO。嵌套 enqueue 只追加节点，由最外层 drain
 依次调用 resume，避免 completion 在当前 resume 栈内递归重入 continuation。该队列不提供跨线程
-同步；worker pool 和线程安全队列属于 0.4.7。
+同步。
+
+0.4.7 将 enqueue 实现移到 `runtime/scheduler.jiang`，backend 只生成稳定 ABI 调用。macOS runtime
+通过 `system.thread` 使用 libdispatch：concurrent domain 进入系统 concurrent queue，serial domain
+按 `domain_id` 进入各自的 serial queue，所有 enqueue 都由 dispatch group 计入 shutdown 生命周期。
+serial queue 注册表由 macOS unfair lock 保护；同一 serial domain 不并发，不同 serial domain
+可以并行。
+runtime shutdown 等待已 enqueue 的 continuation 完成；libdispatch worker 由系统持有，不由 Jiang join。
+其他平台的多线程 runtime 尚未启用。
 
 第三方 runtime 提供的 `extern async` 使用单隐藏参数 ABI：
 
