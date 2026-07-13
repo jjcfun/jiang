@@ -86,7 +86,7 @@ chmod +x "$PACKAGE_DIR/install.sh"
 cat >"$PACKAGE_DIR/README.md" <<README
 # Jiang $VERSION ($TARGET)
 
-This package statically links LLVM into `jiangc`; users do not need a local LLVM runtime.
+This package statically links LLVM into \`jiangc\`; users do not need a local LLVM runtime.
 
 Then install Jiang:
 
