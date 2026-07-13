@@ -184,6 +184,16 @@ observed Future 的 task 和 observer 各持有一次 ownership。`await()` 消�
 作用域结束时未消费则 detach；completion 与 observer release 通过 CAS 决定最后释放 task-state、frame
 和未消费 result 的一方。0.4.6 不提供 cancellation，detach 不会停止已经启动的 coroutine。
 
+0.4.7 的 `Future.cancel()` 与 `await()` 是互斥的 consuming operation。cancel 设置 cancellation request，
+把处理请求的工作调度到 task execution domain，并挂起 caller 直到 completion 或 cancellation unwind
+进入 terminal state；它不是 request-and-detach。terminal acknowledgement 发布后才能恢复 cancel waiter，
+并保证 frame、capture 和未消费 result 已经完成清理。completion、cancel、detach 的竞争必须复用
+可验证的原子 ownership 协议，任意资源仍只允许释放一次。
+
+Future 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
+coroutine frame 转移。Future task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Future
+的 effect body 所在 current domain。
+
 ## 不变量
 
 - MIR 不保存 AST id。

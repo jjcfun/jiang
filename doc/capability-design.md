@@ -299,6 +299,12 @@ async () foo(T!& x) {
   显式切到 `D`。
 - `future.await()` 不把 caller 留在 Future 的 execution domain；完成后 caller 回到等待方 current domain。
 
+async 函数或 async block 内的 `sync [D] {}` 必须能静态证明 `D` 与 current domain 不同。
+domain-neutral async 函数的 current domain 运行时才确定，因此也不能在其中使用静态 `sync [D]`。
+同一 serial domain 的 sync wait 会占住该 domain 的执行权，使等待中的 continuation 无法恢复；在
+concurrent domain 中也会无谓阻塞 worker。需要继续异步执行时应直接调用 async 函数或使用 async block。
+能静态证明跨 domain 的 `sync [OtherDomain] {}` 暂不由这条规则禁止。
+
 跨 domain 时的能力检查：
 
 - `T!&`：只能留在同一个 serial domain 内，不能传给或捕获到其他 domain。
@@ -356,7 +362,7 @@ let future = async {
 }
 ```
 
-Jiang 的 future 语义是 eager、single-completion、cached result：
+Jiang 的 future 语义是 eager、single-completion、cached result、single-consumer：
 
 - 创建 future 后立即入队或开始执行，不等到 `await()` 时才启动。
 - future body 只执行一次。
@@ -366,6 +372,8 @@ Jiang 的 future 语义是 eager、single-completion、cached result：
   exception channel。
 - future result type 不能是 future；`async { ... }` / `async [D] { ... }` 不允许产生
   nested future。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Future<Future<T>>`。
+- `await()` 和 `cancel()` 都消费 Future，只能选择其中一个；Future 被消费后不能再次 await、cancel
+  或移动。
 
 因此这里是合法的：
 
@@ -405,6 +413,25 @@ Future<Int> make_future(); // error: Future 不能出现在签名中
 编译器内部用 future kind 保存 result type 和 domain。这个 kind 服务 type check、borrow check、
 lowering 和 runtime ABI；用户可见的 `Future<T>` 只是 body-local 标注表面。
 
+Future 的 observer ownership 固定在创建它的 async/sync effect body。0.4.7 禁止 Future 被任何
+嵌套的 async/sync block 或 lambda 捕获，不区分是否 move、是否同 domain；普通词法 block 不形成
+capture 边界。Future 可以在创建它的 effect body 中等待一个运行于其他 domain 的 task，完成后
+caller 仍回到等待方 current domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
+
+```jiang
+sync [UiDomain] {
+    Future<Image> image = async [WorkerPoolDomain] { load_image() };
+    Image value = image.await(); // allowed: Future 没有被嵌套 effect block 捕获
+}
+```
+
+```jiang
+Future<Image> image = async [WorkerPoolDomain] { load_image() };
+async [UiDomain] {
+    image.await() // error: future_capture_not_allowed
+}
+```
+
 普通 `T!&` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
 
 ```jiang
@@ -419,9 +446,16 @@ sync [UiDomain] {
 不能捕获栈上 borrow。
 结构化并发可以允许有限的同 domain capture，但必须证明所有 future 在 scope 结束前完成。
 
-0.4.6 不提供 cancellation。Future 在未 `await()` 时离开词法作用域表示 detach，task 继续执行；task
-完成后由 task/observer ownership 协议释放 frame、capture 和未消费 result。显式协作式取消以及外部
-async operation 的 cancel acknowledgement ABI 留到后续版本。
+0.4.6 不提供 cancellation。0.4.7 采用显式、协作式 cancellation：`future.cancel()` 消费 Future，
+向 task 的 execution domain 请求取消，并挂起 caller，直到 task 已正常完成或完成 cancellation
+unwind。取消请求线程不能直接析构 frame；resume 入口和 suspend boundary 检查请求，frame、capture
+和跨 suspend local 沿正常 drop state 析构。若 completion 先发生，`cancel()` 丢弃已完成 result
+后返回；cancellation 不进入 async 函数的普通返回类型。
+
+`cancel()` 返回时保证 task 不会再执行用户代码，相关 frame、capture 和未消费 result 已完成
+清理。Future 在未 `await()` 或 `cancel()` 时离开词法作用域仍表示 detach，不请求取消，task 继续
+执行；task 完成后由 task/observer ownership 协议完成最终释放。若以后需要只发请求而不等待，
+应使用不同的显式操作，不能削弱 `cancel()` 的终态确认语义。
 
 跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
 `Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
