@@ -153,7 +153,7 @@ Float c = two + f;      // 错误：Int 变量不会隐式提升为 Float
 
 ### 可选类型 (Optional)
 
-Optional 使用 `T?` 表示，也可以显式写作 `Option<T>`。`T?` 是 `Option<T>` 的类型语法糖。
+Optional 只使用 `T?` 表示；compiler-owned constructor 名称不对外开放。
 
 ```c
 Int? a1 = 123;
@@ -399,21 +399,24 @@ foo[0][1] // 2
 Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、析构和显式 move 的边界。
 指针语义约定为：
 
-- `T^`：`Box<T>` 的语法糖，表示自动解引用的 owning pointer；它不是 C 风格 raw pointer
+- `T^`：自动解引用的 owning pointer；它不是 C 风格 raw pointer
 - `T&`：自动解引用的非 owning 引用，通常用于引用已有值，不承担释放职责
 - `T!&`：从 `T!` storage 借出的非 owning 引用，保留目标 storage 的可变性
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
-- `T[]&`：`Ref<Slice<T>>` 的语法糖，是 borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，不表达所有权；裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value
+- `T[]&`：borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，
+  不表达所有权；裸 `T[]` 是 unsized array type，不能作为普通 value
 - `T[*:0]`：sentinel many-pointer，不带 length，适合 C string ABI
-- `T[:0]&`：`Ref<SentinelSlice<T, 0>>` 的语法糖，是 sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
+- `T[:0]&`：sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外
+  保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
 
 只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T[*]` 和 `T*` 都不拥有目标对象。
 
 #### Pointer / 引用类型
 
-Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 是 `Box<T>` 的语法糖，表示 owning pointer 外层；`&` 是 `Ref<T>` 的语法糖，表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
+Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 表示 owning pointer 外层；
+`&` 表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
 
 ```c
 // 在栈中开辟内存空间
@@ -590,10 +593,11 @@ Buffer^ b = a$.move();
 
 ### 切片（Slice）
 
-`Slice<T>`（后缀写法 `T[]`）是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]` 不能作为普通 value 单独存放或传递。
-`T[]&` / `Ref<Slice<T>>` 才是借用的 slice view，运行时 layout 类似 `{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 slice view 的使用范围。
-`T[]^` / `Box<Slice<T>>` 是 owned unsized array，拥有已初始化的 buffer，drop 时会按元素类型逐个析构并释放底层 allocation。
-`SentinelSlice<T, S>`（后缀写法 `T[:S]`）同样是 unsized array type；`T[:S]&` 是带 sentinel 保证的 borrowed view。
+`T[]` 是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]`
+不能作为普通 value 单独存放或传递。`T[]&` 是借用的 slice view，运行时 layout 类似
+`{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 view 的使用范围。
+`T[]^` 是 owned unsized array，拥有已初始化的 buffer，drop 时会按元素类型逐个析构并释放底层
+allocation。`T[:S]` 同样是 unsized array type；`T[:S]&` 是带 sentinel 保证的 borrowed view。
 标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_slice()` 会消耗 `Vector`，
 把已初始化区间交给返回的 `T[]^` 拥有，调用后原 `Vector` 失效。
 
@@ -744,9 +748,9 @@ Int[]& sort(Int[]& list, RawFn<Bool, Int, Int> compare)
 @where(T: Numeric)
 T[]& sort<T>(T[]& list, RawFn<Bool, T, T> compare)
 
-// 支持泛型的排序，会返回 Result，其中 E 可以为任意错误类型
+// 支持泛型的可错排序，其中 E 可以为任意错误类型
 @where(T: Numeric)
-Result<T[]&, E> sort<T, E>(T[]& list, RawFn<Result<Bool, E>, T, T> compare)
+T[]&@E sort<T, E>(T[]& list, RawFn<Bool@E, T, T> compare)
 ```
 
 #### 函数指针
@@ -772,7 +776,7 @@ RawFn<Bool, Int, Int> compare;
 - 普通顶层函数衰减为 `RawFn<...>`
 - 类型函数衰减为 `RawFn<...>`
 - 实例方法通过 `Type.method` 衰减为 `RawFn<Ret, Receiver&, Args...>`
-- `RawFn<...>` 的返回类型可以写成 `Result<T, E>`
+- `RawFn<...>` 的返回类型可以写成 `T@E`
 - 通过 `RawFn<...>` 变量进行调用
 - 非捕获 lambda 表达式赋值给 `RawFn<...>`
 - 若同名函数/方法存在多个重载：
@@ -828,21 +832,21 @@ Int value = add(user$.ref(), 2);
 - 后续参数与方法声明中的普通参数保持一致
 - 当前需要显式传入 `user$.ref()`
 
-示例 4：返回 `Result` 的函数指针
+示例 4：返回 errorable result 的函数指针
 
 ```c
 enum Err {
     bad = 1,
 }
 
-Result<Bool, Err> less(Int left, Int right) {
+Bool@Err less(Int left, Int right) {
     if (left < 0) {
         throw Err.bad;
     }
     return left < right;
 }
 
-RawFn<Result<Bool, Err>, Int, Int> compare = less;
+RawFn<Bool@Err, Int, Int> compare = less;
 ```
 
 示例 5：重载函数值按 `RawFn<...>` 目标类型消歧
@@ -888,16 +892,16 @@ lambda 规则：
 
 ```c
 @where(T: Numeric, E2: CompareError)
-async Result<T[]&, E1> sort<T, E1, E2>(
+async T[]&@E1 sort<T, E1, E2>(
     T[]& list,
-    RawFn<async Result<RawFn<async Result<Bool, E2>, T, T>, E1>, T[]&> compare
+    RawFn<async RawFn<async Bool@E2, T, T>@E1, T[]&> compare
 )
 
 @where(T: Numeric, E2: CompareError)
-@alias(Cmp = RawFn<async Result<Bool, E2>, T, T>)
-async Result<T[]&, E1> sort<T, E1, E2>(
+@alias(Cmp = RawFn<async Bool@E2, T, T>)
+async T[]&@E1 sort<T, E1, E2>(
     T[]& list,
-    RawFn<async Result<Cmp, E1>, T[]&> compare
+    RawFn<async Cmp@E1, T[]&> compare
 )
 ```
 
@@ -1049,12 +1053,11 @@ Int y = switch (value) {
 - 分支根 pattern 只支持 variant / optional / literal
 - binding/wildcard 只作为 variant 或 optional payload 的子 pattern 使用
 - 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法
-- 当前不支持对 `Result<T, E>` 结果直接使用 `switch` 表达式
+- 当前不支持对 `T@E` 结果直接使用 `switch` 表达式
 
 #### 异常
 
-Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，推荐写作 `T@E`；
-`Result<T, E>` 是同一个类型的兼容名称：
+Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，并且只写作 `T@E`：
 
 ```c
 Int@Err parse(UInt8[]& text)
@@ -1068,7 +1071,7 @@ RawFn<Bool@Err, Int, Int> compare
 
 - `T` 是成功值类型
 - `E` 是错误值类型
-- `T@E` / `Result<T, E>` 只允许作为函数返回类型，或出现在 callable 的返回位
+- `T@E` 只允许作为函数返回类型，或出现在 callable 的返回位
 - 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
 - `T@E` 必须连续书写，`T @E` 和 `T@ E` 都不合法
 
@@ -1126,7 +1129,7 @@ enum Err {
     bad = 7,
 }
 
-Result<Int, Err> parse(Bool fail) {
+Int@Err parse(Bool fail) {
     if (fail) {
         throw Err.bad;
     }
@@ -1158,7 +1161,7 @@ Int main() {
 
 - 只支持前置 `try catch` 表达式形式：`try expr catch (...) => fallback`
 - `try` 只包住 `catch` 前面的单个表达式
-- `expr` 必须是 `Result<T, E>`
+- `expr` 必须是 `T@E`
 - `catch` 参数列表必须写 `(...)`；不需要错误值时写 `()`
 - `catch` 绑定可省略类型；如果写绑定，类型自动推断为错误类型 `E`
 - fallback 可以是表达式或 block
@@ -1748,7 +1751,7 @@ union MyUnion {
 `union` 也支持泛型：
 
 ```c
-union Result<T, E> {
+union Outcome<T, E> {
   T value;
   E error;
 }
@@ -1789,8 +1792,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 Cmp compare<T>(Items left, Items right)
 ```
 `Name == Type` / `Name != Type` 也可用于类型形状匹配，pattern 中的 `_` 表示单个 type argument
-wildcard，例如 `@where(T == Box<_>)`、`@where(T != Option<_>)`。后缀语法糖在这里按 canonical
-builtin type 匹配：`T[]` 匹配 `Slice<_>`，`T[N]` 匹配 `Array<_, _>`。
+wildcard，例如 `@where(T == _^)`、`@where(T != _?)`。后缀语法在这里直接按 canonical type 匹配。
 例如：
 
 ```c
@@ -2179,16 +2181,15 @@ extend User: HasValue {
   `extend <T> T?` 和 `extend <T, E> T@E`。推荐在 `extend` 与参数列表之间保留空格；空格不是
   语法要求，并为未来的 `extend [options] <T>` 形式保留清晰结构。目标中的未声明名称按普通类型名解析，
   `extend Holder<T>` 不会隐式声明 `T`；`_` 只匹配一个 type argument 且不绑定名称。
-- binder 与 owner generic parameter 相互独立，不要求数量相同。`extend <T> Box<Slice<T>>` 会从
-  `Box<Slice<Int>>` 捕获 `T = Int`；`@where(S == Slice<T>) extend <T, S> Box<S>` 表达同一绑定链。
+- binder 与 owner generic parameter 相互独立，不要求数量相同。`extend <T> T[]^` 会从
+  `Int[]^` 捕获 `T = Int`；`@where(S == T[]) extend <T, S> S^` 表达同一绑定链。
   无法从 target/equality pattern 推导的 binder 会在声明处报错。
 - concrete specialized target 可以直接写，例如 `extend Holder<Int>`、`extend Int?`；需要同时保留
   pattern 参数并添加附加条件时，使用 `@where(T == Int) extend <T> Holder<T> { ... }`。
-- receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend <T> Holder<T>` 或
-  `@where(T != Option<_>) extend <T> Holder<T>`。
+- receiver 形状约束写在 `@where` 中，例如 `@where(T == _^) extend <T> Holder<T>` 或
+  `@where(T != _?) extend <T> Holder<T>`。
 - `T^` / `T&` / `T*` / `T[*]`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型
-  receiver 或 where pattern 时，会按对应 canonical builtin owner 查找和匹配 extension，例如
-  `UInt8[]^` 可查找 `Box<UInt8[]>` 上的方法，`UInt8[3]` 可匹配 `Array<UInt8, _>`。
+  receiver 或 where pattern 时，会按对应内部 canonical owner 查找和匹配 extension。
 - `public extend` 可以跨模块传播；普通 `extend` 只在声明模块可见。`public import` 会继续 re-export
   imported module 的 public extensions。
 - 用户模块可以扩展 builtin 或其他模块公开的类型，不使用全局 orphan 禁令；extension 只参与当前模块

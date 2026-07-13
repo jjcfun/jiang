@@ -161,8 +161,8 @@ sentinel slice、pointer、reference、box、optional、result、user struct、e
 self type 等都应统一作为 type namespace provider 参与 `Type.member` 和 `value.method`
 lookup。
 
-内建类型和语法糖类型也遵循同一条规则：`UInt8[]&` 的成员 lookup 会落到
-`Ref<Slice<UInt8>>` 的 namespace，`Int[4]` 会落到 array 类型的 namespace，
+内建后缀类型也遵循同一条规则：`UInt8[]&` 的成员 lookup 会落到 borrowed slice
+类型的 namespace，`Int[4]` 会落到 array 类型的 namespace，
 `Int` 会落到 builtin integer type 的 namespace。backend 或 MIR 可以继续把 builtin 类型
 lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不是 nominal struct 而拆出
 不同的成员查找路径。
@@ -175,30 +175,29 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T<A, B>`：泛型类型参数。
 - `(A, B)`：tuple type。
 - `T!`：当前类型层级的可变 flag。
-- `T?`：`Option<T>` 的类型语法糖。
+- `T?`：optional 类型。
 - `T?!`：optional 类型层可变的规范写法。
-- `T^`：`Box<T>` 的类型语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
-- `T&`：`Ref<T>` 的类型语法糖，表示非 owning 引用，不表达释放职责。
-- `T[]&`：`Ref<Slice<T>>` 的语法糖，borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` / `Slice<T>` 是 unsized array type，不能作为普通 value。
-- `T[:S]&`：`Ref<SentinelSlice<T, S>>` 的语法糖，borrowed sentinel slice view，
+- `T^`：owning pointer；它不是 C 风格 raw pointer。
+- `T&`：非 owning 引用，不表达释放职责。
+- `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` 是
+  unsized array type，不能作为普通 value。
+- `T[:S]&`：borrowed sentinel slice view，
   layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == S`。
-  裸 `T[:S]` / `SentinelSlice<T, S>` 是带 sentinel 的 unsized array type，不能作为普通 value。
-- `T[*]`：`ManyPointer<T>` 的类型语法糖，不默认自动解引用，只能通过下标访问元素。
+  裸 `T[:S]` 是带 sentinel 的 unsized array type，不能作为普通 value。
+- `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
 - `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
-- `T*`：`RawPointer<T>` 的类型语法糖，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
+- `T*`：raw pointer，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
-- `T@E`：errorable result，只能出现在函数、方法和 callable 类型的返回位；与
-  `Result<T, E>` canonical 到同一类型。
+- `T@E`：errorable result，只能出现在函数、方法和 callable 类型的返回位。
 - 错误类型 `E` 顶层不能带 `?` 或 `!`。如果成功值需要 optional/mutable，应写成 `T?!@E`。
 - `T@E` 两侧不允许空白，避免与前缀 annotation 和普通表达式混淆。
 
-内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、
-`Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Ref<T>`、`RawPointer<T>`、
-`ManyPointer<T>` 或 `Result<T, E>`，也不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
-`T^`、`T&`、`T*`、`T[*]` 等表面语法。语法糖形成的类型仍会参与对应
-builtin owner 的 extension/member lookup，例如 `UInt8[]^` 可查找 `Box<UInt8[]>` 上的类型函数。
+内建后缀类型语法不经过普通名字解析，compiler-owned constructor 名称也不进入用户可见
+namespace。用户仍可声明同名 nominal type，但不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
+`T^`、`T&`、`T*`、`T[*]` 等表面语法。后缀类型仍会参与对应内部 canonical owner 的
+extension/member lookup。
 
 sentinel value 使用 `S: const T` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
 元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型不是 move-only。
@@ -210,15 +209,16 @@ sentinel value 使用 `S: const T` 语义，`S` 的类型来自元素类型 `T`�
 Int[2][3] matrix;
 Int?[] values;
 UInt8[*] raw;
-Result<Int, Error> result;
-Result<Int?!, Error> maybe_result;
+Int@Error result;
+Int?!@Error maybe_result;
 ```
 
 ## 可变性
 
 可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变；它不表示 optional，也不表示空值。也就是说，`Int` 与 `Int!` 是不同的 Jiang 类型形态，虽然类型检查可以在受控位置做兼容判断。
 
-`!` 作用在当前类型层级，表示这一层可变；同一类型层级中最多出现一次。`?` 是 `Option<T>` 的语法糖，可以重复出现，`T??` 表示 `Option<Option<T>>`。
+`!` 作用在当前类型层级，表示这一层可变；同一类型层级中最多出现一次。`?` 可以重复出现，
+`T??` 表示两层 optional。
 
 `^` / `&` 会基于左侧已经形成的类型创建新的 language handle 外层。创建出的外层也可以
 继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 `^` 或 `&` 外层；因此不支持
@@ -339,13 +339,14 @@ ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明�
 Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、lifetime 和 drop safety。
 这里先固定 pointer/reference 的目标语义：
 
-- `T^`：`Box<T>` 的语法糖，表示 owning pointer；它不是 C 风格 raw pointer。
+- `T^`：owning pointer；它不是 C 风格 raw pointer。
 - `T&`：非 owning 引用，不表达释放职责。通过 `T&` 可以读写目标内部声明为 `!` 的成员。
 - `T!&`：从 `T!` storage 借出的非 owning 引用，目标 storage 的可变性保留在被引用类型中。
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
-- `T[]`：`Slice<T>` 的语法糖，表示 unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^` 形成 owning handle。
+- `T[]`：unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^`
+  形成 owning handle。
 - `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
 - `T[:0]`：带 sentinel 的 unsized array type，必须通过 `T[:0]&` 形成 sentinel slice view，或通过 `T[:0]^` 形成 owning handle；sentinel view 保证 `data[length] == 0`。
 
@@ -656,7 +657,7 @@ materialize 成 readonly `MirGlobal`，initializer 用 `MirStaticValue` 表达�
 const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
 `recursive_const_initializer`；comptime 函数调用受递归深度和 branch quota 限制，避免编译期执行失控。
 0.4.6 计划把 const generic 参数迁移到约束语法：`K: const Type`。例如
-`struct Array<T, N: const Int>` 或 `Int size<N: const Int>() { N }`。这里 `const Type` 是一种
+`struct Fixed<T, N: const Int>` 或 `Int size<N: const Int>() { N }`。这里 `const Type` 是一种
 约束 kind，不是 trait；const generic 名字是值层参数，可在表达式中使用，不能作为类型名使用。
 trait associated item 也可以使用同一形式表达编译期值约束，例如
 `associated kind: const DomainKind`。
@@ -931,7 +932,7 @@ count 分别添加 `T == Int`、`N == 4`。member lookup 只执行统一的 exte
 
 extension binder 是独立的语义参数 owner，不按位置复用 target owner 的 generic DefId，也不要求两边
 参数数量相同。target/equality pattern 在 lookup 时递归生成 `GenericBindings`，并将绑定统一应用到
-where predicates、成员参数、返回类型和函数值。`extend <T> Box<Slice<T>>` 可直接捕获嵌套的 `T`；
+where predicates、成员参数、返回类型和函数值。`extend <T> T[]^` 可直接捕获嵌套的 `T`；
 无法从 target/equality pattern 推导的 binder 报 `unbound_extension_parameter`。
 
 extension 不使用全局 orphan 禁令，用户模块可以扩展 builtin 或其他模块公开的类型。普通 extension 只在
@@ -986,7 +987,9 @@ trait Indexable {
   `Trait.VTable` 是 compiler-private 方法表类型，用户源码不能直接命名或传参。当前实现支持
   ref receiver method 的动态分派和 owning trait object drop，暂不支持 move receiver
   trait object dispatch。
-- 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如 `Box<T>.get() -> T` 在 `Box<Int!>` 上调用时，等价于 `Box.get(box&) -> Int!`；如果这个结果写入 `Int` 目标，再按上面的写入目标规则忽略顶层 mutable。
+- 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如
+  `Holder<T>.get() -> T` 在 `Holder<Int!>` 上调用时，结果类型为 `Int!`；如果这个结果写入 `Int`
+  目标，再按上面的写入目标规则忽略顶层 mutable。
 - union variant name 和同一 union 的类型函数/显式 method name 共享类型成员命名空间，
   不能重名，避免 `Union.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须
@@ -1035,13 +1038,12 @@ T id<T>(T value);
 支持类型相等/不等约束、negative trait bound，以及 associated type equality constraint；相等关系使用 `==`，不使用赋值语义的 `=`。associated type projection 需要显式写出 trait，以避免短投影歧义：
 
 ```jiang
-@where(T: Sequence, T.[Sequence].Element == Int, T: !Mutable, T != Box<_>)
+@where(T: Sequence, T.[Sequence].Element == Int, T: !Mutable, T != _^)
 ```
 
 类型相等/不等约束中的右侧类型可以作为形状 pattern 使用，`_` 匹配单个 type argument。
-例如 `@where(T == Box<_>)` 匹配任意 boxed value，`@where(T != Option<_>)` 排除 optional。
-内建后缀类型在 pattern 中按 canonical builtin type 处理：`T[]` 等价于 `Slice<T>`，`T[N]`
-等价于 `Array<T, N>`。
+例如 `@where(T == _^)` 匹配任意 owning pointer，`@where(T != _?)` 排除 optional。
+内建后缀类型在 pattern 中直接按 canonical type 处理。
 
 当前 AST 使用：
 
@@ -1053,11 +1055,9 @@ T id<T>(T value);
 
 ## Optional 和 Errorable
 
-Optional 使用 `T?` 表示，也可以显式写作 `Option<T>`。
+Optional 只使用 `T?` 表示。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
 
-`?` 是 `Option<T>` 的语法糖。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
-
-Optional 不再幂等：`T??` 表示 `Option<Option<T>>`。`!` 是当前绑定或类型层的可变标记，
+Optional 不再幂等：`T??` 表示两层 optional。`!` 是当前绑定或类型层的可变标记，
 例如 `Int?!` 表示 optional 这一层本身可变。
 
 已确定表达式能力：
@@ -1071,7 +1071,7 @@ Optional 不再幂等：`T??` 表示 `Option<Option<T>>`。`!` 是当前绑定�
 - 借用解包 pattern: `value is .some(ref Int payload)`
 - 可重绑定借用解包 pattern: `value is .some(ref! Int payload)`
 
-`.some(...)` / `.none` 是 `Option<T>` 的 pattern 写法。`some` 是普通标识符，
+`.some(...)` / `.none` 是 optional 的 pattern 写法。`some` 是普通标识符，
 不再作为 optional pattern 关键字。`ref` 是绑定模式，不是类型名；
 `ref T payload` 借用 payload 并创建不可重绑定的引用绑定；`ref! T payload` 借用 payload
 并创建可重绑定的引用 slot。被引用类型的可变性来自 payload 本身，例如 `T!` payload 会得到
@@ -1104,8 +1104,8 @@ switch value {
 目标设计偏向显式 optional handling。是否支持 `x == null` / `x != null`
 分支窄化仍未定；在定稿前，sema 不应依赖该能力。
 
-Errorable 使用 `T@E` 表示，并与 `Result<T, E>` canonical 到同一类型。`T` 是成功值类型，`E` 是
-错误类型。错误类型顶层不能带 `?` 或 `!`。
+Errorable 只使用 `T@E` 表示。`T` 是成功值类型，`E` 是错误类型。错误类型顶层不能带
+`?` 或 `!`。
 
 合法：
 

@@ -308,8 +308,8 @@ name        <- ident / "self"
 - `T&` 表示引用外层。
 - `T^` 表示 owning pointer 外层。
 - `T*` 表示 raw pointer；主要用于 FFI / ABI / 低层 capability 场景，不参与自动解引用。
-- `T[]` 表示 `Slice<T>` 这个 unsized array type，不能作为普通 value；`T[]&` 表示 borrowed slice view。
-- `T[:0]` 表示 `SentinelSlice<T, 0>` 这个 sentinel unsized array type，`T[:0]&` 表示 borrowed sentinel slice view，
+- `T[]` 表示 unsized array type，不能作为普通 value；`T[]&` 表示 borrowed slice view。
+- `T[:0]` 表示 sentinel unsized array type，`T[:0]&` 表示 borrowed sentinel slice view，
   并额外记录 `data[length] == 0` 的类型语义。
 - `T[*]` 表示 many pointer。
 - `T[*:0]` 表示 sentinel many pointer；它不带 length，适合 C string ABI。
@@ -318,8 +318,7 @@ name        <- ident / "self"
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
-- `T@E` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位；它与
-  `Result<T, E>` canonical 到同一个 error-union 类型。
+- `T@E` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位。
 - `T@E` 不允许空白：`T @E`、`T@ E` 和 `T @ E` 都报 `unexpected_trivia`。
 - `RawFn<unsafe T, ...>`、`RawFn<async T, ...>` 和 `RawFn<async [domain] T, ...>`
   表示带调用效果的函数指针类型。调用效果
@@ -349,9 +348,8 @@ name        <- ident / "self"
   effect keyword 的规范顺序是 `unsafe` 在前，`async` / `sync` 在后。
 
 `T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]` 等内建后缀类型语法
-不通过普通名字解析；用户定义同名 `Option`、`Array`、`Slice`、`SentinelSlice`、`Box`、
-`Ref`、`RawPointer`、`ManyPointer` 不会改变这些语法的含义。`Result<T, E>` 由编译器识别为
-内建 result 类型。
+不通过普通名字解析。compiler-owned constructor 名称不进入用户可见 namespace；用户声明
+同名 nominal type 也不会改变这些语法的含义。
 
 ## struct
 
@@ -477,7 +475,7 @@ extend_member
 目标类型中的未声明名称按普通类型名解析，不会隐式引入模式参数；因此找不到类型 `T` 时，
 `extend Foo<T> {}` 会报告 `unresolved_type`。`_` 仍表示不绑定名称的单个类型占位符。
 extension binder 的数量不要求与 target constructor 的参数数量相同；target pattern 决定绑定关系。
-例如 `extend <T> Box<Slice<T>> {}` 从嵌套 Slice 捕获 `T`。无法从 target/equality pattern 推导的
+例如 `extend <T> T[]^ {}` 从嵌套 owning slice 捕获 `T`。无法从 target/equality pattern 推导的
 binder 会报告 `unbound_extension_parameter`。
 
 ## 语句和 block
