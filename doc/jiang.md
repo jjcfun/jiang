@@ -2175,20 +2175,25 @@ extend User: HasValue {
 - 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self` 方法会消耗 `value`
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式
-- generic receiver extension 必须显式声明模式参数，例如 `extend<T> Holder<T>`、
-  `extend<T> T?` 和 `extend<T, E> T@E`。目标中的未声明名称按普通类型名解析，
+- generic receiver extension 必须显式声明模式参数，例如 `extend <T> Holder<T>`、
+  `extend <T> T?` 和 `extend <T, E> T@E`。推荐在 `extend` 与参数列表之间保留空格；空格不是
+  语法要求，并为未来的 `extend [options] <T>` 形式保留清晰结构。目标中的未声明名称按普通类型名解析，
   `extend Holder<T>` 不会隐式声明 `T`；`_` 只匹配一个 type argument 且不绑定名称。
-- binder 与 owner generic parameter 相互独立，不要求数量相同。`extend<T> Box<Slice<T>>` 会从
-  `Box<Slice<Int>>` 捕获 `T = Int`；`@where(S == Slice<T>) extend<T, S> Box<S>` 表达同一绑定链。
+- binder 与 owner generic parameter 相互独立，不要求数量相同。`extend <T> Box<Slice<T>>` 会从
+  `Box<Slice<Int>>` 捕获 `T = Int`；`@where(S == Slice<T>) extend <T, S> Box<S>` 表达同一绑定链。
   无法从 target/equality pattern 推导的 binder 会在声明处报错。
 - concrete specialized target 可以直接写，例如 `extend Holder<Int>`、`extend Int?`；需要同时保留
-  pattern 参数并添加附加条件时，使用 `@where(T == Int) extend<T> Holder<T> { ... }`。
-- receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend<T> Holder<T>` 或
-  `@where(T != Option<_>) extend<T> Holder<T>`。
+  pattern 参数并添加附加条件时，使用 `@where(T == Int) extend <T> Holder<T> { ... }`。
+- receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend <T> Holder<T>` 或
+  `@where(T != Option<_>) extend <T> Holder<T>`。
 - `T^` / `T&` / `T*` / `T[*]`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型
   receiver 或 where pattern 时，会按对应 canonical builtin owner 查找和匹配 extension，例如
   `UInt8[]^` 可查找 `Box<UInt8[]>` 上的方法，`UInt8[3]` 可匹配 `Array<UInt8, _>`。
-- `public extend` 可以跨模块传播；普通 `extend` 只在声明模块和直接导入者可见。`public import` 会继续 re-export imported module 的 public extensions
+- `public extend` 可以跨模块传播；普通 `extend` 只在声明模块可见。`public import` 会继续 re-export
+  imported module 的 public extensions。
+- 用户模块可以扩展 builtin 或其他模块公开的类型，不使用全局 orphan 禁令；extension 只参与当前模块
+  可见集合中的 lookup。相同调用同时匹配多个同 specificity extension 时报告 ambiguity，concrete pattern
+  优先于 generic pattern。
 - union variant name 和同一 union 的 method name 不能重名，避免 `Union.member(...)` 歧义
 - 同名 method 可以 overload，但参数数量或参数类型必须不同
 - `extend Type: Trait { ... }` 会做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现

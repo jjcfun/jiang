@@ -393,11 +393,13 @@ struct MirLowerer: Movable {
             body: mir_body
         );
         if (effects.has_async) {
-            self.output.set_borrow_check_override(function);
+            mir.MirFunction! borrow_check_source = function;
             function = drop_elaborate.elaborate_function(self.ctx, self.output, function);
             function.coroutine_frame = self.coroutine_frame_layout_for_body(
                 hir_def.def_id, function.body, effects
             );
+            borrow_check_source.coroutine_frame = function.coroutine_frame;
+            self.output.set_borrow_check_override(borrow_check_source$.move());
             self.output.mark_drop_elaborated(function.id);
         }
         self.output.add_function(function);
@@ -1641,6 +1643,7 @@ struct BodyLowerer: Movable {
     list.ArrayList<hir.HirId>! active_defers;
     typeck_store.LambdaCaptureInfo[]&? lambda_capture_infos;
     types.EffectSet! current_effects;
+    mir.MirLocalId?! active_coroutine_capture_future;
     Int! hir_local_offset;
     mir.MirBlockId! current_block;
     Bool! terminated;
@@ -1669,6 +1672,7 @@ struct BodyLowerer: Movable {
         self.active_defers = list.ArrayList<hir.HirId>();
         self.lambda_capture_infos = lowerer.typeck.lambda_capture_infos(hir_def.def_id);
         self.current_effects = lowerer.function_effects_for_def(hir_def.def_id, substitutions);
+        self.active_coroutine_capture_future = null;
         self.current_block = self.reserve_block(span);
         self.terminated = false;
         self.hir_local_offset = self.lowerer.add_initial_locals(hir_def, substitutions, self.locals$.ref());
@@ -2432,6 +2436,10 @@ struct BodyLowerer: Movable {
             self.mark_unsupported(node_id);
             return true;
         }
+        guard mir.place_local_id(destination) is .some(future_local) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
         token.Span span = self.lowerer.hir_span(node_id);
         if (self.async_start_is_detached(node_id)) {
             self.lower_detached_async_block(node_id, function_def, captures, layout$.ref(), span);
@@ -2444,7 +2452,9 @@ struct BodyLowerer: Movable {
         qid.TypeId allocation_pointer_type = self.lowerer.ctx.store.types.raw_pointer_type(allocation_type, span);
         mir.MirLocalId inline_storage = self.add_temp(allocation_type, span);
         mir.MirPlace inline_storage_place = self.place_for_local(inline_storage);
-        mir.MirLocalId allocation_pointer = self.add_temp(allocation_pointer_type, span);
+        mir.MirLocalId allocation_pointer = self.add_coroutine_capture_temp(
+            allocation_pointer_type, span, future_local
+        );
         mir.MirPlace allocation_pointer_place = self.place_for_local(allocation_pointer);
         self.statements.add(mir.MirStatement (
             span: span,
@@ -2468,7 +2478,7 @@ struct BodyLowerer: Movable {
             span
         );
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
-        args.add(self.async_block_env_operand(node_id, function_def, captures, span));
+        args.add(self.async_block_env_operand(node_id, function_def, captures, future_local, span));
         self.lower_async_operands_into_frame(args$.ref(), layout$.ref(), frame_place, span);
         mir.MirFunctionRef resume_function = self.coroutine_generated_function_ref(
             function_def,
@@ -2534,7 +2544,7 @@ struct BodyLowerer: Movable {
         );
         mir.MirPlace frame_place = self.project_deref(frame_pointer_place, true);
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
-        args.add(self.async_block_env_operand(node_id, function_def, captures, span));
+        args.add(self.async_block_env_operand(node_id, function_def, captures, null, span));
         self.lower_async_operands_into_frame(args$.ref(), layout, frame_place, span);
         self.statements.add(coroutine_future_abi.frame_state_initializer(
             self.lowerer.output,
@@ -2652,6 +2662,7 @@ struct BodyLowerer: Movable {
         hir.HirId node_id,
         qid.DefId function_def,
         typeck_store.LambdaCaptureInfo[]& captures,
+        mir.MirLocalId? capture_future,
         token.Span span
     ) {
         if (captures.length == 0) {
@@ -2667,7 +2678,7 @@ struct BodyLowerer: Movable {
             function_def: function_def,
             body: node_id
         );
-        mir.MirOperand env = self.heap_lambda_env_operand(node_id, lambda, span);
+        mir.MirOperand env = self.heap_lambda_env_operand(node_id, lambda, capture_future, span);
         qid.TypeId env_type = self.lambda_env_type_for_infos(function_def, captures, span);
         qid.DefId drop_shim = self.ensure_lambda_env_drop_shim(node_id, env_type, true);
         self.lowerer.async_block_env_drop_shims.set(function_def, drop_shim);
@@ -4518,7 +4529,7 @@ struct BodyLowerer: Movable {
             mir.alloc_box_rvalue(mir.MirAllocBoxRvalue (value_type: closure_type)),
             span
         );
-        mir.MirOperand env = self.heap_lambda_env_operand(lambda_id, lambda, span);
+        mir.MirOperand env = self.heap_lambda_env_operand(lambda_id, lambda, null, span);
         mir.MirOperand vtable = self.lambda_vtable_operand(lambda_id, lambda, true, span);
         self.push_closure_assign(
             lambda_id,
@@ -5476,7 +5487,7 @@ struct BodyLowerer: Movable {
         }
         token.Span span = self.lowerer.hir_span(node_id);
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
-        args.add(self.async_block_env_operand(async_block, function_def, captures, span));
+        args.add(self.async_block_env_operand(async_block, function_def, captures, null, span));
         self.lower_async_direct_continuation_call(
             function_def,
             self.lowerer.output.empty_type_args(),
@@ -8055,16 +8066,26 @@ struct BodyLowerer: Movable {
         return self.erased_lambda_env_address_operand(env_place, env_pointer_type, span);
     }
 
-    mir.MirOperand heap_lambda_env_operand(self, hir.HirId node_id, hir.HirLambda lambda, token.Span span) {
+    mir.MirOperand heap_lambda_env_operand(
+        self,
+        hir.HirId node_id,
+        hir.HirLambda lambda,
+        mir.MirLocalId? capture_future,
+        token.Span span
+    ) {
         guard self.lowerer.typeck.lambda_capture_infos(lambda.function_def) is .some(captures) else {
             return self.null_operand(self.closure_env_type(span), span);
         }
         if (captures.length == 0) {
             return self.null_operand(self.closure_env_type(span), span);
         }
+        mir.MirLocalId?! saved_capture_future = self.active_coroutine_capture_future;
+        self.active_coroutine_capture_future = capture_future;
         qid.TypeId env_type = self.lambda_env_type_for_infos(lambda.function_def, captures, span);
         qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
-        mir.MirLocalId env_pointer = self.add_temp(env_pointer_type, span);
+        mir.MirLocalId env_pointer = self.add_optional_coroutine_capture_temp(
+            env_pointer_type, span, capture_future
+        );
         mir.MirPlace env_pointer_place = self.place_for_local(env_pointer);
         self.push_assign(
             env_pointer_place,
@@ -8073,7 +8094,11 @@ struct BodyLowerer: Movable {
         );
         mir.MirPlace env_place = self.project_deref(env_pointer_place, true);
         self.fill_lambda_env(node_id, lambda, captures, env_place);
-        return self.erased_lambda_env_pointer_operand(env_pointer_place, env_pointer_type, span);
+        mir.MirOperand env = self.erased_lambda_env_pointer_operand(
+            env_pointer_place, env_pointer_type, capture_future, span
+        );
+        self.active_coroutine_capture_future = saved_capture_future;
+        return env;
     }
 
     mir.MirOperand lambda_vtable_operand(
@@ -8435,10 +8460,13 @@ struct BodyLowerer: Movable {
         self,
         mir.MirPlace env_pointer_place,
         qid.TypeId env_pointer_type,
+        mir.MirLocalId? capture_future,
         token.Span span
     ) {
         qid.TypeId erased_type = self.closure_env_type(span);
-        mir.MirLocalId erased_local = self.add_temp(erased_type, span);
+        mir.MirLocalId erased_local = self.add_optional_coroutine_capture_temp(
+            erased_type, span, capture_future
+        );
         mir.MirPlace erased_place = self.place_for_local(erased_local);
         self.push_assign(
             erased_place,
@@ -12773,8 +12801,32 @@ struct BodyLowerer: Movable {
             name: null,
             def_id: null,
             mutable_local: true,
-            address_taken: false
+            address_taken: false,
+            coroutine_capture_future: self.active_coroutine_capture_future
         ));
+        return local_id;
+    }
+
+    mir.MirLocalId add_optional_coroutine_capture_temp(
+        self,
+        qid.TypeId type_id,
+        token.Span span,
+        mir.MirLocalId? capture_future
+    ) {
+        guard capture_future is .some(future_local) else { return self.add_temp(type_id, span); }
+        return self.add_coroutine_capture_temp(type_id, span, future_local);
+    }
+
+    mir.MirLocalId add_coroutine_capture_temp(
+        self,
+        qid.TypeId type_id,
+        token.Span span,
+        mir.MirLocalId capture_future
+    ) {
+        mir.MirLocalId local_id = self.add_temp(type_id, span);
+        mir.MirLocalDecl! local = self.locals.get(local_id.to_index());
+        local.coroutine_capture_future = capture_future;
+        self.locals.set(local_id.to_index(), local$.move());
         return local_id;
     }
 

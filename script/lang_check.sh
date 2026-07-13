@@ -106,7 +106,7 @@ run_run_case() {
     return
   fi
 
-  if ! "$LLVM_CLANG" "$llvm_output" "${companion_args[@]}" -o "$executable" \
+  if ! "$LLVM_CLANG" "$llvm_output" ${companion_args[@]+"${companion_args[@]}"} -o "$executable" \
     "${llvm_link_args[@]}" >/tmp/jiang_lang_run_link.out 2>&1; then
     echo "FAIL run $source link failed"
     sed -n '1,120p' /tmp/jiang_lang_run_link.out
@@ -157,7 +157,7 @@ run_release_case() {
   if ! "$JIANGC" \
     --mode release \
     "${jiang_llvm_link_args[@]}" \
-    "${companion_link_args[@]}" \
+    ${companion_link_args[@]+"${companion_link_args[@]}"} \
     -o "$executable" \
     "$source" >/tmp/jiang_lang_release_build.out 2>&1; then
     echo "FAIL release-run $source build failed"

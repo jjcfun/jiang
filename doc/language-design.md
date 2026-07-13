@@ -919,18 +919,25 @@ union variant 声明按 grammar 使用字段式写法，所有 variant 必须写
 
 `extend` 给已有类型增加实现或方法。
 
-泛型 extension 使用独立且显式的模式参数列表：`extend<T> Foo<T> {}`。目标类型中的名称不会
-隐式成为模式参数；未在 `extend<...>` 中声明的名称按普通类型名解析。`extend Foo<T> {}` 只有在
+泛型 extension 使用独立且显式的模式参数列表：`extend <T> Foo<T> {}`。推荐在 `extend` 和 `<T>`
+之间保留空格，为未来的 `extend [options] <T>` 形式保留清晰结构，但该空格不是语法强制要求。
+目标类型中的名称不会隐式成为模式参数；未在 `extend <...>` 中声明的名称按普通类型名解析。
+`extend Foo<T> {}` 只有在
 作用域中确实存在类型 `T` 时才合法，否则报告 `unresolved_type`。`_` 是匿名类型占位符，不创建绑定。
 
 具体 extension target 会在 HIR lowering 时归一化为 canonical owner pattern 和相等约束。例如
-`extend Int?` 等价于 `@where(T == Int) extend<T> T?`，`extend Int[4]` 等价于对 array element 和
+`extend Int?` 等价于 `@where(T == Int) extend <T> T?`，`extend Int[4]` 等价于对 array element 和
 count 分别添加 `T == Int`、`N == 4`。member lookup 只执行统一的 extension where predicate 匹配。
 
 extension binder 是独立的语义参数 owner，不按位置复用 target owner 的 generic DefId，也不要求两边
 参数数量相同。target/equality pattern 在 lookup 时递归生成 `GenericBindings`，并将绑定统一应用到
-where predicates、成员参数、返回类型和函数值。`extend<T> Box<Slice<T>>` 可直接捕获嵌套的 `T`；
+where predicates、成员参数、返回类型和函数值。`extend <T> Box<Slice<T>>` 可直接捕获嵌套的 `T`；
 无法从 target/equality pattern 推导的 binder 报 `unbound_extension_parameter`。
+
+extension 不使用全局 orphan 禁令，用户模块可以扩展 builtin 或其他模块公开的类型。普通 extension 只在
+声明模块可见；`public extend` 通过 import graph 传播，`public import` 可以继续 re-export。member lookup
+只考虑使用点可见且 pattern/where predicates 满足的 extension；concrete pattern 优先于 generic pattern，
+同 specificity 的多个可调用候选报告 ambiguity，不按声明顺序静默选择。
 
 示例：
 

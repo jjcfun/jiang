@@ -136,6 +136,7 @@ struct FunctionBorrowChecker: Movable {
     public types.EffectSet function_effects;
     public types.EffectSet! current_effects;
     public mir.MirBody body;
+    public mir.MirCoroutineFrameLayout? coroutine_frame;
     public move_path.MovePathTree! paths;
     public BorrowDataflowState! dataflow;
     public location.MirLocation! current_location;
@@ -159,6 +160,7 @@ struct FunctionBorrowChecker: Movable {
         self.function_effects = self.function_effects_for_def(function.def_id);
         self.current_effects = self.function_effects;
         self.body = function.body;
+        self.coroutine_frame = function.coroutine_frame;
         mir.MirBody! body = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
         self.dataflow = BorrowDataflowState();
@@ -488,6 +490,7 @@ struct FunctionBorrowChecker: Movable {
         if (!self.place_may_write_outside_current_body(destination)) {
             return;
         }
+        if (self.scoped_coroutine_capture_allows_store(destination, value)) { return; }
         if (self.type_contains_stack_closure(self.place_type(destination))) {
             if (self.assignment_is_owned_closure_init(destination, value)) {
                 return;
@@ -551,6 +554,128 @@ struct FunctionBorrowChecker: Movable {
             return self.self_lifetime_allows_borrow_store(destination, cast_value.value);
         }
         return false;
+    }
+
+    Bool scoped_coroutine_capture_allows_store(self, mir.MirPlace destination, mir.MirRvalue value) {
+        guard self.coroutine_capture_future_for_place(destination) is .some(future_local) else { return false; }
+        if (!self.inline_future_starts_in_current_block(future_local)) { return false; }
+        if (!self.coroutine_capture_value_matches_future(value, future_local)) { return false; }
+        guard self.coroutine_capture_source_local(value) is .some(source_local) else { return true; }
+        table.HashTable<Int, Bool>! visiting = table.HashTable<Int, Bool>();
+        return self.capture_source_lives_until_consume(
+            self.current_location.block_id,
+            self.current_location.statement_index + 1,
+            future_local,
+            source_local,
+            visiting$.ref()
+        );
+    }
+
+    mir.MirLocalId? coroutine_capture_future_for_place(self, mir.MirPlace place) {
+        guard mir.place_local_id(place) is .some(local_id) else { return null; }
+        Int index = local_id.to_index();
+        if (index < 0 || index >= self.body.locals.length) { return null; }
+        return self.body.locals[index].coroutine_capture_future;
+    }
+
+    Bool inline_future_starts_in_current_block(self, mir.MirLocalId future_local) {
+        guard self.coroutine_frame is .some(frame) else { return false; }
+        Int! index = 0;
+        while (index < frame.future_consumptions.length) {
+            mir.MirFutureConsumption consumption = frame.future_consumptions[index];
+            index = index + 1;
+            if (consumption.future_local.to_index() != future_local.to_index()) { continue; }
+            if (consumption.start_block.to_index() != self.current_location.block_id.to_index()) { return false; }
+            return consumption.storage == .inline_observed;
+        }
+        return false;
+    }
+
+    Bool coroutine_capture_value_matches_future(self, mir.MirRvalue value, mir.MirLocalId future_local) {
+        if (value is .borrow_value(_)) { return true; }
+        if (value is .address_of_value(_)) { return true; }
+        guard self.rvalue_operand_place(value) is .some(source) else { return false; }
+        guard self.coroutine_capture_future_for_place(source) is .some(source_future) else { return false; }
+        return source_future.to_index() == future_local.to_index();
+    }
+
+    mir.MirPlace? rvalue_operand_place(self, mir.MirRvalue value) {
+        if (value is .use_value(use_value)) { return self.operand_place(use_value.value); }
+        if (value is .cast_value(cast_value)) { return self.operand_place(cast_value.value); }
+        return null;
+    }
+
+    mir.MirLocalId? coroutine_capture_source_local(self, mir.MirRvalue value) {
+        if (value is .borrow_value(borrow_value)) { return mir.place_local_id(borrow_value.place); }
+        if (value is .address_of_value(address_of_value)) { return mir.place_local_id(address_of_value.place); }
+        guard self.rvalue_operand_place(value) is .some(source) else { return null; }
+        move_path.MovePathId source_path = self.paths.path_for_place(source);
+        if (!self.valid_move_path(source_path)) { return null; }
+        Int! index = 0;
+        while (index < self.dataflow.active_loans.len()) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            index = index + 1;
+            if (!self.loan_target_matches_path(fact.target, source_path)) { continue; }
+            loan.Loan active = self.results.loans.get(fact.loan_id);
+            return self.paths.get(active.source).local_id;
+        }
+        return null;
+    }
+
+    Bool capture_source_lives_until_consume(
+        self,
+        mir.MirBlockId block_id,
+        Int statement_index,
+        mir.MirLocalId future_local,
+        mir.MirLocalId source_local,
+        table.HashTable<Int, Bool>& visiting
+    ) {
+        Int block_index = block_id.to_index();
+        if (table.hash_table_get_value<Int, Bool>(visiting, block_index) != null) { return false; }
+        visiting.set(block_index, true);
+        mir.MirBlock block = self.body.blocks[block_index];
+        Int! index = statement_index;
+        while (index < block.statements.length) {
+            mir.MirStatement statement = block.statements[index];
+            if (self.statement_consumes_future(statement, future_local)) {
+                visiting.remove(block_index);
+                return true;
+            }
+            if (self.statement_kills_local(statement, source_local)) {
+                visiting.remove(block_index);
+                return false;
+            }
+            index = index + 1;
+        }
+        Int successor_count = mir.terminator_successor_count(block.terminator);
+        if (successor_count == 0) {
+            visiting.remove(block_index);
+            return false;
+        }
+        Int! successor_index = 0;
+        while (successor_index < successor_count) {
+            mir.MirBlockId successor = mir.terminator_successor_at(block.terminator, successor_index);
+            if (!self.capture_source_lives_until_consume(
+                successor, 0, future_local, source_local, visiting
+            )) {
+                visiting.remove(block_index);
+                return false;
+            }
+            successor_index = successor_index + 1;
+        }
+        visiting.remove(block_index);
+        return true;
+    }
+
+    Bool statement_consumes_future(self, mir.MirStatement statement, mir.MirLocalId future_local) {
+        guard statement.kind is .future_consume_stmt(consume) else { return false; }
+        guard mir.place_local_id(consume.future) is .some(local_id) else { return false; }
+        return local_id.to_index() == future_local.to_index();
+    }
+
+    Bool statement_kills_local(self, mir.MirStatement statement, mir.MirLocalId local_id) {
+        guard statement.kind is .storage_dead_stmt(storage_dead) else { return false; }
+        return storage_dead.local_id.to_index() == local_id.to_index();
     }
 
     Bool self_lifetime_allows_borrow_store(self, mir.MirPlace destination, mir.MirOperand operand) {
