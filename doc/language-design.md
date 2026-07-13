@@ -189,10 +189,10 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T[N]`：定长数组。
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
-- `Result<T, E>`：errorable result，只能出现在函数、方法和 callable 类型的返回位。
-- `Result` 的错误类型 `E` 顶层不能带 `?` 或 `!`。如果成功值类型需要 optional/mutable，
-  必须写在第一个类型参数上，例如 `Result<T?!, E>`。
-- 0.4.6 已移除旧的 `T@E` 返回类型语法。
+- `T@E`：errorable result，只能出现在函数、方法和 callable 类型的返回位；与
+  `Result<T, E>` canonical 到同一类型。
+- 错误类型 `E` 顶层不能带 `?` 或 `!`。如果成功值需要 optional/mutable，应写成 `T?!@E`。
+- `T@E` 两侧不允许空白，避免与前缀 annotation 和普通表达式混淆。
 
 内建后缀类型语法不经过普通名字解析。即使用户定义了同名 `Option<T>`、`Array<T>`、
 `Slice<T>`、`SentinelSlice<T, S>`、`Box<T>`、`Ref<T>`、`RawPointer<T>`、
@@ -919,6 +919,10 @@ union variant 声明按 grammar 使用字段式写法，所有 variant 必须写
 
 `extend` 给已有类型增加实现或方法。
 
+泛型 extension 使用独立且显式的模式参数列表：`extend<T> Foo<T> {}`。目标类型中的名称不会
+隐式成为模式参数；未在 `extend<...>` 中声明的名称按普通类型名解析。`extend Foo<T> {}` 只有在
+作用域中确实存在类型 `T` 时才合法，否则报告 `unresolved_type`。`_` 是匿名类型占位符，不创建绑定。
+
 示例：
 
 ```jiang
@@ -1084,26 +1088,26 @@ switch value {
 目标设计偏向显式 optional handling。是否支持 `x == null` / `x != null`
 分支窄化仍未定；在定稿前，sema 不应依赖该能力。
 
-Errorable 使用 `Result<T, E>` 表示。`T` 是成功值类型，`E` 是错误类型。错误类型顶层不能带
-`?` 或 `!`；如果成功值需要 optional/mutable，必须写在第一个类型参数上。
+Errorable 使用 `T@E` 表示，并与 `Result<T, E>` canonical 到同一类型。`T` 是成功值类型，`E` 是
+错误类型。错误类型顶层不能带 `?` 或 `!`。
 
 合法：
 
 ```jiang
-Result<Int, Error> value;
-Result<Int?!, Error> maybe_value;
-Result<Int, (T1?, T2!)> tuple_error;
+Int@Error parse();
+Int?!@Error parse_optional_mutable();
+RawFn<Int@(T1?, T2!)> parse_tuple_error;
 ```
 
 非法：
 
 ```jiang
-Result<Int, Error?>;
-Result<Int, Error!>;
+Int@Error? parse_optional_error();
+Int@Error! parse_mutable_error();
 ```
 
-当前 errorable value 不做隐式传播。`Result<T, E>` 只能作为完整 errorable value 保存或返回；
-如果上下文需要 `T`，必须用 `try expr catch (...) => ...` 显式处理 error 分支。
+errorable 函数调用在同错误类型的函数中透明投影为成功类型 `T`，失败时自动向上一层传播；成功值可
+直接参与表达式。`try call() catch (...) => ...` 对单个调用点阻止自动传播并处理 error 分支。
 `throw expr` 只能出现在返回 errorable type 的函数中，`expr` 必须可赋给该函数的 error type。
 catch binding 只在 catch body 内可见，类型来自被处理 errorable value 的 error type。
 

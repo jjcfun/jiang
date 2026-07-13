@@ -21,6 +21,7 @@
 import hir = "../hir/hir.jiang";
 import diagnostic = "../diagnostic/diagnostic.jiang";
 import qid = "../store/id.jiang";
+import extension_target = "./extension_target.jiang";
 import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import unicode = "../support/unicode.jiang";
@@ -313,8 +314,10 @@ struct HirLower: Movable {
         self.current_owner_def = owner_def;
         self.env.enter_scope(.generic_scope);
         self.define_self_type(owner_def);
-        self.define_owner_generic_params(owner_def);
+        self.define_extend_generic_params(extend_decl.generics, owner_def);
         Int extension_index = self.state.store.hirs.add_extension_group(self.state.module_id, owner_def, public_flag);
+        self.lower_extend_generic_constraints(extension_index, extend_decl.generics, owner_def);
+        self.lower_extend_generic_bounds(extension_index, extend_decl.generics, owner_def);
         self.lower_extend_target_arg_patterns(extension_index, extend_decl.target_type, owner_def);
         self.lower_extension_annotations(extension_index, annotations);
         if (extend_decl.trait_path is .some(trait_path)) {
@@ -329,6 +332,108 @@ struct HirLower: Movable {
         self.record_extension_members(extension_index, extend_decl.members);
         self.env.exit_scope();
         self.current_owner_def = previous_owner;
+    }
+
+    () define_extend_generic_params(self, ast.AstId? generics, qid.DefId owner_def) {
+        guard self.extend_generic_param_range(generics) is .some(params) else {
+            self.define_owner_generic_params(owner_def);
+            return;
+        }
+        guard self.state.store.hirs.def(owner_def) is .some(owner_hir) else { return; }
+        Int! index = 0;
+        while (index < params.length && index < owner_hir.generic_params.len()) {
+            ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, index));
+            guard param_node.data is .generic_param(param) else {
+                index = index + 1;
+                continue;
+            }
+            ast.AstId name_id = param.name;
+            guard self.state.name_symbol(name_id) is .some(symbol) else {
+                index = index + 1;
+                continue;
+            }
+            qid.DefId param_def = owner_hir.generic_params.get(index);
+            def.DefRecord record = self.state.store.defs.get(param_def);
+            self.env.define(symbol, record.domain, param_def, self.state.unit.get(name_id).span);
+            index = index + 1;
+        }
+    }
+
+    ast.AstRange? extend_generic_param_range(self, ast.AstId? generics) {
+        guard generics is .some(generic_id) else { return null; }
+        ast.AstNode node = self.state.unit.get(generic_id);
+        guard node.data is .generic_params(params) else { return null; }
+        return params.type_params;
+    }
+
+    () lower_extend_generic_bounds(
+        self,
+        Int extension_index,
+        ast.AstId? generics,
+        qid.DefId owner_def
+    ) {
+        guard self.extend_generic_param_range(generics) is .some(params) else { return; }
+        guard self.state.store.hirs.def(owner_def) is .some(owner_hir) else { return; }
+        Int! index = 0;
+        while (index < params.length && index < owner_hir.generic_params.len()) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (node.data is .generic_param(param)) {
+                if (param.type_bound is .some(bound)) {
+                    self.lower_extend_type_bound(
+                        extension_index, owner_hir.generic_params.get(index), bound
+                    );
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_extend_generic_constraints(
+        self,
+        Int extension_index,
+        ast.AstId? generics,
+        qid.DefId owner_def
+    ) {
+        guard self.extend_generic_param_range(generics) is .some(params) else { return; }
+        guard self.state.store.hirs.def(owner_def) is .some(owner_hir) else { return; }
+        Int! index = 0;
+        while (index < params.length && index < owner_hir.generic_params.len()) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (node.data is .generic_param(param)) {
+                if (param.type_ref is .some(type_ref)) {
+                    self.state.store.hirs.add_extension_generic_constraint(
+                        extension_index,
+                        hir.HirExtensionGenericConstraint (
+                            param_def: owner_hir.generic_params.get(index),
+                            type_ref: self.lower_type_ref(type_ref)
+                        )
+                    );
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_extend_type_bound(self, Int extension_index, qid.DefId subject_def, ast.AstId bound_id) {
+        ast.AstNode bound = self.state.unit.get(bound_id);
+        if (bound.data is .trait_bound(trait_bound)) {
+            hir.HirWhereTypeBound lowered = hir.HirWhereTypeBound (
+                subject: self.lower_def_type_ref(subject_def),
+                bound: self.lower_trait_bound_ref(trait_bound)
+            );
+            if (trait_bound.negative) {
+                self.state.store.hirs.add_extension_where_predicate(
+                    extension_index, .negative_type_bound(lowered)
+                );
+            } else {
+                self.state.store.hirs.add_extension_where_predicate(extension_index, .type_bound(lowered));
+            }
+            return;
+        }
+        if (bound.data is .type_bound_intersection(intersection)) {
+            self.lower_extend_type_bound(extension_index, subject_def, intersection.left);
+            self.lower_extend_type_bound(extension_index, subject_def, intersection.right);
+        }
     }
 
     () lower_extension_trait_assoc_bindings(self,
@@ -3001,6 +3106,9 @@ struct HirLower: Movable {
     }
 
     qid.DefId? resolved_type_def_for_type_ref(self, ast.AstId type_id) {
+        if (extension_target.builtin_constructor_owner(self.state, type_id) is .some(owner_def)) {
+            return owner_def;
+        }
         ast.AstNode node = self.state.unit.get(type_id);
         if (node.data is .type_ref(type_ref)) {
             return self.resolved_type_def_for_type_ref(type_ref.base);

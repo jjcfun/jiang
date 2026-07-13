@@ -18,6 +18,7 @@ import resolve_state = "./state.jiang";
 import store = "./store.jiang";
 import table = "../support/table.jiang";
 import trait_companion = "./trait_companion.jiang";
+import extension_target = "./extension_target.jiang";
 import std;
 
 public struct ReferenceResolver: Movable {
@@ -257,10 +258,6 @@ public struct ReferenceResolver: Movable {
             return;
         }
         if (body.data is .extend_decl(extend_decl)) {
-            qid.DefId?! extend_owner_def = self.resolve_extend_target(extend_decl.target_type);
-            if (extend_decl.trait_path is .some(trait_path)) {
-                self.resolve_type_bound(trait_path);
-            }
             if (extend_decl.members.length == 0 && !self.current_source_allows_bodyless_extension()) {
                 self.add_diagnostic(
                     body.span,
@@ -268,15 +265,26 @@ public struct ReferenceResolver: Movable {
                     "extern_extension_core_only"
                 );
             }
-            if (!self.can_resolve_extend_members(extend_decl.target_type)) {
-                return;
-            }
+            qid.DefId?! extend_owner_def = self.extend_target_owner_def(extend_decl.target_type);
             qid.DefId? previous_owner = self.current_owner_def;
             self.env.enter_scope(.generic_scope);
             if (extend_owner_def is .some(owner_def)) {
                 self.current_owner_def = owner_def;
                 self.define_self_type(owner_def);
-                self.define_owner_generic_params(owner_def);
+                self.define_extend_generic_params(extend_decl.generics, owner_def);
+                self.resolve_extend_generic_constraints(extend_decl.generics);
+                self.resolve_type_ref(extend_decl.target_type);
+                self.check_extend_target_args(extend_decl.target_type, owner_def);
+            } else {
+                self.resolve_type_ref(extend_decl.target_type);
+                self.add_diagnostic(
+                    self.state.unit.get(extend_decl.target_type).span,
+                    "extend target must be a namespace-bearing type",
+                    "unsupported_extend_target"
+                );
+            }
+            if (extend_decl.trait_path is .some(trait_path)) {
+                self.resolve_type_bound(trait_path);
             }
             self.resolve_where_annotations(top_level.annotations);
             self.resolve_member_range(extend_decl.members);
@@ -327,25 +335,10 @@ public struct ReferenceResolver: Movable {
             || self.std_source_allows_internal_builtin(module, source_path);
     }
 
-    qid.DefId? resolve_extend_target(self, ast.AstId target_type) {
-        guard self.extend_target_owner_def(target_type) is .some(owner_def) else {
-            self.resolve_type_ref(target_type);
-            self.add_diagnostic(
-                self.state.unit.get(target_type).span,
-                "extend target must be a namespace-bearing type",
-                "unsupported_extend_target"
-            );
-            return null;
-        }
-        self.env.enter_scope(.generic_scope);
-        self.define_owner_generic_params(owner_def);
-        self.resolve_type_ref(target_type);
-        self.check_extend_target_args(target_type, owner_def);
-        self.env.exit_scope();
-        return owner_def;
-    }
-
     qid.DefId? extend_target_owner_def(self, ast.AstId type_id) {
+        if (extension_target.builtin_constructor_owner(self.state, type_id) is .some(owner_def)) {
+            return owner_def;
+        }
         ast.AstNode node = self.state.unit.get(type_id);
         if (node.data is .type_ref(type_data)) {
             return self.extend_target_owner_def(type_data.base);
@@ -360,6 +353,71 @@ public struct ReferenceResolver: Movable {
             return self.resolved_alias_target(self.resolve_name_reference(type_id, .type_name));
         }
         return null;
+    }
+
+    () define_extend_generic_params(self, ast.AstId? generics, qid.DefId owner_def) {
+        guard self.extend_generic_param_range(generics) is .some(generic_params) else {
+            if (self.current_source_allows_bodyless_extension()) {
+                self.define_owner_generic_params(owner_def);
+            }
+            return;
+        }
+        list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+        if (generic_params.length != params.len()) {
+            token.Span! span = token.Span();
+            if (generics is .some(generic_id)) { span = self.state.unit.get(generic_id).span; }
+            self.add_diagnostic(
+                span,
+                "extend pattern parameter count does not match target type constructor",
+                "extend_pattern_param_arity_mismatch"
+            );
+        }
+        Int! index = 0;
+        while (index < generic_params.length && index < params.len()) {
+            ast.AstId param_id = self.state.unit.child_at(generic_params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            guard param_node.data is .generic_param(param_data) else {
+                index = index + 1;
+                continue;
+            }
+            ast.AstId name_id = param_data.name;
+            guard self.state.name_symbol(name_id) is .some(symbol) else {
+                index = index + 1;
+                continue;
+            }
+            qid.DefId param_def = params.get(index);
+            def.DefRecord record = self.state.store.defs.get(param_def);
+            Bool expects_const = record.domain == .value_name;
+            if (param_data.is_const != expects_const) {
+                self.add_diagnostic(
+                    self.state.unit.get(param_id).span,
+                    "extend generic parameter kind does not match target type constructor",
+                    "extend_generic_param_kind_mismatch"
+                );
+            }
+            self.env.define(symbol, record.domain, param_def, self.state.unit.get(name_id).span);
+            index = index + 1;
+        }
+    }
+
+    ast.AstRange? extend_generic_param_range(self, ast.AstId? generics) {
+        guard generics is .some(generic_id) else { return null; }
+        ast.AstNode node = self.state.unit.get(generic_id);
+        guard node.data is .generic_params(params) else { return null; }
+        return params.type_params;
+    }
+
+    () resolve_extend_generic_constraints(self, ast.AstId? generics) {
+        guard self.extend_generic_param_range(generics) is .some(params) else { return; }
+        Int! index = 0;
+        while (index < params.length) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (node.data is .generic_param(param)) {
+                if (param.type_ref is .some(type_ref)) { self.resolve_type_ref(type_ref); }
+                if (param.type_bound is .some(type_bound)) { self.resolve_type_bound(type_bound); }
+            }
+            index = index + 1;
+        }
     }
 
     qid.DefId? resolved_alias_target(self, qid.DefId? def_id) {
@@ -399,23 +457,22 @@ public struct ReferenceResolver: Movable {
         Int! index = 0;
         while (index < named_type.args.length) {
             ast.AstId arg = self.state.unit.child_at(named_type.args, index);
-            if (!self.extend_target_arg_matches_param(arg, params.get(index))) {
-                self.add_diagnostic(
-                    self.state.unit.get(arg).span,
-                    "extend target generic argument must name the target generic parameter",
-                    "unsupported_extend_target_arg"
-                );
-            }
+            self.check_extend_target_arg(arg, params.get(index));
             index = index + 1;
         }
     }
 
-    Bool extend_target_arg_matches_param(self, ast.AstId arg, qid.DefId param_def) {
+    () check_extend_target_arg(self, ast.AstId arg, qid.DefId param_def) {
         ast.AstNode node = self.state.unit.get(arg);
-        if (node.data is .infer_type) { return true; }
-        if (self.extend_target_arg_is_pattern(arg)) { return true; }
-        guard self.resolved_extend_target_arg_def(arg, param_def) is .some(arg_def) else { return false; }
-        return arg_def.to_index() == param_def.to_index();
+        if (node.data is .infer_type || self.extend_target_arg_is_pattern(arg)) { return; }
+        guard self.resolved_extend_target_arg_def(arg, param_def) is .some(arg_def) else { return; }
+        if (arg_def.to_index() != param_def.to_index()) {
+            self.add_diagnostic(
+                self.state.unit.get(arg).span,
+                "extend target generic argument must name the target generic parameter",
+                "unsupported_extend_target_arg"
+            );
+        }
     }
 
     qid.DefId? resolved_extend_target_arg_def(self, ast.AstId arg, qid.DefId param_def) {
@@ -624,10 +681,10 @@ public struct ReferenceResolver: Movable {
             return self.resolved_type_def(type_data.base);
         }
         if (node.data is .named_type(named_type)) {
-            return self.resolve_path(named_type.path, .type_name);
+            return self.try_resolve_path(named_type.path, .type_name);
         }
         if (node.data is .path(_)) {
-            return self.resolve_path(type_id, .type_name);
+            return self.try_resolve_path(type_id, .type_name);
         }
         if (node.data is .name(_)) {
             return self.resolve_name_reference(type_id, .type_name);

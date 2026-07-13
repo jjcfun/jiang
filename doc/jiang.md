@@ -1053,25 +1053,24 @@ Int y = switch (value) {
 
 #### 异常
 
-Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，推荐写作
-`Result<T, E>`：
+Jiang 的异常不是 runtime exception，也不做栈展开。它只是返回值编码，推荐写作 `T@E`；
+`Result<T, E>` 是同一个类型的兼容名称：
 
 ```c
-Result<Int, Err> parse(UInt8[]& text)
+Int@Err parse(UInt8[]& text)
   
-Result<(), Err> flush()
+()@Err flush()
   
-RawFn<Result<Bool, Err>, Int, Int> compare
+RawFn<Bool@Err, Int, Int> compare
 ```
 
 其中：
 
 - `T` 是成功值类型
 - `E` 是错误值类型
-- `Result<T, E>` 只允许作为函数返回类型，或出现在 `RawFn<...>` / `Fn<...>` 的返回位
+- `T@E` / `Result<T, E>` 只允许作为函数返回类型，或出现在 callable 的返回位
 - 底层布局复用通用 result/union 模型，不单独引入 runtime exception 机制
-
-0.4.6 已移除旧的 `T@E` 返回类型语法；代码应写 `Result<T, E>`。
+- `T@E` 必须连续书写，`T @E` 和 `T@ E` 都不合法
 
 抛出错误使用 `throw expr;`：
 
@@ -1080,7 +1079,7 @@ enum Err {
     bad = 7,
 }
 
-Result<Int, Err> parse(Bool fail) {
+Int@Err parse(Bool fail) {
     if (fail) {
         throw Err.bad;
     }
@@ -1090,34 +1089,32 @@ Result<Int, Err> parse(Bool fail) {
 
 `throw` 规则：
 
-- 只允许出现在返回类型为 `Result<T, E>` 的函数里
+- 只允许出现在返回 errorable type 的函数里
 - `throw` 的值必须与当前函数的错误类型 `E` 一致
 - `throw` 只是语句，不是表达式
 
-在 `Result<T, E>` 函数里调用另一个 `Result<U, E>` 函数时，错误会自动传播：
+在 `T@E` 函数里调用另一个 `U@E` 函数时，调用表达式直接表现为 `U`；失败时错误自动传播：
 
 ```c
-Result<Int, Err> ok() {
+Int@Err ok() {
     return 1;
 }
 
-Result<Int, Err> outer(Bool fail) {
-    parse(fail);
-    Int x = ok();
-    return x + 41;
+Int@Err outer(Bool fail) {
+    return parse(fail) + ok() + 40;
 }
 ```
 
 这里：
 
-- `parse(fail)` 成功时继续执行
+- `parse(fail)` 和 `ok()` 的成功值可以直接参与表达式
 - 失败时自动从 `outer` 返回同一个错误
 - 只支持**相同错误类型 `E`** 的隐式传播
-- 在非 `Result<T, E>` 函数里，不能把 `Result<T, E>` 调用结果当普通值直接使用
+- 在非 errorable 函数里，不能把 errorable 调用结果当普通值直接使用
 
 异常的使用方式是：
 
-- 在 `Result<T, E>` 函数里依靠普通调用做同 `E` 的隐式传播
+- 在 `T@E` 函数里依靠普通调用做同 `E` 的隐式传播
 - 用 `try expr catch (...) => fallback` 处理单个失败结果
 
 异常结果不通过 `switch` 匹配。
@@ -2178,9 +2175,13 @@ extend User: HasValue {
 - 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self` 方法会消耗 `value`
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式
-- `extend Holder<T>` / `extend Box<T>` 可以声明 generic receiver extension；`extend Holder<Int>` 这类 specialized target 暂不支持，使用 `@where(T == Int) extend Holder<T> { ... }`
-- receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend Holder<T>` 或
-  `@where(T != Option<_>) extend Holder<T>`；`_` 只匹配一个 type argument。
+- generic receiver extension 必须显式声明模式参数，例如 `extend<T> Holder<T>`、
+  `extend<T> T?` 和 `extend<T, E> T@E`。目标中的未声明名称按普通类型名解析，
+  `extend Holder<T>` 不会隐式声明 `T`；`_` 只匹配一个 type argument 且不绑定名称。
+- `extend Holder<Int>` 这类 specialized target 暂不支持，使用
+  `@where(T == Int) extend<T> Holder<T> { ... }`。
+- receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend<T> Holder<T>` 或
+  `@where(T != Option<_>) extend<T> Holder<T>`。
 - `T^` / `T&` / `T*` / `T[*]`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型
   receiver 或 where pattern 时，会按对应 canonical builtin owner 查找和匹配 extension，例如
   `UInt8[]^` 可查找 `Box<UInt8[]>` 上的方法，`UInt8[3]` 可匹配 `Array<UInt8, _>`。

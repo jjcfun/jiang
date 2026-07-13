@@ -318,8 +318,9 @@ name        <- ident / "self"
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
   个元素，末尾元素保存 sentinel。
-- `Result<T, E>` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位。
-  0.4.6 已移除旧的 `T@E` 返回类型语法。
+- `T@E` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位；它与
+  `Result<T, E>` canonical 到同一个 error-union 类型。
+- `T@E` 不允许空白：`T @E`、`T@ E` 和 `T @ E` 都报 `unexpected_trivia`。
 - `RawFn<unsafe T, ...>`、`RawFn<async T, ...>` 和 `RawFn<async [domain] T, ...>`
   表示带调用效果的函数指针类型。调用效果
   前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型。
@@ -464,12 +465,16 @@ trait_method_decl
 ## extend
 
 ```peg
-extend_decl <- "extend" type (":" path)? "{" extend_member* "}"
+extend_decl <- "extend" generic_params? result_type (":" path)? "{" extend_member* "}"
 
 extend_member
             <- assoc_type_impl
              / member_decl
 ```
+
+泛型 extension 必须在 `extend` 后显式声明模式参数，例如 `extend<T> Foo<T> {}`。
+目标类型中的未声明名称按普通类型名解析，不会隐式引入模式参数；因此找不到类型 `T` 时，
+`extend Foo<T> {}` 会报告 `unresolved_type`。`_` 仍表示不绑定名称的单个类型占位符。
 
 ## 语句和 block
 

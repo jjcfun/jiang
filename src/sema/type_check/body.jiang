@@ -53,6 +53,7 @@ public struct BodyCheck: Movable {
     Int! lambda_capture_initializer_depth;
     Int! await_depth;
     Int! await_future_count;
+    hir.HirId?! catch_value_call;
     types.EffectSet! current_effects;
     qid.DefId?! current_body_def;
 
@@ -67,6 +68,7 @@ public struct BodyCheck: Movable {
         self.lambda_capture_initializer_depth = 0;
         self.await_depth = 0;
         self.await_future_count = 0;
+        self.catch_value_call = null;
         self.current_effects = types.EffectSet();
         self.current_body_def = null;
     }
@@ -577,6 +579,9 @@ public struct BodyCheck: Movable {
         if (node.data is .await_future_expr(value)) {
             type_id = self.check_node(value);
         }
+        if (node.data is .propagate_error_expr(value)) {
+            type_id = self.check_node(value);
+        }
         if (node.data is .sync_block(async_block)) {
             type_id = self.check_sync_block(node_id, async_block);
         }
@@ -943,6 +948,9 @@ public struct BodyCheck: Movable {
         if (node.data is .await_future_expr(value)) {
             return self.lambda_node_has_implicit_capture(lambda_def, value);
         }
+        if (node.data is .propagate_error_expr(value)) {
+            return self.lambda_node_has_implicit_capture(lambda_def, value);
+        }
         if (node.data is .is_pattern(is_pattern)) {
             return self.lambda_node_has_implicit_capture(lambda_def, is_pattern.value)
                 || self.lambda_node_has_implicit_capture(lambda_def, is_pattern.pattern);
@@ -1110,6 +1118,10 @@ public struct BodyCheck: Movable {
             return;
         }
         if (node.data is .await_future_expr(value)) {
+            self.collect_implicit_lambda_captures(lambda_def, value, captures);
+            return;
+        }
+        if (node.data is .propagate_error_expr(value)) {
             self.collect_implicit_lambda_captures(lambda_def, value, captures);
             return;
         }
@@ -2381,6 +2393,7 @@ public struct BodyCheck: Movable {
         if (node.data is .catch_expr(catch_expr)) { return self.catch_has_control_exit(catch_expr); }
         if (node.data is .await_expr(value)) { return self.defer_body_has_control_exit(value); }
         if (node.data is .await_future_expr(value)) { return self.defer_body_has_control_exit(value); }
+        if (node.data is .propagate_error_expr(value)) { return self.defer_body_has_control_exit(value); }
         return false;
     }
 
@@ -3698,7 +3711,10 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_catch_expr(self, hir.HirId node_id, hir.HirCatch catch_expr) {
+        hir.HirId? saved_catch_value = self.catch_value_call;
+        self.catch_value_call = catch_expr.value;
         qid.TypeId value_type = self.check_node(catch_expr.value);
+        self.catch_value_call = saved_catch_value;
         types.TypeInfo value_info = self.state.store.types.get(value_type);
         guard value_info.data is .error_union(error_union) else {
             if (!self.type_ops.is_invalid_type(value_type)) {
@@ -4345,7 +4361,7 @@ public struct BodyCheck: Movable {
             return self.check_type_constructor_call(node_id, call);
         }
         if (self.check_future_await_call(node_id, call) is .some(result_type)) {
-            return result_type;
+            return self.project_error_call_result(node_id, result_type);
         }
         if (self.check_enum_init_call(node_id, call) is .some(type_id)) {
             return type_id;
@@ -4359,7 +4375,10 @@ public struct BodyCheck: Movable {
         }
         self.prepare_call_callee_selection(call);
         if (self.selected_function_call_def(node_id, call, type_args$.ref()) is .some(selected_def)) {
-            return self.check_selected_function_call(node_id, call, selected_def, type_args$.ref());
+            qid.TypeId result = self.check_selected_function_call(
+                node_id, call, selected_def, type_args$.ref()
+            );
+            return self.project_error_call_result(node_id, result);
         }
         qid.TypeId callee_type = self.check_node(call.callee);
         guard self.callable_function_type(callee_type) is .some(function_type) else {
@@ -4403,7 +4422,40 @@ public struct BodyCheck: Movable {
             self.check_domain_call_arg(function_type.effects, expected, arg_value);
             index = index + 1;
         }
-        return self.substituted_call_result_type(node_id, call, type_args$.ref(), function_type.result);
+        qid.TypeId result = self.substituted_call_result_type(
+            node_id, call, type_args$.ref(), function_type.result
+        );
+        return self.project_error_call_result(node_id, result);
+    }
+
+    qid.TypeId project_error_call_result(self, hir.HirId node_id, qid.TypeId result_type) {
+        if (self.catch_value_call is .some(catch_call)) {
+            if (hir.HirId.equal(catch_call$.ref(), node_id$.ref())) { return result_type; }
+        }
+        if (self.type_ops.is_invalid_type(result_type)) { return result_type; }
+        types.TypeInfo info = self.state.store.types.get(result_type);
+        guard info.data is .error_union(error_union) else { return result_type; }
+        guard self.current_body_def is .some(body_def) else { return result_type; }
+        guard self.current_error_type(body_def) is .some(current_error) else { return result_type; }
+        if (!self.type_ops.same_type(current_error, error_union.error)) { return result_type; }
+        self.wrap_propagate_error_node(node_id, result_type, error_union.value);
+        return error_union.value;
+    }
+
+    () wrap_propagate_error_node(
+        self,
+        hir.HirId node_id,
+        qid.TypeId error_union_type,
+        qid.TypeId value_type
+    ) {
+        hir.HirNode original = self.state.hirs.node(node_id);
+        hir.HirId value_id = self.state.hirs.add_node(node_id.owner_def, original.data);
+        self.state.results.clone_node_results(node_id, value_id);
+        self.state.results.set_node_type(value_id, error_union_type);
+        self.node_states.set(value_id, 2);
+        self.copy_hir_span(node_id, value_id);
+        self.state.hirs.replace_node_data(node_id, .propagate_error_expr(value_id));
+        self.state.results.set_node_type(node_id, value_type);
     }
 
     qid.TypeId? check_future_await_call(self, hir.HirId node_id, hir.HirCall call) {
