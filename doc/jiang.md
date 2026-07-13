@@ -1766,6 +1766,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 `@where(...)` 是一种编译期约束注解，用于约束其后一个泛型声明中的类型参数。  
 当前 `@where(...)` 支持以下约束项：
 
+- `Name: const Type`
 - `Name: Trait`
 - `Name: !Trait`
 - `Name: Trait<Assoc = Type>`
@@ -1773,6 +1774,10 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 - `Name == Type`
 - `Name != Type`
 - `Name.[Trait].Assoc == Type`
+
+`Name: const Type` 是 const generic constraint 的 canonical 形式，并把对应泛型参数绑定到
+value namespace。例如 `@where(N: const Int) struct Fixed<T, N>`。泛型列表中的
+`N: const Int` 是等价简写，编译器会 lower 到同一条 HIR predicate。
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。

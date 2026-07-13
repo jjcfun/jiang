@@ -231,6 +231,7 @@ where_constraints
 
 where_constraint
             <- projected_where_constraint
+             / name ":" "const" type
              / name ":" type_bound
              / name "==" type
              / name "!=" type
@@ -259,6 +260,10 @@ trait_bound_arg
             <- name "=" type
              / type
 ```
+
+`@where(N: const Int)` 是 const generic constraint 的 canonical 写法。声明列表中的
+`N: const Int` 是等价简写，并 lower 到同一条 HIR predicate；两种写法重复出现时会去重，
+约束类型不一致时报 `conflicting_const_constraint`。
 
 ## 类型
 

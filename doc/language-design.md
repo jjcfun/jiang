@@ -656,9 +656,11 @@ materialize 成 readonly `MirGlobal`，initializer 用 `MirStaticValue` 表达�
 
 const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
 `recursive_const_initializer`；comptime 函数调用受递归深度和 branch quota 限制，避免编译期执行失控。
-0.4.6 计划把 const generic 参数迁移到约束语法：`K: const Type`。例如
-`struct Fixed<T, N: const Int>` 或 `Int size<N: const Int>() { N }`。这里 `const Type` 是一种
-约束 kind，不是 trait；const generic 名字是值层参数，可在表达式中使用，不能作为类型名使用。
+const generic 参数的 canonical 约束语法是 `@where(K: const Type)`，例如
+`@where(N: const Int) struct Fixed<T, N>`。声明列表中的 `N: const Int` 是等价简写，lower
+到同一条 HIR predicate。这里 `const Type` 是一种约束 kind，不是 trait；const generic 名字
+绑定在 value namespace，可在表达式中使用，不能作为类型名使用。重复的同类型约束会去重，
+类型不一致时报 `conflicting_const_constraint`。
 trait associated item 也可以使用同一形式表达编译期值约束，例如
 `associated kind: const DomainKind`。
 

@@ -271,7 +271,7 @@ public struct ReferenceResolver: Movable {
             if (extend_owner_def is .some(owner_def)) {
                 self.current_owner_def = owner_def;
                 self.define_self_type(owner_def);
-                self.define_extend_generic_params(extend_decl.generics, owner_def);
+                self.define_extend_generic_params(extend_decl.generics, owner_def, top_level.annotations);
                 self.resolve_extend_generic_constraints(extend_decl.generics);
                 self.resolve_type_ref(extend_decl.target_type);
                 self.check_extend_target_pattern_binders(extend_decl.target_type);
@@ -356,14 +356,19 @@ public struct ReferenceResolver: Movable {
         return null;
     }
 
-    () define_extend_generic_params(self, ast.AstId? generics, qid.DefId owner_def) {
+    () define_extend_generic_params(
+        self,
+        ast.AstId? generics,
+        qid.DefId owner_def,
+        ast.AstRange annotations
+    ) {
         guard generics is .some(generic_id) else { return; }
         token.Span span = self.state.unit.get(generic_id).span;
         qid.DefId binding_owner = self.create_extension_binding_owner(span);
         self.state.record_declaration_def(generic_id, binding_owner);
         qid.DefId? previous_owner = self.current_owner_def;
         self.current_owner_def = binding_owner;
-        self.resolve_optional_generics(generics);
+        self.resolve_optional_generics_with_annotations(generics, annotations);
         self.current_owner_def = previous_owner;
     }
 
@@ -548,7 +553,7 @@ public struct ReferenceResolver: Movable {
             self.owner_type_lookup_enabled = true;
             self.define_self_type(owner_def);
         }
-        self.resolve_optional_generics(nominal.generics);
+        self.resolve_optional_generics_with_annotations(nominal.generics, annotations);
         self.resolve_where_annotations(annotations);
         self.resolve_path_range(nominal.traits, .type_name);
         self.resolve_member_range(nominal.members);
@@ -566,7 +571,7 @@ public struct ReferenceResolver: Movable {
             self.owner_type_lookup_enabled = true;
             self.define_self_type(owner_def);
         }
-        self.resolve_optional_generics(trait_decl.generics);
+        self.resolve_optional_generics_with_annotations(trait_decl.generics, annotations);
         self.resolve_where_annotations(annotations);
         self.resolve_path_range(trait_decl.parents, .type_name);
         self.define_member_associated_type_names(trait_decl.members);
@@ -801,7 +806,7 @@ public struct ReferenceResolver: Movable {
             self.current_owner_def = function_def;
         }
         self.env.enter_scope(.generic_scope);
-        self.resolve_optional_generics(function_decl.generics);
+        self.resolve_optional_generics_with_annotations(function_decl.generics, annotations);
         self.resolve_function_annotations(annotations);
         self.resolve_effect_set(function_decl.effects);
         self.resolve_type_ref(function_decl.result_type);
@@ -1130,6 +1135,19 @@ public struct ReferenceResolver: Movable {
 
     () resolve_where_constraint(self, ast.AstId constraint_id) {
         ast.AstNode constraint = self.state.unit.get(constraint_id);
+        if (constraint.data is .where_const(constraint)) {
+            if (self.resolve_value_expr_path(constraint.param) is .some(param_def)) {
+                if (self.state.store.defs.get(param_def).kind != .generic_param_def) {
+                    self.add_diagnostic(
+                        self.state.unit.get(constraint.param).span,
+                        "const constraint subject must be a generic parameter",
+                        "const_constraint_requires_generic_parameter"
+                    );
+                }
+            }
+            self.resolve_type_ref(constraint.type_ref);
+            return;
+        }
         if (constraint.data is .where_type_bound(bound)) {
             self.resolve_type_ref(bound.param);
             self.resolve_type_bound(bound.bound);
@@ -1404,31 +1422,72 @@ public struct ReferenceResolver: Movable {
     }
 
     () resolve_optional_generics(self, ast.AstId? generics) {
+        self.resolve_optional_generics_with_annotations(generics, ast.AstRange(0, 0));
+    }
+
+    () resolve_optional_generics_with_annotations(self, ast.AstId? generics, ast.AstRange annotations) {
         guard generics is .some(generic_id) else { return; }
         ast.AstNode generic_node = self.state.unit.get(generic_id);
         guard generic_node.data is .generic_params(generic_data) else { return; }
 
         Int! index = 0;
         while (index < generic_data.type_params.length) {
-            self.define_generic_param(self.state.unit.child_at(generic_data.type_params, index));
+            self.define_generic_param(
+                self.state.unit.child_at(generic_data.type_params, index),
+                annotations
+            );
             index = index + 1;
         }
     }
 
-    () define_generic_param(self, ast.AstId param_id) {
+    () define_generic_param(self, ast.AstId param_id, ast.AstRange annotations) {
         ast.AstNode param_node = self.state.unit.get(param_id);
         guard param_node.data is .generic_param(param_data) else { return; }
-        if (param_data.is_const) {
-            if (param_data.type_ref is .some(type_ref)) {
-                self.resolve_type_ref(type_ref);
+        if (self.generic_param_const_type(param_data, annotations) is .some(type_ref)) {
+            if (!param_data.is_const && param_data.type_bound != null) {
+                self.add_diagnostic(
+                    param_node.span,
+                    "generic parameter cannot have both type and const constraints",
+                    "conflicting_generic_param_constraint_kind"
+                );
             }
+            self.resolve_type_ref(type_ref);
             self.define_local_name(param_data.name, .generic_param_def, .value_name);
+            if (self.state.declaration_def(param_data.name) is .some(param_def)) {
+                self.state.record_generic_param_const_type(param_def, type_ref);
+            }
             return;
         }
         if (param_data.type_bound is .some(type_bound)) {
             self.resolve_type_bound(type_bound);
         }
         self.define_local_name(param_data.name, .generic_param_def, .type_name);
+    }
+
+    ast.AstId? generic_param_const_type(
+        self,
+        ast.GenericParamData param_data,
+        ast.AstRange annotations
+    ) {
+        if (param_data.type_ref is .some(type_ref)) { return type_ref; }
+        guard self.state.name_symbol(param_data.name) is .some(symbol) else { return null; }
+        Int! index = 0;
+        while (index < annotations.length) {
+            ast.AstId annotation_id = self.state.unit.child_at(annotations, index);
+            if (self.annotation_const_type_for_symbol(annotation_id, symbol) is .some(type_ref)) {
+                return type_ref;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    ast.AstId? annotation_const_type_for_symbol(self, ast.AstId annotation_id, qid.SymbolId symbol) {
+        ast.AstNode annotation = self.state.unit.get(annotation_id);
+        guard annotation.data is .where_const(constraint) else { return null; }
+        guard self.state.name_symbol(constraint.param) is .some(constraint_symbol) else { return null; }
+        if (constraint_symbol != symbol) { return null; }
+        return constraint.type_ref;
     }
 
     () resolve_type_range(self, ast.AstRange range) {
