@@ -923,6 +923,15 @@ union variant 声明按 grammar 使用字段式写法，所有 variant 必须写
 隐式成为模式参数；未在 `extend<...>` 中声明的名称按普通类型名解析。`extend Foo<T> {}` 只有在
 作用域中确实存在类型 `T` 时才合法，否则报告 `unresolved_type`。`_` 是匿名类型占位符，不创建绑定。
 
+具体 extension target 会在 HIR lowering 时归一化为 canonical owner pattern 和相等约束。例如
+`extend Int?` 等价于 `@where(T == Int) extend<T> T?`，`extend Int[4]` 等价于对 array element 和
+count 分别添加 `T == Int`、`N == 4`。member lookup 只执行统一的 extension where predicate 匹配。
+
+extension binder 是独立的语义参数 owner，不按位置复用 target owner 的 generic DefId，也不要求两边
+参数数量相同。target/equality pattern 在 lookup 时递归生成 `GenericBindings`，并将绑定统一应用到
+where predicates、成员参数、返回类型和函数值。`extend<T> Box<Slice<T>>` 可直接捕获嵌套的 `T`；
+无法从 target/equality pattern 推导的 binder 报 `unbound_extension_parameter`。
+
 示例：
 
 ```jiang

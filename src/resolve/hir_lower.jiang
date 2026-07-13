@@ -314,10 +314,15 @@ struct HirLower: Movable {
         self.current_owner_def = owner_def;
         self.env.enter_scope(.generic_scope);
         self.define_self_type(owner_def);
-        self.define_extend_generic_params(extend_decl.generics, owner_def);
-        Int extension_index = self.state.store.hirs.add_extension_group(self.state.module_id, owner_def, public_flag);
-        self.lower_extend_generic_constraints(extension_index, extend_decl.generics, owner_def);
-        self.lower_extend_generic_bounds(extension_index, extend_decl.generics, owner_def);
+        qid.DefId binding_owner = self.define_extend_generic_params(extend_decl.generics, owner_def);
+        Int extension_index = self.state.store.hirs.add_extension_group(
+            self.state.module_id,
+            owner_def,
+            binding_owner,
+            public_flag
+        );
+        self.lower_extend_generic_constraints(extension_index, extend_decl.generics, binding_owner);
+        self.lower_extend_generic_bounds(extension_index, extend_decl.generics, binding_owner);
         self.lower_extend_target_arg_patterns(extension_index, extend_decl.target_type, owner_def);
         self.lower_extension_annotations(extension_index, annotations);
         if (extend_decl.trait_path is .some(trait_path)) {
@@ -334,14 +339,15 @@ struct HirLower: Movable {
         self.current_owner_def = previous_owner;
     }
 
-    () define_extend_generic_params(self, ast.AstId? generics, qid.DefId owner_def) {
+    qid.DefId define_extend_generic_params(self, ast.AstId? generics, qid.DefId owner_def) {
         guard self.extend_generic_param_range(generics) is .some(params) else {
             self.define_owner_generic_params(owner_def);
-            return;
+            return owner_def;
         }
-        guard self.state.store.hirs.def(owner_def) is .some(owner_hir) else { return; }
+        guard generics is .some(generic_id) else { return owner_def; }
+        guard self.state.declaration_def(generic_id) is .some(binding_owner) else { return owner_def; }
         Int! index = 0;
-        while (index < params.length && index < owner_hir.generic_params.len()) {
+        while (index < params.length) {
             ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, index));
             guard param_node.data is .generic_param(param) else {
                 index = index + 1;
@@ -352,11 +358,18 @@ struct HirLower: Movable {
                 index = index + 1;
                 continue;
             }
-            qid.DefId param_def = owner_hir.generic_params.get(index);
+            guard self.state.declaration_def(name_id) is .some(param_def) else {
+                index = index + 1;
+                continue;
+            }
             def.DefRecord record = self.state.store.defs.get(param_def);
             self.env.define(symbol, record.domain, param_def, self.state.unit.get(name_id).span);
+            if (param.type_ref is .some(type_ref)) {
+                self.state.store.hirs.set_decl_type_ref(param_def, self.lower_type_ref(type_ref));
+            }
             index = index + 1;
         }
+        return binding_owner;
     }
 
     ast.AstRange? extend_generic_param_range(self, ast.AstId? generics) {
@@ -462,7 +475,24 @@ struct HirLower: Movable {
     () lower_extend_target_arg_patterns(self, Int extension_index, ast.AstId target_type, qid.DefId owner_def) {
         ast.AstNode node = self.state.unit.get(target_type);
         if (node.data is .type_ref(type_data)) {
+            if (extension_target.builtin_constructor_owner(self.state, target_type) != null) {
+                self.lower_extend_layered_target_pattern(extension_index, type_data, owner_def);
+                return;
+            }
             self.lower_extend_target_arg_patterns(extension_index, type_data.base, owner_def);
+            return;
+        }
+        if (node.data is .errorable_type(errorable)) {
+            list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+            if (params.len() < 2) { return; }
+            self.lower_extend_target_arg_pattern(extension_index, params.get(0), errorable.value_type);
+            if (errorable.error_type is .some(error_type)) {
+                self.lower_extend_target_arg_pattern(extension_index, params.get(1), error_type);
+            }
+            return;
+        }
+        if (node.data is .array_type(array_type)) {
+            self.lower_extend_array_target_pattern(extension_index, array_type, owner_def, node.span);
             return;
         }
         guard node.data is .named_type(named_type) else { return; }
@@ -470,9 +500,104 @@ struct HirLower: Movable {
         list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
         Int! index = 0;
         while (index < named_type.args.length && index < params.len()) {
-            self.lower_extend_target_arg_pattern(extension_index, params.get(index), self.state.unit.child_at(named_type.args, index));
+            self.lower_extend_target_arg_pattern(
+                extension_index,
+                params.get(index),
+                self.state.unit.child_at(named_type.args, index)
+            );
             index = index + 1;
         }
+    }
+
+    () lower_extend_layered_target_pattern(
+        self,
+        Int extension_index,
+        ast.TypeData type_data,
+        qid.DefId owner_def
+    ) {
+        list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+        if (params.len() == 0) { return; }
+        ast.AstId! element = type_data.base;
+        if (type_data.layer == .reference) {
+            ast.AstNode base = self.state.unit.get(type_data.base);
+            if (base.data is .type_ref(slice) && slice.layer == .slice) {
+                element = slice.base;
+            }
+        }
+        self.lower_extend_target_arg_pattern(extension_index, params.get(0), element);
+        if (type_data.sentinel_kind == .none || params.len() < 2) { return; }
+        hir.HirId sentinel = self.lower_extend_sentinel_pattern(
+            type_data.sentinel_kind,
+            type_data.sentinel_symbol_id,
+            type_data.sentinel_span
+        );
+        self.add_extend_target_equal(extension_index, params.get(1), sentinel);
+    }
+
+    () lower_extend_array_target_pattern(
+        self,
+        Int extension_index,
+        ast.ArrayTypeData array_type,
+        qid.DefId owner_def,
+        token.Span span
+    ) {
+        list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+        if (params.len() < 2) { return; }
+        self.lower_extend_target_arg_pattern(extension_index, params.get(0), array_type.element);
+        hir.HirId count = self.lower_extend_array_count_pattern(array_type, span);
+        self.add_extend_target_equal(extension_index, params.get(1), count);
+        if (array_type.sentinel_kind == .none || params.len() < 3) { return; }
+        hir.HirId sentinel = self.lower_extend_sentinel_pattern(
+            array_type.sentinel_kind,
+            array_type.sentinel_symbol_id,
+            array_type.sentinel_span
+        );
+        self.add_extend_target_equal(extension_index, params.get(2), sentinel);
+    }
+
+    hir.HirId lower_extend_array_count_pattern(self, ast.ArrayTypeData array_type, token.Span span) {
+        if (array_type.count_kind == .inferred) {
+            return self.add_node(.infer_type_ref(), span);
+        }
+        guard array_type.count_symbol_id is .some(symbol) else { return self.add_invalid_node(span); }
+        if (array_type.count_kind == .const_name) {
+            return self.lower_extend_const_name_pattern(symbol, span);
+        }
+        return self.lower_extend_int_pattern(self.array_count_value(array_type), span);
+    }
+
+    hir.HirId lower_extend_sentinel_pattern(
+        self,
+        ast.TypeSentinelKind kind,
+        qid.SymbolId? symbol_id,
+        token.Span span
+    ) {
+        if (kind == .wildcard) { return self.add_node(.infer_type_ref(), span); }
+        guard symbol_id is .some(symbol) else { return self.add_invalid_node(span); }
+        if (kind == .const_name) { return self.lower_extend_const_name_pattern(symbol, span); }
+        return self.lower_extend_int_pattern(self.parse_uint_literal(self.state.store.symbols.text(symbol)), span);
+    }
+
+    hir.HirId lower_extend_const_name_pattern(self, qid.SymbolId symbol, token.Span span) {
+        guard self.env.lookup_def(symbol, .value_name) is .some(def_id) else {
+            return self.add_invalid_node(span);
+        }
+        return self.add_node(.named_type_ref(hir.HirNamedTypeRef(
+            def_id: def_id,
+            args: self.empty_hir_ids()
+        )), span);
+    }
+
+    hir.HirId lower_extend_int_pattern(self, UInt64 value, token.Span span) {
+        hir.HirLiteralValue literal = .int_value(hir.HirIntLiteral(bits: value, signed_value: true));
+        return self.add_node(.literal(hir.HirLiteral(value: literal)), span);
+    }
+
+    () add_extend_target_equal(self, Int extension_index, qid.DefId param_def, hir.HirId value) {
+        self.state.store.hirs.add_extension_where_predicate(extension_index, .equal(hir.HirWhereEqual(
+            subject: self.lower_def_type_ref(param_def),
+            value: value
+        )));
     }
 
     () lower_extend_target_arg_pattern(self, Int extension_index, qid.DefId param_def, ast.AstId arg) {

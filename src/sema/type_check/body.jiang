@@ -1634,7 +1634,10 @@ public struct BodyCheck: Movable {
         );
         while (cursor.valid()) {
             namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
-            if (self.function_value_candidate_matches(node_id, binding.def_id, expected_type, member_access)) {
+            if (
+                self.call_candidate_specific_enough(binding.def_id, initial_def)
+                && self.function_value_candidate_matches(node_id, binding.def_id, expected_type, member_access)
+            ) {
                 selected = binding.def_id;
                 matches = matches + 1;
             }
@@ -1661,8 +1664,20 @@ public struct BodyCheck: Movable {
         if (!self.overloadable_call_kind(self.state.store.defs.get(candidate_def).kind)) {
             return false;
         }
+        if (!self.function_value_extension_visible(node_id, candidate_def, member_access)) { return false; }
         qid.TypeId candidate_type = self.function_value_type_for_member(candidate_def, member_access);
         return self.type_ops.same_type_ignoring_mutability(candidate_type, expected_type);
+    }
+
+    Bool function_value_extension_visible(
+        self,
+        hir.HirId node_id,
+        qid.DefId candidate_def,
+        hir.HirMemberAccess? member_access
+    ) {
+        guard member_access is .some(member) else { return true; }
+        qid.TypeId base_type = self.raw_member_base_type(member.base);
+        return self.type_ops.extension_member_visible_for_type(base_type, node_id.owner_def, candidate_def);
     }
 
     qid.TypeId function_value_type(self, hir.HirId node_id, qid.DefId function_def) {
@@ -1674,11 +1689,20 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId function_value_type_for_member(self, qid.DefId function_def, hir.HirMemberAccess? member_access) {
-        qid.TypeId raw_type = self.function_value_raw_type(function_def);
+        qid.TypeId! raw_type = self.function_value_raw_type(function_def);
         guard member_access is .some(access) else {
             return raw_type;
         }
         qid.TypeId raw_base_type = self.raw_member_base_type(access.base);
+        generic_bindings.GenericBindings extension_bindings = self.type_ops.extension_bindings_for_member(
+            raw_base_type,
+            function_def
+        );
+        raw_type = generic_bindings.substitute_type(
+            self.state.store,
+            raw_type,
+            extension_bindings$.ref()
+        );
         if (self.trait_object_function_value_type(raw_base_type, access.member_symbol, function_def) is .some(type_id)) {
             return type_id;
         }
@@ -5409,6 +5433,7 @@ public struct BodyCheck: Movable {
             namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
             if (
                 self.type_ops.def_accessible_from(binding.def_id, node_id.owner_def)
+                && self.call_candidate_specific_enough(binding.def_id, initial_def)
                 && self.call_candidate_matches(call, binding.def_id, type_args)
             ) {
                 selected = binding.def_id;
@@ -5424,6 +5449,11 @@ public struct BodyCheck: Movable {
             return null;
         }
         return initial_def;
+    }
+
+    Bool call_candidate_specific_enough(self, qid.DefId candidate_def, qid.DefId selected_def) {
+        return self.type_ops.extension_member_specificity(candidate_def)
+            >= self.type_ops.extension_member_specificity(selected_def);
     }
 
     qid.DefId? initial_call_def(self, hir.HirCall call) {
@@ -5453,6 +5483,7 @@ public struct BodyCheck: Movable {
         qid.DefId candidate_def,
         list.ArrayList<qid.TypeId>& type_args
     ) {
+        if (!self.call_extension_candidate_visible(call, candidate_def)) { return false; }
         def.DefKind kind = self.state.store.defs.get(candidate_def).kind;
         if (!self.overloadable_call_kind(kind)) {
             return false;
@@ -5466,6 +5497,17 @@ public struct BodyCheck: Movable {
             return false;
         }
         return self.call_args_match_candidate_types(call, candidate_def, type_args, function_type, values$.ref());
+    }
+
+    Bool call_extension_candidate_visible(self, hir.HirCall call, qid.DefId candidate_def) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .member_access(member) else { return true; }
+        qid.TypeId base_type = self.raw_member_base_type(member.base);
+        return self.type_ops.extension_member_visible_for_type(
+            base_type,
+            call.callee.owner_def,
+            candidate_def
+        );
     }
 
     Bool call_args_match_candidate_types(self,
@@ -7088,7 +7130,8 @@ public struct BodyCheck: Movable {
         list.ArrayList<qid.TypeId>& type_args,
         qid.TypeId param_type
     ) {
-        qid.TypeId substituted = self.substitute_call_generic_type(node_id, target_def, type_args, param_type);
+        qid.TypeId extension_type = self.substitute_extension_call_type(call, target_def, param_type);
+        qid.TypeId substituted = self.substitute_call_generic_type(node_id, target_def, type_args, extension_type);
         return self.substitute_call_self_type(call, target_def, substituted);
     }
 
@@ -7099,8 +7142,25 @@ public struct BodyCheck: Movable {
         list.ArrayList<qid.TypeId>& type_args,
         qid.TypeId result_type
     ) {
-        qid.TypeId substituted = self.substitute_call_generic_type(node_id, target_def, type_args, result_type);
+        qid.TypeId extension_type = self.substitute_extension_call_type(call, target_def, result_type);
+        qid.TypeId substituted = self.substitute_call_generic_type(node_id, target_def, type_args, extension_type);
         return self.substitute_call_self_type(call, target_def, substituted);
+    }
+
+    qid.TypeId substitute_extension_call_type(
+        self,
+        hir.HirCall call,
+        qid.DefId target_def,
+        qid.TypeId raw_type
+    ) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .member_access(member) else { return raw_type; }
+        qid.TypeId base_type = self.raw_member_base_type(member.base);
+        generic_bindings.GenericBindings bindings = self.type_ops.extension_bindings_for_member(
+            base_type,
+            target_def
+        );
+        return generic_bindings.substitute_type(self.state.store, raw_type, bindings$.ref());
     }
 
     qid.TypeId substitute_call_generic_type(self,

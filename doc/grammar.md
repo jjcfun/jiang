@@ -475,6 +475,9 @@ extend_member
 泛型 extension 必须在 `extend` 后显式声明模式参数，例如 `extend<T> Foo<T> {}`。
 目标类型中的未声明名称按普通类型名解析，不会隐式引入模式参数；因此找不到类型 `T` 时，
 `extend Foo<T> {}` 会报告 `unresolved_type`。`_` 仍表示不绑定名称的单个类型占位符。
+extension binder 的数量不要求与 target constructor 的参数数量相同；target pattern 决定绑定关系。
+例如 `extend<T> Box<Slice<T>> {}` 从嵌套 Slice 捕获 `T`。无法从 target/equality pattern 推导的
+binder 会报告 `unbound_extension_parameter`。
 
 ## 语句和 block
 

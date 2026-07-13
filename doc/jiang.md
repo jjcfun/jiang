@@ -2178,8 +2178,11 @@ extend User: HasValue {
 - generic receiver extension 必须显式声明模式参数，例如 `extend<T> Holder<T>`、
   `extend<T> T?` 和 `extend<T, E> T@E`。目标中的未声明名称按普通类型名解析，
   `extend Holder<T>` 不会隐式声明 `T`；`_` 只匹配一个 type argument 且不绑定名称。
-- `extend Holder<Int>` 这类 specialized target 暂不支持，使用
-  `@where(T == Int) extend<T> Holder<T> { ... }`。
+- binder 与 owner generic parameter 相互独立，不要求数量相同。`extend<T> Box<Slice<T>>` 会从
+  `Box<Slice<Int>>` 捕获 `T = Int`；`@where(S == Slice<T>) extend<T, S> Box<S>` 表达同一绑定链。
+  无法从 target/equality pattern 推导的 binder 会在声明处报错。
+- concrete specialized target 可以直接写，例如 `extend Holder<Int>`、`extend Int?`；需要同时保留
+  pattern 参数并添加附加条件时，使用 `@where(T == Int) extend<T> Holder<T> { ... }`。
 - receiver 形状约束写在 `@where` 中，例如 `@where(T == Box<_>) extend<T> Holder<T>` 或
   `@where(T != Option<_>) extend<T> Holder<T>`。
 - `T^` / `T&` / `T*` / `T[*]`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型

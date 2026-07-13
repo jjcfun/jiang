@@ -19,6 +19,7 @@ import comptime_value = "../comptime/value.jiang";
 import contiguous = "../contiguous.jiang";
 import copy_semantics = "../copy.jiang";
 import diagnostics = "../diagnostics.jiang";
+import generic_bindings = "../generic/bindings.jiang";
 import types = "../type.jiang";
 import type_check_state = "./state.jiang";
 import typeck_store = "./store.jiang";
@@ -1353,7 +1354,7 @@ public struct TypeOps: Movable {
         args.add(types.generic_type_arg(slice_type.element));
         if (self.is_sentinel_slice_builtin_type_def(constructor_def)) {
             guard slice_type.sentinel is .some(sentinel) else { return args$.move(); }
-            args.add(types.generic_const_arg(self.sentinel_comptime_value(sentinel)));
+            args.add(self.constructor_const_arg(constructor_def, 1, self.sentinel_comptime_value(sentinel)));
         }
         return args$.move();
     }
@@ -1373,12 +1374,27 @@ public struct TypeOps: Movable {
     ) {
         list.ArrayList<types.GenericArg>! args = list.ArrayList<types.GenericArg>();
         args.add(types.generic_type_arg(array_type.element));
-        args.add(types.generic_const_arg(self.array_count_comptime_value(array_type)));
+        args.add(self.constructor_const_arg(constructor_def, 1, self.array_count_comptime_value(array_type)));
         if (self.is_sentinel_array_builtin_type_def(constructor_def)) {
             guard array_type.sentinel is .some(sentinel) else { return args$.move(); }
-            args.add(types.generic_const_arg(self.sentinel_comptime_value(sentinel)));
+            args.add(self.constructor_const_arg(constructor_def, 2, self.sentinel_comptime_value(sentinel)));
         }
         return args$.move();
+    }
+
+    types.GenericArg constructor_const_arg(
+        self,
+        qid.DefId constructor_def,
+        Int index,
+        comptime_value.ComptimeValue value
+    ) {
+        guard self.state.hirs.def(constructor_def) is .some(owner_hir) else {
+            return types.generic_const_arg(value);
+        }
+        if (index < 0 || index >= owner_hir.generic_params.len()) {
+            return types.generic_const_arg(value);
+        }
+        return types.generic_const_param_arg(owner_hir.generic_params.get(index), value);
     }
 
     public Bool type_extension_satisfies_trait(self, qid.TypeId subject, qid.DefId trait_def, qid.DefId use_owner) {
@@ -4544,17 +4560,68 @@ public struct TypeOps: Movable {
             domain
         );
         qid.DefId?! selected = null;
+        Int! selected_specificity = -1;
         while (cursor.valid()) {
             namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
             if (self.extension_member_visible_for_type(type_id, use_owner, binding.def_id)) {
-                selected = binding.def_id;
+                Int specificity = self.extension_member_specificity(binding.def_id);
+                if (specificity >= selected_specificity) {
+                    selected = binding.def_id;
+                    selected_specificity = specificity;
+                }
             }
             cursor = self.state.store.resolve.next_binding_cursor(cursor);
         }
         return selected;
     }
 
-    Bool extension_member_visible_for_type(self, qid.TypeId type_id, qid.DefId use_owner, qid.DefId member_def) {
+    public Int extension_member_specificity(self, qid.DefId member_def) {
+        guard self.state.store.hirs.extension_group_for_member(member_def) is .some(extension_index) else {
+            return 0x3fffffff;
+        }
+        hir.HirExtensionGroup& group = self.state.store.hirs.extension_group_ref(extension_index);
+        Int! specificity = 0;
+        Int! index = 0;
+        while (index < group.where_predicates.len()) {
+            hir.HirWherePredicate predicate = group.where_predicates.get(index);
+            if (predicate is .equal(equal)) {
+                specificity = specificity + self.extension_pattern_specificity(equal.value, group);
+            } else {
+                specificity = specificity + 1;
+            }
+            index = index + 1;
+        }
+        return specificity;
+    }
+
+    Int extension_pattern_specificity(self, hir.HirId pattern_ref, hir.HirExtensionGroup& group) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) { return 0; }
+        if (pattern.data is .named_type_ref(named)) {
+            if (self.extension_type_param(group, named.def_id)) { return 0; }
+            Int! specificity = 1;
+            Int! index = 0;
+            while (index < named.args.length) {
+                specificity = specificity + self.extension_pattern_specificity(named.args[index], group);
+                index = index + 1;
+            }
+            return specificity;
+        }
+        if (pattern.data is .layered_type_ref(layered)) {
+            return 1 + self.extension_pattern_specificity(layered.element, group);
+        }
+        if (pattern.data is .array_type_ref(array_type)) {
+            return 1 + self.extension_pattern_specificity(array_type.element, group);
+        }
+        return 1;
+    }
+
+    public Bool extension_member_visible_for_type(
+        self,
+        qid.TypeId type_id,
+        qid.DefId use_owner,
+        qid.DefId member_def
+    ) {
         guard self.state.store.hirs.extension_group_for_member(member_def) is .some(extension_index) else {
             return true;
         }
@@ -4641,20 +4708,450 @@ public struct TypeOps: Movable {
             return true;
         }
         list.ArrayList<types.GenericArg> args = self.namespace_provider_args(type_id, group.target_owner_def);
+        generic_bindings.GenericBindings! bindings = generic_bindings.GenericBindings();
+        if (!self.bind_extension_target_patterns(group, args$.ref(), bindings$.ref())) { return false; }
         Int! index = 0;
         while (index < group.where_predicates.len()) {
             hir.HirWherePredicate predicate = group.where_predicates.get(index);
-            if (!self.type_owner_where_predicate_satisfied_with_args(
-                use_owner,
-                group.target_owner_def,
-                args$.ref(),
-                predicate
-            )) {
+            if (!self.extension_predicate_satisfied(use_owner, group, args$.ref(), bindings$.ref(), predicate)) {
                 return false;
             }
             index = index + 1;
         }
         return true;
+    }
+
+    public generic_bindings.GenericBindings extension_bindings_for_member(
+        self,
+        qid.TypeId type_id,
+        qid.DefId member_def
+    ) {
+        generic_bindings.GenericBindings! bindings = generic_bindings.GenericBindings();
+        guard self.state.store.hirs.extension_group_for_member(member_def) is .some(extension_index) else {
+            return bindings$.move();
+        }
+        hir.HirExtensionGroup& group = self.state.store.hirs.extension_group_ref(extension_index);
+        list.ArrayList<types.GenericArg> args = self.namespace_provider_args(type_id, group.target_owner_def);
+        self.bind_extension_target_patterns(group, args$.ref(), bindings$.ref());
+        return bindings$.move();
+    }
+
+    Bool bind_extension_target_patterns(
+        self,
+        hir.HirExtensionGroup& group,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        Int! pass = 0;
+        while (pass < group.where_predicates.len()) {
+            if (!self.bind_extension_equal_pass(group, args, bindings)) { return false; }
+            pass = pass + 1;
+        }
+        return self.extension_bindings_complete(group, bindings);
+    }
+
+    Bool bind_extension_equal_pass(
+        self,
+        hir.HirExtensionGroup& group,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        Int! index = 0;
+        while (index < group.where_predicates.len()) {
+            hir.HirWherePredicate predicate = group.where_predicates.get(index);
+            if (predicate is .equal(equal)) {
+                if (!self.bind_extension_equal(group, args, bindings, equal)) { return false; }
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool bind_extension_equal(
+        self,
+        hir.HirExtensionGroup& group,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings& bindings,
+        hir.HirWhereEqual equal
+    ) {
+        if (!self.bind_extension_owner_equal(group, args, bindings, equal)) { return false; }
+        guard self.extension_equal_type_param(equal.subject) is .some(param_def) else { return true; }
+        if (!self.extension_type_param(group, param_def)) { return true; }
+        if (bindings.type_binding(param_def) is .some(actual)) {
+            return self.bind_extension_type_pattern(actual, equal.value, group, bindings);
+        }
+        qid.TypeId expected = self.extension_substituted_type(equal.value, bindings);
+        if (self.type_is_unbound_extension_param(expected, group, bindings)) { return true; }
+        bindings.set_type(param_def, expected);
+        return true;
+    }
+
+    Bool extension_bindings_complete(
+        self,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (group.binding_owner_def.to_index() == group.target_owner_def.to_index()) { return true; }
+        guard self.state.hirs.def(group.binding_owner_def) is .some(owner_hir) else { return true; }
+        Int! index = 0;
+        while (index < owner_hir.generic_params.len()) {
+            qid.DefId param_def = owner_hir.generic_params.get(index);
+            def.DefRecord record = self.state.store.defs.get(param_def);
+            if (record.domain == .type_name && !bindings.has_type(param_def)) { return false; }
+            if (record.domain == .value_name && !bindings.has_const(param_def)) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool type_is_unbound_extension_param(
+        self,
+        qid.TypeId type_id,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .named(named) else { return false; }
+        if (!self.extension_type_param(group, named.def_id)) { return false; }
+        return !bindings.has_type(named.def_id);
+    }
+
+    Bool extension_predicate_satisfied(
+        self,
+        qid.DefId use_owner,
+        hir.HirExtensionGroup& group,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings& bindings,
+        hir.HirWherePredicate predicate
+    ) {
+        if (predicate is .type_bound(bound)) {
+            qid.TypeId subject = self.extension_substituted_type(bound.subject, bindings);
+            return self.type_owner_type_bound_satisfied(use_owner, subject, bound.bound);
+        }
+        if (predicate is .negative_type_bound(bound)) {
+            qid.TypeId subject = self.extension_substituted_type(bound.subject, bindings);
+            return !self.type_owner_type_bound_satisfied(use_owner, subject, bound.bound);
+        }
+        if (predicate is .equal(equal)) {
+            if (self.extension_equal_type_param(equal.subject) is .some(param_def)) {
+                if (self.generic_param_index(group.target_owner_def, param_def) != null) {
+                    return self.bind_extension_owner_equal(group, args, bindings, equal);
+                }
+            }
+            return self.extension_type_equal(equal, bindings);
+        }
+        if (predicate is .not_equal(equal)) {
+            return !self.extension_type_equal(equal, bindings);
+        }
+        return self.type_owner_where_predicate_satisfied_with_args(
+            use_owner,
+            group.target_owner_def,
+            args,
+            predicate
+        );
+    }
+
+    Bool extension_type_equal(
+        self,
+        hir.HirWhereEqual equal,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (!self.where_equal_uses_type_refs(equal)) { return true; }
+        qid.TypeId subject = self.extension_substituted_type(equal.subject, bindings);
+        qid.TypeId value = self.extension_substituted_type(equal.value, bindings);
+        return self.same_type_ignoring_mutability(subject, value);
+    }
+
+    qid.TypeId extension_substituted_type(
+        self,
+        hir.HirId type_ref,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        return generic_bindings.substitute_type(self.state.store, self.check_type_ref(type_ref), bindings);
+    }
+
+    Bool bind_extension_owner_equal(
+        self,
+        hir.HirExtensionGroup& group,
+        list.ArrayList<types.GenericArg>& args,
+        generic_bindings.GenericBindings& bindings,
+        hir.HirWhereEqual equal
+    ) {
+        if (self.const_generic_param_ref(equal.subject) is .some(param_def)) {
+            guard self.generic_param_index(group.target_owner_def, param_def) != null else { return true; }
+            guard self.const_arg_for_param(args, param_def) is .some(actual) else { return false; }
+            return self.bind_extension_const_pattern(actual, equal.value, group, bindings);
+        }
+        guard self.extension_equal_type_param(equal.subject) is .some(param_def) else { return true; }
+        guard self.generic_param_index(group.target_owner_def, param_def) != null else { return true; }
+        list.ArrayList<qid.TypeId> type_args = self.type_args_from_generic_args(args);
+        qid.TypeId actual = self.substituted_where_type_ref(
+            group.target_owner_def,
+            type_args$.ref(),
+            equal.subject
+        );
+        return self.bind_extension_type_pattern(actual, equal.value, group, bindings);
+    }
+
+    Bool bind_extension_const_pattern(
+        self,
+        comptime_value.ComptimeValue actual,
+        hir.HirId pattern_ref,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) { return true; }
+        if (self.const_generic_param_ref(pattern_ref) is .some(param_def)) {
+            if (self.extension_const_param(group, param_def)) {
+                if (bindings.const_binding(param_def) is .some(bound)) {
+                    return self.const_value_matches(bound, actual);
+                }
+                qid.TypeId expected = self.type_for_def(param_def);
+                if (!self.same_type(expected, actual.type_id)) { return false; }
+                bindings.set_const(param_def, actual);
+                return true;
+            }
+        }
+        guard self.const_value_for_expected_type(pattern_ref, actual.type_id) is .some(expected) else {
+            return false;
+        }
+        return self.const_value_matches(expected, actual);
+    }
+
+    Bool bind_extension_type_pattern(
+        self,
+        qid.TypeId actual,
+        hir.HirId pattern_ref,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_ref);
+        if (pattern.data is .infer_type_ref()) { return true; }
+        if (pattern.data is .named_type_ref(named)) {
+            if (self.extension_type_param(group, named.def_id)) {
+                return self.bind_extension_type_param(actual, named.def_id, bindings);
+            }
+            return self.bind_extension_named_pattern(actual, pattern_ref, named, group, bindings);
+        }
+        if (pattern.data is .layered_type_ref(layered)) {
+            return self.bind_extension_layered_pattern(actual, layered, group, bindings);
+        }
+        if (pattern.data is .array_type_ref(array_type)) {
+            return self.bind_extension_array_pattern(actual, array_type, group, bindings);
+        }
+        qid.TypeId expected = generic_bindings.substitute_type(
+            self.state.store,
+            self.check_type_ref(pattern_ref),
+            bindings
+        );
+        return self.same_type_ignoring_mutability(actual, expected);
+    }
+
+    Bool bind_extension_layered_pattern(
+        self,
+        qid.TypeId actual,
+        hir.HirLayeredTypeRef pattern,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        types.TypeInfo info = self.state.store.types.get(actual);
+        if (pattern.kind == .mutable_type) {
+            return self.bind_extension_type_pattern(actual, pattern.element, group, bindings);
+        }
+        if (pattern.kind == .optional_type) {
+            guard info.data is .optional(optional) else { return false; }
+            return self.bind_extension_type_pattern(optional.element, pattern.element, group, bindings);
+        }
+        guard info.data is .handle_type(handle) else { return false; }
+        if (!self.extension_handle_kind_matches(pattern.kind, handle.kind)) { return false; }
+        if (!self.bind_extension_type_pattern(handle.element, pattern.element, group, bindings)) { return false; }
+        return self.bind_extension_sentinel_pattern(handle.sentinel, pattern, group, bindings);
+    }
+
+    Bool extension_handle_kind_matches(self, hir.HirTypeLayerKind pattern, types.HandleTypeKind actual) {
+        if (pattern == .reference) { return actual == .reference; }
+        if (pattern == .owner_pointer) { return actual == .owner_pointer; }
+        if (pattern == .raw_pointer) { return actual == .raw_pointer; }
+        if (pattern == .many_pointer) { return actual == .many_pointer; }
+        return pattern == .slice && actual == .slice;
+    }
+
+    Bool bind_extension_sentinel_pattern(
+        self,
+        types.Sentinel? actual,
+        hir.HirLayeredTypeRef pattern,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (pattern.sentinel_kind == .none) { return actual == null; }
+        guard actual is .some(sentinel) else { return false; }
+        if (pattern.sentinel_kind == .wildcard) { return true; }
+        if (pattern.sentinel_kind == .const_name) {
+            guard self.extension_param_for_symbol(group, pattern.sentinel_value, .value_name)
+                is .some(param_def) else { return false; }
+            return self.bind_extension_const_param(sentinel.value, param_def, bindings);
+        }
+        return types.comptime_value_as_uint64(sentinel.value) == pattern.sentinel_value;
+    }
+
+    Bool bind_extension_array_pattern(
+        self,
+        qid.TypeId actual,
+        hir.HirArrayTypeRef pattern,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        types.TypeInfo info = self.state.store.types.get(actual);
+        guard info.data is .array_type(array_type) else { return false; }
+        if (!self.bind_extension_type_pattern(array_type.element, pattern.element, group, bindings)) { return false; }
+        if (!self.bind_extension_array_count(array_type, pattern, group, bindings)) { return false; }
+        return self.bind_extension_array_sentinel(array_type.sentinel, pattern, group, bindings);
+    }
+
+    Bool bind_extension_array_count(
+        self,
+        types.ArrayType actual,
+        hir.HirArrayTypeRef pattern,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (pattern.count_kind == .inferred) { return true; }
+        comptime_value.ComptimeValue value = self.array_count_comptime_value(actual);
+        if (pattern.count_kind == .const_name) {
+            guard self.extension_param_for_symbol(group, pattern.count_value, .value_name)
+                is .some(param_def) else { return false; }
+            return self.bind_extension_const_param(value, param_def, bindings);
+        }
+        return types.comptime_value_as_uint64(value) == pattern.count_value;
+    }
+
+    Bool bind_extension_array_sentinel(
+        self,
+        types.Sentinel? actual,
+        hir.HirArrayTypeRef pattern,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (pattern.sentinel_kind == .none) { return actual == null; }
+        guard actual is .some(sentinel) else { return false; }
+        if (pattern.sentinel_kind == .wildcard) { return true; }
+        if (pattern.sentinel_kind == .const_name) {
+            guard self.extension_param_for_symbol(group, pattern.sentinel_value, .value_name)
+                is .some(param_def) else { return false; }
+            return self.bind_extension_const_param(sentinel.value, param_def, bindings);
+        }
+        return types.comptime_value_as_uint64(sentinel.value) == pattern.sentinel_value;
+    }
+
+    qid.DefId? extension_param_for_symbol(
+        self,
+        hir.HirExtensionGroup& group,
+        UInt64 symbol_index,
+        def.NameDomain domain
+    ) {
+        guard self.state.hirs.def(group.binding_owner_def) is .some(owner_hir) else { return null; }
+        Int! index = 0;
+        while (index < owner_hir.generic_params.len()) {
+            qid.DefId param_def = owner_hir.generic_params.get(index);
+            def.DefRecord record = self.state.store.defs.get(param_def);
+            if (record.domain == domain && record.name.symbol.to_index() == Int(symbol_index)) {
+                return param_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool bind_extension_const_param(
+        self,
+        comptime_value.ComptimeValue actual,
+        qid.DefId param_def,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (bindings.const_binding(param_def) is .some(bound)) {
+            return self.const_value_matches(bound, actual);
+        }
+        qid.TypeId expected = self.type_for_def(param_def);
+        if (!self.same_type(expected, actual.type_id)) { return false; }
+        bindings.set_const(param_def, actual);
+        return true;
+    }
+
+    Bool bind_extension_named_pattern(
+        self,
+        qid.TypeId actual,
+        hir.HirId pattern_ref,
+        hir.HirNamedTypeRef named,
+        hir.HirExtensionGroup& group,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (named.args.length == 0) {
+            qid.TypeId expected = self.check_type_ref(pattern_ref);
+            return self.same_type_ignoring_mutability(actual, expected);
+        }
+        if (!self.type_matches_namespace_provider(actual, named.def_id)) { return false; }
+        list.ArrayList<types.GenericArg> actual_args = self.namespace_provider_args(actual, named.def_id);
+        if (actual_args.len() != named.args.length) { return false; }
+        Int! index = 0;
+        while (index < named.args.length) {
+            types.GenericArg arg = actual_args.get(index);
+            guard arg is .type_arg(type_arg) else { return false; }
+            if (!self.bind_extension_type_pattern(type_arg.value, named.args[index], group, bindings)) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    qid.DefId? extension_equal_type_param(self, hir.HirId type_ref) {
+        hir.HirNode node = self.state.hirs.node(type_ref);
+        guard node.data is .named_type_ref(named) else { return null; }
+        def.DefRecord record = self.state.store.defs.get(named.def_id);
+        if (record.kind != .generic_param_def || record.domain != .type_name) { return null; }
+        return named.def_id;
+    }
+
+    Bool bind_extension_type_param(
+        self,
+        qid.TypeId actual,
+        qid.DefId param_def,
+        generic_bindings.GenericBindings& bindings
+    ) {
+        if (bindings.type_binding(param_def) is .some(bound)) {
+            return self.same_type_ignoring_mutability(actual, bound);
+        }
+        bindings.set_type(param_def, actual);
+        return true;
+    }
+
+    Bool extension_type_param(self, hir.HirExtensionGroup& group, qid.DefId param_def) {
+        if (group.binding_owner_def.to_index() == group.target_owner_def.to_index()) { return false; }
+        guard self.state.hirs.def(group.binding_owner_def) is .some(owner_hir) else { return false; }
+        Int! index = 0;
+        while (index < owner_hir.generic_params.len()) {
+            qid.DefId candidate = owner_hir.generic_params.get(index);
+            if (candidate.to_index() == param_def.to_index()) {
+                return self.state.store.defs.get(candidate).domain == .type_name;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool extension_const_param(self, hir.HirExtensionGroup& group, qid.DefId param_def) {
+        if (group.binding_owner_def.to_index() == group.target_owner_def.to_index()) { return false; }
+        guard self.state.hirs.def(group.binding_owner_def) is .some(owner_hir) else { return false; }
+        Int! index = 0;
+        while (index < owner_hir.generic_params.len()) {
+            qid.DefId candidate = owner_hir.generic_params.get(index);
+            if (candidate.to_index() == param_def.to_index()) {
+                return self.state.store.defs.get(candidate).domain == .value_name;
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     comptime_value.ComptimeValue array_count_comptime_value(self, types.ArrayType array_type) {
