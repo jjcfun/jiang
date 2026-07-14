@@ -6,6 +6,16 @@
 import thread = "../system/thread.jiang";
 
 const Int concurrent_domain_kind = 1;
+const Int resume_idle = 0;
+const Int resume_running = 1;
+const Int resume_pending = 2;
+const Int resume_completed_word = 0;
+const Int resume_state_word = 1;
+const Int resume_queue_word = 2;
+const Int resume_context_word = 3;
+const Int resume_function_word = 4;
+const Int resume_callback_word = 5;
+const Int resume_token_words = 6;
 
 struct RuntimeState {
     thread.Group! group;
@@ -46,10 +56,118 @@ public () shutdown() {
 }
 
 @link_symbol("__jiang_runtime_domain_enqueue")
-public () enqueue(Int domain_id, Int domain_kind, UInt8* context, UInt8* resume) {
+public () enqueue(
+    Int domain_id,
+    Int domain_kind,
+    UInt8* context,
+    UInt8* token_slot,
+    UInt8* resume,
+    UInt8* callback
+) {
     assert(runtime_state.initialized);
     thread.Queue queue = queue_for(domain_id, domain_kind);
-    assert(thread.enqueue(runtime_state.group, queue, context, resume));
+    if (domain_kind != concurrent_domain_kind) {
+        assert(thread.enqueue(runtime_state.group, queue, context, resume));
+        return;
+    }
+    UInt8* token = resume_token(token_slot, queue, context, resume, callback);
+    schedule_or_mark_pending(token);
+}
+
+@link_symbol("__jiang_runtime_resume_token_complete")
+public () complete_resume_token(UInt8* raw_token) {
+    if (raw_token == null) { return; }
+    unsafe { thread.atomic_compare_exchange(resume_token_word(raw_token, resume_completed_word), 0, 1); }
+}
+
+UInt8* resume_token(
+    UInt8* raw_slot,
+    thread.Queue queue,
+    UInt8* context,
+    UInt8* resume,
+    UInt8* callback
+) {
+    Int existing_address = load_storage_word(raw_slot, 0);
+    if (existing_address != 0) { return unsafe { existing_address$.as(UInt8*) }; }
+    UInt8* candidate = allocate_resume_token(queue, context, resume, callback);
+    store_storage_word(raw_slot, 0, unsafe { candidate$.as(Int) });
+    return candidate;
+}
+
+UInt8* allocate_resume_token(thread.Queue queue, UInt8* context, UInt8* resume, UInt8* callback) {
+    UInt8* storage = thread.allocate_storage(resume_token_words * Int$.size());
+    assert(storage != null);
+    store_storage_word(storage, resume_completed_word, 0);
+    store_storage_word(storage, resume_state_word, resume_idle);
+    store_storage_word(storage, resume_queue_word, unsafe { thread.queue_handle(queue)$.as(Int) });
+    store_storage_word(storage, resume_context_word, unsafe { context$.as(Int) });
+    store_storage_word(storage, resume_function_word, unsafe { resume$.as(Int) });
+    store_storage_word(storage, resume_callback_word, unsafe { callback$.as(Int) });
+    return storage;
+}
+
+() schedule_or_mark_pending(UInt8* token) {
+    while (true) {
+        Int!* state = resume_token_word(token, resume_state_word);
+        if (thread.atomic_compare_exchange(state, resume_idle, resume_running)) {
+            enqueue_token(token);
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_running, resume_pending)) {
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_pending, resume_pending)) {
+            return;
+        }
+    }
+}
+
+() enqueue_token(UInt8* token) {
+    Int queue_handle = load_storage_word(token, resume_queue_word);
+    thread.Queue queue = thread.Queue(unsafe { queue_handle$.as(UInt8*) });
+    Int callback_address = load_storage_word(token, resume_callback_word);
+    UInt8* callback_pointer = unsafe { callback_address$.as(UInt8*) };
+    assert(thread.enqueue(runtime_state.group, queue, token, callback_pointer));
+}
+
+@link_symbol("__jiang_runtime_run_scheduled_resume")
+() run_scheduled_resume(UInt8* context) {
+}
+
+@link_symbol("__jiang_runtime_release_resume_token")
+() release_resume_token(UInt8* token) {
+    while (true) {
+        Int!* completed = resume_token_word(token, resume_completed_word);
+        Int!* state = resume_token_word(token, resume_state_word);
+        if (thread.atomic_compare_exchange(completed, 1, 1)) {
+            finish_resume_token(token);
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_pending, resume_running)) {
+            enqueue_token(token);
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_running, resume_idle)) {
+            return;
+        }
+    }
+}
+
+() finish_resume_token(UInt8* token) {
+    while (true) {
+        Int!* state = resume_token_word(token, resume_state_word);
+        if (thread.atomic_compare_exchange(state, resume_pending, resume_idle)) {
+            break;
+        }
+        if (thread.atomic_compare_exchange(state, resume_running, resume_idle)) {
+            break;
+        }
+    }
+    thread.deallocate_storage(token);
+}
+
+Int!* resume_token_word(UInt8* token, Int index) {
+    return storage_word(token, index);
 }
 
 thread.Queue queue_for(Int domain_id, Int domain_kind) {

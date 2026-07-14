@@ -1449,6 +1449,9 @@ struct MirLowerer: Movable {
             waiter_domain_kind: self.add_future_task_state_field(
                 state_def, "waiter_domain_kind", int_type, span
             ),
+            cancellation_requested: self.add_future_task_state_field(
+                state_def, "cancellation_requested", int_type, span
+            ),
             allocation_pointer: self.add_future_task_state_field(
                 state_def, "allocation_pointer", raw_pointer, span
             ),
@@ -1832,6 +1835,7 @@ struct BodyLowerer: Movable {
         if (node.data is .catch_expr(_)) { return true; }
         if (node.data is .await_expr(_)) { return true; }
         if (node.data is .await_future_expr(_)) { return true; }
+        if (node.data is .cancel_future_expr(_)) { return true; }
         if (node.data is .propagate_error_expr(_)) { return true; }
         return false;
     }
@@ -2324,6 +2328,10 @@ struct BodyLowerer: Movable {
             self.lower_await_future_expr(value, destination);
             return;
         }
+        if (node.data is .cancel_future_expr(value)) {
+            self.lower_cancel_future_expr(value, destination);
+            return;
+        }
         if (node.data is .propagate_error_expr(value)) {
             self.lower_propagate_error_expr(node_id, value, destination);
             return;
@@ -2550,6 +2558,12 @@ struct BodyLowerer: Movable {
         list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
         args.add(self.async_block_env_operand(node_id, function_def, captures, null, span));
         self.lower_async_operands_into_frame(args$.ref(), layout, frame_place, span);
+        self.statements.add(coroutine_future_abi.resume_token_initializer(
+            self.lowerer.output,
+            layout,
+            frame_place,
+            span
+        ));
         self.statements.add(coroutine_future_abi.frame_state_initializer(
             self.lowerer.output,
             layout,
@@ -5462,7 +5476,38 @@ struct BodyLowerer: Movable {
                 )
             ))
         )), span);
-        self.release_awaited_future(future_place, span);
+        self.release_consumed_future(future_place, true, span);
+    }
+
+    () lower_cancel_future_expr(self, hir.HirId value, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(value);
+        mir.MirPlace future_place;
+        if (self.place_for_expr(value) is .some(place)) {
+            future_place = place;
+        } else {
+            mir.MirLocalId future_local = self.add_temp(self.type_for_node(value), span);
+            future_place = self.place_for_local(future_local);
+            self.lower_into_place(value, future_place);
+        }
+        mir.MirFutureTaskStateLayout task_state = self.task_state_layout_for_future(future_place);
+        self.statements.add(mir.MirStatement (
+            span: span,
+            kind: mir.future_consume_statement_kind(mir.MirFutureConsumeStatement (
+                future: future_place
+            ))
+        ));
+        self.statements.add(mir.MirStatement (
+            span: span,
+            kind: mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
+                destination: coroutine_future_abi.future_field_place(
+                    self.lowerer.output, future_place, task_state.cancellation_requested
+                ),
+                value: mir.const_operand_value(self.int_const(1, span))
+            ))
+        ));
+        self.lower_await_future_ready(future_place, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+        self.release_consumed_future(future_place, false, span);
     }
 
     () lower_sync_block(
@@ -5503,7 +5548,12 @@ struct BodyLowerer: Movable {
         );
     }
 
-    () release_awaited_future(self, mir.MirPlace future_place, token.Span span) {
+    () release_consumed_future(
+        self,
+        mir.MirPlace future_place,
+        Bool result_consumed,
+        token.Span span
+    ) {
         mir.MirFutureTaskStateLayout task_state = self.task_state_layout_for_future(future_place);
         mir.MirPlace allocation_pointer = coroutine_future_abi.future_field_place(
             self.lowerer.output, future_place, task_state.allocation_pointer
@@ -5525,7 +5575,7 @@ struct BodyLowerer: Movable {
                     self.lowerer.output, future_place, task_state.result_drop
                 ),
                 storage: mir.MirFutureStorageKind.heap_observed,
-                result_consumed: true,
+                result_consumed: result_consumed,
                 task_completed: false
             ))
         ));
@@ -5753,7 +5803,7 @@ struct BodyLowerer: Movable {
             span: span,
             kind: mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
                 destination: waiter_state,
-                value: mir.const_operand_value(self.int_const(2, span))
+                value: mir.const_operand_value(self.int_const(1, span))
             ))
         ));
         mir.MirLocalId observed_state = self.add_temp(self.mir_place_type(waiter_state), span);
@@ -5776,32 +5826,28 @@ struct BodyLowerer: Movable {
             )),
             span
         );
-        mir.MirBlockId claim_block = self.reserve_block(span);
+        mir.MirBlockId ready_claim_block = self.reserve_block(span);
         mir.MirBlockId suspend_block = self.reserve_block(span);
         self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
             condition: self.operand_for_place(self.place_for_local(ready)),
-            then_target: claim_block,
+            then_target: ready_claim_block,
             else_target: suspend_block
         )), span);
-        self.start_block(claim_block);
+        self.start_block(ready_claim_block);
         mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(claimed),
             mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
                 place: waiter_state,
-                expected: mir.const_operand_value(self.int_const(2, span)),
+                expected: mir.const_operand_value(self.int_const(1, span)),
                 desired: mir.const_operand_value(self.int_const(0, span))
             )),
             span
         );
-        self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
-            condition: self.operand_for_place(self.place_for_local(claimed)),
-            then_target: ready_block,
-            else_target: suspend_block
-        )), span);
+        self.finish_block(self.goto_terminator(ready_block), span);
         self.start_block(suspend_block);
         self.finish_block(mir.suspend_pending_terminator_kind(mir.MirSuspendPendingTerminator (
-            future: null,
+            future: future_place,
             target: check_block
         )), span);
         self.start_block(ready_block);
