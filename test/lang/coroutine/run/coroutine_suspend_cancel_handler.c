@@ -6,6 +6,7 @@
 
 static _Atomic int64_t registration_ready;
 static _Atomic int64_t registration_open;
+static _Atomic int64_t cancel_started;
 static pthread_t opener_thread;
 
 void suspend_cancel_registration_block(void) {
@@ -23,6 +24,9 @@ void suspend_cancel_registration_wait_ready(void) {
 
 static void *open_registration(void *opaque) {
     (void)opaque;
+    while (atomic_load(&cancel_started) == 0) {
+        sched_yield();
+    }
     usleep(10000);
     atomic_store(&registration_open, 1);
     return 0;
@@ -30,6 +34,10 @@ static void *open_registration(void *opaque) {
 
 void suspend_cancel_registration_open_later(void) {
     pthread_create(&opener_thread, 0, open_registration, 0);
+}
+
+void suspend_cancel_registration_begin_cancel(void) {
+    atomic_store(&cancel_started, 1);
 }
 
 void suspend_cancel_registration_join(void) {
