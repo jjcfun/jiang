@@ -830,8 +830,14 @@ public FrameRewriteResult add_state_machine_skeleton(
     mir.MirPlace frame_place = deref_frame_pointer_place(output, result.frame_local_id);
     mir.MirLocalId cancellation_state_local = mir.MirLocalId.from_index(result.body.locals.length);
     mir.MirLocalId cancellation_claimed_local = mir.MirLocalId.from_index(result.body.locals.length + 1);
+    mir.MirLocalId cancellation_context_local = mir.MirLocalId.from_index(result.body.locals.length + 2);
     mir.MirLocalDecl[]& locals = locals_with_cancellation_check(
-        output, result.body, layout, cancellation_state_local, cancellation_claimed_local
+        output,
+        result.body,
+        layout,
+        cancellation_state_local,
+        cancellation_claimed_local,
+        cancellation_context_local
     );
     mir.MirBlockId dispatch_id = mir.MirBlockId.from_index(result.body.blocks.length);
     mir.MirBody body = body_with_blocks(
@@ -843,6 +849,7 @@ public FrameRewriteResult add_state_machine_skeleton(
             frame_place,
             cancellation_state_local,
             cancellation_claimed_local,
+            cancellation_context_local,
             dispatch_id
         )
     );
@@ -857,9 +864,10 @@ mir.MirLocalDecl[]& locals_with_cancellation_check(
     mir.MirBody body,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirLocalId state_local,
-    mir.MirLocalId claimed_local
+    mir.MirLocalId claimed_local,
+    mir.MirLocalId context_local
 ) {
-    mir.MirLocalDecl![*] locals = output.alloc_local_array(body.locals.length + 2);
+    mir.MirLocalDecl![*] locals = output.alloc_local_array(body.locals.length + 3);
     Int! index = 0;
     while (index < body.locals.length) {
         locals[index] = body.locals[index];
@@ -874,7 +882,13 @@ mir.MirLocalDecl[]& locals_with_cancellation_check(
     locals[body.locals.length + 1] = generated_local(
         claimed_local, mir.MirLocalKind.compiler_temp, layout.task_abi.bool_type_id, body.span
     );
-    return locals[0..body.locals.length + 2];
+    locals[body.locals.length + 2] = generated_local(
+        context_local,
+        mir.MirLocalKind.compiler_temp,
+        layout.fields[layout.cancellation_context_field_index].type_id,
+        body.span
+    );
+    return locals[0..body.locals.length + 3];
 }
 
 public ResumeRewriteResult add_resume_return_skeleton(
@@ -1259,14 +1273,17 @@ mir.MirBlock[]& state_machine_blocks(
     mir.MirPlace frame_place,
     mir.MirLocalId cancellation_state_local,
     mir.MirLocalId cancellation_claimed_local,
+    mir.MirLocalId cancellation_context_local,
     mir.MirBlockId dispatch_id
 ) {
     mir.MirBlockId invalid_state_id = mir.MirBlockId.from_index(body.blocks.length + 1);
     mir.MirBlockId state_check_id = mir.MirBlockId.from_index(body.blocks.length + 2);
     mir.MirBlockId enabled_check_id = mir.MirBlockId.from_index(body.blocks.length + 3);
-    mir.MirBlockId request_check_id = mir.MirBlockId.from_index(body.blocks.length + 4);
-    mir.MirBlockId claim_id = mir.MirBlockId.from_index(body.blocks.length + 5);
-    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(body.blocks.length + 6);
+    mir.MirBlockId observed_request_check_id = mir.MirBlockId.from_index(body.blocks.length + 4);
+    mir.MirBlockId inherited_context_check_id = mir.MirBlockId.from_index(body.blocks.length + 5);
+    mir.MirBlockId inherited_request_check_id = mir.MirBlockId.from_index(body.blocks.length + 6);
+    mir.MirBlockId claim_id = mir.MirBlockId.from_index(body.blocks.length + 7);
+    list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(body.blocks.length + 8);
     Int! index = 0;
     while (index < body.blocks.length) {
         blocks.add(state_machine_block(output, body.blocks[index], layout, frame_place));
@@ -1291,7 +1308,8 @@ mir.MirBlock[]& state_machine_blocks(
         frame_place,
         cancellation_state_local,
         enabled_check_id,
-        request_check_id,
+        observed_request_check_id,
+        inherited_context_check_id,
         dispatch_id
     ));
     blocks.add(cancellation_request_check_block(
@@ -1300,8 +1318,28 @@ mir.MirBlock[]& state_machine_blocks(
         layout,
         frame_place,
         cancellation_state_local,
-        request_check_id,
+        observed_request_check_id,
         claim_id,
+        dispatch_id
+    ));
+    blocks.add(inherited_cancellation_context_check_block(
+        output,
+        body,
+        layout,
+        frame_place,
+        cancellation_claimed_local,
+        cancellation_context_local,
+        inherited_context_check_id,
+        inherited_request_check_id,
+        dispatch_id
+    ));
+    blocks.add(inherited_cancellation_request_check_block(
+        output,
+        body,
+        layout,
+        cancellation_state_local,
+        cancellation_context_local,
+        inherited_request_check_id,
         dispatch_id
     ));
     blocks.add(cancellation_claim_block(
@@ -1485,7 +1523,8 @@ mir.MirBlock cancellation_enabled_check_block(
     mir.MirPlace frame_place,
     mir.MirLocalId state_local,
     mir.MirBlockId id,
-    mir.MirBlockId request_check_id,
+    mir.MirBlockId observed_request_check_id,
+    mir.MirBlockId inherited_context_check_id,
     mir.MirBlockId dispatch_id
 ) {
     mir.MirPlace state_place = mir.local_place(state_local, output.empty_projection());
@@ -1496,6 +1535,97 @@ mir.MirBlock cancellation_enabled_check_block(
         frame_field_place(output, layout, frame_place, layout.cancellation_enabled_field_index),
         body.span
     ));
+    list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(2);
+    cases.add(mir.MirSwitchCase (
+        value: state_const(layout, body.span, 1),
+        target: observed_request_check_id
+    ));
+    cases.add(mir.MirSwitchCase (
+        value: state_const(layout, body.span, 2),
+        target: inherited_context_check_id
+    ));
+    return mir.MirBlock (
+        id: id,
+        span: body.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: mir.MirTerminator (
+            span: body.span,
+            kind: mir.switch_terminator_kind(mir.MirSwitchTerminator (
+                discriminator: mir.copy_operand_value(mir.MirCopyOperand (place: state_place)),
+                cases: output.switch_case_array(cases$.ref()),
+                default_target: dispatch_id
+            ))
+        )
+    );
+}
+
+mir.MirBlock inherited_cancellation_context_check_block(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place,
+    mir.MirLocalId present_local,
+    mir.MirLocalId context_local,
+    mir.MirBlockId id,
+    mir.MirBlockId request_check_id,
+    mir.MirBlockId dispatch_id
+) {
+    mir.MirPlace present_place = mir.local_place(present_local, output.empty_projection());
+    mir.MirPlace context_place = mir.local_place(context_local, output.empty_projection());
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(2);
+    statements.add(assign_copy_statement(
+        output,
+        context_place,
+        frame_field_place(output, layout, frame_place, layout.cancellation_context_field_index),
+        body.span
+    ));
+    statements.add(mir.MirStatement (
+        span: body.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: present_place,
+            value: mir.binary_rvalue(mir.MirBinaryRvalue (
+                op: mir.MirBinaryOp.ne,
+                lhs: mir.copy_operand_value(mir.MirCopyOperand (place: context_place)),
+                rhs: mir.const_operand_value(cancellation_context_null_const(layout, body.span))
+            ))
+        ))
+    ));
+    return mir.MirBlock (
+        id: id,
+        span: body.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: mir.MirTerminator (
+            span: body.span,
+            kind: mir.branch_terminator_kind(mir.MirBranchTerminator (
+                condition: mir.copy_operand_value(mir.MirCopyOperand (place: present_place)),
+                then_target: request_check_id,
+                else_target: dispatch_id
+            ))
+        )
+    );
+}
+
+mir.MirBlock inherited_cancellation_request_check_block(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId state_local,
+    mir.MirLocalId context_local,
+    mir.MirBlockId id,
+    mir.MirBlockId dispatch_id
+) {
+    mir.MirPlace state_place = mir.local_place(state_local, output.empty_projection());
+    mir.MirPlace request_place = cancellation_request_place_from_context(
+        output, layout, context_local
+    );
+    list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(1);
+    statements.add(mir.MirStatement (
+        span: body.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: state_place,
+            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: request_place))
+        ))
+    ));
     return switch_block(
         output,
         id,
@@ -1503,9 +1633,36 @@ mir.MirBlock cancellation_enabled_check_block(
         statements$.ref(),
         mir.copy_operand_value(mir.MirCopyOperand (place: state_place)),
         state_const(layout, body.span, 1),
-        request_check_id,
+        layout.cancellation_entry,
         dispatch_id
     );
+}
+
+mir.MirConst cancellation_context_null_const(
+    mir.MirCoroutineFrameLayout& layout,
+    token.Span span
+) {
+    return mir.MirConst (
+        type_id: layout.fields[layout.cancellation_context_field_index].type_id,
+        span: span,
+        value: mir.null_const_kind(mir.MirNullConst (typed_null: true))
+    );
+}
+
+mir.MirPlace cancellation_request_place_from_context(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId local_id
+) {
+    mir.MirSyntheticField field = layout.task_abi.cancellation_requested_field;
+    list.ArrayList<mir.MirPlaceElem>! projection = list.ArrayList<mir.MirPlaceElem>(2);
+    projection.add(mir.deref_projection_elem(mir.MirDerefProjection (raw_pointer: true)));
+    projection.add(mir.field_projection_elem(mir.MirFieldProjection (
+        field_def: field.def_id,
+        field_type: field.type_id,
+        field_index: field.index
+    )));
+    return mir.local_place(local_id, output.projection_array(projection$.ref()));
 }
 
 mir.MirBlock cancellation_claim_block(
@@ -2395,6 +2552,9 @@ mir.MirRvalue rewrite_rvalue(
         Int! field_index = layout.continuation_context_field_index;
         if (current_task.observed) {
             field_index = layout.cancellation_enabled_field_index;
+        }
+        if (current_task.cancellation_context) {
+            field_index = layout.cancellation_context_field_index;
         }
         return mir.use_rvalue(mir.MirUseRvalue (
             value: mir.copy_operand_value(mir.MirCopyOperand (

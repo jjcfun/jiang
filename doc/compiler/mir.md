@@ -202,8 +202,9 @@ observed Task 的 task 和 observer 各持有一次 ownership。`await()` 消费
 request 从 requested claim 为 cancelling，并从 cancellation entry 进入 drop elaboration 生成的清理链。
 parent 挂起于显式 `child.await()` 时，会把 child request 注册到 parent task-state；取消 parent
 会先请求
-取消 child，parent 只在 child terminal acknowledgement 恢复后进入自身 unwind。隐式 async call 和
-extern operation 的主动取消仍是后续工作。
+取消 child，parent 只在 child terminal acknowledgement 恢复后进入自身 unwind。直接调用的 async child
+继承根 Task 的 cancellation context；child 在自然恢复边界观察请求并先 unwind，再通过 continuation
+恢复 parent，且只有根 Task claim 请求。extern operation 的主动取消仍是后续工作。
 cancellation cleanup 统一释放已初始化的 body-local Task observer，再为 drop elaboration 管理的
 parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，extern continuation record 等
 跨 suspend temp 仍由 liveness 放入 frame。
