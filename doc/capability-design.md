@@ -457,9 +457,9 @@ unwind。取消请求线程不能直接析构 frame；resume 入口和 suspend b
 执行；task 完成后由 task/observer ownership 协议完成最终释放。若以后需要只发请求而不等待，
 应使用不同的显式操作，不能削弱 `cancel()` 的终态确认语义。
 
-0.4.7 当前实现阶段先在 coroutine entry 处理 cancel-before-start。Task 一旦开始或挂起，取消请求暂不
-执行中途 unwind，而是等待自然 completion 后确认；这仍满足 `cancel()` 返回后的终态保证。后续再把
-检查扩展到 suspend boundary，并加入 child propagation 与 extern async cancel acknowledgement。
+0.4.7 当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占 frame，
+也暂不主动取消 child 或 extern operation；等待当前 operation 自然完成并恢复 coroutine 后，再沿 drop
+state unwind。后续加入 child propagation 与 extern async cancel acknowledgement。
 
 跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
 `Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
