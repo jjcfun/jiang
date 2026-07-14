@@ -146,9 +146,9 @@ MIR lowering 接收 `MonomorphStore`。非泛型函数按 `DefId` 直接 lower�
 async source function 的普通 MIR body 只作为 coroutine pass 的输入，不直接生成源码形状的
 backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；普通隐式 await 直接把
 child frame 连接到 caller continuation。`async call` 和 observed `async {}` 显式 materialize
-`Future<T>`；直接作为语句使用的 async block 生成 detached start。
+`Task<T>`；直接作为语句使用的 async block 生成 detached start。
 
-显式 Future 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 domain
+显式 Task 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 domain
 identity 和 resume operand。它不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
 LLVM backend 将其 lowering 为私有
 `__jiang_runtime_domain_enqueue(domain_id, domain_kind, context, resume)` runtime ABI。`domain_id` 是当前程序
@@ -183,23 +183,28 @@ continuation record 嵌入 caller coroutine frame，不要求堆分配。runtime
 先写 result，再调用 `resume_fn(caller_context)`。`result_ptr`、frame linkage 等 compiler 地址使用
 专用 MIR 来源标记，但 backend 仍 lower 成普通 raw pointer；用户 raw/reference 借用规则不因此放宽。
 
-跨线程 Future completion 必须使用 release/acquire 同步，并通过 waiter claim CAS 防止丢唤醒或重复
+跨线程 Task completion 必须使用 release/acquire 同步，并通过 waiter claim CAS 防止丢唤醒或重复
 resume。等待方先写 waiter context/function，再发布 armed 状态并重新 acquire 检查 ready；完成方发布
 ready 后只在成功把 armed claim 为 notified 时调用 waiter。等待方若观察到 ready，只在成功撤销 armed
 时直接继续，否则由已经 claim 的完成方负责恢复。serial domain 可以在证明不跨线程后消除原子操作。
 
-observed Future 的 task 和 observer 各持有一次 ownership。`await()` 消费 observer，Future 在词法
+observed Task 的 task 和 observer 各持有一次 ownership。`await()` 消费 observer，Task 在词法
 作用域结束时未消费则 detach；completion 与 observer release 通过 CAS 决定最后释放 task-state、frame
 和未消费 result 的一方。0.4.6 不提供 cancellation，detach 不会停止已经启动的 coroutine。
 
-0.4.7 的 `Future.cancel()` 与 `await()` 是互斥的 consuming operation。cancel 设置 cancellation request，
+0.4.7 的 `Task.cancel()` 与 `await()` 是互斥的 consuming operation。cancel 设置 cancellation request，
 把处理请求的工作调度到 task execution domain，并挂起 caller 直到 completion 或 cancellation unwind
 进入 terminal state；它不是 request-and-detach。terminal acknowledgement 发布后才能恢复 cancel waiter，
 并保证 frame、capture 和未消费 result 已经完成清理。completion、cancel、detach 的竞争必须复用
 可验证的原子 ownership 协议，任意资源仍只允许释放一次。
 
-Future 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
-coroutine frame 转移。Future task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Future
+当前实现先覆盖 cancel-before-start：observed Task frame 在 entry resume 时用 CAS 将 request 从
+requested claim 为 cancelling，并从 cancellation entry 进入 drop elaboration 生成的清理链。已经开始或
+挂起的 Task 暂不抢占，`cancel()` 等待其自然 completion；suspend boundary、child 和 extern async 的
+取消传播仍是后续工作。
+
+Task 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
+coroutine frame 转移。Task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Task
 的 effect body 所在 current domain。
 
 ## 不变量

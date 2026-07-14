@@ -130,8 +130,8 @@ async [domain: app_runtime.UiDomain] {
 
 ```jiang
 sync [UiDomain] {
-    Future<Int> a = async { load_data() }; // 继承 UiDomain
-    Future<Int> b = async { load_data() }; // 继承 UiDomain
+    Task<Int> a = async { load_data() }; // 继承 UiDomain
+    Task<Int> b = async { load_data() }; // 继承 UiDomain
     a.await() + b.await()
 }
 ```
@@ -182,7 +182,7 @@ domain type；带 `context` 的形式只用于 block。`UiDomain` 本质上仍�
 ```
 
 它可以被任意调用者同步调用，执行在调用者当前控制流中。普通函数不能直接建立或等待
-Future。如果普通函数要进入异步运行时，必须显式写外层 domain：
+Task。如果普通函数要进入异步运行时，必须显式写外层 domain：
 
 ```jiang
 Int main() {
@@ -278,11 +278,11 @@ async () foo(T!& x) {
 实现上：
 
 - 同 domain await：不需要 domain hop，只是普通 coroutine resume。
-- `future.await()` 在 waiter 的 current domain 中挂起；Future 可以在其他 domain 执行。
+- `task.await()` 在 waiter 的 current domain 中挂起；Task 可以在其他 domain 执行。
 - 跨 domain completion 将 waiter continuation enqueue 回等待方 domain，再从原 current domain 恢复。
 
 静态 capability 检查本身应当是零运行时开销。运行时开销来自实际的 enqueue、suspend/resume
-和 Future 等待。
+和 Task 等待。
 
 ## Domain 切换规则
 
@@ -293,11 +293,11 @@ async () foo(T!& x) {
 - domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
   current domain。
 - `async {}` / `sync {}` 只有外层已有 current domain 时可省略 domain，并继承 current。
-- `async [D] {}` 创建 future，是显式 domain 入口；如果 domain type `D` 不等于 current，
+- `async [D] {}` 创建 task，是显式 domain 入口；如果 domain type `D` 不等于 current，
   则是 domain 切换边界。
 - `sync [D] {}` 从普通同步世界阻塞进入 domain type `D`，也可以在已有 current domain 中
   显式切到 `D`。
-- `future.await()` 不把 caller 留在 Future 的 execution domain；完成后 caller 回到等待方 current domain。
+- `task.await()` 不把 caller 留在 Task 的 execution domain；完成后 caller 回到等待方 current domain。
 
 async 函数或 async block 内的 `sync [D] {}` 必须能静态证明 `D` 与 current domain 不同。
 domain-neutral async 函数的 current domain 运行时才确定，因此也不能在其中使用静态 `sync [D]`。
@@ -317,9 +317,9 @@ concurrent domain 中也会无谓阻塞 worker。需要继续异步执行时应�
 `sync [D] {}` 即使会阻塞等待，也不能把外层其他 domain 的普通 `T!&` 带入 `D`。阻塞只保证
 caller 等待 block 结束，不给普通引用增加跨 domain 同步语义。
 
-## Future 与结构化并发
+## Task 与结构化并发
 
-普通 async 调用表示 suspend call，不创建 future，也不返回 future。调用点挂起当前 coroutine，
+普通 async 调用表示 suspend call，不创建 task，也不返回 task。调用点挂起当前 coroutine，
 callee 完成后继续执行：
 
 ```jiang
@@ -334,51 +334,51 @@ async Int render() {
 需要并发启动而不等待结果时，使用 `async call` 或 async block：
 
 ```jiang
-Future<Int> a = async load_a();
-Future<Int> b = async load_b();
+Task<Int> a = async load_a();
+Task<Int> b = async load_b();
 
 a.await() + b.await()
 ```
 
-`async load_a()` 阻止普通 `load_a()` 调用的隐式 await，并返回 body-local `Future<Int>`。
-`Future.await()` 消费一个 Future；多个 Future 提前启动后，即使按顺序调用 `await()`，仍保持并发执行：
+`async load_a()` 阻止普通 `load_a()` 调用的隐式 await，并返回 body-local `Task<Int>`。
+`Task.await()` 消费一个 Task；多个 Task 提前启动后，即使按顺序调用 `await()`，仍保持并发执行：
 
 ```jiang
-Future<Int> a = async load_a();
-Future<Int> b = async load_b();
+Task<Int> a = async load_a();
+Task<Int> b = async load_b();
 
 a.await() + b.await()
 ```
 
-Jiang 不提供 `await expr` 或隐式多 Future barrier。需要等待多个 Future 时，分别调用 `await()`；已完成
-Future 走 ready fast path，未完成 Future 才挂起当前 coroutine。
+Jiang 不提供 `await expr` 或隐式多 Task barrier。需要等待多个 Task 时，分别调用 `await()`；已完成
+Task 走 ready fast path，未完成 Task 才挂起当前 coroutine。
 
-`async {}` / `async [D] {}` 可创建一个显式 block future，用于需要自定义 future body 或显式
+`async {}` / `async [D] {}` 可创建一个显式 block task，用于需要自定义 task body 或显式
 domain 边界的场景：
 
 ```jiang
-let future = async {
+let task = async {
     load_page()
 }
 ```
 
-Jiang 的 future 语义是 eager、single-completion、cached result、single-consumer：
+Jiang 的 task 语义是 eager、single-completion、cached result、single-consumer：
 
-- 创建 future 后立即入队或开始执行，不等到 `await()` 时才启动。
-- future body 只执行一次。
+- 创建 task 后立即入队或开始执行，不等到 `await()` 时才启动。
+- task body 只执行一次。
 - 完成值缓存一次；`await()` 读取缓存结果，不重复执行 body。
-- coroutine 是无栈协程；future 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
-- 如果 body 返回 `Result<T, E>`，future 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
+- coroutine 是无栈协程；task 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
+- 如果 body 返回 `Result<T, E>`，task 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
   exception channel。
-- future result type 不能是 future；`async { ... }` / `async [D] { ... }` 不允许产生
-  nested future。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Future<Future<T>>`。
-- `await()` 和 `cancel()` 都消费 Future，只能选择其中一个；Future 被消费后不能再次 await、cancel
+- task result type 不能是 task；`async { ... }` / `async [D] { ... }` 不允许产生
+  nested task。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Task<Task<T>>`。
+- `await()` 和 `cancel()` 都消费 Task，只能选择其中一个；Task 被消费后不能再次 await、cancel
   或移动。
 
 因此这里是合法的：
 
 ```jiang
-let future = async [PageDomain] {
+let task = async [PageDomain] {
     load_page() // body type: Int
 }
 ```
@@ -393,42 +393,42 @@ let nested = async [PageDomain] {
 }
 ```
 
-Future 只能在 async/sync body 内作为局部不透明值使用。用户可以在局部变量上写
-`Future<T>`，但不能显式写 domain 参数。编译器会根据 initializer 把它补全成内部
-`Future<T, domain D>`：
+Task 只能在 async/sync body 内作为局部不透明值使用。用户可以在局部变量上写
+`Task<T>`，但不能显式写 domain 参数。编译器会根据 initializer 把它补全成内部
+`Task<T, domain D>`：
 
 ```jiang
-Future<Int> future = async [PageDomain] { load_page() }; // internal domain: PageDomain
+Task<Int> task = async [PageDomain] { load_page() }; // internal domain: PageDomain
 ```
 
-如果局部变量没有 initializer，`Future<T>` 的 domain 默认是调用点 `current`。
-`Future<T, PageDomain>` 这类显式 domain 参数暂不开放。
+如果局部变量没有 initializer，`Task<T>` 的 domain 默认是调用点 `current`。
+`Task<T, PageDomain>` 这类显式 domain 参数暂不开放。
 
-Future 不能出现在函数返回值、参数类型、字段类型或 public ABI：
+Task 不能出现在函数返回值、参数类型、字段类型或 public ABI：
 
 ```jiang
-Future<Int> make_future(); // error: Future 不能出现在签名中
+Task<Int> make_task(); // error: Task 不能出现在签名中
 ```
 
-编译器内部用 future kind 保存 result type 和 domain。这个 kind 服务 type check、borrow check、
-lowering 和 runtime ABI；用户可见的 `Future<T>` 只是 body-local 标注表面。
+编译器内部用 task kind 保存 result type 和 domain。这个 kind 服务 type check、borrow check、
+lowering 和 runtime ABI；用户可见的 `Task<T>` 只是 body-local 标注表面。
 
-Future 的 observer ownership 固定在创建它的 async/sync effect body。0.4.7 禁止 Future 被任何
+Task 的 observer ownership 固定在创建它的 async/sync effect body。0.4.7 禁止 Task 被任何
 嵌套的 async/sync block 或 lambda 捕获，不区分是否 move、是否同 domain；普通词法 block 不形成
-capture 边界。Future 可以在创建它的 effect body 中等待一个运行于其他 domain 的 task，完成后
+capture 边界。Task 可以在创建它的 effect body 中等待一个运行于其他 domain 的 task，完成后
 caller 仍回到等待方 current domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
 
 ```jiang
 sync [UiDomain] {
-    Future<Image> image = async [WorkerPoolDomain] { load_image() };
-    Image value = image.await(); // allowed: Future 没有被嵌套 effect block 捕获
+    Task<Image> image = async [WorkerPoolDomain] { load_image() };
+    Image value = image.await(); // allowed: Task 没有被嵌套 effect block 捕获
 }
 ```
 
 ```jiang
-Future<Image> image = async [WorkerPoolDomain] { load_image() };
+Task<Image> image = async [WorkerPoolDomain] { load_image() };
 async [UiDomain] {
-    image.await() // error: future_capture_not_allowed
+    image.await() // error: task_capture_not_allowed
 }
 ```
 
@@ -437,25 +437,29 @@ async [UiDomain] {
 ```jiang
 sync [UiDomain] {
     async [WorkerPoolDomain] {
-        update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain future
+        update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain task
     }
 }
 ```
 
-同 domain 的 future creation 仍需要生命周期约束。如果 future 可能在当前函数返回后运行，
+同 domain 的 task creation 仍需要生命周期约束。如果 task 可能在当前函数返回后运行，
 不能捕获栈上 borrow。
-结构化并发可以允许有限的同 domain capture，但必须证明所有 future 在 scope 结束前完成。
+结构化并发可以允许有限的同 domain capture，但必须证明所有 task 在 scope 结束前完成。
 
-0.4.6 不提供 cancellation。0.4.7 采用显式、协作式 cancellation：`future.cancel()` 消费 Future，
+0.4.6 不提供 cancellation。0.4.7 采用显式、协作式 cancellation：`task.cancel()` 消费 Task，
 向 task 的 execution domain 请求取消，并挂起 caller，直到 task 已正常完成或完成 cancellation
 unwind。取消请求线程不能直接析构 frame；resume 入口和 suspend boundary 检查请求，frame、capture
 和跨 suspend local 沿正常 drop state 析构。若 completion 先发生，`cancel()` 丢弃已完成 result
 后返回；cancellation 不进入 async 函数的普通返回类型。
 
 `cancel()` 返回时保证 task 不会再执行用户代码，相关 frame、capture 和未消费 result 已完成
-清理。Future 在未 `await()` 或 `cancel()` 时离开词法作用域仍表示 detach，不请求取消，task 继续
+清理。Task 在未 `await()` 或 `cancel()` 时离开词法作用域仍表示 detach，不请求取消，task 继续
 执行；task 完成后由 task/observer ownership 协议完成最终释放。若以后需要只发请求而不等待，
 应使用不同的显式操作，不能削弱 `cancel()` 的终态确认语义。
+
+0.4.7 当前实现阶段先在 coroutine entry 处理 cancel-before-start。Task 一旦开始或挂起，取消请求暂不
+执行中途 unwind，而是等待自然 completion 后确认；这仍满足 `cancel()` 返回后的终态保证。后续再把
+检查扩展到 suspend boundary，并加入 child propagation 与 extern async cancel acknowledgement。
 
 跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
 `Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
@@ -518,7 +522,7 @@ Vector<Int!&> // error
 ## 与 Rust 的差异
 
 Rust 主要靠 `&mut T` 独占、`Send` / `Sync` trait、executor API 约束来防数据竞争。Rust 没有显式
-`async [domain]`；future 被哪个 executor poll，就在哪执行。
+`async [domain]`；task 被哪个 executor poll，就在哪执行。
 
 Jiang 的草案不同：
 
@@ -540,4 +544,4 @@ Jiang 的草案不同：
 - `T!&` 返回值的生命周期和 domain 如何在 HIR / type check 中表示。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
 - `unique` 和 optimizer noalias 的精确关系。
-- `async [D] {}`、结构化并发 scope、detached future 的最终语法。
+- `async [D] {}`、结构化并发 scope、detached task 的最终语法。

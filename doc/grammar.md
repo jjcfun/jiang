@@ -343,9 +343,9 @@ name        <- ident / "self"
   为后续版本保留，不属于 0.4.6 的用户语法。
 - 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type。
 - 无 domain 的 `async {}` / `sync {}` 只能在已有 current domain 的上下文中使用，并继承 current。
-- `async [domain]? call(...)` 是 Future creation expression，最外层 postfix 必须是函数调用；对任意
-  非调用表达式创建 Future 时使用 `async [domain]? { ... }`。
-- Future creation 是 eager 的并返回 body-local `Future<T>`；等待使用 `future.await()`。旧的
+- `async [domain]? call(...)` 是 Task creation expression，最外层 postfix 必须是函数调用；对任意
+  非调用表达式创建 Task 时使用 `async [domain]? { ... }`。
+- Task creation 是 eager 的并返回 body-local `Task<T>`；等待使用 `task.await()`。旧的
   `callee$().async()` 和 `await expr` 不属于 0.4.6 语法。
 - 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
   `async [domain] { ... }`、`sync [domain] { ... }`、`async { ... }`、`sync { ... }`、
