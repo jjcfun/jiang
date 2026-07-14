@@ -106,6 +106,7 @@ struct MirLowerer: Movable {
     table.HashTable<Int, qid.DefId> raw_fn_vtable_globals;
     table.HashTable<Int, qid.DefId> lambda_vtable_globals;
     table.HashTable<Int, qid.DefId> lambda_env_drop_shims;
+    table.HashTable<Int, qid.DefId> cancel_handler_shims;
     table.HashTable<qid.DefId, qid.DefId> async_block_env_drop_shims;
     table.HashTable<Int, mir.MirTaskStateLayout> task_state_layouts;
     qid.DefId?! closure_noop_drop_shim;
@@ -132,6 +133,7 @@ struct MirLowerer: Movable {
         self.raw_fn_vtable_globals = table.HashTable<Int, qid.DefId>();
         self.lambda_vtable_globals = table.HashTable<Int, qid.DefId>();
         self.lambda_env_drop_shims = table.HashTable<Int, qid.DefId>();
+        self.cancel_handler_shims = table.HashTable<Int, qid.DefId>();
         self.async_block_env_drop_shims = table.HashTable<qid.DefId, qid.DefId>();
         self.task_state_layouts = table.HashTable<Int, mir.MirTaskStateLayout>();
         self.closure_noop_drop_shim = null;
@@ -932,6 +934,43 @@ struct MirLowerer: Movable {
             result_field_index: 0,
             context_field_index: 1,
             resume_field_index: 2
+        );
+    }
+
+    mir.MirSuspendContinuationLayout suspend_continuation_layout(
+        self,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
+        qid.TypeId context_type = self.coroutine_context_pointer_type(span);
+        qid.TypeId raw_pointer = self.coroutine_context_pointer_type(span);
+        qid.TypeId resume_function = self.coroutine_continuation_type(raw_pointer, span);
+        qid.TypeId int_type = self.ctx.store.types.int_type();
+        list.ArrayList<qid.TypeId>! fields = list.ArrayList<qid.TypeId>(10);
+        fields.add(self.ctx.store.types.raw_pointer_type(result_type, span));
+        fields.add(context_type);
+        fields.add(resume_function);
+        fields.add(int_type);
+        fields.add(self.ctx.store.types.raw_pointer_type(int_type, span));
+        fields.add(self.ctx.store.types.raw_pointer_type(int_type, span));
+        fields.add(self.ctx.store.types.raw_pointer_type(raw_pointer, span));
+        fields.add(self.ctx.store.types.raw_pointer_type(resume_function, span));
+        fields.add(raw_pointer);
+        fields.add(resume_function);
+        qid.TypeId type_id = self.ctx.store.types.tuple_type(fields$.move(), span);
+        return mir.MirSuspendContinuationLayout (
+            type_id: type_id,
+            pointer_type_id: self.ctx.store.types.raw_pointer_type(type_id, span),
+            result_field_index: 0,
+            context_field_index: 1,
+            resume_field_index: 2,
+            resumed_field_index: 3,
+            cancel_request_pointer_field_index: 4,
+            cancel_word_pointer_field_index: 5,
+            cancel_context_pointer_field_index: 6,
+            cancel_function_pointer_field_index: 7,
+            handler_context_field_index: 8,
+            handler_drop_field_index: 9
         );
     }
 
@@ -6111,10 +6150,11 @@ struct BodyLowerer: Movable {
             mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: target_word)),
             span
         );
-        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(3);
+        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(4);
         cases.add(mir.MirSwitchCase (value: self.int_const(0, span), target: enqueue_task));
         cases.add(mir.MirSwitchCase (value: self.int_const(1, span), target: enqueue_target));
         cases.add(mir.MirSwitchCase (value: self.int_const(2, span), target: enqueue_task));
+        cases.add(mir.MirSwitchCase (value: self.int_const(3, span), target: complete));
         self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
             discriminator: self.operand_for_place(self.place_for_local(observed)),
             cases: self.lowerer.output.switch_case_array(cases$.ref()),
@@ -7517,6 +7557,170 @@ struct BodyLowerer: Movable {
             type_id: self.lowerer.task_resume_function_type(span),
             span: self.lowerer.hir_span(node_id)
         );
+    }
+
+    mir.MirFunctionRef ensure_cancel_handler_shim(
+        self,
+        hir.HirId handler_id,
+        hir.HirLambda handler,
+        mir.MirFunctionRef drop,
+        token.Span span
+    ) {
+        qid.DefId shim_def;
+        Int key = handler.function_def.to_index();
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.cancel_handler_shims$.ref(), key
+        ) is .some(existing)) {
+            shim_def = existing;
+        } else {
+            shim_def = self.create_cancel_handler_shim_def(handler.function_def, span);
+            self.lowerer.cancel_handler_shims.set(key, shim_def);
+            self.add_cancel_handler_shim_function(
+                shim_def,
+                self.cancel_handler_function(handler_id, handler, span),
+                drop,
+                span
+            );
+        }
+        return mir.MirFunctionRef (
+            function_def: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.lowerer.task_resume_function_type(span),
+            span: span
+        );
+    }
+
+    mir.MirFunctionRef cancel_handler_function(
+        self,
+        hir.HirId handler_id,
+        hir.HirLambda handler,
+        token.Span span
+    ) {
+        return mir.MirFunctionRef (
+            function_def: handler.function_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_code_type(self.type_for_node(handler_id)),
+            span: span
+        );
+    }
+
+    qid.DefId create_cancel_handler_shim_def(self, qid.DefId handler_def, token.Span span) {
+        def.DefRecord handler_record = self.lowerer.ctx.store.defs.get(handler_def);
+        std.String name = build_text_int("__cancel_handler_", handler_def.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            handler_record.owner_def,
+            handler_record.module_id,
+            handler_record.decl_namespace_id,
+            null
+        );
+    }
+
+    () add_cancel_handler_shim_function(
+        self,
+        qid.DefId shim_def,
+        mir.MirFunctionRef handler,
+        mir.MirFunctionRef drop,
+        token.Span span
+    ) {
+        Int function_index = self.lowerer.output.functions.len();
+        qid.TypeId unit_type = self.lowerer.ctx.store.types.unit_type();
+        list.ArrayList<mir.MirLocalDecl>! locals = list.ArrayList<mir.MirLocalDecl>(4);
+        locals.add(self.receiver_drop_local(0, .return_place, unit_type, span));
+        locals.add(self.receiver_drop_local(1, .param, self.closure_env_type(span), span));
+        locals.add(self.receiver_drop_local(2, .compiler_temp, unit_type, span));
+        locals.add(self.receiver_drop_local(3, .compiler_temp, unit_type, span));
+        list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(3);
+        blocks.add(self.cancel_handler_call_block(handler, 2, 0, 1, span));
+        blocks.add(self.cancel_handler_call_block(drop, 3, 1, 2, span));
+        blocks.add(mir.MirBlock (
+            id: mir.MirBlockId.from_index(2),
+            span: span,
+            statements: self.lowerer.output.empty_statements(),
+            terminator: self.receiver_drop_return_terminator(span)
+        ));
+        mir.MirBody body = mir.MirBody (
+            id: mir.MirBodyId.from_index(function_index),
+            span: span,
+            locals: self.freeze_generated_locals(locals$.ref()),
+            blocks: self.lowerer.output.block_array(blocks$.ref()),
+            entry: mir.MirBlockId.from_index(0),
+            return_local: mir.MirLocalId.from_index(0)
+        );
+        self.add_cancel_handler_shim_mir(shim_def, function_index, body, span);
+    }
+
+    mir.MirBlock cancel_handler_call_block(
+        self,
+        mir.MirFunctionRef function,
+        Int result_local,
+        Int block_index,
+        Int target_index,
+        token.Span span
+    ) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+        args.add(mir.copy_operand_value(mir.MirCopyOperand (
+            place: self.receiver_drop_param_place()
+        )));
+        return mir.MirBlock (
+            id: mir.MirBlockId.from_index(block_index),
+            span: span,
+            statements: self.lowerer.output.empty_statements(),
+            terminator: mir.MirTerminator (
+                span: span,
+                kind: mir.call_terminator_kind(mir.MirCallTerminator (
+                    callee: mir.direct_function_callee(function),
+                    args: self.lowerer.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: mir.local_place(
+                        mir.MirLocalId.from_index(result_local),
+                        self.lowerer.output.empty_projection()
+                    ),
+                    target: mir.MirBlockId.from_index(target_index),
+                    initialized_place: null,
+                    unique_places: self.lowerer.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    () add_cancel_handler_shim_mir(
+        self,
+        qid.DefId shim_def,
+        Int function_index,
+        mir.MirBody body,
+        token.Span span
+    ) {
+        self.lowerer.output.add_function(mir.MirFunction (
+            id: mir.MirFunctionId.from_index(function_index),
+            def_id: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: span,
+            body: body
+        ));
     }
 
     qid.DefId create_cancellable_cancel_shim_def(self, qid.TypeId subject_type, token.Span span) {
@@ -11948,6 +12152,18 @@ struct BodyLowerer: Movable {
             self.lower_builtin_assert(node_id, call);
             return;
         }
+        if (self.is_coroutine_suspend_def(target_def)) {
+            self.lower_coroutine_suspend(node_id, call, destination);
+            return;
+        }
+        if (self.is_continuation_resume_def(target_def)) {
+            self.lower_continuation_resume(node_id, call, destination);
+            return;
+        }
+        if (self.is_continuation_on_cancel_def(target_def)) {
+            self.lower_continuation_on_cancel(node_id, call, destination);
+            return;
+        }
         qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.callee, target_def);
         comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.callee, target_def);
         qid.TypeId function_type = self.function_type_for_ref(target_def, type_args, const_args);
@@ -11988,6 +12204,719 @@ struct BodyLowerer: Movable {
             cleanup: null
         )), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    Bool is_coroutine_suspend_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.coroutine_suspend
+            is .some(suspend_def) else { return false; }
+        return target_def == suspend_def;
+    }
+
+    Bool is_continuation_resume_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.continuation_resume
+            is .some(resume_def) else { return false; }
+        return target_def == resume_def;
+    }
+
+    Bool is_continuation_on_cancel_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.continuation_on_cancel
+            is .some(on_cancel_def) else { return false; }
+        return target_def == on_cancel_def;
+    }
+
+    () lower_coroutine_suspend(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call,
+        mir.MirPlace destination
+    ) {
+        guard call.args.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        hir.HirId registration_id = call.args[0].value;
+        qid.TypeId registration_type = self.type_for_node(registration_id);
+        types.TypeInfo registration_info = self.lowerer.ctx.store.types.get(registration_type);
+        guard registration_info.data is .function_type(registration_fn) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard registration_fn.params.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.lower_coroutine_suspend_registration(
+            node_id,
+            registration_id,
+            registration_type,
+            registration_fn.params[0],
+            destination
+        );
+    }
+
+    () lower_coroutine_suspend_registration(
+        self,
+        hir.HirId node_id,
+        hir.HirId registration_id,
+        qid.TypeId registration_type,
+        qid.TypeId continuation_type,
+        mir.MirPlace destination
+    ) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirSuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
+            self.mir_place_type(destination), span
+        );
+        mir.MirLocalId record_local = self.add_temp(layout.type_id, span);
+        mir.MirPlace record = self.place_for_local(record_local);
+        self.initialize_suspend_continuation(layout, record, destination, span);
+        self.check_cancellation_before_suspend_registration(record, layout, span);
+        mir.MirLocalId continuation_local = self.add_temp(continuation_type, span);
+        mir.MirPlace continuation = self.place_for_local(continuation_local);
+        self.initialize_suspend_handle(layout, record, continuation, span);
+        mir.MirLocalId registration_local = self.add_temp(registration_type, span);
+        mir.MirPlace registration = self.place_for_local(registration_local);
+        self.lower_into_place(registration_id, registration);
+        self.call_suspend_registration(registration, continuation, span);
+    }
+
+    () check_cancellation_before_suspend_registration(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirTaskStateLayout state = self.current_task_state_layout();
+        mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
+        mir.MirPlace task = self.project_deref(pointer, true);
+        mir.MirPlace request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancellation_requested
+        );
+        mir.MirLocalId requested = self.add_temp(self.mir_place_type(request), span);
+        self.push_assign(
+            self.place_for_local(requested),
+            mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: request)),
+            span
+        );
+        mir.MirBlockId cancelled = self.reserve_block(span);
+        mir.MirBlockId registration = self.reserve_block(span);
+        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(1);
+        cases.add(mir.MirSwitchCase (
+            value: self.int_const(1, span),
+            target: cancelled
+        ));
+        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(requested)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: registration
+        )), span);
+        self.start_block(cancelled);
+        self.clear_suspend_registration_target(record, layout, span);
+        mir.MirBlockId parked = self.reserve_block(span);
+        self.call_suspend_resume(record, layout, parked, span);
+        self.start_block(parked);
+        self.finish_block(mir.suspend_pending_terminator_kind(mir.MirSuspendPendingTerminator (
+            task: null,
+            target: parked
+        )), span);
+        self.start_block(registration);
+    }
+
+    () clear_suspend_registration_target(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirPlace word = self.project_deref(
+            self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+            true
+        );
+        mir.MirLocalId cleared = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(cleared),
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: word,
+                expected: mir.const_operand_value(self.int_const(3, span)),
+                desired: mir.const_operand_value(self.int_const(0, span))
+            )),
+            span
+        );
+    }
+
+    () initialize_suspend_continuation(
+        self,
+        mir.MirSuspendContinuationLayout layout,
+        mir.MirPlace record,
+        mir.MirPlace destination,
+        token.Span span
+    ) {
+        self.push_assign(
+            self.project_constant_index(record, layout.result_field_index),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: destination,
+                frame_root: false
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.context_field_index),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: self.place_for_local(self.return_local()),
+                frame_root: true
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.resume_field_index),
+            mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.function_operand_value(mir.MirFunctionRef (
+                    function_def: self.hir_def.def_id,
+                    type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+                    const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+                    coroutine_resume: true,
+                    coroutine_completion: false,
+                    type_id: self.lowerer.coroutine_continuation_type(
+                        self.lowerer.coroutine_context_pointer_type(span), span
+                    ),
+                    span: span
+                ))
+            )),
+            span
+        );
+        self.push_atomic_store(
+            self.project_constant_index(record, layout.resumed_field_index),
+            mir.const_operand_value(self.int_const(0, span)),
+            span
+        );
+        self.initialize_suspend_cancel_target(layout, record, span);
+    }
+
+    () initialize_suspend_cancel_target(
+        self,
+        mir.MirSuspendContinuationLayout layout,
+        mir.MirPlace record,
+        token.Span span
+    ) {
+        mir.MirTaskStateLayout state = self.current_task_state_layout();
+        mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
+        mir.MirPlace task = self.project_deref(pointer, true);
+        mir.MirPlace word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancel_target_word
+        );
+        mir.MirPlace request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancellation_requested
+        );
+        mir.MirPlace context = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancel_target_context
+        );
+        mir.MirPlace function = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancel_target_function
+        );
+        self.store_suspend_field_address(record, layout.cancel_request_pointer_field_index, request, span);
+        self.store_suspend_field_address(record, layout.cancel_word_pointer_field_index, word, span);
+        self.store_suspend_field_address(record, layout.cancel_context_pointer_field_index, context, span);
+        self.store_suspend_field_address(record, layout.cancel_function_pointer_field_index, function, span);
+        self.initialize_suspend_cancel_owner(task, state, span);
+        self.push_atomic_store(word, mir.const_operand_value(self.int_const(3, span)), span);
+    }
+
+    () store_suspend_field_address(
+        self,
+        mir.MirPlace record,
+        Int field_index,
+        mir.MirPlace value,
+        token.Span span
+    ) {
+        self.push_assign(
+            self.project_constant_index(record, field_index),
+            mir.address_of_rvalue(mir.MirAddressOfRvalue (
+                mutable_pointer: true,
+                place: value
+            )),
+            span
+        );
+    }
+
+    () initialize_suspend_cancel_owner(
+        self,
+        mir.MirPlace task,
+        mir.MirTaskStateLayout state,
+        token.Span span
+    ) {
+        self.push_assign(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.output, task, state.cancel_target_frame
+            ),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: self.place_for_local(self.return_local()),
+                frame_root: true
+            )),
+            span
+        );
+        self.push_assign(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.output, task, state.cancel_target_resume
+            ),
+            mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.function_operand_value(mir.MirFunctionRef (
+                    function_def: self.hir_def.def_id,
+                    type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+                    const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+                    coroutine_resume: true,
+                    coroutine_completion: false,
+                    type_id: state.cancel_target_resume.type_id,
+                    span: span
+                ))
+            )),
+            span
+        );
+        self.push_assign(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.output, task, state.cancel_target_domain_id
+            ),
+            mir.current_domain_rvalue(mir.MirCurrentDomainRvalue (domain_kind: false)),
+            span
+        );
+        self.push_assign(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.output, task, state.cancel_target_domain_kind
+            ),
+            mir.current_domain_rvalue(mir.MirCurrentDomainRvalue (domain_kind: true)),
+            span
+        );
+    }
+
+    () initialize_suspend_handle(
+        self,
+        mir.MirSuspendContinuationLayout layout,
+        mir.MirPlace record,
+        mir.MirPlace continuation,
+        token.Span span
+    ) {
+        mir.MirLocalId pointer = self.add_temp(layout.pointer_type_id, span);
+        mir.MirPlace pointer_place = self.place_for_local(pointer);
+        self.push_assign(
+            pointer_place,
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: record,
+                frame_root: false
+            )),
+            span
+        );
+        mir.MirPlace state = self.project_constant_index(continuation, 0);
+        self.push_assign(
+            state,
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.ptr_to_int,
+                value: self.operand_for_place(pointer_place),
+                target_type: self.mir_place_type(state)
+            )),
+            span
+        );
+    }
+
+    () call_suspend_registration(
+        self,
+        mir.MirPlace registration,
+        mir.MirPlace continuation,
+        token.Span span
+    ) {
+        mir.MirPlace vtable = self.project_deref(
+            self.project_constant_index(registration, 1), true
+        );
+        mir.MirPlace function = self.project_constant_index(vtable, 0);
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(2);
+        args.add(self.operand_for_place(self.project_constant_index(registration, 0)));
+        args.add(self.operand_for_place(continuation));
+        mir.MirLocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        mir.MirBlockId next = self.reserve_block(span);
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.indirect_operand_callee(self.operand_for_place(function)),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: true,
+            destination: self.place_for_local(result),
+            target: next,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next);
+    }
+
+    () lower_continuation_resume(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call,
+        mir.MirPlace destination
+    ) {
+        guard call.args.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.call_member_receiver(call) is .some(receiver_id) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.hir_span(node_id);
+        hir.HirId value_id = call.args[0].value;
+        mir.MirSuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
+            self.type_for_node(value_id), span
+        );
+        mir.MirPlace record = self.suspend_record_for_receiver(receiver_id, layout, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+        self.resume_suspend_record(value_id, record, layout, span);
+    }
+
+    () lower_continuation_on_cancel(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call,
+        mir.MirPlace destination
+    ) {
+        guard call.args.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.call_member_receiver(call) is .some(receiver_id) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        hir.HirId handler_id = call.args[0].value;
+        hir.HirNode handler_node = self.lowerer.hirs.node(handler_id);
+        guard handler_node.data is .lambda_expr(handler) else {
+            self.mark_unsupported(handler_id);
+            return;
+        }
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId result_type = self.continuation_result_type(receiver_id);
+        mir.MirSuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
+            result_type, span
+        );
+        mir.MirPlace record = self.suspend_record_for_receiver(receiver_id, layout, span);
+        self.register_suspend_cancel_handler(handler_id, handler, record, layout, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+    }
+
+    qid.TypeId continuation_result_type(self, hir.HirId receiver_id) {
+        qid.TypeId! type_id = self.type_for_node(receiver_id);
+        types.TypeInfo! info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            type_id = handle.element;
+            info = self.lowerer.ctx.store.types.get(type_id);
+        }
+        guard info.data is .named(named) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        guard named.type_args.length == 1 else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        return self.lowerer.substitute_type(named.type_args[0], self.substitutions);
+    }
+
+    () register_suspend_cancel_handler(
+        self,
+        hir.HirId handler_id,
+        hir.HirLambda handler,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirOperand context = self.heap_lambda_env_operand(handler_id, handler, null, span);
+        mir.MirFunctionRef drop = self.cancel_handler_drop_function(handler_id, handler, span);
+        mir.MirFunctionRef invoke = self.ensure_cancel_handler_shim(
+            handler_id, handler, drop, span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.handler_context_field_index),
+            mir.use_rvalue(mir.MirUseRvalue (value: context)),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.handler_drop_field_index),
+            mir.use_rvalue(mir.MirUseRvalue (value: mir.function_operand_value(drop))),
+            span
+        );
+        self.push_assign(
+            self.project_deref(
+                self.project_constant_index(record, layout.cancel_context_pointer_field_index),
+                true
+            ),
+            mir.use_rvalue(mir.MirUseRvalue (value: context)),
+            span
+        );
+        self.push_assign(
+            self.project_deref(
+                self.project_constant_index(record, layout.cancel_function_pointer_field_index),
+                true
+            ),
+            mir.use_rvalue(mir.MirUseRvalue (value: mir.function_operand_value(invoke))),
+            span
+        );
+        self.push_atomic_store(
+            self.project_deref(
+                self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+                true
+            ),
+            mir.const_operand_value(self.int_const(1, span)),
+            span
+        );
+        self.invoke_suspend_cancel_handler_if_requested(record, layout, span);
+    }
+
+    () invoke_suspend_cancel_handler_if_requested(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirPlace request = self.project_deref(
+            self.project_constant_index(record, layout.cancel_request_pointer_field_index),
+            true
+        );
+        mir.MirLocalId requested = self.add_temp(self.mir_place_type(request), span);
+        self.push_assign(
+            self.place_for_local(requested),
+            mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: request)),
+            span
+        );
+        mir.MirBlockId invoke = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(1);
+        cases.add(mir.MirSwitchCase (value: self.int_const(1, span), target: invoke));
+        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(requested)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: complete
+        )), span);
+        self.start_block(invoke);
+        self.invoke_suspend_cancel_handler(record, layout, span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    () invoke_suspend_cancel_handler(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirPlace word = self.project_deref(
+            self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+            true
+        );
+        mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: word,
+                expected: mir.const_operand_value(self.int_const(1, span)),
+                desired: mir.const_operand_value(self.int_const(2, span))
+            )),
+            span
+        );
+        mir.MirBlockId invoke = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: invoke,
+            else_target: complete
+        )), span);
+        self.start_block(invoke);
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+        args.add(self.operand_for_place(self.project_deref(
+            self.project_constant_index(record, layout.cancel_context_pointer_field_index),
+            true
+        )));
+        mir.MirLocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.indirect_operand_callee(self.operand_for_place(self.project_deref(
+                self.project_constant_index(record, layout.cancel_function_pointer_field_index),
+                true
+            ))),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(complete);
+    }
+
+    mir.MirFunctionRef cancel_handler_drop_function(
+        self,
+        hir.HirId handler_id,
+        hir.HirLambda handler,
+        token.Span span
+    ) {
+        qid.DefId! drop_def = self.ensure_closure_noop_drop_shim(span);
+        if (self.lowerer.typeck.lambda_capture_infos(handler.function_def) is .some(captures)) {
+            if (captures.length > 0) {
+                qid.TypeId env_type = self.lambda_env_type_for_infos(handler.function_def, captures, span);
+                drop_def = self.ensure_lambda_env_drop_shim(handler_id, env_type, true);
+            }
+        }
+        return mir.MirFunctionRef (
+            function_def: drop_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.lowerer.task_resume_function_type(span),
+            span: span
+        );
+    }
+
+    hir.HirId? call_member_receiver(self, hir.HirCall call) {
+        hir.HirNode callee = self.lowerer.hirs.node(call.callee);
+        guard callee.data is .member_access(member_access) else { return null; }
+        return member_access.base;
+    }
+
+    mir.MirPlace suspend_record_for_receiver(
+        self,
+        hir.HirId receiver_id,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirPlace! receiver = self.receiver_source_place(receiver_id, span);
+        if (self.type_is_reference(self.mir_place_type(receiver))) {
+            receiver = self.project_deref(receiver, false);
+        }
+        mir.MirPlace state = self.project_constant_index(receiver, 0);
+        mir.MirLocalId pointer = self.add_temp(layout.pointer_type_id, span);
+        mir.MirPlace pointer_place = self.place_for_local(pointer);
+        self.push_assign(
+            pointer_place,
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.int_to_ptr,
+                value: self.operand_for_place(state),
+                target_type: layout.pointer_type_id
+            )),
+            span
+        );
+        return self.project_deref(pointer_place, true);
+    }
+
+    () resume_suspend_record(
+        self,
+        hir.HirId value_id,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: self.project_constant_index(record, layout.resumed_field_index),
+                expected: mir.const_operand_value(self.int_const(0, span)),
+                desired: mir.const_operand_value(self.int_const(1, span))
+            )),
+            span
+        );
+        mir.MirBlockId resume = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: resume,
+            else_target: complete
+        )), span);
+        self.start_block(resume);
+        self.clear_suspend_cancel_handler(record, layout, span);
+        mir.MirPlace result_pointer = self.project_constant_index(record, layout.result_field_index);
+        self.lower_into_place(value_id, self.project_deref(result_pointer, true));
+        self.call_suspend_resume(record, layout, complete, span);
+        self.start_block(complete);
+    }
+
+    () clear_suspend_cancel_handler(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        mir.MirPlace word = self.project_deref(
+            self.project_constant_index(record, layout.cancel_word_pointer_field_index), true
+        );
+        mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: word,
+                expected: mir.const_operand_value(self.int_const(1, span)),
+                desired: mir.const_operand_value(self.int_const(0, span))
+            )),
+            span
+        );
+        mir.MirBlockId drop = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: drop,
+            else_target: complete
+        )), span);
+        self.start_block(drop);
+        self.call_suspend_handler_drop(record, layout, complete, span);
+        self.start_block(complete);
+        self.clear_suspend_registration_target(record, layout, span);
+    }
+
+    () call_suspend_handler_drop(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        mir.MirBlockId complete,
+        token.Span span
+    ) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+        args.add(self.operand_for_place(
+            self.project_constant_index(record, layout.handler_context_field_index)
+        ));
+        mir.MirLocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.indirect_operand_callee(self.operand_for_place(
+                self.project_constant_index(record, layout.handler_drop_field_index)
+            )),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+    }
+
+    () call_suspend_resume(
+        self,
+        mir.MirPlace record,
+        mir.MirSuspendContinuationLayout layout,
+        mir.MirBlockId complete,
+        token.Span span
+    ) {
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+        args.add(self.operand_for_place(
+            self.project_constant_index(record, layout.context_field_index)
+        ));
+        mir.MirLocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.indirect_operand_callee(self.operand_for_place(
+                self.project_constant_index(record, layout.resume_field_index)
+            )),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
     }
 
     () lower_async_direct_call(
