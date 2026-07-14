@@ -101,6 +101,7 @@ struct MirLowerer: Movable {
     table.HashTable<TraitVTableGlobalKey, qid.DefId> trait_vtable_globals;
     table.HashTable<Int, qid.DefId> receiver_type_globals;
     table.HashTable<Int, qid.DefId> receiver_drop_shims;
+    table.HashTable<Int, qid.DefId> cancellable_cancel_shims;
     table.HashTable<Int, qid.DefId> raw_fn_to_fn_shims;
     table.HashTable<Int, qid.DefId> raw_fn_vtable_globals;
     table.HashTable<Int, qid.DefId> lambda_vtable_globals;
@@ -126,6 +127,7 @@ struct MirLowerer: Movable {
         self.trait_vtable_globals = table.HashTable<TraitVTableGlobalKey, qid.DefId>();
         self.receiver_type_globals = table.HashTable<Int, qid.DefId>();
         self.receiver_drop_shims = table.HashTable<Int, qid.DefId>();
+        self.cancellable_cancel_shims = table.HashTable<Int, qid.DefId>();
         self.raw_fn_to_fn_shims = table.HashTable<Int, qid.DefId>();
         self.raw_fn_vtable_globals = table.HashTable<Int, qid.DefId>();
         self.lambda_vtable_globals = table.HashTable<Int, qid.DefId>();
@@ -890,7 +892,7 @@ struct MirLowerer: Movable {
         locals[source_param_count + 1] = self.runtime_local(
             mir.MirLocalId.from_index(source_param_count + 1),
             .param,
-            self.external_async_continuation_pointer_type(function_type.result, span),
+            self.external_async_continuation_layout(function_type.result, span).pointer_type_id,
             span
         );
         return mir.MirBody (
@@ -913,17 +915,24 @@ struct MirLowerer: Movable {
         return self.ctx.store.types.function_type(params$.move(), self.ctx.store.types.unit_type(), span);
     }
 
-    qid.TypeId external_async_continuation_type(self, qid.TypeId result_type, token.Span span) {
+    mir.MirExternalContinuationLayout external_async_continuation_layout(
+        self,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
         qid.TypeId context_type = self.coroutine_context_pointer_type(span);
         list.ArrayList<qid.TypeId>! fields = list.ArrayList<qid.TypeId>(3);
         fields.add(self.ctx.store.types.raw_pointer_type(result_type, span));
         fields.add(context_type);
         fields.add(self.coroutine_continuation_type(context_type, span));
-        return self.ctx.store.types.tuple_type(fields$.move(), span);
-    }
-
-    qid.TypeId external_async_continuation_pointer_type(self, qid.TypeId result_type, token.Span span) {
-        return self.ctx.store.types.raw_pointer_type(self.external_async_continuation_type(result_type, span), span);
+        qid.TypeId type_id = self.ctx.store.types.tuple_type(fields$.move(), span);
+        return mir.MirExternalContinuationLayout (
+            type_id: type_id,
+            pointer_type_id: self.ctx.store.types.raw_pointer_type(type_id, span),
+            result_field_index: 0,
+            context_field_index: 1,
+            resume_field_index: 2
+        );
     }
 
     qid.TypeId external_async_abi_function_type(self, qid.TypeId source_type, token.Span span) {
@@ -937,7 +946,7 @@ struct MirLowerer: Movable {
             params.add(function_type.params[index]);
             index = index + 1;
         }
-        params.add(self.external_async_continuation_pointer_type(function_type.result, span));
+        params.add(self.external_async_continuation_layout(function_type.result, span).pointer_type_id);
         return self.ctx.store.types.function_type(params$.move(), self.ctx.store.types.unit_type(), span);
     }
 
@@ -1534,6 +1543,18 @@ struct MirLowerer: Movable {
             resume_function: self.add_task_state_field(
                 state_def, "resume_function", resume_function, span
             ),
+            cancellation_requested: self.add_task_state_field(
+                state_def, "cancellation_requested", int_type, span
+            ),
+            cancel_target_word: self.add_task_state_field(
+                state_def, "cancel_target_word", int_type, span
+            ),
+            cancel_target_context: self.add_task_state_field(
+                state_def, "cancel_target_context", raw_pointer, span
+            ),
+            cancel_target_function: self.add_task_state_field(
+                state_def, "cancel_target_function", resume_function, span
+            ),
             result: self.add_task_state_field(state_def, "result", result_type, span),
             result_drop: self.add_task_state_field(
                 state_def, "result_drop", resume_function, span
@@ -1554,13 +1575,10 @@ struct MirLowerer: Movable {
             waiter_domain_kind: self.add_task_state_field(
                 state_def, "waiter_domain_kind", int_type, span
             ),
-            cancellation_requested: self.add_task_state_field(
-                state_def, "cancellation_requested", int_type, span
-            ),
-            cancellation_child: self.add_task_state_field(
+            external_continuation: self.add_task_state_field(
                 state_def,
-                "cancellation_child",
-                self.ctx.store.types.raw_pointer_type(int_type, span),
+                "external_continuation",
+                self.external_async_continuation_layout(result_type, span).type_id,
                 span
             ),
             allocation_pointer: self.add_task_state_field(
@@ -1745,6 +1763,11 @@ struct MirLowerer: Movable {
 // BodyLowerer 负责把单个 HIR function body 转成 MIR CFG。
 // block id 先预留再回填，保证 branch/call 提前引用目标 block 时，
 // `MirBlockId.index` 仍然等于 `MirBody.blocks[index]`。
+struct CancellableTarget {
+    mir.MirRvalue context;
+    mir.MirOperand function;
+}
+
 struct BodyLowerer: Movable {
     MirLowerer& lowerer;
     mir.MirBodyId body_id;
@@ -5433,16 +5456,24 @@ struct BodyLowerer: Movable {
             state_index = state_index + 1;
         }
         self.push_task_result_drop_initializer(node_id, layout, task_place, span);
-        qid.TypeId continuation_type = self.lowerer.external_async_continuation_type(
-            layout.task_abi.result_type_id, span
+        mir.MirExternalContinuationLayout continuation_layout =
+            self.lowerer.external_async_continuation_layout(
+                layout.task_abi.result_type_id, span
+            );
+        mir.MirPlace continuation_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, layout.task_abi.external_continuation_field
         );
-        mir.MirLocalId continuation_local = self.add_temp(continuation_type, span);
-        mir.MirPlace continuation_place = self.place_for_local(continuation_local);
         self.initialize_external_task_continuation(
-            node_id, call, layout, task_place, continuation_place, span
+            node_id,
+            call,
+            layout,
+            task_place,
+            continuation_layout,
+            continuation_place,
+            span
         );
         mir.MirLocalId continuation_pointer = self.add_temp(
-            self.lowerer.external_async_continuation_pointer_type(layout.task_abi.result_type_id, span),
+            continuation_layout.pointer_type_id,
             span
         );
         self.push_assign(
@@ -5477,35 +5508,55 @@ struct BodyLowerer: Movable {
         hir.HirImplicitCall call,
         mir.MirCoroutineFrameLayout& layout,
         mir.MirPlace task_place,
+        mir.MirExternalContinuationLayout continuation_layout,
         mir.MirPlace continuation_place,
         token.Span span
     ) {
+        mir.MirRvalue context = mir.use_rvalue(mir.MirUseRvalue (
+            value: self.operand_for_place(self.project_constant_index(
+                task_place, layout.task_abi.handle_pointer_field_index
+            ))
+        ));
+        mir.MirOperand resume = mir.function_operand_value(
+            self.async_call_completion_function_ref(node_id, call, layout)$.some()
+        );
+        self.initialize_external_async_continuation(
+            continuation_layout,
+            continuation_place,
+            coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, layout.task_abi.result_field
+            ),
+            context,
+            resume,
+            span
+        );
+    }
+
+    () initialize_external_async_continuation(
+        self,
+        mir.MirExternalContinuationLayout layout,
+        mir.MirPlace continuation_place,
+        mir.MirPlace result_place,
+        mir.MirRvalue context,
+        mir.MirOperand resume,
+        token.Span span
+    ) {
         self.push_assign(
-            self.project_constant_index(continuation_place, 0),
+            self.project_constant_index(continuation_place, layout.result_field_index),
             mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
-                place: coroutine_task_abi.task_field_place(
-                    self.lowerer.output, task_place, layout.task_abi.result_field
-                ),
+                place: result_place,
                 frame_root: false
             )),
             span
         );
         self.push_assign(
-            self.project_constant_index(continuation_place, 1),
-            mir.use_rvalue(mir.MirUseRvalue (
-                value: self.operand_for_place(self.project_constant_index(
-                    task_place, layout.task_abi.handle_pointer_field_index
-                ))
-            )),
+            self.project_constant_index(continuation_place, layout.context_field_index),
+            context,
             span
         );
         self.push_assign(
-            self.project_constant_index(continuation_place, 2),
-            mir.use_rvalue(mir.MirUseRvalue (
-                value: mir.function_operand_value(
-                    self.async_call_completion_function_ref(node_id, call, layout)$.some()
-                )
-            )),
+            self.project_constant_index(continuation_place, layout.resume_field_index),
+            mir.use_rvalue(mir.MirUseRvalue (value: resume)),
             span
         );
     }
@@ -5864,7 +5915,7 @@ struct BodyLowerer: Movable {
         ));
         self.finish_block(self.goto_terminator(check_block), span);
         self.start_block(ready_block);
-        self.clear_current_task_cancellation_child(span);
+        self.clear_current_task_cancel_child(task_place, span);
     }
 
     () lower_atomic_task_waiter_registration(
@@ -5875,7 +5926,7 @@ struct BodyLowerer: Movable {
         token.Span span
     ) {
         mir.MirTaskStateLayout task_state = self.task_state_layout_for_task(task_place);
-        self.register_current_task_cancellation_child(task_place, task_state, span);
+        self.register_current_task_cancel_child(task_place, span);
         mir.MirPlace waiter_state = coroutine_task_abi.task_field_place(
             self.lowerer.output, task_place, task_state.waiter_registered
         );
@@ -5992,94 +6043,137 @@ struct BodyLowerer: Movable {
         mir.MirTaskStateLayout task_state,
         token.Span span
     ) {
-        mir.MirOperand request = mir.const_operand_value(self.int_const(1, span));
-        mir.MirPlace request_field = coroutine_task_abi.task_field_place(
-            self.lowerer.output, task_place, task_state.cancellation_requested
+        mir.MirPlace state_pointer = coroutine_task_abi.task_handle_pointer_place(
+            self.lowerer.output, task_place
         );
-        self.push_atomic_store(request_field, request, span);
-        mir.MirPlace child_field = coroutine_task_abi.task_field_place(
-            self.lowerer.output, task_place, task_state.cancellation_child
-        );
-        mir.MirLocalId sentinel = self.add_temp(self.mir_place_type(child_field), span);
+        self.request_task_cancellation_pointer(state_pointer, task_state, span);
+    }
+
+    () request_task_cancellation_pointer(
+        self,
+        mir.MirPlace start_pointer,
+        mir.MirTaskStateLayout task_state,
+        token.Span span
+    ) {
+        mir.MirLocalId current_pointer = self.add_temp(self.mir_place_type(start_pointer), span);
         self.push_assign(
-            self.place_for_local(sentinel),
-            mir.address_of_rvalue(mir.MirAddressOfRvalue (
-                mutable_pointer: true,
-                place: request_field
-            )),
+            self.place_for_local(current_pointer),
+            mir.use_rvalue(mir.MirUseRvalue (value: self.operand_for_place(start_pointer))),
             span
         );
+        mir.MirBlockId visit = self.reserve_block(span);
         mir.MirBlockId check = self.reserve_block(span);
         mir.MirBlockId claim = self.reserve_block(span);
-        mir.MirBlockId propagate = self.reserve_block(span);
+        mir.MirBlockId dispatch = self.reserve_block(span);
+        mir.MirBlockId invoke = self.reserve_block(span);
+        mir.MirBlockId descend = self.reserve_block(span);
         mir.MirBlockId complete = self.reserve_block(span);
+        self.finish_block(self.goto_terminator(visit), span);
+        self.start_block(visit);
+        mir.MirPlace current_state = self.project_deref(self.place_for_local(current_pointer), true);
+        mir.MirPlace request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, current_state, task_state.cancellation_requested
+        );
+        self.push_atomic_store(request, mir.const_operand_value(self.int_const(1, span)), span);
         self.finish_block(self.goto_terminator(check), span);
         self.start_block(check);
-        mir.MirLocalId child = self.add_temp(self.mir_place_type(child_field), span);
+        mir.MirPlace target_word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, current_state, task_state.cancel_target_word
+        );
+        mir.MirLocalId observed = self.add_temp(self.mir_place_type(target_word), span);
         self.push_assign(
-            self.place_for_local(child),
-            mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: child_field)),
+            self.place_for_local(observed),
+            mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: target_word)),
             span
         );
-        self.branch_on_non_null_pointer(self.place_for_local(child), claim, complete, span);
+        list.ArrayList<mir.MirSwitchCase>! inactive_cases = list.ArrayList<mir.MirSwitchCase>(2);
+        inactive_cases.add(mir.MirSwitchCase (value: self.int_const(0, span), target: complete));
+        inactive_cases.add(mir.MirSwitchCase (value: self.int_const(2, span), target: complete));
+        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(observed)),
+            cases: self.lowerer.output.switch_case_array(inactive_cases$.ref()),
+            default_target: claim
+        )), span);
         self.start_block(claim);
         mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
         self.push_assign(
             self.place_for_local(claimed),
             mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
-                place: child_field,
-                expected: self.operand_for_place(self.place_for_local(child)),
-                desired: self.operand_for_place(self.place_for_local(sentinel))
+                place: target_word,
+                expected: self.operand_for_place(self.place_for_local(observed)),
+                desired: mir.const_operand_value(self.int_const(2, span))
             )),
             span
         );
         self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
             condition: self.operand_for_place(self.place_for_local(claimed)),
-            then_target: propagate,
+            then_target: dispatch,
             else_target: check
         )), span);
-        self.start_block(propagate);
-        self.push_atomic_store(self.project_deref(self.place_for_local(child), true), request, span);
-        self.push_atomic_store(
-            child_field,
-            self.null_operand(self.mir_place_type(child_field), span),
+        self.start_block(dispatch);
+        list.ArrayList<mir.MirSwitchCase>! target_cases = list.ArrayList<mir.MirSwitchCase>(1);
+        target_cases.add(mir.MirSwitchCase (value: self.int_const(1, span), target: invoke));
+        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(observed)),
+            cases: self.lowerer.output.switch_case_array(target_cases$.ref()),
+            default_target: descend
+        )), span);
+        self.start_block(invoke);
+        mir.MirPlace function = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, current_state, task_state.cancel_target_function
+        );
+        mir.MirPlace context = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, current_state, task_state.cancel_target_context
+        );
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+        args.add(self.operand_for_place(context));
+        mir.MirLocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.indirect_operand_callee(self.operand_for_place(function)),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            unique_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(descend);
+        self.push_assign(
+            self.place_for_local(current_pointer),
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.int_to_ptr,
+                value: self.operand_for_place(self.place_for_local(observed)),
+                target_type: self.mir_place_type(self.place_for_local(current_pointer))
+            )),
             span
         );
-        self.finish_block(self.goto_terminator(complete), span);
+        self.finish_block(self.goto_terminator(visit), span);
         self.start_block(complete);
     }
 
-    () register_current_task_cancellation_child(
+    () register_current_task_cancel_child(
         self,
         mir.MirPlace child_task,
-        mir.MirTaskStateLayout child_state,
         token.Span span
     ) {
         mir.MirBlockId register = self.reserve_block(span);
         mir.MirBlockId complete = self.reserve_block(span);
-        self.branch_on_current_task_observed(register, complete, span);
-        self.start_block(register);
         mir.MirTaskStateLayout parent_state = self.current_task_state_layout();
-        mir.MirPlace parent_pointer = self.current_task_state_pointer(parent_state, span);
+        mir.MirPlace parent_pointer = self.current_task_cancellation_state_pointer(
+            parent_state, span
+        );
+        self.branch_on_non_null_pointer(parent_pointer, register, complete, span);
+        self.start_block(register);
         mir.MirPlace parent_value = self.project_deref(parent_pointer, true);
-        mir.MirPlace parent_child = coroutine_task_abi.task_state_field_place(
-            self.lowerer.output, parent_value, parent_state.cancellation_child
+        mir.MirPlace target_word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, parent_value, parent_state.cancel_target_word
         );
-        mir.MirPlace child_request = coroutine_task_abi.task_field_place(
-            self.lowerer.output, child_task, child_state.cancellation_requested
-        );
-        mir.MirLocalId child_pointer = self.add_temp(self.mir_place_type(parent_child), span);
-        self.push_assign(
-            self.place_for_local(child_pointer),
-            mir.address_of_rvalue(mir.MirAddressOfRvalue (
-                mutable_pointer: true,
-                place: child_request
-            )),
-            span
-        );
+        mir.MirPlace child_word = self.task_cancel_target_word(child_task, target_word, span);
         self.push_atomic_store(
-            parent_child,
-            self.operand_for_place(self.place_for_local(child_pointer)),
+            target_word,
+            self.operand_for_place(child_word),
             span
         );
         mir.MirPlace parent_request = coroutine_task_abi.task_state_field_place(
@@ -6100,84 +6194,61 @@ struct BodyLowerer: Movable {
             default_target: complete
         )), span);
         self.start_block(propagate);
-        self.push_atomic_store(
-            child_request,
-            mir.const_operand_value(self.int_const(1, span)),
+        self.request_task_cancellation_pointer(parent_pointer, parent_state, span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    () clear_current_task_cancel_child(
+        self,
+        mir.MirPlace child_task,
+        token.Span span
+    ) {
+        if (!self.current_effects.has_async) { return; }
+        mir.MirBlockId prepare = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        mir.MirTaskStateLayout state = self.current_task_state_layout();
+        mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
+        self.branch_on_non_null_pointer(pointer, prepare, complete, span);
+        self.start_block(prepare);
+        mir.MirPlace parent = self.project_deref(pointer, true);
+        mir.MirPlace target_word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, parent, state.cancel_target_word
+        );
+        mir.MirPlace child_word = self.task_cancel_target_word(child_task, target_word, span);
+        mir.MirLocalId cleared = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(cleared),
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: target_word,
+                expected: self.operand_for_place(child_word),
+                desired: mir.const_operand_value(self.int_const(0, span))
+            )),
             span
         );
         self.finish_block(self.goto_terminator(complete), span);
         self.start_block(complete);
     }
 
-    () clear_current_task_cancellation_child(self, token.Span span) {
-        if (!self.current_effects.has_async) { return; }
-        mir.MirBlockId prepare = self.reserve_block(span);
-        mir.MirBlockId check = self.reserve_block(span);
-        mir.MirBlockId claim = self.reserve_block(span);
-        mir.MirBlockId complete = self.reserve_block(span);
-        self.branch_on_current_task_observed(prepare, complete, span);
-        self.start_block(prepare);
-        mir.MirTaskStateLayout state = self.current_task_state_layout();
-        mir.MirPlace pointer = self.current_task_state_pointer(state, span);
-        mir.MirPlace parent = self.project_deref(pointer, true);
-        mir.MirPlace child_field = coroutine_task_abi.task_state_field_place(
-            self.lowerer.output, parent, state.cancellation_child
-        );
-        mir.MirPlace request_field = coroutine_task_abi.task_state_field_place(
-            self.lowerer.output, parent, state.cancellation_requested
-        );
-        mir.MirLocalId sentinel = self.add_temp(self.mir_place_type(child_field), span);
+    mir.MirPlace task_cancel_target_word(
+        self,
+        mir.MirPlace task,
+        mir.MirPlace target_word,
+        token.Span span
+    ) {
+        mir.MirLocalId encoded = self.add_temp(self.mir_place_type(target_word), span);
         self.push_assign(
-            self.place_for_local(sentinel),
-            mir.address_of_rvalue(mir.MirAddressOfRvalue (
-                mutable_pointer: true,
-                place: request_field
+            self.place_for_local(encoded),
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.ptr_to_int,
+                value: self.operand_for_place(coroutine_task_abi.task_handle_pointer_place(
+                    self.lowerer.output, task
+                )),
+                target_type: self.mir_place_type(target_word)
             )),
             span
         );
-        self.finish_block(self.goto_terminator(check), span);
-        self.start_block(check);
-        mir.MirLocalId child = self.add_temp(self.mir_place_type(child_field), span);
-        self.push_assign(
-            self.place_for_local(child),
-            mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: child_field)),
-            span
-        );
-        mir.MirLocalId available = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
-        self.push_assign(
-            self.place_for_local(available),
-            mir.binary_rvalue(mir.MirBinaryRvalue (
-                op: mir.MirBinaryOp.ne,
-                lhs: self.operand_for_place(self.place_for_local(child)),
-                rhs: self.operand_for_place(self.place_for_local(sentinel))
-            )),
-            span
-        );
-        mir.MirBlockId inspect = self.reserve_block(span);
-        self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
-            condition: self.operand_for_place(self.place_for_local(available)),
-            then_target: inspect,
-            else_target: check
-        )), span);
-        self.start_block(inspect);
-        self.branch_on_non_null_pointer(self.place_for_local(child), claim, complete, span);
-        self.start_block(claim);
-        mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
-        self.push_assign(
-            self.place_for_local(claimed),
-            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
-                place: child_field,
-                expected: self.operand_for_place(self.place_for_local(child)),
-                desired: self.null_operand(self.mir_place_type(child_field), span)
-            )),
-            span
-        );
-        self.finish_block(mir.branch_terminator_kind(mir.MirBranchTerminator (
-            condition: self.operand_for_place(self.place_for_local(claimed)),
-            then_target: complete,
-            else_target: check
-        )), span);
-        self.start_block(complete);
+        return self.place_for_local(encoded);
     }
 
     mir.MirTaskStateLayout current_task_state_layout(self) {
@@ -6185,7 +6256,7 @@ struct BodyLowerer: Movable {
         return self.task_state_layout_for_result(result);
     }
 
-    mir.MirPlace current_task_state_pointer(
+    mir.MirPlace current_task_cancellation_state_pointer(
         self,
         mir.MirTaskStateLayout state,
         token.Span span
@@ -6196,35 +6267,11 @@ struct BodyLowerer: Movable {
             self.place_for_local(pointer),
             mir.current_task_rvalue(mir.MirCurrentTaskRvalue (
                 observed: false,
-                cancellation_context: false
+                cancellation_context: true
             )),
             span
         );
         return self.place_for_local(pointer);
-    }
-
-    () branch_on_current_task_observed(
-        self,
-        mir.MirBlockId observed,
-        mir.MirBlockId unobserved,
-        token.Span span
-    ) {
-        mir.MirLocalId value = self.add_temp(self.lowerer.ctx.store.types.int_type(), span);
-        self.push_assign(
-            self.place_for_local(value),
-            mir.current_task_rvalue(mir.MirCurrentTaskRvalue (
-                observed: true,
-                cancellation_context: false
-            )),
-            span
-        );
-        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(1);
-        cases.add(mir.MirSwitchCase (value: self.int_const(1, span), target: observed));
-        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
-            discriminator: self.operand_for_place(self.place_for_local(value)),
-            cases: self.lowerer.output.switch_case_array(cases$.ref()),
-            default_target: unobserved
-        )), span);
     }
 
     () branch_on_non_null_pointer(
@@ -7355,6 +7402,158 @@ struct BodyLowerer: Movable {
             ))
         ));
         return mir.aggregate_static_value(self.lowerer.output.static_field_array(fields$.ref()));
+    }
+
+    mir.MirFunctionRef ensure_cancellable_cancel_shim(
+        self,
+        hir.HirId node_id,
+        qid.TypeId subject_type,
+        qid.TypeId receiver_type,
+        mir.MirFunctionRef cancel_function,
+        token.Span span
+    ) {
+        qid.DefId shim_def;
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.cancellable_cancel_shims$.ref(), subject_type.to_index()
+        ) is .some(existing)) {
+            shim_def = existing;
+        } else {
+            shim_def = self.create_cancellable_cancel_shim_def(subject_type, span);
+            self.lowerer.cancellable_cancel_shims.set(subject_type.to_index(), shim_def);
+            self.add_cancellable_cancel_shim_function(
+                shim_def, receiver_type, cancel_function, span
+            );
+        }
+        return mir.MirFunctionRef (
+            function_def: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.lowerer.task_resume_function_type(span),
+            span: self.lowerer.hir_span(node_id)
+        );
+    }
+
+    qid.DefId create_cancellable_cancel_shim_def(self, qid.TypeId subject_type, token.Span span) {
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.hir_def.def_id);
+        std.String name = build_text_int("__cancellable_cancel_", subject_type.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    () add_cancellable_cancel_shim_function(
+        self,
+        qid.DefId shim_def,
+        qid.TypeId receiver_type,
+        mir.MirFunctionRef cancel_function,
+        token.Span span
+    ) {
+        Int function_index = self.lowerer.output.functions.len();
+        qid.TypeId raw_pointer = self.lowerer.ctx.store.types.raw_pointer_type(
+            self.lowerer.ctx.store.types.uint8_type(), span
+        );
+        list.ArrayList<mir.MirLocalDecl>! locals = list.ArrayList<mir.MirLocalDecl>(3);
+        locals.add(self.receiver_drop_local(
+            0, .return_place, self.lowerer.ctx.store.types.unit_type(), span
+        ));
+        locals.add(self.receiver_drop_local(1, .param, raw_pointer, span));
+        locals.add(self.receiver_drop_local(2, .compiler_temp, receiver_type, span));
+        mir.MirPlace receiver = mir.local_place(
+            mir.MirLocalId.from_index(2), self.lowerer.output.empty_projection()
+        );
+        list.ArrayList<mir.MirStatement>! statements = list.ArrayList<mir.MirStatement>(1);
+        statements.add(mir.MirStatement (
+            span: span,
+            kind: mir.assign_statement_kind(mir.MirAssignStatement (
+                destination: receiver,
+                value: mir.cast_rvalue(mir.MirCastRvalue (
+                    kind: mir.MirCastKind.ptr_to_ptr,
+                    value: mir.copy_operand_value(mir.MirCopyOperand (
+                        place: self.receiver_drop_param_place()
+                    )),
+                    target_type: receiver_type
+                ))
+            ))
+        ));
+        list.ArrayList<mir.MirOperand>! args = list.ArrayList<mir.MirOperand>(1);
+        args.add(mir.copy_operand_value(mir.MirCopyOperand (place: receiver)));
+        list.ArrayList<mir.MirBlock>! blocks = list.ArrayList<mir.MirBlock>(2);
+        blocks.add(mir.MirBlock (
+            id: mir.MirBlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements$.ref()),
+            terminator: mir.MirTerminator (
+                span: span,
+                kind: mir.call_terminator_kind(mir.MirCallTerminator (
+                    callee: mir.direct_function_callee(cancel_function),
+                    args: self.lowerer.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: mir.local_place(
+                        mir.MirLocalId.from_index(0), self.lowerer.output.empty_projection()
+                    ),
+                    target: mir.MirBlockId.from_index(1),
+                    initialized_place: null,
+                    unique_places: self.lowerer.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        ));
+        blocks.add(mir.MirBlock (
+            id: mir.MirBlockId.from_index(1),
+            span: span,
+            statements: self.lowerer.output.empty_statements(),
+            terminator: self.receiver_drop_return_terminator(span)
+        ));
+        mir.MirBody body = mir.MirBody (
+            id: mir.MirBodyId.from_index(function_index),
+            span: span,
+            locals: self.freeze_generated_locals(locals$.ref()),
+            blocks: self.lowerer.output.block_array(blocks$.ref()),
+            entry: mir.MirBlockId.from_index(0),
+            return_local: mir.MirLocalId.from_index(0)
+        );
+        self.lowerer.output.add_function(mir.MirFunction (
+            id: mir.MirFunctionId.from_index(function_index),
+            def_id: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: span,
+            body: body
+        ));
+    }
+
+    mir.MirLocalDecl[]& freeze_generated_locals(
+        self,
+        list.ArrayList<mir.MirLocalDecl>& locals
+    ) {
+        mir.MirLocalDecl![*] stored = self.lowerer.output.alloc_local_array(locals.len());
+        Int! index = 0;
+        while (index < locals.len()) {
+            stored[index] = locals.get(index);
+            index = index + 1;
+        }
+        return stored[0..locals.len()];
     }
 
     qid.DefId ensure_receiver_drop_shim(self, hir.HirId node_id, qid.TypeId subject_type) {
@@ -11723,6 +11922,7 @@ struct BodyLowerer: Movable {
         }
         if (function.is_external && self.current_effects.has_async) {
             self.lower_external_async_continuation_call(
+                node_id,
                 target_def,
                 type_args,
                 const_args,
@@ -11787,6 +11987,7 @@ struct BodyLowerer: Movable {
 
     () lower_external_async_continuation_call(
         self,
+        hir.HirId node_id,
         qid.DefId target_def,
         qid.TypeId[]& type_args,
         comptime_value.ComptimeValue[]& const_args,
@@ -11794,46 +11995,39 @@ struct BodyLowerer: Movable {
         mir.MirPlace destination,
         token.Span span
     ) {
+        Bool cancellable_target = self.register_current_cancellable_target(node_id, span);
         qid.TypeId context_type = self.lowerer.coroutine_context_pointer_type(span);
         qid.TypeId continuation_type = self.lowerer.coroutine_continuation_type(context_type, span);
-        qid.TypeId continuation_record_type = self.lowerer.external_async_continuation_type(
-            self.mir_place_type(destination), span
-        );
-        mir.MirLocalId continuation_record = self.add_temp(continuation_record_type, span);
+        mir.MirExternalContinuationLayout continuation_layout =
+            self.lowerer.external_async_continuation_layout(
+                self.mir_place_type(destination), span
+            );
+        mir.MirLocalId continuation_record = self.add_temp(continuation_layout.type_id, span);
         mir.MirPlace continuation_place = self.place_for_local(continuation_record);
-        self.push_assign(
-            self.project_constant_index(continuation_place, 0),
-            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
-                place: destination,
-                frame_root: false
-            )),
-            span
-        );
-        self.push_assign(
-            self.project_constant_index(continuation_place, 1),
+        mir.MirRvalue context =
             mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
                 place: self.place_for_local(self.return_local()),
                 frame_root: true
-            )),
-            span
-        );
-        self.push_assign(
-            self.project_constant_index(continuation_place, 2),
-            mir.use_rvalue(mir.MirUseRvalue (
-                value: mir.function_operand_value(mir.MirFunctionRef (
-                    function_def: self.hir_def.def_id,
-                    type_args: self.lowerer.output.type_arg_array(self.function_type_args),
-                    const_args: self.lowerer.output.const_arg_array(self.function_const_args),
-                    coroutine_resume: true,
-                    coroutine_completion: false,
-                    type_id: continuation_type,
-                    span: span
-                ))
-            )),
+            ));
+        mir.MirOperand resume = mir.function_operand_value(mir.MirFunctionRef (
+            function_def: self.hir_def.def_id,
+            type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+            const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+            coroutine_resume: true,
+            coroutine_completion: false,
+            type_id: continuation_type,
+            span: span
+        ));
+        self.initialize_external_async_continuation(
+            continuation_layout,
+            continuation_place,
+            destination,
+            context,
+            resume,
             span
         );
         mir.MirLocalId continuation_pointer = self.add_temp(
-            self.lowerer.external_async_continuation_pointer_type(self.mir_place_type(destination), span),
+            continuation_layout.pointer_type_id,
             span
         );
         self.push_assign(
@@ -11875,6 +12069,9 @@ struct BodyLowerer: Movable {
             cleanup: null
         )), span);
         self.start_block(next_block);
+        if (cancellable_target) {
+            self.clear_current_cancellable_target(span);
+        }
     }
 
     () lower_async_direct_continuation_call(
@@ -11952,6 +12149,160 @@ struct BodyLowerer: Movable {
             cleanup: null
         )), span);
         self.start_block(next_block);
+    }
+
+    Bool register_current_cancellable_target(self, hir.HirId node_id, token.Span span) {
+        guard self.current_cancellable_cancel_target(node_id, span) is .some(target) else {
+            return false;
+        }
+        mir.MirBlockId register = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        mir.MirTaskStateLayout state = self.current_task_state_layout();
+        mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
+        self.branch_on_non_null_pointer(pointer, register, complete, span);
+        self.start_block(register);
+        mir.MirPlace task = self.project_deref(pointer, true);
+        mir.MirPlace context = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancel_target_context
+        );
+        self.push_assign(context, target.context, span);
+        self.push_assign(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.output, task, state.cancel_target_function
+            ),
+            mir.use_rvalue(mir.MirUseRvalue (value: target.function)),
+            span
+        );
+        self.push_atomic_store(
+            coroutine_task_abi.task_state_field_place(
+                self.lowerer.output, task, state.cancel_target_word
+            ),
+            mir.const_operand_value(self.int_const(1, span)),
+            span
+        );
+        mir.MirPlace request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancellation_requested
+        );
+        mir.MirLocalId requested = self.add_temp(self.mir_place_type(request), span);
+        self.push_assign(
+            self.place_for_local(requested),
+            mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: request)),
+            span
+        );
+        mir.MirBlockId invoke = self.reserve_block(span);
+        list.ArrayList<mir.MirSwitchCase>! cases = list.ArrayList<mir.MirSwitchCase>(1);
+        cases.add(mir.MirSwitchCase (value: self.int_const(1, span), target: invoke));
+        self.finish_block(mir.switch_terminator_kind(mir.MirSwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(requested)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: complete
+        )), span);
+        self.start_block(invoke);
+        self.request_task_cancellation_pointer(pointer, state, span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+        return true;
+    }
+
+    () clear_current_cancellable_target(self, token.Span span) {
+        mir.MirBlockId clear = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        mir.MirTaskStateLayout state = self.current_task_state_layout();
+        mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
+        self.branch_on_non_null_pointer(pointer, clear, complete, span);
+        self.start_block(clear);
+        mir.MirPlace task = self.project_deref(pointer, true);
+        mir.MirLocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.output, task, state.cancel_target_word
+                ),
+                expected: mir.const_operand_value(self.int_const(1, span)),
+                desired: mir.const_operand_value(self.int_const(0, span))
+            )),
+            span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    CancellableTarget? current_cancellable_cancel_target(
+        self,
+        hir.HirId node_id,
+        token.Span span
+    ) {
+        guard self.current_receiver_local() is .some(receiver_local) else { return null; }
+        qid.TypeId receiver_type = self.locals.get(receiver_local.to_index()).type_id;
+        qid.TypeId subject_type = self.trait_ref_subject_type(receiver_type);
+        guard self.cancellable_cancel_member(subject_type) is .some(cancel_member) else { return null; }
+        guard self.trait_vtable_function_ref(node_id, subject_type, cancel_member)
+            is .some(cancel_function) else {
+            return null;
+        }
+        mir.MirFunctionRef shim = self.ensure_cancellable_cancel_shim(
+            node_id, subject_type, receiver_type, cancel_function, span
+        );
+        qid.TypeId raw_pointer = self.lowerer.ctx.store.types.raw_pointer_type(
+            self.lowerer.ctx.store.types.uint8_type(), span
+        );
+        return CancellableTarget (
+            context: mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.ptr_to_ptr,
+                value: self.operand_for_place(self.place_for_local(receiver_local)),
+                target_type: raw_pointer
+            )),
+            function: mir.function_operand_value(shim)
+        );
+    }
+
+    mir.MirLocalId? current_receiver_local(self) {
+        guard self.hir_def.decl.function_signature is .some(signature) else { return null; }
+        if (!signature.has_receiver) { return null; }
+        qid.SymbolId self_symbol = self.lowerer.ctx.store.symbols.intern("self");
+        Int! index = 1;
+        while (index < self.locals.len()) {
+            mir.MirLocalDecl local = self.locals.get(index);
+            if (local.name is .some(name)) {
+                if (name == self_symbol) { return local.id; }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.DefId? cancellable_cancel_member(self, qid.TypeId subject_type) {
+        guard self.lowerer.ctx.store.resolve.core_traits.cancellable_trait
+            is .some(cancellable_trait) else {
+            return null;
+        }
+        if (!self.type_directly_declares_trait(subject_type, cancellable_trait)) { return null; }
+        qid.SymbolId cancel_symbol = self.lowerer.ctx.store.symbols.intern("cancel");
+        guard self.trait_member_for_symbol(cancellable_trait, cancel_symbol)
+            is .some(cancel_member) else {
+            return null;
+        }
+        guard self.impl_member_for_trait_type(subject_type, cancel_member) is .some(_) else {
+            return null;
+        }
+        return cancel_member;
+    }
+
+    Bool type_directly_declares_trait(self, qid.TypeId subject_type, qid.DefId trait_def) {
+        guard self.namespace_provider_def_for_type(subject_type) is .some(type_def) else {
+            return false;
+        }
+        guard self.lowerer.hirs.def(type_def) is .some(hir_def) else { return false; }
+        Int! index = 0;
+        while (index < hir_def.trait_refs.len()) {
+            hir.HirNode node = self.lowerer.hirs.node(hir_def.trait_refs.get(index));
+            if (node.data is .named_type_ref(named)) {
+                if (named.def_id == trait_def) { return true; }
+            }
+            index = index + 1;
+        }
+        return false;
     }
 
     () lower_async_operands_into_frame(
