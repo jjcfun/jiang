@@ -200,10 +200,13 @@ observed Task 的 task 和 observer 各持有一次 ownership。`await()` 消费
 
 当前实现覆盖 cancel-before-start 和自然恢复边界：observed Task frame 在 resume dispatch 前用 CAS 将
 request 从 requested claim 为 cancelling，并从 cancellation entry 进入 drop elaboration 生成的清理链。
-挂起的 Task 暂不主动取消 child 或 extern operation；它们自然完成并恢复 parent 后，parent 才执行取消
-unwind。主动 child propagation 和 extern async cancel acknowledgement 仍是后续工作。
-cancellation cleanup 只为 drop elaboration 管理的 parameter/user local 合成 storage boundary，不为
-compiler temp 伪造 marker；extern continuation record 等跨 suspend temp 仍由 liveness 放入 frame。
+parent 挂起于显式 `child.await()` 时，会把 child request 注册到 parent task-state；取消 parent
+会先请求
+取消 child，parent 只在 child terminal acknowledgement 恢复后进入自身 unwind。隐式 async call 和
+extern operation 的主动取消仍是后续工作。
+cancellation cleanup 统一释放已初始化的 body-local Task observer，再为 drop elaboration 管理的
+parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，extern continuation record 等
+跨 suspend temp 仍由 liveness 放入 frame。
 
 Task 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
 coroutine frame 转移。Task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Task

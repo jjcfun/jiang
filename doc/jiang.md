@@ -965,7 +965,8 @@ async Int load_both() {
 `async { ... }` 创建 block Task；`async [WorkerDomain] { ... }` 同时指定 execution domain。
 `Task<T>` 只能作为函数 body 内的局部值，不能出现在参数、返回类型、字段或 public ABI 中，也不能
 显式写 domain 参数。`task.await()` 与 `task.cancel()` 都消费 Task，只能选择一个；`cancel()` 等待 Task
-进入终态后返回。Task 未被消费就离开作用域表示 detach，不会隐式请求取消。
+进入终态后返回。若 Task 正在等待显式 child Task，取消会传播到 child，并在 child 进入终态后继续
+清理 parent。Task 未被消费就离开作用域表示 detach，不会隐式请求取消。
 
 ### 控制流（Control Flow）
 
