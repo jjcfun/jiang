@@ -33,7 +33,7 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 ## Domain 能力
 
 语言核心只认识抽象 capability，不内建 `UiDomain`、`WorkerDomain` 这类具体 domain。
-0.4.6 使用单一 `Domain` trait，并用 `const` 约束形式的 associated item 表示 domain
+0.4.7 使用单一 `Domain` trait，并用 `const` 约束形式的 associated item 表示 domain
 执行语义，避免 `Domain<.serial>` / `Domain<.concurrent>` 这种 generic 形式带来的多重实现问题：
 
 ```jiang
@@ -295,15 +295,14 @@ async () foo(T!& x) {
 - `async {}` / `sync {}` 只有外层已有 current domain 时可省略 domain，并继承 current。
 - `async [D] {}` 创建 task，是显式 domain 入口；如果 domain type `D` 不等于 current，
   则是 domain 切换边界。
-- `sync [D] {}` 从普通同步世界阻塞进入 domain type `D`，也可以在已有 current domain 中
-  显式切到 `D`。
+- 普通同步函数中的最外层 `sync [D] {}` 阻塞调用线程，进入 runtime 并等待 block 完成。
+- async context 中的 `sync [D] {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
+  block，完成后回到进入前的 domain；它不创建用户可见 Task，也不阻塞 worker thread。
 - `task.await()` 不把 caller 留在 Task 的 execution domain；完成后 caller 回到等待方 current domain。
 
-async 函数或 async block 内的 `sync [D] {}` 必须能静态证明 `D` 与 current domain 不同。
-domain-neutral async 函数的 current domain 运行时才确定，因此也不能在其中使用静态 `sync [D]`。
-同一 serial domain 的 sync wait 会占住该 domain 的执行权，使等待中的 continuation 无法恢复；在
-concurrent domain 中也会无谓阻塞 worker。需要继续异步执行时应直接调用 async 函数或使用 async block。
-能静态证明跨 domain 的 `sync [OtherDomain] {}` 暂不由这条规则禁止。
+async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` 直接执行 block；只有跨 Domain
+时才 enqueue 和挂起。domain-neutral async 函数也允许使用静态 `sync [D]`；当前可以保守 enqueue，
+后续再根据 frame 中的 current domain 增加运行时同 Domain fast path。
 
 跨 domain 时的能力检查：
 
@@ -314,8 +313,8 @@ concurrent domain 中也会无谓阻塞 worker。需要继续异步执行时应�
 - `T*` / `T[*]`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
 
-`sync [D] {}` 即使会阻塞等待，也不能把外层其他 domain 的普通 `T!&` 带入 `D`。阻塞只保证
-caller 等待 block 结束，不给普通引用增加跨 domain 同步语义。
+`sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T!&` 带入 `D`。
+等待不为普通引用增加跨 domain 同步语义。
 
 ## Task 与结构化并发
 
@@ -461,8 +460,29 @@ unwind。取消请求线程不能直接析构 frame；resume 入口和 suspend b
 frame。
 parent 挂起于显式 `child.await()` 时会把取消单向传播给 child，并等待 child terminal acknowledgement
 后再 unwind。隐式 async call 的 child 继承根 Task cancellation context，在自然恢复边界先观察请求并
-unwind，再恢复 parent；根 Task 负责唯一的 request claim。extern operation 仍等待自然完成，后续为
-extern ABI 加入 cancel acknowledgement。
+unwind，再恢复 parent；根 Task 负责唯一的 request claim。
+
+底层 async API 使用 `core/coroutine` 的主动 suspend 原语桥接 callback：
+
+```jiang
+async Response send(Request& request) {
+    coroutine.suspend((continuation) => {
+        Operation operation = request.start((response) => {
+            continuation.resume(response);
+        });
+        continuation.on_cancel(() [_ operation] => {
+            operation.cancel();
+        });
+    })
+}
+```
+
+`suspend` 的 registration 同步执行；若 Task 已取消，则不启动 registration 中的外部操作。registration
+期间发生取消时，`on_cancel` 必须立即或在所属 Domain 上执行 handler；completion 与 cancel 竞争只能有
+一方取得 continuation 的 terminal resume 权。取消 handler 用于尽快中断网络请求等外部操作，原
+completion/cancel acknowledgement 仍负责确认外部系统不再持有 continuation，之后 coroutine frame
+才能进入 unwind。0.4.7 不提供类型级 `Cancellable` trait；每个 suspend operation 独立注册 handler，
+避免强迫一个类型的多个 async 方法共享一个 cancel 方法。
 
 跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
 `Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。

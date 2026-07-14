@@ -144,8 +144,9 @@ Jiang 统一把 `@where(...)`、`@life(...)`、`@intrinsic(...)` 这类
 `@alias(Name = Type)` 是声明局部类型别名。一个 `@alias(...)` 可以包含多个逗号分隔的绑定；
 这些绑定等价于按顺序拆成多个 `@alias`，因此后面的绑定可以引用前面引入的名字。
 
-关键字 options 使用 `keyword [options] ...` 形式。`extern [builtin]` 当前只用于标准库或
-编译器内部源码，用来声明编译器内建常量；普通用户源码不应依赖这个内部入口。
+关键字 options 使用 `keyword [options] ...` 形式。`extern [builtin]` 当前只用于标准库、
+core 或编译器内部源码，用来声明编译器内建常量和函数；普通用户源码不应依赖这个内部入口。
+其中 builtin 函数定义按 public visibility 收集，无需额外书写 `public`。
 旧的 `keyword(...)` options 写法不再作为 release 分支语法保留。
 
 ```peg
@@ -343,9 +344,12 @@ name        <- ident / "self"
   为后续版本保留，不属于 0.4.6 的用户语法。
 - 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type。
 - 无 domain 的 `async {}` / `sync {}` 只能在已有 current domain 的上下文中使用，并继承 current。
+- 普通同步函数中的最外层 `sync [domain] {}` 阻塞进入 runtime；async context 中的
+  `sync [domain] {}` 挂起当前 coroutine，结构化切换到目标 Domain，完成后回到原 Domain，不创建 Task。
 - `async [domain]? call(...)` 是 Task creation expression，最外层 postfix 必须是函数调用；对任意
   非调用表达式创建 Task 时使用 `async [domain]? { ... }`。
-- Task creation 是 eager 的并返回 body-local `Task<T>`；等待使用 `task.await()`。旧的
+- Task creation 是 eager 的并返回 body-local `Task<T>`；`task.await()` 和 `task.cancel()` 都是
+  consuming operation，只能选择其中一个。旧的
   `callee$().async()` 和 `await expr` 不属于 0.4.6 语法。
 - 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
   `async [domain] { ... }`、`sync [domain] { ... }`、`async { ... }`、`sync { ... }`、

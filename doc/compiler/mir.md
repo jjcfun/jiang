@@ -148,8 +148,9 @@ backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；�
 child frame 连接到 caller continuation。`async call` 和 observed `async {}` 显式 materialize
 `Task<T>`；直接作为语句使用的 async block 生成 detached start。
 
-显式 Task 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 domain
-identity 和 resume operand。它不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
+显式 Task 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 Domain type
+identity 和 resume operand。effect argument 不再接受 const value。它不解析用户类型上的 `enqueue`
+成员，也不暴露 coroutine frame ABI。
 LLVM backend 将其 lowering 为私有
 `__jiang_runtime_domain_enqueue(domain_id, domain_kind, context, resume)` runtime ABI。`domain_id` 是当前程序
 内的编译期 domain identity，`domain_kind` 来自 associated const `Domain.kind`；两者都不进入用户
@@ -204,7 +205,15 @@ parent 挂起于显式 `child.await()` 时，会把 child request 注册到 pare
 会先请求
 取消 child，parent 只在 child terminal acknowledgement 恢复后进入自身 unwind。直接调用的 async child
 继承根 Task 的 cancellation context；child 在自然恢复边界观察请求并先 unwind，再通过 continuation
-恢复 parent，且只有根 Task claim 请求。extern operation 的主动取消仍是后续工作。
+恢复 parent，且只有根 Task claim 请求。
+
+`coroutine.suspend(registration)` lower 为嵌入 caller frame 的 suspend continuation record。
+`Continuation.on_cancel(handler)` 把本次 operation 的 handler 注册为 active cancel target；
+`Continuation.resume(value)` 与取消方通过 pointer-sized tagged atomic word 竞争 terminal ownership。
+registration 同步执行，因此 lowering 必须处理 cancel-before-registration、注册中取消、同步 resume 和
+跨线程迟到 resume。只有取得 terminal ownership 的一方能够恢复 coroutine；取消方仍需等待外部
+completion/cancel acknowledgement 后才能释放 continuation 所在 frame。类型级 `Cancellable` target
+已经移除；每次 suspend 注册的 handler 与 child Task 复用同一个 tagged active-target 状态字。
 cancellation cleanup 统一释放已初始化的 body-local Task observer，再为 drop elaboration 管理的
 parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，extern continuation record 等
 跨 suspend temp 仍由 liveness 放入 frame。

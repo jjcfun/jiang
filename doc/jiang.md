@@ -969,6 +969,20 @@ async Int load_both() {
 清理 parent；直接调用的 async child 会继承同一取消上下文，在恢复边界先 unwind，再恢复 parent。
 Task 未被消费就离开作用域表示 detach，不会隐式请求取消。
 
+在 async 函数中只需要结构化切换 execution domain 时，继续使用 `sync [Domain]`，不必创建临时
+Task：
+
+```c
+async Response load() {
+    sync [WorkerDomain] {
+        request.send()
+    }
+}
+```
+
+这里 `sync` 挂起当前 coroutine，在 `WorkerDomain` 执行 block，完成后回到进入前的 Domain；它不会
+阻塞 worker thread。普通同步函数中的最外层 `sync [Domain]` 仍会阻塞调用线程等待结果。
+
 ### 控制流（Control Flow）
 
 #### 块语句（Block）
