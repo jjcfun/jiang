@@ -9,6 +9,9 @@ import domain_executor = "./domain_executor.jiang";
 const Int resume_idle = 0;
 const Int resume_running = 1;
 const Int resume_pending = 2;
+// Final Task release either destroys an idle token or hands destruction to its active callback.
+const Int resume_destroy_pending = 3;
+const Int resume_destroyed = 4;
 const Int resume_completed_word = 0;
 const Int resume_state_word = 1;
 const Int resume_queue_word = 2;
@@ -116,6 +119,16 @@ public () complete_resume_token(UInt8* raw_token) {
     unsafe { thread.atomic_compare_exchange(resume_token_word(raw_token, resume_completed_word), 0, 1); }
 }
 
+@link_symbol("__jiang_runtime_resume_token_destroy")
+public () destroy_resume_token(Void* raw_frame) {
+    if (raw_frame == null) { return; }
+    UInt8* frame = unsafe { raw_frame$.as(UInt8*) };
+    Int token_address = load_storage_word(frame, 0);
+    if (token_address == 0) { return; }
+    UInt8* token = unsafe { token_address$.as(UInt8*) };
+    destroy_or_defer_resume_token(token);
+}
+
 UInt8* resume_token(
     UInt8* raw_slot,
     thread.Queue queue,
@@ -143,9 +156,14 @@ UInt8* allocate_resume_token(thread.Queue queue, Void* context, Void* resume, Vo
 }
 
 () schedule_or_mark_pending(UInt8* token) {
+    if (resume_token_completed(token)) { return; }
     while (true) {
         Int!* state = resume_token_word(token, resume_state_word);
         if (thread.atomic_compare_exchange(state, resume_idle, resume_running)) {
+            if (resume_token_completed(token)) {
+                finish_completed_resume_token(token);
+                return;
+            }
             enqueue_token(token);
             return;
         }
@@ -155,6 +173,10 @@ UInt8* allocate_resume_token(thread.Queue queue, Void* context, Void* resume, Vo
         if (thread.atomic_compare_exchange(state, resume_pending, resume_pending)) {
             return;
         }
+        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroy_pending)) {
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_destroyed, resume_destroyed)) { return; }
     }
 }
 
@@ -174,10 +196,13 @@ UInt8* allocate_resume_token(thread.Queue queue, Void* context, Void* resume, Vo
 @link_symbol("__jiang_runtime_release_resume_token")
 () release_resume_token(UInt8* token) {
     while (true) {
-        Int!* completed = resume_token_word(token, resume_completed_word);
         Int!* state = resume_token_word(token, resume_state_word);
-        if (thread.atomic_compare_exchange(completed, 1, 1)) {
-            finish_resume_token(token);
+        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroyed)) {
+            thread.deallocate_storage(token);
+            return;
+        }
+        if (resume_token_completed(token)) {
+            finish_completed_resume_token(token);
             return;
         }
         if (thread.atomic_compare_exchange(state, resume_pending, resume_running)) {
@@ -190,17 +215,42 @@ UInt8* allocate_resume_token(thread.Queue queue, Void* context, Void* resume, Vo
     }
 }
 
-() finish_resume_token(UInt8* token) {
+Bool resume_token_completed(UInt8* token) {
+    Int!* completed = resume_token_word(token, resume_completed_word);
+    return thread.atomic_compare_exchange(completed, 1, 1);
+}
+
+() finish_completed_resume_token(UInt8* token) {
     while (true) {
         Int!* state = resume_token_word(token, resume_state_word);
         if (thread.atomic_compare_exchange(state, resume_pending, resume_idle)) {
-            break;
+            return;
         }
         if (thread.atomic_compare_exchange(state, resume_running, resume_idle)) {
-            break;
+            return;
         }
+        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroyed)) {
+            thread.deallocate_storage(token);
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_destroyed, resume_destroyed)) { return; }
     }
-    thread.deallocate_storage(token);
+}
+
+() destroy_or_defer_resume_token(UInt8* token) {
+    while (true) {
+        Int!* state = resume_token_word(token, resume_state_word);
+        if (thread.atomic_compare_exchange(state, resume_idle, resume_destroyed)) {
+            thread.deallocate_storage(token);
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_running, resume_destroy_pending)) { return; }
+        if (thread.atomic_compare_exchange(state, resume_pending, resume_destroy_pending)) { return; }
+        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroy_pending)) {
+            return;
+        }
+        if (thread.atomic_compare_exchange(state, resume_destroyed, resume_destroyed)) { return; }
+    }
 }
 
 Int!* resume_token_word(UInt8* token, Int index) {
