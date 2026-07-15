@@ -226,6 +226,13 @@ cancellation cleanup 统一释放已初始化的 body-local Task observer，再�
 parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，extern continuation record 等
 跨 suspend temp 仍由 liveness 放入 frame。
 
+coroutine frame 的 parent continuation 统一保存 `executor + context + resume`。Task 根 completion 的
+executor 为 null，表示直接执行内部 completion；child completion 使用调用方 executor，经 scheduler
+选择同 serial Domain direct resume 或跨 Domain enqueue。`extern async` 对 C 可见的 continuation 前三个
+word 仍为 `result + context + resume`，其中 context 指向完整 record，resume 是 runtime scheduling
+trampoline；record 尾部保存 executor 和真实 context/resume，因此外部 callback 不再
+直接进入 coroutine body，concurrent executor 也继续复用原子 resume token。
+
 Task 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
 coroutine frame 转移。Task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Task
 的 effect body 所在 current domain。
