@@ -203,13 +203,19 @@ observed Task 的 task 和 observer 各持有一次 ownership。`await()` 消费
 
 当前实现覆盖 cancel-before-start 和自然恢复边界：observed Task frame 在 resume dispatch 前用 CAS 将
 request 从 requested claim 为 cancelling，并从 cancellation entry 进入 drop elaboration 生成的清理链。
+普通 async call 借出 continuation 前将 active-target word 从 inactive 发布为 passive suspend；
+取消方看到 passive suspend 只保留 request 并等待自然 callback。callback 恢复后，resume boundary
+将 passive suspend 作为无主动 handler 的取消入口处理，因此不会在外部仍持有 continuation 时
+提前释放 frame。
 parent 挂起于显式 `child.await()` 时，会把 child request 注册到 parent task-state；取消 parent
 会先请求
 取消 child，parent 只在 child terminal acknowledgement 恢复后进入自身 unwind。直接调用的 async child
 继承根 Task 的 cancellation context；child 在自然恢复边界观察请求并先 unwind，再通过 continuation
 恢复 parent，且只有根 Task claim 请求。
 
-`coroutine.suspend(registration)` lower 为嵌入 caller frame 的 suspend continuation record。
+`coroutine.suspend(registration)` lower 为嵌入 caller frame 的 suspend continuation record。record 保存
+进入 suspend 时的 executor；`Continuation.resume(value)` 取得 terminal ownership 并发布 result 后，
+把 `context + resume` 调度回该 executor，不在任意 callback 线程直接执行 coroutine body。
 `Continuation.on_cancel(handler)` 把本次 operation 的 handler 注册为 active cancel target；
 `Continuation.resume(value)` 与取消方通过 pointer-sized tagged atomic word 竞争 terminal ownership。
 registration 同步执行，因此 lowering 必须处理 cancel-before-registration、注册中取消、同步 resume 和
@@ -223,6 +229,16 @@ parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，
 Task 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
 coroutine frame 转移。Task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Task
 的 effect body 所在 current domain。
+
+macOS serial `DomainExecutor` 在创建 dispatch queue 时以 executor pointer 作为 queue-specific key 和
+context，因此当前 job 可以无 TLS、无额外 job allocation 地验证 serial Domain 执行权。concurrent
+Domain 共享 global queue，不能从底层 queue identity 推导具体 Domain；其 same-executor 判断保持关闭。
+generated coroutine resume 在统一入口保存并设置 executor 的 active frame，在统一出口恢复先前值。
+serial scheduler 只有在当前 queue identity 与目标 executor 相同、且目标 frame 不是 active frame 时
+才直接调用 resume；嵌套恢复其他 frame 会保存/恢复外层 frame，同步恢复当前 suspend frame 则继续
+enqueue，避免在 registration 尚未返回时重入同一个 frame。
+executor 的 tracking-enabled 位由 generated resume 首次 enter 时开启；旧 bootstrap 生成、尚未包含
+enter/leave 的 coroutine 因此保持保守 enqueue，不会只更新 scheduler 后误启用 direct resume。
 
 ## 不变量
 

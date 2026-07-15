@@ -1,0 +1,187 @@
+// Runtime-owned executor identity for a canonical const Domain binding.
+//
+// The current materialization table is a transition boundary: callers still
+// provide the compiler binding id once, while scheduled work only consumes the
+// resulting opaque executor. Task/Continuation will carry this pointer directly.
+
+import thread = "../system/thread.jiang";
+
+const Int concurrent_domain_kind = 1;
+const Int executor_kind_word = 0;
+const Int executor_queue_word = 1;
+const Int executor_active_context_word = 2;
+const Int executor_tracking_enabled_word = 3;
+const Int executor_word_count = 4;
+
+thread.Mutex! executors_mutex = thread.Mutex(null);
+UInt8*! executor_binding_ids = null;
+UInt8*! executor_handles = null;
+Int! executor_count = 0;
+Int! executor_capacity = 0;
+
+public Bool initialize() {
+    executors_mutex = thread.create_mutex();
+    keep_resume_abi_reachable();
+    return thread.mutex_valid(executors_mutex);
+}
+
+public () shutdown() {
+    free_executors();
+    thread.destroy(executors_mutex);
+    executors_mutex = thread.Mutex(null);
+}
+
+@link_symbol("__jiang_runtime_domain_executor")
+public Void* materialize(Int binding_id, Int domain_kind) {
+    thread.lock(executors_mutex);
+    Void* executor = find_or_add_executor(binding_id, domain_kind);
+    thread.unlock(executors_mutex);
+    return executor;
+}
+
+public thread.Queue queue(Void* executor) {
+    Int handle = load_executor_word(executor, executor_queue_word);
+    return thread.Queue(unsafe { handle$.as(Void*) });
+}
+
+public Bool is_concurrent(Void* executor) {
+    return load_executor_word(executor, executor_kind_word) == concurrent_domain_kind;
+}
+
+public Bool is_current(Void* executor) {
+    if (executor == null || is_concurrent(executor)) { return false; }
+    return thread.has_queue_identity(executor);
+}
+
+public Bool can_inline(Void* executor, Void* context) {
+    if (!is_current(executor) || context == null) { return false; }
+    if (load_executor_word(executor, executor_tracking_enabled_word) == 0) { return false; }
+    return active_context(executor) != context;
+}
+
+@link_symbol("__jiang_runtime_executor_enter")
+public Void* enter(Void* executor, Void* context) {
+    if (executor == null || is_concurrent(executor)) { return null; }
+    Void* previous = active_context(executor);
+    store_executor_word(executor, executor_active_context_word, unsafe { context$.as(Int) });
+    store_executor_word(executor, executor_tracking_enabled_word, 1);
+    return previous;
+}
+
+@link_symbol("__jiang_runtime_executor_leave")
+public () leave(Void* executor, Void* previous_context) {
+    if (executor == null || is_concurrent(executor)) { return; }
+    store_executor_word(
+        executor,
+        executor_active_context_word,
+        unsafe { previous_context$.as(Int) }
+    );
+}
+
+// Generated resume MIR calls these fixed ABI entries without a Jiang-level
+// function reference. Keep both definitions in the runtime reachability graph.
+() keep_resume_abi_reachable() {
+    Void* previous = enter(null, null);
+    leave(null, previous);
+}
+
+Void* find_or_add_executor(Int binding_id, Int domain_kind) {
+    Int! index = 0;
+    while (index < executor_count) {
+        if (load_storage_word(executor_binding_ids, index) == binding_id) {
+            return load_executor_handle(index);
+        }
+        index = index + 1;
+    }
+    return add_executor(binding_id, domain_kind);
+}
+
+Void* add_executor(Int binding_id, Int domain_kind) {
+    ensure_executor_capacity();
+    UInt8* storage = thread.allocate_storage(executor_word_count * Int$.size());
+    assert(storage != null);
+    thread.Queue! target_queue = thread.concurrent_queue();
+    if (domain_kind != concurrent_domain_kind) {
+        target_queue = thread.serial_queue();
+        thread.set_queue_identity(target_queue, unsafe { storage$.as(Void*) });
+    }
+    store_storage_word(storage, executor_kind_word, domain_kind);
+    store_storage_word(
+        storage,
+        executor_queue_word,
+        unsafe { thread.queue_handle(target_queue)$.as(Int) }
+    );
+    store_storage_word(storage, executor_active_context_word, 0);
+    store_storage_word(storage, executor_tracking_enabled_word, 0);
+    Int index = executor_count;
+    store_storage_word(executor_binding_ids, index, binding_id);
+    store_storage_word(executor_handles, index, unsafe { storage$.as(Int) });
+    executor_count = index + 1;
+    return unsafe { storage$.as(Void*) };
+}
+
+Void* load_executor_handle(Int index) {
+    Int handle = load_storage_word(executor_handles, index);
+    return unsafe { handle$.as(Void*) };
+}
+
+() ensure_executor_capacity() {
+    if (executor_count < executor_capacity) { return; }
+    Int! capacity = executor_capacity * 2;
+    if (capacity == 0) { capacity = 8; }
+    executor_binding_ids = resize_storage(executor_binding_ids, capacity * Int$.size());
+    executor_handles = resize_storage(executor_handles, capacity * Void*$.size());
+    executor_capacity = capacity;
+}
+
+UInt8* resize_storage(UInt8* storage, Int size) {
+    UInt8* resized = thread.reallocate_storage(storage, size);
+    assert(resized != null);
+    return resized;
+}
+
+Int load_executor_word(Void* executor, Int index) {
+    UInt8* storage = unsafe { executor$.as(UInt8*) };
+    return load_storage_word(storage, index);
+}
+
+Void* active_context(Void* executor) {
+    return unsafe { load_executor_word(executor, executor_active_context_word)$.as(Void*) };
+}
+
+() store_executor_word(Void* executor, Int index, Int value) {
+    UInt8* storage = unsafe { executor$.as(UInt8*) };
+    store_storage_word(storage, index, value);
+}
+
+Int load_storage_word(UInt8* storage, Int index) {
+    return unsafe { storage_word(storage, index)$.get() };
+}
+
+() store_storage_word(UInt8* storage, Int index, Int value) {
+    unsafe { storage_word(storage, index)$.set(value); }
+}
+
+Int!* storage_word(UInt8* storage, Int index) {
+    Int address = unsafe { storage$.as(Int) } + index * Int$.size();
+    return unsafe { address$.as(Int!*) };
+}
+
+() free_executors() {
+    Int! index = 0;
+    while (index < executor_count) {
+        Void* executor = load_executor_handle(index);
+        thread.deallocate_storage(unsafe { executor$.as(UInt8*) });
+        index = index + 1;
+    }
+    free_storage(executor_binding_ids);
+    free_storage(executor_handles);
+    executor_binding_ids = null;
+    executor_handles = null;
+    executor_count = 0;
+    executor_capacity = 0;
+}
+
+() free_storage(UInt8* storage) {
+    if (storage != null) { thread.deallocate_storage(storage); }
+}

@@ -4,8 +4,8 @@
 // platform thread and synchronization primitives come from system.thread.
 
 import thread = "../system/thread.jiang";
+import domain_executor = "./domain_executor.jiang";
 
-const Int concurrent_domain_kind = 1;
 const Int resume_idle = 0;
 const Int resume_running = 1;
 const Int resume_pending = 2;
@@ -19,29 +19,20 @@ const Int resume_token_words = 6;
 
 struct RuntimeState {
     thread.Group! group;
-    thread.Queue! concurrent_queue;
     Bool! initialized;
 
     init(self) {
         self.group = thread.Group(null);
-        self.concurrent_queue = thread.Queue(null);
         self.initialized = false;
     }
 }
 
 RuntimeState! runtime_state = RuntimeState();
-thread.Mutex! serial_domains_mutex = thread.Mutex(null);
-UInt8*! serial_domain_ids = null;
-UInt8*! serial_queue_handles = null;
-Int! serial_domain_count = 0;
-Int! serial_domain_capacity = 0;
 
 public Bool initialize() {
     if (!thread.supported()) { return false; }
     runtime_state.group = thread.create_group();
-    runtime_state.concurrent_queue = thread.concurrent_queue();
-    serial_domains_mutex = thread.create_mutex();
-    if (!thread.mutex_valid(serial_domains_mutex)) { return false; }
+    if (!domain_executor.initialize()) { return false; }
     runtime_state.initialized = true;
     return true;
 }
@@ -49,9 +40,7 @@ public Bool initialize() {
 public () shutdown() {
     if (!runtime_state.initialized) { return; }
     thread.wait_group(runtime_state.group);
-    free_serial_domains();
-    thread.destroy(serial_domains_mutex);
-    serial_domains_mutex = thread.Mutex(null);
+    domain_executor.shutdown();
     runtime_state.initialized = false;
 }
 
@@ -65,13 +54,35 @@ public () enqueue(
     Void* callback
 ) {
     assert(runtime_state.initialized);
-    thread.Queue queue = queue_for(domain_id, domain_kind);
-    if (domain_kind != concurrent_domain_kind) {
+    Void* executor = domain_executor.materialize(domain_id, domain_kind);
+    enqueue_executor(executor, context, token_slot, resume, callback);
+}
+
+@link_symbol("__jiang_runtime_executor_enqueue")
+public () enqueue_executor(
+    Void* executor,
+    Void* context,
+    UInt8* token_slot,
+    Void* resume,
+    Void* callback
+) {
+    assert(runtime_state.initialized);
+    thread.Queue queue = domain_executor.queue(executor);
+    if (!domain_executor.is_concurrent(executor)) {
+        if (domain_executor.can_inline(executor, context)) {
+            invoke_resume(resume, context);
+            return;
+        }
         assert(thread.enqueue(runtime_state.group, queue, context, resume));
         return;
     }
     UInt8* token = resume_token(token_slot, queue, context, resume, callback);
     schedule_or_mark_pending(token);
+}
+
+() invoke_resume(Void* resume, Void* context) {
+    RawFn<(), Void*> function = unsafe { resume$.as(RawFn<(), Void*>) };
+    function(context);
 }
 
 @link_symbol("__jiang_runtime_resume_token_complete")
@@ -171,53 +182,6 @@ Int!* resume_token_word(UInt8* token, Int index) {
     return storage_word(token, index);
 }
 
-thread.Queue queue_for(Int domain_id, Int domain_kind) {
-    if (domain_kind == concurrent_domain_kind) {
-        return runtime_state.concurrent_queue;
-    }
-    thread.lock(serial_domains_mutex);
-    thread.Queue queue = serial_queue_for(domain_id);
-    thread.unlock(serial_domains_mutex);
-    return queue;
-}
-
-thread.Queue serial_queue_for(Int domain_id) {
-    Int! index = 0;
-    while (index < serial_domain_count) {
-        if (load_storage_word(serial_domain_ids, index) == domain_id) {
-            Int handle = load_storage_word(serial_queue_handles, index);
-            return thread.Queue(unsafe { handle$.as(Void*) });
-        }
-        index = index + 1;
-    }
-    return add_serial_queue(domain_id);
-}
-
-thread.Queue add_serial_queue(Int domain_id) {
-    ensure_serial_domain_capacity();
-    thread.Queue queue = thread.serial_queue();
-    Int index = serial_domain_count;
-    store_storage_word(serial_domain_ids, index, domain_id);
-    Void* handle = thread.queue_handle(queue);
-    store_storage_word(serial_queue_handles, index, unsafe { handle$.as(Int) });
-    serial_domain_count = index + 1;
-    return queue;
-}
-
-() ensure_serial_domain_capacity() {
-    if (serial_domain_count < serial_domain_capacity) { return; }
-    Int! capacity = serial_domain_capacity * 2;
-    if (capacity == 0) { capacity = 8; }
-    UInt8* next_domain_ids = thread.reallocate_storage(serial_domain_ids, capacity * Int$.size());
-    assert(next_domain_ids != null);
-    serial_domain_ids = next_domain_ids;
-    Int handles_size = capacity * Void*$.size();
-    UInt8* next_handles = thread.reallocate_storage(serial_queue_handles, handles_size);
-    assert(next_handles != null);
-    serial_queue_handles = next_handles;
-    serial_domain_capacity = capacity;
-}
-
 Int load_storage_word(UInt8* storage, Int index) {
     return unsafe { storage_word(storage, index)$.get() };
 }
@@ -229,17 +193,4 @@ Int load_storage_word(UInt8* storage, Int index) {
 Int!* storage_word(UInt8* storage, Int index) {
     Int address = unsafe { storage$.as(Int) } + index * Int$.size();
     return unsafe { address$.as(Int!*) };
-}
-
-() free_serial_domains() {
-    free_storage(serial_domain_ids);
-    free_storage(serial_queue_handles);
-    serial_domain_ids = null;
-    serial_queue_handles = null;
-    serial_domain_count = 0;
-    serial_domain_capacity = 0;
-}
-
-() free_storage(UInt8* storage) {
-    if (storage != null) { thread.deallocate_storage(storage); }
 }

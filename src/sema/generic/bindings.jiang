@@ -19,11 +19,13 @@ public struct GenericBindings: Movable {
     // interpreter，后续语法接入 const generic 时复用同一入口。
     table.HashTable<qid.DefId, qid.TypeId> type_bindings;
     table.HashTable<qid.DefId, comptime_value.ComptimeValue> const_bindings;
+    table.HashTable<qid.DefId, qid.DefId> const_binding_defs;
     table.HashTable<Int, qid.TypeId> type_cache;
 
     public init(self) {
         self.type_bindings = table.HashTable<qid.DefId, qid.TypeId>();
         self.const_bindings = table.HashTable<qid.DefId, comptime_value.ComptimeValue>();
+        self.const_binding_defs = table.HashTable<qid.DefId, qid.DefId>();
         self.type_cache = table.HashTable<Int, qid.TypeId>();
     }
 
@@ -56,6 +58,14 @@ public struct GenericBindings: Movable {
 
     public () set_const(self, qid.DefId generic_param, comptime_value.ComptimeValue concrete_value) {
         self.const_bindings.set(generic_param, concrete_value);
+    }
+
+    public qid.DefId? const_binding_def(self, qid.DefId generic_param) {
+        return table.hash_table_get_value<qid.DefId, qid.DefId>(self.const_binding_defs$.ref(), generic_param);
+    }
+
+    public () set_const_binding_def(self, qid.DefId generic_param, qid.DefId binding_def) {
+        self.const_binding_defs.set(generic_param, binding_def);
     }
 
     public qid.TypeId? cached_type(self, qid.TypeId template_type) {
@@ -137,7 +147,7 @@ public GenericBindings bindings_for_instance(
         return;
     }
     if (generic_param_is_const_param(compiler_store, param_def)) {
-        bind_const_arg_by_param(bindings, param_def, args);
+        bind_const_arg_by_param(bindings, param_def, args, caller_bindings);
     }
 }
 
@@ -164,7 +174,7 @@ Int bind_generic_members(
             continue;
         }
         if (generic_param_is_const_param(compiler_store, member_def)) {
-            bind_const_arg_at(bindings, member_def, args, const_index);
+            bind_const_arg_at(bindings, member_def, args, const_index, caller_bindings);
             const_index = const_index + 1;
             arg_index = arg_index + 1;
         }
@@ -230,14 +240,15 @@ Bool bind_type_arg_by_param(
     GenericBindings& bindings,
     qid.DefId member_def,
     types.GenericArg[]& args,
-    Int arg_index
+    Int arg_index,
+    GenericBindings& caller_bindings
 ) {
-    if (bind_const_arg_by_param(bindings, member_def, args)) {
+    if (bind_const_arg_by_param(bindings, member_def, args, caller_bindings)) {
         return;
     }
     if (arg_index >= args.length) { return; }
     guard self_const_arg_by_ordinal(args, arg_index) is .some(const_arg) else { return; }
-    bindings.set_const(member_def, const_arg.value);
+    bind_const_arg(bindings, member_def, const_arg, caller_bindings);
 }
 
 types.GenericConstArg? self_const_arg_by_ordinal(types.GenericArg[]& args, Int ordinal) {
@@ -256,20 +267,42 @@ types.GenericConstArg? self_const_arg_by_ordinal(types.GenericArg[]& args, Int o
 Bool bind_const_arg_by_param(
     GenericBindings& bindings,
     qid.DefId member_def,
-    types.GenericArg[]& args
+    types.GenericArg[]& args,
+    GenericBindings& caller_bindings
 ) {
     Int! index = 0;
     while (index < args.length) {
         types.GenericArg arg = args[index];
         if (arg is .const_arg(const_arg)) {
             if (generic_const_arg_matches_param(const_arg, member_def)) {
-                bindings.set_const(member_def, const_arg.value);
+                bind_const_arg(bindings, member_def, const_arg, caller_bindings);
                 return true;
             }
         }
         index = index + 1;
     }
     return false;
+}
+
+() bind_const_arg(
+    GenericBindings& bindings,
+    qid.DefId member_def,
+    types.GenericConstArg arg,
+    GenericBindings& caller_bindings
+) {
+    comptime_value.ComptimeValue! value = arg.value;
+    if (value.data is .const_param_value(param_def)) {
+        if (caller_bindings.const_binding(param_def) is .some(concrete_value)) {
+            value = concrete_value;
+        }
+    }
+    bindings.set_const(member_def, value);
+    guard arg.binding_def is .some(source_binding) else { return; }
+    qid.DefId! binding = source_binding;
+    if (caller_bindings.const_binding_def(source_binding) is .some(concrete_binding)) {
+        binding = concrete_binding;
+    }
+    bindings.set_const_binding_def(member_def, binding);
 }
 
 Bool generic_type_arg_matches_param(types.GenericTypeArg arg, qid.DefId member_def) {
@@ -481,10 +514,16 @@ struct TypeSubstituter: Movable {
 
     types.GenericArg substitute_generic_const_arg(self, types.GenericConstArg arg) {
         comptime_value.ComptimeValue value = self.substitute_comptime_value(arg.value);
+        qid.DefId?! binding_def = self.substitute_const_binding_def(arg);
         if (arg.param_def is .some(param_def)) {
-            return types.generic_const_param_arg(param_def, value);
+            return types.generic_const_param_arg(param_def, value, binding_def);
         }
-        return types.generic_const_arg(value);
+        return types.generic_const_arg(value, binding_def);
+    }
+
+    qid.DefId? substitute_const_binding_def(self, types.GenericConstArg arg) {
+        guard arg.value.data is .const_param_value(param_def) else { return arg.binding_def; }
+        return self.bindings.const_binding_def(param_def);
     }
 
     comptime_value.ComptimeValue substitute_comptime_value(self, comptime_value.ComptimeValue value) {
@@ -528,7 +567,7 @@ struct TypeSubstituter: Movable {
     qid.TypeId substitute_task(self, types.TypeInfo type_info, types.TaskType task_type) {
         qid.TypeId task_id = self.store.types.task_type(
             self.substitute(task_type.result),
-            self.substitute_domain_type(task_type.domain_type),
+            self.substitute_domain(task_type.domain),
             type_info.span
         );
         return self.preserve_mutability(type_info, task_id);
@@ -538,18 +577,17 @@ struct TypeSubstituter: Movable {
         return types.EffectSet(
             has_unsafe: effects.has_unsafe,
             has_async: effects.has_async,
-            domain_type: self.substitute_domain_type(effects.domain_type)
+            domain: self.substitute_domain(effects.domain)
         );
     }
 
-    qid.DefId? substitute_domain_type(self, qid.DefId? domain_type) {
-        guard domain_type is .some(domain_def) else { return null; }
-        guard self.bindings.type_binding(domain_def) is .some(concrete_type) else {
-            return domain_def;
+    types.DomainEffect? substitute_domain(self, types.DomainEffect? domain) {
+        guard domain is .some(value) else { return null; }
+        qid.DefId! binding = value.binding;
+        if (self.bindings.const_binding_def(binding) is .some(concrete_binding)) {
+            binding = concrete_binding;
         }
-        types.TypeInfo info = self.store.types.get(concrete_type);
-        if (info.data is .named(named)) { return named.def_id; }
-        return domain_def;
+        return types.DomainEffect(binding: binding, domain_type: self.substitute(value.domain_type));
     }
 
     qid.TypeId preserve_mutability(self, types.TypeInfo original, qid.TypeId substituted) {
