@@ -174,15 +174,17 @@ runtime shutdown 等待已 enqueue 的 continuation 完成；libdispatch worker 
 extern_async(args..., AsyncContinuation*) -> Unit
 
 AsyncContinuation {
-  result_ptr
-  caller_context
+  result_ptr: Void*
+  caller_context: Void*
   resume_fn
 }
 ```
 
 continuation record 嵌入 caller coroutine frame，不要求堆分配。runtime 可以保存该稳定指针，完成后
 先写 result，再调用 `resume_fn(caller_context)`。`result_ptr`、frame linkage 等 compiler 地址使用
-专用 MIR 来源标记，但 backend 仍 lower 成普通 raw pointer；用户 raw/reference 借用规则不因此放宽。
+专用 MIR 来源标记，但 backend 统一 lower 成 opaque `Void*`；需要访问真实对象的一侧必须先 cast
+回具体指针类型。`Void*` 只允许传递、比较和 cast，不支持 `$.get()` / `$.set()`；用户
+raw/reference 借用规则不因此放宽。
 
 跨线程 Task completion 必须使用 release/acquire 同步，并通过 waiter claim CAS 防止丢唤醒或重复
 resume。等待方先写 waiter context/function，再发布 armed 状态并重新 acquire 检查 ready；完成方发布

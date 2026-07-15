@@ -60,8 +60,8 @@ callable vtable。
 
 callable vtable 至少包含：
 
-- `call: RawFn<Ret, UInt8*, Args...>`，使用 erased receiver 调用 closure body。
-- `drop: RawFn<Unit, UInt8*>`，销毁 receiver 指向的匿名 closure object。
+- `call: RawFn<Ret, Void*, Args...>`，使用 erased receiver 调用 closure body。
+- `drop: RawFn<Unit, Void*>`，销毁 receiver 指向的匿名 closure object。
 
 普通 `Fn` 的 receiver 指向当前栈帧或当前 aggregate 内的匿名 closure object，因此 `Fn<...>` 不能
 返回、保存到 heap/global，也不能写入可能比当前函数更久的外部位置。
@@ -71,7 +71,7 @@ callable vtable 至少包含：
 vtable 中的 `drop(receiver)` drop heap closure object，并释放其 storage。
 
 调用时抽象成 `vtable.call(receiver, args...)`：call 槽的底层调用约定为
-`RawFn<Ret, RawPointer<UInt8>, Args...>`，调用时先传 `receiver`，再传源码参数。
+`RawFn<Ret, Void*, Args...>`，调用时先传 `receiver`，再传源码参数。
 
 `Fn<...>` 是统一 erased callable 类型，不把每个 closure 的匿名具体类型暴露给用户。每个
 closure expression 仍有内部 env layout；捕获字段按顺序紧密放入连续 env memory。非捕获 lambda
@@ -96,8 +96,8 @@ Jiang closure object。C ABI 函数指针只应该映射到 `RawFn<...>`。
 
 ```text
 {
-  receiver: UInt8*,
-  vtable:   { call: RawFn<Ret, UInt8*, Args...>, drop: RawFn<Unit, UInt8*> }*
+  receiver: Void*,
+  vtable:   { call: RawFn<Ret, Void*, Args...>, drop: RawFn<Unit, Void*> }*
 }
 ```
 
@@ -462,7 +462,7 @@ lambda.function_def -> [
 - `is_unique` 记录显式 unique capture 需求。
 
 MIR lowering 从 `LambdaCaptureInfo` 生成 sourceless 的私有 struct def 和 field def。stack `Fn`
-创建临时 env struct，heap `Fn^` 分配同形状 env struct，并把指针擦成 `UInt8*` 存入 closure
+创建临时 env struct，heap `Fn^` 分配同形状 env struct，并把指针擦成 `Void*` 存入 closure
 object。field 名字尽量沿用 capture 名字，没有稳定源码名字时使用 `_0`、`_1` 这类匿名字段名。
 
 这个 synthetic env struct 只服务 layout、projection、drop 和诊断展示，不进入 resolver namespace，

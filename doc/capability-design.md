@@ -159,7 +159,7 @@ async [domain: PageDomain, context: page_ctx] {
 ```jiang
 Fn<async Int>
 Fn<async [UiDomain] Int, Model!&>
-RawFn<unsafe async [UiDomain] Result<Int, Error>, UInt8*>
+RawFn<unsafe async [UiDomain] Result<Int, Error>, Void*>
 ```
 
 在 callable type 中，`async [D]` 修饰 callable signature，不修饰返回值类型本身，也不表示
