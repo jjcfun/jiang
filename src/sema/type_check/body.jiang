@@ -2651,6 +2651,12 @@ public struct BodyCheck: Movable {
     }
 
     Bool assignment_target_is_writable(self, hir.HirId target_id, qid.TypeId target_type) {
+        hir.HirNode target = self.state.hirs.node(target_id);
+        if (target.data is .index_access(index_access)) {
+            if (self.node_is_raw_pointer(index_access.base)) {
+                return self.place_type_has_write_capability(index_access.base);
+            }
+        }
         return self.place_has_mutable_binding(target_id);
     }
 
@@ -2677,6 +2683,9 @@ public struct BodyCheck: Movable {
             return self.place_has_mutable_binding(member.base);
         }
         if (place.data is .index_access(index_access)) {
+            if (self.node_is_raw_pointer(index_access.base)) {
+                return self.place_type_has_write_capability(index_access.base);
+            }
             if (self.place_type_has_write_capability(index_access.base)) { return true; }
             return self.place_has_mutable_binding(index_access.base);
         }
@@ -2709,6 +2718,11 @@ public struct BodyCheck: Movable {
     Bool place_type_has_write_capability(self, hir.HirId place_id) {
         guard self.state.results.node_type(place_id) is .some(type_id) else { return false; }
         return self.state.store.types.get(type_id).is_mutable;
+    }
+
+    Bool node_is_raw_pointer(self, hir.HirId node_id) {
+        guard self.state.results.node_type(node_id) is .some(type_id) else { return false; }
+        return self.type_is_raw_pointer(type_id);
     }
 
     Bool assignment_initializes_local(self, hir.HirAssign assign_stmt) {
@@ -3110,6 +3124,9 @@ public struct BodyCheck: Movable {
     qid.TypeId check_index_access(self, hir.HirId node_id, hir.HirIndexAccess index_access) {
         qid.TypeId base_type = self.check_node(index_access.base);
         qid.TypeId index_type = self.check_node(index_access.index);
+        if (self.type_is_raw_pointer(base_type)) {
+            self.check_call_effects(node_id, types.EffectSet(has_unsafe: true));
+        }
         self.type_ops.expect_value_assignable(
             index_access.index,
             self.state.store.types.int_type(),
@@ -3184,6 +3201,9 @@ public struct BodyCheck: Movable {
         if (self.owned_slice_access_result_type(base_type) is .some(result_type)) {
             return result_type;
         }
+        if (self.type_is_raw_pointer(base_type)) {
+            return null;
+        }
         if (self.index_element_type(base_type) is .some(element_type)) {
             return self.state.store.types.slice_type(element_type, token.Span());
         }
@@ -3254,9 +3274,17 @@ public struct BodyCheck: Movable {
             if (self.handle_is_owned_slice_value(handle)) {
                 return self.owned_slice_value_handle_element_type(handle);
             }
-            return handle.element;
+            if (handle.kind == .slice || handle.kind == .raw_pointer || handle.kind == .many_pointer) {
+                return handle.element;
+            }
         }
         return null;
+    }
+
+    Bool type_is_raw_pointer(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        return handle.kind == .raw_pointer;
     }
 
     qid.TypeId? owned_slice_value_handle_element_type(self, types.HandleType handle) {
@@ -7102,10 +7130,11 @@ public struct BodyCheck: Movable {
             self.type_ops.add_node_error(node_id, "mutable borrow requires writable storage", "immutable_borrow_source");
             return self.state.store.types.invalid_type();
         }
-        qid.TypeId element = self.type_ops.read_value_type(base_type);
+        qid.TypeId! element = self.type_ops.read_value_type(base_type);
         qid.TypeId! result;
         if (raw_pointer) {
             self.check_call_effects(node_id, types.EffectSet(has_unsafe: true));
+            element = self.pointer_projection_element_type(base_type);
             result = self.state.store.types.raw_pointer_type(element, token.Span());
         } else {
             result = self.type_ops.borrow_reference_type_for_element(element);
@@ -7170,19 +7199,17 @@ public struct BodyCheck: Movable {
         if (self.type_is_closure_function(handle.element)) {
             return self.invalid_ptr_receiver(node_id);
         }
-        if (handle.kind == .reference || handle.kind == .owner_pointer || handle.kind == .raw_pointer) {
-            return self.state.store.types.raw_pointer_type(handle.element, token.Span());
-        }
-        if (handle.kind != .slice) { return self.invalid_ptr_receiver(node_id); }
-        if (handle.sentinel is .some(sentinel)) {
-            return self.state.store.types.handle_type_with_sentinel(
-                .many_pointer,
-                handle.element,
-                sentinel,
+        if (handle.kind == .reference
+            || handle.kind == .owner_pointer
+            || handle.kind == .raw_pointer
+            || handle.kind == .slice
+            || handle.kind == .many_pointer) {
+            return self.state.store.types.raw_pointer_type(
+                self.type_ops.read_value_type(handle.element),
                 token.Span()
             );
         }
-        return self.state.store.types.many_pointer_type(handle.element, token.Span());
+        return self.invalid_ptr_receiver(node_id);
     }
 
     qid.TypeId array_ptr_type(self, hir.HirId node_id, hir.HirId base_id, types.ArrayType array_type) {
@@ -7190,15 +7217,21 @@ public struct BodyCheck: Movable {
             self.type_ops.add_node_error(node_id, "array ptr receiver must be a place", "ptr_requires_place");
             return self.state.store.types.invalid_type();
         }
-        if (array_type.sentinel is .some(sentinel)) {
-            return self.state.store.types.handle_type_with_sentinel(
-                .many_pointer,
-                array_type.element,
-                sentinel,
-                token.Span()
-            );
+        return self.state.store.types.raw_pointer_type(
+            self.type_ops.read_value_type(array_type.element),
+            token.Span()
+        );
+    }
+
+    qid.TypeId pointer_projection_element_type(self, qid.TypeId base_type) {
+        types.TypeInfo info = self.state.store.types.get(base_type);
+        if (info.data is .array_type(array_type)) {
+            return self.type_ops.read_value_type(array_type.element);
         }
-        return self.state.store.types.many_pointer_type(array_type.element, token.Span());
+        if (info.data is .handle_type(handle)) {
+            return self.type_ops.read_value_type(handle.element);
+        }
+        return self.type_ops.read_value_type(base_type);
     }
 
     Bool type_is_closure_function(self, qid.TypeId type_id) {
