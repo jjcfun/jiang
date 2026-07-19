@@ -1,4 +1,5 @@
 #include <sched.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -19,7 +20,15 @@ void cancel_gate_wait_ready(void) {
     }
 }
 
-void cancel_gate_open_later(void) {
+static void *cancel_gate_open_thread(void *unused) {
     usleep(10000);
     atomic_store(&gate_open, 1);
+    return unused;
+}
+
+void cancel_gate_open_later(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, cancel_gate_open_thread, 0) == 0) {
+        pthread_detach(thread);
+    }
 }

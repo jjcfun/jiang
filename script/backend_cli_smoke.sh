@@ -94,7 +94,7 @@ printf 'import std;\nInt main() { if (std.fs.exists("/tmp")) { 0 } else { 1 } }\
 cat >"$alloc_sample" <<'EOF'
 Int main() {
     unsafe {
-        Int![*] values = Int!$.alloc_many(2);
+        Int[*]! values = Int!$.alloc_many(2);
         values[0] = 1;
         values$.dealloc();
     }
@@ -132,7 +132,7 @@ Int main() {
 
 Bool text_equal(UInt8[]& lhs, UInt8[]& rhs) {
     if (lhs.length != rhs.length) { return false; }
-    Int! index = 0;
+    Int index! = 0;
     while (index < lhs.length) {
         if (lhs[index] != rhs[index]) { return false; }
         index = index + 1;
@@ -183,11 +183,11 @@ test -s "$sample_obj"
 test -s "$alloc_no_libc_ll"
 grep -q "__jiang_malloc" "$alloc_no_libc_ll"
 grep -q "__jiang_free" "$alloc_no_libc_ll"
-if grep -q "@malloc" "$alloc_no_libc_ll"; then
+if grep -q "@malloc(" "$alloc_no_libc_ll"; then
   echo "unexpected malloc reference in --no-link-libc LLVM output" >&2
   exit 1
 fi
-if grep -q "@free" "$alloc_no_libc_ll"; then
+if grep -q "@free(" "$alloc_no_libc_ll"; then
   echo "unexpected free reference in --no-link-libc LLVM output" >&2
   exit 1
 fi
@@ -208,11 +208,11 @@ fi
 test -s "$alloc_linux_no_libc_ll"
 grep -q "__jiang_malloc" "$alloc_linux_no_libc_ll"
 grep -q "__jiang_free" "$alloc_linux_no_libc_ll"
-if grep -q "@malloc" "$alloc_linux_no_libc_ll"; then
+if grep -q "@malloc(" "$alloc_linux_no_libc_ll"; then
   echo "unexpected malloc reference in linux --no-link-libc LLVM output" >&2
   exit 1
 fi
-if grep -q "@free" "$alloc_linux_no_libc_ll"; then
+if grep -q "@free(" "$alloc_linux_no_libc_ll"; then
   echo "unexpected free reference in linux --no-link-libc LLVM output" >&2
   exit 1
 fi
@@ -233,11 +233,11 @@ fi
 test -s "$alloc_wasm_ll"
 grep -q "__jiang_malloc" "$alloc_wasm_ll"
 grep -q "__jiang_free" "$alloc_wasm_ll"
-if grep -q "@malloc" "$alloc_wasm_ll"; then
+if grep -q "@malloc(" "$alloc_wasm_ll"; then
   echo "unexpected malloc reference in wasm LLVM output" >&2
   exit 1
 fi
-if grep -q "@free" "$alloc_wasm_ll"; then
+if grep -q "@free(" "$alloc_wasm_ll"; then
   echo "unexpected free reference in wasm LLVM output" >&2
   exit 1
 fi

@@ -39,9 +39,18 @@ void cancel_child_wait_ready(void) {
     }
 }
 
-void cancel_child_open_later(void) {
+static void *open_cancel_child(void *opaque) {
+    (void)opaque;
     usleep(10000);
     atomic_store(&gate_open, 1);
+    return 0;
+}
+
+void cancel_child_open_later(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, open_cancel_child, 0) == 0) {
+        pthread_detach(thread);
+    }
 }
 
 void cancel_child_join(void) {
