@@ -66,7 +66,7 @@ LayoutStore
 - bool layout
 - function pointer layout
 - optional layout：第一版使用显式 `{ tag, payload }`，不做 niche 优化
-- `T&` / `T^` / `T*` / `T[*]` / `T[*:0]` layout：pointer-sized scalar，layout key 保留 handle kind 和 sentinel 标记
+- `T&` / `T^` / `T*` / `T*!` layout：pointer-sized scalar；raw pointer 不携带 length 或 sentinel
 - `T[]` / `T[:0]` 是 unsized array type，没有独立 by-value layout；`T[]&` / `T[:0]&` borrowed view layout 是 pointer + pointer-sized unsigned length，sentinel 不改变物理 layout，只改变类型语义
 - `T[]^` / `T[:0]^` owned unsized array handle 当前也使用 pointer + pointer-sized unsigned length，但它表达 buffer 所有权，drop 时需要析构元素并释放 allocation
 - enum layout：当前 enum 无 associated value，使用 enum underlying integer scalar

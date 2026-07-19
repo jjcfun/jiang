@@ -19,7 +19,7 @@ import std;
 - `fs`：文件读写和路径相关能力，当前主要 re-export `system/fs.jiang`。
 - `io`：标准输入输出能力，当前主要 re-export `system/io.jiang`。
 - `process`：进程参数、环境变量和可执行文件查找，当前主要 re-export `system/process.jiang`。
-- `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`many_pointer()` 和 `into_slice()`。
+- `Vector<T>`：可增长连续缓冲区，支持 `append`、`slice()`、`ptr()` 和 `into_slice()`。
   `Vector<T>` 满足 `Contiguous`，其中 `Element == T`；`length()` 表示已初始化元素数量，
   不包含 `capacity()`。`capacity()` 只表示 `Vector` 自己管理的 spare capacity，
   不属于 `Contiguous` 语义。`truncate()`、`clear()` 和 `deinit` 会析构被移出已初始化区间的元素。
@@ -30,7 +30,7 @@ import std;
 - `Path` / `PathBuilder`：面向路径文本的 owned path 和 builder。`Path.text()` 返回借用视图，
   `Path.into_slice()` 可转成拥有所有权的字节切片。路径算法仍保留在 `std.path` namespace 下。
 - 内建 primitive type 与 trait 的公开入口。optional、errorable、pointer、reference、array 和 slice
-  只通过 `T?`、`T@E`、`T^`、`T&`、`T*`、`T[*]`、`T[N]`、`T[]`、`T[:S]` 等表面语法表达，
+  只通过 `T?`、`T@E`、`T^`、`T&`、`T*`、`T[N]`、`T[]`、`T[:S]` 等表面语法表达，
   compiler-owned constructor 名称不从 `std` re-export。
 - `jiang`：Jiang 语言自身的词法和 syntax 辅助 API。当前包括 `std.jiang.syntax.*`、
   `std.jiang.Token`、`std.jiang.Tokenizer` 和 `std.jiang.ident`。

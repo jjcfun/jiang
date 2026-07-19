@@ -131,7 +131,7 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 - `Int` / `UInt` 是 pointer-sized 整数，语义上分别对应 `isize` / `usize`；在 64-bit target 上通常是 64 位，在 32-bit target 上通常是 32 位。
 - 需要固定 ABI 宽度、文件格式或网络协议布局时，使用 `Int8/Int16/Int32/Int64` 与 `UInt8/UInt16/UInt32/UInt64`。
 - `Char` 表示单个 Unicode 标量，例如 `'a'`、`'中'`
-- 字符串字面量按 UTF-8 字节序列处理，默认类型为 `UInt8[:0]&`；backing storage 自动追加末尾 `0`，但 sentinel 不计入 length。当前可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可按 expected type 转成 `UInt8[*:0]` 或 `UInt8[N:0]`
+- 字符串字面量按 UTF-8 字节序列处理，默认类型为 `UInt8[:0]&`；backing storage 自动追加末尾 `0`，但 sentinel 不计入 length。当前可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可按 expected type 转成 `UInt8*` 或 `UInt8[N:0]`
 - `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
 
 数值字面量在类型检查前保持未定型，优先由上下文决定最终类型。普通已经定型的数值之间不做隐式提升：
@@ -268,8 +268,8 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `Int$.size()`：获取类型 `Int` 的大小
 - `Int$.align()`：获取类型 `Int` 的 ABI 对齐
 - `Int$.max_align()`：获取当前内建分配器保证支持的最大 Jiang 类型对齐
-- `Int$.alloc()`：分配一个未初始化的 `Int![*]`，长度为 `1`
-- `Int$.alloc(10)` / `Int$.alloc_many(10)`：分配一个长度为 `10` 的 `Int![*]`
+- `Int$.alloc()`：分配一个未初始化的 `Int*!`，元素数为 `1`
+- `Int$.alloc(10)`：分配一个包含 `10` 个未初始化元素的 `Int*!`
 
 在当前设计中，许多原本会被写成内建函数的操作，都会逐步迁移到隐式操作层。例如，类型大小不再写作 `size_of(T)`，而统一写作 `T$.size()`。
 
@@ -280,7 +280,7 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `T$.max_align()`
 - `T$.alloc()`
 - `T$.alloc(...)`
-- `T$.alloc_many(...)`
+- `T$.alloc(...)`
 - `value$.ref()`
 - `value$.ptr()`
 - `value$.get()`
@@ -404,14 +404,13 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
 - `T!&`：从 `T!` storage 借出的非 owning 引用，保留目标 storage 的可变性
 - `T&!`：可重绑定的 reference slot，不改变目标对象所有权
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
-- `T[*]`：可按下标访问和按元素偏移的 many-pointer；它不默认自动解引用
-- `T[]&`：borrowed slice view，语义上类似 `{ T[*], length }&` 的连续内存引用视图，
+- `T*`：可在 `unsafe` 中按下标读取的 raw pointer；`T*!` 还可写入
+- `T[]&`：borrowed slice view，语义上类似 `{ T*, length }&` 的连续内存引用视图，
   不表达所有权；裸 `T[]` 是 unsized array type，不能作为普通 value
-- `T[*:0]`：sentinel many-pointer，不带 length，适合 C string ABI
 - `T[:0]&`：sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外
   保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
 
-只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T[*]` 和 `T*` 都不拥有目标对象。
+只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T*` 和 `T*!` 都不拥有目标对象。
 
 #### Pointer / 引用类型
 
@@ -459,7 +458,7 @@ Int& b;
 #### 自动解引用
 
 使用 `T^` 时默认自动解引用，除非 expected type 本身与 owning pointer 类型一致。`T&`、`T*` 和
-`T[*]` 不参与默认自动解引用。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；
+`T*` 不参与默认自动解引用。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；
 需要显式解引用或写入单对象指针/引用时使用 `ptr$.get()` / `ptr$.set(value)`。其中 `ptr$.set(value)`
 只有在 pointee 类型带顶层 `!` 时才合法，例如 `Int!*` 可以写入，`Int*` 只能读取。
 
@@ -522,8 +521,8 @@ unsafe {
 }
 
 Int[1] items = [41];
-Int[*] raw = unsafe {
-    items[0]$.as(Int[*])
+Int* raw = unsafe {
+    items$.ptr()
 };
 
 // many-pointer 通过下标访问
@@ -532,12 +531,12 @@ Int y = raw[0];
 
 `T*` raw pointer 不参与默认自动解引用，只能通过 `$.get()` 显式读取单个目标对象；只有 pointee
 类型带顶层 `!` 的 raw pointer，例如 `T!*`，才允许通过 `$.set(value)` 显式写入。
-`T[*]` many-pointer 也不参与默认自动解引用。它表示一段可按元素索引的连续地址，必须通过下标表达式取元素：
+`T*` raw pointer 也不参与默认自动解引用。它可以在 `unsafe` 中通过下标表达式取元素：
 
 ```c
-Int[*] ptr = items[0]$.as(Int[*]);
+Int* ptr = items$.ptr();
 
-_ raw = ptr;    // raw: Int[*]
+_ raw = ptr;    // raw: Int*
 Int value = ptr[0];
 ptr[1] = 42;
 
@@ -547,7 +546,7 @@ unsafe {
 }
 ```
 
-`T[*]` many-pointer 支持下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
+`T*` 支持 unsafe 下标读，`T*!` 支持 unsafe 下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
 
 除数组、slice、many-pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]` 语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
 
@@ -571,16 +570,16 @@ Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源�
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
-- `T[*]`、`T*` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
+- `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 - 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
-- `T&`、`T!&`、`T&!`、`T[*]`、`T*`、`T[]&` 字段不会被编译器自动释放。
+- `T&`、`T!&`、`T&!`、`T*`、`T*!`、`T[]&` 字段不会被编译器自动释放。
 - `T[]&` 本身不拥有整段 buffer；drop slice reference 时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
-- 经过 `T*` / `T[*]` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
+- 经过 `T*!` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
-- `T&`、`T!&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T!&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 
 显式转移所有权使用 `move()`：
@@ -595,7 +594,7 @@ Buffer^ b = a$.move();
 
 `T[]` 是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]`
 不能作为普通 value 单独存放或传递。`T[]&` 是借用的 slice view，运行时 layout 类似
-`{ data: T[*], length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 view 的使用范围。
+`{ data: T*, length }`，不拥有元素和 buffer，并要求被引用存储的 lifetime 覆盖 view 的使用范围。
 `T[]^` 是 owned unsized array，拥有已初始化的 buffer，drop 时会按元素类型逐个析构并释放底层
 allocation。`T[:S]` 同样是 unsized array type；`T[:S]&` 是带 sentinel 保证的 borrowed view。
 标准库 `Vector<T>.slice()` 返回借用 `T[]&` 视图；`Vector<T>.into_slice()` 会消耗 `Vector`，
@@ -676,10 +675,10 @@ UInt8[_] str1 = "hello";
 UInt8[]& str2 = "hello";
 UInt8[5:0] str3 = "hello";
 UInt8[:0]& str4 = "hello";
-UInt8[*:0] c_str = "hello";
+UInt8* c_str = "hello";
 ```
 
-字符串字面量的底层存储会自动追加末尾 `0`，但 `length` 不包含这个 sentinel。例如 `"hello"` 作为 `UInt8[:0]&` 时，`length == 5`。`UInt8[5:0]` 的逻辑长度是 5，但实际 storage 是 6 个 `UInt8`，因此 `UInt8[5:0]$.size() == 6`。普通 `UInt8[*]` 不直接接收字符串字面量；需要 C 风格 NUL 结尾指针时使用 `UInt8[*:0]`。
+字符串字面量的底层存储会自动追加末尾 `0`，但 `length` 不包含这个 sentinel。例如 `"hello"` 作为 `UInt8[:0]&` 时，`length == 5`。`UInt8[5:0]` 的逻辑长度是 5，但实际 storage 是 6 个 `UInt8`，因此 `UInt8[5:0]$.size() == 6`。需要 C 风格 NUL 结尾指针时使用 `UInt8*`；raw pointer 类型本身不记录 sentinel。
 
 ### Range
 
@@ -1296,7 +1295,7 @@ while (i < 10) {
 ##### For 循环
 
 Jiang 语言支持 `for-in` 语法，用于遍历区间、数组或任何可迭代对象。
-裸 `T[*]` many pointer 不作为 iterable；需要遍历指针区间时，使用 range 产生 index，
+裸 `T*` / `T*!` raw pointer 不作为 iterable；需要遍历指针区间时，使用 range 产生 index，
 再在循环体内写 `p[i]`。
 
 **1. 区间遍历**
@@ -1446,7 +1445,7 @@ struct 还可以定义 `deinit` 函数。
 
 ```c
 struct Buffer {
-  UInt8[*] data;
+  UInt8* data;
 
   deinit() {
     unsafe {
@@ -1759,7 +1758,7 @@ union MyUnion {
 - `RawFn<...>`
 - `T^`
 - `T&`
-- `T[*]`
+- `T*` / `T*!`
 - `T*`
 - optional
 - 其他 `union` / `enum`
@@ -2209,7 +2208,7 @@ extend User: HasValue {
   pattern 参数并添加附加条件时，使用 `@where(T == Int) extend <T> Holder<T> { ... }`。
 - receiver 形状约束写在 `@where` 中，例如 `@where(T == _^) extend <T> Holder<T>` 或
   `@where(T != _?) extend <T> Holder<T>`。
-- `T^` / `T&` / `T*` / `T[*]`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型
+- `T^` / `T&` / `T*` / `T*!`、`T[]` / `T[:S]`、`T[N]` / `T[N:S]` 等语法糖作为类型
   receiver 或 where pattern 时，会按对应内部 canonical owner 查找和匹配 extension。
 - `public extend` 可以跨模块传播；普通 `extend` 只在声明模块可见。`public import` 会继续 re-export
   imported module 的 public extensions。
@@ -2476,13 +2475,13 @@ public alias Bool = Bool;
 
 ### FFI
 
-传给 C 风格 API 的字符串优先使用 `UInt8[*:0]` 表示。字符串字面量在 `UInt8[*:0]` 上下文中会生成以 `\0` 结尾的只读全局数据。`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量。
+传给 C 风格 API 的字符串使用 `UInt8*` 表示。字符串字面量在 `UInt8*` 上下文中会生成以 `\0` 结尾的只读全局数据，pointer 类型本身不记录 sentinel。
 
-如果需要借用 NUL 结尾的只读字节序列，使用 `UInt8[:0]&`；如果需要传给 C ABI，使用 `UInt8[*:0]`。
+如果需要借用 NUL 结尾且保留 length 的只读字节序列，使用 `UInt8[:0]&`；如果需要传给 C ABI，使用 `UInt8*`。
 
 ```c
 extern {
-  public Int open(UInt8[*:0] path, Int options);
+  public Int open(UInt8* path, Int options);
   public Int write(Int fd, UInt8[]& buf, Int count);
   public Int errno;
 }
@@ -2492,6 +2491,6 @@ extern {
 也支持单条声明：
 
 ```c
-extern public Int puts(UInt8[*:0] text);
+extern public Int puts(UInt8* text);
 public extern Int errno;
 ```

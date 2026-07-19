@@ -105,7 +105,7 @@ drop 一次，并且 drop 时不会使仍然活跃的 loan 悬垂。它不展开
 也不生成字段析构 CFG。
 
 drop elaboration 先读取 sema drop query。只有 `Movable` 类型会被考虑自动 drop；
-`T*` / `T[*]` 派生 place 是 raw memory，不做隐式 drop。确认需要 drop 后，再读取 layout
+`T*` / `T*!` 派生 place 是 raw memory，不做隐式 drop。确认需要 drop 后，再读取 layout
 的 drop category 决定具体展开方式：
 
 - `no_drop`：不插入 drop。

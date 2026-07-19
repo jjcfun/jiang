@@ -317,9 +317,8 @@ name        <- ident / "self"
 - `T[]` 表示 unsized array type，不能作为普通 value；`T[]&` 表示 borrowed slice view。
 - `T[:0]` 表示 sentinel unsized array type，`T[:0]&` 表示 borrowed sentinel slice view，
   并额外记录 `data[length] == 0` 的类型语义。
-- `T[*]` 表示 many pointer。
-- `T[*:0]` 表示 sentinel many pointer；它不带 length，适合 C string ABI。
-- raw pointer、many pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
+- `T*` 表示只读能力的 raw pointer，`T*!` 表示可写 raw pointer；二者都不携带 length 或 sentinel。
+- raw pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8**`、`LLVMType**`。
 - `T^` / `T&` 是语言级 ownership/reference handle，不能与其他 handle 叠加。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
 - `T[N:S]` 表示 sentinel 定长数组语法；逻辑长度为 `N`，实际 storage 为 `N + 1`
@@ -356,7 +355,7 @@ name        <- ident / "self"
   `unsafe async [domain] { ... }`。
   effect keyword 的规范顺序是 `unsafe` 在前，`async` / `sync` 在后。
 
-`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T[*]` 等内建后缀类型语法
+`T?`、`T[N]`、`T[]&`、`T[:0]&`、`T^`、`T&`、`T*`、`T*!` 等内建后缀类型语法
 不通过普通名字解析。compiler-owned constructor 名称不进入用户可见 namespace；用户声明
 同名 nominal type 也不会改变这些语法的含义。
 

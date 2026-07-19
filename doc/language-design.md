@@ -144,9 +144,9 @@ SQL、shader 或 UI DSL，同时保持后续类型检查、借用检查、单态
 
 字符字面量用于表示单个字符。`UInt8 byte = 'a';` 这类初始化由 expected type 约束；非 ASCII 字符初始化 `UInt8` 应编译失败。
 
-字符串字面量是 UTF-8 字节序列。字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8[*:0]` 或 `UInt8[N:0]`。
+字符串字面量是 UTF-8 字节序列。字符串字面量的默认类型为 `UInt8[:0]&`；backing storage 会自动追加末尾 `0`，但该 sentinel 不计入 length。字符串字面量可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可在 expected type 下转换为 `UInt8*` 或 `UInt8[N:0]`。
 
-`UInt8[*]` 是普通裸 many pointer，不直接接收字符串字面量；如果要表达 C 风格 NUL 结尾字符串，使用 `UInt8[*:0]`。新代码使用 `UInt8[:0]&` 表达只读 sentinel slice，使用 `UInt8[*:0]` 表达 C ABI 的 NUL 结尾 many pointer。
+`UInt8*` 可以接收字符串字面量，用于 C ABI 的 NUL 结尾地址；类型本身不记录 sentinel。需要保留 length 和 sentinel 语义时使用 `UInt8[:0]&`。
 
 ## 类型系统
 
@@ -184,8 +184,7 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T[:S]&`：borrowed sentinel slice view，
   layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == S`。
   裸 `T[:S]` 是带 sentinel 的 unsized array type，不能作为普通 value。
-- `T[*]`：many pointer，不默认自动解引用，只能通过下标访问元素。
-- `T[*:0]`：sentinel many pointer，不带 length，适合 C string ABI。
+- `T*`：raw pointer，可在 `unsafe` 中按下标读取；`T*!` 还可在 `unsafe` 中按下标写入。
 - `T*`：raw pointer，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
 - `T[N]`：定长数组。
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
@@ -196,7 +195,7 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 
 内建后缀类型语法不经过普通名字解析，compiler-owned constructor 名称也不进入用户可见
 namespace。用户仍可声明同名 nominal type，但不会影响 `T?`、`T[N]`、`T[]&`、`T[:0]&`、
-`T^`、`T&`、`T*`、`T[*]` 等表面语法。后缀类型仍会参与对应内部 canonical owner 的
+`T^`、`T&`、`T*` 等表面语法。后缀类型仍会参与对应内部 canonical owner 的
 extension/member lookup。
 
 sentinel value 使用 `S: const T` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
@@ -208,7 +207,7 @@ sentinel value 使用 `S: const T` 语义，`S` 的类型来自元素类型 `T`�
 ```jiang
 Int[2][3] matrix;
 Int?[] values;
-UInt8[*] raw;
+UInt8* raw;
 Int@Error result;
 Int?!@Error maybe_result;
 ```
@@ -223,7 +222,7 @@ Int?!@Error maybe_result;
 `^` / `&` 会基于左侧已经形成的类型创建新的 language handle 外层。创建出的外层也可以
 继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 `^` 或 `&` 外层；因此不支持
 `T^^`、`T&&`、`T^&` 或 `T&^` 这类 language handle 的 handle。raw pointer、many pointer
-和 slice 是 ABI/低层指针形态，允许按 C ABI 需要叠加，例如 `UInt8[*][*]`、`LLVMType*[*]`。
+和 slice 是 ABI/低层指针形态，允许按 C ABI 需要叠加，例如 `UInt8**`、`LLVMType**`。
 类型归一化阶段如果得到重复 `^` / `&` 层，按当前同类 handle 合并；如果同时出现 `^`
 和 `&`，必须保留错误状态并报告 diagnostic，不能静默选择一种。
 
@@ -344,10 +343,9 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 - `T!&`：从 `T!` storage 借出的非 owning 引用，目标 storage 的可变性保留在被引用类型中。
 - `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
-- `T[*]`：many pointer，可下标访问，不表达单对象 ownership。
+- `T*`：raw pointer，可在 `unsafe` 中下标读取；`T*!` 还可下标写入。
 - `T[]`：unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^`
   形成 owning handle。
-- `T[*:0]`：sentinel many pointer，不带 length，但类型语义保证能扫描到 sentinel。
 - `T[:0]`：带 sentinel 的 unsized array type，必须通过 `T[:0]&` 形成 sentinel slice view，或通过 `T[:0]^` 形成 owning handle；sentinel view 保证 `data[length] == 0`。
 
 标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice(Self self)` 消耗 receiver，
@@ -373,7 +371,7 @@ Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多�
 channel 或用户协议保证。
 
 `^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
-或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*`、`T[*]` 和 `T[]&`
+或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*` 和 `T[]&`
 是 ABI/低层指针视图，可以按 C ABI 需要叠加。归一化阶段如果因为泛型替换得到重复同类
 language handle，可以合并；如果得到 `^` 与 `&` 混合的 handle 层，必须保留错误状态并报告
 diagnostic。
@@ -424,12 +422,12 @@ Int sum = value + 100;        // 允许：value 自动解引用为 Int
 Int bad = value$.ref() + 100; // 错误：Int& 不会在结果位置继续自动解引用
 ```
 
-`T[*]` many pointer 不参与默认自动解引用。它表示一段可按元素索引的连续地址，必须通过下标表达式取元素：
+`T*` raw pointer 不参与默认自动解引用。它表示可在 `unsafe` 中按元素索引的地址：
 
 ```jiang
-Int[*] ptr;
+Int* ptr;
 
-_ raw = ptr;    // raw: Int[*]
+_ raw = ptr;    // raw: Int*
 Int value = ptr[0];
 ptr[1] = 42;
 
@@ -452,7 +450,7 @@ move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable 
 
 - `T^` 是 owning pointer。它拥有指向的堆对象，并参与自动析构。
 - `T&` 是非 owning 引用。它不拥有资源，不参与自动析构。
-- `T[*]`、`T*` 是低层指针；`T[]&` 是 slice reference。它们不表达所有权，不参与自动析构。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
+- `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达所有权，不参与自动析构。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 
 自动析构规则：
 
@@ -460,11 +458,11 @@ move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable 
 - `T^` 是内建 `Movable`，drop 时先 drop pointee，再释放其堆存储。
 - nominal、tuple、array、optional、errorable 作为值拥有自己的字段、元素或 payload；
   如果内部类型需要 drop，外层按结构递归 drop。
-- `T&`、`T*`、`T[*]` 本身不拥有目标对象，不会因为 element type 是 `Movable`
+- `T&`、`T*`、`T*!` 本身不拥有目标对象，不会因为 element type 是 `Movable`
   就自动 drop。
 - `T[]&` 本身不拥有整段 buffer，drop slice reference 时不 drop 全部元素；但 `slice[i]`
   是一个已初始化 `T` place，覆盖该元素时按 `T` 的 drop 规则处理旧值。
-- 经过 `T*` / `T[*]` 得到的 place 是低层裸指针派生 place，写入时是 raw write，
+- 经过 `T*!` 得到的 place 是低层裸指针派生 place，写入时是 raw write，
   不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，它必须声明 `Movable`；drop 该 nominal 时先执行
   自定义 `deinit`，再递归 drop 字段。
@@ -474,7 +472,7 @@ move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable 
 ```jiang
 struct Node: Movable {
     Node^ next;      // 自动析构
-    UInt8[*] bytes;  // 不自动析构
+    UInt8* bytes;  // 不自动析构
     Int length;
 
     deinit() {
@@ -496,7 +494,7 @@ implicit copy / Movable 规则：
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
 - 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
-- `T&`、`T!&`、`T&!`、`T[*]`、`T*`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T!&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
 - 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
@@ -585,7 +583,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 - `value$.as(Type)`：强制类型转换，不保证类型安全。
 - `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
 - `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `unsafe`。
-- `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；`T[*]` many pointer 必须使用下标访问。
+- `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；raw pointer 也可在 `unsafe` 中使用下标访问。
 - `value$.set(new_value)`：显式写入 `T!*` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
 - `value$.addr()`：获取裸指针，需要 `unsafe`。
@@ -594,8 +592,8 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 - `Type$.size()`：类型大小。
 - `Type$.align()`：ABI 对齐。
 - `Type$.max_align()`：默认分配器保证支持的最大对齐。
-- `Type$.alloc()`：分配一个未初始化元素，返回 `Type![*]`。
-- `Type$.alloc(n)` / `Type$.alloc_many(n)`：分配 `n` 个元素。
+- `Type$.alloc()`：分配一个未初始化元素，返回 `Type*!`。
+- `Type$.alloc(n)`：分配 `n` 个未初始化元素，返回 `Type*!`。
 
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
@@ -609,7 +607,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 - 总是安全或低风险的编译期查询：`Type$.size()`、`Type$.align()`、`Type$.max_align()`。
 - 类型系统强制操作：`optional$.some()`，后续需要定义失败时的诊断、trap 或静态证明规则。
-- 需要低层内存能力：`value$.ptr()`、`value$.addr()`、`value$.dealloc()`、`Type$.alloc()`、`Type$.alloc(n)`、`Type$.alloc_many(n)`。
+- 需要低层内存能力：`value$.ptr()`、`value$.mut_ptr()`、`value$.dealloc()`、`Type$.alloc()`、`Type$.alloc(n)`。
 - 需要 unsafe/cast 能力：`value$.as(Type)`。
 
 当前阶段不区分编译器源码包和普通 Jiang 包，普通 package 也默认拥有这些低层能力。最小能力集合和
@@ -1209,7 +1207,7 @@ Int x = {
 - `start..end`：range，左闭右开，item type 是 `Int`。
 - `T[]&`：slice view，item type 是 `T`。
 - `T[N]`：定长数组，item type 是 `T`。
-- `T[*]`：many pointer 不是 iterable；需要遍历时使用 range 产生 index，再用 `p[i]` 访问。
+- `T*` / `T*!`：raw pointer 不是 iterable；需要遍历时使用 range 产生 index，再在 `unsafe` 中用 `p[i]` 访问。
 
 自定义遍历协议分为两层：
 

@@ -196,14 +196,14 @@ ref! _ alias = expr
 - 只读取的外层 local 默认按共享引用捕获，environment 保存 `T&`。
 - 写入外层 `!` storage 时默认按可变引用捕获，environment 保存 `T!&`，并参与 unique borrow 检查。
 - 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
-- `T*`、`T[*]`、`T&` 这类非 owning handle 默认捕获 handle 值，不再额外生成
+- `T*`、`T*!`、`T&` 这类 non-owning handle 默认捕获 handle 值，不再额外生成
   `Ref<handle>`。
 - `T^` 这类 owning handle 不做默认捕获；需要写成 `field = value$.move()` 这类显式
   environment 字段初始化，owner capture/drop 语义后续再完整设计。
 
 闭包体里对隐式捕获名字的自动解引用不是按 env field 类型临时猜测，而是 capture metadata 的
 一部分。只有普通 value 被默认捕获成 slot reference 时，body 使用原名才自动解引用；如果外层
-变量本身就是 `T&`、`T*`、`T[*]` 这类 handle，默认捕获的是 handle 值，body 使用原名仍是原
+变量本身就是 `T&`、`T*`、`T*!` 这类 handle，默认捕获的是 handle 值，body 使用原名仍是原
 handle 类型。
 
 显式 capture alias 不会把 initializer 中的 source 名字注册成 body 里的等价名字。例如

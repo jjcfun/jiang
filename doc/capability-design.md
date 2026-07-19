@@ -310,7 +310,7 @@ async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` �
 - `T&`：跨 domain 需要 `T` 是可共享的不可变/同步安全类型。
 - `T^`：可以 move 到另一个 domain，前提是 `T` 可安全跨 domain 移动。
 - `Fn` / `Fn^`：根据参数类型和捕获 environment 判断是否能跨 domain。
-- `T*` / `T[*]`：跨 domain 需要 `unsafe` 边界。
+- `T*` / `T*!`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
 
 `sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T!&` 带入 `D`。

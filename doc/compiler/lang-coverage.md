@@ -65,7 +65,7 @@
 | MIR control flow | `control_flow`, `error_handling` | partial | loop cleanup、nested try/catch run 用例 |
 | backend runtime entry | `runtime` | covered | argv/env deferred |
 | sentinel const | `generic`, `runtime`, `literal` | covered | `Bool` / `Char` / enum / struct sentinel 和 move-only 反例已覆盖 |
-| sentinel string | `runtime`, `literal` | covered | `UInt8[:0]` / `UInt8[*:0]` 基础转换已覆盖 |
+| sentinel string | `runtime`, `literal` | covered | `UInt8[:0]` / `UInt8*` 基础转换已覆盖 |
 
 ## 补测优先级
 
