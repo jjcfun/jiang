@@ -312,10 +312,7 @@ public struct BodyCheck: Movable {
             if (local.kind != .parameter) { continue; }
             if (signature.has_receiver && self.symbol_text_equal(local.symbol, "self")) { continue; }
             if (param_index >= signature.params.length) { return; }
-            qid.TypeId! param_type = self.checked_param_type(function_type, param_offset + param_index);
-            if (local.mutable_binding && !self.type_ops.is_invalid_type(param_type)) {
-                param_type = self.state.store.types.mutable_type(param_type, token.Span());
-            }
+            qid.TypeId param_type = self.checked_param_type(function_type, param_offset + param_index);
             self.type_ops.bind_def_type(local.def_id, param_type);
             param_index = param_index + 1;
         }
@@ -1195,6 +1192,9 @@ public struct BodyCheck: Movable {
         if (self.handle_borrow_returns_self(source_type)) {
             return source_type;
         }
+        if (self.def_has_mutable_binding(source_def)) {
+            return self.type_ops.borrow_binding_type_for_element(source_type, true);
+        }
         return self.type_ops.borrow_reference_type_for_element(source_type);
     }
 
@@ -1467,10 +1467,19 @@ public struct BodyCheck: Movable {
             self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
             return;
         }
+        if (local.mutable_borrow && !self.borrow_source_is_writable(initializer, value_type)) {
+            self.type_ops.add_node_error(
+                initializer,
+                "mutable borrow requires writable storage",
+                "immutable_borrow_source"
+            );
+            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
+            return;
+        }
         qid.TypeId element_type = self.borrow_binding_element_type(local, initializer, value_type);
         self.type_ops.bind_def_type(
             local.def_id,
-            self.type_ops.borrow_binding_type_for_element(element_type, local.mutable_binding)
+            self.type_ops.borrow_binding_type_for_element(element_type, local.mutable_borrow)
         );
     }
 
@@ -2369,6 +2378,10 @@ public struct BodyCheck: Movable {
         if (kind != .local_def && kind != .parameter_def) { return; }
         qid.TypeId type_id = self.type_ops.type_for_def(def_id);
         if (self.type_is_task(type_id)) { return; }
+        if (self.def_has_mutable_binding(def_id)) {
+            self.add_cross_domain_capture_error(node_id);
+            return;
+        }
         if (self.type_crosses_domain_as_mutable(type_id)) {
             self.add_cross_domain_capture_error(node_id);
             return;
@@ -2607,7 +2620,7 @@ public struct BodyCheck: Movable {
                 && !self.init_self_member_assignment(assign_stmt.target)
                 && !self.init_self_assignment(assign_stmt.target)
                 && !self.type_ops.is_invalid_type(target_type)
-                && !self.state.store.types.get(target_type).is_mutable) {
+                && !self.assignment_target_is_writable(assign_stmt.target, target_type)) {
                 self.type_ops.add_node_error(
                     assign_stmt.target,
                     "assignment target is immutable",
@@ -2635,6 +2648,67 @@ public struct BodyCheck: Movable {
             return;
         }
         self.type_ops.add_node_error(target_id, "field setter is not accessible", "private_set");
+    }
+
+    Bool assignment_target_is_writable(self, hir.HirId target_id, qid.TypeId target_type) {
+        return self.place_has_mutable_binding(target_id);
+    }
+
+    Bool borrow_source_is_writable(self, hir.HirId source_id, qid.TypeId source_type) {
+        return self.assignment_target_is_writable(source_id, source_type);
+    }
+
+    Bool place_has_mutable_binding(self, hir.HirId place_id) {
+        hir.HirNode place = self.state.hirs.node(place_id);
+        if (place.data is .name_ref(name_ref)) {
+            if (name_ref is .local(local_id)) {
+                hir.HirDef& owner = self.state.hirs.def_ref(place_id.owner_def);
+                guard owner.body is .some(ref _ body) else { return false; }
+                return body.local(local_id).mutable_binding;
+            }
+            if (name_ref is .def_ref(def_id)) {
+                return self.def_has_mutable_binding(def_id);
+            }
+            return false;
+        }
+        if (place.data is .member_access(member)) {
+            if (self.member_binding_is_mutable(place_id)) { return true; }
+            if (self.place_type_has_write_capability(member.base)) { return true; }
+            return self.place_has_mutable_binding(member.base);
+        }
+        if (place.data is .index_access(index_access)) {
+            if (self.place_type_has_write_capability(index_access.base)) { return true; }
+            return self.place_has_mutable_binding(index_access.base);
+        }
+        if (place.data is .slice_access(slice_access)) {
+            if (self.place_type_has_write_capability(slice_access.base)) { return true; }
+            return self.place_has_mutable_binding(slice_access.base);
+        }
+        return false;
+    }
+
+    Bool def_has_mutable_binding(self, qid.DefId def_id) {
+        def.DefRecord record = self.state.store.defs.get(def_id);
+        if (record.kind == .local_def || record.kind == .parameter_def) {
+            guard record.owner_def is .some(owner_def) else { return false; }
+            guard self.state.hirs.def(owner_def) is .some(owner) else { return false; }
+            guard owner.body is .some(ref _ body) else { return false; }
+            guard body.local_for_def(def_id) is .some(local_id) else { return false; }
+            return body.local(local_id).mutable_binding;
+        }
+        guard self.state.hirs.def(def_id) is .some(hir_def) else { return false; }
+        return hir_def.decl.mutable_binding && !hir_def.decl.is_const;
+    }
+
+    Bool member_binding_is_mutable(self, hir.HirId member_id) {
+        guard self.state.results.member_selection(member_id) is .some(member_def) else { return false; }
+        guard self.state.hirs.def(member_def) is .some(hir_def) else { return false; }
+        return hir_def.decl.mutable_binding && !hir_def.decl.is_const;
+    }
+
+    Bool place_type_has_write_capability(self, hir.HirId place_id) {
+        guard self.state.results.node_type(place_id) is .some(type_id) else { return false; }
+        return self.state.store.types.get(type_id).is_mutable;
     }
 
     Bool assignment_initializes_local(self, hir.HirAssign assign_stmt) {
@@ -2804,11 +2878,7 @@ public struct BodyCheck: Movable {
         if (self.state.store.defs.get(member_def).kind == .enum_case_def) {
             return self.enum_case_value_type(member_def);
         }
-        qid.TypeId member_type = self.member_type_for_base(base_type, member_def);
-        if (self.state.store.types.get(base_type).is_mutable && !self.type_ops.is_invalid_type(member_type)) {
-            return self.state.store.types.mutable_type(member_type, token.Span());
-        }
-        return member_type;
+        return self.member_type_for_base(base_type, member_def);
     }
 
     qid.TypeId? namespace_member_access_type(self, hir.HirId node_id, hir.HirMemberAccess member_access) {
@@ -3245,10 +3315,16 @@ public struct BodyCheck: Movable {
         types.TypeInfo info = self.state.store.types.get(base_type);
         if (info.data is .handle_type(handle)) {
             if (self.handle_supports_member_access(handle.kind)) {
-                return handle.element;
+                return self.mutable_handle_element_type(info, handle);
             }
         }
         return base_type;
+    }
+
+    qid.TypeId mutable_handle_element_type(self, types.TypeInfo info, types.HandleType handle) {
+        qid.TypeId element = self.type_ops.read_value_type(handle.element);
+        if (!info.is_mutable) { return element; }
+        return self.state.store.types.mutable_type(element, token.Span());
     }
 
     qid.TypeId member_lookup_type_for_base(self, hir.HirId base, qid.TypeId raw_base_type) {
@@ -4340,11 +4416,7 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId local_binding_type(self, hir.HirLocal local, qid.TypeId value_type) {
-        qid.TypeId! local_type = value_type;
-        if (local.mutable_binding && !self.type_ops.is_invalid_type(local_type)) {
-            local_type = self.state.store.types.mutable_type(local_type, token.Span());
-        }
-        return local_type;
+        return value_type;
     }
 
     () mark_let_initialized(self, qid.DefId owner_def, hir.HirLocalId local_id, Bool initialized) {
@@ -4385,10 +4457,10 @@ public struct BodyCheck: Movable {
 
     qid.TypeId borrow_binding_element_type(self, hir.HirLocal local, hir.HirId initializer, qid.TypeId value_type) {
         guard local.type_ref is .some(type_ref) else {
-            return value_type;
+            return self.type_ops.read_value_type(value_type);
         }
         if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
-            return value_type;
+            return self.type_ops.read_value_type(value_type);
         }
         if (self.type_ops.type_ref_is_inferred_mutable(type_ref)) {
             self.type_ops.add_node_error(
@@ -4399,7 +4471,8 @@ public struct BodyCheck: Movable {
             return self.state.store.types.invalid_type();
         }
         qid.TypeId element_type = self.type_ops.check_value_type_ref(type_ref);
-        if (!self.type_ops.same_type(element_type, value_type)) {
+        qid.TypeId source_type = self.type_ops.read_value_type(value_type);
+        if (!self.type_ops.same_type(element_type, source_type)) {
             self.type_ops.add_node_error(
                 initializer,
                 "borrow binding type does not match source storage type",
@@ -4848,7 +4921,7 @@ public struct BodyCheck: Movable {
         types.TypeInfo info = self.state.store.types.get(type_id);
         guard info.data is .handle_type(handle) else { return false; }
         if (handle.kind != .reference && handle.kind != .slice) { return false; }
-        return self.state.store.types.get(handle.element).is_mutable;
+        return info.is_mutable;
     }
 
     () record_call_callee_receiver_instance(self, hir.HirId callee_id, qid.DefId selected_def) {
@@ -6697,7 +6770,9 @@ public struct BodyCheck: Movable {
             .pointer_set => self.check_pointer_set_builtin(node_id, call),
             .move => self.check_move_builtin(node_id, call),
             .borrow_ref => self.check_borrow_ref_builtin(node_id, call, false),
+            .mutable_borrow_ref => self.check_mutable_borrow_builtin(node_id, call, false),
             .address_of => self.check_borrow_ref_builtin(node_id, call, true),
+            .mutable_address_of => self.check_mutable_borrow_builtin(node_id, call, true),
             .cast => self.check_cast_builtin(node_id, call),
             .slice_ptr => self.check_slice_ptr_builtin(node_id, call),
             .dealloc => self.check_dealloc_builtin(node_id, call),
@@ -6961,8 +7036,7 @@ public struct BodyCheck: Movable {
         return element;
     }
 
-    // set 写入的是 pointee，不是 pointer slot 本身，所以可变性必须看
-    // handle.element 的顶层 `!`，不能看 base 表达式是否是可变 local。
+    // T&!/T*! 的写能力存储在 handle 自身，不能从 element 的可变性推导。
     qid.TypeId check_pointer_set_builtin(self, hir.HirId node_id, hir.HirImplicitCall call) {
         qid.TypeId base_type = self.check_node(call.base);
         if (!self.expect_implicit_arg_count(node_id, call, 1)) {
@@ -7010,6 +7084,33 @@ public struct BodyCheck: Movable {
             return base_type;
         }
         return self.type_ops.borrow_reference_type_for_element(base_type);
+    }
+
+    qid.TypeId check_mutable_borrow_builtin(self,
+        hir.HirId node_id,
+        hir.HirImplicitCall call,
+        Bool raw_pointer
+    ) {
+        qid.TypeId base_type = self.check_node(call.base);
+        self.expect_implicit_arg_count(node_id, call, 0);
+        if (!self.is_assignment_target(call.base)) {
+            self.type_ops.add_node_error(node_id, "mutable borrow requires a place expression", "borrow_requires_place");
+            return self.state.store.types.invalid_type();
+        }
+        if (!self.state.store.types.get(base_type).is_mutable
+            && !self.place_has_mutable_binding(call.base)) {
+            self.type_ops.add_node_error(node_id, "mutable borrow requires writable storage", "immutable_borrow_source");
+            return self.state.store.types.invalid_type();
+        }
+        qid.TypeId element = self.type_ops.read_value_type(base_type);
+        qid.TypeId! result;
+        if (raw_pointer) {
+            self.check_call_effects(node_id, types.EffectSet(has_unsafe: true));
+            result = self.state.store.types.raw_pointer_type(element, token.Span());
+        } else {
+            result = self.type_ops.borrow_reference_type_for_element(element);
+        }
+        return self.state.store.types.mutable_type(result, token.Span());
     }
 
     Bool handle_borrow_returns_self(self, qid.TypeId base_type) {
@@ -7202,7 +7303,7 @@ public struct BodyCheck: Movable {
         types.TypeInfo type_info = self.state.store.types.get(type_id);
         guard type_info.data is .handle_type(handle) else { return null; }
         if (handle.kind == .reference || handle.kind == .raw_pointer || handle.kind == .owner_pointer) {
-            return handle.element;
+            return self.mutable_handle_element_type(type_info, handle);
         }
         return null;
     }
@@ -7608,9 +7709,7 @@ public struct BodyCheck: Movable {
     Bool name_ref_is_captured_assignment_target(self, qid.DefId owner_def, hir.HirNameRef name_ref) {
         guard name_ref is .def_ref(def_id) else { return false; }
         if (!self.lambda_name_ref_is_capture(owner_def, name_ref)) { return false; }
-        qid.TypeId type_id = self.type_ops.type_for_def(def_id);
-        if (self.type_ops.is_invalid_type(type_id)) { return false; }
-        return self.state.store.types.get(type_id).is_mutable;
+        return self.def_has_mutable_binding(def_id);
     }
 
     // Jiang 不支持 move out of projection。move 只能消耗完整 root place，
