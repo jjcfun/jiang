@@ -2377,6 +2377,10 @@ struct BodyLowerer: Movable {
     }
 
     qid.TypeId source_type_for_expected_conversion(self, hir.HirId node_id) {
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        if (node.data is .array_literal(array_literal)) {
+            return self.array_literal_source_type(node_id, array_literal);
+        }
         // `place_for_expr` 可能为复杂 place 生成临时值；探测期望转换类型时，
         // 只对确定无副作用的表达式调用它。
         if (self.place_lookup_has_no_lowering_side_effect(node_id)) {
@@ -2386,6 +2390,22 @@ struct BodyLowerer: Movable {
             return self.mir_place_type(place);
         }
         return self.type_for_node(node_id);
+    }
+
+    qid.TypeId array_literal_source_type(self, hir.HirId node_id, hir.HirArrayLiteral literal) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .array_type(_)) {
+            return type_id;
+        }
+        guard info.data is .handle_type(handle) else { return type_id; }
+        if (handle.kind != .slice) { return type_id; }
+        return self.lowerer.ctx.store.types.array_type_with_sentinel(
+            handle.element,
+            literal.items.length,
+            handle.sentinel,
+            self.lowerer.hir_span(node_id)
+        );
     }
 
     Bool place_lookup_has_no_lowering_side_effect(self, hir.HirId node_id) {
@@ -8683,7 +8703,10 @@ struct BodyLowerer: Movable {
     }
 
     () lower_array_literal(self, hir.HirId node_id, hir.HirArrayLiteral literal, mir.MirPlace destination) {
-        qid.TypeId element_type = self.array_element_type(node_id);
+        if (self.lower_array_literal_to_slice(node_id, literal, destination)) {
+            return;
+        }
+        qid.TypeId element_type = self.array_element_type(node_id, destination);
         Int index! = 0;
         while (index < literal.items.length) {
             mir.MirPlace element_place = self.project_constant_index(destination, index);
@@ -8691,6 +8714,38 @@ struct BodyLowerer: Movable {
             index = index + 1;
         }
         self.lower_array_sentinel_storage(destination, element_type, self.lowerer.hir_span(node_id));
+    }
+
+    Bool lower_array_literal_to_slice(
+        self,
+        hir.HirId node_id,
+        hir.HirArrayLiteral literal,
+        mir.MirPlace destination
+    ) {
+        qid.TypeId destination_type = self.mir_place_type(destination);
+        types.TypeInfo destination_info = self.lowerer.ctx.store.types.get(destination_type);
+        guard destination_info.data is .handle_type(handle) else { return false; }
+        if (handle.kind != .slice) { return false; }
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId storage_type = self.lowerer.ctx.store.types.array_type_with_sentinel(
+            handle.element,
+            literal.items.length,
+            handle.sentinel,
+            span
+        );
+        mir.MirLocalId storage = self.add_temp(storage_type, span);
+        mir.MirPlace storage_place = self.place_for_local(storage);
+        self.lower_array_literal(node_id, literal, storage_place);
+        self.push_assign(
+            destination,
+            mir.slice_rvalue(mir.MirSliceRvalue (
+                base: storage_place,
+                start: null,
+                end: self.array_to_slice_end(storage_type, span)
+            )),
+            span
+        );
+        return true;
     }
 
     () lower_array_sentinel_storage(self, mir.MirPlace destination, qid.TypeId element_type, token.Span span) {
@@ -8702,10 +8757,19 @@ struct BodyLowerer: Movable {
         self.lower_comptime_value_into_place_at_span(sentinel.value, sentinel_place, span);
     }
 
-    qid.TypeId array_element_type(self, hir.HirId node_id) {
-        qid.TypeId type_id = self.type_for_node(node_id);
-        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+    qid.TypeId array_element_type(self, hir.HirId node_id, mir.MirPlace destination) {
+        qid.TypeId destination_type = self.mir_place_type(destination);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(destination_type);
         if (info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        hir.HirNode node = self.lowerer.hirs.node(node_id);
+        guard node.data is .array_literal(literal) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        qid.TypeId source_type = self.array_literal_source_type(node_id, literal);
+        types.TypeInfo source_info = self.lowerer.ctx.store.types.get(source_type);
+        if (source_info.data is .array_type(array_type)) {
             return array_type.element;
         }
         return self.lowerer.ctx.store.types.invalid_type();
@@ -10418,13 +10482,27 @@ struct BodyLowerer: Movable {
             if (elem is .field_projection(field)) {
                 current = field.field_type;
             } else if (elem is .constant_index_projection(constant_index)) {
-                current = self.layout_for_type(current).fields[constant_index.offset].field_type;
+                current = self.constant_index_projection_type(current, constant_index.offset);
             } else {
                 current = self.pointer_like_element_type(current);
             }
             index = index + 1;
         }
         return current;
+    }
+
+    qid.TypeId constant_index_projection_type(self, qid.TypeId type_id, Int offset) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            assert(offset >= 0 && offset < tuple_type.items.length);
+            return tuple_type.items[offset];
+        }
+        layout.TypeLayout type_layout = self.layout_for_type(type_id);
+        assert(offset >= 0 && offset < type_layout.fields.length);
+        return type_layout.fields[offset].field_type;
     }
 
     qid.TypeId mir_place_base_type(self, mir.MirPlace place) {
