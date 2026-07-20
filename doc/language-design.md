@@ -254,7 +254,7 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 
 - `T^`：owning pointer；它不是 C 风格 raw pointer。
 - `T&`：shared non-owning reference，不表达释放职责，也不提供可变能力。
-- `T&!`：unique mutable non-owning reference；存活期间排斥指向同一 place 的其他共享或可变引用。
+- `T&!`：唯一可变的 non-owning reference；存活期间排斥指向同一 place 的其他共享或可变引用。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T*`：raw pointer，可在 `unsafe` 中下标读取；`T*!` 还可下标写入。
 - `T[]`：unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^`
@@ -277,7 +277,7 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 ```
 
 该能力属于类型并进入函数签名；`swap(Int&! left, Int&! right)` 不能把同一个 place 同时传给
-两个参数。参数 `unique` 关键字已移除。
+两个参数。唯一可变能力完全由 `T&!` 类型表达，不存在额外的参数修饰关键字。
 
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
 `!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、

@@ -12,7 +12,7 @@
 - `T&!` 表示唯一可变引用；其存活期间不能存在指向重叠 place 的其他共享或可变引用。
 - domain 切换检查叠加在唯一借用之上：普通 `T&!` 不能跨 serial domain 逃逸。
 - `Atomic`、`Mutex`、`Channel`、`Actor` 等同步/并发类型是跨 domain 共享可变状态的显式入口。
-- 唯一性属于 `T&!` 类型并进入函数签名；参数位置不再使用额外的 `unique` 关键字。
+- 唯一性属于 `T&!` 类型并进入函数签名；参数位置不使用额外的能力修饰关键字。
 
 本文的主体是 capability。`effect` 用来描述调用上下文，例如 `unsafe`、`async`、`sync`；
 data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capability 检查。
@@ -221,7 +221,7 @@ domain-bound `async [D]` 函数在签名 metadata 中保存 domain type，调用
 ```
 
 编译器在创建借用、调用和 reborrow 时检查冲突，并沿封装边界要求调用者同样提供 `T&!`。
-`unique` 参数关键字已移除。是否向优化器发出 noalias 仍需服从完整 lifetime 与 ABI 规则。
+是否向优化器发出 noalias 仍需服从完整 lifetime 与 ABI 规则。
 
 ## Async 调用与隐式 Await
 

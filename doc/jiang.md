@@ -391,7 +391,7 @@ Jiang 区分共享引用与唯一可变引用，并对二者执行静态 borrow 
 
 - `T^`：自动解引用的 owning pointer；它不是 C 风格 raw pointer
 - `T&`：自动解引用的 shared non-owning reference，不承担释放职责
-- `T&!`：自动解引用的 unique mutable non-owning reference，存活期间排斥其他别名引用
+- `T&!`：自动解引用的唯一可变 non-owning reference，存活期间排斥其他别名引用
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T*`：可在 `unsafe` 中按下标读取的 raw pointer；`T*!` 还可写入
 - `T[]&`：borrowed slice view，语义上类似 `{ T*, length }&` 的连续内存引用视图，
