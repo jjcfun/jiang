@@ -166,6 +166,15 @@ RawFn<unsafe async [UiDomain] Result<Int, Error>, Void*>
 异步地产生一个 `Fn` 值。`Fn<async [D] R, Args...>` 表示调用该 callable 时进入 `D` 并最终
 得到 `R`。
 
+lambda 的 effect 完全由 expected callable type 决定，表达式本身不重复书写 `async`：
+
+```jiang
+Fn<async [UiDomain] Int, Int> load = (id) => fetch(id);
+```
+
+当前最小实现要求调用点已在 `UiDomain` 中；跨 Domain 的 async `Fn` 动态调用留待后续调度
+入口完成后开放。
+
 `async [UiDomain]` / `sync [UiDomain]` 是 effect keyword option 中
 `async [domain: UiDomain]` / `sync [domain: UiDomain]` 的短写。`async [UiDomain, ctx]`
 是 `async [domain: UiDomain, context: ctx]` 的短写。函数声明和 callable type 只使用静态

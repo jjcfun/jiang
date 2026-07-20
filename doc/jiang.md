@@ -920,6 +920,15 @@ RawFn<unsafe Int, Int>[]& unsafe_callbacks;
 RawFn<async Bool[]&> load_callbacks;
 ```
 
+闭包值使用 `Fn<...>`。lambda 必须有完整的 expected callable type；异步、unsafe 和 Domain
+effect 均由该类型决定，lambda 表达式本身不重复书写：
+
+```jiang
+Fn<async [UiDomain] Int, Int> load = (id) => fetch(id);
+```
+
+当前 async `Fn` 只支持在其签名指定的同一 Domain 内动态调用；跨 Domain 调用暂不支持。
+
 调用带 `unsafe` effect 的函数需要进入显式 effect context：
 
 ```c

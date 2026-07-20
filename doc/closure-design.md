@@ -473,8 +473,14 @@ artifact 或 async frame 如果需要更强的 env 身份，应继续从现有 `
 
 ## 与 async / 数据竞争的关系
 
-async closure 应建立在普通 closure 之上：async state machine 保存的是 closure environment
-和跨 await 存活 local 的组合。数据竞争机制需要约束：
+async closure 已建立在普通 closure 之上。源码仍使用普通
+`(params) [captures] => body`，async effect 由 expected `Fn<async ...>` 类型决定；
+vtable code slot 采用统一的
+`(env, args..., continuation*) -> ()` 启动 ABI，启动 shim 分配具体 coroutine frame，并把 closure
+environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 continuation。
+
+当前第一阶段只开放同 Domain 动态调用。跨 Domain 调度、取消传播以及 async `RawFn`
+的完整运行时适配仍需继续完成。数据竞争机制还需要约束：
 
 - 哪些 capture 可以跨 await 存活。
 - 哪些 closure 可以跨 task/thread move。
@@ -501,6 +507,10 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 显式 capture alias 通过 initializer/type ref 绑定 `def_type`。
 - [x] type check side table 记录显式和隐式 capture metadata。
 - [x] lambda body 按 expected `RawFn` / `Fn` 的 unsafe、async effects 检查。
+- [x] async lambda 根据 expected `Fn<async ...>` 类型确定 effect，不增加重复的表达式前缀。
+- [x] 同 Domain async `Fn` 通过 continuation ABI 启动和恢复。
+- [ ] async `Fn` 跨 Domain 动态调用。
+- [ ] async `RawFn` 运行时启动 ABI。
 - [x] `RawFn<Result<Ret, Err>, ...>` 和 `Fn<Result<Ret, Err>, ...>` 返回位解析。
 - [x] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [x] 需要绑定 receiver 时必须写显式 lambda。
