@@ -1,7 +1,8 @@
 # Capability 设计草案
 
 本文记录 Jiang capability 体系的当前设计草案，并讨论它如何支撑 effect、协程、异步和
-数据竞争防护。这里描述的是方向，不是已实现规范。
+数据竞争防护。`T&!` 唯一借用、基础 domain 检查和 Task 生命周期规则已有实现；更完整的
+跨 domain shareability、同步类型和结构化并发仍是设计方向，不应把整篇都视为已实现规范。
 设计目标是：尽量把数据竞争检查压到编译期完成，不为普通可变访问插入锁、atomic
 或动态 borrow flag。
 
@@ -32,7 +33,7 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 ## Domain 能力
 
 语言核心只认识抽象 capability，不内建 `UiDomain`、`WorkerDomain` 这类具体 domain。
-0.4.7 使用单一 `Domain` trait，并用 `const` 约束形式的 associated item 表示 domain
+0.4.7-2 使用单一 `Domain` trait，并用 `const` 约束形式的 associated item 表示 domain
 执行语义，避免 `Domain<.serial>` / `Domain<.concurrent>` 这种 generic 形式带来的多重实现问题：
 
 ```jiang
@@ -150,7 +151,7 @@ async [domain: PageDomain, context: page_ctx] {
 ```
 
 这里 `PageDomain` 是编译期可见的静态 domain type，用于 data race 检查；`page_ctx` 是后续版本
-预留的运行时 async context，可用于调度、取消、页面生命周期或 tracing。0.4.6 尚不开放
+预留的运行时 async context，可用于调度、取消、页面生命周期或 tracing。当前版本尚不开放
 `context` option；它不参与 domain 静态相等判断，也不能替代 domain。
 
 函数类型沿用第一个类型参数作为 callable signature head：
@@ -241,7 +242,7 @@ async () refresh(Model&! model) {
 
 ```jiang
 sync [UiDomain] {
-    refresh(model$.ref())
+    refresh(model$.mut_ref())
 }
 ```
 
@@ -528,7 +529,7 @@ Vector<Int&!>
 
 - `unsafe`：调用需要 unsafe context。
 - `async`：调用可能挂起。
-- `sync`：block 在某个 domain 同步执行；0.4.6 不保留函数前 `sync` 修饰符。
+- `sync`：block 在某个 domain 同步执行；函数前不保留 `sync` 修饰符。
 - `io`、`atomic`、`alloc` 等未来可作为独立 effect 讨论。
 
 普通 mutable access 由 `T&!` 唯一借用、serial domain 和 domain 切换检查共同保证。这样 `Fn`、
@@ -548,11 +549,10 @@ Jiang 的 `T&!` 与 Rust `&mut T` 一样表达唯一可变借用；Jiang 还叠�
 
 ## 未决问题
 
-- `async [D]` / `sync [D]` block 的 parser 表达和错误信息如何设计。
-- `D` 0.4.6 必须是 domain type；未来是否允许 dependent / instance domain。
+- `D` 当前必须是 domain type；未来是否允许 dependent / instance domain。
 - `T&` 跨 domain 的 shareable 规则如何表达，是否需要公开 `Send` / `Sync` 等 trait 名称。
 - `Fn<async [D] ...>` 的 coroutine context ABI、闭包捕获和错误信息如何设计。
-- `T&!` 返回值的生命周期和 domain 如何在 HIR / type check 中表示。
+- 多来源 `T&!` 返回值的 lifetime/domain 关系与复杂 reborrow 诊断如何进一步收紧。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
 - `T&!` 与 optimizer noalias 的精确关系。
 - `async [D] {}`、结构化并发 scope、detached task 的最终语法。

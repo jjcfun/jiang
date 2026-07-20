@@ -21,7 +21,7 @@ target model、LLVM/object 输出和 executable 诊断边界。
 
 Linux glibc executable 需要 glibc sysroot / toolchain，Jiang 不维护 glibc。macOS host 上编译
 `linux-gnu` hosted executable 必须早停诊断，不能误用 host `cc` 链接 Linux object。
-Linux / WSL host 自举需要 Linux 可执行 bootstrap compiler，当前不属于 0.4.4 第一阶段目标。
+Linux / WSL host 自举需要 Linux 可执行 bootstrap compiler，当前 release 尚不承诺该链路。
 
 Jiang 官方 Linux All in one 路线优先支持 no-libc 静态 executable。`src/system/os/provider.jiang`
 是系统能力抽象入口，`src/system/os/linux/no_libc.jiang` 是移除 libc 依赖的 Linux provider。

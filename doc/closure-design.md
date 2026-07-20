@@ -10,15 +10,15 @@
 表达式本身推导出公开匿名类型。这个规则接近 Swift 的 closure 使用方式：调用者先给出
 函数类型，闭包体再按这个 expected type 检查。
 
-## 0.4.5 发布状态
+## 已实现状态
 
-0.4.5 已经落地基础闭包闭环：`RawFn` / `Fn` 分离、lambda expected type 下推、捕获分析、
+基础闭包闭环已经落地：`RawFn` / `Fn` 分离、lambda expected type 下推、捕获分析、
 `Fn` / `Fn^` lowering、heap env、`Fn(raw)` 显式包装、`Fn^$.ref()` callable borrow view，
-以及对应 borrow / drop 检查。0.4.6 不重做这些主功能，只继续收口诊断、文档和 async/domain
-边界。
+以及对应 borrow / drop 检查。0.4.7-2 在此基础上让可变 capture 使用 `T&!`，并参与唯一
+借用、最后一次使用和 async/domain 边界检查。
 
-已验证的行为见本文末尾测试清单。测试清单中的 `[x]` 表示 0.4.5 发布时或 0.4.6 收口阶段
-已经有语言测试或 smoke 覆盖；未在清单中标成 `[x]` 的 async closure、`FnOnce`、完整
+已验证的行为见本文末尾测试清单。测试清单中的 `[x]` 表示当前已有语言测试或 smoke
+覆盖；未在清单中标成 `[x]` 的 async closure、`FnOnce`、完整
 `Send` / `Sync` 等能力仍属于后续设计。
 
 ## 目标
@@ -171,7 +171,7 @@ Fn<Int, Int> f = (arg) [value = old_value$.move(), Config& config = config$.ref(
 ```jiang
 alias = expr
 _ alias = expr
-_! alias = expr
+_ alias! = expr
 Type alias = expr
 ref _ alias = expr
 ref! _ alias = expr
@@ -451,8 +451,8 @@ lambda.function_def -> [
 
 ## Environment 表示评估
 
-0.4.6 结论：捕获 env 降低为编译器合成的私有匿名 struct，而不是 tuple。env 的语义信息仍保存在
-`LambdaCaptureInfo` side table 中：
+当前实现把捕获 env 降低为编译器合成的私有匿名 struct，而不是 tuple。env 的语义信息
+仍保存在 `LambdaCaptureInfo` side table 中：
 
 - `kind` 区分显式 capture 和隐式 capture。
 - `source_def` / `local_def` 描述外层来源和闭包体中的绑定。
@@ -485,7 +485,7 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 
 ## 测试清单
 
-下面清单同步到 0.4.5 发布后的实现状态，并包含 0.4.6 已补的 Fn/RawFn 混用诊断。
+下面清单同步到当前实现状态，包括 Fn/RawFn 混用诊断和可变 capture 借用检查。
 
 - [x] 非捕获 lambda 可赋给显式 `RawFn<...>`。
 - [x] 非捕获 lambda 可赋给显式 `Fn<...>`。

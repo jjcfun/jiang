@@ -3,11 +3,16 @@
 borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCheckStore` 类型事实和
 `LayoutStore` 中的 concrete layout，不重新推导类型，不重新计算布局。
 
-Jiang 的 borrow check 只处理所有权、move/use-after-move、引用逃逸和析构安全边界。
-它不检查 shared/mutable aliasing，不负责 data-race freedom，也不根据外层 slot
-是否可变决定内部字段能否写入。并发安全和数据竞争策略后续作为单独语言机制设计。
+Jiang 的 borrow check 处理所有权、move/use-after-move、引用逃逸、析构安全边界，以及
+`T&!` 的唯一可变借用。共享引用可以共存；只要某个 `T&!` 仍会被使用，指向重叠 place 的
+共享借用、另一个可变借用和对来源 place 的直接访问都会报错。借用活跃区间按 CFG 上的
+后续使用计算，因此最后一次使用结束后，来源 place 可以恢复访问。
+
+唯一借用只约束语言引用，不负责证明并发代码整体没有 data race。跨 domain 的可变引用另由
+domain borrow 规则检查；同步共享状态仍应使用 mutex、atomic、channel 等显式机制。
 裸指针的创建、转换和显式释放由 sema 的 unsafe effect gate 检查；borrow check 不再重复做
-unsafe/capability gate。borrow check 只在这些操作影响 owner/lifetime/drop safety 时介入。
+unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证明；borrow check 只在
+裸指针操作影响 owner、lifetime 或 drop safety 时介入。
 
 ## 输入
 
@@ -22,6 +27,10 @@ unsafe/capability gate。borrow check 只在这些操作影响 owner/lifetime/dr
 - 检查 owner 被 move/drop/free 后，依赖它的引用不能继续使用。
 - 检查局部引用不能逃出来源 owner 的有效范围。
 - 检查引用存入字段、返回值、闭包捕获等逃逸位置时满足 lifetime 约束。
+- 检查 `T&!` 与仍活跃的共享/可变借用之间不存在重叠 place 冲突。
+- 检查 `T&!` 存活期间不能直接读写其来源 place。
+- 检查同一调用中多个 `T&!` 实参不能指向重叠 place。
+- 检查可变 receiver 或可变引用参数的要求已经由函数签名中的 `T&!` 表达。
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
 - 为 drop 插入和后续 backend 提供约束结果。
 
@@ -30,13 +39,13 @@ unsafe/capability gate。borrow check 只在这些操作影响 owner/lifetime/dr
 显式写出所有允许来源；跨函数调用返回引用、返回含引用字段的聚合值、或 public API 需要表达
 返回来源时，仍应使用 `@life(source > return)`。
 
-mutability 的基本 assignment 检查已经在 type check 阶段完成；borrow check 只处理需要 CFG
-和 lifetime 信息的约束。字段、tuple 元素、union payload、数组元素能否写入，只由对应成员
-类型自己的 `!` 可变性决定；不由 owner/local/reference slot 的可变性决定。
+binding/place 的基本可写性由 type check 阶段检查：`T name!` 表示该存储位置可写，但不改变
+`TypeId`。字段、tuple 元素、union payload 和数组元素的写能力沿 place 传播；共享引用 `T&`
+不会授予写能力。borrow check 再处理需要 CFG 与 lifetime 信息的唯一借用冲突。
 
 ## 数据结构
 
-第一版需要三类核心表：
+当前实现使用以下核心结构：
 
 ```text
 MovePath
@@ -45,23 +54,27 @@ MovePath
   children: MovePathId[]
 
 Loan
-  borrowed_place: MovePathId
-  handle_kind: reference | raw_pointer
-  issued_at: MirLocation
-  expires_at: RegionId?
+  kind: shared_reference | mutable_reference | raw_pointer
+  source: MovePathId
+  target: MovePathId
+  domain_type: DefId?
+
+ActiveLoanFact
+  target: MovePathId
+  loan_id: LoanId
 
 BorrowCheckStore
-  move_state per block
-  active loans per block
-  diagnostics
+  ok
+  loans
+  inferred_return_lifetime_sources
 ```
 
 `MovePath` 按 MIR place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
 里的不同节点。移动父 path 会使子 path 不可用；重新赋值父 path 会重新初始化整棵子树。
 
-`Loan` 表示某个 MIR location 产生的引用或指针视图。`handle_kind` 只区分语言引用和裸指针，
-不表达 shared/mutable 或只读/独占语义。第一版只需要足够表达防悬垂：loan 的来源 place
-必须活到所有使用点之后。
+`Loan` 表示某个 MIR location 产生的引用或指针视图。当前实现区分 shared reference、mutable
+reference 和 raw pointer view，并同时记录来源与承载该 view 的目标 place。引用 loan 既用于
+lifetime/逃逸检查，也用于 shared/mutable 冲突检查；raw pointer view 不参与别名排他性判断。
 
 ## 分析流程
 
@@ -70,6 +83,7 @@ build move paths from MIR places
   -> compute copy/drop category from TypeCheckStore + LayoutStore
   -> forward dataflow: maybe-uninitialized / maybe-moved
   -> forward dataflow: active loans
+  -> query future uses to shorten loan activity after the last use
   -> validate returns, stores, calls and drops
   -> emit BorrowCheckStore
 ```
@@ -136,8 +150,8 @@ MIR 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap
 
 ## 待设计
 
-- `T&`、`T&!`、`T[]&` 和 raw pointer 的精确 lifetime 规则。
+- 更精确的 region/lifetime 推导，以及复杂循环和聚合 reborrow 的诊断质量。
 - copy/drop trait 或 builtin copy 规则。
 - packed/alignment 对 borrow 的限制。
 - 与 `@life(...)` annotation 的集成。
-- 闭包捕获和 async/generator 状态机的借用规则。
+- 闭包捕获和 async/generator 状态机中跨挂起点借用的完整规则。

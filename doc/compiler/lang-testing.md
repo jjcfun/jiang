@@ -36,7 +36,8 @@ test/lang/<feature>/
 详细覆盖状态见 `doc/compiler/lang-coverage.md`。当前 release 需要优先覆盖这些 feature：
 
 - `literal`：integer/float/char/string/bool/null，expected type 转换，字符串与 `UInt8[:0]&`、`UInt8*` 兼容语义。
-- `type`：type suffix 顺序、handle 限制、raw pointer/many pointer/slice/array、errorable。
+- `type`：type suffix 顺序、handle 限制、raw pointer/slice/array、已移除 many pointer 的反例、
+  errorable。
 - `aggregate`：tuple、array、slice、struct 默认构造、union constructor。
 - `function`：tail expr、call stmt、overload、default params、named args、constructor args。
 - `control_flow`：if/switch/guard/while/for/range/defer/break/continue/Never 合并。

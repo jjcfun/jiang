@@ -296,8 +296,6 @@ type_postfix
              / "*"
              / "[" "]"
              / "[" ":" int_lit "]"
-             / "[" "*" "]"
-             / "[" "*" ":" int_lit "]"
              / "[" array_count "]"
              / "[" array_count ":" int_lit "]"
 
@@ -320,6 +318,8 @@ name        <- ident / "self"
 - `T[:0]` 表示 sentinel unsized array type，`T[:0]&` 表示 borrowed sentinel slice view，
   并额外记录 `data[length] == 0` 的类型语义。
 - `T*` 表示只读能力的 raw pointer，`T*!` 表示可写 raw pointer；二者都不携带 length 或 sentinel。
+- `T[*]` 和 `T[*:S]` 已移除；连续内存的低层地址使用 `T*` / `T*!`，带长度的安全 view
+  使用 `T[]&` / `T[:S]&`。
 - raw pointer 和 slice 可以按 C ABI 需要继续叠加，例如 `UInt8**`、`LLVMType**`。
 - `T^` / `T&` 是语言级 ownership/reference handle，不能与其他 handle 叠加。
 - `T[N]` 表示定长数组，`N` 只能是整数字面量。
@@ -342,7 +342,7 @@ name        <- ident / "self"
 - `async [domain]` / `sync [domain]` 是 block effect 中
   `async [domain: domain]` / `sync [domain: domain]` 的短写。`domain` 是实现 `Domain` 的编译期
   domain type；编译器通过 `Domain.kind` 区分 serial/concurrent 语义。运行时 `context` option
-  为后续版本保留，不属于 0.4.6 的用户语法。
+  为后续版本保留，不属于当前用户语法。
 - 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type。
 - 无 domain 的 `async {}` / `sync {}` 只能在已有 current domain 的上下文中使用，并继承 current。
 - 普通同步函数中的最外层 `sync [domain] {}` 阻塞进入 runtime；async context 中的
@@ -351,7 +351,7 @@ name        <- ident / "self"
   非调用表达式创建 Task 时使用 `async [domain]? { ... }`。
 - Task creation 是 eager 的并返回 body-local `Task<T>`；`task.await()` 和 `task.cancel()` 都是
   consuming operation，只能选择其中一个。旧的
-  `callee$().async()` 和 `await expr` 不属于 0.4.6 语法。
+  `callee$().async()` 和 `await expr` 不属于当前语法。
 - 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
   `async [domain] { ... }`、`sync [domain] { ... }`、`async { ... }`、`sync { ... }`、
   `unsafe async [domain] { ... }`。

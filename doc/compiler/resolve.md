@@ -12,10 +12,10 @@ resolved AST lower 成 HIR，不再产生 `ResolvedFile` 这种中间文件结�
 内可达 module 直接 lower 到 HIR：
 
 ```jiang
-syntax_store.Store! asts = syntax_store.Store()
+syntax_store.Store asts! = syntax_store.Store()
 SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
 asts.set_unit(root.unit, source_revision)
-ModuleResolver! resolver = ModuleResolver(ctx, asts$.ref())
+ModuleResolver resolver! = ModuleResolver(ctx, asts$.ref())
 ModuleGraph^ graph = resolver.build_module_graph(root_unit)
 resolver.lower_module_graph_to_hir(graph$.ref())
 ```

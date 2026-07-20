@@ -94,6 +94,9 @@ mutable_items[0] = 10;
 
 类型推导默认得到不可重赋值 binding；需要可写 binding 时写 `_ value!`。绑定可变性不进入
 `TypeId` 或函数签名。`T&!` 是唯一可变引用，`T*!` 是可写 raw pointer；其他类型不能带 `!`。
+`ref! _ borrowed = value` 与 `value$.mut_ref()` 都从可写 place 创建 `T&!`；
+`ref _ borrowed! = value` 只让新 binding 可重新赋值，仍然创建共享引用 `T&`。
+语言没有 `unique` 参数关键字；`unique` 可以作为普通标识符。
 
 ### 基本类型
 
@@ -257,7 +260,9 @@ Jiang 语言把安全转换和低层强制转换分开：
 
 - `a$.as(Int)`：对值 `a` 做低层强制转换
 - `a$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`
+- `a$.mut_ref()`：从可写 place 创建唯一可变引用 `T&!`
 - `a$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `unsafe`
+- `a$.mut_ptr()`：从可写 place 创建可写 raw pointer `T*!`，需要 `unsafe`
 - `a$.get()`：显式解引用 `T^` / `T&`，返回指向的值
 - `a$.move()`：显式转交当前变量的值，源变量随后失效且不再析构
 - `a$.addr()`：获取值 `a` 的裸指针，需要 `unsafe`
@@ -277,9 +282,10 @@ Jiang 语言把安全转换和低层强制转换分开：
 - `T$.max_align()`
 - `T$.alloc()`
 - `T$.alloc(...)`
-- `T$.alloc(...)`
 - `value$.ref()`
+- `value$.mut_ref()`
 - `value$.ptr()`
+- `value$.mut_ptr()`
 - `value$.get()`
 - `value$.as(Type)`
 
@@ -390,16 +396,16 @@ Jiang 区分共享引用与唯一可变引用，并对二者执行静态 borrow 
 指针语义约定为：
 
 - `T^`：自动解引用的 owning pointer；它不是 C 风格 raw pointer
-- `T&`：自动解引用的 shared non-owning reference，不承担释放职责
-- `T&!`：自动解引用的唯一可变 non-owning reference，存活期间排斥其他别名引用
-- `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
-- `T*`：可在 `unsafe` 中按下标读取的 raw pointer；`T*!` 还可写入
+- `T&`：shared non-owning reference，不承担释放职责，也不授予写能力
+- `T&!`：唯一可变 non-owning reference，存活期间排斥重叠的共享/可变借用
+- `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景；可在 `unsafe` 中按下标读取，
+  `T*!` 还可写入
 - `T[]&`：borrowed slice view，语义上类似 `{ T*, length }&` 的连续内存引用视图，
   不表达所有权；裸 `T[]` 是 unsized array type，不能作为普通 value
 - `T[:0]&`：sentinel borrowed slice view，layout 与 `T[]&` 一样是 `{ data, length }`，并额外
   保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
 
-只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T*` 和 `T*!` 都不拥有目标对象。
+只有 `T^` 表达语言级所有权。`T&`、`T&!`、`T[]&`、`T*` 和 `T*!` 都不拥有目标对象。
 类型后缀 `!` 当前只允许写在 reference 和 raw pointer 外层，即 `T&!` 与 `T*!`，并进入签名。
 `T name!` 中绑定名后的 `!` 只允许重新赋值，不进入签名。
 
@@ -449,8 +455,9 @@ Int& b;
 
 #### 自动解引用
 
-使用 `T^` 时默认自动解引用，除非 expected type 本身与 owning pointer 类型一致。`T&`、`T*` 和
-`T*` 不参与默认自动解引用。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；
+使用 `T^` 时默认自动解引用，除非 expected type 本身与 owning pointer 类型一致。`T&`、`T&!`、
+`T*` 和 `T*!` 不参与默认自动解引用。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr`
+这种写法不成立；
 需要显式解引用或写入单对象指针/引用时使用 `ptr$.get()` / `ptr$.set(value)`。其中 `ptr$.set(value)`
 要求 `T&!` 或 `T*!` 写能力；`T&` 和 `T*` 只能读取。
 
@@ -512,30 +519,37 @@ Int* raw = unsafe {
     items$.ptr()
 };
 
-// many-pointer 通过下标访问
-Int y = raw[0];
+Int y = unsafe {
+    raw[0]
+};
 ```
 
-`T*` raw pointer 不参与默认自动解引用，只能通过 `$.get()` 显式读取单个目标对象；只有 pointee
-类型带顶层 `!` 的 raw pointer，例如 `T*!`，才允许通过 `$.set(value)` 显式写入。
-`T*` raw pointer 也不参与默认自动解引用。它可以在 `unsafe` 中通过下标表达式取元素：
+`T*` raw pointer 只能通过 `$.get()` 显式读取单个目标对象；只有 raw pointer 外层带 `!` 的
+`T*!` 才允许通过 `$.set(value)` 写入。raw pointer 也可以在 `unsafe` 中通过下标表达式取元素：
 
 ```c
-Int* ptr = items$.ptr();
+Int[2] mutable_items! = [41, 0];
 
-_ raw = ptr;    // raw: Int*
-Int value = ptr[0];
-ptr[1] = 42;
-
-_ item_ref = ptr[1]$.ref(); // item_ref: Int&
 unsafe {
-    _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
+    Int* ptr = mutable_items$.ptr();
+    Int*! writable = mutable_items$.mut_ptr();
+    _ raw = ptr;                   // raw: Int*
+    Int value = ptr[0];
+    writable[1] = 42;
+
+    _ item_ref = ptr[1]$.ref();    // item_ref: Int&
+    _ item_ptr = ptr[1]$.ptr();    // item_ptr: Int*
 }
 ```
 
 `T*` 支持 unsafe 下标读，`T*!` 支持 unsafe 下标读写，但当前不提供 `offset()` 这类额外指针算术语法。
+`Void*` / `Void*!` 只能传递、比较和转换，不能 `$.get()`、`$.set()` 或下标访问；访问前必须先
+转换为具有具体元素类型的 raw pointer。
+旧的 `T[*]` / `T[*:S]` many pointer 类型已经移除：低层地址统一使用 `T*` / `T*!`，需要
+length 或 sentinel 保证时使用 `T[]&` / `T[:S]&`。
 
-除数组、slice、many-pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]` 语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
+除数组、slice、raw pointer 外，显式实现 `SubscriptGet` trait 的用户类型也支持 `value[index]`
+语法；如果该类型还显式实现 `SubscriptSet`，则支持 `value[index] = new_value`。
 
 `^` owning pointer 可通过 `ptr$.dealloc()` 主动释放默认堆分配器上的对象；`&` 引用只是非 owning 引用，不参与释放。
 `ptr$.dealloc()` 是低层释放操作，不作为普通析构入口使用。目标语言的自动析构由作用域退出、`T^` 字段析构和类型的 `deinit()` 规则处理。
@@ -552,21 +566,22 @@ unsafe {
 
 ### 所有权、implicit copy 和析构
 
-Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源释放、自动析构、隐式 copy 和
-显式 move 的边界。
+Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` 的唯一可变借用。
+共享引用可以共存；活跃的 `T&!` 会排斥重叠的共享/可变借用，并阻止直接访问来源 place。
+引用最后一次使用后，来源 place 可以恢复访问。raw pointer 不参与这项别名证明。
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 - 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
-- `T&`、`T&!`、`T&!`、`T*`、`T*!`、`T[]&` 字段不会被编译器自动释放。
+- `T&`、`T&!`、`T*`、`T*!`、`T[]&` 字段不会被编译器自动释放。
 - `T[]&` 本身不拥有整段 buffer；drop slice reference 时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
 - 经过 `T*!` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
-- `T&`、`T&!`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 
 显式转移所有权使用 `move()`：
@@ -2179,7 +2194,9 @@ extend User: HasValue {
 
 - method 不进入模块顶层命名空间
 - `self` 参数表示 receiver `Self&`；`Self self` 表示拥有值 receiver
-- 字段能否赋值只由字段类型本身是否 mutable 决定
+- 字段声明用 `Type name!` 表达该字段 storage 可写；实际赋值还要求访问链上的外层 place
+  可写，
+  共享引用不能把字段升级成可写 place
 - 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self` 方法会消耗 `value`
 - receiver 已经是 pointer 时，`ptr.method(args...)` 与 `value.method(args...)` 使用同一套 lookup
 - `Type.method(receiver, args...)` 是显式方法调用形式

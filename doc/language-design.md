@@ -3,9 +3,8 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.6` 分支继承 0.4.5 已发布的自举编译器、core 源码化入口、
-标准库孵化入口、泛型/trait 基础、Lang Package 自定义语法、MIR/backend、inline asm、
-WASI 输出、闭包基础闭环和源码级语言测试。
+当前 `release/0.4.7-2` 分支在既有自举编译器、泛型/trait、MIR/backend、闭包、async/domain
+和源码级语言测试基础上，收口 binding mutability、唯一可变引用与 raw pointer 能力。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
@@ -183,8 +182,8 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T[:S]&`：borrowed sentinel slice view，
   layout 与 `T[]&` 一样是 `{ data, length }`，并额外保证 `data[length] == S`。
   裸 `T[:S]` 是带 sentinel 的 unsized array type，不能作为普通 value。
-- `T*`：raw pointer，可在 `unsafe` 中按下标读取；`T*!` 还可在 `unsafe` 中按下标写入。
-- `T*`：raw pointer，供 FFI / ABI / 低层能力使用，不使用语言级 owning pointer 语法表示。
+- `T*`：raw pointer，供 FFI / ABI / 低层能力使用；可在 `unsafe` 中按下标读取，`T*!`
+  还可在 `unsafe` 中按下标写入。
 - `T[N]`：定长数组。
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
@@ -233,6 +232,7 @@ Int*! pointer = unsafe { value$.mut_ptr() };
 绑定名后的 `!` 是 place metadata，不进入 `TypeId` 或函数签名。因此 `foo(Int value!)`
 和 `foo(Int value)` 的签名相同；前者只允许函数体内重新赋值参数槽。相反，
 `foo(Int&! value)` 的唯一可变引用能力属于参数类型，必须进入签名。
+语言不提供额外的 `unique` 参数修饰符；`unique` 是普通标识符。
 
 字段同样使用绑定名表达存储可写性：
 
@@ -255,11 +255,14 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 - `T^`：owning pointer；它不是 C 风格 raw pointer。
 - `T&`：shared non-owning reference，不表达释放职责，也不提供可变能力。
 - `T&!`：唯一可变的 non-owning reference；存活期间排斥指向同一 place 的其他共享或可变引用。
-- `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
-- `T*`：raw pointer，可在 `unsafe` 中下标读取；`T*!` 还可下标写入。
+- `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景；可在 `unsafe` 中下标读取，
+  `T*!` 还可下标写入。
 - `T[]`：unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^`
   形成 owning handle。
 - `T[:0]`：带 sentinel 的 unsized array type，必须通过 `T[:0]&` 形成 sentinel slice view，或通过 `T[:0]^` 形成 owning handle；sentinel view 保证 `data[length] == 0`。
+
+旧的 `T[*]` / `T[*:S]` many pointer 类型已经移除。低层连续内存地址统一使用 `T*` / `T*!`；
+需要 length 或 sentinel 保证时使用 slice reference。raw pointer 类型本身不携带这些元数据。
 
 标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice(Self self)` 消耗 receiver，
 并把 initialized 区间转移为 owning `T[]^`。
@@ -279,9 +282,9 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 该能力属于类型并进入函数签名；`swap(Int&! left, Int&! right)` 不能把同一个 place 同时传给
 两个参数。唯一可变能力完全由 `T&!` 类型表达，不存在额外的参数修饰关键字。
 
-Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
-`!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、
-channel 或用户协议保证。
+唯一可变引用会在单个 borrow-check 域内排斥重叠别名，但这不等于自动证明任意并发程序
+没有 data race。跨 domain 传递受 domain borrow 规则约束；跨线程共享可变状态仍必须通过
+标准库的 mutex、rwlock、atomic、channel 或其他显式同步协议表达。
 
 `^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
 或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*` 和 `T[]&`
@@ -335,14 +338,15 @@ Int bad = value$.ref() + 100; // 错误：Int& 不会在结果位置继续自动
 
 ```jiang
 Int* ptr;
+Int*! writable;
 
-_ raw = ptr;    // raw: Int*
-Int value = ptr[0];
-ptr[1] = 42;
-
-_ item_ref = ptr[1]$.ref(); // item_ref: Int&
 unsafe {
-    _ item_ptr = ptr[1]$.ptr(); // item_ptr: Int*
+    _ raw = ptr;                  // raw: Int*
+    Int value = ptr[0];
+    writable[1] = 42;
+
+    _ item_ref = ptr[1]$.ref();   // item_ref: Int&
+    _ item_ptr = ptr[1]$.ptr();   // item_ptr: Int*
 }
 ```
 
@@ -350,10 +354,9 @@ unsafe {
 
 ## 所有权、implicit copy 和析构
 
-目标规则：Jiang 不引入完整 alias borrow checker，但必须把资源释放、自动析构、隐式复制和
-显式 move 的边界固定下来。当前 borrow check 已经作为 MIR 后的必经阶段，用于检查
-move/use-after-move、引用逃逸和 drop safety；它不检查 shared/mutable aliasing，
-也不负责 data-race freedom。
+当前 borrow check 是 MIR 后的必经阶段，用于检查 move/use-after-move、引用逃逸、drop safety
+以及 `T&!` 的唯一可变借用。它按重叠 place 和引用的后续使用检查 alias 冲突；raw pointer
+不参与这项别名证明，其访问由 `unsafe` 边界约束。
 
 所有权类型：
 
@@ -386,7 +389,7 @@ struct Node: Movable {
 
     deinit() {
         unsafe {
-            bytes$.dealloc(); // 只有自定义 deinit 会释放 many pointer
+            bytes$.dealloc(); // raw pointer 不会自动释放，必须显式管理
         }
     }
 }
@@ -403,7 +406,7 @@ implicit copy / Movable 规则：
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
 - 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
-- `T&`、`T&!`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
 - 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
@@ -442,8 +445,9 @@ a.length; // 编译错误：a 已经 move
 // 作用域结束时只析构 b，不析构 a
 ```
 
-这套规则只解决所有权转移、析构和悬垂引用安全，不等同于完整 alias borrow checker。
-`T&` 不表达只读或独占访问，也不用于静态防止数据竞争。
+`T&` 表达共享只读访问，`T&!` 表达唯一可变访问。borrow checker 会阻止仍活跃的 `T&!`
+与重叠共享/可变引用并存，也会阻止通过来源 place 绕过该借用直接访问。引用最后一次
+使用后，来源 place 可以恢复访问。
 
 生命周期约束使用 `@life(...)` leading annotation 表达。`@life(a > b)` 表示 `a` 的目标 lifetime 必须 outlive `b`；`>` 只表示 outlives，不表示值比较或依赖方向。`@life` 与 `@where` 分离：`@where` 只描述类型、trait 和 associated type 约束，`@life` 只描述引用 lifetime 约束。
 
@@ -454,7 +458,7 @@ a.length; // 编译错误：a 已经 move
 - 参数名：参数或参数引用目标 lifetime。
 - 字段名：该字段引用目标 lifetime。
 
-带 `T&` / `T&!` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
+带 `T&` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
 
 ```jiang
 @life(data > self)
@@ -479,9 +483,9 @@ UInt8& first(UInt8& input);
 Slice make_slice(Buffer& buffer);
 ```
 
-第一版 lifetime 检查目标是防悬垂：局部引用不能逃出其来源 owner 的有效范围；
-owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数和存储到类型字段的关系通过
-`@life` 检查。Jiang 不做 shared/mutable alias borrow checking。
+当前 lifetime 检查会阻止局部引用逃出来源 owner 的有效范围，并阻止 owner 在活跃借用期间被
+move/drop/free。跨函数和存储到类型字段的来源关系通过 `@life` 检查；shared/mutable alias
+冲突则由 loan 的种类、重叠 place 和最后一次使用共同判断。
 
 ## 隐式操作层
 
@@ -491,7 +495,9 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 
 - `value$.as(Type)`：强制类型转换，不保证类型安全。
 - `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
+- `value$.mut_ref()`：从可写 place 创建唯一可变引用 `T&!`。
 - `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `unsafe`。
+- `value$.mut_ptr()`：从可写 place 创建可写裸指针 `T*!`，需要 `unsafe`。
 - `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；raw pointer 也可在 `unsafe` 中使用下标访问。
 - `value$.set(new_value)`：显式写入 `T*!` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
@@ -507,7 +513,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 安全类型转换优先用类型初始化形式，例如 `Int(value)`；`$.as()` 保留为底层强制转换。
 
 隐式操作层的低层操作会逐步接入 effect 检查。当前裸指针获取和显式释放需要放在 `unsafe`
-中；borrow check 仍然只检查所有权、lifetime 和 drop safety。
+中；语言引用仍由 borrow checker 检查 ownership、lifetime、drop safety 和唯一可变借用。
 
 如果后续引入更细的 capability 系统，`$` 会成为受编译期 capability 约束的低层操作层。每个 `$`
 操作都需要对应能力；缺少能力时编译失败。

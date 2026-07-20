@@ -50,7 +50,7 @@
 | Semantic area | Feature dir | Status | Missing cases |
 | --- | --- | --- | --- |
 | expected type literal conversion | `literal`, `aggregate` | partial | float/int 溢出边界、char 到非字符目标 |
-| mutability layering | `type`, `ownership` | partial | tuple/array/union 内层可变性组合 |
+| binding/type mutability | `type`, `ownership` | covered | `name!` 与 `T&!` / `T*!` 的签名和能力边界 |
 | pointer/reference operations | `type`, `ownership` | covered | raw pointer arithmetic deferred |
 | ownership move/copy | `ownership` | covered | generic negative bound 更多组合 |
 | drop/deinit/defer | `ownership` | partial | nested loop early-exit run 用例 |

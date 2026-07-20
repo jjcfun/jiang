@@ -8,24 +8,12 @@
 
 常规版本从 `main` 建立 `release/<version>`，使用上一版正式 release 的 `jiangc` 构建当前源码。
 当当前版本需要 bootstrap 分支承接破坏性升级时，`release/<version>` 使用同版本 bootstrap
-编译器继续开发和验证。0.4.4 属于这个模式。
+编译器继续开发和验证。
 
 推荐安装路径：
 
 ```text
 ~/.jiang/versions/<previous-version>/bin/jiangc
-```
-
-0.4.4 release 分支的默认 bootstrap compiler 是：
-
-```text
-../bootstrap-0.4.4/build/bin/jiangc.next
-```
-
-如果没有同级 bootstrap worktree，也可以把 0.4.4 bootstrap 编译器安装到本地环境：
-
-```text
-~/.jiang/versions/0.4.4-bootstrap/bin/jiangc
 ```
 
 构建当前源码：
@@ -34,17 +22,10 @@
 bash ./script/build_next.sh
 ```
 
-默认构建链路：
-
-```text
-../bootstrap-0.4.4/build/bin/jiangc.next -> build/bin/jiangc.next
-```
-
-脚本会校验 bootstrap compiler 版本，0.4.4 release 分支只接受 `jiang 0.4.4-bootstrap`。
-如果需要使用其它路径的同版本编译器，可以显式指定：
+脚本会校验 bootstrap compiler 版本。如果需要使用其他路径的兼容编译器，可以显式指定：
 
 ```bash
-BOOTSTRAP_BIN=/path/to/jiang-0.4.4-bootstrap/bin/jiangc bash ./script/build_next.sh
+BOOTSTRAP_BIN=/path/to/previous/bin/jiangc bash ./script/build_next.sh
 ```
 
 提交前至少跑：
@@ -54,10 +35,55 @@ VERIFY=none bash ./script/build_next.sh
 JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 ```
 
-正式 release 前跑 stable bootstrap 和完整验证：
+正式 release 前生成 stable，并用 stable 跑语言测试：
 
 ```bash
-BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
+BOOTSTRAP_DEPTH=stable VERIFY=none bash ./script/build_next.sh
+JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
+```
+
+## 0.4.7-2 自举链
+
+0.4.7-2 的可变性语法无法直接由普通 release 源码兼容完成，因此固定使用以下链路：
+
+```text
+0.4.7-bootstrap seed
+  -> bootstrap/0.4.7-2 的 jiangc.next
+  -> release/0.4.7-2 的 jiangc.next
+  -> release/0.4.7-2 的 stable jiangc
+```
+
+bootstrap worktree 只负责第一条边，不要求用 bootstrap next 再编译 bootstrap 自己。release
+源码只使用新 canonical 语法，不为 bootstrap worktree 中的旧源码增加兼容。
+
+构建 bootstrap next：
+
+```bash
+BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.7/build/bin/jiangc \
+VERIFY=none \
+bash ./script/build_next.sh
+```
+
+release worktree 使用 bootstrap next；由于该过渡编译器对外报告 `jiang 0.4.7`，需要同步设置
+版本校验值：
+
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.4.7 \
+BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.7-2/build/bin/jiangc.next \
+VERIFY=none \
+bash ./script/build_next.sh
+```
+
+生成 release stable 并执行语言测试：
+
+```bash
+BOOTSTRAP_RELEASE_VERSION=0.4.7 \
+BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.7-2/build/bin/jiangc.next \
+BOOTSTRAP_DEPTH=stable \
+VERIFY=none \
+bash ./script/build_next.sh
+
+JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 ```
 
 ## 双 worktree 模式
@@ -89,8 +115,8 @@ BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 `bootstrap/<version>` 只需要一轮自举：
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=<previous-version> \
 BOOTSTRAP_BIN=/path/to/previous/release/jiangc \
-JIANG_VERSION=<version> \
 bash ./script/build_next.sh
 ```
 
@@ -99,8 +125,8 @@ bash ./script/build_next.sh
 `release/<version>` 使用 bootstrap 编译器验证：
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=<version> \
 BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-<version>/build/bin/jiangc.next \
-JIANG_VERSION=<version> \
 bash ./script/build_next.sh
 ```
 
