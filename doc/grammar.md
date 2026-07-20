@@ -197,10 +197,13 @@ param_list  <- required_param ("," required_param)* ("," default_param)* ","?
             / default_param ("," default_param)* ","?
 
 required_param
-            <- "unique"? type name
+            <- type binding_name
 
 default_param
-            <- "unique"? type name "=" expr
+            <- type binding_name "=" expr
+
+binding_name
+            <- name "!"?
 ```
 
 说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。
@@ -308,9 +311,8 @@ name        <- ident / "self"
 约定：
 
 - `T?` 表示 optional 类型层。
-- `T!` 表示当前类型层级可变。
-- `?` 和 `!` 最多各出现一次，且顺序必须是 `?` 再 `!`。`T?!` 合法；
-  `T!?` 应改成 `T?!`，`T??` / `T!!` 不合法。
+- `!` 作为类型后缀只允许直接修饰 reference 或 raw pointer 外层：`T&!` 和 `T*!`。
+  `T!`、`T^!`、`T[]!`、`T?!` 和 `T!&` 都不合法。
 - `T&` 表示引用外层。
 - `T^` 表示 owning pointer 外层。
 - `T*` 表示 raw pointer；主要用于 FFI / ABI / 低层 capability 场景，不参与自动解引用。
@@ -784,13 +786,13 @@ pattern_list
 
 - `match_pattern` 用于 `is` 和 `switch` 分支根，只接受 optional、variant、literal。
 - 单段 `path` 只作为 binding 子 pattern 使用，不能作为 `is` 或 `switch` 的分支根。
-- `ref T name` 表示借用绑定；需要可重绑定引用 slot 时写 `ref! T name`。
-  `ref! Int value` 生成 `Int&!` 绑定。`ref` 是绑定模式，不是类型名。
+- `ref T name` 创建共享借用；`ref! T name` 创建唯一可变借用，结果类型为 `T&!`。
+  `ref` / `ref!` 是绑定模式，不是类型名。
 - `ref _ name` 可用在需要推导 payload 类型的借用 pattern 中；裸 `_` 仍表示 wildcard。
   需要借用 payload 时写 `.some(ref T name)`、`.some(ref _ name)` 或 `.case(ref T name)`。
 - destructure 和 local declaration 仍支持 `_` 类型占位，例如 `_ value = expr;`、`(_ left, Int right) = pair;`。
-- `_! name` 可在 pattern 中表示可变绑定；旧的 `_` 后缀借用写法不再作为 pattern 借用绑定语法。
-  payload 借用使用 `ref T name`，需要可重绑定引用 slot 时使用 `ref! T name`。
+- 绑定名后的 `!` 表示该绑定可重新赋值，例如 `ref T name!`；它不会把共享借用变成可变借用。
+- `_! name` 不合法；payload 共享借用使用 `ref T name`，唯一可变借用使用 `ref! T name`。
 - 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法。
 
 ## 说明

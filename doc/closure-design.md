@@ -194,7 +194,7 @@ ref! _ alias = expr
 未列入列表的外层 local 仍按默认规则自动捕获。默认规则是“统一引用捕获”：
 
 - 只读取的外层 local 默认按共享引用捕获，environment 保存 `T&`。
-- 写入外层 `!` storage 时默认按可变引用捕获，environment 保存 `T!&`，并参与 unique borrow 检查。
+- 写入外层可写 storage 时默认按可变引用捕获，environment 保存 `T&!`，并参与唯一借用检查。
 - 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
 - `T*`、`T*!`、`T&` 这类 non-owning handle 默认捕获 handle 值，不再额外生成
   `Ref<handle>`。
@@ -303,7 +303,7 @@ extern fn qsort(
 默认捕获必须能从闭包 body 和 expected type 推导出安全 environment：
 
 - 只读取的外层 local 保存共享引用，闭包值不能活过被捕获 storage 的生命周期。
-- 写入外层 `!` storage 保存可变引用，闭包创建和调用都要满足 unique borrow 约束。
+- 写入外层可写 storage 保存 `T&!`，闭包创建和调用都要满足唯一借用约束。
 - owner move 只能通过显式字段初始化进入 environment，不能由默认捕获隐式发生。
 
 因此基础闭环里，非 owner capture 的闭包不能拥有外层对象；它只能保存值副本或借用外层
@@ -378,17 +378,17 @@ aggregate member lifetime 规则后续统一在 borrow/lifetime checker 中表�
 
 ## Borrow 和可变捕获
 
-可变捕获应借用被捕获 storage，并和 `unique` 参数规则一致：
+可变捕获应借用被捕获 storage，并和 `T&!` 参数规则一致：
 
 ```jiang
-Int! total = 0;
+Int total! = 0;
 Fn<(), Int> add = (value) => {
     total = total + value;
 };
 ```
 
 在 `add` 存活期间，外层不能再创建冲突的可变借用或写入 `total`，除非 borrow check 能证明
-闭包不再使用。这个规则要复用现有“最后一次引用使用后允许 unique 操作”的能力。
+闭包不再使用。这个规则复用“最后一次引用使用后允许创建唯一可变借用”的能力。
 
 ## Lowering
 
@@ -401,7 +401,7 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 2. Resolve：lambda body 进入子 scope；外层 local 引用标记为 capture candidate。
 3. HIR：为 lambda 分配内部 function def，在 `HirLambda` 上记录 params、captures 和 call body。
 4. Type check：从 expected type 检查参数和返回，并推导 capture kind、call ability。
-5. Borrow check：检查 capture lifetime、unique conflict、move 后使用。
+5. Borrow check：检查 capture lifetime、mutable-borrow conflict、move 后使用。
 6. MIR：`Fn` 构造 stack anonymous closure object，并生成 callable vtable。
 7. MIR：`Fn^` 构造 heap anonymous closure object，并复用 callable vtable call/drop 路径。
 8. Drop elaborate：通过 `vtable.drop(receiver)` 销毁 closure object。
@@ -459,7 +459,7 @@ lambda.function_def -> [
 - `type_id` 是 capture 字段类型。
 - `field_index` 是后端 env layout 的稳定字段序。
 - `deref_on_use` 描述隐式引用捕获在 body 中是否自动解引用。
-- `is_unique` 记录显式 unique capture 需求。
+- capture 的 `T&!` 字段类型记录显式可变借用需求。
 
 MIR lowering 从 `LambdaCaptureInfo` 生成 sourceless 的私有 struct def 和 field def。stack `Fn`
 创建临时 env struct，heap `Fn^` 分配同形状 env struct，并把指针擦成 `Void*` 存入 closure
@@ -506,7 +506,7 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
 - [x] 隐式捕获统一按引用捕获。
-- [x] 标量 `T!` 捕获后可读到外层 storage 的后续写入。
+- [x] 标量 `T name!` 捕获后可读到外层 storage 的后续写入。
 - [x] 共享引用捕获外层非平凡 local 并立即调用。
 - [x] 可变捕获修改外层 `!` storage。
 - [x] 裸 `Fn` 返回导致 stack env 流出当前函数时报错。
@@ -521,4 +521,4 @@ async closure 应建立在普通 closure 之上：async state machine 保存的�
 - [x] 裸 `Fn` 显式 owner capture 随 stack closure object 离开 scope 自动 drop。
 - [x] `Fn^` 可放入 struct、optional、tuple、array 后返回，并借成 `Fn&` 调用。
 - [x] 对外层 local 执行非法 move 的闭包报错。
-- [x] 修改 capture 字段不要求 unique closure value，后续交给 effect / 数据竞争机制约束。
+- [x] 修改 capture 字段不额外要求独占 closure value，后续交给 effect / 数据竞争机制约束。

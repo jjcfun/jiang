@@ -79,24 +79,21 @@ Int?[3]^ c = new [1, null, 3]
 
 ### 可变性
 
-可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变：
+普通存储是否可重新赋值由绑定名后的 `!` 表示。类型级 `!` 当前只用于 `T&!` 与 `T*!`：
 
 ```c
-Bool! flag = true;
+Bool flag! = true;
 flag = false;
 
-Int[3] values = [1, 2, 3];
-Int[3]! mutable_values = values; // 外层数组值可重新赋值
+Int[3] mutable_values! = [1, 2, 3];
 mutable_values = [4, 5, 6];
 
-Int![3]! mutable_items = [1, 2, 3]; // 元素层和外层数组值都可变
+Int[3] mutable_items! = [1, 2, 3];
 mutable_items[0] = 10;
-mutable_items = [4, 5, 6];
 ```
 
-如果变量声明写出了完整左侧类型，则以左侧声明类型为准。类型推导默认得到不可变绑定；需要可变绑定时写 `_ value!` 或写出带 `!` 的左侧类型。类型推导会保留表达式的自然类型，不自动解引用 `T^` / `T&`；需要值类型时写出 expected type。类型推导只能影响推导结果的最外层可变性，不能凭空改变数组元素、tuple 元素、union payload 或 struct 字段等内部层级的可变性。
-
-结构体、tuple、union 和数组的内部成员是否可修改，由成员类型自己的可变性决定，不由外层变量是否带 `!` 决定。
+类型推导默认得到不可重赋值 binding；需要可写 binding 时写 `_ value!`。绑定可变性不进入
+`TypeId` 或函数签名。`T&!` 是唯一可变引用，`T*!` 是可写 raw pointer；其他类型不能带 `!`。
 
 ### 基本类型
 
@@ -114,8 +111,8 @@ Float16 num5 = 1.5;
 Float32 num6 = 2.5;
 Float64 num7 = 3.5;
 
-// 类型后紧跟'!'号，表示当前类型层级可变
-Bool! foo = true;
+// 绑定名后紧跟'!'号，表示该存储位置可重新赋值
+Bool foo! = true;
 foo = false;
 
 // 类型推断
@@ -174,8 +171,8 @@ if a1 is .some(x) {
 	// 这里x为null
 }
 
-if a1 is .some(Int! x) {
-  // 这里x为可变绑定
+if a1 is .some(Int x!) {
+  // 这里 x binding 可重新赋值
 }
 
 if a1 is .some(ref Int x) {
@@ -355,27 +352,20 @@ Int[_] y = [1, 2, 3]
 Int[3] z = [1, 2, 3]
 ```
 
-#### 数组可变性
+#### 数组可写性
 
-虽然数组的长度固定，但支持数组内的元素可变：
+数组 binding 可写时，可以修改元素或整体重新赋值：
 
 ```c
-// 数组内的元素可变
-Int![_] b = [1, 2, 3] // b: [1, 2, 3]
+Int[_] b! = [1, 2, 3] // b: [1, 2, 3]
 
 b[1] = 4 // b: [1, 4, 3]
 
-// 数组不可变，但是变量可以重新赋值
-Int[_]! c = [1, 2, 3]
+Int[_] c! = [1, 2, 3]
 c = [4, 5, 6]
 
-// 数组可变，变量也可以重新赋值
-Int![_]! d = [1, 2, 3] // d: [1, 2, 3]
-d[1] = 4 // d: [1, 4, 3]
-d = [4, 5, 6] // d: [4, 5, 6]
-
 // 数组在堆上创建
-Int[_]^! e = new [1, 2, 3]
+Int[_]^ e! = new [1, 2, 3]
 // 这里，变量赋值的时候会在堆上分配内存
 e = new [4, 5, 6]
 ```
@@ -396,13 +386,12 @@ foo[0][1] // 2
 
 ### 指针与引用
 
-Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、析构和显式 move 的边界。
+Jiang 区分共享引用与唯一可变引用，并对二者执行静态 borrow check。
 指针语义约定为：
 
 - `T^`：自动解引用的 owning pointer；它不是 C 风格 raw pointer
-- `T&`：自动解引用的非 owning 引用，通常用于引用已有值，不承担释放职责
-- `T!&`：从 `T!` storage 借出的非 owning 引用，保留目标 storage 的可变性
-- `T&!`：可重绑定的 reference slot，不改变目标对象所有权
+- `T&`：自动解引用的 shared non-owning reference，不承担释放职责
+- `T&!`：自动解引用的 unique mutable non-owning reference，存活期间排斥其他别名引用
 - `T*`：裸指针，主要用于 FFI / ABI / 低层 capability 场景
 - `T*`：可在 `unsafe` 中按下标读取的 raw pointer；`T*!` 还可写入
 - `T[]&`：borrowed slice view，语义上类似 `{ T*, length }&` 的连续内存引用视图，
@@ -411,11 +400,13 @@ Jiang 不引入完整 alias borrow checker，但会固定所有权、引用、�
   保证 `data[length] == 0`；裸 `T[:0]` 是带 sentinel 的 unsized array type，不能作为普通 value
 
 只有 `T^` 表达语言级所有权。`T&`、`T[]&`、`T*` 和 `T*!` 都不拥有目标对象。
+类型后缀 `!` 当前只允许写在 reference 和 raw pointer 外层，即 `T&!` 与 `T*!`，并进入签名。
+`T name!` 中绑定名后的 `!` 只允许重新赋值，不进入签名。
 
 #### Pointer / 引用类型
 
 Pointer / reference 类型也遵循 **从左往右，从里到外** 的原则。`^` 表示 owning pointer 外层；
-`&` 表示 reference 外层；二者都可以和 optional / mutable 标记组合使用。
+`&` 表示 reference 外层。只有 reference 和 raw pointer 外层可以继续写 `!`。
 
 ```c
 // 在栈中开辟内存空间
@@ -430,9 +421,10 @@ Int[3]^ c = new [1, 2, 3];
 // 临时引用
 Int& d = a$.ref();
 
-Int!^? maybe_owner; // optional owning pointer to mutable Int
 Int?& maybe_ref;    // reference to optional Int
-Int^! owner_slot;   // owning pointer 绑定本身可变
+Int^ owner_slot!;   // owning pointer 绑定本身可重新赋值
+Int&! mut_ref;      // 唯一可变引用
+Int*! mut_ptr;      // 可写 raw pointer
 
 ```
 
@@ -460,19 +452,14 @@ Int& b;
 使用 `T^` 时默认自动解引用，除非 expected type 本身与 owning pointer 类型一致。`T&`、`T*` 和
 `T*` 不参与默认自动解引用。Jiang 没有前缀手动解引用语法，表达式位置的 `*ptr` 这种写法不成立；
 需要显式解引用或写入单对象指针/引用时使用 `ptr$.get()` / `ptr$.set(value)`。其中 `ptr$.set(value)`
-只有在 pointee 类型带顶层 `!` 时才合法，例如 `Int!*` 可以写入，`Int*` 只能读取。
+要求 `T&!` 或 `T*!` 写能力；`T&` 和 `T*` 只能读取。
 
 类型推导会保留 pointer/reference 层，并默认得到不可变绑定；写出 expected type 只会让 `T^`
 触发自动解引用，`T&` / `T*` 仍需要显式 `$.get()`：
 
 ```c
-Int&! ref = value$.ref();
-
-_ copied = ref;      // copied: Int&
-_ mutable! = ref;    // mutable: Int&!
+Int&! ref = value$.mut_ref();
 Int copied_value = ref$.get();
-Int& kept = ref;     // expected type 是 Int&，保留 reference
-_ raw_ref = ref$.ref(); // raw_ref: Int&
 Int explicit_value = ref$.get(); // 显式解引用
 ```
 
@@ -515,7 +502,7 @@ Int bad = p$.ref() + 1; // 编译错误
 Int explicit = p$.get();
 
 unsafe {
-    Int!* raw_ptr = p$.ptr();
+    Int*! raw_ptr = p$.mut_ptr();
     Int raw_value = raw_ptr$.get();
     raw_ptr$.set(42);
 }
@@ -530,7 +517,7 @@ Int y = raw[0];
 ```
 
 `T*` raw pointer 不参与默认自动解引用，只能通过 `$.get()` 显式读取单个目标对象；只有 pointee
-类型带顶层 `!` 的 raw pointer，例如 `T!*`，才允许通过 `$.set(value)` 显式写入。
+类型带顶层 `!` 的 raw pointer，例如 `T*!`，才允许通过 `$.set(value)` 显式写入。
 `T*` raw pointer 也不参与默认自动解引用。它可以在 `unsafe` 中通过下标表达式取元素：
 
 ```c
@@ -572,14 +559,14 @@ Jiang 的目标规则是不引入完整 alias borrow checker，但明确资源�
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
 - 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
-- `T&`、`T!&`、`T&!`、`T*`、`T*!`、`T[]&` 字段不会被编译器自动释放。
+- `T&`、`T&!`、`T&!`、`T*`、`T*!`、`T[]&` 字段不会被编译器自动释放。
 - `T[]&` 本身不拥有整段 buffer；drop slice reference 时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
 - 经过 `T*!` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
 - 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
-- `T&`、`T!&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T&!`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
 
 显式转移所有权使用 `move()`：
@@ -652,8 +639,8 @@ print("x = %d, y = %d", x, y); // 输出：x = 100, y = 300
 Int add(Int a, Int b);
 
 // 以下两种语法也等价
-(Int! x) = add(1, 2);		// 解构变量
-Int! x = add(1, 2); 		// 定义变量
+(Int x!) = add(1, 2);		// 解构出可重赋值 binding
+Int x! = add(1, 2); 		// 定义可重赋值 binding
 ```
 
 #### Unit
@@ -1285,7 +1272,7 @@ if (a != 0) {
 `while` 循环在给定的条件表达式为真时持续执行其代码块。
 
 ```c
-Int! i = 0;
+Int i! = 0;
 while (i < 10) {
     print("i = %d", i);
     i += 1;
@@ -1585,9 +1572,9 @@ struct User {
   // id为不可变属性
   Int id;
   // age为可变属性
-  Int! age;
+  Int age!;
   // nick_name为可空的可变属性
-  UInt8[]&?! nick_name;
+  UInt8[]& nick_name!;
 }
 
 // 定义一个结构体常量并初始化
@@ -1854,10 +1841,9 @@ Foo<Float> y = Foo<Float> { value: 3.14 };
 _ z = Foo<Float> { value: 3.14 };
 ```
 
-泛型参数的顶层 `!` 可变性约束当前只有显式 `Mutable` 模式：
+泛型参数的顶层 `!` 能力约束当前只有显式 `Mutable` 模式：
 
-- 默认不写约束时，泛型参数只接受**不带**顶层 `!` 的实参
-- `@where(T: Mutable)` 表示该泛型参数**必须**带顶层 `!`
+- `@where(T: Mutable)` 表示该泛型参数必须是 `T&!` 或 `T*!` 这类带顶层可写能力的类型
 
 ```c
 @where(T: Mutable)
@@ -1865,7 +1851,7 @@ struct MutableBox<T> {
   T value;
 }
 
-MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
+MutableBox<Int*!> a = MutableBox<Int*!> { value: null };
 ```
 
 其中：
@@ -1876,8 +1862,8 @@ MutableBox<Int!> a = MutableBox<Int!> { value: 1 };
 
 当前规则只看**顶层** `!`：
 
-- `Int` 不满足 `Mutable`
-- `Int!` 满足 `Mutable`
+- `Int`、`Int&` 和 `Int*` 不满足 `Mutable`
+- `Int&!` 和 `Int*!` 满足 `Mutable`
 
 ### Trait
 

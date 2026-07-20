@@ -1467,7 +1467,7 @@ public struct BodyCheck: Movable {
             self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
             return;
         }
-        if (local.mutable_borrow && !self.borrow_source_is_writable(initializer, value_type)) {
+        if (local.mutable_borrow && !self.borrow_source_is_writable(initializer)) {
             self.type_ops.add_node_error(
                 initializer,
                 "mutable borrow requires writable storage",
@@ -2660,8 +2660,31 @@ public struct BodyCheck: Movable {
         return self.place_has_mutable_binding(target_id);
     }
 
-    Bool borrow_source_is_writable(self, hir.HirId source_id, qid.TypeId source_type) {
-        return self.assignment_target_is_writable(source_id, source_type);
+    Bool borrow_source_is_writable(self, hir.HirId source_id) {
+        hir.HirNode source = self.state.hirs.node(source_id);
+        if (source.data is .name_ref(_)) {
+            if (self.place_has_mutable_binding(source_id)) { return true; }
+            return self.place_handle_has_write_capability(source_id);
+        }
+        if (source.data is .member_access(member)) {
+            return self.borrow_source_is_writable(member.base);
+        }
+        if (source.data is .index_access(index_access)) {
+            if (self.place_handle_has_write_capability(index_access.base)) { return true; }
+            return self.borrow_source_is_writable(index_access.base);
+        }
+        if (source.data is .slice_access(slice_access)) {
+            if (self.place_handle_has_write_capability(slice_access.base)) { return true; }
+            return self.borrow_source_is_writable(slice_access.base);
+        }
+        return false;
+    }
+
+    Bool place_handle_has_write_capability(self, hir.HirId place_id) {
+        guard self.state.results.node_type(place_id) is .some(type_id) else { return false; }
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (!info.is_mutable) { return false; }
+        return info.data is .handle_type(_);
     }
 
     Bool place_has_mutable_binding(self, hir.HirId place_id) {
@@ -3202,6 +3225,9 @@ public struct BodyCheck: Movable {
         self.check_optional_slice_bound(slice_access.end);
         self.check_slice_open_end(node_id, slice_access, base_type);
         if (self.slice_access_result_type(base_type) is .some(result_type)) {
+            if (self.borrow_source_is_writable(slice_access.base)) {
+                return self.state.store.types.mutable_type(result_type, token.Span());
+            }
             return result_type;
         }
         self.type_ops.add_node_error(node_id, "sliced value is not sliceable", "not_sliceable");
@@ -6823,6 +6849,7 @@ public struct BodyCheck: Movable {
             .forget => self.check_forget_builtin(node_id, call),
             .optional_some => self.check_optional_some_builtin(node_id, call),
             .trait_ref => self.check_trait_ref_builtin(node_id, call),
+            .trait_mut_ref => self.check_trait_mut_ref_builtin(node_id, call),
             .trait_new => self.check_trait_new_builtin(node_id, call),
             .trait_vtable => self.check_trait_companion_vtable_builtin(node_id, call),
             .trait_receiver => self.check_trait_companion_value_builtin(node_id, call, .receiver),
@@ -6911,6 +6938,28 @@ public struct BodyCheck: Movable {
         return result;
     }
 
+    qid.TypeId check_trait_mut_ref_builtin(self, hir.HirId node_id, hir.HirImplicitCall call) {
+        qid.TypeId reference = self.trait_object_handle_result_type(node_id, call, .reference);
+        qid.TypeId result = self.state.store.types.mutable_type(reference, token.Span());
+        if (!self.expect_implicit_arg_count(node_id, call, 1)) {
+            self.check_implicit_call_args(call);
+            return result;
+        }
+        qid.TypeId argument_type = self.check_node(call.args[0]);
+        qid.TypeId subject_type = self.trait_ref_subject_type(argument_type);
+        self.expect_trait_companion_subject(node_id, call.args[0], call, subject_type);
+        if (!self.is_assignment_target(call.args[0])) {
+            self.type_ops.add_node_error(node_id, "mutable borrow requires a place expression", "borrow_requires_place");
+        } else if (!self.borrow_source_is_writable(call.args[0])) {
+            self.type_ops.add_node_error(
+                node_id,
+                "mutable borrow requires writable storage",
+                "immutable_borrow_source"
+            );
+        }
+        return result;
+    }
+
     qid.TypeId check_trait_new_builtin(self, hir.HirId node_id, hir.HirImplicitCall call) {
         qid.TypeId result = self.trait_object_handle_result_type(node_id, call, .owner_pointer);
         if (!self.expect_implicit_arg_count(node_id, call, 1)) {
@@ -6993,7 +7042,7 @@ public struct BodyCheck: Movable {
         if (self.trait_has_restricted_receiver_method(trait_def)) {
             self.type_ops.add_node_error(
                 call.base,
-                "trait object does not support move or unique receiver methods",
+                "trait object does not support move receiver methods",
                 "trait_object_restricted_receiver_not_supported"
             );
         }
@@ -7015,19 +7064,7 @@ public struct BodyCheck: Movable {
         guard self.state.hirs.def(function_def) is .some(hir_def) else { return false; }
         guard hir_def.decl.function_signature is .some(signature) else { return false; }
         if (!signature.has_receiver) { return false; }
-        if (signature.receiver_mode == .move_receiver) { return true; }
-        return self.signature_has_unique_self(signature);
-    }
-
-    Bool signature_has_unique_self(self, hir.HirFunctionSignature signature) {
-        Int index! = 0;
-        while (index < signature.unique_symbols.length) {
-            if (self.symbol_text_equal(signature.unique_symbols[index], "self")) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
+        return signature.receiver_mode == .move_receiver;
     }
 
     qid.DefId? trait_def_for_companion_receiver(self, qid.TypeId receiver_type) {
@@ -7127,8 +7164,7 @@ public struct BodyCheck: Movable {
             self.type_ops.add_node_error(node_id, "mutable borrow requires a place expression", "borrow_requires_place");
             return self.state.store.types.invalid_type();
         }
-        if (!self.state.store.types.get(base_type).is_mutable
-            && !self.place_has_mutable_binding(call.base)) {
+        if (!self.borrow_source_is_writable(call.base)) {
             self.type_ops.add_node_error(node_id, "mutable borrow requires writable storage", "immutable_borrow_source");
             return self.state.store.types.invalid_type();
         }

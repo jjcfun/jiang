@@ -136,7 +136,7 @@ MIR 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap
 
 ## 待设计
 
-- `T&`、`T!&`、`T&!`、`T[]&` 和 raw pointer 的精确 lifetime 规则。
+- `T&`、`T&!`、`T[]&` 和 raw pointer 的精确 lifetime 规则。
 - copy/drop trait 或 builtin copy 规则。
 - packed/alignment 对 borrow 的限制。
 - 与 `@life(...)` annotation 的集成。

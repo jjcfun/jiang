@@ -453,6 +453,7 @@ struct FunctionBorrowChecker: Movable {
         if (statement.kind is .assign_stmt(assign_stmt)) {
             self.check_rvalue(assign_stmt.value);
             self.check_assignment_escape(assign_stmt.destination, assign_stmt.value);
+            self.check_place_write(assign_stmt.destination);
             self.clear_place(assign_stmt.destination);
             self.record_assignment_loan(assign_stmt.destination, assign_stmt.value);
             return;
@@ -870,7 +871,7 @@ struct FunctionBorrowChecker: Movable {
 
     () record_assignment_loan(self, mir.MirPlace destination, mir.MirRvalue value) {
         if (value is .borrow_value(borrow_value)) {
-            self.add_loan(.reference_view, borrow_value.place, destination);
+            self.add_loan(self.reference_loan_kind_for_type(self.place_type(destination)), borrow_value.place, destination);
             return;
         }
         if (value is .address_of_value(address_of_value)) {
@@ -972,7 +973,7 @@ struct FunctionBorrowChecker: Movable {
     () record_slice_loan(self, mir.MirPlace destination, mir.MirSliceRvalue value) {
         types.TypeInfo base_info = self.ctx.store.types.get(self.place_type(value.base));
         if (base_info.data is .array_type(_)) {
-            self.add_loan(.reference_view, value.base, destination);
+            self.add_loan(self.reference_loan_kind_for_type(self.place_type(destination)), value.base, destination);
             return;
         }
         if (base_info.data is .handle_type(handle)) {
@@ -1074,10 +1075,20 @@ struct FunctionBorrowChecker: Movable {
             return null;
         }
         guard info.data is .handle_type(handle) else { return null; }
-        if (types.is_reference_handle(handle)) { return loan.reference_view_kind(); }
-        if (types.is_slice_handle(handle)) { return loan.reference_view_kind(); }
+        if (types.is_reference_handle(handle) || types.is_slice_handle(handle)) {
+            return self.reference_loan_kind_for_type(self.place_type(place));
+        }
         if (types.is_raw_pointer_handle(handle)) { return loan.raw_pointer_view_kind(); }
         return null;
+    }
+
+    loan.LoanKind reference_loan_kind_for_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return loan.reference_view_kind(); }
+        if (info.is_mutable && (types.is_reference_handle(handle) || types.is_slice_handle(handle))) {
+            return loan.mutable_reference_view_kind();
+        }
+        return loan.reference_view_kind();
     }
 
     Bool type_may_carry_borrow(self, qid.TypeId type_id) {
@@ -1090,10 +1101,44 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () add_loan(self, loan.LoanKind kind, mir.MirPlace source, mir.MirPlace target) {
-        move_path.MovePathId source_path = self.canonical_loan_source(self.paths.path_for_place(source));
+        move_path.MovePathId original_source_path = self.paths.path_for_place(source);
+        move_path.MovePathId source_path = self.canonical_loan_source(original_source_path);
         move_path.MovePathId target_path = self.paths.path_for_place(target);
         if (!self.valid_move_path(source_path) || !self.valid_move_path(target_path)) { return; }
+        self.check_new_reference_loan(kind, original_source_path, source_path);
         self.add_loan_from_paths(kind, source_path, target_path);
+    }
+
+    () check_new_reference_loan(
+        self,
+        loan.LoanKind kind,
+        move_path.MovePathId original_source,
+        move_path.MovePathId canonical_source
+    ) {
+        if (kind == .raw_pointer_view) { return; }
+        Int index! = 0;
+        while (index < self.dataflow.active_loans.len()) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan.Loan current = self.results.loans.get(fact.loan_id);
+            index = index + 1;
+            if (!self.reference_loan_kinds_conflict(kind, current.kind)) { continue; }
+            if (self.loan_target_matches_path(fact.target, original_source)) { continue; }
+            if (!self.loan_sources_overlap(canonical_source, current.source)) { continue; }
+            table.HashTable<Int, Bool> visiting! = table.HashTable<Int, Bool>();
+            if (!self.loan_target_task_used_from_current_location(fact.target, visiting$.ref())) { continue; }
+            self.results.mark_error();
+            self.add_mutable_borrow_diagnostic();
+        }
+    }
+
+    Bool reference_loan_kinds_conflict(self, loan.LoanKind lhs, loan.LoanKind rhs) {
+        if (lhs == .raw_pointer_view || rhs == .raw_pointer_view) { return false; }
+        return lhs == .mutable_reference_view || rhs == .mutable_reference_view;
+    }
+
+    Bool loan_sources_overlap(self, move_path.MovePathId lhs, move_path.MovePathId rhs) {
+        if (self.path_matches_or_contains(lhs, rhs)) { return true; }
+        return self.path_matches_or_contains(rhs, lhs);
     }
 
     () add_loan_from_paths(self, loan.LoanKind kind, move_path.MovePathId source, move_path.MovePathId target) {
@@ -1531,6 +1576,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () check_unique_places_call(self, mir.MirCallTerminator call_term) {
+        self.check_unique_place_pairs(call_term.unique_places);
         Int unique_index! = 0;
         while (unique_index < call_term.unique_places.length) {
             self.check_unique_place_call(call_term, call_term.unique_places[unique_index]);
@@ -1538,17 +1584,41 @@ struct FunctionBorrowChecker: Movable {
         }
     }
 
+    () check_unique_place_pairs(self, mir.MirPlace[]& places) {
+        Int left_index! = 0;
+        while (left_index < places.length) {
+            move_path.MovePathId left = self.canonical_loan_source(self.paths.path_for_place(places[left_index]));
+            Int right_index! = left_index + 1;
+            while (right_index < places.length) {
+                move_path.MovePathId right = self.canonical_loan_source(
+                    self.paths.path_for_place(places[right_index])
+                );
+                if (self.loan_sources_overlap(left, right)) {
+                    self.results.mark_error();
+                    self.add_mutable_borrow_diagnostic();
+                }
+                right_index = right_index + 1;
+            }
+            left_index = left_index + 1;
+        }
+    }
+
     () check_unique_place_call(self, mir.MirCallTerminator call_term, mir.MirPlace unique_place) {
         self.check_unique_place_signature_requirement(unique_place);
-        move_path.MovePathId unique_path = self.paths.path_for_place(unique_place);
+        move_path.MovePathId argument_path = self.paths.path_for_place(unique_place);
+        move_path.MovePathId unique_path = self.canonical_loan_source(argument_path);
         if (!self.valid_move_path(unique_path)) { return; }
         Int index! = 0;
         while (index < self.dataflow.active_loans.len()) {
             loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
             loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (self.loan_target_matches_path(fact.target, argument_path)) {
+                index = index + 1;
+                continue;
+            }
             if (self.unique_place_loan_conflicts(call_term, unique_path, current, fact.target)) {
                 self.results.mark_error();
-                self.add_unique_borrow_diagnostic();
+                self.add_mutable_borrow_diagnostic();
             }
             index = index + 1;
         }
@@ -1564,7 +1634,7 @@ struct FunctionBorrowChecker: Movable {
             loan.Loan current = self.results.loans.get(fact.loan_id);
             if (self.unique_place_statement_loan_conflicts(unique_path, current, fact.target)) {
                 self.results.mark_error();
-                self.add_unique_borrow_diagnostic();
+                self.add_mutable_borrow_diagnostic();
             }
             index = index + 1;
         }
@@ -1578,7 +1648,7 @@ struct FunctionBorrowChecker: Movable {
         if (self.current_function_is_init() && self.source_symbol_is_self(source_symbol)) { return; }
         if (self.current_signature_has_unique_symbol(source_symbol)) { return; }
         self.results.mark_error();
-        self.add_unique_requirement_diagnostic();
+        self.add_mutable_reference_requirement_diagnostic();
     }
 
     Bool unique_place_requires_signature(self, move_path.MovePathId unique_path) {
@@ -2281,6 +2351,34 @@ struct FunctionBorrowChecker: Movable {
             self.add_use_after_move_diagnostic();
         }
         self.check_active_loan_valid(path);
+        self.check_mutable_loan_source_access(path);
+    }
+
+    () check_place_write(self, mir.MirPlace place) {
+        move_path.MovePathId path = self.paths.path_for_place(place);
+        if (!self.valid_move_path(path)) { return; }
+        self.check_mutable_loan_source_access(path);
+    }
+
+    () check_mutable_loan_source_access(self, move_path.MovePathId path) {
+        Int index! = 0;
+        while (index < self.dataflow.active_loans.len()) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            loan.Loan current = self.results.loans.get(fact.loan_id);
+            index = index + 1;
+            if (current.kind != .mutable_reference_view) { continue; }
+            if (self.current_statement_kills_loan_target(fact.target)) { continue; }
+            if (!self.loan_sources_overlap(path, current.source)) { continue; }
+            table.HashTable<Int, Bool> visiting! = table.HashTable<Int, Bool>();
+            if (!self.loan_target_task_used_from_current_location(fact.target, visiting$.ref())) { continue; }
+            self.results.mark_error();
+            self.add_mutable_borrow_diagnostic();
+        }
+    }
+
+    Bool current_statement_kills_loan_target(self, move_path.MovePathId target_path) {
+        if (self.current_location.kind != .statement) { return false; }
+        return self.statement_kills_loan_target(self.current_statement(), target_path);
     }
 
     () check_active_loan_valid(self, move_path.MovePathId path) {
@@ -2341,7 +2439,7 @@ struct FunctionBorrowChecker: Movable {
         );
     }
 
-    () add_unique_borrow_diagnostic(self) {
+    () add_mutable_borrow_diagnostic(self) {
         if (!self.record_diagnostic(5)) {
             return;
         }
@@ -2349,14 +2447,14 @@ struct FunctionBorrowChecker: Movable {
             diagnostic.Diagnostic(
                 .error,
                 .borrow_check,
-                diagnostic.DiagnosticCode("unique_borrow_conflict"),
+                diagnostic.DiagnosticCode("mutable_borrow_conflict"),
                 self.current_source_range(),
-                "unique call conflicts with a live borrow"
+                "mutable borrow conflicts with a live borrow"
             )
         );
     }
 
-    () add_unique_requirement_diagnostic(self) {
+    () add_mutable_reference_requirement_diagnostic(self) {
         if (!self.record_diagnostic(6)) {
             return;
         }
@@ -2364,9 +2462,9 @@ struct FunctionBorrowChecker: Movable {
             diagnostic.Diagnostic(
                 .error,
                 .borrow_check,
-                diagnostic.DiagnosticCode("unique_requirement_not_declared"),
+                diagnostic.DiagnosticCode("mutable_reference_requirement_not_declared"),
                 self.current_source_range(),
-                "call requires unique access; mark the root parameter as unique"
+                "call requires mutable access; declare the root parameter as T&!"
             )
         );
     }

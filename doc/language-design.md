@@ -174,9 +174,8 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T` / `foo.Bar`：命名类型。
 - `T<A, B>`：泛型类型参数。
 - `(A, B)`：tuple type。
-- `T!`：当前类型层级的可变 flag。
+- `T&!`：唯一可变引用。
 - `T?`：optional 类型。
-- `T?!`：optional 类型层可变的规范写法。
 - `T^`：owning pointer；它不是 C 风格 raw pointer。
 - `T&`：非 owning 引用，不表达释放职责。
 - `T[]&`：borrowed slice view，layout 是 `{ data, length }`，不表达所有权。裸 `T[]` 是
@@ -190,7 +189,7 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 - `T[N:0]`：sentinel 定长数组。逻辑长度为 `N`，实际 storage 为 `N + 1` 个元素，末尾元素保存 sentinel；`T[N:0]$.size()` 包含 sentinel storage。
 - `T[_]`：数组长度由初始化器推断。
 - `T@E`：errorable result，只能出现在函数、方法和 callable 类型的返回位。
-- 错误类型 `E` 顶层不能带 `?` 或 `!`。如果成功值需要 optional/mutable，应写成 `T?!@E`。
+- 错误类型 `E` 顶层不能带 `?` 或 `!`。
 - `T@E` 两侧不允许空白，避免与前缀 annotation 和普通表达式混淆。
 
 内建后缀类型语法不经过普通名字解析，compiler-owned constructor 名称也不进入用户可见
@@ -209,139 +208,53 @@ Int[2][3] matrix;
 Int?[] values;
 UInt8* raw;
 Int@Error result;
-Int?!@Error maybe_result;
+Int?@Error maybe_result;
 ```
 
 ## 可变性
 
-可变性是类型系统的一部分，并且是分层的。`!` 表示当前类型层级可变；它不表示 optional，也不表示空值。也就是说，`Int` 与 `Int!` 是不同的 Jiang 类型形态，虽然类型检查可以在受控位置做兼容判断。
+当前版本只支持两种类型级可变能力：
 
-`!` 作用在当前类型层级，表示这一层可变；同一类型层级中最多出现一次。`?` 可以重复出现，
-`T??` 表示两层 optional。
+- `T&!`：唯一可变引用；在其存活期间，借用的 place 不能再被共享借用、可变借用或直接访问。
+- `T*!`：可写 raw pointer；在 `unsafe` 中允许下标写入。
 
-`^` / `&` 会基于左侧已经形成的类型创建新的 language handle 外层。创建出的外层也可以
-继续带 `?` / `!`，但一个完整源码类型中最多只能出现一个 `^` 或 `&` 外层；因此不支持
-`T^^`、`T&&`、`T^&` 或 `T&^` 这类 language handle 的 handle。raw pointer、many pointer
-和 slice 是 ABI/低层指针形态，允许按 C ABI 需要叠加，例如 `UInt8**`、`LLVMType**`。
-类型归一化阶段如果得到重复 `^` / `&` 层，按当前同类 handle 合并；如果同时出现 `^`
-和 `&`，必须保留错误状态并报告 diagnostic，不能静默选择一种。
-
-为了避免用户在不同排列之间做选择，同一层级的 type suffix 顺序固定：
-
-- 普通层写成 `T?!`
-- owning pointer 外层写成 `T^?!`
-- reference 外层写成 `T&?!`
-
-其中 `?` 和 `!` 可以省略，但剩余 suffix 的相对顺序不能变化：
+其他类型不支持 `!` 后缀。`Int!`、`T^!`、`T[]!`、`T?!` 和 `T!&` 都必须报错。
+如果普通变量、参数、全局或字段需要可写，应把 `!` 放在绑定名上：
 
 ```jiang
-Int?! value;       // optional + mutable
-Int!^?! owner;     // optional mutable owning pointer to mutable Int
-Int?& ref;         // reference to optional Int
-Int!& mut_ref;     // reference to mutable Int storage
-Int&! ref_slot;    // mutable slot containing non-owning reference to Int
+Int value! = 1;
+value = 2;
+
+Int& shared = value$.ref();
+Int&! borrowed = value$.mut_ref();
+Int*! pointer = unsafe { value$.mut_ptr() };
 ```
 
-`T!&` 表示从 `T!` storage 借出的引用；它保留目标 storage 的可变性，但不表达独占访问。
-`T&!` 中的 `!` 属于 reference 外层，只表示引用 slot 本身可重绑定。两者可以组合为
-`T!&!`：指向 `T!` storage 的、可重绑定的引用 slot。
+绑定名后的 `!` 是 place metadata，不进入 `TypeId` 或函数签名。因此 `foo(Int value!)`
+和 `foo(Int value)` 的签名相同；前者只允许函数体内重新赋值参数槽。相反，
+`foo(Int&! value)` 的唯一可变引用能力属于参数类型，必须进入签名。
 
-`Int!?`、`Int^!?`、`Int^^`、`Int&&`、`Int^&` 都是语法错误。编译器可以按规范顺序恢复后继续解析，但必须报告 diagnostic。
-
-如果同一层级同时出现 `?` 和 `!`，源码只能写成 `T?!`：
-
-```jiang
-Int?! value; // optional 层可变
-```
-
-`T!?` 是语法错误，编译器可以恢复为 `T?!` 继续解析，但必须报告 diagnostic。
-
-重复可变标记是语法错误。编译器恢复时可以把 `T!!` 当作 `T!` 继续解析，但必须报告 diagnostic。只要重复发生在同一类型层级内，即使中间夹着 `?` 也要报错，例如 `T!?!`。
-
-language handle 外层只能是 `^` 或 `&` 之一，不能写成 `T^&` 或 `T&^`。raw pointer、
-many pointer 和 slice 可以继续叠加，用于描述 FFI 中的 pointer-to-pointer、pointer array
-或 C 字符串数组。
-
-源码报错规则和类型归一化规则要分开：源码中直接写出的重复 suffix 必须报错；归一化阶段因为泛型替换得到重复 flag 时，重复的 `?` / `!` / 同类 handle 可以合并。
-
-```jiang
-// 假设 T 实例化为 Int!
-T! value; // 归一化为 Int!
-```
-
-示例：
-
-```jiang
-Bool! flag = true;
-flag = false;
-
-Int[3] values = [1, 2, 3];
-Int[3]! mutable_values = values; // 外层数组值可重新赋值
-mutable_values = [4, 5, 6];
-
-Int![3]! mutable_items = [1, 2, 3]; // 显式声明：元素层和外层数组值都可变
-mutable_items[0] = 10;
-mutable_items = [4, 5, 6];
-```
-
-变量、参数、全局变量和字段声明如果写出了完整左侧类型，则以左侧声明类型为准。左侧类型可以表达每个类型层级的可变性，例如 `Int![3]!` 表示元素层是 `Int!`，外层数组值也是可变层。初始化器只负责提供值，不能反过来改变左侧声明出来的分层可变性。
-
-赋值、初始化、传参和 `return` 都是“把右值写入一个目标位置”的场景。这里不使用普通类型兼容性去判断可变性，而是以目标位置的类型为准：比较目标类型和值类型时，在两侧相同结构位置忽略 mutable flag，但保留 optional flag、pointer kind、数组形状、字段、payload 等结构差异。
-
-```jiang
-Int! a = 3;
-Int b = a;   // 允许：把 mutable 右值写入不可变目标，目标类型是 Int
-Int! c = b;  // 允许：把不可变右值写入 mutable 目标，目标类型是 Int!
-
-Int?! optional_mut = 1;
-Int? optional_value = optional_mut; // 允许：optional 层相同，只忽略同层 mutable
-Int plain = optional_mut;           // 编译错误：不能忽略 optional
-
-Int! value = 3;
-Int& ref = value$.ref(); // 允许：reference 结构相同，pointee 的 mutable 以左侧 Int& 为准
-```
-
-这条规则只属于写入目标的场景，不能把 `Int` 与 `Int!` 视为全局等价类型。二元运算、分支合并、重载判定中不应该因为某一侧带 `!` 就把两种类型普遍合并；这些上下文需要先有明确的 expected type 或目标位置，再按上面的写入规则检查。
-
-类型推导场景不同：如果左侧没有写出完整类型结构，默认推导为不可变绑定；只有 `_ value!` 或等价的可变解构绑定能对推导结果的最外层追加 `!`。推导表达式保留自然类型，不自动解引用 `T^` / `T&`；只有显式 expected type、运算符、函数参数等上下文需要值类型时才触发自动解引用。也就是说，推导可以得到“这个绑定本身可变”，但不能凭空把推导类型内部的数组元素、tuple 元素、union payload 或 struct 字段改成可变。内部层级需要可变时，必须显式写出左侧类型。
-
-解构语法可以为每个解构出来的绑定重新指定可变性，因为解构本质上是在声明多个局部绑定。但这种可变性也只作用于对应元素类型的最外层，不能深入修改该元素类型的内部层级：
-
-```jiang
-(Int, User) pair = (1, user);
-(_ count!, _ current_user!) = pair; // count 和 current_user 两个绑定本身可变
-
-(Int[3]) arrays = ([1, 2, 3]);
-(_ inferred_array!) = arrays; // 只能让 inferred_array 这个外层绑定可变
-```
-
-内部成员的可变性来自类型定义本身。对于 `struct` 字段、tuple 元素、union payload、数组元素，只要成员类型在其定义处是可变的，该成员就可以通过 owner 或 `T&` 引用写入；这不受外层变量本身是否带 `!` 影响，也不由引用类型提供额外的只读/独占权限。
+字段同样使用绑定名表达存储可写性：
 
 ```jiang
 struct User {
     Int id;
-    Int! age;
+    Int age!;
 }
-
-User user = User(id: 1, age: 18);
-user.age = 19; // 允许：age 字段自身是可变字段
-user.id = 2;   // 编译错误：id 字段自身不可变
-
-User& ref = user$.ref();
-ref.age = 20; // 允许：T& 不拥有 User，但可以写入 User 内部声明为 ! 的字段
 ```
 
-数组、tuple、union 和 struct 也遵循同一条分层规则：外层变量或引用 slot 的可变性只控制该 slot 是否可整体重赋值；成员或元素能否被修改，由成员或元素类型自己的可变性决定。`T&` 不提供数据竞争保护，也不阻止写入内部 `!` 成员。
+共享引用 `T&` 不授予写能力；通过共享引用也不能把字段或元素升级成 `T&!`。
+需要修改借用目标时，必须从可写 place 创建 `ref!` / `$.mut_ref()`，并由 borrow checker
+保证该可变引用唯一。raw pointer 不参与引用别名证明，写入仍受 `unsafe` 约束。
 
 ## 指针、引用、数组和 Slice
 
-Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、lifetime 和 drop safety。
+Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时检查 ownership、lifetime 和 drop safety。
 这里先固定 pointer/reference 的目标语义：
 
 - `T^`：owning pointer；它不是 C 风格 raw pointer。
-- `T&`：非 owning 引用，不表达释放职责。通过 `T&` 可以读写目标内部声明为 `!` 的成员。
-- `T!&`：从 `T!` storage 借出的非 owning 引用，目标 storage 的可变性保留在被引用类型中。
-- `T&!`：可重绑定的引用 slot，slot 中保存的是 `T&`。它允许引用变量/字段改指向，但不改变目标对象的所有权。
+- `T&`：shared non-owning reference，不表达释放职责，也不提供可变能力。
+- `T&!`：unique mutable non-owning reference；存活期间排斥指向同一 place 的其他共享或可变引用。
 - `T*`：裸指针，只用于 FFI / ABI / 低层 capability 场景。
 - `T*`：raw pointer，可在 `unsafe` 中下标读取；`T*!` 还可下标写入。
 - `T[]`：unsized array type，必须通过 `T[]&` 形成 borrowed slice view，或通过 `T[]^`
@@ -352,19 +265,19 @@ Jiang 不引入 shared/mutable alias borrow checker，但会检查所有权、li
 并把 initialized 区间转移为 owning `T[]^`。
 
 `T&`、`T&!` 和 `T[]&` 可以作为字段；它们不拥有目标对象，字段析构时不会释放目标对象。
-`T!&` 不能作为普通字段类型，因为它需要携带当前 serial token 下的可写访问能力。
-存储引用字段时，目标对象的生命周期必须覆盖包含该字段的值。裸 `T[]` 是 unsized array type，
+存储引用字段时，目标对象的生命周期必须覆盖包含该字段的值；`T&!` 字段还会持续持有
+其来源 place 的唯一借用。裸 `T[]` 是 unsized array type，
 不能作为普通字段类型。
 
-函数参数可以用 `unique` 声明调用点必须提供不别名的访问能力：
+函数签名直接用 `T&!` 声明调用点必须提供唯一可变访问能力：
 
 ```jiang
-() swap(unique Int!& left, unique Int!& right) {
+() swap(Int&! left, Int&! right) {
 }
 ```
 
-`unique` 是参数 capability，不是普通引用类型的一部分；普通 `T!&` 仍然允许同 serial token
-内 alias。
+该能力属于类型并进入函数签名；`swap(Int&! left, Int&! right)` 不能把同一个 place 同时传给
+两个参数。参数 `unique` 关键字已移除。
 
 Jiang 不通过引用类型系统保证 data-race freedom。多个线程或多个引用同时访问同一对象并写入
 `!` 成员时，语言类型系统不做排他性证明；并发安全必须通过标准库的 mutex、rwlock、atomic、
@@ -386,23 +299,19 @@ _ b = foo();         // 推导上下文保留自然类型，b: Int^
 Int c = foo();       // expected type 是 Int，自动解引用
 _ d = foo() + 123;   // 算术上下文，自动解引用为 Int
 
-Int&! ref = value$.ref();
-_ copied = ref;      // 推导上下文保留 reference，copied: Int&
-_ mutable! = ref;    // mutable: Int&!
+Int&! ref = value$.mut_ref();
 Int copied_value = ref$.get();
-Int& kept = ref;     // expected type 是 Int&，保留 reference
-_ raw_ref = ref$.ref(); // '$' 阻止自动解引用，raw_ref: Int&
 ```
 
 Jiang 没有前缀手动解引用语法，`*foo()` 这类写法不成立。需要显式取出 `T^` / `T&` / `T*`
 指向的值时，使用隐式操作层的 `value$.get()`；需要通过 pointer/reference 写入目标对象时使用
-`value$.set(new_value)`，并且 pointee 类型必须带顶层 `!`。
+`value$.set(new_value)`。写入 reference 需要 `T&!`，写入 raw pointer 需要 `T*!`。
 
 ```jiang
 Int& ref = value$.ref();
 Int copied = ref$.get();
 unsafe {
-    Int!* ptr = value$.ptr();
+    Int*! ptr = value$.mut_ptr();
     ptr$.set(42);
 }
 ```
@@ -494,7 +403,7 @@ implicit copy / Movable 规则：
 - 普通 `struct`、`union` 默认可以隐式 copy。
 - `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
 - 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
-- `T&`、`T!&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
+- `T&`、`T&!`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
 - nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
 - 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
 - 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
@@ -545,7 +454,7 @@ a.length; // 编译错误：a 已经 move
 - 参数名：参数或参数引用目标 lifetime。
 - 字段名：该字段引用目标 lifetime。
 
-带 `T&` / `T!&` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
+带 `T&` / `T&!` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
 
 ```jiang
 @life(data > self)
@@ -584,7 +493,7 @@ owner 被 move/drop/free 后，依赖它的引用不能继续使用；跨函数�
 - `value$.ref()`：阻止 receiver 自动解引用，并返回其指向值的 `T&`。
 - `value$.ptr()`：阻止 receiver 自动解引用，并返回其指向值的 `T*`，需要 `unsafe`。
 - `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；raw pointer 也可在 `unsafe` 中使用下标访问。
-- `value$.set(new_value)`：显式写入 `T!*` 指向的单个目标对象；`T*` 不允许写入。
+- `value$.set(new_value)`：显式写入 `T*!` 指向的单个目标对象；`T*` 不允许写入。
 - `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
 - `value$.addr()`：获取裸指针，需要 `unsafe`。
 - `value$.dealloc()`：释放默认堆分配器上的对象，需要 `unsafe`。
@@ -969,8 +878,7 @@ trait Indexable {
 - `init(self, ...)` 是 constructor，拥有初始化中的 `self` 目标；`self` 在 `init` body
   中表示正在初始化的 `Self` storage。`init` 只能通过 `Type(...)` / `new Type(...)`
   调用，不作为普通函数值暴露。
-- 字段能否被赋值由字段类型本身决定：字段类型必须带 `!`。instance method 的 `self` 可以写入 `Self` 内部声明为 `!` 的字段。
-- 第一版不需要 `mutating` 或等价标记；修改 `!` 字段是普通 instance method 能力。方法是否会修改状态属于后续 effect proposal，不进入第一版类型规则。
+- 字段能否被赋值由字段名后的 `!` 和访问路径的可写能力共同决定。修改 receiver 需要 `Self&! self`。
 - 默认 `value.method(args...)` 等价于 `Type.method(value$.ref(), args...)`；`Self self`
   方法等价于传入 `value$.move()`，调用后原 receiver 失效。
 - 如果 receiver 已经是 pointer/reference，`ref.method(args...)` 也等价于 `Type.method(ref, args...)`。
@@ -988,8 +896,7 @@ trait Indexable {
   ref receiver method 的动态分派和 owning trait object drop，暂不支持 move receiver
   trait object dispatch。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如
-  `Holder<T>.get() -> T` 在 `Holder<Int!>` 上调用时，结果类型为 `Int!`；如果这个结果写入 `Int`
-  目标，再按上面的写入目标规则忽略顶层 mutable。
+  `Holder<T>.get() -> T` 在 `Holder<Int*!>` 上调用时，结果类型为 `Int*!`。
 - union variant name 和同一 union 的类型函数/显式 method name 共享类型成员命名空间，
   不能重名，避免 `Union.member(...)` 歧义。
 - 同名函数和同名方法允许 overload；参数数量、参数类型或默认参数可接受范围必须
@@ -1055,10 +962,8 @@ T id<T>(T value);
 
 ## Optional 和 Errorable
 
-Optional 只使用 `T?` 表示。`Int?` 表示 `Int` 值可能为空；`Int?!` 表示 optional 这一层本身可变。
-
-Optional 不再幂等：`T??` 表示两层 optional。`!` 是当前绑定或类型层的可变标记，
-例如 `Int?!` 表示 optional 这一层本身可变。
+Optional 只使用 `T?` 表示。`Int?` 表示 `Int` 值可能为空。Optional 不再幂等：
+`T??` 表示两层 optional；optional 类型层不支持 `!`。
 
 已确定表达式能力：
 
@@ -1067,15 +972,14 @@ Optional 不再幂等：`T??` 表示两层 optional。`!` 是当前绑定或类�
 - guard: `guard value is .some(payload) else { return; }`
 - 强制解包: `value$.some()`
 - 条件解包 pattern: `value is .some(payload)`
-- 可变条件解包 pattern: `value is .some(Int! payload)`
+- 可重赋值条件解包 binding: `value is .some(Int payload!)`
 - 借用解包 pattern: `value is .some(ref Int payload)`
-- 可重绑定借用解包 pattern: `value is .some(ref! Int payload)`
+- 唯一可变借用解包 pattern: `value is .some(ref! Int payload)`
 
 `.some(...)` / `.none` 是 optional 的 pattern 写法。`some` 是普通标识符，
 不再作为 optional pattern 关键字。`ref` 是绑定模式，不是类型名；
-`ref T payload` 借用 payload 并创建不可重绑定的引用绑定；`ref! T payload` 借用 payload
-并创建可重绑定的引用 slot。被引用类型的可变性来自 payload 本身，例如 `T!` payload 会得到
-`T!&`。
+`ref T payload` 创建共享借用；`ref! T payload` 创建唯一可变借用并得到 `T&!`。
+如果只需要让新绑定可重新赋值，写 `ref T payload!`；绑定名上的 `!` 不改变借用能力。
 
 示例：
 
@@ -1084,8 +988,8 @@ if value is .some(payload) {
     // payload: T
 }
 
-if value is .some(Int! payload) {
-    // payload: T!
+if value is .some(Int payload!) {
+    // payload: T；binding 可重新赋值
 }
 
 if value is .some(ref Int payload) {
@@ -1111,8 +1015,8 @@ Errorable 只使用 `T@E` 表示。`T` 是成功值类型，`E` 是错误类型�
 
 ```jiang
 Int@Error parse();
-Int?!@Error parse_optional_mutable();
-RawFn<Int@(T1?, T2!)> parse_tuple_error;
+Int?@Error parse_optional();
+RawFn<Int@(T1?, T2)> parse_tuple_error;
 ```
 
 非法：
@@ -1249,7 +1153,7 @@ destructure 语法。
 if value is .some(payload) {
 }
 
-if block is .some(Int! dead) {
+if block is .some(Int dead!) {
 }
 ```
 

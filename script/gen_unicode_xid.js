@@ -88,7 +88,7 @@ function wrapValues(values, indent, perLine) {
 
 function emitArray(type, name, values, perLine) {
   return [
-    `${type}![${values.length}] ${name} = [`,
+    `${type}[${values.length}] ${name} = [`,
     ...wrapValues(values, "    ", perLine),
     "];",
   ].join("\n");

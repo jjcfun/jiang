@@ -169,8 +169,8 @@ scan/parse DSL block。
 provider 必须实现统一接口：
 
 ```text
-Lang.scan(std.jiang.syntax.Input, std.jiang.syntax.Builder.Any&) -> std.jiang.syntax.ScanResult
-Lang.parse(std.jiang.syntax.Input, std.jiang.syntax.Builder.Any&) -> std.jiang.syntax.NodeId
+Lang.scan(std.jiang.syntax.Input, std.jiang.syntax.Builder.Any&!) -> std.jiang.syntax.ScanResult
+Lang.parse(std.jiang.syntax.Input, std.jiang.syntax.Builder.Any&!) -> std.jiang.syntax.NodeId
 ```
 
 `Lang` 是 `type = lang` package root module 的 public 导出，并且必须满足
@@ -182,7 +182,7 @@ public struct Lang: std.jiang.syntax.Provider {
 
     public std.jiang.syntax.ScanResult scan(
         std.jiang.syntax.Input input,
-        std.jiang.syntax.Builder.Any& builder
+        std.jiang.syntax.Builder.Any&! builder
     ) {
         self.tokens = tokenize_sql(input, builder);
         return std.jiang.syntax.ScanResult.ok(...);
@@ -190,7 +190,7 @@ public struct Lang: std.jiang.syntax.Provider {
 
     public std.jiang.syntax.NodeId parse(
         std.jiang.syntax.Input input,
-        std.jiang.syntax.Builder.Any& builder
+        std.jiang.syntax.Builder.Any&! builder
     ) {
         ...
     }

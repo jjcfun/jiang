@@ -9,11 +9,10 @@
 
 - `async` 类似 Kotlin `suspend`：调用 async 函数表示可能挂起，不要求显式 `await`。
 - 普通函数不绑定 execution domain；它只在调用者当前同步控制流中直接执行。
-- `T!&` 表示某个 serial domain 下的可变引用；同一 serial domain 内允许多个 `T!&` alias。
-- 数据竞争检查转换为 domain 切换检查：普通 `T!&` 不能跨 serial domain 逃逸。
+- `T&!` 表示唯一可变引用；其存活期间不能存在指向重叠 place 的其他共享或可变引用。
+- domain 切换检查叠加在唯一借用之上：普通 `T&!` 不能跨 serial domain 逃逸。
 - `Atomic`、`Mutex`、`Channel`、`Actor` 等同步/并发类型是跨 domain 共享可变状态的显式入口。
-- `unique` 不作为普通 `T!&` 的默认语义；它是参数位置的额外能力，用于 noalias、move/drop
-  协议或特殊 API 约束。
+- 唯一性属于 `T&!` 类型并进入函数签名；参数位置不再使用额外的 `unique` 关键字。
 
 本文的主体是 capability。`effect` 用来描述调用上下文，例如 `unsafe`、`async`、`sync`；
 data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capability 检查。
@@ -28,7 +27,7 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 - **domain switch / hop**：从一个 domain 进入另一个 domain 的执行上下文。
 
 普通 executor 或线程池不一定是 serial domain。只有能保证同一 domain 上代码串行执行的 domain，
-才能用于放宽 `T!&` alias 和跨挂起点规则。
+才能用于放宽 `T&!` alias 和跨挂起点规则。
 
 ## Domain 能力
 
@@ -72,7 +71,7 @@ public struct WorkerPoolDomain: Domain {
 和 UI 主线程适配由 runtime 层提供，不作为 `Domain` 的公开成员。
 
 `Domain.kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.kind ==
-.concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T!&` 不能依赖它保证安全。在
+.concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T&!` 不能依赖它保证安全。在
 concurrent domain 中共享可变状态必须使用 `Mutex`、`Atomic`、`Channel` 或等价同步
 capability。
 
@@ -84,13 +83,13 @@ capability。
 ```jiang
 async Int load_data();
 
-async [UiDomain] () render(Model!& model) {
+async [UiDomain] () render(Model&! model) {
     model.loading = true;
     load_data();
     model.loading = false;
 }
 
-() inc(Int!& value) {
+() inc(Int&! value) {
     value = value + 1;
 }
 ```
@@ -158,7 +157,7 @@ async [domain: PageDomain, context: page_ctx] {
 
 ```jiang
 Fn<async Int>
-Fn<async [UiDomain] Int, Model!&>
+Fn<async [UiDomain] Int, Model&!>
 RawFn<unsafe async [UiDomain] Result<Int, Error>, Void*>
 ```
 
@@ -176,7 +175,7 @@ domain type；带 `context` 的形式只用于 block。`UiDomain` 本质上仍�
 普通函数没有默认 domain，也不是隐式 `sync [current]`：
 
 ```jiang
-() inc(Int!& value) {
+() inc(Int&! value) {
     value = value + 1;
 }
 ```
@@ -203,32 +202,26 @@ domain-bound `async [D]` 函数在签名 metadata 中保存 domain type，调用
 检查参数和返回 continuation。它不是普通 `async` 函数的默认形态，而是给“整个函数必须在
 某个 domain 执行”的 API 使用。
 
-## `T!&` 的 Domain 语义
+## `T&!` 的唯一借用与 Domain 语义
 
-`T!&` 是某个 serial domain 下的可变引用。同一 serial domain 内允许多个 `T!&` alias：
+`T&!` 是 Rust 式唯一可变引用。它可以被顺序 reborrow，但不能与指向同一 place 的共享引用
+或另一个可变引用同时存活：
 
 ```jiang
-() bump_twice(Int!& value) {
-    Int!& again = value$.ref();
+() bump(Int&! value) {
     value = value + 1;
-    again = again + 1;
 }
 ```
 
-这不是 Rust `&mut` 的唯一引用模型。安全性来自 serial domain 的串行执行，而不是来自
-全局唯一。
-
-因此后端和优化不能默认把 `T!&` 当作 noalias。需要 noalias、重分配、释放、move-out
-或严格独占时，在参数位置写 `unique`：
+函数参数直接用 `T&!` 表达这一能力：
 
 ```jiang
-() swap(unique Int!& left, unique Int!& right) {
+() swap(Int&! left, Int&! right) {
 }
 ```
 
-`unique` 是用户显式声明的调用点能力要求，不是字段或局部变量的常驻类型属性。
-编译器负责检查 callee 要求 `unique` 时 caller 必须满足并沿封装边界透传；
-编译器不尝试从所有 `unsafe` 函数体中自动推断 `unique`。
+编译器在创建借用、调用和 reborrow 时检查冲突，并沿封装边界要求调用者同样提供 `T&!`。
+`unique` 参数关键字已移除。是否向优化器发出 noalias 仍需服从完整 lifetime 与 ABI 规则。
 
 ## Async 调用与隐式 Await
 
@@ -237,7 +230,7 @@ Jiang 不需要显式 `await`。调用 async 函数就是挂起点：
 ```jiang
 async Int fetch();
 
-async () refresh(Model!& model) {
+async () refresh(Model&! model) {
     model.loading = true;
     Int value = fetch(); // 可能挂起，默认保持 UiDomain
     model.value = value;
@@ -268,7 +261,7 @@ sync [UiDomain] {
 async coroutine frame 在创建它的 current domain 上执行和恢复：
 
 ```jiang
-async () foo(T!& x) {
+async () foo(T&! x) {
     x = ...
     bar(); // 默认 await
     x = ... // 仍在同一个 current domain 恢复
@@ -306,14 +299,14 @@ async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` �
 
 跨 domain 时的能力检查：
 
-- `T!&`：只能留在同一个 serial domain 内，不能传给或捕获到其他 domain。
+- `T&!`：只能留在同一个 serial domain 内，不能传给或捕获到其他 domain。
 - `T&`：跨 domain 需要 `T` 是可共享的不可变/同步安全类型。
 - `T^`：可以 move 到另一个 domain，前提是 `T` 可安全跨 domain 移动。
 - `Fn` / `Fn^`：根据参数类型和捕获 environment 判断是否能跨 domain。
 - `T*` / `T*!`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
 
-`sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T!&` 带入 `D`。
+`sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T&!` 带入 `D`。
 等待不为普通引用增加跨 domain 同步语义。
 
 ## Task 与结构化并发
@@ -431,7 +424,7 @@ async [UiDomain] {
 }
 ```
 
-普通 `T!&` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
+普通 `T&!` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
 
 ```jiang
 sync [UiDomain] {
@@ -484,7 +477,7 @@ completion/cancel acknowledgement 仍负责确认外部系统不再持有 contin
 才能进入 unwind。0.4.7 不提供类型级 `Cancellable` trait；每个 suspend operation 独立注册 handler，
 避免强迫一个类型的多个 async 方法共享一个 cancel 方法。
 
-跨 domain 共享可变状态不使用普通 `T!&` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
+跨 domain 共享可变状态不使用普通 `T&!` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
 `Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
 
 ## Actor 与 Isolate
@@ -492,7 +485,7 @@ completion/cancel acknowledgement 仍负责确认外部系统不再持有 contin
 `actor` 不替代 `domain`。它可以作为 domain 之上的对象模型：
 
 - actor 拥有自己的状态。
-- 外部不能直接拿到 actor state 的 `T!&`。
+- 外部不能直接拿到 actor state 的 `T&!`。
 - 外部只能发消息或调用 async 方法。
 - actor 内部方法在该 actor 的 serial domain 上串行执行。
 
@@ -504,31 +497,30 @@ completion/cancel acknowledgement 仍负责确认外部系统不再持有 contin
 `isolate` 更适合表示隔离状态、独立 heap 或 actor-like container，不适合替代 `domain`。
 本文中的主概念是 execution domain。
 
-## `T!&` 作为字段
+## `T&!` 作为字段
 
-初版禁止 `T!&` 作为普通持久字段：
+`T&!` 可以作为字段或 aggregate payload，但 aggregate 的生命周期不能超过借用来源，且该字段
+存活期间持续占用来源 place 的唯一可变借用：
 
 ```jiang
 struct Holder {
-    Int!& value; // error
+    Int&! value;
 }
 ```
 
-同时禁止把 `T!&` 存入 tuple、enum payload、generic container、heap/global storage 等持久位置：
+tuple、enum payload 和 generic container 遵循同一条 lifetime/loan 规则。不能把局部来源的
+`T&!` 逃逸到更长寿命的 heap/global storage：
 
 ```jiang
-(Int!&, Int)  // error
-Option<Int!&> // error
-Vector<Int!&> // error
+(Int&!, Int)
+Option<Int&!>
+Vector<Int&!>
 ```
 
-`T!&` 只允许作为参数、局部绑定、返回的短生命周期 borrow projection 和临时表达式。
-这样可以避免普通 aggregate 自身也必须携带 domain/lifetime/capability 的复杂度。
+闭包 env 同样受这些规则约束：
 
-闭包 env 是例外但必须受控：
-
-- 非逃逸 `Fn` 可以捕获 `T!&`，因为 env 是编译器管理的 borrow frame。
-- 逃逸 `Fn^` 不能捕获普通 `T!&`，除非后续引入明确的 domain-bound owner 机制。
+- 非逃逸 `Fn` 可以捕获 `T&!`，因为 env 是编译器管理的 borrow frame。
+- 逃逸 `Fn^` 不能捕获普通 `T&!`，除非后续引入明确的 domain-bound owner 机制。
 
 ## 与 Effect 的关系
 
@@ -539,20 +531,16 @@ Vector<Int!&> // error
 - `sync`：block 在某个 domain 同步执行；0.4.6 不保留函数前 `sync` 修饰符。
 - `io`、`atomic`、`alloc` 等未来可作为独立 effect 讨论。
 
-普通 mutable access 由 serial domain 和 domain 切换检查保证。这样 `Fn`、capture list 和函数参数
-不需要额外写 `@effect(write)`。需要 noalias 时在参数位置写 `unique`。
+普通 mutable access 由 `T&!` 唯一借用、serial domain 和 domain 切换检查共同保证。这样 `Fn`、
+capture list 和函数参数不需要额外写 `@effect(write)`。
 
 ## 与 Rust 的差异
 
 Rust 主要靠 `&mut T` 独占、`Send` / `Sync` trait、executor API 约束来防数据竞争。Rust 没有显式
 `async [domain]`；task 被哪个 executor poll，就在哪执行。
 
-Jiang 的草案不同：
-
-- `T!&` 不是全局唯一可变引用。
-- 同一 serial domain 内允许多个 `T!&` alias。
-- 跨 domain 使用 `T!&` 被禁止。
-- `unique` 是用户显式声明的独占能力，用于结构性失效、noalias 或特殊 API 约束。
+Jiang 的 `T&!` 与 Rust `&mut T` 一样表达唯一可变借用；Jiang 还叠加显式 domain 规则，
+禁止普通 `T&!` 跨不兼容 domain 使用。
 
 这使 Jiang 更接近 domain/dispatcher/actor 风格的并发模型，但仍希望保持静态检查和
 零额外运行时 borrow
@@ -564,7 +552,7 @@ Jiang 的草案不同：
 - `D` 0.4.6 必须是 domain type；未来是否允许 dependent / instance domain。
 - `T&` 跨 domain 的 shareable 规则如何表达，是否需要公开 `Send` / `Sync` 等 trait 名称。
 - `Fn<async [D] ...>` 的 coroutine context ABI、闭包捕获和错误信息如何设计。
-- `T!&` 返回值的生命周期和 domain 如何在 HIR / type check 中表示。
+- `T&!` 返回值的生命周期和 domain 如何在 HIR / type check 中表示。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
-- `unique` 和 optimizer noalias 的精确关系。
+- `T&!` 与 optimizer noalias 的精确关系。
 - `async [D] {}`、结构化并发 scope、detached task 的最终语法。
