@@ -94,7 +94,7 @@ printf 'import std;\nInt main() { if (std.fs.exists("/tmp")) { 0 } else { 1 } }\
 cat >"$alloc_sample" <<'EOF'
 Int main() {
     unsafe {
-        Int[*]! values = Int!$.alloc_many(2);
+        Int*! values = Int$.alloc(2);
         values[0] = 1;
         values$.dealloc();
     }
