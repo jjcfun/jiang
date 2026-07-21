@@ -84,6 +84,30 @@ struct TraitVTableGlobalKey: Hashable, Equatable {
     }
 }
 
+struct LambdaVTableGlobalKey: Hashable, Equatable {
+    mir.MirFunctionKey function;
+    Bool heap_env;
+
+    public init(self,
+        qid.DefId function_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        Bool heap_env
+    ) {
+        self.function = mir.MirFunctionKey(function_def, type_args, const_args);
+        self.heap_env = heap_env;
+    }
+
+    public UInt64 hash(self) {
+        return hash.combine(self.function.hash(), hash.hash_bool(self.heap_env));
+    }
+
+    public Bool equal(LambdaVTableGlobalKey& lhs, LambdaVTableGlobalKey& rhs) {
+        if (lhs.heap_env != rhs.heap_env) { return false; }
+        return mir.MirFunctionKey.equal(lhs.function$.ref(), rhs.function$.ref());
+    }
+}
+
 std.String build_text_int(UInt8[]& prefix, Int value) {
     std.StringBuilder builder = std.StringBuilder();
     builder.append(prefix);
@@ -103,7 +127,7 @@ struct MirLowerer: Movable {
     table.HashTable<Int, qid.DefId> receiver_drop_shims;
     table.HashTable<Int, qid.DefId> raw_fn_to_fn_shims;
     table.HashTable<Int, qid.DefId> raw_fn_vtable_globals;
-    table.HashTable<Int, qid.DefId> lambda_vtable_globals;
+    table.HashTable<LambdaVTableGlobalKey, qid.DefId> lambda_vtable_globals;
     table.HashTable<Int, qid.DefId> lambda_env_drop_shims;
     table.HashTable<mir.MirFunctionKey, qid.DefId> async_callable_start_shims;
     table.HashTable<mir.MirFunctionKey, qid.DefId> async_callable_completion_shims;
@@ -131,7 +155,7 @@ struct MirLowerer: Movable {
         self.receiver_drop_shims = table.HashTable<Int, qid.DefId>();
         self.raw_fn_to_fn_shims = table.HashTable<Int, qid.DefId>();
         self.raw_fn_vtable_globals = table.HashTable<Int, qid.DefId>();
-        self.lambda_vtable_globals = table.HashTable<Int, qid.DefId>();
+        self.lambda_vtable_globals = table.HashTable<LambdaVTableGlobalKey, qid.DefId>();
         self.lambda_env_drop_shims = table.HashTable<Int, qid.DefId>();
         self.async_callable_start_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
         self.async_callable_completion_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
@@ -9585,8 +9609,10 @@ struct BodyLowerer: Movable {
         if (self.type_is_closure(function_type)) {
             return self.unsupported_operand(node_id);
         }
-        qid.TypeId[]& type_args = self.lowerer.output.empty_type_args();
-        comptime_value.ComptimeValue[]& const_args = self.lowerer.output.empty_const_args();
+        self.ensure_lambda_function_instance(lambda.function_def);
+        qid.TypeId[]& type_args = self.lowerer.output.type_arg_array(self.function_type_args);
+        comptime_value.ComptimeValue[]& const_args =
+            self.lowerer.output.const_arg_array(self.function_const_args);
         return mir.function_operand_value(
             self.function_ref(node_id, lambda.function_def, function_type, type_args, const_args)
         );
@@ -9680,11 +9706,13 @@ struct BodyLowerer: Movable {
         qid.TypeId closure_type,
         Bool heap_env
     ) {
-        Int key! = lambda.function_def.to_index() * 2;
-        if (heap_env) {
-            key = key + 1;
-        }
-        if (table.hash_table_get_value<Int, qid.DefId>(
+        LambdaVTableGlobalKey key = LambdaVTableGlobalKey(
+            lambda.function_def,
+            self.function_type_args,
+            self.function_const_args,
+            heap_env
+        );
+        if (table.hash_table_get_value<LambdaVTableGlobalKey, qid.DefId>(
             self.lowerer.lambda_vtable_globals$.ref(),
             key
         ) is .some(existing)) {
@@ -9718,23 +9746,30 @@ struct BodyLowerer: Movable {
         Bool heap_env
     ) {
         token.Span span = self.lowerer.hir_span(node_id);
+        self.ensure_lambda_function_instance(lambda.function_def);
         list.ArrayList<mir.MirStaticField> fields! = list.ArrayList<mir.MirStaticField>(2);
         qid.TypeId code_type = self.closure_code_type(closure_type);
         qid.DefId code_def! = lambda.function_def;
         if (self.function_type_is_async(closure_type)) {
             code_def = self.ensure_async_callable_start_shim(
                 lambda.function_def,
-                self.lowerer.output.empty_type_args(),
-                self.lowerer.output.empty_const_args(),
+                self.function_type_args,
+                self.function_const_args,
                 span
             );
+        }
+        qid.TypeId[]& code_type_args! = self.lowerer.output.empty_type_args();
+        comptime_value.ComptimeValue[]& code_const_args! = self.lowerer.output.empty_const_args();
+        if (code_def == lambda.function_def) {
+            code_type_args = self.lowerer.output.type_arg_array(self.function_type_args);
+            code_const_args = self.lowerer.output.const_arg_array(self.function_const_args);
         }
         fields.add(mir.MirStaticField (
             type_id: code_type,
             value: mir.function_static_value(mir.MirFunctionRef (
                 function_def: code_def,
-                type_args: self.lowerer.output.empty_type_args(),
-                const_args: self.lowerer.output.empty_const_args(),
+                type_args: code_type_args,
+                const_args: code_const_args,
                 coroutine_resume: false,
             coroutine_completion: false,
                 type_id: code_type,
@@ -9746,6 +9781,14 @@ struct BodyLowerer: Movable {
             value: self.lambda_drop_env_static_value(node_id, lambda, heap_env, span)
         ));
         return mir.aggregate_static_value(self.lowerer.output.static_field_array(fields$.ref()));
+    }
+
+    () ensure_lambda_function_instance(self, qid.DefId lambda_def) {
+        self.lowerer.ensure_function_instance_with_const_args(
+            lambda_def,
+            self.function_type_args,
+            self.function_const_args
+        );
     }
 
     qid.DefId ensure_async_callable_start_shim(
@@ -13542,10 +13585,11 @@ struct BodyLowerer: Movable {
         guard node.data is .lambda_expr(lambda) else { return false; }
         qid.TypeId closure_type = self.type_for_node(registration_id);
         mir.MirOperand environment = self.lambda_env_operand(registration_id, lambda, span);
+        self.ensure_lambda_function_instance(lambda.function_def);
         mir.MirFunctionRef function = mir.MirFunctionRef (
             function_def: lambda.function_def,
-            type_args: self.lowerer.output.empty_type_args(),
-            const_args: self.lowerer.output.empty_const_args(),
+            type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+            const_args: self.lowerer.output.const_arg_array(self.function_const_args),
             coroutine_resume: false,
             coroutine_completion: false,
             type_id: self.closure_code_type(closure_type),
