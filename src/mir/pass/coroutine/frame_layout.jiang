@@ -8,7 +8,6 @@ import mir = "../../mir.jiang";
 import live_across_suspend = "./live_across_suspend.jiang";
 import state_dispatch = "./state_dispatch.jiang";
 import suspend_points = "./suspend_points.jiang";
-import task_consumption = "./task_consumption.jiang";
 
 public mir.MirCoroutineFrameLayout? build_frame_layout(
     mir.MirStore& output,
@@ -21,14 +20,21 @@ public mir.MirCoroutineFrameLayout? build_frame_layout(
 ) {
     unsafe {
         if (!effects.has_async) { return null; }
-        Bool*! live_locals = live_across_suspend.analyze(body);
+        live_across_suspend.FrameLiveness liveness =
+            live_across_suspend.analyze_frame_liveness(body);
+        Bool*! live_locals = liveness.live_locals;
         list.ArrayList<mir.MirCoroutineFrameField> fields! = list.ArrayList<mir.MirCoroutineFrameField>();
         list.ArrayList<mir.MirCoroutineLocalFrameField> mappings! =
             list.ArrayList<mir.MirCoroutineLocalFrameField>();
         qid.TypeId raw_pointer_type = type_store.raw_pointer_type(type_store.uint8_type(), body.span);
         fields.add(frame_field(.resume_token, raw_pointer_type, null, false));
         fields.add(frame_field(.state, state_type, null, false));
-        fields.add(frame_field(.return_slot, body.locals[body.return_local.to_index()].type_id, body.return_local, false));
+        fields.add(frame_field(
+            .return_slot,
+            body.locals[body.return_local.to_index()].type_id,
+            body.return_local,
+            false
+        ));
         mappings.add(local_mapping(body.return_local, 2));
         qid.TypeId result_type = body.locals[body.return_local.to_index()].type_id;
         qid.TypeId task_type = type_store.task_type(result_type, effects.domain, body.span);
@@ -48,19 +54,27 @@ public mir.MirCoroutineFrameLayout? build_frame_layout(
         while (index < body.locals.length) {
             mir.MirLocalDecl local = body.locals[index];
             if (local_should_get_frame_field(local, live_locals)) {
-                Int field_index = fields.len();
-                fields.add(frame_field(
-                    frame_field_kind_for_local(local.kind),
-                    local.type_id,
-                    local.id,
-                    live_locals[local.id.to_index()]
-                ));
+                Int field_index! = reusable_frame_field_index(
+                    body,
+                    local,
+                    liveness$.ref(),
+                    fields$.ref(),
+                    mappings$.ref()
+                );
+                if (field_index < 0) {
+                    field_index = fields.len();
+                    fields.add(frame_field(
+                        frame_field_kind_for_local(local.kind),
+                        local.type_id,
+                        local.id,
+                        live_locals[local.id.to_index()]
+                    ));
+                }
                 mappings.add(local_mapping(local.id, field_index));
             }
             index = index + 1;
         }
         mir.MirCoroutineSuspendPoint[]& points = suspend_points.collect(output, body);
-        mir.MirTaskConsumption[]& task_consumptions = task_consumption.analyze(output, body);
         qid.TypeId frame_type_id = build_frame_type(type_store, fields$.ref(), body.span);
         return mir.MirCoroutineFrameLayout (
             frame_type_id: frame_type_id,
@@ -71,7 +85,6 @@ public mir.MirCoroutineFrameLayout? build_frame_layout(
             local_mappings: output.coroutine_local_frame_field_array(mappings$.ref()),
             suspend_points: points,
             state_dispatch: state_dispatch.build(output, points),
-            task_consumptions: task_consumptions,
             cancellation_entry: cancellation_entry,
             resume_token_field_index: 0,
             state_field_index: 1,
@@ -192,11 +205,83 @@ mir.MirCoroutineFrameField frame_field(
     );
 }
 
-Bool local_should_get_frame_field(mir.MirLocalDecl local, Bool*! live_locals) {
+Bool local_should_get_frame_field(
+    mir.MirLocalDecl local,
+    Bool*! live_locals
+) {
     unsafe {
         if (local.kind == .return_place) { return false; }
         if (local.kind == .param) { return true; }
         return live_locals[local.id.to_index()];
+    }
+}
+
+Int reusable_frame_field_index(
+    mir.MirBody body,
+    mir.MirLocalDecl local,
+    live_across_suspend.FrameLiveness& liveness,
+    list.ArrayList<mir.MirCoroutineFrameField>& fields,
+    list.ArrayList<mir.MirCoroutineLocalFrameField>& mappings
+) {
+    unsafe {
+        // 参数必须在首次 resume 前就由 caller 写入 frame；被取地址的 local 则可能被
+        // MIR liveness 看不到的引用间接访问。这两类 storage 暂不参与 slot 复用。
+        if (local.kind == .param || liveness.address_preserved[local.id.to_index()]) {
+            return -1;
+        }
+        Int mapping_index! = 0;
+        while (mapping_index < mappings.len()) {
+            Int field_index = mappings.get(mapping_index).field_index;
+            if (frame_field_can_store_local(body, local, field_index, liveness, fields, mappings)) {
+                return field_index;
+            }
+            mapping_index = mapping_index + 1;
+        }
+        return -1;
+    }
+}
+
+Bool frame_field_can_store_local(
+    mir.MirBody body,
+    mir.MirLocalDecl local,
+    Int field_index,
+    live_across_suspend.FrameLiveness& liveness,
+    list.ArrayList<mir.MirCoroutineFrameField>& fields,
+    list.ArrayList<mir.MirCoroutineLocalFrameField>& mappings
+) {
+    mir.MirCoroutineFrameField field = fields.get(field_index);
+    if (!reusable_local_field_kind(field.kind)) { return false; }
+
+    // 只复用完全相同的 TypeId。这样 field projection 的类型、ABI size/alignment 和显式
+    // drop lowering 都无需引入 union storage 或额外的 active-type tag。
+    if (field.type_id.to_index() != local.type_id.to_index()) { return false; }
+
+    Int mapping_index! = 0;
+    while (mapping_index < mappings.len()) {
+        mir.MirCoroutineLocalFrameField mapping = mappings.get(mapping_index);
+        if (mapping.field_index == field_index) {
+            mir.MirLocalDecl existing = body.locals[mapping.local_id.to_index()];
+            if (!locals_can_share_frame_slot(local, existing, liveness)) { return false; }
+        }
+        mapping_index = mapping_index + 1;
+    }
+    return true;
+}
+
+Bool reusable_local_field_kind(mir.MirCoroutineFrameFieldKind kind) {
+    return kind == .local || kind == .temp;
+}
+
+Bool locals_can_share_frame_slot(
+    mir.MirLocalDecl lhs,
+    mir.MirLocalDecl rhs,
+    live_across_suspend.FrameLiveness& liveness
+) {
+    unsafe {
+        if (rhs.kind == .param || liveness.address_preserved[rhs.id.to_index()]) {
+            return false;
+        }
+        return !live_across_suspend.locals_interfere(liveness, lhs.id, rhs.id);
     }
 }
 

@@ -1,0 +1,218 @@
+// run-pass
+// expected-exit: 0
+
+import std;
+import context = "../../../../src/context.jiang";
+import hir = "../../../../src/hir/hir.jiang";
+import mir = "../../../../src/mir/mir.jiang";
+import mir_lower = "../../../../src/mir/lower.jiang";
+import frame_liveness = "../../../../src/mir/pass/coroutine/live_across_suspend.jiang";
+import module_graph = "../../../../src/resolve/module_graph.jiang";
+import resolve = "../../../../src/resolve/module_resolver.jiang";
+import rdef = "../../../../src/resolve/def.jiang";
+import store = "../../../../src/resolve/store.jiang";
+import qid = "../../../../src/store/id.jiang";
+import syntax_store = "../../../../src/syntax/store.jiang";
+import ast = "../../../../src/syntax/ast.jiang";
+import monomorph = "../../../../src/sema/monomorph.jiang";
+import type_check = "../../../../src/sema/type_check/api.jiang";
+import source = "../../../../src/source/source.jiang";
+import syntax = "../../../../src/syntax/api.jiang";
+import system_io = "../../../../src/system/io.jiang";
+
+unsafe Int main() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    UInt8[]^ text = frame_layout_source();
+    module_graph.ModuleGraph^ graph = lower_text_to_hir(
+        ctx$.ref(), "frame_layout_slot_mapping", text[..]
+    );
+    mir.MirStore^ lowered = lower_mir(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+
+    if (!slot_relation(
+        ctx$.ref(), graph$.ref(), lowered$.ref(), "sequential", "first", "second", true
+    )) { return 1; }
+    if (!slot_relation(
+        ctx$.ref(), graph$.ref(), lowered$.ref(), "overlapping", "first", "second", false
+    )) { return 2; }
+    if (!slot_relation(
+        ctx$.ref(), graph$.ref(), lowered$.ref(), "parameter_slot", "value", "local", false
+    )) { return 3; }
+    if (!slot_relation(
+        ctx$.ref(), graph$.ref(), lowered$.ref(), "addressed_slot", "addressed", "later", false
+    )) { return 4; }
+    if (!slot_relation(
+        ctx$.ref(), graph$.ref(), lowered$.ref(), "distinct_type", "number", "flag", false
+    )) { return 5; }
+    return 0;
+}
+
+UInt8[]^ frame_layout_source() {
+    std.StringBuilder text = std.StringBuilder();
+    text.append("async Int pause() { 1 } async Bool pause_bool() { true }");
+    text.append("async Int sequential() {");
+    text.append("{ Int first = 1; Int first_resumed = pause();");
+    text.append("Int first_result = first + first_resumed; }");
+    text.append("{ Int second = 2; Int second_resumed = pause();");
+    text.append("Int second_result = second + second_resumed; } 0 }");
+    text.append("async Int overlapping() {");
+    text.append("Int first = 1; Int second = 2; pause() + first + second }");
+    text.append("async Int parameter_slot(Int value) {");
+    text.append("Int local = value; pause() + local }");
+    text.append("async Int addressed_slot() {");
+    text.append("{ Int addressed = 1; unsafe { addressed$.ptr(); }");
+    text.append("Int first_resumed = pause(); Int first_result = addressed + first_resumed; }");
+    text.append("{ Int later = 2; Int second_resumed = pause();");
+    text.append("Int second_result = later + second_resumed; } 0 }");
+    text.append("async Int distinct_type() {");
+    text.append("{ Int number = 1; Int resumed = pause(); Int result = number + resumed; }");
+    text.append("{ Bool flag = true; Bool resumed = pause_bool();");
+    text.append("if flag && resumed { Int result = 1; } } 0 }");
+    return text$.move().into_slice();
+}
+
+unsafe Bool slot_relation(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph,
+    mir.MirStore& lowered,
+    UInt8[]& function_name,
+    UInt8[]& lhs_name,
+    UInt8[]& rhs_name,
+    Bool should_share
+) {
+    qid.DefId function_def = find_named_function_def(ctx, graph.root_module, function_name);
+    guard lowered.function_id_for_def(function_def) is .some(function_id) else {
+        return false;
+    }
+    mir.MirFunction function = lowered.function(function_id);
+    guard function.coroutine_frame is .some(frame) else {
+        return false;
+    }
+    guard find_named_local(ctx, function.body, lhs_name) is .some(lhs) else { return false; }
+    guard find_named_local(ctx, function.body, rhs_name) is .some(rhs) else { return false; }
+    guard frame_field_for_local(frame, lhs) is .some(lhs_field) else { return false; }
+    guard frame_field_for_local(frame, rhs) is .some(rhs_field) else { return false; }
+    if ((lhs_field == rhs_field) == should_share) { return true; }
+    frame_liveness.FrameLiveness liveness = frame_liveness.analyze_frame_liveness(function.body);
+    Bool interferes = frame_liveness.locals_interfere(liveness$.ref(), lhs, rhs);
+    report_slot_mismatch(
+        function_name, lhs_name, lhs_field, rhs_name, rhs_field, interferes
+    );
+    return false;
+}
+
+() report_slot_mismatch(
+    UInt8[]& function_name,
+    UInt8[]& lhs_name,
+    Int lhs_field,
+    UInt8[]& rhs_name,
+    Int rhs_field,
+    Bool interferes
+) {
+    std.StringBuilder message = std.StringBuilder();
+    message.append(function_name);
+    message.append(": ");
+    message.append(lhs_name);
+    message.append("=");
+    message.append(lhs_field);
+    message.append(", ");
+    message.append(rhs_name);
+    message.append("=");
+    message.append(rhs_field);
+    message.append(", interferes=");
+    message.append(interferes);
+    message.append("\n");
+    UInt8[]^ text = message$.move().into_slice();
+    system_io.stdout().write_all(text[..]);
+}
+
+unsafe mir.MirLocalId? find_named_local(
+    context.CompilerContext& ctx,
+    mir.MirBody body,
+    UInt8[]& name
+) {
+    qid.SymbolId expected = ctx.store.symbols.intern(name);
+    Int index! = 0;
+    while (index < body.locals.length) {
+        mir.MirLocalDecl local = body.locals[index];
+        if (local.name is .some(symbol)) {
+            if (symbol == expected) { return local.id; }
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+unsafe Int? frame_field_for_local(
+    mir.MirCoroutineFrameLayout frame,
+    mir.MirLocalId local_id
+) {
+    Int index! = 0;
+    while (index < frame.local_mappings.length) {
+        mir.MirCoroutineLocalFrameField mapping = frame.local_mappings[index];
+        if (mapping.local_id == local_id) { return mapping.field_index; }
+        index = index + 1;
+    }
+    return null;
+}
+
+unsafe module_graph.ModuleGraph^ lower_text_to_hir(
+    context.CompilerContext& ctx,
+    UInt8[]& name,
+    UInt8[]& text
+) {
+    syntax_store.Store asts! = syntax_store.Store();
+    source.SourceId source_id = ctx.store.sources.intern_virtual(name, source.content_hash(text));
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx, text, source_id);
+    assert(!parsed.has_errors());
+    Int source_revision = ctx.store.sources.get(source_id).revision;
+    asts.set_unit(parsed.take_unit(), source_revision);
+
+    resolve.ModuleResolver resolver = resolve.ModuleResolver(ctx, asts$.ref());
+    ast.AstUnit& root_unit = asts.unit(source_id, source_revision)$.some();
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(root_unit);
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    assert(type_check.check_hir_package(ctx, graph$.ref()));
+    return graph$.move();
+}
+
+unsafe mir.MirStore^ lower_mir(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph
+) {
+    monomorph.MonomorphStore^ instances = monomorph.collect_reachable_instances(
+        ctx,
+        ctx.store.hirs$.ref(),
+        ctx.store.typeck$.ref(),
+        graph
+    );
+    return mir_lower.lower_package(
+        ctx,
+        ctx.store.hirs$.ref(),
+        ctx.store.typeck$.ref(),
+        instances$.ref(),
+        graph
+    );
+}
+
+unsafe qid.DefId find_named_function_def(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id,
+    UInt8[]& name
+) {
+    store.ModuleRecord module = ctx.store.resolve.modules.get(module_id);
+    hir.HirDef& module_hir = ctx.store.hirs.def_ref(module.def_id);
+    qid.SymbolId symbol = ctx.store.symbols.intern(name);
+    Int index! = 0;
+    while (index < module_hir.members.len()) {
+        qid.DefId def_id = module_hir.members.get(index);
+        rdef.DefRecord def_record = ctx.store.defs.get(def_id);
+        if (def_record.kind == .function_def && def_record.name.symbol == symbol) {
+            return def_id;
+        }
+        index = index + 1;
+    }
+    assert(false);
+    return module.def_id;
+}
