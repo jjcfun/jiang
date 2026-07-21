@@ -44,6 +44,14 @@ unsafe Int main() {
     if (!slot_relation(
         ctx$.ref(), graph$.ref(), lowered$.ref(), "distinct_type", "number", "flag", false
     )) { return 5; }
+    Int task_region_result = task_region_parent_storage_result(
+        ctx$.ref(), graph$.ref(), lowered$.ref()
+    );
+    if (task_region_result != 0) { return task_region_result; }
+    Int task_slot_result = sequential_task_slot_result(
+        ctx$.ref(), graph$.ref(), lowered$.ref()
+    );
+    if (task_slot_result != 0) { return task_slot_result; }
     return 0;
 }
 
@@ -68,7 +76,145 @@ UInt8[]^ frame_layout_source() {
     text.append("{ Int number = 1; Int resumed = pause(); Int result = number + resumed; }");
     text.append("{ Bool flag = true; Bool resumed = pause_bool();");
     text.append("if flag && resumed { Int result = 1; } } 0 }");
+    text.append("async Int task_child() { pause() }");
+    text.append("async Int task_parent() {");
+    text.append("Task<Int> child = async task_child(); child.await() }");
+    text.append("async Int sequential_tasks() {");
+    text.append("{ Task<Int> first = async task_child(); Int a = first.await(); }");
+    text.append("{ Task<Int> second = async task_child(); Int b = second.await(); } 0 }");
     return text$.move().into_slice();
+}
+
+unsafe Int task_region_parent_storage_result(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph,
+    mir.MirStore& lowered
+) {
+    qid.DefId function_def = find_named_function_def(ctx, graph.root_module, "task_parent");
+    guard lowered.function_id_for_def(function_def) is .some(function_id) else { return 6; }
+    mir.MirFunction function = lowered.function(function_id);
+    guard function.coroutine_frame is .some(frame) else { return 7; }
+    if (frame.task_regions.length != 1) { return 8; }
+    mir.MirTaskRegion region = frame.task_regions[0];
+    if (region.storage.control != .local || region.storage.frame != .local) { return 9; }
+    if (region.storage.reclaim != .parent) { return 10; }
+    if (region.consume_count == 0 || region.release_count == 0) { return 11; }
+    if (body_has_heap_task_allocation(function.body)) { return 12; }
+    if (!task_state_is_in_parent_frame(function.body, frame$.ref(), region.task_local)) { return 13; }
+    if (frame.fields[0].kind != .state) { return 25; }
+    if (frame.task_abi.schedule_state_field.index != 0
+        || frame.task_abi.schedule_executor_field.index != 1
+        || frame.task_abi.schedule_context_field.index != 2
+        || frame.task_abi.schedule_resume_field.index != 3
+        || frame.task_abi.schedule_active_executor_field.index != 4
+    ) {
+        return 26;
+    }
+    return 0;
+}
+
+unsafe Int sequential_task_slot_result(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph,
+    mir.MirStore& lowered
+) {
+    qid.DefId function_def = find_named_function_def(ctx, graph.root_module, "sequential_tasks");
+    guard lowered.function_id_for_def(function_def) is .some(function_id) else { return 14; }
+    mir.MirFunction function = lowered.function(function_id);
+    guard function.coroutine_frame is .some(frame) else { return 15; }
+    guard find_named_local(ctx, function.body, "first") is .some(first) else { return 16; }
+    guard find_named_local(ctx, function.body, "second") is .some(second) else { return 17; }
+    return captured_slot_result(function.body, frame$.ref(), first, second);
+}
+
+unsafe Int captured_slot_result(
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId lhs_task,
+    mir.MirLocalId rhs_task
+) {
+    Int shared_count! = 0;
+    Int lhs_index! = 0;
+    while (lhs_index < body.locals.length) {
+        mir.MirLocalDecl lhs = body.locals[lhs_index];
+        if (lhs.coroutine_capture_task is .some(owner) && owner == lhs_task) {
+            if (is_task_storage_capture(lhs) && frame_field_for_local(frame, lhs.id) is .some(lhs_field)) {
+                guard matching_capture_slot(body, frame, lhs, rhs_task) is .some(rhs_field) else {
+                    if (lhs.coroutine_capture_kind is .some(kind) && kind == .task_control) { return 19; }
+                    return 22;
+                }
+                if (lhs_field != rhs_field) { return 20; }
+                shared_count = shared_count + 1;
+            }
+        }
+        lhs_index = lhs_index + 1;
+    }
+    // TaskState 和 child frame 都必须进入父 frame 并分别复用。
+    if (shared_count < 2) { return 21; }
+    return 0;
+}
+
+unsafe Int? matching_capture_slot(
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalDecl lhs,
+    mir.MirLocalId rhs_task
+) {
+    Int rhs_index! = 0;
+    while (rhs_index < body.locals.length) {
+        mir.MirLocalDecl rhs = body.locals[rhs_index];
+        if (rhs.coroutine_capture_task is .some(owner) && owner == rhs_task) {
+            if (rhs.coroutine_capture_kind == lhs.coroutine_capture_kind) {
+                return frame_field_for_local(frame, rhs.id);
+            }
+        }
+        rhs_index = rhs_index + 1;
+    }
+    return null;
+}
+
+Bool is_task_storage_capture(mir.MirLocalDecl local) {
+    guard local.coroutine_capture_kind is .some(kind) else { return false; }
+    return kind == .task_control || kind == .task_frame;
+}
+
+Bool body_has_heap_task_allocation(mir.MirBody body) {
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        mir.MirBlock block = body.blocks[block_index];
+        Int statement_index! = 0;
+        while (statement_index < block.statements.length) {
+            mir.MirStatement statement = block.statements[statement_index];
+            if (statement_allocates_task(statement)) { return true; }
+            statement_index = statement_index + 1;
+        }
+        block_index = block_index + 1;
+    }
+    return false;
+}
+
+Bool statement_allocates_task(mir.MirStatement statement) {
+    if (statement.kind is .task_allocation_stmt(_)) { return true; }
+    guard statement.kind is .assign_stmt(assign) else { return false; }
+    return assign.value is .alloc_box_value(_);
+}
+
+unsafe Bool task_state_is_in_parent_frame(
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& frame,
+    mir.MirLocalId task_local
+) {
+    Int index! = 0;
+    while (index < body.locals.length) {
+        mir.MirLocalDecl local = body.locals[index];
+        if (local.coroutine_capture_task is .some(owner) && owner == task_local) {
+            if (local.type_id == frame.task_abi.task_state_type_id) {
+                return frame_field_for_local(frame, local.id) != null;
+            }
+        }
+        index = index + 1;
+    }
+    return false;
 }
 
 unsafe Bool slot_relation(
@@ -90,8 +236,8 @@ unsafe Bool slot_relation(
     }
     guard find_named_local(ctx, function.body, lhs_name) is .some(lhs) else { return false; }
     guard find_named_local(ctx, function.body, rhs_name) is .some(rhs) else { return false; }
-    guard frame_field_for_local(frame, lhs) is .some(lhs_field) else { return false; }
-    guard frame_field_for_local(frame, rhs) is .some(rhs_field) else { return false; }
+    guard frame_field_for_local(frame$.ref(), lhs) is .some(lhs_field) else { return false; }
+    guard frame_field_for_local(frame$.ref(), rhs) is .some(rhs_field) else { return false; }
     if ((lhs_field == rhs_field) == should_share) { return true; }
     frame_liveness.FrameLiveness liveness = frame_liveness.analyze_frame_liveness(function.body);
     Bool interferes = frame_liveness.locals_interfere(liveness$.ref(), lhs, rhs);
@@ -144,7 +290,7 @@ unsafe mir.MirLocalId? find_named_local(
 }
 
 unsafe Int? frame_field_for_local(
-    mir.MirCoroutineFrameLayout frame,
+    mir.MirCoroutineFrameLayout& frame,
     mir.MirLocalId local_id
 ) {
     Int index! = 0;

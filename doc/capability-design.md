@@ -455,9 +455,10 @@ unwind。取消请求线程不能直接析构 frame；resume 入口和 suspend b
 后返回；cancellation 不进入 async 函数的普通返回类型。
 
 `cancel()` 返回时保证 task 不会再执行用户代码，相关 frame、capture 和未消费 result 已完成
-清理。Task 在未 `await()` 或 `cancel()` 时离开词法作用域仍表示 detach，不请求取消，task 继续
-执行；task 完成后由 task/observer ownership 协议完成最终释放。若以后需要只发请求而不等待，
-应使用不同的显式操作，不能削弱 `cancel()` 的终态确认语义。
+清理。0.4.8 起，body-local Task 是结构化子任务：未 `await()` 或 `cancel()` 的 Task 离开作用域时，
+编译器先向同一退出路径上的全部活跃 Task 请求取消，再逐个等待终态。需要 detached 执行时使用
+不形成 Task handle 的 standalone async block；Task handle 固定在创建它的绑定上，不支持
+`move()`、`forget()` 或重新赋值。
 
 0.4.7 当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占
 frame。
@@ -564,4 +565,4 @@ Jiang 的 `T&!` 与 Rust `&mut T` 一样表达唯一可变借用；Jiang 还叠�
 - 多来源 `T&!` 返回值的 lifetime/domain 关系与复杂 reborrow 诊断如何进一步收紧。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
 - `T&!` 与 optimizer noalias 的精确关系。
-- `async [D] {}`、结构化并发 scope、detached task 的最终语法。
+- 动态 task group、失败聚合和显式 detached handle 是否需要独立类型。

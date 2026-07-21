@@ -148,13 +148,34 @@ backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；�
 child frame 连接到 caller continuation。`async call` 和 observed `async {}` 显式 materialize
 `Task<T>`；直接作为语句使用的 async block 生成 detached start。
 
-显式 Task 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`，其中只保存编译期 Domain type
-identity 和 resume operand。effect argument 不再接受 const value。它不解析用户类型上的 `enqueue`
-成员，也不暴露 coroutine frame ABI。
-LLVM backend 将其 lowering 为私有
-`__jiang_runtime_domain_enqueue(domain_id, domain_kind, context, resume)` runtime ABI。`domain_id` 是当前程序
-内的编译期 domain identity，`domain_kind` 来自 associated const `Domain.kind`；两者都不进入用户
-ABI。MIR 不关心 runtime 使用单线程队列还是 worker pool，调度实现变化不再改变 MIR 形状。
+显式 Task 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`；动态 executor 路径使用
+`dynamic_domain_enqueue`。callee 同时携带可选 TaskState pointer 和 `handoff` 位。effect argument 不再
+接受 const value；lowering 不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
+
+LLVM backend 把普通 wake lowering 为
+`__jiang_runtime_task_request(executor, task, context, resume)`，把当前 Job 上的 continuation 转移
+lowering 为 `__jiang_runtime_task_handoff(...)`。静态 Domain identity 只用于取得 canonical executor，
+不进入用户 ABI。MIR 不关心 runtime 使用单线程队列还是 worker pool，调度实现变化不改变
+用户类型。
+
+已知无环 direct async call 把 child frame 嵌入 caller frame。MIR lowering 用 concrete
+`MirFunctionKey` 记录正在构造的 coroutine；遇到 self/mutual-recursive 回边时不再递归形成无限
+frame type，而是调用该 concrete callee 的 heap async-context start shim。start shim 和动态
+async Fn/RawFn start 都携带当前 Task pointer，并以 `task_handoff` 转移 Job；caller resume、start
+shim 和 runtime handoff 的返回块必须保持 codegen-empty，使 LLVM 能生成 tail call。
+
+immutable local 直接绑定的 async lambda 也按已知 direct callee lowering：调用点保留 concrete lambda
+DefId，把 capture env 和显式参数写入 parent-owned child frame，再直接调用 resume。参数到 frame 的
+映射必须扫描 callee 源 MIR 的 `.param` local；不能假设第 N 个 ABI 参数恒等于 local N+1，因为
+lambda receiver/env 是合成 local，而且未跨 suspend 的参数可能没有 frame field。
+
+真正动态的 async Fn/RawFn start shim 使用 `MirCoroutineFrameAllocRvalue`，completion shim 使用
+`MirCoroutineFrameFreeRvalue`。LLVM 将二者分别降低为
+`__jiang_runtime_coroutine_frame_alloc(executor, size, alignment)` 和对应 free。它们与普通 Box
+alloc/free 分离，保证 coroutine placement policy 可以变化而不污染语言级 heap allocation。
+recursive backedge 和 detached async block 复用同一 ABI。serial executor 的热路径使用无锁、
+无原子的 executor-local size-class freelist；跨 executor 和 concurrent 路径使用 system provider
+隐藏的 ABA-safe shared pool，MIR 和 runtime 均不依赖平台原子队列的具体布局。
 
 0.4.6 的 backend 内建 enqueue 使用进程内单线程 FIFO。嵌套 enqueue 只追加节点，由最外层 drain
 依次调用 resume，避免 completion 在当前 resume 栈内递归重入 continuation。该队列不提供跨线程
@@ -191,15 +212,19 @@ resume。等待方先写 waiter context/function，再发布 armed 状态并重�
 ready 后只在成功把 armed claim 为 notified 时调用 waiter。等待方若观察到 ready，只在成功撤销 armed
 时直接继续，否则由已经 claim 的完成方负责恢复。serial domain 可以在证明不跨线程后消除原子操作。
 
-observed Task 的 task 和 observer 各持有一次 ownership。`await()` 消费 observer，Task 在词法
-作用域结束时未消费则 detach；completion 与 observer release 通过 CAS 决定最后释放 task-state、frame
-和未消费 result 的一方。0.4.6 不提供 cancellation，detach 不会停止已经启动的 coroutine。
+0.4.8 的 scoped Task 由 parent 唯一回收；completion 不再与 observer 通过 ownership CAS 竞争释放。
+`TaskRegion` 为 control state 和 child frame 分别选择 parent frame、caller stack 或 heap storage，
+并让不重叠的结构化 Task 复用 frame slot。动态/递归 child 仍可只把 child frame 放到 heap。
 
 0.4.7 的 `Task.cancel()` 与 `await()` 是互斥的 consuming operation。cancel 设置 cancellation request，
 把处理请求的工作调度到 task execution domain，并挂起 caller 直到 completion 或 cancellation unwind
 进入 terminal state；它不是 request-and-detach。terminal acknowledgement 发布后才能恢复 cancel waiter，
-并保证 frame、capture 和未消费 result 已经完成清理。completion、cancel、detach 的竞争必须复用
-可验证的原子 ownership 协议，任意资源仍只允许释放一次。
+并保证 frame、capture 和未消费 result 已经完成清理。
+
+0.4.8 将 body-local `Task<T>` 固定为结构化子任务。HIR -> MIR lowering 在每条 scope exit、return、
+throw 和 parent cancellation 路径上生成 cancel-all-then-join CFG：先向全部未消费 Task 发出取消，
+再逐个生成可挂起 join，最后才进入普通 local drop。cancellation entry 在 BodyLowerer 内生成，因此
+cleanup 新增的 suspend point 会参与 state dispatch 和 frame liveness。
 
 当前实现覆盖 cancel-before-start 和自然恢复边界：observed Task frame 在 resume dispatch 前用 CAS 将
 request 从 requested claim 为 cancelling，并从 cancellation entry 进入 drop elaboration 生成的清理链。
@@ -222,16 +247,21 @@ registration 同步执行，因此 lowering 必须处理 cancel-before-registrat
 跨线程迟到 resume。只有取得 terminal ownership 的一方能够恢复 coroutine；取消方仍需等待外部
 completion/cancel acknowledgement 后才能释放 continuation 所在 frame。类型级 `Cancellable` target
 已经移除；每次 suspend 注册的 handler 与 child Task 复用同一个 tagged active-target 状态字。
-cancellation cleanup 统一释放已初始化的 body-local Task observer，再为 drop elaboration 管理的
+cancellation cleanup 统一取消并等待已初始化的 body-local Task，再为 drop elaboration 管理的
 parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，extern continuation record 等
 跨 suspend temp 仍由 liveness 放入 frame。
 
-coroutine frame 的 parent continuation 统一保存 `executor + context + resume`。Task 根 completion 的
-executor 为 null，表示直接执行内部 completion；child completion 使用调用方 executor，经 scheduler
-选择同 serial Domain direct resume 或跨 Domain enqueue。`extern async` 对 C 可见的 continuation 前三个
-word 仍为 `result + context + resume`，其中 context 指向完整 record，resume 是 runtime scheduling
-trampoline；record 尾部保存 executor 和真实 context/resume，因此外部 callback 不再
-直接进入 coroutine body，concurrent executor 也继续复用原子 resume token。
+coroutine frame 的 parent continuation 统一保存 `executor + context + resume`。普通 async child 继承
+当前 Task pointer，但不创建新的 TaskState；完成时使用 handoff 对称转移到 parent continuation。
+Task 根 completion 的 executor 为 null，表示直接执行内部 completion；跨 Domain 才进入 executor queue。
+`extern async` 对 C 可见的 continuation 前三个 word 仍为 `result + context + resume`，其中 context 指向
+完整 record，resume 是 runtime scheduling trampoline；record 尾部保存 executor、Task pointer 和真实
+context/resume，因此外部 callback 不直接进入 coroutine body。
+
+并发调度状态只存在于 TaskState 的固定 Job header，不进入每个 coroutine frame，也不再分配 resume
+token。Job 区分 request 与 handoff：外部 wake/首次启动使用 request，内部 async completion、async
+callable completion shim 和 coroutine continuation 转移使用 handoff。queue callback 调用 target 后不得
+再访问 TaskState，Task completion 最终发布后同样禁止回读。
 
 Task 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
 coroutine frame 转移。Task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Task

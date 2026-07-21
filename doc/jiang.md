@@ -977,7 +977,19 @@ async Int load_both() {
 显式写 domain 参数。`task.await()` 与 `task.cancel()` 都消费 Task，只能选择一个；`cancel()` 等待 Task
 进入终态后返回。若 Task 正在等待显式 child Task，取消会传播到 child，并在 child 进入终态后继续
 清理 parent；直接调用的 async child 会继承同一取消上下文，在恢复边界先 unwind，再恢复 parent。
-Task 未被消费就离开作用域表示 detach，不会隐式请求取消。
+
+Task 是结构化子任务。未消费的 Task 离开 scope、执行 `return`/`throw` 或随 parent 取消时，编译器
+先向该退出路径上的全部活跃 Task 请求取消，再逐个等待其进入终态；所有 child 完成后才销毁其余
+局部值并释放 parent frame。Task handle 固定在创建它的绑定上，`Task<T>` 不支持 `move()`、
+`forget()` 或重新赋值。
+
+需要 detached 执行时，直接把 async block 作为语句启动，不形成 Task handle：
+
+```c
+async [WorkerDomain] {
+    refresh_cache()
+};
+```
 
 在 async 函数中只需要结构化切换 execution domain 时，继续使用 `sync [Domain]`，不必创建临时
 Task：

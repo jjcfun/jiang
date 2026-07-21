@@ -1,27 +1,33 @@
 // Jiang coroutine scheduler runtime.
 //
-// This module owns the stable backend ABI. Scheduling policy belongs here;
-// platform thread and synchronization primitives come from system.thread.
+// AsyncContext 只保存函数状态；可并发调度的状态属于 TaskState 的固定前缀。
+// 没有 TaskState 的 continuation 直接调用或直接入队，不承担原子状态机成本。
 
 import thread = "../system/thread.jiang";
 import domain_executor = "./domain_executor.jiang";
 
-const Int resume_idle = 0;
-const Int resume_running = 1;
-const Int resume_pending = 2;
-// Final Task release either destroys an idle token or hands destruction to its active callback.
-const Int resume_destroy_pending = 3;
-const Int resume_destroyed = 4;
-const Int resume_completed_word = 0;
-const Int resume_state_word = 1;
-const Int resume_queue_word = 2;
-const Int resume_context_word = 3;
-const Int resume_function_word = 4;
-const Int resume_callback_word = 5;
-const Int resume_token_words = 6;
+const Int schedule_idle = 0;
+const Int schedule_queued = 1;
+const Int schedule_running = 2;
+const Int schedule_pending = 3;
+const Int schedule_completed = 4;
+const Int schedule_publishing_idle = 5;
+const Int schedule_publishing_pending = 6;
+const Int schedule_publishing_handoff = 7;
+const Int schedule_kind_mask = 7;
+const Int schedule_generation_step = 8;
+
+// TaskState 的固定 runtime header。
+const Int schedule_state_word = 0;
+const Int schedule_executor_word = 1;
+const Int schedule_context_word = 2;
+const Int schedule_resume_word = 3;
+const Int schedule_active_executor_word = 4;
+
 const Int continuation_executor_word = 3;
 const Int continuation_context_word = 4;
 const Int continuation_resume_word = 5;
+const Int continuation_task_word = 6;
 
 struct RuntimeState {
     thread.Group group!;
@@ -51,44 +57,253 @@ public () shutdown() {
     runtime_state.initialized = false;
 }
 
+// C/runtime 探针使用 binding id；编译器生成代码直接传 canonical executor。
 @link_symbol("__jiang_runtime_domain_enqueue")
-public () enqueue(
+public () request_domain(
     Int domain_id,
     Int domain_kind,
     Void* context,
-    UInt8* token_slot,
+    Void* raw_task,
     Void* resume,
     Void* callback
 ) {
-    assert(runtime_state.initialized);
     Void* executor = domain_executor.materialize_uncached(domain_id, domain_kind);
-    enqueue_executor(executor, context, token_slot, resume, callback);
+    request(executor, raw_task, context, resume);
 }
 
-@link_symbol("__jiang_runtime_executor_enqueue")
-public () enqueue_executor(
+@link_symbol("__jiang_runtime_task_request")
+public () request(
     Void* executor,
+    Void* raw_task,
     Void* context,
-    UInt8* token_slot,
-    Void* resume,
-    Void* callback
+    Void* resume
 ) {
     assert(runtime_state.initialized);
+    if (raw_task == null) {
+        schedule_raw(executor, context, resume);
+        return;
+    }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    request_task(task, executor, context, resume);
+}
+
+@link_symbol("__jiang_runtime_task_handoff")
+public () handoff(
+    Void* executor,
+    Void* raw_task,
+    Void* context,
+    Void* resume
+) {
+    assert(runtime_state.initialized);
+    if (raw_task == null) {
+        schedule_raw(executor, context, resume);
+        return;
+    }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int publishing = claim_handoff(task);
+    if (publishing < 0) { return; }
+    publish_target(task, executor, context, resume);
+    schedule_published(task, publishing, true);
+}
+
+@link_symbol("__jiang_runtime_task_suspend")
+public () suspend_task(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    while (true) {
+        Int*! state = task_word(task, schedule_state_word);
+        Int observed = thread.atomic_load(state);
+        Int kind = schedule_kind(observed);
+        if (kind == schedule_running) {
+            if (thread.atomic_compare_exchange(
+                    state, observed, schedule_as(observed, schedule_idle)
+                )
+            ) {
+                return;
+            }
+            continue;
+        }
+        if (kind == schedule_pending) {
+            Int publishing = schedule_as(observed, schedule_publishing_handoff);
+            if (!thread.atomic_compare_exchange(state, observed, publishing)) { continue; }
+            schedule_published(task, publishing, true);
+            return;
+        }
+        if (kind == schedule_completed) { return; }
+        if (schedule_is_publishing(kind)) { continue; }
+        assert(false);
+    }
+}
+
+@link_symbol("__jiang_runtime_task_complete")
+public () complete_task(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    while (true) {
+        Int*! state = task_word(task, schedule_state_word);
+        Int observed = thread.atomic_load(state);
+        Int kind = schedule_kind(observed);
+        if (kind == schedule_running || kind == schedule_pending) {
+            if (thread.atomic_compare_exchange(
+                    state, observed, schedule_as(observed, schedule_completed)
+                )
+            ) {
+                return;
+            }
+            continue;
+        }
+        if (kind == schedule_completed) { return; }
+        if (schedule_is_publishing(kind)) { continue; }
+        assert(false);
+    }
+}
+
+@link_symbol("__jiang_runtime_scheduled_continuation_resume")
+() run_scheduled_continuation(Void* raw_continuation) {
+    if (raw_continuation == null) { return; }
+    UInt8* continuation = unsafe { raw_continuation$.as(UInt8*) };
+    request(
+        load_pointer(continuation, continuation_executor_word),
+        load_pointer(continuation, continuation_task_word),
+        load_pointer(continuation, continuation_context_word),
+        load_pointer(continuation, continuation_resume_word)
+    );
+}
+
+() request_task(UInt8* task, Void* executor, Void* context, Void* resume) {
+    while (true) {
+        Int*! state = task_word(task, schedule_state_word);
+        Int observed = thread.atomic_load(state);
+        Int kind = schedule_kind(observed);
+        if (kind == schedule_idle) {
+            Int publishing = schedule_next(observed, schedule_publishing_idle);
+            if (!thread.atomic_compare_exchange(state, observed, publishing)) { continue; }
+            publish_target(task, executor, context, resume);
+            schedule_published(task, publishing, false);
+            return;
+        }
+        if (kind == schedule_running) {
+            Int publishing = schedule_next(observed, schedule_publishing_pending);
+            if (!thread.atomic_compare_exchange(state, observed, publishing)) { continue; }
+            publish_target(task, executor, context, resume);
+            assert(thread.atomic_compare_exchange(
+                state, publishing, schedule_as(publishing, schedule_pending)
+            ));
+            return;
+        }
+        if (kind == schedule_pending || kind == schedule_queued) {
+            Bool matches = published_target_matches(task, executor, context, resume);
+            if (!published_target_is_stable(task, observed)) { continue; }
+            assert(matches);
+            return;
+        }
+        if (kind == schedule_completed) { return; }
+        // 先等待发布完成，再验证重复 wake 是否仍指向同一 continuation。
+        if (schedule_is_publishing(kind)) { continue; }
+        assert(false);
+    }
+}
+
+Int claim_handoff(UInt8* task) {
+    while (true) {
+        Int*! state = task_word(task, schedule_state_word);
+        Int observed = thread.atomic_load(state);
+        Int kind = schedule_kind(observed);
+        if (kind == schedule_running || kind == schedule_pending) {
+            Int publishing = schedule_next(observed, schedule_publishing_handoff);
+            if (thread.atomic_compare_exchange(
+                    state, observed, publishing
+                )
+            ) {
+                return publishing;
+            }
+            continue;
+        }
+        if (kind == schedule_completed) { return -1; }
+        if (schedule_is_publishing(kind)) { continue; }
+        assert(false);
+    }
+    return -1;
+}
+
+() schedule_published(UInt8* task, Int expected, Bool handoff) {
+    Void* executor = load_pointer(task, schedule_executor_word);
+    Void* context = load_pointer(task, schedule_context_word);
+    Void* resume = load_pointer(task, schedule_resume_word);
+    if (target_can_inline(task, executor, context, handoff)) {
+        assert(thread.atomic_compare_exchange(
+            task_word(task, schedule_state_word),
+            expected,
+            schedule_as(expected, schedule_running)
+        ));
+        store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
+        invoke_resume(resume, context);
+        return;
+    }
+    assert(thread.atomic_compare_exchange(
+        task_word(task, schedule_state_word),
+        expected,
+        schedule_as(expected, schedule_queued)
+    ));
+    enqueue_task(task, executor);
+}
+
+Bool target_can_inline(UInt8* task, Void* executor, Void* context, Bool handoff) {
+    if (executor == null) { return true; }
+    if (!handoff) {
+        return !domain_executor.is_concurrent(executor)
+            && domain_executor.can_inline(executor, context);
+    }
+    Void* current = load_pointer(task, schedule_active_executor_word);
+    if (current == executor && domain_executor.is_concurrent(executor)) { return true; }
+    return !domain_executor.is_concurrent(executor)
+        && domain_executor.can_inline(executor, context);
+}
+
+() schedule_raw(Void* executor, Void* context, Void* resume) {
     if (executor == null) {
         invoke_resume(resume, context);
         return;
     }
-    thread.Queue queue = domain_executor.queue(executor);
-    if (!domain_executor.is_concurrent(executor)) {
-        if (domain_executor.can_inline(executor, context)) {
-            invoke_resume(resume, context);
-            return;
-        }
-        assert(thread.enqueue(runtime_state.group, queue, context, resume));
+    if (!domain_executor.is_concurrent(executor)
+        && domain_executor.can_inline(executor, context)
+    ) {
+        invoke_resume(resume, context);
         return;
     }
-    UInt8* token = resume_token(token_slot, queue, context, resume, callback);
-    schedule_or_mark_pending(token);
+    assert(thread.enqueue(
+        runtime_state.group, domain_executor.queue(executor), context, resume
+    ));
+}
+
+() enqueue_task(UInt8* task, Void* executor) {
+    assert(executor != null);
+    RawFn<(), Void*> callback = run_scheduled_task;
+    assert(thread.enqueue(
+        runtime_state.group,
+        domain_executor.queue(executor),
+        unsafe { task$.as(Void*) },
+        unsafe { callback$.as(Void*) }
+    ));
+}
+
+() run_scheduled_task(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int*! state = task_word(task, schedule_state_word);
+    Int observed = thread.atomic_load(state);
+    if (schedule_kind(observed) != schedule_queued) { return; }
+    Void* executor = load_pointer(task, schedule_executor_word);
+    Void* context = load_pointer(task, schedule_context_word);
+    Void* resume = load_pointer(task, schedule_resume_word);
+    if (!thread.atomic_compare_exchange(
+            state, observed, schedule_as(observed, schedule_running)
+        )
+    ) {
+        return;
+    }
+    store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
+    invoke_resume(resume, context);
 }
 
 () invoke_resume(Void* resume, Void* context) {
@@ -96,184 +311,58 @@ public () enqueue_executor(
     function(context);
 }
 
-@link_symbol("__jiang_runtime_scheduled_continuation_resume")
-() run_scheduled_continuation(Void* raw_continuation) {
-    if (raw_continuation == null) { return; }
-    UInt8* continuation = unsafe { raw_continuation$.as(UInt8*) };
-    Void* executor = load_storage_pointer(continuation, continuation_executor_word);
-    Void* context = load_storage_pointer(continuation, continuation_context_word);
-    Void* resume = load_storage_pointer(continuation, continuation_resume_word);
-    RawFn<(), Void*> callback = run_scheduled_resume;
-    enqueue_executor(
-        executor,
-        context,
-        unsafe { context$.as(UInt8*) },
-        resume,
-        unsafe { callback$.as(Void*) }
-    );
+() publish_target(UInt8* task, Void* executor, Void* context, Void* resume) {
+    store_word(task, schedule_executor_word, unsafe { executor$.as(Int) });
+    store_word(task, schedule_context_word, unsafe { context$.as(Int) });
+    store_word(task, schedule_resume_word, unsafe { resume$.as(Int) });
 }
 
-@link_symbol("__jiang_runtime_resume_token_complete")
-public () complete_resume_token(UInt8* raw_token) {
-    if (raw_token == null) { return; }
-    unsafe { thread.atomic_compare_exchange(resume_token_word(raw_token, resume_completed_word), 0, 1); }
-}
-
-@link_symbol("__jiang_runtime_resume_token_destroy")
-public () destroy_resume_token(Void* raw_frame) {
-    if (raw_frame == null) { return; }
-    UInt8* frame = unsafe { raw_frame$.as(UInt8*) };
-    Int token_address = load_storage_word(frame, 0);
-    if (token_address == 0) { return; }
-    UInt8* token = unsafe { token_address$.as(UInt8*) };
-    destroy_or_defer_resume_token(token);
-}
-
-UInt8* resume_token(
-    UInt8* raw_slot,
-    thread.Queue queue,
+Bool published_target_matches(
+    UInt8* task,
+    Void* executor,
     Void* context,
-    Void* resume,
-    Void* callback
+    Void* resume
 ) {
-    Int*! slot = storage_word(raw_slot, 0);
-    Int existing_address = thread.atomic_load(slot);
-    if (existing_address != 0) { return unsafe { existing_address$.as(UInt8*) }; }
-    UInt8* candidate = allocate_resume_token(queue, context, resume, callback);
-    Int candidate_address = unsafe { candidate$.as(Int) };
-    // 首次执行和立即取消可能并发入队同一 frame；只发布一个 token，统一走同一状态机。
-    if (thread.atomic_compare_exchange(slot, 0, candidate_address)) { return candidate; }
-    thread.deallocate_storage(candidate);
-    return unsafe { thread.atomic_load(slot)$.as(UInt8*) };
+    return load_pointer(task, schedule_executor_word) == executor
+        && load_pointer(task, schedule_context_word) == context
+        && load_pointer(task, schedule_resume_word) == resume;
 }
 
-UInt8* allocate_resume_token(thread.Queue queue, Void* context, Void* resume, Void* callback) {
-    UInt8* storage = thread.allocate_storage(resume_token_words * Int$.size());
-    assert(storage != null);
-    store_storage_word(storage, resume_completed_word, 0);
-    store_storage_word(storage, resume_state_word, resume_idle);
-    store_storage_word(storage, resume_queue_word, unsafe { thread.queue_handle(queue)$.as(Int) });
-    store_storage_word(storage, resume_context_word, unsafe { context$.as(Int) });
-    store_storage_word(storage, resume_function_word, unsafe { resume$.as(Int) });
-    store_storage_word(storage, resume_callback_word, unsafe { callback$.as(Int) });
-    return storage;
+Bool published_target_is_stable(UInt8* task, Int observed) {
+    return thread.atomic_load(task_word(task, schedule_state_word)) == observed;
 }
 
-() schedule_or_mark_pending(UInt8* token) {
-    if (resume_token_completed(token)) { return; }
-    while (true) {
-        Int*! state = resume_token_word(token, resume_state_word);
-        if (thread.atomic_compare_exchange(state, resume_idle, resume_running)) {
-            if (resume_token_completed(token)) {
-                finish_completed_resume_token(token);
-                return;
-            }
-            enqueue_token(token);
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_running, resume_pending)) {
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_pending, resume_pending)) {
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroy_pending)) {
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_destroyed, resume_destroyed)) { return; }
-    }
+Int schedule_kind(Int state) {
+    return state & schedule_kind_mask;
 }
 
-() enqueue_token(UInt8* token) {
-    Int queue_handle = load_storage_word(token, resume_queue_word);
-    thread.Queue queue = thread.Queue(unsafe { queue_handle$.as(Void*) });
-    Int callback_address = load_storage_word(token, resume_callback_word);
-    Void* callback_pointer = unsafe { callback_address$.as(Void*) };
-    Void* context = unsafe { token$.as(Void*) };
-    assert(thread.enqueue(runtime_state.group, queue, context, callback_pointer));
+Int schedule_as(Int state, Int kind) {
+    return (state & -schedule_generation_step) | kind;
 }
 
-@link_symbol("__jiang_runtime_run_scheduled_resume")
-() run_scheduled_resume(Void* context) {
+Int schedule_next(Int state, Int kind) {
+    return schedule_as(state + schedule_generation_step, kind);
 }
 
-@link_symbol("__jiang_runtime_release_resume_token")
-() release_resume_token(UInt8* token) {
-    while (true) {
-        Int*! state = resume_token_word(token, resume_state_word);
-        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroyed)) {
-            thread.deallocate_storage(token);
-            return;
-        }
-        if (resume_token_completed(token)) {
-            finish_completed_resume_token(token);
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_pending, resume_running)) {
-            enqueue_token(token);
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_running, resume_idle)) {
-            return;
-        }
-    }
+Bool schedule_is_publishing(Int kind) {
+    return kind == schedule_publishing_idle
+        || kind == schedule_publishing_pending
+        || kind == schedule_publishing_handoff;
 }
 
-Bool resume_token_completed(UInt8* token) {
-    Int*! completed = resume_token_word(token, resume_completed_word);
-    return thread.atomic_compare_exchange(completed, 1, 1);
+Void* load_pointer(UInt8* storage, Int index) {
+    return unsafe { load_word(storage, index)$.as(Void*) };
 }
 
-() finish_completed_resume_token(UInt8* token) {
-    while (true) {
-        Int*! state = resume_token_word(token, resume_state_word);
-        if (thread.atomic_compare_exchange(state, resume_pending, resume_idle)) {
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_running, resume_idle)) {
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroyed)) {
-            thread.deallocate_storage(token);
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_destroyed, resume_destroyed)) { return; }
-    }
+Int load_word(UInt8* storage, Int index) {
+    return unsafe { task_word(storage, index)$.get() };
 }
 
-() destroy_or_defer_resume_token(UInt8* token) {
-    while (true) {
-        Int*! state = resume_token_word(token, resume_state_word);
-        if (thread.atomic_compare_exchange(state, resume_idle, resume_destroyed)) {
-            thread.deallocate_storage(token);
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_running, resume_destroy_pending)) { return; }
-        if (thread.atomic_compare_exchange(state, resume_pending, resume_destroy_pending)) { return; }
-        if (thread.atomic_compare_exchange(state, resume_destroy_pending, resume_destroy_pending)) {
-            return;
-        }
-        if (thread.atomic_compare_exchange(state, resume_destroyed, resume_destroyed)) { return; }
-    }
+() store_word(UInt8* storage, Int index, Int value) {
+    unsafe { task_word(storage, index)$.set(value); }
 }
 
-Int*! resume_token_word(UInt8* token, Int index) {
-    return storage_word(token, index);
-}
-
-Int load_storage_word(UInt8* storage, Int index) {
-    return unsafe { storage_word(storage, index)$.get() };
-}
-
-Void* load_storage_pointer(UInt8* storage, Int index) {
-    return unsafe { load_storage_word(storage, index)$.as(Void*) };
-}
-
-() store_storage_word(UInt8* storage, Int index, Int value) {
-    unsafe { storage_word(storage, index)$.set(value); }
-}
-
-Int*! storage_word(UInt8* storage, Int index) {
+Int*! task_word(UInt8* storage, Int index) {
     Int address = unsafe { storage$.as(Int) } + index * Int$.size();
     return unsafe { address$.as(Int*!) };
 }

@@ -11,7 +11,13 @@ const Int executor_kind_word = 0;
 const Int executor_queue_word = 1;
 const Int executor_active_context_word = 2;
 const Int executor_tracking_enabled_word = 3;
-const Int executor_word_count = 4;
+const Int executor_local_frame_pool_word = 4;
+const Int frame_pool_class_count = 8;
+const Int executor_shared_frame_pool_handle_word =
+    executor_local_frame_pool_word + frame_pool_class_count;
+const Int executor_word_count = executor_shared_frame_pool_handle_word + 1;
+const Int frame_header_size = 16;
+const Int frame_pool_min_size = 64;
 
 thread.Mutex executors_mutex! = thread.Mutex(null);
 UInt8* executor_binding_ids! = null;
@@ -92,6 +98,46 @@ public () leave(Void* executor, Void* previous_context) {
     );
 }
 
+// serial executor 的本地热路径使用无原子 freelist；跨 executor 和 concurrent executor
+// 通过 system.thread 提供的 ABA-safe 原子栈复用。超大或高对齐 frame 才回退到系统 allocator。
+@link_symbol("__jiang_runtime_coroutine_frame_alloc")
+public Void* allocate_coroutine_frame(Void* executor, Int size, Int alignment) {
+    Int class_index = frame_pool_class(size, alignment);
+    if (executor == null || class_index < 0) {
+        return allocate_uncached_frame(size, alignment);
+    }
+    Bool local = frame_pool_is_local(executor);
+    UInt8* block! = pop_frame_block(executor, class_index, local);
+    if (block == null) {
+        block = thread.allocate_storage(frame_pool_class_size(class_index));
+        assert(block != null);
+    }
+    Int marker! = class_index + frame_pool_class_count;
+    if (local) { marker = class_index; }
+    store_storage_word(block, 1, marker);
+    return frame_payload(block);
+}
+
+@link_symbol("__jiang_runtime_coroutine_frame_free")
+public () deallocate_coroutine_frame(Void* executor, Void* raw_frame) {
+    if (raw_frame == null) { return; }
+    UInt8* frame = unsafe { raw_frame$.as(UInt8*) };
+    UInt8* header = frame_header(frame);
+    Int marker = load_storage_word(header, 1);
+    Int class_index = marker % frame_pool_class_count;
+    if (marker >= 0 && marker < frame_pool_class_count && frame_pool_is_local(executor)) {
+        push_local_frame_block(executor, class_index, header);
+        return;
+    }
+    if (marker >= 0 && marker < frame_pool_class_count * 2 && executor != null) {
+        push_shared_frame_block(executor, class_index, header);
+        return;
+    }
+    UInt8* allocation! = unsafe { load_storage_word(header, 0)$.as(UInt8*) };
+    if (marker >= 0) { allocation = header; }
+    thread.deallocate_storage(allocation);
+}
+
 // Generated resume MIR calls these fixed ABI entries without a Jiang-level
 // function reference. Keep both definitions in the runtime reachability graph.
 () keep_resume_abi_reachable() {
@@ -127,6 +173,19 @@ Void* add_executor(Int binding_id, Int domain_kind) {
     );
     store_storage_word(storage, executor_active_context_word, 0);
     store_storage_word(storage, executor_tracking_enabled_word, 0);
+    Int word_index! = executor_local_frame_pool_word;
+    while (word_index < executor_shared_frame_pool_handle_word) {
+        store_storage_word(storage, word_index, 0);
+        word_index = word_index + 1;
+    }
+    thread.AtomicStackArray shared_stacks =
+        thread.create_atomic_stack_array(frame_pool_class_count);
+    assert(thread.atomic_stack_array_valid(shared_stacks));
+    store_storage_word(
+        storage,
+        executor_shared_frame_pool_handle_word,
+        unsafe { thread.atomic_stack_array_handle(shared_stacks)$.as(Int) }
+    );
     Int index = executor_count;
     store_storage_word(executor_binding_ids, index, binding_id);
     store_storage_word(executor_handles, index, unsafe { storage$.as(Int) });
@@ -159,6 +218,96 @@ Int load_executor_word(Void* executor, Int index) {
     return load_storage_word(storage, index);
 }
 
+Bool frame_pool_is_local(Void* executor) {
+    if (executor == null || is_concurrent(executor)) { return false; }
+    return is_current(executor);
+}
+
+Int frame_pool_class(Int size, Int alignment) {
+    if (alignment > 16) { return -1; }
+    Int required = size + frame_header_size;
+    Int class_size! = frame_pool_min_size;
+    Int class_index! = 0;
+    while (class_index < frame_pool_class_count) {
+        if (required <= class_size) { return class_index; }
+        class_size = class_size * 2;
+        class_index = class_index + 1;
+    }
+    return -1;
+}
+
+Int frame_pool_class_size(Int class_index) {
+    Int size! = frame_pool_min_size;
+    Int index! = 0;
+    while (index < class_index) {
+        size = size * 2;
+        index = index + 1;
+    }
+    return size;
+}
+
+UInt8* pop_frame_block(Void* executor, Int class_index, Bool local) {
+    if (!local) { return pop_shared_frame_block(executor, class_index); }
+    Int word = executor_local_frame_pool_word + class_index;
+    UInt8* block = unsafe { load_executor_word(executor, word)$.as(UInt8*) };
+    if (block != null) {
+        store_executor_word(executor, word, load_storage_word(block, 0));
+        return block;
+    }
+    return pop_shared_frame_block(executor, class_index);
+}
+
+() push_local_frame_block(Void* executor, Int class_index, UInt8* block) {
+    Int word = executor_local_frame_pool_word + class_index;
+    store_storage_word(block, 0, load_executor_word(executor, word));
+    store_executor_word(executor, word, unsafe { block$.as(Int) });
+}
+
+UInt8* pop_shared_frame_block(Void* executor, Int class_index) {
+    return thread.atomic_stack_pop(shared_frame_pool(executor), class_index);
+}
+
+() push_shared_frame_block(Void* executor, Int class_index, UInt8* block) {
+    thread.atomic_stack_push(shared_frame_pool(executor), class_index, block);
+}
+
+thread.AtomicStackArray shared_frame_pool(Void* executor) {
+    Int handle = load_executor_word(executor, executor_shared_frame_pool_handle_word);
+    return thread.atomic_stack_array_from_handle(unsafe { handle$.as(Void*) });
+}
+
+Void* allocate_uncached_frame(Int size, Int alignment) {
+    Int effective_alignment! = alignment;
+    if (effective_alignment < 16) { effective_alignment = 16; }
+    Int padding! = 0;
+    if (effective_alignment > 16) { padding = effective_alignment; }
+    UInt8* allocation = thread.allocate_storage(size + padding + frame_header_size);
+    assert(allocation != null);
+    Int base = unsafe { allocation$.as(Int) } + frame_header_size;
+    Int payload_address = align_frame_address(base, effective_alignment);
+    UInt8* payload = unsafe { payload_address$.as(UInt8*) };
+    UInt8* header = frame_header(payload);
+    store_storage_word(header, 0, unsafe { allocation$.as(Int) });
+    store_storage_word(header, 1, -1);
+    return unsafe { payload$.as(Void*) };
+}
+
+Int align_frame_address(Int address, Int alignment) {
+    Int remainder = address % alignment;
+    if (remainder == 0) { return address; }
+    return address + alignment - remainder;
+}
+
+Void* frame_payload(UInt8* block) {
+    Int address = unsafe { block$.as(Int) } + frame_header_size;
+    return unsafe { address$.as(Void*) };
+}
+
+UInt8* frame_header(UInt8* frame) {
+    Int address = unsafe { frame$.as(Int) } - frame_header_size;
+    return unsafe { address$.as(UInt8*) };
+}
+
 Void* active_context(Void* executor) {
     return unsafe { load_executor_word(executor, executor_active_context_word)$.as(Void*) };
 }
@@ -185,6 +334,7 @@ Int*! storage_word(UInt8* storage, Int index) {
     Int index! = 0;
     while (index < executor_count) {
         Void* executor = load_executor_handle(index);
+        free_executor_frame_pool(executor);
         thread.deallocate_storage(unsafe { executor$.as(UInt8*) });
         index = index + 1;
     }
@@ -194,6 +344,28 @@ Int*! storage_word(UInt8* storage, Int index) {
     executor_handles = null;
     executor_count = 0;
     executor_capacity = 0;
+}
+
+() free_executor_frame_pool(Void* executor) {
+    Int class_index! = 0;
+    while (class_index < frame_pool_class_count) {
+        UInt8* block! = unsafe {
+            load_executor_word(executor, executor_local_frame_pool_word + class_index)$.as(UInt8*)
+        };
+        while (block != null) {
+            UInt8* next = unsafe { load_storage_word(block, 0)$.as(UInt8*) };
+            thread.deallocate_storage(block);
+            block = next;
+        }
+        block = pop_shared_frame_block(executor, class_index);
+        while (block != null) {
+            UInt8* next = pop_shared_frame_block(executor, class_index);
+            thread.deallocate_storage(block);
+            block = next;
+        }
+        class_index = class_index + 1;
+    }
+    thread.destroy_atomic_stack_array(shared_frame_pool(executor));
 }
 
 () free_storage(UInt8* storage) {
