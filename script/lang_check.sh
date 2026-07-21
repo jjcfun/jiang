@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JIANGC="${JIANGC:-$ROOT_DIR/build/bin/jiangc}"
+LANG_CHECK_ROOT="${LANG_CHECK_ROOT:-test/lang}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -190,20 +191,20 @@ run_release_case() {
 
 while IFS= read -r source; do
   run_check_case "$source"
-done < <(find test/lang -path '*/check/*.jiang' -type f | sort)
+done < <(find "$LANG_CHECK_ROOT" -path '*/check/*.jiang' -type f | sort)
 
 while IFS= read -r source; do
   run_fail_case "$source"
-done < <(find test/lang -path '*/fail/*.jiang' -type f | sort)
+done < <(find "$LANG_CHECK_ROOT" -path '*/fail/*.jiang' -type f | sort)
 
 while IFS= read -r source; do
   run_emit_case "$source"
-done < <(find test/lang -path '*/emit/*.jiang' -type f | sort)
+done < <(find "$LANG_CHECK_ROOT" -path '*/emit/*.jiang' -type f | sort)
 
 if [ -x "$LLVM_CLANG" ]; then
   while IFS= read -r source; do
     run_run_case "$source"
-  done < <(find test/lang -path '*/run/*.jiang' -type f | sort)
+  done < <(find "$LANG_CHECK_ROOT" -path '*/run/*.jiang' -type f | sort)
 else
   echo "SKIP run cases: missing LLVM_CLANG=$LLVM_CLANG"
 fi
@@ -211,7 +212,7 @@ fi
 if [ "${LANG_CHECK_RELEASE_RUNS:-0}" = "1" ]; then
   while IFS= read -r source; do
     run_release_case "$source"
-  done < <(find test/lang -path '*/run/*.jiang' -type f | sort)
+  done < <(find "$LANG_CHECK_ROOT" -path '*/run/*.jiang' -type f | sort)
 fi
 
 exit "$status"

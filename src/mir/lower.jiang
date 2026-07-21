@@ -105,8 +105,8 @@ struct MirLowerer: Movable {
     table.HashTable<Int, qid.DefId> raw_fn_vtable_globals;
     table.HashTable<Int, qid.DefId> lambda_vtable_globals;
     table.HashTable<Int, qid.DefId> lambda_env_drop_shims;
-    table.HashTable<qid.DefId, qid.DefId> async_lambda_start_shims;
-    table.HashTable<qid.DefId, qid.DefId> async_lambda_completion_shims;
+    table.HashTable<mir.MirFunctionKey, qid.DefId> async_callable_start_shims;
+    table.HashTable<mir.MirFunctionKey, qid.DefId> async_callable_completion_shims;
     table.HashTable<Int, qid.DefId> cancel_handler_shims;
     table.HashTable<qid.DefId, qid.DefId> async_block_env_drop_shims;
     table.HashTable<Int, mir.MirTaskStateLayout> task_state_layouts;
@@ -133,8 +133,8 @@ struct MirLowerer: Movable {
         self.raw_fn_vtable_globals = table.HashTable<Int, qid.DefId>();
         self.lambda_vtable_globals = table.HashTable<Int, qid.DefId>();
         self.lambda_env_drop_shims = table.HashTable<Int, qid.DefId>();
-        self.async_lambda_start_shims = table.HashTable<qid.DefId, qid.DefId>();
-        self.async_lambda_completion_shims = table.HashTable<qid.DefId, qid.DefId>();
+        self.async_callable_start_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
+        self.async_callable_completion_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
         self.cancel_handler_shims = table.HashTable<Int, qid.DefId>();
         self.async_block_env_drop_shims = table.HashTable<qid.DefId, qid.DefId>();
         self.task_state_layouts = table.HashTable<Int, mir.MirTaskStateLayout>();
@@ -175,7 +175,7 @@ struct MirLowerer: Movable {
         guard function.coroutine_frame is .some(frame) else {
             return;
         }
-        self.add_async_lambda_abi_functions(function, frame$.ref());
+        self.add_async_callable_abi_functions(function, frame$.ref());
         mir.MirFunctionRef? env_drop = self.async_block_env_drop_function(function.def_id, function.span);
         if (function.is_external) {
             coroutine_frame_rewrite.add_completion_function(self.output, function, frame$.ref(), env_drop);
@@ -220,32 +220,34 @@ struct MirLowerer: Movable {
         );
     }
 
-    () add_async_lambda_abi_functions(
+    () add_async_callable_abi_functions(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout
     ) {
-        guard table.hash_table_get_value<qid.DefId, qid.DefId>(
-            self.async_lambda_start_shims$.ref(), source.def_id
+        mir.MirFunctionKey key = mir.MirFunctionKey(
+            source.def_id, source.type_args, source.const_args
+        );
+        guard table.hash_table_get_value<mir.MirFunctionKey, qid.DefId>(
+            self.async_callable_start_shims$.ref(), key
         ) is .some(start_def) else { return; }
-        guard table.hash_table_get_value<qid.DefId, qid.DefId>(
-            self.async_lambda_completion_shims$.ref(), source.def_id
+        guard table.hash_table_get_value<mir.MirFunctionKey, qid.DefId>(
+            self.async_callable_completion_shims$.ref(), key
         ) is .some(completion_def) else { return; }
-        self.add_async_lambda_start_function(source, layout, start_def, completion_def);
-        self.add_async_lambda_completion_function(source, layout, completion_def);
+        self.add_async_callable_start_function(source, layout, start_def, completion_def);
+        self.add_async_callable_completion_function(source, layout, completion_def);
     }
 
-    () add_async_lambda_start_function(
+    () add_async_callable_start_function(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout,
         qid.DefId start_def,
         qid.DefId completion_def
     ) {
-        guard self.typeck.def_type(source.def_id) is .some(type_id) else { return; }
-        guard self.ctx.store.types.get(type_id).data is .function_type(function_type) else { return; }
+        types.FunctionType function_type = self.async_callable_source_type(source);
         mir.MirFunctionId id = mir.MirFunctionId.from_index(self.output.functions.len());
-        mir.MirBody body = self.async_lambda_start_body(
+        mir.MirBody body = self.async_callable_start_body(
             source, layout, function_type, completion_def, id
         );
         self.output.add_generated_function(mir.MirFunction (
@@ -270,7 +272,33 @@ struct MirLowerer: Movable {
         self.output.mark_borrow_check_exempt(id);
     }
 
-    mir.MirBody async_lambda_start_body(
+    types.FunctionType async_callable_source_type(self, mir.MirFunction source) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>();
+        Int index! = 0;
+        while (index < source.body.locals.length) {
+            mir.MirLocalDecl local = source.body.locals[index];
+            if (local.kind == .param) {
+                params.add(local.type_id);
+            }
+            index = index + 1;
+        }
+        qid.TypeId result = source.body.locals[source.body.return_local.to_index()].type_id;
+        qid.TypeId type_id = self.ctx.store.types.function_type_with_effects(
+            params$.move(), result, source.span, source.effects
+        );
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else {
+            return types.FunctionType (
+                params: self.output.empty_type_args(),
+                result: self.ctx.store.types.unit_type(),
+                effects: types.EffectSet(),
+                kind: .raw
+            );
+        }
+        return function_type;
+    }
+
+    mir.MirBody async_callable_start_body(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout,
@@ -315,7 +343,7 @@ struct MirLowerer: Movable {
                 mir.alloc_box_rvalue(mir.MirAllocBoxRvalue (value_type: layout.frame_type_id)),
                 span
             ));
-            self.append_async_lambda_frame_initializers(
+            self.append_async_callable_frame_initializers(
                 source,
                 layout,
                 function_type,
@@ -328,7 +356,7 @@ struct MirLowerer: Movable {
                 statements$.ref()
             );
             list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(2);
-            blocks.add(self.async_lambda_start_call_block(
+            blocks.add(self.async_callable_start_call_block(
                 source, layout, erased_frame_local, statements$.ref(), span
             ));
             blocks.add(self.generated_return_block(1, span));
@@ -343,7 +371,7 @@ struct MirLowerer: Movable {
         }
     }
 
-    () append_async_lambda_frame_initializers(
+    () append_async_callable_frame_initializers(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout,
@@ -387,12 +415,24 @@ struct MirLowerer: Movable {
             statements.add(domain[index]);
             index = index + 1;
         }
+        statements.add(coroutine_task_abi.cancellation_enabled_initializer(
+            self.output, layout, frame, 2, span
+        ));
+        mir.MirExternalContinuationLayout continuation_layout =
+            self.external_async_continuation_layout(function_type.result, span);
+        mir.MirPlace continuation = self.generated_deref_place(
+            mir.local_place(continuation_local, self.output.empty_projection()), true
+        );
+        statements.add(self.generated_assign_operand(
+            self.generated_constant_index_place(frame, layout.cancellation_context_field_index),
+            mir.copy_operand_value(mir.MirCopyOperand (
+                place: self.generated_constant_index_place(
+                    continuation, continuation_layout.cancellation_context_field_index
+                )
+            )),
+            span
+        ));
         if (layout.effects.domain == null) {
-            mir.MirExternalContinuationLayout continuation_layout =
-                self.external_async_continuation_layout(function_type.result, span);
-            mir.MirPlace continuation = self.generated_deref_place(
-                mir.local_place(continuation_local, self.output.empty_projection()), true
-            );
             statements.add(self.generated_assign_operand(
                 self.generated_constant_index_place(frame, layout.current_executor_field_index),
                 mir.copy_operand_value(mir.MirCopyOperand (
@@ -403,7 +443,7 @@ struct MirLowerer: Movable {
                 span
             ));
         }
-        self.append_async_lambda_continuation_initializers(
+        self.append_async_callable_continuation_initializers(
             layout,
             function_type,
             frame,
@@ -416,7 +456,7 @@ struct MirLowerer: Movable {
         );
     }
 
-    () append_async_lambda_continuation_initializers(
+    () append_async_callable_continuation_initializers(
         self,
         mir.MirCoroutineFrameLayout& layout,
         types.FunctionType function_type,
@@ -441,9 +481,9 @@ struct MirLowerer: Movable {
             span
         ));
         statements.add(self.generated_cast_assign(
-            self.generated_constant_index_place(frame, layout.cancellation_context_field_index),
+            self.generated_constant_index_place(frame, layout.external_continuation_field_index),
             mir.local_place(continuation_local, self.output.empty_projection()),
-            layout.fields[layout.cancellation_context_field_index].type_id,
+            layout.fields[layout.external_continuation_field_index].type_id,
             span
         ));
         statements.add(self.generated_cast_assign(
@@ -478,7 +518,7 @@ struct MirLowerer: Movable {
         ));
     }
 
-    mir.MirBlock async_lambda_start_call_block(
+    mir.MirBlock async_callable_start_call_block(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout,
@@ -488,8 +528,8 @@ struct MirLowerer: Movable {
     ) {
         mir.MirFunctionRef resume = mir.MirFunctionRef (
             function_def: source.def_id,
-            type_args: self.output.empty_type_args(),
-            const_args: self.output.empty_const_args(),
+            type_args: source.type_args,
+            const_args: source.const_args,
             coroutine_resume: true,
             coroutine_completion: false,
             type_id: layout.task_abi.resume_function_type_id,
@@ -499,6 +539,14 @@ struct MirLowerer: Movable {
         args.add(mir.copy_operand_value(mir.MirCopyOperand (
             place: mir.local_place(erased_frame_local, self.output.empty_projection())
         )));
+        mir.MirCallCallee callee! = mir.direct_function_callee(resume);
+        if (layout.effects.domain is .some(domain)) {
+            callee = mir.domain_enqueue_callee(
+                domain.binding,
+                layout.domain_kind,
+                mir.function_operand_value(resume)
+            );
+        }
         return mir.MirBlock (
             id: mir.MirBlockId.from_index(0),
             span: span,
@@ -506,7 +554,7 @@ struct MirLowerer: Movable {
             terminator: mir.MirTerminator (
                 span: span,
                 kind: mir.call_terminator_kind(mir.MirCallTerminator (
-                    callee: mir.direct_function_callee(resume),
+                    callee: callee,
                     args: self.output.operand_array(args$.ref()),
                     current_effects: types.EffectSet(),
                     is_suspend_point: false,
@@ -520,7 +568,7 @@ struct MirLowerer: Movable {
         );
     }
 
-    () add_async_lambda_completion_function(
+    () add_async_callable_completion_function(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout,
@@ -544,12 +592,12 @@ struct MirLowerer: Movable {
             inline_always: true,
             naked: false,
             span: source.span,
-            body: self.async_lambda_completion_body(source, layout, id)
+            body: self.async_callable_completion_body(source, layout, id)
         ));
         self.output.mark_borrow_check_exempt(id);
     }
 
-    mir.MirBody async_lambda_completion_body(
+    mir.MirBody async_callable_completion_body(
         self,
         mir.MirFunction source,
         mir.MirCoroutineFrameLayout& layout,
@@ -591,7 +639,7 @@ struct MirLowerer: Movable {
             ));
             statements.add(self.generated_cast_assign(
                 mir.local_place(continuation_local, self.output.empty_projection()),
-                self.generated_constant_index_place(frame, layout.cancellation_context_field_index),
+                self.generated_constant_index_place(frame, layout.external_continuation_field_index),
                 continuation_layout.pointer_type_id,
                 span
             ));
@@ -603,7 +651,7 @@ struct MirLowerer: Movable {
                 span
             ));
             list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(2);
-            blocks.add(self.async_lambda_completion_call_block(
+            blocks.add(self.async_callable_completion_call_block(
                 continuation_layout, continuation_local, statements$.ref(), span
             ));
             blocks.add(self.generated_return_block(1, span));
@@ -618,7 +666,7 @@ struct MirLowerer: Movable {
         }
     }
 
-    mir.MirBlock async_lambda_completion_call_block(
+    mir.MirBlock async_callable_completion_call_block(
         self,
         mir.MirExternalContinuationLayout layout,
         mir.MirLocalId continuation_local,
@@ -1478,10 +1526,11 @@ struct MirLowerer: Movable {
     ) {
         qid.TypeId context_type = self.coroutine_context_pointer_type(span);
         qid.TypeId resume_type = self.coroutine_continuation_type(context_type, span);
-        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(6);
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(7);
         fields.add(self.ctx.store.types.raw_pointer_type(result_type, span));
         fields.add(context_type);
         fields.add(resume_type);
+        fields.add(context_type);
         fields.add(context_type);
         fields.add(context_type);
         fields.add(resume_type);
@@ -1494,7 +1543,8 @@ struct MirLowerer: Movable {
             resume_field_index: 2,
             executor_field_index: 3,
             target_context_field_index: 4,
-            target_resume_field_index: 5
+            target_resume_field_index: 5,
+            cancellation_context_field_index: 6
         );
     }
 
@@ -1507,7 +1557,7 @@ struct MirLowerer: Movable {
         qid.TypeId raw_pointer = self.coroutine_context_pointer_type(span);
         qid.TypeId resume_function = self.coroutine_continuation_type(raw_pointer, span);
         qid.TypeId int_type = self.ctx.store.types.int_type();
-        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(11);
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(15);
         fields.add(self.ctx.store.types.raw_pointer_type(result_type, span));
         fields.add(context_type);
         fields.add(resume_function);
@@ -1517,6 +1567,10 @@ struct MirLowerer: Movable {
         fields.add(self.ctx.store.types.raw_pointer_type(int_type, span));
         fields.add(self.ctx.store.types.raw_pointer_type(raw_pointer, span));
         fields.add(self.ctx.store.types.raw_pointer_type(resume_function, span));
+        fields.add(raw_pointer);
+        fields.add(resume_function);
+        fields.add(int_type);
+        fields.add(int_type);
         fields.add(raw_pointer);
         fields.add(resume_function);
         qid.TypeId type_id = self.ctx.store.types.tuple_type(fields$.move(), span);
@@ -1533,7 +1587,11 @@ struct MirLowerer: Movable {
             cancel_context_pointer_field_index: 7,
             cancel_function_pointer_field_index: 8,
             handler_context_field_index: 9,
-            handler_drop_field_index: 10
+            handler_drop_field_index: 10,
+            fallback_cancel_request_field_index: 11,
+            fallback_cancel_word_field_index: 12,
+            fallback_cancel_context_field_index: 13,
+            fallback_cancel_function_field_index: 14
         );
     }
 
@@ -1944,17 +2002,15 @@ struct MirLowerer: Movable {
         guard self.typeck.def_type(hir_def.def_id) is .some(type_id) else { return false; }
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         guard info.data is .function_type(function_type) else { return false; }
-        Int explicit_capture_count! = 0;
-        if (self.typeck.lambda_capture_infos(hir_def.def_id) is .some(captures)) {
-            Int index! = 0;
-            while (index < captures.length) {
-                if (captures[index].kind == .explicit_capture) {
-                    explicit_capture_count = explicit_capture_count + 1;
-                }
-                index = index + 1;
+        Int parameter_count! = 0;
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            if (body.locals.get_index(index).kind == .parameter) {
+                parameter_count = parameter_count + 1;
             }
+            index = index + 1;
         }
-        return function_type.params.length == body.locals.len() - explicit_capture_count + 1;
+        return function_type.params.length == parameter_count + 1;
     }
 
     mir.MirLocalDecl synthetic_closure_env_local(self, hir.HirDef& hir_def) {
@@ -6262,6 +6318,19 @@ struct BodyLowerer: Movable {
             mir.use_rvalue(mir.MirUseRvalue (value: resume)),
             span
         );
+        mir.MirPlace cancellation_context = self.project_constant_index(
+            continuation_place, layout.cancellation_context_field_index
+        );
+        mir.MirRvalue cancellation_value! = mir.use_rvalue(mir.MirUseRvalue (
+            value: self.null_operand(self.mir_place_type(cancellation_context), span)
+        ));
+        if (self.current_effects.has_async) {
+            cancellation_value = mir.current_task_rvalue(mir.MirCurrentTaskRvalue (
+                observed: false,
+                cancellation_context: true
+            ));
+        }
+        self.push_assign(cancellation_context, cancellation_value, span);
     }
 
     () lower_external_async_start_call(
@@ -9653,7 +9722,12 @@ struct BodyLowerer: Movable {
         qid.TypeId code_type = self.closure_code_type(closure_type);
         qid.DefId code_def! = lambda.function_def;
         if (self.function_type_is_async(closure_type)) {
-            code_def = self.ensure_async_lambda_start_shim(lambda.function_def, span);
+            code_def = self.ensure_async_callable_start_shim(
+                lambda.function_def,
+                self.lowerer.output.empty_type_args(),
+                self.lowerer.output.empty_const_args(),
+                span
+            );
         }
         fields.add(mir.MirStaticField (
             type_id: code_type,
@@ -9674,35 +9748,44 @@ struct BodyLowerer: Movable {
         return mir.aggregate_static_value(self.lowerer.output.static_field_array(fields$.ref()));
     }
 
-    qid.DefId ensure_async_lambda_start_shim(self, qid.DefId lambda_def, token.Span span) {
-        if (table.hash_table_get_value<qid.DefId, qid.DefId>(
-            self.lowerer.async_lambda_start_shims$.ref(), lambda_def
+    qid.DefId ensure_async_callable_start_shim(
+        self,
+        qid.DefId source_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        token.Span span
+    ) {
+        mir.MirFunctionKey key = mir.MirFunctionKey(source_def, type_args, const_args);
+        if (table.hash_table_get_value<mir.MirFunctionKey, qid.DefId>(
+            self.lowerer.async_callable_start_shims$.ref(), key
         ) is .some(existing)) {
             return existing;
         }
-        qid.DefId start_def = self.create_async_lambda_abi_def(lambda_def, "__async_fn_start_", span);
-        qid.DefId completion_def = self.create_async_lambda_abi_def(lambda_def, "__async_fn_complete_", span);
-        self.lowerer.async_lambda_start_shims.set(lambda_def, start_def);
-        self.lowerer.async_lambda_completion_shims.set(lambda_def, completion_def);
+        qid.DefId start_def = self.create_async_callable_abi_def(source_def, "__async_fn_start_", span);
+        qid.DefId completion_def = self.create_async_callable_abi_def(
+            source_def, "__async_fn_complete_", span
+        );
+        self.lowerer.async_callable_start_shims.set(key, start_def);
+        self.lowerer.async_callable_completion_shims.set(key, completion_def);
         return start_def;
     }
 
-    qid.DefId create_async_lambda_abi_def(
+    qid.DefId create_async_callable_abi_def(
         self,
-        qid.DefId lambda_def,
+        qid.DefId source_def,
         UInt8[]& prefix,
         token.Span span
     ) {
-        def.DefRecord lambda_record = self.lowerer.ctx.store.defs.get(lambda_def);
-        std.String name = build_text_int(prefix, lambda_def.to_index());
+        def.DefRecord source_record = self.lowerer.ctx.store.defs.get(source_def);
+        std.String name = build_text_int(prefix, source_def.to_index());
         return self.lowerer.ctx.store.defs.create(
             .function_def,
             .value_name,
             .private_visibility,
             def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
-            lambda_record.owner_def,
-            lambda_record.module_id,
-            lambda_record.decl_namespace_id,
+            source_record.owner_def,
+            source_record.module_id,
+            source_record.decl_namespace_id,
             null
         );
     }
@@ -10135,7 +10218,12 @@ struct BodyLowerer: Movable {
     }
 
     Bool function_type_is_async(self, qid.TypeId type_id) {
-        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        types.TypeInfo info! = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .owner_pointer || handle.kind == .reference) {
+                info = self.lowerer.ctx.store.types.get(handle.element);
+            }
+        }
         guard info.data is .function_type(function_type) else { return false; }
         return function_type.effects.has_async;
     }
@@ -10257,9 +10345,27 @@ struct BodyLowerer: Movable {
         self.lowerer.ensure_external_function(def_id);
         qid.TypeId[]& type_args = self.function_ref_type_args(node_id, def_id);
         comptime_value.ComptimeValue[]& const_args = self.function_ref_const_args(node_id, def_id);
+        qid.TypeId value_type = self.type_for_node(node_id);
+        if (self.function_type_is_async(value_type) && self.internal_async_function_value(def_id)) {
+            qid.DefId start_def = self.ensure_async_callable_start_shim(
+                def_id, type_args, const_args, self.lowerer.hir_span(node_id)
+            );
+            return mir.function_operand_value(self.function_ref(
+                node_id,
+                start_def,
+                value_type,
+                self.lowerer.output.empty_type_args(),
+                self.lowerer.output.empty_const_args()
+            ));
+        }
         return mir.function_operand_value(
-            self.function_ref(node_id, def_id, self.type_for_node(node_id), type_args, const_args)
+            self.function_ref(node_id, def_id, value_type, type_args, const_args)
         );
+    }
+
+    Bool internal_async_function_value(self, qid.DefId function_def) {
+        guard self.lowerer.hirs.def(function_def) is .some(hir_def) else { return false; }
+        return self.lowerer.hirs.has_body(hir_def.def_id);
     }
 
     mir.MirOperand? const_global_operand(self, hir.HirId node_id, qid.DefId def_id) {
@@ -11474,6 +11580,10 @@ struct BodyLowerer: Movable {
             self.lower_closure_call(node_id, call, destination);
             return;
         }
+        if (self.function_type_is_async(self.type_for_node(call.callee))) {
+            self.lower_async_raw_fn_call(node_id, call, destination);
+            return;
+        }
         list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(call.args.length);
         mir.MirCallCallee callee = mir.indirect_operand_callee(self.lower_to_operand(call.callee));
         Int index! = 0;
@@ -11494,6 +11604,47 @@ struct BodyLowerer: Movable {
             cleanup: null
         )), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    () lower_async_raw_fn_call(self, hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        qid.TypeId source_type = self.type_for_node(call.callee);
+        qid.TypeId abi_type = self.lowerer.external_async_abi_function_type(source_type, span);
+        mir.MirLocalId abi_callee = self.add_temp(abi_type, span);
+        self.push_assign(
+            self.place_for_local(abi_callee),
+            mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.ptr_to_ptr,
+                value: self.lower_to_operand(call.callee),
+                target_type: abi_type
+            )),
+            span
+        );
+        mir.MirExternalContinuationLayout layout = self.lowerer.external_async_continuation_layout(
+            self.mir_place_type(destination), span
+        );
+        mir.MirLocalId continuation = self.add_temp(layout.type_id, span);
+        mir.MirPlace continuation_place = self.place_for_local(continuation);
+        self.initialize_current_async_continuation(layout, continuation_place, destination, span);
+        mir.MirLocalId continuation_pointer = self.add_temp(layout.pointer_type_id, span);
+        self.push_assign(
+            self.place_for_local(continuation_pointer),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(call.args.length + 1);
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_to_operand(call.args[index].value));
+            index = index + 1;
+        }
+        args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        self.finish_async_indirect_start(
+            self.operand_for_place(self.place_for_local(abi_callee)), args$.ref(), span
+        );
     }
 
     () lower_closure_call(self, hir.HirId node_id, hir.HirCall call, mir.MirPlace destination) {
@@ -11531,6 +11682,34 @@ struct BodyLowerer: Movable {
         );
         mir.MirLocalId continuation = self.add_temp(layout.type_id, span);
         mir.MirPlace continuation_place = self.place_for_local(continuation);
+        self.initialize_current_async_continuation(layout, continuation_place, destination, span);
+        mir.MirLocalId continuation_pointer = self.add_temp(layout.pointer_type_id, span);
+        self.push_assign(
+            self.place_for_local(continuation_pointer),
+            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(call.args.length + 2);
+        args.add(self.closure_env_operand(call.callee));
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_to_operand(call.args[index].value));
+            index = index + 1;
+        }
+        args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        self.finish_async_indirect_start(self.closure_call_operand(call.callee), args$.ref(), span);
+    }
+
+    () initialize_current_async_continuation(
+        self,
+        mir.MirExternalContinuationLayout layout,
+        mir.MirPlace continuation_place,
+        mir.MirPlace destination,
+        token.Span span
+    ) {
         mir.MirRvalue context = mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
             place: self.place_for_local(self.return_local()),
             frame_root: true
@@ -11554,28 +11733,19 @@ struct BodyLowerer: Movable {
             resume,
             span
         );
-        mir.MirLocalId continuation_pointer = self.add_temp(layout.pointer_type_id, span);
-        self.push_assign(
-            self.place_for_local(continuation_pointer),
-            mir.coroutine_address_rvalue(mir.MirCoroutineAddressRvalue (
-                place: continuation_place,
-                frame_root: false
-            )),
-            span
-        );
-        list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(call.args.length + 2);
-        args.add(self.closure_env_operand(call.callee));
-        Int index! = 0;
-        while (index < call.args.length) {
-            args.add(self.lower_to_operand(call.args[index].value));
-            index = index + 1;
-        }
-        args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+    }
+
+    () finish_async_indirect_start(
+        self,
+        mir.MirOperand callee,
+        list.ArrayList<mir.MirOperand>& args,
+        token.Span span
+    ) {
         mir.MirLocalId unit_result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
         mir.MirBlockId next_block = self.reserve_block(span);
         self.compare_exchange_passive_cancel_target(0, 3, span);
         self.finish_block(mir.call_terminator_kind(mir.MirCallTerminator (
-            callee: mir.indirect_operand_callee(self.closure_call_operand(call.callee)),
+            callee: mir.indirect_operand_callee(callee),
             args: self.lowerer.output.operand_slice(args.slice()),
             current_effects: self.current_effects,
             is_suspend_point: true,
@@ -12159,6 +12329,10 @@ struct BodyLowerer: Movable {
     () add_raw_fn_to_fn_shim_function(self, qid.DefId shim_def, qid.TypeId raw_type, token.Span span) {
         types.TypeInfo info = self.lowerer.ctx.store.types.get(raw_type);
         guard info.data is .function_type(function_type) else { return; }
+        if (function_type.effects.has_async) {
+            self.add_async_raw_fn_to_fn_shim_function(shim_def, raw_type, function_type, span);
+            return;
+        }
         Int function_index = self.lowerer.output.functions.len();
         mir.MirLocalId raw_local = mir.MirLocalId.from_index(function_type.params.length + 2);
         list.ArrayList<mir.MirLocalDecl> locals! = list.ArrayList<mir.MirLocalDecl>(function_type.params.length + 3);
@@ -12215,6 +12389,125 @@ struct BodyLowerer: Movable {
             span: span,
             body: body
         ));
+    }
+
+    () add_async_raw_fn_to_fn_shim_function(
+        self,
+        qid.DefId shim_def,
+        qid.TypeId raw_type,
+        types.FunctionType function_type,
+        token.Span span
+    ) {
+        Int function_index = self.lowerer.output.functions.len();
+        Int param_count = function_type.params.length;
+        mir.MirLocalId continuation_local = mir.MirLocalId.from_index(param_count + 2);
+        mir.MirLocalId raw_local = mir.MirLocalId.from_index(param_count + 3);
+        qid.TypeId abi_type = self.lowerer.external_async_abi_function_type(raw_type, span);
+        list.ArrayList<mir.MirLocalDecl> locals! = list.ArrayList<mir.MirLocalDecl>(param_count + 4);
+        locals.add(self.raw_fn_to_fn_local(
+            0, .return_place, self.lowerer.ctx.store.types.unit_type(), span, null
+        ));
+        locals.add(self.raw_fn_to_fn_local(
+            1,
+            .param,
+            self.closure_env_type(span),
+            span,
+            self.lowerer.ctx.store.symbols.intern("__env")
+        ));
+        Int param_index! = 0;
+        while (param_index < param_count) {
+            locals.add(self.raw_fn_to_fn_local(
+                param_index + 2, .param, function_type.params[param_index], span, null
+            ));
+            param_index = param_index + 1;
+        }
+        mir.MirExternalContinuationLayout continuation_layout =
+            self.lowerer.external_async_continuation_layout(function_type.result, span);
+        locals.add(self.raw_fn_to_fn_local(
+            continuation_local.to_index(), .param, continuation_layout.pointer_type_id, span, null
+        ));
+        locals.add(self.raw_fn_to_fn_local(
+            raw_local.to_index(), .compiler_temp, abi_type, span, null
+        ));
+        list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
+        statements.add(self.raw_fn_to_fn_cast_statement(raw_local, abi_type, span));
+        list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(2);
+        blocks.add(self.async_raw_fn_to_fn_call_block(
+            raw_local, continuation_local, function_type, statements$.ref(), span
+        ));
+        blocks.add(self.raw_fn_to_fn_return_block(self.lowerer.ctx.store.types.unit_type(), span));
+        mir.MirFunctionId function_id = mir.MirFunctionId.from_index(function_index);
+        self.lowerer.output.add_generated_function(mir.MirFunction (
+            id: function_id,
+            def_id: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: span,
+            body: mir.MirBody (
+                id: mir.MirBodyId.from_index(function_index),
+                span: span,
+                locals: self.raw_fn_to_fn_locals(locals$.ref()),
+                blocks: self.lowerer.output.block_array(blocks$.ref()),
+                entry: mir.MirBlockId.from_index(0),
+                return_local: mir.MirLocalId.from_index(0)
+            )
+        ));
+        self.lowerer.output.mark_borrow_check_exempt(function_id);
+    }
+
+    mir.MirBlock async_raw_fn_to_fn_call_block(
+        self,
+        mir.MirLocalId raw_local,
+        mir.MirLocalId continuation_local,
+        types.FunctionType function_type,
+        list.ArrayList<mir.MirStatement>& statements,
+        token.Span span
+    ) {
+        list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(
+            function_type.params.length + 1
+        );
+        Int index! = 0;
+        while (index < function_type.params.length) {
+            args.add(mir.copy_operand_value(mir.MirCopyOperand (
+                place: self.place_for_local(mir.MirLocalId.from_index(index + 2))
+            )));
+            index = index + 1;
+        }
+        args.add(mir.copy_operand_value(mir.MirCopyOperand (
+            place: self.place_for_local(continuation_local)
+        )));
+        return mir.MirBlock (
+            id: mir.MirBlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements),
+            terminator: mir.MirTerminator (
+                span: span,
+                kind: mir.call_terminator_kind(mir.MirCallTerminator (
+                    callee: mir.indirect_operand_callee(mir.copy_operand_value(mir.MirCopyOperand (
+                        place: self.place_for_local(raw_local)
+                    ))),
+                    args: self.lowerer.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: self.place_for_local(mir.MirLocalId.from_index(0)),
+                    target: mir.MirBlockId.from_index(1),
+                    initialized_place: null,
+                    exclusive_places: self.lowerer.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
     }
 
     mir.MirLocalDecl raw_fn_to_fn_local(
@@ -12945,11 +13238,9 @@ struct BodyLowerer: Movable {
         mir.MirSuspendContinuationLayout layout,
         token.Span span
     ) {
-        mir.MirTaskStateLayout state = self.current_task_state_layout();
-        mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
-        mir.MirPlace task = self.project_deref(pointer, true);
-        mir.MirPlace request = coroutine_task_abi.task_state_field_place(
-            self.lowerer.output, task, state.cancellation_requested
+        mir.MirPlace request = self.project_deref(
+            self.project_constant_index(record, layout.cancel_request_pointer_field_index),
+            true
         );
         mir.MirLocalId requested = self.add_temp(self.mir_place_type(request), span);
         self.push_assign(
@@ -13064,6 +13355,11 @@ struct BodyLowerer: Movable {
     ) {
         mir.MirTaskStateLayout state = self.current_task_state_layout();
         mir.MirPlace pointer = self.current_task_cancellation_state_pointer(state, span);
+        mir.MirBlockId inherited = self.reserve_block(span);
+        mir.MirBlockId fallback = self.reserve_block(span);
+        mir.MirBlockId complete = self.reserve_block(span);
+        self.branch_on_non_null_pointer(pointer, inherited, fallback, span);
+        self.start_block(inherited);
         mir.MirPlace task = self.project_deref(pointer, true);
         mir.MirPlace word = coroutine_task_abi.task_state_field_place(
             self.lowerer.output, task, state.cancel_target_word
@@ -13083,6 +13379,54 @@ struct BodyLowerer: Movable {
         self.store_suspend_field_address(record, layout.cancel_function_pointer_field_index, function, span);
         self.initialize_suspend_cancel_owner(task, state, span);
         self.push_atomic_store(word, mir.const_operand_value(self.int_const(3, span)), span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(fallback);
+        mir.MirPlace fallback_request = self.project_constant_index(
+            record, layout.fallback_cancel_request_field_index
+        );
+        mir.MirPlace fallback_word = self.project_constant_index(
+            record, layout.fallback_cancel_word_field_index
+        );
+        mir.MirPlace fallback_context = self.project_constant_index(
+            record, layout.fallback_cancel_context_field_index
+        );
+        mir.MirPlace fallback_function = self.project_constant_index(
+            record, layout.fallback_cancel_function_field_index
+        );
+        self.push_atomic_store(
+            fallback_request, mir.const_operand_value(self.int_const(0, span)), span
+        );
+        self.push_atomic_store(
+            fallback_word, mir.const_operand_value(self.int_const(3, span)), span
+        );
+        self.push_assign(
+            fallback_context,
+            mir.use_rvalue(mir.MirUseRvalue (
+                value: self.null_operand(self.mir_place_type(fallback_context), span)
+            )),
+            span
+        );
+        self.push_assign(
+            fallback_function,
+            mir.use_rvalue(mir.MirUseRvalue (
+                value: self.null_operand(self.mir_place_type(fallback_function), span)
+            )),
+            span
+        );
+        self.store_suspend_field_address(
+            record, layout.cancel_request_pointer_field_index, fallback_request, span
+        );
+        self.store_suspend_field_address(
+            record, layout.cancel_word_pointer_field_index, fallback_word, span
+        );
+        self.store_suspend_field_address(
+            record, layout.cancel_context_pointer_field_index, fallback_context, span
+        );
+        self.store_suspend_field_address(
+            record, layout.cancel_function_pointer_field_index, fallback_function, span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
     }
 
     () store_suspend_field_address(
