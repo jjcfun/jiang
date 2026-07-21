@@ -35,6 +35,29 @@ const Int suspend_parked = 1;
 const Int suspend_resuming = 2;
 const Int suspend_resumed = 3;
 
+enum AtomicBuiltinKind {
+    load,
+    store,
+    compare_exchange,
+}
+
+struct AtomicBuiltin {
+    AtomicBuiltinKind kind;
+    mir.MirAtomicOrdering success;
+    mir.MirAtomicOrdering failure;
+
+    init(
+        self,
+        AtomicBuiltinKind kind,
+        mir.MirAtomicOrdering success,
+        mir.MirAtomicOrdering failure
+    ) {
+        self.kind = kind;
+        self.success = success;
+        self.failure = failure;
+    }
+}
+
 public mir.MirStore^ lower_package(
     context.CompilerContext& ctx,
     monomorph.MonomorphStore& instances,
@@ -13420,6 +13443,10 @@ struct BodyLowerer: Movable {
             self.lower_continuation_on_cancel(node_id, call, destination);
             return;
         }
+        if (self.atomic_builtin(call, target_def) is .some(builtin)) {
+            self.lower_atomic_builtin_call(node_id, call, builtin, destination);
+            return;
+        }
         qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.callee, target_def);
         comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.callee, target_def);
         qid.TypeId function_type = self.function_type_for_ref(target_def, type_args, const_args);
@@ -13460,6 +13487,64 @@ struct BodyLowerer: Movable {
             cleanup: null
         )), self.lowerer.hir_span(node_id));
         self.start_block(next_block);
+    }
+
+    () lower_atomic_builtin_call(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call,
+        AtomicBuiltin builtin,
+        mir.MirPlace destination
+    ) {
+        token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirPlace storage = self.atomic_builtin_storage(call.args[0].value, span);
+        if (builtin.kind == .load) {
+            self.push_assign(
+                destination,
+                mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
+                    place: storage,
+                    ordering: builtin.success
+                )),
+                span
+            );
+            return;
+        }
+        mir.MirOperand value = self.lower_to_operand(call.args[1].value);
+        if (builtin.kind == .store) {
+            self.statements.add(mir.MirStatement (
+                span: span,
+                kind: mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
+                    destination: storage,
+                    value: value,
+                    ordering: builtin.success
+                ))
+            ));
+            self.push_assign(destination, self.unit_rvalue(span), span);
+            return;
+        }
+        self.push_assign(
+            destination,
+            mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+                place: storage,
+                expected: value,
+                desired: self.lower_to_operand(call.args[2].value),
+                success_ordering: builtin.success,
+                failure_ordering: builtin.failure
+            )),
+            span
+        );
+    }
+
+    mir.MirPlace atomic_builtin_storage(self, hir.HirId value_id, token.Span span) {
+        qid.TypeId reference_type = self.type_for_node(value_id);
+        mir.MirLocalId reference = self.add_temp(reference_type, span);
+        mir.MirPlace reference_place = self.place_for_local(reference);
+        self.push_assign(
+            reference_place,
+            mir.use_rvalue(mir.MirUseRvalue (value: self.lower_to_operand(value_id))),
+            span
+        );
+        return self.project_deref(reference_place, true);
     }
 
     Bool is_coroutine_suspend_def(self, qid.DefId target_def) {
@@ -15643,6 +15728,43 @@ struct BodyLowerer: Movable {
     Bool is_builtin_call(self, qid.DefId def_id, UInt8[]& name) {
         def.DefRecord def_record = self.lowerer.ctx.store.defs.get(def_id);
         return string.equal(self.lowerer.ctx.store.symbols.text(def_record.name.symbol), name);
+    }
+
+    AtomicBuiltin? atomic_builtin(self, hir.HirCall call, qid.DefId def_id) {
+        guard self.lowerer.hirs.def(def_id) is .some(hir_def) else { return null; }
+        if (hir_def.decl.extern_kind != .builtin) { return null; }
+        UInt8[]& name = self.lowerer.ctx.store.symbols.text(
+            self.lowerer.ctx.store.defs.get(def_id).name.symbol
+        );
+        if (string.equal(name, "atomic_load") && call.args.length == 2) {
+            guard self.atomic_ordering(call.args[1].value) is .some(ordering) else { return null; }
+            return AtomicBuiltin(.load, ordering, .relaxed);
+        }
+        if (string.equal(name, "atomic_store") && call.args.length == 3) {
+            guard self.atomic_ordering(call.args[2].value) is .some(ordering) else { return null; }
+            return AtomicBuiltin(.store, ordering, .relaxed);
+        }
+        if (string.equal(name, "atomic_compare_exchange") && call.args.length == 5) {
+            guard self.atomic_ordering(call.args[3].value) is .some(success) else { return null; }
+            guard self.atomic_ordering(call.args[4].value) is .some(failure) else { return null; }
+            return AtomicBuiltin(.compare_exchange, success, failure);
+        }
+        return null;
+    }
+
+    mir.MirAtomicOrdering? atomic_ordering(self, hir.HirId value_id) {
+        guard self.enum_case_def_for_value(value_id) is .some(case_def) else { return null; }
+        UInt8[]& name = self.lowerer.ctx.store.symbols.text(
+            self.lowerer.ctx.store.defs.get(case_def).name.symbol
+        );
+        if (string.equal(name, "relaxed")) { return mir.MirAtomicOrdering.relaxed; }
+        if (string.equal(name, "acquire")) { return mir.MirAtomicOrdering.acquire; }
+        if (string.equal(name, "release")) { return mir.MirAtomicOrdering.release; }
+        if (string.equal(name, "acquire_release")) { return mir.MirAtomicOrdering.acquire_release; }
+        if (string.equal(name, "sequential")) {
+            return mir.MirAtomicOrdering.sequentially_consistent;
+        }
+        return null;
     }
 
     qid.DefId? call_callee_def(self, hir.HirId callee) {
