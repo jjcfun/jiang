@@ -1,16 +1,14 @@
-// implicit copy 的统一判定入口。
+// Copyable/Movable 的统一判定入口。
 //
-// type check 用它决定赋值/传参/返回是否需要 `$.move()`；borrow check 用同一
-// 套规则决定 MIR copy operand 会不会消耗 move path。这里只读 HIR、DefStore、
-// TypeStore，不反向依赖 type_check 过程本身。
+// Movable 是默认 auto trait，nominal 可以通过 `!Movable` 退出；Copyable
+// 必须由用户定义类型显式声明。bootstrap 还接受 0.4.7 的旧 copy/move
+// 约定，供旧编译器源码迁移；Copyable 合约检查始终使用严格的新规则。
 
 import hir = "../hir/hir.jiang";
 import store_api = "../store/api.jiang";
 import qid = "../store/id.jiang";
 import def = "../resolve/def.jiang";
 import list = "../support/list.jiang";
-import typeck_store = "./type_check/store.jiang";
-import table = "../support/table.jiang";
 import types = "./type.jiang";
 
 public struct CopyQuery {
@@ -27,20 +25,11 @@ public struct CopyQuery {
 
     Bool is_implicit_copy_type_inner(self, qid.TypeId type_id, list.ArrayList<qid.DefId>& visiting) {
         types.TypeInfo info = self.store.types.get(type_id);
-        if (info.data is .invalid) { return true; }
-        if (info.data is .never) { return true; }
-        if (info.data is .unit) { return true; }
-        if (info.data is .bool_type) { return true; }
-        if (info.data is .char_type) { return true; }
-        if (info.data is .int_type(_)) { return true; }
-        if (info.data is .float_type(_)) { return true; }
+        if (self.intrinsic_copy_type(info)) { return true; }
         if (info.data is .function_type(function_type)) {
             return function_type.kind == .raw;
         }
-        if (info.data is .task_type(_)) {
-            return false;
-        }
-        if (info.data is .trait_companion(_)) { return true; }
+        if (info.data is .task_type(_)) { return false; }
         if (info.data is .handle_type(handle)) {
             return handle.kind != .owner_pointer;
         }
@@ -58,9 +47,20 @@ public struct CopyQuery {
             return self.tuple_is_implicit_copy(tuple_type, visiting);
         }
         if (info.data is .named(named)) {
-            return self.named_is_implicit_copy(named, visiting);
+            return self.named_is_implicit_copy(named.def_id, visiting);
         }
         return false;
+    }
+
+    Bool intrinsic_copy_type(self, types.TypeInfo info) {
+        if (info.data is .invalid) { return true; }
+        if (info.data is .never) { return true; }
+        if (info.data is .unit) { return true; }
+        if (info.data is .bool_type) { return true; }
+        if (info.data is .char_type) { return true; }
+        if (info.data is .int_type(_)) { return true; }
+        if (info.data is .float_type(_)) { return true; }
+        return info.data is .trait_companion(_);
     }
 
     Bool tuple_is_implicit_copy(self, types.TupleType tuple_type, list.ArrayList<qid.DefId>& visiting) {
@@ -74,228 +74,271 @@ public struct CopyQuery {
         return true;
     }
 
-    Bool named_is_implicit_copy(self, types.NamedType named_type, list.ArrayList<qid.DefId>& visiting) {
-        def.DefRecord def_record = self.store.defs.get(named_type.def_id);
-        if (def_record.kind == .generic_param_def) {
-            return self.generic_param_declares_non_movable(def_record);
+    Bool named_is_implicit_copy(self, qid.DefId def_id, list.ArrayList<qid.DefId>& visiting) {
+        def.DefRecord record = self.store.defs.get(def_id);
+        if (record.kind == .generic_param_def) {
+            return self.generic_param_declares_copyable(record);
         }
-        if (def_record.kind == .enum_def) {
-            return true;
-        }
-        if (!self.copy_nominal_kind(def_record.kind)) {
-            return false;
-        }
-        if (self.def_declares_movable(named_type.def_id)) {
-            return false;
-        }
-        guard self.store.hirs.def(named_type.def_id) is .some(hir_def) else {
-            return false;
-        }
-        if (hir_def.custom_deinit_def != null) {
-            return false;
-        }
-        return self.nominal_members_are_copy(hir_def, visiting);
+        if (self.def_declares_copyable(def_id)) { return true; }
+        return self.legacy_nominal_is_implicit_copy(def_id, visiting);
     }
 
-    Bool nominal_members_are_copy(self, hir.HirDef& hir_def, list.ArrayList<qid.DefId>& visiting) {
-        if (self.copy_stack_has(visiting, hir_def.def_id)) {
-            return true;
-        }
+    Bool legacy_nominal_is_implicit_copy(
+        self,
+        qid.DefId def_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        def.DefKind kind = self.store.defs.get(def_id).kind;
+        if (kind == .enum_def) { return true; }
+        if (!self.copy_nominal_kind(kind)) { return false; }
+        if (self.def_declares_movable(def_id)) { return false; }
+        if (self.def_declares_non_movable(def_id)) { return false; }
+        if (self.copy_stack_has(visiting, def_id)) { return true; }
+        guard self.store.hirs.def(def_id) is .some(hir_def) else { return false; }
+        if (hir_def.custom_deinit_def != null) { return false; }
         Int depth = visiting.len();
-        visiting.add(hir_def.def_id);
-        Bool result = self.copy_relevant_members_are_copy(hir_def, visiting);
+        visiting.add(def_id);
+        Bool result = self.copy_relevant_members_are_implicit_copy(hir_def, visiting);
         visiting.truncate(depth);
         return result;
     }
 
-    Bool copy_relevant_members_are_copy(self, hir.HirDef& hir_def, list.ArrayList<qid.DefId>& visiting) {
+    Bool copy_relevant_members_are_implicit_copy(
+        self,
+        hir.HirDef& hir_def,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
         Int index! = 0;
         while (index < hir_def.members.len()) {
             qid.DefId member_def = hir_def.members.get(index);
             index = index + 1;
             if (!self.copy_relevant_member(member_def)) { continue; }
-            typeck_store.TypeCheckStore& typeck = self.store.typeck$.ref();
-            table.HashTable<qid.DefId, qid.TypeId>& def_types = typeck.def_types$.ref();
-            qid.TypeId member_type = table.hash_table_get_value<qid.DefId, qid.TypeId>(
-                def_types,
-                member_def
-            )$.some();
-            if (!self.is_implicit_copy_type_inner(member_type, visiting)) {
-                return false;
-            }
+            guard self.store.typeck.def_type(member_def) is .some(member_type) else { continue; }
+            if (!self.is_implicit_copy_type_inner(member_type, visiting)) { return false; }
         }
         return true;
     }
 
-    public Bool def_declares_movable(self, qid.DefId def_id) {
+    public Bool def_declares_copyable(self, qid.DefId def_id) {
+        guard self.store.resolve.core_traits.copyable_trait is .some(copyable_trait) else {
+            return false;
+        }
+        def.DefRecord record = self.store.defs.get(def_id);
+        if (record.kind == .generic_param_def) {
+            return self.generic_param_declares_trait(record, copyable_trait);
+        }
+        list.ArrayList<qid.DefId> visited! = list.ArrayList<qid.DefId>();
+        return self.def_declares_trait(def_id, copyable_trait, visited$.ref());
+    }
+
+    Bool generic_param_declares_copyable(self, def.DefRecord record) {
+        if (self.store.resolve.core_traits.copyable_trait is .some(copyable_trait)) {
+            if (self.generic_param_declares_trait(record, copyable_trait)) { return true; }
+        }
         guard self.store.resolve.core_traits.movable_trait is .some(movable_trait) else {
             return false;
         }
-        def.DefRecord def_record = self.store.defs.get(def_id);
-        if (def_record.kind == .generic_param_def) {
-            return self.generic_param_declares_trait(def_record, movable_trait);
+        guard record.owner_def is .some(owner_def) else { return false; }
+        return self.owner_has_negative_trait_bound(owner_def, record.id, movable_trait);
+    }
+
+    public Bool is_declared_copyable_type(self, qid.TypeId type_id) {
+        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+        return self.is_declared_copyable_type_inner(type_id, visiting$.ref());
+    }
+
+    public Bool legacy_copy_bound_satisfied(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        if (info.data is .named(named)) {
+            def.DefRecord record = self.store.defs.get(named.def_id);
+            if (record.kind == .generic_param_def) {
+                guard self.store.resolve.core_traits.movable_trait is .some(movable_trait) else {
+                    return true;
+                }
+                return !self.generic_param_declares_trait(record, movable_trait);
+            }
+        }
+        return self.is_implicit_copy_type(type_id);
+    }
+
+    Bool is_declared_copyable_type_inner(
+        self,
+        qid.TypeId type_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        types.TypeInfo info = self.store.types.get(type_id);
+        if (self.intrinsic_copy_type(info)) { return true; }
+        if (info.data is .function_type(function_type)) { return function_type.kind == .raw; }
+        if (info.data is .handle_type(handle)) { return handle.kind != .owner_pointer; }
+        if (info.data is .optional(optional)) {
+            return self.is_declared_copyable_type_inner(optional.element, visiting);
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.is_declared_copyable_type_inner(error_union.value, visiting)
+                && self.is_declared_copyable_type_inner(error_union.error, visiting);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.is_declared_copyable_type_inner(array_type.element, visiting);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            Int index! = 0;
+            while (index < tuple_type.items.length) {
+                if (!self.is_declared_copyable_type_inner(tuple_type.items[index], visiting)) {
+                    return false;
+                }
+                index = index + 1;
+            }
+            return true;
+        }
+        guard info.data is .named(named) else { return false; }
+        return self.def_declares_copyable(named.def_id);
+    }
+
+    Bool def_declares_movable(self, qid.DefId def_id) {
+        guard self.store.resolve.core_traits.movable_trait is .some(movable_trait) else {
+            return false;
         }
         list.ArrayList<qid.DefId> visited! = list.ArrayList<qid.DefId>();
         return self.def_declares_trait(def_id, movable_trait, visited$.ref());
     }
 
-    public Bool generic_param_declares_non_movable(self, def.DefRecord def_record) {
-        guard self.store.resolve.core_traits.movable_trait is .some(movable_trait) else {
-            return false;
-        }
-        if (def_record.kind != .generic_param_def) {
-            return false;
-        }
-        guard def_record.owner_def is .some(owner_def) else {
-            return false;
-        }
-        return self.generic_param_where_negative_trait(def_record.id, owner_def, movable_trait);
-    }
-
-    public Bool type_requires_movable(self, qid.TypeId type_id) {
+    public Bool type_is_movable(self, qid.TypeId type_id) {
         list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
-        return self.type_requires_movable_inner(type_id, visiting$.ref());
+        return self.type_is_movable_inner(type_id, visiting$.ref());
     }
 
-    Bool type_requires_movable_inner(self, qid.TypeId type_id, list.ArrayList<qid.DefId>& visiting) {
+    Bool type_is_movable_inner(self, qid.TypeId type_id, list.ArrayList<qid.DefId>& visiting) {
         types.TypeInfo info = self.store.types.get(type_id);
-        if (info.data is .trait_companion(_)) { return false; }
-        if (info.data is .function_type(function_type)) {
-            return function_type.kind == .closure;
-        }
-        if (info.data is .task_type(_)) {
-            return true;
-        }
-        if (info.data is .handle_type(handle)) {
-            if (handle.kind == .owner_pointer) { return true; }
-            return false;
-        }
+        if (info.data is .task_type(_)) { return false; }
         if (info.data is .optional(optional)) {
-            return self.type_requires_movable_inner(optional.element, visiting);
+            return self.type_is_movable_inner(optional.element, visiting);
         }
         if (info.data is .error_union(error_union)) {
-            return self.type_requires_movable_inner(error_union.value, visiting)
-                || self.type_requires_movable_inner(error_union.error, visiting);
+            return self.type_is_movable_inner(error_union.value, visiting)
+                && self.type_is_movable_inner(error_union.error, visiting);
         }
         if (info.data is .array_type(array_type)) {
-            return self.type_requires_movable_inner(array_type.element, visiting);
+            return self.type_is_movable_inner(array_type.element, visiting);
         }
         if (info.data is .tuple_type(tuple_type)) {
-            return self.tuple_requires_movable(tuple_type, visiting);
+            return self.tuple_is_movable(tuple_type, visiting);
         }
         if (info.data is .named(named)) {
-            return self.named_type_requires_movable(named.def_id, visiting);
+            return self.named_type_is_movable(named.def_id, visiting);
         }
-        return false;
+        return true;
     }
 
-    Bool tuple_requires_movable(self, types.TupleType tuple_type, list.ArrayList<qid.DefId>& visiting) {
+    Bool tuple_is_movable(self, types.TupleType tuple_type, list.ArrayList<qid.DefId>& visiting) {
         Int index! = 0;
         while (index < tuple_type.items.length) {
-            if (self.type_requires_movable_inner(tuple_type.items[index], visiting)) {
-                return true;
+            if (!self.type_is_movable_inner(tuple_type.items[index], visiting)) {
+                return false;
             }
             index = index + 1;
         }
-        return false;
+        return true;
     }
 
-    Bool named_type_requires_movable(self, qid.DefId def_id, list.ArrayList<qid.DefId>& visiting) {
-        if (self.def_declares_movable(def_id)) {
+    Bool named_type_is_movable(self, qid.DefId def_id, list.ArrayList<qid.DefId>& visiting) {
+        def.DefRecord record = self.store.defs.get(def_id);
+        if (record.kind == .generic_param_def && self.generic_param_declares_copyable(record)) {
             return true;
         }
-        def.DefKind kind = self.store.defs.get(def_id).kind;
-        if (!self.copy_nominal_kind(kind)) {
-            return false;
-        }
-        if (self.copy_stack_has(visiting, def_id)) {
-            return false;
-        }
-        guard self.store.hirs.def(def_id) is .some(hir_def) else {
-            return false;
-        }
-        if (hir_def.custom_deinit_def != null) {
-            return true;
-        }
+        if (self.def_declares_non_movable(def_id)) { return false; }
+        def.DefKind kind = record.kind;
+        if (!self.copy_nominal_kind(kind)) { return true; }
+        if (self.copy_stack_has(visiting, def_id)) { return true; }
+        guard self.store.hirs.def(def_id) is .some(hir_def) else { return true; }
         Int depth = visiting.len();
         visiting.add(def_id);
-        Bool result = self.nominal_member_requires_movable(hir_def, visiting);
+        Bool result = self.nominal_members_are_movable(hir_def, visiting);
         visiting.truncate(depth);
         return result;
     }
 
-    Bool nominal_member_requires_movable(self, hir.HirDef& hir_def, list.ArrayList<qid.DefId>& visiting) {
+    Bool nominal_members_are_movable(self, hir.HirDef& hir_def, list.ArrayList<qid.DefId>& visiting) {
         Int index! = 0;
         while (index < hir_def.members.len()) {
             qid.DefId member_def = hir_def.members.get(index);
             index = index + 1;
             if (!self.copy_relevant_member(member_def)) { continue; }
-            qid.TypeId member_type = self.store.typeck.def_type(member_def)$.some();
-            if (self.type_requires_movable_inner(member_type, visiting)) {
+            guard self.store.typeck.def_type(member_def) is .some(member_type) else { continue; }
+            if (!self.type_is_movable_inner(member_type, visiting)) { return false; }
+        }
+        return true;
+    }
+
+    public Bool def_declares_non_movable(self, qid.DefId def_id) {
+        guard self.store.resolve.core_traits.movable_trait is .some(movable_trait) else {
+            return false;
+        }
+        def.DefRecord record = self.store.defs.get(def_id);
+        if (record.kind == .generic_param_def) {
+            guard record.owner_def is .some(owner_def) else { return false; }
+            return self.owner_has_negative_trait_bound(owner_def, def_id, movable_trait);
+        }
+        guard self.store.hirs.def(def_id) is .some(hir_def) else { return false; }
+        Int index! = 0;
+        while (index < hir_def.negative_trait_refs.len()) {
+            if (self.type_ref_names_def(hir_def.negative_trait_refs.get(index), movable_trait)) {
                 return true;
             }
+            index = index + 1;
         }
         return false;
     }
 
-    Bool generic_param_declares_trait(self, def.DefRecord def_record, qid.DefId trait_def) {
-        if (self.generic_param_direct_trait(def_record.id, trait_def)) {
-            return true;
+    Bool owner_has_negative_trait_bound(
+        self,
+        qid.DefId owner_def,
+        qid.DefId subject_def,
+        qid.DefId trait_def
+    ) {
+        guard self.store.hirs.def(owner_def) is .some(hir_def) else { return false; }
+        Int index! = 0;
+        while (index < hir_def.where_predicates.len()) {
+            hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
+            index = index + 1;
+            guard predicate is .negative_type_bound(bound) else { continue; }
+            if (!self.type_ref_names_def(bound.subject, subject_def)) { continue; }
+            if (self.type_ref_names_def(bound.bound, trait_def)) { return true; }
         }
-        guard def_record.owner_def is .some(owner_def) else {
-            return false;
-        }
-        return self.generic_param_where_trait(def_record.id, owner_def, trait_def);
+        return false;
+    }
+
+    // 过渡期保留这个查询名称；它表示需要所有权转移，不再表示 Movable trait。
+    public Bool type_requires_movable(self, qid.TypeId type_id) {
+        return !self.is_implicit_copy_type(type_id);
+    }
+
+    Bool generic_param_declares_trait(self, def.DefRecord record, qid.DefId trait_def) {
+        if (self.generic_param_direct_trait(record.id, trait_def)) { return true; }
+        guard record.owner_def is .some(owner_def) else { return false; }
+        return self.generic_param_where_trait(record.id, owner_def, trait_def);
     }
 
     Bool generic_param_direct_trait(self, qid.DefId generic_def, qid.DefId trait_def) {
-        guard self.store.hirs.def(generic_def) is .some(hir_def) else {
-            return false;
-        }
+        guard self.store.hirs.def(generic_def) is .some(hir_def) else { return false; }
         return self.hir_def_declares_trait_ref(hir_def, trait_def);
     }
 
     Bool generic_param_where_trait(self, qid.DefId generic_def, qid.DefId owner_def, qid.DefId trait_def) {
-        guard self.store.hirs.def(owner_def) is .some(hir_def) else {
-            return false;
-        }
+        guard self.store.hirs.def(owner_def) is .some(hir_def) else { return false; }
         Int index! = 0;
         while (index < hir_def.where_predicates.len()) {
             hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
             index = index + 1;
             guard predicate is .type_bound(bound) else { continue; }
             if (!self.type_ref_names_def(bound.subject, generic_def)) { continue; }
-            if (self.type_ref_names_def(bound.bound, trait_def)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    Bool generic_param_where_negative_trait(self, qid.DefId generic_def, qid.DefId owner_def, qid.DefId trait_def) {
-        guard self.store.hirs.def(owner_def) is .some(hir_def) else {
-            return false;
-        }
-        Int index! = 0;
-        while (index < hir_def.where_predicates.len()) {
-            hir.HirWherePredicate predicate = hir_def.where_predicates.get(index);
-            index = index + 1;
-            guard predicate is .negative_type_bound(bound) else { continue; }
-            if (!self.type_ref_names_def(bound.subject, generic_def)) { continue; }
-            if (self.type_ref_names_def(bound.bound, trait_def)) {
-                return true;
-            }
+            if (self.type_ref_names_def(bound.bound, trait_def)) { return true; }
         }
         return false;
     }
 
     Bool def_declares_trait(self, qid.DefId def_id, qid.DefId trait_def, list.ArrayList<qid.DefId>& visited) {
-        if (self.copy_stack_has(visited, def_id)) {
-            return false;
-        }
-        guard self.store.hirs.def(def_id) is .some(hir_def) else {
-            return false;
-        }
+        if (self.copy_stack_has(visited, def_id)) { return false; }
+        guard self.store.hirs.def(def_id) is .some(hir_def) else { return false; }
         Int depth = visited.len();
         visited.add(def_id);
         Bool result = self.hir_def_declares_trait(hir_def, trait_def, visited);
@@ -303,18 +346,19 @@ public struct CopyQuery {
         return result;
     }
 
-    Bool hir_def_declares_trait(self, hir.HirDef& hir_def, qid.DefId trait_def, list.ArrayList<qid.DefId>& visited) {
+    Bool hir_def_declares_trait(
+        self,
+        hir.HirDef& hir_def,
+        qid.DefId trait_def,
+        list.ArrayList<qid.DefId>& visited
+    ) {
         Int index! = 0;
         while (index < hir_def.trait_refs.len()) {
             hir.HirNode node = self.store.hirs.node(hir_def.trait_refs.get(index));
             index = index + 1;
             guard node.data is .named_type_ref(named) else { continue; }
-            if (self.same_def(named.def_id, trait_def)) {
-                return true;
-            }
-            if (self.def_declares_trait(named.def_id, trait_def, visited)) {
-                return true;
-            }
+            if (self.same_def(named.def_id, trait_def)) { return true; }
+            if (self.def_declares_trait(named.def_id, trait_def, visited)) { return true; }
         }
         return false;
     }
@@ -322,9 +366,7 @@ public struct CopyQuery {
     Bool hir_def_declares_trait_ref(self, hir.HirDef& hir_def, qid.DefId trait_def) {
         Int index! = 0;
         while (index < hir_def.trait_refs.len()) {
-            if (self.type_ref_names_def(hir_def.trait_refs.get(index), trait_def)) {
-                return true;
-            }
+            if (self.type_ref_names_def(hir_def.trait_refs.get(index), trait_def)) { return true; }
             index = index + 1;
         }
         return false;
@@ -333,22 +375,19 @@ public struct CopyQuery {
     public Bool copy_relevant_member(self, qid.DefId member_def) {
         def.DefKind kind = self.store.defs.get(member_def).kind;
         if (kind == .field_def) { return true; }
-        if (kind == .union_variant_def) { return true; }
-        return false;
+        return kind == .union_variant_def;
     }
 
     Bool copy_nominal_kind(self, def.DefKind kind) {
         if (kind == .struct_def) { return true; }
-        if (kind == .union_def) { return true; }
-        return false;
+        if (kind == .enum_def) { return true; }
+        return kind == .union_def;
     }
 
     Bool copy_stack_has(self, list.ArrayList<qid.DefId>& stack, qid.DefId def_id) {
         Int index! = 0;
         while (index < stack.len()) {
-            if (self.same_def(stack.get(index), def_id)) {
-                return true;
-            }
+            if (self.same_def(stack.get(index), def_id)) { return true; }
             index = index + 1;
         }
         return false;
@@ -356,9 +395,7 @@ public struct CopyQuery {
 
     Bool type_ref_names_def(self, hir.HirId type_ref, qid.DefId def_id) {
         hir.HirNode node = self.store.hirs.node(type_ref);
-        guard node.data is .named_type_ref(named) else {
-            return false;
-        }
+        guard node.data is .named_type_ref(named) else { return false; }
         return self.same_def(named.def_id, def_id);
     }
 
