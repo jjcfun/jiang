@@ -1,0 +1,784 @@
+// fully-confined 协程变体。
+//
+// 变体与标准 resume/completion 共享不可变的 local/type/projection 数据，只复制
+// block/statement 层。用户 Atomic<T> 保持原子语义；只有编译器生成的协程协议
+// 以及 Task 调度协议改为单 executor 版本。
+
+import qid = "../../../store/id.jiang";
+import list = "../../../support/list.jiang";
+import token = "../../../syntax/token.jiang";
+import mir = "../../mir.jiang";
+import plan = "./plan.jiang";
+
+struct TaskRootVariant {
+    mir.MirPlace task;
+    mir.MirFunctionRef source_resume;
+    mir.MirFunctionRef variant_resume;
+}
+
+struct LocalCallee {
+    mir.MirCallCallee value;
+    Bool confined_direct;
+}
+
+public mir.MirFunction select_task_roots(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    plan.Store& plans
+) {
+    list.ArrayList<TaskRootVariant> variants! = list.ArrayList<TaskRootVariant>();
+    collect_task_root_variants(
+        output,
+        source.body,
+        plans,
+        variants$.ref()
+    );
+    if (variants.len() == 0) { return source; }
+    return function_with_body(source, selected_root_body(output, source.body, variants$.ref()));
+}
+
+() collect_task_root_variants(
+    mir.MirStore& output,
+    mir.MirBody body,
+    plan.Store& plans,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        mir.MirBlock block = body.blocks[block_index];
+        Int statement_index! = 0;
+        while (statement_index < block.statements.length) {
+            append_task_root_variant(
+                output,
+                block.statements[statement_index],
+                plans,
+                variants
+            );
+            statement_index = statement_index + 1;
+        }
+        block_index = block_index + 1;
+    }
+}
+
+() append_task_root_variant(
+    mir.MirStore& output,
+    mir.MirStatement statement,
+    plan.Store& plans,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    guard statement.kind is .task_region_start_stmt(start) else { return; }
+    guard start.child_resume is .some(source_resume) else { return; }
+    mir.MirFunctionKey key = mir.MirFunctionKey(
+        source_resume.function_def,
+        source_resume.type_args,
+        source_resume.const_args
+    );
+    if (start.storage.sync != .local_serial) { return; }
+    guard plans.get(key).confined_resume is .some(variant_def) else { return; }
+    variants.add(TaskRootVariant (
+        task: start.task,
+        source_resume: source_resume,
+        variant_resume: variant_function_ref(
+            output, source_resume, variant_def
+        )
+    ));
+}
+
+mir.MirFunctionRef variant_function_ref(
+    mir.MirStore& output,
+    mir.MirFunctionRef source,
+    qid.DefId variant_def
+) {
+    return mir.MirFunctionRef (
+        function_def: variant_def,
+        type_args: output.empty_type_args(),
+        const_args: output.empty_const_args(),
+        coroutine_resume: false,
+        coroutine_completion: false,
+        type_id: source.type_id,
+        span: source.span
+    );
+}
+
+@life(source > return, body > return)
+mir.MirFunction function_with_body(mir.MirFunction source, mir.MirBody body) {
+    return mir.MirFunction (
+        id: source.id,
+        def_id: source.def_id,
+        type_args: source.type_args,
+        const_args: source.const_args,
+        signature_id: source.signature_id,
+        effects: source.effects,
+        is_coroutine: source.is_coroutine,
+        coroutine_frame: source.coroutine_frame,
+        confinement: source.confinement,
+        confinement_domain: source.confinement_domain,
+        is_coroutine_resume: source.is_coroutine_resume,
+        is_coroutine_completion: source.is_coroutine_completion,
+        is_language_entry: source.is_language_entry,
+        is_runtime_entry: source.is_runtime_entry,
+        is_external: source.is_external,
+        inline_always: source.inline_always,
+        naked: source.naked,
+        span: source.span,
+        body: body
+    );
+}
+
+mir.MirBody selected_root_body(
+    mir.MirStore& output,
+    mir.MirBody source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(source.blocks.length);
+    Int index! = 0;
+    while (index < source.blocks.length) {
+        blocks.add(selected_root_block(output, source.blocks[index], variants));
+        index = index + 1;
+    }
+    return mir.MirBody (
+        id: source.id,
+        span: source.span,
+        locals: source.locals,
+        blocks: output.block_array(blocks$.ref()),
+        entry: source.entry,
+        return_local: source.return_local
+    );
+}
+
+mir.MirBlock selected_root_block(
+    mir.MirStore& output,
+    mir.MirBlock source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    list.ArrayList<mir.MirStatement> statements! =
+        list.ArrayList<mir.MirStatement>(source.statements.length);
+    Int index! = 0;
+    while (index < source.statements.length) {
+        if (selected_root_statement(
+                source.statements[index], variants
+            ) is .some(statement)
+        ) {
+            statements.add(statement);
+        }
+        index = index + 1;
+    }
+    return mir.MirBlock (
+        id: source.id,
+        span: source.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: selected_root_terminator(source.terminator, variants)
+    );
+}
+
+mir.MirTerminator selected_root_terminator(
+    mir.MirTerminator source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    guard source.kind is .call_term(call) else { return source; }
+    guard call.callee is .direct_function(function_ref) else { return source; }
+    Int index! = 0;
+    while (index < variants.len()) {
+        TaskRootVariant variant = variants.get(index);
+        if (function_ref_equal(function_ref, variant.source_resume)) {
+            return call_with_resume(source.span, call, variant.variant_resume);
+        }
+        index = index + 1;
+    }
+    return source;
+}
+
+mir.MirTerminator call_with_resume(
+    token.Span span,
+    mir.MirCallTerminator call,
+    mir.MirFunctionRef resume
+) {
+    return mir.MirTerminator (
+        span: span,
+        kind: mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: mir.direct_function_callee(resume),
+            args: call.args,
+            current_effects: call.current_effects,
+            is_suspend_point: call.is_suspend_point,
+            suspend_wake: call.suspend_wake,
+            suspend_child: resume,
+            task_handoff: call.task_handoff,
+            async_start: call.async_start,
+            destination: call.destination,
+            target: call.target,
+            initialized_place: call.initialized_place,
+            exclusive_places: call.exclusive_places,
+            cleanup: call.cleanup
+        ))
+    );
+}
+
+mir.MirStatement? selected_root_statement(
+    mir.MirStatement source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    if (source.kind is .task_region_start_stmt(start)) {
+        return selected_root_start_statement(source.span, start, variants);
+    }
+    guard source.kind is .assign_stmt(assign) else { return source; }
+    guard assign.value is .use_value(use_value) else { return source; }
+    guard use_value.value is .function_operand(function_ref) else { return source; }
+    Int index! = 0;
+    while (index < variants.len()) {
+        TaskRootVariant variant = variants.get(index);
+        if (place_has_prefix(assign.destination, variant.task)
+            && function_ref_equal(function_ref, variant.source_resume)
+        ) {
+            return function_assign_statement(source.span, assign.destination, variant.variant_resume);
+        }
+        index = index + 1;
+    }
+    return source;
+}
+
+mir.MirStatement selected_root_start_statement(
+    token.Span span,
+    mir.MirTaskRegionStartStatement start,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    guard start.child_resume is .some(child_resume) else {
+        return mir.MirStatement(span: span, kind: mir.task_region_start_statement_kind(start));
+    }
+    Int index! = 0;
+    while (index < variants.len()) {
+        TaskRootVariant variant = variants.get(index);
+        if (function_ref_equal(child_resume, variant.source_resume)
+            && place_equal(start.task, variant.task)
+        ) {
+            return mir.MirStatement (
+                span: span,
+                kind: mir.task_region_start_statement_kind(mir.MirTaskRegionStartStatement (
+                    task: start.task,
+                    storage: start.storage,
+                    child_resume: variant.variant_resume
+                ))
+            );
+        }
+        index = index + 1;
+    }
+    return mir.MirStatement(span: span, kind: mir.task_region_start_statement_kind(start));
+}
+
+mir.MirStatement function_assign_statement(
+    token.Span span,
+    mir.MirPlace destination,
+    mir.MirFunctionRef function_ref
+) {
+    return mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: destination,
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.function_operand_value(function_ref)
+            ))
+        ))
+    );
+}
+
+Bool function_ref_equal(mir.MirFunctionRef lhs, mir.MirFunctionRef rhs) {
+    if (lhs.coroutine_resume != rhs.coroutine_resume) { return false; }
+    if (lhs.coroutine_completion != rhs.coroutine_completion) { return false; }
+    mir.MirFunctionKey lhs_key = mir.MirFunctionKey(
+        lhs.function_def, lhs.type_args, lhs.const_args
+    );
+    mir.MirFunctionKey rhs_key = mir.MirFunctionKey(
+        rhs.function_def, rhs.type_args, rhs.const_args
+    );
+    return mir.MirFunctionKey.equal(lhs_key$.ref(), rhs_key$.ref());
+}
+
+Bool place_equal(mir.MirPlace lhs, mir.MirPlace rhs) {
+    if (!place_base_equal(lhs.base, rhs.base)) { return false; }
+    if (lhs.projection.length != rhs.projection.length) { return false; }
+    return projection_prefix_equal(lhs.projection, rhs.projection);
+}
+
+Bool place_has_prefix(mir.MirPlace place, mir.MirPlace prefix) {
+    if (!place_base_equal(place.base, prefix.base)) { return false; }
+    if (place.projection.length < prefix.projection.length) { return false; }
+    return projection_prefix_equal(place.projection, prefix.projection);
+}
+
+Bool place_base_equal(mir.MirPlaceBase lhs, mir.MirPlaceBase rhs) {
+    if (lhs is .local(lhs_local)) {
+        if (rhs is .local(rhs_local)) { return lhs_local == rhs_local; }
+        return false;
+    }
+    guard lhs is .global(lhs_global) else { return false; }
+    guard rhs is .global(rhs_global) else { return false; }
+    return lhs_global.global_def == rhs_global.global_def;
+}
+
+Bool projection_prefix_equal(mir.MirPlaceElem[]& lhs, mir.MirPlaceElem[]& rhs) {
+    Int index! = 0;
+    while (index < rhs.length) {
+        if (!place_elem_equal(lhs[index], rhs[index])) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool place_elem_equal(mir.MirPlaceElem lhs, mir.MirPlaceElem rhs) {
+    if (lhs is .deref_projection(left)) {
+        if (rhs is .deref_projection(right)) { return left.raw_pointer == right.raw_pointer; }
+        return false;
+    }
+    if (lhs is .field_projection(left)) {
+        if (rhs is .field_projection(right)) {
+            return left.field_def == right.field_def && left.field_index == right.field_index;
+        }
+        return false;
+    }
+    if (lhs is .frame_field_projection(left)) {
+        if (rhs is .frame_field_projection(right)) { return left.field_index == right.field_index; }
+        return false;
+    }
+    if (lhs is .index_projection(left)) {
+        if (rhs is .index_projection(right)) { return left.index_local == right.index_local; }
+        return false;
+    }
+    if (lhs is .constant_index_projection(left)) {
+        if (rhs is .constant_index_projection(right)) { return left.offset == right.offset; }
+        return false;
+    }
+    if (lhs is .subslice_projection(left)) {
+        if (rhs is .subslice_projection(right)) {
+            return left.from == right.from && left.to == right.to;
+        }
+    }
+    return false;
+}
+
+public mir.MirFunction add(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    qid.DefId variant_def,
+    mir.MirPlace? current_executor,
+    plan.Store& plans
+) {
+    mir.MirFunctionId id = mir.MirFunctionId.from_index(output.functions.len());
+    mir.MirFunction variant = mir.MirFunction (
+        id: id,
+        def_id: variant_def,
+        type_args: output.empty_type_args(),
+        const_args: output.empty_const_args(),
+        signature_id: null,
+        effects: source.effects,
+        is_coroutine: false,
+        coroutine_frame: null,
+        confinement: .preserving,
+        confinement_domain: source.confinement_domain,
+        is_coroutine_resume: false,
+        is_coroutine_completion: false,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: source.inline_always,
+        naked: false,
+        span: source.span,
+        body: local_body(
+            output,
+            source.body,
+            id,
+            current_executor,
+            plans
+        )
+    );
+    output.add_generated_function(variant);
+    output.mark_drop_elaborated(id);
+    output.mark_borrow_check_exempt(id);
+    return variant;
+}
+
+mir.MirBody local_body(
+    mir.MirStore& output,
+    mir.MirBody source,
+    mir.MirFunctionId function_id,
+    mir.MirPlace? current_executor,
+    plan.Store& plans
+) {
+    mir.MirLocalId? executor_local = executor_scope_local(source);
+    list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(source.blocks.length);
+    Int index! = 0;
+    while (index < source.blocks.length) {
+        blocks.add(local_block(
+            output,
+            source.blocks[index],
+            executor_local,
+            current_executor,
+            plans
+        ));
+        index = index + 1;
+    }
+    return mir.MirBody (
+        id: mir.MirBodyId.from_index(function_id.to_index()),
+        span: source.span,
+        locals: source.locals,
+        blocks: output.block_array(blocks$.ref()),
+        entry: source.entry,
+        return_local: source.return_local
+    );
+}
+
+mir.MirLocalId? executor_scope_local(mir.MirBody body) {
+    // confined resume 只能由已经进入同一 serial executor 的调用者直连进入。
+    // 删除成对的 enter/leave 后，整条父子链借用最外层标准 resume 的 context。
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        mir.MirLocalId? local_id = executor_scope_local_in_block(
+            body.blocks[block_index]
+        );
+        if (local_id != null) { return local_id; }
+        block_index = block_index + 1;
+    }
+    return null;
+}
+
+mir.MirLocalId? executor_scope_local_in_block(mir.MirBlock block) {
+    Int index! = 0;
+    while (index < block.statements.length) {
+        mir.MirStatement statement = block.statements[index];
+        if (statement.kind is .assign_stmt(assign)) {
+            if (assign.value is .executor_enter_value(enter)) { return enter.executor; }
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+mir.MirBlock local_block(
+    mir.MirStore& output,
+    mir.MirBlock source,
+    mir.MirLocalId? executor_local,
+    mir.MirPlace? current_executor,
+    plan.Store& plans
+) {
+    mir.MirTerminator terminator = local_terminator(output, source.terminator, plans);
+    list.ArrayList<mir.MirStatement> statements! =
+        list.ArrayList<mir.MirStatement>(source.statements.length);
+    Int index! = 0;
+    while (index < source.statements.length) {
+        mir.MirStatement statement = source.statements[index];
+        if (!statement_is_executor_scope(statement, executor_local)) {
+            statements.add(local_statement(
+                output,
+                statement,
+                current_executor,
+                plans
+            ));
+        }
+        index = index + 1;
+    }
+    return mir.MirBlock (
+        id: source.id,
+        span: source.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: terminator
+    );
+}
+
+Bool statement_is_executor_scope(
+    mir.MirStatement statement,
+    mir.MirLocalId? executor_local
+) {
+    if (statement.kind is .executor_leave_stmt(_)) { return true; }
+    guard statement.kind is .assign_stmt(assign) else { return false; }
+    if (assign.value is .executor_enter_value(_)) { return true; }
+    guard executor_local is .some(local_id) else { return false; }
+    guard mir.place_local_id(assign.destination) is .some(destination) else { return false; }
+    return destination == local_id;
+}
+
+mir.MirStatement local_statement(
+    mir.MirStore& output,
+    mir.MirStatement source,
+    mir.MirPlace? current_executor,
+    plan.Store& plans
+) {
+    return mir.MirStatement (
+        span: source.span,
+        kind: local_statement_kind(
+            output,
+            source.kind,
+            current_executor,
+            plans
+        )
+    );
+}
+
+mir.MirStatementKind local_statement_kind(
+    mir.MirStore& output,
+    mir.MirStatementKind kind,
+    mir.MirPlace? current_executor,
+    plan.Store& plans
+) {
+    if (kind is .assign_stmt(assign)) {
+        return mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: assign.destination,
+            value: local_rvalue(
+                output,
+                assign.value,
+                current_executor,
+                plans
+            )
+        ));
+    }
+    if (kind is .atomic_store_stmt(store)) {
+        if (store.mode != .coroutine_atomic) { return kind; }
+        return mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
+            destination: store.destination,
+            value: store.value,
+            ordering: store.ordering,
+            mode: .coroutine_local
+        ));
+    }
+    if (kind is .task_suspend_stmt(suspend)) {
+        return mir.task_suspend_statement_kind(mir.MirTaskSuspendStatement (
+            task: suspend.task,
+            mode: .local
+        ));
+    }
+    if (kind is .task_complete_stmt(complete)) {
+        return mir.task_complete_statement_kind(mir.MirTaskCompleteStatement (
+            task: complete.task,
+            mode: .local
+        ));
+    }
+    if (kind is .task_region_start_stmt(start)) {
+        return mir.task_region_start_statement_kind(mir.MirTaskRegionStartStatement (
+            task: start.task,
+            storage: start.storage,
+            child_resume: local_optional_function_ref(
+                output, start.child_resume, plans
+            )
+        ));
+    }
+    return kind;
+}
+
+mir.MirRvalue local_rvalue(
+    mir.MirStore& output,
+    mir.MirRvalue value,
+    mir.MirPlace? current_executor,
+    plan.Store& plans
+) {
+    if (value is .use_value(use_value)) {
+        return mir.use_rvalue(mir.MirUseRvalue (
+            value: local_operand(output, use_value.value, plans)
+        ));
+    }
+    if (value is .domain_executor_value(_)) {
+        if (current_executor is .some(executor)) {
+            return mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.copy_operand_value(mir.MirCopyOperand (place: executor))
+            ));
+        }
+        return value;
+    }
+    if (value is .atomic_load_value(load)) {
+        if (load.mode != .coroutine_atomic) { return value; }
+        return mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
+            place: load.place,
+            ordering: load.ordering,
+            mode: .coroutine_local
+        ));
+    }
+    if (value is .atomic_exchange_value(exchange)) {
+        if (exchange.mode != .coroutine_atomic) { return value; }
+        return mir.atomic_exchange_rvalue(mir.MirAtomicExchangeRvalue (
+            place: exchange.place,
+            desired: exchange.desired,
+            ordering: exchange.ordering,
+            mode: .coroutine_local
+        ));
+    }
+    if (value is .atomic_compare_exchange_value(exchange)) {
+        if (exchange.mode != .coroutine_atomic) { return value; }
+        return mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
+            place: exchange.place,
+            expected: exchange.expected,
+            desired: exchange.desired,
+            success_ordering: exchange.success_ordering,
+            failure_ordering: exchange.failure_ordering,
+            mode: .coroutine_local
+        ));
+    }
+    return value;
+}
+
+mir.MirTerminator local_terminator(
+    mir.MirStore& output,
+    mir.MirTerminator source,
+    plan.Store& plans
+) {
+    guard source.kind is .call_term(call) else { return source; }
+    Bool local_edge = !async_start_is_detached(call.async_start);
+    LocalCallee callee = local_callee(output, call.callee, local_edge, plans);
+    mir.MirFunctionRef? suspend_child! = call.suspend_child;
+    if (local_edge) {
+        suspend_child = local_optional_function_ref(
+            output, call.suspend_child, plans
+        );
+    }
+    return mir.MirTerminator (
+        span: source.span,
+        kind: mir.call_terminator_kind(mir.MirCallTerminator (
+            callee: callee.value,
+            args: local_operands(output, call.args, plans),
+            current_effects: call.current_effects,
+            is_suspend_point: call.is_suspend_point,
+            suspend_wake: call.suspend_wake,
+            suspend_child: suspend_child,
+            task_handoff: call.task_handoff && !callee.confined_direct,
+            async_start: call.async_start,
+            destination: call.destination,
+            target: call.target,
+            initialized_place: call.initialized_place,
+            exclusive_places: call.exclusive_places,
+            cleanup: call.cleanup
+        ))
+    );
+}
+
+Bool async_start_is_detached(mir.MirAsyncStartKind? value) {
+    if (value is .some(kind)) { return kind == .detached; }
+    return false;
+}
+
+LocalCallee local_callee(
+    mir.MirStore& output,
+    mir.MirCallCallee source,
+    Bool local_edge,
+    plan.Store& plans
+) {
+    if (!local_edge) {
+        return LocalCallee (value: source, confined_direct: false);
+    }
+    if (source is .direct_function(function_ref)) {
+        mir.MirFunctionRef localized = local_function_ref(output, function_ref, plans);
+        return LocalCallee (
+            value: mir.direct_function_callee(localized),
+            confined_direct: !function_ref_equal(function_ref, localized)
+        );
+    }
+    if (source is .indirect_operand(operand)) {
+        return LocalCallee (
+            value: mir.indirect_operand_callee(local_operand(
+                output, operand, plans
+            )),
+            confined_direct: false
+        );
+    }
+    if (source is .domain_enqueue(enqueue)) {
+        mir.MirOperand resume = local_operand(output, enqueue.resume, plans);
+        if (localized_domain_resume(enqueue.resume, resume) is .some(local_ref)) {
+            return LocalCallee (
+                value: mir.direct_function_callee(local_ref),
+                confined_direct: true
+            );
+        }
+        return LocalCallee (
+            value: .domain_enqueue(mir.MirDomainEnqueueCallee (
+                domain_def: enqueue.domain_def,
+                domain_kind: enqueue.domain_kind,
+                task: local_optional_operand(
+                    output, enqueue.task, plans
+                ),
+                resume: resume,
+                handoff: enqueue.handoff
+            )),
+            confined_direct: false
+        );
+    }
+    if (source is .dynamic_domain_enqueue(enqueue)) {
+        // 外部线程只唤醒并发 root；confined 子树的 request/handoff 都发生在
+        // root executor 内，因此保留状态机语义但改用普通 load/store。
+        return LocalCallee (
+            value: .dynamic_domain_enqueue(mir.MirDynamicDomainEnqueueCallee (
+                executor: local_operand(output, enqueue.executor, plans),
+                task: local_optional_operand(output, enqueue.task, plans),
+                resume: local_operand(output, enqueue.resume, plans),
+                handoff: enqueue.handoff,
+                mode: .local
+            )),
+            confined_direct: false
+        );
+    }
+    return LocalCallee (value: source, confined_direct: false);
+}
+
+mir.MirFunctionRef? localized_domain_resume(
+    mir.MirOperand source,
+    mir.MirOperand localized
+) {
+    guard source is .function_operand(source_ref) else { return null; }
+    guard localized is .function_operand(local_ref) else { return null; }
+    if (function_ref_equal(source_ref, local_ref)) { return null; }
+    return local_ref;
+}
+
+mir.MirOperand[]& local_operands(
+    mir.MirStore& output,
+    mir.MirOperand[]& source,
+    plan.Store& plans
+) {
+    list.ArrayList<mir.MirOperand> values! = list.ArrayList<mir.MirOperand>(source.length);
+    Int index! = 0;
+    while (index < source.length) {
+        values.add(local_operand(output, source[index], plans));
+        index = index + 1;
+    }
+    return output.operand_array(values$.ref());
+}
+
+mir.MirOperand? local_optional_operand(
+    mir.MirStore& output,
+    mir.MirOperand? source,
+    plan.Store& plans
+) {
+    if (source is .some(value)) {
+        return local_operand(output, value, plans);
+    }
+    return null;
+}
+
+mir.MirOperand local_operand(
+    mir.MirStore& output,
+    mir.MirOperand source,
+    plan.Store& plans
+) {
+    guard source is .function_operand(function_ref) else { return source; }
+    return mir.function_operand_value(local_function_ref(output, function_ref, plans));
+}
+
+mir.MirFunctionRef? local_optional_function_ref(
+    mir.MirStore& output,
+    mir.MirFunctionRef? source,
+    plan.Store& plans
+) {
+    if (source is .some(value)) {
+        return local_function_ref(output, value, plans);
+    }
+    return null;
+}
+
+mir.MirFunctionRef local_function_ref(
+    mir.MirStore& output,
+    mir.MirFunctionRef source,
+    plan.Store& plans
+) {
+    mir.MirFunctionKey key = mir.MirFunctionKey(
+        source.function_def, source.type_args, source.const_args
+    );
+    if (source.coroutine_resume) {
+        if (plans.get(key).confined_resume is .some(variant_def)) {
+            return variant_function_ref(output, source, variant_def);
+        }
+    }
+    return source;
+}

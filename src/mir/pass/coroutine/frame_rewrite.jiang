@@ -70,6 +70,135 @@ public ResumeRewriteResult lower_resume_body(
     return add_resume_return_skeleton(output, state_result, source, layout);
 }
 
+public ResumeFunctionLowering lower_rtc_resume_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId resume_function_id
+) {
+    FrameRewriteResult frame_result = rewrite_body_with_frame_local(
+        output, source.body, layout
+    );
+    ResumeRewriteResult lowered = add_rtc_return_skeleton(
+        output, frame_result, layout
+    );
+    return ResumeFunctionLowering (
+        function: resume_function_for_body(
+            output,
+            source,
+            resume_function_id,
+            body_with_id(lowered.body, resume_function_id)
+        ),
+        frame_local_id: lowered.frame_local_id,
+        resume_return_local_id: lowered.resume_return_local_id
+    );
+}
+
+ResumeRewriteResult add_rtc_return_skeleton(
+    mir.MirStore& output,
+    FrameRewriteResult result,
+    mir.MirCoroutineFrameLayout& layout
+) {
+    mir.MirLocalId return_local = mir.MirLocalId.from_index(
+        result.body.locals.length
+    );
+    mir.MirLocalDecl[]& locals = locals_with_rtc_return(
+        output, result.body, layout, return_local
+    );
+    mir.MirBody body = body_with_return_local(
+        body_with_locals(result.body, locals), return_local
+    );
+    mir.MirPlace frame_place = deref_frame_pointer_place(
+        output, result.frame_local_id
+    );
+    return ResumeRewriteResult (
+        body: body_with_blocks(
+            body, blocks_with_rtc_returns(output, body, layout, frame_place)
+        ),
+        frame_local_id: result.frame_local_id,
+        resume_return_local_id: return_local
+    );
+}
+
+mir.MirLocalDecl[]& locals_with_rtc_return(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId return_local
+) {
+    unsafe {
+        mir.MirLocalDecl*! locals = output.alloc_local_array(
+            body.locals.length + 1
+        );
+        Int index! = 0;
+        while (index < body.locals.length) {
+            locals[index] = body.locals[index];
+            index = index + 1;
+        }
+        locals[body.locals.length] = generated_local(
+            return_local,
+            mir.MirLocalKind.return_place,
+            layout.task_abi.resume_return_type_id,
+            body.span
+        );
+        return locals[0..body.locals.length + 1];
+    }
+}
+
+mir.MirBlock[]& blocks_with_rtc_returns(
+    mir.MirStore& output,
+    mir.MirBody body,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    list.ArrayList<mir.MirBlock> blocks! =
+        list.ArrayList<mir.MirBlock>(body.blocks.length);
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        blocks.add(rtc_return_block(
+            output, body.blocks[index], layout, frame_place
+        ));
+        index = index + 1;
+    }
+    return output.block_array(blocks$.ref());
+}
+
+mir.MirBlock rtc_return_block(
+    mir.MirStore& output,
+    mir.MirBlock block,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace frame_place
+) {
+    if (block.terminator.kind is .return_term(_)) {
+        mir.MirPlace result_place = frame_field_place(
+            output, layout, frame_place, layout.return_field_index
+        );
+        return block_with_added_statements(
+            output,
+            block,
+            completion_statements(
+                output, layout, frame_place, result_place, block.terminator.span
+            ),
+            unit_return_terminator(block.terminator.span)
+        );
+    }
+    if (block.terminator.kind is .cancel_term(_)) {
+        return block_with_terminator(
+            block, unit_return_terminator(block.terminator.span)
+        );
+    }
+    return block;
+}
+
+mir.MirTerminator unit_return_terminator(token.Span span) {
+    return mir.MirTerminator (
+        span: span,
+        kind: mir.return_terminator_kind(mir.MirReturnTerminator (
+            implicit_unit: true
+        ))
+    );
+}
+
 public ResumeFunctionLowering lower_resume_function(
     mir.MirStore& output,
     mir.MirFunction source,
@@ -108,7 +237,26 @@ public CompletionFunctionLowering add_completion_function(
 ) {
     mir.MirFunctionId function_id = mir.MirFunctionId.from_index(output.functions.len());
     CompletionFunctionLowering lowered = CompletionFunctionLowering (
-        function: completion_function(output, source, layout, function_id, env_drop)
+        function: completion_function(
+            output, source, layout, function_id, env_drop, false
+        )
+    );
+    output.add_generated_function(lowered.function);
+    return lowered;
+}
+
+public CompletionFunctionLowering add_serial_completion_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionRef? env_drop,
+    qid.DefId shim_def
+) {
+    mir.MirFunctionId function_id = mir.MirFunctionId.from_index(output.functions.len());
+    CompletionFunctionLowering lowered = CompletionFunctionLowering (
+        function: serial_completion_function(
+            output, source, layout, function_id, env_drop, shim_def
+        )
     );
     output.add_generated_function(lowered.function);
     return lowered;
@@ -122,38 +270,12 @@ public CompletionFunctionLowering add_detached_completion_function(
 ) {
     mir.MirFunctionId function_id = mir.MirFunctionId.from_index(output.functions.len());
     CompletionFunctionLowering lowered = CompletionFunctionLowering (
-        function: detached_completion_function(output, source, layout, function_id, env_drop)
+        function: completion_function(
+            output, source, layout, function_id, env_drop, true
+        )
     );
     output.add_generated_function(lowered.function);
     return lowered;
-}
-
-mir.MirFunction detached_completion_function(
-    mir.MirStore& output,
-    mir.MirFunction source,
-    mir.MirCoroutineFrameLayout& layout,
-    mir.MirFunctionId function_id,
-    mir.MirFunctionRef? env_drop
-) {
-    return mir.MirFunction (
-        id: function_id,
-        def_id: source.def_id,
-        type_args: output.type_arg_array(source.type_args),
-        const_args: output.const_arg_array(source.const_args),
-        signature_id: null,
-        effects: types.EffectSet(),
-        is_coroutine: false,
-        coroutine_frame: null,
-        is_coroutine_resume: false,
-        is_coroutine_completion: true,
-        is_language_entry: false,
-        is_runtime_entry: false,
-        is_external: false,
-        inline_always: true,
-        naked: false,
-        span: source.span,
-        body: detached_completion_body(output, layout, function_id, source.span, env_drop)
-    );
 }
 
 mir.MirFunction completion_function(
@@ -161,7 +283,8 @@ mir.MirFunction completion_function(
     mir.MirFunction source,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirFunctionId function_id,
-    mir.MirFunctionRef? env_drop
+    mir.MirFunctionRef? env_drop,
+    Bool detached
 ) {
     return mir.MirFunction (
         id: function_id,
@@ -172,6 +295,8 @@ mir.MirFunction completion_function(
         effects: types.EffectSet(),
         is_coroutine: false,
         coroutine_frame: null,
+        confinement: source.confinement,
+        confinement_domain: source.confinement_domain,
         is_coroutine_resume: false,
         is_coroutine_completion: true,
         is_language_entry: false,
@@ -180,7 +305,58 @@ mir.MirFunction completion_function(
         inline_always: true,
         naked: false,
         span: source.span,
-        body: completion_body(output, layout, function_id, source.span, env_drop)
+        body: completion_body_for_kind(
+            output, layout, function_id, source.span, env_drop, detached
+        )
+    );
+}
+
+mir.MirBody completion_body_for_kind(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId function_id,
+    token.Span span,
+    mir.MirFunctionRef? env_drop,
+    Bool detached
+) {
+    if (detached) {
+        return detached_completion_body(
+            output, layout, function_id, span, env_drop
+        );
+    }
+    return completion_body(output, layout, function_id, span, env_drop, true);
+}
+
+mir.MirFunction serial_completion_function(
+    mir.MirStore& output,
+    mir.MirFunction source,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirFunctionId function_id,
+    mir.MirFunctionRef? env_drop,
+    qid.DefId shim_def
+) {
+    return mir.MirFunction (
+        id: function_id,
+        def_id: shim_def,
+        type_args: output.empty_type_args(),
+        const_args: output.empty_const_args(),
+        signature_id: null,
+        effects: types.EffectSet(),
+        is_coroutine: false,
+        coroutine_frame: null,
+        confinement: source.confinement,
+        confinement_domain: source.confinement_domain,
+        is_coroutine_resume: false,
+        is_coroutine_completion: false,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: true,
+        naked: false,
+        span: source.span,
+        body: completion_body(
+            output, layout, function_id, source.span, env_drop, false
+        )
     );
 }
 
@@ -367,79 +543,149 @@ mir.MirBlock detached_env_drop_block(
     );
 }
 
+mir.MirLocalDecl[]& completion_local_declarations(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    token.Span span,
+    Bool concurrent
+) {
+    unsafe {
+        Int local_count! = 7;
+        if (concurrent) { local_count = 9; }
+        mir.MirLocalDecl*! locals = output.alloc_local_array(local_count);
+        locals[0] = generated_local(
+            mir.MirLocalId.from_index(0),
+            .return_place,
+            layout.task_abi.resume_return_type_id,
+            span
+        );
+        locals[1] = generated_local(
+            mir.MirLocalId.from_index(1),
+            .param,
+            layout.fields[layout.continuation_context_field_index].type_id,
+            span
+        );
+        locals[2] = generated_local(
+            mir.MirLocalId.from_index(2),
+            .compiler_temp,
+            layout.task_abi.frame_pointer_type_id,
+            span
+        );
+        locals[3] = generated_local(
+            mir.MirLocalId.from_index(3),
+            .compiler_temp,
+            layout.fields[layout.state_field_index].type_id,
+            span
+        );
+        locals[4] = generated_local(
+            mir.MirLocalId.from_index(4),
+            .compiler_temp,
+            layout.task_abi.state_field.type_id,
+            span
+        );
+        locals[5] = generated_local(
+            mir.MirLocalId.from_index(5),
+            .compiler_temp,
+            layout.task_abi.state_field.type_id,
+            span
+        );
+        locals[6] = generated_local(
+            mir.MirLocalId.from_index(6),
+            .compiler_temp,
+            layout.task_abi.waiter_layout.pointer_type_id,
+            span
+        );
+        if (concurrent) {
+            locals[7] = generated_local(
+                mir.MirLocalId.from_index(7),
+                .compiler_temp,
+                layout.task_abi.state_field.type_id,
+                span
+            );
+            locals[8] = generated_local(
+                mir.MirLocalId.from_index(8),
+                .compiler_temp,
+                layout.task_abi.blocking_ack_pointer_type_id,
+                span
+            );
+        }
+        return locals[0..local_count];
+    }
+}
+
+() append_completion_result_blocks(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace task_place,
+    mir.MirLocalId return_local,
+    mir.MirLocalId frame_pointer_local,
+    mir.MirLocalId cancellation_state_local,
+    mir.MirLocalId completion_state_local,
+    mir.MirFunctionRef? env_drop,
+    mir.MirBlockId initialize_select_id,
+    mir.MirBlockId result_present_id,
+    mir.MirBlockId result_absent_id,
+    mir.MirBlockId publish_id,
+    Bool concurrent,
+    token.Span span,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    if (env_drop is .some(drop_function)) {
+        blocks.add(completion_env_drop_block(
+            output,
+            layout,
+            task_place,
+            return_local,
+            frame_pointer_local,
+            drop_function,
+            initialize_select_id,
+            span
+        ));
+    }
+    mir.MirPlace cancellation_state_place = mir.local_place(
+        cancellation_state_local, output.empty_projection()
+    );
+    blocks.add(completion_result_initialize_select_block(
+        output,
+        layout,
+        task_place,
+        cancellation_state_place,
+        initialize_select_id,
+        result_present_id,
+        result_absent_id,
+        concurrent,
+        span
+    ));
+    blocks.add(completion_result_state_block(
+        output, layout, completion_state_local, result_present_id, publish_id, 1, span
+    ));
+    blocks.add(completion_result_state_block(
+        output, layout, completion_state_local, result_absent_id, publish_id, 3, span
+    ));
+}
+
+// standard 与 fully-confined completion 共享结果/drop CFG。concurrent 只控制
+// 最终 completion word 的原子发布、blocking waiter 唤醒和 executor handoff。
 mir.MirBody completion_body(
     mir.MirStore& output,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirFunctionId function_id,
     token.Span span,
-    mir.MirFunctionRef? env_drop
+    mir.MirFunctionRef? env_drop,
+    Bool concurrent
 ) {
     unsafe {
         mir.MirLocalId return_local = mir.MirLocalId.from_index(0);
         mir.MirLocalId context_local = mir.MirLocalId.from_index(1);
-        mir.MirLocalId none_claimed_local = mir.MirLocalId.from_index(2);
-        mir.MirLocalId registering_claimed_local = mir.MirLocalId.from_index(3);
-        mir.MirLocalId armed_claimed_local = mir.MirLocalId.from_index(4);
-        mir.MirLocalId blocking_claimed_local = mir.MirLocalId.from_index(5);
-        mir.MirLocalId frame_pointer_local = mir.MirLocalId.from_index(6);
-        mir.MirLocalId cancellation_state_local = mir.MirLocalId.from_index(7);
-        mir.MirLocalId waiter_context_local = mir.MirLocalId.from_index(8);
-        mir.MirLocalId waiter_resume_local = mir.MirLocalId.from_index(9);
-        mir.MirLocalId waiter_executor_local = mir.MirLocalId.from_index(10);
-        mir.MirLocalDecl*! locals = output.alloc_local_array(11);
-        locals[0] = generated_local(
-            return_local,
-            mir.MirLocalKind.return_place,
-            layout.task_abi.resume_return_type_id,
-            span
-        );
-        locals[1] = generated_local(
-            context_local,
-            mir.MirLocalKind.param,
-            layout.fields[layout.continuation_context_field_index].type_id,
-            span
-        );
-        locals[2] = generated_local(
-            none_claimed_local, mir.MirLocalKind.compiler_temp, layout.task_abi.bool_type_id, span
-        );
-        locals[3] = generated_local(
-            registering_claimed_local, mir.MirLocalKind.compiler_temp, layout.task_abi.bool_type_id, span
-        );
-        locals[4] = generated_local(
-            armed_claimed_local, mir.MirLocalKind.compiler_temp, layout.task_abi.bool_type_id, span
-        );
-        locals[5] = generated_local(
-            blocking_claimed_local, mir.MirLocalKind.compiler_temp, layout.task_abi.bool_type_id, span
-        );
-        locals[6] = generated_local(
-            frame_pointer_local,
-            mir.MirLocalKind.compiler_temp,
-            layout.task_abi.frame_pointer_type_id,
-            span
-        );
-        locals[7] = generated_local(
-            cancellation_state_local,
-            mir.MirLocalKind.compiler_temp,
-            layout.fields[layout.state_field_index].type_id,
-            span
-        );
-        locals[8] = generated_local(
-            waiter_context_local,
-            mir.MirLocalKind.compiler_temp,
-            layout.task_abi.waiter_context_field.type_id,
-            span
-        );
-        locals[9] = generated_local(
-            waiter_resume_local,
-            mir.MirLocalKind.compiler_temp,
-            layout.task_abi.waiter_resume_field.type_id,
-            span
-        );
-        locals[10] = generated_local(
-            waiter_executor_local,
-            mir.MirLocalKind.compiler_temp,
-            layout.task_abi.waiter_executor_field.type_id,
-            span
+        mir.MirLocalId frame_pointer_local = mir.MirLocalId.from_index(2);
+        mir.MirLocalId cancellation_state_local = mir.MirLocalId.from_index(3);
+        mir.MirLocalId completion_state_local = mir.MirLocalId.from_index(4);
+        mir.MirLocalId previous_state_local = mir.MirLocalId.from_index(5);
+        mir.MirLocalId waiter_pointer_local = mir.MirLocalId.from_index(6);
+        mir.MirLocalId waiter_tag_local = mir.MirLocalId.from_index(7);
+        mir.MirLocalId blocking_ack_pointer_local = mir.MirLocalId.from_index(8);
+        mir.MirLocalDecl[]& locals = completion_local_declarations(
+            output, layout, span, concurrent
         );
         mir.MirPlace task_place = deref_frame_pointer_place(output, context_local);
         mir.MirPlace task_pointer = mir.local_place(context_local, output.empty_projection());
@@ -451,131 +697,130 @@ mir.MirBody completion_body(
         Int completion_offset! = 0;
         if (env_drop != null) { completion_offset = 1; }
         mir.MirBlockId initialize_select_id = mir.MirBlockId.from_index(completion_offset);
-        mir.MirBlockId result_initialize_id = mir.MirBlockId.from_index(completion_offset + 1);
-        mir.MirBlockId none_claim_id = mir.MirBlockId.from_index(completion_offset + 2);
-        mir.MirBlockId registering_claim_id = mir.MirBlockId.from_index(completion_offset + 3);
-        mir.MirBlockId armed_claim_id = mir.MirBlockId.from_index(completion_offset + 4);
-        mir.MirBlockId waiter_capture_id = mir.MirBlockId.from_index(completion_offset + 5);
-        mir.MirBlockId blocking_claim_id = mir.MirBlockId.from_index(completion_offset + 6);
-        mir.MirBlockId publish_id = mir.MirBlockId.from_index(completion_offset + 7);
-        mir.MirBlockId publish_notify_id = mir.MirBlockId.from_index(completion_offset + 8);
-        mir.MirBlockId publish_blocking_id = mir.MirBlockId.from_index(completion_offset + 9);
-        mir.MirBlockId return_id = mir.MirBlockId.from_index(completion_offset + 10);
-        list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(completion_offset + 11);
-        if (env_drop is .some(drop_function)) {
-            blocks.add(completion_env_drop_block(
+        mir.MirBlockId result_present_id = mir.MirBlockId.from_index(completion_offset + 1);
+        mir.MirBlockId result_absent_id = mir.MirBlockId.from_index(completion_offset + 2);
+        mir.MirBlockId publish_id = mir.MirBlockId.from_index(completion_offset + 3);
+        mir.MirBlockId classify_id = mir.MirBlockId.from_index(completion_offset + 4);
+        mir.MirBlockId wake_id = mir.MirBlockId.from_index(completion_offset + 6);
+        Int notify_offset! = 4;
+        Int return_offset! = 5;
+        Int invalid_offset! = 6;
+        Int block_count! = 7;
+        if (concurrent) {
+            notify_offset = 5;
+            return_offset = 7;
+            invalid_offset = 8;
+            block_count = 9;
+        }
+        mir.MirBlockId notify_id = mir.MirBlockId.from_index(
+            completion_offset + notify_offset
+        );
+        mir.MirBlockId return_id = mir.MirBlockId.from_index(
+            completion_offset + return_offset
+        );
+        mir.MirBlockId invalid_id = mir.MirBlockId.from_index(
+            completion_offset + invalid_offset
+        );
+        list.ArrayList<mir.MirBlock> blocks! = list.ArrayList<mir.MirBlock>(
+            completion_offset + block_count
+        );
+        append_completion_result_blocks(
+            output,
+            layout,
+            task_place,
+            return_local,
+            frame_pointer_local,
+            cancellation_state_local,
+            completion_state_local,
+            env_drop,
+            initialize_select_id,
+            result_present_id,
+            result_absent_id,
+            publish_id,
+            concurrent,
+            span,
+            blocks$.ref()
+        );
+        if (concurrent) {
+            blocks.add(completion_publish_exchange_block(
                 output,
                 layout,
-                task_place,
+                task_pointer,
+                completed_place,
+                completion_state_local,
+                previous_state_local,
+                publish_id,
+                return_id,
+                classify_id,
+                invalid_id,
+                span
+            ));
+            blocks.add(completion_classify_waiter_block(
+                output,
+                layout,
+                previous_state_local,
+                waiter_tag_local,
+                classify_id,
+                notify_id,
+                wake_id,
+                span
+            ));
+            blocks.add(completion_notify_waiter_block(
+                output,
+                layout,
+                previous_state_local,
+                waiter_pointer_local,
                 return_local,
-                frame_pointer_local,
-                drop_function,
-                initialize_select_id,
+                notify_id,
+                return_id,
+                false,
+                span
+            ));
+            blocks.add(completion_wake_block(
+                output,
+                layout,
+                completed_place,
+                previous_state_local,
+                waiter_tag_local,
+                blocking_ack_pointer_local,
+                wake_id,
+                return_id,
+                span
+            ));
+        } else {
+            blocks.add(serial_completion_publish_block(
+                output,
+                layout,
+                task_pointer,
+                completed_place,
+                completion_state_local,
+                previous_state_local,
+                publish_id,
+                return_id,
+                notify_id,
+                invalid_id,
+                span
+            ));
+            blocks.add(completion_notify_waiter_block(
+                output,
+                layout,
+                previous_state_local,
+                waiter_pointer_local,
+                return_local,
+                notify_id,
+                return_id,
+                true,
                 span
             ));
         }
-        mir.MirPlace cancellation_state_place = mir.local_place(
-            cancellation_state_local, output.empty_projection()
-        );
-        blocks.add(completion_result_initialize_select_block(
-            output,
-            layout,
-            task_place,
-            cancellation_state_place,
-            initialize_select_id,
-            result_initialize_id,
-            none_claim_id,
-            span
-        ));
-        blocks.add(completion_result_initialize_block(
-            output, layout, task_place, result_initialize_id, none_claim_id, span
-        ));
-        blocks.add(completion_waiter_claim_block(
-            output,
-            layout,
-            task_place,
-            none_claimed_local,
-            none_claim_id,
-            0,
-            4,
-            publish_id,
-            registering_claim_id,
-            span
-        ));
-        blocks.add(completion_waiter_claim_block(
-            output,
-            layout,
-            task_place,
-            registering_claimed_local,
-            registering_claim_id,
-            1,
-            3,
-            publish_id,
-            armed_claim_id,
-            span
-        ));
-        blocks.add(completion_waiter_claim_block(
-            output,
-            layout,
-            task_place,
-            armed_claimed_local,
-            armed_claim_id,
-            2,
-            3,
-            waiter_capture_id,
-            blocking_claim_id,
-            span
-        ));
-        blocks.add(completion_waiter_capture_block(
-            output,
-            layout,
-            task_place,
-            waiter_context_local,
-            waiter_resume_local,
-            waiter_executor_local,
-            waiter_capture_id,
-            publish_notify_id,
-            span
-        ));
-        blocks.add(completion_waiter_claim_block(
-            output,
-            layout,
-            task_place,
-            blocking_claimed_local,
-            blocking_claim_id,
-            5,
-            3,
-            publish_blocking_id,
-            publish_id,
-            span
-        ));
-        blocks.add(completion_publish_block(
-            output, layout, task_pointer, completed_place, publish_id, return_id, span
-        ));
-        blocks.add(completion_publish_notify_block(
-            output,
-            layout,
-            task_place,
-            task_pointer,
-            completed_place,
-            waiter_context_local,
-            waiter_resume_local,
-            waiter_executor_local,
-            return_local,
-            publish_notify_id,
-            return_id,
-            span
-        ));
-        blocks.add(completion_publish_blocking_block(
-            output, layout, task_pointer, completed_place, publish_blocking_id, return_id, span
-        ));
         blocks.add(completion_return_block(
             output, return_id, span
         ));
+        blocks.add(invalid_state_block(output, span, invalid_id));
         return mir.MirBody (
             id: mir.MirBodyId.from_index(function_id.to_index()),
             span: span,
-            locals: locals[0..11],
+            locals: locals,
             blocks: output.block_array(blocks$.ref()),
             entry: mir.MirBlockId.from_index(0),
             return_local: return_local
@@ -583,153 +828,209 @@ mir.MirBody completion_body(
     }
 }
 
-mir.MirBlock completion_waiter_claim_block(
+mir.MirBlock serial_completion_publish_block(
     mir.MirStore& output,
     mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_place,
-    mir.MirLocalId claimed_local,
+    mir.MirPlace task_pointer,
+    mir.MirPlace completed_place,
+    mir.MirLocalId completion_state_local,
+    mir.MirLocalId previous_state_local,
     mir.MirBlockId id,
-    Int expected,
-    Int desired,
-    mir.MirBlockId claimed_id,
-    mir.MirBlockId unclaimed_id,
+    mir.MirBlockId return_id,
+    mir.MirBlockId notify_id,
+    mir.MirBlockId invalid_id,
+    token.Span span
+) {
+    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(3);
+    statements.add(task_schedule_complete_store(task_pointer, span));
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(previous_state_local, output.empty_projection()),
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.copy_operand_value(mir.MirCopyOperand (place: completed_place))
+            ))
+        ))
+    ));
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: completed_place,
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(completion_state_local, output.empty_projection())
+                ))
+            ))
+        ))
+    ));
+    return completion_publish_switch_block(
+        output,
+        layout,
+        statements$.ref(),
+        previous_state_local,
+        id,
+        return_id,
+        notify_id,
+        invalid_id,
+        span
+    );
+}
+
+mir.MirBlock completion_publish_exchange_block(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirPlace task_pointer,
+    mir.MirPlace completed_place,
+    mir.MirLocalId completion_state_local,
+    mir.MirLocalId previous_state_local,
+    mir.MirBlockId id,
+    mir.MirBlockId return_id,
+    mir.MirBlockId classify_id,
+    mir.MirBlockId invalid_id,
+    token.Span span
+) {
+    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(2);
+    statements.add(task_schedule_complete_store(task_pointer, span));
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(previous_state_local, output.empty_projection()),
+            value: mir.atomic_exchange_rvalue(mir.MirAtomicExchangeRvalue (
+                place: completed_place,
+                desired: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(completion_state_local, output.empty_projection())
+                )),
+                mode: .coroutine_atomic
+            ))
+        ))
+    ));
+    return completion_publish_switch_block(
+        output,
+        layout,
+        statements$.ref(),
+        previous_state_local,
+        id,
+        return_id,
+        classify_id,
+        invalid_id,
+        span
+    );
+}
+
+mir.MirBlock completion_publish_switch_block(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    list.ArrayList<mir.MirStatement>& statements,
+    mir.MirLocalId previous_state_local,
+    mir.MirBlockId id,
+    mir.MirBlockId return_id,
+    mir.MirBlockId waiter_id,
+    mir.MirBlockId invalid_id,
+    token.Span span
+) {
+    list.ArrayList<mir.MirSwitchCase> cases! =
+        list.ArrayList<mir.MirSwitchCase>(5);
+    cases.add(mir.MirSwitchCase (
+        value: state_const(layout, span, 0), target: return_id
+    ));
+    Int invalid_state! = 1;
+    while (invalid_state <= 4) {
+        cases.add(mir.MirSwitchCase (
+            value: state_const(layout, span, invalid_state),
+            target: invalid_id
+        ));
+        invalid_state = invalid_state + 1;
+    }
+    return mir.MirBlock (
+        id: id,
+        span: span,
+        statements: output.statement_array(statements),
+        terminator: mir.MirTerminator (
+            span: span,
+            kind: mir.switch_terminator_kind(mir.MirSwitchTerminator (
+                discriminator: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(previous_state_local, output.empty_projection())
+                )),
+                cases: output.switch_case_array(cases$.ref()),
+                default_target: waiter_id
+            ))
+        )
+    );
+}
+
+mir.MirBlock completion_classify_waiter_block(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId previous_state_local,
+    mir.MirLocalId tag_local,
+    mir.MirBlockId id,
+    mir.MirBlockId notify_id,
+    mir.MirBlockId wake_id,
     token.Span span
 ) {
     list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
     statements.add(mir.MirStatement (
         span: span,
         kind: mir.assign_statement_kind(mir.MirAssignStatement (
-            destination: mir.local_place(claimed_local, output.empty_projection()),
-            value: mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
-                place: task_abi.task_state_field_place(
-                    output, task_place, layout.task_abi.waiter_registered_field
-                ),
-                expected: mir.const_operand_value(state_const(layout, span, expected)),
-                desired: mir.const_operand_value(state_const(layout, span, desired))
-            ))
-        ))
-    ));
-    return mir.MirBlock (
-        id: id,
-        span: span,
-        statements: output.statement_array(statements$.ref()),
-        terminator: mir.MirTerminator (
-            span: span,
-            kind: mir.branch_terminator_kind(mir.MirBranchTerminator (
-                condition: mir.copy_operand_value(mir.MirCopyOperand (
-                    place: mir.local_place(claimed_local, output.empty_projection())
+            destination: mir.local_place(tag_local, output.empty_projection()),
+            value: mir.binary_rvalue(mir.MirBinaryRvalue (
+                op: mir.MirBinaryOp.bit_and,
+                lhs: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(previous_state_local, output.empty_projection())
                 )),
-                then_target: claimed_id,
-                else_target: unclaimed_id
-            ))
-        )
-    );
-}
-
-mir.MirBlock completion_waiter_capture_block(
-    mir.MirStore& output,
-    mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_place,
-    mir.MirLocalId context_local,
-    mir.MirLocalId resume_local,
-    mir.MirLocalId executor_local,
-    mir.MirBlockId id,
-    mir.MirBlockId target,
-    token.Span span
-) {
-    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(3);
-    statements.add(completion_waiter_copy(
-        output, layout, task_place, context_local, layout.task_abi.waiter_context_field, span
-    ));
-    statements.add(completion_waiter_copy(
-        output, layout, task_place, resume_local, layout.task_abi.waiter_resume_field, span
-    ));
-    statements.add(completion_waiter_copy(
-        output, layout, task_place, executor_local, layout.task_abi.waiter_executor_field, span
-    ));
-    return mir.MirBlock (
-        id: id,
-        span: span,
-        statements: output.statement_array(statements$.ref()),
-        terminator: goto_terminator(span, target)
-    );
-}
-
-mir.MirStatement completion_waiter_copy(
-    mir.MirStore& output,
-    mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_place,
-    mir.MirLocalId destination,
-    mir.MirSyntheticField field,
-    token.Span span
-) {
-    return mir.MirStatement (
-        span: span,
-        kind: mir.assign_statement_kind(mir.MirAssignStatement (
-            destination: mir.local_place(destination, output.empty_projection()),
-            value: mir.use_rvalue(mir.MirUseRvalue (
-                value: mir.copy_operand_value(mir.MirCopyOperand (
-                    place: task_abi.task_state_field_place(output, task_place, field)
-                ))
+                rhs: mir.const_operand_value(state_const(layout, span, 1))
             ))
         ))
+    ));
+    return switch_block(
+        output,
+        id,
+        span,
+        statements$.ref(),
+        mir.copy_operand_value(mir.MirCopyOperand (
+            place: mir.local_place(tag_local, output.empty_projection())
+        )),
+        state_const(layout, span, 1),
+        wake_id,
+        notify_id
     );
 }
 
-mir.MirBlock completion_publish_block(
+mir.MirBlock completion_notify_waiter_block(
     mir.MirStore& output,
     mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_pointer,
-    mir.MirPlace completed_place,
-    mir.MirBlockId id,
-    mir.MirBlockId target,
-    token.Span span
-) {
-    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(2);
-    statements.add(task_schedule_complete_store(task_pointer, span));
-    statements.add(completion_state_store(layout, completed_place, 1, span));
-    return mir.MirBlock (
-        id: id,
-        span: span,
-        statements: output.statement_array(statements$.ref()),
-        terminator: goto_terminator(span, target)
-    );
-}
-
-mir.MirBlock completion_publish_notify_block(
-    mir.MirStore& output,
-    mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_place,
-    mir.MirPlace task_pointer,
-    mir.MirPlace completed_place,
-    mir.MirLocalId context_local,
-    mir.MirLocalId resume_local,
-    mir.MirLocalId executor_local,
+    mir.MirLocalId previous_state_local,
+    mir.MirLocalId pointer_local,
     mir.MirLocalId return_local,
     mir.MirBlockId id,
     mir.MirBlockId target,
+    Bool handoff,
     token.Span span
 ) {
-    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(2);
-    statements.add(task_schedule_complete_store(task_pointer, span));
-    statements.add(completion_state_store(layout, completed_place, 1, span));
+    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(pointer_local, output.empty_projection()),
+            value: mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.int_to_ptr,
+                value: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(previous_state_local, output.empty_projection())
+                )),
+                target_type: layout.task_abi.waiter_layout.pointer_type_id
+            ))
+        ))
+    ));
+    mir.MirPlace waiter = deref_frame_pointer_place(output, pointer_local);
     list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(1);
-    args.add(mir.copy_operand_value(mir.MirCopyOperand (
-        place: mir.local_place(context_local, output.empty_projection())
-    )));
+    args.add(waiter_field_operand(
+        output, waiter, layout.task_abi.waiter_layout.context_field_index
+    ));
     mir.MirCallCallee callee = mir.dynamic_task_enqueue_callee(
-        mir.copy_operand_value(mir.MirCopyOperand (
-            place: mir.local_place(executor_local, output.empty_projection())
-        )),
-        mir.copy_operand_value(mir.MirCopyOperand (
-            place: task_abi.task_state_field_place(
-                output, task_place, layout.task_abi.waiter_task_field
-            )
-        )),
-        mir.copy_operand_value(mir.MirCopyOperand (
-            place: mir.local_place(resume_local, output.empty_projection())
-        )),
-        false
+        waiter_field_operand(output, waiter, layout.task_abi.waiter_layout.executor_field_index),
+        waiter_field_operand(output, waiter, layout.task_abi.waiter_layout.task_field_index),
+        waiter_field_operand(output, waiter, layout.task_abi.waiter_layout.resume_field_index),
+        handoff
     );
     return mir.MirBlock (
         id: id,
@@ -752,26 +1053,70 @@ mir.MirBlock completion_publish_notify_block(
     );
 }
 
-mir.MirBlock completion_publish_blocking_block(
+mir.MirOperand waiter_field_operand(
+    mir.MirStore& output,
+    mir.MirPlace waiter,
+    Int field_index
+) {
+    return mir.copy_operand_value(mir.MirCopyOperand (
+        place: task_abi.projected_field_place(output, waiter, field_index)
+    ));
+}
+
+mir.MirBlock completion_wake_block(
     mir.MirStore& output,
     mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_pointer,
     mir.MirPlace completed_place,
+    mir.MirLocalId previous_state_local,
+    mir.MirLocalId untagged_word_local,
+    mir.MirLocalId ack_pointer_local,
     mir.MirBlockId id,
     mir.MirBlockId target,
     token.Span span
 ) {
     list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(4);
-    statements.add(task_schedule_complete_store(task_pointer, span));
-    statements.add(completion_state_store(layout, completed_place, 2, span));
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(untagged_word_local, output.empty_projection()),
+            value: mir.binary_rvalue(mir.MirBinaryRvalue (
+                op: mir.MirBinaryOp.bit_xor,
+                lhs: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(previous_state_local, output.empty_projection())
+                )),
+                rhs: mir.const_operand_value(state_const(layout, span, 1))
+            ))
+        ))
+    ));
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(ack_pointer_local, output.empty_projection()),
+            value: mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.int_to_ptr,
+                value: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(untagged_word_local, output.empty_projection())
+                )),
+                target_type: layout.task_abi.blocking_ack_pointer_type_id
+            ))
+        ))
+    ));
     statements.add(mir.MirStatement (
         span: span,
         kind: mir.task_wait_statement_kind(mir.MirTaskWaitStatement (
             state: completed_place,
-            wake: true
+            wake: true,
+            expected: mir.const_operand_value(state_const(layout, span, 0))
         ))
     ));
-    statements.add(completion_state_store(layout, completed_place, 1, span));
+    statements.add(mir.MirStatement (
+        span: span,
+        kind: mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
+            destination: deref_frame_pointer_place(output, ack_pointer_local),
+            value: mir.const_operand_value(state_const(layout, span, 1)),
+            mode: .coroutine_atomic
+        ))
+    ));
     return mir.MirBlock (
         id: id,
         span: span,
@@ -788,21 +1133,6 @@ mir.MirStatement task_schedule_complete_store(
         span: span,
         kind: mir.task_complete_statement_kind(mir.MirTaskCompleteStatement (
             task: task_pointer
-        ))
-    );
-}
-
-mir.MirStatement completion_state_store(
-    mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace completed_place,
-    Int value,
-    token.Span span
-) {
-    return mir.MirStatement (
-        span: span,
-        kind: mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
-            destination: completed_place,
-            value: mir.const_operand_value(state_const(layout, span, value))
         ))
     );
 }
@@ -831,18 +1161,27 @@ mir.MirBlock completion_result_initialize_select_block(
     mir.MirBlockId id,
     mir.MirBlockId initialize_id,
     mir.MirBlockId state_id,
+    Bool concurrent,
     token.Span span
 ) {
+    mir.MirPlace request = task_abi.task_state_field_place(
+        output, task_place, layout.task_abi.cancellation_requested_field
+    );
+    mir.MirRvalue request_value! = mir.use_rvalue(mir.MirUseRvalue (
+        value: mir.copy_operand_value(mir.MirCopyOperand (place: request))
+    ));
+    if (concurrent) {
+        request_value = mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
+            place: request,
+            mode: .coroutine_atomic
+        ));
+    }
     list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
     statements.add(mir.MirStatement (
         span: span,
         kind: mir.assign_statement_kind(mir.MirAssignStatement (
             destination: cancellation_state_place,
-            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
-                place: task_abi.task_state_field_place(
-                    output, task_place, layout.task_abi.cancellation_requested_field
-                )
-            ))
+            value: request_value
         ))
     ));
     return switch_block(
@@ -857,22 +1196,23 @@ mir.MirBlock completion_result_initialize_select_block(
     );
 }
 
-mir.MirBlock completion_result_initialize_block(
+mir.MirBlock completion_result_state_block(
     mir.MirStore& output,
     mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_place,
+    mir.MirLocalId completion_state_local,
     mir.MirBlockId id,
     mir.MirBlockId target,
+    Int value,
     token.Span span
 ) {
     list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
     statements.add(mir.MirStatement (
         span: span,
-        kind: mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
-            destination: task_abi.task_state_field_place(
-                output, task_place, layout.task_abi.result_initialized_field
-            ),
-            value: mir.const_operand_value(state_const(layout, span, 1))
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: mir.local_place(completion_state_local, output.empty_projection()),
+            value: mir.use_rvalue(mir.MirUseRvalue (
+                value: mir.const_operand_value(state_const(layout, span, value))
+            ))
         ))
     ));
     return mir.MirBlock (
@@ -992,6 +1332,19 @@ mir.MirPlace deref_frame_pointer_place(mir.MirStore& output, mir.MirLocalId fram
     return mir.local_place(frame_local_id, output.projection_array(projection$.ref()));
 }
 
+public mir.MirPlace resume_current_executor_place(
+    mir.MirStore& output,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirLocalId frame_local_id
+) {
+    return frame_field_place(
+        output,
+        layout,
+        deref_frame_pointer_place(output, frame_local_id),
+        layout.current_executor_field_index
+    );
+}
+
 public FrameRewriteResult add_state_machine_skeleton(
     mir.MirStore& output,
     FrameRewriteResult result,
@@ -1002,6 +1355,8 @@ public FrameRewriteResult add_state_machine_skeleton(
     mir.MirLocalId cancellation_claimed_local = mir.MirLocalId.from_index(result.body.locals.length + 1);
     mir.MirLocalId cancellation_context_local = mir.MirLocalId.from_index(result.body.locals.length + 2);
     mir.MirLocalId cancellation_result_local = mir.MirLocalId.from_index(result.body.locals.length + 3);
+    mir.MirLocalId cancellation_tag_local = mir.MirLocalId.from_index(result.body.locals.length + 4);
+    mir.MirLocalId cancellation_target_local = mir.MirLocalId.from_index(result.body.locals.length + 5);
     mir.MirLocalDecl[]& locals = locals_with_cancellation_check(
         output,
         result.body,
@@ -1009,7 +1364,9 @@ public FrameRewriteResult add_state_machine_skeleton(
         cancellation_state_local,
         cancellation_claimed_local,
         cancellation_context_local,
-        cancellation_result_local
+        cancellation_result_local,
+        cancellation_tag_local,
+        cancellation_target_local
     );
     mir.MirBlockId dispatch_id = mir.MirBlockId.from_index(result.body.blocks.length);
     mir.MirBody body = body_with_blocks(
@@ -1023,6 +1380,8 @@ public FrameRewriteResult add_state_machine_skeleton(
             cancellation_claimed_local,
             cancellation_context_local,
             cancellation_result_local,
+            cancellation_tag_local,
+            cancellation_target_local,
             dispatch_id
         )
     );
@@ -1039,10 +1398,12 @@ mir.MirLocalDecl[]& locals_with_cancellation_check(
     mir.MirLocalId state_local,
     mir.MirLocalId claimed_local,
     mir.MirLocalId context_local,
-    mir.MirLocalId result_local
+    mir.MirLocalId result_local,
+    mir.MirLocalId tag_local,
+    mir.MirLocalId target_local
 ) {
     unsafe {
-        mir.MirLocalDecl*! locals = output.alloc_local_array(body.locals.length + 4);
+        mir.MirLocalDecl*! locals = output.alloc_local_array(body.locals.length + 6);
         Int index! = 0;
         while (index < body.locals.length) {
             locals[index] = body.locals[index];
@@ -1066,7 +1427,19 @@ mir.MirLocalDecl[]& locals_with_cancellation_check(
         locals[body.locals.length + 3] = generated_local(
             result_local, mir.MirLocalKind.compiler_temp, layout.task_abi.resume_return_type_id, body.span
         );
-        return locals[0..body.locals.length + 4];
+        locals[body.locals.length + 4] = generated_local(
+            tag_local,
+            mir.MirLocalKind.compiler_temp,
+            layout.task_abi.cancel_target_word_field.type_id,
+            body.span
+        );
+        locals[body.locals.length + 5] = generated_local(
+            target_local,
+            mir.MirLocalKind.compiler_temp,
+            layout.task_abi.suspend_layout.pointer_type_id,
+            body.span
+        );
+        return locals[0..body.locals.length + 6];
     }
 }
 
@@ -1077,15 +1450,13 @@ public ResumeRewriteResult add_resume_return_skeleton(
     mir.MirCoroutineFrameLayout& layout
 ) {
     mir.MirLocalId resume_return_local_id = mir.MirLocalId.from_index(result.body.locals.length);
-    mir.MirLocalId waiter_armed_local_id = mir.MirLocalId.from_index(result.body.locals.length + 1);
-    mir.MirLocalId previous_context_local_id = mir.MirLocalId.from_index(result.body.locals.length + 2);
-    mir.MirLocalId executor_local_id = mir.MirLocalId.from_index(result.body.locals.length + 3);
+    mir.MirLocalId previous_context_local_id = mir.MirLocalId.from_index(result.body.locals.length + 1);
+    mir.MirLocalId executor_local_id = mir.MirLocalId.from_index(result.body.locals.length + 2);
     mir.MirLocalDecl[]& locals = locals_with_resume_return(
         output,
         result.body,
         layout,
         resume_return_local_id,
-        waiter_armed_local_id,
         previous_context_local_id,
         executor_local_id
     );
@@ -1104,7 +1475,6 @@ public ResumeRewriteResult add_resume_return_skeleton(
             source,
             layout,
             result.frame_local_id,
-            waiter_armed_local_id,
             previous_context_local_id,
             executor_local_id,
             resume_return_id,
@@ -1149,6 +1519,8 @@ mir.MirFunction resume_function_for_body(
         effects: types.EffectSet(),
         is_coroutine: false,
         coroutine_frame: null,
+        confinement: source.confinement,
+        confinement_domain: source.confinement_domain,
         is_coroutine_resume: true,
         is_coroutine_completion: false,
         is_language_entry: false,
@@ -1267,12 +1639,11 @@ mir.MirLocalDecl[]& locals_with_resume_return(
     mir.MirBody body,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirLocalId resume_return_local_id,
-    mir.MirLocalId waiter_armed_local_id,
     mir.MirLocalId previous_context_local_id,
     mir.MirLocalId executor_local_id
 ) {
     unsafe {
-        mir.MirLocalDecl*! locals = output.alloc_local_array(body.locals.length + 4);
+        mir.MirLocalDecl*! locals = output.alloc_local_array(body.locals.length + 3);
         Int index! = 0;
         while (index < body.locals.length) {
             locals[index] = body.locals[index];
@@ -1288,29 +1659,19 @@ mir.MirLocalDecl[]& locals_with_resume_return(
             mutable_local: true,
             address_taken: false
         );
-        locals[body.locals.length + 1] = mir.MirLocalDecl (
-            id: waiter_armed_local_id,
-            kind: mir.MirLocalKind.compiler_temp,
-            type_id: layout.task_abi.bool_type_id,
-            span: body.span,
-            name: null,
-            def_id: null,
-            mutable_local: true,
-            address_taken: false
-        );
-        locals[body.locals.length + 2] = generated_local(
+        locals[body.locals.length + 1] = generated_local(
             previous_context_local_id,
             mir.MirLocalKind.compiler_temp,
             layout.fields[layout.current_executor_field_index].type_id,
             body.span
         );
-        locals[body.locals.length + 3] = generated_local(
+        locals[body.locals.length + 2] = generated_local(
             executor_local_id,
             mir.MirLocalKind.compiler_temp,
             layout.fields[layout.current_executor_field_index].type_id,
             body.span
         );
-        return locals[0..body.locals.length + 4];
+        return locals[0..body.locals.length + 3];
     }
 }
 
@@ -1490,6 +1851,8 @@ mir.MirBlock[]& state_machine_blocks(
     mir.MirLocalId cancellation_claimed_local,
     mir.MirLocalId cancellation_context_local,
     mir.MirLocalId cancellation_result_local,
+    mir.MirLocalId cancellation_tag_local,
+    mir.MirLocalId cancellation_target_local,
     mir.MirBlockId dispatch_id
 ) {
     mir.MirBlockId invalid_state_id = mir.MirBlockId.from_index(body.blocks.length + 1);
@@ -1594,6 +1957,7 @@ mir.MirBlock[]& state_machine_blocks(
         body,
         layout,
         cancellation_state_local,
+        cancellation_tag_local,
         target_dispatch_id,
         target_invoke_id,
         child_enqueue_id
@@ -1602,7 +1966,9 @@ mir.MirBlock[]& state_machine_blocks(
         output,
         body,
         layout,
-        cancellation_context_local,
+        cancellation_state_local,
+        cancellation_tag_local,
+        cancellation_target_local,
         cancellation_result_local,
         target_invoke_id,
         cancel_return_id
@@ -1797,7 +2163,10 @@ mir.MirBlock cancellation_request_check_block(
         span: body.span,
         kind: mir.assign_statement_kind(mir.MirAssignStatement (
             destination: state_place,
-            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: request_place))
+            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
+                place: request_place,
+                mode: .coroutine_atomic
+            ))
         ))
     ));
     return switch_block(
@@ -1920,7 +2289,10 @@ mir.MirBlock inherited_cancellation_request_check_block(
         span: body.span,
         kind: mir.assign_statement_kind(mir.MirAssignStatement (
             destination: state_place,
-            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: request_place))
+            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
+                place: request_place,
+                mode: .coroutine_atomic
+            ))
         ))
     ));
     return switch_block(
@@ -1998,7 +2370,10 @@ mir.MirBlock cancellation_target_check_block(
         span: body.span,
         kind: mir.assign_statement_kind(mir.MirAssignStatement (
             destination: state,
-            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (place: target))
+            value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
+                place: target,
+                mode: .coroutine_atomic
+            ))
         ))
     ));
     list.ArrayList<mir.MirSwitchCase> cases! = list.ArrayList<mir.MirSwitchCase>(2);
@@ -2050,7 +2425,8 @@ mir.MirBlock cancellation_target_claim_block(
             value: mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
                 place: target,
                 expected: mir.copy_operand_value(mir.MirCopyOperand (place: state)),
-                desired: mir.const_operand_value(state_const(layout, body.span, 2))
+                desired: mir.const_operand_value(state_const(layout, body.span, 2)),
+                mode: .coroutine_atomic
             ))
         ))
     ));
@@ -2074,19 +2450,32 @@ mir.MirBlock cancellation_target_dispatch_block(
     mir.MirBody body,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirLocalId state_local,
+    mir.MirLocalId tag_local,
     mir.MirBlockId id,
     mir.MirBlockId invoke_id,
     mir.MirBlockId child_id
 ) {
-    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(0);
+    mir.MirPlace tag = mir.local_place(tag_local, output.empty_projection());
+    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
+    statements.add(mir.MirStatement (
+        span: body.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: tag,
+            value: mir.binary_rvalue(mir.MirBinaryRvalue (
+                op: mir.MirBinaryOp.bit_and,
+                lhs: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(state_local, output.empty_projection())
+                )),
+                rhs: mir.const_operand_value(state_const(layout, body.span, 1))
+            ))
+        ))
+    ));
     return switch_block(
         output,
         id,
         body.span,
         statements$.ref(),
-        mir.copy_operand_value(mir.MirCopyOperand (
-            place: mir.local_place(state_local, output.empty_projection())
-        )),
+        mir.copy_operand_value(mir.MirCopyOperand (place: tag)),
         state_const(layout, body.span, 1),
         invoke_id,
         child_id
@@ -2097,23 +2486,53 @@ mir.MirBlock cancellation_target_invoke_block(
     mir.MirStore& output,
     mir.MirBody body,
     mir.MirCoroutineFrameLayout& layout,
-    mir.MirLocalId context_local,
+    mir.MirLocalId state_local,
+    mir.MirLocalId tag_local,
+    mir.MirLocalId target_local,
     mir.MirLocalId result_local,
     mir.MirBlockId id,
     mir.MirBlockId return_id
 ) {
-    mir.MirPlace function = task_state_field_from_context(
-        output, context_local, layout.task_abi.cancel_target_function_field
+    mir.MirPlace tag = mir.local_place(tag_local, output.empty_projection());
+    mir.MirPlace target = mir.local_place(target_local, output.empty_projection());
+    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(2);
+    statements.add(mir.MirStatement (
+        span: body.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: tag,
+            value: mir.binary_rvalue(mir.MirBinaryRvalue (
+                op: mir.MirBinaryOp.sub,
+                lhs: mir.copy_operand_value(mir.MirCopyOperand (
+                    place: mir.local_place(state_local, output.empty_projection())
+                )),
+                rhs: mir.const_operand_value(state_const(layout, body.span, 1))
+            ))
+        ))
+    ));
+    statements.add(mir.MirStatement (
+        span: body.span,
+        kind: mir.assign_statement_kind(mir.MirAssignStatement (
+            destination: target,
+            value: mir.cast_rvalue(mir.MirCastRvalue (
+                kind: mir.MirCastKind.int_to_ptr,
+                value: mir.copy_operand_value(mir.MirCopyOperand (place: tag)),
+                target_type: layout.task_abi.suspend_layout.pointer_type_id
+            ))
+        ))
+    ));
+    mir.MirPlace record = deref_frame_pointer_place(output, target_local);
+    mir.MirPlace function = task_abi.projected_field_place(
+        output, record, layout.task_abi.suspend_layout.handler_function_field_index
     );
-    mir.MirPlace context = task_state_field_from_context(
-        output, context_local, layout.task_abi.cancel_target_context_field
+    mir.MirPlace context = task_abi.projected_field_place(
+        output, record, layout.task_abi.suspend_layout.handler_context_field_index
     );
     list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(1);
     args.add(mir.copy_operand_value(mir.MirCopyOperand (place: context)));
     return mir.MirBlock (
         id: id,
         span: body.span,
-        statements: output.empty_statements(),
+        statements: output.statement_array(statements$.ref()),
         terminator: mir.MirTerminator (
             span: body.span,
             kind: mir.call_terminator_kind(mir.MirCallTerminator (
@@ -2165,7 +2584,8 @@ mir.MirBlock cancellation_child_enqueue_block(
             destination: task_state_field_from_context(
                 output, context_local, layout.task_abi.cancellation_requested_field
             ),
-            value: mir.const_operand_value(state_const(layout, body.span, 1))
+            value: mir.const_operand_value(state_const(layout, body.span, 1)),
+            mode: .coroutine_atomic
         ))
     ));
     // 子 Task 可能在父级取得目标后完成；此时不能再等待一次不会发生的唤醒。
@@ -2176,17 +2596,18 @@ mir.MirBlock cancellation_child_enqueue_block(
             value: mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
                 place: task_state_field_from_context(
                     output, context_local, layout.task_abi.state_field
-                )
+                ),
+                mode: .coroutine_atomic
             ))
         ))
     ));
-    return switch_block(
+    return completed_state_switch_block(
         output,
         id,
         body.span,
         statements$.ref(),
         mir.copy_operand_value(mir.MirCopyOperand (place: state)),
-        state_const(layout, body.span, 1),
+        layout,
         completed_id,
         schedule_id
     );
@@ -2252,8 +2673,8 @@ mir.MirBlock cancellation_return_block(
         terminator: mir.MirTerminator (
             span: body.span,
             kind: mir.suspend_pending_terminator_kind(mir.MirSuspendPendingTerminator (
-                task: null,
-                target: id
+                target: id,
+                suspend_wake: .none
             ))
         )
     );
@@ -2306,7 +2727,8 @@ mir.MirBlock cancellation_claim_block(
             value: mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
                 place: cancellation_request_place(output, layout, frame_place),
                 expected: mir.const_operand_value(state_const(layout, body.span, 1)),
-                desired: mir.const_operand_value(state_const(layout, body.span, 2))
+                desired: mir.const_operand_value(state_const(layout, body.span, 2)),
+                mode: .coroutine_atomic
             ))
         ))
     ));
@@ -2400,6 +2822,38 @@ mir.MirBlock switch_block(
     );
 }
 
+mir.MirBlock completed_state_switch_block(
+    mir.MirStore& output,
+    mir.MirBlockId id,
+    token.Span span,
+    list.ArrayList<mir.MirStatement>& statements,
+    mir.MirOperand discriminator,
+    mir.MirCoroutineFrameLayout& layout,
+    mir.MirBlockId completed,
+    mir.MirBlockId pending
+) {
+    list.ArrayList<mir.MirSwitchCase> cases! = list.ArrayList<mir.MirSwitchCase>(2);
+    cases.add(mir.MirSwitchCase (
+        value: state_const(layout, span, 1), target: completed
+    ));
+    cases.add(mir.MirSwitchCase (
+        value: state_const(layout, span, 3), target: completed
+    ));
+    return mir.MirBlock (
+        id: id,
+        span: span,
+        statements: output.statement_array(statements),
+        terminator: mir.MirTerminator (
+            span: span,
+            kind: mir.switch_terminator_kind(mir.MirSwitchTerminator (
+                discriminator: discriminator,
+                cases: output.switch_case_array(cases$.ref()),
+                default_target: pending
+            ))
+        )
+    );
+}
+
 mir.MirSwitchCase[]& dispatch_cases(
     mir.MirStore& output,
     mir.MirBody body,
@@ -2452,7 +2906,6 @@ mir.MirBlock[]& blocks_with_resume_returns(
     mir.MirFunction source,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirLocalId frame_local_id,
-    mir.MirLocalId waiter_armed_local_id,
     mir.MirLocalId previous_context_local_id,
     mir.MirLocalId executor_local_id,
     mir.MirBlockId resume_return_id,
@@ -2469,7 +2922,6 @@ mir.MirBlock[]& blocks_with_resume_returns(
             source,
             layout,
             frame_local_id,
-            waiter_armed_local_id,
             previous_context_local_id,
             executor_local_id,
             resume_return_id,
@@ -2563,7 +3015,6 @@ mir.MirBlock block_with_resume_return(
     mir.MirFunction source,
     mir.MirCoroutineFrameLayout& layout,
     mir.MirLocalId frame_local_id,
-    mir.MirLocalId waiter_armed_local_id,
     mir.MirLocalId previous_context_local_id,
     mir.MirLocalId executor_local_id,
     mir.MirBlockId resume_return_id,
@@ -2590,26 +3041,7 @@ mir.MirBlock block_with_resume_return(
             );
         }
     }
-    if (block.terminator.kind is .suspend_pending_term(suspend_pending)) {
-        if (suspend_pending.task is .some(task_place)) {
-            return block_with_added_statements(
-                output,
-                block,
-                task_waiter_arm(
-                    output, layout, task_place, waiter_armed_local_id, block.terminator.span
-                ),
-                mir.MirTerminator (
-                    span: block.terminator.span,
-                    kind: mir.branch_terminator_kind(mir.MirBranchTerminator (
-                        condition: mir.copy_operand_value(mir.MirCopyOperand (
-                            place: mir.local_place(waiter_armed_local_id, output.empty_projection())
-                        )),
-                        then_target: suspend_return_id,
-                        else_target: suspend_pending.target
-                    ))
-                )
-            );
-        }
+    if (block.terminator.kind is .suspend_pending_term(_)) {
         return block_with_terminator(block, goto_terminator(block.terminator.span, suspend_return_id));
     }
     if (block.terminator.kind is .return_term(_)) {
@@ -2747,30 +3179,6 @@ mir.MirTerminator call_terminator_with_target(
             cleanup: call_term.cleanup
         ))
     );
-}
-
-mir.MirStatement[]& task_waiter_arm(
-    mir.MirStore& output,
-    mir.MirCoroutineFrameLayout& layout,
-    mir.MirPlace task_place,
-    mir.MirLocalId armed_local_id,
-    token.Span span
-) {
-    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
-    statements.add(mir.MirStatement (
-        span: span,
-        kind: mir.assign_statement_kind(mir.MirAssignStatement (
-            destination: mir.local_place(armed_local_id, output.empty_projection()),
-            value: mir.atomic_compare_exchange_rvalue(mir.MirAtomicCompareExchangeRvalue (
-                place: task_abi.task_field_place(
-                    output, task_place, layout.task_abi.waiter_registered_field
-                ),
-                expected: mir.const_operand_value(state_const(layout, span, 1)),
-                desired: mir.const_operand_value(state_const(layout, span, 2))
-            ))
-        ))
-    ));
-    return output.statement_array(statements$.ref());
 }
 
 mir.MirTerminator continuation_call_terminator(
@@ -3072,7 +3480,8 @@ mir.MirStatementKind rewrite_statement_kind(
         return mir.atomic_store_statement_kind(mir.MirAtomicStoreStatement (
             destination: rewrite_place_to_frame(output, layout, frame_place, atomic_store.destination),
             value: rewrite_operand(output, atomic_store.value, layout, frame_place),
-            ordering: atomic_store.ordering
+            ordering: atomic_store.ordering,
+            mode: atomic_store.mode
         ));
     }
     if (kind is .executor_leave_stmt(executor_leave)) {
@@ -3080,12 +3489,14 @@ mir.MirStatementKind rewrite_statement_kind(
     }
     if (kind is .task_suspend_stmt(suspend)) {
         return mir.task_suspend_statement_kind(mir.MirTaskSuspendStatement (
-            task: rewrite_place_to_frame(output, layout, frame_place, suspend.task)
+            task: rewrite_place_to_frame(output, layout, frame_place, suspend.task),
+            mode: suspend.mode
         ));
     }
     if (kind is .task_complete_stmt(complete)) {
         return mir.task_complete_statement_kind(mir.MirTaskCompleteStatement (
-            task: rewrite_place_to_frame(output, layout, frame_place, complete.task)
+            task: rewrite_place_to_frame(output, layout, frame_place, complete.task),
+            mode: complete.mode
         ));
     }
     if (kind is .set_discriminant_stmt(set_discriminant)) {
@@ -3112,7 +3523,8 @@ mir.MirStatementKind rewrite_statement_kind(
     if (kind is .task_wait_stmt(wait)) {
         return mir.task_wait_statement_kind(mir.MirTaskWaitStatement (
             state: rewrite_place_to_frame(output, layout, frame_place, wait.state),
-            wake: wait.wake
+            wake: wait.wake,
+            expected: rewrite_operand(output, wait.expected, layout, frame_place)
         ));
     }
     if (kind is .task_allocation_stmt(allocation)) {
@@ -3125,21 +3537,17 @@ mir.MirStatementKind rewrite_statement_kind(
     if (kind is .task_region_start_stmt(start)) {
         return mir.task_region_start_statement_kind(mir.MirTaskRegionStartStatement (
             task: rewrite_place_to_frame(output, layout, frame_place, start.task),
-            storage: start.storage
+            storage: start.storage,
+            child_resume: start.child_resume
         ));
     }
     if (kind is .task_release_stmt(release)) {
         return mir.task_release_statement_kind(mir.MirTaskReleaseStatement (
             task_pointer: rewrite_place_to_frame(output, layout, frame_place, release.task_pointer),
             frame: rewrite_place_to_frame(output, layout, frame_place, release.frame),
-            allocation_pointer: rewrite_place_to_frame(
-                output, layout, frame_place, release.allocation_pointer
-            ),
+            state: rewrite_place_to_frame(output, layout, frame_place, release.state),
             result: rewrite_place_to_frame(output, layout, frame_place, release.result),
-            result_drop: rewrite_place_to_frame(output, layout, frame_place, release.result_drop),
-            result_initialized: rewrite_place_to_frame(
-                output, layout, frame_place, release.result_initialized
-            ),
+            result_drop: release.result_drop,
             result_consumed: release.result_consumed,
             storage: release.storage
         ));
@@ -3199,13 +3607,10 @@ mir.MirTerminatorKind rewrite_terminator_kind(
         ));
     }
     if (kind is .suspend_pending_term(suspend_pending)) {
-        mir.MirPlace? task! = null;
-        if (suspend_pending.task is .some(place)) {
-            task = rewrite_place_to_frame(output, layout, frame_place, place);
-        }
         return mir.suspend_pending_terminator_kind(mir.MirSuspendPendingTerminator (
-            task: task,
-            target: suspend_pending.target
+            target: suspend_pending.target,
+            suspend_wake: suspend_pending.suspend_wake,
+            task_local: suspend_pending.task_local
         ));
     }
     if (kind is .throw_term(throw_term)) {
@@ -3227,6 +3632,8 @@ mir.MirTerminatorKind rewrite_call_terminator(
         args: rewrite_operands(output, call_term.args, layout, frame_place),
         current_effects: call_term.current_effects,
         is_suspend_point: call_term.is_suspend_point,
+        suspend_wake: call_term.suspend_wake,
+        suspend_child: call_term.suspend_child,
         task_handoff: call_term.task_handoff,
         async_start: call_term.async_start,
         destination: rewrite_place_to_frame(output, layout, frame_place, call_term.destination),
@@ -3260,7 +3667,8 @@ mir.MirCallCallee rewrite_callee(
             executor: rewrite_operand(output, enqueue.executor, layout, frame_place),
             task: rewrite_optional_operand(output, enqueue.task, layout, frame_place),
             resume: rewrite_operand(output, enqueue.resume, layout, frame_place),
-            handoff: enqueue.handoff
+            handoff: enqueue.handoff,
+            mode: enqueue.mode
         ));
     }
     return callee;
@@ -3437,7 +3845,16 @@ mir.MirRvalue rewrite_place_rvalue(
     if (value is .atomic_load_value(atomic_load)) {
         return mir.atomic_load_rvalue(mir.MirAtomicLoadRvalue (
             place: rewrite_place_to_frame(output, layout, frame_place, atomic_load.place),
-            ordering: atomic_load.ordering
+            ordering: atomic_load.ordering,
+            mode: atomic_load.mode
+        ));
+    }
+    if (value is .atomic_exchange_value(exchange)) {
+        return mir.atomic_exchange_rvalue(mir.MirAtomicExchangeRvalue (
+            place: rewrite_place_to_frame(output, layout, frame_place, exchange.place),
+            desired: rewrite_operand(output, exchange.desired, layout, frame_place),
+            ordering: exchange.ordering,
+            mode: exchange.mode
         ));
     }
     if (value is .atomic_compare_exchange_value(compare_exchange)) {
@@ -3446,7 +3863,8 @@ mir.MirRvalue rewrite_place_rvalue(
             expected: rewrite_operand(output, compare_exchange.expected, layout, frame_place),
             desired: rewrite_operand(output, compare_exchange.desired, layout, frame_place),
             success_ordering: compare_exchange.success_ordering,
-            failure_ordering: compare_exchange.failure_ordering
+            failure_ordering: compare_exchange.failure_ordering,
+            mode: compare_exchange.mode
         ));
     }
     if (value is .slice_value(slice_value)) {
@@ -3661,12 +4079,10 @@ mir.MirInlineAsmOperand rewrite_inline_asm_operand(
         return;
     }
     if (statement.kind is .task_release_stmt(release)) {
-        count_read_place(release.task_pointer, layout, plan);
-        count_read_place(release.frame, layout, plan);
-        count_read_place(release.allocation_pointer, layout, plan);
-        count_read_place(release.result, layout, plan);
-        count_read_place(release.result_drop, layout, plan);
-        count_read_place(release.result_initialized, layout, plan);
+    count_read_place(release.task_pointer, layout, plan);
+    count_read_place(release.frame, layout, plan);
+    count_read_place(release.state, layout, plan);
+    count_read_place(release.result, layout, plan);
     }
 }
 

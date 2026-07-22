@@ -7,16 +7,21 @@
 
 ## 当前实现的问题
 
-当前实现已经完成第一轮架构收敛：普通 async 直接调用复用父 continuation，调度所有权位于
-`TaskState` 的 Job header，每个 coroutine frame 不再携带独立 resume token。剩余结构性成本是：
+当前实现已经完成第一轮架构收敛：普通 async 直接调用复用父 continuation，
+scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
+调度所有权位于 `TaskState` 的 Job header，每个 coroutine frame 不再携带独立 resume token。
+剩余结构性成本是：
 
-- 普通显式 async 调用把子 frame 放在父 frame，却单独 heap 分配 TaskState。
-- observed async block heap 分配 `[TaskState, frame]`，与普通 async 调用采用不同的存储路径。
-- TaskState 对所有调用统一保留 waiter、取消、external continuation、result drop、allocation pointer
-  和 ownership 字段。即使某条路径不需要这些能力，也要支付空间和初始化成本。
-- `local_serial` 与 concurrent Task 暂时共用原子 Job 状态机，尚未生成纯 load/store 快路径。
-- Task 被消费和 coroutine 完成通过 ownership CAS 竞争最终释放者；同 serial executor 和严格结构化
-  Task 也支付同样的原子成本。
+- TaskState 对所有 scoped 调用仍统一保留并发 Job header；取消状态已经压缩为 request word 与
+  tagged target word。external continuation 和 suspend-handler payload 都已移出通用 TaskState，
+  只在实际需要时进入父 frame/当前 suspend record。
+- completion word 已合并 readiness、结果状态和唯一 waiter；剩余空间优化重点是按静态 Task 形态
+  裁剪取消字段，而不是继续压缩完成协议。
+- `local_serial` 已为 completion word、waiter registration 和结构化 Task 启动生成普通 load/store
+  专用路径。MIR 记录每个 suspend 的 direct child、Task child、跨 executor、external、dynamic 来源，
+  并通过递归 SCC 固定点计算传递执行封闭摘要。匹配调用点使用独立 confined
+  resume 变体：
+  Job schedule、request/handoff、suspend/complete 全部使用无原子协议，标准并发 ABI 保持不变。
 - 静态可追踪的 immutable async lambda 已去虚化并把 child frame 嵌入 parent frame；真正动态的
   async Fn/RawFn context 使用专用 coroutine frame ABI。同一 serial executor 的 size-class frame
   在 executor-local freelist 中复用，跨 executor、concurrent 和超大 frame 仍需完善共享 fallback。
@@ -155,6 +160,9 @@ fallback 也不能创建 Task control state 或独立 resume token。
   child frame；control state 仍由父 frame 持有。
 - control state 和 child frame 的 storage slot 都参与 CFG lifetime slot reuse。
 - parent 是唯一回收者，child completion 不释放 scoped storage，不需要 ownership CAS。
+- `local_serial` 且传递 `may_defer=false` 的 Task root 使用 run-to-completion 变体：创建表达式返回前
+  child 必然完成，因此不建立 schedule target，不注册 waiter，也不调用通用 completion shim；结果和
+  completion word 由 child 直接发布。该路径仍保持 eager Task 语义，不把 Task 改成 lazy Future。
 
 不能简单规定所有 child frame 永远 inline。
 递归 frame 会形成无限 layout；大型冷分支 frame 也可能
@@ -220,8 +228,10 @@ Task completion。最终发布之后，child、completion shim 和 queue callbac
 或 child frame。async callable completion shim 必须直接 handoff 到 external continuation 的真实 target，
 不能调用一个再发普通 request 的 wrapper，否则会留下无人接续的 `running + pending` Job。
 
-同 serial executor 的 Task 最终使用静态 `local_serial` 调度模式：schedule word、waiter 和取消状态都
-使用普通 load/store；只有跨 executor、concurrent Domain 或外部线程 callback 使用 atomic 模式。
+同 serial executor 完成的 Task 使用静态 `local_serial` completion 模式：completion word 与 waiter
+registration 使用普通 load/store。Job schedule word 仍可能被外部 callback 跨线程访问；取消链也可能
+沿 Task 内部的跨 Domain 调用传播，因此只有额外证明整个执行子图 fully-confined 后才能去原子化，
+不能从“parent 与 Task completion 同 executor”直接推出。
 
 ### ScopedTaskState
 
@@ -235,28 +245,39 @@ ScopedTaskState<T>
   result
 ```
 
-`completion_word` 是 tagged word：running sentinel、等待它的 parent frame pointer，或最终完成
-状态。parent 在写入等待关系时用 CAS 把 running 替换为自身 frame pointer；child completion 用
-一次 exchange 发布完成，并从旧值直接取得 waiter。exchange 是 TaskState 的最后一次访问，之后
-只能使用已经复制到局部值的 waiter 信息。
+`completion_word` 是 tagged word：0 表示 running，1/3 分别表示有结果/无结果完成；其余值为
+waiter record 指针。低位 0 是父 coroutine frame 内的 async waiter record，低位 1 是同步调用栈上的
+blocking acknowledgement word。parent 初始化 record 后，用一次 CAS 将其发布；child completion
+用一次 acquire-release exchange 发布终态，并从旧值直接取得唯一 waiter。
 
-当前独立的 `state`、`waiter_registered` 和 `result_initialized` 因而合并进 completion word；
-完成状态同时编码 success/cancelled/error，观察到完成就意味着 result 状态已经最终确定。
+async completion 在 exchange 后只读取 parent-owned waiter record，并以一次 runtime request 恢复
+parent，不再读取 TaskState。waiter record 参与 `TaskRegion` frame slot reuse，生命周期不重叠的
+scoped Task 不重复扩大父 frame。普通 async waiter 的完成热路径没有 waiter claim/arm CAS，也没有
+第二次原子完成写。
 
 - `ownership_state`：结构化 parent 是唯一回收者，删除。
 - `allocation_pointer`：storage plan 是 MIR/生成函数的静态事实，删除。
 - `result_drop`：drop shim 由 concrete Task result type 静态选择，不存函数指针。
-- waiter context/resume/executor：parent frame pointer 直接编码在 completion word 的旧值中。
-- external continuation：只存在于 external-async adapter layout，不进入普通 ScopedTaskState。
+- waiter context/resume/executor/task：从 TaskState 删除，改存 parent frame 的可复用 waiter record；
+  record 指针直接编码在 completion word 中。
+- external continuation：只存在于 external-async adapter capture，不进入普通 ScopedTaskState；
+  其 7 个指针随所属 TaskRegion 存活，互不重叠的 external Task 复用同一个 parent-frame slot。
+  以 64 位目标为例，普通 TaskState 因此固定减少 56 字节。
+- cancel handler context/function/frame/resume/executor：不进入 TaskState。`cancel_target_word` 的低位 0
+  表示 child TaskState，低位 1 表示当前 suspend record；claim 仍只做原有的一次 CAS。
+  handler record 自带 context/function，owner resume 所需信息复用 record 原有字段，
+  不增加第二份 payload。以 64 位目标为例，TaskState 再固定减少 40 字节；
+  suspend record 同时从 16 个机器字缩到 13 个。
 
 `cancel_target_word` 编码 cancel-requested bit 以及 inactive、handler、claimed、passive suspend
 和 child TaskState pointer。它与 completion 的并发转换不同，强行合并会增加 CAS 循环和错误
 共享。只有计数证明合并后更少原子操作时才继续压缩。
 
-同步 root 的 blocking join 不能直接复用 async waiter 协议：系统 wake 仍可能在 parent 观察状态后
-使用 word 地址。它采用 `running -> publishing -> completed`，先进入 publishing 并 wake，再以最后
-一次 release store 写 completed；waiter 被唤醒后必须等到 completed 才能回收栈上 storage。这个
-额外阶段只存在于 blocking join，不污染 coroutine-to-coroutine fast path。
+同步 root 的 blocking join 不能在看到 completed 后立即回收 storage，因为系统允许虚假唤醒，
+completion 仍可能尚未执行使用 completion-word 地址的 wake。blocking parent 因此发布低位打 tag 的
+栈上 ack 指针；completion exchange 终态后先 wake，再 release-store ack。parent 从系统 wait 返回后
+必须 acquire-load ack，只有看到 1 才能继续回收。这样既消除了地址复用 ABA，
+也让 async 热路径仍然只有一次 exchange；blocking 专用握手不会增加 TaskState 字段。
 
 ## 完成发布协议
 
@@ -314,15 +335,79 @@ reclaim: parent | self
 
 ### local_serial
 
-父子在同一个 serial executor 上执行时不存在并发访问：
+parent 与 Task completion 在同一个 serial executor 上执行时，completion word 不存在并发访问：
 
-- completion、waiter registration、cancel request 使用普通 load/store。
-- completion 发现 parent 正在等待时直接进入 scheduler 的 inline/tail-resume 路径。
+- completion publish、ready check 和 waiter registration 使用普通 load/store。
+- completion 发现 parent 正在等待时使用专用 handoff；idle parent 以一次 generation CAS 直接转为
+  running，直接 tail-resume 传入的 continuation，不发布 target、不入队、不支付第二次 CAS。
 - scoped reclaim 不执行 CAS。
 - 已同步完成的 Task，`await()` 只检查 lifecycle word 并 move result。
 
 “同为 serial Domain”不够；必须证明 executor binding 相同。不同 serial executor、concurrent
 Domain 和可能从任意线程完成的 external async 都使用 concurrent 模式。
+继承当前 executor 的 async wrapper 也可以使用 local completion；即使 wrapper 内部调用另一个
+Domain，跨 Domain continuation 必须先回到 wrapper executor，才允许发布 wrapper 的 completion word。
+这不等价于取消链 fully-confined。
+
+执行封闭摘要不是简单 Bool。继承 executor 的 wrapper 没有声明 Domain，但内部可能只调用某个
+静态 binding；因此固定点使用三态格：
+
+```text
+unconstrained               // 任意串行入口都保持独占
+requires_binding(binding)   // 入口为该 binding 时保持独占
+escaping                    // external/dynamic/冲突 binding，不能去原子化
+```
+
+递归 SCC 从 `unconstrained` 开始，遇到跨 executor、external、dynamic 或不一致的 binding 约束后
+单调下降。显式 Domain 函数会用自己的 binding 消去相同约束；不同约束直接变为 `escaping`。
+这使 `async same_domain_child()` wrapper 可在同 binding 调用点专门化，同时不会把跨 binding wrapper
+误判为本地执行。
+
+同一固定点还计算独立的传递 `may_defer` 位。它回答的不是源码中是否出现 `async`，
+而是 confined 变体从当前入口开始是否可能等待未来事件：普通同步调用不产生等待；direct child 和
+`local_serial` Task child 传播 child 的结果；external/dynamic/arbitrary wake 必然产生等待。
+改写前标记为 `cross_executor` 的边，如果其 binding 正是 confined 变体的入口约束，local variant
+会把 enqueue 改成直接 resume，因此只传播 child 的真实等待能力；声明 Domain 与所需 binding
+不一致时仍严格标记为可延迟。该证明用于生成独立的 run-to-completion 路径，
+不能直接放宽标准 resume ABI 或取消协议。
+
+无等待的非递归 direct-async DAG 使用按需生成的 `__rtc_resume_`：callee 仍接收现有 frame pointer，
+但省略 state dispatch、取消 claim、executor enter/leave 和 suspend skeleton，完成后直接返回 caller。
+递归 SCC 不生成该变体，继续使用 `musttail` handoff trampoline，保证原生栈深度为常量。标准 scheduled
+root 已经进入 executor 后，同 binding 的静态 direct-child 边也可以调用 RTC 变体；root 自身仍保留并发
+completion 和入口 executor lease，不把跨线程协议错误地降成 confined 协议。无显式 Domain 的 wrapper
+若带有逻辑上 cross-executor、但由 confinement binding 证明实际同 executor 的边，必须先按该 binding
+生成完整 confined 可达闭包，再允许外层 RTC；只生成外层变体会把 scheduler handoff 留在嵌套栈调用中，
+破坏 Job lease。纯 direct-child DAG 不额外生成 confined 副本，避免无用代码尺寸和间接分支回归。
+
+显式 `local_serial` scoped Task 统一使用 confined resume 和 serial completion。它保留 Task 的发布、等待与
+capture-env 析构协议，不再为“可能同步完成”复制一套完整协程体。只有语法上的 direct async 调用在静态
+证明整个调用 DAG 不会等待时使用 RTC resume；Task handle 一旦存在，就继续采用标准 Task ABI。这样优化
+边界由调用形态决定，不需要在 frame layout 阶段反向删除 Task 字段和伪 suspend，也避免协程体随入口协议
+成倍复制。direct-child RTC 改写仍发生在 frame liveness 与 layout 之前，因此不可达的 direct child frame
+不会被固定进 parent frame。
+
+fully-confined 变体采用 borrowed executor-context ABI。只有标准 resume、queue callback 等真实调度
+边界执行一次 `executor_enter/leave`；confined 父子、递归和 completion 链借用该 context，
+不在每层重复切换 active context。变体只能从证明为 `local_serial` 且 child resume 静态可知的
+Task root 进入。
+函数引用、Task frame 中的 resume initializer 和递归边全部重写到独立 synthetic DefId，
+不会改变标准 `_Resume/_Complete` 符号的并发语义。变体从 `local_serial` Task root 开始按可达闭包
+惰性生成；未被 local root 使用的 preserving coroutine 不增加 MIR/LLVM 函数。Task completion 已有
+独立 serial shim，不再额外复制一份无人引用的 confined completion。
+
+confined resume 与四个 local Task protocol helper 使用 LLVM internal linkage。release O2 会把 helper
+和可内联的 child resume 融入调用者，再删除独立函数副本；它们不会作为无用 runtime ABI 导出。
+confined handoff 的 target 已经处于当前 executor 的 `running` 或 `pending` lease，发布信息也已经存在，
+因此 backend 直接生成与 resume ABI 同签名的 `musttail` continuation 调用；不重复写
+executor/context/resume，不递增 generation，也不进入 runtime 调度器。`musttail` 是递归 SCC
+保持常量原生栈的硬约束，不能降级成依赖优化器猜测的普通 tail hint。
+目标 continuation 必须在返回前消费该 lease，完成或对称移交给下一层。
+
+外部取消只原子写共享 root mailbox，并请求 root resume；它不再从调用线程遍历 child TaskState。
+root 在所属 executor 内向 child 传播取消，因此 confined 子树的 cancel target 和 Job schedule
+可以使用普通 load/store。confined MIR 仍显式标记用户 `Atomic<T>` 为 `user_atomic`，只把编译器生成的
+coroutine protocol 操作降为 local，不能借执行封闭证明削弱用户原子的内存语义。
 
 ### concurrent
 
@@ -387,20 +472,32 @@ Task cleanup CFG 必须先于 coroutine suspend-point collection 和 frame liven
 
 1. 已完成：固定结构化 Task 语义，禁止 forget，并为 scope/return/throw/cancel 建立
    cancel-all-then-join CFG。
-2. 先把 scoped reclaim 改为 parent-only：completion 不再释放 TaskState，join 后由 parent 回收。
+2. 已完成：scoped reclaim 改为 parent-only，completion 不再释放 TaskState，join 后由 parent 回收。
    同时建立“最终完成发布后零访问”协议；
    这一步即使暂时保留 heap allocation 也必须成立。
-3. 增加 TaskRegion analysis 和 storage plan，再让 scoped Task control state 进入父 frame/栈。
+3. 已完成：增加 TaskRegion analysis 和 storage plan，让 scoped Task control state 与静态 child frame
+   进入父 frame。
 4. 进行中：普通 async、async block、async Fn/RawFn 统一消费 storage plan；非泛型递归回边已经使用
    heap frame + Job handoff，静态 immutable async lambda 已去虚化，真正动态 frame 仍需接入统一
    placement/allocator。
-5. 删除 scoped ownership CAS、allocation pointer 和 result-drop 函数指针，合并 completion word。
-6. 实现 `local_serial` 与 `concurrent` 两套静态 lowering。
+5. 已完成：删除 scoped ownership CAS、allocation pointer、result-drop 函数指针、
+   result-initialized 原子字、通用 external continuation 和固定 cancel-handler payload；waiter 协议已合并
+   进 completion word，waiter/adapter record 都由 parent frame 按 TaskRegion 复用，cancel handler 直接
+   由 tagged target word 指向 suspend record。
+6. 进行中：`local_serial` 与 `concurrent` 生成不同 completion/join lowering；同 binding serial
+   completion 使用普通 load/store，显式跨 binding、concurrent Domain、external async 保留
+   acquire/release 协议。传递执行封闭分析、递归 SCC/binding 固定点和独立 confined
+   resume 变体已经接通并按 local-root 可达闭包惰性生成；confined Task 的 start、request、handoff、
+   suspend、complete 与 cancel propagation 均使用无原子协议，并消除了父子 resume 间重复的
+   executor enter/leave。传递 `may_defer` 固定点、非递归 direct-async DAG 的最小 RTC resume，以及
+   direct-child fusion 已经接通；standard scheduled root 持有 executor 后可以直调 RTC child，并在 layout
+   前删除不再跨 suspend 的 direct-child frame slot。显式 scoped Task 不生成专用 RTC 协程体，统一使用
+   confined resume 与 serial completion。递归 SCC 保留 `musttail` trampoline，不能退回原生递归栈。
 7. 已完成：删除 resume token；用 Task JobHeader 统一并发调度，AsyncContext 只保存函数状态，
    completion callback 通过 handoff 对称转移。
 8. 已完成：dynamic async callable、非泛型 recursive backedge 和 detached frame 接入 coroutine
    size-class allocator；serial local pool 为零原子热路径，concurrent/cross-executor 使用 ABA-safe
-   shared pool。后续用 compiler wide-atomic intrinsic 替换 macOS provider 的过渡 OSAtomic 实现。
+   shared pool。调度器统一通过语言层 atomic intrinsic 实现，不依赖特定系统的队列原语。
 9. 最后基于 profile 调整 parent-frame/heap-frame placement，不用固定大小阈值代替证据。
 
 每一步都必须保持同一套 Task lifecycle 语义；
@@ -424,7 +521,12 @@ storage、sync 和 reclaim policy 可以静态特化，但不能
 - direct async call：0 TaskState allocation，0 ownership CAS；
   acyclic known callee 为 0 frame allocation，recursive/dynamic callee 最多 1 次。
 - scoped Task：0 control-state allocation，0 ownership CAS。
-- 同 serial executor scoped Task：join/completion 路径 0 atomic operation。
+- 同 serial executor scoped Task：completion word/join registration 0 atomic operation；传递证明
+  fully-confined 后，整个 join/completion 路径 0 atomic operation。
+- `may_defer=false` scoped Task：沿 confined resume 与 serial completion 执行，不复制专用协程体；若 profile
+  证明 Task ABI 本身是瓶颈，再设计调用 RTC core 的薄适配层，不能复制 body 或在 layout 后删除协议字段。
+- `may_defer=false` direct child：标准 scheduled root 内 0 child handoff、0 child state dispatch，child frame
+  不进入 parent frame layout；scheduled root 自身仍保留一次 executor enter/leave 和 concurrent completion。
 - concurrent scheduling：0 resume-token allocation。
 - known acyclic child frame：允许 0 child-frame allocation，并验证 slot reuse。
 - known immutable async lambda：调用热路径 0 child-frame allocation、0 indirect start call，并验证

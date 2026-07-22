@@ -25,6 +25,23 @@ import llvm_type = "./type.jiang";
 import llvm_value = "./value.jiang";
 import std;
 
+Bool local_task_protocol_symbol(UInt8[]& name) {
+    if (string.equal(name, "__jiang_runtime_task_suspend_local")) { return true; }
+    if (string.equal(name, "__jiang_runtime_task_complete_local")) { return true; }
+    if (string.equal(name, "__jiang_runtime_task_request_local")) { return true; }
+    return string.equal(name, "__jiang_runtime_task_handoff_local");
+}
+
+Bool text_starts_with(UInt8[]& text, UInt8[]& prefix) {
+    if (text.length < prefix.length) { return false; }
+    Int index! = 0;
+    while (index < prefix.length) {
+        if (text[index] != prefix[index]) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
 public Bool lower_module(context.CompilerContext& ctx, mir.MirStore& store) {
     LlvmLowerer lowerer! = LlvmLowerer(ctx, true, "default-target");
     return lowerer.lower_module(store);
@@ -519,6 +536,7 @@ struct LlvmLowerer: Movable {
             llvm_abi.add_function_attributes(state$.ref(), llvm_function, function_abi$.ref());
             self.add_inline_attribute(function, llvm_function);
             self.add_naked_attribute(function, llvm_function);
+            self.add_internal_linkage(function, name.bytes(), llvm_function);
             self.declared_function_indexes.set(
                 symbol.function_symbol_key(self.ctx, function),
                 self.declared_function_values.len()
@@ -536,6 +554,26 @@ struct LlvmLowerer: Movable {
     () add_naked_attribute(self, mir.MirFunction& function, ffi.Value llvm_function) {
         if (!function.naked) { return; }
         ffi.function_add_enum_attribute(self.llvm_context$.ref(), llvm_function, -1, "naked");
+    }
+
+    () add_internal_linkage(
+        self,
+        mir.MirFunction& function,
+        UInt8[]& name,
+        ffi.Value llvm_function
+    ) {
+        if (!local_task_protocol_symbol(name) && !self.function_is_local_variant(function)) {
+            return;
+        }
+        ffi.value_set_internal_linkage(llvm_function);
+    }
+
+    Bool function_is_local_variant(self, mir.MirFunction& function) {
+        qid.SymbolId symbol_id = self.ctx.store.defs.get(function.def_id).name.symbol;
+        UInt8[]& name = self.ctx.store.symbols.text(symbol_id);
+        if (text_starts_with(name, "__confined_resume_")) { return true; }
+        if (text_starts_with(name, "__rtc_resume_")) { return true; }
+        return text_starts_with(name, "__serial_task_complete_");
     }
 
     std.String function_symbol_name(self, mir.MirFunction& function) {
@@ -774,6 +812,9 @@ struct LlvmLowerer: Movable {
                 state$.ref(), body, atomic_store.destination, local_slots
             );
             ffi.Value value = llvm_value.lower_operand(state$.ref(), body, atomic_store.value, local_slots);
+            if (atomic_store.mode == .coroutine_local) {
+                return ffi.value_valid(ffi.builder_build_store(state.builder, value, pointer));
+            }
             return ffi.value_valid(ffi.builder_build_atomic_store(
                 state.builder,
                 value,
@@ -828,7 +869,10 @@ struct LlvmLowerer: Movable {
             ffi.Value pointer = llvm_place.lower_place_pointer(state$.ref(), body, wait.state, local_slots);
             if (!ffi.value_valid(pointer)) { return false; }
             if (wait.wake) { return self.lower_task_wake(pointer); }
-            return self.lower_task_wait(pointer);
+            ffi.Value expected = llvm_value.lower_operand(
+                state$.ref(), body, wait.expected, local_slots
+            );
+            return self.lower_task_wait(pointer, expected);
         }
         if (statement.kind is .task_allocation_stmt(allocation)) {
             mir.MirRvalue value = mir.alloc_box_rvalue(mir.MirAllocBoxRvalue (
@@ -868,7 +912,11 @@ struct LlvmLowerer: Movable {
             mir.copy_operand_value(mir.MirCopyOperand (place: suspend.task)),
             local_slots
         );
-        ffi.Value runtime = ffi.module_get_function(state.module, "__jiang_runtime_task_suspend");
+        UInt8[]& runtime_name! = "__jiang_runtime_task_suspend";
+        if (suspend.mode == .local) {
+            runtime_name = "__jiang_runtime_task_suspend_local";
+        }
+        ffi.Value runtime = ffi.module_get_function(state.module, runtime_name);
         if (!ffi.value_valid(task_value) || !ffi.value_valid(runtime)) { return false; }
         ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context);
         list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(1);
@@ -892,7 +940,11 @@ struct LlvmLowerer: Movable {
             mir.copy_operand_value(mir.MirCopyOperand (place: complete.task)),
             local_slots
         );
-        ffi.Value runtime = ffi.module_get_function(state.module, "__jiang_runtime_task_complete");
+        UInt8[]& runtime_name! = "__jiang_runtime_task_complete";
+        if (complete.mode == .local) {
+            runtime_name = "__jiang_runtime_task_complete_local";
+        }
+        ffi.Value runtime = ffi.module_get_function(state.module, runtime_name);
         if (!ffi.value_valid(task_value) || !ffi.value_valid(runtime)) { return false; }
         ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context);
         list.ArrayList<ffi.Type> params! = list.ArrayList<ffi.Type>(1);
@@ -907,8 +959,8 @@ struct LlvmLowerer: Movable {
         ));
     }
 
-    Bool lower_task_wait(self, ffi.Value state_pointer) {
-        if (self.target_is_apple()) { return self.lower_darwin_task_wait(state_pointer); }
+    Bool lower_task_wait(self, ffi.Value state_pointer, ffi.Value expected) {
+        if (self.target_is_apple()) { return self.lower_darwin_task_wait(state_pointer, expected); }
         self.add_codegen_error(
             "blocking Task wait is not implemented for this target",
             "llvm_task_wait_target_unsupported"
@@ -916,7 +968,7 @@ struct LlvmLowerer: Movable {
         return false;
     }
 
-    Bool lower_darwin_task_wait(self, ffi.Value state_pointer) {
+    Bool lower_darwin_task_wait(self, ffi.Value state_pointer, ffi.Value expected) {
         if (!self.target_is_apple()) {
             self.add_codegen_error(
                 "blocking Task wait is not implemented for this target",
@@ -937,7 +989,7 @@ struct LlvmLowerer: Movable {
         list.ArrayList<ffi.Value> args! = list.ArrayList<ffi.Value>(4);
         args.add(ffi.const_int(int32_type, 1));
         args.add(state_pointer);
-        args.add(ffi.const_int(int64_type, 0));
+        args.add(expected);
         args.add(ffi.const_int(int32_type, 0));
         return ffi.value_valid(ffi.builder_build_call(
             self.builder$.ref(), function_type, function, args$.ref()
@@ -1031,10 +1083,15 @@ struct LlvmLowerer: Movable {
         if (!self.lower_task_result_drop(state, body, llvm_function, release, local_slots)) { return false; }
         Bool owns_allocation = release.storage.control == .heap || release.storage.frame == .heap;
         if (!owns_allocation) { return true; }
+        // Heap control 以 TaskState 开头；只有 frame 在 heap 时，frame pointer 就是分配基址。
+        mir.MirPlace allocation! = release.frame;
+        if (release.storage.control == .heap) {
+            allocation = release.task_pointer;
+        }
         ffi.Value pointer = llvm_value.lower_operand(
             state,
             body,
-            mir.copy_operand_value(mir.MirCopyOperand (place: release.allocation_pointer)),
+            mir.copy_operand_value(mir.MirCopyOperand (place: allocation)),
             local_slots
         );
         if (!ffi.value_valid(pointer)) { return false; }
@@ -1050,16 +1107,23 @@ struct LlvmLowerer: Movable {
         list.ArrayList<ffi.Value>& local_slots
     ) {
         if (release.result_consumed) { return true; }
-        ffi.Value initialized_pointer = llvm_place.lower_place_pointer(
-            state, body, release.result_initialized, local_slots
+        ffi.Value completed_pointer = llvm_place.lower_place_pointer(
+            state, body, release.state, local_slots
         );
-        ffi.Type initialized_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
-        if (!ffi.value_valid(initialized_pointer) || !ffi.type_valid(initialized_type)) { return false; }
-        ffi.Value initialized = ffi.builder_build_atomic_load(
-            state.builder, initialized_type, initialized_pointer, Int32(4)
-        );
+        ffi.Type completed_type = llvm_type.lower_type(state, self.ctx.store.types.int_type());
+        if (!ffi.value_valid(completed_pointer) || !ffi.type_valid(completed_type)) { return false; }
+        ffi.Value completed!;
+        if (release.storage.sync == .concurrent) {
+            completed = ffi.builder_build_atomic_load(
+                state.builder, completed_type, completed_pointer, Int32(4)
+            );
+        } else {
+            completed = ffi.builder_build_load(
+                state.builder, completed_type, completed_pointer
+            );
+        }
         ffi.Value should_drop = ffi.builder_build_icmp(
-            state.builder, 33, initialized, ffi.const_int(initialized_type, 0)
+            state.builder, 32, completed, ffi.const_int(completed_type, 1)
         );
         ffi.BasicBlock drop_block = ffi.context_append_block(
             state.llvm_context, llvm_function, "task.result.drop"
@@ -1091,12 +1155,7 @@ struct LlvmLowerer: Movable {
         list.ArrayList<ffi.Value>& local_slots
     ) {
         ffi.Type pointer_type = ffi.context_pointer_type(state.llvm_context);
-        ffi.Value drop_function = llvm_value.lower_operand(
-            state,
-            body,
-            mir.copy_operand_value(mir.MirCopyOperand (place: release.result_drop)),
-            local_slots
-        );
+        ffi.Value drop_function = llvm_value.function_value_for_ref(state, release.result_drop);
         ffi.Value result_pointer = llvm_place.lower_place_pointer(
             state, body, release.result, local_slots
         );

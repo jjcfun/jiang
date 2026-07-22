@@ -46,6 +46,7 @@ public Bool initialize() {
     runtime_state.group = thread.create_group();
     if (!domain_executor.initialize()) { return false; }
     run_scheduled_continuation(null);
+    keep_local_task_abi_reachable(false);
     runtime_state.initialized = true;
     return true;
 }
@@ -100,6 +101,18 @@ public () handoff(
         return;
     }
     UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    if (target_can_inline(task, executor, context, true)) {
+        while (true) {
+            Int*! state = task_word(task, schedule_state_word);
+            Int observed = thread.atomic_load(state);
+            if (schedule_kind(observed) != schedule_idle) { break; }
+            Int running = schedule_next(observed, schedule_running);
+            if (!thread.atomic_compare_exchange(state, observed, running)) { continue; }
+            store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
+            invoke_resume(resume, context);
+            return;
+        }
+    }
     Int publishing = claim_handoff(task);
     if (publishing < 0) { return; }
     publish_target(task, executor, context, resume);
@@ -158,6 +171,141 @@ public () complete_task(Void* raw_task) {
     }
 }
 
+// confined 变体只有单一 serial executor 能访问调度字；保留状态机语义但不付原子成本。
+@link_symbol("__jiang_runtime_task_suspend_local")
+@inline(always)
+() suspend_task_local(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int state = load_word(task, schedule_state_word);
+    Int kind = schedule_kind(state);
+    if (kind == schedule_running) {
+        store_word(task, schedule_state_word, schedule_as(state, schedule_idle));
+        return;
+    }
+    if (kind == schedule_pending) {
+        store_word(task, schedule_state_word, schedule_as(state, schedule_running));
+        invoke_published_target(task);
+        return;
+    }
+    if (kind == schedule_completed) { return; }
+    assert(false);
+}
+
+@link_symbol("__jiang_runtime_task_complete_local")
+@inline(always)
+() complete_task_local(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int state = load_word(task, schedule_state_word);
+    Int kind = schedule_kind(state);
+    if (kind == schedule_running || kind == schedule_pending) {
+        store_word(task, schedule_state_word, schedule_as(state, schedule_completed));
+        return;
+    }
+    if (kind == schedule_completed) { return; }
+    assert(false);
+}
+
+// confined 调用链已经持有唯一 serial executor；本地 request 只发布下一次运行，
+// 不进入跨线程 publishing 状态，也不执行原子 RMW。
+@link_symbol("__jiang_runtime_task_request_local")
+@inline(always)
+() request_local(
+    Void* executor,
+    Void* raw_task,
+    Void* context,
+    Void* resume
+) {
+    if (raw_task == null) {
+        invoke_resume(resume, context);
+        return;
+    }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int state = load_word(task, schedule_state_word);
+    Int kind = schedule_kind(state);
+    if (kind == schedule_idle) {
+        publish_and_invoke_local(task, executor, context, resume, state);
+        return;
+    }
+    if (kind == schedule_running) {
+        publish_target(task, executor, context, resume);
+        store_word(task, schedule_state_word, schedule_next(state, schedule_pending));
+        return;
+    }
+    if (kind == schedule_pending) {
+        assert(published_target_matches(task, executor, context, resume));
+        return;
+    }
+    if (kind == schedule_completed) { return; }
+    assert(false);
+}
+
+// local handoff 是对当前 executor 的对称转移。目标已经持有发布信息，
+// 因而这里只需直接调用 continuation，不需要重新发布协议槽或递增 generation。
+@link_symbol("__jiang_runtime_task_handoff_local")
+@inline(always)
+() handoff_local(
+    Void* executor,
+    Void* raw_task,
+    Void* context,
+    Void* resume
+) {
+    if (raw_task == null) {
+        invoke_resume(resume, context);
+        return;
+    }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int state = load_word(task, schedule_state_word);
+    Int kind = schedule_kind(state);
+    if (kind == schedule_completed) { return; }
+    if (!local_handoff_kind(kind)) {
+        assert(false);
+        return;
+    }
+    invoke_resume(resume, context);
+}
+
+Bool local_handoff_kind(Int kind) {
+    return kind == schedule_running || kind == schedule_pending;
+}
+
+@inline(always)
+() publish_and_invoke_local(
+    UInt8* task,
+    Void* executor,
+    Void* context,
+    Void* resume,
+    Int state
+) {
+    publish_target(task, executor, context, resume);
+    store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
+    store_word(task, schedule_state_word, schedule_next(state, schedule_running));
+    invoke_resume(resume, context);
+}
+
+// backend 以固定 symbol 生成 local protocol call；这个不可执行锚点只负责让
+// private Jiang 定义进入 MIR，O2 会连同已内联后的独立函数副本一起删除。
+() keep_local_task_abi_reachable(Bool enabled) {
+    if (!enabled) { return; }
+    suspend_task_local(null);
+    complete_task_local(null);
+    request_local(null, null, null, null);
+    handoff_local(null, null, null, null);
+}
+
+() invoke_published_target(UInt8* task) {
+    store_word(
+        task,
+        schedule_active_executor_word,
+        unsafe { load_pointer(task, schedule_executor_word)$.as(Int) }
+    );
+    invoke_resume(
+        load_pointer(task, schedule_resume_word),
+        load_pointer(task, schedule_context_word)
+    );
+}
+
 @link_symbol("__jiang_runtime_scheduled_continuation_resume")
 () run_scheduled_continuation(Void* raw_continuation) {
     if (raw_continuation == null) { return; }
@@ -209,6 +357,11 @@ Int claim_handoff(UInt8* task) {
         Int*! state = task_word(task, schedule_state_word);
         Int observed = thread.atomic_load(state);
         Int kind = schedule_kind(observed);
+        if (kind == schedule_idle) {
+            Int publishing = schedule_next(observed, schedule_publishing_handoff);
+            if (!thread.atomic_compare_exchange(state, observed, publishing)) { continue; }
+            return publishing;
+        }
         if (kind == schedule_running || kind == schedule_pending) {
             Int publishing = schedule_next(observed, schedule_publishing_handoff);
             if (thread.atomic_compare_exchange(
