@@ -314,7 +314,7 @@ async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` �
 - `T^`：可以 move 到另一个 domain，前提是 `T` 可安全跨 domain 移动。
 - `Fn` / `Fn^`：根据参数类型和捕获 environment 判断是否能跨 domain。
 - `T*` / `T*!`：跨 domain 需要 `unsafe` 边界。
-- `Atomic<T>` / `Mutex`：由标准库或 runtime 声明为同步安全入口。
+- `Atomic<T>` / `Mutex<T>`：由标准库或 runtime 声明为同步安全入口。
 
 `sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T&!` 带入 `D`。
 等待不为普通引用增加跨 domain 同步语义。
@@ -496,7 +496,7 @@ completion/cancel acknowledgement 仍负责确认外部系统不再持有 contin
 才能进入 unwind。当前不提供类型级 `Cancellable` trait；每个 suspend operation 独立注册 handler，
 避免强迫一个类型的多个 async 方法共享一个 cancel 方法。
 
-跨 domain 共享可变状态不使用普通 `T&!` 表达。0.4.8 需要共享时使用 `Mutex`、`Atomic<T>` 或
+跨 domain 共享可变状态不使用普通 `T&!` 表达。0.4.8 需要共享时使用 `Mutex<T>`、`Atomic<T>` 或
 move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃逸时显式进入 `unsafe`。
 
 ## Actor 与 Isolate

@@ -1,7 +1,7 @@
 // 判断类型值中是否可能携带 borrow。
 //
-// checker 只关心一个 place 的值是否可能把 active loan 传播到另一个 place；
-// named/tuple/array 等类型结构的递归细节集中放在这里。
+// 查询只计算 borrow shape，不创建替换后的 TypeId。泛型实例通过局部符号
+// 绑定环境解释字段类型，避免 borrow check 再执行一次完整类型替换。
 
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
@@ -21,99 +21,231 @@ public struct BorrowCarryQuery: Copyable {
     }
 
     public Bool type_may_carry_borrow(self, qid.TypeId type_id) {
-        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
-        return self.type_may_carry_borrow_inner(type_id, visiting$.ref());
+        return self.borrow_shape(type_id) != .no_borrow;
     }
 
-    Bool type_may_carry_borrow_inner(self, qid.TypeId type_id, list.ArrayList<qid.DefId>& visiting) {
+    public typeck_store.BorrowShape borrow_shape(self, qid.TypeId type_id) {
+        if (self.typeck.borrow_shape(type_id) is .some(shape)) { return shape; }
+        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.DefId> binding_defs! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.TypeId> binding_types! = list.ArrayList<qid.TypeId>();
+        typeck_store.BorrowShape shape = self.borrow_shape_inner(
+            type_id,
+            visiting$.ref(),
+            binding_defs$.ref(),
+            binding_types$.ref()
+        );
+        self.typeck.set_borrow_shape(type_id, shape);
+        return shape;
+    }
+
+    typeck_store.BorrowShape borrow_shape_inner(
+        self,
+        qid.TypeId type_id,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         if (info.data is .trait_companion(companion)) {
-            if (companion.kind == .any) { return true; }
-            return companion.kind == .receiver;
+            if (companion.kind == .any || companion.kind == .receiver) { return .may_borrow; }
+            return .no_borrow;
         }
         if (info.data is .handle_type(handle)) {
-            return self.handle_type_may_carry_borrow(handle);
+            return self.handle_borrow_shape(handle);
         }
         if (info.data is .optional(optional)) {
-            return self.type_may_carry_borrow_inner(optional.element, visiting);
+            return self.borrow_shape_inner(optional.element, visiting, binding_defs, binding_types);
         }
         if (info.data is .error_union(error_union)) {
-            return self.type_may_carry_borrow_inner(error_union.value, visiting)
-                || self.type_may_carry_borrow_inner(error_union.error, visiting);
+            typeck_store.BorrowShape value = self.borrow_shape_inner(
+                error_union.value, visiting, binding_defs, binding_types
+            );
+            typeck_store.BorrowShape error = self.borrow_shape_inner(
+                error_union.error, visiting, binding_defs, binding_types
+            );
+            return self.merge_shapes(value, error);
         }
         if (info.data is .array_type(array_type)) {
-            return self.type_may_carry_borrow_inner(array_type.element, visiting);
+            return self.borrow_shape_inner(array_type.element, visiting, binding_defs, binding_types);
         }
         if (info.data is .tuple_type(tuple_type)) {
-            return self.tuple_type_may_carry_borrow(tuple_type, visiting);
+            return self.tuple_borrow_shape(tuple_type, visiting, binding_defs, binding_types);
         }
         if (info.data is .function_type(function_type)) {
-            return function_type.kind == .closure;
+            if (function_type.kind == .closure) { return .may_borrow; }
+            return .no_borrow;
         }
         if (info.data is .named(named)) {
-            return self.named_type_may_carry_borrow(named, visiting);
+            return self.named_borrow_shape(named, visiting, binding_defs, binding_types);
         }
-        return false;
+        return .no_borrow;
     }
 
-    Bool handle_type_may_carry_borrow(self, types.HandleType handle) {
-        if (types.is_reference_handle(handle)) { return true; }
-        if (types.is_slice_handle(handle)) { return true; }
-        return types.is_raw_pointer_handle(handle);
+    typeck_store.BorrowShape handle_borrow_shape(self, types.HandleType handle) {
+        if (types.is_reference_handle(handle)) { return .may_borrow; }
+        if (types.is_slice_handle(handle)) { return .may_borrow; }
+        return .no_borrow;
     }
 
-    Bool tuple_type_may_carry_borrow(self, types.TupleType tuple_type, list.ArrayList<qid.DefId>& visiting) {
+    typeck_store.BorrowShape tuple_borrow_shape(
+        self,
+        types.TupleType tuple_type,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        typeck_store.BorrowShape result! = .no_borrow;
         Int index! = 0;
         while (index < tuple_type.items.length) {
-            if (self.type_may_carry_borrow_inner(tuple_type.items[index], visiting)) {
-                return true;
-            }
+            typeck_store.BorrowShape item = self.borrow_shape_inner(
+                tuple_type.items[index], visiting, binding_defs, binding_types
+            );
+            result = self.merge_shapes(result, item);
+            if (result == .may_borrow) { return result; }
             index = index + 1;
         }
-        return false;
-    }
-
-    Bool named_type_may_carry_borrow(self, types.NamedType named, list.ArrayList<qid.DefId>& visiting) {
-        if (self.borrow_type_stack_has(visiting, named.def_id)) {
-            return false;
-        }
-        Int depth = visiting.len();
-        visiting.add(named.def_id);
-        Bool result = self.named_members_may_carry_borrow(named.def_id, visiting);
-        visiting.truncate(depth);
         return result;
     }
 
-    Bool named_members_may_carry_borrow(self, qid.DefId def_id, list.ArrayList<qid.DefId>& visiting) {
-        guard self.ctx.store.hirs.def(def_id) is .some(hir_def) else { return false; }
+    typeck_store.BorrowShape named_borrow_shape(
+        self,
+        types.NamedType named,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        if (self.generic_param_type(named.def_id)) {
+            guard self.bound_type(named.def_id, binding_defs, binding_types) is .some(bound) else {
+                return .unknown;
+            }
+            return self.borrow_shape_inner(bound, visiting, binding_defs, binding_types);
+        }
+        if (self.borrow_type_stack_has(visiting, named.def_id)) { return .no_borrow; }
+        guard self.ctx.store.hirs.def(named.def_id) is .some(hir_def) else { return .no_borrow; }
+        Int visit_depth = visiting.len();
+        Int binding_depth = binding_defs.len();
+        visiting.add(named.def_id);
+        self.bind_named_type_args(hir_def, named, binding_defs, binding_types);
+        typeck_store.BorrowShape result = self.named_members_borrow_shape(
+            hir_def, visiting, binding_defs, binding_types
+        );
+        binding_defs.truncate(binding_depth);
+        binding_types.truncate(binding_depth);
+        visiting.truncate(visit_depth);
+        return result;
+    }
+
+    () bind_named_type_args(
+        self,
+        hir.HirDef& hir_def,
+        types.NamedType named,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        Int param_index! = 0;
+        Int type_index! = 0;
+        while (param_index < hir_def.generic_params.len() && type_index < named.type_args.length) {
+            qid.DefId param_def = hir_def.generic_params.get(param_index);
+            param_index = param_index + 1;
+            if (!self.generic_param_type(param_def)) { continue; }
+            qid.TypeId concrete = self.resolve_bound_type(
+                named.type_args[type_index], binding_defs, binding_types
+            );
+            binding_defs.add(param_def);
+            binding_types.add(concrete);
+            type_index = type_index + 1;
+        }
+    }
+
+    qid.TypeId resolve_bound_type(
+        self,
+        qid.TypeId type_id,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .named(named) else { return type_id; }
+        guard self.bound_type(named.def_id, binding_defs, binding_types) is .some(bound) else {
+            return type_id;
+        }
+        return bound;
+    }
+
+    qid.TypeId? bound_type(
+        self,
+        qid.DefId param_def,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        Int index! = binding_defs.len();
+        while (index > 0) {
+            index = index - 1;
+            if (binding_defs.get(index).to_index() == param_def.to_index()) {
+                return binding_types.get(index);
+            }
+        }
+        return null;
+    }
+
+    typeck_store.BorrowShape named_members_borrow_shape(
+        self,
+        hir.HirDef& hir_def,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        typeck_store.BorrowShape result! = .no_borrow;
         Int index! = 0;
         while (index < hir_def.members.len()) {
             qid.DefId member_def = hir_def.members.get(index);
-            if (self.field_def_may_carry_borrow(member_def, visiting)) {
-                return true;
-            }
+            typeck_store.BorrowShape field = self.field_borrow_shape(
+                member_def, visiting, binding_defs, binding_types
+            );
+            result = self.merge_shapes(result, field);
+            if (result == .may_borrow) { return result; }
             index = index + 1;
         }
-        return false;
+        return result;
     }
 
-    Bool field_def_may_carry_borrow(self, qid.DefId member_def, list.ArrayList<qid.DefId>& visiting) {
-        if (self.ctx.store.defs.get(member_def).kind != .field_def) {
-            return false;
-        }
+    typeck_store.BorrowShape field_borrow_shape(
+        self,
+        qid.DefId member_def,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        if (self.ctx.store.defs.get(member_def).kind != .field_def) { return .no_borrow; }
         table.HashTable<qid.DefId, qid.TypeId>& def_types = self.typeck.def_types$.ref();
-        guard table.hash_table_get_value<qid.DefId, qid.TypeId>(def_types, member_def) is .some(field_type) else {
-            return false;
+        guard table.hash_table_get_value<qid.DefId, qid.TypeId>(
+            def_types,
+            member_def
+        ) is .some(field_type) else {
+            return .unknown;
         }
-        return self.type_may_carry_borrow_inner(field_type, visiting);
+        return self.borrow_shape_inner(field_type, visiting, binding_defs, binding_types);
+    }
+
+    Bool generic_param_type(self, qid.DefId def_id) {
+        if (!self.ctx.store.defs.has(def_id)) { return false; }
+        return self.ctx.store.defs.get(def_id).kind == .generic_param_def;
+    }
+
+    typeck_store.BorrowShape merge_shapes(
+        self,
+        typeck_store.BorrowShape lhs,
+        typeck_store.BorrowShape rhs
+    ) {
+        if (lhs == .may_borrow || rhs == .may_borrow) { return .may_borrow; }
+        if (lhs == .unknown || rhs == .unknown) { return .unknown; }
+        return .no_borrow;
     }
 
     Bool borrow_type_stack_has(self, list.ArrayList<qid.DefId>& visiting, qid.DefId def_id) {
         Int index! = 0;
         while (index < visiting.len()) {
-            if (visiting.get(index).to_index() == def_id.to_index()) {
-                return true;
-            }
+            if (visiting.get(index).to_index() == def_id.to_index()) { return true; }
             index = index + 1;
         }
         return false;

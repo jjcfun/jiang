@@ -417,7 +417,7 @@ implicit copy / Movable 规则：
 - `Movable` 是默认 auto trait，表示初始化完成后值可以改变 storage address。nominal 可以用
   `!Movable` 显式退出；包含 `!Movable` 字段或 payload 的聚合也不可移动。
 - `!Movable` 值不能按值传参、返回、赋给新 place、捕获、`$.move()` 或 `$.forget()`；它必须
-  直接初始化到最终 place，并一直保留到该 place 析构。直接 `Task<T>` 和 `Mutex` 使用这一规则
+  直接初始化到最终 place，并一直保留到该 place 析构。直接 `Task<T>` 和 `Mutex<T>` 使用这一规则
   保持地址稳定。
 - `Copyable` 继承 `Movable`，决定普通值使用是复制还是移动。整数、浮点、Bool、Char、enum、
   shared reference、raw pointer 和 RawFn 默认 Copyable。
@@ -494,10 +494,13 @@ struct Slice {
 }
 ```
 
-返回引用只来自同一种输入来源时，该来源 lifetime 默认覆盖当前函数返回值，不需要额外写
-`@life(source > return)`。例如只返回 `self` 内部字段，或只返回同一个参数引用，都可以使用默认规则。
-如果返回引用可能来自多种输入来源，必须显式写出所有允许来源。函数显式写了 return lifetime
-约束后，borrow check 只允许标注中的来源。
+函数没有显式 return lifetime 时，公开契约固定为 `@life(arg0 > return)`：方法的 `arg0`
+是 `self`，自由函数的 `arg0` 是第一个参数。返回来源不是 `arg0`、可能来自多个参数或存在歧义时，
+必须显式写出所有允许来源；编译器不会根据函数体“恰好只返回某一个参数”改变公开契约。
+
+`@life(input > return)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
+因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
+不含 borrow 的参数对应空 loan 集合，约束自然成立。raw pointer 不携带语言级 lifetime。
 
 跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，仍建议显式表达返回值不超过来源：
 
@@ -897,9 +900,10 @@ Task creation 是 eager 的。`async` 创建地址固定的直接 `Task<T>`；`n
 lock-free 的整数、Bool 和 raw pointer 标量；它是显式内部可变性入口，写操作不要求外部 binding
 带 `!`。
 
-同步临界区使用 `Mutex.lock() -> MutexGuard`。`Mutex` 是 `!Movable`；guard 唯一拥有 unlock 责任，
-离开作用域时自动解锁，没有公开手工 `unlock()`。`MutexGuard` 可以 move 给同步 helper，但不能
-跨 async 挂起点存活。当前 Mutex 不提供 poison 状态，0.4.8 也不提供公共 Channel/RwLock API。
+同步临界区使用 `Mutex<T>.with_lock<R>(Fn<R, T&!>)`。Mutex 将 lock 与受保护值绑定，只在同步
+callback 期间提供 `T&!`；callback 返回后自动解锁，没有公开的 `lock()`、`unlock()` 或 guard。
+callback 的返回值不能携带从受保护值派生的引用，因此 `T&!` 不会逃出临界区。`Mutex<T>` 是
+`!Movable`，当前不提供 poison 状态；0.4.8 也不提供公共 Channel/RwLock API。
 
 ## Struct、Enum、Union
 

@@ -570,6 +570,10 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 共享引用可以共存；活跃的 `T&!` 会排斥重叠的共享/可变借用，并阻止直接访问来源 place。
 引用最后一次使用后，来源 place 可以恢复访问。raw pointer 不参与这项别名证明。
 
+函数省略 `@life` 时，默认返回来源固定为第 0 个参数：方法是 `self`，自由函数是第一个参数。
+返回引用可能来自其他参数或多个来源时必须显式标注。`@life(input > return)` 只传播 `input`
+值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
+
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
@@ -1019,21 +1023,24 @@ Bool changed = state.compare_exchange_with_order(
 success order。Atomic 是显式的内部可变性入口，调用写操作不要求外部 binding 带 `!`。当前 `T`
 仅支持后端保证 lock-free 的整数、Bool 和裸指针标量。
 
-需要保护一段同步访问时使用 `Mutex`。`lock()` 返回独占 `MutexGuard`；guard 离开作用域时自动解锁，
-没有需要手工配对的公开 `unlock()`：
+需要保护共享状态时使用 `Mutex<T>`。Mutex 将锁与值绑定，`with_lock<R>()` 只在同步 callback
+执行期间提供值的唯一可变引用：
 
 ```jiang
-Mutex mutex = Mutex();
-{
-    MutexGuard lock_guard = mutex.lock();
-    update_shared_state();
+struct State: Movable {
+    Int count;
 }
+
+Mutex<State> state = Mutex<State>(State(count: 0));
+Int count = state.with_lock((value) => {
+    value.count = value.count + 1;
+    value.count
+});
 ```
 
-`Mutex` 是 `!Movable`，因此已有 guard 不会因锁对象移动而悬垂。`MutexGuard` 可以 move，以便把唯一的
-解锁责任传给同步 helper；它不能跨 async 挂起点存活。需要等待异步操作时，应先结束 guard 的作用域，
-再调用 async 函数。当前 Mutex 不提供 poison 状态：Jiang 的正常 `return`、`throw` 和协程 cleanup 都会
-执行 guard 析构，而不可恢复的进程终止没有可供后续持锁者观察的恢复阶段。
+callback 是普通同步 `Fn`，不能在持锁期间 `await`；它的返回值也不能携带从 `value` 派生的引用。
+`Mutex<T>` 是 `!Movable`，正常 `return`、`throw` 和 cleanup 都会通过内部 RAII lock 自动解锁。
+当前 Mutex 不提供 poison 状态；不可恢复的进程终止没有可供后续持锁者观察的恢复阶段。
 
 需要 detached 执行时，直接把 async block 作为语句启动，不形成 Task handle：
 
