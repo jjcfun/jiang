@@ -546,7 +546,8 @@ mir.MirStatementKind copy_statement_kind(mir.MirStore& output, mir.MirStatementK
     if (kind is .task_complete_stmt(complete)) {
         return mir.task_complete_statement_kind(mir.MirTaskCompleteStatement (
             task: copy_place(output, complete.task),
-            mode: complete.mode
+            mode: complete.mode,
+            owner_lifecycle: complete.owner_lifecycle
         ));
     }
     if (kind is .set_discriminant_stmt(set_discriminant)) {
@@ -563,26 +564,19 @@ mir.MirStatementKind copy_statement_kind(mir.MirStore& output, mir.MirStatementK
     }
     if (kind is .task_consume_stmt(consume)) {
         return mir.task_consume_statement_kind(mir.MirTaskConsumeStatement (
-            task: copy_place(output, consume.task)
-        ));
-    }
-    if (kind is .task_retain_stmt(retain)) {
-        return mir.task_retain_statement_kind(mir.MirTaskRetainStatement (
-            pointer: copy_operand(output, retain.pointer$.ref())
+            task: copy_place(output, consume.task),
+            task_local: consume.task_local,
+            user_visible: consume.user_visible,
+            site: consume.site,
+            repeatable: consume.repeatable
         ));
     }
     if (kind is .task_region_start_stmt(start)) {
         return mir.task_region_start_statement_kind(mir.MirTaskRegionStartStatement (
             task: copy_place(output, start.task),
+            task_local: start.task_local,
             storage: start.storage,
             child_resume: start.child_resume
-        ));
-    }
-    if (kind is .task_allocation_stmt(allocation)) {
-        return mir.task_allocation_statement_kind(mir.MirTaskAllocationStatement (
-            pointer: copy_place(output, allocation.pointer),
-            allocation_type: allocation.allocation_type,
-            storage: allocation.storage
         ));
     }
     if (kind is .task_wait_stmt(wait)) {
@@ -595,12 +589,18 @@ mir.MirStatementKind copy_statement_kind(mir.MirStore& output, mir.MirStatementK
     if (kind is .task_release_stmt(release)) {
         return mir.task_release_statement_kind(mir.MirTaskReleaseStatement (
             task_pointer: copy_place(output, release.task_pointer),
+            task_local: release.task_local,
             frame: copy_place(output, release.frame),
             state: copy_place(output, release.state),
             result: copy_place(output, release.result),
             result_drop: release.result_drop,
             result_consumed: release.result_consumed,
             storage: release.storage
+        ));
+    }
+    if (kind is .task_owner_release_stmt(release)) {
+        return mir.task_owner_release_statement_kind(mir.MirTaskOwnerReleaseStatement (
+            pointer: copy_place(output, release.pointer)
         ));
     }
     if (kind is .storage_live_stmt(storage_live)) {
@@ -1235,7 +1235,9 @@ mir.MirBlock instrument_drop_flag_block(
     }
     Int index! = 0;
     while (index < block.statements.length) {
-        instrument_drop_flag_statement(ctx, output, flags, block.statements[index], statements$.ref());
+        instrument_drop_flag_statement(
+            ctx, output, body, flags, block.statements[index], statements$.ref()
+        );
         index = index + 1;
     }
     mir.MirTerminator terminator = instrument_drop_flag_terminator(
@@ -1272,6 +1274,7 @@ mir.MirBlock instrument_drop_flag_block(
 () instrument_drop_flag_statement(
     context.CompilerContext& ctx,
     mir.MirStore& output,
+    mir.MirBody body,
     DropFlagMap flags,
     mir.MirStatement statement,
     list.ArrayList<mir.MirStatement>& statements
@@ -1298,13 +1301,26 @@ mir.MirBlock instrument_drop_flag_block(
         return;
     }
     if (statement.kind is .task_consume_stmt(consume)) {
-        if (mir.place_local_id(consume.task) is .some(local_id) && flags.has_flag(local_id)) {
-            push_set_drop_flag(ctx, output, flags.flag_for(local_id), false, statement.span, statements);
+        if (mir.place_local_id(consume.task) is .some(local_id)) {
+            if (flags.has_flag(local_id) && task_consume_clears_root_flag(ctx, body, local_id)) {
+                push_set_drop_flag(
+                    ctx, output, flags.flag_for(local_id), false, statement.span, statements
+                );
+            }
         }
         statements.add(statement);
         return;
     }
     statements.add(statement);
+}
+
+Bool task_consume_clears_root_flag(
+    context.CompilerContext& ctx,
+    mir.MirBody body,
+    mir.MirLocalId local_id
+) {
+    qid.TypeId root_type = body.locals[local_id.to_index()].type_id;
+    return ctx.store.types.get(root_type).data is .task_type(_);
 }
 
 mir.MirTerminator instrument_drop_flag_terminator(
@@ -1946,6 +1962,12 @@ DropExpansion append_owner_pointer_drop_chain(
     guard temps.cleanup_result is .some(cleanup_result) else {
         return DropExpansion(next_target, false);
     }
+    if (ctx.store.types.get(handle_type.element).data is .task_type(_)) {
+        mir.MirBlockId release_target = append_task_owner_release_block(
+            output, source_block, place, next_target, blocks
+        );
+        return DropExpansion(release_target, true);
+    }
     if (handle_is_trait_object(ctx, handle_type)) {
         mir.MirBlockId drop_target = append_trait_object_drop_block(
             ctx,
@@ -2000,6 +2022,30 @@ DropExpansion append_owner_pointer_drop_chain(
         blocks
     );
     return DropExpansion(pointee_drop, true);
+}
+
+mir.MirBlockId append_task_owner_release_block(
+    mir.MirStore& output,
+    mir.MirBlock source_block,
+    mir.MirPlace place,
+    mir.MirBlockId next_target,
+    list.ArrayList<mir.MirBlock>& blocks
+) {
+    mir.MirBlockId id = mir.MirBlockId.from_index(blocks.len());
+    list.ArrayList<mir.MirStatement> statements! = list.ArrayList<mir.MirStatement>(1);
+    statements.add(mir.MirStatement (
+        span: source_block.terminator.span,
+        kind: mir.task_owner_release_statement_kind(mir.MirTaskOwnerReleaseStatement (
+            pointer: place
+        ))
+    ));
+    blocks.add(mir.MirBlock (
+        id: id,
+        span: source_block.terminator.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: goto_terminator(source_block, next_target)
+    ));
+    return id;
 }
 
 Bool handle_is_trait_object(context.CompilerContext& ctx, types.HandleType handle_type) {

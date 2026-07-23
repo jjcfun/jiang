@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JIANGC="${JIANGC:-$ROOT_DIR/build/bin/jiangc}"
 LANG_CHECK_ROOT="${LANG_CHECK_ROOT:-test/lang}"
+LANG_CHECK_RUN_FILTER="${LANG_CHECK_RUN_FILTER:-}"
+LANG_CHECK_SANITIZER="${LANG_CHECK_SANITIZER:-}"
+LANG_CHECK_SANITIZER_CLANG="${LANG_CHECK_SANITIZER_CLANG:-}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
@@ -18,6 +21,41 @@ cd "$ROOT_DIR"
 status=0
 llvm_link_args=()
 jiang_llvm_link_args=()
+sanitizer_args=()
+sanitizer_env=()
+run_clang="$LLVM_CLANG"
+
+configure_sanitizer() {
+  case "$LANG_CHECK_SANITIZER" in
+    "")
+      ;;
+    address)
+      sanitizer_args=(-fsanitize=address -fno-omit-frame-pointer)
+      if [ "$(uname -s)" = "Darwin" ]; then
+        sanitizer_env=(env ASAN_OPTIONS=abort_on_error=1)
+      else
+        sanitizer_env=(env ASAN_OPTIONS=abort_on_error=1:detect_leaks=1)
+      fi
+      ;;
+    thread)
+      sanitizer_args=(-fsanitize=thread -fno-omit-frame-pointer)
+      sanitizer_env=(env TSAN_OPTIONS=halt_on_error=1)
+      ;;
+    *)
+      echo "unsupported LANG_CHECK_SANITIZER=$LANG_CHECK_SANITIZER" >&2
+      exit 2
+      ;;
+  esac
+  if [ -n "$LANG_CHECK_SANITIZER_CLANG" ]; then
+    run_clang="$LANG_CHECK_SANITIZER_CLANG"
+  elif [ -n "$LANG_CHECK_SANITIZER" ] && [ "$(uname -s)" = "Darwin" ]; then
+    run_clang=/usr/bin/clang
+  fi
+  if [ ! -x "$run_clang" ]; then
+    echo "missing run clang: $run_clang" >&2
+    exit 2
+  fi
+}
 
 collect_llvm_link_args() {
   local arg
@@ -34,6 +72,7 @@ collect_llvm_link_args() {
 }
 
 collect_llvm_link_args
+configure_sanitizer
 
 run_check_case() {
   local source="$1"
@@ -107,8 +146,9 @@ run_run_case() {
     return
   fi
 
-  if ! "$LLVM_CLANG" "$llvm_output" ${companion_args[@]+"${companion_args[@]}"} -o "$executable" \
-    "${llvm_link_args[@]}" >/tmp/jiang_lang_run_link.out 2>&1; then
+  if ! "$run_clang" "$llvm_output" ${companion_args[@]+"${companion_args[@]}"} -o "$executable" \
+    ${sanitizer_args[@]+"${sanitizer_args[@]}"} "${llvm_link_args[@]}" \
+    >/tmp/jiang_lang_run_link.out 2>&1; then
     echo "FAIL run $source link failed"
     sed -n '1,120p' /tmp/jiang_lang_run_link.out
     status=1
@@ -122,7 +162,8 @@ run_run_case() {
   fi
 
   set +e
-  bash -c '"$1"; exit $?' _ "$executable" >/tmp/jiang_lang_run.out 2>&1
+  ${sanitizer_env[@]+"${sanitizer_env[@]}"} bash -c '"$1"; exit $?' _ "$executable" \
+    >/tmp/jiang_lang_run.out 2>&1
   local code=$?
   set -e
   rm -f "$llvm_output" "$executable"
@@ -189,20 +230,25 @@ run_release_case() {
   status=1
 }
 
-while IFS= read -r source; do
-  run_check_case "$source"
-done < <(find "$LANG_CHECK_ROOT" -path '*/check/*.jiang' -type f | sort)
+if [ -z "$LANG_CHECK_SANITIZER" ]; then
+  while IFS= read -r source; do
+    run_check_case "$source"
+  done < <(find "$LANG_CHECK_ROOT" -path '*/check/*.jiang' -type f | sort)
 
-while IFS= read -r source; do
-  run_fail_case "$source"
-done < <(find "$LANG_CHECK_ROOT" -path '*/fail/*.jiang' -type f | sort)
+  while IFS= read -r source; do
+    run_fail_case "$source"
+  done < <(find "$LANG_CHECK_ROOT" -path '*/fail/*.jiang' -type f | sort)
 
-while IFS= read -r source; do
-  run_emit_case "$source"
-done < <(find "$LANG_CHECK_ROOT" -path '*/emit/*.jiang' -type f | sort)
+  while IFS= read -r source; do
+    run_emit_case "$source"
+  done < <(find "$LANG_CHECK_ROOT" -path '*/emit/*.jiang' -type f | sort)
+fi
 
 if [ -x "$LLVM_CLANG" ]; then
   while IFS= read -r source; do
+    if [ -n "$LANG_CHECK_RUN_FILTER" ] && [[ ! "$source" =~ $LANG_CHECK_RUN_FILTER ]]; then
+      continue
+    fi
     run_run_case "$source"
   done < <(find "$LANG_CHECK_ROOT" -path '*/run/*.jiang' -type f | sort)
 else

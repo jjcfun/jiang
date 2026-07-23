@@ -18,6 +18,7 @@ import typeck_store = "../sema/type_check/store.jiang";
 import types = "../sema/type.jiang";
 import hash = "../support/hash.jiang";
 import list = "../support/list.jiang";
+import string = "../support/string.jiang";
 import table = "../support/table.jiang";
 import token = "../syntax/token.jiang";
 import loan = "./loan.jiang";
@@ -73,15 +74,43 @@ public struct PackageBorrowChecker: Copyable {
     }
 }
 
-struct BorrowDataflowState: Movable {
-    public table.HashTable<move_path.MovePathId, Bool> moved!;
-    public loan_facts.ActiveLoanFacts active_loans!;
-    public table.HashTable<move_path.MovePathId, Bool> live_locals!;
+struct TaskConsumeFact: Copyable {
+    public move_path.MovePathId path;
+    public Int site;
+}
 
-    public init(self) {
-        self.moved = table.HashTable<move_path.MovePathId, Bool>();
+struct BorrowDataflowState: Movable {
+    public UInt64*! moved;
+    public list.ArrayList<TaskConsumeFact> consumed_tasks!;
+    public loan_facts.ActiveLoanFacts active_loans!;
+    public UInt64*! live_locals;
+    public Int path_count;
+    public Int word_count;
+
+    public init(self, Int path_count) {
+        unsafe {
+            self.path_count = path_count;
+            self.word_count = (path_count + 63) / 64;
+            self.moved = UInt64$.alloc(self.word_count);
+            self.live_locals = UInt64$.alloc(self.word_count);
+            Int index! = 0;
+            while (index < self.word_count) {
+                self.moved[index] = UInt64(0);
+                self.live_locals[index] = UInt64(0);
+                index = index + 1;
+            }
+        }
+        self.consumed_tasks = list.ArrayList<TaskConsumeFact>();
         self.active_loans = loan_facts.ActiveLoanFacts();
-        self.live_locals = table.HashTable<move_path.MovePathId, Bool>();
+    }
+
+    deinit(self) {
+        if (self.word_count > 0) {
+            unsafe {
+                self.moved$.dealloc();
+                self.live_locals$.dealloc();
+            }
+        }
     }
 }
 
@@ -163,7 +192,7 @@ struct FunctionBorrowChecker: Movable {
         self.coroutine_frame = function.coroutine_frame;
         mir.MirBody body! = function.body;
         self.paths = move_path.build_move_path_tree(body$.ref());
-        self.dataflow = BorrowDataflowState();
+        self.dataflow = BorrowDataflowState(self.paths.len());
         self.current_location = location.MirLocation(function.id, body.entry, .terminator, -1);
         self.reported_diagnostics = table.HashTable<BorrowDiagnosticKey, Bool>();
         self.reported_dead_loan_sources = table.HashTable<move_path.MovePathId, Bool>();
@@ -187,6 +216,13 @@ struct FunctionBorrowChecker: Movable {
             if (block_count == 0) {
                 return;
             }
+            self.prebuild_aggregate_move_paths();
+            self.dataflow = BorrowDataflowState(self.paths.len());
+            if (self.check_mutex_guard_liveness()) {
+                return;
+            }
+            Int entry_index = self.body.entry.to_index();
+            if (!self.valid_block_index(entry_index)) { return; }
 
             BorrowDataflowState*! in_states = unsafe {
                 BorrowDataflowState$.alloc(block_count)
@@ -197,13 +233,11 @@ struct FunctionBorrowChecker: Movable {
             Bool*! queued = unsafe {
                 Bool$.alloc(block_count)
             };
-            self.init_dataflow_arrays(in_states, reachable, queued, block_count);
+            self.init_dataflow_arrays(
+                in_states, reachable, queued, block_count, self.paths.len()
+            );
 
             list.ArrayList<Int> worklist! = list.ArrayList<Int>();
-            Int entry_index = self.body.entry.to_index();
-            if (!self.valid_block_index(entry_index)) {
-                return;
-            }
             self.init_entry_live_locals(in_states[entry_index]$.ref());
             self.enqueue_block(entry_index, reachable, queued, worklist$.ref());
 
@@ -220,7 +254,84 @@ struct FunctionBorrowChecker: Movable {
                     worklist$.ref()
                 );
             }
+            self.destroy_dataflow_arrays(in_states, block_count);
+            reachable$.dealloc();
+            queued$.dealloc();
         }
+    }
+
+    () prebuild_aggregate_move_paths(self) {
+        Int block_index! = 0;
+        while (block_index < self.body.blocks.length) {
+            mir.MirBlock block = self.body.blocks[block_index];
+            Int statement_index! = 0;
+            while (statement_index < block.statements.length) {
+                self.prebuild_statement_aggregate_paths(block.statements[statement_index]);
+                statement_index = statement_index + 1;
+            }
+            block_index = block_index + 1;
+        }
+    }
+
+    () prebuild_statement_aggregate_paths(self, mir.MirStatement statement) {
+        guard statement.kind is .assign_stmt(assign_stmt) else { return; }
+        guard assign_stmt.value is .aggregate_value(value) else { return; }
+        move_path.MovePathId destination = self.paths.path_for_place(assign_stmt.destination);
+        if (!self.valid_move_path(destination)) { return; }
+        Int field_index! = 0;
+        while (field_index < value.fields.length) {
+            self.aggregate_field_path(destination, value, field_index);
+            field_index = field_index + 1;
+        }
+    }
+
+    Bool check_mutex_guard_liveness(self) {
+        guard self.coroutine_frame is .some(frame) else { return false; }
+        Int index! = 0;
+        while (index < frame.fields.length) {
+            mir.MirCoroutineFrameField field = frame.fields[index];
+            if (field.live_across_suspend && self.type_is_mutex_guard(field.type_id)) {
+                self.results.mark_error();
+                self.add_mutex_guard_across_suspend_diagnostic();
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool type_is_mutex_guard(self, qid.TypeId type_id) {
+        guard self.ctx.store.types.get(type_id).data is .named(named) else { return false; }
+        qid.SymbolId symbol = self.ctx.store.defs.get(named.def_id).name.symbol;
+        if (!string.equal(self.ctx.store.symbols.text(symbol), "MutexGuard")) { return false; }
+        guard self.ctx.store.defs.get(named.def_id).module_id is .some(module_id) else { return false; }
+        UInt8[]& path = self.ctx.store.sources.get(
+            self.ctx.store.resolve.module(module_id).source_id
+        ).key.value;
+        return self.text_ends_with(path, "src/builtin/mutex.jiang");
+    }
+
+    Bool text_ends_with(self, UInt8[]& text, UInt8[]& suffix) {
+        if (suffix.length > text.length) { return false; }
+        Int offset = text.length - suffix.length;
+        Int index! = 0;
+        while (index < suffix.length) {
+            if (text[offset + index] != suffix[index]) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    () add_mutex_guard_across_suspend_diagnostic(self) {
+        self.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("mutex_guard_across_suspend"),
+                self.current_source_range(),
+                "MutexGuard cannot remain live across an async suspension point"
+            )
+        );
     }
 
     () init_entry_live_locals(self, BorrowDataflowState& state) {
@@ -281,16 +392,28 @@ struct FunctionBorrowChecker: Movable {
         BorrowDataflowState*! in_states,
         Bool*! reachable,
         Bool*! queued,
-        Int block_count
+        Int block_count,
+        Int path_count
     ) {
         unsafe {
             Int index! = 0;
             while (index < block_count) {
-                in_states[index] = BorrowDataflowState();
+                in_states[index] = BorrowDataflowState(path_count);
                 reachable[index] = false;
                 queued[index] = false;
                 index = index + 1;
             }
+        }
+    }
+
+    () destroy_dataflow_arrays(self, BorrowDataflowState*! states, Int count) {
+        unsafe {
+            Int index! = 0;
+            while (index < count) {
+                states[index]$.addr()$.destroy();
+                index = index + 1;
+            }
+            states$.dealloc();
         }
     }
 
@@ -355,7 +478,7 @@ struct FunctionBorrowChecker: Movable {
     }
 
     BorrowDataflowState clone_state(self, BorrowDataflowState& source) {
-        BorrowDataflowState clone! = BorrowDataflowState();
+        BorrowDataflowState clone! = BorrowDataflowState(self.paths.len());
         self.merge_state(clone$.ref(), source, false);
         return clone;
     }
@@ -363,51 +486,77 @@ struct FunctionBorrowChecker: Movable {
     // CFG 合流采用 may-analysis：任一前驱 move/borrow 过的 path，在后继入口都视为可能存在。
     // live local 采用 must-analysis：只有所有前驱都 live 的 local，后继入口才视为 live。
     Bool merge_state(self, BorrowDataflowState& target, BorrowDataflowState& source, Bool target_reachable) {
-        Bool changed! = false;
-        Int index! = 0;
-        while (index < self.paths.len()) {
-            move_path.MovePathId path = move_path.MovePathId(index);
-            changed = self.merge_moved_path(target, source, path) || changed;
-            changed = self.merge_live_local(target, source, path, target_reachable) || changed;
-            index = index + 1;
-        }
+        Bool changed! = self.merge_path_bits(target, source, target_reachable);
+        changed = self.merge_consumed_tasks(target, source) || changed;
         changed = self.merge_active_loans(target, source) || changed;
         return changed;
     }
 
-    Bool merge_live_local(self,
+    Bool merge_path_bits(
+        self,
         BorrowDataflowState& target,
         BorrowDataflowState& source,
-        move_path.MovePathId path,
         Bool target_reachable
     ) {
-        Bool source_live = source.live_locals.has(path);
-        Bool target_live = target.live_locals.has(path);
-        if (!target_reachable) {
-            if (!source_live) { return false; }
-            target.live_locals.set(path, true);
-            return true;
+        unsafe {
+            Bool changed! = false;
+            Int index! = 0;
+            while (index < target.word_count) {
+                UInt64 moved = target.moved[index] | source.moved[index];
+                UInt64 live! = source.live_locals[index];
+                if (target_reachable) { live = target.live_locals[index] & live; }
+                changed = changed || moved != target.moved[index];
+                changed = changed || live != target.live_locals[index];
+                target.moved[index] = moved;
+                target.live_locals[index] = live;
+                index = index + 1;
+            }
+            return changed;
         }
-        if (!target_live || source_live) {
-            return false;
-        }
-        target.live_locals.remove(path);
-        return true;
     }
 
-    Bool merge_moved_path(self,
-        BorrowDataflowState& target,
-        BorrowDataflowState& source,
-        move_path.MovePathId path
-    ) {
-        if (!source.moved.has(path)) {
-            return false;
+    Bool state_has_path(self, UInt64*! bits, move_path.MovePathId path) {
+        if (!self.valid_move_path(path)) { return false; }
+        unsafe {
+            Int index = path.to_index();
+            assert(index < self.dataflow.path_count);
+            UInt64 mask = UInt64(1) << UInt64(index % 64);
+            return (bits[index / 64] & mask) != UInt64(0);
         }
-        if (target.moved.has(path)) {
-            return false;
+    }
+
+    () state_set_path(self, UInt64*! bits, move_path.MovePathId path) {
+        if (!self.valid_move_path(path)) { return; }
+        unsafe {
+            Int index = path.to_index();
+            assert(index < self.dataflow.path_count);
+            Int word = index / 64;
+            bits[word] = bits[word] | (UInt64(1) << UInt64(index % 64));
         }
-        target.moved.set(path, true);
-        return true;
+    }
+
+    () state_clear_path(self, UInt64*! bits, move_path.MovePathId path) {
+        if (!self.valid_move_path(path)) { return; }
+        unsafe {
+            Int index = path.to_index();
+            assert(index < self.dataflow.path_count);
+            Int word = index / 64;
+            bits[word] = bits[word] & ~(UInt64(1) << UInt64(index % 64));
+        }
+    }
+
+    Bool merge_consumed_tasks(self, BorrowDataflowState& target, BorrowDataflowState& source) {
+        Bool changed! = false;
+        Int index! = 0;
+        while (index < source.consumed_tasks.len()) {
+            TaskConsumeFact fact = source.consumed_tasks.get(index);
+            if (!self.has_task_consume_fact(target, fact.path, fact.site)) {
+                target.consumed_tasks.add(fact);
+                changed = true;
+            }
+            index = index + 1;
+        }
+        return changed;
     }
 
     Bool merge_active_loans(self, BorrowDataflowState& target, BorrowDataflowState& source) {
@@ -474,6 +623,14 @@ struct FunctionBorrowChecker: Movable {
             self.check_place_use(complete.task);
             return;
         }
+        if (statement.kind is .task_owner_release_stmt(release)) {
+            self.check_place_use(release.pointer);
+            return;
+        }
+        if (statement.kind is .task_consume_stmt(consume)) {
+            self.check_task_consume(consume);
+            return;
+        }
         if (statement.kind is .set_discriminant_stmt(discriminant_stmt)) {
             self.clear_place(discriminant_stmt.destination);
             return;
@@ -493,8 +650,54 @@ struct FunctionBorrowChecker: Movable {
 
     () clear_storage_dead_local(self, mir.MirLocalId local_id) {
         move_path.MovePathId path = self.paths.root_for_local(local_id);
-        self.dataflow.live_locals.remove(path);
+        self.state_clear_path(self.dataflow.live_locals, path);
         self.clear_path_and_descendants(path);
+    }
+
+    () check_task_consume(self, mir.MirTaskConsumeStatement consume) {
+        if (!consume.user_visible) { return; }
+        move_path.MovePathId path = self.paths.path_for_place(consume.task);
+        if (!self.valid_move_path(path)) { return; }
+        if (self.task_path_was_consumed(path, consume.site, consume.repeatable)) {
+            self.results.mark_error();
+            self.add_task_result_consumed_diagnostic();
+            return;
+        }
+        if (!self.has_task_consume_fact(self.dataflow$.ref(), path, consume.site)) {
+            self.dataflow.consumed_tasks.add(TaskConsumeFact(path: path, site: consume.site));
+        }
+    }
+
+    Bool task_path_was_consumed(self, move_path.MovePathId path, Int site, Bool repeatable) {
+        Int index! = 0;
+        while (index < self.dataflow.consumed_tasks.len()) {
+            TaskConsumeFact fact = self.dataflow.consumed_tasks.get(index);
+            if ((fact.site != site || repeatable) && self.task_consume_paths_overlap(path, fact.path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool has_task_consume_fact(
+        self,
+        BorrowDataflowState& state,
+        move_path.MovePathId path,
+        Int site
+    ) {
+        Int index! = 0;
+        while (index < state.consumed_tasks.len()) {
+            TaskConsumeFact fact = state.consumed_tasks.get(index);
+            if (fact.path == path && fact.site == site) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool task_consume_paths_overlap(self, move_path.MovePathId lhs, move_path.MovePathId rhs) {
+        if (lhs == rhs) { return true; }
+        return self.is_descendant_of(lhs, rhs) || self.is_descendant_of(rhs, lhs);
     }
 
     () mark_local_live(self, mir.MirLocalId local_id) {
@@ -503,7 +706,7 @@ struct FunctionBorrowChecker: Movable {
 
     () mark_state_local_live(self, BorrowDataflowState& state, mir.MirLocalId local_id) {
         move_path.MovePathId root = self.paths.root_for_local(local_id);
-        state.live_locals.set(root, true);
+        self.state_set_path(state.live_locals, root);
     }
 
     () check_assignment_escape(self, mir.MirPlace destination, mir.MirRvalue value) {
@@ -2140,7 +2343,9 @@ struct FunctionBorrowChecker: Movable {
             return;
         }
         if (value is .coroutine_address_value(coroutine_address)) {
-            self.check_place_use(coroutine_address.place);
+            // Internal coroutine ABI addresses may target result storage that has not been
+            // initialized yet. Forming the address does not read or move the pointee.
+            self.check_place_write(coroutine_address.place);
             return;
         }
         if (value is .executor_enter_value(executor_enter)) {
@@ -2379,7 +2584,7 @@ struct FunctionBorrowChecker: Movable {
     Bool loan_source_is_live(self, loan.Loan current) {
         move_path.MovePath source = self.paths.get(current.source);
         move_path.MovePathId root = self.paths.root_for_local(source.local_id);
-        return self.dataflow.live_locals.has(root);
+        return self.state_has_path(self.dataflow.live_locals, root);
     }
 
     () add_use_after_move_diagnostic(self) {
@@ -2393,6 +2598,19 @@ struct FunctionBorrowChecker: Movable {
                 diagnostic.DiagnosticCode("use_after_move"),
                 self.current_source_range(),
                 "use of moved value"
+            )
+        );
+    }
+
+    () add_task_result_consumed_diagnostic(self) {
+        if (!self.record_diagnostic(10)) { return; }
+        self.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .borrow_check,
+                diagnostic.DiagnosticCode("task_result_already_consumed"),
+                self.current_source_range(),
+                "Task result has already been consumed"
             )
         );
     }
@@ -2622,11 +2840,11 @@ struct FunctionBorrowChecker: Movable {
 
     () mark_moved(self, move_path.MovePathId path) {
         self.clear_descendants(path);
-        self.dataflow.moved.set(path, true);
+        self.state_set_path(self.dataflow.moved, path);
     }
 
     Bool is_path_uninitialized(self, move_path.MovePathId path) {
-        if (self.dataflow.moved.has(path)) {
+        if (self.state_has_path(self.dataflow.moved, path)) {
             return true;
         }
         if (self.has_moved_ancestor(path)) {
@@ -2638,7 +2856,7 @@ struct FunctionBorrowChecker: Movable {
     Bool has_moved_ancestor(self, move_path.MovePathId path) {
         move_path.MovePath current! = self.paths.get(path);
         while (current.has_parent) {
-            if (self.dataflow.moved.has(current.parent)) {
+            if (self.state_has_path(self.dataflow.moved, current.parent)) {
                 return true;
             }
             current = self.paths.get(current.parent);
@@ -2647,18 +2865,21 @@ struct FunctionBorrowChecker: Movable {
     }
 
     Bool has_moved_descendant(self, move_path.MovePathId path) {
-        Int index! = 0;
-        while (index < self.paths.len()) {
-            move_path.MovePathId candidate = move_path.MovePathId(index);
-            if (self.dataflow.moved.has(candidate) && self.is_descendant_of(candidate, path)) {
-                return true;
-            }
-            index = index + 1;
+        list.ArrayList<move_path.MovePathId> pending! = list.ArrayList<move_path.MovePathId>();
+        self.paths.append_children(path, pending$.ref());
+        while (!pending.empty()) {
+            move_path.MovePathId candidate = pending.pop();
+            if (self.state_has_path(self.dataflow.moved, candidate)) { return true; }
+            self.paths.append_children(candidate, pending$.ref());
         }
         return false;
     }
 
     Bool is_descendant_of(self, move_path.MovePathId child, move_path.MovePathId parent) {
+        move_path.MovePath parent_path = self.paths.get(parent);
+        if (!parent_path.has_parent) {
+            return child != parent && self.paths.get(child).local_id == parent_path.local_id;
+        }
         move_path.MovePath current! = self.paths.get(child);
         while (current.has_parent) {
             if (current.parent == parent) {
@@ -2670,23 +2891,49 @@ struct FunctionBorrowChecker: Movable {
     }
 
     () clear_path_and_descendants(self, move_path.MovePathId path) {
-        self.dataflow.moved.remove(path);
+        self.state_clear_path(self.dataflow.moved, path);
+        self.clear_consumed_tasks_under(path);
         self.remove_active_loan_facts_under(path);
         self.clear_descendants(path);
     }
 
-    () clear_descendants(self, move_path.MovePathId path) {
+    () clear_consumed_tasks_under(self, move_path.MovePathId path) {
+        if (!self.has_consumed_task_under(path)) { return; }
+        list.ArrayList<TaskConsumeFact> kept! = list.ArrayList<TaskConsumeFact>();
         Int index! = 0;
-        while (index < self.paths.len()) {
-            move_path.MovePathId candidate = move_path.MovePathId(index);
-            if (self.is_descendant_of(candidate, path)) {
-                self.dataflow.moved.remove(candidate);
+        while (index < self.dataflow.consumed_tasks.len()) {
+            TaskConsumeFact fact = self.dataflow.consumed_tasks.get(index);
+            if (!self.path_matches_or_contains(path, fact.path)) {
+                kept.add(fact);
             }
             index = index + 1;
+        }
+        self.dataflow.consumed_tasks = kept;
+    }
+
+    Bool has_consumed_task_under(self, move_path.MovePathId path) {
+        Int index! = 0;
+        while (index < self.dataflow.consumed_tasks.len()) {
+            if (self.path_matches_or_contains(path, self.dataflow.consumed_tasks.get(index).path)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () clear_descendants(self, move_path.MovePathId path) {
+        list.ArrayList<move_path.MovePathId> pending! = list.ArrayList<move_path.MovePathId>();
+        self.paths.append_children(path, pending$.ref());
+        while (!pending.empty()) {
+            move_path.MovePathId candidate = pending.pop();
+            self.state_clear_path(self.dataflow.moved, candidate);
+            self.paths.append_children(candidate, pending$.ref());
         }
     }
 
     () remove_active_loan_facts_under(self, move_path.MovePathId path) {
+        if (!self.has_active_loan_fact_under(path)) { return; }
         loan_facts.ActiveLoanFacts kept! = loan_facts.ActiveLoanFacts(self.dataflow.active_loans.len());
         Int index! = 0;
         while (index < self.dataflow.active_loans.len()) {
@@ -2697,6 +2944,16 @@ struct FunctionBorrowChecker: Movable {
             index = index + 1;
         }
         self.dataflow.active_loans = kept;
+    }
+
+    Bool has_active_loan_fact_under(self, move_path.MovePathId path) {
+        Int index! = 0;
+        while (index < self.dataflow.active_loans.len()) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            if (self.active_loan_target_under_path(fact, path)) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     Bool active_loan_target_under_path(self, loan_facts.ActiveLoanFact fact, move_path.MovePathId path) {

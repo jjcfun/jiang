@@ -25,6 +25,8 @@ public mir.MirCoroutineFrameLayout? build_frame_layout(
             live_across_suspend.analyze_frame_liveness(body);
         Bool*! live_locals = liveness.live_locals;
         mir.MirTaskRegion[]& task_regions = task_region.analyze(output, body);
+        task_region.DisjointnessCache region_cache! =
+            task_region.DisjointnessCache(task_regions.length);
         list.ArrayList<mir.MirCoroutineFrameField> fields! = list.ArrayList<mir.MirCoroutineFrameField>();
         list.ArrayList<mir.MirCoroutineLocalFrameField> mappings! =
             list.ArrayList<mir.MirCoroutineLocalFrameField>();
@@ -60,6 +62,7 @@ public mir.MirCoroutineFrameLayout? build_frame_layout(
                     type_store,
                     liveness$.ref(),
                     task_regions,
+                    region_cache$.ref(),
                     fields$.ref(),
                     mappings$.ref()
                 );
@@ -155,7 +158,6 @@ mir.MirTaskAbiLayout build_task_abi(
         suspend_layout: build_suspend_continuation_layout(type_store, result_type_id, span),
         blocking_ack_pointer_type_id: type_store.raw_pointer_type(task_state.state.type_id, span),
         bool_type_id: type_store.bool_type(),
-        handle_pointer_field_index: 0,
         state_field: task_state.state,
         frame_field: task_state.frame,
         resume_function_field: task_state.resume_function,
@@ -163,7 +165,8 @@ mir.MirTaskAbiLayout build_task_abi(
         result_field: task_state.result,
         cancellation_requested_field: task_state.cancellation_requested,
         cancel_target_word_field: task_state.cancel_target_word,
-        external_ref_count_field: task_state.external_ref_count,
+        lifetime_state_field: task_state.lifetime_state,
+        cleanup_function_field: task_state.cleanup_function,
         schedule_state_field: task_state.schedule_state,
         schedule_executor_field: task_state.schedule_executor,
         schedule_context_field: task_state.schedule_context,
@@ -284,6 +287,7 @@ Int reusable_frame_field_index(
     types.TypeStore& type_store,
     live_across_suspend.FrameLiveness& liveness,
     mir.MirTaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache,
     list.ArrayList<mir.MirCoroutineFrameField>& fields,
     list.ArrayList<mir.MirCoroutineLocalFrameField>& mappings
 ) {
@@ -294,7 +298,15 @@ Int reusable_frame_field_index(
         while (mapping_index < mappings.len()) {
             Int field_index = mappings.get(mapping_index).field_index;
             if (frame_field_can_store_local(
-                    body, local, field_index, type_store, liveness, task_regions, fields, mappings
+                    body,
+                    local,
+                    field_index,
+                    type_store,
+                    liveness,
+                    task_regions,
+                    region_cache,
+                    fields,
+                    mappings
                 )
             ) {
                 return field_index;
@@ -312,6 +324,7 @@ Bool frame_field_can_store_local(
     types.TypeStore& type_store,
     live_across_suspend.FrameLiveness& liveness,
     mir.MirTaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache,
     list.ArrayList<mir.MirCoroutineFrameField>& fields,
     list.ArrayList<mir.MirCoroutineLocalFrameField>& mappings
 ) {
@@ -327,7 +340,10 @@ Bool frame_field_can_store_local(
         mir.MirCoroutineLocalFrameField mapping = mappings.get(mapping_index);
         if (mapping.field_index == field_index) {
             mir.MirLocalDecl existing = body.locals[mapping.local_id.to_index()];
-            if (!locals_can_share_frame_slot(body, local, existing, liveness, task_regions)) {
+            if (!locals_can_share_frame_slot(
+                    body, local, existing, liveness, task_regions, region_cache
+                )
+            ) {
                 return false;
             }
         }
@@ -345,14 +361,17 @@ Bool locals_can_share_frame_slot(
     mir.MirLocalDecl lhs,
     mir.MirLocalDecl rhs,
     live_across_suspend.FrameLiveness& liveness,
-    mir.MirTaskRegion[]& task_regions
+    mir.MirTaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache
 ) {
     unsafe {
         if (rhs.kind == .param) { return false; }
         Bool lhs_addressed = liveness.address_preserved[lhs.id.to_index()];
         Bool rhs_addressed = liveness.address_preserved[rhs.id.to_index()];
         if (lhs_addressed || rhs_addressed) {
-            return captured_task_locals_can_share(body, lhs, rhs, liveness, task_regions);
+            return captured_task_locals_can_share(
+                body, lhs, rhs, liveness, task_regions, region_cache
+            );
         }
         return !live_across_suspend.locals_interfere(liveness, lhs.id, rhs.id);
     }
@@ -363,7 +382,8 @@ Bool captured_task_locals_can_share(
     mir.MirLocalDecl lhs,
     mir.MirLocalDecl rhs,
     live_across_suspend.FrameLiveness& liveness,
-    mir.MirTaskRegion[]& task_regions
+    mir.MirTaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache
 ) {
     guard lhs.coroutine_capture_task is .some(lhs_task) else { return false; }
     guard rhs.coroutine_capture_task is .some(rhs_task) else { return false; }
@@ -382,7 +402,7 @@ Bool captured_task_locals_can_share(
     if (!region_has_parent_local_storage(rhs_region)) { return false; }
     // capture 的地址只发布给所属 Task。Task release 完成后地址失效，因此 owner Task
     // 的 region 可以作为间接引用的精确代理，而不必永久钉住父 frame 槽位。
-    return task_region.regions_do_not_overlap(body, lhs_region, rhs_region);
+    return region_cache.regions_do_not_overlap(body, task_regions, lhs_index, rhs_index);
 }
 
 Int? region_index_for_task(
@@ -398,7 +418,7 @@ Int? region_index_for_task(
 }
 
 Bool region_has_parent_local_storage(mir.MirTaskRegion region) {
-    return region.storage.control == .local &&
+    return region.storage.allocation == .local &&
         region.storage.frame == .local &&
         region.storage.reclaim == .parent &&
         region.consume_count > 0 && region.release_count > 0;

@@ -4,10 +4,21 @@ import list = "../../../support/list.jiang";
 import mir = "../../mir.jiang";
 
 struct LiveState: Movable {
-    list.ArrayList<mir.MirLocalId> locals!;
+    UInt64*! words;
+    Int word_count;
 
-    public init(self) {
-        self.locals = list.ArrayList<mir.MirLocalId>();
+    public init(self, Int local_count) {
+        unsafe {
+            self.word_count = bit_word_count(local_count);
+            self.words = UInt64$.alloc(self.word_count);
+            init_uint64_array(self.words, self.word_count);
+        }
+    }
+
+    deinit(self) {
+        if (self.word_count > 0) {
+            unsafe { self.words$.dealloc(); }
+        }
     }
 }
 
@@ -26,8 +37,8 @@ public FrameLiveness analyze_frame_liveness(mir.MirBody body) {
     unsafe {
         Bool*! result = Bool$.alloc(body.locals.length);
         Bool*! address_preserved = Bool$.alloc(body.locals.length);
-        // 干涉关系使用稠密索引和位图存储。
-        // 保留 O(N²) 查询，同时避免 Bool 矩阵的字节级膨胀。
+        // 每个 local 对应一行位图。记录某个活跃集合时，整行按 word 合并，
+        // 避免在每条 statement 上做 O(N²) 的 local 两两枚举。
         Int interference_words = interference_word_count(body.locals.length);
         UInt64*! interference = UInt64$.alloc(interference_words);
         init_bool_array(result, body.locals.length);
@@ -44,7 +55,7 @@ public FrameLiveness analyze_frame_liveness(mir.MirBody body) {
 
         Bool*! reachable = compute_reachable(body);
         LiveState*! in_states = LiveState$.alloc(body.blocks.length);
-        init_live_states(in_states, body.blocks.length);
+        init_live_states(in_states, body.blocks.length, body.locals.length);
         FrameLiveness analysis = FrameLiveness (
             live_locals: result,
             address_preserved: address_preserved,
@@ -52,7 +63,9 @@ public FrameLiveness analyze_frame_liveness(mir.MirBody body) {
             local_count: body.locals.length
         );
         solve_liveness(body, reachable, in_states, analysis$.ref());
+        destroy_live_states(in_states, body.blocks.length);
         Bool has_suspend = has_suspend_point(body, reachable);
+        reachable$.dealloc();
         if (has_suspend) {
             merge_bool_arrays(result, address_preserved, body.locals.length);
         } else {
@@ -68,14 +81,18 @@ public Bool locals_interfere(
     mir.MirLocalId rhs
 ) {
     unsafe {
-        Int bit_index = lhs.to_index() * analysis.local_count + rhs.to_index();
-        UInt64 mask = UInt64(1) << UInt64(bit_index % 64);
-        return (analysis.interference[bit_index / 64] & mask) != UInt64(0);
+        Int row_words = bit_word_count(analysis.local_count);
+        Int word_index = lhs.to_index() * row_words + rhs.to_index() / 64;
+        UInt64 mask = UInt64(1) << UInt64(rhs.to_index() % 64);
+        return (analysis.interference[word_index] & mask) != UInt64(0);
     }
 }
 
 Int interference_word_count(Int local_count) {
-    Int bit_count = local_count * local_count;
+    return local_count * bit_word_count(local_count);
+}
+
+Int bit_word_count(Int bit_count) {
     return (bit_count + 63) / 64;
 }
 
@@ -109,13 +126,24 @@ Int interference_word_count(Int local_count) {
     }
 }
 
-() init_live_states(LiveState*! states, Int count) {
+() init_live_states(LiveState*! states, Int count, Int local_count) {
     unsafe {
         Int index! = 0;
         while (index < count) {
-            states[index] = LiveState();
+            states[index] = LiveState(local_count);
             index = index + 1;
         }
+    }
+}
+
+() destroy_live_states(LiveState*! states, Int count) {
+    unsafe {
+        Int index! = 0;
+        while (index < count) {
+            states[index]$.addr()$.destroy();
+            index = index + 1;
+        }
+        states$.dealloc();
     }
 }
 
@@ -210,7 +238,7 @@ LiveState successor_live_state(
     LiveState*! in_states
 ) {
     unsafe {
-        LiveState state! = LiveState();
+        LiveState state! = LiveState(body.locals.length);
         Int successor_index! = 0;
         while (successor_index < mir.terminator_successor_count(block.terminator)) {
             mir.MirBlockId successor = mir.terminator_successor_at(block.terminator, successor_index);
@@ -276,16 +304,8 @@ LiveState successor_live_state(
         use_place(state, consume.task);
         return;
     }
-    if (statement.kind is .task_retain_stmt(retain)) {
-        use_operand(state, retain.pointer);
-        return;
-    }
     if (statement.kind is .task_region_start_stmt(start)) {
         use_place(state, start.task);
-        return;
-    }
-    if (statement.kind is .task_allocation_stmt(allocation)) {
-        write_place(state, allocation.pointer);
         return;
     }
     if (statement.kind is .task_wait_stmt(wait)) {
@@ -295,6 +315,10 @@ LiveState successor_live_state(
     }
     if (statement.kind is .task_release_stmt(release)) {
         use_task_release(state, release);
+        return;
+    }
+    if (statement.kind is .task_owner_release_stmt(release)) {
+        use_place(state, release.pointer);
     }
 }
 
@@ -506,7 +530,7 @@ Bool collect_suspend_facts(
 ) {
     if (terminator.kind is .call_term(call_term)) {
         if (!call_term.is_suspend_point) { return false; }
-        mark_live_state(live_out, analysis.live_locals);
+        mark_live_state(live_out, analysis.live_locals, analysis.local_count);
         mark_place_local(call_term.destination, analysis.live_locals);
         mark_suspend_destination_interference(call_term, live_out, analysis);
         if (call_term.initialized_place is .some(initialized_place)) {
@@ -515,7 +539,7 @@ Bool collect_suspend_facts(
         return true;
     }
     guard terminator.kind is .suspend_pending_term(_) else { return false; }
-    mark_live_state(live_out, analysis.live_locals);
+    mark_live_state(live_out, analysis.live_locals, analysis.local_count);
     return true;
 }
 
@@ -557,19 +581,31 @@ Bool is_suspend_terminator(mir.MirTerminator terminator) {
 }
 
 () mark_live_pairs(LiveState& state, UInt64*! interference, Int local_count) {
-    Int lhs_index! = 0;
-    while (lhs_index < state.locals.len()) {
-        Int rhs_index! = lhs_index + 1;
-        while (rhs_index < state.locals.len()) {
-            mark_local_pair(
-                state.locals.get(lhs_index),
-                state.locals.get(rhs_index),
-                interference,
-                local_count
-            );
-            rhs_index = rhs_index + 1;
+    unsafe {
+        Int row_words = bit_word_count(local_count);
+        Int local_index! = 0;
+        while (local_index < local_count) {
+            if (state_has_index(state, local_index)) {
+                or_state_into_row(interference, local_index, row_words, state);
+            }
+            local_index = local_index + 1;
         }
-        lhs_index = lhs_index + 1;
+    }
+}
+
+() or_state_into_row(
+    UInt64*! interference,
+    Int row_index,
+    Int row_words,
+    LiveState& state
+) {
+    unsafe {
+        Int word_index! = 0;
+        while (word_index < row_words) {
+            Int target = row_index * row_words + word_index;
+            interference[target] = interference[target] | state.words[word_index];
+            word_index = word_index + 1;
+        }
     }
 }
 
@@ -597,10 +633,16 @@ Bool is_suspend_terminator(mir.MirTerminator terminator) {
     UInt64*! interference,
     Int local_count
 ) {
-    Int index! = 0;
-    while (index < state.locals.len()) {
-        mark_local_pair(local_id, state.locals.get(index), interference, local_count);
-        index = index + 1;
+    unsafe {
+        Int row_words = bit_word_count(local_count);
+        or_state_into_row(interference, local_id.to_index(), row_words, state);
+        Int index! = 0;
+        while (index < local_count) {
+            if (state_has_index(state, index)) {
+                set_interference_bit(interference, index, local_id.to_index(), row_words);
+            }
+            index = index + 1;
+        }
     }
 }
 
@@ -623,30 +665,25 @@ Bool is_suspend_terminator(mir.MirTerminator terminator) {
 ) {
     if (lhs.to_index() == rhs.to_index()) { return; }
     unsafe {
-        set_interference_bit(
-            interference,
-            lhs.to_index() * local_count + rhs.to_index()
-        );
-        set_interference_bit(
-            interference,
-            rhs.to_index() * local_count + lhs.to_index()
-        );
+        Int row_words = bit_word_count(local_count);
+        set_interference_bit(interference, lhs.to_index(), rhs.to_index(), row_words);
+        set_interference_bit(interference, rhs.to_index(), lhs.to_index(), row_words);
     }
 }
 
-() set_interference_bit(UInt64*! interference, Int bit_index) {
+() set_interference_bit(UInt64*! interference, Int row, Int column, Int row_words) {
     unsafe {
-        Int word_index = bit_index / 64;
-        UInt64 mask = UInt64(1) << UInt64(bit_index % 64);
+        Int word_index = row * row_words + column / 64;
+        UInt64 mask = UInt64(1) << UInt64(column % 64);
         interference[word_index] = interference[word_index] | mask;
     }
 }
 
-() mark_live_state(LiveState& state, Bool*! result) {
+() mark_live_state(LiveState& state, Bool*! result, Int local_count) {
     unsafe {
         Int index! = 0;
-        while (index < state.locals.len()) {
-            result[state.locals.get(index).to_index()] = true;
+        while (index < local_count) {
+            if (state_has_index(state, index)) { result[index] = true; }
             index = index + 1;
         }
     }
@@ -689,47 +726,45 @@ Bool is_suspend_terminator(mir.MirTerminator terminator) {
 }
 
 Bool merge_state(LiveState& target, LiveState& source) {
-    Bool changed! = false;
-    Int index! = 0;
-    while (index < source.locals.len()) {
-        changed = add_live_local(target, source.locals.get(index)) || changed;
-        index = index + 1;
+    unsafe {
+        Bool changed! = false;
+        Int index! = 0;
+        while (index < source.word_count) {
+            UInt64 merged = target.words[index] | source.words[index];
+            changed = changed || merged != target.words[index];
+            target.words[index] = merged;
+            index = index + 1;
+        }
+        return changed;
     }
-    return changed;
 }
 
 Bool add_live_local(LiveState& state, mir.MirLocalId local_id) {
-    if (has_live_local(state, local_id)) { return false; }
-    state.locals.add(local_id);
-    return true;
+    unsafe {
+        Int index = local_id.to_index();
+        Int word_index = index / 64;
+        UInt64 mask = UInt64(1) << UInt64(index % 64);
+        Bool changed = (state.words[word_index] & mask) == UInt64(0);
+        state.words[word_index] = state.words[word_index] | mask;
+        return changed;
+    }
 }
 
 () remove_live_local(LiveState& state, mir.MirLocalId local_id) {
-    Int index! = 0;
-    while (index < state.locals.len()) {
-        if (state.locals.get(index).to_index() == local_id.to_index()) {
-            remove_live_local_at(state, index);
-            return;
-        }
-        index = index + 1;
+    unsafe {
+        Int index = local_id.to_index();
+        Int word_index = index / 64;
+        UInt64 mask = UInt64(1) << UInt64(index % 64);
+        state.words[word_index] = state.words[word_index] & ~mask;
     }
 }
 
-() remove_live_local_at(LiveState& state, Int index) {
-    Int last_index = state.locals.len() - 1;
-    if (index != last_index) {
-        state.locals.set(index, state.locals.get(last_index));
+Bool state_has_index(LiveState& state, Int index) {
+    unsafe {
+        Int word_index = index / 64;
+        UInt64 mask = UInt64(1) << UInt64(index % 64);
+        return (state.words[word_index] & mask) != UInt64(0);
     }
-    state.locals.truncate(last_index);
-}
-
-Bool has_live_local(LiveState& state, mir.MirLocalId local_id) {
-    Int index! = 0;
-    while (index < state.locals.len()) {
-        if (state.locals.get(index).to_index() == local_id.to_index()) { return true; }
-        index = index + 1;
-    }
-    return false;
 }
 
 Bool valid_block_index(mir.MirBody body, Int index) {

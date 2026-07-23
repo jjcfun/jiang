@@ -28,7 +28,15 @@ const Int task_resume_word = 7;
 const Int task_execution_executor_word = 8;
 const Int task_cancellation_requested_word = 9;
 const Int task_cancel_target_word = 10;
-const Int task_external_ref_count_word = 11;
+const Int task_lifetime_state_word = 11;
+const Int task_cleanup_function_word = 12;
+
+const Int task_lifetime_stack = 0;
+const Int task_lifetime_heap_running_owner = 1;
+const Int task_lifetime_heap_completed_owner = 2;
+const Int task_lifetime_heap_running_ownerless = 3;
+const Int task_lifetime_heap_consumed_owner = 4;
+const Int task_lifetime_cleanup_claimed = 5;
 
 const Int continuation_executor_word = 3;
 const Int continuation_context_word = 4;
@@ -61,33 +69,10 @@ public () shutdown() {
     if (!runtime_state.initialized) { return; }
     thread.wait_group(runtime_state.group);
     domain_executor.shutdown();
+    thread.destroy_group(runtime_state.group);
+    runtime_state.group = thread.Group(null);
+    thread.shutdown();
     runtime_state.initialized = false;
-}
-
-@link_symbol("__jiang_runtime_task_retain")
-public () task_retain(Void* raw_task) {
-    if (raw_task == null) { return; }
-    UInt8* task = unsafe { raw_task$.as(UInt8*) };
-    Int*! count = task_word(task, task_external_ref_count_word);
-    while (true) {
-        Int observed = thread.atomic_load(count);
-        assert(observed > 0);
-        if (thread.atomic_compare_exchange(count, observed, observed + 1)) { return; }
-    }
-}
-
-@link_symbol("__jiang_runtime_task_release")
-public () task_release(Void* raw_task) {
-    if (raw_task == null) { return; }
-    UInt8* task = unsafe { raw_task$.as(UInt8*) };
-    Int*! count = task_word(task, task_external_ref_count_word);
-    while (true) {
-        Int observed = thread.atomic_load(count);
-        assert(observed > 0);
-        if (!thread.atomic_compare_exchange(count, observed, observed - 1)) { continue; }
-        if (observed == 1) { thread.deallocate_storage(task); }
-        return;
-    }
 }
 
 // C/runtime 探针使用 binding id；编译器生成代码直接传 canonical executor。
@@ -201,6 +186,106 @@ public () complete_task(Void* raw_task) {
         if (schedule_is_publishing(kind)) { continue; }
         assert(false);
     }
+}
+
+// Heap Task 只有 owner 与运行中 coroutine 两方。completion 发布结果后
+// 交出 coroutine 一侧；若 owner 已离开，则由 completion 执行类型化 cleanup。
+@link_symbol("__jiang_runtime_task_owner_complete")
+public () complete_task_owner(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int*! state = task_word(task, task_lifetime_state_word);
+    while (true) {
+        Int observed = thread.atomic_load(state);
+        if (observed == task_lifetime_stack) { return; }
+        if (observed == task_lifetime_heap_running_owner) {
+            if (thread.atomic_compare_exchange(
+                    state, observed, task_lifetime_heap_completed_owner
+                )
+            ) {
+                return;
+            }
+            continue;
+        }
+        if (observed == task_lifetime_heap_running_ownerless) {
+            if (!thread.atomic_compare_exchange(
+                    state, observed, task_lifetime_cleanup_claimed
+                )
+            ) {
+                continue;
+            }
+            invoke_task_cleanup(task);
+            return;
+        }
+        assert(false);
+        return;
+    }
+}
+
+// Task.await()/cancel_and_await() 已回收 result 与 frame，但 owner allocation
+// 仍由 Task<T>^ 的普通析构负责。
+@link_symbol("__jiang_runtime_task_owner_consumed")
+public () consume_task_owner(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int*! state = task_word(task, task_lifetime_state_word);
+    while (true) {
+        Int observed = thread.atomic_load(state);
+        if (observed == task_lifetime_stack) { return; }
+        assert(observed == task_lifetime_heap_completed_owner);
+        if (thread.atomic_compare_exchange(
+                state, observed, task_lifetime_heap_consumed_owner
+            )
+        ) {
+            return;
+        }
+    }
+}
+
+// owner 析构不等待、不取消。若 coroutine 仍运行，只发布 ownerless；
+// 若 completion 已发布，则当前线程成为最后一方并执行 cleanup。
+@link_symbol("__jiang_runtime_task_owner_release")
+public () release_task_owner(Void* raw_task) {
+    if (raw_task == null) { return; }
+    UInt8* task = unsafe { raw_task$.as(UInt8*) };
+    Int*! state = task_word(task, task_lifetime_state_word);
+    while (true) {
+        Int observed = thread.atomic_load(state);
+        if (observed == task_lifetime_heap_running_owner) {
+            if (thread.atomic_compare_exchange(
+                    state, observed, task_lifetime_heap_running_ownerless
+                )
+            ) {
+                return;
+            }
+            continue;
+        }
+        if (observed == task_lifetime_heap_completed_owner) {
+            if (!claim_task_cleanup(state, observed)) { continue; }
+            invoke_task_cleanup(task);
+            return;
+        }
+        if (observed == task_lifetime_heap_consumed_owner) {
+            if (!claim_task_cleanup(state, observed)) { continue; }
+            thread.deallocate_storage(task);
+            return;
+        }
+        assert(false);
+        return;
+    }
+}
+
+Bool claim_task_cleanup(Int*! state, Int observed) {
+    return thread.atomic_compare_exchange(
+        state, observed, task_lifetime_cleanup_claimed
+    );
+}
+
+() invoke_task_cleanup(UInt8* task) {
+    Void* raw_cleanup = load_pointer(task, task_cleanup_function_word);
+    assert(raw_cleanup != null);
+    RawFn<(), Void*> cleanup = unsafe { raw_cleanup$.as(RawFn<(), Void*>) };
+    cleanup(unsafe { task$.as(Void*) });
 }
 
 // confined 变体只有单一 serial executor 能访问调度字；保留状态机语义但不付原子成本。

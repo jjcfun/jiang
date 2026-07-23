@@ -51,6 +51,7 @@ public struct BodyCheck: Movable {
     list.ArrayList<LocalInitBinding> local_init_states!;
     Int assignment_target_depth!;
     Int lambda_capture_initializer_depth!;
+    Bool allow_implicit_owner_capture!;
     Int await_depth!;
     Int await_task_count!;
     hir.HirId? catch_value_call!;
@@ -66,6 +67,7 @@ public struct BodyCheck: Movable {
         self.local_init_states = list.ArrayList<LocalInitBinding>();
         self.assignment_target_depth = 0;
         self.lambda_capture_initializer_depth = 0;
+        self.allow_implicit_owner_capture = false;
         self.await_depth = 0;
         self.await_task_count = 0;
         self.catch_value_call = null;
@@ -1186,6 +1188,7 @@ public struct BodyCheck: Movable {
             return source_type;
         }
         if (self.type_is_owner_pointer(source_type)) {
+            if (self.allow_implicit_owner_capture) { return source_type; }
             self.type_ops.add_node_error(
                 node_id,
                 "owner value capture requires explicit capture initializer",
@@ -2028,6 +2031,14 @@ public struct BodyCheck: Movable {
         self.check_inherited_async_block_domain(node_id, block.effects);
         self.check_effect_set(block.effects);
         self.check_cross_domain_block_captures(block);
+        if (block.effects.has_async && self.async_block_has_explicit_return(block)) {
+            self.type_ops.add_node_error(
+                node_id,
+                "async and sync blocks do not support an explicit return; use the block result",
+                "async_block_explicit_return_not_supported"
+            );
+            return self.state.store.types.invalid_type();
+        }
         types.EffectSet saved_effects = self.enter_block_effects(block.effects);
         Int index! = 0;
         while (index < block.statements.length) {
@@ -2048,6 +2059,53 @@ public struct BodyCheck: Movable {
         }
         self.current_effects = saved_effects;
         return self.block_result_type(node_id, block, self.state.store.types.unit_type(), null);
+    }
+
+    Bool async_block_has_explicit_return(self, hir.HirBlock block) {
+        Int index! = 0;
+        while (index < block.statements.length) {
+            if (self.node_has_explicit_return(block.statements[index])) { return true; }
+            index = index + 1;
+        }
+        if (block.result is .some(result)) {
+            return self.node_has_explicit_return(result);
+        }
+        return false;
+    }
+
+    Bool node_has_explicit_return(self, hir.HirId node_id) {
+        hir.HirNode node = self.state.hirs.node(node_id);
+        if (node.data is .return_stmt(_)) { return true; }
+        if (node.data is .block(block)) {
+            if (block.effects.has_async) { return false; }
+            return self.async_block_has_explicit_return(block);
+        }
+        if (node.data is .guard_stmt(guard_stmt)) {
+            return self.node_has_explicit_return(guard_stmt.else_body);
+        }
+        if (node.data is .if_expr(if_expr)) {
+            if (self.node_has_explicit_return(if_expr.then_body)) { return true; }
+            if (if_expr.else_body is .some(else_body)) {
+                return self.node_has_explicit_return(else_body);
+            }
+            return false;
+        }
+        if (node.data is .loop_expr(loop_expr)) {
+            return self.node_has_explicit_return(loop_expr.body);
+        }
+        if (node.data is .switch_expr(switch_expr)) {
+            Int index! = 0;
+            while (index < switch_expr.cases.length) {
+                if (self.node_has_explicit_return(switch_expr.cases[index].body)) { return true; }
+                index = index + 1;
+            }
+            return false;
+        }
+        if (node.data is .catch_expr(catch_expr)) {
+            return self.node_has_explicit_return(catch_expr.value)
+                || self.node_has_explicit_return(catch_expr.body);
+        }
+        return false;
     }
 
     qid.TypeId check_block_expected(self, hir.HirId node_id, hir.HirBlock block, qid.TypeId expected_type) {
@@ -2102,6 +2160,9 @@ public struct BodyCheck: Movable {
 
     qid.TypeId check_sync_block(self, hir.HirId node_id, hir.HirId async_block) {
         qid.TypeId task_type = self.check_node(async_block);
+        if (self.type_ops.is_invalid_type(task_type)) {
+            return task_type;
+        }
         types.TypeInfo info = self.state.store.types.get(task_type);
         guard info.data is .task_type(task) else {
             self.type_ops.add_node_error(
@@ -2134,7 +2195,12 @@ public struct BodyCheck: Movable {
         if (self.state.results.def_type(function_def) != null) { return; }
         list.ArrayList<typeck_store.LambdaCaptureInfo> captures! =
             list.ArrayList<typeck_store.LambdaCaptureInfo>();
+        Bool saved_owner_capture = self.allow_implicit_owner_capture;
+        // async block 的 environment 由新 Task 独占；owner capture 因而是一次隐式 move。
+        // 普通 Fn lambda 仍要求显式 capture initializer，避免闭包值构造时隐藏所有权转移。
+        self.allow_implicit_owner_capture = true;
         self.collect_implicit_lambda_captures(function_def, node_id, captures$.ref());
+        self.allow_implicit_owner_capture = saved_owner_capture;
         self.state.results.record_lambda_captures(function_def, captures$.ref());
         self.check_task_lambda_captures(node_id, function_def);
         list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
@@ -2169,9 +2235,9 @@ public struct BodyCheck: Movable {
     Bool lambda_capture_is_task(self, typeck_store.LambdaCaptureInfo capture) {
         if (capture.source_def is .some(source_def)) {
             qid.TypeId source_type = self.type_ops.type_for_def(source_def);
-            if (self.type_is_task(source_type)) { return true; }
+            if (self.type_ops.type_contains_task_value(source_type)) { return true; }
         }
-        return self.type_is_task(capture.type_id);
+        return self.type_ops.type_contains_task_value(capture.type_id);
     }
 
     () mark_detached_async_start(self, hir.HirId node_id) {
@@ -4668,6 +4734,9 @@ public struct BodyCheck: Movable {
         if (self.check_task_cancel_call(node_id, call) is .some(result_type)) {
             return result_type;
         }
+        if (self.check_task_cancel_await_call(node_id, call) is .some(result_type)) {
+            return result_type;
+        }
         if (self.check_enum_init_call(node_id, call) is .some(type_id)) {
             return type_id;
         }
@@ -4806,14 +4875,33 @@ public struct BodyCheck: Movable {
             );
             return self.state.store.types.invalid_type();
         }
+        self.state.hirs.replace_node_data(node_id, .cancel_task_expr(member_access.base));
+        return self.state.store.types.unit_type();
+    }
+
+    qid.TypeId? check_task_cancel_await_call(self, hir.HirId node_id, hir.HirCall call) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .member_access(member_access) else { return null; }
+        if (!self.symbol_text_equal(member_access.member_symbol, "cancel_and_await")) { return null; }
+        qid.TypeId base_type = self.check_node(member_access.base);
+        guard self.task_value_type(base_type) is .some(_) else { return null; }
+        if (call.type_args.length != 0 || call.args.length != 0) {
+            self.check_call_args(call);
+            self.type_ops.add_node_error(
+                node_id,
+                "Task.cancel_and_await() does not accept arguments",
+                "task_cancel_await_arity_mismatch"
+            );
+            return self.state.store.types.invalid_type();
+        }
         if (!self.current_effects.has_async) {
             self.type_ops.add_node_error(
                 node_id,
-                "Task.cancel() requires async context",
-                "task_cancel_requires_async_context"
+                "Task.cancel_and_await() requires async context",
+                "task_cancel_await_requires_async_context"
             );
         }
-        self.state.hirs.replace_node_data(node_id, .cancel_task_expr(member_access.base));
+        self.state.hirs.replace_node_data(node_id, .cancel_await_task_expr(member_access.base));
         return self.state.store.types.unit_type();
     }
 
