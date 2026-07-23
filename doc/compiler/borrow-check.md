@@ -35,10 +35,10 @@ unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证�
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
 - 为 drop 插入和后续 backend 提供约束结果。
 
-返回引用只来自同一种输入来源时，该来源 lifetime 默认覆盖当前函数返回值。如果函数显式声明了
-`@life(... > return)`，borrow check 只允许标注中的来源。返回引用可能来自多种输入来源时，必须
-显式写出所有允许来源；跨函数调用返回引用、返回含引用字段的聚合值、或 public API 需要表达
-返回来源时，仍应使用 `@life(source > return)`。
+普通函数没有显式 return lifetime 时，只允许 `arg0` 覆盖返回值；方法的 `arg0` 是 `self`，
+自由函数的 `arg0` 是第一个参数。`@life(... > return)` 只允许标注中的来源，`@life()` 则
+明确禁止所有参数来源。`Fn` / `RawFn` 默认使用空返回契约；高阶接口允许 callback 返回参数
+borrow 时，必须显式声明 callable 的来源关系。
 
 binding/place 的基本可写性由 type check 阶段检查：`T name!` 表示该存储位置可写，但不改变
 `TypeId`。字段、tuple 元素、union payload 和数组元素的写能力沿 place 传播；共享引用 `T&`

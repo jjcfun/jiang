@@ -573,6 +573,7 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 函数省略 `@life` 时，默认返回来源固定为第 0 个参数：方法是 `self`，自由函数是第一个参数。
 返回引用可能来自其他参数或多个来源时必须显式标注。`@life(input > return)` 只传播 `input`
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
+`@life()` 明确表示返回值不能携带任何参数 borrow。
 
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
@@ -583,6 +584,10 @@ Int& apply(Fn<Int& result, Int& value> callback, Int& value);
 
 契约名本身不参与类型身份；解析后的来源关系参与 callable 的语义兼容性。因此，返回其他参数
 借用的函数或 lambda 不能传给上述 `callback`。
+
+`Fn<R, Args...>` 和 `RawFn<R, Args...>` 默认使用空 lifetime 契约：`R` 不能借用 callback
+参数。允许 callback 返回参数 borrow 时，必须像上例一样显式声明
+`callback.value > callback.result`。这条规则不同于普通函数的默认 `arg0 > return`。
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。

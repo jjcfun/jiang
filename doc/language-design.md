@@ -497,6 +497,8 @@ struct Slice {
 函数没有显式 return lifetime 时，公开契约固定为 `@life(arg0 > return)`：方法的 `arg0`
 是 `self`，自由函数的 `arg0` 是第一个参数。返回来源不是 `arg0`、可能来自多个参数或存在歧义时，
 必须显式写出所有允许来源；编译器不会根据函数体“恰好只返回某一个参数”改变公开契约。
+`@life()` 表示显式空返回契约，即返回值不能携带来自任何参数的 borrow。只声明
+`callback.input > callback.result` 之类的 callable 子契约不会清除外层函数自身的默认契约。
 
 `@life(input > return)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
 因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
@@ -518,6 +520,11 @@ Int& apply(
 共用该 contract；
 closure environment 等 ABI 隐藏参数不进入公开索引。trait object 动态派发和 RawFn/Fn adapter
 同样必须把 contract 映射到 MIR 实参数；borrow checker 不再用“callee 加全部实参”猜测间接调用来源。
+
+裸 `Fn<R, Args...>` / `RawFn<R, Args...>` 的默认返回契约为空。它等价于把 `R` 固定在参数
+lifetime 之外，因此 callback 不能把参数 borrow 作为 `R` 返回；这与普通函数默认
+`arg0 > return` 的规则不同。需要返回参数 borrow 的高阶接口必须用 callable 契约名
+显式声明来源。
 
 跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，仍建议显式表达返回值不超过来源：
 

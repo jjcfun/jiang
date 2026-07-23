@@ -44,6 +44,10 @@
 `Fn<Ret, Args...>` 和 `RawFn<Ret, Args...>` 是编译器内建类型族。`Args...` 是内建的
 type parameter pack，不要求先开放普通用户泛型参数包。
 
+两者默认使用空 `LifetimeContract`：返回类型 `Ret` 不能携带参数 borrow。允许 callable
+返回某个参数的 borrow 时，由接收它的函数通过命名 result/参数和 `@life` 显式声明来源；
+普通函数自身仍使用默认 `arg0 > return`，也可以用 `@life()` 强制设为空。
+
 ```jiang
 Fn<Bool, Int, Int>       // 栈闭包值，可能带 environment
 Fn<Bool, Int, Int>^      // owned closure handle，environment 在 heap 上
