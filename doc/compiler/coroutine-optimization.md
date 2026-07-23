@@ -133,8 +133,9 @@ pool。runtime 只依赖 `system.thread.AtomicStackArray` 的 opaque handle，�
 macOS provider 暂由 `OSAtomicEnqueue/Dequeue` 保证 ABA safety；最终应由 compiler atomic intrinsic
 提供目标相关的 lock-free tagged CAS，不能退化成未经证明的单指针 Treiber stack。
 
-公开的 `Atomic<T>` 属于 std；load/store/exchange/CAS 必须由 compiler intrinsic 直接生成 LLVM
-atomic IR。system 只承载目标能力和 runtime 私有 provider，不能让每次用户原子操作经过 OS 函数。
+公开的 `Atomic<T>` 由 builtin 声明并通过 core 导出；load/store/exchange/CAS 由 compiler intrinsic
+直接生成 LLVM atomic IR。协程 runtime 的标量状态字也通过同一 `Atomic<Int>` 路径访问，不再经过
+system 或 OS atomic 函数。system 只保留等待/唤醒、队列和 ABA-safe shared frame stack 等目标能力。
 
 ## 三种执行形态
 
