@@ -32,16 +32,19 @@ scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
 
 ## 语义基础：Task 是结构化子任务
 
-`Task<T>` 已经只能作为 body-local 类型，不能出现在参数、返回值、字段或 global 中，也不能被
-lambda/effect block 捕获。最终实现继续利用这个限制，固定以下语义：
+直接 `Task<T>` 是地址稳定的 `!Movable` 结构化子任务；`new async` 在 heap 上原地初始化相同布局，
+并返回可移动、非 Copyable 的 `Task<T>^` owner。TaskState 是 Task 的唯一内联字段，不存在独立
+control block。两种形态共享完成、等待与取消状态机：
 
 - 显式 Task 必须在父 coroutine 完成前完成。
-- `await()` 正常消费 Task；`cancel()` 请求取消并等待 Task 完成。
+- `await()` 正常消费 result；`cancel()` 只同步发布幂等取消请求，`cancel_and_await()` 请求取消并
+  等待 Task 完成。result 只能被 `await()` 或 `cancel_and_await()` 消费一次。
 - 活跃 Task 到达 scope exit、return、throw 或父任务取消路径时，
   编译器先请求取消，再等待完成。
 - 同一退出路径有多个活跃 Task 时，先向全部 Task 发出取消，再逐个 join，不能串行执行
   `cancel + join`。
-- standalone `async { ... }` 是显式 detached 入口。丢弃 Task handle 不再隐式表达 detach。
+- standalone `async { ... }` 是显式 detached 入口。丢弃直接 Task 不表达 detach；丢弃 `Task<T>^`
+  owner 不阻塞、也不隐式取消，由 owner/coroutine 双方交接回收 heap Task。
 - 禁止对 Task 使用 `forget`，否则结构化生命周期无法成立。
 
 因此父 frame 是所有 scoped Task storage 的合法 owner。父 cleanup 只有在所有子任务 join 后才能
@@ -51,7 +54,7 @@ lambda/effect block 捕获。最终实现继续利用这个限制，固定以下
 
 ### Swift
 
-Jiang 的 body-local `Task<T>` 最接近 Swift `async let`：
+Jiang 的直接 `Task<T>` 最接近 Swift `async let`：
 子任务不能越过词法作用域；
 未显式等待的子任务在任何退出路径上都先隐式取消，再等待完成。
 它不等价于 Swift 的非结构化 `Task`；后者即使 handle 被丢弃也会继续运行。
@@ -114,6 +117,12 @@ liveness 自动完成组合，不把 sender/receiver 模板层暴露给语言使
 - scoped Task：借鉴 Swift `async let` 的结构化生命周期和预分配 storage，由 parent 唯一回收。
 - detached coroutine：独立 heap ownership，语义上对应 Swift 非结构化 Task，而不是 scoped Task。
 
+这里的“一套”以 source resume 和 continuation ABI 为边界：direct、scoped/heap Task、跨 Domain
+Task 和 detached 都复用同一 frame state dispatch、suspend 与取消入口。它们只替换 continuation
+终点；跨 Domain 只替换 enqueue policy。`extern async` 没有 Jiang resume body，但其 adapter 发布
+同一 TaskState completion 协议。direct/detached 不形成可观察 Task，因此不为布局统一而补造
+TaskState。
+
 frame pool、task-local arena 等 allocator 技术只处理无法静态嵌入的 fallback frame，不能进入语言
 语义，也不能代替逃逸、递归 layout 和跨线程生命周期证明。
 
@@ -152,7 +161,7 @@ fallback 也不能创建 Task control state 或独立 resume token。
 
 ### Scoped Task
 
-源码形成 body-local Task 时：
+源码形成直接 Task 时：
 
 - Task control state 默认位于父 frame；同步 root 可以位于调用者栈。
 - 静态已知且不形成递归 layout 的子 frame，可以与 control state 一起位于父 frame。
@@ -169,6 +178,16 @@ fallback 也不能创建 Task control state 或独立 resume token。
 因为扩大父 allocation 和 cache footprint 而比单独分配更慢。最终由 storage planner 根据 layout、
 递归 SCC、CFG 热度和 profile 信息选择 `parent_frame` 或 `heap_frame`，
 而不是把经验阈值写死在 ABI 中。
+
+### Heap Task owner
+
+`new async { ... }` 直接在 heap allocation 中初始化 `Task<T>`，并返回 `Task<T>^`。owner pointer
+可以按值传参、返回、存入字段、数组和泛型实例，而 TaskState 与 coroutine frame 的地址保持稳定。
+heap Task 不使用通用引用计数：owner 和 coroutine 各持有固定的一方 lifetime 状态，最后离开的一方
+回收 result、frame 和 Task allocation。owner 析构不能在 serial Domain 上阻塞等待，也不能隐式取消。
+当前 `new async` 始终采用这个 heap baseline。直接 `Task<T>` 已由类型规则证明不逃逸并使用 parent-local
+storage，不需要再做事后 escape analysis；只有分配 benchmark 证明有必要时，才考虑对未逃逸
+`Task<T>^` 做不改变地址、生命周期和 `new` 可观察语义的 as-if stack promotion。
 
 ### Detached coroutine
 
@@ -458,11 +477,11 @@ token 或调度引用计数。
 
 结构化 Task cleanup 是可挂起控制流，不能继续作为 `StorageDead` 前的一条 release statement：
 
-1. Task handle 在函数入口初始化为 null，创建成功后再发布真实 state pointer。
-2. MIR lowering 根据离开的词法 local range 找出 Task；已消费或未初始化 Task 的 handle 为 null。
-3. 第一阶段向全部仍有 handle 的 Task 传播取消。
-4. 第二阶段为每个 Task 生成 join suspend point，并消费 handle。
-5. join 完成后 drop 未消费 result、销毁 child frame，并清除 Task owner。
+1. 每个直接 Task place 在最终 destination 中原地初始化，编译器记录初始化和 result 消费事实。
+2. MIR lowering 根据离开的词法 place range 找出 Task；未初始化或已经完成消费的 place 不进入 cleanup。
+3. 第一阶段向全部仍然活跃的 Task 传播取消。
+4. 第二阶段为每个 Task 生成 join suspend point，并消费其 result ownership。
+5. join 完成后 drop 未消费 result、销毁 child frame，并按 storage plan 释放 Task storage。
 6. 所有 Task 完成后才继续 `StorageDead`、普通 local drop 和 parent completion。
 
 Task cleanup CFG 必须先于 coroutine suspend-point collection 和 frame liveness，否则新增 join 状态
@@ -477,14 +496,13 @@ Task cleanup CFG 必须先于 coroutine suspend-point collection 和 frame liven
    这一步即使暂时保留 heap allocation 也必须成立。
 3. 已完成：增加 TaskRegion analysis 和 storage plan，让 scoped Task control state 与静态 child frame
    进入父 frame。
-4. 进行中：普通 async、async block、async Fn/RawFn 统一消费 storage plan；非泛型递归回边已经使用
-   heap frame + Job handoff，静态 immutable async lambda 已去虚化，真正动态 frame 仍需接入统一
-   placement/allocator。
+4. 已完成：普通 async、async block、async Fn/RawFn 统一消费 storage plan；递归回边使用 heap frame +
+   Job handoff，静态 immutable async lambda 已去虚化，动态 frame 接入 coroutine allocator。
 5. 已完成：删除 scoped ownership CAS、allocation pointer、result-drop 函数指针、
    result-initialized 原子字、通用 external continuation 和固定 cancel-handler payload；waiter 协议已合并
    进 completion word，waiter/adapter record 都由 parent frame 按 TaskRegion 复用，cancel handler 直接
    由 tagged target word 指向 suspend record。
-6. 进行中：`local_serial` 与 `concurrent` 生成不同 completion/join lowering；同 binding serial
+6. 已完成：`local_serial` 与 `concurrent` 生成不同 completion/join lowering；同 binding serial
    completion 使用普通 load/store，显式跨 binding、concurrent Domain、external async 保留
    acquire/release 协议。传递执行封闭分析、递归 SCC/binding 固定点和独立 confined
    resume 变体已经接通并按 local-root 可达闭包惰性生成；confined Task 的 start、request、handoff、
@@ -498,7 +516,7 @@ Task cleanup CFG 必须先于 coroutine suspend-point collection 和 frame liven
 8. 已完成：dynamic async callable、非泛型 recursive backedge 和 detached frame 接入 coroutine
    size-class allocator；serial local pool 为零原子热路径，concurrent/cross-executor 使用 ABA-safe
    shared pool。调度器统一通过语言层 atomic intrinsic 实现，不依赖特定系统的队列原语。
-9. 最后基于 profile 调整 parent-frame/heap-frame placement，不用固定大小阈值代替证据。
+9. 后续仅在 benchmark 证明必要时调整 parent-frame/heap-frame placement，不用固定大小阈值代替证据。
 
 每一步都必须保持同一套 Task lifecycle 语义；
 storage、sync 和 reclaim policy 可以静态特化，但不能
@@ -509,18 +527,25 @@ storage、sync 和 reclaim policy 可以静态特化，但不能
 正确性测试至少覆盖：
 
 - Task 正常 await、显式 cancel、scope exit、early return、throw 和父取消。
-- 已消费 Task 不得重复取消；所有退出路径上的未消费 Task 必须先传播取消。
+- Task result 不得在不同源码位置重复消费；`cancel()` 可重复调用，并且取消后仍可 await。
 - 多个 live child 先全部 cancel 再 join。
 - child completion 与 waiter registration、cancel request、parent cleanup 的全部竞态。
 - 同/不同 serial executor、concurrent Domain 和外部线程 callback。
 - recursive async、dynamic async Fn/RawFn、detached async 和 sync root。
 - result/capture drop 恰好一次，并在 sanitizer 下无 UAF、leak 或 data race。
 
+`script/lang_check.sh` 可用 `LANG_CHECK_SANITIZER=address|thread` 对 run 用例启用 ASan/TSan，
+并用 `LANG_CHECK_RUN_FILTER` 选择竞态用例。macOS 默认使用系统 clang 的 compiler-rt；其他平台可用
+`LANG_CHECK_SANITIZER_CLANG` 指定带 sanitizer runtime 的 clang。compile-only check/fail/emit 在该模式下
+跳过，避免把 sanitizer gate 和普通诊断测试混在一起。
+
 性能验证不能只测总耗时，还要有结构断言：
 
 - direct async call：0 TaskState allocation，0 ownership CAS；
   acyclic known callee 为 0 frame allocation，recursive/dynamic callee 最多 1 次。
 - scoped Task：0 control-state allocation，0 ownership CAS。
+- heap Task owner：当前 baseline 恰好 2 次 box allocation，分别保存完整 `Task<T>` 和 child frame；
+  TaskState 不形成第三个 allocation。
 - 同 serial executor scoped Task：completion word/join registration 0 atomic operation；传递证明
   fully-confined 后，整个 join/completion 路径 0 atomic operation。
 - `may_defer=false` scoped Task：沿 confined resume 与 serial completion 执行，不复制专用协程体；若 profile
@@ -533,6 +558,10 @@ storage、sync 和 reclaim policy 可以静态特化，但不能
   capture env 与所有显式参数按源 MIR `.param` local 顺序写入 frame。
 - recursive/dynamic child：最多 1 次 frame allocation，不再额外分配 TaskState/token。
 - detached coroutine：最多 1 次 frame allocation。
+
+`frame_layout_slot_mapping.jiang` 直接统计 lowering 后的 MIR allocation 节点，固定 direct/scoped 为 0、
+heap owner 为 2、detached 为 1。该结构计数与 allocator pool/cache 是否命中无关；运行时 benchmark
+只能用于判断这些 baseline allocation 是否值得优化，不能替代结构断言。
 
 同时记录 frame size、heap bytes、原子 RMW 次数、enqueue 次数、direct resume 次数和 allocator
 remote-free 次数。任何“优化”如果只减少 malloc，

@@ -1,6 +1,6 @@
 # Type Check 设计
 
-type check 消费 resolved HIR，输出 `TypeCheckStore`。它负责类型引用解析、function
+type check 消费 resolved HIR，输出 `TypeCheckStore` 和规范化后的 typed HIR。它负责类型引用解析、function
 signature、expression/pattern type、member selection、generic arg 检查、trait bound 基础规则
 和 lazy type query cycle guard。
 
@@ -11,7 +11,10 @@ signature、expression/pattern type、member selection、generic arg 检查、tr
 - `TypeStore`：类型驻留和 builtin type。
 - `CompilerContext.diagnostics`：诊断输出。
 
-type check 不回读 AST，不重新 resolve，也不直接修改 HIR。
+type check 不回读 AST，也不重新 resolve。普通 call 在语义选择完成后可以保留原 `HirId`，原位替换成
+`await_task_expr`、`cancel_task_expr` 等 typed HIR operation。包装原表达式时，原表达式获得新 `HirId`，
+已经完成的类型与选择结果通过 `TypeCheckStore.clone_node_results()` 迁移。`replace_node_data()` 本身只替换
+节点数据，不维护任何 side table。
 
 ## 输出
 
@@ -26,6 +29,9 @@ type check 不回读 AST，不重新 resolve，也不直接修改 HIR。
 - default/named call argument 的签名顺序重排结果。
 - generic instantiation 所需的 type args。
 - 错误状态和必要诊断。
+
+typed HIR operation 只表达已经完成语义选择、需要专用控制流 lowering 的操作。它不是在 type check 中
+重新建立一棵任意 IR，也不能绕过普通 member/call 检查。
 
 普通 definition 的类型结果写入 `TypeCheckStore`，不写回 `TypeStore`。
 

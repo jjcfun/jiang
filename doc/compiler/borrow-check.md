@@ -9,7 +9,7 @@ Jiang 的 borrow check 处理所有权、move/use-after-move、引用逃逸、�
 后续使用计算，因此最后一次使用结束后，来源 place 可以恢复访问。
 
 唯一借用只约束语言引用，不负责证明并发代码整体没有 data race。跨 domain 的可变引用另由
-domain borrow 规则检查；同步共享状态仍应使用 mutex、atomic、channel 等显式机制。
+domain borrow 规则检查；同步共享状态仍应使用 mutex、atomic 等显式机制。
 裸指针的创建、转换和显式释放由 sema 的 unsafe effect gate 检查；borrow check 不再重复做
 unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证明；borrow check 只在
 裸指针操作影响 owner、lifetime 或 drop safety 时介入。
@@ -71,6 +71,12 @@ BorrowCheckStore
 
 `MovePath` 按 MIR place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
 里的不同节点。移动父 path 会使子 path 不可用；重新赋值父 path 会重新初始化整棵子树。
+
+moved/live dataflow 以 `MovePathId` 为下标存入 bitset。父 path 的清理通过 move-path child table
+遍历真实子树，不扫描整个函数的全部 path，也不为每个候选 path 重走祖先链。consumed Task 与 active
+loan 仍是稀疏事实列表；StorageDead 清理先探测是否存在匹配事实，无匹配时不重建列表。这样顺序创建
+大量 scoped Task 时，清理成本与当前 local 的子树和实际事实数量相关，而不是与全函数 MovePath 数量
+相乘。
 
 `Loan` 表示某个 MIR location 产生的引用或指针视图。当前实现区分 shared reference、mutable
 reference 和 raw pointer view，并同时记录来源与承载该 view 的目标 place。引用 loan 既用于
@@ -151,7 +157,6 @@ MIR 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap
 ## 待设计
 
 - 更精确的 region/lifetime 推导，以及复杂循环和聚合 reborrow 的诊断质量。
-- copy/drop trait 或 builtin copy 规则。
 - packed/alignment 对 borrow 的限制。
 - 与 `@life(...)` annotation 的集成。
 - 闭包捕获和 async/generator 状态机中跨挂起点借用的完整规则。

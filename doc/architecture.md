@@ -83,12 +83,14 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 - `hir`
   - 生产：resolved untyped HIR、HIR store。
   - 消费：resolve facts。
-  - 禁止：保存 type check 结果、layout、backend symbol。
+  - 禁止：保存 type check side table、layout、backend symbol。
 - `type_check`
-  - 生产：`TypeCheckStore`、trait/overload/type facts、builtin operation lowering kind、
+  - 生产：`TypeCheckStore`、trait/overload/type facts、typed HIR operation、builtin operation lowering kind、
     trait companion type facts、const initializer 的 `ComptimeValue`。
   - 消费：HIR、resolve facts。
-  - 禁止：改写 HIR、计算 ABI layout、生成 MIR。
+  - 允许：保留 `HirId` 原位把普通 call/wrapper 规范化为 typed HIR operation；相关类型与选择结果仍写入
+    `TypeCheckStore`。
+  - 禁止：重新 resolve 名字、计算 ABI layout、生成 MIR。
 - `comptime`
   - 生产：早期 source selection 结果，以及 `ComptimeStore` 中的 `DefId -> ComptimeValue`。
   - 消费：AST、resolve facts、type facts。

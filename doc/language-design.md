@@ -3,8 +3,8 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.7-2` 分支在既有自举编译器、泛型/trait、MIR/backend、闭包、async/domain
-和源码级语言测试基础上，收口 binding mutability、唯一可变引用与 raw pointer 能力。
+当前 `release/0.4.8` 分支在既有自举编译器、泛型/trait、MIR/backend、闭包、async/domain
+和源码级语言测试基础上，完善一等 Task、协作式取消、Movable/Copyable 与多线程同步 API。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
@@ -284,7 +284,7 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 
 唯一可变引用会在单个 borrow-check 域内排斥重叠别名，但这不等于自动证明任意并发程序
 没有 data race。跨 domain 传递受 domain borrow 规则约束；跨线程共享可变状态仍必须通过
-标准库的 mutex、rwlock、atomic、channel 或其他显式同步协议表达。
+标准库的 mutex、atomic 或其他显式同步协议表达。Channel 与 rwlock 尚未进入 0.4.8 公共 API。
 
 `^` 和 `&` 会创建新的 language handle 外层。一个完整源码类型中最多只能出现一个 `^`
 或 `&` 外层；源码中不允许写出 `^^`、`&&`、`^&` 或 `&^`。`T*` 和 `T[]&`

@@ -961,7 +961,7 @@ Int main() {
 }
 ```
 
-需要并发启动调用时，在调用前写 `async`，得到 body-local `Task<T>`。Task 是 eager 的，创建后
+需要并发启动调用时，在调用前写 `async`，得到地址固定的 `Task<T>`。Task 是 eager 的，创建后
 立即开始执行；依次调用 `await()` 不会把启动过程串行化：
 
 ```c
@@ -973,15 +973,56 @@ async Int load_both() {
 ```
 
 `async { ... }` 创建 block Task；`async [WorkerDomain] { ... }` 同时指定 execution domain。
-`Task<T>` 只能作为函数 body 内的局部值，不能出现在参数、返回类型、字段或 public ABI 中，也不能
-显式写 domain 参数。`task.await()` 与 `task.cancel()` 都消费 Task，只能选择一个；`cancel()` 等待 Task
-进入终态后返回。若 Task 正在等待显式 child Task，取消会传播到 child，并在 child 进入终态后继续
-清理 parent；直接调用的 async child 会继承同一取消上下文，在恢复边界先 unwind，再恢复 parent。
+async/sync block 使用最后一个表达式作为结果，不支持显式 `return`；`return` 只用于普通或 async 函数体。
+直接 `Task<T>` 是 `!Movable` 原地值，可以直接作为 struct、tuple 或固定数组中的静态字段；包含它的
+聚合值同样不可移动、按值传参、返回或捕获。`new async { ... }` 创建可移动、非 Copyable 的
+`Task<T>^` owner。owner 可以按值传参、返回、存入字段、容器和泛型实例；Task 的公开类型不包含 execution
+domain。`task.await()` 消费一次 result，重复消费会被诊断。`task.cancel()` 只同步、幂等地发布请求，
+不等待也不消费 result；`task.cancel_and_await()` 发布请求并等待退出。若 Task 正在等待显式 child
+Task，取消会传播到 child，并在 child 进入终态后继续清理 parent；直接调用的 async child 会继承
+同一取消上下文，在恢复边界先 unwind，再恢复 parent。CPU 密集型 async 代码可调用
+`coroutine.check_cancelled()` 显式观察请求；`await()` 遇到已取消 child 时会取消当前 parent，并由
+结构化 cleanup 取消其余 sibling。`cancel_and_await()` 只取消目标 Task，不取消 caller。
 
-Task 是结构化子任务。未消费的 Task 离开 scope、执行 `return`/`throw` 或随 parent 取消时，编译器
+直接 Task 是结构化子任务。未消费的直接 Task 离开 scope、执行 `return`/`throw` 或随 parent 取消时，编译器
 先向该退出路径上的全部活跃 Task 请求取消，再逐个等待其进入终态；所有 child 完成后才销毁其余
-局部值并释放 parent frame。Task handle 固定在创建它的绑定上，`Task<T>` 不支持 `move()`、
-`forget()` 或重新赋值。
+局部值并释放 parent frame。直接 `Task<T>` 的地址固定，不支持 `move()`、`forget()` 或重新赋值。
+`Task<T>^` owner 析构不阻塞、也不隐式取消；owner 与 coroutine 通过固定的双方原子交接决定最后回收者。
+
+跨线程共享简单标量状态时使用 `Atomic<T>`。默认的 `get()`、`set()`、`get_and_set()` 和
+`compare_exchange()` 使用 sequential order；需要更弱顺序时使用对应的 `*_with_order` 方法：
+
+```jiang
+Atomic<Int> state = Atomic<Int>(0);
+state.set_with_order(1, .release);
+Int observed = state.get_with_order(.acquire);
+Int previous = state.get_and_set_with_order(2, .acquire_release);
+Bool changed = state.compare_exchange_with_order(
+    2, 3, MemoryOrder.acquire_release, MemoryOrder.acquire
+);
+```
+
+`MemoryOrder` 统一提供 `relaxed`、`acquire`、`release`、`acquire_release` 和 `sequential`。load 只接受
+`relaxed`、`acquire`、`sequential`；store 只接受 `relaxed`、`release`、`sequential`；exchange 接受
+全部顺序；compare-exchange 的 failure order 只接受 `relaxed`、`acquire`、`sequential`，且不能强于
+success order。Atomic 是显式的内部可变性入口，调用写操作不要求外部 binding 带 `!`。当前 `T`
+仅支持后端保证 lock-free 的整数、Bool 和裸指针标量。
+
+需要保护一段同步访问时使用 `Mutex`。`lock()` 返回独占 `MutexGuard`；guard 离开作用域时自动解锁，
+没有需要手工配对的公开 `unlock()`：
+
+```jiang
+Mutex mutex = Mutex();
+{
+    MutexGuard lock_guard = mutex.lock();
+    update_shared_state();
+}
+```
+
+`Mutex` 是 `!Movable`，因此已有 guard 不会因锁对象移动而悬垂。`MutexGuard` 可以 move，以便把唯一的
+解锁责任传给同步 helper；它不能跨 async 挂起点存活。需要等待异步操作时，应先结束 guard 的作用域，
+再调用 async 函数。当前 Mutex 不提供 poison 状态：Jiang 的正常 `return`、`throw` 和协程 cleanup 都会
+执行 guard 析构，而不可恢复的进程终止没有可供后续持锁者观察的恢复阶段。
 
 需要 detached 执行时，直接把 async block 作为语句启动，不形成 Task handle：
 

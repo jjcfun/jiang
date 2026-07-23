@@ -148,6 +148,23 @@ backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；�
 child frame 连接到 caller continuation。`async call` 和 observed `async {}` 显式 materialize
 `Task<T>`；直接作为语句使用的 async block 生成 detached start。
 
+所有非 external 的 async source 都进入同一套 resume lowering：standard `_Resume(frame)` 共享 frame
+state dispatch、suspend 边界和取消检查。confined 变体只改写已证明 executor-local 的协议操作，RTC
+变体只裁剪已证明不会 suspend 的 direct DAG。入口本身只选择 frame continuation 和调度策略：
+
+| 入口 | control state | completion | schedule |
+| --- | --- | --- | --- |
+| 普通 async 调用 | 继承当前 Task | 恢复 parent | 跨 Domain 才 enqueue |
+| observed Task | 内嵌 TaskState | 发布 Task completion | 静态 storage/sync policy |
+| 跨 Domain Task | 同一 TaskState | 发布 Task completion | 目标 Domain enqueue |
+| detached block | 无 TaskState | 丢弃 result、回收 frame | 按需 enqueue |
+| `extern async` Task | 同一 TaskState header | adapter 发布 completion | 无 Jiang resume body |
+
+因此“统一状态机”指统一 source resume、Task completion word、wait/cancel 协议，不表示给 direct 或
+detached 路径补造 TaskState。standard、fully-confined completion 共用同一 result/drop CFG；后者只在
+证明 executor-local 后把协议操作改为 local。run-to-completion resume 也只对静态证明不会 suspend 的
+direct DAG 生成，它是原状态机的裁剪版本，不是另一套可观察语义。
+
 显式 Task 启动到不同 domain 时使用 `MirCallCallee.domain_enqueue`；动态 executor 路径使用
 `dynamic_domain_enqueue`。callee 同时携带可选 TaskState pointer 和 `handoff` 位。effect argument 不再
 接受 const value；lowering 不解析用户类型上的 `enqueue` 成员，也不暴露 coroutine frame ABI。
@@ -181,13 +198,17 @@ recursive backedge 和 detached async block 复用同一 ABI。serial executor �
 依次调用 resume，避免 completion 在当前 resume 栈内递归重入 continuation。该队列不提供跨线程
 同步。
 
-0.4.7 将 enqueue 实现移到 `runtime/scheduler.jiang`，backend 只生成稳定 ABI 调用。macOS runtime
-通过 `system.thread` 使用 libdispatch：concurrent domain 进入系统 concurrent queue，serial domain
-按 `domain_id` 进入各自的 serial queue，所有 enqueue 都由 dispatch group 计入 shutdown 生命周期。
-serial queue 注册表由 macOS unfair lock 保护；同一 serial domain 不并发，不同 serial domain
-可以并行。
-runtime shutdown 等待已 enqueue 的 continuation 完成；libdispatch worker 由系统持有，不由 Jiang join。
-其他平台的多线程 runtime 尚未启用。
+0.4.7 将 enqueue 实现移到 `runtime/scheduler.jiang`，backend 只生成稳定 ABI 调用。0.4.8 的
+`system.thread` 为 macOS 和 hosted Linux 提供同一组 Queue、Group、Mutex、Task word wait/wake 与
+shutdown 能力。macOS provider 使用 libdispatch/unfair lock/ulock；Linux hosted provider 使用
+pthread queue/group 和 futex。Linux no-libc 的 Task word wait/wake 直接使用 futex syscall，但完整
+多线程 scheduler 仍需要后续的 clone/thread startup provider。
+
+所有 enqueue 都由 runtime Group 计入 shutdown 生命周期。shutdown 先等待已 enqueue continuation
+完成，再停止并 join runtime 持有的 Linux serial worker，最后释放 executor、Queue、Group 与 provider
+同步状态；macOS 的 libdispatch worker 仍由系统持有。backend 生成的阻塞 Task join 只调用
+`__jiang_system_thread_wait_word` / `wake_word`，不直接引用 ulock 或 futex。provider 的 wait wrapper
+负责吸收 EINTR 和伪唤醒，直到状态字不再等于 expected，避免把中断误当成 Task completion。
 
 第三方 runtime 提供的 `extern async` 使用单隐藏参数 ABI：
 
@@ -216,12 +237,18 @@ ready 后只在成功把 armed claim 为 notified 时调用 waiter。等待方�
 `TaskRegion` 为 control state 和 child frame 分别选择 parent frame、caller stack 或 heap storage，
 并让不重叠的结构化 Task 复用 frame slot。动态/递归 child 仍可只把 child frame 放到 heap。
 
-0.4.7 的 `Task.cancel()` 与 `await()` 是互斥的 consuming operation。cancel 设置 cancellation request，
-把处理请求的工作调度到 task execution domain，并挂起 caller 直到 completion 或 cancellation unwind
-进入 terminal state；它不是 request-and-detach。terminal acknowledgement 发布后才能恢复 cancel waiter，
-并保证 frame、capture 和未消费 result 已经完成清理。
+0.4.8 中 `Task.cancel()` 只原子发布幂等 cancellation request，并把处理请求的工作调度到 task
+execution domain；它不挂起 caller，也不消费 result。`Task.cancel_and_await()` 才会在发布请求后等待
+completion 或 cancellation unwind 进入 terminal state。`await()` 与 `cancel_and_await()` 是 result 的
+single-consumer operation，MIR 的 `TaskConsume` 与 borrow check 会诊断不同源码位置的重复消费。
+`coroutine.check_cancelled()` 对根 cancellation context 执行原子 request claim；即使当前 direct child
+使用 fully-confined 变体，这个访问也不能去原子化，因为根 Task 仍可能由另一 Domain 并发取消。
+普通 `await()` 读到 cancelled terminal state 后转入 caller cancellation entry，继而清理 sibling；
+`cancel_and_await()` 只释放目标 Task 并继续 caller。
 
-0.4.8 将 body-local `Task<T>` 固定为结构化子任务。HIR -> MIR lowering 在每条 scope exit、return、
+0.4.8 将直接 `Task<T>` 固定为地址稳定的结构化子任务，并将 TaskState 作为 Task 的唯一内联字段。
+`new async` 在 heap 上直接初始化同一布局，所得 `Task<T>^` owner 可以传参、返回和存入聚合。
+HIR -> MIR lowering 在每条 scope exit、return、
 throw 和 parent cancellation 路径上生成 cancel-all-then-join CFG：先向全部未消费 Task 发出取消，
 再逐个生成可挂起 join，最后才进入普通 local drop。cancellation entry 在 BodyLowerer 内生成，因此
 cleanup 新增的 suspend point 会参与 state dispatch 和 frame liveness。
@@ -247,7 +274,7 @@ registration 同步执行，因此 lowering 必须处理 cancel-before-registrat
 跨线程迟到 resume。只有取得 terminal ownership 的一方能够恢复 coroutine；取消方仍需等待外部
 completion/cancel acknowledgement 后才能释放 continuation 所在 frame。类型级 `Cancellable` target
 已经移除；每次 suspend 注册的 handler 与 child Task 复用同一个 tagged active-target 状态字。
-cancellation cleanup 统一取消并等待已初始化的 body-local Task，再为 drop elaboration 管理的
+cancellation cleanup 统一取消并等待已初始化的直接 Task，再为 drop elaboration 管理的
 parameter/user local 合成 storage boundary；compiler temp 不伪造 marker，extern continuation record 等
 跨 suspend temp 仍由 liveness 放入 frame。
 
@@ -263,9 +290,9 @@ token。Job 区分 request 与 handoff：外部 wake/首次启动使用 request�
 callable completion shim 和 coroutine continuation 转移使用 handoff。queue callback 调用 target 后不得
 再访问 TaskState，Task completion 最终发布后同样禁止回读。
 
-Task 不允许被嵌套 async/sync effect block 或 lambda 捕获，因此 observer ownership 在 0.4.7 中不会跨
-coroutine frame 转移。Task 可以运行于不同 domain，completion 仍将 waiter enqueue 回创建 Task
-的 effect body 所在 current domain。
+直接 `Task<T>` 不允许被嵌套 async/sync effect block 或 lambda 捕获；可移动的 `Task<T>^` owner
+遵守普通 move、borrow、lifetime 与跨 Domain Sendable 规则。Task 可以运行于不同 domain，completion
+仍将 waiter enqueue 回等待方所在 current domain。
 
 macOS serial `DomainExecutor` 在创建 dispatch queue 时以 executor pointer 作为 queue-specific key 和
 context，因此当前 job 可以无 TLS、无额外 job allocation 地验证 serial Domain 执行权。concurrent

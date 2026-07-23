@@ -12,7 +12,7 @@
 - 普通函数不绑定 execution domain；它只在调用者当前同步控制流中直接执行。
 - `T&!` 表示唯一可变引用；其存活期间不能存在指向重叠 place 的其他共享或可变引用。
 - domain 切换检查叠加在唯一借用之上：普通 `T&!` 不能跨 serial domain 逃逸。
-- `Atomic`、`Mutex`、`Channel`、`Actor` 等同步/并发类型是跨 domain 共享可变状态的显式入口。
+- `Atomic`、`Mutex` 等同步类型是跨 domain 共享可变状态的显式入口；Channel、Actor 留给后续版本。
 - 唯一性属于 `T&!` 类型并进入函数签名；参数位置不使用额外的能力修饰关键字。
 
 本文的主体是 capability。`effect` 用来描述调用上下文，例如 `unsafe`、`async`、`sync`；
@@ -73,7 +73,7 @@ public struct WorkerPoolDomain: Domain {
 
 `Domain.kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.kind ==
 .concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T&!` 不能依赖它保证安全。在
-concurrent domain 中共享可变状态必须使用 `Mutex`、`Atomic`、`Channel` 或等价同步
+concurrent domain 中共享可变状态必须使用 `Mutex`、`Atomic` 或等价同步
 capability。
 
 ## 语法草案
@@ -314,7 +314,7 @@ async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` �
 - `T^`：可以 move 到另一个 domain，前提是 `T` 可安全跨 domain 移动。
 - `Fn` / `Fn^`：根据参数类型和捕获 environment 判断是否能跨 domain。
 - `T*` / `T*!`：跨 domain 需要 `unsafe` 边界。
-- `Atomic<T>` / `Mutex<T>` / `Channel<T>`：由标准库或 runtime 声明为同步安全入口。
+- `Atomic<T>` / `Mutex`：由标准库或 runtime 声明为同步安全入口。
 
 `sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T&!` 带入 `D`。
 等待不为普通引用增加跨 domain 同步语义。
@@ -342,7 +342,7 @@ Task<Int> b = async load_b();
 a.await() + b.await()
 ```
 
-`async load_a()` 阻止普通 `load_a()` 调用的隐式 await，并返回 body-local `Task<Int>`。
+`async load_a()` 阻止普通 `load_a()` 调用的隐式 await，并返回地址稳定的 `Task<Int>`。
 `Task.await()` 消费一个 Task；多个 Task 提前启动后，即使按顺序调用 `await()`，仍保持并发执行：
 
 ```jiang
@@ -374,8 +374,8 @@ Jiang 的 task 语义是 eager、single-completion、cached result、single-cons
   exception channel。
 - task result type 不能是 task；`async { ... }` / `async [D] { ... }` 不允许产生
   nested task。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Task<Task<T>>`。
-- `await()` 和 `cancel()` 都消费 Task，只能选择其中一个；Task 被消费后不能再次 await、cancel
-  或移动。
+- `await()` 和 `cancel_and_await()` 消费一次 result；第二个消费位置会被诊断。
+- `cancel()` 只同步、幂等地发布请求，不消费 result，也不等待 Task 退出；取消后仍可 `await()`。
 
 因此这里是合法的：
 
@@ -395,30 +395,34 @@ let nested = async [PageDomain] {
 }
 ```
 
-Task 只能在 async/sync body 内作为局部不透明值使用。用户可以在局部变量上写
-`Task<T>`，但不能显式写 domain 参数。编译器会根据 initializer 把它补全成内部
-`Task<T, domain D>`：
+用户可以在局部变量或静态可寻址的聚合字段中写直接 `Task<T>`，也可以用 `new async` 创建
+`Task<T>^` owner。Task 的
+公开类型不包含 domain 参数；domain 只保存在创建点和 runtime state 中：
 
 ```jiang
-Task<Int> task = async [PageDomain] { load_page() }; // internal domain: PageDomain
+Task<Int> task = async [PageDomain] { load_page() };
+Task<Int>^ owned = new async [PageDomain] { load_page() };
 ```
 
-如果局部变量没有 initializer，`Task<T>` 的 domain 默认是调用点 `current`。
-`Task<T, PageDomain>` 这类显式 domain 参数暂不开放。
-
-Task 不能出现在函数返回值、参数类型、字段类型或 public ABI：
+直接 `Task<T>` 是 `!Movable`，包含它的聚合值也不能移动、按值传参或返回。直接 Task 字段目前只支持
+struct、tuple 和固定数组中的静态位置，不支持 optional/error union/union 等动态变体。
+`Task<T>^` 是 Movable、非 Copyable 的一等
+owner，可以出现在参数、返回值、字段、容器、泛型实例和 public ABI：
 
 ```jiang
-Task<Int> make_task(); // error: Task 不能出现在签名中
+Task<Int>^ make_task() {
+    new async [PageDomain] { load_page() }
+}
 ```
 
-编译器内部用 task kind 保存 result type 和 domain。这个 kind 服务 type check、borrow check、
-lowering 和 runtime ABI；用户可见的 `Task<T>` 只是 body-local 标注表面。
+编译器内部 task kind 只保存 result type；domain 不进入公开类型身份。TaskState 直接内联为 Task 的
+唯一字段，`Task<T>^` 只是 heap Task 的 owner pointer，不指向第二个 control block。
 
-Task 的 observer ownership 固定在创建它的 async/sync effect body。0.4.7 禁止 Task 被任何
-嵌套的 async/sync block 或 lambda 捕获，不区分是否 move、是否同 domain；普通词法 block 不形成
-capture 边界。Task 可以在创建它的 effect body 中等待一个运行于其他 domain 的 task，完成后
-caller 仍回到等待方 current domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
+直接 Task 的 observer ownership 固定在创建它的 async/sync effect body；直接 binding 或包含它的聚合值
+不能被嵌套的 async/sync
+block 或 lambda 捕获。`Task<T>^` owner 可以 move 进普通 callable 或其他存储，并遵守普通 lifetime
+与跨 Domain Sendable 规则。Task 可以运行于不同 domain，完成后 caller 仍回到等待方 current
+domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
 
 ```jiang
 sync [UiDomain] {
@@ -448,19 +452,23 @@ sync [UiDomain] {
 不能捕获栈上 borrow。
 结构化并发可以允许有限的同 domain capture，但必须证明所有 task 在 scope 结束前完成。
 
-0.4.6 不提供 cancellation。0.4.7 采用显式、协作式 cancellation：`task.cancel()` 消费 Task，
-向 task 的 execution domain 请求取消，并挂起 caller，直到 task 已正常完成或完成 cancellation
-unwind。取消请求线程不能直接析构 frame；resume 入口和 suspend boundary 检查请求，frame、capture
-和跨 suspend local 沿正常 drop state 析构。若 completion 先发生，`cancel()` 丢弃已完成 result
-后返回；cancellation 不进入 async 函数的普通返回类型。
+0.4.8 采用显式、协作式 cancellation：`task.cancel()` 向 task 的 execution domain 原子发布请求后
+立即返回；`task.cancel_and_await()` 才等待 task 正常完成或完成 cancellation unwind。取消请求线程
+不能直接析构 frame；resume 入口和 suspend boundary 检查请求，frame、capture 和跨 suspend local
+沿正常 drop state 析构。长时间不挂起的计算可以调用 `coroutine.check_cancelled()` 建立显式检查点；
+没有请求时它立即返回，有请求时直接进入当前 coroutine cleanup。cancellation 不进入 async 函数的
+普通返回类型。
 
-`cancel()` 返回时保证 task 不会再执行用户代码，相关 frame、capture 和未消费 result 已完成
-清理。0.4.8 起，body-local Task 是结构化子任务：未 `await()` 或 `cancel()` 的 Task 离开作用域时，
+`await()` 遇到因取消结束、没有 result 的 child 时，当前 parent 也进入 cancellation cleanup；其余未完成
+sibling 会先全部收到取消请求，再被逐个等待。`cancel_and_await()` 则只请求并消费指定 Task，不会取消
+caller，因此适合“停止这一项工作后继续执行”的路径。
+
+直接 Task 是结构化子任务：未 `await()` 或 `cancel_and_await()` 的 Task 离开作用域时，
 编译器先向同一退出路径上的全部活跃 Task 请求取消，再逐个等待终态。需要 detached 执行时使用
-不形成 Task handle 的 standalone async block；Task handle 固定在创建它的绑定上，不支持
+不形成 Task handle 的 standalone async block；直接 Task 固定在创建它的 place 上，不支持
 `move()`、`forget()` 或重新赋值。
 
-0.4.7 当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占
+0.4.8 当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占
 frame。
 parent 挂起于显式 `child.await()` 时会把取消单向传播给 child，并等待 child terminal acknowledgement
 后再 unwind。隐式 async call 的 child 继承根 Task cancellation context，在自然恢复边界先观察请求并
@@ -485,11 +493,11 @@ async Response send(Request& request) {
 期间发生取消时，`on_cancel` 必须立即或在所属 Domain 上执行 handler；completion 与 cancel 竞争只能有
 一方取得 continuation 的 terminal resume 权。取消 handler 用于尽快中断网络请求等外部操作，原
 completion/cancel acknowledgement 仍负责确认外部系统不再持有 continuation，之后 coroutine frame
-才能进入 unwind。0.4.7 不提供类型级 `Cancellable` trait；每个 suspend operation 独立注册 handler，
+才能进入 unwind。当前不提供类型级 `Cancellable` trait；每个 suspend operation 独立注册 handler，
 避免强迫一个类型的多个 async 方法共享一个 cancel 方法。
 
-跨 domain 共享可变状态不使用普通 `T&!` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>`、
-`Channel<T>`、actor 消息或 move/copy 结果；需要底层逃逸时显式进入 `unsafe`。
+跨 domain 共享可变状态不使用普通 `T&!` 表达。0.4.8 需要共享时使用 `Mutex`、`Atomic<T>` 或
+move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃逸时显式进入 `unsafe`。
 
 ## Actor 与 Isolate
 

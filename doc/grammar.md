@@ -353,8 +353,9 @@ name        <- ident / "self"
   `sync [domain] {}` 挂起当前 coroutine，结构化切换到目标 Domain，完成后回到原 Domain，不创建 Task。
 - `async [domain]? call(...)` 是 Task creation expression，最外层 postfix 必须是函数调用；对任意
   非调用表达式创建 Task 时使用 `async [domain]? { ... }`。
-- Task creation 是 eager 的并返回 body-local `Task<T>`；`task.await()` 和 `task.cancel()` 都是
-  consuming operation，只能选择其中一个。旧的
+- Task creation 是 eager 的。`async` 返回地址固定的 `Task<T>`，`new async` 返回可移动、非复制的
+  `Task<T>^` owner。`task.await()` 和 `task.cancel_and_await()` 消费一次 result；`task.cancel()`
+  只同步发布幂等取消请求，不消费 result，也不等待 Task 退出。旧的
   `callee$().async()` 和 `await expr` 不属于当前语法。
 - 需要进入调用效果上下文时，推荐使用 keyword block：`unsafe { ... }`、
   `async [domain] { ... }`、`sync [domain] { ... }`、`async { ... }`、`sync { ... }`、
