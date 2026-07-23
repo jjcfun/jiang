@@ -574,6 +574,16 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 返回引用可能来自其他参数或多个来源时必须显式标注。`@life(input > return)` 只传播 `input`
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
 
+高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
+
+```jiang
+@life(callback.value > callback.result, value > return)
+Int& apply(Fn<Int& result, Int& value> callback, Int& value);
+```
+
+契约名本身不参与类型身份；解析后的来源关系参与 callable 的语义兼容性。因此，返回其他参数
+借用的函数或 lambda 不能传给上述 `callback`。
+
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
@@ -776,6 +786,16 @@ RawFn<Bool, Int, Int> compare;
 
 - 返回 `Bool`
 - 接收两个 `Int` 参数
+
+callable 类型可以为 result 和全部参数提供契约名：
+
+```jiang
+Fn<Int result, Int value> transform;
+RawFn<Bool result, Int left, Int right> compare;
+```
+
+契约名按需提供，但已经提供的名称不能重复。它们只用于 `@life` 等 callable 契约、文档和诊断，不是调用参数标签，
+也不进入函数类型身份或 ABI。因此仅契约名不同的两个 `Fn` / `RawFn` 类型仍是同一函数类型。
 
 当前支持：
 

@@ -134,12 +134,68 @@ public struct TypeOps: Movable {
             params.add(self.check_non_task_container_type_ref(signature.params[index]));
             index = index + 1;
         }
-        return self.state.store.types.function_type_with_effects(
-            params,
-            self.check_function_result_type_ref(signature.result),
-            token.Span(),
-            self.function_effects(signature.effects)
-        );
+        qid.TypeId result = self.check_function_result_type_ref(signature.result);
+        types.EffectSet effects = self.function_effects(signature.effects);
+        list.ArrayList<Int> lifetime_sources! = list.ArrayList<Int>();
+        if (self.append_function_result_lifetime_sources(def_id, signature, lifetime_sources$.ref())) {
+            return self.state.store.types.function_type_with_effects(
+                params, result, token.Span(), effects, lifetime_sources.slice()
+            );
+        }
+        return self.state.store.types.function_type_with_effects(params, result, token.Span(), effects);
+    }
+
+    Bool append_function_result_lifetime_sources(
+        self,
+        qid.DefId def_id,
+        hir.HirFunctionSignature signature,
+        list.ArrayList<Int>& sources
+    ) {
+        guard self.state.hirs.def(def_id) is .some(hir_def) else { return false; }
+        Bool explicit_effect! = false;
+        Int index! = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            index = index + 1;
+            if (constraint.shorter.kind != .return_lifetime) { continue; }
+            explicit_effect = true;
+            guard self.function_lifetime_source_index(signature, constraint.longer)
+                is .some(source) else {
+                continue;
+            }
+            self.add_lifetime_source_once(sources, source);
+        }
+        return explicit_effect;
+    }
+
+    Int? function_lifetime_source_index(
+        self,
+        hir.HirFunctionSignature signature,
+        hir.HirLifetimeName name
+    ) {
+        if (name.kind == .self_lifetime) {
+            if (signature.has_receiver) { return 0; }
+            return null;
+        }
+        if (name.kind != .named_lifetime) { return null; }
+        guard name.symbol is .some(symbol) else { return null; }
+        Int offset! = 0;
+        if (signature.has_receiver) { offset = 1; }
+        Int index! = 0;
+        while (index < signature.param_symbols.length) {
+            if (signature.param_symbols[index] == symbol) { return index + offset; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    () add_lifetime_source_once(self, list.ArrayList<Int>& sources, Int source) {
+        Int index! = 0;
+        while (index < sources.len()) {
+            if (sources.get(index) == source) { return; }
+            index = index + 1;
+        }
+        sources.add(source);
     }
 
     public types.EffectSet function_effects(self, hir.HirEffectSet effects) {
@@ -708,6 +764,16 @@ public struct TypeOps: Movable {
 
     public qid.TypeId type_for_named_ref(self, hir.HirId type_ref, hir.HirNamedTypeRef ref_data) {
         qid.DefId target_def = ref_data.def_id;
+        if (ref_data.contract_names != null
+            && !self.is_raw_fn_builtin_type_def(target_def)
+            && !self.is_fn_builtin_type_def(target_def)) {
+            self.add_node_error(
+                type_ref,
+                "contract names are only allowed on Fn and RawFn types",
+                "contract_names_require_fn"
+            );
+            return self.state.store.types.invalid_type();
+        }
         if (self.trait_companion_type_for_def(target_def) is .some(type_id)) {
             if (ref_data.args.length > 0) {
                 self.add_node_error(
@@ -719,10 +785,16 @@ public struct TypeOps: Movable {
             return type_id;
         }
         if (self.is_raw_fn_builtin_type_def(target_def)) {
+            if (!self.validate_fn_contract_names(type_ref, ref_data)) {
+                return self.state.store.types.invalid_type();
+            }
             CheckedGenericArgs fn_args! = self.check_fn_generic_args(ref_data.args);
             return self.type_for_fn_ref(type_ref, ref_data.args, fn_args$.ref(), .raw);
         }
         if (self.is_fn_builtin_type_def(target_def)) {
+            if (!self.validate_fn_contract_names(type_ref, ref_data)) {
+                return self.state.store.types.invalid_type();
+            }
             CheckedGenericArgs fn_args! = self.check_fn_generic_args(ref_data.args);
             return self.type_for_fn_ref(type_ref, ref_data.args, fn_args$.ref(), .closure);
         }
@@ -960,7 +1032,52 @@ public struct TypeOps: Movable {
             params.add(param);
             index = index + 1;
         }
-        return self.state.store.types.function_type_with_kind(params, result, token.Span(), effects, kind);
+        Int[]&? lifetime_sources = self.state.results.callable_lifetime_contract(type_ref);
+        return self.state.store.types.function_type_with_kind(
+            params,
+            result,
+            token.Span(),
+            effects,
+            kind,
+            lifetime_sources
+        );
+    }
+
+    Bool validate_fn_contract_names(self, hir.HirId type_ref, hir.HirNamedTypeRef ref_data) {
+        guard ref_data.contract_names is .some(names) else { return true; }
+        if (names.length != ref_data.args.length) {
+            self.add_node_error(
+                type_ref,
+                "Fn contract names must align with callable type arguments",
+                "fn_contract_name_arity_mismatch"
+            );
+            return false;
+        }
+        Int index! = 0;
+        while (index < names.length) {
+            if (!self.fn_contract_name_is_unique(names, index)) {
+                self.add_node_error(
+                    type_ref,
+                    "Fn contract names must be unique",
+                    "duplicate_fn_contract_name"
+                );
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool fn_contract_name_is_unique(self, qid.SymbolId[]& names, Int index) {
+        if (names[index].to_index() == 0) { return true; }
+        Int previous! = 0;
+        while (previous < index) {
+            if (names[previous].to_index() != 0 && names[previous] == names[index]) {
+                return false;
+            }
+            previous = previous + 1;
+        }
+        return true;
     }
 
     CheckedGenericArgs check_fn_generic_args(self, hir.HirId[]& arg_refs) {
@@ -3112,7 +3229,8 @@ public struct TypeOps: Movable {
             result,
             type_info.span,
             function_type.effects,
-            function_type.kind
+            function_type.kind,
+            function_type.lifetime_contract.result_sources
         );
         return self.type_with_original_mutability(type_info, function_id);
     }
@@ -3251,7 +3369,8 @@ public struct TypeOps: Movable {
             result,
             type_info.span,
             function_type.effects,
-            function_type.kind
+            function_type.kind,
+            function_type.lifetime_contract.result_sources
         );
         return self.type_with_original_mutability(type_info, function_id);
     }
@@ -3370,7 +3489,8 @@ public struct TypeOps: Movable {
             result,
             type_info.span,
             function_type.effects,
-            function_type.kind
+            function_type.kind,
+            function_type.lifetime_contract.result_sources
         );
         return self.type_with_original_mutability(type_info, function_id);
     }
@@ -3720,7 +3840,8 @@ public struct TypeOps: Movable {
             params,
             function_type.result,
             token.Span(),
-            self.merge_effects(function_type.effects, self.function_effects(effect_type.effects))
+            self.merge_effects(function_type.effects, self.function_effects(effect_type.effects)),
+            function_type.lifetime_contract.result_sources
         );
     }
 

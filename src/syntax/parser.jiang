@@ -27,6 +27,16 @@ public struct ParseResult: Movable {
     }
 }
 
+struct ParsedTypeArgs: Copyable {
+    public ast.AstRange args;
+    public ast.AstRange contract_names;
+}
+
+struct ParsedContractName: Copyable {
+    public ast.AstId name;
+    public Bool present;
+}
+
 public ParseResult parse_tokens(
     store_api.CompilerStore& store,
     list.ArrayList<std.jiang.Token>& tokens,
@@ -569,7 +579,11 @@ public struct Parser: Movable {
             return self.lifetime_name_node_from_token(self.advance(), ast.LifetimeNameKind.return_lifetime);
         }
         if (self.can_start_name()) {
-            return self.lifetime_name_node_from_token(self.advance(), ast.LifetimeNameKind.named_lifetime);
+            std.jiang.Token root = self.advance();
+            if (self.match(.dot)) {
+                return self.parse_callable_lifetime_name(root);
+            }
+            return self.lifetime_name_node_from_token(root, ast.LifetimeNameKind.named_lifetime);
         }
         std.jiang.Token actual = self.peek();
         self.error_at_current("expected_name", .ident);
@@ -578,8 +592,29 @@ public struct Parser: Movable {
         }
         return self.node(actual.span, .lifetime_name(ast.LifetimeNameData (
             kind: ast.LifetimeNameKind.named_lifetime,
-            symbol_id: null
+            symbol_id: null,
+            owner_symbol_id: null
         )));
+    }
+
+    ast.AstId parse_callable_lifetime_name(self, std.jiang.Token root) {
+        if (!self.can_start_name()) {
+            self.error_at_current_kind("expected_name");
+            return self.node(root.span, .lifetime_name(ast.LifetimeNameData (
+                kind: ast.LifetimeNameKind.callable_lifetime,
+                symbol_id: null,
+                owner_symbol_id: self.token_symbol_id(root)
+            )));
+        }
+        std.jiang.Token member = self.advance();
+        return self.node(
+            self.span_from(root.span, member.span),
+            .lifetime_name(ast.LifetimeNameData (
+                kind: ast.LifetimeNameKind.callable_lifetime,
+                symbol_id: self.token_symbol_id(member),
+                owner_symbol_id: self.token_symbol_id(root)
+            ))
+        );
     }
 
     ast.AstId lifetime_name_node_from_token(self, std.jiang.Token tok, ast.LifetimeNameKind kind) {
@@ -589,7 +624,8 @@ public struct Parser: Movable {
         }
         return self.node(tok.span, .lifetime_name(ast.LifetimeNameData (
             kind: kind,
-            symbol_id: symbol
+            symbol_id: symbol,
+            owner_symbol_id: null
         )));
     }
 
@@ -1745,7 +1781,8 @@ public struct Parser: Movable {
         ast.AstId path = self.node_from_range(type_name, segments, .path(ast.PathData (segments: segments)));
         ast.AstId type_ref = self.node_from_child(path, .named_type(ast.NamedTypeData (
             path: path,
-            args: self.empty_range()
+            args: self.empty_range(),
+            contract_names: self.empty_range()
         )));
         self.expect(.dot);
         ast.AstId member_name = self.parse_member_name();
@@ -2069,13 +2106,26 @@ public struct Parser: Movable {
         if (self.check(.ident)) {
             ast.AstId path = self.parse_path();
             ast.AstRange args! = self.empty_range();
-            if (self.check(.lt)) { args = self.parse_type_args(); }
-            return self.node_from_child(path, .named_type(ast.NamedTypeData (path: path, args: args)));
+            ast.AstRange contract_names! = self.empty_range();
+            if (self.check(.lt)) {
+                ParsedTypeArgs parsed = self.parse_named_type_args();
+                args = parsed.args;
+                contract_names = parsed.contract_names;
+            }
+            return self.node_from_child(path, .named_type(ast.NamedTypeData (
+                path: path,
+                args: args,
+                contract_names: contract_names
+            )));
         }
         if (self.match_keyword(.kw_self_type)) {
             ast.AstId name = self.name_node_from_token(self.previous());
             ast.AstId path = self.node_from_child(name, .path(ast.PathData (segments: self.unit.add_child(name))));
-            return self.node_from_child(path, .named_type(ast.NamedTypeData (path: path, args: self.empty_range())));
+            return self.node_from_child(path, .named_type(ast.NamedTypeData (
+                path: path,
+                args: self.empty_range(),
+                contract_names: self.empty_range()
+            )));
         }
         self.error_at_current_kind("expected_type");
         std.jiang.Token current_token = self.advance();
@@ -2131,6 +2181,47 @@ public struct Parser: Movable {
         }
         self.expect_type_arg_gt();
         return self.take_children(arg_start);
+    }
+
+    ParsedTypeArgs parse_named_type_args(Self&! self) {
+        self.expect(.lt);
+        Int arg_start = self.temp.len();
+        list.ArrayList<ast.AstId> names! = list.ArrayList<ast.AstId>();
+        Bool has_contract_name! = false;
+        if (!self.check_type_arg_gt()) {
+            ParsedContractName first = self.parse_named_type_arg();
+            names.add(first.name);
+            has_contract_name = first.present;
+            while (self.match(.comma)) {
+                if (self.check_type_arg_gt()) { break; }
+                ParsedContractName current = self.parse_named_type_arg();
+                names.add(current.name);
+                has_contract_name = has_contract_name || current.present;
+            }
+        }
+        self.expect_type_arg_gt();
+        ast.AstRange args = self.take_children(arg_start);
+        if (!has_contract_name) {
+            return ParsedTypeArgs(args: args, contract_names: self.empty_range());
+        }
+        Int index! = 0;
+        while (index < names.len()) {
+            self.temp.add(names.get(index));
+            index = index + 1;
+        }
+        return ParsedTypeArgs(args: args, contract_names: self.take_children(self.temp.len() - names.len()));
+    }
+
+    ParsedContractName parse_named_type_arg(Self&! self) {
+        ast.AstId arg = self.parse_generic_arg();
+        self.temp.add(arg);
+        if (self.can_start_name()) {
+            return ParsedContractName(name: self.parse_name(), present: true);
+        }
+        return ParsedContractName(
+            name: self.unit_node(self.unit.get(arg).span),
+            present: false
+        );
     }
 
     ast.AstId parse_generic_arg(Self&! self) {
@@ -2929,7 +3020,11 @@ public struct Parser: Movable {
         if (!self.path_looks_like_type_name(path)) { return null; }
         return self.node_from_child(
             name_expr.value,
-            .named_type(ast.NamedTypeData (path: name_expr.value, args: self.empty_range()))
+            .named_type(ast.NamedTypeData (
+                path: name_expr.value,
+                args: self.empty_range(),
+                contract_names: self.empty_range()
+            ))
         );
     }
 
@@ -4325,7 +4420,11 @@ public struct Parser: Movable {
         ast.AstId name = self.name_node_from_symbol(symbol, span);
         ast.AstRange segments = self.unit.add_child(name);
         ast.AstId path = self.node(span, .path(ast.PathData (segments: segments)));
-        return self.node(span, .named_type(ast.NamedTypeData (path: path, args: self.empty_range())));
+        return self.node(span, .named_type(ast.NamedTypeData (
+            path: path,
+            args: self.empty_range(),
+            contract_names: self.empty_range()
+        )));
     }
 
     ast.AstId empty_call(self, ast.AstId callee) {

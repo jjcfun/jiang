@@ -6,7 +6,7 @@
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
 import qid = "../store/id.jiang";
-import list = "../support/list.jiang";
+import types = "../sema/type.jiang";
 
 public enum ReturnLifetimeStatus {
     allowed,
@@ -17,50 +17,23 @@ public enum ReturnLifetimeStatus {
 public struct ReturnLifetimeChecker: Movable {
     public context.CompilerContext& ctx;
     public qid.DefId function_def;
-    public list.ArrayList<qid.SymbolId> sources!;
 
     public init(self, context.CompilerContext& ctx, qid.DefId function_def) {
         self.ctx = ctx;
         self.function_def = function_def;
-        self.sources = list.ArrayList<qid.SymbolId>();
     }
 
     public ReturnLifetimeStatus check_source(self, qid.SymbolId source_symbol) {
-        self.add_source(source_symbol);
         guard self.ctx.store.hirs.def(self.function_def) is .some(hir_def) else {
             return .source_not_allowed;
         }
-        if (self.hir_has_explicit_return_lifetime(hir_def)) {
-            if (self.hir_allows_all_sources(hir_def)) {
-                return .allowed;
-            }
+        if (self.semantic_effect_allows_source(hir_def, source_symbol)) {
+            return .allowed;
+        }
+        if (hir_def.decl.is_lambda_function || self.hir_has_explicit_return_lifetime(hir_def)) {
             return .source_not_allowed;
         }
-        guard self.default_source_symbol(hir_def) is .some(default_source) else {
-            return .source_not_allowed;
-        }
-        if (source_symbol == default_source) { return .allowed; }
         return .needs_explicit_lifetime;
-    }
-
-    Bool add_source(self, qid.SymbolId source_symbol) {
-        if (self.has_source(source_symbol)) {
-            return false;
-        }
-        self.sources.add(source_symbol);
-        return true;
-    }
-
-    Bool has_source(self, qid.SymbolId source_symbol) {
-        Int index! = 0;
-        while (index < self.sources.len()) {
-            qid.SymbolId existing = self.sources.get(index);
-            if (existing == source_symbol) {
-                return true;
-            }
-            index = index + 1;
-        }
-        return false;
     }
 
     Bool hir_has_explicit_return_lifetime(self, hir.HirDef& hir_def) {
@@ -75,32 +48,19 @@ public struct ReturnLifetimeChecker: Movable {
         return false;
     }
 
-    qid.SymbolId? default_source_symbol(self, hir.HirDef& hir_def) {
-        guard hir_def.decl.function_signature is .some(signature) else { return null; }
-        if (signature.has_receiver) {
-            return self.ctx.store.symbols.intern("self");
+    Bool semantic_effect_allows_source(self, hir.HirDef& hir_def, qid.SymbolId source_symbol) {
+        guard self.ctx.store.typeck.def_type(self.function_def) is .some(type_id) else {
+            return false;
         }
-        if (signature.param_symbols.length == 0) { return null; }
-        return signature.param_symbols[0];
-    }
-
-    Bool hir_allows_all_sources(self, hir.HirDef& hir_def) {
-        Int index! = 0;
-        while (index < self.sources.len()) {
-            qid.SymbolId source_symbol = self.sources.get(index);
-            if (!self.hir_allows_source(hir_def, source_symbol)) {
-                return false;
-            }
-            index = index + 1;
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        guard self.source_param_index(hir_def, function_type, source_symbol)
+            is .some(source_index) else {
+            return false;
         }
-        return true;
-    }
-
-    Bool hir_allows_source(self, hir.HirDef& hir_def, qid.SymbolId source_symbol) {
         Int index! = 0;
-        while (index < hir_def.lifetime_constraints.len()) {
-            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
-            if (self.is_return_lifetime_constraint(constraint, source_symbol)) {
+        while (index < function_type.lifetime_contract.result_sources.length) {
+            if (function_type.lifetime_contract.result_sources[index] == source_index) {
                 return true;
             }
             index = index + 1;
@@ -108,18 +68,48 @@ public struct ReturnLifetimeChecker: Movable {
         return false;
     }
 
-    Bool is_return_lifetime_constraint(self, hir.HirLifetimeConstraint constraint, qid.SymbolId source_symbol) {
-        if (constraint.shorter.kind != .return_lifetime) {
-            return false;
+    Int? source_param_index(
+        self,
+        hir.HirDef& hir_def,
+        types.FunctionType function_type,
+        qid.SymbolId source_symbol
+    ) {
+        if (hir_def.decl.is_lambda_function) {
+            return self.lambda_source_param_index(hir_def, function_type, source_symbol);
         }
-        if (constraint.longer.kind == .self_lifetime) {
-            return self.source_symbol_is_self(source_symbol);
+        guard hir_def.decl.function_signature is .some(signature) else { return null; }
+        if (signature.has_receiver && self.source_symbol_is_self(source_symbol)) { return 0; }
+        Int offset! = 0;
+        if (signature.has_receiver) { offset = 1; }
+        Int index! = 0;
+        while (index < signature.param_symbols.length) {
+            if (signature.param_symbols[index] == source_symbol) { return index + offset; }
+            index = index + 1;
         }
-        if (constraint.longer.kind != .named_lifetime) { return false; }
-        guard constraint.longer.symbol is .some(longer_symbol) else {
-            return false;
+        return null;
+    }
+
+    Int? lambda_source_param_index(
+        self,
+        hir.HirDef& hir_def,
+        types.FunctionType function_type,
+        qid.SymbolId source_symbol
+    ) {
+        guard hir_def.body is .some(ref _ body) else { return null; }
+        Int param_count! = 0;
+        Int source_ordinal! = -1;
+        Int local_index! = 0;
+        while (local_index < body.locals.len()) {
+            hir.HirLocal local = body.locals.get(hir.HirLocalId(local_index));
+            if (local.kind == .parameter) {
+                if (local.symbol == source_symbol) { source_ordinal = param_count; }
+                param_count = param_count + 1;
+            }
+            local_index = local_index + 1;
         }
-        return longer_symbol == source_symbol;
+        if (source_ordinal < 0) { return null; }
+        if (function_type.params.length > param_count) { return source_ordinal + 1; }
+        return source_ordinal;
     }
 
     Bool source_symbol_is_self(self, qid.SymbolId source_symbol) {

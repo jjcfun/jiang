@@ -502,6 +502,23 @@ struct Slice {
 因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
 不含 borrow 的参数对应空 loan 集合，约束自然成立。raw pointer 不携带语言级 lifetime。
 
+`Fn` / `RawFn` 的 result 和参数可以提供按需契约名，供外层函数约束 callback：
+
+```jiang
+@life(callback.fallback > callback.result, fallback > return)
+Int& apply(
+    Fn<Int& result, Int& value, Int& fallback> callback,
+    Int& value,
+    Int& fallback
+);
+```
+
+名称只在语法、接口和诊断中保留；声明检查会把它们一次性解析成参数索引。解析后的
+`LifetimeContract` 属于 callable 的语义签名，调用传播、函数值兼容性和 lambda expected type
+共用该 contract；
+closure environment 等 ABI 隐藏参数不进入公开索引。trait object 动态派发和 RawFn/Fn adapter
+同样必须把 contract 映射到 MIR 实参数；borrow checker 不再用“callee 加全部实参”猜测间接调用来源。
+
 跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，仍建议显式表达返回值不超过来源：
 
 ```jiang
@@ -769,6 +786,9 @@ T add<T>(T left, T right);
 - `Fn<Ret, Args...>^` 是 owned heap closure。`new () [captures] => body` 会直接构造
   heap closure object；移动 `Fn^` 只移动 owner handle，drop 时通过 closure vtable
   销毁 environment。
+- callable 类型可写成 `Fn<R result, A value, B fallback>` 或对应的 `RawFn` 形式。result 和参数
+  可以按需命名，已提供的名称必须唯一；这些名称只为 lifetime contract、文档和诊断提供稳定引用，不参与 TypeId、
+  ABI、重载或调用参数匹配。
 
 `RawFn` 适合顶层函数、类型函数、未绑定实例方法和非捕获 lambda：
 
