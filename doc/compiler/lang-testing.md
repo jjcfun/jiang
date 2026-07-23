@@ -43,7 +43,7 @@ test/lang/<feature>/
 - `control_flow`：if/switch/guard/while/for/range/defer/break/continue/Never 合并。
 - `nominal`：struct/enum/union/init/deinit/type function/instance method/member namespace。
 - `generic`：generic type/function、where bound、trait conformance、associated type、monomorph。
-- `ownership`：implicit copy、Movable、explicit move、borrow reference、drop/defer cleanup。
+- `ownership`：Copyable、默认 move、显式 move、`!Movable`、borrow reference、drop/defer cleanup。
 - `lifetime`：`@life` 语法、返回引用、字段引用、逃逸失败。
 - `error_handling`：`Result<T, E>`、throw、try/catch、catch binding、未处理错误。
 - `import`：file import、public import re-export、visibility。

@@ -81,7 +81,7 @@ closure expression 仍有内部 env layout；捕获字段按顺序紧密放入�
 即使两个闭包形状相同，也不要求共享内部表示。
 
 `RawFn<...>` 是 copy；`Fn<...>` 和 `Fn<...>^` 都是 movable。`Fn<...>` 不应因为隐藏的 env layout
-在同一个公开类型下有时 copy、有时 non-copy；基础规则把 `Fn` 当作 move-only。后续如果需要
+在同一个公开类型下有时 copy、有时 non-copy；基础规则把 `Fn` 当作非 Copyable。后续如果需要
 可复制 closure，可以增加显式能力类型或约束，而不是让 `Fn<...>` 的 copy 能力依赖调用点。
 
 `Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。闭包值不是 C 函数指针，`ptr` 也不应泄漏 receiver、

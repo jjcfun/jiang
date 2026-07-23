@@ -47,7 +47,8 @@ HIR/type facts -> initial MIR
 drop elaboration 的职责：
 
 - 根据 locals 的 live range 和 CFG exit 插入隐式 drop。
-- 只对 sema drop query 判定为需要 runtime drop 的 `Movable` 类型生成 drop。
+- 只对 sema drop query 判定为需要 runtime drop 的值生成 drop；`!Movable` 值仍在固定 place
+  的生命周期末尾析构。
 - 对 `custom_drop` nominal type 先生成 `deinit` call，再生成自动递归字段 drop。
 - 对 `recursive_drop` 类型递归展开字段/owner pointer drop。
 - 保持所有插入的控制流仍然是普通 MIR basic block / terminator，不引入 backend-only 节点。

@@ -573,16 +573,17 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。
 - `T*` / `T*!` 是低层指针；`T[]&` 是 slice reference。它们不表达语言级所有权。裸 `T[]` 是 unsized array type，不是可独立存放的 reference value。
-- 只有 `Movable` 类型会自动 drop；`T^` 是内建 `Movable`。
+- runtime drop 由 ownership、字段和自定义 `deinit` 决定；`!Movable` 值仍会在原 place 正常析构。
 - `T&`、`T&!`、`T*`、`T*!`、`T[]&` 字段不会被编译器自动释放。
 - `T[]&` 本身不拥有整段 buffer；drop slice reference 时不 drop 全部元素。但 `slice[i]` 是已初始化元素 place，覆盖时按元素类型的 drop 规则处理旧值。
 - 经过 `T*!` 得到的 place 是裸指针派生 place，写入时是 raw write，不隐式 drop 旧值。
 - 如果 nominal 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构。
-- 普通 `struct`、`union` 默认可以隐式 copy。
-- `T^` 是内建 Movable；显式声明 `Movable` 的 nominal type 永远不能隐式 copy。
-- 直接或间接包含 Movable 字段，或定义了自定义 `deinit` 的 nominal type，必须显式声明 `Movable`。
-- `T&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
-- 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
+- `Movable` 是默认 auto trait；nominal 可用 `!Movable` 保持地址固定，包含它的聚合也不可移动。
+- `Copyable` 继承 `Movable`。基本标量和 enum 默认 Copyable；struct/union 必须显式实现 Copyable，
+  且所有字段或 payload 也必须 Copyable。带自定义 `deinit` 的类型不能 Copyable。
+- 非 Copyable、但 Movable 的值在普通按值位置默认 move；Copyable 值默认 copy。
+- `$.move()` 可以显式转移非 Copyable 值，也可以强制 move Copyable 值；源 place 随后失效。
+- 泛型代码只有在 `T: Copyable` 约束下才能依赖隐式复制。
 
 显式转移所有权使用 `move()`：
 
@@ -868,26 +869,32 @@ RawFn<Int, Int, Int> sum = add;
 示例 6：lambda 表达式
 
 ```c
-RawFn<Int, Int> inc = (Int value) => value + 1;
-RawFn<Int, Int, Int> add = (Int left, Int right) => left + right;
+RawFn<Int, Int> inc = (value) => value + 1;
+RawFn<Int, Int, Int> add = (left, right) => left + right;
 RawFn<Int> answer = () => 42;
+
+Int base = 10;
+Fn<Int, Int> add_base = (value) [_ captured = base] => value + captured;
+Fn<Int> borrowed = () [ref _ value = base] => value$.get();
+Fn<Int>^ owned = new () [_ captured = base] => captured;
 ```
 
 lambda 规则：
 
 - 参数列表必须写 `(...)`
-- 参数可以省略类型；目标 `RawFn<...>` 类型会参与参数类型推断
-- 单参数也必须写括号，例如 `(Int x) => x`
+- 参数只写 binding name；完整 expected `RawFn<...>` / `Fn<...>` 类型提供参数和 result 类型
+- 单参数也必须写括号，例如 `(x) => x`
 - 无参数写 `() => expr`
 - body 可以是表达式或 block
-- 当前只支持非捕获闭包；不能读取或写入外层局部变量
-- lambda 可以赋值给 `RawFn<...>` 或传给需要 `RawFn<...>` 的参数
+- `RawFn` 不携带 environment，因此只接受非捕获 lambda
+- `Fn` 是 callable view，可以捕获外层 local；`Fn^` 是可移动的 owned heap closure
+- 可选 capture list 写在参数列表后，值 capture 遵守 copy/move，`ref` / `ref!` capture 遵守 borrow/lifetime
+- 未列入 capture list 的外层 local 仍按默认捕获规则处理
 
 当前不支持：
 
 - 通过实例值获取绑定方法函数值（例如 `value.method`）
 - `init` 转函数指针
-- 捕获外部变量的闭包
 
 #### 异步函数（Async）
 
@@ -927,7 +934,8 @@ effect 均由该类型决定，lambda 表达式本身不重复书写：
 Fn<async [UiDomain] Int, Int> load = (id) => fetch(id);
 ```
 
-当前 async `Fn` 只支持在其签名指定的同一 Domain 内动态调用；跨 Domain 调用暂不支持。
+async `Fn` / `RawFn` 动态调用复用普通 async 函数的 Domain 切换。跨 Domain 的参数、result 和 capture
+必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
 
 调用带 `unsafe` effect 的函数需要进入显式 effect context：
 
@@ -952,7 +960,10 @@ async Int render() {
 block 完成并返回结果；`async` 直接启动，作为语句使用时不等待：
 
 ```c
-struct UiDomain: Domain<kind = .serial> {}
+struct UiDomainType: Domain<kind = .serial> {}
+struct WorkerDomainType: Domain<kind = .serial> {}
+const UiDomainType UiDomain = UiDomainType();
+const WorkerDomainType WorkerDomain = WorkerDomainType();
 
 Int main() {
     sync [UiDomain] {
@@ -1504,7 +1515,7 @@ struct 还可以定义 `deinit` 函数。
 - `deinit` 不允许 `public` 等可见性修饰
 - `deinit` 由该 nominal 的 drop 触发，不作为普通方法暴露
 - `ptr$.dealloc()` 是低层释放操作，不作为普通析构入口使用
-- 定义了 `deinit` 的 nominal type 必须声明 `Movable`
+- 定义了 `deinit` 的 nominal type 不能实现 `Copyable`
 - 如果 struct 有自定义 `deinit`，先执行自定义 `deinit`，再执行编译器生成的递归字段析构
 
 ```c

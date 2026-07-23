@@ -29,6 +29,7 @@ unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证�
 - 检查引用存入字段、返回值、闭包捕获等逃逸位置时满足 lifetime 约束。
 - 检查 `T&!` 与仍活跃的共享/可变借用之间不存在重叠 place 冲突。
 - 检查 `T&!` 存活期间不能直接读写其来源 place。
+- 检查 `T&!` / `T[]&!` 的普通按值传播执行 move；调用参数位置可以建立临时 reborrow。
 - 检查同一调用中多个 `T&!` 实参不能指向重叠 place。
 - 检查可变 receiver 或可变引用参数的要求已经由函数签名中的 `T&!` 表达。
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
@@ -102,8 +103,8 @@ MIR basic block 是 borrow check 的 CFG 单元。每条 statement/terminator �
 layout 不决定 borrow 语义，但它会影响以下分类：
 
 - 类型是否零大小。
-- 类型是否进入 `Movable` 语义，以及是否需要 runtime drop。
-- 类型是否允许 implicit copy。
+- 类型是否有 concrete runtime drop category。
+- Copyable/Movable 事实由 sema 提供；layout 不自行推导复制或移动语义。
 - packed/alignment 规则是否限制对字段取引用。
 
 borrow check 通过 sema drop query 判断所有权/drop 语义，通过 `LayoutStore` 查询 field offset
@@ -124,7 +125,8 @@ MIR lowering
 drop 一次，并且 drop 时不会使仍然活跃的 loan 悬垂。它不展开自定义 `deinit` body，
 也不生成字段析构 CFG。
 
-drop elaboration 先读取 sema drop query。只有 `Movable` 类型会被考虑自动 drop；
+drop elaboration 先读取 sema drop query。是否需要 runtime drop 由 ownership、字段与自定义 `deinit`
+决定，不由 Movable 标记替代；`!Movable` 值仍在固定 place 的生命周期末尾正常析构。
 `T*` / `T*!` 派生 place 是 raw memory，不做隐式 drop。确认需要 drop 后，再读取 layout
 的 drop category 决定具体展开方式：
 

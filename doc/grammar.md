@@ -337,8 +337,8 @@ name        <- ident / "self"
   `Fn<async [UiDomain] Bool>[]&` 表示“元素为 UI domain 异步闭包值的切片引用”。
 - lambda 必须具有 expected callable type；其 async/unsafe/domain effect 由
   `Fn<...>` 或 `RawFn<...>` expected type 完整决定，lambda 表达式不重复书写 effect 前缀。
-- 当前 async `Fn` 的调用方必须已处于 callable 签名指定的同一 Domain；跨 Domain 动态调用
-  暂报 `async_fn_cross_domain_call_not_supported`。
+- async `Fn` / `RawFn` 动态调用复用普通 async 调用的 Domain 切换；跨 Domain 的参数、result 和
+  capture 必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
 - `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment；`RawFn<Ret, Args...>` 表示裸函数
   指针，不带 environment，可用于 C ABI 函数指针边界。
 - 函数声明只使用 `async` 表示 suspend function；函数前不保留 `sync` 修饰符。`async [domain]`

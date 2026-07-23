@@ -49,7 +49,8 @@ LayoutStore
 `FieldLayout` 保存 field `DefId?`、field `TypeId`、offset 和 field layout。
 
 `DropCategoryKind` 保存 concrete type 的结构化析构类别。它不是自动 drop 的入口；
-自动 drop 入口由 sema drop query 根据 `Movable` 语义决定。
+自动 drop 入口由 sema drop query 根据 ownership、Copyable 和 concrete drop category 决定。
+`Movable` 只约束值能否改变地址，不能代替析构判定。
 
 - `no_drop`：标量、function pointer、non-owning handle 等不需要析构。
 - `trivial_drop`：aggregate/optional/union 本身不需要自定义析构，成员也没有 owning drop。

@@ -63,10 +63,12 @@ Token 只表示词法事实，不承载语义类型。
   作为后续字符。非 ASCII UTF-8 字符按 Unicode `XID_Start` / `XID_Continue` 判定；
   数字、组合标记等只能在 `XID_Continue` 允许的位置出现。Unicode punctuation 不属于
   identifier，lexer 应产生 `unicode_punctuation` 诊断。
-- 关键字集合包括 `new`、`import`、`public`、`alias`、`extern`、`return`、`if`、
-  `else`、`guard`、`while`、`for`、`in`、`is`、`enum`、`union`、`struct`、`trait`、
-  `extend`、`associated`、`switch`、`try`、`catch`、`break`、`continue`、
-  `defer`、`throw`、`true`、`false`、`null`、`self`、`Self`。
+- 保留关键字包括 `new`、`where`、`life`、`import`、`public`、`const`、`alias`、
+  `extern`、`return`、`if`、`else`、`guard`、`while`、`for`、`in`、`is`、`enum`、
+  `union`、`struct`、`trait`、`extend`、`associated`、`init`、`deinit`、`comptime`、
+  `switch`、`try`、`catch`、`await`、`break`、`continue`、`defer`、`do`、`throw`、
+  `true`、`false`、`null`。`ref`、`unsafe`、`async`、`sync` 是上下文关键字；
+  `self`、`Self` 是特殊名字。
 - 字符字面量使用单引号，例如 `'a'`。
 - 字符串字面量使用双引号，文本按 UTF-8 字节序列处理。
 - `Span` 使用字节偏移和字节长度；line/column 在诊断阶段计算。
@@ -197,7 +199,7 @@ namespace。用户仍可声明同名 nominal type，但不会影响 `T?`、`T[N]
 extension/member lookup。
 
 sentinel value 使用 `S: const T` 语义，`S` 的类型来自元素类型 `T`。整数 literal 会根据
-元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型不是 move-only。
+元素类型转换；非整数 constable 类型也可以作为 sentinel，只要元素类型是 Copyable。
 例如 `UInt8[5:0]`、`Bool[1:true]`、`Char[3:'\0']` 和 enum/struct const sentinel 都是同一套规则。
 
 示例：
@@ -263,6 +265,14 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 
 旧的 `T[*]` / `T[*:S]` many pointer 类型已经移除。低层连续内存地址统一使用 `T*` / `T*!`；
 需要 length 或 sentinel 保证时使用 slice reference。raw pointer 类型本身不携带这些元数据。
+
+`Void*` / `Void*!` 只用于擦除类型后的传递、比较和转换，不能 `$.get()`、`$.set()` 或下标访问；
+访问前必须先转换成具有具体元素类型的 raw pointer。
+
+数组字面量的元素是普通 expression，并由 expected type 约束元素类型与长度。`new [expr, ...]`
+可以直接按 expected `T[N]^`、`T[]^` 或 `T[:S]^` 在最终 owning storage 中初始化。借用 expected type
+也会参与字面量类型检查，例如 `T[]& value = [...]` 会先完成元素检查，但随后因为引用了
+临时 storage 而被 ownership/lifetime 检查拒绝。
 
 标准库 `Vector<T>.slice()` 返回借用 view；`Vector<T>.into_slice(Self self)` 消耗 receiver，
 并把 initialized 区间转移为 owning `T[]^`。
@@ -366,8 +376,9 @@ unsafe {
 
 自动析构规则：
 
-- 只有 `Movable` 类型会自动 drop。
-- `T^` 是内建 `Movable`，drop 时先 drop pointee，再释放其堆存储。
+- 是否需要 runtime drop 由类型的 ownership、字段和自定义 `deinit` 决定，不再由 `Movable`
+  标记代替。`!Movable` 值仍会在原 place 的生命周期结束时正常析构。
+- `T^` 是 owning pointer，drop 时先 drop pointee，再释放其堆存储。
 - nominal、tuple、array、optional、errorable 作为值拥有自己的字段、元素或 payload；
   如果内部类型需要 drop，外层按结构递归 drop。
 - `T&`、`T*`、`T*!` 本身不拥有目标对象，不会因为 element type 是 `Movable`
@@ -376,13 +387,13 @@ unsafe {
   是一个已初始化 `T` place，覆盖该元素时按 `T` 的 drop 规则处理旧值。
 - 经过 `T*!` 得到的 place 是低层裸指针派生 place，写入时是 raw write，
   不隐式 drop 旧值。
-- 如果 nominal 有自定义 `deinit`，它必须声明 `Movable`；drop 该 nominal 时先执行
-  自定义 `deinit`，再递归 drop 字段。
+- 如果 nominal 有自定义 `deinit`，drop 该 nominal 时先执行自定义 `deinit`，再递归 drop 字段；
+  该类型不能实现 `Copyable`。
 
 示例：
 
 ```jiang
-struct Node: Movable {
+struct Node {
     Node^ next;      // 自动析构
     UInt8* bytes;  // 不自动析构
     Int length;
@@ -403,43 +414,58 @@ struct Node: Movable {
 
 implicit copy / Movable 规则：
 
-- 普通 `struct`、`union` 默认可以隐式 copy。
-- `T^` 是内建 Movable，不能隐式 copy，转移所有权必须写 `$.move()`。
-- 显式声明 `Movable` 的 nominal type 永远不能隐式 copy，转移所有权必须写 `$.move()`。
-- `T&`、`T&!`、`T*`、`T*!`、`T[]&` 是 non-owning view，字段中包含这些类型不影响 implicit copy。
-- nominal type 直接或间接包含 `Movable` 字段时，必须显式声明 `Movable`。
-- 定义了自定义 `deinit` 的 nominal type 必须显式声明 `Movable`。
-- 泛型参数只有声明 `T: !Movable` bound 时，才能在泛型代码里按 implicit copy 使用。
-- 禁止隐式 copy 的类型如果确实需要复制，必须由类型作者手动实现 copy/clone 语义。实现可以选择深拷贝、共享引用计数或直接禁止复制。
-- 存在自定义 copy/clone 不会恢复隐式 copy；调用方必须显式调用该方法。
+- `Movable` 是默认 auto trait，表示初始化完成后值可以改变 storage address。nominal 可以用
+  `!Movable` 显式退出；包含 `!Movable` 字段或 payload 的聚合也不可移动。
+- `!Movable` 值不能按值传参、返回、赋给新 place、捕获、`$.move()` 或 `$.forget()`；它必须
+  直接初始化到最终 place，并一直保留到该 place 析构。直接 `Task<T>` 和 `Mutex` 使用这一规则
+  保持地址稳定。
+- `Copyable` 继承 `Movable`，决定普通值使用是复制还是移动。整数、浮点、Bool、Char、enum、
+  shared reference、raw pointer 和 RawFn 默认 Copyable。
+- `T&!` 是唯一 capability，不能自由复制成两个可同时使用的引用；按值传播必须转移它，
+  或建立受 lifetime 约束的 reborrow，并在派生借用存活期间冻结原引用。
+- tuple、array、optional 和 errorable 只有在所有组成类型都 Copyable 时才 Copyable。
+- 用户定义的 struct 和 union 不默认 Copyable；必须显式实现 `Copyable`，且所有字段或
+  payload 都必须 Copyable。带自定义 `deinit` 的 nominal 不能 Copyable。
+- `T^`、捕获环境的 `Fn` / `Fn^`、直接 `Task<T>` 和 `Task<T>^` 都不是 Copyable。
+- 非 Copyable、但 Movable 的值在普通按值位置默认 move；不需要写 `$.move()`。Copyable 值
+  默认 copy，也可以用 `$.move()` 强制转移并让源 place 失效。
+- 泛型代码只有在 `T: Copyable` 约束下才能依赖隐式复制；无该约束的按值使用按 move 处理。
+- 自定义 `copy()` / `clone()` 只是普通 API，不会让类型获得隐式 Copyable 语义。
+
+`T&!` 和 `T[]&!` 不属于 Copyable。binding、字段、返回值等普通按值传播会 move capability；
+将已有可变引用传给 `T&!` 或 `T&` 参数时建立只持续到调用点的 reborrow，因此调用返回后
+原引用仍可继续使用。
+reference 的 ABI 表示即使只是一个地址，也不能据此授予第二份可变能力。
 
 ```jiang
-struct Point {
+struct Point: Copyable {
     Int x;
     Int y;
 }
 
 Point p2 = p1; // 允许：普通值类型
 
-struct Buffer: Movable {
+struct Buffer {
     UInt8^ data;
     Int length;
 }
 
-Buffer b2 = b1;        // 编译错误：包含 owning pointer 字段，禁止隐式 copy
-Buffer b3 = b1$.move(); // 允许：显式转移所有权
+Buffer b2 = b1;         // 默认 move，b1 随后失效
+Buffer b3 = b2$.move(); // 也允许显式 move，b2 随后失效
 ```
 
-显式 move：
+move：
 
-- `value$.move()` 会把变量的位级内容转交给新的目标位置。
+- 非 Copyable 值在赋值、按值传参、返回和 capture 时默认 move；`value$.move()` 是保留的
+  显式形式。
+- 对 Copyable 值使用 `$.move()` 会强制 move，而不是 copy。
 - move 后，源变量进入失效状态，后续不能读取、写入、调用方法或再次 move。
 - move 后的源变量离开作用域时不会调用 `deinit`。
 - move 的目标变量成为新的有效值，后续按普通局部变量规则参与析构。
 
 ```jiang
 Buffer a = Buffer();
-Buffer b = a$.move();
+Buffer b = a;
 
 a.length; // 编译错误：a 已经 move
 // 作用域结束时只析构 b，不析构 a
@@ -500,7 +526,9 @@ move/drop/free。跨函数和存储到类型字段的来源关系通过 `@life` 
 - `value$.mut_ptr()`：从可写 place 创建可写裸指针 `T*!`，需要 `unsafe`。
 - `value$.get()`：显式解引用 `T^` / `T&` / `T*`，返回指向的值；raw pointer 也可在 `unsafe` 中使用下标访问。
 - `value$.set(new_value)`：显式写入 `T*!` 指向的单个目标对象；`T*` 不允许写入。
-- `value$.move()`：显式转交当前变量的值，源变量随后失效且不再析构。
+- `value$.move()`：显式转交当前变量的值；Copyable receiver 也会被强制 move，源 place 随后失效。
+- `value$.drop()`：立即结束当前值的生命周期并执行正常析构，需要 `unsafe`。
+- `value$.forget()`：让 Movable 值失效但跳过析构，需要 `unsafe`；`!Movable` receiver 必须拒绝。
 - `value$.addr()`：获取裸指针，需要 `unsafe`。
 - `value$.dealloc()`：释放默认堆分配器上的对象，需要 `unsafe`。
 - `optional$.some()`：强制解包 optional。
@@ -758,6 +786,17 @@ Int base = 10;
 Fn<Int, Int> add_base = (value) => value + base;
 ```
 
+lambda 可以用 `[...]` 显式初始化 capture environment；未列出的外层 local 仍按默认捕获规则
+处理：
+
+```jiang
+Fn<Int, Int> add_snapshot = (value) [_ captured = base] => value + captured;
+Fn<Int> read = () [ref _ borrowed = base] => borrowed$.get();
+```
+
+capture initializer 在闭包创建时求值。值 capture 遵守 Copyable/move 规则，`ref` / `ref!` capture
+遵守普通 borrow 和 lifetime 规则；逃逸的 owned `Fn^` 不能保存指向已结束栈帧的 borrow。
+
 `RawFn` 不允许捕获。`RawFn` 可以通过 `Fn(raw)` 显式包装成同签名 `Fn`，但 `Fn` 不会隐式或
 显式退回 `RawFn`：
 
@@ -791,6 +830,76 @@ struct Meter {
 调用。区别是：trait object 的 vtable 来自 trait requirement，receiver 指向满足 trait 的具体
 值；closure object 的 vtable 来自某个 lambda/callable 签名，receiver 指向该闭包的 environment。
 trait object 表达“某个类型实现了某个 trait”，closure object 表达“某段代码加上它捕获的环境”。
+
+## 异步、Task 和并发同步
+
+函数声明可以带 `unsafe`、`async` 和静态 Domain effect。effect 也进入 `RawFn` / `Fn` 的函数类型：
+
+```jiang
+struct WorkerDomainType: Domain<kind = .serial> {}
+struct UiDomainType: Domain<kind = .serial> {}
+const WorkerDomainType WorkerDomain = WorkerDomainType();
+const UiDomainType UiDomain = UiDomainType();
+
+unsafe Int read_raw(Int* pointer);
+async [WorkerDomain] Int load(Int id);
+
+RawFn<unsafe Int, Int*> reader = read_raw;
+Fn<async [WorkerDomain] Int, Int> loader = (id) => load(id);
+```
+
+lambda 自身不增加 `async (...) =>` 语法；async/unsafe/domain effect 必须由完整 expected callable type
+下推。async `Fn` 与 async `RawFn` 使用普通 async 函数相同的 start/completion ABI，只额外携带 closure
+environment。动态调用可以在相同或不同 Domain 间切换；跨 Domain 的参数、result 和 capture
+必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
+
+普通 async 调用是隐式挂起点，表达式类型仍是函数声明的返回类型。要提前启动并获得
+handle，使用 `async call(...)` 或 `async [Domain] { ... }`：
+
+```jiang
+async [UiDomain] Int render() {
+    Task<Int> first = async [WorkerDomain] load(1);
+    Task<Int> second = async [WorkerDomain] load(2);
+    first.await() + second.await()
+}
+```
+
+Task creation 是 eager 的。`async` 创建地址固定的直接 `Task<T>`；`new async` 在 heap 上原地初始化
+同一 Task 布局并返回 `Task<T>^` owner：
+
+- 直接 `Task<T>` 是 `!Movable`、非 Copyable 的结构化子任务，可放入 struct、tuple 或固定数组的
+  静态 place；包含它的聚合也不可移动、按值传参、返回或捕获。
+  optional/errorable/union 等动态变体暂不承载直接 Task。
+- `Task<T>^` 是 Movable、非 Copyable 的一等 owner，可以按值传参、返回、存入字段、容器和
+  泛型实例。
+  move 只转移 owner pointer，不移动 heap 上的 Task/TaskState。
+- Task 的公开类型只包含 result type，不包含 Domain 类型参数；Domain 是创建点和 runtime
+  元数据。
+- `await()` 消费一次 result；第二个可能消费同一 result 的源码位置会被诊断。
+- `cancel()` 同步、幂等地发布取消请求，不等待、不消费 result；取消后仍可 `await()`。
+- `cancel_and_await()` 发布取消请求并异步等待目标退出，消费 result ownership，但不取消 caller。
+- 直接 Task 离开作用域前若仍活跃，compiler 先向同一路径的全部 child 发布取消，再逐个等待
+  结束。`Task<T>^` owner 析构不阻塞、也不隐式取消，由 owner/coroutine 双方交接完成最终回收。
+
+取消是协作式的：resume/suspend boundary 会观察请求，长时间不挂起的 async 代码可调用
+`coroutine.check_cancelled()` 建立显式检查点。普通 `await()` 发现 child 已取消且没有 result
+时，当前 parent 进入 cancellation cleanup，并取消、等待其余 sibling。
+
+`sync [Domain] { ... }` 在 async context 中挂起当前 coroutine，结构化切换到目标 Domain，完成后回到
+原 Domain；它不创建 Task。普通同步函数用最外层 `sync [Domain]` 进入 runtime 时，会阻塞当前
+线程等待 block 完成。无 Domain 的 `async {}` / `sync {}` 只能继承已有 current Domain；
+`async [current]` 显式绑定调用点的 current Domain。async/sync block 使用 tail expression
+作为结果，不支持显式 `return`。
+
+跨线程共享简单标量状态使用 `Atomic<T>`。`get()`、`set()`、`get_and_set()` 和
+`compare_exchange()` 默认使用 sequential order；`*_with_order` 接受 `MemoryOrder.relaxed`、
+`acquire`、`release`、`acquire_release` 或 `sequential` 中对该操作合法的顺序。Atomic 只支持后端保证
+lock-free 的整数、Bool 和 raw pointer 标量；它是显式内部可变性入口，写操作不要求外部 binding
+带 `!`。
+
+同步临界区使用 `Mutex.lock() -> MutexGuard`。`Mutex` 是 `!Movable`；guard 唯一拥有 unlock 责任，
+离开作用域时自动解锁，没有公开手工 `unlock()`。`MutexGuard` 可以 move 给同步 helper，但不能
+跨 async 挂起点存活。当前 Mutex 不提供 poison 状态，0.4.8 也不提供公共 Channel/RwLock API。
 
 ## Struct、Enum、Union
 
@@ -899,7 +1008,7 @@ trait Indexable {
   表达：`Trait.Any` 和 `Trait.Receiver`。`Trait$.ref(value)` 生成 borrowed dynamic view，
   不移动原值；`Trait$.new(value)` 生成 owning dynamic view，返回 `Trait.Any^`。
   `Trait.VTable` 是 compiler-private 方法表类型，用户源码不能直接命名或传参。当前实现支持
-  ref receiver method 的动态分派和 owning trait object drop，暂不支持 move receiver
+  shared/mutable ref receiver method 的动态分派和 owning trait object drop，暂不支持 move receiver
   trait object dispatch。
 - 泛型 receiver 的实例方法签名必须用实际 receiver type args 实例化后再检查。例如
   `Holder<T>.get() -> T` 在 `Holder<Int*!>` 上调用时，结果类型为 `Int*!`。
@@ -909,17 +1018,20 @@ trait Indexable {
   能区分调用。
 - `extend Type: Trait { ... }` 当前做基础 conformance 检查：trait 必须存在，required method 必须有同名、同参数、同返回类型实现。
 - `Hashable` 继承 `Equatable`；可作为 hash key 的类型必须同时定义 hash 和相等比较。
-- `Movable` / `Hashable` / `Equatable` 属于 compiler core trait。std prelude 只导出同一个
-  DefId；即使后续启用 no-std，它们仍然是语言核心约束。
+- `Movable`、`Copyable`、`Mutable`、`Sendable`、`Domain`、`Contiguous`、`Hashable`、
+  `Equatable` 等属于 compiler core trait。std prelude 只导出同一个 DefId；即使后续启用 no-std，
+  它们仍然是语言核心约束。
 
-完整 trait solving 仍需继续补齐；trait method lookup 和显式 associated type projection 已进入当前类型检查路径。
+当前已经支持 trait parent 继承和循环诊断、required method 签名检查、associated type/const 实现、
+associated type bound、显式 projection、trait-list associated binding 和 where-bound member lookup。
+这仍不是通用逻辑程序式 trait solver；候选歧义、递归约束和更复杂 higher-ranked 规则需要保持
+显式限制。
 
 未定事项：
 
-- trait parent 的解析和循环检查。
-- associated type 的 where constraint。
-- trait method lookup。
-- trait conformance solving。
+- generic associated type 与 higher-ranked bound。
+- move receiver trait object dispatch。
+- 更复杂递归约束的终止与歧义规则。
 
 ## 泛型和 Type Bound
 
@@ -957,6 +1069,10 @@ T id<T>(T value);
 类型相等/不等约束中的右侧类型可以作为形状 pattern 使用，`_` 匹配单个 type argument。
 例如 `@where(T == _^)` 匹配任意 owning pointer，`@where(T != _?)` 排除 optional。
 内建后缀类型在 pattern 中直接按 canonical type 处理。
+
+`@where(T: Copyable)` 表示泛型 body 可以隐式复制 `T`；只有 `T: Movable` 时，按值使用仍是 move。
+`@where(T: !Movable)` 是真正的 negative trait bound，表示 `T` 地址固定，不能把它当作旧版的
+“允许复制”约束。negative bound 对其他 trait 也统一表示“不实现该 trait”。
 
 当前 AST 使用：
 
@@ -1183,12 +1299,13 @@ if block is .some(Int dead!) {
 
 ambiguous re-export 仍需后续完善；package dependency 第一版只支持本地源码路径。
 
-名称解析需要单独定稿：
+当前 resolver 已区分 module、type、value 和 member domain；字段、enum case、union variant 使用 member
+domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的 module/type/value root 继续查找，
+不会仅凭文本在 MIR 或 backend 重判。`import dep;` 优先查当前 package dependency alias。
 
-- type namespace、value namespace、field namespace、variant namespace、trait/associated type namespace 是否分离。
-- `foo.Bar` 在不同上下文中如何解析为 module path、type member、variant 或 field。
-- import alias 和 package path 的解析顺序：`import dep;` 优先查当前 package dependency alias。
-- 重复声明、shadowing 和 visibility 规则。
+仍需继续收口的是跨多个 public re-export 路径的 ambiguity 诊断，以及更细的 shadowing policy；
+这些规则
+不能改变已经建立的 namespace domain 和 package visibility 边界。
 
 ## 编译期执行
 
@@ -1255,7 +1372,10 @@ comptime {
 
 ### API Effect
 
-第一版不实现 API effect system。当前语言规则中，函数或方法能否写入字段只由字段类型是否带 `!` 决定；方法不需要 `mutating` 标记。
+第一版不实现通用 API effect system。当前函数是否能写入某个 place，由 binding 名后的 `!`、
+receiver 类型和 `T&!` / `T*!` capability 决定；方法不需要额外 `mutating` 标记。现有
+`unsafe`、`async` 和
+Domain effect 是调用上下文与 ABI 的语言规则，不属于下面设想的行为摘要。
 
 后续可以引入 `@effect(...)` 作为 API 行为契约，而不是借用类型系统的一部分。例如：
 
@@ -1281,6 +1401,5 @@ Void save(File& file) {
 - `write(self)` / `write(arg)` / `write(global)`：可能修改对应对象或状态。
 - `io`：执行输入输出。
 - `alloc`：分配内存。
-- `unsafe`：未来 capability 系统中可用于标记低层操作；当前暂不启用检查。
 
 未标注函数在该提案中默认为 `unknown` / impure，不强制第一版代码全量标注。若未来启用检查，`@effect(read)` 函数中写入 `self` 的 `!` 字段应编译失败；trait requirement 也可以携带 effect，要求实现不比 requirement 更“脏”。
