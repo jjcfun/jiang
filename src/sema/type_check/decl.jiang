@@ -969,7 +969,15 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        if (self.lifetime_shape_position_count(shape) != 1) {
+        if (self.field_life_uses_self(field)) {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "field @life does not support the self whole-shape shorthand",
+                "field_life_self_not_allowed"
+            );
+            return;
+        }
+        if (!self.lifetime_shape_is_direct_position(shape)) {
             self.check_structured_field_binding(
                 owner,
                 field,
@@ -996,6 +1004,38 @@ public struct DeclCheck: Movable {
             return self.lifetime_shape_sequence_position_count(alternative.items);
         }
         return 0;
+    }
+
+    Int lifetime_shape_binding_position_count(
+        self,
+        lifetime_shape.LifetimeShapeId shape
+    ) {
+        lifetime_shape.LifetimeShape data = self.state.results.lifetime_shapes.get(shape);
+        if (data.data is .empty || data.data is .recursive(_)) { return 0; }
+        if (data.data is .slot || data.data is .symbolic(_)) { return 1; }
+        if (data.data is .repeated(repeated)) {
+            return self.lifetime_shape_binding_position_count(repeated.element);
+        }
+        if (data.data is .product(product)) {
+            return self.lifetime_shape_binding_sequence_count(product.items);
+        }
+        if (data.data is .alternative(alternative)) {
+            return self.lifetime_shape_binding_sequence_count(alternative.items);
+        }
+        return 0;
+    }
+
+    Int lifetime_shape_binding_sequence_count(
+        self,
+        lifetime_shape.LifetimeShapeId[]& shapes
+    ) {
+        Int count! = 0;
+        Int index! = 0;
+        while (index < shapes.length) {
+            count = count + self.lifetime_shape_binding_position_count(shapes[index]);
+            index = index + 1;
+        }
+        return count;
     }
 
     Int lifetime_shape_sequence_position_count(
@@ -1036,18 +1076,6 @@ public struct DeclCheck: Movable {
             return;
         }
         hir.HirLifetimeName source = field.life_clauses.get(0).source;
-        if (self.field_life_source_is_self(source)) {
-            if (owner.region_names.len() != 1) {
-                self.type_ops.add_def_error(
-                    field.def_id,
-                    "@life(self) requires the field and enclosing value to have the same shape",
-                    "field_life_shape_mismatch"
-                );
-                return;
-            }
-            self.add_used_region(used_regions, owner.region_names.get(0));
-            return;
-        }
         guard self.region_binding_source_symbol(source) is .some(symbol) else {
             self.type_ops.add_def_error(
                 field.def_id,
@@ -1084,11 +1112,199 @@ public struct DeclCheck: Movable {
                 return;
             }
         }
+        types.TypeInfo info = self.state.store.types.get(field_type);
+        if (info.data is .tuple_type(tuple_type)) {
+            self.check_tuple_field_binding(
+                owner, field, tuple_type, used_regions
+            );
+            return;
+        }
         self.type_ops.add_def_error(
             field.def_id,
             "structured field lifetime bindings require named public target regions",
             "structured_field_life_binding_required"
         );
+    }
+
+    () check_tuple_field_binding(
+        self,
+        hir.HirDef& owner,
+        hir.HirDef& field,
+        types.TupleType tuple_type,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        guard field.decl.type_ref is .some(type_ref) else { return; }
+        hir.HirNode node = self.state.hirs.node(type_ref);
+        guard node.data is .tuple_type_ref(tuple_ref) else { return; }
+        if (self.field_life_binding_is_positional(field)) {
+            lifetime_shape_query.LifetimeShapeQuery query! =
+                lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+            lifetime_shape.LifetimeShapeId shape =
+                query.lifetime_shape(self.type_ops.type_for_def(field.def_id));
+            self.check_positional_slice_field_binding(
+                owner,
+                field,
+                self.lifetime_shape_binding_position_count(shape),
+                used_regions
+            );
+            return;
+        }
+        self.check_named_tuple_field_binding(
+            owner, field, tuple_ref, tuple_type, used_regions
+        );
+    }
+
+    () check_named_tuple_field_binding(
+        self,
+        hir.HirDef& owner,
+        hir.HirDef& field,
+        hir.HirTupleTypeRef tuple_ref,
+        types.TupleType tuple_type,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        guard tuple_ref.contract_names is .some(names) else {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "named tuple field binding requires named tuple lifetime positions",
+                "tuple_lifetime_names_required"
+            );
+            return;
+        }
+        list.ArrayList<Int> bound! = list.ArrayList<Int>();
+        Int index! = 0;
+        while (index < field.life_clauses.len()) {
+            if (!self.check_named_tuple_field_clause(
+                owner,
+                field.def_id,
+                field.life_clauses.get(index),
+                names,
+                tuple_type,
+                bound$.ref(),
+                used_regions
+            )) {
+                return;
+            }
+            index = index + 1;
+        }
+        self.check_named_tuple_field_binding_complete(
+            field.def_id, names, tuple_type, bound$.ref()
+        );
+    }
+
+    Bool check_named_tuple_field_clause(
+        self,
+        hir.HirDef& owner,
+        qid.DefId field_def,
+        hir.HirLifeClause clause,
+        qid.SymbolId[]& names,
+        types.TupleType tuple_type,
+        list.ArrayList<Int>& bound,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        guard clause.target is .some(target_name) else {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life cannot mix named and positional bindings",
+                "mixed_field_life_binding"
+            );
+            return false;
+        }
+        guard self.region_binding_source_symbol(target_name) is .some(target) else {
+            self.type_ops.add_def_error(
+                field_def,
+                "tuple field @life target must be a tuple lifetime position name",
+                "invalid_field_life_target"
+            );
+            return false;
+        }
+        Int target_index = self.contract_name_index(names, target);
+        if (target_index < 0 || target_index >= tuple_type.items.length) {
+            self.type_ops.add_def_error(
+                field_def,
+                "unknown tuple lifetime position in field @life target",
+                "unknown_field_life_target"
+            );
+            return false;
+        }
+        if (self.int_list_contains(bound, target_index)) {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life target is bound more than once",
+                "duplicate_field_life_target"
+            );
+            return false;
+        }
+        Int binding_count = self.type_lifetime_binding_position_count(
+            tuple_type.items[target_index]
+        );
+        if (binding_count == 0) {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life target does not carry a lifetime",
+                "empty_field_life_target"
+            );
+            return false;
+        }
+        if (binding_count != 1) {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life source does not match the named target shape",
+                "field_life_shape_mismatch"
+            );
+            return false;
+        }
+        bound.add(target_index);
+        return self.check_field_life_source(
+            owner, field_def, clause.source, used_regions
+        );
+    }
+
+    () check_named_tuple_field_binding_complete(
+        self,
+        qid.DefId field_def,
+        qid.SymbolId[]& names,
+        types.TupleType tuple_type,
+        list.ArrayList<Int>& bound
+    ) {
+        Int index! = 0;
+        while (index < tuple_type.items.length && index < names.length) {
+            if (self.type_lifetime_binding_position_count(tuple_type.items[index]) == 0) {
+                index = index + 1;
+                continue;
+            }
+            if (names[index].to_index() == 0) {
+                self.type_ops.add_def_error(
+                    field_def,
+                    "every tuple element carrying a lifetime must be named in named binding mode",
+                    "unnamed_tuple_lifetime_position"
+                );
+                return;
+            }
+            if (!self.int_list_contains(bound, index)) {
+                self.type_ops.add_def_error(
+                    field_def,
+                    "field @life must bind every named tuple lifetime position exactly once",
+                    "incomplete_field_life_binding"
+                );
+                return;
+            }
+            index = index + 1;
+        }
+    }
+
+    Int type_lifetime_binding_position_count(self, qid.TypeId type_id) {
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        return self.lifetime_shape_binding_position_count(query.lifetime_shape(type_id));
+    }
+
+    Bool int_list_contains(self, list.ArrayList<Int>& values, Int candidate) {
+        Int index! = 0;
+        while (index < values.len()) {
+            if (values.get(index) == candidate) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     () check_named_field_binding(
@@ -1099,10 +1315,6 @@ public struct DeclCheck: Movable {
         list.ArrayList<qid.SymbolId>& used_regions
     ) {
         hir.HirDef& region_owner = self.state.hirs.def_ref(region_owner_def);
-        if (self.field_life_binding_is_self(field)) {
-            self.check_self_field_binding(owner, field, region_owner, used_regions);
-            return;
-        }
         if (self.field_life_binding_is_positional(field)) {
             self.check_positional_field_binding(owner, field, region_owner, used_regions);
             return;
@@ -1129,28 +1341,6 @@ public struct DeclCheck: Movable {
                 "field @life must bind every public target region exactly once",
                 "incomplete_field_life_binding"
             );
-        }
-    }
-
-    () check_self_field_binding(
-        self,
-        hir.HirDef& owner,
-        hir.HirDef& field,
-        hir.HirDef& region_owner,
-        list.ArrayList<qid.SymbolId>& used_regions
-    ) {
-        if (owner.region_names.len() != region_owner.region_names.len()) {
-            self.type_ops.add_def_error(
-                field.def_id,
-                "@life(self) requires the field and enclosing value to have the same shape",
-                "field_life_shape_mismatch"
-            );
-            return;
-        }
-        Int index! = 0;
-        while (index < owner.region_names.len()) {
-            self.add_used_region(used_regions, owner.region_names.get(index));
-            index = index + 1;
         }
     }
 
@@ -1190,12 +1380,6 @@ public struct DeclCheck: Movable {
     ) {
         hir.HirDef& region_owner = self.state.hirs.def_ref(region_owner_def);
         Int binding_count = region_owner.region_names.len() + 1;
-        if (self.field_life_binding_is_self(field)) {
-            self.check_self_slice_field_binding(
-                owner, field, binding_count, used_regions
-            );
-            return;
-        }
         if (self.field_life_binding_is_positional(field)) {
             self.check_positional_slice_field_binding(
                 owner, field, binding_count, used_regions
@@ -1239,28 +1423,6 @@ public struct DeclCheck: Movable {
                 "slice field @life must bind its anonymous slot and every element region",
                 "incomplete_field_life_binding"
             );
-        }
-    }
-
-    () check_self_slice_field_binding(
-        self,
-        hir.HirDef& owner,
-        hir.HirDef& field,
-        Int binding_count,
-        list.ArrayList<qid.SymbolId>& used_regions
-    ) {
-        if (owner.region_names.len() != binding_count) {
-            self.type_ops.add_def_error(
-                field.def_id,
-                "@life(self) requires the field and enclosing value to have the same shape",
-                "field_life_shape_mismatch"
-            );
-            return;
-        }
-        Int index! = 0;
-        while (index < owner.region_names.len()) {
-            self.add_used_region(used_regions, owner.region_names.get(index));
-            index = index + 1;
         }
     }
 
@@ -1363,11 +1525,14 @@ public struct DeclCheck: Movable {
         return true;
     }
 
-    Bool field_life_binding_is_self(self, hir.HirDef& field) {
-        if (field.life_clauses.len() != 1) { return false; }
-        hir.HirLifeClause clause = field.life_clauses.get(0);
-        if (clause.target != null) { return false; }
-        return self.field_life_source_is_self(clause.source);
+    Bool field_life_uses_self(self, hir.HirDef& field) {
+        Int index! = 0;
+        while (index < field.life_clauses.len()) {
+            hir.HirLifeClause clause = field.life_clauses.get(index);
+            if (clause.source.kind == .self_lifetime) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     Bool field_life_binding_is_positional(self, hir.HirDef& field) {
@@ -1378,10 +1543,6 @@ public struct DeclCheck: Movable {
             index = index + 1;
         }
         return true;
-    }
-
-    Bool field_life_source_is_self(self, hir.HirLifetimeName source) {
-        return source.kind == .self_lifetime && source.projection_path == null;
     }
 
     () add_used_region(
@@ -1730,7 +1891,7 @@ public struct DeclCheck: Movable {
         lifetime_shape_query.LifetimeShapeQuery query! =
             lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
         lifetime_shape.LifetimeShapeId field_shape = query.lifetime_shape(field_type);
-        if (self.lifetime_shape_position_count(field_shape) == 1) {
+        if (self.lifetime_shape_is_direct_position(field_shape)) {
             if (self.single_field_binding_matches(field, region)) {
                 paths.add(ResolvedLifetimeSlotPath (
                     slot_index: slot_index,
@@ -1768,7 +1929,216 @@ public struct DeclCheck: Movable {
                 visiting,
                 paths
             );
+            return;
         }
+        types.TypeInfo info = self.state.store.types.get(field_type);
+        if (info.data is .tuple_type(tuple_type)) {
+            self.append_tuple_field_region_paths(
+                field,
+                field_type,
+                tuple_type,
+                region,
+                root,
+                field_path,
+                slot_index,
+                visiting,
+                paths
+            );
+        }
+    }
+
+    Bool lifetime_shape_is_direct_position(
+        self,
+        lifetime_shape.LifetimeShapeId shape
+    ) {
+        lifetime_shape.LifetimeShape data = self.state.results.lifetime_shapes.get(shape);
+        return data.data is .slot || data.data is .symbolic(_);
+    }
+
+    () append_tuple_field_region_paths(
+        self,
+        hir.HirDef& field,
+        qid.TypeId field_type,
+        types.TupleType tuple_type,
+        qid.SymbolId region,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId field_path,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        if (self.field_life_binding_is_positional(field)) {
+            Int index! = 0;
+            while (index < field.life_clauses.len()) {
+                hir.HirLifeClause clause = field.life_clauses.get(index);
+                if (self.region_binding_source_symbol(clause.source) is .some(source)
+                    && source == region) {
+                    self.append_type_binding_position_path(
+                        field_type,
+                        index,
+                        root,
+                        field_path,
+                        slot_index,
+                        visiting,
+                        paths
+                    );
+                }
+                index = index + 1;
+            }
+            return;
+        }
+        guard field.decl.type_ref is .some(type_ref) else { return; }
+        hir.HirNode node = self.state.hirs.node(type_ref);
+        guard node.data is .tuple_type_ref(tuple_ref) else { return; }
+        guard tuple_ref.contract_names is .some(names) else { return; }
+        Int clause_index! = 0;
+        while (clause_index < field.life_clauses.len()) {
+            hir.HirLifeClause clause = field.life_clauses.get(clause_index);
+            clause_index = clause_index + 1;
+            guard self.region_binding_source_symbol(clause.source) is .some(source) else {
+                continue;
+            }
+            if (source != region) { continue; }
+            guard clause.target is .some(target_name) else { continue; }
+            guard self.region_binding_source_symbol(target_name) is .some(target) else {
+                continue;
+            }
+            Int item_index = self.contract_name_index(names, target);
+            if (item_index < 0 || item_index >= tuple_type.items.length) { continue; }
+            Int binding_index = self.tuple_item_binding_offset(tuple_type, item_index);
+            self.append_type_binding_position_path(
+                field_type,
+                binding_index,
+                root,
+                field_path,
+                slot_index,
+                visiting,
+                paths
+            );
+        }
+    }
+
+    Int tuple_item_binding_offset(self, types.TupleType tuple_type, Int item_index) {
+        Int offset! = 0;
+        Int index! = 0;
+        while (index < item_index && index < tuple_type.items.length) {
+            offset = offset + self.type_lifetime_binding_position_count(
+                tuple_type.items[index]
+            );
+            index = index + 1;
+        }
+        return offset;
+    }
+
+    () append_type_binding_position_path(
+        self,
+        qid.TypeId type_id,
+        Int binding_index,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        if (self.public_region_owner_for_type(type_id) is .some(owner_def)) {
+            hir.HirDef& owner = self.state.hirs.def_ref(owner_def);
+            if (binding_index < 0 || binding_index >= owner.region_names.len()) { return; }
+            self.append_public_region_paths(
+                type_id,
+                owner.region_names.get(binding_index),
+                root,
+                prefix,
+                slot_index,
+                visiting,
+                paths
+            );
+            return;
+        }
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (info.data is .tuple_type(tuple_type)) {
+            self.append_tuple_binding_position_path(
+                tuple_type,
+                binding_index,
+                root,
+                prefix,
+                slot_index,
+                visiting,
+                paths
+            );
+            return;
+        }
+        if (self.lifetime_slice_element_type(type_id) is .some(element_type)) {
+            if (binding_index == 0) {
+                self.add_resolved_lifetime_path(root, prefix, slot_index, paths);
+                return;
+            }
+            self.append_type_binding_position_path(
+                element_type,
+                binding_index - 1,
+                root,
+                prefix,
+                slot_index,
+                visiting,
+                paths
+            );
+            return;
+        }
+        if (binding_index == 0 && self.type_lifetime_binding_position_count(type_id) == 1) {
+            self.add_resolved_lifetime_path(root, prefix, slot_index, paths);
+        }
+    }
+
+    () append_tuple_binding_position_path(
+        self,
+        types.TupleType tuple_type,
+        Int binding_index,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        Int offset! = 0;
+        Int index! = 0;
+        while (index < tuple_type.items.length) {
+            qid.TypeId item_type = tuple_type.items[index];
+            Int count = self.type_lifetime_binding_position_count(item_type);
+            if (binding_index >= offset && binding_index < offset + count) {
+                types.LifetimeProjectionPathId item_path =
+                    self.state.store.types.intern_lifetime_projection(
+                        prefix, .tuple_index, null, index
+                    );
+                self.append_type_binding_position_path(
+                    item_type,
+                    binding_index - offset,
+                    root,
+                    item_path,
+                    slot_index,
+                    visiting,
+                    paths
+                );
+                return;
+            }
+            offset = offset + count;
+            index = index + 1;
+        }
+    }
+
+    () add_resolved_lifetime_path(
+        self,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId projection_path,
+        Int slot_index,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        paths.add(ResolvedLifetimeSlotPath (
+            slot_index: slot_index,
+            path: types.LifetimePath (
+                root_kind: root.root_kind,
+                root_index: root.root_index,
+                projection_path: projection_path
+            )
+        ));
     }
 
     () append_named_field_region_paths(
@@ -1784,25 +2154,6 @@ public struct DeclCheck: Movable {
         list.ArrayList<ResolvedLifetimeSlotPath>& paths
     ) {
         hir.HirDef& target_owner = self.state.hirs.def_ref(target_owner_def);
-        if (self.field_life_binding_is_self(field)) {
-            guard self.state.store.defs.get(field.def_id).owner_def
-                is .some(owner_def) else { return; }
-            hir.HirDef& owner = self.state.hirs.def_ref(owner_def);
-            guard self.region_name_index(owner, region) is .some(region_index) else {
-                return;
-            }
-            if (region_index >= target_owner.region_names.len()) { return; }
-            self.append_public_region_paths(
-                field_type,
-                target_owner.region_names.get(region_index),
-                root,
-                field_path,
-                slot_index,
-                visiting,
-                paths
-            );
-            return;
-        }
         if (self.field_life_binding_is_positional(field)) {
             self.append_positional_field_region_paths(
                 field,
@@ -1889,20 +2240,6 @@ public struct DeclCheck: Movable {
             return;
         }
         hir.HirDef& target_owner = self.state.hirs.def_ref(target_owner_def);
-        if (self.field_life_binding_is_self(field)) {
-            self.append_self_slice_field_region_paths(
-                field,
-                element_type,
-                target_owner,
-                region,
-                root,
-                field_path,
-                slot_index,
-                visiting,
-                paths
-            );
-            return;
-        }
         if (self.field_life_binding_is_positional(field)) {
             self.append_positional_slice_field_region_paths(
                 field,
@@ -1951,36 +2288,6 @@ public struct DeclCheck: Movable {
                 paths
             );
         }
-    }
-
-    () append_self_slice_field_region_paths(
-        self,
-        hir.HirDef& field,
-        qid.TypeId element_type,
-        hir.HirDef& target_owner,
-        qid.SymbolId region,
-        types.LifetimePath root,
-        types.LifetimeProjectionPathId field_path,
-        Int slot_index,
-        list.ArrayList<qid.DefId>& visiting,
-        list.ArrayList<ResolvedLifetimeSlotPath>& paths
-    ) {
-        guard self.state.store.defs.get(field.def_id).owner_def
-            is .some(owner_def) else { return; }
-        hir.HirDef& owner = self.state.hirs.def_ref(owner_def);
-        guard self.region_name_index(owner, region) is .some(region_index) else {
-            return;
-        }
-        self.append_slice_binding_position_path(
-            element_type,
-            target_owner,
-            region_index,
-            root,
-            field_path,
-            slot_index,
-            visiting,
-            paths
-        );
     }
 
     () append_positional_slice_field_region_paths(
