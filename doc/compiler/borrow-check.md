@@ -69,7 +69,8 @@ BorrowCheckStore
   loans
 
 TypeCheckStore
-  BorrowShape[TypeId]
+  LifetimeShapeStore
+  LifetimeShapeId[TypeId]
   LifetimeContract[FunctionType]
 ```
 
@@ -86,10 +87,21 @@ loan 仍是稀疏事实列表；StorageDead 清理先探测是否存在匹配事
 reference 和 raw pointer view，并同时记录来源与承载该 view 的目标 place。引用 loan 既用于
 lifetime/逃逸检查，也用于 shared/mutable 冲突检查；raw pointer view 不参与别名排他性判断。
 
-`BorrowShape` 是按具体 `TypeId` 缓存的派生属性，只回答值是否可能携带 borrow。
+`LifetimeShape` 是按具体 `TypeId` 缓存并 intern 的派生属性，描述值可公开携带的 lifetime slot
+结构。当前节点包括 empty、slot、product、repeated element、tagged alternative、symbolic 和
+recursive。查询状态显式区分 computing/complete；递归 nominal 在 computing 回边上使用 interned
+recursive 节点，不重新扫描字段。generic 和 associated type 未解析时保留 symbolic 节点。
+需要旧式 empty/non-empty/unknown 结论的消费者统一从 shape 派生，不维护第二套递归类型扫描。
+具体值是否实际携带 borrow 仍由 Loan 和 path dataflow 决定。
+
+reference 提供一个 slot；raw pointer 不提供 slot，owner pointer 保留 pointee shape。tuple/struct
+使用 product，array/slice value 使用 repeated element，optional/error union/union 使用有序
+alternative。slice handle 由自身 slot 与 repeated element 组成；Task 使用 pending empty/completed
+result alternative。RawFn 为空 shape，Fn 的 slot 表示 capture environment lifetime。
+
 `LifetimeContract` 是 intern 后的 path-to-path flow：root 是函数参数或返回值，projection
-直接使用 struct/union 字段 `DefId` 或 tuple 静态下标。不存在独立的 lifetime slot/schema，
-也不再保存只能描述整个返回值的 `result_sources`。
+直接使用 struct/union 字段 `DefId` 或 tuple 静态下标。`LifetimeShape` 描述类型结构，
+contract path 继续保存解析后的稳定投影；不再保存只能描述整个返回值的 `result_sources`。
 
 ## 分析流程
 

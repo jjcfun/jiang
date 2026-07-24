@@ -1,18 +1,19 @@
-// 判断类型值中是否可能携带 borrow。
+// 查询类型值可携带的 lifetime slot 结构。
 //
-// 查询只计算 borrow shape，不创建替换后的 TypeId。泛型实例通过局部符号
-// 绑定环境解释字段类型，避免 borrow check 再执行一次完整类型替换。
+// 查询不创建替换后的 TypeId。泛型实例通过局部符号绑定环境解释字段类型，
+// 避免 borrow check 再执行一次完整类型替换。
 
 import context = "../context.jiang";
 import hir = "../hir/hir.jiang";
 import qid = "../store/id.jiang";
 import def = "../resolve/def.jiang";
+import lifetime_shape = "../sema/lifetime_shape.jiang";
 import typeck_store = "../sema/type_check/store.jiang";
 import types = "../sema/type.jiang";
 import list = "../support/list.jiang";
 import table = "../support/table.jiang";
 
-public struct BorrowCarryQuery: Copyable {
+public struct LifetimeShapeQuery: Copyable {
     public context.CompilerContext& ctx;
     public typeck_store.TypeCheckStore& typeck;
 
@@ -22,113 +23,202 @@ public struct BorrowCarryQuery: Copyable {
     }
 
     public Bool type_may_carry_borrow(self, qid.TypeId type_id) {
-        return self.borrow_shape(type_id) != .no_borrow;
+        lifetime_shape.LifetimeShapeId shape = self.lifetime_shape(type_id);
+        return self.typeck.lifetime_shapes.classify(shape) != .empty;
     }
 
-    public typeck_store.BorrowShape borrow_shape(self, qid.TypeId type_id) {
-        if (self.typeck.borrow_shape(type_id) is .some(shape)) { return shape; }
+    public lifetime_shape.LifetimeShapeId lifetime_shape(self, qid.TypeId type_id) {
         list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
         list.ArrayList<qid.DefId> binding_defs! = list.ArrayList<qid.DefId>();
         list.ArrayList<qid.TypeId> binding_types! = list.ArrayList<qid.TypeId>();
-        typeck_store.BorrowShape shape = self.borrow_shape_inner(
+        return self.lifetime_shape_inner(
             type_id,
             visiting$.ref(),
             binding_defs$.ref(),
             binding_types$.ref()
         );
-        self.typeck.set_borrow_shape(type_id, shape);
-        return shape;
     }
 
-    typeck_store.BorrowShape borrow_shape_inner(
+    lifetime_shape.LifetimeShapeId lifetime_shape_inner(
         self,
         qid.TypeId type_id,
         list.ArrayList<qid.DefId>& visiting,
         list.ArrayList<qid.DefId>& binding_defs,
         list.ArrayList<qid.TypeId>& binding_types
     ) {
+        Bool cacheable = binding_defs.empty();
+        if (cacheable && self.typeck.lifetime_shape(type_id) is .some(shape)) {
+            return shape;
+        }
         types.TypeInfo info = self.ctx.store.types.get(type_id);
+        if (cacheable && self.typeck.lifetime_shape_state(type_id) is .some(state)) {
+            if (state == .computing) { return self.recursive_lifetime_shape(info); }
+        }
+        if (cacheable) { self.typeck.begin_lifetime_shape(type_id); }
+        lifetime_shape.LifetimeShapeId shape = self.compute_lifetime_shape(
+            type_id,
+            info,
+            visiting,
+            binding_defs,
+            binding_types
+        );
+        if (cacheable) { self.typeck.finish_lifetime_shape(type_id, shape); }
+        return shape;
+    }
+
+    lifetime_shape.LifetimeShapeId recursive_lifetime_shape(self, types.TypeInfo info) {
+        if (info.data is .named(named)) {
+            return self.typeck.lifetime_shapes.recursive(named.def_id);
+        }
+        return self.typeck.lifetime_shapes.empty_shape();
+    }
+
+    lifetime_shape.LifetimeShapeId compute_lifetime_shape(
+        self,
+        qid.TypeId type_id,
+        types.TypeInfo info,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
         if (info.data is .trait_companion(companion)) {
-            if (companion.kind == .any || companion.kind == .receiver) { return .may_borrow; }
-            return .no_borrow;
+            if (companion.kind == .any || companion.kind == .receiver) {
+                return self.typeck.lifetime_shapes.symbolic(companion.trait_def);
+            }
+            return self.typeck.lifetime_shapes.empty_shape();
         }
         if (info.data is .handle_type(handle)) {
-            return self.handle_borrow_shape(handle);
+            return self.handle_lifetime_shape(handle, visiting, binding_defs, binding_types);
         }
         if (info.data is .optional(optional)) {
-            return self.borrow_shape_inner(optional.element, visiting, binding_defs, binding_types);
+            list.ArrayList<lifetime_shape.LifetimeShapeId> variants! =
+                list.ArrayList<lifetime_shape.LifetimeShapeId>();
+            variants.add(self.typeck.lifetime_shapes.empty_shape());
+            variants.add(self.lifetime_shape_inner(
+                optional.element, visiting, binding_defs, binding_types
+            ));
+            return self.typeck.lifetime_shapes.alternative(variants$.ref());
         }
         if (info.data is .error_union(error_union)) {
-            typeck_store.BorrowShape value = self.borrow_shape_inner(
+            list.ArrayList<lifetime_shape.LifetimeShapeId> variants! =
+                list.ArrayList<lifetime_shape.LifetimeShapeId>();
+            variants.add(self.lifetime_shape_inner(
                 error_union.value, visiting, binding_defs, binding_types
-            );
-            typeck_store.BorrowShape error = self.borrow_shape_inner(
+            ));
+            variants.add(self.lifetime_shape_inner(
                 error_union.error, visiting, binding_defs, binding_types
-            );
-            return self.merge_shapes(value, error);
+            ));
+            return self.typeck.lifetime_shapes.alternative(variants$.ref());
         }
         if (info.data is .array_type(array_type)) {
-            return self.borrow_shape_inner(array_type.element, visiting, binding_defs, binding_types);
+            lifetime_shape.LifetimeShapeId element = self.lifetime_shape_inner(
+                array_type.element, visiting, binding_defs, binding_types
+            );
+            return self.typeck.lifetime_shapes.repeated(element);
+        }
+        if (info.data is .slice_value_type(slice_value)) {
+            lifetime_shape.LifetimeShapeId element = self.lifetime_shape_inner(
+                slice_value.element, visiting, binding_defs, binding_types
+            );
+            return self.typeck.lifetime_shapes.repeated(element);
         }
         if (info.data is .tuple_type(tuple_type)) {
-            return self.tuple_borrow_shape(tuple_type, visiting, binding_defs, binding_types);
+            return self.tuple_lifetime_shape(tuple_type, visiting, binding_defs, binding_types);
         }
         if (info.data is .function_type(function_type)) {
-            if (function_type.kind == .closure) { return .may_borrow; }
-            return .no_borrow;
+            if (function_type.kind == .closure) { return self.typeck.lifetime_shapes.slot_shape(); }
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        if (info.data is .task_type(task_type)) {
+            list.ArrayList<lifetime_shape.LifetimeShapeId> states! =
+                list.ArrayList<lifetime_shape.LifetimeShapeId>();
+            states.add(self.typeck.lifetime_shapes.empty_shape());
+            states.add(self.lifetime_shape_inner(
+                task_type.result, visiting, binding_defs, binding_types
+            ));
+            return self.typeck.lifetime_shapes.alternative(states$.ref());
         }
         if (info.data is .named(named)) {
-            return self.named_borrow_shape(named, visiting, binding_defs, binding_types);
+            return self.named_lifetime_shape(
+                type_id, named, visiting, binding_defs, binding_types
+            );
         }
-        return .no_borrow;
+        return self.typeck.lifetime_shapes.empty_shape();
     }
 
-    typeck_store.BorrowShape handle_borrow_shape(self, types.HandleType handle) {
-        if (types.is_reference_handle(handle)) { return .may_borrow; }
-        if (types.is_slice_handle(handle)) { return .may_borrow; }
-        return .no_borrow;
+    lifetime_shape.LifetimeShapeId handle_lifetime_shape(
+        self,
+        types.HandleType handle,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        if (types.is_reference_handle(handle)) { return self.typeck.lifetime_shapes.slot_shape(); }
+        if (types.is_owner_pointer_handle(handle)) {
+            return self.lifetime_shape_inner(
+                handle.element, visiting, binding_defs, binding_types
+            );
+        }
+        if (!types.is_slice_handle(handle)) { return self.typeck.lifetime_shapes.empty_shape(); }
+        list.ArrayList<lifetime_shape.LifetimeShapeId> items! =
+            list.ArrayList<lifetime_shape.LifetimeShapeId>();
+        items.add(self.typeck.lifetime_shapes.slot_shape());
+        lifetime_shape.LifetimeShapeId element = self.lifetime_shape_inner(
+            handle.element, visiting, binding_defs, binding_types
+        );
+        items.add(self.typeck.lifetime_shapes.repeated(element));
+        return self.typeck.lifetime_shapes.product(items$.ref());
     }
 
-    typeck_store.BorrowShape tuple_borrow_shape(
+    lifetime_shape.LifetimeShapeId tuple_lifetime_shape(
         self,
         types.TupleType tuple_type,
         list.ArrayList<qid.DefId>& visiting,
         list.ArrayList<qid.DefId>& binding_defs,
         list.ArrayList<qid.TypeId>& binding_types
     ) {
-        typeck_store.BorrowShape result! = .no_borrow;
+        list.ArrayList<lifetime_shape.LifetimeShapeId> items! =
+            list.ArrayList<lifetime_shape.LifetimeShapeId>();
         Int index! = 0;
         while (index < tuple_type.items.length) {
-            typeck_store.BorrowShape item = self.borrow_shape_inner(
+            items.add(self.lifetime_shape_inner(
                 tuple_type.items[index], visiting, binding_defs, binding_types
-            );
-            result = self.merge_shapes(result, item);
-            if (result == .may_borrow) { return result; }
+            ));
             index = index + 1;
         }
-        return result;
+        return self.typeck.lifetime_shapes.product(items$.ref());
     }
 
-    typeck_store.BorrowShape named_borrow_shape(
+    lifetime_shape.LifetimeShapeId named_lifetime_shape(
         self,
+        qid.TypeId type_id,
         types.NamedType named,
         list.ArrayList<qid.DefId>& visiting,
         list.ArrayList<qid.DefId>& binding_defs,
         list.ArrayList<qid.TypeId>& binding_types
     ) {
-        if (self.generic_param_type(named.def_id)) {
+        if (self.symbolic_type_def(named.def_id)) {
             guard self.bound_type(named.def_id, binding_defs, binding_types) is .some(bound) else {
-                return .unknown;
+                if (self.resolved_associated_type(named.def_id, type_id) is .some(resolved)) {
+                    return self.lifetime_shape_inner(
+                        resolved, visiting, binding_defs, binding_types
+                    );
+                }
+                return self.typeck.lifetime_shapes.symbolic(named.def_id);
             }
-            return self.borrow_shape_inner(bound, visiting, binding_defs, binding_types);
+            return self.lifetime_shape_inner(bound, visiting, binding_defs, binding_types);
         }
-        if (self.borrow_type_stack_has(visiting, named.def_id)) { return .no_borrow; }
-        guard self.ctx.store.hirs.def(named.def_id) is .some(hir_def) else { return .no_borrow; }
+        if (!binding_defs.empty() && self.lifetime_type_stack_has(visiting, named.def_id)) {
+            return self.typeck.lifetime_shapes.recursive(named.def_id);
+        }
+        guard self.ctx.store.hirs.def(named.def_id) is .some(hir_def) else {
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
         Int visit_depth = visiting.len();
         Int binding_depth = binding_defs.len();
         visiting.add(named.def_id);
         self.bind_named_type_args(hir_def, named, binding_defs, binding_types);
-        typeck_store.BorrowShape result = self.named_members_borrow_shape(
+        lifetime_shape.LifetimeShapeId result = self.named_members_lifetime_shape(
             hir_def, visiting, binding_defs, binding_types
         );
         binding_defs.truncate(binding_depth);
@@ -189,48 +279,50 @@ public struct BorrowCarryQuery: Copyable {
         return null;
     }
 
-    typeck_store.BorrowShape named_members_borrow_shape(
+    lifetime_shape.LifetimeShapeId named_members_lifetime_shape(
         self,
         hir.HirDef& hir_def,
         list.ArrayList<qid.DefId>& visiting,
         list.ArrayList<qid.DefId>& binding_defs,
         list.ArrayList<qid.TypeId>& binding_types
     ) {
-        typeck_store.BorrowShape result! = .no_borrow;
+        list.ArrayList<lifetime_shape.LifetimeShapeId> members! =
+            list.ArrayList<lifetime_shape.LifetimeShapeId>();
         Int index! = 0;
         while (index < hir_def.members.len()) {
             qid.DefId member_def = hir_def.members.get(index);
-            typeck_store.BorrowShape field = self.field_borrow_shape(
-                member_def, visiting, binding_defs, binding_types
-            );
-            result = self.merge_shapes(result, field);
-            if (result == .may_borrow) { return result; }
+            if (self.lifetime_field_kind(self.ctx.store.defs.get(member_def).kind)) {
+                members.add(self.field_lifetime_shape(
+                    member_def, visiting, binding_defs, binding_types
+                ));
+            }
             index = index + 1;
         }
-        return result;
+        def.DefKind owner_kind = self.ctx.store.defs.get(hir_def.def_id).kind;
+        if (owner_kind == .union_def) {
+            return self.typeck.lifetime_shapes.alternative(members$.ref());
+        }
+        return self.typeck.lifetime_shapes.product(members$.ref());
     }
 
-    typeck_store.BorrowShape field_borrow_shape(
+    lifetime_shape.LifetimeShapeId field_lifetime_shape(
         self,
         qid.DefId member_def,
         list.ArrayList<qid.DefId>& visiting,
         list.ArrayList<qid.DefId>& binding_defs,
         list.ArrayList<qid.TypeId>& binding_types
     ) {
-        if (!self.borrow_field_kind(self.ctx.store.defs.get(member_def).kind)) {
-            return .no_borrow;
-        }
         table.HashTable<qid.DefId, qid.TypeId>& def_types = self.typeck.def_types$.ref();
         guard table.hash_table_get_value<qid.DefId, qid.TypeId>(
             def_types,
             member_def
         ) is .some(field_type) else {
-            return .unknown;
+            return self.typeck.lifetime_shapes.symbolic(member_def);
         }
-        return self.borrow_shape_inner(field_type, visiting, binding_defs, binding_types);
+        return self.lifetime_shape_inner(field_type, visiting, binding_defs, binding_types);
     }
 
-    Bool borrow_field_kind(self, def.DefKind kind) {
+    Bool lifetime_field_kind(self, def.DefKind kind) {
         return kind == .field_def || kind == .union_variant_def;
     }
 
@@ -239,17 +331,21 @@ public struct BorrowCarryQuery: Copyable {
         return self.ctx.store.defs.get(def_id).kind == .generic_param_def;
     }
 
-    typeck_store.BorrowShape merge_shapes(
-        self,
-        typeck_store.BorrowShape lhs,
-        typeck_store.BorrowShape rhs
-    ) {
-        if (lhs == .may_borrow || rhs == .may_borrow) { return .may_borrow; }
-        if (lhs == .unknown || rhs == .unknown) { return .unknown; }
-        return .no_borrow;
+    Bool symbolic_type_def(self, qid.DefId def_id) {
+        if (!self.ctx.store.defs.has(def_id)) { return false; }
+        def.DefKind kind = self.ctx.store.defs.get(def_id).kind;
+        return kind == .generic_param_def || kind == .associated_type_def;
     }
 
-    Bool borrow_type_stack_has(self, list.ArrayList<qid.DefId>& visiting, qid.DefId def_id) {
+    qid.TypeId? resolved_associated_type(self, qid.DefId def_id, qid.TypeId source_type) {
+        if (!self.ctx.store.defs.has(def_id)) { return null; }
+        if (self.ctx.store.defs.get(def_id).kind != .associated_type_def) { return null; }
+        guard self.typeck.def_type(def_id) is .some(resolved) else { return null; }
+        if (resolved.to_index() == source_type.to_index()) { return null; }
+        return resolved;
+    }
+
+    Bool lifetime_type_stack_has(self, list.ArrayList<qid.DefId>& visiting, qid.DefId def_id) {
         Int index! = 0;
         while (index < visiting.len()) {
             if (visiting.get(index).to_index() == def_id.to_index()) { return true; }
