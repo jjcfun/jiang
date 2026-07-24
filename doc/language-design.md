@@ -517,6 +517,8 @@ struct Pair {
 `@life(return: input)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
 因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
 不含 borrow 的参数对应空 loan 集合，约束自然成立。raw pointer 不携带语言级 lifetime。
+带 `@region` 的 nominal 参数使用公开 region 名选择单个位置，例如 `input.left`。该名称解析为
+类型声明的字段 binding，不是对同名字段的访问；private 字段名不能出现在公开 callable contract 中。
 
 `Fn` / `RawFn` 的 result 和参数可以提供按需契约名，供外层函数约束 callback：
 

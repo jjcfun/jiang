@@ -32,6 +32,11 @@ struct ResolvedCallableLifetimePath: Copyable {
     qid.TypeId type_id;
 }
 
+struct ResolvedLifetimeSlotPath: Copyable {
+    Int slot_index;
+    types.LifetimePath path;
+}
+
 public struct DeclCheck: Movable {
     check_state.CheckState& state;
     type_ops_mod.TypeOps& type_ops;
@@ -663,36 +668,83 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        self.check_lifetime_name(hir_def, target);
-        self.check_lifetime_name(hir_def, clause.source);
-        guard self.semantic_lifetime_name_type(hir_def, target) is .some(target_type) else { return; }
-        guard self.semantic_lifetime_name_type(hir_def, clause.source)
-            is .some(source_type) else {
-            return;
-        }
-        self.check_lifetime_shape_compatibility(hir_def.def_id, target_type, source_type);
+        if (!self.check_canonical_lifetime_name(hir_def, target)) { return; }
+        if (!self.check_canonical_lifetime_name(hir_def, clause.source)) { return; }
+        guard self.semantic_lifetime_name_shape(hir_def, target)
+            is .some(target_shape) else { return; }
+        guard self.semantic_lifetime_name_shape(hir_def, clause.source)
+            is .some(source_shape) else { return; }
+        self.check_lifetime_shape_compatibility(hir_def.def_id, target_shape, source_shape);
     }
 
-    qid.TypeId? semantic_lifetime_name_type(
+    Bool check_canonical_lifetime_name(
         self,
         hir.HirDef& hir_def,
         hir.HirLifetimeName name
     ) {
+        if (self.canonical_lifetime_name_allowed(hir_def, name)) { return true; }
+        self.type_ops.add_def_error(
+            hir_def.def_id,
+            "unknown or invalid public lifetime position",
+            "invalid_lifetime_name"
+        );
+        return false;
+    }
+
+    Bool canonical_lifetime_name_allowed(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
+        if (name.projection_path == null) {
+            return self.lifetime_name_allowed(hir_def, name);
+        }
+        if (self.public_region_projection(hir_def, name) != null) { return true; }
+        return self.callable_lifetime_name_allowed(hir_def, name);
+    }
+
+    lifetime_shape.LifetimeShapeId? semantic_lifetime_name_shape(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name
+    ) {
+        if (self.public_region_projection(hir_def, name) != null) {
+            return self.state.results.lifetime_shapes.slot_shape();
+        }
         guard self.lifetime_root_type(hir_def, name) is .some(root_type) else { return null; }
-        guard name.projection_path is .some(path_id) else { return root_type; }
-        return self.lifetime_path_type(hir_def.def_id, root_type, path_id);
+        qid.TypeId position_type! = root_type;
+        if (name.projection_path is .some(path_id)) {
+            guard self.callable_lifetime_position_type(hir_def, name, path_id)
+                is .some(resolved_type) else {
+                return null;
+            }
+            position_type = resolved_type;
+        }
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        return query.lifetime_shape(position_type);
+    }
+
+    qid.TypeId? callable_lifetime_position_type(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name,
+        hir.HirLifetimePathId path_id
+    ) {
+        guard name.symbol is .some(symbol) else { return null; }
+        guard self.function_param_type_ref(hir_def, symbol) is .some(type_ref) else {
+            return null;
+        }
+        guard self.callable_named_type_ref(type_ref) is .some(named) else { return null; }
+        guard self.resolve_callable_lifetime_path(hir_def, named, path_id)
+            is .some(resolved) else {
+            return null;
+        }
+        return resolved.type_id;
     }
 
     () check_lifetime_shape_compatibility(
         self,
         qid.DefId owner_def,
-        qid.TypeId target_type,
-        qid.TypeId source_type
+        lifetime_shape.LifetimeShapeId target_shape,
+        lifetime_shape.LifetimeShapeId source_shape
     ) {
-        lifetime_shape_query.LifetimeShapeQuery query! =
-            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
-        lifetime_shape.LifetimeShapeId target_shape = query.lifetime_shape(target_type);
-        lifetime_shape.LifetimeShapeId source_shape = query.lifetime_shape(source_type);
         lifetime_shape.LifetimeShapeClass target_class =
             self.state.results.lifetime_shapes.classify(target_shape);
         lifetime_shape.LifetimeShapeClass source_class =
@@ -1094,6 +1146,22 @@ public struct DeclCheck: Movable {
         return named.def_id;
     }
 
+    qid.SymbolId? public_region_projection(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name
+    ) {
+        guard name.projection_path is .some(path_id) else { return null; }
+        hir.HirLifetimePathNode node = self.state.hirs.lifetime_path_node(path_id);
+        if (node.parent != null || node.projection.kind != .field) { return null; }
+        guard node.projection.symbol is .some(symbol) else { return null; }
+        guard self.lifetime_root_type(hir_def, name) is .some(root_type) else { return null; }
+        guard self.public_region_owner_for_type(root_type) is .some(owner_def) else { return null; }
+        hir.HirDef& owner = self.state.hirs.def_ref(owner_def);
+        if (!self.region_name_declared(owner, symbol)) { return null; }
+        return symbol;
+    }
+
     qid.SymbolId? region_binding_source_symbol(self, hir.HirLifetimeName source) {
         if (source.kind != .named_lifetime || source.projection_path != null) { return null; }
         return source.symbol;
@@ -1130,7 +1198,73 @@ public struct DeclCheck: Movable {
             self.append_nominal_lifetime_flow(hir_def, constraint, flows$.ref());
             index = index + 1;
         }
+        index = 0;
+        while (index < hir_def.region_constraints.len()) {
+            self.append_nominal_region_flow(
+                hir_def,
+                hir_def.region_constraints.get(index),
+                flows$.ref()
+            );
+            index = index + 1;
+        }
         self.state.results.set_nominal_lifetime_flows(hir_def.def_id, flows$.ref());
+    }
+
+    () append_nominal_region_flow(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirRegionConstraint constraint,
+        list.ArrayList<types.NominalLifetimeFlow>& flows
+    ) {
+        qid.TypeId nominal_type = self.type_ops.self_type_for_owner(hir_def.def_id);
+        types.LifetimePath root = types.LifetimePath (
+            root_kind: .parameter,
+            root_index: 0,
+            projection_path: null
+        );
+        list.ArrayList<qid.DefId> source_visiting! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.DefId> target_visiting! = list.ArrayList<qid.DefId>();
+        list.ArrayList<ResolvedLifetimeSlotPath> source_paths! =
+            list.ArrayList<ResolvedLifetimeSlotPath>();
+        list.ArrayList<ResolvedLifetimeSlotPath> target_paths! =
+            list.ArrayList<ResolvedLifetimeSlotPath>();
+        self.append_public_region_paths(
+            nominal_type,
+            constraint.source,
+            root,
+            null,
+            0,
+            source_visiting$.ref(),
+            source_paths$.ref()
+        );
+        self.append_public_region_paths(
+            nominal_type,
+            constraint.target,
+            root,
+            null,
+            0,
+            target_visiting$.ref(),
+            target_paths$.ref()
+        );
+        Int target_index! = 0;
+        while (target_index < target_paths.len()) {
+            guard target_paths.get(target_index).path.projection_path
+                is .some(target_path) else {
+                target_index = target_index + 1;
+                continue;
+            }
+            Int source_index! = 0;
+            while (source_index < source_paths.len()) {
+                if (source_paths.get(source_index).path.projection_path is .some(source_path)) {
+                    flows.add(types.NominalLifetimeFlow (
+                        source: source_path,
+                        target: target_path
+                    ));
+                }
+                source_index = source_index + 1;
+            }
+            target_index = target_index + 1;
+        }
     }
 
     () append_nominal_lifetime_flow(
@@ -1190,7 +1324,7 @@ public struct DeclCheck: Movable {
             hir.HirLifeClause clause = hir_def.life_clauses.get(index);
             index = index + 1;
             if (clause.target is .some(target)) {
-                self.append_resolved_lifetime_flow(
+                self.append_canonical_lifetime_flows(
                     hir_def,
                     clause.source,
                     target,
@@ -1202,6 +1336,196 @@ public struct DeclCheck: Movable {
             self.append_default_function_lifetime_flow(hir_def, flows$.ref());
         }
         self.state.results.set_function_lifetime_flows(hir_def.def_id, flows$.ref());
+    }
+
+    () append_canonical_lifetime_flows(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName source,
+        hir.HirLifetimeName target,
+        list.ArrayList<types.LifetimeFlow>& flows
+    ) {
+        list.ArrayList<ResolvedLifetimeSlotPath> source_paths! =
+            list.ArrayList<ResolvedLifetimeSlotPath>();
+        list.ArrayList<ResolvedLifetimeSlotPath> target_paths! =
+            list.ArrayList<ResolvedLifetimeSlotPath>();
+        self.append_canonical_lifetime_paths(hir_def, source, source_paths$.ref());
+        self.append_canonical_lifetime_paths(hir_def, target, target_paths$.ref());
+        Int target_index! = 0;
+        while (target_index < target_paths.len()) {
+            ResolvedLifetimeSlotPath target_path = target_paths.get(target_index);
+            Int source_index! = 0;
+            while (source_index < source_paths.len()) {
+                ResolvedLifetimeSlotPath source_path = source_paths.get(source_index);
+                if (source_path.slot_index == target_path.slot_index) {
+                    flows.add(types.LifetimeFlow (
+                        source: source_path.path,
+                        target: target_path.path
+                    ));
+                }
+                source_index = source_index + 1;
+            }
+            target_index = target_index + 1;
+        }
+    }
+
+    () append_canonical_lifetime_paths(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        guard self.semantic_lifetime_root(hir_def, name) is .some(root) else { return; }
+        guard self.lifetime_root_type(hir_def, name) is .some(root_type) else { return; }
+        if (self.public_region_projection(hir_def, name) is .some(region)) {
+            list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+            self.append_public_region_paths(
+                root_type,
+                region,
+                root,
+                null,
+                0,
+                visiting$.ref(),
+                paths
+            );
+            return;
+        }
+        if (name.projection_path != null) {
+            guard self.semantic_lifetime_path(hir_def, name) is .some(path) else { return; }
+            paths.add(ResolvedLifetimeSlotPath(slot_index: 0, path: path));
+            return;
+        }
+        if (self.public_region_owner_for_type(root_type) is .some(region_owner_def)) {
+            hir.HirDef& region_owner = self.state.hirs.def_ref(region_owner_def);
+            Int region_index! = 0;
+            while (region_index < region_owner.region_names.len()) {
+                list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+                self.append_public_region_paths(
+                    root_type,
+                    region_owner.region_names.get(region_index),
+                    root,
+                    null,
+                    region_index,
+                    visiting$.ref(),
+                    paths
+                );
+                region_index = region_index + 1;
+            }
+            return;
+        }
+        paths.add(ResolvedLifetimeSlotPath(slot_index: 0, path: root));
+    }
+
+    () append_public_region_paths(
+        self,
+        qid.TypeId nominal_type,
+        qid.SymbolId region,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId? prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        guard self.public_region_owner_for_type(nominal_type) is .some(owner_def) else { return; }
+        if (self.def_list_contains(visiting, owner_def)) { return; }
+        visiting.add(owner_def);
+        hir.HirDef& owner = self.state.hirs.def_ref(owner_def);
+        Int member_index! = 0;
+        while (member_index < owner.members.len()) {
+            qid.DefId field_def = owner.members.get(member_index);
+            member_index = member_index + 1;
+            if (!self.is_lifetime_field_kind(self.state.store.defs.get(field_def).kind)) { continue; }
+            self.append_field_region_paths(
+                nominal_type,
+                field_def,
+                region,
+                root,
+                prefix,
+                slot_index,
+                visiting,
+                paths
+            );
+        }
+        visiting.pop();
+    }
+
+    () append_field_region_paths(
+        self,
+        qid.TypeId owner_type,
+        qid.DefId field_def,
+        qid.SymbolId region,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId? prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        hir.HirDef& field = self.state.hirs.def_ref(field_def);
+        qid.TypeId field_type = self.lifetime_field_type(owner_type, field_def);
+        types.LifetimeProjectionPathId field_path =
+            self.state.store.types.intern_lifetime_projection(prefix, .field, field_def, 0);
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        lifetime_shape.LifetimeShapeId field_shape = query.lifetime_shape(field_type);
+        if (self.state.results.lifetime_shapes.get(field_shape).data is .slot()) {
+            if (self.single_field_binding_matches(field, region)) {
+                paths.add(ResolvedLifetimeSlotPath (
+                    slot_index: slot_index,
+                    path: types.LifetimePath (
+                        root_kind: root.root_kind,
+                        root_index: root.root_index,
+                        projection_path: field_path
+                    )
+                ));
+            }
+            return;
+        }
+        guard self.public_region_owner_for_type(field_type) is .some(target_owner_def) else {
+            return;
+        }
+        hir.HirDef& target_owner = self.state.hirs.def_ref(target_owner_def);
+        Int clause_index! = 0;
+        while (clause_index < field.life_clauses.len()) {
+            hir.HirLifeClause clause = field.life_clauses.get(clause_index);
+            clause_index = clause_index + 1;
+            guard clause.target is .some(target) else { continue; }
+            guard self.region_binding_source_symbol(clause.source) is .some(source_region) else {
+                continue;
+            }
+            if (source_region != region) { continue; }
+            guard self.region_binding_source_symbol(target) is .some(target_region) else {
+                continue;
+            }
+            if (!self.region_name_declared(target_owner, target_region)) { continue; }
+            self.append_public_region_paths(
+                field_type,
+                target_region,
+                root,
+                field_path,
+                slot_index,
+                visiting,
+                paths
+            );
+        }
+    }
+
+    Bool single_field_binding_matches(self, hir.HirDef& field, qid.SymbolId region) {
+        if (field.life_clauses.len() != 1) { return false; }
+        hir.HirLifeClause clause = field.life_clauses.get(0);
+        if (clause.target != null) { return false; }
+        guard self.region_binding_source_symbol(clause.source) is .some(source) else {
+            return false;
+        }
+        return source == region;
+    }
+
+    Bool def_list_contains(list.ArrayList<qid.DefId>& values, qid.DefId candidate) {
+        Int index! = 0;
+        while (index < values.len()) {
+            if (values.get(index).to_index() == candidate.to_index()) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     () append_function_lifetime_flow(
