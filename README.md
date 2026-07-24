@@ -63,24 +63,22 @@ bash ./script/install_llvm.sh --user
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-0.4.8 release 分支依赖同版本 bootstrap 分支产出的过渡编译器。推荐目录结构：
+0.4.9 release 分支直接使用已发布的 Jiang 0.4.8 stable 编译器作为 bootstrap 输入。默认路径：
 
 ```text
-../bootstrap-0.4.8/build/bin/jiangc.next
+~/.jiang/versions/0.4.8/bin/jiangc
 ```
 
-通过 `BOOTSTRAP_BIN` 显式指定该编译器，并把 bootstrap 版本校验值设为 `0.4.8`：
+安装 0.4.8 后可直接运行：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.4.8 \
-BOOTSTRAP_BIN=../bootstrap-0.4.8/build/bin/jiangc.next \
 bash ./script/build_next.sh
 ```
 
 该脚本会依次构建：
 
 ```text
-../bootstrap-0.4.8/build/bin/jiangc.next -> build/bin/jiangc.next
+~/.jiang/versions/0.4.8/bin/jiangc -> build/bin/jiangc.next
 ```
 
 并默认用 `build/bin/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
