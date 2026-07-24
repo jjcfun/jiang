@@ -575,6 +575,11 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
 `@life()` 明确表示返回值不能携带任何参数 borrow。
 
+struct / union 的每个字段天然有独立 lifetime，字段声明就是其身份；tuple 元素由静态下标
+标识。字段实际不携带 borrow 时，对应来源集合为空。字段 lifetime 隐式覆盖聚合值自身，
+不需要为引用字段逐个重复写 `@life(field > self)`；只有字段之间需要额外约束时才写
+`@life(left == right)` 或 `@life(left > right)`。
+
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
 ```jiang
@@ -582,8 +587,17 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 Int& apply(Fn<Int& result, Int& value> callback, Int& value);
 ```
 
+也可以写位置路径：`callback[0]` 是 result，`callback[1...]` 是公开参数，所以等价的
+callable 子契约是 `@life(callback[1] > callback[0])`。ABI 隐藏的 closure environment、
+receiver adapter 和 continuation 不参与编号。
+
 契约名本身不参与类型身份；解析后的来源关系参与 callable 的语义兼容性。因此，返回其他参数
 借用的函数或 lambda 不能传给上述 `callback`。
+
+聚合返回值可以逐字段描述来源，例如
+`@life(left > return.left, right > return.right)`；tuple 路径使用
+`value[0]`、`return[1]`。struct / union 路径保存稳定字段声明身份，tuple 路径保存静态下标，
+不使用额外 lifetime slot。
 
 `Fn<R, Args...>` 和 `RawFn<R, Args...>` 默认使用空 lifetime 契约：`R` 不能借用 callback
 参数。允许 callback 返回参数 borrow 时，必须像上例一样显式声明

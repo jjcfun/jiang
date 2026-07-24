@@ -377,8 +377,10 @@ Fn<Int>^ make_answer() {
 `Fn^$.ref()` 返回 `Fn&`，表示把 heap closure 临时借成栈内 callable view。`Fn^&` 如果以后需要，
 应表示 owner handle slot 的引用，不作为普通调用所需的借用形式。
 
-tuple 先不支持 `@life(.0 > self)` 或类似显式写法；struct、tuple、union、closure env 的默认
-aggregate member lifetime 规则后续统一在 borrow/lifetime checker 中表达。
+struct / union 字段直接以字段声明作为 lifetime 身份，tuple 元素以静态下标作为身份，不存在
+额外 lifetime slot。callable 契约可使用声明名，也可使用位置路径：`f[0]` 是 result，
+`f[1...]` 是公开参数，例如 `@life(f[1] > f[0])`。closure environment 是 ABI 隐藏参数，
+不参与这个编号。
 
 ## Borrow 和可变捕获
 

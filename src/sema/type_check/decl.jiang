@@ -20,6 +20,16 @@ struct EnumCaseLiteralValue: Copyable {
     Int value;
 }
 
+struct ResolvedLifetimePath: Copyable {
+    qid.TypeId type_id;
+    types.LifetimeProjectionPathId? projection_path;
+}
+
+struct ResolvedCallableLifetimePath: Copyable {
+    types.LifetimePath path;
+    qid.TypeId type_id;
+}
+
 public struct DeclCheck: Movable {
     check_state.CheckState& state;
     type_ops_mod.TypeOps& type_ops;
@@ -608,6 +618,188 @@ public struct DeclCheck: Movable {
             index = index + 1;
         }
         self.record_callable_lifetime_contracts(hir_def);
+        self.record_function_lifetime_flows(hir_def);
+        self.record_nominal_lifetime_flows(hir_def);
+    }
+
+    () record_nominal_lifetime_flows(self, hir.HirDef& hir_def) {
+        def.DefKind kind = self.state.store.defs.get(hir_def.def_id).kind;
+        if (kind != .struct_def && kind != .union_def) { return; }
+        list.ArrayList<types.NominalLifetimeFlow> flows! =
+            list.ArrayList<types.NominalLifetimeFlow>();
+        Int index! = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            self.append_nominal_lifetime_flow(hir_def, constraint, flows$.ref());
+            index = index + 1;
+        }
+        self.state.results.set_nominal_lifetime_flows(hir_def.def_id, flows$.ref());
+    }
+
+    () append_nominal_lifetime_flow(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeConstraint constraint,
+        list.ArrayList<types.NominalLifetimeFlow>& flows
+    ) {
+        guard self.semantic_nominal_lifetime_path(hir_def, constraint.longer)
+            is .some(source) else {
+            return;
+        }
+        guard self.semantic_nominal_lifetime_path(hir_def, constraint.shorter)
+            is .some(target) else {
+            return;
+        }
+        flows.add(types.NominalLifetimeFlow(source: source, target: target));
+        if (constraint.relation == .equal) {
+            flows.add(types.NominalLifetimeFlow(source: target, target: source));
+        }
+    }
+
+    types.LifetimeProjectionPathId? semantic_nominal_lifetime_path(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name
+    ) {
+        if (name.kind != .named_lifetime) { return null; }
+        guard name.symbol is .some(symbol) else { return null; }
+        guard self.nominal_field_def(hir_def, symbol) is .some(field_def) else { return null; }
+        types.LifetimeProjectionPathId root = self.state.store.types.intern_lifetime_projection(
+            null,
+            .field,
+            field_def,
+            0
+        );
+        guard name.projection_path is .some(path_id) else { return root; }
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        guard self.resolve_lifetime_path_from(hir_def.def_id, field_type, path_id, root)
+            is .some(resolved) else {
+            return null;
+        }
+        return resolved.projection_path;
+    }
+
+    () record_function_lifetime_flows(self, hir.HirDef& hir_def) {
+        guard hir_def.decl.function_signature is .some(_) else { return; }
+        list.ArrayList<types.LifetimeFlow> flows! = list.ArrayList<types.LifetimeFlow>();
+        Int index! = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            hir.HirLifetimeConstraint constraint = hir_def.lifetime_constraints.get(index);
+            self.append_function_lifetime_flow(hir_def, constraint, flows$.ref());
+            index = index + 1;
+        }
+        if (flows.len() == 0 && !self.hir_has_explicit_return_lifetime(hir_def)) {
+            self.append_default_function_lifetime_flow(hir_def, flows$.ref());
+        }
+        self.state.results.set_function_lifetime_flows(hir_def.def_id, flows$.ref());
+    }
+
+    () append_function_lifetime_flow(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeConstraint constraint,
+        list.ArrayList<types.LifetimeFlow>& flows
+    ) {
+        if (constraint.shorter.kind == .return_lifetime) {
+            self.append_resolved_lifetime_flow(hir_def, constraint.longer, constraint.shorter, flows);
+        }
+        if (constraint.relation != .equal || constraint.longer.kind != .return_lifetime) { return; }
+        self.append_resolved_lifetime_flow(hir_def, constraint.shorter, constraint.longer, flows);
+    }
+
+    () append_resolved_lifetime_flow(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName source,
+        hir.HirLifetimeName target,
+        list.ArrayList<types.LifetimeFlow>& flows
+    ) {
+        guard self.semantic_lifetime_path(hir_def, source) is .some(source_path) else { return; }
+        guard self.semantic_lifetime_path(hir_def, target) is .some(target_path) else { return; }
+        flows.add(types.LifetimeFlow(source: source_path, target: target_path));
+    }
+
+    () append_default_function_lifetime_flow(
+        self,
+        hir.HirDef& hir_def,
+        list.ArrayList<types.LifetimeFlow>& flows
+    ) {
+        guard hir_def.decl.function_signature is .some(signature) else { return; }
+        if (!signature.has_receiver && signature.params.length == 0) { return; }
+        flows.add(types.LifetimeFlow (
+            source: types.LifetimePath (
+                root_kind: .parameter,
+                root_index: 0,
+                projection_path: null
+            ),
+            target: types.LifetimePath (
+                root_kind: .result,
+                root_index: 0,
+                projection_path: null
+            )
+        ));
+    }
+
+    Bool hir_has_explicit_return_lifetime(self, hir.HirDef& hir_def) {
+        if (hir_def.has_explicit_empty_lifetime_contract) { return true; }
+        Int index! = 0;
+        while (index < hir_def.lifetime_constraints.len()) {
+            if (hir_def.lifetime_constraints.get(index).shorter.kind == .return_lifetime) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    types.LifetimePath? semantic_lifetime_path(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name
+    ) {
+        guard self.semantic_lifetime_root(hir_def, name) is .some(path) else { return null; }
+        guard self.lifetime_root_type(hir_def, name) is .some(root_type) else { return null; }
+        guard name.projection_path is .some(path_id) else { return path; }
+        guard self.resolve_lifetime_path(hir_def.def_id, root_type, path_id)
+            is .some(resolved) else {
+            return null;
+        }
+        return types.LifetimePath (
+            root_kind: path.root_kind,
+            root_index: path.root_index,
+            projection_path: resolved.projection_path
+        );
+    }
+
+    types.LifetimePath? semantic_lifetime_root(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeName name
+    ) {
+        if (name.kind == .return_lifetime) {
+            return types.LifetimePath(root_kind: .result, root_index: 0, projection_path: null);
+        }
+        guard hir_def.decl.function_signature is .some(signature) else { return null; }
+        if (name.kind == .self_lifetime) {
+            if (!signature.has_receiver) { return null; }
+            return types.LifetimePath(root_kind: .parameter, root_index: 0, projection_path: null);
+        }
+        guard name.kind == .named_lifetime else { return null; }
+        guard name.symbol is .some(symbol) else { return null; }
+        Int offset! = 0;
+        if (signature.has_receiver) { offset = 1; }
+        Int index! = 0;
+        while (index < signature.param_symbols.length) {
+            if (signature.param_symbols[index] == symbol) {
+                return types.LifetimePath (
+                    root_kind: .parameter,
+                    root_index: index + offset,
+                    projection_path: null
+                );
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     () record_callable_lifetime_contracts(self, hir.HirDef& hir_def) {
@@ -627,8 +819,8 @@ public struct DeclCheck: Movable {
         hir.HirId type_ref,
         qid.SymbolId owner_symbol
     ) {
-        guard self.callable_contract_names(type_ref) is .some(names) else { return; }
-        list.ArrayList<Int> sources! = list.ArrayList<Int>();
+        if (self.callable_contract_arity(type_ref) <= 0) { return; }
+        list.ArrayList<types.LifetimeFlow> flows! = list.ArrayList<types.LifetimeFlow>();
         Bool explicit_effect! = false;
         Int index! = 0;
         while (index < hir_def.lifetime_constraints.len()) {
@@ -636,20 +828,71 @@ public struct DeclCheck: Movable {
             index = index + 1;
             if (!self.callable_constraint_for_symbol(constraint, owner_symbol)) { continue; }
             explicit_effect = true;
-            guard self.callable_result_source_index(constraint, names) is .some(source) else {
-                continue;
-            }
-            self.add_lifetime_source_once(sources$.ref(), source);
+            self.append_callable_lifetime_flow(hir_def, constraint, type_ref, flows$.ref());
         }
         if (explicit_effect) {
-            self.state.results.set_callable_lifetime_contract(type_ref, sources$.ref());
+            self.state.results.set_callable_lifetime_flows(type_ref, flows$.ref());
         }
     }
 
-    qid.SymbolId[]&? callable_contract_names(self, hir.HirId type_ref) {
+    () append_callable_lifetime_flow(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirLifetimeConstraint constraint,
+        hir.HirId type_ref,
+        list.ArrayList<types.LifetimeFlow>& flows
+    ) {
+        if (self.callable_flow_paths(hir_def, type_ref, constraint.longer, constraint.shorter)
+            is .some(flow)) {
+            flows.add(flow);
+        }
+        if (constraint.relation != .equal) { return; }
+        if (self.callable_flow_paths(hir_def, type_ref, constraint.shorter, constraint.longer)
+            is .some(reverse)) {
+            flows.add(reverse);
+        }
+    }
+
+    types.LifetimeFlow? callable_flow_paths(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirId type_ref,
+        hir.HirLifetimeName source,
+        hir.HirLifetimeName target
+    ) {
+        guard self.resolve_callable_lifetime_name(hir_def, type_ref, source)
+            is .some(source_path) else {
+            return null;
+        }
+        guard self.resolve_callable_lifetime_name(hir_def, type_ref, target)
+            is .some(target_path) else {
+            return null;
+        }
+        if (source_path.path.root_kind != .parameter
+            || target_path.path.root_kind != .result) {
+            return null;
+        }
+        return types.LifetimeFlow(source: source_path.path, target: target_path.path);
+    }
+
+    hir.HirNamedTypeRef? callable_named_type_ref(self, hir.HirId type_ref) {
         hir.HirNode node = self.state.hirs.node(type_ref);
         guard node.data is .named_type_ref(named) else { return null; }
-        return named.contract_names;
+        if (!self.callable_type_def(named.def_id)) { return null; }
+        return named;
+    }
+
+    Int callable_contract_arity(self, hir.HirId type_ref) {
+        guard self.callable_named_type_ref(type_ref) is .some(named) else { return -1; }
+        return named.args.length;
+    }
+
+    Bool callable_type_def(self, qid.DefId type_def) {
+        if (self.state.store.resolve.core_types.fn_type is .some(fn_def)) {
+            if (fn_def == type_def) { return true; }
+        }
+        guard self.state.store.resolve.core_types.raw_fn_type is .some(raw_fn_def) else { return false; }
+        return raw_fn_def == type_def;
     }
 
     Bool callable_constraint_for_symbol(
@@ -657,26 +900,94 @@ public struct DeclCheck: Movable {
         hir.HirLifetimeConstraint constraint,
         qid.SymbolId symbol
     ) {
-        if (constraint.longer.kind != .callable_lifetime
-            || constraint.shorter.kind != .callable_lifetime) {
-            return false;
-        }
-        guard constraint.longer.owner_symbol is .some(longer_owner) else { return false; }
-        guard constraint.shorter.owner_symbol is .some(shorter_owner) else { return false; }
-        return longer_owner == symbol && shorter_owner == symbol;
+        return self.lifetime_name_targets_symbol(constraint.longer, symbol)
+            && self.lifetime_name_targets_symbol(constraint.shorter, symbol);
     }
 
-    Int? callable_result_source_index(
+    ResolvedCallableLifetimePath? resolve_callable_lifetime_name(
         self,
-        hir.HirLifetimeConstraint constraint,
-        qid.SymbolId[]& contract_names
+        hir.HirDef& hir_def,
+        hir.HirId type_ref,
+        hir.HirLifetimeName name
     ) {
-        guard constraint.longer.symbol is .some(source_symbol) else { return null; }
-        guard constraint.shorter.symbol is .some(result_symbol) else { return null; }
-        if (self.contract_name_index(contract_names, result_symbol) != 0) { return null; }
-        Int source_index = self.contract_name_index(contract_names, source_symbol);
-        if (source_index <= 0) { return null; }
-        return source_index - 1;
+        guard self.callable_named_type_ref(type_ref) is .some(named) else { return null; }
+        guard name.projection_path is .some(path_id) else { return null; }
+        return self.resolve_callable_lifetime_path(hir_def, named, path_id);
+    }
+
+    ResolvedCallableLifetimePath? resolve_callable_lifetime_path(
+        self,
+        hir.HirDef& hir_def,
+        hir.HirNamedTypeRef named,
+        hir.HirLifetimePathId path_id
+    ) {
+        hir.HirLifetimePathNode node = self.state.hirs.lifetime_path_node(path_id);
+        if (node.parent == null) {
+            return self.callable_path_for_projection(named, node.projection);
+        }
+        hir.HirLifetimePathId parent_id = node.parent$.some();
+        guard self.resolve_callable_lifetime_path(hir_def, named, parent_id)
+            is .some(parent) else {
+            return null;
+        }
+        guard self.resolve_lifetime_projection(
+            hir_def.def_id,
+            parent.type_id,
+            path_id,
+            parent.path.projection_path,
+            node.projection
+        ) is .some(projected) else {
+            return null;
+        }
+        return ResolvedCallableLifetimePath (
+            path: types.LifetimePath (
+                root_kind: parent.path.root_kind,
+                root_index: parent.path.root_index,
+                projection_path: projected.projection_path
+            ),
+            type_id: projected.type_id
+        );
+    }
+
+    ResolvedCallableLifetimePath? callable_path_for_projection(
+        self,
+        hir.HirNamedTypeRef named,
+        hir.HirLifetimeProjection projection
+    ) {
+        if (projection.kind == .tuple_index) {
+            return self.callable_path_for_position(named, projection.tuple_index);
+        }
+        guard projection.symbol is .some(member_symbol) else { return null; }
+        guard named.contract_names is .some(names) else { return null; }
+        return self.callable_path_for_position(named, self.contract_name_index(names, member_symbol));
+    }
+
+    ResolvedCallableLifetimePath? callable_path_for_position(
+        self,
+        hir.HirNamedTypeRef named,
+        Int position
+    ) {
+        if (position < 0 || position >= named.args.length) { return null; }
+        types.LifetimeRootKind root_kind! = .result;
+        Int root_index! = 0;
+        if (position > 0) {
+            root_kind = .parameter;
+            root_index = position - 1;
+        }
+        return ResolvedCallableLifetimePath (
+            path: types.LifetimePath (
+                root_kind: root_kind,
+                root_index: root_index,
+                projection_path: null
+            ),
+            type_id: self.type_ops.check_non_task_container_type_ref(named.args[position])
+        );
+    }
+
+    Bool lifetime_name_targets_symbol(self, hir.HirLifetimeName name, qid.SymbolId symbol) {
+        if (name.kind != .named_lifetime || name.projection_path == null) { return false; }
+        guard name.symbol is .some(root_symbol) else { return false; }
+        return root_symbol == symbol;
     }
 
     Int contract_name_index(self, qid.SymbolId[]& names, qid.SymbolId symbol) {
@@ -688,25 +999,15 @@ public struct DeclCheck: Movable {
         return -1;
     }
 
-    () add_lifetime_source_once(self, list.ArrayList<Int>& sources, Int source) {
-        Int index! = 0;
-        while (index < sources.len()) {
-            if (sources.get(index) == source) { return; }
-            index = index + 1;
-        }
-        sources.add(source);
-    }
-
     () check_callable_lifetime_constraint(
         self,
         hir.HirDef& hir_def,
         hir.HirLifetimeConstraint constraint
     ) {
-        Bool longer_callable = constraint.longer.kind == .callable_lifetime;
-        Bool shorter_callable = constraint.shorter.kind == .callable_lifetime;
-        if (!longer_callable && !shorter_callable) { return; }
-        if (longer_callable && shorter_callable
-            && constraint.longer.owner_symbol == constraint.shorter.owner_symbol) {
+        qid.SymbolId? longer_owner = self.callable_lifetime_owner(hir_def, constraint.longer);
+        qid.SymbolId? shorter_owner = self.callable_lifetime_owner(hir_def, constraint.shorter);
+        if (longer_owner == null && shorter_owner == null) { return; }
+        if (longer_owner != null && longer_owner == shorter_owner) {
             return;
         }
         self.type_ops.add_def_error(
@@ -714,6 +1015,14 @@ public struct DeclCheck: Movable {
             "callable lifetime constraints must relate members of the same Fn parameter",
             "invalid_callable_lifetime_constraint"
         );
+    }
+
+    qid.SymbolId? callable_lifetime_owner(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
+        guard name.kind == .named_lifetime else { return null; }
+        guard name.symbol is .some(symbol) else { return null; }
+        guard self.function_param_type_ref(hir_def, symbol) is .some(type_ref) else { return null; }
+        if (self.callable_contract_arity(type_ref) <= 0) { return null; }
+        return symbol;
     }
 
     () check_lifetime_name(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
@@ -729,42 +1038,204 @@ public struct DeclCheck: Movable {
 
     Bool lifetime_name_allowed(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
         if (name.kind == .return_lifetime) {
-            return self.type_ops.is_callable_decl(hir_def.decl.kind);
+            if (!self.type_ops.is_callable_decl(hir_def.decl.kind)) { return false; }
+            return self.lifetime_projection_allowed(hir_def, name);
         }
         if (name.kind == .self_lifetime) {
-            return self.self_lifetime_allowed(hir_def.def_id);
-        }
-        if (name.kind == .callable_lifetime) {
-            return self.callable_lifetime_name_allowed(hir_def, name);
+            if (!self.self_lifetime_allowed(hir_def.def_id)) { return false; }
+            return self.lifetime_projection_allowed(hir_def, name);
         }
         guard name.symbol is .some(symbol) else { return false; }
         if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
+            if (name.projection_path != null) {
+                if (self.callable_lifetime_name_allowed(hir_def, name)) { return true; }
+                return self.lifetime_projection_allowed(hir_def, name);
+            }
             return self.function_param_symbol_matches(hir_def, symbol);
         }
         def.DefRecord def_record = self.state.store.defs.get(hir_def.def_id);
         if (def_record.kind == .field_def) {
-            return def_record.name.symbol == symbol;
+            if (def_record.name.symbol != symbol) { return false; }
+            return self.lifetime_projection_allowed(hir_def, name);
         }
-        return self.nominal_field_symbol_matches(hir_def, symbol);
+        if (!self.nominal_field_symbol_matches(hir_def, symbol)) { return false; }
+        return self.lifetime_projection_allowed(hir_def, name);
     }
 
-    Bool callable_lifetime_name_allowed(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
-        guard name.owner_symbol is .some(owner_symbol) else { return false; }
-        guard name.symbol is .some(member_symbol) else { return false; }
-        guard self.function_param_type_ref(hir_def, owner_symbol) is .some(type_ref) else {
-            return false;
+    Bool lifetime_projection_allowed(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
+        if (name.projection_path == null) { return true; }
+        guard self.lifetime_root_type(hir_def, name) is .some(root_type) else { return false; }
+        guard name.projection_path is .some(path_id) else { return false; }
+        return self.lifetime_path_type(hir_def.def_id, root_type, path_id) != null;
+    }
+
+    qid.TypeId? lifetime_root_type(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
+        if (name.kind == .return_lifetime) {
+            guard hir_def.decl.function_signature is .some(signature) else { return null; }
+            return self.type_ops.check_function_result_type_ref(signature.result);
         }
-        hir.HirNode node = self.state.hirs.node(type_ref);
-        guard node.data is .named_type_ref(named) else { return false; }
-        guard named.contract_names is .some(names) else { return false; }
+        if (name.kind == .self_lifetime) {
+            return self.lifetime_self_type(hir_def.def_id);
+        }
+        guard name.symbol is .some(symbol) else { return null; }
+        if (self.type_ops.is_callable_decl(hir_def.decl.kind)) {
+            guard self.function_param_type_ref(hir_def, symbol) is .some(type_ref) else { return null; }
+            return self.type_ops.check_non_task_container_type_ref(type_ref);
+        }
+        guard self.nominal_field_def(hir_def, symbol) is .some(field_def) else { return null; }
+        return self.type_ops.type_for_def(field_def);
+    }
+
+    qid.TypeId? lifetime_self_type(self, qid.DefId owner_def) {
+        def.DefRecord record = self.state.store.defs.get(owner_def);
+        if (self.is_nominal_def_kind(record.kind)) {
+            return self.type_ops.self_type_for_owner(owner_def);
+        }
+        guard record.owner_def is .some(parent_def) else { return null; }
+        return self.type_ops.self_type_for_owner(parent_def);
+    }
+
+    qid.DefId? nominal_field_def(self, hir.HirDef& hir_def, qid.SymbolId symbol) {
+        def.DefRecord record = self.state.store.defs.get(hir_def.def_id);
+        if (record.kind == .field_def) {
+            if (record.name.symbol == symbol) { return hir_def.def_id; }
+            return null;
+        }
         Int index! = 0;
-        while (index < names.length) {
-            if (names[index].to_index() != 0 && names[index] == member_symbol) {
-                return true;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            def.DefRecord member = self.state.store.defs.get(member_def);
+            if (self.is_lifetime_field_kind(member.kind) && member.name.symbol == symbol) {
+                return member_def;
             }
             index = index + 1;
         }
-        return false;
+        return null;
+    }
+
+    Bool is_lifetime_field_kind(self, def.DefKind kind) {
+        return kind == .field_def || kind == .union_variant_def;
+    }
+
+    qid.TypeId? lifetime_path_type(
+        self,
+        qid.DefId use_owner,
+        qid.TypeId root_type,
+        hir.HirLifetimePathId path_id
+    ) {
+        guard self.resolve_lifetime_path(use_owner, root_type, path_id) is .some(resolved) else {
+            return null;
+        }
+        return resolved.type_id;
+    }
+
+    ResolvedLifetimePath? resolve_lifetime_path(
+        self,
+        qid.DefId use_owner,
+        qid.TypeId root_type,
+        hir.HirLifetimePathId path_id
+    ) {
+        return self.resolve_lifetime_path_from(use_owner, root_type, path_id, null);
+    }
+
+    ResolvedLifetimePath? resolve_lifetime_path_from(
+        self,
+        qid.DefId use_owner,
+        qid.TypeId root_type,
+        hir.HirLifetimePathId path_id,
+        types.LifetimeProjectionPathId? root_parent
+    ) {
+        hir.HirLifetimePathNode node = self.state.hirs.lifetime_path_node(path_id);
+        qid.TypeId base_type! = root_type;
+        types.LifetimeProjectionPathId? parent_path! = root_parent;
+        if (node.parent is .some(parent)) {
+            guard self.resolve_lifetime_path_from(use_owner, root_type, parent, root_parent)
+                is .some(resolved_parent) else {
+                return null;
+            }
+            base_type = resolved_parent.type_id;
+            parent_path = resolved_parent.projection_path;
+        }
+        return self.resolve_lifetime_projection(
+            use_owner, base_type, path_id, parent_path, node.projection
+        );
+    }
+
+    ResolvedLifetimePath? resolve_lifetime_projection(
+        self,
+        qid.DefId use_owner,
+        qid.TypeId base_type,
+        hir.HirLifetimePathId path_id,
+        types.LifetimeProjectionPathId? parent_path,
+        hir.HirLifetimeProjection projection
+    ) {
+        qid.TypeId value_type = self.lifetime_projection_base_type(base_type);
+        types.TypeInfo info = self.state.store.types.get(value_type);
+        if (projection.kind == .tuple_index) {
+            guard info.data is .tuple_type(tuple_type) else { return null; }
+            if (projection.tuple_index < 0 || projection.tuple_index >= tuple_type.items.length) {
+                return null;
+            }
+            types.LifetimeProjectionPathId path = self.state.store.types.intern_lifetime_projection(
+                parent_path,
+                .tuple_index,
+                null,
+                projection.tuple_index
+            );
+            return ResolvedLifetimePath (
+                type_id: tuple_type.items[projection.tuple_index],
+                projection_path: path
+            );
+        }
+        guard projection.symbol is .some(symbol) else { return null; }
+        qid.DefId field_def!;
+        if (projection.field_def is .some(resolved_field)) {
+            field_def = resolved_field;
+        } else {
+            guard self.type_ops.value_member_for_type(value_type, use_owner, symbol)
+                is .some(resolved_field) else {
+                return null;
+            }
+            field_def = resolved_field;
+            self.state.hirs.set_lifetime_path_field_def(path_id, field_def);
+        }
+        if (!self.is_lifetime_field_kind(self.state.store.defs.get(field_def).kind)) { return null; }
+        types.LifetimeProjectionPathId path = self.state.store.types.intern_lifetime_projection(
+            parent_path,
+            .field,
+            field_def,
+            0
+        );
+        return ResolvedLifetimePath (
+            type_id: self.lifetime_field_type(value_type, field_def),
+            projection_path: path
+        );
+    }
+
+    qid.TypeId lifetime_projection_base_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            return self.type_ops.read_value_type(handle.element);
+        }
+        return self.type_ops.read_value_type(type_id);
+    }
+
+    qid.TypeId lifetime_field_type(self, qid.TypeId base_type, qid.DefId field_def) {
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        guard self.state.store.defs.get(field_def).owner_def is .some(owner_def) else {
+            return field_type;
+        }
+        list.ArrayList<types.GenericArg> args = self.type_ops.namespace_provider_args(base_type, owner_def);
+        return self.type_ops.substitute_generic_type_with_args(field_type, owner_def, args$.ref());
+    }
+
+    Bool callable_lifetime_name_allowed(self, hir.HirDef& hir_def, hir.HirLifetimeName name) {
+        guard name.kind == .named_lifetime else { return false; }
+        guard name.symbol is .some(owner_symbol) else { return false; }
+        guard self.function_param_type_ref(hir_def, owner_symbol) is .some(type_ref) else {
+            return false;
+        }
+        return self.resolve_callable_lifetime_name(hir_def, type_ref, name) != null;
     }
 
     hir.HirId? function_param_type_ref(self, hir.HirDef& hir_def, qid.SymbolId symbol) {
@@ -807,7 +1278,7 @@ public struct DeclCheck: Movable {
         Int index! = 0;
         while (index < hir_def.members.len()) {
             def.DefRecord member = self.state.store.defs.get(hir_def.members.get(index));
-            if (member.kind == .field_def && member.name.symbol == symbol) {
+            if (self.is_lifetime_field_kind(member.kind) && member.name.symbol == symbol) {
                 return true;
             }
             index = index + 1;
@@ -1319,7 +1790,44 @@ public struct DeclCheck: Movable {
             self_type
         );
         qid.TypeId impl_result = self.type_ops.check_type_ref(impl_signature.result);
-        return self.type_ops.same_type_ignoring_mutability(trait_result, impl_result);
+        if (!self.type_ops.same_type_ignoring_mutability(trait_result, impl_result)) {
+            return false;
+        }
+        return self.trait_method_contract_compatible(trait_method, impl_method);
+    }
+
+    Bool trait_method_contract_compatible(self, qid.DefId trait_method, qid.DefId impl_method) {
+        guard self.state.hirs.def(trait_method) is .some(trait_hir) else { return false; }
+        guard self.state.hirs.def(impl_method) is .some(impl_hir) else { return false; }
+        Bool trait_explicit = self.hir_has_explicit_return_lifetime(trait_hir);
+        Bool impl_explicit = self.hir_has_explicit_return_lifetime(impl_hir);
+        if (!trait_explicit && !impl_explicit) { return true; }
+        guard self.state.results.def_type(trait_method) is .some(trait_type) else { return false; }
+        guard self.state.results.def_type(impl_method) is .some(impl_type) else { return false; }
+        types.TypeInfo trait_info = self.state.store.types.get(trait_type);
+        types.TypeInfo impl_info = self.state.store.types.get(impl_type);
+        guard trait_info.data is .function_type(trait_function) else { return false; }
+        guard impl_info.data is .function_type(impl_function) else { return false; }
+        return self.lifetime_contract_equal(
+            trait_function.lifetime_contract,
+            impl_function.lifetime_contract
+        );
+    }
+
+    Bool lifetime_contract_equal(
+        self,
+        types.LifetimeContract lhs,
+        types.LifetimeContract rhs
+    ) {
+        if (lhs.flows.length != rhs.flows.length) { return false; }
+        Int index! = 0;
+        while (index < lhs.flows.length) {
+            if (!types.lifetime_flow_equal(lhs.flows[index], rhs.flows[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
     }
 
     qid.TypeId substitute_trait_signature_type(self,

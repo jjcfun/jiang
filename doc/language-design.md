@@ -482,17 +482,21 @@ a.length; // 编译错误：a 已经 move
 - `self`：当前 `struct` / `union` 实例 lifetime。
 - `return`：函数返回值 lifetime。
 - 参数名：参数或参数引用目标 lifetime。
-- 字段名：该字段引用目标 lifetime。
+- 字段名：struct / union 字段自身的 lifetime。
 
-带 `T&` / `T&!` / `T[]&` 字段的类型需要表达字段目标必须覆盖包含者：
+struct / union 的每个字段天然都有独立 lifetime，字段声明本身就是 lifetime 身份；tuple
+元素以静态下标标识。字段实际不携带 borrow 时，对应 loan 集合为空。每个字段的有效期都隐式
+覆盖包含它的聚合值，因此无需重复标注 `data > self`：
 
 ```jiang
-@life(data > self)
 struct Slice {
     UInt8[]& data;
     Int len;
 }
 ```
+
+只有字段之间还需要额外关系时才写类型契约，例如 `@life(left == right)` 或
+`@life(left > right)`。嵌套路径直接使用字段名和 tuple 下标，不引入额外 lifetime slot。
 
 函数没有显式 return lifetime 时，公开契约固定为 `@life(arg0 > return)`：方法的 `arg0`
 是 `self`，自由函数的 `arg0` 是第一个参数。返回来源不是 `arg0`、可能来自多个参数或存在歧义时，
@@ -514,6 +518,10 @@ Int& apply(
     Int& fallback
 );
 ```
+
+也可以按 callable 类型参数位置引用：`callback[0]` 是 result，`callback[1...]` 是公开参数。
+因此上例的 callable 子契约也可写为 `@life(callback[2] > callback[0])`。closure environment、
+receiver adapter 和 continuation 等 ABI 隐藏参数不参与编号。
 
 名称只在语法、接口和诊断中保留；声明检查会把它们一次性解析成参数索引。解析后的
 `LifetimeContract` 属于 callable 的语义签名，调用传播、函数值兼容性和 lambda expected type
@@ -539,6 +547,19 @@ Slice make_slice(Buffer& buffer);
 当前 lifetime 检查会阻止局部引用逃出来源 owner 的有效范围，并阻止 owner 在活跃借用期间被
 move/drop/free。跨函数和存储到类型字段的来源关系通过 `@life` 检查；shared/mutable alias
 冲突则由 loan 的种类、重叠 place 和最后一次使用共同判断。
+
+返回聚合值时，契约可以精确到字段或 tuple 元素：
+
+```jiang
+@life(left > return.left, right > return.right)
+PairRef make_pair(Int& left, Int& right);
+
+@life(value[1] > return)
+Int& take_second((Int&, Int&) value);
+```
+
+字段路径在跨模块接口中以稳定字段声明身份保存，tuple 路径保存静态下标。array 的运行时下标
+不能建立彼此独立的 lifetime 身份：动态下标必须保守地与同一 array 的其他元素别名。
 
 ## 隐式操作层
 

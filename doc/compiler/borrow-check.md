@@ -67,7 +67,10 @@ ActiveLoanFact
 BorrowCheckStore
   ok
   loans
-  inferred_return_lifetime_sources
+
+TypeCheckStore
+  BorrowShape[TypeId]
+  LifetimeContract[FunctionType]
 ```
 
 `MovePath` 按 MIR place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
@@ -82,6 +85,11 @@ loan 仍是稀疏事实列表；StorageDead 清理先探测是否存在匹配事
 `Loan` 表示某个 MIR location 产生的引用或指针视图。当前实现区分 shared reference、mutable
 reference 和 raw pointer view，并同时记录来源与承载该 view 的目标 place。引用 loan 既用于
 lifetime/逃逸检查，也用于 shared/mutable 冲突检查；raw pointer view 不参与别名排他性判断。
+
+`BorrowShape` 是按具体 `TypeId` 缓存的派生属性，只回答值是否可能携带 borrow。
+`LifetimeContract` 是 intern 后的 path-to-path flow：root 是函数参数或返回值，projection
+直接使用 struct/union 字段 `DefId` 或 tuple 静态下标。不存在独立的 lifetime slot/schema，
+也不再保存只能描述整个返回值的 `result_sources`。
 
 ## 分析流程
 

@@ -99,6 +99,7 @@ public GenericArg generic_const_arg(
     return .const_arg(GenericConstArg (param_def: null, binding_def: binding_def, value: value));
 }
 
+@life(value > return)
 public GenericArg generic_const_param_arg(
     qid.DefId param_def,
     comptime_value.ComptimeValue value,
@@ -303,8 +304,128 @@ public enum FunctionKind {
 
 // callable 返回值允许携带哪些公开参数的 borrow 来源。
 // 参数索引不包含 closure environment 等 ABI 隐藏参数。
+public struct LifetimeContractId: Copyable {
+    public Int index;
+
+    public init(self, Int index) {
+        self.index = index;
+    }
+}
+
+public struct LifetimeProjectionPathId: Copyable {
+    public Int index;
+
+    public init(self, Int index) {
+        self.index = index;
+    }
+}
+
+public enum LifetimeProjectionKind {
+    field,
+    tuple_index,
+}
+
+public struct LifetimeProjectionPathNode: Copyable {
+    public LifetimeProjectionPathId? parent;
+    public LifetimeProjectionKind kind;
+    public qid.DefId? field_def;
+    public Int tuple_index;
+}
+
+struct LifetimeProjectionPathEntry: Copyable {
+    LifetimeProjectionPathNode node;
+    Int hash;
+    Int collision_next;
+}
+
+public enum LifetimeRootKind {
+    result,
+    parameter,
+}
+
+public struct LifetimePath: Copyable {
+    public LifetimeRootKind root_kind;
+    public Int root_index;
+    public LifetimeProjectionPathId? projection_path;
+}
+
+public struct LifetimeFlow: Copyable {
+    public LifetimePath source;
+    public LifetimePath target;
+}
+
+// Nominal lifetime relations use field paths directly. The first projection is
+// a struct/union field DefId; nested projections continue with field DefIds or
+// static tuple indices. There is no separate lifetime-position numbering.
+public struct NominalLifetimeFlow: Copyable {
+    public LifetimeProjectionPathId source;
+    public LifetimeProjectionPathId target;
+}
+
+public Bool lifetime_flow_equal(LifetimeFlow lhs, LifetimeFlow rhs) {
+    return lifetime_path_equal(lhs.source, rhs.source)
+        && lifetime_path_equal(lhs.target, rhs.target);
+}
+
+public Bool lifetime_path_equal(LifetimePath lhs, LifetimePath rhs) {
+    if (lhs.root_kind != rhs.root_kind || lhs.root_index != rhs.root_index) { return false; }
+    if (lhs.projection_path is .some(left_path)) {
+        guard rhs.projection_path is .some(right_path) else { return false; }
+        return left_path.index == right_path.index;
+    }
+    return rhs.projection_path == null;
+}
+
+public Int lifetime_flow_hash(LifetimeFlow flow) {
+    return lifetime_path_hash(flow.source) * 31 + lifetime_path_hash(flow.target);
+}
+
+public Int lifetime_path_hash(LifetimePath path) {
+    Int projection! = 0;
+    if (path.projection_path is .some(path_id)) {
+        projection = path_id.index + 1;
+    }
+    return (Int(path.root_kind) + 1) * 31 * 31 + (path.root_index + 1) * 31 + projection;
+}
+
+Bool lifetime_projection_equal(LifetimeProjectionPathNode lhs, LifetimeProjectionPathNode rhs) {
+    if (lhs.kind != rhs.kind || lhs.tuple_index != rhs.tuple_index) { return false; }
+    if (!optional_lifetime_path_id_equal(lhs.parent, rhs.parent)) { return false; }
+    return optional_lifetime_field_equal(lhs.field_def, rhs.field_def);
+}
+
+Bool optional_lifetime_path_id_equal(
+    LifetimeProjectionPathId? lhs,
+    LifetimeProjectionPathId? rhs
+) {
+    if (lhs is .some(left)) {
+        guard rhs is .some(right) else { return false; }
+        return left.index == right.index;
+    }
+    return rhs == null;
+}
+
+Bool optional_lifetime_field_equal(qid.DefId? lhs, qid.DefId? rhs) {
+    if (lhs is .some(left)) {
+        guard rhs is .some(right) else { return false; }
+        return left.to_index() == right.to_index();
+    }
+    return rhs == null;
+}
+
+Int lifetime_projection_hash(LifetimeProjectionPathNode node) {
+    Int parent! = 0;
+    if (node.parent is .some(parent_id)) { parent = parent_id.index + 1; }
+    Int field! = 0;
+    if (node.field_def is .some(field_id)) { field = field_id.to_index() + 1; }
+    return (((Int(node.kind) + 1) * 31 + parent) * 31 + field) * 31 + node.tuple_index;
+}
+
 public struct LifetimeContract: Copyable {
-    public Int[]& result_sources;
+    public LifetimeContractId id;
+    public LifetimeFlow[]& flows;
+    Int hash;
+    Int collision_next;
 }
 
 public struct FunctionType: Copyable {
@@ -363,6 +484,10 @@ public struct TypeStore: Movable {
     public table.HashTable<qid.DefId, qid.TypeId> builtin_type_defs;
     public table.HashTable<qid.DefId, qid.TypeId> named_type_defs;
     public table.HashTable<Int, qid.TypeId> task_state_types;
+    list.ArrayList<LifetimeContract> lifetime_contracts;
+    table.HashTable<Int, Int> lifetime_contract_heads;
+    list.ArrayList<LifetimeProjectionPathEntry> lifetime_projection_paths;
+    table.HashTable<Int, Int> lifetime_projection_path_heads;
     arena.Arena storage!;
     BuiltinTypeIds builtins;
 
@@ -371,7 +496,12 @@ public struct TypeStore: Movable {
         self.builtin_type_defs = table.HashTable<qid.DefId, qid.TypeId>();
         self.named_type_defs = table.HashTable<qid.DefId, qid.TypeId>();
         self.task_state_types = table.HashTable<Int, qid.TypeId>();
+        self.lifetime_contracts = list.ArrayList<LifetimeContract>();
+        self.lifetime_contract_heads = table.HashTable<Int, Int>();
+        self.lifetime_projection_paths = list.ArrayList<LifetimeProjectionPathEntry>();
+        self.lifetime_projection_path_heads = table.HashTable<Int, Int>();
         self.storage = arena.Arena();
+        self.intern_lifetime_contract(null);
         qid.TypeId invalid = self.create(.invalid(), token.Span());
         qid.TypeId never = self.create(.never(), token.Span());
         qid.TypeId unit = self.create(.unit(), token.Span());
@@ -780,10 +910,10 @@ public struct TypeStore: Movable {
         qid.TypeId result,
         token.Span span,
         EffectSet effects,
-        Int[]&? result_lifetime_sources = null
+        LifetimeFlow[]&? lifetime_flows = null
     ) {
         return self.function_type_with_kind(
-            params, result, span, effects, .raw, result_lifetime_sources
+            params, result, span, effects, .raw, lifetime_flows
         );
     }
 
@@ -793,7 +923,7 @@ public struct TypeStore: Movable {
         token.Span span,
         EffectSet effects,
         FunctionKind kind,
-        Int[]&? result_lifetime_sources = null
+        LifetimeFlow[]&? lifetime_flows = null
     ) {
         unsafe {
             Int param_count = params.len();
@@ -810,21 +940,144 @@ public struct TypeStore: Movable {
             return self.create(.function_type(FunctionType (
                 params: stored_params[0..param_count],
                 result: result,
-                lifetime_contract: LifetimeContract (
-                    result_sources: self.copy_result_lifetime_sources(result_lifetime_sources)
-                ),
+                lifetime_contract: self.intern_lifetime_contract(lifetime_flows),
                 effects: effects,
                 kind: kind
             )), span);
         }
     }
 
-    Int[]& copy_result_lifetime_sources(self, Int[]&? sources) {
+    LifetimeContract intern_lifetime_contract(self, LifetimeFlow[]&? flows) {
+        Int hash = self.lifetime_contract_hash(flows);
+        Int current! = -1;
+        if (table.hash_table_get_value<Int, Int>(self.lifetime_contract_heads$.ref(), hash)
+            is .some(head)) {
+            current = head;
+        }
+        while (current >= 0) {
+            LifetimeContract contract = self.lifetime_contracts.get(current);
+            if (self.lifetime_contract_matches(contract, flows)) {
+                return contract;
+            }
+            current = contract.collision_next;
+        }
+        return self.add_lifetime_contract(hash, flows);
+    }
+
+    public LifetimeContract empty_lifetime_contract(self) {
+        return self.lifetime_contracts.get(0);
+    }
+
+    public LifetimeProjectionPathId intern_lifetime_projection(
+        self,
+        LifetimeProjectionPathId? parent,
+        LifetimeProjectionKind kind,
+        qid.DefId? field_def,
+        Int tuple_index
+    ) {
+        LifetimeProjectionPathNode node = LifetimeProjectionPathNode (
+            parent: parent,
+            kind: kind,
+            field_def: field_def,
+            tuple_index: tuple_index
+        );
+        Int hash = lifetime_projection_hash(node);
+        Int current! = self.lifetime_projection_head(hash);
+        while (current >= 0) {
+            LifetimeProjectionPathEntry entry = self.lifetime_projection_paths.get(current);
+            if (lifetime_projection_equal(entry.node, node)) {
+                return LifetimeProjectionPathId(current);
+            }
+            current = entry.collision_next;
+        }
+        return self.add_lifetime_projection_path(node, hash);
+    }
+
+    public LifetimeProjectionPathNode lifetime_projection_path(self, LifetimeProjectionPathId id) {
+        return self.lifetime_projection_paths.get(id.index).node;
+    }
+
+    Int lifetime_projection_head(self, Int hash) {
+        if (table.hash_table_get_value<Int, Int>(self.lifetime_projection_path_heads$.ref(), hash)
+            is .some(head)) {
+            return head;
+        }
+        return -1;
+    }
+
+    LifetimeProjectionPathId add_lifetime_projection_path(
+        self,
+        LifetimeProjectionPathNode node,
+        Int hash
+    ) {
+        Int index = self.lifetime_projection_paths.len();
+        self.lifetime_projection_paths.add(LifetimeProjectionPathEntry (
+            node: node,
+            hash: hash,
+            collision_next: self.lifetime_projection_head(hash)
+        ));
+        self.lifetime_projection_path_heads.set(hash, index);
+        return LifetimeProjectionPathId(index);
+    }
+
+    LifetimeContract add_lifetime_contract(
+        self,
+        Int hash,
+        LifetimeFlow[]&? flows
+    ) {
+        Int next! = -1;
+        if (table.hash_table_get_value<Int, Int>(self.lifetime_contract_heads$.ref(), hash)
+            is .some(head)) {
+            next = head;
+        }
+        LifetimeContract contract = LifetimeContract (
+            id: LifetimeContractId(self.lifetime_contracts.len()),
+            flows: self.copy_lifetime_flows(flows),
+            hash: hash,
+            collision_next: next
+        );
+        self.lifetime_contracts.add(contract);
+        self.lifetime_contract_heads.set(hash, contract.id.index);
+        return contract;
+    }
+
+    Bool lifetime_contract_matches(
+        self,
+        LifetimeContract contract,
+        LifetimeFlow[]&? flows
+    ) {
+        return self.same_optional_lifetime_flows(contract.flows, flows);
+    }
+
+    Bool same_optional_lifetime_flows(self, LifetimeFlow[]& stored, LifetimeFlow[]&? values) {
+        guard values is .some(actual) else { return stored.length == 0; }
+        if (stored.length != actual.length) { return false; }
+        Int index! = 0;
+        while (index < stored.length) {
+            if (!lifetime_flow_equal(stored[index], actual[index])) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Int lifetime_contract_hash(self, LifetimeFlow[]&? flows) {
+        Int hash! = 17;
+        if (flows is .some(values)) {
+            Int index! = 0;
+            while (index < values.length) {
+                hash = hash * 31 + lifetime_flow_hash(values[index]);
+                index = index + 1;
+            }
+        }
+        return hash;
+    }
+
+    LifetimeFlow[]& copy_lifetime_flows(self, LifetimeFlow[]&? flows) {
         unsafe {
-            if (sources is .some(values)) {
+            if (flows is .some(values)) {
                 Int capacity! = values.length;
                 if (capacity == 0) { capacity = 1; }
-                Int*! stored = self.storage.alloc_array<Int>(capacity);
+                LifetimeFlow*! stored = self.storage.alloc_array<LifetimeFlow>(capacity);
                 Int index! = 0;
                 while (index < values.length) {
                     stored[index] = values[index];
@@ -832,7 +1085,7 @@ public struct TypeStore: Movable {
                 }
                 return stored[0..values.length];
             }
-            Int*! empty = self.storage.alloc_array<Int>(1);
+            LifetimeFlow*! empty = self.storage.alloc_array<LifetimeFlow>(1);
             return empty[0..0];
         }
     }
@@ -948,10 +1201,7 @@ public struct TypeStore: Movable {
             guard rhs is .function_type(rhs_function) else { return false; }
             return lhs_function.kind == rhs_function.kind
                 && effect_set_equal(lhs_function.effects, rhs_function.effects)
-                && self.same_int_list(
-                    lhs_function.lifetime_contract.result_sources,
-                    rhs_function.lifetime_contract.result_sources
-                )
+                && lhs_function.lifetime_contract.id.index == rhs_function.lifetime_contract.id.index
                 && self.same_type_with_mutability(lhs_function.result, rhs_function.result, compare_mutability)
                 && self.same_type_list(lhs_function.params, rhs_function.params, compare_mutability);
         }
