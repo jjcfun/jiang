@@ -26,16 +26,16 @@
 
 ## 当前分支
 
-当前 `release/0.4.7-2` 是破坏性可变性语法迁移分支，采用双 worktree 自举链：
+当前 `release/0.4.8` 使用同版本 bootstrap 编译器承接所有权、Task 和 lifetime
+升级，正式发布前的自举链为：
 
 ```text
-0.4.7-bootstrap seed
-  -> bootstrap/0.4.7-2 的 jiangc.next
-  -> release/0.4.7-2 的 jiangc.next
-  -> release/0.4.7-2 的 stable jiangc
+0.4.7 stable
+  -> bootstrap/0.4.8 的 jiangc.next
+  -> release/0.4.8 的 jiangc.next
+  -> release/0.4.8 的 stable jiangc
 ```
 
-bootstrap worktree 只负责 seed 到 bootstrap next，不要求用 bootstrap next 再编译自己的旧语法
-源码。release 使用 `name!`、`T&!`、`T*!` 等 canonical 语法，并由 release next 生成 stable。
+bootstrap worktree 只负责上一版 stable 到 bootstrap next；release next 再生成正式 stable。
 详细命令和边界见 [编译器开发流程](develop.md)。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

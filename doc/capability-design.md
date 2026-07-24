@@ -569,8 +569,7 @@ Jiang 的 `T&!` 与 Rust `&mut T` 一样表达唯一可变借用；Jiang 还叠�
 
 - `D` 当前必须是 domain type；未来是否允许 dependent / instance domain。
 - `T&` 跨 domain 的 shareable 规则如何表达，是否需要公开 `Send` / `Sync` 等 trait 名称。
-- `Fn<async [D] ...>` 的 coroutine context ABI、闭包捕获和错误信息如何设计。
-- 多来源 `T&!` 返回值的 lifetime/domain 关系与复杂 reborrow 诊断如何进一步收紧。
+- 复杂循环和跨 suspend reborrow 的诊断如何进一步收紧。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。
 - `T&!` 与 optimizer noalias 的精确关系。
 - 动态 task group、失败聚合和显式 detached handle 是否需要独立类型。

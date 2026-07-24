@@ -515,8 +515,8 @@ environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 
 - [x] lambda body 按 expected `RawFn` / `Fn` 的 unsafe、async effects 检查。
 - [x] async lambda 根据 expected `Fn<async ...>` 类型确定 effect，不增加重复的表达式前缀。
 - [x] 同 Domain async `Fn` 通过 continuation ABI 启动和恢复。
-- [ ] async `Fn` 跨 Domain 动态调用。
-- [ ] async `RawFn` 运行时启动 ABI。
+- [x] async `Fn` 跨 Domain 动态调用。
+- [x] async `RawFn` 同 Domain、跨 Domain 和 extern 启动 ABI。
 - [x] `RawFn<Result<Ret, Err>, ...>` 和 `Fn<Result<Ret, Err>, ...>` 返回位解析。
 - [x] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [x] 需要绑定 receiver 时必须写显式 lambda。
@@ -529,7 +529,7 @@ environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 
 - [x] 裸 `Fn` 保存到返回 aggregate 导致 stack env 流出当前函数时报错。
 - [x] 捕获闭包传给只调用不保存的参数可以通过。
 - [x] 非捕获裸 `Fn` 返回也会报错。
-- [x] `Fn` 是 movable/non-copy closure value；已有 `Fn` 转移必须显式 `$.move()`。
+- [x] `Fn` 是 movable/non-copy closure value；赋值默认 move，也可以用 `$.move()` 强制显式转移。
 - [x] `Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。
 - [x] `new lambda` 构造 `Fn<...>^` 的非捕获闭包，并支持直接调用。
 - [x] `new lambda` 捕获字段的 heap env 后端 lowering 完整验证。

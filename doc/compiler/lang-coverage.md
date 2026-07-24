@@ -23,7 +23,7 @@
 | parameter list | `function` | covered | 默认参数表达式覆盖更多 literal/constructor 场景 |
 | generic params | `generic` | partial | nested generic decl、尾逗号、空参数列表反例 |
 | where constraints | `generic` | partial | projected equality 多关联类型链、负 trait bound 组合 |
-| lifetime annotation | `lifetime` | partial | return/self 组合、非法 ordering |
+| lifetime annotation | `lifetime` | covered | 参数、`self`、返回值、字段/tuple/callable 路径与非法契约 |
 | type postfix | `type` | covered | pointer-to-pointer ABI 场景已有基础覆盖 |
 | tuple / unit type | `type`, `aggregate` | partial | 嵌套 tuple type |
 | struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
@@ -54,7 +54,7 @@
 | pointer/reference operations | `type`, `ownership` | covered | raw pointer arithmetic deferred |
 | ownership move/copy | `ownership` | covered | generic negative bound 更多组合 |
 | drop/deinit/defer | `ownership` | partial | nested loop early-exit run 用例 |
-| lifetime escape | `lifetime`, `ownership` | partial | stored field reference 多层嵌套 |
+| lifetime escape | `lifetime`, `ownership` | covered | 字段敏感 aggregate、跨模块、trait/lambda/async 传播 |
 | overload resolution | `function` | partial | named args + overload + default args 的非歧义正例更多覆盖 |
 | constructor resolution | `function`, `nominal` | covered | generic constructor overload |
 | trait conformance | `generic` | partial | associated type equality 与 parent trait 混合 |
@@ -69,11 +69,10 @@
 
 ## 补测优先级
 
-1. `lifetime`：补 return/self 组合、字段引用嵌套和非法 ordering，因为后续 LSP/诊断会依赖这些错误边界。
-2. `control_flow` + `ownership`：补 nested loop、early return、defer/drop cleanup 的 run 用例。
-3. `generic`：补 nested monomorph、associated type equality 和 parent trait 组合。
-4. `aggregate`：补 tuple/array/union 的嵌套 expected type 和 backend run/emit。
-5. `literal`：补 float、escape、溢出和非法 numeric token 的 fail 用例。
-6. `destructure`：parser 已有 local/global destructure，后续需要补 HIR/type check/MIR 后再加用例。
+1. `control_flow` + `ownership`：补 nested loop、early return、defer/drop cleanup 的 run 用例。
+2. `generic`：补 nested monomorph、associated type equality 和 parent trait 组合。
+3. `aggregate`：补 tuple/array/union 的嵌套 expected type 和 backend run/emit。
+4. `literal`：补 float、escape、溢出和非法 numeric token 的 fail 用例。
+5. `destructure`：parser 已有 local/global destructure，后续需要补 HIR/type check/MIR 后再加用例。
 
 任何新增语言规则进入实现前，先在本矩阵中定位到 feature dir 和最小测试层级。

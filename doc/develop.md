@@ -42,34 +42,33 @@ BOOTSTRAP_DEPTH=stable VERIFY=none bash ./script/build_next.sh
 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 ```
 
-## 0.4.7-2 自举链
+## 0.4.8 自举链
 
-0.4.7-2 的可变性语法无法直接由普通 release 源码兼容完成，因此固定使用以下链路：
+0.4.8 的所有权基础和编译器源码升级由 bootstrap 分支承接，固定使用以下链路：
 
 ```text
-0.4.7-bootstrap seed
-  -> bootstrap/0.4.7-2 的 jiangc.next
-  -> release/0.4.7-2 的 jiangc.next
-  -> release/0.4.7-2 的 stable jiangc
+0.4.7 stable
+  -> bootstrap/0.4.8 的 jiangc.next
+  -> release/0.4.8 的 jiangc.next
+  -> release/0.4.8 的 stable jiangc
 ```
 
-bootstrap worktree 只负责第一条边，不要求用 bootstrap next 再编译 bootstrap 自己。release
-源码只使用新 canonical 语法，不为 bootstrap worktree 中的旧源码增加兼容。
+bootstrap worktree 只负责第一条边，不要求用 bootstrap next 再编译 bootstrap 自己。
 
 构建 bootstrap next：
 
 ```bash
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.7/build/bin/jiangc \
+BOOTSTRAP_RELEASE_VERSION=0.4.7 \
+BOOTSTRAP_BIN=$HOME/.jiang/versions/0.4.7/bin/jiangc \
 VERIFY=none \
 bash ./script/build_next.sh
 ```
 
-release worktree 使用 bootstrap next；由于该过渡编译器对外报告 `jiang 0.4.7`，需要同步设置
-版本校验值：
+release worktree 使用对外报告 `jiang 0.4.8` 的 bootstrap next：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.4.7 \
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.7-2/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.4.8 \
+BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.8/build/bin/jiangc.next \
 VERIFY=none \
 bash ./script/build_next.sh
 ```
@@ -77,13 +76,11 @@ bash ./script/build_next.sh
 生成 release stable 并执行语言测试：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.4.7 \
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.7-2/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.4.8 \
+BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.8/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
-VERIFY=none \
+VERIFY=full \
 bash ./script/build_next.sh
-
-JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 ```
 
 ## 双 worktree 模式
