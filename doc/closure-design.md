@@ -46,7 +46,8 @@ type parameter pack，不要求先开放普通用户泛型参数包。
 
 两者默认使用空 `LifetimeContract`：返回类型 `Ret` 不能携带参数 borrow。允许 callable
 返回某个参数的 borrow 时，由接收它的函数通过命名 result/参数和 `@life` 显式声明来源；
-普通函数自身仍使用默认 `arg0 > return`，也可以用 `@life()` 强制设为空。
+普通函数自身按源码顺序选择第一个 Shape 非空的参数作为默认返回来源，也可以用 `@life()`
+强制设为空。
 
 ```jiang
 Fn<Bool, Int, Int>       // 栈闭包值，可能带 environment
@@ -377,10 +378,9 @@ Fn<Int>^ make_answer() {
 `Fn^$.ref()` 返回 `Fn&`，表示把 heap closure 临时借成栈内 callable view。`Fn^&` 如果以后需要，
 应表示 owner handle slot 的引用，不作为普通调用所需的借用形式。
 
-struct / union 字段直接以字段声明作为 lifetime 身份，tuple 元素以静态下标作为身份，不存在
-额外 lifetime slot。callable 契约可使用声明名，也可使用位置路径：`f[0]` 是 result，
-`f[1...]` 是公开参数，例如 `@life(f[1] > f[0])`。closure environment 是 ABI 隐藏参数，
-不参与这个编号。
+struct / union 的 public region、tuple 元素和 callable result/参数可提供契约名。callable
+契约只能使用这些声明名，例如 `@life(f.result: f.input)`；不支持 `f[0]`、`f[1]`
+一类位置路径。closure environment 是 ABI 隐藏参数，不能出现在公开 contract 中。
 
 ## Borrow 和可变捕获
 

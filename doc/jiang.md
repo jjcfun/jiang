@@ -570,56 +570,60 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 共享引用可以共存；活跃的 `T&!` 会排斥重叠的共享/可变借用，并阻止直接访问来源 place。
 引用最后一次使用后，来源 place 可以恢复访问。raw pointer 不参与这项别名证明。
 
-函数省略 `@life` 时，默认返回来源固定为第 0 个参数：方法是 `self`，自由函数是第一个参数。
-返回引用可能来自其他参数或多个来源时必须显式标注。`@life(return: input)` 只传播 `input`
+函数省略 `@life` 且返回 Shape 非空时，按源码顺序选择第一个 Shape 非空的参数（方法包含
+`self`）作为默认来源。第一个候选不兼容、没有候选或存在其他返回来源时必须显式标注；
+编译器不会继续搜索后续兼容参数。`@life(return: input)` 只传播 `input`
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
 `@life()` 明确表示返回值不能携带任何参数 borrow。
 
 struct / union 使用 `@region` 显式声明公开 lifetime shape。单一 lifetime slot 字段写作
-`@life(a)`；字段类型具有多个公开 region 时使用具名映射：
+`@life(a)`；字段类型具有多个公开 region 时可以按位置绑定，也可以使用具名映射：
 
 ```jiang
-@region(left, right)
+@region(a, b)
 struct Pair {
-    @life(left)
+    @life(a)
     Int& first;
 
-    @life(right)
+    @life(b)
     Int& second;
 }
 
 @region(a, b, b: a)
 struct Wrapper {
-    @life(left: a, right: b)
-    Pair pair;
+    @life(a, b)
+    Pair direct;
+
+    @life(a: b, b: a)
+    Pair reversed;
 }
 ```
 
 `b: a` 表示 `a` outlives `b`。只有裸名称声明 region，约束不能隐式声明名称；region 图必须
-无环，且每个 region 都必须由字段或 union payload 的实际 slot 直接使用。
+无环，且每个 region 都必须由字段或 union payload 的实际 slot 直接使用。字段 binding 的
+target 必须唯一且完整；named 模式不能与位置模式混用，也不能使用 `self` source。
 
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
 ```jiang
-@life(callback.value > callback.result, value > return)
+@life(callback.result: callback.value, return: value)
 Int& apply(Fn<Int& result, Int& value> callback, Int& value);
 ```
 
-也可以写位置路径：`callback[0]` 是 result，`callback[1...]` 是公开参数，所以等价的
-callable 子契约是 `@life(callback[1] > callback[0])`。ABI 隐藏的 closure environment、
-receiver adapter 和 continuation 不参与编号。
+callable contract 只能引用 result/参数的声明名；需要参与 contract 的位置必须命名。
+不支持 `callback[0]` 一类位置路径。ABI 隐藏的 closure environment、receiver adapter
+和 continuation 不能出现在公开 contract 中。
 
 契约名本身不参与类型身份；解析后的来源关系参与 callable 的语义兼容性。因此，返回其他参数
 借用的函数或 lambda 不能传给上述 `callback`。
 
-聚合返回值可以逐字段描述来源，例如
-`@life(left > return.left, right > return.right)`；tuple 路径使用
-`value[0]`、`return[1]`。struct / union 路径保存稳定字段声明身份，tuple 路径保存静态下标，
-不使用额外 lifetime slot。
+聚合返回值必须整体映射，例如 `@life(return: (left, right))`；不能拆成
+`return.left`、`return.right` 多条 target。聚合参数的单个 region 使用公开名称选择，
+例如 `value.second`。tuple/Fn 不支持 `[0]` 一类位置式 lifetime path。
 
 `Fn<R, Args...>` 和 `RawFn<R, Args...>` 默认使用空 lifetime 契约：`R` 不能借用 callback
 参数。允许 callback 返回参数 borrow 时，必须像上例一样显式声明
-`callback.value > callback.result`。这条规则不同于普通函数的默认 `arg0 > return`。
+`callback.result: callback.value`。这条规则不同于普通函数选择第一个非空 region 参数的默认契约。
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。

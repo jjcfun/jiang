@@ -138,7 +138,9 @@ Jiang 统一把 `@where(...)`、`@region(...)`、`@life(...)`、`@intrinsic(...)
 `@life()` 是合法的空 attribute，表示显式空返回 lifetime 契约，不等同于省略 `@life`。
 struct / union 的 `@region(a, b, b: a)` 由裸名称声明 public region，并用
 `target: source` 表示 outlives 约束。单-slot 字段 binding 写作 `@life(a)`，多-slot
-字段 binding 写作 `@life(left: a, right: b)`。
+字段 binding 可以按位置写作 `@life(a, b)`，或按 type occurrence 的具名位置写作
+`@life(left: a, right: b)`；两种模式不能混用，target 必须唯一且完整。callable
+contract 同样使用 `target: source`，但只允许具名 target，不支持 `[0]` 位置路径。
 
 同一个声明前的 attribute 按源码顺序应用，并且都作用在当前声明自己的 namespace 上。
 当前声明的泛型参数会先进入这个 namespace；后面的 attribute 可以引用前面 attribute

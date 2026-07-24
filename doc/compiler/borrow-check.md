@@ -35,10 +35,11 @@ unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证�
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
 - 为 drop 插入和后续 backend 提供约束结果。
 
-普通函数没有显式 return lifetime 时，只允许 `arg0` 覆盖返回值；方法的 `arg0` 是 `self`，
-自由函数的 `arg0` 是第一个参数。`@life(... > return)` 只允许标注中的来源，`@life()` 则
-明确禁止所有参数来源。`Fn` / `RawFn` 默认使用空返回契约；高阶接口允许 callback 返回参数
-borrow 时，必须显式声明 callable 的来源关系。
+普通函数没有显式 return lifetime 且返回 Shape 非空时，按源码顺序选择第一个 Shape 非空的
+参数作为来源，方法的顺序包含 `self`。第一个候选不兼容或不存在时必须显式声明
+`@life(return: source)`；`@life()` 明确禁止所有参数来源。`Fn` / `RawFn` 默认使用空返回契约；
+高阶接口允许 callback 返回参数 borrow 时，必须通过 callable 的 result/参数契约名显式声明
+来源关系。
 
 binding/place 的基本可写性由 type check 阶段检查：`T name!` 表示该存储位置可写，但不改变
 `TypeId`。字段、tuple 元素、union payload 和数组元素的写能力沿 place 传播；共享引用 `T&`
@@ -99,9 +100,11 @@ reference 提供一个 slot；raw pointer 不提供 slot，owner pointer 保留 
 alternative。slice handle 由自身 slot 与 repeated element 组成；Task 使用 pending empty/completed
 result alternative。RawFn 为空 shape，Fn 的 slot 表示 capture environment lifetime。
 
-`LifetimeContract` 是 intern 后的 path-to-path flow：root 是函数参数或返回值，projection
-直接使用 struct/union 字段 `DefId` 或 tuple 静态下标。`LifetimeShape` 描述类型结构，
-contract path 继续保存解析后的稳定投影；不再保存只能描述整个返回值的 `result_sources`。
+`LifetimeContract` 是 intern 后的 path-to-path flow：root 是函数参数或返回值，源码中的
+public region、tuple 元素和 callable 位置名称会解析为稳定 projection。内部 projection
+可以使用字段 `DefId` 或 tuple/callable 位置，但这些内部索引不作为 `[0]` 用户语法暴露。
+`LifetimeShape` 描述类型结构，contract path 保存解析后的稳定投影；不再保存只能描述整个
+返回值的 `result_sources`。
 
 ## 分析流程
 

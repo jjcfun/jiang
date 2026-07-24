@@ -477,16 +477,19 @@ a.length; // 编译错误：a 已经 move
 
 生命周期来源约束使用 `@life(...)` leading annotation 表达，并统一写成
 `target: source`。例如 `@life(return: input)` 表示返回值的 lifetime shape 由 `input`
-覆盖；同一 target 可能有多个来源时，在唯一 annotation 中重复 target clause。
+覆盖。每个 target 在一条 annotation 中必须唯一；同 Shape 的多个候选来源使用
+`left & right` 逐位取得共同最短 region，多-slot source 使用 `(left, right)` 构造
+product shape。
 `@life` 与 `@where` 分离：`@where` 只描述类型、trait 和 associated type 约束，
 `@life` 只描述 lifetime 来源覆盖。
 
 常用 lifetime 名：
 
-- `self`：当前 `struct` / `union` 实例 lifetime。
+- `self`：方法或 trait 方法的 receiver lifetime。
 - `return`：函数返回值 lifetime。
-- 参数名：参数或参数引用目标 lifetime。
-- 字段名：struct / union 字段自身的 lifetime。
+- 参数名：参数值的完整 lifetime shape。
+- callable 的 result/参数契约名：对应 callable 位置的 lifetime shape。
+- public region 名：nominal 类型公开 shape 中的具名位置。
 
 struct / union 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
 region，`target: source` 表示右侧覆盖左侧；约束两端必须先由同一 annotation 的裸名称声明，
@@ -504,15 +507,17 @@ struct Pair {
 }
 ```
 
-字段类型只有一个匿名 lifetime slot 时使用 `@life(a)`。字段类型公开多个具名 region 时必须
-逐项写 `@life(left: a, right: b)`；所有 target 必须恰好绑定一次，不能用
-`@life(a, b)` 按位置绑定。字段 binding 不改变字段 `TypeId`、layout 或 ABI。
+字段类型只有一个 lifetime slot 时使用 `@life(a)`。多-slot 字段可以按公开 Shape 顺序写
+`@life(a, b)`，也可以按 type occurrence 提供的名称写 `@life(left: a, right: b)`。
+named 模式的 target 必须唯一且完整，不能与位置模式混用。字段 binding 不支持 `self` source，
+也不改变字段 `TypeId`、layout 或 ABI。
 
-函数没有显式 return lifetime 时，公开契约固定为 `@life(arg0 > return)`：方法的 `arg0`
-是 `self`，自由函数的 `arg0` 是第一个参数。返回来源不是 `arg0`、可能来自多个参数或存在歧义时，
-必须显式写出所有允许来源；编译器不会根据函数体“恰好只返回某一个参数”改变公开契约。
+函数没有显式 return lifetime 时，如果返回类型的 shape 非空，编译器按源码参数顺序（方法包含
+`self`）选择第一个 shape 非空的参数，等价于 `@life(return: first_region_parameter)`。
+第一个候选与返回 Shape 不兼容、没有候选，或函数体存在其他返回来源时，必须显式写出契约；
+编译器不会继续搜索后续“刚好兼容”的参数，也不会根据函数体改变公开契约。
 `@life()` 表示显式空返回契约，即返回值不能携带来自任何参数的 borrow。只声明
-`callback.input > callback.result` 之类的 callable 子契约不会清除外层函数自身的默认契约。
+`callback.result: callback.input` 之类的 callable 子契约不会清除外层函数自身的默认契约。
 
 `@life(return: input)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
 因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
@@ -523,7 +528,7 @@ struct Pair {
 `Fn` / `RawFn` 的 result 和参数可以提供按需契约名，供外层函数约束 callback：
 
 ```jiang
-@life(callback.fallback > callback.result, fallback > return)
+@life(callback.result: callback.fallback, return: fallback)
 Int& apply(
     Fn<Int& result, Int& value, Int& fallback> callback,
     Int& value,
@@ -531,9 +536,9 @@ Int& apply(
 );
 ```
 
-也可以按 callable 类型参数位置引用：`callback[0]` 是 result，`callback[1...]` 是公开参数。
-因此上例的 callable 子契约也可写为 `@life(callback[2] > callback[0])`。closure environment、
-receiver adapter 和 continuation 等 ABI 隐藏参数不参与编号。
+callable contract 只能引用 result/参数的声明名；需要参与 contract 的位置必须命名。
+不支持 `callback[0]` 之类的位置路径。closure environment、receiver adapter 和 continuation
+等 ABI 隐藏参数不能出现在公开 contract 中。
 
 名称只在语法、接口和诊断中保留；声明检查会把它们一次性解析成参数索引。解析后的
 `LifetimeContract` 属于 callable 的语义签名，调用传播、函数值兼容性和 lambda expected type
@@ -543,16 +548,16 @@ closure environment 等 ABI 隐藏参数不进入公开索引。trait object 动
 
 裸 `Fn<R, Args...>` / `RawFn<R, Args...>` 的默认返回契约为空。它等价于把 `R` 固定在参数
 lifetime 之外，因此 callback 不能把参数 borrow 作为 `R` 返回；这与普通函数默认
-`arg0 > return` 的规则不同。需要返回参数 borrow 的高阶接口必须用 callable 契约名
+选择第一个非空 region 参数的规则不同。需要返回参数 borrow 的高阶接口必须用 callable 契约名
 显式声明来源。
 
 跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，仍建议显式表达返回值不超过来源：
 
 ```jiang
-@life(input > return)
+@life(return: input)
 UInt8& first(UInt8& input);
 
-@life(buffer > return)
+@life(return: buffer)
 Slice make_slice(Buffer& buffer);
 ```
 
@@ -560,18 +565,20 @@ Slice make_slice(Buffer& buffer);
 move/drop/free。跨函数和存储到类型字段的来源关系通过 `@life` 检查；shared/mutable alias
 冲突则由 loan 的种类、重叠 place 和最后一次使用共同判断。
 
-返回聚合值时，契约可以精确到字段或 tuple 元素：
+返回聚合值时，`return` 必须作为完整 Shape 一次映射。source 可以由参数的具名 region
+投影或 product expression 构造：
 
 ```jiang
-@life(left > return.left, right > return.right)
+@life(return: (left, right))
 PairRef make_pair(Int& left, Int& right);
 
-@life(value[1] > return)
-Int& take_second((Int&, Int&) value);
+@life(return: value.second)
+Int& take_second((Int& first, Int& second) value);
 ```
 
-字段路径在跨模块接口中以稳定字段声明身份保存，tuple 路径保存静态下标。array 的运行时下标
-不能建立彼此独立的 lifetime 身份：动态下标必须保守地与同一 array 的其他元素别名。
+不允许把完整 target 拆成 `return.a`、`return.b` 多条映射，也不支持 tuple/Fn 的 `[0]`
+位置式 lifetime path。源码中的具名位置会解析为稳定内部投影；array 的运行时下标不能建立
+彼此独立的 lifetime 身份，必须保守地与同一 array 的其他元素别名。
 
 ## 隐式操作层
 
