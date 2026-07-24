@@ -475,7 +475,11 @@ a.length; // 编译错误：a 已经 move
 与重叠共享/可变引用并存，也会阻止通过来源 place 绕过该借用直接访问。引用最后一次
 使用后，来源 place 可以恢复访问。
 
-生命周期约束使用 `@life(...)` leading annotation 表达。`@life(a > b)` 表示 `a` 的目标 lifetime 必须 outlive `b`；`>` 只表示 outlives，不表示值比较或依赖方向。`@life` 与 `@where` 分离：`@where` 只描述类型、trait 和 associated type 约束，`@life` 只描述引用 lifetime 约束。
+生命周期来源约束使用 `@life(...)` leading annotation 表达，并统一写成
+`target: source`。例如 `@life(return: input)` 表示返回值的 lifetime shape 由 `input`
+覆盖；同一 target 可能有多个来源时，在唯一 annotation 中重复 target clause。
+`@life` 与 `@where` 分离：`@where` 只描述类型、trait 和 associated type 约束，
+`@life` 只描述 lifetime 来源覆盖。
 
 常用 lifetime 名：
 
@@ -510,7 +514,7 @@ struct Pair {
 `@life()` 表示显式空返回契约，即返回值不能携带来自任何参数的 borrow。只声明
 `callback.input > callback.result` 之类的 callable 子契约不会清除外层函数自身的默认契约。
 
-`@life(input > return)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
+`@life(return: input)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
 因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
 不含 borrow 的参数对应空 loan 集合，约束自然成立。raw pointer 不携带语言级 lifetime。
 

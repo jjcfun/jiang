@@ -571,7 +571,7 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 引用最后一次使用后，来源 place 可以恢复访问。raw pointer 不参与这项别名证明。
 
 函数省略 `@life` 时，默认返回来源固定为第 0 个参数：方法是 `self`，自由函数是第一个参数。
-返回引用可能来自其他参数或多个来源时必须显式标注。`@life(input > return)` 只传播 `input`
+返回引用可能来自其他参数或多个来源时必须显式标注。`@life(return: input)` 只传播 `input`
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
 `@life()` 明确表示返回值不能携带任何参数 borrow。
 
