@@ -131,11 +131,14 @@ member_decl_body
              / function_decl
 ```
 
-Jiang 统一把 `@where(...)`、`@life(...)`、`@intrinsic(...)` 这类
+Jiang 统一把 `@where(...)`、`@region(...)`、`@life(...)`、`@intrinsic(...)` 这类
 `@name(...)` 形式称为 attribute。`@intrinsic(value, T)` /
 `@intrinsic(type, T)` 是编译器内部声明 `$` 内禀操作的 attribute block，
 只允许编译器内部源码和标准库内部源码使用；普通用户源码写 `@intrinsic` 会报错。
 `@life()` 是合法的空 attribute，表示显式空返回 lifetime 契约，不等同于省略 `@life`。
+struct / union 的 `@region(a, b, b: a)` 由裸名称声明 public region，并用
+`target: source` 表示 outlives 约束。单-slot 字段 binding 写作 `@life(a)`，多-slot
+字段 binding 写作 `@life(left: a, right: b)`。
 
 同一个声明前的 attribute 按源码顺序应用，并且都作用在当前声明自己的 namespace 上。
 当前声明的泛型参数会先进入这个 namespace；后面的 attribute 可以引用前面 attribute

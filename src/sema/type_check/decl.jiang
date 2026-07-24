@@ -11,6 +11,8 @@ import table = "../../support/table.jiang";
 import token = "../../syntax/token.jiang";
 import copy_semantics = "../copy.jiang";
 import generic_bindings = "../generic/bindings.jiang";
+import lifetime_shape = "../lifetime_shape.jiang";
+import lifetime_shape_query = "../lifetime_shape_query.jiang";
 import types = "../type.jiang";
 import check_state = "./state.jiang";
 import type_ops_mod = "./type_ops.jiang";
@@ -293,6 +295,7 @@ public struct DeclCheck: Movable {
         self.canonicalize_const_where_predicates(hir_def.where_predicates$.ref());
         self.check_trait_refs(hir_def);
         self.check_where_predicates(hir_def);
+        self.check_region_schema(hir_def);
         self.check_lifetime_constraints(hir_def);
         self.check_associated_type_owner(hir_def);
         self.check_struct_declaration(hir_def);
@@ -307,6 +310,7 @@ public struct DeclCheck: Movable {
             self.check_declaration_signature_tree(hir_def.members.get(index));
             index = index + 1;
         }
+        self.check_nominal_region_bindings(hir_def);
         self.check_callable_overload_ambiguity(hir_def);
         self.check_nominal_value_recursion(hir_def.def_id);
         // implicit copy 判定需要读取成员 TypeId。先递归检查子声明签名，
@@ -620,6 +624,412 @@ public struct DeclCheck: Movable {
         self.record_callable_lifetime_contracts(hir_def);
         self.record_function_lifetime_flows(hir_def);
         self.record_nominal_lifetime_flows(hir_def);
+    }
+
+    () check_region_schema(self, hir.HirDef& hir_def) {
+        if (hir_def.region_annotation_count == 0) { return; }
+        def.DefKind kind = self.state.store.defs.get(hir_def.def_id).kind;
+        if (kind != .struct_def && kind != .union_def) {
+            self.type_ops.add_def_error(
+                hir_def.def_id,
+                "@region can only be used on struct or union declarations",
+                "region_annotation_invalid_target"
+            );
+            return;
+        }
+        if (hir_def.region_annotation_count > 1) {
+            self.type_ops.add_def_error(
+                hir_def.def_id,
+                "a declaration can have only one @region annotation",
+                "duplicate_region_annotation"
+            );
+        }
+        if (hir_def.region_names.len() == 0) {
+            self.type_ops.add_def_error(
+                hir_def.def_id,
+                "@region must declare at least one region name",
+                "empty_region_annotation"
+            );
+            return;
+        }
+        self.check_duplicate_region_names(hir_def);
+        self.check_region_constraint_names(hir_def);
+        if (self.region_schema_has_cycle(hir_def)) {
+            self.type_ops.add_def_error(
+                hir_def.def_id,
+                "@region outlives constraints must be acyclic",
+                "cyclic_region_constraint"
+            );
+        }
+    }
+
+    () check_duplicate_region_names(self, hir.HirDef& hir_def) {
+        Int index! = 0;
+        while (index < hir_def.region_names.len()) {
+            qid.SymbolId symbol = hir_def.region_names.get(index);
+            Int previous! = 0;
+            while (previous < index) {
+                if (hir_def.region_names.get(previous) == symbol) {
+                    self.type_ops.add_def_error(
+                        hir_def.def_id,
+                        "duplicate region name in @region",
+                        "duplicate_region_name"
+                    );
+                    return;
+                }
+                previous = previous + 1;
+            }
+            index = index + 1;
+        }
+    }
+
+    () check_region_constraint_names(self, hir.HirDef& hir_def) {
+        Int index! = 0;
+        while (index < hir_def.region_constraints.len()) {
+            hir.HirRegionConstraint constraint = hir_def.region_constraints.get(index);
+            if (!self.region_name_declared(hir_def, constraint.target)
+                || !self.region_name_declared(hir_def, constraint.source)) {
+                self.type_ops.add_def_error(
+                    hir_def.def_id,
+                    "region constraints can only reference explicitly declared region names",
+                    "undeclared_region_name"
+                );
+                return;
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool region_name_declared(self, hir.HirDef& hir_def, qid.SymbolId symbol) {
+        Int index! = 0;
+        while (index < hir_def.region_names.len()) {
+            if (hir_def.region_names.get(index) == symbol) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool region_schema_has_cycle(self, hir.HirDef& hir_def) {
+        Int index! = 0;
+        while (index < hir_def.region_constraints.len()) {
+            hir.HirRegionConstraint constraint = hir_def.region_constraints.get(index);
+            list.ArrayList<qid.SymbolId> visiting! = list.ArrayList<qid.SymbolId>();
+            if (self.region_path_exists(
+                hir_def,
+                constraint.target,
+                constraint.source,
+                visiting$.ref()
+            )) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool region_path_exists(
+        self,
+        hir.HirDef& hir_def,
+        qid.SymbolId current,
+        qid.SymbolId goal,
+        list.ArrayList<qid.SymbolId>& visiting
+    ) {
+        if (current == goal) { return true; }
+        if (self.region_symbol_list_contains(visiting, current)) { return false; }
+        visiting.add(current);
+        Int index! = 0;
+        while (index < hir_def.region_constraints.len()) {
+            hir.HirRegionConstraint constraint = hir_def.region_constraints.get(index);
+            index = index + 1;
+            if (constraint.source != current) { continue; }
+            if (self.region_path_exists(hir_def, constraint.target, goal, visiting)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Bool region_symbol_list_contains(
+        self,
+        list.ArrayList<qid.SymbolId>& symbols,
+        qid.SymbolId symbol
+    ) {
+        Int index! = 0;
+        while (index < symbols.len()) {
+            if (symbols.get(index) == symbol) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () check_nominal_region_bindings(self, hir.HirDef& hir_def) {
+        def.DefKind kind = self.state.store.defs.get(hir_def.def_id).kind;
+        if (kind != .struct_def && kind != .union_def) { return; }
+        Bool has_schema = hir_def.region_annotation_count > 0;
+        list.ArrayList<qid.SymbolId> used_regions! = list.ArrayList<qid.SymbolId>();
+        Int index! = 0;
+        while (index < hir_def.members.len()) {
+            qid.DefId member_def = hir_def.members.get(index);
+            index = index + 1;
+            def.DefKind member_kind = self.state.store.defs.get(member_def).kind;
+            if (!self.is_lifetime_field_kind(member_kind)) { continue; }
+            self.check_field_region_binding(
+                hir_def,
+                member_def,
+                has_schema,
+                used_regions$.ref()
+            );
+        }
+        if (!has_schema) { return; }
+        self.check_dangling_regions(hir_def, used_regions$.ref());
+    }
+
+    () check_field_region_binding(
+        self,
+        hir.HirDef& owner,
+        qid.DefId field_def,
+        Bool has_schema,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        hir.HirDef& field = self.state.hirs.def_ref(field_def);
+        if (field.life_annotation_count > 1) {
+            self.type_ops.add_def_error(
+                field_def,
+                "a field can have only one @life annotation",
+                "duplicate_life_annotation"
+            );
+        }
+        if (!has_schema && field.life_annotation_count > 0) {
+            self.type_ops.add_def_error(
+                owner.def_id,
+                "field @life bindings require an @region declaration on the enclosing type",
+                "field_life_requires_region"
+            );
+            return;
+        }
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        lifetime_shape.LifetimeShapeId shape = query.lifetime_shape(field_type);
+        lifetime_shape.LifetimeShapeClass shape_class =
+            self.state.results.lifetime_shapes.classify(shape);
+        if (!has_schema) { return; }
+        if (shape_class == .empty) {
+            self.reject_empty_field_life_binding(field);
+            return;
+        }
+        if (field.life_clauses.len() == 0) {
+            self.type_ops.add_def_error(
+                owner.def_id,
+                "every field that carries lifetime slots must have a complete @life binding",
+                "missing_field_life_binding"
+            );
+            return;
+        }
+        lifetime_shape.LifetimeShape data = self.state.results.lifetime_shapes.get(shape);
+        if (!(data.data is .slot())) {
+            self.check_structured_field_binding(
+                owner,
+                field,
+                field_type,
+                used_regions
+            );
+            return;
+        }
+        self.check_single_slot_field_binding(owner, field, used_regions);
+    }
+
+    () reject_empty_field_life_binding(self, hir.HirDef& field) {
+        if (field.life_clauses.len() == 0) { return; }
+        self.type_ops.add_def_error(
+            field.def_id,
+            "@life cannot bind a field type with an empty lifetime shape",
+            "empty_field_life_binding"
+        );
+    }
+
+    () check_single_slot_field_binding(
+        self,
+        hir.HirDef& owner,
+        hir.HirDef& field,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        if (field.life_clauses.len() != 1 || field.life_clauses.get(0).target != null) {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "a single anonymous lifetime slot must use @life(region)",
+                "invalid_single_slot_life_binding"
+            );
+            return;
+        }
+        hir.HirLifetimeName source = field.life_clauses.get(0).source;
+        guard self.region_binding_source_symbol(source) is .some(symbol) else {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "field @life source must be a declared region name",
+                "invalid_field_life_source"
+            );
+            return;
+        }
+        if (!self.region_name_declared(owner, symbol)) {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "field @life source is not declared by the enclosing @region",
+                "undeclared_field_life_source"
+            );
+            return;
+        }
+        if (!self.region_symbol_list_contains(used_regions, symbol)) {
+            used_regions.add(symbol);
+        }
+    }
+
+    () check_structured_field_binding(
+        self,
+        hir.HirDef& owner,
+        hir.HirDef& field,
+        qid.TypeId field_type,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        guard self.public_region_owner_for_type(field_type) is .some(region_owner_def) else {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "structured field lifetime bindings require named public target regions",
+                "structured_field_life_binding_required"
+            );
+            return;
+        }
+        hir.HirDef& region_owner = self.state.hirs.def_ref(region_owner_def);
+        list.ArrayList<qid.SymbolId> bound_targets! = list.ArrayList<qid.SymbolId>();
+        Int index! = 0;
+        while (index < field.life_clauses.len()) {
+            hir.HirLifeClause clause = field.life_clauses.get(index);
+            index = index + 1;
+            if (!self.check_structured_field_clause(
+                owner,
+                field.def_id,
+                region_owner,
+                clause,
+                bound_targets$.ref(),
+                used_regions
+            )) {
+                return;
+            }
+        }
+        if (bound_targets.len() != region_owner.region_names.len()) {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "field @life must bind every public target region exactly once",
+                "incomplete_field_life_binding"
+            );
+        }
+    }
+
+    Bool check_structured_field_clause(
+        self,
+        hir.HirDef& owner,
+        qid.DefId field_def,
+        hir.HirDef& region_owner,
+        hir.HirLifeClause clause,
+        list.ArrayList<qid.SymbolId>& bound_targets,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        guard clause.target is .some(target_name) else {
+            self.type_ops.add_def_error(
+                field_def,
+                "structured field lifetime bindings must name each target region",
+                "missing_field_life_target"
+            );
+            return false;
+        }
+        guard self.region_binding_source_symbol(target_name) is .some(target) else {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life target must be a public region name of the field type",
+                "invalid_field_life_target"
+            );
+            return false;
+        }
+        if (!self.region_name_declared(region_owner, target)) {
+            self.type_ops.add_def_error(
+                field_def,
+                "unknown public region name in field @life target",
+                "unknown_field_life_target"
+            );
+            return false;
+        }
+        if (self.region_symbol_list_contains(bound_targets, target)) {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life target is bound more than once",
+                "duplicate_field_life_target"
+            );
+            return false;
+        }
+        bound_targets.add(target);
+        return self.check_field_life_source(owner, field_def, clause.source, used_regions);
+    }
+
+    Bool check_field_life_source(
+        self,
+        hir.HirDef& owner,
+        qid.DefId field_def,
+        hir.HirLifetimeName source,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        guard self.region_binding_source_symbol(source) is .some(symbol) else {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life source must be a declared region name",
+                "invalid_field_life_source"
+            );
+            return false;
+        }
+        if (!self.region_name_declared(owner, symbol)) {
+            self.type_ops.add_def_error(
+                field_def,
+                "field @life source is not declared by the enclosing @region",
+                "undeclared_field_life_source"
+            );
+            return false;
+        }
+        if (!self.region_symbol_list_contains(used_regions, symbol)) {
+            used_regions.add(symbol);
+        }
+        return true;
+    }
+
+    qid.DefId? public_region_owner_for_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .named(named) else { return null; }
+        guard self.state.hirs.def(named.def_id) is .some(hir_def) else { return null; }
+        if (hir_def.region_annotation_count == 0) { return null; }
+        return named.def_id;
+    }
+
+    qid.SymbolId? region_binding_source_symbol(self, hir.HirLifetimeName source) {
+        if (source.kind != .named_lifetime || source.projection_path != null) { return null; }
+        return source.symbol;
+    }
+
+    () check_dangling_regions(
+        self,
+        hir.HirDef& owner,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        Int index! = 0;
+        while (index < owner.region_names.len()) {
+            qid.SymbolId symbol = owner.region_names.get(index);
+            if (!self.region_symbol_list_contains(used_regions, symbol)) {
+                self.type_ops.add_def_error(
+                    owner.def_id,
+                    "every declared region must be bound directly by a field lifetime slot",
+                    "dangling_region_name"
+                );
+                return;
+            }
+            index = index + 1;
+        }
     }
 
     () record_nominal_lifetime_flows(self, hir.HirDef& hir_def) {

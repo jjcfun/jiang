@@ -484,19 +484,25 @@ a.length; // 编译错误：a 已经 move
 - 参数名：参数或参数引用目标 lifetime。
 - 字段名：struct / union 字段自身的 lifetime。
 
-struct / union 的每个字段天然都有独立 lifetime，字段声明本身就是 lifetime 身份；tuple
-元素以静态下标标识。字段实际不携带 borrow 时，对应 loan 集合为空。每个字段的有效期都隐式
-覆盖包含它的聚合值，因此无需重复标注 `data > self`：
+struct / union 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
+region，`target: source` 表示右侧覆盖左侧；约束两端必须先由同一 annotation 的裸名称声明，
+并且关系图必须无环。每个 public region 必须由字段或 union payload 的实际 lifetime slot
+直接使用，不支持 phantom region：
 
 ```jiang
-struct Slice {
-    UInt8[]& data;
-    Int len;
+@region(a, b, b: a)
+struct Pair {
+    @life(a)
+    Int& first;
+
+    @life(b)
+    Int& second;
 }
 ```
 
-只有字段之间还需要额外关系时才写类型契约，例如 `@life(left == right)` 或
-`@life(left > right)`。嵌套路径直接使用字段名和 tuple 下标，不引入额外 lifetime slot。
+字段类型只有一个匿名 lifetime slot 时使用 `@life(a)`。字段类型公开多个具名 region 时必须
+逐项写 `@life(left: a, right: b)`；所有 target 必须恰好绑定一次，不能用
+`@life(a, b)` 按位置绑定。字段 binding 不改变字段 `TypeId`、layout 或 ABI。
 
 函数没有显式 return lifetime 时，公开契约固定为 `@life(arg0 > return)`：方法的 `arg0`
 是 `self`，自由函数的 `arg0` 是第一个参数。返回来源不是 `arg0`、可能来自多个参数或存在歧义时，

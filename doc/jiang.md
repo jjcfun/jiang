@@ -575,10 +575,28 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
 `@life()` 明确表示返回值不能携带任何参数 borrow。
 
-struct / union 的每个字段天然有独立 lifetime，字段声明就是其身份；tuple 元素由静态下标
-标识。字段实际不携带 borrow 时，对应来源集合为空。字段 lifetime 隐式覆盖聚合值自身，
-不需要为引用字段逐个重复写 `@life(field > self)`；只有字段之间需要额外约束时才写
-`@life(left == right)` 或 `@life(left > right)`。
+struct / union 使用 `@region` 显式声明公开 lifetime shape。单一 lifetime slot 字段写作
+`@life(a)`；字段类型具有多个公开 region 时使用具名映射：
+
+```jiang
+@region(left, right)
+struct Pair {
+    @life(left)
+    Int& first;
+
+    @life(right)
+    Int& second;
+}
+
+@region(a, b, b: a)
+struct Wrapper {
+    @life(left: a, right: b)
+    Pair pair;
+}
+```
+
+`b: a` 表示 `a` outlives `b`。只有裸名称声明 region，约束不能隐式声明名称；region 图必须
+无环，且每个 region 都必须由字段或 union payload 的实际 slot 直接使用。
 
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
