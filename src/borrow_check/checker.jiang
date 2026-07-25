@@ -346,6 +346,7 @@ struct FunctionBorrowChecker: Movable {
         list.ArrayList<qid.DefId>& visiting,
         Bool expand_transparent_handles
     ) {
+        if (self.type_has_atomic_lifetime(type_id)) { return; }
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         if (info.data is .tuple_type(tuple_type)) {
             self.prebuild_tuple_lifetime_paths(
@@ -369,9 +370,7 @@ struct FunctionBorrowChecker: Movable {
             return;
         }
         if (info.data is .named(named)) {
-            self.prebuild_named_lifetime_paths(
-                root, type_id, named, visiting, expand_transparent_handles
-            );
+            self.prebuild_named_lifetime_paths(root, named);
         }
     }
 
@@ -546,48 +545,16 @@ struct FunctionBorrowChecker: Movable {
     () prebuild_named_lifetime_paths(
         self,
         move_path.MovePathId root,
-        qid.TypeId type_id,
-        types.NamedType named,
-        list.ArrayList<qid.DefId>& visiting,
-        Bool expand_transparent_handles
+        types.NamedType named
     ) {
-        if (!self.nominal_lifetime_fields(named.def_id)) { return; }
-        if (self.def_list_has(visiting, named.def_id)) { return; }
-        visiting.add(named.def_id);
-        layout.LayoutId layout_id = layout_compute.layout_of_type(self.ctx, type_id);
-        layout.TypeLayout type_layout = self.ctx.store.layouts.layout(layout_id);
+        guard self.typeck.nominal_region_schema(named.def_id) is .some(schema) else {
+            return;
+        }
         Int index! = 0;
-        while (index < type_layout.fields.length) {
-            self.prebuild_layout_field_lifetime_path(
-                root,
-                type_layout.fields[index],
-                index,
-                visiting,
-                expand_transparent_handles
-            );
+        while (index < schema.bindings.length) {
+            self.project_lifetime_move_path(root, schema.bindings[index].path);
             index = index + 1;
         }
-        visiting.pop();
-    }
-
-    () prebuild_layout_field_lifetime_path(
-        self,
-        move_path.MovePathId root,
-        layout.FieldLayout field,
-        Int field_index,
-        list.ArrayList<qid.DefId>& visiting,
-        Bool expand_transparent_handles
-    ) {
-        guard field.field_def is .some(field_def) else { return; }
-        mir.MirPlaceElem projection = mir.field_projection_elem(mir.MirFieldProjection (
-            field_def: field_def,
-            field_type: field.field_type,
-            field_index: field_index
-        ));
-        move_path.MovePathId child = self.paths.child_for_projection(root, projection);
-        self.prebuild_type_lifetime_paths(
-            child, field.field_type, visiting, expand_transparent_handles
-        );
     }
 
     () prebuild_statement_aggregate_paths(self, mir.MirStatement statement) {
@@ -1626,6 +1593,10 @@ struct FunctionBorrowChecker: Movable {
         list.ArrayList<qid.DefId>& visiting
     ) {
         if (!self.type_may_carry_borrow(type_id)) { return; }
+        if (self.type_has_atomic_lifetime(type_id)) {
+            self.add_loan_from_paths(.reference_view, source, destination);
+            return;
+        }
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         if (info.data is .tuple_type(tuple_type)) {
             self.record_tuple_param_loans(source, destination, tuple_type, visiting);
@@ -1647,7 +1618,7 @@ struct FunctionBorrowChecker: Movable {
             return;
         }
         if (info.data is .named(named)) {
-            if (self.record_named_param_loans(source, destination, type_id, named, visiting)) {
+            if (self.record_named_param_loans(source, destination, named)) {
                 return;
             }
         }
@@ -1719,46 +1690,22 @@ struct FunctionBorrowChecker: Movable {
         self,
         move_path.MovePathId source,
         move_path.MovePathId destination,
-        qid.TypeId type_id,
-        types.NamedType named,
-        list.ArrayList<qid.DefId>& visiting
+        types.NamedType named
     ) {
-        if (!self.nominal_lifetime_fields(named.def_id)) { return false; }
-        if (self.def_list_has(visiting, named.def_id)) { return false; }
-        visiting.add(named.def_id);
-        layout.LayoutId layout_id = layout_compute.layout_of_type(self.ctx, type_id);
-        layout.TypeLayout type_layout = self.ctx.store.layouts.layout(layout_id);
+        guard self.typeck.nominal_region_schema(named.def_id) is .some(schema) else {
+            return false;
+        }
         Int index! = 0;
-        while (index < type_layout.fields.length) {
-            self.record_layout_field_param_loan(
-                source, destination, type_layout.fields[index], index, visiting
+        while (index < schema.bindings.length) {
+            typeck_store.NominalRegionBinding binding = schema.bindings[index];
+            self.add_loan_from_paths(
+                .reference_view,
+                self.project_lifetime_move_path(source, binding.path),
+                self.project_lifetime_move_path(destination, binding.path)
             );
             index = index + 1;
         }
-        visiting.pop();
         return true;
-    }
-
-    () record_layout_field_param_loan(
-        self,
-        move_path.MovePathId source,
-        move_path.MovePathId destination,
-        layout.FieldLayout field,
-        Int field_index,
-        list.ArrayList<qid.DefId>& visiting
-    ) {
-        guard field.field_def is .some(field_def) else { return; }
-        mir.MirPlaceElem projection = mir.field_projection_elem(mir.MirFieldProjection (
-            field_def: field_def,
-            field_type: field.field_type,
-            field_index: field_index
-        ));
-        self.record_param_carried_loans_inner(
-            self.existing_lifetime_child(source, projection),
-            self.existing_lifetime_child(destination, projection),
-            field.field_type,
-            visiting
-        );
     }
 
     move_path.MovePathId existing_lifetime_child(
@@ -1767,21 +1714,6 @@ struct FunctionBorrowChecker: Movable {
         mir.MirPlaceElem projection
     ) {
         return self.paths.child_for_projection(parent, projection);
-    }
-
-    Bool nominal_lifetime_fields(self, qid.DefId def_id) {
-        if (!self.ctx.store.defs.has(def_id)) { return false; }
-        return self.ctx.store.defs.get(def_id).kind == .struct_def
-            || self.ctx.store.defs.get(def_id).kind == .union_def;
-    }
-
-    Bool def_list_has(self, list.ArrayList<qid.DefId>& values, qid.DefId target) {
-        Int index! = 0;
-        while (index < values.len()) {
-            if (values.get(index).to_index() == target.to_index()) { return true; }
-            index = index + 1;
-        }
-        return false;
     }
 
     Bool record_active_operand_loans(self,
@@ -1964,6 +1896,13 @@ struct FunctionBorrowChecker: Movable {
         lifetime_shape_query.LifetimeShapeQuery query! =
             lifetime_shape_query.LifetimeShapeQuery(self.ctx, self.typeck);
         return query.type_may_carry_borrow(type_id);
+    }
+
+    Bool type_has_atomic_lifetime(self, qid.TypeId type_id) {
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.ctx, self.typeck);
+        return query.lifetime_shape(type_id).index
+            == self.typeck.lifetime_shapes.slot_shape().index;
     }
 
     Bool valid_local_index(self, Int index) {
@@ -3502,6 +3441,12 @@ struct FunctionBorrowChecker: Movable {
         list.ArrayList<qid.DefId>& visiting
     ) {
         if (!self.type_may_carry_borrow(type_id)) { return; }
+        if (self.type_has_atomic_lifetime(type_id)) {
+            self.add_loan_from_paths_with_domain(
+                .reference_view, source, destination, domain_type
+            );
+            return;
+        }
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         if (info.data is .tuple_type(tuple_type)) {
             self.record_whole_source_tuple_loans(
@@ -3523,7 +3468,7 @@ struct FunctionBorrowChecker: Movable {
         }
         if (info.data is .named(named)
             && self.record_whole_source_named_loans(
-                source, destination, type_id, named, domain_type, visiting
+                source, destination, named, domain_type
             )) {
             return;
         }
@@ -3590,37 +3535,23 @@ struct FunctionBorrowChecker: Movable {
         self,
         move_path.MovePathId source,
         move_path.MovePathId destination,
-        qid.TypeId type_id,
         types.NamedType named,
-        qid.DefId? domain_type,
-        list.ArrayList<qid.DefId>& visiting
+        qid.DefId? domain_type
     ) {
-        if (!self.nominal_lifetime_fields(named.def_id)) { return false; }
-        if (self.def_list_has(visiting, named.def_id)) { return false; }
-        visiting.add(named.def_id);
-        layout.LayoutId layout_id = layout_compute.layout_of_type(self.ctx, type_id);
-        layout.TypeLayout type_layout = self.ctx.store.layouts.layout(layout_id);
+        guard self.typeck.nominal_region_schema(named.def_id) is .some(schema) else {
+            return false;
+        }
         Int index! = 0;
-        while (index < type_layout.fields.length) {
-            layout.FieldLayout field = type_layout.fields[index];
+        while (index < schema.bindings.length) {
+            typeck_store.NominalRegionBinding binding = schema.bindings[index];
             index = index + 1;
-            guard field.field_def is .some(field_def) else { continue; }
-            mir.MirPlaceElem projection = mir.field_projection_elem(
-                mir.MirFieldProjection(
-                    field_def: field_def,
-                    field_type: field.field_type,
-                    field_index: index - 1
-                )
-            );
-            self.record_whole_source_lifetime_loans_inner(
+            self.add_loan_from_paths_with_domain(
+                .reference_view,
                 source,
-                self.existing_lifetime_child(destination, projection),
-                field.field_type,
-                domain_type,
-                visiting
+                self.project_lifetime_move_path(destination, binding.path),
+                domain_type
             );
         }
-        visiting.pop();
         return true;
     }
 
