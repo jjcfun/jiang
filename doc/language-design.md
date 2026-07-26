@@ -493,8 +493,9 @@ product shape。
 
 struct / union 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
 region，`target: source` 表示右侧覆盖左侧；约束两端必须先由同一 annotation 的裸名称声明，
-并且关系图必须无环。每个 public region 必须由字段或 union payload 的实际 lifetime slot
-直接使用，不支持 phantom region：
+同一 constraint target 最多出现一次。coverage 可以成环，例如 `a: b, b: a` 表示两个 region
+互相覆盖。每个 public region 必须由字段或 union payload 的实际 lifetime slot 直接使用，
+不支持 phantom region：
 
 ```jiang
 @region(a, b, b: a)
@@ -512,12 +513,16 @@ struct Pair {
 named 模式的 target 必须唯一且完整，不能与位置模式混用。字段 binding 不支持 `self` source，
 也不改变字段 `TypeId`、layout 或 ABI。
 
-函数没有显式 return lifetime 时，如果返回类型的 shape 非空，编译器按源码参数顺序（方法包含
-`self`）选择第一个 shape 非空的参数，等价于 `@life(return: first_region_parameter)`。
-第一个候选与返回 Shape 不兼容、没有候选，或函数体存在其他返回来源时，必须显式写出契约；
-编译器不会继续搜索后续“刚好兼容”的参数，也不会根据函数体改变公开契约。
-`@life()` 表示显式空返回契约，即返回值不能携带来自任何参数的 borrow。只声明
-`callback.result: callback.input` 之类的 callable 子契约不会清除外层函数自身的默认契约。
+函数没有显式 `@life` 且返回 Shape 非空时，readonly `self` / `Self&! self` reference receiver
+的 Shape 非空则优先使用 receiver，等价于 `@life(return: self)`；即使还有其他非空参数 root，
+也不产生歧义。没有该特例时，只有恰好一个用户可见参数 root 的 Shape 非空且与返回 Shape
+兼容，才默认使用该完整 root。一个 product Shape 仍只算一个 root。`Self self` 按值 receiver
+不享受优先级，只作为普通参数参与唯一 root 计数。
+
+返回 Shape 非空但零个非空输入 root 时，必须显式写 `@life()` 确认返回值不携带参数 borrow；
+存在两个或更多非空 root，或唯一 root Shape 不兼容时，也必须显式写出契约。默认契约只由公开
+签名决定，不读取函数体。任意显式 `@life(...)` 都完全替换 implicit return contract；
+只声明 `callback.result: callback.input` 之类的 callable 子契约不会继续补充外层默认来源。
 
 `@life(return: input)` 约束的是 `input` 值携带进来的 loans，不是按值参数 binding 自身的栈槽。
 因此包含引用字段的值可以传播已有 borrow，但不能对按值 `T` / `T^` 参数的字段临时取引用后返回。
@@ -547,9 +552,8 @@ closure environment 等 ABI 隐藏参数不进入公开索引。trait object 动
 同样必须把 contract 映射到 MIR 实参数；borrow checker 不再用“callee 加全部实参”猜测间接调用来源。
 
 裸 `Fn<R, Args...>` / `RawFn<R, Args...>` 的默认返回契约为空。它等价于把 `R` 固定在参数
-lifetime 之外，因此 callback 不能把参数 borrow 作为 `R` 返回；这与普通函数默认
-选择第一个非空 region 参数的规则不同。需要返回参数 borrow 的高阶接口必须用 callable 契约名
-显式声明来源。
+lifetime 之外，因此 callback 不能把参数 borrow 作为 `R` 返回；这与普通函数的 signature
+elision 不同。需要返回参数 borrow 的高阶接口必须用 callable 契约名显式声明来源。
 
 跨函数调用、返回含引用字段的值、或把来源关系写入 public API 时，仍建议显式表达返回值不超过来源：
 

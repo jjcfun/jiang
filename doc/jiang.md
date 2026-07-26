@@ -570,11 +570,13 @@ Jiang 的 borrow checker 同时检查所有权/lifetime/drop safety 与 `T&!` �
 共享引用可以共存；活跃的 `T&!` 会排斥重叠的共享/可变借用，并阻止直接访问来源 place。
 引用最后一次使用后，来源 place 可以恢复访问。raw pointer 不参与这项别名证明。
 
-函数省略 `@life` 且返回 Shape 非空时，按源码顺序选择第一个 Shape 非空的参数（方法包含
-`self`）作为默认来源。第一个候选不兼容、没有候选或存在其他返回来源时必须显式标注；
-编译器不会继续搜索后续兼容参数。`@life(return: input)` 只传播 `input`
+函数省略 `@life` 且返回 Shape 非空时，readonly `self` / `Self&! self` reference receiver
+优先成为完整默认来源。没有该特例时，只有恰好一个用户可见参数 root 的 Shape 非空且与返回
+Shape 兼容，才默认使用该完整 root；一个多-region 参数仍算一个 root。`Self self` 按值
+receiver 只参与普通唯一 root 规则。零个非空 root 时必须用 `@life()` 确认空契约；两个或更多
+非空 root，或唯一 root Shape 不兼容时必须显式标注。默认规则只读取公开签名，不读取函数体；
+任意显式 `@life(...)` 都完全替换默认返回契约。`@life(return: input)` 只传播 `input`
 值已经携带的 borrow，不能延长按值参数局部槽的生命周期；不含 borrow 的参数约束为空。
-`@life()` 明确表示返回值不能携带任何参数 borrow。
 
 struct / union 使用 `@region` 显式声明公开 lifetime shape。单一 lifetime slot 字段写作
 `@life(a)`；字段类型具有多个公开 region 时可以按位置绑定，也可以使用具名映射：
@@ -599,9 +601,10 @@ struct Wrapper {
 }
 ```
 
-`b: a` 表示 `a` outlives `b`。只有裸名称声明 region，约束不能隐式声明名称；region 图必须
-无环，且每个 region 都必须由字段或 union payload 的实际 slot 直接使用。字段 binding 的
-target 必须唯一且完整；named 模式不能与位置模式混用，也不能使用 `self` source。
+`b: a` 表示 `a` outlives `b`。只有裸名称声明 region，约束不能隐式声明名称；同一 constraint
+target 最多出现一次。coverage 允许成环，`a: b, b: a` 表示两个 region 互相覆盖。每个 region
+都必须由字段或 union payload 的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；
+named 模式不能与位置模式混用，也不能使用 `self` source。
 
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 
@@ -623,7 +626,7 @@ callable contract 只能引用 result/参数的声明名；需要参与 contract
 
 `Fn<R, Args...>` 和 `RawFn<R, Args...>` 默认使用空 lifetime 契约：`R` 不能借用 callback
 参数。允许 callback 返回参数 borrow 时，必须像上例一样显式声明
-`callback.result: callback.value`。这条规则不同于普通函数选择第一个非空 region 参数的默认契约。
+`callback.result: callback.value`。这条规则不同于普通函数的 signature elision。
 
 - `T^` 是 owning pointer，拥有堆上对象，并参与自动析构。
 - `T&` 是 non-owning reference，不拥有资源，不参与自动析构。

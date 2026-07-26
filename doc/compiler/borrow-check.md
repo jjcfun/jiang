@@ -35,11 +35,14 @@ unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证�
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
 - 为 drop 插入和后续 backend 提供约束结果。
 
-普通函数没有显式 return lifetime 且返回 Shape 非空时，按源码顺序选择第一个 Shape 非空的
-参数作为来源，方法的顺序包含 `self`。第一个候选不兼容或不存在时必须显式声明
-`@life(return: source)`；`@life()` 明确禁止所有参数来源。`Fn` / `RawFn` 默认使用空返回契约；
-高阶接口允许 callback 返回参数 borrow 时，必须通过 callable 的 result/参数契约名显式声明
-来源关系。
+普通函数没有显式 `@life` 且返回 Shape 非空时，先应用 reference receiver 特例：
+readonly `self` / `Self&! self` 的 Shape 非空时默认使用完整 receiver root。没有该特例时，
+只有恰好一个用户可见参数 root 的 Shape 非空且与返回 Shape 兼容，才默认使用该完整 root。
+`Self self` 按值 receiver 只参与普通唯一 root 规则，不享受 receiver 优先级。零个、两个或更多
+非空 root，以及唯一 root 与返回 Shape 不兼容时，都必须显式声明；零 root 使用 `@life()`
+确认返回值不携带参数 borrow。默认契约只由公开签名决定，不读取函数体。任意显式
+`@life(...)` 都完全替换默认返回契约。`Fn` / `RawFn` 自身默认使用空返回契约；高阶接口允许
+callback 返回参数 borrow 时，必须通过 callable 的 result/参数契约名显式声明来源关系。
 
 binding/place 的基本可写性由 type check 阶段检查：`T name!` 表示该存储位置可写，但不改变
 `TypeId`。字段、tuple 元素、union payload 和数组元素的写能力沿 place 传播；共享引用 `T&`
