@@ -38,6 +38,11 @@ struct LambdaCheckResult: Copyable {
     qid.TypeId type_id;
 }
 
+struct TaskInitializerParts: Copyable {
+    hir.HirId? domain;
+    hir.HirId closure;
+}
+
 @region(a)
 public struct BodyCheck: Movable {
     @life(a)
@@ -645,6 +650,11 @@ public struct BodyCheck: Movable {
             return type_id;
         }
         if (node.data is .call(call)) {
+            if (self.task_initializer_call_with_expected(node_id, call, expected_type)
+                is .some(type_id)) {
+                self.state.results.set_node_type(node_id, type_id);
+                return type_id;
+            }
             if (self.check_coroutine_suspend_expected(node_id, call, expected_type)
                 is .some(type_id)) {
                 self.state.results.set_node_type(node_id, type_id);
@@ -2305,6 +2315,9 @@ public struct BodyCheck: Movable {
                 self.state.results.set_async_start_usage(node_id, .detached);
             }
             return;
+        }
+        if (node.data is .call(call) && self.task_initializer_callee(call)) {
+            self.state.results.set_async_start_usage(node_id, .detached);
         }
     }
 
@@ -4618,7 +4631,7 @@ public struct BodyCheck: Movable {
                     local_type = self.type_ops.infer_array_type_from_initializer(type_ref, initializer, value_type);
                 } else if (self.local_type_ref_is_task(type_ref)) {
                     local_type = self.type_ops.check_task_local_type_ref(type_ref);
-                    value_type = self.check_task_local_initializer(initializer);
+                    value_type = self.check_task_local_initializer(initializer, local_type);
                     local_type = self.task_local_type_from_initializer(type_ref, initializer, local_type, value_type);
                 } else {
                     local_type = self.type_ops.check_value_type_ref(type_ref);
@@ -4662,10 +4675,10 @@ public struct BodyCheck: Movable {
         );
     }
 
-    qid.TypeId check_task_local_initializer(self, hir.HirId initializer) {
+    qid.TypeId check_task_local_initializer(self, hir.HirId initializer, qid.TypeId expected_type) {
         Int saved_depth = self.await_depth;
         self.await_depth = 0;
-        qid.TypeId value_type = self.check_node(initializer);
+        qid.TypeId value_type = self.check_node_expected(initializer, expected_type);
         self.await_depth = saved_depth;
         return value_type;
     }
@@ -4823,6 +4836,9 @@ public struct BodyCheck: Movable {
     qid.TypeId check_call(self, hir.HirId node_id, hir.HirCall call, qid.TypeId? expected_result) {
         // call 先要求 callee 已经能得到 function type；参数逐个检查后，
         // 再用函数签名决定 call 表达式的结果类型。
+        if (call.type_args.length == 0 && self.task_initializer_callee(call)) {
+            return self.check_inferred_task_initializer_call(node_id, call);
+        }
         if (self.is_type_ref_node(call.callee)) {
             return self.check_type_constructor_call(node_id, call);
         }
@@ -6746,6 +6762,9 @@ public struct BodyCheck: Movable {
         hir.HirCall call,
         qid.TypeId result_type
     ) {
+        if (self.check_task_initializer_call(node_id, call, result_type)) {
+            return result_type;
+        }
         if (self.fn_constructor_call(node_id, result_type, call)) {
             return result_type;
         }
@@ -6775,6 +6794,220 @@ public struct BodyCheck: Movable {
             "type_constructor_arity_mismatch"
         );
         return self.state.store.types.invalid_type();
+    }
+
+    qid.TypeId? task_initializer_call_with_expected(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.TypeId expected_type
+    ) {
+        if (call.type_args.length != 0) { return null; }
+        if (!self.task_initializer_callee(call)) { return null; }
+        if (!self.type_ops.type_is_task(expected_type)) { return null; }
+        self.check_task_initializer_call(node_id, call, expected_type);
+        return expected_type;
+    }
+
+    Bool check_task_initializer_call(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call,
+        qid.TypeId result_type
+    ) {
+        types.TypeInfo result_info = self.state.store.types.get(result_type);
+        guard result_info.data is .task_type(task) else { return false; }
+        guard self.task_initializer_parts(node_id, call) is .some(parts) else { return true; }
+        types.DomainEffect? domain = self.task_initializer_domain(parts.domain);
+        if (parts.domain == null && !self.current_effects.has_async
+            && self.current_effects.domain == null) {
+            self.type_ops.add_node_error(
+                node_id,
+                "Task initializer without domain requires an async context",
+                "task_initializer_requires_domain"
+            );
+        }
+        types.EffectSet effects = types.EffectSet(has_async: true, domain: domain);
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>();
+        qid.TypeId expected_lambda = self.state.store.types.function_type_with_kind(
+            params,
+            task.result,
+            token.Span(),
+            effects,
+            .closure
+        );
+        Bool saved_owner_capture = self.allow_implicit_owner_capture;
+        self.allow_implicit_owner_capture = true;
+        qid.TypeId lambda_type = self.check_node_expected(parts.closure, expected_lambda);
+        self.allow_implicit_owner_capture = saved_owner_capture;
+        if (!self.type_ops.is_invalid_type(lambda_type)) {
+            self.bind_task_initializer_function(node_id, parts.closure);
+        }
+        self.state.results.mark_expr_lowering(node_id, .task_initializer);
+        self.mark_observed_async_start_if_needed(node_id);
+        return true;
+    }
+
+    qid.TypeId check_inferred_task_initializer_call(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call
+    ) {
+        guard self.task_initializer_parts(node_id, call) is .some(parts) else {
+            return self.state.store.types.invalid_type();
+        }
+        types.DomainEffect? domain = self.task_initializer_domain(parts.domain);
+        if (parts.domain == null && !self.current_effects.has_async
+            && self.current_effects.domain == null) {
+            self.type_ops.add_node_error(
+                node_id,
+                "Task initializer without domain requires an async context",
+                "task_initializer_requires_domain"
+            );
+        }
+        types.EffectSet effects = types.EffectSet(has_async: true, domain: domain);
+        qid.TypeId result! = self.check_inferred_task_lambda(parts.closure, effects);
+        if (self.type_is_task(result)) {
+            self.type_ops.add_node_error(
+                parts.closure,
+                "Task initializer result type cannot be another Task",
+                "nested_task_not_allowed"
+            );
+            result = self.state.store.types.invalid_type();
+        }
+        self.state.results.mark_expr_lowering(node_id, .task_initializer);
+        self.mark_observed_async_start_if_needed(node_id);
+        self.bind_task_initializer_function(node_id, parts.closure);
+        return self.state.store.types.task_type(result, null, token.Span());
+    }
+
+    qid.TypeId check_inferred_task_lambda(
+        self,
+        hir.HirId closure_id,
+        types.EffectSet effects
+    ) {
+        hir.HirNode closure_node = self.state.hirs.node(closure_id);
+        guard closure_node.data is .lambda_expr(lambda) else {
+            return self.state.store.types.invalid_type();
+        }
+        self.check_lambda_capture_initializers(lambda);
+        if (lambda.param_count != 0) {
+            self.type_ops.add_node_error(
+                closure_id,
+                "Task initializer closure cannot have parameters",
+                "lambda_arity"
+            );
+            return self.state.store.types.invalid_type();
+        }
+        Bool saved_owner_capture = self.allow_implicit_owner_capture;
+        self.allow_implicit_owner_capture = true;
+        self.bind_lambda_capture_types(lambda.function_def, lambda);
+        self.record_lambda_captures(lambda.function_def, lambda);
+        self.allow_implicit_owner_capture = saved_owner_capture;
+        self.check_task_lambda_captures(closure_id, lambda.function_def);
+        self.check_cross_domain_lambda_captures(closure_id, effects, lambda.function_def);
+        types.EffectSet saved_effects = self.current_effects;
+        self.current_effects = effects;
+        qid.TypeId result = self.check_node(lambda.body);
+        self.current_effects = saved_effects;
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>();
+        qid.TypeId callable = self.state.store.types.function_type_with_kind(
+            params,
+            result,
+            token.Span(),
+            effects,
+            .closure
+        );
+        types.TypeInfo callable_info = self.state.store.types.get(callable);
+        if (callable_info.data is .function_type(function_type)) {
+            self.state.results.set_def_type(
+                lambda.function_def,
+                self.lambda_function_def_type(callable, function_type)
+            );
+        }
+        self.state.results.set_node_type(closure_id, callable);
+        self.node_states.set(closure_id, 2);
+        return result;
+    }
+
+    Bool task_initializer_callee(self, hir.HirCall call) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .named_type_ref(named) else { return false; }
+        qid.DefId target = self.type_ops.resolve_alias_target(named.def_id);
+        return self.type_ops.is_task_builtin_type_def(target);
+    }
+
+    TaskInitializerParts? task_initializer_parts(
+        self,
+        hir.HirId node_id,
+        hir.HirCall call
+    ) {
+        hir.HirId? closure! = null;
+        hir.HirId? domain! = null;
+        qid.SymbolId domain_symbol = self.state.store.symbols.intern("domain");
+        Int index! = 0;
+        while (index < call.args.length) {
+            hir.HirCallArg arg = call.args[index];
+            if (arg.trailing) {
+                if (closure != null) {
+                    self.type_ops.add_node_error(
+                        arg.value,
+                        "Task initializer accepts one trailing closure",
+                        "task_initializer_duplicate_closure"
+                    );
+                }
+                closure = arg.value;
+            } else {
+                if (arg.label is .some(label) && label == domain_symbol && domain == null) {
+                    domain = arg.value;
+                } else {
+                    self.type_ops.add_node_error(
+                        arg.value,
+                        "Task initializer accepts only the named domain argument",
+                        "task_initializer_argument"
+                    );
+                }
+            }
+            index = index + 1;
+        }
+        guard closure is .some(closure_id) else {
+            self.type_ops.add_node_error(
+                node_id,
+                "Task initializer requires a trailing closure",
+                "task_initializer_requires_closure"
+            );
+            return null;
+        }
+        hir.HirNode closure_node = self.state.hirs.node(closure_id);
+        if (!(closure_node.data is .lambda_expr(_))) {
+            self.type_ops.add_node_error(
+                closure_id,
+                "Task initializer trailing argument must be a closure",
+                "task_initializer_requires_closure"
+            );
+            return null;
+        }
+        return TaskInitializerParts(domain: domain, closure: closure_id);
+    }
+
+    types.DomainEffect? task_initializer_domain(self, hir.HirId? domain) {
+        guard domain is .some(domain_id) else { return null; }
+        self.check_domain_effect_expr(domain_id);
+        guard self.type_ops.effect_domain_binding_def(domain_id)
+            is .some(binding_def) else { return null; }
+        return types.DomainEffect(
+            binding: binding_def,
+            domain_type: self.type_ops.type_for_def(binding_def)
+        );
+    }
+
+    () bind_task_initializer_function(self, hir.HirId call_id, hir.HirId closure_id) {
+        hir.HirNode closure_node = self.state.hirs.node(closure_id);
+        guard closure_node.data is .lambda_expr(lambda) else { return; }
+        self.state.results.mark_async_block_function(lambda.function_def);
+        if (self.state.results.async_start_usage(call_id) is .some(usage)) {
+            self.state.results.set_async_block_function_usage(lambda.function_def, usage);
+        }
     }
 
     Bool fn_constructor_call(self, hir.HirId node_id, qid.TypeId result_type, hir.HirCall call) {
@@ -6911,6 +7144,13 @@ public struct BodyCheck: Movable {
         if (named.args.length != 0) {
             self.type_ops.check_type_args(call.type_args);
             return self.type_ops.check_type_ref(call.callee);
+        }
+        if (self.type_ops.is_task_builtin_type_def(named.def_id)) {
+            return self.type_ops.task_type_with_checked_generic_args(
+                call.callee,
+                named.def_id,
+                call.type_args
+            );
         }
         return self.type_ops.named_type_with_checked_generic_args(call.callee, named.def_id, call.type_args);
     }
