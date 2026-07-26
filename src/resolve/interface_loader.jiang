@@ -1,11 +1,12 @@
 // 从 ModuleInterface 加载 declaration skeleton。
 //
-// InterfaceLoader 不加载 body，也不伪造 type-check 结果。它只把 `.ji`
-// interface 里的声明面重建到当前 session 的 DefStore / NamespaceStore /
-// HirStore 中，让下游 module 可以做 name resolve 和签名查询。
+// InterfaceLoader 从 `.ji` 重建声明面和 generic body template。template 必须
+// 在 package type check 前恢复，才能为其中的 inferred generic call 重新建立
+// node type 和 concrete instance facts；不能等到 monomorph 阶段才只恢复 HIR。
 
 import context = "../context.jiang";
 import artifact = "../artifact/source.jiang";
+import hir_template = "../artifact/hir_template.jiang";
 import store_api = "../store/api.jiang";
 import syntax_store = "../syntax/store.jiang";
 import qid = "../store/id.jiang";
@@ -18,9 +19,11 @@ import token = "../syntax/token.jiang";
 import def = "./def.jiang";
 import diagnostics = "./diagnostics.jiang";
 import module_graph_builder = "./module_graph_builder.jiang";
+import namespace = "./namespace.jiang";
 import resolve_state = "./state.jiang";
 import store = "./store.jiang";
 import comptime_value = "../sema/comptime/value.jiang";
+import std;
 
 @region(a, b, c, d, e)
 public struct InterfaceLoader: Copyable {
@@ -96,7 +99,49 @@ public struct InterfaceLoader: Copyable {
             self.load_declaration_facts(module_interface, declaration);
             index = index + 1;
         }
-        self.load_public_aliases(module_id, module_interface);
+        self.load_public_aliases(module_id, module_interface, false);
+    }
+
+    public () load_module_interface_templates(self, artifact.ModuleInterface& module_interface) {
+        Int index! = 0;
+        while (index < module_interface.generic_templates.len()) {
+            artifact.GenericTemplate& generic_template =
+                module_interface.generic_templates.ref_at(index);
+            self.load_generic_template(generic_template);
+            index = index + 1;
+        }
+    }
+
+    () load_generic_template(self, artifact.GenericTemplate& generic_template) {
+        guard self.store.incremental.current_def_for_stable(generic_template.owner_stable_id)
+            is .some(def_id) else {
+            self.store.hirs.mark_error();
+            return;
+        }
+        hir_template.HirTemplateDecodeResult decoded =
+            hir_template.decode_body_result(self.store, def_id, generic_template.payload.slice());
+        if (decoded.ok) { return; }
+        qid.SymbolId name = self.store.defs.get(def_id).name.symbol;
+        std.StringBuilder message = std.StringBuilder();
+        message.append("failed to decode interface generic body: ");
+        message.append(self.store.symbols.text(name));
+        if (decoded.missing_stable_id is .some(missing)) {
+            message.append(", missing stable def ");
+            message.append(Int(missing.low));
+            message.append(":");
+            message.append(Int(missing.high));
+        }
+        self.add_interface_type_error(def_id, message.slice(), "interface_generic_template_decode_failed");
+        self.store.hirs.mark_error();
+    }
+
+    public () load_module_interface_aliases(
+        self,
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface,
+        Bool require_targets
+    ) {
+        self.load_public_aliases(module_id, module_interface, require_targets);
     }
 
     Bool declaration_loaded_or_waiting(self, artifact.InterfaceDeclSummary declaration) {
@@ -123,6 +168,13 @@ public struct InterfaceLoader: Copyable {
             return existing;
         }
         guard self.owner_def(module_id, declaration) is .some(semantic_owner) else {
+            diagnostics.add_error(
+                self.ctx,
+                module_interface.source_id,
+                token.Span(),
+                self.store.symbols.text(declaration.name),
+                "interface_declaration_owner_missing"
+            );
             self.store.hirs.mark_error();
             return null;
         }
@@ -156,11 +208,19 @@ public struct InterfaceLoader: Copyable {
         );
         self.store.resolve.bind_name(decl_namespace, declaration.name, declaration.domain, def_id, token.Span());
         self.store.hirs.declare_def(def_id, self.hir_decl_kind(declaration.kind));
-        self.store.hirs.add_member(semantic_owner, def_id);
+        self.add_owner_declaration(semantic_owner, def_id, declaration.kind);
         self.store.source_map.set_def_span(def_id, module_interface.source_id, token.Span());
         self.bind_type_identity(def_id, declaration.kind);
         self.record_interface_stable_key(module, module_interface, declaration, def_id);
         return def_id;
+    }
+
+    () add_owner_declaration(self, qid.DefId owner, qid.DefId declaration, def.DefKind kind) {
+        if (kind == .generic_param_def) {
+            self.store.hirs.add_generic_param(owner, declaration);
+            return;
+        }
+        self.store.hirs.add_member(owner, declaration);
     }
 
     () load_declaration_facts(self,
@@ -171,6 +231,8 @@ public struct InterfaceLoader: Copyable {
             self.store.hirs.mark_error();
             return;
         }
+        self.load_declaration_modifiers(def_id, declaration);
+        self.load_field_default(def_id, module_interface, declaration);
         self.load_decl_type_ref(def_id, module_interface, declaration);
         self.load_trait_refs(def_id, module_interface, declaration);
         self.load_where_predicates(def_id, module_interface, declaration);
@@ -183,6 +245,61 @@ public struct InterfaceLoader: Copyable {
         self.load_life_clauses(def_id, module_interface, declaration);
         self.load_function_signature(def_id, module_interface, declaration);
         self.load_const_value(def_id, module_interface, declaration);
+    }
+
+    () load_declaration_modifiers(
+        self,
+        qid.DefId def_id,
+        artifact.InterfaceDeclSummary declaration
+    ) {
+        self.store.hirs.set_decl_mutable_binding(def_id, declaration.mutable_binding);
+        self.store.hirs.set_decl_is_const(def_id, declaration.is_const);
+        self.store.hirs.set_decl_extern_kind(
+            def_id,
+            self.extern_kind_from_interface(declaration.extern_kind)
+        );
+        self.store.hirs.set_decl_is_external(def_id, declaration.is_external);
+        self.store.hirs.set_inline_mode(
+            def_id,
+            self.inline_mode_from_interface(declaration.inline_mode)
+        );
+        if (declaration.naked) {
+            self.store.hirs.set_naked(def_id);
+        }
+        if (declaration.link_symbol is .some(symbol)) {
+            self.store.hirs.set_link_symbol(def_id, symbol);
+        }
+    }
+
+    hir.HirExternKind extern_kind_from_interface(self, Int value) {
+        if (value == Int(hir.HirExternKind.native)) { return .native; }
+        if (value == Int(hir.HirExternKind.c_abi)) { return .c_abi; }
+        if (value == Int(hir.HirExternKind.builtin)) { return .builtin; }
+        return .none;
+    }
+
+    hir.HirInlineMode inline_mode_from_interface(self, Int value) {
+        if (value == Int(hir.HirInlineMode.always)) { return .always; }
+        return .none;
+    }
+
+    () load_field_default(
+        self,
+        qid.DefId def_id,
+        artifact.ModuleInterface& module_interface,
+        artifact.InterfaceDeclSummary declaration
+    ) {
+        guard module_interface.field_default(declaration.stable_id) is .some(payload) else { return; }
+        guard hir_template.decode_expression(self.store, def_id, payload) is .some(value) else {
+            self.add_interface_type_error(
+                def_id,
+                "failed to decode interface field default",
+                "interface_field_default_decode_failed"
+            );
+            self.store.hirs.mark_error();
+            return;
+        }
+        self.store.hirs.set_field_default(def_id, value);
     }
 
     () load_const_value(self,
@@ -280,40 +397,82 @@ public struct InterfaceLoader: Copyable {
     }
 
 
-    () load_public_aliases(self, qid.ModuleId module_id, artifact.ModuleInterface& module_interface) {
+    () load_public_aliases(
+        self,
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface,
+        Bool require_targets
+    ) {
         Int index! = 0;
         while (index < module_interface.public_aliases.len()) {
-            self.load_public_alias(module_id, module_interface.public_aliases.get(index));
+            self.load_public_alias(
+                module_id,
+                module_interface.public_aliases.get(index),
+                require_targets
+            );
             index = index + 1;
         }
     }
 
-    () load_public_alias(self, qid.ModuleId module_id, artifact.AliasExportSummary alias_export) {
+    () load_public_alias(
+        self,
+        qid.ModuleId module_id,
+        artifact.AliasExportSummary alias_export,
+        Bool require_target
+    ) {
         guard self.store.incremental.current_def_for_stable(alias_export.target_stable_id)
             is .some(target_def) else {
+            if (!require_target) { return; }
+            store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
+            diagnostics.add_error(
+                self.ctx,
+                module.source_id,
+                token.Span(),
+                self.store.symbols.text(alias_export.alias_symbol),
+                "interface_public_alias_target_missing"
+            );
             self.store.hirs.mark_error();
             return;
         }
         def.DefRecord target_record = self.store.defs.get(target_def);
         def.NameDomain domain = self.alias_domain(target_record);
-        if (self.loaded_alias_def(module_id, alias_export.alias_symbol, domain) is .some(alias_def)) {
+        if (
+            self.loaded_alias_def(module_id, alias_export.alias_symbol, domain, target_def)
+            is .some(alias_def)
+        ) {
             self.store.hirs.set_alias_target(alias_def, target_def);
+            self.store.defs.ref_at(alias_def).owned_namespace_id = target_record.owned_namespace_id;
             return;
         }
         self.create_interface_alias(module_id, alias_export.alias_symbol, target_def, target_record, domain);
     }
 
-    qid.DefId? loaded_alias_def(self, qid.ModuleId module_id, qid.SymbolId alias_symbol, def.NameDomain domain) {
+    qid.DefId? loaded_alias_def(
+        self,
+        qid.ModuleId module_id,
+        qid.SymbolId alias_symbol,
+        def.NameDomain domain,
+        qid.DefId target_def
+    ) {
         store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
-        guard self.store.resolve.lookup_namespace(module.namespace_id, alias_symbol, domain, false)
-            is .some(binding) else {
-            return null;
-        }
-        def.DefKind kind = self.store.defs.get(binding.def_id).kind;
-        if (kind == .alias_def || kind == .import_alias_def) {
-            return binding.def_id;
+        table.MultiTableCursor cursor! =
+            self.store.resolve.first_binding_cursor(module.namespace_id, alias_symbol, domain);
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = self.store.resolve.binding_at(cursor);
+            if (self.alias_targets_def(binding.def_id, target_def)) {
+                return binding.def_id;
+            }
+            cursor = self.store.resolve.next_binding_cursor(cursor);
         }
         return null;
+    }
+
+    Bool alias_targets_def(self, qid.DefId alias_def, qid.DefId target_def) {
+        def.DefKind kind = self.store.defs.get(alias_def).kind;
+        if (kind != .alias_def && kind != .import_alias_def) { return false; }
+        guard self.store.hirs.def(alias_def) is .some(alias_hir) else { return false; }
+        guard alias_hir.decl.alias_target is .some(existing_target) else { return false; }
+        return existing_target == target_def;
     }
 
     qid.DefId create_interface_alias(self,
@@ -1241,11 +1400,19 @@ public struct InterfaceLoader: Copyable {
             module_path: module_interface.module_path,
             owner: owner,
             name: declaration.name,
-            domain: declaration.domain
+            domain: declaration.domain,
+            disambiguator: declaration.disambiguator
         );
         qkey.StableSymbolId computed = qkey.stable_symbol_id_for_key(self.store.symbols$.ref(), key);
         self.store.incremental.record_loaded_symbol(declaration.stable_id, key, def_id);
         if (computed != declaration.stable_id) {
+            diagnostics.add_error(
+                self.ctx,
+                module_interface.source_id,
+                token.Span(),
+                self.store.symbols.text(declaration.name),
+                "interface_stable_symbol_mismatch"
+            );
             self.store.hirs.mark_error();
         }
     }

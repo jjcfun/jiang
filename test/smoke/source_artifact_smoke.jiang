@@ -6,15 +6,18 @@ import artifact_path = "../../src/artifact/path.jiang";
 import context = "../../src/context.jiang";
 import qid = "../../src/store/id.jiang";
 import qkey = "../../src/incremental/key.jiang";
+import fingerprint = "../../src/incremental/fingerprint.jiang";
 import rdef = "../../src/resolve/def.jiang";
 import syntax_store = "../../src/syntax/store.jiang";
 import graph_builder = "../../src/resolve/module_graph_builder.jiang";
+import interface_loader = "../../src/resolve/interface_loader.jiang";
 import hir = "../../src/hir/hir.jiang";
 import module_graph = "../../src/resolve/module_graph.jiang";
 import module_resolver = "../../src/resolve/module_resolver.jiang";
 import resolve_state = "../../src/resolve/state.jiang";
 import store = "../../src/resolve/store.jiang";
 import source = "../../src/source/source.jiang";
+import type_check = "../../src/sema/type_check/api.jiang";
 import string = "../../src/support/string.jiang";
 import fs = "../../src/system/fs.jiang";
 import table = "../../src/support/table.jiang";
@@ -34,6 +37,7 @@ Int main() {
     check_import_summary_section_is_stable();
     check_interface_fingerprint_uses_stable_symbols();
     check_interface_fingerprint_ignores_section_order();
+    check_overloaded_function_stable_ids();
     check_private_body_change_keeps_interface_hash();
     check_public_signature_change_updates_interface_hash();
     check_interface_type_ref_section_roundtrip();
@@ -43,12 +47,147 @@ Int main() {
     check_interface_hit_loads_from_ji_without_ast();
     check_resolve_stores_module_interface();
     check_interface_builder_exports_nested_members();
+    check_interface_builder_exports_trait_companion_parameter();
+    check_interface_builder_exports_field_default();
+    check_interface_builder_exports_private_const_value();
     check_interface_builder_exports_private_member_skeletons();
     check_interface_builder_exports_generic_signature_and_template();
+    check_interface_builder_exports_private_generic_template();
     check_import_summary_builds_graph_without_ast();
-    check_interface_hit_lowers_without_ast();
-    check_interface_hit_skips_discovery_ast();
     return 0;
+}
+
+() check_overloaded_function_stable_ids() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    syntax_store.Store asts! = syntax_store.Store();
+    UInt8[]& text = "Int choose(Int value) { value } UInt choose(UInt value) { value }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "overloaded_function_stable_ids",
+        source.content_hash(text)
+    );
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx$.ref(), text, source_id);
+    assert(!parsed.has_errors());
+    asts.set_unit(parsed.take_unit(), ctx.store.sources.get(source_id).revision);
+
+    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
+    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    qid.ModuleId module_id = ctx.store.resolve.module_for_source(source_id)$.some();
+    qid.DefId function_def = first_function_def_named(ctx$.ref(), module_id, "choose");
+    assert_hidden_receiver_not_in_discriminator(ctx$.ref(), function_def);
+    resolver.finalize_module_graph_hir(graph$.ref());
+
+    artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
+    qid.SymbolId choose_symbol = ctx.store.symbols.intern("choose");
+    qkey.StableSymbolId? first! = null;
+    qkey.StableSymbolId? second! = null;
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+        if (declaration.name == choose_symbol) {
+            if (first == null) {
+                first = declaration.stable_id;
+            } else {
+                second = declaration.stable_id;
+            }
+            assert(declaration.disambiguator != null);
+        }
+        index = index + 1;
+    }
+    assert(first != null);
+    assert(second != null);
+    assert(first$.some() != second$.some());
+
+    source_fingerprint.SourceSectionImage encoded =
+        source_fingerprint.encode_module_interface_section(ctx$.ref(), module_interface);
+    artifact.ModuleInterface decoded = source_fingerprint.decode_module_interface_section(
+        ctx$.ref(),
+        source_id,
+        ctx.store.sources.get(source_id).content_hash,
+        encoded.bytes.slice()
+    )$.some();
+    assert_overloaded_interface_ids(decoded$.ref(), choose_symbol, first$.some(), second$.some());
+}
+
+qid.DefId first_function_def_named(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id,
+    UInt8[]& name
+) {
+    qid.SymbolId symbol = ctx.store.symbols.intern(name);
+    qid.DefId module_def = ctx.store.resolve.module_ref(module_id).def_id;
+    hir.HirDef& module_hir = ctx.store.hirs.def_ref(module_def);
+    Int index! = 0;
+    while (index < module_hir.members.len()) {
+        qid.DefId member_def = module_hir.members.get(index);
+        rdef.DefRecord declaration = ctx.store.defs.get(member_def);
+        if (declaration.kind == .function_def && declaration.name.symbol == symbol) {
+            return member_def;
+        }
+        index = index + 1;
+    }
+    return qid.DefId.from_index(0);
+}
+
+() assert_hidden_receiver_not_in_discriminator(
+    context.CompilerContext& ctx,
+    qid.DefId function_def
+) {
+    hir.HirFunctionSignature ref_signature! =
+        ctx.store.hirs.def_ref(function_def).decl.function_signature$.some();
+    ref_signature.has_receiver = true;
+    ref_signature.receiver_mode = .ref_receiver;
+    hir.HirFunctionSignature move_signature! = ref_signature;
+    move_signature.receiver_mode = .move_receiver;
+    qkey.Fingerprint128 ref_hidden = fingerprint.callable_signature_fingerprint(
+        ctx,
+        function_def,
+        ref_signature,
+        false
+    );
+    qkey.Fingerprint128 move_hidden = fingerprint.callable_signature_fingerprint(
+        ctx,
+        function_def,
+        move_signature,
+        false
+    );
+    assert(ref_hidden == move_hidden);
+    qkey.Fingerprint128 ref_visible = fingerprint.callable_signature_fingerprint(
+        ctx,
+        function_def,
+        ref_signature,
+        true
+    );
+    qkey.Fingerprint128 move_visible = fingerprint.callable_signature_fingerprint(
+        ctx,
+        function_def,
+        move_signature,
+        true
+    );
+    assert(ref_visible != move_visible);
+}
+
+() assert_overloaded_interface_ids(
+    artifact.ModuleInterface& module_interface,
+    qid.SymbolId name,
+    qkey.StableSymbolId first,
+    qkey.StableSymbolId second
+) {
+    Bool found_first! = false;
+    Bool found_second! = false;
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+        if (declaration.name == name && declaration.stable_id == first) {
+            found_first = true;
+        }
+        if (declaration.name == name && declaration.stable_id == second) {
+            found_second = true;
+        }
+        index = index + 1;
+    }
+    assert(found_first);
+    assert(found_second);
 }
 
 () check_interface_builder_exports_private_member_skeletons() {
@@ -60,7 +199,7 @@ Int main() {
     );
     text = string.concat_slice(text[..], "Int hidden_static() { 1 } public Int visible_static() { 2 } } ");
     text = string.concat_slice(text[..], "struct PrivateBox { Int value; } ");
-    text = string.concat_slice(text[..], "public PublicBox make_box() { PublicBox { hidden: 1, shown: 2 } }");
+    text = string.concat_slice(text[..], "public PublicBox make_box() { PublicBox(hidden: 1, shown: 2) }");
     source.SourceId source_id = ctx.store.sources.intern_virtual(
         "interface_private_member_skeletons",
         source.content_hash(text[..])
@@ -72,6 +211,7 @@ Int main() {
     module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
     module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
     assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
 
     artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
     assert_interface_function_returns_decl(ctx$.ref(), module_interface, "make_box", "PublicBox");
@@ -94,6 +234,14 @@ Int main() {
         qkey.Fingerprint128(31, 32)
     );
     qkey.StableSymbolId function_id = module_interface.declarations.get(0).stable_id;
+    artifact.InterfaceDeclSummary&! declaration = module_interface.declarations.ref_at(0);
+    declaration.mutable_binding = true;
+    declaration.is_const = true;
+    declaration.is_external = true;
+    declaration.extern_kind = Int(hir.HirExternKind.c_abi);
+    declaration.inline_mode = Int(hir.HirInlineMode.always);
+    declaration.naked = true;
+    declaration.link_symbol = ctx.store.symbols.intern("artifact_answer");
     artifact.InterfaceFunctionSignature signature! = artifact.InterfaceFunctionSignature(
         false,
         sample_errorable_interface_type()
@@ -146,6 +294,17 @@ Int main() {
     assert(decoded.trait_refs.len() == 1);
     assert(decoded.where_predicates.len() == 1);
     assert(decoded.lifetime_constraints.len() == 1);
+    artifact.InterfaceDeclSummary decoded_declaration = decoded.declarations.get(0);
+    assert(decoded_declaration.mutable_binding);
+    assert(decoded_declaration.is_const);
+    assert(decoded_declaration.is_external);
+    assert(decoded_declaration.extern_kind == Int(hir.HirExternKind.c_abi));
+    assert(decoded_declaration.inline_mode == Int(hir.HirInlineMode.always));
+    assert(decoded_declaration.naked);
+    assert(string.equal(
+        ctx.store.symbols.text(decoded_declaration.link_symbol$.some()),
+        "artifact_answer"
+    ));
 }
 
 artifact.InterfaceTypeRef sample_function_interface_type() {
@@ -354,9 +513,14 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
         asts$.ref(),
         module_states$.ref(),
         declaration_defs$.ref(),
-        cache_root
+        cache_root,
+        UInt64(1)
     );
-    module_graph.ModuleGraph^ graph = builder.build_module_graph_for_source(root_source);
+    qid.ModuleId root_module = builder.ensure_module(root_source);
+    store.ModuleRecord& root = ctx.store.resolve.module_ref(root_module);
+    module_graph.ModuleGraph^ graph =
+        new module_graph.ModuleGraph(root.package_id, root_module, true);
+    builder.discover_module_imports(graph$.ref(), root_module);
     assert(graph.module_count() == 2);
     assert(graph.edge_count() == 1);
     artifact.SourceArtifactStats stats = ctx.store.artifacts.stats;
@@ -458,6 +622,7 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
     module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
     module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
     assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
 
     artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
     assert(module_interface.declarations.len() == 1);
@@ -478,17 +643,40 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
         "ji_interface_root",
         source.content_hash("ji_interface_root")
     );
-    ctx.store.sources.intern_virtual("ji_interface_dep", source.content_hash("ji_interface_dep"));
+    source.SourceId dep_source = ctx.store.sources.intern_virtual(
+        "ji_interface_dep",
+        source.content_hash("ji_interface_dep")
+    );
 
-    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref(), cache_root);
-    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(root_source);
-    assert(graph.module_count() == 2);
-    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
-    artifact.SourceArtifactStats stats = ctx.store.artifacts.stats;
-    assert(stats.import_hit == 2);
-    assert(stats.interface_hit == 2);
-    assert(stats.missing_count() == 0);
-    assert(stats.stale_count() == 0);
+    table.HashTable<qid.ModuleId, graph_builder.ModuleResolvePassState> module_states =
+        table.HashTable<qid.ModuleId, graph_builder.ModuleResolvePassState>();
+    table.HashTable<resolve_state.DeclarationDefKey, qid.DefId> declaration_defs =
+        table.HashTable<resolve_state.DeclarationDefKey, qid.DefId>();
+    graph_builder.ModuleGraphBuilder builder = graph_builder.ModuleGraphBuilder(
+        ctx$.ref(),
+        asts$.ref(),
+        module_states$.ref(),
+        declaration_defs$.ref(),
+        cache_root,
+        UInt64(1)
+    );
+    qid.ModuleId root_module = builder.ensure_module(root_source);
+    qid.ModuleId dep_module = builder.ensure_module(dep_source);
+    assert(builder.load_source_artifacts_from_file(root_module));
+    assert(builder.load_source_artifacts_from_file(dep_module));
+    assert(asts.unit(root_source, ctx.store.sources.get(root_source).revision) == null);
+    assert(asts.unit(dep_source, ctx.store.sources.get(dep_source).revision) == null);
+
+    interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
+        ctx$.ref(),
+        asts$.ref(),
+        module_states$.ref(),
+        declaration_defs$.ref()
+    );
+    artifact.ModuleInterface& root_interface = ctx.store.artifacts.load_interface(root_source)$.some();
+    artifact.ModuleInterface& dep_interface = ctx.store.artifacts.load_interface(dep_source)$.some();
+    loader.load_module_interface(root_module, root_interface);
+    loader.load_module_interface(dep_module, dep_interface);
 }
 
 () write_interface_source_ji_cache(UInt8[]& cache_root) {
@@ -560,8 +748,8 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
 }
 
 () store_empty_interface(context.CompilerContext& ctx, source.SourceId source_id, qid.ModuleId module_id) {
-    store.ModuleRecord module = ctx.store.resolve.modules.get(module_id);
-    store.PackageRecord package_record = ctx.store.resolve.packages.get(module.package_id);
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    store.PackageRecord& package_record = ctx.store.resolve.package_ref(module.package_id);
     ctx.store.artifacts.store_interface(source_id, artifact.ModuleInterface(
         source_id,
         ctx.store.sources.get(source_id).content_hash,
@@ -575,7 +763,7 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
     syntax_store.Store asts! = syntax_store.Store();
     UInt8[]^ text = string.concat_slice(
         "public struct Box { public Int value; public Int get(self) { return self.value; } ",
-        "public Int make() { return 1; } } public Box make_box() { Box { value: 1 } }"
+        "public Int make() { return 1; } } public Box make_box() { Box(value: 1) }"
     );
     source.SourceId source_id = ctx.store.sources.intern_virtual(
         "interface_nested_members",
@@ -588,6 +776,7 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
     module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
     module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
     assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
 
     artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
     assert(module_interface.declarations.len() == 5);
@@ -602,6 +791,128 @@ artifact.InterfaceLiteral sample_int_literal(UInt64 bits) {
             section.bytes.slice()
         )$.some();
     assert_interface_function_returns_decl(ctx$.ref(), decoded$.ref(), "make_box", "Box");
+}
+
+() check_interface_builder_exports_trait_companion_parameter() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    syntax_store.Store asts! = syntax_store.Store();
+    UInt8[]& text = "public trait Sink { () write(self); } public () consume(Sink.Any& sink) {}";
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "interface_trait_companion_parameter",
+        source.content_hash(text)
+    );
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx$.ref(), text, source_id);
+    assert(!parsed.has_errors());
+    asts.set_unit(parsed.take_unit(), ctx.store.sources.get(source_id).revision);
+
+    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
+    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
+
+    artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
+    qkey.StableSymbolId function_stable =
+        stable_decl_named(module_interface, ctx.store.symbols.intern("consume"));
+    artifact.InterfaceFunctionSignature& signature =
+        module_interface.function_signature(function_stable)$.some();
+    artifact.InterfaceTypeRef& param = signature.params.ref_at(0).type_ref$.ref();
+    assert(param.kind_tag == 3);
+    artifact.InterfaceTypeRef element = param.arg_at(0);
+    assert(element.kind_tag == 9);
+    assert(element.has_stable_def);
+}
+
+() check_interface_builder_exports_field_default() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    syntax_store.Store asts! = syntax_store.Store();
+    UInt8[]& text = "public struct Flags { public Bool enabled! = false; }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "interface_field_default",
+        source.content_hash(text)
+    );
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx$.ref(), text, source_id);
+    assert(!parsed.has_errors());
+    asts.set_unit(parsed.take_unit(), ctx.store.sources.get(source_id).revision);
+
+    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
+    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
+
+    artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
+    qkey.StableSymbolId field_stable =
+        stable_decl_named(module_interface, ctx.store.symbols.intern("enabled"));
+    assert(module_interface.field_default(field_stable) != null);
+    assert(interface_decl(module_interface, field_stable).mutable_binding);
+
+    source_fingerprint.SourceSectionImage section =
+        source_fingerprint.encode_module_interface_section(ctx$.ref(), module_interface);
+    artifact.ModuleInterface decoded =
+        source_fingerprint.decode_module_interface_section(
+            ctx$.ref(),
+            source_id,
+            ctx.store.sources.get(source_id).content_hash,
+            section.bytes.slice()
+        )$.some();
+    assert(decoded.field_default(field_stable) != null);
+    assert(interface_decl(decoded$.ref(), field_stable).mutable_binding);
+}
+
+() check_interface_builder_exports_private_const_value() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    syntax_store.Store asts! = syntax_store.Store();
+    UInt8[]& text = "const Int SECRET = 7; public Int answer() { SECRET }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "interface_private_const_value",
+        source.content_hash(text)
+    );
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx$.ref(), text, source_id);
+    assert(!parsed.has_errors());
+    asts.set_unit(parsed.take_unit(), ctx.store.sources.get(source_id).revision);
+
+    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
+    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    assert(type_check.check_hir_package(ctx$.ref(), graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
+
+    artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
+    qkey.StableSymbolId const_stable =
+        stable_decl_named(module_interface, ctx.store.symbols.intern("SECRET"));
+    assert(interface_decl(module_interface, const_stable).is_const);
+    assert(module_interface.const_value(const_stable) != null);
+
+    source_fingerprint.SourceSectionImage section =
+        source_fingerprint.encode_module_interface_section(ctx$.ref(), module_interface);
+    artifact.ModuleInterface decoded =
+        source_fingerprint.decode_module_interface_section(
+            ctx$.ref(),
+            source_id,
+            ctx.store.sources.get(source_id).content_hash,
+            section.bytes.slice()
+        )$.some();
+    assert(interface_decl(decoded$.ref(), const_stable).is_const);
+    assert(decoded.const_value(const_stable) != null);
+}
+
+artifact.InterfaceDeclSummary interface_decl(
+    artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+        if (declaration.stable_id == stable_id) { return declaration; }
+        index = index + 1;
+    }
+    return artifact.InterfaceDeclSummary(
+        stable_id,
+        .error_def,
+        rdef.NameDomain.value_name,
+        rdef.Visibility.private_visibility,
+        qid.SymbolId(0),
+        null
+    );
 }
 
 () assert_interface_function_returns_decl(
@@ -649,20 +960,83 @@ qkey.StableSymbolId stable_decl_named(artifact.ModuleInterface& module_interface
     module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
     module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
     assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
 
     artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
-    assert(module_interface.declarations.len() == 1);
+    assert(module_interface.declarations.len() == 2);
+    qkey.StableSymbolId function_stable =
+        stable_decl_named(module_interface, ctx.store.symbols.intern("id"));
+    qkey.StableSymbolId param_stable =
+        stable_decl_named(module_interface, ctx.store.symbols.intern("T"));
     artifact.InterfaceFunctionSignature& signature =
-        module_interface.function_signature(module_interface.declarations.get(0).stable_id)$.some();
+        module_interface.function_signature(function_stable)$.some();
     assert(signature.params.len() == 1);
+    assert_generic_param_declaration(module_interface, param_stable, function_stable);
     assert(module_interface.generic_templates.len() == 1);
-    qkey.StableSymbolId generic_stable_id = module_interface.declarations.get(0).stable_id;
-    qid.DefId generic_def = ctx.store.incremental.current_def_for_stable(generic_stable_id)$.some();
+    qid.DefId generic_def = ctx.store.incremental.current_def_for_stable(function_stable)$.some();
     assert(hir_template.decode_body(
         ctx.store$.ref(),
         generic_def,
         module_interface.generic_templates.ref_at(0).payload.slice()
     ));
+
+    source_fingerprint.SourceSectionImage section =
+        source_fingerprint.encode_module_interface_section(ctx$.ref(), module_interface);
+    artifact.ModuleInterface decoded =
+        source_fingerprint.decode_module_interface_section(
+            ctx$.ref(),
+            source_id,
+            ctx.store.sources.get(source_id).content_hash,
+            section.bytes.slice()
+        )$.some();
+    assert_generic_param_declaration(decoded$.ref(), param_stable, function_stable);
+}
+
+() check_interface_builder_exports_private_generic_template() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    syntax_store.Store asts! = syntax_store.Store();
+    UInt8[]& text =
+        "T helper<T>(T value) { return value; } public T use<T>(T value) { return helper<T>(value); }";
+    source.SourceId source_id = ctx.store.sources.intern_virtual(
+        "interface_private_generic_template",
+        source.content_hash(text)
+    );
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx$.ref(), text, source_id);
+    assert(!parsed.has_errors());
+    asts.set_unit(parsed.take_unit(), ctx.store.sources.get(source_id).revision);
+
+    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
+    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
+
+    artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
+    qkey.StableSymbolId helper =
+        stable_decl_named(module_interface, ctx.store.symbols.intern("helper"));
+    qkey.StableSymbolId use = stable_decl_named(module_interface, ctx.store.symbols.intern("use"));
+    assert(helper != qkey.StableSymbolId());
+    assert(use != qkey.StableSymbolId());
+    assert(module_interface.generic_templates.len() == 2);
+    assert(ctx.store.artifacts.load_generic_template(helper) != null);
+    assert(ctx.store.artifacts.load_generic_template(use) != null);
+}
+
+() assert_generic_param_declaration(
+    artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId param_stable,
+    qkey.StableSymbolId owner_stable
+) {
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+        if (declaration.stable_id == param_stable) {
+            assert(declaration.kind == .generic_param_def);
+            assert(declaration.owner$.some() == owner_stable);
+            return;
+        }
+        index = index + 1;
+    }
+    assert(false);
 }
 
 () check_import_summary_section_is_stable() {
@@ -757,16 +1131,16 @@ artifact.ImportSummary sample_import_summary(context.CompilerContext& ctx, UInt6
         "public Int answer() { return helper(); } Int helper() { return 1; }";
     UInt8[]& second_text =
         "public Int answer() { return helper(); } Int helper() { return 2; }";
-    qkey.Fingerprint128 first_hash = interface_hash_for_text("private_body_first", first_text);
-    qkey.Fingerprint128 second_hash = interface_hash_for_text("private_body_second", second_text);
+    qkey.Fingerprint128 first_hash = interface_hash_for_text("private_body", first_text);
+    qkey.Fingerprint128 second_hash = interface_hash_for_text("private_body", second_text);
     assert(first_hash == second_hash);
 }
 
 () check_public_signature_change_updates_interface_hash() {
     UInt8[]& first_text = "public Int answer(Int value) { return value; }";
     UInt8[]& second_text = "public Int answer(Bool value) { return 1; }";
-    qkey.Fingerprint128 first_hash = interface_hash_for_text("public_signature_first", first_text);
-    qkey.Fingerprint128 second_hash = interface_hash_for_text("public_signature_second", second_text);
+    qkey.Fingerprint128 first_hash = interface_hash_for_text("public_signature", first_text);
+    qkey.Fingerprint128 second_hash = interface_hash_for_text("public_signature", second_text);
     assert(first_hash != second_hash);
 }
 
@@ -781,6 +1155,7 @@ qkey.Fingerprint128 interface_hash_for_text(UInt8[]& name, UInt8[]& text) {
     module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
     module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(source_id);
     assert(resolver.lower_module_graph_to_hir(graph$.ref()));
+    resolver.finalize_module_graph_hir(graph$.ref());
     artifact.ModuleInterface& module_interface = ctx.store.artifacts.load_interface(source_id)$.some();
     return module_interface.interface_hash;
 }
@@ -937,122 +1312,14 @@ artifact.ModuleInterface ordered_interface(context.CompilerContext& ctx, Bool re
         module_states$.ref(),
         declaration_defs$.ref()
     );
-    module_graph.ModuleGraph^ graph = builder.build_module_graph_for_source(root_source);
+    qid.ModuleId root_module = builder.ensure_module(root_source);
+    store.ModuleRecord& root = ctx.store.resolve.module_ref(root_module);
+    module_graph.ModuleGraph^ graph =
+        new module_graph.ModuleGraph(root.package_id, root_module, true);
+    builder.discover_module_imports(graph$.ref(), root_module);
     assert(graph.module_count() == 2);
     assert(graph.edge_count() == 1);
-    qid.ModuleId root_module = ctx.store.resolve.module_for_source(root_source)$.some();
     qid.ModuleId dep_module = ctx.store.resolve.module_for_source(dep_source)$.some();
     assert(ctx.store.resolve.modules.get(root_module).imports.get(0).target_module$.some().to_index()
         == dep_module.to_index());
-}
-
-() check_interface_hit_lowers_without_ast() {
-    context.CompilerContext ctx! = context.CompilerContext();
-    syntax_store.Store asts! = syntax_store.Store();
-
-    UInt8[]& root_name = "interface_root";
-    UInt8[]& dep_name = "interface_dep";
-    source.SourceId root_source = ctx.store.sources.intern_virtual(root_name, source.content_hash(root_name));
-    source.SourceId dep_source = ctx.store.sources.intern_virtual(dep_name, source.content_hash(dep_name));
-    qid.SymbolId package_name = ctx.store.symbols.intern("__main_package");
-    qid.SymbolId root_symbol = ctx.store.symbols.intern(root_name);
-    qid.SymbolId dep_symbol = ctx.store.symbols.intern(dep_name);
-
-    artifact.ImportSummary root_summary = artifact.ImportSummary(
-        root_source,
-        ctx.store.sources.get(root_source).content_hash,
-        ctx.store.sources.get(root_source).revision,
-        package_name,
-        root_symbol,
-        root_symbol
-    );
-    root_summary.add_import(artifact.ImportSummaryEntry(
-        .package_import,
-        .private_visibility,
-        false,
-        dep_symbol,
-        null
-    ));
-    ctx.store.artifacts.store_import_summary(root_source, root_summary$.move());
-
-    artifact.ImportSummary dep_summary = artifact.ImportSummary(
-        dep_source,
-        ctx.store.sources.get(dep_source).content_hash,
-        ctx.store.sources.get(dep_source).revision,
-        package_name,
-        dep_symbol,
-        dep_symbol
-    );
-    ctx.store.artifacts.store_import_summary(dep_source, dep_summary$.move());
-
-    ctx.store.artifacts.store_interface(root_source, artifact.ModuleInterface(
-        root_source,
-        ctx.store.sources.get(root_source).content_hash,
-        package_name,
-        root_symbol
-    ));
-    ctx.store.artifacts.store_interface(dep_source, artifact.ModuleInterface(
-        dep_source,
-        ctx.store.sources.get(dep_source).content_hash,
-        package_name,
-        dep_symbol
-    ));
-
-    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
-    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(root_source);
-    assert(graph.module_count() == 2);
-    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
-}
-
-
-() check_interface_hit_skips_discovery_ast() {
-    context.CompilerContext ctx! = context.CompilerContext();
-    syntax_store.Store asts! = syntax_store.Store();
-
-    UInt8[]& root_name = "interface_root_with_ast_dep";
-    UInt8[]& dep_text = "Int broken() { missing_name }";
-    source.SourceId root_source = ctx.store.sources.intern_virtual(root_name, source.content_hash(root_name));
-    source.SourceId dep_source = ctx.store.sources.intern_virtual(dep_text, source.content_hash(dep_text));
-    qid.SymbolId package_name = ctx.store.symbols.intern("__main_package");
-    qid.SymbolId root_symbol = ctx.store.symbols.intern(root_name);
-    qid.SymbolId dep_symbol = ctx.store.symbols.intern(dep_text);
-
-    syntax.SyntaxResult parsed_dep = syntax.parse_source(ctx$.ref(), dep_text, dep_source);
-    assert(!parsed_dep.has_errors());
-    asts.set_unit(parsed_dep.take_unit(), ctx.store.sources.get(dep_source).revision);
-
-    artifact.ImportSummary root_summary = artifact.ImportSummary(
-        root_source,
-        ctx.store.sources.get(root_source).content_hash,
-        ctx.store.sources.get(root_source).revision,
-        package_name,
-        root_symbol,
-        root_symbol
-    );
-    root_summary.add_import(artifact.ImportSummaryEntry(
-        .package_import,
-        .private_visibility,
-        false,
-        dep_symbol,
-        null
-    ));
-    ctx.store.artifacts.store_import_summary(root_source, root_summary$.move());
-
-    ctx.store.artifacts.store_interface(root_source, artifact.ModuleInterface(
-        root_source,
-        ctx.store.sources.get(root_source).content_hash,
-        package_name,
-        root_symbol
-    ));
-    ctx.store.artifacts.store_interface(dep_source, artifact.ModuleInterface(
-        dep_source,
-        ctx.store.sources.get(dep_source).content_hash,
-        package_name,
-        dep_symbol
-    ));
-
-    module_resolver.ModuleResolver resolver = module_resolver.ModuleResolver(ctx$.ref(), asts$.ref());
-    module_graph.ModuleGraph^ graph = resolver.build_module_graph_for_source(root_source);
-    assert(graph.module_count() == 2);
-    assert(resolver.lower_module_graph_to_hir(graph$.ref()));
 }
