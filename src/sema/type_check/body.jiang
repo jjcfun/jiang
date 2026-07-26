@@ -5687,16 +5687,6 @@ public struct BodyCheck: Movable {
     () mark_call_lowering_plan(self, hir.HirId node_id, hir.HirCall call, qid.DefId selected_def) {
         if (self.call_is_trait_object_method(call, selected_def)) {
             self.state.results.mark_expr_lowering(node_id, .trait_object_method_call);
-            return;
-        }
-        if (!self.is_core_hash_method(selected_def)) {
-            return;
-        }
-        guard self.hash_receiver_node(call.callee) is .some(receiver) else {
-            return;
-        }
-        if (self.receiver_may_use_builtin_hash(self.check_node(receiver))) {
-            self.state.results.mark_expr_lowering(node_id, .builtin_primitive_hash);
         }
     }
 
@@ -5712,40 +5702,6 @@ public struct BodyCheck: Movable {
             return false;
         }
         return method_def.to_index() == selected_def.to_index();
-    }
-
-    Bool is_core_hash_method(self, qid.DefId function_def) {
-        guard self.state.store.resolve.core_traits.hashable_trait is .some(hashable_def) else {
-            return false;
-        }
-        guard self.state.store.defs.get(function_def).owner_def is .some(owner_def) else {
-            return false;
-        }
-        if (owner_def.to_index() != hashable_def.to_index()) {
-            return false;
-        }
-        qid.SymbolId symbol = self.state.store.defs.get(function_def).name.symbol;
-        return string.equal(self.state.store.symbols.text(symbol), "hash");
-    }
-
-    hir.HirId? hash_receiver_node(self, hir.HirId callee_id) {
-        hir.HirNode callee = self.state.hirs.node(callee_id);
-        if (callee.data is .member_access(member_access)) {
-            return member_access.base;
-        }
-        return null;
-    }
-
-    Bool type_has_builtin_primitive_hash(self, qid.TypeId type_id) {
-        types.TypeInfo info = self.state.store.types.get(type_id);
-        if (info.data is .bool_type) { return true; }
-        if (info.data is .char_type) { return true; }
-        if (info.data is .int_type(_)) { return true; }
-        return info.data is .float_type(_);
-    }
-
-    Bool receiver_may_use_builtin_hash(self, qid.TypeId type_id) {
-        return self.type_has_builtin_primitive_hash(type_id);
     }
 
     () complete_call_type_args(self,
@@ -5937,14 +5893,37 @@ public struct BodyCheck: Movable {
         guard self.trait_owner_for_def(function_def) is .some(trait_def) else {
             return function_def;
         }
+        if (self.trait_method_has_body(function_def)) {
+            return function_def;
+        }
         guard self.concrete_static_receiver_def(call.callee) is .some(receiver_def) else {
             return function_def;
         }
-        qid.SymbolId member_symbol = self.state.store.defs.get(function_def).name.symbol;
-        if (self.member_def_by_symbol(receiver_def, member_symbol) is .some(member_def)) {
+        if (self.member_def_for_trait_member(receiver_def, function_def) is .some(member_def)) {
             return member_def;
         }
         return function_def;
+    }
+
+    Bool trait_method_has_body(self, qid.DefId method_def) {
+        guard self.state.hirs.def(method_def) is .some(method_hir) else { return false; }
+        return method_hir.body != null;
+    }
+
+    qid.DefId? member_def_for_trait_member(self, qid.DefId owner_def, qid.DefId trait_member) {
+        guard self.state.hirs.def(owner_def) is .some(owner_hir) else { return null; }
+        Int index! = 0;
+        while (index < owner_hir.members.len()) {
+            qid.DefId member_def = owner_hir.members.get(index);
+            def.DefRecord record = self.state.store.defs.get(member_def);
+            if (record.associated_trait_member is .some(implemented_member)) {
+                if (implemented_member == trait_member) {
+                    return member_def;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     qid.DefId? concrete_static_receiver_def(self, hir.HirId callee_id) {
@@ -5991,6 +5970,7 @@ public struct BodyCheck: Movable {
         }
         qid.DefId selected! = initial_def;
         Int matches! = 0;
+        Int best_score! = -1;
         table.MultiTableCursor cursor! = self.state.store.resolve.first_binding_cursor(
             initial.decl_namespace_id,
             initial.name.symbol,
@@ -5998,15 +5978,38 @@ public struct BodyCheck: Movable {
         );
         while (cursor.valid()) {
             namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
-            if (
-                self.type_ops.def_accessible_from(binding.def_id, node_id.owner_def)
-                && self.call_candidate_specific_enough(binding.def_id, initial_def)
-                && self.call_candidate_matches(call, binding.def_id, type_args)
-            ) {
+            Int score! = -1;
+            if (self.type_ops.def_accessible_from(binding.def_id, node_id.owner_def)
+                && self.call_candidate_specific_enough(binding.def_id, initial_def)) {
+                score = self.call_candidate_score(call, binding.def_id, type_args);
+            }
+            if (score > best_score) {
                 selected = binding.def_id;
+                matches = 1;
+                best_score = score;
+            } else if (score >= 0 && score == best_score) {
                 matches = matches + 1;
             }
             cursor = self.state.store.resolve.next_binding_cursor(cursor);
+        }
+        if (matches == 0 && self.trait_call_overload_member(call) is .some(trait_member)) {
+            cursor = self.state.store.resolve.first_binding_cursor(
+                self.state.store.defs.get(trait_member).decl_namespace_id,
+                initial.name.symbol,
+                initial.domain
+            );
+            while (cursor.valid()) {
+                namespace.BindingEntry binding = self.state.store.resolve.binding_at(cursor);
+                Int score = self.call_candidate_score(call, binding.def_id, type_args);
+                if (score > best_score) {
+                    selected = binding.def_id;
+                    matches = 1;
+                    best_score = score;
+                } else if (score >= 0 && score == best_score) {
+                    matches = matches + 1;
+                }
+                cursor = self.state.store.resolve.next_binding_cursor(cursor);
+            }
         }
         if (matches == 1) {
             return selected;
@@ -6016,6 +6019,13 @@ public struct BodyCheck: Movable {
             return null;
         }
         return initial_def;
+    }
+
+    qid.DefId? trait_call_overload_member(self, hir.HirCall call) {
+        hir.HirNode callee = self.state.hirs.node(call.callee);
+        guard callee.data is .member_access(member) else { return null; }
+        qid.TypeId base_type = self.member_lookup_type(self.raw_member_base_type(member.base));
+        return self.type_ops.trait_overload_member_for_type(base_type, member.member_symbol);
     }
 
     Bool call_candidate_specific_enough(self, qid.DefId candidate_def, qid.DefId selected_def) {
@@ -6045,25 +6055,25 @@ public struct BodyCheck: Movable {
         return false;
     }
 
-    Bool call_candidate_matches(self,
+    Int call_candidate_score(self,
         hir.HirCall call,
         qid.DefId candidate_def,
         list.ArrayList<qid.TypeId>& type_args
     ) {
-        if (!self.call_extension_candidate_visible(call, candidate_def)) { return false; }
+        if (!self.call_extension_candidate_visible(call, candidate_def)) { return -1; }
         def.DefKind kind = self.state.store.defs.get(candidate_def).kind;
         if (!self.overloadable_call_kind(kind)) {
-            return false;
+            return -1;
         }
-        guard self.function_signature_for_def(candidate_def) is .some(signature) else { return false; }
+        guard self.function_signature_for_def(candidate_def) is .some(signature) else { return -1; }
         qid.TypeId candidate_type = self.type_ops.type_for_def(candidate_def);
         types.TypeInfo candidate_info = self.state.store.types.get(candidate_type);
-        guard candidate_info.data is .function_type(function_type) else { return false; }
+        guard candidate_info.data is .function_type(function_type) else { return -1; }
         list.ArrayList<hir.HirId> values! = self.empty_argument_values(signature);
         if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false, true)) {
-            return false;
+            return -1;
         }
-        return self.call_args_match_candidate_types(call, candidate_def, type_args, function_type, values$.ref());
+        return self.call_args_candidate_score(call, candidate_def, type_args, function_type, values$.ref());
     }
 
     Bool call_extension_candidate_visible(self, hir.HirCall call, qid.DefId candidate_def) {
@@ -6077,7 +6087,7 @@ public struct BodyCheck: Movable {
         );
     }
 
-    Bool call_args_match_candidate_types(self,
+    Int call_args_candidate_score(self,
         hir.HirCall call,
         qid.DefId candidate_def,
         list.ArrayList<qid.TypeId>& type_args,
@@ -6086,6 +6096,7 @@ public struct BodyCheck: Movable {
     ) {
         Int param_offset = self.call_param_offset(candidate_def);
         Int index! = 0;
+        Int score! = 0;
         while (index < values.len()) {
             qid.TypeId param_type = function_type.params[index + param_offset];
             qid.TypeId expected = self.substituted_call_param_type_for_def(
@@ -6097,14 +6108,33 @@ public struct BodyCheck: Movable {
             );
             hir.HirId value = values.get(index);
             guard self.candidate_arg_type(value, expected) is .some(value_type) else {
-                return false;
+                return -1;
             }
             if (!self.type_ops.value_assignable_to_expected(expected, value, value_type)) {
-                return false;
+                return -1;
             }
+            score = score + self.call_argument_score(value, expected, value_type);
             index = index + 1;
         }
-        return true;
+        return score;
+    }
+
+    Int call_argument_score(self, hir.HirId value, qid.TypeId expected, qid.TypeId actual) {
+        hir.HirNode node = self.state.hirs.node(value);
+        if (node.data is .literal(literal)) {
+            if (literal.value is .int_value(_)
+                && self.type_ops.same_type_ignoring_mutability(expected, self.state.store.types.int_type())) {
+                return 4;
+            }
+            if (literal.value is .float_value(_)
+                && self.type_ops.same_type_ignoring_mutability(expected, self.state.store.types.float_type())) {
+                return 4;
+            }
+        }
+        if (self.type_ops.same_type_ignoring_mutability(expected, actual)) {
+            return 2;
+        }
+        return 1;
     }
 
     qid.TypeId? candidate_arg_type(self, hir.HirId value, qid.TypeId expected) {
