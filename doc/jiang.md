@@ -794,8 +794,7 @@ add(10, extra: 20);
 ```c
 Int[_] list = [5, 3, 4, 1, 2];
 
-sort(list, (left, right) => left < right);
-sort(list, (Int left, Int right) => left < right);
+sort(list) { left, right => left < right };
 ```
 
 #### 函数签名
@@ -937,26 +936,26 @@ RawFn<Int, Int, Int> sum = add;
 示例 6：lambda 表达式
 
 ```c
-RawFn<Int, Int> inc = (value) => value + 1;
-RawFn<Int, Int, Int> add = (left, right) => left + right;
-RawFn<Int> answer = () => 42;
+RawFn<Int, Int> inc = { value => value + 1 };
+RawFn<Int, Int, Int> add = { left, right => left + right };
+RawFn<Int> answer = { => 42 };
 
 Int base = 10;
-Fn<Int, Int> add_base = (value) [_ captured = base] => value + captured;
-Fn<Int> borrowed = () [ref _ value = base] => value$.get();
-Fn<Int>^ owned = new () [_ captured = base] => captured;
+Fn<Int, Int> add_base = { [_ captured = base] value => value + captured };
+Fn<Int> borrowed = { [ref _ value = base] => value$.get() };
+Fn<Int>^ owned = new { [_ captured = base] => captured };
 ```
 
 lambda 规则：
 
-- 参数列表必须写 `(...)`
+- lambda 使用 `{ [captures] args => body }`
 - 参数只写 binding name；完整 expected `RawFn<...>` / `Fn<...>` 类型提供参数和 result 类型
-- 单参数也必须写括号，例如 `(x) => x`
-- 无参数写 `() => expr`
-- body 可以是表达式或 block
+- 单参数写作 `{ x => x }`
+- 无参数写作 `{ => expr }`
+- `=>` 后可以写表达式或多条 block statement
 - `RawFn` 不携带 environment，因此只接受非捕获 lambda
 - `Fn` 是 callable view，可以捕获外层 local；`Fn^` 是可移动的 owned heap closure
-- 可选 capture list 写在参数列表后，值 capture 遵守 copy/move，`ref` / `ref!` capture 遵守 borrow/lifetime
+- 可选 capture list 写在参数之前，值 capture 遵守 copy/move，`ref` / `ref!` capture 遵守 borrow/lifetime
 - 未列入 capture list 的外层 local 仍按默认捕获规则处理
 
 当前不支持：
@@ -999,7 +998,7 @@ RawFn<async Bool[]&> load_callbacks;
 effect 均由该类型决定，lambda 表达式本身不重复书写：
 
 ```jiang
-Fn<async [UiDomain] Int, Int> load = (id) => fetch(id);
+Fn<async [UiDomain] Int, Int> load = { id => fetch(id) };
 ```
 
 async `Fn` / `RawFn` 动态调用复用普通 async 函数的 Domain 切换。跨 Domain 的参数、result 和 capture
@@ -1040,21 +1039,22 @@ Int main() {
 }
 ```
 
-需要并发启动调用时，在调用前写 `async`，得到地址固定的 `Task<T>`。Task 是 eager 的，创建后
+需要并发启动调用时，使用 Task initializer 得到地址固定的 `Task<T>`。Task 是 eager 的，创建后
 立即开始执行；依次调用 `await()` 不会把启动过程串行化：
 
 ```c
 async Int load_both() {
-    Task<Int> left = async load_left();
-    Task<Int> right = async load_right();
+    Task<Int> left = Task { load_left() };
+    Task<Int> right = Task { load_right() };
     left.await() + right.await()
 }
 ```
 
-`async { ... }` 创建 block Task；`async [WorkerDomain] { ... }` 同时指定 execution domain。
-async/sync block 使用最后一个表达式作为结果，不支持显式 `return`；`return` 只用于普通或 async 函数体。
+`Task { ... }` 继承 current domain；`Task(domain: WorkerDomain) { ... }` 显式指定
+execution domain。Task closure 和 sync block 使用最后一个表达式作为结果，不支持显式
+`return`；`return` 只用于普通或 async 函数体。
 直接 `Task<T>` 是 `!Movable` 原地值，可以直接作为 struct、tuple 或固定数组中的静态字段；包含它的
-聚合值同样不可移动、按值传参、返回或捕获。`new async { ... }` 创建可移动、非 Copyable 的
+聚合值同样不可移动、按值传参、返回或捕获。`new Task { ... }` 创建可移动、非 Copyable 的
 `Task<T>^` owner。owner 可以按值传参、返回、存入字段、容器和泛型实例；Task 的公开类型不包含 execution
 domain。`task.await()` 消费一次 result，重复消费会被诊断。`task.cancel()` 只同步、幂等地发布请求，
 不等待也不消费 result；`task.cancel_and_await()` 发布请求并等待退出。若 Task 正在等待显式 child
@@ -1096,20 +1096,20 @@ struct State: Movable {
 }
 
 Mutex<State> state = Mutex<State>(State(count: 0));
-Int count = state.with_lock((value) => {
+Int count = state.with_lock { value =>
     value.count = value.count + 1;
     value.count
-});
+};
 ```
 
 callback 是普通同步 `Fn`，不能在持锁期间 `await`；它的返回值也不能携带从 `value` 派生的引用。
 `Mutex<T>` 是 `!Movable`，正常 `return`、`throw` 和 cleanup 都会通过内部 RAII lock 自动解锁。
 当前 Mutex 不提供 poison 状态；不可恢复的进程终止没有可供后续持锁者观察的恢复阶段。
 
-需要 detached 执行时，直接把 async block 作为语句启动，不形成 Task handle：
+需要 detached 执行时，直接把 Task initializer 作为语句启动，不形成 Task handle：
 
 ```c
-async [WorkerDomain] {
+Task(domain: WorkerDomain) {
     refresh_cache()
 };
 ```

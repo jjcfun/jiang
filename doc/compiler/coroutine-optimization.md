@@ -32,7 +32,7 @@ scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
 
 ## 语义基础：Task 是结构化子任务
 
-直接 `Task<T>` 是地址稳定的 `!Movable` 结构化子任务；`new async` 在 heap 上原地初始化相同布局，
+直接 `Task<T>` 是地址稳定的 `!Movable` 结构化子任务；`new Task` 在 heap 上原地初始化相同布局，
 并返回可移动、非 Copyable 的 `Task<T>^` owner。TaskState 是 Task 的唯一内联字段，不存在独立
 control block。两种形态共享完成、等待与取消状态机：
 
@@ -43,7 +43,8 @@ control block。两种形态共享完成、等待与取消状态机：
   编译器先请求取消，再等待完成。
 - 同一退出路径有多个活跃 Task 时，先向全部 Task 发出取消，再逐个 join，不能串行执行
   `cancel + join`。
-- standalone `async { ... }` 是显式 detached 入口。丢弃直接 Task 不表达 detach；丢弃 `Task<T>^`
+- standalone `Task { ... };` 是显式 detached 入口。丢弃已绑定的直接 Task 不表达 detach；
+  丢弃 `Task<T>^`
   owner 不阻塞、也不隐式取消，由 owner/coroutine 双方交接回收 heap Task。
 - 禁止对 Task 使用 `forget`，否则结构化生命周期无法成立。
 
@@ -182,17 +183,17 @@ fallback 也不能创建 Task control state 或独立 resume token。
 
 ### Heap Task owner
 
-`new async { ... }` 直接在 heap allocation 中初始化 `Task<T>`，并返回 `Task<T>^`。owner pointer
+`new Task { ... }` 直接在 heap allocation 中初始化 `Task<T>`，并返回 `Task<T>^`。owner pointer
 可以按值传参、返回、存入字段、数组和泛型实例，而 TaskState 与 coroutine frame 的地址保持稳定。
 heap Task 不使用通用引用计数：owner 和 coroutine 各持有固定的一方 lifetime 状态，最后离开的一方
 回收 result、frame 和 Task allocation。owner 析构不能在 serial Domain 上阻塞等待，也不能隐式取消。
-当前 `new async` 始终采用这个 heap baseline。直接 `Task<T>` 已由类型规则证明不逃逸并使用 parent-local
+当前 `new Task` 始终采用这个 heap baseline。直接 `Task<T>` 已由类型规则证明不逃逸并使用 parent-local
 storage，不需要再做事后 escape analysis；只有分配 benchmark 证明有必要时，才考虑对未逃逸
 `Task<T>^` 做不改变地址、生命周期和 `new` 可观察语义的 as-if stack promotion。
 
 ### Detached coroutine
 
-standalone async 没有结构化 parent owner：
+standalone Task initializer 没有结构化 parent owner：
 
 - frame 使用 self-owned heap storage。
 - 不创建带 result/waiter 的完整 TaskState。
@@ -380,7 +381,7 @@ escaping                    // external/dynamic/冲突 binding，不能去原子
 
 递归 SCC 从 `unconstrained` 开始，遇到跨 executor、external、dynamic 或不一致的 binding 约束后
 单调下降。显式 Domain 函数会用自己的 binding 消去相同约束；不同约束直接变为 `escaping`。
-这使 `async same_domain_child()` wrapper 可在同 binding 调用点专门化，同时不会把跨 binding wrapper
+这使 `Task { same_domain_child() }` wrapper 可在同 binding 调用点专门化，同时不会把跨 binding wrapper
 误判为本地执行。
 
 同一固定点还计算独立的传递 `may_defer` 位。它回答的不是源码中是否出现 `async`，
@@ -497,7 +498,7 @@ Task cleanup CFG 必须先于 coroutine suspend-point collection 和 frame liven
    这一步即使暂时保留 heap allocation 也必须成立。
 3. 已完成：增加 TaskRegion analysis 和 storage plan，让 scoped Task control state 与静态 child frame
    进入父 frame。
-4. 已完成：普通 async、async block、async Fn/RawFn 统一消费 storage plan；递归回边使用 heap frame +
+4. 已完成：普通 async、Task initializer、async Fn/RawFn 统一消费 storage plan；递归回边使用 heap frame +
    Job handoff，静态 immutable async lambda 已去虚化，动态 frame 接入 coroutine allocator。
 5. 已完成：删除 scoped ownership CAS、allocation pointer、result-drop 函数指针、
    result-initialized 原子字、通用 external continuation 和固定 cancel-handler payload；waiter 协议已合并

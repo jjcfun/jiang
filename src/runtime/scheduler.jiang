@@ -119,22 +119,34 @@ public () handoff(
         return;
     }
     UInt8* task = unsafe { raw_task$.as(UInt8*) };
-    if (target_can_inline(task, executor, context, true)) {
-        while (true) {
-            atomic.Atomic<Int>& state = atomic_word(task, schedule_state_word);
-            Int observed = state.get();
-            if (schedule_kind(observed) != schedule_idle) { break; }
-            Int running = schedule_next(observed, schedule_running);
-            if (!state.compare_exchange(observed, running)) { continue; }
-            store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
-            invoke_resume(resume, context);
-            return;
-        }
-    }
+    if (try_inline_handoff(task, executor, context, resume)) { return; }
     Int publishing = claim_handoff(task);
     if (publishing < 0) { return; }
     publish_target(task, executor, context, resume);
     schedule_published(task, publishing, true);
+}
+
+Bool try_inline_handoff(UInt8* task, Void* executor, Void* context, Void* resume) {
+    if (!target_can_inline(task, executor, context, true)) { return false; }
+    if (!domain_executor.try_enter_inline(executor)) { return false; }
+    Bool invoked = claim_inline_handoff(task);
+    if (invoked) {
+        store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
+        invoke_resume(resume, context);
+    }
+    leave_and_drain_inline(executor);
+    return invoked;
+}
+
+Bool claim_inline_handoff(UInt8* task) {
+    atomic.Atomic<Int>& state = atomic_word(task, schedule_state_word);
+    while (true) {
+        Int observed = state.get();
+        if (schedule_kind(observed) != schedule_idle) { return false; }
+        Int running = schedule_next(observed, schedule_running);
+        if (state.compare_exchange(observed, running)) { return true; }
+    }
+    return false;
 }
 
 @link_symbol("__jiang_runtime_task_suspend")
@@ -477,10 +489,17 @@ Int claim_handoff(UInt8* task) {
     Void* context = load_pointer(task, schedule_context_word);
     Void* resume = load_pointer(task, schedule_resume_word);
     atomic.Atomic<Int>& state = atomic_word(task, schedule_state_word);
-    if (target_can_inline(task, executor, context, handoff)) {
+    Bool can_inline = target_can_inline(task, executor, context, handoff);
+    if (can_inline && domain_executor.try_enter_inline(executor)) {
         assert(state.compare_exchange(expected, schedule_as(expected, schedule_running)));
         store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
         invoke_resume(resume, context);
+        leave_and_drain_inline(executor);
+        return;
+    }
+    if (can_inline && domain_executor.defer_inline(executor, context, resume)) {
+        assert(state.compare_exchange(expected, schedule_as(expected, schedule_running)));
+        store_word(task, schedule_active_executor_word, unsafe { executor$.as(Int) });
         return;
     }
     assert(state.compare_exchange(expected, schedule_as(expected, schedule_queued)));
@@ -504,10 +523,14 @@ Bool target_can_inline(UInt8* task, Void* executor, Void* context, Bool handoff)
         invoke_resume(resume, context);
         return;
     }
-    if (!domain_executor.is_concurrent(executor)
-        && domain_executor.can_inline(executor, context)
-    ) {
+    Bool can_inline = !domain_executor.is_concurrent(executor)
+        && domain_executor.can_inline(executor, context);
+    if (can_inline && domain_executor.try_enter_inline(executor)) {
         invoke_resume(resume, context);
+        leave_and_drain_inline(executor);
+        return;
+    }
+    if (can_inline && domain_executor.defer_inline(executor, context, resume)) {
         return;
     }
     assert(thread.enqueue(
@@ -546,6 +569,15 @@ Bool target_can_inline(UInt8* task, Void* executor, Void* context, Bool handoff)
 () invoke_resume(Void* resume, Void* context) {
     RawFn<(), Void*> function = unsafe { resume$.as(RawFn<(), Void*>) };
     function(context);
+}
+
+() leave_and_drain_inline(Void* executor) {
+    if (!domain_executor.leave_inline(executor)) { return; }
+    while (domain_executor.take_deferred_inline(executor) is .some(target)) {
+        assert(domain_executor.try_enter_inline(executor));
+        invoke_resume(target.resume, target.context);
+        assert(domain_executor.leave_inline(executor));
+    }
 }
 
 () publish_target(UInt8* task, Void* executor, Void* context, Void* resume) {

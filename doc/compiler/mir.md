@@ -146,8 +146,8 @@ MIR lowering 接收 `MonomorphStore`。非泛型函数按 `DefId` 直接 lower�
 
 async source function 的普通 MIR body 只作为 coroutine pass 的输入，不直接生成源码形状的
 backend function。backend 生成 `_Resume(frame)` 和 `_Complete(context)`；普通隐式 await 直接把
-child frame 连接到 caller continuation。`async call` 和 observed `async {}` 显式 materialize
-`Task<T>`；直接作为语句使用的 async block 生成 detached start。
+child frame 连接到 caller continuation。observed `Task { ... }` 显式 materialize `Task<T>`；
+直接作为语句使用的 Task initializer 生成 detached start。
 
 所有非 external 的 async source 都进入同一套 resume lowering：standard `_Resume(frame)` 共享 frame
 state dispatch、suspend 边界和取消检查。confined 变体只改写已证明 executor-local 的协议操作，RTC
@@ -191,7 +191,7 @@ lambda receiver/env 是合成 local，而且未跨 suspend 的参数可能没有
 `MirCoroutineFrameFreeRvalue`。LLVM 将二者分别降低为
 `__jiang_runtime_coroutine_frame_alloc(executor, size, alignment)` 和对应 free。它们与普通 Box
 alloc/free 分离，保证 coroutine placement policy 可以变化而不污染语言级 heap allocation。
-recursive backedge 和 detached async block 复用同一 ABI。serial executor 的热路径使用无锁、
+recursive backedge 和 detached Task initializer 复用同一 ABI。serial executor 的热路径使用无锁、
 无原子的 executor-local size-class freelist；跨 executor 和 concurrent 路径使用 system provider
 隐藏的 ABA-safe shared pool，MIR 和 runtime 均不依赖平台原子队列的具体布局。
 
@@ -248,7 +248,7 @@ single-consumer operation，MIR 的 `TaskConsume` 与 borrow check 会诊断不�
 `cancel_and_await()` 只释放目标 Task 并继续 caller。
 
 0.4.8 将直接 `Task<T>` 固定为地址稳定的结构化子任务，并将 TaskState 作为 Task 的唯一内联字段。
-`new async` 在 heap 上直接初始化同一布局，所得 `Task<T>^` owner 可以传参、返回和存入聚合。
+`new Task` 在 heap 上直接初始化同一布局，所得 `Task<T>^` owner 可以传参、返回和存入聚合。
 HIR -> MIR lowering 在每条 scope exit、return、
 throw 和 parent cancellation 路径上生成 cancel-all-then-join CFG：先向全部未消费 Task 发出取消，
 再逐个生成可挂起 join，最后才进入普通 local drop。cancellation entry 在 BodyLowerer 内生成，因此

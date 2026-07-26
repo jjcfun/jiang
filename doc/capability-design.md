@@ -108,7 +108,7 @@ sync [UiDomain] {
 callee body，参数按跨入 `D` 的规则检查；返回后 caller continuation 回到原 current domain。
 因此这类函数可以避免整个 body 再包一层 `sync [D] {}`。
 
-`async` / `sync` block 可以带 domain。最外层进入异步运行时必须显式写 domain：
+`Task` initializer 与 `sync` block 可以带 domain。最外层进入异步运行时必须显式写 domain：
 
 ```jiang
 import app_runtime;
@@ -118,41 +118,27 @@ sync [app_runtime.UiDomain] {
 }
 ```
 
-如果一个 keyword 后续还有多个 option，可以用带 key 的形式：
+Task initializer 使用命名参数选择 execution domain：
 
 ```jiang
-async [domain: app_runtime.UiDomain] {
+Task(domain: app_runtime.UiDomain) {
     load_data();
-}
+};
 ```
 
-只有外层已有 current domain 时，内层 `async {}` / `sync {}` 才能省略 domain，并继承 current：
+只有外层已有 current domain 时，内层 `Task { ... }` / `sync { ... }` 才能省略 domain，
+并继承 current：
 
 ```jiang
 sync [UiDomain] {
-    Task<Int> a = async { load_data() }; // 继承 UiDomain
-    Task<Int> b = async { load_data() }; // 继承 UiDomain
+    Task<Int> a = Task { load_data() }; // 继承 UiDomain
+    Task<Int> b = Task { load_data() }; // 继承 UiDomain
     a.await() + b.await()
 }
 ```
 
-普通函数中直接写无 domain 的 `sync {}` 或 `async {}` 应诊断，因为普通函数没有 current domain。
-
-`async` / `sync` block 后续可以带运行时 context：
-
-```jiang
-async [PageDomain, page_ctx] {
-    load(model$.ref());
-}
-
-async [domain: PageDomain, context: page_ctx] {
-    load(model$.ref());
-}
-```
-
-这里 `PageDomain` 是编译期可见的静态 domain type，用于 data race 检查；`page_ctx` 是后续版本
-预留的运行时 async context，可用于调度、取消、页面生命周期或 tracing。当前版本尚不开放
-`context` option；它不参与 domain 静态相等判断，也不能替代 domain。
+普通函数中直接写无 domain 的 `sync {}` 或 `Task { ... }` 应诊断，因为普通函数没有 current domain。
+Task initializer 当前只公开 `domain` 命名参数；runtime context 不是用户语法。
 
 函数类型沿用第一个类型参数作为 callable signature head：
 
@@ -169,7 +155,7 @@ RawFn<unsafe async [UiDomain] Result<Int, Error>, Void*>
 lambda 的 effect 完全由 expected callable type 决定，表达式本身不重复书写 `async`：
 
 ```jiang
-Fn<async [UiDomain] Int, Int> load = (id) => fetch(id);
+Fn<async [UiDomain] Int, Int> load = { id => fetch(id) };
 ```
 
 当前最小实现要求调用点已在 `UiDomain` 中；跨 Domain 的 async `Fn` 动态调用留待后续调度
@@ -201,7 +187,7 @@ Int main() {
 }
 ```
 
-在已有 current domain 的 async/sync block 或 async 调用链中，普通函数调用不切 domain，
+在已有 current domain 的 Task/sync block 或 async 调用链中，普通函数调用不切 domain，
 只是当前 coroutine 内的同步片段。普通函数没有 hidden domain/context 参数。
 
 domain-neutral `async` 函数不绑定 domain；调用点必须已经有 current domain，coroutine frame
@@ -260,9 +246,9 @@ domain：
 
 ```jiang
 sync [UiDomain] {
-    async [WorkerPoolDomain] {
+    Task(domain: WorkerPoolDomain) {
         update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain
-    }
+    };
 }
 ```
 
@@ -295,8 +281,8 @@ async () foo(T&! x) {
 - domain-neutral async 函数调用不切 domain；callee 在 caller 的 current domain 中挂起/恢复。
 - domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
   current domain。
-- `async {}` / `sync {}` 只有外层已有 current domain 时可省略 domain，并继承 current。
-- `async [D] {}` 创建 task，是显式 domain 入口；如果 domain type `D` 不等于 current，
+- `Task { ... }` / `sync { ... }` 只有外层已有 current domain 时可省略 domain，并继承 current。
+- `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果 domain type `D` 不等于 current，
   则是 domain 切换边界。
 - 普通同步函数中的最外层 `sync [D] {}` 阻塞调用线程，进入 runtime 并等待 block 完成。
 - async context 中的 `sync [D] {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
@@ -333,21 +319,22 @@ async Int render() {
 }
 ```
 
-需要并发启动而不等待结果时，使用 `async call` 或 async block：
+需要并发启动而不等待结果时，使用 Task initializer：
 
 ```jiang
-Task<Int> a = async load_a();
-Task<Int> b = async load_b();
+Task<Int> a = Task { load_a() };
+Task<Int> b = Task { load_b() };
 
 a.await() + b.await()
 ```
 
-`async load_a()` 阻止普通 `load_a()` 调用的隐式 await，并返回地址稳定的 `Task<Int>`。
+Task closure 内的 `load_a()` 是普通隐式 await；initializer 立即启动该 closure，并返回地址稳定的
+`Task<Int>`。
 `Task.await()` 消费一个 Task；多个 Task 提前启动后，即使按顺序调用 `await()`，仍保持并发执行：
 
 ```jiang
-Task<Int> a = async load_a();
-Task<Int> b = async load_b();
+Task<Int> a = Task { load_a() };
+Task<Int> b = Task { load_b() };
 
 a.await() + b.await()
 ```
@@ -355,13 +342,13 @@ a.await() + b.await()
 Jiang 不提供 `await expr` 或隐式多 Task barrier。需要等待多个 Task 时，分别调用 `await()`；已完成
 Task 走 ready fast path，未完成 Task 才挂起当前 coroutine。
 
-`async {}` / `async [D] {}` 可创建一个显式 block task，用于需要自定义 task body 或显式
-domain 边界的场景：
+`Task { ... }` / `Task(domain: D) { ... }` 创建显式 task，用于自定义 task body 或显式
+domain 边界：
 
 ```jiang
-let task = async {
+Task<Int> task = Task {
     load_page()
-}
+};
 ```
 
 Jiang 的 task 语义是 eager、single-completion、cached result、single-consumer：
@@ -372,7 +359,7 @@ Jiang 的 task 语义是 eager、single-completion、cached result、single-cons
 - coroutine 是无栈协程；task 保存的是编译器生成的 coroutine frame，不保存独立调用栈。
 - 如果 body 返回 `Result<T, E>`，task 缓存的就是这个 `Result<T, E>` 值；Jiang 不引入隐藏
   exception channel。
-- task result type 不能是 task；`async { ... }` / `async [D] { ... }` 不允许产生
+- task result type 不能是 task；`Task { ... }` / `Task(domain: D) { ... }` 不允许产生
   nested task。实现上可以用 `@where` 风格的内部 type predicate 禁止 `Task<Task<T>>`。
 - `await()` 和 `cancel_and_await()` 消费一次 result；第二个消费位置会被诊断。
 - `cancel()` 只同步、幂等地发布请求，不消费 result，也不等待 Task 退出；取消后仍可 `await()`。
@@ -380,28 +367,28 @@ Jiang 的 task 语义是 eager、single-completion、cached result、single-cons
 因此这里是合法的：
 
 ```jiang
-let task = async [PageDomain] {
+Task<Int> task = Task(domain: PageDomain) {
     load_page() // body type: Int
-}
+};
 ```
 
 但这里应诊断：
 
 ```jiang
-let nested = async [PageDomain] {
-    async [PageDomain] {
+Task<Task<Int>> nested = Task(domain: PageDomain) {
+    Task(domain: PageDomain) {
         load_page()
     }
-}
+};
 ```
 
-用户可以在局部变量或静态可寻址的聚合字段中写直接 `Task<T>`，也可以用 `new async` 创建
+用户可以在局部变量或静态可寻址的聚合字段中写直接 `Task<T>`，也可以用 `new Task` 创建
 `Task<T>^` owner。Task 的
 公开类型不包含 domain 参数；domain 只保存在创建点和 runtime state 中：
 
 ```jiang
-Task<Int> task = async [PageDomain] { load_page() };
-Task<Int>^ owned = new async [PageDomain] { load_page() };
+Task<Int> task = Task(domain: PageDomain) { load_page() };
+Task<Int>^ owned = new Task(domain: PageDomain) { load_page() };
 ```
 
 直接 `Task<T>` 是 `!Movable`，包含它的聚合值也不能移动、按值传参或返回。直接 Task 字段目前只支持
@@ -411,7 +398,7 @@ owner，可以出现在参数、返回值、字段、容器、泛型实例和 pu
 
 ```jiang
 Task<Int>^ make_task() {
-    new async [PageDomain] { load_page() }
+    new Task(domain: PageDomain) { load_page() }
 }
 ```
 
@@ -426,25 +413,25 @@ domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
 
 ```jiang
 sync [UiDomain] {
-    Task<Image> image = async [WorkerPoolDomain] { load_image() };
+    Task<Image> image = Task(domain: WorkerPoolDomain) { load_image() };
     Image value = image.await(); // allowed: Task 没有被嵌套 effect block 捕获
 }
 ```
 
 ```jiang
-Task<Image> image = async [WorkerPoolDomain] { load_image() };
-async [UiDomain] {
+Task<Image> image = Task(domain: WorkerPoolDomain) { load_image() };
+Task(domain: UiDomain) {
     image.await() // error: task_capture_not_allowed
-}
+};
 ```
 
-普通 `T&!` 不能被捕获到不同 domain。`async [D] {}` 是严格 domain 切换边界：
+普通 `T&!` 不能被捕获到不同 domain。`Task(domain: D) { ... }` 是严格 domain 切换边界：
 
 ```jiang
 sync [UiDomain] {
-    async [WorkerPoolDomain] {
+    Task(domain: WorkerPoolDomain) {
         update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain task
-    }
+    };
 }
 ```
 
@@ -465,7 +452,7 @@ caller，因此适合“停止这一项工作后继续执行”的路径。
 
 直接 Task 是结构化子任务：未 `await()` 或 `cancel_and_await()` 的 Task 离开作用域时，
 编译器先向同一退出路径上的全部活跃 Task 请求取消，再逐个等待终态。需要 detached 执行时使用
-不形成 Task handle 的 standalone async block；直接 Task 固定在创建它的 place 上，不支持
+不形成 Task handle 的 standalone Task initializer；直接 Task 固定在创建它的 place 上，不支持
 `move()`、`forget()` 或重新赋值。
 
 0.4.8 当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占
@@ -478,14 +465,15 @@ unwind，再恢复 parent；根 Task 负责唯一的 request claim。
 
 ```jiang
 async Response send(Request& request) {
-    coroutine.suspend((continuation) => {
-        Operation operation = request.start((response) => {
+    coroutine.suspend { continuation =>
+        Operation operation = request.start { response =>
             continuation.resume(response);
-        });
-        continuation.on_cancel(() [_ operation] => {
+        };
+        continuation.on_cancel {
+            [_ operation] =>
             operation.cancel();
-        });
-    })
+        };
+    }
 }
 ```
 

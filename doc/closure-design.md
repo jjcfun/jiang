@@ -71,7 +71,7 @@ callable vtable 至少包含：
 普通 `Fn` 的 receiver 指向当前栈帧或当前 aggregate 内的匿名 closure object，因此 `Fn<...>` 不能
 返回、保存到 heap/global，也不能写入可能比当前函数更久的外部位置。
 
-`Fn<...>^` 是 owned closure handle。`new () [captures] => body` 直接构造 heap closure object；
+`Fn<...>^` 是 owned closure handle。`new { [captures] args => body }` 直接构造 heap closure object；
 它不是把一个普通 stack `Fn` 再装进 `Box`。`Fn^` move 时只移动 owner handle；drop 时通过
 vtable 中的 `drop(receiver)` drop heap closure object，并释放其 storage。
 
@@ -123,50 +123,51 @@ trampoline：先取出 receiver 中保存的 raw function，再以源码参数�
 
 ## Lambda 语法
 
-沿用现有 lambda 语法：
+canonical lambda 使用 brace closure 语法：
 
 ```jiang
-Fn<Int, Int> inc = (value) => value + 1;
+Fn<Int, Int> inc = { value => value + 1 };
 
 Int base = 10;
-Fn<Int, Int> add_base = (value) => value + base;
+Fn<Int, Int> add_base = { value => value + base };
 
-RawFn<Int, Int, Int> sum = (left, right) => { left + right };
+RawFn<Int, Int, Int> sum = { left, right => left + right };
 ```
 
 lambda 必须有 expected callable type。参数类型可以从 expected callable type 推导：
 
 ```jiang
-Fn<Bool, Int, Int> less = (left, right) => left < right;
-RawFn<Bool, Int, Int> raw_less = (left, right) => left < right;
+Fn<Bool, Int, Int> less = { left, right => left < right };
+RawFn<Bool, Int, Int> raw_less = { left, right => left < right };
 ```
 
 没有 expected type 时，lambda 表达式不能作为局部变量 initializer：
 
 ```jiang
-let bad = (left, right) => left + right; // fail
+let bad = { left, right => left + right }; // fail
 ```
 
 当 expected type 是 `Fn<...>` 时，lambda 可以捕获环境：
 
 ```jiang
 Int base = 1;
-Fn<Int, Int> add_base = (value) => value + base;
+Fn<Int, Int> add_base = { value => value + base };
 ```
 
 当 expected type 是 `RawFn<...>` 时，lambda 必须无捕获：
 
 ```jiang
 Int base = 1;
-RawFn<Int, Int> add_one = (value) => value + 1;    // ok
-RawFn<Int, Int> bad_add = (value) => value + base; // fail: captures environment
+RawFn<Int, Int> add_one = { value => value + 1 };    // ok
+RawFn<Int, Int> bad_add = { value => value + base }; // fail: captures environment
 ```
 
-后续可以引入显式 environment 字段初始化列表。它写在参数列表之后、`=>` 之前：
+显式 environment 字段初始化列表写在参数之前：
 
 ```jiang
-Fn<Int, Int> f = (arg) [value = old_value$.move(), Config& config = config$.ref()] => {
-    arg + value + config.offset
+Fn<Int, Int> f = {
+    [value = old_value$.move(), Config& config = config$.ref()]
+    arg => arg + value + config.offset
 };
 ```
 
@@ -241,7 +242,7 @@ let f = Fn(raw); // Fn<Bool, Foo&, Int, Int>
 转换不允许：
 
 ```jiang
-Fn<Int, Int> f = (value) => value + 1;
+Fn<Int, Int> f = { value => value + 1 };
 RawFn<Int, Int> raw = f; // fail
 ```
 
@@ -282,7 +283,7 @@ sort(self.compare); // fail: RawFn<Bool, Foo&, Int, Int> 不是 Fn<Bool, Int, In
 绑定 receiver 必须显式写 lambda：
 
 ```jiang
-sort((left, right) => self.compare(left, right));
+sort { left, right => self.compare(left, right) };
 ```
 
 这个 lambda 捕获 `self`，目标类型是 `Fn<Bool, Int, Int>`。
@@ -345,7 +346,7 @@ owner capture 牵涉 consuming call、drop 和闭包重复调用规则，应该�
 
 ```jiang
 Fn<Int> make_bad() {
-    () => 42 // fail: stack Fn outlives its env storage
+    { => 42 } // fail: stack Fn outlives its env storage
 }
 ```
 
@@ -353,25 +354,25 @@ Fn<Int> make_bad() {
 
 ```jiang
 Int local = 1;
-Fn<Int> f = () => local + 1;
+Fn<Int> f = { => local + 1 };
 Int value = f();
 ```
 
 `Fn<...>^` 的 env memory 在 heap 上。`new lambda` 会直接构造 heap closure object；隐式捕获仍可
 使用，但默认是引用捕获，因此是否能流出当前作用域交给 lifetime / borrow check 判断：
 
-- `return new () => 1` 没有外部 borrow，可以通过。
-- `return new () => local` 隐式捕获 `local&`，如果 `local` 是当前栈局部，则生命周期检查失败。
-- `return new () [value = value$.move()] => value` 把 owner 移入 heap env，env 随 `Fn^` owner 存活。
+- `return new { => 1 }` 没有外部 borrow，可以通过。
+- `return new { => local }` 隐式捕获 `local&`，如果 `local` 是当前栈局部，则生命周期检查失败。
+- `return new { [value = value$.move()] => value }` 把 owner 移入 heap env，env 随 `Fn^` owner 存活。
 
 ```jiang
 Fn<Int>^ make_bad() {
     Int local = 1;
-    new () => local // fail: env 中的 local& 逃逸
+    new { => local } // fail: env 中的 local& 逃逸
 }
 
 Fn<Int>^ make_answer() {
-    new () => 42 // ok: heap env 为空
+    new { => 42 } // ok: heap env 为空
 }
 ```
 
@@ -388,7 +389,7 @@ struct / union 的 public region、tuple 元素和 callable result/参数可提�
 
 ```jiang
 Int total! = 0;
-Fn<(), Int> add = (value) => {
+Fn<(), Int> add = { value =>
     total = total + value;
 };
 ```
@@ -480,7 +481,7 @@ artifact 或 async frame 如果需要更强的 env 身份，应继续从现有 `
 ## 与 async / 数据竞争的关系
 
 async closure 已建立在普通 closure 之上。源码仍使用普通
-`(params) [captures] => body`，async effect 由 expected `Fn<async ...>` 类型决定；
+`{ [captures] params => body }`，async effect 由 expected `Fn<async ...>` 类型决定；
 vtable code slot 采用统一的
 `(env, args..., continuation*) -> ()` 启动 ABI，启动 shim 分配具体 coroutine frame，并把 closure
 environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 continuation。

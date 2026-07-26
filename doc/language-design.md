@@ -834,7 +834,7 @@ T add<T>(T left, T right);
 - `Fn<Ret, Args...>` 是 erased callable view。它可以表示捕获 lambda，运行时模型是
   `{ receiver, vtable }`；`receiver` 指向编译器合成的 closure object，`vtable` 提供
   call/drop 槽。
-- `Fn<Ret, Args...>^` 是 owned heap closure。`new () [captures] => body` 会直接构造
+- `Fn<Ret, Args...>^` 是 owned heap closure。`new { [captures] args => body }` 会直接构造
   heap closure object；移动 `Fn^` 只移动 owner handle，drop 时通过 closure vtable
   销毁 environment。
 - callable 类型可写成 `Fn<R result, A value, B fallback>` 或对应的 `RawFn` 形式。result 和参数
@@ -849,7 +849,7 @@ Int inc(Int value) {
 }
 
 RawFn<Int, Int> raw = inc;
-RawFn<Int, Int> also_raw = (value) => value + 1;
+RawFn<Int, Int> also_raw = { value => value + 1 };
 ```
 
 `Fn` 可以捕获外层 local。lambda 必须出现在有 expected callable type 的位置，参数类型由
@@ -857,15 +857,15 @@ expected type 下推：
 
 ```jiang
 Int base = 10;
-Fn<Int, Int> add_base = (value) => value + base;
+Fn<Int, Int> add_base = { value => value + base };
 ```
 
 lambda 可以用 `[...]` 显式初始化 capture environment；未列出的外层 local 仍按默认捕获规则
 处理：
 
 ```jiang
-Fn<Int, Int> add_snapshot = (value) [_ captured = base] => value + captured;
-Fn<Int> read = () [ref _ borrowed = base] => borrowed$.get();
+Fn<Int, Int> add_snapshot = { [_ captured = base] value => value + captured };
+Fn<Int> read = { [ref _ borrowed = base] => borrowed$.get() };
 ```
 
 capture initializer 在闭包创建时求值。值 capture 遵守 Copyable/move 规则，`ref` / `ref!` capture
@@ -895,7 +895,7 @@ struct Meter {
     }
 
     Int ok(self) {
-        self.call((extra) => self.add(extra))
+        self.call { extra => self.add(extra) }
     }
 }
 ```
@@ -919,27 +919,27 @@ unsafe Int read_raw(Int* pointer);
 async [WorkerDomain] Int load(Int id);
 
 RawFn<unsafe Int, Int*> reader = read_raw;
-Fn<async [WorkerDomain] Int, Int> loader = (id) => load(id);
+Fn<async [WorkerDomain] Int, Int> loader = { id => load(id) };
 ```
 
-lambda 自身不增加 `async (...) =>` 语法；async/unsafe/domain effect 必须由完整 expected callable type
+lambda 自身不增加 effect 前缀；async/unsafe/domain effect 必须由完整 expected callable type
 下推。async `Fn` 与 async `RawFn` 使用普通 async 函数相同的 start/completion ABI，只额外携带 closure
 environment。动态调用可以在相同或不同 Domain 间切换；跨 Domain 的参数、result 和 capture
 必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
 
 普通 async 调用是隐式挂起点，表达式类型仍是函数声明的返回类型。要提前启动并获得
-handle，使用 `async call(...)` 或 `async [Domain] { ... }`：
+handle，使用 Task initializer：
 
 ```jiang
 async [UiDomain] Int render() {
-    Task<Int> first = async [WorkerDomain] load(1);
-    Task<Int> second = async [WorkerDomain] load(2);
+    Task<Int> first = Task(domain: WorkerDomain) { load(1) };
+    Task<Int> second = Task(domain: WorkerDomain) { load(2) };
     first.await() + second.await()
 }
 ```
 
-Task creation 是 eager 的。`async` 创建地址固定的直接 `Task<T>`；`new async` 在 heap 上原地初始化
-同一 Task 布局并返回 `Task<T>^` owner：
+Task creation 是 eager 的。`Task { ... }` 创建地址固定的直接 `Task<T>`；`new Task { ... }`
+在 heap 上原地初始化同一 Task 布局并返回 `Task<T>^` owner：
 
 - 直接 `Task<T>` 是 `!Movable`、非 Copyable 的结构化子任务，可放入 struct、tuple 或固定数组的
   静态 place；包含它的聚合也不可移动、按值传参、返回或捕获。
@@ -961,9 +961,9 @@ Task creation 是 eager 的。`async` 创建地址固定的直接 `Task<T>`；`n
 
 `sync [Domain] { ... }` 在 async context 中挂起当前 coroutine，结构化切换到目标 Domain，完成后回到
 原 Domain；它不创建 Task。普通同步函数用最外层 `sync [Domain]` 进入 runtime 时，会阻塞当前
-线程等待 block 完成。无 Domain 的 `async {}` / `sync {}` 只能继承已有 current Domain；
-`async [current]` 显式绑定调用点的 current Domain。async/sync block 使用 tail expression
-作为结果，不支持显式 `return`。
+线程等待 block 完成。`Task { ... }` 与 `sync { ... }` 只能继承已有 current Domain；
+`Task(domain: D) { ... }` 显式选择 execution Domain。Task closure 与 sync block 使用 tail
+expression 作为结果，不支持显式 `return`。
 
 跨线程共享简单标量状态使用 `Atomic<T>`。`get()`、`set()`、`get_and_set()` 和
 `compare_exchange()` 默认使用 sequential order；`*_with_order` 接受 `MemoryOrder.relaxed`、

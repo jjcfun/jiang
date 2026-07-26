@@ -198,6 +198,7 @@ struct MirLowerer: Movable {
     table.HashTable<Int, qid.DefId> raw_fn_to_fn_shims;
     table.HashTable<Int, qid.DefId> raw_fn_vtable_globals;
     table.HashTable<LambdaVTableGlobalKey, qid.DefId> lambda_vtable_globals;
+    table.HashTable<mir.MirFunctionKey, qid.TypeId> lambda_env_types;
     table.HashTable<Int, qid.DefId> lambda_env_drop_shims;
     table.HashTable<mir.MirFunctionKey, qid.DefId> async_callable_start_shims;
     table.HashTable<mir.MirFunctionKey, qid.DefId> async_callable_completion_shims;
@@ -206,7 +207,7 @@ struct MirLowerer: Movable {
     list.ArrayList<Bool> rtc_eligible!;
     table.HashTable<mir.MirFunctionKey, Bool> lowering_functions;
     table.HashTable<Int, qid.DefId> cancel_handler_shims;
-    table.HashTable<qid.DefId, qid.DefId> async_block_env_drop_shims;
+    table.HashTable<mir.MirFunctionKey, qid.DefId> async_block_env_drop_shims;
     table.HashTable<Int, mir.MirTaskStateLayout> task_state_layouts;
     table.HashTable<Int, qid.DefId> task_cleanup_shims;
     qid.DefId? closure_noop_drop_shim!;
@@ -231,6 +232,7 @@ struct MirLowerer: Movable {
         self.raw_fn_to_fn_shims = table.HashTable<Int, qid.DefId>();
         self.raw_fn_vtable_globals = table.HashTable<Int, qid.DefId>();
         self.lambda_vtable_globals = table.HashTable<LambdaVTableGlobalKey, qid.DefId>();
+        self.lambda_env_types = table.HashTable<mir.MirFunctionKey, qid.TypeId>();
         self.lambda_env_drop_shims = table.HashTable<Int, qid.DefId>();
         self.async_callable_start_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
         self.async_callable_completion_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
@@ -239,7 +241,7 @@ struct MirLowerer: Movable {
         self.rtc_eligible = list.ArrayList<Bool>();
         self.lowering_functions = table.HashTable<mir.MirFunctionKey, Bool>();
         self.cancel_handler_shims = table.HashTable<Int, qid.DefId>();
-        self.async_block_env_drop_shims = table.HashTable<qid.DefId, qid.DefId>();
+        self.async_block_env_drop_shims = table.HashTable<mir.MirFunctionKey, qid.DefId>();
         self.task_state_layouts = table.HashTable<Int, mir.MirTaskStateLayout>();
         self.task_cleanup_shims = table.HashTable<Int, qid.DefId>();
         self.closure_noop_drop_shim = null;
@@ -396,7 +398,8 @@ struct MirLowerer: Movable {
                 source.effects,
                 self.ctx.store.types.int_type(),
                 task_state$.ref(),
-                frame.cancellation_entry
+                frame.cancellation_entry,
+                self.coroutine_capture_env_type(frame$.ref())
             ) is .some(updated)
         ) {
             mir.MirCoroutineFrameLayout layout! = updated;
@@ -406,6 +409,11 @@ struct MirLowerer: Movable {
             function.body = body;
             function.coroutine_frame = layout;
         }
+    }
+
+    qid.TypeId? coroutine_capture_env_type(self, mir.MirCoroutineFrameLayout& layout) {
+        if (layout.capture_env_field_index < 0) { return null; }
+        return layout.fields[layout.capture_env_field_index].type_id;
     }
 
     () prepare_rtc_resume_shims(
@@ -567,7 +575,7 @@ struct MirLowerer: Movable {
             return;
         }
         self.add_async_callable_abi_functions(function, frame$.ref());
-        mir.MirFunctionRef? env_drop = self.async_block_env_drop_function(function.def_id, function.span);
+        mir.MirFunctionRef? env_drop = self.async_block_env_drop_function(function, function.span);
         if (function.is_external) {
             coroutine_frame_rewrite.add_completion_function(self.output, function, frame$.ref(), env_drop);
             return;
@@ -716,10 +724,19 @@ struct MirLowerer: Movable {
         return usage == typeck_store.AsyncStartUsage.detached;
     }
 
-    mir.MirFunctionRef? async_block_env_drop_function(self, qid.DefId function_def, token.Span span) {
-        guard table.hash_table_get_value<qid.DefId, qid.DefId>(
+    mir.MirFunctionRef? async_block_env_drop_function(
+        self,
+        mir.MirFunction function,
+        token.Span span
+    ) {
+        mir.MirFunctionKey key = mir.MirFunctionKey(
+            function.def_id,
+            function.type_args,
+            function.const_args
+        );
+        guard table.hash_table_get_value<mir.MirFunctionKey, qid.DefId>(
             self.async_block_env_drop_shims$.ref(),
-            function_def
+            key
         ) is .some(shim_def) else { return null; }
         list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
         params.add(self.ctx.store.types.opaque_pointer_type(span));
@@ -1600,6 +1617,7 @@ struct MirLowerer: Movable {
             span
         );
         mir.MirBlockId cancellation_entry = body_lowerer.cancellation_entry;
+        qid.TypeId? capture_env_type = body_lowerer.coroutine_capture_env_type();
         mir.MirBody mir_body! = body_lowerer.lower();
         Int function_index = self.output.functions.len();
         mir_body = self.body_with_id(mir_body, mir.MirBodyId.from_index(function_index));
@@ -1627,7 +1645,11 @@ struct MirLowerer: Movable {
             mir.MirFunction borrow_check_source! = function;
             function = drop_elaborate.elaborate_function(self.ctx, self.output, function);
             function.coroutine_frame = self.coroutine_frame_layout_for_body(
-                hir_def.def_id, function.body, effects, cancellation_entry
+                hir_def.def_id,
+                function.body,
+                effects,
+                cancellation_entry,
+                capture_env_type
             );
             borrow_check_source.coroutine_frame = function.coroutine_frame;
             self.output.set_borrow_check_override(borrow_check_source);
@@ -1703,7 +1725,7 @@ struct MirLowerer: Movable {
         if (!effects.has_async) { return null; }
         mir.MirBody source_body = self.external_source_function_body(body_id, function_def, span);
         return self.coroutine_frame_layout_for_body(
-            function_def, source_body, effects, source_body.entry
+            function_def, source_body, effects, source_body.entry, null
         );
     }
 
@@ -2689,7 +2711,8 @@ struct MirLowerer: Movable {
         qid.DefId function_def,
         mir.MirBody body,
         types.EffectSet effects,
-        mir.MirBlockId cancellation_entry
+        mir.MirBlockId cancellation_entry,
+        qid.TypeId? capture_env_type
     ) {
         if (!effects.has_async) { return null; }
         mir.MirTaskStateLayout task_state! = self.create_task_state_layout(
@@ -2704,7 +2727,8 @@ struct MirLowerer: Movable {
             effects,
             self.ctx.store.types.int_type(),
             task_state$.ref(),
-            cancellation_entry
+            cancellation_entry,
+            capture_env_type
         ) is .some(layout) else {
             return null;
         }
@@ -3033,6 +3057,13 @@ struct BodyLowerer: Movable {
             entry: mir.MirBlockId.from_index(0),
             return_local: self.return_local()
         );
+    }
+
+    qid.TypeId? coroutine_capture_env_type(self) {
+        if (!self.current_effects.has_async) { return null; }
+        guard self.lambda_capture_infos is .some(captures) else { return null; }
+        if (captures.length == 0) { return null; }
+        return self.lambda_env_type_for_infos(self.hir_def.def_id, captures, self.span);
     }
 
     () lower_cancellation_entry(self) {
@@ -4038,7 +4069,12 @@ struct BodyLowerer: Movable {
         mir.MirLocalId task_local = self.ensure_task_place_identity(destination, span);
         if (self.async_start_is_detached(node_id)) {
             self.lower_detached_async_block(
-                node_id, function_def, captures, function$.ref(), layout$.ref(), span
+                capture_node,
+                captures,
+                lambda,
+                function$.ref(),
+                layout$.ref(),
+                span
             );
             self.push_assign(
                 coroutine_task_abi.task_field_place(
@@ -4071,10 +4107,12 @@ struct BodyLowerer: Movable {
         list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(1);
         args.add(self.async_task_env_operand(
             capture_node,
-            function_def,
             captures,
             lambda,
             task_local,
+            function$.ref(),
+            layout$.ref(),
+            frame_place,
             span
         ));
         mir.MirOperand[]& frozen_args = self.lowerer.output.operand_array(args$.ref());
@@ -4123,9 +4161,9 @@ struct BodyLowerer: Movable {
 
     () lower_detached_async_block(
         self,
-        hir.HirId node_id,
-        qid.DefId function_def,
+        hir.HirId capture_node,
         typeck_store.LambdaCaptureInfo[]& captures,
+        hir.HirLambda? lambda,
         mir.MirFunction& function,
         mir.MirCoroutineFrameLayout& layout,
         token.Span span
@@ -4161,7 +4199,9 @@ struct BodyLowerer: Movable {
         );
         mir.MirPlace frame_place = self.project_deref(frame_pointer_place, true);
         list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(1);
-        args.add(self.async_block_env_operand(node_id, function_def, captures, null, span));
+        args.add(self.detached_async_env_operand(
+            capture_node, captures, lambda, function, layout, frame_place, span
+        ));
         mir.MirOperand[]& frozen_args = self.lowerer.output.operand_array(args$.ref());
         self.lower_async_operands_into_frame(frozen_args, function, layout, frame_place, span);
         self.statements.add(coroutine_task_abi.frame_state_initializer(
@@ -4199,7 +4239,7 @@ struct BodyLowerer: Movable {
             span
         );
         mir.MirFunctionRef completion_function = self.coroutine_generated_function_ref(
-            function_def,
+            function.def_id,
             self.lowerer.output.empty_type_args(),
             self.lowerer.output.empty_const_args(),
             layout,
@@ -4216,7 +4256,40 @@ struct BodyLowerer: Movable {
         self.statements.add(coroutine_task_abi.continuation_executor_null_initializer(
             self.lowerer.output, layout, frame_place, span
         ));
-        self.lower_detached_resume_call(function_def, layout, frame_pointer_place, span);
+        self.lower_detached_resume_call(function.def_id, layout, frame_pointer_place, span);
+    }
+
+    mir.MirOperand detached_async_env_operand(
+        self,
+        hir.HirId node_id,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        hir.HirLambda? lambda,
+        mir.MirFunction& function,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace frame_place,
+        token.Span span
+    ) {
+        if (lambda is .some(task_lambda)) {
+            return self.embedded_async_env_operand(
+                node_id,
+                task_lambda,
+                captures,
+                null,
+                function,
+                layout,
+                frame_place,
+                span
+            );
+        }
+        return self.async_block_env_operand(
+            node_id,
+            captures,
+            null,
+            function,
+            layout,
+            frame_place,
+            span
+        );
     }
 
     () lower_detached_resume_call(
@@ -4281,9 +4354,11 @@ struct BodyLowerer: Movable {
     mir.MirOperand async_block_env_operand(
         self,
         hir.HirId node_id,
-        qid.DefId function_def,
         typeck_store.LambdaCaptureInfo[]& captures,
         mir.MirLocalId? capture_task,
+        mir.MirFunction& function,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace frame_place,
         token.Span span
     ) {
         unsafe {
@@ -4297,45 +4372,93 @@ struct BodyLowerer: Movable {
                 param_count: 0,
                 params: params[0..0],
                 captures: explicit_captures[0..0],
-                function_def: function_def,
+                function_def: function.def_id,
                 body: node_id
             );
-            mir.MirOperand env = self.heap_lambda_env_operand(node_id, lambda, capture_task, span);
-            qid.TypeId env_type = self.lambda_env_type_for_infos(function_def, captures, span);
-            qid.DefId drop_shim = self.ensure_lambda_env_drop_shim(node_id, env_type, true);
-            self.lowerer.async_block_env_drop_shims.set(function_def, drop_shim);
-            return env;
+            return self.embedded_async_env_operand(
+                node_id,
+                lambda,
+                captures,
+                capture_task,
+                function,
+                layout,
+                frame_place,
+                span
+            );
         }
     }
 
     mir.MirOperand async_task_env_operand(
         self,
         hir.HirId node_id,
-        qid.DefId function_def,
         typeck_store.LambdaCaptureInfo[]& captures,
         hir.HirLambda? lambda,
         mir.MirLocalId capture_task,
+        mir.MirFunction& function,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace frame_place,
         token.Span span
     ) {
         guard lambda is .some(task_lambda) else {
             return self.async_block_env_operand(
                 node_id,
-                function_def,
                 captures,
                 capture_task,
+                function,
+                layout,
+                frame_place,
                 span
             );
         }
-        mir.MirOperand env = self.heap_lambda_env_operand(
+        return self.embedded_async_env_operand(
             node_id,
             task_lambda,
+            captures,
             capture_task,
+            function,
+            layout,
+            frame_place,
             span
         );
-        if (captures.length == 0) { return env; }
-        qid.TypeId env_type = self.lambda_env_type_for_infos(function_def, captures, span);
-        qid.DefId drop_shim = self.ensure_lambda_env_drop_shim(node_id, env_type, true);
-        self.lowerer.async_block_env_drop_shims.set(function_def, drop_shim);
+    }
+
+    mir.MirOperand embedded_async_env_operand(
+        self,
+        hir.HirId node_id,
+        hir.HirLambda lambda,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        mir.MirLocalId? capture_task,
+        mir.MirFunction& function,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace frame_place,
+        token.Span span
+    ) {
+        if (captures.length == 0) {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        Int field_index = layout.capture_env_field_index;
+        if (field_index < 0) {
+            return self.unsupported_operand(node_id);
+        }
+        mir.MirLocalId? saved_capture_task! = self.active_coroutine_capture_task;
+        self.active_coroutine_capture_task = capture_task;
+        mir.MirPlace env_place = self.project_constant_index(frame_place, field_index);
+        self.fill_lambda_env(node_id, lambda, captures, env_place);
+        qid.TypeId env_type = layout.fields[field_index].type_id;
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        mir.MirOperand env = self.erased_lambda_env_address_operand(
+            env_place,
+            env_pointer_type,
+            span
+        );
+        qid.DefId drop_shim = self.ensure_lambda_env_drop_shim(node_id, env_type, false);
+        mir.MirFunctionKey key = mir.MirFunctionKey(
+            function.def_id,
+            function.type_args,
+            function.const_args
+        );
+        self.lowerer.async_block_env_drop_shims.set(key, drop_shim);
+        self.active_coroutine_capture_task = saved_capture_task;
         return env;
     }
 
@@ -7446,8 +7569,18 @@ struct BodyLowerer: Movable {
             return;
         }
         token.Span span = self.lowerer.hir_span(node_id);
+        mir.MirLocalId frame_local = self.add_temp(layout.frame_type_id, span);
+        mir.MirPlace frame_place = self.place_for_local(frame_local);
         list.ArrayList<mir.MirOperand> args! = list.ArrayList<mir.MirOperand>(1);
-        args.add(self.async_block_env_operand(async_block, function_def, captures, null, span));
+        args.add(self.async_block_env_operand(
+            async_block,
+            captures,
+            null,
+            function$.ref(),
+            layout$.ref(),
+            frame_place,
+            span
+        ));
         self.lower_async_direct_continuation_call(
             function_def,
             self.lowerer.output.empty_type_args(),
@@ -7456,6 +7589,7 @@ struct BodyLowerer: Movable {
             destination,
             function$.ref(),
             layout$.ref(),
+            frame_place,
             span
         );
     }
@@ -11498,8 +11632,21 @@ struct BodyLowerer: Movable {
         typeck_store.LambdaCaptureInfo[]& captures,
         token.Span span
     ) {
+        mir.MirFunctionKey key = mir.MirFunctionKey(
+            lambda_def,
+            self.function_type_args,
+            self.function_const_args
+        );
+        if (table.hash_table_get_value<mir.MirFunctionKey, qid.TypeId>(
+            self.lowerer.lambda_env_types$.ref(),
+            key
+        ) is .some(existing)) {
+            return existing;
+        }
         qid.DefId env_def = self.create_lambda_env_struct_def(lambda_def, captures, span);
-        return self.lowerer.ctx.store.types.named_type(env_def, span);
+        qid.TypeId env_type = self.lowerer.ctx.store.types.named_type(env_def, span);
+        self.lowerer.lambda_env_types.set(key, env_type);
+        return env_type;
     }
 
     qid.DefId create_lambda_env_struct_def(
@@ -15995,6 +16142,7 @@ struct BodyLowerer: Movable {
                 destination,
                 function$.ref(),
                 layout$.ref(),
+                null,
                 span
             );
             return;
@@ -16221,11 +16369,15 @@ struct BodyLowerer: Movable {
         mir.MirPlace destination,
         mir.MirFunction& function,
         mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace? prepared_frame,
         token.Span span
     ) {
         // 普通 async 调用属于当前 Task：callee frame 保存在父 frame 中，完成后直接恢复父协程。
-        mir.MirLocalId frame_local = self.add_temp(layout.frame_type_id, span);
-        mir.MirPlace frame_place = self.place_for_local(frame_local);
+        mir.MirPlace frame_place = self.direct_continuation_frame_place(
+            layout,
+            prepared_frame,
+            span
+        );
         self.lower_async_operands_into_frame(args, function, layout, frame_place, span);
         mir.MirFunctionRef parent_resume = mir.MirFunctionRef (
             function_def: self.hir_def.def_id,
@@ -16306,6 +16458,18 @@ struct BodyLowerer: Movable {
         )), span);
         self.start_block(next_block);
         self.compare_exchange_passive_cancel_target(3, 0, span);
+    }
+
+    @life(return: self & prepared_frame)
+    mir.MirPlace direct_continuation_frame_place(
+        self,
+        mir.MirCoroutineFrameLayout& layout,
+        mir.MirPlace? prepared_frame,
+        token.Span span
+    ) {
+        if (prepared_frame is .some(frame_place)) { return frame_place; }
+        mir.MirLocalId frame_local = self.add_temp(layout.frame_type_id, span);
+        return self.place_for_local(frame_local);
     }
 
     () compare_exchange_passive_cancel_target(
