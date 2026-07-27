@@ -48,4 +48,15 @@ for source in test/smoke/*.jiang; do
   fi
 done
 
+printf '\n== source artifact function alias warm hit ==\n'
+if "$JIANGC" --check test/smoke/std_smoke.jiang \
+  && "$JIANGC" --check test/smoke/std_smoke.jiang
+then
+  echo "OK"
+else
+  code=$?
+  echo "FAIL:$code"
+  status=1
+fi
+
 exit "$status"
