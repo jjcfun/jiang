@@ -199,14 +199,9 @@ global_tail <- ("=" expr)? ";"
 function_tail
             <- generic_params? "(" param_list? ")" (";" / block)
 
-param_list  <- required_param ("," required_param)* ("," default_param)* ","?
-            / default_param ("," default_param)* ","?
+param_list  <- param ("," param)* ","?
 
-required_param
-            <- type binding_name
-
-default_param
-            <- type binding_name "=" expr
+param       <- type binding_name ("=" expr)?
 
 binding_name
             <- name "!"?
@@ -220,7 +215,9 @@ binding_name
 `comptime` block 是顶层 item，不经由 `decl_modifier`，只负责在编译期选择其中的顶层 item。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
-默认参数只能出现在参数列表尾部；带默认值的参数后面不能再出现必填参数。
+默认参数可以出现在参数列表任意位置。位置实参总是绑定最早尚未绑定的参数，不会按类型跳过
+带默认值的参数；命名实参可以跳过或重排默认参数。第一个命名实参之后，其余普通实参也必须
+使用命名形式。
 
 ## 泛型和 where 约束
 
@@ -590,7 +587,6 @@ expr_with_block
             <- block_expr
              / effect_block_expr
              / async_call_expr
-             / struct_expr
              / if_expr
              / switch_expr
              / try_catch_expr
@@ -598,7 +594,7 @@ expr_with_block
 expr_without_block
             <- range_expr
 
-lambda_expr <- "(" lambda_param_list? ")" lambda_capture_list? "=>" lambda_body
+lambda_expr <- "{" lambda_capture_list? lambda_param_list? "=>" stmt* tail_expr? "}"
 
 lambda_param_list
             <- lambda_param ("," lambda_param)* ","?
@@ -613,8 +609,6 @@ lambda_capture_list
 lambda_capture_item
             <- type name "=" expr
              / name "=" expr
-
-lambda_body <- block / expr
 
 range_expr  <- logic_or_expr ".." logic_or_expr
              / logic_or_expr
@@ -656,6 +650,7 @@ postfix_expr
 postfix_tail
             <- type_args "(" call_args? ")"
              / "(" call_args? ")"
+             / trailing_closure
              / "?." name
              / "." name
              / "?" "[" index_or_slice "]"
@@ -677,6 +672,10 @@ implicit_args
 call_args   <- call_arg ("," call_arg)* ","?
 
 call_arg    <- (name ":")? expr
+
+trailing_closure
+            <- lambda_expr
+             / block
 ```
 
 `range_expr` 表示 range 这一优先级层；只有 `logic_or_expr ".." logic_or_expr`
@@ -692,6 +691,10 @@ call_arg    <- (name ":")? expr
 `Type field = expr`。这些 initializer 在闭包创建时求值；未列入列表的外层 local 仍可按
 默认捕获规则处理：只读 local 按共享引用捕获，写入外层 `!` storage 时按可变引用捕获。
 `RawFn<...>` expected type 下不允许任何捕获，也不允许 capture list。
+
+调用的最后一个 callable 参数可以写成尾随闭包：`run { work() }` 或
+`map(values) { value => transform(value) }`。尾随位置中不含 `=>` 的 `{ ... }` 会转换成零参数
+closure；普通表达式位置的同形语法仍是 block。当前一次调用只允许一个尾随闭包。
 
 ## primary expression
 
@@ -719,11 +722,6 @@ array_expr  <- "[" (expr ("," expr)* ","?)? "]"
 lang_invocation
             <- "#" provider_path raw_block
 
-struct_lit  <- "{" (field_init_expr ("," field_init_expr)* ","?)? "}"
-
-field_init_expr
-            <- name ":" expr
-
 block_expr  <- block
 
 effect_block_expr
@@ -735,8 +733,6 @@ async_call_expr
 effect_keywords
             <- "unsafe" (("async" / "sync") keyword_options?)?
              / ("async" / "sync") keyword_options?
-
-struct_expr <- path type_args? struct_lit
 
 if_expr     <- "if" expr_without_block block "else" block
 

@@ -26,16 +26,17 @@
 
 ## 当前分支
 
-当前 `release/0.4.8` 使用同版本 bootstrap 编译器承接所有权、Task 和 lifetime
-升级，正式发布前的自举链为：
+当前 `main` 以 Jiang 0.4.9 stable 为日常 bootstrap 输入。0.4.9 已发布，其从 0.4.8 stable
+开始的可复现自举链为：
 
 ```text
-0.4.7 stable
-  -> bootstrap/0.4.8 的 jiangc.next
-  -> release/0.4.8 的 jiangc.next
-  -> release/0.4.8 的 stable jiangc
+0.4.8 stable
+  -> 0.4.9-bootstrap
+  -> 0.4.9-bootstrap2
+  -> 0.4.9 release next
+  -> 0.4.9 stable
 ```
 
-bootstrap worktree 只负责上一版 stable 到 bootstrap next；release next 再生成正式 stable。
-详细命令和边界见 [编译器开发流程](develop.md)。
+过渡 tag 用于在新机器上复现破坏性语法升级，不要求日常保留 bootstrap worktree。详细命令和
+边界见 [编译器开发流程](develop.md)。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

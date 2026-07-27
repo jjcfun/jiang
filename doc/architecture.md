@@ -311,7 +311,9 @@ src/
 不建立额外的业务层命名分类。
 
 - `HashTable<K, V>`：复杂 key 到 value 的 hash 映射；key 必须满足 `Hashable`，
-  而 `Hashable` 继承 `Equatable`；`get` 返回 `V?`，`get_ref` 返回 `V&?`。
+  而 `Hashable` 继承 `Equatable`。`Hashable.hash` 把规范字节写入泛型 `Hasher`，
+  当前表实现使用 `WyHasher`；稳定 artifact fingerprint 仍使用 BLAKE3。`get` 返回 `V?`，
+  `get_ref` 返回 `V&?`。
 - `ArrayTable<Id, T>`：append-only 实体主表；`next_id` 和 `append`
   通过 `Indexable.from_index` 返回强类型 Id。
 - `SideTable<Id, T>`：已有 Id 到附加数据的直接索引表，适合半稠密 side data。

@@ -121,7 +121,9 @@ module import cycle 允许。package dependency cycle 不允许：ModuleGraph �
 - root module 的 public function/type/global 可作为 package API 访问。
 - root module 的 `public import` 可以把目标 module namespace 作为 public API 的一个成员
   重新导出，但不会 flatten 目标 module declarations。
-- root module 的 `public alias` 可以把一个具体 public symbol 重新导出到 package API。
+- root module 的 `public alias` 可以重新导出 public symbol。函数 alias 记录一个可见 overload
+  anchor，调用时仍在目标原始 namespace/name 下执行 public overload resolution；不会暴露
+  private 同名函数。
 - 非 root module 中的 public declaration 不会自动成为 package API。
 - private declaration、private alias 和非 root public declaration 跨 package lookup 都会诊断。
 

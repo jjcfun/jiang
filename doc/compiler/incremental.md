@@ -140,6 +140,17 @@ cache 存在，但不进入长期 cache。
 - name。
 - name domain。
 - symbol kind。
+- 可选的稳定 disambiguator。
+
+函数重载共享基础路径，但不共享完整 stable key。HIR signature lowering 会从 callable signature
+生成 disambiguator；`init` / `deinit` 的隐式 receiver 不计入该值。函数的参数、返回类型和
+generic signature 改变会形成新的 stable identity，函数 body 变化则只改变 body fingerprint。
+`@life` 等不改变重载身份的 contract 信息进入 semantic fingerprint，而不伪装成函数名或
+overload signature。
+
+函数 alias 自身仍有独立 `DefId` 和 stable identity。它保存一个可见 overload anchor；调用解析
+通过 anchor 回到目标的原始 namespace/name，枚举 public overload set。artifact 恢复 alias 时
+也必须在目标 declarations 可用后重建该关系，不能把 alias 压缩成一份重载签名副本。
 
 local/pattern binding 默认不跨 session 缓存。需要 body 级复用时，可以在 body fingerprint 内使用
 def-local ordinal 或语法结构 hash，但它们不升级成 package 级 stable symbol。

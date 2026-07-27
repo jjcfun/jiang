@@ -767,10 +767,10 @@ Jiang 的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 表�
 
 #### 函数参数
 
-Jiang 支持位置参数、命名参数和尾部默认参数：
+Jiang 支持位置参数、命名参数和默认参数：
 
 ```c
-Int add(Int base, Int extra = 1) {
+Int add(Int base = 1, Int extra) {
     return base + extra;
 }
 ```
@@ -778,15 +778,16 @@ Int add(Int base, Int extra = 1) {
 规则如下：
 
 - 位置参数按定义顺序匹配
-- 带默认值的参数必须位于参数列表尾部
+- 默认参数可以出现在参数列表任意位置
+- 位置参数不会按类型跳过默认参数，而是绑定最早尚未绑定的参数
 - 当前默认值只支持 literal，并按参数 expected type 检查
 - 命名参数使用 `name: value`，可以重排或跳过带默认值的参数
-- 命名参数出现后，后续不能再出现位置参数
+- 命名参数出现后，后续普通参数也必须使用命名形式
 - overload 决议必须能按参数数量和参数类型区分候选，否则诊断为歧义
 
 ```c
-add(10);
-add(10, extra: 20);
+add(10, 20);
+add(extra: 20);
 ```
 
 #### 函数调用
@@ -884,14 +885,14 @@ Bool ok = compare(1, 2);
 struct User {
     Int id;
 
-    Int add(Int extra) {
+    Int add(self, Int extra) {
         return self.id + extra;
     }
 }
 
 RawFn<Int, User&, Int> add = User.add;
 
-User user = User { id: 40 };
+User user = User(id: 40);
 Int value = add(user$.ref(), 2);
 ```
 
@@ -1511,16 +1512,16 @@ struct Offset {
 }
 
 // 定义一个结构体常量
-Point point1 = Point { x: 0, y: 0 }
+Point point1 = Point(x: 0, y: 0)
 // 与以下两种方式等价
-_ point1 = Point { x: 0, y: 0 }
-Point point1 = Point { x: 0, y: 0 }
+_ point1 = Point(x: 0, y: 0)
+Point point1 = Point(x: 0, y: 0)
 
-Point point move_point(Point point, Offset offset) {
+Point move_point(Point point, Offset offset) {
   // 返回一个新的point
-  return Point { x: point.x + offset.x, y: point.y + offset.y }
+  return Point(x: point.x + offset.x, y: point.y + offset.y)
   // 与以下方式等价
-  // return Point { x: point.x + offset.x, y: point.y + offset.y }
+  // return Point(x: point.x + offset.x, y: point.y + offset.y)
 }
 ```
 
@@ -1537,9 +1538,9 @@ struct 可以自定义 `init` 函数。
 - `init` 只允许 `return;` / `return ();`
 - `Point(...)` / `new Point(...)` 是结构体构造语法
 - 如果类型定义了一个或多个 `init`，那么 `Point(...)` 会在这些 `init` 中按参数个数和参数类型做重载决议
-- `init` 支持普通位置参数、命名参数和尾部默认参数，规则与普通函数一致
-- 如果类型没有定义 `init`，那么默认字段初始化使用 `Point { field: value }`
-- 只要类型定义了 `init`，就不允许再用 `Point { ... }`
+- `init` 支持普通位置参数、命名参数和默认参数，规则与普通函数一致
+- 如果类型没有定义 `init`，默认构造器使用 `Point(field: value)`
+- 只要类型定义了 `init`，`Point(...)` 就只参与显式 `init` 的重载决议
 - `new` 只接受构造形式，不支持任意表达式
 - 例如：
   - `new Int`
@@ -1660,7 +1661,7 @@ struct User {
 }
 
 Int a = User.zero();
-User user = User { id: 42 };
+User user = User(id: 42);
 Int b = user.value();
 ```
 
@@ -1713,12 +1714,12 @@ Jiang语言中，结构体即可以是值类型，也可以是引用类型。这
 
 ```c
 // p1为值
-Point p1 = Point { x: 0, y: 0 }
+Point p1 = Point(x: 0, y: 0)
 // p1赋值给p2是值拷贝
 Point p2 = p1
 
 // p3为 owning pointer，此时为引用类型
-Point^ p3 = new Point { x: 100, y: 200 }
+Point^ p3 = new Point(x: 100, y: 200)
 
 // 由于Jiang语言的 owning pointer 默认自动解引用，此时的p3被当成值
 print("p3.x = %d, p3.y = %d", p3.x, p3.y) // 输出：p3.x = 100, p3.y = 200
@@ -1774,7 +1775,7 @@ enum Priority {
 }
 
 // 显式指定值类型为UInt16
-enum(UInt16) HttpStatus {
+enum [UInt16] HttpStatus {
     ok = 200,
     created = 201,
     bad_request = 400,
@@ -1808,7 +1809,7 @@ Jiang 的 `union` 是安全的 tagged union：每个值都会携带当前 varian
 `union` 可以复用已有 `enum` 作为 tag，也可以省略 tag enum，由编译器根据 variant 名自动生成隐式 tag。`enum` 只表示 tag/value set；`union` 表示 tag 加 payload 的 sum type。
 
 ```c
-enum(UInt8) Kind {
+enum [UInt8] Kind {
   a = 1,
   b,
   c,
@@ -1867,7 +1868,7 @@ enum Kind {
   b,
 }
 
-union(Kind) ExplicitResult {
+union [Kind] ExplicitResult {
   Int a;
   Int b;
 }
@@ -1880,7 +1881,7 @@ union ImplicitResult {
 
 规则：
 
-- `union(TagEnum)` 的 variant 名必须能对应到 `TagEnum` 的成员。
+- `union [TagEnum]` 的 variant 名必须能对应到 `TagEnum` 的成员。
 - 省略 tag enum 时，编译器按 variant 声明生成隐式 tag。
 - `union` variant 本身不单独声明 `public` / `private`，只由外层 `union` 是否公开决定。
 - 如果 `union` 是 `public`，它的 variant 属于公开类型表面；如果 `union` 不公开，variant 也只在模块内可见。
@@ -1984,20 +1985,22 @@ add<Float>(3.14, 9.8);
 
 /// 定义泛型结构体
 @where(T: Numeric)
+@region(a)
 struct Foo<T> {
+  @life(a)
   T value;
 
-  T bar() {
+  T bar(self) {
     return self.value * 2;
   }
 }
 
-// 此时 T 推断为 Int
-Foo x = { value: 123 };
+// 显式给出实例类型，并使用 expected type 构造简写
+Foo<Int> x = .(value: 123);
 // 此时 T 明确为 Float
-Foo<Float> y = Foo<Float> { value: 3.14 };
+Foo<Float> y = Foo<Float>(value: 3.14);
 // 也可以写成
-_ z = Foo<Float> { value: 3.14 };
+_ z = Foo<Float>(value: 3.14);
 ```
 
 泛型参数的顶层 `!` 能力约束当前只有显式 `Mutable` 模式：
@@ -2006,11 +2009,13 @@ _ z = Foo<Float> { value: 3.14 };
 
 ```c
 @where(T: Mutable)
+@region(a)
 struct MutableBox<T> {
+  @life(a)
   T value;
 }
 
-MutableBox<Int*!> a = MutableBox<Int*!> { value: null };
+MutableBox<Int*!> a = MutableBox<Int*!>(value: null);
 ```
 
 其中：
@@ -2074,7 +2079,7 @@ trait Equatable {
 }
 
 trait Hashable: Equatable {
-  UInt64 hash();
+  () hash<H: Hasher>(self, H&! hasher);
 }
 ```
 
@@ -2090,21 +2095,21 @@ trait HashEq: Hashable {
 
 ```c
 trait AddInt {
-  Int apply(Int delta);
+  Int apply(self, Int delta);
 }
 
 trait FlagValue {
-  Int apply(Bool flag);
+  Int apply(self, Bool flag);
 }
 
 struct Counter: AddInt, FlagValue {
   Int base;
 
-  Int apply(Int delta) {
+  Int apply(self, Int delta) {
     return self.base + delta;
   }
 
-  Int apply(Bool flag) {
+  Int apply(self, Bool flag) {
     if (flag) {
       return self.base + 10;
     }
@@ -2112,7 +2117,7 @@ struct Counter: AddInt, FlagValue {
   }
 }
 
-Counter counter = Counter { base: 30 };
+Counter counter = Counter(base: 30);
 Int a = counter.apply(2);
 Int b = counter.apply(true);
 ```
@@ -2227,17 +2232,17 @@ public trait SubscriptSet: SubscriptGet {
 
 ```c
 trait HasValue {
-  Int value();
+  Int value(self);
 }
 
 trait HasDouble: HasValue {
-  Int double_value();
+  Int double_value(self);
 }
 
 struct Box: HasValue {
   Int inner;
 
-  Int value() {
+  Int value(self) {
     return self.inner;
   }
 }
@@ -2314,7 +2319,7 @@ extend Counter: Iterator {
 
 ```c
 trait HasValue {
-  Int value();
+  Int value(self);
 }
 
 struct User {
@@ -2322,13 +2327,13 @@ struct User {
 }
 
 extend User {
-  Int id_value() {
+  Int id_value(self) {
     return self.id;
   }
 }
 
 extend User: HasValue {
-  Int value() {
+  Int value(self) {
     return self.id;
   }
 }
@@ -2511,7 +2516,7 @@ lexer/
 [package]
 name = frontend
 root = src/main.jiang
-version = 0.4.3
+version = 1.0.0
 ```
 
 当前第一版 package 机制还支持本地依赖：

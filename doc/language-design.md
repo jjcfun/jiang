@@ -3,8 +3,9 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `release/0.4.8` 分支在既有自举编译器、泛型/trait、MIR/backend、闭包、async/domain
-和源码级语言测试基础上，完善一等 Task、协作式取消、Movable/Copyable 与多线程同步 API。
+当前 `main` 以 Jiang 0.4.9 stable 为自举基线，在既有泛型/trait、MIR/backend、所有权和
+Task 基础上，已经接入具名 lifetime region、Shape-aware lifetime contract、brace closure、
+尾随闭包、非尾部默认参数、trait 默认实现和基于 `Hasher` 的 `Hashable`。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
@@ -740,7 +741,7 @@ package 对外导出面固定为 root file 的 public namespace：
 - root file 的 public declaration 是 package API。
 - root file 的 `public import` 可以重新导出一个 module namespace，但不 flatten 目标 module
   的 declarations。
-- root file 的 `public alias` 可以重新导出一个具体 public symbol。
+- root file 的 `public alias` 可以重新导出 public symbol；函数 alias 保留目标 overload family。
 - 非 root module 的 public declaration 不会自动暴露为 package API。
 - dependency package 中的 `main` 不参与当前 package 的 hosted entry wrapper 选择。
 
@@ -759,13 +760,16 @@ alias name = module.symbol;
 public alias Bool;
 ```
 
-如果右侧解析为已有 namespace/type/value/member symbol，alias 会绑定到同一个 name domain，
-并在 HIR 中记录目标 `DefId`。如果右侧不能解析为已有 symbol，则按 type alias 处理，右侧必须
-是类型语法。
+如果右侧解析为已有 namespace/type/value/member symbol，alias 会绑定到同一个 name domain。
+非函数 alias 在 HIR 中记录单一目标 `DefId`；函数 alias 记录一个可见 public overload anchor，
+调用时在目标原始 namespace 和 name 下枚举 public overload set，再执行普通重载决议。目标模块
+的 private 同名函数不会通过 alias 暴露。如果右侧不能解析为已有 symbol，则按 type alias
+处理，右侧必须是类型语法。
 
 `public alias` 是 package public surface 的显式 re-export 机制。package 对外只暴露 root file
 的 public namespace；root file 可以通过 `public import` 重新导出模块命名空间，也可以通过
-`public alias` 重新导出某个具体符号。非 root module 的 public 声明不会自动成为 package API。
+`public alias` 重新导出符号或函数 overload family。非 root module 的 public 声明不会自动成为
+package API。
 
 未定事项：
 
@@ -790,21 +794,22 @@ Int add(Int left, Int right) {
 }
 ```
 
-函数参数支持默认值。带默认值的参数必须位于参数列表尾部；当前默认值只支持 literal，
-并按参数的 expected type 检查：
+函数参数支持默认值。默认参数可以出现在任意位置；当前默认值只支持 literal，并按参数的
+expected type 检查：
 
 ```jiang
-Int add(Int left, Int right = 1) {
+Int add(Int left = 1, Int right) {
     return left + right;
 }
 ```
 
-调用支持 C# 风格命名参数。位置参数必须出现在命名参数之前；命名参数可以重排，
-也可以跳过带默认值的参数：
+位置实参总是绑定最早尚未绑定的参数，不会按类型跳过默认参数。命名参数可以重排，也可以跳过
+带默认值的参数；第一个命名参数出现后，后续普通参数都必须使用命名形式：
 
 ```jiang
-add(10);
-add(10, right: 20);
+add(10, 20);
+add(right: 20);
+add(left: 10, right: 20);
 draw(x: 1, y: 2);
 ```
 
@@ -1047,7 +1052,7 @@ trait Equatable {
 }
 
 trait Hashable: Equatable {
-    UInt64 hash(self);
+    () hash<H: Hasher>(self, H&! hasher);
 }
 
 trait Indexable {
@@ -1368,7 +1373,8 @@ if block is .some(Int dead!) {
 - `public import` 导入当前模块使用，并将被导入模块作为当前模块 public API 中的一个模块
   命名空间重新导出。它不摊平被导入模块的声明；例如 `middle` 中 `public import leaf;` 后，
   外部通过 `middle.leaf.Name` 访问，而不是 `middle.Name`。
-- `public alias name = target;` 将一个具体 symbol 重新导出到当前模块 public namespace。
+- `public alias name = target;` 将 symbol 重新导出到当前模块 public namespace；函数目标保留
+  目标 namespace/name 下的 public overload family。
 - `public` 标记声明对外可见。
 - 基本类型不是关键字，由名字解析绑定到内建声明。
 
@@ -1456,17 +1462,17 @@ Domain effect 是调用上下文与 ABI 的语言规则，不属于下面设想�
 
 ```jiang
 @effect(read)
-Int get() {
+Int get(self) {
     return self.value;
 }
 
 @effect(write(self))
-Void set(Int value) {
+() set(Self&! self, Int value) {
     self.value = value;
 }
 
 @effect(write(self), io, alloc)
-Void save(File& file) {
+() save(self, File& file) {
 }
 ```
 

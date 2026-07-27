@@ -1,19 +1,14 @@
 # Jiang 编译器开发流程
 
-本文记录 Jiang release 分支的自举和验证流程。常规版本优先依赖上一版正式 release
-编译器；只有当前 release 编译器无法直接编译新源码时，才启用 bootstrap / release
-双 worktree 模式。
+本文记录 Jiang 的自举和验证流程。常规开发使用上一版正式 release 编译器；只有该编译器
+无法直接编译新源码时，才建立一个或多个最小 bootstrap 过渡阶段。
 
-## 常规 release 模式
+## 常规开发
 
-常规版本从 `main` 建立 `release/<version>`，使用上一版正式 release 的 `jiangc` 构建当前源码。
-当当前版本需要 bootstrap 分支承接破坏性升级时，`release/<version>` 使用同版本 bootstrap
-编译器继续开发和验证。
-
-推荐安装路径：
+当前 `main` 默认使用已安装的 Jiang 0.4.9 stable：
 
 ```text
-~/.jiang/versions/<previous-version>/bin/jiangc
+~/.jiang/versions/0.4.9/bin/jiangc
 ```
 
 构建当前源码：
@@ -22,136 +17,97 @@
 bash ./script/build_next.sh
 ```
 
-脚本会校验 bootstrap compiler 版本。如果需要使用其他路径的兼容编译器，可以显式指定：
+脚本会校验 bootstrap compiler 版本。需要使用其他兼容编译器时，可以显式指定：
 
 ```bash
-BOOTSTRAP_BIN=/path/to/previous/bin/jiangc bash ./script/build_next.sh
+BOOTSTRAP_RELEASE_VERSION=<version> \
+BOOTSTRAP_BIN=/path/to/compatible/jiangc \
+bash ./script/build_next.sh
 ```
 
-提交前至少跑：
+提交功能前优先运行相关语言测试。需要检查完整语言测试时：
 
 ```bash
 VERIFY=none bash ./script/build_next.sh
 JIANGC=./build/bin/jiangc.next bash ./script/lang_check.sh
 ```
 
-正式 release 前生成 stable，并用 stable 跑语言测试：
+正式 release 前生成 stable，并执行完整验证：
 
 ```bash
-BOOTSTRAP_DEPTH=stable VERIFY=none bash ./script/build_next.sh
-JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
+BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 ```
 
-## 0.4.8 自举链
+## 破坏性升级
 
-0.4.8 的所有权基础和编译器源码升级由 bootstrap 分支承接，固定使用以下链路：
+如果上一版 stable 无法解析或编译新源码，先从上一版可编译的源码建立
+`bootstrap/<version>`。过渡分支只实现让下一阶段可编译所需的最小能力，不作为用户 release。
+
+如果一轮过渡仍不足，可以增加 `bootstrap/<version>-2`。不要预先固定阶段数量；每个阶段都必须
+由前一阶段编译，并且其 `jiangc.next` 必须通过新语法所需的语言测试。
+
+通用链路为：
 
 ```text
-0.4.7 stable
-  -> bootstrap/0.4.8 的 jiangc.next
-  -> release/0.4.8 的 jiangc.next
-  -> release/0.4.8 的 stable jiangc
+previous stable
+  -> bootstrap/<version>
+  -> bootstrap/<version>-2（仅在需要时）
+  -> release/<version> next
+  -> release/<version> stable
 ```
 
-bootstrap worktree 只负责第一条边，不要求用 bootstrap next 再编译 bootstrap 自己。
+release 分支最终 rebase 到最后一个 bootstrap checkpoint，使源码历史和可复现自举顺序一致。
+各阶段必须使用独立 build 目录，不混用编译产物。
 
-构建 bootstrap next：
+## Jiang 0.4.9 的可复现自举链
 
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.4.7 \
-BOOTSTRAP_BIN=$HOME/.jiang/versions/0.4.7/bin/jiangc \
-VERIFY=none \
-bash ./script/build_next.sh
+0.4.9 的 lifetime 语法和编译器源码升级需要两个过渡编译器。发布后固定的链路为：
+
+```text
+Jiang 0.4.8 stable
+  -> tag 0.4.9-bootstrap
+  -> tag 0.4.9-bootstrap2
+  -> tag 0.4.9 的 next
+  -> Jiang 0.4.9 stable
 ```
 
-release worktree 使用对外报告 `jiang 0.4.8` 的 bootstrap next：
+在新机器上复现时，依次 checkout 对应 tag，并把前一阶段生成的 `build/bin/jiangc.next`
+作为下一阶段的 `BOOTSTRAP_BIN`。最后在 `0.4.9` tag 上运行：
 
 ```bash
-BOOTSTRAP_RELEASE_VERSION=0.4.8 \
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.8/build/bin/jiangc.next \
-VERIFY=none \
-bash ./script/build_next.sh
-```
-
-生成 release stable 并执行语言测试：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=0.4.8 \
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-0.4.8/build/bin/jiangc.next \
+BOOTSTRAP_RELEASE_VERSION=0.4.9 \
+BOOTSTRAP_BIN=/path/to/0.4.9-bootstrap2/build/bin/jiangc.next \
 BOOTSTRAP_DEPTH=stable \
 VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-## 双 worktree 模式
-
-当新版本需要引入上一版 release 编译器无法直接编译的语法、core 源码组织或编译器内部
-结构时，使用两个 worktree：
-
-- `bootstrap/<version>`：过渡编译器分支，只负责产出能编译正式版本的编译器。
-- `release/<version>`：正式发布分支，使用 bootstrap 编译器继续开发和验证。
-
-推荐目录：
-
-```text
-/Users/jjc/project/jiang/bootstrap-<version>  -> bootstrap/<version>
-/Users/jjc/project/jiang/jiang                -> release/<version>
-```
-
-双 worktree 开发步骤：
-
-1. 从上一个正式 release 建立 `bootstrap/<version>`。
-2. 在 `bootstrap/<version>` 中实现最小过渡能力。
-3. 用上一个正式 release 编译器构建 bootstrap 编译器。
-4. 从 bootstrap checkpoint 建立或继续 `release/<version>`。
-5. 在 `release/<version>` 中实现正式功能。
-6. 用 bootstrap 编译器构建 `release/<version>`。
-7. 在 `release/<version>` 上跑完整语言测试和 stable bootstrap。
-8. 正式发布时只给 `release/<version>` 打用户可见 tag。
-
-`bootstrap/<version>` 只需要一轮自举：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=<previous-version> \
-BOOTSTRAP_BIN=/path/to/previous/release/jiangc \
-bash ./script/build_next.sh
-```
-
-它的验证目标是产出可用的过渡编译器，不作为正式 release 发布。
-
-`release/<version>` 使用 bootstrap 编译器验证：
-
-```bash
-BOOTSTRAP_RELEASE_VERSION=<version> \
-BOOTSTRAP_BIN=/Users/jjc/project/jiang/bootstrap-<version>/build/bin/jiangc.next \
-bash ./script/build_next.sh
-```
+这些 tag 是历史自举输入。当前 0.5 开发直接使用已安装的 0.4.9 stable，不需要恢复 bootstrap
+worktree。
 
 ## 分支和 tag 规则
 
 - `release/<version>` 是正式发布分支。
-- `bootstrap/<version>` 只在破坏性升级时创建，是内部过渡分支。
-- 一般不需要给 bootstrap 分支立即打 tag。
-- 如果需要固定 bootstrap checkpoint，可以打内部 tag：`<version>-bootstrap`。
-- 用户可见 release tag 只打在 `release/<version>` 上。
+- `bootstrap/<version>` 只在破坏性升级时创建。
+- 第二个过渡阶段使用 `bootstrap/<version>-2`，对应 tag `<version>-bootstrap2`。
+- 第一个固定 checkpoint 使用 tag `<version>-bootstrap`。
+- 用户 release tag `<version>` 只指向正式 release 源码。
+- 发布后可以删除本地 bootstrap worktree；tag 保留可复现链。
 
-## 代码迁移规则
+## 迁移和验证规则
 
-从后续实验分支 cherry-pick 代码到正式版本时：
-
-- 只 pick 已经被当前 bootstrap compiler 支持的改动。
-- 不直接 pick 被当前正式线重构替代的旧实现。
-- 破坏性能力先落在 bootstrap 分支，正式功能再落在 release 分支。
-- 每个大功能完成后提交一次；提交前跑完整语言测试。
+- 只迁移当前 bootstrap compiler 已支持的源码改动。
+- 删除旧语法前，先保证下一阶段编译器可以解析新语法且相关语言测试通过。
+- 闭包等后续破坏性语法若超过当前 stable 能力，再建立新的 bootstrap 链，不复用已发布版本的
+  历史 worktree。
+- 每完成一个功能可以提交；提交前运行直接相关测试。
+- 测试失败时先修复该失败，不重复运行已经通过且与修改无关的部分。
+- 完整自举和 full-test 留到发布验证阶段。
+- 不为了通过测试恢复已经废弃的兼容语义。
 
 ## 注意事项
 
-- 常规 release 分支不要依赖仓库内 `dist/` 展开路径作为默认 bootstrap；默认路径应指向
-  `~/.jiang/versions/<previous-version>/bin/jiangc`。
-- 如果 `~/.jiang/bin/jiangc` 被切到其它版本，不应影响 release 分支构建；脚本应使用固定
-  versioned path。
-- 双 worktree 模式下，不要在 `release/<version>` 上用旧 release 编译器判断是否支持新语法；
-  正式线应以 `bootstrap/<version>` 编译器为准。
-- 不要把 bootstrap 分支作为用户 release 发布。
-- 不要让 bootstrap worktree 和 release worktree 混用 build 产物。
-- 如果默认 worktree 要切到正式发布线，先确认其它实验分支的未提交改动已经提交或 stash。
+- 默认 bootstrap 使用固定 versioned path，不受 `~/.jiang/bin/jiangc` 当前指向影响。
+- 不依赖仓库内 `dist/` 解压目录作为默认 bootstrap。
+- bootstrap 和 release 阶段不能共享 build 产物。
+- bootstrap checkpoint 必须能独立编译下一阶段，不能依赖未提交源码。

@@ -63,13 +63,13 @@ bash ./script/install_llvm.sh --user
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-0.4.9 release 分支直接使用已发布的 Jiang 0.4.8 stable 编译器作为 bootstrap 输入。默认路径：
+当前 `main` 默认使用已发布的 Jiang 0.4.9 stable 编译器作为 bootstrap 输入。默认路径：
 
 ```text
-~/.jiang/versions/0.4.8/bin/jiangc
+~/.jiang/versions/0.4.9/bin/jiangc
 ```
 
-安装 0.4.8 后可直接运行：
+安装 0.4.9 后可直接运行：
 
 ```bash
 bash ./script/build_next.sh
@@ -78,7 +78,7 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-~/.jiang/versions/0.4.8/bin/jiangc -> build/bin/jiangc.next
+~/.jiang/versions/0.4.9/bin/jiangc -> build/bin/jiangc.next
 ```
 
 并默认用 `build/bin/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
@@ -98,8 +98,9 @@ build/bin/jiangc.next
 BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 ```
 
-破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。正式 release 前需要在
-`release/<version>` 上使用对应的 `bootstrap/<version>` 编译器完成构建、语言测试和 stable bootstrap。
+破坏性升级版本的开发流程见 [编译器开发流程](doc/develop.md)。Jiang 0.4.9 的可复现历史
+自举链使用 `0.4.9-bootstrap` 和 `0.4.9-bootstrap2` 两个过渡 tag；普通开发不需要保留对应
+worktree。
 
 当前 release 只承诺 macOS arm64 hosted `jiangc`。Linux `jiangc` release 暂缓到语法和
 bootstrap pipeline 稳定之后。源码中已有 Linux x86_64/aarch64、Wasm `wasm32-unknown-unknown`、

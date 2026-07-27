@@ -25,7 +25,7 @@
 
 - 支持读取外层局部变量的闭包。
 - 支持把闭包赋给显式 `Fn<...>` 类型的局部变量或参数。
-- 支持后续用 `new lambda` 创建 `Fn<...>^` 堆闭包。
+- 支持用 `new { ... }` 创建 `Fn<...>^` 堆闭包。
 - 支持非捕获 lambda 初始化 `RawFn<...>`。
 - 支持 `RawFn<...>` 与 C 函数指针互通。
 - 基础闭环支持默认捕获推导，并由 lifetime / borrow check 阻止借用逃逸。
@@ -358,7 +358,7 @@ Fn<Int> f = { => local + 1 };
 Int value = f();
 ```
 
-`Fn<...>^` 的 env memory 在 heap 上。`new lambda` 会直接构造 heap closure object；隐式捕获仍可
+`Fn<...>^` 的 env memory 在 heap 上。`new { ... }` 会直接构造 heap closure object；隐式捕获仍可
 使用，但默认是引用捕获，因此是否能流出当前作用域交给 lifetime / borrow check 判断：
 
 - `return new { => 1 }` 没有外部 borrow，可以通过。
@@ -532,8 +532,8 @@ environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 
 - [x] 非捕获裸 `Fn` 返回也会报错。
 - [x] `Fn` 是 movable/non-copy closure value；赋值默认 move，也可以用 `$.move()` 强制显式转移。
 - [x] `Fn<...>` 和 `Fn<...>^` 不暴露 `$.ptr()`。
-- [x] `new lambda` 构造 `Fn<...>^` 的非捕获闭包，并支持直接调用。
-- [x] `new lambda` 捕获字段的 heap env 后端 lowering 完整验证。
+- [x] `new { ... }` 构造 `Fn<...>^` 的非捕获闭包，并支持直接调用。
+- [x] `new { ... }` 捕获字段的 heap env 后端 lowering 完整验证。
 - [x] `Fn^$.ref()` 返回 `Fn&`，用于把 heap closure 临时借成 callable view。
 - [x] 裸 `Fn` 显式 owner capture 随 stack closure object 离开 scope 自动 drop。
 - [x] `Fn^` 可放入 struct、optional、tuple、array 后返回，并借成 `Fn&` 调用。
