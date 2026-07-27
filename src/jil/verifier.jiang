@@ -1,0 +1,412 @@
+// JIL pass 的结构验证器。
+//
+// 每个会改变 JIL 的 pass 都必须在约定边界验证 CFG、local/place 和阶段状态。
+// 验证失败表示编译器内部不变量被破坏，backend 不得继续消费该 Store。
+
+import context = "../context.jiang";
+import diagnostic_helper = "../diagnostic/helper.jiang";
+import jil = "../jil.jiang";
+import std;
+
+public enum Stage {
+    lower_output,
+    drop_input,
+    drop_output,
+    backend_input,
+}
+
+public Bool verify(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    Stage stage
+) {
+    if (store.has_errors()) { return false; }
+    if (!verify_globals(store) || !verify_functions(store, stage)) {
+        add_failure(ctx, stage);
+        store.mark_error();
+        return false;
+    }
+    return true;
+}
+
+Bool verify_globals(jil.Store& store) {
+    Int index! = 0;
+    while (index < store.globals.len()) {
+        if (store.globals.get(index).id.to_index() != index) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_functions(jil.Store& store, Stage stage) {
+    Int index! = 0;
+    while (index < store.functions.len()) {
+        jil.Function function = store.functions.get(index);
+        if (function.id.to_index() != index) { return false; }
+        if (!verify_function(store, function, stage)) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_function(jil.Store& store, jil.Function function, Stage stage) {
+    if (function.is_external && function.body.blocks.length == 0) { return true; }
+    if (function.body.id.to_index() != function.id.to_index()) { return false; }
+    if (!verify_drop_stage(store, function, stage)) { return false; }
+    if (!verify_locals(function.body)) { return false; }
+    Bool allow_cancel = function.is_coroutine
+        && !function.is_coroutine_resume
+        && !function.is_coroutine_completion;
+    if (!verify_blocks(function.body, stage, allow_cancel)) { return false; }
+    return true;
+}
+
+Bool verify_drop_stage(jil.Store& store, jil.Function function, Stage stage) {
+    if (stage != .drop_output && stage != .backend_input) { return true; }
+    return store.is_drop_elaborated(function.id);
+}
+
+Bool verify_locals(jil.Body body) {
+    if (!local_valid(body, body.return_local)) { return false; }
+    Int index! = 0;
+    while (index < body.locals.length) {
+        if (body.locals[index].id.to_index() != index) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_blocks(jil.Body body, Stage stage, Bool allow_cancel) {
+    if (!block_valid(body, body.entry)) { return false; }
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        jil.Block block = body.blocks[index];
+        if (block.id.to_index() != index) { return false; }
+        if (!verify_block(body, block, stage, allow_cancel)) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_block(
+    jil.Body body,
+    jil.Block block,
+    Stage stage,
+    Bool allow_cancel
+) {
+    Int index! = 0;
+    while (index < block.statements.length) {
+        if (!verify_statement(body, block.statements[index])) { return false; }
+        index = index + 1;
+    }
+    if (!verify_successors(body, block.terminator)) { return false; }
+    return verify_terminator(body, block.terminator, stage, allow_cancel);
+}
+
+Bool verify_successors(jil.Body body, jil.Terminator terminator) {
+    Int index! = 0;
+    while (index < jil.terminator_successor_count(terminator)) {
+        if (!block_valid(body, jil.terminator_successor_at(terminator, index))) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_statement(jil.Body body, jil.Statement statement) {
+    if (statement.kind is .assign_stmt(assign)) {
+        return verify_place(body, assign.destination) && verify_rvalue(body, assign.value);
+    }
+    if (statement.kind is .atomic_store_stmt(atomic_store)) {
+        return verify_place(body, atomic_store.destination)
+            && verify_operand(body, atomic_store.value);
+    }
+    if (statement.kind is .executor_leave_stmt(executor_leave)) {
+        return local_valid(body, executor_leave.executor)
+            && local_valid(body, executor_leave.previous_context);
+    }
+    if (statement.kind is .task_suspend_stmt(task_suspend)) {
+        return verify_place(body, task_suspend.task);
+    }
+    if (statement.kind is .task_complete_stmt(task_complete)) {
+        return verify_place(body, task_complete.task);
+    }
+    if (statement.kind is .storage_live_stmt(storage_live)) {
+        return local_valid(body, storage_live.local_id);
+    }
+    if (statement.kind is .storage_dead_stmt(storage_dead)) {
+        return local_valid(body, storage_dead.local_id);
+    }
+    if (statement.kind is .set_discriminant_stmt(set_discriminant)) {
+        return verify_place(body, set_discriminant.destination);
+    }
+    if (statement.kind is .forget_stmt(forget)) {
+        return verify_place(body, forget.place);
+    }
+    if (statement.kind is .exclusive_stmt(exclusive)) {
+        return verify_place(body, exclusive.place);
+    }
+    if (statement.kind is .task_consume_stmt(task_consume)) {
+        return verify_task_consume(body, task_consume);
+    }
+    if (statement.kind is .task_region_start_stmt(task_start)) {
+        return verify_task_region_start(body, task_start);
+    }
+    if (statement.kind is .task_release_stmt(task_release)) {
+        return verify_task_release(body, task_release);
+    }
+    if (statement.kind is .task_owner_release_stmt(owner_release)) {
+        return verify_place(body, owner_release.pointer);
+    }
+    if (statement.kind is .task_wait_stmt(task_wait)) {
+        return verify_place(body, task_wait.state)
+            && verify_operand(body, task_wait.expected);
+    }
+    return false;
+}
+
+Bool verify_task_consume(jil.Body body, jil.TaskConsumeStatement statement) {
+    if (!verify_place(body, statement.task)) { return false; }
+    if (statement.task_local is .some(local_id)) {
+        return local_valid(body, local_id);
+    }
+    return true;
+}
+
+Bool verify_task_region_start(jil.Body body, jil.TaskRegionStartStatement statement) {
+    return verify_place(body, statement.task)
+        && local_valid(body, statement.task_local);
+}
+
+Bool verify_task_release(jil.Body body, jil.TaskReleaseStatement statement) {
+    if (!verify_place(body, statement.task_pointer)) { return false; }
+    if (!verify_place(body, statement.frame)) { return false; }
+    if (!verify_place(body, statement.state)) { return false; }
+    if (!verify_place(body, statement.result)) { return false; }
+    if (statement.task_local is .some(local_id)) {
+        return local_valid(body, local_id);
+    }
+    return true;
+}
+
+Bool verify_terminator(
+    jil.Body body,
+    jil.Terminator terminator,
+    Stage stage,
+    Bool allow_cancel
+) {
+    if (terminator.kind is .branch_term(branch)) {
+        return verify_operand(body, branch.condition);
+    }
+    if (terminator.kind is .switch_term(switch_term)) {
+        return verify_operand(body, switch_term.discriminator);
+    }
+    if (terminator.kind is .call_term(call_term)) {
+        return verify_call(body, call_term);
+    }
+    if (terminator.kind is .drop_term(drop_term)) {
+        return verify_place(body, drop_term.place);
+    }
+    if (terminator.kind is .assert_term(assert_term)) {
+        return verify_operand(body, assert_term.condition);
+    }
+    if (terminator.kind is .suspend_pending_term(suspend_pending)) {
+        if (suspend_pending.task_local is .some(local_id)) {
+            return local_valid(body, local_id);
+        }
+        return true;
+    }
+    if (terminator.kind is .throw_term(throw_term)) {
+        return verify_operand(body, throw_term.error_value);
+    }
+    if (terminator.kind is .cancel_term(_)) {
+        return allow_cancel || (stage != .drop_output && stage != .backend_input);
+    }
+    return true;
+}
+
+Bool verify_call(jil.Body body, jil.CallTerminator call_term) {
+    if (!verify_callee(body, call_term.callee)) { return false; }
+    if (!verify_operands(body, call_term.args)) { return false; }
+    if (!verify_place(body, call_term.destination)) { return false; }
+    if (!verify_optional_place(body, call_term.initialized_place)) { return false; }
+    if (!verify_optional_operands(body, call_term.lifetime_args)) { return false; }
+    if (!verify_optional_place(body, call_term.lifetime_destination)) { return false; }
+    return verify_places(body, call_term.exclusive_places);
+}
+
+Bool verify_callee(jil.Body body, jil.CallCallee callee) {
+    if (callee is .direct_function(_)) { return true; }
+    if (callee is .indirect_operand(operand)) {
+        return verify_operand(body, operand);
+    }
+    if (callee is .domain_enqueue(enqueue)) {
+        return verify_optional_operand(body, enqueue.task)
+            && verify_operand(body, enqueue.resume);
+    }
+    guard callee is .dynamic_domain_enqueue(enqueue) else { return false; }
+    return verify_operand(body, enqueue.executor)
+        && verify_optional_operand(body, enqueue.task)
+        && verify_operand(body, enqueue.resume);
+}
+
+Bool verify_places(jil.Body body, jil.Place[]& places) {
+    Int index! = 0;
+    while (index < places.length) {
+        if (!verify_place(body, places[index])) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_optional_place(jil.Body body, jil.Place? place) {
+    if (place is .some(value)) { return verify_place(body, value); }
+    return true;
+}
+
+Bool verify_place(jil.Body body, jil.Place place) {
+    if (place.base is .local(local_id)) {
+        if (!local_valid(body, local_id)) { return false; }
+        if (place.local_id.to_index() != local_id.to_index()) { return false; }
+    }
+    Int index! = 0;
+    while (index < place.projection.length) {
+        if (place.projection[index] is .index_projection(projection)) {
+            if (!local_valid(body, projection.index_local)) { return false; }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_operands(jil.Body body, jil.Operand[]& operands) {
+    Int index! = 0;
+    while (index < operands.length) {
+        if (!verify_operand(body, operands[index])) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_optional_operands(jil.Body body, jil.Operand[]&? operands) {
+    if (operands is .some(values)) { return verify_operands(body, values); }
+    return true;
+}
+
+Bool verify_optional_operand(jil.Body body, jil.Operand? operand) {
+    if (operand is .some(value)) { return verify_operand(body, value); }
+    return true;
+}
+
+Bool verify_operand(jil.Body body, jil.Operand operand) {
+    if (operand is .copy_operand(copy)) { return verify_place(body, copy.place); }
+    if (operand is .move_operand(move)) { return verify_place(body, move.place); }
+    if (operand is .out_operand(out)) { return verify_place(body, out.place); }
+    return true;
+}
+
+Bool verify_rvalue(jil.Body body, jil.Rvalue value) {
+    if (value is .use_value(use)) { return verify_operand(body, use.value); }
+    if (value is .unary_value(unary)) { return verify_operand(body, unary.value); }
+    if (value is .binary_value(binary)) {
+        return verify_operand(body, binary.lhs) && verify_operand(body, binary.rhs);
+    }
+    if (value is .cast_value(cast)) { return verify_operand(body, cast.value); }
+    if (value is .inline_asm_value(inline_asm)) {
+        return verify_inline_asm(body, inline_asm);
+    }
+    if (value is .borrow_value(borrow)) { return verify_place(body, borrow.place); }
+    if (value is .address_of_value(address)) { return verify_place(body, address.place); }
+    if (value is .coroutine_address_value(address)) {
+        return verify_place(body, address.place);
+    }
+    if (value is .executor_enter_value(enter)) {
+        return local_valid(body, enter.executor) && local_valid(body, enter.context);
+    }
+    if (value is .atomic_load_value(load)) { return verify_place(body, load.place); }
+    if (value is .atomic_exchange_value(exchange)) {
+        return verify_place(body, exchange.place) && verify_operand(body, exchange.desired);
+    }
+    if (value is .atomic_compare_exchange_value(exchange)) {
+        return verify_atomic_compare_exchange(body, exchange);
+    }
+    if (value is .coroutine_frame_alloc_value(alloc)) {
+        return verify_operand(body, alloc.executor);
+    }
+    if (value is .alloc_value(alloc)) { return verify_operand(body, alloc.value); }
+    if (value is .alloc_array_value(alloc)) { return verify_operand(body, alloc.count); }
+    if (value is .free_value(free)) { return verify_operand(body, free.pointer); }
+    if (value is .coroutine_frame_free_value(free)) {
+        return verify_operand(body, free.pointer) && verify_operand(body, free.executor);
+    }
+    if (value is .slice_value(slice)) { return verify_slice(body, slice); }
+    if (value is .len_value(len)) { return verify_place(body, len.place); }
+    if (value is .discriminant_value(discriminant)) {
+        return verify_place(body, discriminant.place);
+    }
+    if (value is .aggregate_value(aggregate)) {
+        return verify_optional_operand(body, aggregate.tag)
+            && verify_operands(body, aggregate.fields);
+    }
+    if (value is .optional_value(optional)) {
+        return verify_operand(body, optional.value);
+    }
+    if (value is .error_union_value(error_union)) {
+        return verify_operand(body, error_union.value);
+    }
+    return true;
+}
+
+Bool verify_inline_asm(jil.Body body, jil.InlineAsmRvalue inline_asm) {
+    Int index! = 0;
+    while (index < inline_asm.operands.length) {
+        if (inline_asm.operands[index] is .input(input)) {
+            if (!verify_operand(body, input.value)) { return false; }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool verify_atomic_compare_exchange(
+    jil.Body body,
+    jil.AtomicCompareExchangeRvalue exchange
+) {
+    return verify_place(body, exchange.place)
+        && verify_operand(body, exchange.expected)
+        && verify_operand(body, exchange.desired);
+}
+
+Bool verify_slice(jil.Body body, jil.SliceRvalue slice) {
+    return verify_place(body, slice.base)
+        && verify_optional_operand(body, slice.start)
+        && verify_optional_operand(body, slice.end);
+}
+
+Bool local_valid(jil.Body body, jil.LocalId local_id) {
+    return local_id.to_index() >= 0 && local_id.to_index() < body.locals.length;
+}
+
+Bool block_valid(jil.Body body, jil.BlockId block_id) {
+    return block_id.to_index() >= 0 && block_id.to_index() < body.blocks.length;
+}
+
+() add_failure(context.CompilerContext& ctx, Stage stage) {
+    std.StringBuilder builder = std.StringBuilder();
+    builder.append("JIL verifier failed after ");
+    builder.append(stage_name(stage));
+    diagnostic_helper.add_package_error(
+        ctx,
+        builder.into_string().bytes(),
+        "jil_verifier_failed"
+    );
+}
+
+@life()
+UInt8[]& stage_name(Stage stage) {
+    if (stage == .lower_output) { return "lowering"; }
+    if (stage == .drop_input) { return "drop input"; }
+    if (stage == .drop_output) { return "drop elaboration"; }
+    return "backend input";
+}

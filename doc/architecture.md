@@ -117,6 +117,10 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 生产：elaborated JIL CFG。
   - 消费：JIL、borrow store、drop/layout query。
   - 禁止：重新判断类型规则、生成 backend-only 节点。
+- `jil/verifier`
+  - 生产：pass boundary 的结构验证结果。
+  - 消费：lowering、drop 输入/输出和最终 JIL。
+  - 禁止：修改 CFG、补造缺失语义或把失败降级成 backend fallback。
 - `backend`
   - 生产：LLVM IR、object、executable。
   - 消费：elaborated JIL、layout、target、symbols。
@@ -195,7 +199,8 @@ CompilerStore
 - 每个 pass 必须有明确输入和输出，不能顺手修复其他阶段遗漏的语义。
 - pass 可以查询上游事实，但不能修改上游事实表。
 - pass 修改 JIL 时只产生普通 JIL block、statement 和 terminator。
-- backend 只能消费最终 elaborated JIL。
+- lowering、drop elaboration 输入/输出以及 backend 入口必须通过共享 JIL verifier。
+- backend 只能消费最终 verified、elaborated JIL。
 - backend 不消费 `ComptimeValue`。标量 const 必须在 JIL lowering 前降成 `jil.Const`；
   复合 const 作为运行时值使用时，必须先 materialize 成 readonly `jil.Global`。
 - 如果 backend 需要理解语言级结构，说明 JIL 还没有表达清楚。

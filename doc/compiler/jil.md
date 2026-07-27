@@ -39,8 +39,11 @@ elaboration 改写 JIL。
 
 ```text
 Semantic Model/type facts -> initial JIL
+  -> structural verifier
   -> borrow check
+  -> drop-input verifier
   -> drop elaboration
+  -> final verifier
   -> backend
 ```
 
@@ -56,6 +59,22 @@ drop elaboration 的职责：
 borrow check 负责在 drop elaboration 前证明已有 move/drop/use 不变量。drop elaboration 先按
 sema drop query 判断是否需要 runtime drop，再按 layout drop category 改写 CFG；backend 只消费
 elaborated JIL，不再自行推导析构顺序。
+
+## Verifier
+
+`jil/verifier.jiang` 是所有 JIL pass 共用的结构 gate。当前固定检查：
+
+- function、body、local、block 与 global 的索引身份一致，entry、return local 和所有 CFG successor
+  都在边界内。
+- statement、terminator、operand、rvalue 和 place 中引用的 local、index local、projection、
+  call destination 与 cleanup edge 都有效。
+- drop 输出以及 backend 输入中的可发出 function 已完成 drop elaboration。
+- coroutine resume/completion 在 backend 前不能保留 `CancelTerminator`；不直接发出的原始 async
+  body 可以保留它，供 coroutine 分析与诊断使用。
+
+lowering、drop elaboration 输入/输出和 backend 入口都运行 verifier。
+任何结构失败都终止当前编译，backend 不负责修补损坏的 JIL。后续新增 CFG pass 时，
+必须声明它保留或使哪些 analysis 失效，并在 pass 后复用同一个 verifier。
 
 ## 结构
 
@@ -310,3 +329,5 @@ enter/leave 的 coroutine 因此保持保守 enqueue，不会只更新 scheduler
 - JIL local 保留 `TypeId`；类型来源是 `TypeCheckStore`，不是 Semantic Model nullable type 字段。
 - JIL 不保存 field offset、size、align 或 ABI 信息；这些事实只来自 `LayoutStore`。
 - backend-specific symbol/mangling 不写入 JIL。
+- 所有可发出的 JIL 在进入 backend 前必须通过 final verifier；
+  backend 不接受“边生成边修复”的 CFG。
