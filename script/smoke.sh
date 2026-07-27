@@ -59,4 +59,16 @@ else
   status=1
 fi
 
+printf '\n== source artifact extension warm fallback ==\n'
+extension_case=test/lang/generic/check/std_floating_point_trait.jiang
+if "$JIANGC" --check "$extension_case" \
+  && "$JIANGC" --check "$extension_case"
+then
+  echo "OK"
+else
+  code=$?
+  echo "FAIL:$code"
+  status=1
+fi
+
 exit "$status"
