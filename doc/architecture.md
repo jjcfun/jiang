@@ -23,6 +23,7 @@ driver/cli -> pipeline.compile
 流程中的几个块对应：
 
 - `source/package`：入口文件或 package manifest 归一化、source 读取和 `SourceId` 建立。
+  工作目录内同一文件的绝对路径和相对路径归一为同一个 source identity。
 - `lang registry`：先按入口 source path 构建 provider registry，再按 module graph/package
   补全 package 级 registry。`#alias { ... }` 优先匹配 compiler builtin provider；否则调用
   manifest dependency 中的 `type = lang` provider。provider 返回 public syntax tree，compiler
@@ -121,8 +122,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：elaborated JIL、layout、target、symbols。
   - 禁止：语言语义判断、Semantic Model fallback、修改 JIL/layout。
 - `incremental`
-  - 生产：`StableKey`、fingerprint、source interface / Semantic Model template / object artifact metadata、
-    package-level artifact key/path。
+  - 生产：`StableKey`、fingerprint、`.ji` interface/template/object closure、分片 object index、
+    stable codegen unit 与 package closure。
   - 消费：source、interface、object artifact。
   - 禁止：缓存 session-local Semantic Model/type/JIL 对象。
 
@@ -248,7 +249,9 @@ CompilerStore
   wrapper dylib 构建、host dylib 加载和 syntax-stage provider invocation；
   详见 [DSL / Lang Package](compiler/dsl.md)。
 - `artifact` 保存 source/interface/object/package artifact 的 key、fingerprint、path 和物理容器
-  适配；package-level 产物通过 `package_fingerprint` 和 `package_artifact` 统一失效规则。
+  适配；object index 只保存 cache-root 相对路径和稳定构建上下文，不保存 session-local ID。
+  普通 package object 由 unit key/hash closure 决定；`package_fingerprint` /
+  `package_artifact` 只服务 module graph 之前发现的 lang provider dylib。
 - `store` 是跨阶段事实集合聚合点；普通阶段通过 store API 查询，
   不直接依赖其他阶段内部表。
 - `support` 只放可复用容器和工具，不 import 编译阶段模块。

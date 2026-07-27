@@ -49,6 +49,11 @@ rm -rf "$PACKAGE_DIR" "$PACKAGE_ZIP"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/script"
 
 cp "$JIANGC_BIN" "$PACKAGE_DIR/bin/jiangc"
+if [ ! -f "$JIANGC_BIN.build-id" ]; then
+  echo "missing compiler build id: $JIANGC_BIN.build-id" >&2
+  exit 2
+fi
+cp "$JIANGC_BIN.build-id" "$PACKAGE_DIR/bin/jiangc.build-id"
 cp "$ROOT_DIR/package.ini" "$PACKAGE_DIR/package.ini"
 cp "$ROOT_DIR/script/install_llvm.sh" "$PACKAGE_DIR/script/install_llvm.sh"
 chmod +x "$PACKAGE_DIR/bin/jiangc" "$PACKAGE_DIR/script/install_llvm.sh"

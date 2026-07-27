@@ -37,20 +37,17 @@ interface 做 name resolve 和 type check。
 
 ## 缓存产物
 
-长期缓存分成四类：
+长期缓存只跨进程保存三类内容：
 
 ```text
-ImportSummary:
-  用于 module graph discovery。
+.ji
+  ImportSummary、ModuleInterface、GenericTemplate 和 object closure。
 
-ModuleInterface:
-  用于 decl / namespace / type signature graph。
+object
+  source unit、monomorph unit、整包单文件 object 和 lang provider dylib。
 
-ObjectArtifact:
-  用于复用 concrete codegen output。
-
-PackageArtifact:
-  用于整包产物路径和命中判断，例如 package object、dynamic library、lang provider dylib。
+artifact cache index
+  stable unit key 到本机相对 object path、校验 hash 和构建上下文的映射。
 ```
 
 `ImportSummary` 和 `ModuleInterface` 在类型和 API 上必须分开，但物理上可以放在同一个 `.ji`
@@ -62,9 +59,9 @@ load_interface(source) -> ModuleInterface
 load_generic_template(stable_id) -> GenericTemplate
 ```
 
-`ModuleInterface` 只保存 public signature 和 template index；generic body payload 保存在 `.ji`
-的独立 Semantic Model template section。跨 package 泛型实例化不重新读取依赖源码，而是按 stable id 读取
-generic Semantic Model template。
+`ModuleInterface` 保存跨 package type check 所需的声明面、generic template index 和 object
+closure。generic body payload 保存在 `.ji` 的独立 Semantic Model template section。跨 package
+泛型实例化不重新读取依赖源码，而是按 stable id 读取 generic Semantic Model template。
 
 `ModuleInterface.interface_hash` 是 public semantic surface 的 hash，不是 source hash：
 
@@ -92,33 +89,14 @@ codegen 的稳定输入：
 - type / layout fingerprint。
 - monomorph instance key。
 - target triple / ABI。
-- compiler version。
+- compiler build/schema fingerprint 与 language version。
+- LLVM/toolchain 与 backend profile。
 - dependency interface hash。
 
-Package artifact 是比 source object 更粗的整包边界。它不替代 `.ji` 或 debug source object；
-它只负责最终 package-level 产物的 key/path：
-
-```text
-PackageArtifactKey:
-  kind
-  package_hash
-  compiler_hash
-  wrapper_hash
-  target_cache_key
-  compile_mode
-```
-
-当前 kind 包括：
-
-- `package_object`：普通 package 整包 object，可用于 executable 或 dynamic library link。
-- `lang_provider_dynamic_library`：`type = lang` provider 的 host dylib。
-
-`wrapper_hash` 由 lang provider dylib 使用，用于 wrapper template / provider ABI 变化时失效旧产物；
-普通 package object 使用 0。package artifact path 统一由 `artifact/package_artifact.jiang`
-生成，不能在 pipeline 或 lang builder 里另写一套 hash/path 逻辑。
-
-`package_hash` 统一由 `artifact/package_fingerprint.jiang` 计算。manifest 入口用于 resolve 前的
-lang provider registry；package record 入口用于 module graph 已经构建后的普通 target package。
+整包单文件 object 的身份由稳定排序的 unit key/hash closure 决定，和旧的 source 文本整包 hash
+无关。`type = lang` provider dylib 仍使用 package artifact key，因为 provider discovery
+发生在普通 module graph 之前；它的 key 同时包含 provider source、wrapper ABI、compiler、
+target 和 profile。
 
 ## AST
 
@@ -175,7 +153,7 @@ SectionTable
   ImportSummarySection: offset / length / hash
   InterfaceSection: offset / length / hash
   GenericTemplateSection: offset / length / hash
-  SourceMapSection: offset / length / hash
+  ObjectClosureSection: offset / length / hash
 ```
 
 读取策略：
@@ -189,6 +167,9 @@ decl/type graph:
 
 monomorph:
   read one generic template payload by stable owner id
+
+codegen/link:
+  validate object closure through the local artifact index
 ```
 
 编译阶段只依赖 `load_import_summary` / `load_interface` / `load_generic_template`，不直接依赖
@@ -311,19 +292,31 @@ concrete JIL 和 `.o`。这个 body 来自 `.ji` 的 generic Semantic Model temp
 
 object cache 是 backend/codegen cache，不是 semantic cache。
 
-object cache lookup 分两步：
+每个 stable codegen unit 都有独立的分片 index record：
 
 ```text
-lookup:
-  只查 artifact index，返回 missing/hit。
-
-validate:
-  调用方读取 object 文件并计算 actual object hash。
-  ObjectArtifactCache 只比较记录 hash 和 actual hash，返回 hit/stale/missing。
+ObjectIndexRecord
+  format version
+  object kind
+  stable unit key
+  compiler build/schema fingerprint
+  language version
+  target/ABI fingerprint
+  LLVM/toolchain fingerprint
+  backend profile fingerprint
+  dependency/interface fingerprint
+  relative object path
+  expected object hash
 ```
 
-cache 层不直接读写文件，也不调用 LLVM emission。文件系统和 codegen unit 调度属于
-driver/backend。
+record 不保存绝对路径、pointer、`DefId`、`TypeId` 或其他 session-local ID。相对路径只允许
+直接位于 cache root 的 `objects/` 下，拒绝绝对路径、父目录和嵌套目录穿越。每个 stable key
+对应一个独立 `.jai` record，因此两个进程写不同 key 不需要合并全量 index。
+
+lookup 会先读取 record，再校验完整构建上下文、dependency fingerprint、预期相对路径和
+object 文件的实际 hash。record 缺失返回 `missing`；record 存在但截断、损坏、版本不兼容、
+上下文不匹配、文件缺失或 hash 不匹配返回 `stale`。内存中的 `ObjectArtifactCache`
+只是当前进程的加速层，不能作为跨进程命中依据。
 
 object path 由 backend artifact path planner 生成：
 
@@ -332,10 +325,15 @@ cache_root/objects/source_<hash>.o
 cache_root/objects/mono_<stable_instance_fingerprint>.o
 cache_root/objects/package_<package_artifact_hash>.o
 cache_root/lang/lang_<package_artifact_hash>.<dylib-ext>
+cache_root/index/objects/source_<stable-unit-key>.jai
+cache_root/index/objects/mono_<stable-unit-key>.jai
+cache_root/index/objects/package_<closure-key>.jai
 ```
 
-planner 是纯函数，不创建目录、不写文件。pipeline 负责在 object emit 前创建 cache 目录，
-并在 cache lookup / validate 时使用 `artifact/object_hash` 计算实际 object hash。
+planner 是纯函数，不创建目录、不写文件。backend 把 object 先写入同一 cache root 下带进程
+标识的临时路径，完成并可计算 hash 后用原子替换发布 object，最后原子发布 index record。
+任何失败都会删除本进程的临时文件。相同 stable key 的并发编译允许重复生成，
+但最终 object 内容和 record 必须一致；不能出现 index 指向半写入 object 的状态。
 
 `CompileOptions.artifact_cache_dir` 是当前编译的 cache root，默认值为 `build/cache`。
 命令行可用 `--artifact-cache-dir <path>` 为一次编译选择其他 cache root。测试 runner
@@ -346,29 +344,20 @@ pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
 
 ```text
 source object:
-  普通 concrete 函数、global、hosted entry wrapper。
+  同一 source module 的普通 concrete function、global 和 hosted entry wrapper。
 
 monomorph object:
-  泛型函数实例。
-  泛型 type 的 method / init / deinit 实例。
-  泛型 trait impl method 实例。
+  一个 concrete generic instance，包括 type args 和 const args。
 ```
 
-`CodegenUnit` 是 backend-independent 的 JIL 分组，不是 LLVM module：
+external declaration 不拥有 object。每个 definition 只能由一个 unit 发出；source/monomorph
+unit 与 symbol 顺序都按 stable identity 排序，不能依赖 session-local ID。
 
-```text
-source unit:
-  同一 source module 的普通 concrete functions。
-
-monomorph unit:
-  一个泛型 concrete instance。
-```
-
-external declaration 不拥有 object unit。每个 backend emission 可以按需要在当前 object 内
-materialize 外部声明。
-
-`emit_object_for_unit` 仍然可以先声明完整 `jil.Store` 里的函数，再只 lower 当前 unit 的 body。
-这样跨 unit 调用只需要 LLVM declaration，不会把被调用方 body 一起写进当前 `.o`。
+每个 unit 只声明并 lower 自己拥有的 function body；遇到跨 unit 的直接调用时，backend 根据
+JIL function reference 按需补充 LLVM declaration，不把被调用方 body 写入当前 `.o`。
+只包含 global、没有 function 的 source module 也必须建立 source unit。通过已验证 interface
+object closure 加载的 global 在当前 JIL 中只是 external declaration，其 definition 仍由恢复的
+source object 提供，不能在当前 unit 重复发出。
 `CodegenUnitKey` 只做本轮 JIL 分组；长期 object path 必须来自 source object key 或
 stable monomorph instance key。
 `artifact/object_key_builder.jiang` 负责把当前 session 的 module/type 信息转换成稳定 object key
@@ -386,20 +375,56 @@ interface/body/layout 等多段 fingerprint 通过 `artifact/object_key.jiang` �
 StableInstanceKey
   generic_owner_stable_id
   type_args
-  comptime_args
+  const_args
   body_hash
   layout_hash
   target / ABI
-  compiler_version
+  compiler build / language version / toolchain
   backend_profile
 ```
 
-当前 session 内的 `MonomorphStore` 仍然使用 `DefId + TypeId[]` 做内存去重。这个 key
+当前 session 内的 `MonomorphStore` 仍然使用 `DefId + TypeId[] + ComptimeValue[]` 做内存去重。这个 key
 不能写入本地 cache。`StableInstanceKey` 只用于 object cache，type args 必须先转换成不含
-session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/object_key_builder.jiang`。
+session-local `TypeId` 的 stable type key，const args 也必须转换成稳定值 fingerprint。
 
-同一个 compilation 内，`StableInstanceKey` 相同就复用同一个 concrete JIL / object cache entry。
-不同 owner 即使文本相同，也不做结构性去重。
+同一个 compilation 内可能因 session-local `TypeId` 不同而暂时出现语义等价的 concrete JIL
+instance。codegen unit 分组必须用稳定 symbol identity 归一化这些重复项，只发出一个 definition
+和一个 object cache entry。不同 owner 即使文本相同，也不做结构性去重。
+
+### Link closure
+
+executable 和 dylib 直接链接稳定排序后的 unit objects。link closure 包含：
+
+- 当前编译的 source/monomorph units。
+- 已通过本机 index 和实际 hash 验证的 interface-loaded units。
+- package 的传递依赖 units。
+- 在依赖 generic template 上生成的 concrete monomorph units。
+- target runtime object。
+
+link plan 按 object path 和 definition identity 去重。当前 compilation 已重新生成某个 definition
+时，不再链接 interface closure 中该 definition 的旧 object。
+
+`.ji` 的 object closure 只保存 unit kind、stable unit key、definition key、dependency
+fingerprint 和 package closure fingerprint，不保存本机路径。interface loader 只有在整条 closure
+都能通过本机 index 验证时，才允许 codegen 模式跳过依赖 source 的 Semantic Model/JIL lowering。
+源码仍可用时，缺失或 stale closure 会回退到正常源码编译；将来提供 interface-only 分发时，
+缺少必需 object 必须成为不可恢复诊断。
+
+### `--emit-obj`
+
+`--emit-obj -o file.o` 对用户始终只产生一个 object。内部 unit object 不暴露为多个输出。
+整包 object key 是稳定排序的 unit key/hash closure。
+
+当前 backend 尚未对所有目标提供可靠的 relocatable object merge，因此 `--emit-obj` 采用完整
+package lowering 后的整包 emission，并缓存最终 package object。它不会像 executable/dylib
+那样跳过依赖 source body；这样冷/热构建的单文件拥有相同 symbol closure。目标平台具备可靠
+merge 后，可以改为合并已验证 unit objects，但不能改变单文件契约。
+
+### 可观测统计
+
+`--artifact-stats` 在 stderr 输出 interface hit/miss/stale、object hit/miss/stale、
+emitted/reused unit 和最终 linked object 数。统计只用于回归与性能分析，不进入 cache key，
+也不改变构建结果。
 
 ## 当前实现边界
 
@@ -411,15 +436,16 @@ session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/obj
 - `InterfaceLoader`：从 `ModuleInterface` 恢复 `DefRecord`、namespace binding 和 Semantic Model signature skeleton。
 - `StableInstanceKey`：描述 monomorph object 的稳定输入。
 - `ConcreteInstanceRegistry`：在同一 compilation 内按 stable instance 复用 concrete JIL body 位置。
-- `ObjectArtifactCache`：区分 source object 和 monomorph object，不保存 semantic interface。
-- `PackageArtifactKey`：描述整包产物 cache key，当前用于普通 package object 和 lang provider dylib。
-- `package_fingerprint`：统一计算 target package 和 `type = lang` provider package 的 package hash。
+- `ObjectArtifactCache`：区分 source、monomorph 和 package object，作为当前进程的 lookup 加速层。
+- `ObjectIndexRecord`：按 stable key 分片持久化，并验证本机 object 和构建上下文。
+- `ObjectReusePlan`：建立稳定 unit 所有权、lookup 状态和 package closure。
+- `ObjectClosure`：让 `.ji` 恢复并验证依赖 unit objects。
+- `PackageArtifactKey`：只负责需要在普通 module graph 前发现的 lang provider dylib。
 - `QueryDependencyGraph`：记录 query dependency / reverse dependency，并提供 transitive invalidation。
 - `CompilerSession`：持有可复用 `CompilerContext`，通过 `begin_compilation` 进入下一轮编译。
 
-这些结构中，source/interface artifact 和 object artifact 仍主要以内存 index 描述长期身份；
-pipeline 已接入 object cache 目录创建、object lookup/validate、缺失 object emission 和命中
-object 复制。长驻服务、磁盘 artifact index 持久化和更细粒度 invalidation 仍在后续阶段。
+磁盘边界到此为止。长驻服务可以复用当前进程的 query dependency graph，但 0.5.0 不把
+Semantic Model、type facts、layout 或 JIL 序列化到磁盘。
 
 ## Invalidation
 
@@ -446,12 +472,14 @@ Interface 命中:
   非 root module 如果只是 import discovery 临时 parse 过，仍可加载 interface skeleton。
 
 ObjectArtifact 命中:
-  可以跳过 Semantic Model/type_check/JIL/codegen，但不能跳过 interface loading。
+  与有效 Interface/ObjectClosure 一起命中时，可以跳过依赖 source 的
+  Semantic Model/type_check/JIL/codegen，但不能跳过 interface loading。
 
 PackageArtifact 命中:
-  可以复用整包最终产物路径，但不能替代 `.ji` / interface loading。
-  对 lang provider dylib，命中只表示 package key 对应的 dylib 文件存在；如果 dylib 加载失败、
-  缺少固定符号或 ABI 不匹配，应报告诊断，不自动重建来掩盖错误。
+  `--emit-obj` 可以复用 unit closure 对应的整包单文件 object。
+  lang provider dylib 可以复用 provider package key 对应的文件。
+  两者都不能替代 `.ji` / interface loading；dylib 加载失败、缺少固定符号或 ABI 不匹配时
+  应报告诊断，不自动重建来掩盖错误。
 ```
 
 只改 private function body 时，通常：
@@ -478,6 +506,17 @@ Interface 不变
 新增 InstanceKey
 新增 monomorph object
 ```
+
+其他失效边界：
+
+- compiler binary 的 `.build-id` 改变时，interface/object context 都失效；开发构建不能只依赖
+  长期不变的 package version 字符串。
+- debug/release、target/ABI、LLVM/toolchain 或影响 codegen 的 backend profile 改变时，
+  object key 改变。
+- private body 改变只重建定义所属 source unit；public interface 改变还会改变依赖 closure，
+  使消费方 unit 重建。
+- 损坏的 `.ji`、index 或 object 不触发进程崩溃；有源码时按 miss/stale 路径恢复。
+- 并发发布后不保留临时文件，下一次热构建必须能得到完整命中。
 
 ## 不变量
 

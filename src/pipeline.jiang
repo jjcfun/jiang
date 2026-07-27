@@ -4,6 +4,8 @@ import context = "./context.jiang";
 import diagnostic_helper = "./diagnostic/helper.jiang";
 import syntax_store = "./syntax/store.jiang";
 import source_ji = "./artifact/source_ji.jiang";
+import object_index = "./artifact/object_index.jiang";
+import object_key_builder = "./artifact/object_key_builder.jiang";
 import backend = "./backend.jiang";
 import borrow_check = "./borrow_check.jiang";
 import driver_options = "./driver/options.jiang";
@@ -19,6 +21,7 @@ import source_entry = "./source/entry.jiang";
 import source = "./source.jiang";
 import system_fs = "./system/fs.jiang";
 import system_io = "./system/io.jiang";
+import system_target = "./system/target.jiang";
 import std;
 
 // 编译器唯一公开入口。driver 负责把命令行整理成 CompileOptions，
@@ -78,17 +81,31 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
         diagnostic_helper.add_package_error(ctx, "failed to load parsed root file", "root_ast_missing");
         return;
     }
-    // Module interface 只保存语义签名和 generic Semantic Model template，不保存普通函数实现。
-    // 在 object artifact 尚未持久化并加入 link plan 前，只有 check-only 可以安全
-    // 跳过依赖模块的源码 lowering；所有 codegen 模式必须保留完整实现体。
-    Bool use_source_artifacts = options.emit == .check_only;
+    // check 模式只要求语义 interface；codegen 模式还必须验证 `.ji` 中的
+    // object closure，完整命中后才允许跳过跨 package 依赖源码。
+    Bool require_object_closure = options.emit != .check_only;
+    std.String target_cache_key = system_target.cache_key(ctx.target$.ref());
+    std.String toolchain_version = backend.llvm_version_text();
+    object_index.ObjectIndexContext object_context = object_index.ObjectIndexContext(
+        object_key_builder.compiler_fingerprint(options.compiler_build),
+        object_key_builder.language_version_fingerprint(options.compiler_version),
+        object_key_builder.target_fingerprint(target_cache_key.bytes()),
+        object_key_builder.toolchain_fingerprint(toolchain_version.bytes()),
+        object_key_builder.backend_profile_fingerprint(options.mode)
+    );
+    // `--emit-obj` 当前用整包 backend emission 保持单文件契约，必须完整 lowering
+    // 所有依赖源码；executable/dylib 已能直接链接 unit object，才允许加载 interface
+    // 并跳过依赖 body。
+    Bool use_source_artifacts = options.emit != .object_file;
     resolve.ModuleResolver resolver = resolve.ModuleResolver(
         ctx,
         asts$.ref(),
         options.artifact_cache_dir,
         compiler_version_hash,
         use_source_artifacts,
-        options.mode
+        options.mode,
+        require_object_closure,
+        object_context
     );
     module_graph.ModuleGraph^ graph = resolver.build_module_graph(root_unit);
     if (!graph.ok) {
@@ -112,7 +129,7 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     }
     print_jil_stage_if_enabled(options, "type_check_done");
     resolver.finalize_module_graph_model(graph$.ref());
-    if (use_source_artifacts) {
+    if (!require_object_closure) {
         source_ji.write_package_source_artifact_cache(
             ctx,
             graph$.ref(),
@@ -147,13 +164,26 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
         print_jil_stage("drop_done");
         print_jil_stats(dropped$.ref());
     }
-    if (backend.emit_package(
+    Bool backend_failed = backend.emit_package(
         ctx,
         dropped$.ref(),
-        options,
-        graph.package_id
-    ).has_errors()) {
+        options
+    ).has_errors();
+    if (backend_failed) {
         return;
+    }
+    print_jil_stage_if_enabled(options, "backend_done");
+    if (require_object_closure) {
+        source_ji.write_package_source_artifact_cache(
+            ctx,
+            graph$.ref(),
+            options.artifact_cache_dir,
+            options.compiler_version
+        );
+    }
+    print_jil_stage_if_enabled(options, "artifact_done");
+    if (options.artifact_stats) {
+        print_artifact_stats(ctx);
     }
 }
 
@@ -176,6 +206,31 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     builder.append(store.storage.used_bytes());
     builder.append(" jil_arena_reserved_bytes=");
     builder.append(store.storage.reserved_bytes());
+    system_fs.File error_output = system_io.stderr();
+    error_output.write_all(builder.slice());
+    error_output.write_all("\n");
+}
+
+() print_artifact_stats(context.CompilerContext& ctx) {
+    std.StringBuilder builder = std.StringBuilder();
+    builder.append("artifact_interface_hit=");
+    builder.append(ctx.store.artifacts.stats.interface_hit);
+    builder.append(" artifact_interface_miss=");
+    builder.append(ctx.store.artifacts.stats.interface_missing);
+    builder.append(" artifact_interface_stale=");
+    builder.append(ctx.store.artifacts.stats.interface_stale);
+    builder.append(" artifact_object_hit=");
+    builder.append(ctx.store.object_artifacts.stats.hit_count());
+    builder.append(" artifact_object_miss=");
+    builder.append(ctx.store.object_artifacts.stats.missing_count());
+    builder.append(" artifact_object_stale=");
+    builder.append(ctx.store.object_artifacts.stats.stale_count());
+    builder.append(" artifact_emitted_units=");
+    builder.append(ctx.store.object_artifacts.stats.emitted_units);
+    builder.append(" artifact_reused_units=");
+    builder.append(ctx.store.object_artifacts.stats.reused_units);
+    builder.append(" artifact_linked_objects=");
+    builder.append(ctx.store.object_artifacts.stats.linked_objects);
     system_fs.File error_output = system_io.stderr();
     error_output.write_all(builder.slice());
     error_output.write_all("\n");

@@ -77,6 +77,20 @@ collect_llvm_link_args() {
   done
 }
 
+write_compiler_build_id() {
+  local compiler_bin="$1"
+  local build_id
+  if command -v shasum >/dev/null 2>&1; then
+    build_id="$(shasum -a 256 "$compiler_bin" | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    build_id="$(sha256sum "$compiler_bin" | awk '{print $1}')"
+  else
+    echo "missing shasum or sha256sum for compiler build id" >&2
+    exit 2
+  fi
+  printf '%s\n' "$build_id" >"$compiler_bin.build-id"
+}
+
 clear_bootstrap_artifact_cache() {
   # bootstrap 编译器可能把旧 schema 的 source artifact 写到默认 build/cache。
   # next/stable 阶段必须用当前编译器重新生成，避免 smoke 读到旧接口。
@@ -88,6 +102,7 @@ emit_next_from_bootstrap() {
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
   "$BOOTSTRAP_BIN" --target "$JIANG_HOST_TARGET" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
   test -x "$output_bin"
+  write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
 }
 
@@ -98,6 +113,7 @@ emit_compiler_with_compiler() {
   printf '== build next: compile executable with %s ==\n' "$source_bin"
   "$source_bin" --target "$JIANG_HOST_TARGET" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
   test -x "$output_bin"
+  write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
 }
 

@@ -42,7 +42,23 @@ public object_key.StableTypeKey stable_type_key_for_type(
     qid.TypeId type_id
 ) {
     types.TypeInfo info = ctx.store.types.get(type_id);
-    return stable_type_key_for_data(ctx, info.data);
+    object_key.StableTypeKey key! = stable_type_key_for_data(ctx, info.data);
+    key.is_mutable = info.is_mutable;
+    return key;
+}
+
+public qkey.Fingerprint128 stable_type_fingerprint_for_type(
+    context.CompilerContext& ctx,
+    qid.TypeId type_id
+) {
+    object_key.StableTypeKey key = stable_type_key_for_type(ctx, type_id);
+    hash.WyHasher low! = hash.WyHasher();
+    low.write(UInt64(6148914691236517205));
+    object_key.write_stable_type_key(low$.mut_ref(), key$.ref());
+    hash.WyHasher high! = hash.WyHasher();
+    high.write(UInt64(12297829382473034410));
+    object_key.write_stable_type_key(high$.mut_ref(), key$.ref());
+    return qkey.Fingerprint128(low.finish(), high.finish());
 }
 
 public object_key.StableInstanceKey? stable_instance_key_for_function(
@@ -66,6 +82,11 @@ public object_key.StableInstanceKey? stable_instance_key_for_function(
     Int index! = 0;
     while (index < function.type_args.length) {
         key.add_type_arg(stable_type_key_for_type(ctx, function.type_args[index]));
+        index = index + 1;
+    }
+    index = 0;
+    while (index < function.const_args.length) {
+        key.add_comptime_arg(stable_comptime_value_fingerprint(ctx, function.const_args[index]));
         index = index + 1;
     }
     return key;
@@ -94,6 +115,15 @@ public SourceObjectFingerprints source_object_fingerprints_for_module(
 }
 
 qkey.Fingerprint128 stable_function_body_hash(context.CompilerContext& ctx, qid.DefId def_id) {
+    if (ctx.store.incremental.stable_id_for_def(def_id) is .some(stable_id)) {
+        if (ctx.store.artifacts.load_generic_template(stable_id) is .some(template)) {
+            return template.body_fingerprint;
+        }
+        qkey.Fingerprint128 stored = ctx.store.incremental.body_fingerprint(stable_id);
+        if (stored != qkey.Fingerprint128()) {
+            return stored;
+        }
+    }
     if (ctx.store.model.def(def_id) is .some(model_def)) {
         return fingerprint.model_body_fingerprint(ctx, model_def);
     }
@@ -163,8 +193,18 @@ public qkey.Fingerprint128 target_fingerprint(UInt8[]& target_triple) {
     return domain_fingerprint("target:", target_triple);
 }
 
-public qkey.Fingerprint128 compiler_fingerprint(UInt8[]& compiler_version) {
-    return domain_fingerprint("compiler:", compiler_version);
+public qkey.Fingerprint128 compiler_fingerprint(UInt8[]& compiler_build) {
+    // compiler build-id 由二进制内容生成；schema seed 额外保证手工构造的
+    // CompileOptions 也不会跨 object/codegen 格式复用。
+    return domain_fingerprint("compiler-build:object-codegen-v1:", compiler_build);
+}
+
+public qkey.Fingerprint128 language_version_fingerprint(UInt8[]& language_version) {
+    return domain_fingerprint("language-version:", language_version);
+}
+
+public qkey.Fingerprint128 toolchain_fingerprint(UInt8[]& toolchain_version) {
+    return domain_fingerprint("llvm-toolchain:", toolchain_version);
 }
 
 public qkey.Fingerprint128 backend_profile_fingerprint(driver_options.CompileMode mode) {
@@ -211,17 +251,26 @@ UInt64 source_hash_for_module(context.CompilerContext& ctx, qid.ModuleId module_
     guard ctx.store.incremental.stable_id_for_def(model_def.def_id) is .some(stable_id) else {
         return;
     }
+    qkey.Fingerprint128 signature! = ctx.store.incremental.signature_fingerprint(stable_id);
+    qkey.Fingerprint128 body! = ctx.store.incremental.body_fingerprint(stable_id);
+    if (signature == qkey.Fingerprint128()) {
+        signature = fingerprint.model_signature_fingerprint(ctx, model_def);
+    }
+    if (body == qkey.Fingerprint128()) {
+        body = fingerprint.model_body_fingerprint(ctx, model_def);
+    }
     interface_parts.add(def_fingerprint_part(
         UInt64(201),
         stable_id,
-        fingerprint.model_signature_fingerprint(ctx, model_def)
+        signature
     ));
     body_parts.add(def_fingerprint_part(
         UInt64(202),
         stable_id,
-        fingerprint.model_body_fingerprint(ctx, model_def)
+        body
     ));
-    if (ctx.store.typeck.def_type(model_def.def_id) is .some(type_id)
+    if (definition_declares_nominal_layout(ctx, model_def.def_id)
+        && ctx.store.typeck.def_type(model_def.def_id) is .some(type_id)
         && type_has_concrete_layout(ctx, type_id)
     ) {
         layout.TypeLayout type_layout = ctx.store.layouts.layout(layout_compute.layout_of_type(ctx, type_id));
@@ -231,6 +280,11 @@ UInt64 source_hash_for_module(context.CompilerContext& ctx, qid.ModuleId module_
             fingerprint.type_layout_fingerprint(ctx, type_layout)
         ));
     }
+}
+
+Bool definition_declares_nominal_layout(context.CompilerContext& ctx, qid.DefId def_id) {
+    def.DefKind kind = ctx.store.defs.get(def_id).kind;
+    return kind == .struct_def || kind == .enum_def || kind == .union_def;
 }
 
 Bool type_has_concrete_layout(context.CompilerContext& ctx, qid.TypeId type_id) {
@@ -438,6 +492,11 @@ object_key.StableTypeKey stable_aggregate_type_key(
         }
         return key;
     }
+    if (data is .task_type(task_type)) {
+        object_key.StableTypeKey key! = object_key.StableTypeKey(.task_type);
+        key.add_arg(stable_type_key_for_type(ctx, task_type.result));
+        return key;
+    }
     if (data is .trait_companion(companion)) {
         guard ctx.store.incremental.stable_id_for_def(companion.trait_def) is .some(stable_def) else {
             return object_key.StableTypeKey(.invalid_type);
@@ -477,6 +536,11 @@ object_key.StableTypeKey stable_named_type_key(
         key.add_arg(stable_type_key_for_type(ctx, named.type_args[index]));
         index = index + 1;
     }
+    index = 0;
+    while (index < named.const_args.length) {
+        key.add_comptime_arg(stable_comptime_value_fingerprint(ctx, named.const_args[index]));
+        index = index + 1;
+    }
     return key;
 }
 
@@ -497,7 +561,7 @@ object_key.StableSentinel? stable_sentinel(context.CompilerContext& ctx, types.S
     return null;
 }
 
-qkey.Fingerprint128 stable_comptime_value_fingerprint(
+public qkey.Fingerprint128 stable_comptime_value_fingerprint(
     context.CompilerContext& ctx,
     comptime_value.ComptimeValue value
 ) {

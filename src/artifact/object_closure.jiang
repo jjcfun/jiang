@@ -1,0 +1,284 @@
+// `.ji` 中的 object closure 元数据。
+//
+// 这里只保存 stable unit key、定义身份、依赖 fingerprint 和 package closure
+// key。实际 object 路径由本机分片 index 恢复，绝对路径和会话内 ID 不进入
+// interface。
+
+import ji = "./ji_file.jiang";
+import object_artifact = "./object.jiang";
+import object_hash = "./object_hash.jiang";
+import object_index = "./object_index.jiang";
+import object_key = "./object_key.jiang";
+import source_artifact = "./source.jiang";
+import qkey = "../incremental/key.jiang";
+import list = "../support/list.jiang";
+import std;
+
+public struct ValidatedObjectUnit: Movable {
+    public std.String path;
+    public qkey.Fingerprint128 hash;
+
+    public init(self, UInt8[]& path, qkey.Fingerprint128 hash) {
+        self.path = std.String(path);
+        self.hash = hash;
+    }
+}
+
+public ji.JiSectionPayload payload(source_artifact.ModuleInterface& module_interface) {
+    list.ArrayList<UInt8> bytes = encode(module_interface);
+    qkey.Fingerprint128 hash = object_hash.hash_bytes(bytes.slice());
+    return ji.JiSectionPayload(.object_closure, bytes, hash);
+}
+
+public list.ArrayList<UInt8> encode(source_artifact.ModuleInterface& module_interface) {
+    list.ArrayList<UInt8> output = list.ArrayList<UInt8>();
+    write_u64(output$.ref(), closure_magic());
+    write_u64(output$.ref(), UInt64(2));
+    Bool has_closure = module_interface.package_object_key != null
+        && module_interface.object_closure_fingerprint != null;
+    write_u64(output$.ref(), if has_closure { UInt64(1) } else { UInt64(0) });
+    write_optional_closure(output$.ref(), module_interface);
+    list.ArrayList<Int> indexes = sorted_unit_indexes(module_interface);
+    write_u64(output$.ref(), UInt64(indexes.len()));
+    Int index! = 0;
+    while (index < indexes.len()) {
+        write_unit(output$.ref(), module_interface.object_units.get(indexes.get(index)));
+        index = index + 1;
+    }
+    return output;
+}
+
+public Bool decode(
+    source_artifact.ModuleInterface& module_interface,
+    UInt8[]& bytes
+) {
+    if (bytes.length < header_size() || read_u64(bytes, 0) != closure_magic()) {
+        return false;
+    }
+    if (read_u64(bytes, 8) != UInt64(2)) {
+        return false;
+    }
+    UInt64 flags = read_u64(bytes, 16);
+    if (flags > UInt64(1)) {
+        return false;
+    }
+    Int count = Int(read_u64(bytes, 56));
+    if (count < 0 || bytes.length != header_size() + count * unit_size()) {
+        return false;
+    }
+    if (flags == UInt64(1)) {
+        module_interface.set_object_closure(
+            read_fingerprint(bytes, 24),
+            read_fingerprint(bytes, 40)
+        );
+    }
+    Int index! = 0;
+    while (index < count) {
+        guard read_unit(bytes, header_size() + index * unit_size()) is .some(unit) else {
+            return false;
+        }
+        module_interface.add_object_unit(unit);
+        index = index + 1;
+    }
+    return true;
+}
+
+public Bool validate(
+    UInt8[]& cache_root,
+    source_artifact.ModuleInterface& module_interface,
+    object_index.ObjectIndexContext context
+) {
+    guard module_interface.package_object_key is .some(_) else { return false; }
+    guard module_interface.object_closure_fingerprint is .some(expected_closure) else {
+        return false;
+    }
+    if (module_interface.object_units.len() == 0) {
+        return false;
+    }
+    guard compute_fingerprint(cache_root, module_interface, context) is .some(actual_closure) else {
+        return false;
+    }
+    return actual_closure == expected_closure;
+}
+
+public qkey.Fingerprint128? compute_fingerprint(
+    UInt8[]& cache_root,
+    source_artifact.ModuleInterface& module_interface,
+    object_index.ObjectIndexContext context
+) {
+    if (module_interface.object_units.len() == 0) {
+        return null;
+    }
+    list.ArrayList<qkey.Fingerprint128> parts = list.ArrayList<qkey.Fingerprint128>();
+    list.ArrayList<Int> indexes = sorted_unit_indexes(module_interface);
+    Int index! = 0;
+    while (index < indexes.len()) {
+        source_artifact.InterfaceObjectUnit unit = module_interface.object_units.get(indexes.get(index));
+        guard validated_unit(cache_root, unit, context) is .some(validated) else {
+            return null;
+        }
+        parts.add(unit.stable_unit_key);
+        parts.add(validated.hash);
+        index = index + 1;
+    }
+    return object_key.combine_fingerprints(UInt64(105), parts$.ref());
+}
+
+public ValidatedObjectUnit? validated_unit(
+    UInt8[]& cache_root,
+    source_artifact.InterfaceObjectUnit unit,
+    object_index.ObjectIndexContext context
+) {
+    object_artifact.ObjectArtifactKind kind = object_kind(unit.kind);
+    guard object_index.load(cache_root, kind, unit.stable_unit_key) is .some(record) else {
+        return null;
+    }
+    if (!object_index.record_matches(record$.ref(), kind, unit.stable_unit_key, context)) {
+        return null;
+    }
+    if (record.dependency_fingerprint != unit.dependency_fingerprint) {
+        return null;
+    }
+    guard object_index.object_path(cache_root, record$.ref()) is .some(path) else {
+        return null;
+    }
+    guard object_hash.hash_file(path.bytes()) is .some(actual_hash) else { return null; }
+    if (actual_hash != record.object_hash) { return null; }
+    return ValidatedObjectUnit(path.bytes(), actual_hash);
+}
+
+object_artifact.ObjectArtifactKind object_kind(source_artifact.InterfaceObjectUnitKind kind) {
+    if (kind == .source_unit) {
+        return .source_object;
+    }
+    return .monomorph_object;
+}
+
+() write_optional_closure(
+    list.ArrayList<UInt8>& output,
+    source_artifact.ModuleInterface& module_interface
+) {
+    if (module_interface.package_object_key is .some(package_key)
+        && module_interface.object_closure_fingerprint is .some(closure)
+    ) {
+        write_fingerprint(output, package_key);
+        write_fingerprint(output, closure);
+        return;
+    }
+    write_fingerprint(output, qkey.Fingerprint128());
+    write_fingerprint(output, qkey.Fingerprint128());
+}
+
+() write_unit(list.ArrayList<UInt8>& output, source_artifact.InterfaceObjectUnit unit) {
+    write_u64(output, UInt64(Int(unit.kind)));
+    write_fingerprint(output, unit.stable_unit_key);
+    write_fingerprint(output, unit.definition_key);
+    write_fingerprint(output, unit.dependency_fingerprint);
+}
+
+source_artifact.InterfaceObjectUnit? read_unit(UInt8[]& bytes, Int offset) {
+    guard unit_kind(Int(read_u64(bytes, offset))) is .some(kind) else { return null; }
+    return source_artifact.InterfaceObjectUnit(
+        kind,
+        read_fingerprint(bytes, offset + 8),
+        read_fingerprint(bytes, offset + 24),
+        read_fingerprint(bytes, offset + 40)
+    );
+}
+
+source_artifact.InterfaceObjectUnitKind? unit_kind(Int value) {
+    if (value == Int(source_artifact.InterfaceObjectUnitKind.source_unit)) {
+        return source_artifact.InterfaceObjectUnitKind.source_unit;
+    }
+    if (value == Int(source_artifact.InterfaceObjectUnitKind.monomorph_unit)) {
+        return source_artifact.InterfaceObjectUnitKind.monomorph_unit;
+    }
+    return null;
+}
+
+list.ArrayList<Int> sorted_unit_indexes(source_artifact.ModuleInterface& module_interface) {
+    list.ArrayList<Int> indexes = list.ArrayList<Int>();
+    Int index! = 0;
+    while (index < module_interface.object_units.len()) {
+        indexes.add(index);
+        index = index + 1;
+    }
+    sort_unit_indexes(indexes$.ref(), module_interface);
+    return indexes;
+}
+
+() sort_unit_indexes(
+    list.ArrayList<Int>& indexes,
+    source_artifact.ModuleInterface& module_interface
+) {
+    Int index! = 1;
+    while (index < indexes.len()) {
+        Int current! = index;
+        while (current > 0 && unit_index_less(indexes, current, module_interface)) {
+            swap_indexes(indexes, current, current - 1);
+            current = current - 1;
+        }
+        index = index + 1;
+    }
+}
+
+Bool unit_index_less(
+    list.ArrayList<Int>& indexes,
+    Int current,
+    source_artifact.ModuleInterface& module_interface
+) {
+    source_artifact.InterfaceObjectUnit lhs = module_interface.object_units.get(indexes.get(current));
+    source_artifact.InterfaceObjectUnit rhs = module_interface.object_units.get(indexes.get(current - 1));
+    if (lhs.kind != rhs.kind) {
+        return Int(lhs.kind) < Int(rhs.kind);
+    }
+    if (lhs.stable_unit_key.high != rhs.stable_unit_key.high) {
+        return lhs.stable_unit_key.high < rhs.stable_unit_key.high;
+    }
+    return lhs.stable_unit_key.low < rhs.stable_unit_key.low;
+}
+
+() swap_indexes(list.ArrayList<Int>& indexes, Int lhs_index, Int rhs_index) {
+    Int lhs = indexes.get(lhs_index);
+    indexes.set(lhs_index, indexes.get(rhs_index));
+    indexes.set(rhs_index, lhs);
+}
+
+() write_fingerprint(list.ArrayList<UInt8>& output, qkey.Fingerprint128 value) {
+    write_u64(output, value.low);
+    write_u64(output, value.high);
+}
+
+qkey.Fingerprint128 read_fingerprint(UInt8[]& bytes, Int offset) {
+    return qkey.Fingerprint128(read_u64(bytes, offset), read_u64(bytes, offset + 8));
+}
+
+Int header_size() {
+    return 64;
+}
+
+Int unit_size() {
+    return 56;
+}
+
+UInt64 closure_magic() {
+    return UInt64(5354033248158350674);
+}
+
+() write_u64(list.ArrayList<UInt8>& output, UInt64 value) {
+    Int index! = 0;
+    while (index < 8) {
+        output.add(UInt8((value >> UInt64(index * 8)) & UInt64(255)));
+        index = index + 1;
+    }
+}
+
+UInt64 read_u64(UInt8[]& bytes, Int offset) {
+    UInt64 value! = UInt64(0);
+    Int index! = 0;
+    while (index < 8) {
+        value = value | (UInt64(bytes[offset + index]) << UInt64(index * 8));
+        index = index + 1;
+    }
+    return value;
+}

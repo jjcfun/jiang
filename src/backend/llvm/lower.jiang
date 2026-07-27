@@ -9,6 +9,7 @@ import diagnostic = "../../diagnostic.jiang";
 import jil = "../../jil.jiang";
 import qid = "../../store/id.jiang";
 import types = "../../sema/type.jiang";
+import hash = "../../support/hash.jiang";
 import list = "../../support/list.jiang";
 import string = "../../support/string.jiang";
 import table = "../../support/table.jiang";
@@ -43,7 +44,7 @@ Bool text_starts_with(UInt8[]& text, UInt8[]& prefix) {
 }
 
 public Bool lower_module(context.CompilerContext& ctx, jil.Store& store) {
-    LlvmLowerer lowerer! = LlvmLowerer(ctx, true, "default-target");
+    LlvmLowerer lowerer! = LlvmLowerer(ctx, store, true, "default-target");
     return lowerer.lower_module(store);
 }
 
@@ -56,7 +57,7 @@ public Bool emit_object_file(
     Bool link_libc,
     UInt8[]& target_triple
 ) {
-    LlvmLowerer lowerer! = LlvmLowerer(ctx, link_libc, target_triple);
+    LlvmLowerer lowerer! = LlvmLowerer(ctx, store, link_libc, target_triple);
     return lowerer.emit_object_file(store, output_path, opt_level, pass_pipeline);
 }
 
@@ -70,7 +71,7 @@ public Bool emit_object_unit_file(
     Bool link_libc,
     UInt8[]& target_triple
 ) {
-    LlvmLowerer lowerer! = LlvmLowerer(ctx, link_libc, target_triple);
+    LlvmLowerer lowerer! = LlvmLowerer(ctx, store, link_libc, target_triple);
     return lowerer.emit_object_unit_file(store, unit, output_path, opt_level, pass_pipeline);
 }
 
@@ -81,7 +82,7 @@ public Bool emit_llvm_ir_file(
     Bool link_libc,
     UInt8[]& target_triple
 ) {
-    LlvmLowerer lowerer! = LlvmLowerer(ctx, link_libc, target_triple);
+    LlvmLowerer lowerer! = LlvmLowerer(ctx, store, link_libc, target_triple);
     return lowerer.emit_llvm_ir_file(store, output_path);
 }
 
@@ -92,30 +93,41 @@ public UInt8[]&? emit_llvm_ir_text(
     Bool link_libc,
     UInt8[]& target_triple
 ) {
-    LlvmLowerer lowerer! = LlvmLowerer(ctx, link_libc, target_triple);
+    LlvmLowerer lowerer! = LlvmLowerer(ctx, store, link_libc, target_triple);
     return lowerer.emit_llvm_ir_text(store);
 }
 
-@region(a, b)
+@region(a, b, c)
 struct LlvmLowerer: Movable {
     @life(a)
     context.CompilerContext& ctx;
+    @life(b)
+    jil.Store& store;
     ffi.Context llvm_context;
     ffi.Module module;
     ffi.Builder builder;
     table.HashTable<symbol.BackendSymbolKey, Int> declared_function_indexes;
     list.ArrayList<ffi.Value> declared_function_values;
+    table.MultiTable<UInt64, Int> lowered_function_name_indexes;
+    list.ArrayList<std.String> lowered_function_names;
     table.HashTable<qid.SymbolId, Int> declared_external_function_indexes;
     table.HashTable<qid.SymbolId, Int> external_function_indexes;
     list.ArrayList<ffi.Value> external_function_values;
-    @life(b)
+    @life(c)
     system_memory.Allocator allocator;
-    @life(b)
+    @life(c)
     UInt8[]& target_triple!;
     Bool link_libc!;
 
-    init(self, context.CompilerContext& ctx, Bool link_libc, UInt8[]& target_triple) {
+    init(
+        self,
+        context.CompilerContext& ctx,
+        jil.Store& store,
+        Bool link_libc,
+        UInt8[]& target_triple
+    ) {
         self.ctx = ctx;
+        self.store = store;
         self.llvm_context = ffi.Context();
         self.module = ffi.Module(self.llvm_context$.ref(), "jiang_module");
         self.target_triple = self.effective_target_triple(target_triple);
@@ -126,6 +138,8 @@ struct LlvmLowerer: Movable {
         self.builder = ffi.Builder(self.llvm_context$.ref());
         self.declared_function_indexes = table.HashTable<symbol.BackendSymbolKey, Int>();
         self.declared_function_values = list.ArrayList<ffi.Value>();
+        self.lowered_function_name_indexes = table.MultiTable<UInt64, Int>();
+        self.lowered_function_names = list.ArrayList<std.String>();
         self.declared_external_function_indexes = table.HashTable<qid.SymbolId, Int>();
         self.external_function_indexes = table.HashTable<qid.SymbolId, Int>();
         self.external_function_values = list.ArrayList<ffi.Value>();
@@ -202,19 +216,10 @@ struct LlvmLowerer: Movable {
     }
 
     Bool lower_unit(self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
-        if (!self.declare_store_functions(store) || !self.declare_store_globals(store)) {
+        // 独立 object 只拥有当前 unit 的 body，其他函数由引用 lowering 按需声明。
+        if (!self.declare_unit_functions(store, unit) || !self.declare_store_globals_for_unit(store, unit)) {
             return false;
         }
-        if (unit.key.kind == .source_unit) {
-            if (!self.lower_source_unit(store, unit)) {
-                return false;
-            }
-            if (self.should_emit_linux_no_libc_runtime() && self.source_unit_contains_language_entry(store, unit)) {
-                return self.lower_linux_no_libc_runtime();
-            }
-            return true;
-        }
-
         Int index! = 0;
         while (index < unit.functions.len()) {
             jil.Function& function = store.functions.ref_at(unit.functions.get(index).to_index());
@@ -232,55 +237,22 @@ struct LlvmLowerer: Movable {
             }
             index = index + 1;
         }
+        if (self.should_emit_linux_no_libc_runtime() && self.unit_contains_language_entry(store, unit)) {
+            return self.lower_linux_no_libc_runtime();
+        }
         return true;
     }
 
-    Bool source_unit_contains_language_entry(self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
+    Bool unit_contains_language_entry(self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
         Int index! = 0;
-        while (index < store.functions.len()) {
-            jil.Function& function = store.functions.ref_at(index);
-            if (function.is_language_entry && self.source_unit_contains_function(unit, function)) {
+        while (index < unit.functions.len()) {
+            jil.Function& function = store.functions.ref_at(unit.functions.get(index).to_index());
+            if (function.is_language_entry) {
                 return true;
             }
             index = index + 1;
         }
         return false;
-    }
-
-    Bool lower_source_unit(self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
-        Int index! = 0;
-        while (index < store.functions.len()) {
-            jil.Function& function = store.functions.ref_at(index);
-            if (!self.should_lower_function(function)) {
-                index = index + 1;
-                continue;
-            }
-            if (!self.source_unit_contains_function(unit, function)) {
-                index = index + 1;
-                continue;
-            }
-            if (!self.lower_function(function)) {
-                self.add_function_codegen_error(
-                    function,
-                    "failed to lower LLVM function body",
-                    "llvm_function_body_lower_failed"
-                );
-                return false;
-            }
-            index = index + 1;
-        }
-        return true;
-    }
-
-    Bool source_unit_contains_function(self, codegen_unit.CodegenUnit& unit, jil.Function& function) {
-        if (function.type_args.length != 0) {
-            return false;
-        }
-        symbol.BackendSymbolKey key = symbol.function_symbol_key(self.ctx, function);
-        if (key.package_index != unit.key.package_index) {
-            return false;
-        }
-        return key.module_index == unit.key.module_index;
     }
 
     Bool lower_store(self, jil.Store& store) {
@@ -420,7 +392,7 @@ struct LlvmLowerer: Movable {
         Int index! = 0;
         while (ok && index < store.globals.len()) {
             jil.Global& global = store.globals.ref_at(index);
-            ffi.Value value = self.declare_global(global);
+            ffi.Value value = self.declare_global(global, !global.is_external);
             ok = ffi.value_valid(value);
             if (!ok) {
                 self.add_codegen_error("failed to declare LLVM global", "llvm_global_declare_failed");
@@ -430,7 +402,43 @@ struct LlvmLowerer: Movable {
         return ok;
     }
 
-    ffi.Value declare_global(self, jil.Global& global) {
+    Bool declare_store_globals_for_unit(
+        self,
+        jil.Store& store,
+        codegen_unit.CodegenUnit& unit
+    ) {
+        Bool ok! = true;
+        Int index! = 0;
+        while (ok && index < store.globals.len()) {
+            jil.Global& global = store.globals.ref_at(index);
+            Bool owns_definition = self.source_unit_owns_global(store, unit, global);
+            ok = ffi.value_valid(self.declare_global(global, owns_definition));
+            index = index + 1;
+        }
+        if (!ok) {
+            self.add_codegen_error("failed to declare LLVM global", "llvm_global_declare_failed");
+        }
+        return ok;
+    }
+
+    Bool source_unit_owns_global(
+        self,
+        jil.Store& store,
+        codegen_unit.CodegenUnit& unit,
+        jil.Global& global
+    ) {
+        if (global.is_external || unit.key.kind != .source_unit) {
+            return false;
+        }
+        if (self.ctx.store.defs.get(global.def_id).module_id is .some(module_id)) {
+            qid.PackageId package_id = self.ctx.store.resolve.module_ref(module_id).package_id;
+            return package_id.to_index() == unit.key.package_index
+                && module_id.to_index() == unit.key.module_index;
+        }
+        return self.unit_contains_language_entry(store, unit);
+    }
+
+    ffi.Value declare_global(self, jil.Global& global, Bool owns_definition) {
         llvm_state.LowerState state! = self.lower_state();
         ffi.Type value_type = self.global_storage_type(state$.ref(), global);
         if (!ffi.type_valid(value_type)) {
@@ -445,14 +453,14 @@ struct LlvmLowerer: Movable {
         if (!ffi.value_valid(llvm_global)) {
             return ffi.Value();
         }
-        if (global.initializer is .some(initializer)) {
+        if (owns_definition && global.initializer is .some(initializer)) {
             ffi.Value value = llvm_value.lower_static_value(state$.ref(), initializer, global.type_id);
             if (!ffi.value_valid(value)) {
                 self.add_codegen_error("failed to lower LLVM global initializer", "llvm_global_initializer_lower_failed");
                 return ffi.Value();
             }
             ffi.global_set_initializer(llvm_global, value);
-        } else if (!global.is_external) {
+        } else if (owns_definition) {
             ffi.global_set_initializer(llvm_global, ffi.const_null(value_type));
         }
         ffi.global_set_constant(llvm_global, global.read_only);
@@ -489,6 +497,23 @@ struct LlvmLowerer: Movable {
             index = index + 1;
         }
         return ok;
+    }
+
+    Bool declare_unit_functions(self, jil.Store& store, codegen_unit.CodegenUnit& unit) {
+        Int index! = 0;
+        while (index < unit.functions.len()) {
+            jil.Function& function = store.functions.ref_at(unit.functions.get(index).to_index());
+            if (!ffi.value_valid(self.declare_function(function))) {
+                self.add_function_codegen_error(
+                    function,
+                    "failed to declare LLVM function",
+                    "llvm_function_declare_failed"
+                );
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
     }
 
     () dispose(self) {
@@ -592,11 +617,34 @@ struct LlvmLowerer: Movable {
     Bool lower_function(self,
         jil.Function& function
     ) {
+        std.String name = self.function_symbol_name(function);
+        if (self.function_name_was_lowered(name.bytes())) {
+            return true;
+        }
         ffi.Value llvm_function = self.function_value(function);
         if (!ffi.value_valid(llvm_function)) {
             return false;
         }
-        return self.lower_body(function.body$.ref(), llvm_function);
+        if (!self.lower_body(function.body$.ref(), llvm_function)) {
+            return false;
+        }
+        UInt64 name_hash = hash.hash_bytes(name.bytes());
+        Int name_index = self.lowered_function_names.len();
+        self.lowered_function_names.add(name);
+        self.lowered_function_name_indexes.add(name_hash, name_index);
+        return true;
+    }
+
+    Bool function_name_was_lowered(self, UInt8[]& name) {
+        table.MultiTableCursor cursor! = self.lowered_function_name_indexes.first(hash.hash_bytes(name));
+        while (cursor.valid()) {
+            Int index = self.lowered_function_name_indexes.get(cursor);
+            if (string.equal(self.lowered_function_names.ref_at(index).bytes(), name)) {
+                return true;
+            }
+            cursor = self.lowered_function_name_indexes.next(cursor);
+        }
+        return false;
     }
 
     ffi.Value function_value(self, jil.Function& function) {
@@ -1438,10 +1486,11 @@ struct LlvmLowerer: Movable {
         );
     }
 
-    @life(return: (self, self, self, self, self, self, self, self, self))
+    @life(return: (self, self, self, self, self, self, self, self, self, self))
     llvm_state.LowerState lower_state(self) {
         return llvm_state.LowerState(
             self.ctx,
+            self.store,
             self.llvm_context$.ref(),
             self.module$.ref(),
             self.builder$.ref(),

@@ -5,12 +5,16 @@
 // backend-independent key，后续真实 codegen/mangling 都从这个 key 派生。
 
 import jil = "../jil.jiang";
+import object_key_builder = "../artifact/object_key_builder.jiang";
 import core_traits = "../core/traits.jiang";
 import context = "../context.jiang";
 import lang_abi = "../lang/abi.jiang";
 import def = "../resolve/def.jiang";
 import qid = "../store/id.jiang";
+import qkey = "../incremental/key.jiang";
 import comptime_value = "../sema/comptime/value.jiang";
+import types = "../sema/type.jiang";
+import hash = "../support/hash.jiang";
 import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import table = "../support/table.jiang";
@@ -188,7 +192,7 @@ std.String stable_function_symbol_name(context.CompilerContext& ctx, jil.Functio
     guard ctx.store.incremental.stable_id_for_def(function.def_id) is .some(stable_id) else {
         return symbol_name(function_symbol_key(ctx, function));
     }
-    std.StringBuilder builder = std.StringBuilder();
+    std.StringBuilder builder! = std.StringBuilder();
     builder.append("_Js");
     builder.append(Int(stable_id.low));
     builder.append("_");
@@ -196,14 +200,18 @@ std.String stable_function_symbol_name(context.CompilerContext& ctx, jil.Functio
     std.String name! = builder.into_string();
     Int index! = 0;
     while (index < function.type_args.length) {
-        name = append_int_part(name, "_T", function.type_args[index].to_index());
+        qkey.Fingerprint128 fingerprint = object_key_builder.stable_type_fingerprint_for_type(
+            ctx,
+            function.type_args[index]
+        );
+        name = append_fingerprint_part(name, "_T", fingerprint);
         index = index + 1;
     }
     index = 0;
     while (index < function.const_args.length) {
-        std.String part = comptime_value_symbol_part(function.const_args[index]);
-        name = append_text(name, "_C");
-        name = append_text(name, part.bytes());
+        qkey.Fingerprint128 fingerprint =
+            object_key_builder.stable_comptime_value_fingerprint(ctx, function.const_args[index]);
+        name = append_fingerprint_part(name, "_C", fingerprint);
         index = index + 1;
     }
     if (function.is_coroutine_resume) { name = append_text(name, "_Resume"); }
@@ -316,6 +324,20 @@ std.String append_int_part(std.String prefix, UInt8[]& marker, Int value) {
     return builder.into_string();
 }
 
+std.String append_fingerprint_part(
+    std.String prefix,
+    UInt8[]& marker,
+    qkey.Fingerprint128 fingerprint
+) {
+    std.StringBuilder builder = std.StringBuilder();
+    builder.append(prefix.bytes());
+    builder.append(marker);
+    builder.append(Int(fingerprint.low));
+    builder.append("_");
+    builder.append(Int(fingerprint.high));
+    return builder.into_string();
+}
+
 std.String append_text(std.String prefix, UInt8[]& text) {
     std.StringBuilder builder = std.StringBuilder();
     builder.append(prefix.bytes());
@@ -323,7 +345,10 @@ std.String append_text(std.String prefix, UInt8[]& text) {
     return builder.into_string();
 }
 
-() write_comptime_value_hash<H: core_traits.Hasher>(H&! hasher, comptime_value.ComptimeValue value) {
+public () write_comptime_value_hash<H: core_traits.Hasher>(
+    H&! hasher,
+    comptime_value.ComptimeValue value
+) {
     hasher.write(Int(value.type_id.to_index()));
     if (value.data is .invalid) { hasher.write(Int(1)); return; }
     if (value.data is .unit_value) { hasher.write(Int(2)); return; }
@@ -365,7 +390,7 @@ std.String append_text(std.String prefix, UInt8[]& text) {
     hasher.write(Int(99));
 }
 
-Bool comptime_value_slices_equal(
+public Bool comptime_value_slices_equal(
     comptime_value.ComptimeValue[]& lhs,
     comptime_value.ComptimeValue[]& rhs
 ) {
@@ -479,47 +504,151 @@ public Bool validate_unique_function_symbol_names(context.CompilerContext& ctx, 
 }
 
 public std.String? duplicate_function_symbol_name(context.CompilerContext& ctx, jil.Store& store) {
-    list.ArrayList<std.String> names! = list.ArrayList<std.String>();
-    list.ArrayList<Int> indexes! = list.ArrayList<Int>();
+    table.MultiTable<UInt64, Int> indexes! = table.MultiTable<UInt64, Int>();
     Int index! = 0;
     while (index < store.functions.len()) {
         jil.Function& function = store.functions.ref_at(index);
         std.String symbol_name = function_symbol_name(ctx, function);
-        Int? existing_name_index! = null;
-        {
-            existing_name_index = duplicate_symbol_name_index(names$.ref(), symbol_name.bytes());
-        }
-        if (existing_name_index is .some(name_index)) {
-            Int previous_index = indexes.get(name_index);
+        UInt64 name_hash = hash.hash_bytes(symbol_name.bytes());
+        Int? previous_index = duplicate_symbol_function_index(
+            ctx,
+            store,
+            indexes$.ref(),
+            name_hash,
+            symbol_name.bytes()
+        );
+        if (previous_index is .some(existing_index)) {
+            Int previous_index = existing_index;
             jil.Function& previous = store.functions.ref_at(previous_index);
             if (!compatible_duplicate_function_name(ctx, previous, function)) {
-                return std.String(symbol_name.bytes());
+                return duplicate_function_symbol_description(ctx, symbol_name.bytes(), previous, function);
             }
-        } else {
-            names.add(std.String(symbol_name.bytes()));
-            indexes.add(index);
         }
+        indexes.add(name_hash, index);
         index = index + 1;
     }
     return null;
 }
 
-Int? duplicate_symbol_name_index(list.ArrayList<std.String>& names, UInt8[]& name) {
-    Int index! = 0;
-    while (index < names.len()) {
-        if (string.equal(names.ref_at(index).bytes(), name)) {
-            return index;
+Int? duplicate_symbol_function_index(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    table.MultiTable<UInt64, Int>& indexes,
+    UInt64 name_hash,
+    UInt8[]& symbol_name
+) {
+    table.MultiTableCursor cursor! = indexes.first(name_hash);
+    while (cursor.valid()) {
+        Int previous_index = indexes.get(cursor);
+        jil.Function& previous = store.functions.ref_at(previous_index);
+        std.String previous_name = function_symbol_name(ctx, previous);
+        if (string.equal(previous_name.bytes(), symbol_name)) {
+            return previous_index;
         }
-        index = index + 1;
+        cursor = indexes.next(cursor);
     }
     return null;
+}
+
+std.String duplicate_function_symbol_description(
+    context.CompilerContext& ctx,
+    UInt8[]& symbol_name,
+    jil.Function& lhs,
+    jil.Function& rhs
+) {
+    std.StringBuilder builder! = std.StringBuilder();
+    builder.append(symbol_name);
+    append_function_instance_description(ctx, builder$.mut_ref(), lhs);
+    append_function_instance_description(ctx, builder$.mut_ref(), rhs);
+    return builder.into_string();
+}
+
+() append_function_instance_description(
+    context.CompilerContext& ctx,
+    std.StringBuilder&! builder,
+    jil.Function& function
+) {
+    builder.append(" [");
+    builder.append(ctx.store.symbols.text(ctx.store.defs.get(function.def_id).name.symbol));
+    builder.append(" types:");
+    Int index! = 0;
+    while (index < function.type_args.length) {
+        builder.append(" ");
+        builder.append(function.type_args[index].to_index());
+        append_type_instance_description(ctx, builder, function.type_args[index]);
+        index = index + 1;
+    }
+    builder.append("]");
+}
+
+() append_type_instance_description(
+    context.CompilerContext& ctx,
+    std.StringBuilder&! builder,
+    qid.TypeId type_id
+) {
+    types.TypeInfo info = ctx.store.types.get(type_id);
+    if (info.is_mutable) { builder.append(":mutable"); }
+    if (info.type_owner_def is .some(owner_def)) {
+        builder.append(":owner=");
+        builder.append(ctx.store.symbols.text(ctx.store.defs.get(owner_def).name.symbol));
+    }
+    append_type_data_description(ctx, builder, info.data);
+}
+
+() append_type_data_description(
+    context.CompilerContext& ctx,
+    std.StringBuilder&! builder,
+    types.TypeData data
+) {
+    if (data is .invalid) { builder.append(":invalid"); return; }
+    if (data is .never) { builder.append(":never"); return; }
+    if (data is .unit) { builder.append(":unit"); return; }
+    if (data is .bool_type) { builder.append(":bool"); return; }
+    if (data is .char_type) { builder.append(":char"); return; }
+    if (data is .int_type(value)) { builder.append(":int="); builder.append(value.bits); return; }
+    if (data is .float_type(value)) { builder.append(":float="); builder.append(value.bits); return; }
+    if (data is .named(value)) {
+        builder.append(":named=");
+        builder.append(ctx.store.symbols.text(ctx.store.defs.get(value.def_id).name.symbol));
+        return;
+    }
+    if (data is .trait_companion) { builder.append(":trait-companion"); return; }
+    if (data is .optional) { builder.append(":optional"); return; }
+    if (data is .error_union) { builder.append(":error-union"); return; }
+    if (data is .handle_type(value)) {
+        builder.append(":handle=");
+        builder.append(Int(value.kind));
+        return;
+    }
+    if (data is .slice_value_type) { builder.append(":slice-value"); return; }
+    if (data is .array_type) { builder.append(":array"); return; }
+    if (data is .tuple_type) { builder.append(":tuple"); return; }
+    if (data is .function_type) { builder.append(":function"); return; }
+    builder.append(":task");
 }
 
 Bool compatible_duplicate_function_name(context.CompilerContext& ctx, jil.Function& lhs, jil.Function& rhs) {
     if (lhs.is_external && rhs.is_external) {
         return external_function_signature_equal(ctx, lhs, rhs);
     }
+    if (same_stable_function_instance(ctx, lhs, rhs)) {
+        return true;
+    }
     return runtime_entry_extern_duplicate(ctx, lhs, rhs);
+}
+
+public Bool same_stable_function_instance(
+    context.CompilerContext& ctx,
+    jil.Function& lhs,
+    jil.Function& rhs
+) {
+    if (lhs.def_id != rhs.def_id) { return false; }
+    if (lhs.is_runtime_entry != rhs.is_runtime_entry) { return false; }
+    if (lhs.is_coroutine_resume != rhs.is_coroutine_resume) { return false; }
+    if (lhs.is_coroutine_completion != rhs.is_coroutine_completion) { return false; }
+    std.String lhs_name = function_symbol_name(ctx, lhs);
+    std.String rhs_name = function_symbol_name(ctx, rhs);
+    return string.equal(lhs_name.bytes(), rhs_name.bytes());
 }
 
 Bool runtime_entry_extern_duplicate(context.CompilerContext& ctx, jil.Function& lhs, jil.Function& rhs) {

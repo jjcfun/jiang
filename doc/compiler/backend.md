@@ -18,15 +18,14 @@ LLVM IR 是 backend 产物，不是 JIL 的替代品。JIL 保留 Jiang 语义�
 
 backend-specific symbol/mangling 从 `BackendSymbolKey` 派生。key 包含：
 
-- package index
-- module index
-- function `DefId`
-- concrete type args
-- runtime entry flag
+- 当前 session 的 package/module/function identity。
+- concrete type args 和 const args。
+- runtime entry / coroutine variant。
 
-这层 symbol 只服务目标代码生成，不应该反向写入 JIL。普通 Jiang 函数会 mangling 成
-`_Jp<package>_m<module>_f<def>` 形态，并在泛型实例后追加 concrete type args。这样不同
-package/module 中同名函数不会在 LLVM module 里冲突。
+`BackendSymbolKey` 只服务本轮 LLVM declaration/value 对齐，不写入长期 cache。真正写进 object
+的内部函数名从 declaration stable id 派生；泛型后缀使用 stable type/const fingerprint，
+不能使用 `DefId`、`TypeId` 或 package/module 数组下标。这样跨编译进程恢复的 caller/callee
+仍拥有相同链接符号。
 
 只有 hosted entry wrapper 输出 C ABI `main`。language main 的选择只发生在 root package
 root module 中；dependency package 即使也定义 `main`，也只是普通 Jiang 函数。
@@ -94,6 +93,41 @@ backend 当前区分 debug/release：
 
 backend profile 由 driver options 统一描述，包含 mode、codegen opt level 和 pass pipeline。
 这个 profile 必须进入 object cache key，避免优化策略变化后复用旧 object。
+
+## Codegen unit 与 object cache
+
+backend-independent `CodegenUnit` 把最终 JIL 分为：
+
+- source unit：拥有同一 source module 的普通 concrete function、global 和 hosted entry wrapper。
+- monomorph unit：拥有一个带完整 type/const args 的 concrete generic instance。
+
+external declaration 不拥有 object。每个 definition 只能由一个 unit 发出；unit、function、global
+和最终 link input 都按 stable identity 排序。session-local `TypeId` 不同但稳定 symbol identity
+相同的 concrete instance 只发出一次。只包含 global 的 module 仍拥有 source unit；
+interface-loaded global 保持 external，由已验证 object closure 提供 definition。
+
+unit emission 只声明并 lower 当前 unit 拥有的 function body。跨 unit 的直接 function reference
+按需声明为 LLVM external declaration，不扫描或声明完整 JIL Store，也不把 callee body 复制进
+当前 object。
+
+object cache index 按 stable unit key 分片。命中必须同时验证 compiler build、language version、
+target/ABI、LLVM/toolchain、backend profile、dependency/interface fingerprint、相对路径和实际
+object hash。backend 只消费通过验证的 object。
+
+object 和 index 都以同目录临时文件写入，再原子发布；object 总是先于 index。
+并发编译同一 unit 可以重复 codegen，但最终发布内容必须一致，
+不能留下 index 指向未完成 object。
+
+executable 和 dylib 的 `LinkPlan` 包含当前 units、interface-loaded package 的已验证 units、
+传递依赖和 runtime object。当前编译重新拥有的 definition 会覆盖 interface closure 中的旧版本，
+随后再按路径去重。
+
+`--emit-obj -o file.o` 始终保持单文件输出。当前所有目标还没有统一的 relocatable merge contract，
+因此该模式完整 lowering package 并生成一个以 unit key/hash closure 为 key 的整包 object；
+executable/dylib 则直接链接 unit objects，并可在 closure 完整命中时跳过依赖 body lowering。
+
+开发时可用 `--artifact-stats` 观察 interface/object hit、miss、stale、emitted/reused unit 和
+linked object 数量。统计不进入 cache key。
 
 ## C ABI classifier
 

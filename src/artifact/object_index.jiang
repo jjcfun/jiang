@@ -1,0 +1,350 @@
+// Object cache index 的持久化格式与按 key 分片发布。
+//
+// 每个 stable codegen unit 使用独立 record，记录只保存相对 cache root 的
+// object 路径和跨进程 fingerprint；Semantic Model、TypeId、JIL 等会话数据
+// 不进入该格式。
+
+import object_artifact = "./object.jiang";
+import object_key = "./object_key.jiang";
+import artifact_path = "./path.jiang";
+import qkey = "../incremental/key.jiang";
+import system_fs = "../system/fs.jiang";
+import list = "../support/list.jiang";
+import std;
+
+public const Int object_index_format_version = 1;
+
+public struct ObjectIndexContext: Copyable {
+    public qkey.Fingerprint128 compiler_build;
+    public qkey.Fingerprint128 language_version;
+    public qkey.Fingerprint128 target_abi;
+    public qkey.Fingerprint128 toolchain;
+    public qkey.Fingerprint128 backend_profile;
+
+    public init(self,
+        qkey.Fingerprint128 compiler_build,
+        qkey.Fingerprint128 language_version,
+        qkey.Fingerprint128 target_abi,
+        qkey.Fingerprint128 toolchain,
+        qkey.Fingerprint128 backend_profile
+    ) {
+        self.compiler_build = compiler_build;
+        self.language_version = language_version;
+        self.target_abi = target_abi;
+        self.toolchain = toolchain;
+        self.backend_profile = backend_profile;
+    }
+}
+
+public struct ObjectIndexRecord: Movable {
+    public object_artifact.ObjectArtifactKind kind;
+    public qkey.Fingerprint128 unit_key;
+    public ObjectIndexContext context;
+    public qkey.Fingerprint128 dependency_fingerprint;
+    public qkey.Fingerprint128 object_hash;
+    public std.String relative_object_path;
+
+    public init(self,
+        object_artifact.ObjectArtifactKind kind,
+        qkey.Fingerprint128 unit_key,
+        ObjectIndexContext context,
+        qkey.Fingerprint128 dependency_fingerprint,
+        qkey.Fingerprint128 object_hash,
+        UInt8[]& relative_object_path
+    ) {
+        self.kind = kind;
+        self.unit_key = unit_key;
+        self.context = context;
+        self.dependency_fingerprint = dependency_fingerprint;
+        self.object_hash = object_hash;
+        self.relative_object_path = std.String(relative_object_path);
+    }
+}
+
+public ObjectIndexRecord source_record(
+    object_artifact.SourceObjectKey key,
+    ObjectIndexContext context,
+    qkey.Fingerprint128 object_hash,
+    UInt8[]& relative_object_path
+) {
+    return ObjectIndexRecord(
+        .source_object,
+        object_artifact.source_object_fingerprint(key),
+        context,
+        key.interface_hash,
+        object_hash,
+        relative_object_path
+    );
+}
+
+public ObjectIndexRecord monomorph_record(
+    object_key.StableInstanceKey& key,
+    ObjectIndexContext context,
+    qkey.Fingerprint128 object_hash,
+    UInt8[]& relative_object_path
+) {
+    return ObjectIndexRecord(
+        .monomorph_object,
+        object_key.stable_instance_fingerprint(key),
+        context,
+        monomorph_dependency_fingerprint(key),
+        object_hash,
+        relative_object_path
+    );
+}
+
+public Bool record_matches(
+    ObjectIndexRecord& record,
+    object_artifact.ObjectArtifactKind kind,
+    qkey.Fingerprint128 unit_key,
+    ObjectIndexContext context
+) {
+    if (record.kind != kind || record.unit_key != unit_key) { return false; }
+    if (record.context.compiler_build != context.compiler_build) { return false; }
+    if (record.context.language_version != context.language_version) { return false; }
+    if (record.context.target_abi != context.target_abi) { return false; }
+    if (record.context.toolchain != context.toolchain) { return false; }
+    return record.context.backend_profile == context.backend_profile;
+}
+
+public Bool source_dependency_matches(
+    ObjectIndexRecord& record,
+    object_artifact.SourceObjectKey key
+) {
+    return record.dependency_fingerprint == key.interface_hash;
+}
+
+public Bool monomorph_dependency_matches(
+    ObjectIndexRecord& record,
+    object_key.StableInstanceKey& key
+) {
+    return record.dependency_fingerprint == monomorph_dependency_fingerprint(key);
+}
+
+public Bool relative_object_path_valid(UInt8[]& path) {
+    if (path.length <= 8 || !starts_with(path, "objects/")) {
+        return false;
+    }
+    Int index! = 8;
+    while (index < path.length) {
+        UInt8 byte = path[index];
+        if (byte == UInt8(0) || byte == UInt8(47) || byte == UInt8(92)) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+public std.String? object_path(UInt8[]& cache_root, ObjectIndexRecord& record) {
+    UInt8[]& relative = record.relative_object_path.bytes();
+    if (!relative_object_path_valid(relative)) {
+        return null;
+    }
+    UInt8[]^ joined = std.path.join(cache_root, relative).into_slice();
+    return std.String(joined[..]);
+}
+
+public UInt8[]^ index_dir(UInt8[]& cache_root) {
+    return std.path.join(cache_root, "index/objects").into_slice();
+}
+
+public UInt8[]^ record_path(
+    UInt8[]& cache_root,
+    object_artifact.ObjectArtifactKind kind,
+    qkey.Fingerprint128 unit_key
+) {
+    std.StringBuilder name = std.StringBuilder();
+    name.append(kind_prefix(kind));
+    name.append("_");
+    name.append(unit_key.low);
+    name.append("_");
+    name.append(unit_key.high);
+    name.append(".jai");
+    UInt8[]^ dir = index_dir(cache_root);
+    return std.path.join(dir[..], name.slice()).into_slice();
+}
+
+public Bool publish(UInt8[]& cache_root, ObjectIndexRecord& record) {
+    if (!relative_object_path_valid(record.relative_object_path.bytes())) {
+        return false;
+    }
+    UInt8[]^ dir = index_dir(cache_root);
+    if (!system_fs.create_dirs(dir[..])) {
+        return false;
+    }
+    UInt8[]^ final_path = record_path(cache_root, record.kind, record.unit_key);
+    UInt8[]^ temporary_path = temporary_record_path(final_path[..]);
+    list.ArrayList<UInt8> encoded = encode(record);
+    if (!system_fs.write_all(temporary_path[..], encoded.slice())) {
+        return false;
+    }
+    if (system_fs.atomic_replace(temporary_path[..], final_path[..])) {
+        return true;
+    }
+    system_fs.remove_file(temporary_path[..]);
+    return false;
+}
+
+public ObjectIndexRecord? load(
+    UInt8[]& cache_root,
+    object_artifact.ObjectArtifactKind kind,
+    qkey.Fingerprint128 unit_key
+) {
+    UInt8[]^ path = record_path(cache_root, kind, unit_key);
+    guard system_fs.read_all(path[..]) is .some(bytes) else { return null; }
+    return decode(bytes);
+}
+
+public list.ArrayList<UInt8> encode(ObjectIndexRecord& record) {
+    list.ArrayList<UInt8> output = list.ArrayList<UInt8>();
+    write_u64(output$.ref(), index_magic());
+    write_u64(output$.ref(), UInt64(object_index_format_version));
+    write_u64(output$.ref(), UInt64(Int(record.kind)));
+    write_fingerprint(output$.ref(), record.unit_key);
+    write_context(output$.ref(), record.context);
+    write_fingerprint(output$.ref(), record.dependency_fingerprint);
+    write_fingerprint(output$.ref(), record.object_hash);
+    UInt8[]& relative = record.relative_object_path.bytes();
+    write_u64(output$.ref(), UInt64(relative.length));
+    append_bytes(output$.ref(), relative);
+    return output;
+}
+
+public ObjectIndexRecord? decode(UInt8[]& bytes) {
+    if (bytes.length < encoded_header_size()) { return null; }
+    if (read_u64(bytes, 0) != index_magic()) { return null; }
+    if (read_u64(bytes, 8) != UInt64(object_index_format_version)) { return null; }
+    guard kind_from_u64(read_u64(bytes, 16)) is .some(kind) else { return null; }
+    Int path_length = Int(read_u64(bytes, 152));
+    if (path_length <= 0 || path_length > 1024) { return null; }
+    if (bytes.length != encoded_header_size() + path_length) { return null; }
+    UInt8[]& relative = bytes[encoded_header_size()..bytes.length];
+    if (!relative_object_path_valid(relative)) { return null; }
+    return ObjectIndexRecord(
+        kind,
+        read_fingerprint(bytes, 24),
+        read_context(bytes),
+        read_fingerprint(bytes, 120),
+        read_fingerprint(bytes, 136),
+        relative
+    );
+}
+
+public qkey.Fingerprint128 monomorph_dependency_fingerprint(object_key.StableInstanceKey& key) {
+    return qkey.Fingerprint128(
+        key.body_hash.low ^ key.layout_hash.low,
+        key.body_hash.high ^ key.layout_hash.high
+    );
+}
+
+() write_context(list.ArrayList<UInt8>& output, ObjectIndexContext context) {
+    write_fingerprint(output, context.compiler_build);
+    write_fingerprint(output, context.language_version);
+    write_fingerprint(output, context.target_abi);
+    write_fingerprint(output, context.toolchain);
+    write_fingerprint(output, context.backend_profile);
+}
+
+ObjectIndexContext read_context(UInt8[]& bytes) {
+    return ObjectIndexContext(
+        read_fingerprint(bytes, 40),
+        read_fingerprint(bytes, 56),
+        read_fingerprint(bytes, 72),
+        read_fingerprint(bytes, 88),
+        read_fingerprint(bytes, 104)
+    );
+}
+
+() write_fingerprint(list.ArrayList<UInt8>& output, qkey.Fingerprint128 value) {
+    write_u64(output, value.low);
+    write_u64(output, value.high);
+}
+
+qkey.Fingerprint128 read_fingerprint(UInt8[]& bytes, Int offset) {
+    return qkey.Fingerprint128(read_u64(bytes, offset), read_u64(bytes, offset + 8));
+}
+
+object_artifact.ObjectArtifactKind? kind_from_u64(UInt64 value) {
+    if (value == UInt64(Int(object_artifact.ObjectArtifactKind.source_object))) {
+        return object_artifact.ObjectArtifactKind.source_object;
+    }
+    if (value == UInt64(Int(object_artifact.ObjectArtifactKind.monomorph_object))) {
+        return object_artifact.ObjectArtifactKind.monomorph_object;
+    }
+    if (value == UInt64(Int(object_artifact.ObjectArtifactKind.package_object))) {
+        return object_artifact.ObjectArtifactKind.package_object;
+    }
+    return null;
+}
+
+@life()
+UInt8[]& kind_prefix(object_artifact.ObjectArtifactKind kind) {
+    if (kind == .source_object) {
+        return "source";
+    }
+    if (kind == .package_object) {
+        return "package";
+    }
+    return "mono";
+}
+
+UInt8[]^ temporary_record_path(UInt8[]& final_path) {
+    return temporary_path(final_path, ".index.tmp.");
+}
+
+public UInt8[]^ temporary_object_path(UInt8[]& final_path) {
+    return temporary_path(final_path, ".object.tmp.");
+}
+
+UInt8[]^ temporary_path(UInt8[]& final_path, UInt8[]& marker) {
+    std.StringBuilder path = std.StringBuilder();
+    path.append(final_path);
+    path.append(marker);
+    path.append(system_fs.process_id());
+    return path.into_slice();
+}
+
+Bool starts_with(UInt8[]& text, UInt8[]& prefix) {
+    if (text.length < prefix.length) { return false; }
+    Int index! = 0;
+    while (index < prefix.length) {
+        if (text[index] != prefix[index]) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Int encoded_header_size() {
+    return 160;
+}
+
+UInt64 index_magic() {
+    return UInt64(5354029960630459721);
+}
+
+() write_u64(list.ArrayList<UInt8>& output, UInt64 value) {
+    Int index! = 0;
+    while (index < 8) {
+        output.add(UInt8((value >> UInt64(index * 8)) & UInt64(255)));
+        index = index + 1;
+    }
+}
+
+UInt64 read_u64(UInt8[]& bytes, Int offset) {
+    UInt64 value! = UInt64(0);
+    Int index! = 0;
+    while (index < 8) {
+        value = value | (UInt64(bytes[offset + index]) << UInt64(index * 8));
+        index = index + 1;
+    }
+    return value;
+}
+
+() append_bytes(list.ArrayList<UInt8>& output, UInt8[]& bytes) {
+    Int index! = 0;
+    while (index < bytes.length) {
+        output.add(bytes[index]);
+        index = index + 1;
+    }
+}
