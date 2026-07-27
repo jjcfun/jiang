@@ -66,5 +66,5 @@ generate_source
 
 printf 'shape=%s branches=%s runs=%s\n' \
   "$JIANG_COMPILE_BENCH_SHAPE" "$JIANG_COMPILE_BENCH_BRANCHES" "$JIANG_COMPILE_BENCH_RUNS"
-run_case mir "$JIANGC" --mode release --mir-stats --check "$SOURCE"
-run_case llvm "$JIANGC" --mode release --mir-stats --emit-llvm -o "$LLVM_OUTPUT" "$SOURCE"
+run_case jil "$JIANGC" --mode release --jil-stats --check "$SOURCE"
+run_case llvm "$JIANGC" --mode release --jil-stats --emit-llvm -o "$LLVM_OUTPUT" "$SOURCE"

@@ -20,6 +20,9 @@ JIL 的输入是 Semantic Model、`TypeCheckStore`、monomorph `MonomorphStore`�
 JIL 生成完成后，borrow check、drop elaboration 和 backend 会继续把 JIL 与 layout 查询结果
 组合使用。
 
+优化 pass、测量方法和 tail/musttail 证据见
+[JIL 优化与基线](jil-optimization.md)。
+
 `$` Intrinsic Operation 不在 JIL lowering 中重新按文本猜测。type check 先根据
 `@intrinsic(value, Pattern)` / `@intrinsic(type, Pattern)` 的 receiver pattern 和 where 约束
 选出 builtin lowering kind；JIL lowering 只消费这个 side table。带所有权副作用的
