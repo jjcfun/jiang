@@ -135,9 +135,21 @@ JIANGC=./build/bin/jiangc bash ./script/backend_cli_smoke.sh
 ```
 
 `script/test.sh` 统一发现 `check/`、`fail/`、`emit/` 和 `run/` 用例。默认运行
-`test/lang`，通过 `TEST_ROOT` 可选择编译器内部测试。每个用例的中间产物和日志隔离在
-`build/test` 下，为后续并行执行保留边界；`TEST_FILTER` 可用正则选择任意类别的用例，
-`TEST_LIST` 可指定按仓库相对路径逐行列出的用例清单。
+`test/lang`，通过 `TEST_ROOT` 可选择编译器内部测试。runner 默认使用逻辑 CPU 数和 4
+中的较小值并行执行；`TEST_JOBS=1` 可用于串行复现。每个用例都有独立的工作目录和
+artifact cache，避免并发编译共享可写状态。`TEST_FILTER` 可用正则选择任意类别的用例，
+`TEST_LIST` 可指定按仓库相对路径逐行列出的用例清单：
+
+```bash
+TEST_JOBS=1 TEST_FILTER='tuple' JIANGC=./build/bin/jiangc bash ./script/test.sh
+TEST_JOBS=4 TEST_TIMEOUT=120 JIANGC=./build/bin/jiangc bash ./script/test.sh
+```
+
+默认在首个失败后停止派发新用例，并等待已经启动的用例结束；设置
+`TEST_KEEP_GOING=1` 可完成全部已选择用例。失败时 runner 会打印保留目录，其中的
+`cases/<序号>-<类别>-<用例>/` 保存编译、链接、运行日志和独立 cache。成功用例默认清理；
+调试时可用 `TEST_KEEP_WORK=1` 保留全部产物。`TEST_TIMING=1` 会输出每个阶段、每个用例和
+整个 suite 的耗时。
 `script/lang_check.sh` 暂时作为兼容入口。
 
 `script/smoke.sh` 使用显式用例清单运行日常快速测试，不定义另一套测试语义。它默认
@@ -152,6 +164,12 @@ release object/executable 路径和 LLVM O2 pass pipeline 时，打开 release r
 
 ```bash
 TEST_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/test.sh
+```
+
+runner 自身的调度契约可独立验证：
+
+```bash
+bash ./script/test_runner_self_test.sh
 ```
 
 macOS arm64 release 包：

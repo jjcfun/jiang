@@ -338,6 +338,8 @@ planner 是纯函数，不创建目录、不写文件。pipeline 负责在 objec
 并在 cache lookup / validate 时使用 `artifact/object_hash` 计算实际 object hash。
 
 `CompileOptions.artifact_cache_dir` 是当前编译的 cache root，默认值为 `build/cache`。
+命令行可用 `--artifact-cache-dir <path>` 为一次编译选择其他 cache root。测试 runner
+会为每个 case 使用独立目录；日常编译未指定该选项时继续使用默认位置。
 pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
 
 推荐分成两类：

@@ -68,3 +68,93 @@ LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 
 任何新增语言能力必须同步更新本矩阵；如果某个语义尚未定稿，应在对应 TODO 中标注，不能用临时
 测试假定长期规则。
+
+## 统一 runner
+
+`script/test.sh` 是语言测试和编译器模块测试共用的执行器。`script/smoke.sh` 只提供日常快速
+profile，仍把清单交给同一个 runner；它不定义另一套成功、失败或运行语义。
+
+runner 默认使用逻辑 CPU 数和 4 中的较小值作为进程数。下面两条命令选择完全相同的用例，
+结果按发现顺序输出；后一条只改变同时执行的用例数：
+
+```bash
+TEST_JOBS=1 JIANGC=./build/bin/jiangc bash ./script/test.sh
+TEST_JOBS=4 JIANGC=./build/bin/jiangc bash ./script/test.sh
+```
+
+每个 case 在一次运行中拥有唯一的 `work` 和 mutable artifact cache。P3 完成并发安全的
+artifact 发布前，测试进程不会共享默认 `build/cache`。`check`、`fail` 和 `emit` 各只调用
+一次编译器；`run` 只执行一次 emit、link 和 program run。profile 选择与日志汇总不会再次编译
+同一 case。
+
+常用控制项：
+
+- `TEST_FILTER=<regex>`：按路径正则筛选所有类别。
+- `TEST_LIST=<file>`：只运行清单中逐行列出的仓库相对路径。
+- `TEST_RUN_FILTER=<regex>`：进一步筛选需要链接执行的 `run` 用例。
+- `TEST_JOBS=<n>`：设置最大并发进程数；`1` 用于稳定地串行复现。
+- `TEST_TIMEOUT=<seconds>`：限制单个 case 的总时长，`0` 表示不限制。
+- `TEST_KEEP_GOING=1`：失败后继续完成全部已选择用例。
+- `TEST_KEEP_WORK=1`：成功时也保留 work、cache 和日志。
+- `TEST_TIMING=1`：输出 compile/emit、link、execute、case total 和 suite wall time。
+- `TEST_RELEASE_RUNS=1`：在普通 `run` 后额外验证 release executable 路径。
+
+默认 fail-fast 会在发现首个失败后停止派发新 case，并等待已经启动的进程收敛。并行执行时，
+先完成的 worker 不直接写最终输出，因此完成顺序不会改变结果顺序。`TEST_KEEP_GOING=1`
+用于一次收集完整失败集合，不改变单个 case 的判定。
+
+失败或 `TEST_KEEP_WORK=1` 时，runner 会打印本次运行的 artifact 路径：
+
+```text
+build/test/run.<随机后缀>/
+  cases/<序号>-<类别>-<用例键>/
+    cache/
+    compiler.out
+    emit.out
+    link.out
+    run.out
+```
+
+不同类别只生成实际需要的日志。超时 case 同样保留已经写入的完整日志。诊断用例在源文件中用
+`// expected: <文本>` 指定必须出现的诊断片段；runner 的汇总输出只报告结果，原始诊断保存在
+case 日志中。
+
+## 性能基线
+
+比较 runner 调度策略时必须使用同一编译器、profile、用例选择和 cache 策略。先串行测量，
+再只改变 `TEST_JOBS`：
+
+```bash
+TEST_ROOT=test/compiler \
+TEST_LIST=test/profile/compiler-smoke.txt \
+TEST_JOBS=1 TEST_TIMING=1 \
+JIANGC=./build/bin/jiangc bash ./script/test.sh
+
+TEST_ROOT=test/compiler \
+TEST_LIST=test/profile/compiler-smoke.txt \
+TEST_JOBS=4 TEST_TIMING=1 \
+JIANGC=./build/bin/jiangc bash ./script/test.sh
+```
+
+记录 compiler version、profile、目标平台、case 数、`jobs` 和 suite wall time。runner 的
+阶段时间使用整秒墙钟时间，适合发现调度和外部工具瓶颈，不替代编译器内部 profiler。
+
+2026-07-27 的 P1 基线使用 `jiang 0.5.0`、LLVM 22.1.8、arm64 Darwin，并为每个 case
+使用独立冷 cache：
+
+| 选择范围 | case 数 | `TEST_JOBS=1` | `TEST_JOBS=4` |
+| --- | ---: | ---: | ---: |
+| `test/profile/compiler-smoke.txt` | 17 | 341s | 105s |
+| `TEST_FILTER='^test/lang/literal/'` | 21 | 8s | 2s |
+
+compiler profile 的 4-worker wall time 是串行的约 31%，语言 literal 组是 25%。两组串行和
+并行运行均全部通过，最终结果保持相同的发现顺序。
+
+修改 runner 后先运行其独立自测：
+
+```bash
+bash ./script/test_runner_self_test.sh
+```
+
+自测覆盖串行/并行稳定输出、所有 case 类别、诊断匹配、fail-fast、keep-going、超时和
+work/cache 隔离，不编译 Jiang 标准测试集。
