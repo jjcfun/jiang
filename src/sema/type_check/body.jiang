@@ -944,7 +944,7 @@ public struct BodyCheck: Movable {
         }
         if (node.data is .destructure_stmt(destructure)) {
             if (self.lambda_node_has_implicit_capture(lambda_def, destructure.initializer)) { return true; }
-            return self.lambda_node_array_has_implicit_capture(lambda_def, destructure.bindings);
+            return self.lambda_node_has_implicit_capture(lambda_def, destructure.pattern);
         }
         if (node.data is .defer_stmt(defer_stmt)) {
             return self.lambda_node_has_implicit_capture(lambda_def, defer_stmt.body);
@@ -1054,7 +1054,7 @@ public struct BodyCheck: Movable {
         }
         if (node.data is .destructure_stmt(destructure)) {
             self.collect_implicit_lambda_captures(lambda_def, destructure.initializer, captures);
-            self.collect_implicit_lambda_node_array(lambda_def, destructure.bindings, captures);
+            self.collect_implicit_lambda_captures(lambda_def, destructure.pattern, captures);
             return;
         }
         if (node.data is .defer_stmt(defer_stmt)) {
@@ -1196,6 +1196,10 @@ public struct BodyCheck: Movable {
         if (node.data is .is_pattern(is_pattern)) {
             self.collect_implicit_lambda_captures(lambda_def, is_pattern.value, captures);
             self.collect_implicit_lambda_captures(lambda_def, is_pattern.pattern, captures);
+            return;
+        }
+        if (node.data is .tuple_pattern(tuple_pattern)) {
+            self.collect_implicit_lambda_node_array(lambda_def, tuple_pattern.items, captures);
             return;
         }
         if (node.data is .variant_pattern(variant_pattern)) {
@@ -4613,11 +4617,6 @@ public struct BodyCheck: Movable {
         hir.HirDef& owner = self.state.hirs.def(node_id.owner_def)$.some();
         guard owner.body is .some(ref _ body) else { return self.state.store.types.invalid_type(); }
         hir.HirLocal local = body.local(let_stmt.local_id);
-        if (local.borrow_binding) {
-            self.check_borrow_binding_let(node_id, local, let_stmt);
-            self.mark_let_initialized(node_id.owner_def, local.id, true);
-            return self.state.store.types.unit_type();
-        }
         if (local.type_ref is .some(type_ref)) {
             if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
                 self.check_inferred_binding_let(node_id, local, let_stmt);
@@ -4750,20 +4749,6 @@ public struct BodyCheck: Movable {
         self.type_ops.bind_def_type(local.def_id, local_type);
     }
 
-    () check_borrow_binding_let(self, hir.HirId node_id, hir.HirLocal local, hir.HirLet let_stmt) {
-        guard let_stmt.initializer is .some(initializer) else {
-            self.type_ops.add_node_error(
-                node_id,
-                "borrow binding requires initializer",
-                "borrow_binding_requires_initializer"
-            );
-            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
-            return;
-        }
-        qid.TypeId value_type = self.check_node(initializer);
-        self.bind_borrow_binding_type(local, initializer, value_type);
-    }
-
     qid.TypeId borrow_binding_element_type(self, hir.HirLocal local, hir.HirId initializer, qid.TypeId value_type) {
         guard local.type_ref is .some(type_ref) else {
             return self.type_ops.read_value_type(value_type);
@@ -4793,44 +4778,43 @@ public struct BodyCheck: Movable {
 
     qid.TypeId check_destructure(self, hir.HirId node_id, hir.HirDestructure destructure) {
         qid.TypeId initializer_type = self.check_node(destructure.initializer);
-        qid.TypeId[]& item_types = self.destructure_tuple_item_types(node_id, destructure, initializer_type);
-        Int index! = 0;
-        while (index < destructure.bindings.length) {
-            qid.TypeId item_type = self.destructure_item_type(item_types, index);
-            self.pattern_check.check_pattern(destructure.bindings[index], item_type);
-            index = index + 1;
+        if (self.pattern_has_mutable_borrow(destructure.pattern)
+            && !self.borrow_source_is_writable(destructure.initializer)) {
+            self.type_ops.add_node_error(
+                destructure.initializer,
+                "mutable borrow requires writable storage",
+                "immutable_borrow_source"
+            );
         }
+        self.pattern_check.check_pattern(destructure.pattern, initializer_type);
         return self.state.store.types.unit_type();
     }
 
-    qid.TypeId[]& destructure_tuple_item_types(self,
-        hir.HirId node_id,
-        hir.HirDestructure destructure,
-        qid.TypeId initializer_type
-    ) {
-        types.TypeInfo info = self.state.store.types.get(initializer_type);
-        guard info.data is .tuple_type(tuple_type) else {
-            if (!self.type_ops.is_invalid_type(initializer_type)) {
-                self.type_ops.add_node_error(node_id, "destructuring requires tuple value", "destructure_requires_tuple");
-            }
-            return self.empty_type_ids();
+    Bool pattern_range_has_mutable_borrow(self, hir.HirId[]& patterns) {
+        Int index! = 0;
+        while (index < patterns.length) {
+            if (self.pattern_has_mutable_borrow(patterns[index])) { return true; }
+            index = index + 1;
         }
-        if (tuple_type.items.length != destructure.bindings.length) {
-            self.type_ops.add_node_error(node_id, "destructuring arity mismatch", "destructure_arity_mismatch");
-            return self.empty_type_ids();
-        }
-        return tuple_type.items;
+        return false;
     }
 
-    qid.TypeId[]& empty_type_ids(self) {
-        return self.state.results.empty_type_ids();
-    }
-
-    qid.TypeId destructure_item_type(self, qid.TypeId[]& item_types, Int index) {
-        if (index < item_types.length) {
-            return item_types[index];
+    Bool pattern_has_mutable_borrow(self, hir.HirId pattern_id) {
+        hir.HirNode pattern = self.state.hirs.node(pattern_id);
+        if (pattern.data is .binding_pattern(binding)) {
+            hir.HirDef& owner = self.state.hirs.def(pattern_id.owner_def)$.some();
+            guard owner.body is .some(ref _ body) else { return false; }
+            return body.local(binding.local_id).mutable_borrow;
         }
-        return self.state.store.types.invalid_type();
+        if (pattern.data is .tuple_pattern(tuple_pattern)) {
+            return self.pattern_range_has_mutable_borrow(tuple_pattern.items);
+        }
+        if (pattern.data is .variant_pattern(variant_pattern)) {
+            return self.pattern_range_has_mutable_borrow(variant_pattern.payload);
+        }
+        guard pattern.data is .optional_pattern(optional_pattern) else { return false; }
+        guard optional_pattern.nested is .some(nested) else { return false; }
+        return self.pattern_has_mutable_borrow(nested);
     }
 
     qid.TypeId check_call(self, hir.HirId node_id, hir.HirCall call, qid.TypeId? expected_result) {
@@ -8362,6 +8346,7 @@ public struct BodyCheck: Movable {
         if (node.data is .binding_pattern(_)) { return true; }
         if (node.data is .literal_pattern(_)) { return true; }
         if (node.data is .optional_pattern(_)) { return true; }
+        if (node.data is .tuple_pattern(_)) { return true; }
         if (node.data is .variant_pattern(_)) { return true; }
         if (node.data is .wildcard_pattern) { return true; }
         return false;

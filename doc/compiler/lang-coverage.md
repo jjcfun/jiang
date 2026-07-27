@@ -18,7 +18,7 @@
 | identifier tokens | `import` | covered | 普通 escaped identifier deferred；当前只允许 extern symbol name |
 | trivia / recovery tokens | `token` | covered | block comment deferred |
 | import / alias | `import`, `package` | covered | package registry/lockfile deferred |
-| top-level global | `import`, `runtime` | partial | global destructure 正反例 |
+| top-level global | `import`, `runtime` | partial | 顶层 destructure 拒绝用例已覆盖 |
 | function declaration | `function` | covered | 更多 overload + named/default 参数交互 |
 | parameter list | `function` | covered | 默认参数表达式覆盖更多 literal/constructor 场景 |
 | generic params | `generic` | partial | nested generic decl、尾逗号、空参数列表反例 |
@@ -31,7 +31,7 @@
 | union | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |
 | trait / extend | `generic` | partial | type function requirement、move receiver trait object deferred |
 | block / tail expr | `function`, `control_flow` | covered | tail expr 与 defer/drop 组合 |
-| var / destructure stmt | `function`, `aggregate` | partial | local/global destructure 尚未接入 HIR/type check/MIR |
+| var / destructure stmt | `function`, `aggregate`, `control_flow` | covered | 递归 Tuple 与 ref binding 已覆盖 |
 | assignment stmt | `control_flow`, `type` | covered | compound assignment 与 overload deferred |
 | call stmt | `function` | covered | implicit call statement 的更多反例 |
 | extern declaration | `import` | covered | `@link_name` 不支持；ABI 非普通名字通过 extern escaped identifier |
@@ -43,7 +43,7 @@
 | implicit layer call | `type`, `ownership` | partial | `size/align/max_align` run/emit、非法 type arg 组合 |
 | struct expression | `aggregate`, `nominal` | covered | default field initializer 语义 deferred |
 | array expression | `aggregate` | covered | array literal 对 tuple/union 元素 expected type |
-| pattern | `control_flow`, `nominal` | partial | payload ignore、mutable payload binding、or-pattern 更多反例 |
+| pattern | `control_flow`, `nominal`, `ownership` | covered | Tuple payload、局部类型推导和 ref binding 已覆盖 |
 
 ## Semantic Coverage
 
@@ -73,6 +73,6 @@
 2. `generic`：补 nested monomorph、associated type equality 和 parent trait 组合。
 3. `aggregate`：补 tuple/array/union 的嵌套 expected type 和 backend run/emit。
 4. `literal`：补 float、escape、溢出和非法 numeric token 的 fail 用例。
-5. `destructure`：parser 已有 local/global destructure，后续需要补 HIR/type check/MIR 后再加用例。
+5. `destructure`：补更多局部递归 Tuple 的借用冲突、move/copy 和作用域组合。
 
 任何新增语言规则进入实现前，先在本矩阵中定位到 feature dir 和最小测试层级。

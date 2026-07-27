@@ -179,18 +179,21 @@ alias = expr
 _ alias = expr
 _ alias! = expr
 Type alias = expr
+ref alias = expr
+ref! alias = expr
 ref _ alias = expr
 ref! _ alias = expr
 ```
 
 `expr` 在闭包创建时求值，结果保存为 environment 字段 `alias`；body 中的 `alias` 解析到
 这个字段。`alias = expr` 等价于 binding pattern 的裸名字绑定；也可以用 `_ alias = expr`
-显式表示类型推断。移动、借用和复制都由普通表达式语义表达：
+显式表示类型推断。`ref alias` / `ref! alias` 分别是 `ref _ alias` /
+`ref! _ alias` 的简写。移动、借用和复制都由普通表达式语义表达：
 
 ```jiang
 (arg) [
     owned = old_owned$.move(),
-    ref _ borrowed = old_value,
+    ref borrowed = old_value,
     Int snapshot = counter
 ] => {
     arg + snapshot

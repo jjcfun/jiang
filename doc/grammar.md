@@ -53,7 +53,6 @@ top_level_item
             <- compile_block
              / intrinsic_block
              / extern_block
-             / global_destructure
              / top_level_decl
 
 compile_block
@@ -73,12 +72,6 @@ extern_block
 
 extern_item <- "public"? (extern_function_decl / extern_global_decl)
 
-global_destructure
-            <- "(" destructure_binding ("," destructure_binding)* ")"
-               "=" expr ";"
-
-destructure_binding
-            <- type name
 ```
 
 ## 声明
@@ -215,6 +208,8 @@ binding_name
 `comptime` block 是顶层 item，不经由 `decl_modifier`，只负责在编译期选择其中的顶层 item。
 `global_decl` 只允许出现在 `top_level_decl` 和 `extern_item` 中；类型成员、trait/extend
 成员等非顶层声明使用 `member_decl`，不允许定义全局变量。
+顶层变量只使用普通 global declaration。独立 destructure 是函数体内的语句，
+不能出现在顶层。
 默认参数可以出现在参数列表任意位置。位置实参总是绑定最早尚未绑定的参数，不会按类型跳过
 带默认值的参数；命名实参可以跳过或重排默认参数。第一个命名实参之后，其余普通实参也必须
 使用命名形式。
@@ -537,8 +532,14 @@ var_decl_stmt
             <- type name ("=" expr)? ";"
 
 destructure_stmt
-            <- "(" destructure_binding ("," destructure_binding)* ")"
+            <- "(" (destructure_binding ("," destructure_binding)*)? ")"
                "=" expr ";"
+
+destructure_binding
+            <- tuple_pattern
+             / "_"
+             / type_pattern name "!"?
+             / ref_binding_mode type_pattern? name "!"?
 
 assign_stmt <- expr assign_op expr ";"
 
@@ -759,21 +760,29 @@ catch_body  <- block / expr
 match_pattern
             <- literal
              / variant_pattern
+             / tuple_pattern
 
 pattern     <- match_pattern
              / binding_pattern
 
 binding_pattern
             <- "_"
-             / ref_binding_mode type name
-             / type name
+             / ref_binding_mode type_pattern? name "!"?
+             / type_pattern name "!"?
              / name
 
 ref_binding_mode
-            <- "ref"
+            <- "ref" "!"?
+
+type_pattern
+            <- type
+             / "_"
 
 variant_pattern
             <- variant_name ("(" pattern_list? ")")?
+
+tuple_pattern
+            <- "(" pattern_list? ")"
 
 variant_name
             <- "." name
@@ -788,16 +797,24 @@ pattern_list
 
 说明：
 
-- `match_pattern` 用于 `is` 和 `switch` 分支根，只接受 optional、variant、literal。
+- `match_pattern` 用于 `is` 和 `switch` 分支根，接受 optional、variant、tuple 和 literal。
 - 单段 `path` 只作为 binding 子 pattern 使用，不能作为 `is` 或 `switch` 的分支根。
 - `ref T name` 创建共享借用；`ref! T name` 创建唯一可变借用，结果类型为 `T&!`。
   `ref` / `ref!` 是绑定模式，不是类型名。
-- `ref _ name` 可用在需要推导 payload 类型的借用 pattern 中；裸 `_` 仍表示 wildcard。
-  需要借用 payload 时写 `.some(ref T name)`、`.some(ref _ name)` 或 `.case(ref T name)`。
-- destructure 和 local declaration 仍支持 `_` 类型占位，例如 `_ value = expr;`、`(_ left, Int right) = pair;`。
+- 所有借用 binding 都可省略类型位：`ref name` 等价于 `ref _ name`，`ref! name`
+  等价于 `ref! _ name`。这适用于 match payload、独立解构和 lambda capture。
+- 普通变量定义不能使用左侧 `ref`。定义引用变量时使用 RHS 借用表达式，例如
+  `Int& shared = value$.ref();` 或 `Int&! unique = value$.mut_ref();`。
+- 独立解构必须以括号为语法入口；即使只有一个 binding，也写 `(ref name) = value;`。
+  by-value 解构不能省略类型位置，例如 `(_ left, Int right) = pair;`。
+- type pattern 可以具体、完整推导或局部推导，例如 `Int value`、`_ value`、
+  `Int[_] values`、`_[3] values`。
 - 绑定名后的 `!` 表示该绑定可重新赋值，例如 `ref T name!`；它不会把共享借用变成可变借用。
 - `_! name` 不合法；payload 共享借用使用 `ref T name`，唯一可变借用使用 `ref! T name`。
-- 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法。
+- Tuple pattern 递归保留括号层级。union/optional 的 Tuple payload 直接展开一层：
+  `.pair(left, right)` 匹配 `(Int, Int)` payload；嵌套结构写作
+  `.nested((left, right), tail)`。
+- 单元素 Tuple 与元素等价，所以 `(ref name) = value;` 不会对 `value` 额外执行索引投影。
 
 ## 说明
 

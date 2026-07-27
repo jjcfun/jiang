@@ -870,7 +870,7 @@ lambda 可以用 `[...]` 显式初始化 capture environment；未列出的外�
 
 ```jiang
 Fn<Int, Int> add_snapshot = { [_ captured = base] value => value + captured };
-Fn<Int> read = { [ref _ borrowed = base] => borrowed$.get() };
+Fn<Int> read = { [ref borrowed = base] => borrowed$.get() };
 ```
 
 capture initializer 在闭包创建时求值。值 capture 遵守 Copyable/move 规则，`ref` / `ref!` capture
@@ -1342,10 +1342,20 @@ pattern 目前包括：
 - literal
 - variant
 - optional
+- tuple
 
-binding/wildcard 只作为 optional 或 variant payload 的子 pattern 使用，不能作为
-`is` 或 `switch` 分支根。当前不支持 tuple pattern；tuple 解构应使用独立
-destructure 语法。
+binding/wildcard 只作为子 pattern 使用，不能作为 `is` 或 `switch` 分支根。
+tuple pattern 可以作为分支根，并递归保留括号层级。
+union/optional 的 Tuple payload 直接展开一层，因此 `(Int, Int)` payload 使用
+`.case(left, right)`，不是 `.case((left, right))`。
+
+binding 的统一语义形态是 `binding_mode? type_pattern name binding_mutability?`。
+match payload 中可以省略 type pattern；所有 `ref` / `ref!` binding 也可以省略，
+例如 `ref item` 等价于 `ref _ item`。独立 by-value 解构必须保留类型位置，并且
+整个解构必须写在括号内。type pattern 支持 `_` 以及 `Int[_]`、`_[3]` 这类局部推导。
+
+普通变量定义不接受左侧 `ref`；引用变量通过 `value$.ref()` / `value$.mut_ref()`
+作为 RHS 初始化。
 
 `is` 用于 pattern matching，不再使用 `==` 表达 pattern 解构。
 

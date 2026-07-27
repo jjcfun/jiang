@@ -94,8 +94,16 @@ mutable_items[0] = 10;
 
 类型推导默认得到不可重赋值 binding；需要可写 binding 时写 `_ value!`。绑定可变性不进入
 `TypeId` 或函数签名。`T&!` 是唯一可变引用，`T*!` 是可写 raw pointer；其他类型不能带 `!`。
-`ref! _ borrowed = value` 与 `value$.mut_ref()` 都从可写 place 创建 `T&!`；
-`ref _ borrowed! = value` 只让新 binding 可重新赋值，仍然创建共享引用 `T&`。
+普通变量定义不接受左侧 `ref`。引用值由 RHS 显式创建：
+
+```c
+Int& borrowed = value$.ref();
+Int&! unique = mutable_value$.mut_ref();
+```
+
+`ref` / `ref!` 保留给 pattern binding；例如 `(ref borrowed) = value;` 和
+`(ref! unique) = mutable_value;`。类型位可以省略，分别等价于 `ref _ borrowed`
+和 `ref! _ unique`。绑定名后的 `!` 仍只表示新 binding 可重新赋值。
 语言没有 `unique` 参数关键字；`unique` 可以作为普通标识符。
 
 ### 基本类型
@@ -699,6 +707,12 @@ print("x = %d, y = %d", x, y); // 输出：a = 100, b = 200
 (_ x, _ y!) = foo(10, 200);
 y += 100;
 print("x = %d, y = %d", x, y); // 输出：x = 100, y = 300
+
+// by-value 解构必须保留类型位置；借用 binding 可省略类型位
+(ref first, Int second) = pair;
+
+// type pattern 支持局部推导
+(Int[_] left, _[3] right) = arrays;
 ```
 
 #### 一元组
@@ -943,7 +957,7 @@ RawFn<Int> answer = { => 42 };
 
 Int base = 10;
 Fn<Int, Int> add_base = { [_ captured = base] value => value + captured };
-Fn<Int> borrowed = { [ref _ value = base] => value$.get() };
+Fn<Int> borrowed = { [ref value = base] => value$.get() };
 Fn<Int>^ owned = new { [_ captured = base] => captured };
 ```
 
@@ -1212,9 +1226,10 @@ Int y = switch (value) {
 - 分支结果是右侧语句或 block 最后一条语句的值
 - 所有分支结果类型必须一致
 - `enum` / `union` / `optional` 仍然做穷尽性检查
-- 分支根 pattern 只支持 variant / optional / literal
-- binding/wildcard 只作为 variant 或 optional payload 的子 pattern 使用
-- 当前不支持 tuple pattern；tuple 解构应使用独立 destructure 语法
+- 分支根 pattern 支持 variant / optional / tuple / literal
+- binding/wildcard 只作为子 pattern 使用，不能单独作为分支根
+- Tuple payload 在 variant/optional pattern 中展开一层，例如 `.pair(left, right)`；
+  嵌套 Tuple 继续保留括号，例如 `.nested((left, right), tail)`
 - 当前不支持对 `T@E` 结果直接使用 `switch` 表达式
 
 #### 异常
