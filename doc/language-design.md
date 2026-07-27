@@ -3,7 +3,7 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 `main` 以 Jiang 0.4.9 stable 为自举基线，在既有泛型/trait、MIR/backend、所有权和
+当前 `main` 以 Jiang 0.4.9 stable 为自举基线，在既有泛型/trait、JIL/backend、所有权和
 Task 基础上，已经接入具名 lifetime region、Shape-aware lifetime contract、brace closure、
 尾随闭包、非尾部默认参数、trait 默认实现和基于 `Hasher` 的 `Hashable`。
 本文档描述当前分支希望稳定下来的语言规则；
@@ -15,7 +15,7 @@ Task 基础上，已经接入具名 lifetime region、Shape-aware lifetime contr
 为避免混淆，后续章节使用这些状态：
 
 - **目标规则**：希望长期保留的语言规则。
-- **当前已定义**：parser、HIR/type check/MIR/backend 中已经接入并有测试覆盖的规则。
+- **当前已定义**：parser、Semantic Model/type check/JIL/backend 中已经接入并有测试覆盖的规则。
 - **当前缺口**：目标设计需要，但当前实现尚未完整接入。
 - **未定**：设计尚未冻结，不能作为 resolve/sema 的硬前提。
 
@@ -27,7 +27,7 @@ Jiang 是面向系统编程的语言，目标是在低层控制能力、工程�
 
 - 明确的值语义、指针语义和可变性语义。
 - 可读的泛型和 trait 约束。
-- AST 保留源码结构，语义信息进入 resolve/sema/HIR。
+- AST 保留源码结构，语义信息进入 resolve/sema/Semantic Model。
 - 字符串、数组、slice、指针等系统级类型有直接语法支持。
 - 通过 lang package 支持场景化语法扩展；扩展必须回到 Jiang syntax tree，再进入普通语义检查。
 
@@ -115,8 +115,8 @@ lang package root 必须 public 导出固定入口 `Lang`，并满足 `std.jiang
 - 一个 lang package 只提供一个默认 provider。
 - provider 输出必须是 `std.jiang.syntax.Tree`。当前支持 expression 和 statement 位置，因此
   root kind 必须匹配 `Input.entry_kind`；其他 root kind 是 public syntax tree 为后续扩展保留的结构。
-- provider 不能直接生成 HIR、MIR、后端 IR，也不能绕过普通 resolve/type check。
-- DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/MIR/backend。
+- provider 不能直接生成 Semantic Model、JIL、后端 IR，也不能绕过普通 resolve/type check。
+- DSL 生成的节点和普通 Jiang 源码节点进入同一套 resolve/sema/JIL/backend。
 
 provider 有两个阶段：
 
@@ -165,7 +165,7 @@ lookup。
 
 内建后缀类型也遵循同一条规则：`UInt8[]&` 的成员 lookup 会落到 borrowed slice
 类型的 namespace，`Int[4]` 会落到 array 类型的 namespace，
-`Int` 会落到 builtin integer type 的 namespace。backend 或 MIR 可以继续把 builtin 类型
+`Int` 会落到 builtin integer type 的 namespace。backend 或 JIL 可以继续把 builtin 类型
 lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不是 nominal struct 而拆出
 不同的成员查找路径。
 
@@ -365,7 +365,7 @@ unsafe {
 
 ## 所有权、implicit copy 和析构
 
-当前 borrow check 是 MIR 后的必经阶段，用于检查 move/use-after-move、引用逃逸、drop safety
+当前 borrow check 是 JIL 后的必经阶段，用于检查 move/use-after-move、引用逃逸、drop safety
 以及 `T&!` 的唯一可变借用。它按重叠 place 和引用的后续使用检查 alias 冲突；raw pointer
 不参与这项别名证明，其访问由 `unsafe` 边界约束。
 
@@ -550,7 +550,7 @@ callable contract 只能引用 result/参数的声明名；需要参与 contract
 `LifetimeContract` 属于 callable 的语义签名，调用传播、函数值兼容性和 lambda expected type
 共用该 contract；
 closure environment 等 ABI 隐藏参数不进入公开索引。trait object 动态派发和 RawFn/Fn adapter
-同样必须把 contract 映射到 MIR 实参数；borrow checker 不再用“callee 加全部实参”猜测间接调用来源。
+同样必须把 contract 映射到 JIL 实参数；borrow checker 不再用“callee 加全部实参”猜测间接调用来源。
 
 裸 `Fn<R, Args...>` / `RawFn<R, Args...>` 的默认返回契约为空。它等价于把 `R` 固定在参数
 lifetime 之外，因此 callback 不能把参数 borrow 作为 `R` 返回；这与普通函数的 signature
@@ -662,16 +662,16 @@ declaration type 和 const payload；跨模块使用时由 importer 还原成 `C
 定义模块的 initializer。value path 会先解析出真实 value root，再由 type check 验证后续 member
 chain，因此 `build.target.link_libc` 这类 public aggregate const 字段读取按普通字段访问处理。
 
-`ComptimeValue` 只存在于 sema、interface loading/building 和 HIR->MIR lowering 之前。标量 const
-在 MIR 中降成 `MirConst`，枚举 case 降成整数 tag const；复合 const 整体作为运行时值使用时按需
-materialize 成 readonly `MirGlobal`，initializer 用 `MirStaticValue` 表达。backend 只消费 MIR
+`ComptimeValue` 只存在于 sema、interface loading/building 和 Semantic Model->JIL lowering 之前。标量 const
+在 JIL 中降成 `jil.Const`，枚举 case 降成整数 tag const；复合 const 整体作为运行时值使用时按需
+materialize 成 readonly `jil.Global`，initializer 用 `jil.StaticValue` 表达。backend 只消费 JIL
 事实，不读取 `ComptimeValue`。
 
 const initializer 不能依赖运行时值，也不能执行 IO 或其他运行时副作用。递归 initializer 诊断为
 `recursive_const_initializer`；comptime 函数调用受递归深度和 branch quota 限制，避免编译期执行失控。
 const generic 参数的 canonical 约束语法是 `@where(K: const Type)`，例如
 `@where(N: const Int) struct Fixed<T, N>`。声明列表中的 `N: const Int` 是等价简写，lower
-到同一条 HIR predicate。这里 `const Type` 是一种约束 kind，不是 trait；const generic 名字
+到同一条 Semantic Model predicate。这里 `const Type` 是一种约束 kind，不是 trait；const generic 名字
 绑定在 value namespace，可在表达式中使用，不能作为类型名使用。重复的同类型约束会去重，
 类型不一致时报 `conflicting_const_constraint`。
 trait associated item 也可以使用同一形式表达编译期值约束，例如
@@ -761,7 +761,7 @@ public alias Bool;
 ```
 
 如果右侧解析为已有 namespace/type/value/member symbol，alias 会绑定到同一个 name domain。
-非函数 alias 在 HIR 中记录单一目标 `DefId`；函数 alias 记录一个可见 public overload anchor，
+非函数 alias 在 Semantic Model 中记录单一目标 `DefId`；函数 alias 记录一个可见 public overload anchor，
 调用时在目标原始 namespace 和 name 下枚举 public overload set，再执行普通重载决议。目标模块
 的 private 同名函数不会通过 alias 暴露。如果右侧不能解析为已有 symbol，则按 type alias
 处理，右侧必须是类型语法。
@@ -814,7 +814,7 @@ draw(x: 1, y: 2);
 ```
 
 type check 会把 call args 重排成函数签名顺序，并把缺失参数替换成默认值。这个结果写入
-`TypeCheckStore.call_args`，MIR lowering 只消费重排后的参数列表，不重新做 overload
+`TypeCheckStore.call_args`，JIL lowering 只消费重排后的参数列表，不重新做 overload
 或默认参数匹配。
 
 同名函数和同名方法允许 overload。默认参数参与 overload 检查：如果两个 overload
@@ -1030,7 +1030,7 @@ union variant 声明按 grammar 使用字段式写法，所有 variant 必须写
 `extend Foo<T> {}` 只有在
 作用域中确实存在类型 `T` 时才合法，否则报告 `unresolved_type`。`_` 是匿名类型占位符，不创建绑定。
 
-具体 extension target 会在 HIR lowering 时归一化为 canonical owner pattern 和相等约束。例如
+具体 extension target 会在 Semantic Model lowering 时归一化为 canonical owner pattern 和相等约束。例如
 `extend Int?` 等价于 `@where(T == Int) extend <T> T?`，`extend Int[4]` 等价于对 array element 和
 count 分别添加 `T == Int`、`N == 4`。member lookup 只执行统一的 extension where predicate 匹配。
 
@@ -1332,8 +1332,8 @@ trait Sequence {
 
 `Iterator` 是有状态游标，`next()` 每次返回下一个元素，`none` 表示结束。
 `Sequence` 是容器或视图，`make_iterator()` 产生游标。`for pattern in expr` 的 type check
-负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Element`。MIR
-lowering 只消费这个 plan，不在 MIR 阶段重新做 trait lookup。
+负责选择具体 iteration plan，并把 `pattern` 的 expected type 设为 `Element`。JIL
+lowering 只消费这个 plan，不在 JIL 阶段重新做 trait lookup。
 
 ## Pattern Matching
 
@@ -1392,7 +1392,7 @@ ambiguous re-export 仍需后续完善；package dependency 第一版只支持�
 
 当前 resolver 已区分 module、type、value 和 member domain；字段、enum case、union variant 使用 member
 domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的 module/type/value root 继续查找，
-不会仅凭文本在 MIR 或 backend 重判。`import dep;` 优先查当前 package dependency alias。
+不会仅凭文本在 JIL 或 backend 重判。`import dep;` 优先查当前 package dependency alias。
 
 仍需继续收口的是跨多个 public re-export 路径的 ambiguity 诊断，以及更细的 shadowing policy；
 这些规则
@@ -1416,7 +1416,7 @@ domain，associated type 使用 type domain。`foo.Bar` 根据左侧已解析的
 - `comptime if` 的 condition 是普通表达式，但类型必须能在编译期求值为 `Bool`。
   conditional import 需要在 module graph 阶段就决定依赖边，因此 source selection 使用一个窄的
   AST-level 前置 evaluator；它只负责选源文件里的顶层 item，并产出同一套 `ComptimeValue` 模型。
-- 常规 const initializer 由 type check 后的 HIR comptime interpreter 执行。它支持 const 引用、
+- 常规 const initializer 由 type check 后的 Semantic Model comptime interpreter 执行。它支持 const 引用、
   aggregate literal、字段访问、控制流、block 尾表达式、普通函数调用和自定义 `init`，但不执行
   IO，不访问运行时变量。
 
@@ -1457,7 +1457,7 @@ comptime {
 - host lexer 只识别 provider path 和 raw block envelope；DSL body 的内部 token/cache 由 provider 自己维护。
 - 自定义语法必须返回 Jiang syntax tree，不能通过字符串拼接回灌 host parser 来隐藏错误位置。
 - 自定义语法不能绕过基础语言的错误恢复、诊断 span 和 IDE/LSP 能力。
-- HIR-level、MIR-level 或 backend-level plugin 不属于当前 Lang Package 设计。
+- Semantic Model-level、JIL-level 或 backend-level plugin 不属于当前 Lang Package 设计。
 
 ## 后续提案
 

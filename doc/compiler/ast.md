@@ -8,7 +8,7 @@ AST 是 `syntax` 阶段的输出，只表达源码语法结构。它不进入长
 - lexer 产生 token。
 - parser 产生 flat AST。
 - AST 保留源码语法结构和 source span。
-- AST 不保存 `DefId`、`TypeId`、`HirId` 或任何跨阶段语义结果。
+- AST 不保存 `DefId`、`TypeId`、`sem.NodeId` 或任何跨阶段语义结果。
 
 ## 存储结构
 

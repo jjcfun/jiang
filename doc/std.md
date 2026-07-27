@@ -54,7 +54,7 @@ symbol store 中 intern。
 
 identifier 判定由 `std.jiang.ident` 提供。ASCII 路径直接判断字节；UTF-8 路径使用 Unicode
 `XID_Start` / `XID_Continue`。压缩 XID 表由 `script/gen_unicode_xid.js` 生成到
-`std/jiang/text/generated/xid.jiang`，当前以 global array 保存，依赖 MIR 对 global array
+`std/jiang/text/generated/xid.jiang`，当前以 global array 保存，依赖 JIL 对 global array
 动态下标访问的支持。
 
 ## 稳定性边界

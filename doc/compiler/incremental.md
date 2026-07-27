@@ -1,7 +1,7 @@
 # Incremental Compilation 设计
 
 增量编译的目标是复用稳定语义事实和目标产物，不是复用一次编译过程里的内存对象。
-`DefId`、`HirId`、`TypeId`、`MirFunctionId` 等 ID 都是 session-local handle，不能写入长期
+`DefId`、`sem.NodeId`、`TypeId`、`jil.FunctionId` 等 ID 都是 session-local handle，不能写入长期
 cache，也不能作为跨次编译的身份。
 
 ## 阶段边界
@@ -12,10 +12,10 @@ cache，也不能作为跨次编译的身份。
 root source
   -> module graph
   -> interface loading / decl graph
-  -> resolve / HIR
+  -> resolve / Semantic Model
   -> type_check
   -> monomorph
-  -> MIR
+  -> JIL
   -> layout
   -> borrow_check
   -> backend
@@ -30,7 +30,7 @@ source artifact 边界稳定后再引入。
 
 - `.ji` 是 semantic input/cache，用于渐进式构建 import graph、decl graph 和 type signature。
 - `.o` 是 backend artifact，只表示某个 concrete codegen unit 的机器码可复用。
-- HIR、type check 结果、layout 临时查询、单态化结果和 MIR 都是本次 compilation 的内存状态。
+- Semantic Model、type check 结果、layout 临时查询、单态化结果和 JIL 都是本次 compilation 的内存状态。
 
 因此 `.o` 命中不能替代 `.ji`。即使某个 module 的 `.o` 可复用，其他 module 仍然需要它的
 interface 做 name resolve 和 type check。
@@ -63,8 +63,8 @@ load_generic_template(stable_id) -> GenericTemplate
 ```
 
 `ModuleInterface` 只保存 public signature 和 template index；generic body payload 保存在 `.ji`
-的独立 HIR template section。跨 package 泛型实例化不重新读取依赖源码，而是按 stable id 读取
-generic HIR template。
+的独立 Semantic Model template section。跨 package 泛型实例化不重新读取依赖源码，而是按 stable id 读取
+generic Semantic Model template。
 
 `ModuleInterface.interface_hash` 是 public semantic surface 的 hash，不是 source hash：
 
@@ -79,7 +79,7 @@ generic HIR template。
 - session-local ID。
 - `TypeCheckStore`。
 - `MonomorphStore`。
-- concrete MIR。
+- concrete JIL。
 - borrow check 临时状态。
 - layout 临时状态。
 - `.o` 的内部 codegen 细节。
@@ -142,7 +142,7 @@ cache 存在，但不进入长期 cache。
 - symbol kind。
 - 可选的稳定 disambiguator。
 
-函数重载共享基础路径，但不共享完整 stable key。HIR signature lowering 会从 callable signature
+函数重载共享基础路径，但不共享完整 stable key。Semantic Model signature lowering 会从 callable signature
 生成 disambiguator；`init` / `deinit` 的隐式 receiver 不计入该值。函数的参数、返回类型和
 generic signature 改变会形成新的 stable identity，函数 body 变化则只改变 body fingerprint。
 `@life` 等不改变重载身份的 contract 信息进入 semantic fingerprint，而不伪装成函数名或
@@ -238,10 +238,10 @@ build_module_graph(root):
 
 - `ModuleGraph`
 - `ResolveStore`
-- `HirStore`
+- `sem_store.Store`
 - `TypeCheckStore`
 - `LayoutStore`
-- `MirStore`
+- `jil.Store`
 
 这些表可以有对应的 stable key 或 artifact key，但长期层不能保存这些表的 session-local 内容。
 
@@ -260,20 +260,20 @@ build_module_graph(root):
 - `DefStore`
 - `TypeStore`
 - `ResolveStore`
-- `HirStore`
+- `sem_store.Store`
 - `TypeCheckStore`
 - `LayoutStore`
 
-因此同一个 context 可以进入下一轮 package 编译，但旧的 `DefId`、`HirId`、`TypeId`
+因此同一个 context 可以进入下一轮 package 编译，但旧的 `DefId`、`sem.NodeId`、`TypeId`
 不能继续使用。
 
 例如：
 
 - `ResolveStore` 可以重建当前 `DefId -> DefRecord`，长期层保存 stable id 与当前 def 的对齐结果。
-- `HirStore` 可以重建当前 HIR，长期层保存 signature/body fingerprint。
-- `TypeCheckStore` 是 HIR -> MIR side table，不作为长期 cache artifact。
+- `sem_store.Store` 可以重建当前 Semantic Model，长期层保存 signature/body fingerprint。
+- `TypeCheckStore` 是 Semantic Model -> JIL side table，不作为长期 cache artifact。
 - `LayoutStore` 按 session 重建；后续如果要缓存 layout fact，key 不能包含 session-local `TypeId`。
-- `MirStore` 按 session 重建；长期层只保存 object artifact key 和 `.o` 路径。
+- `jil.Store` 按 session 重建；长期层只保存 object artifact key 和 `.o` 路径。
 
 ## Interface
 
@@ -291,8 +291,8 @@ interface 保存：
 - 影响下游 resolve/type check 的 fingerprint。
 
 interface 不保存单态化结果，也不直接内联完整 body payload。单态化结果只存在于当前
-compilation 的内存 `MonomorphStore` 中。public generic body 以 HIR template payload 的形式
-保存在 `.ji`，不保存成 concrete MIR。
+compilation 的内存 `MonomorphStore` 中。public generic body 以 Semantic Model template payload 的形式
+保存在 `.ji`，不保存成 concrete JIL。
 
 跨 package 调用 public 泛型时，下游需要能恢复上游泛型 body：
 
@@ -305,7 +305,7 @@ package app:
 ```
 
 如果 Jiang 不使用 runtime metadata 泛型，`app` 必须拿到 `id<T>` 的 body，生成 `id<Int>` 的
-concrete MIR 和 `.o`。这个 body 来自 `.ji` 的 generic HIR template section，不依赖上游源码。
+concrete JIL 和 `.o`。这个 body 来自 `.ji` 的 generic Semantic Model template section，不依赖上游源码。
 
 ## Object Cache
 
@@ -354,7 +354,7 @@ monomorph object:
   泛型 trait impl method 实例。
 ```
 
-`CodegenUnit` 是 backend-independent 的 MIR 分组，不是 LLVM module：
+`CodegenUnit` 是 backend-independent 的 JIL 分组，不是 LLVM module：
 
 ```text
 source unit:
@@ -367,9 +367,9 @@ monomorph unit:
 external declaration 不拥有 object unit。每个 backend emission 可以按需要在当前 object 内
 materialize 外部声明。
 
-`emit_object_for_unit` 仍然可以先声明完整 `MirStore` 里的函数，再只 lower 当前 unit 的 body。
+`emit_object_for_unit` 仍然可以先声明完整 `jil.Store` 里的函数，再只 lower 当前 unit 的 body。
 这样跨 unit 调用只需要 LLVM declaration，不会把被调用方 body 一起写进当前 `.o`。
-`CodegenUnitKey` 只做本轮 MIR 分组；长期 object path 必须来自 source object key 或
+`CodegenUnitKey` 只做本轮 JIL 分组；长期 object path 必须来自 source object key 或
 stable monomorph instance key。
 `artifact/object_key_builder.jiang` 负责把当前 session 的 module/type 信息转换成稳定 object key
 输入；pipeline 不应直接读取 `ResolveStore` / `SourceStore` 拼 cache key。
@@ -398,7 +398,7 @@ StableInstanceKey
 不能写入本地 cache。`StableInstanceKey` 只用于 object cache，type args 必须先转换成不含
 session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/object_key_builder.jiang`。
 
-同一个 compilation 内，`StableInstanceKey` 相同就复用同一个 concrete MIR / object cache entry。
+同一个 compilation 内，`StableInstanceKey` 相同就复用同一个 concrete JIL / object cache entry。
 不同 owner 即使文本相同，也不做结构性去重。
 
 ## 当前实现边界
@@ -408,9 +408,9 @@ session-local `TypeId` 的 stable type key。当前转换入口是 `artifact/obj
 - `SourceArtifactCache`：保存 `ImportSummary`、`ModuleInterface` 和 `GenericTemplate`。
 - `JiFileImage`：提供 `.ji` header / section table / read_at 的最小 API。
 - `ModuleGraphBuilder`：从 `ImportSummary` 或 AST 构建 session-local `ModuleGraph`。
-- `InterfaceLoader`：从 `ModuleInterface` 恢复 `DefRecord`、namespace binding 和 HIR signature skeleton。
+- `InterfaceLoader`：从 `ModuleInterface` 恢复 `DefRecord`、namespace binding 和 Semantic Model signature skeleton。
 - `StableInstanceKey`：描述 monomorph object 的稳定输入。
-- `ConcreteInstanceRegistry`：在同一 compilation 内按 stable instance 复用 concrete MIR body 位置。
+- `ConcreteInstanceRegistry`：在同一 compilation 内按 stable instance 复用 concrete JIL body 位置。
 - `ObjectArtifactCache`：区分 source object 和 monomorph object，不保存 semantic interface。
 - `PackageArtifactKey`：描述整包产物 cache key，当前用于普通 package object 和 lang provider dylib。
 - `package_fingerprint`：统一计算 target package 和 `type = lang` provider package 的 package hash。
@@ -423,7 +423,7 @@ object 复制。长驻服务、磁盘 artifact index 持久化和更细粒度 in
 
 ## Invalidation
 
-source change 后先重新 parse 当前 source，并重建可达 import/module facts。resolve/HIR 阶段用
+source change 后先重新 parse 当前 source，并重建可达 import/module facts。resolve/Semantic Model 阶段用
 stable key 对齐新旧 def：
 
 - 新 stable id：新增 def。
@@ -446,7 +446,7 @@ Interface 命中:
   非 root module 如果只是 import discovery 临时 parse 过，仍可加载 interface skeleton。
 
 ObjectArtifact 命中:
-  可以跳过 HIR/type_check/MIR/codegen，但不能跳过 interface loading。
+  可以跳过 Semantic Model/type_check/JIL/codegen，但不能跳过 interface loading。
 
 PackageArtifact 命中:
   可以复用整包最终产物路径，但不能替代 `.ji` / interface loading。

@@ -1,0 +1,441 @@
+// 构造无等待 coroutine DAG 的同步执行变体。
+//
+// RTC resume 仍接收现有 frame pointer 并把结果写入 continuation_result，
+// 但完成时直接返回调用者。这样静态 direct child 可以成为普通可内联调用；
+// recursive start shim、Task suspend 和任何真实 wake 边都不会进入该 ABI。
+
+import list = "../../support/list.jiang";
+import jil = "../../jil.jiang";
+import plan = "./plan.jiang";
+
+public list.ArrayList<Bool> analyze(jil.Store& output) {
+    list.ArrayList<Bool> eligible! = initial_eligibility(output);
+    Bool changed! = true;
+    while (changed) {
+        changed = refine_eligibility(output, eligible$.mut_ref());
+    }
+    return eligible;
+}
+
+list.ArrayList<Bool> initial_eligibility(jil.Store& output) {
+    list.ArrayList<Bool> eligible! = list.ArrayList<Bool>(output.functions.len());
+    Int index! = 0;
+    while (index < output.functions.len()) {
+        eligible.add(function_has_rtc_shape(
+            output, output.functions.get(index)
+        ));
+        index = index + 1;
+    }
+    return eligible;
+}
+
+Bool function_has_rtc_shape(
+    jil.Store& output,
+    jil.Function function
+) {
+    if (!function.is_coroutine || function.is_external) { return false; }
+    guard function.coroutine_frame is .some(frame) else { return false; }
+    if (frame.may_defer) { return false; }
+    Int index! = 0;
+    while (index < function.body.blocks.length) {
+        if (!terminator_has_rtc_shape(
+                output, frame$.ref(), function.body.blocks[index].terminator
+            )
+        ) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool terminator_has_rtc_shape(
+    jil.Store& output,
+    jil.CoroutineFrameLayout& frame,
+    jil.Terminator terminator
+) {
+    if (terminator.kind is .suspend_pending_term(suspend)) {
+        return task_suspend_completes_inline(output, frame, suspend);
+    }
+    guard terminator.kind is .call_term(call) else { return true; }
+    if (!call.is_suspend_point) {
+        return observed_task_has_static_child(call);
+    }
+    guard call.suspend_child is .some(child) else { return false; }
+    if (call.suspend_wake != .direct_child && call.suspend_wake != .cross_executor) {
+        return false;
+    }
+    return call_directly_names_child(call.callee, child);
+}
+
+Bool observed_task_has_static_child(jil.CallTerminator call) {
+    guard call.async_start is .some(kind) else { return true; }
+    if (kind != .observed_task) { return true; }
+    guard call.suspend_child is .some(child) else { return false; }
+    return call_directly_names_child(call.callee, child);
+}
+
+Bool refine_eligibility(
+    jil.Store& output,
+    list.ArrayList<Bool>&! eligible
+) {
+    Bool changed! = false;
+    Int index! = 0;
+    while (index < output.functions.len()) {
+        if (eligible.get(index) && !children_are_eligible(
+                output, output.functions.get(index), eligible
+            )
+        ) {
+            eligible.set(index, false);
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool children_are_eligible(
+    jil.Store& output,
+    jil.Function function,
+    list.ArrayList<Bool>& eligible
+) {
+    Int index! = 0;
+    while (index < function.body.blocks.length) {
+        jil.Terminator terminator = function.body.blocks[index].terminator;
+        if (terminator.kind is .call_term(call)) {
+            if (!call_child_is_eligible(output, call, eligible)) { return false; }
+        }
+        if (terminator.kind is .suspend_pending_term(suspend)) {
+            if (!task_suspend_child_is_eligible(
+                    output, function, suspend, eligible
+                )
+            ) { return false; }
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool call_child_is_eligible(
+    jil.Store& output,
+    jil.CallTerminator call,
+    list.ArrayList<Bool>& eligible
+) {
+    Bool observed! = false;
+    if (call.async_start is .some(kind)) { observed = kind == .observed_task; }
+    if (!call.is_suspend_point && !observed) { return true; }
+    guard call.suspend_child is .some(child) else { return false; }
+    guard function_id(output, child) is .some(function_id) else { return false; }
+    Int index = function_id.to_index();
+    return index >= 0 && index < eligible.len() && eligible.get(index);
+}
+
+Bool task_suspend_child_is_eligible(
+    jil.Store& output,
+    jil.Function function,
+    jil.SuspendPendingTerminator suspend,
+    list.ArrayList<Bool>& eligible
+) {
+    if (suspend.suspend_wake != .task_child) { return false; }
+    guard function.coroutine_frame is .some(frame) else { return false; }
+    guard task_region(frame$.ref(), suspend) is .some(region) else { return false; }
+    guard region.child_resume is .some(child) else { return false; }
+    guard function_id(output, child) is .some(function_id) else { return false; }
+    return function_is_eligible(eligible, function_id);
+}
+
+public Bool function_is_eligible(
+    list.ArrayList<Bool>& eligible,
+    jil.FunctionId function_id
+) {
+    Int index = function_id.to_index();
+    return index >= 0 && index < eligible.len() && eligible.get(index);
+}
+
+@life(return: call)
+public jil.FunctionRef? eligible_child(
+    jil.Store& output,
+    list.ArrayList<Bool>& eligible,
+    jil.CallTerminator call
+) {
+    if (!call.is_suspend_point) { return null; }
+    guard call.suspend_child is .some(child) else { return null; }
+    if (!call_directly_names_child(call.callee, child)) { return null; }
+    guard function_id(output, child) is .some(function_id) else { return null; }
+    if (!function_is_eligible(eligible, function_id)) { return null; }
+    return child;
+}
+
+@life(return: output & body)
+public jil.Body rewrite_body(
+    jil.Store& output,
+    jil.Body body,
+    jil.CoroutineFrameLayout& frame,
+    plan.Store& plans
+) {
+    list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(body.blocks.length);
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        blocks.add(rewrite_block(output, body.blocks[index], frame, plans));
+        index = index + 1;
+    }
+    return jil.Body (
+        id: body.id,
+        span: body.span,
+        locals: body.locals,
+        blocks: output.block_array(blocks$.ref()),
+        entry: body.entry,
+        return_local: body.return_local
+    );
+}
+
+public Bool body_uses_rtc(
+    jil.Store& output,
+    jil.Body body,
+    jil.CoroutineFrameLayout& frame,
+    plan.Store& plans
+) {
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        jil.Terminator terminator = body.blocks[index].terminator;
+        if (terminator.kind is .call_term(call)) {
+            if (call_uses_rtc(call, plans)) { return true; }
+        }
+        if (terminator.kind is .suspend_pending_term(suspend)) {
+            if (task_suspend_completes_inline(output, frame, suspend)) {
+                return true;
+            }
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+public Bool body_has_direct_rtc_child(
+    jil.Body body,
+    plan.Store& plans
+) {
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        jil.Terminator terminator = body.blocks[index].terminator;
+        if (terminator.kind is .call_term(call)) {
+            if (direct_call_uses_rtc(call, plans)) { return true; }
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+public Bool body_has_cross_executor_child(jil.Body body) {
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        jil.Terminator terminator = body.blocks[index].terminator;
+        if (terminator.kind is .call_term(call)) {
+            if (call.is_suspend_point && call.suspend_wake == .cross_executor) {
+                return true;
+            }
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+@life(return: output & body)
+public jil.Body rewrite_direct_rtc_children(
+    jil.Store& output,
+    jil.Body body,
+    plan.Store& plans
+) {
+    list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(body.blocks.length);
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        jil.Block block = body.blocks[index];
+        blocks.add(jil.Block (
+            id: block.id,
+            span: block.span,
+            statements: block.statements,
+            terminator: direct_rtc_terminator(output, block.terminator, plans)
+        ));
+        index = index + 1;
+    }
+    return jil.Body (
+        id: body.id,
+        span: body.span,
+        locals: body.locals,
+        blocks: output.block_array(blocks$.ref()),
+        entry: body.entry,
+        return_local: body.return_local
+    );
+}
+
+Bool direct_call_uses_rtc(
+    jil.CallTerminator call,
+    plan.Store& plans
+) {
+    if (call.suspend_wake != .direct_child) { return false; }
+    return call_uses_rtc(call, plans);
+}
+
+@life(return: output & terminator & plans)
+jil.Terminator direct_rtc_terminator(
+    jil.Store& output,
+    jil.Terminator terminator,
+    plan.Store& plans
+) {
+    guard terminator.kind is .call_term(call) else { return terminator; }
+    if (!direct_call_uses_rtc(call, plans)) { return terminator; }
+    return rewrite_rtc_call(output, terminator, plans);
+}
+
+Bool call_uses_rtc(
+    jil.CallTerminator call,
+    plan.Store& plans
+) {
+    guard call.suspend_child is .some(child) else { return false; }
+    jil.FunctionKey key = jil.FunctionKey(
+        child.function_def, child.type_args, child.const_args
+    );
+    return plans.get(key).rtc_resume != null;
+}
+
+@life(return: output & block & frame & plans)
+jil.Block rewrite_block(
+    jil.Store& output,
+    jil.Block block,
+    jil.CoroutineFrameLayout& frame,
+    plan.Store& plans
+) {
+    return jil.Block (
+        id: block.id,
+        span: block.span,
+        statements: block.statements,
+        terminator: rewrite_terminator(
+            output, block.terminator, frame, plans
+        )
+    );
+}
+
+@life(return: output & terminator & frame & plans)
+jil.Terminator rewrite_terminator(
+    jil.Store& output,
+    jil.Terminator terminator,
+    jil.CoroutineFrameLayout& frame,
+    plan.Store& plans
+) {
+    if (terminator.kind is .suspend_pending_term(suspend)) {
+        if (task_suspend_completes_inline(output, frame, suspend)) {
+            return jil.Terminator (
+                span: terminator.span,
+                kind: jil.goto_terminator_kind(jil.GotoTerminator (
+                    target: suspend.target
+                ))
+            );
+        }
+        return terminator;
+    }
+    return rewrite_rtc_call(output, terminator, plans);
+}
+
+@life(return: output & terminator & plans)
+jil.Terminator rewrite_rtc_call(
+    jil.Store& output,
+    jil.Terminator terminator,
+    plan.Store& plans
+) {
+    guard terminator.kind is .call_term(call) else { return terminator; }
+    guard call.suspend_child is .some(child) else { return terminator; }
+    jil.FunctionKey key = jil.FunctionKey(
+        child.function_def, child.type_args, child.const_args
+    );
+    guard plans.get(key).rtc_resume is .some(variant_def) else { return terminator; }
+    jil.FunctionRef variant = jil.FunctionRef (
+        function_def: variant_def,
+        type_args: output.empty_type_args(),
+        const_args: output.empty_const_args(),
+        coroutine_resume: false,
+        coroutine_completion: false,
+        type_id: child.type_id,
+        span: child.span
+    );
+    return jil.Terminator (
+        span: terminator.span,
+        kind: jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.direct_function_callee(variant),
+            args: call.args,
+            current_effects: call.current_effects,
+            is_suspend_point: false,
+            destination: call.destination,
+            target: call.target,
+            initialized_place: call.initialized_place,
+            exclusive_places: call.exclusive_places,
+            cleanup: call.cleanup
+        ))
+    );
+}
+
+Bool task_suspend_completes_inline(
+    jil.Store& output,
+    jil.CoroutineFrameLayout& frame,
+    jil.SuspendPendingTerminator suspend
+) {
+    if (suspend.suspend_wake != .task_child) { return false; }
+    guard task_region(frame, suspend) is .some(region) else { return false; }
+    if (region.storage.sync != .local_serial) { return false; }
+    guard region.child_resume is .some(child) else { return false; }
+    guard function_id(output, child) is .some(function_id) else { return false; }
+    jil.Function child_function = output.function(function_id);
+    guard child_function.coroutine_frame is .some(child_frame) else { return false; }
+    return !child_frame.may_defer;
+}
+
+jil.TaskRegion? task_region(
+    jil.CoroutineFrameLayout& frame,
+    jil.SuspendPendingTerminator suspend
+) {
+    guard suspend.task_local is .some(task_local) else { return null; }
+    Int index! = 0;
+    while (index < frame.task_regions.length) {
+        jil.TaskRegion region = frame.task_regions[index];
+        if (region.task_local == task_local) { return region; }
+        index = index + 1;
+    }
+    return null;
+}
+
+Bool call_directly_names_child(
+    jil.CallCallee callee,
+    jil.FunctionRef child
+) {
+    if (callee is .direct_function(function_ref)) {
+        return function_ref_equal(function_ref, child);
+    }
+    if (callee is .domain_enqueue(enqueue)) {
+        guard enqueue.resume is .function_operand(function_ref) else { return false; }
+        return function_ref_equal(function_ref, child);
+    }
+    return false;
+}
+
+Bool function_ref_equal(jil.FunctionRef lhs, jil.FunctionRef rhs) {
+    if (lhs.coroutine_resume != rhs.coroutine_resume) { return false; }
+    if (lhs.coroutine_completion != rhs.coroutine_completion) { return false; }
+    jil.FunctionKey left = jil.FunctionKey(
+        lhs.function_def, lhs.type_args, lhs.const_args
+    );
+    jil.FunctionKey right = jil.FunctionKey(
+        rhs.function_def, rhs.type_args, rhs.const_args
+    );
+    return jil.FunctionKey.equal(left$.ref(), right$.ref());
+}
+
+jil.FunctionId? function_id(
+    jil.Store& output,
+    jil.FunctionRef child
+) {
+    if (child.type_args.length == 0 && child.const_args.length == 0) {
+        return output.function_id_for_def(child.function_def);
+    }
+    return output.function_id_for_instance(
+        child.function_def, child.type_args, child.const_args
+    );
+}

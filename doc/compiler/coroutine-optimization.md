@@ -18,7 +18,7 @@ scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
 - completion word 已合并 readiness、结果状态和唯一 waiter；剩余空间优化重点是按静态 Task 形态
   裁剪取消字段，而不是继续压缩完成协议。
 - `local_serial` 已为 completion word、waiter registration 和结构化 Task 启动生成普通 load/store
-  专用路径。MIR 记录每个 suspend 的 direct child、Task child、跨 executor、external、dynamic 来源，
+  专用路径。JIL 记录每个 suspend 的 direct child、Task child、跨 executor、external、dynamic 来源，
   并通过递归 SCC 固定点计算传递执行封闭摘要。匹配调用点使用独立 confined
   resume 变体：
   Job schedule、request/handoff、suspend/complete 全部使用无原子协议，标准并发 ABI 保持不变。
@@ -64,7 +64,7 @@ Jiang 的直接 `Task<T>` 最接近 Swift `async let`：
 Swift runtime 对结构化子任务允许编译器提供预分配空间。空间足够时，task header、future result
 和 initial async context 可以共用这块 storage；不足时再从 parent task allocator 取得空间。这个
 设计证明“父级预留、必要时 fallback”可行，但 Jiang 不直接复制 task-local LIFO allocator：Jiang
-先由 MIR 的 `TaskRegion` 和 CFG lifetime 证明 slot 生命周期及复用顺序，避免把正确性建立在动态
+先由 JIL 的 `TaskRegion` 和 CFG lifetime 证明 slot 生命周期及复用顺序，避免把正确性建立在动态
 deallocation 顺序上。
 
 Swift future 把完成状态和 waiter 链表头编码在同一个 atomic word 中。Jiang 的 scoped Task 是
@@ -277,7 +277,7 @@ scoped Task 不重复扩大父 frame。普通 async waiter 的完成热路径没
 第二次原子完成写。
 
 - `ownership_state`：结构化 parent 是唯一回收者，删除。
-- `allocation_pointer`：storage plan 是 MIR/生成函数的静态事实，删除。
+- `allocation_pointer`：storage plan 是 JIL/生成函数的静态事实，删除。
 - `result_drop`：drop shim 由 concrete Task result type 静态选择，不存函数指针。
 - waiter context/resume/executor/task：从 TaskState 删除，改存 parent frame 的可复用 waiter record；
   record 指针直接编码在 completion word 中。
@@ -318,7 +318,7 @@ callback 不能在 resume 返回后释放内嵌 token。这个协议是父帧内
 
 ## Storage planner
 
-MIR 在 coroutine frame layout 之前运行 Task ownership/storage analysis。每个 Task origin 形成
+JIL 在 coroutine frame layout 之前运行 Task ownership/storage analysis。每个 Task origin 形成
 `TaskRegion`：
 
 ```text
@@ -414,7 +414,7 @@ fully-confined 变体采用 borrowed executor-context ABI。只有标准 resume�
 Task root 进入。
 函数引用、Task frame 中的 resume initializer 和递归边全部重写到独立 synthetic DefId，
 不会改变标准 `_Resume/_Complete` 符号的并发语义。变体从 `local_serial` Task root 开始按可达闭包
-惰性生成；未被 local root 使用的 preserving coroutine 不增加 MIR/LLVM 函数。Task completion 已有
+惰性生成；未被 local root 使用的 preserving coroutine 不增加 JIL/LLVM 函数。Task completion 已有
 独立 serial shim，不再额外复制一份无人引用的 confined completion。
 
 confined resume 与四个 local Task protocol helper 使用 LLVM internal linkage。release O2 会把 helper
@@ -427,7 +427,7 @@ executor/context/resume，不递增 generation，也不进入 runtime 调度器�
 
 外部取消只原子写共享 root mailbox，并请求 root resume；它不再从调用线程遍历 child TaskState。
 root 在所属 executor 内向 child 传播取消，因此 confined 子树的 cancel target 和 Job schedule
-可以使用普通 load/store。confined MIR 仍显式标记用户 `Atomic<T>` 为 `user_atomic`，只把编译器生成的
+可以使用普通 load/store。confined JIL 仍显式标记用户 `Atomic<T>` 为 `user_atomic`，只把编译器生成的
 coroutine protocol 操作降为 local，不能借执行封闭证明削弱用户原子的内存语义。
 
 ### concurrent
@@ -441,7 +441,7 @@ coroutine protocol 操作降为 local，不能借执行封闭证明削弱用户�
 - queue callback 在 tail-call resume 后不再访问 frame，最终发布后可以立即回收 scoped storage。
 
 禁止为了源码统一让 local_serial 继续走 atomic helper；
-同步模式必须在 MIR 中静态可见并生成不同
+同步模式必须在 JIL 中静态可见并生成不同
 lowering。
 
 ### Suspend registration handshake
@@ -480,7 +480,7 @@ token 或调度引用计数。
 结构化 Task cleanup 是可挂起控制流，不能继续作为 `StorageDead` 前的一条 release statement：
 
 1. 每个直接 Task place 在最终 destination 中原地初始化，编译器记录初始化和 result 消费事实。
-2. MIR lowering 根据离开的词法 place range 找出 Task；未初始化或已经完成消费的 place 不进入 cleanup。
+2. JIL lowering 根据离开的词法 place range 找出 Task；未初始化或已经完成消费的 place 不进入 cleanup。
 3. 第一阶段向全部仍然活跃的 Task 传播取消。
 4. 第二阶段为每个 Task 生成 join suspend point，并消费其 result ownership。
 5. join 完成后 drop 未消费 result、销毁 child frame，并按 storage plan 释放 Task storage。
@@ -557,11 +557,11 @@ storage、sync 和 reclaim policy 可以静态特化，但不能
 - concurrent scheduling：0 resume-token allocation。
 - known acyclic child frame：允许 0 child-frame allocation，并验证 slot reuse。
 - known immutable async lambda：调用热路径 0 child-frame allocation、0 indirect start call，并验证
-  capture env 与所有显式参数按源 MIR `.param` local 顺序写入 frame。
+  capture env 与所有显式参数按源 JIL `.param` local 顺序写入 frame。
 - recursive/dynamic child：最多 1 次 frame allocation，不再额外分配 TaskState/token。
 - detached coroutine：最多 1 次 frame allocation。
 
-`frame_layout_slot_mapping.jiang` 直接统计 lowering 后的 MIR allocation 节点，固定 direct/scoped 为 0、
+`frame_layout_slot_mapping.jiang` 直接统计 lowering 后的 JIL allocation 节点，固定 direct/scoped 为 0、
 heap owner 为 2、detached 为 1。该结构计数与 allocator pool/cache 是否命中无关；运行时 benchmark
 只能用于判断这些 baseline allocation 是否值得优化，不能替代结构断言。
 

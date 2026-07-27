@@ -1,0 +1,439 @@
+// 构造无栈协程的 frame layout，确定跨挂起点存活局部变量的槽位。
+
+import qid = "../../store/id.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../../jil.jiang";
+import live_across_suspend = "./live_across_suspend.jiang";
+import state_dispatch = "./state_dispatch.jiang";
+import suspend_points = "./suspend_points.jiang";
+import task_region = "./task_region.jiang";
+
+@life(return: output)
+public jil.CoroutineFrameLayout? build_frame_layout(
+    jil.Store& output,
+    types.TypeStore& type_store,
+    jil.Body body,
+    types.EffectSet effects,
+    qid.TypeId state_type,
+    jil.TaskStateLayout& task_state,
+    jil.BlockId cancellation_entry,
+    qid.TypeId? capture_env_type
+) {
+    unsafe {
+        if (!effects.has_async) { return null; }
+        live_across_suspend.FrameLiveness liveness =
+            live_across_suspend.analyze_frame_liveness(body);
+        Bool*! live_locals = liveness.live_locals;
+        jil.TaskRegion[]& task_regions = task_region.analyze(output, body);
+        task_region.DisjointnessCache region_cache! =
+            task_region.DisjointnessCache(task_regions.length);
+        list.ArrayList<jil.CoroutineFrameField> fields! = list.ArrayList<jil.CoroutineFrameField>();
+        list.ArrayList<jil.CoroutineLocalFrameField> mappings! =
+            list.ArrayList<jil.CoroutineLocalFrameField>();
+        fields.add(frame_field(.state, state_type, null, false));
+        fields.add(frame_field(
+            .return_slot,
+            body.locals[body.return_local.to_index()].type_id,
+            body.return_local,
+            false
+        ));
+        mappings.add(local_mapping(body.return_local, 1));
+        qid.TypeId result_type = body.locals[body.return_local.to_index()].type_id;
+        qid.TypeId task_type = type_store.task_type(result_type, effects.domain, body.span);
+        qid.TypeId context_type = type_store.raw_pointer_type(task_state.type_id, body.span);
+        qid.TypeId result_pointer_type = type_store.raw_pointer_type(result_type, body.span);
+        qid.TypeId continuation_type = build_continuation_function_type(type_store, context_type, body.span);
+        qid.TypeId executor_type = type_store.opaque_pointer_type(body.span);
+        fields.add(frame_field(.continuation_result, result_pointer_type, null, false));
+        fields.add(frame_field(.continuation_context, context_type, null, false));
+        fields.add(frame_field(.continuation_function, continuation_type, null, false));
+        fields.add(frame_field(.continuation_executor, executor_type, null, false));
+        fields.add(frame_field(.current_executor, executor_type, null, false));
+        fields.add(frame_field(.temp, state_type, null, false));
+        fields.add(frame_field(.temp, context_type, null, false));
+        fields.add(frame_field(.external_continuation, executor_type, null, false));
+        Int capture_env_field_index! = -1;
+        if (capture_env_type is .some(env_type)) {
+            capture_env_field_index = fields.len();
+            fields.add(frame_field(.capture_env, env_type, null, false));
+        }
+        Int index! = 0;
+        while (index < body.locals.length) {
+            jil.LocalDecl local = body.locals[index];
+            if (local_should_get_frame_field(local, live_locals)) {
+                Int field_index! = reusable_frame_field_index(
+                    body,
+                    local,
+                    type_store,
+                    liveness$.ref(),
+                    task_regions,
+                    region_cache$.ref(),
+                    fields$.ref(),
+                    mappings$.ref()
+                );
+                if (field_index < 0) {
+                    field_index = fields.len();
+                    fields.add(frame_field(
+                        frame_field_kind_for_local(local.kind),
+                        local.type_id,
+                        local.id,
+                        live_locals[local.id.to_index()]
+                    ));
+                }
+                mappings.add(local_mapping(local.id, field_index));
+            }
+            index = index + 1;
+        }
+        jil.CoroutineSuspendPoint[]& points = suspend_points.collect(output, body);
+        qid.TypeId frame_type_id = build_frame_type(type_store, fields$.ref(), body.span);
+        return jil.CoroutineFrameLayout (
+            frame_type_id: frame_type_id,
+            task_abi: build_task_abi(
+                type_store, frame_type_id, result_type, state_type, effects.domain, task_state, body.span
+            ),
+            fields: output.coroutine_frame_field_array(fields$.ref()),
+            local_mappings: output.coroutine_local_frame_field_array(mappings$.ref()),
+            suspend_points: points,
+            task_regions: task_regions,
+            state_dispatch: state_dispatch.build(output, points),
+            cancellation_entry: cancellation_entry,
+            state_field_index: 0,
+            return_field_index: 1,
+            continuation_result_field_index: 2,
+            continuation_context_field_index: 3,
+            continuation_function_field_index: 4,
+            continuation_executor_field_index: 5,
+            current_executor_field_index: 6,
+            cancellation_enabled_field_index: 7,
+            cancellation_context_field_index: 8,
+            external_continuation_field_index: 9,
+            capture_env_field_index: capture_env_field_index,
+            domain_kind: -1,
+            effects: effects,
+            may_defer: true
+        );
+    }
+}
+
+qid.TypeId build_continuation_function_type(
+    types.TypeStore& type_store,
+    qid.TypeId context_type,
+    token.Span span
+) {
+    list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+    params.add(context_type);
+    return type_store.function_type(params, type_store.unit_type(), span);
+}
+
+qid.TypeId build_frame_type(
+    types.TypeStore& type_store,
+    list.ArrayList<jil.CoroutineFrameField>& fields,
+    token.Span span
+) {
+    list.ArrayList<qid.TypeId> field_types! = list.ArrayList<qid.TypeId>(fields.len());
+    Int index! = 0;
+    while (index < fields.len()) {
+        field_types.add(fields.get(index).type_id);
+        index = index + 1;
+    }
+    return type_store.tuple_type(field_types, span);
+}
+
+jil.TaskAbiLayout build_task_abi(
+    types.TypeStore& type_store,
+    qid.TypeId frame_type_id,
+    qid.TypeId result_type_id,
+    qid.TypeId state_type,
+    types.DomainEffect? domain,
+    jil.TaskStateLayout& task_state,
+    token.Span span
+) {
+    qid.TypeId frame_pointer_type_id = type_store.raw_pointer_type(frame_type_id, span);
+    qid.TypeId task_type_id = type_store.task_type(result_type_id, domain, span);
+    qid.TypeId resume_function_type_id = build_resume_function_type(type_store, span);
+    jil.TaskWaiterLayout waiter_layout = build_task_waiter_layout(type_store, span);
+    return jil.TaskAbiLayout (
+        task_type_id: task_type_id,
+        task_state_type_id: task_state.type_id,
+        task_state_pointer_type_id: type_store.raw_pointer_type(task_state.type_id, span),
+        result_type_id: result_type_id,
+        frame_pointer_type_id: frame_pointer_type_id,
+        resume_return_type_id: type_store.unit_type(),
+        resume_function_type_id: resume_function_type_id,
+        waiter_layout: waiter_layout,
+        suspend_layout: build_suspend_continuation_layout(type_store, result_type_id, span),
+        blocking_ack_pointer_type_id: type_store.raw_pointer_type(task_state.state.type_id, span),
+        bool_type_id: type_store.bool_type(),
+        state_field: task_state.state,
+        frame_field: task_state.frame,
+        resume_function_field: task_state.resume_function,
+        execution_executor_field: task_state.execution_executor,
+        result_field: task_state.result,
+        cancellation_requested_field: task_state.cancellation_requested,
+        cancel_target_word_field: task_state.cancel_target_word,
+        lifetime_state_field: task_state.lifetime_state,
+        cleanup_function_field: task_state.cleanup_function,
+        schedule_state_field: task_state.schedule_state,
+        schedule_executor_field: task_state.schedule_executor,
+        schedule_context_field: task_state.schedule_context,
+        schedule_resume_field: task_state.schedule_resume,
+        schedule_active_executor_field: task_state.schedule_active_executor
+    );
+}
+
+public jil.SuspendContinuationLayout build_suspend_continuation_layout(
+    types.TypeStore& type_store,
+    qid.TypeId result_type,
+    token.Span span
+) {
+    qid.TypeId pointer_type = type_store.opaque_pointer_type(span);
+    qid.TypeId resume_type = build_resume_function_type(type_store, span);
+    qid.TypeId int_type = type_store.int_type();
+    list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(13);
+    fields.add(type_store.raw_pointer_type(result_type, span));
+    fields.add(pointer_type);
+    fields.add(resume_type);
+    fields.add(pointer_type);
+    fields.add(int_type);
+    fields.add(type_store.raw_pointer_type(int_type, span));
+    fields.add(type_store.raw_pointer_type(int_type, span));
+    fields.add(pointer_type);
+    fields.add(resume_type);
+    fields.add(resume_type);
+    fields.add(int_type);
+    fields.add(int_type);
+    fields.add(pointer_type);
+    qid.TypeId type_id = type_store.tuple_type(fields, span);
+    return jil.SuspendContinuationLayout (
+        type_id: type_id,
+        pointer_type_id: type_store.raw_pointer_type(type_id, span),
+        result_field_index: 0,
+        context_field_index: 1,
+        resume_field_index: 2,
+        executor_field_index: 3,
+        phase_field_index: 4,
+        cancel_request_pointer_field_index: 5,
+        cancel_word_pointer_field_index: 6,
+        handler_context_field_index: 7,
+        handler_function_field_index: 8,
+        handler_drop_field_index: 9,
+        fallback_cancel_request_field_index: 10,
+        fallback_cancel_word_field_index: 11,
+        task_field_index: 12
+    );
+}
+
+jil.TaskWaiterLayout build_task_waiter_layout(
+    types.TypeStore& type_store,
+    token.Span span
+) {
+    qid.TypeId pointer_type = type_store.opaque_pointer_type(span);
+    qid.TypeId resume_type = build_resume_function_type(type_store, span);
+    list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(4);
+    fields.add(pointer_type);
+    fields.add(resume_type);
+    fields.add(pointer_type);
+    fields.add(pointer_type);
+    qid.TypeId type_id = type_store.tuple_type(fields, span);
+    return jil.TaskWaiterLayout (
+        type_id: type_id,
+        pointer_type_id: type_store.raw_pointer_type(type_id, span),
+        context_field_index: 0,
+        resume_field_index: 1,
+        executor_field_index: 2,
+        task_field_index: 3
+    );
+}
+
+qid.TypeId build_resume_function_type(
+    types.TypeStore& type_store,
+    token.Span span
+) {
+    list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+    params.add(type_store.opaque_pointer_type(span));
+    return type_store.function_type(params, type_store.unit_type(), span);
+}
+
+jil.CoroutineLocalFrameField local_mapping(jil.LocalId local_id, Int field_index) {
+    return jil.CoroutineLocalFrameField (
+        local_id: local_id,
+        field_index: field_index
+    );
+}
+
+jil.CoroutineFrameField frame_field(
+    jil.CoroutineFrameFieldKind kind,
+    qid.TypeId type_id,
+    jil.LocalId? local_id,
+    Bool live_across_suspend
+) {
+    return jil.CoroutineFrameField (
+        kind: kind,
+        type_id: type_id,
+        local_id: local_id,
+        live_across_suspend: live_across_suspend,
+        needs_drop: false
+    );
+}
+
+Bool local_should_get_frame_field(
+    jil.LocalDecl local,
+    Bool*! live_locals
+) {
+    unsafe {
+        if (local.kind == .return_place) { return false; }
+        if (local.kind == .param) { return true; }
+        return live_locals[local.id.to_index()];
+    }
+}
+
+Int reusable_frame_field_index(
+    jil.Body body,
+    jil.LocalDecl local,
+    types.TypeStore& type_store,
+    live_across_suspend.FrameLiveness& liveness,
+    jil.TaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache,
+    list.ArrayList<jil.CoroutineFrameField>& fields,
+    list.ArrayList<jil.CoroutineLocalFrameField>& mappings
+) {
+    unsafe {
+        // 参数必须在首次 resume 前就由 caller 写入 frame，不能参与 slot 复用。
+        if (local.kind == .param) { return -1; }
+        Int mapping_index! = 0;
+        while (mapping_index < mappings.len()) {
+            Int field_index = mappings.get(mapping_index).field_index;
+            if (frame_field_can_store_local(
+                    body,
+                    local,
+                    field_index,
+                    type_store,
+                    liveness,
+                    task_regions,
+                    region_cache,
+                    fields,
+                    mappings
+                )
+            ) {
+                return field_index;
+            }
+            mapping_index = mapping_index + 1;
+        }
+        return -1;
+    }
+}
+
+Bool frame_field_can_store_local(
+    jil.Body body,
+    jil.LocalDecl local,
+    Int field_index,
+    types.TypeStore& type_store,
+    live_across_suspend.FrameLiveness& liveness,
+    jil.TaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache,
+    list.ArrayList<jil.CoroutineFrameField>& fields,
+    list.ArrayList<jil.CoroutineLocalFrameField>& mappings
+) {
+    jil.CoroutineFrameField field = fields.get(field_index);
+    if (!reusable_local_field_kind(field.kind)) { return false; }
+
+    // tuple 等结构类型可能被重建成不同 TypeId；只要结构类型相同，ABI、projection
+    // 和 drop 规则就相同，仍无需 union storage 或额外的 active-type tag。
+    if (!type_store.same_type(field.type_id, local.type_id)) { return false; }
+
+    Int mapping_index! = 0;
+    while (mapping_index < mappings.len()) {
+        jil.CoroutineLocalFrameField mapping = mappings.get(mapping_index);
+        if (mapping.field_index == field_index) {
+            jil.LocalDecl existing = body.locals[mapping.local_id.to_index()];
+            if (!locals_can_share_frame_slot(
+                    body, local, existing, liveness, task_regions, region_cache
+                )
+            ) {
+                return false;
+            }
+        }
+        mapping_index = mapping_index + 1;
+    }
+    return true;
+}
+
+Bool reusable_local_field_kind(jil.CoroutineFrameFieldKind kind) {
+    return kind == .local || kind == .temp;
+}
+
+Bool locals_can_share_frame_slot(
+    jil.Body body,
+    jil.LocalDecl lhs,
+    jil.LocalDecl rhs,
+    live_across_suspend.FrameLiveness& liveness,
+    jil.TaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache
+) {
+    unsafe {
+        if (rhs.kind == .param) { return false; }
+        Bool lhs_addressed = liveness.address_preserved[lhs.id.to_index()];
+        Bool rhs_addressed = liveness.address_preserved[rhs.id.to_index()];
+        if (lhs_addressed || rhs_addressed) {
+            return captured_task_locals_can_share(
+                body, lhs, rhs, liveness, task_regions, region_cache
+            );
+        }
+        return !live_across_suspend.locals_interfere(liveness, lhs.id, rhs.id);
+    }
+}
+
+Bool captured_task_locals_can_share(
+    jil.Body body,
+    jil.LocalDecl lhs,
+    jil.LocalDecl rhs,
+    live_across_suspend.FrameLiveness& liveness,
+    jil.TaskRegion[]& task_regions,
+    task_region.DisjointnessCache& region_cache
+) {
+    guard lhs.coroutine_capture_task is .some(lhs_task) else { return false; }
+    guard rhs.coroutine_capture_task is .some(rhs_task) else { return false; }
+    guard lhs.coroutine_capture_kind is .some(lhs_kind) else { return false; }
+    guard rhs.coroutine_capture_kind is .some(rhs_kind) else { return false; }
+    if (lhs_kind == .auxiliary || lhs_kind != rhs_kind) { return false; }
+    if (lhs_task == rhs_task) {
+        if (lhs_kind != .task_waiter) { return false; }
+        return !live_across_suspend.locals_interfere(liveness, lhs.id, rhs.id);
+    }
+    guard region_index_for_task(task_regions, lhs_task) is .some(lhs_index) else { return false; }
+    guard region_index_for_task(task_regions, rhs_task) is .some(rhs_index) else { return false; }
+    jil.TaskRegion lhs_region = task_regions[lhs_index];
+    jil.TaskRegion rhs_region = task_regions[rhs_index];
+    if (!region_has_parent_local_storage(lhs_region)) { return false; }
+    if (!region_has_parent_local_storage(rhs_region)) { return false; }
+    // capture 的地址只发布给所属 Task。Task release 完成后地址失效，因此 owner Task
+    // 的 region 可以作为间接引用的精确代理，而不必永久钉住父 frame 槽位。
+    return region_cache.regions_do_not_overlap(body, task_regions, lhs_index, rhs_index);
+}
+
+Int? region_index_for_task(
+    jil.TaskRegion[]& regions,
+    jil.LocalId task_local
+) {
+    Int index! = 0;
+    while (index < regions.length) {
+        if (regions[index].task_local == task_local) { return index; }
+        index = index + 1;
+    }
+    return null;
+}
+
+Bool region_has_parent_local_storage(jil.TaskRegion region) {
+    return region.storage.allocation == .local &&
+        region.storage.frame == .local &&
+        region.storage.reclaim == .parent &&
+        region.consume_count > 0 && region.release_count > 0;
+}
+
+jil.CoroutineFrameFieldKind frame_field_kind_for_local(jil.LocalKind kind) {
+    if (kind == .param) { return .param; }
+    if (kind == .user_local) { return .local; }
+    return .temp;
+}

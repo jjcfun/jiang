@@ -1,0 +1,1757 @@
+// Semantic Model generic body template 的 artifact 编解码。
+//
+// `.ji` 里的 generic template 不能保存 session-local ID。这里编码 owner-local
+// Semantic Model graph：NodeId 只写 local_index，外部 DefId 写 stable id，local DefId
+// 通过 symbol 重建。span/source offset 不进入 payload。
+
+import context = "../context.jiang";
+import diagnostic = "../diagnostic.jiang";
+import sem = "../sema/model.jiang";
+import store_api = "../store.jiang";
+import qid = "../store/id.jiang";
+import qkey = "../incremental/key.jiang";
+import def = "../resolve/def.jiang";
+import list = "../support/list.jiang";
+import memory = "../support/memory.jiang";
+import token = "../syntax/token.jiang";
+
+enum TemplateNodeTag {
+    block = 1,
+    name_ref = 2,
+    member_access = 3,
+    index_access = 4,
+    slice_access = 5,
+    struct_literal = 6,
+    array_literal = 7,
+    range_expr = 8,
+    call = 9,
+    implicit_call = 10,
+    literal = 11,
+    let_stmt = 12,
+    defer_stmt = 14,
+    guard_stmt = 15,
+    assign_stmt = 16,
+    return_stmt = 17,
+    throw_stmt = 18,
+    break_stmt = 19,
+    continue_stmt = 20,
+    unary = 21,
+    binary = 22,
+    if_expr = 23,
+    loop_expr = 24,
+    switch_expr = 25,
+    catch_expr = 26,
+    is_pattern = 27,
+    binding_pattern = 28,
+    literal_pattern = 29,
+    optional_pattern = 30,
+    variant_pattern = 31,
+    wildcard_pattern = 32,
+    named_type_ref = 33,
+    layered_type_ref = 34,
+    array_type_ref = 35,
+    errorable_type_ref = 36,
+    function_type_ref = 37,
+    tuple_type_ref = 38,
+    infer_type_ref = 39,
+    unit_type_ref = 40,
+    invalid_type_ref = 41,
+    invalid_node = 42,
+    tuple_literal = 43,
+    destructure_stmt = 47,
+    trait_companion_type_ref = 48,
+    inline_asm = 49,
+    tuple_pattern = 50,
+}
+
+enum TemplateNameRefKind {
+    local = 1,
+    def_ref = 2,
+}
+
+enum TemplateLiteralKind {
+    int_value = 1,
+    float_value = 2,
+    bool_value = 3,
+    string_value = 4,
+    char_value = 5,
+    null_value = 6,
+    unit_value = 7,
+}
+
+@life()
+public UInt8[]& encode_body(context.CompilerContext& ctx, sem.Def& model_def) {
+    TemplateWriter writer! = TemplateWriter(ctx);
+    writer.write_bytes("jiang.sem-template.v7");
+    writer.write_def(model_def.def_id);
+    writer.write_body(model_def);
+    if (!writer.ok) {
+        add_template_encode_error(ctx);
+        return "";
+    }
+    return writer.finish();
+}
+
+@life()
+public UInt8[]& encode_expression(
+    context.CompilerContext& ctx,
+    sem.Def& model_def,
+    sem.NodeId root
+) {
+    TemplateWriter writer! = TemplateWriter(ctx);
+    writer.write_bytes("jiang.sem-expression.v4");
+    writer.write_def(model_def.def_id);
+    writer.write_model_id(root);
+    writer.write_nodes(model_def);
+    if (!writer.ok) {
+        add_template_encode_error(ctx);
+        return "";
+    }
+    return writer.finish();
+}
+
+() add_template_encode_error(context.CompilerContext& ctx) {
+    ctx.store.diagnostics.add(
+        diagnostic.Diagnostic(
+            .error,
+            .incremental,
+            diagnostic.DiagnosticCode("model_template_encode_failed"),
+            diagnostic.SourceRange(),
+            "failed to encode generic Semantic Model template"
+        )
+    );
+}
+
+public struct TemplateDecodeResult: Copyable {
+    public Bool ok;
+    public qkey.StableSymbolId? missing_stable_id;
+}
+
+public Bool decode_body(store_api.CompilerStore& store, qid.DefId owner_def, UInt8[]& bytes) {
+    return decode_body_result(store, owner_def, bytes).ok;
+}
+
+public TemplateDecodeResult decode_body_result(
+    store_api.CompilerStore& store,
+    qid.DefId owner_def,
+    UInt8[]& bytes
+) {
+    TemplateReader reader! = TemplateReader(store, owner_def, bytes);
+    if (!reader.read_header()) {
+        reader.ok = false;
+        return reader.decode_result();
+    }
+    reader.skip_owner_def();
+    if (!reader.read_bool()) {
+        reader.ok = false;
+        return reader.decode_result();
+    }
+
+    sem.Def& model_def = store.model.def_ref(owner_def);
+    reader.begin_nodes(model_def);
+    sem.NodeId root = reader.read_model_id();
+    sem.Body body! = sem.Body(owner_def, root);
+    reader.read_locals(body$.ref());
+    reader.read_nodes(model_def);
+    if (!reader.ok) { return reader.decode_result(); }
+    store.model.load_body(owner_def, body);
+    return reader.decode_result();
+}
+
+public sem.NodeId? decode_expression(
+    store_api.CompilerStore& store,
+    qid.DefId owner_def,
+    UInt8[]& bytes
+) {
+    TemplateReader reader! = TemplateReader(store, owner_def, bytes);
+    if (!reader.read_magic("jiang.sem-expression.v4")) { return null; }
+    reader.skip_owner_def();
+    sem.Def& model_def = store.model.def_ref(owner_def);
+    reader.begin_nodes(model_def);
+    sem.NodeId root = reader.read_model_id();
+    reader.read_nodes(model_def);
+    if (!reader.ok) { return null; }
+    return root;
+}
+
+struct TemplateLocal: Copyable {
+    sem.LocalKind kind;
+    qid.SymbolId symbol;
+    Bool mutable_binding;
+    Bool borrow_binding;
+    Bool mutable_borrow;
+    sem.NodeId? type_ref;
+}
+
+@region(a, b)
+struct TemplateReader: Movable {
+    @life(a)
+    store_api.CompilerStore& store;
+    qid.DefId owner_def;
+
+    @life(b)
+    UInt8[]& bytes;
+    Int offset!;
+    Int node_base!;
+    Bool ok!;
+    qkey.StableSymbolId? missing_stable_id!;
+
+    init(self, store_api.CompilerStore& store, qid.DefId owner_def, UInt8[]& bytes) {
+        self.store = store;
+        self.owner_def = owner_def;
+        self.bytes = bytes;
+        self.offset = 0;
+        self.node_base = 0;
+        self.ok = true;
+        self.missing_stable_id = null;
+    }
+
+    TemplateDecodeResult decode_result(self) {
+        return TemplateDecodeResult(ok: self.ok, missing_stable_id: self.missing_stable_id);
+    }
+
+    Bool read_header(self) {
+        return self.read_magic("jiang.sem-template.v7");
+    }
+
+    Bool read_magic(self, UInt8[]& magic) {
+        if (self.bytes.length < magic.length) { return false; }
+        Int index! = 0;
+        while (index < magic.length) {
+            if (self.bytes[index] != magic[index]) { return false; }
+            index = index + 1;
+        }
+        self.offset = magic.length;
+        return true;
+    }
+
+    () skip_owner_def(self) {
+        self.read_def();
+    }
+
+    () begin_nodes(self, sem.Def& model_def) {
+        self.node_base = model_def.nodes.len();
+    }
+
+    () read_locals(self, sem.Body& body) {
+        Int count = self.read_int();
+        Int index! = 0;
+        while (index < count) {
+            TemplateLocal local = self.read_template_local();
+            qid.DefId def_id = self.create_local_def(local.symbol);
+            body.add_local_with_borrow_binding(
+                local.kind,
+                local.symbol,
+                def_id,
+                local.mutable_binding,
+                local.borrow_binding,
+                local.type_ref,
+                local.mutable_borrow
+            );
+            index = index + 1;
+        }
+    }
+
+    TemplateLocal read_template_local(self) {
+        self.read_int();
+        sem.LocalKind kind = local_kind_from_tag(self.read_int());
+        qid.SymbolId symbol = self.read_symbol();
+        Bool mutable_binding = self.read_bool();
+        Bool borrow_binding = self.read_bool();
+        Bool mutable_borrow = self.read_bool();
+        sem.NodeId? type_ref = self.read_optional_model_id();
+        return TemplateLocal (
+            kind: kind,
+            symbol: symbol,
+            mutable_binding: mutable_binding,
+            borrow_binding: borrow_binding,
+            mutable_borrow: mutable_borrow,
+            type_ref: type_ref
+        );
+    }
+
+    qid.DefId create_local_def(self, qid.SymbolId symbol) {
+        def.DefRecord owner = self.store.defs.get(self.owner_def);
+        token.Span span = token.Span();
+        qid.DefId def_id = self.store.defs.create(
+            .local_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: symbol, span: span),
+            self.owner_def,
+            owner.module_id,
+            owner.decl_namespace_id,
+            null
+        );
+        self.store.source_map.set_sourceless_def_span(def_id, span);
+        return def_id;
+    }
+
+    () read_nodes(self, sem.Def& model_def) {
+        Int count = self.read_int();
+        Int index! = 0;
+        while (index < count) {
+            sem.NodeId node_id = self.read_model_id();
+            sem.NodeData data = self.read_node_data();
+            if (node_id.owner_def != self.owner_def || node_id.local_index != self.node_base + index) {
+                self.ok = false;
+                return;
+            }
+            model_def.nodes.add(sem.Node(node_id, data));
+            index = index + 1;
+        }
+    }
+
+    sem.NodeData read_node_data(self) {
+        guard node_tag_from_int(self.read_int()) is .some(tag) else {
+            self.ok = false;
+            return .invalid();
+        }
+        if (tag == .block) { return .block(self.read_block()); }
+        if (tag == .name_ref) { return .name_ref(self.read_name_ref()); }
+        if (tag == .member_access) { return .member_access(self.read_member_access()); }
+        if (tag == .index_access) { return .index_access(self.read_index_access()); }
+        if (tag == .slice_access) { return .slice_access(self.read_slice_access()); }
+        if (tag == .struct_literal) { return .struct_literal(self.read_struct_literal()); }
+        if (tag == .tuple_literal) {
+            sem.TupleLiteral tuple_literal = sem.TupleLiteral (items: self.read_model_id_array());
+            return .tuple_literal(tuple_literal);
+        }
+        if (tag == .array_literal) {
+            sem.ArrayLiteral array_literal = sem.ArrayLiteral (items: self.read_model_id_array());
+            return .array_literal(array_literal);
+        }
+        if (tag == .range_expr) { return .range_expr(self.read_range()); }
+        if (tag == .inline_asm) { return .inline_asm(self.read_inline_asm()); }
+        if (tag == .call) { return .call(self.read_call()); }
+        if (tag == .implicit_call) { return .implicit_call(self.read_implicit_call()); }
+        if (tag == .literal) { return .literal(self.read_literal_payload()); }
+        if (tag == .let_stmt) { return .let_stmt(self.read_let()); }
+        if (tag == .destructure_stmt) { return .destructure_stmt(self.read_destructure()); }
+        if (tag == .defer_stmt) {
+            sem.Defer defer_stmt = sem.Defer (body: self.read_model_id());
+            return .defer_stmt(defer_stmt);
+        }
+        if (tag == .guard_stmt) { return .guard_stmt(self.read_guard()); }
+        if (tag == .assign_stmt) { return .assign_stmt(self.read_assign()); }
+        if (tag == .return_stmt) {
+            sem.Return return_stmt = sem.Return (value: self.read_optional_model_id());
+            return .return_stmt(return_stmt);
+        }
+        if (tag == .throw_stmt) {
+            sem.Throw throw_stmt = sem.Throw (value: self.read_model_id());
+            return .throw_stmt(throw_stmt);
+        }
+        if (tag == .break_stmt) { return .break_stmt(); }
+        if (tag == .continue_stmt) { return .continue_stmt(); }
+        if (tag == .unary) { return .unary(self.read_unary()); }
+        if (tag == .binary) { return .binary(self.read_binary()); }
+        if (tag == .if_expr) { return .if_expr(self.read_if()); }
+        if (tag == .loop_expr) { return .loop_expr(self.read_loop()); }
+        if (tag == .switch_expr) { return .switch_expr(self.read_switch()); }
+        if (tag == .catch_expr) { return .catch_expr(self.read_catch()); }
+        if (tag == .is_pattern) { return .is_pattern(self.read_is_pattern()); }
+        if (tag == .binding_pattern) { return .binding_pattern(self.read_binding_pattern()); }
+        if (tag == .literal_pattern) { return .literal_pattern(self.read_literal_pattern()); }
+        if (tag == .optional_pattern) {
+            sem.OptionalPattern pattern = sem.OptionalPattern (nested: self.read_optional_model_id());
+            return .optional_pattern(pattern);
+        }
+        if (tag == .tuple_pattern) {
+            sem.TuplePattern pattern = sem.TuplePattern (items: self.read_model_id_array());
+            return .tuple_pattern(pattern);
+        }
+        if (tag == .variant_pattern) { return .variant_pattern(self.read_variant_pattern()); }
+        if (tag == .wildcard_pattern) { return .wildcard_pattern(); }
+        if (tag == .trait_companion_type_ref) {
+            return .trait_companion_type_ref(self.read_trait_companion_type_ref());
+        }
+        if (tag == .named_type_ref) { return .named_type_ref(self.read_named_type_ref()); }
+        if (tag == .layered_type_ref) {
+            return .layered_type_ref(self.read_layered_type_ref());
+        }
+        if (tag == .array_type_ref) { return .array_type_ref(self.read_array_type_ref()); }
+        if (tag == .errorable_type_ref) {
+            return .errorable_type_ref(self.read_errorable_type_ref());
+        }
+        if (tag == .function_type_ref) {
+            return .function_type_ref(self.read_function_type_ref());
+        }
+        if (tag == .tuple_type_ref) {
+            sem.TupleTypeRef tuple_type_ref = sem.TupleTypeRef (
+                items: self.read_model_id_array(),
+                contract_names: self.read_optional_symbol_array()
+            );
+            return .tuple_type_ref(tuple_type_ref);
+        }
+        if (tag == .infer_type_ref) { return .infer_type_ref(); }
+        if (tag == .unit_type_ref) { return .unit_type_ref(); }
+        if (tag == .invalid_type_ref) { return .invalid_type_ref(); }
+        if (tag == .invalid_node) { return .invalid(); }
+        self.ok = false;
+        return .invalid();
+    }
+
+    sem.Block read_block(self) {
+        sem.EffectSet effects = self.read_effect_set();
+        sem.NodeId[]& statements = self.read_model_id_array();
+        sem.NodeId? result = self.read_optional_model_id();
+        return sem.Block (effects: effects, statements: statements, result: result);
+    }
+
+    sem.NameRef read_name_ref(self) {
+        guard name_ref_kind_from_int(self.read_int()) is .some(kind) else {
+            self.ok = false;
+            return .def_ref(qid.DefId.from_index(0));
+        }
+        if (kind == .local) { return .local(sem.LocalId.from_index(self.read_int())); }
+        if (kind == .def_ref) { return .def_ref(self.read_def()); }
+        self.ok = false;
+        return .def_ref(qid.DefId.from_index(0));
+    }
+
+    sem.MemberAccess read_member_access(self) {
+        return sem.MemberAccess (base: self.read_model_id(), member_symbol: self.read_symbol());
+    }
+
+    sem.IndexAccess read_index_access(self) {
+        return sem.IndexAccess (base: self.read_model_id(), index: self.read_model_id());
+    }
+
+    sem.SliceAccess read_slice_access(self) {
+        return sem.SliceAccess (
+            base: self.read_model_id(),
+            start: self.read_optional_model_id(),
+            end: self.read_optional_model_id()
+        );
+    }
+
+    sem.StructLiteral read_struct_literal(self) {
+        sem.NodeId type_ref = self.read_model_id();
+        Int count = self.read_int();
+        sem.FieldInit[]& fields = self.read_field_inits(count);
+        return sem.StructLiteral (type_ref: type_ref, fields: fields);
+    }
+
+    sem.Range read_range(self) {
+        return sem.Range (start: self.read_model_id(), end: self.read_model_id());
+    }
+
+    sem.InlineAsm read_inline_asm(self) {
+        return sem.InlineAsm (
+            result_type: self.read_model_id(),
+            code_symbol: self.read_symbol(),
+            operands: self.read_inline_asm_operands(),
+            clobbers: self.read_symbol_array(),
+            volatile: self.read_bool(),
+            memory: self.read_bool(),
+            noreturn: self.read_bool()
+        );
+    }
+
+    sem.InlineAsmOperand[]& read_inline_asm_operands(self) {
+        unsafe {
+            Int count = self.read_int();
+            Int capacity = max_one(count);
+            sem.InlineAsmOperand*! stored = self.store.model.storage.alloc_array<sem.InlineAsmOperand>(
+                capacity
+            );
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = self.read_inline_asm_operand();
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.InlineAsmOperand read_inline_asm_operand(self) {
+        Int kind = self.read_int();
+        if (kind == 1) {
+            return .input(sem.InlineAsmInput (
+                name: self.read_symbol(),
+                constraint_symbol: self.read_symbol(),
+                value: self.read_model_id()
+            ));
+        }
+        if (kind == 2) {
+            return .output(sem.InlineAsmOutput (
+                name: self.read_symbol(),
+                constraint_symbol: self.read_symbol(),
+                type_ref: self.read_optional_model_id()
+            ));
+        }
+        self.ok = false;
+        return .input(sem.InlineAsmInput (
+            name: qid.SymbolId(0),
+            constraint_symbol: qid.SymbolId(0),
+            value: sem.NodeId(self.owner_def, 0)
+        ));
+    }
+
+    sem.Call read_call(self) {
+        sem.NodeId callee = self.read_model_id();
+        sem.NodeId[]& type_args = self.read_model_id_array();
+        sem.CallArg[]& args = self.read_call_args();
+        sem.CallTarget? target! = null;
+        if (self.read_bool()) {
+            target = sem.CallTarget (def_id: self.read_def(), signature_id: null);
+        }
+        return sem.Call (callee: callee, type_args: type_args, args: args, target: target);
+    }
+
+    sem.ImplicitCall read_implicit_call(self) {
+        sem.NodeId base = self.read_model_id();
+        sem.ImplicitOp op = implicit_op_from_tag(self.read_int());
+        sem.NodeId[]& args = self.read_model_id_array();
+        Bool optional_chain = self.read_bool();
+        return sem.ImplicitCall (
+            base: base,
+            op: op,
+            args: args,
+            optional_chain: optional_chain
+        );
+    }
+
+    sem.Literal read_literal_payload(self) {
+        guard literal_kind_from_int(self.read_int()) is .some(kind) else {
+            self.ok = false;
+            return sem.Literal (value: .unit_value());
+        }
+        if (kind == .int_value) {
+            sem.IntLiteral int_literal = sem.IntLiteral (
+                bits: self.read_u64(),
+                signed_value: self.read_bool()
+            );
+            return sem.Literal (value: .int_value(int_literal));
+        }
+        if (kind == .float_value) {
+            sem.FloatLiteral float_literal = sem.FloatLiteral (value: float64_from_bits(self.read_u64()));
+            return sem.Literal (value: .float_value(float_literal));
+        }
+        if (kind == .bool_value) { return sem.Literal (value: .bool_value(self.read_bool())); }
+        if (kind == .string_value) { return sem.Literal (value: .string_value(self.read_symbol())); }
+        if (kind == .char_value) { return sem.Literal (value: .char_value(UInt32(self.read_u64()))); }
+        if (kind == .null_value) { return sem.Literal (value: .null_value()); }
+        if (kind == .unit_value) { return sem.Literal (value: .unit_value()); }
+        self.ok = false;
+        return sem.Literal (value: .unit_value());
+    }
+
+    sem.Let read_let(self) {
+        sem.LocalId local_id = sem.LocalId.from_index(self.read_int());
+        sem.NodeId? initializer = self.read_optional_model_id();
+        return sem.Let (local_id: local_id, initializer: initializer);
+    }
+
+    sem.Destructure read_destructure(self) {
+        sem.NodeId pattern = self.read_model_id();
+        sem.NodeId initializer = self.read_model_id();
+        return sem.Destructure (pattern: pattern, initializer: initializer);
+    }
+
+    sem.Guard read_guard(self) {
+        return sem.Guard (condition: self.read_model_id(), else_body: self.read_model_id());
+    }
+
+    sem.Assign read_assign(self) {
+        sem.AssignOp op = assign_op_from_tag(self.read_int());
+        sem.NodeId target = self.read_model_id();
+        sem.NodeId value = self.read_model_id();
+        return sem.Assign (op: op, target: target, value: value);
+    }
+
+    sem.Unary read_unary(self) {
+        sem.UnaryOp op = unary_op_from_tag(self.read_int());
+        sem.NodeId value = self.read_model_id();
+        return sem.Unary (op: op, value: value);
+    }
+
+    sem.Binary read_binary(self) {
+        return sem.Binary (
+            op: binary_op_from_tag(self.read_int()),
+            left: self.read_model_id(),
+            right: self.read_model_id()
+        );
+    }
+
+    sem.If read_if(self) {
+        return sem.If (
+            condition: self.read_model_id(),
+            then_body: self.read_model_id(),
+            else_body: self.read_optional_model_id()
+        );
+    }
+
+    sem.Loop read_loop(self) {
+        return sem.Loop (
+            condition: self.read_optional_model_id(),
+            pattern: self.read_optional_model_id(),
+            iterable: self.read_optional_model_id(),
+            body: self.read_model_id()
+        );
+    }
+
+    sem.Switch read_switch(self) {
+        unsafe {
+            sem.NodeId value = self.read_model_id();
+            Int count = self.read_int();
+            Int capacity = max_one(count);
+            sem.SwitchCase*! stored = self.store.model.storage.alloc_array<sem.SwitchCase>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                sem.NodeId[]& patterns = self.read_model_id_array();
+                sem.NodeId body = self.read_model_id();
+                stored[index] = sem.SwitchCase (
+                    patterns: patterns,
+                    body: body
+                );
+                index = index + 1;
+            }
+            sem.SwitchCase[]& cases = stored[0..count];
+            return sem.Switch (value: value, cases: cases);
+        }
+    }
+
+    sem.Catch read_catch(self) {
+        return sem.Catch (
+            value: self.read_model_id(),
+            pattern: self.read_optional_model_id(),
+            body: self.read_model_id()
+        );
+    }
+
+    sem.IsPattern read_is_pattern(self) {
+        return sem.IsPattern (value: self.read_model_id(), pattern: self.read_model_id());
+    }
+
+    sem.BindingPattern read_binding_pattern(self) {
+        return sem.BindingPattern (local_id: sem.LocalId.from_index(self.read_int()));
+    }
+
+    sem.LiteralPattern read_literal_pattern(self) {
+        return sem.LiteralPattern (literal: self.read_literal_payload());
+    }
+
+    sem.VariantPattern read_variant_pattern(self) {
+        return sem.VariantPattern (
+            variant_def: self.read_optional_def(),
+            member_symbol: self.read_optional_symbol(),
+            payload: self.read_model_id_array()
+        );
+    }
+
+    sem.NamedTypeRef read_named_type_ref(self) {
+        return sem.NamedTypeRef (
+            def_id: self.read_def(),
+            args: self.read_model_id_array(),
+            contract_names: self.read_optional_symbol_array()
+        );
+    }
+
+    sem.TraitCompanionTypeRef read_trait_companion_type_ref(self) {
+        return sem.TraitCompanionTypeRef (
+            trait_def: self.read_def(),
+            kind: trait_companion_kind_from_tag(self.read_int())
+        );
+    }
+
+    sem.LayeredTypeRef read_layered_type_ref(self) {
+        sem.TypeLayerKind kind = type_layer_kind_from_tag(self.read_int());
+        sem.NodeId element = self.read_model_id();
+        sem.SentinelKind sentinel_kind = sentinel_kind_from_tag(self.read_int());
+        return sem.LayeredTypeRef (
+            kind: kind,
+            element: element,
+            sentinel_kind: sentinel_kind,
+            sentinel_value: self.read_sentinel_value(sentinel_kind)
+        );
+    }
+
+    sem.ArrayTypeRef read_array_type_ref(self) {
+        sem.NodeId element = self.read_model_id();
+        sem.ArrayCountKind count_kind = array_count_kind_from_tag(self.read_int());
+        UInt64 count_value = self.read_array_count_value(count_kind);
+        sem.SentinelKind sentinel_kind = sentinel_kind_from_tag(self.read_int());
+        return sem.ArrayTypeRef (
+            element: element,
+            count_kind: count_kind,
+            count_value: count_value,
+            sentinel_kind: sentinel_kind,
+            sentinel_value: self.read_sentinel_value(sentinel_kind)
+        );
+    }
+
+    UInt64 read_array_count_value(self, sem.ArrayCountKind kind) {
+        if (kind == .const_name) { return UInt64(self.read_symbol().to_index()); }
+        return self.read_u64();
+    }
+
+    UInt64 read_sentinel_value(self, sem.SentinelKind kind) {
+        if (kind == .const_name) { return UInt64(self.read_symbol().to_index()); }
+        return self.read_u64();
+    }
+
+    sem.ErrorableTypeRef read_errorable_type_ref(self) {
+        return sem.ErrorableTypeRef (
+            value_type: self.read_model_id(),
+            error_type: self.read_optional_model_id()
+        );
+    }
+
+    sem.FunctionTypeRef read_function_type_ref(self) {
+        sem.NodeId[]& params = self.read_model_id_array();
+        sem.NodeId result = self.read_model_id();
+        sem.EffectSet effects = self.read_effect_set();
+        return sem.FunctionTypeRef (params: params, result: result, effects: effects);
+    }
+
+    sem.NodeId[]& read_model_id_array(self) {
+        unsafe {
+            Int count = self.read_int();
+            Int capacity = max_one(count);
+            sem.NodeId*! stored = self.store.model.storage.alloc_array<sem.NodeId>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = self.read_model_id();
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    qid.SymbolId[]& read_symbol_array(self) {
+        unsafe {
+            Int count = self.read_int();
+            Int capacity = max_one(count);
+            qid.SymbolId*! stored = self.store.model.storage.alloc_array<qid.SymbolId>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = self.read_symbol();
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    qid.SymbolId[]&? read_optional_symbol_array(self) {
+        if (!self.read_bool()) { return null; }
+        return self.read_symbol_array();
+    }
+
+    sem.CallArg[]& read_call_args(self) {
+        unsafe {
+            Int count = self.read_int();
+            Int capacity = max_one(count);
+            sem.CallArg*! stored = self.store.model.storage.alloc_array<sem.CallArg>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = sem.CallArg (
+                    label: self.read_optional_symbol(),
+                    value: self.read_model_id(),
+                    trailing: self.read_bool()
+                );
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.FieldInit[]& read_field_inits(self, Int count) {
+        unsafe {
+            Int capacity = max_one(count);
+            sem.FieldInit*! stored = self.store.model.storage.alloc_array<sem.FieldInit>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = sem.FieldInit (
+                    field_symbol: self.read_symbol(),
+                    value: self.read_model_id()
+                );
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.NodeId read_model_id(self) {
+        return sem.NodeId(self.owner_def, self.node_base + self.read_int());
+    }
+
+    sem.NodeId? read_optional_model_id(self) {
+        if (self.read_bool()) { return self.read_model_id(); }
+        return null;
+    }
+
+    qid.DefId? read_optional_def(self) {
+        if (self.read_bool()) { return self.read_def(); }
+        return null;
+    }
+
+    qid.SymbolId? read_optional_symbol(self) {
+        if (self.read_bool()) { return self.read_symbol(); }
+        return null;
+    }
+
+    qid.DefId read_def(self) {
+        if (self.read_bool()) {
+            qkey.StableSymbolId stable_id = qkey.StableSymbolId(self.read_u64(), self.read_u64());
+            if (self.store.incremental.current_def_for_stable(stable_id) is .some(def_id)) {
+                return def_id;
+            }
+            self.missing_stable_id = stable_id;
+            self.ok = false;
+            return qid.DefId.from_index(0);
+        }
+        return self.create_local_def(self.read_symbol());
+    }
+
+    qid.SymbolId read_symbol(self) {
+        Int length = self.read_int();
+        unsafe {
+            UInt8*! buffer = UInt8$.alloc(length + 1);
+            Int index! = 0;
+            while (index < length) {
+                buffer[index] = self.read_byte();
+                index = index + 1;
+            }
+            buffer[length] = 0;
+            UInt8* frozen = buffer$.as(UInt8*);
+            return self.store.symbols.intern(frozen[0..length]);
+        }
+    }
+
+    Bool read_bool(self) {
+        return self.read_byte() != 0;
+    }
+
+    sem.EffectSet read_effect_set(self) {
+        return sem.EffectSet(
+            has_unsafe: self.read_bool(),
+            has_async: self.read_bool(),
+            has_sync: self.read_bool(),
+            domain: self.read_optional_model_id(),
+            context: self.read_optional_model_id()
+        );
+    }
+
+    Int read_int(self) {
+        return Int(self.read_u64());
+    }
+
+    UInt64 read_u64(self) {
+        UInt64 value! = 0;
+        Int index! = 0;
+        while (index < 8) {
+            value = value | (UInt64(self.read_byte()) << UInt64(index * 8));
+            index = index + 1;
+        }
+        return value;
+    }
+
+    UInt8 read_byte(self) {
+        if (self.offset >= self.bytes.length) {
+            self.ok = false;
+            return 0;
+        }
+        UInt8 value = self.bytes[self.offset];
+        self.offset = self.offset + 1;
+        return value;
+    }
+}
+
+@region(a)
+struct TemplateWriter: Movable {
+    @life(a)
+    context.CompilerContext& ctx;
+    list.ArrayList<UInt8> bytes!;
+    Bool ok!;
+    init(self, context.CompilerContext& ctx) {
+        self.ctx = ctx;
+        self.bytes = list.ArrayList<UInt8>();
+        self.ok = true;
+    }
+
+    @life()
+    UInt8[]& finish(self) {
+        unsafe {
+            UInt8*! result = UInt8$.alloc(self.bytes.len() + 1);
+            Int index! = 0;
+            while (index < self.bytes.len()) {
+                result[index] = self.bytes.get(index);
+                index = index + 1;
+            }
+            result[self.bytes.len()] = 0;
+            UInt8* frozen = result$.as(UInt8*);
+            return frozen[0..self.bytes.len()];
+        }
+    }
+
+    () write_body(self, sem.Def& model_def) {
+        if (model_def.body is .some(ref _ body_ref)) {
+            self.write_bool(true);
+            self.write_model_id(body_ref.root);
+            self.write_int(body_ref.locals.len());
+            Int index! = 0;
+            while (index < body_ref.locals.len()) {
+                sem.Local& local = body_ref.locals.ref_at_index(index);
+                self.write_int(local.id.to_index());
+                self.write_int(local_kind_tag(local.kind));
+                self.write_symbol(local.symbol);
+                self.write_bool(local.mutable_binding);
+                self.write_bool(local.borrow_binding);
+                self.write_bool(local.mutable_borrow);
+                self.write_optional_model_id(local.type_ref);
+                index = index + 1;
+            }
+            self.write_nodes(model_def);
+            return;
+        }
+        self.write_bool(false);
+    }
+
+    () write_nodes(self, sem.Def& model_def) {
+        self.write_int(model_def.nodes.len());
+        Int index! = 0;
+        while (index < model_def.nodes.len()) {
+            sem.Node& node = model_def.nodes.ref_at(index);
+            self.write_int(node.id.local_index);
+            self.write_node_data(node.data);
+            index = index + 1;
+        }
+    }
+
+    () write_node_data(self, sem.NodeData data) {
+        if (data is .block(block)) { self.write_block(block); return; }
+        if (data is .name_ref(name_ref)) { self.write_name_ref(name_ref); return; }
+        if (data is .member_access(member)) { self.write_member_access(member); return; }
+        if (data is .index_access(index_access)) { self.write_index_access(index_access); return; }
+        if (data is .slice_access(slice_access)) { self.write_slice_access(slice_access); return; }
+        if (data is .struct_literal(literal)) { self.write_struct_literal(literal); return; }
+        if (data is .tuple_literal(literal)) {
+            self.write_model_id_array(Int(TemplateNodeTag.tuple_literal), literal.items);
+            return;
+        }
+        if (data is .array_literal(literal)) {
+            self.write_model_id_array(Int(TemplateNodeTag.array_literal), literal.items);
+            return;
+        }
+        if (data is .range_expr(range)) {
+            self.write_binary_ids(Int(TemplateNodeTag.range_expr), range.start, range.end);
+            return;
+        }
+        if (data is .inline_asm(inline_asm)) { self.write_inline_asm(inline_asm); return; }
+        if (data is .call(call)) { self.write_call(call); return; }
+        if (data is .implicit_call(call)) { self.write_implicit_call(call); return; }
+        if (data is .literal(literal)) { self.write_literal(literal); return; }
+        if (data is .let_stmt(let_stmt)) { self.write_let(let_stmt); return; }
+        if (data is .destructure_stmt(destructure)) { self.write_destructure(destructure); return; }
+        if (data is .defer_stmt(defer_stmt)) {
+            self.write_unary_id(Int(TemplateNodeTag.defer_stmt), defer_stmt.body);
+            return;
+        }
+        if (data is .guard_stmt(guard_stmt)) { self.write_guard(guard_stmt); return; }
+        if (data is .assign_stmt(assign_stmt)) { self.write_assign(assign_stmt); return; }
+        if (data is .return_stmt(return_stmt)) { self.write_return(return_stmt); return; }
+        if (data is .throw_stmt(throw_stmt)) {
+            self.write_unary_id(Int(TemplateNodeTag.throw_stmt), throw_stmt.value);
+            return;
+        }
+        if (data is .break_stmt) { self.write_tag(Int(TemplateNodeTag.break_stmt)); return; }
+        if (data is .continue_stmt) { self.write_tag(Int(TemplateNodeTag.continue_stmt)); return; }
+        if (data is .unary(unary)) { self.write_unary(unary); return; }
+        if (data is .binary(binary)) { self.write_binary(binary); return; }
+        if (data is .if_expr(if_expr)) { self.write_if(if_expr); return; }
+        if (data is .loop_expr(loop_expr)) { self.write_loop(loop_expr); return; }
+        if (data is .switch_expr(switch_expr)) { self.write_switch(switch_expr); return; }
+        if (data is .catch_expr(catch_expr)) { self.write_catch(catch_expr); return; }
+        if (data is .is_pattern(is_pattern)) {
+            self.write_binary_ids(Int(TemplateNodeTag.is_pattern), is_pattern.value, is_pattern.pattern);
+            return;
+        }
+        if (data is .binding_pattern(pattern)) { self.write_binding_pattern(pattern); return; }
+        if (data is .literal_pattern(pattern)) { self.write_literal_pattern(pattern); return; }
+        if (data is .optional_pattern(pattern)) {
+            self.write_tag(Int(TemplateNodeTag.optional_pattern));
+            self.write_optional_model_id(pattern.nested);
+            return;
+        }
+        if (data is .tuple_pattern(pattern)) {
+            self.write_tag(Int(TemplateNodeTag.tuple_pattern));
+            self.write_model_id_array_payload(pattern.items);
+            return;
+        }
+        if (data is .variant_pattern(pattern)) { self.write_variant_pattern(pattern); return; }
+        if (data is .wildcard_pattern) { self.write_tag(Int(TemplateNodeTag.wildcard_pattern)); return; }
+        if (data is .trait_companion_type_ref(companion)) {
+            self.write_trait_companion_type_ref(companion);
+            return;
+        }
+        if (data is .named_type_ref(named)) { self.write_named_type_ref(named); return; }
+        if (data is .layered_type_ref(layered)) { self.write_layered_type_ref(layered); return; }
+        if (data is .array_type_ref(array_type)) { self.write_array_type_ref(array_type); return; }
+        if (data is .errorable_type_ref(errorable)) { self.write_errorable_type_ref(errorable); return; }
+        if (data is .function_type_ref(function_type)) { self.write_function_type_ref(function_type); return; }
+        if (data is .tuple_type_ref(tuple_type)) {
+            self.write_model_id_array(Int(TemplateNodeTag.tuple_type_ref), tuple_type.items);
+            self.write_optional_symbol_array(tuple_type.contract_names);
+            return;
+        }
+        if (data is .infer_type_ref) { self.write_tag(Int(TemplateNodeTag.infer_type_ref)); return; }
+        if (data is .unit_type_ref) { self.write_tag(Int(TemplateNodeTag.unit_type_ref)); return; }
+        if (data is .invalid_type_ref) { self.write_tag(Int(TemplateNodeTag.invalid_type_ref)); return; }
+        if (data is .invalid) { self.write_tag(Int(TemplateNodeTag.invalid_node)); return; }
+        self.ok = false;
+        self.write_tag(Int(TemplateNodeTag.unit_type_ref));
+    }
+
+    () write_block(self, sem.Block block) {
+        self.write_tag(Int(TemplateNodeTag.block));
+        self.write_effect_set(block.effects);
+        self.write_model_id_array_payload(block.statements);
+        self.write_optional_model_id(block.result);
+    }
+
+    () write_name_ref(self, sem.NameRef name_ref) {
+        self.write_tag(Int(TemplateNodeTag.name_ref));
+        if (name_ref is .local(local_id)) {
+            self.write_int(Int(TemplateNameRefKind.local));
+            self.write_int(local_id.to_index());
+            return;
+        }
+        if (name_ref is .def_ref(def_id)) {
+            self.write_int(Int(TemplateNameRefKind.def_ref));
+            self.write_def(def_id);
+            return;
+        }
+        self.ok = false;
+        self.write_int(Int(TemplateNameRefKind.local));
+        self.write_int(0);
+    }
+
+    () write_member_access(self, sem.MemberAccess member) {
+        self.write_tag(Int(TemplateNodeTag.member_access));
+        self.write_model_id(member.base);
+        self.write_symbol(member.member_symbol);
+    }
+
+    () write_index_access(self, sem.IndexAccess index_access) {
+        self.write_binary_ids(Int(TemplateNodeTag.index_access), index_access.base, index_access.index);
+    }
+
+    () write_slice_access(self, sem.SliceAccess slice_access) {
+        self.write_tag(Int(TemplateNodeTag.slice_access));
+        self.write_model_id(slice_access.base);
+        self.write_optional_model_id(slice_access.start);
+        self.write_optional_model_id(slice_access.end);
+    }
+
+    () write_struct_literal(self, sem.StructLiteral literal) {
+        self.write_tag(Int(TemplateNodeTag.struct_literal));
+        self.write_model_id(literal.type_ref);
+        self.write_int(literal.fields.length);
+        Int index! = 0;
+        while (index < literal.fields.length) {
+            self.write_symbol(literal.fields[index].field_symbol);
+            self.write_model_id(literal.fields[index].value);
+            index = index + 1;
+        }
+    }
+
+    () write_inline_asm(self, sem.InlineAsm inline_asm) {
+        self.write_tag(Int(TemplateNodeTag.inline_asm));
+        self.write_model_id(inline_asm.result_type);
+        self.write_symbol(inline_asm.code_symbol);
+        self.write_int(inline_asm.operands.length);
+        Int index! = 0;
+        while (index < inline_asm.operands.length) {
+            self.write_inline_asm_operand(inline_asm.operands[index]);
+            index = index + 1;
+        }
+        self.write_symbol_array(inline_asm.clobbers);
+        self.write_bool(inline_asm.volatile);
+        self.write_bool(inline_asm.memory);
+        self.write_bool(inline_asm.noreturn);
+    }
+
+    () write_inline_asm_operand(self, sem.InlineAsmOperand operand) {
+        if (operand is .input(input)) {
+            self.write_int(1);
+            self.write_symbol(input.name);
+            self.write_symbol(input.constraint_symbol);
+            self.write_model_id(input.value);
+            return;
+        }
+        if (operand is .output(output)) {
+            self.write_int(2);
+            self.write_symbol(output.name);
+            self.write_symbol(output.constraint_symbol);
+            self.write_optional_model_id(output.type_ref);
+            return;
+        }
+        self.write_int(0);
+    }
+
+    () write_call(self, sem.Call call) {
+        self.write_tag(Int(TemplateNodeTag.call));
+        self.write_model_id(call.callee);
+        self.write_model_id_array_payload(call.type_args);
+        self.write_int(call.args.length);
+        Int index! = 0;
+        while (index < call.args.length) {
+            self.write_optional_symbol(call.args[index].label);
+            self.write_model_id(call.args[index].value);
+            self.write_bool(call.args[index].trailing);
+            index = index + 1;
+        }
+        if (call.target is .some(target)) {
+            self.write_bool(true);
+            self.write_def(target.def_id);
+            return;
+        }
+        self.write_bool(false);
+    }
+
+    () write_implicit_call(self, sem.ImplicitCall call) {
+        self.write_tag(Int(TemplateNodeTag.implicit_call));
+        self.write_model_id(call.base);
+        self.write_int(implicit_op_tag(call.op));
+        self.write_model_id_array_payload(call.args);
+        self.write_bool(call.optional_chain);
+    }
+
+    () write_literal(self, sem.Literal literal) {
+        self.write_tag(Int(TemplateNodeTag.literal));
+        self.write_literal_payload(literal);
+    }
+
+    () write_literal_payload(self, sem.Literal literal) {
+        if (literal.value is .int_value(value)) {
+            self.write_int(Int(TemplateLiteralKind.int_value));
+            self.write_u64(value.bits);
+            self.write_bool(value.signed_value);
+            return;
+        }
+        if (literal.value is .float_value(value)) {
+            self.write_int(Int(TemplateLiteralKind.float_value));
+            self.write_u64(float64_to_bits(value.value));
+            return;
+        }
+        if (literal.value is .bool_value(value)) {
+            self.write_int(Int(TemplateLiteralKind.bool_value));
+            self.write_bool(value);
+            return;
+        }
+        if (literal.value is .string_value(value)) {
+            self.write_int(Int(TemplateLiteralKind.string_value));
+            self.write_symbol(value);
+            return;
+        }
+        if (literal.value is .char_value(value)) {
+            self.write_int(Int(TemplateLiteralKind.char_value));
+            self.write_u64(UInt64(value));
+            return;
+        }
+        if (literal.value is .null_value) {
+            self.write_int(Int(TemplateLiteralKind.null_value));
+            return;
+        }
+        self.write_int(Int(TemplateLiteralKind.unit_value));
+    }
+
+    () write_let(self, sem.Let let_stmt) {
+        self.write_tag(Int(TemplateNodeTag.let_stmt));
+        self.write_int(let_stmt.local_id.to_index());
+        self.write_optional_model_id(let_stmt.initializer);
+    }
+
+    () write_destructure(self, sem.Destructure destructure) {
+        self.write_tag(Int(TemplateNodeTag.destructure_stmt));
+        self.write_model_id(destructure.pattern);
+        self.write_model_id(destructure.initializer);
+    }
+
+    () write_guard(self, sem.Guard guard_stmt) {
+        self.write_tag(Int(TemplateNodeTag.guard_stmt));
+        self.write_model_id(guard_stmt.condition);
+        self.write_model_id(guard_stmt.else_body);
+    }
+
+    () write_assign(self, sem.Assign assign_stmt) {
+        self.write_tag(Int(TemplateNodeTag.assign_stmt));
+        self.write_int(assign_op_tag(assign_stmt.op));
+        self.write_model_id(assign_stmt.target);
+        self.write_model_id(assign_stmt.value);
+    }
+
+    () write_return(self, sem.Return return_stmt) {
+        self.write_tag(Int(TemplateNodeTag.return_stmt));
+        self.write_optional_model_id(return_stmt.value);
+    }
+
+    () write_unary(self, sem.Unary unary) {
+        self.write_tag(Int(TemplateNodeTag.unary));
+        self.write_int(unary_op_tag(unary.op));
+        self.write_model_id(unary.value);
+    }
+
+    () write_binary(self, sem.Binary binary) {
+        self.write_tag(Int(TemplateNodeTag.binary));
+        self.write_int(binary_op_tag(binary.op));
+        self.write_model_id(binary.left);
+        self.write_model_id(binary.right);
+    }
+
+    () write_if(self, sem.If if_expr) {
+        self.write_tag(Int(TemplateNodeTag.if_expr));
+        self.write_model_id(if_expr.condition);
+        self.write_model_id(if_expr.then_body);
+        self.write_optional_model_id(if_expr.else_body);
+    }
+
+    () write_loop(self, sem.Loop loop_expr) {
+        self.write_tag(Int(TemplateNodeTag.loop_expr));
+        self.write_optional_model_id(loop_expr.condition);
+        self.write_optional_model_id(loop_expr.pattern);
+        self.write_optional_model_id(loop_expr.iterable);
+        self.write_model_id(loop_expr.body);
+    }
+
+    () write_switch(self, sem.Switch switch_expr) {
+        self.write_tag(Int(TemplateNodeTag.switch_expr));
+        self.write_model_id(switch_expr.value);
+        self.write_int(switch_expr.cases.length);
+        Int index! = 0;
+        while (index < switch_expr.cases.length) {
+            self.write_model_id_array_payload(switch_expr.cases[index].patterns);
+            self.write_model_id(switch_expr.cases[index].body);
+            index = index + 1;
+        }
+    }
+
+    () write_catch(self, sem.Catch catch_expr) {
+        self.write_tag(Int(TemplateNodeTag.catch_expr));
+        self.write_model_id(catch_expr.value);
+        self.write_optional_model_id(catch_expr.pattern);
+        self.write_model_id(catch_expr.body);
+    }
+
+    () write_binding_pattern(self, sem.BindingPattern pattern) {
+        self.write_tag(Int(TemplateNodeTag.binding_pattern));
+        self.write_int(pattern.local_id.to_index());
+    }
+
+    () write_literal_pattern(self, sem.LiteralPattern pattern) {
+        self.write_tag(Int(TemplateNodeTag.literal_pattern));
+        self.write_literal_payload(pattern.literal);
+    }
+
+    () write_variant_pattern(self, sem.VariantPattern pattern) {
+        self.write_tag(Int(TemplateNodeTag.variant_pattern));
+        self.write_optional_def(pattern.variant_def);
+        self.write_optional_symbol(pattern.member_symbol);
+        self.write_model_id_array_payload(pattern.payload);
+    }
+
+    () write_named_type_ref(self, sem.NamedTypeRef named) {
+        self.write_tag(Int(TemplateNodeTag.named_type_ref));
+        self.write_def(named.def_id);
+        self.write_model_id_array_payload(named.args);
+        self.write_optional_symbol_array(named.contract_names);
+    }
+
+    () write_trait_companion_type_ref(self, sem.TraitCompanionTypeRef companion) {
+        self.write_tag(Int(TemplateNodeTag.trait_companion_type_ref));
+        self.write_def(companion.trait_def);
+        self.write_int(trait_companion_kind_tag(companion.kind));
+    }
+
+    () write_layered_type_ref(self, sem.LayeredTypeRef layered) {
+        self.write_tag(Int(TemplateNodeTag.layered_type_ref));
+        self.write_int(type_layer_kind_tag(layered.kind));
+        self.write_model_id(layered.element);
+        self.write_int(sentinel_kind_tag(layered.sentinel_kind));
+        self.write_sentinel_value(layered.sentinel_kind, layered.sentinel_value);
+    }
+
+    () write_array_type_ref(self, sem.ArrayTypeRef array_type) {
+        self.write_tag(Int(TemplateNodeTag.array_type_ref));
+        self.write_model_id(array_type.element);
+        self.write_int(array_count_kind_tag(array_type.count_kind));
+        self.write_array_count_value(array_type.count_kind, array_type.count_value);
+        self.write_int(sentinel_kind_tag(array_type.sentinel_kind));
+        self.write_sentinel_value(array_type.sentinel_kind, array_type.sentinel_value);
+    }
+
+    () write_array_count_value(self, sem.ArrayCountKind kind, UInt64 value) {
+        if (kind == .const_name) {
+            self.write_symbol(qid.SymbolId(Int(value)));
+            return;
+        }
+        self.write_u64(value);
+    }
+
+    () write_sentinel_value(self, sem.SentinelKind kind, UInt64 value) {
+        if (kind == .const_name) {
+            self.write_symbol(qid.SymbolId(Int(value)));
+            return;
+        }
+        self.write_u64(value);
+    }
+
+    () write_errorable_type_ref(self, sem.ErrorableTypeRef errorable) {
+        self.write_tag(Int(TemplateNodeTag.errorable_type_ref));
+        self.write_model_id(errorable.value_type);
+        self.write_optional_model_id(errorable.error_type);
+    }
+
+    () write_function_type_ref(self, sem.FunctionTypeRef function_type) {
+        self.write_tag(Int(TemplateNodeTag.function_type_ref));
+        self.write_model_id_array_payload(function_type.params);
+        self.write_model_id(function_type.result);
+        self.write_effect_set(function_type.effects);
+    }
+
+    () write_model_id_array(self, Int tag, sem.NodeId[]& values) {
+        self.write_tag(tag);
+        self.write_model_id_array_payload(values);
+    }
+
+    () write_binary_ids(self, Int tag, sem.NodeId left, sem.NodeId right) {
+        self.write_tag(tag);
+        self.write_model_id(left);
+        self.write_model_id(right);
+    }
+
+    () write_unary_id(self, Int tag, sem.NodeId value) {
+        self.write_tag(tag);
+        self.write_model_id(value);
+    }
+
+    () write_tag(self, Int tag) {
+        self.write_int(tag);
+    }
+
+    () write_model_id_array_payload(self, sem.NodeId[]& values) {
+        self.write_int(values.length);
+        Int index! = 0;
+        while (index < values.length) {
+            self.write_model_id(values[index]);
+            index = index + 1;
+        }
+    }
+
+    () write_symbol_array(self, qid.SymbolId[]& values) {
+        self.write_int(values.length);
+        Int index! = 0;
+        while (index < values.length) {
+            self.write_symbol(values[index]);
+            index = index + 1;
+        }
+    }
+
+    () write_optional_symbol_array(self, qid.SymbolId[]&? values) {
+        if (values is .some(items)) {
+            self.write_bool(true);
+            self.write_symbol_array(items);
+            return;
+        }
+        self.write_bool(false);
+    }
+
+    () write_model_id(self, sem.NodeId id) {
+        self.write_int(id.local_index);
+    }
+
+    () write_optional_model_id(self, sem.NodeId? id) {
+        if (id is .some(value)) {
+            self.write_bool(true);
+            self.write_model_id(value);
+            return;
+        }
+        self.write_bool(false);
+    }
+
+    () write_optional_def(self, qid.DefId? def_id) {
+        if (def_id is .some(value)) {
+            self.write_bool(true);
+            self.write_def(value);
+            return;
+        }
+        self.write_bool(false);
+    }
+
+    () write_def(self, qid.DefId def_id) {
+        if (self.ctx.store.incremental.stable_id_for_def(def_id) is .some(stable_id)) {
+            self.write_bool(true);
+            self.write_u64(stable_id.low);
+            self.write_u64(stable_id.high);
+            return;
+        }
+        self.write_bool(false);
+        self.write_symbol(self.ctx.store.defs.get(def_id).name.symbol);
+    }
+
+    () write_optional_symbol(self, qid.SymbolId? symbol_id) {
+        if (symbol_id is .some(symbol)) {
+            self.write_bool(true);
+            self.write_symbol(symbol);
+            return;
+        }
+        self.write_bool(false);
+    }
+
+    () write_symbol(self, qid.SymbolId symbol_id) {
+        UInt8[]& text = self.ctx.store.symbols.text(symbol_id);
+        self.write_int(text.length);
+        self.write_bytes(text);
+    }
+
+    () write_bool(self, Bool value) {
+        if (value) { self.bytes.add(UInt8(1)); return; }
+        self.bytes.add(UInt8(0));
+    }
+
+    () write_effect_set(self, sem.EffectSet effects) {
+        self.write_bool(effects.has_unsafe);
+        self.write_bool(effects.has_async);
+        self.write_bool(effects.has_sync);
+        self.write_optional_model_id(effects.domain);
+        self.write_optional_model_id(effects.context);
+    }
+
+    () write_int(self, Int value) {
+        self.write_u64(UInt64(value));
+    }
+
+    () write_u64(self, UInt64 value) {
+        Int index! = 0;
+        while (index < 8) {
+            self.bytes.add(UInt8((value >> UInt64(index * 8)) & UInt64(255)));
+            index = index + 1;
+        }
+    }
+
+    () write_bytes(self, UInt8[]& value) {
+        Int index! = 0;
+        while (index < value.length) {
+            self.bytes.add(value[index]);
+            index = index + 1;
+        }
+    }
+}
+
+TemplateNodeTag? node_tag_from_int(Int value) {
+    if (value == Int(TemplateNodeTag.block)) { return TemplateNodeTag.block; }
+    if (value == Int(TemplateNodeTag.name_ref)) { return TemplateNodeTag.name_ref; }
+    if (value == Int(TemplateNodeTag.member_access)) { return TemplateNodeTag.member_access; }
+    if (value == Int(TemplateNodeTag.index_access)) { return TemplateNodeTag.index_access; }
+    if (value == Int(TemplateNodeTag.slice_access)) { return TemplateNodeTag.slice_access; }
+    if (value == Int(TemplateNodeTag.struct_literal)) { return TemplateNodeTag.struct_literal; }
+    if (value == Int(TemplateNodeTag.array_literal)) { return TemplateNodeTag.array_literal; }
+    if (value == Int(TemplateNodeTag.range_expr)) { return TemplateNodeTag.range_expr; }
+    if (value == Int(TemplateNodeTag.call)) { return TemplateNodeTag.call; }
+    if (value == Int(TemplateNodeTag.implicit_call)) { return TemplateNodeTag.implicit_call; }
+    if (value == Int(TemplateNodeTag.literal)) { return TemplateNodeTag.literal; }
+    if (value == Int(TemplateNodeTag.let_stmt)) { return TemplateNodeTag.let_stmt; }
+    if (value == Int(TemplateNodeTag.destructure_stmt)) { return TemplateNodeTag.destructure_stmt; }
+    if (value == Int(TemplateNodeTag.defer_stmt)) { return TemplateNodeTag.defer_stmt; }
+    if (value == Int(TemplateNodeTag.guard_stmt)) { return TemplateNodeTag.guard_stmt; }
+    if (value == Int(TemplateNodeTag.assign_stmt)) { return TemplateNodeTag.assign_stmt; }
+    if (value == Int(TemplateNodeTag.return_stmt)) { return TemplateNodeTag.return_stmt; }
+    if (value == Int(TemplateNodeTag.throw_stmt)) { return TemplateNodeTag.throw_stmt; }
+    if (value == Int(TemplateNodeTag.break_stmt)) { return TemplateNodeTag.break_stmt; }
+    if (value == Int(TemplateNodeTag.continue_stmt)) { return TemplateNodeTag.continue_stmt; }
+    if (value == Int(TemplateNodeTag.unary)) { return TemplateNodeTag.unary; }
+    if (value == Int(TemplateNodeTag.binary)) { return TemplateNodeTag.binary; }
+    if (value == Int(TemplateNodeTag.if_expr)) { return TemplateNodeTag.if_expr; }
+    if (value == Int(TemplateNodeTag.loop_expr)) { return TemplateNodeTag.loop_expr; }
+    if (value == Int(TemplateNodeTag.switch_expr)) { return TemplateNodeTag.switch_expr; }
+    if (value == Int(TemplateNodeTag.catch_expr)) { return TemplateNodeTag.catch_expr; }
+    if (value == Int(TemplateNodeTag.is_pattern)) { return TemplateNodeTag.is_pattern; }
+    if (value == Int(TemplateNodeTag.binding_pattern)) { return TemplateNodeTag.binding_pattern; }
+    if (value == Int(TemplateNodeTag.literal_pattern)) { return TemplateNodeTag.literal_pattern; }
+    if (value == Int(TemplateNodeTag.optional_pattern)) { return TemplateNodeTag.optional_pattern; }
+    if (value == Int(TemplateNodeTag.tuple_pattern)) { return TemplateNodeTag.tuple_pattern; }
+    if (value == Int(TemplateNodeTag.variant_pattern)) { return TemplateNodeTag.variant_pattern; }
+    if (value == Int(TemplateNodeTag.wildcard_pattern)) { return TemplateNodeTag.wildcard_pattern; }
+    if (value == Int(TemplateNodeTag.named_type_ref)) { return TemplateNodeTag.named_type_ref; }
+    if (value == Int(TemplateNodeTag.layered_type_ref)) { return TemplateNodeTag.layered_type_ref; }
+    if (value == Int(TemplateNodeTag.array_type_ref)) { return TemplateNodeTag.array_type_ref; }
+    if (value == Int(TemplateNodeTag.errorable_type_ref)) { return TemplateNodeTag.errorable_type_ref; }
+    if (value == Int(TemplateNodeTag.function_type_ref)) { return TemplateNodeTag.function_type_ref; }
+    if (value == Int(TemplateNodeTag.tuple_type_ref)) { return TemplateNodeTag.tuple_type_ref; }
+    if (value == Int(TemplateNodeTag.infer_type_ref)) { return TemplateNodeTag.infer_type_ref; }
+    if (value == Int(TemplateNodeTag.unit_type_ref)) { return TemplateNodeTag.unit_type_ref; }
+    if (value == Int(TemplateNodeTag.invalid_type_ref)) { return TemplateNodeTag.invalid_type_ref; }
+    if (value == Int(TemplateNodeTag.invalid_node)) { return TemplateNodeTag.invalid_node; }
+    if (value == Int(TemplateNodeTag.tuple_literal)) { return TemplateNodeTag.tuple_literal; }
+    if (value == Int(TemplateNodeTag.trait_companion_type_ref)) {
+        return TemplateNodeTag.trait_companion_type_ref;
+    }
+    if (value == Int(TemplateNodeTag.inline_asm)) { return TemplateNodeTag.inline_asm; }
+    return null;
+}
+
+Int trait_companion_kind_tag(sem.TraitCompanionKind kind) {
+    if (kind == .any) { return 1; }
+    if (kind == .vtable) { return 2; }
+    return 3;
+}
+
+sem.TraitCompanionKind trait_companion_kind_from_tag(Int tag) {
+    if (tag == 1) { return .any; }
+    if (tag == 2) { return .vtable; }
+    return .receiver;
+}
+
+TemplateNameRefKind? name_ref_kind_from_int(Int value) {
+    if (value == Int(TemplateNameRefKind.local)) { return TemplateNameRefKind.local; }
+    if (value == Int(TemplateNameRefKind.def_ref)) { return TemplateNameRefKind.def_ref; }
+    return null;
+}
+
+TemplateLiteralKind? literal_kind_from_int(Int value) {
+    if (value == Int(TemplateLiteralKind.int_value)) { return TemplateLiteralKind.int_value; }
+    if (value == Int(TemplateLiteralKind.float_value)) { return TemplateLiteralKind.float_value; }
+    if (value == Int(TemplateLiteralKind.bool_value)) { return TemplateLiteralKind.bool_value; }
+    if (value == Int(TemplateLiteralKind.string_value)) { return TemplateLiteralKind.string_value; }
+    if (value == Int(TemplateLiteralKind.char_value)) { return TemplateLiteralKind.char_value; }
+    if (value == Int(TemplateLiteralKind.null_value)) { return TemplateLiteralKind.null_value; }
+    if (value == Int(TemplateLiteralKind.unit_value)) { return TemplateLiteralKind.unit_value; }
+    return null;
+}
+
+Int local_kind_tag(sem.LocalKind kind) {
+    if (kind == .parameter) { return 1; }
+    if (kind == .generic_parameter) { return 2; }
+    if (kind == .local_variable) { return 3; }
+    return 4;
+}
+
+sem.LocalKind local_kind_from_tag(Int tag) {
+    if (tag == 1) { return .parameter; }
+    if (tag == 2) { return .generic_parameter; }
+    if (tag == 3) { return .local_variable; }
+    return .pattern_binding;
+}
+
+Int implicit_op_tag(sem.ImplicitOp op) {
+    if (op == .get) { return 1; }
+    if (op == .set) { return 2; }
+    if (op == .move) { return 3; }
+    if (op == .ref) { return 4; }
+    if (op == .addr) { return 5; }
+    if (op == .cast) { return 6; }
+    if (op == .dealloc) { return 7; }
+    if (op == .optional_some) { return 8; }
+    if (op == .destroy) { return 9; }
+    if (op == .size) { return 10; }
+    if (op == .align) { return 11; }
+    if (op == .max_align) { return 12; }
+    if (op == .ptr) { return 13; }
+    if (op == .forget) { return 14; }
+    if (op == .alloc) { return 15; }
+    if (op == .trait_new) { return 16; }
+    if (op == .trait_vtable) { return 17; }
+    if (op == .trait_receiver) { return 18; }
+    if (op == .mut_ref) { return 19; }
+    if (op == .mut_ptr) { return 20; }
+    if (op == .drop) { return 21; }
+    if (op == .async_call) { return 22; }
+    return 0;
+}
+
+sem.ImplicitOp implicit_op_from_tag(Int tag) {
+    if (tag == 1) { return .get; }
+    if (tag == 2) { return .set; }
+    if (tag == 3) { return .move; }
+    if (tag == 4) { return .ref; }
+    if (tag == 5) { return .addr; }
+    if (tag == 6) { return .cast; }
+    if (tag == 7) { return .dealloc; }
+    if (tag == 8) { return .optional_some; }
+    if (tag == 9) { return .destroy; }
+    if (tag == 10) { return .size; }
+    if (tag == 11) { return .align; }
+    if (tag == 12) { return .max_align; }
+    if (tag == 13) { return .ptr; }
+    if (tag == 14) { return .forget; }
+    if (tag == 15) { return .alloc; }
+    if (tag == 16) { return .trait_new; }
+    if (tag == 17) { return .trait_vtable; }
+    if (tag == 18) { return .trait_receiver; }
+    if (tag == 19) { return .mut_ref; }
+    if (tag == 20) { return .mut_ptr; }
+    if (tag == 21) { return .drop; }
+    if (tag == 22) { return .async_call; }
+    return .unknown;
+}
+
+Int assign_op_tag(sem.AssignOp op) {
+    if (op == .assign) { return 1; }
+    if (op == .add_assign) { return 2; }
+    if (op == .sub_assign) { return 3; }
+    if (op == .mul_assign) { return 4; }
+    if (op == .div_assign) { return 5; }
+    if (op == .mod_assign) { return 6; }
+    if (op == .bit_and_assign) { return 7; }
+    if (op == .bit_or_assign) { return 8; }
+    if (op == .bit_xor_assign) { return 9; }
+    if (op == .shift_left_assign) { return 10; }
+    return 11;
+}
+
+sem.AssignOp assign_op_from_tag(Int tag) {
+    if (tag == 1) { return .assign; }
+    if (tag == 2) { return .add_assign; }
+    if (tag == 3) { return .sub_assign; }
+    if (tag == 4) { return .mul_assign; }
+    if (tag == 5) { return .div_assign; }
+    if (tag == 6) { return .mod_assign; }
+    if (tag == 7) { return .bit_and_assign; }
+    if (tag == 8) { return .bit_or_assign; }
+    if (tag == 9) { return .bit_xor_assign; }
+    if (tag == 10) { return .shift_left_assign; }
+    return .shift_right_assign;
+}
+
+Int unary_op_tag(sem.UnaryOp op) {
+    if (op == .negate) { return 1; }
+    if (op == .not) { return 2; }
+    if (op == .bit_not) { return 3; }
+    if (op == .address_of) { return 4; }
+    if (op == .deref) { return 5; }
+    return 6;
+}
+
+sem.UnaryOp unary_op_from_tag(Int tag) {
+    if (tag == 1) { return .negate; }
+    if (tag == 2) { return .not; }
+    if (tag == 3) { return .bit_not; }
+    if (tag == 4) { return .address_of; }
+    if (tag == 5) { return .deref; }
+    return .new_value;
+}
+
+Int binary_op_tag(sem.BinaryOp op) {
+    if (op == .add) { return 1; }
+    if (op == .sub) { return 2; }
+    if (op == .mul) { return 3; }
+    if (op == .div) { return 4; }
+    if (op == .mod) { return 5; }
+    if (op == .bit_and) { return 6; }
+    if (op == .bit_or) { return 7; }
+    if (op == .bit_xor) { return 8; }
+    if (op == .logic_and) { return 9; }
+    if (op == .logic_or) { return 10; }
+    if (op == .coalesce) { return 11; }
+    if (op == .shift_left) { return 12; }
+    if (op == .shift_right) { return 13; }
+    if (op == .equal) { return 14; }
+    if (op == .not_equal) { return 15; }
+    if (op == .less) { return 16; }
+    if (op == .less_equal) { return 17; }
+    if (op == .greater) { return 18; }
+    return 19;
+}
+
+sem.BinaryOp binary_op_from_tag(Int tag) {
+    if (tag == 1) { return .add; }
+    if (tag == 2) { return .sub; }
+    if (tag == 3) { return .mul; }
+    if (tag == 4) { return .div; }
+    if (tag == 5) { return .mod; }
+    if (tag == 6) { return .bit_and; }
+    if (tag == 7) { return .bit_or; }
+    if (tag == 8) { return .bit_xor; }
+    if (tag == 9) { return .logic_and; }
+    if (tag == 10) { return .logic_or; }
+    if (tag == 11) { return .coalesce; }
+    if (tag == 12) { return .shift_left; }
+    if (tag == 13) { return .shift_right; }
+    if (tag == 14) { return .equal; }
+    if (tag == 15) { return .not_equal; }
+    if (tag == 16) { return .less; }
+    if (tag == 17) { return .less_equal; }
+    if (tag == 18) { return .greater; }
+    return .greater_equal;
+}
+
+Int type_layer_kind_tag(sem.TypeLayerKind kind) {
+    if (kind == .optional_type) { return 1; }
+    if (kind == .mutable_type) { return 2; }
+    if (kind == .reference) { return 3; }
+    if (kind == .owner_pointer) { return 4; }
+    if (kind == .raw_pointer) { return 5; }
+    return 7;
+}
+
+sem.TypeLayerKind type_layer_kind_from_tag(Int tag) {
+    if (tag == 1) { return .optional_type; }
+    if (tag == 2) { return .mutable_type; }
+    if (tag == 3) { return .reference; }
+    if (tag == 4) { return .owner_pointer; }
+    if (tag == 5) { return .raw_pointer; }
+    return .slice;
+}
+
+Int array_count_kind_tag(sem.ArrayCountKind kind) {
+    if (kind == .inferred) { return 1; }
+    if (kind == .const_name) { return 3; }
+    return 2;
+}
+
+sem.ArrayCountKind array_count_kind_from_tag(Int tag) {
+    if (tag == 1) { return .inferred; }
+    if (tag == 3) { return .const_name; }
+    return .int_lit;
+}
+
+Int sentinel_kind_tag(sem.SentinelKind kind) {
+    if (kind == .value) { return 1; }
+    if (kind == .wildcard) { return 2; }
+    if (kind == .const_name) { return 3; }
+    if (kind == .char_value) { return 4; }
+    if (kind == .bool_value) { return 5; }
+    return 0;
+}
+
+sem.SentinelKind sentinel_kind_from_tag(Int tag) {
+    if (tag == 1) { return .value; }
+    if (tag == 2) { return .wildcard; }
+    if (tag == 3) { return .const_name; }
+    if (tag == 4) { return .char_value; }
+    if (tag == 5) { return .bool_value; }
+    return .none;
+}
+
+Int max_one(Int value) {
+    if (value > 0) { return value; }
+    return 1;
+}
+
+UInt64 float64_to_bits(Float64 value) {
+    unsafe {
+        Float64*! input = Float64$.alloc(1);
+        UInt64*! output = UInt64$.alloc(1);
+        input[0] = value;
+        memory.copy_bytes(output[0]$.ptr()$.as(UInt8*), input[0]$.ptr()$.as(UInt8*), 8);
+        UInt64 result = output[0];
+        input$.dealloc();
+        output$.dealloc();
+        return result;
+    }
+}
+
+Float64 float64_from_bits(UInt64 bits) {
+    unsafe {
+        UInt64*! input = UInt64$.alloc(1);
+        Float64*! output = Float64$.alloc(1);
+        input[0] = bits;
+        memory.copy_bytes(output[0]$.ptr()$.as(UInt8*), input[0]$.ptr()$.as(UInt8*), 8);
+        Float64 result = output[0];
+        input$.dealloc();
+        output$.dealloc();
+        return result;
+    }
+}

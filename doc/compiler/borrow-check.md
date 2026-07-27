@@ -1,6 +1,6 @@
 # Borrow Check 设计
 
-borrow check 在 MIR 和 layout 之后运行。它消费 MIR 控制流、`TypeCheckStore` 类型事实和
+borrow check 在 JIL 和 layout 之后运行。它消费 JIL 控制流、`TypeCheckStore` 类型事实和
 `LayoutStore` 中的 concrete layout，不重新推导类型，不重新计算布局。
 
 Jiang 的 borrow check 处理所有权、move/use-after-move、引用逃逸、析构安全边界，以及
@@ -16,7 +16,7 @@ unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证�
 
 ## 输入
 
-- MIR locals、places、moves、borrows、assignments 和 CFG。
+- JIL locals、places、moves、borrows、assignments 和 CFG。
 - `TypeCheckStore` 中的 expression/local/member 类型事实。
 - `LayoutStore` 中的 copy/drop/layout 相关 concrete type 信息。
 - source map，用于把诊断定位回源码。
@@ -54,7 +54,7 @@ binding/place 的基本可写性由 type check 阶段检查：`T name!` 表示�
 
 ```text
 MovePath
-  place: MirPlace
+  place: jil.Place
   parent: MovePathId?
   children: MovePathId[]
 
@@ -78,7 +78,7 @@ TypeCheckStore
   LifetimeContract[FunctionType]
 ```
 
-`MovePath` 按 MIR place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
+`MovePath` 按 JIL place tree 建模。`x`、`x.field`、`x.field.inner` 是同一棵 move path tree
 里的不同节点。移动父 path 会使子 path 不可用；重新赋值父 path 会重新初始化整棵子树。
 
 moved/live dataflow 以 `MovePathId` 为下标存入 bitset。父 path 的清理通过 move-path child table
@@ -87,7 +87,7 @@ loan 仍是稀疏事实列表；StorageDead 清理先探测是否存在匹配事
 大量 scoped Task 时，清理成本与当前 local 的子树和实际事实数量相关，而不是与全函数 MovePath 数量
 相乘。
 
-`Loan` 表示某个 MIR location 产生的引用或指针视图。当前实现区分 shared reference、mutable
+`Loan` 表示某个 JIL location 产生的引用或指针视图。当前实现区分 shared reference、mutable
 reference 和 raw pointer view，并同时记录来源与承载该 view 的目标 place。引用 loan 既用于
 lifetime/逃逸检查，也用于 shared/mutable 冲突检查；raw pointer view 不参与别名排他性判断。
 
@@ -112,7 +112,7 @@ public region、tuple 元素和 callable 位置名称会解析为稳定 projecti
 ## 分析流程
 
 ```text
-build move paths from MIR places
+build move paths from JIL places
   -> compute copy/drop category from TypeCheckStore + LayoutStore
   -> forward dataflow: maybe-uninitialized / maybe-moved
   -> forward dataflow: active loans
@@ -121,8 +121,8 @@ build move paths from MIR places
   -> emit BorrowCheckStore
 ```
 
-MIR basic block 是 borrow check 的 CFG 单元。每条 statement/terminator 内部的位置用
-`MirLocation { block, statement_or_terminator_index }` 表达。
+JIL basic block 是 borrow check 的 CFG 单元。每条 statement/terminator 内部的位置用
+`jil.Location { block, statement_or_terminator_index }` 表达。
 
 ## Layout 的作用
 
@@ -134,16 +134,16 @@ layout 不决定 borrow 语义，但它会影响以下分类：
 - packed/alignment 规则是否限制对字段取引用。
 
 borrow check 通过 sema drop query 判断所有权/drop 语义，通过 `LayoutStore` 查询 field offset
-或 ABI layout；不能从 MIR 自己推导 ABI layout。
+或 ABI layout；不能从 JIL 自己推导 ABI layout。
 
 ## Drop 插入
 
 drop elaboration 不在 type check 或 layout 中完成，也不由 backend 临时推导。长期顺序固定为：
 
 ```text
-MIR lowering
+JIL lowering
   -> borrow check 验证已有 drop/隐式 drop 候选是否合法
-  -> drop elaboration 改写 MIR，插入具体 drop/deinit CFG
+  -> drop elaboration 改写 JIL，插入具体 drop/deinit CFG
   -> backend
 ```
 
@@ -160,19 +160,19 @@ drop elaboration 先读取 sema drop query。是否需要 runtime drop 由 owner
 - `trivial_drop` / `recursive_drop`：插入字段/owner pointer 的自动 drop 路径。
 - `custom_drop`：先调用 nominal type 的 `deinit`，再按语言规则插入自动递归字段析构。
 
-`custom_drop` 的事实来自 HIR owner 上的 `custom_deinit_def`。resolve 只记录该 fact；
-layout 根据 fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 MIR 层展开。
+`custom_drop` 的事实来自 Semantic Model owner 上的 `custom_deinit_def`。resolve 只记录该 fact；
+layout 根据 fact 返回 `custom_drop`；真正调用哪个 deinit body 由 drop elaboration 在 JIL 层展开。
 
 ## 诊断
 
-诊断必须通过 source map 回到 HIR/source 位置：
+诊断必须通过 source map 回到 Semantic Model/source 位置：
 
 - move 发生的位置。
 - use-after-move 的使用位置。
 - 引用来源 owner 的定义/最后有效位置。
 - 引用逃逸的位置。
 
-MIR 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap` 查询。
+JIL 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap` 查询。
 
 ## 边界
 
@@ -180,7 +180,7 @@ MIR 不保存 AST id；需要源码定位时通过 lowering 写入的 `SourceMap
 - borrow check 不重新做 name resolution。
 - borrow check 不重新 type check。
 - borrow check 不自己计算 field offset 或 ABI layout。
-- borrow check 的诊断通过 HIR/source map 定位，不要求 MIR 保存 AST id。
+- borrow check 的诊断通过 Semantic Model/source map 定位，不要求 JIL 保存 AST id。
 
 ## 待设计
 

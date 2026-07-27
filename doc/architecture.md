@@ -9,13 +9,13 @@ Jiang 编译器围绕稳定的阶段边界组织。本文只保留整体架构�
 driver/cli -> pipeline.compile
                 |
                 v
-        source/package -> lang registry -> syntax parse -> module graph/resolve -> HIR
+        source/package -> lang registry -> syntax parse -> module graph/resolve -> Semantic Model
                               |                 |                 |
                               v                 v                 v
                        provider dylib      public syntax       early comptime
                          prepare           expansion           source select
 
-        HIR -> type facts + const values -> monomorph instances -> MIR -> checked MIR -> backend output
+        Semantic Model -> type facts + const values -> monomorph instances -> JIL -> checked JIL -> backend output
                  \                    \              \             \          \
                   --------------------- layout facts --------------------------
 ```
@@ -27,26 +27,26 @@ driver/cli -> pipeline.compile
   补全 package 级 registry。`#alias { ... }` 优先匹配 compiler builtin provider；否则调用
   manifest dependency 中的 `type = lang` provider。provider 返回 public syntax tree，compiler
   转换为内部 AST。
-- `HIR`：resolve 直接生成的未类型化语义树。
+- `Semantic Model`：resolve 直接生成的未类型化语义树。
 - `type facts + const values`：`TypeCheckStore` 和 `ComptimeStore`。早期 `comptime if`
-  source selection 在 resolve/HIR lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
+  source selection 在 resolve/Semantic Model lower 中完成，const value 在 sema 中写入 `ComptimeStore`。
 - `monomorph instances`：type check 之后收集的 concrete generic instance 集合。
-- `MIR`：HIR lowering 生成的 CFG。
-- `checked MIR`：borrow check 后经过 drop elaboration 的 MIR。
+- `JIL`：Semantic Model lowering 生成的 CFG。
+- `checked JIL`：borrow check 后经过 drop elaboration 的 JIL。
 - `backend output`：LLVM IR、object file 或 executable。
-- `layout facts`：由 HIR、type facts 和 target layout 按需查询得到，供 MIR、borrow/drop 和
+- `layout facts`：由 Semantic Model、type facts 和 target layout 按需查询得到，供 JIL、borrow/drop 和
   backend 使用。
 
-当前 root module 加载前会先加载 `src/core/core.jiang`。core 源码声明 compiler-known
+当前 root module 加载前会先加载 `src/core.jiang`。core 源码声明 compiler-known
 trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`
 intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。
 
-`layout` 是 store 层事实，不从 MIR body 生成。它消费 HIR、`TypeCheckStore`、
-`MonomorphStore` 和 target layout。MIR lowering、borrow check、drop elaboration
+`layout` 是 store 层事实，不从 JIL body 生成。它消费 Semantic Model、`TypeCheckStore`、
+`MonomorphStore` 和 target layout。JIL lowering、borrow check、drop elaboration
 和 backend 都可以按需查询 layout；各阶段不能绕过 `LayoutStore` 自己推导 field offset、size
 或 ABI 表达。
 
-`--check` 当前仍会跑到 MIR、borrow check 和 drop elaboration，保证源码级语言契约不只停在
+`--check` 当前仍会跑到 JIL、borrow check 和 drop elaboration，保证源码级语言契约不只停在
 type check。
 
 ## 架构规则
@@ -56,8 +56,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 
 ### 总原则
 
-- 编译器内部数据按事实表组织，不让 AST/HIR/MIR 节点直接持有跨阶段复杂对象。
-- `DefId`、`HirId`、`TypeId`、`LayoutId`、`MirFunctionId` 都是 session-local handle。
+- 编译器内部数据按事实表组织，不让 AST/Semantic Model/JIL 节点直接持有跨阶段复杂对象。
+- `DefId`、`sem.NodeId`、`TypeId`、`LayoutId`、`jil.FunctionId` 都是 session-local handle。
 - 跨次编译身份统一使用 `StableKey`，不能写入 session-local ID。
 - fingerprint 只表示内容摘要，artifact cache key 只能由 `StableKey` 和编译配置组合计算得到。
 - 每个事实只能有一个 owner store；其他模块只能查询或引用，不能复制一份并长期维护。
@@ -75,60 +75,56 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 - `lang`
   - 生产：lang provider registry、provider dynamic library handle、public syntax tree expansion。
   - 消费：package manifest、artifact cache、host dynamic library loader、`std.jiang.syntax.Provider`。
-  - 禁止：生成 HIR/MIR/backend IR、依赖普通 import/name resolve 查找 provider。
+  - 禁止：生成 Semantic Model/JIL/backend IR、依赖普通 import/name resolve 查找 provider。
 - `resolve`
-  - 生产：core/module graph、namespace、`DefId`、名字绑定、HIR。
+  - 生产：core/module graph、namespace、`DefId`、名字绑定、Semantic Model。
   - 消费：AST、source、package manifest、compiler-known core root。
-  - 禁止：类型推导、layout、MIR/backend 逻辑。
-- `hir`
-  - 生产：resolved untyped HIR、HIR store。
-  - 消费：resolve facts。
-  - 禁止：保存 type check side table、layout、backend symbol。
+  - 禁止：类型推导、layout、JIL/backend 逻辑。
 - `type_check`
-  - 生产：`TypeCheckStore`、trait/overload/type facts、typed HIR operation、builtin operation lowering kind、
+  - 生产：`TypeCheckStore`、trait/overload/type facts、typed Semantic Model operation、builtin operation lowering kind、
     trait companion type facts、const initializer 的 `ComptimeValue`。
-  - 消费：HIR、resolve facts。
-  - 允许：保留 `HirId` 原位把普通 call/wrapper 规范化为 typed HIR operation；相关类型与选择结果仍写入
+  - 消费：Semantic Model、resolve facts。
+  - 允许：保留 `sem.NodeId` 原位把普通 call/wrapper 规范化为 typed Semantic Model operation；相关类型与选择结果仍写入
     `TypeCheckStore`。
-  - 禁止：重新 resolve 名字、计算 ABI layout、生成 MIR。
+  - 禁止：重新 resolve 名字、计算 ABI layout、生成 JIL。
 - `comptime`
   - 生产：早期 source selection 结果，以及 `ComptimeStore` 中的 `DefId -> ComptimeValue`。
   - 消费：AST、resolve facts、type facts。
-  - 禁止：执行运行时副作用、生成 MIR/backend 节点、把 `ComptimeValue` 泄漏到 backend。
-  - 备注：`comptime if` 的 top-level item 选择目前嵌在 resolve/name resolver 和 HIR lowering
+  - 禁止：执行运行时副作用、生成 JIL/backend 节点、把 `ComptimeValue` 泄漏到 backend。
+  - 备注：`comptime if` 的 top-level item 选择目前嵌在 resolve/name resolver 和 Semantic Model lowering
     中，通过 `CompileSelector` 判断条件；`ComptimeStore` 本身只保存 const value。
 - `monomorph`
   - 生产：concrete generic instance 集合。
-  - 消费：type facts、HIR generic template。
+  - 消费：type facts、Semantic Model generic template。
   - 禁止：生成目标代码、修改 type facts。
-- `mir`
+- `jil`
   - 生产：CFG、local、place、rvalue、terminator。
-  - 消费：HIR、type facts、builtin operation lowering kind、monomorph、layout query。
+  - 消费：Semantic Model、type facts、builtin operation lowering kind、monomorph、layout query。
   - 禁止：重新 resolve/type check、按源码文本重新判断 builtin operation、写 backend symbol。
-  - 备注：`Trait.Any` 动态调用、`Trait.VTable` slot 和 `Trait.Receiver` 构造在 MIR lowering
-    中消费 type check 已选出的 companion facts，不在 MIR 里重新做 trait lookup。
+  - 备注：`Trait.Any` 动态调用、`Trait.VTable` slot 和 `Trait.Receiver` 构造在 JIL lowering
+    中消费 type check 已选出的 companion facts，不在 JIL 里重新做 trait lookup。
 - `layout`
   - 生产：size、align、field index、ABI representation，包括 `Trait.Any` / `Trait.VTable` /
     `Trait.Receiver` 的 erased runtime representation。
   - 消费：TypeId、type facts、target data layout。
-  - 禁止：类型推导、读取 MIR 控制流、插入 drop。
+  - 禁止：类型推导、读取 JIL 控制流、插入 drop。
 - `borrow_check`
   - 生产：borrow/drop safety 结果。
-  - 消费：MIR、type facts、layout。
-  - 禁止：修改 HIR/type facts、处理数据竞争策略。
+  - 消费：JIL、type facts、layout。
+  - 禁止：修改 Semantic Model/type facts、处理数据竞争策略。
 - `drop_elaborate`
-  - 生产：elaborated MIR CFG。
-  - 消费：MIR、borrow store、drop/layout query。
+  - 生产：elaborated JIL CFG。
+  - 消费：JIL、borrow store、drop/layout query。
   - 禁止：重新判断类型规则、生成 backend-only 节点。
 - `backend`
   - 生产：LLVM IR、object、executable。
-  - 消费：elaborated MIR、layout、target、symbols。
-  - 禁止：语言语义判断、HIR fallback、修改 MIR/layout。
+  - 消费：elaborated JIL、layout、target、symbols。
+  - 禁止：语言语义判断、Semantic Model fallback、修改 JIL/layout。
 - `incremental`
-  - 生产：`StableKey`、fingerprint、source interface / HIR template / object artifact metadata、
+  - 生产：`StableKey`、fingerprint、source interface / Semantic Model template / object artifact metadata、
     package-level artifact key/path。
   - 消费：source、interface、object artifact。
-  - 禁止：缓存 session-local HIR/type/MIR 对象。
+  - 禁止：缓存 session-local Semantic Model/type/JIL 对象。
 
 如果某个实现需要违反上述 contract，优先修改前一阶段产出的事实，
 而不是在后一阶段补临时逻辑。
@@ -159,7 +155,7 @@ CompilerStore
   typeck
   comptime_store
   resolve
-  hirs
+  model
   layouts
   artifacts
   object_artifacts
@@ -177,31 +173,32 @@ CompilerStore
 - 阶段产物只有确实被多个后续阶段消费时才挂入 `CompilerStore`。
 - `syntax.Store` 是单次 compilation 的 parse cache，不作为跨阶段长期语义 store。
 - `ResolveStore` 保存 package、module、namespace、import/export 和 def store，是名字事实 owner。
-- `HirStore` 保存每个 `DefId` 的 HIR signature/body，是 HIR 事实 owner。
+- `sem_store.Store` 保存每个 `DefId` 的 Semantic Model signature/body，是 Semantic Model 事实 owner。
 - `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
 - `TypeCheckStore` 保存 node/def/call/pattern 的类型事实，不和 `TypeStore` 合并所有权语义。
 - `ComptimeStore` 保存 `DefId -> ComptimeValue` 的编译期常量事实。它只服务 sema、
-  public interface artifact 和 HIR->MIR lowering；MIR 之后的阶段只能看 `MirConst`、
-  `MirGlobal` 和 `MirStaticValue`。
-- `src/core` 是 compiler-known 源码入口，不作为用户可 import package；core 中的
+  public interface artifact 和 Semantic Model->JIL lowering；JIL 之后的阶段只能看 `jil.Const`、
+  `jil.Global` 和 `jil.StaticValue`。
+- `src/core.jiang` 是 compiler-known 源码入口，`src/core/` 保存它导入的实现文件。core
+  不作为用户可 import package；其中的
   body-less trait implementation 只声明 builtin type 的 trait 关系，具体 lowering 仍由
-  type check / MIR / layout 的 compiler-known facts 承接。
+  type check / JIL / layout 的 compiler-known facts 承接。
 - `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
-- `MonomorphStore`、`MirStore` 和 `BorrowCheckStore` 是单次 pipeline 中的阶段产物，
-  不挂在 `CompilerStore` 上；backend 直接消费 drop elaboration 后的 `MirStore`，
-  不维护一份等价 MIR。
+- `MonomorphStore`、`jil.Store` 和 `BorrowCheckStore` 是单次 pipeline 中的阶段产物，
+  不挂在 `CompilerStore` 上；backend 直接消费 drop elaboration 后的 `jil.Store`，
+  不维护一份等价 JIL。
 - `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
 
 ### Pass 规则
 
 - 每个 pass 必须有明确输入和输出，不能顺手修复其他阶段遗漏的语义。
 - pass 可以查询上游事实，但不能修改上游事实表。
-- pass 修改 MIR 时只产生普通 MIR block、statement 和 terminator。
-- backend 只能消费最终 elaborated MIR。
-- backend 不消费 `ComptimeValue`。标量 const 必须在 MIR lowering 前降成 `MirConst`；
-  复合 const 作为运行时值使用时，必须先 materialize 成 readonly `MirGlobal`。
-- 如果 backend 需要理解语言级结构，说明 MIR 还没有表达清楚。
-- layout query 可以被 MIR、borrow/drop 和 backend 使用，但 field offset/size/align 只能来自
+- pass 修改 JIL 时只产生普通 JIL block、statement 和 terminator。
+- backend 只能消费最终 elaborated JIL。
+- backend 不消费 `ComptimeValue`。标量 const 必须在 JIL lowering 前降成 `jil.Const`；
+  复合 const 作为运行时值使用时，必须先 materialize 成 readonly `jil.Global`。
+- 如果 backend 需要理解语言级结构，说明 JIL 还没有表达清楚。
+- layout query 可以被 JIL、borrow/drop 和 backend 使用，但 field offset/size/align 只能来自
   `LayoutStore`。
 
 ### 开发检查清单
@@ -228,21 +225,22 @@ CompilerStore
   intrinsic 声明；它不参与用户 import 解析。
 - `syntax` 只产生 token 和 AST；详见 [AST 设计](compiler/ast.md)。
 - `diagnostic` 负责诊断数据结构、终端输出和未来 LSP 位置转换。
-- `source_map` 属于 `source` 模块，保存 `DefId` / `HirId` 到源码 span 的定位事实。
-- `resolve` 负责 import、module graph、namespace 和名字解析，并直接生成 HIR；
+- `source_map` 属于 `source` 模块，保存 `DefId` / `sem.NodeId` 到源码 span 的定位事实。
+- `resolve` 负责 import、module graph、namespace 和名字解析，并直接生成 Semantic Model；
   详见 [Resolve 设计](compiler/resolve.md)。
-- `hir` 包含 resolved、未类型化的语义树；详见 [HIR 设计](compiler/hir.md)。
-- `sema` 负责类型检查、trait、generic、overload 和类型转换；
+- `sema/model.jiang` 与 `sema/model/` 保存 resolved、未类型化的 Semantic Model；
+  详见 [Semantic Model 设计](compiler/semantic-model.md)。
+- `sema` 还负责类型检查、trait、generic、overload 和类型转换；
   详见 [Type Check 设计](compiler/type-check.md)。
 - `monomorph` 运行在 type check 之后，负责收集 concrete generic instances；
   详见 [Monomorph 设计](compiler/monomorph.md)。
-- `mir` 包含 MIR 数据定义、HIR -> MIR lowering 和 drop elaboration；MIR lowering 可以查询
+- `jil` 包含 JIL 数据定义、Semantic Model -> JIL lowering 和 drop elaboration；JIL lowering 可以查询
   layout 做布局相关的 representation 决策，但 layout 仍由 `layout` 模块统一计算；
-  详见 [MIR 设计](compiler/mir.md)。
+  详见 [JIL 设计](compiler/jil.md)。
 - `layout` 负责 concrete type layout 查询和缓存；详见 [Layout 设计](compiler/layout.md)。
-- `borrow_check` 消费 MIR、`TypeCheckStore` 和 layout；详见
+- `borrow_check` 消费 JIL、`TypeCheckStore` 和 layout；详见
   [Borrow Check 设计](compiler/borrow-check.md)。
-- `backend` 把 elaborated MIR 和 layout 转成 LLVM IR、object file 或可执行产物；
+- `backend` 把 elaborated JIL 和 layout 转成 LLVM IR、object file 或可执行产物；
   详见 [Backend 设计](compiler/backend.md)。
 - `incremental` 负责 hashing、cache key、依赖图和复用策略；详见
   [Incremental Compilation 设计](compiler/incremental.md)。
@@ -259,47 +257,60 @@ CompilerStore
 
 `CompilerStore` 是跨阶段事实集合的生命周期所有者。具体 entry/key 类型仍由 owner 模块定义。
 
-- `store/api.jiang` 定义 `CompilerStore`。
+- `store.jiang` 定义 `CompilerStore`。
 - `resolve/interner.jiang` 定义 `SymbolStore`；关键字分类是 symbol 的附加事实。
 - `resolve/def.jiang` 定义 `DefKind`、`Visibility`、`NameDomain`、`DefRecord` 和 `DefStore`。
 - `resolve/namespace.jiang` 定义持久 namespace、namespace binding 和 lookup key。
 - `resolve/store.jiang` 组合 package/module、import/export 和 namespace store。
 - `ResolveStore.modules` 是 `ModuleId -> ModuleRecord` 主表。
 - `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的辅助 store。
-- `HirStore`、`TypeStore`、`TypeCheckStore`、`LayoutStore` 和 `IncrementalSymbolStore`
+- `sem_store.Store`、`TypeStore`、`TypeCheckStore`、`LayoutStore` 和 `IncrementalSymbolStore`
   都挂在 `CompilerStore`。
 - `SourceArtifactCache`、`ObjectArtifactCache` 和 `QueryDependencyGraph` 也挂在
   `CompilerStore`，用于 artifact 复用统计、object 复用和 query dependency 记录。
-- `MonomorphStore`、`MirStore`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
+- `MonomorphStore`、`jil.Store`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
   调用中的阶段产物。
 - `syntax.Store` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
 - cache-backed query dependency tracking 后续按实际 artifact cache 需求继续收敛；当前不保留未接入的 cache 骨架。
-- 后续需要缓存或依赖追踪的跨阶段问题，再在 `store/api.jiang` 增加高阶查询入口。
+- 后续需要缓存或依赖追踪的跨阶段问题，再在 `store.jiang` 增加高阶查询入口。
 
 ## 源码目录
 
 ```text
 src/
+  source.jiang  source 模块稳定入口
   driver/       CLI 参数和命令入口
   source/       package、source file、source manager、source map
+  syntax.jiang  syntax 阶段稳定入口
   syntax/       token、lexer、parser、flat AST
+  lang.jiang    lang provider 稳定入口
   lang/         lang package registry、wrapper dylib、provider runtime bridge
   artifact/     source .ji、object key、package artifact key/path、fingerprint
+  diagnostic.jiang  诊断数据模型入口
   diagnostic/   diagnostic、reporter
+  builtin.jiang compiler-known builtin 初始化入口
   builtin/      compiler-known builtin type、trait 和 intrinsic 初始化
-  core/         compiler-known core 源码入口、builtin trait/type 外壳、intrinsic 声明
+  core.jiang    compiler-known core 源码入口
+  core/         builtin trait/type 外壳、intrinsic 声明
   resolve/      symbol store、keyword store、import/module/name resolver
   sema/         type store、trait、generic、overload、type check、comptime、monomorph
+    model.jiang Semantic Model 稳定入口
+    model/      Semantic Model store
     comptime/   source selection、const value evaluator/interpreter、ComptimeStore
     generic/    generic substitution 和实例化辅助
     type_check/ type check 主体、类型事实和调用/模式/表达式 side table
-  hir/          HIR 数据结构和 HIR store
-  mir/          MIR 数据结构和 HIR -> MIR lowering
+  jil.jiang     JIL 数据模型稳定入口
+  jil/          JIL 数据结构和 Semantic Model -> JIL lowering
+  layout.jiang  concrete type layout 数据模型入口
   layout/       concrete type layout 查询层
+  borrow_check.jiang  borrow check 阶段入口
   borrow_check/ ownership、loan、lifetime 和 drop safety 检查
+  backend.jiang 后端输出编排入口
   backend/      target、output、codegen unit、link plan 和后端入口
+    llvm.jiang  LLVM backend 入口
     llvm/       LLVM IR/object emission
   incremental/  cache key、fingerprint、依赖图、symbol store
+  store.jiang   CompilerStore 入口
   store/        compiler store 和 session-local id
   system/       host/target OS、filesystem、process、dynamic library、target info
   support/      arena、list、hash、unicode 等通用工具
@@ -341,7 +352,7 @@ public trait Indexable {
 - 常量使用 `SCREAMING_SNAKE_CASE`。
 - 缩写词按普通单词处理，只首字母大写：
   - 使用 `CompilerStore`，不要用 `CompilerSTORE`。
-  - 使用 `ModuleId`、`DefId`、`AstId`、`MirId`。
+  - 使用 `ModuleId`、`DefId`、`AstId`、`sem.NodeId`、`jil.FunctionId`。
   - 使用 `LspServer`、`Utf8`、`Utf16`。
 - 文件名使用 lower snake case：`source_manager.jiang`、`type_check.jiang`。
 - 数据/模型文件优先使用名词：`token.jiang`、`type.jiang`。

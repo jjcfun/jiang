@@ -3,7 +3,7 @@
 Jiang 的 DSL 机制是 syntax-stage provider expansion。lexer 看到 `#alias { ... }` 后创建
 per-block provider 实例并调用 `scan` 决定 block 边界；parser 后续读到 `raw_block` token 时调用
 同一 provider 的 `parse`，再把 public syntax tree 转成 compiler 内部 AST。DSL provider 不生成
-HIR、MIR 或 backend IR；它只把外部语法片段翻译成 Jiang 语法层能表示的 syntax tree。
+Semantic Model、JIL 或 backend IR；它只把外部语法片段翻译成 Jiang 语法层能表示的 syntax tree。
 
 ## Goal
 
@@ -58,14 +58,14 @@ Jiang source
   -> Jiang lexer creates provider and scans raw block
   -> Jiang parser calls provider.parse at raw_block
   -> src/syntax/ast.jiang
-  -> resolve/HIR/sema/MIR/backend
+  -> resolve/Semantic Model/sema/JIL/backend
 
 DSL source
   -> raw_block token with block id
   -> lang provider
   -> std.jiang.syntax.Tree
   -> validate/convert into src/syntax/ast.jiang
-  -> resolve/HIR/sema/MIR/backend
+  -> resolve/Semantic Model/sema/JIL/backend
 ```
 
 也就是说，`#alias { ... }` 不会进入内部 AST 成为占位节点。lexer 只产出 provider path 和
@@ -239,7 +239,7 @@ provider 需要保留 source span。对于从 DSL 原文生成的节点，应使
 
 公开 syntax tree 不包含：
 
-- HIR/MIR/backend IR。
+- Semantic Model/JIL/backend IR。
 - `DefId`、`TypeId`、内部 token range。
 - compiler-only intrinsic block。
 - 已废弃或内部兼容用的 compile-if 节点。
@@ -258,4 +258,4 @@ DSL provider 返回 syntax tree 后，validator/converter 负责：
 - 把 public syntax node 转换成 `src/syntax/ast.jiang` 内部 AST。
 - 对不支持或不合法的 public syntax tree 结构产生 parser/syntax 诊断。
 
-后续 resolve、type check、MIR 和 backend 不区分这些节点来自 Jiang source 还是 lang provider。
+后续 resolve、type check、JIL 和 backend 不区分这些节点来自 Jiang source 还是 lang provider。

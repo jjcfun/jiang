@@ -1,11 +1,11 @@
 # Backend 设计
 
-backend 消费 elaborated MIR 和 layout，生成目标产物。当前 LLVM backend 放在 `backend/llvm`；
-LLVM-specific lowering 不写进 MIR 或 layout。
+backend 消费 elaborated JIL 和 layout，生成目标产物。当前 LLVM backend 放在 `backend/llvm`；
+LLVM-specific lowering 不写进 JIL 或 layout。
 
 ## 输入
 
-- MIR function bodies。
+- JIL function bodies。
 - `LayoutStore` 中的 concrete type layout。
 - monomorph `MonomorphStore`。
 - target 配置。
@@ -13,7 +13,7 @@ LLVM-specific lowering 不写进 MIR 或 layout。
 
 ## LLVM 关系
 
-LLVM IR 是 backend 产物，不是 MIR 的替代品。MIR 保留 Jiang 语义、控制流、place、local 和
+LLVM IR 是 backend 产物，不是 JIL 的替代品。JIL 保留 Jiang 语义、控制流、place、local 和
 类型事实引用；LLVM lowering 负责把这些语义映射到 LLVM type、value、basic block 和 symbol。
 
 backend-specific symbol/mangling 从 `BackendSymbolKey` 派生。key 包含：
@@ -24,7 +24,7 @@ backend-specific symbol/mangling 从 `BackendSymbolKey` 派生。key 包含：
 - concrete type args
 - runtime entry flag
 
-这层 symbol 只服务目标代码生成，不应该反向写入 MIR。普通 Jiang 函数会 mangling 成
+这层 symbol 只服务目标代码生成，不应该反向写入 JIL。普通 Jiang 函数会 mangling 成
 `_Jp<package>_m<module>_f<def>` 形态，并在泛型实例后追加 concrete type args。这样不同
 package/module 中同名函数不会在 LLVM module 里冲突。
 
@@ -73,7 +73,7 @@ compatibility provider：
   避免把 POSIX 固定成 hosted libc。
 - no-libc provider 不能通过 hosted libc ABI 间接依赖 libc；它必须走 syscall、compiler
   intrinsic、inline asm、Wasm host import 或 target runtime object。inline asm 基础链路已经通过
-  builtin provider `#asm` / `#jiang.asm` 接入语法、HIR、MIR 和 LLVM lowering；真实 no-libc
+  builtin provider `#asm` / `#jiang.asm` 接入语法、Semantic Model、JIL 和 LLVM lowering；真实 no-libc
   executable 和 target runtime object 仍是后续 proposal。
 
 `--no-link-libc` 不是单纯少传 linker 参数。pipeline 会先根据 target 判断是否存在 hosted
@@ -110,10 +110,10 @@ attribute。LLVM declaration 和 call site 必须使用同一个 plan。
 ## 边界
 
 - backend 不重新 type check。
-- backend 不从 MIR 自己推导 field offset；field offset 只能来自 `LayoutStore`。
+- backend 不从 JIL 自己推导 field offset；field offset 只能来自 `LayoutStore`。
 - backend ABI classifier 可以读取 `LayoutStore` 的 size/align，但不能修改 layout facts。
-- backend 不修改 HIR、MIR 或 `TypeCheckStore`。
-- backend 不把 LLVM-specific 表达泄漏到 MIR 数据结构。
+- backend 不修改 Semantic Model、JIL 或 `TypeCheckStore`。
+- backend 不把 LLVM-specific 表达泄漏到 JIL 数据结构。
 
 ## 当前覆盖
 

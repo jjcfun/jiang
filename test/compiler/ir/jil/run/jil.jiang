@@ -1,0 +1,486 @@
+// 验证 JIL 的 CFG 数据模型、lowering 和基础操作。
+
+import context = "../../../../../src/context.jiang";
+import sem = "../../../../../src/sema/model.jiang";
+import jil = "../../../../../src/jil.jiang";
+import jil_lower = "../../../../../src/jil/lower.jiang";
+import module_graph = "../../../../../src/resolve/module_graph.jiang";
+import resolve = "../../../../../src/resolve/module_resolver.jiang";
+import rdef = "../../../../../src/resolve/def.jiang";
+import store = "../../../../../src/resolve/store.jiang";
+import qid = "../../../../../src/store/id.jiang";
+import syntax_store = "../../../../../src/syntax/store.jiang";
+import ast = "../../../../../src/syntax/ast.jiang";
+import monomorph = "../../../../../src/sema/monomorph.jiang";
+import type_check = "../../../../../src/sema/type_check.jiang";
+import source = "../../../../../src/source.jiang";
+import syntax = "../../../../../src/syntax.jiang";
+import std;
+
+unsafe Int main() {
+    check_function_skeletons_follow_model_ownership_tree();
+    check_function_locals_include_params_and_user_locals();
+    check_call_lowers_to_call_terminator();
+    check_generic_function_lowers_as_concrete_instance();
+    check_if_expression_lowers_to_branch_join();
+    check_field_access_lowers_to_projection();
+    check_while_break_lowers_to_loop_edges();
+    check_switch_lowers_to_switch_terminator();
+    check_await_lowers_to_suspend_state();
+    check_lower_rejects_errored_model_store();
+    return 0;
+}
+
+unsafe () check_await_lowers_to_suspend_state() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_await_task_result",
+        "async Int f(Int x){x} async Int g(){Task<Int> a=Task{f(1)};Task<Int> b=Task{f(2)};a.await()+b.await()}"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    qid.DefId entry_def = find_named_function_def(ctx$.ref(), graph.root_module, "g");
+    guard lowered.function_id_for_def(entry_def) is .some(entry_id) else {
+        assert(false);
+        return;
+    }
+    jil.Function entry = lowered.function(entry_id);
+    guard entry.coroutine_frame is .some(frame) else {
+        assert(false);
+        return;
+    }
+    assert(frame.suspend_points.length > 0);
+    assert_suspend_points_numbered(frame);
+}
+
+unsafe () check_function_skeletons_follow_model_ownership_tree() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_order",
+        "Int first(Int x) { x } Int second(Int y) { y }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    assert(lowered.functions.len() >= 2);
+
+    jil.FunctionId first_id =
+        function_id_for_module_def(ctx$.ref(), graph$.ref(), lowered$.ref(), 0);
+    jil.FunctionId second_id =
+        function_id_for_module_def(ctx$.ref(), graph$.ref(), lowered$.ref(), 1);
+    assert(first_id.to_index() < second_id.to_index());
+    assert_entry_returns_copied_param(lowered.function(first_id));
+    assert_entry_returns_copied_param(lowered.function(second_id));
+    assert_return_local_uses_type_check_result(lowered.function(first_id));
+    assert_return_local_uses_type_check_result(lowered.function(second_id));
+}
+
+unsafe () check_function_locals_include_params_and_user_locals() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_locals",
+        "Int entry(Int p) { Int x! = p; x } Int main() { entry(1) }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    qid.DefId entry_def = find_named_function_def(ctx$.ref(), graph.root_module, "entry");
+    guard lowered.function_id_for_def(entry_def) is .some(entry_id) else {
+        assert(false);
+        return;
+    }
+    jil.Function function = lowered.function(entry_id);
+    assert(function.body.locals.length == 3);
+    assert(function.body.locals[0].kind == .return_place);
+    assert(function.body.locals[1].kind == .param);
+    assert(function.body.locals[2].kind == .user_local);
+    qid.TypeId param_type = function.body.locals[1].type_id;
+    qid.TypeId int_type = ctx.store.types.int_type();
+    assert(param_type.to_index() == int_type.to_index());
+    assert(function.body.locals[2].mutable_local);
+    assert(function.body.blocks.length == 1);
+    assert(function.body.blocks[0].statements.length == 4);
+    assert_storage_live(function.body.blocks[0].statements[0], 2);
+    assert_assigns_local_from_local(function.body.blocks[0].statements[1], 2, 1);
+    assert_assigns_local_from_local(function.body.blocks[0].statements[2], 0, 2);
+    assert_storage_dead(function.body.blocks[0].statements[3], 2);
+}
+
+unsafe () check_call_lowers_to_call_terminator() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_call",
+        "Int callee() { 1 } Int main() { callee() }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    assert(lowered.functions.len() >= 2);
+
+    qid.DefId main_def = find_named_function_def(ctx$.ref(), graph.root_module, "main");
+    guard lowered.function_id_for_def(main_def) is .some(main_id) else {
+        assert(false);
+        return;
+    }
+    jil.Function main_function = lowered.function(main_id);
+    assert(main_function.body.blocks.length == 2);
+
+    jil.Block call_block = main_function.body.blocks[0];
+    assert(call_block.statements.length == 0);
+    guard call_block.terminator.kind is .call_term(call_term) else {
+        assert(false);
+        return;
+    }
+    assert(call_term.destination.local_id.to_index() == 0);
+    assert(call_term.target.to_index() == 1);
+
+    guard main_function.body.blocks[1].terminator.kind is .return_term(return_term) else {
+        assert(false);
+        return;
+    }
+    assert(!return_term.implicit_unit);
+}
+
+unsafe () check_generic_function_lowers_as_concrete_instance() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_generic_instance",
+        "T id<T>(T value) { value$.move() } Int main() { id<Int>(1) }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    assert(lowered.functions.len() >= 2);
+
+    qid.DefId id_def = find_named_function_def(ctx$.ref(), graph.root_module, "id");
+    qid.TypeId*! int_args = ctx.store.model.storage.alloc_array<qid.TypeId>(1);
+    int_args[0] = ctx.store.types.int_type();
+    guard lowered.function_id_for_instance(
+        id_def,
+        int_args[0..1],
+        lowered.empty_const_args()
+    ) is .some(id_instance) else {
+        assert(false);
+        return;
+    }
+
+    jil.Function function = lowered.function(id_instance);
+    assert(function.def_id.to_index() == id_def.to_index());
+    assert(function.type_args.length == 1);
+    qid.TypeId instance_arg = function.type_args[0];
+    qid.TypeId return_type = function.body.locals[0].type_id;
+    qid.TypeId value_type = function.body.locals[1].type_id;
+    qid.TypeId int_type = ctx.store.types.int_type();
+    assert(instance_arg.to_index() == int_type.to_index());
+    assert(return_type.to_index() == int_type.to_index());
+    assert(value_type.to_index() == int_type.to_index());
+}
+
+unsafe () check_if_expression_lowers_to_branch_join() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_if",
+        "Int entry(Bool cond) { if cond { 1 } else { 2 } } Int main() { entry(true) }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    jil.Function function = named_function(ctx$.ref(), graph$.ref(), lowered$.ref(), "entry");
+    assert(function.body.blocks.length == 4);
+
+    guard function.body.blocks[0].terminator.kind is .branch_term(branch) else {
+        assert(false);
+        return;
+    }
+    assert(branch.then_target.to_index() == 1);
+    assert(branch.else_target.to_index() == 2);
+
+}
+
+unsafe () check_field_access_lowers_to_projection() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_field",
+        "struct Point { Int x; } Int entry(Point p) { p.x } Int main() { entry(Point(x: 1)) }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    jil.Function function = named_function(ctx$.ref(), graph$.ref(), lowered$.ref(), "entry");
+    assert(function.body.blocks.length == 1);
+
+    guard first_assign_statement(function.body.blocks[0]).kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .copy_operand(copy_operand) else {
+        assert(false);
+        return;
+    }
+    assert(copy_operand.place.local_id.to_index() == 1);
+    assert(copy_operand.place.projection.length == 1);
+    guard copy_operand.place.projection[0] is .field_projection(field_projection) else {
+        assert(false);
+        return;
+    }
+    assert(ctx.store.defs.get(field_projection.field_def).kind == .field_def);
+}
+
+unsafe () check_while_break_lowers_to_loop_edges() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_break",
+        "Int entry(Bool cond) { while cond { break; } 1 } Int main() { entry(true) }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    jil.Function function = named_function(ctx$.ref(), graph$.ref(), lowered$.ref(), "entry");
+    assert(function.body.blocks.length == 4);
+    assert_goto_target(function.body.blocks[0], 1);
+
+    guard function.body.blocks[1].terminator.kind is .branch_term(branch) else {
+        assert(false);
+        return;
+    }
+    assert(branch.then_target.to_index() == 2);
+    assert(branch.else_target.to_index() == 3);
+    assert_goto_target(function.body.blocks[2], 3);
+    assert_returns(function.body.blocks[3], false);
+}
+
+unsafe () check_switch_lowers_to_switch_terminator() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(
+        ctx$.ref(),
+        "jil_lower_switch",
+        "Int choose(Int value) { switch value { 1 => 2, else => 3 } }"
+    );
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(!lowered.has_errors());
+    jil.Function function = named_function(ctx$.ref(), graph$.ref(), lowered$.ref(), "choose");
+    assert(function.body.blocks.length == 5);
+
+    guard function.body.blocks[0].terminator.kind is .switch_term(switch_term) else {
+        assert(false);
+        return;
+    }
+    assert(switch_term.cases.length == 1);
+    assert(switch_term.cases[0].target.to_index() >= 0);
+    assert(switch_term.default_target.to_index() >= 0);
+}
+
+unsafe () check_lower_rejects_errored_model_store() {
+    context.CompilerContext ctx! = context.CompilerContext();
+    module_graph.ModuleGraph^ graph = lower_text_to_model(ctx$.ref(), "jil_lower_error", "Int main() { 0 }");
+    ctx.store.model.mark_error();
+
+    jil.Store^ lowered = lower_jil(ctx$.ref(), graph$.ref());
+    assert(lowered.has_errors());
+    assert(lowered.functions.len() == 0);
+}
+
+unsafe jil.Statement first_assign_statement(jil.Block block) {
+    Int index! = 0;
+    while (index < block.statements.length) {
+        if (block.statements[index].kind is .assign_stmt) {
+            return block.statements[index];
+        }
+        index = index + 1;
+    }
+    assert(false);
+    return block.statements[0];
+}
+
+unsafe () assert_storage_live(jil.Statement statement, Int local_index) {
+    guard statement.kind is .storage_live_stmt(storage_live) else {
+        assert(false);
+        return;
+    }
+    assert(storage_live.local_id.to_index() == local_index);
+}
+
+unsafe () assert_storage_dead(jil.Statement statement, Int local_index) {
+    guard statement.kind is .storage_dead_stmt(storage_dead) else {
+        assert(false);
+        return;
+    }
+    assert(storage_dead.local_id.to_index() == local_index);
+}
+
+unsafe () assert_goto_target(jil.Block block, Int target_index) {
+    guard block.terminator.kind is .goto_term(goto_term) else {
+        assert(false);
+        return;
+    }
+    assert(goto_term.target.to_index() == target_index);
+}
+
+unsafe () assert_returns(jil.Block block, Bool implicit_unit) {
+    guard block.terminator.kind is .return_term(return_term) else {
+        assert(false);
+        return;
+    }
+    assert(return_term.implicit_unit == implicit_unit);
+}
+
+unsafe module_graph.ModuleGraph^ lower_text_to_model(context.CompilerContext& ctx, UInt8[]& name, UInt8[]& text) {
+    syntax_store.Store asts! = syntax_store.Store();
+    source.SourceId source_id = ctx.store.sources.intern_virtual(name, source.content_hash(text));
+    syntax.SyntaxResult parsed = syntax.parse_source(ctx, text, source_id);
+    assert(!parsed.has_errors());
+    Int source_revision = ctx.store.sources.get(source_id).revision;
+    asts.set_unit(parsed.take_unit(), source_revision);
+
+    resolve.ModuleResolver resolver = resolve.ModuleResolver(ctx, asts$.ref());
+    ast.AstUnit& root_unit = asts.unit(source_id, source_revision)$.some();
+    module_graph.ModuleGraph^ graph = resolver.build_module_graph(root_unit);
+    assert(graph.ok);
+    assert(resolver.lower_module_graph_to_model(graph$.ref()));
+    if (!type_check.check_model_package(ctx, graph$.ref())) {
+        dump_diagnostic_codes(ctx);
+        assert(false);
+    }
+    return graph$.move();
+}
+
+() dump_diagnostic_codes(context.CompilerContext& ctx) {
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        std.io.stderr().write_all(ctx.store.diagnostics.get(index).code.text);
+        std.io.stderr().write_all("\n");
+        index = index + 1;
+    }
+}
+
+unsafe jil.Store^ lower_jil(context.CompilerContext& ctx, module_graph.ModuleGraph& graph) {
+    monomorph.MonomorphStore^ instances = monomorph.collect_reachable_instances(
+        ctx,
+        ctx.store.model$.ref(),
+        ctx.store.typeck$.ref(),
+        graph
+    );
+    return jil_lower.lower_package(
+        ctx,
+        ctx.store.model$.ref(),
+        ctx.store.typeck$.ref(),
+        instances$.ref(),
+        graph
+    );
+}
+
+unsafe jil.FunctionId function_id_for_module_def(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph,
+    jil.Store& lowered,
+    Int index
+) {
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(graph.root_module);
+    sem.Def& module_model = ctx.store.model.def_ref(module.def_id);
+    qid.DefId expected_def = module_model.members.get(index);
+
+    guard lowered.function_id_for_def(expected_def) is .some(function_id) else {
+        assert(false);
+        return jil.FunctionId.from_index(0);
+    }
+    jil.Function function = lowered.function(function_id);
+    assert(function.def_id.to_index() == expected_def.to_index());
+    return function_id;
+}
+
+unsafe () assert_entry_returns_copied_param(jil.Function function) {
+    assert(function.body.blocks.length == 1);
+    assert(function.body.entry.to_index() == 0);
+
+    jil.Block entry = function.body.blocks[0];
+    assert(entry.id.to_index() == 0);
+    assert(entry.statements.length == 1);
+    assert_assigns_local_from_local(entry.statements[0], 0, 1);
+    guard entry.terminator.kind is .return_term(return_term) else {
+        assert(false);
+        return;
+    }
+    assert(!return_term.implicit_unit);
+}
+
+unsafe () assert_assigns_local_from_local(jil.Statement statement, Int destination_index, Int source_index) {
+    guard statement.kind is .assign_stmt(assign_stmt) else {
+        assert(false);
+        return;
+    }
+    assert(assign_stmt.destination.local_id.to_index() == destination_index);
+    guard assign_stmt.value is .use_value(use_value) else {
+        assert(false);
+        return;
+    }
+    guard use_value.value is .copy_operand(copy_operand) else {
+        assert(false);
+        return;
+    }
+    assert(copy_operand.place.local_id.to_index() == source_index);
+}
+
+unsafe () assert_return_local_uses_type_check_result(jil.Function function) {
+    assert(function.body.locals.length >= 1);
+    assert(function.body.locals[0].kind == .return_place);
+    qid.TypeId return_type = function.body.locals[0].type_id;
+    assert(return_type.to_index() >= 0);
+}
+
+unsafe qid.DefId find_named_function_def(context.CompilerContext& ctx, qid.ModuleId module_id, UInt8[]& name) {
+    store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    sem.Def& module_model = ctx.store.model.def_ref(module.def_id);
+    qid.SymbolId symbol = ctx.store.symbols.intern(name);
+    Int index! = 0;
+    while (index < module_model.members.len()) {
+        qid.DefId def_id = module_model.members.get(index);
+        rdef.DefRecord def_record = ctx.store.defs.get(def_id);
+        if (def_record.kind == .function_def && def_record.name.symbol == symbol) {
+            return def_id;
+        }
+        index = index + 1;
+    }
+    assert(false);
+    return module.def_id;
+}
+
+@life(return: (lowered, lowered, lowered, lowered))
+unsafe jil.Function named_function(
+    context.CompilerContext& ctx,
+    module_graph.ModuleGraph& graph,
+    jil.Store& lowered,
+    UInt8[]& name
+) {
+    qid.DefId def_id = find_named_function_def(ctx, graph.root_module, name);
+    jil.FunctionId function_id = lowered.function_id_for_def(def_id)$.some();
+    return lowered.function(function_id);
+}
+
+() assert_suspend_points_numbered(jil.CoroutineFrameLayout frame) {
+    assert(frame.state_dispatch.entry_state_id == 0);
+    assert(frame.state_dispatch.completed_state_id == frame.suspend_points.length + 1);
+    assert(frame.state_dispatch.resume_cases.length == frame.suspend_points.length);
+    Int index! = 0;
+    while (index < frame.suspend_points.length) {
+        jil.CoroutineSuspendPoint point = frame.suspend_points[index];
+        jil.CoroutineResumeCase resume_case = frame.state_dispatch.resume_cases[index];
+        assert(point.state_id == index + 1);
+        assert(resume_case.state_id == point.state_id);
+        assert(resume_case.target.to_index() == point.resume_target.to_index());
+        index = index + 1;
+    }
+}

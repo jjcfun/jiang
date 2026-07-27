@@ -1955,7 +1955,7 @@ Jiang 语言通常以 `<T>` 形式声明泛型参数。
 
 `Name: const Type` 是 const generic constraint 的 canonical 形式，并把对应泛型参数绑定到
 value namespace。例如 `@where(N: const Int) struct Fixed<T, N>`。泛型列表中的
-`N: const Int` 是等价简写，编译器会 lower 到同一条 HIR predicate。
+`N: const Int` 是等价简写，编译器会 lower 到同一条 Semantic Model predicate。
 
 在泛型声明上，`@where(...)` 中引用的名字必须出现在后续声明的 `<...>` 泛型参数列表中。  
 在 trait 内部，`@where(...)` 也可以引用当前 trait 可见的关联类型名。
@@ -2591,14 +2591,14 @@ type = lang
 provider root 必须 public 导出 `Lang`，并实现 `std.jiang.syntax.Provider`。编译器在 host 上
 把 lang package 编译成 dynamic library；lexer 调用 `scan` 决定 block 边界，parser 调用 `parse`
 取得 `std.jiang.syntax.Tree`，再转换成普通 Jiang AST。DSL 返回的节点继续走普通 resolve、
-type check、MIR 和 backend。
+type check、JIL 和 backend。
 
 当前限制：
 
 - 只支持 block invocation：`#alias { ... }`
 - 不支持 `#alias(...)`
 - 一个 lang package 只提供一个默认 provider
-- provider 不能直接生成 HIR/MIR/backend IR
+- provider 不能直接生成 Semantic Model/JIL/backend IR
 - dependency package 中的 `main` 不会成为当前 package 的 hosted entry wrapper
 
 `alias` 是纯符号别名，而不是新的变量绑定。它用于给已经存在的符号路径起一个新的名字。

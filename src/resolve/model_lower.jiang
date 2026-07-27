@@ -1,0 +1,4369 @@
+// 从已经完成引用解析的 AST 文件生成 resolved、未类型化的 Semantic Model。
+//
+// 这个 lowering 属于 resolve 阶段。调用它之前，ModuleResolver 已经完成：
+// 1. 构建 module graph / import closure；
+// 2. 对所有可达 module 收集 declaration，创建 DefId 和 Def skeleton；
+// 3. 对当前文件完成 reference resolve。
+//
+// 输入：
+// - AstResolveState：当前 AstUnit + module/namespace/query 上下文。
+//
+// 输出：
+// - 原地写入 CompilerStore.model。function/global definition 会得到自己的
+//   def-local Node 表和可选 Body root。
+//
+// 边界：
+// - Semantic Model 已经 resolve，但还没有 type check；这里不读写 TypeId。
+// - value.member 只保存 base NodeId + member symbol；具体 member DefId
+//   后续由 type check 根据 base type 选出来。
+// - 局部绑定由 lowering 维护词法环境并直接创建 DefId。
+
+import sem = "../sema/model.jiang";
+import fingerprint = "../incremental/fingerprint.jiang";
+import qkey = "../incremental/key.jiang";
+import diagnostic = "../diagnostic.jiang";
+import qid = "../store/id.jiang";
+import extension_target = "./extension_target.jiang";
+import list = "../support/list.jiang";
+import string = "../support/string.jiang";
+import unicode = "../support/unicode.jiang";
+import ast = "../syntax/ast.jiang";
+import token = "../syntax/token.jiang";
+import def = "./def.jiang";
+import compile_select = "../sema/comptime/select.jiang";
+import resolve_state = "./state.jiang";
+import scope = "./scope.jiang";
+import store = "./store.jiang";
+import trait_companion = "./trait_companion.jiang";
+
+extern {
+    Float64 strtod(UInt8* text, Int endptr);
+}
+
+public Bool lower_unit(resolve_state.AstResolveState& state) {
+    Lower lower! = Lower(state);
+    lower.lower();
+    return !state.store.model.has_errors();
+}
+
+@region(a)
+struct Lower: Movable {
+    @life(a)
+    resolve_state.AstResolveState& state;
+    qid.DefId? current_owner_def!;
+    Bool owner_type_lookup_enabled!;
+    scope.LexicalEnv env;
+
+    public init(self, resolve_state.AstResolveState& state) {
+        self.state = state;
+        self.current_owner_def = null;
+        self.owner_type_lookup_enabled = false;
+        self.env = scope.LexicalEnv();
+    }
+
+    // 只遍历能在 Semantic Model 中拥有可执行/类型语法的 declaration。declaration
+    // skeleton 已经存在，这一趟只为当前文件填充 body 和 def-local nodes。
+    public () lower(self) {
+        guard self.state.unit.root is .some(root_id) else { return; }
+        ast.AstNode root = self.state.unit.get(root_id);
+        guard ast.root_data(root.data) is .some(root_data) else { return; }
+
+
+        Int index! = 0;
+        while (index < root_data.items.length) {
+            self.lower_top_level_item(self.state.unit.child_at(root_data.items, index));
+            index = index + 1;
+        }
+    }
+
+    () lower_top_level_item(self, ast.AstId item_id) {
+        ast.AstNode item = self.state.unit.get(item_id);
+        if (item.data is .top_level_decl(top_level)) {
+            ast.AstNode body = self.state.unit.get(top_level.body);
+            if (body.data is .extend_decl(extend_decl)) {
+                self.lower_extend(extend_decl, top_level.annotations, top_level.modifiers.public_flag);
+                return;
+            }
+            self.lower_decl_with_extern_kind(
+                top_level.body,
+                top_level.annotations,
+                self.extern_kind(top_level.modifiers.extern_kind),
+                false
+            );
+            return;
+        }
+        if (item.data is .extern_block(extern_block)) {
+            self.lower_extern_block(extern_block);
+            return;
+        }
+        if (item.data is .compile_block(compile_block)) {
+            self.lower_compile_block(compile_block);
+            return;
+        }
+        if (item.data is .compile_if(compile_if)) {
+            self.lower_compile_if(compile_if);
+            return;
+        }
+        self.lower_decl_with_annotations(item_id, self.empty_ast_range(), false);
+    }
+
+    () lower_compile_block(self, ast.CompileBlockData compile_block) {
+        Int index! = 0;
+        while (index < compile_block.items.length) {
+            self.lower_top_level_item(self.state.unit.child_at(compile_block.items, index));
+            index = index + 1;
+        }
+    }
+
+    () lower_compile_if(self, ast.CompileIfData compile_if) {
+        compile_select.CompileSelector selector = compile_select.CompileSelector(self.state);
+        if (selector.condition_true(compile_if.condition, false)) {
+            self.lower_top_level_item(compile_if.then_body);
+            return;
+        }
+        if (compile_if.else_body is .some(else_body)) {
+            self.lower_top_level_item(else_body);
+        }
+    }
+
+    () lower_extern_block(self, ast.ExternBlockData extern_block) {
+        sem.ExternKind extern_kind = self.extern_kind(extern_block.extern_kind);
+        Int index! = 0;
+        while (index < extern_block.items.length) {
+            ast.AstId item_id = self.state.unit.child_at(extern_block.items, index);
+            ast.AstNode item = self.state.unit.get(item_id);
+            if (item.data is .extern_item(extern_item)) {
+                self.lower_decl_with_extern_kind(extern_item.body, self.empty_ast_range(), extern_kind, true);
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_decl(self, ast.AstId decl_id) {
+        self.lower_decl_with_annotations(decl_id, self.empty_ast_range(), false);
+    }
+
+    () lower_decl_with_annotations(self, ast.AstId decl_id, ast.AstRange annotations, Bool static_member) {
+        sem.ExternKind extern_kind! = .none;
+        if (static_member) {
+            extern_kind = .native;
+        }
+        self.lower_decl_with_extern_kind(decl_id, annotations, extern_kind, static_member);
+    }
+
+    () lower_decl_with_extern_kind(self,
+        ast.AstId decl_id,
+        ast.AstRange annotations,
+        sem.ExternKind extern_kind,
+        Bool static_member
+    ) {
+        ast.AstNode decl = self.state.unit.get(decl_id);
+        if (decl.data is .function_decl(function_decl)) {
+            self.lower_function(
+                function_decl,
+                annotations,
+                static_member,
+                extern_kind
+            );
+            return;
+        }
+        if (decl.data is .init_decl(init_decl)) {
+            self.lower_init(init_decl, annotations);
+            return;
+        }
+        if (decl.data is .deinit_decl(deinit_decl)) {
+            self.lower_deinit(deinit_decl);
+            return;
+        }
+        if (decl.data is .global_decl(global_decl)) {
+            self.lower_global(global_decl, annotations, extern_kind);
+            return;
+        }
+        if (decl.data is .alias_decl(alias_decl)) {
+            self.lower_alias(alias_decl, annotations);
+            return;
+        }
+        if (decl.data is .field_decl(field_decl)) {
+            self.lower_field_decl(field_decl, annotations);
+            return;
+        }
+        if (decl.data is .typed_union_variants(variants)) {
+            self.lower_typed_union_variants(variants, annotations);
+            return;
+        }
+        if (decl.data is .enum_case(enum_case)) {
+            self.lower_enum_case(enum_case);
+            return;
+        }
+        if (decl.data is .assoc_type(assoc_type)) {
+            self.lower_assoc_type(assoc_type, annotations);
+            return;
+        }
+        if (decl.data is .nominal_decl(nominal)) {
+            // 成员 declaration 的 DefId 已经在 name resolve 阶段创建。
+            // 这里切到 owner def，只是为了让 field/case/method 的 Semantic Model
+            // 节点落到各自 owner 的 def-local 表里。
+            qid.DefId? previous_owner = self.current_owner_def;
+            Bool previous_owner_type_lookup = self.owner_type_lookup_enabled;
+            Bool entered_generics! = false;
+            if (self.decl_def_for_name(nominal.name, .type_name) is .some(owner_def)) {
+                self.current_owner_def = owner_def;
+                self.owner_type_lookup_enabled = true;
+                self.enter_generic_scope_for_owner(owner_def, nominal.generics);
+                self.define_self_type(owner_def);
+                entered_generics = true;
+                self.lower_annotations(owner_def, annotations);
+                if (nominal.enum_underlying_type is .some(underlying_type)) {
+                    self.state.store.model.set_enum_underlying_type_ref(owner_def, self.lower_type_ref(underlying_type));
+                }
+                self.state.store.model.set_layout_options(owner_def, self.lower_layout_options(nominal));
+                self.lower_trait_ref_range(owner_def, nominal.traits);
+            }
+            self.lower_member_range(nominal.members);
+            if (entered_generics) {
+                self.env.exit_scope();
+            }
+            self.current_owner_def = previous_owner;
+            self.owner_type_lookup_enabled = previous_owner_type_lookup;
+            return;
+        }
+        if (decl.data is .trait_decl(trait_decl)) {
+            qid.DefId? previous_owner = self.current_owner_def;
+            Bool previous_owner_type_lookup = self.owner_type_lookup_enabled;
+            Bool entered_generics! = false;
+            if (self.decl_def_for_name(trait_decl.name, .type_name) is .some(owner_def)) {
+                self.current_owner_def = owner_def;
+                self.owner_type_lookup_enabled = true;
+                self.enter_generic_scope_for_owner(owner_def, trait_decl.generics);
+                self.define_self_type(owner_def);
+                entered_generics = true;
+                self.lower_annotations(owner_def, annotations);
+                self.lower_trait_ref_range(owner_def, trait_decl.parents);
+                self.define_member_associated_type_names(trait_decl.members);
+            }
+            self.lower_member_range(trait_decl.members);
+            if (entered_generics) {
+                self.env.exit_scope();
+            }
+            self.current_owner_def = previous_owner;
+            self.owner_type_lookup_enabled = previous_owner_type_lookup;
+            return;
+        }
+        if (decl.data is .extend_decl(extend_decl)) {
+            self.lower_extend(extend_decl, annotations, false);
+            return;
+        }
+    }
+
+    sem.LayoutOptions lower_layout_options(self, ast.NominalData nominal) {
+        if (nominal.nominal_kind != ast.NominalKind.struct_kind) {
+            return sem.LayoutOptions();
+        }
+        return sem.LayoutOptions(
+            packed: nominal.layout_options.packed,
+            align: nominal.layout_options.align
+        );
+    }
+
+    sem.ExternKind extern_kind(self, ast.ExternKind kind) {
+        if (kind == .native) { return .native; }
+        if (kind == .c_abi) { return .c_abi; }
+        if (kind == .builtin) { return .builtin; }
+        return .none;
+    }
+
+    Bool function_decl_is_external(self, ast.FunctionData function_decl, sem.ExternKind extern_kind) {
+        if (extern_kind == .none) {
+            return false;
+        }
+        return function_decl.body == null;
+    }
+
+    () define_member_associated_type_names(self, ast.AstRange members) {
+        Int index! = 0;
+        while (index < members.length) {
+            self.define_member_associated_type_name(self.state.unit.child_at(members, index));
+            index = index + 1;
+        }
+    }
+
+    () define_member_associated_type_name(self, ast.AstId member_id) {
+        ast.AstNode member = self.state.unit.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            self.define_member_associated_type_name(member_decl.body);
+            return;
+        }
+        if (member.data is .assoc_type(assoc_type)) {
+            guard self.state.declaration_def(assoc_type.name) is .some(assoc_def) else { return; }
+            self.define_existing_local(assoc_type.name, self.assoc_type_domain(assoc_type), assoc_def);
+        }
+    }
+
+    def.NameDomain assoc_type_domain(self, ast.AssocTypeData assoc_type) {
+        if (assoc_type.is_const) { return .value_name; }
+        return .type_name;
+    }
+
+    ast.AstRange empty_ast_range(self) {
+        return ast.AstRange(0, 0);
+    }
+
+    () lower_extend(self, ast.ExtendData extend_decl, ast.AstRange annotations, Bool public_flag) {
+        guard self.resolved_type_def_for_type_ref(extend_decl.target_type) is .some(owner_def) else {
+            self.lower_member_range(extend_decl.members);
+            return;
+        }
+
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = owner_def;
+        self.env.enter_scope(.generic_scope);
+        self.define_self_type(owner_def);
+        qid.DefId binding_owner = self.define_extend_generic_params(extend_decl.generics, owner_def);
+        Int extension_index = self.state.store.model.add_extension_group(
+            self.state.module_id,
+            owner_def,
+            binding_owner,
+            public_flag
+        );
+        self.lower_extend_generic_constraints(extension_index, extend_decl.generics, binding_owner);
+        self.lower_extend_generic_bounds(extension_index, extend_decl.generics, binding_owner);
+        self.lower_extend_target_arg_patterns(extension_index, extend_decl.target_type, owner_def);
+        self.lower_extension_annotations(extension_index, annotations);
+        if (extend_decl.trait_path is .some(trait_path)) {
+            ast.AstNode trait_node = self.state.unit.get(trait_path);
+            guard trait_node.data is .trait_bound(trait_bound) else { return; }
+            sem.NodeId lowered_trait_ref = self.lower_trait_bound_ref(trait_bound);
+            self.state.store.model.add_trait_ref(owner_def, lowered_trait_ref);
+            self.state.store.model.set_extension_trait_ref(extension_index, lowered_trait_ref);
+            self.lower_extension_trait_assoc_bindings(extension_index, extend_decl.target_type, trait_bound, lowered_trait_ref);
+        }
+        self.lower_member_range(extend_decl.members);
+        self.record_extension_members(extension_index, extend_decl.members);
+        self.env.exit_scope();
+        self.current_owner_def = previous_owner;
+    }
+
+    qid.DefId define_extend_generic_params(self, ast.AstId? generics, qid.DefId owner_def) {
+        guard self.extend_generic_param_range(generics) is .some(params) else { return owner_def; }
+        guard generics is .some(generic_id) else { return owner_def; }
+        guard self.state.declaration_def(generic_id) is .some(binding_owner) else { return owner_def; }
+        Int index! = 0;
+        while (index < params.length) {
+            ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, index));
+            guard param_node.data is .generic_param(param) else {
+                index = index + 1;
+                continue;
+            }
+            ast.AstId name_id = param.name;
+            guard self.state.name_symbol(name_id) is .some(symbol) else {
+                index = index + 1;
+                continue;
+            }
+            guard self.state.declaration_def(name_id) is .some(param_def) else {
+                index = index + 1;
+                continue;
+            }
+            def.DefRecord record = self.state.store.defs.get(param_def);
+            self.env.define(symbol, record.domain, param_def, self.state.unit.get(name_id).span);
+            if (self.state.generic_param_const_type(param_def) is .some(type_ref)) {
+                self.state.store.model.set_decl_type_ref(param_def, self.lower_type_ref(type_ref));
+            }
+            index = index + 1;
+        }
+        return binding_owner;
+    }
+
+    ast.AstRange? extend_generic_param_range(self, ast.AstId? generics) {
+        guard generics is .some(generic_id) else { return null; }
+        ast.AstNode node = self.state.unit.get(generic_id);
+        guard node.data is .generic_params(params) else { return null; }
+        return params.type_params;
+    }
+
+    () lower_extend_generic_bounds(
+        self,
+        Int extension_index,
+        ast.AstId? generics,
+        qid.DefId owner_def
+    ) {
+        guard self.extend_generic_param_range(generics) is .some(params) else { return; }
+        guard self.state.store.model.def(owner_def) is .some(owner_model) else { return; }
+        Int index! = 0;
+        while (index < params.length && index < owner_model.generic_params.len()) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (node.data is .generic_param(param)) {
+                if (param.type_bound is .some(bound)) {
+                    self.lower_extend_type_bound(
+                        extension_index, owner_model.generic_params.get(index), bound
+                    );
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_extend_generic_constraints(
+        self,
+        Int extension_index,
+        ast.AstId? generics,
+        qid.DefId owner_def
+    ) {
+        guard self.extend_generic_param_range(generics) is .some(params) else { return; }
+        guard self.state.store.model.def(owner_def) is .some(owner_model) else { return; }
+        Int index! = 0;
+        while (index < params.length && index < owner_model.generic_params.len()) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (node.data is .generic_param(_)) {
+                self.lower_extend_generic_const_constraint(
+                    extension_index,
+                    owner_model.generic_params.get(index)
+                );
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_extend_generic_const_constraint(
+        self,
+        Int extension_index,
+        qid.DefId param_def
+    ) {
+        guard self.state.generic_param_const_type(param_def) is .some(type_ref) else { return; }
+        sem.NodeId lowered = self.lower_type_ref(type_ref);
+        self.state.store.model.add_extension_generic_constraint(
+            extension_index,
+            sem.ExtensionGenericConstraint(param_def: param_def, type_ref: lowered)
+        );
+        self.add_extension_const_where_predicate(extension_index, param_def, lowered);
+    }
+
+    () lower_extend_type_bound(self, Int extension_index, qid.DefId subject_def, ast.AstId bound_id) {
+        ast.AstNode bound = self.state.unit.get(bound_id);
+        if (bound.data is .trait_bound(trait_bound)) {
+            sem.WhereTypeBound lowered = sem.WhereTypeBound (
+                subject: self.lower_def_type_ref(subject_def),
+                bound: self.lower_trait_bound_ref(trait_bound)
+            );
+            if (trait_bound.negative) {
+                self.state.store.model.add_extension_where_predicate(
+                    extension_index, .negative_type_bound(lowered)
+                );
+            } else {
+                self.state.store.model.add_extension_where_predicate(extension_index, .type_bound(lowered));
+            }
+            return;
+        }
+        if (bound.data is .type_bound_intersection(intersection)) {
+            self.lower_extend_type_bound(extension_index, subject_def, intersection.left);
+            self.lower_extend_type_bound(extension_index, subject_def, intersection.right);
+        }
+    }
+
+    () lower_extension_trait_assoc_bindings(self,
+        Int extension_index,
+        ast.AstId target_type,
+        ast.TraitBoundData trait_bound,
+        sem.NodeId trait_ref
+    ) {
+        Int index! = 0;
+        while (index < trait_bound.args.length) {
+            ast.AstId arg_id = self.state.unit.child_at(trait_bound.args, index);
+            ast.AstNode arg = self.state.unit.get(arg_id);
+            if (arg.data is .assoc_type_binding(binding)) {
+                sem.WhereProjectionEqual predicate = sem.WhereProjectionEqual(
+                    subject: self.lower_type_ref(target_type),
+                    trait_ref: trait_ref,
+                    assoc_symbol: self.symbol_for_name(binding.name),
+                    value: self.lower_assoc_binding_value(trait_bound, binding)
+                );
+                self.state.store.model.add_extension_where_predicate(extension_index, .projection_equal(predicate));
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_extend_target_arg_patterns(self, Int extension_index, ast.AstId target_type, qid.DefId owner_def) {
+        ast.AstNode node = self.state.unit.get(target_type);
+        if (node.data is .type_ref(type_data)) {
+            if (extension_target.builtin_constructor_owner(self.state, target_type) != null) {
+                self.lower_extend_layered_target_pattern(extension_index, type_data, owner_def);
+                return;
+            }
+            self.lower_extend_target_arg_patterns(extension_index, type_data.base, owner_def);
+            return;
+        }
+        if (node.data is .errorable_type(errorable)) {
+            list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+            if (params.len() < 2) { return; }
+            self.lower_extend_target_arg_pattern(extension_index, params.get(0), errorable.value_type);
+            if (errorable.error_type is .some(error_type)) {
+                self.lower_extend_target_arg_pattern(extension_index, params.get(1), error_type);
+            }
+            return;
+        }
+        if (node.data is .array_type(array_type)) {
+            self.lower_extend_array_target_pattern(extension_index, array_type, owner_def, node.span);
+            return;
+        }
+        guard node.data is .named_type(named_type) else { return; }
+        if (named_type.args.length == 0) { return; }
+        list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+        Int index! = 0;
+        while (index < named_type.args.length && index < params.len()) {
+            self.lower_extend_target_arg_pattern(
+                extension_index,
+                params.get(index),
+                self.state.unit.child_at(named_type.args, index)
+            );
+            index = index + 1;
+        }
+    }
+
+    () lower_extend_layered_target_pattern(
+        self,
+        Int extension_index,
+        ast.TypeData type_data,
+        qid.DefId owner_def
+    ) {
+        list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+        if (params.len() == 0) { return; }
+        ast.AstId element! = type_data.base;
+        ast.TypeSentinelKind sentinel_kind! = type_data.sentinel_kind;
+        qid.SymbolId? sentinel_symbol! = type_data.sentinel_symbol_id;
+        token.Span sentinel_span! = type_data.sentinel_span;
+        if (type_data.layer == .reference) {
+            ast.AstNode base = self.state.unit.get(type_data.base);
+            if (base.data is .type_ref(slice) && slice.layer == .slice) {
+                element = slice.base;
+                sentinel_kind = slice.sentinel_kind;
+                sentinel_symbol = slice.sentinel_symbol_id;
+                sentinel_span = slice.sentinel_span;
+            }
+        }
+        self.lower_extend_target_arg_pattern(extension_index, params.get(0), element);
+        if (sentinel_kind == .none || params.len() < 2) { return; }
+        sem.NodeId sentinel = self.lower_extend_sentinel_pattern(
+            sentinel_kind,
+            sentinel_symbol,
+            sentinel_span
+        );
+        self.add_extend_target_equal(extension_index, params.get(1), sentinel);
+    }
+
+    () lower_extend_array_target_pattern(
+        self,
+        Int extension_index,
+        ast.ArrayTypeData array_type,
+        qid.DefId owner_def,
+        token.Span span
+    ) {
+        list.ArrayList<qid.DefId> params = self.owner_generic_params(owner_def);
+        if (params.len() < 2) { return; }
+        self.lower_extend_target_arg_pattern(extension_index, params.get(0), array_type.element);
+        sem.NodeId count = self.lower_extend_array_count_pattern(array_type, span);
+        self.add_extend_target_equal(extension_index, params.get(1), count);
+        if (array_type.sentinel_kind == .none || params.len() < 3) { return; }
+        sem.NodeId sentinel = self.lower_extend_sentinel_pattern(
+            array_type.sentinel_kind,
+            array_type.sentinel_symbol_id,
+            array_type.sentinel_span
+        );
+        self.add_extend_target_equal(extension_index, params.get(2), sentinel);
+    }
+
+    sem.NodeId lower_extend_array_count_pattern(self, ast.ArrayTypeData array_type, token.Span span) {
+        if (array_type.count_kind == .inferred) {
+            return self.add_node(.infer_type_ref(), span);
+        }
+        guard array_type.count_symbol_id is .some(symbol) else { return self.add_invalid_node(span); }
+        if (array_type.count_kind == .const_name) {
+            return self.lower_extend_const_name_pattern(symbol, span);
+        }
+        return self.lower_extend_int_pattern(self.array_count_value(array_type), span);
+    }
+
+    sem.NodeId lower_extend_sentinel_pattern(
+        self,
+        ast.TypeSentinelKind kind,
+        qid.SymbolId? symbol_id,
+        token.Span span
+    ) {
+        if (kind == .wildcard) { return self.add_node(.infer_type_ref(), span); }
+        if (kind == .bool_true) { return self.lower_extend_bool_pattern(true, span); }
+        if (kind == .bool_false) { return self.lower_extend_bool_pattern(false, span); }
+        guard symbol_id is .some(symbol) else { return self.add_invalid_node(span); }
+        if (kind == .const_name) { return self.lower_extend_const_name_pattern(symbol, span); }
+        if (kind == .char_value) {
+            sem.LiteralValue literal = .char_value(self.char_symbol_value(symbol));
+            return self.add_node(.literal(sem.Literal(value: literal)), span);
+        }
+        return self.lower_extend_int_pattern(self.parse_uint_literal(self.state.store.symbols.text(symbol)), span);
+    }
+
+    sem.NodeId lower_extend_bool_pattern(self, Bool value, token.Span span) {
+        return self.add_node(.literal(sem.Literal(value: .bool_value(value))), span);
+    }
+
+    sem.NodeId lower_extend_const_name_pattern(self, qid.SymbolId symbol, token.Span span) {
+        guard self.env.lookup_def(symbol, .value_name) is .some(def_id) else {
+            return self.add_invalid_node(span);
+        }
+        return self.add_node(.named_type_ref(sem.NamedTypeRef(
+            def_id: def_id,
+            args: self.empty_model_ids()
+        )), span);
+    }
+
+    sem.NodeId lower_extend_int_pattern(self, UInt64 value, token.Span span) {
+        sem.LiteralValue literal = .int_value(sem.IntLiteral(bits: value, signed_value: true));
+        return self.add_node(.literal(sem.Literal(value: literal)), span);
+    }
+
+    () add_extend_target_equal(self, Int extension_index, qid.DefId param_def, sem.NodeId value) {
+        self.state.store.model.add_extension_where_predicate(extension_index, .equal(sem.WhereEqual(
+            subject: self.lower_def_type_ref(param_def),
+            value: value
+        )));
+    }
+
+    () lower_extend_target_arg_pattern(self, Int extension_index, qid.DefId param_def, ast.AstId arg) {
+        if (self.extend_target_arg_is_plain_param(arg, param_def)) {
+            return;
+        }
+        if (self.extend_target_arg_is_plain_wildcard(arg)) {
+            return;
+        }
+        sem.NodeId value! = self.lower_type_ref(arg);
+        if (self.state.store.defs.get(param_def).domain == .value_name) {
+            value = self.lower_const_generic_arg(arg);
+        }
+        sem.WhereEqual predicate = sem.WhereEqual(
+            subject: self.lower_def_type_ref(param_def),
+            value: value
+        );
+        self.state.store.model.add_extension_where_predicate(extension_index, .equal(predicate));
+    }
+
+    Bool extend_target_arg_is_plain_wildcard(self, ast.AstId arg) {
+        ast.AstNode node = self.state.unit.get(arg);
+        return node.data is .infer_type;
+    }
+
+    Bool extend_target_arg_is_plain_param(self, ast.AstId arg, qid.DefId param_def) {
+        guard self.resolved_extend_target_arg_def(arg, param_def) is .some(arg_def) else { return false; }
+        return arg_def.to_index() == param_def.to_index();
+    }
+
+    qid.DefId? resolved_extend_target_arg_def(self, ast.AstId arg, qid.DefId param_def) {
+        if (self.state.store.defs.get(param_def).domain == .value_name) {
+            return self.resolved_extend_target_value_arg(arg);
+        }
+        return self.resolved_type_def_for_type_ref(arg);
+    }
+
+    qid.DefId? resolved_extend_target_value_arg(self, ast.AstId arg) {
+        ast.AstNode node = self.state.unit.get(arg);
+        if (node.data is .named_type(named_type)) {
+            return self.resolved_path_def(named_type.path, .value_name);
+        }
+        return self.resolved_value_def_for_expr(arg);
+    }
+
+    list.ArrayList<qid.DefId> owner_generic_params(self, qid.DefId owner_def) {
+        list.ArrayList<qid.DefId> params! = list.ArrayList<qid.DefId>();
+        guard self.state.store.model.def(owner_def) is .some(model_def) else { return params; }
+        Int index! = 0;
+        while (index < model_def.generic_params.len()) {
+            qid.DefId param_def = model_def.generic_params.get(index);
+            params.add(param_def);
+            index = index + 1;
+        }
+        return params;
+    }
+
+    () lower_extension_annotations(self, Int extension_index, ast.AstRange annotations) {
+        Int index! = 0;
+        while (index < annotations.length) {
+            ast.AstId annotation_id = self.state.unit.child_at(annotations, index);
+            ast.AstNode annotation = self.state.unit.get(annotation_id);
+            if (annotation.data is .alias_attribute(alias_attr)) {
+                self.lower_alias_attribute(alias_attr);
+            } else {
+                self.lower_extension_where_constraint(extension_index, annotation_id);
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_extension_where_constraint(self, Int extension_index, ast.AstId constraint_id) {
+        ast.AstNode constraint = self.state.unit.get(constraint_id);
+        if (constraint.data is .where_const(constraint)) {
+            guard self.resolved_value_def_for_expr(constraint.param) is .some(param_def) else { return; }
+            self.add_extension_const_where_predicate(
+                extension_index,
+                param_def,
+                self.lower_type_ref(constraint.type_ref)
+            );
+            return;
+        }
+        if (constraint.data is .where_type_bound(bound)) {
+            self.lower_extension_where_type_bound(extension_index, bound.param, bound.bound);
+            return;
+        }
+        if (constraint.data is .where_equal(equal)) {
+            self.state.store.model.add_extension_where_predicate(extension_index, .equal(sem.WhereEqual(
+                    subject: self.lower_where_equal_subject(equal.param),
+                    value: self.lower_where_equal_value(equal.param, equal.value)
+                ))
+            );
+            return;
+        }
+        if (constraint.data is .where_not_equal(equal)) {
+            self.state.store.model.add_extension_where_predicate(extension_index, .not_equal(sem.WhereEqual(
+                    subject: self.lower_where_equal_subject(equal.param),
+                    value: self.lower_where_equal_value(equal.param, equal.value)
+                ))
+            );
+            return;
+        }
+        if (constraint.data is .where_projection_equal(equal)) {
+            self.state.store.model.add_extension_where_predicate(extension_index, .projection_equal(sem.WhereProjectionEqual(
+                    subject: self.lower_type_ref(equal.param),
+                    trait_ref: self.lower_type_ref(equal.trait_path),
+                    assoc_symbol: self.symbol_for_name(equal.assoc_name),
+                    value: self.lower_projection_equal_value(equal.trait_path, equal.assoc_name, equal.value)
+                ))
+            );
+        }
+    }
+
+    () add_extension_const_where_predicate(
+        self,
+        Int extension_index,
+        qid.DefId param_def,
+        sem.NodeId type_ref
+    ) {
+        self.state.store.model.add_extension_where_predicate(
+            extension_index,
+            .const_type(sem.WhereConstConstraint(param_def: param_def, type_ref: type_ref))
+        );
+    }
+
+    () lower_extension_where_type_bound(self, Int extension_index, ast.AstId subject, ast.AstId bound_id) {
+        ast.AstNode bound = self.state.unit.get(bound_id);
+        if (bound.data is .trait_bound(trait_bound)) {
+            sem.WhereTypeBound lowered = sem.WhereTypeBound(
+                    subject: self.lower_type_ref(subject),
+                    bound: self.lower_trait_bound_ref(trait_bound)
+                );
+            if (trait_bound.negative) {
+                self.state.store.model.add_extension_where_predicate(extension_index, .negative_type_bound(lowered));
+            } else {
+                self.state.store.model.add_extension_where_predicate(extension_index, .type_bound(lowered));
+            }
+            return;
+        }
+        if (bound.data is .type_bound_intersection(intersection)) {
+            self.lower_extension_where_type_bound(extension_index, subject, intersection.left);
+            self.lower_extension_where_type_bound(extension_index, subject, intersection.right);
+        }
+    }
+
+    // init body 归属于隐藏 init_def。init ABI 使用 hidden `self` receiver，
+    // 直接在调用方给出的 storage 上初始化，不能把 Self 当普通返回值复制。
+    () lower_init(self, ast.InitData init_decl, ast.AstRange annotations) {
+        guard self.current_owner_def is .some(owner_def) else { return; }
+        token.Span span = self.state.unit.get(init_decl.body).span;
+        guard self.next_unlowered_init_def(owner_def) is .some(init_def) else { return; }
+
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = init_def;
+        self.env.enter_scope(.generic_scope);
+        self.define_self_type(owner_def);
+        sem.FunctionSignature signature = self.lower_init_signature(init_decl, owner_def, span);
+        self.declare_callable_signature(init_def, signature, false);
+        self.lower_annotations(init_def, annotations);
+
+        sem.NodeId placeholder = self.add_invalid_node(span);
+        self.state.store.model.load_body(init_def, sem.Body(init_def, placeholder));
+        self.env.enter_scope(.function_scope);
+        self.add_init_self_local(init_def, owner_def);
+        self.lower_parameters(init_def, init_decl.params, signature.params);
+        sem.NodeId user_body = self.lower_expr(init_decl.body);
+        sem.NodeId root = self.synthetic_init_root(user_body, span);
+        self.env.exit_scope();
+        self.env.exit_scope();
+
+        self.state.store.model.set_body_root(init_def, root);
+        self.current_owner_def = previous_owner;
+    }
+
+    sem.FunctionSignature lower_init_signature(self, ast.InitData init_decl, qid.DefId owner_def, token.Span span) {
+        list.ArrayList<sem.NodeId> params! = list.ArrayList<sem.NodeId>(init_decl.params.length);
+        list.ArrayList<qid.SymbolId> param_symbols! = list.ArrayList<qid.SymbolId>(init_decl.params.length);
+        list.ArrayList<sem.ParamDefault> param_defaults! = list.ArrayList<sem.ParamDefault>();
+        Int index! = 0;
+        Int param_index! = 0;
+        while (index < init_decl.params.length) {
+            ast.AstId param_id = self.state.unit.child_at(init_decl.params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .param(param)) {
+                if (self.param_is_explicit_receiver(param, index)) {
+                    index = index + 1;
+                    continue;
+                }
+                params.add(self.lower_type_ref(param.type_ref));
+                param_symbols.add(self.name_symbol_or_zero(param.name));
+                self.lower_param_default(param_index, param, param_defaults$.ref());
+                param_index = param_index + 1;
+            }
+            index = index + 1;
+        }
+        return sem.FunctionSignature (
+            has_receiver: true,
+            receiver_mode: .ref_receiver,
+            params: self.freeze_model_ids(params),
+            param_symbols: self.freeze_symbol_ids(param_symbols),
+            exclusive_symbols: self.empty_symbol_ids(),
+            param_defaults: self.freeze_param_defaults(param_defaults),
+            result: self.add_node(.unit_type_ref(), span),
+            effects: sem.EffectSet()
+        );
+    }
+
+    sem.NodeId synthetic_init_root(self, sem.NodeId user_body, token.Span span) {
+        list.ArrayList<sem.NodeId> statements! = list.ArrayList<sem.NodeId>(1);
+        statements.add(user_body);
+        return self.add_node(.block(sem.Block (
+            effects: sem.EffectSet(),
+            statements: self.freeze_model_ids(statements),
+            result: null
+        )), span);
+    }
+
+    qid.DefId? next_unlowered_init_def(self, qid.DefId owner_def) {
+        sem.Def& owner_model = self.state.store.model.def_ref(owner_def);
+        Int index! = 0;
+        while (index < owner_model.members.len()) {
+            qid.DefId member_def = owner_model.members.get(index);
+            if (self.unlowered_init_def(member_def)) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Bool unlowered_init_def(self, qid.DefId def_id) {
+        if (self.state.store.defs.get(def_id).kind != .init_def) {
+            return false;
+        }
+        sem.Def& init_model = self.state.store.model.def_ref(def_id);
+        return init_model.decl.function_signature == null;
+    }
+
+    // deinit body 归属于隐藏 deinit_def。它没有显式参数，返回 unit；
+    // owner type 的泛型 scope 已在 nominal lowering 外层进入，因此 deinit
+    // body 仍然能解析 owner 泛型参数。
+    () lower_deinit(self, ast.StmtData deinit_decl) {
+        guard self.current_owner_def is .some(owner_def) else { return; }
+        if (!self.state.store.model.has_def(owner_def)) { return; }
+        sem.Def& owner_model = self.state.store.model.def_ref(owner_def);
+        guard owner_model.custom_deinit_def is .some(deinit_def) else { return; }
+
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = deinit_def;
+        sem.FunctionSignature signature = sem.FunctionSignature (
+            has_receiver: true,
+            receiver_mode: .ref_receiver,
+            params: self.empty_model_ids(),
+            param_symbols: self.empty_symbol_ids(),
+            exclusive_symbols: self.empty_symbol_ids(),
+            param_defaults: self.empty_param_defaults(),
+            result: self.add_node(.unit_type_ref(), self.state.unit.get(deinit_decl.value).span),
+            effects: sem.EffectSet()
+        );
+        self.declare_callable_signature(deinit_def, signature, false);
+        sem.NodeId placeholder = self.add_invalid_node(self.state.unit.get(deinit_decl.value).span);
+        self.state.store.model.load_body(deinit_def, sem.Body(deinit_def, placeholder));
+        self.env.enter_scope(.function_scope);
+        self.add_self_local(deinit_def, owner_def, .ref_receiver);
+        sem.NodeId root = self.lower_expr(deinit_decl.value);
+        self.env.exit_scope();
+        self.state.store.model.set_body_root(deinit_def, root);
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_member_range(self, ast.AstRange members) {
+        Int index! = 0;
+        while (index < members.length) {
+            ast.AstId member_id = self.state.unit.child_at(members, index);
+            ast.AstNode member = self.state.unit.get(member_id);
+            if (member.data is .member_decl(member_decl)) {
+                self.lower_decl_with_annotations(
+                    member_decl.body,
+                    member_decl.annotations,
+                    member_decl.modifiers.static_flag
+                );
+            } else {
+                self.lower_decl_with_annotations(member_id, self.empty_ast_range(), false);
+            }
+            index = index + 1;
+        }
+    }
+
+    () record_extension_members(self, Int extension_index, ast.AstRange members) {
+        Int index! = 0;
+        while (index < members.length) {
+            ast.AstId member_id = self.state.unit.child_at(members, index);
+            if (self.member_def_for_ast(member_id) is .some(member_def)) {
+                self.state.store.model.add_extension_member(extension_index, member_def);
+            }
+            index = index + 1;
+        }
+    }
+
+    qid.DefId? member_def_for_ast(self, ast.AstId member_id) {
+        ast.AstNode member = self.state.unit.get(member_id);
+        if (member.data is .member_decl(member_decl)) {
+            return self.member_def_for_ast(member_decl.body);
+        }
+        if (member.data is .function_decl(function_decl)) {
+            return self.decl_def_for_name(function_decl.name, .value_name);
+        }
+        if (member.data is .global_decl(global_decl)) {
+            return self.decl_def_for_name(global_decl.name, .value_name);
+        }
+        if (member.data is .field_decl(field_decl)) {
+            return self.first_field_def(field_decl);
+        }
+        if (member.data is .assoc_type(assoc_type)) {
+            return self.decl_def_for_name(assoc_type.name, self.assoc_type_domain(assoc_type));
+        }
+        if (member.data is .nominal_decl(nominal)) {
+            return self.decl_def_for_name(nominal.name, .type_name);
+        }
+        return null;
+    }
+
+    qid.DefId? first_field_def(self, ast.FieldData field_decl) {
+        if (field_decl.fields.length == 0) { return null; }
+        ast.AstId field_id = self.state.unit.child_at(field_decl.fields, 0);
+        ast.AstNode field_node = self.state.unit.get(field_id);
+        guard field_node.data is .field_declarator(field_data) else { return null; }
+        return self.decl_def_for_name(field_data.name, .member_name);
+    }
+
+    () lower_trait_ref_range(self, qid.DefId owner_def, ast.AstRange traits) {
+        Int index! = 0;
+        while (index < traits.length) {
+            self.lower_trait_bound_into(owner_def, self.state.unit.child_at(traits, index));
+            index = index + 1;
+        }
+    }
+
+    // 函数 body 是一个独立 Semantic Model owner。函数签名里的 type refs 和 body
+    // expression nodes 都归到 function_def，后续 type check/JIL lowering
+    // 只需要从 DefId 找到这一份 Def。
+    () lower_function(self,
+        ast.FunctionData function_decl,
+        ast.AstRange annotations,
+        Bool static_member,
+        sem.ExternKind extern_kind
+    ) {
+        guard self.decl_def_for_name(function_decl.name, .value_name) is .some(function_def) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = function_def;
+
+        self.enter_generic_scope_for_owner(function_def, function_decl.generics);
+        if (self.state.store.defs.get(function_def).owner_def is .some(owner_def)) {
+            self.define_self_type(owner_def);
+        }
+        Bool has_receiver = self.function_has_receiver(function_def, function_decl.params, static_member);
+        sem.FunctionSignature signature = self.lower_function_signature(
+            function_decl,
+            has_receiver,
+            self.self_receiver_mode_for_function(function_decl.params, annotations),
+            self.exclusive_symbols_from_signature(function_decl.params),
+            extern_kind
+        );
+        self.declare_callable_signature(function_def, signature, true);
+        if (extern_kind != .none) {
+            self.state.store.model.set_decl_extern_kind(function_def, extern_kind);
+            self.state.store.model.set_decl_is_external(function_def, function_decl.body == null);
+        }
+        self.lower_annotations(function_def, annotations);
+
+        if (function_decl.body is .some(body_ast)) {
+            // Body 拥有自己的 def-local node 空间。先放一个临时 invalid root，
+            // 这样可以在真实 root expression lower 之前创建 params/locals。
+            sem.NodeId placeholder = self.add_invalid_node(self.state.unit.get(function_decl.name).span);
+            self.state.store.model.load_body(function_def, sem.Body(function_def, placeholder));
+            self.env.enter_scope(.function_scope);
+            self.add_self_local_for_instance_function(function_def, has_receiver);
+            self.lower_parameters(function_def, function_decl.params, signature.params);
+            sem.NodeId root = self.lower_expr(body_ast);
+            self.env.exit_scope();
+            self.state.store.model.set_body_root(function_def, root);
+        }
+
+        self.env.exit_scope();
+        self.current_owner_def = previous_owner;
+    }
+
+    () add_self_local_for_instance_function(self, qid.DefId function_def, Bool has_receiver) {
+        if (!has_receiver) { return; }
+        if (self.state.store.defs.get(function_def).owner_def is .some(owner_def)) {
+            self.add_self_local(function_def, owner_def, self.self_local_receiver_mode(function_def));
+        }
+    }
+
+    () declare_callable_signature(
+        self,
+        qid.DefId def_id,
+        sem.FunctionSignature signature,
+        Bool include_receiver
+    ) {
+        self.state.store.model.declare_signature(def_id, signature);
+        qkey.Fingerprint128 disambiguator = fingerprint.callable_signature_fingerprint(
+            self.state.ctx,
+            def_id,
+            signature,
+            include_receiver
+        );
+        self.record_callable_stable_def(def_id, disambiguator);
+        self.record_callable_generic_params(def_id);
+    }
+
+    () record_callable_stable_def(
+        self,
+        qid.DefId def_id,
+        qkey.Fingerprint128 disambiguator
+    ) {
+        store.ModuleRecord& module = self.state.store.resolve.module_ref(self.state.module_id);
+        store.PackageRecord& package_record = self.state.store.resolve.package_ref(module.package_id);
+        def.DefRecord declaration = self.state.store.defs.get(def_id);
+        qid.DefId owner_def! = module.def_id;
+        if (declaration.owner_def is .some(owner)) {
+            owner_def = owner;
+        }
+        qkey.StableSymbolId? owner = self.state.store.incremental.stable_id_for_def(owner_def);
+        self.state.store.incremental.record_symbol(
+            self.state.store.symbols$.ref(),
+            qkey.StableSymbolKey (
+                kind: .function_symbol,
+                package_name: package_record.name,
+                module_path: module.path_symbol,
+                owner: owner,
+                name: declaration.name.symbol,
+                domain: declaration.domain,
+                disambiguator: disambiguator
+            ),
+            def_id
+        );
+    }
+
+    () record_callable_generic_params(self, qid.DefId callable_def) {
+        guard self.state.store.incremental.stable_id_for_def(callable_def)
+            is .some(owner) else {
+            return;
+        }
+        store.ModuleRecord& module = self.state.store.resolve.module_ref(self.state.module_id);
+        store.PackageRecord& package_record = self.state.store.resolve.package_ref(module.package_id);
+        sem.Def& callable = self.state.store.model.def_ref(callable_def);
+        Int index! = 0;
+        while (index < callable.generic_params.len()) {
+            qid.DefId param_def = callable.generic_params.get(index);
+            def.DefRecord param = self.state.store.defs.get(param_def);
+            self.state.store.incremental.record_symbol(
+                self.state.store.symbols$.ref(),
+                qkey.StableSymbolKey (
+                    kind: .local_symbol,
+                    package_name: package_record.name,
+                    module_path: module.path_symbol,
+                    owner: owner,
+                    name: param.name.symbol,
+                    domain: param.domain
+                ),
+                param_def
+            );
+            index = index + 1;
+        }
+    }
+
+    // global initializer 也需要 body/root，这样 JIL/codegen 可以像处理
+    // function body 一样消费它；没有 initializer 的 global 只有 decl type。
+    () lower_global(self, ast.GlobalData global_decl, ast.AstRange annotations, sem.ExternKind extern_kind) {
+        guard self.decl_def_for_name(global_decl.name, .value_name) is .some(global_def) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = global_def;
+
+        self.state.store.model.set_decl_type_ref(
+            global_def,
+            self.lower_type_ref(global_decl.type_ref)
+        );
+        self.state.store.model.set_decl_mutable_binding(global_def, global_decl.mutable_binding);
+        self.state.store.model.set_decl_is_const(global_def, global_decl.is_const);
+        self.state.store.model.set_decl_extern_kind(global_def, extern_kind);
+        self.lower_annotations(global_def, annotations);
+
+        if (global_decl.initializer is .some(initializer)) {
+            sem.NodeId placeholder = self.add_invalid_node(self.state.unit.get(global_decl.name).span);
+            self.state.store.model.load_body(global_def, sem.Body(global_def, placeholder));
+            sem.NodeId root = self.lower_expr(initializer);
+            self.state.store.model.set_body_root(global_def, root);
+        }
+
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_alias(self, ast.AliasData alias_decl, ast.AstRange annotations) {
+        guard self.state.declaration_def(alias_decl.name) is .some(alias_def) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = alias_def;
+        sem.Def& alias_model = self.state.store.model.def_ref(alias_def);
+        if (alias_model.decl.alias_target == null) {
+            if (alias_decl.target is .some(target_id)) {
+                self.state.store.model.set_decl_type_ref(alias_def, self.lower_type_ref(target_id));
+            }
+        }
+        self.lower_annotations(alias_def, annotations);
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_field_decl(self, ast.FieldData field_decl, ast.AstRange annotations) {
+        Int index! = 0;
+        while (index < field_decl.fields.length) {
+            ast.AstId field_id = self.state.unit.child_at(field_decl.fields, index);
+            ast.AstNode field_node = self.state.unit.get(field_id);
+            if (field_node.data is .field_declarator(field_data)) {
+                if (self.decl_def_for_name(field_data.name, .member_name) is .some(field_def)) {
+                    qid.DefId? previous_owner = self.current_owner_def;
+                    self.current_owner_def = field_def;
+                    self.state.store.model.set_decl_type_ref(
+                        field_def,
+                        self.lower_type_ref(field_decl.type_ref)
+                    );
+                    self.state.store.model.set_decl_mutable_binding(field_def, field_data.mutable_binding);
+                    if (field_data.default_value is .some(default_value)) {
+                        self.state.store.model.set_field_default(field_def, self.lower_expr(default_value));
+                    }
+                    self.lower_annotations(field_def, annotations);
+                    self.current_owner_def = previous_owner;
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    // Semantic Model lowering 不能重新做 name resolve，但 generic param 是局部 type
+    // binding，不在 module namespace 里。这里把 reference resolve 已经创建
+    // 的 generic_param DefId 重新挂进 lowering 的临时 env，保证签名、
+    // where 和成员类型里的 `T` 能降成 named_type_ref(self, T)。
+    () enter_generic_scope_for_owner(self, qid.DefId owner_def, ast.AstId? generics) {
+        self.env.enter_scope(.generic_scope);
+        guard generics is .some(generic_id) else { return; }
+        ast.AstNode generic_node = self.state.unit.get(generic_id);
+        guard generic_node.data is .generic_params(generic_data) else { return; }
+
+        Int index! = 0;
+        while (index < generic_data.type_params.length) {
+            self.enter_generic_param(owner_def, self.state.unit.child_at(generic_data.type_params, index));
+            index = index + 1;
+        }
+    }
+
+    () enter_generic_param(self, qid.DefId owner_def, ast.AstId param_id) {
+        ast.AstNode param_node = self.state.unit.get(param_id);
+        guard param_node.data is .generic_param(param_data) else { return; }
+        guard self.generic_param_def_for_any_domain(owner_def, param_data.name) is .some(generic_def) else {
+            return;
+        }
+        def.NameDomain domain = self.state.store.defs.get(generic_def).domain;
+        self.define_existing_local(param_data.name, domain, generic_def);
+        if (domain == .value_name) {
+            if (self.state.generic_param_const_type(generic_def) is .some(type_ref)) {
+                sem.NodeId lowered = self.lower_type_ref(type_ref);
+                self.state.store.model.set_decl_type_ref(generic_def, lowered);
+                self.add_const_where_predicate(owner_def, generic_def, lowered);
+            }
+            return;
+        }
+        if (domain == .type_name) {
+            if (param_data.type_bound is .some(type_bound)) {
+                self.lower_where_type_bound(owner_def, param_data.name, type_bound);
+            }
+        }
+    }
+
+    qid.DefId? generic_param_def_for_any_domain(self, qid.DefId owner_def, ast.AstId name_id) {
+        if (self.generic_param_def_for_name(owner_def, name_id, .value_name) is .some(generic_def)) {
+            return generic_def;
+        }
+        return self.generic_param_def_for_name(owner_def, name_id, .type_name);
+    }
+
+    qid.DefId? generic_param_def_for_name(self, qid.DefId owner_def, ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
+        sem.Def& model_def = self.state.store.model.def_ref(owner_def);
+
+        Int index! = 0;
+        while (index < model_def.generic_params.len()) {
+            qid.DefId member_def = model_def.generic_params.get(index);
+            def.DefRecord member_record = self.state.store.defs.get(member_def);
+            if (member_record.name.symbol == symbol && member_record.domain == domain) {
+                return member_def;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    () define_self_type(self, qid.DefId owner_def) {
+        qid.SymbolId self_symbol = self.state.store.symbols.intern("Self");
+        token.Span span! = token.Span();
+        if (self.state.store.source_map.def_span(owner_def) is .some(loc)) {
+            span = loc.span;
+        }
+        self.env.define(self_symbol, .type_name, owner_def, span);
+    }
+
+    () define_owner_generic_params(self, qid.DefId owner_def) {
+        guard self.state.store.model.def(owner_def) is .some(model_def) else { return; }
+        Int index! = 0;
+        while (index < model_def.generic_params.len()) {
+            self.define_existing_generic_param(model_def.generic_params.get(index));
+            index = index + 1;
+        }
+    }
+
+    () define_existing_generic_param(self, qid.DefId param_def) {
+        def.DefRecord record = self.state.store.defs.get(param_def);
+        token.Span span! = record.name.span;
+        if (self.state.store.source_map.def_span(param_def) is .some(loc)) {
+            span = loc.span;
+        }
+        self.env.define(record.name.symbol, record.domain, param_def, span);
+    }
+
+    () define_existing_local(self, ast.AstId name_id, def.NameDomain domain, qid.DefId def_id) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return; }
+        token.Span span = self.state.unit.get(name_id).span;
+        self.env.define(symbol, domain, def_id, span);
+    }
+
+    () lower_annotations(self, qid.DefId owner_def, ast.AstRange annotations) {
+        Int index! = 0;
+        while (index < annotations.length) {
+            self.lower_annotation(owner_def, self.state.unit.child_at(annotations, index));
+            index = index + 1;
+        }
+    }
+
+    () lower_annotation(self, qid.DefId owner_def, ast.AstId annotation_id) {
+        ast.AstNode annotation = self.state.unit.get(annotation_id);
+        if (annotation.data is .self_attribute(_)) {
+            return;
+        }
+        if (annotation.data is .inline_attribute(_)) {
+            self.state.store.model.set_inline_mode(owner_def, .always);
+            return;
+        }
+        if (annotation.data is .naked_attribute(_)) {
+            self.state.store.model.set_naked(owner_def);
+            return;
+        }
+        if (annotation.data is .link_symbol_attribute(link_symbol)) {
+            if (link_symbol.symbol_id is .some(symbol)) {
+                self.state.store.model.set_link_symbol(owner_def, symbol);
+            }
+            return;
+        }
+        if (annotation.data is .alias_attribute(alias_attr)) {
+            self.lower_alias_attribute(alias_attr);
+            return;
+        }
+        if (annotation.data is .lifetime_constraint(lifetime)) {
+            self.state.store.model.add_lifetime_constraint(owner_def, sem.LifetimeConstraint (
+                longer: self.lower_lifetime_name(lifetime.longer),
+                shorter: self.lower_lifetime_name(lifetime.shorter),
+                relation: self.lifetime_constraint_relation(lifetime.relation)
+            ));
+            return;
+        }
+        if (annotation.data is .lifetime_contract_attribute(_)) {
+            self.state.store.model.begin_life_annotation(owner_def);
+            self.state.store.model.mark_explicit_empty_lifetime_contract(owner_def);
+            return;
+        }
+        if (annotation.data is .life_attribute(life_attr)) {
+            self.lower_life_attribute(owner_def, life_attr);
+            return;
+        }
+        if (annotation.data is .region_attribute(region)) {
+            self.lower_region_attribute(owner_def, region);
+            return;
+        }
+        self.lower_where_constraint(owner_def, annotation_id);
+    }
+
+    () lower_life_attribute(self, qid.DefId owner_def, ast.LifeAttributeData life_attr) {
+        self.state.store.model.begin_life_annotation(owner_def);
+        Int index! = 0;
+        while (index < life_attr.clauses.length) {
+            ast.AstNode node = self.state.unit.get(
+                self.state.unit.child_at(life_attr.clauses, index)
+            );
+            if (node.data is .life_clause(clause)) {
+                sem.LifetimeName? target! = null;
+                if (clause.target is .some(target_id)) {
+                    target = self.lower_lifetime_name(target_id);
+                }
+                sem.LifetimeExpressionId? source_expression! = null;
+                ast.AstNode source_node = self.state.unit.get(clause.source);
+                if (!(source_node.data is .lifetime_name(_))) {
+                    source_expression = self.lower_lifetime_expression(clause.source);
+                }
+                self.state.store.model.add_life_clause(owner_def, sem.LifeClause (
+                    target: target,
+                    source: self.lower_lifetime_name(clause.source),
+                    source_expression: source_expression
+                ));
+            }
+            index = index + 1;
+        }
+    }
+
+    sem.LifetimeExpressionId lower_lifetime_expression(
+        self,
+        ast.AstId expression_id
+    ) {
+        ast.AstNode node = self.state.unit.get(expression_id);
+        if (node.data is .lifetime_name(_)) {
+            return self.add_lifetime_name_expression(
+                self.lower_lifetime_name(expression_id)
+            );
+        }
+        if (node.data is .lifetime_expression_meet(meet)) {
+            return self.add_lifetime_binary_expression(
+                self.lower_lifetime_expression(meet.left),
+                self.lower_lifetime_expression(meet.right),
+                false
+            );
+        }
+        guard node.data is .lifetime_expression_product(product) else {
+            return self.add_lifetime_name_expression(
+                self.lower_lifetime_name(expression_id)
+            );
+        }
+        return self.lower_lifetime_product_expression(product);
+    }
+
+    sem.LifetimeExpressionId lower_lifetime_product_expression(
+        self,
+        ast.LifetimeExpressionProductData product
+    ) {
+        if (product.items.length == 0) {
+            return self.add_lifetime_name_expression(self.invalid_lifetime_name());
+        }
+        sem.LifetimeExpressionId result! = self.lower_lifetime_expression(
+            self.state.unit.child_at(product.items, 0)
+        );
+        Int index! = 1;
+        while (index < product.items.length) {
+            result = self.add_lifetime_binary_expression(
+                result,
+                self.lower_lifetime_expression(
+                    self.state.unit.child_at(product.items, index)
+                ),
+                true
+            );
+            index = index + 1;
+        }
+        return result;
+    }
+
+    sem.LifetimeExpressionId add_lifetime_name_expression(
+        self,
+        sem.LifetimeName name
+    ) {
+        return self.state.store.model.add_lifetime_expression(
+            sem.LifetimeExpression(data: .name(name))
+        );
+    }
+
+    sem.LifetimeExpressionId add_lifetime_binary_expression(
+        self,
+        sem.LifetimeExpressionId left,
+        sem.LifetimeExpressionId right,
+        Bool product
+    ) {
+        sem.LifetimeExpressionBinary binary =
+            sem.LifetimeExpressionBinary(left: left, right: right);
+        if (product) {
+            return self.state.store.model.add_lifetime_expression(
+                sem.LifetimeExpression(data: .product(binary))
+            );
+        }
+        return self.state.store.model.add_lifetime_expression(
+            sem.LifetimeExpression(data: .meet(binary))
+        );
+    }
+
+    sem.LifetimeName invalid_lifetime_name(self) {
+        return sem.LifetimeName (
+            kind: sem.LifetimeNameKind.named_lifetime,
+            symbol: null,
+            projection_path: null
+        );
+    }
+
+    () lower_region_attribute(self, qid.DefId owner_def, ast.RegionAttributeData region) {
+        self.state.store.model.begin_region_annotation(owner_def);
+        Int index! = 0;
+        while (index < region.items.length) {
+            ast.AstId item_id = self.state.unit.child_at(region.items, index);
+            ast.AstNode item = self.state.unit.get(item_id);
+            if (item.data is .name(_)) {
+                self.lower_region_param(owner_def, item_id);
+            } else if (item.data is .region_constraint(constraint)) {
+                self.lower_region_param(owner_def, constraint.target);
+                self.lower_region_constraint(owner_def, constraint);
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_region_param(self, qid.DefId owner_def, ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return; }
+        self.state.store.model.add_region_param(owner_def, sem.RegionParam (
+            name: symbol,
+            span: self.state.unit.get(name_id).span
+        ));
+    }
+
+    () lower_region_constraint(self, qid.DefId owner_def, ast.RegionConstraintData constraint) {
+        guard self.state.name_symbol(constraint.target) is .some(target) else { return; }
+        guard self.state.name_symbol(constraint.source) is .some(source) else { return; }
+        self.state.store.model.add_region_constraint(
+            owner_def,
+            sem.RegionConstraint(target: target, source: source)
+        );
+    }
+
+    () lower_alias_attribute(self, ast.AliasAttributeData alias_attr) {
+        guard self.state.declaration_def(alias_attr.name) is .some(alias_def) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = alias_def;
+        self.state.store.model.set_decl_type_ref(alias_def, self.lower_type_ref(alias_attr.value));
+        self.current_owner_def = previous_owner;
+    }
+
+    sem.LifetimeName lower_lifetime_name(self, ast.AstId name_id) {
+        ast.AstNode node = self.state.unit.get(name_id);
+        guard node.data is .lifetime_name(name) else {
+            return sem.LifetimeName (
+                kind: sem.LifetimeNameKind.named_lifetime,
+                symbol: null,
+                projection_path: null
+            );
+        }
+
+        qid.SymbolId? symbol! = null;
+        if (name.symbol_id is .some(symbol_id)) {
+            symbol = symbol_id;
+        }
+        return sem.LifetimeName (
+            kind: self.lifetime_name_kind(name.kind),
+            symbol: symbol,
+            projection_path: self.lower_lifetime_projections(name.projections)
+        );
+    }
+
+    sem.LifetimePathId? lower_lifetime_projections(self, ast.AstRange projections) {
+        sem.LifetimePathId? path! = null;
+        Int index! = 0;
+        while (index < projections.length) {
+            ast.AstNode projection_node = self.state.unit.get(self.state.unit.child_at(projections, index));
+            if (projection_node.data is .lifetime_projection(projection)) {
+                path = self.add_lifetime_projection(path, projection);
+            }
+            index = index + 1;
+        }
+        return path;
+    }
+
+    sem.LifetimePathId add_lifetime_projection(
+        self,
+        sem.LifetimePathId? parent,
+        ast.LifetimeProjectionData projection
+    ) {
+        sem.LifetimeProjectionKind kind! = .field;
+        Int tuple_index! = 0;
+        if (projection.kind == .tuple_index) {
+            kind = .tuple_index;
+            tuple_index = self.lifetime_tuple_index(projection.symbol_id);
+        }
+        return self.state.store.model.add_lifetime_path_node(sem.LifetimePathNode (
+            parent: parent,
+            projection: sem.LifetimeProjection (
+                kind: kind,
+                symbol: projection.symbol_id,
+                field_def: null,
+                tuple_index: tuple_index
+            )
+        ));
+    }
+
+    Int lifetime_tuple_index(self, qid.SymbolId? symbol) {
+        guard symbol is .some(value) else { return 0; }
+        return Int(self.parse_uint_literal(self.state.store.symbols.text(value)));
+    }
+
+    sem.LifetimeConstraintRelation lifetime_constraint_relation(ast.LifetimeConstraintRelation relation) {
+        if (relation == .equal) { return .equal; }
+        return .outlives;
+    }
+
+    sem.LifetimeNameKind lifetime_name_kind(self, ast.LifetimeNameKind kind) {
+        if (kind == .self_lifetime) { return .self_lifetime; }
+        if (kind == .return_lifetime) { return .return_lifetime; }
+        return .named_lifetime;
+    }
+
+    () lower_where_constraint(self, qid.DefId owner_def, ast.AstId constraint_id) {
+        ast.AstNode constraint = self.state.unit.get(constraint_id);
+        if (constraint.data is .where_const(constraint)) {
+            guard self.resolved_value_def_for_expr(constraint.param) is .some(param_def) else { return; }
+            self.add_const_where_predicate(
+                owner_def,
+                param_def,
+                self.lower_type_ref(constraint.type_ref)
+            );
+            return;
+        }
+        if (constraint.data is .where_type_bound(bound)) {
+            self.lower_where_type_bound(owner_def, bound.param, bound.bound);
+            return;
+        }
+        if (constraint.data is .where_equal(equal)) {
+            self.state.store.model.add_where_predicate(owner_def, .equal(sem.WhereEqual (
+                    subject: self.lower_where_equal_subject(equal.param),
+                    value: self.lower_where_equal_value(equal.param, equal.value)
+                ))
+            );
+            return;
+        }
+        if (constraint.data is .where_not_equal(equal)) {
+            self.state.store.model.add_where_predicate(owner_def, .not_equal(sem.WhereEqual (
+                    subject: self.lower_where_equal_subject(equal.param),
+                    value: self.lower_where_equal_value(equal.param, equal.value)
+                ))
+            );
+            return;
+        }
+        if (constraint.data is .where_projection_equal(equal)) {
+            self.state.store.model.add_where_predicate(owner_def, .projection_equal(sem.WhereProjectionEqual(
+                    subject: self.lower_type_ref(equal.param),
+                    trait_ref: self.lower_type_ref(equal.trait_path),
+                    assoc_symbol: self.symbol_for_name(equal.assoc_name),
+                    value: self.lower_projection_equal_value(equal.trait_path, equal.assoc_name, equal.value)
+                ))
+            );
+        }
+    }
+
+    () add_const_where_predicate(
+        self,
+        qid.DefId owner_def,
+        qid.DefId param_def,
+        sem.NodeId type_ref
+    ) {
+        self.state.store.model.add_where_predicate(owner_def, .const_type(sem.WhereConstConstraint(
+            param_def: param_def,
+            type_ref: type_ref
+        )));
+    }
+
+    () lower_where_type_bound(self, qid.DefId owner_def, ast.AstId subject, ast.AstId bound_id) {
+        ast.AstNode bound = self.state.unit.get(bound_id);
+        if (bound.data is .trait_bound(trait_bound)) {
+            sem.WhereTypeBound lowered = sem.WhereTypeBound (
+                    subject: self.lower_type_ref(subject),
+                    bound: self.lower_trait_bound_ref(trait_bound)
+                );
+            if (trait_bound.negative) {
+                self.state.store.model.add_where_predicate(owner_def, .negative_type_bound(lowered));
+            } else {
+                self.state.store.model.add_where_predicate(owner_def, .type_bound(lowered));
+                self.lower_where_trait_assoc_bindings(owner_def, subject, trait_bound, lowered.bound);
+            }
+            return;
+        }
+        if (bound.data is .type_bound_intersection(intersection)) {
+            self.lower_where_type_bound(owner_def, subject, intersection.left);
+            self.lower_where_type_bound(owner_def, subject, intersection.right);
+        }
+    }
+
+    () lower_where_trait_assoc_bindings(self,
+        qid.DefId owner_def,
+        ast.AstId subject,
+        ast.TraitBoundData trait_bound,
+        sem.NodeId trait_ref
+    ) {
+        Int index! = 0;
+        while (index < trait_bound.args.length) {
+            ast.AstId arg_id = self.state.unit.child_at(trait_bound.args, index);
+            ast.AstNode arg = self.state.unit.get(arg_id);
+            if (arg.data is .assoc_type_binding(binding)) {
+                sem.WhereProjectionEqual predicate = sem.WhereProjectionEqual(
+                    subject: self.lower_type_ref(subject),
+                    trait_ref: trait_ref,
+                    assoc_symbol: self.symbol_for_name(binding.name),
+                    value: self.lower_assoc_binding_value(trait_bound, binding)
+                );
+                self.state.store.model.add_where_predicate(owner_def, .projection_equal(predicate));
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_typed_union_variants(
+        self,
+        ast.TypedUnionVariantsData variants,
+        ast.AstRange annotations
+    ) {
+        // `Int a, b;` 这种 typed union variant group 会生成多个 variant def，
+        // 但它们共享同一个 payload type syntax。Semantic Model 需要给每个 variant
+        // 都写入自己的 type_ref，type check 才能按 DefId 读取 payload 类型。
+        Int index! = 0;
+        while (index < variants.names.length) {
+            ast.AstId name_id = self.state.unit.child_at(variants.names, index);
+            if (self.decl_def_for_name(name_id, .member_name) is .some(variant_def)) {
+                qid.DefId? previous_owner = self.current_owner_def;
+                self.current_owner_def = variant_def;
+                self.state.store.model.set_decl_type_ref(variant_def, self.lower_type_ref(variants.type_ref));
+                self.lower_annotations(variant_def, annotations);
+                self.current_owner_def = previous_owner;
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_enum_case(self, ast.EnumCaseData enum_case) {
+        guard self.decl_def_for_name(enum_case.name, .member_name) is .some(case_def) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = case_def;
+        if (enum_case.value is .some(value)) {
+            self.state.store.model.set_enum_case_value(case_def, self.lower_expr(value));
+        }
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_assoc_type(self, ast.AssocTypeData assoc_type, ast.AstRange annotations) {
+        def.NameDomain domain = self.assoc_type_domain(assoc_type);
+        guard self.decl_def_for_name(assoc_type.name, domain) is .some(assoc_def) else { return; }
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = assoc_def;
+        self.lower_annotations(assoc_def, annotations);
+        self.state.store.model.set_decl_is_const(assoc_def, assoc_type.is_const);
+        if (assoc_type.value is .some(value)) {
+            self.state.store.model.set_decl_type_ref(assoc_def, self.lower_type_ref(value));
+        }
+        if (assoc_type.type_ref is .some(type_ref)) {
+            self.state.store.model.set_decl_type_ref(assoc_def, self.lower_type_ref(type_ref));
+        }
+        if (assoc_type.const_value is .some(value)) {
+            sem.NodeId placeholder = self.add_invalid_node(self.state.unit.get(assoc_type.name).span);
+            self.state.store.model.load_body(assoc_def, sem.Body(assoc_def, placeholder));
+            sem.NodeId root = self.lower_expr(value);
+            self.state.store.model.set_body_root(assoc_def, root);
+        }
+        self.lower_assoc_type_constraints(assoc_def, assoc_type.constraints);
+        self.current_owner_def = previous_owner;
+    }
+
+    () lower_assoc_type_constraints(self, qid.DefId assoc_def, ast.AstRange constraints) {
+        Int index! = 0;
+        while (index < constraints.length) {
+            self.lower_trait_bound_into(assoc_def, self.state.unit.child_at(constraints, index));
+            index = index + 1;
+        }
+    }
+
+    () lower_trait_bound_into(self, qid.DefId owner_def, ast.AstId bound_id) {
+        ast.AstNode bound = self.state.unit.get(bound_id);
+        if (bound.data is .trait_bound(trait_bound)) {
+            if (trait_bound.negative) {
+                self.lower_negative_nominal_trait(owner_def, bound.span, trait_bound);
+                return;
+            }
+            sem.NodeId trait_ref = self.lower_trait_bound_ref(trait_bound);
+            self.state.store.model.add_trait_ref(owner_def, trait_ref);
+            self.lower_associated_type_trait_assoc_bindings(owner_def, trait_bound, trait_ref);
+            self.lower_concrete_trait_assoc_const_bindings(owner_def, trait_bound);
+            return;
+        }
+        if (bound.data is .type_bound_intersection(intersection)) {
+            self.lower_trait_bound_into(owner_def, intersection.left);
+            self.lower_trait_bound_into(owner_def, intersection.right);
+        }
+    }
+
+    () lower_negative_nominal_trait(
+        self,
+        qid.DefId owner_def,
+        token.Span span,
+        ast.TraitBoundData trait_bound
+    ) {
+        def.DefKind owner_kind = self.state.store.defs.get(owner_def).kind;
+        if (!self.is_nominal_kind(owner_kind) || !self.trait_bound_names_movable(trait_bound)) {
+            self.add_name_resolution_error(
+                span,
+                "only nominal types may opt out of Movable",
+                "negative_trait_in_trait_list"
+            );
+            return;
+        }
+        self.state.store.model.add_negative_trait_ref(
+            owner_def,
+            self.lower_trait_bound_ref(trait_bound)
+        );
+    }
+
+    Bool is_nominal_kind(self, def.DefKind kind) {
+        if (kind == .struct_def) { return true; }
+        if (kind == .enum_def) { return true; }
+        return kind == .union_def;
+    }
+
+    Bool trait_bound_names_movable(self, ast.TraitBoundData trait_bound) {
+        guard self.resolved_type_def_for_expr(trait_bound.path) is .some(trait_def) else {
+            return false;
+        }
+        guard self.state.store.resolve.core_traits.movable_trait is .some(movable_trait) else {
+            return false;
+        }
+        return trait_def.to_index() == movable_trait.to_index();
+    }
+
+    () lower_associated_type_trait_assoc_bindings(self,
+        qid.DefId assoc_def,
+        ast.TraitBoundData trait_bound,
+        sem.NodeId trait_ref
+    ) {
+        sem.NodeId subject = self.lower_def_type_ref(assoc_def);
+        Int index! = 0;
+        while (index < trait_bound.args.length) {
+            ast.AstId arg_id = self.state.unit.child_at(trait_bound.args, index);
+            ast.AstNode arg = self.state.unit.get(arg_id);
+            if (arg.data is .assoc_type_binding(binding)) {
+                sem.WhereProjectionEqual predicate = sem.WhereProjectionEqual(
+                    subject: subject,
+                    trait_ref: trait_ref,
+                    assoc_symbol: self.symbol_for_name(binding.name),
+                    value: self.lower_assoc_binding_value(trait_bound, binding)
+                );
+                self.state.store.model.add_where_predicate(assoc_def, .projection_equal(predicate));
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_concrete_trait_assoc_const_bindings(self, qid.DefId owner_def, ast.TraitBoundData trait_bound) {
+        def.DefKind owner_kind = self.state.store.defs.get(owner_def).kind;
+        if (owner_kind != .struct_def && owner_kind != .enum_def && owner_kind != .union_def) { return; }
+        guard self.resolved_type_def_for_expr(trait_bound.path) is .some(trait_def) else { return; }
+        guard self.state.store.defs.get(trait_def).owned_namespace_id is .some(namespace_id) else { return; }
+        Int index! = 0;
+        while (index < trait_bound.args.length) {
+            ast.AstId arg_id = self.state.unit.child_at(trait_bound.args, index);
+            ast.AstNode arg = self.state.unit.get(arg_id);
+            index = index + 1;
+            guard arg.data is .assoc_type_binding(binding) else { continue; }
+            guard self.state.name_symbol(binding.name) is .some(symbol) else { continue; }
+            guard self.associated_item_in_domain(namespace_id, symbol, .value_name) is .some(trait_assoc) else {
+                continue;
+            }
+            self.lower_synthetic_assoc_const(owner_def, trait_assoc, binding);
+        }
+    }
+
+    () lower_synthetic_assoc_const(
+        self,
+        qid.DefId owner_def,
+        qid.DefId trait_assoc,
+        ast.AssocTypeBindingData binding
+    ) {
+        token.Span span = self.state.unit.get(binding.name).span;
+        qid.SymbolId symbol = self.state.store.defs.get(trait_assoc).name.symbol;
+        qid.DefId impl_assoc = self.state.store.defs.create(
+            .associated_type_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: symbol, span: span),
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.state.store.defs.ref_at(impl_assoc).associated_trait_member = trait_assoc;
+        self.state.store.source_map.set_def_span(impl_assoc, self.state.unit.source_id, span);
+        self.state.store.model.declare_def(impl_assoc, .associated_type_decl);
+        self.state.store.model.add_member(owner_def, impl_assoc);
+        self.state.store.model.set_decl_is_const(impl_assoc, true);
+        qid.DefId? previous_owner = self.current_owner_def;
+        self.current_owner_def = impl_assoc;
+        sem.NodeId placeholder = self.add_invalid_node(span);
+        self.state.store.model.load_body(impl_assoc, sem.Body(impl_assoc, placeholder));
+        self.state.store.model.set_body_root(impl_assoc, self.lower_expr(binding.value));
+        self.current_owner_def = previous_owner;
+    }
+
+    sem.NodeId lower_def_type_ref(self, qid.DefId def_id) {
+        list.ArrayList<sem.NodeId> args! = list.ArrayList<sem.NodeId>();
+        guard self.state.store.model.def(def_id) is .some(owner_model) else {
+            return self.add_node(.named_type_ref(sem.NamedTypeRef(
+                def_id: def_id,
+                args: self.freeze_model_ids(args)
+            )), token.Span());
+        }
+        Int index! = 0;
+        while (index < owner_model.generic_params.len()) {
+            args.add(self.lower_def_type_ref(owner_model.generic_params.get(index)));
+            index = index + 1;
+        }
+        return self.add_node(.named_type_ref(sem.NamedTypeRef(
+            def_id: def_id,
+            args: self.freeze_model_ids(args)
+        )), token.Span());
+    }
+
+    sem.NodeId lower_trait_bound_ref(self, ast.TraitBoundData trait_bound) {
+        token.Span span = self.state.unit.get(trait_bound.path).span;
+        guard self.resolved_type_def_for_expr(trait_bound.path) is .some(def_id) else {
+            return self.add_node(.invalid_type_ref(), span);
+        }
+        return self.add_node(.named_type_ref(sem.NamedTypeRef(
+            def_id: def_id,
+            args: self.lower_trait_bound_args(trait_bound.args)
+        )), span);
+    }
+
+    sem.NodeId[]& lower_trait_bound_args(self, ast.AstRange args) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(args.length);
+        Int index! = 0;
+        while (index < args.length) {
+            ast.AstId arg_id = self.state.unit.child_at(args, index);
+            ast.AstNode arg = self.state.unit.get(arg_id);
+            if (arg.data is .assoc_type_binding(_)) {
+                // `Trait<Item = Int>` is only sugar for a projection-equality
+                // where predicate. Keep it out of positional type args.
+            } else {
+                values.add(self.lower_type_ref(arg_id));
+            }
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    qid.SymbolId symbol_for_name(self, ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else {
+            return qid.SymbolId(0);
+        }
+        return symbol;
+    }
+
+    Bool function_has_receiver(self, qid.DefId function_def, ast.AstRange params, Bool static_member) {
+        if (static_member) { return false; }
+        guard self.state.store.defs.get(function_def).owner_def is .some(owner_def) else { return false; }
+        return self.params_have_receiver_syntax(params);
+    }
+
+    @life(return: self & exclusive_symbols)
+    sem.FunctionSignature lower_function_signature(self,
+        ast.FunctionData function_decl,
+        Bool has_receiver,
+        sem.SelfReceiverMode receiver_mode,
+        qid.SymbolId[]& exclusive_symbols,
+        sem.ExternKind extern_kind
+    ) {
+        list.ArrayList<sem.NodeId> params! = list.ArrayList<sem.NodeId>(function_decl.params.length);
+        list.ArrayList<qid.SymbolId> param_symbols! = list.ArrayList<qid.SymbolId>(function_decl.params.length);
+        list.ArrayList<sem.ParamDefault> param_defaults! = list.ArrayList<sem.ParamDefault>();
+        Int index! = 0;
+        Int param_index! = 0;
+        while (index < function_decl.params.length) {
+            ast.AstId param_id = self.state.unit.child_at(function_decl.params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .param(param)) {
+                if (self.param_is_explicit_receiver(param, index)) {
+                    index = index + 1;
+                    continue;
+                }
+                params.add(self.lower_type_ref(param.type_ref));
+                param_symbols.add(self.name_symbol_or_zero(param.name));
+                self.lower_param_default(param_index, param, param_defaults$.ref());
+                param_index = param_index + 1;
+            }
+            index = index + 1;
+        }
+        return sem.FunctionSignature (
+            has_receiver: has_receiver,
+            receiver_mode: receiver_mode,
+            params: self.freeze_model_ids(params),
+            param_symbols: self.freeze_symbol_ids(param_symbols),
+            exclusive_symbols: exclusive_symbols,
+            param_defaults: self.freeze_param_defaults(param_defaults),
+            result: self.lower_type_ref(function_decl.result_type),
+            effects: self.lower_function_effects(function_decl.effects, extern_kind)
+        );
+    }
+
+    sem.EffectSet lower_function_effects(self, ast.EffectSet effects, sem.ExternKind extern_kind) {
+        sem.EffectSet lowered = self.lower_effect_set(effects);
+        if (extern_kind == .c_abi) {
+            return sem.EffectSet(
+                has_unsafe: true,
+                has_async: lowered.has_async,
+                has_sync: false,
+                domain: lowered.domain,
+                context: lowered.context
+            );
+        }
+        return lowered;
+    }
+
+    qid.SymbolId[]& exclusive_symbols_from_signature(self, ast.AstRange params) {
+        list.ArrayList<qid.SymbolId> symbols! = list.ArrayList<qid.SymbolId>();
+        self.append_exclusive_param_symbols(params, symbols$.ref());
+        return self.freeze_symbol_ids(symbols);
+    }
+
+    () append_exclusive_param_symbols(self, ast.AstRange params, list.ArrayList<qid.SymbolId>& symbols) {
+        Int index! = 0;
+        while (index < params.length) {
+            ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, index));
+            guard param_node.data is .param(param) else { index = index + 1; continue; }
+            if (self.param_type_is_mutable_reference(param.type_ref)) {
+                symbols.add(self.symbol_for_name(param.name));
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool param_type_is_mutable_reference(self, ast.AstId type_ref) {
+        ast.AstNode type_node = self.state.unit.get(type_ref);
+        guard type_node.data is .type_ref(mutable_type) else { return false; }
+        if (mutable_type.layer != .mutable_type) { return false; }
+        ast.AstNode element_node = self.state.unit.get(mutable_type.base);
+        guard element_node.data is .type_ref(element) else { return false; }
+        return element.layer == .reference;
+    }
+
+    sem.SelfReceiverMode self_receiver_mode_for_function(self,
+        ast.AstRange params,
+        ast.AstRange annotations
+    ) {
+        if (self.explicit_self_receiver_mode(params) is .some(mode)) { return mode; }
+        return .ref_receiver;
+    }
+
+    sem.SelfReceiverMode? explicit_self_receiver_mode(self, ast.AstRange params) {
+        if (params.length == 0) { return null; }
+        ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, 0));
+        guard param_node.data is .param(param) else { return null; }
+        if (param.receiver_mode is .some(mode)) { return self.lower_self_receiver_mode(mode); }
+        if (!self.param_name_is_self(param)) { return null; }
+        return self.self_receiver_mode_from_type_ref(param.type_ref);
+    }
+
+    Bool param_is_explicit_receiver(self, ast.ParamData param, Int index) {
+        if (index != 0) { return false; }
+        if (param.receiver_mode != null) { return true; }
+        if (!self.param_name_is_self(param)) { return false; }
+        return self.self_receiver_mode_from_type_ref(param.type_ref) != null;
+    }
+
+    Bool params_have_receiver_syntax(self, ast.AstRange params) {
+        Int index! = 0;
+        while (index < params.length) {
+            ast.AstNode param_node = self.state.unit.get(self.state.unit.child_at(params, index));
+            if (param_node.data is .param(param)) {
+                if (self.param_is_explicit_receiver(param, index)) { return true; }
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool param_name_is_self(self, ast.ParamData param) {
+        guard self.state.name_symbol(param.name) is .some(symbol) else { return false; }
+        return symbol == self.state.store.symbols.intern("self");
+    }
+
+    sem.SelfReceiverMode? self_receiver_mode_from_type_ref(self, ast.AstId type_ref) {
+        ast.AstNode type_node = self.state.unit.get(type_ref);
+        if (type_node.data is .type_ref(type_data)) {
+            if (type_data.layer == .mutable_type) {
+                ast.AstNode element_node = self.state.unit.get(type_data.base);
+                if (element_node.data is .type_ref(element)
+                    && element.layer == .reference
+                    && self.state.self_type_ref_owner(element.base) != null) {
+                    return sem.SelfReceiverMode.mutable_ref_receiver;
+                }
+            }
+            if (type_data.layer == .reference && self.state.self_type_ref_owner(type_data.base) != null) {
+                return sem.SelfReceiverMode.ref_receiver;
+            }
+        }
+        if (self.state.self_type_ref_owner(type_ref) != null) {
+            return sem.SelfReceiverMode.move_receiver;
+        }
+        return null;
+    }
+
+    sem.SelfReceiverMode lower_self_receiver_mode(self, ast.SelfReceiverMode mode) {
+        if (mode == .move_receiver) {
+            return .move_receiver;
+        }
+        if (mode == .mutable_ref_receiver) {
+            return .mutable_ref_receiver;
+        }
+        return .ref_receiver;
+    }
+
+    () lower_param_default(self,
+        Int param_index,
+        ast.ParamData param,
+        list.ArrayList<sem.ParamDefault>& param_defaults
+    ) {
+        if (param.default_value is .some(value)) {
+            param_defaults.add(sem.ParamDefault (
+                param_index: param_index,
+                value: self.lower_expr(value)
+            ));
+        }
+    }
+
+    qid.SymbolId[]& empty_symbol_ids(self) {
+        list.ArrayList<qid.SymbolId> values! = list.ArrayList<qid.SymbolId>();
+        return self.freeze_symbol_ids(values);
+    }
+
+    sem.ParamDefault[]& empty_param_defaults(self) {
+        list.ArrayList<sem.ParamDefault> values! = list.ArrayList<sem.ParamDefault>();
+        return self.freeze_param_defaults(values);
+    }
+
+    () lower_parameters(self, qid.DefId owner_def, ast.AstRange params, sem.NodeId[]& param_type_refs) {
+        Int index! = 0;
+        Int type_index! = 0;
+        while (index < params.length) {
+            ast.AstId param_id = self.state.unit.child_at(params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .param(param)) {
+                if (self.param_is_explicit_receiver(param, index)) {
+                    index = index + 1;
+                    continue;
+                }
+                self.add_local_for_name(
+                    owner_def,
+                    param.name,
+                    .parameter_def,
+                    .parameter,
+                    param.mutable_binding,
+                    false,
+                    param_type_refs[type_index]
+                );
+                type_index = type_index + 1;
+            }
+            index = index + 1;
+        }
+    }
+
+    () add_self_local(self, qid.DefId function_def, qid.DefId owner_def, sem.SelfReceiverMode receiver_mode) {
+        qid.SymbolId self_symbol = self.state.store.symbols.intern("self");
+        token.Span span! = token.Span();
+        if (self.state.store.source_map.def_span(owner_def) is .some(loc)) {
+            span = loc.span;
+        }
+        qid.DefId self_def = self.state.store.defs.create(
+            .parameter_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: self_symbol, span: span),
+            function_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        if (!self.env.empty()) {
+            self.env.define(self_symbol, .value_name, self_def, span);
+        }
+        sem.NodeId type_ref = self.lower_self_receiver_type_ref(owner_def, receiver_mode, span);
+        self.state.store.model.add_local(function_def, .parameter, self_symbol, self_def, false, type_ref);
+    }
+
+    sem.SelfReceiverMode self_local_receiver_mode(self, qid.DefId function_def) {
+        guard self.state.store.model.def_ref(function_def).decl.function_signature is .some(signature) else {
+            return .ref_receiver;
+        }
+        return signature.receiver_mode;
+    }
+
+    sem.NodeId lower_self_receiver_type_ref(self,
+        qid.DefId owner_def,
+        sem.SelfReceiverMode receiver_mode,
+        token.Span span
+    ) {
+        if (receiver_mode == .move_receiver) {
+            return self.lower_self_type_ref(owner_def, span);
+        }
+        if (receiver_mode == .mutable_ref_receiver) {
+            return self.add_node(.layered_type_ref(sem.LayeredTypeRef (
+                kind: .mutable_type,
+                element: self.lower_self_reference_type_ref(owner_def, span)
+            )), span);
+        }
+        return self.lower_self_reference_type_ref(owner_def, span);
+    }
+
+    sem.LocalId add_init_self_local(self, qid.DefId init_def, qid.DefId owner_def) {
+        qid.SymbolId self_symbol = self.state.store.symbols.intern("self");
+        token.Span span! = token.Span();
+        if (self.state.store.source_map.def_span(owner_def) is .some(loc)) {
+            span = loc.span;
+        }
+        qid.DefId self_def = self.state.store.defs.create(
+            .local_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: self_symbol, span: span),
+            init_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.env.define(self_symbol, .value_name, self_def, span);
+        sem.NodeId type_ref = self.lower_self_type_ref(owner_def, span);
+        return self.state.store.model.add_local(init_def, .local_variable, self_symbol, self_def, true, type_ref);
+    }
+
+    sem.NodeId lower_self_type_ref(self, qid.DefId owner_def, token.Span span) {
+        return self.add_node(.named_type_ref(sem.NamedTypeRef (
+            def_id: owner_def,
+            args: self.lower_owner_generic_type_args(owner_def, span)
+        )), span);
+    }
+
+    sem.NodeId lower_self_reference_type_ref(self, qid.DefId owner_def, token.Span span) {
+        return self.add_node(.layered_type_ref(sem.LayeredTypeRef (
+            kind: .reference,
+            element: self.lower_self_type_ref(owner_def, span)
+        )), span);
+    }
+
+    sem.NodeId[]& lower_owner_generic_type_args(self, qid.DefId owner_def, token.Span span) {
+        list.ArrayList<sem.NodeId> args! = list.ArrayList<sem.NodeId>();
+        sem.Def& owner_model = self.state.store.model.def_ref(owner_def);
+
+        Int index! = 0;
+        while (index < owner_model.generic_params.len()) {
+            qid.DefId member_def = owner_model.generic_params.get(index);
+            if (self.state.store.defs.get(member_def).domain == .type_name) {
+                args.add(self.add_node(.named_type_ref(sem.NamedTypeRef (
+                    def_id: member_def,
+                    args: self.empty_model_ids()
+                )), span));
+            } else {
+                args.add(self.add_node(.named_type_ref(sem.NamedTypeRef (
+                    def_id: member_def,
+                    args: self.empty_model_ids()
+                )), span));
+            }
+            index = index + 1;
+        }
+        return self.freeze_model_ids(args);
+    }
+
+    sem.NodeId lower_stmt(self, ast.AstId stmt_id) {
+        ast.AstNode stmt_node = self.state.unit.get(stmt_id);
+        if (ast.stmt_data(stmt_node.data) is .some(stmt_data)) {
+            return self.lower_expr(stmt_data.value);
+        }
+        if (stmt_node.data is .let_stmt(let_stmt)) {
+            return self.lower_let_stmt(let_stmt);
+        }
+        if (stmt_node.data is .destructure_stmt(destructure)) {
+            return self.lower_destructure_stmt(destructure, stmt_node.span);
+        }
+        if (stmt_node.data is .defer_stmt(defer_stmt)) {
+            return self.add_node(.defer_stmt(sem.Defer (body: self.lower_expr(defer_stmt.value))), stmt_node.span);
+        }
+        if (stmt_node.data is .guard_stmt(guard_stmt)) {
+            return self.lower_guard_stmt(guard_stmt);
+        }
+        if (stmt_node.data is .control_stmt(control_stmt)) {
+            return self.lower_control_stmt(control_stmt);
+        }
+        if (stmt_node.data is .assign_stmt(assign_stmt)) {
+            return self.add_node(.assign_stmt(sem.Assign (
+                op: self.assign_op(assign_stmt.op),
+                target: self.lower_expr(assign_stmt.target),
+                value: self.lower_expr(assign_stmt.value)
+            )), stmt_node.span);
+        }
+        return self.lower_expr(stmt_id);
+    }
+
+    sem.NodeId lower_expr(self, ast.AstId expr_id) {
+        // 表达式 lowering 保留的是 resolve 后的语义，不是原始表层语法。
+        // 尚未接入的 AST 形态先显式 lower 成 invalid node，等 Semantic Model/type check
+        // 支持对应结构后再补齐。
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        if (expr.data is .literal(literal)) {
+            return self.add_node(.literal(self.model_literal(literal)), expr.span);
+        }
+        if (expr.data is .lambda_expr(lambda)) {
+            return self.lower_lambda_expr(lambda, expr.span);
+        }
+        if (expr.data is .unit_type) {
+            sem.LiteralValue value = .unit_value();
+            return self.add_node(.literal(sem.Literal (value: value)), expr.span);
+        }
+        if (expr.data is .name_expr(name_expr)) {
+            return self.lower_expr(name_expr.value);
+        }
+        if (expr.data is .name(_)) {
+            return self.lower_name_ref(expr_id);
+        }
+        if (expr.data is .path(path)) {
+            return self.lower_path_expr(expr_id, path);
+        }
+        if (expr.data is .call(call)) {
+            return self.lower_call_expr(call, expr.span);
+        }
+        if (expr.data is .implicit_call(implicit_call)) {
+            return self.lower_implicit_call_expr(implicit_call, expr.span);
+        }
+        if (expr.data is .type_implicit_call(implicit_call)) {
+            return self.lower_type_implicit_call_expr(implicit_call, expr.span);
+        }
+        if (expr.data is .call_arg(call_arg)) {
+            return self.lower_expr(call_arg.value);
+        }
+        if (expr.data is .implicit_arg(implicit_arg)) {
+            return self.lower_implicit_arg(implicit_arg, expr.span);
+        }
+        if (expr.data is .block(block)) {
+            if (block.effects.has_sync) {
+                return self.lower_sync_block(block, expr.span);
+            }
+            if (block.effects.has_async) {
+                return self.lower_async_block(block, expr.span);
+            }
+            return self.lower_block(block, expr.span);
+        }
+        if (expr.data is .field_expr(field)) {
+            return self.lower_field_expr(field, expr.span);
+        }
+        if (expr.data is .index_expr(index_expr)) {
+            return self.lower_index_expr(index_expr, expr.span);
+        }
+        if (expr.data is .slice_expr(slice_expr)) {
+            return self.lower_slice_expr(slice_expr, expr.span);
+        }
+        if (expr.data is .range(range)) {
+            return self.add_node(.range_expr(sem.Range (
+                start: self.lower_expr(range.start),
+                end: self.lower_expr(range.end)
+            )), expr.span);
+        }
+        if (expr.data is .inline_asm(inline_asm)) {
+            return self.lower_inline_asm(inline_asm, expr.span);
+        }
+        if (expr.data is .struct_literal(struct_literal)) {
+            return self.lower_struct_literal(struct_literal, expr.span);
+        }
+        if (expr.data is .tuple_expr(items)) {
+            return self.add_node(.tuple_literal(sem.TupleLiteral (
+                items: self.lower_expr_range(items)
+            )), expr.span);
+        }
+        if (expr.data is .array_expr(items)) {
+            return self.add_node(.array_literal(sem.ArrayLiteral (
+                items: self.lower_expr_range(items)
+            )), expr.span);
+        }
+        if (expr.data is .unary(unary)) {
+            return self.add_node(.unary(sem.Unary (
+                op: self.unary_op(unary.op),
+                value: self.lower_expr(unary.value)
+            )), expr.span);
+        }
+        if (expr.data is .binary(binary)) {
+            return self.add_node(.binary(sem.Binary (
+                op: self.binary_op(binary.op),
+                left: self.lower_expr(binary.left),
+                right: self.lower_expr(binary.right)
+            )), expr.span);
+        }
+        if (expr.data is .if_expr(if_expr)) {
+            return self.lower_if_expr(if_expr, expr.span);
+        }
+        if (expr.data is .loop_expr(loop_expr)) {
+            return self.lower_loop_expr(loop_expr, expr.span);
+        }
+        if (expr.data is .switch_expr(switch_expr)) {
+            return self.lower_switch_expr(switch_expr, expr.span);
+        }
+        if (expr.data is .catch_expr(catch_expr)) {
+            return self.lower_catch_expr(catch_expr, expr.span);
+        }
+        if (expr.data is .await_expr(await_expr)) {
+            return self.add_node(.await_expr(self.lower_expr(await_expr.value)), expr.span);
+        }
+        if (expr.data is .is_pattern(is_pattern)) {
+            return self.add_node(.is_pattern(sem.IsPattern (
+                value: self.lower_expr(is_pattern.value),
+                pattern: self.lower_pattern(is_pattern.pattern)
+            )), expr.span);
+        }
+        return self.add_invalid_node(expr.span);
+    }
+
+    sem.NodeId lower_lambda_expr(self, ast.LambdaData lambda, token.Span span) {
+        guard self.current_owner_def is .some(owner_def) else { return self.add_invalid_node(span); }
+        qid.DefId lambda_def = self.create_lambda_function_def(owner_def, span);
+        list.ArrayList<sem.LambdaParam> params! = list.ArrayList<sem.LambdaParam>(lambda.params.length);
+        list.ArrayList<sem.LambdaCapture> captures! = list.ArrayList<sem.LambdaCapture>(lambda.captures.length);
+        sem.NodeId body = self.lower_lambda_body(lambda_def, lambda, params$.ref(), captures$.ref(), span);
+        qid.DefId? previous_owner! = self.current_owner_def;
+        self.current_owner_def = owner_def;
+        sem.NodeId result = self.add_node(.lambda_expr(sem.Lambda (
+            param_count: lambda.params.length,
+            params: self.freeze_model_lambda_params(params),
+            captures: self.freeze_model_lambda_captures(captures),
+            function_def: lambda_def,
+            body: body
+        )), span);
+        self.current_owner_def = previous_owner;
+        return result;
+    }
+
+    qid.DefId create_lambda_function_def(self, qid.DefId owner_def, token.Span span) {
+        qid.SymbolId symbol = self.state.store.symbols.intern("__lambda");
+        qid.DefId lambda_def = self.state.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: symbol, span: span),
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.state.store.model.declare_def(lambda_def, .function_decl);
+        self.state.store.model.mark_lambda_function(lambda_def);
+        self.state.store.model.add_member(owner_def, lambda_def);
+        self.state.store.source_map.set_def_span(lambda_def, self.state.unit.source_id, span);
+        return lambda_def;
+    }
+
+    sem.NodeId lower_lambda_body(self,
+        qid.DefId lambda_def,
+        ast.LambdaData lambda,
+        list.ArrayList<sem.LambdaParam>& params,
+        list.ArrayList<sem.LambdaCapture>& captures,
+        token.Span span
+    ) {
+        qid.DefId? previous_owner = self.current_owner_def;
+        sem.NodeId[]& capture_values = self.lower_lambda_capture_values(lambda.captures);
+        self.current_owner_def = lambda_def;
+        sem.NodeId placeholder = self.add_invalid_node(span);
+        self.state.store.model.load_body(lambda_def, sem.Body(lambda_def, placeholder));
+
+        self.env.enter_scope(.function_scope);
+        self.lower_lambda_capture_locals(lambda_def, lambda.captures, capture_values, captures);
+        self.lower_lambda_params(lambda_def, lambda.params, params);
+        sem.NodeId body = self.lower_expr(lambda.body);
+        self.env.exit_scope();
+        self.state.store.model.set_body_root(lambda_def, body);
+        self.current_owner_def = previous_owner;
+        return body;
+    }
+
+    sem.NodeId[]& lower_lambda_capture_values(self, ast.AstRange captures) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(captures.length);
+        Int index! = 0;
+        while (index < captures.length) {
+            ast.AstId capture_id = self.state.unit.child_at(captures, index);
+            ast.AstNode capture_node = self.state.unit.get(capture_id);
+            if (capture_node.data is .lambda_capture_item(capture)) {
+                values.add(self.lower_expr(capture.value));
+            }
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    () lower_lambda_capture_locals(
+        self,
+        qid.DefId owner_def,
+        ast.AstRange captures,
+        sem.NodeId[]& capture_values,
+        list.ArrayList<sem.LambdaCapture>& values
+    ) {
+        Int index! = 0;
+        while (index < captures.length) {
+            ast.AstId capture_id = self.state.unit.child_at(captures, index);
+            ast.AstNode capture_node = self.state.unit.get(capture_id);
+            if (capture_node.data is .lambda_capture_item(capture)) {
+                sem.NodeId? type_ref! = null;
+                if (capture.type_ref is .some(type_ast)) {
+                    type_ref = self.lower_type_ref(type_ast);
+                }
+                sem.LocalId local_id = self.add_local_for_name(
+                    owner_def,
+                    capture.name,
+                    .local_def,
+                    .local_variable,
+                    capture.mutable_binding,
+                    capture.borrow_binding,
+                    type_ref,
+                    capture.mutable_borrow
+                );
+                values.add(sem.LambdaCapture (
+                    index: index,
+                    local_id: local_id,
+                    value: capture_values[index]
+                ));
+            }
+            index = index + 1;
+        }
+    }
+
+    () lower_lambda_params(self,
+        qid.DefId owner_def,
+        ast.AstRange params,
+        list.ArrayList<sem.LambdaParam>& values
+    ) {
+        Int index! = 0;
+        while (index < params.length) {
+            ast.AstId param_id = self.state.unit.child_at(params, index);
+            ast.AstNode param_node = self.state.unit.get(param_id);
+            if (param_node.data is .lambda_param(param)) {
+                if (param.name is .some(name)) {
+                    values.add(sem.LambdaParam (
+                        index: index,
+                        local_id: self.add_local_for_name(
+                            owner_def,
+                            name,
+                            .parameter_def,
+                            .parameter,
+                            false,
+                            false,
+                            null
+                        )
+                    ));
+                } else {
+                    values.add(sem.LambdaParam (
+                        index: index,
+                        local_id: self.add_anonymous_lambda_param_local(owner_def, param_node.span)
+                    ));
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    sem.LocalId add_anonymous_lambda_param_local(self, qid.DefId owner_def, token.Span span) {
+        qid.SymbolId symbol = self.state.store.symbols.intern("_");
+        qid.DefId def_id = self.state.store.defs.create(
+            .parameter_def,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: symbol, span: span),
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        self.state.store.source_map.set_def_span(def_id, self.state.unit.source_id, span);
+        return self.state.store.model.add_local_with_borrow_binding(
+            owner_def,
+            .parameter,
+            symbol,
+            def_id,
+            false,
+            false,
+            null
+        );
+    }
+
+    // LexicalEnv 只在 lowering 期间使用：把刚创建的 local DefId 解析回
+    // LocalId/name_ref.local。lowering 完成后，长期状态在 Body.locals。
+    sem.NodeId lower_block(self, ast.BlockData block, token.Span span) {
+        self.env.enter_scope(.block_scope);
+        list.ArrayList<sem.NodeId> statements! = list.ArrayList<sem.NodeId>(block.statements.length);
+        Int index! = 0;
+        while (index < block.statements.length) {
+            statements.add(self.lower_stmt(self.state.unit.child_at(block.statements, index)));
+            index = index + 1;
+        }
+
+        sem.NodeId? result! = null;
+        if (block.tail_expr is .some(tail_expr)) {
+            result = self.lower_expr(tail_expr);
+        }
+        sem.NodeId block_id = self.add_node(.block(sem.Block (
+            effects: self.lower_effect_set(block.effects),
+            statements: self.freeze_model_ids(statements),
+            result: result
+        )), span);
+        self.env.exit_scope();
+        return block_id;
+    }
+
+    sem.NodeId lower_async_block(self, ast.BlockData block, token.Span span) {
+        guard self.current_owner_def is .some(owner_def) else { return self.add_invalid_node(span); }
+        qid.DefId function_def = self.create_lambda_function_def(owner_def, span);
+        qid.DefId? previous_owner! = self.current_owner_def;
+        self.current_owner_def = function_def;
+        sem.NodeId placeholder = self.add_invalid_node(span);
+        self.state.store.model.load_body(function_def, sem.Body(function_def, placeholder));
+        self.env.enter_scope(.function_scope);
+        sem.NodeId body = self.lower_block(block, span);
+        self.env.exit_scope();
+        self.state.store.model.set_body_root(function_def, body);
+        self.current_owner_def = previous_owner;
+        return body;
+    }
+
+    sem.NodeId lower_sync_block(self, ast.BlockData block, token.Span span) {
+        ast.BlockData async_block! = block;
+        async_block.effects = ast.EffectSet(
+            has_unsafe: block.effects.has_unsafe,
+            has_async: true,
+            has_sync: false,
+            domain: block.effects.domain,
+            context: block.effects.context
+        );
+        return self.add_node(.sync_block(self.lower_async_block(async_block, span)), span);
+    }
+
+    sem.NodeId lower_let_stmt(self, ast.LetData let_stmt) {
+        token.Span span = self.state.unit.get(let_stmt.name).span;
+        guard self.current_owner_def is .some(owner_def) else { return self.add_invalid_node(span); }
+        sem.NodeId? type_ref! = null;
+        if (let_stmt.type_ref is .some(type_ast)) {
+            type_ref = self.lower_type_ref(type_ast);
+        }
+        sem.NodeId? initializer! = null;
+        if (let_stmt.initializer is .some(initializer_ast)) {
+            initializer = self.lower_expr(initializer_ast);
+        }
+        sem.LocalId local_id = self.add_local_for_name(
+            owner_def,
+            let_stmt.name,
+            .local_def,
+            .local_variable,
+            let_stmt.mutable_binding,
+            false,
+            type_ref,
+            false
+        );
+        return self.add_node(.let_stmt(sem.Let (local_id: local_id, initializer: initializer)), span);
+    }
+
+    sem.NodeId lower_destructure_stmt(self, ast.DestructureData destructure, token.Span span) {
+        return self.add_node(.destructure_stmt(sem.Destructure (
+            pattern: self.lower_pattern(destructure.pattern),
+            initializer: self.lower_expr(destructure.initializer)
+        )), span);
+    }
+
+    sem.NodeId lower_guard_stmt(self, ast.GuardData guard_stmt) {
+        // guard 是语句，不是 if 表达式。else body 在 parser 阶段已经要求
+        // 必须退出当前控制流；Semantic Model 保留这个结构，后续 type check 只验证条件
+        // 和 else body 的返回/退出类型。
+        token.Span span = self.state.unit.get(guard_stmt.condition).span;
+        return self.add_node(.guard_stmt(sem.Guard (
+            condition: self.lower_expr(guard_stmt.condition),
+            else_body: self.lower_expr(guard_stmt.else_body)
+        )), span);
+    }
+
+    sem.NodeId lower_control_stmt(self, ast.ControlStmtData control_stmt) {
+        token.Span span! = token.Span();
+        if (control_stmt.value is .some(value_for_span)) {
+            span = self.state.unit.get(value_for_span).span;
+        }
+        if (control_stmt.kind == .return_value) {
+            sem.NodeId? value! = null;
+            if (control_stmt.value is .some(value_ast)) {
+                value = self.lower_expr(value_ast);
+            }
+            return self.add_node(.return_stmt(sem.Return (value: value)), span);
+        }
+        if (control_stmt.kind == .break_loop) {
+            return self.add_node(.break_stmt(), span);
+        }
+        if (control_stmt.kind == .continue_loop) {
+            return self.add_node(.continue_stmt(), span);
+        }
+        if (control_stmt.kind == .throw_value) {
+            guard control_stmt.value is .some(value_ast) else {
+                return self.add_invalid_node(span);
+            }
+            return self.add_node(.throw_stmt(sem.Throw (value: self.lower_expr(value_ast))), span);
+        }
+        return self.add_invalid_node(span);
+    }
+
+    sem.NodeId lower_call_expr(self, ast.CallData call, token.Span span) {
+        list.ArrayList<sem.CallArg> args! = list.ArrayList<sem.CallArg>(call.args.length);
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_call_arg(self.state.unit.child_at(call.args, index)));
+            index = index + 1;
+        }
+        return self.add_node(.call(sem.Call (
+            callee: self.lower_call_callee(call.callee),
+            type_args: self.lower_generic_arg_range(call.type_args),
+            args: self.freeze_call_args(args),
+            target: self.call_target(call.callee)
+        )), span);
+    }
+
+    sem.CallArg lower_call_arg(self, ast.AstId arg_id) {
+        ast.AstNode arg = self.state.unit.get(arg_id);
+        guard arg.data is .call_arg(call_arg) else {
+            return sem.CallArg (label: null, value: self.lower_expr(arg_id));
+        }
+        qid.SymbolId? label! = null;
+        if (call_arg.label is .some(label_id)) {
+            label = self.name_symbol_or_zero(label_id);
+        }
+        return sem.CallArg (
+            label: label,
+            value: self.lower_expr(call_arg.value),
+            trailing: call_arg.trailing
+        );
+    }
+
+    sem.NodeId lower_call_callee(self, ast.AstId callee_id) {
+        if (self.lower_enum_init_callee(callee_id) is .some(lowered)) {
+            return lowered;
+        }
+        ast.AstNode callee = self.state.unit.get(callee_id);
+        if (callee.data is .infer_type) {
+            return self.lower_type_ref(callee_id);
+        }
+        if (self.resolved_value_def_for_expr(callee_id) is .some(_)) {
+            return self.lower_expr(callee_id);
+        }
+        if (self.resolved_type_def_for_expr(callee_id) is .some(_)) {
+            return self.lower_type_ref(callee_id);
+        }
+        return self.lower_expr(callee_id);
+    }
+
+    sem.NodeId? lower_enum_init_callee(self, ast.AstId callee_id) {
+        ast.AstNode node = self.state.unit.get(callee_id);
+        guard node.data is .path(path) else { return null; }
+        if (path.segments.length != 2) { return null; }
+        ast.AstId owner_id = self.state.unit.child_at(path.segments, 0);
+        ast.AstId member_id = self.state.unit.child_at(path.segments, 1);
+        guard self.state.name_symbol(member_id) is .some(member_symbol) else { return null; }
+        if (!string.equal(self.state.store.symbols.text(member_symbol), "init?")) { return null; }
+        guard self.resolved_type_def_for_expr(owner_id) is .some(enum_def) else { return null; }
+        if (self.state.store.defs.get(enum_def).kind != .enum_def) { return null; }
+        return self.add_node(.member_access(sem.MemberAccess (
+            base: self.lower_type_ref(owner_id),
+            member_symbol: member_symbol
+        )), node.span);
+    }
+
+    sem.NodeId lower_implicit_call_expr(self, ast.ImplicitCallData call, token.Span span) {
+        list.ArrayList<sem.NodeId> args! = list.ArrayList<sem.NodeId>(call.args.length);
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_expr(self.state.unit.child_at(call.args, index)));
+            index = index + 1;
+        }
+        return self.add_node(.implicit_call(sem.ImplicitCall (
+            base: self.lower_expr(call.base),
+            op: self.implicit_op(call.name),
+            args: self.freeze_model_ids(args),
+            optional_chain: call.optional_chain
+        )), span);
+    }
+
+    sem.NodeId lower_type_implicit_call_expr(self, ast.ImplicitCallData call, token.Span span) {
+        list.ArrayList<sem.NodeId> args! = list.ArrayList<sem.NodeId>(call.args.length);
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_expr(self.state.unit.child_at(call.args, index)));
+            index = index + 1;
+        }
+        // Type receiver 会保留为 Semantic Model type-ref node；type check 根据
+        // receiver type 解释 size/align/alloc 这类内建操作。
+        return self.add_node(.implicit_call(sem.ImplicitCall (
+            base: self.lower_type_ref(call.base),
+            op: self.implicit_op(call.name),
+            args: self.freeze_model_ids(args),
+            optional_chain: call.optional_chain
+        )), span);
+    }
+
+    sem.ImplicitOp implicit_op(self, ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return .unknown; }
+        UInt8[]& text = self.state.store.symbols.text(symbol);
+        return self.implicit_op_from_text(text);
+    }
+
+    sem.ImplicitOp implicit_op_from_text(self, UInt8[]& text) {
+        if (string.equal(text, "get")) { return .get; }
+        if (string.equal(text, "set")) { return .set; }
+        if (string.equal(text, "ref")) { return .ref; }
+        if (string.equal(text, "mut_ref")) { return .mut_ref; }
+        if (string.equal(text, "addr")) { return .addr; }
+        if (string.equal(text, "mut_ptr")) { return .mut_ptr; }
+        if (string.equal(text, "as")) { return .cast; }
+        if (string.equal(text, "dealloc")) { return .dealloc; }
+        if (string.equal(text, "destroy")) { return .destroy; }
+        if (string.equal(text, "drop")) { return .drop; }
+        if (string.equal(text, "forget")) { return .forget; }
+        if (string.equal(text, "move")) { return .move; }
+        if (string.equal(text, "some")) { return .optional_some; }
+        if (string.equal(text, "alloc")) { return .alloc; }
+        if (string.equal(text, "size")) { return .size; }
+        if (string.equal(text, "align")) { return .align; }
+        if (string.equal(text, "max_align")) { return .max_align; }
+        if (string.equal(text, "ptr")) { return .ptr; }
+        if (string.equal(text, "async")) { return .async_call; }
+        if (string.equal(text, "new")) { return .trait_new; }
+        return .unknown;
+    }
+
+    sem.NodeId lower_implicit_arg(self, ast.ImplicitArgData implicit_arg, token.Span span) {
+        if (implicit_arg is .value_arg(value_arg)) {
+            return self.lower_expr(value_arg);
+        }
+        if (implicit_arg is .type_arg(type_arg)) {
+            return self.lower_type_ref(type_arg);
+        }
+        return self.add_invalid_node(span);
+    }
+
+    sem.NodeId lower_where_equal_subject(self, ast.AstId subject) {
+        if (self.where_equal_subject_is_const(subject)) {
+            return self.lower_const_generic_arg(subject);
+        }
+        return self.lower_type_ref(subject);
+    }
+
+    sem.NodeId lower_where_equal_value(self, ast.AstId subject, ast.AstId value) {
+        if (self.where_equal_subject_is_const(subject)) {
+            return self.lower_const_generic_arg(value);
+        }
+        return self.lower_type_ref(value);
+    }
+
+    Bool where_equal_subject_is_const(self, ast.AstId subject) {
+        guard self.resolved_value_def_for_expr(subject) is .some(def_id) else { return false; }
+        return self.generic_param_is_value_param(def_id);
+    }
+
+    sem.NodeId lower_projection_equal_value(self, ast.AstId trait_path, ast.AstId assoc_name, ast.AstId value) {
+        guard self.resolved_type_def_for_expr(trait_path) is .some(trait_def) else {
+            return self.lower_type_ref(value);
+        }
+        if (self.trait_associated_item_domain(trait_def, assoc_name) is .some(domain)) {
+            if (domain == .value_name) {
+                return self.lower_const_generic_arg(value);
+            }
+        }
+        return self.lower_type_ref(value);
+    }
+
+    sem.NodeId lower_assoc_binding_value(self, ast.TraitBoundData trait_bound, ast.AssocTypeBindingData binding) {
+        return self.lower_projection_equal_value(trait_bound.path, binding.name, binding.value);
+    }
+
+    Bool generic_param_is_value_param(self, qid.DefId def_id) {
+        def.DefRecord record = self.state.store.defs.get(def_id);
+        return record.kind == .generic_param_def && record.domain == .value_name;
+    }
+
+    def.NameDomain? trait_associated_item_domain(self, qid.DefId trait_def, ast.AstId assoc_name) {
+        guard self.state.name_symbol(assoc_name) is .some(symbol) else { return null; }
+        guard self.state.store.defs.get(trait_def).owned_namespace_id is .some(namespace_id) else { return null; }
+        if (self.associated_item_in_domain(namespace_id, symbol, .type_name) != null) {
+            return def.NameDomain.type_name;
+        }
+        if (self.associated_item_in_domain(namespace_id, symbol, .value_name) != null) {
+            return def.NameDomain.value_name;
+        }
+        return null;
+    }
+
+    qid.DefId? associated_item_in_domain(
+        self,
+        qid.NamespaceId namespace_id,
+        qid.SymbolId symbol,
+        def.NameDomain domain
+    ) {
+        guard self.state.store.resolve.namespaces.first_binding(namespace_id, symbol, domain)
+            is .some(binding) else {
+            return null;
+        }
+        if (self.state.store.defs.get(binding.def_id).kind != .associated_type_def) {
+            return null;
+        }
+        return binding.def_id;
+    }
+
+    sem.NodeId lower_field_expr(self, ast.FieldExprData field, token.Span span) {
+        return self.add_node(.member_access(sem.MemberAccess (
+            base: self.lower_field_base(field.base),
+            member_symbol: self.name_symbol_or_zero(field.name)
+        )), span);
+    }
+
+    sem.NodeId lower_field_base(self, ast.AstId base) {
+        ast.AstNode node = self.state.unit.get(base);
+        if (node.data is .unit_type) {
+            return self.lower_expr(base);
+        }
+        if (self.resolved_type_def_for_expr(base) is .some(_)) {
+            return self.lower_type_ref(base);
+        }
+        if (self.ast_node_is_type_ref(base)) {
+            return self.lower_type_ref(base);
+        }
+        return self.lower_expr(base);
+    }
+
+    Bool ast_node_is_type_ref(self, ast.AstId node_id) {
+        ast.AstNode node = self.state.unit.get(node_id);
+        if (node.data is .infer_type) { return true; }
+        if (node.data is .unit_type) { return true; }
+        if (node.data is .type_ref(_)) { return true; }
+        if (node.data is .named_type(_)) { return true; }
+        if (node.data is .array_type(_)) { return true; }
+        if (node.data is .errorable_type(_)) { return true; }
+        if (node.data is .function_type(_)) { return true; }
+        if (node.data is .effect_type(_)) { return true; }
+        if (node.data is .tuple_type(_)) { return true; }
+        return false;
+    }
+
+    sem.NodeId lower_index_expr(self, ast.IndexExprData index_expr, token.Span span) {
+        return self.add_node(.index_access(sem.IndexAccess (
+            base: self.lower_expr(index_expr.base),
+            index: self.lower_expr(index_expr.index)
+        )), span);
+    }
+
+    sem.NodeId lower_slice_expr(self, ast.SliceExprData slice_expr, token.Span span) {
+        sem.NodeId? start! = null;
+        sem.NodeId? end! = null;
+        if (slice_expr.start is .some(start_expr)) {
+            start = self.lower_expr(start_expr);
+        }
+        if (slice_expr.end is .some(end_expr)) {
+            end = self.lower_expr(end_expr);
+        }
+        return self.add_node(.slice_access(sem.SliceAccess (
+            base: self.lower_expr(slice_expr.base),
+            start: start,
+            end: end
+        )), span);
+    }
+
+    sem.NodeId lower_struct_literal(self, ast.StructLiteralData literal, token.Span span) {
+        list.ArrayList<sem.FieldInit> fields! = list.ArrayList<sem.FieldInit>(literal.fields.length);
+        Int index! = 0;
+        while (index < literal.fields.length) {
+            ast.AstNode field_node = self.state.unit.get(self.state.unit.child_at(literal.fields, index));
+            if (field_node.data is .field_init(field_init)) {
+                fields.add(sem.FieldInit (
+                    field_symbol: self.name_symbol_or_zero(field_init.name),
+                    value: self.lower_expr(field_init.value)
+                ));
+            }
+            index = index + 1;
+        }
+        return self.add_node(.struct_literal(sem.StructLiteral (
+            type_ref: self.lower_literal_type_ref(literal),
+            fields: self.freeze_field_inits(fields)
+        )), span);
+    }
+
+    sem.NodeId lower_literal_type_ref(self, ast.StructLiteralData literal) {
+        guard literal.type_ref is .some(type_ref) else {
+            return self.add_node(.invalid_type_ref(), token.Span());
+        }
+        if (literal.type_args.length == 0) {
+            return self.lower_type_ref(type_ref);
+        }
+        token.Span span = self.state.unit.get(type_ref).span;
+        guard self.resolved_type_def_for_expr(type_ref) is .some(def_id) else {
+            return self.add_node(.invalid_type_ref(), span);
+        }
+        return self.add_node(.named_type_ref(sem.NamedTypeRef (
+            def_id: def_id,
+            args: self.lower_generic_arg_range(literal.type_args)
+        )), span);
+    }
+
+    // Parser 目前会把 `value.field.subfield` 表示成一个 path。如果
+    // resolve 没有把整个 path 绑定到 namespace/type target，就按链式
+    // value member access lower。每一段 member 是否存在，由 type check
+    // 根据 base type 验证。
+    sem.NodeId lower_path_expr(self, ast.AstId path_id, ast.PathData path) {
+        if (self.state.value_path_resolution(path_id) is .some(resolution)) {
+            return self.lower_resolved_value_path(path, resolution);
+        }
+        if (path.segments.length > 1 && self.resolved_value_def_for_expr(path_id) == null) {
+            return self.lower_member_path(path);
+        }
+        return self.lower_name_ref(path_id);
+    }
+
+    sem.NodeId lower_resolved_value_path(self, ast.PathData path, resolve_state.ValuePathResolution resolution) {
+        ast.AstId root_segment = self.state.unit.child_at(path.segments, resolution.value_root_segment_index);
+        sem.NodeId current! = self.add_node(
+            .name_ref(.def_ref(resolution.value_root_def)),
+            self.state.unit.get(root_segment).span
+        );
+        Int index! = resolution.value_root_segment_index + 1;
+        while (index < path.segments.length) {
+            ast.AstId segment = self.state.unit.child_at(path.segments, index);
+            current = self.add_node(.member_access(sem.MemberAccess (
+                base: current,
+                member_symbol: self.name_symbol_or_zero(segment)
+            )), self.state.unit.get(segment).span);
+            index = index + 1;
+        }
+        return current;
+    }
+
+    // `value.a.b` 被 parser 表示成 path 时，这里左折成
+    // member_access(member_access(self, value, a), b)。每一步的具体 member
+    // 选择仍然留给 type check，因为它依赖上一段表达式的类型。
+    sem.NodeId lower_member_path(self, ast.PathData path) {
+        if (path.segments.length == 0) {
+            return self.add_invalid_node(token.Span());
+        }
+        sem.NodeId current! = self.lower_member_path_base(self.state.unit.child_at(path.segments, 0));
+        Int index! = 1;
+        while (index < path.segments.length) {
+            ast.AstId segment = self.state.unit.child_at(path.segments, index);
+            current = self.add_node(.member_access(sem.MemberAccess (
+                base: current,
+                member_symbol: self.name_symbol_or_zero(segment)
+            )), self.state.unit.get(segment).span);
+            index = index + 1;
+        }
+        return current;
+    }
+
+    sem.NodeId lower_member_path_base(self, ast.AstId first_segment) {
+        // `value.member` 和 `module.member` 都会先进入 path/member lowering。
+        // 如果第一段在当前 lexical scope 里是 value binding，必须先按 value
+        // 处理，避免同名 import alias 抢走局部变量的 member access。
+        if (self.resolved_name_def(first_segment, .value_name) is .some(_)) {
+            return self.lower_name_ref(first_segment);
+        }
+        if (self.resolved_namespace_def_for_expr(first_segment) is .some(namespace_def)) {
+            return self.add_node(
+                .name_ref(.def_ref(namespace_def)),
+                self.state.unit.get(first_segment).span
+            );
+        }
+        if (self.resolved_type_def_for_expr(first_segment) is .some(_)) {
+            return self.lower_type_ref(first_segment);
+        }
+        return self.lower_name_ref(first_segment);
+    }
+
+    sem.NodeId lower_if_expr(self, ast.IfData if_expr, token.Span span) {
+        if (self.condition_contains_pattern_binding(if_expr.condition)) {
+            return self.lower_pattern_if_expr(if_expr, span);
+        }
+        sem.NodeId condition = self.lower_expr(if_expr.condition);
+        sem.NodeId then_body = self.lower_expr(if_expr.then_body);
+        sem.NodeId? else_body! = null;
+        if (if_expr.else_body is .some(else_ast)) {
+            else_body = self.lower_expr(else_ast);
+        }
+        return self.add_node(.if_expr(sem.If (
+            condition: condition,
+            then_body: then_body,
+            else_body: else_body
+        )), span);
+    }
+
+    Bool condition_contains_pattern_binding(self, ast.AstId condition_id) {
+        ast.AstNode condition = self.state.unit.get(condition_id);
+        if (condition.data is .is_pattern(_)) {
+            return true;
+        }
+        if (condition.data is .binary(binary)) {
+            if (binary.op == .logic_and) {
+                return self.condition_contains_pattern_binding(binary.left)
+                    || self.condition_contains_pattern_binding(binary.right);
+            }
+        }
+        return false;
+    }
+
+    sem.NodeId lower_pattern_if_expr(self, ast.IfData if_expr, token.Span span) {
+        // 条件里的 pattern binding 只在后续条件和 then body 内可见。
+        // condition lowering 会创建 LocalId 并写入临时 lexical env，所以
+        // 这里必须把 condition 和 then body 包在同一个额外 scope 里。
+        self.env.enter_scope(.block_scope);
+        sem.NodeId condition = self.lower_expr(if_expr.condition);
+        sem.NodeId then_body = self.lower_expr(if_expr.then_body);
+        self.env.exit_scope();
+
+        sem.NodeId? else_body! = null;
+        if (if_expr.else_body is .some(else_ast)) {
+            else_body = self.lower_expr(else_ast);
+        }
+        return self.add_node(.if_expr(sem.If (
+            condition: condition,
+            then_body: then_body,
+            else_body: else_body
+        )), span);
+    }
+
+    sem.NodeId lower_loop_expr(self, ast.LoopData loop_expr, token.Span span) {
+        // while/for 在 AST 里共用 LoopData：while 只有 condition，
+        // for 只有 pattern + iterable。Semantic Model 保留三者的 optional 形态，
+        // 让后续 type check 按不同组合解释。
+        self.env.enter_scope(.loop_scope);
+        sem.NodeId? condition! = null;
+        if (loop_expr.condition is .some(condition_ast)) {
+            condition = self.lower_expr(condition_ast);
+        }
+        sem.NodeId? iterable! = null;
+        if (loop_expr.iterable is .some(iterable_ast)) {
+            iterable = self.lower_expr(iterable_ast);
+        }
+        sem.NodeId? pattern! = null;
+        if (loop_expr.pattern is .some(pattern_ast)) {
+            pattern = self.lower_pattern(pattern_ast);
+        }
+        sem.NodeId body = self.lower_expr(loop_expr.body);
+        self.env.exit_scope();
+        return self.add_node(.loop_expr(sem.Loop (
+            condition: condition,
+            pattern: pattern,
+            iterable: iterable,
+            body: body
+        )), span);
+    }
+
+    sem.NodeId lower_switch_expr(self, ast.SwitchData switch_expr, token.Span span) {
+        list.ArrayList<sem.SwitchCase> cases! = list.ArrayList<sem.SwitchCase>(switch_expr.cases.length);
+        Int index! = 0;
+        while (index < switch_expr.cases.length) {
+            cases.add(self.lower_switch_case(self.state.unit.child_at(switch_expr.cases, index)));
+            index = index + 1;
+        }
+        return self.add_node(.switch_expr(sem.Switch (
+            value: self.lower_expr(switch_expr.value),
+            cases: self.freeze_switch_cases(cases)
+        )), span);
+    }
+
+    sem.NodeId lower_catch_expr(self, ast.CatchExprData catch_expr, token.Span span) {
+        sem.NodeId value = self.lower_expr(catch_expr.value);
+        ast.AstNode catch_node = self.state.unit.get(catch_expr.catch_clause);
+        guard catch_node.data is .catch_clause(catch_clause) else {
+            return self.add_invalid_node(span);
+        }
+        self.env.enter_scope(.block_scope);
+        sem.NodeId? pattern! = null;
+        if (catch_clause.pattern is .some(pattern_ast)) {
+            pattern = self.lower_catch_binding(pattern_ast);
+        }
+        sem.NodeId body = self.lower_expr(catch_clause.body);
+        self.env.exit_scope();
+        return self.add_node(.catch_expr(sem.Catch (
+            value: value,
+            pattern: pattern,
+            body: body
+        )), span);
+    }
+
+    sem.NodeId lower_catch_binding(self, ast.AstId binding_id) {
+        ast.AstNode binding = self.state.unit.get(binding_id);
+        if (binding.data is .param(param)) {
+            return self.lower_catch_param_binding(param, binding.span);
+        }
+        if (ast.pattern_data(binding.data) is .some(_)) {
+            return self.lower_pattern(binding_id);
+        }
+        return self.add_invalid_node(binding.span);
+    }
+
+    sem.NodeId lower_catch_param_binding(self, ast.ParamData param, token.Span span) {
+        guard self.current_owner_def is .some(owner_def) else { return self.add_invalid_node(span); }
+        sem.NodeId type_ref = self.lower_type_ref(param.type_ref);
+        sem.LocalId local_id = self.add_local_for_name(
+            owner_def,
+            param.name,
+            .local_def,
+            .pattern_binding,
+            param.mutable_binding,
+            false,
+            type_ref
+        );
+        return self.add_node(.binding_pattern(sem.BindingPattern (local_id: local_id)), span);
+    }
+
+    sem.SwitchCase lower_switch_case(self, ast.AstId case_id) {
+        ast.AstNode case_node = self.state.unit.get(case_id);
+        guard case_node.data is .switch_case(case_data) else {
+            return sem.SwitchCase (
+                patterns: self.empty_model_ids(),
+                body: self.add_invalid_node(case_node.span)
+            );
+        }
+        self.env.enter_scope(.block_scope);
+        sem.NodeId[]& patterns = self.lower_switch_patterns(case_data.patterns);
+        sem.NodeId body = self.lower_expr(case_data.body);
+        self.env.exit_scope();
+        return sem.SwitchCase (patterns: patterns, body: body);
+    }
+
+    sem.NodeId[]& lower_switch_patterns(self, ast.AstRange patterns) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(patterns.length);
+        Int index! = 0;
+        while (index < patterns.length) {
+            values.add(self.lower_switch_pattern(self.state.unit.child_at(patterns, index)));
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    sem.NodeId lower_switch_pattern(self, ast.AstId pattern_id) {
+        // switch 的 else case 在 parser 中用 unit node 占位；Semantic Model 中把它
+        // 归一成 wildcard pattern，后续阶段不需要知道这个 parser 细节。
+        ast.AstNode pattern_node = self.state.unit.get(pattern_id);
+        if (pattern_node.data is .unit_type) {
+            return self.add_node(.wildcard_pattern(), pattern_node.span);
+        }
+        return self.lower_pattern(pattern_id);
+    }
+
+    sem.NodeId lower_pattern(self, ast.AstId pattern_id) {
+        // Pattern 也是 Semantic Model node。binding pattern 额外在当前 Body 中创建
+        // LocalId；需要类型参与选择的 variant pattern 先保持未定，等
+        // type check 根据 scrutinee type 处理。
+        ast.AstNode pattern_node = self.state.unit.get(pattern_id);
+        guard ast.pattern_data(pattern_node.data) is .some(pattern) else {
+            return self.add_invalid_node(pattern_node.span);
+        }
+
+        if (pattern.optional_pattern) {
+            sem.NodeId? nested! = null;
+            if (pattern.value is .some(value)) {
+                nested = self.lower_pattern(value);
+            }
+            return self.add_node(.optional_pattern(sem.OptionalPattern (nested: nested)), pattern_node.span);
+        }
+
+        if (pattern.value is .some(value)) {
+            ast.AstNode value_node = self.state.unit.get(value);
+            if (value_node.data is .literal(literal)) {
+                return self.add_node(.literal_pattern(sem.LiteralPattern (
+                    literal: self.model_literal(literal)
+                )), pattern_node.span);
+            }
+            return self.add_invalid_node(pattern_node.span);
+        }
+
+        if (pattern.name is .some(name)) {
+            if (self.pattern_is_variant(pattern, name)) {
+                // `Type.case` 已经有 resolved DefId；`.case` 只有名字，
+                // owner type 要等 switch/is pattern 的 expected type 决定。
+                return self.add_node(.variant_pattern(sem.VariantPattern (
+                    variant_def: self.variant_pattern_def(pattern, name),
+                    member_symbol: self.state.name_symbol(name),
+                    payload: self.lower_pattern_range(pattern.payload)
+                )), pattern_node.span);
+            }
+            return self.lower_binding_pattern(pattern, name);
+        }
+
+        if (pattern.payload.is_empty()) {
+            return self.add_node(.wildcard_pattern(), pattern_node.span);
+        }
+        return self.add_node(.tuple_pattern(sem.TuplePattern (
+            items: self.lower_pattern_range(pattern.payload)
+        )), pattern_node.span);
+    }
+
+    sem.NodeId lower_binding_pattern(self, ast.PatternData pattern, ast.AstId name) {
+        ast.AstId binding_name = self.pattern_binding_name_id(name);
+        token.Span span = self.state.unit.get(binding_name).span;
+        guard self.current_owner_def is .some(owner_def) else { return self.add_invalid_node(span); }
+        sem.NodeId? type_ref! = null;
+        if (pattern.type_ref is .some(type_ast)) {
+            type_ref = self.lower_type_ref(type_ast);
+        }
+        sem.LocalId local_id = self.add_local_for_name(
+            owner_def,
+            binding_name,
+            .local_def,
+            .pattern_binding,
+            pattern.mutable_binding,
+            pattern.borrow_binding,
+            type_ref,
+            pattern.mutable_borrow
+        );
+        return self.add_node(.binding_pattern(sem.BindingPattern (local_id: local_id)), span);
+    }
+
+    ast.AstId pattern_binding_name_id(self, ast.AstId name_or_path) {
+        ast.AstNode node = self.state.unit.get(name_or_path);
+        if (node.data is .path(path)) {
+            if (path.segments.length == 1) {
+                return self.state.unit.child_at(path.segments, 0);
+            }
+        }
+        return name_or_path;
+    }
+
+    sem.NodeId[]& lower_pattern_range(self, ast.AstRange patterns) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(patterns.length);
+        Int index! = 0;
+        while (index < patterns.length) {
+            values.add(self.lower_pattern(self.state.unit.child_at(patterns, index)));
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    sem.NodeId[]& lower_expr_range(self, ast.AstRange exprs) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(exprs.length);
+        Int index! = 0;
+        while (index < exprs.length) {
+            values.add(self.lower_expr(self.state.unit.child_at(exprs, index)));
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    sem.NodeId lower_inline_asm(self, ast.InlineAsmData inline_asm, token.Span span) {
+        return self.add_node(.inline_asm(sem.InlineAsm (
+            result_type: self.lower_type_ref(inline_asm.result_type),
+            code_symbol: inline_asm.code_symbol,
+            operands: self.lower_inline_asm_operands(inline_asm.operands),
+            clobbers: self.lower_inline_asm_clobbers(inline_asm.clobbers),
+            volatile: inline_asm.options.volatile,
+            memory: inline_asm.options.memory,
+            noreturn: inline_asm.options.noreturn
+        )), span);
+    }
+
+    sem.InlineAsmOperand[]& lower_inline_asm_operands(self, ast.AstRange operands) {
+        list.ArrayList<sem.InlineAsmOperand> values! = list.ArrayList<sem.InlineAsmOperand>(operands.length);
+        Int index! = 0;
+        while (index < operands.length) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(operands, index));
+            if (node.data is .inline_asm_operand(operand)) {
+                values.add(self.lower_inline_asm_operand(operand));
+            }
+            index = index + 1;
+        }
+        return self.freeze_inline_asm_operands(values);
+    }
+
+    sem.InlineAsmOperand lower_inline_asm_operand(self, ast.InlineAsmData.Operand operand) {
+        if (operand is .input(input)) {
+            return .input(sem.InlineAsmInput (
+                name: input.name,
+                constraint_symbol: input.constraint_symbol,
+                value: self.lower_expr(input.value)
+            ));
+        }
+        if (operand is .output(output)) {
+            sem.NodeId? type_ref! = null;
+            if (output.type_ref is .some(type_ast)) {
+                type_ref = self.lower_type_ref(type_ast);
+            }
+            return .output(sem.InlineAsmOutput (
+                name: output.name,
+                constraint_symbol: output.constraint_symbol,
+                type_ref: type_ref
+            ));
+        }
+        return .input(sem.InlineAsmInput (
+            name: qid.SymbolId(0),
+            constraint_symbol: qid.SymbolId(0),
+            value: self.add_invalid_node(token.Span())
+        ));
+    }
+
+    qid.SymbolId[]& lower_inline_asm_clobbers(self, ast.AstRange clobbers) {
+        list.ArrayList<qid.SymbolId> values! = list.ArrayList<qid.SymbolId>(clobbers.length);
+        Int index! = 0;
+        while (index < clobbers.length) {
+            ast.AstNode node = self.state.unit.get(self.state.unit.child_at(clobbers, index));
+            if (node.data is .inline_asm_clobber(clobber)) {
+                values.add(clobber.name);
+            }
+            index = index + 1;
+        }
+        return self.freeze_symbol_ids(values);
+    }
+
+    qid.DefId? variant_pattern_def(self, ast.PatternData pattern, ast.AstId name) {
+        // `.case` 的 name 在 AST 里仍是普通 name 节点，可能和外层局部变量同名。
+        // dot-prefix pattern 的 owner 必须由 type check 根据 scrutinee type 决定，
+        // 这里不能把同名局部变量误记成 variant DefId。
+        if (pattern.dot_prefix) {
+            return null;
+        }
+        return self.resolved_def_for_expr(name);
+    }
+
+    Bool pattern_is_variant(self, ast.PatternData pattern, ast.AstId name) {
+        if (pattern.dot_prefix) {
+            return true;
+        }
+        if (!pattern.payload.is_empty()) {
+            return true;
+        }
+        if (self.resolved_def_for_expr(name) is .some(def_id)) {
+            def.DefKind kind = self.state.store.defs.get(def_id).kind;
+            return kind == .enum_case_def || kind == .union_variant_def;
+        }
+        return false;
+    }
+
+    sem.NodeId lower_type_ref(self, ast.AstId type_id) {
+        ast.AstNode node = self.state.unit.get(type_id);
+        // 表达式位置的 type constructor callee 可能仍包着 name_expr，
+        // 先剥掉语法外壳，再按真正的 name/path 做 type-ref lowering。
+        if (node.data is .name_expr(name_expr)) {
+            return self.lower_type_ref(name_expr.value);
+        }
+        if (node.data is .infer_type) {
+            return self.add_node(.infer_type_ref(), node.span);
+        }
+        if (node.data is .unit_type) {
+            return self.add_node(.unit_type_ref(), node.span);
+        }
+        if (node.data is .type_ref(type_data)) {
+            return self.add_node(.layered_type_ref(sem.LayeredTypeRef (
+                kind: self.type_layer_kind(type_data.layer),
+                element: self.lower_type_ref(type_data.base),
+                sentinel_kind: self.sentinel_kind(type_data.sentinel_kind),
+                sentinel_value: self.sentinel_value(type_data.sentinel_kind, type_data.sentinel_symbol_id)
+            )), node.span);
+        }
+        if (node.data is .named_type(named_type)) {
+            return self.lower_named_type_ref(type_id, named_type);
+        }
+        if (node.data is .array_type(array_type)) {
+            return self.add_node(.array_type_ref(sem.ArrayTypeRef (
+                element: self.lower_type_ref(array_type.element),
+                count_kind: self.array_count_kind(array_type.count_kind),
+                count_value: self.array_count_value(array_type),
+                sentinel_kind: self.sentinel_kind(array_type.sentinel_kind),
+                sentinel_value: self.sentinel_value(array_type.sentinel_kind, array_type.sentinel_symbol_id)
+            )), node.span);
+        }
+        if (node.data is .errorable_type(errorable_type)) {
+            sem.NodeId? error_type! = null;
+            if (errorable_type.error_type is .some(error_ast)) {
+                error_type = self.lower_type_ref(error_ast);
+            }
+            return self.add_node(.errorable_type_ref(sem.ErrorableTypeRef (
+                value_type: self.lower_type_ref(errorable_type.value_type),
+                error_type: error_type
+            )), node.span);
+        }
+        if (node.data is .function_type(function_type)) {
+            return self.add_node(.function_type_ref(sem.FunctionTypeRef (
+                params: self.lower_type_ref_range(function_type.params),
+                result: self.lower_type_ref(function_type.result),
+                effects: self.lower_effect_set(function_type.effects)
+            )), node.span);
+        }
+        if (node.data is .effect_type(effect_type)) {
+            return self.add_node(.effect_type_ref(sem.EffectTypeRef (
+                base: self.lower_type_ref(effect_type.base),
+                effects: self.lower_effect_set(effect_type.effects)
+            )), node.span);
+        }
+        if (node.data is .tuple_type(tuple)) {
+            return self.add_node(.tuple_type_ref(sem.TupleTypeRef (
+                items: self.lower_type_ref_range(tuple.items),
+                contract_names: self.lower_tuple_contract_names(tuple)
+            )), node.span);
+        }
+        if (node.data is .path(_) || node.data is .name(_)) {
+            if (self.state.trait_companion_type_ref(type_id) is .some(companion)) {
+                return self.lower_trait_companion_type_ref(companion, node.span);
+            }
+            guard self.resolved_type_def_for_expr(type_id) is .some(def_id) else {
+                return self.add_node(.invalid_type_ref(), node.span);
+            }
+            if (self.state.self_type_ref_owner(type_id) is .some(owner_def)) {
+                return self.lower_self_placeholder_type_ref(owner_def, node.span);
+            }
+            return self.add_node(.named_type_ref(sem.NamedTypeRef (
+                def_id: def_id,
+                args: self.empty_model_ids()
+            )), node.span);
+        }
+        return self.add_node(.invalid_type_ref(), node.span);
+    }
+
+    sem.EffectSet lower_effect_set(self, ast.EffectSet effects) {
+        return sem.EffectSet(
+            has_unsafe: effects.has_unsafe,
+            has_async: effects.has_async,
+            has_sync: effects.has_sync,
+            domain: self.lower_optional_effect_expr(effects.domain),
+            context: self.lower_optional_effect_expr(effects.context)
+        );
+    }
+
+    sem.NodeId? lower_optional_effect_expr(self, ast.AstId? expr) {
+        if (expr is .some(value)) {
+            if (self.effect_expr_is_current_domain(value)) { return null; }
+            if (self.resolved_type_def_for_expr(value) != null) {
+                return self.lower_type_ref(value);
+            }
+            return self.lower_expr(value);
+        }
+        return null;
+    }
+
+    Bool effect_expr_is_current_domain(self, ast.AstId expr_id) {
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        guard expr.data is .name_expr(name_expr) else { return false; }
+        ast.AstNode path_node = self.state.unit.get(name_expr.value);
+        guard path_node.data is .path(path) else { return false; }
+        if (path.segments.length != 1) { return false; }
+        ast.AstId name_id = self.state.unit.child_at(path.segments, 0);
+        ast.AstNode name_node = self.state.unit.get(name_id);
+        guard name_node.data is .name(name_data) else { return false; }
+        guard name_data.symbol_id is .some(symbol) else { return false; }
+        UInt8[]& text = self.state.store.symbols.text(symbol);
+        if (text.length != 7) { return false; }
+        return text[0] == UInt8(99)
+            && text[1] == UInt8(117)
+            && text[2] == UInt8(114)
+            && text[3] == UInt8(114)
+            && text[4] == UInt8(101)
+            && text[5] == UInt8(110)
+            && text[6] == UInt8(116);
+    }
+
+    sem.NodeId lower_named_type_ref(self, ast.AstId type_id, ast.NamedTypeData named_type) {
+        token.Span span = self.state.unit.get(named_type.path).span;
+        if (self.state.trait_companion_type_ref(type_id) is .some(companion)) {
+            return self.lower_trait_companion_type_ref(companion, span);
+        }
+        guard self.resolved_type_def_for_expr(named_type.path) is .some(def_id) else {
+            return self.add_node(.invalid_type_ref(), span);
+        }
+        if (self.state.self_type_ref_owner(type_id) is .some(owner_def)) {
+            return self.lower_self_placeholder_type_ref(owner_def, span);
+        }
+        return self.add_node(.named_type_ref(sem.NamedTypeRef (
+            def_id: def_id,
+            args: self.lower_generic_arg_range_for_owner(def_id, named_type.args),
+            contract_names: self.lower_contract_names(named_type)
+        )), span);
+    }
+
+    qid.SymbolId[]&? lower_contract_names(self, ast.NamedTypeData named_type) {
+        if (named_type.contract_names.length == 0) { return null; }
+        if (named_type.contract_names.length != named_type.args.length) { return null; }
+        list.ArrayList<qid.SymbolId> names! =
+            list.ArrayList<qid.SymbolId>(named_type.contract_names.length);
+        Int index! = 0;
+        while (index < named_type.contract_names.length) {
+            ast.AstId name_id = self.state.unit.child_at(named_type.contract_names, index);
+            names.add(self.name_symbol_or_zero(name_id));
+            index = index + 1;
+        }
+        return self.freeze_symbol_ids(names);
+    }
+
+    qid.SymbolId[]&? lower_tuple_contract_names(self, ast.TupleTypeData tuple) {
+        if (tuple.contract_names.length == 0) { return null; }
+        if (tuple.contract_names.length != tuple.items.length) { return null; }
+        list.ArrayList<qid.SymbolId> names! =
+            list.ArrayList<qid.SymbolId>(tuple.contract_names.length);
+        Int index! = 0;
+        while (index < tuple.contract_names.length) {
+            ast.AstId name_id = self.state.unit.child_at(tuple.contract_names, index);
+            names.add(self.name_symbol_or_zero(name_id));
+            index = index + 1;
+        }
+        return self.freeze_symbol_ids(names);
+    }
+
+    sem.NodeId lower_self_placeholder_type_ref(self, qid.DefId owner_def, token.Span span) {
+        return self.add_node(.self_type_ref(owner_def), span);
+    }
+
+    sem.NodeId lower_trait_companion_type_ref(self,
+        resolve_state.TraitCompanionTypeRef companion,
+        token.Span span
+    ) {
+        return self.add_node(.trait_companion_type_ref(sem.TraitCompanionTypeRef (
+            trait_def: companion.trait_def,
+            kind: companion.kind
+        )), span);
+    }
+
+    sem.NodeId[]& lower_generic_arg_range_for_owner(self, qid.DefId owner_def, ast.AstRange range) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(range.length);
+        Int index! = 0;
+        while (index < range.length) {
+            ast.AstId arg_id = self.state.unit.child_at(range, index);
+            if (self.generic_arg_is_resolved_value(arg_id)) {
+                values.add(self.lower_const_generic_arg(arg_id));
+                index = index + 1;
+                continue;
+            }
+            if (!self.ast_node_is_type_ref(arg_id)) {
+                values.add(self.lower_const_generic_arg(arg_id));
+                index = index + 1;
+                continue;
+            }
+            values.add(self.lower_type_ref(arg_id));
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    Bool generic_arg_is_resolved_value(self, ast.AstId arg_id) {
+        ast.AstNode arg = self.state.unit.get(arg_id);
+        if (arg.data is .named_type(named_type)) {
+            return self.resolved_path_def(named_type.path, .value_name) != null;
+        }
+        return false;
+    }
+
+    sem.NodeId lower_const_generic_arg(self, ast.AstId arg_id) {
+        ast.AstNode arg = self.state.unit.get(arg_id);
+        token.Span span = arg.span;
+        if (arg.data is .infer_type) {
+            return self.add_node(.infer_type_ref(), span);
+        }
+        ast.AstId path_id! = arg_id;
+        if (arg.data is .named_type(named_type)) {
+            path_id = named_type.path;
+        }
+        if (self.resolved_path_def(path_id, .value_name) is .some(def_id)) {
+            return self.add_node(.named_type_ref(sem.NamedTypeRef (
+                def_id: def_id,
+                args: self.empty_model_ids()
+            )), span);
+        }
+        return self.lower_expr(arg_id);
+    }
+
+    def.NameDomain? generic_param_domain_at(self, qid.DefId owner_def, Int index) {
+        guard self.state.store.model.def(owner_def) is .some(model_def) else { return null; }
+        if (index < 0 || index >= model_def.generic_params.len()) {
+            return null;
+        }
+        qid.DefId param_def = model_def.generic_params.get(index);
+        return self.state.store.defs.get(param_def).domain;
+    }
+
+    sem.NodeId[]& lower_generic_arg_range(self, ast.AstRange range) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(range.length);
+        Int index! = 0;
+        while (index < range.length) {
+            ast.AstId arg_id = self.state.unit.child_at(range, index);
+            if (self.generic_arg_is_resolved_value(arg_id)) {
+                values.add(self.lower_const_generic_arg(arg_id));
+            } else if (self.ast_node_is_type_ref(arg_id)) {
+                values.add(self.lower_type_ref(arg_id));
+            } else {
+                values.add(self.lower_expr(arg_id));
+            }
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    sem.NodeId[]& lower_type_ref_range(self, ast.AstRange range) {
+        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(range.length);
+        Int index! = 0;
+        while (index < range.length) {
+            values.add(self.lower_type_ref(self.state.unit.child_at(range, index)));
+            index = index + 1;
+        }
+        return self.freeze_model_ids(values);
+    }
+
+    sem.NodeId lower_name_ref(self, ast.AstId expr_id) {
+        guard self.resolved_value_def_for_expr(expr_id) is .some(def_id) else {
+            return self.add_invalid_node(self.state.unit.get(expr_id).span);
+        }
+        sem.NameRef name_ref! = .def_ref(def_id);
+        // 本地绑定虽然也有 DefId，但在当前 body 内用 LocalId 更直接；
+        // 跨 owner 或非 local 定义仍保留 DefId 引用。
+        if (self.current_owner_def is .some(owner_def)) {
+            if (self.state.store.model.local_for_def(owner_def, def_id) is .some(local_id)) {
+                name_ref = .local(local_id);
+            }
+        }
+        return self.add_node(.name_ref(name_ref), self.state.unit.get(expr_id).span);
+    }
+
+    sem.LocalId add_local_for_name(self,
+        qid.DefId owner_def,
+        ast.AstId name_id,
+        def.DefKind def_kind,
+        sem.LocalKind kind,
+        Bool mutable_binding,
+        Bool borrow_binding,
+        sem.NodeId? type_ref,
+        Bool mutable_borrow = false
+    ) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return sem.LocalId.from_index(0); }
+        token.Span span = self.state.unit.get(name_id).span;
+        qid.DefId def_id = self.state.store.defs.create(
+            def_kind,
+            .value_name,
+            .private_visibility,
+            def.Name (symbol: symbol, span: span),
+            owner_def,
+            self.state.module_id,
+            self.state.namespace_id,
+            null
+        );
+        if (!self.env.empty()) {
+            self.env.define(symbol, .value_name, def_id, span);
+        }
+        return self.state.store.model.add_local_with_borrow_binding(
+            owner_def,
+            kind,
+            symbol,
+            def_id,
+            mutable_binding,
+            borrow_binding,
+            type_ref,
+            mutable_borrow
+        );
+    }
+
+    sem.CallTarget? call_target(self, ast.AstId callee_id) {
+        guard self.resolved_value_def_for_expr(callee_id) is .some(def_id) else { return null; }
+        def.DefKind kind = self.state.store.defs.get(def_id).kind;
+        if (kind == .function_def || kind == .union_variant_def) {
+            return sem.CallTarget (def_id: def_id, signature_id: null);
+        }
+        if (kind == .enum_case_def) {
+            return sem.CallTarget (def_id: def_id, signature_id: null);
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_def_for_expr(self, ast.AstId expr_id) {
+        if (self.resolved_value_def_for_expr(expr_id) is .some(def_id)) { return def_id; }
+        if (self.resolved_type_def_for_expr(expr_id) is .some(def_id)) { return def_id; }
+        return self.resolved_path_def(expr_id, .member_name);
+    }
+
+    qid.DefId? resolved_value_def_for_expr(self, ast.AstId expr_id) {
+        guard self.resolved_path_def(expr_id, .value_name) is .some(def_id) else { return null; }
+        return self.resolve_alias_target(def_id);
+    }
+
+    qid.DefId? resolved_type_def_for_expr(self, ast.AstId expr_id) {
+        guard self.resolved_path_def(expr_id, .type_name) is .some(def_id) else { return null; }
+        return self.resolve_alias_target(def_id);
+    }
+
+    qid.DefId? resolved_namespace_def_for_expr(self, ast.AstId expr_id) {
+        guard self.resolved_path_def(expr_id, .namespace_name) is .some(def_id) else { return null; }
+        return self.resolve_alias_target(def_id);
+    }
+
+    qid.DefId? resolved_type_def_for_type_ref(self, ast.AstId type_id) {
+        if (extension_target.builtin_constructor_owner(self.state, type_id) is .some(owner_def)) {
+            return owner_def;
+        }
+        ast.AstNode node = self.state.unit.get(type_id);
+        if (node.data is .type_ref(type_ref)) {
+            return self.resolved_type_def_for_type_ref(type_ref.base);
+        }
+        if (node.data is .named_type(named_type)) {
+            return self.resolved_type_def_for_expr(named_type.path);
+        }
+        return self.resolved_type_def_for_expr(type_id);
+    }
+
+    qid.DefId resolve_alias_target(self, qid.DefId def_id) {
+        qid.DefId current! = def_id;
+        Int depth! = 0;
+        while (depth < 64) {
+            if (self.state.store.defs.get(current).kind != .alias_def) {
+                return current;
+            }
+            if (!self.state.store.model.has_def(current)) { return current; }
+            sem.Def& alias_model = self.state.store.model.def_ref(current);
+            guard alias_model.decl.alias_target is .some(target_def) else { return current; }
+            current = target_def;
+            depth = depth + 1;
+        }
+        return current;
+    }
+
+    qid.DefId? resolved_path_def(self, ast.AstId expr_id, def.NameDomain domain) {
+        ast.AstNode expr = self.state.unit.get(expr_id);
+        if (expr.data is .name_expr(name_expr)) {
+            return self.resolved_path_def(name_expr.value, domain);
+        }
+        if (expr.data is .name(_)) {
+            return self.resolved_name_def(expr_id, domain);
+        }
+        if (expr.data is .path(path)) {
+            if (path.segments.length == 1) {
+                return self.resolved_name_def(self.state.unit.child_at(path.segments, 0), domain);
+            }
+            if (path.segments.length >= 2) {
+                return self.resolved_qualified_path_def(path, domain);
+            }
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_name_def(self, ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
+        if (self.env.lookup_def(symbol, domain) is .some(local_def)) {
+            return local_def;
+        }
+        if (domain == .type_name) {
+            if (self.current_owner_type_member(symbol) is .some(owner_member)) {
+                return owner_member;
+            }
+        }
+        if (
+            self.state.store.resolve.lookup_visible_name(self.state.namespace_id, symbol, domain, true)
+            is .some(binding)
+        ) {
+            return binding.def_id;
+        }
+        return null;
+    }
+
+    qid.DefId? current_owner_type_member(self, qid.SymbolId symbol) {
+        if (!self.owner_type_lookup_enabled) { return null; }
+        guard self.current_owner_def is .some(start_def) else { return null; }
+        qid.DefId current! = start_def;
+        Int depth! = 0;
+        while (depth < 64) {
+            def.DefRecord record = self.state.store.defs.get(current);
+            if (record.owned_namespace_id is .some(owner_namespace)) {
+                if (
+                    self.state.store.resolve.lookup_namespace(owner_namespace, symbol, .type_name, false)
+                    is .some(binding)
+                ) {
+                    return binding.def_id;
+                }
+            }
+            guard record.owner_def is .some(parent_def) else { return null; }
+            current = parent_def;
+            depth = depth + 1;
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_qualified_path_def(self, ast.PathData path, def.NameDomain domain) {
+        ast.AstId first_id = self.state.unit.child_at(path.segments, 0);
+        if (self.qualified_root_namespace(first_id) is .some(namespace_id)) {
+            return self.resolved_qualified_segments(path, 1, namespace_id, domain);
+        }
+        return null;
+    }
+
+    qid.NamespaceId? qualified_root_namespace(self, ast.AstId first_id) {
+        if (
+            self.lookup_owned_namespace(self.state.namespace_id, first_id, .namespace_name, true, true)
+            is .some(namespace_id)
+        ) {
+            return namespace_id;
+        }
+        if (self.current_owner_type_namespace(first_id) is .some(namespace_id)) {
+            return namespace_id;
+        }
+        return self.lookup_owned_namespace(self.state.namespace_id, first_id, .type_name, true, false);
+    }
+
+    qid.NamespaceId? current_owner_type_namespace(self, ast.AstId name_id) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
+        guard self.current_owner_type_member(symbol) is .some(def_id) else { return null; }
+        return self.state.store.defs.get(def_id).owned_namespace_id;
+    }
+
+    qid.NamespaceId? lookup_owned_namespace(self,
+        qid.NamespaceId namespace_id,
+        ast.AstId name_id,
+        def.NameDomain domain,
+        Bool visible_lookup,
+        Bool allow_import_alias_target
+    ) {
+        guard self.state.name_symbol(name_id) is .some(symbol) else { return null; }
+        if (visible_lookup) {
+            if (
+                self.state.store.resolve.lookup_visible_name(namespace_id, symbol, domain, true)
+                is .some(binding)
+            ) {
+                return self.owned_namespace_for_def(binding.def_id, allow_import_alias_target);
+            }
+            return null;
+        }
+        if (self.state.store.resolve.lookup_namespace(namespace_id, symbol, domain, false) is .some(binding)) {
+            return self.owned_namespace_for_def(binding.def_id, allow_import_alias_target);
+        }
+        return null;
+    }
+
+    qid.NamespaceId? owned_namespace_for_def(self, qid.DefId def_id, Bool allow_import_alias_target) {
+        if (allow_import_alias_target) {
+            if (self.import_alias_target_namespace(def_id) is .some(target_namespace)) {
+                return target_namespace;
+            }
+        }
+        return self.state.store.defs.get(def_id).owned_namespace_id;
+    }
+
+    qid.NamespaceId? import_alias_target_namespace(self, qid.DefId alias_def) {
+        store.ModuleRecord& module = self.state.store.resolve.module_ref(self.state.module_id);
+        Int index! = 0;
+        while (index < module.imports.len()) {
+            store.ImportRecord import_record = module.imports.get(index);
+            if (import_record.alias_def is .some(import_alias_def)) {
+                if (import_alias_def == alias_def) {
+                    guard import_record.target_module is .some(target_module) else { return null; }
+                    return self.state.store.resolve.module_ref(target_module).namespace_id;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.DefId? resolved_qualified_segments(self,
+        ast.PathData path,
+        Int start_index,
+        qid.NamespaceId namespace_id,
+        def.NameDomain domain
+    ) {
+        qid.NamespaceId current_namespace! = namespace_id;
+        Int index! = start_index;
+        while (index < path.segments.length) {
+            ast.AstId segment_id = self.state.unit.child_at(path.segments, index);
+            Bool is_last = index + 1 == path.segments.length;
+            if (is_last) {
+                return self.resolved_last_qualified_segment(segment_id, current_namespace, domain);
+            }
+            if (self.next_qualified_namespace(segment_id, current_namespace) is .some(next_namespace)) {
+                current_namespace = next_namespace;
+            } else {
+                return null;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    qid.NamespaceId? next_qualified_namespace(self, ast.AstId segment_id, qid.NamespaceId namespace_id) {
+        if (
+            self.lookup_owned_namespace(namespace_id, segment_id, .namespace_name, false, false)
+            is .some(next_namespace)
+        ) {
+            return next_namespace;
+        }
+        return self.lookup_owned_namespace(namespace_id, segment_id, .type_name, false, false);
+    }
+
+    qid.DefId? resolved_last_qualified_segment(self,
+        ast.AstId segment_id,
+        qid.NamespaceId namespace_id,
+        def.NameDomain domain
+    ) {
+        guard self.state.name_symbol(segment_id) is .some(symbol) else { return null; }
+        if (
+            self.state.store.resolve.lookup_namespace(namespace_id, symbol, domain, false)
+            is .some(binding)
+        ) {
+            return binding.def_id;
+        }
+        if (domain == .value_name) {
+            if (
+                self.state.store.resolve.lookup_namespace(namespace_id, symbol, .member_name, false)
+                is .some(member_binding)
+            ) {
+                return member_binding.def_id;
+            }
+        }
+        if (domain == .type_name) {
+            return trait_companion.get_or_create_def(self.state, namespace_id, segment_id);
+        }
+        return null;
+    }
+
+    qid.DefId? decl_def_for_name(self, ast.AstId name_id, def.NameDomain domain) {
+        guard self.state.declaration_def(name_id) is .some(def_id) else { return null; }
+        if (Int(self.state.store.defs.get(def_id).domain) != Int(domain)) {
+            return null;
+        }
+        return def_id;
+    }
+
+    sem.NodeId add_node(self, sem.NodeData data, token.Span span) {
+        guard self.current_owner_def is .some(owner_def) else {
+            self.add_internal_error(span, "Semantic Model node lowered without owner", "model_node_without_owner");
+            return sem.NodeId(qid.DefId.from_index(0), 0);
+        }
+        sem.NodeId model_id = self.state.store.model.add_node(owner_def, data);
+        self.state.store.source_map.set_model_span(model_id, self.state.unit.source_id, span);
+        return model_id;
+    }
+
+    sem.NodeId add_invalid_node(self, token.Span span) {
+        return self.add_node(.invalid(), span);
+    }
+
+    sem.NodeId[]& empty_model_ids(self) {
+        list.ArrayList<sem.NodeId> empty = list.ArrayList<sem.NodeId>();
+        return self.freeze_model_ids(empty);
+    }
+
+    // Semantic Model node 里的 slice 不能指向临时 ArrayList；统一复制到
+    // Store arena，让它和 package Semantic Model 生命周期一致。
+    sem.NodeId[]& freeze_model_ids(self, list.ArrayList<sem.NodeId> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.NodeId*! stored = self.state.store.model.storage.alloc_array<sem.NodeId>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.LambdaParam[]& freeze_model_lambda_params(self, list.ArrayList<sem.LambdaParam> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.LambdaParam*! stored = self.state.store.model.storage.alloc_array<sem.LambdaParam>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.LambdaCapture[]& freeze_model_lambda_captures(self, list.ArrayList<sem.LambdaCapture> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.LambdaCapture*! stored = self.state.store.model.storage.alloc_array<sem.LambdaCapture>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    @life(return: (self, self))
+    sem.SwitchCase[]& freeze_switch_cases(self, list.ArrayList<sem.SwitchCase> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.SwitchCase*! stored = self.state.store.model.storage.alloc_array<sem.SwitchCase>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.ParamDefault[]& freeze_param_defaults(self, list.ArrayList<sem.ParamDefault> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.ParamDefault*! stored = self.state.store.model.storage.alloc_array<sem.ParamDefault>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.CallArg[]& freeze_call_args(self, list.ArrayList<sem.CallArg> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.CallArg*! stored = self.state.store.model.storage.alloc_array<sem.CallArg>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.FieldInit[]& freeze_field_inits(self, list.ArrayList<sem.FieldInit> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.FieldInit*! stored = self.state.store.model.storage.alloc_array<sem.FieldInit>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    sem.InlineAsmOperand[]& freeze_inline_asm_operands(self, list.ArrayList<sem.InlineAsmOperand> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            sem.InlineAsmOperand*! stored = self.state.store.model.storage.alloc_array<sem.InlineAsmOperand>(
+                capacity
+            );
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    qid.SymbolId[]& freeze_symbol_ids(self, list.ArrayList<qid.SymbolId> values) {
+        unsafe {
+            Int count = values.len();
+            Int capacity! = count;
+            if (capacity == 0) {
+                capacity = 1;
+            }
+            qid.SymbolId*! stored = self.state.store.model.storage.alloc_array<qid.SymbolId>(capacity);
+            Int index! = 0;
+            while (index < count) {
+                stored[index] = values.get(index);
+                index = index + 1;
+            }
+            return stored[0..count];
+        }
+    }
+
+    qid.SymbolId name_symbol_or_zero(self, ast.AstId name_id) {
+        if (self.state.name_symbol(name_id) is .some(symbol)) {
+            return symbol;
+        }
+        return qid.SymbolId(0);
+    }
+
+    sem.Literal model_literal(self, ast.LiteralData literal) {
+        sem.LiteralValue value! = .null_value();
+        if (literal.kind == .int_lit) {
+            value = .int_value(sem.IntLiteral (
+                bits: self.int_literal_bits(literal),
+                signed_value: true
+            ));
+        }
+        if (literal.kind == .float_lit) {
+            value = .float_value(sem.FloatLiteral (value: self.float_literal_value(literal)));
+        }
+        if (literal.kind == .char_lit) {
+            value = .char_value(self.char_literal_value(literal));
+        }
+        if (literal.kind == .string_lit) {
+            if (literal.symbol_id is .some(symbol)) {
+                value = .string_value(symbol);
+            }
+        }
+        if (literal.kind == .bool_lit) {
+            value = .bool_value(literal.bool_value);
+        }
+        return sem.Literal (value: value);
+    }
+
+    UInt32 char_literal_value(self, ast.LiteralData literal) {
+        guard literal.symbol_id is .some(symbol) else {
+            return UInt32(0);
+        }
+        return self.char_symbol_value(symbol);
+    }
+
+    UInt32 char_symbol_value(self, qid.SymbolId symbol) {
+        UInt8[]& text = self.state.store.symbols.text(symbol);
+        if (text.length == 0) {
+            return UInt32(0);
+        }
+        if (text[0] < UInt8(128)) {
+            return UInt32(text[0]);
+        }
+        if (unicode.is_valid_utf8_at(text, 0)) {
+            return UInt32(unicode.utf8_scalar_at(text, 0));
+        }
+        return UInt32(0);
+    }
+
+    UInt64 int_literal_bits(self, ast.LiteralData literal) {
+        guard literal.symbol_id is .some(symbol) else {
+            return UInt64(0);
+        }
+        return self.parse_uint_literal(self.state.store.symbols.text(symbol));
+    }
+
+    Float64 float_literal_value(self, ast.LiteralData literal) {
+        guard literal.symbol_id is .some(symbol) else {
+            return Float64(0);
+        }
+        UInt8*! text = self.float_literal_c_string(self.state.store.symbols.text(symbol));
+        Float64 value;
+        unsafe {
+            value = strtod(text$.as(UInt8*), 0);
+            text$.dealloc();
+        }
+        return value;
+    }
+
+    UInt8*! float_literal_c_string(self, UInt8[]& text) {
+        unsafe {
+            UInt8*! bytes = unsafe {
+                UInt8$.alloc(text.length + 1)
+            };
+            Int read! = 0;
+            Int write! = 0;
+            while (read < text.length) {
+                if (text[read] != UInt8(95)) {
+                    bytes[write] = text[read];
+                    write = write + 1;
+                }
+                read = read + 1;
+            }
+            bytes[write] = 0;
+            return bytes;
+        }
+    }
+
+    Bool is_decimal_digit_or_separator(self, UInt8 byte) {
+        if (byte == UInt8(95)) { return true; }
+        return byte >= UInt8(48) && byte <= UInt8(57);
+    }
+
+    sem.TypeLayerKind type_layer_kind(self, ast.TypeLayerKind kind) {
+        if (kind == .optional) { return .optional_type; }
+        if (kind == .mutable_type) { return .mutable_type; }
+        if (kind == .reference) { return .reference; }
+        if (kind == .owner_pointer) { return .owner_pointer; }
+        if (kind == .raw_pointer) { return .raw_pointer; }
+        return .slice;
+    }
+
+    sem.ArrayCountKind array_count_kind(self, ast.ArrayCountKind kind) {
+        if (kind == .int_lit) {
+            return .int_lit;
+        }
+        if (kind == .const_name) {
+            return .const_name;
+        }
+        return .inferred;
+    }
+
+    sem.SentinelKind sentinel_kind(self, ast.TypeSentinelKind kind) {
+        if (kind == .value) { return .value; }
+        if (kind == .char_value) { return .char_value; }
+        if (kind == .bool_true || kind == .bool_false) { return .bool_value; }
+        if (kind == .const_name) {
+            return .const_name;
+        }
+        if (kind == .wildcard) {
+            return .wildcard;
+        }
+        return .none;
+    }
+
+    UInt64 array_count_value(self, ast.ArrayTypeData array_type) {
+        guard array_type.count_symbol_id is .some(symbol) else {
+            return UInt64(0);
+        }
+        if (array_type.count_kind == .const_name) {
+            return UInt64(symbol.to_index());
+        }
+        return self.parse_uint_literal(self.state.store.symbols.text(symbol));
+    }
+
+    UInt64 sentinel_value(self, ast.TypeSentinelKind kind, qid.SymbolId? sentinel_symbol_id) {
+        if (kind == .bool_true) { return UInt64(1); }
+        if (kind == .bool_false) { return UInt64(0); }
+        guard sentinel_symbol_id is .some(symbol) else {
+            return UInt64(0);
+        }
+        if (kind == .const_name) {
+            return UInt64(symbol.to_index());
+        }
+        if (kind != .value) {
+            if (kind == .char_value) { return UInt64(self.char_symbol_value(symbol)); }
+            return UInt64(0);
+        }
+        return self.parse_uint_literal(self.state.store.symbols.text(symbol));
+    }
+
+    UInt64 parse_uint_literal(self, UInt8[]& text) {
+        Int base! = 10;
+        Int index! = 0;
+        if (text.length > 2 && text[0] == UInt8(48)) {
+            if (text[1] == UInt8(120) || text[1] == UInt8(88)) { base = 16; index = 2; }
+            else if (text[1] == UInt8(98) || text[1] == UInt8(66)) { base = 2; index = 2; }
+            else if (text[1] == UInt8(111) || text[1] == UInt8(79)) { base = 8; index = 2; }
+        }
+
+        UInt64 value! = UInt64(0);
+        while (index < text.length) {
+            if (text[index] == UInt8(95)) {
+                index = index + 1;
+                continue;
+            }
+            value = value * UInt64(base) + UInt64(self.digit_value(text[index]));
+            index = index + 1;
+        }
+        return value;
+    }
+
+    Int digit_value(self, UInt8 byte) {
+        if (byte >= UInt8(48) && byte <= UInt8(57)) { return Int(byte - UInt8(48)); }
+        if (byte >= UInt8(97) && byte <= UInt8(102)) { return Int(byte - UInt8(97)) + 10; }
+        if (byte >= UInt8(65) && byte <= UInt8(70)) { return Int(byte - UInt8(65)) + 10; }
+        return 0;
+    }
+
+    sem.UnaryOp unary_op(self, ast.UnaryOp op) {
+        if (op == .negate) { return .negate; }
+        if (op == .not) { return .not; }
+        if (op == .bit_not) { return .bit_not; }
+        if (op == .address_of) { return .address_of; }
+        if (op == .deref) { return .deref; }
+        return .new_value;
+    }
+
+    sem.BinaryOp binary_op(self, ast.BinaryOp op) {
+        if (op == .add) { return .add; }
+        if (op == .sub) { return .sub; }
+        if (op == .mul) { return .mul; }
+        if (op == .div) { return .div; }
+        if (op == .mod) { return .mod; }
+        if (op == .bit_and) { return .bit_and; }
+        if (op == .bit_or) { return .bit_or; }
+        if (op == .bit_xor) { return .bit_xor; }
+        if (op == .logic_and) { return .logic_and; }
+        if (op == .logic_or) { return .logic_or; }
+        if (op == .coalesce) { return .coalesce; }
+        if (op == .shift_left) { return .shift_left; }
+        if (op == .shift_right) { return .shift_right; }
+        if (op == .equal) { return .equal; }
+        if (op == .not_equal) { return .not_equal; }
+        if (op == .less) { return .less; }
+        if (op == .less_equal) { return .less_equal; }
+        if (op == .greater) { return .greater; }
+        return .greater_equal;
+    }
+
+    sem.AssignOp assign_op(self, ast.AssignOp op) {
+        if (op == .assign) { return .assign; }
+        if (op == .add_assign) { return .add_assign; }
+        if (op == .sub_assign) { return .sub_assign; }
+        if (op == .mul_assign) { return .mul_assign; }
+        if (op == .div_assign) { return .div_assign; }
+        if (op == .mod_assign) { return .mod_assign; }
+        if (op == .bit_and_assign) { return .bit_and_assign; }
+        if (op == .bit_or_assign) { return .bit_or_assign; }
+        if (op == .bit_xor_assign) { return .bit_xor_assign; }
+        if (op == .shift_left_assign) { return .shift_left_assign; }
+        return .shift_right_assign;
+    }
+
+    () add_internal_error(self, token.Span span, UInt8[]& message, UInt8[]& code) {
+        self.state.store.model.mark_error();
+        self.state.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .internal,
+                diagnostic.DiagnosticCode(code),
+                diagnostic.SourceRange(self.state.unit.source_id, span),
+                message
+            )
+        );
+    }
+
+    () add_name_resolution_error(self, token.Span span, UInt8[]& message, UInt8[]& code) {
+        self.state.store.model.mark_error();
+        self.state.ctx.store.diagnostics.add(
+            diagnostic.Diagnostic(
+                .error,
+                .name_resolution,
+                diagnostic.DiagnosticCode(code),
+                diagnostic.SourceRange(self.state.unit.source_id, span),
+                message
+            )
+        );
+    }
+
+}

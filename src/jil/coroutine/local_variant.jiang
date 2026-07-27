@@ -1,0 +1,818 @@
+// 构造 fully-confined 协程的 JIL 执行变体。
+//
+// 变体与标准 resume/completion 共享不可变的 local/type/projection 数据，只复制
+// block/statement 层。用户 Atomic<T> 保持原子语义；只有编译器生成的协程协议
+// 以及 Task 调度协议改为单 executor 版本。
+
+import qid = "../../store/id.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../../jil.jiang";
+import plan = "./plan.jiang";
+
+@region(a)
+struct TaskRootVariant: Copyable {
+    @life(a)
+    jil.Place task;
+
+    @life(a)
+    jil.FunctionRef source_resume;
+
+    @life(a)
+    jil.FunctionRef variant_resume;
+}
+
+@region(a)
+struct LocalCallee: Copyable {
+    @life(a)
+    jil.CallCallee value;
+    Bool confined_direct;
+}
+
+@life(return: (source.a, source.b, source.c, output & source.d))
+public jil.Function select_task_roots(
+    jil.Store& output,
+    jil.Function source,
+    plan.Store& plans
+) {
+    list.ArrayList<TaskRootVariant> variants! = list.ArrayList<TaskRootVariant>();
+    collect_task_root_variants(
+        output,
+        source.body,
+        plans,
+        variants$.ref()
+    );
+    if (variants.len() == 0) { return source; }
+    return function_with_body(source, selected_root_body(output, source.body, variants$.ref()));
+}
+
+() collect_task_root_variants(
+    jil.Store& output,
+    jil.Body body,
+    plan.Store& plans,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        jil.Block block = body.blocks[block_index];
+        Int statement_index! = 0;
+        while (statement_index < block.statements.length) {
+            append_task_root_variant(
+                output,
+                block.statements[statement_index],
+                plans,
+                variants
+            );
+            statement_index = statement_index + 1;
+        }
+        block_index = block_index + 1;
+    }
+}
+
+() append_task_root_variant(
+    jil.Store& output,
+    jil.Statement statement,
+    plan.Store& plans,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    guard statement.kind is .task_region_start_stmt(start) else { return; }
+    guard start.child_resume is .some(source_resume) else { return; }
+    jil.FunctionKey key = jil.FunctionKey(
+        source_resume.function_def,
+        source_resume.type_args,
+        source_resume.const_args
+    );
+    if (start.storage.sync != .local_serial) { return; }
+    guard plans.get(key).confined_resume is .some(variant_def) else { return; }
+    variants.add(TaskRootVariant (
+        task: start.task,
+        source_resume: source_resume,
+        variant_resume: variant_function_ref(
+            output, source_resume, variant_def
+        )
+    ));
+}
+
+@life(return: output)
+jil.FunctionRef variant_function_ref(
+    jil.Store& output,
+    jil.FunctionRef source,
+    qid.DefId variant_def
+) {
+    return jil.FunctionRef (
+        function_def: variant_def,
+        type_args: output.empty_type_args(),
+        const_args: output.empty_const_args(),
+        coroutine_resume: false,
+        coroutine_completion: false,
+        type_id: source.type_id,
+        span: source.span
+    );
+}
+
+@life(return: (source.a, source.b, source.c, source.d & body))
+jil.Function function_with_body(jil.Function source, jil.Body body) {
+    return jil.Function (
+        id: source.id,
+        def_id: source.def_id,
+        type_args: source.type_args,
+        const_args: source.const_args,
+        signature_id: source.signature_id,
+        effects: source.effects,
+        is_coroutine: source.is_coroutine,
+        coroutine_frame: source.coroutine_frame,
+        confinement: source.confinement,
+        confinement_domain: source.confinement_domain,
+        is_coroutine_resume: source.is_coroutine_resume,
+        is_coroutine_completion: source.is_coroutine_completion,
+        is_language_entry: source.is_language_entry,
+        is_runtime_entry: source.is_runtime_entry,
+        is_external: source.is_external,
+        inline_always: source.inline_always,
+        naked: source.naked,
+        span: source.span,
+        body: body
+    );
+}
+
+@life(return: output & source)
+jil.Body selected_root_body(
+    jil.Store& output,
+    jil.Body source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(source.blocks.length);
+    Int index! = 0;
+    while (index < source.blocks.length) {
+        blocks.add(selected_root_block(output, source.blocks[index], variants));
+        index = index + 1;
+    }
+    return jil.Body (
+        id: source.id,
+        span: source.span,
+        locals: source.locals,
+        blocks: output.block_array(blocks$.ref()),
+        entry: source.entry,
+        return_local: source.return_local
+    );
+}
+
+@life(return: output & source & variants)
+jil.Block selected_root_block(
+    jil.Store& output,
+    jil.Block source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    list.ArrayList<jil.Statement> statements! =
+        list.ArrayList<jil.Statement>(source.statements.length);
+    Int index! = 0;
+    while (index < source.statements.length) {
+        if (selected_root_statement(
+                source.statements[index], variants
+            ) is .some(statement)
+        ) {
+            statements.add(statement);
+        }
+        index = index + 1;
+    }
+    return jil.Block (
+        id: source.id,
+        span: source.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: selected_root_terminator(source.terminator, variants)
+    );
+}
+
+@life(return: source & variants)
+jil.Terminator selected_root_terminator(
+    jil.Terminator source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    guard source.kind is .call_term(call) else { return source; }
+    guard call.callee is .direct_function(function_ref) else { return source; }
+    Int index! = 0;
+    while (index < variants.len()) {
+        TaskRootVariant variant = variants.get(index);
+        if (function_ref_equal(function_ref, variant.source_resume)) {
+            return call_with_resume(source.span, call, variant.variant_resume);
+        }
+        index = index + 1;
+    }
+    return source;
+}
+
+@life(return: call & resume)
+jil.Terminator call_with_resume(
+    token.Span span,
+    jil.CallTerminator call,
+    jil.FunctionRef resume
+) {
+    return jil.Terminator (
+        span: span,
+        kind: jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.direct_function_callee(resume),
+            args: call.args,
+            current_effects: call.current_effects,
+            is_suspend_point: call.is_suspend_point,
+            suspend_wake: call.suspend_wake,
+            suspend_child: resume,
+            task_handoff: call.task_handoff,
+            async_start: call.async_start,
+            destination: call.destination,
+            target: call.target,
+            initialized_place: call.initialized_place,
+            exclusive_places: call.exclusive_places,
+            cleanup: call.cleanup
+        ))
+    );
+}
+
+@life(return: source & variants)
+jil.Statement? selected_root_statement(
+    jil.Statement source,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    if (source.kind is .task_region_start_stmt(start)) {
+        return selected_root_start_statement(source.span, start, variants);
+    }
+    guard source.kind is .assign_stmt(assign) else { return source; }
+    guard assign.value is .use_value(use_value) else { return source; }
+    guard use_value.value is .function_operand(function_ref) else { return source; }
+    Int index! = 0;
+    while (index < variants.len()) {
+        TaskRootVariant variant = variants.get(index);
+        if (place_has_prefix(assign.destination, variant.task)
+            && function_ref_equal(function_ref, variant.source_resume)
+        ) {
+            return function_assign_statement(source.span, assign.destination, variant.variant_resume);
+        }
+        index = index + 1;
+    }
+    return source;
+}
+
+@life(return: start & variants)
+jil.Statement selected_root_start_statement(
+    token.Span span,
+    jil.TaskRegionStartStatement start,
+    list.ArrayList<TaskRootVariant>& variants
+) {
+    guard start.child_resume is .some(child_resume) else {
+        return jil.Statement(span: span, kind: jil.task_region_start_statement_kind(start));
+    }
+    Int index! = 0;
+    while (index < variants.len()) {
+        TaskRootVariant variant = variants.get(index);
+        if (function_ref_equal(child_resume, variant.source_resume)
+            && place_equal(start.task, variant.task)
+        ) {
+            return jil.Statement (
+                span: span,
+                kind: jil.task_region_start_statement_kind(jil.TaskRegionStartStatement (
+                    task: start.task,
+                    task_local: start.task_local,
+                    storage: start.storage,
+                    child_resume: variant.variant_resume
+                ))
+            );
+        }
+        index = index + 1;
+    }
+    return jil.Statement(span: span, kind: jil.task_region_start_statement_kind(start));
+}
+
+@life(return: destination & function_ref)
+jil.Statement function_assign_statement(
+    token.Span span,
+    jil.Place destination,
+    jil.FunctionRef function_ref
+) {
+    return jil.Statement (
+        span: span,
+        kind: jil.assign_statement_kind(jil.AssignStatement (
+            destination: destination,
+            value: jil.use_rvalue(jil.UseRvalue (
+                value: jil.function_operand_value(function_ref)
+            ))
+        ))
+    );
+}
+
+Bool function_ref_equal(jil.FunctionRef lhs, jil.FunctionRef rhs) {
+    if (lhs.coroutine_resume != rhs.coroutine_resume) { return false; }
+    if (lhs.coroutine_completion != rhs.coroutine_completion) { return false; }
+    jil.FunctionKey lhs_key = jil.FunctionKey(
+        lhs.function_def, lhs.type_args, lhs.const_args
+    );
+    jil.FunctionKey rhs_key = jil.FunctionKey(
+        rhs.function_def, rhs.type_args, rhs.const_args
+    );
+    return jil.FunctionKey.equal(lhs_key$.ref(), rhs_key$.ref());
+}
+
+Bool place_equal(jil.Place lhs, jil.Place rhs) {
+    if (!place_base_equal(lhs.base, rhs.base)) { return false; }
+    if (lhs.projection.length != rhs.projection.length) { return false; }
+    return projection_prefix_equal(lhs.projection, rhs.projection);
+}
+
+Bool place_has_prefix(jil.Place place, jil.Place prefix) {
+    if (!place_base_equal(place.base, prefix.base)) { return false; }
+    if (place.projection.length < prefix.projection.length) { return false; }
+    return projection_prefix_equal(place.projection, prefix.projection);
+}
+
+Bool place_base_equal(jil.PlaceBase lhs, jil.PlaceBase rhs) {
+    if (lhs is .local(lhs_local)) {
+        if (rhs is .local(rhs_local)) { return lhs_local == rhs_local; }
+        return false;
+    }
+    guard lhs is .global(lhs_global) else { return false; }
+    guard rhs is .global(rhs_global) else { return false; }
+    return lhs_global.global_def == rhs_global.global_def;
+}
+
+Bool projection_prefix_equal(jil.PlaceElem[]& lhs, jil.PlaceElem[]& rhs) {
+    Int index! = 0;
+    while (index < rhs.length) {
+        if (!place_elem_equal(lhs[index], rhs[index])) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool place_elem_equal(jil.PlaceElem lhs, jil.PlaceElem rhs) {
+    if (lhs is .deref_projection(left)) {
+        if (rhs is .deref_projection(right)) { return left.raw_pointer == right.raw_pointer; }
+        return false;
+    }
+    if (lhs is .field_projection(left)) {
+        if (rhs is .field_projection(right)) {
+            return left.field_def == right.field_def && left.field_index == right.field_index;
+        }
+        return false;
+    }
+    if (lhs is .frame_field_projection(left)) {
+        if (rhs is .frame_field_projection(right)) { return left.field_index == right.field_index; }
+        return false;
+    }
+    if (lhs is .index_projection(left)) {
+        if (rhs is .index_projection(right)) { return left.index_local == right.index_local; }
+        return false;
+    }
+    if (lhs is .constant_index_projection(left)) {
+        if (rhs is .constant_index_projection(right)) { return left.offset == right.offset; }
+        return false;
+    }
+    if (lhs is .subslice_projection(left)) {
+        if (rhs is .subslice_projection(right)) {
+            return left.from == right.from && left.to == right.to;
+        }
+    }
+    return false;
+}
+
+@life(return: (output, output, output, output & source.d & current_executor))
+public jil.Function add(
+    jil.Store& output,
+    jil.Function source,
+    qid.DefId variant_def,
+    jil.Place? current_executor,
+    plan.Store& plans
+) {
+    jil.FunctionId id = jil.FunctionId.from_index(output.functions.len());
+    jil.Function variant = jil.Function (
+        id: id,
+        def_id: variant_def,
+        type_args: output.empty_type_args(),
+        const_args: output.empty_const_args(),
+        signature_id: null,
+        effects: source.effects,
+        is_coroutine: false,
+        coroutine_frame: null,
+        confinement: .preserving,
+        confinement_domain: source.confinement_domain,
+        is_coroutine_resume: false,
+        is_coroutine_completion: false,
+        is_language_entry: false,
+        is_runtime_entry: false,
+        is_external: false,
+        inline_always: source.inline_always,
+        naked: false,
+        span: source.span,
+        body: local_body(
+            output,
+            source.body,
+            id,
+            current_executor,
+            plans
+        )
+    );
+    output.add_generated_function(variant);
+    output.mark_drop_elaborated(id);
+    output.mark_borrow_check_exempt(id);
+    return variant;
+}
+
+@life(return: output & source & current_executor)
+jil.Body local_body(
+    jil.Store& output,
+    jil.Body source,
+    jil.FunctionId function_id,
+    jil.Place? current_executor,
+    plan.Store& plans
+) {
+    jil.LocalId? executor_local = executor_scope_local(source);
+    list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(source.blocks.length);
+    Int index! = 0;
+    while (index < source.blocks.length) {
+        blocks.add(local_block(
+            output,
+            source.blocks[index],
+            executor_local,
+            current_executor,
+            plans
+        ));
+        index = index + 1;
+    }
+    return jil.Body (
+        id: jil.BodyId.from_index(function_id.to_index()),
+        span: source.span,
+        locals: source.locals,
+        blocks: output.block_array(blocks$.ref()),
+        entry: source.entry,
+        return_local: source.return_local
+    );
+}
+
+jil.LocalId? executor_scope_local(jil.Body body) {
+    // confined resume 只能由已经进入同一 serial executor 的调用者直连进入。
+    // 删除成对的 enter/leave 后，整条父子链借用最外层标准 resume 的 context。
+    Int block_index! = 0;
+    while (block_index < body.blocks.length) {
+        jil.LocalId? local_id = executor_scope_local_in_block(
+            body.blocks[block_index]
+        );
+        if (local_id != null) { return local_id; }
+        block_index = block_index + 1;
+    }
+    return null;
+}
+
+jil.LocalId? executor_scope_local_in_block(jil.Block block) {
+    Int index! = 0;
+    while (index < block.statements.length) {
+        jil.Statement statement = block.statements[index];
+        if (statement.kind is .assign_stmt(assign)) {
+            if (assign.value is .executor_enter_value(enter)) { return enter.executor; }
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+@life(return: output & source & current_executor & plans)
+jil.Block local_block(
+    jil.Store& output,
+    jil.Block source,
+    jil.LocalId? executor_local,
+    jil.Place? current_executor,
+    plan.Store& plans
+) {
+    jil.Terminator terminator = local_terminator(output, source.terminator, plans);
+    list.ArrayList<jil.Statement> statements! =
+        list.ArrayList<jil.Statement>(source.statements.length);
+    Int index! = 0;
+    while (index < source.statements.length) {
+        jil.Statement statement = source.statements[index];
+        if (!statement_is_executor_scope(statement, executor_local)) {
+            statements.add(local_statement(
+                output,
+                statement,
+                current_executor,
+                plans
+            ));
+        }
+        index = index + 1;
+    }
+    return jil.Block (
+        id: source.id,
+        span: source.span,
+        statements: output.statement_array(statements$.ref()),
+        terminator: terminator
+    );
+}
+
+Bool statement_is_executor_scope(
+    jil.Statement statement,
+    jil.LocalId? executor_local
+) {
+    if (statement.kind is .executor_leave_stmt(_)) { return true; }
+    guard statement.kind is .assign_stmt(assign) else { return false; }
+    if (assign.value is .executor_enter_value(_)) { return true; }
+    guard executor_local is .some(local_id) else { return false; }
+    guard jil.place_local_id(assign.destination) is .some(destination) else { return false; }
+    return destination == local_id;
+}
+
+@life(return: output & source & current_executor & plans)
+jil.Statement local_statement(
+    jil.Store& output,
+    jil.Statement source,
+    jil.Place? current_executor,
+    plan.Store& plans
+) {
+    return jil.Statement (
+        span: source.span,
+        kind: local_statement_kind(
+            output,
+            source.kind,
+            current_executor,
+            plans
+        )
+    );
+}
+
+@life(return: output & kind & current_executor & plans)
+jil.StatementKind local_statement_kind(
+    jil.Store& output,
+    jil.StatementKind kind,
+    jil.Place? current_executor,
+    plan.Store& plans
+) {
+    if (kind is .assign_stmt(assign)) {
+        return jil.assign_statement_kind(jil.AssignStatement (
+            destination: assign.destination,
+            value: local_rvalue(
+                output,
+                assign.value,
+                current_executor,
+                plans
+            )
+        ));
+    }
+    if (kind is .atomic_store_stmt(store)) {
+        if (store.mode != .coroutine_atomic) { return kind; }
+        return jil.atomic_store_statement_kind(jil.AtomicStoreStatement (
+            destination: store.destination,
+            value: store.value,
+            ordering: store.ordering,
+            mode: .coroutine_local
+        ));
+    }
+    if (kind is .task_suspend_stmt(suspend)) {
+        return jil.task_suspend_statement_kind(jil.TaskSuspendStatement (
+            task: suspend.task,
+            mode: .local
+        ));
+    }
+    if (kind is .task_complete_stmt(complete)) {
+        return jil.task_complete_statement_kind(jil.TaskCompleteStatement (
+            task: complete.task,
+            mode: .local,
+            owner_lifecycle: complete.owner_lifecycle
+        ));
+    }
+    if (kind is .task_region_start_stmt(start)) {
+        return jil.task_region_start_statement_kind(jil.TaskRegionStartStatement (
+            task: start.task,
+            task_local: start.task_local,
+            storage: start.storage,
+            child_resume: local_optional_function_ref(
+                output, start.child_resume, plans
+            )
+        ));
+    }
+    return kind;
+}
+
+@life(return: output & value & current_executor & plans)
+jil.Rvalue local_rvalue(
+    jil.Store& output,
+    jil.Rvalue value,
+    jil.Place? current_executor,
+    plan.Store& plans
+) {
+    if (value is .use_value(use_value)) {
+        return jil.use_rvalue(jil.UseRvalue (
+            value: local_operand(output, use_value.value, plans)
+        ));
+    }
+    if (value is .domain_executor_value(_)) {
+        if (current_executor is .some(executor)) {
+            return jil.use_rvalue(jil.UseRvalue (
+                value: jil.copy_operand_value(jil.CopyOperand (place: executor))
+            ));
+        }
+        return value;
+    }
+    if (value is .atomic_load_value(load)) {
+        if (load.mode != .coroutine_atomic) { return value; }
+        return jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+            place: load.place,
+            ordering: load.ordering,
+            mode: .coroutine_local
+        ));
+    }
+    if (value is .atomic_exchange_value(exchange)) {
+        if (exchange.mode != .coroutine_atomic) { return value; }
+        return jil.atomic_exchange_rvalue(jil.AtomicExchangeRvalue (
+            place: exchange.place,
+            desired: exchange.desired,
+            ordering: exchange.ordering,
+            mode: .coroutine_local
+        ));
+    }
+    if (value is .atomic_compare_exchange_value(exchange)) {
+        if (exchange.mode != .coroutine_atomic) { return value; }
+        return jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+            place: exchange.place,
+            expected: exchange.expected,
+            desired: exchange.desired,
+            success_ordering: exchange.success_ordering,
+            failure_ordering: exchange.failure_ordering,
+            mode: .coroutine_local
+        ));
+    }
+    return value;
+}
+
+@life(return: output & source & plans)
+jil.Terminator local_terminator(
+    jil.Store& output,
+    jil.Terminator source,
+    plan.Store& plans
+) {
+    guard source.kind is .call_term(call) else { return source; }
+    Bool local_edge = !async_start_is_detached(call.async_start);
+    LocalCallee callee = local_callee(output, call.callee, local_edge, plans);
+    jil.FunctionRef? suspend_child! = call.suspend_child;
+    if (local_edge) {
+        suspend_child = local_optional_function_ref(
+            output, call.suspend_child, plans
+        );
+    }
+    return jil.Terminator (
+        span: source.span,
+        kind: jil.call_terminator_kind(jil.CallTerminator (
+            callee: callee.value,
+            args: local_operands(output, call.args, plans),
+            current_effects: call.current_effects,
+            is_suspend_point: call.is_suspend_point,
+            suspend_wake: call.suspend_wake,
+            suspend_child: suspend_child,
+            task_handoff: call.task_handoff && !callee.confined_direct,
+            async_start: call.async_start,
+            destination: call.destination,
+            target: call.target,
+            initialized_place: call.initialized_place,
+            exclusive_places: call.exclusive_places,
+            cleanup: call.cleanup
+        ))
+    );
+}
+
+Bool async_start_is_detached(jil.AsyncStartKind? value) {
+    if (value is .some(kind)) { return kind == .detached; }
+    return false;
+}
+
+@life(return: output & source & plans)
+LocalCallee local_callee(
+    jil.Store& output,
+    jil.CallCallee source,
+    Bool local_edge,
+    plan.Store& plans
+) {
+    if (!local_edge) {
+        return LocalCallee (value: source, confined_direct: false);
+    }
+    if (source is .direct_function(function_ref)) {
+        jil.FunctionRef localized = local_function_ref(output, function_ref, plans);
+        return LocalCallee (
+            value: jil.direct_function_callee(localized),
+            confined_direct: !function_ref_equal(function_ref, localized)
+        );
+    }
+    if (source is .indirect_operand(operand)) {
+        return LocalCallee (
+            value: jil.indirect_operand_callee(local_operand(
+                output, operand, plans
+            )),
+            confined_direct: false
+        );
+    }
+    if (source is .domain_enqueue(enqueue)) {
+        jil.Operand resume = local_operand(output, enqueue.resume, plans);
+        if (localized_domain_resume(enqueue.resume, resume) is .some(local_ref)) {
+            return LocalCallee (
+                value: jil.direct_function_callee(local_ref),
+                confined_direct: true
+            );
+        }
+        return LocalCallee (
+            value: .domain_enqueue(jil.DomainEnqueueCallee (
+                domain_def: enqueue.domain_def,
+                domain_kind: enqueue.domain_kind,
+                task: local_optional_operand(
+                    output, enqueue.task, plans
+                ),
+                resume: resume,
+                handoff: enqueue.handoff
+            )),
+            confined_direct: false
+        );
+    }
+    if (source is .dynamic_domain_enqueue(enqueue)) {
+        // 外部线程只唤醒并发 root；confined 子树的 request/handoff 都发生在
+        // root executor 内，因此保留状态机语义但改用普通 load/store。
+        return LocalCallee (
+            value: .dynamic_domain_enqueue(jil.DynamicDomainEnqueueCallee (
+                executor: local_operand(output, enqueue.executor, plans),
+                task: local_optional_operand(output, enqueue.task, plans),
+                resume: local_operand(output, enqueue.resume, plans),
+                handoff: enqueue.handoff,
+                mode: .local
+            )),
+            confined_direct: false
+        );
+    }
+    return LocalCallee (value: source, confined_direct: false);
+}
+
+@life(return: localized)
+jil.FunctionRef? localized_domain_resume(
+    jil.Operand source,
+    jil.Operand localized
+) {
+    guard source is .function_operand(source_ref) else { return null; }
+    guard localized is .function_operand(local_ref) else { return null; }
+    if (function_ref_equal(source_ref, local_ref)) { return null; }
+    return local_ref;
+}
+
+@life(return: (output, output))
+jil.Operand[]& local_operands(
+    jil.Store& output,
+    jil.Operand[]& source,
+    plan.Store& plans
+) {
+    list.ArrayList<jil.Operand> values! = list.ArrayList<jil.Operand>(source.length);
+    Int index! = 0;
+    while (index < source.length) {
+        values.add(local_operand(output, source[index], plans));
+        index = index + 1;
+    }
+    return output.operand_array(values$.ref());
+}
+
+@life(return: output & source)
+jil.Operand? local_optional_operand(
+    jil.Store& output,
+    jil.Operand? source,
+    plan.Store& plans
+) {
+    if (source is .some(value)) {
+        return local_operand(output, value, plans);
+    }
+    return null;
+}
+
+@life(return: output & source)
+jil.Operand local_operand(
+    jil.Store& output,
+    jil.Operand source,
+    plan.Store& plans
+) {
+    guard source is .function_operand(function_ref) else { return source; }
+    return jil.function_operand_value(local_function_ref(output, function_ref, plans));
+}
+
+@life(return: output & source)
+jil.FunctionRef? local_optional_function_ref(
+    jil.Store& output,
+    jil.FunctionRef? source,
+    plan.Store& plans
+) {
+    if (source is .some(value)) {
+        return local_function_ref(output, value, plans);
+    }
+    return null;
+}
+
+@life(return: output & source)
+jil.FunctionRef local_function_ref(
+    jil.Store& output,
+    jil.FunctionRef source,
+    plan.Store& plans
+) {
+    jil.FunctionKey key = jil.FunctionKey(
+        source.function_def, source.type_args, source.const_args
+    );
+    if (source.coroutine_resume) {
+        if (plans.get(key).confined_resume is .some(variant_def)) {
+            return variant_function_ref(output, source, variant_def);
+        }
+    }
+    return source;
+}

@@ -62,7 +62,7 @@
 | monomorphization | `generic`, `package` | partial | 跨 package public generic body run 用例已覆盖，更多 nested instance 待补 |
 | package public surface | `package`, `import` | covered | public alias chain 已覆盖 |
 | layout-sensitive aggregate | `aggregate`, `nominal` | partial | emit/run 覆盖更多 tuple/array/union 嵌套 |
-| MIR control flow | `control_flow`, `error_handling` | partial | loop cleanup、nested try/catch run 用例 |
+| JIL control flow | `control_flow`, `error_handling` | partial | loop cleanup、nested try/catch run 用例 |
 | backend runtime entry | `runtime` | covered | argv/env deferred |
 | sentinel const | `generic`, `runtime`, `literal` | covered | `Bool` / `Char` / enum / struct sentinel 和非 Copyable 反例已覆盖 |
 | sentinel string | `runtime`, `literal` | covered | `UInt8[:0]` / `UInt8*` 基础转换已覆盖 |

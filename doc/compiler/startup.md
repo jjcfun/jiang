@@ -35,7 +35,7 @@ Jiang 源码中的 root module `main` 会被 backend lowering 为 `__jiang_main`
 - `__jiang_startup_state`：启动状态 global。
 
 `main` 和 `__jiang_startup_state` 都由源码普通声明定义，通过 `@link_symbol` 绑定链接层符号。
-编译器不再在 LLVM lowering 中合成 startup state global。`__jiang_main` 仍由 MIR lowering 生成，
+编译器不再在 LLVM lowering 中合成 startup state global。`__jiang_main` 仍由 JIL lowering 生成，
 只负责把用户 root `main` 的返回值适配成进程 exit code。
 
 `StartupState` 只保存启动瞬间由平台入口交给语言运行时的初始事实。当前只包含

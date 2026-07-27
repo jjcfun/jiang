@@ -409,21 +409,21 @@ Parser 只记录 closure expr 的语法事实。capture 分析应在 resolve/typ
 
 1. AST：新增 `lambda_expr`，包含 params、body、是否 block body。
 2. Resolve：lambda body 进入子 scope；外层 local 引用标记为 capture candidate。
-3. HIR：为 lambda 分配内部 function def，在 `HirLambda` 上记录 params、captures 和 call body。
+3. Semantic Model：为 lambda 分配内部 function def，在 `sem.Lambda` 上记录 params、captures 和 call body。
 4. Type check：从 expected type 检查参数和返回，并推导 capture kind、call ability。
 5. Borrow check：检查 capture lifetime、mutable-borrow conflict、move 后使用。
-6. MIR：`Fn` 构造 stack anonymous closure object，并生成 callable vtable。
-7. MIR：`Fn^` 构造 heap anonymous closure object，并复用 callable vtable call/drop 路径。
+6. JIL：`Fn` 构造 stack anonymous closure object，并生成 callable vtable。
+7. JIL：`Fn^` 构造 heap anonymous closure object，并复用 callable vtable call/drop 路径。
 8. Drop elaborate：通过 `vtable.drop(receiver)` 销毁 closure object。
 
 当 expected type 是 `RawFn<...>` 时，不构造 environment；如果 capture analysis 发现任何捕获，
 直接报错。
 
-HIR 不把 closure env 伪装成源码 struct，也不新增 AST 节点。`HirLambda` 平铺保存显式
+Semantic Model 不把 closure env 伪装成源码 struct，也不新增 AST 节点。`sem.Lambda` 平铺保存显式
 callable-local binding metadata；params 和显式 captures 属于同一个局部 binding namespace：
 
 ```text
-HirLambda {
+sem.Lambda {
   params:   [x, y]
   captures: [base, name]
 }
@@ -431,15 +431,15 @@ HirLambda {
 
 params 和显式 captures 不能同名；显式 capture alias 也占用这个 namespace。resolve 结束后，
 全局/成员 namespace 仍保存在 `NamespaceStore`，但 lambda 内的参数、显式 capture local 和普通
-local 都已经落成具体 `DefId` / `HirLocalId`，后续阶段不再通过字符串名字查找它们。
+local 都已经落成具体 `DefId` / `sem.LocalId`，后续阶段不再通过字符串名字查找它们。
 
-`HirLambdaParam` 和 `HirLambdaCapture` 本身不直接保存 type。type check 从 expected callable type
+`sem.LambdaParam` 和 `sem.LambdaCapture` 本身不直接保存 type。type check 从 expected callable type
 绑定参数类型，从 capture initializer 或显式 type ref 绑定 capture alias 类型，统一写入对应
-`HirLocal.def_id` 的 `def_type`：
+`sem.Local.def_id` 的 `def_type`：
 
 ```text
-lambda.params[i].local_id   -> HirLocal.def_id -> TypeCheckStore.def_type
-lambda.captures[i].local_id -> HirLocal.def_id -> TypeCheckStore.def_type
+lambda.params[i].local_id   -> sem.Local.def_id -> TypeCheckStore.def_type
+lambda.captures[i].local_id -> sem.Local.def_id -> TypeCheckStore.def_type
 ```
 
 type check 还会把显式 capture 和隐式 capture 合并记录到 `TypeCheckStore.lambda_captures`。
@@ -456,7 +456,7 @@ lambda.function_def -> [
 隐式 capture 由 lambda body 中指向外层 local/parameter 的 `def_ref` 推导，按首次出现顺序去重。
 显式 capture 的 `source_def` 只描述 initializer 来源，不参与 body 中外层 `def_ref` 到 env field 的匹配；
 只有隐式 capture 用 `source_def` 匹配外层名字。
-当前 HIR 不把这些 `def_ref` 重写成新的 capture local；type check、MIR lowering 和 borrow check
+当前 Semantic Model 不把这些 `def_ref` 重写成新的 capture local；type check、JIL lowering 和 borrow check
 通过 `lambda_captures` side table 把它们映射到 env field。
 
 ## Environment 表示评估
@@ -471,15 +471,15 @@ lambda.function_def -> [
 - `deref_on_use` 描述隐式引用捕获在 body 中是否自动解引用。
 - capture 的 `T&!` 字段类型记录显式可变借用需求。
 
-MIR lowering 从 `LambdaCaptureInfo` 生成 sourceless 的私有 struct def 和 field def。stack `Fn`
+JIL lowering 从 `LambdaCaptureInfo` 生成 sourceless 的私有 struct def 和 field def。stack `Fn`
 创建临时 env struct，heap `Fn^` 分配同形状 env struct，并把指针擦成 `Void*` 存入 closure
 object。field 名字尽量沿用 capture 名字，没有稳定源码名字时使用 `_0`、`_1` 这类匿名字段名。
 
 这个 synthetic env struct 只服务 layout、projection、drop 和诊断展示，不进入 resolver namespace，
-也不是用户可写或可引用的 HIR struct。borrow check、drop elaborate 和 backend 不从 struct 名字
+也不是用户可写或可引用的 Semantic Model struct。borrow check、drop elaborate 和 backend 不从 struct 名字
 反推 capture 语义，只消费 `LambdaCaptureInfo`、field index 和普通类型/drop 规则。后续 debug info、
 artifact 或 async frame 如果需要更强的 env 身份，应继续从现有 `LambdaCaptureInfo` 生成，而不是把
-源码 HIR 改写成用户可见 struct。
+源码 Semantic Model 改写成用户可见 struct。
 
 ## 与 async / 数据竞争的关系
 
@@ -512,7 +512,7 @@ environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 
 - [x] `Fn<...>` call slot 使用 receiver-first 调用约定。
 - [x] `Fn(raw)` 通过 trampoline 适配 receiver-first 调用约定。
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
-- [x] HIR 使用 `HirLambda` 平铺记录 params 和显式 captures。
+- [x] Semantic Model 使用 `sem.Lambda` 平铺记录 params 和显式 captures。
 - [x] lambda params 和显式 capture alias 同名时报错。
 - [x] 显式 capture alias 通过 initializer/type ref 绑定 `def_type`。
 - [x] type check side table 记录显式和隐式 capture metadata。

@@ -15,7 +15,7 @@ test/lang/<feature>/
 ```
 
 `feature` 按语言功能命名，使用 snake_case。不要按编译阶段建目录；语言测试关注用户可见语义，
-不是关注 parser/type_check/MIR 的内部实现。
+不是关注 parser/type_check/JIL 的内部实现。
 
 ## 覆盖原则
 
@@ -25,7 +25,7 @@ test/lang/<feature>/
 - 反例：语法错误、类型错误、名字解析错误、可见性/作用域错误。
 - 边界：空列表、单元素、多元素、尾逗号、省略写法、嵌套写法。
 - 交互：与泛型、trait、method、module、ownership、lifetime、default/named args 的组合。
-- 后端：会影响 layout/MIR/backend 的功能必须至少有一个 `run/` 或 `emit/` 用例。
+- 后端：会影响 layout/JIL/backend 的功能必须至少有一个 `run/` 或 `emit/` 用例。
 - 诊断：每个新增错误分支至少有一个 `fail/` 用例，并写 `// expected: code`。
 
 覆盖目标不是“每个文件很多断言”，而是“每个语法/语义分支至少有一个稳定用例”。一个用例可以覆盖
@@ -54,7 +54,7 @@ test/lang/<feature>/
 
 1. 先按 `doc/grammar.md` 的语法规则补 parser/type check 可见的 check/fail 用例。
 2. 再按 `doc/language-design.md` 的语义章节补类型、所有权、lifetime、泛型和模块用例。
-3. 最后给所有会影响 MIR/layout/backend 的功能补 `run/` 或 `emit/` 用例。
+3. 最后给所有会影响 JIL/layout/backend 的功能补 `run/` 或 `emit/` 用例。
 
 `script/lang_check.sh` 默认的 `run/` 会用 `jiangc --emit-llvm` 生成 LLVM IR，再用 LLVM clang
 链接运行。需要覆盖 release object/executable 路径时，设置：

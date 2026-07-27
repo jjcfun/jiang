@@ -1,29 +1,29 @@
 # Layout 设计
 
-layout 是按需查询或批量物化的 concrete type layout 层。它的数据来源不是 MIR body。
-layout 消费 HIR、`TypeCheckStore`、monomorph `MonomorphStore` 和 `TargetLayout`，
-输出 `LayoutStore`。MIR lowering 可以触发 layout 查询，但不能自己计算 layout。
+layout 是按需查询或批量物化的 concrete type layout 层。它的数据来源不是 JIL body。
+layout 消费 Semantic Model、`TypeCheckStore`、monomorph `MonomorphStore` 和 `TargetLayout`，
+输出 `LayoutStore`。JIL lowering 可以触发 layout 查询，但不能自己计算 layout。
 
 ## 边界
 
 - layout 不回读 AST，不重新 resolve，不重新 type check。
-- layout 不修改 HIR、`TypeCheckStore`、`TypeStore`、`MonomorphStore` 或 MIR。
-- layout 不遍历 MIR 来决定类型布局。
+- layout 不修改 Semantic Model、`TypeCheckStore`、`TypeStore`、`MonomorphStore` 或 JIL。
+- layout 不遍历 JIL 来决定类型布局。
 - layout key 表达 concrete type 语义身份，nominal generic type 必须带 type args。
 - layout 负责 size、align、stride 和 field offset。
 - C ABI 参数/返回值分类由 backend ABI classifier 消费 layout facts 后完成。
-- field offset 只存在于 `LayoutStore`，不写回 MIR。
+- field offset 只存在于 `LayoutStore`，不写回 JIL。
 - target 变化必须使 layout 查询失效。
 
 ## 顺序
 
 ```text
-HIR + TypeCheckStore + MonomorphStore + TargetLayout
+Semantic Model + TypeCheckStore + MonomorphStore + TargetLayout
   -> layout query
   -> LayoutStore
 ```
 
-MIR lowering、borrow check、drop elaboration 和 backend 都可以按需触发 layout 查询。
+JIL lowering、borrow check、drop elaboration 和 backend 都可以按需触发 layout 查询。
 layout 不要求在任何阶段之前批量完成。
 
 ## Store
@@ -90,7 +90,7 @@ layout 需要独立 active stack：
 
 ## 不变量
 
-- MIR lowering 不自己计算 layout；布局事实统一来自 `LayoutStore`。
+- JIL lowering 不自己计算 layout；布局事实统一来自 `LayoutStore`。
 - layout 不改变类型检查结果。
 - backend 不能绕过 `LayoutStore` 自己推导 field offset。
 - backend ABI classifier 可以读取 `LayoutStore` 的 size/align，但不写 layout facts。

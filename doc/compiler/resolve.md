@@ -2,14 +2,14 @@
 
 resolve 是 package root 入口之后的名字解析阶段。它负责 module graph、import 解析、
 namespace 建立、declaration collection 和 reference resolution。当前 resolve 直接把
-resolved AST lower 成 HIR，不再产生 `ResolvedFile` 这种中间文件结果。
+resolved AST lower 成 Semantic Model，不再产生 `ResolvedFile` 这种中间文件结果。
 
 ## 入口
 
 `resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 先创建本次 package 编译的
 临时 `syntax.Store`，root/import closure 的 AST 都放在这张表里。外部创建
 `ModuleResolver(ctx, asts)`，先构建 root import closure 的 `ModuleGraph`，再把 graph
-内可达 module 直接 lower 到 HIR：
+内可达 module 直接 lower 到 Semantic Model：
 
 ```jiang
 syntax_store.Store asts! = syntax_store.Store()
@@ -17,7 +17,7 @@ SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
 asts.set_unit(root.unit, source_revision)
 ModuleResolver resolver! = ModuleResolver(ctx, asts$.ref())
 ModuleGraph^ graph = resolver.build_module_graph(root_unit)
-resolver.lower_module_graph_to_hir(graph$.ref())
+resolver.lower_module_graph_to_model(graph$.ref())
 ```
 
 `pipeline.compile(ctx, options)` 是当前 source/syntax/resolve 的路径入口：
@@ -41,7 +41,7 @@ build_module_graph(root_unit)
 ```
 
 `ModuleGraph.package_id` 只记录入口 root package。`ModuleGraph.modules` 可以包含多个
-package 的 module；后续 HIR/type check/monomorph/MIR/layout/borrow/backend 都消费同一张
+package 的 module；后续 Semantic Model/type check/monomorph/JIL/layout/borrow/backend 都消费同一张
 root import closure。
 
 `ensure_module(source_id)` 保证一个 source 有稳定的 `ModuleId`：
@@ -89,8 +89,8 @@ NameResolver {
 - `resolve_references`：遍历当前 file 的 declaration body，校验基础 type reference、
   expression name、local binding 和 import alias path。
 
-reference resolution 完成后，HIR lowering 使用同一套 namespace/local lookup 直接写入
-resolved HIR。
+reference resolution 完成后，Semantic Model lowering 使用同一套 namespace/local lookup 直接写入
+resolved Semantic Model。
 
 ## Import Target
 
@@ -127,18 +127,18 @@ module import cycle 允许。package dependency cycle 不允许：ModuleGraph �
 - 非 root module 中的 public declaration 不会自动成为 package API。
 - private declaration、private alias 和非 root public declaration 跨 package lookup 都会诊断。
 
-## HIR Lowering
+## Semantic Model Lowering
 
-resolve 的最终输出是 HIR facts：
+resolve 的最终输出是 Semantic Model facts：
 
 ```text
-lower_module_graph_to_hir(graph)
+lower_module_graph_to_model(graph)
   -> collect declarations for all graph modules
   -> NameResolver.resolve_references()
-  -> lower resolved AST nodes directly into CompilerStore.hirs
+  -> lower resolved AST nodes directly into CompilerStore.model
 ```
 
-resolve 不输出 `ResolvedFile`，也不把 AST 持久化到 query。HIR lowering 只在 resolve 阶段
+resolve 不输出 `ResolvedFile`，也不把 AST 持久化到 query。Semantic Model lowering 只在 resolve 阶段
 使用 AST 和 resolve state。
 
 ## 待完成
