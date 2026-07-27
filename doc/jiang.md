@@ -599,7 +599,7 @@ struct Pair {
     Int& second;
 }
 
-@region(a, b, b: a)
+@region(a, b: a)
 struct Wrapper {
     @life(a, b)
     Pair direct;
@@ -609,10 +609,11 @@ struct Wrapper {
 }
 ```
 
-`b: a` 表示 `a` outlives `b`。只有裸名称声明 region，约束不能隐式声明名称；同一 constraint
-target 最多出现一次。coverage 允许成环，`a: b, b: a` 表示两个 region 互相覆盖。每个 region
-都必须由字段或 union payload 的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；
-named 模式不能与位置模式混用，也不能使用 `self` source。
+`b: a` 在声明 `b` 的同时表示 `a` outlives `b`。每个 target 在 `@region` 中只出现一次；
+source 也必须由同一 annotation 声明，但可以写在 target 之前或之后。coverage 允许成环，
+`@region(a: b, b: a)` 表示两个 region 互相覆盖。每个 region 都必须由字段或 union payload
+的实际 slot 直接使用。字段 binding 的 target 必须唯一且完整；named 模式不能与位置模式
+混用，也不能使用 `self` source。
 
 高阶函数可以用 `Fn` / `RawFn` 的契约名描述 callback 的返回来源：
 

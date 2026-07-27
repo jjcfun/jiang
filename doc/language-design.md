@@ -493,13 +493,13 @@ product shape。
 - public region 名：nominal 类型公开 shape 中的具名位置。
 
 struct / union 只有显式 `@region` 才公开 lifetime shape。裸名称按源码顺序声明 public
-region，`target: source` 表示右侧覆盖左侧；约束两端必须先由同一 annotation 的裸名称声明，
-同一 constraint target 最多出现一次。coverage 可以成环，例如 `a: b, b: a` 表示两个 region
-互相覆盖。每个 public region 必须由字段或 union payload 的实际 lifetime slot 直接使用，
-不支持 phantom region：
+region，`target: source` 在声明 target 的同时表示 source 覆盖 target。每个 target 在
+annotation 中只出现一次，source 必须由同一 annotation 的其他 item 声明，但可以位于 target
+之前或之后。coverage 可以成环，例如 `a: b, b: a` 表示两个 region 互相覆盖。每个 public
+region 必须由字段或 union payload 的实际 lifetime slot 直接使用，不支持 phantom region：
 
 ```jiang
-@region(a, b, b: a)
+@region(a, b: a)
 struct Pair {
     @life(a)
     Int& first;

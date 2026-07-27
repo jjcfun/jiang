@@ -129,8 +129,9 @@ Jiang 统一把 `@where(...)`、`@region(...)`、`@life(...)`、`@intrinsic(...)
 `@intrinsic(type, T)` 是编译器内部声明 `$` 内禀操作的 attribute block，
 只允许编译器内部源码和标准库内部源码使用；普通用户源码写 `@intrinsic` 会报错。
 `@life()` 是合法的空 attribute，表示显式空返回 lifetime 契约，不等同于省略 `@life`。
-struct / union 的 `@region(a, b, b: a)` 由裸名称声明 public region，并用
-`target: source` 表示 outlives 约束。单-slot 字段 binding 写作 `@life(a)`，多-slot
+struct / union 的 `@region(a, b: a)` 中，每个 item 声明一个 public region；
+`target: source` 同时声明 target 并表示 outlives 约束，每个 target 只能出现一次。单-slot
+字段 binding 写作 `@life(a)`，多-slot
 字段 binding 可以按位置写作 `@life(a, b)`，或按 type occurrence 的具名位置写作
 `@life(left: a, right: b)`；两种模式不能混用，target 必须唯一且完整。callable
 contract 同样使用 `target: source`，但只允许具名 target，不支持 `[0]` 位置路径。
