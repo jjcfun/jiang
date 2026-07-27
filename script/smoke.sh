@@ -71,4 +71,18 @@ else
   status=1
 fi
 
+printf '\n== source artifact core identity across package roots ==\n'
+rm -rf "$ROOT_DIR/build/cache"
+package_app=test/lang/package/check/async_domain_interface_app/main.jiang
+package_lib=test/lang/package/check/async_domain_interface_lib/lib.jiang
+if "$JIANGC" --check "$package_app" \
+  && "$JIANGC" --check "$package_lib"
+then
+  echo "OK"
+else
+  code=$?
+  echo "FAIL:$code"
+  status=1
+fi
+
 exit "$status"
