@@ -133,9 +133,9 @@ if [ "$VERIFY" != "none" ]; then
 fi
 
 if [ "$VERIFY" = "full" ]; then
-  printf '\n== next verify: lang check with %s ==\n' "$VERIFY_BIN"
+  printf '\n== next verify: language tests with %s ==\n' "$VERIFY_BIN"
   JIANGC="$VERIFY_BIN" \
-  bash "$ROOT_DIR/script/lang_check.sh"
+  bash "$ROOT_DIR/script/test.sh"
 fi
 
 chmod +x "$VERIFY_BIN"

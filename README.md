@@ -128,22 +128,30 @@ syscall/runtime 路线；Linux no-libc 静态 executable 仍是后续阶段目�
 基础测试：
 
 ```bash
+JIANGC=./build/bin/jiangc bash ./script/test.sh
+TEST_ROOT=test/compiler JIANGC=./build/bin/jiangc bash ./script/test.sh
 JIANGC=./build/bin/jiangc bash ./script/smoke.sh
 JIANGC=./build/bin/jiangc bash ./script/backend_cli_smoke.sh
-JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 ```
 
-`script/smoke.sh` 默认跳过较慢的 lang provider dylib smoke。需要覆盖该路径时，显式打开：
+`script/test.sh` 统一发现 `check/`、`fail/`、`emit/` 和 `run/` 用例。默认运行
+`test/lang`，通过 `TEST_ROOT` 可选择编译器内部测试。每个用例的中间产物和日志隔离在
+`build/test` 下，为后续并行执行保留边界；`TEST_FILTER` 可用正则选择任意类别的用例，
+`TEST_LIST` 可指定按仓库相对路径逐行列出的用例清单。
+`script/lang_check.sh` 暂时作为兼容入口。
+
+`script/smoke.sh` 使用显式用例清单运行日常快速测试，不定义另一套测试语义。它默认
+跳过较慢的 lang provider dylib 用例；需要覆盖该路径时，显式打开：
 
 ```bash
 JIANG_SLOW_SMOKE=1 JIANGC=./build/bin/jiangc bash ./script/smoke.sh
 ```
 
-`lang_check.sh` 默认的 `run/` 用例仍走 `--emit-llvm` 后用 LLVM clang 链接。需要验证
+`test.sh` 默认的 `run/` 用例仍走 `--emit-llvm` 后用 LLVM clang 链接。需要验证
 release object/executable 路径和 LLVM O2 pass pipeline 时，打开 release run：
 
 ```bash
-LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
+TEST_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/test.sh
 ```
 
 macOS arm64 release 包：
