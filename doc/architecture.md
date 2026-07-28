@@ -326,8 +326,8 @@ src/
     llvm.jiang  LLVM backend 入口
     llvm/       LLVM IR/object emission
   incremental/  cache key、fingerprint、依赖图、symbol store
+  id.jiang      跨阶段共享的 session-local handle
   store.jiang   CompilerStore 入口
-  store/        compiler store 和 session-local id
   system/       host/target OS、filesystem、process、dynamic library、target info
   support/      arena、list、hash、unicode 等通用工具
 ```
