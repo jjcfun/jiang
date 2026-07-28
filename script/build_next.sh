@@ -14,7 +14,6 @@ BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.9}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
-BOOTSTRAP_ARTIFACT_CACHE_DIR="${BOOTSTRAP_ARTIFACT_CACHE_DIR:-$BUILD_DIR/cache/bootstrap-$BOOTSTRAP_RELEASE_VERSION}"
 NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/cache/next}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
@@ -22,7 +21,6 @@ source "$ROOT_DIR/script/llvm_env.sh"
 mkdir -p \
   "$BUILD_DIR" \
   "$BUILD_BIN_DIR" \
-  "$BOOTSTRAP_ARTIFACT_CACHE_DIR" \
   "$NEXT_ARTIFACT_CACHE_DIR"
 cp "$ROOT_DIR/package.ini" "$BUILD_DIR/package.ini"
 cd "$ROOT_DIR"
@@ -97,11 +95,16 @@ write_compiler_build_id() {
   printf '%s\n' "$build_id" >"$compiler_bin.build-id"
 }
 
+clear_bootstrap_artifact_cache() {
+  # 0.4.9 不支持显式 artifact cache 路径，只能使用默认 build/cache。
+  # stable 编译前后清理该目录，避免不同 schema 的 source artifact 相互污染。
+  rm -rf "$ROOT_DIR/build/cache"
+}
+
 emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
   "$BOOTSTRAP_BIN" \
-    --artifact-cache-dir "$BOOTSTRAP_ARTIFACT_CACHE_DIR" \
     --target "$JIANG_HOST_TARGET" \
     --linker "$CLANG_BIN" \
     "${LLVM_LINK_ARGS[@]}" \
@@ -132,7 +135,10 @@ emit_compiler_with_compiler() {
 collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
+clear_bootstrap_artifact_cache
 emit_next_from_bootstrap "$NEXT_BIN"
+clear_bootstrap_artifact_cache
+mkdir -p "$NEXT_ARTIFACT_CACHE_DIR"
 
 VERIFY_BIN="$NEXT_BIN"
 if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then
