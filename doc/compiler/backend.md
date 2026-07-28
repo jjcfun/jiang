@@ -141,6 +141,17 @@ linked object 数量。统计不进入 cache key。
 `backend/llvm/abi.jiang` 只负责把这个 plan 翻译成 LLVM function type 和 `byval`/`sret`
 attribute。LLVM declaration 和 call site 必须使用同一个 plan。
 
+final JIL 的参数级 analysis 还会给出彼此独立的已证明事实。backend 只做机械翻译：
+
+- 不捕获参数在 LLVM 22 中写成 `captures(none)`，对应概念上的 `nocapture`。
+- `noalias` 只来自 Jiang 唯一引用语义，不从“没有逃逸”推断。
+- `readonly` 必须同时没有 through-reference write 和未知效果调用。
+- `dereferenceable(N)` 只用于 safe、sized reference，`N` 来自 concrete pointee layout。
+
+fat reference（例如 trait object）在 LLVM ABI 中是 aggregate，不能直接携带 pointer-only
+parameter attribute；即使 JIL 已证明语义事实，backend 也必须先检查 LLVM 参数形态是否兼容。
+外部函数和任何未证明条件都不添加属性。
+
 ## 边界
 
 - backend 不重新 type check。

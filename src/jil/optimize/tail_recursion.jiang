@@ -1,0 +1,494 @@
+// 安全的直接尾递归消除。
+//
+// pass 只把已证明处于 tail position、实例和 ABI 完全相同、没有 cleanup/coroutine
+// 义务且参数不引用当前栈帧的 self call 改写成参数更新与入口回边。
+
+import analysis = "../analysis/provenance.jiang";
+import context = "../../context.jiang";
+import jil = "../model.jiang";
+import drop = "../../sema/drop.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+
+public enum Eligibility {
+    eligible,
+    not_direct_self,
+    not_tail_position,
+    incompatible_instance,
+    cleanup_required,
+    coroutine_obligation,
+    unsupported_parameter_drop,
+    current_stack_argument,
+    prior_stack_escape,
+}
+
+public struct Statistics: Copyable {
+    public Int considered;
+    public Int transformed;
+
+    public init(self) {
+        self.considered = 0;
+        self.transformed = 0;
+    }
+}
+
+public Statistics optimize_package(
+    context.CompilerContext& ctx,
+    jil.Store&! store,
+    analysis.Store& facts
+) {
+    Statistics statistics! = Statistics();
+    Int function_index! = 0;
+    while (function_index < store.functions.len()) {
+        jil.Function function = store.functions.get(function_index);
+        analysis.FunctionFacts& function_facts = facts.function(function.id);
+        list.ArrayList<Int> sites! = eligible_sites(
+            ctx,
+            store,
+            function,
+            function_facts,
+            statistics$.mut_ref()
+        );
+        if (sites.len() > 0) {
+            rewrite_function(store, function, sites$.ref());
+            statistics.transformed = statistics.transformed + sites.len();
+        }
+        function_index = function_index + 1;
+    }
+    return statistics;
+}
+
+list.ArrayList<Int> eligible_sites(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    jil.Function function,
+    analysis.FunctionFacts& facts,
+    Statistics&! statistics
+) {
+    list.ArrayList<Int> sites! = list.ArrayList<Int>();
+    Int block_index! = 0;
+    while (block_index < function.body.blocks.length) {
+        jil.Block block! = function.body.blocks[block_index];
+        if (block.terminator.kind is .call_term(call_term)) {
+            statistics.considered = statistics.considered + 1;
+            if (eligibility(ctx, store, function, block.id, call_term, facts)
+                == .eligible) {
+                sites.add(block_index);
+            }
+        }
+        block_index = block_index + 1;
+    }
+    return sites;
+}
+
+public Eligibility eligibility(
+    context.CompilerContext& ctx,
+    jil.Store& store,
+    jil.Function function,
+    jil.BlockId block_id,
+    jil.CallTerminator call_term,
+    analysis.FunctionFacts& facts
+) {
+    guard call_term.callee is .direct_function(function_ref) else {
+        return .not_direct_self;
+    }
+    if (!callee_is_current_function(store, function, function_ref)) {
+        return .not_direct_self;
+    }
+    if (!same_instance(function, function_ref)) {
+        return .incompatible_instance;
+    }
+    if (has_coroutine_obligation(function, function_ref, call_term)) {
+        return .coroutine_obligation;
+    }
+    if (call_term.cleanup != null || call_term.initialized_place != null) {
+        return .cleanup_required;
+    }
+    list.ArrayList<jil.LocalDecl> parameters = parameter_locals(function);
+    if (call_term.args.length != parameters.len()) {
+        return .incompatible_instance;
+    }
+    if (parameters_need_drop(ctx, parameters$.ref())) {
+        return .unsupported_parameter_drop;
+    }
+    if (!continuation_returns_value(
+        function.body,
+        call_term.target,
+        call_term.destination
+    )) {
+        return .not_tail_position;
+    }
+    analysis.Provenance arguments =
+        analysis.call_arguments_before_terminator(facts, block_id, call_term);
+    if (arguments.may_reference_current_stack()) {
+        return .current_stack_argument;
+    }
+    if (facts.current_stack_may_escape()) {
+        return .prior_stack_escape;
+    }
+    return .eligible;
+}
+
+Bool callee_is_current_function(
+    jil.Store& store,
+    jil.Function function,
+    jil.FunctionRef function_ref
+) {
+    jil.FunctionId? callee_id! = null;
+    if (function_ref.type_args.length == 0
+        && function_ref.const_args.length == 0) {
+        callee_id = store.function_id_for_def(function_ref.function_def);
+    } else {
+        callee_id = store.function_id_for_instance(
+            function_ref.function_def,
+            function_ref.type_args,
+            function_ref.const_args
+        );
+    }
+    if (callee_id is .some(id)) { return id == function.id; }
+    return false;
+}
+
+Bool same_instance(jil.Function function, jil.FunctionRef function_ref) {
+    if (function_ref.coroutine_resume || function_ref.coroutine_completion) {
+        return false;
+    }
+    jil.FunctionKey function_key = jil.FunctionKey(
+        function.def_id,
+        function.type_args,
+        function.const_args
+    );
+    jil.FunctionKey reference_key = jil.FunctionKey(
+        function_ref.function_def,
+        function_ref.type_args,
+        function_ref.const_args
+    );
+    return jil.FunctionKey.equal(function_key$.ref(), reference_key$.ref());
+}
+
+Bool has_coroutine_obligation(
+    jil.Function function,
+    jil.FunctionRef function_ref,
+    jil.CallTerminator call_term
+) {
+    if (function.is_coroutine || function.is_coroutine_resume) { return true; }
+    if (function.is_coroutine_completion) { return true; }
+    if (call_term.is_suspend_point || call_term.task_handoff) { return true; }
+    if (call_term.suspend_wake != .none) { return true; }
+    if (call_term.suspend_child != null || call_term.async_start != null) {
+        return true;
+    }
+    return function_ref.coroutine_resume || function_ref.coroutine_completion;
+}
+
+list.ArrayList<jil.LocalDecl> parameter_locals(jil.Function function) {
+    list.ArrayList<jil.LocalDecl> parameters! =
+        list.ArrayList<jil.LocalDecl>();
+    Int index! = 0;
+    while (index < function.body.locals.length) {
+        jil.LocalDecl local = function.body.locals[index];
+        if (local.kind == .param) { parameters.add(local); }
+        index = index + 1;
+    }
+    return parameters;
+}
+
+Bool parameters_need_drop(
+    context.CompilerContext& ctx,
+    list.ArrayList<jil.LocalDecl>& parameters
+) {
+    drop.DropQuery query = drop.DropQuery(ctx);
+    Int index! = 0;
+    while (index < parameters.len()) {
+        if (query.type_needs_runtime_drop(parameters.get(index).type_id)) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool continuation_returns_value(
+    jil.Body body,
+    jil.BlockId first_block,
+    jil.Place destination
+) {
+    guard plain_local(destination) is .some(value_local) else { return false; }
+    jil.BlockId block_id! = first_block;
+    jil.LocalId current_value! = value_local;
+    Int visited! = 0;
+    while (visited < body.blocks.length) {
+        jil.Block block = body.blocks[block_id.to_index()];
+        guard forwarded_value(block, current_value) is .some(forwarded) else {
+            return false;
+        }
+        current_value = forwarded;
+        if (block.terminator.kind is .return_term(_)) {
+            return current_value == body.return_local;
+        }
+        guard block.terminator.kind is .goto_term(goto_term) else {
+            return false;
+        }
+        block_id = goto_term.target;
+        visited = visited + 1;
+    }
+    return false;
+}
+
+jil.LocalId? forwarded_value(jil.Block block, jil.LocalId initial) {
+    jil.LocalId current! = initial;
+    Int index! = 0;
+    while (index < block.statements.length) {
+        jil.Statement statement = block.statements[index];
+        if (statement.kind is .storage_live_stmt(_)
+            || statement.kind is .storage_dead_stmt(_)) {
+            index = index + 1;
+            continue;
+        }
+        guard forwarding_assignment(statement, current) is .some(next) else {
+            return null;
+        }
+        current = next;
+        index = index + 1;
+    }
+    return current;
+}
+
+jil.LocalId? forwarding_assignment(
+    jil.Statement statement,
+    jil.LocalId source_local
+) {
+    guard statement.kind is .assign_stmt(assign) else { return null; }
+    guard assign.value is .use_value(use) else { return null; }
+    guard operand_plain_local(use.value) is .some(source) else { return null; }
+    if (source != source_local) { return null; }
+    return plain_local(assign.destination);
+}
+
+jil.LocalId? operand_plain_local(jil.Operand operand) {
+    if (operand is .copy_operand(copy)) { return plain_local(copy.place); }
+    if (operand is .move_operand(move)) { return plain_local(move.place); }
+    return null;
+}
+
+jil.LocalId? plain_local(jil.Place place) {
+    if (place.projection.length != 0) { return null; }
+    if (place.base is .local(local_id)) { return local_id; }
+    return null;
+}
+
+() rewrite_function(
+    jil.Store&! store,
+    jil.Function function!,
+    list.ArrayList<Int>& sites
+) {
+    list.ArrayList<jil.LocalDecl> parameters = parameter_locals(function);
+    Int first_temporary = function.body.locals.length;
+    jil.LocalDecl[]& locals = locals_with_temporaries(
+        store,
+        function,
+        parameters$.ref()
+    );
+    jil.Block[]& blocks = blocks_with_tail_loops(
+        store,
+        function,
+        sites,
+        parameters$.ref(),
+        first_temporary
+    );
+    function.body.locals = locals;
+    function.body.blocks = blocks;
+    store.functions.set(function.id.to_index(), function);
+}
+
+@life(return: store)
+jil.LocalDecl[]& locals_with_temporaries(
+    jil.Store& store,
+    jil.Function function,
+    list.ArrayList<jil.LocalDecl>& parameters
+) {
+    unsafe {
+        Int old_count = function.body.locals.length;
+        Int new_count = old_count + parameters.len();
+        jil.LocalDecl*! locals = store.alloc_local_array(new_count);
+        Int index! = 0;
+        while (index < old_count) {
+            locals[index] = function.body.locals[index];
+            index = index + 1;
+        }
+        while (index < new_count) {
+            jil.LocalDecl parameter = parameters.get(index - old_count);
+            locals[index] = tail_temporary(index, parameter, function.span);
+            index = index + 1;
+        }
+        return locals[0..new_count];
+    }
+}
+
+jil.LocalDecl tail_temporary(
+    Int index,
+    jil.LocalDecl parameter,
+    token.Span span
+) {
+    return jil.LocalDecl (
+        id: jil.LocalId.from_index(index),
+        kind: .compiler_temp,
+        type_id: parameter.type_id,
+        span: span,
+        name: null,
+        def_id: null,
+        mutable_local: true,
+        address_taken: false
+    );
+}
+
+@life(return: (store & function.d, store & function.d))
+jil.Block[]& blocks_with_tail_loops(
+    jil.Store& store,
+    jil.Function function,
+    list.ArrayList<Int>& sites,
+    list.ArrayList<jil.LocalDecl>& parameters,
+    Int first_temporary
+) {
+    list.ArrayList<jil.Block> blocks! =
+        list.ArrayList<jil.Block>(function.body.blocks.length);
+    Int block_index! = 0;
+    while (block_index < function.body.blocks.length) {
+        jil.Block block! = function.body.blocks[block_index];
+        if (contains_site(sites, block_index)) {
+            block = rewritten_tail_block(
+                store,
+                function,
+                block,
+                parameters,
+                first_temporary
+            );
+        }
+        blocks.add(block);
+        block_index = block_index + 1;
+    }
+    return store.block_array(blocks$.ref());
+}
+
+Bool contains_site(list.ArrayList<Int>& sites, Int block_index) {
+    Int index! = 0;
+    while (index < sites.len()) {
+        if (sites.get(index) == block_index) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+@life(return: store & function.d & block)
+jil.Block rewritten_tail_block(
+    jil.Store& store,
+    jil.Function function,
+    jil.Block block,
+    list.ArrayList<jil.LocalDecl>& parameters,
+    Int first_temporary
+) {
+    guard block.terminator.kind is .call_term(call_term) else { return block; }
+    list.ArrayList<jil.Statement> statements! =
+        list.ArrayList<jil.Statement>(block.statements.length + parameters.len() * 2);
+    append_existing_statements(block$.ref(), statements$.mut_ref());
+    append_argument_temporaries(
+        store,
+        first_temporary,
+        call_term,
+        block.terminator.span,
+        statements$.mut_ref()
+    );
+    append_parameter_updates(
+        store,
+        first_temporary,
+        parameters,
+        call_term,
+        block.terminator.span,
+        statements$.mut_ref()
+    );
+    jil.Block rewritten = jil.Block (
+        id: block.id,
+        span: block.span,
+        statements: store.statement_array(statements$.ref()),
+        terminator: jil.Terminator (
+            span: block.terminator.span,
+            kind: .goto_term(jil.GotoTerminator (target: function.body.entry))
+        )
+    );
+    return rewritten;
+}
+
+() append_existing_statements(
+    jil.Block& block,
+    list.ArrayList<jil.Statement>&! output
+) {
+    Int index! = 0;
+    while (index < block.statements.length) {
+        output.add(block.statements[index]);
+        index = index + 1;
+    }
+}
+
+() append_argument_temporaries(
+    jil.Store& store,
+    Int first_temporary,
+    jil.CallTerminator call_term,
+    token.Span span,
+    list.ArrayList<jil.Statement>&! output
+) {
+    Int index! = 0;
+    while (index < call_term.args.length) {
+        output.add(assign_operand(
+            store,
+            jil.LocalId.from_index(first_temporary + index),
+            call_term.args[index],
+            span
+        ));
+        index = index + 1;
+    }
+}
+
+() append_parameter_updates(
+    jil.Store& store,
+    Int first_temporary,
+    list.ArrayList<jil.LocalDecl>& parameters,
+    jil.CallTerminator call_term,
+    token.Span span,
+    list.ArrayList<jil.Statement>&! output
+) {
+    Int index! = 0;
+    while (index < parameters.len()) {
+        jil.LocalId temporary = jil.LocalId.from_index(first_temporary + index);
+        jil.Operand value = .move_operand(jil.MoveOperand (
+            place: local_place(store, temporary)
+        ));
+        output.add(assign_operand(
+            store,
+            parameters.get(index).id,
+            value,
+            span
+        ));
+        index = index + 1;
+    }
+}
+
+@life(return: store & value)
+jil.Statement assign_operand(
+    jil.Store& store,
+    jil.LocalId destination,
+    jil.Operand value,
+    token.Span span
+) {
+    return jil.Statement (
+        span: span,
+        kind: .assign_stmt(jil.AssignStatement (
+            destination: local_place(store, destination),
+            value: .use_value(jil.UseRvalue (value: value))
+        ))
+    );
+}
+
+@life(return: store)
+jil.Place local_place(jil.Store& store, jil.LocalId local_id) {
+    return jil.local_place(local_id, store.empty_projection());
+}

@@ -1,0 +1,134 @@
+// 从 JIL dataflow 与类型语义证明 LLVM 可消费的参数事实。
+//
+// 每项事实使用独立条件：nocapture 来自参数级 escape analysis，noalias 来自
+// 唯一引用语义，readonly 来自写入与调用边界，dereferenceable 来自安全引用
+// 和 concrete pointee layout。backend 只能翻译这里已经证明的结果。
+
+import context = "../../context.jiang";
+import jil = "../model.jiang";
+import layout_compute = "../../layout/compute.jiang";
+import provenance = "./provenance.jiang";
+import qid = "../../store/id.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+
+public struct ParameterFacts: Copyable {
+    public jil.LocalId local_id;
+    public Bool nocapture;
+    public Bool noalias;
+    public Bool readonly;
+    public Int dereferenceable_bytes;
+
+    public init(self, jil.LocalId local_id) {
+        self.local_id = local_id;
+        self.nocapture = false;
+        self.noalias = false;
+        self.readonly = false;
+        self.dereferenceable_bytes = 0;
+    }
+}
+
+public struct FunctionFacts: Movable {
+    public jil.FunctionId function_id;
+    public list.ArrayList<ParameterFacts> parameters;
+
+    public init(self, jil.FunctionId function_id) {
+        self.function_id = function_id;
+        self.parameters = list.ArrayList<ParameterFacts>();
+    }
+}
+
+public struct Store: Movable {
+    public list.ArrayList<FunctionFacts> functions;
+
+    public init(self) {
+        self.functions = list.ArrayList<FunctionFacts>();
+    }
+
+    public FunctionFacts& function(self, jil.FunctionId function_id) {
+        return self.functions.ref_at(function_id.to_index());
+    }
+}
+
+public Store analyze(context.CompilerContext& ctx, jil.Store& store) {
+    Store result! = Store();
+    Int index! = 0;
+    while (index < store.functions.len()) {
+        result.functions.add(analyze_function(ctx, store.functions.get(index)));
+        index = index + 1;
+    }
+    return result;
+}
+
+FunctionFacts analyze_function(
+    context.CompilerContext& ctx,
+    jil.Function function
+) {
+    FunctionFacts result! = FunctionFacts(function.id);
+    Int index! = 0;
+    while (index < function.body.locals.length) {
+        jil.LocalDecl local = function.body.locals[index];
+        if (local.kind == .param) {
+            result.parameters.add(analyze_parameter(ctx, function, local));
+        }
+        index = index + 1;
+    }
+    return result;
+}
+
+ParameterFacts analyze_parameter(
+    context.CompilerContext& ctx,
+    jil.Function function,
+    jil.LocalDecl parameter
+) {
+    ParameterFacts result! = ParameterFacts(parameter.id);
+    if (function.is_external) { return result; }
+    types.TypeInfo type_info = ctx.store.types.get(parameter.type_id);
+    guard type_info.data is .handle_type(handle) else { return result; }
+    if (!types.is_reference_handle(handle)) { return result; }
+
+    provenance.FunctionFacts flow =
+        provenance.analyze_parameter(function, parameter.id);
+    result.nocapture = parameter_does_not_escape(flow$.ref());
+    result.noalias = type_info.is_mutable;
+    result.readonly = parameter_is_readonly(flow$.ref());
+    result.dereferenceable_bytes = pointee_size(ctx, handle.element);
+    return result;
+}
+
+Bool parameter_does_not_escape(provenance.FunctionFacts& facts) {
+    return !facts.returned.parameter
+        && !facts.stored_externally.parameter
+        && !facts.passed_to_call.parameter
+        && !facts.captured_by_coroutine.parameter;
+}
+
+Bool parameter_is_readonly(provenance.FunctionFacts& facts) {
+    return !facts.written_through.parameter
+        && !facts.passed_to_call.parameter
+        && !facts.captured_by_coroutine.parameter;
+}
+
+Int pointee_size(context.CompilerContext& ctx, qid.TypeId type_id) {
+    if (!pointee_has_concrete_layout(ctx, type_id)) { return 0; }
+    layout_compute.layout_of_type(ctx, type_id);
+    guard ctx.store.layouts.layout_id_for_type(type_id) is .some(layout_id) else {
+        return 0;
+    }
+    Int size = ctx.store.layouts.layout(layout_id).size;
+    if (size <= 0) { return 0; }
+    return size;
+}
+
+Bool pointee_has_concrete_layout(
+    context.CompilerContext& ctx,
+    qid.TypeId type_id
+) {
+    types.TypeInfo info = ctx.store.types.get(type_id);
+    if (info.data is .invalid || info.data is .never) { return false; }
+    if (info.data is .slice_value_type(_)) { return false; }
+    if (info.data is .trait_companion(companion)) {
+        return companion.kind != .any;
+    }
+    return true;
+}

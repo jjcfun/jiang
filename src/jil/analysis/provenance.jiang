@@ -1,0 +1,865 @@
+// JIL 引用 provenance 与 escape fixed-point analysis。
+//
+// 分析按 local 汇总引用来源，在 CFG join 处取并集。projection 与 aggregate
+// 使用保守的 whole-local 摘要；未知调用、外部存储和 coroutine frame capture
+// 分开记录，供 tail eligibility、栈逃逸和 coroutine placement 共同消费。
+
+import jil = "../model.jiang";
+import list = "../../support/list.jiang";
+
+public struct Provenance: Copyable {
+    public Bool parameter;
+    public Bool current_stack;
+    public Bool global_storage;
+    public Bool heap_storage;
+    public Bool coroutine_frame;
+    public Bool unknown;
+
+    public init(self) {
+        self.parameter = false;
+        self.current_stack = false;
+        self.global_storage = false;
+        self.heap_storage = false;
+        self.coroutine_frame = false;
+        self.unknown = false;
+    }
+
+    public Provenance parameter_value() {
+        Provenance value! = Provenance();
+        value.parameter = true;
+        return value;
+    }
+
+    public Provenance stack_value() {
+        Provenance value! = Provenance();
+        value.current_stack = true;
+        return value;
+    }
+
+    public Provenance global_value() {
+        Provenance value! = Provenance();
+        value.global_storage = true;
+        return value;
+    }
+
+    public Provenance heap_value() {
+        Provenance value! = Provenance();
+        value.heap_storage = true;
+        return value;
+    }
+
+    public Provenance frame_value() {
+        Provenance value! = Provenance();
+        value.coroutine_frame = true;
+        return value;
+    }
+
+    public Provenance unknown_value() {
+        Provenance value! = Provenance();
+        value.unknown = true;
+        return value;
+    }
+
+    public Bool empty(self) {
+        return !self.parameter
+            && !self.current_stack
+            && !self.global_storage
+            && !self.heap_storage
+            && !self.coroutine_frame
+            && !self.unknown;
+    }
+
+    public Bool may_reference_current_stack(self) {
+        return self.current_stack || self.unknown;
+    }
+
+    public Provenance conservatively_unknown(self) {
+        Provenance value! = Provenance();
+        value.parameter = self.parameter;
+        value.current_stack = self.current_stack;
+        value.global_storage = self.global_storage;
+        value.heap_storage = self.heap_storage;
+        value.coroutine_frame = self.coroutine_frame;
+        value.unknown = true;
+        return value;
+    }
+}
+
+public Provenance join(Provenance lhs, Provenance rhs) {
+    Provenance result! = Provenance();
+    result.parameter = lhs.parameter || rhs.parameter;
+    result.current_stack = lhs.current_stack || rhs.current_stack;
+    result.global_storage = lhs.global_storage || rhs.global_storage;
+    result.heap_storage = lhs.heap_storage || rhs.heap_storage;
+    result.coroutine_frame = lhs.coroutine_frame || rhs.coroutine_frame;
+    result.unknown = lhs.unknown || rhs.unknown;
+    return result;
+}
+
+public Bool equal(Provenance lhs, Provenance rhs) {
+    return lhs.parameter == rhs.parameter
+        && lhs.current_stack == rhs.current_stack
+        && lhs.global_storage == rhs.global_storage
+        && lhs.heap_storage == rhs.heap_storage
+        && lhs.coroutine_frame == rhs.coroutine_frame
+        && lhs.unknown == rhs.unknown;
+}
+
+public struct FunctionFacts: Movable {
+    public jil.FunctionId function_id;
+    public Int local_count;
+    public Int block_count;
+    public list.ArrayList<Provenance> block_entries;
+    public list.ArrayList<Provenance> terminator_entries;
+    public list.ArrayList<Provenance> block_exits;
+    public list.ArrayList<Bool> reachable;
+    public Provenance returned;
+    public Provenance stored_externally;
+    public Provenance passed_to_call;
+    public Provenance passed_to_unknown_call;
+    public Provenance captured_by_coroutine;
+    public Provenance written_through;
+
+    public init(
+        self,
+        jil.FunctionId function_id,
+        Int local_count,
+        Int block_count
+    ) {
+        self.function_id = function_id;
+        self.local_count = local_count;
+        self.block_count = block_count;
+        self.block_entries = provenance_matrix(self.block_count, self.local_count);
+        self.terminator_entries = provenance_matrix(self.block_count, self.local_count);
+        self.block_exits = provenance_matrix(self.block_count, self.local_count);
+        self.reachable = bool_vector(self.block_count);
+        self.returned = Provenance();
+        self.stored_externally = Provenance();
+        self.passed_to_call = Provenance();
+        self.passed_to_unknown_call = Provenance();
+        self.captured_by_coroutine = Provenance();
+        self.written_through = Provenance();
+    }
+
+    public Provenance entry(self, jil.BlockId block_id, jil.LocalId local_id) {
+        return self.block_entries.get(self.offset(block_id, local_id));
+    }
+
+    public Provenance exit(self, jil.BlockId block_id, jil.LocalId local_id) {
+        return self.block_exits.get(self.offset(block_id, local_id));
+    }
+
+    public Provenance before_terminator(
+        self,
+        jil.BlockId block_id,
+        jil.LocalId local_id
+    ) {
+        return self.terminator_entries.get(self.offset(block_id, local_id));
+    }
+
+    public Bool block_reachable(self, jil.BlockId block_id) {
+        return self.reachable.get(block_id.to_index());
+    }
+
+    public Bool current_stack_may_escape(self) {
+        return self.returned.current_stack
+            || self.stored_externally.current_stack
+            || self.passed_to_call.current_stack
+            || self.captured_by_coroutine.current_stack;
+    }
+
+    Int offset(self, jil.BlockId block_id, jil.LocalId local_id) {
+        return block_id.to_index() * self.local_count + local_id.to_index();
+    }
+}
+
+public struct Store: Movable {
+    public list.ArrayList<FunctionFacts> functions;
+
+    public init(self) {
+        self.functions = list.ArrayList<FunctionFacts>();
+    }
+
+    public FunctionFacts& function(self, jil.FunctionId function_id) {
+        return self.functions.ref_at(function_id.to_index());
+    }
+}
+
+public Store analyze(jil.Store& store) {
+    Store facts! = Store();
+    Int index! = 0;
+    while (index < store.functions.len()) {
+        facts.functions.add(analyze_function(store.functions.get(index)));
+        index = index + 1;
+    }
+    return facts;
+}
+
+public FunctionFacts analyze_body(jil.Body body) {
+    FunctionFacts facts! = FunctionFacts(
+        jil.FunctionId.from_index(0),
+        body.locals.length,
+        body.blocks.length
+    );
+    if (body.blocks.length == 0) { return facts; }
+    seed_all_parameters(body, facts$.mut_ref());
+    return analyze_fixed_point(body, facts);
+}
+
+public Provenance operand_before_terminator(
+    FunctionFacts& facts,
+    jil.BlockId block_id,
+    jil.Operand operand
+) {
+    list.ArrayList<Provenance> state =
+        terminator_state(facts, block_id);
+    return operand_provenance(operand, state$.ref());
+}
+
+public Provenance call_arguments_before_terminator(
+    FunctionFacts& facts,
+    jil.BlockId block_id,
+    jil.CallTerminator call_term
+) {
+    list.ArrayList<Provenance> state =
+        terminator_state(facts, block_id);
+    return operands_provenance(call_term.args, state$.ref());
+}
+
+list.ArrayList<Provenance> terminator_state(
+    FunctionFacts& facts,
+    jil.BlockId block_id
+) {
+    list.ArrayList<Provenance> state =
+        list.ArrayList<Provenance>(facts.local_count);
+    Int index! = 0;
+    while (index < facts.local_count) {
+        state.add(facts.before_terminator(
+            block_id,
+            jil.LocalId.from_index(index)
+        ));
+        index = index + 1;
+    }
+    return state;
+}
+
+FunctionFacts analyze_function(jil.Function function) {
+    FunctionFacts facts! = FunctionFacts(
+        function.id,
+        function.body.locals.length,
+        function.body.blocks.length
+    );
+    if (function.body.blocks.length == 0) { return facts; }
+    seed_all_parameters(function.body, facts$.mut_ref());
+    return analyze_fixed_point(function.body, facts);
+}
+
+public FunctionFacts analyze_parameter(
+    jil.Function function,
+    jil.LocalId parameter
+) {
+    FunctionFacts facts! = FunctionFacts(
+        function.id,
+        function.body.locals.length,
+        function.body.blocks.length
+    );
+    if (function.body.blocks.length == 0) { return facts; }
+    facts.reachable.set(function.body.entry.to_index(), true);
+    set_entry(
+        facts$.mut_ref(),
+        function.body.entry,
+        parameter,
+        Provenance.parameter_value()
+    );
+    return analyze_fixed_point(function.body, facts);
+}
+
+FunctionFacts analyze_fixed_point(jil.Body body, FunctionFacts facts!) {
+    Bool changed! = true;
+    while (changed) {
+        changed = analyze_iteration(body, facts$.mut_ref());
+    }
+    return facts;
+}
+
+() seed_all_parameters(jil.Body body, FunctionFacts&! facts) {
+    facts.reachable.set(body.entry.to_index(), true);
+    Int index! = 0;
+    while (index < body.locals.length) {
+        if (body.locals[index].kind == .param) {
+            set_entry(facts, body.entry, jil.LocalId.from_index(index), Provenance.parameter_value());
+        }
+        index = index + 1;
+    }
+}
+
+Bool analyze_iteration(jil.Body body, FunctionFacts&! facts) {
+    Bool changed! = false;
+    Int index! = 0;
+    while (index < body.blocks.length) {
+        jil.Block block = body.blocks[index];
+        if (facts.reachable.get(index) && analyze_block(body, block, facts)) {
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool analyze_block(
+    jil.Body body,
+    jil.Block block,
+    FunctionFacts&! facts
+) {
+    list.ArrayList<Provenance> state! = entry_state(facts, block.id);
+    Int index! = 0;
+    while (index < block.statements.length) {
+        transfer_statement(block.statements[index], state$.mut_ref(), facts);
+        index = index + 1;
+    }
+    Bool changed! = set_terminator_state(facts, block.id, state$.ref());
+    transfer_terminator(body, block.terminator, state$.mut_ref(), facts);
+    if (set_exit_state(facts, block.id, state$.ref())) {
+        changed = true;
+    }
+    if (merge_successors(block.terminator, state$.ref(), facts)) {
+        changed = true;
+    }
+    return changed;
+}
+
+() transfer_statement(
+    jil.Statement statement,
+    list.ArrayList<Provenance>&! state,
+    FunctionFacts&! facts
+) {
+    if (statement.kind is .assign_stmt(assign)) {
+        record_rvalue_effects(assign.value, state, facts);
+        Provenance value = rvalue_provenance(assign.value, state);
+        assign_to_place(assign.destination, value, state, facts);
+        return;
+    }
+    if (statement.kind is .storage_live_stmt(storage_live)) {
+        state.set(storage_live.local_id.to_index(), Provenance());
+        return;
+    }
+    if (statement.kind is .storage_dead_stmt(storage_dead)) {
+        state.set(storage_dead.local_id.to_index(), Provenance());
+        return;
+    }
+    if (statement.kind is .atomic_store_stmt(atomic_store)) {
+        Provenance value = operand_provenance(atomic_store.value, state);
+        store_through_place(atomic_store.destination, value, state, facts);
+        return;
+    }
+    if (statement.kind is .task_region_start_stmt(task_start)) {
+        Provenance value = place_provenance(task_start.task, state);
+        facts.captured_by_coroutine = join(facts.captured_by_coroutine, value);
+        return;
+    }
+    if (statement.kind is .task_suspend_stmt(task_suspend)) {
+        record_runtime_place(task_suspend.task, state, facts);
+        return;
+    }
+    if (statement.kind is .task_complete_stmt(task_complete)) {
+        record_runtime_place(task_complete.task, state, facts);
+        return;
+    }
+    if (statement.kind is .task_consume_stmt(task_consume)) {
+        record_runtime_place(task_consume.task, state, facts);
+        return;
+    }
+    if (statement.kind is .task_release_stmt(task_release)) {
+        record_task_release(task_release, state, facts);
+        return;
+    }
+    if (statement.kind is .task_owner_release_stmt(owner_release)) {
+        record_runtime_place(owner_release.pointer, state, facts);
+        return;
+    }
+    if (statement.kind is .task_wait_stmt(task_wait)) {
+        Provenance value! = place_provenance(task_wait.state, state);
+        value = join(value, operand_provenance(task_wait.expected, state));
+        facts.passed_to_call = join(facts.passed_to_call, value);
+    }
+}
+
+() record_runtime_place(
+    jil.Place place,
+    list.ArrayList<Provenance>& state,
+    FunctionFacts&! facts
+) {
+    Provenance value = place_provenance(place, state);
+    facts.passed_to_call = join(facts.passed_to_call, value);
+}
+
+() record_task_release(
+    jil.TaskReleaseStatement task_release,
+    list.ArrayList<Provenance>& state,
+    FunctionFacts&! facts
+) {
+    Provenance value! = place_provenance(task_release.task_pointer, state);
+    value = join(value, place_provenance(task_release.frame, state));
+    value = join(value, place_provenance(task_release.state, state));
+    value = join(value, place_provenance(task_release.result, state));
+    facts.passed_to_call = join(facts.passed_to_call, value);
+}
+
+() transfer_terminator(
+    jil.Body body,
+    jil.Terminator terminator,
+    list.ArrayList<Provenance>&! state,
+    FunctionFacts&! facts
+) {
+    if (terminator.kind is .call_term(call_term)) {
+        transfer_call(call_term, state, facts);
+        return;
+    }
+    if (terminator.kind is .return_term(_)) {
+        facts.returned = join(
+            facts.returned,
+            state.get(body.return_local.to_index())
+        );
+        return;
+    }
+    if (terminator.kind is .throw_term(throw_term)) {
+        Provenance value = operand_provenance(throw_term.error_value, state);
+        facts.returned = join(facts.returned, value);
+        facts.stored_externally = join(facts.stored_externally, value);
+    }
+}
+
+() transfer_call(
+    jil.CallTerminator call_term,
+    list.ArrayList<Provenance>&! state,
+    FunctionFacts&! facts
+) {
+    Provenance arguments! = operands_provenance(call_term.args, state);
+    arguments = join(arguments, callee_provenance(call_term.callee, state));
+    facts.passed_to_call = join(facts.passed_to_call, arguments);
+    if (!(call_term.callee is .direct_function(_))) {
+        facts.passed_to_unknown_call = join(
+            facts.passed_to_unknown_call,
+            arguments
+        );
+    }
+    Provenance result! = arguments;
+    result.unknown = true;
+    assign_to_place(call_term.destination, result, state, facts);
+    if (call_term.initialized_place is .some(initialized)) {
+        assign_to_place(initialized, Provenance.unknown_value(), state, facts);
+    }
+    if (call_captures_coroutine(call_term)) {
+        facts.captured_by_coroutine = join(facts.captured_by_coroutine, arguments);
+    }
+}
+
+Provenance callee_provenance(
+    jil.CallCallee callee,
+    list.ArrayList<Provenance>& state
+) {
+    if (callee is .indirect_operand(indirect)) {
+        return operand_provenance(indirect, state);
+    }
+    if (callee is .domain_enqueue(enqueue)) {
+        Provenance result! = operand_provenance(enqueue.resume, state);
+        if (enqueue.task is .some(task)) {
+            result = join(result, operand_provenance(task, state));
+        }
+        return result;
+    }
+    if (callee is .dynamic_domain_enqueue(enqueue)) {
+        Provenance result! = operand_provenance(enqueue.executor, state);
+        result = join(result, operand_provenance(enqueue.resume, state));
+        if (enqueue.task is .some(task)) {
+            result = join(result, operand_provenance(task, state));
+        }
+        return result;
+    }
+    return Provenance();
+}
+
+Bool call_captures_coroutine(jil.CallTerminator call_term) {
+    return call_term.is_suspend_point
+        || call_term.callee is .domain_enqueue(_)
+        || call_term.callee is .dynamic_domain_enqueue(_);
+}
+
+() record_rvalue_effects(
+    jil.Rvalue value,
+    list.ArrayList<Provenance>& state,
+    FunctionFacts&! facts
+) {
+    if (value is .inline_asm_value(inline_asm)) {
+        Provenance inputs = inline_asm_provenance(inline_asm, state);
+        facts.passed_to_unknown_call = join(facts.passed_to_unknown_call, inputs);
+        facts.passed_to_call = join(facts.passed_to_call, inputs);
+        return;
+    }
+    if (value is .alloc_value(alloc)) {
+        Provenance stored = operand_provenance(alloc.value, state);
+        facts.stored_externally = join(facts.stored_externally, stored);
+        return;
+    }
+    if (value is .atomic_exchange_value(exchange)) {
+        Provenance stored = operand_provenance(exchange.desired, state);
+        facts.stored_externally = join(facts.stored_externally, stored);
+        return;
+    }
+    if (value is .atomic_compare_exchange_value(exchange)) {
+        Provenance stored = operand_provenance(exchange.desired, state);
+        facts.stored_externally = join(facts.stored_externally, stored);
+    }
+}
+
+() assign_to_place(
+    jil.Place destination,
+    Provenance value,
+    list.ArrayList<Provenance>&! state,
+    FunctionFacts&! facts
+) {
+    if (place_captures_coroutine(destination)) {
+        facts.captured_by_coroutine = join(facts.captured_by_coroutine, value);
+    }
+    if (destination.base is .global(_)) {
+        facts.stored_externally = join(facts.stored_externally, value);
+        return;
+    }
+    if (place_stores_through_reference(destination)) {
+        facts.written_through = join(
+            facts.written_through,
+            place_base_provenance(destination, state)
+        );
+        facts.stored_externally = join(facts.stored_externally, value);
+        return;
+    }
+    jil.LocalId local_id = destination.local_id;
+    if (destination.projection.length == 0) {
+        state.set(local_id.to_index(), value);
+        return;
+    }
+    state.set(local_id.to_index(), join(state.get(local_id.to_index()), value));
+}
+
+() store_through_place(
+    jil.Place destination,
+    Provenance value,
+    list.ArrayList<Provenance>&! state,
+    FunctionFacts&! facts
+) {
+    if (destination.base is .local(_) && !place_stores_through_reference(destination)) {
+        assign_to_place(destination, value, state, facts);
+        return;
+    }
+    if (place_stores_through_reference(destination)) {
+        facts.written_through = join(
+            facts.written_through,
+            place_base_provenance(destination, state)
+        );
+    }
+    facts.stored_externally = join(facts.stored_externally, value);
+}
+
+Provenance place_base_provenance(
+    jil.Place place,
+    list.ArrayList<Provenance>& state
+) {
+    if (place.base is .global(_)) { return Provenance.global_value(); }
+    return state.get(place.local_id.to_index());
+}
+
+Provenance rvalue_provenance(
+    jil.Rvalue value,
+    list.ArrayList<Provenance>& state
+) {
+    if (value is .use_value(use)) { return operand_provenance(use.value, state); }
+    if (value is .unary_value(unary)) { return operand_provenance(unary.value, state); }
+    if (value is .binary_value(binary)) {
+        return join(
+            operand_provenance(binary.lhs, state),
+            operand_provenance(binary.rhs, state)
+        );
+    }
+    if (value is .cast_value(cast)) { return operand_provenance(cast.value, state); }
+    if (value is .inline_asm_value(inline_asm)) {
+        return inline_asm_provenance(inline_asm, state).conservatively_unknown();
+    }
+    if (value is .borrow_value(borrow)) {
+        return address_provenance(borrow.place, state);
+    }
+    if (value is .address_of_value(address)) {
+        return address_provenance(address.place, state);
+    }
+    if (value is .coroutine_address_value(address)) {
+        if (address.frame_root) { return Provenance.frame_value(); }
+        return address_provenance(address.place, state);
+    }
+    if (value is .atomic_load_value(load)) {
+        return place_provenance(load.place, state);
+    }
+    if (value is .atomic_exchange_value(exchange)) {
+        return join(
+            place_provenance(exchange.place, state),
+            operand_provenance(exchange.desired, state)
+        );
+    }
+    if (value is .atomic_compare_exchange_value(exchange)) {
+        return atomic_compare_exchange_provenance(exchange, state);
+    }
+    if (value is .alloc_box_value(_)) { return Provenance.heap_value(); }
+    if (value is .coroutine_frame_alloc_value(_)) {
+        return Provenance.frame_value();
+    }
+    if (value is .alloc_value(_)) { return Provenance.heap_value(); }
+    if (value is .alloc_array_value(_)) { return Provenance.heap_value(); }
+    if (value is .slice_value(slice)) {
+        return address_provenance(slice.base, state);
+    }
+    if (value is .free_value(_)) { return Provenance(); }
+    if (value is .coroutine_frame_free_value(_)) { return Provenance(); }
+    if (value is .len_value(_)) { return Provenance(); }
+    if (value is .discriminant_value(_)) { return Provenance(); }
+    if (value is .aggregate_value(aggregate)) {
+        Provenance fields! = operands_provenance(aggregate.fields, state);
+        if (aggregate.tag is .some(tag)) {
+            fields = join(fields, operand_provenance(tag, state));
+        }
+        return fields;
+    }
+    if (value is .optional_value(optional)) {
+        if (optional.op == .is_some || optional.op == .make_none) {
+            return Provenance();
+        }
+        return operand_provenance(optional.value, state);
+    }
+    if (value is .error_union_value(error_union)) {
+        if (error_union.op == .is_error) { return Provenance(); }
+        return operand_provenance(error_union.value, state);
+    }
+    if (value is .domain_executor_value(_)) { return Provenance.unknown_value(); }
+    if (value is .current_executor_value(_)) { return Provenance.unknown_value(); }
+    if (value is .scheduled_continuation_resume_value(_)) {
+        return Provenance.unknown_value();
+    }
+    if (value is .executor_enter_value(_)) { return Provenance.unknown_value(); }
+    if (value is .current_task_value(_)) { return Provenance.unknown_value(); }
+    return Provenance();
+}
+
+Provenance inline_asm_provenance(
+    jil.InlineAsmRvalue inline_asm,
+    list.ArrayList<Provenance>& state
+) {
+    Provenance result! = Provenance();
+    Int index! = 0;
+    while (index < inline_asm.operands.length) {
+        if (inline_asm.operands[index] is .input(input)) {
+            result = join(result, operand_provenance(input.value, state));
+        }
+        index = index + 1;
+    }
+    return result;
+}
+
+Provenance atomic_compare_exchange_provenance(
+    jil.AtomicCompareExchangeRvalue exchange,
+    list.ArrayList<Provenance>& state
+) {
+    Provenance result! = place_provenance(exchange.place, state);
+    result = join(result, operand_provenance(exchange.expected, state));
+    return join(result, operand_provenance(exchange.desired, state));
+}
+
+Provenance operands_provenance(
+    jil.Operand[]& operands,
+    list.ArrayList<Provenance>& state
+) {
+    Provenance result! = Provenance();
+    Int index! = 0;
+    while (index < operands.length) {
+        result = join(result, operand_provenance(operands[index], state));
+        index = index + 1;
+    }
+    return result;
+}
+
+Provenance operand_provenance(
+    jil.Operand operand,
+    list.ArrayList<Provenance>& state
+) {
+    if (operand is .copy_operand(copy)) {
+        return place_provenance(copy.place, state);
+    }
+    if (operand is .move_operand(move)) {
+        return place_provenance(move.place, state);
+    }
+    if (operand is .out_operand(out)) {
+        return address_provenance(out.place, state);
+    }
+    if (operand is .global_address_operand(_)) {
+        return Provenance.global_value();
+    }
+    if (operand is .global_operand(_)) {
+        return Provenance.global_value();
+    }
+    return Provenance();
+}
+
+Provenance place_provenance(
+    jil.Place place,
+    list.ArrayList<Provenance>& state
+) {
+    if (place.base is .global(_)) { return Provenance.global_value(); }
+    if (place_stores_through_reference(place)) {
+        return state.get(place.local_id.to_index()).conservatively_unknown();
+    }
+    return state.get(place.local_id.to_index());
+}
+
+Provenance address_provenance(
+    jil.Place place,
+    list.ArrayList<Provenance>& state
+) {
+    if (place.base is .global(_)) { return Provenance.global_value(); }
+    if (place_captures_coroutine(place)) { return Provenance.frame_value(); }
+    if (place_stores_through_reference(place)) {
+        return state.get(place.local_id.to_index());
+    }
+    return Provenance.stack_value();
+}
+
+Bool place_stores_through_reference(jil.Place place) {
+    if (place.projection.length == 0) { return false; }
+    return place.projection[0] is .deref_projection(_);
+}
+
+Bool place_captures_coroutine(jil.Place place) {
+    Int index! = 0;
+    while (index < place.projection.length) {
+        if (place.projection[index] is .frame_field_projection(_)) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool merge_successors(
+    jil.Terminator terminator,
+    list.ArrayList<Provenance>& state,
+    FunctionFacts&! facts
+) {
+    Bool changed! = false;
+    Int index! = 0;
+    while (index < jil.terminator_successor_count(terminator)) {
+        jil.BlockId successor = jil.terminator_successor_at(terminator, index);
+        if (merge_entry(facts, successor, state)) {
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool merge_entry(
+    FunctionFacts&! facts,
+    jil.BlockId block_id,
+    list.ArrayList<Provenance>& state
+) {
+    Bool changed! = false;
+    Int block_index = block_id.to_index();
+    if (!facts.reachable.get(block_index)) {
+        facts.reachable.set(block_index, true);
+        changed = true;
+    }
+    Int index! = 0;
+    while (index < facts.local_count) {
+        Int offset = block_index * facts.local_count + index;
+        Provenance merged = join(facts.block_entries.get(offset), state.get(index));
+        if (!equal(merged, facts.block_entries.get(offset))) {
+            facts.block_entries.set(offset, merged);
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool set_exit_state(
+    FunctionFacts&! facts,
+    jil.BlockId block_id,
+    list.ArrayList<Provenance>& state
+) {
+    Bool changed! = false;
+    Int index! = 0;
+    while (index < facts.local_count) {
+        Int offset = block_id.to_index() * facts.local_count + index;
+        if (!equal(facts.block_exits.get(offset), state.get(index))) {
+            facts.block_exits.set(offset, state.get(index));
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+Bool set_terminator_state(
+    FunctionFacts&! facts,
+    jil.BlockId block_id,
+    list.ArrayList<Provenance>& state
+) {
+    Bool changed! = false;
+    Int index! = 0;
+    while (index < facts.local_count) {
+        Int offset = block_id.to_index() * facts.local_count + index;
+        if (!equal(facts.terminator_entries.get(offset), state.get(index))) {
+            facts.terminator_entries.set(offset, state.get(index));
+            changed = true;
+        }
+        index = index + 1;
+    }
+    return changed;
+}
+
+list.ArrayList<Provenance> entry_state(
+    FunctionFacts&! facts,
+    jil.BlockId block_id
+) {
+    list.ArrayList<Provenance> state = list.ArrayList<Provenance>(facts.local_count);
+    Int index! = 0;
+    while (index < facts.local_count) {
+        state.add(facts.entry(block_id, jil.LocalId.from_index(index)));
+        index = index + 1;
+    }
+    return state;
+}
+
+() set_entry(
+    FunctionFacts& facts,
+    jil.BlockId block_id,
+    jil.LocalId local_id,
+    Provenance value
+) {
+    Int offset = block_id.to_index() * facts.local_count + local_id.to_index();
+    facts.block_entries.set(offset, value);
+}
+
+list.ArrayList<Provenance> provenance_matrix(Int blocks, Int locals) {
+    list.ArrayList<Provenance> values = list.ArrayList<Provenance>(blocks * locals);
+    Int index! = 0;
+    while (index < blocks * locals) {
+        values.add(Provenance());
+        index = index + 1;
+    }
+    return values;
+}
+
+list.ArrayList<Bool> bool_vector(Int length) {
+    list.ArrayList<Bool> values = list.ArrayList<Bool>(length);
+    Int index! = 0;
+    while (index < length) {
+        values.add(false);
+        index = index + 1;
+    }
+    return values;
+}

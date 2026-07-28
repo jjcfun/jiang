@@ -321,6 +321,11 @@ callback 不能在 resume 返回后释放内嵌 token。这个协议是父帧内
 JIL 在 coroutine frame layout 之前运行 Task ownership/storage analysis。每个 Task origin 形成
 `TaskRegion`：
 
+frame layout 同时读取 final JIL provenance 的 coroutine capture 摘要。若 capture 可能携带当前栈
+或 unknown 来源，所有 `address_taken` local 都保守进入 frame；其余 local 仍由
+live-across-suspend 与 interference analysis 决定。这个摘要只补强 capture 安全边界，
+不替代 Task region ownership、slot reuse 或 borrow check。
+
 ```text
 TaskRegion
   origin

@@ -307,8 +307,16 @@ src/
     comptime/   source selection、const value evaluator/interpreter、ComptimeStore
     generic/    generic substitution 和实例化辅助
     type_check/ type check 主体、类型事实和调用/模式/表达式 side table
-  jil.jiang     JIL 数据模型稳定入口
-  jil/          JIL 数据结构和 Semantic Model -> JIL lowering
+  jil.jiang     JIL 阶段稳定入口
+  jil/
+    model.jiang JIL 数据模型入口
+    model/      ID、Place、Value、CFG、Program 和 Store
+    lower.jiang Semantic Model -> JIL lowering 入口
+    lower/      package lowering 和共享 support
+    analysis.jiang  JIL dataflow analysis 入口
+    analysis/   provenance、escape 和参数属性证明
+    optimize.jiang JIL 优化编排入口
+    optimize/   安全尾递归等目标无关 transform
   layout.jiang  concrete type layout 数据模型入口
   layout/       concrete type layout 查询层
   borrow_check.jiang  borrow check 阶段入口
@@ -389,14 +397,15 @@ public trait Indexable {
 
 ## 测试目录
 
-- `test/smoke/`：编译器内部模块和端到端 smoke，由脚本通过 `JIANGC` 指定被测编译器；
-  稳定自举验证使用 `build/bin/jiangc.next` 或 `build/bin/jiangc`。
 - `test/compiler/`：按编译器内部阶段归档的测试目录，覆盖 backend、driver、incremental、
-  IR dump/lower、query、resolve、sema 和 syntax 等阶段。
+  IR dump/lower、query、resolve、sema 和 syntax 等阶段；内部断言程序也由统一 runner
+  完成编译、链接和执行。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
-- `test/lang/`：源码级语言语义用例，和 `test/smoke` 的内部模块 API 测试分开。
-  目录按语言功能优先组织，每个功能目录内部再按测试结果类型分组；覆盖策略见
+- `test/lang/`：源码级语言语义用例。目录按语言功能优先组织，每个功能目录内部再按
+  `check`、`fail`、`emit`、`run` 测试结果类型分组；覆盖策略见
   [Language Testing 设计](compiler/lang-testing.md)。
+- `test/profile/`：同一 runner 的显式用例清单。smoke 只是日常快速选择的 profile，
+  不拥有独立目录或测试语义；self-host、backend CLI 和 release smoke 仍是单独的端到端工作流。
 
 `test/lang` 当前按语言功能组织，每个功能目录内部再按结果类型组织。功能目录会随语言能力增长，
 例如 aggregate、backend、comptime、constant、control_flow、driver、error_handling、

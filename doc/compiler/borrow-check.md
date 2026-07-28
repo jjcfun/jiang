@@ -35,6 +35,17 @@ unsafe/capability gate。`T*` / `T*!` 不参与 shared/mutable alias 冲突证�
 - 检查需要析构的值在所有 CFG 路径上至多析构一次。
 - 为 drop 插入和后续 backend 提供约束结果。
 
+borrow check 通过后，JIL provenance analysis 会复用已经合法的引用语义，按 CFG fixed point
+追踪 parameter、当前栈、global、heap、coroutine frame 和 unknown 来源。这个 analysis 不替代
+borrow check：前者汇总优化可消费的来源与 escape facts，后者仍负责证明源码所有权和借用合法。
+projection 与 aggregate 当前使用 whole-local 保守摘要；未知调用、间接调用、外部存储和
+coroutine capture 都按可能逃逸处理。
+
+LLVM 参数属性也不直接等同于 borrow check 结论。唯一引用语义只用于独立证明 `noalias`；
+`readonly` 还必须证明没有通过参数写入或传给未知效果调用；不捕获事实来自参数级 escape
+analysis；`dereferenceable` 还要求安全引用指向有 concrete layout 的 sized pointee。
+任何一项条件未知时只省略对应属性，不影响其他属性。
+
 普通函数没有显式 `@life` 且返回 Shape 非空时，先应用 reference receiver 特例：
 readonly `self` / `Self&! self` 的 Shape 非空时默认使用完整 receiver root。没有该特例时，
 只有恰好一个用户可见参数 root 的 Shape 非空且与返回 Shape 兼容，才默认使用该完整 root。

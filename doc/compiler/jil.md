@@ -46,7 +46,12 @@ Semantic Model/type facts -> initial JIL
   -> borrow check
   -> drop-input verifier
   -> drop elaboration
-  -> final verifier
+  -> backend-input verifier
+  -> provenance/escape analysis
+  -> safe tail-recursion transform
+  -> provenance invalidation/recompute
+  -> backend-input verifier
+  -> parameter attribute proof
   -> backend
 ```
 
@@ -80,6 +85,23 @@ lowering、drop elaboration 输入/输出和 backend 入口都运行 verifier。
 必须声明它保留或使哪些 analysis 失效，并在 pass 后复用同一个 verifier。
 
 ## 结构
+
+阶段入口按职责组织：
+
+```text
+src/jil.jiang             JIL 阶段稳定入口
+src/jil/model.jiang       数据模型入口
+src/jil/model/            ID、Place、Value、CFG、Program、Store
+src/jil/lower.jiang       Semantic Model -> JIL lowering 入口
+src/jil/lower/            package lowering 与共享 support
+src/jil/analysis.jiang    dataflow analysis 入口
+src/jil/analysis/         provenance 与参数属性证明
+src/jil/optimize.jiang    优化编排入口
+src/jil/optimize/         安全尾递归等具体 transform
+```
+
+`jil.jiang` 和各同名入口文件只提供稳定模块边界；模型、lowering、analysis 和 transform
+不再堆在单个入口文件中。
 
 第一版 JIL 使用非 SSA 的 local + assignment 形式：
 
