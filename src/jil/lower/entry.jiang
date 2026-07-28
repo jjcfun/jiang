@@ -1,0 +1,607 @@
+// 语言入口、运行时入口和外部 ABI 桥接函数生成。
+//
+// 本模块集中维护 compiler-generated entry body，避免入口协议散落到函数体 lowering。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import string = "../../support/string.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import coroutine_frame_layout = "../coroutine/frame_layout.jiang";
+import coroutine_task_abi = "../coroutine/task_abi.jiang";
+import * = "./model.jiang";
+import lower_context = "./context.jiang";
+import * = "./body.jiang";
+import * = "./context.jiang";
+import lower_function = "./function.jiang";
+import lower_type_support = "./type_support.jiang";
+
+public extend lower_context.Context {
+    public () lower_runtime_entry(self) {
+        guard self.language_main_def() is .some(main_def) else { return; }
+        guard self.model.def(main_def) is .some(main_model_def) else { return; }
+        self.lower_function(main_model_def);
+        self.add_runtime_entry_for_main(main_def);
+    }
+
+    public qid.DefId? language_main_def(self) {
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(self.graph.root_module);
+        return self.main_member_def(module.def_id);
+    }
+
+    public qid.DefId? main_member_def(self, qid.DefId owner_def) {
+        guard self.model.def(owner_def) is .some(model_def) else { return null; }
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            qid.DefId member_def = model_def.members.get(index);
+            if (self.def_is_language_main(member_def)) { return member_def; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Bool def_is_language_main(self, qid.DefId def_id) {
+        if (self.ctx.store.defs.get(def_id).kind != .function_def) { return false; }
+        qid.SymbolId symbol_id = self.ctx.store.defs.get(def_id).name.symbol;
+        return string.equal(self.ctx.store.symbols.text(symbol_id), "main");
+    }
+
+    public Bool def_is_language_entry(self, qid.DefId def_id) {
+        guard self.language_main_def() is .some(main_def) else { return false; }
+        return main_def.to_index() == def_id.to_index();
+    }
+
+    public () add_runtime_entry_for_main(self, qid.DefId main_def) {
+        Int function_index = self.output.functions.len();
+        token.Span span = self.def_span(main_def);
+        self.output.add_function(jil.Function (
+            id: jil.FunctionId.from_index(function_index),
+            def_id: main_def,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+        is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: true,
+            is_external: false,
+            inline_always: false,
+            naked: false,
+            span: span,
+            body: self.runtime_entry_body(jil.BodyId.from_index(function_index), main_def, span)
+        ));
+    }
+
+    public jil.Body external_function_body(self, jil.BodyId body_id, sem.Def& model_def, token.Span span) {
+        return self.external_function_body_for_def(body_id, model_def.def_id, span);
+    }
+
+    public jil.Body external_function_body_for_def(self, jil.BodyId body_id, qid.DefId function_def, token.Span span) {
+        qid.TypeId function_type_id! = self.ctx.store.types.invalid_type();
+        if (self.typeck.def_type(function_def) is .some(type_id)) {
+            function_type_id = type_id;
+        }
+        types.TypeInfo info = self.ctx.store.types.get(function_type_id);
+        guard info.data is .function_type(function_type) else {
+            return self.empty_external_body(body_id, span);
+        }
+
+        if (function_type.effects.has_async) {
+            return self.external_async_function_body(body_id, function_type, span);
+        }
+
+        return self.external_source_body_for_type(body_id, function_type, span);
+    }
+
+    public jil.Body external_source_function_body(
+        self,
+        jil.BodyId body_id,
+        qid.DefId function_def,
+        token.Span span
+    ) {
+        guard self.typeck.def_type(function_def) is .some(function_type_id) else {
+            return self.empty_external_body(body_id, span);
+        }
+        types.TypeInfo info = self.ctx.store.types.get(function_type_id);
+        guard info.data is .function_type(function_type) else {
+            return self.empty_external_body(body_id, span);
+        }
+        return self.external_source_body_for_type(body_id, function_type, span);
+    }
+
+    public jil.Body external_source_body_for_type(
+        self,
+        jil.BodyId body_id,
+        types.FunctionType function_type,
+        token.Span span
+    ) {
+        unsafe {
+            Int local_count = function_type.params.length + 1;
+            jil.LocalDecl*! locals = self.output.alloc_local_array(local_count);
+            locals[0] = self.runtime_local(jil.LocalId.from_index(0), .return_place, function_type.result, span);
+            Int index! = 0;
+            while (index < function_type.params.length) {
+                locals[index + 1] = self.runtime_local(
+                    jil.LocalId.from_index(index + 1),
+                    .param,
+                    function_type.params[index],
+                    span
+                );
+                index = index + 1;
+            }
+            return jil.Body (
+                id: body_id,
+                span: span,
+                locals: locals[0..local_count],
+                blocks: self.output.empty_blocks(),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+        }
+    }
+
+    public jil.Body external_async_function_body(
+        self,
+        jil.BodyId body_id,
+        types.FunctionType function_type,
+        token.Span span
+    ) {
+        unsafe {
+            Int source_param_count = function_type.params.length;
+            Int local_count = source_param_count + 2;
+            jil.LocalDecl*! locals = self.output.alloc_local_array(local_count);
+            locals[0] = self.runtime_local(
+                jil.LocalId.from_index(0),
+                .return_place,
+                self.ctx.store.types.unit_type(),
+                span
+            );
+            Int index! = 0;
+            while (index < source_param_count) {
+                locals[index + 1] = self.runtime_local(
+                    jil.LocalId.from_index(index + 1),
+                    .param,
+                    function_type.params[index],
+                    span
+                );
+                index = index + 1;
+            }
+            locals[source_param_count + 1] = self.runtime_local(
+                jil.LocalId.from_index(source_param_count + 1),
+                .param,
+                self.external_async_continuation_layout(function_type.result, span).pointer_type_id,
+                span
+            );
+            return jil.Body (
+                id: body_id,
+                span: span,
+                locals: locals[0..local_count],
+                blocks: self.output.empty_blocks(),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+        }
+    }
+
+    public qid.TypeId coroutine_context_pointer_type(self, token.Span span) {
+        return self.ctx.store.types.opaque_pointer_type(span);
+    }
+
+    public qid.TypeId coroutine_continuation_type(self, qid.TypeId context_type, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(context_type);
+        return self.ctx.store.types.function_type(params, self.ctx.store.types.unit_type(), span);
+    }
+
+    public jil.ExternalContinuationLayout external_async_continuation_layout(
+        self,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
+        qid.TypeId context_type = self.coroutine_context_pointer_type(span);
+        qid.TypeId resume_type = self.coroutine_continuation_type(context_type, span);
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(7);
+        fields.add(self.ctx.store.types.raw_pointer_type(result_type, span));
+        fields.add(context_type);
+        fields.add(resume_type);
+        fields.add(context_type);
+        fields.add(context_type);
+        fields.add(context_type);
+        fields.add(resume_type);
+        qid.TypeId type_id = self.ctx.store.types.tuple_type(fields, span);
+        return jil.ExternalContinuationLayout (
+            type_id: type_id,
+            pointer_type_id: self.ctx.store.types.raw_pointer_type(type_id, span),
+            result_field_index: 0,
+            context_field_index: 1,
+            resume_field_index: 2,
+            executor_field_index: 3,
+            target_context_field_index: 4,
+            target_resume_field_index: 5,
+            cancellation_context_field_index: 6
+        );
+    }
+
+    public jil.TaskWaiterLayout task_waiter_layout(self, token.Span span) {
+        qid.TypeId pointer_type = self.coroutine_context_pointer_type(span);
+        qid.TypeId resume_type = self.coroutine_continuation_type(pointer_type, span);
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(4);
+        fields.add(pointer_type);
+        fields.add(resume_type);
+        fields.add(pointer_type);
+        fields.add(pointer_type);
+        qid.TypeId type_id = self.ctx.store.types.tuple_type(fields, span);
+        return jil.TaskWaiterLayout (
+            type_id: type_id,
+            pointer_type_id: self.ctx.store.types.raw_pointer_type(type_id, span),
+            context_field_index: 0,
+            resume_field_index: 1,
+            executor_field_index: 2,
+            task_field_index: 3
+        );
+    }
+
+    public jil.SuspendContinuationLayout suspend_continuation_layout(
+        self,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
+        return coroutine_frame_layout.build_suspend_continuation_layout(
+            self.ctx.store.types$.ref(), result_type, span
+        );
+    }
+
+    public qid.TypeId external_async_abi_function_type(self, qid.TypeId source_type, token.Span span) {
+        types.TypeInfo info = self.ctx.store.types.get(source_type);
+        guard info.data is .function_type(function_type) else {
+            return source_type;
+        }
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(function_type.params.length + 1);
+        Int index! = 0;
+        while (index < function_type.params.length) {
+            params.add(function_type.params[index]);
+            index = index + 1;
+        }
+        params.add(self.external_async_continuation_layout(function_type.result, span).pointer_type_id);
+        return self.ctx.store.types.function_type(params, self.ctx.store.types.unit_type(), span);
+    }
+
+    public jil.Body empty_external_body(self, jil.BodyId body_id, token.Span span) {
+        unsafe {
+            jil.LocalDecl*! locals = self.output.alloc_local_array(1);
+            locals[0] = self.runtime_local(
+                jil.LocalId.from_index(0),
+                .return_place,
+                self.ctx.store.types.unit_type(),
+                span
+            );
+            return jil.Body (
+                id: body_id,
+                span: span,
+                locals: locals[0..1],
+                blocks: self.output.empty_blocks(),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+        }
+    }
+
+    public jil.Body runtime_entry_body(self, jil.BodyId body_id, qid.DefId main_def, token.Span span) {
+        unsafe {
+            if (self.output.function_id_for_def(main_def) == null) {
+                return self.empty_external_body(body_id, span);
+            }
+            qid.TypeId int_type = self.ctx.store.types.int_type();
+            qid.TypeId main_type = self.typeck.def_type(main_def)$.some();
+            qid.TypeId main_result_type = self.function_result_type(main_type);
+            jil.LocalDecl*! locals = self.output.alloc_local_array(2);
+            locals[0] = self.runtime_local(jil.LocalId.from_index(0), .return_place, int_type, span);
+            locals[1] = self.runtime_local(jil.LocalId.from_index(1), .compiler_temp, main_result_type, span);
+
+            list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+            blocks.add(self.runtime_call_main_block(main_def, main_type, span));
+            blocks.add(self.runtime_return_block(main_result_type, span));
+            return jil.Body (
+                id: body_id,
+                span: span,
+                locals: locals[0..2],
+                blocks: self.output.block_array(blocks$.ref()),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+        }
+    }
+
+    public jil.Body async_runtime_entry_body(
+        self,
+        jil.BodyId body_id,
+        jil.Function main_function,
+        jil.CoroutineFrameLayout& layout,
+        token.Span span
+    ) {
+        unsafe {
+            jil.LocalDecl*! locals = self.output.alloc_local_array(4);
+            locals[0] = self.runtime_local(
+                jil.LocalId.from_index(0), .return_place, self.ctx.store.types.int_type(), span
+            );
+            locals[1] = self.runtime_local(
+                jil.LocalId.from_index(1), .compiler_temp, layout.task_abi.task_type_id, span
+            );
+            locals[2] = self.runtime_local(
+                jil.LocalId.from_index(2), .compiler_temp, layout.frame_type_id, span
+            );
+            locals[3] = self.runtime_local(
+                jil.LocalId.from_index(3), .compiler_temp, self.ctx.store.types.unit_type(), span
+            );
+            jil.Place task_place = self.runtime_place(jil.LocalId.from_index(1));
+            jil.Place frame_place = self.runtime_place(jil.LocalId.from_index(2));
+            jil.FunctionRef resume_function = self.runtime_coroutine_function_ref(
+                main_function, layout, true, span
+            );
+            jil.FunctionRef completion_function = self.runtime_coroutine_function_ref(
+                main_function, layout, false, span
+            );
+            jil.Statement[]& initializers = coroutine_task_abi.initializers(
+                self.output,
+                layout,
+                task_place,
+                frame_place,
+                resume_function,
+                completion_function,
+                span
+            );
+            list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+            blocks.add(self.async_runtime_resume_block(
+                layout,
+                task_place,
+                StatementSlice(values: initializers),
+                span
+            ));
+            blocks.add(self.async_runtime_return_block(layout, task_place, span));
+            return jil.Body (
+                id: body_id,
+                span: span,
+                locals: locals[0..4],
+                blocks: self.output.block_array(blocks$.ref()),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+        }
+    }
+
+    public jil.FunctionRef runtime_coroutine_function_ref(
+        self,
+        jil.Function function,
+        jil.CoroutineFrameLayout& layout,
+        Bool resume,
+        token.Span span
+    ) {
+        qid.TypeId type_id! = layout.fields[layout.continuation_function_field_index].type_id;
+        if (resume) { type_id = layout.task_abi.resume_function_type_id; }
+        return jil.FunctionRef (
+            function_def: function.def_id,
+            type_args: self.output.type_arg_array(function.type_args),
+            const_args: self.output.const_arg_array(function.const_args),
+            coroutine_resume: resume,
+            coroutine_completion: !resume,
+            type_id: type_id,
+            span: span
+        );
+    }
+
+    @life(return: self & initializers)
+    public jil.Block async_runtime_resume_block(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        StatementSlice initializers,
+        token.Span span
+    ) {
+        jil.Place frame_pointer = coroutine_task_abi.task_field_place(
+            self.output, task_place, layout.task_abi.frame_field
+        );
+        jil.Place resume_function = coroutine_task_abi.task_field_place(
+            self.output, task_place, layout.task_abi.resume_function_field
+        );
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(jil.copy_operand_value(jil.CopyOperand (place: frame_pointer)));
+        jil.CallCallee callee = jil.indirect_operand_callee(
+            jil.copy_operand_value(jil.CopyOperand (place: resume_function))
+        );
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: initializers.values,
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.call_terminator_kind(jil.CallTerminator (
+                    callee: callee,
+                    args: self.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    async_start: jil.AsyncStartKind.observed_task,
+                    destination: self.runtime_place(jil.LocalId.from_index(3)),
+                    target: jil.BlockId.from_index(1),
+                    initialized_place: null,
+                    exclusive_places: self.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    public jil.Block async_runtime_return_block(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        token.Span span
+    ) {
+        jil.Place result_place = coroutine_task_abi.task_field_place(
+            self.output, task_place, layout.task_abi.result_field
+        );
+        jil.Operand exit_code = self.runtime_async_exit_operand(result_place, layout.task_abi.result_type_id, span);
+        list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(1);
+        statements.add(jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: self.runtime_place(jil.LocalId.from_index(0)),
+                value: jil.use_rvalue(jil.UseRvalue (value: exit_code))
+            ))
+        ));
+        return jil.Block (
+            id: jil.BlockId.from_index(1),
+            span: span,
+            statements: self.output.statement_array(statements$.ref()),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.return_terminator_kind(jil.ReturnTerminator (implicit_unit: false))
+            )
+        );
+    }
+
+    @life(return: result_place)
+    public jil.Operand runtime_async_exit_operand(
+        self,
+        jil.Place result_place,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
+        if (result_type.to_index() == self.ctx.store.types.unit_type().to_index()) {
+            return jil.const_operand_value(jil.Const (
+                type_id: self.ctx.store.types.int_type(),
+                span: span,
+                value: jil.int_const_kind(jil.IntConst (bits: 0, signed_value: true))
+            ));
+        }
+        return jil.copy_operand_value(jil.CopyOperand (place: result_place));
+    }
+
+    public types.FunctionType function_type_or_empty(self, qid.TypeId callee_type) {
+        types.TypeInfo info = self.ctx.store.types.get(callee_type);
+        if (info.data is .function_type(function_info)) {
+            return function_info;
+        }
+        return types.FunctionType (
+            params: self.output.empty_type_args(),
+            result: self.ctx.store.types.unit_type(),
+            lifetime_contract: self.ctx.store.types.empty_lifetime_contract(),
+            effects: types.EffectSet(),
+            kind: .raw
+        );
+    }
+
+    public qid.TypeId function_result_type(self, qid.TypeId callee_type) {
+        types.TypeInfo info = self.ctx.store.types.get(callee_type);
+        if (info.data is .function_type(function_info)) {
+            return function_info.result;
+        }
+        return self.ctx.store.types.unit_type();
+    }
+
+    public jil.LocalDecl runtime_local(self,
+        jil.LocalId id,
+        jil.LocalKind kind,
+        qid.TypeId type_id,
+        token.Span span
+    ) {
+        return jil.LocalDecl (
+            id: id,
+            kind: kind,
+            type_id: type_id,
+            span: span,
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        );
+    }
+
+    public jil.Block runtime_call_main_block(self,
+        qid.DefId main_def,
+        qid.TypeId main_type,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(0);
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.output.empty_statements(),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.call_terminator_kind(jil.CallTerminator (
+                    callee: self.runtime_main_callee(main_def, main_type, span),
+                    args: self.output.operand_slice(args.slice()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: self.runtime_place(jil.LocalId.from_index(1)),
+                    target: jil.BlockId.from_index(1),
+                    initialized_place: null,
+                    exclusive_places: self.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    public jil.CallCallee runtime_main_callee(self, qid.DefId main_def, qid.TypeId main_type, token.Span span) {
+        return jil.direct_function_callee(jil.FunctionRef (
+            function_def: main_def,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: main_type,
+            span: span
+        ));
+    }
+
+    public jil.Block runtime_return_block(self, qid.TypeId main_result_type, token.Span span) {
+        list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(1);
+        statements.add(jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: self.runtime_place(jil.LocalId.from_index(0)),
+                value: jil.use_rvalue(jil.UseRvalue (
+                    value: self.runtime_return_operand(main_result_type, span)
+                ))
+            ))
+        ));
+        return jil.Block (
+            id: jil.BlockId.from_index(1),
+            span: span,
+            statements: self.output.statement_array(statements$.ref()),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.return_terminator_kind(jil.ReturnTerminator (implicit_unit: false))
+            )
+        );
+    }
+
+    public jil.Operand runtime_return_operand(self, qid.TypeId main_result_type, token.Span span) {
+        if (main_result_type.to_index() != self.ctx.store.types.unit_type().to_index()) {
+            return jil.copy_operand_value(jil.CopyOperand (
+                place: self.runtime_place(jil.LocalId.from_index(1))
+            ));
+        }
+        return jil.const_operand_value(jil.Const (
+            type_id: self.ctx.store.types.int_type(),
+            span: span,
+            value: jil.int_const_kind(jil.IntConst (bits: 0, signed_value: true))
+        ));
+    }
+
+    public jil.Place runtime_place(self, jil.LocalId local_id) {
+        return jil.local_place(local_id, self.output.empty_projection());
+    }
+
+}

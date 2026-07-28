@@ -93,7 +93,7 @@ src/jil.jiang             JIL 阶段稳定入口
 src/jil/model.jiang       数据模型入口
 src/jil/model/            ID、Place、Value、CFG、Program、Store
 src/jil/lower.jiang       Semantic Model -> JIL lowering 入口
-src/jil/lower/            package lowering 与共享 support
+src/jil/lower/            package 入口、body lowering、阶段内模型与共享 support
 src/jil/analysis.jiang    dataflow analysis 入口
 src/jil/analysis/         provenance 与参数属性证明
 src/jil/optimize.jiang    优化编排入口
@@ -102,6 +102,19 @@ src/jil/optimize/         安全尾递归等具体 transform
 
 `jil.jiang` 和各同名入口文件只提供稳定模块边界；模型、lowering、analysis 和 transform
 不再堆在单个入口文件中。
+
+`lower/package.jiang` 只保留 package 到 `jil.Store` 的调度入口。函数体 lowering
+不放进入口文件；lowering 期间使用、但不会进入稳定 JIL 的缓存键和临时结果放在
+`lower/model.jiang`。package 与函数体 lowering 共用的阶段状态放在
+`lower/context.Context`；单个函数体使用 `lower/body.BodyLowerer`。函数、入口、local、
+coroutine、expression、control-flow、pattern、call、place、constant、closure、ownership、
+trait object、aggregate、task、suspend 和 intrinsic 按职责拆分。
+
+这些文件可以在 `jil/lower` 内通过 `public extend BodyLowerer` 或
+`public extend lower_context.Context` 组织同一阶段状态，但阶段外只导入
+`jil/lower.jiang`。`lower/package.jiang` 只重导出 package-level 实现模块，
+`ownership.jiang` 和 `task.jiang` 只重导出各自的内部职责模块；这种重导出是阶段内
+可见性边界，不构成稳定 API，也不允许各文件复制一份独立 lowering 状态。
 
 第一版 JIL 使用非 SSA 的 local + assignment 形式：
 

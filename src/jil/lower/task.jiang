@@ -1,0 +1,1926 @@
+// Task、async call frame 和任务状态 lowering。
+//
+// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
+import typeck_store = "../../sema/type_check/store.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import coroutine_task_abi = "../coroutine/task_abi.jiang";
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import control_flow = "./control_flow.jiang";
+import ownership = "./ownership.jiang";
+import place = "./place.jiang";
+import closure = "./closure.jiang";
+import call = "./call.jiang";
+import suspend = "./suspend.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+public import intrinsic = "./intrinsic.jiang";
+
+public extend body_context.BodyLowerer {
+    public () lower_async_call_task(self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(node_id);
+        guard self.async_call_frame_layout(node_id, call) is .some(layout) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.async_call_target_def(call) is .some(target_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
+        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        guard self.async_call_target_function(target_def, type_args, const_args) is .some(function) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        if (function.is_external) {
+            self.lower_external_async_task(
+                node_id, call, target_def, type_args, const_args, layout$.ref(), destination, span
+            );
+            return;
+        }
+        jil.LocalId task_local = self.ensure_task_place_identity(destination, span);
+        jil.TaskStoragePlan storage! = self.task_local_storage(
+            .local, self.task_sync_mode(layout$.ref())
+        );
+        if (self.task_destination_is_owned(destination)) {
+            storage = self.escaping_task_storage();
+        }
+        guard self.async_call_resume_function_ref(
+                node_id, call, layout$.ref()
+            ) is .some(resume_function)
+        else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.push_task_region_start(destination, task_local, storage, resume_function, span);
+        jil.Place frame_place = self.initialize_task_frame_storage(
+            layout$.ref(), task_local, storage, span
+        );
+        self.initialize_structured_task_state(destination, layout$.ref(), task_local, storage, span);
+        self.lower_async_call_args_into_frame(call, layout$.ref(), frame_place);
+        guard self.async_call_completion_function_ref(
+                node_id, call, layout$.ref(), storage.sync
+            ) is .some(completion_function)
+        else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        jil.Statement[]& initializers = coroutine_task_abi.initialized_task_initializers(
+            self.lowerer.output,
+            layout$.ref(),
+            destination,
+            frame_place,
+            resume_function,
+            completion_function,
+            span
+        );
+        Int index! = 0;
+        while (index < initializers.length) {
+            self.statements.add(initializers[index]);
+            index = index + 1;
+        }
+        self.push_task_lifetime_initializers(destination, layout$.ref(), storage, span);
+        self.push_structured_task_frame_domain(
+            layout$.ref(), frame_place, storage, span
+        );
+        self.push_task_execution_domain_initializers(
+            layout$.ref(), destination, frame_place, span
+        );
+        self.lower_task_resume_call(
+            destination, resume_function, self.async_start_kind(node_id), span
+        );
+    }
+
+    public () lower_external_async_task(
+        self,
+        sem.NodeId node_id,
+        sem.ImplicitCall call,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        token.Span span
+    ) {
+        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
+        jil.TaskStoragePlan storage! = self.task_local_storage(
+            .external, .concurrent
+        );
+        if (self.task_destination_is_owned(task_place)) {
+            storage = jil.TaskStoragePlan (
+                allocation: .heap,
+                frame: .heap,
+                sync: .concurrent,
+                reclaim: .parent
+            );
+        }
+        self.push_task_region_start(task_place, task_local, storage, null, span);
+        self.initialize_structured_task_state(task_place, layout, task_local, storage, span);
+        jil.Place frame_pointer = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, layout.task_abi.frame_field
+        );
+        self.push_assign(
+            frame_pointer,
+            jil.use_rvalue(jil.UseRvalue (
+                value: self.null_operand(self.jil_place_type(frame_pointer), span)
+            )),
+            span
+        );
+        jil.Statement[]& state_initializers = coroutine_task_abi.external_task_state_initializers(
+            self.lowerer.output, layout, task_place, span
+        );
+        Int state_index! = 0;
+        while (state_index < state_initializers.length) {
+            self.statements.add(state_initializers[state_index]);
+            state_index = state_index + 1;
+        }
+        self.push_task_lifetime_initializers(task_place, layout, storage, span);
+        jil.ExternalContinuationLayout continuation_layout =
+            self.lowerer.external_async_continuation_layout(
+                layout.task_abi.result_type_id, span
+            );
+        jil.Place continuation_place = self.initialize_external_task_continuation_storage(
+            layout, continuation_layout, task_place, task_local, storage, span
+        );
+        self.initialize_external_task_continuation(
+            node_id,
+            call,
+            layout,
+            task_place,
+            continuation_layout,
+            continuation_place,
+            span
+        );
+        jil.LocalId continuation_pointer = self.add_temp(
+            continuation_layout.pointer_type_id,
+            span
+        );
+        self.push_assign(
+            self.place_for_local(continuation_pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(call.args.length + 1);
+        Int index! = 0;
+        while (index < call.args.length) {
+            args.add(self.lower_to_operand(call.args[index]));
+            index = index + 1;
+        }
+        args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        jil.Operand[]& abi_args = self.lowerer.output.operand_array(args$.ref());
+        self.lower_external_async_start_call(
+            target_def,
+            type_args,
+            const_args,
+            abi_args,
+            self.async_start_kind(node_id),
+            span
+        );
+    }
+
+    public jil.Place initialize_external_task_continuation_storage(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.ExternalContinuationLayout continuation_layout,
+        jil.Place task_place,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        if (storage.frame != .heap) {
+            jil.LocalId continuation_local = self.add_coroutine_capture_temp(
+                continuation_layout.type_id,
+                span,
+                task_local,
+                .task_external_continuation
+            );
+            return self.place_for_local(continuation_local);
+        }
+        jil.LocalId pointer_local = self.add_temp(
+            continuation_layout.pointer_type_id, span
+        );
+        jil.Place pointer_place = self.place_for_local(pointer_local);
+        self.push_assign(
+            pointer_place,
+            jil.alloc_box_rvalue(jil.AllocBoxRvalue (
+                value_type: continuation_layout.type_id
+            )),
+            span
+        );
+        jil.Place frame = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, layout.task_abi.frame_field
+        );
+        self.push_assign(
+            frame,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_ptr,
+                value: self.operand_for_place(pointer_place),
+                target_type: self.jil_place_type(frame)
+            )),
+            span
+        );
+        return self.project_deref(pointer_place, true);
+    }
+
+    public () initialize_external_task_continuation(
+        self,
+        sem.NodeId node_id,
+        sem.ImplicitCall call,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task_place,
+        jil.ExternalContinuationLayout continuation_layout,
+        jil.Place continuation_place,
+        token.Span span
+    ) {
+        jil.Rvalue context = jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+            place: coroutine_task_abi.task_state_storage_place(self.lowerer.output, task_place),
+            frame_root: false
+        ));
+        jil.Operand resume = jil.function_operand_value(
+            self.async_call_completion_function_ref(
+                node_id, call, layout, .concurrent
+            )$.some()
+        );
+        self.initialize_external_async_continuation(
+            continuation_layout,
+            continuation_place,
+            coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, layout.task_abi.result_field
+            ),
+            jil.use_rvalue(jil.UseRvalue (
+                value: self.operand_for_place(coroutine_task_abi.task_field_place(
+                    self.lowerer.output,
+                    task_place,
+                    layout.task_abi.execution_executor_field
+                ))
+            )),
+            context,
+            resume,
+            span
+        );
+    }
+
+    public () initialize_external_async_continuation(
+        self,
+        jil.ExternalContinuationLayout layout,
+        jil.Place continuation_place,
+        jil.Place result_place,
+        jil.Rvalue executor,
+        jil.Rvalue context,
+        jil.Operand resume,
+        token.Span span
+    ) {
+        self.push_assign(
+            self.project_constant_index(continuation_place, layout.result_field_index),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: result_place,
+                frame_root: false
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, layout.context_field_index),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, layout.resume_field_index),
+            jil.scheduled_continuation_resume_rvalue(jil.ScheduledContinuationResumeRvalue()),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, layout.executor_field_index),
+            executor,
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, layout.target_context_field_index),
+            context,
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(continuation_place, layout.target_resume_field_index),
+            jil.use_rvalue(jil.UseRvalue (value: resume)),
+            span
+        );
+        jil.Place cancellation_context = self.project_constant_index(
+            continuation_place, layout.cancellation_context_field_index
+        );
+        jil.Rvalue cancellation_value! = jil.use_rvalue(jil.UseRvalue (
+            value: self.null_operand(self.jil_place_type(cancellation_context), span)
+        ));
+        if (self.current_effects.has_async) {
+            cancellation_value = jil.current_task_rvalue(jil.CurrentTaskRvalue (
+                observed: false,
+                cancellation_context: true
+            ));
+        }
+        self.push_assign(cancellation_context, cancellation_value, span);
+    }
+
+    public () lower_external_async_start_call(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.Operand[]& args,
+        jil.AsyncStartKind? async_start,
+        token.Span span
+    ) {
+        qid.TypeId source_type = self.function_type_for_ref(target_def, type_args, const_args);
+        jil.LocalId unit_result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        jil.BlockId next_block = self.reserve_block(span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.direct_function_callee(jil.FunctionRef (
+                function_def: target_def,
+                type_args: self.lowerer.output.type_arg_array(type_args),
+                const_args: self.lowerer.output.const_arg_array(const_args),
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: self.lowerer.external_async_abi_function_type(source_type, span),
+                span: span
+            )),
+            args: args,
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            async_start: async_start,
+            destination: self.place_for_local(unit_result),
+            target: next_block,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next_block);
+    }
+
+    public jil.FunctionRef? async_call_completion_function_ref(
+        self,
+        sem.NodeId node_id,
+        sem.ImplicitCall call,
+        jil.CoroutineFrameLayout& layout,
+        jil.TaskSyncMode sync
+    ) {
+        guard self.async_call_target_def(call) is .some(target_def) else { return null; }
+        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
+        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        return self.task_completion_function_ref(
+            target_def,
+            type_args,
+            const_args,
+            layout,
+            sync,
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    public jil.FunctionRef? async_call_resume_function_ref(
+        self,
+        sem.NodeId node_id,
+        sem.ImplicitCall call,
+        jil.CoroutineFrameLayout& layout
+    ) {
+        guard self.async_call_target_def(call) is .some(target_def) else {
+            return null;
+        }
+        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
+        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        return jil.FunctionRef (
+            function_def: target_def,
+            type_args: self.lowerer.output.type_arg_array(type_args),
+            const_args: self.lowerer.output.const_arg_array(const_args),
+            coroutine_resume: true,
+            coroutine_completion: false,
+            type_id: layout.task_abi.resume_function_type_id,
+            span: self.lowerer.model_span(node_id)
+        );
+    }
+
+    public () lower_await_task_expr(self, sem.NodeId value, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(value);
+        jil.Place task_place! = self.task_receiver_place(value);
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
+        jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
+        self.statements.add(jil.Statement (
+            span: span,
+            kind: jil.task_consume_statement_kind(jil.TaskConsumeStatement (
+                task: task_place,
+                task_local: task_local,
+                user_visible: true,
+                site: value.local_index,
+                repeatable: self.loop_targets.len() > 0
+            ))
+        ));
+        if (self.task_place_requires_stable_address(task_place)) {
+            task_place = self.stable_task_place(task_place, storage, span);
+        }
+        self.lower_await_task_ready(task_place, span);
+        self.branch_await_task_result(task_place, task_state, span);
+        self.push_assign(destination, jil.use_rvalue(jil.UseRvalue (
+            value: self.operand_for_place(coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, task_state.result
+            ))
+        )), span);
+        self.release_consumed_task(task_place, true, span);
+    }
+
+    // await may resume in a later invocation. Preserve the resolved Task address instead of
+    // re-evaluating projections whose index temporaries live in the previous stack invocation.
+    public jil.Place stable_task_place(
+        self,
+        jil.Place task_place,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
+        if (self.task_owner_pointer_place(task_place) is .some(owner)) {
+            return self.stable_owned_task_place(owner, task_local, storage, span);
+        }
+        qid.TypeId pointer_type = self.raw_pointer_type(self.jil_place_type(task_place), span);
+        jil.LocalId pointer = self.add_temp(pointer_type, span);
+        self.push_assign(
+            self.place_for_local(pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: task_place,
+                frame_root: false
+            )),
+            span
+        );
+        jil.Place stable = self.project_deref(self.place_for_local(pointer), true);
+        self.bind_task_place_identity(stable, task_local);
+        self.set_task_storage_plan(task_local, storage);
+        return stable;
+    }
+
+    public jil.Place stable_owned_task_place(
+        self,
+        jil.Place owner,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        jil.LocalId pointer = self.add_temp(self.jil_place_type(owner), span);
+        self.push_assign(
+            self.place_for_local(pointer),
+            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(owner))),
+            span
+        );
+        jil.Place stable = self.project_deref(self.place_for_local(pointer), false);
+        self.bind_task_place_identity(stable, task_local);
+        self.set_task_storage_plan(task_local, storage);
+        return stable;
+    }
+
+    public jil.Place? task_owner_pointer_place(self, jil.Place task_place) {
+        Int count = task_place.projection.length;
+        if (count == 0) { return null; }
+        guard task_place.projection[count - 1] is .deref_projection(deref) else { return null; }
+        if (deref.raw_pointer) { return null; }
+        list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(count - 1);
+        Int index! = 0;
+        while (index + 1 < count) {
+            projection.add(task_place.projection[index]);
+            index = index + 1;
+        }
+        return self.place_with_projection(task_place, projection$.ref());
+    }
+
+    public Bool task_place_requires_stable_address(self, jil.Place task_place) {
+        Int index! = 0;
+        while (index < task_place.projection.length) {
+            if (task_place.projection[index] is .index_projection(_)) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    // completion state 3 表示子任务因取消结束，没有可读取的 T。
+    // await 必须消费 Task storage 后转入当前协程的取消清理。
+    public () branch_await_task_result(
+        self,
+        jil.Place task_place,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        jil.Place state_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, task_state.state
+        );
+        jil.Rvalue state_value! = jil.use_rvalue(jil.UseRvalue(
+            value: self.operand_for_place(state_place)
+        ));
+        if (self.task_storage_plan(task_place).sync == .concurrent) {
+            state_value = jil.atomic_load_rvalue(jil.AtomicLoadRvalue(
+                place: state_place,
+                mode: .coroutine_atomic
+            ));
+        }
+        jil.LocalId state_local = self.add_temp(self.jil_place_type(state_place), span);
+        self.push_assign(self.place_for_local(state_local), state_value, span);
+        jil.BlockId cancelled_block = self.reserve_block(span);
+        jil.BlockId result_block = self.reserve_block(span);
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(1);
+        cases.add(jil.SwitchCase(value: self.int_const(3, span), target: cancelled_block));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator(
+            discriminator: self.operand_for_place(self.place_for_local(state_local)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: result_block
+        )), span);
+        self.start_block(cancelled_block);
+        self.release_consumed_task(task_place, false, span);
+        self.finish_block(self.goto_terminator(self.cancellation_entry), span);
+        self.start_block(result_block);
+    }
+
+    public () lower_cancel_task_expr(self, sem.NodeId value, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(value);
+        jil.Place task_place! = self.task_receiver_place(value);
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+        self.request_task_cancellation(task_place, task_state, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+    }
+
+    public () lower_cancel_await_task_expr(self, sem.NodeId value, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(value);
+        jil.Place task_place! = self.task_receiver_place(value);
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
+        jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
+        self.statements.add(jil.Statement (
+            span: span,
+            kind: jil.task_consume_statement_kind(jil.TaskConsumeStatement (
+                task: task_place,
+                task_local: task_local,
+                user_visible: true,
+                site: value.local_index,
+                repeatable: self.loop_targets.len() > 0
+            ))
+        ));
+        if (self.task_place_requires_stable_address(task_place)) {
+            task_place = self.stable_task_place(task_place, storage, span);
+        }
+        self.request_task_cancellation(task_place, task_state, span);
+        self.lower_await_task_ready(task_place, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+        self.release_consumed_task(task_place, false, span);
+    }
+
+    public jil.Place task_receiver_place(self, sem.NodeId value) {
+        jil.Place place = self.pointer_base_place(value);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.jil_place_type(place));
+        if (info.data is .task_type(_)) { return place; }
+        guard info.data is .handle_type(handle) else { return place; }
+        if (handle.kind != .owner_pointer) { return place; }
+        return self.project_deref(place, false);
+    }
+
+    public () lower_sync_block(
+        self,
+        sem.NodeId node_id,
+        sem.NodeId async_block,
+        jil.Place destination
+    ) {
+        if (!self.current_effects.has_async) {
+            self.lower_await_task_expr(async_block, destination);
+            return;
+        }
+        qid.DefId function_def = async_block.owner_def;
+        guard self.lowerer.typeck.lambda_capture_infos(function_def) is .some(captures) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.lowerer.output.function_id_for_def(function_def) is .some(function_id) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        jil.Function function = self.lowerer.output.function(function_id);
+        guard function.coroutine_frame is .some(layout) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.LocalId frame_local = self.add_temp(layout.frame_type_id, span);
+        jil.Place frame_place = self.place_for_local(frame_local);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.async_block_env_operand(
+            async_block,
+            captures,
+            null,
+            function$.ref(),
+            layout$.ref(),
+            frame_place,
+            span
+        ));
+        self.lower_async_direct_continuation_call(
+            function_def,
+            self.lowerer.output.empty_type_args(),
+            self.lowerer.output.empty_const_args(),
+            self.lowerer.output.operand_array(args$.ref()),
+            destination,
+            function$.ref(),
+            layout$.ref(),
+            frame_place,
+            span
+        );
+    }
+
+    public () release_consumed_task(
+        self,
+        jil.Place task_place,
+        Bool result_consumed,
+        token.Span span
+    ) {
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+        jil.Place task_pointer = self.task_state_pointer(task_place, task_state, span);
+        self.statements.add(jil.Statement (
+            span: span,
+            kind: jil.task_release_statement_kind(jil.TaskReleaseStatement (
+                task_pointer: task_pointer,
+                task_local: self.task_identity_for_place(task_place),
+                frame: coroutine_task_abi.task_field_place(
+                    self.lowerer.output, task_place, task_state.frame
+                ),
+                state: coroutine_task_abi.task_field_place(
+                    self.lowerer.output, task_place, task_state.state
+                ),
+                result: coroutine_task_abi.task_field_place(
+                    self.lowerer.output, task_place, task_state.result
+                ),
+                result_drop: self.task_result_drop_function(task_state, span),
+                result_consumed: result_consumed,
+                storage: self.task_storage_plan(task_place)
+            ))
+        ));
+        self.push_assign(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, task_state.state
+            ),
+            jil.use_rvalue(jil.UseRvalue (value: self.int_operand(-1, span))),
+            span
+        );
+    }
+
+    public jil.TaskStoragePlan parent_owned_task_storage(
+        self,
+        jil.TaskFrameStorage frame,
+        jil.TaskSyncMode sync
+    ) {
+        return jil.TaskStoragePlan (
+            allocation: .local,
+            frame: frame,
+            sync: sync,
+            reclaim: .parent
+        );
+    }
+
+    public jil.TaskStoragePlan task_local_storage(
+        self,
+        jil.TaskFrameStorage frame,
+        jil.TaskSyncMode sync
+    ) {
+        return self.parent_owned_task_storage(frame, sync);
+    }
+
+    public jil.TaskStoragePlan escaping_task_storage(self) {
+        return jil.TaskStoragePlan (
+            allocation: .heap,
+            frame: .heap,
+            sync: .concurrent,
+            reclaim: .parent
+        );
+    }
+
+    public Bool task_destination_is_owned(self, jil.Place destination) {
+        return self.task_owner_pointer_place(destination) != null;
+    }
+
+    public jil.Place initialize_task_frame_storage(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        if (storage.frame != .heap) {
+            jil.LocalId frame_local = self.add_coroutine_capture_temp(
+                layout.frame_type_id, span, task_local, .task_frame
+            );
+            return self.place_for_local(frame_local);
+        }
+        qid.TypeId pointer_type = self.raw_pointer_type(layout.frame_type_id, span);
+        jil.LocalId pointer_local = self.add_temp(pointer_type, span);
+        jil.Place pointer_place = self.place_for_local(pointer_local);
+        self.push_assign(
+            pointer_place,
+            jil.alloc_box_rvalue(jil.AllocBoxRvalue (value_type: layout.frame_type_id)),
+            span
+        );
+        return self.project_deref(pointer_place, true);
+    }
+
+    public jil.TaskSyncMode task_sync_mode(self, jil.CoroutineFrameLayout& child) {
+        if (!self.current_effects.has_async) {
+            return .concurrent;
+        }
+        guard self.current_effects.domain is .some(current_domain) else {
+            return .concurrent;
+        }
+        if (child.effects.domain is .some(_)) {
+            if (child.domain_kind != 0) { return .concurrent; }
+            if (!types.effect_domain_equal(self.current_effects.domain, child.effects.domain)) {
+                return .concurrent;
+            }
+            return .local_serial;
+        }
+        if (self.lowerer.domain_kind_for_type(current_domain.domain_type) != 0) {
+            return .concurrent;
+        }
+        return .local_serial;
+    }
+
+    public () push_task_region_start(
+        self,
+        jil.Place task_place,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
+        jil.FunctionRef? child_resume,
+        token.Span span
+    ) {
+        self.set_task_storage_plan(task_local, storage);
+        self.statements.add(jil.Statement (
+            span: span,
+            kind: jil.task_region_start_statement_kind(jil.TaskRegionStartStatement (
+                task: task_place,
+                task_local: task_local,
+                storage: storage,
+                child_resume: child_resume
+            ))
+        ));
+    }
+
+    public () set_task_storage_plan(
+        self,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage
+    ) {
+        self.task_storage_plans.set(task_local.to_index(), storage);
+    }
+
+    public jil.TaskStoragePlan task_storage_plan(self, jil.Place task_place) {
+        if (self.task_identity_for_place(task_place) is .some(task_local)) {
+            if (table.hash_table_get_value<Int, jil.TaskStoragePlan>(
+                    self.task_storage_plans$.ref(), task_local.to_index()
+                ) is .some(storage)
+            ) {
+                return storage;
+            }
+        }
+        return jil.TaskStoragePlan (
+            allocation: .heap,
+            frame: .heap,
+            sync: .concurrent,
+            reclaim: .parent
+        );
+    }
+
+    public jil.LocalId ensure_task_place_identity(
+        self,
+        jil.Place task_place,
+        token.Span span
+    ) {
+        if (self.task_identity_for_place(task_place) is .some(existing)) {
+            return existing;
+        }
+        jil.LocalId identity!;
+        if (task_place.projection.length == 0 && jil.place_local_id(task_place) is .some(local_id)) {
+            identity = local_id;
+        } else {
+            identity = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        }
+        self.task_place_bindings.add(TaskPlaceBinding(place: task_place, identity: identity));
+        return identity;
+    }
+
+    public () bind_task_place_identity(self, jil.Place task_place, jil.LocalId identity) {
+        if (self.task_identity_for_place(task_place) != null) { return; }
+        self.task_place_bindings.add(TaskPlaceBinding(place: task_place, identity: identity));
+    }
+
+    public jil.LocalId? task_identity_for_place(self, jil.Place task_place) {
+        Int index! = 0;
+        while (index < self.task_place_bindings.len()) {
+            TaskPlaceBinding binding = self.task_place_bindings.get(index);
+            if (self.task_places_equal(binding.place, task_place)) { return binding.identity; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Bool task_places_equal(self, jil.Place lhs, jil.Place rhs) {
+        if (!self.task_place_bases_equal(lhs.base, rhs.base)) { return false; }
+        if (lhs.projection.length != rhs.projection.length) { return false; }
+        Int index! = 0;
+        while (index < lhs.projection.length) {
+            if (!self.task_place_elems_equal(lhs.projection[index], rhs.projection[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    public Bool task_place_bases_equal(self, jil.PlaceBase lhs, jil.PlaceBase rhs) {
+        if (lhs is .local(left)) {
+            if (rhs is .local(right)) { return left == right; }
+            return false;
+        }
+        guard lhs is .global(left) else { return false; }
+        guard rhs is .global(right) else { return false; }
+        return left.global_def == right.global_def;
+    }
+
+    public Bool task_place_elems_equal(self, jil.PlaceElem lhs, jil.PlaceElem rhs) {
+        if (lhs is .deref_projection(left)) {
+            if (rhs is .deref_projection(right)) { return left.raw_pointer == right.raw_pointer; }
+            return false;
+        }
+        if (lhs is .field_projection(left)) {
+            if (rhs is .field_projection(right)) {
+                return left.field_def == right.field_def && left.field_index == right.field_index;
+            }
+            return false;
+        }
+        if (lhs is .frame_field_projection(left)) {
+            if (rhs is .frame_field_projection(right)) { return left.field_index == right.field_index; }
+            return false;
+        }
+        if (lhs is .index_projection(left)) {
+            if (rhs is .index_projection(right)) { return left.index_local == right.index_local; }
+            return false;
+        }
+        if (lhs is .constant_index_projection(left)) {
+            if (rhs is .constant_index_projection(right)) { return left.offset == right.offset; }
+            return false;
+        }
+        if (lhs is .subslice_projection(left)) {
+            if (rhs is .subslice_projection(right)) {
+                return left.from == right.from && left.to == right.to;
+            }
+        }
+        return false;
+    }
+
+    public jil.Place initialize_local_task_state(
+        self,
+        jil.Place task_place,
+        jil.CoroutineFrameLayout& layout,
+        jil.LocalId task_local,
+        token.Span span
+    ) {
+        return coroutine_task_abi.task_state_storage_place(self.lowerer.output, task_place);
+    }
+
+    public () initialize_structured_task_state(
+        self,
+        jil.Place task_place,
+        jil.CoroutineFrameLayout& layout,
+        jil.LocalId task_local,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        self.initialize_local_task_state(task_place, layout, task_local, span);
+    }
+
+    public () lower_task_resume_call(
+        self,
+        jil.Place task_place,
+        jil.FunctionRef? known_resume,
+        jil.AsyncStartKind? async_start,
+        token.Span span
+    ) {
+        qid.TypeId task_type = self.jil_place_type(task_place);
+        guard self.lowerer.ctx.store.types.get(task_type).data is .task_type(task_info) else {
+            return;
+        }
+        jil.TaskStateLayout task_state = self.task_state_layout_for_result(task_info.result);
+        jil.LocalId resume_return = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        jil.Place frame_pointer_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, task_state.frame
+        );
+        jil.Place resume_function_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, task_state.resume_function
+        );
+        jil.Place executor_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, task_state.execution_executor
+        );
+        jil.Place task_pointer_place = self.task_state_pointer(task_place, task_state, span);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(0);
+        args.add(jil.copy_operand_value(jil.CopyOperand (place: frame_pointer_place)));
+        jil.BlockId next_block = self.reserve_block(span);
+        jil.Operand resume_operand = self.operand_for_place(resume_function_place);
+        jil.CallCallee callee! = jil.dynamic_task_enqueue_callee(
+            self.operand_for_place(executor_place),
+            self.operand_for_place(task_pointer_place),
+            resume_operand,
+            false
+        );
+        jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
+        if (storage.sync == .local_serial && known_resume is .some(resume_function)) {
+            self.initialize_running_local_task(task_place, task_state, executor_place, span);
+            callee = jil.direct_function_callee(resume_function);
+        }
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: callee,
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            suspend_child: known_resume,
+            async_start: async_start,
+            destination: self.place_for_local(resume_return),
+            target: next_block,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next_block);
+    }
+
+    public () initialize_running_local_task(
+        self,
+        jil.Place task_place,
+        jil.TaskStateLayout task_state,
+        jil.Place executor_place,
+        token.Span span
+    ) {
+        self.push_assign(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, task_state.schedule_state
+            ),
+            jil.use_rvalue(jil.UseRvalue (
+                value: jil.const_operand_value(self.int_const(2, span))
+            )),
+            span
+        );
+        self.push_assign(
+            coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, task_state.schedule_active_executor
+            ),
+            jil.use_rvalue(jil.UseRvalue (
+                value: self.operand_for_place(executor_place)
+            )),
+            span
+        );
+    }
+
+    public jil.AsyncStartKind? async_start_kind(self, sem.NodeId node_id) {
+        guard self.lowerer.typeck.async_start_usage(node_id) is .some(usage) else { return null; }
+        if (usage == typeck_store.AsyncStartUsage.detached) {
+            return jil.AsyncStartKind.detached;
+        }
+        return jil.AsyncStartKind.observed_task;
+    }
+
+    public Int domain_kind_for_def(self, qid.DefId domain_def) {
+        return self.lowerer.domain_kind_for_def(domain_def);
+    }
+
+    public jil.TaskStateLayout task_state_layout_for_task(self, jil.Place task_place) {
+        qid.TypeId task_type = self.jil_place_type(task_place);
+        guard self.lowerer.ctx.store.types.get(task_type).data is .task_type(task) else {
+            return self.task_state_layout_for_result(self.lowerer.ctx.store.types.invalid_type());
+        }
+        return self.task_state_layout_for_result(task.result);
+    }
+
+    public jil.TaskStateLayout task_state_layout_for_result(self, qid.TypeId result_type) {
+        return self.lowerer.create_task_state_layout(
+            self.model_def.def_id, result_type, token.Span()
+        );
+    }
+
+    public jil.FunctionRef task_result_drop_function(
+        self,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        qid.TypeId result_type = task_state.result.type_id;
+        qid.DefId drop_def = self.ensure_lambda_env_drop_shim_at_span(
+            result_type, false, span
+        );
+        return jil.FunctionRef (
+            function_def: drop_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_drop_env_type(span),
+            span: span
+        );
+    }
+
+    public jil.FunctionRef task_cleanup_function(
+        self,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        qid.DefId cleanup_def = self.ensure_task_cleanup_shim(task_state, span);
+        return jil.FunctionRef (
+            function_def: cleanup_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_drop_env_type(span),
+            span: span
+        );
+    }
+
+    public qid.DefId ensure_task_cleanup_shim(
+        self,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        Int key = task_state.result.type_id.to_index();
+        if (table.hash_table_get_value<Int, qid.DefId>(
+                self.lowerer.task_cleanup_shims$.ref(), key
+            ) is .some(existing)
+        ) {
+            return existing;
+        }
+        std.String name = build_text_int("__task_cleanup_", key);
+        qid.DefId cleanup_def = self.create_closure_drop_shim_def(name.bytes(), span);
+        self.lowerer.task_cleanup_shims.set(key, cleanup_def);
+        self.add_task_cleanup_shim_function(cleanup_def, task_state, span);
+        return cleanup_def;
+    }
+
+    public () add_task_cleanup_shim_function(
+        self,
+        qid.DefId cleanup_def,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        jil.FunctionRef result_drop = self.task_result_drop_function(task_state, span);
+        Int function_index = self.lowerer.output.functions.len();
+        qid.TypeId state_pointer_type = self.raw_pointer_type(task_state.type_id, span);
+        list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(3);
+        locals.add(self.receiver_drop_local(
+            0, .return_place, self.lowerer.ctx.store.types.unit_type(), span
+        ));
+        locals.add(self.receiver_drop_local(1, .param, self.closure_env_type(span), span));
+        locals.add(self.receiver_drop_local(2, .compiler_temp, state_pointer_type, span));
+        jil.Place state_pointer = jil.local_place(
+            jil.LocalId.from_index(2), self.lowerer.output.empty_projection()
+        );
+        jil.Place state = self.project_deref(state_pointer, true);
+        list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(2);
+        statements.add(self.task_cleanup_pointer_assign(state_pointer_type, span));
+        statements.add(jil.Statement (
+            span: span,
+            kind: jil.task_release_statement_kind(jil.TaskReleaseStatement (
+                task_pointer: state_pointer,
+                frame: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.output, state, task_state.frame
+                ),
+                state: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.output, state, task_state.state
+                ),
+                result: coroutine_task_abi.task_state_field_place(
+                    self.lowerer.output, state, task_state.result
+                ),
+                result_drop: result_drop,
+                result_consumed: false,
+                storage: jil.TaskStoragePlan (
+                    allocation: .heap,
+                    frame: .heap,
+                    sync: .concurrent,
+                    reclaim: .self_owned
+                )
+            ))
+        ));
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(1);
+        blocks.add(jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements$.ref()),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.return_terminator_kind(jil.ReturnTerminator (implicit_unit: true))
+            )
+        ));
+        self.add_closure_drop_shim_function(
+            cleanup_def, function_index, locals$.ref(), blocks$.ref(), span
+        );
+    }
+
+    public jil.Statement task_cleanup_pointer_assign(
+        self,
+        qid.TypeId state_pointer_type,
+        token.Span span
+    ) {
+        return jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: jil.local_place(
+                    jil.LocalId.from_index(2), self.lowerer.output.empty_projection()
+                ),
+                value: jil.cast_rvalue(jil.CastRvalue (
+                    kind: jil.CastKind.ptr_to_ptr,
+                    value: jil.copy_operand_value(jil.CopyOperand (
+                        place: self.receiver_drop_param_place()
+                    )),
+                    target_type: state_pointer_type
+                ))
+            ))
+        );
+    }
+
+    public () push_task_lifetime_initializers(
+        self,
+        jil.Place task_place,
+        jil.CoroutineFrameLayout& layout,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        jil.Statement[]& initializers! = coroutine_task_abi.inactive_lifetime_initializers(
+            self.lowerer.output, layout, task_place, span
+        );
+        if (storage.allocation == .heap) {
+            jil.FunctionRef cleanup = self.task_cleanup_function(
+                self.task_state_layout_for_task(task_place), span
+            );
+            initializers = coroutine_task_abi.lifetime_initializers(
+                self.lowerer.output, layout, task_place, cleanup, true, span
+            );
+        }
+        Int index! = 0;
+        while (index < initializers.length) {
+            self.statements.add(initializers[index]);
+            index = index + 1;
+        }
+    }
+
+    public () lower_await_task_ready(self, jil.Place task_place, token.Span span) {
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+        jil.TaskStoragePlan storage = self.task_storage_plan(task_place);
+        jil.BlockId check_block = self.reserve_block(span);
+        jil.BlockId ready_block = self.reserve_block(span);
+        jil.BlockId pending_block = self.reserve_block(span);
+        self.finish_block(self.goto_terminator(check_block), span);
+        self.start_block(check_block);
+        jil.Place state_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, task_state.state
+        );
+        jil.LocalId state_local = self.add_temp(self.jil_place_type(state_place), span);
+        jil.Rvalue state_value! = jil.use_rvalue(jil.UseRvalue (
+            value: self.operand_for_place(state_place)
+        ));
+        if (storage.sync == .concurrent) {
+            state_value = jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: state_place,
+                mode: .coroutine_atomic
+            ));
+        }
+        self.push_assign(
+            self.place_for_local(state_local),
+            state_value,
+            span
+        );
+        jil.Operand state_operand = self.operand_for_place(self.place_for_local(state_local));
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(2);
+        cases.add(jil.SwitchCase (value: self.int_const(1, span), target: ready_block));
+        cases.add(jil.SwitchCase (value: self.int_const(3, span), target: ready_block));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: state_operand,
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: pending_block
+        )), span);
+        self.start_block(pending_block);
+        if (self.current_effects.has_async) {
+            if (storage.sync == .local_serial) {
+                self.lower_serial_task_waiter_registration(
+                    task_place, state_place, ready_block, check_block, span
+                );
+                return;
+            }
+            self.lower_atomic_task_waiter_registration(task_place, ready_block, check_block, span);
+            return;
+        }
+        self.lower_blocking_task_waiter_registration(
+            task_place, state_place, ready_block, check_block, span
+        );
+    }
+
+    public () lower_atomic_task_waiter_registration(
+        self,
+        jil.Place task_place,
+        jil.BlockId ready_block,
+        jil.BlockId check_block,
+        token.Span span
+    ) {
+        jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
+        jil.LocalId waiter_word = self.initialize_task_waiter(
+            task_place, task_local, span
+        );
+        jil.LocalId registered = self.add_temp(
+            self.lowerer.ctx.store.types.bool_type(), span
+        );
+        self.push_assign(
+            self.place_for_local(registered),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: coroutine_task_abi.task_field_place(
+                    self.lowerer.output, task_place, task_state.state
+                ),
+                expected: jil.const_operand_value(self.int_const(0, span)),
+                desired: self.operand_for_place(self.place_for_local(waiter_word)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId suspend_block = self.reserve_block(span);
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(registered)),
+            then_target: suspend_block,
+            else_target: check_block
+        )), span);
+        self.start_block(suspend_block);
+        self.finish_block(jil.suspend_pending_terminator_kind(jil.SuspendPendingTerminator (
+            target: check_block,
+            suspend_wake: .task_child,
+            task_local: task_local
+        )), span);
+        self.start_block(ready_block);
+        self.clear_current_task_cancel_child(task_place, span);
+    }
+
+    public () lower_serial_task_waiter_registration(
+        self,
+        jil.Place task_place,
+        jil.Place state_place,
+        jil.BlockId ready_block,
+        jil.BlockId check_block,
+        token.Span span
+    ) {
+        jil.LocalId task_local = self.ensure_task_place_identity(task_place, span);
+        jil.LocalId waiter_word = self.initialize_task_waiter(
+            task_place, task_local, span
+        );
+        self.push_assign(
+            state_place,
+            jil.use_rvalue(jil.UseRvalue (
+                value: self.operand_for_place(self.place_for_local(waiter_word))
+            )),
+            span
+        );
+        self.finish_block(jil.suspend_pending_terminator_kind(jil.SuspendPendingTerminator (
+            target: check_block,
+            suspend_wake: .task_child,
+            task_local: task_local
+        )), span);
+        self.start_block(ready_block);
+        self.clear_current_task_cancel_child(task_place, span);
+    }
+
+    public jil.LocalId initialize_task_waiter(
+        self,
+        jil.Place task_place,
+        jil.LocalId task_local,
+        token.Span span
+    ) {
+        jil.TaskWaiterLayout waiter_layout = self.lowerer.task_waiter_layout(span);
+        jil.LocalId waiter_local = self.add_coroutine_capture_temp(
+            waiter_layout.type_id, span, task_local, .task_waiter
+        );
+        jil.Place waiter = self.place_for_local(waiter_local);
+        self.register_current_task_cancel_child(task_place, span);
+        self.push_assign(
+            self.project_constant_index(waiter, waiter_layout.context_field_index),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: self.place_for_local(self.return_local()),
+                frame_root: true
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(waiter, waiter_layout.resume_field_index),
+            jil.use_rvalue(jil.UseRvalue (
+                value: jil.function_operand_value(jil.FunctionRef (
+                    function_def: self.model_def.def_id,
+                    type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+                    const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+                    coroutine_resume: true,
+                    coroutine_completion: false,
+                    type_id: self.jil_place_type(
+                        self.project_constant_index(waiter, waiter_layout.resume_field_index)
+                    ),
+                    span: span
+                ))
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(waiter, waiter_layout.executor_field_index),
+            jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(waiter, waiter_layout.task_field_index),
+            jil.current_task_rvalue(jil.CurrentTaskRvalue (
+                observed: false,
+                cancellation_context: true
+            )),
+            span
+        );
+        jil.LocalId waiter_pointer = self.add_temp(waiter_layout.pointer_type_id, span);
+        self.push_assign(
+            self.place_for_local(waiter_pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: waiter,
+                frame_root: false
+            )),
+            span
+        );
+        jil.LocalId waiter_word = self.add_temp(self.lowerer.ctx.store.types.int_type(), span);
+        self.push_assign(
+            self.place_for_local(waiter_word),
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_int,
+                value: self.operand_for_place(self.place_for_local(waiter_pointer)),
+                target_type: self.lowerer.ctx.store.types.int_type()
+            )),
+            span
+        );
+        return waiter_word;
+    }
+
+    public () lower_blocking_task_waiter_registration(
+        self,
+        jil.Place task_place,
+        jil.Place state_place,
+        jil.BlockId ready_block,
+        jil.BlockId check_block,
+        token.Span span
+    ) {
+        qid.TypeId int_type = self.lowerer.ctx.store.types.int_type();
+        jil.LocalId acknowledged = self.add_temp(int_type, span);
+        self.push_assign(
+            self.place_for_local(acknowledged),
+            jil.use_rvalue(jil.UseRvalue (
+                value: jil.const_operand_value(self.int_const(0, span))
+            )),
+            span
+        );
+        qid.TypeId ack_pointer_type = self.lowerer.ctx.store.types.raw_pointer_type(int_type, span);
+        jil.LocalId ack_pointer = self.add_temp(ack_pointer_type, span);
+        self.push_assign(
+            self.place_for_local(ack_pointer),
+            jil.address_of_rvalue(jil.AddressOfRvalue (
+                mutable_pointer: true,
+                place: self.place_for_local(acknowledged)
+            )),
+            span
+        );
+        jil.LocalId ack_word = self.add_temp(int_type, span);
+        self.push_assign(
+            self.place_for_local(ack_word),
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_int,
+                value: self.operand_for_place(self.place_for_local(ack_pointer)),
+                target_type: int_type
+            )),
+            span
+        );
+        jil.LocalId tagged_word = self.add_temp(int_type, span);
+        self.push_assign(
+            self.place_for_local(tagged_word),
+            jil.binary_rvalue(jil.BinaryRvalue (
+                op: jil.BinaryOp.bit_or,
+                lhs: self.operand_for_place(self.place_for_local(ack_word)),
+                rhs: jil.const_operand_value(self.int_const(1, span))
+            )),
+            span
+        );
+        jil.LocalId registered = self.add_temp(
+            self.lowerer.ctx.store.types.bool_type(), span
+        );
+        self.push_assign(
+            self.place_for_local(registered),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: state_place,
+                expected: jil.const_operand_value(self.int_const(0, span)),
+                desired: self.operand_for_place(self.place_for_local(tagged_word)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId wait_block = self.reserve_block(span);
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(registered)),
+            then_target: wait_block,
+            else_target: check_block
+        )), span);
+        self.start_block(wait_block);
+        self.statements.add(jil.Statement (
+            span: span,
+            kind: jil.task_wait_statement_kind(jil.TaskWaitStatement (
+                state: state_place,
+                wake: false,
+                expected: self.operand_for_place(self.place_for_local(tagged_word))
+            ))
+        ));
+        jil.BlockId ack_check = self.reserve_block(span);
+        self.finish_block(self.goto_terminator(ack_check), span);
+        self.start_block(ack_check);
+        jil.LocalId ack_state = self.add_temp(int_type, span);
+        self.push_assign(
+            self.place_for_local(ack_state),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: self.place_for_local(acknowledged),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        list.ArrayList<jil.SwitchCase> ack_cases! = list.ArrayList<jil.SwitchCase>(1);
+        ack_cases.add(jil.SwitchCase (
+            value: self.int_const(1, span),
+            target: check_block
+        ));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(ack_state)),
+            cases: self.lowerer.output.switch_case_array(ack_cases$.ref()),
+            default_target: ack_check
+        )), span);
+        self.start_block(ready_block);
+        self.clear_current_task_cancel_child(task_place, span);
+    }
+
+    public () request_task_cancellation(
+        self,
+        jil.Place task_place,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        jil.Place state_pointer = self.task_state_pointer(task_place, task_state, span);
+        self.request_task_cancellation_pointer(state_pointer, task_state, span);
+    }
+
+    public () request_task_cancellation_pointer(
+        self,
+        jil.Place state_pointer,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        jil.LocalId pointer_local = self.add_temp(self.jil_place_type(state_pointer), span);
+        self.push_assign(
+            self.place_for_local(pointer_local),
+            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(state_pointer))),
+            span
+        );
+        jil.Place state = self.project_deref(self.place_for_local(pointer_local), true);
+        jil.Place request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, state, task_state.cancellation_requested
+        );
+        self.push_atomic_store(
+            request, jil.const_operand_value(self.int_const(1, span)), span
+        );
+        jil.Place target = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, state, task_state.cancel_target_word
+        );
+        jil.LocalId observed = self.add_temp(self.jil_place_type(target), span);
+        self.push_assign(
+            self.place_for_local(observed),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: target,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId enqueue = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(1);
+        cases.add(jil.SwitchCase (value: self.int_const(3, span), target: complete));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(observed)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: enqueue
+        )), span);
+        self.start_block(enqueue);
+        self.enqueue_task_cancellation(
+            state, self.place_for_local(pointer_local), task_state, span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public () enqueue_task_cancellation(
+        self,
+        jil.Place state,
+        jil.Place task_pointer,
+        jil.TaskStateLayout task_state,
+        token.Span span
+    ) {
+        jil.Place executor = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, state, task_state.execution_executor
+        );
+        jil.Place frame = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, state, task_state.frame
+        );
+        jil.Place resume = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, state, task_state.resume_function
+        );
+        jil.LocalId observed_executor = self.add_temp(self.jil_place_type(executor), span);
+        self.push_assign(
+            self.place_for_local(observed_executor),
+            jil.use_rvalue(jil.UseRvalue (value: self.operand_for_place(executor))),
+            span
+        );
+        jil.BlockId enqueue = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.branch_on_non_null_pointer(
+            self.place_for_local(observed_executor), enqueue, complete, span
+        );
+        self.start_block(enqueue);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.operand_for_place(frame));
+        jil.LocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.dynamic_task_enqueue_callee(
+                self.operand_for_place(self.place_for_local(observed_executor)),
+                self.operand_for_place(task_pointer),
+                self.operand_for_place(resume),
+                false
+            ),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(complete);
+    }
+
+    public () register_current_task_cancel_child(
+        self,
+        jil.Place child_task,
+        token.Span span
+    ) {
+        jil.BlockId register = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        jil.TaskStateLayout parent_state = self.current_task_state_layout();
+        jil.Place parent_pointer = self.current_task_cancellation_state_pointer(
+            parent_state, span
+        );
+        self.branch_on_non_null_pointer(parent_pointer, register, complete, span);
+        self.start_block(register);
+        jil.Place parent_value = self.project_deref(parent_pointer, true);
+        jil.Place target_word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, parent_value, parent_state.cancel_target_word
+        );
+        jil.Place child_word = self.task_cancel_target_word(child_task, target_word, span);
+        self.push_atomic_store(
+            target_word,
+            self.operand_for_place(child_word),
+            span
+        );
+        jil.Place parent_request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, parent_value, parent_state.cancellation_requested
+        );
+        jil.LocalId request = self.add_temp(self.jil_place_type(parent_request), span);
+        self.push_assign(
+            self.place_for_local(request),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: parent_request,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId propagate = self.reserve_block(span);
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(1);
+        cases.add(jil.SwitchCase (value: self.int_const(1, span), target: propagate));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(request)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: complete
+        )), span);
+        self.start_block(propagate);
+        self.request_task_cancellation(
+            child_task, self.task_state_layout_for_task(child_task), span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public () clear_current_task_cancel_child(
+        self,
+        jil.Place child_task,
+        token.Span span
+    ) {
+        if (!self.current_effects.has_async) { return; }
+        jil.BlockId prepare = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        jil.TaskStateLayout state = self.current_task_state_layout();
+        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        self.branch_on_non_null_pointer(pointer, prepare, complete, span);
+        self.start_block(prepare);
+        jil.Place parent = self.project_deref(pointer, true);
+        jil.Place target_word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, parent, state.cancel_target_word
+        );
+        jil.Place child_word = self.task_cancel_target_word(child_task, target_word, span);
+        jil.LocalId cleared = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(cleared),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: target_word,
+                expected: self.operand_for_place(child_word),
+                desired: jil.const_operand_value(self.int_const(0, span)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public jil.Place task_cancel_target_word(
+        self,
+        jil.Place task,
+        jil.Place target_word,
+        token.Span span
+    ) {
+        jil.LocalId encoded = self.add_temp(self.jil_place_type(target_word), span);
+        self.push_assign(
+            self.place_for_local(encoded),
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_int,
+                value: self.operand_for_place(self.task_state_pointer(
+                    task, self.task_state_layout_for_task(task), span
+                )),
+                target_type: self.jil_place_type(target_word)
+            )),
+            span
+        );
+        return self.place_for_local(encoded);
+    }
+
+    public jil.TaskStateLayout current_task_state_layout(self) {
+        qid.TypeId result = self.jil_place_type(self.place_for_local(self.return_local()));
+        return self.task_state_layout_for_result(result);
+    }
+
+    public jil.Place current_task_cancellation_state_pointer(
+        self,
+        jil.TaskStateLayout state,
+        token.Span span
+    ) {
+        qid.TypeId pointer_type = self.lowerer.ctx.store.types.raw_pointer_type(state.type_id, span);
+        jil.LocalId pointer = self.add_temp(pointer_type, span);
+        self.push_assign(
+            self.place_for_local(pointer),
+            jil.current_task_rvalue(jil.CurrentTaskRvalue (
+                observed: false,
+                cancellation_context: true
+            )),
+            span
+        );
+        return self.place_for_local(pointer);
+    }
+
+    public jil.Place task_state_pointer(
+        self,
+        jil.Place task_place,
+        jil.TaskStateLayout state,
+        token.Span span
+    ) {
+        qid.TypeId pointer_type = self.lowerer.ctx.store.types.raw_pointer_type(state.type_id, span);
+        jil.LocalId pointer = self.add_temp(pointer_type, span);
+        self.push_assign(
+            self.place_for_local(pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: coroutine_task_abi.task_state_storage_place(self.lowerer.output, task_place),
+                frame_root: false
+            )),
+            span
+        );
+        return self.place_for_local(pointer);
+    }
+
+    public () branch_on_task_present(
+        self,
+        jil.Place task_place,
+        jil.TaskStateLayout state,
+        jil.BlockId present,
+        jil.BlockId absent,
+        token.Span span
+    ) {
+        jil.Place state_place = coroutine_task_abi.task_field_place(
+            self.lowerer.output, task_place, state.state
+        );
+        jil.LocalId value = self.add_temp(self.jil_place_type(state_place), span);
+        self.push_assign(
+            self.place_for_local(value),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: state_place,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.LocalId is_present = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(is_present),
+            jil.binary_rvalue(jil.BinaryRvalue (
+                op: jil.BinaryOp.ne,
+                lhs: self.operand_for_place(self.place_for_local(value)),
+                rhs: self.int_operand(-1, span)
+            )),
+            span
+        );
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(is_present)),
+            then_target: present,
+            else_target: absent
+        )), span);
+    }
+
+    public () branch_on_non_null_pointer(
+        self,
+        jil.Place pointer,
+        jil.BlockId present,
+        jil.BlockId absent,
+        token.Span span
+    ) {
+        jil.LocalId is_present = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(is_present),
+            jil.binary_rvalue(jil.BinaryRvalue (
+                op: jil.BinaryOp.ne,
+                lhs: self.operand_for_place(pointer),
+                rhs: self.null_operand(self.jil_place_type(pointer), span)
+            )),
+            span
+        );
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(is_present)),
+            then_target: present,
+            else_target: absent
+        )), span);
+    }
+
+    public () push_atomic_store(self, jil.Place destination, jil.Operand value, token.Span span) {
+        self.statements.add(jil.Statement (
+            span: span,
+            kind: jil.atomic_store_statement_kind(jil.AtomicStoreStatement (
+                destination: destination,
+                value: value,
+                mode: .coroutine_atomic
+            ))
+        ));
+    }
+
+    public () lower_async_call_args_into_frame(
+        self,
+        sem.ImplicitCall call,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place
+    ) {
+        Int index! = 0;
+        while (index < call.args.length) {
+            jil.LocalId param_local = jil.LocalId.from_index(index + 1);
+            if (self.async_call_frame_field_place(layout, frame_place, param_local) is .some(param_place)) {
+                self.lower_into_place_as_type(call.args[index], param_place, self.jil_place_type(param_place));
+            }
+            index = index + 1;
+        }
+    }
+
+    public jil.Place? async_call_frame_field_place(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        jil.LocalId local_id
+    ) {
+        Int index! = 0;
+        while (index < layout.local_mappings.length) {
+            jil.CoroutineLocalFrameField mapping = layout.local_mappings[index];
+            if (mapping.local_id.to_index() == local_id.to_index()) {
+                return self.project_frame_field(frame_place, layout, mapping.field_index);
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public jil.Place project_frame_field(
+        self,
+        jil.Place frame_place,
+        jil.CoroutineFrameLayout& layout,
+        Int field_index
+    ) {
+        list.ArrayList<jil.PlaceElem> projection! =
+            list.ArrayList<jil.PlaceElem>(frame_place.projection.length + 1);
+        Int index! = 0;
+        while (index < frame_place.projection.length) {
+            projection.add(frame_place.projection[index]);
+            index = index + 1;
+        }
+        projection.add(jil.frame_field_projection_elem(jil.FrameFieldProjection (
+            field_index: field_index,
+            field_type: layout.fields[field_index].type_id
+        )));
+        return jil.local_place(frame_place.local_id, self.lowerer.output.projection_array(projection$.ref()));
+    }
+
+    public jil.CoroutineFrameLayout? async_call_frame_layout(self, sem.NodeId node_id, sem.ImplicitCall call) {
+        guard self.async_call_target_def(call) is .some(target_def) else {
+            return null;
+        }
+        qid.TypeId[]& type_args = self.function_call_type_args(node_id, call.base, target_def);
+        comptime_value.ComptimeValue[]& const_args = self.function_call_const_args(node_id, call.base, target_def);
+        self.ensure_async_call_target(target_def, type_args, const_args);
+        guard self.async_call_target_function(target_def, type_args, const_args) is .some(function) else {
+            return null;
+        }
+        return function.coroutine_frame;
+    }
+
+    public qid.DefId? async_call_target_def(self, sem.ImplicitCall call) {
+        if (self.lowerer.typeck.member_selection(call.base) is .some(selected_def)) {
+            return selected_def;
+        }
+        sem.Node base = self.lowerer.model.node(call.base);
+        if (base.data is .name_ref(name_ref)) {
+            guard name_ref is .def_ref(def_id) else { return null; }
+            return def_id;
+        }
+        return null;
+    }
+
+    public () ensure_async_call_target(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args
+    ) {
+        if (self.lowerer.function_is_lowering(target_def, type_args, const_args)) { return; }
+        if (type_args.length > 0 || const_args.length > 0) {
+            self.lowerer.ensure_function_instance_with_const_args(target_def, type_args, const_args);
+            return;
+        }
+        guard self.lowerer.model.def(target_def) is .some(model_def) else {
+            self.lowerer.ensure_external_function(target_def);
+            return;
+        }
+        if (self.lowerer.model.has_body(target_def)) {
+            self.lowerer.lower_function(model_def);
+            return;
+        }
+        self.lowerer.ensure_external_function(target_def);
+    }
+
+    @life(return: (self, self, self, self))
+    public jil.Function? async_call_target_function(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args
+    ) {
+        if (type_args.length > 0 || const_args.length > 0) {
+            guard self.lowerer.output.function_id_for_instance(target_def, type_args, const_args) is .some(id) else {
+                return null;
+            }
+            return self.lowerer.output.function(id);
+        }
+        guard self.lowerer.output.function_id_for_def(target_def) is .some(id) else {
+            return null;
+        }
+        return self.lowerer.output.function(id);
+    }
+
+}

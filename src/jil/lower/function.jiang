@@ -1,0 +1,478 @@
+// 函数树、泛型实例和外部函数的 JIL lowering。
+//
+// 本模块负责从 Semantic Model 声明生成具体 JIL Function。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import source = "../../source.jiang";
+import monomorph = "../../sema/monomorph.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
+import types = "../../sema/type.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import drop_elaborate = "../drop_elaborate.jiang";
+import std;
+import * = "./model.jiang";
+import lower_context = "./context.jiang";
+import * = "./body.jiang";
+import * = "./context.jiang";
+import expression = "./expression.jiang";
+import lower_coroutine = "./coroutine.jiang";
+import lower_entry = "./entry.jiang";
+import lower_local = "./local.jiang";
+import lower_type_support = "./type_support.jiang";
+
+public extend lower_context.Context {
+    public () lower_def_tree(self, qid.DefId def_id) {
+        self.lower_def_tree_with_generics(def_id, 0);
+    }
+
+    public () lower_def_tree_with_generics(self, qid.DefId def_id, Int inherited_generic_count) {
+        guard self.model.def(def_id) is .some(model_def) else {
+            return;
+        }
+        Int generic_count = self.lowering_generic_param_count(model_def, inherited_generic_count);
+        self.lower_async_block_members(model_def, generic_count);
+        if (self.is_lowerable_function_decl(model_def.decl.kind)) {
+            if (self.model.has_body(model_def.def_id)
+                && generic_count == 0
+                && self.function_signature_is_concrete(model_def.def_id)
+            ) {
+                self.lower_function(model_def);
+            } else if (self.is_external_function_decl(model_def)) {
+                self.lower_external_function(model_def);
+            }
+        }
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            self.lower_def_tree_with_generics(model_def.members.get(index), generic_count);
+            index = index + 1;
+        }
+    }
+
+    public () lower_async_block_members(self, sem.Def& model_def, Int inherited_generic_count) {
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            qid.DefId member_def = model_def.members.get(index);
+            if (self.typeck.is_async_block_function(member_def)) {
+                self.lower_def_tree_with_generics(member_def, inherited_generic_count);
+            }
+            index = index + 1;
+        }
+    }
+
+    public Int lowering_generic_param_count(self, sem.Def& model_def, Int inherited_generic_count) {
+        Int tree_count = inherited_generic_count + self.generic_param_count_for_def(model_def.def_id);
+        Int owner_count = self.generic_param_count(model_def);
+        if (owner_count > tree_count) {
+            // Extension members can be discovered from their module even though
+            // their semantic owner is the extended type. Use the owner chain so
+            // methods on `extend <T, N: const Int> T[N]` stay instance-only.
+            return owner_count;
+        }
+        return tree_count;
+    }
+
+    public () lower_function(self, sem.Def& model_def) {
+        if (self.output.function_id_for_def(model_def.def_id) != null) {
+            return;
+        }
+        monomorph.SubstitutionMap empty! = monomorph.SubstitutionMap();
+        self.lower_function_with_substitution(
+            model_def,
+            empty$.ref(),
+            self.output.empty_type_args(),
+            self.output.empty_const_args()
+        );
+    }
+
+    public Bool is_lowerable_function_decl(self, sem.DeclKind kind) {
+        if (kind == .function_decl) { return true; }
+        if (kind == .init_decl) { return true; }
+        return kind == .deinit_decl;
+    }
+
+    public Bool function_signature_is_concrete(self, qid.DefId function_def) {
+        guard self.typeck.def_type(function_def) is .some(type_id) else {
+            return false;
+        }
+        return self.type_is_concrete(type_id);
+    }
+
+    public Bool is_external_function_decl(self, sem.Def& model_def) {
+        if (self.model.has_body(model_def.def_id) || self.generic_param_count(model_def) != 0) {
+            return false;
+        }
+        guard self.ctx.store.defs.get(model_def.def_id).owner_def is .some(owner_def) else {
+            return false;
+        }
+        def.DefKind owner_kind = self.ctx.store.defs.get(owner_def).kind;
+        if (owner_kind == .module_def) { return true; }
+        return owner_kind == .package_def;
+    }
+
+    // 第二阶段 lower concrete generic instances。它们不会出现在 Semantic Model ownership
+    // tree 里，只存在于 MonomorphStore 中。
+    public () lower_instances(self) {
+        Int index! = 0;
+        while (index < self.instances.len()) {
+            self.lower_instance(self.instances.get(index));
+            index = index + 1;
+        }
+    }
+
+    public () lower_instance(self, monomorph.InstanceKey instance) {
+        if (monomorph.instance_kind(self.ctx.store$.ref(), instance) != .function_body) {
+            return;
+        }
+        // Some source-level generic bindings canonicalize to a non-generic JIL
+        // symbol, for example builtin type extensions whose semantic owner has
+        // been rebound through core. Once backend args are empty, DefId is the
+        // only JIL identity and the direct non-generic path owns the body.
+        if (instance.type_args.length == 0 && instance.const_args.length == 0) {
+            if (self.output.function_id_for_def(instance.def_id) != null) {
+                return;
+            }
+        }
+        if (!self.type_args_are_concrete(instance.type_args)) {
+            return;
+        }
+        if (self.output.function_id_for_instance(instance.def_id, instance.type_args, instance.const_args) != null) {
+            return;
+        }
+        guard self.model.def(instance.def_id) is .some(model_def) else {
+            return;
+        }
+        if (!self.model.has_body(model_def.def_id)) {
+            return;
+        }
+        // instance.type_args 先绑定到泛型参数 DefId，body lowering 后续所有
+        // 类型读取都通过 substitutions 转成 concrete TypeId。
+        monomorph.SubstitutionMap substitutions = monomorph.build_substitution(
+            self.ctx.store$.ref(),
+            model_def,
+            instance
+        );
+        self.lower_function_with_substitution(
+            model_def,
+            substitutions$.ref(),
+            instance.type_args,
+            instance.const_args
+        );
+    }
+
+    public () lower_function_with_substitution(self,
+        sem.Def& model_def,
+        monomorph.SubstitutionMap& substitutions,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args
+    ) {
+        jil.FunctionKey lowering_key = jil.FunctionKey(
+            model_def.def_id, type_args, const_args
+        );
+        self.lowering_functions.set(lowering_key, true);
+        Int provisional_function_index = self.output.functions.len();
+        // Semantic Model 不再直接携带 span；诊断位置后续通过 SourceMap 查询。
+        token.Span span = self.def_span(model_def.def_id);
+        BodyLowerer body_lowerer! = BodyLowerer(
+            self,
+            jil.BodyId.from_index(provisional_function_index),
+            model_def,
+            substitutions,
+            type_args,
+            const_args,
+            span
+        );
+        jil.BlockId cancellation_entry = body_lowerer.cancellation_entry;
+        qid.TypeId? capture_env_type = body_lowerer.coroutine_capture_env_type();
+        jil.Body jil_body! = body_lowerer.lower();
+        Int function_index = self.output.functions.len();
+        jil_body = self.body_with_id(jil_body, jil.BodyId.from_index(function_index));
+        types.EffectSet effects = self.function_effects_for_def(model_def.def_id, substitutions);
+        jil.Function function! = jil.Function (
+            id: jil.FunctionId.from_index(function_index),
+            def_id: model_def.def_id,
+            type_args: self.output.type_arg_array(type_args),
+            const_args: self.output.const_arg_array(const_args),
+            signature_id: null,
+            effects: effects,
+            is_coroutine: effects.has_async,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+        is_coroutine_completion: false,
+            is_language_entry: self.def_is_language_entry(model_def.def_id),
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: model_def.decl.inline_mode == .always,
+            naked: model_def.decl.naked,
+            span: span,
+            body: jil_body
+        );
+        if (effects.has_async) {
+            jil.Function borrow_check_source! = function;
+            function = drop_elaborate.elaborate_function(self.ctx, self.output, function);
+            function.coroutine_frame = self.coroutine_frame_layout_for_body(
+                model_def.def_id,
+                function.body,
+                effects,
+                cancellation_entry,
+                capture_env_type
+            );
+            borrow_check_source.coroutine_frame = function.coroutine_frame;
+            self.output.set_borrow_check_override(borrow_check_source);
+            self.output.mark_drop_elaborated(function.id);
+        }
+        self.output.add_function(function);
+        self.lowering_functions.remove(lowering_key);
+    }
+
+    public Bool function_is_lowering(
+        self,
+        qid.DefId function_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args
+    ) {
+        return self.lowering_functions.has(jil.FunctionKey(
+            function_def, type_args, const_args
+        ));
+    }
+
+    @life(return: body)
+    public jil.Body body_with_id(self, jil.Body body, jil.BodyId body_id) {
+        return jil.Body (
+            id: body_id,
+            span: body.span,
+            locals: body.locals,
+            blocks: body.blocks,
+            entry: body.entry,
+            return_local: body.return_local
+        );
+    }
+
+    public () lower_external_function(self, sem.Def& model_def) {
+        if (self.output.function_id_for_def(model_def.def_id) != null) {
+            return;
+        }
+        Int function_index = self.output.functions.len();
+        token.Span span = self.def_span(model_def.def_id);
+        monomorph.SubstitutionMap empty! = monomorph.SubstitutionMap();
+        types.EffectSet effects = self.function_effects_for_def(model_def.def_id, empty$.ref());
+        jil.Body jil_body = self.external_function_body(jil.BodyId.from_index(function_index), model_def, span);
+        jil.CoroutineFrameLayout? coroutine_frame = self.external_coroutine_frame_layout(
+            jil.BodyId.from_index(function_index), model_def.def_id, effects, span
+        );
+        self.output.add_function(jil.Function (
+            id: jil.FunctionId.from_index(function_index),
+            def_id: model_def.def_id,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            signature_id: null,
+            effects: effects,
+            is_coroutine: effects.has_async,
+            coroutine_frame: coroutine_frame,
+            is_coroutine_resume: false,
+        is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: true,
+            inline_always: false,
+            naked: false,
+            span: span,
+            body: jil_body
+        ));
+    }
+
+    public jil.CoroutineFrameLayout? external_coroutine_frame_layout(
+        self,
+        jil.BodyId body_id,
+        qid.DefId function_def,
+        types.EffectSet effects,
+        token.Span span
+    ) {
+        if (!effects.has_async) { return null; }
+        jil.Body source_body = self.external_source_function_body(body_id, function_def, span);
+        return self.coroutine_frame_layout_for_body(
+            function_def, source_body, effects, source_body.entry, null
+        );
+    }
+
+    public () ensure_external_function(self, qid.DefId function_def) {
+        if (self.output.function_id_for_def(function_def) != null) {
+            return;
+        }
+        if (self.def_is_trait_member(function_def)) {
+            return;
+        }
+        if (self.model.def(function_def) is .some(model_def)) {
+            if (self.model.has_body(model_def.def_id)) { return; }
+            self.lower_external_function(model_def);
+            return;
+        }
+        self.lower_external_function_def(function_def);
+    }
+
+    public Bool def_is_trait_member(self, qid.DefId def_id) {
+        guard self.ctx.store.defs.get(def_id).owner_def is .some(owner_def) else {
+            return false;
+        }
+        return self.ctx.store.defs.get(owner_def).kind == .trait_def;
+    }
+
+    public () ensure_function_instance(self, qid.DefId function_def, qid.TypeId[]& type_args) {
+        self.ensure_function_instance_with_const_args(function_def, type_args, self.output.empty_const_args());
+    }
+
+    public () ensure_function_instance_with_const_args(self,
+        qid.DefId function_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args
+    ) {
+        if (type_args.length == 0 && const_args.length == 0) {
+            return;
+        }
+        if (!self.type_args_are_concrete(type_args)) {
+            return;
+        }
+        if (self.output.function_id_for_instance(function_def, type_args, const_args) != null) {
+            return;
+        }
+        if (self.instances.instance_for_codegen_args(function_def, type_args, const_args) is .some(instance)) {
+            self.lower_instance(instance);
+            return;
+        }
+        self.lower_instance(monomorph.InstanceKey(function_def, type_args, const_args));
+    }
+
+    public Bool type_args_are_concrete(self, qid.TypeId[]& type_args) {
+        Int index! = 0;
+        while (index < type_args.length) {
+            if (!self.type_is_concrete(type_args[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    public Bool type_is_concrete(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        if (info.data is .named(named)) {
+            if (self.ctx.store.defs.get(named.def_id).kind == .generic_param_def) {
+                return false;
+            }
+            return self.type_args_are_concrete(named.type_args);
+        }
+        if (info.data is .handle_type(handle)) {
+            return self.type_is_concrete(handle.element);
+        }
+        if (info.data is .optional(optional)) {
+            return self.type_is_concrete(optional.element);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.type_is_concrete(array_type.element);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            return self.type_args_are_concrete(tuple_type.items);
+        }
+        return true;
+    }
+
+    public () ensure_custom_deinit_instances(self) {
+        // drop elaboration 会把 concrete nominal local/field 改写成 deinit 调用。
+        // 这些调用目标必须在 JIL 阶段就补齐，backend 只能消费完整 JIL。
+        Int function_index! = 0;
+        while (function_index < self.output.functions.len()) {
+            jil.Function& function = self.output.functions.ref_at(function_index);
+            self.ensure_custom_deinit_instances_for_body(function.body);
+            function_index = function_index + 1;
+        }
+    }
+
+    public () ensure_custom_deinit_instances_for_body(self, jil.Body body) {
+        Int local_index! = 0;
+        while (local_index < body.locals.length) {
+            self.ensure_custom_deinit_instance_for_type(body.locals[local_index].type_id);
+            local_index = local_index + 1;
+        }
+    }
+
+    public () ensure_custom_deinit_instance_for_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        if (info.data is .named(named)) {
+            self.ensure_custom_deinit_instance_for_named(named);
+            self.ensure_custom_deinit_instances_for_type_args(named.type_args);
+            return;
+        }
+        if (info.data is .handle_type(handle)) {
+            self.ensure_custom_deinit_instance_for_type(handle.element);
+            return;
+        }
+        if (info.data is .optional(optional)) {
+            self.ensure_custom_deinit_instance_for_type(optional.element);
+            return;
+        }
+        if (info.data is .array_type(array_type)) {
+            self.ensure_custom_deinit_instance_for_type(array_type.element);
+            return;
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            self.ensure_custom_deinit_instances_for_type_args(tuple_type.items);
+        }
+    }
+
+    public () ensure_custom_deinit_instances_for_type_args(self, qid.TypeId[]& type_args) {
+        Int index! = 0;
+        while (index < type_args.length) {
+            self.ensure_custom_deinit_instance_for_type(type_args[index]);
+            index = index + 1;
+        }
+    }
+
+    public () ensure_custom_deinit_instance_for_named(self, types.NamedType named) {
+        if (named.type_args.length == 0 || !self.type_args_are_concrete(named.type_args)) {
+            return;
+        }
+        guard self.model.def(named.def_id) is .some(model_def) else {
+            return;
+        }
+        guard model_def.custom_deinit_def is .some(deinit_def) else {
+            return;
+        }
+        self.ensure_function_instance(deinit_def, named.type_args);
+    }
+
+    public () lower_external_function_def(self, qid.DefId function_def) {
+        Int function_index = self.output.functions.len();
+        token.Span span = self.def_span(function_def);
+        monomorph.SubstitutionMap empty! = monomorph.SubstitutionMap();
+        types.EffectSet effects = self.function_effects_for_def(function_def, empty$.ref());
+        jil.Body body = self.external_function_body_for_def(
+            jil.BodyId.from_index(function_index), function_def, span
+        );
+        self.output.add_function(jil.Function (
+            id: jil.FunctionId.from_index(function_index),
+            def_id: function_def,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            signature_id: null,
+            effects: effects,
+            is_coroutine: effects.has_async,
+            coroutine_frame: self.external_coroutine_frame_layout(
+                jil.BodyId.from_index(function_index), function_def, effects, span
+            ),
+            is_coroutine_resume: false,
+        is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: true,
+            inline_always: false,
+            naked: false,
+            span: span,
+            body: body
+        ));
+    }
+
+}

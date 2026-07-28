@@ -1,0 +1,1523 @@
+// 函数体入口、语句和基础表达式 lowering。
+//
+// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import monomorph = "../../sema/monomorph.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
+import typeck_store = "../../sema/type_check/store.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import string = "../../support/string.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import support = "./support.jiang";
+import coroutine_task_abi = "../coroutine/task_abi.jiang";
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import control_flow = "./control_flow.jiang";
+import task = "./task.jiang";
+import ownership = "./ownership.jiang";
+import place = "./place.jiang";
+import closure = "./closure.jiang";
+import constant = "./constant.jiang";
+import call = "./call.jiang";
+import suspend = "./suspend.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+public extend body_context.BodyLowerer {
+    public jil.Body lower(self) {
+        self.initialize_task_local_handles();
+        if (self.model_def.body is .some(ref _ body)) {
+            self.lower_root(body.root);
+        }
+        if (!self.terminated) {
+            self.finish_block(jil.return_terminator_kind(jil.ReturnTerminator (implicit_unit: true)), self.span);
+        }
+        self.lower_cancellation_entry();
+        return jil.Body (
+            id: self.body_id,
+            span: self.span,
+            locals: self.freeze_locals(),
+            blocks: self.lowerer.output.block_array(self.blocks$.ref()),
+            entry: jil.BlockId.from_index(0),
+            return_local: self.return_local()
+        );
+    }
+
+    public qid.TypeId? coroutine_capture_env_type(self) {
+        if (!self.current_effects.has_async) { return null; }
+        guard self.lambda_capture_infos is .some(captures) else { return null; }
+        if (captures.length == 0) { return null; }
+        return self.lambda_env_type_for_infos(self.model_def.def_id, captures, self.span);
+    }
+
+    public () lower_cancellation_entry(self) {
+        if (!self.current_effects.has_async) { return; }
+        self.start_block(self.cancellation_entry);
+        list.ArrayList<jil.LocalId> cleanup_locals! = list.ArrayList<jil.LocalId>();
+        Int index! = 0;
+        while (index < self.locals.len()) {
+            jil.LocalDecl local = self.locals.get(index);
+            index = index + 1;
+            if (local.id.to_index() == self.return_local().to_index()) { continue; }
+            if (local.kind == jil.LocalKind.compiler_temp) { continue; }
+            cleanup_locals.add(local.id);
+        }
+        self.cleanup_local_range(cleanup_locals$.ref(), 0, self.span);
+        self.finish_block(
+            jil.cancel_terminator_kind(jil.CancelTerminator()), self.span
+        );
+    }
+
+    public () initialize_task_local_handles(self) {
+        if (!self.current_effects.has_async) { return; }
+        Int local_count = self.locals.len();
+        Int index! = 0;
+        while (index < local_count) {
+            jil.LocalDecl local = self.locals.get(index);
+            index = index + 1;
+            if (local.kind != jil.LocalKind.user_local) { continue; }
+            self.initialize_direct_task_places(
+                self.place_for_local(local.id), local.type_id, local.span
+            );
+        }
+    }
+
+    public () initialize_direct_task_places(
+        self,
+        jil.Place root,
+        qid.TypeId type_id,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Place> tasks! = list.ArrayList<jil.Place>();
+        self.append_direct_task_places(root, type_id, tasks$.ref());
+        Int index! = 0;
+        while (index < tasks.len()) {
+            jil.Place task_place = tasks.get(index);
+            self.ensure_task_place_identity(task_place, span);
+            jil.TaskStateLayout task_state = self.task_state_layout_for_task(task_place);
+            jil.Place state = coroutine_task_abi.task_field_place(
+                self.lowerer.output, task_place, task_state.state
+            );
+            self.push_assign(
+                state,
+                jil.use_rvalue(jil.UseRvalue (value: self.int_operand(-1, span))),
+                span
+            );
+            index = index + 1;
+        }
+    }
+
+    public () append_direct_task_places(
+        self,
+        jil.Place place,
+        qid.TypeId type_id,
+        list.ArrayList<jil.Place>& tasks
+    ) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .task_type(_)) {
+            tasks.add(place);
+            return;
+        }
+        if (info.data is .array_type(array_type)) {
+            self.append_array_task_places(place, array_type, tasks);
+            return;
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            self.append_tuple_task_places(place, tuple_type, tasks);
+            return;
+        }
+        guard info.data is .named(named) else { return; }
+        self.append_named_task_places(place, named, tasks);
+    }
+
+    public () append_array_task_places(
+        self,
+        jil.Place place,
+        types.ArrayType array_type,
+        list.ArrayList<jil.Place>& tasks
+    ) {
+        Int index! = 0;
+        while (index < array_type.count) {
+            self.append_direct_task_places(
+                self.project_constant_index(place, index), array_type.element, tasks
+            );
+            index = index + 1;
+        }
+    }
+
+    public () append_tuple_task_places(
+        self,
+        jil.Place place,
+        types.TupleType tuple_type,
+        list.ArrayList<jil.Place>& tasks
+    ) {
+        Int index! = 0;
+        while (index < tuple_type.items.length) {
+            self.append_direct_task_places(
+                self.project_constant_index(place, index), tuple_type.items[index], tasks
+            );
+            index = index + 1;
+        }
+    }
+
+    public () append_named_task_places(
+        self,
+        jil.Place place,
+        types.NamedType named,
+        list.ArrayList<jil.Place>& tasks
+    ) {
+        if (self.lowerer.ctx.store.defs.get(named.def_id).kind != .struct_def) { return; }
+        guard self.lowerer.model.def(named.def_id) is .some(owner_model) else { return; }
+        monomorph.SubstitutionMap substitutions = self.nominal_substitution(
+            named.def_id, named.type_args
+        );
+        Int index! = 0;
+        while (index < owner_model.members.len()) {
+            qid.DefId field_def = owner_model.members.get(index);
+            index = index + 1;
+            if (self.lowerer.ctx.store.defs.get(field_def).kind != .field_def) { continue; }
+            guard self.field_expected_type(field_def, substitutions$.ref()) is .some(field_type) else {
+                continue;
+            }
+            jil.Place field_place = self.project_field(place, field_def, field_type);
+            self.append_direct_task_places(field_place, field_type, tasks);
+        }
+    }
+
+    public sem.Local model_local(self, sem.LocalId local_id) {
+        guard self.model_def.body is .some(ref _ body) else {
+            return sem.Local(
+                local_id,
+                .local_variable,
+                self.lowerer.ctx.store.symbols.intern("<invalid>"),
+                qid.DefId.from_index(0),
+                false,
+                false,
+                null
+            );
+        }
+        return body.local(local_id);
+    }
+
+    public () lower_root(self, sem.NodeId root) {
+        sem.Node node = self.lowerer.model.node(root);
+        if (node.data is .block(block)) {
+            self.lower_root_block(block);
+            return;
+        }
+        self.assign_return_value(root);
+        if (!self.terminated) {
+            self.push_active_storage_dead_from(0, self.lowerer.model_span(root));
+            self.finish_return(false, self.lowerer.model_span(root));
+        }
+    }
+
+    public () lower_root_block(self, sem.Block block) {
+        types.EffectSet saved_effects = self.enter_block_effects(block.effects);
+        list.ArrayList<jil.LocalId> scope_locals! = list.ArrayList<jil.LocalId>();
+        Int defer_depth = self.active_defers.len();
+        Int index! = 0;
+        while (index < block.statements.length) {
+            if (self.terminated) {
+                self.current_effects = saved_effects;
+                return;
+            }
+            self.lower_statement_node(block.statements[index], scope_locals$.ref());
+            index = index + 1;
+        }
+        if (self.terminated) {
+            self.current_effects = saved_effects;
+            return;
+        }
+        if (block.result is .some(result)) {
+            self.assign_return_value(result);
+            if (!self.terminated) {
+                self.run_deferred_from(defer_depth, self.lowerer.model_span(result));
+                self.end_scope(scope_locals$.ref(), self.lowerer.model_span(result));
+                self.push_active_storage_dead_from(0, self.lowerer.model_span(result));
+                self.finish_return(false, self.lowerer.model_span(result));
+            }
+            self.current_effects = saved_effects;
+            return;
+        }
+        self.run_deferred_from(defer_depth, self.span);
+        self.end_scope(scope_locals$.ref(), self.span);
+        self.push_active_storage_dead_from(0, self.span);
+        self.finish_unit_return(self.span);
+        self.current_effects = saved_effects;
+    }
+
+    public types.EffectSet enter_block_effects(self, sem.EffectSet effects) {
+        types.EffectSet saved = self.current_effects;
+        types.EffectSet block_effects = self.lowerer.effect_set_for_model(effects);
+        self.current_effects = self.lowerer.merge_effects(self.current_effects, block_effects);
+        return saved;
+    }
+
+    public () lower_statement_node(self, sem.NodeId node_id, list.ArrayList<jil.LocalId>& scope_locals) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .let_stmt(let_stmt)) {
+            scope_locals.add(self.lower_let(node_id, let_stmt));
+            return;
+        }
+        if (node.data is .destructure_stmt(destructure)) {
+            self.lower_destructure(node_id, destructure, scope_locals);
+            return;
+        }
+        if (node.data is .defer_stmt(defer_stmt)) {
+            self.lower_defer(defer_stmt);
+            return;
+        }
+        if (node.data is .guard_stmt(guard_stmt)) {
+            self.lower_guard(node_id, guard_stmt);
+            return;
+        }
+        if (node.data is .return_stmt(return_stmt)) {
+            self.lower_return(node_id, return_stmt);
+            return;
+        }
+        if (node.data is .throw_stmt(throw_stmt)) {
+            self.lower_throw(node_id, throw_stmt);
+            return;
+        }
+        if (node.data is .break_stmt) {
+            self.lower_break(node_id);
+            return;
+        }
+        if (node.data is .continue_stmt) {
+            self.lower_continue(node_id);
+            return;
+        }
+        if (node.data is .assign_stmt(assign_stmt)) {
+            self.lower_assign(node_id, assign_stmt);
+            return;
+        }
+        if (self.is_expr_statement(node)) {
+            self.lower_expr_statement(node_id);
+            return;
+        }
+        self.mark_unsupported(node_id);
+    }
+
+    public Bool is_expr_statement(self, sem.Node node) {
+        if (node.data is .block(_)) { return true; }
+        if (node.data is .name_ref(_)) { return true; }
+        if (node.data is .member_access(_)) { return true; }
+        if (node.data is .index_access(_)) { return true; }
+        if (node.data is .slice_access(_)) { return true; }
+        if (node.data is .call(_)) { return true; }
+        if (node.data is .implicit_call(_)) { return true; }
+        if (node.data is .literal(_)) { return true; }
+        if (node.data is .unary(_)) { return true; }
+        if (node.data is .binary(_)) { return true; }
+        if (node.data is .inline_asm(_)) { return true; }
+        if (node.data is .if_expr(_)) { return true; }
+        if (node.data is .loop_expr(_)) { return true; }
+        if (node.data is .switch_expr(_)) { return true; }
+        if (node.data is .catch_expr(_)) { return true; }
+        if (node.data is .await_expr(_)) { return true; }
+        if (node.data is .await_task_expr(_)) { return true; }
+        if (node.data is .cancel_task_expr(_)) { return true; }
+        if (node.data is .cancel_await_task_expr(_)) { return true; }
+        if (node.data is .propagate_error_expr(_)) { return true; }
+        return false;
+    }
+
+    public () lower_expr_statement(self, sem.NodeId node_id) {
+        jil.LocalId temp = self.add_temp(self.type_for_node(node_id), self.lowerer.model_span(node_id));
+        self.lower_into_place(node_id, self.place_for_local(temp));
+        if (!self.terminated) {
+            self.push_storage_dead(temp, self.lowerer.model_span(node_id));
+        }
+    }
+
+    public () lower_defer(self, sem.Defer defer_stmt) {
+        self.active_defers.add(defer_stmt.body);
+    }
+
+    public jil.LocalId lower_let(self, sem.NodeId node_id, sem.Let let_stmt) {
+        jil.LocalId local_id = self.jil_local_for_model(let_stmt.local_id);
+        self.active_locals.add(local_id);
+        self.push_storage_live(local_id, self.lowerer.model_span(node_id));
+        if (let_stmt.initializer is .some(initializer)) {
+            sem.Local local = self.model_local(let_stmt.local_id);
+            self.lower_into_place(initializer, self.place_for_local(local_id));
+            sem.Node value = self.lowerer.model.node(initializer);
+            if (!local.mutable_binding && value.data is .lambda_expr(_)) {
+                self.known_lambda_initializers.set(
+                    let_stmt.local_id.to_index(), initializer
+                );
+            }
+        }
+        return local_id;
+    }
+
+    public () lower_destructure(self,
+        sem.NodeId node_id,
+        sem.Destructure destructure,
+        list.ArrayList<jil.LocalId>& scope_locals
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        if (self.pattern_has_borrow_binding(destructure.pattern)) {
+            if (self.place_for_expr(destructure.initializer) is .some(place)) {
+                self.lower_destructure_binding(destructure.pattern, place, scope_locals);
+                return;
+            }
+        }
+        jil.LocalId source_local = self.add_temp(self.type_for_node(destructure.initializer), span);
+        jil.Place source_place = self.place_for_local(source_local);
+        scope_locals.add(source_local);
+        self.active_locals.add(source_local);
+        self.push_storage_live(source_local, span);
+        self.lower_into_place(destructure.initializer, source_place);
+        self.lower_destructure_binding(destructure.pattern, source_place, scope_locals);
+    }
+
+    public () lower_destructure_binding(self,
+        sem.NodeId pattern_id,
+        jil.Place source,
+        list.ArrayList<jil.LocalId>& scope_locals
+    ) {
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        if (pattern.data is .wildcard_pattern) { return; }
+        if (pattern.data is .tuple_pattern(tuple_pattern)) {
+            self.lower_tuple_pattern_bindings(tuple_pattern, source, scope_locals);
+            return;
+        }
+        guard pattern.data is .binding_pattern(binding) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        jil.LocalId local_id = self.jil_local_for_model(binding.local_id);
+        scope_locals.add(local_id);
+        self.active_locals.add(local_id);
+        self.push_storage_live(local_id, self.lowerer.model_span(pattern_id));
+        sem.Local local = self.model_local(binding.local_id);
+        if (local.borrow_binding) {
+            self.push_assign(
+                self.place_for_local(local_id),
+                jil.borrow_rvalue(jil.BorrowRvalue (place: source)),
+                self.lowerer.model_span(pattern_id)
+            );
+            return;
+        }
+        self.push_assign(
+            self.place_for_local(local_id),
+            jil.use_rvalue(jil.UseRvalue (value: jil.copy_operand_value(jil.CopyOperand (place: source)))),
+            self.lowerer.model_span(pattern_id)
+        );
+    }
+
+    public () lower_tuple_pattern_bindings(self,
+        sem.TuplePattern tuple_pattern,
+        jil.Place source,
+        list.ArrayList<jil.LocalId>& locals
+    ) {
+        self.lower_product_pattern_bindings(tuple_pattern.items, source, locals);
+    }
+
+    public () lower_product_pattern_bindings(self,
+        sem.NodeId[]& items,
+        jil.Place source,
+        list.ArrayList<jil.LocalId>& locals
+    ) {
+        if (items.length == 1) {
+            self.lower_destructure_binding(items[0], source, locals);
+            return;
+        }
+        Int index! = 0;
+        while (index < items.length) {
+            jil.Place item_place = self.project_constant_index(source, index);
+            self.lower_destructure_binding(
+                items[index],
+                item_place,
+                locals
+            );
+            index = index + 1;
+        }
+    }
+
+    public () lower_borrow_binding_initializer(self, sem.NodeId initializer, jil.Place destination) {
+        guard self.place_for_expr(initializer) is .some(source) else {
+            self.mark_unsupported(initializer);
+            return;
+        }
+        self.push_assign(
+            destination,
+            jil.borrow_rvalue(jil.BorrowRvalue (place: source)),
+            self.lowerer.model_span(initializer)
+        );
+    }
+
+    public () lower_return(self, sem.NodeId node_id, sem.Return return_stmt) {
+        if (return_stmt.value is .some(value)) {
+            self.assign_return_value(value);
+            if (self.terminated) { return; }
+            self.run_deferred_from(0, self.lowerer.model_span(node_id));
+            self.push_active_storage_dead_from(0, self.lowerer.model_span(node_id));
+            self.finish_return(false, self.lowerer.model_span(node_id));
+            return;
+        }
+        self.run_deferred_from(0, self.lowerer.model_span(node_id));
+        self.push_active_storage_dead_from(0, self.lowerer.model_span(node_id));
+        self.finish_unit_return(self.lowerer.model_span(node_id));
+    }
+
+    public () finish_unit_return(self, token.Span span) {
+        if (self.return_type_is_error_union()) {
+            self.assign_return_unit(span);
+            self.finish_return(false, span);
+            return;
+        }
+        self.finish_return(true, span);
+    }
+
+    public () assign_return_unit(self, token.Span span) {
+        self.push_assign(
+            self.place_for_local(self.return_local()),
+            jil.error_union_rvalue(jil.ErrorUnionRvalue (
+                op: jil.ErrorUnionOp.make_value,
+                value: jil.const_operand_value(jil.Const (
+                    type_id: self.lowerer.ctx.store.types.unit_type(),
+                    span: span,
+                    value: jil.unit_const_kind(jil.UnitConst (unit_value: true))
+                ))
+            )),
+            span
+        );
+    }
+
+    public () assign_return_value(self, sem.NodeId value) {
+        jil.Place destination = self.place_for_local(self.return_local());
+        if (self.return_type_is_error_union()) {
+            qid.TypeId return_type = self.locals.get(self.return_local().to_index()).type_id;
+            self.push_assign(
+                destination,
+                jil.error_union_rvalue(jil.ErrorUnionRvalue (
+                    op: jil.ErrorUnionOp.make_value,
+                    value: self.lower_to_operand_as_type(value, self.error_union_value_type(return_type))
+                )),
+                self.lowerer.model_span(value)
+            );
+            return;
+        }
+        self.lower_into_place(value, destination);
+    }
+
+    public Bool return_type_is_error_union(self) {
+        qid.TypeId return_type = self.locals.get(self.return_local().to_index()).type_id;
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(return_type);
+        return info.data is .error_union(_);
+    }
+
+    public () lower_throw(self, sem.NodeId node_id, sem.Throw throw_stmt) {
+        qid.TypeId return_type = self.locals.get(self.return_local().to_index()).type_id;
+        self.push_assign(
+            self.place_for_local(self.return_local()),
+            jil.error_union_rvalue(jil.ErrorUnionRvalue (
+                op: jil.ErrorUnionOp.make_error,
+                value: self.lower_to_operand_as_type(throw_stmt.value, self.error_union_error_type(return_type))
+            )),
+            self.lowerer.model_span(node_id)
+        );
+        if (self.terminated) { return; }
+        self.run_deferred_from(0, self.lowerer.model_span(node_id));
+        self.push_active_storage_dead_from(0, self.lowerer.model_span(node_id));
+        self.finish_return(false, self.lowerer.model_span(node_id));
+    }
+
+    public qid.TypeId error_union_value_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .error_union(error_union)) {
+            return error_union.value;
+        }
+        return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    public qid.TypeId error_union_error_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .error_union(error_union)) {
+            return error_union.error;
+        }
+        return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    public () lower_assign(self, sem.NodeId node_id, sem.Assign assign_stmt) {
+        if (self.lower_subscript_assignment(assign_stmt)) {
+            return;
+        }
+        if (self.lower_init_self_assignment(assign_stmt)) {
+            return;
+        }
+        guard self.place_for_expr(assign_stmt.target) is .some(destination) else {
+            self.mark_unsupported(assign_stmt.target);
+            return;
+        }
+        if (assign_stmt.op == .assign) {
+            self.lower_into_place(assign_stmt.value, destination);
+            return;
+        }
+        guard support.binary_op_for_assign(assign_stmt.op) is .some(op) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        jil.Operand lhs = self.lower_to_operand(assign_stmt.target);
+        jil.Operand rhs = self.lower_to_operand(assign_stmt.value);
+        self.push_assign(
+            destination,
+            jil.binary_rvalue(jil.BinaryRvalue (op: op, lhs: lhs, rhs: rhs)),
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    public Bool lower_init_self_assignment(self, sem.Assign assign_stmt) {
+        if (assign_stmt.op != .assign) {
+            return false;
+        }
+        if (!self.init_self_assignment_target(assign_stmt.target)) {
+            return false;
+        }
+        guard self.place_for_expr(assign_stmt.target) is .some(self_place) else {
+            return false;
+        }
+        jil.Place destination = self.project_deref(self_place, false);
+        self.lower_into_place(assign_stmt.value, destination);
+        return true;
+    }
+
+    public Bool init_self_assignment_target(self, sem.NodeId target_id) {
+        if (self.model_def.decl.kind != .init_decl) {
+            return false;
+        }
+        sem.Node target = self.lowerer.model.node(target_id);
+        guard target.data is .name_ref(name_ref) else { return false; }
+        guard name_ref is .local(local_id) else { return false; }
+        sem.Local local = self.model_local(local_id);
+        return string.equal(self.lowerer.ctx.store.symbols.text(local.symbol), "self");
+    }
+
+    public () lower_into_place(self, sem.NodeId node_id, jil.Place destination) {
+        if (self.node_result_needs_string_literal_constructor(node_id)) {
+            self.lower_string_literal_constructor(node_id, destination);
+            return;
+        }
+        if (self.node_result_needs_array_to_slice(node_id, destination)) {
+            self.lower_array_to_slice_into_place(node_id, destination);
+            return;
+        }
+        if (self.node_result_needs_lift(node_id, destination)) {
+            self.lower_lifted_result_into_place(node_id, destination);
+            return;
+        }
+        self.lower_direct_into_place(node_id, destination);
+    }
+
+    public Bool node_result_needs_string_literal_constructor(self, sem.NodeId node_id) {
+        guard self.lowerer.typeck.expr_lowering(node_id) is .some(lowering) else { return false; }
+        return lowering == .string_literal_constructor;
+    }
+
+    public () lower_string_literal_constructor(self, sem.NodeId node_id, jil.Place destination) {
+        guard self.lowerer.typeck.call_target(node_id) is .some(init_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        sem.Node node = self.lowerer.model.node(node_id);
+        guard node.data is .literal(literal) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId[]& type_args = self.lowerer.output.empty_type_args();
+        comptime_value.ComptimeValue[]& const_args = self.lowerer.output.empty_const_args();
+        qid.TypeId function_type = self.function_type_for_ref(init_def, type_args, const_args);
+        types.FunctionType signature = self.function_type_or_empty(function_type);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(2);
+        args.add(self.borrow_destination_operand(destination, span));
+        args.add(jil.const_operand_value(self.lower_literal_as_const(node_id, literal, signature.params[1])));
+        self.lower_init_call_with_args(node_id, init_def, function_type, args$.ref(), destination, span);
+    }
+
+    public () lower_init_call_with_args(self,
+        sem.NodeId node_id,
+        qid.DefId init_def,
+        qid.TypeId function_type,
+        list.ArrayList<jil.Operand>& args,
+        jil.Place destination,
+        token.Span span
+    ) {
+        self.lowerer.ensure_external_function(init_def);
+        jil.LocalId unit_local = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        jil.BlockId next_block = self.reserve_block(span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: self.direct_function_callee(
+                init_def,
+                function_type,
+                self.lowerer.output.empty_type_args(),
+                self.lowerer.output.empty_const_args(),
+                span
+            ),
+            args: self.lowerer.output.operand_slice(args.slice()),
+            current_effects: self.current_effects,
+            is_suspend_point: self.function_type_is_async(function_type),
+            destination: self.place_for_local(unit_local),
+            target: next_block,
+            initialized_place: destination,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next_block);
+    }
+
+    // Semantic Model 允许按 expected type 把 `T` 隐式提升成 `T?`/`T!E`。这种语义必须在
+    // JIL 中显式化，否则 backend 会把 `T` 的 aggregate 字段写进目标 wrapper。
+    public Bool node_result_needs_lift(self, sem.NodeId node_id, jil.Place destination) {
+        qid.TypeId actual = self.type_for_node(node_id);
+        qid.TypeId expected = self.jil_place_type(destination);
+        return self.type_needs_optional_lift(actual, expected) || self.type_needs_error_union_lift(actual, expected);
+    }
+
+    public Bool node_result_needs_array_to_slice(self, sem.NodeId node_id, jil.Place destination) {
+        qid.TypeId actual = self.source_type_for_expected_conversion(node_id);
+        qid.TypeId expected = self.jil_place_type(destination);
+        return self.type_needs_array_to_slice(actual, expected);
+    }
+
+    public qid.TypeId source_type_for_expected_conversion(self, sem.NodeId node_id) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .array_literal(array_literal)) {
+            return self.array_literal_source_type(node_id, array_literal);
+        }
+        // `place_for_expr` 可能为复杂 place 生成临时值；探测期望转换类型时，
+        // 只对确定无副作用的表达式调用它。
+        if (self.place_lookup_has_no_lowering_side_effect(node_id)) {
+            guard self.place_for_expr(node_id) is .some(place) else {
+                return self.type_for_node(node_id);
+            }
+            return self.jil_place_type(place);
+        }
+        return self.type_for_node(node_id);
+    }
+
+    public qid.TypeId array_literal_source_type(self, sem.NodeId node_id, sem.ArrayLiteral literal) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .array_type(_)) {
+            return type_id;
+        }
+        guard info.data is .handle_type(handle) else { return type_id; }
+        if (handle.kind != .slice) { return type_id; }
+        return self.lowerer.ctx.store.types.array_type_with_sentinel(
+            handle.element,
+            literal.items.length,
+            handle.sentinel,
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    public Bool place_lookup_has_no_lowering_side_effect(self, sem.NodeId node_id) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .name_ref(name_ref)) {
+            return name_ref is .local;
+        }
+        if (node.data is .member_access(member_access)) {
+            return self.place_lookup_has_no_lowering_side_effect(member_access.base);
+        }
+        if (node.data is .index_access(index_access)) {
+            return self.place_lookup_has_no_lowering_side_effect(index_access.base)
+                && self.index_lookup_has_no_lowering_side_effect(index_access.index);
+        }
+        return false;
+    }
+
+    public Bool index_lookup_has_no_lowering_side_effect(self, sem.NodeId node_id) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        guard node.data is .name_ref(name_ref) else {
+            return false;
+        }
+        return name_ref is .local;
+    }
+
+    public Bool type_needs_array_to_slice(self, qid.TypeId actual, qid.TypeId expected) {
+        types.TypeInfo actual_info = self.lowerer.ctx.store.types.get(actual);
+        types.TypeInfo expected_info = self.lowerer.ctx.store.types.get(expected);
+        guard actual_info.data is .array_type(actual_array) else { return false; }
+        guard expected_info.data is .handle_type(expected_handle) else { return false; }
+        if (expected_handle.kind != .slice) { return false; }
+        return self.type_same(actual_array.element, expected_handle.element);
+    }
+
+    public Bool type_same(self, qid.TypeId left, qid.TypeId right) {
+        return left.to_index() == right.to_index();
+    }
+
+    public () lower_array_to_slice_into_place(self, sem.NodeId node_id, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId actual = self.source_type_for_expected_conversion(node_id);
+        if (self.array_to_slice_base_place(node_id) is .some(base)) {
+            self.assign_array_slice(destination, base, actual, span);
+            return;
+        }
+        jil.LocalId temp = self.add_temp(actual, span);
+        self.push_storage_live(temp, span);
+        jil.Place temp_place = self.place_for_local(temp);
+        self.lower_direct_into_place(node_id, temp_place);
+        self.assign_array_slice(destination, temp_place, actual, span);
+        self.push_storage_dead(temp, span);
+    }
+
+    public jil.Place? array_to_slice_base_place(self, sem.NodeId node_id) {
+        if (!self.place_lookup_has_no_lowering_side_effect(node_id)) {
+            return null;
+        }
+        return self.place_for_expr(node_id);
+    }
+
+    public () assign_array_slice(
+        self,
+        jil.Place destination,
+        jil.Place base,
+        qid.TypeId array_type,
+        token.Span span
+    ) {
+        self.push_assign(
+            destination,
+            jil.slice_rvalue(jil.SliceRvalue (
+                base: base,
+                start: null,
+                end: self.array_to_slice_end(array_type, span)
+            )),
+            span
+        );
+    }
+
+    public jil.Operand? array_to_slice_end(self, qid.TypeId array_type, token.Span span) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.array_slice_end_type(array_type));
+        guard info.data is .array_type(array) else { return null; }
+        return jil.const_operand_value(self.int_const(array.count, span));
+    }
+
+    public qid.TypeId array_slice_end_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return type_id; }
+        if (handle.kind != .reference) { return type_id; }
+        return handle.element;
+    }
+
+    public () lower_lifted_result_into_place(self, sem.NodeId node_id, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.LocalId temp = self.add_temp(self.type_for_node(node_id), span);
+        jil.Place temp_place = self.place_for_local(temp);
+        self.lower_direct_into_place(node_id, temp_place);
+        jil.Operand value = self.operand_for_place(temp_place);
+        self.push_assign(
+            destination,
+            jil.use_rvalue(jil.UseRvalue (
+                value: self.normalize_aggregate_operand(value, self.jil_place_type(destination), span)
+            )),
+            span
+        );
+    }
+
+    public () lower_direct_into_place(self, sem.NodeId node_id, jil.Place destination) {
+        if (self.comptime_value_for_expr(node_id) is .some(const_value)) {
+            if (self.lower_comptime_value_into_place(node_id, const_value, destination)) {
+                return;
+            }
+        }
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .block(block)) {
+            if (self.lower_async_block_task(node_id, destination)) {
+                return;
+            }
+            self.lower_block_into_place(block, destination);
+            return;
+        }
+        if (node.data is .call(call)) {
+            if (self.lower_task_initializer_call(node_id, call, destination)) {
+                return;
+            }
+            self.lower_call(node_id, call, destination);
+            return;
+        }
+        if (node.data is .implicit_call(implicit_call)) {
+            self.lower_implicit_call(node_id, implicit_call, destination);
+            return;
+        }
+        if (node.data is .member_access(member_access)) {
+            self.lower_member_access(node_id, member_access, destination);
+            return;
+        }
+        if (node.data is .index_access(index_access)) {
+            if (self.lower_subscript_get(node_id, index_access, destination)) {
+                return;
+            }
+        }
+        if (node.data is .slice_access(slice_access)) {
+            self.lower_slice(node_id, slice_access, destination);
+            return;
+        }
+        if (node.data is .struct_literal(struct_literal)) {
+            self.lower_struct_literal(node_id, struct_literal, destination);
+            return;
+        }
+        if (node.data is .tuple_literal(tuple_literal)) {
+            self.lower_tuple_literal(node_id, tuple_literal, destination);
+            return;
+        }
+        if (node.data is .array_literal(array_literal)) {
+            self.lower_array_literal(node_id, array_literal, destination);
+            return;
+        }
+        if (node.data is .if_expr(if_expr)) {
+            self.lower_if(node_id, if_expr, destination);
+            return;
+        }
+        if (node.data is .loop_expr(loop_expr)) {
+            self.lower_loop(node_id, loop_expr, destination);
+            return;
+        }
+        if (node.data is .switch_expr(switch_expr)) {
+            self.lower_switch(node_id, switch_expr, destination);
+            return;
+        }
+        if (node.data is .catch_expr(catch_expr)) {
+            self.lower_catch(node_id, catch_expr, destination);
+            return;
+        }
+        if (node.data is .await_expr(value)) {
+            self.lower_into_place(value, destination);
+            return;
+        }
+        if (node.data is .await_task_expr(value)) {
+            self.lower_await_task_expr(value, destination);
+            return;
+        }
+        if (node.data is .cancel_task_expr(value)) {
+            self.lower_cancel_task_expr(value, destination);
+            return;
+        }
+        if (node.data is .cancel_await_task_expr(value)) {
+            self.lower_cancel_await_task_expr(value, destination);
+            return;
+        }
+        if (node.data is .propagate_error_expr(value)) {
+            self.lower_propagate_error_expr(node_id, value, destination);
+            return;
+        }
+        if (node.data is .sync_block(async_block)) {
+            self.lower_sync_block(node_id, async_block, destination);
+            return;
+        }
+        if (node.data is .is_pattern(is_pattern)) {
+            self.lower_is_pattern_into_place(node_id, is_pattern, destination);
+            return;
+        }
+        if (node.data is .unary(unary)) {
+            self.lower_unary(node_id, unary, destination);
+            return;
+        }
+        if (node.data is .binary(binary)) {
+            self.lower_binary(node_id, binary, destination);
+            return;
+        }
+        if (node.data is .inline_asm(inline_asm)) {
+            self.lower_inline_asm(node_id, inline_asm, destination);
+            return;
+        }
+        if (node.data is .lambda_expr(lambda)) {
+            if (self.type_is_closure(self.type_for_node(node_id))) {
+                self.lower_lambda_closure(node_id, lambda, destination);
+                return;
+            }
+        }
+        jil.Operand value = self.lower_operand(node_id);
+        self.push_assign(destination, jil.use_rvalue(jil.UseRvalue (value: value)), self.lowerer.model_span(node_id));
+    }
+
+    public () lower_inline_asm(self, sem.NodeId node_id, sem.InlineAsm inline_asm, jil.Place destination) {
+        list.ArrayList<jil.InlineAsmOperand> operands! = list.ArrayList<jil.InlineAsmOperand>(
+            inline_asm.operands.length
+        );
+        Int index! = 0;
+        while (index < inline_asm.operands.length) {
+            operands.add(self.lower_inline_asm_operand(node_id, inline_asm, inline_asm.operands[index]));
+            index = index + 1;
+        }
+        jil.Rvalue value = jil.inline_asm_rvalue(jil.InlineAsmRvalue (
+            result_type: self.type_for_node(node_id),
+            code_symbol: inline_asm.code_symbol,
+            operands: self.lowerer.output.inline_asm_operand_array(operands$.ref()),
+            clobbers: self.lowerer.output.symbol_id_slice(inline_asm.clobbers),
+            volatile: inline_asm.volatile,
+            memory: inline_asm.memory,
+            noreturn: inline_asm.noreturn
+        ));
+        self.push_assign(destination, value, self.lowerer.model_span(node_id));
+        if (inline_asm.noreturn) {
+            self.finish_block(
+                jil.unreachable_terminator_kind(jil.UnreachableTerminator (generated_by_check: false)),
+                self.lowerer.model_span(node_id)
+            );
+        }
+    }
+
+    public jil.InlineAsmOperand lower_inline_asm_operand(self,
+        sem.NodeId node_id,
+        sem.InlineAsm inline_asm,
+        sem.InlineAsmOperand operand
+    ) {
+        if (operand is .input(input)) {
+            return .input(jil.InlineAsmInput (
+                constraint_symbol: input.constraint_symbol,
+                value: self.lower_to_operand(input.value)
+            ));
+        }
+        if (operand is .output(output)) {
+            return .output(jil.InlineAsmOutput (
+                constraint_symbol: output.constraint_symbol,
+                type_id: self.inline_asm_output_type(node_id, inline_asm, output)
+            ));
+        }
+        return .output(jil.InlineAsmOutput (
+            constraint_symbol: qid.SymbolId(0),
+            type_id: self.lowerer.ctx.store.types.invalid_type()
+        ));
+    }
+
+    public qid.TypeId inline_asm_output_type(self,
+        sem.NodeId node_id,
+        sem.InlineAsm inline_asm,
+        sem.InlineAsmOutput output
+    ) {
+        if (output.type_ref is .some(type_ref)) {
+            return self.type_for_node(type_ref);
+        }
+        qid.TypeId result_type = self.type_for_node(inline_asm.result_type);
+        if (!(self.lowerer.ctx.store.types.get(result_type).data is .invalid)) {
+            return result_type;
+        }
+        return self.type_for_node(node_id);
+    }
+
+    public Bool lower_async_block_task(self, sem.NodeId node_id, jil.Place destination) {
+        qid.DefId function_def = node_id.owner_def;
+        if (function_def.to_index() == self.model_def.def_id.to_index()) { return false; }
+        if (!self.lowerer.typeck.is_async_block_function(function_def)) { return false; }
+        guard self.lowerer.typeck.lambda_capture_infos(function_def) is .some(captures) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        return self.lower_async_task(
+            node_id,
+            node_id,
+            function_def,
+            captures,
+            null,
+            destination
+        );
+    }
+
+    public Bool lower_task_initializer_call(
+        self,
+        sem.NodeId node_id,
+        sem.Call call,
+        jil.Place destination
+    ) {
+        guard self.lowerer.typeck.expr_lowering(node_id) is .some(lowering) else {
+            return false;
+        }
+        if (lowering != .task_initializer) { return false; }
+        guard self.task_initializer_lambda(call) is .some(lambda_id) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        sem.Node lambda_node = self.lowerer.model.node(lambda_id);
+        guard lambda_node.data is .lambda_expr(lambda) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        guard self.lowerer.typeck.lambda_capture_infos(lambda.function_def)
+            is .some(captures) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        return self.lower_async_task(
+            node_id,
+            lambda_id,
+            lambda.function_def,
+            captures,
+            lambda,
+            destination
+        );
+    }
+
+    public sem.NodeId? task_initializer_lambda(self, sem.Call call) {
+        Int index! = 0;
+        while (index < call.args.length) {
+            if (call.args[index].trailing) { return call.args[index].value; }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Bool lower_async_task(
+        self,
+        sem.NodeId node_id,
+        sem.NodeId capture_node,
+        qid.DefId function_def,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        sem.Lambda? lambda,
+        jil.Place destination
+    ) {
+        guard self.lowerer.output.function_id_for_def(function_def) is .some(function_id) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        jil.Function function = self.lowerer.output.function(function_id);
+        guard function.coroutine_frame is .some(layout) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.LocalId task_local = self.ensure_task_place_identity(destination, span);
+        if (self.async_start_is_detached(node_id)) {
+            self.lower_detached_async_block(
+                capture_node,
+                captures,
+                lambda,
+                function$.ref(),
+                layout$.ref(),
+                span
+            );
+            self.push_assign(
+                coroutine_task_abi.task_field_place(
+                    self.lowerer.output, destination, layout.task_abi.state_field
+                ),
+                jil.use_rvalue(jil.UseRvalue (value: self.int_operand(-1, span))),
+                span
+            );
+            return true;
+        }
+        jil.TaskStoragePlan storage! = self.task_local_storage(
+            .local, self.task_sync_mode(layout$.ref())
+        );
+        if (self.task_destination_is_owned(destination)) {
+            storage = self.escaping_task_storage();
+        }
+        jil.FunctionRef resume_function = self.coroutine_generated_function_ref(
+            function_def,
+            self.lowerer.output.empty_type_args(),
+            self.lowerer.output.empty_const_args(),
+            layout$.ref(),
+            true,
+            span
+        );
+        self.push_task_region_start(destination, task_local, storage, resume_function, span);
+        jil.Place frame_place = self.initialize_task_frame_storage(
+            layout$.ref(), task_local, storage, span
+        );
+        self.initialize_structured_task_state(destination, layout$.ref(), task_local, storage, span);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.async_task_env_operand(
+            capture_node,
+            captures,
+            lambda,
+            task_local,
+            function$.ref(),
+            layout$.ref(),
+            frame_place,
+            span
+        ));
+        jil.Operand[]& frozen_args = self.lowerer.output.operand_array(args$.ref());
+        self.lower_async_operands_into_frame(
+            frozen_args, function$.ref(), layout$.ref(), frame_place, span
+        );
+        jil.FunctionRef completion_function = self.task_completion_function_ref(
+            function_def,
+            self.lowerer.output.empty_type_args(),
+            self.lowerer.output.empty_const_args(),
+            layout$.ref(),
+            storage.sync,
+            span
+        );
+        jil.Statement[]& initializers = coroutine_task_abi.initialized_task_initializers(
+            self.lowerer.output,
+            layout$.ref(),
+            destination,
+            frame_place,
+            resume_function,
+            completion_function,
+            span
+        );
+        Int index! = 0;
+        while (index < initializers.length) {
+            self.statements.add(initializers[index]);
+            index = index + 1;
+        }
+        self.push_task_lifetime_initializers(destination, layout$.ref(), storage, span);
+        self.push_structured_task_frame_domain(
+            layout$.ref(), frame_place, storage, span
+        );
+        self.push_task_execution_domain_initializers(
+            layout$.ref(), destination, frame_place, span
+        );
+        self.lower_task_resume_call(
+            destination, resume_function, self.async_start_kind(node_id), span
+        );
+        return true;
+    }
+
+    public Bool async_start_is_detached(self, sem.NodeId node_id) {
+        guard self.lowerer.typeck.async_start_usage(node_id) is .some(usage) else { return false; }
+        return usage == typeck_store.AsyncStartUsage.detached;
+    }
+
+    public () lower_detached_async_block(
+        self,
+        sem.NodeId capture_node,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        sem.Lambda? lambda,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        token.Span span
+    ) {
+        jil.LocalId allocation_executor = self.add_temp(
+            self.lowerer.ctx.store.types.opaque_pointer_type(span), span
+        );
+        jil.Rvalue allocation_executor_value! = jil.use_rvalue(jil.UseRvalue (
+            value: self.null_operand(
+                self.lowerer.ctx.store.types.opaque_pointer_type(span), span
+            )
+        ));
+        if (layout.effects.domain is .some(domain)) {
+            allocation_executor_value = jil.domain_executor_rvalue(jil.DomainExecutorRvalue (
+                domain_def: domain.binding,
+                domain_kind: layout.domain_kind
+            ));
+        } else if (self.current_effects.has_async) {
+            allocation_executor_value = jil.current_executor_rvalue(jil.CurrentExecutorRvalue());
+        }
+        self.push_assign(
+            self.place_for_local(allocation_executor), allocation_executor_value, span
+        );
+        jil.LocalId frame_pointer = self.add_temp(layout.task_abi.frame_pointer_type_id, span);
+        jil.Place frame_pointer_place = self.place_for_local(frame_pointer);
+        self.push_assign(
+            frame_pointer_place,
+            jil.coroutine_frame_alloc_rvalue(jil.CoroutineFrameAllocRvalue (
+                value_type: layout.frame_type_id,
+                executor: self.operand_for_place(self.place_for_local(allocation_executor))
+            )),
+            span
+        );
+        jil.Place frame_place = self.project_deref(frame_pointer_place, true);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.detached_async_env_operand(
+            capture_node, captures, lambda, function, layout, frame_place, span
+        ));
+        jil.Operand[]& frozen_args = self.lowerer.output.operand_array(args$.ref());
+        self.lower_async_operands_into_frame(frozen_args, function, layout, frame_place, span);
+        self.statements.add(coroutine_task_abi.frame_state_initializer(
+            self.lowerer.output,
+            layout,
+            frame_place,
+            span
+        ));
+        jil.Statement[]& domain_initializers = coroutine_task_abi.frame_domain_initializers(
+            self.lowerer.output, layout, frame_place, span
+        );
+        Int domain_index! = 0;
+        while (domain_index < domain_initializers.length) {
+            self.statements.add(domain_initializers[domain_index]);
+            domain_index = domain_index + 1;
+        }
+        self.push_inherited_frame_domain(layout, frame_place, span);
+        jil.Place result_place = self.project_constant_index(frame_place, layout.return_field_index);
+        self.push_assign(
+            self.project_constant_index(frame_place, layout.continuation_result_field_index),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: result_place,
+                frame_root: false
+            )),
+            span
+        );
+        jil.Operand erased_frame = self.cast_operand_to_type(
+            self.operand_for_place(frame_pointer_place),
+            self.jil_place_type(self.project_constant_index(frame_place, layout.continuation_context_field_index)),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(frame_place, layout.continuation_context_field_index),
+            jil.use_rvalue(jil.UseRvalue (value: erased_frame)),
+            span
+        );
+        jil.FunctionRef completion_function = self.coroutine_generated_function_ref(
+            function.def_id,
+            self.lowerer.output.empty_type_args(),
+            self.lowerer.output.empty_const_args(),
+            layout,
+            false,
+            span
+        );
+        self.statements.add(coroutine_task_abi.continuation_function_initializer(
+            self.lowerer.output,
+            layout,
+            frame_place,
+            completion_function,
+            span
+        ));
+        self.statements.add(coroutine_task_abi.continuation_executor_null_initializer(
+            self.lowerer.output, layout, frame_place, span
+        ));
+        self.lower_detached_resume_call(function.def_id, layout, frame_pointer_place, span);
+    }
+
+    public jil.Operand detached_async_env_operand(
+        self,
+        sem.NodeId node_id,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        sem.Lambda? lambda,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        token.Span span
+    ) {
+        if (lambda is .some(task_lambda)) {
+            return self.embedded_async_env_operand(
+                node_id,
+                task_lambda,
+                captures,
+                null,
+                function,
+                layout,
+                frame_place,
+                span
+            );
+        }
+        return self.async_block_env_operand(
+            node_id,
+            captures,
+            null,
+            function,
+            layout,
+            frame_place,
+            span
+        );
+    }
+
+    public () lower_detached_resume_call(
+        self,
+        qid.DefId function_def,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_pointer_place,
+        token.Span span
+    ) {
+        jil.FunctionRef resume_function = self.coroutine_generated_function_ref(
+            function_def,
+            self.lowerer.output.empty_type_args(),
+            self.lowerer.output.empty_const_args(),
+            layout,
+            true,
+            span
+        );
+        jil.Operand resume_operand = jil.function_operand_value(resume_function);
+        jil.CallCallee callee! = jil.direct_function_callee(resume_function);
+        if (layout.effects.domain is .some(domain)) {
+            if (!types.effect_domain_equal(self.current_effects.domain, layout.effects.domain)) {
+                callee = jil.domain_enqueue_callee(domain.binding, layout.domain_kind, resume_operand);
+            }
+        }
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.cast_operand_to_type(
+            self.operand_for_place(frame_pointer_place),
+            self.lowerer.ctx.store.types.opaque_pointer_type(span),
+            span
+        ));
+        jil.LocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        jil.BlockId target = self.reserve_block(span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: callee,
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            async_start: jil.AsyncStartKind.detached,
+            destination: self.place_for_local(result),
+            target: target,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(target);
+    }
+
+    public jil.Operand cast_operand_to_type(self, jil.Operand value, qid.TypeId target_type, token.Span span) {
+        jil.LocalId local = self.add_temp(target_type, span);
+        self.push_assign(
+            self.place_for_local(local),
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_ptr,
+                value: value,
+                target_type: target_type
+            )),
+            span
+        );
+        return self.operand_for_place(self.place_for_local(local));
+    }
+
+    public jil.Operand async_block_env_operand(
+        self,
+        sem.NodeId node_id,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        jil.LocalId? capture_task,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        token.Span span
+    ) {
+        unsafe {
+            if (captures.length == 0) {
+                return self.null_operand(self.closure_env_type(span), span);
+            }
+            sem.LambdaParam*! params = self.lowerer.model.storage.alloc_array<sem.LambdaParam>(1);
+            sem.LambdaCapture*! explicit_captures =
+                self.lowerer.model.storage.alloc_array<sem.LambdaCapture>(1);
+            sem.Lambda lambda = sem.Lambda (
+                param_count: 0,
+                params: params[0..0],
+                captures: explicit_captures[0..0],
+                function_def: function.def_id,
+                body: node_id
+            );
+            return self.embedded_async_env_operand(
+                node_id,
+                lambda,
+                captures,
+                capture_task,
+                function,
+                layout,
+                frame_place,
+                span
+            );
+        }
+    }
+
+    public jil.Operand async_task_env_operand(
+        self,
+        sem.NodeId node_id,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        sem.Lambda? lambda,
+        jil.LocalId capture_task,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        token.Span span
+    ) {
+        guard lambda is .some(task_lambda) else {
+            return self.async_block_env_operand(
+                node_id,
+                captures,
+                capture_task,
+                function,
+                layout,
+                frame_place,
+                span
+            );
+        }
+        return self.embedded_async_env_operand(
+            node_id,
+            task_lambda,
+            captures,
+            capture_task,
+            function,
+            layout,
+            frame_place,
+            span
+        );
+    }
+
+    public jil.Operand embedded_async_env_operand(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        jil.LocalId? capture_task,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        token.Span span
+    ) {
+        if (captures.length == 0) {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        Int field_index = layout.capture_env_field_index;
+        if (field_index < 0) {
+            return self.unsupported_operand(node_id);
+        }
+        jil.LocalId? saved_capture_task! = self.active_coroutine_capture_task;
+        self.active_coroutine_capture_task = capture_task;
+        jil.Place env_place = self.project_constant_index(frame_place, field_index);
+        self.fill_lambda_env(node_id, lambda, captures, env_place);
+        qid.TypeId env_type = layout.fields[field_index].type_id;
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        jil.Operand env = self.erased_lambda_env_address_operand(
+            env_place,
+            env_pointer_type,
+            span
+        );
+        qid.DefId drop_shim = self.ensure_lambda_env_drop_shim(node_id, env_type, false);
+        jil.FunctionKey key = jil.FunctionKey(
+            function.def_id,
+            function.type_args,
+            function.const_args
+        );
+        self.lowerer.async_block_env_drop_shims.set(key, drop_shim);
+        self.active_coroutine_capture_task = saved_capture_task;
+        return env;
+    }
+
+    public () lower_block_into_place(self, sem.Block block, jil.Place destination) {
+        types.EffectSet saved_effects = self.enter_block_effects(block.effects);
+        list.ArrayList<jil.LocalId> scope_locals! = list.ArrayList<jil.LocalId>();
+        Int defer_depth = self.active_defers.len();
+        Int index! = 0;
+        while (index < block.statements.length) {
+            if (self.terminated) {
+                self.current_effects = saved_effects;
+                return;
+            }
+            self.lower_statement_node(block.statements[index], scope_locals$.ref());
+            index = index + 1;
+        }
+        if (self.terminated) {
+            self.current_effects = saved_effects;
+            return;
+        }
+        if (block.result is .some(result)) {
+            self.lower_into_place(result, destination);
+            if (!self.terminated) {
+                self.run_deferred_from(defer_depth, self.lowerer.model_span(result));
+                self.end_scope(scope_locals$.ref(), self.lowerer.model_span(result));
+            }
+            self.current_effects = saved_effects;
+            return;
+        }
+        self.push_assign(destination, self.unit_rvalue(token.Span()), token.Span());
+        self.run_deferred_from(defer_depth, token.Span());
+        self.end_scope(scope_locals$.ref(), token.Span());
+        self.current_effects = saved_effects;
+    }
+
+}

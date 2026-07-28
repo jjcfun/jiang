@@ -1,0 +1,373 @@
+// Slice、struct、Tuple、array literal 与目标类型提升 lowering。
+//
+// 本模块负责把 aggregate 值按目标类型写入 JIL place。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import monomorph = "../../sema/monomorph.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import place = "./place.jiang";
+import constant = "./constant.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+
+public extend body_context.BodyLowerer {
+    public () lower_slice(self, sem.NodeId node_id, sem.SliceAccess slice_access, jil.Place destination) {
+        jil.Place base = self.slice_base_place(slice_access.base);
+        token.Span span = self.lowerer.model_span(node_id);
+        self.push_assign(
+            destination,
+            jil.slice_rvalue(jil.SliceRvalue (
+                base: base,
+                start: self.optional_slice_bound(slice_access.start),
+                end: self.slice_end_bound(slice_access, span)
+            )),
+            span
+        );
+    }
+
+    public jil.Operand? slice_end_bound(self, sem.SliceAccess slice_access, token.Span span) {
+        if (slice_access.end is .some(end)) {
+            return self.optional_slice_bound(end);
+        }
+        qid.TypeId base_type = self.type_for_node(slice_access.base);
+        return self.array_to_slice_end(base_type, span);
+    }
+
+    public jil.Place slice_base_place(self, sem.NodeId base_id) {
+        jil.Place base = self.pointer_base_place(base_id);
+        qid.TypeId base_type = self.type_for_node(base_id);
+        if (self.type_is_reference_to_array(base_type)) {
+            return self.project_deref(base, false);
+        }
+        return base;
+    }
+
+    public Bool type_is_reference_to_array(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind != .reference) { return false; }
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        return element_info.data is .array_type(_);
+    }
+
+    public () lower_struct_literal(self, sem.NodeId node_id, sem.StructLiteral literal, jil.Place destination) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        guard self.lowerer.ctx.store.types.get(type_id).data is .named(named) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        if (self.lower_nominal_literal_as_field_assignments(node_id, literal, destination, named)) {
+            return;
+        }
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>();
+        monomorph.SubstitutionMap substitutions = self.nominal_substitution(named.def_id, named.type_args);
+        guard self.append_struct_literal_fields(literal, named.def_id, substitutions$.ref(), fields$.ref()) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.push_assign(
+            destination,
+            self.aggregate_rvalue(jil.AggregateRvalue (
+                kind: self.struct_literal_aggregate_kind(named.def_id),
+                def_id: named.def_id,
+                type_id: type_id,
+                tag: null,
+                payload_field_index: -1,
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            ), self.lowerer.model_span(node_id)),
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    // struct literal 在 JIL 中直接降成字段 assignment。这样 borrow check
+    // 看到的是 `dest.field = value`，不需要重新解释 aggregate 的字段语义。
+    public Bool lower_nominal_literal_as_field_assignments(self,
+        sem.NodeId node_id,
+        sem.StructLiteral literal,
+        jil.Place destination,
+        types.NamedType named
+    ) {
+        def.DefKind kind = self.lowerer.ctx.store.defs.get(named.def_id).kind;
+        if (kind != .struct_def) {
+            return false;
+        }
+        monomorph.SubstitutionMap substitutions = self.nominal_substitution(named.def_id, named.type_args);
+        guard self.lowerer.model.def(named.def_id) is .some(owner_model) else {
+            self.mark_unsupported(node_id);
+            return true;
+        }
+        Int index! = 0;
+        while (index < owner_model.members.len()) {
+            qid.DefId member_def = owner_model.members.get(index);
+            if (self.lowerer.ctx.store.defs.get(member_def).kind == .field_def) {
+                guard self.lower_nominal_literal_field(literal, destination, member_def, substitutions$.ref()) else {
+                    self.mark_unsupported(node_id);
+                    return true;
+                }
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    public Bool lower_nominal_literal_field(self,
+        sem.StructLiteral literal,
+        jil.Place destination,
+        qid.DefId field_def,
+        monomorph.SubstitutionMap& substitutions
+    ) {
+        guard self.struct_literal_field_value(literal, field_def) is .some(value) else { return false; }
+        guard self.field_expected_type(field_def, substitutions) is .some(field_type) else { return false; }
+        jil.Place field_place = self.project_field(destination, field_def, field_type);
+        self.lower_into_place_as_type(value, field_place, field_type);
+        return true;
+    }
+
+    public () lower_into_place_as_type(self, sem.NodeId node_id, jil.Place destination, qid.TypeId expected) {
+        qid.TypeId actual = self.type_for_node(node_id);
+        if (self.type_needs_optional_lift(actual, expected) || self.type_needs_error_union_lift(actual, expected)) {
+            jil.Operand value = self.lower_to_operand_as_type(node_id, expected);
+            self.push_assign(
+                destination,
+                jil.use_rvalue(jil.UseRvalue (value: value)),
+                self.lowerer.model_span(node_id)
+            );
+            return;
+        }
+        self.lower_into_place(node_id, destination);
+    }
+
+    public Bool append_struct_literal_fields(self,
+        sem.StructLiteral literal,
+        qid.DefId owner_def,
+        monomorph.SubstitutionMap& substitutions,
+        list.ArrayList<jil.Operand>& fields
+    ) {
+        guard self.lowerer.model.def(owner_def) is .some(owner_model) else { return false; }
+        Int index! = 0;
+        while (index < owner_model.members.len()) {
+            qid.DefId member_def = owner_model.members.get(index);
+            if (self.lowerer.ctx.store.defs.get(member_def).kind == .field_def) {
+                guard self.struct_literal_field_value(literal, member_def) is .some(value) else { return false; }
+                guard self.field_expected_type(member_def, substitutions) is .some(field_type) else { return false; }
+                fields.add(self.lower_to_operand_as_type(value, field_type));
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    public qid.TypeId? field_expected_type(self, qid.DefId field_def, monomorph.SubstitutionMap& substitutions) {
+        guard self.lowerer.typeck.def_type(field_def) is .some(type_id) else { return null; }
+        return self.lowerer.substitute_type(type_id, substitutions);
+    }
+
+    public jil.Operand lower_to_operand_as_type(self, sem.NodeId node_id, qid.TypeId expected) {
+        jil.Operand value = self.lower_to_operand(node_id);
+        if (self.value_needs_optional_lift(value, expected)) {
+            return self.lower_optional_lift_operand(node_id, value, expected);
+        }
+        return self.lower_error_union_lift_if_needed(node_id, value, expected);
+    }
+
+    public Bool value_needs_optional_lift(self, jil.Operand value, qid.TypeId expected) {
+        return self.type_needs_optional_lift(self.jil_operand_type(value), expected);
+    }
+
+    public Bool type_needs_optional_lift(self, qid.TypeId actual, qid.TypeId expected) {
+        types.TypeInfo expected_info = self.lowerer.ctx.store.types.get(expected);
+        guard expected_info.data is .optional(_) else { return false; }
+        return self.type_can_be_lifted(actual, expected);
+    }
+
+    public jil.Operand lower_optional_lift_operand(self, sem.NodeId node_id, jil.Operand value, qid.TypeId expected) {
+        jil.LocalId temp = self.add_temp(expected, self.lowerer.model_span(node_id));
+        jil.Place temp_place = self.place_for_local(temp);
+        self.push_assign(
+            temp_place,
+            jil.optional_rvalue(jil.OptionalRvalue (
+                op: jil.OptionalOp.make_some,
+                value: value
+            )),
+            self.lowerer.model_span(node_id)
+        );
+        return jil.copy_operand_value(jil.CopyOperand (place: temp_place));
+    }
+
+    @life(return: self & value)
+    public jil.Operand lower_error_union_lift_if_needed(self,
+        sem.NodeId node_id,
+        jil.Operand value,
+        qid.TypeId expected
+    ) {
+        if (self.value_needs_error_union_lift(value, expected)) {
+            return self.lower_error_union_lift_operand(node_id, value, expected);
+        }
+        return value;
+    }
+
+    public Bool value_needs_error_union_lift(self, jil.Operand value, qid.TypeId expected) {
+        return self.type_needs_error_union_lift(self.jil_operand_type(value), expected);
+    }
+
+    public Bool type_needs_error_union_lift(self, qid.TypeId actual, qid.TypeId expected) {
+        types.TypeInfo expected_info = self.lowerer.ctx.store.types.get(expected);
+        guard expected_info.data is .error_union(_) else { return false; }
+        return self.type_can_be_lifted(actual, expected);
+    }
+
+    public Bool type_can_be_lifted(self, qid.TypeId actual, qid.TypeId expected) {
+        if (self.lowerer.ctx.store.types.same_type_ignoring_mutability(actual, expected)) {
+            return false;
+        }
+        types.TypeInfo actual_info = self.lowerer.ctx.store.types.get(actual);
+        if (actual_info.data is .invalid) { return false; }
+        if (actual_info.data is .never) { return false; }
+        return true;
+    }
+
+    public jil.Operand lower_error_union_lift_operand(
+        self,
+        sem.NodeId node_id,
+        jil.Operand value,
+        qid.TypeId expected
+    ) {
+        jil.LocalId temp = self.add_temp(expected, self.lowerer.model_span(node_id));
+        jil.Place temp_place = self.place_for_local(temp);
+        self.push_assign(
+            temp_place,
+            jil.error_union_rvalue(jil.ErrorUnionRvalue (
+                op: jil.ErrorUnionOp.make_value,
+                value: value
+            )),
+            self.lowerer.model_span(node_id)
+        );
+        return jil.copy_operand_value(jil.CopyOperand (place: temp_place));
+    }
+
+    public qid.TypeId jil_operand_type(self, jil.Operand value) {
+        if (value is .const_operand(const_value)) {
+            return const_value.type_id;
+        }
+        if (value is .copy_operand(copy_value)) {
+            return self.jil_place_type(copy_value.place);
+        }
+        if (value is .move_operand(move_value)) {
+            return self.jil_place_type(move_value.place);
+        }
+        if (value is .global_operand(global_value)) {
+            return global_value.type_id;
+        }
+        if (value is .global_address_operand(global_value)) {
+            return global_value.type_id;
+        }
+        if (value is .function_operand(function_value)) {
+            return function_value.type_id;
+        }
+        return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    public sem.NodeId? struct_literal_field_value(self, sem.StructLiteral literal, qid.DefId field_def) {
+        qid.SymbolId field_symbol = self.lowerer.ctx.store.defs.get(field_def).name.symbol;
+        Int index! = 0;
+        while (index < literal.fields.length) {
+            if (literal.fields[index].field_symbol == field_symbol) {
+                return literal.fields[index].value;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public jil.AggregateKind struct_literal_aggregate_kind(self, qid.DefId def_id) {
+        return jil.AggregateKind.struct_value;
+    }
+
+    public () lower_tuple_literal(self, sem.NodeId node_id, sem.TupleLiteral literal, jil.Place destination) {
+        qid.TypeId[]& item_types = self.tuple_item_types(node_id);
+        Int index! = 0;
+        while (index < literal.items.length) {
+            qid.TypeId item_type = self.tuple_item_type(item_types, index);
+            jil.Place item_place = self.project_constant_index(destination, index);
+            self.lower_into_place_as_type(literal.items[index], item_place, item_type);
+            index = index + 1;
+        }
+    }
+
+    public qid.TypeId[]& tuple_item_types(self, sem.NodeId node_id) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .tuple_type(tuple_type)) {
+            return tuple_type.items;
+        }
+        return self.lowerer.output.empty_type_args();
+    }
+
+    public qid.TypeId tuple_item_type(self, qid.TypeId[]& item_types, Int index) {
+        if (index < item_types.length) {
+            return item_types[index];
+        }
+        return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    public () lower_array_literal(self, sem.NodeId node_id, sem.ArrayLiteral literal, jil.Place destination) {
+        qid.TypeId element_type = self.array_element_type(node_id, destination);
+        Int index! = 0;
+        while (index < literal.items.length) {
+            jil.Place element_place = self.project_constant_index(destination, index);
+            self.lower_into_place_as_type(literal.items[index], element_place, element_type);
+            index = index + 1;
+        }
+        self.lower_array_sentinel_storage(destination, element_type, self.lowerer.model_span(node_id));
+    }
+
+    public () lower_array_sentinel_storage(self, jil.Place destination, qid.TypeId element_type, token.Span span) {
+        qid.TypeId destination_type = self.jil_place_type(destination);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(destination_type);
+        guard info.data is .array_type(array_type) else { return; }
+        guard array_type.sentinel is .some(sentinel) else { return; }
+        jil.Place sentinel_place = self.project_constant_index(destination, array_type.count);
+        self.lower_comptime_value_into_place_at_span(sentinel.value, sentinel_place, span);
+    }
+
+    public qid.TypeId array_element_type(self, sem.NodeId node_id, jil.Place destination) {
+        qid.TypeId destination_type = self.jil_place_type(destination);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(destination_type);
+        if (info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        sem.Node node = self.lowerer.model.node(node_id);
+        guard node.data is .array_literal(literal) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        qid.TypeId source_type = self.array_literal_source_type(node_id, literal);
+        types.TypeInfo source_info = self.lowerer.ctx.store.types.get(source_type);
+        if (source_info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    public jil.Operand? optional_slice_bound(self, sem.NodeId? bound) {
+        if (bound is .some(bound_id)) {
+            return self.lower_to_operand(bound_id);
+        }
+        return null;
+    }
+
+}

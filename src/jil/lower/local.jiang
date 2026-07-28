@@ -1,0 +1,245 @@
+// 函数初始 local、参数和返回值类型的构造。
+//
+// 本模块只描述函数进入 body lowering 前所需的局部存储模型。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import monomorph = "../../sema/monomorph.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import string = "../../support/string.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import * = "./model.jiang";
+import lower_context = "./context.jiang";
+import * = "./body.jiang";
+import * = "./context.jiang";
+import lower_type_support = "./type_support.jiang";
+
+public extend lower_context.Context {
+    public Int generic_param_count(self, sem.Def& model_def) {
+        Int count! = self.generic_param_count_for_def(model_def.def_id);
+        qid.DefId? owner! = self.ctx.store.defs.get(model_def.def_id).owner_def;
+        while (owner is .some(owner_def)) {
+            if (!self.ctx.store.defs.has(owner_def)) {
+                return count;
+            }
+            count = count + self.generic_param_count_for_def(owner_def);
+            owner = self.ctx.store.defs.get(owner_def).owner_def;
+        }
+        return count;
+    }
+
+    public Int generic_param_count_for_def(self, qid.DefId def_id) {
+        guard self.model.def(def_id) is .some(model_def) else { return 0; }
+        return model_def.generic_params.len()
+            + monomorph.implicit_trait_self_param_count(self.ctx.store$.ref(), def_id);
+    }
+
+    public Int add_initial_locals(self,
+        sem.Def& model_def,
+        monomorph.SubstitutionMap& substitutions,
+        list.ArrayList<jil.LocalDecl>& locals
+    ) {
+        locals.add(jil.LocalDecl (
+            id: jil.LocalId.from_index(0),
+            kind: jil.LocalKind.return_place,
+            type_id: self.return_type(model_def, substitutions),
+            span: self.def_span(model_def.def_id),
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        ));
+        guard model_def.body is .some(ref _ body) else {
+            return 0;
+        }
+        Int model_local_offset! = 0;
+        if (self.should_synthesize_closure_env_local(model_def, body)) {
+            locals.add(self.synthetic_closure_env_local(model_def));
+            model_local_offset = model_local_offset + 1;
+        }
+        if (self.should_synthesize_receiver_local(model_def, body)) {
+            locals.add(self.synthetic_receiver_local(model_def, substitutions, model_local_offset + 1));
+            model_local_offset = model_local_offset + 1;
+        }
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            sem.Local local = body.locals.get_index(index);
+            locals.add(self.lower_local(model_def, local, substitutions, index + 1 + model_local_offset));
+            index = index + 1;
+        }
+        return model_local_offset;
+    }
+
+    public Bool should_synthesize_receiver_local(self, sem.Def& model_def, sem.Body& body) {
+        guard model_def.decl.function_signature is .some(signature) else { return false; }
+        if (!signature.has_receiver) {
+            return false;
+        }
+        if (body.locals.len() == 0) {
+            return true;
+        }
+        sem.Local first = body.locals.get_index(0);
+        return !string.equal(self.ctx.store.symbols.text(first.symbol), "self");
+    }
+
+    public Bool should_synthesize_closure_env_local(self, sem.Def& model_def, sem.Body& body) {
+        if (!model_def.decl.is_lambda_function) { return false; }
+        guard self.typeck.def_type(model_def.def_id) is .some(type_id) else { return false; }
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        Int parameter_count! = 0;
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            if (body.locals.get_index(index).kind == .parameter) {
+                parameter_count = parameter_count + 1;
+            }
+            index = index + 1;
+        }
+        return function_type.params.length == parameter_count + 1;
+    }
+
+    public jil.LocalDecl synthetic_closure_env_local(self, sem.Def& model_def) {
+        token.Span span = self.def_span(model_def.def_id);
+        return jil.LocalDecl (
+            id: jil.LocalId.from_index(1),
+            kind: jil.LocalKind.param,
+            type_id: self.ctx.store.types.opaque_pointer_type(span),
+            span: span,
+            name: self.ctx.store.symbols.intern("__env"),
+            def_id: null,
+            mutable_local: false,
+            address_taken: false
+        );
+    }
+
+    public jil.LocalDecl synthetic_receiver_local(self,
+        sem.Def& model_def,
+        monomorph.SubstitutionMap& substitutions,
+        Int jil_index
+    ) {
+        token.Span span = self.def_span(model_def.def_id);
+        qid.TypeId type_id = self.receiver_type(model_def, substitutions, span);
+        return jil.LocalDecl (
+            id: jil.LocalId.from_index(jil_index),
+            kind: jil.LocalKind.param,
+            type_id: type_id,
+            span: span,
+            name: self.ctx.store.symbols.intern("self"),
+            def_id: null,
+            mutable_local: false,
+            address_taken: false
+        );
+    }
+
+    public qid.TypeId receiver_type(self,
+        sem.Def& model_def,
+        monomorph.SubstitutionMap& substitutions,
+        token.Span span
+    ) {
+        if (self.typeck.def_type(model_def.def_id) is .some(function_type_id)) {
+            qid.TypeId substituted = self.substitute_type(function_type_id, substitutions);
+            types.TypeInfo info = self.ctx.store.types.get(substituted);
+            if (info.data is .function_type(function_type)) {
+                if (function_type.params.length > 0) {
+                    return function_type.params[0];
+                }
+            }
+        }
+        guard self.ctx.store.defs.get(model_def.def_id).owner_def is .some(owner_def) else {
+            return self.ctx.store.types.invalid_type();
+        }
+        if (self.ctx.store.types.builtin_type_for_def(owner_def) is .some(type_id)) {
+            return self.ctx.store.types.reference_type(type_id, span);
+        }
+        return self.ctx.store.types.reference_type(self.ctx.store.types.named_type(owner_def, span), span);
+    }
+
+    public jil.LocalDecl lower_local(self,
+        sem.Def& model_def,
+        sem.Local local,
+        monomorph.SubstitutionMap& substitutions,
+        Int jil_index
+    ) {
+        qid.TypeId type_id = self.type_for_local(model_def, local, substitutions);
+        return jil.LocalDecl (
+            id: jil.LocalId.from_index(jil_index),
+            kind: self.local_kind(model_def, local),
+            type_id: type_id,
+            span: self.def_span(local.def_id),
+            name: local.symbol,
+            def_id: local.def_id,
+            mutable_local: local.mutable_binding,
+            address_taken: false
+        );
+    }
+
+    public qid.TypeId type_for_local(self,
+        sem.Def& model_def,
+        sem.Local local,
+        monomorph.SubstitutionMap& substitutions
+    ) {
+        if (self.local_is_self_receiver(model_def, local)) {
+            return self.receiver_type(model_def, substitutions, self.def_span(local.def_id));
+        }
+        if (self.typeck.def_type(local.def_id) is .some(type_id)) {
+            return self.substitute_type(type_id, substitutions);
+        }
+        if (local.type_ref is .some(type_ref)) {
+            if (self.typeck.node_type(type_ref) is .some(type_id)) {
+                return self.substitute_type(type_id, substitutions);
+            }
+        }
+        return self.ctx.store.types.invalid_type();
+    }
+
+    public Bool local_is_self_receiver(self, sem.Def& model_def, sem.Local local) {
+        guard model_def.decl.function_signature is .some(signature) else { return false; }
+        if (!signature.has_receiver) {
+            return false;
+        }
+        return string.equal(self.ctx.store.symbols.text(local.symbol), "self");
+    }
+
+    public jil.LocalKind local_kind(self, sem.Def& model_def, sem.Local local) {
+        if (self.local_is_self_receiver(model_def, local)) {
+            return jil.LocalKind.param;
+        }
+        if (local.kind == .parameter) { return jil.LocalKind.param; }
+        if (self.ctx.store.defs.get(local.def_id).kind == .parameter_def) {
+            return jil.LocalKind.param;
+        }
+        return jil.LocalKind.user_local;
+    }
+
+    public qid.TypeId return_type(self, sem.Def& model_def, monomorph.SubstitutionMap& substitutions) {
+        if (self.typeck.def_type(model_def.def_id) is .some(function_type_id)) {
+            qid.TypeId substituted = self.substitute_type(function_type_id, substitutions);
+            if (self.ctx.store.types.get(substituted).data is .function_type(function_type)) {
+                return function_type.result;
+            }
+        }
+        return self.ctx.store.types.unit_type();
+    }
+
+    public types.EffectSet function_effects_for_def(self,
+        qid.DefId function_def,
+        monomorph.SubstitutionMap& substitutions
+    ) {
+        guard self.typeck.def_type(function_def) is .some(function_type_id) else {
+            return types.EffectSet();
+        }
+        qid.TypeId substituted = self.substitute_type(function_type_id, substitutions);
+        types.TypeInfo info = self.ctx.store.types.get(substituted);
+        guard info.data is .function_type(function_type) else {
+            return types.EffectSet();
+        }
+        return function_type.effects;
+    }
+
+}

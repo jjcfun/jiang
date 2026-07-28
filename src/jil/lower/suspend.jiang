@@ -1,0 +1,1543 @@
+// coroutine suspend、continuation、resume 和 cancellation lowering。
+//
+// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import coroutine_task_abi = "../coroutine/task_abi.jiang";
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import task = "./task.jiang";
+import ownership = "./ownership.jiang";
+import place = "./place.jiang";
+import closure = "./closure.jiang";
+import call = "./call.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+public extend body_context.BodyLowerer {
+    public Bool is_coroutine_suspend_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.coroutine_suspend
+            is .some(suspend_def) else { return false; }
+        return target_def == suspend_def;
+    }
+
+    public Bool is_coroutine_check_cancelled_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.coroutine_check_cancelled
+            is .some(check_def) else { return false; }
+        return target_def == check_def;
+    }
+
+    public () lower_coroutine_check_cancelled(
+        self,
+        sem.NodeId node_id,
+        jil.Place destination
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.TaskStateLayout state = self.current_task_state_layout();
+        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.BlockId check = self.reserve_block(span);
+        jil.BlockId observe = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.branch_on_non_null_pointer(pointer, check, complete, span);
+        self.start_block(check);
+        jil.Place request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output,
+            self.project_deref(pointer, true),
+            state.cancellation_requested
+        );
+        jil.LocalId claimed = self.add_temp(
+            self.lowerer.ctx.store.types.bool_type(), span
+        );
+        self.push_assign(
+            self.place_for_local(claimed),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: request,
+                expected: jil.const_operand_value(self.int_const(1, span)),
+                desired: jil.const_operand_value(self.int_const(2, span)),
+                // A confined direct child can still observe its concurrent root Task context.
+                // Keep this claim atomic when local coroutine protocol operations are specialized.
+                mode: .user_atomic
+            )),
+            span
+        );
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: self.cancellation_entry,
+            else_target: observe
+        )), span);
+        self.start_block(observe);
+        jil.LocalId request_state = self.add_temp(self.jil_place_type(request), span);
+        self.push_assign(
+            self.place_for_local(request_state),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: request,
+                mode: .user_atomic
+            )),
+            span
+        );
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(1);
+        cases.add(jil.SwitchCase (
+            value: self.int_const(2, span),
+            target: self.cancellation_entry
+        ));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(request_state)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: complete
+        )), span);
+        self.start_block(complete);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+    }
+
+    public Bool is_continuation_resume_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.continuation_resume
+            is .some(resume_def) else { return false; }
+        return target_def == resume_def;
+    }
+
+    public Bool is_continuation_on_cancel_def(self, qid.DefId target_def) {
+        guard self.lowerer.ctx.store.resolve.core_functions.continuation_on_cancel
+            is .some(on_cancel_def) else { return false; }
+        return target_def == on_cancel_def;
+    }
+
+    public () lower_coroutine_suspend(
+        self,
+        sem.NodeId node_id,
+        sem.Call call,
+        jil.Place destination
+    ) {
+        guard call.args.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        sem.NodeId registration_id = call.args[0].value;
+        qid.TypeId registration_type = self.type_for_node(registration_id);
+        types.TypeInfo registration_info = self.lowerer.ctx.store.types.get(registration_type);
+        guard registration_info.data is .function_type(registration_fn) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard registration_fn.params.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.lower_coroutine_suspend_registration(
+            node_id,
+            registration_id,
+            registration_type,
+            registration_fn.params[0],
+            destination
+        );
+    }
+
+    public () lower_coroutine_suspend_registration(
+        self,
+        sem.NodeId node_id,
+        sem.NodeId registration_id,
+        qid.TypeId registration_type,
+        qid.TypeId continuation_type,
+        jil.Place destination
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
+            self.jil_place_type(destination), span
+        );
+        jil.LocalId record_local = self.add_temp(layout.type_id, span);
+        jil.Place record = self.place_for_local(record_local);
+        self.initialize_suspend_continuation(layout, record, destination, span);
+        self.check_cancellation_before_suspend_registration(record, layout, span);
+        jil.LocalId continuation_local = self.add_temp(continuation_type, span);
+        jil.Place continuation = self.place_for_local(continuation_local);
+        self.initialize_suspend_handle(layout, record, continuation, span);
+        if (self.call_suspend_registration_lambda(
+                registration_id, continuation, record, layout, span
+            )
+        ) {
+            return;
+        }
+        jil.LocalId registration_local = self.add_temp(registration_type, span);
+        jil.Place registration = self.place_for_local(registration_local);
+        self.lower_into_place(registration_id, registration);
+        self.call_suspend_registration(registration, continuation, record, layout, span);
+    }
+
+    public () check_cancellation_before_suspend_registration(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place request = self.project_deref(
+            self.project_constant_index(record, layout.cancel_request_pointer_field_index),
+            true
+        );
+        jil.LocalId requested = self.add_temp(self.jil_place_type(request), span);
+        self.push_assign(
+            self.place_for_local(requested),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: request,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId cancelled = self.reserve_block(span);
+        jil.BlockId registration = self.reserve_block(span);
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(1);
+        cases.add(jil.SwitchCase (
+            value: self.int_const(1, span),
+            target: cancelled
+        ));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(requested)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: registration
+        )), span);
+        self.start_block(cancelled);
+        self.clear_suspend_registration_target(record, layout, span);
+        jil.BlockId parked = self.reserve_block(span);
+        self.call_suspend_resume(record, layout, parked, span);
+        self.start_block(parked);
+        self.finish_block(jil.suspend_pending_terminator_kind(jil.SuspendPendingTerminator (
+            target: parked,
+            suspend_wake: .external
+        )), span);
+        self.start_block(registration);
+    }
+
+    public () clear_suspend_registration_target(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place word = self.project_deref(
+            self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+            true
+        );
+        jil.LocalId cleared = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(cleared),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: word,
+                expected: jil.const_operand_value(self.int_const(3, span)),
+                desired: jil.const_operand_value(self.int_const(0, span)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+    }
+
+    public () initialize_suspend_continuation(
+        self,
+        jil.SuspendContinuationLayout layout,
+        jil.Place record,
+        jil.Place destination,
+        token.Span span
+    ) {
+        self.push_assign(
+            self.project_constant_index(record, layout.result_field_index),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: destination,
+                frame_root: false
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.context_field_index),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: self.place_for_local(self.return_local()),
+                frame_root: true
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.resume_field_index),
+            jil.use_rvalue(jil.UseRvalue (
+                value: jil.function_operand_value(jil.FunctionRef (
+                    function_def: self.model_def.def_id,
+                    type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+                    const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+                    coroutine_resume: true,
+                    coroutine_completion: false,
+                    type_id: self.lowerer.coroutine_continuation_type(
+                        self.lowerer.coroutine_context_pointer_type(span), span
+                    ),
+                    span: span
+                ))
+            )),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.executor_field_index),
+            jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.task_field_index),
+            jil.current_task_rvalue(jil.CurrentTaskRvalue (
+                observed: false,
+                cancellation_context: true
+            )),
+            span
+        );
+        self.push_atomic_store(
+            self.project_constant_index(record, layout.phase_field_index),
+            self.int_operand(suspend_registering, span),
+            span
+        );
+        self.initialize_suspend_cancel_target(layout, record, span);
+    }
+
+    public () initialize_suspend_cancel_target(
+        self,
+        jil.SuspendContinuationLayout layout,
+        jil.Place record,
+        token.Span span
+    ) {
+        jil.TaskStateLayout state = self.current_task_state_layout();
+        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.BlockId inherited = self.reserve_block(span);
+        jil.BlockId fallback = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.branch_on_non_null_pointer(pointer, inherited, fallback, span);
+        self.start_block(inherited);
+        jil.Place task = self.project_deref(pointer, true);
+        jil.Place word = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancel_target_word
+        );
+        jil.Place request = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancellation_requested
+        );
+        self.store_suspend_field_address(record, layout.cancel_request_pointer_field_index, request, span);
+        self.store_suspend_field_address(record, layout.cancel_word_pointer_field_index, word, span);
+        self.push_atomic_store(word, jil.const_operand_value(self.int_const(3, span)), span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(fallback);
+        jil.Place fallback_request = self.project_constant_index(
+            record, layout.fallback_cancel_request_field_index
+        );
+        jil.Place fallback_word = self.project_constant_index(
+            record, layout.fallback_cancel_word_field_index
+        );
+        self.push_atomic_store(
+            fallback_request, jil.const_operand_value(self.int_const(0, span)), span
+        );
+        self.push_atomic_store(
+            fallback_word, jil.const_operand_value(self.int_const(3, span)), span
+        );
+        self.store_suspend_field_address(
+            record, layout.cancel_request_pointer_field_index, fallback_request, span
+        );
+        self.store_suspend_field_address(
+            record, layout.cancel_word_pointer_field_index, fallback_word, span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public () store_suspend_field_address(
+        self,
+        jil.Place record,
+        Int field_index,
+        jil.Place value,
+        token.Span span
+    ) {
+        self.push_assign(
+            self.project_constant_index(record, field_index),
+            jil.address_of_rvalue(jil.AddressOfRvalue (
+                mutable_pointer: true,
+                place: value
+            )),
+            span
+        );
+    }
+
+    public jil.Operand suspend_cancel_target_word(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.LocalId pointer = self.add_temp(layout.pointer_type_id, span);
+        self.push_assign(
+            self.place_for_local(pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: record,
+                frame_root: false
+            )),
+            span
+        );
+        qid.TypeId int_type = self.lowerer.ctx.store.types.int_type();
+        jil.LocalId address = self.add_temp(int_type, span);
+        self.push_assign(
+            self.place_for_local(address),
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_int,
+                value: self.operand_for_place(self.place_for_local(pointer)),
+                target_type: int_type
+            )),
+            span
+        );
+        jil.LocalId tagged = self.add_temp(int_type, span);
+        self.push_assign(
+            self.place_for_local(tagged),
+            jil.binary_rvalue(jil.BinaryRvalue (
+                op: jil.BinaryOp.bit_or,
+                lhs: self.operand_for_place(self.place_for_local(address)),
+                rhs: self.int_operand(1, span)
+            )),
+            span
+        );
+        return self.operand_for_place(self.place_for_local(tagged));
+    }
+
+    public () initialize_suspend_handle(
+        self,
+        jil.SuspendContinuationLayout layout,
+        jil.Place record,
+        jil.Place continuation,
+        token.Span span
+    ) {
+        jil.LocalId pointer = self.add_temp(layout.pointer_type_id, span);
+        jil.Place pointer_place = self.place_for_local(pointer);
+        self.push_assign(
+            pointer_place,
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: record,
+                frame_root: false
+            )),
+            span
+        );
+        jil.Place state = self.project_constant_index(continuation, 0);
+        self.push_assign(
+            state,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_int,
+                value: self.operand_for_place(pointer_place),
+                target_type: self.jil_place_type(state)
+            )),
+            span
+        );
+    }
+
+    public () call_suspend_registration(
+        self,
+        jil.Place registration,
+        jil.Place continuation,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place vtable = self.project_deref(
+            self.project_constant_index(registration, 1), true
+        );
+        jil.Place function = self.project_constant_index(vtable, 0);
+        jil.CallCallee callee = jil.indirect_operand_callee(self.operand_for_place(function));
+        jil.Operand environment = self.operand_for_place(self.project_constant_index(registration, 0));
+        self.finish_suspend_registration_call(
+            callee, environment, continuation, record, layout, span
+        );
+    }
+
+    public Bool call_suspend_registration_lambda(
+        self,
+        sem.NodeId registration_id,
+        jil.Place continuation,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        sem.Node node = self.lowerer.model.node(registration_id);
+        guard node.data is .lambda_expr(lambda) else { return false; }
+        qid.TypeId closure_type = self.type_for_node(registration_id);
+        jil.Operand environment = self.lambda_env_operand(registration_id, lambda, span);
+        self.ensure_lambda_function_instance(lambda.function_def);
+        jil.FunctionRef function = jil.FunctionRef (
+            function_def: lambda.function_def,
+            type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+            const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_code_type(closure_type),
+            span: span
+        );
+        self.finish_suspend_registration_call(
+            jil.direct_function_callee(function),
+            environment,
+            continuation,
+            record,
+            layout,
+            span
+        );
+        return true;
+    }
+
+    public () finish_suspend_registration_call(
+        self,
+        jil.CallCallee callee,
+        jil.Operand environment,
+        jil.Place continuation,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(2);
+        args.add(environment);
+        args.add(self.operand_for_place(continuation));
+        jil.LocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        jil.BlockId next = self.reserve_block(span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: callee,
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: next,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next);
+        self.finish_suspend_registration(record, layout, span);
+    }
+
+    public () finish_suspend_registration(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place phase = self.project_constant_index(record, layout.phase_field_index);
+        jil.LocalId parked = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(parked),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: phase,
+                expected: self.int_operand(suspend_registering, span),
+                desired: self.int_operand(suspend_parked, span),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId suspend = self.reserve_block(span);
+        jil.BlockId await_publish = self.reserve_block(span);
+        jil.BlockId check_cancel = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(parked)),
+            then_target: suspend,
+            else_target: await_publish
+        )), span);
+        self.start_block(suspend);
+        self.finish_block(jil.suspend_pending_terminator_kind(jil.SuspendPendingTerminator (
+            target: complete,
+            suspend_wake: .external
+        )), span);
+        self.start_block(await_publish);
+        jil.LocalId observed = self.add_temp(self.jil_place_type(phase), span);
+        self.push_assign(
+            self.place_for_local(observed),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: phase,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(2);
+        cases.add(jil.SwitchCase (
+            value: self.int_const(suspend_resumed, span),
+            target: check_cancel
+        ));
+        cases.add(jil.SwitchCase (value: self.int_const(suspend_parked, span), target: suspend));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(observed)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: await_publish
+        )), span);
+        self.start_block(check_cancel);
+        self.check_cancellation_before_suspend_registration(record, layout, span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public () lower_continuation_resume(
+        self,
+        sem.NodeId node_id,
+        sem.Call call,
+        jil.Place destination
+    ) {
+        guard call.args.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.call_member_receiver(call) is .some(receiver_id) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        sem.NodeId value_id = call.args[0].value;
+        jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
+            self.type_for_node(value_id), span
+        );
+        jil.Place record = self.suspend_record_for_receiver(receiver_id, layout, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+        self.resume_suspend_record(value_id, record, layout, span);
+    }
+
+    public () lower_continuation_on_cancel(
+        self,
+        sem.NodeId node_id,
+        sem.Call call,
+        jil.Place destination
+    ) {
+        guard call.args.length == 1 else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.call_member_receiver(call) is .some(receiver_id) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        sem.NodeId handler_id = call.args[0].value;
+        sem.Node handler_node = self.lowerer.model.node(handler_id);
+        guard handler_node.data is .lambda_expr(handler) else {
+            self.mark_unsupported(handler_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId result_type = self.continuation_result_type(receiver_id);
+        jil.SuspendContinuationLayout layout = self.lowerer.suspend_continuation_layout(
+            result_type, span
+        );
+        jil.Place record = self.suspend_record_for_receiver(receiver_id, layout, span);
+        self.register_suspend_cancel_handler(handler_id, handler, record, layout, span);
+        self.push_assign(destination, self.unit_rvalue(span), span);
+    }
+
+    public qid.TypeId continuation_result_type(self, sem.NodeId receiver_id) {
+        qid.TypeId type_id! = self.type_for_node(receiver_id);
+        types.TypeInfo info! = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            type_id = handle.element;
+            info = self.lowerer.ctx.store.types.get(type_id);
+        }
+        guard info.data is .named(named) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        guard named.type_args.length == 1 else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        return self.lowerer.substitute_type(named.type_args[0], self.substitutions);
+    }
+
+    public () register_suspend_cancel_handler(
+        self,
+        sem.NodeId handler_id,
+        sem.Lambda handler,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Operand context = self.heap_lambda_env_operand(handler_id, handler, null, span);
+        jil.FunctionRef drop = self.cancel_handler_drop_function(handler_id, handler, span);
+        jil.FunctionRef invoke = self.ensure_cancel_handler_shim(
+            handler_id, handler, drop, span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.handler_context_field_index),
+            jil.use_rvalue(jil.UseRvalue (value: context)),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.handler_drop_field_index),
+            jil.use_rvalue(jil.UseRvalue (value: jil.function_operand_value(drop))),
+            span
+        );
+        self.push_assign(
+            self.project_constant_index(record, layout.handler_function_field_index),
+            jil.use_rvalue(jil.UseRvalue (value: jil.function_operand_value(invoke))),
+            span
+        );
+        self.push_atomic_store(
+            self.project_deref(
+                self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+                true
+            ),
+            self.suspend_cancel_target_word(record, layout, span),
+            span
+        );
+        self.invoke_suspend_cancel_handler_if_requested(record, layout, span);
+    }
+
+    public () invoke_suspend_cancel_handler_if_requested(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place request = self.project_deref(
+            self.project_constant_index(record, layout.cancel_request_pointer_field_index),
+            true
+        );
+        jil.LocalId requested = self.add_temp(self.jil_place_type(request), span);
+        self.push_assign(
+            self.place_for_local(requested),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: request,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId invoke = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(1);
+        cases.add(jil.SwitchCase (value: self.int_const(1, span), target: invoke));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(requested)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: complete
+        )), span);
+        self.start_block(invoke);
+        self.invoke_suspend_cancel_handler(record, layout, span);
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public () invoke_suspend_cancel_handler(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place word = self.project_deref(
+            self.project_constant_index(record, layout.cancel_word_pointer_field_index),
+            true
+        );
+        jil.LocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: word,
+                expected: self.suspend_cancel_target_word(record, layout, span),
+                desired: jil.const_operand_value(self.int_const(2, span)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId invoke = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: invoke,
+            else_target: complete
+        )), span);
+        self.start_block(invoke);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.operand_for_place(
+            self.project_constant_index(record, layout.handler_context_field_index)
+        ));
+        jil.LocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.indirect_operand_callee(self.operand_for_place(
+                self.project_constant_index(record, layout.handler_function_field_index)
+            )),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(complete);
+    }
+
+    public jil.FunctionRef cancel_handler_drop_function(
+        self,
+        sem.NodeId handler_id,
+        sem.Lambda handler,
+        token.Span span
+    ) {
+        qid.DefId drop_def! = self.ensure_closure_noop_drop_shim(span);
+        if (self.lowerer.typeck.lambda_capture_infos(handler.function_def) is .some(captures)) {
+            if (captures.length > 0) {
+                qid.TypeId env_type = self.lambda_env_type_for_infos(handler.function_def, captures, span);
+                drop_def = self.ensure_lambda_env_drop_shim(handler_id, env_type, true);
+            }
+        }
+        return jil.FunctionRef (
+            function_def: drop_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.lowerer.task_resume_function_type(span),
+            span: span
+        );
+    }
+
+    public sem.NodeId? call_member_receiver(self, sem.Call call) {
+        sem.Node callee = self.lowerer.model.node(call.callee);
+        guard callee.data is .member_access(member_access) else { return null; }
+        return member_access.base;
+    }
+
+    public jil.Place suspend_record_for_receiver(
+        self,
+        sem.NodeId receiver_id,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place receiver! = self.receiver_source_place(receiver_id, span);
+        if (self.type_is_reference(self.jil_place_type(receiver))) {
+            receiver = self.project_deref(receiver, false);
+        }
+        jil.Place state = self.project_constant_index(receiver, 0);
+        jil.LocalId pointer = self.add_temp(layout.pointer_type_id, span);
+        jil.Place pointer_place = self.place_for_local(pointer);
+        self.push_assign(
+            pointer_place,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.int_to_ptr,
+                value: self.operand_for_place(state),
+                target_type: layout.pointer_type_id
+            )),
+            span
+        );
+        return self.project_deref(pointer_place, true);
+    }
+
+    public () resume_suspend_record(
+        self,
+        sem.NodeId value_id,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place phase = self.project_constant_index(record, layout.phase_field_index);
+        jil.LocalId observed = self.add_temp(self.jil_place_type(phase), span);
+        jil.LocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        jil.LocalId schedule = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        jil.BlockId inspect = self.reserve_block(span);
+        jil.BlockId claim_registering = self.reserve_block(span);
+        jil.BlockId claim_parked = self.reserve_block(span);
+        jil.BlockId publish = self.reserve_block(span);
+        jil.BlockId enqueue = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.finish_block(self.goto_terminator(inspect), span);
+        self.start_block(inspect);
+        self.push_assign(
+            self.place_for_local(observed),
+            jil.atomic_load_rvalue(jil.AtomicLoadRvalue (
+                place: phase,
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        list.ArrayList<jil.SwitchCase> cases! = list.ArrayList<jil.SwitchCase>(2);
+        cases.add(jil.SwitchCase (
+            value: self.int_const(suspend_registering, span),
+            target: claim_registering
+        ));
+        cases.add(jil.SwitchCase (
+            value: self.int_const(suspend_parked, span),
+            target: claim_parked
+        ));
+        self.finish_block(jil.switch_terminator_kind(jil.SwitchTerminator (
+            discriminator: self.operand_for_place(self.place_for_local(observed)),
+            cases: self.lowerer.output.switch_case_array(cases$.ref()),
+            default_target: complete
+        )), span);
+        self.start_block(claim_registering);
+        self.push_assign(self.place_for_local(schedule), self.bool_rvalue(false, span), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: phase,
+                expected: self.int_operand(suspend_registering, span),
+                desired: self.int_operand(suspend_resuming, span),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: publish,
+            else_target: inspect
+        )), span);
+        self.start_block(claim_parked);
+        self.push_assign(self.place_for_local(schedule), self.bool_rvalue(true, span), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: phase,
+                expected: self.int_operand(suspend_parked, span),
+                desired: self.int_operand(suspend_resuming, span),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: publish,
+            else_target: inspect
+        )), span);
+        self.start_block(publish);
+        self.clear_suspend_cancel_handler(record, layout, span);
+        jil.Place result_pointer = self.project_constant_index(record, layout.result_field_index);
+        self.lower_into_place(value_id, self.project_deref(result_pointer, true));
+        self.push_atomic_store(phase, self.int_operand(suspend_resumed, span), span);
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(schedule)),
+            then_target: enqueue,
+            else_target: complete
+        )), span);
+        self.start_block(enqueue);
+        self.call_suspend_resume(record, layout, complete, span);
+        self.start_block(complete);
+    }
+
+    public () clear_suspend_cancel_handler(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        token.Span span
+    ) {
+        jil.Place word = self.project_deref(
+            self.project_constant_index(record, layout.cancel_word_pointer_field_index), true
+        );
+        jil.LocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: word,
+                expected: self.suspend_cancel_target_word(record, layout, span),
+                desired: jil.const_operand_value(self.int_const(0, span)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        jil.BlockId drop = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.finish_block(jil.branch_terminator_kind(jil.BranchTerminator (
+            condition: self.operand_for_place(self.place_for_local(claimed)),
+            then_target: drop,
+            else_target: complete
+        )), span);
+        self.start_block(drop);
+        self.call_suspend_handler_drop(record, layout, complete, span);
+        self.start_block(complete);
+        self.clear_suspend_registration_target(record, layout, span);
+    }
+
+    public () call_suspend_handler_drop(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        jil.BlockId complete,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.operand_for_place(
+            self.project_constant_index(record, layout.handler_context_field_index)
+        ));
+        jil.LocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.indirect_operand_callee(self.operand_for_place(
+                self.project_constant_index(record, layout.handler_drop_field_index)
+            )),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+    }
+
+    public () call_suspend_resume(
+        self,
+        jil.Place record,
+        jil.SuspendContinuationLayout layout,
+        jil.BlockId complete,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.operand_for_place(
+            self.project_constant_index(record, layout.context_field_index)
+        ));
+        jil.LocalId result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.dynamic_task_enqueue_callee(
+                self.operand_for_place(self.project_constant_index(record, layout.executor_field_index)),
+                self.operand_for_place(self.project_constant_index(record, layout.task_field_index)),
+                self.operand_for_place(self.project_constant_index(record, layout.resume_field_index)),
+                false
+            ),
+            args: self.lowerer.output.operand_array(args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: false,
+            destination: self.place_for_local(result),
+            target: complete,
+            initialized_place: null,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+    }
+
+    public () lower_async_direct_call(
+        self,
+        sem.NodeId node_id,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.Operand[]& args,
+        jil.Place destination,
+        token.Span span
+    ) {
+        if (self.lowerer.function_is_lowering(target_def, type_args, const_args)) {
+            self.lower_recursive_async_direct_call(
+                target_def, type_args, const_args, args, destination, span
+            );
+            return;
+        }
+        self.ensure_async_call_target(target_def, type_args, const_args);
+        guard self.async_call_target_function(target_def, type_args, const_args) is .some(function) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        if (function.is_external && self.current_effects.has_async) {
+            self.lower_external_async_continuation_call(
+                node_id,
+                target_def,
+                type_args,
+                const_args,
+                args,
+                destination,
+                span
+            );
+            return;
+        }
+        guard function.coroutine_frame is .some(layout) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        if (self.current_effects.has_async) {
+            self.lower_async_direct_continuation_call(
+                target_def,
+                type_args,
+                const_args,
+                args,
+                destination,
+                function$.ref(),
+                layout$.ref(),
+                null,
+                span
+            );
+            return;
+        }
+        jil.LocalId frame_local = self.add_temp(layout.frame_type_id, span);
+        jil.Place frame_place = self.place_for_local(frame_local);
+        self.lower_async_operands_into_frame(
+            args, function$.ref(), layout$.ref(), frame_place, span
+        );
+        jil.LocalId task_local = self.add_temp(layout.task_abi.task_type_id, span);
+        jil.Place task_place = self.place_for_local(task_local);
+        jil.TaskStoragePlan storage = self.parent_owned_task_storage(
+            .local, .concurrent
+        );
+        self.bind_task_place_identity(task_place, task_local);
+        self.set_task_storage_plan(task_local, storage);
+        self.initialize_local_task_state(task_place, layout$.ref(), task_local, span);
+        jil.FunctionRef resume_function = self.coroutine_generated_function_ref(
+            target_def, type_args, const_args, layout$.ref(), true, span
+        );
+        jil.FunctionRef completion_function = self.coroutine_generated_function_ref(
+            target_def, type_args, const_args, layout$.ref(), false, span
+        );
+        jil.Statement[]& initializers = coroutine_task_abi.initialized_task_initializers(
+            self.lowerer.output,
+            layout$.ref(),
+            task_place,
+            frame_place,
+            resume_function,
+            completion_function,
+            span
+        );
+        Int index! = 0;
+        while (index < initializers.length) {
+            self.statements.add(initializers[index]);
+            index = index + 1;
+        }
+        self.push_task_lifetime_initializers(task_place, layout$.ref(), storage, span);
+        self.lower_task_resume_call(task_place, resume_function, null, span);
+        self.lower_await_task_ready(task_place, span);
+        self.push_assign(destination, jil.use_rvalue(jil.UseRvalue (
+            value: self.operand_for_place(
+                coroutine_task_abi.task_field_place(
+                    self.lowerer.output, task_place, layout.task_abi.result_field
+                )
+            )
+        )), span);
+        self.release_consumed_task(task_place, true, span);
+    }
+
+    public () lower_recursive_async_direct_call(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.Operand[]& args,
+        jil.Place destination,
+        token.Span span
+    ) {
+        qid.DefId start_def = self.ensure_async_callable_start_shim(
+            target_def, type_args, const_args, span
+        );
+        jil.ExternalContinuationLayout layout =
+            self.lowerer.external_async_continuation_layout(
+                self.jil_place_type(destination), span
+            );
+        jil.LocalId continuation = self.add_temp(layout.type_id, span);
+        jil.Place continuation_place = self.place_for_local(continuation);
+        self.initialize_current_async_continuation(
+            layout, continuation_place, destination, span
+        );
+        jil.LocalId continuation_pointer = self.add_temp(
+            layout.pointer_type_id, span
+        );
+        self.push_assign(
+            self.place_for_local(continuation_pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<jil.Operand> start_args! = list.ArrayList<jil.Operand>(args.length + 1);
+        Int arg_index! = 0;
+        while (arg_index < args.length) {
+            start_args.add(args[arg_index]);
+            arg_index = arg_index + 1;
+        }
+        start_args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        qid.TypeId source_type = self.function_type_for_ref(
+            target_def, type_args, const_args
+        );
+        jil.FunctionRef child_resume = jil.FunctionRef (
+            function_def: target_def,
+            type_args: self.lowerer.output.type_arg_array(type_args),
+            const_args: self.lowerer.output.const_arg_array(const_args),
+            coroutine_resume: true,
+            coroutine_completion: false,
+            type_id: self.lowerer.coroutine_continuation_type(
+                self.lowerer.coroutine_context_pointer_type(span), span
+            ),
+            span: span
+        );
+        self.finish_async_direct_start(
+            jil.FunctionRef (
+                function_def: start_def,
+                type_args: self.lowerer.output.empty_type_args(),
+                const_args: self.lowerer.output.empty_const_args(),
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: self.lowerer.external_async_abi_function_type(source_type, span),
+                span: span
+            ),
+            child_resume,
+            start_args$.ref(),
+            self.type_return_lifetime_flows(source_type, 0),
+            args,
+            destination,
+            span
+        );
+    }
+
+    public () lower_external_async_continuation_call(
+        self,
+        sem.NodeId node_id,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.Operand[]& source_args,
+        jil.Place destination,
+        token.Span span
+    ) {
+        qid.TypeId context_type = self.lowerer.coroutine_context_pointer_type(span);
+        qid.TypeId continuation_type = self.lowerer.coroutine_continuation_type(context_type, span);
+        jil.ExternalContinuationLayout continuation_layout =
+            self.lowerer.external_async_continuation_layout(
+                self.jil_place_type(destination), span
+            );
+        jil.LocalId continuation_record = self.add_temp(continuation_layout.type_id, span);
+        jil.Place continuation_place = self.place_for_local(continuation_record);
+        jil.Rvalue context =
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: self.place_for_local(self.return_local()),
+                frame_root: true
+            ));
+        jil.Operand resume = jil.function_operand_value(jil.FunctionRef (
+            function_def: self.model_def.def_id,
+            type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+            const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+            coroutine_resume: true,
+            coroutine_completion: false,
+            type_id: continuation_type,
+            span: span
+        ));
+        self.initialize_external_async_continuation(
+            continuation_layout,
+            continuation_place,
+            destination,
+            jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
+            context,
+            resume,
+            span
+        );
+        jil.LocalId continuation_pointer = self.add_temp(
+            continuation_layout.pointer_type_id,
+            span
+        );
+        self.push_assign(
+            self.place_for_local(continuation_pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: continuation_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<jil.Operand> abi_args! = list.ArrayList<jil.Operand>(source_args.length + 1);
+        Int index! = 0;
+        while (index < source_args.length) {
+            abi_args.add(source_args[index]);
+            index = index + 1;
+        }
+        abi_args.add(self.operand_for_place(self.place_for_local(continuation_pointer)));
+        jil.LocalId unit_result = self.add_temp(self.lowerer.ctx.store.types.unit_type(), span);
+        jil.BlockId next_block = self.reserve_block(span);
+        self.compare_exchange_passive_cancel_target(0, 3, span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: jil.direct_function_callee(jil.FunctionRef (
+                function_def: target_def,
+                type_args: self.lowerer.output.type_arg_array(type_args),
+                const_args: self.lowerer.output.const_arg_array(const_args),
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: self.lowerer.external_async_abi_function_type(
+                    self.function_type_for_ref(target_def, type_args, const_args), span
+                ),
+                span: span
+            )),
+            args: self.lowerer.output.operand_array(abi_args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: true,
+            suspend_wake: .external,
+            destination: self.place_for_local(unit_result),
+            target: next_block,
+            initialized_place: null,
+            return_lifetime_flows: self.type_return_lifetime_flows(
+                self.function_type_for_ref(target_def, type_args, const_args),
+                0
+            ),
+            lifetime_args: source_args,
+            lifetime_destination: destination,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next_block);
+        self.compare_exchange_passive_cancel_target(3, 0, span);
+    }
+
+    public () lower_async_direct_continuation_call(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.Operand[]& args,
+        jil.Place destination,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place? prepared_frame,
+        token.Span span
+    ) {
+        // 普通 async 调用属于当前 Task：
+        // callee frame 保存在父 frame 中，完成后直接恢复父协程。
+        jil.Place frame_place = self.direct_continuation_frame_place(
+            layout,
+            prepared_frame,
+            span
+        );
+        self.lower_async_operands_into_frame(args, function, layout, frame_place, span);
+        jil.FunctionRef parent_resume = jil.FunctionRef (
+            function_def: self.model_def.def_id,
+            type_args: self.lowerer.output.type_arg_array(self.function_type_args),
+            const_args: self.lowerer.output.const_arg_array(self.function_const_args),
+            coroutine_resume: true,
+            coroutine_completion: false,
+            type_id: layout.fields[layout.continuation_function_field_index].type_id,
+            span: span
+        );
+        jil.Statement[]& initializers = coroutine_task_abi.direct_continuation_initializers(
+            self.lowerer.output,
+            layout,
+            frame_place,
+            destination,
+            self.place_for_local(self.return_local()),
+            parent_resume,
+            span
+        );
+        Int index! = 0;
+        while (index < initializers.length) {
+            self.statements.add(initializers[index]);
+            index = index + 1;
+        }
+        self.push_inherited_frame_domain(layout, frame_place, span);
+        jil.LocalId frame_pointer = self.add_temp(layout.task_abi.frame_pointer_type_id, span);
+        self.push_assign(
+            self.place_for_local(frame_pointer),
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: frame_place,
+                frame_root: false
+            )),
+            span
+        );
+        list.ArrayList<jil.Operand> resume_args! = list.ArrayList<jil.Operand>(1);
+        resume_args.add(self.operand_for_place(self.place_for_local(frame_pointer)));
+        jil.LocalId resume_result = self.add_temp(layout.task_abi.resume_return_type_id, span);
+        jil.BlockId next_block = self.reserve_block(span);
+        jil.FunctionRef resume_function = self.coroutine_generated_function_ref(
+            target_def, type_args, const_args, layout, true, span
+        );
+        jil.CallCallee callee! = jil.direct_function_callee(resume_function);
+        jil.SuspendWakeKind suspend_wake! = .direct_child;
+        if (layout.effects.domain is .some(domain)) {
+            if (!types.effect_domain_equal(self.current_effects.domain, layout.effects.domain)) {
+                callee = jil.domain_task_enqueue_callee(
+                    domain.binding,
+                    layout.domain_kind,
+                    self.operand_for_place(self.project_constant_index(
+                        frame_place, layout.cancellation_context_field_index
+                    )),
+                    jil.function_operand_value(resume_function),
+                    true
+                );
+                suspend_wake = .cross_executor;
+            }
+        }
+        self.compare_exchange_passive_cancel_target(0, 3, span);
+        self.finish_block(jil.call_terminator_kind(jil.CallTerminator (
+            callee: callee,
+            args: self.lowerer.output.operand_array(resume_args$.ref()),
+            current_effects: self.current_effects,
+            is_suspend_point: true,
+            suspend_wake: suspend_wake,
+            suspend_child: resume_function,
+            task_handoff: true,
+            destination: self.place_for_local(resume_result),
+            target: next_block,
+            initialized_place: null,
+            return_lifetime_flows: self.type_return_lifetime_flows(
+                self.function_type_for_ref(target_def, type_args, const_args),
+                0
+            ),
+            lifetime_args: args,
+            lifetime_destination: destination,
+            exclusive_places: self.lowerer.output.empty_places(),
+            cleanup: null
+        )), span);
+        self.start_block(next_block);
+        self.compare_exchange_passive_cancel_target(3, 0, span);
+    }
+
+    @life(return: self & prepared_frame)
+    public jil.Place direct_continuation_frame_place(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place? prepared_frame,
+        token.Span span
+    ) {
+        if (prepared_frame is .some(frame_place)) { return frame_place; }
+        jil.LocalId frame_local = self.add_temp(layout.frame_type_id, span);
+        return self.place_for_local(frame_local);
+    }
+
+    public () compare_exchange_passive_cancel_target(
+        self,
+        Int expected,
+        Int desired,
+        token.Span span
+    ) {
+        jil.TaskStateLayout state = self.current_task_state_layout();
+        jil.Place pointer = self.current_task_cancellation_state_pointer(state, span);
+        jil.BlockId exchange = self.reserve_block(span);
+        jil.BlockId complete = self.reserve_block(span);
+        self.branch_on_non_null_pointer(pointer, exchange, complete, span);
+        self.start_block(exchange);
+        jil.Place task = self.project_deref(pointer, true);
+        jil.Place target = coroutine_task_abi.task_state_field_place(
+            self.lowerer.output, task, state.cancel_target_word
+        );
+        jil.LocalId claimed = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(claimed),
+            jil.atomic_compare_exchange_rvalue(jil.AtomicCompareExchangeRvalue (
+                place: target,
+                expected: jil.const_operand_value(self.int_const(expected, span)),
+                desired: jil.const_operand_value(self.int_const(desired, span)),
+                mode: .coroutine_atomic
+            )),
+            span
+        );
+        self.finish_block(self.goto_terminator(complete), span);
+        self.start_block(complete);
+    }
+
+    public () lower_async_operands_into_frame(
+        self,
+        jil.Operand[]& args,
+        jil.Function& function,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        token.Span span
+    ) {
+        Int arg_index! = 0;
+        Int local_index! = 1;
+        while (local_index < function.body.locals.length && arg_index < args.length) {
+            jil.LocalDecl local = function.body.locals[local_index];
+            if (local.kind != .param) {
+                local_index = local_index + 1;
+                continue;
+            }
+            jil.LocalId param_local = local.id;
+            if (self.async_call_frame_field_place(layout, frame_place, param_local) is .some(param_place)) {
+                self.push_assign(
+                    param_place,
+                    jil.use_rvalue(jil.UseRvalue (value: args[arg_index])),
+                    span
+                );
+            }
+            arg_index = arg_index + 1;
+            local_index = local_index + 1;
+        }
+    }
+
+    public () push_inherited_frame_domain(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        token.Span span
+    ) {
+        if (layout.effects.domain != null || !self.current_effects.has_async) { return; }
+        self.push_assign(
+            self.project_constant_index(frame_place, layout.current_executor_field_index),
+            jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
+            span
+        );
+    }
+
+    public () push_structured_task_frame_domain(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame_place,
+        jil.TaskStoragePlan storage,
+        token.Span span
+    ) {
+        if (storage.sync != .local_serial) {
+            self.push_inherited_frame_domain(layout, frame_place, span);
+            return;
+        }
+        self.push_assign(
+            self.project_constant_index(frame_place, layout.current_executor_field_index),
+            jil.current_executor_rvalue(jil.CurrentExecutorRvalue()),
+            span
+        );
+    }
+
+    public () push_task_execution_domain_initializers(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place task,
+        jil.Place frame,
+        token.Span span
+    ) {
+        jil.Statement[]& initializers = coroutine_task_abi.execution_domain_initializers(
+            self.lowerer.output, layout, task, frame, span
+        );
+        Int index! = 0;
+        while (index < initializers.length) {
+            self.statements.add(initializers[index]);
+            index = index + 1;
+        }
+    }
+
+    public jil.FunctionRef coroutine_generated_function_ref(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.CoroutineFrameLayout& layout,
+        Bool resume,
+        token.Span span
+    ) {
+        qid.TypeId function_type! = layout.fields[layout.continuation_function_field_index].type_id;
+        if (resume) { function_type = layout.task_abi.resume_function_type_id; }
+        return jil.FunctionRef (
+            function_def: target_def,
+            type_args: self.lowerer.output.type_arg_array(type_args),
+            const_args: self.lowerer.output.const_arg_array(const_args),
+            coroutine_resume: resume,
+            coroutine_completion: !resume,
+            type_id: function_type,
+            span: span
+        );
+    }
+
+    public jil.FunctionRef task_completion_function_ref(
+        self,
+        qid.DefId target_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        jil.CoroutineFrameLayout& layout,
+        jil.TaskSyncMode sync,
+        token.Span span
+    ) {
+        if (sync == .concurrent) {
+            return self.coroutine_generated_function_ref(
+                target_def, type_args, const_args, layout, false, span
+            );
+        }
+        qid.DefId shim_def = self.ensure_serial_completion_shim(
+            target_def, type_args, const_args, span
+        );
+        return jil.FunctionRef (
+            function_def: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: layout.fields[layout.continuation_function_field_index].type_id,
+            span: span
+        );
+    }
+
+}

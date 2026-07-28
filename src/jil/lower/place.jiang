@@ -1,0 +1,595 @@
+// JIL place、projection、operand 和存储位置查询。
+//
+// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import module_graph = "../../resolve/module_graph.jiang";
+import store = "../../resolve/store.jiang";
+import source = "../../source.jiang";
+import monomorph = "../../sema/monomorph.jiang";
+import typeck_store = "../../sema/type_check/store.jiang";
+import types = "../../sema/type.jiang";
+import hash = "../../support/hash.jiang";
+import list = "../../support/list.jiang";
+import memory = "../../support/memory.jiang";
+import string = "../../support/string.jiang";
+import table = "../../support/table.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import drop_elaborate = "../drop_elaborate.jiang";
+import std;
+import support = "./support.jiang";
+import * = "./model.jiang";
+import body_context = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import control_flow = "./control_flow.jiang";
+import ownership = "./ownership.jiang";
+import closure = "./closure.jiang";
+import constant = "./constant.jiang";
+import call = "./call.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+public extend body_context.BodyLowerer {
+    public jil.Place? pointer_deref_place(self, sem.NodeId base_id) {
+        jil.Place base_place! = self.pointer_base_place(base_id);
+        list.ArrayList<jil.PlaceElem> elems! = list.ArrayList<jil.PlaceElem>(base_place.projection.length + 1);
+        Int index! = 0;
+        while (index < base_place.projection.length) {
+            elems.add(base_place.projection[index]);
+            index = index + 1;
+        }
+        elems.add(jil.deref_projection_elem(jil.DerefProjection (
+            raw_pointer: self.place_is_raw_pointer(base_place)
+        )));
+        return self.place_with_projection(base_place, elems$.ref());
+    }
+
+    public jil.Place project_deref(self, jil.Place base, Bool raw_pointer) {
+        list.ArrayList<jil.PlaceElem> elems! = list.ArrayList<jil.PlaceElem>(base.projection.length + 1);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            elems.add(base.projection[index]);
+            index = index + 1;
+        }
+        elems.add(jil.deref_projection_elem(jil.DerefProjection (raw_pointer: raw_pointer)));
+        return self.place_with_projection(base, elems$.ref());
+    }
+
+    public jil.Place copy_place_projection(self, jil.Place base) {
+        list.ArrayList<jil.PlaceElem> elems! = list.ArrayList<jil.PlaceElem>(base.projection.length);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            elems.add(base.projection[index]);
+            index = index + 1;
+        }
+        return self.place_with_projection(base, elems$.ref());
+    }
+
+    public jil.Place place_with_projection(self, jil.Place base, list.ArrayList<jil.PlaceElem>& elems) {
+        if (base.base is .global(global_ref)) {
+            return jil.global_place(global_ref, self.lowerer.output.projection_array(elems));
+        }
+        return jil.local_place(base.local_id, self.lowerer.output.projection_array(elems));
+    }
+
+    public jil.Place pointer_base_place(self, sem.NodeId base_id) {
+        if (self.place_for_expr(base_id) is .some(place)) {
+            return place;
+        }
+        jil.LocalId temp = self.add_temp(self.type_for_node(base_id), self.lowerer.model_span(base_id));
+        self.lower_into_place(base_id, self.place_for_local(temp));
+        return self.place_for_local(temp);
+    }
+
+    public Bool is_raw_pointer_type(self, sem.NodeId node_id) {
+        qid.TypeId type_id = self.type_for_node(node_id);
+        types.TypeInfo type_info = self.lowerer.ctx.store.types.get(type_id);
+        guard type_info.data is .handle_type(handle) else { return false; }
+        return handle.kind == .raw_pointer;
+    }
+
+    public Bool place_is_raw_pointer(self, jil.Place place) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.jil_place_type(place));
+        guard info.data is .handle_type(handle) else { return false; }
+        return handle.kind == .raw_pointer;
+    }
+
+    public jil.Operand lower_to_operand(self, sem.NodeId node_id) {
+        if (self.move_operand_for_expr(node_id) is .some(operand)) {
+            return operand;
+        }
+        if (self.comptime_operand_for_expr(node_id) is .some(operand)) {
+            return operand;
+        }
+        if (self.can_lower_as_direct_operand(node_id)) {
+            return self.lower_operand(node_id);
+        }
+        jil.LocalId temp = self.add_temp(self.type_for_node(node_id), self.lowerer.model_span(node_id));
+        self.lower_into_place(node_id, self.place_for_local(temp));
+        return self.operand_for_place(self.place_for_local(temp));
+    }
+
+    public jil.Operand? comptime_operand_for_expr(self, sem.NodeId node_id) {
+        guard self.comptime_value_for_expr(node_id) is .some(const_value) else {
+            return null;
+        }
+        qid.TypeId expected_type = self.type_for_node(node_id);
+        token.Span span = self.lowerer.model_span(node_id);
+        if (self.jil_const_from_comptime_value_for_span(const_value, expected_type, span) is .some(scalar_const)) {
+            return jil.const_operand_value(scalar_const);
+        }
+        jil.LocalId temp = self.add_temp(expected_type, span);
+        guard self.lower_comptime_value_into_place_at_span(const_value, self.place_for_local(temp), span) else {
+            return null;
+        }
+        return self.operand_for_place(self.place_for_local(temp));
+    }
+
+    public jil.Operand? move_operand_for_expr(self, sem.NodeId node_id) {
+        guard self.lowerer.typeck.intrinsic_operation(node_id) is .some(operation) else {
+            return null;
+        }
+        if (operation != typeck_store.IntrinsicOperationKind.move) { return null; }
+        sem.Node node = self.lowerer.model.node(node_id);
+        guard node.data is .implicit_call(call) else { return null; }
+        guard self.place_for_expr(call.base) is .some(source) else {
+            self.mark_unsupported(node_id);
+            return null;
+        }
+        if (source.projection.length != 0) {
+            self.mark_unsupported(node_id);
+            return null;
+        }
+        return jil.move_operand_value(jil.MoveOperand (place: source));
+    }
+
+    public Bool can_lower_as_direct_operand(self, sem.NodeId node_id) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .literal(_)) { return true; }
+        if (node.data is .lambda_expr(_)) { return !self.type_is_closure(self.type_for_node(node_id)); }
+        if (node.data is .name_ref(_)) { return true; }
+        if (node.data is .member_access(_)) {
+            if (self.lowerer.typeck.expr_lowering(node_id) is .some(lowering_kind)) {
+                if (lowering_kind == .trait_object_method_value) {
+                    return true;
+                }
+            }
+            if (self.place_for_expr(node_id) is .some(_)) {
+                return true;
+            }
+            return false;
+        }
+        if (node.data is .index_access(_)) {
+            if (self.place_for_expr(node_id) is .some(_)) {
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    public jil.Operand lower_operand(self, sem.NodeId node_id) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .literal(literal)) {
+            return jil.const_operand_value(self.lower_const(node_id, literal));
+        }
+        if (node.data is .lambda_expr(lambda)) {
+            return self.lambda_function_operand(node_id, lambda);
+        }
+        if (node.data is .name_ref(name_ref)) {
+            if (name_ref is .local(local_id)) {
+                if (self.lambda_capture_place_for_local(local_id) is .some(capture_place)) {
+                    return self.operand_for_capture_place(
+                        capture_place, self.lowerer.model_span(node_id)
+                    );
+                }
+                jil.Place place = self.place_for_local(self.jil_local_for_model(local_id));
+                return self.operand_for_place(place);
+            }
+            if (name_ref is .def_ref(def_id)) {
+                if (self.place_for_local_def(def_id) is .some(place)) {
+                    return self.operand_for_place(place);
+                }
+                if (self.lambda_capture_place_for_def(def_id) is .some(capture_place)) {
+                    return self.operand_for_capture_place(
+                        capture_place, self.lowerer.model_span(node_id)
+                    );
+                }
+                if (self.selected_name_ref_def_operand(node_id) is .some(operand)) {
+                    return operand;
+                }
+                return self.lower_def_operand(node_id, def_id);
+            }
+        }
+        if (node.data is .member_access(_)) {
+            if (self.lowerer.typeck.expr_lowering(node_id) is .some(lowering_kind)) {
+                if (lowering_kind == .trait_object_method_value) {
+                    return self.trait_object_method_value_operand(node_id);
+                }
+            }
+            if (self.lowerer.typeck.member_selection(node_id) is .some(member_def)) {
+                if (self.lowerer.ctx.store.defs.get(member_def).kind == .enum_case_def) {
+                    return self.lower_def_operand(node_id, member_def);
+                }
+                if (self.def_can_be_function_operand(member_def)) {
+                    return self.lower_def_operand(node_id, member_def);
+                }
+            }
+        }
+        if (self.place_for_expr(node_id) is .some(place)) {
+            return self.operand_for_place(place);
+        }
+        return self.unsupported_operand(node_id);
+    }
+
+    @life(return: self & place)
+    public jil.Operand operand_for_capture_place(self, jil.Place place, token.Span span) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.jil_place_type(place));
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .owner_pointer) {
+                jil.LocalId moved = self.add_temp(info.id, span);
+                self.push_assign(
+                    self.place_for_local(moved),
+                    jil.use_rvalue(jil.UseRvalue(
+                        value: jil.move_operand_value(jil.MoveOperand(place: place))
+                    )),
+                    span
+                );
+                self.push_assign(
+                    place,
+                    jil.use_rvalue(jil.UseRvalue(value: self.null_operand(info.id, span))),
+                    span
+                );
+                return self.operand_for_place(self.place_for_local(moved));
+            }
+        }
+        return self.operand_for_place(place);
+    }
+
+    public Bool def_can_be_function_operand(self, qid.DefId def_id) {
+        def.DefKind kind = self.lowerer.ctx.store.defs.get(def_id).kind;
+        if (kind == .function_def || kind == .init_def) {
+            return true;
+        }
+        return kind == .deinit_def;
+    }
+
+    public qid.TypeId[]& function_ref_type_args(self, sem.NodeId node_id, qid.DefId def_id) {
+        if (self.lowerer.typeck.generic_instance(node_id) is .some(instance)) {
+            if (instance.def_id == def_id) {
+                return self.concrete_instance_type_args(instance.type_args);
+            }
+        }
+        return self.lowerer.output.empty_type_args();
+    }
+
+    public jil.Place? place_for_expr(self, sem.NodeId node_id) {
+        sem.Node node = self.lowerer.model.node(node_id);
+        if (node.data is .name_ref(name_ref)) {
+            if (name_ref is .local(local_id)) {
+                if (self.lambda_capture_place_for_local(local_id) is .some(capture_place)) {
+                    return capture_place;
+                }
+                return self.place_for_local(self.jil_local_for_model(local_id));
+            }
+            if (name_ref is .def_ref(def_id)) {
+                if (self.place_for_local_def(def_id) is .some(place)) {
+                    return place;
+                }
+                if (self.lambda_capture_place_for_def(def_id) is .some(capture_place)) {
+                    return capture_place;
+                }
+                guard self.place_for_global_def(node_id, def_id) is .some(global_place) else {
+                    return null;
+                }
+                return global_place;
+            }
+            return null;
+        }
+        if (node.data is .member_access(member_access)) {
+            guard self.place_for_member(node_id, member_access) is .some(member_place) else {
+                return null;
+            }
+            return member_place;
+        }
+        if (node.data is .index_access(index_access)) {
+            if (self.lowerer.typeck.member_selection(node_id) != null) {
+                return null;
+            }
+            guard self.place_for_index(index_access) is .some(index_place) else {
+                return null;
+            }
+            return index_place;
+        }
+        return null;
+    }
+
+    public jil.Place? place_for_local_def(self, qid.DefId def_id) {
+        guard self.model_def.body is .some(ref _ body) else { return null; }
+        Int index! = 0;
+        while (index < body.locals.len()) {
+            sem.Local local = body.locals.get_index(index);
+            if (qid.DefId.equal(local.def_id$.ref(), def_id$.ref())) {
+                return self.place_for_local(self.jil_local_for_model(local.id));
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public jil.Place? place_for_global_def(self, sem.NodeId node_id, qid.DefId def_id) {
+        guard self.lowerer.model.def(def_id) is .some(model_def) else {
+            return null;
+        }
+        if (model_def.decl.kind != .global_decl || model_def.decl.is_const) {
+            return null;
+        }
+        qid.TypeId type_id = self.type_for_node(node_id);
+        if (!self.ensure_runtime_global_storage(node_id, def_id, type_id)) {
+            return null;
+        }
+        return jil.global_place(
+            jil.GlobalRef(
+                global_def: def_id,
+                type_id: type_id,
+                is_external: model_def.decl.is_external,
+                span: self.lowerer.model_span(node_id)
+            ),
+            self.lowerer.output.empty_projection()
+        );
+    }
+
+    public jil.Place? place_for_member(self, sem.NodeId node_id, sem.MemberAccess member_access) {
+        if (self.is_slice_length_access(member_access)) {
+            jil.Place base = self.pointer_base_place(member_access.base);
+            return self.project_constant_index(base, 1);
+        }
+        if (self.trait_companion_member_place(member_access) is .some(place)) {
+            return place;
+        }
+        guard self.lowerer.typeck.member_selection(node_id) is .some(member_def) else {
+            return null;
+        }
+        if (self.lowerer.ctx.store.defs.get(member_def).kind != .field_def) {
+            return null;
+        }
+        jil.Place base! = self.pointer_base_place(member_access.base);
+        if (self.member_base_needs_deref(base)) {
+            base = self.project_deref(base, self.place_is_raw_pointer(base));
+        }
+        return self.project_field(base, member_def, self.type_for_node(node_id));
+    }
+
+    public jil.Place? trait_companion_member_place(self, sem.MemberAccess member_access) {
+        qid.TypeId base_type = self.member_lookup_value_type(self.receiver_expr_type(member_access.base));
+        guard self.trait_companion_for_type(base_type) is .some(companion) else { return null; }
+        jil.Place any_place = self.member_lookup_base_place(member_access.base);
+        if (companion.kind == .any) {
+            if (self.symbol_text_equal(member_access.member_symbol, "receiver")) {
+                return self.project_constant_index(any_place, 0);
+            }
+            return null;
+        }
+        if (companion.kind != .vtable) { return null; }
+        guard self.trait_member_for_symbol(companion.trait_def, member_access.member_symbol) is .some(method_def) else {
+            return null;
+        }
+        guard self.trait_vtable_slot_index(companion.trait_def, method_def) is .some(slot_index) else {
+            return null;
+        }
+        return self.project_constant_index(any_place, slot_index + 1);
+    }
+
+    public jil.Place member_lookup_base_place(self, sem.NodeId base_id) {
+        jil.Place base! = self.pointer_base_place(base_id);
+        if (self.member_base_needs_deref(base)) {
+            base = self.project_deref(base, self.place_is_raw_pointer(base));
+        }
+        return base;
+    }
+
+    public Bool member_base_needs_deref(self, jil.Place base) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.jil_place_type(base));
+        guard info.data is .handle_type(handle) else { return false; }
+        if (self.handle_is_trait_object(handle)) { return false; }
+        if (handle.kind == .reference) { return true; }
+        if (handle.kind == .owner_pointer) { return true; }
+        return handle.kind == .raw_pointer;
+    }
+
+    public Bool handle_is_trait_object(self, types.HandleType handle) {
+        if (handle.kind != .reference && handle.kind != .owner_pointer) {
+            return false;
+        }
+        types.TypeInfo element = self.lowerer.ctx.store.types.get(handle.element);
+        guard element.data is .trait_companion(companion) else { return false; }
+        return companion.kind == .any;
+    }
+
+    // JIL 的 field projection 必须在这里固化成 layout field index。backend 只能
+    // 按 index 取地址，不能再根据 DefId/name 重新解释语言层字段关系。
+    @life(return: self & base)
+    public jil.Place project_field(self, jil.Place base, qid.DefId field_def, qid.TypeId field_type) {
+        qid.TypeId owner_type = self.jil_place_type(base);
+        guard self.layout_field_index_for_def(owner_type, field_def) is .some(field_index) else {
+            self.lowerer.output.mark_error();
+            self.add_field_projection_layout_diagnostic(owner_type, field_def);
+            return base;
+        }
+        return self.project_field_at_index(base, field_def, field_type, field_index);
+    }
+
+    public jil.Place project_field_at_index(self,
+        jil.Place base,
+        qid.DefId field_def,
+        qid.TypeId field_type,
+        Int field_index
+    ) {
+        list.ArrayList<jil.PlaceElem> elems! = list.ArrayList<jil.PlaceElem>(base.projection.length + 1);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            elems.add(base.projection[index]);
+            index = index + 1;
+        }
+        elems.add(jil.field_projection_elem(jil.FieldProjection (
+            field_def: field_def,
+            field_type: field_type,
+            field_index: field_index
+        )));
+        return self.place_with_projection(base, elems$.ref());
+    }
+
+    public qid.TypeId jil_place_type(self, jil.Place place) {
+        qid.TypeId current! = self.jil_place_base_type(place);
+        Int index! = 0;
+        while (index < place.projection.length) {
+            jil.PlaceElem elem = place.projection[index];
+            if (elem is .field_projection(field)) {
+                current = field.field_type;
+            } else if (elem is .frame_field_projection(field)) {
+                current = field.field_type;
+            } else if (elem is .constant_index_projection(constant_index)) {
+                current = self.constant_index_projection_type(current, constant_index.offset);
+            } else {
+                current = self.pointer_like_element_type(current);
+            }
+            index = index + 1;
+        }
+        return current;
+    }
+
+    public qid.TypeId constant_index_projection_type(self, qid.TypeId type_id, Int offset) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            assert(offset >= 0 && offset < tuple_type.items.length);
+            return tuple_type.items[offset];
+        }
+        layout.TypeLayout type_layout = self.layout_for_type(type_id);
+        assert(offset >= 0 && offset < type_layout.fields.length);
+        return type_layout.fields[offset].field_type;
+    }
+
+    public qid.TypeId jil_place_base_type(self, jil.Place place) {
+        if (place.base is .global(global_ref)) {
+            return global_ref.type_id;
+        }
+        return self.locals.get(place.local_id.to_index()).type_id;
+    }
+
+    public qid.TypeId pointer_like_element_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            if (self.handle_is_owned_slice_value(handle)) {
+                return self.owned_slice_value_handle_element_type(handle);
+            }
+            return handle.element;
+        }
+        if (info.data is .array_type(array_type)) {
+            return array_type.element;
+        }
+        return self.lowerer.ctx.store.types.invalid_type();
+    }
+
+    public qid.TypeId owned_slice_value_handle_element_type(self, types.HandleType handle) {
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        guard element_info.data is .slice_value_type(array_type) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        return array_type.element;
+    }
+
+    public Int? layout_field_index_for_def(self, qid.TypeId owner_type, qid.DefId field_def) {
+        layout.TypeLayout owner_layout = self.layout_for_type(owner_type);
+        Int index! = 0;
+        while (index < owner_layout.fields.length) {
+            if (owner_layout.fields[index].field_def is .some(candidate)) {
+                if (candidate.to_index() == field_def.to_index()) {
+                    return index;
+                }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Bool is_slice_length_access(self, sem.MemberAccess member_access) {
+        if (!self.symbol_text_equal(member_access.member_symbol, "length")) {
+            return false;
+        }
+        qid.TypeId base_type = self.type_for_node(member_access.base);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(base_type);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind == .slice) { return true; }
+        return self.handle_is_owned_slice_value(handle);
+    }
+
+    public Bool handle_is_owned_slice_value(self, types.HandleType handle) {
+        if (handle.kind != .owner_pointer) { return false; }
+        types.TypeInfo element_info = self.lowerer.ctx.store.types.get(handle.element);
+        return element_info.data is .slice_value_type(_);
+    }
+
+    public Bool symbol_text_equal(self, qid.SymbolId symbol, UInt8[]& text) {
+        return string.equal(self.lowerer.ctx.store.symbols.text(symbol), text);
+    }
+
+    public jil.Place project_constant_index(self, jil.Place base, Int offset) {
+        list.ArrayList<jil.PlaceElem> elems! = list.ArrayList<jil.PlaceElem>(base.projection.length + 1);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            elems.add(base.projection[index]);
+            index = index + 1;
+        }
+        elems.add(jil.constant_index_projection_elem(jil.ConstantIndexProjection (offset: offset)));
+        return self.place_with_projection(base, elems$.ref());
+    }
+
+    public jil.Place? place_for_index(self, sem.IndexAccess index_access) {
+        guard self.place_for_expr(index_access.base) is .some(base) else {
+            return null;
+        }
+        types.TypeInfo base_info = self.lowerer.ctx.store.types.get(self.jil_place_type(base));
+        if (base_info.data is .array_type(_) || base_info.data is .tuple_type(_)) {
+            sem.Node index_node = self.lowerer.model.node(index_access.index);
+            if (index_node.data is .literal(literal)) {
+                if (literal.value is .int_value(int_value)) {
+                    return self.project_constant_index(base, Int(int_value.bits));
+                }
+            }
+        }
+        jil.LocalId index_local = self.index_local_for_expr(index_access.index);
+        return self.project_index(base, index_local);
+    }
+
+    public jil.LocalId index_local_for_expr(self, sem.NodeId index_id) {
+        if (self.place_for_expr(index_id) is .some(index_place)) {
+            if (index_place.projection.length == 0) {
+                return index_place.local_id;
+            }
+        }
+        jil.LocalId temp = self.add_temp(self.type_for_node(index_id), self.lowerer.model_span(index_id));
+        self.lower_into_place(index_id, self.place_for_local(temp));
+        return temp;
+    }
+
+    public jil.Place project_index(self, jil.Place base, jil.LocalId index_local) {
+        list.ArrayList<jil.PlaceElem> elems! = list.ArrayList<jil.PlaceElem>(base.projection.length + 1);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            elems.add(base.projection[index]);
+            index = index + 1;
+        }
+        elems.add(jil.index_projection_elem(jil.IndexProjection (index_local: index_local)));
+        return self.place_with_projection(base, elems$.ref());
+    }
+
+}

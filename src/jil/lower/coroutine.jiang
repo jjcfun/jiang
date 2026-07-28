@@ -1,0 +1,1406 @@
+// package 级协程规划、变体生成和 task 状态布局。
+//
+// 本模块处理函数体 lowering 之后的协程产物，不承担表达式或语句 lowering。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import source = "../../source.jiang";
+import typeck_store = "../../sema/type_check/store.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import coroutine_frame_layout = "../coroutine/frame_layout.jiang";
+import coroutine_frame_rewrite = "../coroutine/frame_rewrite.jiang";
+import coroutine_task_abi = "../coroutine/task_abi.jiang";
+import coroutine_confinement = "../coroutine/confinement.jiang";
+import coroutine_local_variant = "../coroutine/local_variant.jiang";
+import coroutine_rtc = "../coroutine/run_to_completion.jiang";
+import * = "./model.jiang";
+import lower_context = "./context.jiang";
+import * = "./body.jiang";
+import * = "./context.jiang";
+import lower_entry = "./entry.jiang";
+
+public extend lower_context.Context {
+    public () apply_coroutine_confinement(
+        self,
+        list.ArrayList<coroutine_confinement.Summary>& states
+    ) {
+        Int index! = 0;
+        while (index < self.output.functions.len()) {
+            jil.Function&! function = self.output.functions.ref_at(index);
+            coroutine_confinement.Summary summary = states.get(index);
+            if (summary.kind == .escaping) { function.confinement = .escaping; }
+            else { function.confinement = .preserving; }
+            function.confinement_domain = summary.binding;
+            if (function.coroutine_frame is .some(frame)) {
+                jil.CoroutineFrameLayout updated! = frame;
+                updated.may_defer = summary.may_defer;
+                function.coroutine_frame = updated;
+            }
+            index = index + 1;
+        }
+    }
+
+    public () prepare_coroutine_plans(self) {
+        list.ArrayList<jil.FunctionId> worklist! =
+            list.ArrayList<jil.FunctionId>();
+        Int function_count = self.output.functions.len();
+        Int index! = 0;
+        while (index < function_count) {
+            jil.Function function = self.output.functions.get(index);
+            self.collect_confined_task_roots(function, worklist$.ref());
+            self.collect_direct_rtc_children(function, worklist$.ref());
+            index = index + 1;
+        }
+        index = 0;
+        while (index < worklist.len()) {
+            self.collect_confined_children(
+                self.output.function(worklist.get(index)), worklist$.ref()
+            );
+            index = index + 1;
+        }
+        self.prepare_rtc_resume_shims(worklist$.ref());
+    }
+
+    public () collect_direct_rtc_children(
+        self,
+        jil.Function function,
+        list.ArrayList<jil.FunctionId>& worklist
+    ) {
+        Int block_index! = 0;
+        while (block_index < function.body.blocks.length) {
+            jil.Terminator terminator = function.body.blocks[block_index].terminator;
+            if (terminator.kind is .call_term(call)) {
+                self.create_direct_rtc_resume_shim(call, worklist);
+            }
+            block_index = block_index + 1;
+        }
+    }
+
+    public () create_direct_rtc_resume_shim(
+        self,
+        jil.CallTerminator call,
+        list.ArrayList<jil.FunctionId>& worklist
+    ) {
+        if (call.suspend_wake != .direct_child) { return; }
+        guard coroutine_rtc.eligible_child(
+            self.output, self.rtc_eligible$.ref(), call
+        ) is .some(child) else { return; }
+        guard self.confined_source_function_id(child) is .some(function_id) else { return; }
+        jil.Function function = self.output.function(function_id);
+        if (!self.direct_rtc_binding_is_satisfied(call, function)) { return; }
+        if (coroutine_rtc.body_has_cross_executor_child(function.body)) {
+            self.demand_confined_variant(child, worklist);
+        }
+        self.create_rtc_resume_shim(child);
+    }
+
+    public Bool direct_rtc_binding_is_satisfied(
+        self,
+        jil.CallTerminator call,
+        jil.Function child
+    ) {
+        guard child.confinement_domain is .some(required) else { return true; }
+        guard call.current_effects.domain is .some(domain) else { return false; }
+        return domain.binding == required;
+    }
+
+    public () prepare_coroutine_source_layouts(self) {
+        Int function_count = self.output.functions.len();
+        Int index! = 0;
+        while (index < function_count) {
+            self.prepare_coroutine_source_layout(index);
+            index = index + 1;
+        }
+    }
+
+    public () prepare_coroutine_source_layout(
+        self,
+        Int function_index
+    ) {
+        jil.Function source = self.output.functions.get(function_index);
+        jil.Function selected = coroutine_local_variant.select_task_roots(
+            self.output,
+            source,
+            self.coroutine_plans$.ref()
+        );
+        self.output.functions.ref_at(function_index).body = selected.body;
+        if (source.coroutine_frame == null) {
+            return;
+        }
+        guard source.coroutine_frame is .some(frame) else { return; }
+        Bool has_direct_child = coroutine_rtc.body_has_direct_rtc_child(
+            source.body, self.coroutine_plans$.ref()
+        );
+        if (!has_direct_child) { return; }
+        jil.Body body! = selected.body;
+        body = coroutine_rtc.rewrite_direct_rtc_children(
+            self.output, body, self.coroutine_plans$.ref()
+        );
+        jil.TaskStateLayout task_state = self.create_task_state_layout(
+            source.def_id,
+            frame.task_abi.result_type_id,
+            source.span
+        );
+        if (coroutine_frame_layout.build_frame_layout(
+                self.output,
+                self.ctx.store.types$.ref(),
+                body,
+                source.effects,
+                self.ctx.store.types.int_type(),
+                task_state$.ref(),
+                frame.cancellation_entry,
+                self.coroutine_capture_env_type(frame$.ref())
+            ) is .some(updated)
+        ) {
+            jil.CoroutineFrameLayout layout! = updated;
+            layout.domain_kind = frame.domain_kind;
+            layout.may_defer = frame.may_defer;
+            jil.Function&! function = self.output.functions.ref_at(function_index);
+            function.body = body;
+            function.coroutine_frame = layout;
+        }
+    }
+
+    public qid.TypeId? coroutine_capture_env_type(self, jil.CoroutineFrameLayout& layout) {
+        if (layout.capture_env_field_index < 0) { return null; }
+        return layout.fields[layout.capture_env_field_index].type_id;
+    }
+
+    public () prepare_rtc_resume_shims(
+        self,
+        list.ArrayList<jil.FunctionId>& confined
+    ) {
+        Int function_index! = 0;
+        while (function_index < confined.len()) {
+            jil.Function function = self.output.function(
+                confined.get(function_index)
+            );
+            self.collect_rtc_children(function);
+            function_index = function_index + 1;
+        }
+    }
+
+    public () collect_rtc_children(self, jil.Function function) {
+        Int block_index! = 0;
+        while (block_index < function.body.blocks.length) {
+            jil.Terminator terminator = function.body.blocks[block_index].terminator;
+            if (terminator.kind is .call_term(call)) {
+                if (coroutine_rtc.eligible_child(
+                        self.output, self.rtc_eligible$.ref(), call
+                    ) is .some(child)
+                ) {
+                    self.create_rtc_resume_shim(child);
+                }
+            }
+            block_index = block_index + 1;
+        }
+    }
+
+    public () create_rtc_resume_shim(self, jil.FunctionRef child) {
+        jil.FunctionKey key = jil.FunctionKey(
+            child.function_def, child.type_args, child.const_args
+        );
+        if (self.coroutine_plans.get(key).rtc_resume != null) { return; }
+        qid.DefId resume_def = self.create_coroutine_variant_def(
+            child.function_def, "__rtc_resume_", child.span
+        );
+        self.coroutine_plans.set_rtc_resume(key, resume_def);
+    }
+
+    public () collect_confined_task_roots(
+        self,
+        jil.Function function,
+        list.ArrayList<jil.FunctionId>& worklist
+    ) {
+        guard function.coroutine_frame is .some(frame) else { return; }
+        Int index! = 0;
+        while (index < frame.task_regions.length) {
+            jil.TaskRegion region = frame.task_regions[index];
+            if (region.storage.sync == .local_serial) {
+                self.demand_confined_variant(region.child_resume, worklist);
+            }
+            index = index + 1;
+        }
+    }
+
+    public () collect_confined_children(
+        self,
+        jil.Function function,
+        list.ArrayList<jil.FunctionId>& worklist
+    ) {
+        self.collect_confined_task_roots(function, worklist);
+        Int index! = 0;
+        while (index < function.body.blocks.length) {
+            jil.Terminator terminator = function.body.blocks[index].terminator;
+            if (terminator.kind is .call_term(call)) {
+                if (!async_start_is_detached(call.async_start)) {
+                    self.demand_confined_variant(call.suspend_child, worklist);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    public () demand_confined_variant(
+        self,
+        jil.FunctionRef? candidate,
+        list.ArrayList<jil.FunctionId>& worklist
+    ) {
+        guard candidate is .some(function_ref) else { return; }
+        if (!function_ref.coroutine_resume) { return; }
+        jil.FunctionKey key = jil.FunctionKey(
+            function_ref.function_def, function_ref.type_args, function_ref.const_args
+        );
+        if (self.coroutine_plans.get(key).confined_resume != null) { return; }
+        guard self.confined_source_function_id(function_ref) is .some(function_id) else { return; }
+        jil.Function function = self.output.function(function_id);
+        if (!self.function_has_confined_variant(function)) { return; }
+        self.create_confined_coroutine_shims(function);
+        worklist.add(function_id);
+    }
+
+    public jil.FunctionId? confined_source_function_id(
+        self,
+        jil.FunctionRef function_ref
+    ) {
+        if (function_ref.type_args.length == 0 && function_ref.const_args.length == 0) {
+            return self.output.function_id_for_def(function_ref.function_def);
+        }
+        return self.output.function_id_for_instance(
+            function_ref.function_def, function_ref.type_args, function_ref.const_args
+        );
+    }
+
+    public Bool function_has_confined_variant(self, jil.Function function) {
+        if (!function.is_coroutine || function.is_external) { return false; }
+        if (function.confinement == .escaping) { return false; }
+        return !self.async_block_function_is_detached(function.def_id);
+    }
+
+    public () create_confined_coroutine_shims(self, jil.Function function) {
+        jil.FunctionKey key = jil.FunctionKey(
+            function.def_id, function.type_args, function.const_args
+        );
+        qid.DefId resume_def = self.create_coroutine_variant_def(
+            function.def_id, "__confined_resume_", function.span
+        );
+        self.coroutine_plans.set_confined_resume(key, resume_def);
+    }
+
+    public qid.DefId create_coroutine_variant_def(
+        self,
+        qid.DefId source_def,
+        UInt8[]& prefix,
+        token.Span span
+    ) {
+        def.DefRecord source = self.ctx.store.defs.get(source_def);
+        std.String name = build_text_int(prefix, source_def.to_index());
+        return self.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.ctx.store.symbols.intern(name.bytes()), span: span),
+            source.owner_def,
+            source.module_id,
+            source.decl_namespace_id,
+            null
+        );
+    }
+
+    public () lower_coroutine_resume_functions(self) {
+        Int function_count = self.output.functions.len();
+        Int index! = 0;
+        while (index < function_count) {
+            jil.Function function = self.output.functions.get(index);
+            self.lower_coroutine_resume_function(function);
+            index = index + 1;
+        }
+    }
+
+    public () lower_coroutine_resume_function(self, jil.Function function) {
+        if (!function.is_coroutine || function.is_coroutine_resume) {
+            return;
+        }
+        guard function.coroutine_frame is .some(frame) else {
+            return;
+        }
+        self.add_async_callable_abi_functions(function, frame$.ref());
+        jil.FunctionRef? env_drop = self.async_block_env_drop_function(function, function.span);
+        if (function.is_external) {
+            coroutine_frame_rewrite.add_completion_function(self.output, function, frame$.ref(), env_drop);
+            return;
+        }
+        coroutine_frame_rewrite.ResumeFunctionLowering resume =
+            coroutine_frame_rewrite.add_resume_function(
+                self.output, function, frame$.ref()
+            );
+        self.output.mark_drop_elaborated(resume.function.id);
+        self.output.mark_borrow_check_exempt(resume.function.id);
+        if (self.async_block_function_is_detached(function.def_id)) {
+            coroutine_frame_rewrite.add_detached_completion_function(self.output, function, frame$.ref(), env_drop);
+            return;
+        }
+        coroutine_frame_rewrite.CompletionFunctionLowering completion =
+            coroutine_frame_rewrite.add_completion_function(
+                self.output, function, frame$.ref(), env_drop
+            );
+        self.add_confined_coroutine_variant(function, frame$.ref(), resume);
+        self.add_rtc_coroutine_variant(function, frame$.ref());
+        jil.FunctionKey key = jil.FunctionKey(
+            function.def_id, function.type_args, function.const_args
+        );
+        if (table.hash_table_get_value<jil.FunctionKey, qid.DefId>(
+                self.serial_completion_shims$.ref(), key
+            ) is .some(serial_def)
+        ) {
+            coroutine_frame_rewrite.add_serial_completion_function(
+                self.output, function, frame$.ref(), env_drop, serial_def
+            );
+        }
+    }
+
+    public () add_confined_coroutine_variant(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        coroutine_frame_rewrite.ResumeFunctionLowering resume
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(
+            source.def_id, source.type_args, source.const_args
+        );
+        guard self.coroutine_plans.get(key).confined_resume is .some(resume_def) else {
+            return;
+        }
+        coroutine_frame_rewrite.ResumeFunctionLowering variant_resume! = resume;
+        if (coroutine_rtc.body_uses_rtc(
+                self.output,
+                source.body,
+                layout,
+                self.coroutine_plans$.ref()
+            )
+        ) {
+            jil.Function optimized = self.coroutine_source_with_rtc_calls(
+                source, layout
+            );
+            variant_resume = coroutine_frame_rewrite.lower_resume_function(
+                self.output,
+                optimized,
+                layout,
+                jil.FunctionId.from_index(self.output.functions.len())
+            );
+        }
+        coroutine_local_variant.add(
+            self.output,
+            variant_resume.function,
+            resume_def,
+            coroutine_frame_rewrite.resume_current_executor_place(
+                self.output, layout, variant_resume.frame_local_id
+            ),
+            self.coroutine_plans$.ref()
+        );
+    }
+
+    public () add_rtc_coroutine_variant(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(
+            source.def_id, source.type_args, source.const_args
+        );
+        guard self.coroutine_plans.get(key).rtc_resume is .some(resume_def) else {
+            return;
+        }
+        jil.Function optimized = self.coroutine_source_with_rtc_calls(
+            source, layout
+        );
+        jil.Function optimized_copy = optimized$.ref()$.get();
+        coroutine_frame_rewrite.ResumeFunctionLowering resume =
+            coroutine_frame_rewrite.lower_rtc_resume_function(
+                self.output,
+                optimized_copy,
+                layout,
+                jil.FunctionId.from_index(self.output.functions.len())
+            );
+        jil.Function resume_function = resume.function$.ref()$.get();
+        jil.LocalId frame_local_id = resume.frame_local_id;
+        coroutine_local_variant.add(
+            self.output,
+            resume_function,
+            resume_def,
+            coroutine_frame_rewrite.resume_current_executor_place(
+                self.output, layout, frame_local_id
+            ),
+            self.coroutine_plans$.ref()
+        );
+    }
+
+    @life(return: (source.a, source.b, source.c, self & source.d))
+    public jil.Function coroutine_source_with_rtc_calls(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout
+    ) {
+        return jil.Function (
+            id: source.id,
+            def_id: source.def_id,
+            type_args: source.type_args,
+            const_args: source.const_args,
+            signature_id: source.signature_id,
+            effects: source.effects,
+            is_coroutine: source.is_coroutine,
+            coroutine_frame: source.coroutine_frame,
+            confinement: source.confinement,
+            confinement_domain: source.confinement_domain,
+            is_coroutine_resume: source.is_coroutine_resume,
+            is_coroutine_completion: source.is_coroutine_completion,
+            is_language_entry: source.is_language_entry,
+            is_runtime_entry: source.is_runtime_entry,
+            is_external: source.is_external,
+            inline_always: source.inline_always,
+            naked: source.naked,
+            span: source.span,
+            body: coroutine_rtc.rewrite_body(
+                self.output,
+                source.body,
+                layout,
+                self.coroutine_plans$.ref()
+            )
+        );
+    }
+
+    public Bool async_block_function_is_detached(self, qid.DefId function_def) {
+        guard self.typeck.async_block_function_usage(function_def) is .some(usage) else { return false; }
+        return usage == typeck_store.AsyncStartUsage.detached;
+    }
+
+    public jil.FunctionRef? async_block_env_drop_function(
+        self,
+        jil.Function function,
+        token.Span span
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(
+            function.def_id,
+            function.type_args,
+            function.const_args
+        );
+        guard table.hash_table_get_value<jil.FunctionKey, qid.DefId>(
+            self.async_block_env_drop_shims$.ref(),
+            key
+        ) is .some(shim_def) else { return null; }
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(self.ctx.store.types.opaque_pointer_type(span));
+        qid.TypeId function_type = self.ctx.store.types.function_type(
+            params,
+            self.ctx.store.types.unit_type(),
+            span
+        );
+        return jil.FunctionRef (
+            function_def: shim_def,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: function_type,
+            span: span
+        );
+    }
+
+    public () add_async_callable_abi_functions(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(
+            source.def_id, source.type_args, source.const_args
+        );
+        guard table.hash_table_get_value<jil.FunctionKey, qid.DefId>(
+            self.async_callable_start_shims$.ref(), key
+        ) is .some(start_def) else { return; }
+        guard table.hash_table_get_value<jil.FunctionKey, qid.DefId>(
+            self.async_callable_completion_shims$.ref(), key
+        ) is .some(completion_def) else { return; }
+        self.add_async_callable_start_function(source, layout, start_def, completion_def);
+        self.add_async_callable_completion_function(source, layout, completion_def);
+    }
+
+    public () add_async_callable_start_function(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        qid.DefId start_def,
+        qid.DefId completion_def
+    ) {
+        types.FunctionType function_type = self.async_callable_source_type(source);
+        jil.FunctionId id = jil.FunctionId.from_index(self.output.functions.len());
+        token.Span span = source.span;
+        jil.Body body = self.async_callable_start_body(
+            source, layout, function_type, completion_def, id
+        );
+        self.output.add_generated_function(jil.Function (
+            id: id,
+            def_id: start_def,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: span,
+            body: body
+        ));
+        self.output.mark_borrow_check_exempt(id);
+    }
+
+    public types.FunctionType async_callable_source_type(self, jil.Function source) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>();
+        Int index! = 0;
+        while (index < source.body.locals.length) {
+            jil.LocalDecl local = source.body.locals[index];
+            if (local.kind == .param) {
+                params.add(local.type_id);
+            }
+            index = index + 1;
+        }
+        qid.TypeId result = source.body.locals[source.body.return_local.to_index()].type_id;
+        qid.TypeId type_id = self.ctx.store.types.function_type_with_effects(
+            params, result, source.span, source.effects
+        );
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else {
+            return types.FunctionType (
+                params: self.output.empty_type_args(),
+                result: self.ctx.store.types.unit_type(),
+                lifetime_contract: self.ctx.store.types.empty_lifetime_contract(),
+                effects: types.EffectSet(),
+                kind: .raw
+            );
+        }
+        return function_type;
+    }
+
+    public jil.Body async_callable_start_body(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        types.FunctionType function_type,
+        qid.DefId completion_def,
+        jil.FunctionId function_id
+    ) {
+        unsafe {
+            token.Span span = source.span;
+            Int param_count = function_type.params.length;
+            jil.LocalId continuation_local = jil.LocalId.from_index(param_count + 1);
+            jil.LocalId frame_pointer_local = jil.LocalId.from_index(param_count + 2);
+            jil.LocalId erased_frame_local = jil.LocalId.from_index(param_count + 3);
+            jil.LocalId allocation_executor_local = jil.LocalId.from_index(param_count + 4);
+            Int local_count = param_count + 5;
+            jil.LocalDecl*! locals = self.output.alloc_local_array(local_count);
+            locals[0] = self.generated_local(
+                jil.LocalId.from_index(0), .return_place, self.ctx.store.types.unit_type(), span
+            );
+            Int index! = 0;
+            while (index < param_count) {
+                locals[index + 1] = self.generated_local(
+                    jil.LocalId.from_index(index + 1), .param, function_type.params[index], span
+                );
+                index = index + 1;
+            }
+            jil.ExternalContinuationLayout continuation_layout =
+                self.external_async_continuation_layout(function_type.result, span);
+            locals[continuation_local.to_index()] = self.generated_local(
+                continuation_local, .param, continuation_layout.pointer_type_id, span
+            );
+            locals[frame_pointer_local.to_index()] = self.generated_local(
+                frame_pointer_local, .compiler_temp, layout.task_abi.frame_pointer_type_id, span
+            );
+            locals[erased_frame_local.to_index()] = self.generated_local(
+                erased_frame_local, .compiler_temp, self.ctx.store.types.opaque_pointer_type(span), span
+            );
+            locals[allocation_executor_local.to_index()] = self.generated_local(
+                allocation_executor_local,
+                .compiler_temp,
+                self.ctx.store.types.opaque_pointer_type(span),
+                span
+            );
+            jil.Place frame_pointer = jil.local_place(frame_pointer_local, self.output.empty_projection());
+            jil.Place frame = self.generated_deref_place(frame_pointer, true);
+            list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
+            jil.Place continuation = self.generated_deref_place(
+                jil.local_place(continuation_local, self.output.empty_projection()), true
+            );
+            jil.Rvalue allocation_executor! = jil.use_rvalue(jil.UseRvalue (
+                value: jil.copy_operand_value(jil.CopyOperand (
+                    place: self.generated_constant_index_place(
+                        continuation, continuation_layout.executor_field_index
+                    )
+                ))
+            ));
+            if (layout.effects.domain is .some(domain)) {
+                allocation_executor = jil.domain_executor_rvalue(jil.DomainExecutorRvalue (
+                    domain_def: domain.binding,
+                    domain_kind: layout.domain_kind
+                ));
+            }
+            statements.add(self.generated_assign(
+                jil.local_place(allocation_executor_local, self.output.empty_projection()),
+                allocation_executor,
+                span
+            ));
+            statements.add(self.generated_assign(
+                frame_pointer,
+                jil.coroutine_frame_alloc_rvalue(jil.CoroutineFrameAllocRvalue (
+                    value_type: layout.frame_type_id,
+                    executor: jil.copy_operand_value(jil.CopyOperand (
+                        place: jil.local_place(
+                            allocation_executor_local, self.output.empty_projection()
+                        )
+                    ))
+                )),
+                span
+            ));
+            self.append_async_callable_frame_initializers(
+                source,
+                layout,
+                function_type,
+                frame,
+                continuation_local,
+                frame_pointer_local,
+                erased_frame_local,
+                completion_def,
+                span,
+                statements$.ref()
+            );
+            list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+            blocks.add(self.async_callable_start_call_block(
+                source,
+                layout,
+                frame_pointer_local,
+                erased_frame_local,
+                statements$.ref(),
+                span
+            ));
+            blocks.add(self.generated_return_block(1, span));
+            return jil.Body (
+                id: jil.BodyId.from_index(function_id.to_index()),
+                span: span,
+                locals: locals[0..local_count],
+                blocks: self.output.block_array(blocks$.ref()),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+        }
+    }
+
+    public () append_async_callable_frame_initializers(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        types.FunctionType function_type,
+        jil.Place frame,
+        jil.LocalId continuation_local,
+        jil.LocalId frame_pointer_local,
+        jil.LocalId erased_frame_local,
+        qid.DefId completion_def,
+        token.Span span,
+        list.ArrayList<jil.Statement>& statements
+    ) {
+        Int source_local_index! = 1;
+        Int abi_param_index! = 0;
+        while (source_local_index < source.body.locals.length) {
+            jil.LocalDecl source_local = source.body.locals[source_local_index];
+            if (source_local.kind == .param) {
+                if (self.coroutine_frame_field_index(layout, source_local.id) is .some(field_index)) {
+                    statements.add(self.generated_assign_operand(
+                        self.generated_constant_index_place(frame, field_index),
+                        jil.copy_operand_value(jil.CopyOperand (
+                            place: jil.local_place(
+                                jil.LocalId.from_index(abi_param_index + 1),
+                                self.output.empty_projection()
+                            )
+                        )),
+                        span
+                    ));
+                }
+                abi_param_index = abi_param_index + 1;
+            }
+            source_local_index = source_local_index + 1;
+        }
+        statements.add(coroutine_task_abi.frame_state_initializer(self.output, layout, frame, span));
+        jil.Statement[]& domain = coroutine_task_abi.frame_domain_initializers(
+            self.output, layout, frame, span
+        );
+        Int index! = 0;
+        while (index < domain.length) {
+            statements.add(domain[index]);
+            index = index + 1;
+        }
+        statements.add(coroutine_task_abi.cancellation_enabled_initializer(
+            self.output, layout, frame, 2, span
+        ));
+        jil.ExternalContinuationLayout continuation_layout =
+            self.external_async_continuation_layout(function_type.result, span);
+        jil.Place continuation = self.generated_deref_place(
+            jil.local_place(continuation_local, self.output.empty_projection()), true
+        );
+        statements.add(self.generated_assign_operand(
+            self.generated_constant_index_place(frame, layout.cancellation_context_field_index),
+            jil.copy_operand_value(jil.CopyOperand (
+                place: self.generated_constant_index_place(
+                    continuation, continuation_layout.cancellation_context_field_index
+                )
+            )),
+            span
+        ));
+        if (layout.effects.domain == null) {
+            statements.add(self.generated_assign_operand(
+                self.generated_constant_index_place(frame, layout.current_executor_field_index),
+                jil.copy_operand_value(jil.CopyOperand (
+                    place: self.generated_constant_index_place(
+                        continuation, continuation_layout.executor_field_index
+                    )
+                )),
+                span
+            ));
+        }
+        self.append_async_callable_continuation_initializers(
+            layout,
+            function_type,
+            frame,
+            continuation_local,
+            frame_pointer_local,
+            erased_frame_local,
+            completion_def,
+            span,
+            statements
+        );
+    }
+
+    public () append_async_callable_continuation_initializers(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        types.FunctionType function_type,
+        jil.Place frame,
+        jil.LocalId continuation_local,
+        jil.LocalId frame_pointer_local,
+        jil.LocalId erased_frame_local,
+        qid.DefId completion_def,
+        token.Span span,
+        list.ArrayList<jil.Statement>& statements
+    ) {
+        jil.ExternalContinuationLayout continuation_layout =
+            self.external_async_continuation_layout(function_type.result, span);
+        jil.Place continuation = self.generated_deref_place(
+            jil.local_place(continuation_local, self.output.empty_projection()), true
+        );
+        statements.add(self.generated_assign_operand(
+            self.generated_constant_index_place(frame, layout.continuation_result_field_index),
+            jil.copy_operand_value(jil.CopyOperand (
+                place: self.generated_constant_index_place(continuation, continuation_layout.result_field_index)
+            )),
+            span
+        ));
+        statements.add(self.generated_cast_assign(
+            self.generated_constant_index_place(frame, layout.external_continuation_field_index),
+            jil.local_place(continuation_local, self.output.empty_projection()),
+            layout.fields[layout.external_continuation_field_index].type_id,
+            span
+        ));
+        statements.add(self.generated_cast_assign(
+            jil.local_place(erased_frame_local, self.output.empty_projection()),
+            jil.local_place(frame_pointer_local, self.output.empty_projection()),
+            self.ctx.store.types.opaque_pointer_type(span),
+            span
+        ));
+        statements.add(self.generated_cast_assign(
+            self.generated_constant_index_place(frame, layout.continuation_context_field_index),
+            jil.local_place(frame_pointer_local, self.output.empty_projection()),
+            layout.fields[layout.continuation_context_field_index].type_id,
+            span
+        ));
+        statements.add(coroutine_task_abi.continuation_function_initializer(
+            self.output,
+            layout,
+            frame,
+            jil.FunctionRef (
+                function_def: completion_def,
+                type_args: self.output.empty_type_args(),
+                const_args: self.output.empty_const_args(),
+                coroutine_resume: false,
+                coroutine_completion: false,
+                type_id: layout.fields[layout.continuation_function_field_index].type_id,
+                span: span
+            ),
+            span
+        ));
+        statements.add(coroutine_task_abi.continuation_executor_null_initializer(
+            self.output, layout, frame, span
+        ));
+    }
+
+    @life(return: self & source.a & source.b & source.c & layout)
+    public jil.Block async_callable_start_call_block(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        jil.LocalId frame_pointer_local,
+        jil.LocalId erased_frame_local,
+        list.ArrayList<jil.Statement>& statements,
+        token.Span span
+    ) {
+        jil.FunctionRef resume = jil.FunctionRef (
+            function_def: source.def_id,
+            type_args: source.type_args,
+            const_args: source.const_args,
+            coroutine_resume: true,
+            coroutine_completion: false,
+            type_id: layout.task_abi.resume_function_type_id,
+            span: span
+        );
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(jil.copy_operand_value(jil.CopyOperand (
+            place: jil.local_place(erased_frame_local, self.output.empty_projection())
+        )));
+        jil.Place frame = self.generated_deref_place(
+            jil.local_place(frame_pointer_local, self.output.empty_projection()), true
+        );
+        jil.Operand task = jil.copy_operand_value(jil.CopyOperand (
+            place: self.generated_constant_index_place(
+                frame, layout.cancellation_context_field_index
+            )
+        ));
+        jil.CallCallee callee! = jil.dynamic_task_enqueue_callee(
+            jil.copy_operand_value(jil.CopyOperand (
+                place: self.generated_constant_index_place(
+                    frame, layout.current_executor_field_index
+                )
+            )),
+            task,
+            jil.function_operand_value(resume),
+            true
+        );
+        if (layout.effects.domain is .some(domain)) {
+            callee = jil.domain_task_enqueue_callee(
+                domain.binding,
+                layout.domain_kind,
+                task,
+                jil.function_operand_value(resume),
+                true
+            );
+        }
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.output.statement_array(statements),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.call_terminator_kind(jil.CallTerminator (
+                    callee: callee,
+                    args: self.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    task_handoff: true,
+                    destination: jil.local_place(jil.LocalId.from_index(0), self.output.empty_projection()),
+                    target: jil.BlockId.from_index(1),
+                    initialized_place: null,
+                    exclusive_places: self.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    public () add_async_callable_completion_function(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        qid.DefId completion_def
+    ) {
+        jil.FunctionId id = jil.FunctionId.from_index(self.output.functions.len());
+        self.output.add_generated_function(jil.Function (
+            id: id,
+            def_id: completion_def,
+            type_args: self.output.empty_type_args(),
+            const_args: self.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: source.span,
+            body: self.async_callable_completion_body(source, layout, id)
+        ));
+        self.output.mark_borrow_check_exempt(id);
+    }
+
+    public jil.Body async_callable_completion_body(
+        self,
+        jil.Function source,
+        jil.CoroutineFrameLayout& layout,
+        jil.FunctionId function_id
+    ) {
+        unsafe {
+            token.Span span = source.span;
+            qid.TypeId result_type = source.body.locals[source.body.return_local.to_index()].type_id;
+            jil.ExternalContinuationLayout continuation_layout =
+                self.external_async_continuation_layout(result_type, span);
+            jil.LocalId return_local = jil.LocalId.from_index(0);
+            jil.LocalId context_local = jil.LocalId.from_index(1);
+            jil.LocalId frame_pointer_local = jil.LocalId.from_index(2);
+            jil.LocalId continuation_local = jil.LocalId.from_index(3);
+            jil.LocalId allocation_executor_local = jil.LocalId.from_index(4);
+            jil.LocalDecl*! locals = self.output.alloc_local_array(5);
+            locals[0] = self.generated_local(
+                return_local, .return_place, self.ctx.store.types.unit_type(), span
+            );
+            locals[1] = self.generated_local(
+                context_local,
+                .param,
+                layout.fields[layout.continuation_context_field_index].type_id,
+                span
+            );
+            locals[2] = self.generated_local(
+                frame_pointer_local, .compiler_temp, layout.task_abi.frame_pointer_type_id, span
+            );
+            locals[3] = self.generated_local(
+                continuation_local, .compiler_temp, continuation_layout.pointer_type_id, span
+            );
+            locals[4] = self.generated_local(
+                allocation_executor_local,
+                .compiler_temp,
+                self.ctx.store.types.opaque_pointer_type(span),
+                span
+            );
+            jil.Place frame_pointer = jil.local_place(frame_pointer_local, self.output.empty_projection());
+            jil.Place frame = self.generated_deref_place(frame_pointer, true);
+            list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>(4);
+            statements.add(self.generated_cast_assign(
+                frame_pointer,
+                jil.local_place(context_local, self.output.empty_projection()),
+                layout.task_abi.frame_pointer_type_id,
+                span
+            ));
+            statements.add(self.generated_cast_assign(
+                jil.local_place(continuation_local, self.output.empty_projection()),
+                self.generated_constant_index_place(frame, layout.external_continuation_field_index),
+                continuation_layout.pointer_type_id,
+                span
+            ));
+            statements.add(self.generated_assign_operand(
+                jil.local_place(allocation_executor_local, self.output.empty_projection()),
+                jil.copy_operand_value(jil.CopyOperand (
+                    place: self.generated_constant_index_place(
+                        frame, layout.current_executor_field_index
+                    )
+                )),
+                span
+            ));
+            statements.add(self.generated_assign(
+                jil.local_place(return_local, self.output.empty_projection()),
+                jil.coroutine_frame_free_rvalue(jil.CoroutineFrameFreeRvalue (
+                    pointer: jil.copy_operand_value(jil.CopyOperand (place: frame_pointer)),
+                    executor: jil.copy_operand_value(jil.CopyOperand (
+                        place: jil.local_place(
+                            allocation_executor_local, self.output.empty_projection()
+                        )
+                    ))
+                )),
+                span
+            ));
+            list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+            blocks.add(self.async_callable_completion_call_block(
+                continuation_layout, continuation_local, statements$.ref(), span
+            ));
+            blocks.add(self.generated_return_block(1, span));
+            return jil.Body (
+                id: jil.BodyId.from_index(function_id.to_index()),
+                span: span,
+                locals: locals[0..5],
+                blocks: self.output.block_array(blocks$.ref()),
+                entry: jil.BlockId.from_index(0),
+                return_local: return_local
+            );
+        }
+    }
+
+    public jil.Block async_callable_completion_call_block(
+        self,
+        jil.ExternalContinuationLayout layout,
+        jil.LocalId continuation_local,
+        list.ArrayList<jil.Statement>& statements,
+        token.Span span
+    ) {
+        jil.Place continuation = self.generated_deref_place(
+            jil.local_place(continuation_local, self.output.empty_projection()), true
+        );
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(jil.copy_operand_value(jil.CopyOperand (
+            place: self.generated_constant_index_place(
+                continuation, layout.target_context_field_index
+            )
+        )));
+        // completion shim 正在当前 Task 的 Job 上运行；恢复调用方是执行权转移，
+        // 必须直接 handoff，不能经 scheduled-continuation wrapper 退化成普通 request。
+        jil.CallCallee callee = jil.dynamic_task_enqueue_callee(
+            jil.copy_operand_value(jil.CopyOperand (
+                place: self.generated_constant_index_place(
+                    continuation, layout.executor_field_index
+                )
+            )),
+            jil.copy_operand_value(jil.CopyOperand (
+                place: self.generated_constant_index_place(
+                    continuation, layout.cancellation_context_field_index
+                )
+            )),
+            jil.copy_operand_value(jil.CopyOperand (
+                place: self.generated_constant_index_place(
+                    continuation, layout.target_resume_field_index
+                )
+            )),
+            true
+        );
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.output.statement_array(statements),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.call_terminator_kind(jil.CallTerminator (
+                    callee: callee,
+                    args: self.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: jil.local_place(jil.LocalId.from_index(0), self.output.empty_projection()),
+                    target: jil.BlockId.from_index(1),
+                    initialized_place: null,
+                    exclusive_places: self.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    public jil.LocalDecl generated_local(
+        self,
+        jil.LocalId id,
+        jil.LocalKind kind,
+        qid.TypeId type_id,
+        token.Span span
+    ) {
+        return jil.LocalDecl (
+            id: id,
+            kind: kind,
+            type_id: type_id,
+            span: span,
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        );
+    }
+
+    @life(return: destination & value)
+    public jil.Statement generated_assign(
+        self,
+        jil.Place destination,
+        jil.Rvalue value,
+        token.Span span
+    ) {
+        return jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: destination,
+                value: value
+            ))
+        );
+    }
+
+    @life(return: self & destination & value)
+    public jil.Statement generated_assign_operand(
+        self,
+        jil.Place destination,
+        jil.Operand value,
+        token.Span span
+    ) {
+        return self.generated_assign(
+            destination,
+            jil.use_rvalue(jil.UseRvalue (value: value)),
+            span
+        );
+    }
+
+    @life(return: self & destination & source)
+    public jil.Statement generated_cast_assign(
+        self,
+        jil.Place destination,
+        jil.Place source,
+        qid.TypeId target_type,
+        token.Span span
+    ) {
+        return self.generated_assign(
+            destination,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_int,
+                value: jil.copy_operand_value(jil.CopyOperand (place: source)),
+                target_type: target_type
+            )),
+            span
+        );
+    }
+
+    public jil.Place generated_deref_place(self, jil.Place base, Bool raw_pointer) {
+        list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(base.projection.length + 1);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            projection.add(base.projection[index]);
+            index = index + 1;
+        }
+        projection.add(jil.deref_projection_elem(jil.DerefProjection (raw_pointer: raw_pointer)));
+        return jil.local_place(base.local_id, self.output.projection_array(projection$.ref()));
+    }
+
+    public jil.Place generated_constant_index_place(self, jil.Place base, Int field_index) {
+        list.ArrayList<jil.PlaceElem> projection! = list.ArrayList<jil.PlaceElem>(base.projection.length + 1);
+        Int index! = 0;
+        while (index < base.projection.length) {
+            projection.add(base.projection[index]);
+            index = index + 1;
+        }
+        projection.add(jil.constant_index_projection_elem(jil.ConstantIndexProjection (offset: field_index)));
+        return jil.local_place(base.local_id, self.output.projection_array(projection$.ref()));
+    }
+
+    public Int? coroutine_frame_field_index(self, jil.CoroutineFrameLayout& layout, jil.LocalId local_id) {
+        Int index! = 0;
+        while (index < layout.local_mappings.length) {
+            if (layout.local_mappings[index].local_id == local_id) {
+                return layout.local_mappings[index].field_index;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public jil.Block generated_return_block(self, Int index, token.Span span) {
+        return jil.Block (
+            id: jil.BlockId.from_index(index),
+            span: span,
+            statements: self.output.empty_statements(),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.return_terminator_kind(jil.ReturnTerminator (implicit_unit: true))
+            )
+        );
+    }
+
+    public jil.CoroutineFrameLayout? coroutine_frame_layout_for_body(
+        self,
+        qid.DefId function_def,
+        jil.Body body,
+        types.EffectSet effects,
+        jil.BlockId cancellation_entry,
+        qid.TypeId? capture_env_type
+    ) {
+        if (!effects.has_async) { return null; }
+        jil.TaskStateLayout task_state! = self.create_task_state_layout(
+            function_def,
+            body.locals[body.return_local.to_index()].type_id,
+            body.span
+        );
+        guard coroutine_frame_layout.build_frame_layout(
+            self.output,
+            self.ctx.store.types$.ref(),
+            body,
+            effects,
+            self.ctx.store.types.int_type(),
+            task_state$.ref(),
+            cancellation_entry,
+            capture_env_type
+        ) is .some(layout) else {
+            return null;
+        }
+        jil.CoroutineFrameLayout result! = layout;
+        if (effects.domain is .some(domain)) {
+            result.domain_kind = self.domain_kind_for_type(domain.domain_type);
+        }
+        return result;
+    }
+
+    public jil.TaskStateLayout create_task_state_layout(
+        self,
+        qid.DefId function_def,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
+        if (table.hash_table_get_value<Int, jil.TaskStateLayout>(
+                self.task_state_layouts$.ref(), result_type.to_index()
+            ) is .some(layout)
+        ) {
+            return layout;
+        }
+        qid.DefId state_def = self.create_task_state_def(function_def, result_type, span);
+        qid.TypeId state_type = self.ctx.store.types.named_type(state_def, span);
+        self.ctx.store.types.bind_task_state_type(result_type, state_type);
+        qid.TypeId int_type = self.ctx.store.types.int_type();
+        qid.TypeId opaque_pointer = self.ctx.store.types.opaque_pointer_type(span);
+        qid.TypeId resume_function = self.task_resume_function_type(span);
+        jil.TaskStateLayout result = jil.TaskStateLayout (
+            type_id: state_type,
+            schedule_state: self.add_task_state_field(
+                state_def, "schedule_state", int_type, span
+            ),
+            schedule_executor: self.add_task_state_field(
+                state_def, "schedule_executor", opaque_pointer, span
+            ),
+            schedule_context: self.add_task_state_field(
+                state_def, "schedule_context", opaque_pointer, span
+            ),
+            schedule_resume: self.add_task_state_field(
+                state_def, "schedule_resume", resume_function, span
+            ),
+            schedule_active_executor: self.add_task_state_field(
+                state_def, "schedule_active_executor", opaque_pointer, span
+            ),
+            state: self.add_task_state_field(state_def, "state", int_type, span),
+            frame: self.add_task_state_field(state_def, "frame", opaque_pointer, span),
+            resume_function: self.add_task_state_field(
+                state_def, "resume_function", resume_function, span
+            ),
+            execution_executor: self.add_task_state_field(
+                state_def, "execution_executor", opaque_pointer, span
+            ),
+            cancellation_requested: self.add_task_state_field(
+                state_def, "cancellation_requested", int_type, span
+            ),
+            cancel_target_word: self.add_task_state_field(
+                state_def, "cancel_target_word", int_type, span
+            ),
+            lifetime_state: self.add_task_state_field(
+                state_def, "lifetime_state", int_type, span
+            ),
+            cleanup_function: self.add_task_state_field(
+                state_def, "cleanup_function", resume_function, span
+            ),
+            result: self.add_task_state_field(state_def, "result", result_type, span)
+        );
+        self.task_state_layouts.set(result_type.to_index(), result);
+        return result;
+    }
+
+    public qid.DefId create_task_state_def(
+        self,
+        qid.DefId function_def,
+        qid.TypeId result_type,
+        token.Span span
+    ) {
+        def.DefRecord function_record = self.ctx.store.defs.get(function_def);
+        std.String name = build_text_int("__task_state_", result_type.to_index());
+        qid.DefId state_def = self.ctx.store.defs.create(
+            .struct_def,
+            .type_name,
+            .private_visibility,
+            def.Name(symbol: self.ctx.store.symbols.intern(name.bytes()), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+        self.ctx.store.source_map.set_sourceless_def_span(state_def, span);
+        self.model.declare_def(state_def, .type_decl);
+        self.ctx.store.types.bind_named_type_def(state_def, self.ctx.store.types.named_type(state_def, span));
+        return state_def;
+    }
+
+    public jil.SyntheticField add_task_state_field(
+        self,
+        qid.DefId state_def,
+        UInt8[]& name,
+        qid.TypeId type_id,
+        token.Span span
+    ) {
+        sem.Def& state_model = self.model.def_ref(state_def);
+        Int field_index = state_model.members.len();
+        def.DefRecord state_record = self.ctx.store.defs.get(state_def);
+        qid.DefId field_def = self.ctx.store.defs.create(
+            .field_def,
+            .member_name,
+            .private_visibility,
+            def.Name(symbol: self.ctx.store.symbols.intern(name), span: span),
+            state_def,
+            state_record.module_id,
+            state_record.decl_namespace_id,
+            null
+        );
+        self.ctx.store.source_map.set_sourceless_def_span(field_def, span);
+        self.model.declare_def(field_def, .field_decl);
+        self.model.add_member(state_def, field_def);
+        self.typeck.set_def_type(field_def, type_id);
+        return jil.SyntheticField(def_id: field_def, type_id: type_id, index: field_index);
+    }
+
+    public qid.TypeId task_resume_function_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(self.ctx.store.types.opaque_pointer_type(span));
+        return self.ctx.store.types.function_type(params, self.ctx.store.types.unit_type(), span);
+    }
+
+    public Int domain_kind_for_def(self, qid.DefId domain_def) {
+        guard self.ctx.store.resolve.core_traits.domain_trait is .some(domain_trait) else { return -1; }
+        qid.SymbolId kind_symbol = self.ctx.store.symbols.intern("kind");
+        guard self.model.def(domain_trait) is .some(domain_model) else { return -1; }
+        Int index! = 0;
+        while (index < domain_model.members.len()) {
+            qid.DefId kind_assoc = domain_model.members.get(index);
+            index = index + 1;
+            if (self.ctx.store.defs.get(kind_assoc).name.symbol.to_index() != kind_symbol.to_index()) { continue; }
+            return self.domain_kind_for_member(domain_def, kind_assoc);
+        }
+        return -1;
+    }
+
+    public Int domain_kind_for_type(self, qid.TypeId domain_type) {
+        types.TypeInfo info = self.ctx.store.types.get(domain_type);
+        guard info.data is .named(named) else { return -1; }
+        return self.domain_kind_for_def(named.def_id);
+    }
+
+    public Int domain_kind_for_member(self, qid.DefId domain_def, qid.DefId kind_assoc) {
+        guard self.model.def(domain_def) is .some(domain_model) else { return -1; }
+        Int index! = 0;
+        while (index < domain_model.members.len()) {
+            qid.DefId member_def = domain_model.members.get(index);
+            index = index + 1;
+            def.DefRecord record = self.ctx.store.defs.get(member_def);
+            guard record.associated_trait_member is .some(trait_member) else { continue; }
+            if (trait_member != kind_assoc) { continue; }
+            guard self.ctx.store.comptime_store.const_value(member_def) is .some(value) else { return -1; }
+            guard value.data is .enum_case_value(case_def) else { return -1; }
+            if (self.typeck.enum_case_value(case_def) is .some(kind)) { return kind; }
+            return -1;
+        }
+        return -1;
+    }
+
+}

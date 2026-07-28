@@ -1,0 +1,1145 @@
+// Pattern condition、payload binding 和 switch pattern lowering。
+//
+// 本模块统一处理 is、optional、union、Tuple 与 switch payload 的匹配和绑定。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import source = "../../source.jiang";
+import monomorph = "../../sema/monomorph.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import support = "./support.jiang";
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import place = "./place.jiang";
+import constant = "./constant.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+import control_flow = "./control_flow.jiang";
+
+public extend body_context.BodyLowerer {
+    public support.IfConditionLowerResult lower_if_condition(self, sem.NodeId condition_id) {
+        sem.Node condition_node = self.lowerer.model.node(condition_id);
+        if (condition_node.data is .is_pattern(is_pattern)) {
+            return self.lower_is_pattern_condition(condition_id, is_pattern);
+        }
+        if (condition_node.data is .binary(binary)) {
+            if (binary.op == .logic_and) {
+                return self.lower_logic_and_condition(condition_id, binary);
+            }
+        }
+        return self.empty_if_condition_result(self.lower_to_operand(condition_id));
+    }
+
+    @life(return: condition)
+    public support.IfConditionLowerResult empty_if_condition_result(self, jil.Operand condition) {
+        return support.IfConditionLowerResult (
+            condition: condition,
+            binding: null,
+            active_locals: list.ArrayList<jil.LocalId>()
+        );
+    }
+
+    @life(return: condition & subject_place)
+    public support.IfConditionLowerResult pattern_if_condition_result(self,
+        jil.Operand condition,
+        sem.NodeId pattern_id,
+        jil.Place subject_place,
+        qid.TypeId subject_type
+    ) {
+        return support.IfConditionLowerResult (
+            condition: condition,
+            binding: support.PatternConditionBinding (
+                pattern_id: pattern_id,
+                subject_place: subject_place,
+                subject_type: subject_type
+            ),
+            active_locals: list.ArrayList<jil.LocalId>()
+        );
+    }
+
+    public support.IfConditionLowerResult lower_is_pattern_condition(
+        self,
+        sem.NodeId node_id,
+        sem.IsPattern is_pattern
+    ) {
+        sem.Node pattern_node = self.lowerer.model.node(is_pattern.pattern);
+        if (pattern_node.data is .optional_pattern(_)) {
+            return self.lower_optional_pattern_condition(node_id, is_pattern);
+        }
+        if (pattern_node.data is .tuple_pattern(_)) {
+            return self.lower_tuple_pattern_condition(node_id, is_pattern);
+        }
+        if (pattern_node.data is .variant_pattern(variant_pattern)) {
+            if (self.variant_pattern_is_optional(variant_pattern, self.type_for_node(is_pattern.value))) {
+                return self.lower_optional_variant_pattern_condition(node_id, is_pattern, variant_pattern);
+            }
+            return self.lower_variant_pattern_condition(node_id, is_pattern);
+        }
+        if (pattern_node.data is .wildcard_pattern) {
+            return self.empty_if_condition_result(self.bool_operand(true, self.lowerer.model_span(node_id)));
+        }
+        self.mark_unsupported(is_pattern.pattern);
+        return self.empty_if_condition_result(self.bool_operand(false, self.lowerer.model_span(node_id)));
+    }
+
+    public support.IfConditionLowerResult lower_tuple_pattern_condition(self,
+        sem.NodeId node_id,
+        sem.IsPattern is_pattern
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        jil.Place subject_place = self.tuple_pattern_subject_place(is_pattern, span, value_type);
+        return self.pattern_if_condition_result(
+            self.bool_operand(true, span),
+            is_pattern.pattern,
+            subject_place,
+            self.pattern_subject_type(value_type)
+        );
+    }
+
+    public jil.Place tuple_pattern_subject_place(self,
+        sem.IsPattern is_pattern,
+        token.Span span,
+        qid.TypeId value_type
+    ) {
+        if (self.pattern_has_borrow_binding(is_pattern.pattern)) {
+            if (self.place_for_expr(is_pattern.value) is .some(place)) {
+                return self.pattern_subject_place_for_value(place, value_type);
+            }
+        }
+        jil.LocalId subject_local = self.add_temp(value_type, span);
+        jil.Place subject_place = self.place_for_local(subject_local);
+        self.lower_into_place(is_pattern.value, subject_place);
+        return self.pattern_subject_place_for_value(subject_place, value_type);
+    }
+
+    public support.IfConditionLowerResult lower_optional_pattern_condition(self,
+        sem.NodeId node_id,
+        sem.IsPattern is_pattern
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.Place subject_place = self.optional_pattern_subject_place(is_pattern, span);
+        qid.TypeId subject_type = self.pattern_subject_type(self.type_for_node(is_pattern.value));
+        jil.LocalId condition_local = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(condition_local),
+            jil.optional_rvalue(jil.OptionalRvalue (
+                op: jil.OptionalOp.is_some,
+                value: jil.copy_operand_value(jil.CopyOperand (place: subject_place))
+            )),
+            span
+        );
+        return self.pattern_if_condition_result(
+            jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(condition_local))),
+            is_pattern.pattern,
+            subject_place,
+            subject_type
+        );
+    }
+
+    public support.IfConditionLowerResult lower_optional_variant_pattern_condition(self,
+        sem.NodeId node_id,
+        sem.IsPattern is_pattern,
+        sem.VariantPattern variant_pattern
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.Place subject_place = self.optional_variant_pattern_subject_place(is_pattern, variant_pattern, span);
+        qid.TypeId subject_type = self.pattern_subject_type(self.type_for_node(is_pattern.value));
+        jil.LocalId condition_local = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(condition_local),
+            jil.optional_rvalue(jil.OptionalRvalue (
+                op: jil.OptionalOp.is_some,
+                value: jil.copy_operand_value(jil.CopyOperand (place: subject_place))
+            )),
+            span
+        );
+        if (self.optional_variant_pattern_is_none(variant_pattern)) {
+            self.push_assign(
+                self.place_for_local(condition_local),
+                jil.unary_rvalue(jil.UnaryRvalue (
+                    op: jil.UnaryOp.logic_not,
+                    value: jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(condition_local)))
+                )),
+                span
+            );
+        }
+        return self.pattern_if_condition_result(
+            jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(condition_local))),
+            is_pattern.pattern,
+            subject_place,
+            subject_type
+        );
+    }
+
+    public jil.Place optional_pattern_subject_place(self, sem.IsPattern is_pattern, token.Span span) {
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        if (self.optional_pattern_has_borrow_binding(is_pattern.pattern)) {
+            if (self.place_for_expr(is_pattern.value) is .some(place)) {
+                return self.pattern_subject_place_for_value(place, value_type);
+            }
+        }
+        jil.LocalId subject_local = self.add_temp(value_type, span);
+        jil.Place subject_place! = self.place_for_local(subject_local);
+        self.lower_into_place(is_pattern.value, subject_place);
+        return self.pattern_subject_place_for_value(subject_place, value_type);
+    }
+
+    public Bool optional_pattern_has_borrow_binding(self, sem.NodeId pattern_id) {
+        sem.Node pattern_node = self.lowerer.model.node(pattern_id);
+        guard pattern_node.data is .optional_pattern(optional_pattern) else { return false; }
+        guard optional_pattern.nested is .some(nested) else { return false; }
+        sem.Node nested_node = self.lowerer.model.node(nested);
+        guard nested_node.data is .binding_pattern(binding) else { return false; }
+        sem.Local local = self.model_local(binding.local_id);
+        return local.borrow_binding;
+    }
+
+    public jil.Place optional_variant_pattern_subject_place(self,
+        sem.IsPattern is_pattern,
+        sem.VariantPattern variant_pattern,
+        token.Span span
+    ) {
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        if (self.optional_variant_pattern_has_borrow_binding(variant_pattern)) {
+            if (self.place_for_expr(is_pattern.value) is .some(place)) {
+                return self.pattern_subject_place_for_value(place, value_type);
+            }
+        }
+        jil.LocalId subject_local = self.add_temp(value_type, span);
+        jil.Place subject_place! = self.place_for_local(subject_local);
+        self.lower_into_place(is_pattern.value, subject_place);
+        return self.pattern_subject_place_for_value(subject_place, value_type);
+    }
+
+    public Bool optional_variant_pattern_has_borrow_binding(self, sem.VariantPattern variant_pattern) {
+        return self.pattern_range_has_borrow_binding(variant_pattern.payload);
+    }
+
+    public support.IfConditionLowerResult lower_variant_pattern_condition(self,
+        sem.NodeId node_id,
+        sem.IsPattern is_pattern
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        qid.TypeId subject_type = self.pattern_subject_type(value_type);
+        jil.Place subject_place = self.variant_pattern_subject_place(is_pattern, span);
+        jil.LocalId condition_local = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(condition_local),
+            jil.binary_rvalue(jil.BinaryRvalue (
+                op: jil.BinaryOp.eq,
+                lhs: self.variant_pattern_discriminator(
+                    is_pattern.value,
+                    is_pattern.pattern,
+                    subject_type,
+                    subject_place
+                ),
+                rhs: self.variant_pattern_tag(is_pattern.pattern, subject_type)
+            )),
+            span
+        );
+        return self.pattern_if_condition_result(
+            jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(condition_local))),
+            is_pattern.pattern,
+            subject_place,
+            subject_type
+        );
+    }
+
+    public jil.Place variant_pattern_subject_place(self, sem.IsPattern is_pattern, token.Span span) {
+        qid.TypeId value_type = self.type_for_node(is_pattern.value);
+        if (self.variant_pattern_has_borrow_binding(is_pattern.pattern)) {
+            if (self.place_for_expr(is_pattern.value) is .some(place)) {
+                return self.pattern_subject_place_for_value(place, value_type);
+            }
+        }
+        jil.LocalId subject_local = self.add_temp(value_type, span);
+        jil.Place subject_place = self.place_for_local(subject_local);
+        self.lower_into_place(is_pattern.value, subject_place);
+        return self.pattern_subject_place_for_value(subject_place, value_type);
+    }
+
+    public Bool variant_pattern_has_borrow_binding(self, sem.NodeId pattern_id) {
+        sem.Node pattern_node = self.lowerer.model.node(pattern_id);
+        guard pattern_node.data is .variant_pattern(variant_pattern) else { return false; }
+        Int index! = 0;
+        while (index < variant_pattern.payload.length) {
+            if (self.pattern_has_borrow_binding(variant_pattern.payload[index])) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public Bool pattern_has_borrow_binding(self, sem.NodeId pattern_id) {
+        sem.Node pattern_node = self.lowerer.model.node(pattern_id);
+        if (pattern_node.data is .binding_pattern(binding)) {
+            sem.Local local = self.model_local(binding.local_id);
+            return local.borrow_binding;
+        }
+        if (pattern_node.data is .tuple_pattern(tuple_pattern)) {
+            return self.pattern_range_has_borrow_binding(tuple_pattern.items);
+        }
+        if (pattern_node.data is .variant_pattern(variant_pattern)) {
+            return self.pattern_range_has_borrow_binding(variant_pattern.payload);
+        }
+        if (pattern_node.data is .optional_pattern(optional_pattern)) {
+            guard optional_pattern.nested is .some(nested) else { return false; }
+            return self.pattern_has_borrow_binding(nested);
+        }
+        return false;
+    }
+
+    public Bool pattern_range_has_borrow_binding(self, sem.NodeId[]& patterns) {
+        Int index! = 0;
+        while (index < patterns.length) {
+            if (self.pattern_has_borrow_binding(patterns[index])) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public () append_condition_active_locals(self,
+        list.ArrayList<jil.LocalId>& target,
+        list.ArrayList<jil.LocalId>& source
+    ) {
+        Int index! = 0;
+        while (index < source.len()) {
+            target.add(source.get(index));
+            index = index + 1;
+        }
+    }
+
+    public qid.TypeId pattern_subject_type(self, qid.TypeId value_type) {
+        // JIL subject 类型需要和 type check 一致：pattern 检查引用指向的值，
+        // 而不是引用 handle 本身。
+        qid.TypeId read_type = self.read_value_type(value_type);
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(read_type);
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) {
+                return self.read_value_type(handle.element);
+            }
+        }
+        return read_type;
+    }
+
+    public jil.Place pattern_subject_place_for_value(self, jil.Place value_place, qid.TypeId value_type) {
+        // 源表达式是引用时，discriminant/payload 要从被引用的 place 读取。
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.read_value_type(value_type));
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .reference) {
+                return self.project_deref(value_place, false);
+            }
+        }
+        return self.copy_place_projection(value_place);
+    }
+
+    public qid.TypeId read_value_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (!info.is_mutable) {
+            return type_id;
+        }
+        return self.lowerer.ctx.store.types.create(info.data, info.span);
+    }
+
+    public jil.Operand variant_pattern_discriminator(self,
+        sem.NodeId value_id,
+        sem.NodeId pattern_id,
+        qid.TypeId subject_type,
+        jil.Place subject_place
+    ) {
+        if (!self.switch_needs_explicit_discriminant(subject_type)) {
+            return self.lower_to_operand(value_id);
+        }
+        token.Span span = self.lowerer.model_span(pattern_id);
+        jil.LocalId discriminator_local = self.add_temp(self.lowerer.ctx.store.types.int_type(), span);
+        self.push_assign(
+            self.place_for_local(discriminator_local),
+            jil.discriminant_rvalue(jil.DiscriminantRvalue (place: subject_place)),
+            span
+        );
+        return jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(discriminator_local)));
+    }
+
+    public jil.Operand variant_pattern_tag(self, sem.NodeId pattern_id, qid.TypeId subject_type) {
+        guard self.lowerer.typeck.pattern_selection(pattern_id) is .some(variant_def) else {
+            self.mark_unsupported(pattern_id);
+            return self.bool_operand(false, self.lowerer.model_span(pattern_id));
+        }
+        qid.TypeId discriminator_type = self.switch_discriminator_type(subject_type);
+        return jil.const_operand_value(self.variant_tag_const(pattern_id, variant_def, discriminator_type));
+    }
+
+    public () lower_is_pattern_into_place(self, sem.NodeId node_id, sem.IsPattern is_pattern, jil.Place destination) {
+        support.IfConditionLowerResult condition = self.lower_is_pattern_condition(node_id, is_pattern);
+        self.push_assign(
+            destination,
+            jil.use_rvalue(jil.UseRvalue (value: condition.condition)),
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    public () lower_if_condition_bindings(self,
+        support.IfConditionLowerResult& condition,
+        list.ArrayList<jil.LocalId>& condition_locals
+    ) {
+        Int active_index! = 0;
+        while (active_index < condition.active_locals.len()) {
+            jil.LocalId local_id = condition.active_locals.get(active_index);
+            self.active_locals.add(local_id);
+            condition_locals.add(local_id);
+            active_index = active_index + 1;
+        }
+
+        if (condition.binding is .some(binding)) {
+            self.lower_condition_binding(binding, condition_locals);
+        }
+    }
+
+    public () lower_condition_binding(self,
+        support.PatternConditionBinding binding,
+        list.ArrayList<jil.LocalId>& condition_locals
+    ) {
+        sem.Node pattern_node = self.lowerer.model.node(binding.pattern_id);
+        if (pattern_node.data is .optional_pattern(optional_pattern)) {
+            if (optional_pattern.nested is .some(nested)) {
+                self.lower_optional_pattern_binding(nested, binding.subject_place, condition_locals);
+            }
+            return;
+        }
+        if (pattern_node.data is .tuple_pattern(_)) {
+            self.lower_payload_pattern(binding.pattern_id, binding.subject_place, condition_locals);
+            return;
+        }
+        if (pattern_node.data is .variant_pattern(variant_pattern)) {
+            if (self.variant_pattern_is_optional(variant_pattern, binding.subject_type)) {
+                self.lower_optional_variant_condition_binding(
+                    variant_pattern,
+                    binding.subject_place,
+                    binding.subject_type,
+                    condition_locals
+                );
+                return;
+            }
+            if (variant_pattern.payload.length != 0) {
+                self.lower_variant_payload_binding(
+                    binding.pattern_id,
+                    binding.subject_place,
+                    binding.subject_type,
+                    condition_locals
+                );
+            }
+            return;
+        }
+    }
+
+    public () lower_optional_variant_condition_binding(self,
+        sem.VariantPattern variant_pattern,
+        jil.Place subject_place,
+        qid.TypeId subject_type,
+        list.ArrayList<jil.LocalId>& condition_locals
+    ) {
+        if (self.optional_variant_pattern_is_none(variant_pattern)) { return; }
+        qid.TypeId value_type = self.pattern_subject_type(subject_type);
+        types.TypeInfo value_info = self.lowerer.ctx.store.types.get(value_type);
+        guard value_info.data is .optional(optional) else { return; }
+        jil.Place payload_place = self.project_constant_index(subject_place, 1);
+        self.lower_variant_payload_patterns(
+            variant_pattern,
+            payload_place,
+            optional.element,
+            condition_locals
+        );
+    }
+
+    public Bool variant_pattern_is_optional(self, sem.VariantPattern variant_pattern, qid.TypeId value_type) {
+        qid.TypeId subject_type = self.pattern_subject_type(value_type);
+        types.TypeInfo subject_info = self.lowerer.ctx.store.types.get(subject_type);
+        if (!(subject_info.data is .optional(_))) { return false; }
+        guard variant_pattern.member_symbol is .some(symbol) else { return false; }
+        UInt8[]& name = self.lowerer.ctx.store.symbols.text(symbol);
+        return self.string_equal(name, "some") || self.string_equal(name, "none");
+    }
+
+    public Bool optional_variant_pattern_is_none(self, sem.VariantPattern variant_pattern) {
+        guard variant_pattern.member_symbol is .some(symbol) else { return false; }
+        return self.string_equal(self.lowerer.ctx.store.symbols.text(symbol), "none");
+    }
+
+    public Bool string_equal(self, UInt8[]& lhs, UInt8[]& rhs) {
+        if (lhs.length != rhs.length) { return false; }
+        Int index! = 0;
+        while (index < lhs.length) {
+            if (lhs[index] != rhs[index]) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    public () lower_optional_pattern_binding(self,
+        sem.NodeId pattern_id,
+        jil.Place subject_place,
+        list.ArrayList<jil.LocalId>& condition_locals
+    ) {
+        sem.Node pattern_node = self.lowerer.model.node(pattern_id);
+        if (pattern_node.data is .wildcard_pattern) { return; }
+        guard pattern_node.data is .binding_pattern(binding) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        jil.LocalId local_id = self.jil_local_for_model(binding.local_id);
+        condition_locals.add(local_id);
+        self.active_locals.add(local_id);
+        self.push_storage_live(local_id, self.lowerer.model_span(pattern_id));
+        sem.Local local = self.model_local(binding.local_id);
+        if (local.borrow_binding) {
+            jil.Place payload_place = self.project_constant_index(subject_place, 1);
+            self.push_assign(
+                self.place_for_local(local_id),
+                jil.borrow_rvalue(jil.BorrowRvalue (place: payload_place)),
+                self.lowerer.model_span(pattern_id)
+            );
+            return;
+        }
+        self.push_assign(
+            self.place_for_local(local_id),
+            jil.optional_rvalue(jil.OptionalRvalue (
+                op: jil.OptionalOp.unwrap_some,
+                value: jil.copy_operand_value(jil.CopyOperand (place: subject_place))
+            )),
+            self.lowerer.model_span(pattern_id)
+        );
+    }
+
+    public jil.Place? switch_subject_place(self, sem.Switch switch_expr, qid.TypeId value_type) {
+        if (self.switch_needs_explicit_discriminant(value_type)) {
+            return self.pointer_base_place(switch_expr.value);
+        }
+        if (self.switch_has_payload_patterns(switch_expr)) {
+            return self.pointer_base_place(switch_expr.value);
+        }
+        return null;
+    }
+
+    public Bool switch_has_payload_patterns(self, sem.Switch switch_expr) {
+        Int case_index! = 0;
+        while (case_index < switch_expr.cases.length) {
+            if (self.switch_case_has_payload_pattern(switch_expr.cases[case_index])) {
+                return true;
+            }
+            case_index = case_index + 1;
+        }
+        return false;
+    }
+
+    public Bool switch_case_has_payload_pattern(self, sem.SwitchCase switch_case) {
+        Int pattern_index! = 0;
+        while (pattern_index < switch_case.patterns.length) {
+            if (self.pattern_has_payload(switch_case.patterns[pattern_index])) {
+                return true;
+            }
+            pattern_index = pattern_index + 1;
+        }
+        return false;
+    }
+
+    public Bool pattern_has_payload(self, sem.NodeId pattern_id) {
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        if (pattern.data is .tuple_pattern(_)) {
+            return true;
+        }
+        guard pattern.data is .variant_pattern(variant_pattern) else {
+            return false;
+        }
+        return variant_pattern.payload.length != 0;
+    }
+
+    public jil.Operand lower_switch_discriminator(self,
+        sem.NodeId value,
+        qid.TypeId value_type,
+        jil.Place? subject_place
+    ) {
+        qid.TypeId subject_type = self.pattern_subject_type(value_type);
+        types.TypeInfo subject_info = self.lowerer.ctx.store.types.get(subject_type);
+        if (subject_info.data is .optional(_)) {
+            return self.lower_optional_switch_discriminator(value, value_type, subject_place);
+        }
+        if (!self.switch_needs_explicit_discriminant(value_type)) {
+            return self.lower_to_operand(value);
+        }
+        token.Span span = self.lowerer.model_span(value);
+        guard subject_place is .some(place) else {
+            return self.unsupported_operand(value);
+        }
+        jil.LocalId temp = self.add_temp(self.lowerer.ctx.store.types.int_type(), span);
+        self.push_assign(
+            self.place_for_local(temp),
+            jil.discriminant_rvalue(jil.DiscriminantRvalue (place: place)),
+            span
+        );
+        return jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(temp)));
+    }
+
+    public jil.Operand lower_optional_switch_discriminator(self,
+        sem.NodeId value,
+        qid.TypeId value_type,
+        jil.Place? subject_place
+    ) {
+        token.Span span = self.lowerer.model_span(value);
+        guard subject_place is .some(place) else { return self.unsupported_operand(value); }
+        jil.Place value_place = self.pattern_subject_place_for_value(place, value_type);
+        jil.LocalId temp = self.add_temp(self.lowerer.ctx.store.types.bool_type(), span);
+        self.push_assign(
+            self.place_for_local(temp),
+            jil.optional_rvalue(jil.OptionalRvalue (
+                op: jil.OptionalOp.is_some,
+                value: jil.copy_operand_value(jil.CopyOperand (place: value_place))
+            )),
+            span
+        );
+        return jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(temp)));
+    }
+
+    public qid.TypeId switch_discriminator_type(self, qid.TypeId value_type) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.pattern_subject_type(value_type));
+        if (info.data is .optional(_)) {
+            return self.lowerer.ctx.store.types.bool_type();
+        }
+        if (self.switch_needs_explicit_discriminant(value_type)) {
+            return self.lowerer.ctx.store.types.int_type();
+        }
+        return value_type;
+    }
+
+    public Bool switch_needs_explicit_discriminant(self, qid.TypeId value_type) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(self.pattern_subject_type(value_type));
+        if (info.data is .optional(_)) { return true; }
+        guard self.nominal_def_kind(value_type) is .some(kind) else {
+            return false;
+        }
+        return kind == .union_def;
+    }
+
+    public jil.BlockId add_switch_patterns(self,
+        sem.SwitchCase switch_case,
+        jil.BlockId body_block,
+        jil.BlockId default_target,
+        qid.TypeId value_type,
+        qid.TypeId discriminator_type,
+        list.ArrayList<jil.SwitchCase>& cases,
+        list.ArrayList<support.SwitchPayloadEntry>& payload_entries
+    ) {
+        jil.BlockId updated_default! = default_target;
+        Int pattern_index! = 0;
+        while (pattern_index < switch_case.patterns.length) {
+            sem.NodeId pattern_id = switch_case.patterns[pattern_index];
+            updated_default = self.add_switch_pattern(
+                pattern_id,
+                body_block,
+                updated_default,
+                value_type,
+                discriminator_type,
+                cases,
+                payload_entries
+            );
+            pattern_index = pattern_index + 1;
+        }
+        return updated_default;
+    }
+
+    public jil.BlockId add_switch_pattern(self,
+        sem.NodeId pattern_id,
+        jil.BlockId body_block,
+        jil.BlockId default_target,
+        qid.TypeId value_type,
+        qid.TypeId discriminator_type,
+        list.ArrayList<jil.SwitchCase>& cases,
+        list.ArrayList<support.SwitchPayloadEntry>& payload_entries
+    ) {
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        if (pattern.data is .wildcard_pattern) {
+            return body_block;
+        }
+        if (pattern.data is .literal_pattern(literal_pattern)) {
+            cases.add(jil.SwitchCase (
+                value: self.lower_literal_as_const(pattern_id, literal_pattern.literal, discriminator_type),
+                target: body_block
+            ));
+            return default_target;
+        }
+        if (pattern.data is .variant_pattern(variant_pattern)) {
+            if (self.variant_pattern_is_optional(variant_pattern, value_type)) {
+                self.add_optional_switch_pattern(
+                    pattern_id,
+                    variant_pattern,
+                    body_block,
+                    discriminator_type,
+                    cases,
+                    payload_entries
+                );
+                return default_target;
+            }
+            self.add_variant_switch_pattern(
+                pattern_id,
+                variant_pattern,
+                body_block,
+                discriminator_type,
+                cases,
+                payload_entries
+            );
+            return default_target;
+        }
+        if (pattern.data is .tuple_pattern(_)) {
+            jil.BlockId entry_block = self.reserve_block(self.lowerer.model_span(pattern_id));
+            payload_entries.add(support.SwitchPayloadEntry (
+                pattern_id: pattern_id,
+                entry_block: entry_block,
+                body_block: body_block
+            ));
+            return entry_block;
+        }
+        self.mark_unsupported(pattern_id);
+        return default_target;
+    }
+
+    public () add_optional_switch_pattern(self,
+        sem.NodeId pattern_id,
+        sem.VariantPattern variant_pattern,
+        jil.BlockId body_block,
+        qid.TypeId discriminator_type,
+        list.ArrayList<jil.SwitchCase>& cases,
+        list.ArrayList<support.SwitchPayloadEntry>& payload_entries
+    ) {
+        Bool is_some = !self.optional_variant_pattern_is_none(variant_pattern);
+        jil.BlockId target! = body_block;
+        if (is_some && variant_pattern.payload.length != 0) {
+            target = self.reserve_block(self.lowerer.model_span(pattern_id));
+            payload_entries.add(support.SwitchPayloadEntry (
+                pattern_id: pattern_id,
+                entry_block: target,
+                body_block: body_block
+            ));
+        }
+        cases.add(jil.SwitchCase (
+            value: jil.Const (
+                type_id: discriminator_type,
+                span: self.lowerer.model_span(pattern_id),
+                value: jil.bool_const_kind(jil.BoolConst (value: is_some))
+            ),
+            target: target
+        ));
+    }
+
+    public () add_variant_switch_pattern(self,
+        sem.NodeId pattern_id,
+        sem.VariantPattern variant_pattern,
+        jil.BlockId body_block,
+        qid.TypeId discriminator_type,
+        list.ArrayList<jil.SwitchCase>& cases,
+        list.ArrayList<support.SwitchPayloadEntry>& payload_entries
+    ) {
+        guard self.lowerer.typeck.pattern_selection(pattern_id) is .some(variant_def) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        jil.BlockId target! = body_block;
+        if (variant_pattern.payload.length != 0) {
+            target = self.reserve_block(self.lowerer.model_span(pattern_id));
+            payload_entries.add(support.SwitchPayloadEntry (
+                pattern_id: pattern_id,
+                entry_block: target,
+                body_block: body_block
+            ));
+        }
+        cases.add(jil.SwitchCase (
+            value: self.variant_tag_const(pattern_id, variant_def, discriminator_type),
+            target: target
+        ));
+    }
+
+    public jil.Const variant_tag_const(
+        self,
+        sem.NodeId pattern_id,
+        qid.DefId variant_def,
+        qid.TypeId discriminator_type
+    ) {
+        return jil.Const (
+            type_id: discriminator_type,
+            span: self.lowerer.model_span(pattern_id),
+            value: jil.int_const_kind(jil.IntConst (
+                bits: UInt64(self.variant_tag_value(variant_def)),
+                signed_value: true
+            ))
+        );
+    }
+
+    public Int variant_tag_value(self, qid.DefId variant_def) {
+        if (self.lowerer.ctx.store.defs.get(variant_def).kind == .enum_case_def) {
+            return self.enum_case_value_or_error(variant_def);
+        }
+        return self.variant_tag_index(variant_def);
+    }
+
+    public Int enum_case_value_or_error(self, qid.DefId case_def) {
+        if (self.lowerer.typeck.enum_case_value(case_def) is .some(value)) {
+            return value;
+        }
+        self.lowerer.output.mark_error();
+        return 0;
+    }
+
+    public Int variant_tag_index(self, qid.DefId variant_def) {
+        guard self.lowerer.ctx.store.defs.get(variant_def).owner_def is .some(owner_def) else {
+            return 0;
+        }
+        guard self.lowerer.model.def(owner_def) is .some(owner_model) else {
+            return 0;
+        }
+        Int tag! = 0;
+        Int index! = 0;
+        while (index < owner_model.members.len()) {
+            qid.DefId member_def = owner_model.members.get(index);
+            if (member_def.to_index() == variant_def.to_index()) {
+                return tag;
+            }
+            if (self.def_is_variant_member(member_def)) {
+                tag = tag + 1;
+            }
+            index = index + 1;
+        }
+        return 0;
+    }
+
+    public Bool def_is_variant_member(self, qid.DefId def_id) {
+        def.DefKind kind = self.lowerer.ctx.store.defs.get(def_id).kind;
+        if (kind == .enum_case_def) {
+            return true;
+        }
+        return kind == .union_variant_def;
+    }
+
+    public () lower_switch_payload_entries(self,
+        list.ArrayList<support.SwitchPayloadEntry>& entries,
+        jil.Place? subject_place,
+        qid.TypeId subject_type
+    ) {
+        Int index! = 0;
+        while (index < entries.len()) {
+            support.SwitchPayloadEntry entry = entries.get(index);
+            self.start_block(entry.entry_block);
+            list.ArrayList<jil.LocalId> entry_locals! = list.ArrayList<jil.LocalId>();
+            self.lower_switch_pattern_binding(
+                entry.pattern_id,
+                subject_place,
+                subject_type,
+                entry_locals$.ref()
+            );
+            if (!self.terminated) {
+                self.finish_block(
+                    jil.goto_terminator_kind(jil.GotoTerminator (target: entry.body_block)),
+                    self.lowerer.model_span(entry.pattern_id)
+                );
+            }
+            index = index + 1;
+        }
+    }
+
+    public () lower_switch_pattern_binding(self,
+        sem.NodeId pattern_id,
+        jil.Place? subject_place,
+        qid.TypeId subject_type,
+        list.ArrayList<jil.LocalId>& case_locals
+    ) {
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        if (pattern.data is .variant_pattern(variant_pattern)) {
+            if (self.variant_pattern_is_optional(variant_pattern, subject_type)) {
+                guard subject_place is .some(place) else {
+                    self.mark_unsupported(pattern_id);
+                    return;
+                }
+                jil.Place value_place = self.pattern_subject_place_for_value(place, subject_type);
+                self.lower_optional_variant_condition_binding(
+                    variant_pattern,
+                    value_place,
+                    subject_type,
+                    case_locals
+                );
+                return;
+            }
+            self.lower_variant_payload_binding(pattern_id, subject_place, subject_type, case_locals);
+            return;
+        }
+        guard pattern.data is .tuple_pattern(_) else { return; }
+        guard subject_place is .some(place) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        jil.Place value_place = self.pattern_subject_place_for_value(place, subject_type);
+        self.lower_payload_pattern(pattern_id, value_place, case_locals);
+    }
+
+    public def.DefKind? nominal_def_kind(self, qid.TypeId type_id) {
+        guard self.nominal_type_data(type_id) is .some(named) else {
+            return null;
+        }
+        return self.lowerer.ctx.store.defs.get(named.def_id).kind;
+    }
+
+    public types.NamedType? nominal_type_data(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .named(named) else {
+            return null;
+        }
+        return named;
+    }
+
+    public () lower_switch_case_bodies(self,
+        sem.Switch switch_expr,
+        list.ArrayList<jil.BlockId>& body_blocks,
+        jil.Place destination,
+        jil.BlockId join_block,
+        Int active_depth,
+        jil.Place? subject_place,
+        qid.TypeId subject_type
+    ) {
+        Int case_index! = 0;
+        while (case_index < switch_expr.cases.length) {
+            self.start_block(body_blocks.get(case_index));
+            list.ArrayList<jil.LocalId> case_locals! = list.ArrayList<jil.LocalId>();
+            self.collect_switch_case_payload_locals(switch_expr.cases[case_index], case_locals$.ref());
+            self.lower_into_place(switch_expr.cases[case_index].body, destination);
+            if (!self.terminated) {
+                self.end_scope(case_locals$.ref(), self.lowerer.model_span(switch_expr.cases[case_index].body));
+                self.finish_block(
+                    jil.goto_terminator_kind(jil.GotoTerminator (target: join_block)),
+                    self.lowerer.model_span(switch_expr.cases[case_index].body)
+                );
+            }
+            self.restore_active_locals(active_depth);
+            case_index = case_index + 1;
+        }
+    }
+
+    public () collect_switch_case_payload_locals(self,
+        sem.SwitchCase switch_case,
+        list.ArrayList<jil.LocalId>& case_locals
+    ) {
+        Int pattern_index! = 0;
+        while (pattern_index < switch_case.patterns.length) {
+            self.collect_payload_pattern_locals(switch_case.patterns[pattern_index], case_locals);
+            pattern_index = pattern_index + 1;
+        }
+    }
+
+    public () lower_variant_payload_binding(self,
+        sem.NodeId pattern_id,
+        jil.Place? subject_place,
+        qid.TypeId subject_type,
+        list.ArrayList<jil.LocalId>& case_locals
+    ) {
+        guard subject_place is .some(base_place) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        guard pattern.data is .variant_pattern(variant_pattern) else { return; }
+        guard self.lowerer.typeck.pattern_selection(pattern_id) is .some(variant_def) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        qid.TypeId payload_type = self.variant_payload_type(variant_def, subject_type);
+        jil.Place payload_place = self.project_field(base_place, variant_def, payload_type);
+        self.lower_variant_payload_patterns(variant_pattern, payload_place, payload_type, case_locals);
+    }
+
+    public () lower_variant_payload_patterns(self,
+        sem.VariantPattern variant_pattern,
+        jil.Place payload_place,
+        qid.TypeId payload_type,
+        list.ArrayList<jil.LocalId>& case_locals
+    ) {
+        if (variant_pattern.payload.length == 1) {
+            self.lower_payload_pattern(variant_pattern.payload[0], payload_place, case_locals);
+            return;
+        }
+        if (!self.payload_type_is_tuple(payload_type)) {
+            self.mark_unsupported(variant_pattern.payload[0]);
+            return;
+        }
+        Int index! = 0;
+        while (index < variant_pattern.payload.length) {
+            self.lower_payload_pattern(
+                variant_pattern.payload[index],
+                self.project_constant_index(payload_place, index),
+                case_locals
+            );
+            index = index + 1;
+        }
+    }
+
+    public () collect_payload_pattern_locals(self, sem.NodeId pattern_id, list.ArrayList<jil.LocalId>& case_locals) {
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        if (pattern.data is .tuple_pattern(tuple_pattern)) {
+            Int index! = 0;
+            while (index < tuple_pattern.items.length) {
+                self.collect_payload_pattern_locals(tuple_pattern.items[index], case_locals);
+                index = index + 1;
+            }
+            return;
+        }
+        if (pattern.data is .variant_pattern(variant_pattern)) {
+            Int index! = 0;
+            while (index < variant_pattern.payload.length) {
+                self.collect_payload_pattern_locals(variant_pattern.payload[index], case_locals);
+                index = index + 1;
+            }
+            return;
+        }
+        if (pattern.data is .binding_pattern(binding)) {
+            self.add_case_payload_local(self.jil_local_for_model(binding.local_id), case_locals);
+        }
+    }
+
+    public () add_case_payload_local(self, jil.LocalId local_id, list.ArrayList<jil.LocalId>& case_locals) {
+        Int index! = 0;
+        while (index < case_locals.len()) {
+            if (case_locals.get(index).to_index() == local_id.to_index()) { return; }
+            index = index + 1;
+        }
+        case_locals.add(local_id);
+        self.active_locals.add(local_id);
+    }
+
+    public () lower_payload_pattern(self,
+        sem.NodeId pattern_id,
+        jil.Place source,
+        list.ArrayList<jil.LocalId>& case_locals
+    ) {
+        sem.Node pattern = self.lowerer.model.node(pattern_id);
+        if (pattern.data is .wildcard_pattern) { return; }
+        if (pattern.data is .tuple_pattern(tuple_pattern)) {
+            self.lower_tuple_payload_pattern(tuple_pattern, source, case_locals);
+            return;
+        }
+        guard pattern.data is .binding_pattern(binding) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        jil.LocalId local_id = self.jil_local_for_model(binding.local_id);
+        self.add_case_payload_local(local_id, case_locals);
+        self.push_storage_live(local_id, self.lowerer.model_span(pattern_id));
+        sem.Local local = self.model_local(binding.local_id);
+        if (local.borrow_binding) {
+            self.push_assign(
+                self.place_for_local(local_id),
+                jil.borrow_rvalue(jil.BorrowRvalue (place: source)),
+                self.lowerer.model_span(pattern_id)
+            );
+            return;
+        }
+        self.push_assign(
+            self.place_for_local(local_id),
+            jil.use_rvalue(jil.UseRvalue (value: jil.copy_operand_value(jil.CopyOperand (place: source)))),
+            self.lowerer.model_span(pattern_id)
+        );
+    }
+
+    public () lower_tuple_payload_pattern(self,
+        sem.TuplePattern tuple_pattern,
+        jil.Place source,
+        list.ArrayList<jil.LocalId>& case_locals
+    ) {
+        if (tuple_pattern.items.length == 1) {
+            self.lower_payload_pattern(tuple_pattern.items[0], source, case_locals);
+            return;
+        }
+        Int index! = 0;
+        while (index < tuple_pattern.items.length) {
+            jil.Place item_place = self.project_constant_index(source, index);
+            self.lower_payload_pattern(tuple_pattern.items[index], item_place, case_locals);
+            index = index + 1;
+        }
+    }
+
+    public qid.TypeId variant_payload_type(self, qid.DefId variant_def, qid.TypeId subject_type) {
+        guard self.nominal_type_data(subject_type) is .some(named) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        guard self.lowerer.ctx.store.defs.get(variant_def).owner_def is .some(owner_def) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        if (owner_def.to_index() != named.def_id.to_index()) {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        guard self.lowerer.typeck.def_type(variant_def) is .some(template_type) else {
+            return self.lowerer.ctx.store.types.invalid_type();
+        }
+        monomorph.SubstitutionMap substitutions = self.nominal_substitution(named.def_id, named.type_args);
+        return self.lowerer.substitute_type(template_type, substitutions$.ref());
+    }
+
+    public monomorph.SubstitutionMap nominal_substitution(self, qid.DefId owner_def, qid.TypeId[]& type_args) {
+        monomorph.SubstitutionMap substitutions! = monomorph.SubstitutionMap();
+        sem.Def& owner_model = self.lowerer.model.def_ref(owner_def);
+        Int type_index! = 0;
+        Int member_index! = 0;
+        while (member_index < owner_model.generic_params.len()) {
+            qid.DefId member_def = owner_model.generic_params.get(member_index);
+            def.DefRecord member = self.lowerer.ctx.store.defs.get(member_def);
+            // const generic 参数不占用 type_args 槽位；混合参数顺序里
+            // 后续类型参数必须继续绑定到下一个类型实参。
+            if (member.domain == .type_name && type_index < type_args.length) {
+                substitutions.set_type(member_def, type_args[type_index]);
+                type_index = type_index + 1;
+            }
+            member_index = member_index + 1;
+        }
+        return substitutions;
+    }
+
+    public Bool payload_type_is_tuple(self, qid.TypeId payload_type) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(payload_type);
+        return info.data is .tuple_type(_);
+    }
+
+    public () lower_catch_pattern(self,
+        sem.NodeId? pattern,
+        jil.Place error_union_place,
+        list.ArrayList<jil.LocalId>& catch_locals,
+        token.Span span
+    ) {
+        guard pattern is .some(pattern_id) else { return; }
+        sem.Node pattern_node = self.lowerer.model.node(pattern_id);
+        guard pattern_node.data is .binding_pattern(binding) else {
+            self.mark_unsupported(pattern_id);
+            return;
+        }
+        jil.LocalId local_id = self.jil_local_for_model(binding.local_id);
+        catch_locals.add(local_id);
+        self.active_locals.add(local_id);
+        self.push_storage_live(local_id, span);
+        self.push_assign(
+            self.place_for_local(local_id),
+            jil.error_union_rvalue(jil.ErrorUnionRvalue (
+                op: jil.ErrorUnionOp.unwrap_error,
+                value: jil.copy_operand_value(jil.CopyOperand (place: error_union_place))
+            )),
+            span
+        );
+    }
+
+}

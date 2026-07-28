@@ -1,0 +1,887 @@
+// Lambda capture、closure environment、vtable 和 drop shim lowering。
+//
+// 本模块是 lower/body 实现族的一部分，只在 Semantic Model -> JIL 阶段内使用。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import copy_semantics = "../../sema/copy.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
+import typeck_store = "../../sema/type_check/store.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import control_flow = "./control_flow.jiang";
+import ownership = "./ownership.jiang";
+import place = "./place.jiang";
+import constant = "./constant.jiang";
+import call = "./call.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+public extend body_context.BodyLowerer {
+    public jil.Operand lambda_function_operand(self, sem.NodeId node_id, sem.Lambda lambda) {
+        qid.TypeId function_type = self.type_for_node(node_id);
+        if (self.type_is_closure(function_type)) {
+            return self.unsupported_operand(node_id);
+        }
+        self.ensure_lambda_function_instance(lambda.function_def);
+        qid.TypeId[]& type_args = self.lowerer.output.type_arg_array(self.function_type_args);
+        comptime_value.ComptimeValue[]& const_args =
+            self.lowerer.output.const_arg_array(self.function_const_args);
+        return jil.function_operand_value(
+            self.function_ref(
+                node_id,
+                lambda.function_def,
+                function_type,
+                FunctionRefArgs(type_args: type_args, const_args: const_args)
+            )
+        );
+    }
+
+    public () lower_lambda_closure(self, sem.NodeId node_id, sem.Lambda lambda, jil.Place destination) {
+        token.Span span = self.lowerer.model_span(node_id);
+        jil.Operand env = self.lambda_env_operand(node_id, lambda, span);
+        jil.Operand vtable = self.lambda_vtable_operand(node_id, lambda, false, span);
+        self.push_closure_assign(
+            node_id,
+            destination,
+            self.type_for_node(node_id),
+            env,
+            vtable
+        );
+    }
+
+    public jil.Operand lambda_env_operand(self, sem.NodeId node_id, sem.Lambda lambda, token.Span span) {
+        guard self.lowerer.typeck.lambda_capture_infos(lambda.function_def) is .some(captures) else {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        if (captures.length == 0) {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        qid.TypeId env_type = self.lambda_env_type_for_infos(lambda.function_def, captures, span);
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        jil.LocalId env_local = self.add_temp(env_type, span);
+        jil.Place env_place = self.place_for_local(env_local);
+        self.push_storage_live(env_local, span);
+        self.fill_lambda_env(node_id, lambda, captures, env_place);
+        return self.erased_lambda_env_address_operand(env_place, env_pointer_type, span);
+    }
+
+    public jil.Operand heap_lambda_env_operand(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        jil.LocalId? capture_task,
+        token.Span span
+    ) {
+        guard self.lowerer.typeck.lambda_capture_infos(lambda.function_def) is .some(captures) else {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        if (captures.length == 0) {
+            return self.null_operand(self.closure_env_type(span), span);
+        }
+        jil.LocalId? saved_capture_task! = self.active_coroutine_capture_task;
+        self.active_coroutine_capture_task = capture_task;
+        qid.TypeId env_type = self.lambda_env_type_for_infos(lambda.function_def, captures, span);
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        jil.LocalId env_pointer = self.add_optional_coroutine_capture_temp(
+            env_pointer_type, span, capture_task
+        );
+        jil.Place env_pointer_place = self.place_for_local(env_pointer);
+        self.push_assign(
+            env_pointer_place,
+            jil.alloc_box_rvalue(jil.AllocBoxRvalue (value_type: env_type)),
+            span
+        );
+        jil.Place env_place = self.project_deref(env_pointer_place, true);
+        self.fill_lambda_env(node_id, lambda, captures, env_place);
+        jil.Operand env = self.erased_lambda_env_pointer_operand(
+            env_pointer_place, env_pointer_type, capture_task, span
+        );
+        self.active_coroutine_capture_task = saved_capture_task;
+        return env;
+    }
+
+    public jil.Operand lambda_vtable_operand(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        Bool heap_env,
+        token.Span span
+    ) {
+        qid.TypeId closure_type = self.type_for_node(node_id);
+        qid.DefId global_def = self.ensure_lambda_vtable_global(node_id, lambda, closure_type, heap_env);
+        return jil.global_address_operand_value(jil.GlobalRef (
+            global_def: global_def,
+            type_id: self.closure_vtable_pointer_type(closure_type, span),
+            is_external: false,
+            span: span
+        ));
+    }
+
+    public qid.DefId ensure_lambda_vtable_global(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        qid.TypeId closure_type,
+        Bool heap_env
+    ) {
+        LambdaVTableGlobalKey key = LambdaVTableGlobalKey(
+            lambda.function_def,
+            self.function_type_args,
+            self.function_const_args,
+            heap_env
+        );
+        if (table.hash_table_get_value<LambdaVTableGlobalKey, qid.DefId>(
+            self.lowerer.lambda_vtable_globals$.ref(),
+            key
+        ) is .some(existing)) {
+            return existing;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        std.String name! = build_text_int("__closure_vtable_stack_", lambda.function_def.to_index());
+        if (heap_env) {
+            name = build_text_int("__closure_vtable_heap_", lambda.function_def.to_index());
+        }
+        qid.DefId global_def = self.create_closure_vtable_global_def(name.bytes(), span);
+        jil.GlobalId id = jil.GlobalId.from_index(self.lowerer.output.globals.len());
+        self.lowerer.output.add_global(jil.Global (
+            id: id,
+            def_id: global_def,
+            type_id: self.closure_vtable_type(closure_type, span),
+            span: span,
+            read_only: true,
+            is_external: false,
+            initializer: self.lambda_vtable_static_value(node_id, lambda, closure_type, heap_env)
+        ));
+        self.lowerer.lambda_vtable_globals.set(key, global_def);
+        return global_def;
+    }
+
+    public jil.StaticValue lambda_vtable_static_value(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        qid.TypeId closure_type,
+        Bool heap_env
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        self.ensure_lambda_function_instance(lambda.function_def);
+        list.ArrayList<jil.StaticField> fields! = list.ArrayList<jil.StaticField>(2);
+        qid.TypeId code_type = self.closure_code_type(closure_type);
+        qid.DefId code_def! = lambda.function_def;
+        if (self.function_type_is_async(closure_type)) {
+            code_def = self.ensure_async_callable_start_shim(
+                lambda.function_def,
+                self.function_type_args,
+                self.function_const_args,
+                span
+            );
+        }
+        qid.TypeId[]& code_type_args! = self.lowerer.output.empty_type_args();
+        comptime_value.ComptimeValue[]& code_const_args! = self.lowerer.output.empty_const_args();
+        if (code_def == lambda.function_def) {
+            code_type_args = self.lowerer.output.type_arg_array(self.function_type_args);
+            code_const_args = self.lowerer.output.const_arg_array(self.function_const_args);
+        }
+        fields.add(jil.StaticField (
+            type_id: code_type,
+            value: jil.function_static_value(jil.FunctionRef (
+                function_def: code_def,
+                type_args: code_type_args,
+                const_args: code_const_args,
+                coroutine_resume: false,
+            coroutine_completion: false,
+                type_id: code_type,
+                span: span
+            ))
+        ));
+        fields.add(jil.StaticField (
+            type_id: self.closure_drop_env_type(span),
+            value: self.lambda_drop_env_static_value(node_id, lambda, heap_env, span)
+        ));
+        return jil.StaticValue.aggregate(
+            self.lowerer.output.static_field_array(fields$.ref())
+        );
+    }
+
+    public () ensure_lambda_function_instance(self, qid.DefId lambda_def) {
+        self.lowerer.ensure_function_instance_with_const_args(
+            lambda_def,
+            self.function_type_args,
+            self.function_const_args
+        );
+    }
+
+    public qid.DefId ensure_async_callable_start_shim(
+        self,
+        qid.DefId source_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        token.Span span
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(source_def, type_args, const_args);
+        if (table.hash_table_get_value<jil.FunctionKey, qid.DefId>(
+            self.lowerer.async_callable_start_shims$.ref(), key
+        ) is .some(existing)) {
+            return existing;
+        }
+        qid.DefId start_def = self.create_async_callable_abi_def(source_def, "__async_fn_start_", span);
+        qid.DefId completion_def = self.create_async_callable_abi_def(
+            source_def, "__async_fn_complete_", span
+        );
+        self.lowerer.async_callable_start_shims.set(key, start_def);
+        self.lowerer.async_callable_completion_shims.set(key, completion_def);
+        return start_def;
+    }
+
+    public qid.DefId ensure_serial_completion_shim(
+        self,
+        qid.DefId source_def,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        token.Span span
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(source_def, type_args, const_args);
+        if (table.hash_table_get_value<jil.FunctionKey, qid.DefId>(
+            self.lowerer.serial_completion_shims$.ref(), key
+        ) is .some(existing)) {
+            return existing;
+        }
+        qid.DefId shim_def = self.create_async_callable_abi_def(
+            source_def, "__serial_task_complete_", span
+        );
+        self.lowerer.serial_completion_shims.set(key, shim_def);
+        return shim_def;
+    }
+
+    public qid.DefId create_async_callable_abi_def(
+        self,
+        qid.DefId source_def,
+        UInt8[]& prefix,
+        token.Span span
+    ) {
+        def.DefRecord source_record = self.lowerer.ctx.store.defs.get(source_def);
+        std.String name = build_text_int(prefix, source_def.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            source_record.owner_def,
+            source_record.module_id,
+            source_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public jil.StaticValue lambda_drop_env_static_value(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        Bool heap_env,
+        token.Span span
+    ) {
+        guard self.lowerer.typeck.lambda_capture_infos(lambda.function_def) is .some(captures) else {
+            return self.closure_noop_drop_static_value(span);
+        }
+        if (captures.length == 0) {
+            return self.closure_noop_drop_static_value(span);
+        }
+        qid.TypeId env_type = self.lambda_env_type_for_infos(lambda.function_def, captures, span);
+        return jil.function_static_value(jil.FunctionRef (
+            function_def: self.ensure_lambda_env_drop_shim(node_id, env_type, heap_env),
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_drop_env_type(span),
+            span: span
+        ));
+    }
+
+    public jil.StaticValue closure_noop_drop_static_value(self, token.Span span) {
+        return jil.function_static_value(jil.FunctionRef (
+            function_def: self.ensure_closure_noop_drop_shim(span),
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_drop_env_type(span),
+            span: span
+        ));
+    }
+
+    public qid.DefId create_closure_vtable_global_def(self, UInt8[]& name, token.Span span) {
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.model_def.def_id);
+        return self.lowerer.ctx.store.defs.create(
+            .global_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public qid.TypeId lambda_env_type_for_infos(
+        self,
+        qid.DefId lambda_def,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        token.Span span
+    ) {
+        jil.FunctionKey key = jil.FunctionKey(
+            lambda_def,
+            self.function_type_args,
+            self.function_const_args
+        );
+        if (table.hash_table_get_value<jil.FunctionKey, qid.TypeId>(
+            self.lowerer.lambda_env_types$.ref(),
+            key
+        ) is .some(existing)) {
+            return existing;
+        }
+        qid.DefId env_def = self.create_lambda_env_struct_def(lambda_def, captures, span);
+        qid.TypeId env_type = self.lowerer.ctx.store.types.named_type(env_def, span);
+        self.lowerer.lambda_env_types.set(key, env_type);
+        return env_type;
+    }
+
+    public qid.DefId create_lambda_env_struct_def(
+        self,
+        qid.DefId lambda_def,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        token.Span span
+    ) {
+        def.DefRecord lambda_record = self.lowerer.ctx.store.defs.get(lambda_def);
+        // env struct 只作为 JIL/layout carrier；capture 语义仍来自 LambdaCaptureInfo。
+        qid.DefId env_def = self.lowerer.ctx.store.defs.create(
+            .struct_def,
+            .type_name,
+            .private_visibility,
+            def.Name(symbol: self.lambda_env_struct_symbol(lambda_def), span: span),
+            lambda_record.owner_def,
+            lambda_record.module_id,
+            lambda_record.decl_namespace_id,
+            null
+        );
+        self.lowerer.ctx.store.source_map.set_sourceless_def_span(env_def, span);
+        self.lowerer.model.declare_def(env_def, .type_decl);
+        self.lowerer.ctx.store.types.bind_named_type_def(
+            env_def,
+            self.lowerer.ctx.store.types.named_type(env_def, span)
+        );
+        self.add_lambda_env_fields(env_def, captures, span);
+        return env_def;
+    }
+
+    public qid.SymbolId lambda_env_struct_symbol(self, qid.DefId lambda_def) {
+        std.String name = build_text_int("__closure_env_", lambda_def.to_index());
+        return self.lowerer.ctx.store.symbols.intern(name.bytes());
+    }
+
+    public () add_lambda_env_fields(
+        self,
+        qid.DefId env_def,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        token.Span span
+    ) {
+        Int index! = 0;
+        while (index < captures.length) {
+            self.add_lambda_env_field(env_def, captures[index], index, span);
+            index = index + 1;
+        }
+    }
+
+    public () add_lambda_env_field(
+        self,
+        qid.DefId env_def,
+        typeck_store.LambdaCaptureInfo info,
+        Int index,
+        token.Span span
+    ) {
+        def.DefRecord env_record = self.lowerer.ctx.store.defs.get(env_def);
+        qid.DefId field_def = self.lowerer.ctx.store.defs.create(
+            .field_def,
+            .member_name,
+            .private_visibility,
+            def.Name(symbol: self.lambda_env_field_symbol(info, index), span: span),
+            env_def,
+            env_record.module_id,
+            env_record.decl_namespace_id,
+            null
+        );
+        self.lowerer.ctx.store.source_map.set_sourceless_def_span(field_def, span);
+        self.lowerer.model.declare_def(field_def, .field_decl);
+        self.lowerer.model.add_member(env_def, field_def);
+        self.lowerer.typeck.set_def_type(field_def, self.lambda_env_capture_type(info));
+    }
+
+    public qid.SymbolId lambda_env_field_symbol(self, typeck_store.LambdaCaptureInfo info, Int index) {
+        if (self.lambda_env_capture_symbol(info) is .some(symbol)) {
+            return symbol;
+        }
+        std.String name = build_text_int("_", index);
+        return self.lowerer.ctx.store.symbols.intern(name.bytes());
+    }
+
+    public qid.SymbolId? lambda_env_capture_symbol(self, typeck_store.LambdaCaptureInfo info) {
+        if (info.kind == .explicit_capture) {
+            return self.lowerer.ctx.store.defs.get(info.local_def).name.symbol;
+        }
+        if (info.source_def is .some(source_def)) {
+            return self.lowerer.ctx.store.defs.get(source_def).name.symbol;
+        }
+        return null;
+    }
+
+    public qid.TypeId lambda_env_capture_type(self, typeck_store.LambdaCaptureInfo info) {
+        qid.TypeId type_id! = info.type_id;
+        if (info.kind == .explicit_capture) {
+            if (self.lowerer.typeck.def_type(info.local_def) is .some(local_type)) {
+                type_id = local_type;
+            }
+        }
+        return self.lowerer.substitute_type(type_id, self.substitutions);
+    }
+
+    public qid.TypeId raw_pointer_type(self, qid.TypeId element_type, token.Span span) {
+        return self.lowerer.ctx.store.types.raw_pointer_type(element_type, span);
+    }
+
+    public () fill_lambda_env(self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        typeck_store.LambdaCaptureInfo[]& captures,
+        jil.Place env_value
+    ) {
+        Int index! = 0;
+        while (index < captures.length) {
+            typeck_store.LambdaCaptureInfo info = captures[index];
+            jil.Place field_place = self.project_constant_index(env_value, info.field_index);
+            self.fill_lambda_capture(node_id, lambda, info, field_place);
+            index = index + 1;
+        }
+    }
+
+    public () fill_lambda_capture(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        typeck_store.LambdaCaptureInfo info,
+        jil.Place field_place
+    ) {
+        if (info.kind == .explicit_capture) {
+            sem.LambdaCapture capture = lambda.captures[info.field_index];
+            sem.Local local = self.lambda_capture_local(lambda.function_def, capture.local_id);
+            if (local.borrow_binding) {
+                self.lower_borrow_binding_initializer(capture.value, field_place);
+                return;
+            }
+            self.lower_into_place(capture.value, field_place);
+            return;
+        }
+        self.push_assign(
+            field_place,
+            jil.use_rvalue(jil.UseRvalue (value: self.lambda_capture_operand(node_id, lambda, info))),
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    public sem.Local lambda_capture_local(self, qid.DefId lambda_def, sem.LocalId local_id) {
+        sem.Def& lambda_model = self.lowerer.model.def(lambda_def)$.some();
+        guard lambda_model.body is .some(ref _ body) else {
+            return sem.Local(local_id, .local_variable, qid.SymbolId(0), qid.DefId.from_index(0), false, false, null);
+        }
+        return body.local(local_id);
+    }
+
+    public jil.Operand lambda_capture_operand(
+        self,
+        sem.NodeId node_id,
+        sem.Lambda lambda,
+        typeck_store.LambdaCaptureInfo info
+    ) {
+        if (info.kind == .explicit_capture) {
+            return self.lower_to_operand(lambda.captures[info.field_index].value);
+        }
+        if (info.source_def is .some(source_def)) {
+            if (self.place_for_local_def(source_def) is .some(place)) {
+                if (info.deref_on_use) {
+                    return self.borrow_operand_from_place(place, self.lowerer.model_span(node_id));
+                }
+                return self.operand_for_place(place);
+            }
+        }
+        return self.unsupported_operand(node_id);
+    }
+
+    public jil.Operand borrow_operand_from_place(self, jil.Place place, token.Span span) {
+        qid.TypeId reference_type = self.lowerer.ctx.store.types.reference_type(self.jil_place_type(place), span);
+        jil.LocalId reference_local = self.add_temp(reference_type, span);
+        jil.Place reference_place = self.place_for_local(reference_local);
+        self.push_assign(reference_place, jil.borrow_rvalue(jil.BorrowRvalue (place: place)), span);
+        return self.operand_for_place(reference_place);
+    }
+
+    public jil.Operand erased_lambda_env_address_operand(
+        self,
+        jil.Place env_place,
+        qid.TypeId env_pointer_type,
+        token.Span span
+    ) {
+        qid.TypeId erased_type = self.closure_env_type(span);
+        jil.LocalId erased_local = self.add_temp(erased_type, span);
+        jil.Place erased_place = self.place_for_local(erased_local);
+        self.push_assign(
+            erased_place,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: self.cast_kind(env_pointer_type, erased_type),
+                value: self.lambda_env_address_operand(env_place, env_pointer_type, span),
+                target_type: erased_type
+            )),
+            span
+        );
+        return self.operand_for_place(erased_place);
+    }
+
+    public jil.Operand erased_lambda_env_pointer_operand(
+        self,
+        jil.Place env_pointer_place,
+        qid.TypeId env_pointer_type,
+        jil.LocalId? capture_task,
+        token.Span span
+    ) {
+        qid.TypeId erased_type = self.closure_env_type(span);
+        jil.LocalId erased_local = self.add_optional_coroutine_capture_temp(
+            erased_type, span, capture_task
+        );
+        jil.Place erased_place = self.place_for_local(erased_local);
+        self.push_assign(
+            erased_place,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: self.cast_kind(env_pointer_type, erased_type),
+                value: self.operand_for_place(env_pointer_place),
+                target_type: erased_type
+            )),
+            span
+        );
+        return self.operand_for_place(erased_place);
+    }
+
+    public jil.Operand lambda_env_address_operand(self,
+        jil.Place env_place,
+        qid.TypeId env_pointer_type,
+        token.Span span
+    ) {
+        jil.LocalId pointer_local = self.add_temp(env_pointer_type, span);
+        jil.Place pointer_place = self.place_for_local(pointer_local);
+        self.push_assign(
+            pointer_place,
+            jil.address_of_rvalue(jil.AddressOfRvalue (
+                mutable_pointer: true,
+                place: env_place
+            )),
+            span
+        );
+        return self.operand_for_place(pointer_place);
+    }
+
+    public () push_closure_assign(self,
+        sem.NodeId node_id,
+        jil.Place destination,
+        qid.TypeId closure_type,
+        jil.Operand env,
+        jil.Operand vtable
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>(2);
+        fields.add(env);
+        fields.add(vtable);
+        self.push_assign(
+            destination,
+            jil.aggregate_rvalue(jil.AggregateRvalue (
+                kind: jil.AggregateKind.struct_value,
+                def_id: null,
+                type_id: closure_type,
+                tag: null,
+                payload_field_index: -1,
+                fields: self.lowerer.output.operand_slice(fields.slice())
+            )),
+            span
+        );
+    }
+
+    public qid.TypeId closure_env_type(self, token.Span span) {
+        return self.lowerer.ctx.store.types.opaque_pointer_type(span);
+    }
+
+    public qid.TypeId closure_drop_env_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(self.closure_env_type(span));
+        return self.lowerer.ctx.store.types.function_type(
+            params,
+            self.lowerer.ctx.store.types.unit_type(),
+            span
+        );
+    }
+
+    public qid.TypeId closure_vtable_type(self, qid.TypeId closure_type, token.Span span) {
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(2);
+        fields.add(self.closure_code_type(closure_type));
+        fields.add(self.closure_drop_env_type(span));
+        return self.lowerer.ctx.store.types.tuple_type(fields, span);
+    }
+
+    public qid.TypeId closure_vtable_pointer_type(self, qid.TypeId closure_type, token.Span span) {
+        return self.raw_pointer_type(self.closure_vtable_type(closure_type, span), span);
+    }
+
+    public qid.TypeId lambda_env_type_for_body(self, token.Span span) {
+        guard self.lambda_capture_infos is .some(captures) else {
+            return self.lowerer.ctx.store.types.unit_type();
+        }
+        return self.lambda_env_type_for_infos(self.model_def.def_id, captures, span);
+    }
+
+    public jil.Place? lambda_capture_place_for_local(self, sem.LocalId local_id) {
+        sem.Local local = self.model_local(local_id);
+        return self.lambda_capture_place_for_local_def(local.def_id, true);
+    }
+
+    public jil.Place? lambda_capture_place_for_def(self, qid.DefId def_id) {
+        return self.lambda_capture_place_for_local_def(def_id, false);
+    }
+
+    public jil.Place? lambda_capture_place_for_local_def(self, qid.DefId def_id, Bool explicit_only) {
+        guard self.lambda_capture_infos is .some(captures) else { return null; }
+        Int index! = 0;
+        while (index < captures.length) {
+            typeck_store.LambdaCaptureInfo info = captures[index];
+            if (explicit_only && info.kind != .explicit_capture) {
+                index = index + 1;
+                continue;
+            }
+            if (self.lambda_capture_matches_def(info, def_id)) {
+                jil.Place field_place = self.lambda_capture_field_place(info, token.Span());
+                if (self.lambda_capture_def_needs_deref(info, explicit_only)) {
+                    return self.project_deref(field_place, false);
+                }
+                return field_place;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public Bool lambda_capture_def_needs_deref(self, typeck_store.LambdaCaptureInfo info, Bool explicit_only) {
+        if (explicit_only) { return false; }
+        if (info.kind != .implicit_capture) { return false; }
+        return info.deref_on_use;
+    }
+
+    public Bool lambda_capture_matches_def(self, typeck_store.LambdaCaptureInfo info, qid.DefId def_id) {
+        if (qid.DefId.equal(info.local_def$.ref(), def_id$.ref())) { return true; }
+        if (info.kind != .implicit_capture) { return false; }
+        if (info.source_def is .some(source_def)) {
+            return qid.DefId.equal(source_def$.ref(), def_id$.ref());
+        }
+        return false;
+    }
+
+    public jil.Place lambda_capture_field_place(self, typeck_store.LambdaCaptureInfo info, token.Span span) {
+        qid.TypeId env_type = self.lambda_env_type_for_body(span);
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        jil.LocalId typed_env = self.add_temp(env_pointer_type, span);
+        jil.Place typed_env_place = self.place_for_local(typed_env);
+        self.push_assign(
+            typed_env_place,
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: self.cast_kind(self.closure_env_type(span), env_pointer_type),
+                value: self.operand_for_place(self.place_for_local(jil.LocalId.from_index(1))),
+                target_type: env_pointer_type
+            )),
+            span
+        );
+        jil.Place env_value = self.project_deref(typed_env_place, true);
+        return self.project_constant_index(env_value, info.field_index);
+    }
+
+    public Bool type_is_closure(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        return function_type.kind == .closure;
+    }
+
+    public Bool function_type_is_async(self, qid.TypeId type_id) {
+        types.TypeInfo info! = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .handle_type(handle)) {
+            if (handle.kind == .owner_pointer || handle.kind == .reference) {
+                info = self.lowerer.ctx.store.types.get(handle.element);
+            }
+        }
+        guard info.data is .function_type(function_type) else { return false; }
+        return function_type.effects.has_async;
+    }
+
+    public Bool type_is_closure_callable(self, qid.TypeId type_id) {
+        if (self.type_is_closure(type_id)) { return true; }
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (handle.kind != .owner_pointer && handle.kind != .reference) {
+            return false;
+        }
+        return self.type_is_closure(handle.element);
+    }
+
+    public jil.Operand? selected_name_ref_def_operand(self, sem.NodeId node_id) {
+        guard self.lowerer.typeck.member_selection(node_id) is .some(selected_def) else {
+            return null;
+        }
+        if (!self.def_can_be_function_operand(selected_def)) {
+            return null;
+        }
+        // `RawFn<...>` expected typing can refine an overloaded name_ref to a
+        // different function def than the one resolve used as its initial
+        // representative. JIL must lower that refined choice.
+        return self.lower_def_operand(node_id, selected_def);
+    }
+
+    @life(return: place)
+    public jil.Operand operand_for_place(self, jil.Place place) {
+        if (self.place_moves_by_default(place)) {
+            return jil.move_operand_value(jil.MoveOperand (place: place));
+        }
+        return jil.copy_operand_value(jil.CopyOperand (place: place));
+    }
+
+    public Bool place_moves_by_default(self, jil.Place place) {
+        if (place.projection.length != 0) {
+            return false;
+        }
+        copy_semantics.CopyQuery query = copy_semantics.CopyQuery(self.lowerer.ctx.store$.ref());
+        return !query.is_implicit_copy_type(self.jil_place_type(place));
+    }
+
+    public () lower_member_access(self, sem.NodeId node_id, sem.MemberAccess member_access, jil.Place destination) {
+        if (self.lowerer.typeck.expr_lowering(node_id) is .some(lowering_kind)) {
+            if (lowering_kind == .trait_object_method_value) {
+                self.push_assign(
+                    destination,
+                    jil.use_rvalue(jil.UseRvalue (value: self.trait_object_method_value_operand(node_id))),
+                    self.lowerer.model_span(node_id)
+                );
+                return;
+            }
+        }
+        if (self.lowerer.typeck.member_selection(node_id) is .some(member_def)) {
+            def.DefKind kind = self.lowerer.ctx.store.defs.get(member_def).kind;
+            if (kind == .union_variant_def) {
+                self.lower_empty_union_variant_value(node_id, member_def, destination);
+                return;
+            }
+            if (kind == .enum_case_def || self.def_can_be_function_operand(member_def)) {
+                self.push_assign(
+                    destination,
+                    jil.use_rvalue(jil.UseRvalue (value: self.lower_def_operand(node_id, member_def))),
+                    self.lowerer.model_span(node_id)
+                );
+                return;
+            }
+        }
+        jil.Operand value = self.lower_operand(node_id);
+        self.push_assign(destination, jil.use_rvalue(jil.UseRvalue (value: value)), self.lowerer.model_span(node_id));
+    }
+
+    public () lower_empty_union_variant_value(self, sem.NodeId node_id, qid.DefId variant_def, jil.Place destination) {
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>();
+        self.push_assign(
+            destination,
+            jil.aggregate_rvalue(jil.AggregateRvalue (
+                kind: jil.AggregateKind.union_variant,
+                def_id: variant_def,
+                type_id: self.type_for_node(node_id),
+                tag: self.union_variant_tag_operand(node_id, variant_def),
+                payload_field_index: self.union_variant_payload_field_index(node_id, variant_def),
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            )),
+            self.lowerer.model_span(node_id)
+        );
+    }
+
+    public jil.Operand lower_def_operand(self, sem.NodeId node_id, qid.DefId def_id) {
+        if (self.lowerer.ctx.store.defs.get(def_id).kind == .enum_case_def) {
+            return jil.const_operand_value(jil.Const (
+                type_id: self.type_for_node(node_id),
+                span: self.lowerer.model_span(node_id),
+                value: jil.int_const_kind(jil.IntConst (
+                    bits: UInt64(self.enum_case_value_or_error(def_id)),
+                    signed_value: true
+                ))
+            ));
+        }
+        if (self.const_global_operand(node_id, def_id) is .some(operand)) {
+            return operand;
+        }
+        if (self.is_const_global_def(def_id)) {
+            return self.unsupported_operand(node_id);
+        }
+        if (!self.def_can_be_function_operand(def_id)) {
+            self.ensure_runtime_global_storage(node_id, def_id, self.type_for_node(node_id));
+            Bool is_external! = false;
+            if (self.lowerer.model.def(def_id) is .some(model_def)) {
+                is_external = model_def.decl.is_external;
+            }
+            return jil.global_operand_value(jil.GlobalRef (
+                global_def: def_id,
+                type_id: self.type_for_node(node_id),
+                is_external: is_external,
+                span: self.lowerer.model_span(node_id)
+            ));
+        }
+        self.lowerer.ensure_external_function(def_id);
+        qid.TypeId[]& type_args = self.function_ref_type_args(node_id, def_id);
+        comptime_value.ComptimeValue[]& const_args = self.function_ref_const_args(node_id, def_id);
+        qid.TypeId value_type = self.type_for_node(node_id);
+        if (self.function_type_is_async(value_type) && self.internal_async_function_value(def_id)) {
+            qid.DefId start_def = self.ensure_async_callable_start_shim(
+                def_id, type_args, const_args, self.lowerer.model_span(node_id)
+            );
+            FunctionRefArgs args = FunctionRefArgs(
+                type_args: self.lowerer.output.empty_type_args(),
+                const_args: self.lowerer.output.empty_const_args()
+            );
+            return jil.function_operand_value(
+                self.function_ref(node_id, start_def, value_type, args)
+            );
+        }
+        return jil.function_operand_value(
+            self.function_ref(
+                node_id,
+                def_id,
+                value_type,
+                FunctionRefArgs(type_args: type_args, const_args: const_args)
+            )
+        );
+    }
+
+    public Bool internal_async_function_value(self, qid.DefId function_def) {
+        guard self.lowerer.model.def(function_def) is .some(model_def) else { return false; }
+        return self.lowerer.model.has_body(model_def.def_id);
+    }
+
+}

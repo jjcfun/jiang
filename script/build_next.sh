@@ -14,10 +14,16 @@ BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.9}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
+BOOTSTRAP_ARTIFACT_CACHE_DIR="${BOOTSTRAP_ARTIFACT_CACHE_DIR:-$BUILD_DIR/cache/bootstrap-$BOOTSTRAP_RELEASE_VERSION}"
+NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/cache/next}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
-mkdir -p "$BUILD_DIR" "$BUILD_BIN_DIR"
+mkdir -p \
+  "$BUILD_DIR" \
+  "$BUILD_BIN_DIR" \
+  "$BOOTSTRAP_ARTIFACT_CACHE_DIR" \
+  "$NEXT_ARTIFACT_CACHE_DIR"
 cp "$ROOT_DIR/package.ini" "$BUILD_DIR/package.ini"
 cd "$ROOT_DIR"
 
@@ -91,16 +97,16 @@ write_compiler_build_id() {
   printf '%s\n' "$build_id" >"$compiler_bin.build-id"
 }
 
-clear_bootstrap_artifact_cache() {
-  # bootstrap 编译器可能把旧 schema 的 source artifact 写到默认 build/cache。
-  # next/stable 阶段必须用当前编译器重新生成，避免 smoke 读到旧接口。
-  rm -rf "$ROOT_DIR/build/cache"
-}
-
 emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
-  "$BOOTSTRAP_BIN" --target "$JIANG_HOST_TARGET" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
+  "$BOOTSTRAP_BIN" \
+    --artifact-cache-dir "$BOOTSTRAP_ARTIFACT_CACHE_DIR" \
+    --target "$JIANG_HOST_TARGET" \
+    --linker "$CLANG_BIN" \
+    "${LLVM_LINK_ARGS[@]}" \
+    -o "$output_bin" \
+    src/jiangc.jiang
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
@@ -111,7 +117,13 @@ emit_compiler_with_compiler() {
   local output_bin="$2"
   test -x "$source_bin"
   printf '== build next: compile executable with %s ==\n' "$source_bin"
-  "$source_bin" --target "$JIANG_HOST_TARGET" --linker "$CLANG_BIN" "${LLVM_LINK_ARGS[@]}" -o "$output_bin" src/jiangc.jiang
+  "$source_bin" \
+    --artifact-cache-dir "$NEXT_ARTIFACT_CACHE_DIR" \
+    --target "$JIANG_HOST_TARGET" \
+    --linker "$CLANG_BIN" \
+    "${LLVM_LINK_ARGS[@]}" \
+    -o "$output_bin" \
+    src/jiangc.jiang
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
@@ -120,9 +132,7 @@ emit_compiler_with_compiler() {
 collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
-clear_bootstrap_artifact_cache
 emit_next_from_bootstrap "$NEXT_BIN"
-clear_bootstrap_artifact_cache
 
 VERIFY_BIN="$NEXT_BIN"
 if [ "$BOOTSTRAP_DEPTH" = "stable" ]; then

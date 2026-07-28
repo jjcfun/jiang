@@ -1,0 +1,1367 @@
+// Trait object、vtable、receiver metadata 与 compiler-generated shim lowering。
+//
+// 本模块集中维护动态派发所需的 JIL 数据和辅助函数。
+
+import context = "../../context.jiang";
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import layout_compute = "../../layout/compute.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import store = "../../resolve/store.jiang";
+import source = "../../source.jiang";
+import drop_semantics = "../../sema/drop.jiang";
+import comptime_value = "../../sema/comptime/value.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import * = "./model.jiang";
+import * = "./context.jiang";
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import package = "./package.jiang";
+import expression = "./expression.jiang";
+import place = "./place.jiang";
+import closure = "./closure.jiang";
+import call = "./call.jiang";
+import dispatch = "./dispatch.jiang";
+import builder = "./builder.jiang";
+
+
+public extend body_context.BodyLowerer {
+    public () lower_trait_receiver(self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.lower_trait_receiver_value(call.args[0], destination, self.lowerer.model_span(node_id));
+    }
+
+    public () lower_trait_vtable(self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
+        guard self.trait_companion_for_type(self.type_for_node(node_id)) is .some(companion) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.trait_vtable_subject_type(call) is .some(subject_type) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.ensure_trait_vtable_global(node_id, companion.trait_def, subject_type) is .some(global_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        self.push_assign(
+            destination,
+            jil.use_rvalue(jil.UseRvalue (
+                value: jil.global_address_operand_value(jil.GlobalRef (
+                    global_def: global_def,
+                    type_id: self.type_for_node(node_id),
+                    is_external: false,
+                    span: span
+                ))
+            )),
+            span
+        );
+    }
+
+    public () lower_trait_ref(self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.trait_object_companion_for_type(self.type_for_node(node_id)) is .some(companion) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId subject_type = self.trait_ref_subject_type(self.type_for_node(call.args[0]));
+        guard self.ensure_trait_vtable_global(node_id, companion.trait_def, subject_type) is .some(global_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        self.push_trait_object_assign(node_id, destination, companion.trait_def, global_def, call.args[0], span);
+    }
+
+    public () lower_trait_mut_ref(self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.trait_object_companion_for_type(self.type_for_node(node_id)) is .some(companion) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId subject_type = self.trait_ref_subject_type(self.type_for_node(call.args[0]));
+        guard self.ensure_trait_vtable_global(node_id, companion.trait_def, subject_type) is .some(global_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        jil.Place reference = self.mutable_trait_reference_place(call.args[0], span);
+        self.push_trait_object_assign_from_reference(
+            node_id,
+            destination,
+            companion.trait_def,
+            global_def,
+            reference,
+            span
+        );
+    }
+
+    public jil.Place mutable_trait_reference_place(self, sem.NodeId value_id, token.Span span) {
+        qid.TypeId value_type = self.type_for_node(value_id);
+        if (self.type_is_reference(value_type)) {
+            jil.LocalId copied = self.add_temp(value_type, span);
+            jil.Place copied_place = self.place_for_local(copied);
+            self.push_assign(
+                copied_place,
+                jil.use_rvalue(jil.UseRvalue(value: self.lower_to_operand(value_id))),
+                span
+            );
+            return copied_place;
+        }
+        jil.Place source = self.receiver_source_place(value_id, span);
+        qid.TypeId reference_type = self.lowerer.ctx.store.types.reference_type(value_type, span);
+        qid.TypeId mutable_reference = self.lowerer.ctx.store.types.mutable_type(reference_type, span);
+        jil.LocalId borrowed = self.add_temp(mutable_reference, span);
+        jil.Place borrowed_place = self.place_for_local(borrowed);
+        self.push_assign(borrowed_place, jil.borrow_rvalue(jil.BorrowRvalue(place: source)), span);
+        return borrowed_place;
+    }
+
+    public () lower_trait_new(self, sem.NodeId node_id, sem.ImplicitCall call, jil.Place destination) {
+        if (call.args.length != 1) {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        guard self.trait_object_companion_for_type(self.type_for_node(node_id)) is .some(companion) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId subject_type = self.type_for_node(call.args[0]);
+        guard self.ensure_trait_vtable_global(node_id, companion.trait_def, subject_type) is .some(global_def) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        jil.LocalId owned_local = self.add_temp(
+            self.lowerer.ctx.store.types.owner_pointer_type(subject_type, span),
+            span
+        );
+        jil.Place owned_place = self.place_for_local(owned_local);
+        self.push_assign(
+            owned_place,
+            jil.alloc_box_rvalue(jil.AllocBoxRvalue (value_type: subject_type)),
+            span
+        );
+        self.lower_into_place(call.args[0], self.project_deref(owned_place, false));
+        self.push_trait_object_owned_assign(node_id, destination, companion.trait_def, global_def, owned_place, span);
+    }
+
+    public () push_trait_object_assign(self,
+        sem.NodeId node_id,
+        jil.Place destination,
+        qid.DefId trait_def,
+        qid.DefId global_def,
+        sem.NodeId value_id,
+        token.Span span
+    ) {
+        qid.TypeId receiver_type = self.lowerer.ctx.store.types.trait_companion_type(
+            trait_def,
+            .receiver,
+            span
+        );
+        qid.TypeId vtable_type = self.lowerer.ctx.store.types.trait_companion_type(
+            trait_def,
+            .vtable,
+            span
+        );
+        jil.LocalId receiver_local = self.add_temp(receiver_type, span);
+        self.lower_trait_receiver_value(value_id, self.place_for_local(receiver_local), span);
+        self.push_trait_object_aggregate(node_id, destination, global_def, receiver_local, vtable_type, span);
+    }
+
+    public () push_trait_object_assign_from_reference(self,
+        sem.NodeId node_id,
+        jil.Place destination,
+        qid.DefId trait_def,
+        qid.DefId global_def,
+        jil.Place reference,
+        token.Span span
+    ) {
+        qid.TypeId receiver_type = self.lowerer.ctx.store.types.trait_companion_type(
+            trait_def,
+            .receiver,
+            span
+        );
+        qid.TypeId vtable_type = self.lowerer.ctx.store.types.trait_companion_type(
+            trait_def,
+            .vtable,
+            span
+        );
+        jil.LocalId receiver_local = self.add_temp(receiver_type, span);
+        self.push_assign(
+            self.place_for_local(receiver_local),
+            jil.use_rvalue(jil.UseRvalue(
+                value: jil.copy_operand_value(jil.CopyOperand(place: reference))
+            )),
+            span
+        );
+        self.push_trait_object_aggregate(node_id, destination, global_def, receiver_local, vtable_type, span);
+    }
+
+    public () push_trait_object_owned_assign(self,
+        sem.NodeId node_id,
+        jil.Place destination,
+        qid.DefId trait_def,
+        qid.DefId global_def,
+        jil.Place owned_place,
+        token.Span span
+    ) {
+        qid.TypeId receiver_type = self.lowerer.ctx.store.types.trait_companion_type(trait_def, .receiver, span);
+        qid.TypeId vtable_type = self.lowerer.ctx.store.types.trait_companion_type(trait_def, .vtable, span);
+        jil.LocalId receiver_local = self.add_temp(receiver_type, span);
+        self.push_assign(
+            self.place_for_local(receiver_local),
+            jil.cast_rvalue(jil.CastRvalue (
+                kind: jil.CastKind.ptr_to_ptr,
+                value: jil.copy_operand_value(jil.CopyOperand (place: owned_place)),
+                target_type: receiver_type
+            )),
+            span
+        );
+        self.push_trait_object_aggregate(node_id, destination, global_def, receiver_local, vtable_type, span);
+    }
+
+    public () push_trait_object_aggregate(self,
+        sem.NodeId node_id,
+        jil.Place destination,
+        qid.DefId global_def,
+        jil.LocalId receiver_local,
+        qid.TypeId vtable_type,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>(2);
+        fields.add(jil.copy_operand_value(jil.CopyOperand (place: self.place_for_local(receiver_local))));
+        fields.add(jil.global_address_operand_value(jil.GlobalRef (
+            global_def: global_def,
+            type_id: vtable_type,
+            is_external: false,
+            span: span
+        )));
+        self.push_assign(
+            destination,
+            self.aggregate_rvalue(jil.AggregateRvalue (
+                kind: jil.AggregateKind.tuple,
+                def_id: null,
+                type_id: self.type_for_node(node_id),
+                tag: null,
+                payload_field_index: -1,
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            ), span),
+            span
+        );
+    }
+
+    public qid.TypeId trait_ref_subject_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return type_id; }
+        if (handle.kind == .reference) { return handle.element; }
+        return type_id;
+    }
+
+    public qid.DefId? ensure_trait_vtable_global(self,
+        sem.NodeId node_id,
+        qid.DefId trait_def,
+        qid.TypeId subject_type
+    ) {
+        TraitVTableGlobalKey key = TraitVTableGlobalKey(trait_def, subject_type);
+        if (table.hash_table_get_value<TraitVTableGlobalKey, qid.DefId>(
+            self.lowerer.trait_vtable_globals$.ref(),
+            key
+        ) is .some(existing)) {
+            return existing;
+        }
+        guard self.trait_vtable_static_value(node_id, trait_def, subject_type) is .some(initializer) else {
+            return null;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId vtable_type = self.lowerer.ctx.store.types.trait_companion_type(trait_def, .vtable, span);
+        qid.DefId global_def = self.create_trait_vtable_global_def(trait_def, subject_type, span);
+        jil.GlobalId id = jil.GlobalId.from_index(self.lowerer.output.globals.len());
+        self.lowerer.output.add_global(jil.Global (
+            id: id,
+            def_id: global_def,
+            type_id: vtable_type,
+            span: span,
+            read_only: true,
+            is_external: false,
+            initializer: initializer
+        ));
+        self.lowerer.trait_vtable_globals.set(key, global_def);
+        return global_def;
+    }
+
+    public qid.DefId create_trait_vtable_global_def(self,
+        qid.DefId trait_def,
+        qid.TypeId subject_type,
+        token.Span span
+    ) {
+        // vtable 是使用点生成的实体，必须归当前 function 的 source unit 所有。
+        // 若归到 trait 定义 module，会用一个局部 global 冒充整个 dependency source unit。
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.model_def.def_id);
+        std.String name = self.trait_vtable_global_name(trait_def, subject_type);
+        return self.lowerer.ctx.store.defs.create(
+            .global_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public std.String trait_vtable_global_name(self, qid.DefId trait_def, qid.TypeId subject_type) {
+        std.StringBuilder builder = std.StringBuilder();
+        builder.append("__vtable_");
+        builder.append(trait_def.to_index());
+        builder.append("_");
+        builder.append(subject_type.to_index());
+        return builder.into_string();
+    }
+
+    public () lower_trait_receiver_value(self, sem.NodeId value_id, jil.Place destination, token.Span span) {
+        if (self.type_is_reference(self.type_for_node(value_id))) {
+            self.push_assign(
+                destination,
+                jil.use_rvalue(jil.UseRvalue (value: self.lower_to_operand(value_id))),
+                span
+            );
+            return;
+        }
+        jil.Place source = self.receiver_source_place(value_id, span);
+        self.push_assign(
+            destination,
+            jil.address_of_rvalue(jil.AddressOfRvalue (
+                mutable_pointer: true,
+                place: source
+            )),
+            span
+        );
+    }
+
+    public () push_trait_vtable_assign(self,
+        sem.NodeId node_id,
+        jil.Place destination,
+        qid.DefId trait_def,
+        qid.TypeId subject_type
+    ) {
+        token.Span span = self.lowerer.model_span(node_id);
+        list.ArrayList<jil.Operand> fields = self.trait_vtable_operands(node_id, trait_def, subject_type);
+        self.push_assign(
+            destination,
+            self.aggregate_rvalue(jil.AggregateRvalue (
+                kind: jil.AggregateKind.tuple,
+                def_id: null,
+                type_id: self.jil_place_type(destination),
+                tag: null,
+                payload_field_index: -1,
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            ), span),
+            span
+        );
+    }
+
+    public list.ArrayList<jil.Operand> trait_vtable_operands(self,
+        sem.NodeId node_id,
+        qid.DefId trait_def,
+        qid.TypeId subject_type
+    ) {
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>();
+        guard self.lowerer.model.def(trait_def) is .some(model_def) else { return fields; }
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            qid.DefId trait_member = model_def.members.get(index);
+            if (self.lowerer.ctx.store.defs.get(trait_member).kind == .function_def) {
+                fields.add(self.trait_vtable_function_operand(node_id, subject_type, trait_member));
+            }
+            index = index + 1;
+        }
+        return fields;
+    }
+
+    public jil.StaticValue? trait_vtable_static_value(self,
+        sem.NodeId node_id,
+        qid.DefId trait_def,
+        qid.TypeId subject_type
+    ) {
+        list.ArrayList<jil.StaticField> fields! = list.ArrayList<jil.StaticField>();
+        fields.add(self.receiver_type_info_static_field(node_id, subject_type));
+        guard self.lowerer.model.def(trait_def) is .some(model_def) else { return null; }
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            qid.DefId trait_member = model_def.members.get(index);
+            if (self.lowerer.ctx.store.defs.get(trait_member).kind == .function_def) {
+                guard self.trait_vtable_function_ref(node_id, subject_type, trait_member) is .some(function_ref) else {
+                    return null;
+                }
+                fields.add(jil.StaticField (
+                    type_id: function_ref.type_id,
+                    value: jil.function_static_value(function_ref)
+                ));
+            }
+            index = index + 1;
+        }
+        return jil.StaticValue.aggregate(
+            self.lowerer.output.static_field_array(fields$.ref())
+        );
+    }
+
+    public jil.StaticField receiver_type_info_static_field(self, sem.NodeId node_id, qid.TypeId subject_type) {
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.TypeId pointer_type = self.receiver_type_info_pointer_type(span);
+        return jil.StaticField (
+            type_id: pointer_type,
+            value: jil.global_address_static_value(jil.GlobalRef (
+                global_def: self.ensure_receiver_type_global(node_id, subject_type),
+                type_id: pointer_type,
+                is_external: false,
+                span: span
+            ))
+        );
+    }
+
+    public qid.TypeId receiver_drop_function_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(self.lowerer.ctx.store.types.opaque_pointer_type(span));
+        return self.lowerer.ctx.store.types.function_type(
+            params,
+            self.lowerer.ctx.store.types.unit_type(),
+            span
+        );
+    }
+
+    public qid.TypeId receiver_type_info_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(3);
+        fields.add(self.receiver_drop_function_type(span));
+        fields.add(self.lowerer.ctx.store.types.int_type());
+        fields.add(self.lowerer.ctx.store.types.int_type());
+        return self.lowerer.ctx.store.types.tuple_type(fields, span);
+    }
+
+    public qid.TypeId receiver_type_info_pointer_type(self, token.Span span) {
+        return self.lowerer.ctx.store.types.raw_pointer_type(self.receiver_type_info_type(span), span);
+    }
+
+    public qid.DefId ensure_receiver_type_global(self, sem.NodeId node_id, qid.TypeId subject_type) {
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.receiver_type_globals$.ref(),
+            subject_type.to_index()
+        ) is .some(existing)) {
+            return existing;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.DefId global_def = self.create_receiver_type_global_def(subject_type, span);
+        jil.GlobalId id = jil.GlobalId.from_index(self.lowerer.output.globals.len());
+        self.lowerer.output.add_global(jil.Global (
+            id: id,
+            def_id: global_def,
+            type_id: self.receiver_type_info_type(span),
+            span: span,
+            read_only: true,
+            is_external: false,
+            initializer: self.receiver_type_info_static_value(node_id, subject_type)
+        ));
+        self.lowerer.receiver_type_globals.set(subject_type.to_index(), global_def);
+        return global_def;
+    }
+
+    public jil.StaticValue receiver_type_info_static_value(self, sem.NodeId node_id, qid.TypeId subject_type) {
+        token.Span span = self.lowerer.model_span(node_id);
+        list.ArrayList<jil.StaticField> fields! = list.ArrayList<jil.StaticField>(3);
+        qid.TypeId drop_type = self.receiver_drop_function_type(span);
+        fields.add(jil.StaticField (
+            type_id: drop_type,
+            value: jil.function_static_value(jil.FunctionRef (
+                function_def: self.ensure_receiver_drop_shim(node_id, subject_type),
+                type_args: self.lowerer.output.empty_type_args(),
+                const_args: self.lowerer.output.empty_const_args(),
+                coroutine_resume: false,
+            coroutine_completion: false,
+                type_id: drop_type,
+                span: span
+            ))
+        ));
+        fields.add(jil.StaticField (
+            type_id: self.lowerer.ctx.store.types.int_type(),
+            value: jil.scalar_static_value(jil.Const (
+                type_id: self.lowerer.ctx.store.types.int_type(),
+                span: span,
+                value: jil.int_const_kind(jil.IntConst (bits: UInt64(0), signed_value: true))
+            ))
+        ));
+        fields.add(jil.StaticField (
+            type_id: self.lowerer.ctx.store.types.int_type(),
+            value: jil.scalar_static_value(jil.Const (
+                type_id: self.lowerer.ctx.store.types.int_type(),
+                span: span,
+                value: jil.int_const_kind(jil.IntConst (bits: UInt64(0), signed_value: true))
+            ))
+        ));
+        return jil.StaticValue.aggregate(
+            self.lowerer.output.static_field_array(fields$.ref())
+        );
+    }
+
+    public jil.FunctionRef ensure_cancel_handler_shim(
+        self,
+        sem.NodeId handler_id,
+        sem.Lambda handler,
+        jil.FunctionRef drop,
+        token.Span span
+    ) {
+        qid.DefId shim_def;
+        Int key = handler.function_def.to_index();
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.cancel_handler_shims$.ref(), key
+        ) is .some(existing)) {
+            shim_def = existing;
+        } else {
+            shim_def = self.create_cancel_handler_shim_def(handler.function_def, span);
+            self.lowerer.cancel_handler_shims.set(key, shim_def);
+            self.add_cancel_handler_shim_function(
+                shim_def,
+                self.cancel_handler_function(handler_id, handler, span),
+                drop,
+                span
+            );
+        }
+        return jil.FunctionRef (
+            function_def: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.lowerer.task_resume_function_type(span),
+            span: span
+        );
+    }
+
+    public jil.FunctionRef cancel_handler_function(
+        self,
+        sem.NodeId handler_id,
+        sem.Lambda handler,
+        token.Span span
+    ) {
+        return jil.FunctionRef (
+            function_def: handler.function_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: self.closure_code_type(self.type_for_node(handler_id)),
+            span: span
+        );
+    }
+
+    public qid.DefId create_cancel_handler_shim_def(self, qid.DefId handler_def, token.Span span) {
+        def.DefRecord handler_record = self.lowerer.ctx.store.defs.get(handler_def);
+        std.String name = build_text_int("__cancel_handler_", handler_def.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            handler_record.owner_def,
+            handler_record.module_id,
+            handler_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public () add_cancel_handler_shim_function(
+        self,
+        qid.DefId shim_def,
+        jil.FunctionRef handler,
+        jil.FunctionRef drop,
+        token.Span span
+    ) {
+        Int function_index = self.lowerer.output.functions.len();
+        qid.TypeId unit_type = self.lowerer.ctx.store.types.unit_type();
+        list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(4);
+        locals.add(self.receiver_drop_local(0, .return_place, unit_type, span));
+        locals.add(self.receiver_drop_local(1, .param, self.closure_env_type(span), span));
+        locals.add(self.receiver_drop_local(2, .compiler_temp, unit_type, span));
+        locals.add(self.receiver_drop_local(3, .compiler_temp, unit_type, span));
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(3);
+        blocks.add(self.cancel_handler_call_block(handler, 2, 0, 1, span));
+        blocks.add(self.cancel_handler_call_block(drop, 3, 1, 2, span));
+        blocks.add(jil.Block (
+            id: jil.BlockId.from_index(2),
+            span: span,
+            statements: self.lowerer.output.empty_statements(),
+            terminator: self.receiver_drop_return_terminator(span)
+        ));
+        jil.Body body = jil.Body (
+            id: jil.BodyId.from_index(function_index),
+            span: span,
+            locals: self.freeze_generated_locals(locals$.ref()),
+            blocks: self.lowerer.output.block_array(blocks$.ref()),
+            entry: jil.BlockId.from_index(0),
+            return_local: jil.LocalId.from_index(0)
+        );
+        self.add_cancel_handler_shim_jil(shim_def, function_index, body, span);
+    }
+
+    @life(return: self & function)
+    public jil.Block cancel_handler_call_block(
+        self,
+        jil.FunctionRef function,
+        Int result_local,
+        Int block_index,
+        Int target_index,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(jil.copy_operand_value(jil.CopyOperand (
+            place: self.receiver_drop_param_place()
+        )));
+        return jil.Block (
+            id: jil.BlockId.from_index(block_index),
+            span: span,
+            statements: self.lowerer.output.empty_statements(),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.call_terminator_kind(jil.CallTerminator (
+                    callee: jil.direct_function_callee(function),
+                    args: self.lowerer.output.operand_array(args$.ref()),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: jil.local_place(
+                        jil.LocalId.from_index(result_local),
+                        self.lowerer.output.empty_projection()
+                    ),
+                    target: jil.BlockId.from_index(target_index),
+                    initialized_place: null,
+                    exclusive_places: self.lowerer.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    public () add_cancel_handler_shim_jil(
+        self,
+        qid.DefId shim_def,
+        Int function_index,
+        jil.Body body,
+        token.Span span
+    ) {
+        self.lowerer.output.add_function(jil.Function (
+            id: jil.FunctionId.from_index(function_index),
+            def_id: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: span,
+            body: body
+        ));
+    }
+
+    public jil.LocalDecl[]& freeze_generated_locals(
+        self,
+        list.ArrayList<jil.LocalDecl>& locals
+    ) {
+        unsafe {
+            jil.LocalDecl*! stored = self.lowerer.output.alloc_local_array(locals.len());
+            Int index! = 0;
+            while (index < locals.len()) {
+                stored[index] = locals.get(index);
+                index = index + 1;
+            }
+            return stored[0..locals.len()];
+        }
+    }
+
+    public qid.DefId ensure_receiver_drop_shim(self, sem.NodeId node_id, qid.TypeId subject_type) {
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.receiver_drop_shims$.ref(),
+            subject_type.to_index()
+        ) is .some(existing)) {
+            return existing;
+        }
+        token.Span span = self.lowerer.model_span(node_id);
+        qid.DefId shim_def = self.create_receiver_drop_shim_def(subject_type, span);
+        self.lowerer.receiver_drop_shims.set(subject_type.to_index(), shim_def);
+        self.add_receiver_drop_shim_function(shim_def, subject_type, span);
+        self.lowerer.ensure_custom_deinit_instance_for_type(subject_type);
+        return shim_def;
+    }
+
+    public qid.DefId create_receiver_drop_shim_def(self, qid.TypeId subject_type, token.Span span) {
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.model_def.def_id);
+        std.String name = build_text_int("__receiver_drop_in_place_", subject_type.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public () add_receiver_drop_shim_function(self, qid.DefId shim_def, qid.TypeId subject_type, token.Span span) {
+        unsafe {
+            Int function_index = self.lowerer.output.functions.len();
+            qid.TypeId receiver_type = self.lowerer.ctx.store.types.raw_pointer_type(
+                self.lowerer.ctx.store.types.uint8_type(),
+                span
+            );
+            qid.TypeId subject_pointer = self.lowerer.ctx.store.types.raw_pointer_type(subject_type, span);
+            list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(3);
+            locals.add(self.receiver_drop_local(0, .return_place, self.lowerer.ctx.store.types.unit_type(), span));
+            locals.add(self.receiver_drop_local(1, .param, receiver_type, span));
+            locals.add(self.receiver_drop_local(2, .compiler_temp, subject_pointer, span));
+
+            drop_semantics.DropQuery query = drop_semantics.DropQuery(self.lowerer.ctx);
+            Bool needs_runtime_drop = query.type_needs_runtime_drop(subject_type);
+            Bool needs_free = self.receiver_type_needs_free(subject_type);
+            jil.Place pointer_place = jil.local_place(
+                jil.LocalId.from_index(2),
+                self.lowerer.output.empty_projection()
+            );
+            list.ArrayList<jil.PlaceElem> deref_projection! = list.ArrayList<jil.PlaceElem>(1);
+            deref_projection.add(jil.deref_projection_elem(jil.DerefProjection(raw_pointer: true)));
+            jil.Place pointee = jil.local_place(
+                jil.LocalId.from_index(2),
+                self.lowerer.output.projection_array(deref_projection$.ref())
+            );
+            list.ArrayList<jil.Statement> entry_statements! = list.ArrayList<jil.Statement>(1);
+            if (needs_runtime_drop) {
+                entry_statements.add(self.receiver_drop_pointer_assign(pointer_place, subject_pointer, span));
+            }
+            list.ArrayList<jil.Statement> return_statements! = list.ArrayList<jil.Statement>(1);
+            if (needs_free) {
+                return_statements.add(self.receiver_drop_free_statement(span));
+            }
+            list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+            if (needs_runtime_drop) {
+                blocks.add(self.receiver_drop_block(pointee, entry_statements$.ref(), span));
+            } else {
+                blocks.add(self.receiver_drop_return_block(return_statements$.ref(), span));
+            }
+            blocks.add(jil.Block(
+                id: jil.BlockId.from_index(1),
+                span: span,
+                statements: self.lowerer.output.statement_array(return_statements$.ref()),
+                terminator: jil.Terminator(
+                    span: span,
+                    kind: jil.return_terminator_kind(jil.ReturnTerminator(implicit_unit: true))
+                )
+            ));
+            jil.LocalDecl*! stored_locals = self.lowerer.output.alloc_local_array(locals.len());
+            Int local_index! = 0;
+            while (local_index < locals.len()) {
+                stored_locals[local_index] = locals[local_index];
+                local_index = local_index + 1;
+            }
+            jil.Body body = jil.Body(
+                id: jil.BodyId.from_index(function_index),
+                span: span,
+                locals: stored_locals[0..locals.len()],
+                blocks: self.lowerer.output.block_array(blocks$.ref()),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+            self.lowerer.output.add_function(jil.Function(
+                id: jil.FunctionId.from_index(function_index),
+                def_id: shim_def,
+                type_args: self.lowerer.output.empty_type_args(),
+                const_args: self.lowerer.output.empty_const_args(),
+                signature_id: null,
+                effects: types.EffectSet(),
+                is_coroutine: false,
+                coroutine_frame: null,
+                is_coroutine_resume: false,
+            is_coroutine_completion: false,
+                is_language_entry: false,
+                is_runtime_entry: false,
+                is_external: false,
+                inline_always: false,
+                naked: false,
+                span: span,
+                body: body
+            ));
+        }
+    }
+
+    public Bool receiver_type_needs_free(self, qid.TypeId subject_type) {
+        layout.LayoutId layout_id = layout_compute.layout_of_type(self.lowerer.ctx, subject_type);
+        layout.TypeLayout type_layout = self.lowerer.ctx.store.layouts.layout(layout_id);
+        return type_layout.kind != .invalid && type_layout.kind != .zero_sized;
+    }
+
+    @life(return: self & pointee & statements)
+    public jil.Block receiver_drop_block(self,
+        jil.Place pointee,
+        list.ArrayList<jil.Statement>& statements,
+        token.Span span
+    ) {
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.drop_terminator_kind(jil.DropTerminator (
+                    place: pointee,
+                    target: jil.BlockId.from_index(1),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    public jil.Block receiver_drop_return_block(self,
+        list.ArrayList<jil.Statement>& statements,
+        token.Span span
+    ) {
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements),
+            terminator: self.receiver_drop_return_terminator(span)
+        );
+    }
+
+    public jil.Terminator receiver_drop_return_terminator(self, token.Span span) {
+        return jil.Terminator (
+            span: span,
+            kind: jil.return_terminator_kind(jil.ReturnTerminator (implicit_unit: true))
+        );
+    }
+
+    @life(return: self & pointer_place)
+    public jil.Statement receiver_drop_pointer_assign(self,
+        jil.Place pointer_place,
+        qid.TypeId subject_pointer,
+        token.Span span
+    ) {
+        jil.Operand receiver_operand = jil.copy_operand_value(jil.CopyOperand (
+            place: self.receiver_drop_param_place()
+        ));
+        jil.Rvalue cast_value = jil.cast_rvalue(jil.CastRvalue (
+            kind: jil.CastKind.ptr_to_ptr,
+            value: receiver_operand,
+            target_type: subject_pointer
+        ));
+        return jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: pointer_place,
+                value: cast_value
+            ))
+        );
+    }
+
+    public jil.Statement receiver_drop_free_statement(self, token.Span span) {
+        jil.Place return_place = jil.local_place(
+            jil.LocalId.from_index(0),
+            self.lowerer.output.empty_projection()
+        );
+        jil.Operand pointer = jil.copy_operand_value(jil.CopyOperand (
+            place: self.receiver_drop_param_place()
+        ));
+        jil.Rvalue free_value = jil.free_rvalue(jil.FreeRvalue (pointer: pointer));
+        return jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: return_place,
+                value: free_value
+            ))
+        );
+    }
+
+    public jil.Place receiver_drop_param_place(self) {
+        return jil.local_place(jil.LocalId.from_index(1), self.lowerer.output.empty_projection());
+    }
+
+    public jil.LocalDecl receiver_drop_local(self, Int index, jil.LocalKind kind, qid.TypeId type_id, token.Span span) {
+        return jil.LocalDecl(
+            id: jil.LocalId.from_index(index),
+            kind: kind,
+            type_id: type_id,
+            span: span,
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        );
+    }
+
+    public qid.DefId ensure_closure_noop_drop_shim(self, token.Span span) {
+        if (self.lowerer.closure_noop_drop_shim is .some(existing)) {
+            return existing;
+        }
+        qid.DefId shim_def = self.create_closure_drop_shim_def("__closure_drop_noop", span);
+        self.lowerer.closure_noop_drop_shim = shim_def;
+        self.add_closure_noop_drop_shim_function(shim_def, span);
+        return shim_def;
+    }
+
+    public () add_closure_noop_drop_shim_function(self, qid.DefId shim_def, token.Span span) {
+        Int function_index = self.lowerer.output.functions.len();
+        list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(2);
+        locals.add(self.receiver_drop_local(0, .return_place, self.lowerer.ctx.store.types.unit_type(), span));
+        locals.add(self.receiver_drop_local(1, .param, self.closure_env_type(span), span));
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(1);
+        blocks.add(self.env_drop_return_block(
+            StatementSlice(values: self.lowerer.output.empty_statements()),
+            span,
+            0
+        ));
+        self.add_closure_drop_shim_function(shim_def, function_index, locals$.ref(), blocks$.ref(), span);
+    }
+
+    public qid.DefId ensure_lambda_env_drop_shim(self, sem.NodeId node_id, qid.TypeId env_type, Bool heap_env) {
+        return self.ensure_lambda_env_drop_shim_at_span(
+            env_type, heap_env, self.lowerer.model_span(node_id)
+        );
+    }
+
+    public qid.DefId ensure_lambda_env_drop_shim_at_span(
+        self,
+        qid.TypeId env_type,
+        Bool heap_env,
+        token.Span span
+    ) {
+        Int key! = env_type.to_index() * 2;
+        if (heap_env) {
+            key = key + 1;
+        }
+        if (table.hash_table_get_value<Int, qid.DefId>(
+            self.lowerer.lambda_env_drop_shims$.ref(),
+            key
+        ) is .some(existing)) {
+            return existing;
+        }
+        std.String name! = build_text_int("__closure_drop_env_stack_", env_type.to_index());
+        if (heap_env) {
+            name = build_text_int("__closure_drop_env_heap_", env_type.to_index());
+        }
+        qid.DefId shim_def = self.create_closure_drop_shim_def(name.bytes(), span);
+        self.lowerer.lambda_env_drop_shims.set(key, shim_def);
+        self.add_lambda_env_drop_shim_function(shim_def, env_type, heap_env, span);
+        return shim_def;
+    }
+
+    public qid.DefId create_closure_drop_shim_def(self, UInt8[]& name, token.Span span) {
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.model_def.def_id);
+        return self.lowerer.ctx.store.defs.create(
+            .function_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public () add_lambda_env_drop_shim_function(
+        self,
+        qid.DefId shim_def,
+        qid.TypeId env_type,
+        Bool heap_env,
+        token.Span span
+    ) {
+        Int function_index = self.lowerer.output.functions.len();
+        qid.TypeId env_pointer_type = self.raw_pointer_type(env_type, span);
+        list.ArrayList<jil.LocalDecl> locals! = list.ArrayList<jil.LocalDecl>(3);
+        locals.add(self.receiver_drop_local(0, .return_place, self.lowerer.ctx.store.types.unit_type(), span));
+        locals.add(self.receiver_drop_local(1, .param, self.closure_env_type(span), span));
+        locals.add(self.receiver_drop_local(2, .compiler_temp, env_pointer_type, span));
+
+        Bool needs_runtime_drop = self.closure_env_type_needs_runtime_drop(env_type);
+        list.ArrayList<jil.Statement> entry_statements! = list.ArrayList<jil.Statement>(1);
+        if (needs_runtime_drop) {
+            entry_statements.add(self.env_drop_pointer_assign(env_pointer_type, span));
+        }
+        list.ArrayList<jil.Statement> return_statements! = list.ArrayList<jil.Statement>(1);
+        if (heap_env) {
+            return_statements.add(self.env_drop_free_statement(span));
+        }
+
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+        if (needs_runtime_drop) {
+            jil.Place pointer_place = jil.local_place(
+                jil.LocalId.from_index(2),
+                self.lowerer.output.empty_projection()
+            );
+            blocks.add(self.env_drop_block(
+                self.project_deref(pointer_place, true),
+                entry_statements$.ref(),
+                span
+            ));
+            blocks.add(self.env_drop_return_block(
+                StatementSlice(
+                    values: self.lowerer.output.statement_array(return_statements$.ref())
+                ),
+                span,
+                1
+            ));
+        } else {
+            blocks.add(self.env_drop_return_block(
+                StatementSlice(
+                    values: self.lowerer.output.statement_array(return_statements$.ref())
+                ),
+                span,
+                0
+            ));
+        }
+        self.add_closure_drop_shim_function(shim_def, function_index, locals$.ref(), blocks$.ref(), span);
+    }
+
+    public Bool closure_env_type_needs_runtime_drop(self, qid.TypeId env_type) {
+        drop_semantics.DropQuery query = drop_semantics.DropQuery(self.lowerer.ctx);
+        return query.type_needs_runtime_drop(env_type);
+    }
+
+    public () add_closure_drop_shim_function(self,
+        qid.DefId shim_def,
+        Int function_index,
+        list.ArrayList<jil.LocalDecl>& locals,
+        list.ArrayList<jil.Block>& blocks,
+        token.Span span
+    ) {
+        unsafe {
+            jil.LocalDecl*! stored_locals = self.lowerer.output.alloc_local_array(locals.len());
+            Int local_index! = 0;
+            while (local_index < locals.len()) {
+                stored_locals[local_index] = locals.get(local_index);
+                local_index = local_index + 1;
+            }
+            jil.Body body = jil.Body(
+                id: jil.BodyId.from_index(function_index),
+                span: span,
+                locals: stored_locals[0..locals.len()],
+                blocks: self.lowerer.output.block_array(blocks),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            );
+            self.lowerer.output.add_function(jil.Function(
+                id: jil.FunctionId.from_index(function_index),
+                def_id: shim_def,
+                type_args: self.lowerer.output.empty_type_args(),
+                const_args: self.lowerer.output.empty_const_args(),
+                signature_id: null,
+                effects: types.EffectSet(),
+                is_coroutine: false,
+                coroutine_frame: null,
+                is_coroutine_resume: false,
+            is_coroutine_completion: false,
+                is_language_entry: false,
+                is_runtime_entry: false,
+                is_external: false,
+                inline_always: false,
+                naked: false,
+                span: span,
+                body: body
+            ));
+        }
+    }
+
+    public jil.Statement env_drop_pointer_assign(self, qid.TypeId env_pointer_type, token.Span span) {
+        jil.Operand env_operand = jil.copy_operand_value(jil.CopyOperand (
+            place: self.receiver_drop_param_place()
+        ));
+        return jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: jil.local_place(jil.LocalId.from_index(2), self.lowerer.output.empty_projection()),
+                value: jil.cast_rvalue(jil.CastRvalue (
+                    kind: jil.CastKind.ptr_to_ptr,
+                    value: env_operand,
+                    target_type: env_pointer_type
+                ))
+            ))
+        );
+    }
+
+    public jil.Statement env_drop_free_statement(self, token.Span span) {
+        jil.Operand pointer = jil.copy_operand_value(jil.CopyOperand (
+            place: self.receiver_drop_param_place()
+        ));
+        return jil.Statement (
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement (
+                destination: jil.local_place(jil.LocalId.from_index(0), self.lowerer.output.empty_projection()),
+                value: jil.free_rvalue(jil.FreeRvalue (pointer: pointer))
+            ))
+        );
+    }
+
+    @life(return: self & pointee & statements)
+    public jil.Block env_drop_block(self,
+        jil.Place pointee,
+        list.ArrayList<jil.Statement>& statements,
+        token.Span span
+    ) {
+        return jil.Block (
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements),
+            terminator: jil.Terminator (
+                span: span,
+                kind: jil.drop_terminator_kind(jil.DropTerminator (
+                    place: pointee,
+                    target: jil.BlockId.from_index(1),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    @life(return: self & statements)
+    public jil.Block env_drop_return_block(self,
+        StatementSlice statements,
+        token.Span span,
+        Int block_index
+    ) {
+        return jil.Block (
+            id: jil.BlockId.from_index(block_index),
+            span: span,
+            statements: statements.values,
+            terminator: self.receiver_drop_return_terminator(span)
+        );
+    }
+
+    public qid.DefId create_receiver_type_global_def(self, qid.TypeId subject_type, token.Span span) {
+        def.DefRecord function_record = self.lowerer.ctx.store.defs.get(self.model_def.def_id);
+        std.String name = build_text_int("__receiver_type_", subject_type.to_index());
+        return self.lowerer.ctx.store.defs.create(
+            .global_def,
+            .value_name,
+            .private_visibility,
+            def.Name(symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()), span: span),
+            function_record.owner_def,
+            function_record.module_id,
+            function_record.decl_namespace_id,
+            null
+        );
+    }
+
+    public jil.Operand trait_vtable_function_operand(self,
+        sem.NodeId node_id,
+        qid.TypeId subject_type,
+        qid.DefId trait_member
+    ) {
+        guard self.trait_vtable_function_ref(node_id, subject_type, trait_member) is .some(function_ref) else {
+            return self.unsupported_operand(node_id);
+        }
+        return jil.function_operand_value(function_ref);
+    }
+
+    public jil.FunctionRef? trait_vtable_function_ref(self,
+        sem.NodeId node_id,
+        qid.TypeId subject_type,
+        qid.DefId trait_member
+    ) {
+        guard self.impl_member_for_trait_type(subject_type, trait_member) is .some(impl_def) else {
+            return null;
+        }
+        qid.TypeId[]& type_args = self.impl_function_type_args(subject_type, impl_def);
+        comptime_value.ComptimeValue[]& const_args = self.impl_function_const_args(subject_type, impl_def);
+        qid.TypeId function_type = self.function_type_for_ref(impl_def, type_args, const_args);
+        if (type_args.length > 0 || const_args.length > 0) {
+            self.lowerer.ensure_function_instance_with_const_args(impl_def, type_args, const_args);
+        } else {
+            self.lowerer.ensure_external_function(impl_def);
+        }
+        return self.function_ref(
+            node_id,
+            impl_def,
+            function_type,
+            FunctionRefArgs(type_args: type_args, const_args: const_args)
+        );
+    }
+
+    public qid.DefId? impl_member_for_trait_type(self, qid.TypeId subject_type, qid.DefId trait_member) {
+        guard self.namespace_provider_def_for_type(subject_type) is .some(impl_def) else { return null; }
+        return self.member_impl_for_trait_member(impl_def, trait_member, .value_name);
+    }
+
+    public qid.DefId? member_impl_for_trait_member(
+        self,
+        qid.DefId impl_def,
+        qid.DefId trait_member,
+        def.NameDomain domain
+    ) {
+        if (self.qualified_member_impl_for_trait_member(impl_def, trait_member) is .some(impl_member)) {
+            return impl_member;
+        }
+        if (self.trait_member_has_default_body(trait_member)) {
+            return trait_member;
+        }
+        guard self.lowerer.ctx.store.defs.get(impl_def).owned_namespace_id is .some(namespace_id) else { return null; }
+        qid.SymbolId symbol = self.lowerer.ctx.store.defs.get(trait_member).name.symbol;
+        guard self.lowerer.ctx.store.resolve.namespaces.first_binding(namespace_id, symbol, domain)
+            is .some(binding) else {
+            return null;
+        }
+        return binding.def_id;
+    }
+
+    public Bool trait_member_has_default_body(self, qid.DefId trait_member) {
+        guard self.lowerer.model.def(trait_member) is .some(member_model) else { return false; }
+        return member_model.body != null;
+    }
+
+    public qid.DefId? qualified_member_impl_for_trait_member(self, qid.DefId impl_def, qid.DefId trait_member) {
+        guard self.lowerer.model.def(impl_def) is .some(model_def) else { return null; }
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            qid.DefId member_def = model_def.members.get(index);
+            def.DefRecord member_record = self.lowerer.ctx.store.defs.get(member_def);
+            if (member_record.associated_trait_member is .some(implemented_member)) {
+                if (implemented_member == trait_member) { return member_def; }
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public qid.TypeId[]& impl_function_type_args(self, qid.TypeId subject_type, qid.DefId impl_def) {
+        guard self.lowerer.ctx.store.defs.get(impl_def).owner_def is .some(owner_def) else {
+            return self.lowerer.output.empty_type_args();
+        }
+        guard self.receiver_type_args_for_owner(subject_type, owner_def) is .some(args) else {
+            return self.lowerer.output.empty_type_args();
+        }
+        return args;
+    }
+
+    @life(return: (self, self))
+    public comptime_value.ComptimeValue[]& impl_function_const_args(self, qid.TypeId subject_type, qid.DefId impl_def) {
+        guard self.lowerer.ctx.store.defs.get(impl_def).owner_def is .some(owner_def) else {
+            return self.lowerer.output.empty_const_args();
+        }
+        guard self.receiver_const_args_for_owner(subject_type, owner_def) is .some(args) else {
+            return self.lowerer.output.empty_const_args();
+        }
+        return args;
+    }
+
+    public qid.TypeId? trait_vtable_subject_type(self, sem.ImplicitCall call) {
+        if (call.args.length != 1) { return null; }
+        return self.type_for_node(call.args[0]);
+    }
+
+    public qid.DefId? trait_member_for_symbol(self, qid.DefId trait_def, qid.SymbolId symbol) {
+        guard self.lowerer.ctx.store.defs.get(trait_def).owned_namespace_id is .some(namespace_id) else {
+            return null;
+        }
+        guard self.lowerer.ctx.store.resolve.namespaces.first_binding(namespace_id, symbol, .value_name)
+            is .some(binding) else {
+            return null;
+        }
+        if (self.lowerer.ctx.store.defs.get(binding.def_id).kind != .function_def) { return null; }
+        return binding.def_id;
+    }
+
+    public qid.DefId trait_member_identity(self, qid.DefId member_def) {
+        def.DefRecord record = self.lowerer.ctx.store.defs.get(member_def);
+        if (record.associated_trait_member is .some(trait_member)) {
+            return trait_member;
+        }
+        return member_def;
+    }
+
+    public Int? trait_vtable_slot_index(self, qid.DefId trait_def, qid.DefId member_def) {
+        qid.DefId target = self.trait_member_identity(member_def);
+        guard self.lowerer.model.def(trait_def) is .some(model_def) else { return null; }
+        Int slot! = 0;
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            qid.DefId candidate = model_def.members.get(index);
+            if (self.lowerer.ctx.store.defs.get(candidate).kind == .function_def) {
+                if (candidate == target) { return slot; }
+                slot = slot + 1;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    public types.TraitCompanionType? trait_companion_for_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .trait_companion(companion)) {
+            return companion;
+        }
+        return null;
+    }
+
+    public types.TraitCompanionType? trait_object_companion_for_type(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(type_id);
+        if (info.data is .trait_companion(companion)) {
+            return companion;
+        }
+        guard info.data is .handle_type(handle) else { return null; }
+        types.TypeInfo element = self.lowerer.ctx.store.types.get(handle.element);
+        guard element.data is .trait_companion(companion) else { return null; }
+        if (companion.kind != .any) { return null; }
+        return companion;
+    }
+
+    public jil.CastKind cast_kind(self, qid.TypeId source_type, qid.TypeId target_type) {
+        types.TypeInfo source = self.lowerer.ctx.store.types.get(source_type);
+        types.TypeInfo target = self.lowerer.ctx.store.types.get(target_type);
+        if (source.data is .handle_type(_)) {
+            if (target.data is .handle_type(_)) {
+                return jil.CastKind.ptr_to_ptr;
+            }
+            if (target.data is .function_type(_)) {
+                return jil.CastKind.ptr_to_ptr;
+            }
+            if (target.data is .int_type(_)) { return jil.CastKind.ptr_to_int; }
+        }
+        if (source.data is .function_type(_)) {
+            if (target.data is .handle_type(_)) {
+                return jil.CastKind.ptr_to_ptr;
+            }
+            if (target.data is .int_type(_)) { return jil.CastKind.ptr_to_int; }
+        }
+        if (source.data is .int_type(_)) {
+            if (target.data is .handle_type(_)) { return jil.CastKind.int_to_ptr; }
+            if (target.data is .function_type(_)) { return jil.CastKind.int_to_ptr; }
+            if (target.data is .float_type(_)) { return jil.CastKind.int_to_float; }
+            if (target.data is .int_type(_)) { return jil.CastKind.int_to_int; }
+        }
+        if (source.data is .float_type(_)) {
+            if (target.data is .int_type(_)) { return jil.CastKind.float_to_int; }
+            if (target.data is .float_type(_)) { return jil.CastKind.float_to_float; }
+        }
+        return jil.CastKind.bitcast;
+    }
+
+}
