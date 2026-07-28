@@ -10,14 +10,40 @@ VERIFY="${VERIFY:-full}"
 BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="$PACKAGE_VERSION"
+BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
+NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/artifact-cache/next/$JIANG_VERSION}"
 BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.9}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
-NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/cache/next}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
 
+canonical_cache_dir() {
+  mkdir -p "$1"
+  (cd "$1" && pwd -P)
+}
+
+validate_cache_layout() {
+  local bootstrap_cache
+  local next_cache
+  bootstrap_cache="$(canonical_cache_dir "$BOOTSTRAP_ARTIFACT_CACHE_DIR")"
+  next_cache="$(canonical_cache_dir "$NEXT_ARTIFACT_CACHE_DIR")"
+  case "$next_cache/" in
+    "$bootstrap_cache/"*)
+      echo "NEXT_ARTIFACT_CACHE_DIR must not be inside $BOOTSTRAP_ARTIFACT_CACHE_DIR" >&2
+      exit 2
+      ;;
+  esac
+  case "$bootstrap_cache/" in
+    "$next_cache/"*)
+      echo "NEXT_ARTIFACT_CACHE_DIR must not contain $BOOTSTRAP_ARTIFACT_CACHE_DIR" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_cache_layout
 mkdir -p \
   "$BUILD_DIR" \
   "$BUILD_BIN_DIR" \
@@ -97,8 +123,8 @@ write_compiler_build_id() {
 
 clear_bootstrap_artifact_cache() {
   # 0.4.9 不支持显式 artifact cache 路径，只能使用默认 build/cache。
-  # stable 编译前后清理该目录，避免不同 schema 的 source artifact 相互污染。
-  rm -rf "$ROOT_DIR/build/cache"
+  # stable 编译前后只清理它自己的目录；current cache 位于不相交的 root。
+  rm -rf "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
 }
 
 emit_next_from_bootstrap() {
@@ -135,6 +161,8 @@ emit_compiler_with_compiler() {
 collect_llvm_link_args
 
 printf '== build next: %s -> next ==\n' "$BOOTSTRAP_VERSION"
+printf '== bootstrap cache: %s ==\n' "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
+printf '== current cache: %s ==\n' "$NEXT_ARTIFACT_CACHE_DIR"
 clear_bootstrap_artifact_cache
 emit_next_from_bootstrap "$NEXT_BIN"
 clear_bootstrap_artifact_cache

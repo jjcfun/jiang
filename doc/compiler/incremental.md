@@ -340,6 +340,12 @@ planner 是纯函数，不创建目录、不写文件。backend 把 object 先�
 会为每个 case 使用独立目录；日常编译未指定该选项时继续使用默认位置。
 pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
 
+自举构建额外隔离 bootstrap 与 current cache。0.4.9 stable 不支持
+`--artifact-cache-dir`，因此只能在编译前后清理仓库默认的 `build/cache`；current compiler
+使用 `build/artifact-cache/next/<version>`，由自身的 compiler build、source schema 和 object
+schema fingerprint 处理 stale。`build_next.sh` 会拒绝两个 cache root 相同或互相嵌套，
+避免 stable 清理动作删除 current 的可复用产物。
+
 source interface 只复用可在新 `CompilerContext` 中完整恢复的 package 源码。`build.target`
 由当前 target 注入，不能跨 context 复用；`std/` facade 又包含指向相邻模块定义的公开 alias。
 0.5.0 因此始终从源码加载 `build` 和 `std/`，不把不完整 alias target 或其他 target 的构建

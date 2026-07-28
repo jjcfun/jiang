@@ -25,6 +25,11 @@ BOOTSTRAP_BIN=/path/to/compatible/jiangc \
 bash ./script/build_next.sh
 ```
 
+0.4.9 stable 不能指定 artifact cache，只使用仓库内的 `build/cache`。`build_next.sh`
+在 stable 编译前后清理该目录；current compiler 使用独立的
+`build/artifact-cache/next/<version>`，不会随 bootstrap cache 一起删除。需要自定义时可设置
+`NEXT_ARTIFACT_CACHE_DIR`，但它不能包含 `build/cache`，也不能位于 `build/cache` 内。
+
 提交功能前优先运行相关语言测试。需要检查完整语言测试时：
 
 ```bash
