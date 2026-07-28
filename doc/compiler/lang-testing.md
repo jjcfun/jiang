@@ -83,10 +83,19 @@ TEST_JOBS=4 JIANGC=./build/bin/jiangc bash ./script/test.sh
 ```
 
 每个 case 在一次运行中拥有唯一的 `work` 和 mutable artifact cache。P3 完成并发安全的
-artifact 发布前，测试进程不会共享默认 `build/cache`。`check`、`fail` 和 `emit` 各只调用
-一次编译器；`run` 只执行一次 emit、link 和 program run。profile 选择与日志汇总不会再次编译
-同一 case。runner 执行测试程序时还会设置 `JIANG_TEST_WORK_DIR`；需要自行创建 source、
-object、cache 或临时目录的 compiler 测试必须把可变产物放到该目录，不能使用共享的固定路径。
+artifact 发布前，测试进程不会共享默认 `build/cache`。语言测试的 `check`、`fail` 和 `emit`
+各只调用一次编译器；`run` 只执行一次 emit、link 和 program run。profile 选择与日志汇总
+不会再次编译同一 case。
+
+`test/compiler/*/run` 使用 `test/compiler/compiler.jiang` 作为聚合入口。各模块公开一个
+`run()`，runner 先把全部编译器单元测试构建为一个 executable，再按 case 路径分别启动它。
+因此编译器源码只编译和链接一次，而每个 case 仍保持进程、退出码和全局状态隔离。sanitizer
+模式同样只生成一个聚合 executable；`TEST_RELEASE_RUNS=1` 会额外构建一个 release 聚合产物。
+
+runner 执行测试程序时会设置 `JIANG_TEST_WORK_DIR`，并为需要模拟独立 package 的用例提供
+仓库外的 `JIANG_TEST_TEMP_DIR`。普通日志、object 和 cache 放在 work 目录；会触发 package
+root 查找的临时源码必须放在 temp 目录。两者都按 case 唯一分配，不能使用共享的固定路径。
+成功时外部 temp 自动清理；失败时 runner 会打印并保留其路径。
 
 常用控制项：
 
@@ -108,6 +117,8 @@ object、cache 或临时目录的 compiler 测试必须把可变产物放到该�
 
 ```text
 build/test/run.<随机后缀>/
+  compiler-tests
+  compiler-debug-build.out
   cases/<序号>-<类别>-<用例键>/
     cache/
     compiler.out
@@ -150,6 +161,18 @@ JIANGC=./build/bin/jiangc bash ./script/test.sh
 
 compiler profile 的 4-worker wall time 是串行的约 31%，语言 literal 组是 25%。两组串行和
 并行运行均全部通过，最终结果保持相同的发现顺序。
+
+2026-07-28 将 67 个 compiler `run` case 改为单一聚合 executable 后，同一 arm64 Darwin
+环境使用 `jiang 0.5.0`、LLVM 22.1.8 和 `TEST_JOBS=4` 的完整 compiler suite 数据为：
+
+| 阶段 | 耗时 |
+| --- | ---: |
+| 聚合 executable 冷构建 | 122s |
+| 67 个 case 全部完成（包含构建） | 143s |
+
+旧 runner 仅 17 项 compiler smoke 的 4-worker 基线已经需要 105s，后续同源码测量曾达到
+160s；逐文件完整套件还会继续重复编译。聚合后完整 67 项只冷构建一次；剩余主要运行期成本
+来自 `driver/pipeline` 和 `sema/model_type_check`，不再来自重复编译编译器源码。
 
 修改 runner 后先运行其独立自测：
 

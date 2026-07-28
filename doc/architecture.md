@@ -398,8 +398,9 @@ public trait Indexable {
 ## 测试目录
 
 - `test/compiler/`：按编译器内部阶段归档的测试目录，覆盖 backend、driver、incremental、
-  IR dump/lower、query、resolve、sema 和 syntax 等阶段；内部断言程序也由统一 runner
-  完成编译、链接和执行。
+  IR dump/lower、query、resolve、sema 和 syntax 等阶段。`test/compiler/compiler.jiang`
+  将各模块公开的 `run()` 聚合为一个 executable；统一 runner 按 case 分进程执行，避免
+  为每个内部断言程序重复编译完整编译器源码。
 - `test/compiler/fixture/`：编译器阶段测试的辅助输入。
 - `test/lang/`：源码级语言语义用例。目录按语言功能优先组织，每个功能目录内部再按
   `check`、`fail`、`emit`、`run` 测试结果类型分组；覆盖策略见

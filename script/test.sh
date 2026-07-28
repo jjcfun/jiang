@@ -38,6 +38,8 @@ RESULT_DIR=""
 FAIL_MARKER=""
 LINK_ARGS_FILE="${LINK_ARGS_FILE:-}"
 JIANG_LINK_ARGS_FILE="${JIANG_LINK_ARGS_FILE:-}"
+COMPILER_TEST_BIN="${COMPILER_TEST_BIN:-}"
+COMPILER_TEST_RELEASE_BIN="${COMPILER_TEST_RELEASE_BIN:-}"
 TIMEOUT_BIN=""
 SUITE_START=0
 
@@ -242,6 +244,16 @@ case_work_dir() {
   printf '%s/cases/%s-%s-%s\n' "$RUN_ROOT" "$index" "$kind" "$(case_key "$source")"
 }
 
+case_temp_dir() {
+  local work_dir="$1"
+  local run_key
+  local case_key
+  local temp_root="${TMPDIR:-/tmp}"
+  run_key="$(basename "$(dirname "$(dirname "$work_dir")")")"
+  case_key="$(basename "$work_dir")"
+  printf '%s/jiang-test-%s-%s\n' "${temp_root%/}" "$run_key" "$case_key"
+}
+
 timing_line() {
   if [ "$TEST_TIMING" = "1" ]; then
     printf 'TIME %s\n' "$*"
@@ -351,6 +363,7 @@ run_run_case() {
   local run_time
   local expected
   local code
+  local temp_dir
 
   if [ -f "$companion" ]; then
     companion_args+=("$companion")
@@ -378,9 +391,12 @@ run_run_case() {
   link_time=$((SECONDS - link_started))
 
   expected="$(expected_exit_code "$source")"
+  temp_dir="$(case_temp_dir "$work_dir")"
+  mkdir -p "$temp_dir"
   run_started=$SECONDS
   set +e
   env JIANG_TEST_WORK_DIR="$work_dir" \
+    JIANG_TEST_TEMP_DIR="$temp_dir" \
     ${sanitizer_env[@]+"${sanitizer_env[@]}"} \
     bash -c '"$1"; exit $?' _ "$executable" \
     >"$run_log" 2>&1
@@ -389,13 +405,52 @@ run_run_case() {
   run_time=$((SECONDS - run_started))
 
   if [ "$code" = "$expected" ]; then
+    rm -rf "$temp_dir"
     echo "PASS run $source"
     timing_line "run $source emit=${emit_time}s link=${link_time}s execute=${run_time}s"
     return 0
   fi
   echo "FAIL run $source exited $code, expected $expected"
+  echo "test temp: $temp_dir"
   print_log_prefix "$run_log"
   timing_line "run $source emit=${emit_time}s link=${link_time}s execute=${run_time}s"
+  return 1
+}
+
+run_compiler_case() {
+  local source="$1"
+  local work_dir="$2"
+  local executable="$3"
+  local label="$4"
+  local run_log="$work_dir/run.out"
+  local relative="${source#$ROOT_DIR/}"
+  local case_name="${relative#test/compiler/}"
+  local started=$SECONDS
+  local expected
+  local code
+  local temp_dir
+
+  mkdir -p "$work_dir"
+  temp_dir="$(case_temp_dir "$work_dir")"
+  mkdir -p "$temp_dir"
+  expected="$(expected_exit_code "$source")"
+  set +e
+  env \
+    JIANG_TEST_WORK_DIR="$work_dir" \
+    JIANG_TEST_TEMP_DIR="$temp_dir" \
+    "$executable" "$case_name" >"$run_log" 2>&1
+  code=$?
+  set -e
+  if [ "$code" = "$expected" ]; then
+    rm -rf "$temp_dir"
+    echo "PASS $label $source"
+    timing_line "$label $source execute=$((SECONDS - started))s"
+    return 0
+  fi
+  echo "FAIL $label $source exited $code, expected $expected"
+  echo "test temp: $temp_dir"
+  print_log_prefix "$run_log"
+  timing_line "$label $source execute=$((SECONDS - started))s"
   return 1
 }
 
@@ -416,6 +471,7 @@ run_release_case() {
   local run_time
   local expected
   local code
+  local temp_dir
 
   if [ -f "$companion" ]; then
     if ! "$LLVM_CLANG" -c "$companion" -o "$companion_object" >"$companion_log" 2>&1; then
@@ -442,20 +498,25 @@ run_release_case() {
   build_time=$((SECONDS - build_started))
 
   expected="$(expected_exit_code "$source")"
+  temp_dir="$(case_temp_dir "$work_dir")"
+  mkdir -p "$temp_dir"
   run_started=$SECONDS
   set +e
   env JIANG_TEST_WORK_DIR="$work_dir" \
+    JIANG_TEST_TEMP_DIR="$temp_dir" \
     bash -c '"$1"; exit $?' _ "$executable" >"$run_log" 2>&1
   code=$?
   set -e
   run_time=$((SECONDS - run_started))
 
   if [ "$code" = "$expected" ]; then
+    rm -rf "$temp_dir"
     echo "PASS release-run $source"
     timing_line "release $source build=${build_time}s execute=${run_time}s"
     return 0
   fi
   echo "FAIL release-run $source exited $code, expected $expected"
+  echo "test temp: $temp_dir"
   print_log_prefix "$run_log"
   timing_line "release $source build=${build_time}s execute=${run_time}s"
   return 1
@@ -487,8 +548,20 @@ run_case_kind() {
     check) run_check_case "$source" "$work_dir" ;;
     fail) run_fail_case "$source" "$work_dir" ;;
     emit) run_emit_case "$source" "$work_dir" ;;
-    run) run_run_case "$source" "$work_dir" ;;
-    release) run_release_case "$source" "$work_dir" ;;
+    run)
+      if [ -n "$COMPILER_TEST_BIN" ]; then
+        run_compiler_case "$source" "$work_dir" "$COMPILER_TEST_BIN" run
+      else
+        run_run_case "$source" "$work_dir"
+      fi
+      ;;
+    release)
+      if [ -n "$COMPILER_TEST_RELEASE_BIN" ]; then
+        run_compiler_case "$source" "$work_dir" "$COMPILER_TEST_RELEASE_BIN" release-run
+      else
+        run_release_case "$source" "$work_dir"
+      fi
+      ;;
     *)
       echo "FAIL unknown test kind: $kind"
       return 1
@@ -542,6 +615,87 @@ prepare_run_root() {
   write_arg_file "$JIANG_LINK_ARGS_FILE" "${jiang_llvm_link_args[@]}"
 }
 
+uses_compiler_test_runner() {
+  [ "$TEST_ROOT" = "test/compiler" ] || [ "$TEST_ROOT" = "$ROOT_DIR/test/compiler" ]
+}
+
+build_compiler_test_executable() {
+  local mode="$1"
+  local output="$2"
+  local source="$ROOT_DIR/test/compiler/compiler.jiang"
+  local cache_dir="$RUN_ROOT/compiler-$mode-cache"
+  local build_log="$RUN_ROOT/compiler-$mode-build.out"
+  local started=$SECONDS
+  local mode_args=()
+  if [ "$mode" = release ]; then
+    mode_args=(--mode release)
+  fi
+  if [ -n "$TEST_SANITIZER" ] && [ "$mode" = debug ]; then
+    if build_sanitized_compiler_test_executable "$source" "$cache_dir" "$output" "$build_log"; then
+      timing_line "compiler test executable mode=$mode sanitizer=$TEST_SANITIZER build=$((SECONDS - started))s"
+      return 0
+    fi
+    return 1
+  fi
+  if "$JIANGC" \
+    --artifact-cache-dir "$cache_dir" \
+    ${mode_args[@]+"${mode_args[@]}"} \
+    --linker "$RUN_CLANG" \
+    "${jiang_llvm_link_args[@]}" \
+    -o "$output" \
+    "$source" >"$build_log" 2>&1
+  then
+    timing_line "compiler test executable mode=$mode build=$((SECONDS - started))s"
+    return 0
+  fi
+  echo "FAIL compiler test executable mode=$mode build"
+  print_log_prefix "$build_log"
+  return 1
+}
+
+build_sanitized_compiler_test_executable() {
+  local source="$1"
+  local cache_dir="$2"
+  local output="$3"
+  local build_log="$4"
+  local llvm_output="$RUN_ROOT/compiler-debug.ll"
+  if ! "$JIANGC" \
+    --artifact-cache-dir "$cache_dir" \
+    --emit-llvm -o "$llvm_output" \
+    "$source" >"$build_log" 2>&1
+  then
+    echo "FAIL compiler test executable sanitizer emit"
+    print_log_prefix "$build_log"
+    return 1
+  fi
+  if "$RUN_CLANG" \
+    "$llvm_output" \
+    -o "$output" \
+    "${sanitizer_args[@]}" \
+    "${llvm_link_args[@]}" >>"$build_log" 2>&1
+  then
+    return 0
+  fi
+  echo "FAIL compiler test executable sanitizer link"
+  print_log_prefix "$build_log"
+  return 1
+}
+
+prepare_compiler_test_runner() {
+  if ! uses_compiler_test_runner; then
+    return 0
+  fi
+  COMPILER_TEST_BIN="$RUN_ROOT/compiler-tests"
+  if ! build_compiler_test_executable debug "$COMPILER_TEST_BIN"; then
+    return 1
+  fi
+  if [ "$TEST_RELEASE_RUNS" != 1 ]; then
+    return 0
+  fi
+  COMPILER_TEST_RELEASE_BIN="$RUN_ROOT/compiler-tests-release"
+  build_compiler_test_executable release "$COMPILER_TEST_RELEASE_BIN"
+}
+
 write_jobs() {
   local index=0
   local count="${#CASE_KINDS[@]}"
@@ -580,6 +734,7 @@ run_case_with_timeout() {
   fi
 
   export JIANGC TEST_TIMING TEST_SANITIZER TEST_SANITIZER_CLANG
+  export COMPILER_TEST_BIN COMPILER_TEST_RELEASE_BIN
   export LLVM_CLANG RUN_CLANG LINK_ARGS_FILE JIANG_LINK_ARGS_FILE
   "$TIMEOUT_BIN" "$TEST_TIMEOUT" bash "$ROOT_DIR/script/test.sh" \
     --internal-case "$kind" "$source" "$work_dir"
@@ -706,6 +861,10 @@ run_suite() {
   prepare_run_root
   write_jobs
   SUITE_START=$SECONDS
+  if ! prepare_compiler_test_runner; then
+    echo "test artifacts: $RUN_ROOT"
+    return 1
+  fi
 
   if [ "${#CASE_KINDS[@]}" -gt 0 ]; then
     run_workers

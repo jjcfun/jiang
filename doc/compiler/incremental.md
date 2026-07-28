@@ -340,6 +340,12 @@ planner 是纯函数，不创建目录、不写文件。backend 把 object 先�
 会为每个 case 使用独立目录；日常编译未指定该选项时继续使用默认位置。
 pipeline 后续只从这里取得 cache root，不在各阶段硬编码路径。
 
+source interface 只复用可在新 `CompilerContext` 中完整恢复的 package 源码。`build.target`
+由当前 target 注入，不能跨 context 复用；`std/` facade 又包含指向相邻模块定义的公开 alias。
+0.5.0 因此始终从源码加载 `build` 和 `std/`，不把不完整 alias target 或其他 target 的构建
+上下文伪装成 interface hit。后续若扩展 schema，必须把 target fingerprint 和跨模块 alias
+恢复纳入一致性测试后才能取消该边界。
+
 推荐分成两类：
 
 ```text
