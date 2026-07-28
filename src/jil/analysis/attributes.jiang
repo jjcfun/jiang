@@ -60,7 +60,34 @@ public Store analyze(context.CompilerContext& ctx, jil.Store& store) {
     return result;
 }
 
-FunctionFacts analyze_function(
+// debug codegen 不消费数据流证明，只维持与函数参数一一对应的保守事实。
+// release 再调用 analyze 生成 LLVM 优化 attributes。
+public Store conservative(jil.Store& store) {
+    Store result! = Store();
+    Int index! = 0;
+    while (index < store.functions.len()) {
+        jil.Function function = store.functions.get(index);
+        FunctionFacts facts! = FunctionFacts(function.id);
+        add_conservative_parameters(facts$.ref(), function);
+        result.functions.add(facts);
+        index = index + 1;
+    }
+    return result;
+}
+
+// whole-package LLVM 可以从完整函数体推导 escape/write facts。这里只提供
+// Jiang 类型系统直接保证的属性，避免在 O2 前重复运行一次全包 dataflow。
+public Store semantic(context.CompilerContext& ctx, jil.Store& store) {
+    Store result! = Store();
+    Int index! = 0;
+    while (index < store.functions.len()) {
+        result.functions.add(semantic_function(ctx, store.functions.get(index)));
+        index = index + 1;
+    }
+    return result;
+}
+
+FunctionFacts semantic_function(
     context.CompilerContext& ctx,
     jil.Function function
 ) {
@@ -69,44 +96,141 @@ FunctionFacts analyze_function(
     while (index < function.body.locals.length) {
         jil.LocalDecl local = function.body.locals[index];
         if (local.kind == .param) {
-            result.parameters.add(analyze_parameter(ctx, function, local));
+            result.parameters.add(semantic_parameter(ctx, local));
         }
         index = index + 1;
     }
     return result;
 }
 
-ParameterFacts analyze_parameter(
+ParameterFacts semantic_parameter(
     context.CompilerContext& ctx,
-    jil.Function function,
     jil.LocalDecl parameter
 ) {
     ParameterFacts result! = ParameterFacts(parameter.id);
-    if (function.is_external) { return result; }
     types.TypeInfo type_info = ctx.store.types.get(parameter.type_id);
     guard type_info.data is .handle_type(handle) else { return result; }
     if (!types.is_reference_handle(handle)) { return result; }
-
-    provenance.FunctionFacts flow =
-        provenance.analyze_parameter(function, parameter.id);
-    result.nocapture = parameter_does_not_escape(flow$.ref());
     result.noalias = type_info.is_mutable;
-    result.readonly = parameter_is_readonly(flow$.ref());
     result.dereferenceable_bytes = pointee_size(ctx, handle.element);
     return result;
 }
 
-Bool parameter_does_not_escape(provenance.FunctionFacts& facts) {
-    return !facts.returned.parameter
-        && !facts.stored_externally.parameter
-        && !facts.passed_to_call.parameter
-        && !facts.captured_by_coroutine.parameter;
+() add_conservative_parameters(FunctionFacts& facts, jil.Function function) {
+    Int index! = 0;
+    while (index < function.body.locals.length) {
+        jil.LocalDecl local = function.body.locals[index];
+        if (local.kind == .param) {
+            facts.parameters.add(ParameterFacts(local.id));
+        }
+        index = index + 1;
+    }
 }
 
-Bool parameter_is_readonly(provenance.FunctionFacts& facts) {
-    return !facts.written_through.parameter
-        && !facts.passed_to_call.parameter
-        && !facts.captured_by_coroutine.parameter;
+FunctionFacts analyze_function(
+    context.CompilerContext& ctx,
+    jil.Function function
+) {
+    FunctionFacts result! = FunctionFacts(function.id);
+    if (function.is_external || !has_reference_parameter(ctx, function)) {
+        add_conservative_parameters(result$.ref(), function);
+        return result;
+    }
+    provenance.FunctionFacts flow =
+        provenance.analyze_function(function);
+    Int index! = 0;
+    while (index < function.body.locals.length) {
+        jil.LocalDecl local = function.body.locals[index];
+        if (local.kind == .param) {
+            result.parameters.add(analyze_parameter(
+                ctx,
+                function,
+                local,
+                flow$.ref()
+            ));
+        }
+        index = index + 1;
+    }
+    return result;
+}
+
+Bool has_reference_parameter(
+    context.CompilerContext& ctx,
+    jil.Function function
+) {
+    Int index! = 0;
+    while (index < function.body.locals.length) {
+        jil.LocalDecl local = function.body.locals[index];
+        if (local.kind == .param && is_reference_parameter(ctx, local)) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool is_reference_parameter(
+    context.CompilerContext& ctx,
+    jil.LocalDecl parameter
+) {
+    types.TypeInfo type_info = ctx.store.types.get(parameter.type_id);
+    if (type_info.data is .handle_type(handle)) {
+        return types.is_reference_handle(handle);
+    }
+    return false;
+}
+
+ParameterFacts analyze_parameter(
+    context.CompilerContext& ctx,
+    jil.Function function,
+    jil.LocalDecl parameter,
+    provenance.FunctionFacts& flow
+) {
+    ParameterFacts result! = ParameterFacts(parameter.id);
+    types.TypeInfo type_info = ctx.store.types.get(parameter.type_id);
+    guard type_info.data is .handle_type(handle) else { return result; }
+    if (!types.is_reference_handle(handle)) { return result; }
+
+    if (!provenance.tracks_parameter_separately(parameter.id)) {
+        provenance.FunctionFacts exact =
+            provenance.analyze_parameter(function, parameter.id);
+        return proven_parameter_facts(ctx, parameter, handle, exact$.ref());
+    }
+    return proven_parameter_facts(ctx, parameter, handle, flow);
+}
+
+ParameterFacts proven_parameter_facts(
+    context.CompilerContext& ctx,
+    jil.LocalDecl parameter,
+    types.HandleType handle,
+    provenance.FunctionFacts& flow
+) {
+    ParameterFacts result! = ParameterFacts(parameter.id);
+    types.TypeInfo type_info = ctx.store.types.get(parameter.type_id);
+    result.nocapture = parameter_does_not_escape(flow, parameter.id);
+    result.noalias = type_info.is_mutable;
+    result.readonly = parameter_is_readonly(flow, parameter.id);
+    result.dereferenceable_bytes = pointee_size(ctx, handle.element);
+    return result;
+}
+
+Bool parameter_does_not_escape(
+    provenance.FunctionFacts& facts,
+    jil.LocalId parameter
+) {
+    return !facts.returned.contains_parameter(parameter)
+        && !facts.stored_externally.contains_parameter(parameter)
+        && !facts.passed_to_call.contains_parameter(parameter)
+        && !facts.captured_by_coroutine.contains_parameter(parameter);
+}
+
+Bool parameter_is_readonly(
+    provenance.FunctionFacts& facts,
+    jil.LocalId parameter
+) {
+    return !facts.written_through.contains_parameter(parameter)
+        && !facts.passed_to_call.contains_parameter(parameter)
+        && !facts.captured_by_coroutine.contains_parameter(parameter);
 }
 
 Int pointee_size(context.CompilerContext& ctx, qid.TypeId type_id) {

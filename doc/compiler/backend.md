@@ -123,8 +123,10 @@ executable 和 dylib 的 `LinkPlan` 包含当前 units、interface-loaded packag
 随后再按路径去重。
 
 `--emit-obj -o file.o` 始终保持单文件输出。当前所有目标还没有统一的 relocatable merge contract，
-因此该模式完整 lowering package 并生成一个以 unit key/hash closure 为 key 的整包 object；
-executable/dylib 则直接链接 unit objects，并可在 closure 完整命中时跳过依赖 body lowering。
+因此该模式完整 lowering package 并生成一个以 unit key/hash closure 为 key 的整包 object。
+0.5.0 当前的 executable/dylib 性能 bridge 也暂时使用 whole-package object emission，避免约
+12,000 个 JIL function 在逐 unit 路径重复承担全包分析和 LLVM 固定开销；unit/link closure
+contract 保持为目标设计，待细粒度 emission 的冷/热收益验证后恢复。
 
 开发时可用 `--artifact-stats` 观察 interface/object hit、miss、stale、emitted/reused unit 和
 linked object 数量。统计不进入 cache key。
@@ -151,6 +153,11 @@ final JIL 的参数级 analysis 还会给出彼此独立的已证明事实。bac
 fat reference（例如 trait object）在 LLVM ABI 中是 aggregate，不能直接携带 pointer-only
 parameter attribute；即使 JIL 已证明语义事实，backend 也必须先检查 LLVM 参数形态是否兼容。
 外部函数和任何未证明条件都不添加属性。
+
+细粒度 release unit emission 在一次 prepared store 上复用完整参数级 dataflow；超过快速位集
+范围的参数单独回退为精确分析。whole-package release emission 只注入 Jiang 类型语义直接保证的
+`noalias` 和 `dereferenceable`，把 `captures(none)`、`readonly` 等全包推导交给 LLVM O2；
+debug emission 使用与参数一一对应的保守事实，不运行这组优化分析。
 
 ## 边界
 

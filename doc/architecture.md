@@ -199,8 +199,9 @@ CompilerStore
 - 每个 pass 必须有明确输入和输出，不能顺手修复其他阶段遗漏的语义。
 - pass 可以查询上游事实，但不能修改上游事实表。
 - pass 修改 JIL 时只产生普通 JIL block、statement 和 terminator。
-- lowering、drop elaboration 输入/输出以及 backend 入口必须通过共享 JIL verifier。
-- backend 只能消费最终 verified、elaborated JIL。
+- lowering、drop elaboration 输出以及 backend 入口共享同一 JIL verifier contract；
+  `--verify-jil` 在开发构建中显式执行检查，普通构建不为完整 JIL 重复支付遍历成本。
+- backend 只能消费满足 final verifier contract 的 elaborated JIL。
 - backend 不消费 `ComptimeValue`。标量 const 必须在 JIL lowering 前降成 `jil.Const`；
   复合 const 作为运行时值使用时，必须先 materialize 成 readonly `jil.Global`。
 - 如果 backend 需要理解语言级结构，说明 JIL 还没有表达清楚。

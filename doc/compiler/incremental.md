@@ -399,7 +399,7 @@ instance。codegen unit 分组必须用稳定 symbol identity 归一化这些重
 
 ### Link closure
 
-executable 和 dylib 直接链接稳定排序后的 unit objects。link closure 包含：
+长期 contract 中，executable 和 dylib 直接链接稳定排序后的 unit objects。link closure 包含：
 
 - 当前编译的 source/monomorph units。
 - 已通过本机 index 和实际 hash 验证的 interface-loaded units。
@@ -409,6 +409,11 @@ executable 和 dylib 直接链接稳定排序后的 unit objects。link closure 
 
 link plan 按 object path 和 definition identity 去重。当前 compilation 已重新生成某个 definition
 时，不再链接 interface closure 中该 definition 的旧 object。
+
+0.5.0 当前暂时保留 whole-package executable/dylib emission bridge。细粒度路径曾对约 12,000 个
+JIL function 重复执行全包分析，并为每个 unit 支付 LLVM/object 固定开销，冷构建超过 20 分钟。
+bridge 不改变上述 cache/index/link contract，也不伪装 unit cache hit；恢复 unit emission 前必须
+消除重复分析和固定开销，并同时证明冷 debug/release 不出现数量级回退、热构建能实际复用 unit。
 
 `.ji` 的 object closure 只保存 unit kind、stable unit key、definition key、dependency
 fingerprint 和 package closure fingerprint，不保存本机路径。interface loader 只有在整条 closure
