@@ -85,7 +85,8 @@ TEST_JOBS=4 JIANGC=./build/bin/jiangc bash ./script/test.sh
 每个 case 在一次运行中拥有唯一的 `work` 和 mutable artifact cache。P3 完成并发安全的
 artifact 发布前，测试进程不会共享默认 `build/cache`。`check`、`fail` 和 `emit` 各只调用
 一次编译器；`run` 只执行一次 emit、link 和 program run。profile 选择与日志汇总不会再次编译
-同一 case。
+同一 case。runner 执行测试程序时还会设置 `JIANG_TEST_WORK_DIR`；需要自行创建 source、
+object、cache 或临时目录的 compiler 测试必须把可变产物放到该目录，不能使用共享的固定路径。
 
 常用控制项：
 

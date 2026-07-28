@@ -380,7 +380,9 @@ run_run_case() {
   expected="$(expected_exit_code "$source")"
   run_started=$SECONDS
   set +e
-  ${sanitizer_env[@]+"${sanitizer_env[@]}"} bash -c '"$1"; exit $?' _ "$executable" \
+  env JIANG_TEST_WORK_DIR="$work_dir" \
+    ${sanitizer_env[@]+"${sanitizer_env[@]}"} \
+    bash -c '"$1"; exit $?' _ "$executable" \
     >"$run_log" 2>&1
   code=$?
   set -e
@@ -442,7 +444,8 @@ run_release_case() {
   expected="$(expected_exit_code "$source")"
   run_started=$SECONDS
   set +e
-  bash -c '"$1"; exit $?' _ "$executable" >"$run_log" 2>&1
+  env JIANG_TEST_WORK_DIR="$work_dir" \
+    bash -c '"$1"; exit $?' _ "$executable" >"$run_log" 2>&1
   code=$?
   set -e
   run_time=$((SECONDS - run_started))
