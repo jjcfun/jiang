@@ -17,7 +17,10 @@ mkdir -p "$OUTPUT_DIR"
 
 generate_source() {
   {
-    printf '%s\n' 'struct CompileBenchDomain: Domain<kind = .serial> {}'
+    printf '%s\n' 'struct CompileBenchDomain: Domain<kind = .serial> {'
+    printf '%s\n' '    associated ExecutorType = SerialExecutor;'
+    printf '%s\n' '    SerialExecutor make_executor(Self& self) { SerialExecutor() }'
+    printf '%s\n' '}'
     printf '%s\n' 'const CompileBenchDomain CompileBench = CompileBenchDomain();'
     printf '%s\n' 'async [CompileBench] Int leaf(Int value) { value }'
     printf '%s\n' 'async [CompileBench] Int large_cfg(Int seed) {'
@@ -32,12 +35,12 @@ generate_source() {
         printf '%s\n' '    }'
       elif [ "$JIANG_COMPILE_BENCH_SHAPE" = "task" ]; then
         printf '%s\n' '    {'
-        printf '        Task<Int> task = async [CompileBench] leaf(%s);\n' "$index"
+        printf '        Task<Int> task = Task(domain: CompileBench) { leaf(%s) };\n' "$index"
         printf '%s\n' '        total = total + task.await();'
         printf '%s\n' '    }'
       else
         printf '%s\n' '    if (total >= 0) {'
-        printf '        Task<Int> task = async [CompileBench] leaf(%s);\n' "$index"
+        printf '        Task<Int> task = Task(domain: CompileBench) { leaf(%s) };\n' "$index"
         printf '%s\n' '        total = total + task.await();'
         printf '%s\n' '    } else {'
         printf '        total = total - leaf(%s);\n' "$index"

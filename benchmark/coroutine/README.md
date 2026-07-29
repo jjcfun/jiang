@@ -11,17 +11,45 @@ bash ./script/coroutine_bench.sh
 
 The benchmark warms executor and allocator state before measuring these paths:
 
-- direct async call;
+- ordinary synchronous call;
+- same-Domain direct async handoff;
 - scoped `Task<T>` creation and await;
 - `Task<T>^` allocation, parameter/return forwarding, and await;
 - cross-Domain enqueue and await;
+- `global_domain`, `main_domain`, and a minimal custom Executor enqueue;
 - immediate suspend/resume;
 - cancellation before a scoped task starts;
 - repeated work spread across eight serial Domains.
 
-Each line reports elapsed monotonic time and nanoseconds per logical operation. Compare repeated runs from the same
-compiler build and machine; the numbers are not a correctness gate and allocator cache hits do not change the JIL
-allocation-structure baseline.
+Each line reports elapsed monotonic time, nanoseconds per logical operation, and Jiang runtime Job-wrapper allocations.
+The allocation count excludes coroutine frames, explicit `new Task`, and allocations internal to the platform queue.
+It is the structural Job-wrapper allocation count for each path, not allocator instrumentation: Task-backed
+standard/custom enqueue reuses TaskState storage. Compare repeated runs from the same compiler build and machine;
+the numbers are not a correctness gate. The synchronous leaf uses a no-allocation external optimization barrier so
+LLVM cannot fold the entire baseline loop into a constant.
+
+### 0.5.0 development baseline
+
+2026-07-30 on arm64 macOS 26.5, Jiang 0.5.0/LLVM 22.1.8, five runs of 10,000 iterations produced these median
+values:
+
+| Path | Median ns/op | Job-wrapper allocations |
+| --- | ---: | ---: |
+| synchronous | 1.0 | 0 |
+| same-domain | 4.8 | 0 |
+| scoped-task | 12.7 | 0 |
+| heap-owner | 132.4 | 0 |
+| cross-domain serial | 3490.4 | 0 |
+| global-enqueue | 3060.2 | 0 |
+| main-enqueue | 5219.5 | 0 |
+| custom inline enqueue | 101.1 | 0 |
+| immediate-resume | 147.8 | 0 |
+| cancel-before-start | 13.2 | 0 |
+| eight serial Domains | 1719.6 | 0 |
+
+The preceding same-machine 1,000-iteration development sample measured the shared legacy rows at approximately
+5/13/139/3795/270/27/1790 ns/op. The five-run medians show no unexplained regression in the synchronous,
+same-Domain, Task-owner, serial cross-Domain, immediate-resume, cancellation, or multi-Domain paths.
 
 ## Compiler scaling benchmark
 
