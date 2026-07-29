@@ -36,20 +36,22 @@ values:
 | Path | Median ns/op | Job-wrapper allocations |
 | --- | ---: | ---: |
 | synchronous | 1.0 | 0 |
-| same-domain | 4.8 | 0 |
-| scoped-task | 12.7 | 0 |
-| heap-owner | 132.4 | 0 |
-| cross-domain serial | 3490.4 | 0 |
-| global-enqueue | 3060.2 | 0 |
-| main-enqueue | 5219.5 | 0 |
-| custom inline enqueue | 101.1 | 0 |
-| immediate-resume | 147.8 | 0 |
-| cancel-before-start | 13.2 | 0 |
-| eight serial Domains | 1719.6 | 0 |
+| same-domain | 4.9 | 0 |
+| scoped-task | 14.1 | 0 |
+| heap-owner | 137.6 | 0 |
+| cross-domain serial | 3505.5 | 0 |
+| global-enqueue | 3057.3 | 0 |
+| main-enqueue | 3904.6 | 0 |
+| custom inline enqueue | 83.5 | 0 |
+| immediate-resume | 146.5 | 0 |
+| cancel-before-start | 14.4 | 0 |
+| eight serial Domains | 1752.6 | 0 |
 
 The preceding same-machine 1,000-iteration development sample measured the shared legacy rows at approximately
 5/13/139/3795/270/27/1790 ns/op. The five-run medians show no unexplained regression in the synchronous,
 same-Domain, Task-owner, serial cross-Domain, immediate-resume, cancellation, or multi-Domain paths.
+After the main queue began reusing TaskState Job storage, its five-run median fell from 5219.5 to
+3904.6 ns/op while keeping zero Job-wrapper allocations.
 
 ## Compiler scaling benchmark
 
