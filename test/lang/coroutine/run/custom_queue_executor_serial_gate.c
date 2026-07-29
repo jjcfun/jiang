@@ -8,6 +8,7 @@ typedef void (*queue_callback)(intptr_t);
 
 static _Atomic int64_t active[2];
 static _Atomic int64_t distinct_entered;
+static _Atomic int64_t concurrent_entered;
 static _Atomic int64_t created;
 static _Atomic int64_t destroyed;
 
@@ -46,9 +47,20 @@ int64_t distinct_domain_probe(int64_t domain) {
     return 0;
 }
 
+int64_t concurrent_domain_probe(void) {
+    atomic_fetch_add(&concurrent_entered, 1);
+    for (int index = 0; index < 2000; ++index) {
+        if (atomic_load(&concurrent_entered) >= 2) {
+            return 1;
+        }
+        usleep(1000);
+    }
+    return 0;
+}
+
 __attribute__((destructor))
 static void verify_executor_lifecycle(void) {
-    if (atomic_load(&created) != 2 || atomic_load(&destroyed) != 2) {
+    if (atomic_load(&created) != 3 || atomic_load(&destroyed) != 3) {
         abort();
     }
 }
