@@ -2,11 +2,17 @@
 
 import context = "./context.jiang";
 import diagnostic_helper = "./diagnostic/helper.jiang";
+import qkey = "./incremental/key.jiang";
+import source_graph = "./incremental/source_graph.jiang";
 import syntax_store = "./syntax/store.jiang";
 import source_ji = "./artifact/source_ji.jiang";
-import object_index = "./artifact/object_index.jiang";
+import build_state = "./artifact/build_state.jiang";
+import artifact_path = "./artifact/path.jiang";
+import cache_identity = "./artifact/cache_identity.jiang";
+import import_context = "./artifact/import_context.jiang";
 import object_key_builder = "./artifact/object_key_builder.jiang";
 import backend = "./backend.jiang";
+import codegen_unit = "./backend/codegen_unit.jiang";
 import borrow_check = "./borrow_check.jiang";
 import driver_options = "./driver/options.jiang";
 import lang = "./lang.jiang";
@@ -22,6 +28,7 @@ import source = "./source.jiang";
 import system_fs = "./system/fs.jiang";
 import system_io = "./system/io.jiang";
 import system_target = "./system/target.jiang";
+import system_time = "./system/time.jiang";
 import std;
 
 // 编译器唯一公开入口。driver 负责把命令行整理成 CompileOptions，
@@ -53,18 +60,99 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     if (!backend.validate_output_request(ctx, options)) {
         return;
     }
+    ctx.store.artifacts.enable_timing(options.jil_stats);
+    UInt64 stage_started! = system_time.monotonic_time_ns();
     UInt64 compiler_version_hash = source_artifact_version_hash(options.compiler_version);
+    std.String target_cache_key = system_target.cache_key(ctx.target$.ref());
+    std.String toolchain_version = backend.llvm_version_text();
+    cache_identity.ContextKey context_key = cache_identity.context_key(
+        object_key_builder.compiler_fingerprint(options.compiler_build),
+        object_key_builder.language_version_fingerprint(options.compiler_version),
+        object_key_builder.target_fingerprint(target_cache_key.bytes()),
+        object_key_builder.toolchain_fingerprint(toolchain_version.bytes()),
+        object_key_builder.backend_profile_fingerprint(options.mode),
+        import_context.fingerprint_for_source_path(root_path)
+    );
+    UInt8[]^ context_root = artifact_path.context_cache_root(
+        options.artifact_cache_dir,
+        context_key
+    );
+    std.String artifact_cache_dir = std.String(context_root[..]);
+    UInt8[]^ package_source_base =
+        cache_identity.absolute_path(std.path.dirname(root_path));
+    system_fs.FileLock build_lock! = system_fs.FileLock();
+    if (options.emit == .executable) {
+        qkey.Fingerprint128 target_identity =
+            cache_identity.build_target_identity(options.input_path);
+        qkey.Fingerprint128 invocation = cache_identity.build_invocation_fingerprint(
+            options.output_path,
+            options.linker_path,
+            options.link_args$.ref()
+        );
+        if (build_state.is_no_op(
+            artifact_cache_dir.bytes(),
+            target_identity,
+            context_key.fingerprint,
+            invocation,
+            package_source_base[..],
+            options.output_path
+        )) {
+            ctx.store.object_artifacts.stats.no_op_hits = 1;
+            if (options.artifact_stats) {
+                print_artifact_stats(ctx);
+            }
+            return;
+        }
+        UInt8[]^ lock_dir = artifact_path.lock_dir(artifact_cache_dir.bytes());
+        if (!system_fs.create_dirs(lock_dir[..])) {
+            diagnostic_helper.add_package_error(
+                ctx,
+                "failed to create artifact lock directory",
+                "artifact_lock_directory_failed"
+            );
+            return;
+        }
+        UInt8[]^ lock_path = artifact_path.target_build_lock_path(
+            artifact_cache_dir.bytes(),
+            target_identity
+        );
+        guard system_fs.acquire_file_lock(lock_path[..]) is .some(held_lock) else {
+            diagnostic_helper.add_package_error(
+                ctx,
+                "failed to acquire target build lock",
+                "target_build_lock_failed"
+            );
+            return;
+        }
+        build_lock = held_lock;
+        if (build_state.is_no_op(
+            artifact_cache_dir.bytes(),
+            target_identity,
+            context_key.fingerprint,
+            invocation,
+            package_source_base[..],
+            options.output_path
+        )) {
+            ctx.store.object_artifacts.stats.no_op_hits = 1;
+            if (options.artifact_stats) {
+                print_artifact_stats(ctx);
+            }
+            return;
+        }
+    }
     // syntax.Store 是本次 package 编译的临时 parse cache。resolve/Semantic Model 完成后，
     // AST 不再进入 CompilerStore 的长期状态。
     syntax_store.Store asts! = syntax_store.Store();
     lang.PrepareResult lang_registry! = lang.prepare_for_root(
         ctx,
         root_path,
-        options
+        options,
+        artifact_cache_dir.bytes()
     );
     if (!lang_registry.ok()) {
         return;
     }
+    ctx.store.artifacts.record_source_parse();
     syntax.SyntaxResult syntax_result! = syntax.parse_source_with_lang(
         ctx,
         source_text,
@@ -74,47 +162,44 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     if (syntax_result.has_errors()) {
         return;
     }
-    print_jil_stage_if_enabled(options, "parse_done");
+    stage_started = print_jil_stage_if_enabled(options, "parse_done", stage_started);
     Int source_revision = ctx.store.sources.get(source_id).revision;
     asts.set_unit(syntax_result.take_unit(), source_revision);
     guard asts.unit(source_id, source_revision) is .some(root_unit) else {
         diagnostic_helper.add_package_error(ctx, "failed to load parsed root file", "root_ast_missing");
         return;
     }
-    // 正常 executable/dylib 恢复 whole-package emission，不消费跨 package
-    // object closure。显式 object artifact 路径仍保留细粒度缓存验证。
-    Bool require_object_closure = options.emit == .object_file;
-    std.String target_cache_key = system_target.cache_key(ctx.target$.ref());
-    std.String toolchain_version = backend.llvm_version_text();
-    object_index.ObjectIndexContext object_context = object_index.ObjectIndexContext(
-        object_key_builder.compiler_fingerprint(options.compiler_build),
-        object_key_builder.language_version_fingerprint(options.compiler_version),
-        object_key_builder.target_fingerprint(target_cache_key.bytes()),
-        object_key_builder.toolchain_fingerprint(toolchain_version.bytes()),
-        object_key_builder.backend_profile_fingerprint(options.mode)
-    );
-    // 只有 check 可以完全依赖语义 interface；所有 codegen 模式必须加载完整
-    // package closure，确保 whole-package object 含有全部函数定义。
-    Bool use_source_artifacts = options.emit == .check_only;
+    // release 仍需完整 package body；debug 只有在 `.jbuild` 覆盖对应
+    // source/monomorph object 时才允许 clean source 保持 interface-only。
+    Bool debug_incremental = options.emit == .executable && options.mode == .debug;
+    Bool use_source_artifacts = options.emit == .check_only || debug_incremental;
     resolve.ModuleResolver resolver = resolve.ModuleResolver(
         ctx,
         asts$.ref(),
-        options.artifact_cache_dir,
+        artifact_cache_dir.bytes(),
         compiler_version_hash,
         use_source_artifacts,
         options.mode,
-        require_object_closure,
-        object_context
+        options.jil_stats
     );
     module_graph.ModuleGraph^ graph = resolver.build_module_graph(root_unit);
     if (!graph.ok) {
         return;
     }
-    print_jil_stage_if_enabled(options, "graph_done");
+    if (debug_incremental) {
+        mark_uncovered_debug_sources_dirty(
+            ctx,
+            options,
+            artifact_cache_dir.bytes(),
+            context_key.fingerprint
+        );
+    }
+    stage_started = print_jil_stage_if_enabled(options, "graph_done", stage_started);
     lang.PrepareResult graph_lang_registry! = lang.prepare_for_package(
         ctx,
         graph.package_id,
-        options
+        options,
+        artifact_cache_dir.bytes()
     );
     if (!graph_lang_registry.ok()) {
         return;
@@ -122,42 +207,49 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     if (!resolver.lower_module_graph_to_model(graph$.ref())) {
         return;
     }
-    print_jil_stage_if_enabled(options, "model_done");
+    if (options.jil_stats) {
+        print_model_timing(resolver.model_timing());
+    }
+    stage_started = print_jil_stage_if_enabled(options, "model_done", stage_started);
     if (!type_check.check_model_package(ctx, graph$.ref())) {
         return;
     }
-    print_jil_stage_if_enabled(options, "type_check_done");
-    resolver.finalize_module_graph_model(graph$.ref());
-    // 只为会消费 source interface 的 check 路径写缓存。executable、dylib
-    // 和 LLVM IR 目前仍需要完整源码，提前序列化不会缩短后续构建。
+    stage_started = print_jil_stage_if_enabled(options, "type_check_done", stage_started);
+    // release 和普通 object 输出不会从 source `.ji` 恢复语义，也不使用细粒度
+    // interface fingerprint；避免为不会被读取的 interface 增加全包构造开销。
     if (use_source_artifacts) {
+        resolver.finalize_module_graph_model(graph$.ref());
+    }
+    // `--check` 不进入 codegen，可以在前端成功后立即发布语义快照。
+    // Debug codegen 必须等 object 与最终产物全部成功后再发布完整 `.ji`。
+    if (options.emit == .check_only) {
         source_ji.write_package_source_artifact_cache(
             ctx,
             graph$.ref(),
-            options.artifact_cache_dir,
+            artifact_cache_dir.bytes(),
             options.compiler_version
         );
     }
-    print_jil_stage_if_enabled(options, "front_end_done");
+    stage_started = print_jil_stage_if_enabled(options, "front_end_done", stage_started);
     monomorph.MonomorphStore^ instances = monomorph.collect_reachable_instances(
         ctx,
         graph$.ref()
     );
-    print_jil_stage_if_enabled(options, "instances_done");
+    stage_started = print_jil_stage_if_enabled(options, "instances_done", stage_started);
     jil.Store^ lowered = jil_pipeline.lower_package(
         ctx,
         instances$.ref(),
         graph$.ref(),
         options.verify_jil
     );
-    print_jil_stage_if_enabled(options, "lower_done");
+    stage_started = print_jil_stage_if_enabled(options, "lower_done", stage_started);
     if (lowered.has_errors()) {
         return;
     }
     if (!borrow_check.run_package(ctx, lowered$.ref())) {
         return;
     }
-    print_jil_stage_if_enabled(options, "borrow_done");
+    stage_started = print_jil_stage_if_enabled(options, "borrow_done", stage_started);
     jil.Store^ dropped = jil_pipeline.elaborate_drops(
         ctx,
         lowered,
@@ -175,41 +267,105 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
         return;
     }
     if (options.jil_stats) {
-        print_jil_stage("drop_done");
+        stage_started = print_jil_stage("drop_done", stage_started);
         print_jil_stats(optimized$.ref());
+        print_codegen_unit_stats(ctx, optimized$.ref());
     }
     Bool backend_failed = backend.emit_package(
         ctx,
         optimized$.ref(),
-        options
+        options,
+        artifact_cache_dir.bytes(),
+        context_key.fingerprint,
+        package_source_base[..]
     ).has_errors();
     if (backend_failed) {
+        if (options.artifact_stats) {
+            print_artifact_stats(ctx);
+        }
         return;
     }
-    print_jil_stage_if_enabled(options, "backend_done");
-    if (require_object_closure) {
+    if (use_source_artifacts) {
         source_ji.write_package_source_artifact_cache(
             ctx,
             graph$.ref(),
-            options.artifact_cache_dir,
+            artifact_cache_dir.bytes(),
             options.compiler_version
         );
     }
-    print_jil_stage_if_enabled(options, "artifact_done");
+    stage_started = print_jil_stage_if_enabled(options, "backend_done", stage_started);
+    stage_started = print_jil_stage_if_enabled(options, "artifact_done", stage_started);
     if (options.artifact_stats) {
         print_artifact_stats(ctx);
     }
 }
 
-() print_jil_stage_if_enabled(driver_options.CompileOptions& options, UInt8[]& name) {
-    if (options.jil_stats) { print_jil_stage(name); }
+() print_codegen_unit_stats(context.CompilerContext& ctx, jil.Store& store) {
+    codegen_unit.CodegenUnitSet units = codegen_unit.build_codegen_units(ctx, store);
+    codegen_unit.Statistics statistics = codegen_unit.statistics(units$.ref());
+    std.StringBuilder builder = std.StringBuilder();
+    builder.append("codegen_source_units=");
+    builder.append(statistics.source_units);
+    builder.append(" codegen_monomorph_units=");
+    builder.append(statistics.monomorph_units);
+    builder.append(" codegen_functions=");
+    builder.append(statistics.functions);
+    builder.append(" codegen_largest_unit_functions=");
+    builder.append(statistics.largest_unit_functions);
+    system_fs.File error_output = system_io.stderr();
+    error_output.write_all(builder.slice());
+    error_output.write_all("\n");
 }
 
-() print_jil_stage(UInt8[]& name) {
+() print_model_timing(resolve.ModelTiming timing) {
+    std.StringBuilder builder = std.StringBuilder();
+    builder.append("model_prepare_ms=");
+    builder.append(timing.prepare_ns / UInt64(1000000));
+    builder.append(" model_freshness_ms=");
+    builder.append(timing.freshness_ns / UInt64(1000000));
+    builder.append(" model_bindings_ms=");
+    builder.append(timing.bindings_ns / UInt64(1000000));
+    builder.append(" model_skeletons_ms=");
+    builder.append(timing.skeletons_ns / UInt64(1000000));
+    builder.append(" model_declarations_ms=");
+    builder.append(timing.declarations_ns / UInt64(1000000));
+    builder.append(" model_facts_ms=");
+    builder.append(timing.facts_ns / UInt64(1000000));
+    builder.append(" model_bodies_ms=");
+    builder.append(timing.bodies_ns / UInt64(1000000));
+    builder.append(" model_store_ms=");
+    builder.append(timing.store_ns / UInt64(1000000));
+    builder.append(" model_finalize_ms=");
+    builder.append(timing.finalize_ns / UInt64(1000000));
+    system_fs.File error_output = system_io.stderr();
+    error_output.write_all(builder.slice());
+    error_output.write_all("\n");
+}
+
+UInt64 print_jil_stage_if_enabled(
+    driver_options.CompileOptions& options,
+    UInt8[]& name,
+    UInt64 started
+) {
+    if (options.jil_stats) { return print_jil_stage(name, started); }
+    return started;
+}
+
+UInt64 print_jil_stage(UInt8[]& name, UInt64 started) {
+    UInt64 finished = system_time.monotonic_time_ns();
+    UInt64 elapsed_ms! = UInt64(0);
+    if (finished >= started) {
+        elapsed_ms = (finished - started) / UInt64(1000000);
+    }
     system_fs.File error_output = system_io.stderr();
     error_output.write_all("jil_stage=");
     error_output.write_all(name);
+    error_output.write_all(" elapsed_ms=");
+    std.StringBuilder elapsed = std.StringBuilder();
+    elapsed.append(elapsed_ms);
+    error_output.write_all(elapsed.slice());
     error_output.write_all("\n");
+    return finished;
 }
 
 () print_jil_stats(jil.Store& store) {
@@ -233,6 +389,20 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     builder.append(ctx.store.artifacts.stats.interface_missing);
     builder.append(" artifact_interface_stale=");
     builder.append(ctx.store.artifacts.stats.interface_stale);
+    builder.append(" artifact_section_reads=");
+    builder.append(ctx.store.artifacts.stats.section_reads);
+    builder.append(" artifact_section_mb=");
+    builder.append(ctx.store.artifacts.stats.section_bytes / (1024 * 1024));
+    builder.append(" artifact_section_read_ms=");
+    builder.append(ctx.store.artifacts.stats.section_read_ns / UInt64(1000000));
+    builder.append(" artifact_section_decode_ms=");
+    builder.append(ctx.store.artifacts.stats.section_decode_ns / UInt64(1000000));
+    builder.append(" artifact_interface_read_ms=");
+    builder.append(ctx.store.artifacts.stats.interface_read_ns / UInt64(1000000));
+    builder.append(" artifact_interface_decode_ms=");
+    builder.append(ctx.store.artifacts.stats.interface_decode_ns / UInt64(1000000));
+    builder.append(" artifact_parsed_sources=");
+    builder.append(ctx.store.artifacts.stats.parsed_sources);
     builder.append(" artifact_object_hit=");
     builder.append(ctx.store.object_artifacts.stats.hit_count());
     builder.append(" artifact_object_miss=");
@@ -245,6 +415,8 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
     builder.append(ctx.store.object_artifacts.stats.reused_units);
     builder.append(" artifact_linked_objects=");
     builder.append(ctx.store.object_artifacts.stats.linked_objects);
+    builder.append(" artifact_no_op_hits=");
+    builder.append(ctx.store.object_artifacts.stats.no_op_hits);
     system_fs.File error_output = system_io.stderr();
     error_output.write_all(builder.slice());
     error_output.write_all("\n");
@@ -253,4 +425,65 @@ public () compile(context.CompilerContext& ctx, driver_options.CompileOptions& o
 // source interface 的版本 hash 统一委托给 artifact 层，pipeline 不定义格式。
 UInt64 source_artifact_version_hash(UInt8[]& compiler_version) {
     return source_ji.artifact_version_hash(compiler_version);
+}
+
+// `.ji` 只证明语义 interface 可复用。object coverage 不完整时必须在
+// Semantic Model lowering 前回退源码，不能用空 body 尝试补发产物。
+() mark_uncovered_debug_sources_dirty(
+    context.CompilerContext& ctx,
+    driver_options.CompileOptions& options,
+    UInt8[]& context_root,
+    qkey.Fingerprint128 context_fingerprint
+) {
+    qkey.Fingerprint128 target_identity =
+        cache_identity.build_target_identity(options.input_path);
+    build_state.BuildState? previous = build_state.load(
+        context_root,
+        target_identity,
+        context_fingerprint
+    );
+    Int index! = 0;
+    while (index < ctx.store.source_dependencies.node_count()) {
+        source_graph.SourceNodeId node_id = source_graph.SourceNodeId(index);
+        source_graph.SourceNode& node = ctx.store.source_dependencies.node(node_id);
+        if (!node.dirty && !debug_source_products_available(
+            previous$.ref(),
+            node.identity,
+            context_root
+        )) {
+            ctx.store.source_dependencies.mark_dirty(node_id);
+        }
+        index = index + 1;
+    }
+}
+
+Bool debug_source_products_available(
+    build_state.BuildState?& previous,
+    cache_identity.StableSourceIdentity identity,
+    UInt8[]& context_root
+) {
+    guard previous is .some(ref _ state) else { return false; }
+    UInt8[]^ source_path = artifact_path.stable_source_object_path(context_root, identity);
+    if (!build_state.work_product_is_available(
+        state,
+        identity.fingerprint,
+        .source_unit,
+        source_path[..]
+    )) {
+        return false;
+    }
+    guard state.find_work_product(
+        identity.fingerprint,
+        .monomorph_unit
+    ) is .some(_) else {
+        return true;
+    }
+    UInt8[]^ mono_path =
+        artifact_path.stable_source_monomorph_object_path(context_root, identity);
+    return build_state.work_product_is_available(
+        state,
+        identity.fingerprint,
+        .monomorph_unit,
+        mono_path[..]
+    );
 }

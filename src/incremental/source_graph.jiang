@@ -1,0 +1,495 @@
+// 单次编译会话的 source 依赖图。
+//
+// 节点使用连续 SourceNodeId；稳定 source identity 只用于查找和去重。
+// 正向边表示 source -> dependency，反向边表示 dependency -> importer。
+
+import cache_identity = "../artifact/cache_identity.jiang";
+import ji = "../artifact/ji_file.jiang";
+import qkey = "./key.jiang";
+import core_traits = "../core/traits.jiang";
+import traits = "../support/traits.jiang";
+import list = "../support/list.jiang";
+import table = "../support/table.jiang";
+import std;
+
+public struct SourceNodeId: Copyable, traits.Indexable, Hashable, Equatable {
+    Int index;
+
+    public init(self, Int index) {
+        assert(index >= 0);
+        self.index = index;
+    }
+
+    public Int to_index(self) {
+        return self.index;
+    }
+
+    public SourceNodeId from_index(Int index) {
+        return SourceNodeId(index);
+    }
+
+    public () hash<H: core_traits.Hasher>(self, H&! hasher) {
+        hasher.write(self.index);
+    }
+
+    public Bool equal(SourceNodeId& lhs, SourceNodeId& rhs) {
+        return lhs.index == rhs.index;
+    }
+}
+
+public struct SourceNode: Movable {
+    public cache_identity.StableSourceIdentity identity;
+    public qkey.Fingerprint128 package_identity;
+    public std.String package_relative_path;
+    public ji.JiHeader? previous_header;
+    public Bool dirty;
+
+    public init(self,
+        cache_identity.StableSourceIdentity identity,
+        qkey.Fingerprint128 package_identity,
+        UInt8[]& package_relative_path,
+        ji.JiHeader? previous_header,
+        Bool dirty
+    ) {
+        self.identity = identity;
+        self.package_identity = package_identity;
+        self.package_relative_path = std.String(package_relative_path);
+        self.previous_header = previous_header;
+        self.dirty = dirty;
+    }
+}
+
+struct TarjanState: Movable {
+    list.ArrayList<Int> indices;
+    list.ArrayList<Int> low_links;
+    list.ArrayList<Bool> on_stack;
+    list.ArrayList<SourceNodeId> stack;
+    list.ArrayList<SourceNodeId> ordered;
+    list.ArrayList<Int> component_ends;
+    Int next_index!;
+
+    init(self, Int node_count) {
+        self.indices = list.ArrayList<Int>(node_count);
+        self.low_links = list.ArrayList<Int>(node_count);
+        self.on_stack = list.ArrayList<Bool>(node_count);
+        self.stack = list.ArrayList<SourceNodeId>(node_count);
+        self.ordered = list.ArrayList<SourceNodeId>(node_count);
+        self.component_ends = list.ArrayList<Int>();
+        self.next_index = 0;
+        Int index! = 0;
+        while (index < node_count) {
+            self.indices.add(-1);
+            self.low_links.add(-1);
+            self.on_stack.add(false);
+            index = index + 1;
+        }
+    }
+}
+
+public struct SourceSchedule: Movable {
+    list.ArrayList<SourceNodeId> nodes;
+    list.ArrayList<Int> component_ends;
+
+    init(self, list.ArrayList<SourceNodeId> nodes, list.ArrayList<Int> component_ends) {
+        self.nodes = nodes;
+        self.component_ends = component_ends;
+    }
+
+    public Int node_count(self) {
+        return self.nodes.len();
+    }
+
+    public SourceNodeId node_at(self, Int index) {
+        return self.nodes.get(index);
+    }
+
+    public Int component_count(self) {
+        return self.component_ends.len();
+    }
+
+    public Int component_end(self, Int index) {
+        return self.component_ends.get(index);
+    }
+
+    public list.ArrayList<SourceNodeId> take_nodes(self) {
+        return self.nodes.take();
+    }
+}
+
+public struct SourceDependencyGraph: Movable {
+    list.ArrayList<SourceNode> nodes;
+    table.HashTable<cache_identity.StableSourceIdentity, SourceNodeId> by_identity;
+    table.MultiTable<SourceNodeId, SourceNodeId> dependencies;
+    table.MultiTable<SourceNodeId, SourceNodeId> importers;
+
+    public init(self) {
+        self.nodes = list.ArrayList<SourceNode>();
+        self.by_identity =
+            table.HashTable<cache_identity.StableSourceIdentity, SourceNodeId>();
+        self.dependencies = table.MultiTable<SourceNodeId, SourceNodeId>();
+        self.importers = table.MultiTable<SourceNodeId, SourceNodeId>();
+    }
+
+    public Int node_count(self) {
+        return self.nodes.len();
+    }
+
+    public Int edge_count(self) {
+        return self.dependencies.value_len();
+    }
+
+    public SourceNodeId ensure_node(self,
+        cache_identity.StableSourceIdentity identity,
+        qkey.Fingerprint128 package_identity,
+        UInt8[]& package_relative_path,
+        ji.JiHeader? previous_header,
+        Bool dirty
+    ) {
+        if (table.hash_table_get_value<
+            cache_identity.StableSourceIdentity,
+            SourceNodeId
+        >(self.by_identity$.ref(), identity) is .some(existing)) {
+            self.merge_node(existing, previous_header, dirty);
+            return existing;
+        }
+        SourceNodeId node_id = SourceNodeId(self.nodes.len());
+        self.nodes.add(SourceNode(
+            identity,
+            package_identity,
+            package_relative_path,
+            previous_header,
+            dirty
+        ));
+        self.by_identity.set(identity, node_id);
+        return node_id;
+    }
+
+    public SourceNodeId? find(self, cache_identity.StableSourceIdentity identity) {
+        return table.hash_table_get_value<
+            cache_identity.StableSourceIdentity,
+            SourceNodeId
+        >(self.by_identity$.ref(), identity);
+    }
+
+    public SourceNode& node(self, SourceNodeId node_id) {
+        return self.nodes.ref_at(node_id.to_index());
+    }
+
+    public () add_dependency(self, SourceNodeId importer, SourceNodeId dependency) {
+        if (self.has_dependency(importer, dependency)) { return; }
+        self.dependencies.add(importer, dependency);
+        self.importers.add(dependency, importer);
+    }
+
+    public Int dependency_count(self, SourceNodeId node_id) {
+        return self.edge_value_count(self.dependencies$.ref(), node_id);
+    }
+
+    public Int importer_count(self, SourceNodeId node_id) {
+        return self.edge_value_count(self.importers$.ref(), node_id);
+    }
+
+    public () mark_dirty(self, SourceNodeId node_id) {
+        self.nodes.ref_at(node_id.to_index()).dirty = true;
+    }
+
+    // 只有当前 source 的 importer-visible interface 真正变化时才标记
+    // 直接 importer。后续 importer 完成分析后再决定是否继续向外传播。
+    public Int mark_changed_importers(
+        self,
+        SourceNodeId changed,
+        qkey.Fingerprint128 package_interface,
+        qkey.Fingerprint128 public_interface
+    ) {
+        SourceNode& changed_node = self.node(changed);
+        Bool package_changed = self.package_interface_changed(changed_node, package_interface);
+        Bool public_changed = self.public_interface_changed(changed_node, public_interface);
+        Int marked! = 0;
+        table.MultiTableCursor cursor! = self.importers.first(changed);
+        while (cursor.valid()) {
+            SourceNodeId importer = self.importers.get(cursor);
+            if (self.importer_observes_change(importer, changed_node, package_changed, public_changed)) {
+                marked = marked + self.mark_dirty_once(importer);
+            }
+            cursor = self.importers.next(cursor);
+        }
+        return marked;
+    }
+
+    public Int mark_importers_dirty(self, SourceNodeId changed) {
+        Int marked! = 0;
+        table.MultiTableCursor cursor! = self.importers.first(changed);
+        while (cursor.valid()) {
+            marked = marked + self.mark_dirty_once(self.importers.get(cursor));
+            cursor = self.importers.next(cursor);
+        }
+        return marked;
+    }
+
+    public list.ArrayList<SourceNodeId> dirty_nodes(self) {
+        list.ArrayList<SourceNodeId> result! = list.ArrayList<SourceNodeId>();
+        Int index! = 0;
+        while (index < self.nodes.len()) {
+            if (self.nodes.ref_at(index).dirty) {
+                result.add(SourceNodeId(index));
+            }
+            index = index + 1;
+        }
+        return result;
+    }
+
+    // Tarjan 按稳定 identity 遍历，天然以 dependency SCC 先于 importer SCC
+    // 输出。单个 SCC 内再次按稳定 identity 排序，并统一 dirty 状态。
+    public list.ArrayList<SourceNodeId> ordered_nodes(self) {
+        SourceSchedule result! = self.schedule();
+        return result.take_nodes();
+    }
+
+    public SourceSchedule schedule(self) {
+        TarjanState state! = TarjanState(self.nodes.len());
+        list.ArrayList<SourceNodeId> roots = self.all_nodes_sorted();
+        Int index! = 0;
+        while (index < roots.len()) {
+            SourceNodeId node_id = roots.get(index);
+            if (state.indices.get(node_id.to_index()) < 0) {
+                self.strong_connect(node_id, state$.mut_ref());
+            }
+            index = index + 1;
+        }
+        return SourceSchedule(state.ordered.take(), state.component_ends.take());
+    }
+
+    () merge_node(self, SourceNodeId node_id, ji.JiHeader? previous_header, Bool dirty) {
+        SourceNode&! node = self.nodes.ref_at(node_id.to_index());
+        if (node.previous_header == null && previous_header is .some(header)) {
+            node.previous_header = header;
+        }
+        if (dirty) { node.dirty = true; }
+    }
+
+    Bool has_dependency(self, SourceNodeId importer, SourceNodeId dependency) {
+        table.MultiTableCursor cursor! = self.dependencies.first(importer);
+        while (cursor.valid()) {
+            if (self.dependencies.get(cursor) == dependency) { return true; }
+            cursor = self.dependencies.next(cursor);
+        }
+        return false;
+    }
+
+    Int edge_value_count(
+        self,
+        table.MultiTable<SourceNodeId, SourceNodeId>& edges,
+        SourceNodeId node_id
+    ) {
+        Int count! = 0;
+        table.MultiTableCursor cursor! = edges.first(node_id);
+        while (cursor.valid()) {
+            count = count + 1;
+            cursor = edges.next(cursor);
+        }
+        return count;
+    }
+
+    Bool package_interface_changed(
+        self,
+        SourceNode& node,
+        qkey.Fingerprint128 current
+    ) {
+        guard node.previous_header is .some(header) else { return true; }
+        return header.package_interface_fingerprint != current;
+    }
+
+    Bool public_interface_changed(
+        self,
+        SourceNode& node,
+        qkey.Fingerprint128 current
+    ) {
+        guard node.previous_header is .some(header) else { return true; }
+        return header.public_interface_fingerprint != current;
+    }
+
+    Bool importer_observes_change(
+        self,
+        SourceNodeId importer,
+        SourceNode& changed,
+        Bool package_changed,
+        Bool public_changed
+    ) {
+        SourceNode& importer_node = self.node(importer);
+        if (importer_node.package_identity == changed.package_identity) {
+            return package_changed;
+        }
+        return public_changed;
+    }
+
+    Int mark_dirty_once(self, SourceNodeId node_id) {
+        SourceNode&! node = self.nodes.ref_at(node_id.to_index());
+        if (node.dirty) { return 0; }
+        node.dirty = true;
+        return 1;
+    }
+
+    list.ArrayList<SourceNodeId> all_nodes_sorted(self) {
+        list.ArrayList<SourceNodeId> result! = list.ArrayList<SourceNodeId>(self.nodes.len());
+        Int index! = 0;
+        while (index < self.nodes.len()) {
+            result.add(SourceNodeId(index));
+            index = index + 1;
+        }
+        self.sort_node_ids(result$.ref());
+        return result;
+    }
+
+    public list.ArrayList<SourceNodeId> dependency_nodes(self, SourceNodeId node_id) {
+        list.ArrayList<SourceNodeId> result! = list.ArrayList<SourceNodeId>();
+        table.MultiTableCursor cursor! = self.dependencies.first(node_id);
+        while (cursor.valid()) {
+            result.add(self.dependencies.get(cursor));
+            cursor = self.dependencies.next(cursor);
+        }
+        self.sort_node_ids(result$.ref());
+        return result;
+    }
+
+    () sort_node_ids(self, list.ArrayList<SourceNodeId>& nodes) {
+        if (nodes.len() < 2) { return; }
+        list.ArrayList<SourceNodeId> scratch! = list.ArrayList<SourceNodeId>(nodes.len());
+        Int index! = 0;
+        while (index < nodes.len()) {
+            scratch.add(nodes.get(0));
+            index = index + 1;
+        }
+        self.merge_sort_node_ids(nodes, scratch$.ref(), 0, nodes.len());
+    }
+
+    () merge_sort_node_ids(
+        self,
+        list.ArrayList<SourceNodeId>& nodes,
+        list.ArrayList<SourceNodeId>& scratch,
+        Int begin,
+        Int end
+    ) {
+        if (end - begin < 2) { return; }
+        Int middle = begin + (end - begin) / 2;
+        self.merge_sort_node_ids(nodes, scratch, begin, middle);
+        self.merge_sort_node_ids(nodes, scratch, middle, end);
+        self.merge_node_ranges(nodes, scratch, begin, middle, end);
+    }
+
+    () merge_node_ranges(
+        self,
+        list.ArrayList<SourceNodeId>& nodes,
+        list.ArrayList<SourceNodeId>& scratch,
+        Int begin,
+        Int middle,
+        Int end
+    ) {
+        Int index! = begin;
+        while (index < end) {
+            scratch.set(index, nodes.get(index));
+            index = index + 1;
+        }
+        Int left! = begin;
+        Int right! = middle;
+        index = begin;
+        while (index < end) {
+            Bool take_right! = left >= middle;
+            if (right < end && left < middle) {
+                take_right = self.node_less(scratch.get(right), scratch.get(left));
+            }
+            nodes.set(index, if take_right { scratch.get(right) } else { scratch.get(left) });
+            if (take_right) { right = right + 1; } else { left = left + 1; }
+            index = index + 1;
+        }
+    }
+
+    Bool node_less(self, SourceNodeId lhs, SourceNodeId rhs) {
+        qkey.Fingerprint128 left = self.nodes.ref_at(lhs.to_index()).identity.fingerprint;
+        qkey.Fingerprint128 right = self.nodes.ref_at(rhs.to_index()).identity.fingerprint;
+        if (left.high != right.high) { return left.high < right.high; }
+        return left.low < right.low;
+    }
+
+    () strong_connect(self, SourceNodeId node_id, TarjanState&! state) {
+        Int node_index = node_id.to_index();
+        Int discovery_index = state.next_index;
+        state.next_index = state.next_index + 1;
+        state.indices.set(node_index, discovery_index);
+        state.low_links.set(node_index, discovery_index);
+        state.stack.add(node_id);
+        state.on_stack.set(node_index, true);
+
+        list.ArrayList<SourceNodeId> dependencies = self.dependency_nodes(node_id);
+        Int index! = 0;
+        while (index < dependencies.len()) {
+            self.visit_tarjan_dependency(
+                node_id,
+                dependencies.get(index),
+                state
+            );
+            index = index + 1;
+        }
+        if (state.low_links.get(node_index) != discovery_index) { return; }
+        self.finish_component(node_id, state);
+    }
+
+    () visit_tarjan_dependency(
+        self,
+        SourceNodeId node_id,
+        SourceNodeId dependency,
+        TarjanState&! state
+    ) {
+        Int dependency_index = dependency.to_index();
+        if (state.indices.get(dependency_index) < 0) {
+            self.strong_connect(dependency, state);
+            self.merge_low_link(node_id, state.low_links.get(dependency_index), state);
+            return;
+        }
+        if (state.on_stack.get(dependency_index)) {
+            self.merge_low_link(node_id, state.indices.get(dependency_index), state);
+        }
+    }
+
+    () merge_low_link(self, SourceNodeId node_id, Int candidate, TarjanState&! state) {
+        Int node_index = node_id.to_index();
+        if (candidate < state.low_links.get(node_index)) {
+            state.low_links.set(node_index, candidate);
+        }
+    }
+
+    () finish_component(self, SourceNodeId root, TarjanState&! state) {
+        list.ArrayList<SourceNodeId> component! = list.ArrayList<SourceNodeId>();
+        while (!state.stack.empty()) {
+            SourceNodeId member = state.stack.pop();
+            state.on_stack.set(member.to_index(), false);
+            component.add(member);
+            if (member == root) { break; }
+        }
+        self.sort_node_ids(component$.ref());
+        self.merge_component_dirty(component$.ref());
+        Int index! = 0;
+        while (index < component.len()) {
+            state.ordered.add(component.get(index));
+            index = index + 1;
+        }
+        state.component_ends.add(state.ordered.len());
+    }
+
+    () merge_component_dirty(self, list.ArrayList<SourceNodeId>& component) {
+        Bool dirty! = false;
+        Int index! = 0;
+        while (index < component.len()) {
+            if (self.nodes.ref_at(component.get(index).to_index()).dirty) {
+                dirty = true;
+                break;
+            }
+            index = index + 1;
+        }
+        if (!dirty) { return; }
+        index = 0;
+        while (index < component.len()) {
+            self.mark_dirty(component.get(index));
+            index = index + 1;
+        }
+    }
+}

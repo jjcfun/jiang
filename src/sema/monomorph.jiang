@@ -341,11 +341,13 @@ public struct MonomorphStore: Movable {
     // 按发现顺序保存实例，JIL lowering 直接线性遍历这张表。
     // indexes 只负责去重和 O(1) 查询，不依赖 HashTable 遍历顺序。
     public list.ArrayList<InstanceKey> instances;
+    table.MultiTable<Int, qid.ModuleId> owner_modules;
     table.HashTable<InstanceKey, Int> indexes;
 
     public init(self) {
         self.storage = arena.Arena();
         self.instances = list.ArrayList<InstanceKey>();
+        self.owner_modules = table.MultiTable<Int, qid.ModuleId>();
         self.indexes = table.HashTable<InstanceKey, Int>();
     }
 
@@ -377,7 +379,13 @@ public struct MonomorphStore: Movable {
 
     public Bool add_instance(self, qid.DefId def_id, qid.TypeId[]& type_args) {
         InstanceKey key = InstanceKey(def_id, type_args);
-        return self.add_instance_with_const_args(def_id, key.args, type_args, self.empty_const_args());
+        return self.add_instance_with_owner(
+            def_id,
+            key.args,
+            type_args,
+            self.empty_const_args(),
+            null
+        );
     }
 
     public Bool add_instance_with_const_args(self,
@@ -386,8 +394,22 @@ public struct MonomorphStore: Movable {
         qid.TypeId[]& type_args,
         comptime_value.ComptimeValue[]& const_args
     ) {
+        return self.add_instance_with_owner(def_id, args, type_args, const_args, null);
+    }
+
+    public Bool add_instance_with_owner(self,
+        qid.DefId def_id,
+        types.GenericArg[]& args,
+        qid.TypeId[]& type_args,
+        comptime_value.ComptimeValue[]& const_args,
+        qid.ModuleId? owner_module
+    ) {
         InstanceKey lookup = InstanceKey(def_id, args, type_args, const_args);
-        if (self.indexes.has(lookup)) {
+        if (table.hash_table_get_value<InstanceKey, Int>(
+            self.indexes$.ref(),
+            lookup
+        ) is .some(existing_index)) {
+            self.add_owner(existing_index, owner_module);
             return false;
         }
         InstanceKey stored = InstanceKey(
@@ -396,9 +418,31 @@ public struct MonomorphStore: Movable {
             self.copy_type_args(type_args),
             self.copy_const_args(const_args)
         );
-        self.indexes.set(stored, self.instances.len());
+        Int instance_index = self.instances.len();
+        self.indexes.set(stored, instance_index);
         self.instances.add(stored);
+        self.add_owner(instance_index, owner_module);
         return true;
+    }
+
+    public list.ArrayList<qid.ModuleId> owners(self, Int instance_index) {
+        list.ArrayList<qid.ModuleId> result! = list.ArrayList<qid.ModuleId>();
+        table.MultiTableCursor cursor! = self.owner_modules.first(instance_index);
+        while (cursor.valid()) {
+            result.add(self.owner_modules.get(cursor));
+            cursor = self.owner_modules.next(cursor);
+        }
+        return result;
+    }
+
+    () add_owner(self, Int instance_index, qid.ModuleId? owner_module) {
+        guard owner_module is .some(owner) else { return; }
+        table.MultiTableCursor cursor! = self.owner_modules.first(instance_index);
+        while (cursor.valid()) {
+            if (self.owner_modules.get(cursor) == owner) { return; }
+            cursor = self.owner_modules.next(cursor);
+        }
+        self.owner_modules.add(instance_index, owner);
     }
 
     public Int? instance_index_with_const_args(self,
@@ -623,10 +667,10 @@ struct InstanceCollector: Movable {
     table.HashTable<qid.DefId, Bool> visited_defs;
     table.HashTable<Int, Int> visiting_types;
 
-    // instance_states: 1 = visiting, 2 = done。这里的 visiting 不是错误：
-    // 递归函数会在收集 body 时再次引用同一个 concrete instance。遇到
-    // visiting 只说明该 instance 已经在本轮调度中，直接返回即可。
-    table.HashTable<InstanceKey, Int> instance_states;
+    // 同一实例会进入每个实际调用方的 mono unit。按 instance + owner
+    // 去重递归展开，既截断递归调用，也把传递依赖传播给全部调用方。
+    table.MultiTable<InstanceKey, qid.ModuleId> visited_instance_owners;
+    qid.ModuleId current_owner_module!;
     public init(self,
         context.CompilerContext& ctx,
         MonomorphStore& instances,
@@ -637,7 +681,8 @@ struct InstanceCollector: Movable {
         self.results = results;
         self.visited_defs = table.HashTable<qid.DefId, Bool>();
         self.visiting_types = table.HashTable<Int, Int>();
-        self.instance_states = table.HashTable<InstanceKey, Int>();
+        self.visited_instance_owners = table.MultiTable<InstanceKey, qid.ModuleId>();
+        self.current_owner_module = qid.ModuleId.from_index(0);
     }
 
     public () collect_reachable(self,
@@ -647,7 +692,9 @@ struct InstanceCollector: Movable {
     ) {
         Int index! = 0;
         while (index < graph.module_count()) {
-            store.ModuleRecord& module = compiler_store.resolve.module_ref(graph.module_at(index));
+            qid.ModuleId module_id = graph.module_at(index);
+            self.current_owner_module = module_id;
+            store.ModuleRecord& module = compiler_store.resolve.module_ref(module_id);
             self.collect_root_def(compiler_store, model, module.def_id);
             index = index + 1;
         }
@@ -780,16 +827,9 @@ struct InstanceCollector: Movable {
         Int instance_index
     ) {
         InstanceKey instance = self.instances.get(instance_index);
-        Int visiting! = 1;
-        Int done! = 2;
-
-        if (self.instance_states.get(instance) is .some(state)) {
-            return;
-        }
-
-        self.instance_states.set(instance, visiting);
+        if (self.instance_owner_visited(instance, self.current_owner_module)) { return; }
+        self.visited_instance_owners.add(instance, self.current_owner_module);
         guard model.def(instance.def_id) is .some(model_def) else {
-            self.instance_states.set(instance, done);
             return;
         }
         SubstitutionMap substitutions = build_substitution(compiler_store, model_def, instance);
@@ -807,7 +847,15 @@ struct InstanceCollector: Movable {
                 instance.const_args
             );
         }
-        self.instance_states.set(instance, done);
+    }
+
+    Bool instance_owner_visited(self, InstanceKey instance, qid.ModuleId owner) {
+        table.MultiTableCursor cursor! = self.visited_instance_owners.first(instance);
+        while (cursor.valid()) {
+            if (self.visited_instance_owners.get(cursor) == owner) { return true; }
+            cursor = self.visited_instance_owners.next(cursor);
+        }
+        return false;
     }
 
     () collect_nominal_member_types(self,
@@ -837,9 +885,13 @@ struct InstanceCollector: Movable {
         comptime_value.ComptimeValue[]& const_args
     ) {
         guard model_def.custom_deinit_def is .some(deinit_def) else { return; }
-        if (!self.instances.add_instance_with_const_args(deinit_def, args, type_args, const_args)) {
-            return;
-        }
+        self.instances.add_instance_with_owner(
+            deinit_def,
+            args,
+            type_args,
+            const_args,
+            self.current_owner_module
+        );
         guard self.instances.instance_index_with_const_args(deinit_def, args, type_args, const_args) is .some(instance_index) else {
             return;
         }
@@ -1044,7 +1096,13 @@ struct InstanceCollector: Movable {
         if (!self.type_args_are_concrete(compiler_store, type_args)) {
             return;
         }
-        self.instances.add_instance_with_const_args(instance.def_id, args, type_args, const_args);
+        self.instances.add_instance_with_owner(
+            instance.def_id,
+            args,
+            type_args,
+            const_args,
+            self.current_owner_module
+        );
         guard self.instances.instance_index_with_const_args(
             instance.def_id,
             args,
@@ -1137,25 +1195,28 @@ struct InstanceCollector: Movable {
         sem_store.Store& model,
         types.NamedType named
     ) {
-        Bool added! = false;
         if (named.type_args.length == 0 && named.const_args.length == 0) {
             return;
         }
         if (!self.type_args_are_concrete(compiler_store, named.type_args)) {
             return;
         }
-        added = self.instances.add_instance_with_const_args(named.def_id, named.args, named.type_args, named.const_args);
-        if (added) {
-            guard self.instances.instance_index_with_const_args(
-                named.def_id,
-                named.args,
-                named.type_args,
-                named.const_args
-            ) is .some(instance_index) else {
-                return;
-            }
-            self.collect_instance_at(compiler_store, model, instance_index);
+        self.instances.add_instance_with_owner(
+            named.def_id,
+            named.args,
+            named.type_args,
+            named.const_args,
+            self.current_owner_module
+        );
+        guard self.instances.instance_index_with_const_args(
+            named.def_id,
+            named.args,
+            named.type_args,
+            named.const_args
+        ) is .some(instance_index) else {
+            return;
         }
+        self.collect_instance_at(compiler_store, model, instance_index);
         self.collect_type_args(compiler_store, model, named.type_args);
     }
 
@@ -1327,9 +1388,14 @@ struct InstanceCollector: Movable {
         if (!self.type_args_are_concrete(compiler_store, type_args)) {
             return;
         }
-        if (!self.instances.add_instance(function_def, type_args)) {
-            return;
-        }
+        InstanceKey key = InstanceKey(function_def, type_args);
+        self.instances.add_instance_with_owner(
+            function_def,
+            key.args,
+            type_args,
+            self.instances.empty_const_args(),
+            self.current_owner_module
+        );
         guard self.instances.instance_index(function_def, type_args) is .some(instance_index) else {
             return;
         }

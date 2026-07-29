@@ -64,32 +64,48 @@ public struct InterfaceLoader: Copyable {
         qid.ModuleId module_id,
         artifact.ModuleInterface& module_interface
     ) {
-        Bool progress! = true;
-        while (progress) {
-            progress = false;
-            Int index! = 0;
-            while (index < module_interface.declarations.len()) {
-                artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
-                if (self.declaration_loaded_or_waiting(declaration)) {
-                    index = index + 1;
-                    continue;
-                }
-                if (self.load_declaration_skeleton(module_id, module_interface, declaration) != null) {
-                    progress = true;
-                }
-                index = index + 1;
-            }
+        Int progress! = 1;
+        while (progress > 0) {
+            progress = self.load_module_interface_skeleton_round(module_id, module_interface);
         }
 
         Int index! = 0;
         while (index < module_interface.declarations.len()) {
             artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
             if (self.store.incremental.current_def_for_stable(declaration.stable_id) == null) {
-                self.load_declaration_skeleton(module_id, module_interface, declaration);
+                self.load_declaration_skeleton(module_id, module_interface, declaration, true);
             }
             index = index + 1;
         }
         return module_id;
+    }
+
+    // SCC 中的 extension 成员可能由另一个 source 声明 owner。单轮只恢复
+    // owner 已就绪的声明，由 component 调度在所有 source 之间迭代。
+    public Int load_module_interface_skeleton_round(
+        self,
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface
+    ) {
+        Int progress! = 0;
+        Int index! = 0;
+        while (index < module_interface.declarations.len()) {
+            artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+            index = index + 1;
+            if (self.store.incremental.current_def_for_stable(declaration.stable_id) != null) {
+                continue;
+            }
+            if (!self.declaration_owner_ready(declaration)) { continue; }
+            if (self.load_declaration_skeleton(
+                module_id,
+                module_interface,
+                declaration,
+                false
+            ) != null) {
+                progress = progress + 1;
+            }
+        }
+        return progress;
     }
 
     public () load_module_interface_facts(self, qid.ModuleId module_id, artifact.ModuleInterface& module_interface) {
@@ -99,6 +115,7 @@ public struct InterfaceLoader: Copyable {
             self.load_declaration_facts(module_interface, declaration);
             index = index + 1;
         }
+        self.load_extension_groups(module_id, module_interface);
         self.load_public_aliases(module_id, module_interface, false);
     }
 
@@ -162,21 +179,24 @@ public struct InterfaceLoader: Copyable {
     qid.DefId? load_declaration_skeleton(self,
         qid.ModuleId module_id,
         artifact.ModuleInterface& module_interface,
-        artifact.InterfaceDeclSummary declaration
+        artifact.InterfaceDeclSummary declaration,
+        Bool diagnose_missing_owner
     ) {
         if (self.store.incremental.current_def_for_stable(declaration.stable_id) is .some(existing)) {
             self.record_declaration_fingerprints(declaration);
             return existing;
         }
         guard self.owner_def(module_id, declaration) is .some(semantic_owner) else {
-            diagnostics.add_error(
-                self.ctx,
-                module_interface.source_id,
-                token.Span(),
-                self.store.symbols.text(declaration.name),
-                "interface_declaration_owner_missing"
-            );
-            self.store.model.mark_error();
+            if (diagnose_missing_owner) {
+                diagnostics.add_error(
+                    self.ctx,
+                    module_interface.source_id,
+                    token.Span(),
+                    self.store.symbols.text(declaration.name),
+                    "interface_declaration_owner_missing"
+                );
+                self.store.model.mark_error();
+            }
             return null;
         }
 
@@ -207,14 +227,159 @@ public struct InterfaceLoader: Copyable {
             decl_namespace,
             owned_namespace
         );
-        self.store.resolve.bind_name(decl_namespace, declaration.name, declaration.domain, def_id, token.Span());
+        if (declaration.kind != .extension_def) {
+            self.store.resolve.bind_name(
+                decl_namespace,
+                declaration.name,
+                declaration.domain,
+                def_id,
+                token.Span()
+            );
+        }
         self.store.model.declare_def(def_id, self.model_decl_kind(declaration.kind));
-        self.add_owner_declaration(semantic_owner, def_id, declaration.kind);
+        if (declaration.kind != .extension_def) {
+            self.add_owner_declaration(semantic_owner, def_id, declaration.kind);
+            self.add_builtin_extension_module_declaration(
+                module_id,
+                semantic_owner,
+                def_id,
+                declaration.kind
+            );
+        }
         self.store.source_map.set_def_span(def_id, module_interface.source_id, token.Span());
-        self.bind_type_identity(def_id, declaration.kind);
+        self.bind_type_identity(def_id, declaration.kind, declaration.domain);
         self.record_interface_stable_key(module, module_interface, declaration, def_id);
         self.record_declaration_fingerprints(declaration);
         return def_id;
+    }
+
+    () load_extension_groups(
+        self,
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface
+    ) {
+        Int index! = 0;
+        while (index < module_interface.extension_groups.len()) {
+            artifact.InterfaceExtensionGroup& group =
+                module_interface.extension_groups.ref_at(index);
+            self.load_extension_group(module_id, module_interface, group);
+            index = index + 1;
+        }
+    }
+
+    () load_extension_group(
+        self,
+        qid.ModuleId module_id,
+        artifact.ModuleInterface& module_interface,
+        artifact.InterfaceExtensionGroup& group
+    ) {
+        guard self.current_def_for_interface_stable(group.target_owner)
+            is .some(target_owner) else {
+            self.store.model.mark_error();
+            return;
+        }
+        guard self.current_def_for_interface_stable(group.binding_owner)
+            is .some(binding_owner) else {
+            self.store.model.mark_error();
+            return;
+        }
+        Int extension_index = self.store.model.add_extension_group(
+            module_id,
+            target_owner,
+            binding_owner,
+            group.public_flag
+        );
+        self.load_extension_trait_ref(extension_index, target_owner, binding_owner, group);
+        self.load_extension_where_predicates(
+            extension_index,
+            binding_owner,
+            module_interface,
+            group
+        );
+        self.load_extension_constraints(extension_index, binding_owner, group);
+        self.load_extension_members(extension_index, group);
+    }
+
+    () load_extension_trait_ref(
+        self,
+        Int extension_index,
+        qid.DefId target_owner,
+        qid.DefId binding_owner,
+        artifact.InterfaceExtensionGroup& group
+    ) {
+        guard group.trait_ref is .some(ref _ encoded) else { return; }
+        sem.NodeId trait_ref = self.lower_interface_type_ref(binding_owner, encoded);
+        self.store.model.add_trait_ref(target_owner, trait_ref);
+        self.store.model.set_extension_trait_ref(extension_index, trait_ref);
+    }
+
+    () load_extension_where_predicates(
+        self,
+        Int extension_index,
+        qid.DefId binding_owner,
+        artifact.ModuleInterface& module_interface,
+        artifact.InterfaceExtensionGroup& group
+    ) {
+        Int index! = 0;
+        while (index < group.where_predicates.len()) {
+            self.store.model.add_extension_where_predicate(
+                extension_index,
+                self.lower_where_predicate(
+                    binding_owner,
+                    module_interface,
+                    group.where_predicates.ref_at(index)
+                )
+            );
+            index = index + 1;
+        }
+    }
+
+    () load_extension_constraints(
+        self,
+        Int extension_index,
+        qid.DefId binding_owner,
+        artifact.InterfaceExtensionGroup& group
+    ) {
+        Int index! = 0;
+        while (index < group.generic_constraints.len()) {
+            artifact.InterfaceExtensionConstraint& constraint =
+                group.generic_constraints.ref_at(index);
+            guard self.current_def_for_interface_stable(constraint.param_stable_id)
+                is .some(param_def) else {
+                self.store.model.mark_error();
+                index = index + 1;
+                continue;
+            }
+            self.store.model.add_extension_generic_constraint(
+                extension_index,
+                sem.ExtensionGenericConstraint (
+                    param_def: param_def,
+                    type_ref: self.lower_interface_type_ref(
+                        binding_owner,
+                        constraint.type_ref$.ref()
+                    )
+                )
+            );
+            index = index + 1;
+        }
+    }
+
+    () load_extension_members(
+        self,
+        Int extension_index,
+        artifact.InterfaceExtensionGroup& group
+    ) {
+        Int index! = 0;
+        while (index < group.members.len()) {
+            guard self.current_def_for_interface_stable(group.members.get(index))
+                is .some(member_def) else {
+                self.store.model.mark_error();
+                index = index + 1;
+                continue;
+            }
+            self.store.model.add_extension_member(extension_index, member_def);
+            index = index + 1;
+        }
     }
 
     () record_declaration_fingerprints(self, artifact.InterfaceDeclSummary declaration) {
@@ -231,6 +396,27 @@ public struct InterfaceLoader: Copyable {
             return;
         }
         self.store.model.add_member(owner, declaration);
+        if (kind == .deinit_def) {
+            // deinit 是 nominal 的语义属性，不是普通可见成员。接口命中时也要
+            // 恢复该关联，否则 drop 分类会把自定义析构类型误判为普通 aggregate。
+            self.store.model.mark_custom_deinit(owner, declaration);
+        }
+    }
+
+    () add_builtin_extension_module_declaration(
+        self,
+        qid.ModuleId module_id,
+        qid.DefId owner,
+        qid.DefId declaration,
+        def.DefKind kind
+    ) {
+        if (kind == .generic_param_def) { return; }
+        if (self.store.defs.get(owner).kind != .builtin_type_def) { return; }
+        // builtin type 不属于普通 module ownership tree。源码 lowering 会把
+        // extension 成员同时挂到声明 module；接口恢复也必须保持同一遍历入口，
+        // 否则恢复的泛型方法体不会进入 type check。
+        qid.DefId module_def = self.store.resolve.module_ref(module_id).def_id;
+        self.store.model.add_member(module_def, declaration);
     }
 
     () load_declaration_facts(self,
@@ -968,6 +1154,7 @@ public struct InterfaceLoader: Copyable {
         if (type_ref.kind_tag == 9) { return self.lower_trait_companion_interface_type_ref(owner_def, type_ref); }
         if (type_ref.kind_tag == 10) { return self.lower_const_interface_type_ref(owner_def, type_ref); }
         if (type_ref.kind_tag == 11) { return self.lower_effect_interface_type_ref(owner_def, type_ref); }
+        if (type_ref.kind_tag == 12) { return self.lower_self_interface_type_ref(owner_def, type_ref); }
         return self.store.model.add_node(owner_def, .invalid_type_ref());
     }
 
@@ -1031,10 +1218,10 @@ public struct InterfaceLoader: Copyable {
         }
         qkey.StableSymbolId stable_def = qkey.StableSymbolId(type_ref.stable_def_low, type_ref.stable_def_high);
         guard self.current_def_for_interface_stable(stable_def) is .some(trait_def) else {
-            self.add_interface_type_error(
+            self.add_unknown_stable_type_error(
                 owner_def,
-                "module interface refers to an unknown stable trait companion type",
-                "interface_type_ref_unknown_stable"
+                stable_def,
+                "module interface refers to an unknown stable trait companion type"
             );
             self.store.model.mark_error();
             return self.store.model.add_node(owner_def, .invalid_type_ref());
@@ -1043,6 +1230,34 @@ public struct InterfaceLoader: Copyable {
             trait_def: trait_def,
             kind: self.trait_companion_kind_from_int(type_ref.count_kind)
         )));
+    }
+
+    sem.NodeId lower_self_interface_type_ref(
+        self,
+        qid.DefId owner_def,
+        artifact.InterfaceTypeRef& type_ref
+    ) {
+        if (!type_ref.has_stable_def) {
+            self.add_interface_type_error(
+                owner_def,
+                "module interface Self type is missing a stable owner definition",
+                "interface_self_type_missing_stable"
+            );
+            self.store.model.mark_error();
+            return self.store.model.add_node(owner_def, .invalid_type_ref());
+        }
+        qkey.StableSymbolId stable_def =
+            qkey.StableSymbolId(type_ref.stable_def_low, type_ref.stable_def_high);
+        guard self.current_def_for_interface_stable(stable_def) is .some(self_def) else {
+            self.add_unknown_stable_type_error(
+                owner_def,
+                stable_def,
+                "module interface refers to an unknown Self owner definition"
+            );
+            self.store.model.mark_error();
+            return self.store.model.add_node(owner_def, .invalid_type_ref());
+        }
+        return self.store.model.add_node(owner_def, .self_type_ref(self_def));
     }
 
     sem.NodeId lower_named_interface_type_ref(self, qid.DefId owner_def, artifact.InterfaceTypeRef& type_ref) {
@@ -1057,10 +1272,10 @@ public struct InterfaceLoader: Copyable {
         }
         qkey.StableSymbolId stable_def = qkey.StableSymbolId(type_ref.stable_def_low, type_ref.stable_def_high);
         guard self.current_def_for_interface_stable(stable_def) is .some(def_id) else {
-            self.add_interface_type_error(
+            self.add_unknown_stable_type_error(
                 owner_def,
-                "module interface refers to an unknown stable type",
-                "interface_type_ref_unknown_stable"
+                stable_def,
+                "module interface refers to an unknown stable type"
             );
             self.store.model.mark_error();
             return self.store.model.add_node(owner_def, .invalid_type_ref());
@@ -1139,6 +1354,28 @@ public struct InterfaceLoader: Copyable {
         if (self.builtin_trait_def_for_stable(stable_id, "Sequence") is .some(def_id)) { return def_id; }
         if (self.builtin_trait_def_for_stable(stable_id, "Contiguous") is .some(def_id)) { return def_id; }
         return self.builtin_trait_def_for_stable(stable_id, "Domain");
+    }
+
+    () add_unknown_stable_type_error(
+        self,
+        qid.DefId owner_def,
+        qkey.StableSymbolId stable_id,
+        UInt8[]& description
+    ) {
+        std.StringBuilder message = std.StringBuilder();
+        message.append(description);
+        message.append(": ");
+        message.append(Int(stable_id.low));
+        message.append(":");
+        message.append(Int(stable_id.high));
+        if (self.store.incremental.has_stable(stable_id)) {
+            message.append(" (not loaded in this compilation)");
+        }
+        self.add_interface_type_error(
+            owner_def,
+            message.slice(),
+            "interface_type_ref_unknown_stable"
+        );
     }
 
     qid.DefId? builtin_type_def_for_stable(self, qkey.StableSymbolId stable_id, UInt8[]& name) {
@@ -1507,19 +1744,24 @@ public struct InterfaceLoader: Copyable {
         }
     }
 
-    () bind_type_identity(self, qid.DefId def_id, def.DefKind kind) {
-        if (!self.def_kind_has_type_identity(kind)) {
+    () bind_type_identity(
+        self,
+        qid.DefId def_id,
+        def.DefKind kind,
+        def.NameDomain domain
+    ) {
+        if (!self.def_kind_has_type_identity(kind, domain)) {
             return;
         }
         self.store.types.bind_named_type_def(def_id, self.store.types.named_type(def_id, token.Span()));
     }
 
-    Bool def_kind_has_type_identity(self, def.DefKind kind) {
+    Bool def_kind_has_type_identity(self, def.DefKind kind, def.NameDomain domain) {
         if (kind == .struct_def) { return true; }
         if (kind == .enum_def) { return true; }
         if (kind == .union_def) { return true; }
         if (kind == .trait_def) { return true; }
-        return kind == .generic_param_def;
+        return kind == .generic_param_def && domain == .type_name;
     }
 
     Bool def_kind_owns_namespace(self, def.DefKind kind) {
@@ -1530,6 +1772,7 @@ public struct InterfaceLoader: Copyable {
     }
 
     sem.DeclKind model_decl_kind(self, def.DefKind kind) {
+        if (kind == .extension_def) { return .extension_decl; }
         if (kind == .function_def) { return .function_decl; }
         if (kind == .init_def) { return .init_decl; }
         if (kind == .deinit_def) { return .deinit_decl; }

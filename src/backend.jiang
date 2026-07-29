@@ -5,24 +5,28 @@
 
 import context = "./context.jiang";
 import diagnostic_helper = "./diagnostic/helper.jiang";
+import build_state = "./artifact/build_state.jiang";
+import cache_identity = "./artifact/cache_identity.jiang";
 import cache = "./backend/cache.jiang";
 import codegen = "./backend/codegen.jiang";
+import debug_work_product = "./backend/debug_work_product.jiang";
 import link_plan = "./backend/link_plan.jiang";
 import linker = "./backend/linker.jiang";
 import object_output = "./backend/object_output.jiang";
 import validate = "./backend/validate.jiang";
-import object_plan = "./artifact/object_plan.jiang";
 import build_sdk = "./build/sdk.jiang";
 import driver_options = "./driver/options.jiang";
-import jil = "./jil.jiang";
+import qkey = "./incremental/key.jiang";
 import qid = "./id.jiang";
 import source = "./source.jiang";
+import jil = "./jil.jiang";
 import list = "./support/list.jiang";
 import string = "./support/string.jiang";
 import system_env = "./system/env.jiang";
 import system_fs = "./system/fs.jiang";
 import system_io = "./system/io.jiang";
 import system_target = "./system/target.jiang";
+import system_time = "./system/time.jiang";
 import std;
 
 public Bool validate_output_request(
@@ -35,12 +39,15 @@ public Bool validate_output_request(
 public codegen.BackendResult emit_package(
     context.CompilerContext& ctx,
     jil.Store& lowered,
-    driver_options.CompileOptions& options
+    driver_options.CompileOptions& options,
+    UInt8[]& artifact_cache_dir,
+    qkey.Fingerprint128 context_fingerprint,
+    UInt8[]& source_base
 ) {
     if (options.emit == .check_only) {
         return codegen.BackendResult(true);
     }
-    if (!cache.prepare_artifact_cache(ctx, options.emit, options.artifact_cache_dir)) {
+    if (!cache.prepare_artifact_cache(ctx, options.emit, artifact_cache_dir)) {
         return codegen.BackendResult(false);
     }
     system_target.TargetInfo& target_info = ctx.target$.ref();
@@ -50,6 +57,9 @@ public codegen.BackendResult emit_package(
         ctx,
         lowered,
         options,
+        artifact_cache_dir,
+        context_fingerprint,
+        source_base,
         llvm_triple,
         target_cache_key.bytes(),
         target_info,
@@ -70,29 +80,28 @@ public UInt8[]& default_target_triple_text() {
     return codegen.default_target_triple_text();
 }
 
-// 根据 emit kind 分发 backend 输出。executable/object 可以使用 object cache；
-// llvm-ir 是调试输出，直接消费最终 JIL。
+// 根据 emit kind 分发 backend 输出。executable 在 debug 下使用内部
+// work products；显式 object 与 llvm-ir 保持单文件输出契约。
 codegen.BackendResult emit_backend(
     context.CompilerContext& ctx,
     jil.Store& lowered,
     driver_options.CompileOptions& options,
+    UInt8[]& artifact_cache_dir,
+    qkey.Fingerprint128 context_fingerprint,
+    UInt8[]& source_base,
     UInt8[]& llvm_triple,
     UInt8[]& target_cache_key,
     system_target.TargetInfo& target_info,
     Bool link_libc
 ) {
     if (options.emit == .object_file) {
-        return object_output.emit_object_with_cache(
+        return object_output.emit_object(
             ctx,
             lowered,
             options.output_path,
-            options.artifact_cache_dir,
-            llvm_triple,
-            target_cache_key,
-            options.compiler_version,
-            options.compiler_build,
             options.mode,
-            link_libc
+            link_libc,
+            llvm_triple
         );
     }
     if (options.emit == .llvm_ir) {
@@ -111,6 +120,7 @@ codegen.BackendResult emit_backend(
             ctx,
             lowered,
             options,
+            artifact_cache_dir,
             llvm_triple,
             target_cache_key,
             target_info,
@@ -121,30 +131,24 @@ codegen.BackendResult emit_backend(
         return emit_release_executable(
             ctx,
             lowered,
-            options.output_path,
-            options.artifact_cache_dir,
+            options,
+            artifact_cache_dir,
+            context_fingerprint,
+            source_base,
             llvm_triple,
-            target_cache_key,
             target_info,
-            options.compiler_version,
-            options.compiler_build,
-            options.linker_path,
-            options.link_args$.ref(),
             link_libc
         );
     }
     return emit_debug_package_executable(
         ctx,
         lowered,
-        options.output_path,
-        options.artifact_cache_dir,
+        options,
+        artifact_cache_dir,
+        context_fingerprint,
+        source_base,
         llvm_triple,
-        target_cache_key,
         target_info,
-        options.compiler_version,
-        options.compiler_build,
-        options.linker_path,
-        options.link_args$.ref(),
         link_libc
     );
 }
@@ -152,78 +156,128 @@ codegen.BackendResult emit_backend(
 codegen.BackendResult emit_debug_package_executable(
     context.CompilerContext& ctx,
     jil.Store& lowered,
-    UInt8[]& output_path,
+    driver_options.CompileOptions& options,
     UInt8[]& artifact_cache_dir,
+    qkey.Fingerprint128 context_fingerprint,
+    UInt8[]& source_base,
     UInt8[]& llvm_triple,
-    UInt8[]& target_cache_key,
     system_target.TargetInfo& target_info,
-    UInt8[]& compiler_version,
-    UInt8[]& compiler_build,
-    UInt8[]& linker_path,
-    list.ArrayList<UInt8[]&>& link_args,
     Bool link_libc
 ) {
-    UInt8[]^ object_path = object_output.temporary_whole_package_object_path(
-        artifact_cache_dir,
-        driver_options.CompileMode.debug
-    );
-    codegen.BackendResult emitted = object_output.emit_whole_package_object(
+    debug_work_product.DebugWorkProducts products! = debug_work_product.prepare(
         ctx,
         lowered,
-        object_path[..],
-        driver_options.CompileMode.debug,
+        options,
+        artifact_cache_dir,
+        context_fingerprint,
+        source_base,
+        llvm_triple,
         link_libc,
-        llvm_triple
+        options.jil_stats
     );
-    if (emitted.has_errors()) { return emitted; }
-    link_plan.LinkPlan links! = link_plan.LinkPlan();
-    links.add_user_object(object_path[..]);
-    if (!append_runtime_objects(ctx, links$.ref(), target_info)) {
-        system_fs.remove_file(object_path[..]);
+    if (!products.ok) {
+        debug_work_product.publish_work_products(
+            artifact_cache_dir,
+            source_base,
+            products$.mut_ref()
+        );
+        return codegen.BackendResult(false);
+    }
+    debug_work_product.publish_work_products(
+        artifact_cache_dir,
+        source_base,
+        products$.mut_ref()
+    );
+    link_plan.LinkPlan&! links = products.links$.mut_ref();
+    if (!append_runtime_objects(ctx, links, target_info)) {
         return codegen.BackendResult(false);
     }
     ctx.store.object_artifacts.record_linked_objects(links.len());
     if (!validate_target_sdkroot(ctx, target_info)) {
-        system_fs.remove_file(object_path[..]);
         return codegen.BackendResult(false);
     }
-    guard linker_path_for_target(ctx, target_info, linker_path) is .some(effective_linker) else {
-        system_fs.remove_file(object_path[..]);
+    guard linker_path_for_target(ctx, target_info, options.linker_path) is .some(effective_linker) else {
         return codegen.BackendResult(false);
     }
+    UInt64 link_started = system_time.monotonic_time_ns();
     UInt8[]& effective_linker_text = effective_linker[..];
     linker.LinkResult result = linker.link_for_target(
-        links$.ref(),
+        links,
         target_info,
         effective_linker_text,
-        output_path,
-        link_args
+        options.output_path,
+        options.link_args$.ref()
     );
-    system_fs.remove_file(object_path[..]);
     if (!result.ok) {
         diagnostic_helper.add_package_error(
             ctx,
-            linker.failure_message(result, effective_linker_text, output_path, links$.ref()),
+            linker.failure_message(result, effective_linker_text, options.output_path, links),
             "linker_execution_failed"
         );
+        return codegen.BackendResult(false);
     }
-    return codegen.BackendResult(result.ok);
+    UInt64 link_ns = elapsed_if_enabled(options.jil_stats, link_started);
+    UInt64 publish_started = system_time.monotonic_time_ns();
+    debug_work_product.publish_success(
+        ctx,
+        artifact_cache_dir,
+        options.output_path,
+        source_base,
+        products$.mut_ref()
+    );
+    if (options.jil_stats) {
+        print_debug_timing(
+            products.timing,
+            link_ns,
+            elapsed_if_enabled(true, publish_started)
+        );
+    }
+    return codegen.BackendResult(true);
+}
+
+UInt64 elapsed_if_enabled(Bool enabled, UInt64 started) {
+    if (!enabled) { return UInt64(0); }
+    UInt64 finished = system_time.monotonic_time_ns();
+    if (finished < started) { return UInt64(0); }
+    return finished - started;
+}
+
+() print_debug_timing(
+    debug_work_product.DebugTiming timing,
+    UInt64 link_ns,
+    UInt64 publish_ns
+) {
+    std.StringBuilder builder = std.StringBuilder();
+    builder.append("backend_state_ms=");
+    builder.append(timing.state_ns / UInt64(1000000));
+    builder.append(" backend_prepare_store_ms=");
+    builder.append(timing.prepare_store_ns / UInt64(1000000));
+    builder.append(" backend_plan_ms=");
+    builder.append(timing.plan_ns / UInt64(1000000));
+    builder.append(" backend_units_ms=");
+    builder.append(timing.units_ns / UInt64(1000000));
+    builder.append(" backend_link_ms=");
+    builder.append(link_ns / UInt64(1000000));
+    builder.append(" backend_publish_ms=");
+    builder.append(publish_ns / UInt64(1000000));
+    system_fs.File error_output = system_io.stderr();
+    error_output.write_all(builder.slice());
+    error_output.write_all("\n");
 }
 
 codegen.BackendResult emit_release_executable(
     context.CompilerContext& ctx,
     jil.Store& lowered,
-    UInt8[]& output_path,
+    driver_options.CompileOptions& options,
     UInt8[]& artifact_cache_dir,
+    qkey.Fingerprint128 context_fingerprint,
+    UInt8[]& source_base,
     UInt8[]& llvm_triple,
-    UInt8[]& target_cache_key,
     system_target.TargetInfo& target_info,
-    UInt8[]& compiler_version,
-    UInt8[]& compiler_build,
-    UInt8[]& linker_path,
-    list.ArrayList<UInt8[]&>& link_args,
     Bool link_libc
 ) {
+    qkey.Fingerprint128? input_source_snapshot =
+        source_stat_snapshot(ctx, source_base, artifact_cache_dir);
     UInt8[]^ object_path = object_output.temporary_whole_package_object_path(
         artifact_cache_dir,
         driver_options.CompileMode.release
@@ -248,7 +302,7 @@ codegen.BackendResult emit_release_executable(
         system_fs.remove_file(object_path[..]);
         return codegen.BackendResult(false);
     }
-    guard linker_path_for_target(ctx, target_info, linker_path) is .some(effective_linker) else {
+    guard linker_path_for_target(ctx, target_info, options.linker_path) is .some(effective_linker) else {
         system_fs.remove_file(object_path[..]);
         return codegen.BackendResult(false);
     }
@@ -257,24 +311,34 @@ codegen.BackendResult emit_release_executable(
         links$.ref(),
         target_info,
         effective_linker_text,
-        output_path,
-        link_args
+        options.output_path,
+        options.link_args$.ref()
     );
     system_fs.remove_file(object_path[..]);
     if (!result.ok) {
         diagnostic_helper.add_package_error(
             ctx,
-            linker.failure_message(result, effective_linker_text, output_path, links$.ref()),
+            linker.failure_message(result, effective_linker_text, options.output_path, links$.ref()),
             "linker_execution_failed"
         );
+        return codegen.BackendResult(false);
     }
-    return codegen.BackendResult(result.ok);
+    publish_last_success(
+        ctx,
+        options,
+        artifact_cache_dir,
+        context_fingerprint,
+        source_base,
+        input_source_snapshot
+    );
+    return codegen.BackendResult(true);
 }
 
 codegen.BackendResult emit_dynamic_library(
     context.CompilerContext& ctx,
     jil.Store& lowered,
     driver_options.CompileOptions& options,
+    UInt8[]& artifact_cache_dir,
     UInt8[]& llvm_triple,
     UInt8[]& target_cache_key,
     system_target.TargetInfo& target_info,
@@ -284,6 +348,7 @@ codegen.BackendResult emit_dynamic_library(
         ctx,
         lowered,
         options,
+        artifact_cache_dir,
         llvm_triple,
         target_info,
         link_libc
@@ -294,12 +359,13 @@ codegen.BackendResult emit_whole_package_dynamic_library(
     context.CompilerContext& ctx,
     jil.Store& lowered,
     driver_options.CompileOptions& options,
+    UInt8[]& artifact_cache_dir,
     UInt8[]& llvm_triple,
     system_target.TargetInfo& target_info,
     Bool link_libc
 ) {
     UInt8[]^ object_path = object_output.temporary_whole_package_object_path(
-        options.artifact_cache_dir,
+        artifact_cache_dir,
         options.mode
     );
     codegen.BackendResult emitted = object_output.emit_whole_package_object(
@@ -338,6 +404,79 @@ codegen.BackendResult emit_whole_package_dynamic_library(
     return codegen.BackendResult(result.ok);
 }
 
+() publish_last_success(
+    context.CompilerContext& ctx,
+    driver_options.CompileOptions& options,
+    UInt8[]& context_root,
+    qkey.Fingerprint128 context_fingerprint,
+    UInt8[]& source_base,
+    qkey.Fingerprint128? input_source_snapshot
+) {
+    guard input_source_snapshot is .some(expected_snapshot) else { return; }
+    qkey.Fingerprint128 target_identity =
+        cache_identity.build_target_identity(options.input_path);
+    qkey.Fingerprint128 invocation = cache_identity.build_invocation_fingerprint(
+        options.output_path,
+        options.linker_path,
+        options.link_args$.ref()
+    );
+    build_state.BuildState state! = build_state.BuildState(context_fingerprint, invocation);
+    add_reachable_sources(ctx, state$.mut_ref(), source_base, context_root);
+    guard build_state.source_snapshot_from_files(
+        state$.ref(),
+        source_base
+    ) is .some(snapshot) else {
+        return;
+    }
+    if (snapshot != expected_snapshot) { return; }
+    guard system_fs.file_metadata(options.output_path) is .some(metadata) else { return; }
+    if (metadata.size < 0) { return; }
+    state.set_last_success(
+        snapshot,
+        metadata.modified_ns,
+        UInt64(metadata.size),
+        // 最终可执行文件只按本轮发布的元数据命中；被外部改动后保守重链。
+        qkey.Fingerprint128()
+    );
+    build_state.publish(context_root, target_identity, state$.ref());
+}
+
+qkey.Fingerprint128? source_stat_snapshot(
+    context.CompilerContext& ctx,
+    UInt8[]& source_base,
+    UInt8[]& context_root
+) {
+    build_state.BuildState state! = build_state.BuildState(
+        qkey.Fingerprint128(),
+        qkey.Fingerprint128()
+    );
+    add_reachable_sources(ctx, state$.mut_ref(), source_base, context_root);
+    return build_state.source_snapshot_from_files(state$.ref(), source_base);
+}
+
+() add_reachable_sources(
+    context.CompilerContext& ctx,
+    build_state.BuildState&! state,
+    UInt8[]& source_base,
+    UInt8[]& context_root
+) {
+    Int index! = 0;
+    while (index < ctx.store.resolve.modules.len()) {
+        qid.ModuleId module_id = qid.ModuleId.from_index(index);
+        source.SourceId source_id = ctx.store.resolve.module_ref(module_id).source_id;
+        source.SourceRecord record = ctx.store.sources.get(source_id);
+        if (record.key.kind == .file) {
+            if (cache_identity.path_is_within(record.key.value, context_root)) {
+                index = index + 1;
+                continue;
+            }
+            UInt8[]^ relative = cache_identity.relative_path(source_base, record.key.value);
+            state.add_reachable_source(relative[..]);
+        }
+        index = index + 1;
+    }
+}
+
 Bool append_runtime_objects(
     context.CompilerContext& ctx,
     link_plan.LinkPlan& links,
@@ -360,35 +499,6 @@ Bool append_runtime_objects(
         return false;
     }
     links.add_runtime_object(runtime_object);
-    return true;
-}
-
-Bool append_interface_objects(
-    context.CompilerContext& ctx,
-    link_plan.LinkPlan& links,
-    object_plan.ObjectReusePlan& objects
-) {
-    Int index! = 0;
-    while (index < ctx.store.resolve.modules.len()) {
-        qid.ModuleId module_id = qid.ModuleId.from_index(index);
-        source.SourceId source_id = ctx.store.resolve.module_ref(module_id).source_id;
-        if (ctx.store.artifacts.load_interface(source_id) is .some(module_interface)) {
-            if (!links.add_interface_objects(
-                objects.cache_root.bytes(),
-                module_interface,
-                objects.index_context,
-                objects
-            )) {
-                diagnostic_helper.add_package_error(
-                    ctx,
-                    "validated dependency object closure became stale",
-                    "dependency_object_closure_stale"
-                );
-                return false;
-            }
-        }
-        index = index + 1;
-    }
     return true;
 }
 

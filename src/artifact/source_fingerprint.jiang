@@ -98,11 +98,12 @@ public source_artifact.ImportSummary? decode_import_summary_section(
     UInt8[]& bytes
 ) {
     SourceSectionReader reader! = SourceSectionReader(bytes);
-    if (!reader.read_magic("jiang.import-summary.v1")) {
+    if (!reader.read_magic("jiang.import-summary.v2")) {
         return null;
     }
     guard reader.read_uint64() is .some(source_hash) else { return null; }
     guard reader.read_int() is .some(source_revision) else { return null; }
+    guard reader.read_fingerprint() is .some(import_context_fingerprint) else { return null; }
     guard reader.read_symbol(ctx) is .some(package_name) else { return null; }
     guard reader.read_symbol(ctx) is .some(module_path) else { return null; }
     guard reader.read_symbol(ctx) is .some(source_path) else { return null; }
@@ -113,7 +114,8 @@ public source_artifact.ImportSummary? decode_import_summary_section(
         source_revision,
         package_name,
         module_path,
-        source_path
+        source_path,
+        import_context_fingerprint
     );
     if (!read_import_entries(ctx, reader$.ref(), summary$.ref())) { return null; }
     if (!read_alias_entries(ctx, reader$.ref(), summary$.ref())) { return null; }
@@ -125,10 +127,12 @@ public source_artifact.ModuleInterface? decode_module_interface_section(
     context.CompilerContext& ctx,
     source.SourceId source_id,
     UInt64 source_hash,
-    UInt8[]& bytes
+    UInt8[]& bytes,
+    qkey.Fingerprint128? interface_hash = null,
+    qkey.Fingerprint128? public_interface_hash = null
 ) {
     SourceSectionReader reader! = SourceSectionReader(bytes);
-    if (!reader.read_magic("jiang.interface.v10")) {
+    if (!reader.read_magic("jiang.interface.v13")) {
         return null;
     }
     guard reader.read_symbol(ctx) is .some(package_name) else { return null; }
@@ -143,8 +147,20 @@ public source_artifact.ModuleInterface? decode_module_interface_section(
     if (!read_interface_declarations(ctx, reader$.ref(), module_interface$.ref())) { return null; }
     if (!read_interface_imports(ctx, reader$.ref(), module_interface$.ref())) { return null; }
     if (!read_interface_aliases(ctx, reader$.ref(), module_interface$.ref())) { return null; }
+    if (!read_extension_groups(ctx, reader$.ref(), module_interface$.ref())) { return null; }
     if (!reader.finished()) { return null; }
-    module_interface.interface_hash = module_interface_fingerprint(ctx, module_interface$.ref());
+    if (interface_hash is .some(cached) && cached != qkey.Fingerprint128()) {
+        module_interface.interface_hash = cached;
+    } else {
+        module_interface.interface_hash =
+            module_interface_fingerprint(ctx, module_interface$.ref());
+    }
+    if (public_interface_hash is .some(cached) && cached != qkey.Fingerprint128()) {
+        module_interface.public_interface_hash = cached;
+    } else {
+        module_interface.public_interface_hash =
+            module_public_interface_fingerprint(ctx, module_interface$.ref());
+    }
     return module_interface;
 }
 
@@ -172,8 +188,32 @@ public qkey.Fingerprint128 module_interface_fingerprint(
     context.CompilerContext& ctx,
     source_artifact.ModuleInterface& module_interface
 ) {
-    SourceSectionImage image = encode_module_interface_section(ctx, module_interface);
-    return image.fingerprint;
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    SourceSectionWriter writer! = SourceSectionWriter(bytes$.ref());
+    writer.write_bytes("jiang.package-interface.v1");
+    write_symbol_text(ctx, writer$.ref(), module_interface.package_name);
+    write_symbol_text(ctx, writer$.ref(), module_interface.module_path);
+    write_package_surface_declarations(ctx, writer$.ref(), module_interface);
+    write_public_imports(ctx, writer$.ref(), module_interface);
+    write_public_aliases(ctx, writer$.ref(), module_interface);
+    write_extension_groups(ctx, writer$.ref(), module_interface, false);
+    return writer.finish();
+}
+
+public qkey.Fingerprint128 module_public_interface_fingerprint(
+    context.CompilerContext& ctx,
+    source_artifact.ModuleInterface& module_interface
+) {
+    list.ArrayList<UInt8> bytes! = list.ArrayList<UInt8>();
+    SourceSectionWriter writer! = SourceSectionWriter(bytes$.ref());
+    writer.write_bytes("jiang.public-interface.v1");
+    write_symbol_text(ctx, writer$.ref(), module_interface.package_name);
+    write_symbol_text(ctx, writer$.ref(), module_interface.module_path);
+    write_public_surface_declarations(ctx, writer$.ref(), module_interface);
+    write_public_imports(ctx, writer$.ref(), module_interface);
+    write_public_aliases(ctx, writer$.ref(), module_interface);
+    write_extension_groups(ctx, writer$.ref(), module_interface, true);
+    return writer.finish();
 }
 
 @region(a)
@@ -375,12 +415,14 @@ source_artifact.ImportSummaryEntry? read_import_entry(
     guard reader.read_int() is .some(flatten_value) else { return null; }
     guard reader.read_symbol(ctx) is .some(path_symbol) else { return null; }
     qid.SymbolId? alias_symbol = reader.read_optional_symbol(ctx);
+    qkey.Fingerprint128? target_source_identity = reader.read_optional_fingerprint();
     return source_artifact.ImportSummaryEntry(
         import_kind_from_int(kind_value),
         visibility_from_int(visibility_value),
         flatten_value != 0,
         path_symbol,
-        alias_symbol
+        alias_symbol,
+        target_source_identity
     );
 }
 
@@ -527,24 +569,35 @@ Bool read_where_predicate(
     source_artifact.ModuleInterface& module_interface,
     qkey.StableSymbolId stable_id
 ) {
-    guard reader.read_int() is .some(kind_value) else { return false; }
-    guard read_type_ref(ctx, reader) is .some(subject) else { return false; }
-    guard read_type_ref(ctx, reader) is .some(bound_or_value) else { return false; }
-    guard read_type_ref(ctx, reader) is .some(trait_ref) else { return false; }
+    guard read_where_predicate_value(ctx, reader, module_interface)
+        is .some(predicate) else {
+        return false;
+    }
+    module_interface.add_where_predicate(stable_id, predicate);
+    return true;
+}
+
+source_artifact.InterfaceWherePredicate? read_where_predicate_value(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_int() is .some(kind_value) else { return null; }
+    guard read_type_ref(ctx, reader) is .some(subject) else { return null; }
+    guard read_type_ref(ctx, reader) is .some(bound_or_value) else { return null; }
+    guard read_type_ref(ctx, reader) is .some(trait_ref) else { return null; }
     qid.SymbolId? assoc_symbol = reader.read_optional_symbol(ctx);
     source_artifact.InterfaceWherePredicateKind kind = where_predicate_kind_from_int(kind_value);
     if (kind == .projection_equal && assoc_symbol == null) {
-        return false;
+        return null;
     }
-    module_interface.add_where_predicate_parts(
-        stable_id,
-        kind,
-        subject,
-        bound_or_value,
-        trait_ref,
-        assoc_symbol
-    );
-    return true;
+    source_artifact.InterfaceWherePredicate predicate! =
+        source_artifact.InterfaceWherePredicate(kind);
+    predicate.subject_index = module_interface.add_where_type_ref(subject);
+    predicate.bound_or_value_index = module_interface.add_where_type_ref(bound_or_value);
+    predicate.trait_ref_index = module_interface.add_where_type_ref(trait_ref);
+    predicate.assoc_symbol = assoc_symbol;
+    return predicate;
 }
 
 Bool read_lifetime_constraints(
@@ -1028,6 +1081,98 @@ Bool read_interface_aliases(
     return true;
 }
 
+Bool read_extension_groups(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_int() is .some(count) else { return false; }
+    Int index! = 0;
+    while (index < count) {
+        guard read_extension_group(ctx, reader, module_interface) is .some(group) else {
+            return false;
+        }
+        module_interface.add_extension_group(group);
+        index = index + 1;
+    }
+    return true;
+}
+
+source_artifact.InterfaceExtensionGroup? read_extension_group(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface
+) {
+    guard reader.read_stable_id() is .some(target_owner) else { return null; }
+    guard reader.read_stable_id() is .some(binding_owner) else { return null; }
+    guard reader.read_bool() is .some(public_flag) else { return null; }
+    source_artifact.InterfaceExtensionGroup group! =
+        source_artifact.InterfaceExtensionGroup(target_owner, binding_owner, public_flag);
+    guard reader.read_bool() is .some(has_trait_ref) else { return null; }
+    if (has_trait_ref) {
+        guard read_type_ref(ctx, reader) is .some(trait_ref) else { return null; }
+        group.trait_ref = trait_ref;
+    }
+    if (!read_extension_where_predicates(ctx, reader, module_interface, group$.ref())) {
+        return null;
+    }
+    if (!read_extension_constraints(ctx, reader, group$.ref())) { return null; }
+    if (!read_extension_members(reader, group$.ref())) { return null; }
+    return group;
+}
+
+Bool read_extension_where_predicates(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceExtensionGroup& group
+) {
+    guard reader.read_int() is .some(count) else { return false; }
+    Int index! = 0;
+    while (index < count) {
+        guard read_where_predicate_value(ctx, reader, module_interface)
+            is .some(predicate) else {
+            return false;
+        }
+        group.where_predicates.add(predicate);
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_extension_constraints(
+    context.CompilerContext& ctx,
+    SourceSectionReader& reader,
+    source_artifact.InterfaceExtensionGroup& group
+) {
+    guard reader.read_int() is .some(count) else { return false; }
+    Int index! = 0;
+    while (index < count) {
+        guard reader.read_stable_id() is .some(param_stable_id) else { return false; }
+        guard read_type_ref(ctx, reader) is .some(type_ref) else { return false; }
+        group.generic_constraints.add(source_artifact.InterfaceExtensionConstraint(
+            param_stable_id,
+            type_ref
+        ));
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_extension_members(
+    SourceSectionReader& reader,
+    source_artifact.InterfaceExtensionGroup& group
+) {
+    guard reader.read_int() is .some(count) else { return false; }
+    Int index! = 0;
+    while (index < count) {
+        guard reader.read_stable_id() is .some(member) else { return false; }
+        group.members.add(member);
+        index = index + 1;
+    }
+    return true;
+}
+
 store.ImportKind import_kind_from_int(Int value) {
     store.ImportKind package_import = .package_import;
     store.ImportKind module_import = .module_import;
@@ -1149,9 +1294,10 @@ source_artifact.InterfaceLiteralKind literal_kind_from_int(Int value) {
     SourceSectionWriter& writer,
     source_artifact.ImportSummary& summary
 ) {
-    writer.write_bytes("jiang.import-summary.v1");
+    writer.write_bytes("jiang.import-summary.v2");
     writer.write_uint64(summary.source_hash);
     writer.write_int(summary.source_revision);
+    write_fingerprint(writer, summary.import_context_fingerprint);
     write_symbol_text(ctx, writer, summary.package_name);
     write_symbol_text(ctx, writer, summary.module_path);
     write_symbol_text(ctx, writer, summary.source_path);
@@ -1164,12 +1310,13 @@ source_artifact.InterfaceLiteralKind literal_kind_from_int(Int value) {
     SourceSectionWriter& writer,
     source_artifact.ModuleInterface& module_interface
 ) {
-    writer.write_bytes("jiang.interface.v10");
+    writer.write_bytes("jiang.interface.v13");
     write_symbol_text(ctx, writer, module_interface.package_name);
     write_symbol_text(ctx, writer, module_interface.module_path);
     write_declarations(ctx, writer, module_interface);
     write_public_imports(ctx, writer, module_interface);
     write_public_aliases(ctx, writer, module_interface);
+    write_extension_groups(ctx, writer, module_interface, false);
 }
 
 () write_generic_templates(
@@ -1215,16 +1362,93 @@ Bool read_generic_template(
     Int index! = 0;
     while (index < module_interface.declarations.len()) {
         source_artifact.InterfaceDeclSummary decl = module_interface.declarations.get(indexes.get(index));
-        write_declaration(ctx, writer, module_interface, decl);
+        write_declaration(ctx, writer, module_interface, decl, true);
         index = index + 1;
     }
+}
+
+() write_package_surface_declarations(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface
+) {
+    list.ArrayList<Int> indexes = sorted_declaration_indexes(module_interface);
+    writer.write_int(indexes.len());
+    Int index! = 0;
+    while (index < indexes.len()) {
+        source_artifact.InterfaceDeclSummary decl = module_interface.declarations.get(indexes.get(index));
+        write_declaration(ctx, writer, module_interface, decl, false);
+        index = index + 1;
+    }
+}
+
+() write_public_surface_declarations(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface
+) {
+    list.ArrayList<Int> indexes = sorted_declaration_indexes(module_interface);
+    writer.write_int(public_surface_declaration_count(module_interface));
+    Int index! = 0;
+    while (index < indexes.len()) {
+        source_artifact.InterfaceDeclSummary decl = module_interface.declarations.get(indexes.get(index));
+        if (declaration_is_public_surface(module_interface, decl)) {
+            write_declaration(ctx, writer, module_interface, decl, false);
+        }
+        index = index + 1;
+    }
+}
+
+Int public_surface_declaration_count(source_artifact.ModuleInterface& module_interface) {
+    Int count! = 0;
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        if (declaration_is_public_surface(
+            module_interface,
+            module_interface.declarations.get(index)
+        )) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
+}
+
+Bool declaration_is_public_surface(
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceDeclSummary declaration
+) {
+    source_artifact.InterfaceDeclSummary current! = declaration;
+    Int depth! = 0;
+    while (current.owner is .some(owner) && depth < module_interface.declarations.len()) {
+        guard declaration_with_id(module_interface, owner) is .some(parent) else {
+            return false;
+        }
+        current = parent;
+        depth = depth + 1;
+    }
+    return current.visibility == .public_visibility;
+}
+
+source_artifact.InterfaceDeclSummary? declaration_with_id(
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId stable_id
+) {
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        source_artifact.InterfaceDeclSummary declaration = module_interface.declarations.get(index);
+        if (declaration.stable_id == stable_id) { return declaration; }
+        index = index + 1;
+    }
+    return null;
 }
 
 () write_declaration(
     context.CompilerContext& ctx,
     SourceSectionWriter& writer,
     source_artifact.ModuleInterface& module_interface,
-    source_artifact.InterfaceDeclSummary decl
+    source_artifact.InterfaceDeclSummary decl,
+    Bool persist_body_fingerprint
 ) {
     write_stable_id(writer, decl.stable_id);
     writer.write_int(Int(decl.kind));
@@ -1234,7 +1458,10 @@ Bool read_generic_template(
     write_optional_stable_id(writer, decl.owner);
     write_optional_fingerprint(writer, decl.disambiguator);
     write_fingerprint(writer, decl.signature_fingerprint);
-    write_fingerprint(writer, decl.body_fingerprint);
+    write_fingerprint(
+        writer,
+        declaration_body_fingerprint(module_interface, decl, persist_body_fingerprint)
+    );
     writer.write_bool(decl.mutable_binding);
     writer.write_bool(decl.is_const);
     writer.write_bool(decl.is_external);
@@ -1252,6 +1479,79 @@ Bool read_generic_template(
     write_function_signature(ctx, writer, module_interface, decl.stable_id);
     write_field_default(writer, module_interface, decl.stable_id);
     write_const_value(ctx, writer, module_interface, decl.stable_id);
+}
+
+qkey.Fingerprint128 declaration_body_fingerprint(
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceDeclSummary declaration,
+    Bool persist_all
+) {
+    if (persist_all || declaration.inline_mode != 0) {
+        return declaration.body_fingerprint;
+    }
+    if (declaration_has_generic_parameters(module_interface, declaration)) {
+        return declaration.body_fingerprint;
+    }
+    if (declaration_is_trait_member(module_interface, declaration)) {
+        // trait 默认实现会在调用方实例化；即使方法没有显式泛型参数，
+        // body 变化也属于调用方可见 interface 变化。
+        return declaration.body_fingerprint;
+    }
+    return qkey.Fingerprint128();
+}
+
+Bool declaration_is_trait_member(
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceDeclSummary declaration
+) {
+    guard declaration.owner is .some(owner) else { return false; }
+    guard declaration_with_id(module_interface, owner) is .some(parent) else { return false; }
+    return parent.kind == .trait_def;
+}
+
+Bool declaration_has_generic_parameters(
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceDeclSummary declaration
+) {
+    source_artifact.InterfaceDeclSummary current! = declaration;
+    Int depth! = 0;
+    while (depth < module_interface.declarations.len()) {
+        if (declaration_owns_generic_parameter(module_interface, current.stable_id)) {
+            return true;
+        }
+        guard current.owner is .some(owner) else { return false; }
+        guard declaration_with_id(module_interface, owner) is .some(parent) else {
+            return false;
+        }
+        current = parent;
+        depth = depth + 1;
+    }
+    return false;
+}
+
+Bool declaration_owns_generic_parameter(
+    source_artifact.ModuleInterface& module_interface,
+    qkey.StableSymbolId owner
+) {
+    Int index! = 0;
+    while (index < module_interface.declarations.len()) {
+        source_artifact.InterfaceDeclSummary candidate =
+            module_interface.declarations.get(index);
+        if (candidate.kind == .generic_param_def
+            && declaration_owner_matches(candidate, owner)) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Bool declaration_owner_matches(
+    source_artifact.InterfaceDeclSummary declaration,
+    qkey.StableSymbolId owner
+) {
+    guard declaration.owner is .some(candidate) else { return false; }
+    return candidate == owner;
 }
 
 () write_field_default(
@@ -1788,6 +2088,7 @@ source_artifact.InterfaceConstValueKind interface_const_value_kind(source_artifa
     }
     write_symbol_text(ctx, writer, entry.path_symbol);
     write_optional_symbol_text(ctx, writer, entry.alias_symbol);
+    write_optional_fingerprint(writer, entry.target_source_identity);
 }
 
 () write_public_aliases(
@@ -1802,6 +2103,81 @@ source_artifact.InterfaceConstValueKind interface_const_value_kind(source_artifa
         source_artifact.AliasExportSummary alias_export = module_interface.public_aliases.get(indexes.get(index));
         write_symbol_text(ctx, writer, alias_export.alias_symbol);
         write_stable_id(writer, alias_export.target_stable_id);
+        index = index + 1;
+    }
+}
+
+() write_extension_groups(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    Bool public_only
+) {
+    writer.write_int(extension_group_count(module_interface, public_only));
+    Int index! = 0;
+    while (index < module_interface.extension_groups.len()) {
+        source_artifact.InterfaceExtensionGroup& group =
+            module_interface.extension_groups.ref_at(index);
+        if (!public_only || group.public_flag) {
+            write_extension_group(ctx, writer, module_interface, group);
+        }
+        index = index + 1;
+    }
+}
+
+Int extension_group_count(
+    source_artifact.ModuleInterface& module_interface,
+    Bool public_only
+) {
+    if (!public_only) { return module_interface.extension_groups.len(); }
+    Int count! = 0;
+    Int index! = 0;
+    while (index < module_interface.extension_groups.len()) {
+        if (module_interface.extension_groups.ref_at(index).public_flag) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
+}
+
+() write_extension_group(
+    context.CompilerContext& ctx,
+    SourceSectionWriter& writer,
+    source_artifact.ModuleInterface& module_interface,
+    source_artifact.InterfaceExtensionGroup& group
+) {
+    write_stable_id(writer, group.target_owner);
+    write_stable_id(writer, group.binding_owner);
+    writer.write_bool(group.public_flag);
+    writer.write_bool(group.trait_ref != null);
+    if (group.trait_ref is .some(ref _ trait_ref)) {
+        write_type_ref(writer, trait_ref);
+    }
+    writer.write_int(group.where_predicates.len());
+    Int index! = 0;
+    while (index < group.where_predicates.len()) {
+        write_where_predicate(
+            ctx,
+            writer,
+            module_interface,
+            group.where_predicates.ref_at(index)
+        );
+        index = index + 1;
+    }
+    writer.write_int(group.generic_constraints.len());
+    index = 0;
+    while (index < group.generic_constraints.len()) {
+        source_artifact.InterfaceExtensionConstraint& constraint =
+            group.generic_constraints.ref_at(index);
+        write_stable_id(writer, constraint.param_stable_id);
+        write_type_ref(writer, constraint.type_ref$.ref());
+        index = index + 1;
+    }
+    writer.write_int(group.members.len());
+    index = 0;
+    while (index < group.members.len()) {
+        write_stable_id(writer, group.members.get(index));
         index = index + 1;
     }
 }

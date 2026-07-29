@@ -1,0 +1,512 @@
+// `.jbuild` 保存单个 build target 的本地构建状态。
+//
+// 这里仅记录快速 no-op 所需的上次成功快照，以及 debug codegen 的粗粒度
+// work products。语义 interface 始终属于 `.ji`，会话内 ID 和 object 路径
+// 不进入该格式。
+
+import artifact_path = "./path.jiang";
+import cache_identity = "./cache_identity.jiang";
+import object_hash = "./object_hash.jiang";
+import object_key = "./object_key.jiang";
+import qkey = "../incremental/key.jiang";
+import system_fs = "../system/fs.jiang";
+import list = "../support/list.jiang";
+import std;
+
+public const Int format_version = 2;
+
+public enum WorkProductKind {
+    source_unit,
+    monomorph_unit,
+}
+
+public struct WorkProduct: Copyable {
+    public qkey.Fingerprint128 source_identity;
+    public WorkProductKind kind;
+    public qkey.Fingerprint128 input_fingerprint;
+    public qkey.Fingerprint128 object_hash;
+    public UInt64 object_modified_ns;
+    public UInt64 object_size;
+
+    public init(self,
+        qkey.Fingerprint128 source_identity,
+        WorkProductKind kind,
+        qkey.Fingerprint128 input_fingerprint,
+        qkey.Fingerprint128 object_hash
+    ) {
+        self = WorkProduct(
+            source_identity,
+            kind,
+            input_fingerprint,
+            object_hash,
+            UInt64(0),
+            UInt64(0)
+        );
+    }
+
+    public init(self,
+        qkey.Fingerprint128 source_identity,
+        WorkProductKind kind,
+        qkey.Fingerprint128 input_fingerprint,
+        qkey.Fingerprint128 object_hash,
+        UInt64 object_modified_ns,
+        UInt64 object_size
+    ) {
+        self.source_identity = source_identity;
+        self.kind = kind;
+        self.input_fingerprint = input_fingerprint;
+        self.object_hash = object_hash;
+        self.object_modified_ns = object_modified_ns;
+        self.object_size = object_size;
+    }
+}
+
+public struct BuildState: Movable {
+    public qkey.Fingerprint128 context;
+    public qkey.Fingerprint128 invocation;
+    public Bool has_last_success!;
+    public qkey.Fingerprint128 source_snapshot!;
+    public UInt64 output_modified_ns!;
+    public UInt64 output_size!;
+    public qkey.Fingerprint128 output_fingerprint!;
+    list.ArrayList<std.String> reachable_sources;
+    list.ArrayList<WorkProduct> work_products;
+
+    public init(self,
+        qkey.Fingerprint128 context,
+        qkey.Fingerprint128 invocation
+    ) {
+        self.context = context;
+        self.invocation = invocation;
+        self.has_last_success = false;
+        self.source_snapshot = qkey.Fingerprint128();
+        self.output_modified_ns = UInt64(0);
+        self.output_size = UInt64(0);
+        self.output_fingerprint = qkey.Fingerprint128();
+        self.reachable_sources = list.ArrayList<std.String>();
+        self.work_products = list.ArrayList<WorkProduct>();
+    }
+
+    public () set_last_success(self,
+        qkey.Fingerprint128 source_snapshot,
+        UInt64 output_modified_ns,
+        UInt64 output_size,
+        qkey.Fingerprint128 output_fingerprint
+    ) {
+        self.has_last_success = true;
+        self.source_snapshot = source_snapshot;
+        self.output_modified_ns = output_modified_ns;
+        self.output_size = output_size;
+        self.output_fingerprint = output_fingerprint;
+    }
+
+    public () add_reachable_source(self, UInt8[]& relative_path) {
+        self.reachable_sources.add(std.String(relative_path));
+    }
+
+    public Int reachable_source_count(self) {
+        return self.reachable_sources.len();
+    }
+
+    public UInt8[]& reachable_source_at(self, Int index) {
+        return self.reachable_sources.ref_at(index).bytes();
+    }
+
+    public Int work_product_count(self) {
+        return self.work_products.len();
+    }
+
+    public WorkProduct work_product_at(self, Int index) {
+        return self.work_products.get(index);
+    }
+
+    public () upsert_work_product(self, WorkProduct product) {
+        Int index! = 0;
+        while (index < self.work_products.len()) {
+            WorkProduct current = self.work_products.get(index);
+            if (same_work_product_slot(current, product)) {
+                self.work_products.set(index, product);
+                return;
+            }
+            index = index + 1;
+        }
+        self.work_products.add(product);
+    }
+
+    public WorkProduct? find_work_product(
+        self,
+        qkey.Fingerprint128 source_identity,
+        WorkProductKind kind
+    ) {
+        Int index! = 0;
+        while (index < self.work_products.len()) {
+            WorkProduct product = self.work_products.get(index);
+            if (product.source_identity == source_identity && product.kind == kind) {
+                return product;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+}
+
+public Bool publish(
+    UInt8[]& context_root,
+    qkey.Fingerprint128 target_identity,
+    BuildState& state
+) {
+    UInt8[]^ directory = artifact_path.build_dir(context_root);
+    if (!system_fs.create_dirs(directory[..])) { return false; }
+    UInt8[]^ final_path = artifact_path.build_state_path(context_root, target_identity);
+    UInt8[]^ temporary_path = artifact_path.temporary_artifact_path(
+        final_path[..],
+        ".jbuild.tmp."
+    );
+    list.ArrayList<UInt8> bytes = encode(state);
+    if (!system_fs.write_all(temporary_path[..], bytes.slice())) {
+        system_fs.remove_file(temporary_path[..]);
+        return false;
+    }
+    if (system_fs.atomic_replace(temporary_path[..], final_path[..])) {
+        return true;
+    }
+    system_fs.remove_file(temporary_path[..]);
+    return false;
+}
+
+public BuildState? load(
+    UInt8[]& context_root,
+    qkey.Fingerprint128 target_identity,
+    qkey.Fingerprint128 expected_context
+) {
+    UInt8[]^ path = artifact_path.build_state_path(context_root, target_identity);
+    guard system_fs.read_all(path[..]) is .some(bytes) else { return null; }
+    guard decode(bytes) is .some(state) else { return null; }
+    if (state.context != expected_context) { return null; }
+    return state;
+}
+
+public Bool is_no_op(
+    UInt8[]& context_root,
+    qkey.Fingerprint128 target_identity,
+    qkey.Fingerprint128 expected_context,
+    qkey.Fingerprint128 expected_invocation,
+    UInt8[]& source_base,
+    UInt8[]& output_path
+) {
+    guard load(
+        context_root,
+        target_identity,
+        expected_context
+    ) is .some(state) else {
+        return false;
+    }
+    if (!state.has_last_success || state.invocation != expected_invocation) {
+        return false;
+    }
+    guard source_snapshot_from_files(state$.ref(), source_base) is .some(snapshot) else {
+        return false;
+    }
+    if (snapshot != state.source_snapshot) { return false; }
+    return output_matches(state$.ref(), output_path);
+}
+
+// 语义阶段只有在对应 object 仍可复用时才能跳过源码 body。
+// 发布时的 mtime/size 命中即可沿用已校验 hash，元数据变化时再读取 object。
+public Bool work_product_is_available(
+    BuildState& state,
+    qkey.Fingerprint128 source_identity,
+    WorkProductKind kind,
+    UInt8[]& object_path
+) {
+    guard state.find_work_product(source_identity, kind) is .some(product) else {
+        return false;
+    }
+    guard system_fs.file_metadata(object_path) is .some(metadata) else { return false; }
+    if (metadata.size < 0) { return false; }
+    if (product.object_modified_ns == metadata.modified_ns
+        && product.object_size == UInt64(metadata.size)
+    ) {
+        return true;
+    }
+    guard object_hash.hash_file(object_path) is .some(actual) else { return false; }
+    return actual == product.object_hash;
+}
+
+public qkey.Fingerprint128? source_snapshot_from_files(BuildState& state) {
+    return source_snapshot_from_files(state, "");
+}
+
+public qkey.Fingerprint128? source_snapshot_from_files(
+    BuildState& state,
+    UInt8[]& source_base
+) {
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    Int index! = 0;
+    while (index < state.reachable_source_count()) {
+        UInt8[]& relative_path = state.reachable_source_at(index);
+        UInt8[]^ path = resolved_source_path(source_base, relative_path);
+        guard system_fs.file_metadata(path[..]) is .some(metadata) else { return null; }
+        if (metadata.size < 0) { return null; }
+        parts.add(cache_identity.text_fingerprint("build-source:", relative_path));
+        parts.add(qkey.Fingerprint128(metadata.modified_ns, UInt64(metadata.size)));
+        index = index + 1;
+    }
+    return object_key.combine_fingerprints(UInt64(125), parts$.ref());
+}
+
+UInt8[]^ resolved_source_path(UInt8[]& source_base, UInt8[]& relative_path) {
+    if (source_base.length == 0) {
+        std.StringBuilder path = std.StringBuilder();
+        path.append(relative_path);
+        return path.into_slice();
+    }
+    return cache_identity.resolve_relative_path(source_base, relative_path);
+}
+
+Bool output_matches(BuildState& state, UInt8[]& output_path) {
+    guard system_fs.file_metadata(output_path) is .some(metadata) else { return false; }
+    if (metadata.size < 0) { return false; }
+    if (state.output_modified_ns == metadata.modified_ns
+        && state.output_size == UInt64(metadata.size)
+    ) {
+        return true;
+    }
+    if (state.output_fingerprint == qkey.Fingerprint128()) { return false; }
+    guard object_hash.hash_file(output_path) is .some(actual) else { return false; }
+    return actual == state.output_fingerprint;
+}
+
+public list.ArrayList<UInt8> encode(BuildState& state) {
+    list.ArrayList<UInt8> output! = list.ArrayList<UInt8>();
+    write_uint64(output$.ref(), magic());
+    write_uint64(output$.ref(), UInt64(format_version));
+    write_fingerprint(output$.ref(), state.context);
+    write_fingerprint(output$.ref(), state.invocation);
+    write_uint64(output$.ref(), if state.has_last_success { UInt64(1) } else { UInt64(0) });
+    write_fingerprint(output$.ref(), state.source_snapshot);
+    write_uint64(output$.ref(), state.output_modified_ns);
+    write_uint64(output$.ref(), state.output_size);
+    write_fingerprint(output$.ref(), state.output_fingerprint);
+    write_uint64(output$.ref(), UInt64(state.reachable_source_count()));
+    write_uint64(output$.ref(), UInt64(state.work_product_count()));
+    write_reachable_sources(output$.ref(), state);
+    write_work_products(output$.ref(), state);
+    return output;
+}
+
+public BuildState? decode(UInt8[]& bytes) {
+    BuildStateReader reader! = BuildStateReader(bytes);
+    guard reader.read_uint64() is .some(file_magic) else { return null; }
+    if (file_magic != magic()) { return null; }
+    guard reader.read_uint64() is .some(version) else { return null; }
+    if (version != UInt64(format_version)) { return null; }
+    guard reader.read_fingerprint() is .some(context) else { return null; }
+    guard reader.read_fingerprint() is .some(invocation) else { return null; }
+    guard reader.read_bool_flag() is .some(has_last_success) else { return null; }
+    guard reader.read_fingerprint() is .some(source_snapshot) else { return null; }
+    guard reader.read_uint64() is .some(output_modified_ns) else { return null; }
+    guard reader.read_uint64() is .some(output_size) else { return null; }
+    guard reader.read_fingerprint() is .some(output_fingerprint) else { return null; }
+    guard reader.read_count() is .some(source_count) else { return null; }
+    guard reader.read_count() is .some(product_count) else { return null; }
+
+    BuildState state! = BuildState(context, invocation);
+    if (has_last_success) {
+        state.set_last_success(
+            source_snapshot,
+            output_modified_ns,
+            output_size,
+            output_fingerprint
+        );
+    }
+    if (!read_reachable_sources(reader$.mut_ref(), state$.mut_ref(), source_count)) {
+        return null;
+    }
+    if (!read_work_products(reader$.mut_ref(), state$.mut_ref(), product_count)) {
+        return null;
+    }
+    if (!reader.finished()) { return null; }
+    return state;
+}
+
+() write_reachable_sources(
+    list.ArrayList<UInt8>& output,
+    BuildState& state
+) {
+    Int index! = 0;
+    while (index < state.reachable_source_count()) {
+        UInt8[]& path = state.reachable_source_at(index);
+        write_uint64(output, UInt64(path.length));
+        append_bytes(output, path);
+        index = index + 1;
+    }
+}
+
+() write_work_products(
+    list.ArrayList<UInt8>& output,
+    BuildState& state
+) {
+    Int index! = 0;
+    while (index < state.work_product_count()) {
+        WorkProduct product = state.work_product_at(index);
+        write_fingerprint(output, product.source_identity);
+        write_uint64(output, UInt64(Int(product.kind)));
+        write_fingerprint(output, product.input_fingerprint);
+        write_fingerprint(output, product.object_hash);
+        write_uint64(output, product.object_modified_ns);
+        write_uint64(output, product.object_size);
+        index = index + 1;
+    }
+}
+
+Bool read_reachable_sources(
+    BuildStateReader& reader,
+    BuildState& state,
+    Int count
+) {
+    Int index! = 0;
+    while (index < count) {
+        guard reader.read_sized_bytes() is .some(path) else { return false; }
+        state.add_reachable_source(path);
+        index = index + 1;
+    }
+    return true;
+}
+
+Bool read_work_products(
+    BuildStateReader& reader,
+    BuildState& state,
+    Int count
+) {
+    Int index! = 0;
+    while (index < count) {
+        guard read_work_product(reader) is .some(product) else { return false; }
+        if (state.find_work_product(product.source_identity, product.kind) != null) {
+            return false;
+        }
+        state.upsert_work_product(product);
+        index = index + 1;
+    }
+    return true;
+}
+
+WorkProduct? read_work_product(BuildStateReader& reader) {
+    guard reader.read_fingerprint() is .some(source_identity) else { return null; }
+    guard reader.read_uint64() is .some(kind_value) else { return null; }
+    guard work_product_kind(kind_value) is .some(kind) else { return null; }
+    guard reader.read_fingerprint() is .some(input_fingerprint) else { return null; }
+    guard reader.read_fingerprint() is .some(object_hash) else { return null; }
+    guard reader.read_uint64() is .some(object_modified_ns) else { return null; }
+    guard reader.read_uint64() is .some(object_size) else { return null; }
+    return WorkProduct(
+        source_identity,
+        kind,
+        input_fingerprint,
+        object_hash,
+        object_modified_ns,
+        object_size
+    );
+}
+
+WorkProductKind? work_product_kind(UInt64 value) {
+    if (value == UInt64(Int(WorkProductKind.source_unit))) {
+        return WorkProductKind.source_unit;
+    }
+    if (value == UInt64(Int(WorkProductKind.monomorph_unit))) {
+        return WorkProductKind.monomorph_unit;
+    }
+    return null;
+}
+
+Bool same_work_product_slot(WorkProduct lhs, WorkProduct rhs) {
+    return lhs.source_identity == rhs.source_identity && lhs.kind == rhs.kind;
+}
+
+@region(a)
+struct BuildStateReader: Copyable {
+    @life(a)
+    UInt8[]& bytes;
+    Int offset!;
+
+    init(self, UInt8[]& bytes) {
+        self.bytes = bytes;
+        self.offset = 0;
+    }
+
+    Bool finished(self) {
+        return self.offset == self.bytes.length;
+    }
+
+    UInt64? read_uint64(self) {
+        guard self.read_bytes(8) is .some(value) else { return null; }
+        UInt64 result! = UInt64(0);
+        Int index! = 7;
+        while (index >= 0) {
+            result = result << 8;
+            result = result | UInt64(value[index]);
+            index = index - 1;
+        }
+        return result;
+    }
+
+    qkey.Fingerprint128? read_fingerprint(self) {
+        guard self.read_uint64() is .some(low) else { return null; }
+        guard self.read_uint64() is .some(high) else { return null; }
+        return qkey.Fingerprint128(low, high);
+    }
+
+    Bool? read_bool_flag(self) {
+        guard self.read_uint64() is .some(value) else { return null; }
+        if (value > UInt64(1)) { return null; }
+        return value == UInt64(1);
+    }
+
+    Int? read_count(self) {
+        guard self.read_uint64() is .some(value) else { return null; }
+        if (value > UInt64(1048576)) { return null; }
+        return Int(value);
+    }
+
+    UInt8[]&? read_sized_bytes(self) {
+        guard self.read_uint64() is .some(value) else { return null; }
+        if (value > UInt64(1048576)) { return null; }
+        return self.read_bytes(Int(value));
+    }
+
+    UInt8[]&? read_bytes(self, Int length) {
+        if (length < 0 || self.offset > self.bytes.length) { return null; }
+        if (length > self.bytes.length - self.offset) { return null; }
+        Int start = self.offset;
+        self.offset = self.offset + length;
+        return self.bytes[start..self.offset];
+    }
+}
+
+() write_fingerprint(
+    list.ArrayList<UInt8>& output,
+    qkey.Fingerprint128 fingerprint
+) {
+    write_uint64(output, fingerprint.low);
+    write_uint64(output, fingerprint.high);
+}
+
+() write_uint64(list.ArrayList<UInt8>& output, UInt64 value) {
+    Int index! = 0;
+    while (index < 8) {
+        output.add(UInt8((value >> UInt64(index * 8)) & UInt64(255)));
+        index = index + 1;
+    }
+}
+
+() append_bytes(list.ArrayList<UInt8>& output, UInt8[]& bytes) {
+    Int index! = 0;
+    while (index < bytes.length) {
+        output.add(bytes[index]);
+        index = index + 1;
+    }
+}
+
+UInt64 magic() {
+    return UInt64(7234299878896329322);
+}

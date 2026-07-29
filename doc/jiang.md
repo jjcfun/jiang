@@ -2488,17 +2488,26 @@ jiangc --emit-obj path/to/pkg -o pkg.o
 jiangc path/to/pkg -o pkg
 ```
 
-编译器默认把可复用的接口和对象产物保存在当前目录的 `build/cache`。
+编译器默认把可复用的接口和构建产物保存在当前目录的 `build/cache`。
 可以为一次编译选择其他位置：
 
 ```bash
 jiangc --artifact-cache-dir path/to/cache path/to/pkg -o pkg
 ```
 
-缓存只影响构建速度，不改变程序语义。需要完全重新构建时，
-可以删除所选择的缓存目录；下次编译会自动重建。排查构建复用情况时可加
-`--artifact-stats`，编译器会在标准错误输出接口与对象的命中、缺失、失效、生成、复用和
-最终链接数量。
+debug 构建会按源码复用未变化的编译产物；release 构建仍对整个 package 做统一优化。
+两种模式在输入和输出均未变化时都会直接复用上次成功结果。缓存缺失、损坏或不匹配只会
+回退到正常构建，不改变程序语义。需要完全重新构建时，
+可以显式清理所选择的缓存目录；下次编译会自动重建：
+
+```bash
+jiangc --artifact-cache-dir path/to/cache --clean-artifact-cache
+```
+
+不指定 `--artifact-cache-dir` 时清理默认的 `build/cache`。编译器会拒绝空路径、
+文件系统根路径以及含 `.` 或 `..` 路径段的清理请求。排查构建复用情况时可加
+`--artifact-stats`，编译器会在标准错误输出接口与对象的命中、缺失、失效、生成、复用、
+最终链接和无修改快速命中数量。
 
 当输入路径是目录时，编译器会读取该目录下固定文件名的 `package.ini`。当前识别：
 

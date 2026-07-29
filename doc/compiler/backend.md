@@ -99,37 +99,34 @@ backend profile 由 driver options 统一描述，包含 mode、codegen opt leve
 backend-independent `CodegenUnit` 把最终 JIL 分为：
 
 - source unit：拥有同一 source module 的普通 concrete function、global 和 hosted entry wrapper。
-- monomorph unit：拥有一个带完整 type/const args 的 concrete generic instance。
+- monomorph unit：拥有该 source 最终 JIL 实际引用的 concrete generic instance 闭包。
 
-external declaration 不拥有 object。每个 definition 只能由一个 unit 发出；unit、function、global
-和最终 link input 都按 stable identity 排序。session-local `TypeId` 不同但稳定 symbol identity
-相同的 concrete instance 只发出一次。只包含 global 的 module 仍拥有 source unit；
-interface-loaded global 保持 external，由已验证 object closure 提供 definition。
+external declaration 不拥有 object。普通 definition 只由一个 source unit 发出；同一 concrete
+instance 可以由多个调用方 monomorph unit 以 weak/linkonce 定义发出。unit、function、global
+和最终 link input 都按 stable identity 排序。单个 unit 内 session-local `TypeId` 不同但稳定
+symbol identity 相同的 concrete instance 只发出一次。只包含 global 的 module 仍拥有 source unit；
+每个 source 最多生成 `<stable-source-id>.o` 和 `<stable-source-id>.mono.o` 两个 debug object。
 
 unit emission 只声明并 lower 当前 unit 拥有的 function body。跨 unit 的直接 function reference
 按需声明为 LLVM external declaration，不扫描或声明完整 JIL Store，也不把 callee body 复制进
 当前 object。
 
-object cache index 按 stable unit key 分片。命中必须同时验证 compiler build、language version、
-target/ABI、LLVM/toolchain、backend profile、dependency/interface fingerprint、相对路径和实际
-object hash。backend 只消费通过验证的 object。
+`.ji` 不保存 object 信息。debug work-product 记录只保存在当前 target 的 `.jbuild` 中。
+外层 `context-key` 隔离 compiler build、language version、target/ABI、LLVM/toolchain 和 backend
+profile；命中还必须验证 input fingerprint 和稳定路径上的 object metadata/hash。
 
-object 和 index 都以同目录临时文件写入，再原子发布；object 总是先于 index。
-并发编译同一 unit 可以重复 codegen，但最终发布内容必须一致，
-不能留下 index 指向未完成 object。
+object 和 `.jbuild` 都先写同目录临时文件再原子替换。只有 object 已完成发布且最终链接成功后，
+`.jbuild` 才更新 `last_success`。同一 target/context 由 build lock 串行化并在等待后重查 no-op。
 
-executable 和 dylib 的 `LinkPlan` 包含当前 units、interface-loaded package 的已验证 units、
-传递依赖和 runtime object。当前编译重新拥有的 definition 会覆盖 interface closure 中的旧版本，
-随后再按路径去重。
+debug executable 的 `LinkPlan` 只包含本轮 CGU plan 和 runtime object，不恢复历史 link closure。
+release executable 始终使用 whole-package codegen 和整体优化，不读写细粒度 work products。
 
 `--emit-obj -o file.o` 始终保持单文件输出。当前所有目标还没有统一的 relocatable merge contract，
-因此该模式完整 lowering package 并生成一个以 unit key/hash closure 为 key 的整包 object。
-0.5.0 当前的 executable/dylib 性能 bridge 也暂时使用 whole-package object emission，避免约
-12,000 个 JIL function 在逐 unit 路径重复承担全包分析和 LLVM 固定开销；unit/link closure
-contract 保持为目标设计，待细粒度 emission 的冷/热收益验证后恢复。
+因此该模式完整 lowering package 并直接生成一个 whole-package object；内部 debug units 不暴露给
+用户。
 
 开发时可用 `--artifact-stats` 观察 interface/object hit、miss、stale、emitted/reused unit 和
-linked object 数量。统计不进入 cache key。
+linked object 以及 `.jbuild` no-op hit 数量。统计不进入 cache key。
 
 ## C ABI classifier
 

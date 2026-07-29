@@ -5,9 +5,8 @@
 // 恢复成当前 session 的 SymbolId/StableSymbolId 结构。
 
 import context = "../context.jiang";
-import diagnostic = "../diagnostic.jiang";
-import qkey = "../incremental/key.jiang";
 import qid = "../id.jiang";
+import qkey = "../incremental/key.jiang";
 import module_graph = "../resolve/module_graph.jiang";
 import resolve_store = "../resolve/store.jiang";
 import source = "../source.jiang";
@@ -15,14 +14,14 @@ import system_fs = "../system/fs.jiang";
 import list = "../support/list.jiang";
 import ji = "./ji_file.jiang";
 import artifact_path = "./path.jiang";
-import object_closure = "./object_closure.jiang";
+import cache_identity = "./cache_identity.jiang";
 import source_artifact = "./source.jiang";
 import source_fingerprint = "./source_fingerprint.jiang";
 
 public UInt64 artifact_version_hash(UInt8[]& compiler_version) {
     // `.ji` 的版本 hash 同时包含编译器版本和 source artifact schema seed。
     // 只要 section payload 编码发生变化，就 bump seed，让旧缓存自动失效。
-    return source.content_hash(compiler_version) ^ source.content_hash("source-ji-v60");
+    return source.content_hash(compiler_version) ^ source.content_hash("source-ji-v65");
 }
 
 public struct SourceJiSections: Movable {
@@ -32,8 +31,6 @@ public struct SourceJiSections: Movable {
     public list.ArrayList<UInt8> interface_section!;
     public Bool has_generic_templates!;
     public list.ArrayList<UInt8> generic_templates!;
-    public Bool has_object_closure!;
-    public list.ArrayList<UInt8> object_closure!;
 
     public init(self) {
         self.has_import_summary = false;
@@ -42,8 +39,6 @@ public struct SourceJiSections: Movable {
         self.interface_section = list.ArrayList<UInt8>();
         self.has_generic_templates = false;
         self.generic_templates = list.ArrayList<UInt8>();
-        self.has_object_closure = false;
-        self.object_closure = list.ArrayList<UInt8>();
     }
 }
 
@@ -51,7 +46,8 @@ public ji.JiFileImage? build_source_ji_image(
     context.CompilerContext& ctx,
     source_artifact.SourceArtifactCache& cache,
     source.SourceId source_id,
-    UInt64 compiler_version
+    UInt64 compiler_version,
+    ji.JiSourceMetadata? metadata = null
 ) {
     list.ArrayList<ji.JiSectionPayload> payloads! = list.ArrayList<ji.JiSectionPayload>();
     UInt64? source_hash! = null;
@@ -67,14 +63,20 @@ public ji.JiFileImage? build_source_ji_image(
         }
         add_interface_payload(ctx, payloads$.ref(), module_interface);
         add_generic_templates_payload(ctx, payloads$.ref(), module_interface);
-        add_object_closure_payload(payloads$.ref(), module_interface);
     }
 
     if (payloads.empty()) {
         return null;
     }
     guard source_hash is .some(hash) else { return null; }
-    return ji.build_ji_file_image(compiler_version, hash, payloads);
+    ji.JiSourceMetadata effective! = ji.JiSourceMetadata(hash);
+    if (metadata is .some(provided)) {
+        effective = provided;
+    } else if (cache.load_interface(source_id) is .some(module_interface)) {
+        effective.package_interface_fingerprint = module_interface.interface_hash;
+        effective.public_interface_fingerprint = module_interface.public_interface_hash;
+    }
+    return ji.build_ji_file_image(compiler_version, effective, payloads);
 }
 
 public Bool write_source_ji_file(
@@ -82,9 +84,16 @@ public Bool write_source_ji_file(
     source_artifact.SourceArtifactCache& cache,
     source.SourceId source_id,
     UInt64 compiler_version,
-    UInt8[]& path
+    UInt8[]& path,
+    ji.JiSourceMetadata? metadata = null
 ) {
-    guard build_source_ji_image(ctx, cache, source_id, compiler_version) is .some(image) else {
+    guard build_source_ji_image(
+        ctx,
+        cache,
+        source_id,
+        compiler_version,
+        metadata
+    ) is .some(image) else {
         return false;
     }
     return ji.write_ji_file(path, image$.ref());
@@ -111,31 +120,25 @@ public () write_package_source_artifact_cache(
     }
 }
 
-// 为单个 module 写入 `.ji` interface。没有 stable def id 的 module 不具备
-// 跨编译身份，不能进入本地 artifact cache。
-() write_module_source_artifact(
+public cache_identity.StableSourceIdentity? source_identity_for_module(
     context.CompilerContext& ctx,
-    qkey.StableSymbolId stable_id,
-    source.SourceId source_id,
-    UInt8[]& artifact_cache_dir,
-    UInt64 compiler_version
+    qid.ModuleId module_id
 ) {
-    source.SourceRecord source_record = ctx.store.sources.get(source_id);
-    UInt8[]^ artifact_file = artifact_path.source_ji_path(
-        artifact_cache_dir,
-        stable_id,
-        source_record.content_hash,
-        compiler_version
-    );
-    write_source_ji_file(
-        ctx,
-        ctx.store.artifacts$.ref(),
-        source_id,
-        compiler_version,
-        artifact_file[..]
+    resolve_store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    resolve_store.PackageRecord& package_record = ctx.store.resolve.package_ref(module.package_id);
+    guard ctx.store.incremental.stable_id_for_def(package_record.def_id) is .some(package_identity) else {
+        return null;
+    }
+    source.SourceRecord source_record = ctx.store.sources.get(module.source_id);
+    return cache_identity.stable_source_identity(
+        package_identity,
+        ctx.store.symbols.text(package_record.dir_path),
+        source_record.name()
     );
 }
 
+// 为单个 module 写入 `.ji` interface。没有 stable source identity 的 module
+// 不具备跨编译身份，不能进入本地 artifact cache。
 () write_module_source_artifact(
     context.CompilerContext& ctx,
     qid.ModuleId module_id,
@@ -143,10 +146,99 @@ public () write_package_source_artifact_cache(
     UInt64 compiler_version
 ) {
     resolve_store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
-    guard ctx.store.incremental.stable_id_for_def(module.def_id) is .some(stable_id) else {
+    // interface-only 模块沿用磁盘中的成功快照。只发布本轮真正从源码
+    // lower 的模块，避免单文件修改后重写整个 package 的 `.ji`。
+    if (module.interface_only) { return; }
+    if (!source_snapshot_matches(ctx, module_id)) { return; }
+    guard source_identity_for_module(ctx, module_id) is .some(source_identity) else {
         return;
     }
-    write_module_source_artifact(ctx, stable_id, module.source_id, artifact_cache_dir, compiler_version);
+    guard acquire_source_artifact_lock(
+        artifact_cache_dir,
+        source_identity
+    ) is .some(held_lock) else {
+        return;
+    }
+    system_fs.FileLock lock! = held_lock;
+    UInt8[]^ artifact_file = artifact_path.stable_source_ji_path(
+        artifact_cache_dir,
+        source_identity
+    );
+    ji.JiSourceMetadata metadata = source_metadata(ctx, module_id, source_identity);
+    write_source_ji_file(
+        ctx,
+        ctx.store.artifacts$.ref(),
+        module.source_id,
+        compiler_version,
+        artifact_file[..],
+        metadata
+    );
+}
+
+public system_fs.FileLock? acquire_module_artifact_lock(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id,
+    UInt8[]& artifact_cache_dir
+) {
+    guard source_identity_for_module(ctx, module_id) is .some(source_identity) else {
+        return null;
+    }
+    return acquire_source_artifact_lock(artifact_cache_dir, source_identity);
+}
+
+system_fs.FileLock? acquire_source_artifact_lock(
+    UInt8[]& artifact_cache_dir,
+    cache_identity.StableSourceIdentity source_identity
+) {
+    UInt8[]^ directory = artifact_path.lock_dir(artifact_cache_dir);
+    if (!system_fs.create_dirs(directory[..])) { return null; }
+    UInt8[]^ path = artifact_path.source_lock_path(artifact_cache_dir, source_identity);
+    return system_fs.acquire_file_lock(path[..]);
+}
+
+// artifact 只能对应本轮读取到的源码快照。文件在分析期间发生变化时，
+// 放弃发布旧 interface，由下一次编译重新读取。
+public Bool source_snapshot_matches(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id
+) {
+    resolve_store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    source.SourceRecord source_record = ctx.store.sources.get(module.source_id);
+    if (source_record.key.kind != .file) { return true; }
+    guard system_fs.read_all(source_record.key.value) is .some(text) else {
+        return false;
+    }
+    return source.content_hash(text) == source_record.content_hash;
+}
+
+ji.JiSourceMetadata source_metadata(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id,
+    cache_identity.StableSourceIdentity source_identity
+) {
+    resolve_store.ModuleRecord& module = ctx.store.resolve.module_ref(module_id);
+    source.SourceRecord source_record = ctx.store.sources.get(module.source_id);
+    ji.JiSourceMetadata metadata! = ji.JiSourceMetadata(source_record.content_hash);
+    metadata.stable_source_identity = source_identity.fingerprint;
+    record_source_file_metadata(metadata$.mut_ref(), source_record);
+    if (ctx.store.artifacts.load_interface(module.source_id) is .some(module_interface)) {
+        metadata.package_interface_fingerprint = module_interface.interface_hash;
+        metadata.public_interface_fingerprint = module_interface.public_interface_hash;
+    }
+    return metadata;
+}
+
+() record_source_file_metadata(
+    ji.JiSourceMetadata&! metadata,
+    source.SourceRecord source_record
+) {
+    if (source_record.key.kind != .file) { return; }
+    guard system_fs.file_metadata(source_record.key.value) is .some(file_metadata) else {
+        return;
+    }
+    if (file_metadata.size < 0) { return; }
+    metadata.source_modified_ns = file_metadata.modified_ns;
+    metadata.source_size = UInt64(file_metadata.size);
 }
 
 public SourceJiSections? read_source_ji_sections(UInt8[]& path) {
@@ -169,51 +261,70 @@ public Bool load_source_artifacts_from_ji(
     UInt8[]& path,
     UInt64 expected_compiler_version
 ) {
-    guard ji.read_ji_file(path) is .some(image) else {
+    guard ji.read_ji_layout(path) is .some(layout) else {
         // 旧格式、损坏或并发留下的半成品 source artifact 都按 cache miss 处理。
         return false;
     }
-    return load_source_artifacts_from_image(ctx, cache, source_id, image$.ref(), expected_compiler_version);
+    return load_source_artifacts_from_layout(
+        ctx,
+        cache,
+        source_id,
+        path,
+        layout$.ref(),
+        expected_compiler_version
+    );
 }
 
-public Bool load_source_artifacts_from_image(
+// Import discovery 只读取 header、section table 和 import summary。interface、
+// generic template 留到真正消费它的阶段再读取。
+public Bool load_import_summary_from_ji(
     context.CompilerContext& ctx,
     source_artifact.SourceArtifactCache& cache,
     source.SourceId source_id,
-    ji.JiFileImage& image,
+    UInt8[]& path,
+    UInt64 expected_compiler_version,
+    qkey.Fingerprint128 expected_source_identity
+) {
+    guard ji.read_ji_layout(path) is .some(layout) else { return false; }
+    if (layout.header.compiler_version != expected_compiler_version) { return false; }
+    if (layout.header.stable_source_identity != expected_source_identity) { return false; }
+    UInt64 expected_source_hash = ctx.store.sources.get(source_id).content_hash;
+    if (layout.header.source_hash != expected_source_hash) { return false; }
+    return load_import_summary_from_layout(ctx, cache, source_id, path, layout$.ref());
+}
+
+Bool load_source_artifacts_from_layout(
+    context.CompilerContext& ctx,
+    source_artifact.SourceArtifactCache& cache,
+    source.SourceId source_id,
+    UInt8[]& path,
+    ji.JiDiskLayout& layout,
     UInt64 expected_compiler_version
 ) {
-    if (image.header.compiler_version != expected_compiler_version) {
-        add_source_ji_warning(ctx, "source artifact compiler version mismatch", "source_ji_version_mismatch");
+    if (layout.header.compiler_version != expected_compiler_version) {
+        return false;
+    }
+    if (!has_semantic_section(layout)) {
         return false;
     }
 
     UInt64 expected_source_hash = ctx.store.sources.get(source_id).content_hash;
-    if (image.header.source_hash != expected_source_hash) {
-        add_source_ji_warning(ctx, "source artifact source hash mismatch", "source_ji_hash_mismatch");
+    if (layout.header.source_hash != expected_source_hash) {
         return false;
     }
-    if (!load_import_summary_from_image(ctx, cache, source_id, image)) {
-        add_source_ji_warning(ctx, "failed to decode source import summary", "source_ji_import_decode_failed");
+    if (!load_import_summary_from_layout(ctx, cache, source_id, path, layout)) {
         return false;
     }
-    if (!load_interface_from_image(ctx, cache, source_id, image)) {
-        add_source_ji_warning(ctx, "failed to decode source module interface", "source_ji_interface_decode_failed");
+    if (!load_interface_from_layout(ctx, cache, source_id, path, layout)) {
         return false;
     }
     return true;
 }
 
-() add_source_ji_warning(context.CompilerContext& ctx, UInt8[]& message, UInt8[]& code) {
-    ctx.store.diagnostics.add(
-        diagnostic.Diagnostic(
-            .warning,
-            .incremental,
-            diagnostic.DiagnosticCode(code),
-            diagnostic.SourceRange(),
-            message
-        )
-    );
+Bool has_semantic_section(ji.JiDiskLayout& layout) {
+    if (layout.sections.find(.import_summary) != null) { return true; }
+    if (layout.sections.find(.interface_section) != null) { return true; }
+    return layout.sections.find(.generic_templates) != null;
 }
 
 () add_import_summary_payload(
@@ -243,69 +354,91 @@ public Bool load_source_artifacts_from_image(
     payloads.add(source_fingerprint.generic_templates_payload(ctx, module_interface));
 }
 
-() add_object_closure_payload(
-    list.ArrayList<ji.JiSectionPayload>& payloads,
-    source_artifact.ModuleInterface& module_interface
-) {
-    if (module_interface.object_units.len() == 0
-        && module_interface.object_closure_fingerprint == null
-    ) {
-        return;
-    }
-    payloads.add(object_closure.payload(module_interface));
-}
-
-Bool load_import_summary_from_image(
+Bool load_import_summary_from_layout(
     context.CompilerContext& ctx,
     source_artifact.SourceArtifactCache& cache,
     source.SourceId source_id,
-    ji.JiFileImage& image
+    UInt8[]& path,
+    ji.JiDiskLayout& layout
 ) {
-    guard image.read_section(.import_summary) is .some(bytes) else { return true; }
-    guard source_fingerprint.decode_import_summary_section(ctx, source_id, bytes) is .some(summary) else {
+    if (layout.sections.find(.import_summary) == null) { return true; }
+    guard read_section(ctx, path, layout, .import_summary) is .some(bytes) else {
         return false;
     }
+    UInt64 started = cache.section_timing_start();
+    guard source_fingerprint.decode_import_summary_section(ctx, source_id, bytes)
+        is .some(summary) else {
+        return false;
+    }
+    cache.record_section_decode(.import_summary, started);
     cache.store_import_summary(source_id, summary);
     return true;
 }
 
-Bool load_interface_from_image(
+Bool load_interface_from_layout(
     context.CompilerContext& ctx,
     source_artifact.SourceArtifactCache& cache,
     source.SourceId source_id,
-    ji.JiFileImage& image
+    UInt8[]& path,
+    ji.JiDiskLayout& layout
 ) {
-    guard image.read_section(.interface_section) is .some(bytes) else { return true; }
-    UInt64 source_hash = image.header.source_hash;
-    guard source_fingerprint.decode_module_interface_section(ctx, source_id, source_hash, bytes) is .some(iface) else {
+    if (layout.sections.find(.interface_section) == null) { return true; }
+    guard read_section(ctx, path, layout, .interface_section) is .some(bytes) else {
         return false;
     }
+    UInt64 source_hash = layout.header.source_hash;
+    UInt64 started = cache.section_timing_start();
+    guard source_fingerprint.decode_module_interface_section(
+        ctx,
+        source_id,
+        source_hash,
+        bytes,
+        layout.header.package_interface_fingerprint,
+        layout.header.public_interface_fingerprint
+    ) is .some(iface) else {
+        return false;
+    }
+    cache.record_section_decode(.interface_section, started);
     source_artifact.ModuleInterface loaded! = iface;
-    if (!load_generic_templates_from_image(ctx, loaded$.ref(), image)) {
-        return false;
-    }
-    if (!load_object_closure_from_image(loaded$.ref(), image)) {
+    if (!load_generic_templates_from_layout(ctx, loaded$.ref(), path, layout)) {
         return false;
     }
     cache.store_interface(source_id, loaded);
     return true;
 }
 
-Bool load_generic_templates_from_image(
+Bool load_generic_templates_from_layout(
     context.CompilerContext& ctx,
     source_artifact.ModuleInterface& module_interface,
-    ji.JiFileImage& image
+    UInt8[]& path,
+    ji.JiDiskLayout& layout
 ) {
-    guard image.read_section(.generic_templates) is .some(bytes) else { return true; }
-    return source_fingerprint.decode_generic_templates_section(ctx, module_interface, bytes);
+    if (layout.sections.find(.generic_templates) == null) { return true; }
+    guard read_section(ctx, path, layout, .generic_templates) is .some(bytes) else {
+        return false;
+    }
+    UInt64 started = ctx.store.artifacts.section_timing_start();
+    Bool decoded =
+        source_fingerprint.decode_generic_templates_section(ctx, module_interface, bytes);
+    ctx.store.artifacts.record_section_decode(.generic_templates, started);
+    return decoded;
 }
 
-Bool load_object_closure_from_image(
-    source_artifact.ModuleInterface& module_interface,
-    ji.JiFileImage& image
+@life()
+public UInt8[]&? read_section(
+    context.CompilerContext& ctx,
+    UInt8[]& path,
+    ji.JiDiskLayout& layout,
+    ji.JiSectionKind kind
 ) {
-    guard image.read_section(.object_closure) is .some(bytes) else { return true; }
-    return object_closure.decode(module_interface, bytes);
+    UInt64 started = ctx.store.artifacts.section_timing_start();
+    UInt8[]&? result = ji.read_ji_section(path, layout, kind);
+    Int length! = 0;
+    if (layout.sections.find(kind) is .some(entry)) {
+        length = entry.length;
+    }
+    ctx.store.artifacts.record_section_read(kind, length, started);
+    return result;
 }
 
 () record_source_section(SourceJiSections&! sections, ji.JiSectionKind kind, UInt8[]& bytes) {
@@ -322,11 +455,6 @@ Bool load_object_closure_from_image(
     if (kind == .generic_templates) {
         sections.has_generic_templates = true;
         sections.generic_templates = copy_bytes(bytes);
-        return;
-    }
-    if (kind == .object_closure) {
-        sections.has_object_closure = true;
-        sections.object_closure = copy_bytes(bytes);
         return;
     }
 }

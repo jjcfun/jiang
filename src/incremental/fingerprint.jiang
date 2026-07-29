@@ -8,6 +8,7 @@ import sem = "../sema/model.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
 import def = "../resolve/def.jiang";
+import namespace = "../resolve/namespace.jiang";
 import layout = "../layout.jiang";
 import jil = "../jil.jiang";
 import module_graph = "../resolve/module_graph.jiang";
@@ -16,15 +17,19 @@ import typeck_store = "../sema/type_check/store.jiang";
 import types = "../sema/type.jiang";
 import blake3 = "../support/blake3.jiang";
 import list = "../support/list.jiang";
+import table = "../support/table.jiang";
 
 public () fingerprint_module_graph(context.CompilerContext& ctx, module_graph.ModuleGraph& graph) {
     Int index! = 0;
     while (index < graph.module_count()) {
-        qid.ModuleId module_id = graph.module_at(index);
-        qid.DefId module_def = ctx.store.resolve.module_ref(module_id).def_id;
-        fingerprint_def_tree(ctx, module_def);
+        fingerprint_module(ctx, graph.module_at(index));
         index = index + 1;
     }
+}
+
+public () fingerprint_module(context.CompilerContext& ctx, qid.ModuleId module_id) {
+    qid.DefId module_def = ctx.store.resolve.module_ref(module_id).def_id;
+    fingerprint_def_tree(ctx, module_def);
 }
 
 Int jil_atomic_ordering_tag(jil.AtomicOrdering ordering) {
@@ -139,7 +144,7 @@ public qkey.Fingerprint128 callable_signature_fingerprint(
 
 public qkey.Fingerprint128 model_body_fingerprint(context.CompilerContext& ctx, sem.Def& model_def) {
     FingerprintWriter writer = FingerprintWriter();
-    writer.write_int(2);
+    writer.write_int(3);
     if (model_def.body is .some(ref _ body)) {
         writer.write_bool(true);
         writer.write_model_id(ctx, body.root);
@@ -2095,8 +2100,102 @@ struct FingerprintWriter: Movable {
         }
         if (name_ref is .def_ref(def_id)) {
             self.write_int(2);
-            self.write_def_ref(ctx, def_id);
+            self.write_resolved_def_identity(ctx, def_id);
         }
+    }
+
+    () write_resolved_def_identity(self, context.CompilerContext& ctx, qid.DefId def_id) {
+        def.DefRecord def_record = ctx.store.defs.get(def_id);
+        if (!self.def_kind_can_overload(def_record.kind)) {
+            self.write_int(1);
+            self.write_def_ref(ctx, def_id);
+            return;
+        }
+
+        // resolve 阶段只在 NameRef 中暂存 overload 集合的一项；source lowering
+        // 与 `.ji` loading 的声明顺序可能不同。body fingerprint 必须记录排序后的
+        // 稳定候选集合，不能把这个临时代表当成最终调用目标。
+        self.write_int(2);
+        list.ArrayList<qkey.Fingerprint128> candidates =
+            self.overload_candidate_identities(ctx, def_record);
+        self.write_int(candidates.len());
+        Int index! = 0;
+        while (index < candidates.len()) {
+            qkey.Fingerprint128 candidate = candidates.get(index);
+            self.write_uint64(candidate.low);
+            self.write_uint64(candidate.high);
+            index = index + 1;
+        }
+    }
+
+    Bool def_kind_can_overload(self, def.DefKind kind) {
+        return kind == .function_def || kind == .init_def || kind == .deinit_def;
+    }
+
+    list.ArrayList<qkey.Fingerprint128> overload_candidate_identities(
+        self,
+        context.CompilerContext& ctx,
+        def.DefRecord initial
+    ) {
+        list.ArrayList<qkey.Fingerprint128> candidates =
+            list.ArrayList<qkey.Fingerprint128>();
+        table.MultiTableCursor cursor! = ctx.store.resolve.first_binding_cursor(
+            initial.decl_namespace_id,
+            initial.name.symbol,
+            initial.domain
+        );
+        while (cursor.valid()) {
+            namespace.BindingEntry binding = ctx.store.resolve.binding_at(cursor);
+            candidates.add(self.resolved_def_fingerprint(ctx, binding.def_id));
+            cursor = ctx.store.resolve.next_binding_cursor(cursor);
+        }
+        if (candidates.len() == 0) {
+            candidates.add(self.resolved_def_fingerprint(ctx, initial.id));
+        }
+        self.sort_fingerprints(candidates$.ref());
+        return candidates;
+    }
+
+    qkey.Fingerprint128 resolved_def_fingerprint(
+        self,
+        context.CompilerContext& ctx,
+        qid.DefId def_id
+    ) {
+        FingerprintWriter writer = FingerprintWriter();
+        if (ctx.store.incremental.stable_id_for_def(def_id) is .some(stable_id)) {
+            writer.write_int(1);
+            writer.write_uint64(stable_id.low);
+            writer.write_uint64(stable_id.high);
+            return writer.finish();
+        }
+        writer.write_int(2);
+        writer.write_def_record(ctx, ctx.store.defs.get(def_id));
+        return writer.finish();
+    }
+
+    () sort_fingerprints(self, list.ArrayList<qkey.Fingerprint128>& fingerprints) {
+        Int index! = 1;
+        while (index < fingerprints.len()) {
+            Int current! = index;
+            while (current > 0
+                && self.fingerprint_less(fingerprints.get(current), fingerprints.get(current - 1))
+            ) {
+                qkey.Fingerprint128 previous = fingerprints.get(current - 1);
+                fingerprints.set(current - 1, fingerprints.get(current));
+                fingerprints.set(current, previous);
+                current = current - 1;
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool fingerprint_less(
+        self,
+        qkey.Fingerprint128 lhs,
+        qkey.Fingerprint128 rhs
+    ) {
+        if (lhs.low != rhs.low) { return lhs.low < rhs.low; }
+        return lhs.high < rhs.high;
     }
 
     () write_call(self, context.CompilerContext& ctx, sem.Call call) {
@@ -2106,8 +2205,7 @@ struct FingerprintWriter: Movable {
         self.write_call_arg_array(ctx, call.args);
         if (call.target is .some(target)) {
             self.write_bool(true);
-            self.write_def_ref(ctx, target.def_id);
-            self.write_optional_signature_id(target.signature_id);
+            self.write_resolved_def_identity(ctx, target.def_id);
             return;
         }
         self.write_bool(false);

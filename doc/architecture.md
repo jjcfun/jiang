@@ -126,8 +126,8 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
   - 消费：elaborated JIL、layout、target、symbols。
   - 禁止：语言语义判断、Semantic Model fallback、修改 JIL/layout。
 - `incremental`
-  - 生产：`StableKey`、fingerprint、`.ji` interface/template/object closure、分片 object index、
-    stable codegen unit 与 package closure。
+  - 生产：`StableKey`、fingerprint、source dependency graph、`.ji` semantic interface、
+    debug codegen unit 与 `.jbuild` build state。
   - 消费：source、interface、object artifact。
   - 禁止：缓存 session-local Semantic Model/type/JIL 对象。
 
@@ -255,8 +255,10 @@ CompilerStore
   wrapper dylib 构建、host dylib 加载和 syntax-stage provider invocation；
   详见 [DSL / Lang Package](compiler/dsl.md)。
 - `artifact` 保存 source/interface/object/package artifact 的 key、fingerprint、path 和物理容器
-  适配；object index 只保存 cache-root 相对路径和稳定构建上下文，不保存 session-local ID。
-  普通 package object 由 unit key/hash closure 决定；`package_fingerprint` /
+  适配；`.ji` 只保存语义 interface，debug object 记录位于 `.jbuild`，路径由 stable source
+  identity 与固定 unit kind 推导，不保存 session-local ID。
+  release executable 使用 whole-package codegen；
+  `package_fingerprint` /
   `package_artifact` 只服务 module graph 之前发现的 lang provider dylib。
 - `store` 是跨阶段事实集合聚合点；普通阶段通过 store API 查询，
   不直接依赖其他阶段内部表。

@@ -1,0 +1,777 @@
+// Debug 模式的粗粒度 object 产物。
+//
+// 每个源码身份最多拥有一个普通定义 object 和一个泛型实例 object。
+// `.jbuild` 是唯一的持久索引；`.ji` 不记录任何 codegen 信息。
+
+import build_state = "../artifact/build_state.jiang";
+import cache_identity = "../artifact/cache_identity.jiang";
+import object_artifact = "../artifact/object.jiang";
+import object_hash = "../artifact/object_hash.jiang";
+import object_key = "../artifact/object_key.jiang";
+import object_key_builder = "../artifact/object_key_builder.jiang";
+import artifact_path = "../artifact/path.jiang";
+import source_ji = "../artifact/source_ji.jiang";
+import context = "../context.jiang";
+import driver_options = "../driver/options.jiang";
+import qid = "../id.jiang";
+import qkey = "../incremental/key.jiang";
+import source_graph = "../incremental/source_graph.jiang";
+import jil = "../jil.jiang";
+import source = "../source.jiang";
+import list = "../support/list.jiang";
+import string = "../support/string.jiang";
+import table = "../support/table.jiang";
+import system_fs = "../system/fs.jiang";
+import system_time = "../system/time.jiang";
+import codegen = "./codegen.jiang";
+import codegen_unit = "./codegen_unit.jiang";
+import link_plan = "./link_plan.jiang";
+
+public struct DebugTiming: Copyable {
+    public UInt64 state_ns = UInt64(0);
+    public UInt64 prepare_store_ns = UInt64(0);
+    public UInt64 plan_ns = UInt64(0);
+    public UInt64 units_ns = UInt64(0);
+}
+
+public struct DebugWorkProducts: Movable {
+    public Bool ok;
+    public link_plan.LinkPlan links;
+    public build_state.BuildState state;
+    public qkey.Fingerprint128 target_identity;
+    public DebugTiming timing!;
+
+    public init(self,
+        Bool ok,
+        link_plan.LinkPlan links,
+        build_state.BuildState state,
+        qkey.Fingerprint128 target_identity
+    ) {
+        self.ok = ok;
+        self.links = links;
+        self.state = state;
+        self.target_identity = target_identity;
+        self.timing = DebugTiming();
+    }
+}
+
+public DebugWorkProducts prepare(
+    context.CompilerContext& ctx,
+    jil.Store& lowered,
+    driver_options.CompileOptions& options,
+    UInt8[]& context_root,
+    qkey.Fingerprint128 context_fingerprint,
+    UInt8[]& source_base,
+    UInt8[]& llvm_triple,
+    Bool link_libc,
+    Bool timing_enabled
+) {
+    UInt64 started! = timing_start(timing_enabled);
+    qkey.Fingerprint128 target_identity =
+        cache_identity.build_target_identity(options.input_path);
+    qkey.Fingerprint128 invocation = cache_identity.build_invocation_fingerprint(
+        options.output_path,
+        options.linker_path,
+        options.link_args$.ref()
+    );
+    build_state.BuildState next! = build_state.BuildState(context_fingerprint, invocation);
+    build_state.BuildState? previous! = build_state.load(
+        context_root,
+        target_identity,
+        context_fingerprint
+    );
+    link_plan.LinkPlan links! = link_plan.LinkPlan();
+    UInt8[]^ object_dir = artifact_path.object_dir(context_root);
+    if (!system_fs.create_dirs(object_dir[..])) {
+        return DebugWorkProducts(false, links, next, target_identity);
+    }
+
+    codegen_unit.CodegenUnitSet units! = codegen_unit.build_codegen_units(ctx, lowered);
+    restore_interface_units(ctx, units$.mut_ref(), previous$.ref());
+    UInt64 state_ns = timing_elapsed(timing_enabled, started);
+    started = timing_start(timing_enabled);
+    codegen.PreparedStore prepared = codegen.prepare_store(ctx, lowered, .debug);
+    if (!prepared.ok) {
+        return DebugWorkProducts(false, links, next, target_identity);
+    }
+    UInt64 prepare_store_ns = timing_elapsed(timing_enabled, started);
+    started = timing_start(timing_enabled);
+    record_reachable_sources(ctx, next$.mut_ref(), source_base, context_root);
+    if (build_state.source_snapshot_from_files(
+        next$.ref(),
+        source_base
+    ) is .some(snapshot)) {
+        next.source_snapshot = snapshot;
+    }
+    UnitFingerprintContext fingerprints = UnitFingerprintContext(
+        object_key_builder.target_fingerprint(llvm_triple),
+        object_key_builder.compiler_fingerprint(options.compiler_build),
+        object_key_builder.backend_profile_fingerprint(.debug)
+    );
+    list.ArrayList<Int> order = stable_unit_order(ctx, units$.ref());
+    if (order.len() != units.len()) {
+        return DebugWorkProducts(false, links, next, target_identity);
+    }
+    table.HashTable<qkey.Fingerprint128, Bool> reused_sources! =
+        table.HashTable<qkey.Fingerprint128, Bool>();
+    UInt64 plan_ns = timing_elapsed(timing_enabled, started);
+    started = timing_start(timing_enabled);
+    Int index! = 0;
+    while (index < order.len()) {
+        codegen_unit.CodegenUnit& unit = units.unit_at(order.get(index));
+        if (!prepare_unit(
+            ctx,
+            lowered,
+            unit,
+            prepared$.ref(),
+            previous$.ref(),
+            reused_sources$.ref(),
+            next$.mut_ref(),
+            links$.mut_ref(),
+            context_root,
+            fingerprints,
+            llvm_triple,
+            link_libc
+        )) {
+            return DebugWorkProducts(false, links, next, target_identity);
+        }
+        index = index + 1;
+    }
+    DebugWorkProducts result = DebugWorkProducts(true, links, next, target_identity);
+    result.timing.state_ns = state_ns;
+    result.timing.prepare_store_ns = prepare_store_ns;
+    result.timing.plan_ns = plan_ns;
+    result.timing.units_ns = timing_elapsed(timing_enabled, started);
+    return result;
+}
+
+UInt64 timing_start(Bool enabled) {
+    if (!enabled) { return UInt64(0); }
+    return system_time.monotonic_time_ns();
+}
+
+UInt64 timing_elapsed(Bool enabled, UInt64 started) {
+    if (!enabled) { return UInt64(0); }
+    UInt64 finished = system_time.monotonic_time_ns();
+    if (finished < started) { return UInt64(0); }
+    return finished - started;
+}
+
+public Bool publish_success(
+    context.CompilerContext& ctx,
+    UInt8[]& context_root,
+    UInt8[]& output_path,
+    UInt8[]& source_base,
+    DebugWorkProducts& products
+) {
+    guard output_metadata(output_path) is .some(metadata) else {
+        return false;
+    }
+    guard build_state.source_snapshot_from_files(
+        products.state$.ref(),
+        source_base
+    ) is .some(source_snapshot) else {
+        return false;
+    }
+    if (products.state.source_snapshot == qkey.Fingerprint128()) {
+        return false;
+    }
+    if (products.state.source_snapshot != source_snapshot) {
+        return false;
+    }
+    products.state.set_last_success(
+        source_snapshot,
+        metadata.modified_ns,
+        UInt64(metadata.size),
+        // 最终可执行文件不是可复用的编译输入。元数据不一致时保守重链，
+        // 不在每次成功构建后重新读取并哈希整个文件。
+        qkey.Fingerprint128()
+    );
+    return build_state.publish(
+        context_root,
+        products.target_identity,
+        products.state$.ref()
+    );
+}
+
+// unit 已逐个原子发布，即使后续 unit 或链接失败，也可保存本轮已经证明
+// 可复用的 work product；last_success 仍保持 false，不能形成错误 no-op。
+public Bool publish_work_products(
+    UInt8[]& context_root,
+    UInt8[]& source_base,
+    DebugWorkProducts& products
+) {
+    if (products.state.source_snapshot == qkey.Fingerprint128()) { return false; }
+    guard build_state.source_snapshot_from_files(
+        products.state$.ref(),
+        source_base
+    ) is .some(source_snapshot) else {
+        return false;
+    }
+    if (products.state.source_snapshot != source_snapshot) { return false; }
+    return build_state.publish(
+        context_root,
+        products.target_identity,
+        products.state$.ref()
+    );
+}
+
+struct UnitFingerprintContext: Copyable {
+    qkey.Fingerprint128 target;
+    qkey.Fingerprint128 compiler;
+    qkey.Fingerprint128 profile;
+
+    init(self,
+        qkey.Fingerprint128 target,
+        qkey.Fingerprint128 compiler,
+        qkey.Fingerprint128 profile
+    ) {
+        self.target = target;
+        self.compiler = compiler;
+        self.profile = profile;
+    }
+}
+
+Bool prepare_unit(
+    context.CompilerContext& ctx,
+    jil.Store& lowered,
+    codegen_unit.CodegenUnit& unit,
+    codegen.PreparedStore& prepared,
+    build_state.BuildState?& previous,
+    table.HashTable<qkey.Fingerprint128, Bool>& reused_sources,
+    build_state.BuildState&! next,
+    link_plan.LinkPlan&! links,
+    UInt8[]& context_root,
+    UnitFingerprintContext fingerprints,
+    UInt8[]& llvm_triple,
+    Bool link_libc
+) {
+    qid.ModuleId module_id = qid.ModuleId.from_index(unit.key.module_index);
+    guard source_ji.source_identity_for_module(ctx, module_id) is .some(source_identity) else {
+        return false;
+    }
+    build_state.WorkProductKind kind = work_product_kind(unit.key.kind);
+    UInt8[]^ path = object_path(context_root, source_identity, kind);
+    if (ctx.store.resolve.module_ref(module_id).interface_only) {
+        if (kind == .monomorph_unit
+            && !work_product_record_exists(previous, source_identity.fingerprint, kind)
+        ) {
+            return true;
+        }
+        return reuse_interface_unit(
+            ctx,
+            previous,
+            reused_sources,
+            next,
+            links,
+            path[..],
+            source_identity.fingerprint,
+            kind
+        );
+    }
+    if (kind == .monomorph_unit && unit.functions.len() == 0) {
+        if (!reused_sources.has(source_identity.fingerprint)) {
+            return true;
+        }
+        return reuse_previous_unit(
+            ctx,
+            previous,
+            next,
+            links,
+            path[..],
+            source_identity.fingerprint,
+            kind
+        );
+    }
+    guard unit_input_fingerprint(
+        ctx,
+        lowered,
+        unit,
+        module_id,
+        fingerprints
+    ) is .some(input_fingerprint) else {
+        return false;
+    }
+    if (reusable_product(previous, source_identity.fingerprint, kind, input_fingerprint, path[..])
+        is .some(product)
+    ) {
+        next.upsert_work_product(product);
+        links.add_user_object(path[..]);
+        ctx.store.object_artifacts.record_reused_unit();
+        record_reuse_status(ctx, kind, .hit);
+        if (kind == .source_unit) {
+            reused_sources.set(source_identity.fingerprint, true);
+        }
+        return true;
+    }
+    object_artifact.ObjectArtifactStatus status! = .missing;
+    if (work_product_record_exists(previous, source_identity.fingerprint, kind)) {
+        status = .stale;
+    }
+    record_reuse_status(ctx, kind, status);
+    return emit_unit(
+        ctx,
+        lowered,
+        unit,
+        prepared,
+        next,
+        links,
+        path[..],
+        source_identity,
+        kind,
+        input_fingerprint,
+        llvm_triple,
+        link_libc,
+        module_id
+    );
+}
+
+() restore_interface_units(
+    context.CompilerContext& ctx,
+    codegen_unit.CodegenUnitSet& units,
+    build_state.BuildState?& previous
+) {
+    guard previous is .some(ref _ state) else { return; }
+    Int index! = 0;
+    while (index < state.work_product_count()) {
+        build_state.WorkProduct product = state.work_product_at(index);
+        if (module_for_product(ctx, product) is .some(module_id)) {
+            qid.PackageId package_id = ctx.store.resolve.module_ref(module_id).package_id;
+            units.ensure_unit(codegen_unit.CodegenUnitKey(
+                codegen_unit_kind(product.kind),
+                package_id.to_index(),
+                module_id.to_index()
+            ));
+        }
+        index = index + 1;
+    }
+}
+
+qid.ModuleId? module_for_product(
+    context.CompilerContext& ctx,
+    build_state.WorkProduct product
+) {
+    cache_identity.StableSourceIdentity identity =
+        cache_identity.StableSourceIdentity(product.source_identity);
+    guard module_for_source_identity(ctx, identity) is .some(module_id) else {
+        return null;
+    }
+    return module_id;
+}
+
+codegen_unit.CodegenUnitKind codegen_unit_kind(build_state.WorkProductKind kind) {
+    if (kind == .source_unit) { return .source_unit; }
+    return .monomorph_unit;
+}
+
+Bool reuse_interface_unit(
+    context.CompilerContext& ctx,
+    build_state.BuildState?& previous,
+    table.HashTable<qkey.Fingerprint128, Bool>& reused_sources,
+    build_state.BuildState&! next,
+    link_plan.LinkPlan&! links,
+    UInt8[]& path,
+    qkey.Fingerprint128 source_identity,
+    build_state.WorkProductKind kind
+) {
+    Bool reused = reuse_previous_unit(
+        ctx,
+        previous,
+        next,
+        links,
+        path,
+        source_identity,
+        kind
+    );
+    if (reused && kind == .source_unit) {
+        reused_sources.set(source_identity, true);
+    }
+    return reused;
+}
+
+Bool reuse_previous_unit(
+    context.CompilerContext& ctx,
+    build_state.BuildState?& previous,
+    build_state.BuildState&! next,
+    link_plan.LinkPlan&! links,
+    UInt8[]& path,
+    qkey.Fingerprint128 source_identity,
+    build_state.WorkProductKind kind
+) {
+    guard previous is .some(ref _ state) else { return false; }
+    guard state.find_work_product(source_identity, kind) is .some(product) else {
+        return false;
+    }
+    if (!build_state.work_product_is_available(
+        state,
+        source_identity,
+        kind,
+        path
+    )) {
+        return false;
+    }
+    next.upsert_work_product(product);
+    links.add_user_object(path);
+    ctx.store.object_artifacts.record_reused_unit();
+    record_reuse_status(ctx, kind, .hit);
+    return true;
+}
+
+Bool work_product_record_exists(
+    build_state.BuildState?& previous,
+    qkey.Fingerprint128 source_identity,
+    build_state.WorkProductKind kind
+) {
+    guard previous is .some(ref _ state) else { return false; }
+    return state.find_work_product(source_identity, kind) != null;
+}
+
+Bool emit_unit(
+    context.CompilerContext& ctx,
+    jil.Store& lowered,
+    codegen_unit.CodegenUnit& unit,
+    codegen.PreparedStore& prepared,
+    build_state.BuildState&! next,
+    link_plan.LinkPlan&! links,
+    UInt8[]& path,
+    cache_identity.StableSourceIdentity source_identity,
+    build_state.WorkProductKind kind,
+    qkey.Fingerprint128 input_fingerprint,
+    UInt8[]& llvm_triple,
+    Bool link_libc,
+    qid.ModuleId module_id
+) {
+    UInt8[]^ temporary = artifact_path.temporary_artifact_path(path, ".object.tmp.");
+    codegen.BackendResult result = codegen.emit_object_for_prepared_unit(
+        ctx,
+        lowered,
+        unit,
+        prepared,
+        temporary[..],
+        .debug,
+        link_libc,
+        llvm_triple
+    );
+    if (result.has_errors()) {
+        system_fs.remove_file(temporary[..]);
+        return false;
+    }
+    if (!system_fs.atomic_replace(temporary[..], path)) {
+        system_fs.remove_file(temporary[..]);
+        return false;
+    }
+    guard object_hash.hash_file(path) is .some(hash) else { return false; }
+    guard output_metadata(path) is .some(metadata) else { return false; }
+    next.upsert_work_product(build_state.WorkProduct(
+        source_identity.fingerprint,
+        kind,
+        input_fingerprint,
+        hash,
+        metadata.modified_ns,
+        UInt64(metadata.size)
+    ));
+    links.add_user_object(path);
+    ctx.store.object_artifacts.record_emitted_unit();
+    return true;
+}
+
+build_state.WorkProduct? reusable_product(
+    build_state.BuildState?& previous,
+    qkey.Fingerprint128 source_identity,
+    build_state.WorkProductKind kind,
+    qkey.Fingerprint128 input_fingerprint,
+    UInt8[]& path
+) {
+    guard previous is .some(ref _ state) else { return null; }
+    guard state.find_work_product(source_identity, kind) is .some(product) else {
+        return null;
+    }
+    if (product.input_fingerprint != input_fingerprint) { return null; }
+    guard output_metadata(path) is .some(metadata) else { return null; }
+    if (product.object_modified_ns == metadata.modified_ns
+        && product.object_size == UInt64(metadata.size)
+    ) {
+        return product;
+    }
+    guard object_hash.hash_file(path) is .some(actual_hash) else { return null; }
+    if (actual_hash != product.object_hash) { return null; }
+    return build_state.WorkProduct(
+        product.source_identity,
+        product.kind,
+        product.input_fingerprint,
+        product.object_hash,
+        metadata.modified_ns,
+        UInt64(metadata.size)
+    );
+}
+
+qkey.Fingerprint128? unit_input_fingerprint(
+    context.CompilerContext& ctx,
+    jil.Store& lowered,
+    codegen_unit.CodegenUnit& unit,
+    qid.ModuleId module_id,
+    UnitFingerprintContext fingerprints
+) {
+    if (unit.key.kind == .source_unit) {
+        object_key_builder.SourceObjectFingerprints source_fingerprints =
+            object_key_builder.source_object_fingerprints_for_module(ctx, module_id);
+        guard object_key_builder.source_object_key_for_module(
+            ctx,
+            module_id,
+            source_fingerprints,
+            fingerprints.target,
+            fingerprints.compiler,
+            fingerprints.profile
+        ) is .some(key) else {
+            return null;
+        }
+        qkey.Fingerprint128 source_fingerprint =
+            object_artifact.source_object_fingerprint(key);
+        return source_unit_input_fingerprint(ctx, module_id, source_fingerprint);
+    }
+
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    Int index! = 0;
+    while (index < unit.functions.len()) {
+        jil.Function function = lowered.functions.get(unit.functions.get(index).to_index());
+        guard object_key_builder.stable_instance_key_for_function(
+            ctx,
+            function,
+            fingerprints.target,
+            fingerprints.compiler,
+            fingerprints.profile
+        ) is .some(key) else {
+            return null;
+        }
+        parts.add(object_key.stable_instance_fingerprint(key$.ref()));
+        index = index + 1;
+    }
+    sort_fingerprints(parts$.ref());
+    return object_key.combine_fingerprints(UInt64(123), parts$.ref());
+}
+
+qkey.Fingerprint128? source_unit_input_fingerprint(
+    context.CompilerContext& ctx,
+    qid.ModuleId module_id,
+    qkey.Fingerprint128 source_fingerprint
+) {
+    guard source_ji.source_identity_for_module(ctx, module_id) is .some(identity) else {
+        return source_fingerprint;
+    }
+    guard ctx.store.source_dependencies.find(identity) is .some(node_id) else {
+        return source_fingerprint;
+    }
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(source_fingerprint);
+    list.ArrayList<source_graph.SourceNodeId> dependencies =
+        ctx.store.source_dependencies.dependency_nodes(node_id);
+    Int index! = 0;
+    while (index < dependencies.len()) {
+        source_graph.SourceNode& dependency =
+            ctx.store.source_dependencies.node(dependencies.get(index));
+        if (dependency_input_fingerprint(
+            ctx,
+            module_id,
+            dependency
+        ) is .some(dependency_fingerprint)) {
+            parts.add(dependency_fingerprint);
+        }
+        index = index + 1;
+    }
+    return object_key.combine_fingerprints(UInt64(126), parts$.ref());
+}
+
+qkey.Fingerprint128? dependency_input_fingerprint(
+    context.CompilerContext& ctx,
+    qid.ModuleId importer,
+    source_graph.SourceNode& dependency
+) {
+    guard module_for_source_identity(ctx, dependency.identity) is .some(module_id) else {
+        return null;
+    }
+    guard dependency_interface_fingerprint(
+        ctx,
+        importer,
+        module_id
+    ) is .some(interface_fingerprint) else {
+        return null;
+    }
+    list.ArrayList<qkey.Fingerprint128> parts! = list.ArrayList<qkey.Fingerprint128>();
+    parts.add(dependency.identity.fingerprint);
+    parts.add(interface_fingerprint);
+    return object_key.combine_fingerprints(UInt64(127), parts$.ref());
+}
+
+qid.ModuleId? module_for_source_identity(
+    context.CompilerContext& ctx,
+    cache_identity.StableSourceIdentity identity
+) {
+    Int index! = 0;
+    while (index < ctx.store.resolve.modules.len()) {
+        qid.ModuleId module_id = qid.ModuleId.from_index(index);
+        if (source_ji.source_identity_for_module(ctx, module_id) is .some(candidate)) {
+            if (candidate == identity) { return module_id; }
+        }
+        index = index + 1;
+    }
+    return null;
+}
+
+qkey.Fingerprint128? dependency_interface_fingerprint(
+    context.CompilerContext& ctx,
+    qid.ModuleId importer,
+    qid.ModuleId dependency
+) {
+    qid.PackageId importer_package = ctx.store.resolve.module_ref(importer).package_id;
+    qid.PackageId dependency_package = ctx.store.resolve.module_ref(dependency).package_id;
+    source.SourceId source_id = ctx.store.resolve.module_ref(dependency).source_id;
+    guard ctx.store.artifacts.load_interface(source_id) is .some(module_interface) else {
+        return null;
+    }
+    if (importer_package == dependency_package) {
+        return module_interface.interface_hash;
+    }
+    return module_interface.public_interface_hash;
+}
+
+list.ArrayList<Int> stable_unit_order(
+    context.CompilerContext& ctx,
+    codegen_unit.CodegenUnitSet& units
+) {
+    list.ArrayList<Int> order! = list.ArrayList<Int>();
+    Int index! = 0;
+    while (index < units.len()) {
+        if (unit_source_identity(ctx, units.unit_at(index)) == null) {
+            return order;
+        }
+        order.add(index);
+        Int current! = order.len() - 1;
+        while (current > 0 && unit_less(ctx, units, order.get(current), order.get(current - 1))) {
+            Int previous = order.get(current - 1);
+            order.set(current - 1, order.get(current));
+            order.set(current, previous);
+            current = current - 1;
+        }
+        index = index + 1;
+    }
+    return order;
+}
+
+Bool unit_less(
+    context.CompilerContext& ctx,
+    codegen_unit.CodegenUnitSet& units,
+    Int lhs_index,
+    Int rhs_index
+) {
+    codegen_unit.CodegenUnit& lhs = units.unit_at(lhs_index);
+    codegen_unit.CodegenUnit& rhs = units.unit_at(rhs_index);
+    qkey.Fingerprint128 lhs_identity = unit_source_identity(ctx, lhs)$.some();
+    qkey.Fingerprint128 rhs_identity = unit_source_identity(ctx, rhs)$.some();
+    if (lhs_identity.high != rhs_identity.high) {
+        return lhs_identity.high < rhs_identity.high;
+    }
+    if (lhs_identity.low != rhs_identity.low) {
+        return lhs_identity.low < rhs_identity.low;
+    }
+    return Int(lhs.key.kind) < Int(rhs.key.kind);
+}
+
+qkey.Fingerprint128? unit_source_identity(
+    context.CompilerContext& ctx,
+    codegen_unit.CodegenUnit& unit
+) {
+    qid.ModuleId module_id = qid.ModuleId.from_index(unit.key.module_index);
+    guard source_ji.source_identity_for_module(ctx, module_id) is .some(identity) else {
+        return null;
+    }
+    return identity.fingerprint;
+}
+
+() sort_fingerprints(list.ArrayList<qkey.Fingerprint128>& values) {
+    Int index! = 1;
+    while (index < values.len()) {
+        Int current! = index;
+        while (current > 0 && fingerprint_less(values.get(current), values.get(current - 1))) {
+            qkey.Fingerprint128 previous = values.get(current - 1);
+            values.set(current - 1, values.get(current));
+            values.set(current, previous);
+            current = current - 1;
+        }
+        index = index + 1;
+    }
+}
+
+Bool fingerprint_less(qkey.Fingerprint128 lhs, qkey.Fingerprint128 rhs) {
+    if (lhs.high != rhs.high) { return lhs.high < rhs.high; }
+    return lhs.low < rhs.low;
+}
+
+build_state.WorkProductKind work_product_kind(codegen_unit.CodegenUnitKind kind) {
+    if (kind == .source_unit) { return .source_unit; }
+    return .monomorph_unit;
+}
+
+UInt8[]^ object_path(
+    UInt8[]& context_root,
+    cache_identity.StableSourceIdentity source_identity,
+    build_state.WorkProductKind kind
+) {
+    if (kind == .source_unit) {
+        return artifact_path.stable_source_object_path(context_root, source_identity);
+    }
+    return artifact_path.stable_source_monomorph_object_path(context_root, source_identity);
+}
+
+() record_reuse_status(
+    context.CompilerContext& ctx,
+    build_state.WorkProductKind kind,
+    object_artifact.ObjectArtifactStatus status
+) {
+    if (kind == .source_unit) {
+        ctx.store.object_artifacts.record_source_lookup(status);
+        return;
+    }
+    ctx.store.object_artifacts.record_monomorph_lookup(status);
+}
+
+() record_reachable_sources(
+    context.CompilerContext& ctx,
+    build_state.BuildState&! state,
+    UInt8[]& source_base,
+    UInt8[]& context_root
+) {
+    Int index! = 0;
+    while (index < ctx.store.resolve.modules.len()) {
+        qid.ModuleId module_id = qid.ModuleId.from_index(index);
+        source.SourceId source_id = ctx.store.resolve.module_ref(module_id).source_id;
+        source.SourceRecord record = ctx.store.sources.get(source_id);
+        if (record.key.kind != .file) {
+            index = index + 1;
+            continue;
+        }
+        if (cache_identity.path_is_within(record.key.value, context_root)) {
+            index = index + 1;
+            continue;
+        }
+        UInt8[]^ relative = cache_identity.relative_path(source_base, record.key.value);
+        if (!reachable_source_seen(state, relative[..])) {
+            state.add_reachable_source(relative[..]);
+        }
+        index = index + 1;
+    }
+}
+
+Bool reachable_source_seen(build_state.BuildState& state, UInt8[]& path) {
+    Int index! = 0;
+    while (index < state.reachable_source_count()) {
+        if (string.equal(state.reachable_source_at(index), path)) { return true; }
+        index = index + 1;
+    }
+    return false;
+}
+
+system_fs.FileMetadata? output_metadata(UInt8[]& path) {
+    guard system_fs.file_metadata(path) is .some(metadata) else { return null; }
+    if (metadata.size < 0) { return null; }
+    return metadata;
+}

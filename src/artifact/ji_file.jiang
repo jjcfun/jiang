@@ -6,22 +6,54 @@
 import qkey = "../incremental/key.jiang";
 import fs = "../system/fs.jiang";
 import list = "../support/list.jiang";
+import artifact_path = "./path.jiang";
+import object_hash = "./object_hash.jiang";
 
 public enum JiSectionKind {
     import_summary,
     interface_section,
     generic_templates,
     source_map,
-    object_closure,
 }
 
 public struct JiHeader: Copyable {
     public UInt64 magic;
     public Int format_version;
     public UInt64 compiler_version;
+    public qkey.Fingerprint128 stable_source_identity;
+    public UInt64 source_modified_ns;
+    public UInt64 source_size;
     public UInt64 source_hash;
+    public qkey.Fingerprint128 package_interface_fingerprint;
+    public qkey.Fingerprint128 public_interface_fingerprint;
     public Int section_table_offset;
     public Int section_table_length;
+
+    public init(self,
+        UInt64 magic,
+        Int format_version,
+        UInt64 compiler_version,
+        qkey.Fingerprint128 stable_source_identity,
+        UInt64 source_modified_ns,
+        UInt64 source_size,
+        UInt64 source_hash,
+        qkey.Fingerprint128 package_interface_fingerprint,
+        qkey.Fingerprint128 public_interface_fingerprint,
+        Int section_table_offset,
+        Int section_table_length
+    ) {
+        self.magic = magic;
+        self.format_version = format_version;
+        self.compiler_version = compiler_version;
+        self.stable_source_identity = stable_source_identity;
+        self.source_modified_ns = source_modified_ns;
+        self.source_size = source_size;
+        self.source_hash = source_hash;
+        self.package_interface_fingerprint = package_interface_fingerprint;
+        self.public_interface_fingerprint = public_interface_fingerprint;
+        self.section_table_offset = section_table_offset;
+        self.section_table_length = section_table_length;
+    }
 
     public init(self,
         UInt64 magic,
@@ -34,9 +66,32 @@ public struct JiHeader: Copyable {
         self.magic = magic;
         self.format_version = format_version;
         self.compiler_version = compiler_version;
+        self.stable_source_identity = qkey.Fingerprint128();
+        self.source_modified_ns = UInt64(0);
+        self.source_size = UInt64(0);
         self.source_hash = source_hash;
+        self.package_interface_fingerprint = qkey.Fingerprint128();
+        self.public_interface_fingerprint = qkey.Fingerprint128();
         self.section_table_offset = section_table_offset;
         self.section_table_length = section_table_length;
+    }
+}
+
+public struct JiSourceMetadata: Copyable {
+    public qkey.Fingerprint128 stable_source_identity;
+    public UInt64 source_modified_ns;
+    public UInt64 source_size;
+    public UInt64 source_hash;
+    public qkey.Fingerprint128 package_interface_fingerprint;
+    public qkey.Fingerprint128 public_interface_fingerprint;
+
+    public init(self, UInt64 source_hash) {
+        self.stable_source_identity = qkey.Fingerprint128();
+        self.source_modified_ns = UInt64(0);
+        self.source_size = UInt64(0);
+        self.source_hash = source_hash;
+        self.package_interface_fingerprint = qkey.Fingerprint128();
+        self.public_interface_fingerprint = qkey.Fingerprint128();
     }
 }
 
@@ -111,6 +166,18 @@ public JiFileImage build_ji_file_image(
     UInt64 source_hash,
     list.ArrayList<JiSectionPayload> payloads
 ) {
+    return build_ji_file_image(
+        compiler_version,
+        JiSourceMetadata(source_hash),
+        payloads
+    );
+}
+
+public JiFileImage build_ji_file_image(
+    UInt64 compiler_version,
+    JiSourceMetadata metadata,
+    list.ArrayList<JiSectionPayload> payloads
+) {
     list.ArrayList<Int> order = sorted_section_payload_indexes(payloads$.ref());
     JiSectionTable sections = JiSectionTable();
     list.ArrayList<UInt8> bytes = list.ArrayList<UInt8>();
@@ -123,20 +190,94 @@ public JiFileImage build_ji_file_image(
         index = index + 1;
     }
 
-    JiHeader header = JiHeader(ji_magic(), 1, compiler_version, source_hash, header_size(), sections.len());
+    JiHeader header = JiHeader(
+        ji_magic(),
+        current_format_version(),
+        compiler_version,
+        metadata.stable_source_identity,
+        metadata.source_modified_ns,
+        metadata.source_size,
+        metadata.source_hash,
+        metadata.package_interface_fingerprint,
+        metadata.public_interface_fingerprint,
+        header_size(),
+        sections.len()
+    );
     return JiFileImage.from_owned_bytes(header, sections, bytes);
 }
 
 public Bool write_ji_file(UInt8[]& path, JiFileImage& image) {
     list.ArrayList<UInt8> bytes = encode_ji_file(image);
     UInt8[]& encoded = bytes.slice();
-    return fs.write_all(path, encoded);
+    UInt8[]^ temporary = artifact_path.temporary_artifact_path(path, ".ji.tmp.");
+    if (!fs.write_all(temporary[..], encoded)) {
+        fs.remove_file(temporary[..]);
+        return false;
+    }
+    if (fs.atomic_replace(temporary[..], path)) {
+        return true;
+    }
+    fs.remove_file(temporary[..]);
+    return false;
+}
+
+public JiHeader? read_ji_header(UInt8[]& path) {
+    guard fs.read_at(path, 0, header_size()) is .some(bytes) else { return null; }
+    JiHeader header = read_header(bytes);
+    if (!header_valid(header)) { return null; }
+    return header;
+}
+
+public JiDiskLayout? read_ji_layout(UInt8[]& path) {
+    guard read_ji_header(path) is .some(header) else { return null; }
+    guard fs.file_size(path) is .some(file_length) else { return null; }
+    if (!section_table_fits(header, file_length)) { return null; }
+    Int table_size = header.section_table_length * section_entry_size();
+    guard fs.read_at(path, header.section_table_offset, table_size) is .some(bytes) else {
+        return null;
+    }
+    JiSectionTable sections = JiSectionTable();
+    Int minimum_offset! = header.section_table_offset + table_size;
+    Int index! = 0;
+    while (index < header.section_table_length) {
+        guard read_section_entry(bytes, index * section_entry_size()) is .some(entry) else {
+            return null;
+        }
+        if (!disk_section_valid(entry, minimum_offset, file_length)) { return null; }
+        if (sections.find(entry.kind) != null) { return null; }
+        sections.add(entry);
+        minimum_offset = entry.offset + entry.length;
+        index = index + 1;
+    }
+    return JiDiskLayout(header, sections);
+}
+
+@life()
+public UInt8[]&? read_ji_section(
+    UInt8[]& path,
+    JiDiskLayout& layout,
+    JiSectionKind kind
+) {
+    guard layout.sections.find(kind) is .some(entry) else { return null; }
+    guard fs.read_at(path, entry.offset, entry.length) is .some(bytes) else { return null; }
+    if (object_hash.hash_bytes(bytes) != entry.hash) { return null; }
+    return bytes;
 }
 
 public JiFileImage? read_ji_file(UInt8[]& path) {
-    UInt8[]&? loaded = fs.read_all(path);
-    guard loaded is .some(bytes) else { return null; }
-    return decode_ji_file(bytes);
+    guard read_ji_layout(path) is .some(layout) else { return null; }
+    list.ArrayList<UInt8> payload! = list.ArrayList<UInt8>();
+    JiSectionTable sections! = JiSectionTable();
+    Int index! = 0;
+    while (index < layout.sections.len()) {
+        JiSectionEntry entry = layout.sections.entry_at(index);
+        guard read_disk_section(path, entry) is .some(bytes) else { return null; }
+        Int offset = payload.len();
+        append_bytes(payload$.ref(), bytes);
+        sections.add(JiSectionEntry(entry.kind, offset, entry.length, entry.hash));
+        index = index + 1;
+    }
+    return JiFileImage.from_owned_bytes(layout.header, sections, payload);
 }
 
 public list.ArrayList<UInt8> encode_ji_file(JiFileImage& image) {
@@ -148,7 +289,12 @@ public list.ArrayList<UInt8> encode_ji_file(JiFileImage& image) {
         ji_magic(),
         image.header.format_version,
         image.header.compiler_version,
+        image.header.stable_source_identity,
+        image.header.source_modified_ns,
+        image.header.source_size,
         image.header.source_hash,
+        image.header.package_interface_fingerprint,
+        image.header.public_interface_fingerprint,
         table_offset,
         table_length
     ));
@@ -173,23 +319,20 @@ public JiFileImage? decode_ji_file(UInt8[]& bytes) {
         return null;
     }
     JiHeader header = read_header(bytes);
-    if (header.magic != ji_magic()) {
-        return null;
-    }
+    if (!header_valid(header)) { return null; }
+    if (!section_table_fits(header, bytes.length)) { return null; }
     Int table_end = header.section_table_offset + header.section_table_length * section_entry_size();
-    if (header.section_table_offset < header_size() || table_end > bytes.length) {
-        return null;
-    }
 
     JiSectionTable sections = JiSectionTable();
+    Int minimum_offset! = table_end;
     Int index! = 0;
     while (index < header.section_table_length) {
         Int entry_offset = header.section_table_offset + index * section_entry_size();
-        JiSectionEntry entry = read_section_entry(bytes, entry_offset);
-        if (entry.offset < table_end || entry.offset + entry.length > bytes.length) {
-            return null;
-        }
+        guard read_section_entry(bytes, entry_offset) is .some(entry) else { return null; }
+        if (!disk_section_valid(entry, minimum_offset, bytes.length)) { return null; }
+        if (sections.find(entry.kind) != null) { return null; }
         sections.add(JiSectionEntry(entry.kind, entry.offset - table_end, entry.length, entry.hash));
+        minimum_offset = entry.offset + entry.length;
         index = index + 1;
     }
 
@@ -198,15 +341,30 @@ public JiFileImage? decode_ji_file(UInt8[]& bytes) {
         header.magic,
         header.format_version,
         header.compiler_version,
+        header.stable_source_identity,
+        header.source_modified_ns,
+        header.source_size,
         header.source_hash,
+        header.package_interface_fingerprint,
+        header.public_interface_fingerprint,
         header.section_table_offset,
         header.section_table_length
     );
     return JiFileImage.from_owned_bytes(memory_header, sections, payload);
 }
 
-public struct JiFileImage: Movable {
+public struct JiDiskLayout: Movable {
     public JiHeader header;
+    public JiSectionTable sections;
+
+    public init(self, JiHeader header, JiSectionTable sections) {
+        self.header = header;
+        self.sections = sections;
+    }
+}
+
+public struct JiFileImage: Movable {
+    public JiHeader header!;
     public JiSectionTable sections;
     list.ArrayList<UInt8> bytes!;
 
@@ -243,13 +401,42 @@ public struct JiFileImage: Movable {
         guard self.sections.find(kind) is .some(section) else { return null; }
         return self.read_at(section.offset, section.length);
     }
+
     public UInt8[]& payload_bytes(self) {
         return self.bytes.slice();
     }
 }
 
+Bool header_valid(JiHeader header) {
+    if (header.magic != ji_magic()) { return false; }
+    if (header.format_version != current_format_version()) { return false; }
+    if (header.section_table_offset < header_size()) { return false; }
+    return header.section_table_length >= 0;
+}
+
+Bool section_table_fits(JiHeader header, Int file_length) {
+    if (file_length < header.section_table_offset) { return false; }
+    Int available = file_length - header.section_table_offset;
+    return header.section_table_length <= available / section_entry_size();
+}
+
+Bool disk_section_valid(JiSectionEntry entry, Int minimum_offset, Int file_length) {
+    if (entry.offset < minimum_offset || entry.offset > file_length) { return false; }
+    if (entry.length < 0) { return false; }
+    return entry.length <= file_length - entry.offset;
+}
+
+@life()
+UInt8[]&? read_disk_section(UInt8[]& path, JiSectionEntry entry) {
+    guard fs.read_at(path, entry.offset, entry.length) is .some(bytes) else {
+        return null;
+    }
+    if (object_hash.hash_bytes(bytes) != entry.hash) { return null; }
+    return bytes;
+}
+
 Int header_size() {
-    return 48;
+    return 112;
 }
 
 Int section_entry_size() {
@@ -260,11 +447,20 @@ UInt64 ji_magic() {
     return UInt64(1785686385);
 }
 
+Int current_format_version() {
+    return 3;
+}
+
 () write_header(list.ArrayList<UInt8>& output, JiHeader header) {
     write_uint64(output, header.magic);
     write_uint64(output, UInt64(header.format_version));
     write_uint64(output, header.compiler_version);
+    write_fingerprint(output, header.stable_source_identity);
+    write_uint64(output, header.source_modified_ns);
+    write_uint64(output, header.source_size);
     write_uint64(output, header.source_hash);
+    write_fingerprint(output, header.package_interface_fingerprint);
+    write_fingerprint(output, header.public_interface_fingerprint);
     write_uint64(output, UInt64(header.section_table_offset));
     write_uint64(output, UInt64(header.section_table_length));
 }
@@ -274,9 +470,29 @@ JiHeader read_header(UInt8[]& bytes) {
         read_uint64(bytes, 0),
         Int(read_uint64(bytes, 8)),
         read_uint64(bytes, 16),
-        read_uint64(bytes, 24),
-        Int(read_uint64(bytes, 32)),
-        Int(read_uint64(bytes, 40))
+        read_fingerprint(bytes, 24),
+        read_uint64(bytes, 40),
+        read_uint64(bytes, 48),
+        read_uint64(bytes, 56),
+        read_fingerprint(bytes, 64),
+        read_fingerprint(bytes, 80),
+        Int(read_uint64(bytes, 96)),
+        Int(read_uint64(bytes, 104))
+    );
+}
+
+() write_fingerprint(
+    list.ArrayList<UInt8>& output,
+    qkey.Fingerprint128 fingerprint
+) {
+    write_uint64(output, fingerprint.low);
+    write_uint64(output, fingerprint.high);
+}
+
+qkey.Fingerprint128 read_fingerprint(UInt8[]& bytes, Int offset) {
+    return qkey.Fingerprint128(
+        read_uint64(bytes, offset),
+        read_uint64(bytes, offset + 8)
     );
 }
 
@@ -288,25 +504,28 @@ JiHeader read_header(UInt8[]& bytes) {
     write_uint64(output, entry.hash.high);
 }
 
-JiSectionEntry read_section_entry(UInt8[]& bytes, Int offset) {
+JiSectionEntry? read_section_entry(UInt8[]& bytes, Int offset) {
+    guard section_kind_from_int(Int(read_uint64(bytes, offset))) is .some(kind) else {
+        return null;
+    }
     return JiSectionEntry(
-        section_kind_from_int(Int(read_uint64(bytes, offset))),
+        kind,
         Int(read_uint64(bytes, offset + 8)),
         Int(read_uint64(bytes, offset + 16)),
         qkey.Fingerprint128(read_uint64(bytes, offset + 24), read_uint64(bytes, offset + 32))
     );
 }
 
-JiSectionKind section_kind_from_int(Int value) {
+JiSectionKind? section_kind_from_int(Int value) {
     JiSectionKind import_summary = .import_summary;
     JiSectionKind interface_section = .interface_section;
     JiSectionKind generic_templates = .generic_templates;
-    JiSectionKind object_closure = .object_closure;
-    if (value == Int(import_summary)) { return .import_summary; }
-    if (value == Int(interface_section)) { return .interface_section; }
-    if (value == Int(generic_templates)) { return .generic_templates; }
-    if (value == Int(object_closure)) { return .object_closure; }
-    return .source_map;
+    JiSectionKind source_map = .source_map;
+    if (value == Int(import_summary)) { return JiSectionKind.import_summary; }
+    if (value == Int(interface_section)) { return JiSectionKind.interface_section; }
+    if (value == Int(generic_templates)) { return JiSectionKind.generic_templates; }
+    if (value == Int(source_map)) { return JiSectionKind.source_map; }
+    return null;
 }
 
 () write_uint64(list.ArrayList<UInt8>& output, UInt64 value) {

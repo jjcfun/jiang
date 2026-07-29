@@ -6,7 +6,10 @@
 
 import context = "../context.jiang";
 import artifact = "../artifact/source.jiang";
+import cache_identity = "../artifact/cache_identity.jiang";
 import artifact_path = "../artifact/path.jiang";
+import ji = "../artifact/ji_file.jiang";
+import import_context = "../artifact/import_context.jiang";
 import driver_options = "../driver/options.jiang";
 import source_ji = "../artifact/source_ji.jiang";
 import lang_registry_builder = "../lang/registry_builder.jiang";
@@ -14,6 +17,7 @@ import store_api = "../store.jiang";
 import syntax_store = "../syntax/store.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
+import source_graph = "../incremental/source_graph.jiang";
 import source = "../source.jiang";
 import package_manifest = "../source/package_manifest.jiang";
 import fs = "../system/fs.jiang";
@@ -113,6 +117,7 @@ public struct ModuleGraphBuilder: Copyable {
         self.discover_module_imports(graph$.ref(), root_module);
         self.discover_std_prelude_imports(graph$.ref());
         self.discover_target_startup_imports(graph$.ref());
+        self.record_implicit_source_dependencies(graph$.ref());
         self.check_package_dependency_cycles(graph$.ref());
         return graph;
     }
@@ -185,12 +190,14 @@ public struct ModuleGraphBuilder: Copyable {
         if (!graph.add_module(module_id)) {
             return;
         }
+        self.record_source_node(module_id);
         self.collect_imports_for_module(module_id);
         Int index! = 0;
         while (index < self.store.resolve.module_ref(module_id).imports.len()) {
             self.discover_import_target(graph, module_id, index);
             index = index + 1;
         }
+        self.write_import_summary(module_id);
     }
 
     public () collect_imports_for_module(self, qid.ModuleId module_id) {
@@ -211,6 +218,7 @@ public struct ModuleGraphBuilder: Copyable {
             self.set_module_state(module_id, .imports_collected);
             return;
         }
+        self.mark_source_dirty(module_id);
         self.collect_imports_from_ast(module_id);
         self.write_import_summary(module_id);
         self.set_module_state(module_id, .imports_collected);
@@ -227,13 +235,19 @@ public struct ModuleGraphBuilder: Copyable {
         store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
         source.SourceRecord source_record = self.store.sources.get(module.source_id);
         if (self.store.artifacts.load_import_summary(module.source_id) == null) {
-            self.load_source_artifacts_from_file(module_id);
+            self.load_import_summary_from_file(module_id);
         }
         guard self.store.artifacts.load_import_summary(module.source_id) is .some(summary) else {
             self.store.artifacts.record_import_lookup(.missing);
             return false;
         }
         if (summary.source_hash != source_record.content_hash) {
+            self.store.artifacts.record_import_lookup(.stale);
+            return false;
+        }
+        qkey.Fingerprint128 current_context =
+            import_context.fingerprint_for_source_path(source_record.name());
+        if (summary.import_context_fingerprint != current_context) {
             self.store.artifacts.record_import_lookup(.stale);
             return false;
         }
@@ -279,9 +293,6 @@ public struct ModuleGraphBuilder: Copyable {
     }
 
     () write_import_summary(self, qid.ModuleId module_id) {
-        if (!self.use_source_artifacts) {
-            return;
-        }
         store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
         source.SourceRecord source_record = self.store.sources.get(module.source_id);
         store.PackageRecord& package_record = self.store.resolve.package_ref(module.package_id);
@@ -291,7 +302,8 @@ public struct ModuleGraphBuilder: Copyable {
             source_record.revision,
             package_record.name,
             module.path_symbol,
-            self.store.symbols.intern(source_record.name())
+            self.store.symbols.intern(source_record.name()),
+            import_context.fingerprint_for_source_path(source_record.name())
         );
 
         Int index! = 0;
@@ -302,11 +314,40 @@ public struct ModuleGraphBuilder: Copyable {
                 import_record.visibility,
                 import_record.flatten,
                 import_record.path_symbol,
-                import_record.alias_symbol
+                import_record.alias_symbol,
+                self.import_target_identity(import_record)
             ));
             index = index + 1;
         }
         self.store.artifacts.store_import_summary(module.source_id, summary);
+    }
+
+    qkey.Fingerprint128? import_target_identity(self, store.ImportRecord import_record) {
+        guard import_record.target_module is .some(target_module) else { return null; }
+        guard source_ji.source_identity_for_module(self.ctx, target_module) is .some(identity) else {
+            return null;
+        }
+        return identity.fingerprint;
+    }
+
+    Bool cached_import_target_matches(
+        self,
+        qid.ModuleId module_id,
+        Int import_index,
+        qid.ModuleId target_module
+    ) {
+        source.SourceId source_id = self.store.resolve.module_ref(module_id).source_id;
+        guard self.store.artifacts.load_import_summary(source_id) is .some(summary) else {
+            return true;
+        }
+        if (import_index < 0 || import_index >= summary.imports.len()) { return false; }
+        guard summary.imports.get(import_index).target_source_identity is .some(expected) else {
+            return true;
+        }
+        guard source_ji.source_identity_for_module(self.ctx, target_module) is .some(actual) else {
+            return false;
+        }
+        return expected == actual.fingerprint;
     }
 
     Bool imports_ready(self, ModuleResolvePassState state) {
@@ -365,7 +406,11 @@ public struct ModuleGraphBuilder: Copyable {
             return;
         }
         self.store.resolve.set_import_target(module_id, import_index, target_module);
+        if (!self.cached_import_target_matches(module_id, import_index, target_module)) {
+            self.mark_source_dirty(module_id);
+        }
         graph.add_import(module_id, target_module, import_record.span, import_record.path_symbol);
+        self.record_source_dependency(module_id, target_module);
         self.discover_module_imports(graph, target_module);
     }
 
@@ -424,7 +469,7 @@ public struct ModuleGraphBuilder: Copyable {
             return summary.source_hash == source_record.content_hash;
         }
         qid.ModuleId module_id = self.ensure_module(source_id);
-        if (self.load_source_artifacts_from_file(module_id)) {
+        if (self.load_import_summary_from_file(module_id)) {
             return self.has_fresh_import_summary(source_id, source_record);
         }
         return false;
@@ -566,6 +611,7 @@ public struct ModuleGraphBuilder: Copyable {
         if (self.source_has_ast(source_id)) {
             return source_id;
         }
+        self.ctx.store.artifacts.record_source_parse();
         syntax.SyntaxResult parsed = syntax.parse_source(self.ctx, bytes, source_id);
         if (parsed.has_errors()) {
             diagnostics.add_error(
@@ -601,7 +647,7 @@ public struct ModuleGraphBuilder: Copyable {
     ) {
         UInt8[]& import_path = self.store.symbols.text(import_record.path_symbol);
         Path primary = self.import_paths.primary_file_import_path(module_id, import_path);
-        return self.load_file_import(primary.text(), false);
+        return self.load_file_import(primary.text(), true);
     }
 
     Bool text_ends_with(self, UInt8[]& text, UInt8[]& suffix) {
@@ -663,19 +709,26 @@ public struct ModuleGraphBuilder: Copyable {
 
     source.SourceId? load_file_import(self, UInt8[]& source_path, Bool allow_summary) {
         Path normalized_text = std.path.normalize(source_path);
+        Bool use_summary = allow_summary && !self.is_std_source(normalized_text.text());
+        if (use_summary && self.load_file_import_from_header(normalized_text.text()) is .some(cached)) {
+            return cached;
+        }
         UInt8[]&? loaded = fs.read_all(normalized_text.text());
         guard loaded is .some(bytes) else { return null; }
         UInt64 content_hash = source.content_hash(bytes);
         source.SourceId source_id = self.store.sources.intern_path(normalized_text.text(), content_hash);
+        source.SourceRecord source_record = self.store.sources.get(source_id);
         // std facade 的公开 alias 会跨多个 std 子模块绑定；当前 source
         // interface 尚不能完整恢复这组 target，先保留源码解析边界。
-        Bool use_summary = allow_summary && !self.is_std_source(normalized_text.text());
         if (self.source_has_ast(source_id)) {
             return source_id;
         }
         if (use_summary && self.source_has_ast_or_summary(source_id)) { return source_id; }
         qid.ModuleId module_id = self.ensure_module(source_id);
-        if (use_summary && self.load_source_artifacts_from_file(module_id)) {
+        if (use_summary
+            && self.load_source_artifacts_from_file(module_id)
+            && self.has_fresh_import_summary(source_id, source_record)
+        ) {
             return source_id;
         }
         guard self.parse_file_source(normalized_text.text(), bytes, source_id) is .some(parsed) else {
@@ -695,6 +748,44 @@ public struct ModuleGraphBuilder: Copyable {
         return source_id;
     }
 
+    source.SourceId? load_file_import_from_header(self, UInt8[]& source_path) {
+        guard fs.file_metadata(source_path) is .some(metadata) else { return null; }
+        source.SourceId source_id = self.store.sources.reserve_path(source_path);
+        qid.ModuleId module_id = self.ensure_module(source_id);
+        UInt8[]^ artifact_file = self.source_artifact_file(module_id);
+        if (artifact_file.length == 0) { return null; }
+        guard ji.read_ji_header(artifact_file[..]) is .some(header) else {
+            return null;
+        }
+        if (!self.cached_source_snapshot_matches(module_id, header, metadata)) {
+            return null;
+        }
+        source.SourceRecord current = self.store.sources.get(source_id);
+        if (current.content_hash_known && current.content_hash != header.source_hash) {
+            return null;
+        }
+        source.SourceId finalized = self.store.sources.intern_path(source_path, header.source_hash);
+        assert(finalized.to_index() == source_id.to_index());
+        if (!self.load_import_summary_from_file(module_id)) { return null; }
+        return source_id;
+    }
+
+    Bool cached_source_snapshot_matches(
+        self,
+        qid.ModuleId module_id,
+        ji.JiHeader header,
+        fs.FileMetadata metadata
+    ) {
+        if (header.compiler_version != self.compiler_version_hash) { return false; }
+        guard source_ji.source_identity_for_module(self.ctx, module_id) is .some(identity) else {
+            return false;
+        }
+        if (header.stable_source_identity != identity.fingerprint) { return false; }
+        if (header.source_modified_ns != metadata.modified_ns) { return false; }
+        if (metadata.size < 0) { return false; }
+        return header.source_size == UInt64(metadata.size);
+    }
+
     syntax.SyntaxResult? parse_file_source(self,
         UInt8[]& source_path,
         UInt8[]& bytes,
@@ -710,6 +801,7 @@ public struct ModuleGraphBuilder: Copyable {
         if (!lang_registry.ok) {
             return null;
         }
+        self.ctx.store.artifacts.record_source_parse();
         return syntax.parse_source_with_lang(self.ctx, bytes, source_id, lang_registry.registry$.ref());
     }
 
@@ -739,18 +831,165 @@ public struct ModuleGraphBuilder: Copyable {
         return false;
     }
 
-    UInt8[]^ source_artifact_file(self, qid.ModuleId module_id) {
+    Bool load_import_summary_from_file(self, qid.ModuleId module_id) {
+        if (!self.use_source_artifacts) { return false; }
+        guard source_ji.source_identity_for_module(self.ctx, module_id) is .some(identity) else {
+            return false;
+        }
+        UInt8[]^ artifact_file = artifact_path.stable_source_ji_path(
+            self.artifact_cache_dir,
+            identity
+        );
+        if (!fs.file_exists(artifact_file[..])) { return false; }
         store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
-        guard self.store.incremental.stable_id_for_def(module.def_id) is .some(stable_id) else {
+        return source_ji.load_import_summary_from_ji(
+            self.ctx,
+            self.store.artifacts$.ref(),
+            module.source_id,
+            artifact_file[..],
+            self.compiler_version_hash,
+            identity.fingerprint
+        );
+    }
+
+    UInt8[]^ source_artifact_file(self, qid.ModuleId module_id) {
+        guard source_ji.source_identity_for_module(self.ctx, module_id) is .some(source_identity) else {
             return new "";
         }
-        source.SourceRecord source_record = self.store.sources.get(module.source_id);
-        return artifact_path.source_ji_path(
+        return artifact_path.stable_source_ji_path(
             self.artifact_cache_dir,
-            stable_id,
-            source_record.content_hash,
-            self.compiler_version_hash
+            source_identity
         );
+    }
+
+    () record_source_node(self, qid.ModuleId module_id) {
+        guard self.source_graph_identity(module_id) is .some(identity) else { return; }
+        if (self.store.source_dependencies.find(identity) != null) { return; }
+        store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
+        store.PackageRecord& package_record = self.store.resolve.package_ref(module.package_id);
+        guard self.store.incremental.stable_id_for_def(package_record.def_id) is .some(package_id) else {
+            return;
+        }
+        source.SourceRecord source_record = self.store.sources.get(module.source_id);
+        UInt8[]^ relative_path = cache_identity.package_relative_source_path(
+            self.store.symbols.text(package_record.dir_path),
+            source_record.name()
+        );
+        ji.JiHeader? previous_header! = null;
+        Bool dirty! = true;
+        if (self.valid_source_layout(module_id, source_record) is .some(layout)) {
+            previous_header = layout.header;
+            dirty = false;
+        } else if (self.previous_source_header(module_id) is .some(header)) {
+            // 源码变化后不能复用旧 interface，但仍需保留上次成功发布的
+            // 可见接口摘要，以判断是否需要继续向 importer 传播失效。
+            previous_header = header;
+        }
+        self.store.source_dependencies.ensure_node(
+            identity,
+            qkey.Fingerprint128(package_id.low, package_id.high),
+            relative_path[..],
+            previous_header,
+            dirty
+        );
+    }
+
+    () record_source_dependency(self, qid.ModuleId importer, qid.ModuleId dependency) {
+        guard self.source_node_id(importer) is .some(importer_id) else { return; }
+        guard self.source_node_id(dependency) is .some(dependency_id) else { return; }
+        self.store.source_dependencies.add_dependency(importer_id, dependency_id);
+    }
+
+    () record_implicit_source_dependencies(self, module_graph.ModuleGraph& graph) {
+        Int index! = 0;
+        while (index < graph.module_count()) {
+            qid.ModuleId module_id = graph.module_at(index);
+            self.record_implicit_core_dependency(module_id);
+            self.record_implicit_prelude_dependency(module_id);
+            index = index + 1;
+        }
+    }
+
+    () record_implicit_core_dependency(self, qid.ModuleId module_id) {
+        guard self.store.resolve.core_module is .some(core_module) else { return; }
+        if (module_id == core_module) { return; }
+        self.record_source_dependency(module_id, core_module);
+    }
+
+    () record_implicit_prelude_dependency(self, qid.ModuleId module_id) {
+        guard self.store.resolve.std_prelude_module is .some(prelude_module) else { return; }
+        if (module_id == prelude_module) { return; }
+        store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
+        source.SourceRecord source_record = self.store.sources.get(module.source_id);
+        if (self.is_std_source(source_record.name())) { return; }
+        if (self.store.resolve.package_ref(module.package_id).kind == .core) { return; }
+        self.record_source_dependency(module_id, prelude_module);
+    }
+
+    source_graph.SourceNodeId? source_node_id(self, qid.ModuleId module_id) {
+        self.record_source_node(module_id);
+        guard self.source_graph_identity(module_id) is .some(identity) else { return null; }
+        return self.store.source_dependencies.find(identity);
+    }
+
+    () mark_source_dirty(self, qid.ModuleId module_id) {
+        guard self.source_node_id(module_id) is .some(node_id) else { return; }
+        self.store.source_dependencies.mark_dirty(node_id);
+    }
+
+    cache_identity.StableSourceIdentity? source_graph_identity(self, qid.ModuleId module_id) {
+        return source_ji.source_identity_for_module(self.ctx, module_id);
+    }
+
+    ji.JiDiskLayout? valid_source_layout(
+        self,
+        qid.ModuleId module_id,
+        source.SourceRecord source_record
+    ) {
+        if (!source_record.content_hash_known) { return null; }
+        UInt8[]^ path = self.source_artifact_file(module_id);
+        if (path.length == 0) { return null; }
+        guard ji.read_ji_layout(path[..]) is .some(layout) else { return null; }
+        if (!self.source_layout_matches(module_id, source_record, layout$.ref())) {
+            return null;
+        }
+        return layout;
+    }
+
+    ji.JiHeader? previous_source_header(self, qid.ModuleId module_id) {
+        UInt8[]^ path = self.source_artifact_file(module_id);
+        if (path.length == 0) { return null; }
+        guard ji.read_ji_layout(path[..]) is .some(layout) else { return null; }
+        if (!self.source_layout_identity_matches(module_id, layout.header)) {
+            return null;
+        }
+        if (source_ji.read_section(
+            self.ctx,
+            path[..],
+            layout$.ref(),
+            .interface_section
+        ) == null) {
+            return null;
+        }
+        return layout.header;
+    }
+
+    Bool source_layout_matches(
+        self,
+        qid.ModuleId module_id,
+        source.SourceRecord source_record,
+        ji.JiDiskLayout& layout
+    ) {
+        if (!self.source_layout_identity_matches(module_id, layout.header)) { return false; }
+        if (layout.header.source_hash != source_record.content_hash) { return false; }
+        if (layout.sections.find(.import_summary) == null) { return false; }
+        return layout.sections.find(.interface_section) != null;
+    }
+
+    Bool source_layout_identity_matches(self, qid.ModuleId module_id, ji.JiHeader header) {
+        if (header.compiler_version != self.compiler_version_hash) { return false; }
+        guard self.source_graph_identity(module_id) is .some(identity) else { return false; }
+        return header.stable_source_identity == identity.fingerprint;
     }
 
     () check_package_dependency_cycles(self, module_graph.ModuleGraph& graph) {
