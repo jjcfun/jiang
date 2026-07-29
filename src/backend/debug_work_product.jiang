@@ -24,6 +24,7 @@ import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import table = "../support/table.jiang";
 import system_fs = "../system/fs.jiang";
+import system_env = "../system/env.jiang";
 import system_time = "../system/time.jiang";
 import codegen = "./codegen.jiang";
 import codegen_unit = "./codegen_unit.jiang";
@@ -32,7 +33,7 @@ import std;
 
 // LLVM unit 同时运行过多会放大峰值内存；这个上限只属于 compiler 策略，
 // 不进入 Domain 或语言级并发语义。
-const Int emission_worker_limit = 4;
+const Int default_emission_worker_limit = 4;
 
 public struct DebugTiming: Copyable {
     public UInt64 state_ns = UInt64(0);
@@ -190,16 +191,7 @@ public Bool publish_success(
     guard output_metadata(output_path) is .some(metadata) else {
         return false;
     }
-    guard build_state.source_snapshot_from_files(
-        products.state$.ref(),
-        source_base
-    ) is .some(source_snapshot) else {
-        return false;
-    }
-    if (products.state.source_snapshot == qkey.Fingerprint128()) {
-        return false;
-    }
-    if (products.state.source_snapshot != source_snapshot) {
+    guard current_source_snapshot(source_base, products) is .some(source_snapshot) else {
         return false;
     }
     products.state.set_last_success(
@@ -224,19 +216,46 @@ public Bool publish_work_products(
     UInt8[]& source_base,
     DebugWorkProducts& products
 ) {
-    if (products.state.source_snapshot == qkey.Fingerprint128()) { return false; }
-    guard build_state.source_snapshot_from_files(
-        products.state$.ref(),
-        source_base
-    ) is .some(source_snapshot) else {
-        return false;
-    }
-    if (products.state.source_snapshot != source_snapshot) { return false; }
+    if (!sources_unchanged(source_base, products)) { return false; }
     return build_state.publish(
         context_root,
         products.target_identity,
         products.state$.ref()
     );
+}
+
+public Bool sources_unchanged(
+    UInt8[]& source_base,
+    DebugWorkProducts& products
+) {
+    return current_source_snapshot(source_base, products) != null;
+}
+
+qkey.Fingerprint128? current_source_snapshot(
+    UInt8[]& source_base,
+    DebugWorkProducts& products
+) {
+    if (products.state.source_snapshot == qkey.Fingerprint128()) { return null; }
+    guard build_state.source_snapshot_from_files(
+        products.state$.ref(),
+        source_base
+    ) is .some(source_snapshot) else {
+        return null;
+    }
+    if (products.state.source_snapshot != source_snapshot) { return null; }
+    return source_snapshot;
+}
+
+// smoke 用 marker 和短暂停顿稳定地在 object emission 与 link 之间改动源码。
+public () pause_before_link_for_test() {
+    guard system_env.get("JIANG_INTERNAL_BACKEND_PAUSE_BEFORE_LINK") is .some(marker) else {
+        return;
+    }
+    if (marker.length == 0) { return; }
+    if (!system_fs.write_all(marker[..], "ready")) { return; }
+    UInt64 started = system_time.monotonic_time_ns();
+    UInt64 duration = UInt64(250000000);
+    while (system_time.monotonic_time_ns() - started < duration) {}
 }
 
 struct UnitFingerprintContext: Copyable {
@@ -299,6 +318,8 @@ struct EmissionBatchInput: Copyable, Sendable {
     Int slots_address;
     Int target_address;
     Int target_length;
+    Int failure_unit;
+    Int delay_unit;
     Bool link_libc;
 }
 
@@ -311,6 +332,9 @@ struct EmissionWorkerInput: Copyable, Sendable {
     Int slot_address;
     Int target_address;
     Int target_length;
+    Int unit_order;
+    Int failure_unit;
+    Int delay_unit;
     Bool link_libc;
 }
 
@@ -581,6 +605,8 @@ EmissionBatchInput emission_batch_input(
         slots_address: unsafe { slots$.ptr()$.as(Int) },
         target_address: unsafe { llvm_triple$.ptr()$.as(Int) },
         target_length: llvm_triple.length,
+        failure_unit: internal_emission_unit("JIANG_INTERNAL_BACKEND_FAIL_UNIT"),
+        delay_unit: internal_emission_unit("JIANG_INTERNAL_BACKEND_DELAY_UNIT"),
         link_libc: link_libc
     );
 }
@@ -595,6 +621,7 @@ async [core_executor.global_domain] Bool emit_pending_batches(EmissionBatchInput
     if (pending.len() == 1) {
         return emit_pending_unit(worker_input(input, pending, slots, 0));
     }
+    Int worker_limit = emission_worker_limit();
     Int start! = 0;
     while (start < pending.len()) {
         if (!emit_pending_batch(
@@ -602,13 +629,41 @@ async [core_executor.global_domain] Bool emit_pending_batches(EmissionBatchInput
             pending,
             slots,
             start,
-            emission_worker_limit
+            worker_limit
         )) {
             return false;
         }
-        start = start + emission_worker_limit;
+        start = start + worker_limit;
     }
     true
+}
+
+// 仅供 compiler 性能基准覆盖串行/默认 emission；非法值保持默认策略。
+Int emission_worker_limit() {
+    guard system_env.get("JIANG_INTERNAL_BACKEND_WORKERS") is .some(value) else {
+        return default_emission_worker_limit;
+    }
+    if (value.length != 1) { return default_emission_worker_limit; }
+    Int parsed = Int(value[0]) - Int(UInt8(48));
+    if (parsed < 1 || parsed > default_emission_worker_limit) {
+        return default_emission_worker_limit;
+    }
+    return parsed;
+}
+
+Int internal_emission_unit(UInt8[]& name) {
+    guard system_env.get(name) is .some(value) else { return -1; }
+    if (value.length == 0) { return -1; }
+    Int parsed! = 0;
+    Int index! = 0;
+    while (index < value.length) {
+        Int digit = Int(value[index]) - Int(UInt8(48));
+        if (digit < 0 || digit > 9) { return -1; }
+        parsed = parsed * 10 + digit;
+        if (parsed > 1000000) { return -1; }
+        index = index + 1;
+    }
+    return parsed;
 }
 
 async [core_executor.global_domain] Bool emit_pending_batch(
@@ -664,6 +719,9 @@ EmissionWorkerInput worker_input(
         slot_address: unsafe { slot$.ptr()$.as(Int) },
         target_address: batch.target_address,
         target_length: batch.target_length,
+        unit_order: index,
+        failure_unit: batch.failure_unit,
+        delay_unit: batch.delay_unit,
         link_libc: batch.link_libc
     );
 }
@@ -690,6 +748,8 @@ async [core_executor.global_domain] Bool emit_pending_unit(EmissionWorkerInput i
     UInt8[]& target = unsafe {
         input.target_address$.as(UInt8*)[0..input.target_length]
     };
+    delay_emission_unit_for_test(input);
+    if (force_emission_unit_failure(input, slot)) { return false; }
     codegen.BackendResult result = codegen.emit_object_for_prepared_unit_isolated(
         ctx,
         lowered,
@@ -712,6 +772,30 @@ async [core_executor.global_domain] Bool emit_pending_unit(EmissionWorkerInput i
         ));
     }
     slot.ok
+}
+
+// 仅供 smoke 稳定覆盖“失败时仍有 worker 正在运行”的 join/cleanup 边界。
+() delay_emission_unit_for_test(EmissionWorkerInput input) {
+    if (input.unit_order != input.delay_unit) { return; }
+    UInt64 started = system_time.monotonic_time_ns();
+    UInt64 duration = UInt64(100000000);
+    while (system_time.monotonic_time_ns() - started < duration) {}
+}
+
+Bool force_emission_unit_failure(
+    EmissionWorkerInput input,
+    EmissionSlot&! slot
+) {
+    if (input.unit_order != input.failure_unit) { return false; }
+    slot.diagnostics.add(diagnostic.Diagnostic(
+        .error,
+        .codegen,
+        diagnostic.DiagnosticCode("backend_forced_unit_failure"),
+        diagnostic.SourceRange(),
+        "forced backend unit failure"
+    ));
+    slot.ok = false;
+    return true;
 }
 
 () merge_emission_diagnostics(

@@ -133,7 +133,8 @@ require_no_temporary_files() {
   local cache="$1"
   local temporary
   temporary="$(find "$cache" -type f \
-    \( -name '*.object.tmp.*' -o -name '*.ji.tmp.*' \) -print -quit)"
+    \( -name '*.object.tmp.*' -o -name '*.ji.tmp.*' -o -name '*.link.tmp.*' \) \
+    -print -quit)"
   [ -z "$temporary" ] || fail "temporary cache file remains: $temporary"
 }
 
@@ -808,6 +809,76 @@ check_failed_link_preserves_work_products() {
   expect_exit "$output" 0
 }
 
+check_emission_failure_cleanup() {
+  local input="$ROOT_DIR/test/lang/package/run/source_dependency_app"
+  local cache="$WORK_DIR/emission-failure-cache"
+  local output="$WORK_DIR/emission-failure"
+  local log="$WORK_DIR/emission-failure.log"
+
+  if env \
+    JIANG_INTERNAL_BACKEND_WORKERS=4 \
+    JIANG_INTERNAL_BACKEND_FAIL_UNIT=3 \
+    JIANG_INTERNAL_BACKEND_DELAY_UNIT=0 \
+    "$JIANGC" --artifact-cache-dir "$cache" --artifact-stats \
+      -o "$output" "$input" >"$log" 2>&1
+  then
+    fail "forced unit emission failure unexpectedly succeeded"
+  fi
+  grep -q 'backend_forced_unit_failure' "$log" \
+    || fail "forced unit failure diagnostic missing"
+  require_no_temporary_files "$cache"
+  [ -z "$(find "$cache" -type f -name '*.o' -print -quit)" ] \
+    || fail "failed emission published an object"
+
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/emission-retry.log" \
+    "$output" "$input"
+  require_stat_ge "$WORK_DIR/emission-retry.log" artifact_emitted_units 4
+  expect_exit "$output" 52
+}
+
+check_source_change_before_link() {
+  local fixture="$WORK_DIR/source-change-fixture"
+  local input="$fixture/package/run/source_dependency_app"
+  local dependency="$fixture/package/check/source_dependency_util/util.jiang"
+  local cache="$WORK_DIR/source-change-cache"
+  local output="$WORK_DIR/source-change"
+  local marker="$WORK_DIR/source-change.ready"
+  local log="$WORK_DIR/source-change.log"
+  local pid
+  local attempts
+
+  mkdir -p "$fixture"
+  cp -R "$ROOT_DIR/test/lang/package" "$fixture/package"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/source-change-seed.log" \
+    "$output" "$input"
+  expect_exit "$output" 52
+  perl -0pi -e 's/Int hidden\(\) \{\n    99\n\}/Int hidden() {\n    98\n}/' "$dependency"
+
+  env JIANG_INTERNAL_BACKEND_PAUSE_BEFORE_LINK="$marker" \
+    "$JIANGC" --artifact-cache-dir "$cache" --artifact-stats \
+      -o "$output" "$input" >"$log" 2>&1 &
+  pid=$!
+  attempts=0
+  while [ ! -f "$marker" ] && [ "$attempts" -lt 500 ]; do
+    sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [ -f "$marker" ] || fail "compiler did not reach before-link marker"
+  perl -0pi -e 's/Int hidden\(\) \{\n    98\n\}/Int hidden() {\n    97\n}/' "$dependency"
+  if wait "$pid"; then
+    fail "source change before link unexpectedly succeeded"
+  fi
+  grep -q 'source_changed_during_build' "$log" \
+    || fail "source-change diagnostic missing"
+  expect_exit "$output" 52
+  require_no_temporary_files "$cache"
+
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/source-change-retry.log" \
+    "$output" "$input"
+  require_stat_ge "$WORK_DIR/source-change-retry.log" artifact_emitted_units 1
+  expect_exit "$output" 52
+}
+
 check_lang_provider_dylib() {
   TEST_ROOT="$ROOT_DIR/test/lang" \
     TEST_JOBS=1 \
@@ -849,6 +920,8 @@ run_check trait_interface "trait interface" check_trait_interface
 run_check concurrent "concurrent publication" check_concurrent_publish
 run_check clean "explicit cache clean" check_explicit_cache_clean
 run_check partial "failed link preserves work products" check_failed_link_preserves_work_products
+run_check emission_failure "unit emission failure cleanup" check_emission_failure_cleanup
+run_check source_race "source change before link" check_source_change_before_link
 run_check dylib "lang provider dylib" check_lang_provider_dylib
 
 SUCCESS=1
