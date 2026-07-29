@@ -6,6 +6,7 @@
 
 import thread = "../system/thread.jiang";
 import atomic = "../core/atomic.jiang";
+import descriptor_model = "./domain_descriptor.jiang";
 
 const Int concurrent_domain_kind = 1;
 const Int executor_kind_word = 0;
@@ -21,7 +22,9 @@ const Int executor_inline_depth_limit = 32;
 const Int frame_pool_class_count = 8;
 const Int executor_shared_frame_pool_handle_word =
     executor_local_frame_pool_word + frame_pool_class_count;
-const Int executor_word_count = executor_shared_frame_pool_handle_word + 1;
+const Int executor_descriptor_word = executor_shared_frame_pool_handle_word + 1;
+const Int executor_instance_word = executor_descriptor_word + 1;
+const Int executor_word_count = executor_instance_word + 1;
 const Int frame_header_size = 16;
 const Int frame_pool_min_size = 64;
 
@@ -50,13 +53,22 @@ public () shutdown() {
 
 @link_symbol("__jiang_runtime_domain_executor")
 @inline
-public Void* materialize(Int*! slot, Int cached_address, Int binding_id, Int domain_kind) {
+public Void* materialize(
+    Int*! slot,
+    Int cached_address,
+    Int binding_id,
+    Int domain_kind,
+    Void* descriptor,
+    Void* domain_config
+) {
     if (cached_address != 0) { return unsafe { cached_address$.as(Void*) }; }
     thread.lock(executors_mutex);
     atomic.Atomic<Int>& atomic_slot = unsafe { slot$.as(atomic.Atomic<Int>&) };
     Int address! = atomic_slot.get();
     if (address == 0) {
-        Void* executor = find_or_add_executor(binding_id, domain_kind);
+        Void* executor = find_or_add_executor(
+            binding_id, domain_kind, descriptor, domain_config
+        );
         address = unsafe { executor$.as(Int) };
         assert(atomic_slot.compare_exchange(0, address));
     }
@@ -66,7 +78,7 @@ public Void* materialize(Int*! slot, Int cached_address, Int binding_id, Int dom
 
 public Void* materialize_uncached(Int binding_id, Int domain_kind) {
     thread.lock(executors_mutex);
-    Void* executor = find_or_add_executor(binding_id, domain_kind);
+    Void* executor = find_or_add_executor(binding_id, domain_kind, null, null);
     thread.unlock(executors_mutex);
     return executor;
 }
@@ -74,6 +86,17 @@ public Void* materialize_uncached(Int binding_id, Int domain_kind) {
 public thread.Queue queue(Void* executor) {
     Int handle = load_executor_word(executor, executor_queue_word);
     return thread.Queue(unsafe { handle$.as(Void*) });
+}
+
+// scheduler 只提交 opaque Job，不直接依赖具体 Queue。后续自定义 Executor 与内建
+// system.thread Executor 都从这一边界进入相同的 request/handoff 状态机。
+public Bool enqueue(
+    thread.Group group,
+    Void* executor,
+    Void* context,
+    Void* callback
+) {
+    return thread.enqueue(group, queue(executor), context, callback);
 }
 
 public Bool is_concurrent(Void* executor) {
@@ -204,7 +227,12 @@ public () deallocate_coroutine_frame(Void* executor, Void* raw_frame) {
     leave(null, previous);
 }
 
-Void* find_or_add_executor(Int binding_id, Int domain_kind) {
+Void* find_or_add_executor(
+    Int binding_id,
+    Int domain_kind,
+    Void* descriptor,
+    Void* domain_config
+) {
     Int index! = 0;
     while (index < executor_count) {
         if (load_storage_word(executor_binding_ids, index) == binding_id) {
@@ -212,17 +240,25 @@ Void* find_or_add_executor(Int binding_id, Int domain_kind) {
         }
         index = index + 1;
     }
-    return add_executor(binding_id, domain_kind);
+    return add_executor(binding_id, domain_kind, descriptor, domain_config);
 }
 
-Void* add_executor(Int binding_id, Int domain_kind) {
+Void* add_executor(
+    Int binding_id,
+    Int domain_kind,
+    Void* descriptor,
+    Void* domain_config
+) {
     ensure_executor_capacity();
     UInt8* storage = thread.allocate_storage(executor_word_count * Int$.size());
     assert(storage != null);
-    thread.Queue target_queue! = thread.concurrent_queue();
-    if (domain_kind != concurrent_domain_kind) {
-        target_queue = thread.serial_queue();
-        thread.set_queue_identity(target_queue, unsafe { storage$.as(Void*) });
+    thread.Queue target_queue! = thread.Queue(null);
+    if (descriptor == null) {
+        target_queue = thread.concurrent_queue();
+        if (domain_kind != concurrent_domain_kind) {
+            target_queue = thread.serial_queue();
+            thread.set_queue_identity(target_queue, unsafe { storage$.as(Void*) });
+        }
     }
     store_storage_word(storage, executor_kind_word, domain_kind);
     store_storage_word(
@@ -249,11 +285,61 @@ Void* add_executor(Int binding_id, Int domain_kind) {
         executor_shared_frame_pool_handle_word,
         unsafe { thread.atomic_stack_array_handle(shared_stacks)$.as(Int) }
     );
+    store_storage_word(storage, executor_descriptor_word, unsafe { descriptor$.as(Int) });
+    store_storage_word(storage, executor_instance_word, 0);
+    if (descriptor != null) {
+        initialize_custom_executor(storage, domain_kind, descriptor, domain_config);
+    }
     Int index = executor_count;
     store_storage_word(executor_binding_ids, index, binding_id);
     store_storage_word(executor_handles, index, unsafe { storage$.as(Int) });
     executor_count = index + 1;
     return unsafe { storage$.as(Void*) };
+}
+
+() initialize_custom_executor(
+    UInt8* executor,
+    Int domain_kind,
+    Void* raw_descriptor,
+    Void* domain_config
+) {
+    descriptor_model.DomainDescriptor& descriptor = unsafe {
+        raw_descriptor$.as(descriptor_model.DomainDescriptor&)
+    };
+    assert(descriptor.domain_kind == domain_kind);
+    Void* instance = allocate_aligned_storage(
+        descriptor.executor_size, descriptor.executor_alignment
+    );
+    RawFn<(), Void*, Void*> create = unsafe {
+        descriptor.create$.as(RawFn<(), Void*, Void*>)
+    };
+    create(domain_config, instance);
+    store_storage_word(executor, executor_instance_word, unsafe { instance$.as(Int) });
+}
+
+Void* allocate_aligned_storage(Int size, Int alignment) {
+    Int effective_size! = size;
+    if (effective_size < 1) { effective_size = 1; }
+    Int effective_alignment! = alignment;
+    if (effective_alignment < Int$.size()) { effective_alignment = Int$.size(); }
+    Int header_size = Int$.size();
+    UInt8* allocation = thread.allocate_storage(
+        effective_size + effective_alignment + header_size
+    );
+    assert(allocation != null);
+    Int start = unsafe { allocation$.as(Int) } + header_size;
+    Int aligned = align_frame_address(start, effective_alignment);
+    UInt8* header = unsafe { (aligned - header_size)$.as(UInt8*) };
+    store_storage_word(header, 0, unsafe { allocation$.as(Int) });
+    return unsafe { aligned$.as(Void*) };
+}
+
+() free_aligned_storage(Void* storage) {
+    if (storage == null) { return; }
+    Int header_address = unsafe { storage$.as(Int) } - Int$.size();
+    UInt8* header = unsafe { header_address$.as(UInt8*) };
+    UInt8* allocation = unsafe { load_storage_word(header, 0)$.as(UInt8*) };
+    thread.deallocate_storage(allocation);
 }
 
 Void* load_executor_handle(Int index) {
@@ -404,7 +490,11 @@ Int*! storage_word(UInt8* storage, Int index) {
     while (index < executor_count) {
         Void* executor = load_executor_handle(index);
         free_executor_frame_pool(executor);
-        thread.destroy_queue(queue(executor), is_concurrent(executor));
+        if (executor_descriptor(executor) == null) {
+            thread.destroy_queue(queue(executor), is_concurrent(executor));
+        } else {
+            destroy_custom_executor(executor);
+        }
         thread.deallocate_storage(unsafe { executor$.as(UInt8*) });
         index = index + 1;
     }
@@ -414,6 +504,24 @@ Int*! storage_word(UInt8* storage, Int index) {
     executor_handles = null;
     executor_count = 0;
     executor_capacity = 0;
+}
+
+Void* executor_descriptor(Void* executor) {
+    Int raw = load_executor_word(executor, executor_descriptor_word);
+    return unsafe { raw$.as(Void*) };
+}
+
+() destroy_custom_executor(Void* executor) {
+    Void* raw_descriptor = executor_descriptor(executor);
+    descriptor_model.DomainDescriptor& descriptor = unsafe {
+        raw_descriptor$.as(descriptor_model.DomainDescriptor&)
+    };
+    Void* instance = unsafe {
+        load_executor_word(executor, executor_instance_word)$.as(Void*)
+    };
+    RawFn<(), Void*> destroy = unsafe { descriptor.destroy$.as(RawFn<(), Void*>) };
+    destroy(instance);
+    free_aligned_storage(instance);
 }
 
 () free_executor_frame_pool(Void* executor) {
