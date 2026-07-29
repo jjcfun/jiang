@@ -146,6 +146,9 @@ profile；命中还必须验证 input fingerprint 和稳定路径上的 object m
 object 和 `.jbuild` 都先写同目录临时文件再原子替换。
 只有 object 已完成发布且最终链接成功后，
 `.jbuild` 才更新 `last_success`。同一 target/context 由 build lock 串行化并在等待后重查 no-op。
+debug linker 同样先写临时 executable；发布前重新验证本轮 source snapshot，
+再原子替换最终路径。源码在 emission 或 link 期间变化时，本轮失败并保留上一次
+成功的 executable，下一轮重新规划。
 
 debug executable 的 `LinkPlan` 只包含本轮 CGU plan 和 runtime object，不恢复历史 link closure。
 release executable 始终使用 whole-package codegen 和整体优化，不读写细粒度 work products。

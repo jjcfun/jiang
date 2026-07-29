@@ -26,17 +26,15 @@
 
 ## 当前分支
 
-当前 `main` 以 Jiang 0.4.9 stable 为日常 bootstrap 输入。0.4.9 已发布，其从 0.4.8 stable
-开始的可复现自举链为：
+当前 0.5.0 release 开发使用显式 transition chain：
 
 ```text
-0.4.8 stable
-  -> 0.4.9-bootstrap
-  -> 0.4.9-bootstrap2
-  -> 0.4.9 release next
-  -> 0.4.9 stable
+0.4.9 stable
+  -> bootstrap/0.5.0 next
+  -> bootstrap/0.5.0-2 next
+  -> release/0.5.0 next
 ```
 
-过渡 tag 用于在新机器上复现破坏性语法升级，不要求日常保留 bootstrap worktree。详细命令和
-边界见 [编译器开发流程](develop.md)。
+release 源码已经采用新的 Domain/Executor ABI，不能再由 0.4.9 stable 直接编译。
+0.4.9 自身的历史复现链和当前 transition 的详细命令见 [编译器开发流程](develop.md)。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。

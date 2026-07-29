@@ -329,11 +329,11 @@ name        <- ident / "self"
 - `RawFn<unsafe T, ...>`、`RawFn<async T, ...>` 和 `RawFn<async [domain] T, ...>`
   表示带调用效果的函数指针类型。调用效果
   前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型。
-  因此 `RawFn<async [UiDomain] Bool>[]&` 表示“元素为 UI domain 异步函数指针的切片引用”。
+  因此 `RawFn<async [main_domain] Bool>[]&` 表示“元素为主线程 Domain 异步函数指针的切片引用”。
 - `Fn<unsafe T, ...>`、`Fn<async T, ...>` 和 `Fn<async [domain] T, ...>`
   表示带调用效果的闭包值类型。调用效果前缀写在
   `Fn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层闭包值类型；因此
-  `Fn<async [UiDomain] Bool>[]&` 表示“元素为 UI domain 异步闭包值的切片引用”。
+  `Fn<async [global_domain] Bool>[]&` 表示“元素为全局并发 Domain 异步闭包值的切片引用”。
 - lambda 必须具有 expected callable type；其 async/unsafe/domain effect 由
   `Fn<...>` 或 `RawFn<...>` expected type 完整决定，lambda 表达式不重复书写 effect 前缀。
 - async `Fn` / `RawFn` 动态调用复用普通 async 调用的 Domain 切换；跨 Domain 的参数、result 和
@@ -343,8 +343,10 @@ name        <- ident / "self"
 - 函数声明只使用 `async` 表示 suspend function；函数前不保留 `sync` 修饰符。`async [domain]`
   可用于函数声明，表示 domain-bound async function。
 - `sync [domain]` 是 `sync [domain: domain]` 的短写。`domain` 是实现 `Domain` 的编译期
-  domain value；编译器通过 `Domain.kind` 区分 serial/concurrent 语义。
-- 函数声明和 callable type 中的 `async [domain]` 只接受静态 domain type。
+  domain value；`main_domain` 和 `global_domain` 是标准 binding。自定义 Domain 必须提供
+  `kind`、`ExecutorType` 和同步 `make_executor`；编译器通过 `Domain.kind` 区分
+  serial/concurrent 语义。
+- 函数声明和 callable type 中的 `async [domain]` 只接受 canonical const Domain binding。
 - 无 domain 的 `Task { ... }` / `sync { ... }` 只能在已有 current domain 的上下文中使用，
   并继承 current。
 - 普通同步函数中的最外层 `sync [domain] {}` 阻塞进入 runtime；async context 中的

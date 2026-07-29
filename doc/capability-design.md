@@ -32,44 +32,58 @@ data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capabil
 
 ## Domain 能力
 
-语言核心只认识抽象 capability，不内建 `UiDomain`、`WorkerDomain` 这类具体 domain。
-0.4.7-2 使用单一 `Domain` trait，并用 `const` 约束形式的 associated item 表示 domain
-执行语义，避免 `Domain<.serial>` / `Domain<.concurrent>` 这种 generic 形式带来的多重实现问题：
+语言核心只认识抽象 capability，并提供 `main_domain`、`global_domain` 两个标准 binding；
+UI event loop、专用线程池等具体 Domain 仍由库和应用定义。0.5.0 的 `Domain` trait 同时声明
+语言级执行语义和运行时 Executor 类型：
 
 ```jiang
-enum DomainKind {
+public enum DomainKind {
     serial,
     concurrent,
 }
 
-trait Domain {
+public trait Domain {
     associated kind: const DomainKind;
+    associated ExecutorType: Executor;
+
+    ExecutorType make_executor(Self& self);
 }
 
 ```
 
-具体 domain 由 runtime、框架或第三方库提供，domain identity 由类型本身表示：
+Domain identity 由命名 `const` binding 表示；同一类型的两个 binding 仍是不同 Domain：
 
 ```jiang
-public struct UiDomain: Domain {
-    associated kind = .serial;
+public struct UiDomain: Domain<kind = .serial> {
+    associated ExecutorType = SerialExecutor;
+
+    SerialExecutor make_executor(Self& self) {
+        SerialExecutor()
+    }
 }
 
-public struct WorkerPoolDomain: Domain {
-    associated kind = .concurrent;
+public struct WorkerPoolDomain: Domain<kind = .concurrent> {
+    associated ExecutorType = ConcurrentExecutor;
+
+    ConcurrentExecutor make_executor(Self& self) {
+        ConcurrentExecutor()
+    }
 }
+
+public const UiDomain ui_domain = UiDomain();
+public const WorkerPoolDomain worker_pool_domain = WorkerPoolDomain();
 ```
 
 因此：
 
 - `current` 是语言内建特殊值，表示继承当前 async/sync domain context。
-- `UiDomain`、`WorkerPoolDomain` 等不是语言魔法；它们来自 import 后可见的类型。
-- `async [domain_type]` / `sync [domain_type]` 中的 `domain_type` 必须是实现
-  `Domain` 的类型；编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
+- `ui_domain`、`worker_pool_domain` 等不是语言魔法；它们是 import 后可见的命名 `const`。
+- `async [domain]` / `sync [domain]` 中的 `domain` 必须是实现 `Domain` 的 canonical const
+  binding；编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
 
-`Domain` 只描述 identity 和串行性。用户实现 `Domain` 时不需要接触 executor、coroutine frame
-或 continuation ABI。编译器根据 `Domain.kind` 选择内部 runtime 调度入口；具体事件循环、线程池
-和 UI 主线程适配由 runtime 层提供，不作为 `Domain` 的公开成员。
+`Domain.kind` 描述语言级串行性，`ExecutorType` 和 `make_executor` 选择排队策略。用户 Executor
+只处理一次性的 `ExecutorJob`，不接触 coroutine frame、TaskState 或 continuation ABI。
+runtime 即使面对自定义 Executor 也继续维护 Domain identity、serial gate 和 Task 生命周期。
 
 `Domain.kind == .serial` 保证同一 domain 上的 continuation 不会并发执行；`Domain.kind ==
 .concurrent` 允许同一 domain 内多个任务并发执行，因此普通 `T&!` 不能依赖它保证安全。在
@@ -84,7 +98,7 @@ capability。
 ```jiang
 async Int load_data();
 
-async [UiDomain] () render(Model&! model) {
+async [ui_domain] () render(Model&! model) {
     model.loading = true;
     load_data();
     model.loading = false;
@@ -99,8 +113,8 @@ async [UiDomain] () render(Model&! model) {
 在已有 current domain 的上下文中调用：
 
 ```jiang
-sync [UiDomain] {
-    Int value = load_data(); // 隐式 await，在 UiDomain current domain 上运行
+sync [ui_domain] {
+    Int value = load_data(); // 隐式 await，在 ui_domain current domain 上运行
 }
 ```
 
@@ -113,7 +127,7 @@ callee body，参数按跨入 `D` 的规则检查；返回后 caller continuatio
 ```jiang
 import app_runtime;
 
-sync [app_runtime.UiDomain] {
+sync [app_runtime.ui_domain] {
     load_data();
 }
 ```
@@ -121,7 +135,7 @@ sync [app_runtime.UiDomain] {
 Task initializer 使用命名参数选择 execution domain：
 
 ```jiang
-Task(domain: app_runtime.UiDomain) {
+Task(domain: app_runtime.ui_domain) {
     load_data();
 };
 ```
@@ -130,9 +144,9 @@ Task(domain: app_runtime.UiDomain) {
 并继承 current：
 
 ```jiang
-sync [UiDomain] {
-    Task<Int> a = Task { load_data() }; // 继承 UiDomain
-    Task<Int> b = Task { load_data() }; // 继承 UiDomain
+sync [ui_domain] {
+    Task<Int> a = Task { load_data() }; // 继承 ui_domain
+    Task<Int> b = Task { load_data() }; // 继承 ui_domain
     a.await() + b.await()
 }
 ```
@@ -144,8 +158,8 @@ Task initializer 当前只公开 `domain` 命名参数；runtime context 不是�
 
 ```jiang
 Fn<async Int>
-Fn<async [UiDomain] Int, Model&!>
-RawFn<unsafe async [UiDomain] Result<Int, Error>, Void*>
+Fn<async [ui_domain] Int, Model&!>
+RawFn<unsafe async [ui_domain] Result<Int, Error>, Void*>
 ```
 
 在 callable type 中，`async [D]` 修饰 callable signature，不修饰返回值类型本身，也不表示
@@ -155,16 +169,14 @@ RawFn<unsafe async [UiDomain] Result<Int, Error>, Void*>
 lambda 的 effect 完全由 expected callable type 决定，表达式本身不重复书写 `async`：
 
 ```jiang
-Fn<async [UiDomain] Int, Int> load = { id => fetch(id) };
+Fn<async [ui_domain] Int, Int> load = { id => fetch(id) };
 ```
 
-当前最小实现要求调用点已在 `UiDomain` 中；跨 Domain 的 async `Fn` 动态调用留待后续调度
-入口完成后开放。
+async `Fn` / `RawFn` 动态调用遵守与直接 async 调用相同的 Domain 切换和 Sendable 检查。
 
-`async [UiDomain]` / `sync [UiDomain]` 是 effect keyword option 中
-`async [domain: UiDomain]` / `sync [domain: UiDomain]` 的短写。`async [UiDomain, ctx]`
-是 `async [domain: UiDomain, context: ctx]` 的短写。函数声明和 callable type 只使用静态
-domain type；带 `context` 的形式只用于 block。`UiDomain` 本质上仍是 domain type，不是语言魔法。
+`async [ui_domain]` / `sync [ui_domain]` 是 effect keyword option 中
+`async [domain: ui_domain]` / `sync [domain: ui_domain]` 的短写。
+函数声明和 callable type 只使用 canonical const Domain binding；带 `context` 的形式只用于 block。
 
 ## 默认 Domain
 
@@ -181,7 +193,7 @@ Task。如果普通函数要进入异步运行时，必须显式写外层 domain
 
 ```jiang
 Int main() {
-    sync [UiDomain] {
+    sync [ui_domain] {
         load_data()
     }
 }
@@ -194,7 +206,7 @@ domain-neutral `async` 函数不绑定 domain；调用点必须已经有 current
 也在该 current domain 下执行和恢复。实现上 async frame 可以携带隐藏的 coroutine
 context/domain handle，但这个上下文不进入普通参数列表。
 
-domain-bound `async [D]` 函数在签名 metadata 中保存 domain type，调用点按进入 `D` 的规则
+domain-bound `async [D]` 函数在签名 metadata 中保存 Domain binding，调用点按进入 `D` 的规则
 检查参数和返回 continuation。它不是普通 `async` 函数的默认形态，而是给“整个函数必须在
 某个 domain 执行”的 API 使用。
 
@@ -228,7 +240,7 @@ async Int fetch();
 
 async () refresh(Model&! model) {
     model.loading = true;
-    Int value = fetch(); // 可能挂起，默认保持 UiDomain
+    Int value = fetch(); // 可能挂起，默认保持 ui_domain
     model.value = value;
 }
 ```
@@ -236,7 +248,7 @@ async () refresh(Model&! model) {
 `refresh` 本身不选择 domain。调用者需要在某个 current domain 中运行它：
 
 ```jiang
-sync [UiDomain] {
+sync [ui_domain] {
     refresh(model$.mut_ref())
 }
 ```
@@ -245,9 +257,9 @@ sync [UiDomain] {
 domain：
 
 ```jiang
-sync [UiDomain] {
-    Task(domain: WorkerPoolDomain) {
-        update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain
+sync [ui_domain] {
+    Task(domain: worker_pool_domain) {
+        update_worker(model) // error: model 属于 ui_domain，不能进入 worker_pool_domain
     };
 }
 ```
@@ -282,7 +294,7 @@ async () foo(T&! x) {
 - domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
   current domain。
 - `Task { ... }` / `sync { ... }` 只有外层已有 current domain 时可省略 domain，并继承 current。
-- `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果 domain type `D` 不等于 current，
+- `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果 Domain binding `D` 不等于 current，
   则是 domain 切换边界。
 - 普通同步函数中的最外层 `sync [D] {}` 阻塞调用线程，进入 runtime 并等待 block 完成。
 - async context 中的 `sync [D] {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
@@ -412,15 +424,15 @@ block 或 lambda 捕获。`Task<T>^` owner 可以 move 进普通 callable 或其
 domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
 
 ```jiang
-sync [UiDomain] {
-    Task<Image> image = Task(domain: WorkerPoolDomain) { load_image() };
+sync [ui_domain] {
+    Task<Image> image = Task(domain: worker_pool_domain) { load_image() };
     Image value = image.await(); // allowed: Task 没有被嵌套 effect block 捕获
 }
 ```
 
 ```jiang
-Task<Image> image = Task(domain: WorkerPoolDomain) { load_image() };
-Task(domain: UiDomain) {
+Task<Image> image = Task(domain: worker_pool_domain) { load_image() };
+Task(domain: ui_domain) {
     image.await() // error: task_capture_not_allowed
 };
 ```
@@ -428,9 +440,9 @@ Task(domain: UiDomain) {
 普通 `T&!` 不能被捕获到不同 domain。`Task(domain: D) { ... }` 是严格 domain 切换边界：
 
 ```jiang
-sync [UiDomain] {
-    Task(domain: WorkerPoolDomain) {
-        update_worker(model) // error: model 属于 UiDomain，不能进入 WorkerPoolDomain task
+sync [ui_domain] {
+    Task(domain: worker_pool_domain) {
+        update_worker(model) // error: model 属于 ui_domain，不能进入 worker_pool_domain task
     };
 }
 ```
@@ -439,7 +451,7 @@ sync [UiDomain] {
 不能捕获栈上 borrow。
 结构化并发可以允许有限的同 domain capture，但必须证明所有 task 在 scope 结束前完成。
 
-0.4.8 采用显式、协作式 cancellation：`task.cancel()` 向 task 的 execution domain 原子发布请求后
+当前采用显式、协作式 cancellation：`task.cancel()` 向 task 的 execution Domain 原子发布请求后
 立即返回；`task.cancel_and_await()` 才等待 task 正常完成或完成 cancellation unwind。取消请求线程
 不能直接析构 frame；resume 入口和 suspend boundary 检查请求，frame、capture 和跨 suspend local
 沿正常 drop state 析构。长时间不挂起的计算可以调用 `coroutine.check_cancelled()` 建立显式检查点；
@@ -455,7 +467,7 @@ caller，因此适合“停止这一项工作后继续执行”的路径。
 不形成 Task handle 的 standalone Task initializer；直接 Task 固定在创建它的 place 上，不支持
 `move()`、`forget()` 或重新赋值。
 
-0.4.8 当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占
+当前实现在 coroutine entry 和自然 resume boundary 检查取消。挂起时不会从请求线程抢占
 frame。
 parent 挂起于显式 `child.await()` 时会把取消单向传播给 child，并等待 child terminal acknowledgement
 后再 unwind。隐式 async call 的 child 继承根 Task cancellation context，在自然恢复边界先观察请求并
@@ -484,7 +496,7 @@ completion/cancel acknowledgement 仍负责确认外部系统不再持有 contin
 才能进入 unwind。当前不提供类型级 `Cancellable` trait；每个 suspend operation 独立注册 handler，
 避免强迫一个类型的多个 async 方法共享一个 cancel 方法。
 
-跨 domain 共享可变状态不使用普通 `T&!` 表达。0.4.8 需要共享时使用 `Mutex<T>`、`Atomic<T>` 或
+跨 Domain 共享可变状态不使用普通 `T&!` 表达。需要共享时使用 `Mutex<T>`、`Atomic<T>` 或
 move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃逸时显式进入 `unsafe`。
 
 ## Actor 与 Isolate
@@ -497,7 +509,7 @@ move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃�
 - actor 内部方法在该 actor 的 serial domain 上串行执行。
 
 初版不建议把 actor 纳入核心 domain 语法，因为每个 actor instance 的 domain 往往是运行时值，
-而当前 `async [D]` / `sync [D]` block 草案要求 `D` 是编译期 domain type。可以先用库层
+而当前 `async [D]` / `sync [D]` block 要求 `D` 是 canonical const Domain binding。可以先用库层
 `Actor<T>` 封装状态；
 未来如果需要语言级 actor，再单独设计 `self domain` 或 instance domain。
 
@@ -555,7 +567,7 @@ Jiang 的 `T&!` 与 Rust `&mut T` 一样表达唯一可变借用；Jiang 还叠�
 
 ## 未决问题
 
-- `D` 当前必须是 domain type；未来是否允许 dependent / instance domain。
+- `D` 当前必须是 canonical const Domain binding；未来是否允许 dependent / instance Domain。
 - `T&` 跨 domain 的 shareable 规则如何表达，是否需要公开 `Send` / `Sync` 等 trait 名称。
 - 复杂循环和跨 suspend reborrow 的诊断如何进一步收紧。
 - 标准库和第三方 runtime 如何声明跨 domain 能力。

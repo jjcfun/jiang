@@ -1014,7 +1014,7 @@ RawFn<async Bool[]&> load_callbacks;
 effect 均由该类型决定，lambda 表达式本身不重复书写：
 
 ```jiang
-Fn<async [UiDomain] Int, Int> load = { id => fetch(id) };
+Fn<async [global_domain] Int, Int> load = { id => fetch(id) };
 ```
 
 async `Fn` / `RawFn` 动态调用复用普通 async 函数的 Domain 切换。跨 Domain 的参数、result 和 capture
@@ -1039,18 +1039,20 @@ async Int render() {
 }
 ```
 
-最外层从普通函数进入异步运行时，需要使用带静态 Domain 的 `sync` 或 `async` block。`sync` 等待
-block 完成并返回结果；`async` 直接启动，作为语句使用时不等待：
+最外层从普通函数进入异步运行时，使用 `sync [main_domain]`。`main_domain` 绑定程序启动线程，
+`global_domain` 使用进程共享的并发执行器：
 
-```c
-struct UiDomainType: Domain<kind = .serial> {}
-struct WorkerDomainType: Domain<kind = .serial> {}
-const UiDomainType UiDomain = UiDomainType();
-const WorkerDomainType WorkerDomain = WorkerDomainType();
+```jiang
+async [global_domain] Int load_page(Int id) {
+    id
+}
 
 Int main() {
-    sync [UiDomain] {
-        render()
+    sync [main_domain] {
+        Task<Int> page = Task(domain: global_domain) {
+            load_page(1)
+        };
+        page.await()
     }
 }
 ```
@@ -1066,7 +1068,7 @@ async Int load_both() {
 }
 ```
 
-`Task { ... }` 继承 current domain；`Task(domain: WorkerDomain) { ... }` 显式指定
+`Task { ... }` 继承 current Domain；`Task(domain: global_domain) { ... }` 显式指定
 execution domain。Task closure 和 sync block 使用最后一个表达式作为结果，不支持显式
 `return`；`return` 只用于普通或 async 函数体。
 直接 `Task<T>` 是 `!Movable` 原地值，可以直接作为 struct、tuple 或固定数组中的静态字段；包含它的
@@ -1083,6 +1085,31 @@ Task，取消会传播到 child，并在 child 进入终态后继续清理 paren
 先向该退出路径上的全部活跃 Task 请求取消，再逐个等待其进入终态；所有 child 完成后才销毁其余
 局部值并释放 parent frame。直接 `Task<T>` 的地址固定，不支持 `move()`、`forget()` 或重新赋值。
 `Task<T>^` owner 析构不阻塞、也不隐式取消；owner 与 coroutine 通过固定的双方原子交接决定最后回收者。
+
+Domain 是静态执行身份，Executor 是它在运行时采用的调度策略。
+需要接入自有事件循环时，实现 `Executor`，再由 Domain 的 `make_executor` 创建它：
+
+```jiang
+struct InlineExecutor: Executor {
+    () enqueue(Self& self, ExecutorJob job) {
+        job.run();
+    }
+}
+
+struct InlineDomain: Domain<kind = .serial> {
+    associated ExecutorType = InlineExecutor;
+
+    InlineExecutor make_executor(Self& self) {
+        InlineExecutor()
+    }
+}
+
+const InlineDomain inline_domain = InlineDomain();
+```
+
+每个命名 `const` Domain binding 都有独立身份，并且只懒创建一个 Executor 实例。
+`.serial` 保证同一 Domain 的 Job 不重叠；`.concurrent` 允许并行执行。`ExecutorJob` 是一次性值，
+`enqueue` 接收后必须最终调用一次 `run()`，不能复制、保存借用或静默丢弃。
 
 跨线程共享简单标量状态时使用 `Atomic<T>`。默认的 `get()`、`set()`、`get_and_set()` 和
 `compare_exchange()` 使用 sequential order；需要更弱顺序时使用对应的 `*_with_order` 方法：
@@ -1125,7 +1152,7 @@ callback 是普通同步 `Fn`，不能在持锁期间 `await`；它的返回值�
 需要 detached 执行时，直接把 Task initializer 作为语句启动，不形成 Task handle：
 
 ```c
-Task(domain: WorkerDomain) {
+Task(domain: global_domain) {
     refresh_cache()
 };
 ```
@@ -1135,13 +1162,13 @@ Task：
 
 ```c
 async Response load() {
-    sync [WorkerDomain] {
+    sync [global_domain] {
         request.send()
     }
 }
 ```
 
-这里 `sync` 挂起当前 coroutine，在 `WorkerDomain` 执行 block，完成后回到进入前的 Domain；它不会
+这里 `sync` 挂起当前 coroutine，在 `global_domain` 执行 block，完成后回到进入前的 Domain；它不会
 阻塞 worker thread。普通同步函数中的最外层 `sync [Domain]` 仍会阻塞调用线程等待结果。
 
 ### 控制流（Control Flow）

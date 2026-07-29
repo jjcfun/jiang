@@ -347,13 +347,22 @@ token。Job 区分 request 与 handoff：外部 wake/首次启动使用 request�
 callable completion shim 和 coroutine continuation 转移使用 handoff。queue callback 调用 target 后不得
 再访问 TaskState，Task completion 最终发布后同样禁止回读。
 
+公开 `Domain` 只提供静态 `kind`、concrete `ExecutorType` 和同步 `make_executor`。JIL 不保存
+concrete Executor value；lowering 为每个实际使用的 canonical const binding 生成
+`DomainDescriptor`，其中包含 storage size/alignment 与 create/enqueue/destroy trampoline。
+runtime 通过 descriptor 原地构造并 type erase Executor，向用户 `enqueue` 交付一次性的
+`ExecutorJob`。同 binding 的 identity、serial gate、current executor 和 active frame
+仍由 runtime 维护，不能下放给用户 Executor。
+
 直接 `Task<T>` 不允许被嵌套 async/sync effect block 或 lambda 捕获；可移动的 `Task<T>^` owner
 遵守普通 move、borrow、lifetime 与跨 Domain Sendable 规则。Task 可以运行于不同 domain，completion
 仍将 waiter enqueue 回等待方所在 current domain。
 
-macOS serial `DomainExecutor` 在创建 dispatch queue 时以 executor pointer 作为 queue-specific key 和
-context，因此当前 job 可以无 TLS、无额外 job allocation 地验证 serial Domain 执行权。concurrent
-Domain 共享 global queue，不能从底层 queue identity 推导具体 Domain；其 same-executor 判断保持关闭。
+内建 macOS serial `DomainExecutor` 在创建 dispatch queue 时以 executor pointer 作为 queue-specific
+key 和 context，因此当前 job 可以无 TLS、无额外 job allocation 地验证 serial Domain 执行权。
+自定义 Executor 也走相同的 runtime identity 和 per-domain serial gate；不能从用户队列身份推导
+Domain identity。concurrent Domain 共享 global queue，不能从底层 queue identity 推导具体 Domain；
+其 same-executor 判断保持关闭。
 generated coroutine resume 在统一入口保存并设置 executor 的 active frame，在统一出口恢复先前值。
 serial scheduler 只有在当前 queue identity 与目标 executor 相同、且目标 frame 不是 active frame 时
 才直接调用 resume；嵌套恢复其他 frame 会保存/恢复外层 frame，同步恢复当前 suspend frame 则继续

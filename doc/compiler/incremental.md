@@ -123,6 +123,11 @@ monomorph unit fingerprint 覆盖排序后的 concrete instance key、generic bo
 package-level provenance、属性和 verifier 事实只准备一次，再供所有 stale unit 使用。LLVM lowering
 仍按 unit 执行，但不会为每个 object 重复跑全包分析。
 
+多个 stale unit 使用 Jiang async `Task` 在 `global_domain` 并发 emission。任务之间不共享可变
+LLVM context/module 或诊断 store；主任务按 stable unit 顺序收集结果。并发只缩短本轮 miss 的
+codegen 时间，不改变 CGU fingerprint、object 路径、link plan 或 `.jbuild` 格式。单 unit miss
+走直接路径，all-hit/no-op 不启动 worker。
+
 ## Release 与用户 object 输出
 
 release 始终执行 whole-package codegen 和整体优化。输入失效时完整重建临时 package object，
@@ -162,6 +167,9 @@ Semantic Model、绝对源码路径或 link closure。
 `.ji`、object 和 `.jbuild` 均采用“同目录临时文件 + 原子替换”。object 发布后才可写入
 work-product index；只有链接和最终输出成功后才更新 `last_success`。进程中断可能造成下一次少量
 重复 codegen，但不会产生错误命中。
+
+并行 worker 只写各自的临时 object。所有 worker 成功并完成 join 后，主任务才按 stable unit
+顺序发布 object 和 work-product；失败或取消时清理未发布临时文件，不留下可命中的半成品。
 
 同一 target/context 使用 advisory build lock：
 

@@ -26,9 +26,22 @@ scoped Task 的 control state 与静态已知 child frame 由父 frame 持有，
   async Fn/RawFn context 使用专用 coroutine frame ABI。同一 serial executor 的 size-class frame
   在 executor-local freelist 中复用，跨 executor、concurrent 和超大 frame 仍需完善共享 fallback。
 
-最后一点说明：只恢复旧 inline Task 不足以解决问题。
-存储、结构化生命周期、完成协议、Job 调度
-和最终回收必须作为一个整体重构。
+最后一点说明：只恢复旧 inline Task 不足以解决问题。存储、结构化生命周期、完成协议、
+Job 调度和最终回收必须作为一个整体重构。
+
+## Domain 与 Executor 边界
+
+Domain 是编译期 effect identity，Executor 是 runtime 调度策略。每个 canonical const Domain
+binding 由 compiler 生成独立 slot 和 type-erased descriptor，首次进入时同步调用一次
+`make_executor`，shutdown 时等待已接受 Job 完成后确定性析构。`Domain.kind` 的语义由 runtime
+执行：`.serial` 即使使用并发 Executor 也经过 per-domain gate，`.concurrent` 只允许并行，
+不承诺公平性、线程数或固定线程。
+
+`ExecutorJob` 表示一次 coroutine resume 执行权。Task-backed Job 复用 TaskState 固定 storage；
+其他 continuation 才使用 runtime-owned storage。`enqueue` 可以立即运行，也可以把 move-only Job
+移入队列，但必须最终恰好运行一次。run 建立 current executor/active frame，
+返回后恢复外层 context。
+平台线程、队列、TaskState 和 coroutine frame 均不进入公开 Executor ABI。
 
 ## 语义基础：Task 是结构化子任务
 

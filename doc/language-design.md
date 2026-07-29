@@ -915,16 +915,11 @@ trait object 表达“某个类型实现了某个 trait”，closure object 表�
 函数声明可以带 `unsafe`、`async` 和静态 Domain effect。effect 也进入 `RawFn` / `Fn` 的函数类型：
 
 ```jiang
-struct WorkerDomainType: Domain<kind = .serial> {}
-struct UiDomainType: Domain<kind = .serial> {}
-const WorkerDomainType WorkerDomain = WorkerDomainType();
-const UiDomainType UiDomain = UiDomainType();
-
 unsafe Int read_raw(Int* pointer);
-async [WorkerDomain] Int load(Int id);
+async [global_domain] Int load(Int id);
 
 RawFn<unsafe Int, Int*> reader = read_raw;
-Fn<async [WorkerDomain] Int, Int> loader = { id => load(id) };
+Fn<async [global_domain] Int, Int> loader = { id => load(id) };
 ```
 
 lambda 自身不增加 effect 前缀；async/unsafe/domain effect 必须由完整 expected callable type
@@ -936,9 +931,9 @@ environment。动态调用可以在相同或不同 Domain 间切换；跨 Domain
 handle，使用 Task initializer：
 
 ```jiang
-async [UiDomain] Int render() {
-    Task<Int> first = Task(domain: WorkerDomain) { load(1) };
-    Task<Int> second = Task(domain: WorkerDomain) { load(2) };
+async [main_domain] Int render() {
+    Task<Int> first = Task(domain: global_domain) { load(1) };
+    Task<Int> second = Task(domain: global_domain) { load(2) };
     first.await() + second.await()
 }
 ```
@@ -969,6 +964,36 @@ Task creation 是 eager 的。`Task { ... }` 创建地址固定的直接 `Task<T
 线程等待 block 完成。`Task { ... }` 与 `sync { ... }` 只能继承已有 current Domain；
 `Task(domain: D) { ... }` 显式选择 execution Domain。Task closure 与 sync block 使用 tail
 expression 作为结果，不支持显式 `return`。
+
+`main_domain` 是绑定进程启动线程的标准串行 Domain，`global_domain`
+是进程共享的标准并发 Domain。
+Domain 是静态 effect identity；Executor 是该身份在运行时采用的排队策略。每个 canonical const
+Domain binding 恰好懒创建一个 Executor：
+
+```jiang
+struct InlineExecutor: Executor {
+    () enqueue(Self& self, ExecutorJob job) {
+        job.run();
+    }
+}
+
+struct InlineDomain: Domain<kind = .serial> {
+    associated ExecutorType = InlineExecutor;
+
+    InlineExecutor make_executor(Self& self) {
+        InlineExecutor()
+    }
+}
+
+const InlineDomain inline_domain = InlineDomain();
+```
+
+`Executor.enqueue` 是同步方法，但可以把 move-only `ExecutorJob` 放入自己的队列后再运行。
+它可能从多个线程并发调用，因此 Executor 的可变状态必须使用显式同步。
+Job 被接收后必须最终恰好运行一次；未运行、重复运行或在仍有 pending Job 时销毁均违反
+contract。Domain 的 `.serial`
+保证由 runtime 的 per-domain gate 维护，即使多个串行 Domain 复用同一种并发 Executor，
+它们也拥有各自独立的执行身份和串行序列。
 
 跨线程共享简单标量状态使用 `Atomic<T>`。`get()`、`set()`、`get_and_set()` 和
 `compare_exchange()` 默认使用 sequential order；`*_with_order` 接受 `MemoryOrder.relaxed`、

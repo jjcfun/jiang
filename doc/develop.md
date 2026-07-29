@@ -87,8 +87,21 @@ VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-这些 tag 是历史自举输入。当前 0.5 开发直接使用已安装的 0.4.9 stable，不需要恢复 bootstrap
-worktree。
+这些 tag 是历史自举输入。0.5.0 开发最初由 0.4.9 stable 建立 `bootstrap/0.5.0` next；
+Domain/Executor ABI 跨越再由该 next 构建 `bootstrap/0.5.0-2`。当前 release 构建链固定为：
+
+```text
+Jiang 0.4.9 stable
+  -> bootstrap/0.5.0 next
+  -> bootstrap/0.5.0-2 next
+  -> release/0.5.0 next
+  -> release/0.5.0 stable
+```
+
+当前 release 开发应显式使用
+`/Users/jjc/project/jiang/bootstrap-0.5.0-2/build/bin/jiangc.next`，不能退回 0.4.9
+直接编译已经采用新 Domain ABI 的 compiler source。`try ... catch` 新语法只出现在 release
+测试和用户源码中，compiler source 本身没有依赖该语法，因此无需为它增加第三层 transition。
 
 ## 分支和 tag 规则
 
