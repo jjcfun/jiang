@@ -12,6 +12,8 @@ import object_key_builder = "../artifact/object_key_builder.jiang";
 import artifact_path = "../artifact/path.jiang";
 import source_ji = "../artifact/source_ji.jiang";
 import context = "../context.jiang";
+import core_executor = "../core/executor.jiang";
+import diagnostic = "../diagnostic.jiang";
 import driver_options = "../driver/options.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
@@ -26,6 +28,11 @@ import system_time = "../system/time.jiang";
 import codegen = "./codegen.jiang";
 import codegen_unit = "./codegen_unit.jiang";
 import link_plan = "./link_plan.jiang";
+import std;
+
+// LLVM unit 同时运行过多会放大峰值内存；这个上限只属于 compiler 策略，
+// 不进入 Domain 或语言级并发语义。
+const Int emission_worker_limit = 4;
 
 public struct DebugTiming: Copyable {
     public UInt64 state_ns = UInt64(0);
@@ -114,11 +121,13 @@ public DebugWorkProducts prepare(
     }
     table.HashTable<qkey.Fingerprint128, Bool> reused_sources! =
         table.HashTable<qkey.Fingerprint128, Bool>();
+    list.ArrayList<PendingUnit> pending! = list.ArrayList<PendingUnit>();
     UInt64 plan_ns = timing_elapsed(timing_enabled, started);
     started = timing_start(timing_enabled);
     Int index! = 0;
     while (index < order.len()) {
-        codegen_unit.CodegenUnit& unit = units.unit_at(order.get(index));
+        Int unit_index = order.get(index);
+        codegen_unit.CodegenUnit& unit = units.unit_at(unit_index);
         if (!prepare_unit(
             ctx,
             lowered,
@@ -131,11 +140,25 @@ public DebugWorkProducts prepare(
             context_root,
             fingerprints,
             llvm_triple,
-            link_libc
+            link_libc,
+            unit_index,
+            pending$.mut_ref()
         )) {
             return DebugWorkProducts(false, links, next, target_identity);
         }
         index = index + 1;
+    }
+    if (!emit_pending_units(
+        ctx,
+        lowered,
+        units$.ref(),
+        prepared$.ref(),
+        pending$.ref(),
+        next$.mut_ref(),
+        llvm_triple,
+        link_libc
+    )) {
+        return DebugWorkProducts(false, links, next, target_identity);
     }
     DebugWorkProducts result = DebugWorkProducts(true, links, next, target_identity);
     result.timing.state_ns = state_ns;
@@ -232,6 +255,65 @@ struct UnitFingerprintContext: Copyable {
     }
 }
 
+struct PendingUnit: Movable {
+    Int unit_index;
+    std.String path;
+    std.String temporary;
+    cache_identity.StableSourceIdentity source_identity;
+    build_state.WorkProductKind kind;
+    qkey.Fingerprint128 input_fingerprint;
+
+    init(self,
+        Int unit_index,
+        UInt8[]& path,
+        UInt8[]& temporary,
+        cache_identity.StableSourceIdentity source_identity,
+        build_state.WorkProductKind kind,
+        qkey.Fingerprint128 input_fingerprint
+    ) {
+        self.unit_index = unit_index;
+        self.path = std.String(path);
+        self.temporary = std.String(temporary);
+        self.source_identity = source_identity;
+        self.kind = kind;
+        self.input_fingerprint = input_fingerprint;
+    }
+}
+
+struct EmissionSlot: Movable {
+    diagnostic.DiagnosticStore diagnostics;
+    Bool ok!;
+
+    init(self) {
+        self.diagnostics = diagnostic.DiagnosticStore();
+        self.ok = false;
+    }
+}
+
+struct EmissionBatchInput: Copyable, Sendable {
+    Int context_address;
+    Int store_address;
+    Int units_address;
+    Int prepared_address;
+    Int pending_address;
+    Int slots_address;
+    Int target_address;
+    Int target_length;
+    Bool link_libc;
+}
+
+struct EmissionWorkerInput: Copyable, Sendable {
+    Int context_address;
+    Int store_address;
+    Int unit_address;
+    Int prepared_address;
+    Int pending_address;
+    Int slot_address;
+    Int target_address;
+    Int target_length;
+    Bool link_libc;
+}
+
 Bool prepare_unit(
     context.CompilerContext& ctx,
     jil.Store& lowered,
@@ -244,7 +326,9 @@ Bool prepare_unit(
     UInt8[]& context_root,
     UnitFingerprintContext fingerprints,
     UInt8[]& llvm_triple,
-    Bool link_libc
+    Bool link_libc,
+    Int unit_index,
+    list.ArrayList<PendingUnit>&! pending
 ) {
     qid.ModuleId module_id = qid.ModuleId.from_index(unit.key.module_index);
     guard source_ji.source_identity_for_module(ctx, module_id) is .some(source_identity) else {
@@ -309,21 +393,20 @@ Bool prepare_unit(
         status = .stale;
     }
     record_reuse_status(ctx, kind, status);
-    return emit_unit(
-        ctx,
-        lowered,
-        unit,
-        prepared,
-        next,
-        links,
+    UInt8[]^ temporary = artifact_path.temporary_artifact_path(
         path[..],
+        ".object.tmp."
+    );
+    pending.add(PendingUnit(
+        unit_index,
+        path[..],
+        temporary[..],
         source_identity,
         kind,
-        input_fingerprint,
-        llvm_triple,
-        link_libc,
-        module_id
-    );
+        input_fingerprint
+    ));
+    links.add_user_object(path[..]);
+    return true;
 }
 
 () restore_interface_units(
@@ -426,51 +509,248 @@ Bool work_product_record_exists(
     return state.find_work_product(source_identity, kind) != null;
 }
 
-Bool emit_unit(
+Bool emit_pending_units(
     context.CompilerContext& ctx,
     jil.Store& lowered,
-    codegen_unit.CodegenUnit& unit,
+    codegen_unit.CodegenUnitSet& units,
     codegen.PreparedStore& prepared,
+    list.ArrayList<PendingUnit>& pending,
     build_state.BuildState&! next,
-    link_plan.LinkPlan&! links,
-    UInt8[]& path,
-    cache_identity.StableSourceIdentity source_identity,
-    build_state.WorkProductKind kind,
-    qkey.Fingerprint128 input_fingerprint,
     UInt8[]& llvm_triple,
-    Bool link_libc,
-    qid.ModuleId module_id
+    Bool link_libc
 ) {
-    UInt8[]^ temporary = artifact_path.temporary_artifact_path(path, ".object.tmp.");
-    codegen.BackendResult result = codegen.emit_object_for_prepared_unit(
+    if (pending.empty()) { return true; }
+    list.ArrayList<EmissionSlot> slots! = list.ArrayList<EmissionSlot>(
+        pending.len()
+    );
+    Int index! = 0;
+    while (index < pending.len()) {
+        slots.add(EmissionSlot());
+        index = index + 1;
+    }
+    EmissionBatchInput input = emission_batch_input(
+        ctx,
+        lowered,
+        units,
+        prepared,
+        pending,
+        slots$.mut_ref(),
+        llvm_triple,
+        link_libc
+    );
+    Task<Bool>^ emission_task = new Task(
+        domain: core_executor.global_domain
+    ) { [saved = input] =>
+        emit_pending_batches(saved)
+    };
+    Bool emitted = sync [core_executor.global_domain] {
+        emission_task.await()
+    };
+    merge_emission_diagnostics(ctx, slots$.mut_ref());
+    if (!emitted) {
+        remove_pending_temporaries(pending);
+        return false;
+    }
+    index = 0;
+    while (index < pending.len()) {
+        if (!publish_pending_unit(ctx, pending.ref_at(index), next)) {
+            remove_pending_temporaries(pending);
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+EmissionBatchInput emission_batch_input(
+    context.CompilerContext& ctx,
+    jil.Store& lowered,
+    codegen_unit.CodegenUnitSet& units,
+    codegen.PreparedStore& prepared,
+    list.ArrayList<PendingUnit>& pending,
+    list.ArrayList<EmissionSlot>&! slots,
+    UInt8[]& llvm_triple,
+    Bool link_libc
+) {
+    return EmissionBatchInput(
+        context_address: unsafe { ctx$.ptr()$.as(Int) },
+        store_address: unsafe { lowered$.ptr()$.as(Int) },
+        units_address: unsafe { units$.ptr()$.as(Int) },
+        prepared_address: unsafe { prepared$.ptr()$.as(Int) },
+        pending_address: unsafe { pending$.ptr()$.as(Int) },
+        slots_address: unsafe { slots$.ptr()$.as(Int) },
+        target_address: unsafe { llvm_triple$.ptr()$.as(Int) },
+        target_length: llvm_triple.length,
+        link_libc: link_libc
+    );
+}
+
+async [core_executor.global_domain] Bool emit_pending_batches(EmissionBatchInput input) {
+    list.ArrayList<PendingUnit>& pending = unsafe {
+        input.pending_address$.as(list.ArrayList<PendingUnit>&)
+    };
+    list.ArrayList<EmissionSlot>&! slots = unsafe {
+        input.slots_address$.as(list.ArrayList<EmissionSlot>&!)
+    };
+    if (pending.len() == 1) {
+        return emit_pending_unit(worker_input(input, pending, slots, 0));
+    }
+    Int start! = 0;
+    while (start < pending.len()) {
+        if (!emit_pending_batch(
+            input,
+            pending,
+            slots,
+            start,
+            emission_worker_limit
+        )) {
+            return false;
+        }
+        start = start + emission_worker_limit;
+    }
+    true
+}
+
+async [core_executor.global_domain] Bool emit_pending_batch(
+    EmissionBatchInput input,
+    list.ArrayList<PendingUnit>& pending,
+    list.ArrayList<EmissionSlot>&! slots,
+    Int start,
+    Int limit
+) {
+    list.ArrayList<Task<Bool>^> tasks! = list.ArrayList<Task<Bool>^>(limit);
+    Int index! = start;
+    while (index < pending.len() && index < start + limit) {
+        EmissionWorkerInput job = worker_input(input, pending, slots, index);
+        tasks.add(start_pending_unit(job));
+        index = index + 1;
+    }
+    while (!tasks.empty()) {
+        Task<Bool>^ task = tasks.pop();
+        if (task.await()) { continue; }
+        while (!tasks.empty()) {
+            Task<Bool>^ pending_task = tasks.pop();
+            pending_task.cancel_and_await();
+        }
+        return false;
+    }
+    true
+}
+
+Task<Bool>^ start_pending_unit(EmissionWorkerInput input) {
+    new Task(domain: core_executor.global_domain) { [saved = input] =>
+        emit_pending_unit(saved)
+    }
+}
+
+EmissionWorkerInput worker_input(
+    EmissionBatchInput batch,
+    list.ArrayList<PendingUnit>& pending,
+    list.ArrayList<EmissionSlot>&! slots,
+    Int index
+) {
+    PendingUnit& plan = pending.ref_at(index);
+    EmissionSlot&! slot = slots.ref_at(index);
+    codegen_unit.CodegenUnitSet& units = unsafe {
+        batch.units_address$.as(codegen_unit.CodegenUnitSet&)
+    };
+    codegen_unit.CodegenUnit& unit = units.unit_at(plan.unit_index);
+    return EmissionWorkerInput(
+        context_address: batch.context_address,
+        store_address: batch.store_address,
+        unit_address: unsafe { unit$.ptr()$.as(Int) },
+        prepared_address: batch.prepared_address,
+        pending_address: unsafe { plan$.ptr()$.as(Int) },
+        slot_address: unsafe { slot$.ptr()$.as(Int) },
+        target_address: batch.target_address,
+        target_length: batch.target_length,
+        link_libc: batch.link_libc
+    );
+}
+
+async [core_executor.global_domain] Bool emit_pending_unit(EmissionWorkerInput input) {
+    context.CompilerContext& ctx = unsafe {
+        input.context_address$.as(context.CompilerContext&)
+    };
+    jil.Store& lowered = unsafe {
+        input.store_address$.as(jil.Store&)
+    };
+    codegen_unit.CodegenUnit& unit = unsafe {
+        input.unit_address$.as(codegen_unit.CodegenUnit&)
+    };
+    codegen.PreparedStore& prepared = unsafe {
+        input.prepared_address$.as(codegen.PreparedStore&)
+    };
+    PendingUnit& plan = unsafe {
+        input.pending_address$.as(PendingUnit&)
+    };
+    EmissionSlot&! slot = unsafe {
+        input.slot_address$.as(EmissionSlot&!)
+    };
+    UInt8[]& target = unsafe {
+        input.target_address$.as(UInt8*)[0..input.target_length]
+    };
+    codegen.BackendResult result = codegen.emit_object_for_prepared_unit_isolated(
         ctx,
         lowered,
         unit,
         prepared,
-        temporary[..],
+        plan.temporary.bytes(),
         .debug,
-        link_libc,
-        llvm_triple
+        input.link_libc,
+        target,
+        unsafe { slot.diagnostics$.ptr()$.as(Int) }
     );
-    if (result.has_errors()) {
-        system_fs.remove_file(temporary[..]);
-        return false;
+    slot.ok = !result.has_errors();
+    if (!slot.ok && slot.diagnostics.empty()) {
+        slot.diagnostics.add(diagnostic.Diagnostic(
+            .error,
+            .codegen,
+            diagnostic.DiagnosticCode("llvm_object_unit_emit_failed"),
+            diagnostic.SourceRange(),
+            "LLVM object unit emission failed"
+        ));
     }
-    if (!system_fs.atomic_replace(temporary[..], path)) {
-        system_fs.remove_file(temporary[..]);
-        return false;
+    slot.ok
+}
+
+() merge_emission_diagnostics(
+    context.CompilerContext& ctx,
+    list.ArrayList<EmissionSlot>&! slots
+) {
+    Int index! = 0;
+    while (index < slots.len()) {
+        diagnostic.DiagnosticStore worker = slots.ref_at(index).diagnostics.take();
+        ctx.store.diagnostics.append(worker);
+        index = index + 1;
     }
-    guard object_hash.hash_file(path) is .some(hash) else { return false; }
-    guard output_metadata(path) is .some(metadata) else { return false; }
+}
+
+() remove_pending_temporaries(list.ArrayList<PendingUnit>& pending) {
+    Int index! = 0;
+    while (index < pending.len()) {
+        system_fs.remove_file(pending.ref_at(index).temporary.bytes());
+        index = index + 1;
+    }
+}
+
+Bool publish_pending_unit(
+    context.CompilerContext& ctx,
+    PendingUnit& plan,
+    build_state.BuildState&! next
+) {
+    UInt8[]& temporary = plan.temporary.bytes();
+    guard object_hash.hash_file(temporary) is .some(hash) else { return false; }
+    guard output_metadata(temporary) is .some(metadata) else { return false; }
+    if (!system_fs.atomic_replace(temporary, plan.path.bytes())) { return false; }
     next.upsert_work_product(build_state.WorkProduct(
-        source_identity.fingerprint,
-        kind,
-        input_fingerprint,
+        plan.source_identity.fingerprint,
+        plan.kind,
+        plan.input_fingerprint,
         hash,
         metadata.modified_ns,
         UInt64(metadata.size)
     ));
-    links.add_user_object(path);
     ctx.store.object_artifacts.record_emitted_unit();
     return true;
 }
