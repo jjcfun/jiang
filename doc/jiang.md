@@ -1296,13 +1296,13 @@ Int@Err outer(Bool fail) {
 异常的使用方式是：
 
 - 在 `T@E` 函数里依靠普通调用做同 `E` 的隐式传播
-- 用 `try expr catch (...) => fallback` 处理单个失败结果
+- 用 `try expr catch { ... }` 或 `try expr catch error { ... }` 处理单个失败结果
 
 异常结果不通过 `switch` 匹配。
 
-单个可错表达式可以用 `try catch` 处理：
+单个可错表达式可以用 `try catch` 处理。先看不需要错误值的形式：
 
-```c
+```jiang
 enum Err {
     bad = 7,
 }
@@ -1315,42 +1315,53 @@ Int@Err parse(Bool fail) {
 }
 
 Int main() {
-    Int a = try parse(false) catch () => 0;
-    Int b = try parse(true) catch (e) => {
-        if (e == Err.bad) {
+    Int value = try parse(true) catch {
+        0
+    };
+    return value;
+}
+```
+
+需要检查错误值时，直接在 `catch` 后声明绑定。绑定类型可以推导，也可以显式写出：
+
+```jiang
+Int main() {
+    Int a = try parse(true) catch error {
+        if (error == Err.bad) {
+            42
+        } else {
+            0
+        }
+    };
+    Int b = try parse(true) catch Err error {
+        if (error == Err.bad) {
             42;
         } else {
             0;
         };
     };
-    Int c = try parse(true) catch (e) => {
-        Int base = 0;
-        if (e == Err.bad) {
-            base + 7;
-        } else {
-            base;
-        };
-    };
-    return a + b + c;
+    return a + b;
 }
 ```
 
 `catch` 规则：
 
-- 只支持前置 `try catch` 表达式形式：`try expr catch (...) => fallback`
+- 只支持前置 `try catch` 表达式形式：`try expr catch binding? { ... }`
 - `try` 只包住 `catch` 前面的单个表达式
 - `expr` 必须是 `T@E`
-- `catch` 参数列表必须写 `(...)`；不需要错误值时写 `()`
-- `catch` 绑定可省略类型；如果写绑定，类型自动推断为错误类型 `E`
-- fallback 可以是表达式或 block
-- 成功结果类型为 `T`，fallback 的结果类型必须能与 `T` 统一
+- 不需要错误值时直接写 `catch { ... }`
+- `catch error { ... }` 从错误类型 `E` 推导绑定类型；也可写 `catch E error { ... }`
+- 为兼容需要分组的写法，绑定可写成 `catch (error) { ... }` 或 `catch (E error) { ... }`
+- `catch` 后必须是 block，block 尾表达式是失败分支的结果
+- 成功结果类型为 `T`，失败分支的结果类型必须能与 `T` 统一
 - `catch` 不做 runtime unwind，仍然只是结果值分支
 
 不支持：
 
 - 后缀 `expr catch`
 - 多条 `catch`
-- 无 `=>` 的 `catch` fallback
+- `catch (...) => ...` 旧写法
+- 不带 block 的失败分支
 - `finally`
 - 不同错误类型自动组合
 

@@ -1229,7 +1229,8 @@ Int@Error! parse_mutable_error();
 ```
 
 errorable 函数调用在同错误类型的函数中透明投影为成功类型 `T`，失败时自动向上一层传播；成功值可
-直接参与表达式。`try call() catch (...) => ...` 对单个调用点阻止自动传播并处理 error 分支。
+直接参与表达式。`try call() catch error { ... }` 对单个调用点阻止自动传播并处理 error 分支；
+不需要错误值时写作 `catch { ... }`。
 `throw expr` 只能出现在返回 errorable type 的函数中，`expr` 必须可赋给该函数的 error type。
 catch binding 只在 catch body 内可见，类型来自被处理 errorable value 的 error type。
 

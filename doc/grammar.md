@@ -750,9 +750,8 @@ try_catch_expr
             <- "try" expr catch_clause
 
 catch_clause
-            <- "catch" "(" catch_binding? ")" "=>" catch_body
-
-catch_body  <- block / expr
+            <- "catch" catch_binding? block
+             / "catch" "(" catch_binding? ")" block
 ```
 
 ## pattern
