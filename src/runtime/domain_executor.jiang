@@ -24,9 +24,19 @@ const Int executor_shared_frame_pool_handle_word =
     executor_local_frame_pool_word + frame_pool_class_count;
 const Int executor_descriptor_word = executor_shared_frame_pool_handle_word + 1;
 const Int executor_instance_word = executor_descriptor_word + 1;
-const Int executor_word_count = executor_instance_word + 1;
+const Int executor_serial_mutex_word = executor_instance_word + 1;
+const Int executor_serial_active_word = executor_serial_mutex_word + 1;
+const Int executor_serial_head_word = executor_serial_active_word + 1;
+const Int executor_serial_tail_word = executor_serial_head_word + 1;
+const Int executor_word_count = executor_serial_tail_word + 1;
 const Int frame_header_size = 16;
 const Int frame_pool_min_size = 64;
+const Int custom_job_group_word = 0;
+const Int custom_job_context_word = 1;
+const Int custom_job_callback_word = 2;
+const Int custom_job_executor_word = 3;
+const Int custom_job_next_word = 4;
+const Int custom_job_word_count = 5;
 
 public struct InlineTarget: Copyable {
     public Void* context;
@@ -96,7 +106,130 @@ public Bool enqueue(
     Void* context,
     Void* callback
 ) {
+    if (executor_descriptor(executor) != null) {
+        return enqueue_custom(group, executor, context, callback);
+    }
     return thread.enqueue(group, queue(executor), context, callback);
+}
+
+Bool enqueue_custom(
+    thread.Group group,
+    Void* executor,
+    Void* context,
+    Void* callback
+) {
+    UInt8* job = thread.allocate_storage(custom_job_word_count * Int$.size());
+    if (job == null) { return false; }
+    store_storage_word(
+        job, custom_job_group_word, unsafe { thread.group_handle(group)$.as(Int) }
+    );
+    store_storage_word(job, custom_job_context_word, unsafe { context$.as(Int) });
+    store_storage_word(job, custom_job_callback_word, unsafe { callback$.as(Int) });
+    store_storage_word(job, custom_job_executor_word, unsafe { executor$.as(Int) });
+    store_storage_word(job, custom_job_next_word, 0);
+    if (!thread.enter_group(group)) {
+        thread.deallocate_storage(job);
+        return false;
+    }
+    descriptor_model.DomainDescriptor& descriptor = unsafe {
+        executor_descriptor(executor)$.as(descriptor_model.DomainDescriptor&)
+    };
+    Void* instance = unsafe {
+        load_executor_word(executor, executor_instance_word)$.as(Void*)
+    };
+    RawFn<(), Void*, Int, Int> submit = unsafe {
+        descriptor.enqueue$.as(RawFn<(), Void*, Int, Int>)
+    };
+    RawFn<(), Int> run = run_custom_job;
+    submit(
+        instance,
+        unsafe { job$.as(Int) },
+        unsafe { run$.as(Int) }
+    );
+    return true;
+}
+
+@life()
+() run_custom_job(Int raw_job) {
+    UInt8* job = unsafe { raw_job$.as(UInt8*) };
+    Void* executor = unsafe {
+        load_storage_word(job, custom_job_executor_word)$.as(Void*)
+    };
+    if (!is_concurrent(executor) && !claim_custom_serial_job(executor, job)) {
+        return;
+    }
+    UInt8* current! = job;
+    while (current != null) {
+        run_claimed_custom_job(current);
+        current = take_custom_serial_job(executor);
+    }
+}
+
+() run_claimed_custom_job(UInt8* job) {
+    Void* context = unsafe {
+        load_storage_word(job, custom_job_context_word)$.as(Void*)
+    };
+    Void* callback = unsafe {
+        load_storage_word(job, custom_job_callback_word)$.as(Void*)
+    };
+    RawFn<(), Void*> run = unsafe { callback$.as(RawFn<(), Void*>) };
+    run(context);
+    thread.Group group = thread.group_from_handle(unsafe {
+        load_storage_word(job, custom_job_group_word)$.as(Void*)
+    });
+    thread.leave_group(group);
+    thread.deallocate_storage(job);
+}
+
+Bool claim_custom_serial_job(Void* executor, UInt8* job) {
+    thread.Mutex mutex = custom_serial_mutex(executor);
+    thread.lock(mutex);
+    if (load_executor_word(executor, executor_serial_active_word) == 0) {
+        store_executor_word(executor, executor_serial_active_word, 1);
+        thread.unlock(mutex);
+        return true;
+    }
+    UInt8* tail = unsafe {
+        load_executor_word(executor, executor_serial_tail_word)$.as(UInt8*)
+    };
+    if (tail == null) {
+        store_executor_word(executor, executor_serial_head_word, unsafe { job$.as(Int) });
+    } else {
+        store_storage_word(tail, custom_job_next_word, unsafe { job$.as(Int) });
+    }
+    store_executor_word(executor, executor_serial_tail_word, unsafe { job$.as(Int) });
+    thread.unlock(mutex);
+    return false;
+}
+
+UInt8* take_custom_serial_job(Void* executor) {
+    if (is_concurrent(executor)) { return null; }
+    thread.Mutex mutex = custom_serial_mutex(executor);
+    thread.lock(mutex);
+    UInt8* head = unsafe {
+        load_executor_word(executor, executor_serial_head_word)$.as(UInt8*)
+    };
+    if (head == null) {
+        store_executor_word(executor, executor_serial_active_word, 0);
+        thread.unlock(mutex);
+        return null;
+    }
+    UInt8* next = unsafe {
+        load_storage_word(head, custom_job_next_word)$.as(UInt8*)
+    };
+    store_executor_word(executor, executor_serial_head_word, unsafe { next$.as(Int) });
+    if (next == null) {
+        store_executor_word(executor, executor_serial_tail_word, 0);
+    }
+    thread.unlock(mutex);
+    return head;
+}
+
+thread.Mutex custom_serial_mutex(Void* executor) {
+    Void* handle = unsafe {
+        load_executor_word(executor, executor_serial_mutex_word)$.as(Void*)
+    };
+    return thread.mutex_from_handle(handle);
 }
 
 public Bool is_concurrent(Void* executor) {
@@ -287,6 +420,10 @@ Void* add_executor(
     );
     store_storage_word(storage, executor_descriptor_word, unsafe { descriptor$.as(Int) });
     store_storage_word(storage, executor_instance_word, 0);
+    store_storage_word(storage, executor_serial_mutex_word, 0);
+    store_storage_word(storage, executor_serial_active_word, 0);
+    store_storage_word(storage, executor_serial_head_word, 0);
+    store_storage_word(storage, executor_serial_tail_word, 0);
     if (descriptor != null) {
         initialize_custom_executor(storage, domain_kind, descriptor, domain_config);
     }
@@ -315,6 +452,15 @@ Void* add_executor(
     };
     create(domain_config, instance);
     store_storage_word(executor, executor_instance_word, unsafe { instance$.as(Int) });
+    if (domain_kind != concurrent_domain_kind) {
+        thread.Mutex mutex = thread.create_mutex();
+        assert(thread.mutex_valid(mutex));
+        store_storage_word(
+            executor,
+            executor_serial_mutex_word,
+            unsafe { thread.mutex_handle(mutex)$.as(Int) }
+        );
+    }
 }
 
 Void* allocate_aligned_storage(Int size, Int alignment) {
@@ -522,6 +668,11 @@ Void* executor_descriptor(Void* executor) {
     RawFn<(), Void*> destroy = unsafe { descriptor.destroy$.as(RawFn<(), Void*>) };
     destroy(instance);
     free_aligned_storage(instance);
+    if (!is_concurrent(executor)) {
+        assert(load_executor_word(executor, executor_serial_active_word) == 0);
+        assert(load_executor_word(executor, executor_serial_head_word) == 0);
+        thread.destroy(custom_serial_mutex(executor));
+    }
 }
 
 () free_executor_frame_pool(Void* executor) {

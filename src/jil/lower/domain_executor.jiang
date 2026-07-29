@@ -1,0 +1,892 @@
+// Domain/Executor descriptor 与生命周期 shim lowering。
+//
+// 每个被使用的 canonical const Domain 生成一个只读 descriptor。create 直接把
+// concrete Executor 初始化到 runtime 最终 storage；enqueue 构造 opaque
+// ExecutorJob；destroy 只销毁 concrete value，不释放 runtime 拥有的 storage。
+
+import sem = "../../sema/model.jiang";
+import layout = "../../layout.jiang";
+import layout_compute = "../../layout/compute.jiang";
+import qid = "../../id.jiang";
+import def = "../../resolve/def.jiang";
+import types = "../../sema/type.jiang";
+import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
+import token = "../../syntax/token.jiang";
+import jil = "../model.jiang";
+import std;
+import body_context = "./body.jiang";
+import * = "./body.jiang";
+import constant = "./constant.jiang";
+import trait_object = "./trait_object.jiang";
+import dispatch = "./dispatch.jiang";
+import type_support = "./type_support.jiang";
+import place = "./place.jiang";
+
+public extend body_context.BodyLowerer {
+    public () ensure_domain_executor_descriptor(
+        self,
+        sem.NodeId node_id,
+        qid.DefId domain_def
+    ) {
+        if (self.lowerer.output.domain_executor_descriptor(domain_def) != null) { return; }
+        guard self.domain_descriptor_inputs(node_id, domain_def) is .some(inputs) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        if (self.is_builtin_executor_type(inputs.executor_type)) { return; }
+        token.Span span = self.lowerer.model_span(node_id);
+        guard self.ensure_domain_config_global(
+            domain_def, inputs.domain_type, span
+        ) is .some(config_ref) else {
+            self.mark_unsupported(node_id);
+            return;
+        }
+        jil.FunctionRef create = self.add_domain_create_shim(inputs, span);
+        jil.FunctionRef enqueue = self.add_domain_enqueue_shim(inputs, span);
+        jil.FunctionRef destroy = self.add_domain_destroy_shim(inputs, span);
+        jil.GlobalRef descriptor = self.add_domain_descriptor_global(
+            inputs, create, enqueue, destroy, span
+        );
+        self.lowerer.output.domain_executor_descriptors.set(
+            domain_def,
+            jil.DomainExecutorDescriptor(
+                descriptor: descriptor,
+                domain_config: config_ref
+            )
+        );
+    }
+
+    Bool is_builtin_executor_type(self, qid.TypeId executor_type) {
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(executor_type);
+        guard info.data is .named(named) else { return false; }
+        if (self.lowerer.ctx.store.resolve.core_types.serial_executor_type
+            is .some(serial_executor)
+        ) {
+            if (named.def_id == serial_executor) { return true; }
+        }
+        if (self.lowerer.ctx.store.resolve.core_types.concurrent_executor_type
+            is .some(concurrent_executor)
+        ) {
+            return named.def_id == concurrent_executor;
+        }
+        return false;
+    }
+
+    DomainDescriptorInputs? domain_descriptor_inputs(
+        self,
+        sem.NodeId node_id,
+        qid.DefId domain_def
+    ) {
+        guard self.lowerer.typeck.def_type(domain_def) is .some(domain_type) else {
+            return null;
+        }
+        guard self.domain_executor_type(domain_type) is .some(executor_type) else {
+            return null;
+        }
+        guard self.lowerer.ctx.store.resolve.core_traits.domain_trait
+            is .some(domain_trait) else {
+            return null;
+        }
+        guard self.lowerer.ctx.store.resolve.core_traits.executor_trait
+            is .some(executor_trait) else {
+            return null;
+        }
+        guard self.trait_function_member(domain_trait, "make_executor")
+            is .some(make_member) else {
+            return null;
+        }
+        guard self.trait_function_member(executor_trait, "enqueue")
+            is .some(enqueue_member) else {
+            return null;
+        }
+        guard self.trait_vtable_function_ref(node_id, domain_type, make_member)
+            is .some(make_executor) else {
+            return null;
+        }
+        guard self.trait_vtable_function_ref(node_id, executor_type, enqueue_member)
+            is .some(enqueue) else {
+            return null;
+        }
+        Int domain_kind = self.descriptor_domain_kind_for_type(domain_type);
+        if (domain_kind < 0) { return null; }
+        return DomainDescriptorInputs(
+            domain_def: domain_def,
+            domain_type: domain_type,
+            executor_type: executor_type,
+            domain_kind: domain_kind,
+            make_executor: make_executor,
+            enqueue: enqueue
+        );
+    }
+
+    Int descriptor_domain_kind_for_type(self, qid.TypeId domain_type) {
+        guard self.lowerer.ctx.store.resolve.core_traits.domain_trait
+            is .some(domain_trait) else {
+            return -1;
+        }
+        guard self.trait_associated_type_member(domain_trait, "kind")
+            is .some(kind_assoc) else {
+            return -1;
+        }
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(domain_type);
+        guard info.data is .named(named) else { return -1; }
+        guard self.lowerer.model.def(named.def_id) is .some(domain_model) else {
+            return -1;
+        }
+        Int index! = 0;
+        while (index < domain_model.members.len()) {
+            qid.DefId member = domain_model.members.get(index);
+            index = index + 1;
+            def.DefRecord record = self.lowerer.ctx.store.defs.get(member);
+            guard record.associated_trait_member is .some(trait_member) else {
+                continue;
+            }
+            if (trait_member != kind_assoc) { continue; }
+            guard self.lowerer.ctx.store.comptime_store.const_value(member)
+                is .some(value) else {
+                return -1;
+            }
+            guard value.data is .enum_case_value(case_def) else { return -1; }
+            if (self.lowerer.typeck.enum_case_value(case_def) is .some(kind)) {
+                return kind;
+            }
+            return -1;
+        }
+        return -1;
+    }
+
+    qid.TypeId? domain_executor_type(self, qid.TypeId domain_type) {
+        guard self.lowerer.ctx.store.resolve.core_traits.domain_trait
+            is .some(domain_trait) else {
+            return null;
+        }
+        guard self.trait_associated_type_member(domain_trait, "ExecutorType")
+            is .some(executor_assoc) else {
+            return null;
+        }
+        types.TypeInfo info = self.lowerer.ctx.store.types.get(domain_type);
+        guard info.data is .named(named) else { return null; }
+        guard self.lowerer.model.def(named.def_id) is .some(domain_model) else {
+            return null;
+        }
+        Int index! = 0;
+        qid.SymbolId executor_symbol =
+            self.lowerer.ctx.store.symbols.intern("ExecutorType");
+        while (index < domain_model.members.len()) {
+            qid.DefId member = domain_model.members.get(index);
+            index = index + 1;
+            def.DefRecord record = self.lowerer.ctx.store.defs.get(member);
+            Bool matches! = record.name.symbol == executor_symbol;
+            if (record.associated_trait_member is .some(trait_member)) {
+                matches = trait_member == executor_assoc;
+            }
+            if (!matches) { continue; }
+            if (self.lowerer.typeck.def_type(member) is .some(executor_type)) {
+                return self.lowerer.substitute_type(executor_type, self.substitutions);
+            }
+            guard self.lowerer.model.def(member) is .some(member_model) else {
+                return null;
+            }
+            guard member_model.decl.type_ref is .some(type_ref) else { return null; }
+            if (self.lowerer.typeck.node_type(type_ref) is .some(executor_type)) {
+                return self.lowerer.substitute_type(executor_type, self.substitutions);
+            }
+            return null;
+        }
+        index = 0;
+        while (index < domain_model.where_predicates.len()) {
+            sem.WherePredicate predicate = domain_model.where_predicates.get(index);
+            index = index + 1;
+            guard predicate is .projection_equal(equal) else { continue; }
+            if (!self.projection_targets_associated_type(equal, domain_trait, executor_assoc)) {
+                continue;
+            }
+            guard self.lowerer.typeck.node_type(equal.value) is .some(raw_type) else {
+                return null;
+            }
+            return self.lowerer.substitute_type(raw_type, self.substitutions);
+        }
+        return null;
+    }
+
+    Bool projection_targets_associated_type(
+        self,
+        sem.WhereProjectionEqual equal,
+        qid.DefId trait_def,
+        qid.DefId associated_def
+    ) {
+        sem.Node trait_ref = self.lowerer.model.node(equal.trait_ref);
+        guard trait_ref.data is .named_type_ref(named) else { return false; }
+        if (named.def_id != trait_def) { return false; }
+        return equal.assoc_symbol
+            == self.lowerer.ctx.store.defs.get(associated_def).name.symbol;
+    }
+
+    qid.DefId? trait_associated_type_member(
+        self,
+        qid.DefId trait_def,
+        UInt8[]& name
+    ) {
+        guard self.lowerer.model.def(trait_def) is .some(trait_model) else {
+            return null;
+        }
+        qid.SymbolId symbol = self.lowerer.ctx.store.symbols.intern(name);
+        Int index! = 0;
+        while (index < trait_model.members.len()) {
+            qid.DefId member = trait_model.members.get(index);
+            index = index + 1;
+            def.DefRecord record = self.lowerer.ctx.store.defs.get(member);
+            if (record.kind != .associated_type_def || record.name.symbol != symbol) {
+                continue;
+            }
+            return member;
+        }
+        return null;
+    }
+
+    qid.DefId? trait_function_member(self, qid.DefId trait_def, UInt8[]& name) {
+        guard self.lowerer.model.def(trait_def) is .some(trait_model) else {
+            return null;
+        }
+        qid.SymbolId symbol = self.lowerer.ctx.store.symbols.intern(name);
+        Int index! = 0;
+        while (index < trait_model.members.len()) {
+            qid.DefId member = trait_model.members.get(index);
+            index = index + 1;
+            def.DefRecord record = self.lowerer.ctx.store.defs.get(member);
+            if (record.kind == .function_def && record.name.symbol == symbol) {
+                return member;
+            }
+        }
+        return null;
+    }
+
+    jil.GlobalRef? ensure_domain_config_global(
+        self,
+        qid.DefId domain_def,
+        qid.TypeId domain_type,
+        token.Span span
+    ) {
+        layout.LayoutId layout_id = layout_compute.layout_of_type(
+            self.lowerer.ctx, domain_type
+        );
+        layout.TypeLayout domain_layout =
+            self.lowerer.ctx.store.layouts.layout(layout_id);
+        if (domain_layout.size == 0) {
+            return self.add_zero_sized_domain_config_global(domain_def, span);
+        }
+        if (self.lowerer.output.global_id_for_def(domain_def) == null) {
+            guard self.lowerer.ctx.store.comptime_store.const_value(domain_def)
+                is .some(value) else {
+                return null;
+            }
+            guard self.static_value_from_comptime(value, domain_type, span)
+                is .some(initializer) else {
+                return null;
+            }
+            jil.GlobalId id = jil.GlobalId.from_index(
+                self.lowerer.output.globals.len()
+            );
+            self.lowerer.output.add_global(jil.Global(
+                id: id,
+                def_id: domain_def,
+                type_id: domain_type,
+                span: span,
+                read_only: true,
+                is_external: false,
+                initializer: initializer
+            ));
+        }
+        qid.TypeId pointer_type = self.lowerer.ctx.store.types.raw_pointer_type(
+            domain_type, span
+        );
+        return jil.GlobalRef(
+            global_def: domain_def,
+            type_id: pointer_type,
+            is_external: false,
+            span: span
+        );
+    }
+
+    jil.GlobalRef add_zero_sized_domain_config_global(
+        self,
+        qid.DefId domain_def,
+        token.Span span
+    ) {
+        qid.DefId config_def = self.create_domain_generated_def(
+            .global_def,
+            self.domain_generated_name("__domain_config_", domain_def),
+            span
+        );
+        qid.TypeId storage_type = self.lowerer.ctx.store.types.uint8_type();
+        jil.GlobalId id = jil.GlobalId.from_index(self.lowerer.output.globals.len());
+        self.lowerer.output.add_global(jil.Global(
+            id: id,
+            def_id: config_def,
+            type_id: storage_type,
+            span: span,
+            read_only: true,
+            is_external: false,
+            initializer: jil.scalar_static_value(jil.Const(
+                type_id: storage_type,
+                span: span,
+                value: jil.int_const_kind(jil.IntConst(
+                    bits: UInt64(0),
+                    signed_value: false
+                ))
+            ))
+        ));
+        return jil.GlobalRef(
+            global_def: config_def,
+            type_id: self.lowerer.ctx.store.types.raw_pointer_type(
+                storage_type, span
+            ),
+            is_external: false,
+            span: span
+        );
+    }
+
+    jil.GlobalRef add_domain_descriptor_global(
+        self,
+        DomainDescriptorInputs inputs,
+        jil.FunctionRef create,
+        jil.FunctionRef enqueue,
+        jil.FunctionRef destroy,
+        token.Span span
+    ) {
+        qid.TypeId descriptor_type = self.domain_descriptor_type(
+            create.type_id, enqueue.type_id, destroy.type_id, span
+        );
+        qid.DefId descriptor_def = self.create_domain_generated_def(
+            .global_def, self.domain_generated_name("__domain_descriptor_", inputs.domain_def), span
+        );
+        list.ArrayList<jil.StaticField> fields! =
+            list.ArrayList<jil.StaticField>(6);
+        fields.add(self.domain_descriptor_int_field(inputs.domain_kind, span));
+        layout.LayoutId layout_id = layout_compute.layout_of_type(
+            self.lowerer.ctx, inputs.executor_type
+        );
+        layout.TypeLayout executor_layout =
+            self.lowerer.ctx.store.layouts.layout(layout_id);
+        fields.add(self.domain_descriptor_int_field(executor_layout.size, span));
+        fields.add(self.domain_descriptor_int_field(executor_layout.align, span));
+        fields.add(jil.StaticField(
+            type_id: create.type_id,
+            value: jil.function_static_value(create)
+        ));
+        fields.add(jil.StaticField(
+            type_id: enqueue.type_id,
+            value: jil.function_static_value(enqueue)
+        ));
+        fields.add(jil.StaticField(
+            type_id: destroy.type_id,
+            value: jil.function_static_value(destroy)
+        ));
+        jil.GlobalId id = jil.GlobalId.from_index(self.lowerer.output.globals.len());
+        self.lowerer.output.add_global(jil.Global(
+            id: id,
+            def_id: descriptor_def,
+            type_id: descriptor_type,
+            span: span,
+            read_only: true,
+            is_external: false,
+            initializer: jil.StaticValue.aggregate(
+                self.lowerer.output.static_field_array(fields$.ref())
+            )
+        ));
+        return jil.GlobalRef(
+            global_def: descriptor_def,
+            type_id: self.lowerer.ctx.store.types.raw_pointer_type(
+                descriptor_type, span
+            ),
+            is_external: false,
+            span: span
+        );
+    }
+
+    qid.TypeId domain_descriptor_type(
+        self,
+        qid.TypeId create_type,
+        qid.TypeId enqueue_type,
+        qid.TypeId destroy_type,
+        token.Span span
+    ) {
+        list.ArrayList<qid.TypeId> fields! = list.ArrayList<qid.TypeId>(6);
+        fields.add(self.lowerer.ctx.store.types.int_type());
+        fields.add(self.lowerer.ctx.store.types.int_type());
+        fields.add(self.lowerer.ctx.store.types.int_type());
+        fields.add(create_type);
+        fields.add(enqueue_type);
+        fields.add(destroy_type);
+        return self.lowerer.ctx.store.types.tuple_type(fields, span);
+    }
+
+    jil.StaticField domain_descriptor_int_field(self, Int value, token.Span span) {
+        return jil.StaticField(
+            type_id: self.lowerer.ctx.store.types.int_type(),
+            value: jil.scalar_static_value(jil.Const(
+                type_id: self.lowerer.ctx.store.types.int_type(),
+                span: span,
+                value: jil.int_const_kind(jil.IntConst(
+                    bits: UInt64(value),
+                    signed_value: true
+                ))
+            ))
+        );
+    }
+
+    std.String domain_generated_name(self, UInt8[]& prefix, qid.DefId domain_def) {
+        std.StringBuilder builder = std.StringBuilder();
+        builder.append(prefix);
+        builder.append(domain_def.to_index());
+        return builder.into_string();
+    }
+
+    qid.DefId create_domain_generated_def(
+        self,
+        def.DefKind kind,
+        std.String name,
+        token.Span span
+    ) {
+        def.DefRecord domain_record =
+            self.lowerer.ctx.store.defs.get(self.model_def.def_id);
+        return self.lowerer.ctx.store.defs.create(
+            kind,
+            .value_name,
+            .private_visibility,
+            def.Name(
+                symbol: self.lowerer.ctx.store.symbols.intern(name.bytes()),
+                span: span
+            ),
+            domain_record.owner_def,
+            domain_record.module_id,
+            domain_record.decl_namespace_id,
+            null
+        );
+    }
+}
+
+@region(a)
+public struct DomainDescriptorInputs: Copyable {
+    public qid.DefId domain_def;
+    public qid.TypeId domain_type;
+    public qid.TypeId executor_type;
+    public Int domain_kind;
+    @life(a)
+    public jil.FunctionRef make_executor;
+    @life(a)
+    public jil.FunctionRef enqueue;
+}
+
+public extend body_context.BodyLowerer {
+    jil.FunctionRef add_domain_create_shim(
+        self,
+        DomainDescriptorInputs inputs,
+        token.Span span
+    ) {
+        qid.TypeId function_type = self.domain_create_function_type(span);
+        qid.DefId shim_def = self.create_domain_generated_def(
+            .function_def,
+            self.domain_generated_name("__domain_create_", inputs.domain_def),
+            span
+        );
+        qid.TypeId opaque = self.lowerer.ctx.store.types.opaque_pointer_type(span);
+        qid.TypeId domain_pointer = self.lowerer.ctx.store.types.raw_pointer_type(
+            inputs.domain_type, span
+        );
+        qid.TypeId domain_reference = self.lowerer.ctx.store.types.reference_type(
+            inputs.domain_type, span
+        );
+        qid.TypeId executor_pointer = self.lowerer.ctx.store.types.raw_pointer_type(
+            inputs.executor_type, span
+        );
+        list.ArrayList<jil.LocalDecl> locals! =
+            list.ArrayList<jil.LocalDecl>(6);
+        locals.add(self.domain_shim_local(0, .return_place, self.unit_type(), span));
+        locals.add(self.domain_shim_local(1, .param, opaque, span));
+        locals.add(self.domain_shim_local(2, .param, opaque, span));
+        locals.add(self.domain_shim_local(3, .compiler_temp, domain_pointer, span));
+        locals.add(self.domain_shim_local(4, .compiler_temp, domain_reference, span));
+        locals.add(self.domain_shim_local(5, .compiler_temp, executor_pointer, span));
+        list.ArrayList<jil.Statement> statements! =
+            list.ArrayList<jil.Statement>(3);
+        statements.add(self.domain_cast_statement(3, 1, domain_pointer, .ptr_to_ptr, span));
+        statements.add(self.domain_borrow_statement(4, self.domain_deref_place(3), span));
+        statements.add(self.domain_cast_statement(5, 2, executor_pointer, .ptr_to_ptr, span));
+        jil.Place destination = self.domain_deref_place(5);
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(1);
+        args.add(self.domain_copy_local(4));
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+        blocks.add(self.domain_call_block(
+            inputs.make_executor,
+            args$.ref(),
+            destination,
+            statements$.ref(),
+            0,
+            1,
+            span
+        ));
+        blocks.add(self.domain_return_block(1, span));
+        self.add_domain_shim_function(
+            shim_def, function_type, locals$.ref(), blocks$.ref(), span
+        );
+        return self.domain_shim_ref(shim_def, function_type, span);
+    }
+
+    jil.FunctionRef add_domain_enqueue_shim(
+        self,
+        DomainDescriptorInputs inputs,
+        token.Span span
+    ) {
+        qid.TypeId function_type = self.domain_enqueue_function_type(span);
+        qid.DefId shim_def = self.create_domain_generated_def(
+            .function_def,
+            self.domain_generated_name("__domain_enqueue_", inputs.domain_def),
+            span
+        );
+        guard self.lowerer.ctx.store.resolve.core_types.executor_job_type
+            is .some(job_type_def) else {
+            return self.domain_shim_ref(shim_def, function_type, span);
+        }
+        qid.TypeId job_type = self.lowerer.ctx.store.types.named_type(job_type_def, span);
+        qid.TypeId executor_pointer = self.lowerer.ctx.store.types.raw_pointer_type(
+            inputs.executor_type, span
+        );
+        qid.TypeId executor_reference = self.lowerer.ctx.store.types.reference_type(
+            inputs.executor_type, span
+        );
+        qid.TypeId callback_type = self.domain_job_callback_type(span);
+        qid.TypeId opaque = self.lowerer.ctx.store.types.opaque_pointer_type(span);
+        qid.TypeId int_type = self.lowerer.ctx.store.types.int_type();
+        list.ArrayList<jil.LocalDecl> locals! =
+            list.ArrayList<jil.LocalDecl>(8);
+        locals.add(self.domain_shim_local(0, .return_place, self.unit_type(), span));
+        locals.add(self.domain_shim_local(1, .param, opaque, span));
+        locals.add(self.domain_shim_local(2, .param, int_type, span));
+        locals.add(self.domain_shim_local(3, .param, int_type, span));
+        locals.add(self.domain_shim_local(4, .compiler_temp, executor_pointer, span));
+        locals.add(self.domain_shim_local(5, .compiler_temp, executor_reference, span));
+        locals.add(self.domain_shim_local(6, .compiler_temp, callback_type, span));
+        locals.add(self.domain_shim_local(7, .compiler_temp, job_type, span));
+        list.ArrayList<jil.Statement> statements! =
+            list.ArrayList<jil.Statement>(4);
+        statements.add(self.domain_cast_statement(4, 1, executor_pointer, .ptr_to_ptr, span));
+        statements.add(self.domain_borrow_statement(5, self.domain_deref_place(4), span));
+        statements.add(self.domain_cast_statement(6, 3, callback_type, .int_to_ptr, span));
+        statements.add(self.domain_job_statement(7, job_type_def, job_type, span));
+        list.ArrayList<jil.Operand> args! = list.ArrayList<jil.Operand>(2);
+        args.add(self.domain_copy_local(5));
+        args.add(jil.move_operand_value(jil.MoveOperand(
+            place: self.domain_local_place(7)
+        )));
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+        blocks.add(self.domain_call_block(
+            inputs.enqueue,
+            args$.ref(),
+            self.domain_local_place(0),
+            statements$.ref(),
+            0,
+            1,
+            span
+        ));
+        blocks.add(self.domain_return_block(1, span));
+        self.add_domain_shim_function(
+            shim_def, function_type, locals$.ref(), blocks$.ref(), span
+        );
+        return self.domain_shim_ref(shim_def, function_type, span);
+    }
+
+    jil.FunctionRef add_domain_destroy_shim(
+        self,
+        DomainDescriptorInputs inputs,
+        token.Span span
+    ) {
+        qid.TypeId function_type = self.domain_destroy_function_type(span);
+        qid.DefId shim_def = self.create_domain_generated_def(
+            .function_def,
+            self.domain_generated_name("__domain_destroy_", inputs.domain_def),
+            span
+        );
+        qid.TypeId opaque = self.lowerer.ctx.store.types.opaque_pointer_type(span);
+        qid.TypeId executor_pointer = self.lowerer.ctx.store.types.raw_pointer_type(
+            inputs.executor_type, span
+        );
+        list.ArrayList<jil.LocalDecl> locals! =
+            list.ArrayList<jil.LocalDecl>(3);
+        locals.add(self.domain_shim_local(0, .return_place, self.unit_type(), span));
+        locals.add(self.domain_shim_local(1, .param, opaque, span));
+        locals.add(self.domain_shim_local(2, .compiler_temp, executor_pointer, span));
+        list.ArrayList<jil.Statement> statements! =
+            list.ArrayList<jil.Statement>(1);
+        statements.add(self.domain_cast_statement(2, 1, executor_pointer, .ptr_to_ptr, span));
+        list.ArrayList<jil.Block> blocks! = list.ArrayList<jil.Block>(2);
+        blocks.add(jil.Block(
+            id: jil.BlockId.from_index(0),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements$.ref()),
+            terminator: jil.Terminator(
+                span: span,
+                kind: jil.drop_terminator_kind(jil.DropTerminator(
+                    place: self.domain_deref_place(2),
+                    target: jil.BlockId.from_index(1),
+                    cleanup: null
+                ))
+            )
+        ));
+        blocks.add(self.domain_return_block(1, span));
+        self.add_domain_shim_function(
+            shim_def, function_type, locals$.ref(), blocks$.ref(), span
+        );
+        return self.domain_shim_ref(shim_def, function_type, span);
+    }
+
+    qid.TypeId domain_create_function_type(self, token.Span span) {
+        qid.TypeId opaque = self.lowerer.ctx.store.types.opaque_pointer_type(span);
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(2);
+        params.add(opaque);
+        params.add(opaque);
+        return self.lowerer.ctx.store.types.function_type(params, self.unit_type(), span);
+    }
+
+    qid.TypeId domain_enqueue_function_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(3);
+        params.add(self.lowerer.ctx.store.types.opaque_pointer_type(span));
+        params.add(self.lowerer.ctx.store.types.int_type());
+        params.add(self.lowerer.ctx.store.types.int_type());
+        return self.lowerer.ctx.store.types.function_type(params, self.unit_type(), span);
+    }
+
+    qid.TypeId domain_destroy_function_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(self.lowerer.ctx.store.types.opaque_pointer_type(span));
+        return self.lowerer.ctx.store.types.function_type(params, self.unit_type(), span);
+    }
+
+    qid.TypeId domain_job_callback_type(self, token.Span span) {
+        list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
+        params.add(self.lowerer.ctx.store.types.int_type());
+        return self.lowerer.ctx.store.types.function_type(params, self.unit_type(), span);
+    }
+
+    qid.TypeId unit_type(self) {
+        return self.lowerer.ctx.store.types.unit_type();
+    }
+
+    jil.LocalDecl domain_shim_local(
+        self,
+        Int index,
+        jil.LocalKind kind,
+        qid.TypeId type_id,
+        token.Span span
+    ) {
+        return jil.LocalDecl(
+            id: jil.LocalId.from_index(index),
+            kind: kind,
+            type_id: type_id,
+            span: span,
+            name: null,
+            def_id: null,
+            mutable_local: true,
+            address_taken: false
+        );
+    }
+
+    jil.Statement domain_cast_statement(
+        self,
+        Int destination,
+        Int source,
+        qid.TypeId target_type,
+        jil.CastKind kind,
+        token.Span span
+    ) {
+        return self.domain_assign_statement(
+            self.domain_local_place(destination),
+            jil.cast_rvalue(jil.CastRvalue(
+                kind: kind,
+                value: self.domain_copy_local(source),
+                target_type: target_type
+            )),
+            span
+        );
+    }
+
+    @life(return: self & source)
+    jil.Statement domain_borrow_statement(
+        self,
+        Int destination,
+        jil.Place source,
+        token.Span span
+    ) {
+        return self.domain_assign_statement(
+            self.domain_local_place(destination),
+            jil.borrow_rvalue(jil.BorrowRvalue(place: source)),
+            span
+        );
+    }
+
+    jil.Statement domain_job_statement(
+        self,
+        Int destination,
+        qid.DefId job_type_def,
+        qid.TypeId job_type,
+        token.Span span
+    ) {
+        list.ArrayList<jil.Operand> fields! = list.ArrayList<jil.Operand>(3);
+        fields.add(self.domain_copy_local(2));
+        fields.add(self.domain_copy_local(6));
+        fields.add(jil.const_operand_value(jil.Const(
+            type_id: self.lowerer.ctx.store.types.bool_type(),
+            span: span,
+            value: jil.bool_const_kind(jil.BoolConst(value: true))
+        )));
+        return self.domain_assign_statement(
+            self.domain_local_place(destination),
+            jil.aggregate_rvalue(jil.AggregateRvalue(
+                kind: .struct_value,
+                def_id: job_type_def,
+                type_id: job_type,
+                tag: null,
+                payload_field_index: -1,
+                fields: self.lowerer.output.operand_array(fields$.ref())
+            )),
+            span
+        );
+    }
+
+    @life(return: destination & value)
+    jil.Statement domain_assign_statement(
+        self,
+        jil.Place destination,
+        jil.Rvalue value,
+        token.Span span
+    ) {
+        return jil.Statement(
+            span: span,
+            kind: jil.assign_statement_kind(jil.AssignStatement(
+                destination: destination,
+                value: value
+            ))
+        );
+    }
+
+    @life(return: self & function & args & destination & statements)
+    jil.Block domain_call_block(
+        self,
+        jil.FunctionRef function,
+        list.ArrayList<jil.Operand>& args,
+        jil.Place destination,
+        list.ArrayList<jil.Statement>& statements,
+        Int index,
+        Int target,
+        token.Span span
+    ) {
+        return jil.Block(
+            id: jil.BlockId.from_index(index),
+            span: span,
+            statements: self.lowerer.output.statement_array(statements),
+            terminator: jil.Terminator(
+                span: span,
+                kind: jil.call_terminator_kind(jil.CallTerminator(
+                    callee: jil.direct_function_callee(function),
+                    args: self.lowerer.output.operand_array(args),
+                    current_effects: types.EffectSet(),
+                    is_suspend_point: false,
+                    destination: destination,
+                    target: jil.BlockId.from_index(target),
+                    initialized_place: null,
+                    exclusive_places: self.lowerer.output.empty_places(),
+                    cleanup: null
+                ))
+            )
+        );
+    }
+
+    jil.Block domain_return_block(self, Int index, token.Span span) {
+        return jil.Block(
+            id: jil.BlockId.from_index(index),
+            span: span,
+            statements: self.lowerer.output.empty_statements(),
+            terminator: jil.Terminator(
+                span: span,
+                kind: jil.return_terminator_kind(jil.ReturnTerminator(
+                    implicit_unit: true
+                ))
+            )
+        );
+    }
+
+    () add_domain_shim_function(
+        self,
+        qid.DefId shim_def,
+        qid.TypeId function_type,
+        list.ArrayList<jil.LocalDecl>& locals,
+        list.ArrayList<jil.Block>& blocks,
+        token.Span span
+    ) {
+        Int function_index = self.lowerer.output.functions.len();
+        jil.FunctionId function_id = jil.FunctionId.from_index(function_index);
+        self.lowerer.output.add_generated_function(jil.Function(
+            id: function_id,
+            def_id: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            signature_id: null,
+            effects: types.EffectSet(),
+            is_coroutine: false,
+            coroutine_frame: null,
+            is_coroutine_resume: false,
+            is_coroutine_completion: false,
+            is_language_entry: false,
+            is_runtime_entry: false,
+            is_external: false,
+            inline_always: true,
+            naked: false,
+            span: span,
+            body: jil.Body(
+                id: jil.BodyId.from_index(function_index),
+                span: span,
+                locals: self.freeze_generated_locals(locals),
+                blocks: self.lowerer.output.block_array(blocks),
+                entry: jil.BlockId.from_index(0),
+                return_local: jil.LocalId.from_index(0)
+            )
+        ));
+        self.register_current_monomorph_owners(function_id);
+        self.lowerer.output.mark_borrow_check_exempt(function_id);
+    }
+
+    jil.FunctionRef domain_shim_ref(
+        self,
+        qid.DefId shim_def,
+        qid.TypeId function_type,
+        token.Span span
+    ) {
+        return jil.FunctionRef(
+            function_def: shim_def,
+            type_args: self.lowerer.output.empty_type_args(),
+            const_args: self.lowerer.output.empty_const_args(),
+            coroutine_resume: false,
+            coroutine_completion: false,
+            type_id: function_type,
+            span: span
+        );
+    }
+
+    jil.Place domain_local_place(self, Int index) {
+        return jil.local_place(
+            jil.LocalId.from_index(index),
+            self.lowerer.output.empty_projection()
+        );
+    }
+
+    jil.Place domain_deref_place(self, Int index) {
+        return self.project_deref(self.domain_local_place(index), true);
+    }
+
+    jil.Operand domain_copy_local(self, Int index) {
+        return jil.copy_operand_value(jil.CopyOperand(
+            place: self.domain_local_place(index)
+        ));
+    }
+}
