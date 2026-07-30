@@ -338,6 +338,10 @@ name        <- ident / "self"
   `Fn<...>` 或 `RawFn<...>` expected type 完整决定，lambda 表达式不重复书写 effect 前缀。
 - async `Fn` / `RawFn` 动态调用复用普通 async 调用的 Domain 切换；跨 Domain 的参数、result 和
   capture 必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
+- `Sendable` 不隐含 `Movable` 或 `Copyable`。直接 move/copy 仍分别要求原有值操作能力；
+  `T^` 只转移 owner handle，普通 `T&` / `T&!` 不因 `T: Sendable` 获得跨 Domain 能力。
+- tuple、定长 array、optional、errorable result、Task、owned domain-bound `Fn^` 和 nominal
+  aggregate 递归检查 Sendable payload；raw pointer 不自动满足 Sendable。
 - `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment；`RawFn<Ret, Args...>` 表示裸函数
   指针，不带 environment，可用于 C ABI 函数指针边界。
 - 函数声明只使用 `async` 表示 suspend function；函数前不保留 `sync` 修饰符。`async [domain]`

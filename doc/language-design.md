@@ -927,6 +927,35 @@ lambda 自身不增加 effect 前缀；async/unsafe/domain effect 必须由完�
 environment。动态调用可以在相同或不同 Domain 间切换；跨 Domain 的参数、result 和 capture
 必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
 
+`Sendable` 只描述“值能否安全进入另一个 Domain”，不改变值原有的 ownership、地址稳定性或
+lifetime：
+
+- 直接转移 `T` 仍要求 `T` 可移动，复制 `T` 仍要求 `T` 可复制；两种操作还必须满足
+  `T: Sendable`。`Sendable` 不隐含 `Movable` 或 `Copyable`，反向也不成立。
+- 转移 `T^` 只移动 owner handle，不移动 heap pointee。因此地址固定的
+  `T: Sendable + !Movable` 可以通过 `T^` 进入另一个 Domain，不能直接按值转移。
+- 普通 `T&` 和 `T&!` 是受当前 lifetime 限制的 borrow。即使 `T: Sendable`，borrow 也不会因此
+  获得跨 Domain 能力。
+- tuple、定长 array、optional、errorable result、Task 和用户声明的 aggregate 会逐层检查其
+  payload。任一组成部分不满足 `Sendable`，外层也不满足。
+- raw pointer 不携带 ownership 或 lifetime 证明，不会自动满足 `Sendable`。低层共享必须留在
+  显式 `unsafe` 边界内，或封装进具有明确同步契约的类型。
+
+`Atomic<T>` 在 `T` 是受支持的原子值时提供同步边界。`Mutex<T>` 在 `T: Sendable` 时可以作为
+跨 Domain 的同步对象，但 `Mutex<T>` 本体地址固定，应通过 `Mutex<T>^` 转移 owner handle：
+
+```jiang
+Mutex<Int>^ counter = new Mutex<Int>(0);
+Task(domain: global_domain) {
+    counter.with_lock { value =>
+        value$.set(value$.get() + 1);
+    };
+};
+```
+
+domain-bound owned closure `Fn<async [domain] (...)>^` 在构造时检查全部 capture。值 capture
+遵守相同的 move/copy 与 `Sendable` 规则，borrow capture 不能借闭包 owner 跨 Domain 逃逸。
+
 普通 async 调用是隐式挂起点，表达式类型仍是函数声明的返回类型。要提前启动并获得
 handle，使用 Task initializer：
 
