@@ -432,6 +432,13 @@ implicit copy / Movable 规则：
   默认 copy，也可以用 `$.move()` 强制转移并让源 place 失效。
 - 泛型代码只有在 `T: Copyable` 约束下才能依赖隐式复制；无该约束的按值使用按 move 处理。
 - 自定义 `copy()` / `clone()` 只是普通 API，不会让类型获得隐式 Copyable 语义。
+- owned nominal 的 stored field 可以独立 move，嵌套字段沿同一 place path 处理。move 后该字段
+  及其祖先 aggregate 不能作为完整值读取，但不重叠的兄弟字段仍可使用；重新初始化缺失字段后，
+  祖先 aggregate 恢复完整。
+- 部分移动沿 CFG 做保守合流：任一可达前驱移动过字段，合流后的父值都视为可能不完整。drop
+  只析构该路径上仍然初始化的字段；分支内是否发生 move 由对应字段的运行时 drop state 保留。
+- 普通 `T&`、`T&!`、raw pointer/index 派生 place 不能被部分移动。任一路径上的父 nominal
+  自身声明自定义 `deinit` 时也禁止部分移动，保证 `deinit` 始终观察完整 `self`。
 
 `T&!` 和 `T[]&!` 不属于 Copyable。binding、字段、返回值等普通按值传播会 move capability；
 将已有可变引用传给 `T&!` 或 `T&` 参数时建立只持续到调用点的 reborrow，因此调用返回后

@@ -660,6 +660,28 @@ Buffer^ b = a$.move();
 // move 后 a 失效，离开作用域时不会再析构 a
 ```
 
+拥有 aggregate value 时，也可以只移动其中一个 stored field。已移动字段和整个父值暂时失效，
+其他兄弟字段仍可使用；给该字段重新赋值后，父值会恢复为完整值。借用、裸指针派生 place 和
+带自定义 `deinit` 的父类型不允许这样拆开，因为调用方并不拥有其完整存储，或析构函数需要观察
+完整的 `self`。
+
+```jiang
+struct Pair: Movable {
+    Buffer^ left;
+    Buffer^ right;
+}
+
+Pair replace_left(Pair pair!) {
+    Buffer^ old = pair.left$.move();
+    use(pair.right);               // 兄弟字段仍然有效
+    pair.left = new Buffer();      // 重新初始化被移动字段
+    pair                          // 父值再次完整，可以整体返回
+}
+```
+
+嵌套 stored field 使用同一规则，例如 `value.header.buffer`。离开作用域时只析构仍然有效的字段，
+已经移出的字段由取得它的新 owner 负责。
+
 ### 切片（Slice）
 
 `T[]` 是长度在运行时确定的 unsized array type。它描述一段连续 `T` 元素序列，但裸 `T[]`
