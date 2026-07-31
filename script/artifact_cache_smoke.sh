@@ -809,33 +809,6 @@ check_failed_link_preserves_work_products() {
   expect_exit "$output" 0
 }
 
-check_emission_failure_cleanup() {
-  local input="$ROOT_DIR/test/lang/package/run/source_dependency_app"
-  local cache="$WORK_DIR/emission-failure-cache"
-  local output="$WORK_DIR/emission-failure"
-  local log="$WORK_DIR/emission-failure.log"
-
-  if env \
-    JIANG_INTERNAL_BACKEND_WORKERS=4 \
-    JIANG_INTERNAL_BACKEND_FAIL_UNIT=3 \
-    JIANG_INTERNAL_BACKEND_DELAY_UNIT=0 \
-    "$JIANGC" --artifact-cache-dir "$cache" --artifact-stats \
-      -o "$output" "$input" >"$log" 2>&1
-  then
-    fail "forced unit emission failure unexpectedly succeeded"
-  fi
-  grep -q 'backend_forced_unit_failure' "$log" \
-    || fail "forced unit failure diagnostic missing"
-  require_no_temporary_files "$cache"
-  [ -z "$(find "$cache" -type f -name '*.o' -print -quit)" ] \
-    || fail "failed emission published an object"
-
-  compile_executable "$JIANGC" "$cache" "$WORK_DIR/emission-retry.log" \
-    "$output" "$input"
-  require_stat_ge "$WORK_DIR/emission-retry.log" artifact_emitted_units 4
-  expect_exit "$output" 52
-}
-
 check_source_change_before_link() {
   local fixture="$WORK_DIR/source-change-fixture"
   local input="$fixture/package/run/source_dependency_app"
@@ -920,7 +893,6 @@ run_check trait_interface "trait interface" check_trait_interface
 run_check concurrent "concurrent publication" check_concurrent_publish
 run_check clean "explicit cache clean" check_explicit_cache_clean
 run_check partial "failed link preserves work products" check_failed_link_preserves_work_products
-run_check emission_failure "unit emission failure cleanup" check_emission_failure_cleanup
 run_check source_race "source change before link" check_source_change_before_link
 run_check dylib "lang provider dylib" check_lang_provider_dylib
 

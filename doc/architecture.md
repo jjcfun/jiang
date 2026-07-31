@@ -42,7 +42,6 @@ driver/cli -> pipeline.compile
 `main_domain`/`global_domain`；compiler lowering 生成 type-erased `DomainDescriptor`；
 runtime scheduler 维护 Domain identity、serial gate、Task/continuation 生命周期；
 `system.thread` 再把统一 Queue、Group、Mutex、main queue 和启动线程语义映射到平台 provider。
-compiler backend 的 debug 多 object 输出只使用 Core async/Task API，不反向依赖平台线程层。
 
 当前 root module 加载前会先加载 `src/core.jiang`。core 源码声明 compiler-known
 trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`

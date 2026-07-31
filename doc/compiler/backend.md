@@ -111,37 +111,14 @@ unit emission 只声明并 lower 当前 unit 拥有的 function body。跨 unit 
 按需声明为 LLVM external declaration，不扫描或声明完整 JIL Store，也不把 callee body 复制进
 当前 object。
 
-debug 中多个 stale unit 通过 Jiang `Task` 投递到 `global_domain`，backend 不直接依赖
-`system.thread`、pthread、libdispatch 或 runtime Mutex。主任务先串行冻结 symbol、layout、
-vtable field type、参数属性和 CGU plan；每个 worker 只拥有自己的 LLVM context/module、
-临时 object 路径和局部诊断。worker 数当前上限为 4，单个 stale unit 直接执行。
-开发基准可以用
-内部环境变量 `JIANG_INTERNAL_BACKEND_WORKERS=1..4` 比较 worker 数；它不是用户构建选项，
-也不进入语言语义。
-
-worker 只发布未提交的结果。主任务等待全部 worker 后，
-按 stable unit 顺序合并诊断并原子发布
-object；任一失败会取消尚未开始的 sibling，并等待已开始任务完成清理。最终 `LinkPlan`、
-`.jbuild` work product 和 `last_success` 仍只由主任务更新，因此并发完成顺序不会改变诊断、
-链接输入或缓存状态。
+debug 中的 stale unit 按 stable unit 顺序串行 emission。package-level symbol、layout、
+vtable field type、参数属性和 CGU plan 只准备一次，每个 unit 使用独立 LLVM context/module
+写入临时 object。全部 emission 成功后再按相同顺序原子发布 object、更新 `.jbuild`
+work product 并构造 `LinkPlan`；失败时清理尚未发布的临时文件。
 
 `.ji` 不保存 object 信息。debug work-product 记录只保存在当前 target 的 `.jbuild` 中。
 外层 `context-key` 隔离 compiler build、language version、target/ABI、LLVM/toolchain 和 backend
 profile；命中还必须验证 input fingerprint 和稳定路径上的 object metadata/hash。
-
-2026-07-30 在 arm64 macOS 26.5、Jiang 0.5.0/LLVM 22.1.8 上，以 37 个源码、42 个 debug unit
-的固定 fixture 记录开发基线：
-
-| 场景 | wall time | peak RSS | emitted/reused |
-| --- | ---: | ---: | ---: |
-| cold，1 worker | 1.05 s | 61.4 MiB | 42 / 0 |
-| cold，4 workers | 0.93 s | 64.8 MiB | 42 / 0 |
-| 3 unit stale，4 workers | 0.22 s | — | 3 / 39 |
-| 1 unit stale，直接路径 | 0.22 s | — | 1 / 41 |
-| all hit/no-op | 0.02 s | — | 0 / 0 |
-
-该小 fixture 只证明并发路径没有引入明显固定开销，并展示约 3.4 MiB 的峰值 RSS 增量；
-它不是跨机器性能承诺。更大的 package 仍应同时观察 frontend、link 和磁盘缓存成本。
 
 object 和 `.jbuild` 都先写同目录临时文件再原子替换。
 只有 object 已完成发布且最终链接成功后，
