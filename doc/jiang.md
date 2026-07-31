@@ -1063,6 +1063,20 @@ Task(domain: global_domain) {
 };
 ```
 
+封装底层地址的同步 handle 有时无法由字段类型自动证明安全。完成同步、所有权和释放顺序审计后，
+可以显式承担 `Sendable` 责任：
+
+```jiang
+struct SharedHandle {
+    Void* state;
+}
+
+unsafe extend SharedHandle: Sendable;
+```
+
+`unsafe extend` 只支持 `Sendable`。它不会让 raw pointer 本身变成 `Sendable`，也不会补充
+同步或 lifetime 保证；这些保证由 handle 的实现负责。
+
 domain-bound owned closure 也遵守同一规则。创建 `Fn<async [domain] (...)>^` 时，它的每个
 capture 都必须能以对应的 move/copy 方式安全进入目标 Domain；borrow capture 不能借 closure
 owner 延长 lifetime。

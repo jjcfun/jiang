@@ -948,6 +948,11 @@ lifetime：
 - raw pointer 不携带 ownership 或 lifetime 证明，不会自动满足 `Sendable`。低层共享必须留在
   显式 `unsafe` 边界内，或封装进具有明确同步契约的类型。
 
+`unsafe extend T: Sendable;` 表示实现者显式承担 `T` 的跨 Domain 安全责任。该形式只允许用于
+`Sendable`，并跳过 aggregate 字段的递归 Sendable 验证；普通 conformance 的结构验证保持不变。
+它适用于内部使用 raw pointer、但已自行保证同步、ownership、地址稳定性和释放顺序的 handle。
+该声明不会改变字段类型本身的 conformance，也不会让普通 borrow 获得跨 Domain lifetime。
+
 `Atomic<T>` 在 `T` 是受支持的原子值时提供同步边界。`Mutex<T>` 在 `T: Sendable` 时可以作为
 跨 Domain 的同步对象，但 `Mutex<T>` 本体地址固定，应通过 `Mutex<T>^` 转移 owner handle：
 

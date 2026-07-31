@@ -96,6 +96,7 @@ alias_attribute_binding
 decl_modifier
             <- "public"
              / "extern" keyword_options?
+             / "unsafe" &"extend"
 
 member_modifier
             <- "public"
@@ -201,7 +202,8 @@ binding_name
             <- name "!"?
 ```
 
-说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。
+说明：顶层 `public`、`extern` 由 `decl_modifier` 统一解析。`unsafe` 只在紧邻 `extend`
+时作为 conformance 修饰符。
 因此 `struct_decl`、`record_decl`、`enum_decl`、`union_decl`、`trait_decl`
 等规则本身不重复写 `"public"`。
 `const_global_decl` 同样经由 `top_level_decl` 接受 modifier，因此 `public const Type name = expr;`
@@ -480,12 +482,16 @@ trait_method_decl
 ## extend
 
 ```peg
-extend_decl <- "extend" generic_params? result_type (":" path)? "{" extend_member* "}"
+extend_decl <- "extend" generic_params? result_type (":" path)?
+               (";" / "{" extend_member* "}")
 
 extend_member
             <- assoc_type_impl
              / member_decl
 ```
+
+`unsafe extend Type: Sendable;` 显式承担该类型跨 Domain 传递的安全责任。`unsafe` extension
+只能用于 `Sendable` conformance；普通 extension 仍按字段逐层验证。
 
 泛型 extension 必须在 `extend` 后显式声明模式参数，例如 `extend <T> Foo<T> {}`。推荐保留
 `extend` 与 `<T>` 之间的空格，以兼容未来可读的 `extend [options] <T>` 形式；空格不是语法要求。
