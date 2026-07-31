@@ -5,10 +5,10 @@
 
 ## 常规开发
 
-当前 `main` 默认使用已安装的 Jiang 0.4.9 stable：
+当前 `main` 默认使用已安装的 Jiang 0.5.0 stable：
 
 ```text
-~/.jiang/versions/0.4.9/bin/jiangc
+~/.jiang/versions/0.5.0/bin/jiangc
 ```
 
 构建当前源码：
@@ -25,8 +25,8 @@ BOOTSTRAP_BIN=/path/to/compatible/jiangc \
 bash ./script/build_next.sh
 ```
 
-0.4.9 stable 不能指定 artifact cache，只使用仓库内的 `build/cache`。`build_next.sh`
-在 stable 编译前后清理该目录；current compiler 使用独立的
+bootstrap compiler 固定使用仓库内的 `build/cache`。`build_next.sh` 在 stable 编译前后
+清理该目录；current compiler 使用独立的
 `build/artifact-cache/next/<version>`，不会随 bootstrap cache 一起删除。需要自定义时可设置
 `NEXT_ARTIFACT_CACHE_DIR`，但它不能包含 `build/cache`，也不能位于 `build/cache` 内。
 
@@ -87,8 +87,8 @@ VERIFY=full \
 bash ./script/build_next.sh
 ```
 
-这些 tag 是历史自举输入。0.5.0 开发最初由 0.4.9 stable 建立 `bootstrap/0.5.0` next；
-Domain/Executor ABI 跨越再由该 next 构建 `bootstrap/0.5.0-2`。当前 release 构建链固定为：
+这些 tag 是历史自举输入。0.5.0 最初由 0.4.9 stable 建立 `bootstrap/0.5.0` next；
+Domain/Executor ABI 跨越再由该 next 构建 `bootstrap/0.5.0-2`。发布链固定为：
 
 ```text
 Jiang 0.4.9 stable
@@ -98,10 +98,9 @@ Jiang 0.4.9 stable
   -> release/0.5.0 stable
 ```
 
-当前 release 开发应显式使用
-`/Users/jjc/project/jiang/bootstrap-0.5.0-2/build/bin/jiangc.next`，不能退回 0.4.9
-直接编译已经采用新 Domain ABI 的 compiler source。`try ... catch` 新语法只出现在 release
-测试和用户源码中，compiler source 本身没有依赖该语法，因此无需为它增加第三层 transition。
+复现 0.5.0 release 时应使用 `0.5.0-bootstrap2` tag 生成的 `jiangc.next`，不能退回 0.4.9
+直接编译已经采用新 Domain ABI 的 compiler source。发布后的常规 `main` 开发直接使用
+0.5.0 stable；`try ... catch` 新语法没有进入 compiler source，因此历史链无需第三层 transition。
 
 ## 分支和 tag 规则
 

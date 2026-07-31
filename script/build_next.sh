@@ -12,7 +12,7 @@ PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "
 JIANG_VERSION="$PACKAGE_VERSION"
 BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
 NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/artifact-cache/next/$JIANG_VERSION}"
-BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.4.9}"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.0}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
@@ -122,8 +122,8 @@ write_compiler_build_id() {
 }
 
 clear_bootstrap_artifact_cache() {
-  # 0.4.9 不支持显式 artifact cache 路径，只能使用默认 build/cache。
-  # stable 编译前后只清理它自己的目录；current cache 位于不相交的 root。
+  # bootstrap 构建固定使用默认 build/cache；stable 前后只清理它自己的目录。
+  # current compiler cache 位于不相交的 root，不能被 bootstrap 清理影响。
   rm -rf "$BOOTSTRAP_ARTIFACT_CACHE_DIR"
 }
 

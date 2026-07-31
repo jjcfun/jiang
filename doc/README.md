@@ -24,17 +24,18 @@
 - [compiler/](compiler/)：各阶段的详细设计，包括 AST、resolve、Semantic Model、type check、JIL、
   borrow check、backend、incremental 和测试覆盖。
 
-## 当前分支
+## 0.5.0 自举链
 
-当前 0.5.0 release 开发使用显式 transition chain：
+0.5.0 release 使用以下可复现 transition chain：
 
 ```text
 0.4.9 stable
   -> bootstrap/0.5.0 next
   -> bootstrap/0.5.0-2 next
   -> release/0.5.0 next
+  -> release/0.5.0 stable
 ```
 
-release 源码已经采用新的 Domain/Executor ABI，不能再由 0.4.9 stable 直接编译。
-0.4.9 自身的历史复现链和当前 transition 的详细命令见 [编译器开发流程](develop.md)。
+0.5.0 release 源码采用新的 Domain/Executor ABI，不能由 0.4.9 stable 直接编译。
+历史复现链和详细命令见 [编译器开发流程](develop.md)；发布后的常规开发使用 0.5.0 stable。
 面向用户的语言文档应描述当前分支的可用语法；历史版本说明只在解释兼容边界时保留。
