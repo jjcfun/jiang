@@ -4,6 +4,13 @@
 
 extern bool __jiang_system_thread_pump_main_queue_once(void);
 
+static pthread_t process_main_thread;
+
+__attribute__((constructor))
+static void capture_process_main_thread(void) {
+    process_main_thread = pthread_self();
+}
+
 static void *run_non_main_pump(void *context) {
     int64_t *result = context;
     *result = __jiang_system_thread_pump_main_queue_once() ? 1 : 0;
@@ -23,5 +30,5 @@ int64_t run_non_main_pump_probe(void) {
 }
 
 int64_t on_process_main_thread(void) {
-    return pthread_main_np() != 0;
+    return pthread_equal(pthread_self(), process_main_thread) != 0;
 }

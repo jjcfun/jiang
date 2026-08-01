@@ -64,6 +64,58 @@ previous stable
 release 分支最终 rebase 到最后一个 bootstrap checkpoint，使源码历史和可复现自举顺序一致。
 各阶段必须使用独立 build 目录，不混用编译产物。
 
+## Linux 首次 hosted port seed
+
+0.5.0 正式产物只有 macOS arm64 compiler。0.5.1 首次建立 Linux x86_64 hosted 自举时，
+不创建 bootstrap 分支：语言语法和 compiler source 仍由 Jiang 0.5.0 stable 直接编译，
+平台 seed 只桥接“尚无 Linux 可执行 stable compiler”这一 host 缺口。
+
+在已有 Jiang 0.5.0 stable 的 host 上生成 Linux compiler ELF object：
+
+```bash
+bash ./script/linux_port_seed.sh emit-object
+```
+
+把 `build/linux-port-seed/jiangc-x86_64-linux-gnu.o` 与同一 source revision 传到
+Linux x86_64。Linux host 必须先通过 `script/install_llvm.sh` 准备 Jiang 固定的 LLVM 22.1.8
+fork，然后链接 port seed：
+
+```bash
+bash ./script/linux_port_seed.sh link
+```
+
+link 阶段会先编译运行 Linux hosted ABI probe，锁定当前 provider 使用的 `stat`、`dirent`、
+pthread storage、`-pthread` 和 `-ldl` 边界。probe 通过后，脚本输出 object/compiler 的 SHA-256。
+Linux port seed 只用于接续正常的 stable bootstrap：
+
+```bash
+BOOTSTRAP_BIN=build/bin/jiangc.linux-port-seed \
+BOOTSTRAP_RELEASE_VERSION=0.5.0 \
+VERIFY=none \
+bash ./script/build_next.sh
+```
+
+port seed 不能替代 release compiler，也不能绕过 `next -> stable` 和 release 验证。
+macOS -> Linux hosted executable 仍不属于普通 cross compilation 承诺；跨 host 阶段只生成
+可在 Linux 使用 native LLVM/toolchain 链接的 ELF object。
+
+两跳自举完成后，先运行 Linux hosted process 聚焦门禁：
+
+```bash
+JIANGC=build/bin/jiangc bash ./script/linux_hosted_process_smoke.sh
+```
+
+该门禁覆盖 inherit/PATH、stdout pipe、128 KiB pipe drain、stderr discard 和 signal 退出码，
+并由外层 shell 确认 discard 样例没有向父进程 stderr 泄漏内容。
+
+main queue 与 pthread/futex 运行时聚焦门禁：
+
+```bash
+JIANGC=build/bin/jiangc bash ./script/linux_hosted_runtime_smoke.sh
+```
+
+该门禁覆盖 main-domain round-trip/shutdown/stress、serial/concurrent domain 和跨线程等待。
+
 ## Jiang 0.4.9 的可复现自举链
 
 0.4.9 的 lifetime 语法和编译器源码升级需要两个过渡编译器。发布后固定的链路为：

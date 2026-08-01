@@ -1,9 +1,9 @@
 # Targets
 
-当前 release host 仍只承诺 macOS arm64 hosted `jiangc`。Linux 用户级支持应优先走
-Jiang no-libc 静态可执行路线；`linux-gnu` hosted 暂时只作为 backend target 验证和
-外部 toolchain 模式保留，不作为 Jiang 官方 All in one Linux 承诺。其他 target 先固定
-target model、LLVM/object 输出和 executable 诊断边界。
+0.5.1 正在把 Linux x86_64 hosted/libc 提升为正式 release host。Linux native compiler
+使用系统 libc 和本机 LLVM/linker toolchain 完成自举与 executable 链接；macOS -> Linux
+hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属于 0.5.1 验收范围。
+其他 target 先固定 target model、LLVM/object 输出和 executable 诊断边界。
 
 ## Supported Matrix
 
@@ -11,7 +11,7 @@ target model、LLVM/object 输出和 executable 诊断边界。
 | --- | --- | --- | --- |
 | default host macOS arm64 | supported | supported | supported |
 | `arm64-apple-macosx` / `aarch64-apple-darwin` | supported | supported | supported on macOS host |
-| `x86_64-unknown-linux-gnu` | experimental | experimental | `target_executable_requires_toolchain` |
+| `x86_64-unknown-linux-gnu` | supported | supported | 0.5.1 native hosted bring-up |
 | `aarch64-unknown-linux-gnu` | experimental | experimental | `target_executable_requires_toolchain` |
 | Linux no-libc x86_64 | supported through `--no-link-libc` | supported | planned static executable |
 | `wasm32-unknown-unknown` | supported | supported | `target_executable_runtime_unsupported` |
@@ -19,14 +19,13 @@ target model、LLVM/object 输出和 executable 诊断边界。
 | `x86_64-pc-windows-msvc` | supported | supported | `target_executable_runtime_unsupported` |
 | `aarch64-pc-windows-msvc` | supported | supported | `target_executable_runtime_unsupported` |
 
-Linux glibc executable 需要 glibc sysroot / toolchain，Jiang 不维护 glibc。macOS host 上编译
-`linux-gnu` hosted executable 必须早停诊断，不能误用 host `cc` 链接 Linux object。
-Linux / WSL host 自举需要 Linux 可执行 bootstrap compiler，当前 release 尚不承诺该链路。
+Linux glibc executable 使用 native host 的 libc 与 toolchain，Jiang 不维护 glibc sysroot。
+macOS host 上编译 `linux-gnu` hosted executable 必须早停诊断，不能误用 host `cc` 链接
+Linux object。首次 Linux hosted port seed 流程见 [编译器开发流程](../develop.md)。
 
-Jiang 官方 Linux All in one 路线优先支持 no-libc 静态 executable。`src/system/os/provider.jiang`
-是系统能力抽象入口，`src/system/os/linux/no_libc.jiang` 是移除 libc 依赖的 Linux provider。
-入口、syscall、内存、panic/trap 和必要 runtime object 由 Jiang 维护并随 release 包集成；
-默认情况下用户和 Jiang 开发者都不需要配置 libc/sysroot。
+`src/system/os/provider.jiang` 是系统能力抽象入口。0.5.1 使用
+`src/system/os/linux.jiang` hosted provider；`src/system/os/linux/no_libc.jiang` 是独立的
+实验路线，不参与本版本 hosted 验收。
 
 裸 Wasm `wasm32-unknown-unknown` 当前只承诺 LLVM/object 输出。WASI 使用 `wasm32-wasi`
 作为 Jiang CLI 入口，内部 LLVM triple 使用 LLVM 22 推荐的 `wasm32-wasip1`。WASI
@@ -42,8 +41,21 @@ target-specific linker argv 由 `backend/linker.jiang` 统一生成：
 
 - `-target <triple>` 来自 `TargetInfo.llvm_triple`。
 - macOS SDK root 来自 `TargetInfo.sysroot_strategy`，优先读 `SDKROOT`，否则通过 `xcrun` 查询。
+- Linux hosted 在 object 和用户 link args 之后显式追加 `-pthread`、`-ldl`，不依赖 glibc
+  合并历史库后的隐式兼容行为。
 - pipeline 只决定是否允许 executable 输出、生成 object、组装 `LinkPlan`，不拼 target-specific
   linker 参数。
+
+Linux hosted 文件读写必须处理 partial result，并在 `EINTR` 后重试。provider 创建的临时 C string
+由 provider 在 libc 调用返回后释放；`remove_tree` 必须先尝试 `unlink`，避免遗漏 dangling symlink。
+
+Linux hosted process 首版支持 stdout/stderr inherit、stdout pipe 和 stderr discard。glibc
+`posix_spawn_file_actions_t` 使用经 ABI probe 验证的 opaque storage；stderr pipe 需要双 pipe
+并发 drain，不在 0.5.1 首批 process capability 范围内。
+
+Linux hosted runtime 在启动时记录 main pthread，main-domain job 进入可由启动线程主动 pump
+的 FIFO queue。启动线程等待 runtime group 或 task word 时必须同时 pump，避免 main-domain
+continuation 与 blocking wait 相互等待。
 
 `TargetInfo.executable_support()` 是 executable 诊断的唯一依据。新增 target 时应先补齐这个状态，再补
 pipeline smoke 中的 diagnostic code。

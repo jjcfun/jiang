@@ -7,6 +7,13 @@ import build;
 import c_string = "../../support/c_string.jiang";
 import list = "../../support/list.jiang";
 
+// glibc x86_64 的 posix_spawn_file_actions_t 当前为 80 bytes / 8-byte aligned。
+// macOS 只使用其中第一个 pointer slot；统一 storage 避免在共享流程中泄漏平台形状。
+const Int spawn_file_actions_word_count = 10;
+const Int32 fcntl_set_fd = 2;
+const Int32 fd_close_on_exec = 1;
+const Int errno_interrupted = 4;
+
 comptime {
     if (build.target.os == .macos) {
         import c = "./macos/libc.jiang";
@@ -60,19 +67,13 @@ public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& arg
 
 @life()
 public SpawnResult spawn_wait(UInt8[]& executable, list.ArrayList<UInt8[]&>& args, SpawnOptions& options) {
-    if (!options.capture_stdout && !options.capture_stderr && !options.discard_stderr) {
-        return spawn_wait_inherit(executable, args);
-    }
     if (options.capture_stderr) {
         return SpawnResult(false, -1);
     }
-    if (options.capture_stdout) {
-        if (!target_supports_spawn_file_actions()) {
-            return SpawnResult(false, -1);
-        }
-        return spawn_wait_stdout_pipe(executable, args, options.discard_stderr);
+    if (options.capture_stdout || options.discard_stderr) {
+        return spawn_wait_redirected(executable, args, options.capture_stdout, options.discard_stderr);
     }
-    return SpawnResult(false, -1);
+    return spawn_wait_inherit(executable, args);
 }
 
 @life()
@@ -85,8 +86,8 @@ SpawnResult spawn_wait_inherit(UInt8[]& executable, list.ArrayList<UInt8[]&>& ar
         Int32 spawn_result = c.posix_spawnp(
             pid$.as(Int32*),
             argv[0],
-            0,
-            0,
+            null,
+            null,
             argv,
             envp
         );
@@ -98,7 +99,7 @@ SpawnResult spawn_wait_inherit(UInt8[]& executable, list.ArrayList<UInt8[]&>& ar
         }
 
         Int32*! status = Int32$.alloc(1);
-        if (c.waitpid(pid[0], status$.as(Int32*), 0) < 0) {
+        if (wait_for_pid(pid[0], status$.as(Int32*)) < 0) {
             free_argv(argv, argv_count);
             pid$.dealloc();
             status$.dealloc();
@@ -113,17 +114,18 @@ SpawnResult spawn_wait_inherit(UInt8[]& executable, list.ArrayList<UInt8[]&>& ar
 }
 
 @life()
-SpawnResult spawn_wait_stdout_pipe(
+SpawnResult spawn_wait_redirected(
     UInt8[]& executable,
     list.ArrayList<UInt8[]&>& args,
+    Bool capture_stdout,
     Bool discard_stderr
 ) {
     unsafe {
         UInt8**! argv = argv_array(executable, args);
         UInt8**! envp = inherited_environment();
         Int argv_count = args.len() + 1;
-        PipeCapture stdout_capture! = PipeCapture();
-        if (!stdout_capture.open(discard_stderr)) {
+        SpawnFileActions actions! = SpawnFileActions();
+        if (!actions.open(capture_stdout, discard_stderr)) {
             free_argv(argv, argv_count);
             return SpawnResult(false, -1);
         }
@@ -131,30 +133,30 @@ SpawnResult spawn_wait_stdout_pipe(
         Int32 spawn_result = c.posix_spawnp(
             pid$.as(Int32*),
             argv[0],
-            stdout_capture.file_actions()$.as(Int),
-            0,
+            actions.file_actions(),
+            null,
             argv,
             envp
         );
 
         if (spawn_result != 0) {
-            stdout_capture.close_parent();
+            actions.close_parent();
             free_argv(argv, argv_count);
             pid$.dealloc();
             return SpawnResult(false, Int(spawn_result));
         }
-        stdout_capture.close_child_end();
-        UInt8[]& stdout = stdout_capture.read_all();
+        actions.close_child_end();
+        UInt8[]& stdout = actions.read_all();
         Int32*! status = Int32$.alloc(1);
-        if (c.waitpid(pid[0], status$.as(Int32*), 0) < 0) {
-            stdout_capture.close_parent();
+        if (wait_for_pid(pid[0], status$.as(Int32*)) < 0) {
+            actions.close_parent();
             free_argv(argv, argv_count);
             pid$.dealloc();
             status$.dealloc();
             return SpawnResult(false, -1);
         }
         Int exit_code = exit_code_from_status(status[0]);
-        stdout_capture.close_parent();
+        actions.close_parent();
         free_argv(argv, argv_count);
         pid$.dealloc();
         status$.dealloc();
@@ -162,11 +164,11 @@ SpawnResult spawn_wait_stdout_pipe(
     }
 }
 
-struct PipeCapture: Movable {
+struct SpawnFileActions: Movable {
     Int32 read_fd!;
     Int32 write_fd!;
     Int32 discard_fd!;
-    UInt8**! actions!;
+    UInt64*! actions!;
 
     init(self) {
         self.read_fd = Int32(-1);
@@ -175,7 +177,29 @@ struct PipeCapture: Movable {
         self.actions = null;
     }
 
-    Bool open(self, Bool discard_stderr) {
+    Bool open(self, Bool capture_stdout, Bool discard_stderr) {
+        unsafe {
+            if (capture_stdout && !self.open_stdout_pipe()) { return false; }
+            UInt64*! raw! = UInt64$.alloc(spawn_file_actions_word_count);
+            if (c.posix_spawn_file_actions_init(raw$.as(UInt64*)) != 0) {
+                raw$.dealloc();
+                self.close_parent();
+                return false;
+            }
+            self.actions = raw;
+            if (capture_stdout && !self.add_stdout_pipe()) {
+                self.close_parent();
+                return false;
+            }
+            if (discard_stderr && !self.add_stderr_discard()) {
+                self.close_parent();
+                return false;
+            }
+            return true;
+        }
+    }
+
+    Bool open_stdout_pipe(self) {
         unsafe {
             Int32*! fds = Int32$.alloc(2);
             if (c.pipe(fds$.as(Int32*)) != 0) {
@@ -185,34 +209,27 @@ struct PipeCapture: Movable {
             self.read_fd = fds[0];
             self.write_fd = fds[1];
             fds$.dealloc();
-
-            UInt8**! raw! = UInt8*$.alloc(1);
-            raw[0] = null;
-            if (c.posix_spawn_file_actions_init(raw) != 0) {
-                raw$.dealloc();
+            if (!set_close_on_exec(self.read_fd) || !set_close_on_exec(self.write_fd)) {
                 self.close_parent();
                 return false;
             }
-
-            if (c.posix_spawn_file_actions_adddup2(raw, self.write_fd, Int32(1)) != 0) {
-                c.posix_spawn_file_actions_destroy(raw);
-                raw$.dealloc();
-                self.close_parent();
-                return false;
-            }
-            c.posix_spawn_file_actions_addclose(raw, self.read_fd);
-            if (discard_stderr && !self.add_stderr_discard(raw)) {
-                c.posix_spawn_file_actions_destroy(raw);
-                raw$.dealloc();
-                self.close_parent();
-                return false;
-            }
-            self.actions = raw;
             return true;
         }
     }
 
-    Bool add_stderr_discard(self, UInt8**! raw) {
+    Bool add_stdout_pipe(self) {
+        unsafe {
+            if (c.posix_spawn_file_actions_adddup2(self.actions, self.write_fd, Int32(1)) != 0) {
+                return false;
+            }
+            if (c.posix_spawn_file_actions_addclose(self.actions, self.read_fd) != 0) {
+                return false;
+            }
+            return c.posix_spawn_file_actions_addclose(self.actions, self.write_fd) == 0;
+        }
+    }
+
+    Bool add_stderr_discard(self) {
         unsafe {
             UInt8*! dev_null = c_string.from_slice("/dev/null");
             Int32 fd = c.open(dev_null$.as(UInt8*), 1);
@@ -221,16 +238,16 @@ struct PipeCapture: Movable {
                 return false;
             }
             self.discard_fd = fd;
-            if (c.posix_spawn_file_actions_adddup2(raw, self.discard_fd, Int32(2)) != 0) {
+            if (!set_close_on_exec(self.discard_fd)) { return false; }
+            if (c.posix_spawn_file_actions_adddup2(self.actions, self.discard_fd, Int32(2)) != 0) {
                 return false;
             }
-            c.posix_spawn_file_actions_addclose(raw, self.discard_fd);
-            return true;
+            return c.posix_spawn_file_actions_addclose(self.actions, self.discard_fd) == 0;
         }
     }
 
-    UInt8**! file_actions(self) {
-        return self.actions;
+    UInt64* file_actions(self) {
+        return unsafe { self.actions$.as(UInt64*) };
     }
 
     () close_child_end(self) {
@@ -282,7 +299,7 @@ struct PipeCapture: Movable {
                     buffer$.dealloc();
                     buffer = next;
                 }
-                Int count = c.read(self.read_fd, buffer[length..(length + 1024)]$.ptr(), 1024);
+                Int count = read_retry(self.read_fd, buffer[length..(length + 1024)]$.ptr(), 1024);
                 if (count <= 0) {
                     buffer[length] = 0;
                     return buffer[0..length];
@@ -337,7 +354,29 @@ UInt8**! inherited_environment() {
 }
 
 Int exit_code_from_status(Int32 status) {
+    Int signal = Int(status & 127);
+    if (signal != 0) { return 128 + signal; }
     return Int((status >> 8) & 255);
+}
+
+Int32 wait_for_pid(Int32 pid, Int32* status) {
+    while (true) {
+        Int32 result = unsafe { c.waitpid(pid, status, 0) };
+        if (result >= 0 || last_errno() != errno_interrupted) { return result; }
+    }
+    return Int32(-1);
+}
+
+Int read_retry(Int32 fd, UInt8* buffer, Int length) {
+    while (true) {
+        Int result = unsafe { c.read(fd, buffer, length) };
+        if (result >= 0 || last_errno() != errno_interrupted) { return result; }
+    }
+    return -1;
+}
+
+Bool set_close_on_exec(Int32 fd) {
+    return unsafe { c.fcntl(fd, fcntl_set_fd, fd_close_on_exec) == 0 };
 }
 
 () copy_bytes(UInt8*! dest, UInt8*! source, Int length) {
@@ -352,15 +391,12 @@ Int exit_code_from_status(Int32 status) {
 
 comptime {
     if (build.target.os == .macos) {
-        Bool target_supports_spawn_file_actions() {
-            return true;
+        Int last_errno() {
+            return unsafe { Int(c.__error()$.get()) };
         }
     } else {
-        Bool target_supports_spawn_file_actions() {
-            // glibc 的 posix_spawn_file_actions_t 是平台相关结构体，不是 macOS
-            // 的指针形状。这里先只启用已验证的 macOS ABI，避免 Linux hosted
-            // 捕获 stdout 时写坏调用栈或传错结构体布局。
-            return false;
+        Int last_errno() {
+            return unsafe { Int(c.__errno_location()$.get()) };
         }
     }
 }

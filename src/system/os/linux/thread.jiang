@@ -8,8 +8,8 @@ import build;
 
 const Int futex_wait_private = 128;
 const Int futex_wake_private = 129;
-const Int errno_interrupted = -4;
-const Int errno_try_again = -11;
+const Int errno_interrupted = 4;
+const Int errno_try_again = 11;
 
 const Int pthread_storage_size = 64;
 const Int queue_word_count = 8;
@@ -73,6 +73,8 @@ public struct AtomicStackArray: Copyable {
 UInt8* atomic_mutex! = null;
 UInt8* queue_identity_key_storage! = null;
 Bool queue_identity_ready! = false;
+UInt startup_thread! = UInt(0);
+UInt8* main_queue_storage! = null;
 
 public Bool supported() {
     if (atomic_mutex == null) {
@@ -89,11 +91,22 @@ public Bool supported() {
     return atomic_mutex != null && queue_identity_ready;
 }
 
-public Bool initialize_main_thread() { return true; }
-public Bool is_main_thread() { return false; }
+public Bool initialize_main_thread() {
+    if (main_queue_storage != null) { return is_main_thread(); }
+    startup_thread = unsafe { c.pthread_self() };
+    main_queue_storage = create_queue(queue_serial);
+    if (main_queue_storage != null) { return true; }
+    startup_thread = UInt(0);
+    return false;
+}
+
+public Bool is_main_thread() {
+    if (startup_thread == UInt(0)) { return false; }
+    return unsafe { c.pthread_equal(c.pthread_self(), startup_thread) != Int32(0) };
+}
 
 public UInt8* allocate_storage(Int size) {
-    return unsafe { c.malloc(size) };
+    return unsafe { UInt8$.alloc(size) };
 }
 
 public UInt8* reallocate_storage(UInt8* pointer, Int size) {
@@ -101,7 +114,7 @@ public UInt8* reallocate_storage(UInt8* pointer, Int size) {
 }
 
 public () deallocate_storage(UInt8* pointer) {
-    unsafe { c.free(pointer); }
+    if (pointer != null) { unsafe { pointer$.dealloc(); } }
 }
 
 public Mutex create_mutex() {
@@ -188,12 +201,13 @@ public Queue serial_queue() {
 }
 
 public Queue main_queue() {
-    return Queue(null);
+    return Queue(unsafe { main_queue_storage$.as(Void*) });
 }
 
 public () destroy_queue(Queue queue, Bool concurrent) {
     if (queue.handle == null) { return; }
     UInt8* storage = queue_storage(queue);
+    if (storage == main_queue_storage) { return; }
     if (!concurrent) { stop_serial_worker(storage); }
     destroy_queue_storage(storage);
 }
@@ -207,6 +221,12 @@ public () set_queue_identity(Queue queue, Void* identity) {
 }
 
 public Bool has_queue_identity(Void* identity) {
+    if (main_queue_storage != null && is_main_thread()) {
+        Void* main_identity = unsafe {
+            load_word(main_queue_storage, queue_identity_word)$.as(Void*)
+        };
+        if (identity == main_identity) { return true; }
+    }
     return unsafe { c.pthread_getspecific(queue_identity_key()) == identity };
 }
 
@@ -280,6 +300,10 @@ public () leave_group(Group group) {
 
 public () wait_group(Group group) {
     if (group.handle == null) { return; }
+    if (is_main_thread()) {
+        wait_group_pumping_main(group_storage(group));
+        return;
+    }
     UInt8* storage = group_storage(group);
     UInt8* mutex = word_pointer(storage, group_mutex_word);
     UInt8* condition = word_pointer(storage, group_condition_word);
@@ -290,13 +314,26 @@ public () wait_group(Group group) {
     unsafe { c.pthread_mutex_unlock(mutex); }
 }
 
-public Bool pump_main_queue_once() { return false; }
+public Bool pump_main_queue_once() {
+    if (!is_main_thread() || main_queue_storage == null) { return false; }
+    UInt8* job = take_serial_job(main_queue_storage);
+    if (job == null) { return false; }
+    run_job(job);
+    return true;
+}
 
 public () wait_word(Int*! pointer, Int expected) {
+    if (is_main_thread()) {
+        wait_word_pumping_main(pointer, expected);
+        return;
+    }
     while (true) {
         Int result = futex(pointer, futex_wait_private, expected);
-        if (result == errno_try_again) { return; }
-        if (result != 0 && result != errno_interrupted) { return; }
+        if (result == 0) { continue; }
+        if (result != -1) { return; }
+        Int error = unsafe { Int(c.__errno_location()$.get()) };
+        if (error == errno_try_again) { return; }
+        if (error != errno_interrupted) { return; }
     }
 }
 
@@ -324,6 +361,9 @@ Int futex_syscall_number() {
 }
 
 public () shutdown() {
+    destroy_queue_storage(main_queue_storage);
+    main_queue_storage = null;
+    startup_thread = UInt(0);
     destroy_pthread_mutex(atomic_mutex);
     atomic_mutex = null;
     if (queue_identity_ready) {
@@ -405,7 +445,10 @@ Bool start_detached(UInt8* context, RawFn<Void*, Void*> entry) {
         )
     };
     if (created != 0) { return false; }
-    return unsafe { c.pthread_detach(thread) } == 0;
+    if (unsafe { c.pthread_detach(thread) } != 0) {
+        unsafe { c.pthread_join(thread, null); }
+    }
+    return true;
 }
 
 @life()
@@ -434,15 +477,29 @@ UInt8* wait_serial_job(UInt8* queue) {
     ) {
         unsafe { c.pthread_cond_wait(condition, mutex); }
     }
-    UInt8* job = unsafe { load_word(queue, queue_head_word)$.as(UInt8*) };
+    UInt8* job = take_queue_head(queue);
     if (job == null) {
         unsafe { c.pthread_mutex_unlock(mutex); }
         return null;
     }
+    unsafe { c.pthread_mutex_unlock(mutex); }
+    return job;
+}
+
+UInt8* take_serial_job(UInt8* queue) {
+    UInt8* mutex = word_pointer(queue, queue_mutex_word);
+    unsafe { c.pthread_mutex_lock(mutex); }
+    UInt8* job = take_queue_head(queue);
+    unsafe { c.pthread_mutex_unlock(mutex); }
+    return job;
+}
+
+UInt8* take_queue_head(UInt8* queue) {
+    UInt8* job = unsafe { load_word(queue, queue_head_word)$.as(UInt8*) };
+    if (job == null) { return null; }
     Int next = load_word(job, job_next_word);
     store_word(queue, queue_head_word, next);
     if (next == 0) { store_word(queue, queue_tail_word, 0); }
-    unsafe { c.pthread_mutex_unlock(mutex); }
     return job;
 }
 
@@ -515,6 +572,26 @@ UInt8* create_job(Group group, Queue queue, Void* context, Void* callback) {
     store_word(group, group_pending_word, pending);
     if (pending == 0) { unsafe { c.pthread_cond_broadcast(condition); } }
     unsafe { c.pthread_mutex_unlock(mutex); }
+}
+
+() wait_group_pumping_main(UInt8* group) {
+    while (group_has_pending(group)) {
+        if (!pump_main_queue_once()) { unsafe { c.sched_yield(); } }
+    }
+}
+
+() wait_word_pumping_main(Int*! pointer, Int expected) {
+    while (unsafe { pointer$.get() } == expected) {
+        if (!pump_main_queue_once()) { unsafe { c.sched_yield(); } }
+    }
+}
+
+Bool group_has_pending(UInt8* group) {
+    UInt8* mutex = word_pointer(group, group_mutex_word);
+    unsafe { c.pthread_mutex_lock(mutex); }
+    Bool pending = load_word(group, group_pending_word) > 0;
+    unsafe { c.pthread_mutex_unlock(mutex); }
+    return pending;
 }
 
 () lock_atomic() {

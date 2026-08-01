@@ -131,7 +131,6 @@ emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
   "$BOOTSTRAP_BIN" \
-    --target "$JIANG_HOST_TARGET" \
     --linker "$CLANG_BIN" \
     "${LLVM_LINK_ARGS[@]}" \
     -o "$output_bin" \
@@ -148,7 +147,6 @@ emit_compiler_with_compiler() {
   printf '== build next: compile executable with %s ==\n' "$source_bin"
   "$source_bin" \
     --artifact-cache-dir "$NEXT_ARTIFACT_CACHE_DIR" \
-    --target "$JIANG_HOST_TARGET" \
     --linker "$CLANG_BIN" \
     "${LLVM_LINK_ARGS[@]}" \
     -o "$output_bin" \
