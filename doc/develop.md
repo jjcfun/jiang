@@ -76,23 +76,21 @@ release 分支最终 rebase 到最后一个 bootstrap checkpoint，使源码历�
 bash ./script/linux_port_seed.sh emit-object
 ```
 
-把 `build/linux-port-seed/jiangc-x86_64-linux-gnu.o` 与同一 source revision 传到
-Linux x86_64。Linux host 必须先通过 `script/install_llvm.sh` 准备 Jiang 固定的 LLVM 22.1.8
-fork，然后链接 port seed：
+把 `build/linux-port-seed/jiangc-x86_64-linux-gnu.o`、同目录 manifest 与同一 source revision
+传到 Linux x86_64。Linux host 必须先通过 `script/install_llvm.sh` 准备 Jiang 固定的 LLVM
+22.1.8 fork。脚本会校验 source revision、object SHA-256 和 LLVM fork revision，然后完成
+native link 与 `seed -> next -> stable` 两跳自举：
 
 ```bash
-bash ./script/linux_port_seed.sh link
+bash ./script/linux_port_seed.sh bootstrap
 ```
 
 link 阶段会先编译运行 Linux hosted ABI probe，锁定当前 provider 使用的 `stat`、`dirent`、
-pthread storage、`-pthread` 和 `-ldl` 边界。probe 通过后，脚本输出 object/compiler 的 SHA-256。
-Linux port seed 只用于接续正常的 stable bootstrap：
+pthread storage、`-pthread` 和 `-ldl` 边界。probe 通过后，manifest 记录 source、bootstrap、LLVM、
+glibc、kernel、object、seed、next 和 stable 身份。只需诊断 native link 时也可以单独运行：
 
 ```bash
-BOOTSTRAP_BIN=build/bin/jiangc.linux-port-seed \
-BOOTSTRAP_RELEASE_VERSION=0.5.0 \
-VERIFY=none \
-bash ./script/build_next.sh
+bash ./script/linux_port_seed.sh link
 ```
 
 port seed 不能替代 release compiler，也不能绕过 `next -> stable` 和 release 验证。
