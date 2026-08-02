@@ -52,16 +52,16 @@ sdk_version() {
 }
 
 sdk_archive_name() {
-  printf 'jiang-llvm-%s-%s.tar.zst\n' "$(sdk_version)" "$(sdk_host_tag)"
+  printf 'jiang-llvm-%s-%s.tar.gz\n' "$(sdk_version)" "$(sdk_host_tag)"
 }
 
 sdk_archive_sha256() {
   case "$(sdk_host_tag)" in
     linux-x86_64)
-      printf '%s\n' "f9880ef943ac0c40662e90effe4730c76e8ac86b554ae109a282997e0bada167"
+      printf '%s\n' "42596f306bfa7af4c95f5f919ff0e32915146f1ea952620d035ef913451421de"
       ;;
     macos-arm64)
-      printf '%s\n' "92a051a06a85ffe9ee13fc3cfa0b3a132854a55d72ce6b2a4c51f62e9f7b2728"
+      printf '%s\n' "15cf20d4e314879e4760840a5ad1f33b84bc19becbd5ca8796957eca93d43541"
       ;;
   esac
 }
@@ -237,13 +237,12 @@ install_prebuilt_llvm() {
   fi
 
   require_command tar
-  require_command zstd
   archive="$(download_llvm_sdk)"
   mkdir -p "$(dirname "$install_dir")"
   stage_dir="$(mktemp -d "$(dirname "$install_dir")/.llvm-sdk.XXXXXX")"
   archive_root="${archive##*/}"
-  archive_root="${archive_root%.tar.zst}"
-  if ! zstd -dc "$archive" | tar -xf - -C "$stage_dir"; then
+  archive_root="${archive_root%.tar.gz}"
+  if ! tar -xzf "$archive" -C "$stage_dir"; then
     rm -rf "$stage_dir"
     return 2
   fi
