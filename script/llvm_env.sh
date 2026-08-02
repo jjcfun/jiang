@@ -11,6 +11,7 @@ JIANG_ROOT_DIR="$(cd "$JIANG_LLVM_SCRIPT_DIR/.." && pwd)"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 JIANG_LLVM_TOOLCHAIN_DIR="${JIANG_LLVM_TOOLCHAIN_DIR:-$JIANG_HOME/toolchains/llvm}"
 JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
+JIANG_LLVM_RELEASE_VERSION="${JIANG_LLVM_RELEASE_VERSION:-22.1.8}"
 JIANG_MACOS_DEPLOYMENT_TARGET="${JIANG_MACOS_DEPLOYMENT_TARGET:-${MACOSX_DEPLOYMENT_TARGET:-11.0}}"
 BUILD_DIR="${BUILD_DIR:-$JIANG_ROOT_DIR/build}"
 JIANG_LLVM_CONFIG_DIR="$BUILD_DIR/config"
@@ -236,6 +237,7 @@ jiang_write_llvm_env_file() {
   mkdir -p "$JIANG_LLVM_CONFIG_DIR"
   {
     printf 'JIANG_LLVM_VERSION=%s\n' "$JIANG_LLVM_VERSION"
+    printf 'JIANG_LLVM_RELEASE_VERSION=%s\n' "$JIANG_LLVM_RELEASE_VERSION"
     printf 'LLVM_CONFIG=%s\n' "$LLVM_CONFIG"
     printf 'LLVM_VERSION=%s\n' "$LLVM_VERSION"
     printf 'LLVM_BINDIR=%s\n' "$LLVM_BINDIR"
@@ -257,13 +259,10 @@ jiang_resolve_llvm_env() {
   fi
 
   LLVM_VERSION="$("$LLVM_CONFIG" --version)"
-  case "$LLVM_VERSION" in
-    "$JIANG_LLVM_VERSION"|"$JIANG_LLVM_VERSION".*) ;;
-    *)
-      echo "unsupported LLVM version: expected $JIANG_LLVM_VERSION.x, got $LLVM_VERSION from $LLVM_CONFIG" >&2
-      return 2
-      ;;
-  esac
+  if [ "$LLVM_VERSION" != "$JIANG_LLVM_RELEASE_VERSION" ]; then
+    echo "unsupported LLVM version: expected $JIANG_LLVM_RELEASE_VERSION, got $LLVM_VERSION from $LLVM_CONFIG" >&2
+    return 2
+  fi
 
   LLVM_BINDIR="$("$LLVM_CONFIG" --bindir)"
   LLVM_ROOT="$(cd "$LLVM_BINDIR/.." && pwd)"
@@ -285,7 +284,8 @@ jiang_resolve_llvm_env() {
     export MACOSX_DEPLOYMENT_TARGET
   fi
 
-  export JIANG_LLVM_VERSION JIANG_LLVM_TOOLCHAIN_DIR JIANG_MACOS_DEPLOYMENT_TARGET
+  export JIANG_LLVM_VERSION JIANG_LLVM_RELEASE_VERSION JIANG_LLVM_TOOLCHAIN_DIR
+  export JIANG_MACOS_DEPLOYMENT_TARGET
   export LLVM_CONFIG LLVM_VERSION LLVM_BINDIR LLVM_ROOT LLVM_CLANG LLVM_LIB_DIR JIANG_LLD
   JIANG_HOST_TARGET="${JIANG_HOST_TARGET:-$(jiang_host_target_triple)}"
   export JIANG_HOST_TARGET
@@ -296,6 +296,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   set -euo pipefail
   jiang_resolve_llvm_env
   printf 'JIANG_LLVM_VERSION=%s\n' "$JIANG_LLVM_VERSION"
+  printf 'JIANG_LLVM_RELEASE_VERSION=%s\n' "$JIANG_LLVM_RELEASE_VERSION"
   printf 'LLVM_CONFIG=%s\n' "$LLVM_CONFIG"
   printf 'LLVM_VERSION=%s\n' "$LLVM_VERSION"
   printf 'LLVM_ROOT=%s\n' "$LLVM_ROOT"

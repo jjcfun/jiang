@@ -77,8 +77,9 @@ bash ./script/linux_port_seed.sh emit-object
 ```
 
 把 `build/linux-port-seed/jiangc-x86_64-linux-gnu.o`、同目录 manifest 与同一 source revision
-传到 Linux x86_64。Linux host 必须先通过 `script/install_llvm.sh` 准备 Jiang 固定的 LLVM
-22.1.8 fork。脚本会校验 source revision、object SHA-256 和 LLVM fork revision，然后完成
+传到 Linux x86_64。Linux host 必须先通过 `script/install_llvm.sh` 下载并校验 Jiang 固定的
+LLVM 22.1.8 SDK；只有 LLVM 维护工作才使用 `--from-source`。脚本会校验 source revision、
+object SHA-256 和 LLVM fork revision，然后完成
 native link 与 `seed -> next -> stable` 两跳自举：
 
 ```bash

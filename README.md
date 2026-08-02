@@ -16,13 +16,12 @@ Jiang 仍处于早期版本阶段，语言、标准库和编译器内部结构�
 
 ## 构建自举编译器
 
-当前 release 分支仍以 macOS arm64 作为主要开发、验证和 release host。编译器本身依赖 LLVM 22。
-LLVM 源码通过 `vendor/llvm-project` submodule 固定到 Jiang 维护的 LLVM 22.1.8 分支：
+当前 release 分支使用精确锁定的 LLVM 22.1.8。Jiang 提供 Linux x86_64 和 macOS arm64 的预构建
+LLVM SDK，普通构建不需要下载或编译 LLVM 源码：
 
 ```text
-https://github.com/jjcfun/llvm-project.git
-branch: jiang/22.1.8
-tag: llvmorg-22.1.8
+release: jiang-sdk-llvm-22.1.8-1
+https://github.com/jjcfun/llvm-project/releases/tag/jiang-sdk-llvm-22.1.8-1
 ```
 
 LLVM 本地工具链默认安装在仓库 build 目录下：
@@ -45,8 +44,7 @@ $JIANG_HOME/toolchains/llvm/<version>/<host>
 
 未设置 `JIANG_HOME` 时使用 `~/.jiang`。构建脚本会通过 `script/llvm_env.sh` 查找 Jiang
 托管的 LLVM：优先使用 `build/llvm/<host>/install/bin/llvm-config`，再 fallback 到
-`$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。LLVM 源码来自
-`vendor/llvm-project` submodule，不会写入 submodule 目录。脚本不会 fallback 到系统全局
+`$JIANG_HOME/toolchains/llvm/<version>/<host>/bin/llvm-config`。脚本不会 fallback 到系统全局
 LLVM，也不接受外部 `LLVM_CONFIG` 覆盖。
 
 ```bash
@@ -54,12 +52,17 @@ bash ./script/install_llvm.sh --local
 bash ./script/install_llvm.sh --user
 ```
 
-`install_llvm.sh` 默认等价于 `--local`，从 `vendor/llvm-project` 构建 LLVM 并安装到
-`build/llvm/<host>/install`。`--user` 会安装到 `$JIANG_HOME/toolchains/llvm/<version>/<host>`。
-如果在 release 包中运行脚本且没有 submodule，脚本会从 `jjcfun/llvm-project` 的
-`jiang/22.1.8` 分支浅克隆源码。已存在的本地 LLVM 22 会直接复用；需要强制重建时设置
-`JIANG_LLVM_FORCE_BUILD=1`。LLVM 库默认以静态库形式链接进 `jiangc`，release 用户不需要
-安装 LLVM runtime。
+`install_llvm.sh` 默认等价于 `--local`，下载 SDK、校验锁定的 SHA-256，并安装到
+`build/llvm/<host>/install`；下载归档缓存在 `build/downloads`。`--user` 会安装到
+`$JIANG_HOME/toolchains/llvm/<version>/<host>`。只有排查或维护 LLVM 时才使用源码兜底：
+
+```bash
+bash ./script/install_llvm.sh --local --from-source
+```
+
+源码模式优先使用 `vendor/llvm-project` submodule；release 包没有 submodule 时，从 Jiang LLVM fork
+浅克隆 `llvmorg-22.1.8`。`JIANG_LLVM_FORCE_BUILD=1` 仍表示强制源码重建。LLVM 库默认以静态库形式
+链接进 `jiangc`，release 用户不需要安装 LLVM runtime。
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 

@@ -4,12 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 JIANG_LLVM_VERSION="${JIANG_LLVM_VERSION:-22}"
+JIANG_LLVM_RELEASE_VERSION="${JIANG_LLVM_RELEASE_VERSION:-22.1.8}"
+JIANG_LLVM_SOURCE_REVISION="${JIANG_LLVM_SOURCE_REVISION:-ca7933e47d3a3451d81e72ac174dcb5aa28b59d1}"
+JIANG_LLVM_SDK_REVISION="${JIANG_LLVM_SDK_REVISION:-1}"
 JIANG_LLVM_REPO="${JIANG_LLVM_REPO:-https://github.com/jjcfun/llvm-project.git}"
-JIANG_LLVM_REF="${JIANG_LLVM_REF:-jiang/22.1.8}"
+JIANG_LLVM_REF="${JIANG_LLVM_REF:-llvmorg-22.1.8}"
 JIANG_LLVM_SOURCE_DIR="${JIANG_LLVM_SOURCE_DIR:-$ROOT_DIR/vendor/llvm-project}"
 JIANG_LLVM_BUILD_DIR="${JIANG_LLVM_BUILD_DIR:-}"
 JIANG_LLVM_TOOLCHAIN_DIR="${JIANG_LLVM_TOOLCHAIN_DIR:-$JIANG_HOME/toolchains/llvm}"
+JIANG_LLVM_DOWNLOAD_DIR="${JIANG_LLVM_DOWNLOAD_DIR:-$ROOT_DIR/build/downloads}"
+JIANG_LLVM_SDK_BASE_URL="${JIANG_LLVM_SDK_BASE_URL:-https://github.com/jjcfun/llvm-project/releases/download}"
 JIANG_LLVM_INSTALL_SCOPE="${JIANG_LLVM_INSTALL_SCOPE:-local}"
+JIANG_LLVM_INSTALL_MODE="${JIANG_LLVM_INSTALL_MODE:-sdk}"
 JIANG_LLVM_PROJECTS="${JIANG_LLVM_PROJECTS:-clang;lld}"
 JIANG_LLVM_TARGETS="${JIANG_LLVM_TARGETS:-X86;AArch64;WebAssembly}"
 JIANG_LLVM_BUILD_TYPE="${JIANG_LLVM_BUILD_TYPE:-Release}"
@@ -26,12 +32,51 @@ host_tag() {
   printf '%s-%s\n' "$os" "$arch"
 }
 
+sdk_host_tag() {
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64|Darwin:aarch64)
+      printf '%s\n' "macos-arm64"
+      ;;
+    Linux:x86_64|Linux:amd64)
+      printf '%s\n' "linux-x86_64"
+      ;;
+    *)
+      echo "no prebuilt Jiang LLVM SDK for $(uname -s) $(uname -m); use --from-source" >&2
+      return 2
+      ;;
+  esac
+}
+
+sdk_version() {
+  printf '%s-%s\n' "$JIANG_LLVM_RELEASE_VERSION" "$JIANG_LLVM_SDK_REVISION"
+}
+
+sdk_archive_name() {
+  printf 'jiang-llvm-%s-%s.tar.zst\n' "$(sdk_version)" "$(sdk_host_tag)"
+}
+
+sdk_archive_sha256() {
+  case "$(sdk_host_tag)" in
+    linux-x86_64)
+      printf '%s\n' "f9880ef943ac0c40662e90effe4730c76e8ac86b554ae109a282997e0bada167"
+      ;;
+    macos-arm64)
+      printf '%s\n' "92a051a06a85ffe9ee13fc3cfa0b3a132854a55d72ce6b2a4c51f62e9f7b2728"
+      ;;
+  esac
+}
+
+sdk_release_tag() {
+  printf 'jiang-sdk-llvm-%s\n' "$(sdk_version)"
+}
+
 usage() {
   cat <<'EOF'
-usage: bash ./script/install_llvm.sh [--local|--user]
+usage: bash ./script/install_llvm.sh [--local|--user] [--from-source]
 
-  --local  install into build/llvm/<host>/install (default)
-  --user   install into $JIANG_HOME/toolchains/llvm/<version>/<host>
+  --local        install into build/llvm/<host>/install (default)
+  --user         install into $JIANG_HOME/toolchains/llvm/<version>/<host>
+  --from-source  build the locked LLVM source instead of downloading the SDK
 EOF
 }
 
@@ -43,6 +88,9 @@ parse_args() {
         ;;
       --user)
         JIANG_LLVM_INSTALL_SCOPE="user"
+        ;;
+      --from-source)
+        JIANG_LLVM_INSTALL_MODE="source"
         ;;
       -h|--help)
         usage
@@ -123,6 +171,100 @@ require_command() {
   fi
 }
 
+verify_sha256() {
+  local expected="$1"
+  local path="$2"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$expected" "$path" | sha256sum --check
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$expected" "$path" | shasum -a 256 --check
+    return
+  fi
+  echo "missing sha256sum or shasum" >&2
+  return 2
+}
+
+download_llvm_sdk() {
+  local archive
+  local archive_name
+  local expected
+  local partial
+  local url
+  archive_name="$(sdk_archive_name)"
+  archive="$JIANG_LLVM_DOWNLOAD_DIR/$archive_name"
+  expected="$(sdk_archive_sha256)"
+  if [ -f "$archive" ] && verify_sha256 "$expected" "$archive" >/dev/null 2>&1; then
+    printf '%s\n' "$archive"
+    return
+  fi
+
+  require_command curl
+  mkdir -p "$JIANG_LLVM_DOWNLOAD_DIR"
+  partial="$archive.partial"
+  url="$JIANG_LLVM_SDK_BASE_URL/$(sdk_release_tag)/$archive_name"
+  rm -f "$partial"
+  curl --fail --location --retry 3 --output "$partial" "$url"
+  verify_sha256 "$expected" "$partial" >&2
+  mv "$partial" "$archive"
+  printf '%s\n' "$archive"
+}
+
+llvm_sdk_install_valid() {
+  local install_dir="$1"
+  local manifest="$install_dir/share/jiang/llvm-sdk.json"
+  if [ ! -x "$install_dir/bin/llvm-config" ] || [ ! -r "$manifest" ]; then
+    return 1
+  fi
+  if [ "$("$install_dir/bin/llvm-config" --version)" != "$JIANG_LLVM_RELEASE_VERSION" ]; then
+    return 1
+  fi
+  grep -Fq "\"sdk_version\": \"$(sdk_version)\"" "$manifest" && \
+    grep -Fq "\"host\": \"$(sdk_host_tag)\"" "$manifest" && \
+    grep -Fq "\"llvm_revision\": \"$JIANG_LLVM_SOURCE_REVISION\"" "$manifest"
+}
+
+install_prebuilt_llvm() {
+  local archive
+  local archive_root
+  local install_dir
+  local stage_dir
+  install_dir="$(llvm_install_prefix)"
+  if llvm_sdk_install_valid "$install_dir"; then
+    "$ROOT_DIR/script/llvm_env.sh"
+    return
+  fi
+
+  require_command tar
+  require_command zstd
+  archive="$(download_llvm_sdk)"
+  mkdir -p "$(dirname "$install_dir")"
+  stage_dir="$(mktemp -d "$(dirname "$install_dir")/.llvm-sdk.XXXXXX")"
+  archive_root="${archive##*/}"
+  archive_root="${archive_root%.tar.zst}"
+  if ! zstd -dc "$archive" | tar -xf - -C "$stage_dir"; then
+    rm -rf "$stage_dir"
+    return 2
+  fi
+  if ! llvm_sdk_install_valid "$stage_dir/$archive_root"; then
+    echo "invalid Jiang LLVM SDK archive: $archive" >&2
+    rm -rf "$stage_dir"
+    return 2
+  fi
+
+  rm -rf "$install_dir"
+  mv "$stage_dir/$archive_root" "$install_dir"
+  rmdir "$stage_dir"
+  "$ROOT_DIR/script/llvm_env.sh"
+}
+
+llvm_source_install_valid() {
+  local install_dir="$1"
+  [ -x "$install_dir/bin/llvm-config" ] && \
+    [ "$("$install_dir/bin/llvm-config" --version)" = "$JIANG_LLVM_RELEASE_VERSION" ]
+}
+
 cmake_generator_args() {
   if command -v ninja >/dev/null 2>&1; then
     printf '%s\n' -G Ninja
@@ -176,7 +318,7 @@ cmake_macos_deployment_args() {
   fi
 }
 
-install_managed_llvm() {
+install_source_llvm() {
   local source_dir
   local build_dir
   local install_dir
@@ -184,9 +326,9 @@ install_managed_llvm() {
   build_dir="$(llvm_build_dir)"
   install_dir="$(llvm_install_prefix)"
 
-  if [ "$JIANG_LLVM_FORCE_BUILD" != "1" ] && [ -x "$install_dir/bin/llvm-config" ]; then
+  if [ "$JIANG_LLVM_FORCE_BUILD" != "1" ] && llvm_source_install_valid "$install_dir"; then
     "$ROOT_DIR/script/llvm_env.sh"
-    exit 0
+    return
   fi
 
   require_command cmake
@@ -222,14 +364,34 @@ install_managed_llvm() {
   "$ROOT_DIR/script/llvm_env.sh"
 }
 
-parse_args "$@"
+main() {
+  parse_args "$@"
+  if [ "$JIANG_LLVM_FORCE_BUILD" = "1" ]; then
+    JIANG_LLVM_INSTALL_MODE="source"
+  fi
 
-case "$(uname -s)" in
-  Darwin|Linux)
-    install_managed_llvm
-    ;;
-  *)
-    echo "unsupported host OS: $(uname -s)" >&2
-    exit 2
-    ;;
-esac
+  case "$(uname -s)" in
+    Darwin|Linux) ;;
+    *)
+      echo "unsupported host OS: $(uname -s)" >&2
+      return 2
+      ;;
+  esac
+
+  case "$JIANG_LLVM_INSTALL_MODE" in
+    sdk)
+      install_prebuilt_llvm
+      ;;
+    source)
+      install_source_llvm
+      ;;
+    *)
+      echo "unknown LLVM install mode: $JIANG_LLVM_INSTALL_MODE" >&2
+      return 2
+      ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
