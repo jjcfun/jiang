@@ -205,9 +205,18 @@ download_llvm_sdk() {
   partial="$archive.partial"
   url="$JIANG_LLVM_SDK_BASE_URL/$(sdk_release_tag)/$archive_name"
   rm -f "$partial"
-  curl --fail --location --retry 3 --output "$partial" "$url"
-  verify_sha256 "$expected" "$partial" >&2
-  mv "$partial" "$archive"
+  if ! curl --fail --location --retry 3 --output "$partial" "$url"; then
+    rm -f "$partial"
+    return 1
+  fi
+  if ! verify_sha256 "$expected" "$partial" >&2; then
+    rm -f "$partial"
+    return 1
+  fi
+  if ! mv "$partial" "$archive"; then
+    rm -f "$partial"
+    return 1
+  fi
   printf '%s\n' "$archive"
 }
 
@@ -237,7 +246,9 @@ install_prebuilt_llvm() {
   fi
 
   require_command tar
-  archive="$(download_llvm_sdk)"
+  if ! archive="$(download_llvm_sdk)"; then
+    return 1
+  fi
   mkdir -p "$(dirname "$install_dir")"
   stage_dir="$(mktemp -d "$(dirname "$install_dir")/.llvm-sdk.XXXXXX")"
   archive_root="${archive##*/}"

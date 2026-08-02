@@ -11,7 +11,7 @@ hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属�
 | --- | --- | --- | --- |
 | default host macOS arm64 | supported | supported | supported |
 | `arm64-apple-macosx` / `aarch64-apple-darwin` | supported | supported | supported on macOS host |
-| `x86_64-unknown-linux-gnu` | supported | supported | 0.5.1 native hosted bring-up |
+| `x86_64-unknown-linux-gnu` | supported | supported | supported on Linux x86_64 host |
 | `aarch64-unknown-linux-gnu` | experimental | experimental | `target_executable_requires_toolchain` |
 | Linux no-libc x86_64 | supported through `--no-link-libc` | supported | planned static executable |
 | `wasm32-unknown-unknown` | supported | supported | `target_executable_runtime_unsupported` |
@@ -22,6 +22,10 @@ hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属�
 Linux glibc executable 使用 native host 的 libc 与 toolchain，Jiang 不维护 glibc sysroot。
 macOS host 上编译 `linux-gnu` hosted executable 必须早停诊断，不能误用 host `cc` 链接
 Linux object。首次 Linux hosted port seed 流程见 [编译器开发流程](../develop.md)。
+
+Linux release archive 内的 `ABI.txt` 从最终 `jiangc` ELF 的 GNU symbol version requirements
+计算最低 glibc 版本，并记录 program interpreter、`DT_NEEDED` 和 SHA-256。这个产物审计结果才是
+release 的最低 glibc 依据；Ubuntu runner 版本只定义验证环境，不自动成为兼容性声明。
 
 `src/system/os/provider.jiang` 是系统能力抽象入口。0.5.1 使用
 `src/system/os/linux.jiang` hosted provider；`src/system/os/linux/no_libc.jiang` 是独立的

@@ -42,6 +42,7 @@ COMPILER_TEST_BIN="${COMPILER_TEST_BIN:-}"
 COMPILER_TEST_RELEASE_BIN="${COMPILER_TEST_RELEASE_BIN:-}"
 TIMEOUT_BIN=""
 SUITE_START=0
+TEST_HOST_PLATFORM=""
 
 default_test_jobs() {
   local count
@@ -118,6 +119,14 @@ validate_options() {
   fi
 }
 
+configure_host_platform() {
+  case "$(uname -s)" in
+    Darwin) TEST_HOST_PLATFORM=macos ;;
+    Linux) TEST_HOST_PLATFORM=linux ;;
+    *) TEST_HOST_PLATFORM=unsupported ;;
+  esac
+}
+
 configure_sanitizer() {
   RUN_CLANG="$LLVM_CLANG"
   case "$TEST_SANITIZER" in
@@ -167,10 +176,15 @@ collect_llvm_link_args() {
 
 case_selected() {
   local source="$1"
+  local platform
   if [ -n "$TEST_LIST" ] && ! grep -Fqx "$source" "$TEST_LIST"; then
     return 1
   fi
-  [ -z "$TEST_FILTER" ] || [[ "$source" =~ $TEST_FILTER ]]
+  if [ -n "$TEST_FILTER" ] && [[ ! "$source" =~ $TEST_FILTER ]]; then
+    return 1
+  fi
+  platform="$(sed -n 's/^.*test-platform:[[:space:]]*//p' "$source" | head -n 1)"
+  [ -z "$platform" ] || [ "$platform" = "$TEST_HOST_PLATFORM" ]
 }
 
 add_case() {
@@ -344,6 +358,16 @@ expected_exit_code() {
   printf '%s\n' "$expected"
 }
 
+exit_code_matches() {
+  local expected="$1"
+  local actual="$2"
+  if [ "$expected" = "trap" ]; then
+    [ "$actual" = "132" ] || [ "$actual" = "133" ]
+    return
+  fi
+  [ "$actual" = "$expected" ]
+}
+
 run_run_case() {
   local source="$1"
   local work_dir="$2"
@@ -404,7 +428,7 @@ run_run_case() {
   set -e
   run_time=$((SECONDS - run_started))
 
-  if [ "$code" = "$expected" ]; then
+  if exit_code_matches "$expected" "$code"; then
     rm -rf "$temp_dir"
     echo "PASS run $source"
     timing_line "run $source emit=${emit_time}s link=${link_time}s execute=${run_time}s"
@@ -441,7 +465,7 @@ run_compiler_case() {
     "$executable" "$case_name" >"$run_log" 2>&1
   code=$?
   set -e
-  if [ "$code" = "$expected" ]; then
+  if exit_code_matches "$expected" "$code"; then
     rm -rf "$temp_dir"
     echo "PASS $label $source"
     timing_line "$label $source execute=$((SECONDS - started))s"
@@ -509,7 +533,7 @@ run_release_case() {
   set -e
   run_time=$((SECONDS - run_started))
 
-  if [ "$code" = "$expected" ]; then
+  if exit_code_matches "$expected" "$code"; then
     rm -rf "$temp_dir"
     echo "PASS release-run $source"
     timing_line "release $source build=${build_time}s execute=${run_time}s"
@@ -853,6 +877,7 @@ run_internal_case() {
 
 run_suite() {
   validate_options
+  configure_host_platform
   source "$ROOT_DIR/script/llvm_env.sh"
   configure_sanitizer
   collect_llvm_link_args

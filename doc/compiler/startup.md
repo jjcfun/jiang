@@ -11,6 +11,10 @@ Jiang 的启动路径分成三层：
 当前 hosted executable 入口仍是 C ABI 形状的 `main(argc, argv)`。它由
 `system/startup.jiang` 中的普通函数定义，并通过 `@link_symbol("main")` 绑定到链接层符号。
 
+动态库仍会编译所需的 runtime 状态与能力实现，但不会 lowering 目标 startup 模块中的
+进程入口，也不会生成可执行文件专用的 `__jiang_main` 桥接函数。进程入口的所有权始终
+属于最终可执行文件。
+
 `argc` 保存到 `StartupState.arguments.length`，`argv` 保存到 `StartupState.arguments.raw`。
 写入完成后，hosted entry 调用语言入口 `__jiang_main`。
 

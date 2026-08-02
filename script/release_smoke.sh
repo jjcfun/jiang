@@ -9,12 +9,15 @@ UNPACK_DIR="$SMOKE_DIR/unpack"
 INSTALL_PREFIX="$SMOKE_DIR/prefix"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 VERSION="${VERSION:-$PACKAGE_VERSION}"
-TARGET="${TARGET:-macos-arm64}"
-PACKAGE_NAME="jiang-$VERSION-$TARGET"
-PACKAGE_ZIP="$DIST_DIR/$PACKAGE_NAME.zip"
-PACKAGE_DIR="$UNPACK_DIR/$PACKAGE_NAME"
+RELEASE_SMOKE_BUILD="${RELEASE_SMOKE_BUILD:-1}"
+JIANGC_BIN="${JIANGC_BIN:-$BUILD_DIR/bin/jiangc}"
+LINKER="${RELEASE_SMOKE_LINKER:-cc}"
 
-cd "$ROOT_DIR"
+TARGET=""
+PACKAGE_NAME=""
+PACKAGE_ARCHIVE=""
+PACKAGE_DIR=""
+PACKAGE_SCRIPT=""
 
 require_command() {
   local name="$1"
@@ -24,11 +27,30 @@ require_command() {
   fi
 }
 
-check_macos_host() {
-  if [ "$(uname -s)" != "Darwin" ]; then
-    echo "release smoke currently supports macOS host only" >&2
-    exit 2
-  fi
+configure_host() {
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64|Darwin:aarch64)
+      TARGET="macos-arm64"
+      PACKAGE_ARCHIVE="$DIST_DIR/jiang-$VERSION-$TARGET.zip"
+      PACKAGE_SCRIPT="$ROOT_DIR/script/package_macos_release.sh"
+      require_command unzip
+      require_command otool
+      ;;
+    Linux:x86_64|Linux:amd64)
+      TARGET="linux-x86_64"
+      PACKAGE_ARCHIVE="$DIST_DIR/jiang-$VERSION-$TARGET.tar.gz"
+      PACKAGE_SCRIPT="$ROOT_DIR/script/package_linux_release.sh"
+      require_command tar
+      require_command readelf
+      require_command ldd
+      ;;
+    *)
+      echo "unsupported release smoke host: $(uname -s) $(uname -m)" >&2
+      exit 2
+      ;;
+  esac
+  PACKAGE_NAME="jiang-$VERSION-$TARGET"
+  PACKAGE_DIR="$UNPACK_DIR/$PACKAGE_NAME"
 }
 
 check_binary_version() {
@@ -41,48 +63,92 @@ check_binary_version() {
   fi
 }
 
-check_no_llvm_dylib_dependency() {
+check_dynamic_dependencies() {
   local binary="$1"
-  local deps
-  deps="$(otool -L "$binary")"
-  if printf '%s\n' "$deps" | grep -E 'libLLVM|liblld' >/dev/null; then
-    echo "release binary must not depend on LLVM/lld dylibs:" >&2
-    printf '%s\n' "$deps" >&2
+  local dependencies
+  if [ "$TARGET" = "macos-arm64" ]; then
+    dependencies="$(otool -L "$binary")"
+  else
+    readelf -d "$binary"
+    dependencies="$(ldd "$binary")"
+  fi
+  printf '%s\n' "$dependencies"
+  if grep -E 'lib(LLVM|lld)' <<<"$dependencies" >/dev/null; then
+    echo "release compiler must not dynamically depend on LLVM/lld" >&2
     exit 1
   fi
 }
 
-check_macos_host
-require_command unzip
-require_command zip
-require_command otool
+unpack_archive() {
+  if [ "$TARGET" = "macos-arm64" ]; then
+    unzip -q "$PACKAGE_ARCHIVE" -d "$UNPACK_DIR"
+    return
+  fi
+  tar -xzf "$PACKAGE_ARCHIVE" -C "$UNPACK_DIR"
+}
+
+compile_and_run_samples() {
+  local compiler="$1"
+  local hello="$SMOKE_DIR/hello"
+  local capability="$SMOKE_DIR/hosted-capability"
+  local hello_output
+
+  "$compiler" --linker "$LINKER" -o "$hello" "$ROOT_DIR/test/release/hello.jiang"
+  hello_output="$("$hello")"
+  if [ "$hello_output" != "Hello from Jiang" ]; then
+    echo "unexpected Hello output: $hello_output" >&2
+    exit 1
+  fi
+
+  "$compiler" --linker "$LINKER" -o "$capability" \
+    "$ROOT_DIR/test/release/hosted_capability.jiang"
+  "$capability" release-smoke
+}
+
+cd "$ROOT_DIR"
+configure_host
+require_command "$LINKER"
+
+case "$RELEASE_SMOKE_BUILD" in
+  0|1) ;;
+  *)
+    echo "invalid RELEASE_SMOKE_BUILD=$RELEASE_SMOKE_BUILD; expected 0 or 1" >&2
+    exit 2
+    ;;
+esac
 
 printf '== release smoke: LLVM toolchain ==\n'
-bash ./script/install_llvm.sh >/dev/null
+if ! bash ./script/llvm_env.sh >/dev/null 2>&1; then
+  bash ./script/install_llvm.sh --local >/dev/null
+fi
 source ./script/llvm_env.sh
 printf 'LLVM %s at %s\n' "$LLVM_VERSION" "$LLVM_ROOT"
-printf 'macOS deployment target: %s\n' "${MACOSX_DEPLOYMENT_TARGET:-}"
 
-printf '\n== release smoke: stable compiler ==\n'
-BOOTSTRAP_DEPTH=stable VERIFY=none bash ./script/build_next.sh
-check_binary_version "$BUILD_DIR/bin/jiangc"
-check_no_llvm_dylib_dependency "$BUILD_DIR/bin/jiangc"
+if [ "$RELEASE_SMOKE_BUILD" = "1" ]; then
+  printf '\n== release smoke: stable compiler ==\n'
+  BOOTSTRAP_DEPTH=stable VERIFY=none bash ./script/build_next.sh
+fi
+check_binary_version "$JIANGC_BIN"
+check_dynamic_dependencies "$JIANGC_BIN"
 
 printf '\n== release smoke: package ==\n'
 rm -rf "$SMOKE_DIR"
 mkdir -p "$DIST_DIR" "$UNPACK_DIR"
-DIST_DIR="$DIST_DIR" VERSION="$VERSION" TARGET="$TARGET" bash ./script/package_macos_release.sh
-test -s "$PACKAGE_ZIP"
+BUILD_DIR="$BUILD_DIR" DIST_DIR="$DIST_DIR" VERSION="$VERSION" \
+  JIANGC_BIN="$JIANGC_BIN" bash "$PACKAGE_SCRIPT"
+test -s "$PACKAGE_ARCHIVE"
 
-unzip -q "$PACKAGE_ZIP" -d "$UNPACK_DIR"
+unpack_archive
 test -x "$PACKAGE_DIR/bin/jiangc"
 check_binary_version "$PACKAGE_DIR/bin/jiangc"
-check_no_llvm_dylib_dependency "$PACKAGE_DIR/bin/jiangc"
+check_dynamic_dependencies "$PACKAGE_DIR/bin/jiangc"
 
-printf '\n== release smoke: install script ==\n'
+printf '\n== release smoke: isolated install ==\n'
 PREFIX="$INSTALL_PREFIX" "$PACKAGE_DIR/install.sh" >/dev/null
 test -x "$INSTALL_PREFIX/versions/$VERSION/bin/jiangc"
 test -L "$INSTALL_PREFIX/bin/jiangc"
 check_binary_version "$INSTALL_PREFIX/bin/jiangc"
+check_dynamic_dependencies "$INSTALL_PREFIX/bin/jiangc"
+compile_and_run_samples "$INSTALL_PREFIX/bin/jiangc"
 
-printf '\nOK release smoke: %s\n' "$PACKAGE_ZIP"
+printf '\nOK release smoke: %s\n' "$PACKAGE_ARCHIVE"

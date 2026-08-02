@@ -83,6 +83,11 @@ target-specific linker argv 统一由 `backend/linker.jiang` 生成。pipeline �
 object emission 和 `LinkPlan`，不拼 `-target`、`-isysroot` 等具体 linker 参数。当前 target
 支持矩阵见 [Targets](targets.md)。
 
+macOS arm64 与 Linux x86_64 release compiler 都静态链接固定的 Jiang LLVM SDK。用户程序仍通过
+host PATH 中的 `cc` driver 链接系统 libc/CRT；release compiler 不动态依赖 `libLLVM` 或 `liblld`。
+Linux package 阶段使用 `readelf` / `ldd` 审计动态边界，并根据 GNU symbol version requirements
+生成 `ABI.txt`，避免从构建 runner 名称推导最低 glibc。
+
 ## 编译模式
 
 backend 当前区分 debug/release：

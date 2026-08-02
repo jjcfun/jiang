@@ -105,9 +105,11 @@ BOOTSTRAP_DEPTH=stable VERIFY=full bash ./script/build_next.sh
 自举链使用 `0.5.0-bootstrap` 和 `0.5.0-bootstrap2` 两个过渡 tag；普通开发不需要保留对应
 worktree。
 
-当前 release 只承诺 macOS arm64 hosted `jiangc`。Linux `jiangc` release 暂缓到语法和
-bootstrap pipeline 稳定之后。源码中已有 Linux x86_64/aarch64、Wasm `wasm32-unknown-unknown`、
-WASI `wasm32-wasi` 和 Windows MSVC x86_64/aarch64 的 LLVM IR/object 输出 smoke。
+Jiang 0.5.1 的正式 hosted release host 是 macOS arm64 与 Linux x86_64。Linux release 使用系统
+glibc、pthread、dl 和 C++ runtime；安装包内的 `ABI.txt` 根据最终 ELF symbol version requirements
+记录最低 glibc 版本，不把 CI runner 版本直接当作兼容性承诺。Linux aarch64 暂不提供正式安装包。
+源码中另有 Linux aarch64、Wasm `wasm32-unknown-unknown`、WASI `wasm32-wasi` 和 Windows MSVC
+x86_64/aarch64 的 LLVM IR/object 输出 smoke。
 WASI executable 依赖本地 wasi-sdk，默认安装在：
 
 ```text
@@ -148,6 +150,9 @@ TEST_JOBS=1 TEST_FILTER='tuple' JIANGC=./build/bin/jiangc bash ./script/test.sh
 TEST_JOBS=4 TEST_TIMEOUT=120 JIANGC=./build/bin/jiangc bash ./script/test.sh
 ```
 
+依赖宿主系统 API 的用例可用 `// test-platform: macos` 或 `// test-platform: linux`
+限定运行平台；普通用例不应添加平台限制。
+
 默认在首个失败后停止派发新用例，并等待已经启动的用例结束；设置
 `TEST_KEEP_GOING=1` 可完成全部已选择用例。失败时 runner 会打印保留目录，其中的
 `cases/<序号>-<类别>-<用例>/` 保存编译、链接、运行日志和独立 cache。成功用例默认清理；
@@ -175,15 +180,17 @@ runner 自身的调度契约可独立验证：
 bash ./script/test_runner_self_test.sh
 ```
 
-macOS arm64 release 包：
+生成当前 host 的 release 包：
 
 ```bash
 bash ./script/package_macos_release.sh
+bash ./script/package_linux_release.sh
 ```
 
-该脚本默认从 `package.ini` 读取版本，要求 `build/bin/jiangc --version` 与包版本一致。
-release zip 中的 `jiangc` 静态链接 LLVM，不依赖本机 `libLLVM.dylib`。包内 `install.sh`
-会安装到 `~/.jiang/versions/<version>` 并更新 `~/.jiang/bin/jiangc`。
+两个入口复用 `package_release.sh` 的公共 staging/install 流程，默认从 `package.ini` 读取版本，
+并要求 `build/bin/jiangc --version` 与包版本一致。macOS 产物是 `.zip`，Linux x86_64 产物是
+`.tar.gz`。其中 `jiangc` 静态链接 LLVM，不动态依赖 `libLLVM` / `liblld`；包内 `install.sh`
+会安装到 `~/.jiang/versions/<version>` 并更新 `~/.jiang/bin/jiangc`。Linux 包额外包含 `ABI.txt`。
 
 验证完整 release 链路：
 
@@ -191,9 +198,10 @@ release zip 中的 `jiangc` 静态链接 LLVM，不依赖本机 `libLLVM.dylib`�
 bash ./script/release_smoke.sh
 ```
 
-该脚本会复用或安装本地 LLVM，执行 stable bootstrap 构建，生成 macOS release zip，解包运行
-`jiangc --version`，用临时 `PREFIX` 验证包内 `install.sh`，并检查产物没有动态依赖
-`libLLVM` / `liblld`。
+该脚本会复用或安装本地 LLVM，执行 stable bootstrap 构建，生成当前 host 的 release archive，
+用临时 `PREFIX` 验证包内 `install.sh`，并使用安装后的 compiler 编译运行 Hello 和 hosted capability
+sample。macOS 使用 `otool`，Linux 使用 `readelf` / `ldd` 检查产物不动态依赖 `libLLVM` / `liblld`。
+Linux port seed 或 CI 已经生成 stable compiler 时，可设置 `RELEASE_SMOKE_BUILD=0` 避免重复自举。
 
 ## 文档
 

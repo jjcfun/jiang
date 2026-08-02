@@ -84,6 +84,7 @@ prepare_success_fixture() {
   write_case "$root/basic/check/slow_success.jiang"
   write_case "$root/basic/fail/expected_failure.jiang" "// expected: E_EXPECTED"
   write_case "$root/basic/emit/emit_success.jiang"
+  write_case "$root/basic/run/skipped_platform.jiang" "// test-platform: unsupported"
   write_case "$root/basic/run/run_success.jiang"
   write_case "$root/basic/run/run_exit.jiang" "// expected-exit: 7"
 }
@@ -117,6 +118,7 @@ check_stable_parallel_output() {
   assert_contains "$parallel_output" "PASS emit"
   assert_contains "$parallel_output" "PASS run"
   assert_contains "$parallel_output" "PASS release-run"
+  assert_not_contains "$parallel_output" "skipped_platform.jiang"
 
   local invocation_count
   local cache_count

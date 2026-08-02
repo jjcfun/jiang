@@ -115,6 +115,29 @@ JIANGC=build/bin/jiangc bash ./script/linux_hosted_runtime_smoke.sh
 
 该门禁覆盖 main-domain round-trip/shutdown/stress、serial/concurrent domain 和跨线程等待。
 
+文件系统与 lang provider dynamic library 聚焦门禁：
+
+```bash
+JIANGC=build/bin/jiangc bash ./script/linux_hosted_fs_smoke.sh
+JIANGC=build/bin/jiangc bash ./script/linux_hosted_dylib_smoke.sh
+```
+
+文件系统门禁覆盖读写、文件锁、file/dir 判断、dangling symlink 删除和原子替换；provider 对
+partial result 与 `EINTR` 的循环边界由实现审计和 compiler system tests 共同约束。
+dylib 门禁会真实构建、加载和调用 `.so` provider，并验证缓存失效与损坏产物诊断。
+
+完整 Linux release 验证在 `linux-hosted-full.yml` 中执行两跳自举、全部 compiler/language tests、
+打包和隔离安装 smoke。非 `release/**` 分支只通过 `workflow_dispatch` 手动运行；release 分支 push
+自动触发。Linux package 由以下入口生成：
+
+```bash
+bash ./script/package_linux_release.sh
+RELEASE_SMOKE_BUILD=0 bash ./script/release_smoke.sh
+```
+
+release smoke 使用安装后的 compiler 编译运行 Hello 与 hosted capability sample；`ABI.txt` 记录最终
+ELF 的最低 glibc symbol version、解释器、动态库边界和 SHA-256。
+
 ## Jiang 0.4.9 的可复现自举链
 
 0.4.9 的 lifetime 语法和编译器源码升级需要两个过渡编译器。发布后固定的链路为：

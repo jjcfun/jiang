@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'case $- in *e*) echo "backend CLI smoke failed at line $LINENO" >&2 ;; esac' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build}"
@@ -7,8 +8,22 @@ SMOKE_BUILD_DIR="$BUILD_DIR/smoke/stage2_backend_cli"
 SMOKE_SOURCE_DIR="${TMPDIR:-/tmp}/jiang-backend-cli-smoke"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 EXPECTED_COMPILER_VERSION="${EXPECTED_COMPILER_VERSION:-$PACKAGE_VERSION}"
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
 
 source "$ROOT_DIR/script/llvm_env.sh"
+
+assert_file_matches() {
+  local path="$1"
+  local pattern="$2"
+  local output="$path.file"
+  file "$path" >"$output"
+  if grep -Eiq "$pattern" "$output"; then
+    return
+  fi
+  cat "$output" >&2
+  return 1
+}
 
 mkdir -p "$SMOKE_BUILD_DIR" "$SMOKE_SOURCE_DIR"
 cd "$ROOT_DIR"
@@ -39,6 +54,7 @@ COMPILER_VERSION="$("$COMPILER_UNDER_TEST" --version | sed -n '1p')"
 clang_bin="$LLVM_CLANG"
 compiler_bin="$SMOKE_BUILD_DIR/jiangc"
 llvm_link_args=()
+host_clang_link_args=()
 sample="$SMOKE_BUILD_DIR/minimal.jiang"
 sample_ll="$SMOKE_BUILD_DIR/minimal.ll"
 sample_obj="$SMOKE_BUILD_DIR/minimal.o"
@@ -59,8 +75,12 @@ system_fs_linux_no_libc_ll="$SMOKE_BUILD_DIR/system_fs_linux_no_libc.ll"
 alloc_sample="$SMOKE_BUILD_DIR/no_libc_alloc.jiang"
 alloc_no_libc_ll="$SMOKE_BUILD_DIR/no_libc_alloc.ll"
 alloc_no_libc_obj="$SMOKE_BUILD_DIR/no_libc_alloc.o"
+alloc_no_libc_nm="$SMOKE_BUILD_DIR/no_libc_alloc.nm"
+alloc_no_libc_undefined_nm="$SMOKE_BUILD_DIR/no_libc_alloc.undefined.nm"
 alloc_linux_no_libc_ll="$SMOKE_BUILD_DIR/no_libc_alloc_linux.ll"
 alloc_linux_no_libc_obj="$SMOKE_BUILD_DIR/no_libc_alloc_linux.o"
+alloc_linux_no_libc_nm="$SMOKE_BUILD_DIR/no_libc_alloc_linux.nm"
+alloc_linux_no_libc_undefined_nm="$SMOKE_BUILD_DIR/no_libc_alloc_linux.undefined.nm"
 alloc_wasm_ll="$SMOKE_BUILD_DIR/no_libc_alloc_wasm.ll"
 macos_target_ll="$SMOKE_BUILD_DIR/minimal_macos.ll"
 macos_target_obj="$SMOKE_BUILD_DIR/minimal_macos.o"
@@ -87,6 +107,11 @@ windows_exe_log="$SMOKE_BUILD_DIR/windows_executable.log"
 wasm_exe_log="$SMOKE_BUILD_DIR/wasm_executable.log"
 wasi_exe_log="$SMOKE_BUILD_DIR/wasi_executable.log"
 unsupported_target_log="$SMOKE_BUILD_DIR/unsupported_target.log"
+
+case "$HOST_OS" in
+  Darwin) host_clang_link_args+=(-Wl,-dead_strip) ;;
+  Linux) host_clang_link_args+=(-no-pie) ;;
+esac
 
 printf 'Int main() { 0 }\n' >"$sample"
 printf 'struct Pair { Int left; Int right; }\nInt get_left(Pair p) { p.left }\nInt main() { 0 }\n' >"$field_sample"
@@ -161,7 +186,7 @@ rm -rf "$BUILD_DIR/cache"
 
 "$compiler_bin" --emit-llvm -o "$sample_ll" "$sample"
 test -s "$sample_ll"
-"$clang_bin" "$sample_ll" -o "$sample_from_ll" \
+"$clang_bin" "${host_clang_link_args[@]}" "$sample_ll" -o "$sample_from_ll" \
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
@@ -171,7 +196,7 @@ test -s "$sample_ll"
 
 "$compiler_bin" --emit-obj -o "$sample_obj" "$sample"
 test -s "$sample_obj"
-"$clang_bin" "$sample_obj" -o "$sample_from_obj" \
+"$clang_bin" "${host_clang_link_args[@]}" "$sample_obj" -o "$sample_from_obj" \
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
@@ -193,18 +218,29 @@ if grep -q "@free(" "$alloc_no_libc_ll"; then
 fi
 "$compiler_bin" --no-link-libc --emit-obj -o "$alloc_no_libc_obj" "$alloc_sample"
 test -s "$alloc_no_libc_obj"
-nm -u "$alloc_no_libc_obj" | grep -q "___jiang_malloc"
-nm -u "$alloc_no_libc_obj" | grep -q "___jiang_free"
-if nm -u "$alloc_no_libc_obj" | grep -q "^_malloc$"; then
-  echo "unexpected malloc reference in --no-link-libc object output" >&2
-  exit 1
-fi
-if nm -u "$alloc_no_libc_obj" | grep -q "^_free$"; then
-  echo "unexpected free reference in --no-link-libc object output" >&2
-  exit 1
-fi
+nm "$alloc_no_libc_obj" >"$alloc_no_libc_nm"
+nm -u "$alloc_no_libc_obj" >"$alloc_no_libc_undefined_nm"
+case "$HOST_OS" in
+  Darwin)
+    grep -q "___jiang_malloc" "$alloc_no_libc_undefined_nm"
+    grep -q "___jiang_free" "$alloc_no_libc_undefined_nm"
+    if grep -Eq "^_(malloc|free)$" "$alloc_no_libc_undefined_nm"; then
+      echo "unexpected libc allocation reference in --no-link-libc object output" >&2
+      exit 1
+    fi
+    ;;
+  Linux)
+    grep -q " T __jiang_malloc" "$alloc_no_libc_nm"
+    grep -q " T __jiang_free" "$alloc_no_libc_nm"
+    if grep -Eq " (malloc|free)$" "$alloc_no_libc_undefined_nm"; then
+      echo "unexpected libc allocation reference in --no-link-libc object output" >&2
+      exit 1
+    fi
+    ;;
+esac
 
-"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-llvm -o "$alloc_linux_no_libc_ll" "$alloc_sample"
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc \
+  --emit-llvm -o "$alloc_linux_no_libc_ll" "$alloc_sample"
 test -s "$alloc_linux_no_libc_ll"
 grep -q "__jiang_malloc" "$alloc_linux_no_libc_ll"
 grep -q "__jiang_free" "$alloc_linux_no_libc_ll"
@@ -216,15 +252,18 @@ if grep -q "@free(" "$alloc_linux_no_libc_ll"; then
   echo "unexpected free reference in linux --no-link-libc LLVM output" >&2
   exit 1
 fi
-"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-obj -o "$alloc_linux_no_libc_obj" "$alloc_sample"
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc \
+  --emit-obj -o "$alloc_linux_no_libc_obj" "$alloc_sample"
 test -s "$alloc_linux_no_libc_obj"
-nm "$alloc_linux_no_libc_obj" | grep -q " T __jiang_malloc"
-nm "$alloc_linux_no_libc_obj" | grep -q " T __jiang_free"
-if nm -u "$alloc_linux_no_libc_obj" | grep -q " malloc$"; then
+nm "$alloc_linux_no_libc_obj" >"$alloc_linux_no_libc_nm"
+nm -u "$alloc_linux_no_libc_obj" >"$alloc_linux_no_libc_undefined_nm"
+grep -q " T __jiang_malloc" "$alloc_linux_no_libc_nm"
+grep -q " T __jiang_free" "$alloc_linux_no_libc_nm"
+if grep -q " malloc$" "$alloc_linux_no_libc_undefined_nm"; then
   echo "unexpected malloc reference in linux --no-link-libc object output" >&2
   exit 1
 fi
-if nm -u "$alloc_linux_no_libc_obj" | grep -q " free$"; then
+if grep -q " free$" "$alloc_linux_no_libc_undefined_nm"; then
   echo "unexpected free reference in linux --no-link-libc object output" >&2
   exit 1
 fi
@@ -248,9 +287,11 @@ grep -q 'target triple = "arm64-apple-macosx11.0.0"' "$macos_target_ll"
 grep -q 'target datalayout = ' "$macos_target_ll"
 "$compiler_bin" --target arm64-apple-macosx --emit-obj -o "$macos_target_obj" "$sample"
 test -s "$macos_target_obj"
-file "$macos_target_obj" | grep -q "Mach-O 64-bit object arm64"
-"$compiler_bin" --target arm64-apple-macosx -o "$macos_target_bin" "$sample"
-"$macos_target_bin"
+assert_file_matches "$macos_target_obj" "Mach-O 64-bit (object arm64|arm64 object)"
+if [ "$HOST_OS:$HOST_ARCH" = "Darwin:arm64" ]; then
+  "$compiler_bin" --target arm64-apple-macosx -o "$macos_target_bin" "$sample"
+  "$macos_target_bin"
+fi
 
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$linux_target_ll" "$sample"
 test -s "$linux_target_ll"
@@ -258,7 +299,7 @@ grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$linux_target_ll"
 grep -q 'target datalayout = ' "$linux_target_ll"
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-obj -o "$linux_target_obj" "$sample"
 test -s "$linux_target_obj"
-file "$linux_target_obj" | grep -q "ELF 64-bit.*x86-64"
+assert_file_matches "$linux_target_obj" "ELF 64-bit.*x86-64"
 
 "$compiler_bin" --target aarch64-unknown-linux-gnu --emit-llvm -o "$linux_aarch64_target_ll" "$sample"
 test -s "$linux_aarch64_target_ll"
@@ -266,13 +307,14 @@ grep -q 'target triple = "aarch64-unknown-linux-gnu"' "$linux_aarch64_target_ll"
 grep -q 'target datalayout = ' "$linux_aarch64_target_ll"
 "$compiler_bin" --target aarch64-unknown-linux-gnu --emit-obj -o "$linux_aarch64_target_obj" "$sample"
 test -s "$linux_aarch64_target_obj"
-file "$linux_aarch64_target_obj" | grep -q "ELF 64-bit.*ARM aarch64"
+assert_file_matches "$linux_aarch64_target_obj" "ELF 64-bit.*ARM aarch64"
 
 "$compiler_bin" --target x86_64-unknown-linux-gnu --emit-llvm -o "$system_fs_linux_ll" "$system_fs_sample"
 test -s "$system_fs_linux_ll"
 grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$system_fs_linux_ll"
 
-"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc --emit-llvm -o "$system_fs_linux_no_libc_ll" "$system_fs_sample"
+"$compiler_bin" --target x86_64-unknown-linux-gnu --no-link-libc \
+  --emit-llvm -o "$system_fs_linux_no_libc_ll" "$system_fs_sample"
 test -s "$system_fs_linux_no_libc_ll"
 grep -q 'target triple = "x86_64-unknown-linux-gnu"' "$system_fs_linux_no_libc_ll"
 if grep -Eq "^declare .*@(getenv|posix_spawn|opendir|memcpy|memset)\\b" "$system_fs_linux_no_libc_ll"; then
@@ -286,7 +328,7 @@ grep -q 'target triple = "x86_64-pc-windows-msvc"' "$windows_target_ll"
 grep -q 'target datalayout = ' "$windows_target_ll"
 "$compiler_bin" --target x86_64-pc-windows-msvc --emit-obj -o "$windows_target_obj" "$sample"
 test -s "$windows_target_obj"
-file "$windows_target_obj" | grep -q "COFF"
+assert_file_matches "$windows_target_obj" "COFF"
 
 "$compiler_bin" --target wasm32-unknown-unknown --emit-llvm -o "$wasm_target_ll" "$sample"
 test -s "$wasm_target_ll"
@@ -294,7 +336,7 @@ grep -q 'target triple = "wasm32-unknown-unknown"' "$wasm_target_ll"
 grep -q 'target datalayout = ' "$wasm_target_ll"
 "$compiler_bin" --target wasm32-unknown-unknown --emit-obj -o "$wasm_target_obj" "$sample"
 test -s "$wasm_target_obj"
-file "$wasm_target_obj" | grep -qi "WebAssembly"
+assert_file_matches "$wasm_target_obj" "WebAssembly"
 
 "$compiler_bin" --target wasm32-wasi --emit-llvm -o "$wasi_target_ll" "$sample"
 test -s "$wasi_target_ll"
@@ -302,7 +344,7 @@ grep -q 'target triple = "wasm32-wasip1"' "$wasi_target_ll"
 grep -q 'target datalayout = ' "$wasi_target_ll"
 "$compiler_bin" --target wasm32-wasi --emit-obj -o "$wasi_target_obj" "$sample"
 test -s "$wasi_target_obj"
-file "$wasi_target_obj" | grep -qi "WebAssembly"
+assert_file_matches "$wasi_target_obj" "WebAssembly"
 
 set +e
 "$compiler_bin" --target wasm32-wasi -o "$wasi_target_bin" "$sample" >"$wasi_exe_log" 2>&1
@@ -310,7 +352,7 @@ wasi_exe_status=$?
 set -e
 if [ "$wasi_exe_status" -eq 0 ]; then
   test -s "$wasi_target_bin"
-  file "$wasi_target_bin" | grep -qi "WebAssembly"
+  assert_file_matches "$wasi_target_bin" "WebAssembly"
   if grep -q "function signature mismatch" "$wasi_exe_log"; then
     echo "unexpected WASI linker signature mismatch" >&2
     exit 1
@@ -334,7 +376,7 @@ fi
   -o "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" "$sample" \
   >"$linux_no_libc_exe_log" 2>&1
 test -s "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe"
-file "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" | grep -q "ELF 64-bit.*x86-64"
+assert_file_matches "$SMOKE_BUILD_DIR/minimal_linux_no_libc_exe" "ELF 64-bit.*x86-64"
 
 set +e
 "$compiler_bin" --target aarch64-unknown-linux-gnu --no-link-libc \
@@ -346,7 +388,8 @@ test "$linux_aarch64_no_libc_exe_status" -ne 0
 grep -q "target_executable_requires_runtime" "$linux_aarch64_no_libc_exe_log"
 
 set +e
-"$compiler_bin" --target x86_64-pc-windows-msvc -o "$SMOKE_BUILD_DIR/minimal_windows_exe" "$sample" >"$windows_exe_log" 2>&1
+"$compiler_bin" --target x86_64-pc-windows-msvc \
+  -o "$SMOKE_BUILD_DIR/minimal_windows_exe" "$sample" >"$windows_exe_log" 2>&1
 windows_exe_status=$?
 set -e
 test "$windows_exe_status" -ne 0
@@ -360,13 +403,18 @@ test "$wasm_exe_status" -ne 0
 grep -q "target_executable_runtime_unsupported" "$wasm_exe_log"
 
 set +e
-"$compiler_bin" --target x86_64-unknown-freebsd --emit-llvm -o "$SMOKE_BUILD_DIR/minimal_freebsd.ll" "$sample" >"$unsupported_target_log" 2>&1
+"$compiler_bin" --target x86_64-unknown-freebsd --emit-llvm \
+  -o "$SMOKE_BUILD_DIR/minimal_freebsd.ll" "$sample" >"$unsupported_target_log" 2>&1
 unsupported_target_status=$?
 set -e
 test "$unsupported_target_status" -ne 0
 grep -q "unsupported target triple: x86_64-unknown-freebsd" "$unsupported_target_log"
 
-"$compiler_bin" --link-arg -Wl,-dead_strip -o "$sample_with_link_arg" "$sample"
+host_dead_strip_arg="-Wl,--gc-sections"
+if [ "$HOST_OS" = "Darwin" ]; then
+  host_dead_strip_arg="-Wl,-dead_strip"
+fi
+"$compiler_bin" --link-arg "$host_dead_strip_arg" -o "$sample_with_link_arg" "$sample"
 "$sample_with_link_arg"
 
 "$compiler_bin" -o "$system_env_bin" test/lang/system/run/env_get.jiang
@@ -374,7 +422,7 @@ grep -q "unsupported target triple: x86_64-unknown-freebsd" "$unsupported_target
 
 "$compiler_bin" --mode release --emit-obj -o "$sample_release_obj" "$sample"
 test -s "$sample_release_obj"
-"$clang_bin" "$sample_release_obj" -o "$sample_from_release_obj" \
+"$clang_bin" "${host_clang_link_args[@]}" "$sample_release_obj" -o "$sample_from_release_obj" \
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \
@@ -394,7 +442,7 @@ test "$package_status" -eq 52
 
 "$compiler_bin" --emit-llvm -o "$field_ll" "$field_sample"
 test -s "$field_ll"
-"$clang_bin" "$field_ll" -o "$field_bin" \
+"$clang_bin" "${host_clang_link_args[@]}" "$field_ll" -o "$field_bin" \
   $("$LLVM_CONFIG" --link-static --ldflags) \
   $("$LLVM_CONFIG" --link-static --libs all) \
   $("$LLVM_CONFIG" --link-static --system-libs) \

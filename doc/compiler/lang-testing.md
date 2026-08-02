@@ -66,6 +66,10 @@ LANG_CHECK_RELEASE_RUNS=1 JIANGC=./build/bin/jiangc bash ./script/lang_check.sh
 这会额外对所有 `run/` 用例执行 `jiangc --mode release -o ...`，覆盖 LLVM codegen opt level 2
 和 `default<O2>` pass pipeline。
 
+`run/` 默认必须跨 hosted 平台运行。确实依赖平台系统 API 的用例可用
+`// test-platform: macos` 或 `// test-platform: linux` 限定宿主；`// expected-exit: trap`
+用于匹配 LLVM trap 在不同宿主上的 SIGILL 或 SIGTRAP，不能匹配 SIGSEGV。
+
 任何新增语言能力必须同步更新本矩阵；如果某个语义尚未定稿，应在对应 TODO 中标注，不能用临时
 测试假定长期规则。
 
