@@ -17,6 +17,11 @@
 以及对应 borrow / drop 检查。0.4.7-2 在此基础上让可变 capture 使用 `T&!`，并参与唯一
 借用、最后一次使用和 async/domain 边界检查。
 
+0.5.1 的 JIL 在 borrow check 前保留 typed closure environment、capture operands 和栈环境
+place。capture 携带的 loans 绑定到 `Fn` / `Fn^` 根并随 move、参数和聚合传播；只有 LLVM
+lowering 才把环境擦成 `{ receiver, vtable }` ABI。栈环境使用普通 JIL local，因此 async
+函数中的闭包环境可以复用 coroutine frame rewrite，不依赖 backend block 内临时 `alloca`。
+
 已验证的行为见本文末尾测试清单。测试清单中的 `[x]` 表示当前已有语言测试或 smoke
 覆盖；未在清单中标成 `[x]` 的 async closure、`FnOnce`、完整
 `Send` / `Sync` 等能力仍属于后续设计。

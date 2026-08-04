@@ -114,6 +114,11 @@ reference 提供一个 slot；raw pointer 不提供 slot，owner pointer 保留 
 alternative。slice handle 由自身 slot 与 repeated element 组成；Task 使用 pending empty/completed
 result alternative。RawFn 为空 shape，Fn 的 slot 表示 capture environment lifetime。
 
+闭包构造在 borrow check 输入中保留 typed environment 与 capture operands，不预先擦成 `Void*`。
+构造 `Fn` / `Fn^` 时，全部 capture loans 绑定到 callable 根 slot；后续 move、参数、optional、
+tuple、array 和 struct 传播都复用普通值的 active-loan dataflow。stack/heap 只决定 backend 的
+环境存储位置，不改变 borrow 合法性；栈环境 place 还会参与 coroutine frame rewrite。
+
 `LifetimeContract` 是 intern 后的 path-to-path flow：root 是函数参数或返回值，源码中的
 public region、tuple 元素和 callable 位置名称会解析为稳定 projection。内部 projection
 可以使用字段 `DefId` 或 tuple/callable 位置，但这些内部索引不作为 `[0]` 用户语法暴露。
