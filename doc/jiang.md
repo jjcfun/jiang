@@ -1045,7 +1045,8 @@ Fn<async [global_domain] Int, Int> load = { id => fetch(id) };
 ```
 
 async `Fn` / `RawFn` 动态调用复用普通 async 函数的 Domain 切换。跨 Domain 的参数、result 和 capture
-必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
+按值 transfer 必须满足 Sendable；共享 borrow `T&`（含 borrowed slice）在 `T: Sendable` 时可以
+跨 Domain，并继续由普通 lifetime/borrow check 约束。
 
 `Sendable` 与 move/copy 是三件独立的事：
 
@@ -1053,7 +1054,10 @@ async `Fn` / `RawFn` 动态调用复用普通 async 函数的 Domain 切换。�
   `Sendable`。
 - `T: Sendable + !Movable` 不能直接按值转移，但可以放在 heap 上，通过移动 `T^` owner
   handle 跨 Domain；pointee 的地址不会变化。
-- `T&` 和 `T&!` 仍是受 lifetime 限制的普通 borrow，不会因为 `T: Sendable` 就能跨 Domain。
+- `T&` 可以在 `T: Sendable` 时作为参数、result 或 capture 跨 Domain。引用可以保存或返回，但不能
+  活过来源 owner；借用存活期间 owner 仍不能被 move 或 drop。
+- `T&!` 不直接跨 Domain；需要共享引用时可以自动 reborrow 为 `T&`，并在 shared reborrow 存活期间
+  冻结原 `T&!`。
 
 tuple、定长 array、optional、errorable result、Task 和用户声明的 aggregate 都会递归检查
 payload。raw pointer 不自动满足 `Sendable`，只能留在显式 `unsafe` 边界中。共享可变状态应使用
@@ -1080,11 +1084,11 @@ unsafe extend SharedHandle: Sendable;
 ```
 
 `unsafe extend` 只支持 `Sendable`。它不会让 raw pointer 本身变成 `Sendable`，也不会补充
-同步或 lifetime 保证；这些保证由 handle 的实现负责。
+ownership 或 lifetime 保证；这些保证由 handle 的实现负责。
 
-domain-bound owned closure 也遵守同一规则。创建 `Fn<async [domain] (...)>^` 时，它的每个
-capture 都必须能以对应的 move/copy 方式安全进入目标 Domain；borrow capture 不能借 closure
-owner 延长 lifetime。
+domain-bound owned closure 也遵守同一规则。创建 `Fn<async [domain] (...)>^` 时，值 capture 必须能
+以对应的 move/copy 方式安全进入目标 Domain；`T&` capture 由 closure environment 的 lifetime shape
+传播，不能活过来源 owner。
 
 调用带 `unsafe` effect 的函数需要进入显式 effect context：
 

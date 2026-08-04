@@ -945,7 +945,8 @@ Fn<async [global_domain] Int, Int> loader = { id => load(id) };
 lambda 自身不增加 effect 前缀；async/unsafe/domain effect 必须由完整 expected callable type
 下推。async `Fn` 与 async `RawFn` 使用普通 async 函数相同的 start/completion ABI，只额外携带 closure
 environment。动态调用可以在相同或不同 Domain 间切换；跨 Domain 的参数、result 和 capture
-必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
+按值 transfer 必须满足 Sendable；共享 borrow `T&`（含 borrowed slice）在 `T: Sendable` 时可以
+跨 Domain，并继续由同一套 lifetime/borrow check 约束。
 
 `Sendable` 只描述“值能否安全进入另一个 Domain”，不改变值原有的 ownership、地址稳定性或
 lifetime：
@@ -954,8 +955,10 @@ lifetime：
   `T: Sendable`。`Sendable` 不隐含 `Movable` 或 `Copyable`，反向也不成立。
 - 转移 `T^` 只移动 owner handle，不移动 heap pointee。因此地址固定的
   `T: Sendable + !Movable` 可以通过 `T^` 进入另一个 Domain，不能直接按值转移。
-- 普通 `T&` 和 `T&!` 是受当前 lifetime 限制的 borrow。即使 `T: Sendable`，borrow 也不会因此
-  获得跨 Domain 能力。
+- `T&` 可以在 `T: Sendable` 时作为参数、result 或 capture 跨 Domain。引用可以保存或返回，但其
+  使用期限不能超过来源 owner；跨 Domain 不会放宽 owner move、drop 或 reborrow 约束。
+- `T&!` 不直接跨 Domain。调用需要 `T&` 时可以从 `T&!` 自动建立 shared reborrow；新借用存活期间
+  原 `T&!` 保持冻结。
 - tuple、定长 array、optional、errorable result、Task 和用户声明的 aggregate 会逐层检查其
   payload。任一组成部分不满足 `Sendable`，外层也不满足。
 - raw pointer 不携带 ownership 或 lifetime 证明，不会自动满足 `Sendable`。低层共享必须留在
@@ -964,7 +967,7 @@ lifetime：
 `unsafe extend T: Sendable;` 表示实现者显式承担 `T` 的跨 Domain 安全责任。该形式只允许用于
 `Sendable`，并跳过 aggregate 字段的递归 Sendable 验证；普通 conformance 的结构验证保持不变。
 它适用于内部使用 raw pointer、但已自行保证同步、ownership、地址稳定性和释放顺序的 handle。
-该声明不会改变字段类型本身的 conformance，也不会让普通 borrow 获得跨 Domain lifetime。
+该声明不会改变字段类型本身的 conformance，也不会改变普通 borrow 的 lifetime。
 
 `Atomic<T>` 在 `T` 是受支持的原子值时提供同步边界。`Mutex<T>` 在 `T: Sendable` 时可以作为
 跨 Domain 的同步对象，但 `Mutex<T>` 本体地址固定，应通过 `Mutex<T>^` 转移 owner handle：
@@ -979,7 +982,8 @@ Task(domain: global_domain) {
 ```
 
 domain-bound owned closure `Fn<async [domain] (...)>^` 在构造时检查全部 capture。值 capture
-遵守相同的 move/copy 与 `Sendable` 规则，borrow capture 不能借闭包 owner 跨 Domain 逃逸。
+遵守相同的 move/copy 与 `Sendable` 规则；`T&` capture 的有效期由 closure environment 的 lifetime
+shape 传播，不能活过来源 owner。
 
 普通 async 调用是隐式挂起点，表达式类型仍是函数声明的返回类型。要提前启动并获得
 handle，使用 Task initializer：
