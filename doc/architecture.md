@@ -43,6 +43,12 @@ driver/cli -> pipeline.compile
 runtime scheduler 维护 Domain identity、serial gate、Task/continuation 生命周期；
 `system.thread` 再把统一 Queue、Group、Mutex、main queue 和启动线程语义映射到平台 provider。
 
+编译器内部通过 `support/domains.jiang` 提供两个执行身份：`domains.coordinator` 使用独立的
+串行 Executor，`domains.worker` 使用有界 custom Executor。worker limit 必须在第一次使用前配置。
+Domain 只提供调度能力，不持有 `CompilerStore`，也不隐式保证 compiler facts 可跨线程访问；具体阶段
+必须在提交 Job 前明确共享状态边界。编译器不复用 `main_domain`，避免把 CLI 调度绑定到进程启动线程
+和 main queue pump。
+
 当前 root module 加载前会先加载 `src/core.jiang`。core 源码声明 compiler-known
 trait、builtin named type 的 namespace 外壳、body-less builtin trait implementation，以及 `$`
 intrinsic 接口。std 和用户 package 仍走普通 module graph；core package 不能由用户直接 import。

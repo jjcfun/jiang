@@ -1,0 +1,123 @@
+// 编译器内部的协调与并发 worker Domain。
+//
+// coordinator 提供独立的串行执行身份；worker 在平台并发队列前限制 drain 数量。
+// 具体 compiler phase 的共享状态边界由调用方负责，Domain 本身不持有 CompilerStore。
+
+import thread = "../system/thread.jiang";
+import std;
+
+UInt32 configured_limit! = UInt32(1);
+Bool worker_created! = false;
+
+public () configure_worker_limit(UInt32 limit) {
+    assert(limit > UInt32(0));
+    if (worker_created) {
+        assert(configured_limit == limit);
+        return;
+    }
+    configured_limit = limit;
+}
+
+struct WorkerExecutor: !Movable, Executor {
+    UInt32 limit;
+    thread.Queue queue;
+    thread.Group worker_group;
+    Mutex<WorkerExecutorState> state;
+
+    init(self, UInt32 limit) {
+        assert(limit > UInt32(0));
+        self.limit = limit;
+        self.queue = thread.concurrent_queue();
+        self.worker_group = thread.create_group();
+        self.state = Mutex<WorkerExecutorState>(WorkerExecutorState());
+        assert(thread.queue_handle(self.queue) != null);
+        assert(thread.group_handle(self.worker_group) != null);
+    }
+
+    () enqueue(Self& self, ExecutorJob job) {
+        Bool start_worker = self.push(job);
+        if (!start_worker) { return; }
+        RawFn<(), Void*> callback = drain_worker_executor;
+        Bool submitted = unsafe {
+            thread.enqueue(
+                self.worker_group,
+                self.queue,
+                self$.ptr()$.as(Void*),
+                callback$.as(Void*)
+            )
+        };
+        if (!submitted) { drain_worker_executor(unsafe { self$.ptr()$.as(Void*) }); }
+    }
+
+    Bool push(Self& self, ExecutorJob job) {
+        MutexGuard<WorkerExecutorState> locked = self.state.lock();
+        WorkerExecutorState&! state = locked.get();
+        state.pending.append(job);
+        if (state.workers >= self.limit) { return false; }
+        state.workers = state.workers + UInt32(1);
+        return true;
+    }
+
+    ExecutorJob? take(Self& self) {
+        MutexGuard<WorkerExecutorState> locked = self.state.lock();
+        WorkerExecutorState&! state = locked.get();
+        if (state.pending.length() == 0) {
+            assert(state.workers > UInt32(0));
+            state.workers = state.workers - UInt32(1);
+            return null;
+        }
+        return state.pending.pop();
+    }
+
+    Bool run_one(Self& self) {
+        guard self.take() is .some(job) else { return false; }
+        job.run();
+        return true;
+    }
+
+    deinit(self) {
+        thread.wait_group(self.worker_group);
+        MutexGuard<WorkerExecutorState> locked = self.state.lock();
+        WorkerExecutorState& state = locked.get();
+        assert(state.pending.length() == 0);
+        assert(state.workers == UInt32(0));
+        thread.destroy_group(self.worker_group);
+        thread.destroy_queue(self.queue, true);
+    }
+}
+
+struct WorkerExecutorState: Movable {
+    UInt32 workers!;
+    std.Vector<ExecutorJob> pending;
+
+    init(self) {
+        self.workers = UInt32(0);
+        self.pending = std.Vector<ExecutorJob>();
+    }
+}
+
+@life()
+() drain_worker_executor(Void* context) {
+    WorkerExecutor& executor = unsafe { context$.as(WorkerExecutor&) };
+    while (executor.run_one()) {}
+}
+
+struct WorkerDomain: Domain<kind = .concurrent> {
+    associated ExecutorType = WorkerExecutor;
+
+    WorkerExecutor make_executor(Self& self) {
+        worker_created = true;
+        WorkerExecutor(configured_limit)
+    }
+}
+
+struct CoordinatorDomain: Domain<kind = .serial> {
+    associated ExecutorType = SerialExecutor;
+
+    SerialExecutor make_executor(Self& self) {
+        SerialExecutor()
+    }
+}
+
+public const CoordinatorDomain coordinator = CoordinatorDomain();
+public const WorkerDomain worker = WorkerDomain();
