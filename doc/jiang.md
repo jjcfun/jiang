@@ -979,9 +979,9 @@ RawFn<Int, Int, Int> add = { left, right => left + right };
 RawFn<Int> answer = { => 42 };
 
 Int base = 10;
-Fn<Int, Int> add_base = { [_ captured = base] value => value + captured };
-Fn<Int> borrowed = { [ref value = base] => value$.get() };
-Fn<Int>^ owned = new { [_ captured = base] => captured };
+Fn<Int, Int> add_base = { [base] value => value + base };
+Fn<Int> borrowed = { [ref base] => base$.get() };
+Fn<Int>^ owned = new { [base] => base };
 ```
 
 lambda 规则：
@@ -993,8 +993,13 @@ lambda 规则：
 - `=>` 后可以写表达式或多条 block statement
 - `RawFn` 不携带 environment，因此只接受非捕获 lambda
 - `Fn` 是 callable view，可以捕获外层 local；`Fn^` 是可移动的 owned heap closure
-- 可选 capture list 写在参数之前，值 capture 遵守 copy/move，`ref` / `ref!` capture 遵守 borrow/lifetime
-- 未列入 capture list 的外层 local 仍按默认捕获规则处理
+- 可选 capture list 写在参数之前：`[name]` 按值 copy/move，`[ref name]` / `[ref! name]` 分别建立
+  共享/独占借用
+- capture list 只接受已有 local 的同名捕获，不支持类型、重命名或表达式
+- `[ref name]` / `[ref! name]` 复用 `name$.ref()` / `name$.mut_ref()`；已有 reference handle 的
+  reborrow 是幂等的，不会形成嵌套 reference
+- 未列入 capture list 的普通 value、owner 和 reference local 按共享引用/view 捕获；raw pointer
+  按值捕获，`T*!` 保留写入 pointee 的能力；写入外层 binding 必须显式使用 `ref!`
 
 当前不支持：
 

@@ -162,64 +162,48 @@ RawFn<Int, Int> add_one = { value => value + 1 };    // ok
 RawFn<Int, Int> bad_add = { value => value + base }; // fail: captures environment
 ```
 
-显式 environment 字段初始化列表写在参数之前：
+显式 capture list 写在参数之前，只选择已有 local 及其捕获方式：
 
 ```jiang
+Config config = load_config();
 Fn<Int, Int> f = {
-    [value = old_value$.move(), Config& config = config$.ref()]
-    arg => arg + value + config.offset
+    [old_value, ref config]
+    arg => arg + old_value + config.offset
 };
 ```
 
-捕获列表不是一套独立的 `move` / `ref` 小语言，而是 closure environment 字段初始化列表。
-每个 item 的形式接近局部变量初始化：
+capture list 不是局部变量声明或 initializer 语法，只保留三种形式：
 
 ```jiang
-alias = expr
-_ alias = expr
-_ alias! = expr
-Type alias = expr
-ref alias = expr
-ref! alias = expr
-ref _ alias = expr
-ref! _ alias = expr
+[value]       // 按值：Copyable copy，其他 Movable move
+[ref value]   // 共享借用
+[ref! value]  // 独占借用
 ```
 
-`expr` 在闭包创建时求值，结果保存为 environment 字段 `alias`；body 中的 `alias` 解析到
-这个字段。`alias = expr` 等价于 binding pattern 的裸名字绑定；也可以用 `_ alias = expr`
-显式表示类型推断。`ref alias` / `ref! alias` 分别是 `ref _ alias` /
-`ref! _ alias` 的简写。移动、借用和复制都由普通表达式语义表达：
+`[ref value]` 与 `_ value = value$.ref()` 使用同一语义，`[ref! value]` 与
+`_ value = value$.mut_ref()` 使用同一语义。已有 reference handle 的 reborrow 是幂等的，
+因此 `T&!` 可以通过 `[ref! value]` 捕获为 `T&!`，不会形成嵌套的 `T&!&!`。
+
+capture 名字在闭包内保持不变。需要捕获表达式结果、快照或不同名字时，先使用普通 local：
 
 ```jiang
-(arg) [
-    owned = old_owned$.move(),
-    ref borrowed = old_value,
-    Int snapshot = counter
-] => {
-    arg + snapshot
-}
+Int snapshot = counter;
+Config config = load_config();
+Fn<Int, Int> f = { [snapshot, ref config] arg => arg + snapshot + config.offset };
 ```
 
-未列入列表的外层 local 仍按默认规则自动捕获。默认规则是“统一引用捕获”：
+未列入列表的外层 local 默认按共享引用/view 捕获，raw pointer 是按值例外：
 
-- 只读取的外层 local 默认按共享引用捕获，environment 保存 `T&`。
-- 写入外层可写 storage 时默认按可变引用捕获，environment 保存 `T&!`，并参与唯一借用检查。
-- 内建标量、enum、struct、union、tuple 等类型都遵循同一条默认规则，不做隐式快照。
-- `T*`、`T*!`、`T&` 这类 non-owning handle 默认捕获 handle 值，不再额外生成
-  `Ref<handle>`。
-- `T^` 这类 owning handle 不做默认捕获；需要写成 `field = value$.move()` 这类显式
-  environment 字段初始化，owner capture/drop 语义后续再完整设计。
+- 普通 value 和 owner handle 借用其 binding storage，不发生隐式 copy/move。
+- raw pointer 按值复制；`T*!` 保留写入 pointee 的能力，但不能修改外层 pointer binding。
+- 已有 `T&` / slice 保持共享 view；`T&!` 隐式 reborrow 为 `T&`，不转移唯一 capability。
+- 隐式 capture 不能写入外层 storage；需要写入时显式写 `[ref! value]`。
+- 需要把值或 owner 移入 environment 时显式写 `[value]`。
 
 闭包体里对隐式捕获名字的自动解引用不是按 env field 类型临时猜测，而是 capture metadata 的
-一部分。只有普通 value 被默认捕获成 slot reference 时，body 使用原名才自动解引用；如果外层
-变量本身就是 `T&`、`T*`、`T*!` 这类 handle，默认捕获的是 handle 值，body 使用原名仍是原
-handle 类型。
-
-显式 capture alias 不会把 initializer 中的 source 名字注册成 body 里的等价名字。例如
-`[_ snapshot = base]` 只定义 `snapshot` 字段；如果 body 里还直接使用外层 `base`，`base`
-仍按默认规则生成独立的隐式引用捕获。
-
-基础闭环可以先实现默认捕获，再逐步补齐显式字段初始化列表的 owner capture 和 drop 语义。
+一部分。普通 value 的 environment 字段保存 shared reference，body 使用原名时自动访问原 place；
+已有 shared borrow 或 raw pointer 则直接保存 handle value。显式 capture 与参数使用同一局部 binding
+namespace，不能重名。
 
 ## RawFn 和 Fn 转换
 
@@ -311,17 +295,15 @@ extern fn qsort(
 
 默认捕获必须能从闭包 body 和 expected type 推导出安全 environment：
 
-- 只读取的外层 local 保存共享引用，闭包值不能活过被捕获 storage 的生命周期。
-- 写入外层可写 storage 保存 `T&!`，闭包创建和调用都要满足唯一借用约束。
-- owner move 只能通过显式字段初始化进入 environment，不能由默认捕获隐式发生。
+- 普通 value 和 owner local 的隐式捕获是共享引用，闭包值不能活过被捕获 storage 的生命周期；
+  raw pointer 是不携带语言级 lifetime 的按值例外。
+- 写入外层可写 storage 必须显式 `[ref! value]`，并满足唯一借用约束。
+- owner move 只能通过显式 `[value]` 进入 environment，不能由默认捕获隐式发生。
 
-因此基础闭环里，非 owner capture 的闭包不能拥有外层对象；它只能保存值副本或借用外层
-storage。
+显式 `[value]` 可以让闭包拥有值副本或被移动的值；隐式 capture 只借用外层 storage。
 
 后续能力可以再加入：
 
-- environment 字段初始化列表：`[_ field = expr, Type field = expr]`。
-- owner capture：通过 `field = value$.move()` 移动 owner 进 environment，并在闭包销毁时 drop。
 - 精确字段捕获：只捕获被使用的字段，而不是整个 local。
 
 owner capture 牵涉 consuming call、drop 和闭包重复调用规则，应该和 `FnOnce` 或等价能力
@@ -366,7 +348,7 @@ Int value = f();
 
 - `return new { => 1 }` 没有外部 borrow，可以通过。
 - `return new { => local }` 隐式捕获 `local&`，如果 `local` 是当前栈局部，则生命周期检查失败。
-- `return new { [value = value$.move()] => value }` 把 owner 移入 heap env，env 随 `Fn^` owner 存活。
+- `return new { [value] => value }` 把 owner 移入 heap env，env 随 `Fn^` owner 存活。
 
 ```jiang
 Fn<Int>^ make_bad() {
@@ -429,12 +411,12 @@ sem.Lambda {
 }
 ```
 
-params 和显式 captures 不能同名；显式 capture alias 也占用这个 namespace。resolve 结束后，
+params 和显式 captures 不能同名。resolve 结束后，
 全局/成员 namespace 仍保存在 `NamespaceStore`，但 lambda 内的参数、显式 capture local 和普通
 local 都已经落成具体 `DefId` / `sem.LocalId`，后续阶段不再通过字符串名字查找它们。
 
 `sem.LambdaParam` 和 `sem.LambdaCapture` 本身不直接保存 type。type check 从 expected callable type
-绑定参数类型，从 capture initializer 或显式 type ref 绑定 capture alias 类型，统一写入对应
+绑定参数类型，并从显式 capture 的同名 source local 绑定 capture 类型，统一写入对应
 `sem.Local.def_id` 的 `def_type`：
 
 ```text
@@ -448,14 +430,14 @@ local def 和 capture type：
 
 ```text
 lambda.function_def -> [
-  { kind: explicit, source_def: base?, local_def: snapshot, type: Int, field: 0, deref_on_use: false },
+  { kind: explicit, source_def: base, local_def: base, type: Int, field: 0, deref_on_use: false },
   { kind: implicit, source_def: name, local_def: name, type: String&, field: 1, deref_on_use: true },
 ]
 ```
 
 隐式 capture 由 lambda body 中指向外层 local/parameter 的 `def_ref` 推导，按首次出现顺序去重。
-显式 capture 的 `source_def` 只描述 initializer 来源，不参与 body 中外层 `def_ref` 到 env field 的匹配；
-只有隐式 capture 用 `source_def` 匹配外层名字。
+显式 capture 的 `source_def` 和 `local_def` 分别表示同名外层 source 与闭包内 binding；只有隐式
+capture 用 `source_def` 匹配闭包体中的外层 `def_ref`。
 当前 Semantic Model 不把这些 `def_ref` 重写成新的 capture local；type check、JIL lowering 和 borrow check
 通过 `lambda_captures` side table 把它们映射到 env field。
 
@@ -513,8 +495,8 @@ environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 
 - [x] `Fn(raw)` 通过 trampoline 适配 receiver-first 调用约定。
 - [x] `Fn<...>` 不能转换成 `RawFn<...>`。
 - [x] Semantic Model 使用 `sem.Lambda` 平铺记录 params 和显式 captures。
-- [x] lambda params 和显式 capture alias 同名时报错。
-- [x] 显式 capture alias 通过 initializer/type ref 绑定 `def_type`。
+- [x] lambda params 和显式 capture 同名时报错。
+- [x] 显式 capture 只接受已有 local 的同名 value/ref/ref! 模式。
 - [x] type check side table 记录显式和隐式 capture metadata。
 - [x] lambda body 按 expected `RawFn` / `Fn` 的 unsafe、async effects 检查。
 - [x] async lambda 根据 expected `Fn<async ...>` 类型确定 effect，不增加重复的表达式前缀。
@@ -525,10 +507,10 @@ environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 
 - [x] `self.method` 产生带显式 receiver 参数的 `RawFn<...>`。
 - [x] 需要绑定 receiver 时必须写显式 lambda。
 - [x] 没有 expected type 的 lambda initializer 报错。
-- [x] 隐式捕获统一按引用捕获。
-- [x] 标量 `T name!` 捕获后可读到外层 storage 的后续写入。
+- [x] 普通 value 与 owner 隐式按共享引用捕获，raw pointer 按值捕获。
+- [x] 隐式捕获只提供共享读取，写入必须显式使用 `ref!`。
 - [x] 共享引用捕获外层非平凡 local 并立即调用。
-- [x] 可变捕获修改外层 `!` storage。
+- [x] 显式可变捕获修改外层 `!` storage。
 - [x] 裸 `Fn` 返回导致 stack env 流出当前函数时报错。
 - [x] 裸 `Fn` 保存到返回 aggregate 导致 stack env 流出当前函数时报错。
 - [x] 捕获闭包传给只调用不保存的参数可以通过。

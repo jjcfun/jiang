@@ -621,8 +621,8 @@ lambda_capture_list
             <- "[" lambda_capture_item ("," lambda_capture_item)* ","? "]"
 
 lambda_capture_item
-            <- type name "=" expr
-             / name "=" expr
+            <- "ref" "!"? name
+             / name
 
 range_expr  <- logic_or_expr ".." logic_or_expr
              / logic_or_expr
@@ -701,9 +701,10 @@ trailing_closure
 
 `lambda_expr` 必须有 expected callable type。参数类型由 expected type 提供；
 参数列表只写绑定名。
-`lambda_capture_list` 是可选的 environment 字段初始化列表，每一项形如 `field = expr` 或
-`Type field = expr`。这些 initializer 在闭包创建时求值；未列入列表的外层 local 仍可按
-默认捕获规则处理：只读 local 按共享引用捕获，写入外层 `!` storage 时按可变引用捕获。
+`lambda_capture_list` 是可选的捕获方式列表，只接受已有 local 的同名捕获：`name` 按值
+copy/move，`ref name` 建立共享借用，`ref! name` 建立独占借用。列表中不能声明类型、重命名或
+执行表达式；需要捕获表达式结果时应先声明普通 local。未列入列表的外层 local 统一按共享引用
+捕获；写入外层 storage 必须显式使用 `ref!`。
 `RawFn<...>` expected type 下不允许任何捕获，也不允许 capture list。
 
 调用的最后一个 callable 参数可以写成尾随闭包：`run { work() }` 或

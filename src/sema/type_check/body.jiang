@@ -59,8 +59,6 @@ public struct BodyCheck: Movable {
     table.HashTable<qid.DefId, Int> body_states!;
     list.ArrayList<LocalInitBinding> local_init_states!;
     Int assignment_target_depth!;
-    Int lambda_capture_initializer_depth!;
-    Bool allow_implicit_owner_capture!;
     Int await_depth!;
     Int await_task_count!;
     sem.NodeId? catch_value_call!;
@@ -75,8 +73,6 @@ public struct BodyCheck: Movable {
         self.body_states = table.HashTable<qid.DefId, Int>();
         self.local_init_states = list.ArrayList<LocalInitBinding>();
         self.assignment_target_depth = 0;
-        self.lambda_capture_initializer_depth = 0;
-        self.allow_implicit_owner_capture = false;
         self.await_depth = 0;
         self.await_task_count = 0;
         self.catch_value_call = null;
@@ -767,7 +763,7 @@ public struct BodyCheck: Movable {
         qid.TypeId expected_type,
         types.FunctionType function_type
     ) {
-        self.check_lambda_capture_initializers(lambda);
+        self.check_lambda_capture_sources(lambda);
         Bool has_env = self.lambda_has_env(lambda);
         if (function_type.params.length != lambda.param_count) {
             self.type_ops.add_node_error(
@@ -854,7 +850,7 @@ public struct BodyCheck: Movable {
         return self.state.store.types.opaque_pointer_type(span);
     }
 
-    () check_lambda_capture_initializers(self, sem.Lambda lambda) {
+    () check_lambda_capture_sources(self, sem.Lambda lambda) {
         Int index! = 0;
         while (index < lambda.captures.length) {
             self.check_node(lambda.captures[index].value);
@@ -885,7 +881,7 @@ public struct BodyCheck: Movable {
             sem.Local local = self.local_for_lambda_capture(lambda_def, capture.local_id);
             captures.add(typeck_store.LambdaCaptureInfo(
                 kind: .explicit_capture,
-                source_def: self.lambda_capture_initializer_source_def(capture.value),
+                source_def: self.lambda_capture_source_def(capture.value),
                 local_def: local.def_id,
                 type_id: self.type_for_lambda_capture(local, capture.value),
                 field_index: captures.len(),
@@ -895,13 +891,8 @@ public struct BodyCheck: Movable {
         }
     }
 
-    qid.DefId? lambda_capture_initializer_source_def(self, sem.NodeId value) {
+    qid.DefId? lambda_capture_source_def(self, sem.NodeId value) {
         sem.Node node = self.state.model.node(value);
-        if (node.data is .implicit_call(call)) {
-            if (call.op == .move) {
-                return self.lambda_capture_initializer_source_def(call.base);
-            }
-        }
         guard node.data is .name_ref(name_ref) else { return null; }
         guard name_ref is .def_ref(def_id) else { return null; }
         return def_id;
@@ -920,13 +911,21 @@ public struct BodyCheck: Movable {
             return local_type;
         }
         if (self.state.results.node_type(value) is .some(value_type)) {
-            return self.local_binding_type(local, self.type_ops.read_value_type(value_type));
+            return self.local_binding_type(local, self.explicit_capture_value_type(value_type));
         }
-        if (self.lambda_capture_initializer_source_def(value) is .some(source_def)) {
+        if (self.lambda_capture_source_def(value) is .some(source_def)) {
             qid.TypeId source_type = self.type_ops.type_for_def(source_def);
-            return self.local_binding_type(local, self.type_ops.read_value_type(source_type));
+            return self.local_binding_type(local, self.explicit_capture_value_type(source_type));
         }
         return local_type;
+    }
+
+    qid.TypeId explicit_capture_value_type(self, qid.TypeId source_type) {
+        types.TypeInfo info = self.state.store.types.get(source_type);
+        if (info.is_mutable && info.data is .handle_type(_)) {
+            return source_type;
+        }
+        return self.type_ops.read_value_type(source_type);
     }
 
     Bool lambda_body_has_implicit_capture(self, qid.DefId lambda_def, sem.NodeId body) {
@@ -1217,7 +1216,7 @@ public struct BodyCheck: Movable {
         guard name_ref is .def_ref(source_def) else { return; }
         if (self.lambda_capture_info_contains_source(captures, source_def)) { return; }
         qid.TypeId source_type = self.type_ops.type_for_def(source_def);
-        qid.TypeId capture_type = self.implicit_lambda_capture_type(node_id, source_def);
+        qid.TypeId capture_type = self.implicit_lambda_capture_type(source_def);
         captures.add(typeck_store.LambdaCaptureInfo(
             kind: .implicit_capture,
             source_def: source_def,
@@ -1228,39 +1227,38 @@ public struct BodyCheck: Movable {
         ));
     }
 
-    qid.TypeId implicit_lambda_capture_type(self, sem.NodeId node_id, qid.DefId source_def) {
+    qid.TypeId implicit_lambda_capture_type(self, qid.DefId source_def) {
         qid.TypeId source_type = self.type_ops.type_for_def(source_def);
         if (self.type_ops.is_invalid_type(source_type)) {
             return source_type;
         }
-        if (self.type_is_owner_pointer(source_type)) {
-            if (self.allow_implicit_owner_capture) { return source_type; }
-            self.type_ops.add_node_error(
-                node_id,
-                "owner value capture requires explicit capture initializer",
-                "lambda_implicit_owner_capture"
-            );
-            return self.state.store.types.invalid_type();
-        }
-        if (self.handle_borrow_returns_self(source_type)) {
+        if (self.implicit_capture_copies_raw_pointer(source_type)) {
             return source_type;
         }
-        if (self.def_has_mutable_binding(source_def)) {
-            return self.type_ops.borrow_binding_type_for_element(source_type, true);
+        qid.TypeId value_type = self.type_ops.read_value_type(source_type);
+        if (self.implicit_capture_reuses_borrowed_handle(value_type)) {
+            return value_type;
         }
-        return self.type_ops.borrow_reference_type_for_element(source_type);
+        return self.type_ops.borrow_reference_type_for_element(value_type);
     }
 
     Bool implicit_lambda_capture_derefs_on_use(self, qid.TypeId source_type) {
         if (self.type_ops.is_invalid_type(source_type)) { return false; }
-        if (self.type_is_owner_pointer(source_type)) { return false; }
-        return !self.handle_borrow_returns_self(source_type);
+        if (self.implicit_capture_copies_raw_pointer(source_type)) { return false; }
+        qid.TypeId value_type = self.type_ops.read_value_type(source_type);
+        return !self.implicit_capture_reuses_borrowed_handle(value_type);
     }
 
-    Bool type_is_owner_pointer(self, qid.TypeId type_id) {
+    Bool implicit_capture_copies_raw_pointer(self, qid.TypeId type_id) {
         types.TypeInfo info = self.state.store.types.get(type_id);
         guard info.data is .handle_type(handle) else { return false; }
-        return handle.kind == .owner_pointer;
+        return handle.kind == .raw_pointer;
+    }
+
+    Bool implicit_capture_reuses_borrowed_handle(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        return handle.kind == .reference || handle.kind == .slice;
     }
 
     Bool lambda_capture_info_contains_source(
@@ -1453,68 +1451,15 @@ public struct BodyCheck: Movable {
     }
 
     () bind_lambda_capture_type(self, sem.Local local, sem.NodeId value) {
-        qid.TypeId value_type! = self.check_lambda_capture_initializer(value);
+        qid.TypeId value_type = self.check_node(value);
         if (local.borrow_binding) {
             self.bind_borrow_binding_type(local, value, value_type);
             return;
         }
-        if (local.type_ref is .some(type_ref)) {
-            if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
-                self.type_ops.bind_def_type(
-                    local.def_id,
-                    self.type_for_inferred_lambda_capture(local, value, value_type)
-                );
-                return;
-            }
-            qid.TypeId local_type = self.type_ops.check_value_type_ref(type_ref);
-            value_type = self.check_lambda_capture_initializer_expected(value, local_type);
-            self.type_ops.expect_value_assignable(
-                value,
-                local_type,
-                value_type,
-                "capture initializer type does not match declared type",
-                "capture_initializer_type_mismatch"
-            );
-            self.type_ops.bind_def_type(local.def_id, self.local_binding_type(local, local_type));
-            return;
-        }
-        self.type_ops.bind_def_type(local.def_id, self.type_for_inferred_lambda_capture(local, value, value_type));
-    }
-
-    qid.TypeId check_lambda_capture_initializer(self, sem.NodeId value) {
-        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth + 1;
-        qid.TypeId value_type = self.check_node(value);
-        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth - 1;
-        return value_type;
-    }
-
-    qid.TypeId check_lambda_capture_initializer_expected(self, sem.NodeId value, qid.TypeId expected) {
-        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth + 1;
-        qid.TypeId value_type = self.check_node_expected(value, expected);
-        self.lambda_capture_initializer_depth = self.lambda_capture_initializer_depth - 1;
-        return value_type;
-    }
-
-    qid.TypeId type_for_inferred_lambda_capture(self, sem.Local local, sem.NodeId value, qid.TypeId value_type) {
-        if (self.lambda_capture_initializer_source_def(value) is .some(source_def)) {
-            qid.TypeId source_type = self.type_ops.type_for_def(source_def);
-            if (!self.type_ops.is_invalid_type(source_type)) {
-                return self.local_binding_type(local, self.type_ops.read_value_type(source_type));
-            }
-        }
-        return self.local_binding_type(local, self.type_ops.read_value_type(value_type));
+        self.type_ops.bind_def_type(local.def_id, self.explicit_capture_value_type(value_type));
     }
 
     () bind_borrow_binding_type(self, sem.Local local, sem.NodeId initializer, qid.TypeId value_type) {
-        if (self.type_ops.is_reference_type(value_type)) {
-            self.type_ops.add_node_error(
-                initializer,
-                "borrow binding source is already a reference",
-                "borrow_binding_ref_source"
-            );
-            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
-            return;
-        }
         if (!self.is_borrow_binding_source(initializer)) {
             self.type_ops.add_node_error(initializer, "borrow requires a place expression", "borrow_requires_place");
             self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
@@ -1529,11 +1474,7 @@ public struct BodyCheck: Movable {
             self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
             return;
         }
-        qid.TypeId element_type = self.borrow_binding_element_type(local, initializer, value_type);
-        self.type_ops.bind_def_type(
-            local.def_id,
-            self.type_ops.borrow_binding_type_for_element(element_type, local.mutable_borrow)
-        );
+        self.type_ops.bind_def_type(local.def_id, self.borrow_ref_result_type(value_type, local.mutable_borrow));
     }
 
     sem.Local local_for_lambda_param(self, qid.DefId owner_def, sem.LocalId local_id) {
@@ -2268,12 +2209,7 @@ public struct BodyCheck: Movable {
         if (self.state.results.def_type(function_def) != null) { return; }
         list.ArrayList<typeck_store.LambdaCaptureInfo> captures! =
             list.ArrayList<typeck_store.LambdaCaptureInfo>();
-        Bool saved_owner_capture = self.allow_implicit_owner_capture;
-        // async block 的 environment 由新 Task 独占；owner capture 因而是一次隐式 move。
-        // 普通 Fn lambda 仍要求显式 capture initializer，避免闭包值构造时隐藏所有权转移。
-        self.allow_implicit_owner_capture = true;
         self.collect_implicit_lambda_captures(function_def, node_id, captures$.ref());
-        self.allow_implicit_owner_capture = saved_owner_capture;
         self.state.results.record_lambda_captures(function_def, captures$.ref());
         self.check_task_lambda_captures(node_id, function_def);
         list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>(1);
@@ -2416,7 +2352,7 @@ public struct BodyCheck: Movable {
             return;
         }
         if (node.data is .lambda_expr(lambda)) {
-            self.check_cross_domain_lambda_capture_initializers(lambda, local_defs);
+            self.check_cross_domain_lambda_capture_sources(lambda, local_defs);
             return;
         }
         self.check_cross_domain_expr_tail(node_id, node, local_defs);
@@ -2526,7 +2462,7 @@ public struct BodyCheck: Movable {
         }
     }
 
-    () check_cross_domain_lambda_capture_initializers(
+    () check_cross_domain_lambda_capture_sources(
         self,
         sem.Lambda lambda,
         list.ArrayList<sem.LocalId>& local_defs
@@ -2931,6 +2867,9 @@ public struct BodyCheck: Movable {
                 return body.local(local_id).mutable_binding;
             }
             if (name_ref is .def_ref(def_id)) {
+                if (self.lambda_name_ref_is_capture(place_id.owner_def, name_ref)) {
+                    return false;
+                }
                 return self.def_has_mutable_binding(def_id);
             }
             return false;
@@ -4584,7 +4523,12 @@ public struct BodyCheck: Movable {
             }
             self.ensure_const_dependency_checked(def_id);
             self.state.results.select_member(node_id, def_id);
-            return self.type_ops.type_for_def(def_id);
+            qid.TypeId type_id = self.type_ops.type_for_def(def_id);
+            if (self.lambda_name_ref_is_capture(node_id.owner_def, name_ref)) {
+                if (self.implicit_capture_copies_raw_pointer(type_id)) { return type_id; }
+                return self.type_ops.read_value_type(type_id);
+            }
+            return type_id;
         }
         if (name_ref is .local(local_id)) {
             if (self.assignment_target_depth == 0) {
@@ -4800,33 +4744,6 @@ public struct BodyCheck: Movable {
         );
         self.check_task_binding_mode(node_id, local, local_type);
         self.type_ops.bind_def_type(local.def_id, local_type);
-    }
-
-    qid.TypeId borrow_binding_element_type(self, sem.Local local, sem.NodeId initializer, qid.TypeId value_type) {
-        guard local.type_ref is .some(type_ref) else {
-            return self.type_ops.read_value_type(value_type);
-        }
-        if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
-            return self.type_ops.read_value_type(value_type);
-        }
-        if (self.type_ops.type_ref_is_inferred_mutable(type_ref)) {
-            self.type_ops.add_node_error(
-                initializer,
-                "borrow binding type does not match source storage type",
-                "borrow_binding_type_mismatch"
-            );
-            return self.state.store.types.invalid_type();
-        }
-        qid.TypeId element_type = self.type_ops.check_value_type_ref(type_ref);
-        qid.TypeId source_type = self.type_ops.read_value_type(value_type);
-        if (!self.type_ops.same_type(element_type, source_type)) {
-            self.type_ops.add_node_error(
-                initializer,
-                "borrow binding type does not match source storage type",
-                "borrow_binding_type_mismatch"
-            );
-        }
-        return element_type;
     }
 
     qid.TypeId check_destructure(self, sem.NodeId node_id, sem.Destructure destructure) {
@@ -6868,10 +6785,7 @@ public struct BodyCheck: Movable {
             effects,
             .closure
         );
-        Bool saved_owner_capture = self.allow_implicit_owner_capture;
-        self.allow_implicit_owner_capture = true;
         qid.TypeId lambda_type = self.check_node_expected(parts.closure, expected_lambda);
-        self.allow_implicit_owner_capture = saved_owner_capture;
         if (!self.type_ops.is_invalid_type(lambda_type)) {
             self.bind_task_initializer_function(node_id, parts.closure);
         }
@@ -6922,7 +6836,7 @@ public struct BodyCheck: Movable {
         guard closure_node.data is .lambda_expr(lambda) else {
             return self.state.store.types.invalid_type();
         }
-        self.check_lambda_capture_initializers(lambda);
+        self.check_lambda_capture_sources(lambda);
         if (lambda.param_count != 0) {
             self.type_ops.add_node_error(
                 closure_id,
@@ -6931,11 +6845,8 @@ public struct BodyCheck: Movable {
             );
             return self.state.store.types.invalid_type();
         }
-        Bool saved_owner_capture = self.allow_implicit_owner_capture;
-        self.allow_implicit_owner_capture = true;
         self.bind_lambda_capture_types(lambda.function_def, lambda);
         self.record_lambda_captures(lambda.function_def, lambda);
-        self.allow_implicit_owner_capture = saved_owner_capture;
         self.check_task_lambda_captures(closure_id, lambda.function_def);
         self.check_cross_domain_lambda_captures(closure_id, effects, lambda.function_def);
         types.EffectSet saved_effects = self.current_effects;
@@ -7820,13 +7731,7 @@ public struct BodyCheck: Movable {
             self.check_call_effects(node_id, types.EffectSet(has_unsafe: true));
             return self.state.store.types.raw_pointer_type(base_type, token.Span());
         }
-        if (self.owner_pointer_borrow_type(base_type) is .some(ref_type)) {
-            return ref_type;
-        }
-        if (self.handle_borrow_returns_self(base_type)) {
-            return base_type;
-        }
-        return self.type_ops.borrow_reference_type_for_element(base_type);
+        return self.borrow_ref_result_type(base_type, false);
     }
 
     qid.TypeId check_mutable_borrow_builtin(self,
@@ -7844,15 +7749,24 @@ public struct BodyCheck: Movable {
             self.type_ops.add_node_error(node_id, "mutable borrow requires writable storage", "immutable_borrow_source");
             return self.state.store.types.invalid_type();
         }
-        qid.TypeId element! = self.type_ops.read_value_type(base_type);
-        qid.TypeId result!;
         if (raw_pointer) {
             self.check_call_effects(node_id, types.EffectSet(has_unsafe: true));
-            element = self.pointer_projection_element_type(base_type);
-            result = self.state.store.types.raw_pointer_type(element, token.Span());
-        } else {
-            result = self.type_ops.borrow_reference_type_for_element(element);
+            qid.TypeId element = self.pointer_projection_element_type(base_type);
+            qid.TypeId result = self.state.store.types.raw_pointer_type(element, token.Span());
+            return self.state.store.types.mutable_type(result, token.Span());
         }
+        return self.borrow_ref_result_type(base_type, true);
+    }
+
+    qid.TypeId borrow_ref_result_type(self, qid.TypeId base_type, Bool mutable_borrow) {
+        if (!mutable_borrow) {
+            if (self.owner_pointer_borrow_type(base_type) is .some(ref_type)) { return ref_type; }
+            if (self.handle_borrow_returns_self(base_type)) { return base_type; }
+            return self.type_ops.borrow_reference_type_for_element(base_type);
+        }
+        if (self.type_ops.is_reference_type(base_type)) { return base_type; }
+        qid.TypeId element = self.type_ops.read_value_type(base_type);
+        qid.TypeId result = self.type_ops.borrow_reference_type_for_element(element);
         return self.state.store.types.mutable_type(result, token.Span());
     }
 
@@ -8478,9 +8392,6 @@ public struct BodyCheck: Movable {
         }
         def.DefKind kind = self.state.store.defs.get(def_id).kind;
         if (kind == .field_def) { return false; }
-        if (self.lambda_capture_initializer_depth > 0) {
-            return kind == .local_def || kind == .parameter_def;
-        }
         if (kind != .global_def) {
             self.type_ops.add_node_error(target_id, "move requires a place expression", "move_requires_place");
             return false;

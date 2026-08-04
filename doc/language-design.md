@@ -872,16 +872,22 @@ Int base = 10;
 Fn<Int, Int> add_base = { value => value + base };
 ```
 
-lambda 可以用 `[...]` 显式初始化 capture environment；未列出的外层 local 仍按默认捕获规则
-处理：
+lambda 可以用 `[...]` 显式选择已有 local 的捕获方式；未列出的普通 value、owner 和 reference local
+按共享引用/view 捕获，raw pointer 按值捕获：
 
 ```jiang
-Fn<Int, Int> add_snapshot = { [_ captured = base] value => value + captured };
-Fn<Int> read = { [ref borrowed = base] => borrowed$.get() };
+Fn<Int, Int> add_snapshot = { [base] value => value + base };
+Fn<Int> read = { [ref base] => base$.get() };
 ```
 
-capture initializer 在闭包创建时求值。值 capture 遵守 Copyable/move 规则，`ref` / `ref!` capture
-遵守普通 borrow 和 lifetime 规则；逃逸的 owned `Fn^` 不能保存指向已结束栈帧的 borrow。
+`[name]` 按值捕获，遵守 Copyable/move 规则；`[ref name]` / `[ref! name]` 遵守普通 borrow 和
+lifetime 规则。capture list 不声明变量、类型或 initializer，也不接受表达式；需要快照或表达式
+结果时先声明普通 local。隐式捕获不能写入外层 storage；`T*!` 仍可在 `unsafe` 中写入 pointee。
+逃逸的 owned `Fn^` 不能保存指向已结束栈帧的 borrow。
+
+`[ref name]` 和 `[ref! name]` 分别复用 `name$.ref()` 与 `name$.mut_ref()` 的类型和 lowering 语义。
+对已有 reference handle 的 reborrow 是幂等操作；例如 `T&!` 经 `[ref! name]` 后仍为 `T&!`，
+不会产生嵌套 reference。
 
 `RawFn` 不允许捕获。`RawFn` 可以通过 `Fn(raw)` 显式包装成同签名 `Fn`，但 `Fn` 不会隐式或
 显式退回 `RawFn`：

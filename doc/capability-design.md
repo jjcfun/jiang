@@ -482,7 +482,7 @@ async Response send(Request& request) {
             continuation.resume(response);
         };
         continuation.on_cancel {
-            [_ operation] =>
+            [operation] =>
             operation.cancel();
         };
     }
