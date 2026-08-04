@@ -175,10 +175,26 @@ CompilerStore
 
 `DiagnosticStore` 放在 `CompilerStore` 内，因为它保存编译过程中产生的诊断事实。
 `DiagnosticReporter` 不放进 `CompilerStore`，它只负责终端输出和未来 LSP 消息发布。
+编译完成后由 reporter 按顺序把 store 中的诊断发布给调用方选择的 `Sink`；CLI 使用 stderr sink，
+compiler service 可以直接查询 store 或使用 LSP sink，不把终端 I/O 注入编译 pass。
+
+`CompilerSession` 长期持有 `CompilerContext`，每轮 compilation 重建 session-local 语义表，
+同时保留 `SourceStore`、symbol interner、artifact 统计容器和 stable identity 映射。
+`PackageHandle` 只保存规范化 root path 和稳定 root `SourceId`。workspace/package 加载与
+`compile_loaded` 分离；后者每轮重新读取 SourceStore 并重建 ModuleGraph、Semantic Model 和类型事实。
+`SourceStore` 是源码读取的统一入口：没有 overlay 时读取磁盘，IDE/LSP 设置 overlay 后优先读取
+未保存文本；root source、普通 import 和诊断位置转换不能绕过它直接读取源码文件。
+`CompilerQueries` 是只读 service facade：按 source byte offset 查询当前 compilation 的 `NodeId`、
+definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `SourceLoc`。definition 跳转范围使用
+`DefRecord.name.span`，声明主体范围仍由 `SourceMap.def_span` 表达。
 
 ### Store 规则
 
 - `CompilerStore` 是业务事实集合的生命周期所有者。
+- `SourceStore` 保存稳定 `SourceId`、content revision 和可选内存 overlay；overlay 跨 compilation
+  保留，但不进入 `.ji`、object 或 `.jbuild`。
+- `SourceMap` 保存 `NodeId` / `DefId` 的正向位置事实，并为 source byte offset 查询维护当前
+  compilation 的反向 span 索引；索引随 session-local 语义表一起重建。
 - `CompilerContext` 不直接平铺业务 store；所有业务 store 都通过 `ctx.store` 访问。
 - 阶段产物只有确实被多个后续阶段消费时才挂入 `CompilerStore`。
 - `syntax.Store` 是单次 compilation 的 parse cache，不作为跨阶段长期语义 store。
@@ -230,7 +246,8 @@ CompilerStore
 ## 阶段边界
 
 - `driver` 把进程参数转换成编译请求，直接创建 `CompilerContext` 并调用 pipeline。
-- `pipeline` 以 package root file 为入口串联各阶段，并负责跨阶段错误处理。目录入口读取
+- `pipeline` 以已加载 package 的 root file 为入口串联各阶段，并负责跨阶段错误处理。CLI 兼容入口
+  先加载 package 再执行；长驻 service 可以复用 `PackageHandle`。目录入口只在加载时读取
   `package.ini`，文件入口把该文件作为 root source。
 - `source` 负责 package manifest、路径处理、文件读取和 source ID。
 - `core` 在 root module 前加载，提供 compiler-known trait、builtin type namespace 壳和
