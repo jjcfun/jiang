@@ -1189,14 +1189,14 @@ const InlineDomain inline_domain = InlineDomain();
 `enqueue` 接收后必须最终调用一次 `run()`，不能复制、保存借用或静默丢弃。
 
 跨线程共享简单标量状态时使用 `Atomic<T>`。默认的 `get()`、`set()`、`get_and_set()` 和
-`compare_exchange()` 使用 sequential order；需要更弱顺序时使用对应的 `*_with_order` 方法：
+`compare_and_set()` 使用 sequential order；需要更弱顺序时向同名重载传入 memory order：
 
 ```jiang
 Atomic<Int> state = Atomic<Int>(0);
-state.set_with_order(1, .release);
-Int observed = state.get_with_order(.acquire);
-Int previous = state.get_and_set_with_order(2, .acquire_release);
-Bool changed = state.compare_exchange_with_order(
+state.set(1, .release);
+Int observed = state.get(.acquire);
+Int previous = state.get_and_set(2, .acquire_release);
+Bool changed = state.compare_and_set(
     2, 3, MemoryOrder.acquire_release, MemoryOrder.acquire
 );
 ```
