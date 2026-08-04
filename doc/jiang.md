@@ -1147,6 +1147,13 @@ Task，取消会传播到 child，并在 child 进入终态后继续清理 paren
 `coroutine.check_cancelled()` 显式观察请求；`await()` 遇到已取消 child 时会取消当前 parent，并由
 结构化 cleanup 取消其余 sibling。`cancel_and_await()` 只取消目标 Task，不取消 caller。
 
+Task closure 的引用捕获在 Task 执行期间保持借用；Task 被 await、cancel-and-await 或随直接
+Task 的结构化清理完成后，借用随之结束。`Task<T>` 与 `Task<T>^` 使用同一 lifetime 契约，
+`^` 只改变所有权和存储方式。Task owner 析构不等待 coroutine，因此携带捕获借用的 owner
+必须先 await 或 cancel-and-await。返回或转发这类 owner 时，用 `@life(return: source)` 声明
+来源；零参数 Task owner 工厂即使不捕获，也要用 `@life()` 明确返回值不携带参数 borrow。
+把 Task 存入 struct 时，字段用 `@life` 绑定到 struct 公开的 `@region`。
+
 直接 Task 是结构化子任务。未消费的直接 Task 离开 scope、执行 `return`/`throw` 或随 parent 取消时，编译器
 先向该退出路径上的全部活跃 Task 请求取消，再逐个等待其进入终态；所有 child 完成后才销毁其余
 局部值并释放 parent frame。直接 `Task<T>` 的地址固定，不支持 `move()`、`forget()` 或重新赋值。

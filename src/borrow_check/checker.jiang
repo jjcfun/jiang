@@ -913,6 +913,11 @@ struct FunctionBorrowChecker: Movable {
             self.record_init_assignment_sources(assign_stmt.destination);
             return;
         }
+        if (statement.kind is .capture_bind_stmt(bind)) {
+            self.check_place_use(bind.environment);
+            self.record_capture_environment_loans(bind.destination, bind.environment);
+            return;
+        }
         if (statement.kind is .atomic_store_stmt(atomic_store)) {
             self.check_place_use(atomic_store.destination);
             self.check_operand(atomic_store.value);
@@ -931,6 +936,13 @@ struct FunctionBorrowChecker: Movable {
         }
         if (statement.kind is .task_owner_release_stmt(release)) {
             self.check_place_use(release.pointer);
+            self.check_task_owner_release_loans(release.pointer);
+            return;
+        }
+        if (statement.kind is .task_release_stmt(release)) {
+            if (release.task is .some(task)) {
+                self.remove_active_loan_facts_under(self.paths.path_for_place(task));
+            }
             return;
         }
         if (statement.kind is .task_consume_stmt(consume)) {
@@ -956,8 +968,47 @@ struct FunctionBorrowChecker: Movable {
 
     () clear_storage_dead_local(self, jil.LocalId local_id) {
         move_path.MovePathId path = self.paths.root_for_local(local_id);
+        self.check_task_owner_storage_end(path);
         self.state_clear_path(self.dataflow.live_locals, path);
         self.clear_path_and_descendants(path);
+    }
+
+    () check_task_owner_storage_end(self, move_path.MovePathId path) {
+        Int index! = 0;
+        while (index < self.dataflow.active_loans.len()) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            index = index + 1;
+            if (!self.active_loan_target_under_path(fact, path)) { continue; }
+            if (!self.loan_target_has_task_owner_ancestor(fact.target, path)) { continue; }
+            self.results.mark_error();
+            self.add_borrow_escape_diagnostic();
+            return;
+        }
+    }
+
+    Bool loan_target_has_task_owner_ancestor(
+        self,
+        move_path.MovePathId target,
+        move_path.MovePathId boundary
+    ) {
+        move_path.MovePathId current! = target;
+        while (self.valid_move_path(current)) {
+            if (self.type_is_task_owner(self.move_path_type(current))) {
+                return !self.path_or_ancestor_is_moved(current);
+            }
+            if (current == boundary) { return false; }
+            move_path.MovePath path = self.paths.get(current);
+            if (!path.has_parent) { return false; }
+            current = path.parent;
+        }
+        return false;
+    }
+
+    Bool type_is_task_owner(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (!types.is_owner_pointer_handle(handle)) { return false; }
+        return self.ctx.store.types.get(handle.element).data is .task_type(_);
     }
 
     () check_task_consume(self, jil.TaskConsumeStatement consume) {
@@ -1019,7 +1070,7 @@ struct FunctionBorrowChecker: Movable {
         if (!self.place_may_write_outside_current_body(destination)) {
             return;
         }
-        if (self.internal_coroutine_capture_allows_store(destination, value)) { return; }
+        if (self.internal_coroutine_capture_allows_store(destination)) { return; }
         if (self.type_contains_stack_closure(self.place_type(destination))) {
             if (self.assignment_is_owned_closure_init(destination, value)) {
                 return;
@@ -1085,56 +1136,13 @@ struct FunctionBorrowChecker: Movable {
         return false;
     }
 
-    Bool internal_coroutine_capture_allows_store(
-        self,
-        jil.Place destination,
-        jil.Rvalue value
-    ) {
-        guard self.coroutine_capture_task_for_place(destination) is .some(task_local) else {
-            return false;
-        }
-        if (!self.coroutine_capture_value_matches_task(value, task_local)) { return false; }
-        guard self.coroutine_capture_source_local(value) is .some(source_local) else { return true; }
-        guard self.body.locals[source_local.to_index()].coroutine_capture_task
-            is .some(source_task) else { return false; }
-        return source_task.to_index() == task_local.to_index();
+    Bool internal_coroutine_capture_allows_store(self, jil.Place destination) {
+        return self.coroutine_capture_task_for_place(destination) != null;
     }
 
     jil.LocalId? coroutine_capture_task_for_place(self, jil.Place place) {
         guard jil.place_local_id(place) is .some(local_id) else { return null; }
         return self.body.locals[local_id.to_index()].coroutine_capture_task;
-    }
-
-    Bool coroutine_capture_value_matches_task(self, jil.Rvalue value, jil.LocalId task_local) {
-        if (value is .borrow_value(_)) { return true; }
-        if (value is .address_of_value(_)) { return true; }
-        guard self.rvalue_operand_place(value) is .some(source) else { return false; }
-        guard self.coroutine_capture_task_for_place(source) is .some(source_task) else { return false; }
-        return source_task.to_index() == task_local.to_index();
-    }
-
-    @life(return: value)
-    jil.Place? rvalue_operand_place(self, jil.Rvalue value) {
-        if (value is .use_value(use_value)) { return self.operand_place(use_value.value); }
-        if (value is .cast_value(cast_value)) { return self.operand_place(cast_value.value); }
-        return null;
-    }
-
-    jil.LocalId? coroutine_capture_source_local(self, jil.Rvalue value) {
-        if (value is .borrow_value(borrow_value)) { return jil.place_local_id(borrow_value.place); }
-        if (value is .address_of_value(address_of)) { return jil.place_local_id(address_of.place); }
-        guard self.rvalue_operand_place(value) is .some(source) else { return null; }
-        move_path.MovePathId source_path = self.paths.path_for_place(source);
-        if (!self.valid_move_path(source_path)) { return null; }
-        Int index! = 0;
-        while (index < self.dataflow.active_loans.len()) {
-            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
-            index = index + 1;
-            if (!self.loan_target_matches_path(fact.target, source_path)) { continue; }
-            loan.Loan active = self.results.loans.get(fact.loan_id);
-            return self.paths.get(active.source).local_id;
-        }
-        return null;
     }
 
     Bool self_lifetime_allows_borrow_store(self, jil.Place destination, jil.Operand operand) {
@@ -1376,6 +1384,25 @@ struct FunctionBorrowChecker: Movable {
             );
             index = index + 1;
         }
+    }
+
+    () record_capture_environment_loans(
+        self,
+        jil.Place destination,
+        jil.Place environment
+    ) {
+        self.record_operand_loan(
+            destination,
+            jil.copy_operand_value(jil.CopyOperand (place: environment))
+        );
+    }
+
+    () check_task_owner_release_loans(self, jil.Place owner) {
+        move_path.MovePathId path = self.paths.path_for_place(owner);
+        if (!self.has_active_loan_fact_under(path)) { return; }
+        self.results.mark_error();
+        self.add_borrow_escape_diagnostic();
+        self.remove_active_loan_facts_under(path);
     }
 
     () record_nominal_lifetime_relations(self, jil.Place destination) {
@@ -2214,7 +2241,7 @@ struct FunctionBorrowChecker: Movable {
         qid.DefId def_id,
         list.ArrayList<qid.DefId>& visiting
     ) {
-        if (self.stack_closure_visit_stack_has(visiting, def_id)) {
+        if (self.def_list_contains(visiting, def_id)) {
             return false;
         }
         guard self.ctx.store.model.def(def_id) is .some(model_def) else { return false; }
@@ -2254,7 +2281,7 @@ struct FunctionBorrowChecker: Movable {
         return self.type_contains_stack_closure_inner(field_type, visiting);
     }
 
-    Bool stack_closure_visit_stack_has(self, list.ArrayList<qid.DefId>& visiting, qid.DefId def_id) {
+    Bool def_list_contains(self, list.ArrayList<qid.DefId>& visiting, qid.DefId def_id) {
         Int index! = 0;
         while (index < visiting.len()) {
             if (visiting.get(index).to_index() == def_id.to_index()) {
@@ -2871,6 +2898,27 @@ struct FunctionBorrowChecker: Movable {
         }
         if (statement.kind is .forget_stmt(forget_stmt)) {
             return self.place_uses_loan_target(forget_stmt.place, target_path);
+        }
+        if (statement.kind is .capture_bind_stmt(bind)) {
+            return self.place_uses_loan_target(bind.destination, target_path)
+                || self.place_uses_loan_target(bind.environment, target_path);
+        }
+        if (statement.kind is .task_consume_stmt(consume)) {
+            return self.place_uses_loan_target(consume.task, target_path);
+        }
+        if (statement.kind is .task_release_stmt(release)) {
+            if (release.task is .some(task)) {
+                return self.place_uses_loan_target(task, target_path);
+            }
+            return false;
+        }
+        if (statement.kind is .task_owner_release_stmt(release)) {
+            return self.place_uses_loan_target(release.pointer, target_path);
+        }
+        if (statement.kind is .storage_dead_stmt(storage_dead)) {
+            move_path.MovePathId root = self.paths.root_for_local(storage_dead.local_id);
+            if (!self.path_matches_or_contains(root, target_path)) { return false; }
+            return self.loan_target_has_task_owner_ancestor(target_path, root);
         }
         return false;
     }

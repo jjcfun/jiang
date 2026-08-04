@@ -310,6 +310,14 @@ throw 和 parent cancellation 路径上生成 cancel-all-then-join CFG：先向�
 再逐个生成可挂起 join，最后才进入普通 local drop。cancellation entry 在 BodyLowerer 内生成，因此
 cleanup 新增的 suspend point 会参与 state dispatch 和 frame liveness。
 
+Task lowering 保留 typed capture environment，并用 `CaptureBind(destination, environment)`
+把环境中已有的 loans 绑定到 Task 根。该 statement 只表达 borrow-check 关系，不生成 backend
+指令；frame rewrite、liveness、drop elaboration 和 fingerprint 必须保留它。Task frame 的
+local/heap 选择只是 storage plan，不能决定引用捕获是否合法。`TaskRelease` 在执行结束后清除
+对应 Task 根的 capture loans，因此直接 Task 与 owner Task 共用同一套 lifetime 传播。
+`TaskOwnerRelease` 本身不证明 coroutine 已经结束；若 owner 根仍携带 capture loans，borrow
+check 必须拒绝非阻塞析构。正常 await 路径先由 `TaskRelease` 结束 loans，随后释放空 owner。
+
 当前实现覆盖 cancel-before-start 和自然恢复边界：observed Task frame 在 resume dispatch 前用 CAS 将
 request 从 requested claim 为 cancelling，并从 cancellation entry 进入 drop elaboration 生成的清理链。
 普通 async call 借出 continuation 前将 active-target word 从 inactive 发布为 passive suspend；

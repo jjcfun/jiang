@@ -527,6 +527,13 @@ named 模式的 target 必须唯一且完整，不能与位置模式混用。字
 兼容，才默认使用该完整 root。一个 product Shape 仍只算一个 root。`Self self` 按值 receiver
 不享受优先级，只作为普通参数参与唯一 root 计数。
 
+`Task<T>` 的公开 Shape 由一个 capture slot 和 `T` 的 result Shape 组成；`Task<T>^` 继承同一
+Shape，owner handle 不增加新的 slot。capture slot 约束 Task closure 中的借用，result Shape
+约束 `await()` 取出的值。Task 是直接值还是 owner、frame 位于栈还是 heap，都不改变这份契约。
+`await()`、`cancel_and_await()` 或直接 Task 的结构化 join 结束执行后，capture loans 随 Task 根一起
+结束。`Task<T>^` owner 析构不等待 coroutine，因此带 capture loans 的 owner 必须先消费，不能靠
+离开作用域静默结束借用。
+
 返回 Shape 非空但零个非空输入 root 时，必须显式写 `@life()` 确认返回值不携带参数 borrow；
 存在两个或更多非空 root，或唯一 root Shape 不兼容时，也必须显式写出契约。默认契约只由公开
 签名决定，不读取函数体。任意显式 `@life(...)` 都完全替换 implicit return contract；
