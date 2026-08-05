@@ -175,7 +175,7 @@ verify_sha256() {
   local expected="$1"
   local path="$2"
   if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s  %s\n' "$expected" "$path" | sha256sum --check
+    printf '%s  %s\n' "$expected" "$path" | sha256sum -c
     return
   fi
   if command -v shasum >/dev/null 2>&1; then
