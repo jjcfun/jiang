@@ -43,6 +43,11 @@ struct TaskInitializerParts: Copyable {
     sem.NodeId closure;
 }
 
+struct CoroutineSyncParts: Copyable {
+    sem.NodeId domain;
+    sem.NodeId closure;
+}
+
 @region(a)
 public struct BodyCheck: Movable {
     @life(a)
@@ -5273,6 +5278,9 @@ public struct BodyCheck: Movable {
     qid.TypeId check_call(self, sem.NodeId node_id, sem.Call call, qid.TypeId? expected_result) {
         // call 先要求 callee 已经能得到 function type；参数逐个检查后，
         // 再用函数签名决定 call 表达式的结果类型。
+        if (self.check_coroutine_sync_call(node_id, call, expected_result) is .some(result)) {
+            return result;
+        }
         if (call.type_args.length == 0 && self.task_initializer_callee(call)) {
             return self.check_inferred_task_initializer_call(node_id, call);
         }
@@ -7349,7 +7357,7 @@ public struct BodyCheck: Movable {
         );
         qid.TypeId lambda_type = self.check_node_expected(parts.closure, expected_lambda);
         if (!self.type_ops.is_invalid_type(lambda_type)) {
-            self.bind_task_initializer_function(node_id, parts.closure);
+            self.bind_async_lambda_function(node_id, parts.closure);
         }
         self.state.results.mark_expr_lowering(node_id, .task_initializer);
         self.mark_observed_async_start_if_needed(node_id);
@@ -7374,7 +7382,7 @@ public struct BodyCheck: Movable {
             );
         }
         types.EffectSet effects = types.EffectSet(has_async: true, domain: domain);
-        qid.TypeId result! = self.check_inferred_task_lambda(parts.closure, effects);
+        qid.TypeId result! = self.check_inferred_async_lambda(parts.closure, effects, null);
         if (self.type_is_task(result)) {
             self.type_ops.add_node_error(
                 parts.closure,
@@ -7385,14 +7393,15 @@ public struct BodyCheck: Movable {
         }
         self.state.results.mark_expr_lowering(node_id, .task_initializer);
         self.mark_observed_async_start_if_needed(node_id);
-        self.bind_task_initializer_function(node_id, parts.closure);
+        self.bind_async_lambda_function(node_id, parts.closure);
         return self.state.store.types.task_type(result, null, token.Span());
     }
 
-    qid.TypeId check_inferred_task_lambda(
+    qid.TypeId check_inferred_async_lambda(
         self,
         sem.NodeId closure_id,
-        types.EffectSet effects
+        types.EffectSet effects,
+        qid.TypeId? expected_result
     ) {
         sem.Node closure_node = self.state.model.node(closure_id);
         guard closure_node.data is .lambda_expr(lambda) else {
@@ -7413,7 +7422,12 @@ public struct BodyCheck: Movable {
         self.check_cross_domain_lambda_captures(closure_id, effects, lambda.function_def);
         types.EffectSet saved_effects = self.current_effects;
         self.current_effects = effects;
-        qid.TypeId result = self.check_node(lambda.body);
+        qid.TypeId result! = self.state.store.types.invalid_type();
+        if (expected_result is .some(expected)) {
+            result = self.check_node_expected(lambda.body, expected);
+        } else {
+            result = self.check_node(lambda.body);
+        }
         self.current_effects = saved_effects;
         list.ArrayList<qid.TypeId> params! = list.ArrayList<qid.TypeId>();
         qid.TypeId callable = self.state.store.types.function_type_with_kind(
@@ -7433,6 +7447,57 @@ public struct BodyCheck: Movable {
         self.state.results.set_node_type(closure_id, callable);
         self.node_states.set(closure_id, 2);
         return result;
+    }
+
+    qid.TypeId? check_coroutine_sync_call(
+        self,
+        sem.NodeId node_id,
+        sem.Call call,
+        qid.TypeId? expected_result
+    ) {
+        if (!self.coroutine_sync_callee(call)) { return null; }
+        guard self.coroutine_sync_parts(node_id, call) is .some(parts) else {
+            return self.state.store.types.invalid_type();
+        }
+        types.DomainEffect? domain = self.task_initializer_domain(parts.domain);
+        types.EffectSet effects = types.EffectSet(has_async: true, domain: domain);
+        qid.TypeId result! = self.check_inferred_async_lambda(
+            parts.closure, effects, expected_result
+        );
+        if (self.type_is_task(result)) {
+            self.type_ops.add_node_error(
+                parts.closure,
+                "coroutine.sync result cannot be a Task",
+                "nested_task_not_allowed"
+            );
+            result = self.state.store.types.invalid_type();
+        }
+        self.check_domain_call_result(node_id, effects, result);
+        self.state.results.mark_expr_lowering(node_id, .coroutine_sync);
+        self.bind_async_lambda_function(node_id, parts.closure);
+        return result;
+    }
+
+    Bool coroutine_sync_callee(self, sem.Call call) {
+        if (call.type_args.length != 0) { return false; }
+        guard self.state.store.resolve.core_functions.coroutine_sync is .some(sync_def) else {
+            return false;
+        }
+        guard self.initial_call_def(call) is .some(initial_def) else { return false; }
+        return self.type_ops.resolve_alias_target(initial_def) == sync_def;
+    }
+
+    CoroutineSyncParts? coroutine_sync_parts(self, sem.NodeId node_id, sem.Call call) {
+        if (call.args.length == 2 && !call.args[0].trailing && call.args[1].trailing) {
+            return CoroutineSyncParts(domain: call.args[0].value, closure: call.args[1].value);
+        }
+        self.check_call_args(call);
+        self.type_ops.add_node_error(
+            node_id,
+            "coroutine.sync expects a domain and one trailing closure",
+            "coroutine_sync_arguments"
+        );
+        return null;
     }
 
     Bool task_initializer_callee(self, sem.Call call) {
@@ -7506,7 +7571,7 @@ public struct BodyCheck: Movable {
         );
     }
 
-    () bind_task_initializer_function(self, sem.NodeId call_id, sem.NodeId closure_id) {
+    () bind_async_lambda_function(self, sem.NodeId call_id, sem.NodeId closure_id) {
         sem.Node closure_node = self.state.model.node(closure_id);
         guard closure_node.data is .lambda_expr(lambda) else { return; }
         self.state.results.mark_async_block_function(lambda.function_def);
