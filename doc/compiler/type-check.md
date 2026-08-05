@@ -58,6 +58,10 @@ type check 只负责证明泛型和 trait 约束在源程序层面成立。它�
 - generic params 进入 Semantic Model ownership tree。
 - semantic `NamedType` 保存 type args。
 - generic type arg arity 在 type check 阶段诊断。
+- generic nominal initializer 在 expected type 明确且 nominal head 相同时，可省略重复的 generic
+  arguments；annotation 中的 `_` 是独立 inference hole，显式 argument 保持固定，并由 initializer
+  实参与 expected type 双向求解。无 expected type、head 不匹配、冲突或未唯一求解均产生
+  稳定诊断。
 - nominal trait list / trait parent list 必须指向 trait def。
 - associated type trait bounds 必须指向 trait def。
 - where constraints 和 projected equality 写入类型事实，供 member lookup 和 monomorph 使用。

@@ -270,6 +270,10 @@ trait_bound_arg
 `N: const Int` 是等价简写，并 lower 到同一条 Semantic Model predicate；两种写法重复出现时会去重，
 约束类型不一致时报 `conflicting_const_constraint`。
 
+generic argument 位置的 `_` 同时作为 initializer type inference hole。它只绑定当前位置；
+同一 annotation 中的显式 argument 不会被覆盖。省略 generic nominal constructor 的全部
+arguments 时，必须由 expected type 提供同一 nominal definition 的完整参数。
+
 ## 类型
 
 ```peg

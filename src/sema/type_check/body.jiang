@@ -656,7 +656,9 @@ public struct BodyCheck: Movable {
                 self.state.results.set_node_type(node_id, type_id);
                 return type_id;
             }
-            if (self.expected_type_constructor_callee(call.callee)) {
+            if (self.expected_type_constructor_callee(call.callee)
+                || self.generic_constructor_uses_expected_type(call, expected_type)
+            ) {
                 qid.TypeId type_id = self.check_type_constructor_call_with_result(node_id, call, expected_type);
                 self.state.results.set_node_type(node_id, type_id);
                 return type_id;
@@ -1948,6 +1950,19 @@ public struct BodyCheck: Movable {
     Bool expected_type_constructor_callee(self, sem.NodeId callee_id) {
         sem.Node callee = self.state.model.node(callee_id);
         return callee.data is .infer_type_ref;
+    }
+
+    Bool generic_constructor_uses_expected_type(self, sem.Call call, qid.TypeId expected_type) {
+        if (call.type_args.length != 0) { return false; }
+        sem.Node callee = self.state.model.node(call.callee);
+        guard callee.data is .named_type_ref(named) else { return false; }
+        if (named.args.length != 0) { return false; }
+        guard self.state.model.def(named.def_id) is .some(model_def) else { return false; }
+        if (model_def.generic_params.len() == 0) { return false; }
+        types.TypeInfo expected_info = self.state.store.types.get(expected_type);
+        guard expected_info.data is .named(expected_named) else { return false; }
+        qid.DefId callee_def = self.type_ops.resolve_alias_target(named.def_id);
+        return callee_def.to_index() == expected_named.def_id.to_index();
     }
 
     Bool check_expected_array_literal(self,
@@ -4634,6 +4649,11 @@ public struct BodyCheck: Movable {
         guard owner.body is .some(ref _ body) else { return self.state.store.types.invalid_type(); }
         sem.Local local = body.local(let_stmt.local_id);
         if (local.type_ref is .some(type_ref)) {
+            if (self.partial_nominal_type_ref(type_ref)) {
+                self.check_partial_nominal_binding_let(node_id, local, let_stmt, type_ref);
+                self.mark_let_initialized(node_id.owner_def, local.id, let_stmt.initializer != null);
+                return self.state.store.types.unit_type();
+            }
             if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) {
                 self.check_inferred_binding_let(node_id, local, let_stmt);
                 self.mark_let_initialized(node_id.owner_def, local.id, true);
@@ -4679,6 +4699,464 @@ public struct BodyCheck: Movable {
         self.type_ops.bind_def_type(local.def_id, local_type);
         self.mark_let_initialized(node_id.owner_def, local.id, let_stmt.initializer != null);
         return self.state.store.types.unit_type();
+    }
+
+    Bool partial_nominal_type_ref(self, sem.NodeId type_ref) {
+        sem.Node node = self.state.model.node(type_ref);
+        if (node.data is .layered_type_ref(layered)) {
+            return self.partial_nominal_type_ref(layered.element);
+        }
+        guard node.data is .named_type_ref(named) else { return false; }
+        Int index! = 0;
+        while (index < named.args.length) {
+            if (self.type_ref_contains_inference(named.args[index])) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    Bool type_ref_contains_inference(self, sem.NodeId type_ref) {
+        if (self.type_ops.type_ref_is_inferred_placeholder(type_ref)) { return true; }
+        sem.Node node = self.state.model.node(type_ref);
+        if (node.data is .layered_type_ref(layered)) {
+            return self.type_ref_contains_inference(layered.element);
+        }
+        guard node.data is .named_type_ref(named) else { return false; }
+        Int index! = 0;
+        while (index < named.args.length) {
+            if (self.type_ref_contains_inference(named.args[index])) { return true; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    () check_partial_nominal_binding_let(
+        self,
+        sem.NodeId node_id,
+        sem.Local local,
+        sem.Let let_stmt,
+        sem.NodeId type_ref
+    ) {
+        guard let_stmt.initializer is .some(initializer) else {
+            self.type_ops.add_node_error(
+                node_id,
+                "partial generic type inference requires an initializer",
+                "partial_generic_inference_requires_initializer"
+            );
+            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
+            return;
+        }
+        guard self.infer_partial_nominal_type(type_ref, initializer) is .some(local_type) else {
+            self.type_ops.bind_def_type(local.def_id, self.state.store.types.invalid_type());
+            return;
+        }
+        qid.TypeId value_type = self.check_node_expected(initializer, local_type);
+        if (!self.type_ops.value_assignable_to_expected(local_type, initializer, value_type)) {
+            self.type_ops.add_node_error(
+                initializer,
+                "initializer type does not match inferred local type",
+                "initializer_type_mismatch"
+            );
+        }
+        self.type_ops.bind_def_type(local.def_id, local_type);
+    }
+
+    qid.TypeId? infer_partial_nominal_type(self, sem.NodeId type_ref, sem.NodeId initializer) {
+        guard self.partial_nominal_annotation(type_ref) is .some(annotation_ref) else { return null; }
+        sem.Node annotation = self.state.model.node(annotation_ref);
+        guard annotation.data is .named_type_ref(named) else { return null; }
+        guard self.partial_initializer_call(initializer) is .some(call) else {
+            self.add_partial_generic_inference_error(initializer);
+            return null;
+        }
+        if (!self.partial_initializer_matches_owner(call, named.def_id)) {
+            self.add_partial_generic_inference_error(initializer);
+            return null;
+        }
+        list.ArrayList<qid.DefId> param_defs = self.generic_param_defs(named.def_id);
+        if (param_defs.len() != named.args.length) {
+            self.add_partial_generic_inference_error(type_ref);
+            return null;
+        }
+        list.ArrayList<qid.TypeId> inferred! = list.ArrayList<qid.TypeId>(param_defs.len());
+        self.init_inferred_type_args(param_defs$.ref(), inferred$.ref());
+        list.ArrayList<comptime_value.ComptimeValue> inferred_consts! =
+            self.init_partial_const_args(param_defs.len());
+        self.seed_partial_annotation_args(named, param_defs$.ref(), inferred$.ref());
+        self.infer_partial_constructor_args(
+            call,
+            named.def_id,
+            param_defs$.ref(),
+            inferred$.ref(),
+            inferred_consts$.ref()
+        );
+        if (!self.partial_args_complete(named, param_defs$.ref(), inferred$.ref(), inferred_consts$.ref())) {
+            self.add_partial_generic_inference_error(initializer);
+            return null;
+        }
+        if (!self.bind_partial_annotation_holes(
+            named,
+            param_defs$.ref(),
+            inferred$.ref(),
+            inferred_consts$.ref()
+        )) {
+            self.add_partial_generic_inference_error(type_ref);
+            return null;
+        }
+        return self.type_ops.check_type_ref(type_ref);
+    }
+
+    list.ArrayList<comptime_value.ComptimeValue> init_partial_const_args(self, Int count) {
+        list.ArrayList<comptime_value.ComptimeValue> values! =
+            list.ArrayList<comptime_value.ComptimeValue>(count);
+        Int index! = 0;
+        while (index < count) {
+            values.add(comptime_value.ComptimeValue(
+                type_id: self.state.store.types.invalid_type(),
+                data: .invalid()
+            ));
+            index = index + 1;
+        }
+        return values;
+    }
+
+    sem.NodeId? partial_nominal_annotation(self, sem.NodeId type_ref) {
+        sem.Node node = self.state.model.node(type_ref);
+        if (node.data is .named_type_ref(_)) { return type_ref; }
+        guard node.data is .layered_type_ref(layered) else { return null; }
+        return self.partial_nominal_annotation(layered.element);
+    }
+
+    sem.Call? partial_initializer_call(self, sem.NodeId initializer) {
+        sem.Node node = self.state.model.node(initializer);
+        if (node.data is .call(call)) { return call; }
+        guard node.data is .unary(unary) else { return null; }
+        if (unary.op != .new_value) { return null; }
+        sem.Node value = self.state.model.node(unary.value);
+        if (value.data is .call(call)) { return call; }
+        return null;
+    }
+
+    Bool partial_initializer_matches_owner(self, sem.Call call, qid.DefId owner_def) {
+        sem.Node callee = self.state.model.node(call.callee);
+        guard callee.data is .named_type_ref(named) else { return false; }
+        qid.DefId callee_def = self.type_ops.resolve_alias_target(named.def_id);
+        qid.DefId expected_def = self.type_ops.resolve_alias_target(owner_def);
+        return callee_def.to_index() == expected_def.to_index();
+    }
+
+    () seed_partial_annotation_args(
+        self,
+        sem.NamedTypeRef named,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred
+    ) {
+        Int index! = 0;
+        while (index < named.args.length) {
+            sem.NodeId arg_ref = named.args[index];
+            if (self.state.store.defs.get(param_defs.get(index)).domain == .type_name
+                && !self.type_ref_contains_inference(arg_ref)
+            ) {
+                inferred.set(index, self.type_ops.check_type_ref(arg_ref));
+            }
+            index = index + 1;
+        }
+    }
+
+    Bool partial_args_complete(
+        self,
+        sem.NamedTypeRef named,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred_consts
+    ) {
+        Int index! = 0;
+        while (index < param_defs.len()) {
+            if (self.state.store.defs.get(param_defs.get(index)).domain == .type_name) {
+                if (self.state.store.types.get(inferred.get(index)).data is .invalid) { return false; }
+            } else if (self.type_ref_contains_inference(named.args[index])) {
+                if (inferred_consts.get(index).data is .invalid) { return false; }
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    () infer_partial_constructor_args(
+        self,
+        sem.Call call,
+        qid.DefId owner_def,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred_consts
+    ) {
+        guard self.state.model.def(owner_def) is .some(owner_model) else { return; }
+        guard self.matching_init_def(owner_model, call) is .some(init_def) else { return; }
+        guard self.function_signature_for_def(init_def) is .some(signature) else { return; }
+        list.ArrayList<sem.NodeId> values! = self.empty_argument_values(signature);
+        if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false, true)) {
+            return;
+        }
+        Int index! = 0;
+        while (index < values.len()) {
+            qid.TypeId template_type = self.type_ops.check_type_ref(signature.params[index]);
+            qid.TypeId actual_type = self.partial_initializer_value_type(values.get(index));
+            self.infer_type_arg(template_type, actual_type, param_defs, inferred);
+            self.infer_partial_const_args(
+                template_type,
+                actual_type,
+                param_defs,
+                inferred_consts
+            );
+            index = index + 1;
+        }
+    }
+
+    qid.TypeId partial_initializer_value_type(self, sem.NodeId value) {
+        sem.Node node = self.state.model.node(value);
+        if (node.data is .call(call)) {
+            if (self.infer_bare_generic_constructor_type(call) is .some(type_id)) {
+                return type_id;
+            }
+        }
+        return self.check_node(value);
+    }
+
+    qid.TypeId? infer_bare_generic_constructor_type(self, sem.Call call) {
+        if (call.type_args.length != 0) { return null; }
+        sem.Node callee = self.state.model.node(call.callee);
+        guard callee.data is .named_type_ref(named) else { return null; }
+        if (named.args.length != 0) { return null; }
+        list.ArrayList<qid.DefId> param_defs = self.generic_param_defs(named.def_id);
+        if (param_defs.len() == 0 || !self.partial_params_are_types(param_defs$.ref())) { return null; }
+        guard self.state.model.def(named.def_id) is .some(owner_model) else { return null; }
+        guard self.matching_init_def(owner_model, call) is .some(init_def) else { return null; }
+        guard self.function_signature_for_def(init_def) is .some(signature) else { return null; }
+        list.ArrayList<sem.NodeId> values! = self.empty_argument_values(signature);
+        if (!self.build_ordered_call_args(call.callee, call, signature, values$.ref(), false, true)) {
+            return null;
+        }
+        list.ArrayList<qid.TypeId> inferred! = list.ArrayList<qid.TypeId>(param_defs.len());
+        self.init_inferred_type_args(param_defs$.ref(), inferred$.ref());
+        Int index! = 0;
+        while (index < values.len()) {
+            qid.TypeId template_type = self.type_ops.check_type_ref(signature.params[index]);
+            qid.TypeId actual_type = self.partial_initializer_value_type(values.get(index));
+            self.infer_type_arg(template_type, actual_type, param_defs$.ref(), inferred$.ref());
+            index = index + 1;
+        }
+        if (!self.inferred_type_args_complete(inferred$.ref())) { return null; }
+        return self.state.store.types.named_type_with_args(named.def_id, inferred, token.Span());
+    }
+
+    Bool partial_params_are_types(self, list.ArrayList<qid.DefId>& param_defs) {
+        Int index! = 0;
+        while (index < param_defs.len()) {
+            if (self.state.store.defs.get(param_defs.get(index)).domain != .type_name) { return false; }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    () infer_partial_const_args(
+        self,
+        qid.TypeId template_type,
+        qid.TypeId actual_type,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred
+    ) {
+        types.TypeInfo template = self.state.store.types.get(template_type);
+        types.TypeInfo actual = self.state.store.types.get(actual_type);
+        if (template.data is .named(template_named) && actual.data is .named(actual_named)) {
+            self.infer_partial_named_const_args(template_named, actual_named, param_defs, inferred);
+            return;
+        }
+        if (template.data is .array_type(template_array) && actual.data is .array_type(actual_array)) {
+            self.infer_partial_array_const_args(template_array, actual_array, param_defs, inferred);
+            return;
+        }
+        if (template.data is .handle_type(template_handle) && actual.data is .handle_type(actual_handle)) {
+            if (template_handle.kind == actual_handle.kind) {
+                self.infer_partial_const_args(template_handle.element, actual_handle.element, param_defs, inferred);
+            }
+            return;
+        }
+        if (template.data is .optional(template_optional) && actual.data is .optional(actual_optional)) {
+            self.infer_partial_const_args(template_optional.element, actual_optional.element, param_defs, inferred);
+        }
+    }
+
+    () infer_partial_named_const_args(
+        self,
+        types.NamedType template,
+        types.NamedType actual,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred
+    ) {
+        if (template.def_id != actual.def_id || template.args.length != actual.args.length) { return; }
+        Int index! = 0;
+        while (index < template.args.length) {
+            types.GenericArg template_arg = template.args[index];
+            types.GenericArg actual_arg = actual.args[index];
+            if (template_arg is .type_arg(template_type) && actual_arg is .type_arg(actual_type)) {
+                self.infer_partial_const_args(template_type.value, actual_type.value, param_defs, inferred);
+            }
+            if (template_arg is .const_arg(template_const) && actual_arg is .const_arg(actual_const)) {
+                if (types.sentinel_const_param(template_const.value) is .some(param_def)) {
+                    self.set_partial_const_arg(param_def, actual_const.value, param_defs, inferred);
+                }
+            }
+            index = index + 1;
+        }
+    }
+
+    () infer_partial_array_const_args(
+        self,
+        types.ArrayType template,
+        types.ArrayType actual,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred
+    ) {
+        if (template.count_param is .some(param_def)) {
+            self.set_partial_const_arg(param_def, self.partial_array_count(actual), param_defs, inferred);
+        }
+        if (template.sentinel is .some(template_sentinel)) {
+            if (template_sentinel.value_param is .some(param_def)) {
+                if (actual.sentinel is .some(actual_sentinel)) {
+                    self.set_partial_const_arg(param_def, actual_sentinel.value, param_defs, inferred);
+                }
+            }
+        }
+        self.infer_partial_const_args(template.element, actual.element, param_defs, inferred);
+    }
+
+    comptime_value.ComptimeValue partial_array_count(self, types.ArrayType array_type) {
+        qid.TypeId int_type = self.state.store.types.int_type();
+        if (array_type.count_param is .some(param_def)) {
+            return comptime_value.ComptimeValue(type_id: int_type, data: .const_param_value(param_def));
+        }
+        return comptime_value.ComptimeValue(type_id: int_type, data: .int_value(array_type.count));
+    }
+
+    () set_partial_const_arg(
+        self,
+        qid.DefId param_def,
+        comptime_value.ComptimeValue value,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred
+    ) {
+        guard self.generic_param_index(param_defs, param_def) is .some(index) else { return; }
+        comptime_value.ComptimeValue current = inferred.get(index);
+        if (current.data is .invalid) {
+            inferred.set(index, value);
+            return;
+        }
+        if (!self.type_ops.const_value_matches(current, value)) {
+            inferred.set(index, comptime_value.ComptimeValue(
+                type_id: self.state.store.types.invalid_type(),
+                data: .invalid()
+            ));
+        }
+    }
+
+    Bool bind_partial_annotation_holes(
+        self,
+        sem.NamedTypeRef named,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred,
+        list.ArrayList<comptime_value.ComptimeValue>& inferred_consts
+    ) {
+        Int index! = 0;
+        while (index < named.args.length) {
+            sem.NodeId arg_ref = named.args[index];
+            if (self.state.store.defs.get(param_defs.get(index)).domain != .type_name) {
+                if (self.type_ref_contains_inference(arg_ref)) {
+                    self.state.results.set_inferred_const_arg(arg_ref, inferred_consts.get(index));
+                }
+            } else if (!self.bind_partial_type_pattern(arg_ref, inferred.get(index))) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool bind_partial_type_pattern(self, sem.NodeId pattern_ref, qid.TypeId actual_type) {
+        if (self.type_ops.type_ref_is_inferred_placeholder(pattern_ref)) {
+            if (self.state.results.node_type(pattern_ref) is .some(bound)) {
+                return self.type_ops.same_type_ignoring_mutability(bound, actual_type);
+            }
+            self.state.results.set_node_type(pattern_ref, actual_type);
+            return true;
+        }
+        sem.Node pattern = self.state.model.node(pattern_ref);
+        if (pattern.data is .named_type_ref(named)) {
+            return self.bind_partial_named_pattern(pattern_ref, named, actual_type);
+        }
+        if (pattern.data is .layered_type_ref(layered)) {
+            return self.bind_partial_layered_pattern(layered, actual_type);
+        }
+        qid.TypeId expected = self.type_ops.check_type_ref(pattern_ref);
+        return self.type_ops.same_type_ignoring_mutability(expected, actual_type);
+    }
+
+    Bool bind_partial_named_pattern(
+        self,
+        sem.NodeId pattern_ref,
+        sem.NamedTypeRef named,
+        qid.TypeId actual_type
+    ) {
+        if (!self.type_ref_contains_inference(pattern_ref)) {
+            qid.TypeId expected = self.type_ops.check_type_ref(pattern_ref);
+            return self.type_ops.same_type_ignoring_mutability(expected, actual_type);
+        }
+        qid.DefId provider = self.type_ops.resolve_alias_target(named.def_id);
+        if (!self.type_ops.type_matches_namespace_provider(actual_type, provider)) { return false; }
+        list.ArrayList<types.GenericArg> actual_args =
+            self.type_ops.namespace_provider_args(actual_type, provider);
+        if (actual_args.len() != named.args.length) { return false; }
+        Int index! = 0;
+        while (index < named.args.length) {
+            types.GenericArg actual_arg = actual_args.get(index);
+            if (actual_arg is .type_arg(type_arg)) {
+                if (!self.bind_partial_type_pattern(named.args[index], type_arg.value)) { return false; }
+            } else if (self.type_ref_contains_inference(named.args[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool bind_partial_layered_pattern(self, sem.LayeredTypeRef pattern, qid.TypeId actual_type) {
+        types.TypeInfo actual = self.state.store.types.get(actual_type);
+        if (pattern.kind == .mutable_type) {
+            return self.bind_partial_type_pattern(pattern.element, actual_type);
+        }
+        if (pattern.kind == .optional_type) {
+            guard actual.data is .optional(optional) else { return false; }
+            return self.bind_partial_type_pattern(pattern.element, optional.element);
+        }
+        guard actual.data is .handle_type(handle) else { return false; }
+        if (!self.partial_layer_matches_handle(pattern.kind, handle.kind)) { return false; }
+        return self.bind_partial_type_pattern(pattern.element, handle.element);
+    }
+
+    Bool partial_layer_matches_handle(self, sem.TypeLayerKind layer, types.HandleTypeKind handle) {
+        if (layer == .reference) { return handle == .reference || handle == .slice; }
+        if (layer == .owner_pointer) { return handle == .owner_pointer; }
+        if (layer == .raw_pointer) { return handle == .raw_pointer; }
+        return false;
+    }
+
+    () add_partial_generic_inference_error(self, sem.NodeId node_id) {
+        self.type_ops.add_node_error(
+            node_id,
+            "partial generic arguments could not be inferred uniquely",
+            "partial_generic_inference_failed"
+        );
     }
 
     () check_task_binding_mode(self, sem.NodeId node_id, sem.Local local, qid.TypeId type_id) {
@@ -6152,6 +6630,9 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId? candidate_arg_type(self, sem.NodeId value, qid.TypeId expected) {
+        if (self.generic_constructor_candidate_type(value, expected) is .some(type_id)) {
+            return type_id;
+        }
         sem.Node node = self.state.model.node(value);
         if (node.data is .lambda_expr(lambda)) {
             guard self.callable_function_type(expected) is .some(function_type) else { return null; }
@@ -6178,6 +6659,21 @@ public struct BodyCheck: Movable {
             }
         }
         return self.check_node(value);
+    }
+
+    qid.TypeId? generic_constructor_candidate_type(self, sem.NodeId value, qid.TypeId expected) {
+        sem.Node node = self.state.model.node(value);
+        if (node.data is .call(call)) {
+            if (self.generic_constructor_uses_expected_type(call, expected)) { return expected; }
+            return null;
+        }
+        guard node.data is .unary(unary) else { return null; }
+        if (unary.op != .new_value) { return null; }
+        guard self.owner_pointer_expected_type(expected) is .some(value_type) else { return null; }
+        sem.Node initializer = self.state.model.node(unary.value);
+        guard initializer.data is .call(call) else { return null; }
+        if (self.generic_constructor_uses_expected_type(call, value_type)) { return expected; }
+        return null;
     }
 
     qid.TypeId? new_lambda_candidate_type(self, sem.Unary unary, qid.TypeId expected) {
@@ -6305,6 +6801,42 @@ public struct BodyCheck: Movable {
         }
         if (template_info.data is .handle_type(template_handle)) {
             self.infer_handle_type_arg(template_handle, actual_type, param_defs, inferred);
+            return;
+        }
+        if (template_info.data is .array_type(template_array)) {
+            types.TypeInfo actual_info = self.state.store.types.get(actual_type);
+            if (actual_info.data is .array_type(actual_array)) {
+                self.infer_type_arg(template_array.element, actual_array.element, param_defs, inferred);
+            }
+            return;
+        }
+        if (template_info.data is .optional(template_optional)) {
+            types.TypeInfo actual_info = self.state.store.types.get(actual_type);
+            if (actual_info.data is .optional(actual_optional)) {
+                self.infer_type_arg(template_optional.element, actual_optional.element, param_defs, inferred);
+            }
+            return;
+        }
+        if (template_info.data is .tuple_type(template_tuple)) {
+            types.TypeInfo actual_info = self.state.store.types.get(actual_type);
+            if (actual_info.data is .tuple_type(actual_tuple)) {
+                self.infer_tuple_type_args(template_tuple, actual_tuple, param_defs, inferred);
+            }
+        }
+    }
+
+    () infer_tuple_type_args(
+        self,
+        types.TupleType template,
+        types.TupleType actual,
+        list.ArrayList<qid.DefId>& param_defs,
+        list.ArrayList<qid.TypeId>& inferred
+    ) {
+        if (template.items.length != actual.items.length) { return; }
+        Int index! = 0;
+        while (index < template.items.length) {
+            self.infer_type_arg(template.items[index], actual.items[index], param_defs, inferred);
+            index = index + 1;
         }
     }
 
@@ -7121,6 +7653,14 @@ public struct BodyCheck: Movable {
             return self.state.store.types.invalid_type();
         }
         if (call.type_args.length == 0) {
+            if (self.bare_generic_constructor_requires_context(call)) {
+                self.type_ops.add_node_error(
+                    call.callee,
+                    "generic initializer requires an expected type or explicit generic arguments",
+                    "generic_initializer_requires_context"
+                );
+                return self.state.store.types.invalid_type();
+            }
             return self.type_ops.check_type_ref(call.callee);
         }
         sem.Node callee = self.state.model.node(call.callee);
@@ -7140,6 +7680,14 @@ public struct BodyCheck: Movable {
             );
         }
         return self.type_ops.named_type_with_checked_generic_args(call.callee, named.def_id, call.type_args);
+    }
+
+    Bool bare_generic_constructor_requires_context(self, sem.Call call) {
+        sem.Node callee = self.state.model.node(call.callee);
+        guard callee.data is .named_type_ref(named) else { return false; }
+        if (named.args.length != 0) { return false; }
+        guard self.state.model.def(named.def_id) is .some(model_def) else { return false; }
+        return model_def.generic_params.len() > 0;
     }
 
     qid.TypeId closure_type_from_function(self, types.FunctionType source) {
@@ -7316,8 +7864,13 @@ public struct BodyCheck: Movable {
     () record_constructor_instance(self, qid.TypeId result_type, sem.Call call, qid.DefId init_def) {
         types.TypeInfo result_info = self.state.store.types.get(result_type);
         guard result_info.data is .named(named) else { return; }
-        list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
-        self.state.results.record_generic_instance_from_list(call.callee, init_def, type_args$.ref());
+        list.ArrayList<types.GenericArg> args! = list.ArrayList<types.GenericArg>(named.args.length);
+        Int index! = 0;
+        while (index < named.args.length) {
+            args.add(named.args[index]);
+            index = index + 1;
+        }
+        self.record_generic_instance_from_args(call.callee, init_def, args$.ref());
     }
 
     qid.DefId? type_constructor_init_def(self, qid.TypeId result_type, sem.Call call) {
@@ -7401,11 +7954,21 @@ public struct BodyCheck: Movable {
             return;
         }
         typeck_store.OrderedCallArgs arg_values = self.state.results.ordered_call_args(node_id)$.some();
-        list.ArrayList<qid.TypeId> type_args = self.named_type_args_list(named);
+        generic_bindings.GenericBindings caller! = generic_bindings.GenericBindings();
+        generic_bindings.GenericBindings bindings = generic_bindings.bindings_for_instance(
+            self.state.store,
+            named.def_id,
+            named.args,
+            caller$.ref()
+        );
         Int index! = 0;
         while (index < arg_values.values.length) {
             qid.TypeId param_type = self.type_ops.check_type_ref(signature.params[index]);
-            qid.TypeId expected = self.type_ops.substitute_generic_type(param_type, named.def_id, type_args$.ref());
+            qid.TypeId expected = generic_bindings.substitute_type(
+                self.state.store,
+                param_type,
+                bindings$.ref()
+            );
             sem.NodeId arg_value = arg_values.values[index];
             qid.TypeId arg_type = self.check_node_expected(arg_value, expected);
             if (!self.type_ops.value_assignable_to_expected(expected, arg_value, arg_type)) {
