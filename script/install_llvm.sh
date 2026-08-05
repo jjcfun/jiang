@@ -174,16 +174,20 @@ require_command() {
 verify_sha256() {
   local expected="$1"
   local path="$2"
+  local actual
   if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s  %s\n' "$expected" "$path" | sha256sum -c
-    return
+    actual="$(sha256sum "$path" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$path" | awk '{print $1}')"
+  else
+    echo "missing sha256sum or shasum" >&2
+    return 2
   fi
-  if command -v shasum >/dev/null 2>&1; then
-    printf '%s  %s\n' "$expected" "$path" | shasum -a 256 --check
-    return
+  if [ "$actual" != "$expected" ]; then
+    echo "SHA-256 mismatch for $path: expected $expected, got $actual" >&2
+    return 1
   fi
-  echo "missing sha256sum or shasum" >&2
-  return 2
+  printf '%s: OK\n' "$path"
 }
 
 download_llvm_sdk() {
