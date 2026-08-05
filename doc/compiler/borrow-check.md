@@ -98,8 +98,10 @@ loan 仍是稀疏事实列表；StorageDead 清理先探测是否存在匹配事
 大量 scoped Task 时，清理成本与当前 local 的子树和实际事实数量相关，而不是与全函数 MovePath 数量
 相乘。
 
-`Loan` 表示某个 JIL location 产生的引用或指针视图。当前实现区分 shared reference、mutable
-reference 和 raw pointer view，并同时记录来源与承载该 view 的目标 place。引用 loan 既用于
+`Loan` 表示某个 JIL location 产生的引用或指针视图。当前实现区分普通 shared reference、从
+`T&!` 降级得到的 frozen shared reborrow、mutable reference 和 raw pointer view，并同时记录来源与
+承载该 view 的目标 place。普通 shared view 不禁止 owner 更新 source；frozen shared reborrow 允许
+继续只读使用原 `T&!`，但在 reborrow 最后一次使用前禁止经原唯一 capability 写入。引用 loan 既用于
 lifetime/逃逸检查，也用于 shared/mutable 冲突检查；raw pointer view 不参与别名排他性判断。
 
 `LifetimeShape` 是按具体 `TypeId` 缓存并 intern 的派生属性，描述值可公开携带的 lifetime slot
