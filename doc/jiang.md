@@ -2124,11 +2124,20 @@ struct Foo<T> {
 
 // 显式给出实例类型，并使用 expected type 构造简写
 Foo<Int> x = .(value: 123);
+// generic nominal head 相同时也可以省略重复的类型实参
+Foo<Int> inferred = Foo(value: 123);
+// `_` 只推断对应位置，显式实参保持不变
+Pair<Int, _> pair = Pair(1, true);
 // 此时 T 明确为 Float
 Foo<Float> y = Foo<Float>(value: 3.14);
 // 也可以写成
 _ z = Foo<Float>(value: 3.14);
 ```
+
+省略全部泛型实参时必须有明确的 expected type；`_` 是独立 inference hole，编译器联合
+annotation、initializer 实参与 generic constraints 求解。没有 expected type、nominal head 不同、
+显式实参冲突或 hole 无法唯一确定时都会报错，不会猜测默认类型。value initializer 与
+`new` owner initializer 使用相同规则。
 
 泛型参数的顶层 `!` 能力约束当前只有显式 `Mutable` 模式：
 
