@@ -5,7 +5,7 @@
 
 ## 持久边界
 
-0.5.0 只持久化三类内容：
+0.5.1 只持久化三类内容：
 
 ```text
 cache/<context-key>/
@@ -21,7 +21,7 @@ cache/<context-key>/
 - release 使用 whole-package codegen，不保存细粒度 object 记录。
 
 不存在 `.jd`、`.jai`、每 object sidecar、逐泛型实例 object 或 object closure。源码改名会形成新的
-stable source identity；旧文件由显式 cache clean 清理，0.5.0 不实现自动 GC 或缓存数据库。
+stable source identity；旧文件由显式 cache clean 清理，0.5.1 不实现自动 GC 或缓存数据库。
 
 ## Context 与稳定身份
 
@@ -96,7 +96,7 @@ importer：
 - private body 变化不传播；
 - public signature、可见布局、public import/alias 和调用方可见泛型 body 变化会传播。
 
-0.5.0 不追踪 importer 实际读取的具体声明。`QueryDependencyGraph` 保留给后续声明级 QueryCache。
+0.5.1 不追踪 importer 实际读取的具体声明。`QueryDependencyGraph` 保留给后续声明级 QueryCache。
 
 `--check` 可以直接复用 fresh source 的 interface。debug/release 若未命中 `.jbuild` 快速路径，
 仍需从源码恢复 codegen 所需的普通函数 body；纯语义 `.ji` 不保存这些 body。source graph
@@ -132,9 +132,11 @@ monomorph unit fingerprint 覆盖排序后的 concrete instance key、generic bo
 5. miss 时只生成对应 `.o` 或 `.mono.o`，同目录临时文件完成后原子替换。
 6. link plan 只消费本轮 CGU，不恢复历史 link closure。
 
-package-level provenance、属性和 verifier 事实只准备一次，再供所有 stale unit 使用。LLVM lowering
-仍按 unit 执行，但不会为每个 object 重复跑全包分析。stale unit 按 stable unit 顺序串行
-emission；all-hit/no-op 不进入 object emission。
+package-level provenance、属性和 verifier 事实只准备一次，再供所有 stale unit 使用。JIL 到 owned
+LLVM unit 的 lowering 按 stable unit 顺序串行完成；每个 unit 随后只持有独立 LLVM
+Context/Module 和 owned emission 输入，不再访问 CompilerStore、JIL、DiagnosticStore、
+BuildState 或 LinkPlan。LLVM pass 与 object emission 可以在 worker Domain 中并发执行；
+all-hit/no-op 不进入 object emission。
 
 ## Release 与用户 object 输出
 
@@ -176,8 +178,11 @@ Semantic Model、绝对源码路径或 link closure。
 work-product index；只有链接和最终输出成功后才更新 `last_success`。进程中断可能造成下一次少量
 重复 codegen，但不会产生错误命中。
 
-stale unit 只写临时 object。全部 emission 成功后才按 stable unit 顺序发布 object 和
-work-product；失败时清理未发布临时文件，不留下可命中的半成品。
+每个 stale unit 只写自己的临时 object。成功 unit 会独立原子发布 object 与 work-product 记录；
+失败 unit 只清理自己的临时文件。任一 unit 失败时本轮不链接，
+也不更新 `last_success`，但其他
+已经成功发布的 object 可以在下一次构建中复用。coordinator 会等待全部已启动 worker，并按
+stable unit 顺序汇总诊断与统计。
 
 同一 target/context 使用 advisory build lock：
 
@@ -205,4 +210,4 @@ work-product；失败时清理未发布临时文件，不留下可命中的半�
 
 `QueryDependencyGraph` 当前只提供会话内 dependency/reverse-dependency 与失效遍历骨架。声明级
 QueryCache 需要稳定 declaration key、自动依赖采集、cycle 处理与 source-level 保守 fallback，
-不属于 0.5.0 的 source-level 增量范围。
+不属于 0.5.1 的 source-level 增量范围。

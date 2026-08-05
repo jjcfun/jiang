@@ -342,10 +342,12 @@ name        <- ident / "self"
   `Fn<async [global_domain] Bool>[]&` 表示“元素为全局并发 Domain 异步闭包值的切片引用”。
 - lambda 必须具有 expected callable type；其 async/unsafe/domain effect 由
   `Fn<...>` 或 `RawFn<...>` expected type 完整决定，lambda 表达式不重复书写 effect 前缀。
-- async `Fn` / `RawFn` 动态调用复用普通 async 调用的 Domain 切换；跨 Domain 的参数、result 和
-  capture 必须满足 Sendable，普通 borrow 不能跨不兼容 Domain 逃逸。
+- async `Fn` / `RawFn` 动态调用复用普通 async 调用的 Domain 切换；跨 Domain 按值传递的参数、
+  result 和 capture 必须满足 Sendable。`T&` 在 `T: Sendable` 时可以跨 Domain，但仍受普通
+  lifetime 约束；`T&!` 只能先 reborrow 为冻结写能力的 `T&`。
 - `Sendable` 不隐含 `Movable` 或 `Copyable`。直接 move/copy 仍分别要求原有值操作能力；
-  `T^` 只转移 owner handle，普通 `T&` / `T&!` 不因 `T: Sendable` 获得跨 Domain 能力。
+  `T^` 只转移 owner handle，不移动 heap pointee。跨 Domain 不会放宽 reference 的 lifetime、
+  owner move/drop 或 shared/unique reborrow 约束。
 - tuple、定长 array、optional、errorable result、Task、owned domain-bound `Fn^` 和 nominal
   aggregate 递归检查 Sendable payload；raw pointer 不自动满足 Sendable。
 - `Fn<Ret, Args...>` 表示 Jiang 闭包值，可带 environment；`RawFn<Ret, Args...>` 表示裸函数
