@@ -5,6 +5,7 @@
 
 import build_state = "../artifact/build_state.jiang";
 import cache_identity = "../artifact/cache_identity.jiang";
+import diagnostic_helper = "../diagnostic/helper.jiang";
 import object_artifact = "../artifact/object.jiang";
 import object_hash = "../artifact/object_hash.jiang";
 import object_key = "../artifact/object_key.jiang";
@@ -18,6 +19,7 @@ import qkey = "../incremental/key.jiang";
 import source_graph = "../incremental/source_graph.jiang";
 import jil = "../jil.jiang";
 import source = "../source.jiang";
+import domains = "../support/domains.jiang";
 import list = "../support/list.jiang";
 import string = "../support/string.jiang";
 import table = "../support/table.jiang";
@@ -33,6 +35,8 @@ public struct DebugTiming: Copyable {
     public UInt64 state_ns = UInt64(0);
     public UInt64 prepare_store_ns = UInt64(0);
     public UInt64 plan_ns = UInt64(0);
+    public UInt64 unit_lower_ns = UInt64(0);
+    public UInt64 unit_emit_ns = UInt64(0);
     public UInt64 units_ns = UInt64(0);
 }
 
@@ -69,6 +73,7 @@ public DebugWorkProducts prepare(
     Bool timing_enabled
 ) {
     UInt64 started! = timing_start(timing_enabled);
+    DebugTiming timing! = DebugTiming();
     qkey.Fingerprint128 target_identity =
         cache_identity.build_target_identity(options.input_path);
     qkey.Fingerprint128 invocation = cache_identity.build_invocation_fingerprint(
@@ -90,13 +95,13 @@ public DebugWorkProducts prepare(
 
     codegen_unit.CodegenUnitSet units! = codegen_unit.build_codegen_units(ctx, lowered);
     restore_interface_units(ctx, units$.mut_ref(), previous$.ref());
-    UInt64 state_ns = timing_elapsed(timing_enabled, started);
+    timing.state_ns = timing_elapsed(timing_enabled, started);
     started = timing_start(timing_enabled);
     codegen.PreparedStore prepared = codegen.prepare_store(ctx, lowered, .debug);
     if (!prepared.ok) {
         return DebugWorkProducts(false, links, next, target_identity);
     }
-    UInt64 prepare_store_ns = timing_elapsed(timing_enabled, started);
+    timing.prepare_store_ns = timing_elapsed(timing_enabled, started);
     started = timing_start(timing_enabled);
     record_reachable_sources(ctx, next$.mut_ref(), source_base, context_root);
     if (build_state.source_snapshot_from_files(
@@ -117,7 +122,7 @@ public DebugWorkProducts prepare(
     table.HashTable<qkey.Fingerprint128, Bool> reused_sources! =
         table.HashTable<qkey.Fingerprint128, Bool>();
     list.ArrayList<PendingUnit> pending! = list.ArrayList<PendingUnit>();
-    UInt64 plan_ns = timing_elapsed(timing_enabled, started);
+    timing.plan_ns = timing_elapsed(timing_enabled, started);
     started = timing_start(timing_enabled);
     Int index! = 0;
     while (index < order.len()) {
@@ -151,15 +156,16 @@ public DebugWorkProducts prepare(
         pending$.ref(),
         next$.mut_ref(),
         llvm_triple,
-        link_libc
+        link_libc,
+        options.worker_count(),
+        timing_enabled,
+        timing$.mut_ref()
     )) {
         return DebugWorkProducts(false, links, next, target_identity);
     }
     DebugWorkProducts result = DebugWorkProducts(true, links, next, target_identity);
-    result.timing.state_ns = state_ns;
-    result.timing.prepare_store_ns = prepare_store_ns;
-    result.timing.plan_ns = plan_ns;
-    result.timing.units_ns = timing_elapsed(timing_enabled, started);
+    timing.units_ns = timing_elapsed(timing_enabled, started);
+    result.timing = timing;
     return result;
 }
 
@@ -496,14 +502,20 @@ Bool emit_pending_units(
     list.ArrayList<PendingUnit>& pending,
     build_state.BuildState&! next,
     UInt8[]& llvm_triple,
-    Bool link_libc
+    Bool link_libc,
+    UInt32 jobs,
+    Bool timing_enabled,
+    DebugTiming&! timing
 ) {
     if (pending.empty()) { return true; }
+    UInt64 started! = timing_start(timing_enabled);
+    list.ArrayList<codegen.ObjectUnit^> object_units! =
+        list.ArrayList<codegen.ObjectUnit^>(pending.len());
     Int index! = 0;
     while (index < pending.len()) {
         PendingUnit& plan = pending.ref_at(index);
         codegen_unit.CodegenUnit& unit = units.unit_at(plan.unit_index);
-        codegen.BackendResult result = codegen.emit_object_for_prepared_unit(
+        guard codegen.prepare_object_for_prepared_unit(
             ctx,
             lowered,
             unit,
@@ -512,30 +524,90 @@ Bool emit_pending_units(
             .debug,
             link_libc,
             llvm_triple
-        );
-        if (result.has_errors()) {
-            remove_pending_temporaries(pending);
+        ) is .some(object_unit) else {
             return false;
         }
+        object_units.add(object_unit);
         index = index + 1;
     }
+    timing.unit_lower_ns = timing_elapsed(timing_enabled, started);
+
+    started = timing_start(timing_enabled);
+    domains.configure_worker_limit(jobs);
+    Int fail_index = forced_emission_failure_index(pending.len());
+    Int unit_count = object_units.len();
+    list.ArrayList<Task<Bool>^>^ tasks =
+        new list.ArrayList<Task<Bool>^>(unit_count);
+    // tasks 通过 pop 等待；逆序创建后，等待和发布仍保持 stable unit 顺序。
+    index = unit_count;
+    while (index > 0) {
+        index = index - 1;
+        codegen.ObjectUnit^ object_unit = object_units.pop();
+        Bool force_failure = index == fail_index;
+        Task<Bool>^ task = new Task(domain: domains.worker) {
+            [object_unit, force_failure] =>
+            if force_failure { false } else { object_unit.emit() }
+        };
+        tasks.add(task);
+    }
+    Task<list.ArrayList<Bool>>^ batch = new Task(domain: domains.coordinator) {
+        [tasks, unit_count] =>
+        list.ArrayList<Bool> values! = list.ArrayList<Bool>(unit_count);
+        while (!tasks.empty()) {
+            Task<Bool>^ task = tasks.pop();
+            values.add(task.await());
+        }
+        values
+    };
+    list.ArrayList<Bool> results = sync [domains.coordinator] {
+        batch.await()
+    };
+    timing.unit_emit_ns = timing_elapsed(timing_enabled, started);
+    Bool ok! = true;
     index = 0;
     while (index < pending.len()) {
-        if (!publish_pending_unit(ctx, pending.ref_at(index), next)) {
-            remove_pending_temporaries(pending);
-            return false;
+        PendingUnit& plan = pending.ref_at(index);
+        if (!results.get(index)) {
+            system_fs.remove_file(plan.temporary.bytes());
+            add_object_emission_error(ctx);
+            ok = false;
+        } else if (!publish_pending_unit(ctx, plan, next)) {
+            system_fs.remove_file(plan.temporary.bytes());
+            add_object_publish_error(ctx);
+            ok = false;
         }
         index = index + 1;
     }
-    return true;
+    return ok;
 }
 
-() remove_pending_temporaries(list.ArrayList<PendingUnit>& pending) {
+Int forced_emission_failure_index(Int unit_count) {
+    guard system_env.get("JIANG_INTERNAL_BACKEND_FAIL_UNIT") is .some(value) else {
+        return -1;
+    }
     Int index! = 0;
-    while (index < pending.len()) {
-        system_fs.remove_file(pending.ref_at(index).temporary.bytes());
+    while (index < unit_count) {
+        UInt8[]^ text = string.int_text(index);
+        if (string.equal(value[..], text[..])) { return index; }
         index = index + 1;
     }
+    return -1;
+}
+
+() add_object_emission_error(context.CompilerContext& ctx) {
+    diagnostic_helper.add_package_error(
+        ctx,
+        "LLVM object unit emission failed",
+        "llvm_object_unit_emit_failed"
+    );
+}
+
+() add_object_publish_error(context.CompilerContext& ctx) {
+    diagnostic_helper.add_package_error(
+        ctx,
+        "failed to publish object unit",
+        "object_unit_publish_failed"
+    );
 }
 
 Bool publish_pending_unit(

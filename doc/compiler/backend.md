@@ -116,10 +116,15 @@ unit emission 只声明并 lower 当前 unit 拥有的 function body。跨 unit 
 按需声明为 LLVM external declaration，不扫描或声明完整 JIL Store，也不把 callee body 复制进
 当前 object。
 
-debug 中的 stale unit 按 stable unit 顺序串行 emission。package-level symbol、layout、
-vtable field type、参数属性和 CGU plan 只准备一次，每个 unit 使用独立 LLVM context/module
-写入临时 object。全部 emission 成功后再按相同顺序原子发布 object、更新 `.jbuild`
-work product 并构造 `LinkPlan`；失败时清理尚未发布的临时文件。
+debug 中的 stale unit 按 stable unit 顺序完成 JIL lowering。package-level symbol、layout、
+vtable field type、参数属性和 CGU plan 只准备一次，每个 unit 使用独立 LLVM Context/Module。
+lowering 完成后，owned LLVM unit 可以在受限 worker Domain 中并发执行 LLVM pass 和 object emission；
+worker 不访问 CompilerStore、JIL、DiagnosticStore、BuildState 或 LinkPlan。
+
+coordinator 会等待全部已启动 worker，再按 stable unit 顺序处理结果。成功 unit 的临时 object
+会立即原子发布并写入 `.jbuild` work product；失败 unit 只清理自己的临时文件。
+任一 unit 失败时本轮不链接，也不更新 `last_success`。
+其他成功 unit 可以在下一次构建中复用。
 
 `.ji` 不保存 object 信息。debug work-product 记录只保存在当前 target 的 `.jbuild` 中。
 外层 `context-key` 隔离 compiler build、language version、target/ABI、LLVM/toolchain 和 backend
@@ -140,7 +145,14 @@ release executable 始终使用 whole-package codegen 和整体优化，不读�
 用户。
 
 开发时可用 `--artifact-stats` 观察 interface/object hit、miss、stale、emitted/reused unit 和
-linked object 以及 `.jbuild` no-op hit 数量。统计不进入 cache key。
+linked object 以及 `.jbuild` no-op hit 数量。`--jobs N` 控制 debug object emission 的 worker 上限；
+默认使用当前进程可用的逻辑 CPU 数，平台无法查询时回退到 `1`。release、shared library、
+`--emit-llvm` 和 `--emit-obj` 路径保持串行。
+统计和 worker 数量都不进入 cache key。
+
+`--jil-stats` 中的 `backend_unit_lower_ms` 记录串行 JIL-to-LLVM unit lowering，
+`backend_unit_emit_ms` 记录 worker Task 创建、LLVM pass、object emission 和 await；
+`backend_units_ms` 继续记录 lowering、emission 与串行 object 发布的总时间。
 
 ## C ABI classifier
 
