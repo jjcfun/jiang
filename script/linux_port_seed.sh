@@ -8,7 +8,7 @@ SEED_OBJECT="${SEED_OBJECT:-$SEED_DIR/jiangc-x86_64-linux-gnu.o}"
 SEED_BIN="${SEED_BIN:-$BUILD_DIR/bin/jiangc.linux-port-seed}"
 SEED_MANIFEST="${SEED_MANIFEST:-$SEED_DIR/jiangc-x86_64-linux-gnu.manifest}"
 ABI_PROBE_BIN="${ABI_PROBE_BIN:-$SEED_DIR/linux-hosted-abi-probe}"
-BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.0}"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.1}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc}"
 EXPECTED_LLVM_VERSION="${EXPECTED_LLVM_VERSION:-22.1.8}"
@@ -65,7 +65,7 @@ require_clean_source() {
 
 require_bootstrap() {
   if [ ! -x "$BOOTSTRAP_BIN" ]; then
-    echo "missing Jiang $BOOTSTRAP_RELEASE_VERSION stable compiler: $BOOTSTRAP_BIN" >&2
+    echo "missing Jiang $BOOTSTRAP_RELEASE_VERSION bootstrap compiler: $BOOTSTRAP_BIN" >&2
     exit 2
   fi
   local actual_version

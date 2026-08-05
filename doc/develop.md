@@ -5,10 +5,10 @@
 
 ## 常规开发
 
-当前 `main` 默认使用已安装的 Jiang 0.5.0 stable：
+当前源码默认使用已安装的 Jiang 0.5.1 stable：
 
 ```text
-~/.jiang/versions/0.5.0/bin/jiangc
+~/.jiang/versions/0.5.1/bin/jiangc
 ```
 
 构建当前源码：
@@ -67,12 +67,15 @@ release 分支最终 rebase 到最后一个 bootstrap checkpoint，使源码历�
 ## Linux 首次 hosted port seed
 
 0.5.0 正式产物只有 macOS arm64 compiler。0.5.1 首次建立 Linux x86_64 hosted 自举时，
-不创建 bootstrap 分支：语言语法和 compiler source 仍由 Jiang 0.5.0 stable 直接编译，
-平台 seed 只桥接“尚无 Linux 可执行 stable compiler”这一 host 缺口。
+平台 seed 桥接“尚无 Linux 可执行 stable compiler”这一 host 缺口。最终 0.5.1 compiler source
+包含 0.5.0 无法解析的迁移语法，因此首次 release seed 使用 `0.5.1-bootstrap` 过渡编译器；
+发布后的常规构建直接使用 0.5.1 stable。
 
-在已有 Jiang 0.5.0 stable 的 host 上生成 Linux compiler ELF object：
+在已有兼容 0.5.1 compiler 的 host 上生成 Linux compiler ELF object：
 
 ```bash
+BOOTSTRAP_RELEASE_VERSION=0.5.1 \
+BOOTSTRAP_BIN=/path/to/compatible/jiangc \
 bash ./script/linux_port_seed.sh emit-object
 ```
 
@@ -175,6 +178,21 @@ Jiang 0.4.9 stable
 复现 0.5.0 release 时应使用 `0.5.0-bootstrap2` tag 生成的 `jiangc.next`，不能退回 0.4.9
 直接编译已经采用新 Domain ABI 的 compiler source。发布后的常规 `main` 开发直接使用
 0.5.0 stable；`try ... catch` 新语法没有进入 compiler source，因此历史链无需第三层 transition。
+
+## Jiang 0.5.1 的可复现自举链
+
+0.5.1 的 generic initializer 与 `coroutine.sync` 迁移需要一个过渡编译器。发布链固定为：
+
+```text
+Jiang 0.5.0 stable
+  -> tag 0.5.1-bootstrap next
+  -> tag 0.5.1 的 next
+  -> Jiang 0.5.1 stable
+```
+
+Linux 首次 seed 由 macOS 上的 `0.5.1-bootstrap` 生成 ELF object，再在 Linux 使用 native LLVM
+和系统 toolchain 链接，并执行同一套 next/stable 两跳。GitHub Actions 通过固定 bootstrap commit
+复现该过程；发布后的普通构建直接使用 Jiang 0.5.1 stable。
 
 ## 分支和 tag 规则
 

@@ -1,6 +1,6 @@
 # Targets
 
-0.5.1 正在把 Linux x86_64 hosted/libc 提升为正式 release host。Linux native compiler
+0.5.1 将 Linux x86_64 hosted/libc 提升为正式 release host。Linux native compiler
 使用系统 libc 和本机 LLVM/linker toolchain 完成自举与 executable 链接；macOS -> Linux
 hosted executable 仍保持 cross-toolchain 早停边界。Linux no-libc 不属于 0.5.1 验收范围。
 其他 target 先固定 target model、LLVM/object 输出和 executable 诊断边界。

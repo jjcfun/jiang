@@ -3,9 +3,10 @@
 本文档记录 Jiang 语言本身的设计，不记录编译器源码目录结构和实现细节。编译器工程约定见
 `doc/architecture.md`。
 
-当前 release 开发以 Jiang 0.5.0 stable 为自举基线。0.5.1 在既有泛型/trait、JIL/backend、
-所有权、Task 与 Domain/Executor 基础上，聚焦 Linux hosted/libc、增量与并行编译，以及基础
-LSP 所需的 compiler service；本版本不扩张语言语法表面，也不包含 Linux no-libc。
+Jiang 0.5.1 以 Jiang 0.5.0 stable 为自举基线，在既有泛型/trait、JIL/backend、所有权、Task 与
+Domain/Executor 基础上，聚焦 Linux hosted/libc、增量与并行编译。compiler service 保留为
+后续工具链的基础，但 LSP 延后到后续版本；本版本不扩张语言语法表面，
+也不包含 Linux no-libc。
 本文档描述当前分支希望稳定下来的语言规则；
 未定设计必须显式标注，避免 parser、resolve、sema 在隐含假设上继续扩展。
 
