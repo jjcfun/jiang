@@ -1109,7 +1109,7 @@ async Int render() {
 }
 ```
 
-最外层从普通函数进入异步运行时，使用 `sync [main_domain]`。`main_domain` 绑定程序启动线程，
+最外层从普通函数进入异步运行时，使用 `coroutine.sync(main_domain)`。`main_domain` 绑定程序启动线程，
 `global_domain` 使用进程共享的并发执行器：
 
 ```jiang
@@ -1118,7 +1118,7 @@ async [global_domain] Int load_page(Int id) {
 }
 
 Int main() {
-    sync [main_domain] {
+    coroutine.sync(main_domain) {
         Task<Int> page = Task(domain: global_domain) {
             load_page(1)
         };
@@ -1139,8 +1139,8 @@ async Int load_both() {
 ```
 
 `Task { ... }` 继承 current Domain；`Task(domain: global_domain) { ... }` 显式指定
-execution domain。Task closure 和 sync block 使用最后一个表达式作为结果，不支持显式
-`return`；`return` 只用于普通或 async 函数体。
+execution domain。Task closure 使用最后一个表达式作为结果，不支持显式 `return`；`return`
+只用于普通或 async 函数体。`coroutine.sync(domain) { ... }` 使用普通尾随 closure，domain 必填。
 直接 `Task<T>` 是 `!Movable` 原地值，可以直接作为 struct、tuple 或固定数组中的静态字段；包含它的
 聚合值同样不可移动、按值传参、返回或捕获。`new Task { ... }` 创建可移动、非 Copyable 的
 `Task<T>^` owner。owner 可以按值传参、返回、存入字段、容器和泛型实例；Task 的公开类型不包含 execution
@@ -1234,19 +1234,20 @@ Task(domain: global_domain) {
 };
 ```
 
-在 async 函数中只需要结构化切换 execution domain 时，继续使用 `sync [Domain]`，不必创建临时
+在 async 函数中只需要结构化切换 execution domain 时，继续使用 `coroutine.sync(Domain)`，不必创建临时
 Task：
 
 ```c
 async Response load() {
-    sync [global_domain] {
+    coroutine.sync(global_domain) {
         request.send()
     }
 }
 ```
 
-这里 `sync` 挂起当前 coroutine，在 `global_domain` 执行 block，完成后回到进入前的 Domain；它不会
-阻塞 worker thread。普通同步函数中的最外层 `sync [Domain]` 仍会阻塞调用线程等待结果。
+这里 `coroutine.sync` 挂起当前 coroutine，在 `global_domain` 执行 closure，完成后回到进入前的
+Domain；它不会
+阻塞 worker thread。普通同步函数中的最外层 `coroutine.sync(Domain)` 仍会阻塞调用线程等待结果。
 
 ### 控制流（Control Flow）
 

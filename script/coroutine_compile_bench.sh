@@ -50,7 +50,7 @@ generate_source() {
     done
     printf '%s\n' '    total'
     printf '%s\n' '}'
-    printf '%s\n' 'Int main() { sync [CompileBench] { large_cfg(0) } }'
+    printf '%s\n' 'Int main() { coroutine.sync(CompileBench) { large_cfg(0) } }'
   } >"$SOURCE"
 }
 

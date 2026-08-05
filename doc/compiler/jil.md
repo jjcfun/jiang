@@ -362,9 +362,14 @@ runtime 通过 descriptor 原地构造并 type erase Executor，向用户 `enque
 `ExecutorJob`。同 binding 的 identity、serial gate、current executor 和 active frame
 仍由 runtime 维护，不能下放给用户 Executor。
 
-直接 `Task<T>` 不允许被嵌套 async/sync effect block 或 lambda 捕获；可移动的 `Task<T>^` owner
+直接 `Task<T>` 不允许被嵌套 async closure 或 lambda 捕获；可移动的 `Task<T>^` owner
 遵守普通 move、borrow、lifetime 与跨 Domain Sendable 规则。Task 可以运行于不同 domain，completion
 仍将 waiter enqueue 回等待方所在 current domain。
+
+动态 projection 中的 `Task<T>^` 被 `await()` 或 `cancel_and_await()` 消费时，lowering 在挂起前把
+owner handle move 到稳定 local，并把源 element 置空。resume/release 只引用稳定 local，不能让
+`IndexProjection.index_local` 隐式跨 suspend；frame rewrite 只改写 place base，不改写 projection
+内部保存的 local id。
 
 内建 macOS serial `DomainExecutor` 在创建 dispatch queue 时以 executor pointer 作为 queue-specific
 key 和 context，因此当前 job 可以无 TLS、无额外 job allocation 地验证 serial Domain 执行权。

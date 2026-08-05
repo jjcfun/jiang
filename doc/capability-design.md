@@ -15,14 +15,14 @@
 - `Atomic`、`Mutex` 等同步类型是跨 domain 共享可变状态的显式入口；Channel、Actor 留给后续版本。
 - 唯一性属于 `T&!` 类型并进入函数签名；参数位置不使用额外的能力修饰关键字。
 
-本文的主体是 capability。`effect` 用来描述调用上下文，例如 `unsafe`、`async`、`sync`；
+本文的主体是 capability。`effect` 用来描述调用上下文，例如 `unsafe`、`async`；
 data race 本身不靠 `write` / `set` effect，而靠 serial domain 与 capability 检查。
 
 ## 术语
 
 - **domain**：执行域。它描述一段代码在哪里运行，以及可变引用属于哪个执行上下文。
 - **serial domain**：串行执行域。同一个 serial domain 上的 continuation 不会并发执行。
-- **current domain**：当前 async/sync domain block 或 coroutine 执行所在的 domain。
+- **current domain**：当前 async closure 或 coroutine 执行所在的 domain。
 - **domain-neutral async function**：没有显式 domain 的 async 函数。它本身不选择 executor，
   只能在已有 current domain 的上下文中运行。
 - **domain switch / hop**：从一个 domain 进入另一个 domain 的执行上下文。
@@ -76,9 +76,9 @@ public const WorkerPoolDomain worker_pool_domain = WorkerPoolDomain();
 
 因此：
 
-- `current` 是语言内建特殊值，表示继承当前 async/sync domain context。
+- `current` 是语言内建特殊值，表示继承当前 async domain context。
 - `ui_domain`、`worker_pool_domain` 等不是语言魔法；它们是 import 后可见的命名 `const`。
-- `async [domain]` / `sync [domain]` 中的 `domain` 必须是实现 `Domain` 的 canonical const
+- `async [domain]` / `coroutine.sync(domain)` 中的 `domain` 必须是实现 `Domain` 的 canonical const
   binding；编译器通过 `Domain.kind` 读取 serial/concurrent 语义。
 
 `Domain.kind` 描述语言级串行性，`ExecutorType` 和 `make_executor` 选择排队策略。用户 Executor
@@ -113,21 +113,22 @@ async [ui_domain] () render(Model&! model) {
 在已有 current domain 的上下文中调用：
 
 ```jiang
-sync [ui_domain] {
+coroutine.sync(ui_domain) {
     Int value = load_data(); // 隐式 await，在 ui_domain current domain 上运行
 }
 ```
 
 带 domain 的 `async [D]` 函数是 domain-bound suspend function。调用它表示进入 `D` 执行
 callee body，参数按跨入 `D` 的规则检查；返回后 caller continuation 回到原 current domain。
-因此这类函数可以避免整个 body 再包一层 `sync [D] {}`。
+因此这类函数可以避免整个 body 再包一层 `coroutine.sync(D) {}`。
 
-`Task` initializer 与 `sync` block 可以带 domain。最外层进入异步运行时必须显式写 domain：
+`Task` initializer 可以显式指定 domain；`coroutine.sync` 始终要求 domain。最外层进入异步运行时
+必须显式写 domain：
 
 ```jiang
 import app_runtime;
 
-sync [app_runtime.ui_domain] {
+coroutine.sync(app_runtime.ui_domain) {
     load_data();
 }
 ```
@@ -140,19 +141,19 @@ Task(domain: app_runtime.ui_domain) {
 };
 ```
 
-只有外层已有 current domain 时，内层 `Task { ... }` / `sync { ... }` 才能省略 domain，
-并继承 current：
+只有外层已有 current domain 时，内层 `Task { ... }` 才能省略 domain 并继承 current：
 
 ```jiang
-sync [ui_domain] {
+coroutine.sync(ui_domain) {
     Task<Int> a = Task { load_data() }; // 继承 ui_domain
     Task<Int> b = Task { load_data() }; // 继承 ui_domain
     a.await() + b.await()
 }
 ```
 
-普通函数中直接写无 domain 的 `sync {}` 或 `Task { ... }` 应诊断，因为普通函数没有 current domain。
-Task initializer 当前只公开 `domain` 命名参数；runtime context 不是用户语法。
+普通函数中直接写无 domain 的 `Task { ... }` 应诊断，因为普通函数没有 current domain。
+`coroutine.sync` 的 domain 始终必填。Task initializer 当前只公开 `domain` 命名参数；runtime context
+不是用户语法。
 
 函数类型沿用第一个类型参数作为 callable signature head：
 
@@ -174,13 +175,13 @@ Fn<async [ui_domain] Int, Int> load = { id => fetch(id) };
 
 async `Fn` / `RawFn` 动态调用遵守与直接 async 调用相同的 Domain 切换和 Sendable 检查。
 
-`async [ui_domain]` / `sync [ui_domain]` 是 effect keyword option 中
-`async [domain: ui_domain]` / `sync [domain: ui_domain]` 的短写。
-函数声明和 callable type 只使用 canonical const Domain binding；带 `context` 的形式只用于 block。
+`async [ui_domain]` 是 effect keyword option 中 `async [domain: ui_domain]` 的短写。
+`coroutine.sync(ui_domain) { ... }` 是普通 closure API，不属于 effect keyword option。
+函数声明和 callable type 只使用 canonical const Domain binding。
 
 ## 默认 Domain
 
-普通函数没有默认 domain，也不是隐式 `sync [current]`：
+普通函数没有默认 domain，也不是隐式 `coroutine.sync(current)`：
 
 ```jiang
 () inc(Int&! value) {
@@ -193,14 +194,14 @@ Task。如果普通函数要进入异步运行时，必须显式写外层 domain
 
 ```jiang
 Int main() {
-    sync [ui_domain] {
+    coroutine.sync(ui_domain) {
         load_data()
     }
 }
 ```
 
-在已有 current domain 的 Task/sync block 或 async 调用链中，普通函数调用不切 domain，
-只是当前 coroutine 内的同步片段。普通函数没有 hidden domain/context 参数。
+在已有 current domain 的 Task closure、`coroutine.sync` closure 或 async 调用链中，普通函数调用
+不切 domain，只是当前 coroutine 内的同步片段。普通函数没有 hidden domain/context 参数。
 
 domain-neutral `async` 函数不绑定 domain；调用点必须已经有 current domain，coroutine frame
 也在该 current domain 下执行和恢复。实现上 async frame 可以携带隐藏的 coroutine
@@ -248,16 +249,15 @@ async () refresh(Model&! model) {
 `refresh` 本身不选择 domain。调用者需要在某个 current domain 中运行它：
 
 ```jiang
-sync [ui_domain] {
+coroutine.sync(ui_domain) {
     refresh(model$.mut_ref())
 }
 ```
 
-如果需要在其他 domain 启动工作，应使用显式 domain block。普通 mutable ref 不能跨到其他
-domain：
+如果需要在其他 domain 启动工作，应显式指定 domain。普通 mutable ref 不能跨到其他 domain：
 
 ```jiang
-sync [ui_domain] {
+coroutine.sync(ui_domain) {
     Task(domain: worker_pool_domain) {
         update_worker(model) // error: model 属于 ui_domain，不能进入 worker_pool_domain
     };
@@ -293,17 +293,17 @@ async () foo(T&! x) {
 - domain-neutral async 函数调用不切 domain；callee 在 caller 的 current domain 中挂起/恢复。
 - domain-bound `async [D]` 函数调用进入 `D`；参数必须能安全进入 `D`，返回后 caller 回到原
   current domain。
-- `Task { ... }` / `sync { ... }` 只有外层已有 current domain 时可省略 domain，并继承 current。
+- `Task { ... }` 只有外层已有 current domain 时可省略 domain，并继承 current。
 - `Task(domain: D) { ... }` 创建 task，是显式 domain 入口；如果 Domain binding `D` 不等于 current，
   则是 domain 切换边界。
-- 普通同步函数中的最外层 `sync [D] {}` 阻塞调用线程，进入 runtime 并等待 block 完成。
-- async context 中的 `sync [D] {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
-  block，完成后回到进入前的 domain；它不创建用户可见 Task，也不阻塞 worker thread。
+- 普通同步函数中的最外层 `coroutine.sync(D) {}` 阻塞调用线程，进入 runtime 并等待 closure 完成。
+- async context 中的 `coroutine.sync(D) {}` 是结构化 domain switch：挂起当前 coroutine，在 `D` 执行
+  closure，完成后回到进入前的 domain；它不创建用户可见 Task，也不阻塞 worker thread。
 - `task.await()` 不把 caller 留在 Task 的 execution domain；完成后 caller 回到等待方 current domain。
 
-async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` 直接执行 block；只有跨 Domain
-时才 enqueue 和挂起。domain-neutral async 函数也允许使用静态 `sync [D]`；当前可以保守 enqueue，
-后续再根据 frame 中的 current domain 增加运行时同 Domain fast path。
+async context 中若能静态证明 `D` 与 current domain 相同，`coroutine.sync(D)` 直接执行 closure；只有
+跨 Domain 时才 enqueue 和挂起。domain-neutral async 函数也允许使用静态 `coroutine.sync(D)`；当前可以
+保守 enqueue，后续再根据 frame 中的 current domain 增加运行时同 Domain fast path。
 
 跨 domain 时的能力检查：
 
@@ -314,7 +314,7 @@ async context 中若能静态证明 `D` 与 current domain 相同，`sync [D]` �
 - `T*` / `T*!`：跨 domain 需要 `unsafe` 边界。
 - `Atomic<T>` / `Mutex<T>`：由标准库或 runtime 声明为同步安全入口。
 
-`sync [D] {}` 即使结构化等待 block 完成，也不能把外层其他 domain 的普通 `T&!` 带入 `D`。
+`coroutine.sync(D) {}` 即使结构化等待 closure 完成，也不能把外层其他 domain 的普通 `T&!` 带入 `D`。
 等待不为普通引用增加跨 domain 同步语义。
 
 ## Task 与结构化并发
@@ -417,16 +417,15 @@ Task<Int>^ make_task() {
 编译器内部 task kind 只保存 result type；domain 不进入公开类型身份。TaskState 直接内联为 Task 的
 唯一字段，`Task<T>^` 只是 heap Task 的 owner pointer，不指向第二个 control block。
 
-直接 Task 的 observer ownership 固定在创建它的 async/sync effect body；直接 binding 或包含它的聚合值
-不能被嵌套的 async/sync
-block 或 lambda 捕获。`Task<T>^` owner 可以 move 进普通 callable 或其他存储，并遵守普通 lifetime
-与跨 Domain Sendable 规则。Task 可以运行于不同 domain，完成后 caller 仍回到等待方 current
-domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
+直接 Task 的 observer ownership 固定在创建它的 async closure body；直接 binding 或包含它的聚合值
+不能被嵌套的 async closure 或 lambda 捕获。`Task<T>^` owner 可以 move 进普通 callable 或其他存储，
+并遵守普通 lifetime 与跨 Domain Sendable 规则。Task 可以运行于不同 domain，完成后 caller 仍回到
+等待方 current domain。跨 domain 返回的 result 必须满足对应的 Sendable 约束。
 
 ```jiang
-sync [ui_domain] {
+coroutine.sync(ui_domain) {
     Task<Image> image = Task(domain: worker_pool_domain) { load_image() };
-    Image value = image.await(); // allowed: Task 没有被嵌套 effect block 捕获
+    Image value = image.await(); // allowed: Task 没有被嵌套 closure 捕获
 }
 ```
 
@@ -440,7 +439,7 @@ Task(domain: ui_domain) {
 普通 `T&!` 不能被捕获到不同 domain。`Task(domain: D) { ... }` 是严格 domain 切换边界：
 
 ```jiang
-sync [ui_domain] {
+coroutine.sync(ui_domain) {
     Task(domain: worker_pool_domain) {
         update_worker(model) // error: model 属于 ui_domain，不能进入 worker_pool_domain task
     };
@@ -509,7 +508,7 @@ move/copy 结果；Channel 和 actor 消息留给后续版本，需要底层逃�
 - actor 内部方法在该 actor 的 serial domain 上串行执行。
 
 初版不建议把 actor 纳入核心 domain 语法，因为每个 actor instance 的 domain 往往是运行时值，
-而当前 `async [D]` / `sync [D]` block 要求 `D` 是 canonical const Domain binding。可以先用库层
+而当前 `async [D]` / `coroutine.sync(D)` 要求 `D` 是 canonical const Domain binding。可以先用库层
 `Actor<T>` 封装状态；
 未来如果需要语言级 actor，再单独设计 `self domain` 或 instance domain。
 

@@ -1017,11 +1017,10 @@ Task creation 是 eager 的。`Task { ... }` 创建地址固定的直接 `Task<T
 `coroutine.check_cancelled()` 建立显式检查点。普通 `await()` 发现 child 已取消且没有 result
 时，当前 parent 进入 cancellation cleanup，并取消、等待其余 sibling。
 
-`sync [Domain] { ... }` 在 async context 中挂起当前 coroutine，结构化切换到目标 Domain，完成后回到
-原 Domain；它不创建 Task。普通同步函数用最外层 `sync [Domain]` 进入 runtime 时，会阻塞当前
-线程等待 block 完成。`Task { ... }` 与 `sync { ... }` 只能继承已有 current Domain；
-`Task(domain: D) { ... }` 显式选择 execution Domain。Task closure 与 sync block 使用 tail
-expression 作为结果，不支持显式 `return`。
+`coroutine.sync(Domain) { ... }` 接受必填 Domain 和普通尾随 closure。在 async context 中，它挂起
+当前 coroutine，结构化切换到目标 Domain，完成后回到原 Domain；它不创建用户可见 Task。普通同步函数
+用最外层 `coroutine.sync(Domain)` 进入 runtime 时，会阻塞当前线程等待 closure 完成。
+`Task { ... }` 可以继承已有 current Domain；`Task(domain: D) { ... }` 显式选择 execution Domain。
 
 `main_domain` 是绑定进程启动线程的标准串行 Domain，`global_domain`
 是进程共享的标准并发 Domain。
