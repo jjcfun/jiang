@@ -64,6 +64,27 @@ previous stable
 release 分支最终 rebase 到最后一个 bootstrap checkpoint，使源码历史和可复现自举顺序一致。
 各阶段必须使用独立 build 目录，不混用编译产物。
 
+### 0.5.2 严格检查过渡模式
+
+0.5.2 的 mutable receiver/place 写能力规则始终执行同一套分析。过渡编译器默认以 strict
+模式编译普通源码；只有 bootstrap 自举可以显式使用 `--bootstrap-check-mode audit`。audit
+只降级 `src/`、`std/` 中的可变性诊断与 borrow-check 诊断，测试或用户源码中的违规仍然
+失败；syntax、resolve 和其他 type-check 错误也始终失败。
+
+`BOOTSTRAP_DEPTH=stable` 默认用 audit 构建 self-host candidate。audit warning 不阻止候选
+编译器生成；任何未降级的 fatal diagnostic 仍使构建失败，而且失败的 candidate 不会替换已有
+编译器。
+迁移完成后使用以下门槛切回 strict：
+
+```bash
+BOOTSTRAP_DEPTH=stable \
+BOOTSTRAP_CHECK_MODE=strict \
+VERIFY=full \
+bash ./script/build_next.sh
+```
+
+audit candidate 不是 release compiler，也不提供已经通过借用安全验证的承诺。
+
 ## Linux 首次 hosted port seed
 
 0.5.0 正式产物只有 macOS arm64 compiler。0.5.1 首次建立 Linux x86_64 hosted 自举时，

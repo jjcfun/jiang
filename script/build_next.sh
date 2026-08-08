@@ -8,6 +8,7 @@ NEXT_BIN="${NEXT_BIN:-$BUILD_BIN_DIR/jiangc.next}"
 JIANGC_BIN="${JIANGC_BIN:-$BUILD_BIN_DIR/jiangc}"
 VERIFY="${VERIFY:-full}"
 BOOTSTRAP_DEPTH="${BOOTSTRAP_DEPTH:-next}"
+BOOTSTRAP_CHECK_MODE="${BOOTSTRAP_CHECK_MODE:-audit}"
 PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "$ROOT_DIR/package.ini" | head -n 1)"
 JIANG_VERSION="$PACKAGE_VERSION"
 BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
@@ -87,6 +88,14 @@ case "$BOOTSTRAP_DEPTH" in
     ;;
 esac
 
+case "$BOOTSTRAP_CHECK_MODE" in
+  audit|strict) ;;
+  *)
+    echo "invalid BOOTSTRAP_CHECK_MODE=$BOOTSTRAP_CHECK_MODE; expected audit or strict" >&2
+    exit 2
+    ;;
+esac
+
 case "$JIANG_VERSION" in
   (*[!A-Za-z0-9._+-]*|'')
     echo "invalid JIANG_VERSION=$JIANG_VERSION; expected [A-Za-z0-9._+-]+" >&2
@@ -145,6 +154,10 @@ emit_compiler_with_compiler() {
   local output_bin="$2"
   test -x "$source_bin"
   printf '== build next: compile executable with %s ==\n' "$source_bin"
+  if [ "$BOOTSTRAP_CHECK_MODE" = "audit" ]; then
+    emit_compiler_with_audit "$source_bin" "$output_bin"
+    return
+  fi
   "$source_bin" \
     --artifact-cache-dir "$NEXT_ARTIFACT_CACHE_DIR" \
     --linker "$CLANG_BIN" \
@@ -154,6 +167,24 @@ emit_compiler_with_compiler() {
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
+}
+
+emit_compiler_with_audit() {
+  local source_bin="$1"
+  local output_bin="$2"
+  local candidate="$output_bin.bootstrap-audit-candidate"
+  rm -f "$candidate"
+  "$source_bin" \
+    --bootstrap-check-mode audit \
+    --artifact-cache-dir "$NEXT_ARTIFACT_CACHE_DIR" \
+    --linker "$CLANG_BIN" \
+    "${LLVM_LINK_ARGS[@]}" \
+    -o "$candidate" \
+    src/jiangc.jiang
+  mv "$candidate" "$output_bin"
+  test -x "$output_bin"
+  write_compiler_build_id "$output_bin"
+  printf 'OK %s (bootstrap audit)\n' "$output_bin"
 }
 
 collect_llvm_link_args
