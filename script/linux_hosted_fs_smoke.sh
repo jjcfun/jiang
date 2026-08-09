@@ -24,10 +24,4 @@ TEST_TIMEOUT=120 \
 JIANGC="$JIANGC" \
 bash "$ROOT_DIR/script/test.sh"
 
-TEST_ROOT=test/lang \
-TEST_LIST="$PROFILE" \
-TEST_TIMEOUT=120 \
-JIANGC="$JIANGC" \
-bash "$ROOT_DIR/script/test.sh"
-
 echo "OK Linux hosted fs smoke"

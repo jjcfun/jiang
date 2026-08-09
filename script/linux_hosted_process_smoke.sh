@@ -28,7 +28,7 @@ bash "$ROOT_DIR/script/test.sh"
 
 process_filter='process/run/process_(arguments|path_lookup)'
 process_filter="$process_filter|system/run/process_(pipe_stdout|pipe_large_stdout|stderr_discard)"
-TEST_ROOT=test/lang \
+TEST_ROOT=test/compiler \
 TEST_FILTER="$process_filter" \
 TEST_TIMEOUT=60 \
 JIANGC="$JIANGC" \
@@ -37,7 +37,7 @@ bash "$ROOT_DIR/script/test.sh"
 discard_bin="$SMOKE_DIR/process_stderr_discard"
 discard_stdout="$SMOKE_DIR/process_stderr_discard.stdout"
 discard_stderr="$SMOKE_DIR/process_stderr_discard.stderr"
-"$JIANGC" -o "$discard_bin" test/lang/system/run/process_stderr_discard.jiang
+"$JIANGC" -o "$discard_bin" test/compiler/system/run/process_stderr_discard.jiang
 "$discard_bin" >"$discard_stdout" 2>"$discard_stderr"
 test "$(wc -c <"$discard_stdout" | tr -d ' ')" = "0"
 test ! -s "$discard_stderr"

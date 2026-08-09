@@ -417,7 +417,7 @@ fi
 "$compiler_bin" --link-arg "$host_dead_strip_arg" -o "$sample_with_link_arg" "$sample"
 "$sample_with_link_arg"
 
-"$compiler_bin" -o "$system_env_bin" test/lang/system/run/env_get.jiang
+"$compiler_bin" -o "$system_env_bin" test/compiler/system/run/env_get.jiang
 "$system_env_bin"
 
 "$compiler_bin" --mode release --emit-obj -o "$sample_release_obj" "$sample"

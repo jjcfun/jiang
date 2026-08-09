@@ -25,11 +25,4 @@ TEST_JOBS=1 \
 JIANGC="$JIANGC" \
 bash "$ROOT_DIR/script/test.sh"
 
-TEST_ROOT=test/lang \
-TEST_LIST="$PROFILE" \
-TEST_TIMEOUT=180 \
-TEST_JOBS=2 \
-JIANGC="$JIANGC" \
-bash "$ROOT_DIR/script/test.sh"
-
 echo "OK Linux hosted dylib smoke"

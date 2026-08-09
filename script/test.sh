@@ -573,14 +573,14 @@ run_case_kind() {
     fail) run_fail_case "$source" "$work_dir" ;;
     emit) run_emit_case "$source" "$work_dir" ;;
     run)
-      if [ -n "$COMPILER_TEST_BIN" ]; then
+      if [ -n "$COMPILER_TEST_BIN" ] && ! grep -Fqx '// compiler-integration' "$source"; then
         run_compiler_case "$source" "$work_dir" "$COMPILER_TEST_BIN" run
       else
         run_run_case "$source" "$work_dir"
       fi
       ;;
     release)
-      if [ -n "$COMPILER_TEST_RELEASE_BIN" ]; then
+      if [ -n "$COMPILER_TEST_RELEASE_BIN" ] && ! grep -Fqx '// compiler-integration' "$source"; then
         run_compiler_case "$source" "$work_dir" "$COMPILER_TEST_RELEASE_BIN" release-run
       else
         run_release_case "$source" "$work_dir"
@@ -641,6 +641,21 @@ prepare_run_root() {
 
 uses_compiler_test_runner() {
   [ "$TEST_ROOT" = "test/compiler" ] || [ "$TEST_ROOT" = "$ROOT_DIR/test/compiler" ]
+}
+
+compiler_cases_need_aggregate() {
+  local index=0
+  while [ "$index" -lt "${#CASE_KINDS[@]}" ]; do
+    case "${CASE_KINDS[$index]}" in
+      run|release)
+        if ! grep -Fqx '// compiler-integration' "${CASE_SOURCES[$index]}"; then
+          return 0
+        fi
+        ;;
+    esac
+    index=$((index + 1))
+  done
+  return 1
 }
 
 build_compiler_test_executable() {
@@ -706,7 +721,7 @@ build_sanitized_compiler_test_executable() {
 }
 
 prepare_compiler_test_runner() {
-  if ! uses_compiler_test_runner; then
+  if ! uses_compiler_test_runner || ! compiler_cases_need_aggregate; then
     return 0
   fi
   COMPILER_TEST_BIN="$RUN_ROOT/compiler-tests"
