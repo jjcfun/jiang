@@ -58,9 +58,11 @@ public struct DeclCheck: Movable {
     }
 
     public () check_declaration_signatures(self) {
-        // 第一遍只检查声明签名和类型引用，不进入函数体。这样函数体
-        // type check 时可以跨 module 读取已绑定的 DefId -> TypeId。
+        // Lifetime shape 可以跨声明读取字段类型。先绑定整包字段类型，再验证
+        // lifetime/ownership 合同，避免源码顺序影响结构化 shape。函数类型仍在
+        // 合同规范化之后构造。
         self.predeclare_nominal_region_schemas();
+        self.bind_lifetime_field_types();
         self.check_builtin_declaration_signatures();
         Int module_index! = 0;
         while (module_index < self.state.graph.module_count()) {
@@ -71,6 +73,29 @@ public struct DeclCheck: Movable {
         }
         self.check_extension_generic_constraints();
         self.check_extension_trait_conformances();
+    }
+
+    () bind_lifetime_field_types(self) {
+        Int module_index! = 0;
+        while (module_index < self.state.graph.module_count()) {
+            qid.ModuleId module_id = self.state.graph.module_at(module_index);
+            store.ModuleRecord& module = self.state.store.resolve.module_ref(module_id);
+            self.bind_lifetime_field_type_tree(module.def_id);
+            module_index = module_index + 1;
+        }
+    }
+
+    () bind_lifetime_field_type_tree(self, qid.DefId def_id) {
+        guard self.state.model.def(def_id) is .some(model_def) else { return; }
+        def.DefKind kind = self.state.store.defs.get(def_id).kind;
+        if (kind == .field_def || kind == .union_variant_def) {
+            self.bind_declaration_type(model_def);
+        }
+        Int index! = 0;
+        while (index < model_def.members.len()) {
+            self.bind_lifetime_field_type_tree(model_def.members.get(index));
+            index = index + 1;
+        }
     }
 
     () predeclare_nominal_region_schemas(self) {
@@ -371,12 +396,15 @@ public struct DeclCheck: Movable {
         self.check_struct_declaration(model_def);
         self.check_enum_declaration(model_def);
         self.check_const_global_declaration(model_def);
-        if (self.type_ops.decl_has_type(model_def.decl)
-            && !self.decl_type_needs_initializer(model_def)
-            && !self.decl_type_is_function_alias(model_def)) {
-            self.type_ops.type_for_decl_def(model_def.def_id);
-        }
+        self.bind_declaration_type(model_def);
         self.check_language_main_signature(model_def);
+    }
+
+    () bind_declaration_type(self, sem.Def& model_def) {
+        if (!self.type_ops.decl_has_type(model_def.decl)) { return; }
+        if (self.decl_type_needs_initializer(model_def)) { return; }
+        if (self.decl_type_is_function_alias(model_def)) { return; }
+        self.type_ops.type_for_decl_def(model_def.def_id);
     }
 
     Bool def_is_from_interface_only_module(self, qid.DefId def_id) {
@@ -991,6 +1019,7 @@ public struct DeclCheck: Movable {
         }
         if (self.callable_lifetime_name_allowed(model_def, name)) { return true; }
         if (self.tuple_lifetime_name_allowed(model_def, name)) { return true; }
+        if (self.generic_lifetime_name_allowed(model_def, name)) { return true; }
         return self.public_region_projection(model_def, name) != null;
     }
 
@@ -1024,6 +1053,10 @@ public struct DeclCheck: Movable {
                 return self.semantic_lifetime_position_shape(
                     tuple_query.lifetime_shape(tuple_path.type_id)
                 );
+            }
+            if (self.generic_lifetime_name_shape(model_def, name)
+                is .some(generic_shape)) {
+                return generic_shape;
             }
         }
         if (self.public_region_projection(model_def, name) != null) {
@@ -1270,7 +1303,21 @@ public struct DeclCheck: Movable {
                 "duplicate_life_annotation"
             );
         }
-        if (!has_schema && field.life_annotation_count > 0) {
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        if (self.raw_pointer_field_requires_storage_policy(field_type, query)
+            && field.life_annotation_count == 0) {
+            self.type_ops.add_def_error(
+                field_def,
+                "raw storage of a regionable type must declare @life(...) or @life() policy",
+                "raw_pointer_storage_policy_required"
+            );
+            return;
+        }
+        Bool explicit_non_owning_raw = field.has_explicit_empty_lifetime_contract
+            && self.type_is_raw_pointer(field_type);
+        if (!has_schema && field.life_annotation_count > 0 && !explicit_non_owning_raw) {
             self.type_ops.add_def_error(
                 owner.def_id,
                 "field @life bindings require an @region declaration on the enclosing type",
@@ -1278,20 +1325,12 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
-        lifetime_shape_query.LifetimeShapeQuery query! =
-            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
-        lifetime_shape.LifetimeShapeId shape = query.lifetime_shape(field_type);
+        if (explicit_non_owning_raw) { return; }
+        lifetime_shape.LifetimeShapeId shape =
+            query.field_binding_lifetime_shape(field_def, field_type);
         lifetime_shape.LifetimeShapeClass shape_class =
             self.state.results.lifetime_shapes.classify(shape);
         if (!has_schema) {
-            if (shape_class != .empty && !self.field_type_has_empty_lifetime_bound(owner, field_type)) {
-                self.type_ops.add_def_error(
-                    field_def,
-                    "a lifetime-carrying field requires @region on the enclosing nominal type",
-                    "nominal_lifetime_region_required"
-                );
-            }
             return;
         }
         if (self.field_life_uses_self(field)) {
@@ -1325,6 +1364,16 @@ public struct DeclCheck: Movable {
             );
             return;
         }
+        if (shape_class == .unknown
+            && query.is_generic_symbolic_shape(shape)
+            && self.field_life_binding_is_positional(field)) {
+            self.check_generic_outlives_field_binding(
+                owner,
+                field,
+                used_regions
+            );
+            return;
+        }
         if (!self.lifetime_shape_is_direct_position(shape)) {
             self.check_structured_field_binding(
                 owner,
@@ -1335,6 +1384,48 @@ public struct DeclCheck: Movable {
             return;
         }
         self.check_single_slot_field_binding(owner, field, used_regions);
+    }
+
+    () check_generic_outlives_field_binding(
+        self,
+        sem.Def& owner,
+        sem.Def& field,
+        list.ArrayList<qid.SymbolId>& used_regions
+    ) {
+        if (field.life_clauses.len() != 1
+            || field.life_clauses.get(0).target != null) {
+            self.type_ops.add_def_error(
+                field.def_id,
+                "a generic field shape requires one scalar @life source expression",
+                "invalid_generic_outlives_binding"
+            );
+            return;
+        }
+        self.check_field_life_clause_source(
+            owner,
+            field.def_id,
+            field.life_clauses.get(0),
+            self.state.results.lifetime_shapes.slot_shape(),
+            used_regions
+        );
+    }
+
+    Bool raw_pointer_field_requires_storage_policy(
+        self,
+        qid.TypeId field_type,
+        lifetime_shape_query.LifetimeShapeQuery query
+    ) {
+        types.TypeInfo info = self.state.store.types.get(field_type);
+        guard info.data is .handle_type(handle) else { return false; }
+        if (!types.is_raw_pointer_handle(handle)) { return false; }
+        lifetime_shape.LifetimeShapeId element_shape = query.lifetime_shape(handle.element);
+        return self.state.results.lifetime_shapes.classify(element_shape) != .empty;
+    }
+
+    Bool type_is_raw_pointer(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .handle_type(handle) else { return false; }
+        return types.is_raw_pointer_handle(handle);
     }
 
     sem.NamedTypeRef? field_callable_type_ref(self, sem.Def& field) {
@@ -1548,30 +1639,6 @@ public struct DeclCheck: Movable {
         return count;
     }
 
-    Bool field_type_has_empty_lifetime_bound(self, sem.Def& owner, qid.TypeId field_type) {
-        types.TypeInfo info = self.state.store.types.get(field_type);
-        guard info.data is .named(named) else { return false; }
-        if (self.state.store.defs.get(named.def_id).kind != .generic_param_def) {
-            return false;
-        }
-        qid.SymbolId atomic_value = self.state.store.symbols.intern("AtomicValue");
-        Int index! = 0;
-        while (index < owner.where_predicates.len()) {
-            sem.WherePredicate predicate = owner.where_predicates.get(index);
-            index = index + 1;
-            guard predicate is .type_bound(bound) else { continue; }
-            sem.Node subject = self.state.model.node(bound.subject);
-            guard subject.data is .named_type_ref(subject_name) else { continue; }
-            if (subject_name.def_id.to_index() != named.def_id.to_index()) { continue; }
-            sem.Node trait_ref = self.state.model.node(bound.bound);
-            guard trait_ref.data is .named_type_ref(trait_name) else { continue; }
-            if (self.state.store.defs.get(trait_name.def_id).name.symbol == atomic_value) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     () reject_empty_field_life_binding(self, sem.Def& field) {
         if (field.life_clauses.len() == 0) { return; }
         self.type_ops.add_def_error(
@@ -1618,7 +1685,8 @@ public struct DeclCheck: Movable {
         if (self.field_life_binding_is_positional(field)) {
             lifetime_shape_query.LifetimeShapeQuery query! =
                 lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
-            lifetime_shape.LifetimeShapeId shape = query.lifetime_shape(field_type);
+            lifetime_shape.LifetimeShapeId shape =
+                query.field_binding_lifetime_shape(field.def_id, field_type);
             self.check_positional_slice_field_binding(
                 owner,
                 field,
@@ -1814,6 +1882,18 @@ public struct DeclCheck: Movable {
         lifetime_shape_query.LifetimeShapeQuery query! =
             lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
         return self.lifetime_shape_binding_position_count(query.lifetime_shape(type_id));
+    }
+
+    Int type_lifetime_binding_position_count_in_context(
+        self,
+        qid.TypeId type_id,
+        list.ArrayList<qid.DefId>& visiting
+    ) {
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        return self.lifetime_shape_binding_position_count(
+            query.lifetime_shape_in_context(type_id, visiting)
+        );
     }
 
     Bool int_list_contains(self, list.ArrayList<Int>& values, Int candidate) {
@@ -2797,6 +2877,15 @@ public struct DeclCheck: Movable {
             paths.add(ResolvedLifetimeSlotPath(slot_index: 0, path: root));
             return;
         }
+        if (self.append_generic_lifetime_paths(
+            model_def,
+            name,
+            root,
+            root_type,
+            paths
+        )) {
+            return;
+        }
         if (self.public_region_projection(model_def, name) is .some(region)) {
             types.TypeInfo root_info = self.state.store.types.get(root_type);
             if (root_info.data is .handle_type(handle)
@@ -2947,9 +3036,22 @@ public struct DeclCheck: Movable {
         list.ArrayList<ResolvedLifetimeSlotPath>& paths
     ) {
         sem.Def& field = self.state.model.def_ref(field_def);
-        qid.TypeId field_type = self.lifetime_field_type(owner_type, field_def);
+        qid.TypeId field_type = self.lifetime_field_binding_type(owner_type, field_def);
         types.LifetimeProjectionPathId field_path =
             self.state.store.types.intern_lifetime_projection(prefix, .field, field_def, 0);
+        if (self.field_uses_generic_outlives(field_def)) {
+            self.append_generic_outlives_field_region_paths(
+                field,
+                field_type,
+                region,
+                root,
+                field_path,
+                slot_index,
+                visiting,
+                paths
+            );
+            return;
+        }
         if (self.type_lifetime_binding_position_count(field_type) == 1) {
             if (self.single_field_binding_matches(field, region)) {
                 self.append_single_field_region_paths(
@@ -3011,6 +3113,53 @@ public struct DeclCheck: Movable {
                 visiting,
                 paths
             );
+        }
+    }
+
+    Bool field_uses_generic_outlives(self, qid.DefId field_def) {
+        sem.Def& field = self.state.model.def_ref(field_def);
+        if (field.life_clauses.len() != 1
+            || field.life_clauses.get(0).target != null) {
+            return false;
+        }
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        lifetime_shape.LifetimeShapeId shape =
+            query.field_binding_lifetime_shape(field_def, field_type);
+        return query.is_generic_symbolic_shape(shape);
+    }
+
+    () append_generic_outlives_field_region_paths(
+        self,
+        sem.Def& field,
+        qid.TypeId field_type,
+        qid.SymbolId region,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId field_path,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        sem.LifeClause clause = field.life_clauses.get(0);
+        if (!self.field_clause_source_contains_region(clause, region)) { return; }
+        Int count = self.type_lifetime_binding_position_count(field_type);
+        Int binding_index! = 0;
+        while (binding_index < count) {
+            if (self.field_is_logical_raw_storage(field.def_id)) {
+                self.add_resolved_lifetime_path(root, field_path, slot_index, paths);
+            } else {
+                self.append_type_binding_position_path(
+                    field_type,
+                    binding_index,
+                    root,
+                    field_path,
+                    slot_index,
+                    visiting,
+                    paths
+                );
+            }
+            binding_index = binding_index + 1;
         }
     }
 
@@ -3290,6 +3439,19 @@ public struct DeclCheck: Movable {
             );
             return;
         }
+        if (info.data is .named(_)) {
+            if (self.append_structural_nominal_binding_position_path(
+                type_id,
+                binding_index,
+                root,
+                prefix,
+                slot_index,
+                visiting,
+                paths
+            )) {
+                return;
+            }
+        }
         if (self.lifetime_slice_element_type(type_id) is .some(element_type)) {
             if (binding_index == 0) {
                 self.add_resolved_lifetime_path(root, prefix, slot_index, paths);
@@ -3306,9 +3468,73 @@ public struct DeclCheck: Movable {
             );
             return;
         }
-        if (binding_index == 0 && self.type_lifetime_binding_position_count(type_id) == 1) {
+        if (binding_index == 0
+            && self.type_lifetime_binding_position_count_in_context(type_id, visiting) == 1) {
             self.add_resolved_lifetime_path(root, prefix, slot_index, paths);
         }
+    }
+
+    Bool append_structural_nominal_binding_position_path(
+        self,
+        qid.TypeId type_id,
+        Int binding_index,
+        types.LifetimePath root,
+        types.LifetimeProjectionPathId? prefix,
+        Int slot_index,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .named(named) else { return false; }
+        if (!self.is_nominal_def_kind(self.state.store.defs.get(named.def_id).kind)) {
+            return false;
+        }
+        if (self.public_region_owner_for_type(type_id) != null) { return false; }
+        guard self.state.model.def(named.def_id) is .some(owner) else { return false; }
+        if (self.def_list_contains(visiting, owner.def_id)) { return true; }
+        visiting.add(owner.def_id);
+        Int offset! = 0;
+        Int index! = 0;
+        while (index < owner.members.len()) {
+            qid.DefId field_def = owner.members.get(index);
+            index = index + 1;
+            if (!self.is_lifetime_field_kind(self.state.store.defs.get(field_def).kind)) {
+                continue;
+            }
+            qid.TypeId field_type = self.lifetime_field_binding_type(type_id, field_def);
+            Int count = self.type_lifetime_binding_position_count_in_context(
+                field_type,
+                visiting
+            );
+            if (binding_index < offset || binding_index >= offset + count) {
+                offset = offset + count;
+                continue;
+            }
+            types.LifetimeProjectionPathId field_path =
+                self.state.store.types.intern_lifetime_projection(
+                    prefix,
+                    .field,
+                    field_def,
+                    0
+                );
+            if (self.field_is_logical_raw_storage(field_def)) {
+                self.add_resolved_lifetime_path(root, field_path, slot_index, paths);
+            } else {
+                self.append_type_binding_position_path(
+                    field_type,
+                    binding_index - offset,
+                    root,
+                    field_path,
+                    slot_index,
+                    visiting,
+                    paths
+                );
+            }
+            visiting.pop();
+            return true;
+        }
+        visiting.pop();
+        return true;
     }
 
     () append_tuple_binding_position_path(
@@ -3325,7 +3551,10 @@ public struct DeclCheck: Movable {
         Int index! = 0;
         while (index < tuple_type.items.length) {
             qid.TypeId item_type = tuple_type.items[index];
-            Int count = self.type_lifetime_binding_position_count(item_type);
+            Int count = self.type_lifetime_binding_position_count_in_context(
+                item_type,
+                visiting
+            );
             if (binding_index >= offset && binding_index < offset + count) {
                 types.LifetimeProjectionPathId item_path =
                     self.state.store.types.intern_lifetime_projection(
@@ -3606,9 +3835,7 @@ public struct DeclCheck: Movable {
         sem.LifetimeName target,
         list.ArrayList<types.LifetimeFlow>& flows
     ) {
-        guard self.semantic_lifetime_path(model_def, source) is .some(source_path) else { return; }
-        guard self.semantic_lifetime_path(model_def, target) is .some(target_path) else { return; }
-        flows.add(types.LifetimeFlow(source: source_path, target: target_path));
+        self.append_canonical_lifetime_flows(model_def, source, target, flows);
     }
 
     () append_default_function_lifetime_flow(
@@ -4247,6 +4474,7 @@ public struct DeclCheck: Movable {
 
     Bool lifetime_projection_allowed(self, sem.Def& model_def, sem.LifetimeName name) {
         if (name.projection_path == null) { return true; }
+        if (self.generic_lifetime_name_allowed(model_def, name)) { return true; }
         guard self.lifetime_root_type(model_def, name) is .some(root_type) else { return false; }
         guard name.projection_path is .some(path_id) else { return false; }
         return self.lifetime_path_type(model_def.def_id, root_type, path_id) != null;
@@ -4412,6 +4640,24 @@ public struct DeclCheck: Movable {
         return self.type_ops.substitute_generic_type_with_args(field_type, owner_def, args$.ref());
     }
 
+    qid.TypeId lifetime_field_binding_type(self, qid.TypeId base_type, qid.DefId field_def) {
+        qid.TypeId field_type = self.lifetime_field_type(base_type, field_def);
+        if (!self.field_is_logical_raw_storage(field_def)) { return field_type; }
+        types.TypeInfo info = self.state.store.types.get(field_type);
+        guard info.data is .handle_type(handle) else { return field_type; }
+        if (!types.is_raw_pointer_handle(handle)) { return field_type; }
+        return handle.element;
+    }
+
+    Bool field_is_logical_raw_storage(self, qid.DefId field_def) {
+        sem.Def& field = self.state.model.def_ref(field_def);
+        if (field.life_clauses.len() == 0) { return false; }
+        qid.TypeId field_type = self.type_ops.type_for_def(field_def);
+        types.TypeInfo info = self.state.store.types.get(field_type);
+        guard info.data is .handle_type(handle) else { return false; }
+        return types.is_raw_pointer_handle(handle);
+    }
+
     Bool callable_lifetime_name_allowed(self, sem.Def& model_def, sem.LifetimeName name) {
         guard name.kind == .named_lifetime else { return false; }
         guard name.symbol is .some(owner_symbol) else { return false; }
@@ -4427,6 +4673,205 @@ public struct DeclCheck: Movable {
         sem.LifetimeName name
     ) {
         return self.resolve_tuple_lifetime_name(model_def, name) != null;
+    }
+
+    Bool generic_lifetime_name_allowed(
+        self,
+        sem.Def& model_def,
+        sem.LifetimeName name
+    ) {
+        return self.generic_lifetime_name_shape(model_def, name) != null;
+    }
+
+    lifetime_shape.LifetimeShapeId? generic_lifetime_name_shape(
+        self,
+        sem.Def& model_def,
+        sem.LifetimeName name
+    ) {
+        list.ArrayList<Bool> mask! = list.ArrayList<Bool>();
+        guard self.resolve_generic_lifetime_selection(model_def, name, mask$.ref())
+            is .some(root_type) else {
+            return null;
+        }
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        lifetime_shape.LifetimeShapeId root_shape = query.lifetime_shape(root_type);
+        guard query.select_binding_positions(root_shape, mask$.ref())
+            is .some(selected) else {
+            return null;
+        }
+        if (self.state.results.lifetime_shapes.classify(selected) == .empty) {
+            return null;
+        }
+        return self.semantic_lifetime_position_shape(selected);
+    }
+
+    Bool append_generic_lifetime_paths(
+        self,
+        sem.Def& model_def,
+        sem.LifetimeName name,
+        types.LifetimePath root,
+        qid.TypeId root_type,
+        list.ArrayList<ResolvedLifetimeSlotPath>& paths
+    ) {
+        list.ArrayList<Bool> mask! = list.ArrayList<Bool>();
+        if (self.resolve_generic_lifetime_selection(model_def, name, mask$.ref()) == null) {
+            return false;
+        }
+        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+        Int slot_index! = 0;
+        Int binding_index! = 0;
+        while (binding_index < mask.len()) {
+            if (mask.get(binding_index)) {
+                self.append_type_binding_position_path(
+                    root_type,
+                    binding_index,
+                    root,
+                    root.projection_path,
+                    slot_index,
+                    visiting$.ref(),
+                    paths
+                );
+                slot_index = slot_index + 1;
+            }
+            binding_index = binding_index + 1;
+        }
+        return slot_index > 0;
+    }
+
+    qid.TypeId? resolve_generic_lifetime_selection(
+        self,
+        sem.Def& model_def,
+        sem.LifetimeName name,
+        list.ArrayList<Bool>& mask
+    ) {
+        guard name.projection_path is .some(path_id) else { return null; }
+        guard self.lifetime_root_type_ref(model_def, name) is .some(type_ref) else {
+            return null;
+        }
+        guard self.lifetime_root_type(model_def, name) is .some(root_type) else {
+            return null;
+        }
+        mask.clear();
+        Int count = self.type_lifetime_binding_position_count(root_type);
+        Int index! = 0;
+        while (index < count) {
+            mask.add(true);
+            index = index + 1;
+        }
+        guard self.resolve_generic_lifetime_path(
+            type_ref,
+            root_type,
+            path_id,
+            mask
+        ) is .some(_) else {
+            mask.clear();
+            return null;
+        }
+        if (!self.bool_list_has_true(mask)) {
+            mask.clear();
+            return null;
+        }
+        return root_type;
+    }
+
+    sem.NodeId? resolve_generic_lifetime_path(
+        self,
+        sem.NodeId root_type_ref,
+        qid.TypeId root_type,
+        sem.LifetimePathId path_id,
+        list.ArrayList<Bool>& root_mask
+    ) {
+        sem.LifetimePathNode node = self.state.model.lifetime_path_node(path_id);
+        sem.NodeId base_type_ref! = root_type_ref;
+        qid.TypeId base_type! = root_type;
+        if (node.parent is .some(parent)) {
+            guard self.resolve_generic_lifetime_path(
+                root_type_ref,
+                root_type,
+                parent,
+                root_mask
+            ) is .some(parent_ref) else {
+                return null;
+            }
+            base_type_ref = parent_ref;
+            base_type = self.type_ops.check_non_task_container_type_ref(parent_ref);
+        }
+        guard node.projection.kind == .field else { return null; }
+        guard node.projection.symbol is .some(symbol) else { return null; }
+        sem.Node type_node = self.state.model.node(base_type_ref);
+        guard type_node.data is .named_type_ref(named) else { return null; }
+        guard named.contract_names is .some(names) else { return null; }
+        Int arg_index = self.contract_name_index(names, symbol);
+        if (arg_index < 0 || arg_index >= named.args.length) { return null; }
+        guard self.generic_type_arg_ordinal(named.def_id, arg_index)
+            is .some(type_arg_index) else {
+            return null;
+        }
+        lifetime_shape_query.LifetimeShapeQuery query! =
+            lifetime_shape_query.LifetimeShapeQuery(self.state.ctx, self.state.results);
+        list.ArrayList<Bool> local_mask! = list.ArrayList<Bool>();
+        guard query.generic_argument_selection(
+            base_type,
+            type_arg_index,
+            local_mask$.ref()
+        ) is .some(_) else {
+            return null;
+        }
+        if (!self.compose_generic_lifetime_mask(root_mask, local_mask$.ref())) {
+            return null;
+        }
+        return named.args[arg_index];
+    }
+
+    Int? generic_type_arg_ordinal(self, qid.DefId owner_def, Int arg_index) {
+        guard self.state.model.def(owner_def) is .some(owner) else { return null; }
+        if (arg_index < 0 || arg_index >= owner.generic_params.len()) { return null; }
+        qid.DefId selected = owner.generic_params.get(arg_index);
+        if (self.state.store.defs.get(selected).domain != .type_name) { return null; }
+        Int ordinal! = 0;
+        Int index! = 0;
+        while (index < arg_index) {
+            qid.DefId param_def = owner.generic_params.get(index);
+            if (self.state.store.defs.get(param_def).domain == .type_name) {
+                ordinal = ordinal + 1;
+            }
+            index = index + 1;
+        }
+        return ordinal;
+    }
+
+    Bool compose_generic_lifetime_mask(
+        self,
+        list.ArrayList<Bool>& root_mask,
+        list.ArrayList<Bool>& local_mask
+    ) {
+        if (local_mask.empty()) { return false; }
+        Int source_index! = 0;
+        Int selected! = 0;
+        Int index! = 0;
+        while (index < root_mask.len()) {
+            if (root_mask.get(index)) {
+                Bool keep = local_mask.get(source_index % local_mask.len());
+                root_mask.set(index, keep);
+                source_index = source_index + 1;
+                if (keep) { selected = selected + 1; }
+            }
+            index = index + 1;
+        }
+        if (source_index == 0 || source_index % local_mask.len() != 0) {
+            return false;
+        }
+        return selected > 0;
+    }
+
+    Bool bool_list_has_true(self, list.ArrayList<Bool>& values) {
+        Int index! = 0;
+        while (index < values.len()) {
+            if (values.get(index)) { return true; }
+            index = index + 1;
+        }
+        return false;
     }
 
     sem.NodeId? lifetime_root_type_ref(
@@ -5541,7 +5986,8 @@ public struct DeclCheck: Movable {
     }
 
     Bool type_satisfies_trait(self, qid.TypeId type_id, qid.DefId trait_def, qid.DefId use_owner) {
-        // associated type bound 与普通约束共用同一套 conformance 查询，包含可见 extension 与 where 条件。
+        // associated type bound 与普通约束共用同一套 conformance 查询，
+        // 包含可见 extension 与 where 条件。
         return self.type_ops.type_satisfies_trait(type_id, trait_def, use_owner);
     }
 

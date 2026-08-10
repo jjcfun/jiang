@@ -291,7 +291,10 @@ type_primary
              / "(" type "," type ("," type)* ","? ")"
              / "(" type ")"
 
-type_args   <- "<" type ("," type)* ","? ">"
+type_args   <- "<" named_type_arg ("," named_type_arg)* ","? ">"
+
+named_type_arg
+            <- type name?
 
 type_postfix
             <- "?"
@@ -332,6 +335,15 @@ name        <- ident / "self"
   个元素，末尾元素保存 sentinel。
 - `T@E` 表示 errorable result，只能出现在函数、方法和 callable 类型的返回位。
 - `T@E` 不允许空白：`T @E`、`T@ E` 和 `T @ E` 都报 `unexpected_trivia`。
+- nominal generic 的 type argument 可以在当前 type occurrence 中命名，例如
+  `Foo<Int& a>`。名称只投影该 argument 已有的完整 lifetime shape，不创建 region slot，
+  也不参与类型身份、layout 或 ABI。
+- type argument lifetime name 的作用域是直接包含它的 type occurrence；同一 occurrence 内
+  不能重名，嵌套 occurrence 逐层投影，例如
+  `Outer<Box<Int& a> inner>` 中使用 `value.inner.a`。未存储 argument 的 phantom nominal
+  没有可供该名称投影的 lifetime position。
+- type argument lifetime name 只允许命名 type argument，不允许命名 value argument；
+  带显式 `@region` 的 nominal 继续使用公开 region schema，不能同时使用该语法。
 - `RawFn<unsafe T, ...>`、`RawFn<async T, ...>` 和 `RawFn<async [domain] T, ...>`
   表示带调用效果的函数指针类型。调用效果
   前缀写在 `RawFn<...>` 的返回类型前，但不修饰返回值类型本身，而是修饰外层函数指针类型。
