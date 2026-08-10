@@ -4,14 +4,14 @@
 // 主调度器只负责串联阶段，避免声明/表达式/pattern 检查文件重复维护这些基础 helper。
 
 import sem = "../../sema/model.jiang";
+import database = "../../db.jiang";
 import enforcement = "../../enforcement.jiang";
-import core_traits = "../../core/traits.jiang";
 import qid = "../../id.jiang";
+import qkey = "../../incremental/key.jiang";
 import source_map = "../../source/source_map.jiang";
 import def = "../../resolve/def.jiang";
 import namespace = "../../resolve/namespace.jiang";
 import store = "../../resolve/store.jiang";
-import hash = "../../support/hash.jiang";
 import list = "../../support/list.jiang";
 import set = "../../support/set.jiang";
 import string = "../../support/string.jiang";
@@ -28,15 +28,6 @@ import type_check_state = "./state.jiang";
 import typeck_store = "./store.jiang";
 import std;
 
-enum TypeQueryKind {
-    type_of_def,
-    alias_target_type,
-    associated_type_result,
-    field_type,
-    function_signature,
-    trait_bound_dependency,
-}
-
 struct CheckedGenericArgs: Movable {
     public list.ArrayList<types.GenericArg> args;
     public list.ArrayList<qid.TypeId> type_args;
@@ -51,49 +42,15 @@ struct CheckedGenericArgs: Movable {
     }
 }
 
-struct TypeQueryKey: Copyable, Hashable, Equatable {
-    TypeQueryKind kind;
-    qid.DefId def_id;
-
-    public init(self, TypeQueryKind kind, qid.DefId def_id) {
-        self.kind = kind;
-        self.def_id = def_id;
-    }
-
-    public () hash<H: core_traits.Hasher>(self, H&! hasher) {
-        hasher.write(Int(self.kind_index()));
-        hasher.write(Int(self.def_id.to_index()));
-    }
-
-    public Bool equal(TypeQueryKey& lhs, TypeQueryKey& rhs) {
-        if (lhs.kind != rhs.kind) { return false; }
-        return qid.DefId.equal(lhs.def_id$.ref(), rhs.def_id$.ref());
-    }
-
-    Int kind_index(self) {
-        if (self.kind == .type_of_def) { return 1; }
-        if (self.kind == .alias_target_type) { return 2; }
-        if (self.kind == .associated_type_result) { return 3; }
-        if (self.kind == .field_type) { return 4; }
-        if (self.kind == .function_signature) { return 5; }
-        return 6;
-    }
-}
-
 @region(a)
 public struct TypeOps: Movable {
     @life(a)
     type_check_state.CheckState& state;
-    // lazy sema query 状态表。key 里显式区分 query kind，避免未来
-    // `field_type(F)` 和 `function_signature(self, F)` 之类查询共用一个 DefId 状态。
-    // value: 1 = visiting, 2 = done。
-    table.HashTable<TypeQueryKey, Int> query_states!;
     // type ref 是 Semantic Model node，不一定对应 DefId。递归别名/递归 structural type
     // 会在这里形成 NodeId 回边，必须独立于 DefId query guard 处理。
     table.HashTable<sem.NodeId, Int> type_ref_states!;
     public init(self, type_check_state.CheckState& state) {
         self.state = state;
-        self.query_states = table.HashTable<TypeQueryKey, Int>();
         self.type_ref_states = table.HashTable<sem.NodeId, Int>();
     }
 
@@ -4433,38 +4390,71 @@ public struct TypeOps: Movable {
     }
 
     public qid.TypeId type_for_decl_def(self, qid.DefId def_id) {
+        qid.TypeId invalid_type = self.state.store.types.invalid_type();
+        return database.type_check_def(
+            self.state.ctx.query$.ref(),
+            def_id,
+            { [ref self, def_id, invalid_type] request =>
+                self.evaluate_decl_type_query(
+                    def_id,
+                    invalid_type,
+                    request
+                )
+            }
+        );
+    }
+
+    qid.TypeId evaluate_decl_type_query(
+        self,
+        qid.DefId def_id,
+        qid.TypeId invalid_type,
+        database.TypeCheckDefRequest request
+    ) {
         if (self.state.results.def_type(def_id) is .some(type_id)) {
             return type_id;
         }
         if (self.state.store.types.builtin_type_for_def(def_id) is .some(type_id)) {
             return type_id;
         }
-        TypeQueryKey key = self.type_query_key_for_def(def_id);
-        if (!self.begin_type_query(key, def_id)) {
-            if (self.state.results.def_type(def_id) is .some(done_type)) {
-                return done_type;
-            }
-            return self.state.store.types.invalid_type();
+        if (request == .cycle) {
+            self.add_def_error(
+                def_id,
+                "cyclic type definition",
+                "cyclic_type_definition"
+            );
+            self.bind_def_type(def_id, invalid_type);
+            return invalid_type;
         }
 
         qid.TypeId type_id = self.compute_decl_type(def_id);
         self.bind_def_type(def_id, type_id);
-        self.finish_type_query(key);
         return type_id;
     }
 
     public () check_trait_bound_dependency(self, qid.DefId trait_def) {
-        TypeQueryKey key = TypeQueryKey(.trait_bound_dependency, trait_def);
-        if (!self.begin_dependency_query(
-            key,
+        database.trait_dependency(
+            self.state.ctx.query$.ref(),
             trait_def,
-            "cyclic trait bound dependency",
-            "cyclic_trait_bound"
-        )) {
+            { [ref self, trait_def] request =>
+                self.evaluate_trait_dependency(trait_def, request);
+            }
+        );
+    }
+
+    () evaluate_trait_dependency(
+        self,
+        qid.DefId trait_def,
+        database.TraitDependencyRequest request
+    ) {
+        if (request == .cycle) {
+            self.add_def_error(
+                trait_def,
+                "cyclic trait bound dependency",
+                "cyclic_trait_bound"
+            );
             return;
         }
         self.check_trait_parent_dependencies(trait_def);
-        self.finish_type_query(key);
     }
 
     () check_trait_parent_dependencies(self, qid.DefId trait_def) {
@@ -4475,71 +4465,36 @@ public struct TypeOps: Movable {
             index = index + 1;
             guard parent_ref.data is .named_type_ref(parent) else { continue; }
             if (self.state.store.defs.get(parent.def_id).kind == .trait_def) {
+                self.observe_trait_parent_signature(trait_def, parent.def_id);
                 self.check_trait_bound_dependency(parent.def_id);
             }
         }
     }
 
-    TypeQueryKey type_query_key_for_def(self, qid.DefId def_id) {
-        def.DefKind kind = self.state.store.defs.get(def_id).kind;
-        if (kind == .alias_def) {
-            return TypeQueryKey(.alias_target_type, def_id);
-        }
-        if (kind == .associated_type_def) {
-            return TypeQueryKey(.associated_type_result, def_id);
-        }
-        if (kind == .field_def) {
-            return TypeQueryKey(.field_type, def_id);
-        }
-        if (kind == .function_def || kind == .init_def) {
-            return TypeQueryKey(.function_signature, def_id);
-        }
-        return TypeQueryKey(.type_of_def, def_id);
-    }
-
-    Bool begin_type_query(self, TypeQueryKey key, qid.DefId def_id) {
-        return self.begin_query(
-            key,
-            def_id,
-            "cyclic type definition",
-            "cyclic_type_definition",
-            true
-        );
-    }
-
-    Bool begin_dependency_query(self,
-        TypeQueryKey key,
-        qid.DefId def_id,
-        UInt8[]& message,
-        UInt8[]& code
+    () observe_trait_parent_signature(
+        self,
+        qid.DefId trait_def,
+        qid.DefId parent_def
     ) {
-        return self.begin_query(key, def_id, message, code, false);
-    }
-
-    Bool begin_query(self,
-        TypeQueryKey key,
-        qid.DefId def_id,
-        UInt8[]& message,
-        UInt8[]& code,
-        Bool bind_invalid_type
-    ) {
-        if (self.query_states.has(key)) {
-            Int state = self.query_states.get(key)$.some()$.get();
-            if (state == 1) {
-                self.add_def_error(def_id, message, code);
-                if (bind_invalid_type) {
-                    self.bind_def_type(def_id, self.state.store.types.invalid_type());
-                }
-                self.query_states.set(key, 2);
+        guard self.state.store.incremental.stable_id_for_def(trait_def)
+            is .some(trait_id) else {
+            return;
+        }
+        guard self.state.store.incremental.stable_id_for_def(parent_def)
+            is .some(parent_id) else {
+            return;
+        }
+        qkey.Fingerprint128 signature = self.state.ctx.query.def_signature(
+            parent_id,
+            { [ref self, parent_id] =>
+                self.state.store.incremental.signature_fingerprint(parent_id)
             }
-            return false;
-        }
-        self.query_states.set(key, 1);
-        return true;
-    }
-
-    () finish_type_query(self, TypeQueryKey key) {
-        self.query_states.set(key, 2);
+        );
+        self.state.ctx.query.observe_trait_signature_dependency(
+            trait_id,
+            parent_id,
+            signature
+        );
     }
 
     public qid.TypeId compute_decl_type(self, qid.DefId def_id) {

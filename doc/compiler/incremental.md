@@ -48,8 +48,10 @@ stable source identity；旧文件由显式 cache clean 清理，0.5.1 不实现
 - section table 的位置和数量。
 
 section table 当前描述 import summary、interface、generic template 和 source map。每项保存
-offset、length 与内容 hash。`.ji` 不保存 object、链接输入、codegen summary、Semantic Model
-会话对象或任何 session-local ID。
+offset、length 与内容 hash。interface section 同时保存 QueryEngine 已实际记录的稳定
+`query -> dependency + fingerprint` observation；它不保存 QueryValue、Semantic Model
+会话对象或任何 session-local ID，也不建立独立依赖图文件。`.ji` 不保存 object、链接输入
+或 codegen summary。
 
 长驻 `CompilerSession` 可以在 `SourceStore` 中为文件路径设置未保存文本 overlay。overlay 与磁盘
 source 共用规范化路径和 `SourceId`，每次内容变化递增 revision；存在 overlay 时不读取旧 `.ji`
@@ -96,7 +98,8 @@ importer：
 - private body 变化不传播；
 - public signature、可见布局、public import/alias 和调用方可见泛型 body 变化会传播。
 
-0.5.1 不追踪 importer 实际读取的具体声明。`QueryDependencyGraph` 保留给后续声明级 QueryCache。
+0.5.1 不追踪 importer 实际读取的具体声明。`QueryDependencyGraph` 保留给后续声明级
+查询（多表缓存形态见 [Database 设计](database.md)）。
 
 `--check` 可以直接复用 fresh source 的 interface。debug/release 若未命中 `.jbuild` 快速路径，
 仍需从源码恢复 codegen 所需的普通函数 body；纯语义 `.ji` 不保存这些 body。source graph
@@ -208,6 +211,8 @@ stable unit 顺序汇总诊断与统计。
 
 ## 后续边界
 
-`QueryDependencyGraph` 当前只提供会话内 dependency/reverse-dependency 与失效遍历骨架。声明级
-QueryCache 需要稳定 declaration key、自动依赖采集、cycle 处理与 source-level 保守 fallback，
-不属于 0.5.1 的 source-level 增量范围。
+`src/db/query_dependency.jiang` 统一保存 stable query observation、forward/reverse 索引，
+并管理本轮 changed roots、候选传播和 fingerprint 裁决。`.ji` 可以恢复稳定 observation；
+当前生产 pipeline 只输出候选统计，尚未用 declaration 裁决跳过 QueryValue 或 artifact 重算。
+完整接入前继续以 source-level 失效作为保守 fallback；`.ji` / `.o` / `.jbuild` 的持久布局与
+发布纪律保持不变。

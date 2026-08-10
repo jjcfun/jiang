@@ -155,6 +155,7 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 CompilerContext
   target
   store: CompilerStore
+  query: QueryEngine   # per-query caches + 稳定依赖图（见 Database 设计 §7.2）
 ```
 
 `CompilerStore` 是所有业务事实集合的生命周期所有者。长期事实和单次 compilation cache 都挂在
@@ -175,9 +176,12 @@ CompilerStore
   layouts
   artifacts
   object_artifacts
-  query_dependencies
+  source_dependencies
   incremental
 ```
+
+`CompilerStore` 的演进方向（求值机制由 `CompilerContext` 持有、阶段产物转查询值、
+写路径收敛到 owner）见 [Database 设计](compiler/database.md) §7-§8。
 
 `DiagnosticStore` 放在 `CompilerStore` 内，因为它保存编译过程中产生的诊断事实。
 `DiagnosticReporter` 不放进 `CompilerStore`，它只负责终端输出和未来 LSP 消息发布。
@@ -216,9 +220,10 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   body-less trait implementation 只声明 builtin type 的 trait 关系，具体 lowering 仍由
   type check / JIL / layout 的 compiler-known facts 承接。
 - `LayoutStore` 独立保存 concrete type layout；layout 不是 type check store 的一部分。
-- `MonomorphStore`、`jil.Store` 和 `BorrowCheckStore` 是单次 pipeline 中的阶段产物，
-  不挂在 `CompilerStore` 上；backend 直接消费 drop elaboration 后的 `jil.Store`，
-  不维护一份等价 JIL。
+- `MonomorphStore` 和 `jil.Store` 是单次 pipeline 中的阶段产物；pipeline 的
+  `BorrowCheckStore` 结果发布到 `CompilerStore.borrowck`，作为 borrow facts 的唯一
+  owner。backend 直接消费 drop elaboration 后的同一个 `jil.Store`，不维护一份
+  等价 JIL。
 - `IncrementalSymbolStore` 保存 stable id 和当前 session id 的映射，不保存语义对象本体。
 
 ### Pass 规则
@@ -303,15 +308,46 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 - `resolve/store.jiang` 组合 package/module、import/export 和 namespace store。
 - `ResolveStore.modules` 是 `ModuleId -> ModuleRecord` 主表。
 - `ResolveStore.source_modules` 是 `SourceId -> ModuleId` 的辅助 store。
-- `sem_store.Store`、`TypeStore`、`TypeCheckStore`、`LayoutStore` 和 `IncrementalSymbolStore`
-  都挂在 `CompilerStore`。
-- `SourceArtifactCache`、`ObjectArtifactCache` 和 `QueryDependencyGraph` 也挂在
-  `CompilerStore`，用于 artifact 复用统计、object 复用和 query dependency 记录。
-- `MonomorphStore`、`jil.Store`、`ModuleGraph` 和 `BorrowCheckStore` 是单次 pipeline
-  调用中的阶段产物。
+- `sem_store.Store`、`TypeStore`、`TypeCheckStore`、`LayoutStore`、`BorrowCheckStore`
+  和 `IncrementalSymbolStore` 都挂在 `CompilerStore`。
+- `SourceArtifactCache` 和 `ObjectArtifactCache` 挂在 `CompilerStore`，用于
+  artifact 复用统计和 object 复用；`QueryDependencyGraph` 只由
+  `CompilerContext.query` 持有。
+- `MonomorphStore`、`jil.Store` 和 `ModuleGraph` 是单次 pipeline 调用中的阶段产物；
+  pipeline borrow result 在完成后移入 `CompilerStore.borrowck`。
 - `syntax.Store` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
-- cache-backed query dependency tracking 后续按实际 artifact cache 需求继续收敛；当前不保留未接入的 cache 骨架。
+- `src/db/query_dependency.jiang` 统一拥有稳定 observation、反向索引和本轮失效候选；
+  declaration 裁决接入实际 artifact 复用前，不把候选统计视为增量命中。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `store.jiang` 增加高阶查询入口。
+
+## 查询化改造（Database）
+
+编译器求值方式正从“线性 pipeline + 全量 CompilerContext 传递”向查询驱动
+迁移。目标形态与完整设计见 [Database 设计](compiler/database.md)，要点：
+
+- 编译事实以 per-query 多表缓存按需求值（每个查询一张 typed cache，key/value 由
+  查询声明决定）；阶段间通过查询依赖传递，不再通过 `CompilerContext&` 全量互写。
+- 已有基础：`IncrementalQueryKind` / `StableQueryKey`（稳定 query key）、
+  `QueryDependencyGraph`（依赖边与失效）、
+  `syntax.Store`（瞬时 parse cache）、`IncrementalSymbolStore`（稳定身份映射
+  与 fingerprint）、`ctx.query`（`QueryEngine`：per-query caches + 稳定依赖图）。
+- 递归不是统一 stable-key 栈的属性：type-check body/node/def、JIL body 和 package
+  analysis 分别用自己的 typed active/complete 状态定义重入结果，避免第二套 cycle
+  provenance。
+- 查询以能力收窄的自由函数形态暴露（compute：只读输入 + 本查询 cache + owner
+  写槽），不接收整个 `CompilerContext&!`：bootstrap-0.5.2 对持有 `&!` 字段的
+  struct 存在自举 SIGSEGV，且窄签名天然符合“(key) -> value”的求值纪律；
+  `LayoutQuery` 门面与单表缓存已删除；per-query cache 用固定地址 Mutex 提供
+  共享查询入口，锁不跨 compute 持有。
+- layout 调用点已经全部接线；它没有持久 QueryValue，因此只使用本轮 L1 memo。
+  epoch 清理由 `begin_compilation` 统一承担。
+- 增量以声明级失效为目标形态：L1 session memo + L2 持久 artifact + 依赖指纹
+  两阶段裁决；`IncrementalSymbolStore` / `QueryDependencyGraph` / `SourceGraph`
+  在查询入口内接入（详见 database.md §6）。
+- 新代码遵循严格借用模式：可变访问显式 `&!`，不允许把共享 store 引用存入
+  长期结构；现有宽松代码按迁移路径逐步收紧，不以放松新代码为代价。
+- 当前收口顺序：依赖图与失效状态统一 → typed query wrapper 收口业务入口 →
+  declaration 失效接入实际 L2/artifact 裁决；QueryEngine 保持同步。
 
 ## 源码目录
 
@@ -325,6 +361,8 @@ src/
   lang.jiang    lang provider 稳定入口
   lang/         lang package registry、wrapper dylib、provider runtime bridge
   artifact/     source .ji、object key、package artifact key/path、fingerprint
+  db.jiang      查询层入口；db/ 查询层实现（QueryEngine、per-query caches、
+                 typed 查询函数、layout 查询）
   diagnostic.jiang  诊断数据模型入口
   diagnostic/   diagnostic、reporter
   builtin.jiang compiler-known builtin 初始化入口

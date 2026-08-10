@@ -40,6 +40,7 @@ LINK_ARGS_FILE="${LINK_ARGS_FILE:-}"
 JIANG_LINK_ARGS_FILE="${JIANG_LINK_ARGS_FILE:-}"
 COMPILER_TEST_BIN="${COMPILER_TEST_BIN:-}"
 COMPILER_TEST_RELEASE_BIN="${COMPILER_TEST_RELEASE_BIN:-}"
+COMPILER_TEST_SOURCE="${COMPILER_TEST_SOURCE:-$ROOT_DIR/test/compiler/compiler.jiang}"
 TIMEOUT_BIN=""
 SUITE_START=0
 TEST_HOST_PLATFORM=""
@@ -661,7 +662,7 @@ compiler_cases_need_aggregate() {
 build_compiler_test_executable() {
   local mode="$1"
   local output="$2"
-  local source="$ROOT_DIR/test/compiler/compiler.jiang"
+  local source="$COMPILER_TEST_SOURCE"
   local cache_dir="$RUN_ROOT/compiler-$mode-cache"
   local build_log="$RUN_ROOT/compiler-$mode-build.out"
   local started=$SECONDS

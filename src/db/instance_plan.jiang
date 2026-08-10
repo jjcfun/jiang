@@ -1,0 +1,117 @@
+// 泛型实例计划的 typed query slot 与结果 owner。
+//
+// QueryCache 只保存可复制的 InstancePlanId；MonomorphStore 只在本模块的
+// 单槽 owner 中持有一份。消费方只能在 owner 的同步借用作用域内读取计划。
+
+import monomorph = "../sema/monomorph.jiang";
+import qkey = "../incremental/key.jiang";
+import query_dependency = "./query_dependency.jiang";
+import query_cache = "./query_cache.jiang";
+import std;
+
+public struct InstancePlanId: Copyable {
+    Int index;
+
+    init(self, Int index) {
+        self.index = index;
+    }
+}
+
+// 批处理 epoch 只编译一个 root package，因此结果 owner 是单槽，而不是第二张
+// key/value 表。key 的求值状态仍完全由 QueryCache 决定。
+struct InstancePlanOwner: Movable {
+    monomorph.MonomorphStore^ value!;
+    Bool published!;
+
+    init(self) {
+        self.value = new monomorph.MonomorphStore();
+        self.published = false;
+    }
+
+    InstancePlanId publish(
+        Self&! self,
+        monomorph.MonomorphStore^ value
+    ) {
+        assert(!self.published);
+        self.value = value;
+        self.published = true;
+        return InstancePlanId(0);
+    }
+
+    () consume(
+        Self&! self,
+        InstancePlanId id,
+        Fn<Void, monomorph.MonomorphStore&> consume
+    ) {
+        assert(self.published && id.index == 0);
+        consume(self.value$.ref());
+    }
+}
+
+// 一个 typed query 对应一个 QueryCache。owner store 与 memo 分离，因此 cache
+// 不拥有 arena，也不需要让 Movable 的 MonomorphStore 变成可复制值。
+public struct InstancePlanQuery: Movable {
+    Mutex<query_cache.QueryCache<
+        query_dependency.StableQueryKey,
+        InstancePlanId
+    >>^ cache;
+    Mutex<InstancePlanOwner>^ value;
+
+    public init(self) {
+        self.cache = new Mutex<query_cache.QueryCache<
+            query_dependency.StableQueryKey,
+            InstancePlanId
+        >>(query_cache.QueryCache<
+            query_dependency.StableQueryKey,
+            InstancePlanId
+        >());
+        self.value = new Mutex<InstancePlanOwner>(InstancePlanOwner());
+    }
+
+    public () reset(self) {
+        self.cache.with_lock<Void>({ cache =>
+            cache.reset();
+        });
+        self.value.with_lock<Void>({ value =>
+            value$.set(InstancePlanOwner());
+        });
+    }
+
+    public () evaluate(
+        self,
+        query_dependency.StableQueryKey key,
+        Fn<monomorph.MonomorphStore^> compute,
+        Fn<Void, monomorph.MonomorphStore&> consume
+    ) {
+        query_cache.QueryCacheState state = self.cache.with_lock({ cache =>
+            cache.state(key)
+        });
+        if (state == .ready) {
+            InstancePlanId id = self.cache.with_lock({ cache =>
+                cache.lookup(key)$.some()
+            });
+            self.consume(id, consume);
+            return;
+        }
+        assert(state == .missing);
+
+        InstancePlanId id = self.value.with_lock({ [compute] value =>
+            return value.publish(compute());
+        });
+        self.cache.with_lock<Void>({ cache =>
+            cache.complete(key, id);
+        });
+        self.consume(id, consume);
+    }
+
+    () consume(
+        self,
+        InstancePlanId id,
+        Fn<Void, monomorph.MonomorphStore&> consume
+    ) {
+        self.value.with_lock<Void>({ value =>
+            value.consume(id, consume);
+        });
+    }
+
+}

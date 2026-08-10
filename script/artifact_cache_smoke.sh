@@ -196,6 +196,9 @@ check_cold_hot_and_profiles() {
   require_stat_eq "$WORK_DIR/hot.log" artifact_emitted_units 0
   require_stat_ge "$WORK_DIR/hot.log" artifact_object_hit 1
   require_stat_ge "$WORK_DIR/hot.log" artifact_parsed_sources 1
+  require_stat_ge "$WORK_DIR/hot.log" query_def_signature_l2 1
+  require_stat_ge "$WORK_DIR/hot.log" query_def_body_l2 1
+  require_stat_ge "$WORK_DIR/hot.log" query_observation_l2 1
   expect_exit "$hot" 52
 
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/hot-noop.log" "$hot" "$input"

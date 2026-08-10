@@ -1,6 +1,7 @@
 // 函数体、表达式和 pattern 的 Semantic Model type check。
 
 import sem = "../../sema/model.jiang";
+import database = "../../db.jiang";
 import qid = "../../id.jiang";
 import def = "../../resolve/def.jiang";
 import store = "../../resolve/store.jiang";
@@ -56,12 +57,6 @@ public struct BodyCheck: Movable {
     type_ops_mod.TypeOps& type_ops;
     @life(a)
     pattern_mod.PatternCheck pattern_check!;
-    // expression type 也按 NodeId 做 lazy query。递归函数调用只需要 callee
-    // signature，不能让同一个 Semantic Model node 的 type check 重入到自身。
-    table.HashTable<sem.NodeId, Int> node_states!;
-    // declaration body 也支持按需检查。const initializer 可能引用后声明的
-    // const；解释前必须先保证被引用 const 的 body side table 已经写好。
-    table.HashTable<qid.DefId, Int> body_states!;
     list.ArrayList<LocalInitBinding> local_init_states!;
     Int assignment_target_depth!;
     Int await_depth!;
@@ -74,8 +69,6 @@ public struct BodyCheck: Movable {
         self.state = state;
         self.type_ops = type_ops;
         self.pattern_check = pattern_mod.PatternCheck(state, type_ops);
-        self.node_states = table.HashTable<sem.NodeId, Int>();
-        self.body_states = table.HashTable<qid.DefId, Int>();
         self.local_init_states = list.ArrayList<LocalInitBinding>();
         self.assignment_target_depth = 0;
         self.await_depth = 0;
@@ -143,12 +136,16 @@ public struct BodyCheck: Movable {
     }
 
     () ensure_body_tree_checked(self, qid.DefId def_id) {
-        if (table.hash_table_get_value<qid.DefId, Int>(self.body_states$.ref(), def_id) is .some(state)) {
-            if (state == 1 || state == 2) {
-                return;
+        database.type_check_body(
+            self.state.ctx.query$.ref(),
+            def_id,
+            { [ref self, def_id] =>
+                self.check_body_tree_uncached(def_id);
             }
-        }
-        self.body_states.set(def_id, 1);
+        );
+    }
+
+    () check_body_tree_uncached(self, qid.DefId def_id) {
         guard self.state.model.def(def_id) is .some(model_def) else {
             return;
         }
@@ -163,7 +160,6 @@ public struct BodyCheck: Movable {
             self.ensure_body_tree_checked(model_def.members.get(index));
             index = index + 1;
         }
-        self.body_states.set(def_id, 2);
     }
 
     () check_parameter_defaults(self, sem.Def& model_def) {
@@ -488,21 +484,41 @@ public struct BodyCheck: Movable {
     }
 
     qid.TypeId check_node(self, sem.NodeId node_id) {
+        qid.TypeId invalid_type = self.state.store.types.invalid_type();
+        return database.type_check_node(
+            self.state.ctx.query$.ref(),
+            node_id,
+            { [ref self, node_id, invalid_type] request =>
+                self.evaluate_node_type_query(
+                    node_id,
+                    invalid_type,
+                    request
+                )
+            }
+        );
+    }
+
+    qid.TypeId evaluate_node_type_query(
+        self,
+        sem.NodeId node_id,
+        qid.TypeId invalid_type,
+        database.TypeCheckNodeRequest request
+    ) {
         if (self.state.results.node_type(node_id) is .some(existing)) {
             return existing;
         }
-        if (table.hash_table_get_value<sem.NodeId, Int>(self.node_states$.ref(), node_id) is .some(state)) {
-            if (state == 1) {
-                self.type_ops.add_node_error(
-                    node_id,
-                    "cyclic expression type dependency",
-                    "cyclic_expression_type"
-                );
-                return self.state.store.types.invalid_type();
-            }
+        if (request == .cycle) {
+            self.type_ops.add_node_error(
+                node_id,
+                "cyclic expression type dependency",
+                "cyclic_expression_type"
+            );
+            return invalid_type;
         }
-        self.node_states.set(node_id, 1);
+        return self.check_node_uncached(node_id);
+    }
 
+    qid.TypeId check_node_uncached(self, sem.NodeId node_id) {
         sem.Node node = self.state.model.node(node_id);
         qid.TypeId type_id! = self.state.store.types.invalid_type();
         if (node.data is .literal(literal)) {
@@ -619,7 +635,6 @@ public struct BodyCheck: Movable {
         }
         type_id = self.project_await_task_type(node_id, type_id);
         self.state.results.set_node_type(node_id, type_id);
-        self.node_states.set(node_id, 2);
         return type_id;
     }
 
@@ -4124,7 +4139,6 @@ public struct BodyCheck: Movable {
         sem.NodeId value_id = self.state.model.add_node(node_id.owner_def, original.data);
         self.state.results.clone_node_results(node_id, value_id);
         self.state.results.set_node_type(value_id, task_type);
-        self.node_states.set(value_id, 2);
         self.copy_model_span(node_id, value_id);
         self.state.model.replace_node_data(node_id, .await_task_expr(value_id));
         self.state.results.set_node_type(node_id, result_type);
@@ -5248,7 +5262,6 @@ public struct BodyCheck: Movable {
         sem.NodeId value_id = self.state.model.add_node(node_id.owner_def, original.data);
         self.state.results.clone_node_results(node_id, value_id);
         self.state.results.set_node_type(value_id, error_union_type);
-        self.node_states.set(value_id, 2);
         self.copy_model_span(node_id, value_id);
         self.state.model.replace_node_data(node_id, .propagate_error_expr(value_id));
         self.state.results.set_node_type(node_id, value_type);
@@ -7322,7 +7335,6 @@ public struct BodyCheck: Movable {
             );
         }
         self.state.results.set_node_type(closure_id, callable);
-        self.node_states.set(closure_id, 2);
         return result;
     }
 

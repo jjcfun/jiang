@@ -1,0 +1,291 @@
+// 编译器内部的 WyHash 开放寻址 map。
+//
+// bucket storage 由本类型独占。unsafe 只封装原始分配、bucket 探测、元素搬移
+// 和精确析构；调用方只接触带所有权约束的 typed API。
+
+import hash = "./hash.jiang";
+import memory = "./memory.jiang";
+import traits = "./traits.jiang";
+
+enum WyMapEntryState {
+    empty,
+    occupied,
+    deleted,
+}
+
+union WyMapSlot: Copyable {
+    Int found;
+    Int vacant;
+    () full;
+}
+
+@region(k, v)
+@where(K: Hashable & Equatable & Copyable)
+public struct WyHashMap<K, V>: Movable {
+    WyMapEntryState*! states!;
+
+    @life(k)
+    K*! keys!;
+
+    @life(v)
+    V*! values!;
+    Int capacity!;
+    Int length!;
+    Int deleted_count!;
+
+    public init(self) {
+        self.states = null;
+        self.keys = null;
+        self.values = null;
+        self.capacity = 0;
+        self.length = 0;
+        self.deleted_count = 0;
+    }
+
+    public Int len(self) {
+        return self.length;
+    }
+
+    public Int cap(self) {
+        return self.capacity;
+    }
+
+    public Bool empty(self) {
+        return self.length == 0;
+    }
+
+    public Bool has(self, K key) {
+        return unsafe { self.find_index(key) != null };
+    }
+
+    @life(return: self)
+    public V&? get(self, K key) {
+        unsafe {
+            guard self.find_index(key) is .some(index) else { return null; }
+            return self.values[index]$.ref();
+        }
+    }
+
+    // 返回 true 表示插入新 key，false 表示替换已有 value。
+    public Bool insert(Self&! self, K key, V value) {
+        unsafe {
+            Int index = self.insert_slot(key);
+            if (self.states[index] == WyMapEntryState.occupied) {
+                self.values[index]$.addr()$.destroy();
+                self.values[index] = value;
+                return false;
+            }
+            self.occupy_slot(index, key, value);
+            return true;
+        }
+    }
+
+    @life(return: self)
+    public V&! get_or_insert(Self&! self, K key, V default_value) {
+        unsafe {
+            Int index = self.insert_slot(key);
+            if (self.states[index] != WyMapEntryState.occupied) {
+                self.occupy_slot(index, key, default_value);
+            }
+            return self.values[index]$.mut_ref();
+        }
+    }
+
+    public Bool remove(Self&! self, K key) {
+        unsafe {
+            guard self.find_index(key) is .some(index) else { return false; }
+            self.values[index]$.addr()$.destroy();
+            self.mark_deleted(index);
+            return true;
+        }
+    }
+
+    public V? take(Self&! self, K key) {
+        unsafe {
+            guard self.find_index(key) is .some(index) else { return null; }
+            V value = self.values[index];
+            self.mark_deleted(index);
+            return value;
+        }
+    }
+
+    public () clear(Self&! self) {
+        unsafe {
+            Int index! = 0;
+            while (index < self.capacity) {
+                if (self.states[index] == WyMapEntryState.occupied) {
+                    self.values[index]$.addr()$.destroy();
+                }
+                self.states[index] = WyMapEntryState.empty;
+                index = index + 1;
+            }
+            self.length = 0;
+            self.deleted_count = 0;
+        }
+    }
+
+    public () reserve(Self&! self, Int additional) {
+        if (additional <= 0) { return; }
+        unsafe { self.ensure_capacity(self.length + additional); }
+    }
+
+    UInt64 key_hash(self, K key) {
+        hash.WyHasher hasher! = hash.WyHasher();
+        key.hash(hasher$.mut_ref());
+        return hasher.finish();
+    }
+
+    unsafe WyMapSlot find_slot_in(
+        self,
+        WyMapEntryState*! states!,
+        K*! keys!,
+        Int capacity,
+        K key
+    ) {
+        if (capacity == 0) { return .full(); }
+        Int index! = Int(self.key_hash(key) % UInt64(capacity));
+        Int probe! = 0;
+        Int? first_deleted! = null;
+        while (probe < capacity) {
+            WyMapEntryState state = states[index];
+            if (state == WyMapEntryState.empty) {
+                if (first_deleted is .some(deleted)) {
+                    return .vacant(deleted);
+                }
+                return .vacant(index);
+            }
+            if (state == WyMapEntryState.deleted) {
+                if (first_deleted == null) { first_deleted = index; }
+            } else if (keys[index] == key) {
+                return .found(index);
+            }
+            index = (index + 1) % capacity;
+            probe = probe + 1;
+        }
+        if (first_deleted is .some(deleted)) { return .vacant(deleted); }
+        return .full();
+    }
+
+    unsafe WyMapSlot find_slot(self, K key) {
+        return self.find_slot_in(self.states, self.keys, self.capacity, key);
+    }
+
+    unsafe Int? find_index(self, K key) {
+        WyMapSlot slot = self.find_slot(key);
+        if (slot is .found(index)) { return index; }
+        return null;
+    }
+
+    unsafe Int insert_slot(Self&! self, K key) {
+        while (true) {
+            WyMapSlot existing = self.find_slot(key);
+            if (existing is .found(index)) { return index; }
+            self.ensure_capacity(self.length + 1);
+            WyMapSlot slot = self.find_slot(key);
+            if (slot is .found(index)) { return index; }
+            if (slot is .vacant(index)) { return index; }
+            self.rehash(self.next_capacity(self.length + 1));
+        }
+        return 0;
+    }
+
+    Int next_capacity(self, Int min_length) {
+        Int result! = self.capacity;
+        if (result == 0) { result = 4; }
+        while (min_length * 2 > result) { result = result * 2; }
+        return result;
+    }
+
+    unsafe () ensure_capacity(Self&! self, Int min_length) {
+        if (self.capacity == 0 || min_length * 2 > self.capacity) {
+            self.rehash(self.next_capacity(min_length));
+            return;
+        }
+        if ((self.length + self.deleted_count) * 2 >= self.capacity) {
+            self.rehash(self.capacity);
+        }
+    }
+
+    unsafe () occupy_slot(Self&! self, Int index, K key, V value) {
+        if (self.states[index] == WyMapEntryState.deleted) {
+            self.deleted_count = self.deleted_count - 1;
+        }
+        self.keys[index] = key;
+        self.values[index] = value;
+        self.states[index] = WyMapEntryState.occupied;
+        self.length = self.length + 1;
+    }
+
+    unsafe () mark_deleted(Self&! self, Int index) {
+        self.states[index] = WyMapEntryState.deleted;
+        self.length = self.length - 1;
+        self.deleted_count = self.deleted_count + 1;
+    }
+
+    unsafe () move_entries_into(
+        Self&! self,
+        WyMapEntryState*! states!,
+        K*! keys!,
+        V*! values!,
+        Int capacity
+    ) {
+        Int old_index! = 0;
+        while (old_index < self.capacity) {
+            if (self.states[old_index] == WyMapEntryState.occupied) {
+                WyMapSlot slot = self.find_slot_in(
+                    states,
+                    keys,
+                    capacity,
+                    self.keys[old_index]
+                );
+                guard slot is .vacant(index) else { assert(false); return; }
+                states[index] = WyMapEntryState.occupied;
+                keys[index] = self.keys[old_index];
+                memory.move_array_element<V>(values, index, self.values, old_index);
+            }
+            old_index = old_index + 1;
+        }
+    }
+
+    unsafe () rehash(Self&! self, Int new_capacity) {
+        WyMapEntryState*! states! = WyMapEntryState$.alloc(new_capacity);
+        K*! keys! = K$.alloc(new_capacity);
+        V*! values! = V$.alloc(new_capacity);
+        Int index! = 0;
+        while (index < new_capacity) {
+            states[index] = WyMapEntryState.empty;
+            index = index + 1;
+        }
+        self.move_entries_into(states, keys, values, new_capacity);
+        self.free_storage();
+        self.states = states;
+        self.keys = keys;
+        self.values = values;
+        self.capacity = new_capacity;
+        self.deleted_count = 0;
+    }
+
+    unsafe () free_storage(Self&! self) {
+        if (self.capacity == 0) { return; }
+        self.states?$.dealloc();
+        self.keys?$.dealloc();
+        self.values?$.dealloc();
+    }
+
+    deinit(self) {
+        unsafe {
+            Int index! = 0;
+            while (index < self.capacity) {
+                if (self.states[index] == WyMapEntryState.occupied) {
+                    self.values[index]$.addr()$.destroy();
+                }
+                index = index + 1;
+            }
+            if (self.capacity > 0) {
+                self.states?$.dealloc();
+                self.keys?$.dealloc();
+                self.values?$.dealloc();
+            }
+        }
+    }
+}
