@@ -30,6 +30,50 @@ public struct LifetimeShapeQuery: Copyable {
         return self.typeck.lifetime_shapes.classify(shape) != .empty;
     }
 
+    public Bool is_generic_symbolic_shape(
+        self,
+        lifetime_shape.LifetimeShapeId shape
+    ) {
+        if (self.typeck.lifetime_shapes.classify(shape) != .unknown) {
+            return false;
+        }
+        return self.is_generic_symbolic_shape_inner(shape);
+    }
+
+    Bool is_generic_symbolic_shape_inner(
+        self,
+        lifetime_shape.LifetimeShapeId shape
+    ) {
+        lifetime_shape.LifetimeShape data = self.typeck.lifetime_shapes.get(shape);
+        if (data.data is .empty) { return true; }
+        if (data.data is .symbolic(parameter)) {
+            return self.generic_param_type(parameter);
+        }
+        if (data.data is .slot || data.data is .recursive(_)) { return false; }
+        if (data.data is .repeated(repeated)) {
+            return self.is_generic_symbolic_shape_inner(repeated.element);
+        }
+        if (data.data is .product(product)) {
+            return self.is_generic_symbolic_sequence(product.items);
+        }
+        guard data.data is .alternative(alternative) else { return false; }
+        return self.is_generic_symbolic_sequence(alternative.items);
+    }
+
+    Bool is_generic_symbolic_sequence(
+        self,
+        lifetime_shape.LifetimeShapeId[]& items
+    ) {
+        Int index! = 0;
+        while (index < items.length) {
+            if (!self.is_generic_symbolic_shape_inner(items[index])) {
+                return false;
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
     public lifetime_shape.LifetimeShapeId lifetime_shape(self, qid.TypeId type_id) {
         list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
         list.ArrayList<qid.DefId> binding_defs! = list.ArrayList<qid.DefId>();
@@ -40,6 +84,317 @@ public struct LifetimeShapeQuery: Copyable {
             binding_defs$.ref(),
             binding_types$.ref()
         );
+    }
+
+    public lifetime_shape.LifetimeShapeId field_binding_lifetime_shape(
+        self,
+        qid.DefId field_def,
+        qid.TypeId field_type
+    ) {
+        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.DefId> binding_defs! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.TypeId> binding_types! = list.ArrayList<qid.TypeId>();
+        return self.field_type_lifetime_shape(
+            field_def,
+            field_type,
+            visiting$.ref(),
+            binding_defs$.ref(),
+            binding_types$.ref()
+        );
+    }
+
+    public lifetime_shape.LifetimeShapeId? generic_argument_selection(
+        self,
+        qid.TypeId nominal_type,
+        Int type_arg_index,
+        list.ArrayList<Bool>& mask
+    ) {
+        mask.clear();
+        types.TypeInfo info = self.ctx.store.types.get(nominal_type);
+        guard info.data is .named(named) else { return null; }
+        if (self.typeck.nominal_region_schema(named.def_id) is .some(schema)) {
+            if (schema.params.length > 0) { return null; }
+        }
+        guard self.ctx.store.model.def(named.def_id) is .some(owner) else {
+            return null;
+        }
+        guard self.type_generic_param_at(owner, type_arg_index)
+            is .some(selected_param) else {
+            return null;
+        }
+        if (type_arg_index < 0 || type_arg_index >= named.type_args.length) {
+            return null;
+        }
+        list.ArrayList<qid.DefId> visiting! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.DefId> binding_defs! = list.ArrayList<qid.DefId>();
+        list.ArrayList<qid.TypeId> binding_types! = list.ArrayList<qid.TypeId>();
+        visiting.add(owner.def_id);
+        lifetime_shape.LifetimeShapeId template = self.named_members_lifetime_shape(
+            owner,
+            visiting$.ref(),
+            binding_defs$.ref(),
+            binding_types$.ref()
+        );
+        visiting.pop();
+        lifetime_shape.LifetimeShapeId selected = self.select_generic_argument_shape(
+            template,
+            selected_param,
+            owner,
+            named,
+            mask
+        );
+        Int full_count = self.shape_binding_position_count(
+            self.lifetime_shape(nominal_type)
+        );
+        if (mask.len() != full_count) {
+            mask.clear();
+            return null;
+        }
+        return selected;
+    }
+
+    public lifetime_shape.LifetimeShapeId? select_binding_positions(
+        self,
+        lifetime_shape.LifetimeShapeId shape,
+        list.ArrayList<Bool>& mask
+    ) {
+        if (mask.len() != self.shape_binding_position_count(shape)) {
+            return null;
+        }
+        return self.select_binding_positions_from(shape, mask, 0);
+    }
+
+    lifetime_shape.LifetimeShapeId select_binding_positions_from(
+        self,
+        lifetime_shape.LifetimeShapeId shape,
+        list.ArrayList<Bool>& mask,
+        Int offset
+    ) {
+        lifetime_shape.LifetimeShape data = self.typeck.lifetime_shapes.get(shape);
+        if (data.data is .empty || data.data is .recursive(_)) {
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        if (data.data is .slot || data.data is .symbolic(_)) {
+            if (offset >= 0 && offset < mask.len() && mask.get(offset)) {
+                return shape;
+            }
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        if (data.data is .repeated(repeated)) {
+            lifetime_shape.LifetimeShapeId element =
+                self.select_binding_positions_from(repeated.element, mask, offset);
+            return self.typeck.lifetime_shapes.repeated(element);
+        }
+        if (data.data is .product(product)) {
+            return self.select_binding_sequence(product.items, mask, offset, true);
+        }
+        guard data.data is .alternative(alternative) else {
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        return self.select_binding_sequence(alternative.items, mask, offset, false);
+    }
+
+    lifetime_shape.LifetimeShapeId select_binding_sequence(
+        self,
+        lifetime_shape.LifetimeShapeId[]& items,
+        list.ArrayList<Bool>& mask,
+        Int offset,
+        Bool product
+    ) {
+        list.ArrayList<lifetime_shape.LifetimeShapeId> selected! =
+            list.ArrayList<lifetime_shape.LifetimeShapeId>();
+        Int current! = offset;
+        Int index! = 0;
+        while (index < items.length) {
+            lifetime_shape.LifetimeShapeId item = items[index];
+            selected.add(self.select_binding_positions_from(item, mask, current));
+            current = current + self.shape_binding_position_count(item);
+            index = index + 1;
+        }
+        if (product) { return self.typeck.lifetime_shapes.product(selected$.ref()); }
+        return self.typeck.lifetime_shapes.alternative(selected$.ref());
+    }
+
+    lifetime_shape.LifetimeShapeId select_generic_argument_shape(
+        self,
+        lifetime_shape.LifetimeShapeId shape,
+        qid.DefId selected_param,
+        sem.Def& owner,
+        types.NamedType named,
+        list.ArrayList<Bool>& mask
+    ) {
+        lifetime_shape.LifetimeShape data = self.typeck.lifetime_shapes.get(shape);
+        if (data.data is .empty || data.data is .recursive(_)) {
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        if (data.data is .slot) {
+            mask.add(false);
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        if (data.data is .symbolic(param_def)) {
+            return self.select_symbolic_argument_shape(
+                param_def,
+                selected_param,
+                owner,
+                named,
+                mask
+            );
+        }
+        if (data.data is .repeated(repeated)) {
+            lifetime_shape.LifetimeShapeId element = self.select_generic_argument_shape(
+                repeated.element,
+                selected_param,
+                owner,
+                named,
+                mask
+            );
+            return self.typeck.lifetime_shapes.repeated(element);
+        }
+        list.ArrayList<lifetime_shape.LifetimeShapeId> selected! =
+            list.ArrayList<lifetime_shape.LifetimeShapeId>();
+        if (data.data is .product(product)) {
+            self.append_selected_sequence(
+                product.items,
+                selected_param,
+                owner,
+                named,
+                mask,
+                selected$.ref()
+            );
+            return self.typeck.lifetime_shapes.product(selected$.ref());
+        }
+        guard data.data is .alternative(alternative) else {
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        self.append_selected_sequence(
+            alternative.items,
+            selected_param,
+            owner,
+            named,
+            mask,
+            selected$.ref()
+        );
+        return self.typeck.lifetime_shapes.alternative(selected$.ref());
+    }
+
+    () append_selected_sequence(
+        self,
+        lifetime_shape.LifetimeShapeId[]& items,
+        qid.DefId selected_param,
+        sem.Def& owner,
+        types.NamedType named,
+        list.ArrayList<Bool>& mask,
+        list.ArrayList<lifetime_shape.LifetimeShapeId>& selected
+    ) {
+        Int index! = 0;
+        while (index < items.length) {
+            selected.add(self.select_generic_argument_shape(
+                items[index],
+                selected_param,
+                owner,
+                named,
+                mask
+            ));
+            index = index + 1;
+        }
+    }
+
+    lifetime_shape.LifetimeShapeId select_symbolic_argument_shape(
+        self,
+        qid.DefId param_def,
+        qid.DefId selected_param,
+        sem.Def& owner,
+        types.NamedType named,
+        list.ArrayList<Bool>& mask
+    ) {
+        guard self.type_generic_param_index(owner, param_def)
+            is .some(type_index) else {
+            mask.add(false);
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        if (type_index < 0 || type_index >= named.type_args.length) {
+            mask.add(false);
+            return self.typeck.lifetime_shapes.empty_shape();
+        }
+        lifetime_shape.LifetimeShapeId actual = self.lifetime_shape(
+            named.type_args[type_index]
+        );
+        Bool selected = param_def == selected_param;
+        self.append_shape_mask(actual, selected, mask);
+        if (selected) { return actual; }
+        return self.typeck.lifetime_shapes.empty_shape();
+    }
+
+    () append_shape_mask(
+        self,
+        lifetime_shape.LifetimeShapeId shape,
+        Bool selected,
+        list.ArrayList<Bool>& mask
+    ) {
+        Int count = self.shape_binding_position_count(shape);
+        Int index! = 0;
+        while (index < count) {
+            mask.add(selected);
+            index = index + 1;
+        }
+    }
+
+    Int shape_binding_position_count(
+        self,
+        lifetime_shape.LifetimeShapeId shape
+    ) {
+        lifetime_shape.LifetimeShape data = self.typeck.lifetime_shapes.get(shape);
+        if (data.data is .empty || data.data is .recursive(_)) { return 0; }
+        if (data.data is .slot || data.data is .symbolic(_)) { return 1; }
+        if (data.data is .repeated(repeated)) {
+            return self.shape_binding_position_count(repeated.element);
+        }
+        if (data.data is .product(product)) {
+            return self.shape_sequence_binding_position_count(product.items);
+        }
+        guard data.data is .alternative(alternative) else { return 0; }
+        return self.shape_sequence_binding_position_count(alternative.items);
+    }
+
+    Int shape_sequence_binding_position_count(
+        self,
+        lifetime_shape.LifetimeShapeId[]& items
+    ) {
+        Int count! = 0;
+        Int index! = 0;
+        while (index < items.length) {
+            count = count + self.shape_binding_position_count(items[index]);
+            index = index + 1;
+        }
+        return count;
+    }
+
+    qid.DefId? type_generic_param_at(self, sem.Def& owner, Int type_index) {
+        Int index! = 0;
+        Int seen! = 0;
+        while (index < owner.generic_params.len()) {
+            qid.DefId param_def = owner.generic_params.get(index);
+            if (self.generic_param_type(param_def)) {
+                if (seen == type_index) { return param_def; }
+                seen = seen + 1;
+            }
+            index = index + 1;
+        }
+        return null;
+    }
+
+    Int? type_generic_param_index(self, sem.Def& owner, qid.DefId target) {
+        Int index! = 0;
+        Int seen! = 0;
+        while (index < owner.generic_params.len()) {
+            qid.DefId param_def = owner.generic_params.get(index);
+            if (self.generic_param_type(param_def)) {
+                if (param_def == target) { return seen; }
+                seen = seen + 1;
+            }
+            index = index + 1;
+        }
+        return null;
     }
 
     lifetime_shape.LifetimeShapeId lifetime_shape_inner(
@@ -233,17 +588,51 @@ public struct LifetimeShapeQuery: Copyable {
         guard self.ctx.store.model.def(named.def_id) is .some(model_def) else {
             return self.typeck.lifetime_shapes.empty_shape();
         }
-        guard self.typeck.nominal_region_schema(named.def_id) is .some(schema) else {
-            return self.typeck.lifetime_shapes.empty_shape();
+        if (self.typeck.nominal_region_schema(named.def_id) is .some(schema)) {
+            if (schema.params.length > 0) {
+                return self.nominal_region_lifetime_shape(
+                    named,
+                    model_def,
+                    schema,
+                    visiting,
+                    binding_defs,
+                    binding_types
+                );
+            }
         }
-        return self.nominal_region_lifetime_shape(
+        return self.structural_nominal_lifetime_shape(
             named,
             model_def,
-            schema,
             visiting,
             binding_defs,
             binding_types
         );
+    }
+
+    lifetime_shape.LifetimeShapeId structural_nominal_lifetime_shape(
+        self,
+        types.NamedType named,
+        sem.Def& model_def,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        if (self.lifetime_type_stack_has(visiting, model_def.def_id)) {
+            return self.typeck.lifetime_shapes.recursive(model_def.def_id);
+        }
+        Int binding_depth = binding_defs.len();
+        self.bind_named_type_args(model_def, named, binding_defs, binding_types);
+        visiting.add(model_def.def_id);
+        lifetime_shape.LifetimeShapeId shape = self.named_members_lifetime_shape(
+            model_def,
+            visiting,
+            binding_defs,
+            binding_types
+        );
+        visiting.pop();
+        binding_defs.truncate(binding_depth);
+        binding_types.truncate(binding_depth);
+        return shape;
     }
 
     lifetime_shape.LifetimeShapeId nominal_region_lifetime_shape(
@@ -685,6 +1074,35 @@ public struct LifetimeShapeQuery: Copyable {
         ) is .some(field_type) else {
             return self.typeck.lifetime_shapes.symbolic(member_def);
         }
+        return self.field_type_lifetime_shape(
+            member_def,
+            field_type,
+            visiting,
+            binding_defs,
+            binding_types
+        );
+    }
+
+    lifetime_shape.LifetimeShapeId field_type_lifetime_shape(
+        self,
+        qid.DefId field_def,
+        qid.TypeId field_type,
+        list.ArrayList<qid.DefId>& visiting,
+        list.ArrayList<qid.DefId>& binding_defs,
+        list.ArrayList<qid.TypeId>& binding_types
+    ) {
+        sem.Def& field = self.ctx.store.model.def_ref(field_def);
+        types.TypeInfo info = self.ctx.store.types.get(field_type);
+        if (field.life_clauses.len() > 0
+            && info.data is .handle_type(handle)
+            && types.is_raw_pointer_handle(handle)) {
+            return self.lifetime_shape_inner(
+                handle.element,
+                visiting,
+                binding_defs,
+                binding_types
+            );
+        }
         return self.lifetime_shape_inner(field_type, visiting, binding_defs, binding_types);
     }
 
@@ -694,7 +1112,8 @@ public struct LifetimeShapeQuery: Copyable {
 
     Bool generic_param_type(self, qid.DefId def_id) {
         if (!self.ctx.store.defs.has(def_id)) { return false; }
-        return self.ctx.store.defs.get(def_id).kind == .generic_param_def;
+        def.DefRecord record = self.ctx.store.defs.get(def_id);
+        return record.kind == .generic_param_def && record.domain == .type_name;
     }
 
     Bool symbolic_type_def(self, qid.DefId def_id) {
