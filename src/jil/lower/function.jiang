@@ -11,10 +11,13 @@ import source = "../../source.jiang";
 import monomorph = "../../sema/monomorph.jiang";
 import comptime_value = "../../sema/comptime/value.jiang";
 import types = "../../sema/type.jiang";
+import layout = "../../layout.jiang";
+import layout_compute = "../../layout/compute.jiang";
 import token = "../../syntax/token.jiang";
 import jil = "../model.jiang";
 import drop_elaborate = "../drop_elaborate.jiang";
 import list = "../../support/list.jiang";
+import table = "../../support/table.jiang";
 import std;
 import * = "./model.jiang";
 import lower_context = "./context.jiang";
@@ -409,9 +412,7 @@ public extend lower_context.Context {
     public Bool type_args_are_concrete(self, qid.TypeId[]& type_args) {
         Int index! = 0;
         while (index < type_args.length) {
-            if (!self.type_is_concrete(type_args[index])) {
-                return false;
-            }
+            if (!self.type_is_concrete(type_args[index])) { return false; }
             index = index + 1;
         }
         return true;
@@ -443,6 +444,61 @@ public extend lower_context.Context {
         return true;
     }
 
+    Bool type_has_concrete_nominal_layout(self, types.NamedType named) {
+        def.DefKind kind = self.ctx.store.defs.get(named.def_id).kind;
+        if (kind != .struct_def && kind != .enum_def && kind != .union_def) {
+            return false;
+        }
+        return self.generic_args_are_fully_concrete(named.args);
+    }
+
+    Bool generic_args_are_fully_concrete(self, types.GenericArg[]& args) {
+        Int index! = 0;
+        while (index < args.length) {
+            types.GenericArg arg = args[index];
+            if (arg is .type_arg(type_arg)) {
+                if (!self.type_is_fully_concrete(type_arg.value)) { return false; }
+            }
+            if (arg is .const_arg(const_arg)) {
+                if (const_arg.value.data is .const_param_value(_)) { return false; }
+                if (!self.type_is_fully_concrete(const_arg.value.type_id)) { return false; }
+            }
+            index = index + 1;
+        }
+        return true;
+    }
+
+    Bool type_is_fully_concrete(self, qid.TypeId type_id) {
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        if (info.data is .trait_companion(_)) { return false; }
+        if (info.data is .named(named)) {
+            def.DefKind kind = self.ctx.store.defs.get(named.def_id).kind;
+            if (kind == .generic_param_def || kind == .associated_type_def) { return false; }
+            return self.generic_args_are_fully_concrete(named.args);
+        }
+        if (info.data is .handle_type(handle)) {
+            return self.type_is_fully_concrete(handle.element);
+        }
+        if (info.data is .optional(optional)) {
+            return self.type_is_fully_concrete(optional.element);
+        }
+        if (info.data is .error_union(error_union)) {
+            return self.type_is_fully_concrete(error_union.value)
+                && self.type_is_fully_concrete(error_union.error);
+        }
+        if (info.data is .array_type(array_type)) {
+            return self.type_is_fully_concrete(array_type.element);
+        }
+        if (info.data is .tuple_type(tuple_type)) {
+            Int index! = 0;
+            while (index < tuple_type.items.length) {
+                if (!self.type_is_fully_concrete(tuple_type.items[index])) { return false; }
+                index = index + 1;
+            }
+        }
+        return true;
+    }
+
     public () ensure_custom_deinit_instances(self) {
         // drop elaboration 会把 concrete nominal local/field 改写成 deinit 调用。
         // 这些调用目标必须在 JIL 阶段就补齐，backend 只能消费完整 JIL。
@@ -455,45 +511,98 @@ public extend lower_context.Context {
     }
 
     public () ensure_custom_deinit_instances_for_body(self, jil.Body body) {
+        table.HashTable<Int, Bool> visited! = table.HashTable<Int, Bool>();
         Int local_index! = 0;
         while (local_index < body.locals.length) {
-            self.ensure_custom_deinit_instance_for_type(body.locals[local_index].type_id);
+            self.ensure_custom_deinit_instance_for_type(
+                body.locals[local_index].type_id,
+                visited$.mut_ref()
+            );
             local_index = local_index + 1;
         }
     }
 
     public () ensure_custom_deinit_instance_for_type(self, qid.TypeId type_id) {
+        table.HashTable<Int, Bool> visited! = table.HashTable<Int, Bool>();
+        self.ensure_custom_deinit_instance_for_type(type_id, visited$.mut_ref());
+    }
+
+    () ensure_custom_deinit_instance_for_type(
+        self,
+        qid.TypeId type_id,
+        table.HashTable<Int, Bool>&! visited
+    ) {
+        Int type_index = type_id.to_index();
+        if (visited.has(type_index)) { return; }
+        visited.set(type_index, true);
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         if (info.data is .named(named)) {
             self.ensure_custom_deinit_instance_for_named(named);
-            self.ensure_custom_deinit_instances_for_type_args(named.type_args);
+            self.ensure_custom_deinit_instances_for_type_args(named.type_args, visited);
+            if (self.type_has_concrete_nominal_layout(named)) {
+                self.ensure_custom_deinit_instances_for_fields(type_id, visited);
+            }
             return;
         }
         if (info.data is .handle_type(handle)) {
-            self.ensure_custom_deinit_instance_for_type(handle.element);
+            if (types.is_owner_pointer_handle(handle)) {
+                self.ensure_custom_deinit_instance_for_type(handle.element, visited);
+            }
             return;
         }
         if (info.data is .optional(optional)) {
-            self.ensure_custom_deinit_instance_for_type(optional.element);
+            self.ensure_custom_deinit_instance_for_type(optional.element, visited);
             return;
         }
         if (info.data is .array_type(array_type)) {
-            self.ensure_custom_deinit_instance_for_type(array_type.element);
+            self.ensure_custom_deinit_instance_for_type(array_type.element, visited);
             return;
         }
         if (info.data is .tuple_type(tuple_type)) {
-            self.ensure_custom_deinit_instances_for_type_args(tuple_type.items);
+            self.ensure_custom_deinit_instances_for_type_args(tuple_type.items, visited);
             return;
         }
         if (info.data is .closure_environment_type(environment)) {
-            self.ensure_custom_deinit_instances_for_type_args(environment.capture_types);
+            self.ensure_custom_deinit_instances_for_type_args(
+                environment.capture_types,
+                visited
+            );
+        }
+    }
+
+    () ensure_custom_deinit_instances_for_fields(
+        self,
+        qid.TypeId type_id,
+        table.HashTable<Int, Bool>&! visited
+    ) {
+        layout.LayoutId layout_id = layout_compute.layout_of_type(self.ctx, type_id);
+        layout.TypeLayout type_layout = self.ctx.store.layouts.layout(layout_id);
+        Int index! = 0;
+        while (index < type_layout.fields.length) {
+            self.ensure_custom_deinit_instance_for_type(
+                type_layout.fields[index].field_type,
+                visited
+            );
+            index = index + 1;
         }
     }
 
     public () ensure_custom_deinit_instances_for_type_args(self, qid.TypeId[]& type_args) {
+        table.HashTable<Int, Bool> visited! = table.HashTable<Int, Bool>();
+        self.ensure_custom_deinit_instances_for_type_args(
+            type_args,
+            visited$.mut_ref()
+        );
+    }
+
+    () ensure_custom_deinit_instances_for_type_args(
+        self,
+        qid.TypeId[]& type_args,
+        table.HashTable<Int, Bool>&! visited
+    ) {
         Int index! = 0;
         while (index < type_args.length) {
-            self.ensure_custom_deinit_instance_for_type(type_args[index]);
+            self.ensure_custom_deinit_instance_for_type(type_args[index], visited);
             index = index + 1;
         }
     }
