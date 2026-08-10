@@ -715,6 +715,10 @@ struct FunctionBorrowChecker: Movable {
         guard statement.kind is .assign_stmt(assign_stmt) else { return; }
         move_path.MovePathId destination = self.paths.path_for_place(assign_stmt.destination);
         if (!self.valid_move_path(destination)) { return; }
+        if (self.logical_raw_storage_element_type(assign_stmt.destination)
+            is .some(element_type)) {
+            self.prebuild_single_carried_lifetime_paths(destination, element_type);
+        }
         jil.Rvalue value = assign_stmt.value;
         if (value is .use_value(use_value)) {
             self.prebuild_carried_operand_lifetime_paths(destination, use_value.value);
@@ -745,9 +749,14 @@ struct FunctionBorrowChecker: Movable {
         while (field_index < aggregate_value.fields.length) {
             move_path.MovePathId field_path =
                 self.aggregate_field_path(destination, aggregate_value, field_index);
-            self.prebuild_carried_operand_lifetime_paths(
-                field_path, aggregate_value.fields[field_index]
-            );
+            if (self.aggregate_logical_raw_storage_type(aggregate_value, field_index)
+                is .some(element_type)) {
+                self.prebuild_single_carried_lifetime_paths(field_path, element_type);
+            } else {
+                self.prebuild_carried_operand_lifetime_paths(
+                    field_path, aggregate_value.fields[field_index]
+                );
+            }
             field_index = field_index + 1;
         }
     }
@@ -2100,7 +2109,11 @@ struct FunctionBorrowChecker: Movable {
 
     () record_assignment_loan_value(self, jil.Place destination, jil.Rvalue value) {
         if (value is .borrow_value(borrow_value)) {
-            self.add_loan(self.reference_loan_kind_for_type(self.place_type(destination)), borrow_value.place, destination);
+            self.add_loan(
+                self.reference_loan_kind_for_type(self.place_type(destination)),
+                borrow_value.place,
+                destination
+            );
             self.record_borrowed_place_carried_loans(
                 destination, borrow_value.place
             );
@@ -2108,13 +2121,28 @@ struct FunctionBorrowChecker: Movable {
         }
         if (value is .address_of_value(address_of_value)) {
             self.add_loan(.raw_pointer_view, address_of_value.place, destination);
+            if (self.logical_raw_storage_element_type(destination) is .some(element_type)) {
+                self.record_logical_raw_storage_source(
+                    self.paths.path_for_place(destination),
+                    element_type,
+                    self.paths.path_for_place(address_of_value.place)
+                );
+            }
             return;
         }
         if (value is .use_value(use_value)) {
+            self.record_logical_raw_storage_operand(
+                destination,
+                use_value.value
+            );
             self.record_operand_loan(destination, use_value.value);
             return;
         }
         if (value is .cast_value(cast_value)) {
+            self.record_logical_raw_storage_operand(
+                destination,
+                cast_value.value
+            );
             self.record_operand_loan(destination, cast_value.value);
             return;
         }
@@ -2137,6 +2165,22 @@ struct FunctionBorrowChecker: Movable {
         if (value is .closure_value(closure_value)) {
             self.record_closure_loans(destination, closure_value);
         }
+    }
+
+    () record_logical_raw_storage_operand(
+        self,
+        jil.Place destination,
+        jil.Operand operand
+    ) {
+        guard self.logical_raw_storage_element_type(destination)
+            is .some(element_type) else {
+            return;
+        }
+        self.record_logical_raw_storage_loan(
+            self.paths.path_for_place(destination),
+            element_type,
+            operand
+        );
     }
 
     () record_borrowed_place_carried_loans(
@@ -2282,10 +2326,90 @@ struct FunctionBorrowChecker: Movable {
         Int index! = 0;
         while (index < value.fields.length) {
             move_path.MovePathId field_path = self.aggregate_field_path(destination_path, value, index);
-            qid.TypeId field_type = self.aggregate_field_type(value, index);
-            self.record_operand_loan_to_path(field_path, field_type, value.fields[index]);
+            if (self.aggregate_logical_raw_storage_type(value, index) is .some(element_type)) {
+                self.record_logical_raw_storage_loan(
+                    field_path,
+                    element_type,
+                    value.fields[index]
+                );
+            } else {
+                qid.TypeId field_type = self.aggregate_field_type(value, index);
+                self.record_operand_loan_to_path(field_path, field_type, value.fields[index]);
+            }
             index = index + 1;
         }
+    }
+
+    qid.TypeId? aggregate_logical_raw_storage_type(
+        self,
+        jil.AggregateRvalue value,
+        Int field_index
+    ) {
+        if (value.kind != .struct_value) { return null; }
+        guard self.aggregate_field_def(value.def_id$.some(), field_index)
+            is .some(field_def) else {
+            return null;
+        }
+        sem.Def& field = self.ctx.store.model.def_ref(field_def);
+        if (field.life_clauses.len() == 0) { return null; }
+        types.TypeInfo owner_info = self.ctx.store.types.get(value.type_id);
+        guard owner_info.data is .named(named) else { return null; }
+        qid.TypeId field_type = self.structural_field_type(named, field_def);
+        types.TypeInfo field_info = self.ctx.store.types.get(field_type);
+        guard field_info.data is .handle_type(handle) else { return null; }
+        if (!types.is_raw_pointer_handle(handle)) { return null; }
+        return handle.element;
+    }
+
+    () record_logical_raw_storage_loan(
+        self,
+        move_path.MovePathId destination,
+        qid.TypeId element_type,
+        jil.Operand operand
+    ) {
+        guard self.operand_place(operand) is .some(pointer) else { return; }
+        move_path.MovePathId pointer_path = self.paths.path_for_place(pointer);
+        Int original_len = self.dataflow.active_loans.len();
+        Int index! = 0;
+        while (index < original_len) {
+            loan_facts.ActiveLoanFact fact = self.dataflow.active_loans.get(index);
+            index = index + 1;
+            if (fact.target != pointer_path) { continue; }
+            loan.Loan current = self.results.loans.get(fact.loan_id);
+            if (current.kind != .raw_pointer_view) { continue; }
+            self.record_logical_raw_storage_source(
+                destination,
+                element_type,
+                current.source
+            );
+        }
+    }
+
+    () record_logical_raw_storage_source(
+        self,
+        move_path.MovePathId destination,
+        qid.TypeId element_type,
+        move_path.MovePathId source
+    ) {
+        if (self.record_active_operand_loans(destination, source)) { return; }
+        if (self.source_root_param_index(source) != null) {
+            self.record_param_carried_loans(source, destination, element_type);
+        }
+    }
+
+    qid.TypeId? logical_raw_storage_element_type(
+        self,
+        jil.Place destination
+    ) {
+        if (destination.projection.length == 0) { return null; }
+        jil.PlaceElem projection = destination.projection[destination.projection.length - 1];
+        guard projection is .field_projection(field) else { return null; }
+        sem.Def& model_field = self.ctx.store.model.def_ref(field.field_def);
+        if (model_field.life_clauses.len() == 0) { return null; }
+        types.TypeInfo field_info = self.ctx.store.types.get(field.field_type);
+        guard field_info.data is .handle_type(handle) else { return null; }
+        if (!types.is_raw_pointer_handle(handle)) { return null; }
+        return handle.element;
     }
 
     move_path.MovePathId aggregate_field_path(self,
