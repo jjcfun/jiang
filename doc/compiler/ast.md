@@ -40,8 +40,8 @@ AstId            -> 单个 AstUnit 内部的有效 node index
 `AstUnit.source` 记录 AST 来源；它只能是普通 `SourceFileId` 或 virtual source。
 测试、宏展开、REPL 片段使用 virtual source，不引入 none 状态。
 
-当前 pipeline 会为一次 `compile_package` 创建临时 `syntax.Store`，保存 root/import closure
-内的 AST。`syntax.Store` 用完即可释放，不挂到 `CompilerStore`。
+pipeline 把 owned root `AstUnit` 直接移交给 `ModuleResolver`。resolver 私有持有 root/import
+closure 中尚未完成 lowering 的 AST；每个 module 发布 Semantic Model 后立即释放对应 AST。
 
 ## 不变量
 

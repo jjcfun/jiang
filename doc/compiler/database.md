@@ -356,6 +356,10 @@ source
 复用能够稳定保存的结果。设计不假设常驻 `CrateAst`，也不为了未来 LSP 把 AST、
 TypedFacts 或 JIL 全部放进长期 Database。
 
+`SourceId -> ModuleId` 是 `ResolveStore` 的索引，module pass progress 是 `ModuleResolver` 的
+求值状态。两者都不再复制到 QueryEngine；只有确实存在独立 typed value 或 L2 artifact 的问题
+才建立 QueryCache。
+
 ## 10. 新增查询的规则
 
 新增一个查询时按以下顺序设计：

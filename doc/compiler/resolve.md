@@ -6,17 +6,15 @@ resolved AST lower 成 Semantic Model，不再产生 `ResolvedFile` 这种中间
 
 ## 入口
 
-`resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 先创建本次 package 编译的
-临时 `syntax.Store`，放入 root AST 后按值移交给 `ModuleResolver`。resolver 是 root/import
-closure active AST 的唯一 owner，先构建 `ModuleGraph`，再把 graph
+`resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 把解析得到的 owned root AST
+直接移交给 `ModuleResolver`。resolver 用私有 typed map 持有 root/import closure 中尚未完成
+lowering 的 active AST，先构建 `ModuleGraph`，再把 graph
 内可达 module 直接 lower 到 Semantic Model：
 
 ```jiang
-syntax_store.Store asts! = syntax_store.Store()
-SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
-asts.set_unit(root.unit, source_revision)
-ModuleResolver resolver! = ModuleResolver(ctx, asts$.move())
-ModuleGraph^ graph = resolver.build_module_graph_for_source(root_source_id)
+SyntaxResult root! = syntax.parse_source(ctx, text, root_source_id)
+ModuleResolver resolver! = ModuleResolver(ctx)
+ModuleGraph^ graph = resolver.build_module_graph(root.take_unit())
 resolver.lower_module_graph_to_model(graph$.ref())
 ```
 
@@ -31,10 +29,10 @@ declaration/reference 的解析结果。
 
 ```text
 build_module_graph(root_unit)
-  -> root AstUnit already lives in this compile_package syntax.Store
+  -> move root AstUnit into ModuleResolver active AST map
   -> ensure_declarations(root_unit.source_id)
   -> create/reuse module shell, collect imports, publish declaration names
-  -> resolve import targets, parse/load target AstUnit into the same syntax.Store when needed
+  -> resolve import targets, parse/load target AstUnit into the same resolver-owned map when needed
   -> add ModuleGraph import edges
   -> recursively ensure declarations for reachable source modules
   -> check package dependency cycle on cross-package edges
@@ -108,7 +106,7 @@ resolved Semantic Model。
   `app -> util -> base` 这类递归源码依赖会进入同一编译 closure。
 - 未命中 dependency 时，再按已登记 virtual/module 名称查 `SourceStore`。
 - 找到 source 后调用 `ensure_module(source_id)`。
-- 如果目标 source 的 `AstUnit` 已经登记到本轮 `syntax.Store`，会递归推进目标 module pass。
+- 如果目标 source 的 `AstUnit` 已经登记到 resolver 的 active AST map，会递归推进目标 module pass。
 - 解析成功后创建 `import_alias_def`，并把 alias 作为 `.namespace_name` 绑定到当前 module
   namespace。
 - 对 string/file import，当前取字符串字面量的 symbol 文本，
@@ -142,6 +140,7 @@ lower_module_graph_to_model(graph)
   -> collect declarations for all graph modules
   -> NameResolver.resolve_references()
   -> lower resolved AST nodes directly into CompilerStore.model
+  -> mark module resolved and release its owned AstUnit
 ```
 
 resolve 不输出 `ResolvedFile`，也不把 AST 持久化到 query。Semantic Model lowering 只在 resolve 阶段

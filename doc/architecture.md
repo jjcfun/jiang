@@ -207,7 +207,7 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   compilation 的反向 span 索引；索引随 session-local 语义表一起重建。
 - `CompilerContext` 不直接平铺业务 store；所有业务 store 都通过 `ctx.store` 访问。
 - 阶段产物只有确实被多个后续阶段消费时才挂入 `CompilerStore`。
-- `syntax.Store` 是单次 compilation 的 parse cache，不作为跨阶段长期语义 store。
+- `ModuleResolver` 私有持有尚未完成 lowering 的 owned `AstUnit`，不把 AST 放入长期 store。
 - `ResolveStore` 保存 package、module、namespace、import/export 和 def store，是名字事实 owner。
 - `sem_store.Store` 保存每个 `DefId` 的 Semantic Model signature/body，是 Semantic Model 事实 owner。
 - `TypeStore` 保存 `TypeId -> TypeInfo` 的类型实体。
@@ -315,7 +315,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
   `CompilerContext.query` 持有。
 - `MonomorphStore`、`jil.Store` 和 `ModuleGraph` 是单次 pipeline 调用中的阶段产物；
   pipeline borrow result 在完成后移入 `CompilerStore.borrowck`。
-- `syntax.Store` 是一次 `compile_package` 的临时 AST cache，不挂入 `CompilerStore` 长期状态。
+- `ModuleResolver` 是本次 `compile_package` active AST 的唯一 owner；module 完成 Semantic Model
+  lowering 后立即释放对应 AST。
 - `src/db/query_dependency.jiang` 统一拥有稳定 observation、反向索引和本轮失效候选；
   declaration 裁决接入实际 artifact 复用前，不把候选统计视为增量命中。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `store.jiang` 增加高阶查询入口。
@@ -328,8 +329,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 - 编译事实以 per-query 多表缓存按需求值（每个查询一张 typed cache，key/value 由
   查询声明决定）；阶段间通过查询依赖传递，不再通过 `CompilerContext&` 全量互写。
 - 已有基础：`IncrementalQueryKind` / `StableQueryKey`（稳定 query key）、
-  `QueryDependencyGraph`（依赖边与失效）、
-  `syntax.Store`（瞬时 parse cache）、`IncrementalSymbolStore`（稳定身份映射
+  `QueryDependencyGraph`（依赖边与失效）、resolver-owned active AST map、
+  `IncrementalSymbolStore`（稳定身份映射
   与 fingerprint）、`ctx.query`（`QueryEngine`：per-query caches + 稳定依赖图）。
 - 递归不是统一 stable-key 栈的属性：type-check body/node/def、JIL body 和 package
   analysis 分别用自己的 typed active/complete 状态定义重入结果，避免第二套 cycle
