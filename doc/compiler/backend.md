@@ -159,7 +159,7 @@ linked object 以及 `.jbuild` no-op hit 数量。`--jobs N` 控制 debug object
 `backend/abi.jiang` 是 backend-independent 的 C ABI classifier。它消费 semantic `TypeId`
 和 `LayoutStore`，把函数返回值和参数分类为：
 
-- `none`：zero-sized / unit / never，不进入 ABI 参数列表。
+- `none`：zero-sized / Void / never，不进入 ABI 参数列表。
 - `direct`：标量、handle、function pointer 和小 aggregate，直接映射成 LLVM value。
 - `indirect`：大 aggregate 通过 hidden pointer 传递；参数使用 `byval`，返回值使用 `sret`。
 

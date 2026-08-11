@@ -71,7 +71,7 @@ callable vtable。
 callable vtable 至少包含：
 
 - `call: RawFn<Ret, Void*, Args...>`，使用 erased receiver 调用 closure body。
-- `drop: RawFn<Unit, Void*>`，销毁 receiver 指向的匿名 closure object。
+- `drop: RawFn<Void, Void*>`，销毁 receiver 指向的匿名 closure object。
 
 普通 `Fn` 的 receiver 指向当前栈帧或当前 aggregate 内的匿名 closure object，因此 `Fn<...>` 不能
 返回、保存到 heap/global，也不能写入可能比当前函数更久的外部位置。
@@ -107,7 +107,7 @@ Jiang closure object。C ABI 函数指针只应该映射到 `RawFn<...>`。
 ```text
 {
   receiver: Void*,
-  vtable:   { call: RawFn<Ret, Void*, Args...>, drop: RawFn<Unit, Void*> }*
+  vtable:   { call: RawFn<Ret, Void*, Args...>, drop: RawFn<Void, Void*> }*
 }
 ```
 
@@ -379,7 +379,7 @@ struct / union 的 public region、tuple 元素和 callable result/参数可提�
 
 ```jiang
 Int total! = 0;
-Fn<(), Int> add = { value =>
+Fn<Void, Int> add = { value =>
     total = total + value;
 };
 ```

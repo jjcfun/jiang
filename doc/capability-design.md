@@ -98,13 +98,13 @@ capability。
 ```jiang
 async Int load_data();
 
-async [ui_domain] () render(Model&! model) {
+async [ui_domain] Void render(Model&! model) {
     model.loading = true;
     load_data();
     model.loading = false;
 }
 
-() inc(Int&! value) {
+Void inc(Int&! value) {
     value = value + 1;
 }
 ```
@@ -184,7 +184,7 @@ async `Fn` / `RawFn` 动态调用遵守与直接 async 调用相同的 Domain �
 普通函数没有默认 domain，也不是隐式 `coroutine.sync(current)`：
 
 ```jiang
-() inc(Int&! value) {
+Void inc(Int&! value) {
     value = value + 1;
 }
 ```
@@ -217,7 +217,7 @@ domain-bound `async [D]` 函数在签名 metadata 中保存 Domain binding，调
 或另一个可变引用同时存活：
 
 ```jiang
-() bump(Int&! value) {
+Void bump(Int&! value) {
     value = value + 1;
 }
 ```
@@ -225,7 +225,7 @@ domain-bound `async [D]` 函数在签名 metadata 中保存 Domain binding，调
 函数参数直接用 `T&!` 表达这一能力：
 
 ```jiang
-() swap(Int&! left, Int&! right) {
+Void swap(Int&! left, Int&! right) {
 }
 ```
 
@@ -239,7 +239,7 @@ Jiang 不需要显式 `await`。调用 async 函数就是挂起点：
 ```jiang
 async Int fetch();
 
-async () refresh(Model&! model) {
+async Void refresh(Model&! model) {
     model.loading = true;
     Int value = fetch(); // 可能挂起，默认保持 ui_domain
     model.value = value;
@@ -269,7 +269,7 @@ coroutine.sync(ui_domain) {
 async coroutine frame 在创建它的 current domain 上执行和恢复：
 
 ```jiang
-async () foo(T&! x) {
+async Void foo(T&! x) {
     x = ...
     bar(); // 默认 await
     x = ... // 仍在同一个 current domain 恢复

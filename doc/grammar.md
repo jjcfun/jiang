@@ -287,7 +287,6 @@ async_effect
 type_primary
             <- "_"
              / path type_args?
-             / "(" ")"
              / "(" type "," type ("," type)* ","? ")"
              / "(" type ")"
 
@@ -601,7 +600,7 @@ switch_pattern_list
 ```
 
 说明：`stmt` 永远不贡献 `block` 的值；`block` 的值只来自最后一个不带分号的
-`tail_expr`。没有 `tail_expr` 的 `block` 值为 `Unit`。普通表达式不能随意写成
+`tail_expr`。没有 `tail_expr` 的 `block` 值为 `Void`。普通表达式不能随意写成
 `expr;`，只有调用语句、赋值语句、控制语句和声明等明确 statement 形态可以带
 分号出现。这样可以避免 `T x;` 声明和任意表达式语句在 block 开头互相抢解析。
 `call_stmt` 在语法上先解析为 `postfix_expr`，但要求最外层 postfix 必须是调用；

@@ -25,7 +25,7 @@
 | where constraints | `generic` | partial | projected equality 多关联类型链、负 trait bound 组合 |
 | lifetime annotation | `lifetime` | covered | 参数、`self`、返回值、字段/tuple/callable 路径与非法契约 |
 | type postfix | `type` | covered | pointer-to-pointer ABI 场景已有基础覆盖 |
-| tuple / unit type | `type`, `aggregate` | partial | 嵌套 tuple type |
+| tuple / Void type | `type`, `aggregate` | partial | 嵌套 tuple type |
 | struct | `nominal`, `aggregate` | covered | 默认构造、custom init、方法和字段可见性 |
 | enum | `nominal`, `control_flow` | covered | underlying int 类型的更多边界值 |
 | union | `nominal`, `control_flow` | covered | 多 payload 模式组合已有基础覆盖 |

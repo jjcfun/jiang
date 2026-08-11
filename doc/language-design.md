@@ -173,7 +173,7 @@ lowering 成高效 ABI 表示，但 resolve/sema 层不应该因为类型是不�
 已确定类型语法：
 
 - `_`：推断类型。
-- `()`：Unit 类型。
+- `Void`：Void type；它唯一的值写作 `()`。
 - `T` / `foo.Bar`：命名类型。
 - `T<A, B>`：泛型类型参数。
 - `(A, B)`：tuple type。
@@ -287,7 +287,7 @@ Jiang 对共享引用和唯一可变引用执行静态 borrow check，并同时�
 函数签名直接用 `T&!` 声明调用点必须提供唯一可变访问能力：
 
 ```jiang
-() swap(Int&! left, Int&! right) {
+Void swap(Int&! left, Int&! right) {
 }
 ```
 
@@ -793,11 +793,12 @@ package API。
 
 ## 函数和方法
 
-函数一定有返回类型。无返回值使用 Unit：
+函数一定有返回类型。无返回值使用 `Void`，对应的值写作 `()`。`return;` 是 `return ();` 的简写，
+函数也可以在末尾隐式返回 `()`：
 
 ```jiang
-() hello() {
-    return ();
+Void hello() {
+    return;
 }
 ```
 
@@ -1030,7 +1031,7 @@ Domain binding 恰好懒创建一个 Executor：
 
 ```jiang
 struct InlineExecutor: Executor {
-    () enqueue(Self& self, ExecutorJob job) {
+    Void enqueue(Self& self, ExecutorJob job) {
         job.run();
     }
 }
@@ -1093,12 +1094,12 @@ union variant 的外部可见性由外层类型是否 public 控制。
 ```jiang
 union Maybe<T> {
     T some;
-    () none;
+    Void none;
 }
 ```
 
 union variant 声明按 grammar 使用字段式写法，所有 variant 必须写出 payload 类型。
-没有 payload 的 tag 使用 unit 类型：`union Maybe<T> { T some; () none; }`。
+没有 payload 的 tag 使用 `Void`：`union Maybe<T> { T some; Void none; }`。
 
 ## Trait 和 Extend
 
@@ -1134,7 +1135,7 @@ trait Equatable {
 }
 
 trait Hashable: Equatable {
-    () hash<H: Hasher>(self, H&! hasher);
+    Void hash<H: Hasher>(self, H&! hasher);
 }
 
 trait Indexable {
@@ -1346,7 +1347,7 @@ catch binding 只在 catch body 内可见，类型来自被处理 errorable valu
 `stmt` 和 `expr` 在语法上保持分离。`block` 的语法以 `doc/grammar.md` 为准：
 `block <- "{" stmt* tail_expr? "}"`。`stmt` 不贡献 `block` 的值；`block`
 作为表达式使用时，其值只来自最后一个不带分号的 `tail_expr`。没有
-`tail_expr` 的 `block` 值为 `Unit`。Jiang 没有通用表达式语句，只有
+`tail_expr` 的 `block` 值为 `Void`。Jiang 没有通用表达式语句，只有
 `call_stmt`、赋值、控制语句和声明等明确 statement 形态可以在语句位置出现。
 因此：
 
@@ -1358,25 +1359,25 @@ Int x = {
 ```
 
 上面的 `block` 类型为 `Int`。如果没有最后的 `tail_expr`，或者最后一个
-源码元素是赋值、局部变量声明、`defer` 等语句，则 `block` 类型为 `Unit`。
+源码元素是赋值、局部变量声明、`defer` 等语句，则 `block` 类型为 `Void`。
 
 语句 result type 规则：
 
 | 语句 | result type |
 | --- | --- |
-| `call_stmt` | `Unit` |
-| `block` | block 的 tail expr result type；无 tail expr 时为 `Unit` |
+| `call_stmt` | `Void` |
+| `block` | block 的 tail expr result type；无 tail expr 时为 `Void` |
 | `return expr?;` | `Never` |
 | `throw expr;` | `Never` |
 | `break;` | `Never` |
 | `continue;` | `Never` |
-| `var_decl_stmt` | `Unit` |
-| `destructure_stmt` | `Unit` |
-| `assign_stmt` | `Unit` |
-| `defer_stmt` | `Unit` |
-| `guard_stmt` | `Unit` |
-| `while_stmt` | `Unit` |
-| `for_stmt` | `Unit` |
+| `var_decl_stmt` | `Void` |
+| `destructure_stmt` | `Void` |
+| `assign_stmt` | `Void` |
+| `defer_stmt` | `Void` |
+| `guard_stmt` | `Void` |
+| `while_stmt` | `Void` |
+| `for_stmt` | `Void` |
 
 `Never` 表示该语句不会正常继续执行，可以在分支类型统一时转换为任意目标类型。
 `return`、`throw`、`break`、`continue` 仍然是语句，不属于普通表达式语法。
@@ -1560,12 +1561,12 @@ Int get(self) {
 }
 
 @effect(write(self))
-() set(Self&! self, Int value) {
+Void set(Self&! self, Int value) {
     self.value = value;
 }
 
 @effect(write(self), io, alloc)
-() save(self, File& file) {
+Void save(self, File& file) {
 }
 ```
 

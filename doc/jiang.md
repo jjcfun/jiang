@@ -140,7 +140,7 @@ _ name = "Jiang"; // 推断为 UInt8[_]
 - 需要固定 ABI 宽度、文件格式或网络协议布局时，使用 `Int8/Int16/Int32/Int64` 与 `UInt8/UInt16/UInt32/UInt64`。
 - `Char` 表示单个 Unicode 标量，例如 `'a'`、`'中'`
 - 字符串字面量按 UTF-8 字节序列处理，默认类型为 `UInt8[:0]&`；backing storage 自动追加末尾 `0`，但 sentinel 不计入 length。当前可用于 `UInt8[_]` / `UInt8[]&` / `UInt8[:0]&`，也可按 expected type 转成 `UInt8*` 或 `UInt8[N:0]`
-- `()` 表示 `Unit` 类型；它是一个零大小值，同时承担无返回值语义
+- `Void` 表示 Void type，`()` 是它唯一的值；该值大小为零，同时承担无返回值语义
 
 数值字面量在类型检查前保持未定型，优先由上下文决定最终类型。普通已经定型的数值之间不做隐式提升：
 
@@ -754,15 +754,16 @@ Int add(Int a, Int b);
 Int x! = add(1, 2); 		// 定义可重赋值 binding
 ```
 
-#### Unit
+#### Void
 
-`()` 表示 `Unit` 类型。`Unit` 不占用内存空间，可以像普通类型一样作为值、参数、局部变量和字段使用。
+`Void` 表示 Void type，`()` 是它唯一的值。`Void` 不占用内存空间，可以像普通类型一样作为
+参数、局部变量和字段类型使用。`Void` 函数可以写 `return;` 或 `return ();`，也可以在末尾
+隐式返回 `()`。
 
 ```c
-() hello() {
+Void hello() {
 	print("Hello World!");
-  // return语句必须有返回值，即使返回值是 Unit
-  return ();
+  return;
 }
 ```
 
@@ -793,12 +794,13 @@ _ r = 0..10;
 
 #### 返回值
 
-Jiang 的函数一定有返回值，即使是 `Unit` 值。`Unit` 用 `()` 表示，在运行时不会占用内存空间。
+Jiang 的函数一定有返回类型。无返回值的函数返回 `Void`，其值写作 `()`，在运行时不占用空间。
+`return;` 是 `return ();` 的简写。
 
 ```c
-() hello() {
+Void hello() {
   print("Hello World!");
-  return ();
+  return;
 }
 ```
 
@@ -1168,7 +1170,7 @@ Domain 是静态执行身份，Executor 是它在运行时采用的调度策略�
 
 ```jiang
 struct InlineExecutor: Executor {
-    () enqueue(Self& self, ExecutorJob job) {
+    Void enqueue(Self& self, ExecutorJob job) {
         job.run();
     }
 }
@@ -1300,7 +1302,7 @@ Int z = if (flag) {
 - 分支必须写成 `{ ... }`
 - `{ ... }` 内只允许语句，不允许独立的 tail expression
 - 表达式语句必须以 `;` 结束
-- 分支结果是 block 中最后一条语句的值；空 block 的结果是 `Unit`
+- 分支结果是 block 中最后一条语句的值；空 block 的结果是 `Void`
 
 #### switch表达式
 
@@ -1666,7 +1668,7 @@ struct 可以自定义 `init` 函数。
 - `init` 是结构体内的特殊构造器入口
 - `init` 允许可见性修饰，例如 `public init(...)`
 - `init` 必须显式声明 `self` 参数
-- `init` 不声明返回类型，语义等价于 `()`
+- `init` 不声明返回类型，返回类型在语义上是 `Void`
 - `init` 只允许 `return;` / `return ();`
 - `Point(...)` / `new Point(...)` 是结构体构造语法
 - 如果类型定义了一个或多个 `init`，那么 `Point(...)` 会在这些 `init` 中按参数个数和参数类型做重载决议
@@ -1714,7 +1716,7 @@ struct 还可以定义 `deinit` 函数。
 
 - `deinit` 是结构体内唯一的特殊析构器入口
 - `deinit` 必须显式声明 `self` 参数
-- `deinit` 不声明返回类型，语义等价于 `()`
+- `deinit` 不声明返回类型，返回类型在语义上是 `Void`
 - `deinit` 只允许 `return;` / `return ();`
 - `deinit` 不允许 `public` 等可见性修饰
 - `deinit` 由该 nominal 的 drop 触发，不作为普通方法暴露
@@ -1954,7 +1956,7 @@ union MyUnion {
   Double b;
   (Int, Int) c;
 	Foo d;
-	() e;
+	Void e;
 
   struct Foo {
     Int x;
@@ -2220,7 +2222,7 @@ trait Equatable {
 }
 
 trait Hashable: Equatable {
-  () hash<H: Hasher>(self, H&! hasher);
+  Void hash<H: Hasher>(self, H&! hasher);
 }
 ```
 
@@ -2338,7 +2340,7 @@ public trait SubscriptGet {
 }
 
 public trait SubscriptSet: SubscriptGet {
-  () subscript_set(Index index, Value value);
+  Void subscript_set(Index index, Value value);
 }
 ```
 
@@ -2553,7 +2555,7 @@ public Int min(Int a, Int b) {
 }
 
 // foo只能在文件内部使用
-() foo() {
+Void foo() {
     Int a = 1;
     Int b = 2;
     Int c = 3;

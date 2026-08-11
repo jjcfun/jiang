@@ -270,7 +270,7 @@ pthread queue/group 和 futex。Linux no-libc 的 Task word wait/wake 直接使�
 第三方 runtime 提供的 `extern async` 使用单隐藏参数 ABI：
 
 ```text
-extern_async(args..., AsyncContinuation*) -> Unit
+extern_async(args..., AsyncContinuation*) -> Void
 
 AsyncContinuation {
   result_ptr: Void*
