@@ -139,11 +139,20 @@ clear_bootstrap_artifact_cache() {
 emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
-  "$BOOTSTRAP_BIN" \
-    --linker "$CLANG_BIN" \
-    "${LLVM_LINK_ARGS[@]}" \
-    -o "$output_bin" \
-    src/jiangc.jiang
+  if [ "$BOOTSTRAP_CHECK_MODE" = "audit" ]; then
+    "$BOOTSTRAP_BIN" \
+      --bootstrap-check-mode audit \
+      --linker "$CLANG_BIN" \
+      "${LLVM_LINK_ARGS[@]}" \
+      -o "$output_bin" \
+      src/jiangc.jiang
+  else
+    "$BOOTSTRAP_BIN" \
+      --linker "$CLANG_BIN" \
+      "${LLVM_LINK_ARGS[@]}" \
+      -o "$output_bin" \
+      src/jiangc.jiang
+  fi
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"
