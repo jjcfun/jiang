@@ -48,7 +48,7 @@ public struct ModelTiming: Copyable {
     public UInt64 finalize_ns = UInt64(0);
 }
 
-@region(a, b, c, d)
+@region(a, b, c)
 public struct ModuleResolver: Movable {
     @life(a)
     context.CompilerContext& ctx;
@@ -56,11 +56,10 @@ public struct ModuleResolver: Movable {
     @life(b)
     store_api.CompilerStore& store;
 
-    @life(c)
-    syntax_store.Store& asts;
+    syntax_store.Store asts!;
     table.HashTable<qid.ModuleId, module_graph_builder.ModuleResolvePassState> module_states;
     table.HashTable<resolve_state.DeclarationDefKey, qid.DefId> declaration_defs;
-    @life(d)
+    @life(c)
     UInt8[]& artifact_cache_dir;
     UInt64 compiler_version_hash;
     Bool use_source_artifacts!;
@@ -70,7 +69,7 @@ public struct ModuleResolver: Movable {
     driver_options.CompileMode mode;
     public init(self,
         context.CompilerContext& ctx,
-        syntax_store.Store& asts,
+        syntax_store.Store asts,
         UInt8[]& artifact_cache_dir = "build/cache",
         UInt64? compiler_version_hash = null,
         Bool use_source_artifacts = true,
@@ -106,7 +105,7 @@ public struct ModuleResolver: Movable {
     module_graph_builder.ModuleGraphBuilder graph_builder(self) {
         return module_graph_builder.ModuleGraphBuilder(
             self.ctx,
-            self.asts,
+            self.asts$.ref(),
             self.module_states$.ref(),
             self.declaration_defs$.ref(),
             self.artifact_cache_dir,
@@ -289,7 +288,9 @@ public struct ModuleResolver: Movable {
                 )) {
                     return false;
                 }
-                self.set_module_state(module_id, .collecting_declarations);
+                if (self.module_state(module_id) != .declarations_ready) {
+                    self.set_module_state(module_id, .collecting_declarations);
+                }
             } else {
                 if (!self.prepare_interface_if_available(module_id)) { return false; }
                 self.store.resolve.module_ref(module_id).interface_only = true;
@@ -362,7 +363,7 @@ public struct ModuleResolver: Movable {
                 self.store.artifacts.load_interface(module.source_id)$.some();
             interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
                 self.ctx,
-                self.asts,
+                self.asts$.ref(),
                 self.module_states$.ref(),
                 self.declaration_defs$.ref()
             );
@@ -379,7 +380,7 @@ public struct ModuleResolver: Movable {
             self.store.artifacts.load_interface(module.source_id)$.some();
         interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
             self.ctx,
-            self.asts,
+            self.asts$.ref(),
             self.module_states$.ref(),
             self.declaration_defs$.ref()
         );
@@ -425,6 +426,7 @@ public struct ModuleResolver: Movable {
                 self.module_for_source_node(schedule.node_at(index), source_modules)$.some();
             if (self.module_state(module_id) == .collecting_declarations) {
                 self.collect_module_declaration_names(module_id);
+                self.set_module_state(module_id, .declarations_ready);
             }
             index = index + 1;
         }
@@ -454,7 +456,7 @@ public struct ModuleResolver: Movable {
         while (index < end) {
             qid.ModuleId module_id =
                 self.module_for_source_node(schedule.node_at(index), source_modules)$.some();
-            if (self.module_state(module_id) == .collecting_declarations) {
+            if (self.module_state(module_id) == .declarations_ready) {
                 self.collect_module_aliases(module_id);
             }
             index = index + 1;
@@ -473,7 +475,7 @@ public struct ModuleResolver: Movable {
         while (index < end) {
             qid.ModuleId module_id =
                 self.module_for_source_node(schedule.node_at(index), source_modules)$.some();
-            if (self.module_state(module_id) == .collecting_declarations) {
+            if (self.module_state(module_id) == .declarations_ready) {
                 progress = progress + self.collect_module_aliases_deferred(module_id);
             }
             index = index + 1;
@@ -492,7 +494,7 @@ public struct ModuleResolver: Movable {
         while (index < end) {
             qid.ModuleId module_id =
                 self.module_for_source_node(schedule.node_at(index), source_modules)$.some();
-            if (self.module_state(module_id) == .collecting_declarations) {
+            if (self.module_state(module_id) == .declarations_ready) {
                 self.collect_module_extend_members(module_id);
                 self.set_module_state(module_id, .declarations_collected);
             }
@@ -633,6 +635,7 @@ public struct ModuleResolver: Movable {
     }
 
     Bool lower_module_bodies_to_model(self, qid.ModuleId module_id) {
+        self.set_module_state(module_id, .resolving);
         store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
         ast.AstUnit& unit = self.asts.unit(module.source_id, module.source_revision)$.some();
         resolve_state.AstResolveState state = resolve_state.AstResolveState(
@@ -644,10 +647,16 @@ public struct ModuleResolver: Movable {
         );
         self.resolve_module_references(state$.ref());
         if (self.store.model.has_errors()) {
+            self.set_module_state(module_id, .failed);
             self.store.model.mark_error();
             return false;
         }
-        return model_lower.lower_unit(state$.ref());
+        if (!model_lower.lower_unit(state$.ref())) {
+            self.set_module_state(module_id, .failed);
+            return false;
+        }
+        self.set_module_state(module_id, .resolved);
+        return true;
     }
 
     () collect_module_graph_declarations(self, module_graph.ModuleGraph& graph) {
@@ -687,6 +696,7 @@ public struct ModuleResolver: Movable {
         guard self.store.resolve.core_module is .some(core_module) else { return; }
         module_graph_builder.ModuleResolvePassState state = self.module_state(core_module);
         if (state != .collecting_declarations
+            && state != .declarations_ready
             && state != .declarations_collected
             && state != .interface_loaded
         ) {
@@ -1168,7 +1178,10 @@ public struct ModuleResolver: Movable {
         while (index < graph.module_count()) {
             qid.ModuleId module_id = graph.module_at(index);
             module_graph_builder.ModuleResolvePassState state = self.module_state(module_id);
-            if (state == .declarations_collected || state == .interface_loaded) {
+            if (state == .declarations_ready
+                || state == .declarations_collected
+                || state == .interface_loaded
+            ) {
                 index = index + 1;
                 continue;
             }
@@ -1189,6 +1202,7 @@ public struct ModuleResolver: Movable {
             module_graph_builder.ModuleResolvePassState state = self.module_state(module_id);
             if (state == .collecting_declarations) {
                 self.collect_module_declaration_names(module_id);
+                self.set_module_state(module_id, .declarations_ready);
             }
             index = index + 1;
         }
@@ -1199,7 +1213,7 @@ public struct ModuleResolver: Movable {
         while (index < graph.module_count()) {
             qid.ModuleId module_id = graph.module_at(index);
             module_graph_builder.ModuleResolvePassState state = self.module_state(module_id);
-            if (state == .collecting_declarations) {
+            if (state == .declarations_ready) {
                 self.collect_module_aliases(module_id);
             }
             index = index + 1;
@@ -1211,7 +1225,7 @@ public struct ModuleResolver: Movable {
         while (index < graph.module_count()) {
             qid.ModuleId module_id = graph.module_at(index);
             module_graph_builder.ModuleResolvePassState state = self.module_state(module_id);
-            if (state == .collecting_declarations) {
+            if (state == .declarations_ready) {
                 self.collect_module_extend_members(module_id);
                 self.set_module_state(module_id, .declarations_collected);
             }
@@ -1270,7 +1284,7 @@ public struct ModuleResolver: Movable {
     ) {
         interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
             self.ctx,
-            self.asts,
+            self.asts$.ref(),
             self.module_states$.ref(),
             self.declaration_defs$.ref()
         );
@@ -1295,7 +1309,7 @@ public struct ModuleResolver: Movable {
         guard self.store.artifacts.load_interface(module.source_id) is .some(module_interface) else { return; }
         interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
             self.ctx,
-            self.asts,
+            self.asts$.ref(),
             self.module_states$.ref(),
             self.declaration_defs$.ref()
         );
@@ -1321,7 +1335,7 @@ public struct ModuleResolver: Movable {
         }
         interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
             self.ctx,
-            self.asts,
+            self.asts$.ref(),
             self.module_states$.ref(),
             self.declaration_defs$.ref()
         );
@@ -1349,7 +1363,7 @@ public struct ModuleResolver: Movable {
         guard self.store.artifacts.load_interface(module.source_id) is .some(module_interface) else { return; }
         interface_loader.InterfaceLoader loader = interface_loader.InterfaceLoader(
             self.ctx,
-            self.asts,
+            self.asts$.ref(),
             self.module_states$.ref(),
             self.declaration_defs$.ref()
         );
@@ -1477,6 +1491,11 @@ public struct ModuleResolver: Movable {
         return builder.ensure_module(source_id);
     }
 
+    public qid.ModuleId ensure_declarations(self, source.SourceId source_id) {
+        module_graph_builder.ModuleGraphBuilder builder = self.graph_builder();
+        return builder.ensure_declarations(source_id);
+    }
+
     module_graph_builder.ModuleResolvePassState module_state(self, qid.ModuleId module_id) {
         if (
             table.hash_table_get_value<qid.ModuleId, module_graph_builder.ModuleResolvePassState>(
@@ -1486,7 +1505,7 @@ public struct ModuleResolver: Movable {
         ) {
             return state;
         }
-        return .unresolved;
+        return .unseen;
     }
 
     // module resolve state 是本次 resolver pass 的调度状态，不属于

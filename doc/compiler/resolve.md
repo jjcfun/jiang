@@ -7,16 +7,16 @@ resolved AST lower 成 Semantic Model，不再产生 `ResolvedFile` 这种中间
 ## 入口
 
 `resolve/module_resolver.jiang` 是当前 resolve 入口。pipeline 先创建本次 package 编译的
-临时 `syntax.Store`，root/import closure 的 AST 都放在这张表里。外部创建
-`ModuleResolver(ctx, asts)`，先构建 root import closure 的 `ModuleGraph`，再把 graph
+临时 `syntax.Store`，放入 root AST 后按值移交给 `ModuleResolver`。resolver 是 root/import
+closure active AST 的唯一 owner，先构建 `ModuleGraph`，再把 graph
 内可达 module 直接 lower 到 Semantic Model：
 
 ```jiang
 syntax_store.Store asts! = syntax_store.Store()
 SyntaxResult root = syntax.parse_source(ctx, text, root_source_id)
 asts.set_unit(root.unit, source_revision)
-ModuleResolver resolver! = ModuleResolver(ctx, asts$.ref())
-ModuleGraph^ graph = resolver.build_module_graph(root_unit)
+ModuleResolver resolver! = ModuleResolver(ctx, asts$.move())
+ModuleGraph^ graph = resolver.build_module_graph_for_source(root_source_id)
 resolver.lower_module_graph_to_model(graph$.ref())
 ```
 
@@ -32,11 +32,11 @@ declaration/reference 的解析结果。
 ```text
 build_module_graph(root_unit)
   -> root AstUnit already lives in this compile_package syntax.Store
-  -> ensure_module(root_unit.source_id)
-  -> collect root module imports
+  -> ensure_declarations(root_unit.source_id)
+  -> create/reuse module shell, collect imports, publish declaration names
   -> resolve import targets, parse/load target AstUnit into the same syntax.Store when needed
   -> add ModuleGraph import edges
-  -> recursively discover reachable module imports
+  -> recursively ensure declarations for reachable source modules
   -> check package dependency cycle on cross-package edges
 ```
 
@@ -60,14 +60,20 @@ root import closure。
 
 ## Resolve State
 
-`ModuleRecord.resolve_state` 记录 module 级 pass 进度：
+`ModuleResolver.module_states` 记录本次 resolver 的 module pass 进度：
 
-- `unresolved`：module shell 已存在，但 import/declaration 还未收集。
+- `unseen` / `parsing`：module shell 尚未处理，或正在解析对应 source。
 - `collecting_imports` / `imports_collected`：正在或已经完成 import 收集。
-- `collecting_declarations` / `declarations_collected`：正在或已经完成 top-level declaration 收集。
+- `collecting_declarations`：正在收集 top-level declaration names；重入只复用 module shell。
+- `declarations_ready`：本文件 declaration skeleton 已发布，alias 和 extension 尚未完成。
+- `declarations_collected`：当前 SCC 的 alias 和 extension declaration facts 已完成。
+- `resolving` / `resolved`：正在或已经完成 reference resolve 和 Semantic Model lowering。
+- `interface_loaded`：declaration/model facts 来自持久 interface，不拥有 source AST。
+- `failed`：当前 module 的 parse、resolve 或 model lowering 已失败。
 
 这些状态用于避免重复收集同一个 module，也用于 import cycle。如果 A 和 B 互相 import，
-A 进入 `collecting_declarations` 后再从 B 回到 A，会直接停止递归，等 A 当前 pass 自己完成。
+A 在递归 B 前已经发布本文件 declaration names；B 再回到 A 时，ModuleGraph 只复用已有 shell
+并截断递归。alias、extension 和 body 仍在 SCC declarations 完整后处理。
 
 ## Name Resolver
 
