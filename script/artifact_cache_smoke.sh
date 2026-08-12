@@ -239,7 +239,7 @@ check_dependency_invalidation() {
   perl -0pi -e 's/public Int cstring_length/public Int64 cstring_length/' "$dependency"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/public-change.log" \
     "$WORK_DIR/public-change" "$input"
-  require_stat_ge "$WORK_DIR/public-change.log" artifact_emitted_units 2
+  require_stat_eq "$WORK_DIR/public-change.log" artifact_emitted_units 1
   expect_exit "$WORK_DIR/public-change" 52
 }
 

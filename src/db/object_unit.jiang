@@ -1,0 +1,108 @@
+// source / monomorph object unit 的 L2 复用决策。
+//
+// `.jbuild` 仍拥有持久 work product；query 只按完整 input fingerprint 验证
+// object 并缓存本轮 reuse/emit 结果。
+
+import build_state = "../artifact/build_state.jiang";
+import cache_identity = "../artifact/cache_identity.jiang";
+import object_hash = "../artifact/object_hash.jiang";
+import qkey = "../incremental/key.jiang";
+import core_traits = "../core/traits.jiang";
+import query_cache = "./query_cache.jiang";
+import system_fs = "../system/fs.jiang";
+import std;
+
+public struct ObjectUnitKey: Copyable, Hashable, Equatable {
+    public cache_identity.StableSourceId source;
+    public build_state.WorkProductKind kind;
+    public qkey.Fingerprint128 input;
+
+    public init(self,
+        cache_identity.StableSourceId source,
+        build_state.WorkProductKind kind,
+        qkey.Fingerprint128 input
+    ) {
+        self.source = source;
+        self.kind = kind;
+        self.input = input;
+    }
+
+    public Void hash<H: core_traits.Hasher>(self, H&! hasher) {
+        self.source.hash(hasher);
+        hasher.write(Int(self.kind));
+        self.input.hash(hasher);
+    }
+
+    public Bool equal(ObjectUnitKey& lhs, ObjectUnitKey& rhs) {
+        return lhs.source == rhs.source
+            && lhs.kind == rhs.kind
+            && lhs.input == rhs.input;
+    }
+}
+
+public union ObjectUnitResult: Copyable {
+    build_state.WorkProduct reuse;
+    Void emit;
+}
+
+public struct ObjectUnitQuery: Movable {
+    Mutex<query_cache.QueryCache<ObjectUnitKey, ObjectUnitResult>>^ cache;
+
+    public init(self) {
+        self.cache = new Mutex<query_cache.QueryCache<
+            ObjectUnitKey,
+            ObjectUnitResult
+        >>(query_cache.QueryCache<ObjectUnitKey, ObjectUnitResult>());
+    }
+
+    public Void reset(self) {
+        self.cache.with_lock<Void>({ cache => cache.reset(); });
+    }
+
+    public ObjectUnitResult evaluate(
+        self,
+        ObjectUnitKey key,
+        build_state.BuildState?& previous,
+        UInt8[]& path
+    ) {
+        ObjectUnitResult? cached = self.cache.with_lock({ cache =>
+            cache.lookup(key)
+        });
+        if (cached is .some(result)) { return result; }
+        ObjectUnitResult result! = .emit();
+        if (reusable_product(previous, key, path) is .some(product)) {
+            result = .reuse(product);
+        }
+        self.cache.with_lock<Void>({ cache => cache.publish(key, result); });
+        return result;
+    }
+}
+
+build_state.WorkProduct? reusable_product(
+    build_state.BuildState?& previous,
+    ObjectUnitKey key,
+    UInt8[]& path
+) {
+    guard previous is .some(ref _ state) else { return null; }
+    guard state.find_work_product(key.source.fingerprint, key.kind)
+        is .some(product) else {
+        return null;
+    }
+    if (product.input_fingerprint != key.input) { return null; }
+    guard system_fs.file_metadata(path) is .some(metadata) else { return null; }
+    if (metadata.size < 0) { return null; }
+    if (product.object_modified_ns == metadata.modified_ns
+        && product.object_size == UInt64(metadata.size)) {
+        return product;
+    }
+    guard object_hash.hash_file(path) is .some(actual_hash) else { return null; }
+    if (actual_hash != product.object_hash) { return null; }
+    return build_state.WorkProduct(
+        product.source_identity,
+        product.kind,
+        product.input_fingerprint,
+        product.object_hash,
+        metadata.modified_ns,
+        UInt64(metadata.size)
+    );
+}
