@@ -1059,9 +1059,9 @@ contract。Domain 的 `.serial`
 `release`、`acquire_release` 或 `sequential` 中对该操作合法的顺序。Atomic 只支持后端保证 lock-free
 的整数、Bool 和 raw pointer 标量；它是显式内部可变性入口，写操作不要求外部 binding 带 `!`。
 
-同步临界区优先使用 `Mutex<T>.with_lock<R>(Fn<R, T&!>)`。Mutex 将 lock 与受保护值绑定，只在同步
-callback 期间提供 `T&!`，callback 返回后自动解锁；需要跨多个同步语句持锁时可以显式取得
-`MutexGuard<T>`。guard 和 callback 返回值都受生命周期约束，不能让受保护值的引用活过锁。
+同步临界区使用 `Mutex<T>.with_lock<R>(Fn<R, T&!>)`。Mutex 将 lock 与受保护值绑定，只在同步
+callback 期间提供 `T&!`，callback 返回后自动解锁。公开 API 不提供 guard，锁的作用域只能由
+`with_lock` callback 表达；callback 返回值受生命周期约束，不能让受保护值的引用活过锁。
 `Mutex<T>` 是 `!Movable`，当前不提供 poison 状态；0.5.1 也不提供公共 Channel/RwLock API。
 
 ## Struct、Enum、Union
