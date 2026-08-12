@@ -102,6 +102,7 @@ wrapper 不建立自己的 active set、完成值表或第二套状态机。
 `QueryEngine` 是一次 compilation epoch 的求值容器。它只聚合：
 
 - 各种 typed query wrapper；
+- 本轮 declaration observation recorder；
 - JIL Store identity allocator 等明确的 session 机制。
 
 `QueryEngine.reset()` 清空每个 wrapper 的 L1 cache，并重置 session identity。进程结束后，
@@ -136,21 +137,16 @@ L2 I/O 不放进 `QueryCache`。wrapper 接收窄 callback，在 L1 miss 后由�
 borrow check、drop elaboration 和 generic instance collection 在批处理 pipeline 中各执行一次。
 它们的 Movable owner 直接传给下一阶段，不包装为 query。
 
-## 6. 为什么不保留 QueryDependencyGraph
+## 6. Declaration observations
 
-之前的 dependency graph 记录 declaration observation、传播 candidate，并比较 fingerprint。
-但生产路径没有任何 QueryValue 或 artifact 根据该结果选择 reuse/recompute：
+外部 declaration 的真实读取由 type checker 记录到 importer source 的本轮 observation 集合。
+记录包含 dependency source、stable declaration、读取 aspect 和 fingerprint，不保存 session-local ID。
 
-- `candidate_requires_recompute` 只被测试调用；
-- pipeline 只输出 changed root/candidate 统计；
-- `.ji` query observations 会写入和恢复，但不裁决任何真实 L2 value。
+recorder 属于 `QueryEngine` 的求值机制；完成集合由 `SourceArtifactCache` 拥有并写入 importer `.ji`。
+只有前端或完整编译成功后才整组发布，失败分析不会覆盖上次成功集合。
 
-这些状态不是增量复用能力，只是没有消费者的基础设施。因此 0.5.2 删除依赖图、
-`StableQueryKey` 统一 enum、`.ji` observations 和候选统计。
-
-source/interface 失效继续由 `SourceGraph` 和 source artifact key 负责；object 复用由完整 object key
-和 `.jbuild` 负责。未来只有出现可独立复用的 declaration L2 value 时，才围绕该 owner 设计
-它自己的 observation 和失效裁决。
+不建立通用 `QueryDependencyGraph` 或统一 query key。source import closure 仍由
+`SourceDependencyGraph` 负责；后续 importer 失效裁决直接验证 `.ji` observations。
 
 ## 7. 批处理流程
 
