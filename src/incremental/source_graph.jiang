@@ -4,11 +4,11 @@
 // 正向边表示 source -> dependency，反向边表示 dependency -> importer。
 
 import cache_identity = "../artifact/cache_identity.jiang";
-import ji = "../artifact/ji_file.jiang";
 import qkey = "./key.jiang";
 import core_traits = "../core/traits.jiang";
 import traits = "../support/traits.jiang";
 import list = "../support/list.jiang";
+import map = "../support/map.jiang";
 import table = "../support/table.jiang";
 import std;
 
@@ -39,23 +39,19 @@ public struct SourceNodeId: Copyable, traits.Indexable, Hashable, Equatable {
 
 public struct SourceNode: Movable {
     public cache_identity.StableSourceId identity;
-    public qkey.Fingerprint128 package_identity;
     public std.String package_relative_path;
-    public ji.JiHeader? previous_header;
-    public Bool dirty;
+    public Bool source_dirty;
+    public Bool dependency_candidate!;
 
     public init(self,
         cache_identity.StableSourceId identity,
-        qkey.Fingerprint128 package_identity,
         UInt8[]& package_relative_path,
-        ji.JiHeader? previous_header,
-        Bool dirty
+        Bool source_dirty
     ) {
         self.identity = identity;
-        self.package_identity = package_identity;
         self.package_relative_path = std.String(package_relative_path);
-        self.previous_header = previous_header;
-        self.dirty = dirty;
+        self.source_dirty = source_dirty;
+        self.dependency_candidate = false;
     }
 }
 
@@ -118,14 +114,13 @@ public struct SourceSchedule: Movable {
 
 public struct SourceDependencyGraph: Movable {
     list.ArrayList<SourceNode> nodes;
-    table.HashTable<cache_identity.StableSourceId, SourceNodeId> by_identity;
+    map.WyHashMap<cache_identity.StableSourceId, SourceNodeId> by_identity;
     table.MultiTable<SourceNodeId, SourceNodeId> dependencies;
     table.MultiTable<SourceNodeId, SourceNodeId> importers;
 
     public init(self) {
         self.nodes = list.ArrayList<SourceNode>();
-        self.by_identity =
-            table.HashTable<cache_identity.StableSourceId, SourceNodeId>();
+        self.by_identity = map.WyHashMap<cache_identity.StableSourceId, SourceNodeId>();
         self.dependencies = table.MultiTable<SourceNodeId, SourceNodeId>();
         self.importers = table.MultiTable<SourceNodeId, SourceNodeId>();
     }
@@ -140,35 +135,27 @@ public struct SourceDependencyGraph: Movable {
 
     public SourceNodeId ensure_node(self,
         cache_identity.StableSourceId identity,
-        qkey.Fingerprint128 package_identity,
         UInt8[]& package_relative_path,
-        ji.JiHeader? previous_header,
-        Bool dirty
+        Bool source_dirty
     ) {
-        if (table.hash_table_get_value<
-            cache_identity.StableSourceId,
-            SourceNodeId
-        >(self.by_identity$.ref(), identity) is .some(existing)) {
-            self.merge_node(existing, previous_header, dirty);
+        if (self.by_identity.get(identity) is .some(existing_ref)) {
+            SourceNodeId existing = existing_ref$.get();
+            if (source_dirty) { self.mark_source_dirty(existing); }
             return existing;
         }
         SourceNodeId node_id = SourceNodeId(self.nodes.len());
         self.nodes.add(SourceNode(
             identity,
-            package_identity,
             package_relative_path,
-            previous_header,
-            dirty
+            source_dirty
         ));
-        self.by_identity.set(identity, node_id);
+        self.by_identity.insert(identity, node_id);
         return node_id;
     }
 
     public SourceNodeId? find(self, cache_identity.StableSourceId identity) {
-        return table.hash_table_get_value<
-            cache_identity.StableSourceId,
-            SourceNodeId
-        >(self.by_identity$.ref(), identity);
+        guard self.by_identity.get(identity) is .some(node_id) else { return null; }
+        return node_id$.get();
     }
 
     public SourceNode& node(self, SourceNodeId node_id) {
@@ -189,38 +176,21 @@ public struct SourceDependencyGraph: Movable {
         return self.edge_value_count(self.importers$.ref(), node_id);
     }
 
-    public Void mark_dirty(self, SourceNodeId node_id) {
-        self.nodes.ref_at(node_id.to_index()).dirty = true;
+    public Void mark_source_dirty(self, SourceNodeId node_id) {
+        self.nodes.ref_at(node_id.to_index()).source_dirty = true;
     }
 
-    // 只有当前 source 的 importer-visible interface 真正变化时才标记
-    // 直接 importer。后续 importer 完成分析后再决定是否继续向外传播。
-    public Int mark_changed_importers(
-        self,
-        SourceNodeId changed,
-        qkey.Fingerprint128 package_interface,
-        qkey.Fingerprint128 public_interface
-    ) {
-        SourceNode& changed_node = self.node(changed);
-        Bool package_changed = self.package_interface_changed(changed_node, package_interface);
-        Bool public_changed = self.public_interface_changed(changed_node, public_interface);
+    public Void clear_dependency_candidate(self, SourceNodeId node_id) {
+        self.nodes.ref_at(node_id.to_index()).dependency_candidate = false;
+    }
+
+    // dependency source 重建后所有直接 importer 都必须进入 observation
+    // 验证。是否真正失效由 importer 自身记录的 declaration reads 决定。
+    public Int mark_importer_candidates(self, SourceNodeId changed) {
         Int marked! = 0;
         table.MultiTableCursor cursor! = self.importers.first(changed);
         while (cursor.valid()) {
-            SourceNodeId importer = self.importers.get(cursor);
-            if (self.importer_observes_change(importer, changed_node, package_changed, public_changed)) {
-                marked = marked + self.mark_dirty_once(importer);
-            }
-            cursor = self.importers.next(cursor);
-        }
-        return marked;
-    }
-
-    public Int mark_importers_dirty(self, SourceNodeId changed) {
-        Int marked! = 0;
-        table.MultiTableCursor cursor! = self.importers.first(changed);
-        while (cursor.valid()) {
-            marked = marked + self.mark_dirty_once(self.importers.get(cursor));
+            marked = marked + self.mark_dependency_candidate_once(self.importers.get(cursor));
             cursor = self.importers.next(cursor);
         }
         return marked;
@@ -230,7 +200,8 @@ public struct SourceDependencyGraph: Movable {
         list.ArrayList<SourceNodeId> result! = list.ArrayList<SourceNodeId>();
         Int index! = 0;
         while (index < self.nodes.len()) {
-            if (self.nodes.ref_at(index).dirty) {
+            SourceNode& node = self.nodes.ref_at(index);
+            if (node.source_dirty || node.dependency_candidate) {
                 result.add(SourceNodeId(index));
             }
             index = index + 1;
@@ -259,14 +230,6 @@ public struct SourceDependencyGraph: Movable {
         return SourceSchedule(state.ordered.take(), state.component_ends.take());
     }
 
-    Void merge_node(self, SourceNodeId node_id, ji.JiHeader? previous_header, Bool dirty) {
-        SourceNode&! node = self.nodes.ref_at(node_id.to_index());
-        if (node.previous_header == null && previous_header is .some(header)) {
-            node.previous_header = header;
-        }
-        if (dirty) { node.dirty = true; }
-    }
-
     Bool has_dependency(self, SourceNodeId importer, SourceNodeId dependency) {
         table.MultiTableCursor cursor! = self.dependencies.first(importer);
         while (cursor.valid()) {
@@ -290,42 +253,10 @@ public struct SourceDependencyGraph: Movable {
         return count;
     }
 
-    Bool package_interface_changed(
-        self,
-        SourceNode& node,
-        qkey.Fingerprint128 current
-    ) {
-        guard node.previous_header is .some(header) else { return true; }
-        return header.package_interface_fingerprint != current;
-    }
-
-    Bool public_interface_changed(
-        self,
-        SourceNode& node,
-        qkey.Fingerprint128 current
-    ) {
-        guard node.previous_header is .some(header) else { return true; }
-        return header.public_interface_fingerprint != current;
-    }
-
-    Bool importer_observes_change(
-        self,
-        SourceNodeId importer,
-        SourceNode& changed,
-        Bool package_changed,
-        Bool public_changed
-    ) {
-        SourceNode& importer_node = self.node(importer);
-        if (importer_node.package_identity == changed.package_identity) {
-            return package_changed;
-        }
-        return public_changed;
-    }
-
-    Int mark_dirty_once(self, SourceNodeId node_id) {
+    Int mark_dependency_candidate_once(self, SourceNodeId node_id) {
         SourceNode&! node = self.nodes.ref_at(node_id.to_index());
-        if (node.dirty) { return 0; }
-        node.dirty = true;
+        if (node.source_dirty || node.dependency_candidate) { return 0; }
+        node.dependency_candidate = true;
         return 1;
     }
 
@@ -476,19 +407,19 @@ public struct SourceDependencyGraph: Movable {
     }
 
     Void merge_component_dirty(self, list.ArrayList<SourceNodeId>& component) {
-        Bool dirty! = false;
+        Bool source_dirty! = false;
         Int index! = 0;
         while (index < component.len()) {
-            if (self.nodes.ref_at(component.get(index).to_index()).dirty) {
-                dirty = true;
+            if (self.nodes.ref_at(component.get(index).to_index()).source_dirty) {
+                source_dirty = true;
                 break;
             }
             index = index + 1;
         }
-        if (!dirty) { return; }
+        if (!source_dirty) { return; }
         index = 0;
         while (index < component.len()) {
-            self.mark_dirty(component.get(index));
+            self.mark_source_dirty(component.get(index));
             index = index + 1;
         }
     }
