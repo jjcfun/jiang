@@ -189,9 +189,6 @@ public struct ModuleResolver: Movable {
     ) {
         UInt64 started! = self.timing_start();
         Bool use_source = self.component_requires_source(schedule, source_modules, begin, end);
-        if (use_source) {
-            self.mark_component_importer_candidates(schedule, begin, end);
-        }
         self.timing.freshness_ns =
             self.timing.freshness_ns + self.timing_elapsed(started);
         started = self.timing_start();
@@ -393,7 +390,9 @@ public struct ModuleResolver: Movable {
                     self.set_module_state(module_id, .collecting_declarations);
                 }
             } else {
-                if (!self.prepare_interface_if_available(module_id)) { return false; }
+                // ModuleModelQuery 已完成 L1/L2/L3 选择和 interface freshness
+                // 验证；这里只 materialize 已选中的 interface facts。
+                self.store.artifacts.record_interface_lookup(.hit);
                 self.store.resolve.module_ref(module_id).interface_only = true;
                 self.set_module_state(module_id, .interface_loaded);
             }
@@ -412,13 +411,6 @@ public struct ModuleResolver: Movable {
             self.timing.skeletons_ns =
                 self.timing.skeletons_ns + self.timing_elapsed(started);
         }
-        return true;
-    }
-
-    Bool prepare_interface_if_available(self, qid.ModuleId module_id) {
-        if (self.source_module_is_dirty(module_id)) { return false; }
-        if (!self.ensure_fresh_module_interface(module_id)) { return false; }
-        self.store.artifacts.record_interface_lookup(.hit);
         return true;
     }
 
@@ -495,21 +487,6 @@ public struct ModuleResolver: Movable {
         Int index! = begin;
         while (index < end) {
             self.store.source_dependencies.mark_source_dirty(schedule.node_at(index));
-            index = index + 1;
-        }
-    }
-
-    Void mark_component_importer_candidates(
-        self,
-        source_graph.SourceSchedule& schedule,
-        Int begin,
-        Int end
-    ) {
-        Int index! = begin;
-        while (index < end) {
-            self.store.source_dependencies.mark_importer_candidates(
-                schedule.node_at(index)
-            );
             index = index + 1;
         }
     }
@@ -683,10 +660,29 @@ public struct ModuleResolver: Movable {
             qid.ModuleId module_id = self.module_for_source_node(node_id, source_modules)$.some();
             if (self.module_state(module_id) != .interface_loaded) {
                 incremental_fingerprint.fingerprint_module(self.ctx, module_id);
-                interface_builder.store_module_interface(self.ctx, module_id);
+                if (interface_builder.store_module_interface(self.ctx, module_id)) {
+                    self.publish_module_interface_change(node_id, module_id);
+                }
             }
             index = index + 1;
         }
+    }
+
+    Void publish_module_interface_change(
+        self,
+        source_graph.SourceNodeId node_id,
+        qid.ModuleId module_id
+    ) {
+        store.ModuleRecord& module = self.store.resolve.module_ref(module_id);
+        artifact.ModuleInterface& module_interface =
+            self.store.artifacts.load_interface(module.source_id)$.some();
+        db.publish_module_interface_change(
+            self.ctx.query$.ref(),
+            self.store.source_dependencies$.ref(),
+            node_id,
+            module_interface.interface_hash,
+            module_interface.public_interface_hash
+        );
     }
 
     Bool lower_module_graph_without_source_schedule(
@@ -1290,7 +1286,7 @@ public struct ModuleResolver: Movable {
                 continue;
             }
             self.bind_import_aliases(module_id);
-            if (self.load_interface_if_available(module_id)) {
+            if (self.load_interface_without_source_schedule(module_id)) {
                 self.set_module_state(module_id, .interface_loaded);
             } else {
                 self.set_module_state(module_id, .collecting_declarations);
@@ -1337,7 +1333,9 @@ public struct ModuleResolver: Movable {
         }
     }
 
-    Bool load_interface_if_available(self, qid.ModuleId module_id) {
+    // 仅供 SourceGraph 无法覆盖的保守 fallback 使用。正常增量路径必须经
+    // ModuleModelQuery 选择 source 或 interface。
+    Bool load_interface_without_source_schedule(self, qid.ModuleId module_id) {
         // Codegen 模式当前要求完整源码闭包。即使同一 CompilerContext 的
         // artifact store 仍保留上一轮 interface，也不能绕过本轮源码 lowering。
         if (!self.use_source_artifacts) {
@@ -1683,6 +1681,13 @@ public struct ModuleResolver: Movable {
         store.ImportRecord import_record,
         qid.ModuleId target_module
     ) {
+        store.ModuleRecord& target = self.store.resolve.module_ref(target_module);
+        db.observe_public_namespace(
+            self.ctx.query$.ref(),
+            self.store,
+            module.def_id,
+            target.namespace_id
+        );
         qid.DefId target_module_def = self.store.resolve.module_ref(target_module).def_id;
         guard self.store.model.def(target_module_def) is .some(target_model) else {
             return 0;

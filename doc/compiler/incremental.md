@@ -79,7 +79,8 @@ monomorph          -> generic template section
 
 `SourceDependencyGraph` 是单次 compilation 的 source 级依赖图：
 
-- 节点由连续 `SourceNodeId` 标识，保存 stable source identity、相对路径、旧 `.ji` header 和 dirty；
+- 节点由连续 `SourceNodeId` 标识，保存 stable source/package identity、相对路径、旧 `.ji` 的
+  package/public interface fingerprint 和 dirty/candidate；
 - 正向边为 `source -> dependency`；
 - 反向边为 `dependency -> importer`；
 - identity 到 node 的 HashTable 只用于查找，不决定分析顺序。
@@ -88,17 +89,12 @@ monomorph          -> generic template section
 读取源码重新计算 hash。旧 import summary 缺失、损坏、context 不匹配或 source hash 变化时，从
 当前源码重新收集 import。
 
-完整构图后按 dependency SCC 拓扑顺序分析。SCC 内按 stable source identity 排序；任一成员 dirty
-时保守分析整个 SCC。新的 interface fingerprint 与旧值相同则停止传播；发生变化时才标记直接
-importer：
-
-- 同 package 比较 package-visible fingerprint；
-- 跨 package 比较 public fingerprint；
-- private body 变化不传播；
-- public signature、可见布局、public import/alias 和调用方可见泛型 body 变化会传播。
-
-0.5.2 不追踪 importer 实际读取的具体声明，也不保留没有真实 L2 消费者的
-declaration dependency graph（见 [Database 设计](database.md)）。
+完整构图后按 dependency SCC 拓扑顺序分析。SCC 内按 stable source identity 排序；任一成员需要
+回源时保守分析整个 SCC。source 重算后先比较旧/新可见 interface fingerprint：同 package importer
+比较 package surface，跨 package importer 比较 public surface；未变化时不产生 candidate。发生变化的
+直接 importer 再用自身 `.ji` observations 验证实际读取的 signature、body、namespace-name 或完整
+namespace surface：全部匹配则恢复 interface/model，任一不匹配才回源。缺少 observation、旧 schema、
+损坏 artifact 或无法定位 stable symbol 时安全回源；不建立通用 declaration dependency graph。
 
 `--check` 可以直接复用 fresh source 的 interface。debug/release 若未命中 `.jbuild` 快速路径，
 仍需从源码恢复 codegen 所需的普通函数 body；纯语义 `.ji` 不保存这些 body。source graph
@@ -137,7 +133,7 @@ monomorph unit fingerprint 覆盖排序后的 concrete instance key、generic bo
 package-level provenance、属性和 verifier 事实只准备一次，再供所有 stale unit 使用。JIL 到 owned
 LLVM unit 的 lowering 按 stable unit 顺序串行完成；每个 unit 随后只持有独立 LLVM
 Context/Module 和 owned emission 输入，不再访问 CompilerStore、JIL、DiagnosticStore、
-BuildState 或 LinkPlan。LLVM pass 与 object emission 可以在 worker Domain 中并发执行；
+BuildManifest 或 LinkPlan。LLVM pass 与 object emission 可以在 worker Domain 中并发执行；
 all-hit/no-op 不进入 object emission。
 
 ## Release 与用户 object 输出
@@ -202,6 +198,7 @@ stable unit 顺序汇总诊断与统计。
 
 - interface hit/miss/stale；
 - `.ji` section read 与 parsed source 数；
+- SourceGraph dirty source 与本轮累计标记的 importer candidate 数；
 - object hit/miss/stale；
 - emitted/reused unit 与 linked object 数；
 - `.jbuild` no-op hit 数。
@@ -210,7 +207,8 @@ stable unit 顺序汇总诊断与统计。
 
 ## 后续边界
 
-source/interface 失效由 `SourceDependencyGraph` 和 source artifact key 负责；object 复用由完整
-object key 和 `.jbuild` 负责。不保留没有真实 L2 消费者的 declaration observation 或候选图。
+source closure 由 `SourceDependencyGraph` 负责；细粒度失效依据 importer `.ji` 的 declaration
+observations；object 复用由完整 object key 和 `.jbuild` 负责。observations 是 source artifact 的
+复用契约，不另建持久 package graph 或通用 query graph。
 未来出现可独立复用的 declaration L2 value 时，应围绕该 value 的 owner 设计它自己的
 依赖与失效裁决，不建立无结果的通用图。

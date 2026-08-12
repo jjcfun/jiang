@@ -7,6 +7,7 @@ import artifact = "../artifact/source.jiang";
 import qid = "../id.jiang";
 import qkey = "../incremental/key.jiang";
 import cache_identity = "../artifact/cache_identity.jiang";
+import object_key = "../artifact/object_key.jiang";
 import source_identity = "../incremental/source_identity.jiang";
 import store_api = "../store.jiang";
 import source = "../source.jiang";
@@ -17,17 +18,20 @@ import map = "../support/map.jiang";
 
 struct DeclarationObservationState: Movable {
     map.WyHashMap<source.SourceId, Int> source_indices!;
+    map.WyHashMap<source.SourceId, Bool> extension_searches!;
     list.ArrayList<source.SourceId> sources!;
     list.ArrayList<artifact.DeclarationObservationSet> observations!;
 
     init(self) {
         self.source_indices = map.WyHashMap<source.SourceId, Int>();
+        self.extension_searches = map.WyHashMap<source.SourceId, Bool>();
         self.sources = list.ArrayList<source.SourceId>();
         self.observations = list.ArrayList<artifact.DeclarationObservationSet>();
     }
 
     Void reset(Self&! self) {
         self.source_indices.clear();
+        self.extension_searches.clear();
         self.sources.clear();
         self.observations.clear();
     }
@@ -52,6 +56,12 @@ struct DeclarationObservationState: Movable {
         }
         Int index = index_ref$.get();
         self.observations.ref_at(index).add(observation);
+    }
+
+    Bool begin_extension_search(Self&! self, source.SourceId source_id) {
+        if (self.extension_searches.has(source_id)) { return false; }
+        self.extension_searches.insert(source_id, true);
+        return true;
     }
 
     Void publish(
@@ -101,6 +111,12 @@ public struct DeclarationObservationRecorder: Movable {
     ) {
         self.state.with_lock<Void>({ [source_id, observation] state =>
             state.record(source_id, observation);
+        });
+    }
+
+    public Bool begin_extension_search(self, source.SourceId source_id) {
+        return self.state.with_lock({ [source_id] state =>
+            state.begin_extension_search(source_id)
         });
     }
 
@@ -175,6 +191,66 @@ public Void record_namespace_name_read(
     );
 }
 
+// flatten import 等读取完整公开名字集合的操作必须记录集合 observation。
+// 即使集合为空也记录，使后续新增第一个公开声明能够使 importer 失效。
+public Void record_public_namespace_read(
+    DeclarationObservationRecorder& recorder,
+    store_api.CompilerStore& store,
+    qid.DefId use_owner,
+    qid.NamespaceId namespace_id
+) {
+    guard namespace_owner(store, namespace_id) is .some(owner_def) else { return; }
+    guard store.defs.get(use_owner).module_id is .some(use_module) else { return; }
+    guard store.defs.get(owner_def).module_id is .some(target_module) else { return; }
+    if (use_module == target_module) { return; }
+    guard store.incremental.stable_id_for_def(owner_def) is .some(owner_stable) else { return; }
+    guard source_identity.for_module(store, target_module) is .some(dependency_source) else {
+        return;
+    }
+    guard public_namespace_fingerprint(store, namespace_id) is .some(observed) else { return; }
+    recorder.record(
+        store.resolve.module_ref(use_module).source_id,
+        artifact.DeclarationObservation(
+            dependency_source,
+            owner_stable,
+            .namespace,
+            public_namespace_collection_name(),
+            observed
+        )
+    );
+}
+
+// extension lookup 读取可见 module 的完整公开 extension surface。空 surface
+// 同样落盘，确保 dependency 新增第一个 extension 时 importer 会回源。
+public Void record_public_extension_surface_read(
+    DeclarationObservationRecorder& recorder,
+    store_api.CompilerStore& store,
+    qid.DefId use_owner,
+    qid.ModuleId target_module
+) {
+    guard store.defs.get(use_owner).module_id is .some(use_module) else { return; }
+    if (use_module == target_module) { return; }
+    qid.DefId owner_def = store.resolve.module_ref(target_module).def_id;
+    guard store.incremental.stable_id_for_def(owner_def) is .some(owner_stable) else { return; }
+    guard source_identity.for_module(store, target_module) is .some(dependency_source) else {
+        return;
+    }
+    source.SourceId target_source = store.resolve.module_ref(target_module).source_id;
+    guard store.artifacts.load_interface(target_source) is .some(module_interface) else {
+        return;
+    }
+    recorder.record(
+        store.resolve.module_ref(use_module).source_id,
+        artifact.DeclarationObservation(
+            dependency_source,
+            owner_stable,
+            .namespace,
+            public_extension_surface_name(),
+            module_interface.public_extension_hash
+        )
+    );
+}
+
 public Bool validate_namespace_name(
     store_api.CompilerStore& store,
     artifact.DeclarationObservation observation,
@@ -202,6 +278,30 @@ public Bool validate_namespace_name(
     return observation.observed == qkey.Fingerprint128();
 }
 
+public Bool validate_namespace(
+    store_api.CompilerStore& store,
+    artifact.DeclarationObservation observation,
+    qid.DefId owner_def
+) {
+    if (observation.name == public_extension_surface_name()) {
+        guard store.defs.get(owner_def).module_id is .some(module_id) else { return false; }
+        source.SourceId source_id = store.resolve.module_ref(module_id).source_id;
+        guard store.artifacts.load_interface(source_id) is .some(module_interface) else {
+            return false;
+        }
+        return module_interface.public_extension_hash == observation.observed;
+    }
+    if (observation.name != public_namespace_collection_name()) { return false; }
+    guard store.defs.get(owner_def).owned_namespace_id is .some(namespace_id) else {
+        return false;
+    }
+    guard public_namespace_fingerprint(store, namespace_id)
+        is .some(current) else {
+        return false;
+    }
+    return current == observation.observed;
+}
+
 public qkey.Fingerprint128 namespace_name_fingerprint(
     store_api.CompilerStore& store,
     qid.SymbolId symbol,
@@ -220,6 +320,67 @@ public qkey.Fingerprint128 namespace_name_fingerprint(
         return cache_identity.text_fingerprint("namespace-name:label:", store.symbols.text(symbol));
     }
     return cache_identity.text_fingerprint("namespace-name:namespace:", store.symbols.text(symbol));
+}
+
+qkey.Fingerprint128 public_namespace_collection_name() {
+    return cache_identity.text_fingerprint("namespace-collection:", "public-bindings");
+}
+
+qkey.Fingerprint128 public_extension_surface_name() {
+    return cache_identity.text_fingerprint("namespace-collection:", "public-extensions");
+}
+
+qkey.Fingerprint128? public_namespace_fingerprint(
+    store_api.CompilerStore& store,
+    qid.NamespaceId namespace_id
+) {
+    list.ArrayList<qkey.Fingerprint128> entries! =
+        list.ArrayList<qkey.Fingerprint128>();
+    Int index! = 0;
+    while (index < store.resolve.binding_len()) {
+        namespace.BindingEntry entry = store.resolve.binding_at_index(index);
+        if (entry.namespace_id == namespace_id
+            && store.defs.get(entry.def_id).visibility == .public_visibility) {
+            guard public_binding_fingerprint(store, entry) is .some(fingerprint) else {
+                return null;
+            }
+            insert_fingerprint(entries$.mut_ref(), fingerprint);
+        }
+        index = index + 1;
+    }
+    return object_key.combine_fingerprints(UInt64(126), entries$.ref());
+}
+
+qkey.Fingerprint128? public_binding_fingerprint(
+    store_api.CompilerStore& store,
+    namespace.BindingEntry entry
+) {
+    guard store.incremental.stable_id_for_def(entry.def_id) is .some(stable_id) else {
+        return null;
+    }
+    list.ArrayList<qkey.Fingerprint128> parts! =
+        list.ArrayList<qkey.Fingerprint128>();
+    parts.add(qkey.Fingerprint128(stable_id.low, stable_id.high));
+    parts.add(namespace_name_fingerprint(store, entry.symbol, entry.domain));
+    return object_key.combine_fingerprints(UInt64(127), parts$.ref());
+}
+
+Void insert_fingerprint(
+    list.ArrayList<qkey.Fingerprint128>&! entries,
+    qkey.Fingerprint128 value
+) {
+    Int index! = entries.len();
+    entries.add(value);
+    while (index > 0 && fingerprint_less(value, entries.get(index - 1))) {
+        entries.set(index, entries.get(index - 1));
+        index = index - 1;
+    }
+    entries.set(index, value);
+}
+
+Bool fingerprint_less(qkey.Fingerprint128 lhs, qkey.Fingerprint128 rhs) {
+    if (lhs.high != rhs.high) { return lhs.high < rhs.high; }
+    return lhs.low < rhs.low;
 }
 
 qid.DefId? namespace_owner(

@@ -155,7 +155,7 @@ Jiang 编译器采用 `CompilerStore + Phase Contract + Pass Pipeline` 的开发
 CompilerContext
   target
   store: CompilerStore
-  query: QueryEngine   # per-query caches + 稳定依赖图（见 Database 设计 §7.2）
+  query: QueryEngine   # typed query caches + observation recorder
 ```
 
 `CompilerStore` 是所有业务事实集合的生命周期所有者。长期事实和单次 compilation cache 都挂在
@@ -332,8 +332,8 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 - wrapper 通过固定地址 `Mutex<QueryCache<...>>` 提供共享入口，锁不跨 compute 或 I/O 持有。
 - layout 调用点已经全部接线；它没有持久 QueryValue，因此只使用本轮 L1 memo。
   epoch 清理由 `begin_compilation` 统一承担。
-- source/interface 失效由 `SourceGraph` 与 artifact key 负责，object 复用由 object key 和 `.jbuild`
-  负责；不保留没有真实 L2 消费者的 declaration dependency graph。
+- source import closure 由 `SourceGraph` 负责，importer 的细粒度失效由 `.ji` declaration
+  observations 裁决；object 复用由 object key 和 `.jbuild` 负责，不建立通用 query graph。
 - 新代码遵循严格借用模式：可变访问显式 `&!`，不允许把共享 store 引用存入
   长期结构；现有宽松代码按迁移路径逐步收紧，不以放松新代码为代价。
 - `QueryEngine` 保持同步，Movable 阶段 owner 不进入 cache。

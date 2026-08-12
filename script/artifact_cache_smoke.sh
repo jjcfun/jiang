@@ -63,7 +63,8 @@ artifact_stat_snapshot() {
   : >"$output"
   for key in \
     artifact_interface_hit artifact_interface_miss artifact_interface_stale \
-    artifact_section_reads artifact_parsed_sources artifact_object_hit \
+    artifact_section_reads artifact_parsed_sources artifact_source_dirty \
+    artifact_dependency_candidates artifact_object_hit \
     artifact_object_miss artifact_object_stale artifact_emitted_units \
     artifact_reused_units artifact_linked_objects artifact_no_op_hits
   do
@@ -227,20 +228,43 @@ check_dependency_invalidation() {
   local cache="$WORK_DIR/dependency-cache"
   mkdir -p "$fixture"
   cp -R "$ROOT_DIR/test/lang/package" "$fixture/package"
+  perl -0pi -e \
+    's/public Int answer\(\) \{\n    40\n\}/public Int answer(Int offset = 0) {\n    40 + offset\n}/' \
+    "$dependency"
 
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/dependency-cold.log" \
     "$WORK_DIR/dependency-cold" "$input"
   perl -0pi -e 's/Int hidden\(\) \{\n    99\n\}/Int hidden() {\n    98\n}/' "$dependency"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/private-change.log" \
     "$WORK_DIR/private-change" "$input"
+  require_stat_ge "$WORK_DIR/private-change.log" artifact_parsed_sources 1
+  require_stat_ge "$WORK_DIR/private-change.log" artifact_interface_hit 1
+  require_stat_ge "$WORK_DIR/private-change.log" artifact_source_dirty 1
+  require_stat_eq "$WORK_DIR/private-change.log" artifact_dependency_candidates 0
   require_stat_eq "$WORK_DIR/private-change.log" artifact_emitted_units 1
+  require_stat_ge "$WORK_DIR/private-change.log" artifact_reused_units 1
   expect_exit "$WORK_DIR/private-change" 52
 
-  perl -0pi -e 's/public Int cstring_length/public Int64 cstring_length/' "$dependency"
+  printf '%s\n' 'public Int unused_public() { 1 }' >>"$dependency"
+  compile_executable "$JIANGC" "$cache" "$WORK_DIR/unused-public.log" \
+    "$WORK_DIR/unused-public" "$input"
+  require_stat_ge "$WORK_DIR/unused-public.log" artifact_parsed_sources 1
+  require_stat_ge "$WORK_DIR/unused-public.log" artifact_interface_hit 1
+  require_stat_ge "$WORK_DIR/unused-public.log" artifact_source_dirty 1
+  require_stat_ge "$WORK_DIR/unused-public.log" artifact_dependency_candidates 1
+  require_stat_eq "$WORK_DIR/unused-public.log" artifact_emitted_units 1
+  require_stat_ge "$WORK_DIR/unused-public.log" artifact_reused_units 1
+  expect_exit "$WORK_DIR/unused-public" 52
+
+  perl -0pi -e 's/answer\(Int offset = 0\)/answer(Int offset = 1)/' "$dependency"
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/public-change.log" \
     "$WORK_DIR/public-change" "$input"
-  require_stat_eq "$WORK_DIR/public-change.log" artifact_emitted_units 1
-  expect_exit "$WORK_DIR/public-change" 52
+  require_stat_ge "$WORK_DIR/public-change.log" artifact_parsed_sources 1
+  require_stat_ge "$WORK_DIR/public-change.log" artifact_source_dirty 2
+  require_stat_ge "$WORK_DIR/public-change.log" artifact_dependency_candidates 1
+  require_stat_eq "$WORK_DIR/public-change.log" artifact_emitted_units 2
+  require_stat_ge "$WORK_DIR/public-change.log" artifact_reused_units 1
+  expect_exit "$WORK_DIR/public-change" 53
 }
 
 check_metadata_only_change() {

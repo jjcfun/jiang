@@ -119,7 +119,7 @@ unit emission 只声明并 lower 当前 unit 拥有的 function body。跨 unit 
 debug 中的 stale unit 按 stable unit 顺序完成 JIL lowering。package-level symbol、layout、
 vtable field type、参数属性和 CGU plan 只准备一次，每个 unit 使用独立 LLVM Context/Module。
 lowering 完成后，owned LLVM unit 可以在受限 worker Domain 中并发执行 LLVM pass 和 object emission；
-worker 不访问 CompilerStore、JIL、DiagnosticStore、BuildState 或 LinkPlan。
+worker 不访问 CompilerStore、JIL、DiagnosticStore、BuildManifest 或 LinkPlan。
 
 coordinator 会等待全部已启动 worker，再按 stable unit 顺序处理结果。成功 unit 的临时 object
 会立即原子发布并写入 `.jbuild` work product；失败 unit 只清理自己的临时文件。

@@ -142,6 +142,9 @@ borrow check、drop elaboration 和 generic instance collection 在批处理 pip
 外部 declaration 的真实读取由 type checker 记录到 importer source 的本轮 observation 集合。
 记录包含 dependency source、stable declaration、读取 aspect 和 fingerprint，不保存 session-local ID。
 
+除 declaration signature/body 外，精确名字 lookup 记录 `namespace_name`，flatten import 与 extension
+枚举记录完整 `namespace` surface；空集合也必须记录，才能发现后续新增第一个可见声明或 extension。
+
 recorder 属于 `QueryEngine` 的求值机制；完成集合由 `SourceArtifactCache` 拥有并写入 importer `.ji`。
 只有前端或完整编译成功后才整组发布，失败分析不会覆盖上次成功集合。
 

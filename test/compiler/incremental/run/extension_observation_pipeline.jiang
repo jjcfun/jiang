@@ -1,0 +1,201 @@
+// 验证 importer 会观察可见 dependency 的完整公开 extension surface。
+
+import artifact = "../../../../src/artifact/source.jiang";
+import context = "../../../../src/context.jiang";
+import options = "../../../../src/driver/options.jiang";
+import pipeline = "../../../../src/pipeline.jiang";
+import source = "../../../../src/source.jiang";
+import qkey = "../../../../src/incremental/key.jiang";
+import qid = "../../../../src/id.jiang";
+import env = "../../../../src/system/env.jiang";
+import fs = "../../../../src/system/fs.jiang";
+import io = "../../../../src/system/io.jiang";
+import std;
+
+public Int run() {
+    guard env.get("JIANG_TEST_WORK_DIR") is .some(work_dir) else { return 2; }
+    Path root! = child(work_dir[..], "extension_observation_pipeline");
+    Path app! = child(root.text(), "app");
+    Path facade! = child(root.text(), "facade");
+    Path dependency! = child(root.text(), "dependency");
+    Path cache! = child(root.text(), "cache");
+    assert(fs.create_dirs(app.text()));
+    assert(fs.create_dirs(facade.text()));
+    assert(fs.create_dirs(dependency.text()));
+    write_fixture(app.text(), facade.text(), dependency.text());
+
+    options.CompileOptions compile_options = options.CompileOptions(
+        .check_only,
+        app.text(),
+        "",
+        cache.text(),
+        "test-target",
+        "testc"
+    );
+    context.CompilerContext cold! = context.CompilerContext();
+    pipeline.compile(cold$.mut_ref(), compile_options$.ref());
+    require_no_errors(cold$.ref(), "cold");
+
+    source.SourceId app_source = source_id_at(cold$.ref(), facade.text(), "facade.jiang");
+    artifact.DeclarationObservationSet& observations =
+        cold.store.artifacts.load_observations(app_source)$.some();
+    source.SourceId cold_dependency_source = source_id_at(
+        cold$.ref(), dependency.text(), "lib.jiang"
+    );
+    qkey.Fingerprint128 cold_extension = cold.store.artifacts
+        .load_interface(cold_dependency_source)$.some().public_extension_hash;
+    if (!has_namespace_observation(observations, cold_extension)) {
+        io.stderr().write_all("missing dependency extension observation\n");
+        return 3;
+    }
+
+    context.CompilerContext warm! = context.CompilerContext();
+    pipeline.compile(warm$.mut_ref(), compile_options$.ref());
+    require_no_errors(warm$.ref(), "warm");
+    Int baseline_parsed = warm.store.artifacts.stats.parsed_sources;
+    source.SourceId warm_dependency_source = source_id_at(warm$.ref(), dependency.text(), "lib.jiang");
+    qkey.Fingerprint128 previous_public = warm.store.artifacts
+        .load_interface(warm_dependency_source)$.some().public_interface_hash;
+    qkey.Fingerprint128 previous_extension = warm.store.artifacts
+        .load_interface(warm_dependency_source)$.some().public_extension_hash;
+
+    Path dependency_source! = child(dependency.text(), "lib.jiang");
+    std.StringBuilder changed_source! = std.StringBuilder();
+    changed_source.append("public struct Box<T> {}\n");
+    changed_source.append("public extend <T> Box<T> { public Int value() { return 1; } }\n");
+    changed_source.append("public extend Box<Int> { public Int marker() { return 2; } }\n");
+    assert(fs.write_all(
+        dependency_source.text(),
+        changed_source.slice()
+    ));
+    context.CompilerContext changed! = context.CompilerContext();
+    pipeline.compile(changed$.mut_ref(), compile_options$.ref());
+    require_no_errors(changed$.ref(), "changed");
+    source.SourceId changed_dependency_source = source_id_at(
+        changed$.ref(), dependency.text(), "lib.jiang"
+    );
+    qkey.Fingerprint128 current_public = changed.store.artifacts
+        .load_interface(changed_dependency_source)$.some().public_interface_hash;
+    qkey.Fingerprint128 current_extension = changed.store.artifacts
+        .load_interface(changed_dependency_source)$.some().public_extension_hash;
+    if (previous_public == current_public) {
+        io.stderr().write_all("extension did not change public interface fingerprint\n");
+        return 5;
+    }
+    if (previous_extension == current_extension) {
+        io.stderr().write_all("extension did not change extension surface fingerprint\n");
+        return 7;
+    }
+    source.SourceId changed_app_source = source_id_at(
+        changed$.ref(), facade.text(), "facade.jiang"
+    );
+    qid.ModuleId changed_facade_module = changed.store.resolve
+        .module_for_source(changed_app_source)$.some();
+    if (changed.store.resolve.module_ref(changed_facade_module).interface_only) {
+        io.stderr().write_all("facade was restored instead of recomputed\n");
+        return 9;
+    }
+    artifact.DeclarationObservationSet& changed_observations = changed.store.artifacts
+        .load_observations(changed_app_source)$.some();
+    if (!has_namespace_observation(changed_observations, current_extension)) {
+        io.stderr().write_all("app observations did not update to current extension surface\n");
+        return 8;
+    }
+    if (!changed.query.validate_declaration_observations(
+        changed.store$.ref(),
+        changed_observations
+    )) {
+        io.stderr().write_all("restored app observations are stale after compile\n");
+        return 6;
+    }
+    if (changed.store.artifacts.stats.parsed_sources <= baseline_parsed) {
+        std.StringBuilder message! = std.StringBuilder();
+        message.append("extension change did not increase parse count: baseline=");
+        message.append(baseline_parsed);
+        message.append(", changed=");
+        message.append(changed.store.artifacts.stats.parsed_sources);
+        message.append("\n");
+        io.stderr().write_all(message.slice());
+        return 4;
+    }
+    return 0;
+}
+
+source.SourceId source_id_at(
+    context.CompilerContext& ctx,
+    UInt8[]& directory,
+    UInt8[]& name
+) {
+    Path path! = child(directory, name);
+    return ctx.store.sources.find(source.SourceKey(.file, path.text()))$.some();
+}
+
+Void require_no_errors(context.CompilerContext& ctx, UInt8[]& phase) {
+    if (!ctx.store.diagnostics.has_errors()) { return; }
+    io.stderr().write_all(phase);
+    io.stderr().write_all(" diagnostics:\n");
+    Int index! = 0;
+    while (index < ctx.store.diagnostics.len()) {
+        io.stderr().write_all(ctx.store.diagnostics.get(index).code.text);
+        io.stderr().write_all("\n");
+        index = index + 1;
+    }
+    assert(false);
+}
+
+Bool has_namespace_observation(
+    artifact.DeclarationObservationSet& observations,
+    qkey.Fingerprint128 expected
+) {
+    Int index! = 0;
+    while (index < observations.entries.len()) {
+        artifact.DeclarationObservation observation = observations.entries.get(index);
+        if (observation.aspect == .namespace && observation.observed == expected) {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+Void write_fixture(UInt8[]& app, UInt8[]& facade, UInt8[]& dependency) {
+    Path app_manifest! = child(app, "package.ini");
+    Path app_source! = child(app, "main.jiang");
+    Path facade_manifest! = child(facade, "package.ini");
+    Path facade_source! = child(facade, "facade.jiang");
+    Path dependency_manifest! = child(dependency, "package.ini");
+    Path dependency_source! = child(dependency, "lib.jiang");
+    std.StringBuilder app_manifest_text! = std.StringBuilder();
+    app_manifest_text.append("[package]\nname = extension_app\nroot = main.jiang\n\n");
+    app_manifest_text.append("[dependencies]\nfacade = ../facade\n");
+    assert(fs.write_all(
+        app_manifest.text(),
+        app_manifest_text.slice()
+    ));
+    assert(fs.write_all(
+        app_source.text(),
+        "import facade;\n\nInt result = facade.result;\n"
+    ));
+    std.StringBuilder facade_manifest_text! = std.StringBuilder();
+    facade_manifest_text.append("[package]\nname = extension_facade\nroot = facade.jiang\n\n");
+    facade_manifest_text.append("[dependencies]\ndep = ../dependency\n");
+    assert(fs.write_all(facade_manifest.text(), facade_manifest_text.slice()));
+    assert(fs.write_all(
+        facade_source.text(),
+        "import dep;\n\npublic Int result = dep.Box<Int>().value();\n"
+    ));
+    assert(fs.write_all(
+        dependency_manifest.text(),
+        "[package]\nname = extension_dep\nroot = lib.jiang\n"
+    ));
+    std.StringBuilder dependency_text! = std.StringBuilder();
+    dependency_text.append("public struct Box<T> {}\n");
+    dependency_text.append("public extend <T> Box<T> { public Int value() { return 1; } }\n");
+    assert(fs.write_all(dependency_source.text(), dependency_text.slice()));
+}
+
+Path child(UInt8[]& base, UInt8[]& name) {
+    PathBuilder builder! = PathBuilder(base);
+    builder.append(name);
+    return builder.finish();
+}
