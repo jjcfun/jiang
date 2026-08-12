@@ -311,14 +311,11 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 - `sem_store.Store`、`TypeStore`、`TypeCheckStore`、`LayoutStore`、`BorrowCheckStore`
   和 `IncrementalSymbolStore` 都挂在 `CompilerStore`。
 - `SourceArtifactCache` 和 `ObjectArtifactCache` 挂在 `CompilerStore`，用于
-  artifact 复用统计和 object 复用；`QueryDependencyGraph` 只由
-  `CompilerContext.query` 持有。
+  artifact 复用统计和 object 复用。
 - `MonomorphStore`、`jil.Store` 和 `ModuleGraph` 是单次 pipeline 调用中的阶段产物；
   pipeline borrow result 在完成后移入 `CompilerStore.borrowck`。
 - `ModuleResolver` 是本次 `compile_package` active AST 的唯一 owner；module 完成 Semantic Model
   lowering 后立即释放对应 AST。
-- `src/db/query_dependency.jiang` 统一拥有稳定 observation、反向索引和本轮失效候选；
-  declaration 裁决接入实际 artifact 复用前，不把候选统计视为增量命中。
 - 后续需要缓存或依赖追踪的跨阶段问题，再在 `store.jiang` 增加高阶查询入口。
 
 ## 查询化改造（Database）
@@ -326,29 +323,20 @@ definition、type 和 span，并直接返回已有 `DefId`、`TypeId` 与 `Sourc
 编译器求值方式正从“线性 pipeline + 全量 CompilerContext 传递”向查询驱动
 迁移。目标形态与完整设计见 [Database 设计](compiler/database.md)，要点：
 
-- 编译事实以 per-query 多表缓存按需求值（每个查询一张 typed cache，key/value 由
-  查询声明决定）；阶段间通过查询依赖传递，不再通过 `CompilerContext&` 全量互写。
-- 已有基础：`IncrementalQueryKind` / `StableQueryKey`（稳定 query key）、
-  `QueryDependencyGraph`（依赖边与失效）、resolver-owned active AST map、
-  `IncrementalSymbolStore`（稳定身份映射
-  与 fingerprint）、`ctx.query`（`QueryEngine`：per-query caches + 稳定依赖图）。
-- 递归不是统一 stable-key 栈的属性：type-check body/node/def、JIL body 和 package
-  analysis 分别用自己的 typed active/complete 状态定义重入结果，避免第二套 cycle
+- 每个查询使用一张 typed `QueryCache<K, V>` 按需求值，key/value 由业务本身决定。
+- `ctx.query` 只聚合 typed wrapper 和明确的 session 机制；稳定 source/declaration 查询直接使用
+  `StableSourceId` 或 `StableSymbolId`，不建立统一 key enum。
+- 递归不是统一栈的属性：type-check body/node/def、trait、lifetime shape、const 和 JIL body
+  分别用自己的 typed cache 状态定义重入结果，避免第二套 cycle
   provenance。
-- 查询以能力收窄的自由函数形态暴露（compute：只读输入 + 本查询 cache + owner
-  写槽），不接收整个 `CompilerContext&!`：bootstrap-0.5.2 对持有 `&!` 字段的
-  struct 存在自举 SIGSEGV，且窄签名天然符合“(key) -> value”的求值纪律；
-  `LayoutQuery` 门面与单表缓存已删除；per-query cache 用固定地址 Mutex 提供
-  共享查询入口，锁不跨 compute 持有。
+- wrapper 通过固定地址 `Mutex<QueryCache<...>>` 提供共享入口，锁不跨 compute 或 I/O 持有。
 - layout 调用点已经全部接线；它没有持久 QueryValue，因此只使用本轮 L1 memo。
   epoch 清理由 `begin_compilation` 统一承担。
-- 增量以声明级失效为目标形态：L1 session memo + L2 持久 artifact + 依赖指纹
-  两阶段裁决；`IncrementalSymbolStore` / `QueryDependencyGraph` / `SourceGraph`
-  在查询入口内接入（详见 database.md §6）。
+- source/interface 失效由 `SourceGraph` 与 artifact key 负责，object 复用由 object key 和 `.jbuild`
+  负责；不保留没有真实 L2 消费者的 declaration dependency graph。
 - 新代码遵循严格借用模式：可变访问显式 `&!`，不允许把共享 store 引用存入
   长期结构；现有宽松代码按迁移路径逐步收紧，不以放松新代码为代价。
-- 当前收口顺序：依赖图与失效状态统一 → typed query wrapper 收口业务入口 →
-  declaration 失效接入实际 L2/artifact 裁决；QueryEngine 保持同步。
+- `QueryEngine` 保持同步，Movable 阶段 owner 不进入 cache。
 
 ## 源码目录
 

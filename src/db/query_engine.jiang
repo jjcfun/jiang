@@ -1,7 +1,6 @@
 // QueryEngine：求值层的运行时形态（Database 概念的运行时）。
 //
-// 每个查询一格 typed cache；当前已有 LayoutCache、ModuleInterfaceCache，
-// 并聚合稳定依赖图。递归状态由对应 typed query 自己管理。
+// 每个查询一格 typed cache；递归状态由对应 typed query 自己管理。
 
 import qid = "../id.jiang";
 import layout = "../layout.jiang";
@@ -14,7 +13,6 @@ import layout_query = "./layout_query.jiang";
 import module_interface_query = "./module_interface.jiang";
 import import_summary_query = "./source_import_summary.jiang";
 import stable_fingerprint = "./stable_fingerprint.jiang";
-import instance_plan = "./instance_plan.jiang";
 import body_queries = "./type_check_body.jiang";
 import node_queries = "./type_check_node.jiang";
 import def_queries = "./type_check_def.jiang";
@@ -24,16 +22,11 @@ import trait_satisfaction_queries = "./trait_satisfaction.jiang";
 import const_definition_queries = "./const_definition.jiang";
 import jil_body_queries = "./jil_body.jiang";
 import jil_analysis_queries = "./jil_analysis.jiang";
-import enforcement = "../enforcement.jiang";
-import query_dependency = "./query_dependency.jiang";
-import source_graph = "../incremental/source_graph.jiang";
-import monomorph = "../sema/monomorph.jiang";
 import sem = "../sema/model.jiang";
 import lifetime_shape_model = "../sema/lifetime_shape.jiang";
-import list = "../support/list.jiang";
 import std;
 
-// 求值层运行时：per-query caches + 稳定依赖图。
+// 求值层运行时：per-query typed caches。
 // layout_of_type 的 cache 是 QueryCache<Int, LayoutId>：TypeId 目前没有
 // Hashable，key 用稠密索引（to_index），值仍为强类型 LayoutId。
 public struct QueryEngine: Movable {
@@ -42,7 +35,6 @@ public struct QueryEngine: Movable {
     import_summary_query.SourceImportSummaryQuery source_import_summary;
     stable_fingerprint.StableFingerprintQuery def_signatures;
     stable_fingerprint.StableFingerprintQuery def_bodies;
-    instance_plan.InstancePlanQuery instance_plan;
     body_queries.TypeCheckBodyQuery type_check_body;
     node_queries.TypeCheckNodeQuery type_check_node;
     def_queries.TypeCheckDefQuery type_check_def;
@@ -51,10 +43,7 @@ public struct QueryEngine: Movable {
     trait_satisfaction_queries.TraitSatisfactionQuery trait_satisfaction;
     const_definition_queries.ConstDefinitionQuery const_definition;
     jil_body_queries.JilBodyQuery jil_body;
-    jil_analysis_queries.BorrowCheckQuery borrow_check_result;
-    jil_analysis_queries.DropElaborationQuery drop_elaboration;
     jil_analysis_queries.JilStoreIdentityAllocator jil_store_identities;
-    Mutex<query_dependency.QueryDependencyGraph>^ dependencies;
 
     public init(self) {
         self.layout = layout_query.LayoutQuery();
@@ -62,7 +51,6 @@ public struct QueryEngine: Movable {
         self.source_import_summary = import_summary_query.SourceImportSummaryQuery();
         self.def_signatures = stable_fingerprint.StableFingerprintQuery();
         self.def_bodies = stable_fingerprint.StableFingerprintQuery();
-        self.instance_plan = instance_plan.InstancePlanQuery();
         self.type_check_body = body_queries.TypeCheckBodyQuery();
         self.type_check_node = node_queries.TypeCheckNodeQuery();
         self.type_check_def = def_queries.TypeCheckDefQuery();
@@ -71,31 +59,20 @@ public struct QueryEngine: Movable {
         self.trait_satisfaction = trait_satisfaction_queries.TraitSatisfactionQuery();
         self.const_definition = const_definition_queries.ConstDefinitionQuery();
         self.jil_body = jil_body_queries.JilBodyQuery();
-        self.borrow_check_result = jil_analysis_queries.BorrowCheckQuery();
-        self.drop_elaboration = jil_analysis_queries.DropElaborationQuery();
         self.jil_store_identities =
             jil_analysis_queries.JilStoreIdentityAllocator();
-        self.dependencies = new Mutex<query_dependency.QueryDependencyGraph>(
-            query_dependency.QueryDependencyGraph()
-        );
     }
 
-    // epoch 边界：清空 per-query caches；依赖图与稳定记录跨轮保留。
+    // epoch 边界：清空 per-query caches。
     public Void reset(self) {
         self.layout.reset();
         self.module_interface.reset();
         self.source_import_summary.reset();
         self.def_signatures.reset();
         self.def_bodies.reset();
-        self.instance_plan.reset();
         self.reset_type_check_queries();
         self.jil_body.reset();
-        self.borrow_check_result.reset();
-        self.drop_elaboration.reset();
         self.jil_store_identities.reset();
-        self.dependencies.with_lock<Void>({ dependencies =>
-            dependencies.reset_epoch();
-        });
     }
 
     public Int def_signature_l2_restores(self) {
@@ -127,11 +104,7 @@ public struct QueryEngine: Movable {
         qkey.StableSymbolId stable_id,
         Fn<qkey.Fingerprint128> evaluate
     ) {
-        query_dependency.StableQueryKey key = stable_symbol_query_key(
-            .def_signature,
-            stable_id
-        );
-        return self.def_signatures.evaluate(key, evaluate);
+        return self.def_signatures.evaluate(stable_id, evaluate);
     }
 
     public qkey.Fingerprint128 def_body(
@@ -139,205 +112,20 @@ public struct QueryEngine: Movable {
         qkey.StableSymbolId stable_id,
         Fn<qkey.Fingerprint128> evaluate
     ) {
-        query_dependency.StableQueryKey key = stable_symbol_query_key(
-            .def_body,
-            stable_id
-        );
-        return self.def_bodies.evaluate(key, evaluate);
+        return self.def_bodies.evaluate(stable_id, evaluate);
     }
 
-    public qkey.Fingerprint128 def_signature_for_source(
+    // `.ji` 已经持有 declaration 的稳定 fingerprint。
+    public Void restore_def_fingerprints(
         self,
         qkey.StableSymbolId stable_id,
-        cache_identity.StableSourceIdentity identity,
-        UInt64 source_hash,
-        Fn<qkey.Fingerprint128> evaluate
-    ) {
-        qkey.Fingerprint128 value = self.def_signature(stable_id, evaluate);
-        self.record_stable_source_dependency(
-            .def_signature,
-            stable_id,
-            identity,
-            source_hash
-        );
-        return value;
-    }
-
-    public qkey.Fingerprint128 def_body_for_source(
-        self,
-        qkey.StableSymbolId stable_id,
-        cache_identity.StableSourceIdentity identity,
-        UInt64 source_hash,
-        Fn<qkey.Fingerprint128> evaluate
-    ) {
-        qkey.Fingerprint128 value = self.def_body(stable_id, evaluate);
-        self.record_stable_source_dependency(
-            .def_body,
-            stable_id,
-            identity,
-            source_hash
-        );
-        return value;
-    }
-
-    // `.ji` 已经持有 declaration 的稳定 fingerprint。恢复 L1 时同时重建
-    // declaration -> source observation，不重新计算 Semantic Model fingerprint。
-    public Void restore_def_fingerprints_for_source(
-        self,
-        qkey.StableSymbolId stable_id,
-        cache_identity.StableSourceIdentity identity,
-        UInt64 source_hash,
         qkey.Fingerprint128 signature,
         qkey.Fingerprint128 body
     ) {
-        self.def_signatures.restore(
-            stable_symbol_query_key(.def_signature, stable_id),
-            signature
-        );
-        self.def_bodies.restore(
-            stable_symbol_query_key(.def_body, stable_id),
-            body
-        );
-        self.record_stable_source_dependency(
-            .def_signature,
-            stable_id,
-            identity,
-            source_hash
-        );
-        self.record_stable_source_dependency(
-            .def_body,
-            stable_id,
-            identity,
-            source_hash
-        );
+        self.def_signatures.restore(stable_id, signature);
+        self.def_bodies.restore(stable_id, body);
     }
 
-    Void record_stable_source_dependency(
-        self,
-        query_dependency.IncrementalQueryKind kind,
-        qkey.StableSymbolId stable_id,
-        cache_identity.StableSourceIdentity identity,
-        UInt64 source_hash
-    ) {
-        query_dependency.StableQueryKey query_key =
-            stable_symbol_query_key(kind, stable_id);
-        record_source_dependency(
-            self,
-            query_key,
-            identity,
-            qkey.Fingerprint128(source_hash, 0)
-        );
-    }
-
-    public Void refresh_invalidation(
-        self,
-        source_graph.SourceDependencyGraph& sources
-    ) {
-        self.dependencies.with_lock<Void>({ dependencies =>
-            dependencies.reset_invalidation();
-            add_dirty_source_roots(dependencies, sources);
-        });
-    }
-
-    public query_dependency.InvalidationStats invalidation_stats(self) {
-        return self.dependencies.with_lock({ dependencies =>
-            dependencies$.ref().invalidation_stats()
-        });
-    }
-
-    public Void replace_dependencies(
-        self,
-        query_dependency.StableQueryKey query,
-        query_dependency.ObservedQueryDependency[]& dependencies
-    ) {
-        self.dependencies.with_lock<Void>({ graph =>
-            graph.replace_dependencies(query, dependencies);
-        });
-    }
-
-    // trait parent 检查的稳定输入是父 trait 的 declaration signature。
-    // caller/依赖都由实际递归调用点显式传入，不依赖全局求值栈推断。
-    public Void observe_trait_signature_dependency(
-        self,
-        qkey.StableSymbolId trait_id,
-        qkey.StableSymbolId parent_id,
-        qkey.Fingerprint128 parent_signature
-    ) {
-        query_dependency.StableQueryKey query = stable_symbol_query_key(
-            .trait_conformance,
-            trait_id
-        );
-        query_dependency.StableQueryKey dependency = stable_symbol_query_key(
-            .def_signature,
-            parent_id
-        );
-        self.dependencies.with_lock<Void>({ dependencies =>
-            dependencies.observe_dependency(
-                query,
-                dependency,
-                parent_signature
-            );
-        });
-    }
-
-    public list.ArrayList<query_dependency.ObservedQueryDependency>
-    query_observations(
-        self,
-        query_dependency.StableQueryKey query
-    ) {
-        return self.dependencies.with_lock({ dependencies =>
-            dependencies$.ref().observations(query)
-        });
-    }
-
-    public Void restore_query_observations(
-        self,
-        query_dependency.StableQueryKey query,
-        query_dependency.ObservedQueryDependency[]& observations
-    ) {
-        self.dependencies.with_lock<Void>({ dependencies =>
-            dependencies.restore_observations(query, observations);
-        });
-    }
-
-    public Int query_observation_l2_restores(self) {
-        return self.dependencies.with_lock({ dependencies =>
-            dependencies$.ref().observation_l2_restores()
-        });
-    }
-
-    public Bool candidate_requires_recompute(
-        self,
-        query_dependency.StableQueryKey candidate,
-        query_dependency.ObservedQueryDependency[]& current_dependencies
-    ) {
-        return self.dependencies.with_lock({ dependencies =>
-            dependencies$.ref().candidate_requires_recompute(
-                candidate,
-                current_dependencies
-            )
-        });
-    }
-
-}
-
-Void add_dirty_source_roots(
-    query_dependency.QueryDependencyGraph&! dependencies,
-    source_graph.SourceDependencyGraph& sources
-) {
-    list.ArrayList<source_graph.SourceNodeId> dirty = sources.dirty_nodes();
-    Int index! = 0;
-    while (index < dirty.len()) {
-        source_graph.SourceNode& node = sources.node(dirty.get(index));
-        dependencies.add_changed_root(
-            query_dependency.StableQueryKey.fingerprint_parts(
-                .source_import_summary,
-                node.identity.fingerprint.low,
-                node.identity.fingerprint.high
-            )
-        );
-        index = index + 1;
-    }
 }
 
 public Void type_check_body(
@@ -377,37 +165,6 @@ public Bool jil_body_is_active(
     jil_body_queries.JilBodyKey key
 ) {
     return query.jil_body.is_active(key);
-}
-
-public Bool borrow_check_result(
-    QueryEngine& query,
-    Int store_identity,
-    enforcement.Mode mode,
-    Fn<Bool> compute
-) {
-    return query.borrow_check_result.evaluate(
-        jil_analysis_queries.borrow_key(store_identity, mode),
-        compute
-    );
-}
-
-public Void invalidate_borrow_check_result(
-    QueryEngine& query,
-    Int store_identity,
-    enforcement.Mode mode
-) {
-    query.borrow_check_result.invalidate(
-        jil_analysis_queries.borrow_key(store_identity, mode)
-    );
-}
-
-public jil.Store^ drop_elaboration(
-    QueryEngine& query,
-    Int store_identity,
-    jil.Store^ input,
-    Fn<jil.Store^, jil.Store^> compute
-) {
-    return query.drop_elaboration.evaluate(store_identity, input, compute);
 }
 
 public Void trait_dependency(
@@ -452,114 +209,41 @@ public Bool const_definition(
     return query.const_definition.evaluate(def_id, evaluate);
 }
 
-// 泛型实例计划由 QueryEngine 唯一持有。调用方只能在 consume 的同步作用域内
-// 借用 MonomorphStore，不能把 plan 或其 arena 引用保存到 query 外部。
-public instance_plan.InstancePlanId generic_instance_plan(
-    QueryEngine& query,
-    qkey.StableSymbolId package_identity,
-    query_dependency.ObservedQueryDependency[]& dependencies,
-    Fn<monomorph.MonomorphStore^> compute
-) {
-    query_dependency.StableQueryKey key = stable_symbol_query_key(
-        .generic_instance_plan,
-        package_identity
-    );
-    query.replace_dependencies(key, dependencies);
-    return query.instance_plan.evaluate(key, compute);
-}
-
-public Void with_generic_instance_plan(
-    QueryEngine& query,
-    instance_plan.InstancePlanId id,
-    Fn<Void, monomorph.MonomorphStore&> consume
-) {
-    query.instance_plan.consume(id, consume);
-}
-
-public query_dependency.ObservedQueryDependency observe_source(
-    cache_identity.StableSourceIdentity identity,
-    UInt64 source_hash
-) {
-    return query_dependency.ObservedQueryDependency(
-        source_query_key(.source_import_summary, identity),
-        qkey.Fingerprint128(source_hash, 0)
-    );
-}
-
-public query_dependency.StableQueryKey def_query_key(
-    query_dependency.IncrementalQueryKind kind,
-    qkey.StableSymbolId stable_id
-) {
-    return stable_symbol_query_key(kind, stable_id);
-}
-
-// source_import_summary 是 SourceGraph dirty root。L1 只缓存 SourceId owner 句柄；
+// source import summary 的 L1 只缓存 SourceId owner 句柄；
 // L2 读取和 L3 发布都由调用方保持 SourceArtifactCache 的唯一事实所有权。
 public source.SourceId? source_import_summary(
     QueryEngine& query,
-    cache_identity.StableSourceIdentity identity,
+    cache_identity.StableSourceId identity,
     Fn<source.SourceId?> load
 ) {
-    query_dependency.StableQueryKey key = source_query_key(
-        .source_import_summary,
-        identity
-    );
-    return query.source_import_summary.evaluate(key, load);
+    return query.source_import_summary.evaluate(identity, load);
 }
 
 public Void publish_source_import_summary(
     QueryEngine& query,
-    cache_identity.StableSourceIdentity identity,
+    cache_identity.StableSourceId identity,
     source.SourceId source_id
 ) {
-    query.source_import_summary.publish(
-        source_query_key(.source_import_summary, identity),
-        source_id
-    );
+    query.source_import_summary.publish(identity, source_id);
 }
 
 // 稳定 interface 查询只缓存 owner store 的 SourceId 句柄，不复制 ModuleInterface。
 // load 在 L1 miss 时执行 L2 读取或保守重算，并且不跨 cache lock 调用。
 public source.SourceId? module_interface(
     QueryEngine& query,
-    cache_identity.StableSourceIdentity identity,
-    UInt64 source_hash,
+    cache_identity.StableSourceId identity,
     Fn<source.SourceId?> load
 ) {
-    query_dependency.StableQueryKey key = source_query_key(
-        .module_interface,
-        identity
-    );
-    source.SourceId? result = query.module_interface.evaluate(key, load);
-    if (result != null) {
-        record_source_dependency(
-            query,
-            key,
-            identity,
-            qkey.Fingerprint128(source_hash, 0)
-        );
-    }
-    return result;
+    return query.module_interface.evaluate(identity, load);
 }
 
-// L3 构造并写入 SourceArtifactCache 后，由 owner 的发布路径登记 L1 句柄和依赖。
+// L3 构造并写入 SourceArtifactCache 后，由 owner 的发布路径登记 L1 句柄。
 public Void publish_module_interface(
     QueryEngine& query,
-    cache_identity.StableSourceIdentity identity,
-    UInt64 source_hash,
+    cache_identity.StableSourceId identity,
     source.SourceId source_id
 ) {
-    query_dependency.StableQueryKey key = source_query_key(
-        .module_interface,
-        identity
-    );
-    query.module_interface.publish(key, source_id);
-    record_source_dependency(
-        query,
-        key,
-        identity,
-        qkey.Fingerprint128(source_hash, 0)
-    );
+    query.module_interface.publish(identity, source_id);
 }
 
 // 第一个查询入口：layout_of_type。
@@ -572,45 +256,4 @@ public layout.LayoutId layout_of_type(
     qid.TypeId type_id
 ) {
     return query.layout.evaluate(store, type_id);
-}
-
-query_dependency.StableQueryKey source_query_key(
-    query_dependency.IncrementalQueryKind kind,
-    cache_identity.StableSourceIdentity identity
-) {
-    return query_dependency.StableQueryKey.fingerprint_parts(
-        kind,
-        identity.fingerprint.low,
-        identity.fingerprint.high
-    );
-}
-
-query_dependency.StableQueryKey stable_symbol_query_key(
-    query_dependency.IncrementalQueryKind kind,
-    qkey.StableSymbolId stable_id
-) {
-    return query_dependency.StableQueryKey.stable_symbol_parts(
-        kind,
-        stable_id.low,
-        stable_id.high
-    );
-}
-
-Void record_source_dependency(
-    QueryEngine& query,
-    query_dependency.StableQueryKey query_key,
-    cache_identity.StableSourceIdentity identity,
-    qkey.Fingerprint128 fingerprint
-) {
-    query_dependency.StableQueryKey source_key = source_query_key(
-        .source_import_summary,
-        identity
-    );
-    query_dependency.ObservedQueryDependency[1] observed = [
-        query_dependency.ObservedQueryDependency(
-            source_key,
-            fingerprint
-        )
-    ];
-    query.replace_dependencies(query_key, observed[..]);
 }

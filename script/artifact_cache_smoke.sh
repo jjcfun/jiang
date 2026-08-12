@@ -198,7 +198,6 @@ check_cold_hot_and_profiles() {
   require_stat_ge "$WORK_DIR/hot.log" artifact_parsed_sources 1
   require_stat_ge "$WORK_DIR/hot.log" query_def_signature_l2 1
   require_stat_ge "$WORK_DIR/hot.log" query_def_body_l2 1
-  require_stat_ge "$WORK_DIR/hot.log" query_observation_l2 1
   expect_exit "$hot" 52
 
   compile_executable "$JIANGC" "$cache" "$WORK_DIR/hot-noop.log" "$hot" "$input"
@@ -734,12 +733,12 @@ check_trait_interface() {
     '        Int(value)' \
     '    }' \
     '' \
-    '    public () write(Self&! self, UInt8[]& bytes) {}' \
-    '    public () write(Self&! self, UInt8 value) {}' \
+    '    public Void write(Self&! self, UInt8[]& bytes) {}' \
+    '    public Void write(Self&! self, UInt8 value) {}' \
     '    public UInt64 finish(self) { 0 }' \
     '}' \
     '' \
-    'public () write_u64<H: Hasher>(H&! value) {' \
+    'public Void write_u64<H: Hasher>(H&! value) {' \
     '    value.write(UInt64(0));' \
     '}' \
     '' \
