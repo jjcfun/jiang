@@ -13,9 +13,9 @@ PACKAGE_VERSION="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' "
 JIANG_VERSION="$PACKAGE_VERSION"
 BOOTSTRAP_ARTIFACT_CACHE_DIR="$ROOT_DIR/build/cache"
 NEXT_ARTIFACT_CACHE_DIR="${NEXT_ARTIFACT_CACHE_DIR:-$BUILD_DIR/artifact-cache/next/$JIANG_VERSION}"
-BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.1}"
+BOOTSTRAP_RELEASE_VERSION="${BOOTSTRAP_RELEASE_VERSION:-0.5.2}"
 JIANG_HOME="${JIANG_HOME:-$HOME/.jiang}"
-DEFAULT_BOOTSTRAP_BIN="$JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION/bin/jiangc"
+DEFAULT_BOOTSTRAP_BIN="$ROOT_DIR/../bootstrap-0.5.2/build/bin/jiangc.next"
 BOOTSTRAP_BIN="${BOOTSTRAP_BIN:-$DEFAULT_BOOTSTRAP_BIN}"
 
 source "$ROOT_DIR/script/llvm_env.sh"
@@ -53,9 +53,8 @@ cp "$ROOT_DIR/package.ini" "$BUILD_DIR/package.ini"
 cd "$ROOT_DIR"
 
 if [ -z "$BOOTSTRAP_BIN" ] || [ ! -x "$BOOTSTRAP_BIN" ]; then
-  echo "missing Jiang $BOOTSTRAP_RELEASE_VERSION stable compiler: $BOOTSTRAP_BIN" >&2
-  echo "install Jiang $BOOTSTRAP_RELEASE_VERSION to $JIANG_HOME/versions/$BOOTSTRAP_RELEASE_VERSION," >&2
-  echo "or set BOOTSTRAP_BIN=/path/to/jiangc" >&2
+  echo "missing bootstrap/0.5.2 stage compiler: $BOOTSTRAP_BIN" >&2
+  echo "build ../bootstrap-0.5.2 first, or set BOOTSTRAP_BIN explicitly" >&2
   exit 2
 fi
 BOOTSTRAP_VERSION="$("$BOOTSTRAP_BIN" --version | sed -n '1p')"
@@ -139,11 +138,20 @@ clear_bootstrap_artifact_cache() {
 emit_next_from_bootstrap() {
   local output_bin="$1"
   printf '== build next: compile executable with %s (%s) ==\n' "$BOOTSTRAP_BIN" "$BOOTSTRAP_VERSION"
-  "$BOOTSTRAP_BIN" \
-    --linker "$CLANG_BIN" \
-    "${LLVM_LINK_ARGS[@]}" \
-    -o "$output_bin" \
-    src/jiangc.jiang
+  if [ "$BOOTSTRAP_CHECK_MODE" = "audit" ]; then
+    "$BOOTSTRAP_BIN" \
+      --bootstrap-check-mode audit \
+      --linker "$CLANG_BIN" \
+      "${LLVM_LINK_ARGS[@]}" \
+      -o "$output_bin" \
+      src/jiangc.jiang
+  else
+    "$BOOTSTRAP_BIN" \
+      --linker "$CLANG_BIN" \
+      "${LLVM_LINK_ARGS[@]}" \
+      -o "$output_bin" \
+      src/jiangc.jiang
+  fi
   test -x "$output_bin"
   write_compiler_build_id "$output_bin"
   printf 'OK %s\n' "$output_bin"

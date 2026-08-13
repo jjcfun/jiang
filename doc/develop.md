@@ -5,10 +5,10 @@
 
 ## 常规开发
 
-当前源码默认使用已安装的 Jiang 0.5.1 stable：
+当前第二阶段 bootstrap 默认使用第一阶段 worktree 产物：
 
 ```text
-~/.jiang/versions/0.5.1/bin/jiangc
+../bootstrap-0.5.2/build/bin/jiangc.next
 ```
 
 构建当前源码：

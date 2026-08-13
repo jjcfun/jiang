@@ -66,13 +66,13 @@ bash ./script/install_llvm.sh --local --from-source
 macOS 下默认使用 `JIANG_MACOS_DEPLOYMENT_TARGET=11.0` 构建 LLVM 和链接 `jiangc`，需要
 调整最低系统版本时应统一设置这个变量。
 
-当前源码默认使用已发布的 Jiang 0.5.1 stable 编译器作为 bootstrap 输入。默认路径：
+当前源码是 0.5.2 的第二个 bootstrap 阶段，默认使用第一阶段产物：
 
 ```text
-~/.jiang/versions/0.5.1/bin/jiangc
+../bootstrap-0.5.2/build/bin/jiangc.next
 ```
 
-安装 0.5.1 后可直接运行：
+先在 `bootstrap-0.5.2` worktree 运行其构建脚本，再在本 worktree 运行：
 
 ```bash
 bash ./script/build_next.sh
@@ -81,7 +81,8 @@ bash ./script/build_next.sh
 该脚本会依次构建：
 
 ```text
-~/.jiang/versions/0.5.1/bin/jiangc -> build/bin/jiangc.next
+bootstrap/0.5.2 build/bin/jiangc.next
+  -> bootstrap/0.5.2-2 build/bin/jiangc.next
 ```
 
 并默认用 `build/bin/jiangc.next` 跑 smoke、backend CLI smoke 和 lang check。输出为：
