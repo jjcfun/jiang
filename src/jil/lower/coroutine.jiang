@@ -494,8 +494,10 @@ public extend lower_context.Context {
         jil.Function function,
         token.Span span
     ) {
+        qid.DefId function_def = jil.function_provenance_def(function.origin);
+        if (self.async_lambda_function_consumes_env(function_def)) { return null; }
         jil.FunctionKey key = jil.FunctionKey(
-            jil.function_provenance_def(function.origin),
+            function_def,
             function.type_args,
             function.const_args
         );
@@ -519,6 +521,13 @@ public extend lower_context.Context {
             type_id: function_type,
             span: span
         );
+    }
+
+    Bool async_lambda_function_consumes_env(self, qid.DefId function_def) {
+        guard self.typeck.def_type(function_def) is .some(type_id) else { return false; }
+        types.TypeInfo info = self.ctx.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        return function_type.call_ownership == .consuming;
     }
 
     public Void add_async_callable_abi_functions(
@@ -587,8 +596,15 @@ public extend lower_context.Context {
             index = index + 1;
         }
         qid.TypeId result = source.body.locals[source.body.return_local.to_index()].type_id;
-        qid.TypeId type_id = self.ctx.store.types.function_type_with_effects(
-            params, result, source.span, source.effects
+        qid.DefId source_def = jil.function_provenance_def(source.origin);
+        qid.TypeId type_id = self.ctx.store.types.function_type_with_kind(
+            params,
+            result,
+            source.span,
+            source.effects,
+            .raw,
+            null,
+            self.async_lambda_function_consumes_env(source_def)
         );
         types.TypeInfo info = self.ctx.store.types.get(type_id);
         guard info.data is .function_type(function_type) else {
@@ -619,7 +635,10 @@ public extend lower_context.Context {
             jil.LocalId frame_pointer_local = jil.LocalId.from_index(param_count + 2);
             jil.LocalId erased_frame_local = jil.LocalId.from_index(param_count + 3);
             jil.LocalId allocation_executor_local = jil.LocalId.from_index(param_count + 4);
-            Int local_count = param_count + 5;
+            Bool consumes_env = function_type.call_ownership == .consuming
+                && layout.capture_env_field_index >= 0;
+            Int local_count! = param_count + 5;
+            if (consumes_env) { local_count = local_count + 1; }
             jil.LocalDecl*! locals = self.output.alloc_local_array(local_count);
             locals[0] = self.generated_local(
                 jil.LocalId.from_index(0), .return_place, self.ctx.store.types.unit_type(), span
@@ -648,6 +667,16 @@ public extend lower_context.Context {
                 self.ctx.store.types.opaque_pointer_type(span),
                 span
             );
+            jil.LocalId consuming_env_pointer_local = jil.LocalId.from_index(param_count + 5);
+            if (consumes_env) {
+                qid.TypeId env_type = layout.fields[layout.capture_env_field_index].type_id;
+                locals[consuming_env_pointer_local.to_index()] = self.generated_local(
+                    consuming_env_pointer_local,
+                    .compiler_temp,
+                    self.ctx.store.types.raw_pointer_type(env_type, span),
+                    span
+                );
+            }
             jil.Place frame_pointer = jil.local_place(frame_pointer_local, self.output.empty_projection());
             jil.Place frame = self.generated_deref_place(frame_pointer, true);
             list.ArrayList<jil.Statement> statements! = list.ArrayList<jil.Statement>();
@@ -692,6 +721,7 @@ public extend lower_context.Context {
                 continuation_local,
                 frame_pointer_local,
                 erased_frame_local,
+                consuming_env_pointer_local,
                 completion_id,
                 span,
                 statements$.ref()
@@ -726,6 +756,7 @@ public extend lower_context.Context {
         jil.LocalId continuation_local,
         jil.LocalId frame_pointer_local,
         jil.LocalId erased_frame_local,
+        jil.LocalId consuming_env_pointer_local,
         jil.FunctionId completion_id,
         token.Span span,
         list.ArrayList<jil.Statement>& statements
@@ -736,16 +767,29 @@ public extend lower_context.Context {
             jil.LocalDecl source_local = source.body.locals[source_local_index];
             if (source_local.kind == .param) {
                 if (self.coroutine_frame_field_index(layout, source_local.id) is .some(field_index)) {
-                    statements.add(self.generated_assign_operand(
-                        self.generated_constant_index_place(frame, field_index),
-                        jil.copy_operand_value(jil.CopyOperand (
-                            place: jil.local_place(
-                                jil.LocalId.from_index(abi_param_index + 1),
-                                self.output.empty_projection()
-                            )
-                        )),
-                        span
-                    ));
+                    if (abi_param_index == 0
+                        && function_type.call_ownership == .consuming
+                        && layout.capture_env_field_index >= 0) {
+                        self.append_consuming_async_env_initializers(
+                            layout,
+                            frame,
+                            field_index,
+                            consuming_env_pointer_local,
+                            span,
+                            statements
+                        );
+                    } else {
+                        statements.add(self.generated_assign_operand(
+                            self.generated_constant_index_place(frame, field_index),
+                            jil.copy_operand_value(jil.CopyOperand (
+                                place: jil.local_place(
+                                    jil.LocalId.from_index(abi_param_index + 1),
+                                    self.output.empty_projection()
+                                )
+                            )),
+                            span
+                        ));
+                    }
                 }
                 abi_param_index = abi_param_index + 1;
             }
@@ -799,6 +843,59 @@ public extend lower_context.Context {
             span,
             statements
         );
+    }
+
+    Void append_consuming_async_env_initializers(
+        self,
+        jil.CoroutineFrameLayout& layout,
+        jil.Place frame,
+        Int param_field_index,
+        jil.LocalId env_pointer_local,
+        token.Span span,
+        list.ArrayList<jil.Statement>& statements
+    ) {
+        jil.Place erased_env = jil.local_place(
+            jil.LocalId.from_index(1), self.output.empty_projection()
+        );
+        jil.Place env_pointer = jil.local_place(
+            env_pointer_local, self.output.empty_projection()
+        );
+        qid.TypeId env_type = layout.fields[layout.capture_env_field_index].type_id;
+        qid.TypeId env_pointer_type = self.ctx.store.types.raw_pointer_type(env_type, span);
+        statements.add(self.generated_cast_assign(
+            env_pointer, erased_env, env_pointer_type, span
+        ));
+        jil.Place frame_env = self.generated_constant_index_place(
+            frame, layout.capture_env_field_index
+        );
+        statements.add(self.generated_assign_operand(
+            frame_env,
+            jil.move_operand_value(jil.MoveOperand (
+                place: self.generated_deref_place(env_pointer, true)
+            )),
+            span
+        ));
+        statements.add(self.generated_assign(
+            jil.local_place(jil.LocalId.from_index(0), self.output.empty_projection()),
+            jil.free_rvalue(jil.FreeRvalue (
+                pointer: jil.copy_operand_value(jil.CopyOperand (place: env_pointer))
+            )),
+            span
+        ));
+        statements.add(self.generated_assign(
+            env_pointer,
+            jil.coroutine_address_rvalue(jil.CoroutineAddressRvalue (
+                place: frame_env,
+                frame_root: true
+            )),
+            span
+        ));
+        statements.add(self.generated_cast_assign(
+            self.generated_constant_index_place(frame, param_field_index),
+            env_pointer,
+            layout.fields[param_field_index].type_id,
+            span
+        ));
     }
 
     public Void append_async_callable_continuation_initializers(
