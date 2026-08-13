@@ -34,11 +34,11 @@ lowering 才把环境擦成 `{ receiver, vtable }` ABI。栈环境使用普通 J
 - 支持非捕获 lambda 初始化 `RawFn<...>`。
 - 支持 `RawFn<...>` 与 C 函数指针互通。
 - 基础闭环支持默认捕获推导，并由 lifetime / borrow check 阻止借用逃逸。
-- 为 async closure、iterator adapter、task spawn 和数据竞争检查预留语义空间。
+- async closure 复用 `Fn` / `FnOnce` 的调用所有权；iterator adapter 和数据竞争检查继续扩展。
 
 ## 设计边界
 
-- async closure 建立在普通捕获闭包之上，不作为基础闭包语义的一部分。
+- async closure 建立在普通捕获闭包和相同的调用所有权之上，不增加独立 callable kind。
 - 闭包是否能直接装箱成 trait object 需要等 callable trait 形状稳定后再决定。
 - 闭包表达式不能脱离 expected type 单独推导类型。
 - `Fn<...>` 不能转换成 `RawFn<...>`；一旦擦成闭包值，就不再依赖隐藏的“是否捕获”事实。
@@ -64,8 +64,8 @@ RawFn<Bool, Int, Int>    // 裸函数指针，不带 environment
 
 `Fn` 与 `FnOnce` 使用相同的 closure ABI；调用所有权是独立的类型语义，不产生另一套表示。
 `FnOnce` 调用会消费 callable place，因此不能通过 `FnOnce&` 调用，也不能再次调用原值。
-其闭包体可以 move 按值捕获；普通同步 `Fn` 的闭包体不能 move 按值捕获。当前 async callable 继续使用
-Task/coroutine 的独立 ownership protocol，因此不允许声明 async `FnOnce`。
+其闭包体可以 move 按值捕获；普通 `Fn` 的闭包体不能 move 按值捕获。async `FnOnce` 启动时把
+environment 的唯一所有权转移给 coroutine frame。
 
 `RawFn<...>` 的运行时值是函数入口。它不保存捕获环境，适合 top-level function、type/static
 function、未绑定实例方法和非捕获 lambda。
@@ -318,23 +318,24 @@ extern fn qsort(
 
 - 精确字段捕获：只捕获被使用的字段，而不是整个 local。
 
-owner capture 牵涉 consuming call、drop 和闭包重复调用规则，应该和 `FnOnce` 或等价能力
-一起设计。
+owner capture 由 callable 调用所有权约束：`Fn` 只能借用，`FnOnce` 可以消费 environment。
 
 ## 调用能力
 
-长期可扩展消费 environment 的调用能力：
+callable 的调用能力固定为：
 
 - `Fn`：可重复调用；environment 字段是否可变由字段类型决定。
 - `FnOnce`：会消费 environment，只能调用一次。
 
-基础闭环保守处理：
+当前规则：
 
 - `RawFn<...>`：不带 environment，可重复调用。
 - `Fn<...>`：movable stack closure object，可重复调用；允许共享引用捕获和可变 env 字段。
 - `Fn<...>^`：movable owned closure handle；调用时可临时借成 `Fn<...>&`。
+- `FnOnce<...>`：调用消费 stack closure；从 borrowed place 不可调用。
+- `FnOnce<...>^`：调用消费 owner handle，environment 只析构尚未移出的 capture。
 - 修改 capture 字段不引入 `FnMut`；后续由 write / async / send-like effect 机制约束数据竞争。
-- owner capture 可以进入 `Fn^` 的 heap environment；消费 environment 的调用能力等 `FnOnce` 设计完成。
+- owner capture 可以进入 `Fn^` / `FnOnce^` 的 heap environment；只有 `FnOnce` body 能移出 capture。
 
 ## Lifetime 和存储
 
@@ -478,10 +479,13 @@ artifact 或 async frame 如果需要更强的 env 身份，应继续从现有 `
 ## 与 async / 数据竞争的关系
 
 async closure 已建立在普通 closure 之上。源码仍使用普通
-`{ [captures] params => body }`，async effect 由 expected `Fn<async ...>` 类型决定；
+`{ [captures] params => body }`，async effect 和调用所有权由 expected `Fn<async ...>` 或
+`FnOnce<async ...>` 类型决定；
 vtable code slot 采用统一的
 `(env, args..., continuation*) -> ()` 启动 ABI，启动 shim 分配具体 coroutine frame，并把 closure
-environment 与参数写入 frame。完成 shim 释放 frame 后恢复调用方 continuation。
+environment 与参数写入 frame。`Fn` 启动时借用 environment；`FnOnce` 启动时把 environment
+唯一所有权转移给 frame，并立即消费原 callable。frame 在完成或取消时只析构尚未移出的 capture，
+完成 shim 释放 frame 后恢复调用方 continuation。
 
 当前第一阶段只开放同 Domain 动态调用。跨 Domain 调度、取消传播以及 async `RawFn`
 的完整运行时适配仍需继续完成。数据竞争机制还需要约束：

@@ -994,7 +994,7 @@ lambda 规则：
 - `RawFn` 不携带 environment，因此只接受非捕获 lambda
 - `Fn` 是 callable view，可以捕获外层 local；`Fn^` 是可移动的 owned heap closure
 - `FnOnce` 使用与 `Fn` 相同的表示，但调用会消费 callable；按值 capture 可以在闭包体中 move
-- `FnOnce&` 不能调用，已调用的 `FnOnce` 不能再次使用；async callable 不支持 `FnOnce`
+- `FnOnce&` 不能调用，已调用的 `FnOnce` 不能再次使用；async `FnOnce` 在启动时消费 callable
 - 可选 capture list 写在参数之前：`[name]` 按值 copy/move，`[ref name]` / `[ref! name]` 分别建立
   共享/独占借用
 - capture list 只接受已有 local 的同名捕获，不支持类型、重命名或表达式
@@ -1142,7 +1142,8 @@ async Int load_both() {
 
 `Task { ... }` 继承 current Domain；`Task(domain: global_domain) { ... }` 显式指定
 execution domain。Task closure 使用最后一个表达式作为结果，不支持显式 `return`；`return`
-只用于普通或 async 函数体。`coroutine.sync(domain) { ... }` 使用普通尾随 closure，domain 必填。
+只用于普通或 async 函数体。Task 与 `coroutine.sync(domain) { ... }` 的尾随 closure 均按
+`FnOnce<async ...>` 检查：启动会消费 capture environment，后者的 domain 必填。
 直接 `Task<T>` 是 `!Movable` 原地值，可以直接作为 struct、tuple 或固定数组中的静态字段；包含它的
 聚合值同样不可移动、按值传参、返回或捕获。`new Task { ... }` 创建可移动、非 Copyable 的
 `Task<T>^` owner。owner 可以按值传参、返回、存入字段、容器和泛型实例；Task 的公开类型不包含 execution
