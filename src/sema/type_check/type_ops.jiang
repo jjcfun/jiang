@@ -712,6 +712,15 @@ public struct TypeOps: Movable {
             CheckedGenericArgs fn_args! = self.check_fn_generic_args(ref_data.args);
             return self.type_for_fn_ref(type_ref, ref_data.args, fn_args$.ref(), .closure);
         }
+        if (self.is_fn_once_builtin_type_def(target_def)) {
+            if (!self.validate_fn_contract_names(type_ref, ref_data)) {
+                return self.state.store.types.invalid_type();
+            }
+            CheckedGenericArgs fn_args! = self.check_fn_generic_args(ref_data.args);
+            return self.type_for_fn_ref(
+                type_ref, ref_data.args, fn_args$.ref(), .closure, true
+            );
+        }
         if (!self.validate_generic_contract_names(type_ref, ref_data)) {
             return self.state.store.types.invalid_type();
         }
@@ -807,6 +816,10 @@ public struct TypeOps: Movable {
 
     public Bool is_fn_builtin_type_def(self, qid.DefId def_id) {
         return self.core_type_def_matches(self.state.store.resolve.core_types.fn_type, def_id);
+    }
+
+    public Bool is_fn_once_builtin_type_def(self, qid.DefId def_id) {
+        return self.core_type_def_matches(self.state.store.resolve.core_types.fn_once_type, def_id);
     }
 
     Bool is_reference_builtin_type_def(self, qid.DefId def_id) {
@@ -920,12 +933,15 @@ public struct TypeOps: Movable {
         sem.NodeId type_ref,
         sem.NodeId[]& arg_refs,
         CheckedGenericArgs& args,
-        types.FunctionKind kind
+        types.FunctionKind kind,
+        Bool consuming = false
     ) {
         if (args.const_args.len() > 0 || args.type_args.len() == 0) {
             UInt8[]& message! = "Fn requires a return type followed by zero or more parameter types";
             if (kind == .raw) {
                 message = "RawFn requires a return type followed by zero or more parameter types";
+            } else if (consuming) {
+                message = "FnOnce requires a return type followed by zero or more parameter types";
             }
             self.add_node_error(
                 type_ref,
@@ -936,6 +952,14 @@ public struct TypeOps: Movable {
         }
         qid.TypeId result = self.validate_value_type_ref(arg_refs[0], args.type_args.get(0), true);
         types.EffectSet effects = self.fn_effects_from_result_arg(arg_refs[0]);
+        if (consuming && effects.has_async) {
+            self.add_node_error(
+                type_ref,
+                "async FnOnce is not supported; Task owns async closure consumption",
+                "fnonce_async_not_supported"
+            );
+            return self.state.store.types.invalid_type();
+        }
         if (self.is_invalid_type(result)) {
             return self.state.store.types.invalid_type();
         }
@@ -956,11 +980,13 @@ public struct TypeOps: Movable {
                 result,
                 token.Span(),
                 effects,
-                kind
+                kind,
+                null,
+                consuming
             );
         }
         return self.state.store.types.function_type_with_kind_contract(
-            params, result, token.Span(), effects, kind, lifetime_contract
+            params, result, token.Span(), effects, kind, lifetime_contract, consuming
         );
     }
 
@@ -3475,7 +3501,8 @@ public struct TypeOps: Movable {
             type_info.span,
             function_type.effects,
             function_type.kind,
-            function_type.lifetime_contract.flows
+            function_type.lifetime_contract.flows,
+            function_type.call_ownership == .consuming
         );
         return self.type_with_original_mutability(type_info, function_id);
     }
@@ -3617,7 +3644,8 @@ public struct TypeOps: Movable {
             type_info.span,
             function_type.effects,
             function_type.kind,
-            function_type.lifetime_contract.flows
+            function_type.lifetime_contract.flows,
+            function_type.call_ownership == .consuming
         );
         return self.type_with_original_mutability(type_info, function_id);
     }
@@ -3737,7 +3765,8 @@ public struct TypeOps: Movable {
             type_info.span,
             function_type.effects,
             function_type.kind,
-            function_type.lifetime_contract.flows
+            function_type.lifetime_contract.flows,
+            function_type.call_ownership == .consuming
         );
         return self.type_with_original_mutability(type_info, function_id);
     }
@@ -4104,12 +4133,14 @@ public struct TypeOps: Movable {
             params.add(function_type.params[index]);
             index = index + 1;
         }
-        return self.state.store.types.function_type_with_effects(
+        return self.state.store.types.function_type_with_kind(
             params,
             function_type.result,
             token.Span(),
             self.merge_effects(function_type.effects, self.function_effects(effect_type.effects)),
-            function_type.lifetime_contract.flows
+            function_type.kind,
+            function_type.lifetime_contract.flows,
+            function_type.call_ownership == .consuming
         );
     }
 
@@ -4746,6 +4777,7 @@ public struct TypeOps: Movable {
     Void check_explicit_move_required(self, sem.NodeId value_id, qid.TypeId actual) {
         if (self.is_implicit_copy_type(actual)) { return; }
         if (!self.is_place_expr(value_id)) { return; }
+        if (self.reject_borrowed_callable_capture_move(value_id)) { return; }
         sem.Node value = self.state.model.node(value_id);
         if (value.data is .member_access(member_access)) {
             if (!self.check_field_move_target(value_id, member_access.base)) { return; }
@@ -4753,6 +4785,55 @@ public struct TypeOps: Movable {
             return;
         }
         self.check_movable_value_transfer(value_id, actual);
+    }
+
+    public Bool reject_borrowed_callable_capture_move(self, sem.NodeId value_id) {
+        sem.NodeId root! = value_id;
+        while (self.state.model.node(root).data is .member_access(member_access)) {
+            root = member_access.base;
+        }
+        guard self.state.results.lambda_capture_infos(root.owner_def) is .some(captures) else {
+            return false;
+        }
+        if (!self.lambda_capture_root_is_owned(root, captures)) { return false; }
+        guard self.state.results.def_type(root.owner_def) is .some(type_id) else { return false; }
+        types.TypeInfo info = self.state.store.types.get(type_id);
+        guard info.data is .function_type(function_type) else { return false; }
+        if (function_type.effects.has_async) { return false; }
+        if (function_type.call_ownership == .consuming) { return false; }
+        self.add_node_error(
+            value_id,
+            "Fn body cannot move an owned capture; use FnOnce",
+            "fn_capture_move_requires_once"
+        );
+        return true;
+    }
+
+    Bool lambda_capture_root_is_owned(
+        self,
+        sem.NodeId root,
+        typeck_store.LambdaCaptureInfo[]& captures
+    ) {
+        guard self.lambda_capture_root_def(root) is .some(def_id) else { return false; }
+        Int index! = 0;
+        while (index < captures.length) {
+            typeck_store.LambdaCaptureInfo capture = captures[index];
+            Bool matches! = capture.local_def == def_id;
+            if (capture.source_def is .some(source) && source == def_id) { matches = true; }
+            if (matches) { return capture.owned; }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    qid.DefId? lambda_capture_root_def(self, sem.NodeId root) {
+        sem.Node node = self.state.model.node(root);
+        guard node.data is .name_ref(name_ref) else { return null; }
+        if (name_ref is .def_ref(def_id)) { return def_id; }
+        guard name_ref is .local(local_id) else { return null; }
+        guard self.state.model.def(root.owner_def) is .some(owner) else { return null; }
+        guard owner.body is .some(ref _ body) else { return null; }
+        return body.local(local_id).def_id;
     }
 
     Void check_movable_value_transfer(self, sem.NodeId value_id, qid.TypeId actual) {
@@ -4791,6 +4872,20 @@ public struct TypeOps: Movable {
             self.add_projection_move_error(target_id);
             return false;
         }
+        return false;
+    }
+
+    public Bool check_callable_consume_target(self, sem.NodeId target_id) {
+        sem.Node target = self.state.model.node(target_id);
+        if (target.data is .member_access(member_access)) {
+            return self.check_field_move_target(target_id, member_access.base);
+        }
+        if (target.data is .name_ref(_)) { return true; }
+        self.add_node_error(
+            target_id,
+            "FnOnce call requires an owned callable place",
+            "fnonce_call_requires_owned_place"
+        );
         return false;
     }
 
