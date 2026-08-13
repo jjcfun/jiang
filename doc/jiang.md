@@ -993,6 +993,8 @@ lambda 规则：
 - `=>` 后可以写表达式或多条 block statement
 - `RawFn` 不携带 environment，因此只接受非捕获 lambda
 - `Fn` 是 callable view，可以捕获外层 local；`Fn^` 是可移动的 owned heap closure
+- `FnOnce` 使用与 `Fn` 相同的表示，但调用会消费 callable；按值 capture 可以在闭包体中 move
+- `FnOnce&` 不能调用，已调用的 `FnOnce` 不能再次使用；async callable 不支持 `FnOnce`
 - 可选 capture list 写在参数之前：`[name]` 按值 copy/move，`[ref name]` / `[ref! name]` 分别建立
   共享/独占借用
 - capture list 只接受已有 local 的同名捕获，不支持类型、重命名或表达式

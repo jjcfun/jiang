@@ -3,7 +3,8 @@
 本文描述 Jiang 闭包和函数指针的设计方向。核心区分是：
 
 - `RawFn<Ret, Args...>` 表示裸函数指针，不带 environment，可与 C 函数指针互通。
-- `Fn<Ret, Args...>` 表示栈上的 Jiang 闭包值，可带 environment，movable。
+- `Fn<Ret, Args...>` 表示可重复调用的栈上 Jiang 闭包值，可带 environment，movable。
+- `FnOnce<Ret, Args...>` 表示只能消费调用一次的栈上 Jiang 闭包值。
 - `Fn<Ret, Args...>^` 表示堆上的 owned closure，environment 生命周期跟随 owner。
 
 闭包表达式必须出现在有明确 expected callable type 的位置，不能像普通局部变量一样从闭包
@@ -23,8 +24,7 @@ lowering 才把环境擦成 `{ receiver, vtable }` ABI。栈环境使用普通 J
 函数中的闭包环境可以复用 coroutine frame rewrite，不依赖 backend block 内临时 `alloca`。
 
 已验证的行为见本文末尾测试清单。测试清单中的 `[x]` 表示当前已有语言测试或 smoke
-覆盖；未在清单中标成 `[x]` 的 async closure、`FnOnce`、完整
-`Send` / `Sync` 等能力仍属于后续设计。
+覆盖；未在清单中标成 `[x]` 的完整 `Send` / `Sync` 等能力仍属于后续设计。
 
 ## 目标
 
@@ -46,8 +46,8 @@ lowering 才把环境擦成 `{ receiver, vtable }` ABI。栈环境使用普通 J
 
 ## 类型模型
 
-`Fn<Ret, Args...>` 和 `RawFn<Ret, Args...>` 是编译器内建类型族。`Args...` 是内建的
-type parameter pack，不要求先开放普通用户泛型参数包。
+`RawFn<Ret, Args...>`、`Fn<Ret, Args...>` 和 `FnOnce<Ret, Args...>` 是编译器内建类型族。
+`Args...` 是内建的 type parameter pack，不要求先开放普通用户泛型参数包。
 
 两者默认使用空 `LifetimeContract`：返回类型 `Ret` 不能携带参数 borrow。允许 callable
 返回某个参数的 borrow 时，由接收它的函数通过命名 result/参数和 `@life` 显式声明来源；
@@ -57,8 +57,15 @@ type parameter pack，不要求先开放普通用户泛型参数包。
 ```jiang
 Fn<Bool, Int, Int>       // 栈闭包值，可能带 environment
 Fn<Bool, Int, Int>^      // owned closure handle，environment 在 heap 上
+FnOnce<Bool, Int, Int>   // 消费调用一次的栈闭包值
+FnOnce<Bool, Int, Int>^  // 消费调用一次的 owned heap closure
 RawFn<Bool, Int, Int>    // 裸函数指针，不带 environment
 ```
+
+`Fn` 与 `FnOnce` 使用相同的 closure ABI；调用所有权是独立的类型语义，不产生另一套表示。
+`FnOnce` 调用会消费 callable place，因此不能通过 `FnOnce&` 调用，也不能再次调用原值。
+其闭包体可以 move 按值捕获；普通同步 `Fn` 的闭包体不能 move 按值捕获。当前 async callable 继续使用
+Task/coroutine 的独立 ownership protocol，因此不允许声明 async `FnOnce`。
 
 `RawFn<...>` 的运行时值是函数入口。它不保存捕获环境，适合 top-level function、type/static
 function、未绑定实例方法和非捕获 lambda。
