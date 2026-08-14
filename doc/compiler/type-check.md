@@ -12,9 +12,11 @@ signature、expression/pattern type、member selection、generic arg 检查、tr
 - `CompilerContext.diagnostics`：诊断输出。
 
 type check 不回读 AST，也不重新 resolve。普通 call 在语义选择完成后可以保留原 `sem.NodeId`，原位替换成
-`await_task_expr`、`cancel_task_expr` 等 typed Semantic Model operation。包装原表达式时，原表达式获得新 `sem.NodeId`，
-已经完成的类型与选择结果通过 `TypeCheckStore.clone_node_results()` 迁移。`replace_node_data()` 本身只替换
-节点数据，不维护任何 side table。
+`await_task_expr`、`cancel_task_expr` 等 typed Semantic Model operation。包装原表达式时，原表达式
+获得新 `sem.NodeId`，已经完成的类型与选择结果通过
+`TypeCheckStore.move_node_results()` 从 wrapper Node 迁到 inner Node；wrapper 只记录自身的新类型，
+不保留已经不再适用的调用或选择结果。
+`replace_node_data()` 本身只替换节点数据，不维护任何 side table。
 
 ## 输出
 
