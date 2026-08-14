@@ -2391,13 +2391,15 @@ struct Lower: Movable {
         sem.NodeId body = self.lower_lambda_body(lambda_def, lambda, params$.mut_ref(), captures$.mut_ref(), span);
         qid.DefId? previous_owner! = self.current_owner_def;
         self.current_owner_def = owner_def;
-        sem.NodeId result = self.add_node(.lambda_expr(sem.Lambda (
-            param_count: lambda.params.length,
-            params: self.freeze_model_lambda_params(params),
-            captures: self.freeze_model_lambda_captures(captures),
-            function_def: lambda_def,
-            body: body
-        )), span);
+        sem.NodeId result = self.state.ctx.store.model.add_lambda_expr(
+            owner_def,
+            lambda.params.length,
+            params$.move(),
+            captures$.move(),
+            lambda_def,
+            body
+        );
+        self.state.ctx.store.source_map.set_model_span(result, self.state.unit.source_id, span);
         self.current_owner_def = previous_owner;
         return result;
     }
@@ -2662,12 +2664,19 @@ struct Lower: Movable {
             args.add(self.lower_call_arg(self.state.unit.child_at(call.args, index)));
             index = index + 1;
         }
-        return self.add_node(.call(sem.Call (
-            callee: self.lower_call_callee(call.callee),
-            type_args: self.lower_generic_arg_range(call.type_args),
-            args: self.freeze_call_args(args),
-            target: self.call_target(call.callee)
-        )), span);
+        sem.NodeId callee = self.lower_call_callee(call.callee);
+        list.ArrayList<sem.NodeId> type_args! = self.lower_generic_arg_range(call.type_args);
+        sem.CallTarget? target = self.call_target(call.callee);
+        qid.DefId owner_def = self.current_model_owner(span);
+        sem.NodeId result = self.state.ctx.store.model.add_call(
+            owner_def,
+            callee,
+            type_args$.move(),
+            args$.move(),
+            target
+        );
+        self.state.ctx.store.source_map.set_model_span(result, self.state.unit.source_id, span);
+        return result;
     }
 
     sem.CallArg lower_call_arg(Self&! self, ast.AstId arg_id) {
@@ -2949,10 +2958,8 @@ struct Lower: Movable {
         guard self.resolved_type_def_for_expr(type_ref) is .some(def_id) else {
             return self.add_node(.invalid_type_ref(), span);
         }
-        return self.add_node(.named_type_ref(sem.NamedTypeRef (
-            def_id: def_id,
-            args: self.lower_generic_arg_range(literal.type_args)
-        )), span);
+        list.ArrayList<sem.NodeId> args! = self.lower_generic_arg_range(literal.type_args);
+        return self.add_named_type_node(def_id, args$.move(), span);
     }
 
     // Parser 目前会把 `value.field.subfield` 表示成一个 path。如果
@@ -3105,16 +3112,30 @@ struct Lower: Movable {
     }
 
     sem.NodeId lower_switch_expr(Self&! self, ast.SwitchData switch_expr, token.Span span) {
-        list.ArrayList<sem.SwitchCase> cases! = list.ArrayList<sem.SwitchCase>(switch_expr.cases.length);
+        list.ArrayList<Int> pattern_counts! = list.ArrayList<Int>(switch_expr.cases.length);
+        list.ArrayList<sem.NodeId> patterns! = list.ArrayList<sem.NodeId>();
+        list.ArrayList<sem.NodeId> bodies! = list.ArrayList<sem.NodeId>(switch_expr.cases.length);
         Int index! = 0;
         while (index < switch_expr.cases.length) {
-            cases.add(self.lower_switch_case(self.state.unit.child_at(switch_expr.cases, index)));
+            self.lower_switch_case(
+                self.state.unit.child_at(switch_expr.cases, index),
+                pattern_counts$.mut_ref(),
+                patterns$.mut_ref(),
+                bodies$.mut_ref()
+            );
             index = index + 1;
         }
-        return self.add_node(.switch_expr(sem.Switch (
-            value: self.lower_expr(switch_expr.value),
-            cases: self.freeze_switch_cases(cases)
-        )), span);
+        sem.NodeId value = self.lower_expr(switch_expr.value);
+        qid.DefId owner_def = self.current_model_owner(span);
+        sem.NodeId result = self.state.ctx.store.model.add_switch_expr(
+            owner_def,
+            value,
+            pattern_counts$.move(),
+            patterns$.move(),
+            bodies$.move()
+        );
+        self.state.ctx.store.source_map.set_model_span(result, self.state.unit.source_id, span);
+        return result;
     }
 
     sem.NodeId lower_catch_expr(Self&! self, ast.CatchExprData catch_expr, token.Span span) {
@@ -3163,29 +3184,38 @@ struct Lower: Movable {
         return self.add_node(.binding_pattern(sem.BindingPattern (local_id: local_id)), span);
     }
 
-    sem.SwitchCase lower_switch_case(Self&! self, ast.AstId case_id) {
+    Void lower_switch_case(
+        Self&! self,
+        ast.AstId case_id,
+        list.ArrayList<Int>&! pattern_counts,
+        list.ArrayList<sem.NodeId>&! patterns,
+        list.ArrayList<sem.NodeId>&! bodies
+    ) {
         ast.AstNode case_node = self.state.unit.get(case_id);
         guard case_node.data is .switch_case(case_data) else {
-            return sem.SwitchCase (
-                patterns: self.empty_model_ids(),
-                body: self.add_invalid_node(case_node.span)
-            );
+            pattern_counts.add(0);
+            bodies.add(self.add_invalid_node(case_node.span));
+            return;
         }
         self.env.enter_scope(.block_scope);
-        sem.NodeId[]& patterns = self.lower_switch_patterns(case_data.patterns);
+        Int pattern_start = patterns.len();
+        self.lower_switch_patterns(case_data.patterns, patterns);
         sem.NodeId body = self.lower_expr(case_data.body);
         self.env.exit_scope();
-        return sem.SwitchCase (patterns: patterns, body: body);
+        pattern_counts.add(patterns.len() - pattern_start);
+        bodies.add(body);
     }
 
-    sem.NodeId[]& lower_switch_patterns(Self&! self, ast.AstRange patterns) {
-        list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(patterns.length);
+    Void lower_switch_patterns(
+        Self&! self,
+        ast.AstRange range,
+        list.ArrayList<sem.NodeId>&! values
+    ) {
         Int index! = 0;
-        while (index < patterns.length) {
-            values.add(self.lower_switch_pattern(self.state.unit.child_at(patterns, index)));
+        while (index < range.length) {
+            values.add(self.lower_switch_pattern(self.state.unit.child_at(range, index)));
             index = index + 1;
         }
-        return self.freeze_model_ids(values);
     }
 
     sem.NodeId lower_switch_pattern(Self&! self, ast.AstId pattern_id) {
@@ -3298,18 +3328,25 @@ struct Lower: Movable {
     }
 
     sem.NodeId lower_inline_asm(Self&! self, ast.InlineAsmData inline_asm, token.Span span) {
-        return self.add_node(.inline_asm(sem.InlineAsm (
-            result_type: self.lower_type_ref(inline_asm.result_type),
-            code_symbol: inline_asm.code_symbol,
-            operands: self.lower_inline_asm_operands(inline_asm.operands),
-            clobbers: self.lower_inline_asm_clobbers(inline_asm.clobbers),
-            volatile: inline_asm.options.volatile,
-            memory: inline_asm.options.memory,
-            noreturn: inline_asm.options.noreturn
-        )), span);
+        sem.NodeId result_type = self.lower_type_ref(inline_asm.result_type);
+        list.ArrayList<sem.InlineAsmOperand> operands! = self.lower_inline_asm_operands(inline_asm.operands);
+        list.ArrayList<qid.SymbolId> clobbers! = self.lower_inline_asm_clobbers(inline_asm.clobbers);
+        qid.DefId owner_def = self.current_model_owner(span);
+        sem.NodeId result = self.state.ctx.store.model.add_inline_asm(
+            owner_def,
+            result_type,
+            inline_asm.code_symbol,
+            operands$.move(),
+            clobbers$.move(),
+            inline_asm.options.volatile,
+            inline_asm.options.memory,
+            inline_asm.options.noreturn
+        );
+        self.state.ctx.store.source_map.set_model_span(result, self.state.unit.source_id, span);
+        return result;
     }
 
-    sem.InlineAsmOperand[]& lower_inline_asm_operands(Self&! self, ast.AstRange operands) {
+    list.ArrayList<sem.InlineAsmOperand> lower_inline_asm_operands(Self&! self, ast.AstRange operands) {
         list.ArrayList<sem.InlineAsmOperand> values! = list.ArrayList<sem.InlineAsmOperand>(operands.length);
         Int index! = 0;
         while (index < operands.length) {
@@ -3319,7 +3356,7 @@ struct Lower: Movable {
             }
             index = index + 1;
         }
-        return self.freeze_inline_asm_operands(values);
+        return values$.move();
     }
 
     sem.InlineAsmOperand lower_inline_asm_operand(Self&! self, ast.InlineAsmData.Operand operand) {
@@ -3348,7 +3385,7 @@ struct Lower: Movable {
         ));
     }
 
-    qid.SymbolId[]& lower_inline_asm_clobbers(Self&! self, ast.AstRange clobbers) {
+    list.ArrayList<qid.SymbolId> lower_inline_asm_clobbers(Self&! self, ast.AstRange clobbers) {
         list.ArrayList<qid.SymbolId> values! = list.ArrayList<qid.SymbolId>(clobbers.length);
         Int index! = 0;
         while (index < clobbers.length) {
@@ -3358,7 +3395,7 @@ struct Lower: Movable {
             }
             index = index + 1;
         }
-        return self.freeze_symbol_ids(values);
+        return values$.move();
     }
 
     qid.DefId? variant_pattern_def(Self&! self, ast.PatternData pattern, ast.AstId name) {
@@ -3625,7 +3662,7 @@ struct Lower: Movable {
         return self.state.ctx.store.defs.get(param_def).domain;
     }
 
-    sem.NodeId[]& lower_generic_arg_range(Self&! self, ast.AstRange range) {
+    list.ArrayList<sem.NodeId> lower_generic_arg_range(Self&! self, ast.AstRange range) {
         list.ArrayList<sem.NodeId> values! = list.ArrayList<sem.NodeId>(range.length);
         Int index! = 0;
         while (index < range.length) {
@@ -3639,7 +3676,7 @@ struct Lower: Movable {
             }
             index = index + 1;
         }
-        return self.freeze_model_ids(values);
+        return values$.move();
     }
 
     list.ArrayList<sem.NodeId> lower_type_ref_range(Self&! self, ast.AstRange range) {
@@ -4051,11 +4088,6 @@ struct Lower: Movable {
         return self.add_node(.invalid(), span);
     }
 
-    sem.NodeId[]& empty_model_ids(Self&! self) {
-        list.ArrayList<sem.NodeId> empty = list.ArrayList<sem.NodeId>();
-        return self.freeze_model_ids(empty);
-    }
-
     // Semantic Model node 里的 slice 不能指向临时 ArrayList；统一复制到
     // Store arena，让它和 package Semantic Model 生命周期一致。
     sem.NodeId[]& freeze_model_ids(Self&! self, list.ArrayList<sem.NodeId> values) {
@@ -4075,75 +4107,6 @@ struct Lower: Movable {
         }
     }
 
-    sem.LambdaParam[]& freeze_model_lambda_params(Self&! self, list.ArrayList<sem.LambdaParam> values) {
-        unsafe {
-            Int count = values.len();
-            Int capacity! = count;
-            if (capacity == 0) {
-                capacity = 1;
-            }
-            sem.LambdaParam*! stored = self.state.ctx.store.model.storage.alloc_array<sem.LambdaParam>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = values.get(index);
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
-    sem.LambdaCapture[]& freeze_model_lambda_captures(Self&! self, list.ArrayList<sem.LambdaCapture> values) {
-        unsafe {
-            Int count = values.len();
-            Int capacity! = count;
-            if (capacity == 0) {
-                capacity = 1;
-            }
-            sem.LambdaCapture*! stored = self.state.ctx.store.model.storage.alloc_array<sem.LambdaCapture>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = values.get(index);
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
-    @life(return: (self, values))
-    sem.SwitchCase[]& freeze_switch_cases(Self&! self, list.ArrayList<sem.SwitchCase> values) {
-        unsafe {
-            Int count = values.len();
-            Int capacity! = count;
-            if (capacity == 0) {
-                capacity = 1;
-            }
-            sem.SwitchCase*! stored = self.state.ctx.store.model.storage.alloc_array<sem.SwitchCase>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = values.get(index);
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
-    sem.CallArg[]& freeze_call_args(Self&! self, list.ArrayList<sem.CallArg> values) {
-        unsafe {
-            Int count = values.len();
-            Int capacity! = count;
-            if (capacity == 0) {
-                capacity = 1;
-            }
-            sem.CallArg*! stored = self.state.ctx.store.model.storage.alloc_array<sem.CallArg>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = values.get(index);
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
     sem.FieldInit[]& freeze_field_inits(Self&! self, list.ArrayList<sem.FieldInit> values) {
         unsafe {
             Int count = values.len();
@@ -4152,42 +4115,6 @@ struct Lower: Movable {
                 capacity = 1;
             }
             sem.FieldInit*! stored = self.state.ctx.store.model.storage.alloc_array<sem.FieldInit>(capacity);
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = values.get(index);
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
-    sem.InlineAsmOperand[]& freeze_inline_asm_operands(Self&! self, list.ArrayList<sem.InlineAsmOperand> values) {
-        unsafe {
-            Int count = values.len();
-            Int capacity! = count;
-            if (capacity == 0) {
-                capacity = 1;
-            }
-            sem.InlineAsmOperand*! stored = self.state.ctx.store.model.storage.alloc_array<sem.InlineAsmOperand>(
-                capacity
-            );
-            Int index! = 0;
-            while (index < count) {
-                stored[index] = values.get(index);
-                index = index + 1;
-            }
-            return stored[0..count];
-        }
-    }
-
-    qid.SymbolId[]& freeze_symbol_ids(Self&! self, list.ArrayList<qid.SymbolId> values) {
-        unsafe {
-            Int count = values.len();
-            Int capacity! = count;
-            if (capacity == 0) {
-                capacity = 1;
-            }
-            qid.SymbolId*! stored = self.state.ctx.store.model.storage.alloc_array<qid.SymbolId>(capacity);
             Int index! = 0;
             while (index < count) {
                 stored[index] = values.get(index);
