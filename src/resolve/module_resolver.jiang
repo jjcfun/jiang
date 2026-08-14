@@ -14,7 +14,6 @@ import driver_options = "../driver/options.jiang";
 import source_ji = "../artifact/source_ji.jiang";
 import incremental_fingerprint = "../incremental/fingerprint.jiang";
 import source_graph = "../incremental/source_graph.jiang";
-import store_api = "../store.jiang";
 import system_time = "../system/time.jiang";
 import sem = "../sema/model.jiang";
 import qid = "../id.jiang";
@@ -35,6 +34,7 @@ import name_resolver = "./name_resolver.jiang";
 import namespace = "./namespace.jiang";
 import resolve_state = "./state.jiang";
 import store = "./store.jiang";
+import std;
 
 // 仅在 --jil-stats 下累计 interface 恢复各子阶段，用于定位增量构建热点。
 public struct ModelTiming: Copyable {
@@ -307,15 +307,18 @@ public struct ModuleResolver: Movable {
         while (index < end) {
             source_graph.SourceNodeId node_id = schedule.node_at(index);
             source_graph.SourceNode& node = self.ctx.store.source_dependencies.node(node_id);
+            cache_identity.StableSourceId identity = node.identity;
+            Bool source_dirty = node.source_dirty;
+            Bool dependency_candidate = node.dependency_candidate;
             guard self.module_for_source_node(node_id, source_modules) is .some(module_id) else {
                 self.force_component_source_models(schedule, begin, end);
                 return true;
             }
             db.ModuleModelInput input = db.module_model(
                 self.ctx.query$.ref(),
-                node.identity,
-                node.source_dirty,
-                node.dependency_candidate,
+                identity,
+                source_dirty,
+                dependency_candidate,
                 { [ref self, module_id] dependency_candidate =>
                     return self.module_model_can_restore(module_id, dependency_candidate);
                 }
@@ -363,11 +366,12 @@ public struct ModuleResolver: Movable {
 
     Bool module_observations_valid(Self&! self, qid.ModuleId module_id) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        if (self.ctx.store.artifacts.load_observations(module.source_id) == null
+        source.SourceId source_id = module.source_id;
+        if (self.ctx.store.artifacts.load_observations(source_id) == null
             && !self.load_module_observations(module_id)) {
             return false;
         }
-        guard self.ctx.store.artifacts.load_observations(module.source_id)
+        guard self.ctx.store.artifacts.load_observations(source_id)
             is .some(observations) else {
             return false;
         }
@@ -387,12 +391,10 @@ public struct ModuleResolver: Movable {
             identity
         );
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        store_api.CompilerStore&! compiler_store = self.ctx.store$.mut_ref();
-        artifact.SourceArtifactCache&! artifacts = compiler_store.artifacts$.mut_ref();
+        source.SourceId source_id = module.source_id;
         return source_ji.load_declaration_observations_from_ji(
-            self.ctx$.ref(),
-            artifacts,
-            module.source_id,
+            self.ctx.store$.mut_ref(),
+            source_id,
             path[..],
             self.compiler_version_hash,
             identity.fingerprint
@@ -777,15 +779,18 @@ public struct ModuleResolver: Movable {
     Bool lower_module_bodies_to_model(Self&! self, qid.ModuleId module_id) {
         self.set_module_state(module_id, .resolving);
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        ast.AstUnit& unit = self.asts.get(module.source_id)$.some();
+        source.SourceId source_id = module.source_id;
+        qid.NamespaceId namespace_id = module.namespace_id;
+        ast.AstUnit& unit = self.asts.get(source_id)$.some();
         resolve_state.AstResolveState state! = resolve_state.AstResolveState(
             self.ctx$.mut_ref(),
             unit,
             self.declaration_defs$.mut_ref(),
             module_id,
-            module.namespace_id
+            namespace_id
         );
-        self.resolve_module_references(state$.mut_ref());
+        name_resolver.NameResolver resolver! = name_resolver.NameResolver(state$.mut_ref());
+        resolver.resolve_references();
         if (self.ctx.store.model.has_errors()) {
             self.set_module_state(module_id, .failed);
             self.ctx.store.model.mark_error();
@@ -976,13 +981,13 @@ public struct ModuleResolver: Movable {
     }
 
     Void bind_core_module_type(Self&! self, qid.ModuleId core_module, qid.SymbolId symbol, qid.DefId def_id) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(core_module);
-        if (self.ctx.store.resolve.first_binding(module.namespace_id, symbol, .type_name) != null) {
+        qid.NamespaceId namespace_id = self.ctx.store.resolve.module_ref(core_module).namespace_id;
+        if (self.ctx.store.resolve.first_binding(namespace_id, symbol, .type_name) != null) {
             return;
         }
         // core 源码不再重复声明 builtin type；没有源码绑定时，把启动期
         // builtin DefId 暴露为 core module 的公开类型名。
-        self.ctx.store.resolve.bind_name(module.namespace_id, symbol, .type_name, def_id, token.Span());
+        self.ctx.store.resolve.bind_name(namespace_id, symbol, .type_name, def_id, token.Span());
     }
 
     Void bind_core_trait(Self&! self, qid.ModuleId core_module, UInt8[]& name) {
@@ -1018,12 +1023,14 @@ public struct ModuleResolver: Movable {
 
     namespace.BindingEntry? core_type_binding(Self&! self, qid.ModuleId core_module, qid.SymbolId symbol) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(core_module);
-        if (self.ctx.store.resolve.lookup_namespace(module.namespace_id, symbol, .type_name, false) is .some(binding)) {
+        qid.NamespaceId namespace_id = module.namespace_id;
+        Int import_count = module.imports.len();
+        if (self.ctx.store.resolve.lookup_namespace(namespace_id, symbol, .type_name, false) is .some(binding)) {
             return self.valid_core_type_binding(binding);
         }
         Int index! = 0;
-        while (index < module.imports.len()) {
-            store.ImportRecord import_record = module.imports.get(index);
+        while (index < import_count) {
+            store.ImportRecord import_record = self.ctx.store.resolve.module_ref(core_module).imports.get(index);
             if (import_record.target_module is .some(target_module)) {
                 if (self.core_type_binding_in_module(target_module, symbol) is .some(binding)) {
                     return binding;
@@ -1054,12 +1061,14 @@ public struct ModuleResolver: Movable {
 
     namespace.BindingEntry? core_trait_binding(Self&! self, qid.ModuleId core_module, qid.SymbolId symbol) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(core_module);
-        if (self.ctx.store.resolve.lookup_namespace(module.namespace_id, symbol, .type_name, false) is .some(binding)) {
+        qid.NamespaceId namespace_id = module.namespace_id;
+        Int import_count = module.imports.len();
+        if (self.ctx.store.resolve.lookup_namespace(namespace_id, symbol, .type_name, false) is .some(binding)) {
             return binding;
         }
         Int index! = 0;
-        while (index < module.imports.len()) {
-            store.ImportRecord import_record = module.imports.get(index);
+        while (index < import_count) {
+            store.ImportRecord import_record = self.ctx.store.resolve.module_ref(core_module).imports.get(index);
             if (import_record.target_module is .some(target_module)) {
                 if (self.core_trait_binding_in_module(target_module, symbol) is .some(binding)) {
                     return binding;
@@ -1194,14 +1203,16 @@ public struct ModuleResolver: Movable {
 
     namespace.BindingEntry? core_value_binding(Self&! self, qid.ModuleId core_module, qid.SymbolId symbol) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(core_module);
+        qid.NamespaceId namespace_id = module.namespace_id;
+        Int import_count = module.imports.len();
         if (self.ctx.store.resolve.lookup_namespace(
-            module.namespace_id, symbol, .value_name, false
+            namespace_id, symbol, .value_name, false
         ) is .some(binding)) {
             return self.valid_core_value_binding(binding);
         }
         Int index! = 0;
-        while (index < module.imports.len()) {
-            store.ImportRecord import_record = module.imports.get(index);
+        while (index < import_count) {
+            store.ImportRecord import_record = self.ctx.store.resolve.module_ref(core_module).imports.get(index);
             if (import_record.target_module is .some(target_module)) {
                 if (self.core_value_binding_in_module(target_module, symbol) is .some(binding)) {
                     return binding;
@@ -1248,13 +1259,15 @@ public struct ModuleResolver: Movable {
         guard self.ctx.store.resolve.core_traits.mutable_trait is .some(mutable_def) else { return; }
         guard self.result_error_param(result_def) is .some(error_param) else { return; }
         sem.NodeId subject = self.core_named_type_ref(result_def, error_param);
+        sem.NodeId mutable_ref = self.core_named_type_ref(result_def, mutable_def);
         self.ctx.store.model.add_where_predicate(result_def, .negative_type_bound(sem.WhereTypeBound(
             subject: subject,
-            bound: self.core_named_type_ref(result_def, mutable_def)
+            bound: mutable_ref
         )));
+        sem.NodeId option_pattern = self.core_single_arg_pattern_ref(result_def, option_def);
         self.ctx.store.model.add_where_predicate(result_def, .not_equal(sem.WhereEqual(
             subject: subject,
-            value: self.core_single_arg_pattern_ref(result_def, option_def)
+            value: option_pattern
         )));
     }
 
@@ -1288,9 +1301,10 @@ public struct ModuleResolver: Movable {
         guard self.first_generic_param(def_id) is .some(param_def) else { return; }
         guard self.ctx.store.resolve.core_traits.copyable_trait is .some(copyable_def) else { return; }
         sem.NodeId subject = self.core_named_type_ref(def_id, param_def);
+        sem.NodeId copyable_ref = self.core_named_type_ref(def_id, copyable_def);
         self.ctx.store.model.add_where_predicate(def_id, .type_bound(sem.WhereTypeBound(
             subject: subject,
-            bound: self.core_named_type_ref(def_id, copyable_def)
+            bound: copyable_ref
         )));
     }
 
@@ -1305,9 +1319,10 @@ public struct ModuleResolver: Movable {
         Int arg_count
     ) {
         guard pattern_def is .some(def_id) else { return; }
+        sem.NodeId pattern = self.core_pattern_ref(owner_def, def_id, arg_count);
         self.ctx.store.model.add_where_predicate(owner_def, .not_equal(sem.WhereEqual(
             subject: subject,
-            value: self.core_pattern_ref(owner_def, def_id, arg_count)
+            value: pattern
         )));
     }
 
@@ -1441,16 +1456,16 @@ public struct ModuleResolver: Movable {
     }
 
     Bool ensure_fresh_module_interface(Self&! self, qid.ModuleId module_id) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        if (self.ctx.store.artifacts.load_interface(module.source_id) == null) {
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
+        if (self.ctx.store.artifacts.load_interface(source_id) == null) {
             module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
             builder.load_source_artifacts_from_file(module_id);
         }
-        guard self.ctx.store.artifacts.load_interface(module.source_id) is .some(module_interface) else {
+        guard self.ctx.store.artifacts.load_interface(source_id) is .some(module_interface) else {
             self.ctx.store.artifacts.record_interface_lookup(.missing);
             return false;
         }
-        source.SourceRecord source_record = self.ctx.store.sources.get(module.source_id);
+        source.SourceRecord source_record = self.ctx.store.sources.get(source_id);
         if (module_interface.source_hash != source_record.content_hash) {
             self.ctx.store.artifacts.record_interface_lookup(.stale);
             return false;
@@ -1559,11 +1574,11 @@ public struct ModuleResolver: Movable {
 
     Void bind_std_prelude_aliases(Self&! self) {
         guard self.ctx.store.resolve.std_prelude_module is .some(std_module) else { return; }
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(std_module);
+        qid.NamespaceId namespace_id = self.ctx.store.resolve.module_ref(std_module).namespace_id;
         Int index! = 0;
         while (index < self.ctx.store.resolve.binding_len()) {
             namespace.BindingEntry binding = self.ctx.store.resolve.binding_at_index(index);
-            if (binding.namespace_id == module.namespace_id) {
+            if (binding.namespace_id == namespace_id) {
                 self.bind_std_prelude_alias(binding);
             }
             index = index + 1;
@@ -1592,15 +1607,17 @@ public struct ModuleResolver: Movable {
 
     Void collect_module_declaration_names(Self&! self, qid.ModuleId module_id) {
         store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        if (self.asts.get(module.source_id) == null) {
+        source.SourceId source_id = module.source_id;
+        qid.NamespaceId namespace_id = module.namespace_id;
+        if (self.asts.get(source_id) == null) {
             module_graph_builder.ModuleGraphBuilder builder! = self.graph_builder();
-            if (!builder.ensure_file_source_ast(module.source_id)) {
-                self.add_missing_ast_diagnostic(module.source_id);
+            if (!builder.ensure_file_source_ast(source_id)) {
+                self.add_missing_ast_diagnostic(source_id);
                 return;
             }
         }
-        guard self.asts.get(module.source_id) is .some(unit) else {
-            self.add_missing_ast_diagnostic(module.source_id);
+        guard self.asts.get(source_id) is .some(unit) else {
+            self.add_missing_ast_diagnostic(source_id);
             return;
         }
         resolve_state.AstResolveState state! = resolve_state.AstResolveState(
@@ -1608,7 +1625,7 @@ public struct ModuleResolver: Movable {
             unit,
             self.declaration_defs$.mut_ref(),
             module_id,
-            module.namespace_id
+            namespace_id
         );
         name_resolver.NameResolver resolver! = name_resolver.NameResolver(state$.mut_ref());
         resolver.collect_declaration_names();
@@ -1623,9 +1640,10 @@ public struct ModuleResolver: Movable {
     }
 
     Int collect_module_aliases_impl(Self&! self, qid.ModuleId module_id, Bool defer_unresolved) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        Int progress! = self.bind_flatten_import_aliases(module_id, module);
-        guard self.asts.get(module.source_id) is .some(unit) else {
+        source.SourceId source_id = self.ctx.store.resolve.module_ref(module_id).source_id;
+        qid.NamespaceId namespace_id = self.ctx.store.resolve.module_ref(module_id).namespace_id;
+        Int progress! = self.bind_flatten_import_aliases(module_id);
+        guard self.asts.get(source_id) is .some(unit) else {
             return progress;
         }
         resolve_state.AstResolveState state! = resolve_state.AstResolveState(
@@ -1633,7 +1651,7 @@ public struct ModuleResolver: Movable {
             unit,
             self.declaration_defs$.mut_ref(),
             module_id,
-            module.namespace_id
+            namespace_id
         );
         name_resolver.NameResolver resolver! = name_resolver.NameResolver(state$.mut_ref());
         if (defer_unresolved) {
@@ -1696,10 +1714,10 @@ public struct ModuleResolver: Movable {
     }
 
     Void bind_import_aliases(Self&! self, qid.ModuleId module_id) {
-        store.ModuleRecord& module_info = self.ctx.store.resolve.module_ref(module_id);
+        Int import_count = self.ctx.store.resolve.module_ref(module_id).imports.len();
         Int index! = 0;
-        while (index < module_info.imports.len()) {
-            store.ImportRecord import_record = module_info.imports.get(index);
+        while (index < import_count) {
+            store.ImportRecord import_record = self.ctx.store.resolve.module_ref(module_id).imports.get(index);
             if (import_record.alias_def != null) {
                 index = index + 1;
                 continue;
@@ -1713,16 +1731,16 @@ public struct ModuleResolver: Movable {
         }
     }
 
-    Int bind_flatten_import_aliases(Self&! self, qid.ModuleId module_id, store.ModuleRecord& module) {
+    Int bind_flatten_import_aliases(Self&! self, qid.ModuleId module_id) {
         Int added! = 0;
+        Int import_count = self.ctx.store.resolve.module_ref(module_id).imports.len();
         Int index! = 0;
-        while (index < module.imports.len()) {
-            store.ImportRecord import_record = module.imports.get(index);
+        while (index < import_count) {
+            store.ImportRecord import_record = self.ctx.store.resolve.module_ref(module_id).imports.get(index);
             if (import_record.flatten) {
                 if (import_record.target_module is .some(target_module)) {
                     added = added + self.create_flatten_import_aliases(
                         module_id,
-                        module,
                         import_record,
                         target_module
                     );
@@ -1742,12 +1760,10 @@ public struct ModuleResolver: Movable {
         Int import_index,
         qid.ModuleId target_module
     ) {
-        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
-        store.ImportRecord& import_record = module.imports.ref_at(import_index);
-        Bool duplicate = self.import_alias_has_conflict(module, import_record);
+        store.ImportRecord import_record = self.ctx.store.resolve.module_ref(module_id).imports.get(import_index);
+        Bool duplicate = self.import_alias_has_conflict(module_id, import_record);
         qid.DefId alias_def = self.create_import_alias(
             module_id,
-            module,
             import_record,
             target_module,
             duplicate
@@ -1758,15 +1774,15 @@ public struct ModuleResolver: Movable {
 
     Int create_flatten_import_aliases(Self&! self,
         qid.ModuleId module_id,
-        store.ModuleRecord& module,
         store.ImportRecord import_record,
         qid.ModuleId target_module
     ) {
+        qid.DefId module_def = self.ctx.store.resolve.module_ref(module_id).def_id;
         store.ModuleRecord& target = self.ctx.store.resolve.module_ref(target_module);
         db.observe_public_namespace(
             self.ctx.query$.ref(),
             self.ctx.store$.ref(),
-            module.def_id,
+            module_def,
             target.namespace_id
         );
         qid.DefId target_module_def = self.ctx.store.resolve.module_ref(target_module).def_id;
@@ -1783,7 +1799,6 @@ public struct ModuleResolver: Movable {
             if (self.ctx.store.defs.get(target_def).owner_def == null) {
                 added = added + self.create_flatten_import_alias(
                     module_id,
-                    module,
                     import_record,
                     target_def
                 );
@@ -1801,32 +1816,32 @@ public struct ModuleResolver: Movable {
 
     Int create_flatten_import_alias(Self&! self,
         qid.ModuleId module_id,
-        store.ModuleRecord& module,
         store.ImportRecord import_record,
         qid.DefId target_def
     ) {
+        qid.DefId module_def = self.ctx.store.resolve.module_ref(module_id).def_id;
+        qid.NamespaceId namespace_id = self.ctx.store.resolve.module_ref(module_id).namespace_id;
         def.DefRecord target_record = self.ctx.store.defs.get(target_def);
         if (target_record.visibility != .public_visibility) {
             return 0;
         }
-        if (self.module_has_alias_target(module.def_id, target_def)) { return 0; }
+        if (self.module_has_alias_target(module_def, target_def)) { return 0; }
         qid.SymbolId alias_symbol = target_record.name.symbol;
         if (self.module_declares_explicit_alias(module_id, alias_symbol)) {
             return 0;
         }
         def.NameDomain domain = self.flatten_import_alias_domain(target_record);
         Bool duplicate =
-            self.flatten_import_alias_has_conflict(module, import_record, alias_symbol, domain);
+            self.flatten_import_alias_has_conflict(module_id, import_record, alias_symbol, domain);
         qid.DefId alias_def = self.create_flatten_import_alias_def(
             module_id,
-            module,
             import_record,
             target_def,
             target_record,
             domain
         );
         if (!duplicate) {
-            self.ctx.store.resolve.bind_name(module.namespace_id, alias_symbol, domain, alias_def, import_record.span);
+            self.ctx.store.resolve.bind_name(namespace_id, alias_symbol, domain, alias_def, import_record.span);
         }
         return 1;
     }
@@ -1872,18 +1887,22 @@ public struct ModuleResolver: Movable {
     }
 
     Bool flatten_import_alias_has_conflict(Self&! self,
-        store.ModuleRecord& module,
+        qid.ModuleId module_id,
         store.ImportRecord import_record,
         qid.SymbolId alias_symbol,
         def.NameDomain domain
     ) {
-        if (self.ctx.store.resolve.first_binding(module.namespace_id, alias_symbol, domain) is .some(existing)) {
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        qid.NamespaceId namespace_id = module.namespace_id;
+        source.SourceId source_id = module.source_id;
+        if (self.ctx.store.resolve.first_binding(namespace_id, alias_symbol, domain) is .some(existing)) {
+            UInt8[]& name = self.ctx.store.symbols.text(alias_symbol);
             diagnostics.add_duplicate_def(
                 self.ctx$.mut_ref(),
-                module.source_id,
+                source_id,
                 import_record.span,
                 existing.span,
-                self.ctx.store.symbols.text(alias_symbol)
+                name
             );
             self.ctx.store.model.mark_error();
             return true;
@@ -1893,12 +1912,15 @@ public struct ModuleResolver: Movable {
 
     qid.DefId create_flatten_import_alias_def(Self&! self,
         qid.ModuleId module_id,
-        store.ModuleRecord& module,
         store.ImportRecord import_record,
         qid.DefId target_def,
         def.DefRecord target_record,
         def.NameDomain domain
     ) {
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        qid.DefId module_def = module.def_id;
+        qid.NamespaceId namespace_id = module.namespace_id;
+        source.SourceId source_id = module.source_id;
         def.DefKind alias_kind! = .alias_def;
         if (target_record.kind == .module_def || target_record.kind == .import_alias_def) {
             alias_kind = .import_alias_def;
@@ -1908,17 +1930,18 @@ public struct ModuleResolver: Movable {
             domain,
             import_record.visibility,
             def.Name(symbol: target_record.name.symbol, span: import_record.span),
-            module.def_id,
+            module_def,
             module_id,
-            module.namespace_id,
+            namespace_id,
             target_record.owned_namespace_id
         );
-        self.ctx.store.model.declare_def(alias_def, self.flatten_import_model_decl_kind(alias_kind));
+        sem.DeclKind decl_kind = self.flatten_import_model_decl_kind(alias_kind);
+        self.ctx.store.model.declare_def(alias_def, decl_kind);
         self.ctx.store.model.set_alias_target(alias_def, target_def);
-        self.ctx.store.model.add_member(module.def_id, alias_def);
-        self.ctx.store.source_map.set_def_span(alias_def, module.source_id, import_record.span);
+        self.ctx.store.model.add_member(module_def, alias_def);
+        self.ctx.store.source_map.set_def_span(alias_def, source_id, import_record.span);
         self.record_flatten_import_alias_stable_key(
-            module,
+            module_id,
             alias_def,
             target_record.kind,
             domain,
@@ -1936,21 +1959,27 @@ public struct ModuleResolver: Movable {
     }
 
     Void record_flatten_import_alias_stable_key(Self&! self,
-        store.ModuleRecord& module,
+        qid.ModuleId module_id,
         qid.DefId alias_def,
         def.DefKind target_kind,
         def.NameDomain domain,
         qid.SymbolId alias_symbol,
         token.Span span
     ) {
-        store.PackageRecord& package_record = self.ctx.store.resolve.package_ref(module.package_id);
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        qid.PackageId package_id = module.package_id;
+        qid.SymbolId module_path = module.path_symbol;
+        qid.DefId module_def = module.def_id;
+        qid.SymbolId package_name = self.ctx.store.resolve.package_ref(package_id).name;
+        qkey.StableSymbolId? owner = self.ctx.store.incremental.stable_id_for_def(module_def);
+        qkey.StableSymbolKind stable_kind = self.flatten_import_stable_symbol_kind(target_kind);
         self.ctx.store.incremental.record_symbol(
             self.ctx.store.symbols$.ref(),
             qkey.StableSymbolKey (
-                kind: self.flatten_import_stable_symbol_kind(target_kind),
-                package_name: package_record.name,
-                module_path: module.path_symbol,
-                owner: self.ctx.store.incremental.stable_id_for_def(module.def_id),
+                kind: stable_kind,
+                package_name: package_name,
+                module_path: module_path,
+                owner: owner,
                 name: alias_symbol,
                 domain: domain
             ),
@@ -1986,32 +2015,36 @@ public struct ModuleResolver: Movable {
 
     qid.DefId create_import_alias(Self&! self,
         qid.ModuleId module_id,
-        store.ModuleRecord& module,
-        store.ImportRecord& import_record,
+        store.ImportRecord import_record,
         qid.ModuleId target_module,
         Bool duplicate
     ) {
-        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record);
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        qid.DefId module_def = module.def_id;
+        qid.NamespaceId namespace_id = module.namespace_id;
+        source.SourceId source_id = module.source_id;
+        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record$.ref());
+        qid.NamespaceId target_namespace = self.ctx.store.resolve.module_ref(target_module).namespace_id;
         qid.DefId alias_def = self.ctx.store.defs.create(
             .import_alias_def,
             .namespace_name,
             import_record.visibility,
             def.Name (symbol: alias_symbol, span: import_record.span),
-            module.def_id,
+            module_def,
             module_id,
-            module.namespace_id,
-            self.ctx.store.resolve.module_ref(target_module).namespace_id
+            namespace_id,
+            target_namespace
         );
         self.ctx.store.model.declare_def(alias_def, .import_alias_decl);
-        self.ctx.store.model.add_member(module.def_id, alias_def);
-        self.ctx.store.source_map.set_def_span(alias_def, module.source_id, import_record.span);
-        self.record_import_alias_stable_key(module_id, module, alias_def, alias_symbol, import_record.span);
+        self.ctx.store.model.add_member(module_def, alias_def);
+        self.ctx.store.source_map.set_def_span(alias_def, source_id, import_record.span);
+        self.record_import_alias_stable_key(module_id, alias_def, alias_symbol, import_record.span);
         if (duplicate) {
             return alias_def;
         }
 
         self.ctx.store.resolve.bind_name(
-            module.namespace_id, alias_symbol, .namespace_name, alias_def, import_record.span
+            namespace_id, alias_symbol, .namespace_name, alias_def, import_record.span
         );
         return alias_def;
     }
@@ -2037,28 +2070,32 @@ public struct ModuleResolver: Movable {
             index = index + 1;
         }
 
-        UInt8[]& name = string.trim_extension(text[name_start..text.length]);
-        if (name.length == 0) {
+        std.String name! = std.String(string.trim_extension(text[name_start..text.length]));
+        if (name.byte_length() == 0) {
             return path_symbol;
         }
-        return self.ctx.store.symbols.intern(name);
+        return self.ctx.store.symbols.intern(name.bytes());
     }
 
     Void record_import_alias_stable_key(Self&! self,
         qid.ModuleId module_id,
-        store.ModuleRecord& module,
         qid.DefId alias_def,
         qid.SymbolId alias_symbol,
         token.Span span
     ) {
-        store.PackageRecord& package_record = self.ctx.store.resolve.package_ref(module.package_id);
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        qid.PackageId package_id = module.package_id;
+        qid.SymbolId module_path = module.path_symbol;
+        qid.DefId module_def = module.def_id;
+        qid.SymbolId package_name = self.ctx.store.resolve.package_ref(package_id).name;
+        qkey.StableSymbolId? owner = self.ctx.store.incremental.stable_id_for_def(module_def);
         self.ctx.store.incremental.record_symbol(
             self.ctx.store.symbols$.ref(),
             qkey.StableSymbolKey (
                 kind: qkey.StableSymbolKind.module_symbol,
-                package_name: package_record.name,
-                module_path: module.path_symbol,
-                owner: self.ctx.store.incremental.stable_id_for_def(module.def_id),
+                package_name: package_name,
+                module_path: module_path,
+                owner: owner,
                 name: alias_symbol,
                 domain: def.NameDomain.namespace_name
             ),
@@ -2072,17 +2109,21 @@ public struct ModuleResolver: Movable {
     // 即使重复也会继续创建 alias DefId，方便 SourceMap/diagnostic
     // 保留当前位置；只是不会 bind 成 lookup winner。
     Bool import_alias_has_conflict(Self&! self,
-        store.ModuleRecord& module,
-        store.ImportRecord& import_record
+        qid.ModuleId module_id,
+        store.ImportRecord import_record
     ) {
-        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record);
-        if (self.first_import_alias_conflict(module.namespace_id, alias_symbol) is .some(existing)) {
+        store.ModuleRecord& module = self.ctx.store.resolve.module_ref(module_id);
+        qid.NamespaceId namespace_id = module.namespace_id;
+        source.SourceId source_id = module.source_id;
+        qid.SymbolId alias_symbol = self.import_alias_symbol(import_record$.ref());
+        if (self.first_import_alias_conflict(namespace_id, alias_symbol) is .some(existing)) {
+            UInt8[]& name = self.ctx.store.symbols.text(alias_symbol);
             diagnostics.add_duplicate_def(
                 self.ctx$.mut_ref(),
-                module.source_id,
+                source_id,
                 import_record.span,
                 existing.span,
-                self.ctx.store.symbols.text(alias_symbol)
+                name
             );
             self.ctx.store.model.mark_error();
             return true;
